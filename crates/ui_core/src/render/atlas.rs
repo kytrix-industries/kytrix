@@ -17,10 +17,11 @@ use crate::{
 };
 
 /// 图集页的**上限**（纹素，边长）：2048²。字形页 R8 = 4 MiB、图片页 BGRA8 = 16 MiB
-/// （P02 §10.3）。两张页的页尺寸都按需选档，最大到这一档。
+/// （P02 §10.3）。字形页按 512 → 1024 → 2048 阶梯扩容；**图片页固定用这一档**
+/// （容纳能力与插入顺序无关，见 `resources::ResourceCache`）。
 pub(crate) const MAX_ATLAS_PAGE: u32 = 2048;
 
-/// 图集页的起始档 / 图片页可选档的下界（DEVIATIONS F-208）。
+/// 图集页的起始档（字形页扩容阶梯的下界；图片页不用这个阶梯）。
 ///
 /// 两张页都**懒分配**：没有字形 / 图片时不占 CPU 页、GPU 纹理与 staging。
 pub(crate) const MIN_ATLAS_PAGE: u32 = 512;
@@ -123,7 +124,7 @@ pub(crate) struct Allocation {
 }
 
 impl AtlasAllocator {
-    /// 新建（页尺寸 = `page`；两张页都按需选档，见 DEVIATIONS F-208）。
+    /// 新建（页尺寸 = `page`；字形页由 `text::atlas` 选档，图片页固定最大档）。
     pub(crate) fn with_page(kind: AtlasKind, page: (u32, u32)) -> Self {
         Self {
             kind,

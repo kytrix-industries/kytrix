@@ -225,7 +225,7 @@ fn run_bounds(instances: &[GpuPrimitive]) -> PhysicalBounds {
     bounds
 }
 
-/// clip **AABB**（`[x0, y0, x1, y1]`）→ 整数可见范围；语义与 [`bounds_of_clip`]（xywh）分开，
+/// clip **AABB**（`[x0, y0, x1, y1]`）→ 整数可见范围。与实例路径的 xywh（`clip_extent`）分开，
 /// 避免「存 AABB 却按 xywh 读」这类潜伏错误。
 fn bounds_of_aabb(aabb: [f32; 4]) -> PhysicalBounds {
     if aabb.iter().any(|value| value.is_nan()) {

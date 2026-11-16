@@ -588,6 +588,11 @@ impl Window {
     /// 客户区（F-186 / F-189）。只有平台尚未写入过目标（headless / 快照 / 首帧前）时，
     /// `surface` 才跟随 `size × scale` 的 covering。
     pub fn set_size(&mut self, size: Size) {
+        // 同值短路：DPI 路径当轮已按新 DPI 写回逻辑尺寸，随后那条 `WM_SIZE` 会以同值再调
+        // 一次；不做早退就会多出一整帧布局 + 全量重绘（`set_surface` 一直是这么做的）。
+        if self.size() == size {
+            return;
+        }
         self.options.size = size;
         self.full_damage_pending = true;
         let root = self.tree.root();

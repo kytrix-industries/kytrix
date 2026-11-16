@@ -250,10 +250,10 @@ pub(crate) fn effective_actions(
     {
         actions.push(A11yAction::ScrollIntoView);
     }
-    // 声明了动作（`on_click` / `on_action`）的节点一定能被 AT 激活，与角色无关。
-    if tree
-        .interaction(node)
-        .is_some_and(|slot| slot.action.is_some())
+    // 能被 AT 激活的节点：**按实际派发语义**判断 —— `focus::action_target` 沿祖先链找
+    // `on_click`/`on_action`（指针点击、键盘 Enter、a11y on_click 都走它）。只查本节点会
+    // 漏掉「容器委托点击、子节点无 action」的常见结构，AT 因此失去 Invoke（第二轮复审 P2-4）。
+    if crate::interaction::focus::action_target(tree, node).is_some()
         && !actions.contains(&A11yAction::Click)
     {
         actions.push(A11yAction::Click);

@@ -177,7 +177,11 @@ pub struct A11yOverride {
     pub column_count: Option<usize>,
     /// 实时区域播报策略（`None` = 不表态，P2-6）。
     pub live: Option<A11yLive>,
-    /// 集合内位置与总数（1-based；`None` = 不表态）。
+    /// 集合内位置与总数（`None` = 不表态）。
+    ///
+    /// **遵循 AccessKit 语义：`pos_in_set` 是 0-based**（其文档明确 aria-posinset
+    /// 是 1-based、本属性是 0-based；Windows/AT-SPI 适配层自己 +1）。`size_of_set`
+    /// 应挂在集合**容器**上（consumer 只从祖先上读取）。
     ///
     /// 列表项 / 虚拟列表行用它表达「第 N 项，共 M 项」；表格行仍用 `row_index`。
     pub pos_in_set: Option<usize>,
@@ -238,7 +242,11 @@ pub struct A11yPatch {
     pub expanded: Option<bool>,
     /// 实时区域播报策略（`None` = 不表态）。
     pub live: Option<A11yLive>,
-    /// 集合内位置与总数（1-based；`None` = 不表态）。
+    /// 集合内位置与总数（`None` = 不表态）。
+    ///
+    /// **遵循 AccessKit 语义：`pos_in_set` 是 0-based**（其文档明确 aria-posinset
+    /// 是 1-based、本属性是 0-based；Windows/AT-SPI 适配层自己 +1）。`size_of_set`
+    /// 应挂在集合**容器**上（consumer 只从祖先上读取）。
     ///
     /// 列表项 / 虚拟列表行用它表达「第 N 项，共 M 项」；表格行仍用 `row_index`。
     pub pos_in_set: Option<usize>,
@@ -334,7 +342,11 @@ pub struct A11yNode {
     pub column_count: Option<usize>,
     /// 实时区域播报策略（`None` = 不表态，P2-6）。
     pub live: Option<A11yLive>,
-    /// 集合内位置与总数（1-based；`None` = 不表态）。
+    /// 集合内位置与总数（`None` = 不表态）。
+    ///
+    /// **遵循 AccessKit 语义：`pos_in_set` 是 0-based**（其文档明确 aria-posinset
+    /// 是 1-based、本属性是 0-based；Windows/AT-SPI 适配层自己 +1）。`size_of_set`
+    /// 应挂在集合**容器**上（consumer 只从祖先上读取）。
     ///
     /// 列表项 / 虚拟列表行用它表达「第 N 项，共 M 项」；表格行仍用 `row_index`。
     pub pos_in_set: Option<usize>,

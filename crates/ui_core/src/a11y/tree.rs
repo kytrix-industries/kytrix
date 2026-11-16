@@ -144,14 +144,21 @@ pub(crate) fn node_a11y(
             .or_else(|| over.and_then(|over| over.live)),
         // 虚拟列表行：引擎知道「第 N 项 / 共 M 项」，必须自动填 —— 否则应用得自己算，
         // 而 `VirtualSlot` 是内部状态（review P2-6：修复只做了字段管道，没接线）。
+        //
+        // **AccessKit 的 `pos_in_set` 是 0-based**（其文档明确：aria-posinset 是 1-based，
+        // 而本属性是 0-based；Windows/AT-SPI 适配层自己 +1）。此前写成 `index + 1` 会让 AT
+        // 播报「第 N+2 项」（第二轮复审 P2-1）。
         pos_in_set: patch
             .and_then(|patch| patch.pos_in_set)
             .or_else(|| over.and_then(|over| over.pos_in_set))
-            .or_else(|| virtual_set_position(tree, node).map(|(index, _)| index + 1)),
+            .or_else(|| virtual_set_position(tree, node).map(|(index, _)| index)),
+        // `size_of_set` 必须挂在**容器**上：AccessKit 的 consumer 只在祖先上查它
+        // （`size_of_set_from_container`），写在行上不会到达 AT；写在行上还会让嵌套虚拟列表
+        // 的内层行读到外层的 count。所以这里对「虚拟列表容器」节点填自己的条目总数。
         size_of_set: patch
             .and_then(|patch| patch.size_of_set)
             .or_else(|| over.and_then(|over| over.size_of_set))
-            .or_else(|| virtual_set_position(tree, node).map(|(_, count)| count)),
+            .or_else(|| tree.virtual_slot(node).map(|slot| slot.count)),
         numeric_value: patch
             .and_then(|patch| patch.numeric_value)
             .or_else(|| over.and_then(|over| over.numeric_value)),

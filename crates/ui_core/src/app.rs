@@ -1274,13 +1274,18 @@ impl App {
                 ScrollAxis::Vertical => (pending.y, max.y),
                 ScrollAxis::Horizontal => (pending.x, max.x),
             };
+            // 基准必须钳在**当前**可滚范围内：动画 `to` 不会随内容收缩 / 视口变大而重定向
+            // （`clamp_scroll_offsets` 只改 offset）。不钳的话 `before` 可能是越界值，
+            // `consumed = (before - after) / line_height` 会放大成十几行，把**反向**残量
+            // 传给外层容器（内层缩内容后向上滚一格，外层却往下滚；第二轮复审 P2-2）。
+            let before = before.clamp(0.0, limit);
             let after = (before - drives * slot.line_height).clamp(0.0, limit);
             let consumed = (before - after) / slot.line_height;
             if consumed == 0.0 {
                 continue;
             }
             let handle = ScrollHandle::new(window, node);
-            let mut target = pending;
+            let mut target = Point::new(0.0, 0.0);
             match slot.axis {
                 ScrollAxis::Vertical => target.y = after,
                 ScrollAxis::Horizontal => target.x = after,
@@ -1626,6 +1631,14 @@ impl App {
         let Some(slot) = target.tree_mut().scroll_slot_mut(node) else {
             return Err(EngineError::NotScrollable { node });
         };
+        // 非有限尺寸会让 `max_offset` 算出 NaN，之后每帧 `next == slot.offset` 恒 false
+        // ⇒ 永久请求帧（与 `line_height = 0` 同一机制；第二轮复审 P2-3）。入口处拒绝。
+        if ![content.width, content.height]
+            .iter()
+            .all(|value| value.is_finite())
+        {
+            return Err(EngineError::NotScrollable { node });
+        }
         slot.content = content;
         Ok(())
     }
@@ -1637,6 +1650,13 @@ impl App {
     /// # Errors
     /// `StaleNode`（节点已卸载）/ `NotScrollable`（不是滚动容器）。
     pub fn scroll_to(&mut self, handle: &ScrollHandle, offset: Point) -> Result<(), EngineError> {
+        // NaN/inf 偏移会在 `clamp` 后原样保留（`f32::clamp` 对 NaN 返回 NaN），随后
+        // `next == slot.offset` 恒 false ⇒ 每帧自请求重绘（第二轮复审 P2-3）。入口处拒绝。
+        if ![offset.x, offset.y].iter().all(|value| value.is_finite()) {
+            return Err(EngineError::NotScrollable {
+                node: handle.node(),
+            });
+        }
         let window = handle.window();
         let node = handle.node();
         let Some(target) = self.windows.get_mut(&window) else {
@@ -1847,6 +1867,8 @@ impl App {
         };
         slot.count = count;
         slot.builder = Some(Box::new(build));
+        // 条目总数是容器自身的 a11y 属性（`size_of_set`）：变了必须重发快照。
+        target.tree_mut().mark_a11y(node);
         self.rewindow_virtual(window, node);
         Ok(())
     }
@@ -5268,6 +5290,38 @@ mod interaction_tests {
     }
 
     /// P2-10：`line_height <= 0` 必须在 `make_scroll` 处拒绝，否则残量计算会写出 NaN。
+    /// 复审 P2-3：公开入口的 NaN 必须在 API 边界拒绝（否则 `clamp` 保留 NaN，
+    /// `next == slot.offset` 恒 false ⇒ 每帧自请求重绘）。
+    #[test]
+    fn non_finite_scroll_inputs_are_rejected() {
+        let (_rt, mut app, window) = setup();
+        let outer = mount_scroll_container(&mut app, window, 150.0);
+        frame(&mut app, window);
+        let handle = app
+            .make_scroll(
+                window,
+                outer,
+                ScrollConfig {
+                    axis: ScrollAxis::Vertical,
+                    line_height: 48.0,
+                },
+            )
+            .expect("scrollable");
+        assert!(app.scroll_to(&handle, Point::new(f32::NAN, 0.0)).is_err());
+        assert!(
+            app.scroll_to(&handle, Point::new(0.0, f32::INFINITY))
+                .is_err()
+        );
+        assert!(
+            app.set_scroll_content(&handle, crate::math::Size::new(f32::NAN, 100.0))
+                .is_err()
+        );
+        assert!(
+            app.set_scroll_content(&handle, crate::math::Size::new(100.0, f32::INFINITY))
+                .is_err()
+        );
+    }
+
     #[test]
     fn non_positive_line_height_is_rejected() {
         let (_rt, mut app, window) = setup();
@@ -6019,9 +6073,20 @@ mod interaction_tests {
                 .iter()
                 .find(|node| node.engine == row)
                 .expect("row 必须在快照里");
-            assert_eq!(node.pos_in_set, Some(index + 1), "1-based 位置");
-            assert_eq!(node.size_of_set, Some(100), "集合总数");
+            // AccessKit `pos_in_set` 是 0-based（适配层 +1）。
+            assert_eq!(node.pos_in_set, Some(index), "0-based 位置");
+            assert_eq!(node.size_of_set, None, "size 在容器上，不在行上");
+            // 经过 adapter 之后 AT 拿到的仍是 0-based（UIA/AT-SPI 自己 +1）。
+            let ak = crate::a11y::adapter::to_accesskit(node);
+            assert_eq!(ak.position_in_set(), Some(index));
         }
+        // 容器节点携带集合总数（consumer 只从祖先读取）。
+        let container_node = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.engine == container)
+            .expect("容器必须在快照里");
+        assert_eq!(container_node.size_of_set, Some(100), "集合总数在容器上");
     }
     #[test]
     fn virtual_list_mounts_the_visible_window_and_recycles() {
