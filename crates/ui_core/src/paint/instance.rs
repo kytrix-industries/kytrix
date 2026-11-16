@@ -148,7 +148,9 @@ pub(crate) enum FrameOp {
         index: u32,
         /// 编码时的 clip 链索引（0 = 无裁剪）。
         clip_index: u32,
-        /// 链交集 AABB（物理浮点）。
+        /// 链交集 AABB（物理浮点 `[x0, y0, x1, y1]`；后端的 `geometry_root`
+        /// 负责转成 GPU 的 `(x, y, w, h)`）。与 `Instances` 段的 `(x, y, w, h)`
+        /// **不同**：几何 shader 只读 `draw.clip` 与 clip mask，本字段是 CPU 侧契约。
         clip_rect: [u32; 4],
         /// 该几何的可见范围（同 `Instances::bounds`）。
         bounds: PhysicalBounds,
@@ -223,34 +225,22 @@ fn run_bounds(instances: &[GpuPrimitive]) -> PhysicalBounds {
     bounds
 }
 
-/// clip AABB（物理浮点 **`(x, y, w, h)`**，见 `clip_rect()` 与 contract §2）→ 整数可见范围；
-/// 非有限或空交集时退化成 [`PhysicalBounds::EMPTY`]（宁可少画不可错画）。
-///
-/// **必须按 xywh 解析**：早期实现把它当 `(x0, y0, x1, y1)`，于是右/下边界被当成 `w`/`h`
-/// —— 原点为正的 clip（`(100,50,800,600)`）算出的右边界是 800 而不是 900，damage 裁剪
-/// 会把落在 `(800,900]` 条带的 op 整条跳过，局部刷新留下旧像素。
-fn bounds_of_clip(clip_rect: [f32; 4]) -> PhysicalBounds {
-    if clip_rect.iter().any(|value| value.is_nan()) {
+/// clip **AABB**（`[x0, y0, x1, y1]`）→ 整数可见范围；语义与 [`bounds_of_clip`]（xywh）分开，
+/// 避免「存 AABB 却按 xywh 读」这类潜伏错误。
+fn bounds_of_aabb(aabb: [f32; 4]) -> PhysicalBounds {
+    if aabb.iter().any(|value| value.is_nan()) {
         return PhysicalBounds::EMPTY;
     }
-    // 无裁剪 ⇒ 无界（几何 op 的包围盒不该被哨兵清空）。
-    if is_unclipped(clip_rect) {
-        return PhysicalBounds {
-            x0: i32::MIN,
-            y0: i32::MIN,
-            x1: i32::MAX,
-            y1: i32::MAX,
-        };
-    }
-    let [x, y, w, h] = clip_rect;
-    if w < 0.0 || h < 0.0 {
+    let [x0, y0, x1, y1] = aabb;
+    if x1 < x0 || y1 < y0 {
         return PhysicalBounds::EMPTY;
     }
+    // 无裁剪的哨兵（`[MIN, MIN, MAX, MAX]`）经 `as i32` 饱和成全范围，正确。
     PhysicalBounds {
-        x0: (x.floor() as i32).saturating_sub(1),
-        y0: (y.floor() as i32).saturating_sub(1),
-        x1: ((x + w).ceil() as i32).saturating_add(1),
-        y1: ((y + h).ceil() as i32).saturating_add(1),
+        x0: (x0.floor() as i32).saturating_sub(1),
+        y0: (y0.floor() as i32).saturating_sub(1),
+        x1: (x1.ceil() as i32).saturating_add(1),
+        y1: (y1.ceil() as i32).saturating_add(1),
     }
 }
 
@@ -620,14 +610,14 @@ impl FrameEncoder<'_> {
                     color,
                     desc,
                 });
-                let (clip_index, clip_rect) = self.geometry_clip();
+                let (clip_index, clip_aabb) = self.geometry_clip();
                 self.buffer.ops.push(FrameOp::Geometry {
                     index,
                     clip_index,
-                    clip_rect: clip_rect.map(f32::to_bits),
+                    clip_rect: clip_aabb.map(f32::to_bits),
                     // 几何的可见范围就是它的 clip AABB（顶点在 shader 里变换，
                     // CPU 侧不知道精确包围盒 —— 用 clip 是保守的上界，不会漏画）。
-                    bounds: bounds_of_clip(clip_rect),
+                    bounds: bounds_of_aabb(clip_aabb),
                 });
             }
             Primitive::Geometry(draw) => {
@@ -640,14 +630,14 @@ impl FrameEncoder<'_> {
                     color,
                     desc,
                 });
-                let (clip_index, clip_rect) = self.geometry_clip();
+                let (clip_index, clip_aabb) = self.geometry_clip();
                 self.buffer.ops.push(FrameOp::Geometry {
                     index,
                     clip_index,
-                    clip_rect: clip_rect.map(f32::to_bits),
+                    clip_rect: clip_aabb.map(f32::to_bits),
                     // 几何的可见范围就是它的 clip AABB（顶点在 shader 里变换，
                     // CPU 侧不知道精确包围盒 —— 用 clip 是保守的上界，不会漏画）。
-                    bounds: bounds_of_clip(clip_rect),
+                    bounds: bounds_of_aabb(clip_aabb),
                 });
             }
             Primitive::Canvas(canvas) => {
@@ -755,8 +745,21 @@ impl FrameEncoder<'_> {
     }
 
     /// 几何绘制的 clip 前缀（`(clip_index, clip_rect)`）。
+    /// 当前 clip 链交集的 **AABB**（几何 op 的契约字段：后端 `geometry_root` 会转成 `(x,y,w,h)`）。
     fn geometry_clip(&self) -> (u32, [f32; 4]) {
-        (self.current_chain().0, self.clip_rect())
+        (self.current_chain().0, self.clip_aabb())
+    }
+    /// 当前 clip 链交集，**AABB** 形式 `[x0, y0, x1, y1]`（无裁剪 = 以 `MIN/MAX` 表示的无界）。
+    ///
+    /// 与 `clip_rect()` 的区别只是表示法：实例走 GPU 契约的 `(x, y, w, h)`，几何 op 走后端
+    /// `geometry_root` 期望的 AABB。两者不能再混用（复审 P2-1：旧实现存了 xywh 却被按 AABB
+    /// 再转一次，正原点 clip 会被算成 `(x, y, w-x, h-y)`）。
+    fn clip_aabb(&self) -> [f32; 4] {
+        let chain = self.current_chain();
+        if chain == ClipChainId::NONE {
+            return [f32::MIN, f32::MIN, f32::MAX, f32::MAX];
+        }
+        self.chain_aabb(chain)
     }
 
     /// 当前 clip 链交集，按 GPU 契约写成 `(x, y, w, h)`（`contract.md` §2 / `quad.vert.glsl`
@@ -1064,10 +1067,10 @@ mod tests {
             extent[2] >= 900 && extent[3] >= 650,
             "clip 范围必须覆盖 x+w / y+h：{extent:?}"
         );
-        let bounds = super::bounds_of_clip(primitive.clip_rect);
+        let bounds = super::bounds_of_aabb([100.0, 50.0, 900.0, 650.0]);
         assert!(
             bounds.x1 >= 900 && bounds.y1 >= 650,
-            "bounds_of_clip 同样按 xywh：{bounds:?}"
+            "bounds_of_aabb 必须覆盖整段 AABB：{bounds:?}"
         );
     }
     #[test]
@@ -1328,6 +1331,48 @@ mod tests {
         );
         assert_eq!(buffer.instances[0].params1[0], 1.0);
         assert_eq!(buffer.clips.len(), 2, "哨兵 + 一条去重后的链");
+    }
+
+    /// P2-1：几何 op 的 `clip_rect` 存的是 **AABB**（后端 `geometry_root` 会转成 xywh）。
+    ///
+    /// 旧实现存 xywh 却被按 AABB 再转一次：正原点 clip 会被算成 `(x, y, w-x, h-y)`。
+    #[test]
+    fn geometry_op_stores_clip_aabb() {
+        let geometry = GeometryId::for_test(0, 1);
+        let mut scene = Scene::empty();
+        let lane = scene.new_lane();
+        assert!(scene.push(
+            lane,
+            Primitive::Clip(ClipOp::Push(ClipRect {
+                rect: rect(100.0, 50.0, 800.0, 600.0),
+                corner_radius: [0.0; 4],
+            }))
+        ));
+        assert!(scene.push(
+            lane,
+            Primitive::Geometry(GeometryDraw {
+                id: geometry,
+                transform: Transform::IDENTITY,
+                color: crate::paint::color::Color::WHITE,
+            }),
+        ));
+        assert!(scene.push(lane, Primitive::Clip(ClipOp::Pop)));
+        scene.set_order(&[lane]);
+        let buffer = encode(&scene);
+        let Some(super::FrameOp::Geometry { clip_rect, .. }) = buffer
+            .ops
+            .iter()
+            .find(|op| matches!(op, super::FrameOp::Geometry { .. }))
+            .copied()
+        else {
+            panic!("必须有 geometry op")
+        };
+        let aabb = clip_rect.map(f32::from_bits);
+        assert_eq!(
+            aabb,
+            [200.0, 100.0, 1800.0, 1300.0],
+            "geometry op 必须存物理 AABB (x0, y0, x1, y1)（逻辑 × scale）"
+        );
     }
 
     #[test]
