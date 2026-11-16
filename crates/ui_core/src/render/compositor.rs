@@ -195,7 +195,8 @@ impl FramePlan {
     ///
     /// **消费方**：D3D12 用它同时派生 `Present1` 的 dirty rect 与 copy 范围（`fresh` ⇒ 全量
     /// copy 的规则在 Windows 后端的 `copy_plan` 里），Vulkan 用它生成
-    /// `VK_KHR_incremental_present` 的 region hint；Metal 不消费（无对应扩展，F-121）。
+    /// `VK_KHR_incremental_present` 的 region hint，Metal 用它决定「这张 drawable 相对 persist
+    /// 还差哪些矩形」（`render/macos/compositor.rs` 的 `DrawableSyncs`，P2-6）。
     /// 任何后端都**不得**把它当作「必须跳过的像素」：present 目标跨帧内容在 Metal/Vulkan 上
     /// 没有保证，draw/persist 侧仍按 `plan()` 的 scissor 处理。
     pub(crate) fn present_dirty(self) -> Option<DamageRects> {
@@ -220,8 +221,7 @@ impl FramePlan {
     /// `fresh` 是否仍然成立：`true` = 交换链刚建好，第一次 present 之前 back buffer 的内容未定义。
     ///
     /// 消费方：D3D12 后端的 `copy_to_back`（fresh ⇒ 整块 buffer，否则只拷内容子矩形）与
-    /// `swapchain` 的首帧 present 规则。macOS / Linux 的 present 目标跨帧内容无保证、每帧整面
-    /// 写入，不需要这个判据。
+    /// `swapchain` 的首帧 present 规则；Metal 后端的 drawable 同步表（fresh ⇒ 强制整面拷贝）。
     #[cfg(any(windows, test))]
     pub(crate) fn is_fresh(self) -> bool {
         self.fresh

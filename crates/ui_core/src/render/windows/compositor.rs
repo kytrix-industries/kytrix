@@ -1626,9 +1626,9 @@ fn draw_ops(
 
 /// copy 到 back buffer 的范围：`fresh`（交换链刚建好）时强制整块 buffer。
 ///
-/// 只有 D3D12 后端需要这个规则（F-121：Metal / Vulkan 的 present 目标跨帧内容无保证，两平台
-/// 每帧整面写入）。`present_dirty() == None` 恰好同时覆盖 `fresh` 与 `Plan::Full`；`Idle` 必须
-/// 单独先判，否则会被当成全量。
+/// 只有 D3D12 后端需要这个规则（F-121：Vulkan 的 present 目标跨帧内容无保证，每帧整面写入；
+/// Metal 自 P2-6 起按 drawable 追踪落后区域，但 `fresh` 同样强制整面）。`present_dirty() == None`
+/// 恰好同时覆盖 `fresh` 与 `Plan::Full`；`Idle` 必须单独先判，否则会被当成全量。
 fn copy_plan(frame: FramePlan) -> Plan {
     if frame.is_idle() {
         return Plan::Idle;

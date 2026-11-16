@@ -33,8 +33,8 @@
 //!
 //! 关窗握手（§6.7）：UI 线程**不能**直接 `join` —— DXGI 的 `Present` 可能同步 `SendMessage`
 //! 到窗口的消息泵线程，直接 join 会和「消息泵停转」互等。`Drop` 用 `MsgWaitForMultipleObjects`
-//! 边泵消息边等 GPU 线程句柄，**没有超时**（无限等到线程退出；只有 `WAIT_FAILED` 这类异常才
-//! 记录并放弃）。
+//! 边泵消息边等 GPU 线程句柄：常规路径下线程很快退出，但驱动挂死时**有界放弃**（累计 10 s
+//! 后 detach 并记录诊断），窗口关闭/应用退出不会永久卡住。
 
 use std::{
     collections::VecDeque,
