@@ -1063,7 +1063,12 @@ fn draw_ops(
                         ROOT_UNIFORM_BYTES,
                         2,
                     );
-                    encoder.setFragmentBuffer_offset_atIndex(Some(entry.index()), 0, 1);
+                    // **不要**在这里绑 fragment buffer 1：那个槽是 `bind()` 绑的 clips 表，
+                    // `geometry.metal` 的三个 fragment 入口都声明
+                    // `device const ClipEntry* clips [[buffer(1)]]`。索引缓冲只通过
+                    // `drawIndexedPrimitives` 的参数消费，不需要 `setFragmentBuffer`——
+                    // 误绑会让本帧之后所有带 clip 的绘制从索引缓冲里读 `ClipEntry`（越界读
+                    // + clip 掩码全乱）。
                     encoder
                         .drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset(
                             metal_topology(entry.topology()),

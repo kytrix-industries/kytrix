@@ -223,17 +223,34 @@ fn run_bounds(instances: &[GpuPrimitive]) -> PhysicalBounds {
     bounds
 }
 
-/// clip AABB（物理浮点 `[x0, y0, x1, y1]`）→ 整数可见范围；非有限时退化成 [`PhysicalBounds::EMPTY`]
-/// （宁可少画不可错画 —— 非有限 clip 本身就是异常，`self_check` 已单独断言它有限）。
+/// clip AABB（物理浮点 **`(x, y, w, h)`**，见 `clip_rect()` 与 contract §2）→ 整数可见范围；
+/// 非有限或空交集时退化成 [`PhysicalBounds::EMPTY`]（宁可少画不可错画）。
+///
+/// **必须按 xywh 解析**：早期实现把它当 `(x0, y0, x1, y1)`，于是右/下边界被当成 `w`/`h`
+/// —— 原点为正的 clip（`(100,50,800,600)`）算出的右边界是 800 而不是 900，damage 裁剪
+/// 会把落在 `(800,900]` 条带的 op 整条跳过，局部刷新留下旧像素。
 fn bounds_of_clip(clip_rect: [f32; 4]) -> PhysicalBounds {
-    if !clip_rect.iter().all(|value| value.is_finite()) {
+    if clip_rect.iter().any(|value| value.is_nan()) {
+        return PhysicalBounds::EMPTY;
+    }
+    // 无裁剪 ⇒ 无界（几何 op 的包围盒不该被哨兵清空）。
+    if is_unclipped(clip_rect) {
+        return PhysicalBounds {
+            x0: i32::MIN,
+            y0: i32::MIN,
+            x1: i32::MAX,
+            y1: i32::MAX,
+        };
+    }
+    let [x, y, w, h] = clip_rect;
+    if w < 0.0 || h < 0.0 {
         return PhysicalBounds::EMPTY;
     }
     PhysicalBounds {
-        x0: (clip_rect[0].floor() as i32).saturating_sub(1),
-        y0: (clip_rect[1].floor() as i32).saturating_sub(1),
-        x1: (clip_rect[2].ceil() as i32).saturating_add(1),
-        y1: (clip_rect[3].ceil() as i32).saturating_add(1),
+        x0: (x.floor() as i32).saturating_sub(1),
+        y0: (y.floor() as i32).saturating_sub(1),
+        x1: ((x + w).ceil() as i32).saturating_add(1),
+        y1: ((y + h).ceil() as i32).saturating_add(1),
     }
 }
 
@@ -247,18 +264,38 @@ fn instance_extent(primitive: &GpuPrimitive) -> Option<[i32; 4]> {
     extent_of(x, y, w, h, pad)
 }
 
-/// clip AABB 的整数范围（`clip_rect` 是 `[x0, y0, x1, y1]`）。
+/// `clip_rect()` 表示「无裁剪」的哨兵：`[f32::MIN, f32::MIN, f32::MAX, f32::MAX]`。
+///
+/// 注意它按 `(x, y, w, h)` 解析时 `w`/`h` 都是约 6.8e38（`MAX - MIN`），既不是 inf、
+/// 也不是合法的宽高 —— 必须先识别哨兵，否则会算成「空交集」把整条 op 的包围盒清空，
+/// 于是 damage 裁剪认为它不值得画（静默漏画）。
+fn is_unclipped(clip_rect: [f32; 4]) -> bool {
+    clip_rect[2] >= 1.0e30 && clip_rect[3] >= 1.0e30
+}
+
+/// clip 的整数范围（**`clip_rect` 是 `(x, y, w, h)`**，见 `clip_rect()` 与 contract §2）。
+///
+/// 旧实现把它当 `(x0, y0, x1, y1)` 读，原点为正的 clip 会把 op 包围盒的右/下边界算小，
+/// `draw_ops` 的 damage 裁剪因此漏画（三平台共通的静默缺陷）。
 fn clip_extent(primitive: &GpuPrimitive) -> Option<[i32; 4]> {
-    let [x0, y0, x1, y1] = primitive.clip_rect;
-    let finite = [x0, y0, x1, y1].iter().all(|value| value.is_finite());
-    if !finite {
+    let clip_rect = primitive.clip_rect;
+    if clip_rect.iter().any(|value| value.is_nan()) {
+        return None;
+    }
+    // 无裁剪 ⇒ 无界（与实例范围求交时是恒等，不会缩小包围盒）。
+    if is_unclipped(clip_rect) {
+        return Some([i32::MIN, i32::MIN, i32::MAX, i32::MAX]);
+    }
+    let [x, y, w, h] = clip_rect;
+    if w < 0.0 || h < 0.0 {
+        // 空交集：它对像素没有贡献。
         return None;
     }
     Some([
-        x0.floor() as i32,
-        y0.floor() as i32,
-        x1.ceil() as i32,
-        y1.ceil() as i32,
+        x.floor() as i32,
+        y.floor() as i32,
+        ((x + w).ceil() as i32).saturating_add(1),
+        ((y + h).ceil() as i32).saturating_add(1),
     ])
 }
 
@@ -995,6 +1032,44 @@ mod tests {
         assert_eq!(instance.color1, [0.0; 4]);
     }
 
+    /// P1 回归：clip 的整数范围必须按 `(x, y, w, h)` 解析。
+    ///
+    /// 从内部 AABB 转换到 GPU 契约时写的是 `(x, y, x1-x, y1-y)`；把第三/四分量当右/下
+    /// 边界会让原点为正的 clip 包围盒算小，damage 裁剪成片漏画（三平台共通）。
+    #[test]
+    fn clip_extent_reads_xywh_not_aabb() {
+        let mut canvas = crate::paint::canvas::Canvas::new(rect(0.0, 0.0, 2000.0, 2000.0));
+        assert!(canvas.push_clip(ClipRect {
+            rect: rect(100.0, 50.0, 800.0, 600.0),
+            corner_radius: [0.0; 4],
+        }));
+        canvas.push_quad(Quad {
+            bounds: rect(0.0, 0.0, 2000.0, 2000.0),
+            corner_radius: [0.0; 4],
+            paint: solid(),
+        });
+        assert!(canvas.pop_clip());
+        let scene = scene_with(|scene, lane| {
+            assert!(scene.push(lane, Primitive::Canvas(Rc::new(canvas))));
+        });
+        let buffer = encode(&scene);
+        let primitive = buffer
+            .instances
+            .iter()
+            .find(|primitive| primitive.clip_rect[0] > 0.0)
+            .expect("被裁剪的 quad");
+        let extent = super::clip_extent(primitive).expect("有限 clip");
+        // xywh ⇒ 右边界 = 100+800、下边界 = 50+600（AABB 误读会得到 800 / 600）。
+        assert!(
+            extent[2] >= 900 && extent[3] >= 650,
+            "clip 范围必须覆盖 x+w / y+h：{extent:?}"
+        );
+        let bounds = super::bounds_of_clip(primitive.clip_rect);
+        assert!(
+            bounds.x1 >= 900 && bounds.y1 >= 650,
+            "bounds_of_clip 同样按 xywh：{bounds:?}"
+        );
+    }
     #[test]
     fn negative_origin_clip_encodes_xywh() {
         // 回归：clip_rect 必须按 contract.md / quad.vert.glsl 的 `(x, y, w, h)` 写，
