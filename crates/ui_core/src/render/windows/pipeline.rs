@@ -10,7 +10,14 @@
 //! - 窗口段：`[instances, clips]` per in-flight 槽，每窗口 `SLOT_COUNT × SLOT_SRVS` 个描述符，
 //!   由 [`DescriptorArena`] 动态分配（[`crate::render::windows::device::DescriptorLease`] 持有，
 //!   `Renderer` 销毁时归还）。实例 / 裁剪上传缓冲是每窗口对象（`UploadArena`），所以 SRV 也
-//!   必须每窗口一份；窗口只写自己的描述符区间，互不加锁。
+//!   必须每窗口一份；窗口只写自己的描述符区间，**互不加锁**。
+//!
+//! 「不加锁」有规范依据，不是遗漏：D3D12 Resource Binding 功能规范 *Creating Descriptors*
+//! 一节明确写着「**All methods for creating descriptors are free threaded**」
+//! （<https://microsoft.github.io/DirectX-Specs/d3d/ResourceBinding.html>），各窗口写入的是
+//! **不相交**的描述符区间，因此并发 `CreateShaderResourceView` 合法。Linux/Vulkan 那边必须
+//! 加锁是因为 `vkUpdateDescriptorSets` 规范要求**外部同步** —— 两平台做法不同是各自 API 的要求，
+//! 不是不对称缺陷。
 //!
 //! 根签名因此有两张描述符表（同一张堆的两个区间）：`t0..t1`（窗口槽段）与 `t2..t3`（图集固定段）。
 //! shader 的寄存器绑定不变（`common.hlsl`：`instances` t0 / `clips` t1 / `glyph_atlas` t2 /
