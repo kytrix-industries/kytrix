@@ -467,6 +467,12 @@ pub struct NodeTree {
     debug_ids: Vec<Option<SmolStr>>,
     /// 每节点最近一次重建 lane 时的 clip 上下文（`(depth, covering)`；P06 §5.6 的 B1 守卫）。
     clip_keys: Vec<Option<(u8, Option<PhysicalRect>)>>,
+    /// 每节点**子树包围盒**（绝对坐标；自身 + 全部后代的 layout.bounds 并集）。
+    ///
+    /// 命中测试的唯一安全子树剪枝依据（P2-2）。单看节点自己的布局盒不行：出流 / 溢出
+    /// 子节点可以落在父盒之外（B2），按父盒剪枝会漏命中。这里是并集，只会偏大不会偏小。
+    /// 每次 bsolutize 末尾自底向上重算（O(N)，与布局同阶）。
+    subtree_bounds: Vec<Rect>,
     /// a11y 载荷旁表（`NodeBuilder::{a11y,bind_a11y}`；按 arena 槽位，槽位复用不继承）。
     ///
     /// 与 `layout_cache` / `clip_keys` 同型：`Node` 因此保持 1144 B（P11 F-114）。
@@ -587,6 +593,7 @@ impl NodeTree {
             text_slots: vec![None],
             debug_ids: vec![None],
             clip_keys: vec![None],
+            subtree_bounds: vec![Rect::default()],
             a11y_slots: vec![None],
             a11y_dirty: 1,
             text_dirty: Vec::new(),
@@ -839,6 +846,11 @@ impl NodeTree {
             self.clip_keys.resize_with(index + 1, || None);
         }
         self.clip_keys[index] = None;
+        if self.subtree_bounds.len() <= index {
+            self.subtree_bounds.resize_with(index + 1, Rect::default);
+        }
+        // 新节点还没有布局盒：子树包围盒先清空，bsolutize 会重算。
+        self.subtree_bounds[index] = Rect::default();
         // a11y 载荷同生命周期：槽位复用不得继承上一代节点的声明/补丁（P11 F-114）。
         if self.a11y_slots.len() <= index {
             self.a11y_slots.resize_with(index + 1, || None);
@@ -1922,6 +1934,54 @@ impl NodeTree {
     pub(crate) fn absolutize(&mut self) {
         let epoch = self.layout_epoch;
         self.place_subtree(self.root, Point::ZERO, epoch, true, false);
+        self.recompute_subtree_bounds();
+    }
+
+    /// 自底向上重算每节点的子树包围盒（绝对坐标并集）。
+    ///
+    /// 迭代式后序遍历（显式栈）：树的深度由应用决定，递归可能爆栈。
+    fn recompute_subtree_bounds(&mut self) {
+        let root = self.root;
+        let mut stack: Vec<(NodeId, bool)> = vec![(root, false)];
+        while let Some((node, visited)) = stack.pop() {
+            let Some(target) = self.arena.get(node) else {
+                continue;
+            };
+            if !visited {
+                stack.push((node, true));
+                for child in target.children().iter().rev() {
+                    stack.push((*child, false));
+                }
+                continue;
+            }
+            let mut union = self
+                .arena
+                .get(node)
+                .map_or(Rect::default(), |target| target.layout.bounds);
+            let children = self.arena.get(node).map(|target| target.children());
+            for child in children.unwrap_or_default() {
+                let index = child.index() as usize;
+                if let Some(bounds) = self.subtree_bounds.get(index) {
+                    union = union.union(*bounds);
+                }
+            }
+            let index = node.index() as usize;
+            if self.subtree_bounds.len() <= index {
+                self.subtree_bounds.resize_with(index + 1, Rect::default);
+            }
+            self.subtree_bounds[index] = union;
+        }
+    }
+
+    /// 子树包围盒（绝对坐标；自身 + 后代布局盒的并集）。未布局时返回 `Rect::default()`。
+    ///
+    /// 命中测试用它做**唯一**安全的子树剪枝（P2-2）：节点自己的布局盒不能代表子树，
+    /// 出流 / 溢出后代可以落在父盒之外。
+    pub(crate) fn subtree_bounds(&self, node: NodeId) -> Rect {
+        self.subtree_bounds
+            .get(node.index() as usize)
+            .copied()
+            .unwrap_or_default()
     }
 
     fn place_subtree(

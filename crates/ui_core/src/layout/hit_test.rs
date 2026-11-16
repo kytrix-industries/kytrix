@@ -133,21 +133,14 @@ fn pick(
                 .map_or(Point::ZERO, |slot| slot.offset);
         // 子节点逆序：最后一个子节点绘制在最上层，因此先测。
         for child in slot.children().iter().rev() {
-            let Ok(child_node) = tree.get(*child) else {
+            if tree.get(*child).is_err() {
                 continue;
-            };
-            // B2：布局盒**不能**作为子树的剪枝依据（出流/溢出子节点可落在父盒之外）。
-            // 唯一安全的子树剪枝是「本节点 `Clip::Bounds` 且点在 padding box 外」，由 `pick`
-            // 内部的 `clipped` 处理（它仍然允许命中该节点自己的 border 带）。
-            // 这里只跳过「叶子 + 盒外」这种零代价的明显不可能项。
-            let leaf = child_node.children().is_empty();
-            if leaf
-                && !child_node
-                    .layout()
-                    .bounds
-                    .translate(negate(child_offset))
-                    .contains(point)
-            {
+            }
+            // 子树剪枝（P2-2）：用**子树包围盒**（自身 + 全部后代布局盒的并集）判断整棵
+            // 子树是否可能被命中。只看节点自己的布局盒不行 —— 出流 / 溢出子节点可以落在
+            // 父盒之外（B2），按父盒剪枝会漏命中；并集只会偏大，绝不偏小。
+            let subtree = tree.subtree_bounds(*child).translate(negate(child_offset));
+            if !subtree.contains(point) {
                 continue;
             }
             if let Some(hit) = pick(tree, *child, point, child_offset, chain) {
@@ -639,6 +632,52 @@ mod tests {
             hit_node(&tree, 160.0, 25.0),
             Some(root),
             "有 clip 的父把溢出子节点裁掉"
+        );
+    }
+
+    /// P2-2：子树包围盒必须包含**溢出**后代（命中测试的唯一安全剪枝依据）。
+    ///
+    /// 只看节点自己的布局盒会漏命中出流 / 溢出子节点（B2）；并集偏大但绝不偏小。
+    #[test]
+    fn subtree_bounds_cover_overflowing_descendants() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let parent = add(&mut tree, root, fixed(100.0, 100.0));
+        let mut abs = taffy::Style::<smol_str::SmolStr>::DEFAULT;
+        abs.position = taffy::style::Position::Absolute;
+        abs.inset = taffy::geometry::Rect {
+            left: taffy::style::LengthPercentageAuto::length(150.0),
+            right: taffy::style::LengthPercentageAuto::auto(),
+            top: taffy::style::LengthPercentageAuto::length(10.0),
+            bottom: taffy::style::LengthPercentageAuto::auto(),
+        };
+        abs.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::length(30.0),
+            height: taffy::style::Dimension::length(30.0),
+        };
+        let overflow = add(
+            &mut tree,
+            parent,
+            Style {
+                inner: abs,
+                clip: Clip::None,
+            },
+        );
+        layout(&mut tree);
+
+        let bounds = tree.subtree_bounds(parent);
+        assert!(
+            bounds.contains(Point::new(160.0, 25.0)),
+            "子树包围盒必须覆盖父盒之外的溢出子节点：{bounds:?}"
+        );
+        assert!(
+            bounds.contains(tree.get(parent).expect("存在").layout().bounds.origin),
+            "也必须覆盖自身布局盒：{bounds:?}"
+        );
+        assert_eq!(
+            tree.subtree_bounds(overflow),
+            tree.get(overflow).expect("存在").layout().bounds,
+            "叶子节点的子树包围盒就是它自己的布局盒"
         );
     }
 
