@@ -1,13 +1,13 @@
 //! 读回：persist（`*_SRGB` image）→ host-visible buffer → map（`design/phase-12-macos-linux.md` §6.7）。
 //!
 //! 字节语义与 D3D12 / Metal 同契约：存储字节是 **sRGB 编码后的预乘值**，读回后只做 BGRA→RGBA 交换。
-//! 仅测试 / `test-support` 构建存在。
+//! 仅测试 / `test-support` 构建存在；缓冲是本窗口独占的（共享设备只提供 `VkDevice` / 内存类型）。
 
 use ash::vk;
 
 use crate::{
     error::EngineError,
-    render::linux::device::{Device, init_error},
+    render::linux::device::{SharedGpu, init_error},
 };
 
 /// 读回的一帧像素（RGBA8，预乘，sRGB 编码字节）。
@@ -19,7 +19,7 @@ pub(crate) struct ReadbackImage {
 
 /// 复用的 host-visible buffer。
 pub(crate) struct Readback {
-    /// 第一次 `capture` 时填（在此之前没有任何 Vulkan 句柄）。
+    /// 第一次 `record` 时填（在此之前没有任何 Vulkan 句柄）。
     device: Option<ash::Device>,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -37,19 +37,19 @@ impl Readback {
     }
 
     /// 把 image 拷进 host-visible buffer 并读回（调用方保证 image 处于
-    /// `COLOR_ATTACHMENT_OPTIMAL`，且命令缓冲在 `capture` 之后立即提交 + 等待）。
-    /// 只**录制** barrier + `cmd_copy_image_to_buffer`；映射必须在提交并 `queue_wait_idle`
+    /// `COLOR_ATTACHMENT_OPTIMAL`，且命令缓冲在之后立即提交 + 等待）。
+    /// 只**录制** barrier + `cmd_copy_image_to_buffer`；映射必须在提交并等到 fence
     /// 之后由 [`Readback::fetch`] 做（否则读到的是提交前的旧内容）。
     pub(crate) fn record(
         &mut self,
-        device: &Device,
+        shared: &SharedGpu,
         command: vk::CommandBuffer,
         image: vk::Image,
         size: (u32, u32),
     ) -> Result<(), EngineError> {
         let bytes = u64::from(size.0) * u64::from(size.1) * 4;
         if self.capacity < bytes || self.buffer == vk::Buffer::null() {
-            self.allocate(device, bytes)?;
+            self.allocate(shared, bytes)?;
         }
 
         let range = vk::ImageSubresourceRange::default()
@@ -65,7 +65,7 @@ impl Readback {
             .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
         // SAFETY: barrier / copy 的目标都是调用方持有的资源；范围在 image 边界内。
         unsafe {
-            device.raw().cmd_pipeline_barrier(
+            shared.raw().cmd_pipeline_barrier(
                 command,
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::PipelineStageFlags::TRANSFER,
@@ -74,7 +74,7 @@ impl Readback {
                 &[],
                 &[to_src],
             );
-            device.raw().cmd_copy_image_to_buffer(
+            shared.raw().cmd_copy_image_to_buffer(
                 command,
                 image,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
@@ -98,7 +98,7 @@ impl Readback {
                 .subresource_range(range)
                 .src_access_mask(vk::AccessFlags::TRANSFER_READ)
                 .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
-            device.raw().cmd_pipeline_barrier(
+            shared.raw().cmd_pipeline_barrier(
                 command,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
@@ -112,24 +112,22 @@ impl Readback {
         Ok(())
     }
 
-    /// 提交并等待队列空闲之后的读取（map → 拷贝 → BGRA→RGBA 交换）。
-    pub(crate) fn fetch(
-        &mut self,
-        device: &Device,
-        size: (u32, u32),
-    ) -> Result<ReadbackImage, EngineError> {
+    /// 提交并等待之后的读取（map → 拷贝 → BGRA→RGBA 交换）。
+    pub(crate) fn fetch(&mut self, size: (u32, u32)) -> Result<ReadbackImage, EngineError> {
         let bytes = u64::from(size.0) * u64::from(size.1) * 4;
+        let Some(device) = self.device.as_ref() else {
+            return Err(init_error("readback", "buffer is not allocated"));
+        };
         let mut rgba8 = vec![0u8; bytes as usize];
         // SAFETY: buffer 至少 `bytes`（`record` 已按需扩容）；映射范围在分配内。
         unsafe {
             let pointer = device
-                .raw()
                 .map_memory(self.memory, 0, bytes, vk::MemoryMapFlags::empty())
                 .map_err(|error| init_error("map_memory(readback)", format!("{error:?}")))?;
             std::ptr::copy_nonoverlapping(pointer.cast::<u8>(), rgba8.as_mut_ptr(), bytes as usize);
-            device.raw().unmap_memory(self.memory);
+            device.unmap_memory(self.memory);
         }
-        // 目标格式是 B8G8R8A8（或 R8G8B8A8）：统一换成交给 `SnapshotImage` 的 RGBA8。
+        // 目标格式是 B8G8R8A8（persist 的固定格式）：统一换成交给 `SnapshotImage` 的 RGBA8。
         for pixel in rgba8.as_chunks_mut::<4>().0 {
             pixel.swap(0, 2);
         }
@@ -140,11 +138,11 @@ impl Readback {
         })
     }
 
-    fn allocate(&mut self, device: &Device, bytes: u64) -> Result<(), EngineError> {
+    fn allocate(&mut self, shared: &SharedGpu, bytes: u64) -> Result<(), EngineError> {
         self.release();
         // SAFETY: 句柄归本结构独占；失败时由 `release` 兜底。
         unsafe {
-            self.buffer = device
+            self.buffer = shared
                 .raw()
                 .create_buffer(
                     &vk::BufferCreateInfo::default()
@@ -154,14 +152,14 @@ impl Readback {
                     None,
                 )
                 .map_err(|error| init_error("create_buffer(readback)", format!("{error:?}")))?;
-            let requirements = device.raw().get_buffer_memory_requirements(self.buffer);
-            let memory_type = device
+            let requirements = shared.raw().get_buffer_memory_requirements(self.buffer);
+            let memory_type = shared
                 .memory_type(
                     requirements.memory_type_bits,
                     vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
                 )
                 .ok_or_else(|| init_error("readback memory", "no host-visible memory type"))?;
-            self.memory = device
+            self.memory = shared
                 .raw()
                 .allocate_memory(
                     &vk::MemoryAllocateInfo::default()
@@ -170,14 +168,14 @@ impl Readback {
                     None,
                 )
                 .map_err(|error| init_error("allocate_memory(readback)", format!("{error:?}")))?;
-            device
+            shared
                 .raw()
                 .bind_buffer_memory(self.buffer, self.memory, 0)
                 .map_err(|error| {
                     init_error("bind_buffer_memory(readback)", format!("{error:?}"))
                 })?;
         }
-        self.device = Some(device.raw().clone());
+        self.device = Some(shared.raw().clone());
         self.capacity = bytes;
         Ok(())
     }

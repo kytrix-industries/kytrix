@@ -1,4 +1,9 @@
-//! `VkInstance` + `VK_KHR_wayland_surface`（`design/phase-12-macos-linux.md` §6.1）。
+//! 进程级 `VkInstance` + `VK_KHR_wayland_surface`（`design/phase-12-macos-linux.md` §6.1）。
+//!
+//! 实例是**进程级共享**的（P1-2.9）：多窗口只建一个 `VkInstance`，每个窗口用
+//! [`VulkanInstance::create_surface`] 建自己的 `VkSurfaceKHR`（surface 的存活期 = 窗口，
+//! 由 `swapchain::Surface` 在窗口 drop 时销毁）。实例本身由 `device::SharedGpu` 持有，
+//! 最后一个窗口关闭、`SharedGpu` 引用计数归零时才销毁 —— 因此 surface 必然先于 instance 销毁。
 //!
 //! `display` / `surface` 是 **`wl_display*` / `wl_surface*`**（由 `platform/linux` 提供；
 //! 平台层因此必须启用 `wayland-client` 的 `system` feature —— 纯 Rust 后端的对象指针是令牌，
@@ -14,25 +19,21 @@ use crate::error::EngineError;
 /// 实例级必需的扩展。
 const REQUIRED_EXTENSIONS: [&CStr; 2] = [ash::khr::surface::NAME, ash::khr::wayland_surface::NAME];
 
-/// 实例 + Wayland surface。
+/// 进程级实例 + 每窗口 surface 的创建入口。
 pub(crate) struct VulkanInstance {
     /// 只为保活（实例创建之后 loader 入口仍须有效）。
     _entry: Entry,
     raw: Instance,
-    /// 离屏（快照）实例没有 surface：`null` 句柄，`surface_fn` / `_wayland_fn` 也不存在。
-    surface: ash::vk::SurfaceKHR,
+    /// 产品路径才有 WSI 函数表；离屏实例（快照 / 单测）没有 surface。
     surface_fn: Option<ash::khr::surface::Instance>,
-    /// 只为保活（surface 已创建；销毁走 `surface_fn`）。
-    _wayland_fn: Option<ash::khr::wayland_surface::Instance>,
+    /// 只为保活（surface 由本实例创建，销毁走 `surface_fn`）。
+    wayland_fn: Option<ash::khr::wayland_surface::Instance>,
 }
 
 impl VulkanInstance {
-    /// 建实例与 surface（`display` / `surface` 的生命周期由调用方保证覆盖整个渲染器）。
-    pub(crate) fn new(
-        display: *mut std::ffi::c_void,
-        surface: *mut std::ffi::c_void,
-    ) -> Result<Self, EngineError> {
-        // SAFETY: `Entry::load` 只加载 `libvulkan.so.1`（不碰传入指针）。
+    /// 产品路径的进程级实例：启用 `VK_KHR_surface` + `VK_KHR_wayland_surface`。
+    pub(crate) fn new_product() -> Result<Self, EngineError> {
+        // SAFETY: `Entry::load` 只加载 `libvulkan.so.1`。
         let entry =
             unsafe { Entry::load() }.map_err(|error| init_error("libvulkan", error.to_string()))?;
 
@@ -76,24 +77,11 @@ impl VulkanInstance {
         // SAFETY: `create` 的指针都在本次调用期间有效；没有 `pNext` 链。
         let raw = unsafe { entry.create_instance(&create, None) }
             .map_err(|error| init_error("create_instance", format!("{error:?}")))?;
-
-        let wayland_fn = ash::khr::wayland_surface::Instance::new(&entry, &raw);
-        let surface_fn = ash::khr::surface::Instance::new(&entry, &raw);
-        let surface_create = ash::vk::WaylandSurfaceCreateInfoKHR::default()
-            .display(display)
-            .surface(surface);
-        // SAFETY: 指针来自平台层的 `wl_display` / `wl_surface`（system backend 的真实对象）。
-        let surface = unsafe { wayland_fn.create_wayland_surface(&surface_create, None) }.map_err(
-            |error| EngineError::Swapchain {
-                detail: smol_str::format_smolstr!("create_wayland_surface: {error:?}"),
-            },
-        )?;
         Ok(Self {
+            surface_fn: Some(ash::khr::surface::Instance::new(&entry, &raw)),
+            wayland_fn: Some(ash::khr::wayland_surface::Instance::new(&entry, &raw)),
             _entry: entry,
             raw,
-            surface,
-            surface_fn: Some(surface_fn),
-            _wayland_fn: Some(wayland_fn),
         })
     }
 
@@ -123,9 +111,8 @@ impl VulkanInstance {
         Ok(Self {
             _entry: entry,
             raw,
-            surface: ash::vk::SurfaceKHR::null(),
             surface_fn: None,
-            _wayland_fn: None,
+            wayland_fn: None,
         })
     }
 
@@ -133,25 +120,52 @@ impl VulkanInstance {
         &self.raw
     }
 
-    pub(crate) fn surface(&self) -> ash::vk::SurfaceKHR {
-        self.surface
-    }
-
     /// 产品路径恒 `Some`；离屏实例 `None`（没有 surface 也就没有 WSI 函数）。
     pub(crate) fn surface_fn(&self) -> Option<&ash::khr::surface::Instance> {
         self.surface_fn.as_ref()
+    }
+
+    /// 用平台层的 `wl_display*` / `wl_surface*` 建一个窗口的 `VkSurfaceKHR`。
+    ///
+    /// 指针的生命周期由调用方保证覆盖整个渲染器（窗口路径的 surface 存活期 = 窗口）。
+    pub(crate) fn create_surface(
+        &self,
+        display: *mut std::ffi::c_void,
+        surface: *mut std::ffi::c_void,
+    ) -> Result<ash::vk::SurfaceKHR, EngineError> {
+        let wayland_fn = self
+            .wayland_fn
+            .as_ref()
+            .ok_or_else(|| EngineError::AppInit {
+                detail: smol_str::SmolStr::new_static(
+                    "a window surface requires a product (Wayland) Vulkan instance",
+                ),
+            })?;
+        let create = ash::vk::WaylandSurfaceCreateInfoKHR::default()
+            .display(display)
+            .surface(surface);
+        // SAFETY: 指针来自平台层的 `wl_display` / `wl_surface`（system backend 的真实对象）。
+        unsafe { wayland_fn.create_wayland_surface(&create, None) }.map_err(|error| {
+            EngineError::Swapchain {
+                detail: smol_str::format_smolstr!("create_wayland_surface: {error:?}"),
+            }
+        })
+    }
+
+    /// 销毁一个窗口的 surface（`Surface::drop` 调用；此时 GPU 仍由该窗口的引用保活）。
+    pub(crate) fn destroy_surface(&self, surface: ash::vk::SurfaceKHR) {
+        if let Some(surface_fn) = self.surface_fn.as_ref() {
+            // SAFETY: surface 由本实例创建；调用方保证该 surface 的 swapchain 已销毁。
+            unsafe { surface_fn.destroy_surface(surface, None) };
+        }
     }
 }
 
 impl Drop for VulkanInstance {
     fn drop(&mut self) {
-        // SAFETY: 句柄归本结构独占；`destroy_surface` 之前不会有队列提交。
-        unsafe {
-            if let Some(surface_fn) = self.surface_fn.as_ref() {
-                surface_fn.destroy_surface(self.surface, None);
-            }
-            self.raw.destroy_instance(None);
-        }
+        // SAFETY: 句柄归本结构独占；所有窗口 surface 已先于实例销毁（`SharedGpu` 的引用计数
+        // 保证最后一道窗口资源 drop 之后才走到这里）。
+        unsafe { self.raw.destroy_instance(None) };
     }
 }
 

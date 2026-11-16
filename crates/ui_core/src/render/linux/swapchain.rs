@@ -1,11 +1,15 @@
-//! Wayland WSI：swapchain / acquire / present（`design/phase-12-macos-linux.md` §6.3 / §6.9、
-//! `design/async-render-pipeline.md` §7.2 / §7.4 / §7.6）。
+//! Wayland WSI：每窗口 `VkSurfaceKHR` + swapchain / acquire / present
+//! （`design/phase-12-macos-linux.md` §6.3 / §6.9、`design/async-render-pipeline.md` §7.2 / §7.4 / §7.6）。
+//!
+//! 实例是进程级的（[`VulkanInstance`]），swapchain / surface 是**每窗口**的：多窗口共享同一个
+//! `VkDevice` 与同一条 graphics queue，但各自的 surface 与图像链互不相干。
 //!
 //! **无局部 present**：swapchain image 的内容 present 后未定义 ⇒ 每帧整面 `cmd_copy_image`；
-//! `VK_KHR_incremental_present` 只作为 `pNext` hint（引擎不依赖）。
+//! `VK_KHR_incremental_present` 只作为 `pNext` hint（引擎不依赖）。整面 copy 要求 persist 与
+//! swapchain image 同格式，因此 swapchain 固定要求 [`RENDER_FORMAT`]（不做格式回退）。
 //!
 //! 同步原语的所有权（§7.2）：
-//! - `image_available` 在 [`Device`] 里**每帧槽一个**（acquire 时 signal、submit 时 wait）；
+//! - `image_available` 在每窗口的 `FrameSync` 里**每帧槽一个**（acquire 时 signal、submit 时 wait）；
 //! - `render_finished` 在**本结构里按 swapchain image 索引**（acquire 回同一张图之前，
 //!   presentation engine 可能仍持有它 ⇒ 不能按帧槽索引）。
 //!
@@ -15,6 +19,11 @@
 //! 销毁（§7.4）：本结构没有「重建」入口。重建由 `GpuRenderer` 用 `oldSwapchain` 创建新结构完成，
 //! 旧结构留在延迟销毁队列里，等新 swapchain 成功 present 至少一帧且该帧完成之后才 drop
 //! （`vkDeviceWaitIdle` **不能**证明 presentation engine 已释放图像，因此不作为释放依据）。
+//!
+//! `VkQueue` 的主机访问来自多个窗口线程（present），因此经 `SharedGpu::with_queue` 串行化
+//! （Vulkan 要求外部同步）。
+
+use std::sync::Arc;
 
 use ash::vk::{self, Handle};
 
@@ -23,8 +32,8 @@ use crate::{
     render::{
         compositor::{FramePlan, Plan},
         linux::{
-            device::{Device, on_gpu_thread},
-            instance::VulkanInstance,
+            device::{SharedGpu, on_gpu_thread},
+            pipeline::RENDER_FORMAT,
         },
     },
 };
@@ -57,13 +66,47 @@ pub(crate) enum Present {
     OutOfDate,
 }
 
+/// 一个窗口的 `VkSurfaceKHR`（存活期 = 窗口渲染器）。
+///
+/// 持有 `Arc<SharedGpu>`：surface 的销毁要求 `VkInstance` 还活着，而实例由共享 GPU 保活。
+/// 引用计数上这同时保证「最后一个窗口关闭时才销毁 instance」，销毁顺序固定为
+/// swapchain → surface → device → instance。
+pub(crate) struct Surface {
+    gpu: Arc<SharedGpu>,
+    raw: vk::SurfaceKHR,
+}
+
+impl Surface {
+    /// 用平台层的 `wl_display*` / `wl_surface*` 建 surface（同一进程级实例）。
+    pub(crate) fn new(
+        gpu: &Arc<SharedGpu>,
+        display: *mut std::ffi::c_void,
+        surface: *mut std::ffi::c_void,
+    ) -> Result<Self, EngineError> {
+        Ok(Self {
+            gpu: Arc::clone(gpu),
+            raw: gpu.instance().create_surface(display, surface)?,
+        })
+    }
+
+    pub(crate) fn raw(&self) -> vk::SurfaceKHR {
+        self.raw
+    }
+}
+
+impl Drop for Surface {
+    fn drop(&mut self) {
+        // 该 surface 的 swapchain 已先于本结构销毁（`GpuRenderer` 的字段顺序 / teardown 顺序）。
+        self.gpu.instance().destroy_surface(self.raw);
+    }
+}
+
 /// swapchain + **每 image 一个** render-finished 信号量。
 pub(crate) struct Swapchain {
     device: ash::Device,
     raw: vk::SwapchainKHR,
     fn_: ash::khr::swapchain::Device,
     images: Vec<vk::Image>,
-    format: vk::Format,
     extent: vk::Extent2D,
     incremental: bool,
     /// 长度 = `images.len()`：按 image index 索引（§7.2 硬规则 1）。
@@ -73,76 +116,65 @@ pub(crate) struct Swapchain {
 impl Swapchain {
     /// 首次创建（窗口初始化）。
     pub(crate) fn new(
-        instance: &VulkanInstance,
-        device: &Device,
+        shared: &SharedGpu,
+        surface: vk::SurfaceKHR,
         size: (u32, u32),
     ) -> Result<Self, EngineError> {
-        Self::create(instance, device, size, vk::SwapchainKHR::null(), None)
+        Self::create(shared, surface, size, vk::SwapchainKHR::null())
     }
 
     /// `old` 必须来自同一个 surface：新 swapchain 通过 `oldSwapchain` 接管 surface
-    /// （先建后销毁会报 `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`，F-148）。
+    /// （先建后销毁会报 `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`，F-148）。格式恒为
+    /// [`RENDER_FORMAT`]，重建不改变渲染管线 / persist 的格式。
     ///
     /// 规范：即使创建失败，旧 swapchain 也已 retired、必须销毁 —— 调用方负责把它放进延迟销毁队列。
     pub(crate) fn replace(
-        instance: &VulkanInstance,
-        device: &Device,
+        shared: &SharedGpu,
+        surface: vk::SurfaceKHR,
         size: (u32, u32),
         old: vk::SwapchainKHR,
-        format: vk::Format,
     ) -> Result<Self, EngineError> {
-        Self::create(instance, device, size, old, Some(format))
+        Self::create(shared, surface, size, old)
     }
 
     fn create(
-        instance: &VulkanInstance,
-        device: &Device,
+        shared: &SharedGpu,
+        surface: vk::SurfaceKHR,
         size: (u32, u32),
         old: vk::SwapchainKHR,
-        preferred: Option<vk::Format>,
     ) -> Result<Self, EngineError> {
+        let instance = shared.instance();
         let surface_fn = instance
             .surface_fn()
             .ok_or_else(|| EngineError::Swapchain {
                 detail: smol_str::SmolStr::new_static("swapchain requires a Wayland surface"),
             })?;
         // SAFETY: 句柄与参数都由本结构独占，调用期间有效（Vulkan 的外部同步已由 fence 保证）。
-        let formats = unsafe {
-            surface_fn.get_physical_device_surface_formats(device.physical(), instance.surface())
-        }
-        .map_err(|error| EngineError::Swapchain {
-            detail: smol_str::format_smolstr!("get_physical_device_surface_formats: {error:?}"),
-        })?;
-        // 重建时**必须**保持同一格式：渲染管线与持久目标的格式在初次创建时就定死了。
-        let chosen = match preferred {
-            Some(format) => formats
-                .iter()
-                .find(|candidate| candidate.format == format)
-                .copied()
-                .ok_or_else(|| EngineError::Swapchain {
-                    detail: smol_str::format_smolstr!(
-                        "surface no longer offers {format:?} on swapchain recreation"
-                    ),
-                })?,
-            None => formats
-                .iter()
-                .find(|format| format.format == vk::Format::B8G8R8A8_SRGB)
-                .or_else(|| {
+        let formats =
+            unsafe { surface_fn.get_physical_device_surface_formats(shared.physical(), surface) }
+                .map_err(|error| EngineError::Swapchain {
+                detail: smol_str::format_smolstr!("get_physical_device_surface_formats: {error:?}"),
+            })?;
+        // 渲染目标格式是进程级固定的（PSO / render pass / persist 都按它建）：surface 必须提供
+        // 同一格式，否则整面 `cmdCopyImage` 不合法（B8G8R8A8_SRGB 与 R8G8B8A8_SRGB 不兼容）。
+        let chosen = formats
+            .iter()
+            .find(|candidate| candidate.format == RENDER_FORMAT)
+            .copied()
+            .ok_or_else(|| EngineError::UnsupportedGpu {
+                os: "linux",
+                required: "B8G8R8A8_SRGB surface format (the process render target format)",
+                actual: smol_str::format_smolstr!(
+                    "surface reports formats {:?}",
                     formats
                         .iter()
-                        .find(|format| format.format == vk::Format::R8G8B8A8_SRGB)
-                })
-                .copied()
-                .ok_or_else(|| EngineError::UnsupportedGpu {
-                    os: "linux",
-                    required: "B8G8R8A8_SRGB or R8G8B8A8_SRGB surface format",
-                    actual: smol_str::SmolStr::new_static("surface reports no *_SRGB format"),
-                })?,
-        };
+                        .map(|format| format.format)
+                        .collect::<Vec<_>>()
+                ),
+            })?;
         // SAFETY: 只读查询；surface 由同一实例创建。
         let capabilities = unsafe {
-            surface_fn
-                .get_physical_device_surface_capabilities(device.physical(), instance.surface())
+            surface_fn.get_physical_device_surface_capabilities(shared.physical(), surface)
         }
         .map_err(|error| EngineError::Swapchain {
             detail: smol_str::format_smolstr!(
@@ -151,8 +183,7 @@ impl Swapchain {
         })?;
         // SAFETY: 只读查询。
         let present_modes = unsafe {
-            surface_fn
-                .get_physical_device_surface_present_modes(device.physical(), instance.surface())
+            surface_fn.get_physical_device_surface_present_modes(shared.physical(), surface)
         }
         .map_err(|error| EngineError::Swapchain {
             detail: smol_str::format_smolstr!(
@@ -227,9 +258,9 @@ impl Swapchain {
                 } else {
                     capabilities.max_image_count
                 });
-        let fn_ = ash::khr::swapchain::Device::new(instance.raw(), device.raw());
+        let fn_ = ash::khr::swapchain::Device::new(instance.raw(), shared.raw());
         let create = vk::SwapchainCreateInfoKHR::default()
-            .surface(instance.surface())
+            .surface(surface)
             .old_swapchain(old)
             .min_image_count(image_count)
             .image_format(chosen.format)
@@ -242,7 +273,8 @@ impl Swapchain {
             .composite_alpha(composite_alpha)
             .present_mode(PRESENT_MODE)
             .clipped(true);
-        // SAFETY: `create` 的指针在本次调用期间有效；swapchain 在本结构 Drop（或调用方延迟 drop）时销毁。
+        // SAFETY: `create` 的指针在本次调用期间有效；swapchain 在本结构 Drop（或调用方延迟 drop）
+        // 时销毁；`VkQueue` 由共享 GPU 持有且在 `with_queue` 内串行化。
         let raw = unsafe { fn_.create_swapchain(&create, None) }.map_err(|error| {
             EngineError::Swapchain {
                 detail: smol_str::format_smolstr!("create_swapchain_khr: {error:?}"),
@@ -259,7 +291,7 @@ impl Swapchain {
         for _ in 0..images.len() {
             // SAFETY: 句柄归本结构独占；`Drop` 里销毁（调用方保证 presentation engine 已释放它们）。
             let semaphore = unsafe {
-                device
+                shared
                     .raw()
                     .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
             }
@@ -270,23 +302,18 @@ impl Swapchain {
         }
 
         Ok(Self {
-            device: device.raw().clone(),
+            device: shared.raw().clone(),
             raw,
             fn_,
             images,
-            format: chosen.format,
             extent,
-            incremental: device.caps().incremental_present,
+            incremental: shared.caps().incremental_present,
             render_finished,
         })
     }
 
     pub(crate) fn raw(&self) -> vk::SwapchainKHR {
         self.raw
-    }
-
-    pub(crate) fn format(&self) -> vk::Format {
-        self.format
     }
 
     pub(crate) fn extent(&self) -> vk::Extent2D {
@@ -328,7 +355,7 @@ impl Swapchain {
     /// present：等**本 image** 的 render-finished，`incremental_present` 只在有 dirty 集时挂 `pNext`。
     pub(crate) fn present(
         &self,
-        device: &Device,
+        shared: &SharedGpu,
         image_index: u32,
         frame: FramePlan,
     ) -> Result<Present, EngineError> {
@@ -351,8 +378,9 @@ impl Swapchain {
             regions_info.swapchain_count = 1;
             info = info.push_next(&mut regions_info);
         }
-        // SAFETY: 队列由 device 提供；`info` 的指针指向本函数栈上的数组。
-        let result = unsafe { self.fn_.queue_present(device.queue(), &info) };
+        // SAFETY: `info` 的指针指向本函数栈上的数组；`VkQueue` 由共享 GPU 持有，主机访问在
+        // `with_queue` 内外部同步。
+        let result = shared.with_queue(|queue| unsafe { self.fn_.queue_present(queue, &info) });
         match result {
             Ok(false) => Ok(Present::Presented),
             Ok(true) => Ok(Present::Suboptimal),
@@ -370,7 +398,7 @@ impl Swapchain {
 impl Drop for Swapchain {
     fn drop(&mut self) {
         // SAFETY: 调用方保证 presentation engine 已不再使用本 swapchain 的图像与信号量
-        // （退出路径先 `vkDeviceWaitIdle`；重建路径等新 swapchain 的首帧完成，§7.4）。
+        // （退出路径先等本窗口 timeline；重建路径等新 swapchain 的首帧完成，§7.4）。
         unsafe {
             for semaphore in &self.render_finished {
                 self.device.destroy_semaphore(*semaphore, None);
