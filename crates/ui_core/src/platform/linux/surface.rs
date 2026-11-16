@@ -1634,6 +1634,18 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                     state
                         .events
                         .push((window, Event::Input(InputEvent::PointerLeave)));
+                    // wayland 的隐式 grab 正常期间不会发 `leave`，所以多数拖拽仍会收到 release；
+                    // 但 grab 被合成器撤销（屏幕锁定、Super 概览、别的客户端抢 grab、Alt+Tab 的
+                    // 某些实现）时会**先收到 leave 而没有 release**。此时 app 侧
+                    // `on_pointer_leave` 在 capture=true 时保留会话 ⇒ 拖拽永久停在「按住」，
+                    // 之后所有按下都被忽略（复审 P2-7）。
+                    //
+                    // 所以 leave 之后再投一次 `PointerCancel`：无拖拽时是幂等 no-op（只清
+                    // hover），有拖拽时结束会话并派发 `DragPhase::Cancel`。与 Windows 的
+                    // `WM_CAPTURECHANGED → PointerCancel` 路径对称。
+                    state
+                        .events
+                        .push((window, Event::Input(InputEvent::PointerCancel)));
                 }
             }
             _ => {}
