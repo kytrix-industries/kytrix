@@ -1,12 +1,10 @@
 //! 图集纹理：`R8_UNORM` 字形 + `B8G8R8A8_SRGB` 图片，staging 上传（`design/phase-12-macos-linux.md` §6.5）。
 //!
-//! **staging 是每次上传一次性的 `VkBuffer`**（与 macOS 本轮修复同一策略）：Linux 最多允许
-//! [`MAX_FRAMES_IN_FLIGHT`](crate::render::frame::MAX_FRAMES_IN_FLIGHT) 帧在飞 —— 活性兜底会在
-//! present 卡死时放行第二帧（这正是它存在的目的），所以不能假设「在飞 ≤ 1」。复用一块 staging
-//! 会让后一帧录制时的 CPU 写入覆盖前一帧 GPU `cmd_copy_buffer_to_image` 仍在读的字节。这里每次
-//! 上传只分配**本次脏行大小**的 host-visible 缓冲，录制时使用，随后按**本帧序号**进入 retire
-//! 队列，由 timeline 完成推进释放（I4）。内存只随在飞帧的脏行增长（而不是固定按「页 × 槽位」
-//! 放大），上传又是低频路径，分配的代价远小于一次整页 memcpy。
+//! **staging 是每 in-flight 槽一块常驻的 host-visible 缓冲**（DEVIATIONS F-212）：槽位复用由
+//! `wait_slot` 保证「上一帧已完成」，因此本帧可以直接覆盖写；容量不够时重建并把旧 buffer /
+//! memory 按帧序号 retire。上传是低频路径、每帧至多一次，常驻一块按需扩容的缓冲比每帧分配
+//! 更省（也避免分配抖动）。超过 1 MiB 的上传（整页）改用一次性缓冲并按帧 retire（F-216），
+//! 常驻容量因此不随页尺寸放大。
 
 use ash::vk;
 
@@ -14,7 +12,7 @@ use crate::{
     error::EngineError,
     paint::atlas::AtlasKind,
     render::{
-        atlas::{AtlasRebuilt, DirtyRows, texel_bytes},
+        atlas::{AtlasRebuilt, DirtyRows, MAX_RESIDENT_STAGING_BYTES, texel_bytes},
         frame::MAX_FRAMES_IN_FLIGHT,
         linux::device::{Device, GpuObject, init_error},
     },
@@ -109,6 +107,14 @@ impl AtlasTextures {
         self.glyph.pending.is_some() || self.image.pending.is_some()
     }
 
+    /// 该图集是否有一笔上传已入队、还没被命令缓冲消费（离屏目标的空闲判据）。
+    pub(crate) fn pending(&self, kind: AtlasKind) -> bool {
+        match kind {
+            AtlasKind::Glyph => self.glyph.pending.is_some(),
+            AtlasKind::Image => self.image.pending.is_some(),
+        }
+    }
+
     /// 在录制本帧**之前**把页尺寸变化落地（DEVIATIONS F-208）。
     ///
     /// 描述符集合会被重写（`Pipeline::write_atlas`），旧 image / view 也要销毁：两者都要求
@@ -197,6 +203,11 @@ impl AtlasTexture {
         if rows.spans().is_empty() {
             return;
         }
+        assert!(
+            self.pending.is_none(),
+            "atlas payload slot must be consumed before the next upload ({:?})",
+            self.kind
+        );
         self.pending = Some(PendingUpload { page, pixels, rows });
     }
 
@@ -238,27 +249,44 @@ impl AtlasTexture {
             pending.rows.spans()
         };
         let row_bytes = (self.page * texel_bytes(self.kind)) as usize;
-        let total_rows: u32 = spans.iter().map(|span| span.end - span.start).sum();
+        // 行必须落在页内：`pack_rows` / `row_count` 已按页钳过长度，这里若还越页说明打包
+        // 缓冲与行描述不是同一份数据，按契约错误立刻失败（否则下面的 `ptr::copy` 会读到
+        // `pending.pixels` 之外）。
+        let total_rows: u32 = spans
+            .iter()
+            .map(|span| {
+                assert!(
+                    span.start < span.end && span.end <= self.page,
+                    "atlas dirty span {span:?} is outside the {}-row page",
+                    self.page
+                );
+                span.end - span.start
+            })
+            .sum();
         if total_rows == 0 {
             return Ok(());
         }
         let length = total_rows as usize * row_bytes;
-        // 每槽常驻 staging（持久映射）：容量够就复用，不够才重建并 retire 旧缓冲。
-        self.ensure_staging(device, index, slot, length)?;
-        {
+        // 小上传复用每槽常驻 staging；整页级的大上传用一次性缓冲（本帧后 retire），
+        // 常驻容量不随页尺寸放大（DEVIATIONS F-216）。
+        let mut transient: Option<StagingRing> = None;
+        let (staging_buffer, staging_ptr) = if length as u64 <= MAX_RESIDENT_STAGING_BYTES {
+            self.ensure_staging(device, index, slot, length)?;
             let ring = self.staging[slot]
                 .as_ref()
                 .expect("ensure_staging must fill the slot");
-            // SAFETY: 映射在创建时常驻，`length` 不超过容量；`pending.pixels` 长度已由
-            // `queue_upload` 校验。
-            unsafe {
-                std::ptr::copy_nonoverlapping(pending.pixels.as_ptr(), ring.ptr, length);
-            }
+            (ring.buffer, ring.ptr)
+        } else {
+            let ring = StagingRing::new(device, length as u64)?;
+            let handles = (ring.buffer, ring.ptr);
+            transient = Some(ring);
+            handles
+        };
+        // SAFETY: 映射在创建时常驻，`length` 不超过容量；`pending.pixels` 长度已由
+        // `queue_upload` 校验。
+        unsafe {
+            std::ptr::copy_nonoverlapping(pending.pixels.as_ptr(), staging_ptr, length);
         }
-        let staging_buffer = self.staging[slot]
-            .as_ref()
-            .expect("ensure_staging must fill the slot")
-            .buffer;
 
         let range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -336,6 +364,15 @@ impl AtlasTexture {
                 &[],
                 &[to_sampled],
             );
+        }
+        if let Some(ring) = transient {
+            // 本帧命令缓冲还在读它：解除映射后按帧序号 retire（buffer 先于 memory）。
+            // SAFETY: 映射由本 ring 独占；GPU 访问不受 unmap 影响。
+            unsafe { device.raw().unmap_memory(ring.memory) };
+            let handle = device.allocate(GpuObject::Buffer(ring.buffer));
+            device.retire(index, handle);
+            let handle = device.allocate(GpuObject::Memory(ring.memory));
+            device.retire(index, handle);
         }
         self.initialized = true;
         Ok(())
@@ -486,11 +523,10 @@ fn create_page(
     Ok((image, memory, view))
 }
 
-/// 一次上传专用的 staging（大小 = 本次行区间）。
+/// 每 in-flight 槽一块常驻 staging（host-visible、持久映射；DEVIATIONS F-212）。
 ///
-/// 两个句柄以 `GpuResourceHandle` 的形式进入设备的 retire 队列：真正的 `vkDestroyBuffer` /
-/// `vkFreeMemory` 由 timeline 完成推进触发，Atlas 不再持有跨帧的 staging 状态。
-/// 每 in-flight 槽一块常驻 staging（host-visible、持久映射）。
+/// 扩容换下的缓冲以 `GpuResourceHandle` 进入设备的 retire 队列：真正的 `vkDestroyBuffer` /
+/// `vkFreeMemory` 由 timeline 完成推进触发。
 struct StagingRing {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,

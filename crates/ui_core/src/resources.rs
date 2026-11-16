@@ -151,8 +151,9 @@ impl fmt::Display for DecodeCause {
                 page,
             } => write!(
                 f,
-                "a {width}x{height} tile does not fit the {}x{} image atlas; \
-                 unload a resource and retry",
+                "a {width}x{height} tile does not fit the {}x{} image atlas (the page size is \
+                 locked by the first inserted image; unloading only helps when the page has free \
+                 space)",
                 page.0, page.1
             ),
         }
@@ -213,6 +214,8 @@ impl ResourceCache {
         let decoded =
             image::decode(bytes).map_err(|cause| EngineError::ResourceDecode { cause })?;
         let (width, height) = (decoded.width, decoded.height);
+        // `decode` 已把单边压到 `MAX_TILE_DIM`（≤ 2048 − 2 padding），所以空页上的首块必定放得下；
+        // 这里建页不会出现「先钉住页档、再分配失败」。
         if self.page.is_none() {
             self.open_page(crate::render::atlas::page_for_tile(width, height));
         }

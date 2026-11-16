@@ -260,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_decode_capacity_display_mentions_unload_and_retry() {
+    fn resource_decode_capacity_display_names_the_locked_page() {
         let text = EngineError::ResourceDecode {
             cause: DecodeCause::Capacity {
                 width: 900,
@@ -272,7 +272,10 @@ mod tests {
 
         assert!(text.contains("900x700"), "{text}");
         assert!(text.contains("2048x2048"), "{text}");
-        assert!(text.contains("unload a resource and retry"), "{text}");
+        assert!(
+            text.contains("locked by the first inserted image"),
+            "{text}"
+        );
     }
 
     #[test]

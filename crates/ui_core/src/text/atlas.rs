@@ -57,8 +57,9 @@ pub(crate) struct GlyphAtlas {
     /// 空白/无轮廓字形的**负缓存**（N5：不再每帧重光栅空格）。
     missing: ahash::HashSet<GlyphKey>,
     stats: GlyphAtlasStats,
-    /// 有新的覆盖度写入 ⇒ 下一帧要把整页传上去（P09 全页上传；增量属 P15）。
-    page_dirty: bool,
+    /// 整张字形页被清空过（DPI 换代 / 容量逃逸重排）⇒ 旧代际的 tile 全部失效，
+    /// 上传侧必须把整页内容重写到 GPU（padding 里可能残留旧字形的覆盖度）。
+    cleared: bool,
 }
 
 impl GlyphAtlas {
@@ -68,7 +69,7 @@ impl GlyphAtlas {
             ids: ahash::HashMap::default(),
             missing: ahash::HashSet::default(),
             stats: GlyphAtlasStats::default(),
-            page_dirty: false,
+            cleared: false,
         }
     }
 
@@ -187,8 +188,6 @@ impl GlyphAtlas {
         };
         self.records.insert(key, record);
         self.ids.insert(key, allocation.id);
-        // 新覆盖度：下一帧要整页上传（P09）。
-        self.page_dirty = true;
         debug_assert_eq!(
             self.coverage(key).map_or(0, |data| data.len()) as u32,
             width * height,
@@ -203,29 +202,47 @@ impl GlyphAtlas {
         self.ids.clear();
         self.missing.clear();
         // 换代之后整页内容都要重传（旧代际的 tile 全失效）。
-        self.page_dirty = true;
+        self.cleared = true;
     }
 
-    /// 取走「页面内容变了」的信号（`App::frame` 据此上传整页）。
-    pub(crate) fn take_page_dirty(&mut self) -> bool {
-        core::mem::take(&mut self.page_dirty)
+    /// 取走「页面被清空过」的信号：上传侧据此把整页内容重写到每个窗口的纹理。
+    pub(crate) fn take_cleared(&mut self) -> bool {
+        core::mem::take(&mut self.cleared)
     }
 
     /// 把所有 tile 的覆盖度写进整页缓冲区（`R8`、行主序、页宽 `page_width`）。
     ///
-    /// P09 的上传是**整页**（每批新字形 4 MiB）；脏行增量属 P15（DEVIATIONS V-64）。
+    /// 只在「整页要重传」的帧调用（新窗口 / 页尺寸变化 / 图集清空）；增量帧走
+    /// [`GlyphAtlas::write_rows`]，只碰脏行覆盖到的字形（DEVIATIONS F-211）。
     pub(crate) fn write_page(&self, page: &mut [u8], page_width: u32) {
         for record in self.records.values() {
-            let (x0, y0) = record.origin;
-            let row_len = record.width as usize;
-            for row in 0..record.height {
-                let destination = (y0 + row) as usize * page_width as usize + x0 as usize;
-                let source = row as usize * row_len;
-                if destination + row_len > page.len() {
-                    continue;
+            write_record_rows(page, page_width, record, 0, record.height);
+        }
+    }
+
+    /// 只把 `rows` 覆盖到的字形行写进整页缓冲区（增量上传的 CPU 侧）。
+    ///
+    /// 与 [`GlyphAtlas::write_page`] 的区别：不重写整张页，代价随**脏行数**而不是字形总数
+    /// 增长（2000 个字形的窗口打一个字不再整页重写）。
+    pub(crate) fn write_rows(
+        &self,
+        page: &mut [u8],
+        page_width: u32,
+        rows: &crate::render::DirtyRows,
+    ) {
+        if rows.is_full() {
+            self.write_page(page, page_width);
+            return;
+        }
+        for record in self.records.values() {
+            let record_y0 = record.origin.1;
+            let record_y1 = record_y0 + record.height;
+            for span in rows.spans() {
+                let start = span.start.max(record_y0).min(record_y1);
+                let end = span.end.max(record_y0).min(record_y1);
+                if start < end {
+                    write_record_rows(page, page_width, record, start - record_y0, end - record_y0);
                 }
-                page[destination..destination + row_len]
-                    .copy_from_slice(&record.data[source..source + row_len]);
             }
         }
     }
@@ -250,6 +267,22 @@ impl GlyphAtlas {
 impl Default for GlyphAtlas {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// 把一条字形记录的内容区第 `row0..row1` 行写进整页缓冲。
+fn write_record_rows(page: &mut [u8], page_width: u32, record: &GlyphRecord, row0: u32, row1: u32) {
+    let (x0, y0) = record.origin;
+    let row_len = record.width as usize;
+    let pitch = page_width as usize;
+    for row in row0..row1 {
+        let destination = (y0 + row) as usize * pitch + x0 as usize;
+        let source = row as usize * row_len;
+        if destination + row_len > page.len() || source + row_len > record.data.len() {
+            continue;
+        }
+        page[destination..destination + row_len]
+            .copy_from_slice(&record.data[source..source + row_len]);
     }
 }
 

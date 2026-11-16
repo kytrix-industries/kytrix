@@ -327,6 +327,11 @@ impl GpuRenderer {
         self.atlas.queue_upload(kind, page, pixels, rows);
     }
 
+    /// 该图集是否有一笔上传已入队、还没被命令缓冲消费（离屏目标的空闲判据）。
+    pub(crate) fn atlas_pending(&self, kind: AtlasKind) -> bool {
+        self.atlas.pending(kind)
+    }
+
     /// 录制一帧（不呈现、不提交）：取槽 → 上传 → 图集 blit → persist 绘制 → 整面 blit。
     ///
     /// 返回本帧槽位与命令缓冲；调用方决定是异步 `submit` 还是同步 `submit_blocking`。

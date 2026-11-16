@@ -3,11 +3,11 @@
 //! 像素来源由上层持有（P05 §10.6 的定案：渲染层不保 CPU 副本）；本模块只做
 //! 「staging 写 → blit 到纹理」与「generation 变化时整页重传」。
 //!
-//! **staging 是每帧一次性的 `MTLBuffer`**（Apple 的 short-lived upload 用法）：macOS 允许
-//! [`crate::render::frame::MAX_FRAMES_IN_FLIGHT`] 帧在飞，复用同一块 staging 会让后一帧的 CPU
-//! 写入覆盖前一帧 GPU blit 正在读的字节（Windows 用「每 in-flight 槽 staging + 槽 fence」解决
-//! 同一个问题）。这里每次上传分配一块只装本次行区间的缓冲，编码完就按**本帧序号**进 retire
-//! 队列，帧完成通知到达后才释放（I4）；上传是低频路径，分配的代价远小于一次整页 memcpy。
+//! **staging 是每 in-flight 槽一块常驻的 `MTLBuffer`**（DEVIATIONS F-212）：槽位复用由
+//! `Queue::begin` 的三槽 permit 保证「上一帧已完成」，因此本帧可以直接覆盖写；容量不够时
+//! 重建并把旧缓冲按帧序号 retire。上传是低频路径、每帧至多一次，常驻一块按需扩容的缓冲
+//! 比每帧分配更省（也避免分配抖动）。超过 1 MiB 的上传（整页）改用一次性缓冲并按帧 retire
+//! （F-216），常驻容量因此不随页尺寸放大。
 
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
@@ -19,7 +19,7 @@ use crate::{
     error::EngineError,
     paint::atlas::AtlasKind,
     render::{
-        atlas::{AtlasRebuilt, DirtyRows, texel_bytes},
+        atlas::{AtlasRebuilt, DirtyRows, MAX_RESIDENT_STAGING_BYTES, texel_bytes},
         frame::MAX_FRAMES_IN_FLIGHT,
         macos::{
             device::{Device, GpuObject, init_error},
@@ -119,6 +119,14 @@ impl AtlasTextures {
         self.glyph.pending.is_some() || self.image.pending.is_some()
     }
 
+    /// 该图集是否有一笔上传已入队、还没被命令缓冲消费（离屏目标的空闲判据）。
+    pub(crate) fn pending(&self, kind: AtlasKind) -> bool {
+        match kind {
+            AtlasKind::Glyph => self.glyph.pending.is_some(),
+            AtlasKind::Image => self.image.pending.is_some(),
+        }
+    }
+
     /// 在编码本帧 blit **之前**把页尺寸变化落地（DEVIATIONS F-208）。
     ///
     /// 旧纹理可能在飞帧仍采样：新纹理建好后把旧纹理句柄按 `index` retire。绑定是每帧
@@ -197,6 +205,11 @@ impl AtlasTexture {
         if rows.spans().is_empty() {
             return;
         }
+        assert!(
+            self.pending.is_none(),
+            "atlas payload slot must be consumed before the next upload ({:?})",
+            self.kind
+        );
         self.pending = Some(PendingUpload { page, pixels, rows });
     }
 
@@ -233,18 +246,48 @@ impl AtlasTexture {
             pending.rows.spans()
         };
         let row_bytes = (self.page * texel_bytes(kind)) as usize;
-        let total_rows: u32 = spans.iter().map(|span| span.end - span.start).sum();
+        // 行必须落在页内：`pack_rows` / `row_count` 已按页钳过长度，这里若还越页说明打包
+        // 缓冲与行描述不是同一份数据，按契约错误立刻失败（否则下面的 `ptr::copy` 会读到
+        // `pending.pixels` 之外）。
+        let total_rows: u32 = spans
+            .iter()
+            .map(|span| {
+                assert!(
+                    span.start < span.end && span.end <= self.page,
+                    "atlas dirty span {span:?} is outside the {}-row page",
+                    self.page
+                );
+                span.end - span.start
+            })
+            .sum();
         if total_rows == 0 {
             return Ok(());
         }
-        // 每槽常驻 staging（按需扩容）：容量够就复用，不够才重建并 retire 旧缓冲。
+        // 小上传复用每槽常驻 staging；整页级的大上传用一次性缓冲（本帧后 retire），
+        // 常驻容量不随页尺寸放大（DEVIATIONS F-216）。
         let length = total_rows as usize * row_bytes;
-        self.ensure_staging(device, queue, index, slot, length)?;
-        let staging = self.staging[slot]
-            .as_ref()
-            .expect("ensure_staging must fill the slot")
-            .buffer
-            .clone();
+        let staging = if length as u64 <= MAX_RESIDENT_STAGING_BYTES {
+            self.ensure_staging(device, queue, index, slot, length)?;
+            self.staging[slot]
+                .as_ref()
+                .expect("ensure_staging must fill the slot")
+                .buffer
+                .clone()
+        } else {
+            let buffer = device
+                .raw()
+                .newBufferWithLength_options(length, MTLResourceOptions::StorageModeShared)
+                .ok_or_else(|| {
+                    init_error(
+                        "newBufferWithLength_options(atlas transient)",
+                        "returned nil",
+                    )
+                })?;
+            let handle = device.allocate(GpuObject::Buffer(buffer.clone()));
+            // 本帧命令缓冲还在读它：帧完成通知到达后再释放（I4）。
+            queue.retire(index, handle);
+            buffer
+        };
         let mut staging_row = 0u32;
         let mut packed_row = 0u32;
         for span in spans {

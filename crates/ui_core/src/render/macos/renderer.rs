@@ -200,10 +200,11 @@ impl Renderer {
         page: u32,
         pixels: &[u8],
         rows: DirtyRows,
-    ) {
+    ) -> bool {
         match &mut self.target {
             RenderTarget::Offscreen(gpu) => {
                 gpu.queue_atlas_upload(kind, page, pixels.to_vec(), rows);
+                true
             }
             RenderTarget::Window(window) => window.queue_atlas_upload(kind, page, pixels, rows),
         }
@@ -212,7 +213,8 @@ impl Renderer {
     /// 该图集的共享槽是否空闲（UI 线程据此决定这一帧能否入队，DEVIATIONS F-211）。
     pub(crate) fn atlas_idle(&self, kind: AtlasKind) -> bool {
         match &self.target {
-            RenderTarget::Offscreen(_) => true,
+            // 离屏目标是同步渲染：上一笔上传还没被 `submit_snapshot` 消费时同样算忙。
+            RenderTarget::Offscreen(gpu) => !gpu.atlas_pending(kind),
             RenderTarget::Window(window) => window.atlas_idle(kind),
         }
     }
@@ -458,8 +460,14 @@ impl WindowRenderer {
         self.stats
     }
 
-    fn queue_atlas_upload(&mut self, kind: AtlasKind, page: u32, pixels: &[u8], rows: DirtyRows) {
-        self.shared.queue_atlas(kind, page, pixels, rows);
+    fn queue_atlas_upload(
+        &mut self,
+        kind: AtlasKind,
+        page: u32,
+        pixels: &[u8],
+        rows: DirtyRows,
+    ) -> bool {
+        self.shared.queue_atlas(kind, page, pixels, rows)
     }
 
     fn atlas_idle(&self, kind: AtlasKind) -> bool {
@@ -675,7 +683,7 @@ impl AtlasSlots {
 
     /// 入队一次上传。**槽位由 UI 线程的 `atlas_idle` 保证空闲**（DEVIATIONS F-211）：
     /// 槽里已有未消费的上传时是契约破坏（会丢行），release 也硬失败。
-    fn queue(&mut self, kind: AtlasKind, page: u32, pixels: &[u8], rows: DirtyRows) {
+    fn queue(&mut self, kind: AtlasKind, page: u32, pixels: Vec<u8>, rows: DirtyRows) {
         let slot = match kind {
             AtlasKind::Glyph => &mut self.glyph,
             AtlasKind::Image => &mut self.image,
@@ -687,7 +695,7 @@ impl AtlasSlots {
         *slot = Some(AtlasUpload {
             kind,
             page,
-            pixels: pixels.to_vec(),
+            pixels,
             rows,
         });
     }
@@ -801,20 +809,20 @@ impl Shared {
         self.wake();
     }
 
-    fn queue_atlas(&self, kind: AtlasKind, page: u32, pixels: &[u8], rows: DirtyRows) {
-        let index = match kind {
-            AtlasKind::Glyph => 0,
-            AtlasKind::Image => 1,
-        };
-        // 先占位再入队：GPU 线程 take 之后才释放（DEVIATIONS F-211）。
+    fn queue_atlas(&self, kind: AtlasKind, page: u32, pixels: &[u8], rows: DirtyRows) -> bool {
+        let index = kind.index() as usize;
+        // 像素在**锁外**复制：整页可达 16 MiB，不能让 GPU 线程的取帧锁等这次 memcpy。
+        let pixels = pixels.to_vec();
+        // 先占位再入队：GPU 线程录制完成之后才释放（DEVIATIONS F-211）。
         self.atlas_pending[index].store(true, Ordering::Release);
         let mut state = self.lock();
         if state.shutdown || state.terminated {
             self.atlas_pending[index].store(false, Ordering::Release);
-            return;
+            return false;
         }
         // 不唤醒：图集上传统一在「录制下一帧」之前落地（§4.2），单独唤醒只会空转。
         state.atlas.queue(kind, page, pixels, rows);
+        true
     }
 
     /// 排队一笔 persist clear color（最新者胜）：GPU 线程空闲或录制下一帧前应用。
@@ -919,22 +927,18 @@ impl Shared {
     }
 
     fn take_atlas(&self) -> [Option<AtlasUpload>; 2] {
-        let uploads = self.lock().atlas.take();
-        // 槽空出来了，UI 线程下一帧可以继续入队（DEVIATIONS F-211）。
-        for (index, upload) in uploads.iter().enumerate() {
-            if upload.is_some() {
-                self.atlas_pending[index].store(false, Ordering::Release);
-            }
-        }
-        uploads
+        // 这里**不**清 `atlas_pending`：GPU 线程只是把上传拿走，还没录进 command buffer。
+        // 清得太早，UI 会在本帧未录制（Idle / 尺寸不匹配）时入队下一笔，覆盖掉这一笔（丢行）。
+        self.lock().atlas.take()
+    }
+
+    /// 本帧的图集上传已经编码进 command buffer：共享槽这才算空（UI 可以入队下一笔）。
+    fn atlas_uploaded(&self, kind: AtlasKind) {
+        self.atlas_pending[kind.index() as usize].store(false, Ordering::Release);
     }
 
     fn atlas_idle(&self, kind: AtlasKind) -> bool {
-        let index = match kind {
-            AtlasKind::Glyph => 0,
-            AtlasKind::Image => 1,
-        };
-        !self.atlas_pending[index].load(Ordering::Acquire)
+        !self.atlas_pending[kind.index() as usize].load(Ordering::Acquire)
     }
 
     /// 取走全部完成通知，并把在飞帧数减去同样多（GPU 线程 drain）。
@@ -1048,6 +1052,8 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>) {
     let mut feedback = FeedbackQueue::new();
     // drawable 与请求尺寸不一致的退化状态（P1；粘性，见 [`SurfaceMismatch`]）。
     let mut surface = SurfaceMismatch::new();
+    // 已从共享槽取走、但还没编码进本帧 command buffer 的图集上传（按 `AtlasKind`）。
+    let mut atlas_awaiting = [false; 2];
     loop {
         // 空闲等待前应用一次待定背景色：改色不要求提交一帧（UI 只写共享槽 + 唤醒）。
         if let Some(linear) = shared.take_background() {
@@ -1119,8 +1125,11 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>) {
             renderer.set_background_color(linear);
         }
         // 图集像素在本帧录制前落地（上传先于绘制，§4.2；像素按所有权移交给 GPU）。
-        for upload in shared.take_atlas().into_iter().flatten() {
-            renderer.queue_atlas_upload(upload.kind, upload.page, upload.pixels, upload.rows);
+        for (index, upload) in shared.take_atlas().into_iter().enumerate() {
+            if let Some(upload) = upload {
+                atlas_awaiting[index] = true;
+                renderer.queue_atlas_upload(upload.kind, upload.page, upload.pixels, upload.rows);
+            }
         }
         let resized = match renderer.prepare_target(target) {
             Ok(resized) => resized,
@@ -1142,6 +1151,16 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>) {
         };
         match renderer.submit_frame(&request, &drawable.0, &mut frame, completed) {
             Ok((stats, samples)) => {
+                // 上传已经编码进本帧 command buffer：共享槽这才算空，UI 可以入队下一笔。
+                for (index, awaiting) in atlas_awaiting.iter_mut().enumerate() {
+                    if std::mem::take(awaiting) {
+                        shared.atlas_uploaded(if index == 0 {
+                            AtlasKind::Glyph
+                        } else {
+                            AtlasKind::Image
+                        });
+                    }
+                }
                 // **不**在这里清退化状态：粘性状态只在尺寸重新一致时清除（`SurfaceMismatch`）。
                 shared.note_submitted();
                 feedback.push(index, stats, samples, request.published_at);
@@ -1313,7 +1332,7 @@ mod tests {
     #[test]
     fn a_first_atlas_upload_keeps_its_dirty_rows() {
         let mut slots = AtlasSlots::new();
-        slots.queue(AtlasKind::Glyph, 64, &[1, 2, 3], stale_rows(4, 8));
+        slots.queue(AtlasKind::Glyph, 64, vec![1, 2, 3], stale_rows(4, 8));
         let [glyph, image] = slots.take();
         let glyph = glyph.expect("glyph upload");
         assert_eq!(glyph.page, 64);
@@ -1328,8 +1347,8 @@ mod tests {
     fn queueing_into_a_busy_atlas_slot_is_a_contract_violation() {
         // UI 线程用 `atlas_idle` 门控入队；覆盖未消费的上传会丢行，因此这里是硬失败。
         let mut slots = AtlasSlots::new();
-        slots.queue(AtlasKind::Glyph, 64, &[1, 2, 3], stale_rows(4, 8));
-        slots.queue(AtlasKind::Glyph, 64, &[9, 9, 9], stale_rows(16, 20));
+        slots.queue(AtlasKind::Glyph, 64, vec![1, 2, 3], stale_rows(4, 8));
+        slots.queue(AtlasKind::Glyph, 64, vec![9, 9, 9], stale_rows(16, 20));
     }
 
     #[test]

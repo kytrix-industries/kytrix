@@ -29,6 +29,12 @@ pub(crate) const MIN_ATLAS_PAGE: u32 = 512;
 /// 图片页在首次插入时按图片尺寸选档（见 [`page_for_tile`]）。
 pub(crate) const ATLAS_PAGE_STEPS: [u32; 3] = [MIN_ATLAS_PAGE, MIN_ATLAS_PAGE * 2, MAX_ATLAS_PAGE];
 
+/// 每 in-flight 槽**常驻** staging 的上限（字节）。
+///
+/// 更大的上传（整页 / 新窗口 / 页变化）走一次性缓冲并按帧 retire：常驻容量因此不随图集
+/// 页尺寸放大（2048² 图片页的整页 staging 是 16 MiB/槽，三槽就是 48 MiB）。
+pub(crate) const MAX_RESIDENT_STAGING_BYTES: u64 = 1 << 20;
+
 /// 图片页在首次插入时的选档：覆盖 `max(width, height) + 2`（1 纹素 padding）的最小档。
 ///
 /// 超出 2048 的请求返回上限档，由 `AtlasAllocator::allocate` 以 `Capacity` 拒绝
@@ -79,6 +85,12 @@ impl AtlasRebuilt {
 /// 增量上传的源数据只有脏行；后端按「累计行偏移」从打包缓冲取行。`rows.is_full()` 时等价于
 /// 整页拷贝（新窗口 / 页尺寸变化 / 首次上传都走这条）。
 pub(crate) fn pack_rows(page: &[u8], extent: u32, texel: u32, rows: &DirtyRows, out: &mut Vec<u8>) {
+    let expected = extent as usize * extent as usize * texel as usize;
+    assert_eq!(
+        page.len(),
+        expected,
+        "atlas page buffer must be {extent}² × {texel} bytes"
+    );
     out.clear();
     let row_bytes = extent as usize * texel as usize;
     if rows.is_full() {
@@ -315,6 +327,11 @@ impl DirtyRows {
             .any(|span| span.start == 0 && span.end == u32::MAX)
     }
 
+    /// 没有任何脏行。
+    pub(crate) fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
     pub(crate) fn clear(&mut self) {
         self.spans.clear();
     }
@@ -322,6 +339,16 @@ impl DirtyRows {
     /// 合并另一份脏行（P05 把每轮 `take_dirty_rows` 的结果并入 `App::pending_dirty`）。
     pub(crate) fn merge(&mut self, other: &mut DirtyRows) {
         for span in other.spans.drain(..) {
+            self.mark(span.start, span.end);
+        }
+    }
+
+    /// 只读合并：把 `other` 的区间并进来，但不清空 `other`。
+    ///
+    /// 图集页是进程级共享数据、纹理是每窗口一份：同一批脏行要分发给每个窗口的待发队列
+    /// （忙窗口攒着、空闲时补发），因此不能像 [`DirtyRows::merge`] 那样消费源。
+    pub(crate) fn merge_from(&mut self, other: &DirtyRows) {
+        for span in &other.spans {
             self.mark(span.start, span.end);
         }
     }
@@ -522,6 +549,25 @@ mod tests {
         rows.mark(10, 10);
         rows.mark(20, 5);
         assert!(rows.spans().is_empty());
+    }
+
+    /// 同一批脏行要分发给多个窗口的待发队列：`merge_from` 不能消费源。
+    #[test]
+    fn merge_from_keeps_the_source_spans() {
+        let mut source = DirtyRows::default();
+        source.mark(4, 8);
+        let mut first = DirtyRows::default();
+        let mut second = DirtyRows::default();
+        first.merge_from(&source);
+        second.merge_from(&source);
+
+        assert_eq!(first.spans().len(), 1);
+        assert_eq!(first.spans()[0], 4..8);
+        assert_eq!(second.spans().len(), 1);
+        assert_eq!(second.spans()[0], 4..8);
+        assert_eq!(source.spans().len(), 1, "分发之后源必须仍然完整");
+        assert_eq!(source.spans()[0], 4..8);
+        assert!(!source.is_empty());
     }
 
     #[test]

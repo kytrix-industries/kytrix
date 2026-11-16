@@ -81,7 +81,7 @@ use crate::{
     window::FrameIndex,
 };
 
-/// 测试构建的图集页（2048² 在 WARP 上代价过高；页尺寸由上传的像素长度决定）。
+/// 测试构建的图集页（2048² 在 WARP 上代价过高；页尺寸随上传显式给出，S-153）。
 #[cfg(test)]
 const TEST_ATLAS_PAGE: u32 = 64;
 
@@ -1005,6 +1005,11 @@ impl GpuRenderer {
             "window atlas uploads may only be queued on the kytrix-d3d12 thread"
         );
         self.atlas.queue_upload(kind, page, pixels, rows);
+    }
+
+    /// 该图集是否有一笔上传已入队、还没被命令列表消费（离屏目标的空闲判据）。
+    pub(crate) fn atlas_pending(&self, kind: AtlasKind) -> bool {
+        self.atlas.pending(kind)
     }
 
     /// 读回持久 offscreen（快照；阻塞到 GPU 完成）。

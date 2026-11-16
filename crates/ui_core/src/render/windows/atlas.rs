@@ -3,9 +3,11 @@
 //! 字形图集是 `R8_UNORM`（线性覆盖率），图片图集是 `B8G8R8A8_UNORM_SRGB`；两者都是**懒分配**：
 //! 初始化只建 1×1 占位纹理（描述符始终有效），首次上传时才按页尺寸建真实纹理；页尺寸变化
 //! （字形页换代扩容 / 首次图片页）会重建纹理并 retire 旧资源（DEVIATIONS F-208 / S-153）。
-//! 上传按**行区间**（`DirtyRows`）走每 in-flight 槽独立 staging 的 `CopyTextureRegion`。
+//! staging 有两档：**每槽常驻**一小块（≤ 1 MiB，增量上传复用）与**一次性**大块（整页上传，
+//! 录制后按帧 retire）。常驻容量因此不随图集页尺寸放大（DEVIATIONS F-216）。
 //!
-//! 页尺寸不跨线程传：它是 `pixels.len()` 的纯函数（`page = isqrt(len / texel)`）。
+//! 页尺寸随上传**显式过线**（S-153），不由 `pixels.len()` 反推：增量载荷只有脏行，长度
+//! 不足以恢复整页尺寸。
 
 use std::ops::Range;
 
@@ -21,7 +23,7 @@ use crate::{
     error::EngineError,
     paint::atlas::AtlasKind,
     render::{
-        atlas::{AtlasRebuilt, DirtyRows, texel_bytes},
+        atlas::{AtlasRebuilt, DirtyRows, MAX_RESIDENT_STAGING_BYTES, texel_bytes},
         frame::MAX_FRAMES_IN_FLIGHT,
         retire::GpuResourceHandle,
         windows::{
@@ -61,10 +63,6 @@ struct StagingSlot {
 unsafe impl Send for StagingSlot {}
 
 impl StagingSlot {
-    fn new(device: &mut Device, row_pitch: u32) -> Result<Self, EngineError> {
-        Self::new_with_rows(device, row_pitch, STAGING_ROWS)
-    }
-
     fn new_with_rows(device: &mut Device, row_pitch: u32, rows: u32) -> Result<Self, EngineError> {
         let buffer = create_buffer(
             device,
@@ -147,6 +145,11 @@ impl AtlasTextures {
         self.pending.iter().any(Option::is_some)
     }
 
+    /// 该图集是否有一笔上传已入队、还没被命令列表消费（离屏目标的空闲判据）。
+    pub(crate) fn pending(&self, kind: AtlasKind) -> bool {
+        self.pending[kind.index() as usize].is_some()
+    }
+
     /// 入队一页的脏行（`pixels` 是 `rows` 顺序**紧密打包**的行，DEVIATIONS F-211）。
     ///
     /// `pixels` 按**所有权**移动进待上传槽，避免槽 → 纹理之间再复制一次。长度必须等于
@@ -171,6 +174,10 @@ impl AtlasTextures {
             AtlasKind::Glyph => 0,
             AtlasKind::Image => 1,
         };
+        assert!(
+            self.pending[slot].is_none(),
+            "atlas payload slot must be consumed before the next upload (kind {kind:?})"
+        );
         self.pending[slot] = Some(PendingUpload { page, pixels, rows });
     }
 
@@ -280,7 +287,11 @@ impl AtlasTexture {
         )?;
         let mut staging = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
-            staging.push(StagingSlot::new(device, row_pitch)?);
+            staging.push(StagingSlot::new_with_rows(
+                device,
+                row_pitch,
+                resident_rows(row_pitch),
+            )?);
         }
         Ok(Self {
             kind,
@@ -299,7 +310,10 @@ impl AtlasTexture {
         // 旧纹理：GPU 已空闲（prepare 里 wait_idle），字段替换即释放。
         self.resource = resource;
         for slot in &mut self.staging {
-            let old = std::mem::replace(slot, StagingSlot::new(device, row_pitch)?);
+            let old = std::mem::replace(
+                slot,
+                StagingSlot::new_with_rows(device, row_pitch, resident_rows(row_pitch))?,
+            );
             // 旧 staging 的句柄表项也要一并释放（否则它会把 COM 引用留到设备销毁）。
             device.release(old.handle);
         }
@@ -343,15 +357,39 @@ impl AtlasTexture {
         // 每一段必须在 staging 里**各有位置**：同一 staging 上先写后画的多次拷贝会在 GPU 执行时
         // 读到最后一块的字节（V-64）。因此先按本帧所有段的**总行数**保证容量，再按累计行偏移
         // 把各段顺序落位；`packed_row` 是打包缓冲里的累计行号（源数据只有脏行）。
-        let total_rows: u32 = spans.iter().map(|span| span.end - span.start).sum();
-        self.ensure_staging(device, slot, total_rows, retired)?;
+        //
+        // 行必须落在页内：`pack_rows` / `row_count` 已按页钳过长度，这里若还越页说明打包
+        // 缓冲与行描述不是同一份数据，按契约错误立刻失败（否则下面的 `ptr::add` 会读穿堆）。
+        let total_rows: u32 = spans
+            .iter()
+            .map(|span| {
+                assert!(
+                    span.start < span.end && span.end <= self.page,
+                    "atlas dirty span {span:?} is outside the {}-row page",
+                    self.page
+                );
+                span.end - span.start
+            })
+            .sum();
+        // 小上传复用每槽常驻 staging；整页级的大上传用一次性缓冲（录制后 retire），
+        // 常驻容量不随页尺寸放大（DEVIATIONS F-216）。
+        let total_bytes = u64::from(total_rows) * u64::from(self.row_pitch);
+        let mut transient = None;
+        if total_bytes <= MAX_RESIDENT_STAGING_BYTES {
+            self.ensure_staging(device, slot, total_rows, retired)?;
+        } else {
+            let temp = StagingSlot::new_with_rows(device, self.row_pitch, total_rows)?;
+            retired.push(temp.handle);
+            transient = Some(temp);
+        }
+        let staging = transient.as_ref().unwrap_or(&self.staging[slot]);
         let mut staging_row = 0;
         let mut packed_row = 0;
         for span in spans {
             let rows = span.end - span.start;
             self.upload_chunk(
                 list,
-                slot,
+                staging,
                 kind,
                 pending,
                 Chunk {
@@ -399,19 +437,15 @@ impl AtlasTexture {
     fn upload_chunk(
         &self,
         list: &ID3D12GraphicsCommandList,
-        slot: usize,
+        staging: &StagingSlot,
         kind: AtlasKind,
         pending: &PendingUpload,
         chunk: Chunk,
     ) -> Result<(), EngineError> {
-        let staging = &self.staging[slot];
-        // SAFETY: `staging[slot]` 由 `ensure_staging` 保证容量 ≥ 本帧总行数；指针是该槽的持久
-        // 映射（DEVIATIONS F-210），`staging_row + rows` 不超过容量，源页由 `queue_upload`
-        // 的整页尺寸断言保证。
+        // SAFETY: `staging` 的容量 ≥ 本帧总行数；指针是该槽的持久映射（DEVIATIONS F-210），
+        // `staging_row + rows` 不超过容量，源页由 `queue_upload` 的整页尺寸断言保证。
         unsafe {
             for row in 0..chunk.rows {
-                let source_row = chunk.source_row + row;
-                let _ = source_row;
                 let source = pending
                     .pixels
                     .as_ptr()
@@ -501,6 +535,11 @@ fn align_up(value: u32, alignment: u32) -> u32 {
     value.div_ceil(alignment) * alignment
 }
 
+/// 每槽常驻 staging 的初始行数：受 1 MiB 上限与 [`STAGING_ROWS`] 双重约束。
+fn resident_rows(row_pitch: u32) -> u32 {
+    ((MAX_RESIDENT_STAGING_BYTES / u64::from(row_pitch)) as u32).clamp(1, STAGING_ROWS)
+}
+
 fn create_texture(
     device: &Device,
     width: u32,
@@ -585,8 +624,8 @@ fn create_resource(
 
 #[cfg(test)]
 mod tests {
-    use super::{AtlasTextures, align_up};
-    use crate::render::atlas::MAX_ATLAS_PAGE;
+    use super::{AtlasTextures, STAGING_ROWS, align_up, resident_rows};
+    use crate::render::atlas::{MAX_ATLAS_PAGE, MAX_RESIDENT_STAGING_BYTES};
 
     /// 测试页：2048² 的纹理在 WARP 上代价过高（且会拖垮并行的 GPU 测试）。
     const TEST_PAGE: u32 = 64;
@@ -599,6 +638,25 @@ mod tests {
     fn row_pitch_is_256_aligned_for_both_texels() {
         assert_eq!(align_up(MAX_ATLAS_PAGE, 256), 2048);
         assert_eq!(align_up(MAX_ATLAS_PAGE * 4, 256), 8192);
+    }
+
+    /// 常驻 staging 永远不超过 1 MiB：整页级上传走一次性缓冲（F-216）。
+    #[test]
+    fn resident_staging_stays_within_the_cap() {
+        for pitch in [256u32, 512, 1024, 2048, 4096, 8192] {
+            let rows = resident_rows(pitch);
+            assert!(
+                (1..=STAGING_ROWS).contains(&rows),
+                "pitch {pitch}: {rows} rows"
+            );
+            assert!(
+                u64::from(rows) * u64::from(pitch) <= MAX_RESIDENT_STAGING_BYTES,
+                "pitch {pitch}: {} bytes",
+                u64::from(rows) * u64::from(pitch)
+            );
+        }
+        assert_eq!(resident_rows(8192), 128, "2048² 图片页的行宽");
+        assert_eq!(resident_rows(256), STAGING_ROWS);
     }
 
     #[test]

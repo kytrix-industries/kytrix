@@ -16,6 +16,7 @@ use crate::{
     math::{PhysicalRect, Point, Rect, Scale, Size},
     node::{dirty::DirtyFlags, id::NodeId, tree::NodeTree},
     paint::{
+        atlas::AtlasKind,
         color::{Color, ColorResolver, Interpolation},
         instance::{InstanceBuffer, InstanceEncoder},
         pass::{PaintPass, PaintReport},
@@ -29,6 +30,9 @@ use crate::{
         timer::FrameTimings,
     },
 };
+
+/// 图集行没赶上帧时，最多连续补几帧（窗口的共享槽长期不空时避免空转）。
+const MAX_ATLAS_FOLLOWUPS: u8 = 3;
 
 /// 窗口句柄：单调递增、**永不复用**（陈旧 id 落回 `None`，因此不需要代际）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -294,6 +298,13 @@ pub struct Window {
     glyph_page_received: Option<u32>,
     /// 同上，图片图集页。
     image_page_received: Option<u32>,
+    /// 每个图集在本窗口上「已写脏、还没入队」的行。
+    ///
+    /// 共享槽忙（GPU 线程还没录制上一笔上传）的窗口不参与全局等待：新行先攒在这里，
+    /// 等该窗口的槽空闲再补发。否则一个不再出帧的窗口会永久占住图集上传（DEVIATIONS F-211）。
+    atlas_rows: [crate::render::DirtyRows; 2],
+    /// 本窗口「图集行没赶上帧」的补帧次数（上限见 [`MAX_ATLAS_FOLLOWUPS`]）。
+    atlas_deferrals: u8,
     /// 本帧的分段计时（容量跨帧复用）。
     timings: FrameTimings,
     /// 本帧 lane 绘制序的复用缓冲（避免每帧分配）。
@@ -359,6 +370,8 @@ impl Window {
             renderer: None,
             glyph_page_received: None,
             image_page_received: None,
+            atlas_rows: std::array::from_fn(|_| crate::render::DirtyRows::default()),
+            atlas_deferrals: 0,
             timings: FrameTimings::new(),
             paint_order: Vec::new(),
             full_damage_pending: false,
@@ -769,45 +782,89 @@ impl Window {
         self.image_page_received.is_some()
     }
 
-    /// 已收到的字形页尺寸是否就是 `page`（否则这一帧必须整页重传）。
-    pub(crate) fn glyph_page_matches(&self, page: u32) -> bool {
-        self.glyph_page_received == Some(page)
-    }
-
-    /// 已收到的图片页尺寸是否就是 `page`。
-    pub(crate) fn image_page_matches(&self, page: u32) -> bool {
-        self.image_page_received == Some(page)
-    }
-
-    /// 记账：字形页已整页上传到本窗口的渲染器（记录页尺寸）。
-    pub(crate) fn mark_glyph_page_received(&mut self, page: u32) {
-        self.glyph_page_received = Some(page);
-    }
-
-    /// 记账：图片页已整页上传到本窗口的渲染器（记录页尺寸）。
-    pub(crate) fn mark_image_page_received(&mut self, page: u32) {
-        self.image_page_received = Some(page);
-    }
-
-    /// 把一页图集像素交给渲染器（下一次 `submit` 上传；无渲染器时丢弃）。
-    ///
-    /// `pixels` 是 `rows` 顺序**紧密打包**的行（每行 `page * texel` 字节；整页上传时就是整页），
-    /// 因此增量上传只搬脏行（DEVIATIONS F-211）。消费者：`App::upload_atlas_pages`（广播给所有
-    /// 窗口的渲染器；图集页是进程级共享数据，纹理是每窗口一份）。
-    pub(crate) fn queue_atlas_upload(
-        &mut self,
-        kind: crate::paint::atlas::AtlasKind,
-        page: u32,
-        pixels: &[u8],
-        rows: crate::render::DirtyRows,
-    ) {
-        if let Some(renderer) = self.renderer.as_mut() {
-            renderer.queue_atlas_upload(kind, page, pixels, rows);
+    /// 已收到的整页尺寸是否就是 `page`（否则这一帧必须整页重传）。
+    pub(crate) fn atlas_page_matches(&self, kind: AtlasKind, page: u32) -> bool {
+        match kind {
+            AtlasKind::Glyph => self.glyph_page_received == Some(page),
+            AtlasKind::Image => self.image_page_received == Some(page),
         }
     }
 
+    /// 记账：该图集页已整页入队到本窗口的渲染器（记录页尺寸）。
+    pub(crate) fn mark_atlas_page_received(&mut self, kind: AtlasKind, page: u32) {
+        match kind {
+            AtlasKind::Glyph => self.glyph_page_received = Some(page),
+            AtlasKind::Image => self.image_page_received = Some(page),
+        }
+    }
+
+    /// 该图集在本窗口的整页记账作废：下一次必须整页重传（渲染器换代 / 图集清空）。
+    pub(crate) fn mark_atlas_page_stale(&mut self, kind: AtlasKind) {
+        match kind {
+            AtlasKind::Glyph => self.glyph_page_received = None,
+            AtlasKind::Image => self.image_page_received = None,
+        }
+    }
+
+    /// 本窗口待上传的图集脏行（忙窗口攒着，空闲时补发）。
+    pub(crate) fn atlas_rows(&self, kind: AtlasKind) -> &crate::render::DirtyRows {
+        &self.atlas_rows[kind.index() as usize]
+    }
+
+    /// 本窗口待上传的图集脏行（可变：并入本帧新写的行）。
+    pub(crate) fn atlas_rows_mut(&mut self, kind: AtlasKind) -> &mut crate::render::DirtyRows {
+        &mut self.atlas_rows[kind.index() as usize]
+    }
+
+    /// 本窗口的待发行已入队（或已被整页上传覆盖）。
+    pub(crate) fn clear_atlas_rows(&mut self, kind: AtlasKind) {
+        self.atlas_rows[kind.index() as usize].clear();
+    }
+
+    /// 本窗口还有没赶上帧的图集行：这一帧会以旧图集呈现，需要补一帧。
+    pub(crate) fn atlas_rows_pending(&self) -> bool {
+        self.atlas_rows.iter().any(|rows| !rows.is_empty())
+    }
+
+    /// 记一次「图集行没赶上帧」；返回是否还应再补一帧（上限 [`MAX_ATLAS_FOLLOWUPS`]，
+    /// 槽长期不空时不能无限空转）。
+    pub(crate) fn note_atlas_deferral(&mut self) -> bool {
+        if self.atlas_deferrals >= MAX_ATLAS_FOLLOWUPS {
+            return false;
+        }
+        self.atlas_deferrals += 1;
+        true
+    }
+
+    /// 图集行已经全部入队：补帧计数复位。
+    pub(crate) fn reset_atlas_deferrals(&mut self) {
+        self.atlas_deferrals = 0;
+    }
+
+    /// 请求下一帧（全量 damage）：平台泵用它补发没赶上本帧的图集行。
+    pub(crate) fn request_repaint(&mut self) {
+        self.full_damage_pending = true;
+    }
+
+    /// 把一页图集像素交给渲染器；`false` = 没有渲染器或渲染器已关闭（**没有**入队）。
+    ///
+    /// `pixels` 是 `rows` 顺序**紧密打包**的行（每行 `page * texel` 字节；整页上传时就是整页），
+    /// 因此增量上传只搬脏行（DEVIATIONS F-211）。消费者：`App::upload_atlas_pages`（逐窗口
+    /// 分发；图集页是进程级共享数据，纹理是每窗口一份）。
+    pub(crate) fn queue_atlas_upload(
+        &mut self,
+        kind: AtlasKind,
+        page: u32,
+        pixels: &[u8],
+        rows: crate::render::DirtyRows,
+    ) -> bool {
+        self.renderer
+            .as_mut()
+            .is_some_and(|renderer| renderer.queue_atlas_upload(kind, page, pixels, rows))
+    }
+
     /// 该图集的图集上传槽是否空闲（UI 线程据此决定这一帧能否入队，DEVIATIONS F-211）。
-    pub(crate) fn atlas_idle(&self, kind: crate::paint::atlas::AtlasKind) -> bool {
+    pub(crate) fn atlas_idle(&self, kind: AtlasKind) -> bool {
         self.renderer
             .as_ref()
             .is_none_or(|renderer| renderer.atlas_idle(kind))
@@ -820,6 +877,7 @@ impl Window {
         self.renderer = Some(renderer);
         self.glyph_page_received = None;
         self.image_page_received = None;
+        self.atlas_rows = std::array::from_fn(|_| crate::render::DirtyRows::default());
     }
 
     /// 轮询 renderer 的反馈 / 错误（三平台窗口路径；空闲时也要跑）。
@@ -870,6 +928,7 @@ impl Window {
         self.renderer = Some(Renderer::new_offscreen(surface)?);
         self.glyph_page_received = None;
         self.image_page_received = None;
+        self.atlas_rows = std::array::from_fn(|_| crate::render::DirtyRows::default());
         Ok(())
     }
 

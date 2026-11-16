@@ -533,6 +533,11 @@ impl GpuRenderer {
         self.atlas.queue_upload(kind, page, pixels, rows);
     }
 
+    /// 该图集是否有一笔上传已入队、还没被命令缓冲消费（离屏目标的空闲判据）。
+    pub(crate) fn atlas_pending(&self, kind: AtlasKind) -> bool {
+        self.atlas.pending(kind)
+    }
+
     /// 读回持久 offscreen（快照路径；同步等待 GPU）。
     ///
     /// 调用方（`submit_snapshot` → `finish_sync`）已经等过本帧的槽 fence，所以这里只需要

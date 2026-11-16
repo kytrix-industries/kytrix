@@ -2818,7 +2818,7 @@ GPU 线程只按新内容尺寸重画并 1:1 覆盖，buffer 用 grow-only 高�
 | 设计原文   | `platform/windows/composition.rs` / `async-render-pipeline.md` §36：`buffer_size(content) = round_up_256(content + 512)`，缩容只回到同一个带 512 余量的桶。                                                          |
 | 偏差       | `BUFFER_HEADROOM = 64`（256 对齐不变，因此真实余量 64…319 px）；`BUFFER_COUNT` 仍为 3（用户明确保留）。                                                                                                          |
 | 原因       | 1200×925 的 demo 内容在 512 余量下常驻 1792×1536（面积 ≈ 2.4×），persist + 3 back buffer = 42 MiB；改 64 后桶是 1280×1024，4 块合计 ≈ 20 MiB（−22 MiB）。64 物理 px 已是拖拽步长的几十倍，且桶只是「重建阈值」，不影响 1:1 呈现语义。 |
-| 代价       | 拖动中越过桶边界的次数变多 ⇒ 每次都要 `wait_idle` + 重建交换链 + prime（纯背景一帧）。这是用户拍板接受的内存/平滑度取舍。                                                                                        |
+| 代价       | 阈值处的余量从 512…767 px 降到 64…319 px ⇒ 拖动中越过阈值立刻重建的次数变多（桶间距恒 256，总重建次数仍是 Δ/256 量级）；每次重建要 `wait_idle` + 重建交换链 + prime（纯背景一帧）。这是用户拍板接受的内存/平滑度取舍。 |
 | 不变       | 内容 visual 恒 1:1、背景层 1×1、缩容 2 s 延迟、`Present1` dirty rects、桶逐轴取大的正确性约束（P1-A）。                                                                                                          |
 
 ### S-153 图集页尺寸由像素长度推导（不新增跨线程字段）
@@ -2828,12 +2828,12 @@ GPU 线程只按新内容尺寸重画并 1:1 覆盖，buffer 用 grow-only 高�
 **显式收页尺寸**，并用 `pixels.len() == 行数 × page × texel` 的硬断言兜住契约；页尺寸随上传一起
 过线，不需要从长度反推。
 
-### V-133 待复核（批次 A 落地后）
+### V-133 复核结论（批次 A 落地后）
 
-1. 三平台“首次插入图片选档”与“字形页 512→1024 增长”的实机行为（纹理重建 + 绑定重写 + 首帧内容）；
-2. WARP / lavapipe / Metal validation 对 1×1 占位 → 实际页重建的投诉；
-3. 图片页锁档后大图插入的 `Capacity` 错误路径（应用可见文案）；
-4. 批次 A 的内存收益复测（Windows 私有提交 / GPU Local，macOS footprint，Linux RSS）。
+1. 三平台「首次插入图片选档」与「字形页 512→1024 增长」的实机行为（纹理重建 + 绑定重写 + 首帧内容）：**已复核**（37.2.1；Windows WARP / macOS Metal / Linux lavapipe 均通过）。
+2. 1×1 占位 → 实际页重建：**已复核**，三端 validation 无投诉。
+3. 图片页锁档后大图插入的 `Capacity` 路径：文案已改为「页尺寸由首图锁定」，锁档本身是 F-208 的既定取舍（应用长期持有归一化 UV，换页必须重写 UV，不可行）。
+4. 批次 A 的内存收益复测：**已完成**（37.1 / 37.2.1）。
 
 ### 37.1 批次 A 实测（Windows 本机，1200×925 物理，demo `--features hud`）
 
@@ -2845,9 +2845,10 @@ GPU 线程只按新内容尺寸重画并 1:1 覆盖，buffer 用 grow-only 高�
 | 私有已提交（`VirtualQueryEx` 直方图） | 195.2 MB | 98.7 MB | −96.5 MB |
 | `PAGE_NOCACHE`（上传堆） | 88.3 MB | 40.2 MB | −48.1 MB |
 
-资源清单变化（按实测日志）：图片图集 16 MiB 纹理 + 16 MiB CPU 页 + 20 MiB staging → 512² 档的
-1 MiB + 1 MiB + ~3 MiB；字形页 4 MiB 纹理 + 8.5 MiB staging → 512² 档（demo 的 CJK 字形量下）
-0.25 MiB + ~1.5 MiB。内容 persist + 交换链（42 MiB）不变，属批次 C。
+资源清单变化（按实测日志）：图片图集 16 MiB 纹理 + 16 MiB CPU 页 + staging（每槽按本次上传扩容）→
+512² 档的 1 MiB + 1 MiB + ~1 MiB；字形页 4 MiB 纹理 + ~1.5 MiB staging（3 槽 × 256 行 × 2048 B）
+→ 512² 档的 0.25 MiB + ~0.4 MiB。F-216 之后每槽常驻 staging 另有 1 MiB 上限。内容 persist +
+交换链（42 MiB）不变，属批次 C。
 
 功能验证：`cargo test -p ui_core --features "hud,test-support"` 全通过；demo 截图逐项正常
 （CJK 简/繁/日/韩、PNG 图标、色块、HUD）；跨 target `cargo check`（aarch64-apple-darwin /
@@ -2862,14 +2863,14 @@ x86_64-unknown-linux-gnu，后者按 V-04 的 pkg-config stub）exit 0。
 | 原因     | `Map`/`Unmap` 是 D3D12 里最贵的 CPU 调用之一（每次都要进入运行时的映射表）；UPLOAD 堆的映射本来就可以长期持有。实测每帧 2 次 + 每次图集上传 1 次都省掉。                                            |
 | 安全     | 写入仍受「槽位 fence 完成」约束（每槽独立缓冲 + retire），指针只在 `kytrix-d3d12` 线程使用；`unsafe impl Send` 只覆盖该独占约定。                                                                      |
 
-### F-211 图集增量上传改为「打包脏行 + 空闲门控」（批次 B）
+### F-211 图集增量上传：打包脏行 + 逐窗口分发（批次 B + 评审修复）
 
 | 项         | 内容                                                                                                                                                                                                                                                                          |
 |------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | 设计原文   | `App::upload_atlas_pages` 有脏就把**整页** `pixels` 广播给所有窗口（字形页每帧 4 MiB、图片页 16 MiB 的 CPU→共享槽拷贝），共享槽被覆盖时「整页标记」。                                                                                                                            |
-| 偏差       | ① `pixels` 语义改为**按 `rows` 顺序紧密打包的行**（整页上传时就是整页）：新增 `DirtyRows::row_count(page)` 与 `render::atlas::pack_rows`；三端 `queue_upload(kind, page, pixels, rows)` 显式收页尺寸（删除 `page_from_len`），长度 = `行数 × page × texel` 的硬断言。② 字形页上传改用**真实脏行**（`atlas.take_dirty_rows()` 合并到 `pending_dirty`），图片页继续用 `ResourceCache::take_dirty_rows()`。③ 共享槽入队前用 `Renderer::atlas_idle(kind)` 门控（原子 `atlas_pending`）：槽被 GPU 线程消费前**不再入队**，脏行留在 `App::pending_dirty` / 分配器里下一帧再发——彻底消除了「覆盖丢行 ⇒ 只能整页重传」的旧路径。④ 每个窗口记录**已收到的页尺寸**（`Option<u32>`）；只有页尺寸不匹配（新窗口 / 渲染器重建 / 页换代）才发整页。⑤ `App` 复用整页缓冲 `glyph_page` 与打包缓冲 `packed`，不再每次上传分配。 |
-| 正确性     | 页变化（首次 / 字形页换代）必须整页上传（新纹理内容未定义）：三端 `prepare` 重建后硬断言 `rows` 覆盖整页；`mark(0, page)` 与 `mark(0, u32::MAX)` 等价接受。macOS / Linux 的 staging 仍是**每帧一次性缓冲**（按 `index` retire），逐段 `buffer_offset` 与 `image_offset` 各自落位（V-64 的教训）。                                                            |
-| 未做（记录） | macOS / Linux 的 staging 环形缓冲（每槽常驻复用）仍按原设计保留一次性分配：它只影响上传瞬间的峰值 / CPU 分配，不影响常驻内存；留作 V-134 复核项。                                                                                                                          |
+| 偏差       | ① `pixels` 语义改为**按 `rows` 顺序紧密打包的行**（整页上传时就是整页）：`DirtyRows::row_count(page)` + `render::atlas::pack_rows`；三端 `queue_upload(kind, page, pixels, rows)` 显式收页尺寸（删除 `page_from_len`），长度 = `行数 × page × texel` 的硬断言。② 字形页用 `atlas.take_dirty_rows()` 合并进 `pending_dirty`，图片页用 `ResourceCache::take_dirty_rows()`。③ **逐窗口分发**（评审修复）：`Window::atlas_rows[kind]` 保存该窗口尚未入队的行；`App` 每帧把全局脏行并进每个窗口，空闲窗口立刻打包入队，忙窗口把行攒到下一次——一个不再出帧/最小化的窗口不会拖住其它窗口。④ 共享槽标志只在**录制成功**后清：`take_atlas` 只搬走上传，GPU 线程在 `submit_frame` 返回 `Presented` 后调 `atlas_uploaded(kind)`；`AtlasTextures::pending` 非空时再入队是硬断言（Retry / Idle 帧不会被下一笔覆盖）。⑤ 每个窗口记录**已收到的页尺寸**；页尺寸不匹配**或** `rows.is_full()` 才发整页，且只有入队成功才记账。⑥ 图集 `clear()`（DPI 换代 / 容量逃逸）通过 `GlyphAtlas::take_cleared` 强制整页重建，`glyph_page` 在页尺寸变化/清空后**清零重建**。⑦ `GlyphAtlas::write_rows` 只写脏行覆盖到的字形（增量帧的 CPU 代价随脏行数而不是字形总数增长）；整页缓冲 `glyph_page` 与打包缓冲 `packed` 跨帧复用。⑧ 图集行/整页没赶上本帧（窗口槽还忙）时，`App::frame` 在提交后置全量 damage + `Dispatcher::wake` 补一帧（F-217，上限 3 帧），否则静态窗口会把旧图集的画面一直留着。 |
+| 正确性     | 页变化（首次 / 字形页换代）必须整页上传（新纹理内容未定义）：三端 `prepare` 重建后硬断言 `rows` 覆盖整页；`mark(0, page)` 与 `mark(0, u32::MAX)` 等价接受。macOS / Linux 的 staging 见 F-212（每槽常驻）与 F-216（常驻上限）。逐段 `buffer_offset` 与 `image_offset` 各自落位（V-64 的教训）。 |
+| 未做（记录） | 无。macOS / Linux 的 staging 已改为每槽常驻 + 1 MiB 上限（F-212 / F-216）。                                                                                                                                                                                                    |
 
 ### 37.2 批次 B/C 实测（Windows 本机，其余条件同 §37.1）
 
@@ -2914,8 +2915,8 @@ x86_64-unknown-linux-gnu，后者按 V-04 的 pkg-config stub）exit 0。
    `Option<ShadowSpec>` 等定长值，逐节点 `clone()` 不分配堆；
 3. `Layout` 克隆只在 `measure`/`layout_at`（宽度变化或重新断行）发生，静态文本不每帧重排；
 4. `FramePayload::from_buffer` 的 4 次分配 → 回收池（F-213）；
-5. `Canvas` 节点每帧深拷贝 → `Rc<Canvas>`（F-215）；
-6. 信号写入每帧 `Box::new` → 同类型原地复用（F-214）；
+5. 重建 canvas 节点所在 lane 时的 `Canvas` 深拷贝 → `Rc<Canvas>`（F-215；静态节点本来就不重建，demo 无 canvas，实测无收益）；
+6. 每次信号写入的 `Box::new` → 同类型原地复用（F-214；主要受益者是每帧写 transient 的动画，HUD 每 500 ms 才写一次）；
 7. 未做：`StateStore` 槽位回收（V-134，当前没有释放路径）。
 
 ### F-212 macOS / Linux 图集 staging 改为每槽常驻环
@@ -2923,10 +2924,30 @@ x86_64-unknown-linux-gnu，后者按 V-04 的 pkg-config stub）exit 0。
 | 项       | 内容                                                                                                                                                                                                                                      |
 |----------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | 设计原文 | macOS / Linux 每次图集上传分配一块一次性 staging，编码后按帧序号 retire（`OneShotStaging` / 一次性 `MTLBuffer`）。                                                                                                                        |
-| 偏差     | 每张页按 `MAX_FRAMES_IN_FLIGHT` 维护一块常驻 staging：`record_uploads` 收帧槽下标，容量够就复用、不够才重建（扩容换下的旧缓冲按 `index` retire）。macOS 是 `StorageModeShared` 的 `MTLBuffer`，Linux 是 host-visible + **持久映射**的 buffer。 |
+| 偏差     | 每张页按 `MAX_FRAMES_IN_FLIGHT` 维护一块常驻 staging：`record_uploads` 收帧槽下标，容量够就复用、不够才重建（扩容换下的旧缓冲按 `index` retire）。macOS 是 `StorageModeShared` 的 `MTLBuffer`，Linux 是 host-visible + **持久映射**的 buffer。常驻容量受 1 MiB 上限约束，更大的上传走一次性缓冲（F-216）。 |
 | 依据     | 槽位复用由队列契约保证「上一帧已完成」（macOS 三槽 semaphore / Linux `wait_slot`），因此覆盖写安全；每帧 1–2 次 `newBuffer` / `create_buffer + allocate_memory + bind + map` 全部消掉。                                                       |
 | 释放     | Linux 当前环在 `AtlasTextures::drop` 里 unmap + destroy（扩容换下的旧环走句柄表）；macOS 的 `MTLBuffer` 由句柄表的 ARC 释放。                                                                                                              |
 | 测试     | 三端「两帧在飞」用例改为断言常驻环**不产生 retire** 且像素各自正确；Linux teardown 用例改为「扩容换下的旧环在未提交帧里由 `drain_all_retired` 释放」。                                                                                       |
+
+### F-216 图集 staging 常驻上限 1 MiB + 大上传一次性缓冲
+
+| 项       | 内容                                                                                                                                                                                                 |
+|----------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 设计原文 | F-212 的每槽常驻 staging 按本帧上传字节扩容（三端一致）。                                                                                                                                            |
+| 问题     | 整页上传（首次图片页 / 新窗口 / 字形页换代）会把每槽扩到整页大小：2048² 图片页 = 16 MiB/槽 × 3 槽 = **48 MiB/窗口常驻**，与本次「降常驻内存」目标相反；demo 的 512 页掩盖了它。                        |
+| 偏差     | 常驻上限 `MAX_RESIDENT_STAGING_BYTES = 1 MiB`：Windows 初始行数取 `min(STAGING_ROWS, cap / row_pitch)`；超过上限的上传分配一次性 staging，录制后按帧 retire（Windows 句柄 / macOS `queue.retire` / Linux unmap + buffer/memory retire）。 |
+| 原因     | 整页上传只在首次与换代发生（低频），一次性分配的代价可忽略；常驻内存不随图集页尺寸放大。                                                                                                              |
+| 代价     | 整页上传每次多一次分配 + 释放；增量上传仍走常驻槽。                                                                                                                                                    |
+| 测试     | `resident_staging_stays_within_the_cap`（Windows）：任意 row pitch 下 `rows × pitch ≤ 1 MiB`。                                                                                                        |
+
+### F-217 图集上传没赶上帧时补一帧
+
+| 项       | 内容                                                                                                                                                                                                 |
+|----------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 问题     | `upload_atlas_pages` 分发时，窗口的共享槽可能还在消费上一笔（`atlas_pending` 为真），该窗口的增量行只能攒到下一次；而它自己的这一帧仍会提交并用旧纹理呈现。若之后没有新的 damage（静态窗口停止输入），缺字/旧图会一直停留。 |
+| 偏差     | `App::frame` 在 `commit_frame` 之后检查当前窗口：若仍有待发行，或整页仍不匹配（忙窗口），置 `full_damage_pending` 并 `Dispatcher::wake()` 请求补帧；槽空后补发并重绘。连续补帧上限 `MAX_ATLAS_FOLLOWUPS = 3`，槽长期不空时不空转。 |
+| 代价     | 极端时序下多一帧全量 damage（正常路径不触发）。                                                                                                                                                       |
+| 测试     | `a_deferred_atlas_frame_requests_a_follow_up`（WARP 离屏）：忙槽 → 第一帧后行仍在 → 补帧后行入队。                                                                                                    |
 
 ### F-213 `FramePayload` 缓冲跨线程回收池
 
@@ -2935,14 +2956,14 @@ x86_64-unknown-linux-gnu，后者按 V-04 的 pkg-config stub）exit 0。
 | 设计原文 | `FramePayload::from_buffer` 每帧新建 4 个容器（`Bytes` 实例 + ops/clips/geometry 三个 `Vec`，约 40 KiB/帧 ≈ 2.4 MiB/s）。                                                                                                    |
 | 偏差     | 实例字节改为 `Vec<u8>`；新增跨线程回收池（`OnceLock<Mutex<Vec<PayloadBuffers>>>`，上限 4 帧）：GPU 线程 drop 帧时把四个容器还池，UI 线程下一帧 `from_buffer` 直接取回并复用容量。`empty()` 的零容量帧不进池。                    |
 | 原因     | 三平台队列都各自持有「最新帧槽」，没有归还通道；把回收点放进 `Drop` 是唯一不改三端队列的零拷贝方案（锁每帧一次、临界区只做 4 次 `Vec` 移动）。                                                                                  |
-| 代价     | 池最多常驻 4 帧的容量（实测 ≤ 200 KiB）；`Drop` 里判零容量，纯空帧不占池位。                                                                                                                                                  |
+| 代价     | 池最多常驻 4 组的容量（demo ≈ 200 KiB；容量随窗口图元数增长，4K 窗口可达 MB 级）。`Drop` 里判零容量，纯空帧不占池位。                                                                                                        |
 | 测试     | `a_dropped_payload_returns_its_buffers_to_the_pool`：预置 4096 容量池项 → `from_buffer` 复用 → drop 后回池。                                                                                                                  |
 
 ### F-214 信号写入复用值 Box
 
 | 项       | 内容                                                                                                                                                                                        |
 |----------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| 设计原文 | `StateStore::set_owned` / `set_transient` 每次写入都 `Box::new(value)`，HUD 每帧写同一批信号 ⇒ 每帧 N 次堆分配。                                                                              |
+| 设计原文 | `StateStore::set_owned` / `set_transient` 每次写入都 `Box::new(value)`：动画每帧写 transient、HUD 每 500 ms 写一批文本信号 ⇒ 每次写入一次堆分配。                                                                            |
 | 偏差     | 类型一致时 `downcast_mut::<T>()` 原地赋值，复用已有 Box；类型不一致（引擎不变量被破坏）才重新装箱。                                                                                            |
 | 未做     | **槽位回收**（删除节点后释放槽）仍未实现：`SignalId` 是稠密下标、没有代际，节点树也没有「释放某节点信号」的路径；引入代际 free list 会改动依赖图与所有句柄类型，风险远大于收益（静态场景下槽数不增长）。见 V-134 ①。                |
 | 测试     | `rewriting_an_owned_value_reuses_its_box`：同类型重写后值的地址不变。                                                                                                                            |
@@ -2951,10 +2972,10 @@ x86_64-unknown-linux-gnu，后者按 V-04 的 pkg-config stub）exit 0。
 
 | 项       | 内容                                                                                                                                                                        |
 |----------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| 设计原文 | `NodeKind::Canvas(Canvas)` / `Primitive::Canvas(Canvas)`；paint 每个 canvas 节点每帧 `Box::new(canvas.clone())` 深拷贝画布的 `Vec<Primitive>`。                                |
+| 设计原文 | `NodeKind::Canvas(Canvas)` / `Primitive::Canvas(Canvas)`；paint 重建一个 canvas 节点所在的 lane 时深拷贝 `Canvas` 的 `Vec<Primitive>`（静态节点不会被重建，但任何 canvas 动画/信号变化都会触发）。 |
 | 偏差     | `NodeKind::Canvas(Rc<Canvas>)`、`Primitive::Canvas(Rc<Canvas>)`、`Content::Canvas(Rc<Canvas>)`：paint 只做 `Rc::clone`，公共构造入口 `NodeBuilder::canvas(Canvas)` 不变。        |
-| 原因     | `Canvas` 内嵌 `Lane { primitives: Vec<Primitive>, .. }`，深拷贝是真实分配；共享后每帧零拷贝。                                                                                 |
-| 测试     | 全部 804 个 lib 用例（含实例编码的 canvas 展开）通过。                                                                                                                         |
+| 原因     | `Canvas` 内嵌 `Lane { primitives: Vec<Primitive>, .. }`，重建 lane 时的深拷贝是真实分配；共享后零拷贝（demo 没有 canvas 节点，因此实测数字不含这部分收益）。                 |
+| 测试     | lib 全量用例（含实例编码的 canvas 展开）通过；`Primitive` 的 8 变体 clone/eq/debug 用例覆盖 `Rc<Canvas>`。                                                                     |
 
 ### V-134 仍未做（记录）
 
