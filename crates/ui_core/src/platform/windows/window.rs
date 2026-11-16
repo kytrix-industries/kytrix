@@ -348,26 +348,14 @@ impl NativeWindow {
     }
 
     /// 应用新的 DPI 比例（`WM_DPICHANGED`）：更新最小尺寸，并按新 DPI 重算窗口尺寸。
+    /// 按新 DPI 重排窗口：保持逻辑尺寸不变，重算非客户区。
+    ///
+    /// **只在没有系统建议矩形时用**（`WM_DPICHANGED` 带建议矩形时走 [`Self::note_scale`] +
+    /// [`Self::place`]：先按旧尺寸重排一次再套建议矩形会产生可见跳变和一次多余布局）。
     pub(crate) fn apply_scale(&mut self, scale: Scale, dpi: u32) -> Result<(), EngineError> {
-        self.scale = scale;
-        // 旧 cursor_area 是物理像素；DPI 变化后在下一次 sync 前不得被 WM_IME_START 复用。
-        self.state_mut().clear_ime_cursor_area();
-        let min = (
-            (MIN_SIZE_LOGICAL.0 * scale.factor()).round() as u32,
-            (MIN_SIZE_LOGICAL.1 * scale.factor()).round() as u32,
-        );
-        // SAFETY: `state` 独占；只写 `min_size`。
-        unsafe {
-            (*self.state).set_min_size(min);
-        }
-        // 最小化时客户区是 0×0、`logical_size` 保留着上一次真实尺寸：不能拿 0 或最小尺寸去
-        // 重排窗口（那会把恢复后的窗口压成最小尺寸，P2-3）。恢复时的 `WM_SIZE` /
-        // `WM_DPICHANGED` 会重新走到这里。
-        if self.is_minimized() || self.logical_size.width <= 0.0 || self.logical_size.height <= 0.0
-        {
+        if !self.note_scale(scale, dpi) {
             return Ok(());
         }
-        // 让窗口按新的 DPI 重新计算非客户区（`WM_NCCALCSIZE` 由系统标题栏处理）。
         let window_size =
             dpi::window_size_for_client(physical_client(self.logical_size, scale), dpi);
         // SAFETY: 窗口存活；只改尺寸，不重建。
@@ -384,6 +372,31 @@ impl NativeWindow {
         }
         .map_err(|error| window_error("SetWindowPos(WM_DPICHANGED)", error))?;
         Ok(())
+    }
+
+    /// 只记账新 DPI / scale（不移动、不缩放窗口）。
+    ///
+    /// 返回 `false` = 窗口当前没有可用的逻辑尺寸（最小化 / 尚未布局），调用方不要重排。
+    pub(crate) fn note_scale(&mut self, scale: Scale, dpi: u32) -> bool {
+        self.scale = scale;
+        // 旧 cursor_area 是物理像素；DPI 变化后在下一次 sync 前不得被 WM_IME_START 复用。
+        self.state_mut().clear_ime_cursor_area();
+        // `ptMinTrackSize` 是外框尺寸：与 `apply_dpi_and_size` 用同一条换算（P2-1）。
+        let min = dpi::window_size_for_client(
+            (
+                (MIN_SIZE_LOGICAL.0 * scale.factor()).round() as u32,
+                (MIN_SIZE_LOGICAL.1 * scale.factor()).round() as u32,
+            ),
+            dpi,
+        );
+        // SAFETY: `state` 独占；只写 `min_size`。
+        unsafe {
+            (*self.state).set_min_size((min.0.max(1) as u32, min.1.max(1) as u32));
+        }
+        // 最小化时客户区是 0×0、`logical_size` 保留着上一次真实尺寸：不能拿 0 或最小尺寸去
+        // 重排窗口（那会把恢复后的窗口压成最小尺寸，P2-3）。恢复时的 `WM_SIZE` /
+        // `WM_DPICHANGED` 会重新走到这里。
+        !(self.is_minimized() || self.logical_size.width <= 0.0 || self.logical_size.height <= 0.0)
     }
 
     /// 同步 `logical_size` 字段（客户区被用户拖动改变之后由事件循环调用）。

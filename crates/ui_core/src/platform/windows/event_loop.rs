@@ -1003,14 +1003,13 @@ fn apply_event(
             let scale = dpi::scale_from_dpi(dpi).ok_or(EngineError::InvalidDpiScale {
                 factor: dpi as f32 / dpi::BASE_DPI as f32,
             })?;
-            native.apply_scale(scale, dpi)?;
-            if let Some(rect) = suggested {
-                // 最小化时系统建议的矩形会改掉恢复后的大小；与 `apply_scale` 的守卫一致：
-                // 0×0 / 最小化窗口不移动、不缩放（P2-3）。
-                let logical = native.logical_size();
-                if !native.is_minimized() && logical.width > 0.0 && logical.height > 0.0 {
-                    native.place(rect)?;
-                }
+            // 有系统建议矩形时**不要**先按旧尺寸重排（P2-2）：那会先跳一次再套建议矩形，
+            // 可见抖动 + 一次多余布局。只记账新 DPI，位置与尺寸完全交给建议矩形。
+            let resizable = native.note_scale(scale, dpi);
+            match suggested {
+                Some(rect) if resizable && !native.is_minimized() => native.place(rect)?,
+                // 没有可用建议矩形（系统没给 / 窗口最小化）：保持逻辑尺寸，按新 DPI 重排一次。
+                _ => native.apply_scale(scale, dpi)?,
             }
             if let Some(window) = app.window_mut(id) {
                 window.set_scale(scale);
