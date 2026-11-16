@@ -348,8 +348,32 @@ impl Device {
     }
 }
 
-/// 第一个非软件适配器。
+/// 选硬件适配器：优先**高性能**（独显），再退回「第一个非软件适配器」。
+///
+/// 混合显卡机器（笔记本 / 台式双卡）上 `EnumAdapters1` 的枚举顺序通常是 iGPU 在前，
+/// 直接取第一个非软件适配器会静默用上核显。D3D12 官方推荐的做法是
+/// `EnumAdapterByGpuPreference(DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)`：它会挑驱动声明的
+/// 高性能适配器（无独显时等价于默认顺序）。
+///
+/// 保留旧枚举作为兜底：`IDXGIFactory6` 不可用（极老的 DXGI）时仍能拿到一个硬件适配器。
 fn pick_hardware_adapter(factory: &IDXGIFactory4) -> Result<IDXGIAdapter1, EngineError> {
+    // `cast` 是安全的 COM 查询（失败只说明 IDXGIFactory6 不可用）。
+    if let Ok(factory6) = factory.cast::<IDXGIFactory6>() {
+        // SAFETY: 句柄由调用方持有，参数与输出结构在调用期间有效。
+        if let Ok(adapter) = unsafe {
+            factory6.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                0,
+                DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+            )
+        } {
+            // SAFETY: 适配器句柄由本函数持有到返回。
+            let desc = unsafe { adapter.GetDesc1() }
+                .map_err(|error| init_error_from("GetDesc1", error))?;
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                return Ok(adapter);
+            }
+        }
+    }
     let mut index = 0u32;
     loop {
         // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。

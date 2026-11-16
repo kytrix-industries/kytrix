@@ -10,7 +10,7 @@
 //! GPU 线程**不**碰这里的任何属性：它只读 drawable 纹理的实际尺寸（§5.4 的最后校验）。
 
 use objc2::rc::Retained;
-use objc2_core_graphics::CGColor;
+use objc2_core_graphics::{CGColor, CGColorSpace, kCGColorSpaceSRGB};
 use objc2_foundation::NSSize;
 use objc2_metal::MTLPixelFormat;
 use objc2_quartz_core::CAMetalLayer;
@@ -63,6 +63,13 @@ pub(crate) fn new_layer(
     layer.setDisplaySyncEnabled(true);
     // SAFETY: 同别名上的说明：CoreAnimation 的全局字符串常量，进程生命周期内有效。
     layer.setContentsGravity(unsafe { LIVE_RESIZE_GRAVITY });
+    // **显式声明图层的颜色空间为 sRGB**（P2-3.1）：`CAMetalLayer` 默认跟随窗口所在屏幕的
+    // 颜色空间，在 P3 显示器上会变成 Display P3 —— 而我们写进去的内容是 sRGB 编码
+    // （`pixelFormat = BGRA8Unorm_sRGB`）。不声明时，同一份内容在 P3 与 sRGB 屏之间
+    // 颜色不一致（P3 上过饱和）。声明 sRGB 后由合成器负责到屏幕空间的转换，双屏一致。
+    if let Some(space) = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB })) {
+        layer.setColorspace(Some(&space));
+    }
     set_layer_background(&layer, background);
     set_layer_size(&layer, size, scale);
     let actual = layer.device();
