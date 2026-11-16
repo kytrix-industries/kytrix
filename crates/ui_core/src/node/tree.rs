@@ -651,9 +651,22 @@ impl NodeTree {
 
     /// 卸载 `node` 及其整棵子树（句柄全部变为陈旧）。
     ///
+    /// 删除子树，并把被删节点的 `(NodeId, deps)` 交还调用方（P1-2.5）。
+    ///
+    /// 依赖图按 `SignalId → OwnerSet` 索引，节点卸载**不会**自动解开边；`App` 必须拿着这些
+    /// `deps` 逐条 `graph.detach`。旧实现只返回 `Ok(())`，于是虚拟列表反复滚动、浮层反复开关
+    /// 都会留下死边，`App::write`（最高频热路径）的成本从 O(活跃读者) 退化成 O(历史挂载过的
+    /// 所有读者)，并且每次写都要做一次堆分配。
+    ///
+    /// 对齐 GPUI 的 `SubscriberSet`（entity drop 时同步移除订阅）与 Qt 的 `QObject` 析构
+    /// （自动断开 signal-slot）。
+    ///
     /// # Errors
     /// `EngineError::StaleNode`：`node` 陈旧，或 `node` 是 root（root 不是可移除的子节点，见 N11）。
-    pub fn remove(&mut self, node: NodeId) -> Result<(), EngineError> {
+    pub fn remove(
+        &mut self,
+        node: NodeId,
+    ) -> Result<Vec<(NodeId, SmallVec<[SignalId; 8]>)>, EngineError> {
         if node == self.root {
             return Err(EngineError::StaleNode { node });
         }
@@ -680,6 +693,8 @@ impl NodeTree {
         if let Some(p) = self.arena.get_mut(parent) {
             p.damage = p.damage.union(subtree_damage);
         }
+        // 卸载前收集每个被删节点仍持有的依赖边（节点本身马上就查不到了）。
+        let mut detached: Vec<(NodeId, SmallVec<[SignalId; 8]>)> = Vec::with_capacity(block.len());
         for id in block.iter().rev() {
             let index = id.index() as usize;
             if let Some(slot) = self.layout_cache.get_mut(index) {
@@ -705,7 +720,11 @@ impl NodeTree {
                 self.a11y_dirty = self.a11y_dirty.saturating_sub(1);
             }
             self.hoisted.remove(id);
-            let _ = self.arena.remove(*id);
+            if let Some(target) = self.arena.remove(*id)
+                && !target.deps.is_empty()
+            {
+                detached.push((*id, target.deps));
+            }
         }
         // 别的包含块可能把被卸载的节点记在自己的 hoisted 列表里（出流孙节点）⇒ 逐表剔除。
         self.hoisted.retain(|_, list| {
@@ -715,7 +734,7 @@ impl NodeTree {
         self.mark_structure(parent);
         #[cfg(debug_assertions)]
         self.debug_assert_order_matches_tree();
-        Ok(())
+        Ok(detached)
     }
 
     /// 铸一个新节点并挂到 `parent` 末尾（消费者：`NodeBuilder::build`）。
@@ -1128,13 +1147,25 @@ impl NodeTree {
     /// **只在 `Window::commit_frame` 里、paint 已消费 lane 与 damage 之后调用**：drain 阶段的
     /// `touch` 发生在帧前，帧初归零会吞掉已累积的 damage。帧内不得 `mark_*`（`&mut self` 已把
     /// 写操作挡在帧外）。
+    ///
+    /// `LAYOUT` 只对本轮**真正参与过布局**的节点清除（`laid_out_epoch == layout_epoch`）。
+    /// 这一条是 P1-2.2 的修复：虚拟列表在布局**之后**补挂可见行，那些行本帧从未进 taffy；
+    /// 无条件清 `LAYOUT` 会让它们的脏位凭空消失，于是永久停在 0×0（帧尾不再重排、下一帧
+    /// `needs_frame` 也看不到脏位）。保留脏位让下一帧的 `layout_if_dirty` 把它们排上。
     pub(crate) fn settle_frame(&mut self) {
+        let epoch = self.layout_epoch;
         for id in &self.order {
             if let Some(target) = self.arena.get_mut(*id) {
                 target.damage = Rect::default();
                 target.prev_layout = target.layout;
                 target.dirty.insert(DirtyFlags::REUSABLE);
-                target.dirty.remove(DirtyFlags::LAYOUT | DirtyFlags::PAINT);
+                // 本轮布局过的节点：`LAYOUT` 已由 `set_layout` 消费（那里就 remove 了），
+                // 这里只需清 `PAINT`。没布局过的节点保留 `LAYOUT`，等下一帧重排。
+                target.dirty.remove(DirtyFlags::PAINT);
+                if target.laid_out_epoch != epoch {
+                    continue;
+                }
+                target.dirty.remove(DirtyFlags::LAYOUT);
             }
         }
     }

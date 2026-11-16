@@ -13,7 +13,7 @@ use windows::Win32::{
         DataExchange::{
             CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
         },
-        Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock},
+        Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
         Ole::CF_UNICODETEXT,
     },
 };
@@ -70,6 +70,8 @@ pub(crate) fn set_text(text: &str) -> Result<(), EngineError> {
         std::ptr::copy_nonoverlapping(units.as_ptr().cast::<u8>(), pointer.cast::<u8>(), bytes);
         let _ = GlobalUnlock(global);
         if let Err(error) = SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(global.0))) {
+            // `SetClipboardData` 失败时剪贴板没有接管这块内存；`GlobalFree` 不在本 crate 的
+            // windows feature 集内，这里只关剪贴板。泄漏仅在失败路径发生一次。
             let _ = CloseClipboard();
             return Err(clipboard_error("SetClipboardData", error));
         }
@@ -80,11 +82,20 @@ pub(crate) fn set_text(text: &str) -> Result<(), EngineError> {
 
 /// 读取剪贴板文本（无 `CF_UNICODETEXT` 时返回空串）。
 ///
+/// **边界**：`CF_UNICODETEXT` 由**其它进程**写入，Windows 只保证「约定上以 NUL 结尾」。
+/// 若块内没有 NUL，逐字扫描会越过块尾继续读 —— 未定义行为 / 访问违例。因此先用
+/// `GlobalSize` 取可读字节上限，扫描范围夹在 `size / 2` 个 `u16` 之内。
+///
+/// 三种异常块的处理（明确契约，不是静默）：
+/// - 奇数长度：按 `size / 2` 向下取整（尾部半字节不可读）；
+/// - 空块：返回空串；
+/// - 块内无 NUL：把整个块当作文本（与 Chrome / Qt 的「按长度取数据」一致），不报错。
+///
 /// # Errors
 /// `EngineError::Clipboard`：剪贴板被占用或内存映射失败。
 pub(crate) fn get_text() -> Result<SmolStr, EngineError> {
     let hwnd = owner()?;
-    // SAFETY: 句柄只在打开的剪贴板会话内使用；读取范围由系统给出的 `NUL` 终止。
+    // SAFETY: 句柄只在打开的剪贴板会话内使用；读取范围由 `GlobalSize` 显式限定。
     unsafe {
         OpenClipboard(Some(hwnd)).map_err(|error| clipboard_error("OpenClipboard", error))?;
         let handle = match GetClipboardData(CF_UNICODETEXT.0 as u32) {
@@ -95,6 +106,13 @@ pub(crate) fn get_text() -> Result<SmolStr, EngineError> {
             }
         };
         let global = HGLOBAL(handle.0);
+        // 可读字节上限：**必须**取，否则下面的扫描没有边界（P1-2.10 的核心）。
+        let size = GlobalSize(global);
+        let capacity = size / size_of::<u16>();
+        if capacity == 0 {
+            let _ = CloseClipboard();
+            return Ok(SmolStr::default());
+        }
         let pointer = GlobalLock(global);
         if pointer.is_null() {
             let _ = CloseClipboard();
@@ -102,15 +120,14 @@ pub(crate) fn get_text() -> Result<SmolStr, EngineError> {
                 detail: SmolStr::new_static("GlobalLock returned null"),
             });
         }
-        let mut units = Vec::new();
-        let mut index = 0usize;
-        loop {
-            let unit = *(pointer.cast::<u16>().add(index));
+        let units_ptr = pointer.cast::<u16>();
+        let mut units = Vec::with_capacity(capacity.min(4096));
+        for index in 0..capacity {
+            let unit = *units_ptr.add(index);
             if unit == 0 {
                 break;
             }
             units.push(unit);
-            index += 1;
         }
         let _ = GlobalUnlock(global);
         let _ = CloseClipboard();

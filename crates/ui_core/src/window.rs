@@ -3,7 +3,7 @@
 //! 设计见 `design/phase-03-node-state.md` §5.2 / §15。P03 是 headless 的：只保存参数，不驱动平台
 //! （平台窗口句柄、DPI 事件、标题栏属 P12）。
 
-use std::time::Instant;
+use std::{cell::Cell, rc::Rc, time::Instant};
 
 use smol_str::SmolStr;
 
@@ -185,26 +185,53 @@ pub enum FrameOutcome {
 }
 
 /// `Draining` 的凭证：只能由 [`FrameScheduler::begin`] 铸出，`commit`/`abort` 各消费一次。
-pub(crate) struct FrameTicket(());
+///
+/// **Drop 是 abort**（P1-2.4）：`App::frame` 里的样式/文本/布局/paint 都会执行用户闭包，
+/// 任一 panic 都会让本值被 drop 而不是被 `commit`/`abort` 消费。旧实现没有 `Drop`，状态就永久
+/// 停在 `Draining`：之后 `request_frame()` 恒返回 false → `begin_frame` 返回 `None` →
+/// `App::frame` 返回 `Ok(Idle)`，窗口再也不出帧，且没有 API 能复位。
+///
+/// 与 wgpu 的 surface texture guard、GPUI 的 frame guard、Qt 的 `QPainter::begin/end` 同一思路：
+/// 帧状态的回滚由 RAII 保证，不依赖调用方记得写 `abort`。
+pub(crate) struct FrameTicket {
+    /// 共享的帧状态（与 `FrameScheduler` 同一份）。`Drop` 用它把 `Draining` 复位成 `Idle`。
+    state: Rc<Cell<FrameState>>,
+    /// 已被 `commit`/`abort` 消费：`Drop` 不再改状态（`commit` 可能把状态设成别的）。
+    consumed: bool,
+}
+
+impl Drop for FrameTicket {
+    fn drop(&mut self) {
+        if self.consumed {
+            return;
+        }
+        // panic 展开路径：把 `Draining` 复位，让下一帧仍能开始。
+        if self.state.get() == FrameState::Draining {
+            self.state.set(FrameState::Idle);
+        }
+    }
+}
 
 /// 窗口级帧调度（`FrameIndex` 的唯一递增点在这里）。
 pub(crate) struct FrameScheduler {
-    state: FrameState,
+    /// 帧状态。用 `Rc<Cell<_>>` 而不是裸字段：`FrameTicket` 的 `Drop` 需要在没有
+    /// `&mut FrameScheduler` 的情况下复位它（panic 展开时拿不到借用）。
+    state: Rc<Cell<FrameState>>,
     committed: u32,
 }
 
 impl FrameScheduler {
     pub(crate) fn new() -> Self {
         Self {
-            state: FrameState::Idle,
+            state: Rc::new(Cell::new(FrameState::Idle)),
             committed: 0,
         }
     }
 
     /// `Idle → Pending`；返回是否真的发生了转换（幂等）。
     pub(crate) fn request_frame(&mut self) -> bool {
-        if self.state == FrameState::Idle {
-            self.state = FrameState::Pending;
+        if self.state.get() == FrameState::Idle {
+            self.state.set(FrameState::Pending);
             true
         } else {
             false
@@ -213,17 +240,21 @@ impl FrameScheduler {
 
     /// `Pending → Draining`；不在 `Pending` 时返回 `None`（调用方须先 `request_frame`）。
     pub(crate) fn begin(&mut self) -> Option<FrameTicket> {
-        if self.state == FrameState::Pending {
-            self.state = FrameState::Draining;
-            Some(FrameTicket(()))
+        if self.state.get() == FrameState::Pending {
+            self.state.set(FrameState::Draining);
+            Some(FrameTicket {
+                state: Rc::clone(&self.state),
+                consumed: false,
+            })
         } else {
             None
         }
     }
 
     /// `Draining → Idle`，`committed += 1`，返回新序号（**唯一**递增点）。
-    pub(crate) fn commit(&mut self, _ticket: FrameTicket) -> FrameIndex {
-        self.state = FrameState::Idle;
+    pub(crate) fn commit(&mut self, mut ticket: FrameTicket) -> FrameIndex {
+        ticket.consumed = true;
+        self.state.set(FrameState::Idle);
         let next = self.committed.checked_add(1);
         debug_assert!(next.is_some(), "FrameIndex overflow (u32::MAX frames)");
         // 溢出时**饱和**而不是回绕到 0：0 是「从未提交」的哨兵，回绕会让 in-flight 判据失效。
@@ -234,8 +265,9 @@ impl FrameScheduler {
     }
 
     /// `Draining → Idle`，序号不变（空闲帧 / 错误中止）。
-    pub(crate) fn abort(&mut self, _ticket: FrameTicket) {
-        self.state = FrameState::Idle;
+    pub(crate) fn abort(&mut self, mut ticket: FrameTicket) {
+        ticket.consumed = true;
+        self.state.set(FrameState::Idle);
     }
 
     pub(crate) fn committed(&self) -> u32 {
@@ -2082,6 +2114,43 @@ mod tests {
         );
         let outcome = window.frame().expect("第二帧");
         assert!(matches!(outcome, FrameOutcome::Committed(_)));
+    }
+
+    /// P1-2.4 回归：帧内 panic 之后窗口必须还能出帧。
+    ///
+    /// 旧实现里 `FrameTicket` 没有 `Drop`，panic 展开只是把它丢掉，`FrameScheduler` 永久停在
+    /// `Draining` —— `request_frame()` 之后恒 false，`App::frame` 永远返回 `Idle`，窗口冻结且
+    /// 无 API 可复位。这里用一个会 panic 的 measure 闭包复现，然后断言第二帧仍能提交。
+    #[test]
+    fn a_panicking_frame_does_not_freeze_the_scheduler() {
+        let mut window = Window::new(WindowId::for_test(1), WindowOptions::default());
+        let root = window.tree().root();
+        let node = NodeBuilder::boxed()
+            .measure(Box::new(
+                |_: taffy::Size<Option<f32>>, _: taffy::Size<taffy::AvailableSpace>| {
+                    panic!("user measure closure exploded");
+                },
+            ))
+            .build(window.tree_mut(), root)
+            .expect("挂载成功");
+
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| window.frame()));
+        assert!(caught.is_err(), "闭包 panic 必须冒泡出 frame");
+        assert_eq!(window.frame_index().get(), 0, "panic 帧不得递增序号");
+
+        // 关键断言：调度器没有卡在 `Draining`。移除会 panic 的 measure 之后必须仍能出帧。
+        let mut healthy = NodeBuilder::boxed();
+        window.tree_mut().remove(node).expect("移除会 panic 的节点");
+        healthy = healthy.paint(crate::paint::style::PaintSpec {
+            background: crate::paint::color::Color::WHITE,
+            ..crate::paint::style::PaintSpec::default()
+        });
+        let _ = healthy.build(window.tree_mut(), root).expect("健康节点");
+        let outcome = window.frame();
+        assert!(
+            outcome.is_ok(),
+            "panic 之后必须仍能出帧（否则窗口永久冻结）：{outcome:?}"
+        );
     }
 
     #[test]

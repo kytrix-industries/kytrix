@@ -1757,7 +1757,20 @@ impl App {
             .unwrap_or_default();
         let mut changed = false;
         for (_, row) in &stale {
-            if target.tree_mut().remove(*row).is_ok() {
+            // 回收行同样必须解开依赖边（P1-2.5）：滚动是最高频操作，留下的死边会线性放大
+            // 每一次 `App::write`。
+            if let Ok(detached) = target.tree_mut().remove(*row) {
+                for (removed, deps) in detached {
+                    for signal in deps {
+                        self.graph.detach(
+                            signal,
+                            Owner::Node {
+                                window,
+                                node: removed,
+                            },
+                        );
+                    }
+                }
                 changed = true;
             }
         }
@@ -1905,7 +1918,20 @@ impl App {
         let Some(target) = self.windows.get_mut(&window) else {
             return false;
         };
-        let removed = target.tree_mut().remove(node).is_ok();
+        // 卸载子树必须同步解开依赖边（P1-2.5）：`NodeTree::remove` 把被删节点的 deps 交还，
+        // 这里逐条 detach。否则死边会随「挂载/卸载」次数无界累积，而 `App::write` 是最高频
+        // 热路径 —— 成本会从 O(活跃读者) 退化成 O(历史挂载过的所有读者)。
+        let removed = match target.tree_mut().remove(node) {
+            Ok(detached) => {
+                for (node, deps) in detached {
+                    for signal in deps {
+                        self.graph.detach(signal, Owner::Node { window, node });
+                    }
+                }
+                true
+            }
+            Err(_) => false,
+        };
         if removed {
             self.request_frame();
         }
@@ -3740,6 +3766,48 @@ mod tests {
         );
     }
 
+    /// P1-2.5 回归：卸载节点必须同步解开依赖边。
+    ///
+    /// 旧实现只在 `close_window` 里退订仍存活的节点；`remove_node`（以及虚拟列表回收行）
+    /// 直接 `tree_mut().remove()`，留下永久死边。死边会随「挂载/卸载」次数无界累积，而
+    /// `App::write` 是最高频热路径 —— 每次写都要遍历并过滤这些死 owner。
+    #[test]
+    fn removing_a_node_detaches_its_dependencies() {
+        let (_rt, mut app) = new_app();
+        let signal: Signal<u32> = app.signal(0);
+        let window = app.create_window(WindowOptions::default());
+
+        // 两个独立读者：一个用裸 `tree.remove` 卸载（分层上不负责依赖图），一个走
+        // `App::remove_node`（必须在删除的同时 detach）。断言后者不残留、前者残留。
+        let bare = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
+            opacity: Some(cx.read(&signal) as f32),
+            ..StylePatch::default()
+        });
+        let managed = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
+            opacity: Some(cx.read(&signal) as f32),
+            ..StylePatch::default()
+        });
+        app.refresh_styles(window).expect("窗口存在");
+        let _ = app.take_wake_request();
+        let before = crate::test_support::diagnostics::dependency_dump(&app);
+        assert_eq!(before.edges, 2, "两个节点各一条边：{before:?}");
+
+        app.window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .remove(bare)
+            .expect("裸卸载");
+        assert!(app.remove_node(window, managed), "App 路径卸载");
+
+        let after = crate::test_support::diagnostics::dependency_dump(&app);
+        assert_eq!(
+            after.edges, 1,
+            "`remove_node` 必须解开该节点的边；只剩裸卸载留下的那一条：{after:?}"
+        );
+        let _ = app.take_wake_request();
+        assert!(app.write(&signal, 1), "写本身仍成功");
+    }
+
     #[test]
     fn close_window_detaches_dependencies() {
         let (_rt, mut app) = new_app();
@@ -5392,6 +5460,77 @@ mod interaction_tests {
             "视口 200 / 行高 25 ⇒ 8 行"
         );
         assert_eq!(state.mounted, 8);
+    }
+
+    /// P1-2.2 回归：首帧补挂的行**必须**有真实布局高度。
+    ///
+    /// 旧实现里 `rewindow_virtuals` 在 `layout_if_dirty` **之后**挂载行，而帧尾
+    /// `settle_frame` 无条件清掉全树 `LAYOUT` —— 这些行本帧从未参与 taffy 布局，脏位却被清掉，
+    /// 于是永久停在 0×0、不产生任何图元。`virtual_list_mounts_rows_on_the_first_frame_and_grows_on_resize`
+    /// 只断言挂载区间（`state.first/last`），所以没暴露这个 bug。
+    #[test]
+    fn virtual_rows_are_laid_out_with_the_configured_extent() {
+        let (_rt, mut app, window) = setup();
+        let mut style = Style::default();
+        style.inner.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::length(200.0),
+            height: taffy::style::Dimension::length(100.0),
+        };
+        style.inner.position = taffy::style::Position::Relative;
+        style.clip = Clip::Bounds;
+        let tree = app.window_mut(window).expect("window").tree_mut();
+        let root = tree.root();
+        let container = NodeBuilder::boxed()
+            .style(style)
+            .build(tree, root)
+            .expect("mount");
+        let list = app
+            .make_virtual_list(
+                window,
+                container,
+                VirtualListConfig {
+                    extent: 25.0,
+                    overscan: 0,
+                },
+            )
+            .expect("virtual list");
+        app.set_virtual_items(&list, 100, |index| {
+            NodeBuilder::boxed()
+                .paint(background())
+                .id(format!("row{index}"))
+        })
+        .expect("items");
+        frame(&mut app, window);
+        // 再出一帧：若首帧把补挂行的 LAYOUT 清掉了，这里也救不回来（脏位已丢）。
+        frame(&mut app, window);
+
+        let rows: Vec<(usize, crate::node::id::NodeId)> = app
+            .window(window)
+            .expect("window")
+            .tree()
+            .virtual_slot(list.node())
+            .expect("slot")
+            .mounted
+            .clone();
+        assert!(!rows.is_empty(), "必须挂载了可见行");
+        for (index, row) in rows {
+            let bounds = app
+                .window(window)
+                .expect("window")
+                .tree()
+                .get(row)
+                .expect("row exists")
+                .layout()
+                .bounds;
+            assert_eq!(
+                bounds.size.height, 25.0,
+                "行 {index} 的高度必须等于 extent（实际 {bounds:?}）"
+            );
+            assert!(
+                bounds.size.width > 0.0,
+                "行 {index} 的宽度必须 > 0（实际 {bounds:?}）"
+            );
+        }
     }
 
     #[test]
