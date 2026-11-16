@@ -228,10 +228,18 @@ impl NativeWindow {
             factor: dpi as f32 / dpi::BASE_DPI as f32,
         })?;
         self.scale = scale;
-        let min = (
-            (MIN_SIZE_LOGICAL.0 * scale.factor()).round() as u32,
-            (MIN_SIZE_LOGICAL.1 * scale.factor()).round() as u32,
+        // `WM_GETMINMAXINFO` 的 `ptMinTrackSize` 是**窗口**外框尺寸，而应用给的是**客户区**
+        // 最小尺寸（P2-1）。直接透传会让窗口最小尺寸比预期小一个边框 + 标题栏（在 150% DPI
+        // 下尤其明显），于是能缩到客户区只有几十像素。这里先按真实边框换算成外框。
+        let min = dpi::window_size_for_client(
+            (
+                (MIN_SIZE_LOGICAL.0 * scale.factor()).round() as u32,
+                (MIN_SIZE_LOGICAL.1 * scale.factor()).round() as u32,
+            ),
+            dpi,
         );
+        // 外框尺寸恒为正（`window_size_for_client` 只加边框）。
+        let min = (min.0.max(1) as u32, min.1.max(1) as u32);
         // SAFETY: `state` 由本窗口独占（`Drop` 之前一直有效）；WndProc 只在消息处理期读它。
         unsafe {
             (*self.state).set_min_size(min);
