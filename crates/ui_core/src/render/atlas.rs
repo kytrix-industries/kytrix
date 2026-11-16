@@ -35,19 +35,6 @@ pub(crate) const ATLAS_PAGE_STEPS: [u32; 3] = [MIN_ATLAS_PAGE, MIN_ATLAS_PAGE * 
 /// 页尺寸放大（2048² 图片页的整页 staging 是 16 MiB/槽，三槽就是 48 MiB）。
 pub(crate) const MAX_RESIDENT_STAGING_BYTES: u64 = 1 << 20;
 
-/// 图片页在首次插入时的选档：覆盖 `max(width, height) + 2`（1 纹素 padding）的最小档。
-///
-/// 超出 2048 的请求返回上限档，由 `AtlasAllocator::allocate` 以 `Capacity` 拒绝
-/// （图片页一旦锁定就不能再换页：`ResourceImage.tile` 的 UV 以页尺寸归一化，应用长期持有它）。
-pub(crate) fn page_for_tile(width: u32, height: u32) -> u32 {
-    let needed = width.max(height).saturating_add(2);
-    ATLAS_PAGE_STEPS
-        .iter()
-        .copied()
-        .find(|page| *page >= needed)
-        .unwrap_or(ATLAS_PAGE_STEPS[ATLAS_PAGE_STEPS.len() - 1])
-}
-
 /// 下一档页；`None` = 已到上限。
 fn next_page(page: u32) -> Option<u32> {
     ATLAS_PAGE_STEPS
@@ -356,9 +343,7 @@ impl DirtyRows {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ATLAS_PAGE_STEPS, AtlasAllocator, DirtyRows, MAX_ATLAS_PAGE, MIN_ATLAS_PAGE, page_for_tile,
-    };
+    use super::{ATLAS_PAGE_STEPS, AtlasAllocator, DirtyRows, MAX_ATLAS_PAGE, MIN_ATLAS_PAGE};
     use crate::paint::atlas::AtlasKind;
 
     fn allocator() -> AtlasAllocator {
@@ -445,19 +430,17 @@ mod tests {
         assert!(atlas.allocate((8, 8)).is_some(), "新页可以继续分配");
     }
 
+    /// 图片页固定开最大档（P1-2.7）：容纳能力与插入顺序无关。
+    ///
+    /// 旧实现按**第一张**图片选档并永久锁定，先加载 16×16 图标就会把整页钉在 512²，
+    /// 之后任何 >510 px 的图必然 `Capacity` 且重试无效。
     #[test]
-    fn image_page_bucket_covers_the_tile_plus_padding() {
-        assert_eq!(page_for_tile(16, 16), 512);
-        assert_eq!(page_for_tile(510, 16), 512, "510 + 2 = 512 恰好落在起始档");
-        assert_eq!(page_for_tile(511, 16), 1024);
+    fn image_page_always_uses_the_maximum_bucket() {
         assert_eq!(
-            page_for_tile(16, 1022),
-            1024,
-            "1022 + 2 = 1024 恰好落在第二档"
+            MAX_ATLAS_PAGE as usize,
+            2048 - 2 + 2,
+            "最大页必须能容纳 2046 px 的 tile 加上两侧各 1 纹素 padding"
         );
-        assert_eq!(page_for_tile(16, 1023), 2048);
-        assert_eq!(page_for_tile(2046, 16), 2048);
-        assert_eq!(page_for_tile(4096, 4096), 2048, "超出上限仍给上限档");
     }
 
     #[test]

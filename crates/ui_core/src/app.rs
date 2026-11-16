@@ -5887,8 +5887,8 @@ mod resources_tests {
         assert_eq!(app.resources().len(), 1);
         assert_eq!(
             app.resources().page_pixels().expect("page").0,
-            (512, 512),
-            "图片页在首次插入时按 16×16 图片选到 512² 档"
+            (2048, 2048),
+            "图片页固定最大档（P1-2.7：页尺寸与插入顺序无关）"
         );
         // 另一窗口共享同一份缓存（单 GPU 设备、进程级一份）。
         let second = app.create_window(WindowOptions {
@@ -6188,7 +6188,11 @@ mod resources_tests {
         );
         let _ = app.resources_mut().insert(&png()).expect("insert");
         let (page, pixels) = app.resources().page_pixels().expect("page");
-        assert_eq!(page, (512, 512), "4×4 图片选 512² 档");
-        assert_eq!(pixels.len(), 512 * 512 * 4, "整页 = page² × BGRA8");
+        assert_eq!(
+            page,
+            (2048, 2048),
+            "图片页固定最大档（P1-2.7：页尺寸与插入顺序无关）"
+        );
+        assert_eq!(pixels.len(), 2048 * 2048 * 4, "整页 = page² × BGRA8");
     }
 }

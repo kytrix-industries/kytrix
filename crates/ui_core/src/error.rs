@@ -260,7 +260,9 @@ mod tests {
     }
 
     #[test]
-    fn resource_decode_capacity_display_names_the_locked_page() {
+    /// `Capacity` 的文案必须说清「页已满」而不是「页被首图锁死」（P1-2.7 之后页尺寸固定为
+    /// 最大档，容量失败只可能是页里放不下更多 tile）。
+    fn resource_decode_capacity_display_names_the_full_page() {
         let text = EngineError::ResourceDecode {
             cause: DecodeCause::Capacity {
                 width: 900,
@@ -272,9 +274,10 @@ mod tests {
 
         assert!(text.contains("900x700"), "{text}");
         assert!(text.contains("2048x2048"), "{text}");
+        assert!(text.contains("page is already full"), "{text}");
         assert!(
-            text.contains("locked by the first inserted image"),
-            "{text}"
+            !text.contains("locked by the first inserted image"),
+            "不得再暗示页尺寸被首图锁定（P1-2.7 已修）：{text}"
         );
     }
 

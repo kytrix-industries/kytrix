@@ -151,9 +151,8 @@ impl fmt::Display for DecodeCause {
                 page,
             } => write!(
                 f,
-                "a {width}x{height} tile does not fit the {}x{} image atlas (the page size is \
-                 locked by the first inserted image; unloading only helps when the page has free \
-                 space)",
+                "a {width}x{height} tile does not fit the {}x{} image atlas: the page is already \
+                 full (unload resources you no longer draw to free space)",
                 page.0, page.1
             ),
         }
@@ -214,10 +213,17 @@ impl ResourceCache {
         let decoded =
             image::decode(bytes).map_err(|cause| EngineError::ResourceDecode { cause })?;
         let (width, height) = (decoded.width, decoded.height);
-        // `decode` 已把单边压到 `MAX_TILE_DIM`（≤ 2048 − 2 padding），所以空页上的首块必定放得下；
-        // 这里建页不会出现「先钉住页档、再分配失败」。
+        // **图片页固定开最大档**（P1-2.7）。旧实现用 `page_for_tile(width, height)` 按**第一张**
+        // 图片选档并永久锁定：先加载 16×16 图标 ⇒ 页 = 512² ⇒ 之后任何 >510 px 的图必然
+        // `Capacity`，而错误文案还让「unload 后重试」（页尺寸永不变，重试无效）。
+        // 加载顺序决定整个进程的图片上限是不可接受的隐式契约。
+        //
+        // 固定最大档后，容纳能力与插入顺序无关；懒分配语义不变（没有图片就仍不占内存），
+        // 代价是需要图片时一次性占 16 MiB —— 这本来就是文档里的图片页上限。
+        // 更省内存的做法是 Skia/Impeller 式的多页图集（`AtlasTile` 增 `page`、三平台
+        // `texture_index` 改纹理数组），属契约变更，留作后续优化。
         if self.page.is_none() {
-            self.open_page(crate::render::atlas::page_for_tile(width, height));
+            self.open_page(crate::render::atlas::MAX_ATLAS_PAGE);
         }
         let state = self.page.as_mut().expect("page was just ensured");
         let Some(allocation) = state.allocator.allocate((width, height)) else {
@@ -416,6 +422,26 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(cache.len(), 0);
+    }
+
+    /// P1-2.7 回归：图片页的容纳能力**不得**依赖插入顺序。
+    ///
+    /// 旧实现按第一张图选档并永久锁定：先插 16×16 图标 ⇒ 页 = 512² ⇒ 之后 600×600 必然
+    /// `Capacity`，且 `unload` 后重试也无效（页尺寸永不变）。
+    #[test]
+    fn page_capacity_is_independent_of_insertion_order() {
+        let mut cache = ResourceCache::new();
+        // 先一张小图（旧实现会把页钉在 512²）。
+        let tiny = inserted(&mut cache, [1, 2, 3, 255]);
+        assert_eq!((tiny.width, tiny.height), (4, 4));
+        // 再一张远超 512 的图：必须能放下。
+        let big = cache.insert(&png(600, 600, [9, 9, 9, 255])).expect(
+            "600x600 must fit after a tiny image (the page is not locked by the first insert)",
+        );
+        assert_eq!((big.width, big.height), (600, 600));
+        // 两张都还活着，且指向同一页。
+        assert_eq!(tiny.tile.atlas, big.tile.atlas);
+        assert_eq!(cache.len(), 2);
     }
 
     #[test]
