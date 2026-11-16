@@ -172,7 +172,8 @@ pub(crate) struct WndProcState {
     resize: Option<ResizeSession>,
     /// a11y（P11：首显前构造的 `accesskit_windows::Adapter` + `WM_GETOBJECT` 接线）。
     a11y: crate::platform::windows::a11y::WindowsA11y,
-    /// 引擎**自己**即将释放指针捕获：下一个 WM_CAPTURECHANGED 不能当成`r`n    /// 「系统夺走捕获」，否则每次正常拖拽结束都会误投一次 `PointerCancel`。
+    /// 引擎**自己**即将释放指针捕获：下一个 `WM_CAPTURECHANGED` 不能当成
+    /// 「系统夺走捕获」，否则每次正常拖拽结束都会误投一次 `PointerCancel`。
     ///（MSDN 明确：自己调 `ReleaseCapture` 也会收到该消息。）
     suppress_capture_cancel: bool,
     /// 引擎当前生效的光标（`App::take_cursor_change` 写入）。
@@ -718,9 +719,11 @@ fn pump_loop(
     dispatcher: &Arc<Dispatcher>,
 ) -> Result<(), EngineError> {
     let mut message = MSG::default();
-    // 连续帧定时器记 (宿主 hwnd, timer id)：定时器随窗口销毁而失效，宿主窗口关闭后必须
-    // 在新首窗上重建，否则其余窗口的动画/连续帧永远不再推进（P2-4）。
-    let mut frame_timer: Option<(isize, usize)> = None;
+    // 定时器随宿主窗口销毁而失效：宿主窗口关闭后必须在新首窗上重建，否则其余窗口的
+    // 动画/连续帧永远不再推进（P2-4）。归属判定用 `WindowId` 而不是 HWND 裸值：
+    // 首窗销毁后系统可能把同一个 HWND 复用给新窗，裸值比较会「看起来仍匹配」而不重建
+    // 定时器（复审 P2-8）。
+    let mut frame_timer: Option<(crate::window::WindowId, isize, usize)> = None;
     loop {
         // ① 先 drain：`WM_QUIT` 必须显式识别（`PeekMessageW` 会把它取出来）。
         loop {
@@ -816,20 +819,21 @@ fn pump_loop(
             let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
             // 定时器随宿主窗口销毁而失效：宿主已不是当前首窗 ⇒ 清掉记录，下面在新首窗重建
             // （否则首窗关闭后其余窗口的动画/连续帧永远不再推进，P2-4）。
-            if frame_timer.is_some_and(|(owner, _)| owner != native.hwnd_raw()) {
+            if frame_timer.is_some_and(|(owner, _, _)| owner != native.id()) {
                 frame_timer = None;
             }
-            // a11y 到期补发也借用这个定时器：11y_retry_pending 最多持续`r`n            // A11Y_THROTTLE（100 ms），到期交付后自动停表。
+            // a11y 到期补发也借用这个定时器：`a11y_retry_pending` 最多持续 A11Y_THROTTLE
+            // （100 ms），到期交付后自动停表。
             let needs_tick = app.needs_continuous_frames() || app.a11y_retry_pending();
             match (needs_tick, frame_timer) {
                 (true, None) => {
                     // SAFETY: 1 ms 定时器（probe：实测 16.0 ms）；`KillTimer` 在同一线程。
                     let id = unsafe { SetTimer(Some(hwnd), FRAME_TIMER_ID, 1, None) };
                     if id != 0 {
-                        frame_timer = Some((native.hwnd_raw(), id));
+                        frame_timer = Some((native.id(), native.hwnd_raw(), id));
                     }
                 }
-                (false, Some((owner, id))) => {
+                (false, Some((_, owner, id))) => {
                     // SAFETY: `id` 由本线程在 `owner` 上 `SetTimer` 产生。
                     let owner = HWND(owner as *mut core::ffi::c_void);
                     let _ = unsafe { KillTimer(Some(owner), id) };
