@@ -69,6 +69,16 @@ impl TranslateState {
         self.modifiers
     }
 
+    /// 复位瞬时输入状态（失焦时调用）。
+    ///
+    /// 修饰键按消息顺序维护：失焦期间抬起消息不再到达本窗口，不清位就会让 Shift/Ctrl
+    /// 永久保持按下（Alt+Tab 回来后所有输入都被当成组合键）。半高代理对同理：
+    /// 失焦前残留的高位代理会和回来后的字符拼成乱码。
+    pub(crate) fn reset_transient(&mut self) {
+        self.modifiers = Modifiers::empty();
+        self.high_surrogate = None;
+    }
+
     /// IME 状态（`event_loop` 在 `WM_IME_*` 分支里驱动它）。
     pub(crate) fn ime_mut(&mut self) -> &mut ImeState {
         &mut self.ime
@@ -395,6 +405,29 @@ mod tests {
         assert_eq!(high, None, "高代理单独不产生文本");
         assert_eq!(low, Some(PlatformEvent::Text("🌍".into())));
         assert_eq!(plain, Some(PlatformEvent::Text("a".into())));
+    }
+
+    /// P2-6 回归：失焦必须清修饰键。
+    ///
+    /// 修饰键按消息顺序维护，而失焦期间的抬起消息不会到达本窗口。不复位的话
+    /// Alt+Tab 回来后 Shift/Ctrl 会永久"粘住"，所有输入都被当成组合键。
+    #[test]
+    fn losing_focus_clears_stuck_modifiers() {
+        let mut state = TranslateState::default();
+        // Shift 按下 + Ctrl 按下。
+        let _ = translate(WM_KEYDOWN, 0x10, 0, &mut state);
+        let _ = translate(WM_KEYDOWN, 0x11, 0, &mut state);
+        assert_eq!(state.modifiers(), Modifiers::SHIFT | Modifiers::CONTROL);
+
+        // 失焦：抬起消息永远不会到达，只能靠显式复位。
+        state.reset_transient();
+        assert_eq!(state.modifiers(), Modifiers::empty());
+
+        // 复位幂等，且不影响之后的正常跟踪。
+        state.reset_transient();
+        assert_eq!(state.modifiers(), Modifiers::empty());
+        let _ = translate(WM_KEYDOWN, 0x10, 0, &mut state);
+        assert_eq!(state.modifiers(), Modifiers::SHIFT);
     }
 
     #[test]

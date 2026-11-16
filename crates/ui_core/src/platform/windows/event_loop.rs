@@ -247,6 +247,11 @@ impl WndProcState {
         self.translate.modifiers()
     }
 
+    /// 复位瞬时输入状态（修饰键 / 半高代理对）。失焦时由 WndProc 调用（P2-6）。
+    pub(crate) fn reset_transient_input(&mut self) {
+        self.translate.reset_transient();
+    }
+
     /// 开始自绘边框缩放：记录起点并抓鼠标（不再把消息交给 `DefWindowProcW` 的模态循环）。
     ///
     /// 同时启动 [`RESIZE_TIMER_ID`] 合并定时器：`WM_MOUSEMOVE` 只更新最新光标，真正的
@@ -448,6 +453,13 @@ pub(crate) extern "system" fn wndproc(
             }
         }
         if matches!(msg, WM_KILLFOCUS | WM_ENTERMENULOOP | WM_ENTERSIZEMOVE) {
+            // 丢失键盘焦点时必须**复位瞬时输入状态**（P2-6）：
+            //
+            // 修饰键是按消息顺序维护的（按下置位、抬起清位）。失焦期间抬起消息不再到达本窗口，
+            // 于是 Alt+Tab / 打开菜单 / 进入模态缩放后，用户实际已经松开的 Shift/Ctrl 会永久
+            // 保持"按下"，之后所有输入都被当成组合键。代理对半高也一并清掉（否则失焦前半个
+            // 代理会和失焦后的字符拼成乱码）。
+            (*state).reset_transient_input();
             // SAFETY: 同上。
             let events = { (*state).a11y_mut().focus_changed(false) };
             if let Some(events) = events {

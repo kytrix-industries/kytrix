@@ -438,6 +438,12 @@ impl GuiView {
     }
 
     pub(crate) fn focus_changed(&self, focused: bool) {
+        // 失焦复位瞬时输入状态（P2-4）：修饰键由 `flagsChanged:` 维护，窗口不再是 key
+        // window 时这些事件不再到达，用户松开的 Cmd/Shift 会永久"粘住"，之后点回窗口的
+        // 第一次点击就被当成组合键。悬停同理：指针离开时 `mouseExited:` 也会被吞掉。
+        if !focused {
+            self.ivars().modifiers.set(0);
+        }
         let mut adapter = self.ivars().a11y.take();
         if let Some(a11y) = adapter.as_mut() {
             a11y.focus_changed(focused);
