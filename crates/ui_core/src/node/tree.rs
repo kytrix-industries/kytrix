@@ -2042,6 +2042,23 @@ impl NodeTree {
         true
     }
 
+    /// 只标 `LAYOUT`（不并 damage、不清 `REUSABLE`）—— `bubble_layout` 专用。
+    ///
+    /// 祖先需要知道「要重新跑布局」，但**它自己的绘制输出没有变**：真正的像素变化是
+    /// 移动/改尺寸的那个节点，`place_subtree` 在写新 `bounds` 时会精确地把
+    /// `old ∪ new` 并进它的 damage 并清掉它的 `REUSABLE`。
+    ///
+    /// 旧实现让冒泡复用 `touch(LAYOUT)`，于是每个祖先都把**自己的盒子**并进 damage，
+    /// 一路到根 ⇒ 根盒 = 整个窗口 ⇒ 文本宽度一变就整帧重绘（价格图每 tick 全帧重画的
+    /// 直接原因，P2-3.2）。
+    fn touch_layout_only(&mut self, node: NodeId) -> bool {
+        let Some(target) = self.arena.get_mut(node) else {
+            return false;
+        };
+        target.dirty.insert(DirtyFlags::LAYOUT);
+        true
+    }
+
     /// `LAYOUT` 的向上冒泡（§9.2 的逐字伪代码）。
     fn bubble_layout(&mut self, from: NodeId) {
         let mut child = from;
@@ -2063,7 +2080,7 @@ impl NodeTree {
             if already && self.arena.get(parent).is_some_and(depends_on_children) {
                 break;
             }
-            if !self.touch(parent, DirtyFlags::LAYOUT) {
+            if !self.touch_layout_only(parent) {
                 break;
             }
             if !self.arena.get(parent).is_some_and(depends_on_children) {

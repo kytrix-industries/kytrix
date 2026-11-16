@@ -4676,6 +4676,48 @@ mod interaction_tests {
             .expect("frame succeeds")
     }
 
+    /// P2-3.2 回归：深层节点的布局变化**不得**把祖先（尤其根）的整块盒子并入 damage。
+    ///
+    /// 旧实现的 `bubble_layout` 复用 `touch(LAYOUT)`，每个祖先都会把自己的盒子并进
+    /// damage，一路到根 ⇒ 根盒 = 整个窗口 ⇒ 一段文本宽度变化就整帧重绘（价格图每 tick
+    /// 全帧重写的直接原因）。祖先只需要重跑布局，像素变化由 `place_subtree` 精确产出。
+    #[test]
+    fn a_deep_layout_change_does_not_damage_the_whole_window() {
+        let (_rt, mut app, window) = setup();
+        let tree = app.window_mut(window).expect("window").tree_mut();
+        let root = tree.root();
+        // 三层容器，最内层是文本。
+        let outer = NodeBuilder::boxed().build(tree, root).expect("mount");
+        let inner = NodeBuilder::boxed().build(tree, outer).expect("mount");
+        let label = NodeBuilder::text("100.00", crate::text::TextStyle::new(12.0))
+            .build(tree, inner)
+            .expect("mount");
+        frame(&mut app, window);
+        let _ = app.take_wake_request();
+
+        // 文本内容变长 ⇒ LAYOUT 冒泡到根。
+        let tree = app.window_mut(window).expect("window").tree_mut();
+        tree.set_text_content(
+            label,
+            crate::text::TextContent::new("1000000.00", crate::text::TextStyle::new(12.0)),
+        );
+        frame(&mut app, window);
+
+        let tree = app.window(window).expect("window").tree();
+        // 根自己的 damage 必须是空的：它没有移动，也不该为后代的布局变化背 damage。
+        assert!(
+            tree.get(root).expect("root").damage().is_empty(),
+            "根不应因深层布局变化产生 damage（否则整帧重绘）：{:?}",
+            tree.get(root).expect("root").damage()
+        );
+        // 中间容器同样不该有 damage。
+        assert!(
+            tree.get(outer).expect("outer").damage().is_empty(),
+            "中间容器不应有 damage：{:?}",
+            tree.get(outer).expect("outer").damage()
+        );
+        let _ = inner;
+    }
     fn root_of(app: &App, window: WindowId) -> NodeId {
         app.window(window).expect("window").tree().root()
     }
