@@ -860,7 +860,27 @@ impl GpuRenderer {
                     // 在飞帧的完成由 timeline 记账（等 `last_index` 完成即可释放）。
                     self.retired_swapchains.push((Some(self.last_index), old));
                 }
-                Err(error)
+                // `VK_ERROR_SURFACE_LOST_KHR` 的恢复：**重建 `VkSurfaceKHR`** 后重试一次。
+                // 合成器重启 / 显卡复位后旧 surface 永久失效，只重建 swapchain 会一直失败；
+                // 重试用尽才把错误上报（有界，不无限自旋）。
+                let Some(surface) = self.vk_surface.as_mut() else {
+                    return Err(error);
+                };
+                surface.recreate()?;
+                let raw = self.vk_surface.as_ref().map(Surface::raw);
+                let Some(raw) = raw else {
+                    return Err(error);
+                };
+                let retried = Swapchain::new(&self.shared, raw, size);
+                match retried {
+                    Ok(swapchain) => {
+                        self.swapchain = Some(swapchain);
+                        self.fresh = true;
+                        self.surface = size;
+                        Ok(())
+                    }
+                    Err(retried) => Err(retried),
+                }
             }
         }
     }

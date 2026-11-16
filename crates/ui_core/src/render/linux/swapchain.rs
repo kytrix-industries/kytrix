@@ -74,6 +74,12 @@ pub(crate) enum Present {
 pub(crate) struct Surface {
     gpu: Arc<SharedGpu>,
     raw: vk::SurfaceKHR,
+    /// 平台句柄：`VK_ERROR_SURFACE_LOST_KHR` 之后必须用它们重建 `VkSurfaceKHR`。
+    ///
+    /// 所有权仍属平台层（`WaylandState`）：渲染器 drop 早于 `wl_surface` 销毁（V-122 ⑨），
+    /// 所以这里只借不持有。
+    display: *mut std::ffi::c_void,
+    wl_surface: *mut std::ffi::c_void,
 }
 
 impl Surface {
@@ -86,13 +92,34 @@ impl Surface {
         Ok(Self {
             gpu: Arc::clone(gpu),
             raw: gpu.instance().create_surface(display, surface)?,
+            display,
+            wl_surface: surface,
         })
     }
 
     pub(crate) fn raw(&self) -> vk::SurfaceKHR {
         self.raw
     }
+
+    /// `VK_ERROR_SURFACE_LOST_KHR` 之后用同一对 wl 句柄重建 surface。
+    ///
+    /// 调用方保证该 surface 的 swapchain 已经销毁（`replace_swapchain` 的失败路径先置空
+    /// swapchain 再调本函数）。
+    pub(crate) fn recreate(&mut self) -> Result<(), EngineError> {
+        let raw = self
+            .gpu
+            .instance()
+            .create_surface(self.display, self.wl_surface)?;
+        let old = std::mem::replace(&mut self.raw, raw);
+        self.gpu.instance().destroy_surface(old);
+        Ok(())
+    }
 }
+
+// SAFETY: 两个平台句柄只在 GPU 线程上用于重建 `VkSurfaceKHR`（`Surface::recreate`）。
+// wl 对象的**所有权**仍属平台层（`WaylandState`），渲染器 drop 早于它们（V-122 ⑨）；
+// 这里只跨越线程边界传递指针值，与 `vkCreateWaylandSurfaceKHR` 的常规用法一致。
+unsafe impl Send for Surface {}
 
 impl Drop for Surface {
     fn drop(&mut self) {
