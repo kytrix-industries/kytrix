@@ -2826,6 +2826,20 @@ impl App {
                 .is_none_or(|last| self.clock.saturating_duration_since(*last) >= A11Y_THROTTLE)
     }
 
+    /// 是否有窗口「a11y 脏但正被限流」——平台泵据此安排**到期补发**唤醒。
+    ///
+    /// 没有这条，被限流挡下的最后一次变化永远不会交付：脏位留着，但没有任何机制在
+    /// `A11Y_THROTTLE` 之后把泵叫醒（复审 P1-4）。
+    pub(crate) fn a11y_retry_pending(&self) -> bool {
+        self.windows.keys().any(|window| {
+            self.windows.get(window).is_some_and(Window::a11y_pending)
+                && self
+                    .a11y_delivered
+                    .get(window)
+                    .is_some_and(|last| self.clock.saturating_duration_since(*last) < A11Y_THROTTLE)
+        })
+    }
+
     /// 产出一笔 a11y 交付（消费 `A11Y|ORDER` 位与 `full_pending`）。
     ///
     /// **必须在 `accesskit_windows::Adapter::update_if_active` 的闭包里调用**（adapter 不活跃时
@@ -4326,6 +4340,35 @@ mod tests {
         let _ = derived;
     }
 
+    /// P1-4：被限流挡下的 a11y 变化必须让平台泵「到期补发」。
+    #[test]
+    fn a11y_retry_pending_reports_throttled_changes() {
+        let (_rt, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        let root = app.window(window).expect("窗口").tree().root();
+        let node = NodeBuilder::boxed()
+            .build(app.window_mut(window).expect("窗口").tree_mut(), root)
+            .expect("挂载");
+        app.refresh_styles(window).expect("窗口存在");
+        assert!(app.a11y_take(window).is_some(), "首笔交付");
+
+        // 限流窗口内再标脏：不能立即交付，但必须有「到期补发」信号。
+        app.window_mut(window)
+            .expect("窗口")
+            .tree_mut()
+            .mark_a11y(node);
+        assert!(!app.a11y_pending(window), "限流窗口内不立即交付");
+        assert!(
+            app.a11y_retry_pending(),
+            "必须有到期补发信号，否则最后一次变化永远交付不出去"
+        );
+
+        // 时间窗过后：可交付，补发信号消失。
+        app.advance_clock(std::time::Duration::from_millis(150));
+        assert!(app.a11y_pending(window), "到期后可交付");
+        assert!(!app.a11y_retry_pending(), "可交付时不再需要补发信号");
+        let _ = app.a11y_take(window);
+    }
     /// P2-8：`on_close` 返回 false 必须拦下关闭，返回 true 才真的关。
     #[test]
     fn close_handler_can_veto_the_close() {

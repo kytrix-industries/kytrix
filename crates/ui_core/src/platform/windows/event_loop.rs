@@ -819,7 +819,9 @@ fn pump_loop(
             if frame_timer.is_some_and(|(owner, _)| owner != native.hwnd_raw()) {
                 frame_timer = None;
             }
-            match (app.needs_continuous_frames(), frame_timer) {
+            // a11y 到期补发也借用这个定时器：11y_retry_pending 最多持续`r`n            // A11Y_THROTTLE（100 ms），到期交付后自动停表。
+            let needs_tick = app.needs_continuous_frames() || app.a11y_retry_pending();
+            match (needs_tick, frame_timer) {
                 (true, None) => {
                     // SAFETY: 1 ms 定时器（probe：实测 16.0 ms）；`KillTimer` 在同一线程。
                     let id = unsafe { SetTimer(Some(hwnd), FRAME_TIMER_ID, 1, None) };

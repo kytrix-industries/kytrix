@@ -268,7 +268,8 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
 
     // 连续帧定时器：有动画或 HUD 可见才挂（其余时间空闲零唤醒）。
     if let Some(native) = state.windows.first() {
-        native.set_animating(app.needs_continuous_frames());
+        // a11y 到期补发也借用这个定时器（同 Windows）：到期交付后自动停表。
+        native.set_animating(app.needs_continuous_frames() || app.a11y_retry_pending());
     }
 
     // 关闭：请求关闭的窗口真正关闭；一个不剩就退出。

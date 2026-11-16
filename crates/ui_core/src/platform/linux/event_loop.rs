@@ -325,6 +325,13 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                     .frame_gate_remaining(Instant::now())
                     .unwrap_or(surface::IDLE_TIMEOUT)
             };
+            // a11y 到期补发：被 `A11Y_THROTTLE` 挡下的最后一次变化必须有人在窗口结束时叫醒
+            // 泵，否则它会一直停在旧值（复审 P1-4）。醒来后 `a11y_pending` 变真即交付。
+            let timeout = if app.a11y_retry_pending() {
+                timeout.min(FRAME_TICK)
+            } else {
+                timeout
+            };
             // 有按住键时把等待压到下一次重复的到期时刻：否则 `dispatch` 会睡到空闲超时，
             // 重复键要等到下一个无关事件才被合成（P1-2.11）。
             let timeout = match state.next_key_repeat_in(Instant::now()) {
