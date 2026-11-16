@@ -102,18 +102,27 @@ write_mask = R | G | B | A
 ## 5. 顶点外扩、坐标与 NDC
 
 ```text
-lo = bounds.xy - params0.w
-hi = bounds.xy + bounds.zw + params0.w
+full_lo = bounds.xy - params0.w
+full_hi = bounds.xy + bounds.zw + params0.w
+lo = full_lo
+hi = full_hi
 if (clip_index != 0) {
     lo = max(lo, clip_rect.xy - 2.0)
     hi = min(hi, clip_rect.xy + max(clip_rect.zw, 0) + 2.0)
     hi = max(hi, lo)
 }
 world_px = lerp(lo, hi, corner01)        // corner01 ∈ {0,1}²
+uv_t     = (world_px - full_lo) / max(full_hi - full_lo, 1e-6)
+uv       = lerp(uv.xy, uv.zw, uv_t)      // 注意：**不是** corner01
 ```
 
 `params0.w`（aa_padding，编码器唯一来源）：Quad **1.0**、Shadow **blur + 1.0**、图集（Glyph/Image）**0.0**。
 片元用**真实** `bounds` 求 `local_px = world_px − (bounds.xy + bounds.zw/2)`；扩出去的边缘覆盖率自然为 0。
+
+**UV 必须按未夹紧的四边形求比例**：`clip_rect` 夹紧只为省片元，它改变的是几何覆盖范围，
+不是图元自身的纹理映射。用 `corner01` 直接把 `uv.xy..uv.zw` 映射到夹紧后的四边形，会让
+被裁剪的文本/图标整体拉伸压缩（滚动列表边缘的经典症状）。实色图元不看 UV，因此这条对
+它们无影响；Glyph / Image 必须遵守。
 
 坐标：用户空间恒为**左上原点、Y 向下、物理像素**；`z = 0, w = 1`。
 

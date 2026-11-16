@@ -22,6 +22,9 @@ void main() {
 
     vec2 lo = origin - pad;
     vec2 hi = origin + size + pad;
+    // 未夹紧的四角：UV 必须按**原始**（未夹紧）位置求比例（contract §7）。
+    vec2 full_lo = lo;
+    vec2 full_hi = hi;
 
     if (uint(p.params1.x) != 0u) {
         lo = max(lo, p.clip_rect.xy - KYTRIX_CLIP_VERTEX_SLACK);
@@ -31,9 +34,12 @@ void main() {
 
     vec2 world_px = lerp(lo, hi, corner);
     vec2 center = origin + size * 0.5;
+    // 夹紧只是省片元，不能改变图元自身的纹理映射 —— 否则被裁剪的文本/图标会被拉伸
+    // 压缩（滚动列表边缘的经典症状）。
+    vec2 uv_t = (world_px - full_lo) / max(full_hi - full_lo, vec2(1e-6));
 
     gl_Position = vec4(to_ndc(world_px), 0.0, 1.0);
     v_local_px = world_px - center;
-    v_uv = lerp(p.uv.xy, p.uv.zw, corner);
+    v_uv = lerp(p.uv.xy, p.uv.zw, uv_t);
     v_instance = instance;
 }

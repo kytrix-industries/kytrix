@@ -23,6 +23,9 @@ VsOut vs_main(uint vertex_id : SV_VertexID, uint instance_id : SV_InstanceID) {
 
     float2 lo = origin - pad;
     float2 hi = origin + size + pad;
+    // 未夹紧的四角：UV 必须按**原始**（未夹紧）位置求比例。
+    float2 full_lo = lo;
+    float2 full_hi = hi;
 
     if ((uint)p.params1.x != 0u) {
         lo = max(lo, p.clip_rect.xy - KYTRIX_CLIP_VERTEX_SLACK);
@@ -33,10 +36,15 @@ VsOut vs_main(uint vertex_id : SV_VertexID, uint instance_id : SV_InstanceID) {
     float2 world_px = lerp(lo, hi, corner);
     float2 center = origin + size * 0.5;
 
+    // UV 用**未夹紧**的四边形求比例（contract §7）：夹紧只是省片元，不能改变图元
+    // 自身的纹理映射 —— 否则被裁剪的文本/图标会被拉伸压缩（滚动列表边缘的经典症状）。
+    // 常量 alpha 图元（实色 quad）不看 UV，这条对它们没有影响。
+    float2 uv_t = (world_px - full_lo) / max(full_hi - full_lo, float2(1e-6, 1e-6));
+
     VsOut o;
     o.position = float4(to_ndc(world_px), 0.0, 1.0);
     o.local_px = world_px - center;
-    o.uv = lerp(p.uv.xy, p.uv.zw, corner);
+    o.uv = lerp(p.uv.xy, p.uv.zw, uv_t);
     o.instance = instance_id + base;
     return o;
 }
