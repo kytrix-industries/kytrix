@@ -1415,6 +1415,11 @@ impl NodeTree {
         slot.broken = Some(Box::new(broken));
         slot.laid_width_bits = width.to_bits();
         slot.laid_generation = generation;
+        // 快照变了 ⇒ 文本 lane 里的 UV/尺寸必须重建。`set_text_line` 的调用方
+        // （`layout_text`）在布局阶段跑，此处的 `PAINT` 会让本帧 paint 重新编码该节点，
+        // 而不是复用 `REUSABLE` 的旧图元（否则图集中途换代时会用新纹理画旧 UV，
+        // 复审 P2-9）。`mark_paint` 会清 `REUSABLE`，这正是需要的。
+        self.mark_paint(node);
         true
     }
 

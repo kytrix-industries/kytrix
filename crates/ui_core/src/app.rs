@@ -3537,6 +3537,41 @@ mod tests {
         style
     }
 
+    /// P2-9：文本快照被重写后必须标 `PAINT`，否则 lane 复用旧 UV（新纹理 + 旧坐标）。
+    #[test]
+    fn re_laid_text_marks_paint_for_the_lane() {
+        let (_rt, mut app, window, node) = text_app("hello", Some(400.0));
+        refresh(&mut app, window);
+        layout(&mut app, window);
+        text_layout(&mut app, window);
+
+        // 改文本 ⇒ 宽度变化 ⇒ 下一次 `layout_text` 会重写快照。
+        set_text(
+            &mut app,
+            window,
+            node,
+            "hello brave new world",
+            crate::text::TextStyle::new(16.0),
+        );
+        refresh(&mut app, window);
+        layout(&mut app, window);
+        // 清掉所有脏位，模拟「lane 仍可复用」的稳态：此时没有任何业务脏位。
+        clear_dirty(&mut app, window);
+
+        let report = text_layout(&mut app, window);
+        assert!(report.laid > 0, "必须重排一次");
+        assert!(
+            app.window(window)
+                .expect("窗口存在")
+                .tree()
+                .get(node)
+                .expect("节点存在")
+                .dirty()
+                .contains(DirtyFlags::PAINT),
+            "重排后必须标 PAINT（否则 paint 复用旧 UV）"
+        );
+    }
+
     fn text_app(
         text: &str,
         width: Option<f32>,
