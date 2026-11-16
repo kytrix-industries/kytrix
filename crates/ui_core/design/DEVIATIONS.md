@@ -2886,15 +2886,18 @@ x86_64-unknown-linux-gnu，后者按 V-04 的 pkg-config stub）exit 0。
 
 ### 37.2.1 三平台复测（同一提交 6d1be1a，demo `--features hud`，1200×925 物理内容）
 
-| 平台 / 指标                     | 改前    | 改后        | Δ          |
-|---------------------------------|---------|-------------|------------|
-| Windows 私有提交                | 231.9 MB | **127.6 MB** | −104.3 MB  |
-| Windows 工作集                  | 165.0 MB | **102.2 MB** | −62.8 MB   |
+| 平台 / 指标                     | 改前     | 最终        | Δ          |
+|---------------------------------|----------|-------------|------------|
+| Windows 私有提交                | 231.9 MB | **128.6 MB** | −103.3 MB  |
+| Windows 工作集                  | 165.0 MB | **103.3 MB** | −61.7 MB   |
 | Windows `GPU Process Memory\Local` | 113.4 MB | **46.7 MB**  | −66.7 MB   |
-| macOS `footprint`               | 114 MB   | **51 MB**    | −63 MB     |
-| macOS RSS                       | —        | 52.5 MB      | —          |
-| Linux（lavapipe）RSS            | 157 MB   | **134.5 MB** | −22.5 MB   |
-| Linux（lavapipe）Pss            | 101 MB   | **80.2 MB**  | −20.8 MB   |
+| macOS `footprint`               | 114 MB   | **47 MB**    | −67 MB     |
+| macOS RSS                       | —        | 52.7 MB      | —          |
+| Linux（lavapipe）RSS            | 157 MB   | **132.6 MB** | −24.4 MB   |
+| Linux（lavapipe）Pss            | 101 MB   | **82.4 MB**  | −18.6 MB   |
+
+（「最终」= 批次 A–E 全部落地后的提交 f57d739；Windows 另有 `VirtualQueryEx` 私有已提交 94.6 MB /
+`PAGE_NOCACHE` 35.1 MB，较改前的 195.2 MB / 88.3 MB 分别 −100.6 MB / −53.2 MB。）
 
 三平台测试：Windows 803 lib + 62 其他；macOS 734 lib + 62；Linux 735 lib + 62，全部 0 failed
 （macOS / Linux 实机跑 `cargo test -p ui_core --features "hud,test-support"`，Linux 用
