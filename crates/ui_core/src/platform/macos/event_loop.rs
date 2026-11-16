@@ -275,6 +275,8 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
     let mut closed = false;
     for native in state.windows.iter_mut() {
         if native.take_close_request() {
+            // 观察者仍应看到 `CloseRequested`（delegate 路径下 `sync_state` 不再产生它）。
+            app.dispatch(native.id(), crate::event::Event::CloseRequested);
             // 先问应用：`App::on_close` 返回 `false` 就拦下这次关闭（P2-8）。
             if !app.request_close(native.id()) {
                 continue;

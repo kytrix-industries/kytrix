@@ -1,14 +1,21 @@
 //! 原生窗口：`NSWindow` + 自绘标题栏 + 交通灯（`design/phase-12-macos-linux.md` §7.3）。
 //!
-//! 状态同步（尺寸 / 缩放 / 焦点 / 关闭）走「每轮快照对比」而不是 delegate 或通知：
-//! `NSWindowDelegate` 会引入第二个回调入口，而泵每轮都要读一次这些值（O(1)）。
+//! 状态同步（尺寸 / 缩放 / 焦点）走「每轮快照对比」而不是 delegate 或通知：泵每轮都要读
+//! 一次这些值（O(1)）。**唯一例外是关闭**：`windowShouldClose:` 是 AppKit 在关窗前唯一
+//! 的同步钩子，没有它就无法拦截用户点红点 / Cmd-W（窗口已被 AppKit 关掉，泵事后才观察
+//! 到，veto 也就失去意义）。见 [`CloseDelegate`]。
 
-use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained};
+use std::{cell::Cell, sync::Arc};
+
+use objc2::{
+    DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained,
+    runtime::ProtocolObject,
+};
 use objc2_app_kit::{
     NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSCursor, NSWindow,
-    NSWindowCollectionBehavior, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSWindowCollectionBehavior, NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 use objc2_quartz_core::CAMetalLayer;
 
 use crate::{
@@ -23,6 +30,52 @@ use crate::{
     window::{WindowId, WindowOptions},
 };
 
+/// `NSWindowDelegate` 的 ivar：只记「AppKit 请求关窗」这一个事实并唤醒泵。
+///
+/// 回调里**不碰 `App`**（与 `GuiView` 同一纪律）：置位 + `wake`，由泵在主线程决定
+/// `App::request_close` 的裁决。`windowShouldClose:` 恒返回 `false` —— 真正的关闭由泵在
+/// 应用同意之后调 `NSWindow::close`（`close` 不再询问 delegate，因此不会递归）。
+struct CloseIvars {
+    requested: Cell<bool>,
+    dispatcher: Arc<Dispatcher>,
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "KytrixCloseDelegate"]
+    #[ivars = CloseIvars]
+    struct CloseDelegate;
+
+    unsafe impl NSObjectProtocol for CloseDelegate {}
+
+    unsafe impl NSWindowDelegate for CloseDelegate {
+        #[unsafe(method(windowShouldClose:))]
+        fn window_should_close(&self, _sender: &NSWindow) -> bool {
+            self.ivars().requested.set(true);
+            self.ivars().dispatcher.wake();
+            // 恒拒绝 AppKit 的默认关闭：由泵在 `App::request_close` 同意后再 `close()`。
+            false
+        }
+    }
+);
+
+impl CloseDelegate {
+    fn new(mtm: MainThreadMarker, dispatcher: Arc<Dispatcher>) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(CloseIvars {
+            requested: Cell::new(false),
+            dispatcher,
+        });
+        // SAFETY: `init` 是 NSObject 的指定初始化器；`this` 由 `alloc` 产生且未初始化。
+        unsafe { msg_send![super(this), init] }
+    }
+
+    /// 取走「AppKit 请求关窗」标记。
+    fn take_request(&self) -> bool {
+        self.ivars().requested.replace(false)
+    }
+}
+
 /// 最小客户区（逻辑像素；与 Win32 / Wayland 同源）。
 pub(crate) const MIN_SIZE_LOGICAL: (f32, f32) = (320.0, 200.0);
 
@@ -32,6 +85,8 @@ pub(crate) struct NativeWindow {
     id: WindowId,
     window: Retained<NSWindow>,
     view: Retained<GuiView>,
+    /// `delegate` 是 **weak** 属性：必须由门面持有强引用，否则回调会打在已释放对象上。
+    close_delegate: Retained<CloseDelegate>,
     scale: Scale,
     logical_size: Size,
     /// 最近一次同步的快照（用于检测变化）。
@@ -119,11 +174,19 @@ impl NativeWindow {
         view.install_a11y(a11y);
 
         let scale = f64::from(options.scale.factor());
+        // 关闭拦截：AppKit 的关窗手势（红点 / Cmd-W / performClose:）走 delegate，
+        // windowShouldClose: 恒返回 false 并置位，由泵问过 App::request_close 后才真正 close。
+        let close_delegate = CloseDelegate::new(mtm, Arc::clone(dispatcher));
+        // SAFETY: ProtocolObject::from_ref 要求该对象实现了目标协议 —— 上面刚 impl 过。
+        let delegate: &ProtocolObject<dyn NSWindowDelegate> =
+            ProtocolObject::from_ref(&*close_delegate);
+        window.setDelegate(Some(delegate));
         let mut native = Self {
             mtm,
             id,
             window,
             view,
+            close_delegate,
             scale: options.scale,
             logical_size: options.size,
             seen_scale: 1.0,
@@ -300,7 +363,11 @@ impl NativeWindow {
 
     /// 取走「关闭已请求」标志（泵唯一读点）。
     pub(crate) fn take_close_request(&mut self) -> bool {
-        std::mem::take(&mut self.close_requested)
+        // 两个来源：AppKit 的关窗手势（delegate 置位）与「窗口已不可见」的事后观察
+        // （销毁 / 应用退出等非手势路径）。后者用 close_requested 做一次性去重。
+        let gesture = self.close_delegate.take_request();
+        let observed = std::mem::take(&mut self.close_requested);
+        gesture || observed
     }
 
     pub(crate) fn is_destroyed(&self) -> bool {
