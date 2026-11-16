@@ -213,6 +213,9 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
     // SAFETY: `app` 指针由 `run` 保证有效，且此刻没有其它 `&mut App`。
     let app = unsafe { &mut *state.app };
     app.sync_clock();
+    // 运行时窗口生命周期（P1-2.8）：`App` 里新增/移除的窗口要同步到原生窗口。旧实现只在
+    // `run` 启动时枚举一次，运行时 `App::create_window` 的窗口永远没有原生窗口与渲染器。
+    sync_native_windows(app, &mut state.windows, &state.dispatcher)?;
     // 空闲时也要收 render 线程的反馈：设备丢失/提交失败不能等到下一次输入才冒泡。
     app.poll_renderers()?;
 
@@ -282,6 +285,63 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
     }
     if state.windows.is_empty() || app.windows().next().is_none() {
         state.exit = true;
+    }
+    Ok(())
+}
+
+/// 把 `App` 的窗口集合同步到原生窗口（运行时创建 / 应用主动关闭，P1-2.8）。
+///
+/// 与 Win32 的同名函数同构：
+/// - **创建**：`App` 里存在但还没有原生窗口的 id ⇒ 建 `NativeWindow` + `Renderer`，挂
+///   `CAMetalLayer`，并把尺寸 / DPI / surface 写回 `Window`（与启动路径同一套写入顺序）。
+/// - **销毁**：原生窗口对应的 `App` 窗口已经不存在 ⇒ 从列表移除（`NativeWindow::drop`
+///   负责关窗；`App` 丢弃 `Window` 时已经 drop 了它的 `Renderer`，GPU 线程 join 早于关窗）。
+fn sync_native_windows(
+    app: &mut App,
+    windows: &mut Vec<NativeWindow>,
+    dispatcher: &Arc<Dispatcher>,
+) -> Result<(), EngineError> {
+    windows.retain(|native| app.window(native.id()).is_some());
+    let existing: Vec<WindowId> = windows.iter().map(NativeWindow::id).collect();
+    let pending: Vec<(WindowId, WindowOptions)> = app
+        .windows()
+        .filter(|(id, _)| !existing.contains(id))
+        .map(|(id, window)| (id, window.options().clone()))
+        .collect();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    // `pump` 只在主线程、run loop 上执行，因此这里拿得到 MainThreadMarker。
+    let mtm = MainThreadMarker::new().ok_or(EngineError::AppInit {
+        detail: smol_str::SmolStr::new_static("window creation requires the main thread"),
+    })?;
+    for (id, options) in pending {
+        let native = NativeWindow::create(mtm, id, &options, dispatcher)?;
+        let scale = native.scale();
+        let size = native.backing_size();
+        let renderer = Renderer::new_for_layer(
+            size,
+            f64::from(scale.factor()),
+            native.maximum_frames_per_second(),
+            options.background,
+        )?;
+        {
+            let layer = renderer
+                .layer_handle()
+                .ok_or_else(|| EngineError::AppInit {
+                    detail: smol_str::SmolStr::new_static("metal renderer has no CAMetalLayer"),
+                })?;
+            native.attach_layer(layer);
+        }
+        if let Some(window) = app.window_mut(id) {
+            // `set_renderer` 清空图集页记账；`set_surface` 置全量 damage（新 drawable 必须整帧）。
+            window.set_renderer(renderer);
+            window.set_scale(scale);
+            window.set_size(native.logical_size());
+            window.set_surface(size);
+        }
+        native.show();
+        windows.push(native);
     }
     Ok(())
 }

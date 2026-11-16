@@ -682,6 +682,13 @@ fn pump_loop(
 
         // ② 平台事件 → App。
         app.sync_clock();
+        // ②a 运行时窗口生命周期（P1-2.8）：`App` 里新增/移除的窗口要同步到原生窗口。
+        // 旧实现只在 `run` 启动时枚举一次，运行时 `App::create_window` 得到的窗口永远没有
+        // 原生窗口与渲染器（`App::frame` 对着无 renderer 的 Window 空转）；应用自己调
+        // `App::close_window` 也只删 App 状态，留下幽灵原生窗口并继续收事件。
+        if sync_native_windows(app, windows, dispatcher)? {
+            retarget_wake(windows, dispatcher);
+        }
         collect_events(app, windows, dispatcher)?;
 
         // ②b GPU 线程反馈：设备丢失 / 呈现失败是粘性的，在这里冒泡出去（三平台统一）。
@@ -793,6 +800,64 @@ fn pump_loop(
             DispatchMessageW(&message);
         }
     }
+}
+
+/// 把 `App` 的窗口集合同步到原生窗口（运行时创建 / 应用主动关闭，P1-2.8）。
+///
+/// 返回 `true` 表示原生窗口集合变了（调用方需要重新指向唤醒目标与剪贴板属主）。
+///
+/// 两件事：
+/// - **创建**：`App` 里存在但还没有原生窗口的 id ⇒ 建 `NativeWindow` + `Renderer`，并把
+///   尺寸 / DPI / surface 写回 `Window`（与启动路径同一套写入顺序）。
+/// - **销毁**：原生窗口对应的 `App` 窗口已经不存在 ⇒ `destroy()` + 从列表移除。
+///   （用户点 X 的路径在 `close_requested_windows` 里，已经先 `app.close_window` 再 `destroy`，
+///   这里只兜「应用自己关掉」的那一半。）
+fn sync_native_windows(
+    app: &mut App,
+    windows: &mut Vec<NativeWindow>,
+    dispatcher: &Arc<Dispatcher>,
+) -> Result<bool, EngineError> {
+    let mut changed = false;
+    // 先销毁：避免同一个 id 在窗口关闭又被复用时留下两份原生窗口。
+    windows.retain(|native| {
+        if app.window(native.id()).is_some() {
+            true
+        } else {
+            changed = true;
+            false
+        }
+    });
+    // `NativeWindow::drop` 负责 `DestroyWindow`（GPU 线程的 join 在 `Renderer::drop` 里，
+    // `App::close_window` 已经丢掉了那个 `Window`，因此顺序天然正确）。
+    let existing: Vec<WindowId> = windows.iter().map(NativeWindow::id).collect();
+    let pending: Vec<(WindowId, WindowOptions)> = app
+        .windows()
+        .filter(|(id, _)| !existing.contains(id))
+        .map(|(id, window)| (id, window.options().clone()))
+        .collect();
+    for (id, options) in pending {
+        let mut native = NativeWindow::create(id, &options, dispatcher.clone())?;
+        let client = native.client_size();
+        let renderer = Renderer::new_for_hwnd(native.composition(), client, options.background)?;
+        if let Some(window) = app.window_mut(id) {
+            // `set_renderer` 先清空图集页记账（新渲染器 = 一套空纹理 ⇒ 两张页都要整页重传），
+            // `set_surface` 会把 `full_damage_pending` 置位（新交换链/持久目标必须整帧）。
+            window.set_renderer(renderer);
+            window.set_scale(native.scale());
+            window.set_size(native.logical_size());
+            window.set_surface(client);
+        }
+        {
+            let target = native.composition();
+            let mut target = composition::lock(&target);
+            target.set_geometry(client, client)?;
+        }
+        native.note_composition_geometry((client, client));
+        native.show();
+        windows.push(native);
+        changed = true;
+    }
+    Ok(changed)
 }
 
 /// 把 `WndProc` 收集的事件应用到 `App`（几何/DPI 先落地，再投递事件）。
