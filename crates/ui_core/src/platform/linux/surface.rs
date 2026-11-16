@@ -189,28 +189,22 @@ impl ScrollAccum {
 const CONTINUOUS_AXIS_UNITS_PER_LINE: f32 = 10.0;
 
 /// Wayland 侧的全部状态（`Dispatch` 的实现体 + calloop 的 `Data`）。
-pub(crate) struct WaylandState {
-    /// 待泵消费的平台事件。
-    events: Vec<Event>,
-    connection: Connection,
-    queue_handle: QueueHandle<Self>,
-    /// 只为保活（建 surface 之后不再使用）。
-    _compositor: wl_compositor::WlCompositor,
+/// 一个原生窗口的 Wayland 侧状态（surface / toplevel / 几何 / 帧节流）。
+///
+/// **进程级 vs 每窗口**（P1-2.8 的分层）：`WaylandState` 持有连接、seat、键盘/指针、
+/// xkb、IME、剪贴板、事件队列 —— 这些跨窗口共享；本结构只放「一个 surface 独有」的东西。
+/// 现在是单窗口（`WaylandState::window`），改成多窗口时它变成 `Vec<WindowSurface>`，
+/// 事件按对象（`wl_surface` / `xdg_toplevel`）或焦点窗口路由。
+///
+/// 键盘/指针的事件属于 **seat**，不属于 surface：它们的路由依据是「哪个窗口当前有焦点 /
+/// 指针进入」，那是下一步要做的事，本结构先只负责持有 per-surface 对象。
+struct WindowSurface {
+    /// 稳定 id（与 `App` 的 `WindowId` 对应）。
+    id: crate::window::WindowId,
     surface: wl_surface::WlSurface,
     /// 只为保活（configure 的 ack 在 handler 里）。
     _xdg_surface: xdg_surface::XdgSurface,
     toplevel: xdg_toplevel::XdgToplevel,
-    /// 只为保活（`xdg_wm_base::ping` 必须回 pong）。
-    _wm_base: xdg_wm_base::XdgWmBase,
-    seat: wl_seat::WlSeat,
-    /// `wl_seat.capabilities` 最近一次声明的能力位：只有声明过的设备才能 `get_keyboard` / `get_pointer`
-    /// （否则服务端报 `wl_seat error 0` 并断开连接，见 F-146）。
-    seat_caps: wl_seat::Capability,
-    keyboard: Option<wl_kb::WlKeyboard>,
-    pointer: Option<wl_pointer::WlPointer>,
-    /// 只为保活（`wl_data_device` 的 offer 事件在它上面）。
-    _data_device: wl_data_device::WlDataDevice,
-    text_input: Option<ZwpTextInputV3>,
     /// 应用声明的 IME caret 区域（surface 逻辑坐标；`None` = 无 hint）。
     ime_cursor_area: Option<Rect>,
     /// 最近一次实际下发给 `zwp_text_input_v3` 的区域（含 None 回退）。
@@ -230,6 +224,44 @@ pub(crate) struct WaylandState {
     /// `false` ⇒ 整数回退：`buffer_scale = N`，buffer 是 `round(逻辑 × N)`（V-110）。
     /// `take_viewport` 之后仍保持 `true`。
     uses_viewport: bool,
+    /// 只为保活（`configure` 事件只做记录）。
+    _decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
+    size: Size,
+    scale: Scale,
+    focused: bool,
+    configured: bool,
+    /// 最近一次 configure 的 `Maximized` 状态（自绘标题栏的切换按钮据此选择 set/unset）。
+    maximized: bool,
+    close_requested: bool,
+    /// 帧节流：上一次请求的 `wl_callback` 回来之前不再提交（Idle / 超时兜底见 `frame_gate`）。
+    frame_gate: FrameGate,
+    /// 最近一次 `wl_surface.frame` 的回调对象 id 与门禁令牌。
+    ///
+    /// 门禁的活性兜底会放弃旧 callback 再挂新的；回调事件只带自己这个对象，因此靠 id 区分
+    /// 「当前请求的 callback」与「被兜底放弃、迟到的旧 callback」，令牌只对匹配的回调生效。
+    frame_callback: Option<(ObjectId, CallbackToken)>,
+}
+
+pub(crate) struct WaylandState {
+    /// 唯一的窗口（Stage A：多窗口时改为 `Vec<WindowSurface>` 并按对象 / 焦点路由事件）。
+    window: WindowSurface,
+    /// 待泵消费的平台事件。
+    events: Vec<Event>,
+    connection: Connection,
+    queue_handle: QueueHandle<Self>,
+    /// 只为保活（建 surface 之后不再使用）。
+    _compositor: wl_compositor::WlCompositor,
+    /// 只为保活（`xdg_wm_base::ping` 必须回 pong）。
+    _wm_base: xdg_wm_base::XdgWmBase,
+    seat: wl_seat::WlSeat,
+    /// `wl_seat.capabilities` 最近一次声明的能力位：只有声明过的设备才能 `get_keyboard` / `get_pointer`
+    /// （否则服务端报 `wl_seat error 0` 并断开连接，见 F-146）。
+    seat_caps: wl_seat::Capability,
+    keyboard: Option<wl_kb::WlKeyboard>,
+    pointer: Option<wl_pointer::WlPointer>,
+    /// 只为保活（`wl_data_device` 的 offer 事件在它上面）。
+    _data_device: wl_data_device::WlDataDevice,
+    text_input: Option<ZwpTextInputV3>,
     /// 已绑定的 `wl_output`（容量 2：常见单 / 双屏；多屏时扩容，O(n) 扫描无所谓）。
     outputs: Vec<OutputEntry>,
     /// 本 surface 已 enter 的 output 对象 id（enter / leave 成对；整数回退取其中最大 scale）。
@@ -251,8 +283,6 @@ pub(crate) struct WaylandState {
     /// enter 之前整数 scale 用「全部已绑定 output 的最大值」做保守估计；enter 之后若列表为空
     /// （最小化 / 切工作区）保留上一个值，不再回退到 bound 最大值。
     entered_once: bool,
-    /// 只为保活（`configure` 事件只做记录）。
-    _decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
     ime: ImeState,
     clipboard: Clipboard,
     xkb_context: xkb::Context,
@@ -280,20 +310,6 @@ pub(crate) struct WaylandState {
     /// 本帧尚未提交的滚轮累积（按 `wl_pointer.frame` 成批，P1-2.11）。
     scroll: ScrollAccum,
     pointer_pos: Point,
-    size: Size,
-    scale: Scale,
-    focused: bool,
-    configured: bool,
-    /// 最近一次 configure 的 `Maximized` 状态（自绘标题栏的切换按钮据此选择 set/unset）。
-    maximized: bool,
-    close_requested: bool,
-    /// 帧节流：上一次请求的 `wl_callback` 回来之前不再提交（Idle / 超时兜底见 `frame_gate`）。
-    frame_gate: FrameGate,
-    /// 最近一次 `wl_surface.frame` 的回调对象 id 与门禁令牌。
-    ///
-    /// 门禁的活性兜底会放弃旧 callback 再挂新的；回调事件只带自己这个对象，因此靠 id 区分
-    /// 「当前请求的 callback」与「被兜底放弃、迟到的旧 callback」，令牌只对匹配的回调生效。
-    frame_callback: Option<(ObjectId, CallbackToken)>,
 }
 
 impl WaylandState {
@@ -304,6 +320,7 @@ impl WaylandState {
     pub(crate) fn new(
         size: Size,
         title: &str,
+        id: crate::window::WindowId,
     ) -> Result<(Self, wayland_client::EventQueue<Self>), EngineError> {
         let connection =
             Connection::connect_to_env().map_err(|error| EngineError::WaylandCompositor {
@@ -396,13 +413,33 @@ impl WaylandState {
 
         let clipboard = Clipboard::new(connection.clone(), data_device.clone(), data_source);
         let mut state = Self {
+            window: WindowSurface {
+                id,
+                surface,
+                _xdg_surface: xdg_surface,
+                toplevel,
+                ime_cursor_area: None,
+                ime_cursor_applied: None,
+                _fractional: fractional,
+                viewport,
+                uses_viewport,
+                _decoration: decoration,
+                // Wayland 的 configure / window geometry 是整数，小数的逻辑尺寸在协议层没有表示：
+                // 这里先四舍五入取整，整数回退下 buffer = `round(L × N)` 因而严格是 buffer_scale 的
+                // 整数倍（否则 `wl_surface.attach` 报 `invalid_size`，V-110）。
+                size: Size::new(size.width.round().max(1.0), size.height.round().max(1.0)),
+                scale: Scale::ONE,
+                focused: false,
+                configured: false,
+                maximized: false,
+                close_requested: false,
+                frame_gate: FrameGate::new(),
+                frame_callback: None,
+            },
             events: Vec::with_capacity(16),
             connection,
             queue_handle,
             _compositor: compositor,
-            surface,
-            _xdg_surface: xdg_surface,
-            toplevel,
             _wm_base: wm_base,
             seat,
             seat_caps: wl_seat::Capability::empty(),
@@ -410,16 +447,10 @@ impl WaylandState {
             pointer: None,
             _data_device: data_device,
             text_input,
-            ime_cursor_area: None,
-            ime_cursor_applied: None,
-            _fractional: fractional,
-            viewport,
-            uses_viewport,
             outputs: Vec::with_capacity(2),
             surface_outputs: Vec::with_capacity(2),
             preferred_buffer_scale: None,
             fractional_scale_120: None,
-            _decoration: decoration,
             ime: ImeState::new(),
             clipboard,
             xkb_context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
@@ -433,19 +464,8 @@ impl WaylandState {
             held_keys: Vec::new(),
             scroll: ScrollAccum::default(),
             pointer_pos: Point::new(0.0, 0.0),
-            // Wayland 的 configure / window geometry 是整数，小数的逻辑尺寸在协议层没有表示：
-            // 这里先四舍五入取整，整数回退下 buffer = `round(L × N)` 因而严格是 buffer_scale 的
-            // 整数倍（否则 `wl_surface.attach` 报 `invalid_size`，V-110）。
-            size: Size::new(size.width.round().max(1.0), size.height.round().max(1.0)),
-            scale: Scale::ONE,
             integer_scale: 1,
             entered_once: false,
-            focused: false,
-            configured: false,
-            maximized: false,
-            close_requested: false,
-            frame_gate: FrameGate::new(),
-            frame_callback: None,
         };
         // 启动时绑定所有现存 `wl_output`：`initial_roundtrip` 的 2 次 roundtrip 会带回它们的
         // `wl_output.scale`，整数回退的首帧因此能按「全部已绑定 output 的最大 scale」兜底
@@ -532,7 +552,7 @@ impl WaylandState {
     /// 当前生效的 scale：fractional 模式下用 `preferred_scale`（未收到时回落到整数 scale），
     /// 否则就是整数回退的当前值。
     fn effective_scale(&self) -> Scale {
-        let fractional = if self.uses_viewport {
+        let fractional = if self.window.uses_viewport {
             self.fractional_scale_120
                 .and_then(|scale| dpi::scale_from_120(scale).ok())
         } else {
@@ -541,15 +561,15 @@ impl WaylandState {
         fractional.unwrap_or_else(|| Scale::new(self.integer_scale as f32).expect("positive"))
     }
 
-    /// 先推进整数回退的当前值，再按 effective scale 更新 `self.scale` 并排队
+    /// 先推进整数回退的当前值，再按 effective scale 更新 `self.window.scale` 并排队
     /// `Event::DpiChanged`（事件循环随后 `set_scale` / `set_surface` 并出帧）。
     fn recompute_scale(&mut self) {
         self.integer_scale = self.integer_scale_value();
         let scale = self.effective_scale();
-        if scale == self.scale {
+        if scale == self.window.scale {
             return;
         }
-        self.scale = scale;
+        self.window.scale = scale;
         self.events.push(Event::DpiChanged {
             dpi: (scale.factor() * 96.0).round() as u32,
             scale,
@@ -561,7 +581,7 @@ impl WaylandState {
     ///
     /// GPU 线程在 present 前与 attach/commit 同一次生效（[`crate::render::frame::FrameRequest`]）。
     pub(crate) fn buffer_scale(&self) -> i32 {
-        if self.uses_viewport {
+        if self.window.uses_viewport {
             1
         } else {
             self.integer_scale
@@ -570,7 +590,15 @@ impl WaylandState {
 
     /// `wl_surface` 的代理副本：GPU 线程用它写 `set_buffer_scale`（`WlSurface` 是 `Clone`）。
     pub(crate) fn surface_clone(&self) -> wl_surface::WlSurface {
-        self.surface.clone()
+        self.window.surface.clone()
+    }
+
+    /// 当前窗口的稳定 id（与 `App` 的 `WindowId` 同一值）。
+    ///
+    /// 多窗口路由的锚点：下一步事件循环要按它把 `wl_surface` / `xdg_toplevel` 的事件、
+    /// 以及 seat 的键盘/指针事件（按焦点窗口）派发到正确的 `Window`。
+    pub(crate) fn id(&self) -> crate::window::WindowId {
+        self.window.id
     }
 
     pub(crate) fn connection(&self) -> &Connection {
@@ -581,16 +609,16 @@ impl WaylandState {
     pub(crate) fn raw_pointers(&self) -> (*mut std::ffi::c_void, *mut std::ffi::c_void) {
         (
             self.connection.display().id().as_ptr().cast(),
-            self.surface.id().as_ptr().cast(),
+            self.window.surface.id().as_ptr().cast(),
         )
     }
 
     pub(crate) fn size(&self) -> Size {
-        self.size
+        self.window.size
     }
 
     pub(crate) fn scale(&self) -> Scale {
-        self.scale
+        self.window.scale
     }
 
     pub(crate) fn serial(&self) -> u32 {
@@ -598,11 +626,11 @@ impl WaylandState {
     }
 
     pub(crate) fn is_configured(&self) -> bool {
-        self.configured
+        self.window.configured
     }
 
     pub(crate) fn is_focused(&self) -> bool {
-        self.focused
+        self.window.focused
     }
 
     /// 把 `wp_viewport` 的所有权交给窗口渲染器（`Some` = fractional 模式）。
@@ -617,7 +645,7 @@ impl WaylandState {
     /// 缩放，而且这次 commit 会提前触发 frame callback、破坏 FrameGate。现在 UI 线程不再碰
     /// viewport（也不再 commit `wl_surface`）。
     pub(crate) fn take_viewport(&mut self) -> Option<WpViewport> {
-        self.viewport.take()
+        self.window.viewport.take()
     }
 
     pub(crate) fn take_events(&mut self) -> Vec<Event> {
@@ -625,26 +653,26 @@ impl WaylandState {
     }
 
     pub(crate) fn take_close_request(&mut self) -> bool {
-        std::mem::take(&mut self.close_requested)
+        std::mem::take(&mut self.window.close_requested)
     }
 
     /// 最小化（自绘标题栏的“缩小”按钮）。
     pub(crate) fn minimize(&self) {
-        self.toplevel.set_minimized();
+        self.window.toplevel.set_minimized();
     }
 
     /// 最大化 / 还原切换；最终状态以 compositor 的 configure 为准。
     pub(crate) fn toggle_maximize(&mut self) {
-        if self.maximized {
-            self.toplevel.unset_maximized();
+        if self.window.maximized {
+            self.window.toplevel.unset_maximized();
         } else {
-            self.toplevel.set_maximized();
+            self.window.toplevel.set_maximized();
         }
     }
 
     /// 开始交互式移动；使用触发拖动的指针按键 serial。
     pub(crate) fn begin_move(&self) {
-        self.toplevel._move(&self.seat, self.pointer_serial);
+        self.window.toplevel._move(&self.seat, self.pointer_serial);
     }
 
     /// 开始交互式缩放；使用触发拖动的指针按键 serial。
@@ -663,7 +691,9 @@ impl WaylandState {
             WindowResizeEdge::BottomLeft => ResizeEdge::BottomLeft,
             WindowResizeEdge::BottomRight => ResizeEdge::BottomRight,
         };
-        self.toplevel.resize(&self.seat, self.pointer_serial, edge);
+        self.window
+            .toplevel
+            .resize(&self.seat, self.pointer_serial, edge);
     }
 
     pub(crate) fn clipboard_mut(&mut self) -> &mut Clipboard {
@@ -672,31 +702,31 @@ impl WaylandState {
 
     /// 请求一帧回调（publish 之前调用；已有挂起 callback 时只关好门禁，不重复请求）。
     pub(crate) fn request_frame(&mut self) {
-        let Some(token) = self.frame_gate.request(Instant::now()) else {
+        let Some(token) = self.window.frame_gate.request(Instant::now()) else {
             return;
         };
-        let callback = self.surface.frame(&self.queue_handle, ());
-        self.frame_callback = Some((callback.id(), token));
+        let callback = self.window.surface.frame(&self.queue_handle, ());
+        self.window.frame_callback = Some((callback.id(), token));
     }
 
     pub(crate) fn frame_ready(&self) -> bool {
-        self.frame_gate.is_ready()
+        self.window.frame_gate.is_ready()
     }
 
     /// 本帧没有 publish（Idle / 中止）⇒ 不会 commit：把门禁重新打开（F-183 的 Idle 路径）。
     pub(crate) fn note_frame_not_committed(&mut self) {
-        self.frame_gate.note_not_committed();
+        self.window.frame_gate.note_not_committed();
     }
 
     /// 活性兜底：门禁关闭超过 `GATE_TIMEOUT` 时强制打开。只覆盖「publish 了但没 commit」
     /// （present `OUT_OF_DATE` 等），正常路径不会触发；**不是**呈现节奏（F-183）。
     pub(crate) fn expire_frame_gate(&mut self, now: Instant) -> bool {
-        self.frame_gate.expire(now)
+        self.window.frame_gate.expire(now)
     }
 
     /// 距离活性兜底还有多久（门禁打开时 `None`）；事件循环用它压缩阻塞等待。
     pub(crate) fn frame_gate_remaining(&self, now: Instant) -> Option<Duration> {
-        self.frame_gate.time_until_expiry(now)
+        self.window.frame_gate.time_until_expiry(now)
     }
 
     /// IME 的激活/停用（focus 变化时由键盘事件驱动）。
@@ -713,6 +743,7 @@ impl WaylandState {
             // P1-2.11：从这里开始文本由 `commit_string` 送达，`wl_keyboard` 通路必须静默。
             self.ime_enabled = true;
             let area = self
+                .window
                 .ime_cursor_area
                 .unwrap_or_else(|| Rect::new(0.0, 0.0, 1.0, 1.0));
             text_input.set_cursor_rectangle(
@@ -721,34 +752,34 @@ impl WaylandState {
                 area.size.width.max(1.0).round() as i32,
                 area.size.height.max(1.0).round() as i32,
             );
-            self.ime_cursor_applied = Some(area);
+            self.window.ime_cursor_applied = Some(area);
         } else {
             text_input.disable();
             self.ime_enabled = false;
-            self.ime_cursor_applied = None;
+            self.window.ime_cursor_applied = None;
         }
         text_input.commit();
     }
 
     /// 保存 IME caret 区域；已聚焦时立即下发（`commit` 是 v3 的生效点）。
     pub(crate) fn set_ime_cursor_area(&mut self, area: Option<Rect>) {
-        if self.ime_cursor_area == area {
+        if self.window.ime_cursor_area == area {
             return;
         }
-        self.ime_cursor_area = area;
-        if !self.focused {
+        self.window.ime_cursor_area = area;
+        if !self.window.focused {
             return;
         }
         let effective = area.unwrap_or_else(|| Rect::new(0.0, 0.0, 1.0, 1.0));
         if let Some(text_input) = self.text_input.as_ref() {
-            if self.ime_cursor_applied != Some(effective) {
+            if self.window.ime_cursor_applied != Some(effective) {
                 text_input.set_cursor_rectangle(
                     effective.origin.x.round() as i32,
                     effective.origin.y.round() as i32,
                     effective.size.width.max(1.0).round() as i32,
                     effective.size.height.max(1.0).round() as i32,
                 );
-                self.ime_cursor_applied = Some(effective);
+                self.window.ime_cursor_applied = Some(effective);
             }
             text_input.commit();
         }
@@ -1073,7 +1104,7 @@ impl Dispatch<wl_callback::WlCallback, ()> for WaylandState {
         _: &QueueHandle<Self>,
     ) {
         if let wl_callback::Event::Done { .. } = event {
-            let Some((pending, token)) = state.frame_callback.as_ref() else {
+            let Some((pending, token)) = state.window.frame_callback.as_ref() else {
                 return;
             };
             // 被活性兜底放弃的旧 callback 迟到：对象 id 不匹配，不能动当前请求的挂起状态
@@ -1082,8 +1113,8 @@ impl Dispatch<wl_callback::WlCallback, ()> for WaylandState {
                 return;
             }
             let token = *token;
-            state.frame_callback = None;
-            state.frame_gate.on_callback(token);
+            state.window.frame_callback = None;
+            state.window.frame_gate.on_callback(token);
         }
     }
 }
@@ -1136,20 +1167,22 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandState {
             } => {
                 // 0 = 「客户端自己选」；否则用 compositor 给的建议尺寸。
                 if width > 0 && height > 0 {
-                    state.size = Size::new(width as f32, height as f32);
+                    state.window.size = Size::new(width as f32, height as f32);
                 }
                 // `states` 是协议数组的原始字节（u32 native-endian 的 state 枚举序列）。
                 let maximized = xdg_toplevel::State::Maximized as u32;
-                state.maximized = states
+                state.window.maximized = states
                     .as_chunks::<4>()
                     .0
                     .iter()
                     .any(|chunk| u32::from_ne_bytes(*chunk) == maximized);
-                state.configured = true;
-                state.events.push(Event::Resized { size: state.size });
+                state.window.configured = true;
+                state.events.push(Event::Resized {
+                    size: state.window.size,
+                });
             }
             xdg_toplevel::Event::Close => {
-                state.close_requested = true;
+                state.window.close_requested = true;
             }
             _ => {}
         }
@@ -1248,12 +1281,12 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
             }
             wl_keyboard::Event::Enter { serial, .. } => {
                 state.serial = serial;
-                state.focused = true;
+                state.window.focused = true;
                 state.events.push(Event::FocusChanged { focused: true });
                 state.set_ime_focus(true);
             }
             wl_keyboard::Event::Leave { .. } => {
-                state.focused = false;
+                state.window.focused = false;
                 state.events.push(Event::FocusChanged { focused: false });
                 state.set_ime_focus(false);
             }

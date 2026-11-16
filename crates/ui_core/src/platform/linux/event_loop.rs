@@ -34,6 +34,14 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
     // 唤醒句柄由本平台的 `wake::install` 安装；`attach` 的 token 只对 Win32 有意义。
     dispatcher.attach(1);
 
+    // 先取窗口 id：WaylandState::new 现在要为 WindowSurface 记录它（P1-2.8 Stage A）。
+    let id = app
+        .windows()
+        .next()
+        .map(|(id, _)| id)
+        .ok_or(EngineError::AppInit {
+            detail: smol_str::SmolStr::new_static("Application::run without a window"),
+        })?;
     let (initial_size, initial_title, initial_background) = app.windows().next().map_or(
         (
             crate::math::Size::new(800.0, 600.0),
@@ -48,7 +56,7 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             )
         },
     );
-    let (mut state, mut queue) = WaylandState::new(initial_size, initial_title)?;
+    let (mut state, mut queue) = WaylandState::new(initial_size, initial_title, id)?;
     surface::initial_roundtrip(&mut queue, &mut state)?;
     surface::create_devices(&mut state)?;
     // 首个 configure 之后才知道真实尺寸。buffer 尺寸按 `round(逻辑 × scale)` 取：fractional
@@ -57,13 +65,6 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
     let scale = state.scale();
     let size = state.size();
     let physical = dpi::physical_size(size, scale);
-    let id = app
-        .windows()
-        .next()
-        .map(|(id, _)| id)
-        .ok_or(EngineError::AppInit {
-            detail: smol_str::SmolStr::new_static("Application::run without a window"),
-        })?;
 
     // 下面直到 `Renderer::new_for_surface` 的 setup 全都可以失败，必须排在 renderer 挂载之前：
     // `WaylandState` 持有 `wl_surface` / `wl_display`，而 renderer 的 Vulkan WSI surface /
@@ -132,8 +133,11 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             state.emit_due_key_repeats(Instant::now());
             let events = state.take_events();
             let had_events = !events.is_empty();
+            // 派发目标取自 `WaylandState` 自己（`WindowSurface::id`）：多窗口时这里会变成
+            // 「按事件来源窗口派发」，现在就让它成为唯一的 id 来源，避免两处各记一份。
+            let window_id = state.id();
             for event in events {
-                app.dispatch(id, event);
+                app.dispatch(window_id, event);
             }
             if had_events {
                 // 与 Win32 的 pump 一致：每条平台消息之后都要唤醒，否则应用侧的状态变更
