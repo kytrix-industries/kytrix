@@ -864,9 +864,10 @@ mod tests {
     #[test]
     fn a_first_atlas_upload_keeps_its_dirty_rows() {
         let mut slots = AtlasSlots::new();
-        slots.queue(AtlasKind::Glyph, &[1, 2, 3], stale_rows(4, 8));
+        slots.queue(AtlasKind::Glyph, 64, &[1, 2, 3], stale_rows(4, 8));
         let [glyph, image] = slots.take();
         let glyph = glyph.expect("glyph upload");
+        assert_eq!(glyph.page, 64);
         assert_eq!(glyph.pixels, vec![1, 2, 3]);
         assert_eq!(glyph.rows.spans(), stale_rows(4, 8).spans());
         assert!(image.is_none());
@@ -874,14 +875,12 @@ mod tests {
     }
 
     #[test]
-    fn overwriting_an_upload_marks_the_whole_page() {
+    #[should_panic(expected = "atlas slot must be idle")]
+    fn queueing_into_a_busy_atlas_slot_is_a_contract_violation() {
+        // UI 线程用 `atlas_idle` 门控入队；覆盖未消费的上传会丢行，因此这里是硬失败。
         let mut slots = AtlasSlots::new();
-        slots.queue(AtlasKind::Glyph, &[1, 2, 3], stale_rows(4, 8));
-        slots.queue(AtlasKind::Glyph, &[9, 9, 9], stale_rows(16, 20));
-        let [glyph, _] = slots.take();
-        let glyph = glyph.expect("latest glyph upload");
-        assert_eq!(glyph.pixels, vec![9, 9, 9], "新像素覆盖旧像素");
-        assert!(glyph.rows.is_full(), "被丢掉的中间上传的脏行不会再补");
+        slots.queue(AtlasKind::Glyph, 64, &[1, 2, 3], stale_rows(4, 8));
+        slots.queue(AtlasKind::Glyph, 64, &[9, 9, 9], stale_rows(16, 20));
     }
 
     #[test]
@@ -889,6 +888,7 @@ mod tests {
         let shared = Shared {
             state: Mutex::new(State::new()),
             work: Condvar::new(),
+            atlas_pending: [AtomicBool::new(false), AtomicBool::new(false)],
         };
         assert!(!shared.lock().has_work(), "空槽不是 GPU 线程的工作");
 
@@ -909,6 +909,7 @@ mod tests {
         let shared = Shared {
             state: Mutex::new(State::new()),
             work: Condvar::new(),
+            atlas_pending: [AtomicBool::new(false), AtomicBool::new(false)],
         };
         shared.request_shutdown();
         shared.set_background([1.0, 0.0, 0.0, 1.0]);
@@ -1056,6 +1057,7 @@ mod tests {
         let shared = Shared {
             state: Mutex::new(State::new()),
             work: Condvar::new(),
+            atlas_pending: [AtomicBool::new(false), AtomicBool::new(false)],
         };
         shared.publish_error(EngineError::DeviceLost {
             reason: SmolStr::new_static("VK_ERROR_DEVICE_LOST"),

@@ -2834,7 +2834,49 @@ GPU 线程只按新内容尺寸重画并 1:1 覆盖，buffer 用 grow-only 高�
 3. 图片页锁档后大图插入的 `Capacity` 错误路径（应用可见文案）；
 4. 批次 A 的内存收益复测（Windows 私有提交 / GPU Local，macOS footprint，Linux RSS）。
 
-### 37.1 批次 A 实测（Windows 本机，1200×925 物理，demo `--features hud`）
+### F-210 Windows 上传缓冲持久映射（批次 D）
+
+| 项       | 内容                                                                                                                                                                                                 |
+|----------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 设计原文 | `render/windows/compositor.rs`：每帧 `UploadArena::write` 对实例/裁剪缓冲 `Map` → 拷 → `Unmap`；`render/windows/atlas.rs`：每次图集上传 `Map` → 拷 → `Unmap`。                                        |
+| 偏差     | 实例/裁剪缓冲与图集 staging 在创建（或扩容重建）时 `Map` 一次，保存 `*mut u8` 指针，之后只做 `memcpy`；不再逐次 `Map`/`Unmap`（资源释放时映射随之失效，D3D12 不要求显式 `Unmap`）。                    |
+| 原因     | `Map`/`Unmap` 是 D3D12 里最贵的 CPU 调用之一（每次都要进入运行时的映射表）；UPLOAD 堆的映射本来就可以长期持有。实测每帧 2 次 + 每次图集上传 1 次都省掉。                                            |
+| 安全     | 写入仍受「槽位 fence 完成」约束（每槽独立缓冲 + retire），指针只在 `kytrix-d3d12` 线程使用；`unsafe impl Send` 只覆盖该独占约定。                                                                      |
+
+### F-211 图集增量上传改为「打包脏行 + 空闲门控」（批次 B）
+
+| 项         | 内容                                                                                                                                                                                                                                                                          |
+|------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 设计原文   | `App::upload_atlas_pages` 有脏就把**整页** `pixels` 广播给所有窗口（字形页每帧 4 MiB、图片页 16 MiB 的 CPU→共享槽拷贝），共享槽被覆盖时「整页标记」。                                                                                                                            |
+| 偏差       | ① `pixels` 语义改为**按 `rows` 顺序紧密打包的行**（整页上传时就是整页）：新增 `DirtyRows::row_count(page)` 与 `render::atlas::pack_rows`；三端 `queue_upload(kind, page, pixels, rows)` 显式收页尺寸（删除 `page_from_len`），长度 = `行数 × page × texel` 的硬断言。② 字形页上传改用**真实脏行**（`atlas.take_dirty_rows()` 合并到 `pending_dirty`），图片页继续用 `ResourceCache::take_dirty_rows()`。③ 共享槽入队前用 `Renderer::atlas_idle(kind)` 门控（原子 `atlas_pending`）：槽被 GPU 线程消费前**不再入队**，脏行留在 `App::pending_dirty` / 分配器里下一帧再发——彻底消除了「覆盖丢行 ⇒ 只能整页重传」的旧路径。④ 每个窗口记录**已收到的页尺寸**（`Option<u32>`）；只有页尺寸不匹配（新窗口 / 渲染器重建 / 页换代）才发整页。⑤ `App` 复用整页缓冲 `glyph_page` 与打包缓冲 `packed`，不再每次上传分配。 |
+| 正确性     | 页变化（首次 / 字形页换代）必须整页上传（新纹理内容未定义）：三端 `prepare` 重建后硬断言 `rows` 覆盖整页；`mark(0, page)` 与 `mark(0, u32::MAX)` 等价接受。macOS / Linux 的 staging 仍是**每帧一次性缓冲**（按 `index` retire），逐段 `buffer_offset` 与 `image_offset` 各自落位（V-64 的教训）。                                                            |
+| 未做（记录） | macOS / Linux 的 staging 环形缓冲（每槽常驻复用）仍按原设计保留一次性分配：它只影响上传瞬间的峰值 / CPU 分配，不影响常驻内存；留作 V-134 复核项。                                                                                                                          |
+
+### 37.2 批次 B/C 实测（Windows 本机，其余条件同 §37.1）
+
+| 指标 | 批次 A | +B（打包增量） | +C（余量 64） | 累计 vs 改前 |
+|------|--------|----------------|---------------|--------------|
+| 私有提交 | 131.9 MB | 128.5 MB | **127.6 MB** | −104.3 MB |
+| 工作集 | 102.1 MB | 102.3 MB | 102.2 MB | −62.8 MB |
+| `GPU Local` | 68.9 MB | — | **46.7 MB** | **−66.7 MB** |
+
+`GPU Local` 的 22.2 MB 降幅正是 buffer 桶从 1792×1536 缩到 1280×1024 后的 persist + 3 back buffer
+（4 × 10.5 MiB → 4 × 5.0 MiB）。批次 B 的收益主要在 CPU 拷贝与峰值（字形每帧 4 MiB → 数十 KiB），
+常驻内存基本不变。demo 截图逐项复核正常（CJK 简/繁/日/韩、PNG 图标、色块、HUD）。
+
+### 37.3 批次 E（CPU 高频分配）复核结论
+
+审计列的 E 项逐条核对现状：
+
+1. `paint/pass.rs` 的文本内容已经是 `Rc<ShapedLine>`（`Content::Text(Option<Rc<ShapedLine>>)`），
+   每帧克隆只加引用计数，**不是**深拷贝；
+2. `StylePatch` 全字段 `Copy`、`PaintSpec` 只含 `Color`/`Option<Border>`/`Option<Gradient>`/
+   `Option<ShadowSpec>` 等定长值，逐节点 `clone()` 不分配堆；
+3. `Layout` 克隆只在 `measure`/`layout_at`（宽度变化或重新断行）发生，静态文本不每帧重排；
+4. 仍存在的每帧分配：`FramePayload::from_buffer` 的 4 次 Vec/Bytes 构造（约 40 KiB/帧）、
+   `Canvas` 节点深拷贝、`StateStore` 槽位不回收（信号 id 稠密、节点销毁后留槽）。
+   这三项见 V-134。
+
 
 | 指标 | 改前 | 改后 | Δ |
 |------|------|------|---|
