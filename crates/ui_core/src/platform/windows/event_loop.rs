@@ -706,7 +706,9 @@ fn pump_loop(
     dispatcher: &Arc<Dispatcher>,
 ) -> Result<(), EngineError> {
     let mut message = MSG::default();
-    let mut frame_timer: Option<usize> = None;
+    // 连续帧定时器记 (宿主 hwnd, timer id)：定时器随窗口销毁而失效，宿主窗口关闭后必须
+    // 在新首窗上重建，否则其余窗口的动画/连续帧永远不再推进（P2-4）。
+    let mut frame_timer: Option<(isize, usize)> = None;
     loop {
         // ① 先 drain：`WM_QUIT` 必须显式识别（`PeekMessageW` 会把它取出来）。
         loop {
@@ -771,14 +773,18 @@ fn pump_loop(
         }
 
         // ②c 交互反馈：光标 / 指针捕获 / 连续帧定时器（P10 §5.4 / §11.3、P17 HUD）。
+        // 光标是**每窗口**状态（`WM_SETCURSOR` 各自读自己的 `WndProcState`），而
+        // `App::take_cursor_change` 不带窗口 id ⇒ 必须写到**所有**窗口，否则首窗之外的
+        // 窗口永远显示箭头（P2-4）。
+        if let Some(cursor) = app.take_cursor_change() {
+            for native in windows.iter_mut() {
+                native.state_mut().set_cursor(cursor);
+            }
+            // SAFETY: 系统光标句柄由 `LoadCursorW` 借用，进程不拥有；`SetCursor` 只影响本线程。
+            unsafe { SetCursor(Some(cursor_handle(cursor))) };
+        }
         if let Some(native) = windows.first_mut() {
             let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
-            if let Some(cursor) = app.take_cursor_change() {
-                // 记住当前光标：`WM_SETCURSOR` 里要重新应用（否则会被类光标覆盖）。
-                native.state_mut().set_cursor(cursor);
-                // SAFETY: 系统光标句柄由 `LoadCursorW` 借用，进程不拥有；`SetCursor` 只影响本线程。
-                unsafe { SetCursor(Some(cursor_handle(cursor))) };
-            }
             if let Some(capture) = app.take_capture_request() {
                 if capture {
                     // SAFETY: `hwnd` 是本进程创建的窗口；捕获在拖拽结束/失焦时释放。
@@ -788,17 +794,23 @@ fn pump_loop(
                     let _ = unsafe { ReleaseCapture() };
                 }
             }
+            // 定时器随宿主窗口销毁而失效：宿主已不是当前首窗 ⇒ 清掉记录，下面在新首窗重建
+            // （否则首窗关闭后其余窗口的动画/连续帧永远不再推进，P2-4）。
+            if frame_timer.is_some_and(|(owner, _)| owner != native.hwnd_raw()) {
+                frame_timer = None;
+            }
             match (app.needs_continuous_frames(), frame_timer) {
                 (true, None) => {
                     // SAFETY: 1 ms 定时器（probe：实测 16.0 ms）；`KillTimer` 在同一线程。
                     let id = unsafe { SetTimer(Some(hwnd), FRAME_TIMER_ID, 1, None) };
                     if id != 0 {
-                        frame_timer = Some(id);
+                        frame_timer = Some((native.hwnd_raw(), id));
                     }
                 }
-                (false, Some(id)) => {
-                    // SAFETY: `id` 由本线程的 `SetTimer` 产生。
-                    let _ = unsafe { KillTimer(Some(hwnd), id) };
+                (false, Some((owner, id))) => {
+                    // SAFETY: `id` 由本线程在 `owner` 上 `SetTimer` 产生。
+                    let owner = HWND(owner as *mut core::ffi::c_void);
+                    let _ = unsafe { KillTimer(Some(owner), id) };
                     frame_timer = None;
                 }
                 _ => {}
