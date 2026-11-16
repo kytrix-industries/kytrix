@@ -135,12 +135,18 @@ pub struct ClipRect {
     pub corner_radius: [f32; 4],
 }
 
-/// 静态几何的每帧部分（变换是唯一的 per-primitive 变换）。
+/// 静态几何的每帧部分（变换与颜色是唯一的 per-primitive 参数）。
+///
+/// **两个字段都必须被渲染层消费**：`transform` 进 `draw.basis`/`draw.translation`、
+/// `color` 进 `draw.color0`（`contract.md` §6）。此前 `Path.fill` 在编码期被丢弃、`transform`
+/// 被平台硬编码成单位矩阵，导致几何通道画成不透明白且无法平移 —— 这是 P0-1.2 的核心症状。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GeometryDraw {
     pub id: GeometryId,
-    /// 每帧 uniform 变换（只支持 translate/scale 复合）。
+    /// 每帧 uniform 变换（局部空间 → 内容空间，**逻辑像素**；shader 再乘 DPI）。
     pub transform: Transform,
+    /// 填充色 / 调制色（`GeometryPipeline::Ui` 是实色，`Textured` 是调制色）。
+    pub color: Color,
 }
 
 #[cfg(test)]
@@ -245,6 +251,7 @@ mod tests {
                 Primitive::Geometry(GeometryDraw {
                     id: geometry_id(),
                     transform: Transform::IDENTITY,
+                    color: Color::WHITE,
                 }),
             ),
             ("Canvas", Primitive::Canvas(Rc::new(Canvas::new(rect())))),

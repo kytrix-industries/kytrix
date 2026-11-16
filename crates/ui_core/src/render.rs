@@ -17,6 +17,8 @@ pub(crate) mod frame;
 pub(crate) mod retire;
 pub(crate) mod stats;
 pub(crate) mod timer;
+/// `RootUniform`（112 B）的唯一 CPU 构造点（三平台共用；contract.md §6）。
+pub(crate) mod uniform;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;

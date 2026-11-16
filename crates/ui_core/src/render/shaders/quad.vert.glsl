@@ -8,7 +8,11 @@ layout(location = 1) out vec2 v_uv;
 layout(location = 2) flat out uint v_instance;
 
 void main() {
-    GpuPrimitive p = instances[gl_InstanceIndex];
+    // 实例基址由 push constant `root.draw.clip.y` 显式给出，三平台一致（contract §6 / §7）。
+    // 不依赖 firstInstance：gl_InstanceIndex 会包含它，而 D3D12 的 SV_InstanceID 不会。
+    uint base = uint(root.draw.clip.y);
+    uint instance = uint(gl_InstanceIndex) + base;
+    GpuPrimitive p = instances[instance];
 
     uint vertex_id = uint(gl_VertexIndex);
     vec2 corner = vec2(float(vertex_id & 1u), float(vertex_id >> 1u));
@@ -31,5 +35,5 @@ void main() {
     gl_Position = vec4(to_ndc(world_px), 0.0, 1.0);
     v_local_px = world_px - center;
     v_uv = lerp(p.uv.xy, p.uv.zw, corner);
-    v_instance = uint(gl_InstanceIndex);
+    v_instance = instance;
 }

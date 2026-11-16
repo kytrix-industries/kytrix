@@ -59,8 +59,7 @@ use crate::{
     error::EngineError,
     paint::{
         atlas::AtlasKind,
-        geometry::GeometryId,
-        instance::{FrameOp, GpuClipEntry},
+        instance::{FrameOp, GeometryDrawGpu, GpuClipEntry},
     },
     platform::windows::composition::{self, Composition, buffer_size},
     render::{
@@ -69,6 +68,7 @@ use crate::{
         frame::{FramePayload, FrameRequest, FrameSlot, MAX_FRAMES_IN_FLIGHT},
         retire::GpuResourceHandle,
         timer::{FrameTimings, GpuTimerSample, Section},
+        uniform::{ROOT_UNIFORM_DWORDS, RootUniform},
         windows::{
             atlas::AtlasTextures,
             device::{Device, init_error_from},
@@ -84,9 +84,6 @@ use crate::{
 /// 测试构建的图集页（2048² 在 WARP 上代价过高；页尺寸随上传显式给出，S-153）。
 #[cfg(test)]
 const TEST_ATLAS_PAGE: u32 = 64;
-
-/// `RootUniform` 的字节数（P07 §2.7：112 B = 28 DWORD）。
-const ROOT_UNIFORM_DWORDS: usize = 28;
 
 /// 内容尺寸静止多久之后才把 grow-only 高水位缩回当前内容的桶。
 ///
@@ -161,6 +158,9 @@ pub(crate) struct GpuRenderer {
     fresh: bool,
     /// 最后一次**真正提交**的帧序号（重建资源入 retire 队列时的 tag，§4.3）。
     last_index: FrameIndex,
+    /// 窗口 DPI（`frame.params.x`）。平台层在 DPI 变化时写入；只影响 geometry 通道的
+    /// 逻辑→物理换算，实例通道的 bounds 已是物理像素。
+    scale: f32,
     #[cfg(any(test, feature = "test-support"))]
     readback: Readback,
 }
@@ -321,9 +321,15 @@ impl GpuRenderer {
             content_since: Instant::now(),
             fresh: true,
             last_index: FrameIndex::default(),
+            scale: 1.0,
             #[cfg(any(test, feature = "test-support"))]
             readback: Readback::new(),
         })
+    }
+
+    /// 写入窗口 DPI（平台层在 `set_scale` 之后调用；只影响 geometry 通道）。
+    pub(crate) fn set_scale(&mut self, scale: f32) {
+        self.scale = scale;
     }
 
     /// RTV 堆里第 `index` 个描述符的 CPU 句柄（0 = 内容，1 = 1×1 背景）。
@@ -970,13 +976,14 @@ impl GpuRenderer {
                 atlas: &mut self.atlas,
                 persist,
                 upload: &mut self.upload,
-                geometry: &self.geometry,
+                geometry: &mut self.geometry,
                 timer,
                 swapchain,
                 source,
                 clear_color: self.clear_color,
                 buffer,
                 content,
+                scale: self.scale,
             };
             recorder.record(slot, index, payload, frame, timings, frame_started)
         }
@@ -1036,7 +1043,8 @@ impl GpuRenderer {
         self.readback()
     }
 
-    /// 测试用的静态几何注册入口（P09 的 `GeometryStore` 接上后语义不变）。
+    /// 测试用的静态几何注册入口：直接放进 registry（生产路径是编码器随帧带描述、
+    /// `draw_ops` 按需建缓冲）。
     #[cfg(test)]
     pub(crate) fn register_geometry(
         &mut self,
@@ -1047,15 +1055,23 @@ impl GpuRenderer {
         topology: crate::paint::geometry::Topology,
         index_type: crate::paint::geometry::IndexType,
     ) -> Result<(), EngineError> {
-        self.geometry.register(
-            &mut self.device,
-            id,
-            vertices,
-            indices,
-            pipeline,
-            topology,
+        let desc = crate::paint::geometry::GeometryDesc {
+            vertex_bytes: bytes::Bytes::copy_from_slice(vertices),
+            index_bytes: bytes::Bytes::copy_from_slice(indices),
+            vertex_stride: pipeline.vertex_stride(),
             index_type,
-        )
+            topology,
+            bounds: crate::math::Rect::new(0.0, 0.0, 1.0, 1.0),
+            pipeline,
+        };
+        let mut retired = Vec::new();
+        let _ = self
+            .geometry
+            .ensure(&mut self.device, id, &desc, &mut retired)?;
+        for handle in retired {
+            self.queue.retire(self.last_index, handle);
+        }
+        Ok(())
     }
 
     /// 把底层错误归类为设备丢失（粘性）或原样返回。
@@ -1112,7 +1128,7 @@ struct FrameRecorder<'a> {
     atlas: &'a mut AtlasTextures,
     persist: &'a Persist,
     upload: &'a mut UploadArena,
-    geometry: &'a GeometryRegistry,
+    geometry: &'a mut GeometryRegistry,
     timer: Option<&'a GpuTimer>,
     swapchain: Option<&'a Swapchain>,
     /// 缩容 prime 的内容来源（旧主持久目标）；其余帧为 `None`。
@@ -1122,6 +1138,8 @@ struct FrameRecorder<'a> {
     buffer: (u32, u32),
     /// 当前内容尺寸（viewport / scissor / root uniform / copy / present 的范围）。
     content: (u32, u32),
+    /// 窗口 DPI（`frame.params.x`；geometry 顶点是逻辑像素，shader 用它换物理）。
+    scale: f32,
 }
 
 impl FrameRecorder<'_> {
@@ -1157,7 +1175,7 @@ impl FrameRecorder<'_> {
             gpu_ns: 0,
         });
 
-        let root = root_uniform(self.content.0 as f32, self.content.1 as f32);
+        let root = root_uniform(self.content.0 as f32, self.content.1 as f32, self.scale);
         let full = frame.is_full();
         let scissor_whole = RECT {
             left: 0,
@@ -1166,19 +1184,11 @@ impl FrameRecorder<'_> {
             bottom: self.content.1 as i32,
         };
         // 几何绘制的下标表与 ops 同帧：`FrameOp::Geometry.index` 只有配合同一帧的表才有意义。
-        let mut resolve = |op: u32| {
-            payload
-                .geometry()
-                .get(op as usize)
-                .map(|draw| draw.id)
-                .ok_or_else(|| EngineError::GeometryRegister {
-                    detail: smol_str::format_smolstr!("geometry op index {op} out of range"),
-                })
-        };
-
         let mut draw_calls = 0u32;
         // staging 扩容造成的旧句柄：录制块结束后再 retire（`list` 借用 `self.queue`）。
         let mut atlas_retired: Vec<GpuResourceHandle> = Vec::new();
+        // 几何换代（槽位复用）产生的旧缓冲句柄，同样在录制块结束后 retire。
+        let mut geometry_retired: Vec<GpuResourceHandle> = Vec::new();
         {
             let list = self.queue.list(slot);
             if let Some(timer) = self.timer {
@@ -1224,7 +1234,7 @@ impl FrameRecorder<'_> {
                 self.pipeline,
                 self.persist,
                 slot.index,
-                &root,
+                root,
                 self.content,
             );
             match full {
@@ -1234,8 +1244,10 @@ impl FrameRecorder<'_> {
                         self.pipeline,
                         payload.ops(),
                         self.geometry,
-                        &mut resolve,
-                        &root,
+                        self.device,
+                        &mut geometry_retired,
+                        payload,
+                        root,
                         scissor_whole,
                     )?;
                 }
@@ -1255,8 +1267,10 @@ impl FrameRecorder<'_> {
                                 self.pipeline,
                                 payload.ops(),
                                 self.geometry,
-                                &mut resolve,
-                                &root,
+                                self.device,
+                                &mut geometry_retired,
+                                payload,
+                                root,
                                 scissor,
                             )?);
                         }
@@ -1462,7 +1476,7 @@ fn bind_frame(
     pipeline: &Pipeline,
     persist: &Persist,
     slot: usize,
-    root: &[f32; ROOT_UNIFORM_DWORDS],
+    root: RootUniform,
     content: (u32, u32),
 ) {
     // SAFETY: RTV / 视口 / 矩形由本帧持有，调用期间有效。
@@ -1470,7 +1484,12 @@ fn bind_frame(
         list.SetDescriptorHeaps(&[Some(pipeline.heap().clone())]);
         list.SetGraphicsRootSignature(pipeline.root_signature());
         list.SetPipelineState(pipeline.quad());
-        list.SetGraphicsRoot32BitConstants(0, ROOT_UNIFORM_DWORDS as u32, root.as_ptr().cast(), 0);
+        list.SetGraphicsRoot32BitConstants(
+            0,
+            ROOT_UNIFORM_DWORDS as u32,
+            root.words().as_ptr().cast(),
+            0,
+        );
         list.SetGraphicsRootDescriptorTable(1, pipeline.slot_table(slot));
         list.OMSetRenderTargets(1, Some(&persist.rtv), false, None);
         // 视口 = **内容**尺寸（不是 buffer）：Ndc 坐标由 root uniform 的内容尺寸给出，
@@ -1490,36 +1509,38 @@ fn draw_ops(
     list: &ID3D12GraphicsCommandList,
     pipeline: &Pipeline,
     ops: &[FrameOp],
-    geometry: &GeometryRegistry,
-    resolve: &mut impl FnMut(u32) -> Result<GeometryId, EngineError>,
-    root: &[f32; ROOT_UNIFORM_DWORDS],
+    geometry: &mut GeometryRegistry,
+    device: &mut Device,
+    retired: &mut Vec<GpuResourceHandle>,
+    payload: &FramePayload,
+    root: RootUniform,
     scissor: RECT,
 ) -> Result<u32, EngineError> {
     let mut draw_calls = 0u32;
-    let mut quad_bound = false;
     for op in ops {
         match *op {
             FrameOp::Instances { start, len } => {
                 if len == 0 {
                     continue;
                 }
-                if !quad_bound {
-                    // SAFETY: PSO / 根常量 / 拓扑 / scissor 都属于同一条已打开的 list。
-                    unsafe {
-                        list.SetPipelineState(pipeline.quad());
-                        list.SetGraphicsRoot32BitConstants(
-                            0,
-                            ROOT_UNIFORM_DWORDS as u32,
-                            root.as_ptr().cast(),
-                            0,
-                        );
-                        list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-                        list.RSSetScissorRects(&[scissor]);
-                    }
-                    quad_bound = true;
+                // 实例基址只经 root constant `draw.clip.y` 进 shader，硬件基址恒 0
+                // （D3D12 的 StartInstanceLocation **不**加到 SV_InstanceID 上，contract §6）。
+                let uniform = root.with_instance_base(start);
+                // SAFETY: PSO / 根常量 / 拓扑 / scissor 都属于同一条已打开的 list。
+                unsafe {
+                    list.SetPipelineState(pipeline.quad());
+                    list.SetGraphicsRoot32BitConstants(
+                        0,
+                        ROOT_UNIFORM_DWORDS as u32,
+                        uniform.words().as_ptr().cast(),
+                        0,
+                    );
+                    list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+                    list.RSSetScissorRects(&[scissor]);
                 }
-                // SAFETY: 4 顶点 TriangleStrip + 实例区间 [start, start+len) 已在编码期校验。
-                unsafe { list.DrawInstanced(4, len, 0, start) };
+                // SAFETY: 4 顶点 TriangleStrip + 实例区间 [0, len) 已在编码期校验；
+                // 段起点由 shader 侧的 `draw.clip.y` 承担。
+                unsafe { list.DrawInstanced(4, len, 0, 0) };
                 draw_calls = draw_calls.saturating_add(1);
             }
             FrameOp::Geometry {
@@ -1527,25 +1548,22 @@ fn draw_ops(
                 clip_index,
                 clip_rect,
             } => {
-                let draw = resolve(index)?;
-                let entry = geometry
-                    .lookup(draw)
-                    .ok_or_else(|| EngineError::GeometryRegister {
-                        detail: smol_str::format_smolstr!(
-                            "geometry id {}:{} has no GPU buffers (GeometryStore lands in P09)",
-                            draw.index(),
-                            draw.generation()
-                        ),
-                    })?;
-                let uniform = geometry_root(root, clip_index, clip_rect);
+                let draw = payload.geometry().get(index as usize).ok_or_else(|| {
+                    EngineError::GeometryRegister {
+                        detail: smol_str::format_smolstr!("geometry op index {index} out of range"),
+                    }
+                })?;
+                // 首次见到该 id（或槽位换代）时现场建缓冲；`desc` 随帧过线。
+                let entry = geometry.ensure(device, draw.id, &draw.desc, retired)?;
+                let uniform = geometry_root(root, draw.clone(), clip_index, clip_rect);
                 // SAFETY: 顶点/索引缓冲由 `GeometryRegistry` 持有到本帧结束；
-                // `entry.topology()` 与注册时的图元类型一致（P07 §2.7）。
+                // `entry.topology()` 与注册时的图元类型一致。
                 unsafe {
                     list.SetPipelineState(pipeline.geometry(entry.pipeline()));
                     list.SetGraphicsRoot32BitConstants(
                         0,
                         ROOT_UNIFORM_DWORDS as u32,
-                        uniform.as_ptr().cast(),
+                        uniform.words().as_ptr().cast(),
                         0,
                     );
                     list.IASetPrimitiveTopology(entry.topology());
@@ -1555,7 +1573,6 @@ fn draw_ops(
                     list.DrawIndexedInstanced(entry.index_count(), 1, 0, 0, 0);
                 }
                 draw_calls = draw_calls.saturating_add(1);
-                quad_bound = false;
             }
         }
     }
@@ -1755,55 +1772,36 @@ fn transition(
 }
 
 /// `RootUniform`（112 B）：`frame @0`、`draw @32`（P07 §2.7）。
-fn root_uniform(width: f32, height: f32) -> [f32; ROOT_UNIFORM_DWORDS] {
-    let mut uniform = [0.0f32; ROOT_UNIFORM_DWORDS];
-    uniform[0] = width;
-    uniform[1] = height;
-    uniform[2] = if width > 0.0 { 2.0 / width } else { 0.0 };
-    uniform[3] = if height > 0.0 { 2.0 / height } else { 0.0 };
-    uniform[4] = 1.0; // frame.params.scale（geometry 的逻辑→物理）
-    uniform[8] = 1.0; // draw.basis.m11
-    uniform[11] = 1.0; // draw.basis.m22
-    uniform
+///
+/// 布局由 `render::uniform::RootUniform` 唯一实现；本函数只补 Windows 的 DPI（`scale` 来自
+/// 窗口，经 `GpuRenderer::scale` 传入）。
+fn root_uniform(width: f32, height: f32, scale: f32) -> RootUniform {
+    RootUniform::frame(width, height, scale)
 }
 
-/// 逐 geometry 的 draw uniform（`FrameOp::Geometry` 已经带 clip；颜色通道 P09 补齐）。
-/// geometry 的 draw uniform（112 B；布局严格对照 `common.hlsl` 的 `GeometryDrawUniform`）：
-/// basis @8、translation @12、color0 @16、clip_rect @20（x,y,w,h）、clip @24（`.x` = 索引）。
+/// 逐 geometry 的 draw uniform：在帧级常量之上覆盖 draw 块。
+///
+/// 布局由 `render::uniform::RootUniform` 唯一实现（contract §6）；本函数只负责把编码期
+/// 的 clip 前缀换算成契约要求的 `(x, y, w, h)`。颜色与变换已经在 UI 线程的编码器里解析成
+/// GPU 可直接消费的形式（`GeometryDrawGpu`），GPU 线程不做色彩空间运算。
 fn geometry_root(
-    frame: &[f32; ROOT_UNIFORM_DWORDS],
+    frame: RootUniform,
+    draw: GeometryDrawGpu,
     clip_index: u32,
     clip_rect: [u32; 4],
-) -> [f32; ROOT_UNIFORM_DWORDS] {
-    let mut uniform = [0.0f32; ROOT_UNIFORM_DWORDS];
-    uniform[..8].copy_from_slice(&frame[..8]);
-    // draw.basis @8 = 单位矩阵（P08 只有恒等变换，S-77）。
-    uniform[8] = 1.0;
-    uniform[11] = 1.0;
-    // draw.translation @12 = (0, 0, 0, 0)。
-    // draw.color0 @16 = 不透明白（预乘线性 RGBA；几何着色属 P09，S-77）。
-    uniform[16] = 1.0;
-    uniform[17] = 1.0;
-    uniform[18] = 1.0;
-    uniform[19] = 1.0;
+) -> RootUniform {
     // draw.clip_rect @20 = (x, y, w, h) 物理像素。无裁剪时用视口，避免 inf 进根常量；
     // 有裁剪时把编码器给的 AABB `(x0, y0, x1, y1)` 换成 `(x, y, w, h)`。
-    let (x, y, w, h) = if clip_index == 0 {
-        (0.0, 0.0, frame[0], frame[1])
+    let rect = if clip_index == 0 {
+        [0.0, 0.0, frame.words()[0], frame.words()[1]]
     } else {
         let x0 = f32::from_bits(clip_rect[0]);
         let y0 = f32::from_bits(clip_rect[1]);
         let x1 = f32::from_bits(clip_rect[2]);
         let y1 = f32::from_bits(clip_rect[3]);
-        (x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
+        [x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0)]
     };
-    uniform[20] = x;
-    uniform[21] = y;
-    uniform[22] = w;
-    uniform[23] = h;
-    // draw.clip @24：`.x = clip_index`（uint，逐位写入，不能做 f32 数值转换）。
-    uniform[24] = f32::from_bits(clip_index);
-    uniform
+    RootUniform::geometry(frame, draw.transform, draw.color, clip_index, rect)
 }
 
 fn elapsed_ns(started: Instant) -> u64 {
@@ -1911,7 +1909,7 @@ mod tests {
             atlas::{AtlasKind, AtlasTile},
             color::{Color, ColorResolver, Interpolation},
             geometry::{GeometryId, GeometryPipeline, IndexType, Topology},
-            instance::{FrameOp, InstanceEncoder},
+            instance::{FrameOp, GeometryDrawGpu, InstanceEncoder},
             primitive::{
                 GeometryDraw, GlyphRun, Image, PositionedGlyph, Primitive, Quad, QuadPaint,
             },
@@ -2000,15 +1998,37 @@ mod tests {
 
     #[test]
     fn root_uniform_matches_the_contract() {
-        let uniform = root_uniform(800.0, 600.0);
-        assert_eq!(uniform[0], 800.0);
-        assert_eq!(uniform[1], 600.0);
-        assert_eq!(uniform[2], 2.0 / 800.0);
-        assert_eq!(uniform[3], 2.0 / 600.0);
-        assert_eq!(uniform[4], 1.0);
-        assert_eq!(uniform[8], 1.0);
-        assert_eq!(uniform[11], 1.0);
-        assert_eq!(uniform.len(), 28);
+        let uniform = root_uniform(800.0, 600.0, 1.25);
+        let words = uniform.words();
+        assert_eq!(words[0], 800.0);
+        assert_eq!(words[1], 600.0);
+        assert_eq!(words[2], 2.0 / 800.0);
+        assert_eq!(words[3], 2.0 / 600.0);
+        assert_eq!(words[4], 1.25, "frame.params.x 是 DPI scale");
+        assert_eq!(words[8], 1.0);
+        assert_eq!(words[11], 1.0);
+        assert_eq!(words.len(), 28);
+    }
+
+    /// P0-1.1 回归：实例段起点只经 `draw.clip.y` 进入 shader，`DrawInstanced` 的
+    /// `StartInstanceLocation` 恒 0（D3D12 不会把它加到 `SV_InstanceID` 上）。
+    ///
+    /// 这里扫描本文件源码做防回归：断言字面量用拼接构造，避免断言本身成为「禁止串」的来源。
+    #[test]
+    fn instance_segments_use_the_uniform_base_not_the_hardware_base() {
+        let uniform = root_uniform(64.0, 64.0, 1.0).with_instance_base(7);
+        assert_eq!(uniform.words()[25], 7.0, "draw.clip.y = instance_base");
+
+        let source = include_str!("compositor.rs");
+        let call = ["Draw", "Instanced(4, len, 0, "].concat();
+        assert!(
+            source.contains(&format!("{call}0)")),
+            "硬件实例基址必须恒 0（D3D12 的 StartInstanceLocation 不加到 SV_InstanceID）"
+        );
+        assert!(
+            !source.contains(&format!("{call}start)")),
+            "回退到硬件基址会让第二段之后的实例全部错位"
+        );
     }
 
     /// D3D12 的 copy 范围：`fresh` 时全量，`presented()` 之后恢复局部（等价覆盖原共享层单测）。
@@ -2030,47 +2050,88 @@ mod tests {
         );
     }
 
+    /// 测试用的最小几何描述（`draw_ops` 只读 `id`/`transform`/`color`，描述由 registry 提供）。
+    fn test_desc() -> crate::paint::geometry::GeometryDesc {
+        crate::paint::geometry::GeometryDesc {
+            vertex_bytes: bytes::Bytes::new(),
+            index_bytes: bytes::Bytes::new(),
+            vertex_stride: 8,
+            index_type: IndexType::U16,
+            topology: Topology::TriangleList,
+            bounds: Rect::new(0.0, 0.0, 1.0, 1.0),
+            pipeline: GeometryPipeline::Ui,
+        }
+    }
+
     /// 逐 dword 对照 `common.hlsl` 的 `GeometryDrawUniform`（B1）。
     #[test]
     fn geometry_root_matches_common_hlsl_layout() {
-        let frame = root_uniform(800.0, 600.0);
+        let frame = root_uniform(800.0, 600.0, 1.0);
         let clip_rect = [4.0f32, 5.0, 100.0, 120.0].map(f32::to_bits);
-        let uniform = geometry_root(&frame, 3, clip_rect);
-        assert_eq!(uniform[..8], frame[..8], "frame block is copied verbatim");
-        // draw.basis @8
+        let draw = GeometryDrawGpu {
+            id: GeometryId::for_test(0, 1),
+            transform: Transform::translate(11.0, 13.0),
+            color: resolver().resolve(Color::WHITE).to_array(),
+            desc: std::sync::Arc::new(test_desc()),
+        };
+        let uniform = geometry_root(frame, draw, 3, clip_rect);
+        let words = uniform.words();
         assert_eq!(
-            [uniform[8], uniform[9], uniform[10], uniform[11]],
-            [1.0, 0.0, 0.0, 1.0]
+            &words[..8],
+            &frame.words()[..8],
+            "frame block is copied verbatim"
         );
+        // draw.basis @8：translate 的线性部分是单位矩阵。
+        assert_eq!(&words[8..12], &[1.0, 0.0, 0.0, 1.0]);
         // draw.translation @12
-        assert_eq!(
-            [uniform[12], uniform[13], uniform[14], uniform[15]],
-            [0.0; 4]
-        );
+        assert_eq!(&words[12..14], &[11.0, 13.0]);
         // draw.color0 @16 = premultiplied white
-        assert_eq!(
-            [uniform[16], uniform[17], uniform[18], uniform[19]],
-            [1.0, 1.0, 1.0, 1.0]
-        );
+        assert_eq!(&words[16..20], &[1.0, 1.0, 1.0, 1.0]);
         // draw.clip_rect @20 = (x, y, w, h)
-        assert_eq!(
-            [uniform[20], uniform[21], uniform[22], uniform[23]],
-            [4.0, 5.0, 96.0, 115.0]
+        assert_eq!(&words[20..24], &[4.0, 5.0, 96.0, 115.0]);
+        // draw.clip @24 = clip_index（数值编码，不是位重解释）
+        assert_eq!(words[24], 3.0);
+        // draw.clip.y @25 = instance_base（几何绘制恒 0）
+        assert_eq!(words[25], 0.0);
+        assert_eq!(words[26..].iter().copied().sum::<f32>(), 0.0);
+    }
+
+    /// P0-1.2 回归：几何绘制必须消费 `Path.fill` / `GeometryDraw.color` 与 `transform`。
+    #[test]
+    fn geometry_root_consumes_transform_and_color() {
+        let frame = root_uniform(64.0, 32.0, 2.0);
+        let draw = GeometryDrawGpu {
+            id: GeometryId::for_test(0, 1),
+            transform: Transform::scale(3.0, 4.0),
+            color: resolver()
+                .resolve(Color::srgb(1.0, 0.0, 0.0, 1.0))
+                .to_array(),
+            desc: std::sync::Arc::new(test_desc()),
+        };
+        let uniform = geometry_root(frame, draw, 0, [0; 4]);
+        let words = uniform.words();
+        assert_eq!(&words[8..12], &[3.0, 0.0, 0.0, 4.0], "transform 进 basis");
+        assert!(
+            words[16] > 0.0 && words[17] == 0.0 && words[18] == 0.0,
+            "红色填充必须进 color0（linear premultiplied）"
         );
-        // draw.clip @24 = uint clip_index（逐位）
-        assert_eq!(uniform[24].to_bits(), 3);
-        assert_eq!(uniform[25..].iter().copied().sum::<f32>(), 0.0);
+        assert_eq!(words[19], 1.0, "不透明 alpha");
+        assert_eq!(words[4], 2.0, "DPI scale 进 frame.params.x");
     }
 
     #[test]
     fn geometry_root_without_clip_uses_the_viewport() {
-        let frame = root_uniform(64.0, 32.0);
-        let uniform = geometry_root(&frame, 0, [0; 4]);
-        assert_eq!(
-            [uniform[20], uniform[21], uniform[22], uniform[23]],
-            [0.0, 0.0, 64.0, 32.0]
-        );
-        assert_eq!(uniform[24].to_bits(), 0);
+        let frame = root_uniform(64.0, 32.0, 1.0);
+        let draw = GeometryDrawGpu {
+            id: GeometryId::for_test(0, 1),
+            transform: Transform::IDENTITY,
+            color: resolver().resolve(Color::WHITE).to_array(),
+            desc: std::sync::Arc::new(test_desc()),
+        };
+        let uniform = geometry_root(frame, draw, 0, [0; 4]);
+        let words = uniform.words();
+        assert_eq!(&words[20..24], &[0.0, 0.0, 64.0, 32.0]);
+        assert_eq!(words[24], 0.0);
     }
 
     #[test]
@@ -2263,6 +2324,7 @@ mod tests {
         let scene = one_lane_scene(Primitive::Geometry(GeometryDraw {
             id,
             transform: Transform::IDENTITY,
+            color: Color::WHITE,
         }));
         let mut encoder = InstanceEncoder::new();
         let buffer = encoder.encode(&scene, Scale::ONE, &resolver());

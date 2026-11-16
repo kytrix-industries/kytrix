@@ -126,7 +126,7 @@ FS **不依赖** `SV_Position` 的像素中心约定：片元只用插值出来�
 
 uber-quad 无顶点缓冲：`SV_VertexID` / `vertex_id` / `gl_VertexIndex` 取 4 顶点 unit quad（`(0,0),(1,0),(0,1),(1,1)`），
 `SV_InstanceID` / `instance_id` / `gl_InstanceIndex` 取实例；实例下标以 `nointerpolation uint` / `[[flat]] uint` /
-`flat in uint` 传给片元。
+`flat in uint` 传给片元。**索引前必须先加 `draw.clip.y`**（见 §6 的实例基址表）。
 
 ## 6. `RootUniform`（112 B）与 `ClipEntry`（48 B）
 
@@ -141,7 +141,22 @@ Metal `buffer(2)` / Vulkan push constants `[0, 112)`）。
 | 48     | `draw.translation` | `(tx, ty, 0, 0)`                                                             |
 | 64     | `draw.color0`      | linear premultiplied（`Ui` 的填充色 / `Textured` 的调制色）                  |
 | 80     | `draw.clip_rect`   | 该 draw 的 clip 交集 AABB（物理浮点，`x,y,w,h`）                             |
-| 96     | `draw.clip`        | `.x = clip_index`（0 = 无裁剪），`.yzw` 保留恒 0                             |
+| 96     | `draw.clip`        | `.x = clip_index`（0 = 无裁剪）、`.y = instance_base`、`.zw` 保留恒 0        |
+
+**`draw.clip.y` = `instance_base`（实例基址的唯一通道）**
+
+uber-quad 的每个 `FrameOp::Instances { start, len }` 段都要从 `instances[start]` 起读。三个图形
+API 的硬件实例基址语义**互不相同**：
+
+| API | 参数 | 是否加到 shader 里的实例索引 |
+|---|---|---|
+| D3D12 | `DrawInstanced(_, _, _, StartInstanceLocation)` | **否**（`SV_InstanceID` 不含它；这正是 HLSL SM 6.8 新增 `SV_StartInstanceLocation` 的动机，见 [HLSL 提案 0015](https://microsoft.github.io/hlsl-specs/proposals/0015-extended-command-info/)） |
+| Vulkan | `vkCmdDraw(_, _, firstInstance, _)` | **是**（`gl_InstanceIndex` 含它） |
+| Metal | `drawPrimitives(..., baseInstance:)` | **是**（`instance_id` 含它） |
+
+因此**三平台一律把硬件基址传 0**，段起点只经 `draw.clip.y` 进入 shader：
+`instances[instance_id + uint(draw.clip.y)]`。任何依赖硬件基址的写法都会在至少一个平台上错位，
+且是静默错误像素、不报 API 错误。
 
 `ClipEntry`（P09 从 CPU `ClipChain` 转换上传；**表项 0 恒为哨兵**）：
 

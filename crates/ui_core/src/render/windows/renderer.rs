@@ -180,6 +180,7 @@ impl Renderer {
         }
         match &mut self.target {
             RenderTarget::Offscreen(gpu) => {
+                gpu.set_scale(request.scale);
                 if gpu.surface() != request.surface
                     && let Err(error) = gpu.resize(request.surface)
                 {
@@ -918,6 +919,9 @@ fn run_gpu_loop(
         // 越过高水位 buffer 时在这里重建持久目标 + 交换链（DEVIATIONS §36 F-199 / `GpuRenderer::grow`），
         // 重建失败（含内容 > 16384）以粘性错误退出，不静默裁剪。
         renderer.set_content_size(request.surface)?;
+        // DPI 与 `surface` 同帧过线：geometry 通道的顶点是逻辑像素，root uniform 的
+        // `frame.params.x` 必须与这一帧的 surface 成对（contract §6）。
+        renderer.set_scale(request.scale);
         // 这一帧的内容尺寸自上次变化起已静止 `SHRINK_IDLE` ⇒ 先缩回当前内容的桶、再录这一帧
         // （缩容 prime 里旧内容已经就位，这一帧的 damage 照常画进新持久目标）。空闲路径上的
         // 检查保证静止窗口也缩；这里保证持续出帧（HUD / 动画）时「总有一帧待画」不会饿死缩容。
@@ -1224,6 +1228,7 @@ mod tests {
             payload: crate::render::frame::FramePayload::empty(),
             plan,
             surface: (1, 1),
+            scale: 1.0,
             published_at: std::time::Instant::now(),
         };
         frame.publish(request(1, Plan::Full));

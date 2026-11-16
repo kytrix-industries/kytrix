@@ -39,7 +39,7 @@ struct GeometryDrawUniform {
     vec4  translation;  // (tx, ty, 0, 0)
     vec4  color0;       // premultiplied linear RGBA
     vec4  clip_rect;    // (x, y, w, h) 物理像素
-    uvec4 clip;         // .x = clip_index（0 = 无裁剪）；.yzw 保留恒 0
+    vec4  clip;         // .x = clip_index（0 = 无裁剪），.y = instance_base；.zw 保留恒 0
 };
 
 struct GpuPrimitive {

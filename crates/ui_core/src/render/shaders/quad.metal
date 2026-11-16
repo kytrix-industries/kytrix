@@ -14,7 +14,11 @@ vertex QuadVsOut vs_main(uint vertex_id [[vertex_id]],
                          uint instance_id [[instance_id]],
                          device const GpuPrimitive* instances [[buffer(0)]],
                          constant RootUniform& root [[buffer(2)]]) {
-    GpuPrimitive p = instances[instance_id];
+    // 实例基址由 root constant `draw.clip.y` 显式给出，三平台一致（contract §6 / §7）。
+    // 不依赖 baseInstance：Metal 的 instance_id 会包含它，而 D3D12 的 SV_InstanceID 不会。
+    uint base = uint(root.draw.clip.y);
+    uint instance = instance_id + base;
+    GpuPrimitive p = instances[instance];
 
     float2 corner = float2(float(vertex_id & 1u), float(vertex_id >> 1u));
     float2 origin = p.bounds.xy;
@@ -37,7 +41,7 @@ vertex QuadVsOut vs_main(uint vertex_id [[vertex_id]],
     o.position = float4(to_ndc(world_px, root.frame), 0.0, 1.0);
     o.local_px = world_px - center;
     o.uv = mix(p.uv.xy, p.uv.zw, corner);
-    o.instance = instance_id;
+    o.instance = instance;
     return o;
 }
 

@@ -9,7 +9,12 @@ struct VsOut {
 };
 
 VsOut vs_main(uint vertex_id : SV_VertexID, uint instance_id : SV_InstanceID) {
-    GpuPrimitive p = instances[instance_id];
+    // 实例基址由 root constant `draw.clip.y` 显式给出，三平台一致（contract §6 / §7）。
+    // 不依赖 DrawInstanced 的 StartInstanceLocation：D3D12 的 SV_InstanceID **不包含**它
+    // （HLSL SM 6.8 因此新增 SV_StartInstanceLocation），而 Vulkan 的 firstInstance / Metal 的
+    // baseInstance 却会加到索引上 —— 依赖硬件基址必然三平台分叉。
+    uint base = (uint)draw.clip.y;
+    GpuPrimitive p = instances[instance_id + base];
 
     float2 corner = float2((float)(vertex_id & 1u), (float)(vertex_id >> 1));
     float2 origin = p.bounds.xy;
@@ -32,7 +37,7 @@ VsOut vs_main(uint vertex_id : SV_VertexID, uint instance_id : SV_InstanceID) {
     o.position = float4(to_ndc(world_px), 0.0, 1.0);
     o.local_px = world_px - center;
     o.uv = lerp(p.uv.xy, p.uv.zw, corner);
-    o.instance = instance_id;
+    o.instance = instance_id + base;
     return o;
 }
 

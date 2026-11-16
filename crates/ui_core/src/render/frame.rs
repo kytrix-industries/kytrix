@@ -16,10 +16,7 @@ use std::{
 #[cfg(target_os = "linux")]
 use crate::math::Size;
 use crate::{
-    paint::{
-        instance::{FrameOp, GpuClipEntry, InstanceBuffer},
-        primitive::GeometryDraw,
-    },
+    paint::instance::{FrameOp, GeometryDrawGpu, GpuClipEntry, InstanceBuffer},
     render::{compositor::Plan, stats::RenderStats, timer::GpuTimerSample},
     window::FrameIndex,
 };
@@ -38,7 +35,7 @@ pub(crate) struct FramePayload {
     /// 目前只有 Windows 的录制路径消费它（macOS / Linux 的 `FrameOp::Geometry` 还没有 GPU
     /// 缓冲来源），但三平台的 payload 形状保持一致：它是「一帧的全部 CPU 侧数据」，不是按
     /// 平台裁剪的数据包。
-    geometry: Vec<GeometryDraw>,
+    geometry: Vec<GeometryDrawGpu>,
 }
 
 /// 一帧的四个 CPU 缓冲（`FramePayload` 回收的单位，DEVIATIONS F-213）。
@@ -47,7 +44,7 @@ struct PayloadBuffers {
     instances: Vec<u8>,
     ops: Vec<FrameOp>,
     clips: Vec<GpuClipEntry>,
-    geometry: Vec<GeometryDraw>,
+    geometry: Vec<GeometryDrawGpu>,
 }
 
 /// 回收池上限：最多缓存 4 帧的缓冲（GPU 线程通常只压着一帧，4 个足够且封顶内存）。
@@ -103,7 +100,7 @@ impl FramePayload {
     }
 
     /// `FrameOp::Geometry.index` 的下标表（与 [`FramePayload::ops`] 同帧）。
-    pub(crate) fn geometry(&self) -> &[GeometryDraw] {
+    pub(crate) fn geometry(&self) -> &[GeometryDrawGpu] {
         &self.geometry
     }
 
@@ -154,6 +151,12 @@ pub(crate) struct FrameRequest {
     pub plan: Plan,
     /// 目标物理像素（resize 的唯一来源，§4.4）。
     pub surface: (u32, u32),
+    /// 窗口 DPI（`root.frame.params.x`）。
+    ///
+    /// **必须与 `surface` 同帧过线**：geometry 通道的顶点是逻辑像素，shader 用 `frame.params.x`
+    /// 换物理像素；两者出自不同帧时，DPI 切换后的第一帧几何会被画在错误的尺度上
+    /// （实例通道不受影响，它的 bounds 已是物理像素 —— 这正是这个 bug 容易被漏掉的原因）。
+    pub scale: f32,
     /// 窗口的逻辑尺寸（surface-local 坐标；Linux 专用）。
     ///
     /// Linux 的 Wayland buffer 尺寸是 `round(surface_local × scale)`，而
@@ -342,6 +345,7 @@ mod tests {
             payload: FramePayload::empty(),
             plan,
             surface: (64, 64),
+            scale: 1.0,
             #[cfg(target_os = "linux")]
             surface_local: crate::math::Size::new(64.0, 64.0),
             #[cfg(target_os = "linux")]
@@ -527,12 +531,14 @@ mod tests {
         let mut slot = LatestFrame::new();
         slot.publish(FrameRequest {
             surface: (800, 600),
+            scale: 1.0,
             surface_local: Size::new(800.0, 600.0),
             buffer_scale: 1,
             ..request(1, Plan::Full)
         });
         slot.publish(FrameRequest {
             surface: (876, 626),
+            scale: 1.0,
             surface_local: Size::new(701.0, 501.0),
             buffer_scale: 2,
             ..request(2, Plan::Full)

@@ -167,6 +167,7 @@ impl Renderer {
         }
         match &mut self.target {
             RenderTarget::Offscreen(gpu) => {
+                gpu.set_scale(request.scale);
                 if gpu.surface() != request.surface
                     && let Err(error) = gpu.prepare_target(request.surface)
                 {
@@ -1318,6 +1319,7 @@ mod tests {
             payload: crate::render::frame::FramePayload::empty(),
             plan: Plan::Full,
             surface,
+            scale: 1.0,
             published_at: Instant::now(),
         }
     }
@@ -1361,6 +1363,7 @@ mod tests {
             payload: crate::render::frame::FramePayload::empty(),
             plan,
             surface: (1, 1),
+            scale: 1.0,
             published_at: std::time::Instant::now(),
         };
         frame.publish(request(1, crate::render::compositor::Plan::Full));

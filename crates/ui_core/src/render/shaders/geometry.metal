@@ -48,7 +48,8 @@ vertex GeomVsOut vs_textured(GeomVsInTextured in [[stage_in]],
 fragment float4 ps_ui(GeomVsOut in [[stage_in]],
                       device const ClipEntry* clips [[buffer(1)]],
                       constant RootUniform& root [[buffer(2)]]) {
-    return apply_gamma(root.draw.color0 * clip_mask(in.world_px, root.draw.clip.x, clips));
+    return apply_gamma(root.draw.color0 *
+                       clip_mask(in.world_px, uint(root.draw.clip.x), clips));
 }
 
 fragment float4 ps_textured_image(GeomVsOut in [[stage_in]],
@@ -58,7 +59,7 @@ fragment float4 ps_textured_image(GeomVsOut in [[stage_in]],
                                   sampler atlas_sampler [[sampler(0)]]) {
     float4 texel = image_atlas.sample(atlas_sampler, in.uv);
     float4 color = texel * root.draw.color0;
-    return apply_gamma(color * clip_mask(in.world_px, root.draw.clip.x, clips));
+    return apply_gamma(color * clip_mask(in.world_px, uint(root.draw.clip.x), clips));
 }
 
 fragment float4 ps_textured_glyph(GeomVsOut in [[stage_in]],
@@ -68,5 +69,5 @@ fragment float4 ps_textured_glyph(GeomVsOut in [[stage_in]],
                                   sampler atlas_sampler [[sampler(0)]]) {
     float coverage = glyph_atlas.sample(atlas_sampler, in.uv).r;
     float4 color = root.draw.color0 * coverage;
-    return apply_gamma(color * clip_mask(in.world_px, root.draw.clip.x, clips));
+    return apply_gamma(color * clip_mask(in.world_px, uint(root.draw.clip.x), clips));
 }

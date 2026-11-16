@@ -6,7 +6,7 @@
 
 use bytes::Bytes;
 
-use crate::{math::Rect, paint::atlas::AtlasKind};
+use crate::{math::Rect, node::id::ArenaKey, paint::atlas::AtlasKind};
 
 /// 已注册静态几何的句柄（带代际，防悬垂）。
 ///
@@ -38,6 +38,17 @@ impl GeometryId {
     #[cfg(any(test, feature = "test-support"))]
     pub const fn for_test(index: u32, generation: u32) -> Self {
         Self { index, generation }
+    }
+}
+
+impl ArenaKey for GeometryId {
+    fn from_parts(index: u32, generation: u32) -> Self {
+        debug_assert!(generation >= 1, "arena 的代际恒 >= 1（引擎不变量）");
+        Self { index, generation }
+    }
+
+    fn parts(self) -> (u32, u32) {
+        (self.index, self.generation)
     }
 }
 
@@ -87,7 +98,9 @@ impl GeometryPipeline {
 }
 
 /// 静态几何的注册描述：装载期一次写入，之后不可变。
-#[derive(Debug)]
+///
+/// Clone 是廉价的：Bytes 是引用计数切片，克隆只加引用（顶点字节不复制）。
+#[derive(Clone, Debug)]
 pub struct GeometryDesc {
     /// 顶点字节。长度必须是 `vertex_stride` 的整数倍。
     pub vertex_bytes: Bytes,

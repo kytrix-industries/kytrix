@@ -39,7 +39,7 @@ struct GeometryDrawUniform {
     float4 translation;  // 16 (tx, ty, 0, 0)
     float4 color0;       // 32 premultiplied linear RGBA
     float4 clip_rect;    // 48 (x, y, w, h) 物理像素
-    uint4  clip;         // 64 .x = clip_index（0 = 无裁剪）；.yzw 保留恒 0
+    float4 clip;         // 64 .x = clip_index（0 = 无裁剪），.y = instance_base；.zw 保留恒 0
 };
 
 // 单个 112 B 常量块：frame @ 0，draw @ 32

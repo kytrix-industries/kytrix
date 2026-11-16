@@ -32,18 +32,21 @@ use crate::{
         linux::{
             atlas::AtlasTextures,
             device::{Device, GpuObject, init_error, on_gpu_thread},
+            geometry::GeometryRegistry,
             instance::VulkanInstance,
-            pipeline::{Pipeline, ROOT_UNIFORM_BYTES},
+            pipeline::Pipeline,
             swapchain::{Acquire, Present, Swapchain},
             timer::GpuTimer,
         },
         retire::GpuResourceHandle,
         timer::{FrameTimings, GpuTimerSample, Section},
+        uniform::RootUniform,
     },
     window::FrameIndex,
 };
 #[cfg(feature = "test-support")]
 use crate::{
+    paint::geometry::GeometryPipeline,
     paint::instance::InstanceBuffer,
     render::linux::readback::{Readback, ReadbackImage},
 };
@@ -115,6 +118,10 @@ pub(crate) struct GpuRenderer {
     /// fractional 模式恒为 1（destination 负责缩放）；整数回退是整数 scale `N`（V-110）。
     last_buffer_scale: i32,
     surface: (u32, u32),
+    /// 窗口 DPI（root.frame.params.x；geometry 通道的逻辑到物理换算）。
+    scale: f32,
+    /// 静态几何的 GPU 缓冲（按需创建；换代产生的旧缓冲交 retire 队列）。
+    geometry: GeometryRegistry,
     /// 渲染目标格式（swapchain 的格式，或离屏时的 `B8G8R8A8_SRGB`）。
     format: vk::Format,
     /// 下一次 present 是否必须全量：新建 / 重建之后为 `true`，present 成功后清除。
@@ -228,6 +235,8 @@ impl GpuRenderer {
             wl_surface,
             last_buffer_scale: 1,
             surface: size,
+            scale: 1.0,
+            geometry: GeometryRegistry::new(),
             format,
             fresh: true,
             last_index: FrameIndex::default(),
@@ -311,6 +320,9 @@ impl GpuRenderer {
         if let Some(error) = self.device.lost_error() {
             return Err(error);
         }
+        // DPI 与 surface 同帧过线：geometry 通道的顶点是逻辑像素，root uniform 的
+        // `frame.params.x` 必须与这一帧的 surface 成对（contract §6）。
+        self.scale = request.scale;
         let slot = self.device.slot();
         // ① 槽 fence：复用命令缓冲 / 上传缓冲的**前置条件**（允许阻塞：GPU 线程，§8.2）。
         //
@@ -792,7 +804,7 @@ impl GpuRenderer {
     }
 
     fn draw(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         slot: usize,
         payload: &FramePayload,
@@ -808,6 +820,8 @@ impl GpuRenderer {
         };
         let clears = [clear];
         let framebuffer = self.persist.framebuffer(full);
+        // 帧级常量：viewport + DPI。每次 draw op 在它之上叠加实例基址（`with_instance_base`）。
+        let root = root_uniform(extent, self.scale);
         // SAFETY: 渲染通道/framebuffer 归本结构独占；`loadOp` 与 `clear` 值匹配。
         unsafe {
             self.device.raw().cmd_begin_render_pass(
@@ -835,8 +849,7 @@ impl GpuRenderer {
                 &[self.pipeline.set(slot)],
                 &[],
             );
-            let root = root_uniform(extent);
-            let push_bytes = bytemuck::cast_slice::<f32, u8>(&root);
+            let push_bytes = bytemuck::cast_slice::<f32, u8>(root.words());
             self.device.raw().cmd_push_constants(
                 command,
                 self.pipeline.layout(),
@@ -858,6 +871,8 @@ impl GpuRenderer {
             );
         }
 
+        // 几何换代（槽位复用）产生的旧设备对象：录制块结束后交给 retire 队列。
+        let mut geometry_retired: Vec<GpuObject> = Vec::new();
         // 逐 damage 矩形：每个矩形一次 `cmd_set_scissor` + 全部 draw op。
         match full {
             true => {
@@ -872,7 +887,16 @@ impl GpuRenderer {
                         }],
                     );
                 }
-                draw_calls = draw_ops(&self.device, command, payload)?;
+                draw_calls = draw_ops(
+                    &self.device,
+                    command,
+                    self.pipeline.layout(),
+                    &self.pipeline,
+                    &mut self.geometry,
+                    &mut geometry_retired,
+                    payload,
+                    root,
+                )?;
             }
             false => {
                 if let Plan::Partial(damage) = frame.plan() {
@@ -891,8 +915,16 @@ impl GpuRenderer {
                         unsafe {
                             self.device.raw().cmd_set_scissor(command, 0, &[scissor]);
                         }
-                        draw_calls =
-                            draw_calls.saturating_add(draw_ops(&self.device, command, payload)?);
+                        draw_calls = draw_calls.saturating_add(draw_ops(
+                            &self.device,
+                            command,
+                            self.pipeline.layout(),
+                            &self.pipeline,
+                            &mut self.geometry,
+                            &mut geometry_retired,
+                            payload,
+                            root,
+                        )?);
                     }
                 }
             }
@@ -901,6 +933,11 @@ impl GpuRenderer {
         // SAFETY: 收尾渲染通道。
         unsafe {
             self.device.raw().cmd_end_render_pass(command);
+        }
+        // 几何换代产生的旧设备对象：按当前帧序号入 retire 队列（等该帧完成后释放，I4）。
+        for object in geometry_retired {
+            let handle = self.device.allocate(object);
+            self.device.retire(self.last_index, handle);
         }
         Ok(draw_calls)
     }
@@ -1419,7 +1456,12 @@ impl UploadSlot {
 fn draw_ops(
     device: &Device,
     command: vk::CommandBuffer,
+    layout: vk::PipelineLayout,
+    pipeline: &Pipeline,
+    geometry: &mut GeometryRegistry,
+    retired: &mut Vec<GpuObject>,
     payload: &FramePayload,
+    root: RootUniform,
 ) -> Result<u32, EngineError> {
     let mut draw_calls = 0u32;
     for op in payload.ops() {
@@ -1428,21 +1470,72 @@ fn draw_ops(
                 if len == 0 {
                     continue;
                 }
-                // SAFETY: 4 顶点 unit quad + 实例区间 [start, start+len)（编码期校验）。
+                // 实例基址只经 push constant `draw.clip.y` 进 shader，硬件基址恒 0
+                // （Vulkan 的 firstInstance 会加到 gl_InstanceIndex 上，与 D3D12 相反；
+                //  统一走 uniform 才能三平台一致，contract §6）。
+                let uniform = root.with_instance_base(start);
+                let push_bytes = bytemuck::cast_slice::<f32, u8>(uniform.words());
+                // SAFETY: push constant 的范围由本帧的 pipeline layout 声明（[0, 112)）。
                 unsafe {
-                    device.raw().cmd_draw(command, 4, len, start, 0);
+                    device.raw().cmd_bind_pipeline(
+                        command,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        pipeline.quad(),
+                    );
+                    device.raw().cmd_push_constants(
+                        command,
+                        layout,
+                        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                        0,
+                        push_bytes,
+                    );
+                    // 4 顶点 unit quad + 实例区间 [0, len)；段起点由 shader 侧的 draw.clip.y 承担。
+                    device.raw().cmd_draw(command, 4, len, 0, 0);
                 }
                 draw_calls = draw_calls.saturating_add(1);
             }
-            FrameOp::Geometry { index, .. } => {
-                // Linux 还没有几何 GPU 缓冲（`GeometryStore` 在 P13）。这里顺带校验 `ops` 与
-                // **同帧**的几何表一致：下标越界是编码错误，不是「没有缓冲」。
-                let in_table = payload.geometry().get(index as usize).is_some();
-                return Err(EngineError::GeometryRegister {
-                    detail: smol_str::format_smolstr!(
-                        "geometry op index {index} (in_table={in_table}) has no GPU buffers (GeometryStore lands in P13)"
-                    ),
-                });
+            FrameOp::Geometry {
+                index,
+                clip_index,
+                clip_rect,
+            } => {
+                let draw = payload.geometry().get(index as usize).ok_or_else(|| {
+                    EngineError::GeometryRegister {
+                        detail: smol_str::format_smolstr!("geometry op index {index} out of range"),
+                    }
+                })?;
+                let entry = geometry.ensure(device, draw.id, &draw.desc, retired)?;
+                let uniform = geometry_root(root, draw, clip_index, clip_rect);
+                let push_bytes = bytemuck::cast_slice::<f32, u8>(uniform.words());
+                // SAFETY: 顶点/索引缓冲由 `GeometryRegistry` 持有到本帧结束；
+                // push constant 范围由 pipeline layout 声明。
+                unsafe {
+                    device.raw().cmd_bind_pipeline(
+                        command,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        pipeline.geometry(entry.pipeline()),
+                    );
+                    device.raw().cmd_push_constants(
+                        command,
+                        layout,
+                        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                        0,
+                        push_bytes,
+                    );
+                    device
+                        .raw()
+                        .cmd_bind_vertex_buffers(command, 0, &[entry.vertex()], &[0]);
+                    device.raw().cmd_bind_index_buffer(
+                        command,
+                        entry.index(),
+                        0,
+                        entry.index_type(),
+                    );
+                    device
+                        .raw()
+                        .cmd_draw_indexed(command, entry.index_count(), 1, 0, 0, 0);
+                }
+                draw_calls = draw_calls.saturating_add(1);
             }
         }
     }
@@ -1480,16 +1573,30 @@ fn create_commands(
     }
 }
 
-/// `RootUniform`（112 B）：`frame @0`、`draw @32`；实例绘制只用 `frame.viewport`（P07 §2.7）。
-fn root_uniform(extent: vk::Extent2D) -> [f32; ROOT_UNIFORM_BYTES as usize / 4] {
-    let mut uniform = [0.0f32; ROOT_UNIFORM_BYTES as usize / 4];
-    let width = extent.width as f32;
-    let height = extent.height as f32;
-    uniform[0] = width;
-    uniform[1] = height;
-    uniform[2] = if width > 0.0 { 2.0 / width } else { 0.0 };
-    uniform[3] = if height > 0.0 { 2.0 / height } else { 0.0 };
-    uniform
+/// 逐 geometry 的 draw uniform：在帧级常量之上覆盖 draw 块（与 Windows 同一实现）。
+fn geometry_root(
+    frame: RootUniform,
+    draw: &crate::paint::instance::GeometryDrawGpu,
+    clip_index: u32,
+    clip_rect: [u32; 4],
+) -> RootUniform {
+    let rect = if clip_index == 0 {
+        [0.0, 0.0, frame.words()[0], frame.words()[1]]
+    } else {
+        let x0 = f32::from_bits(clip_rect[0]);
+        let y0 = f32::from_bits(clip_rect[1]);
+        let x1 = f32::from_bits(clip_rect[2]);
+        let y1 = f32::from_bits(clip_rect[3]);
+        [x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0)]
+    };
+    RootUniform::geometry(frame, draw.transform, draw.color, clip_index, rect)
+}
+
+/// `RootUniform`（112 B）：`frame @0`、`draw @32`；布局由 `render::uniform::RootUniform` 唯一实现。
+///
+/// `scale` 是窗口 DPI（`frame.params.x`）：geometry 通道的顶点是逻辑像素，shader 用它换物理。
+fn root_uniform(extent: vk::Extent2D, scale: f32) -> RootUniform {
+    RootUniform::frame(extent.width as f32, extent.height as f32, scale)
 }
 
 fn elapsed_ns(started: Instant) -> u64 {

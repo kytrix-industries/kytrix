@@ -1176,6 +1176,7 @@ impl Window {
             payload: FramePayload::from_buffer(self.instance_buffer()),
             plan,
             surface,
+            scale: self.scale.factor(),
             // Linux：逻辑尺寸与 `surface`（buffer 尺寸）同帧过线，GPU 线程在 present 前用它写
             // `wp_viewport.set_destination`（destination 与 buffer 必须成对，D1 / D2）。
             #[cfg(target_os = "linux")]

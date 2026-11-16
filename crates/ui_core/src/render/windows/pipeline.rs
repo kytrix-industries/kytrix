@@ -7,36 +7,30 @@
 
 use std::{ffi::CStr, mem::ManuallyDrop, path::PathBuf};
 
-#[cfg(test)]
-use windows::Win32::Graphics::Direct3D::{
-    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
-};
-#[cfg(test)]
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_UINT};
 use windows::{
     Win32::Graphics::{
-        Direct3D::{D3D_PRIMITIVE_TOPOLOGY, ID3DBlob},
+        Direct3D::{
+            D3D_PRIMITIVE_TOPOLOGY, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, ID3DBlob,
+        },
         Direct3D12::*,
         Dxgi::Common::{
-            DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R32G32_FLOAT,
-            DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+            DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R16_UINT,
+            DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
         },
     },
     core::PCSTR,
 };
 
-#[cfg(test)]
-use crate::paint::geometry::{IndexType, Topology};
-#[cfg(test)]
-use crate::render::retire::GpuResourceHandle;
 use crate::{
     error::EngineError,
     paint::{
         atlas::AtlasKind,
-        geometry::{GeometryId, GeometryPipeline},
+        geometry::{GeometryId, GeometryPipeline, IndexType, Topology},
     },
     render::{
         frame::MAX_FRAMES_IN_FLIGHT,
+        retire::GpuResourceHandle,
         windows::device::{Device, init_error_from},
     },
 };
@@ -492,8 +486,9 @@ pub(crate) struct GeometryEntry {
     index_count: u32,
     topology: D3D_PRIMITIVE_TOPOLOGY,
     pipeline: GeometryPipeline,
-    /// 卸载时交还的句柄（P09 的 store 用；P08 只有测试会注册）。
-    #[cfg(test)]
+    /// 该条目对应的代际（槽位复用后必须重建缓冲，否则会画成新几何）。
+    generation: u32,
+    /// 卸载时交还的句柄。
     storage: [GpuResourceHandle; 2],
 }
 
@@ -518,14 +513,17 @@ impl GeometryEntry {
         self.pipeline
     }
 
-    /// 卸载时交还的句柄（P09 的 store 用）。
-    #[cfg(test)]
+    /// 卸载时交还的句柄。
     pub(crate) fn storage(&self) -> [GpuResourceHandle; 2] {
         self.storage
     }
 }
 
-/// `GeometryId → GPU 缓冲`（P08 只有测试注册入口；公开的 `GeometryStore` 属 P09）。
+/// `GeometryId → GPU 缓冲`（按需创建；代际不匹配即重建）。
+///
+/// 缓冲由 GPU 线程在**首次见到某个 `GeometryId`** 时创建：编码器把注册描述附在
+/// `GeometryDrawGpu` 上随帧过线，因此这里不需要额外的跨线程注册通道。
+/// 槽位复用（`generation` 变化）会**丢弃并重建**该槽的缓冲，避免旧图元画成新几何。
 pub(crate) struct GeometryRegistry {
     entries: Vec<Option<GeometryEntry>>,
 }
@@ -537,65 +535,83 @@ impl GeometryRegistry {
         }
     }
 
-    pub(crate) fn lookup(&self, id: GeometryId) -> Option<&GeometryEntry> {
-        self.entries
-            .get(id.index() as usize)
-            .and_then(Option::as_ref)
-    }
-
-    /// 测试专用注册（P09 的 `GeometryStore` 是唯一公开铸造点；F-65）。
-    #[cfg(test)]
-    pub(crate) fn register(
+    /// 取该句柄的 GPU 缓冲；没有或代际不匹配时按 `desc` 现场创建。
+    ///
+    /// `retired` 收集被替换掉的旧句柄（调用方在录制块结束后交给 retire 队列，I4）。
+    pub(crate) fn ensure(
         &mut self,
         device: &mut Device,
         id: GeometryId,
-        vertex_bytes: &[u8],
-        index_bytes: &[u8],
-        pipeline: GeometryPipeline,
-        topology: Topology,
-        index_type: IndexType,
-    ) -> Result<(), EngineError> {
-        let vertex = upload_buffer(device, vertex_bytes)?;
-        let index = upload_buffer(device, index_bytes)?;
-        // SAFETY: 缓冲由 `GeometryRegistry` 持有，提交前不会释放；地址只在录制期使用。
-        let vertex_location = unsafe { vertex.GetGPUVirtualAddress() };
-        // SAFETY: 缓冲由 `GeometryRegistry` 持有，提交前不会释放；地址只在录制期使用。
-        let index_location = unsafe { index.GetGPUVirtualAddress() };
-        let vertex_handle = device.allocate(vertex);
-        let index_handle = device.allocate(index);
-        let index_format = match index_type {
-            IndexType::U16 => DXGI_FORMAT_R16_UINT,
-            IndexType::U32 => DXGI_FORMAT_R32_UINT,
-        };
-        let entry = GeometryEntry {
-            vertex: D3D12_VERTEX_BUFFER_VIEW {
-                BufferLocation: vertex_location,
-                SizeInBytes: vertex_bytes.len() as u32,
-                StrideInBytes: pipeline.vertex_stride(),
-            },
-            index: D3D12_INDEX_BUFFER_VIEW {
-                BufferLocation: index_location,
-                SizeInBytes: index_bytes.len() as u32,
-                Format: index_format,
-            },
-            index_count: (index_bytes.len() as u32) / index_type.size(),
-            topology: match topology {
-                Topology::TriangleList => D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
-                Topology::TriangleStrip => D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
-            },
-            pipeline,
-            storage: [vertex_handle, index_handle],
-        };
+        desc: &crate::paint::geometry::GeometryDesc,
+        retired: &mut Vec<GpuResourceHandle>,
+    ) -> Result<&GeometryEntry, EngineError> {
         let slot = id.index() as usize;
         if self.entries.len() <= slot {
             self.entries.resize_with(slot + 1, || None);
         }
-        self.entries[slot] = Some(entry);
-        Ok(())
+        let stale = match &self.entries[slot] {
+            Some(entry) => entry.generation != id.generation(),
+            None => true,
+        };
+        if stale {
+            if let Some(old) = self.entries[slot].take() {
+                retired.extend(old.storage());
+            }
+            let entry = upload_geometry(device, id, desc)?;
+            self.entries[slot] = Some(entry);
+        }
+        self.entries[slot]
+            .as_ref()
+            .ok_or_else(|| EngineError::GeometryRegister {
+                detail: smol_str::format_smolstr!(
+                    "geometry {}:{} failed to produce GPU buffers",
+                    id.index(),
+                    id.generation()
+                ),
+            })
     }
 }
 
-#[cfg(test)]
+/// 按注册描述创建顶点/索引缓冲（`UPLOAD` 堆；几何是静态数据，装载期一次写入）。
+fn upload_geometry(
+    device: &mut Device,
+    id: GeometryId,
+    desc: &crate::paint::geometry::GeometryDesc,
+) -> Result<GeometryEntry, EngineError> {
+    let vertex = upload_buffer(device, &desc.vertex_bytes)?;
+    let index = upload_buffer(device, &desc.index_bytes)?;
+    // SAFETY: 缓冲由 `GeometryRegistry` 持有，提交前不会释放；地址只在录制期使用。
+    let vertex_location = unsafe { vertex.GetGPUVirtualAddress() };
+    // SAFETY: 同上。
+    let index_location = unsafe { index.GetGPUVirtualAddress() };
+    let vertex_handle = device.allocate(vertex);
+    let index_handle = device.allocate(index);
+    let index_format = match desc.index_type {
+        IndexType::U16 => DXGI_FORMAT_R16_UINT,
+        IndexType::U32 => DXGI_FORMAT_R32_UINT,
+    };
+    Ok(GeometryEntry {
+        vertex: D3D12_VERTEX_BUFFER_VIEW {
+            BufferLocation: vertex_location,
+            SizeInBytes: desc.vertex_bytes.len() as u32,
+            StrideInBytes: desc.pipeline.vertex_stride(),
+        },
+        index: D3D12_INDEX_BUFFER_VIEW {
+            BufferLocation: index_location,
+            SizeInBytes: desc.index_bytes.len() as u32,
+            Format: index_format,
+        },
+        index_count: (desc.index_bytes.len() as u32) / desc.index_type.size(),
+        topology: match desc.topology {
+            Topology::TriangleList => D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+            Topology::TriangleStrip => D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+        },
+        pipeline: desc.pipeline,
+        generation: id.generation(),
+        storage: [vertex_handle, index_handle],
+    })
+}
+
 fn upload_buffer(device: &mut Device, bytes: &[u8]) -> Result<ID3D12Resource, EngineError> {
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
@@ -681,21 +697,38 @@ mod tests {
             .iter()
             .flat_map(|value| value.to_ne_bytes())
             .collect::<Vec<u8>>();
-        registry
-            .register(
-                &mut device,
-                GeometryId::for_test(0, 0),
-                &vertices,
-                &indices,
-                GeometryPipeline::Ui,
-                Topology::TriangleList,
-                IndexType::U16,
-            )
-            .expect("register");
-        let entry = registry.lookup(GeometryId::for_test(0, 0)).expect("entry");
+        let desc = crate::paint::geometry::GeometryDesc {
+            vertex_bytes: bytes::Bytes::copy_from_slice(&vertices),
+            index_bytes: bytes::Bytes::copy_from_slice(&indices),
+            vertex_stride: GeometryPipeline::Ui.vertex_stride(),
+            index_type: IndexType::U16,
+            topology: Topology::TriangleList,
+            bounds: crate::math::Rect::new(0.0, 0.0, 32.0, 32.0),
+            pipeline: GeometryPipeline::Ui,
+        };
+        let id = GeometryId::for_test(0, 1);
+        let mut retired = Vec::new();
+        let entry = registry
+            .ensure(&mut device, id, &desc, &mut retired)
+            .expect("ensure");
         assert_eq!(entry.index_count(), 3);
         assert_eq!(entry.vertex().StrideInBytes, 8);
         assert_eq!(entry.topology(), D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         assert_eq!(entry.storage().len(), 2);
+        assert!(retired.is_empty(), "首次创建不产生退役句柄");
+
+        // 同一 id + 同一代际：命中缓存，不重建、不产生退役句柄。
+        let again = registry
+            .ensure(&mut device, id, &desc, &mut retired)
+            .expect("cached");
+        assert_eq!(again.index_count(), 3);
+        assert!(retired.is_empty());
+
+        // 槽位复用（代际 +1）：必须重建，并把旧句柄交还 retire。
+        let reused = GeometryId::for_test(0, 2);
+        let _ = registry
+            .ensure(&mut device, reused, &desc, &mut retired)
+            .expect("rebuilt");
+        assert_eq!(retired.len(), 2, "换代必须退役旧顶点/索引缓冲");
     }
 }

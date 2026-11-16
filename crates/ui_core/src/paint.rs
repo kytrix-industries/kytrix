@@ -4,14 +4,15 @@
 //! `design/phase-02-paint-foundation.md` §3.1 / §3.3）：
 //!
 //! - 公开：`color`（D23 引擎一等颜色）、`primitive`（8 类绘制指令）、`canvas`（应用层唯一公开写入口）、
-//!   `geometry`（静态几何描述）、`atlas`（图集引用数据）、`scene`（P03 起：`Scene`/`LaneId` 只读句柄）、
-//!   `style`（P03 起：`Style`/`StylePatch`/`Cursor`）。
+//!   `geometry`（静态几何描述）、`geometry_store`（静态几何的注册与生命周期）、`atlas`（图集引用数据）、
+//!   `scene`（P03 起：`Scene`/`LaneId` 只读句柄）、`style`（P03 起：`Style`/`StylePatch`/`Cursor`）。
 //! - crate 私有：`scene::Lane` 与 `MAX_CLIP_DEPTH`（应用层经 `Canvas`/`Scene` 的只读方法间接观测）。
 
 pub mod atlas;
 pub mod canvas;
 pub mod color;
 pub mod geometry;
+pub mod geometry_store;
 
 pub(crate) mod instance;
 pub(crate) mod pass;

@@ -959,6 +959,7 @@ mod tests {
             payload: crate::render::frame::FramePayload::empty(),
             plan,
             surface: (1, 1),
+            scale: 1.0,
             surface_local: crate::math::Size::new(1.0, 1.0),
             buffer_scale: 1,
             published_at: std::time::Instant::now(),

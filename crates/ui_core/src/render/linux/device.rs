@@ -115,6 +115,7 @@ pub(crate) fn on_gpu_thread() -> bool {
 }
 
 /// 句柄表里的 Vulkan 资源（`GpuResourceHandle` 的载荷）。
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum GpuObject {
     Buffer(vk::Buffer),
     Memory(vk::DeviceMemory),

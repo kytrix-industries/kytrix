@@ -1,8 +1,12 @@
-//! 固定 descriptor set + push constants + uber-quad 管线（`design/phase-12-macos-linux.md` §6.4）。
+//! 固定 descriptor set + push constants + uber-quad / geometry 管线
+//! （`design/phase-12-macos-linux.md` §6.4）。
 //!
 //! 与 P07 的 `common.glsl` 逐字对应：`set 0` 的 `binding 0`（instances）/`1`（clips）/
 //! `4` + `5`（两张图集 sampler），push constants `[0, 112)`。
-//! 几何通道在 P12 没有注册入口（P08 同），故**不建** geometry pipeline（F-134）。
+//!
+//! geometry 管线按 `GeometryPipeline` 分成三种（`Ui` / `Textured{Image}` / `Textured{Glyph}`），
+//! 顶点布局由 pipeline 唯一决定（`contract.md` §7）：`Ui` = 8 B（`float2` 位置）、
+//! `Textured` = 16 B（`float2` 位置 + `float2` uv）。
 
 use std::path::PathBuf;
 
@@ -10,6 +14,7 @@ use ash::vk;
 
 use crate::{
     error::EngineError,
+    paint::{atlas::AtlasKind, geometry::GeometryPipeline},
     render::{
         frame::MAX_FRAMES_IN_FLIGHT,
         linux::device::{Device, init_error},
@@ -27,6 +32,29 @@ const SPIRV_MAGIC: [u8; 4] = [0x03, 0x02, 0x23, 0x07];
 /// 占位产物前缀。
 const SKIPPED: &[u8] = b"KYTRIX-SHADER-SKIPPED";
 
+/// 三种几何管线的 PSO（按 `GeometryPipeline` 与图集种类分派）。
+#[derive(Clone, Copy)]
+pub(crate) struct GeometryPipelines {
+    ui: vk::Pipeline,
+    image: vk::Pipeline,
+    glyph: vk::Pipeline,
+}
+
+impl GeometryPipelines {
+    /// 按注册描述选 PSO。
+    pub(crate) fn get(self, pipeline: GeometryPipeline) -> vk::Pipeline {
+        match pipeline {
+            GeometryPipeline::Ui => self.ui,
+            GeometryPipeline::Textured {
+                atlas: AtlasKind::Image,
+            } => self.image,
+            GeometryPipeline::Textured {
+                atlas: AtlasKind::Glyph,
+            } => self.glyph,
+        }
+    }
+}
+
 /// 渲染通道 / 描述符 / 管线。
 pub(crate) struct Pipeline {
     device: ash::Device,
@@ -37,6 +65,7 @@ pub(crate) struct Pipeline {
     pass_clear: vk::RenderPass,
     pass_load: vk::RenderPass,
     quad: vk::Pipeline,
+    geometry: GeometryPipelines,
 }
 
 impl Pipeline {
@@ -132,6 +161,35 @@ impl Pipeline {
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         )?;
         let quad = create_quad_pipeline(device, layout, pass_clear)?;
+        let geometry = GeometryPipelines {
+            ui: create_geometry_pipeline(
+                device,
+                layout,
+                pass_clear,
+                "geometry.vs_ui.spv",
+                "geometry.ps_ui.spv",
+                8,
+                vk::PrimitiveTopology::TRIANGLE_LIST,
+            )?,
+            image: create_geometry_pipeline(
+                device,
+                layout,
+                pass_clear,
+                "geometry.vs_textured.spv",
+                "geometry.ps_textured_image.spv",
+                16,
+                vk::PrimitiveTopology::TRIANGLE_LIST,
+            )?,
+            glyph: create_geometry_pipeline(
+                device,
+                layout,
+                pass_clear,
+                "geometry.vs_textured.spv",
+                "geometry.ps_textured_glyph.spv",
+                16,
+                vk::PrimitiveTopology::TRIANGLE_LIST,
+            )?,
+        };
 
         Ok(Self {
             device: device.raw().clone(),
@@ -142,7 +200,13 @@ impl Pipeline {
             pass_clear,
             pass_load,
             quad,
+            geometry,
         })
+    }
+
+    /// 按注册描述选 geometry PSO。
+    pub(crate) fn geometry(&self, pipeline: GeometryPipeline) -> vk::Pipeline {
+        self.geometry.get(pipeline)
     }
 
     /// 随 `clear` 选择两个渲染通道之一（`loadOp` 是渲染通道的属性，不能逐帧改）。
@@ -236,6 +300,9 @@ impl Drop for Pipeline {
         // SAFETY: 句柄归本结构独占；`Renderer::drop` 先 `wait_idle`。
         unsafe {
             self.device.destroy_pipeline(self.quad, None);
+            self.device.destroy_pipeline(self.geometry.ui, None);
+            self.device.destroy_pipeline(self.geometry.image, None);
+            self.device.destroy_pipeline(self.geometry.glyph, None);
             self.device.destroy_render_pass(self.pass_clear, None);
             self.device.destroy_render_pass(self.pass_load, None);
             self.device.destroy_pipeline_layout(self.layout, None);
@@ -358,6 +425,138 @@ fn create_quad_pipeline(
             .create_graphics_pipelines(vk::PipelineCache::null(), &[create], None)
     };
     // shader module 建完管线即可销毁（管线已持有其副本）。
+    // SAFETY: 两个 module 归本函数独占且已不被引用。
+    unsafe {
+        device.raw().destroy_shader_module(vs, None);
+        device.raw().destroy_shader_module(ps, None);
+    }
+    pipelines
+        .map_err(|(_, error)| init_error("create_graphics_pipelines", format!("{error:?}")))
+        .map(|pipelines| pipelines[0])
+}
+
+/// 建一条 geometry PSO。
+///
+/// 与 uber-quad 的差别只有顶点输入（`stride` 与属性表）与拓扑：其余状态（cull = NONE、
+/// 无深度/模板、MSAA 关闭、`ONE / INV_SRC_ALPHA` 混合）逐字相同（`contract.md` §7）。
+///
+/// `stride` = 8 时只有 `POSITION`（`Ui`）；16 时再加 `TEXCOORD`（`Textured`）。
+fn create_geometry_pipeline(
+    device: &Device,
+    layout: vk::PipelineLayout,
+    pass: vk::RenderPass,
+    vertex_shader: &str,
+    fragment_shader: &str,
+    stride: u32,
+    topology: vk::PrimitiveTopology,
+) -> Result<vk::Pipeline, EngineError> {
+    let vertex_path = format!("{}/shaders/{vertex_shader}", env!("OUT_DIR"));
+    let fragment_path = format!("{}/shaders/{fragment_shader}", env!("OUT_DIR"));
+    let (vertex_bytes, fragment_bytes) = match (vertex_shader, fragment_shader) {
+        ("geometry.vs_ui.spv", "geometry.ps_ui.spv") => (
+            include_bytes!(concat!(env!("OUT_DIR"), "/shaders/geometry.vs_ui.spv")).as_slice(),
+            include_bytes!(concat!(env!("OUT_DIR"), "/shaders/geometry.ps_ui.spv")).as_slice(),
+        ),
+        ("geometry.vs_textured.spv", "geometry.ps_textured_image.spv") => (
+            include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/shaders/geometry.vs_textured.spv"
+            ))
+            .as_slice(),
+            include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/shaders/geometry.ps_textured_image.spv"
+            ))
+            .as_slice(),
+        ),
+        _ => (
+            include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/shaders/geometry.vs_textured.spv"
+            ))
+            .as_slice(),
+            include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/shaders/geometry.ps_textured_glyph.spv"
+            ))
+            .as_slice(),
+        ),
+    };
+    let vs = shader_module(device, vertex_bytes, &vertex_path)?;
+    let ps = shader_module(device, fragment_bytes, &fragment_path)?;
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vs)
+            .name(c"main"),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(ps)
+            .name(c"main"),
+    ];
+    let position = vk::VertexInputAttributeDescription::default()
+        .location(0)
+        .binding(0)
+        .format(vk::Format::R32G32_SFLOAT)
+        .offset(0);
+    let texcoord = vk::VertexInputAttributeDescription::default()
+        .location(1)
+        .binding(0)
+        .format(vk::Format::R32G32_SFLOAT)
+        .offset(8);
+    let attributes: Vec<vk::VertexInputAttributeDescription> = if stride == 16 {
+        vec![position, texcoord]
+    } else {
+        vec![position]
+    };
+    let bindings = [vk::VertexInputBindingDescription::default()
+        .binding(0)
+        .stride(stride)
+        .input_rate(vk::VertexInputRate::VERTEX)];
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_binding_descriptions(&bindings)
+        .vertex_attribute_descriptions(&attributes);
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default().topology(topology);
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewport_count(1)
+        .scissor_count(1);
+    let raster = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .line_width(1.0);
+    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+        .blend_enable(true)
+        .src_color_blend_factor(vk::BlendFactor::ONE)
+        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .color_blend_op(vk::BlendOp::ADD)
+        .src_alpha_blend_factor(vk::BlendFactor::ONE)
+        .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .alpha_blend_op(vk::BlendOp::ADD)
+        .color_write_mask(vk::ColorComponentFlags::RGBA);
+    let attachments = [blend_attachment];
+    let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
+    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+    let create = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&raster)
+        .multisample_state(&multisample)
+        .color_blend_state(&blend)
+        .dynamic_state(&dynamic)
+        .layout(layout)
+        .render_pass(pass);
+    // SAFETY: `create` 的指针在本次调用期间有效；pipeline 在 Drop 里销毁。
+    let pipelines = unsafe {
+        device
+            .raw()
+            .create_graphics_pipelines(vk::PipelineCache::null(), &[create], None)
+    };
     // SAFETY: 两个 module 归本函数独占且已不被引用。
     unsafe {
         device.raw().destroy_shader_module(vs, None);

@@ -39,17 +39,17 @@ VsOut vs_textured(VsInTextured input) {
 }
 
 float4 ps_ui(VsOut input) : SV_Target {
-    return apply_gamma(draw.color0 * clip_mask(input.world_px, draw.clip.x));
+    return apply_gamma(draw.color0 * clip_mask(input.world_px, (uint)draw.clip.x));
 }
 
 float4 ps_textured_image(VsOut input) : SV_Target {
     float4 texel = image_atlas.Sample(atlas_sampler, input.uv);
     float4 color = texel * draw.color0;
-    return apply_gamma(color * clip_mask(input.world_px, draw.clip.x));
+    return apply_gamma(color * clip_mask(input.world_px, (uint)draw.clip.x));
 }
 
 float4 ps_textured_glyph(VsOut input) : SV_Target {
     float coverage = glyph_atlas.Sample(atlas_sampler, input.uv).r;
     float4 color = draw.color0 * coverage;
-    return apply_gamma(color * clip_mask(input.world_px, draw.clip.x));
+    return apply_gamma(color * clip_mask(input.world_px, (uint)draw.clip.x));
 }

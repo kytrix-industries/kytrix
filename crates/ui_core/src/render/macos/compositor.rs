@@ -17,9 +17,10 @@ use std::{ffi::c_void, ptr::NonNull, time::Instant};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus,
-    MTLCommandEncoder, MTLDevice, MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType,
-    MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLResourceOptions, MTLScissorRect, MTLSize,
-    MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage, MTLViewport,
+    MTLCommandEncoder, MTLDevice, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
+    MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLResourceOptions,
+    MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
+    MTLViewport,
 };
 use objc2_quartz_core::CAMetalDrawable;
 
@@ -39,11 +40,13 @@ use crate::{
         macos::{
             atlas::AtlasTextures,
             device::{Device, GpuObject, init_error, on_gpu_thread},
+            geometry::GeometryRegistry,
             pipeline::Pipeline,
             queue::Queue,
         },
         retire::GpuResourceHandle,
         timer::{FrameTimings, GpuTimerSample, Section},
+        uniform::RootUniform,
     },
     window::FrameIndex,
 };
@@ -66,6 +69,10 @@ pub(crate) struct GpuRenderer {
     clear_color: [f32; 4],
     /// 当前持久目标 / drawable 的物理尺寸（drawable 的实际尺寸是最后真值，§5.4）。
     surface: (u32, u32),
+    /// 窗口 DPI（`root.frame.params.x`；geometry 通道的逻辑→物理换算）。
+    scale: f32,
+    /// 静态几何的 GPU 缓冲（按需创建；换代产生的旧缓冲交 retire 队列）。
+    geometry: GeometryRegistry,
     /// 下一次 present 是否必须全量（新建 / 重建之后为 `true`）。
     fresh: bool,
     /// 最后一次**提交**的帧序号：重建产生的旧句柄以它作为 retire 的 tag（§4.3）。
@@ -123,6 +130,8 @@ impl GpuRenderer {
             upload,
             clear_color,
             surface: size,
+            scale: 1.0,
+            geometry: GeometryRegistry::new(),
             fresh: true,
             last_index: FrameIndex::default(),
             window_target,
@@ -178,6 +187,11 @@ impl GpuRenderer {
         Ok(true)
     }
 
+    /// 写入窗口 DPI（`root.frame.params.x`；只影响 geometry 通道）。
+    pub(crate) fn set_scale(&mut self, scale: f32) {
+        self.scale = scale;
+    }
+
     /// 改窗口背景色（GPU 线程）：写 persist 的 clear color（**linear**，不是 sRGB 编码）。
     ///
     /// 新 drawable **内部**的条带由下一次全量帧的 clear 填上；旧 drawable **之外**的区域由主线程
@@ -206,6 +220,9 @@ impl GpuRenderer {
         if let Some(error) = self.device.lost_error() {
             return Err(error);
         }
+        // DPI 与 surface 同帧过线：geometry 通道的顶点是逻辑像素，root uniform 的
+        // `frame.params.x` 必须与这一帧的 surface 成对（contract §6）。
+        self.scale = request.scale;
         let mut timings = FrameTimings::new();
         timings.reset(request.index);
         let (slot, command, stats) = self.record_frame(
@@ -381,6 +398,8 @@ impl GpuRenderer {
 
         let full = frame.is_full();
         let mut draw_calls = 0u32;
+        // 几何换代（槽位复用）产生的旧缓冲：录制块结束后交给 retire 队列。
+        let mut geometry_retired: Vec<GpuResourceHandle> = Vec::new();
         // 页尺寸变化在编码 blit 之前落地：新纹理建好、旧纹理句柄按本帧序号 retire
         // （DEVIATIONS F-208）。纹理绑定是每帧 `setFragmentTexture` 现场写的，无需重写。
         let _rebuilt = self
@@ -422,12 +441,21 @@ impl GpuRenderer {
             let encoder = command
                 .renderCommandEncoderWithDescriptor(&pass)
                 .ok_or_else(|| init_error("renderCommandEncoder", "returned nil"))?;
-            self.bind(&encoder, slot.index);
+            let root = self.bind(&encoder, slot.index);
             // 逐 scissor 画：全帧 = 整面一次；局部 = 每个 damage 矩形一次。
             match full {
                 true => {
                     encoder.setScissorRect(whole_scissor(self.surface));
-                    draw_calls = draw_ops(&encoder, payload, instance_count)?;
+                    draw_calls = draw_ops(
+                        &encoder,
+                        payload,
+                        instance_count,
+                        root,
+                        &self.pipeline,
+                        &mut self.geometry,
+                        &mut self.device,
+                        &mut geometry_retired,
+                    )?;
                 }
                 false => match frame.plan() {
                     Plan::Idle | Plan::Full => {}
@@ -444,12 +472,21 @@ impl GpuRenderer {
                                 &encoder,
                                 payload,
                                 instance_count,
+                                root,
+                                &self.pipeline,
+                                &mut self.geometry,
+                                &mut self.device,
+                                &mut geometry_retired,
                             )?);
                         }
                     }
                 },
             }
             encoder.endEncoding();
+        }
+        // 几何换代的旧缓冲按当前帧序号入 retire 队列（等该帧完成后释放，I4）。
+        for handle in geometry_retired {
+            self.queue.retire(self.last_index, handle);
         }
         if let Some(drawable) = drawable {
             let target = drawable.texture();
@@ -469,19 +506,23 @@ impl GpuRenderer {
         ))
     }
 
-    fn bind(&self, encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>, slot: usize) {
+    fn bind(
+        &self,
+        encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+        slot: usize,
+    ) -> RootUniform {
         encoder.setRenderPipelineState(self.pipeline.quad());
         let (instances, clips) = self.upload.slot(slot);
         // `RootUniform` 用 `setVertexBytes`（≤ 4 KB）在**录制时复制**进命令缓冲：没有跨帧的
         // CPU 可写缓冲，因此在飞帧读到的永远是它自己那一帧的常量（D3D12 root constants /
         // Vulkan push constants 的等价物）。单个 shared buffer + 每帧 `write` 会让异步执行的
         // 旧帧读到新帧的 viewport / 尺寸。
-        let root = RootUniform::new(self.surface);
+        let root = root_uniform(self.surface, self.scale);
         // SAFETY: 缓冲/纹理都在本渲染器生命周期内；索引与 P07 的绑定表逐字一致；
         // `root` 在本次调用期间存活（`setVertexBytes` 复制它的字节）。
         unsafe {
             encoder.setVertexBytes_length_atIndex(
-                NonNull::new(root.0.as_ptr().cast_mut().cast::<c_void>()).expect("stack pointer"),
+                NonNull::from(root.words()).cast::<c_void>(),
                 ROOT_UNIFORM_BYTES,
                 2,
             );
@@ -500,6 +541,7 @@ impl GpuRenderer {
                 zfar: 1.0,
             });
         }
+        root
     }
 }
 
@@ -662,30 +704,42 @@ fn write_upload(buffer: &ProtocolObject<dyn MTLBuffer>, bytes: &[u8]) {
     }
 }
 
-/// `RootUniform`（112 B）：`frame @0`、`draw @32`；实例绘制只用 `frame.viewport`（P07 §2.7）。
-///
-/// CPU 侧字节，16 B 对齐（shader 按 `float4` 常量布局读）：`setVertexBytes` 要求数据可读，
-/// Metal 在录制时把它复制进命令缓冲。
-#[repr(C, align(16))]
-struct RootUniform([f32; ROOT_UNIFORM_BYTES / 4]);
+/// 逐 geometry 的 draw uniform：在帧级常量之上覆盖 draw 块（与 Windows 同一实现）。
+fn geometry_root(
+    frame: RootUniform,
+    draw: &crate::paint::instance::GeometryDrawGpu,
+    clip_index: u32,
+    clip_rect: [u32; 4],
+) -> RootUniform {
+    let rect = if clip_index == 0 {
+        [0.0, 0.0, frame.words()[0], frame.words()[1]]
+    } else {
+        let x0 = f32::from_bits(clip_rect[0]);
+        let y0 = f32::from_bits(clip_rect[1]);
+        let x1 = f32::from_bits(clip_rect[2]);
+        let y1 = f32::from_bits(clip_rect[3]);
+        [x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0)]
+    };
+    RootUniform::geometry(frame, draw.transform, draw.color, clip_index, rect)
+}
 
-impl RootUniform {
-    fn new(surface: (u32, u32)) -> Self {
-        let width = surface.0 as f32;
-        let height = surface.1 as f32;
-        let mut uniform = [0.0f32; ROOT_UNIFORM_BYTES / 4];
-        uniform[0] = width;
-        uniform[1] = height;
-        uniform[2] = if width > 0.0 { 2.0 / width } else { 0.0 };
-        uniform[3] = if height > 0.0 { 2.0 / height } else { 0.0 };
-        Self(uniform)
-    }
+/// `RootUniform`（112 B）：`frame @0`、`draw @32`；布局由 `render::uniform::RootUniform` 唯一实现。
+///
+/// `setVertexBytes` 要求 CPU 侧数据可读，Metal 在录制时把它复制进命令缓冲；共享类型是
+/// `#[repr(C)]` 的 `[f32; 28]`，16 B 对齐满足 `float4` 常量布局。
+fn root_uniform(surface: (u32, u32), scale: f32) -> RootUniform {
+    RootUniform::frame(surface.0 as f32, surface.1 as f32, scale)
 }
 
 fn draw_ops(
     encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     payload: &FramePayload,
     instance_count: u32,
+    root: RootUniform,
+    pipeline: &Pipeline,
+    geometry: &mut GeometryRegistry,
+    device: &mut Device,
+    retired: &mut Vec<GpuResourceHandle>,
 ) -> Result<u32, EngineError> {
     let mut draw_calls = 0u32;
     for op in payload.ops() {
@@ -695,31 +749,86 @@ fn draw_ops(
                     continue;
                 }
                 debug_assert!(start.saturating_add(len) <= instance_count);
-                // SAFETY: 4 顶点 unit quad + 实例区间 [start, start+len)（编码期校验）。
+                // 实例基址只经 root constant `draw.clip.y` 进 shader，硬件基址恒 0
+                // （Metal 的 instance_id 会包含 baseInstance，与 D3D12 相反；统一走 uniform
+                //  才能三平台一致，contract §6）。
+                let uniform = root.with_instance_base(start);
+                // SAFETY: 4 顶点 unit quad + 实例区间 [0, len)；段起点由 shader 侧承担。
                 unsafe {
+                    encoder.setRenderPipelineState(pipeline.quad());
+                    encoder.setVertexBytes_length_atIndex(
+                        NonNull::from(uniform.words()).cast::<c_void>(),
+                        ROOT_UNIFORM_BYTES,
+                        2,
+                    );
                     encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
                         MTLPrimitiveType::TriangleStrip,
                         0usize,
                         4usize,
                         len as usize,
-                        start as usize,
+                        0usize,
                     );
                 }
                 draw_calls = draw_calls.saturating_add(1);
             }
-            FrameOp::Geometry { index, .. } => {
-                // Metal 还没有几何 GPU 缓冲（`GeometryStore` 在 P13）。这里顺带校验 `ops` 与
-                // **同帧**的几何表一致：下标越界是编码错误，不是「没有缓冲」。
-                let in_table = payload.geometry().get(index as usize).is_some();
-                return Err(EngineError::GeometryRegister {
-                    detail: smol_str::format_smolstr!(
-                        "geometry op index {index} (in_table={in_table}) has no GPU buffers (GeometryStore lands in P13)"
-                    ),
-                });
+            FrameOp::Geometry {
+                index,
+                clip_index,
+                clip_rect,
+            } => {
+                let draw = payload.geometry().get(index as usize).ok_or_else(|| {
+                    EngineError::GeometryRegister {
+                        detail: smol_str::format_smolstr!("geometry op index {index} out of range"),
+                    }
+                })?;
+                let entry = geometry.ensure(device, draw.id, &draw.desc, retired)?;
+                let uniform = geometry_root(root, draw, clip_index, clip_rect);
+                // SAFETY: 顶点/索引缓冲由 `GeometryRegistry` 持有到本帧结束；
+                // root uniform 由 `setVertexBytes` 在录制时复制。
+                unsafe {
+                    encoder.setRenderPipelineState(pipeline.geometry(entry.pipeline()));
+                    encoder.setVertexBytes_length_atIndex(
+                        NonNull::from(uniform.words()).cast::<c_void>(),
+                        ROOT_UNIFORM_BYTES,
+                        2,
+                    );
+                    encoder.setVertexBuffer_offset_atIndex(Some(entry.vertex()), 0, 0);
+                    encoder.setFragmentBytes_length_atIndex(
+                        NonNull::from(uniform.words()).cast::<c_void>(),
+                        ROOT_UNIFORM_BYTES,
+                        2,
+                    );
+                    encoder.setFragmentBuffer_offset_atIndex(Some(entry.index()), 0, 1);
+                    encoder
+                        .drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset(
+                            metal_topology(entry.topology()),
+                            entry.index_count() as usize,
+                            metal_index_type(entry.index_type()),
+                            entry.index(),
+                            0,
+                        );
+                }
+                draw_calls = draw_calls.saturating_add(1);
             }
         }
     }
     Ok(draw_calls)
+}
+
+/// 注册拓扑 → Metal 图元类型。
+fn metal_topology(topology: crate::paint::geometry::Topology) -> MTLPrimitiveType {
+    match topology {
+        crate::paint::geometry::Topology::TriangleList => MTLPrimitiveType::Triangle,
+        crate::paint::geometry::Topology::TriangleStrip => MTLPrimitiveType::TriangleStrip,
+    }
+}
+
+/// 索引格式 → Metal 索引类型。
+fn metal_index_type(kind: crate::paint::geometry::IndexType) -> MTLIndexType {
+    match kind {
+        crate::paint::geometry::IndexType::U16 => MTLIndexType::UInt16,
+        crate::paint::geometry::IndexType::U32 => MTLIndexType::UInt32,
+    }
 }
 
 /// 整面 blit（**每帧**，因为 drawable 内容跨帧无保证）。

@@ -585,6 +585,11 @@ impl PrimitiveEmitter {
                     Primitive::Geometry(GeometryDraw {
                         id,
                         transform: crate::math::Transform::IDENTITY,
+                        color: self
+                            .patch
+                            .foreground
+                            .unwrap_or(Color::WHITE)
+                            .with_opacity(opacity),
                     }),
                 );
                 context.damage.push(self.bounds, 1.0, self.clip);

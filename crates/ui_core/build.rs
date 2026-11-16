@@ -75,13 +75,25 @@ const FORBIDDEN: [&str; 6] = [
 ];
 
 /// `contract.md` 必须包含的锚点（防止契约文档被删改而构建仍通过）。
-const CONTRACT_ANCHORS: [&str; 6] = [
+const CONTRACT_ANCHORS: [&str; 7] = [
     "TriangleStrip",
     "cull = NONE",
     "ONE_MINUS_SRC_ALPHA",
     "_UNORM_SRGB",
     "aa_padding",
     "size_of == 128",
+    "instance_base",
+];
+
+/// 三套 uber-quad 顶点着色器必须都按 `draw.clip.y` 加实例基址（P0-1.1 的防回归锚点）。
+///
+/// 三个图形 API 的硬件实例基址语义不同：D3D12 的 `SV_InstanceID` **不含** `StartInstanceLocation`，
+/// 而 Vulkan 的 `gl_InstanceIndex` / Metal 的 `instance_id` **含** `firstInstance` / `baseInstance`。
+/// 所以三平台都必须把硬件基址传 0、只经 uniform 加偏移；任一 shader 回退到硬件基址都会静默错位。
+const INSTANCE_BASE_ANCHORS: [(&str, &str); 3] = [
+    ("quad.hlsl", "instances[instance_id + base]"),
+    ("quad.vert.glsl", "instances[instance]"),
+    ("quad.metal", "instances[instance]"),
 ];
 
 /// D3D12 的 7 个 entry：(源文件, profile, 入口名, 产物名)。
@@ -276,6 +288,27 @@ fn validate(manifest: &Path, shader_dir: &Path) {
     for anchor in CONTRACT_ANCHORS {
         if !contract.contains(anchor) {
             fail("contract.md", "契约锚点", anchor, "缺失");
+        }
+    }
+
+    // 7) 实例基址：三套 quad 顶点着色器都必须经 uniform 加偏移，且都读 `draw.clip.y`。
+    for (file, anchor) in INSTANCE_BASE_ANCHORS {
+        let src = read(&shader_dir.join(file));
+        if !src.contains(anchor) {
+            fail(
+                file,
+                "实例基址",
+                &format!("包含 `{anchor}`（经 draw.clip.y 加偏移）"),
+                "找不到（回退到硬件 baseInstance 会三平台分叉）",
+            );
+        }
+        if !src.contains("draw.clip.y") && !src.contains("root.draw.clip.y") {
+            fail(
+                file,
+                "实例基址",
+                "读取 `draw.clip.y` 作为 instance_base",
+                "找不到",
+            );
         }
     }
 }

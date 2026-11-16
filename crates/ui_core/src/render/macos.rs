@@ -6,6 +6,8 @@
 pub(crate) mod atlas;
 pub(crate) mod compositor;
 pub(crate) mod device;
+/// 静态几何的 GPU 缓冲（按需创建；`GeometryStore` 的 Metal 侧缓存）。
+pub(crate) mod geometry;
 pub(crate) mod pipeline;
 pub(crate) mod queue;
 #[cfg(any(test, feature = "test-support"))]

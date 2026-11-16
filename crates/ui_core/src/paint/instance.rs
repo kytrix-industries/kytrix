@@ -17,7 +17,7 @@ use crate::{
     math::{Rect, Scale, Transform},
     paint::{
         color::{Color, ColorResolver, LinearPremulRgba},
-        primitive::{ClipOp, GeometryDraw, GradientKind, Primitive, QuadPaint},
+        primitive::{ClipOp, GradientKind, Primitive, QuadPaint},
         scene::{MAX_CLIP_DEPTH, Scene},
     },
 };
@@ -152,8 +152,27 @@ pub(crate) enum FrameOp {
 pub(crate) struct InstanceBuffer {
     instances: Vec<GpuPrimitive>,
     clips: Vec<ClipChain>,
-    geometry: Vec<GeometryDraw>,
+    geometry: Vec<GeometryDrawGpu>,
     ops: Vec<FrameOp>,
+}
+
+/// 几何绘制的**帧内**表示：颜色已由 UI 线程解析成 linear premultiplied RGBA。
+///
+/// 公开的 [`GeometryDraw`] 携带应用语义的 `Color`；解析（色彩空间 + 插值配置）发生在 UI 线程
+/// 的编码器里，与所有实例图元同一条路径（contract §3 的唯一转换点）。GPU 线程只拿到可以直接
+/// 写进 root constant 的 `[f32; 4]`，因此不需要跨线程传 `ColorResolver`。
+#[derive(Clone, Debug)]
+pub(crate) struct GeometryDrawGpu {
+    pub id: crate::paint::geometry::GeometryId,
+    pub transform: Transform,
+    /// linear premultiplied RGBA（`draw.color0`）。
+    pub color: [f32; 4],
+    /// 几何的顶点/索引字节与布局（GPU 线程首次见到该 `GeometryId` 时据此建缓冲）。
+    ///
+    /// 随帧过线是**有意**的：`GeometryStore` 在 UI 线程，GPU 线程不能直接读它；把描述
+    /// 附在绘制项上，GPU 线程按 `(index, generation)` 缓存自己的缓冲，既不需要额外的
+    /// 跨线程注册通道，也让「注册后第一帧」自然完成上传。
+    pub desc: std::sync::Arc<crate::paint::geometry::GeometryDesc>,
 }
 
 impl InstanceBuffer {
@@ -190,7 +209,7 @@ impl InstanceBuffer {
     }
 
     /// `FrameOp::Geometry.index` 的下标表。
-    pub(crate) fn geometry(&self) -> &[GeometryDraw] {
+    pub(crate) fn geometry(&self) -> &[GeometryDrawGpu] {
         &self.geometry
     }
 
@@ -209,6 +228,8 @@ impl InstanceBuffer {
 /// `Primitive → GpuPrimitive` 的编码器（`Window` 持有，缓冲跨帧复用）。
 pub(crate) struct InstanceEncoder {
     buffer: InstanceBuffer,
+    /// 静态几何注册表的共享句柄（`App` 持有；`Window` 在编码前写入）。
+    store: std::sync::Arc<crate::paint::geometry_store::GeometryStore>,
     stack: SmallVec<[ClipChainId; 8]>,
     chains: ahash::HashMap<(u32, [u32; 4], [u32; 4]), ClipChainId>,
     run_start: usize,
@@ -219,6 +240,7 @@ impl InstanceEncoder {
     pub(crate) fn new() -> Self {
         let mut encoder = Self {
             buffer: InstanceBuffer::new(),
+            store: std::sync::Arc::new(crate::paint::geometry_store::GeometryStore::new()),
             stack: SmallVec::new(),
             chains: ahash::HashMap::default(),
             run_start: 0,
@@ -255,6 +277,7 @@ impl InstanceEncoder {
             chains: &mut self.chains,
             scale,
             resolver,
+            store: &self.store,
             run_start: &mut self.run_start,
         };
         frame.encode_scene(scene);
@@ -344,6 +367,8 @@ struct FrameEncoder<'a> {
     chains: &'a mut ahash::HashMap<(u32, [u32; 4], [u32; 4]), ClipChainId>,
     scale: Scale,
     resolver: &'a ColorResolver,
+    /// 静态几何的注册表（`GeometryId` → 顶点/索引字节）。
+    store: &'a crate::paint::geometry_store::GeometryStore,
     run_start: &'a mut usize,
 }
 
@@ -400,9 +425,11 @@ impl FrameEncoder<'_> {
             }
             Primitive::Path(path) => {
                 self.flush_run();
-                let index = self.push_geometry(GeometryDraw {
+                let index = self.push_geometry(GeometryDrawGpu {
                     id: path.geometry,
                     transform: Transform::IDENTITY,
+                    color: self.resolver.resolve(path.fill).to_array(),
+                    desc: self.geometry_desc(path.geometry),
                 });
                 let (clip_index, clip_rect) = self.geometry_clip();
                 self.buffer.ops.push(FrameOp::Geometry {
@@ -413,7 +440,12 @@ impl FrameEncoder<'_> {
             }
             Primitive::Geometry(draw) => {
                 self.flush_run();
-                let index = self.push_geometry(*draw);
+                let index = self.push_geometry(GeometryDrawGpu {
+                    id: draw.id,
+                    transform: draw.transform,
+                    color: self.resolver.resolve(draw.color).to_array(),
+                    desc: self.geometry_desc(draw.id),
+                });
                 let (clip_index, clip_rect) = self.geometry_clip();
                 self.buffer.ops.push(FrameOp::Geometry {
                     index,
@@ -436,7 +468,30 @@ impl FrameEncoder<'_> {
         }
     }
 
-    fn push_geometry(&mut self, draw: GeometryDraw) -> u32 {
+    /// 取几何描述（`Arc` 克隆，不复制顶点字节）。未注册的句柄给空描述：渲染层会以
+    /// `GeometryRegister` 错误拒绝，而不是画错东西。
+    fn geometry_desc(
+        &self,
+        id: crate::paint::geometry::GeometryId,
+    ) -> std::sync::Arc<crate::paint::geometry::GeometryDesc> {
+        static MISSING: std::sync::OnceLock<std::sync::Arc<crate::paint::geometry::GeometryDesc>> =
+            std::sync::OnceLock::new();
+        self.store.desc_arc(id).unwrap_or_else(|| {
+            std::sync::Arc::clone(MISSING.get_or_init(|| {
+                std::sync::Arc::new(crate::paint::geometry::GeometryDesc {
+                    vertex_bytes: bytes::Bytes::new(),
+                    index_bytes: bytes::Bytes::new(),
+                    vertex_stride: 0,
+                    index_type: crate::paint::geometry::IndexType::U16,
+                    topology: crate::paint::geometry::Topology::TriangleList,
+                    bounds: crate::math::Rect::default(),
+                    pipeline: crate::paint::geometry::GeometryPipeline::Ui,
+                })
+            }))
+        })
+    }
+
+    fn push_geometry(&mut self, draw: GeometryDrawGpu) -> u32 {
         let index = self.buffer.geometry.len() as u32;
         self.buffer.geometry.push(draw);
         index
@@ -1019,6 +1074,7 @@ mod tests {
             Primitive::Geometry(GeometryDraw {
                 id: geometry,
                 transform: Transform::IDENTITY,
+                color: crate::paint::color::Color::WHITE,
             }),
         ));
         assert!(scene.push(lane, quad_primitive(solid())));

@@ -97,6 +97,8 @@ pub struct App {
     atlas: AtlasAllocator,
     /// 图片资源缓存（解码 + 图片图集页；与字形页分图集，且**不随 DPI 换代**，P13 §8.1）。
     resources: ResourceCache,
+    /// 静态几何的注册表（进程级；设备无关的 CPU 字节，各后端自缓存 GPU 缓冲）。
+    geometry: crate::paint::geometry_store::GeometryStore,
     /// 字形 `key → tile` 缓存（与图集同事务换代）。
     glyph_atlas: GlyphAtlas,
     /// 每窗口「图集已同步到的 `scale_epoch`」（DPI 变化 ⇒ 图集换代）。
@@ -335,6 +337,7 @@ impl App {
                 (MIN_ATLAS_PAGE, MIN_ATLAS_PAGE),
             ),
             resources: ResourceCache::new(),
+            geometry: crate::paint::geometry_store::GeometryStore::new(),
             glyph_atlas: GlyphAtlas::new(),
             scale_epochs: ahash::HashMap::default(),
             pending_dirty: crate::render::DirtyRows::default(),
@@ -663,6 +666,17 @@ impl App {
     /// 图片资源缓存（可变）：`insert` / `unload` 的唯一入口。
     pub fn resources_mut(&mut self) -> &mut ResourceCache {
         &mut self.resources
+    }
+
+    /// 静态几何注册表（只读）。
+    #[must_use]
+    pub fn geometry(&self) -> &crate::paint::geometry_store::GeometryStore {
+        &self.geometry
+    }
+
+    /// 静态几何注册表（可变）：`insert` / `release` 的唯一入口。
+    pub fn geometry_mut(&mut self) -> &mut crate::paint::geometry_store::GeometryStore {
+        &mut self.geometry
     }
 
     /// 依赖图（只读；`test-support` 的 `diagnostics::dependency_dump` 用）。
