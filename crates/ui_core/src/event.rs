@@ -133,6 +133,13 @@ pub enum InputEvent {
     },
     /// 指针离开客户区。
     PointerLeave,
+    /// 指针会话被系统**取消**（不是用户松手）：指针捕获丢失、窗口失焦、系统弹窗夺走输入。
+    ///
+    /// 与 [`Self::PointerUp`] 的区别是语义：`Up` 可能触发点击，`Cancel` 必须**不**触发任何
+    /// 提交，只结束拖拽/按压并派发 `DragPhase::Cancel`。丢了这个事件，拖拽会话会永久卡在
+    /// 「按住」状态（Windows 的 `WM_CAPTURECHANGED`、macOS 的 `resignKey`、Linux 的指针
+    /// `leave` 都可能在没有 `Up` 的情况下结束一次拖拽）。
+    PointerCancel,
     /// 滚轮：`delta_*` 以「行」为单位（Windows 一格 = 120 → 1.0 行，符号即方向）。
     Scroll {
         /// 窗口逻辑坐标。
@@ -169,7 +176,7 @@ impl InputEvent {
             | Self::PointerDown { position, .. }
             | Self::PointerUp { position, .. }
             | Self::Scroll { position, .. } => Some(*position),
-            Self::PointerLeave | Self::Key { .. } | Self::Text { .. } => None,
+            Self::PointerLeave | Self::PointerCancel | Self::Key { .. } | Self::Text { .. } => None,
         }
     }
 
@@ -182,7 +189,7 @@ impl InputEvent {
             | Self::PointerUp { modifiers, .. }
             | Self::Scroll { modifiers, .. }
             | Self::Key { modifiers, .. } => *modifiers,
-            Self::PointerLeave | Self::Text { .. } => Modifiers::empty(),
+            Self::PointerLeave | Self::PointerCancel | Self::Text { .. } => Modifiers::empty(),
         }
     }
 }

@@ -402,6 +402,14 @@ pub(crate) extern "system" fn wndproc(
         if state.is_null() {
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
+        // 应用自己持有的指针捕获被系统收回（Alt+Tab、系统弹窗、别的窗口 SetCapture）：
+        // 此时**不会**收到 `WM_LBUTTONUP`，拖拽会话会永久停在「按住」。投递一次
+        // `PointerCancel` 让交互层作废本次会话（结束拖拽 + 派发 `DragPhase::Cancel`）。
+        // 自绘边框缩放有自己的收尾逻辑，走下面的分支，不重复投递。
+        if msg == WM_CAPTURECHANGED && (*state).resize.is_none() {
+            (*state).events.push(PlatformEvent::PointerCancel);
+            return LRESULT(0);
+        }
 
         // ── 自绘边框缩放 ────────────────────────────────────────────────────────
         // 非客户区的缩放不能交给 `DefWindowProcW`：`WM_NCLBUTTONDOWN` 会进入 Win32 的模态
@@ -960,6 +968,7 @@ fn apply_event(
             modifiers,
         }),
         PlatformEvent::PointerLeave => Event::Input(InputEvent::PointerLeave),
+        PlatformEvent::PointerCancel => Event::Input(InputEvent::PointerCancel),
         PlatformEvent::Key { key, state } => Event::Input(InputEvent::Key {
             key,
             state,

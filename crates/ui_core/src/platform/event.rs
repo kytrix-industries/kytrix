@@ -52,6 +52,11 @@ pub(crate) enum PlatformEvent {
     Focus(bool),
     Appearance(bool),
     PointerLeave,
+    /// 指针会话被系统**取消**（捕获丢失 / 窗口失焦 / 系统弹窗夺走输入）。
+    ///
+    /// 映射到 `InputEvent::PointerCancel`：只收尾（结束拖拽、派发 `DragPhase::Cancel`），
+    /// 绝不提交点击。
+    PointerCancel,
     Close,
 }
 

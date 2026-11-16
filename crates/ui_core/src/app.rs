@@ -924,6 +924,9 @@ impl App {
                 modifiers,
             } => self.on_pointer_up(window, position, button, modifiers, &mut outcome),
             InputEvent::PointerLeave => self.on_pointer_leave(window),
+            // 系统取消指针会话（捕获丢失 / 系统弹窗夺走输入）：与失焦同一套收尾，但**不**动
+            // 焦点与 a11y 焦点态 —— 焦点没有变，只是这次指针交互作废。
+            InputEvent::PointerCancel => self.cancel_pointer_session(window),
             InputEvent::Scroll {
                 position,
                 delta_x,
@@ -1295,6 +1298,17 @@ impl App {
     }
 
     fn on_window_focus_lost(&mut self, window: WindowId) {
+        self.cancel_pointer_session(window);
+    }
+
+    /// 作废本窗口当前的指针会话：结束拖拽（派发 `DragPhase::Cancel`）、清按压/悬停/光标、
+    /// 释放指针捕获。
+    ///
+    /// 两条触发路径共用：窗口失焦（`Event::FocusChanged { focused: false }`）与平台报告的
+    /// **指针会话取消**（`InputEvent::PointerCancel`：Windows 的 `WM_CAPTURECHANGED`、
+    /// macOS 的窗口失去 key、Linux 的指针 `leave`）。缺了这条路径，拖拽中 Alt+Tab 会让会话
+    /// 永久停在「按住」，用户只能重启应用。
+    fn cancel_pointer_session(&mut self, window: WindowId) {
         let cancelled = self
             .windows
             .get_mut(&window)
@@ -5878,6 +5892,59 @@ mod interaction_tests {
         frame(&mut app, window);
         assert_eq!(app.read_transient(&value), 0.0, "终点是 0，不得回弹到 1");
         assert!(!app.animations_running(window));
+    }
+
+    /// P2-5 回归：系统取消指针会话时，拖拽必须结束并派发 `Cancel`，不能卡在「按住」。
+    ///
+    /// Windows 的 `WM_CAPTURECHANGED`（Alt+Tab / 系统弹窗 / 别的窗口 `SetCapture`）之后
+    /// 不会再有 `WM_LBUTTONUP`；平台层把它翻译成 `InputEvent::PointerCancel`。缺失这条路径
+    /// 时拖拽会话永久存活，用户只能重启应用。
+    #[test]
+    fn pointer_cancel_ends_the_drag_without_committing_a_click() {
+        let (_rt, mut app, window) = setup();
+        let root = root_of(&app, window);
+        let phases = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = phases.clone();
+        let grip = NodeBuilder::boxed()
+            .layout_override(Rect::new(100.0, 0.0, 6.0, 100.0))
+            .on_drag(Action::custom("split"))
+            .build(app.window_mut(window).expect("window").tree_mut(), root)
+            .expect("mount");
+        app.on_action(Action::custom("split"), move |ctx| {
+            if let ActionSource::Drag { phase, .. } = ctx.source() {
+                seen.borrow_mut().push(phase);
+            }
+        });
+        frame(&mut app, window);
+
+        app.dispatch_input(
+            window,
+            InputEvent::PointerDown {
+                position: Point::new(102.0, 50.0),
+                button: PointerButton::Primary,
+                modifiers: Modifiers::empty(),
+            },
+        );
+        app.dispatch_input(
+            window,
+            InputEvent::PointerMove {
+                position: Point::new(160.0, 50.0),
+                modifiers: Modifiers::empty(),
+            },
+        );
+        assert!(app.drag_state(window).is_some(), "拖拽应已开始");
+
+        // 系统夺走捕获：没有 PointerUp，只有取消。
+        app.dispatch_input(window, InputEvent::PointerCancel);
+
+        assert!(app.drag_state(window).is_none(), "取消后不得残留拖拽会话");
+        assert_eq!(
+            phases.borrow().last().copied(),
+            Some(DragPhase::Cancel),
+            "必须派发 Cancel 阶段：{:?}",
+            phases.borrow()
+        );
+        let _ = grip;
     }
 
     #[test]
