@@ -146,7 +146,12 @@ pub(crate) fn default_actions(role: A11yRole) -> Vec<A11yAction> {
         // `RangeValuePattern.SetValue` 带 `NumericValue` payload），步进走
         // Increment/Decrement（P2-8 / review P2-5）。
         R::Slider => vec![A::SetValue, A::Increment, A::Decrement, A::Focus],
-        R::TextInput | R::MultilineTextInput => vec![A::SetValue, A::SetTextSelection],
+        // 文本输入只声明 `SetValue`。**不**声明 `SetTextSelection`：AccessKit 的
+        // `TextPosition.character_index` 是 grapheme 索引（`character_lengths` 的下标），
+        // 而引擎当前的选区 API 收 UTF-8 字节偏移，且没有建 `TextRun` 节点/字符度量
+        // ⇒ 声明这个动作会让读屏器按 grapheme 下标操作、CJK/emoji 下错位（review P2-9）。
+        // 等引擎补了 TextRun + grapheme→byte 转换再声明（宁可少声明，不给死/错动作）。
+        R::TextInput | R::MultilineTextInput => vec![A::SetValue],
         R::ScrollView => vec![
             A::ScrollUp,
             A::ScrollDown,
