@@ -2877,6 +2877,20 @@ GPU 线程只按新内容尺寸重画并 1:1 覆盖，buffer 用 grow-only 高�
    `Canvas` 节点深拷贝、`StateStore` 槽位不回收（信号 id 稠密、节点销毁后留槽）。
    这三项见 V-134。
 
+### V-134 批次 D/E 的未完成项（待用户拍板）
+
+1. **macOS / Linux staging 环形缓冲**：当前仍是每帧一次性缓冲（按 `index` retire），只影响上传
+   瞬间的峰值与 CPU 分配，不影响常驻内存。改成「每槽常驻 + 按需扩容」需要三处改动（`record_uploads`
+   收 `slot`、按槽记容量、扩容时 retire 旧缓冲）；Windows 已是常驻 staging。
+2. **`FramePayload` 缓冲池**：`from_buffer` 每帧 4 次分配（实例 `Bytes` + ops/clips/geometry 三个
+   `Vec`，约 40 KiB/帧 ≈ 2.4 MiB/s）。零拷贝需要 GPU 线程把缓冲「还」给 UI 线程（三平台各有一条
+   队列，回收路径不一），属于跨线程所有权改造，收益是 CPU 分配而非常驻内存。
+3. **`Canvas` 深拷贝**：`paint/pass.rs` 每个 canvas 节点每次 paint 都 `Box::new(canvas.clone())`。
+   demo 无 canvas 节点；改成 `Rc<Canvas>` 需要动 `NodeKind::Canvas` 的存储形态。
+4. **`StateStore` 槽位回收**：信号槽是稠密 `Vec`，节点销毁后槽位保留（值仍占内存）。回收需要
+   代际 arena + 句柄失效检查，属于状态系统级改动；静态 demo 下无实际增长。
+
+
 
 | 指标 | 改前 | 改后 | Δ |
 |------|------|------|---|

@@ -839,7 +839,7 @@ fn completed_frames<'a>(
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, Condvar, Mutex},
+        sync::{Arc, Condvar, Mutex, atomic::AtomicBool},
         time::Instant,
     };
 
@@ -922,6 +922,7 @@ mod tests {
         let terminated = Shared {
             state: Mutex::new(State::new()),
             work: Condvar::new(),
+            atlas_pending: [AtomicBool::new(false), AtomicBool::new(false)],
         };
         terminated.mark_terminated();
         terminated.set_background([0.0, 1.0, 0.0, 1.0]);
