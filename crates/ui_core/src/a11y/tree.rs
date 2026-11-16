@@ -136,6 +136,10 @@ pub(crate) fn node_a11y(
         checked,
         selected: patch.and_then(|patch| patch.selected),
         expanded: patch.and_then(|patch| patch.expanded),
+        // 实时区域：静态声明优先，其次动态补丁（与 role / label 的合并方向一致）。
+        live: over
+            .and_then(|over| over.live)
+            .or_else(|| patch.and_then(|patch| patch.live)),
         // 行列语义：静态声明优先，其次动态补丁（与 role / label 的合并方向一致）。
         numeric_value: over
             .and_then(|over| over.numeric_value)
@@ -215,6 +219,27 @@ mod tests {
         (root, parent, child)
     }
 
+    /// P2-6：live region 必须落进 accesskit 节点（AT 靠它决定是否主动播报）。
+    #[test]
+    fn live_region_reaches_the_accesskit_node() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let price = NodeBuilder::boxed()
+            .a11y(crate::a11y::A11yOverride {
+                role: Some(crate::a11y::A11yRole::Label),
+                label: Some(smol_str::SmolStr::new_static("BTC 42000")),
+                live: Some(crate::a11y::A11yLive::Polite),
+                ..crate::a11y::A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("price");
+        let mut diagnostics = Vec::new();
+        let node = super::node_a11y(&tree, price, crate::math::Scale::ONE, "", &mut diagnostics)
+            .expect("snapshot");
+        assert_eq!(node.live, Some(crate::a11y::A11yLive::Polite));
+        let ak = crate::a11y::adapter::to_accesskit(&node);
+        assert_eq!(ak.live(), Some(accesskit::Live::Polite));
+    }
     /// P2-8：滑块的数值通道必须同时进快照与 accesskit 节点。
     ///
     /// UIA 的 `RangeValuePattern` 读的是 accesskit 那一层；只给字符串值时不播报也不行调节。

@@ -278,6 +278,10 @@ pub(crate) fn to_accesskit(record: &crate::a11y::A11yNode) -> accesskit::Node {
     if let Some(expanded) = record.expanded {
         node.set_expanded(expanded);
     }
+    // 实时区域（P2-6）：没有它 AT 不会主动播报数值变化。
+    if let Some(live) = record.live {
+        node.set_live(crate::a11y::mapping::live_to_accesskit(live));
+    }
     // 数值通道（P2-8）：UIA 的 RangeValuePattern 读这几个字段。
     if let Some(value) = record.numeric_value {
         node.set_numeric_value(value);

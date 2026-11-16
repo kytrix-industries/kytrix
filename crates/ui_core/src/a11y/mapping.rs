@@ -109,6 +109,14 @@ pub(crate) const fn action_from_accesskit(action: accesskit::Action) -> Option<A
 }
 
 /// 窗口相对、**物理像素**的边界盒（逻辑 × scale，逐边 round；含祖先滚动偏移的屏幕化）。
+/// 实时区域播报策略 → ccesskit::Live。
+pub(crate) const fn live_to_accesskit(live: crate::a11y::A11yLive) -> accesskit::Live {
+    match live {
+        crate::a11y::A11yLive::Polite => accesskit::Live::Polite,
+        crate::a11y::A11yLive::Assertive => accesskit::Live::Assertive,
+    }
+}
+
 pub(crate) fn bounds_of(tree: &NodeTree, node: NodeId, scale: Scale) -> PhysicalRect {
     let content = tree
         .get(node)

@@ -171,6 +171,8 @@ pub struct A11yOverride {
     pub column_index: Option<usize>,
     pub row_count: Option<usize>,
     pub column_count: Option<usize>,
+    /// 实时区域播报策略（`None` = 不表态，P2-6）。
+    pub live: Option<A11yLive>,
     /// 数值通道（`Slider` / `ProgressIndicator` / `ScrollBar` 等，P2-8）。
     ///
     /// 屏幕阅读器播报的是**数值**（"50，最大 100"），UIA 的 `RangeValuePattern` 直接读这几个
@@ -222,12 +224,27 @@ pub struct A11yPatch {
     pub selected: Option<bool>,
     /// 展开（`None` = 不表态）。
     pub expanded: Option<bool>,
+    /// 实时区域播报策略（`None` = 不表态）。
+    pub live: Option<A11yLive>,
     /// 数值通道（滑块 / 进度 / 滚动条的数值与范围，P2-8）。
     pub numeric_value: Option<f64>,
     pub min_numeric_value: Option<f64>,
     pub max_numeric_value: Option<f64>,
     /// 覆盖动作表。
     pub actions: Option<Vec<A11yAction>>,
+}
+
+/// 实时区域（live region）的播报策略。
+///
+/// 行情数字这类**持续变化**的内容必须声明 live region，否则屏幕阅读器只会把它当静态
+/// 文本、用户根本不知道数值变了（P2-6）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum A11yLive {
+    /// 排队播报（不打断用户当前朗读）：适合价格、进度这类高频更新。
+    Polite,
+    /// 立即打断当前朗读：只用于告警级变化（如触发阈值）。
+    Assertive,
 }
 
 /// a11y 侧的节点身份：编码 = 引擎 `NodeId::to_bits()`（`(generation << 32) | index`）。
@@ -295,6 +312,8 @@ pub struct A11yNode {
     pub column_index: Option<usize>,
     pub row_count: Option<usize>,
     pub column_count: Option<usize>,
+    /// 实时区域播报策略（`None` = 不表态，P2-6）。
+    pub live: Option<A11yLive>,
     /// 数值通道（`Slider` / `ProgressIndicator` / `ScrollBar` 等，P2-8）。
     ///
     /// 屏幕阅读器播报的是**数值**（"50%，最大 100"）而不是字符串，且 UIA 的
