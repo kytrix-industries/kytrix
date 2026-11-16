@@ -145,10 +145,10 @@ impl AtlasTextures {
         Ok(rebuilt)
     }
 
-    /// 给待上传的行分配**本帧专用** staging、写进去并编码 `cmd_copy_buffer_to_image`。
+    /// 给待上传的行准备本帧的 staging、写进去并编码 `cmd_copy_buffer_to_image`。
     ///
-    /// staging 以 `index` 进入 retire 队列：timeline 确认该帧完成之前，GPU 可能仍在读它，
-    /// 因此即使下一帧立刻录制自己的上传也不会覆盖（每帧一块一次性缓冲，不共享）。
+    /// 小上传复用该帧槽的常驻缓冲（覆盖写安全：`wait_slot` 已证明上一帧完成）；超过 1 MiB 的
+    /// 整页上传临时分配一块缓冲并以 `index` 进入 retire 队列（F-216），不会覆盖仍在读的常驻缓冲。
     pub(crate) fn record_uploads(
         &mut self,
         device: &mut Device,

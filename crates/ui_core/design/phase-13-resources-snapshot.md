@@ -637,6 +637,11 @@ pub struct ResourceCache {
 
 ### 8.2 `App` 的图集页上传（**广播**）
 
+> **已被 F-211 取代（2026-11）**：现行实现是「逐窗口待发行 + 录制后释放共享槽」，
+> `take_page_dirty` 已删除（换成 `GlyphAtlas::take_cleared`），上传也不再是「有脏就整页广播」。
+> 本节保留原始设计作为背景；现状以 `crates/ui_core/design/DEVIATIONS.md` §37 的 F-211 /
+> F-216 / F-217 为准。
+
 ```rust
 // app.rs（impl App 内，pub(crate)）
 /// 把两张图集页广播给**所有窗口**的渲染器（每帧一次，paint 之前）。

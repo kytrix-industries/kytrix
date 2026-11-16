@@ -160,10 +160,10 @@ impl AtlasTextures {
         Ok(rebuilt)
     }
 
-    /// 把待上传的行写进**本帧专用**的 staging 并编码 blit（必须在一帧的 command buffer 里调用）。
+    /// 把待上传的行写进本帧的 staging 并编码 blit（必须在一帧的 command buffer 里调用）。
     ///
-    /// 每页最多分配一块一次性缓冲；它们以 `index` 进入 retire 队列，因此 GPU 还在读的上一帧
-    /// staging 不会被本帧的 CPU 写入覆盖。
+    /// 小上传复用该帧槽的常驻缓冲（覆盖写安全：上一帧已完成）；超过 1 MiB 的整页上传临时
+    /// 分配一块缓冲并以 `index` 进入 retire 队列（F-216），不会覆盖 GPU 还在读的常驻缓冲。
     pub(crate) fn record_uploads(
         &mut self,
         device: &mut Device,

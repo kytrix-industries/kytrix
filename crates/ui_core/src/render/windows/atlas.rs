@@ -659,6 +659,47 @@ mod tests {
         assert_eq!(resident_rows(256), STAGING_ROWS);
     }
 
+    /// 整页上传（> 1 MiB）必须走一次性缓冲：常驻槽不得按整页扩容（F-216）。
+    #[test]
+    fn a_full_page_upload_does_not_grow_the_resident_slot() {
+        let _guard = crate::render::windows::device::gpu_test_lock();
+        use crate::render::windows::queue::Queue;
+
+        let mut device = Device::new_warp().expect("WARP device");
+        let mut queue = Queue::new(&device).expect("queue");
+        let mut atlas = AtlasTextures::new(&mut device).expect("atlas");
+        // 1024² 的图片整页 = 4 MiB，超过常驻上限。
+        const PAGE: u32 = 1024;
+        let mut rows = DirtyRows::default();
+        rows.mark(0, u32::MAX);
+        atlas.queue_upload(
+            AtlasKind::Image,
+            PAGE,
+            vec![0u8; (PAGE * PAGE * 4) as usize],
+            rows,
+        );
+        atlas.prepare(&mut device, &mut queue).expect("prepare");
+        let mut retired = Vec::new();
+        queue
+            .submit_immediate(|list| {
+                retired = atlas.record_uploads(&mut device, list, 0)?;
+                Ok(())
+            })
+            .expect("upload");
+
+        assert!(
+            !retired.is_empty(),
+            "整页上传必须把一次性 staging 交给 retire"
+        );
+        let row_pitch = align_up(PAGE * 4, 256);
+        let resident = atlas.image.staging[0].rows;
+        assert!(
+            u64::from(resident) * u64::from(row_pitch) <= MAX_RESIDENT_STAGING_BYTES,
+            "常驻槽被整页上传撑大：{resident} 行 × {row_pitch} B"
+        );
+        assert!(resident < PAGE, "整页行数不得常驻（{resident}）");
+    }
+
     #[test]
     fn dirty_rows_upload_only_touches_those_rows() {
         let _guard = crate::render::windows::device::gpu_test_lock();

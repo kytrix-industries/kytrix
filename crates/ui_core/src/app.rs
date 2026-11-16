@@ -2677,7 +2677,7 @@ impl App {
         // 布局后（视口尺寸已知/已变）再修一次虚拟列表窗口：首次布局前视口 = 0，不能靠
         // `set_virtual_items` 那一次调用定终身（P10 §8.3 / 评审 #5）。
         self.rewindow_virtuals(window);
-        // 图集页上传（P13：广播给所有窗口的渲染器；两张页分开、顺序固定以便帧记录复现）。
+        // 图集页上传（P13：逐窗口分发，两张页分开、顺序固定以便帧记录复现）。
         self.upload_atlas_pages();
         let paint = match self.windows.get_mut(&window) {
             Some(target) => match target.paint_frame() {
@@ -5854,6 +5854,10 @@ mod resources_tests {
         assert!(
             app.window(window).expect("window").atlas_rows_pending(),
             "忙窗口的图集行必须留在队列里"
+        );
+        assert!(
+            app.dispatcher.take_frame_wake(),
+            "补帧必须请求一次帧唤醒（否则静态窗口不会重试）"
         );
 
         // 补帧：上一帧的 publish 已经消费了共享槽，这一帧必须把行入队并清掉。
