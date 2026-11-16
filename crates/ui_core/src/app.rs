@@ -103,6 +103,12 @@ pub struct App {
     glyph_atlas: GlyphAtlas,
     /// 每窗口「图集已同步到的 `scale_epoch`」（DPI 变化 ⇒ 图集换代）。
     scale_epochs: ahash::HashMap<WindowId, u32>,
+    /// 已按其重绘过文本的图集代际（P1-2.6）。
+    ///
+    /// 图集是进程级共享的：任一窗口 DPI 变化或字形容量逃逸都会让 `generation` 递增、
+    /// 页内所有 tile 重排。文本 lane 里存的是旧 `AtlasTile`（旧 UV），所以代际一变就必须
+    /// 让**所有窗口**的文本节点重绘；否则画的是旧 UV（错字/花字）。
+    atlas_generation_seen: u32,
     /// 累积的图集脏行（P09 的增量上传输入；`layout_text` 合并、上传后清空）。
     pending_dirty: crate::render::DirtyRows,
     /// 字形页整页缓冲上次按哪个页尺寸重建（`None` = 还没建 / 刚清空）。
@@ -340,6 +346,7 @@ impl App {
             geometry: crate::paint::geometry_store::GeometryStore::new(),
             glyph_atlas: GlyphAtlas::new(),
             scale_epochs: ahash::HashMap::default(),
+            atlas_generation_seen: 0,
             pending_dirty: crate::render::DirtyRows::default(),
             glyph_page_extent: None,
             glyph_page: Vec::new(),
@@ -2692,6 +2699,10 @@ impl App {
                 return None;
             }
         };
+        // P1-2.6：`refresh_text` 可能已让图集换代（DPI 变化 / 字形容量逃逸）。图集是进程级
+        // 共享的，页内 tile 已全部重排，而各窗口文本 lane 里存的是旧 `AtlasTile` —— 必须让
+        // **所有窗口**的文本节点重绘。放在 `layout_text` 之前：本帧就会用新 UV 重建 lane。
+        self.repaint_text_if_atlas_changed();
         let layout = match self.windows.get_mut(&window).map(Window::layout_if_dirty) {
             Some(Ok(report)) => report,
             Some(Err(error)) => {
@@ -3048,6 +3059,27 @@ impl App {
     }
 
     /// 所有窗口的文本节点标 `LAYOUT | PAINT` 并清 `node..root` 缓存。
+    /// 图集代际变化时让**所有窗口**的文本节点重绘（P1-2.6）。
+    ///
+    /// 图集换代（DPI 变化 / 字形扩容逃逸）会让页内所有 tile 重排，而每个文本 lane 里存的是
+    /// 生成时的 `AtlasTile`（旧 UV）。`set_text_line` 不标 `PAINT`，paint 的 lane 复用只看
+    /// `REUSABLE`/`clip_key`，于是旧 UV 被继续使用 —— 表现为错字/花字，且要等一次无关的
+    /// `PAINT` 才可能恢复。
+    ///
+    /// 只标 `PAINT` 不标 `LAYOUT`：换代不改变字形宽度与断行，重排是纯损失。
+    ///
+    /// 对照 Skia：glyph atlas / strike cache 换代时会让所有引用旧 strike 的绘制数据失效。
+    fn repaint_text_if_atlas_changed(&mut self) {
+        let generation = self.atlas.generation();
+        if generation == self.atlas_generation_seen {
+            return;
+        }
+        self.atlas_generation_seen = generation;
+        for window in self.windows.values_mut() {
+            window.tree_mut().mark_all_text_paint();
+        }
+    }
+
     fn invalidate_all_text(&mut self) {
         let ids: SmallVec<[WindowId; 4]> = self.windows.keys().copied().collect();
         for id in ids {
@@ -3463,6 +3495,75 @@ mod tests {
 
         assert_eq!(after, before + 1);
         assert!(app.refresh_text(window).is_some());
+    }
+
+    /// P1-2.6 回归：图集换代必须让**所有窗口**的文本节点重绘。
+    ///
+    /// 图集是进程级共享的，但文本 lane 里存的是生成时的 `AtlasTile`（旧 UV）。旧实现里
+    /// `set_text_line` 不标 `PAINT`，paint 的 lane 复用只看 `REUSABLE`/`clip_key` —— 于是
+    /// 窗口 A 改 DPI 让图集换代后，窗口 B 仍在使用旧 UV（错字/花字）。
+    #[test]
+    fn atlas_generation_change_repaints_text_in_every_window() {
+        let (_rt, mut app, window_a, node_a) = text_app("alpha", None);
+        // 第二个窗口：同样的文本节点，但一直不出帧 —— 它的 lane 会保留旧 AtlasTile。
+        let window_b = app.create_window(WindowOptions::default());
+        let node_b = {
+            let tree = app.window_mut(window_b).expect("窗口存在").tree_mut();
+            let root = tree.root();
+            NodeBuilder::text("beta", crate::text::TextStyle::new(16.0))
+                .build(tree, root)
+                .expect("挂载")
+        };
+
+        // 两个窗口都完成一次 shape + layout（建立各自的文本 lane / ShapedLine）。
+        for window in [window_a, window_b] {
+            let _ = refresh(&mut app, window);
+            let _ = layout(&mut app, window);
+            let _ = text_layout(&mut app, window);
+        }
+        let generation_before = app
+            .window(window_b)
+            .expect("窗口存在")
+            .tree()
+            .text_line(node_b)
+            .expect("快照存在")
+            .atlas_generation;
+
+        // 窗口 A 改 DPI ⇒ 全局图集换代。
+        app.window_mut(window_a)
+            .expect("窗口存在")
+            .set_scale(crate::math::Scale::new(2.0).expect("finite scale"));
+        let _ = refresh(&mut app, window_a);
+        let _ = layout(&mut app, window_a);
+        let _ = text_layout(&mut app, window_a);
+        let generation_after = app
+            .window(window_a)
+            .expect("窗口存在")
+            .tree()
+            .text_line(node_a)
+            .expect("快照存在")
+            .atlas_generation;
+        assert!(
+            generation_after > generation_before,
+            "DPI change must bump the global atlas generation"
+        );
+
+        // 关键断言：窗口 B 的文本节点必须已被标 PAINT，从而在下一帧重建 lane（新 UV）。
+        let dirty_b = app
+            .window(window_b)
+            .expect("窗口存在")
+            .tree()
+            .get(node_b)
+            .expect("节点存在")
+            .dirty();
+        assert!(
+            dirty_b.contains(crate::node::dirty::DirtyFlags::PAINT),
+            "图集换代后，其它窗口的文本节点必须被标 PAINT（否则继续用旧 UV）：{dirty_b:?}"
+        );
+        assert!(
+            !dirty_b.contains(crate::node::dirty::DirtyFlags::LAYOUT),
+            "换代不改变断行，不应触发重排：{dirty_b:?}"
+        );
     }
 
     #[test]

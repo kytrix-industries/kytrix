@@ -1566,6 +1566,35 @@ impl NodeTree {
         self.mark_paint(node)
     }
 
+    /// 把所有文本节点标 `PAINT`（**不动** `LAYOUT`），P1-2.6。
+    ///
+    /// 用途：字形图集是**进程级**共享的，任一窗口的 DPI 变化或容量逃逸都会让
+    /// `AtlasAllocator::generation` 递增、页内所有 tile 重排。此时每个窗口文本节点的
+    /// `ShapedLine` 里存的是旧 `AtlasTile`（旧 UV），而 paint 的 lane 复用只认
+    /// `REUSABLE`/`clip_key` —— 不标 `PAINT` 就会继续画旧 UV，表现为错字/花字。
+    ///
+    /// 只标 `PAINT` 不标 `LAYOUT`：图集换代不改变字形宽度/行数，不需要重排（重排是纯损失）。
+    /// 返回被标记的节点数（诊断 / 测试）。
+    pub(crate) fn mark_all_text_paint(&mut self) -> usize {
+        let nodes: SmallVec<[NodeId; 32]> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|node| {
+                self.arena
+                    .get(*node)
+                    .is_some_and(|t| t.kind.text().is_some())
+            })
+            .collect();
+        let mut marked = 0;
+        for node in nodes {
+            if self.mark_paint(node) {
+                marked += 1;
+            }
+        }
+        marked
+    }
+
     /// 一次布局运行：`compute_root_layout` → 绝对坐标 post-pass → 错误面。
     ///
     /// 消费者：`Window::compute_layout`（唯一调用点）。
