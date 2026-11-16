@@ -392,33 +392,61 @@ mod tests {
         let mut queue = Queue::new(&device).expect("queue");
         let mut atlas = AtlasTextures::new(&mut device).expect("atlas");
 
-        // 第 1 帧：第 5 行 = 不透明深蓝。
-        let mut first_page = page();
-        fill_row(&mut first_page, 5, [0x11, 0x22, 0x33, 0xFF]);
-        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, first_page, rows(5, 6));
-        let (slot1, command1) = queue.begin().expect("command 1");
+        // 第 1 帧：整页上传（新页必须整页，DEVIATIONS F-211），内容全零。
+        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, page(), rows(0, u32::MAX));
+        let (slot_full, command_full) = queue.begin().expect("command full");
         atlas
             .prepare(&mut device, &mut queue, FrameIndex::from_raw(1))
+            .expect("prepare full");
+        {
+            let blit = command_full
+                .blitCommandEncoder()
+                .expect("blit encoder full");
+            atlas
+                .record_uploads(&mut device, &mut queue, FrameIndex::from_raw(1), &blit)
+                .expect("record full");
+            blit.endEncoding();
+        }
+        queue
+            .submit_blocking(
+                FrameIndex::from_raw(1),
+                slot_full,
+                &command_full,
+                &mut device,
+            )
+            .expect("submit full");
+        assert_eq!(queue.retired_handles(), 0, "整页上传完成后 staging 已释放");
+
+        // 第 2 帧：第 5 行 = 不透明深蓝（打包的 1 行）。
+        let mut first_page = page();
+        fill_row(&mut first_page, 5, [0x11, 0x22, 0x33, 0xFF]);
+        let first_row = first_page[5 * TEST_PAGE as usize * 4..6 * TEST_PAGE as usize * 4].to_vec();
+        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, first_row, rows(5, 6));
+        let (slot1, command1) = queue.begin().expect("command 1");
+        atlas
+            .prepare(&mut device, &mut queue, FrameIndex::from_raw(2))
             .expect("prepare frame 1");
         {
             let blit = command1.blitCommandEncoder().expect("blit encoder 1");
             atlas
-                .record_uploads(&mut device, &mut queue, FrameIndex::from_raw(1), &blit)
+                .record_uploads(&mut device, &mut queue, FrameIndex::from_raw(2), &blit)
                 .expect("record frame 1");
             blit.endEncoding();
         }
-        // 第 2 帧：第 7 行 = 不透明橙。第 1 帧还没提交/完成。
+        // 第 3 帧：第 7 行 = 不透明橙。第 2 帧还没提交/完成。
         let mut second_page = page();
         fill_row(&mut second_page, 7, [0x44, 0x55, 0x66, 0xFF]);
-        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, second_page, rows(7, 8));
+        let second_row =
+            second_page[7 * TEST_PAGE as usize * 4..8 * TEST_PAGE as usize * 4].to_vec();
+        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, second_row, rows(7, 8));
         let (slot2, command2) = queue.begin().expect("command 2");
         atlas
-            .prepare(&mut device, &mut queue, FrameIndex::from_raw(2))
+            .prepare(&mut device, &mut queue, FrameIndex::from_raw(3))
             .expect("prepare frame 2");
         {
             let blit = command2.blitCommandEncoder().expect("blit encoder 2");
             atlas
-                .record_uploads(&mut device, &mut queue, FrameIndex::from_raw(2), &blit)
+                .record_uploads(&mut device, &mut queue, FrameIndex::from_raw(3), &blit)
                 .expect("record frame 2");
             blit.endEncoding();
         }
@@ -428,9 +456,9 @@ mod tests {
             "每次上传各自一块一次性 staging，两帧都在飞时两块都不得释放"
         );
 
-        // 第 1 帧完成：只释放它自己的 staging。
+        // 第 2 帧完成：只释放它自己的 staging。
         queue
-            .submit_blocking(FrameIndex::from_raw(1), slot1, &command1, &mut device)
+            .submit_blocking(FrameIndex::from_raw(2), slot1, &command1, &mut device)
             .expect("submit frame 1");
         assert_eq!(
             queue.retired_handles(),
@@ -438,7 +466,7 @@ mod tests {
             "第 2 帧的 staging 必须活到第 2 帧完成"
         );
         queue
-            .submit_blocking(FrameIndex::from_raw(2), slot2, &command2, &mut device)
+            .submit_blocking(FrameIndex::from_raw(3), slot2, &command2, &mut device)
             .expect("submit frame 2");
         assert_eq!(queue.retired_handles(), 0, "两帧都完成后不得残留句柄");
 
@@ -456,14 +484,14 @@ mod tests {
         assert_eq!(read_row(&image, 6), [0, 0, 0, 0], "未上传的行保持原样");
     }
 
-    /// 页尺寸断言（DEVIATIONS S-153）：长度不是 `page² × texel` 的上传是上游契约破坏。
+    /// 载荷长度断言（DEVIATIONS F-211）：`pixels.len()` 必须等于 `行数 × page × texel`。
     #[test]
-    #[should_panic(expected = "is not square")]
-    fn an_upload_must_carry_a_full_page() {
+    #[should_panic(expected = "atlas payload size mismatch")]
+    fn a_short_payload_is_rejected() {
         let mut device = Device::new().expect("metal device");
         let mut atlas = AtlasTextures::new(&mut device).expect("atlas");
         let mut short = page();
-        // 20 字节 = 5 个 BGRA 纹素 ⇒ 不是平方数页。
+        // 20 字节 ≠ 1 行 × 16 × 4。
         short.truncate(20);
         atlas.queue_upload(AtlasKind::Image, TEST_PAGE, short, rows(0, 1));
     }

@@ -823,27 +823,42 @@ mod tests {
         let pool = command_pool(&device);
         let commands = allocate(&device, pool, 2);
 
-        // 第 1 帧：第 5 行 = 不透明深蓝（BGRA）。先只录制，不提交。
-        let mut first_page = page();
-        fill_row(&mut first_page, 5, [0x11, 0x22, 0x33, 0xFF]);
-        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, first_page, rows(5, 6));
+        // 第 1 帧：整页上传（新页必须整页，DEVIATIONS F-211），内容全零。
+        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, page(), rows(0, u32::MAX));
         begin(&device, commands[0]);
-        atlas.prepare(&mut device).expect("prepare frame 1");
+        atlas.prepare(&mut device).expect("prepare full");
         atlas
             .record_uploads(&mut device, FrameIndex::from_raw(1), commands[0])
-            .expect("record frame 1");
+            .expect("record full");
+        end(&device, commands[0]);
+        submit_and_wait(&device, commands[0]);
+        assert_eq!(device.drain_retire(FrameIndex::from_raw(1)), 2);
+        assert_eq!(device.pending_retired(), 0);
+
+        // 第 2 帧：第 5 行 = 不透明深蓝（BGRA，打包的 1 行）。先只录制，不提交。
+        let mut first_page = page();
+        fill_row(&mut first_page, 5, [0x11, 0x22, 0x33, 0xFF]);
+        let first_row = first_page[5 * TEST_PAGE as usize * 4..6 * TEST_PAGE as usize * 4].to_vec();
+        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, first_row, rows(5, 6));
+        begin(&device, commands[0]);
+        atlas.prepare(&mut device).expect("prepare frame 2");
+        atlas
+            .record_uploads(&mut device, FrameIndex::from_raw(2), commands[0])
+            .expect("record frame 2");
         end(&device, commands[0]);
 
-        // 第 2 帧：**同一行** = 不透明橙。第 1 帧还没提交/完成：旧实现会在这里覆盖第 1 帧
+        // 第 3 帧：**同一行** = 不透明橙。第 2 帧还没提交/完成：旧实现会在这里覆盖第 2 帧
         // staging 里的字节。
         let mut second_page = page();
         fill_row(&mut second_page, 5, [0x44, 0x55, 0x66, 0xFF]);
-        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, second_page, rows(5, 6));
+        let second_row =
+            second_page[5 * TEST_PAGE as usize * 4..6 * TEST_PAGE as usize * 4].to_vec();
+        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, second_row, rows(5, 6));
         begin(&device, commands[1]);
-        atlas.prepare(&mut device).expect("prepare frame 2");
+        atlas.prepare(&mut device).expect("prepare frame 3");
         atlas
-            .record_uploads(&mut device, FrameIndex::from_raw(2), commands[1])
-            .expect("record frame 2");
+            .record_uploads(&mut device, FrameIndex::from_raw(3), commands[1])
+            .expect("record frame 3");
         end(&device, commands[1]);
 
         // 第 1 帧完成：它写进第 5 行的必须是**自己的**深蓝，而不是第 2 帧的橙。旧实现（两张页
@@ -863,14 +878,14 @@ mod tests {
         );
         // 只释放第 1 帧自己的 staging：第 2 帧还没提交，完成前沿到不了它。
         assert_eq!(
-            device.drain_retire(FrameIndex::from_raw(1)),
+            device.drain_retire(FrameIndex::from_raw(2)),
             2,
-            "第 1 帧只释放自己的 buffer + memory"
+            "第 2 帧只释放自己的 buffer + memory"
         );
         assert_eq!(
             device.pending_retired(),
             2,
-            "第 2 帧的 staging 必须活到第 2 帧完成"
+            "第 3 帧的 staging 必须活到第 3 帧完成"
         );
 
         // 第 2 帧完成：后一帧覆盖前一帧，之后再释放它的 staging。
@@ -880,7 +895,7 @@ mod tests {
             [0x44, 0x55, 0x66, 0xFF],
             "后一帧的像素覆盖前一帧"
         );
-        assert_eq!(device.drain_retire(FrameIndex::from_raw(2)), 2);
+        assert_eq!(device.drain_retire(FrameIndex::from_raw(3)), 2);
         assert_eq!(device.pending_retired(), 0, "两帧都完成后不得残留句柄");
         assert_eq!(
             read_row(&device, pool, atlas.image.image, 6),
@@ -907,23 +922,23 @@ mod tests {
         let pool = command_pool(&device);
         let commands = allocate(&device, pool, 2);
 
-        // 第 1 帧真正提交并完成：`last_index` 推进到 1。
-        let mut first_page = page();
-        fill_row(&mut first_page, 5, [0x11, 0x22, 0x33, 0xFF]);
-        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, first_page, rows(5, 6));
+        // 第 1 帧：整页上传并完成：`last_index` 推进到 1。
+        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, page(), rows(0, u32::MAX));
         begin(&device, commands[0]);
-        atlas.prepare(&mut device).expect("prepare frame 1");
+        atlas.prepare(&mut device).expect("prepare full");
         atlas
             .record_uploads(&mut device, FrameIndex::from_raw(1), commands[0])
-            .expect("record frame 1");
+            .expect("record full");
         end(&device, commands[0]);
         submit_and_wait(&device, commands[0]);
         assert_eq!(device.drain_retire(FrameIndex::from_raw(1)), 2);
 
-        // 第 2 帧：staging 已 retire 在序号 2，但录制随后的失败让这一帧从未 submit。
-        let mut second_page = page();
-        fill_row(&mut second_page, 5, [0x44, 0x55, 0x66, 0xFF]);
-        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, second_page, rows(5, 6));
+        // 第 2 帧：增量（第 5 行）的 staging 已 retire 在序号 2，但录制随后的失败让这一帧从未
+        // submit。
+        let mut first_page = page();
+        fill_row(&mut first_page, 5, [0x11, 0x22, 0x33, 0xFF]);
+        let first_row = first_page[5 * TEST_PAGE as usize * 4..6 * TEST_PAGE as usize * 4].to_vec();
+        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, first_row, rows(5, 6));
         begin(&device, commands[1]);
         atlas.prepare(&mut device).expect("prepare frame 2");
         atlas
