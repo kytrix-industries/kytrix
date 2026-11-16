@@ -164,6 +164,12 @@ pub struct App {
     /// 待推给平台的捕获请求（`Some(true)` = 取得、`Some(false)` = 释放）。
     /// 待推给平台的**指针捕获请求**（带窗口 id：SetCapture 是每窗口状态，复审 P1-3）。
     capture_request: Option<(WindowId, bool)>,
+    /// IME 被应用**禁用**的窗口集合（P2-7；默认启用）。
+    ///
+    /// 按窗口的**目标状态**：平台泵每轮把它与本窗口已应用状态比较，只有变化才调
+    /// `ImmAssociateContext`（Windows）。用集合而不是单槽：一轮内多个窗口各自关一次 IME
+    /// 时单槽会丢请求。
+    ime_disabled: ahash::HashSet<WindowId>,
     /// 待执行的 Linux 客户端装饰窗口控制（自绘标题栏的按钮 / 拖动）。
     #[cfg(target_os = "linux")]
     window_control: Option<(WindowId, crate::window::WindowControl)>,
@@ -387,6 +393,7 @@ impl App {
             next_animation: 1,
             cursor_pending: None,
             capture_request: None,
+            ime_disabled: ahash::HashSet::default(),
             #[cfg(target_os = "linux")]
             window_control: None,
             a11y_handlers: ahash::HashMap::default(),
@@ -1538,6 +1545,38 @@ impl App {
         }
     }
 
+    /// 启用/禁用某个窗口的输入法（IME，P2-7）。
+    ///
+    /// 禁用后该窗口不再接收 IME 组合输入：Windows 平台在下一轮泵里对窗口调用
+    /// `ImmAssociateContext(hwnd, None)` 把输入上下文摘下来（旧 `HIMC` 由平台保存），字母/
+    /// 数字键因此作为普通 `WM_KEYDOWN` 到达应用；重新启用时恢复保存的上下文（禁用时窗口
+    /// 本来就没有上下文则让系统关联默认上下文）。窗口销毁前平台会自动恢复关联，`HIMC`
+    /// 不会泄漏。
+    ///
+    /// 典型用途：自绘搜索框的「英文直输」模式、只接受快捷键的图表/表格区 —— 用户开着
+    /// 中文/日文输入法时，字母键不会被 IME 变成组合输入。
+    ///
+    /// 这是**每窗口**的目标状态，默认启用；状态变化不标脏、不请求重绘，只在变化时唤醒
+    /// 平台事件循环。窗口不存在时是 no-op。
+    ///
+    /// 若调用时该窗口正在 IME 组合中，禁用会直接丢弃组合（不补发 `ImeEvent::End`）：
+    /// 调用方应在关闭 IME 的同时自己清空 preedit 状态。
+    ///
+    /// 平台支持：目前只有 Windows 落实（macOS / Linux 保持系统默认 IME 行为）。
+    pub fn set_ime_enabled(&mut self, window: WindowId, enabled: bool) {
+        if !self.windows.contains_key(&window) {
+            return;
+        }
+        let changed = if enabled {
+            self.ime_disabled.remove(&window)
+        } else {
+            self.ime_disabled.insert(window)
+        };
+        if changed {
+            self.dispatcher.wake();
+        }
+    }
+
     /// 当前 IME caret hint 对应的窗口客户区逻辑矩形（P16）。
     ///
     /// `Ok(None)` = 没有设置 hint；`Err(TextShape)` = 已设置但文本尚未 shape / 文本变化，
@@ -2440,6 +2479,15 @@ impl App {
         self.capture_request.take()
     }
 
+    /// 本窗口的 IME 目标状态（Windows 平台泵每轮读它与已应用状态比较，P2-7）。
+    ///
+    /// 只在 Windows 平台层消费，因此按平台门控：其它平台的 `set_ime_enabled` 只记录状态，
+    /// 没有读取方（也就不会出现 dead_code 警告）。
+    #[cfg(target_os = "windows")]
+    pub(crate) fn ime_enabled(&self, window: WindowId) -> bool {
+        !self.ime_disabled.contains(&window)
+    }
+
     // ── 窗口 ──────────────────────────────────────────────────────────────────
 
     /// 建一个窗口（headless：只建树与空场景）。`WindowId` 从 **1** 起单调 +1、永不复用
@@ -2511,6 +2559,9 @@ impl App {
         self.close_handlers.remove(&id);
         self.a11y_delivered.remove(&id);
         self.scale_epochs.remove(&id);
+        // 平台 IME 目标状态：窗口没了就没有「已应用状态」可对齐，留着只会在 create/close
+        // 循环下无界增长（WindowId 不复用，不会串到新窗口）。
+        self.ime_disabled.remove(&id);
         // 动画槽引用窗口内的节点与瞬态值：窗口关闭时必须一并清掉（否则 `SetTimer` 永不停）。
         self.animations.retain(|slot| slot.window != id);
         #[cfg(feature = "hud")]
@@ -6992,6 +7043,32 @@ mod interaction_tests {
             .scroll_to(&handle, Point::new(0.0, 10.0))
             .expect_err("节点已卸载");
         assert!(matches!(error, EngineError::StaleNode { node } if node == container));
+    }
+
+    /// P2-7：IME 启用状态是**每窗口**目标状态，默认启用；关窗时从旁表清掉。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn ime_enabled_is_per_window_and_cleared_with_the_window() {
+        let (_rt, mut app, window) = setup();
+        let other = app.create_window(WindowOptions::default());
+        assert!(app.ime_enabled(window), "默认启用");
+        assert!(app.ime_enabled(other), "默认启用");
+
+        app.set_ime_enabled(window, false);
+        assert!(!app.ime_enabled(window), "只禁用目标窗口");
+        assert!(app.ime_enabled(other), "其它窗口不受影响");
+
+        app.set_ime_enabled(window, true);
+        assert!(app.ime_enabled(window), "可以重新启用");
+
+        app.set_ime_enabled(other, false);
+        assert!(app.close_window(other));
+        assert!(
+            !app.ime_disabled.contains(&other),
+            "关窗必须清掉 IME 旁表，否则 create/close 循环无界增长"
+        );
+        let third = app.create_window(WindowOptions::default());
+        assert!(app.ime_enabled(third), "新窗口默认启用");
     }
 }
 

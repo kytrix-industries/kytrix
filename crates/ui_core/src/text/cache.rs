@@ -2,6 +2,11 @@
 //!
 //! 设计见 `design/phase-05-text.md` §11。键**不含** `atlas_generation`（F-53）：图集换代只影响
 //! 字形的 `AtlasTile`，不影响字形 id / advance / 基线 / 行数。
+//!
+//! 键也**不含水平亚像素相位**（P2-2）：相位是 `rasterize` 阶段由最终布局坐标派生的量化值
+//! （`raster::split_subpixel_x`），不是 shape 的输入。同一条 `ShapedText` + 同一内容宽重排出的
+//! 字形位置逐位相同 ⇒ 相位相同；`layout_text` 只在内容宽或图集代际变化时重建 `ShapedLine`，
+//! 相位随该快照一起失效。
 
 use std::{
     collections::VecDeque,

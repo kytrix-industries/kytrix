@@ -12,6 +12,24 @@
 //! 公开路径因此是 `ui_core::text::{TextStyle, FontStack, InlineBoxSpec, ShapedLine, …}`
 //! （`design/phase-05-text.md` §4.1）。文本的**引擎**（字体库/图集/光栅）在 `App` 内部，
 //! 应用层通过 `App::{refresh_text, set_font_stack, …}` 使用，见 §6.1。
+//!
+//! # 字形定位与 hinting（复审 P2-2，方案 A）
+//!
+//! 光栅策略按 Skia/Chrome 的 UI 文本默认：**水平亚像素定位开、hinting 关**。实现与开关都在
+//! `text/raster.rs`：`SUBPIXEL_PHASES = 4`（1/4 px 相位）、`HINTING = false`。
+//!
+//! - **收益**：parley 的落点与 advance 是小数物理像素；旧实现把每个字形 `round` 到整像素并按
+//!   整数 ppem 全 hinting，非整数 DPI（125%/150%）下字形内部笔画与字间 advance 不一致，长数字
+//!   列会出现字距跳动/个别字形重叠。现在 x 吸附到最近的 1/4 px 相位（误差 ≤ 1/8 px），位图按
+//!   该相位光栅；关闭 hinting 后不再按整数 ppem 重排笔画，CJK 也不会被横向挤压。
+//! - **代价**：`GlyphKey` 多出 `subpixel_x` 相位维（最多 4 档），同一字形可能占 1–4 个 tile，
+//!   图集命中率下降、容量最多约 4×（512→1024→2048 的阶梯扩容兜底，但可能提前触发一次整页
+//!   换代）；小 ppem（≤ 16）关闭 hinting 后笔画略软。
+//! - **回退**：把 `raster::SUBPIXEL_PHASES` 改为 `1`（整像素定位）或 `raster::HINTING` 改为
+//!   `true`（旧的全 hinting）。两者都是编译期常量，改完字形图集自然换代，不需要 migration。
+//! - **整数 DPI**：ppem 仍按设备 scale 取整（与旧实现同一个值），advance/行高/断行完全来自
+//!   parley，不受本改动影响；整数 DPI（1x/2x）下不会出现字距/位置跳动，视觉差异仅限关闭
+//!   hinting 带来的抗锯齿细节（方案 A 的预期取舍）。
 
 use core::ops::Range;
 
@@ -633,6 +651,9 @@ pub struct ShapedGlyphRun {
     /// 该 run 覆盖的源文本字节区间。
     pub text_range: Range<usize>,
     /// 已定位且已装箱的字形（顺序 = 绘制顺序）。
+    ///
+    /// 水平亚像素相位已经烘进位图与 tile 落点，这里的位置/尺寸乘 `ShapedLine::scale` 后恒为
+    /// 整数物理像素（见模块文档「字形定位与 hinting」）。
     pub glyphs: Vec<PositionedGlyph>,
 }
 

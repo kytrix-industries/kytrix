@@ -3,6 +3,8 @@
 //! [`ShapedText`] 是一次 shape 的**不可变快照**（parley `Layout` + 内容宽），被 `Rc` 共享：
 //! - measure：`clone()` 后 `break_all_lines` + `align`（宽度变化不重建 `Layout`）；
 //! - 光栅：遍历 `positioned_glyphs()`，按 run 的字体光栅并装箱，产出 [`ShapedLine`]。
+//!   parley 的落点是小数物理坐标；光栅阶段把 x 拆成「整数基准 + 1/4 px 相位」
+//!   （`raster::split_subpixel_x`）后交给字形图集，y 仍按整像素基线。
 
 use std::borrow::Cow;
 
@@ -20,7 +22,7 @@ use super::{
     TextAlign, TextContent, TextDiagnostic, TextDirection, TextSlant, TextStyle, TextWrap,
     atlas::{GlyphAtlas, GlyphAtlasStats},
     inline_flow,
-    raster::GlyphRasterizer,
+    raster::{GlyphRasterizer, split_subpixel_x},
 };
 use crate::{
     error::EngineError,
@@ -259,6 +261,10 @@ impl ShapedText {
 
     /// 光栅 + 装箱，产出只读快照。
     ///
+    /// 水平落点按 1/4 px 相位量化后光栅（`raster`），`ShapedGlyphRun::glyphs[].position` 仍是
+    /// **整数物理像素**：相位已经烘进位图与 `placement.left`，绘制侧不需要再做亚像素变换。
+    /// y 方向继续整像素对齐（水平排版不需要竖直亚像素定位）。
+    ///
     /// `generation` 是当前字形图集的代际（写进 `ShapedLine`，供 P06 判 stale）。
     pub(crate) fn rasterize(
         &self,
@@ -293,6 +299,8 @@ impl ShapedText {
                     PositionedLayoutItem::GlyphRun(run) => {
                         let font = run.run().font().clone();
                         // parley 的 `Run::font_size()` **已是物理值**（B2：不能再乘 scale）。
+                        // ppem 仍取整：本方案只改「定位相位 + 抗锯齿策略」，不改光栅尺寸；
+                        // 落点的小数部分由 `split_subpixel_x` 吸收。
                         let ppem = run.run().font_size().round().clamp(1.0, 512.0);
                         let text_range = run.run().text_range();
                         let color = run.style().brush.color;
@@ -326,19 +334,25 @@ impl ShapedText {
                                 });
                                 continue;
                             }
+                            // 水平亚像素定位（P2-2）：parley 的落点是小数物理坐标，拆成
+                            // 「整数基准 + 1/4 px 相位桶」。位图按相位光栅，绘制落点仍是
+                            // `base + placement.left` 的整数物理像素 —— 相位已烘进位图，
+                            // 不会再被 `Rect::to_physical` 二次取整掉。
+                            let (base_x, subpixel_x) = split_subpixel_x(glyph.x);
                             let tile = glyph_atlas.ensure(
                                 raster,
                                 atlas,
                                 &font,
                                 glyph.id,
                                 ppem,
+                                subpixel_x,
                                 Some(&variation),
                             )?;
                             let Some(tile) = tile else {
                                 // 空白/无轮廓：不产生像素，advance 已由 parley 推进。
                                 continue;
                             };
-                            let origin_x = glyph.x.round() + tile.left as f32;
+                            let origin_x = base_x + tile.left as f32;
                             let origin_y = glyph.y.round() - tile.top as f32;
                             glyphs.push(PositionedGlyph {
                                 tile: tile.tile,
@@ -506,6 +520,18 @@ mod tests {
             width: None,
             height: None,
         }
+    }
+
+    /// 取第一行第一个有覆盖度的字形的 tile（亚像素相位端到端断言用）。
+    fn first_glyph_tile(line: &crate::text::ShapedLine) -> crate::paint::atlas::AtlasTile {
+        line.lines[0]
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ShapedTextItem::GlyphRun(run) => run.glyphs.first().map(|glyph| glyph.tile),
+                ShapedTextItem::InlineBox(_) => None,
+            })
+            .expect("the first item must be a glyph with coverage")
     }
 
     #[test]
@@ -838,8 +864,129 @@ mod tests {
                 (physical - physical.round()).abs() < 1e-3,
                 "scale * size must be integral, got {physical}"
             );
+            let physical_x = glyph.position.x * line.scale;
+            assert!(
+                (physical_x - physical_x.round()).abs() < 1e-3,
+                "亚像素相位必须烘进位图，落点仍是整数物理像素（否则会被 to_physical 二次取整）：{physical_x}"
+            );
         }
         assert_eq!(stats.rasters, run.glyphs.len());
+    }
+
+    /// P2-2 端到端：同一字形只因水平落点差 0.4 px，就必须命中不同的图集 tile。
+    ///
+    /// 这是「`shape.rs` 把相位传进 `GlyphAtlas::ensure`」的回归测试：只改 `raster.rs`/`atlas.rs`
+    /// 而漏传相位时，两处布局会复用同一 tile，此处失败。
+    #[test]
+    fn subpixel_phase_reaches_the_glyph_atlas() {
+        if crate::text::raster::probe_font().is_none() {
+            eprintln!("skip: no system font available");
+            return;
+        }
+        let mut harness = Harness::new();
+        let centered = TextStyle::new(16.0).with_alignment(crate::text::TextAlign::Center);
+        let shaped = harness.shape("R", centered);
+
+        // 居中布局：内容宽 +0.8 px ⇒ 首字形 x +0.4 px（scale=1，逻辑=物理）。
+        let (left_width, right_width) = (200.0f32, 200.8f32);
+        let left_x = shaped.first_glyph_x_at(left_width);
+        let right_x = shaped.first_glyph_x_at(right_width);
+        assert!(
+            (right_x - left_x - 0.4).abs() < 0.01,
+            "precondition: 居中偏移必须线性移动 0.4 px（{left_x} → {right_x}）"
+        );
+        assert_ne!(
+            crate::text::raster::split_subpixel_x(left_x).1,
+            crate::text::raster::split_subpixel_x(right_x).1,
+            "precondition: 0.4 px 的位移必须换到不同相位桶"
+        );
+
+        let mut raster = crate::text::raster::GlyphRasterizer::new();
+        let mut glyphs = crate::text::atlas::GlyphAtlas::new();
+        let mut atlas = crate::render::atlas::AtlasAllocator::with_page(
+            crate::paint::atlas::AtlasKind::Glyph,
+            (512, 512),
+        );
+        let generation = atlas.generation();
+        let (left, _, _) = shaped
+            .rasterize(
+                &shaped.layout_at(left_width),
+                left_width,
+                &mut raster,
+                &mut glyphs,
+                &mut atlas,
+                generation,
+            )
+            .expect("left layout must rasterize");
+        let (right, _, _) = shaped
+            .rasterize(
+                &shaped.layout_at(right_width),
+                right_width,
+                &mut raster,
+                &mut glyphs,
+                &mut atlas,
+                generation,
+            )
+            .expect("right layout must rasterize");
+
+        assert_ne!(
+            first_glyph_tile(&left).uv(),
+            first_glyph_tile(&right).uv(),
+            "0.4 px 的亚像素位移必须产生不同 tile（相位必须进入 GlyphKey）"
+        );
+    }
+
+    /// P2-2：亚像素定位只影响位图与落点相位，不得改变 shape/measure 的度量。
+    ///
+    /// 回归：若有人把相位写进布局坐标（自己累加 x 而不用 parley 的 advance），advance 总和会与
+    /// `layout.width()` 不一致，数字列/断行立刻漂移。
+    #[test]
+    fn subpixel_positioning_does_not_change_advances() {
+        let mut harness = Harness::new();
+        let shaped = harness.shape("0123456789", TextStyle::new(16.0));
+        let layout = shaped.layout();
+        let layout_width = layout.width();
+        let layout_advance = layout
+            .lines()
+            .next()
+            .expect("single line")
+            .metrics()
+            .advance;
+
+        let mut raster = crate::text::raster::GlyphRasterizer::new();
+        let mut glyphs = crate::text::atlas::GlyphAtlas::new();
+        let mut atlas = crate::render::atlas::AtlasAllocator::with_page(
+            crate::paint::atlas::AtlasKind::Glyph,
+            (512, 512),
+        );
+        let generation = atlas.generation();
+        let (line, diagnostics, _) = shaped
+            .rasterize(
+                layout,
+                shaped.widths().max,
+                &mut raster,
+                &mut glyphs,
+                &mut atlas,
+                generation,
+            )
+            .expect("rasterize must not fail");
+        assert!(
+            diagnostics.is_empty(),
+            "digits must not produce diagnostics"
+        );
+
+        assert_eq!(line.width, layout_width, "内容宽必须等于 parley 布局宽");
+        assert_eq!(line.lines.len(), 1);
+        assert_eq!(line.lines[0].advance, layout_advance);
+        let total_advance: f32 = line.lines.iter().map(|line| line.advance).sum();
+        assert!(
+            (total_advance - layout_width).abs() < 1e-3,
+            "亚像素定位不得改变 advance 总和：{total_advance} vs {layout_width}"
+        );
+        assert!(
+            (shaped.widths().max - layout_width).abs() < 1e-3,
+            "形状快照的内容宽也必须与布局宽一致"
+        );
     }
 
     #[test]

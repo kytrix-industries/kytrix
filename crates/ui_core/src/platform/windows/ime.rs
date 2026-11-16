@@ -3,6 +3,10 @@
 //! 事件通路负责组合开始/更新/结束与 `GCS_RESULTSTR` 提交；P16 增加 caret 区域到
 //! `ImmSetCompositionWindow` + `ImmSetCandidateWindow` 的定位通路，不再使用最后指针位置。
 //! probe 实测本机 `ImmGetContext` 返回有效 `HIMC`，两个 Set 函数与对应的 Get 回读均成功。
+//!
+//! 另有**应用可主动关闭 IME** 的通路（自绘搜索框的英文直输模式）：[`ImeState::set_enabled`]
+//! 用 `ImmAssociateContext(hwnd, NULL)` 把输入上下文从窗口上摘下来并保存旧 `HIMC`，
+//! 重新启用时还回去；禁用期间 `WndProc` 吞掉全部 `WM_IME_*`（见 `event_loop.rs`）。
 
 use smol_str::SmolStr;
 use windows::Win32::{
@@ -10,8 +14,9 @@ use windows::Win32::{
     UI::{
         Input::Ime::{
             CANDIDATEFORM, CFS_EXCLUDE, CFS_POINT, COMPOSITIONFORM, GCS_COMPSTR, GCS_RESULTSTR,
-            HIMC, IME_COMPOSITION_STRING, ImmGetCompositionStringW, ImmGetContext,
-            ImmReleaseContext, ImmSetCandidateWindow, ImmSetCompositionWindow,
+            HIMC, IACE_DEFAULT, IME_COMPOSITION_STRING, ImmAssociateContext, ImmAssociateContextEx,
+            ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext, ImmSetCandidateWindow,
+            ImmSetCompositionWindow,
         },
         WindowsAndMessaging::{WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION},
     },
@@ -20,12 +25,33 @@ use windows::Win32::{
 use crate::{event::ImeEvent, math::PhysicalRect};
 
 /// IME 组合状态（每个窗口一份，由 `WndProcState` 持有）。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ImeState {
     /// 上一次提交的字符数：随后到达的 `WM_CHAR` 要跳过，避免提交两次。
     suppress_chars: usize,
     /// 应用声明的 caret 区域（客户区物理像素）；`None` = 无 hint。
     cursor_area: Option<PhysicalRect>,
+    /// 应用是否要求本窗口启用 IME（默认启用）。
+    ///
+    /// `false` 时窗口的输入上下文已从 IMM32 上摘下：`WndProc` 吞掉全部 `WM_IME_*`，
+    /// 字母/数字键以普通 `WM_KEYDOWN` 到达应用（不再被 IME 变成 `VK_PROCESSKEY`）。
+    enabled: bool,
+    /// 禁用时 `ImmAssociateContext(hwnd, None)` 返回的旧上下文；重新启用 / 窗口销毁时还回去。
+    ///
+    /// IME 上下文由 IMM32 与窗口的关联管理：摘下来之后必须还回去，否则窗口销毁时系统
+    /// 看不到它，上下文会泄漏。禁用时窗口本来就没有上下文（返回 NULL）⇒ `None`。
+    saved_context: Option<HIMC>,
+}
+
+impl Default for ImeState {
+    fn default() -> Self {
+        Self {
+            suppress_chars: 0,
+            cursor_area: None,
+            enabled: true,
+            saved_context: None,
+        }
+    }
 }
 
 impl ImeState {
@@ -41,11 +67,21 @@ impl ImeState {
                 if flags & GCS_RESULTSTR.0 != 0 {
                     let text = composition_string(hwnd, GCS_RESULTSTR)?;
                     self.suppress_chars = text.chars().count();
-                    return Some(ImeEvent::Commit(text));
+                    return Some(ImeEvent::Commit {
+                        text,
+                        // WIN32 `GCS_RESULTSTR` 就是本次提交的完整串：IMM32 没有 AppKit
+                        // `replacementRange` 那种「只替换组合串的一段」的区间信息，
+                        // `None` = 替换整个当前组合串（与 `GCS_COMPSTR` 的全量语义一致）。
+                        replace: None,
+                    });
                 }
                 if flags & GCS_COMPSTR.0 != 0 {
                     let text = composition_string(hwnd, GCS_COMPSTR).unwrap_or_default();
-                    return Some(ImeEvent::Preedit(text));
+                    return Some(ImeEvent::Preedit {
+                        text,
+                        // `GCS_COMPSTR` 是**完整**组合串（不是增量），所以整体替换。
+                        replace: None,
+                    });
                 }
                 None
             }
@@ -61,6 +97,63 @@ impl ImeState {
         }
         self.suppress_chars -= 1;
         true
+    }
+
+    /// 本窗口的 IME 当前是否启用（`WndProc` 据此吞掉 `WM_IME_*`）。
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// 应用目标状态与已应用状态不同时调用（泵每轮比较一次，P2-7）。
+    ///
+    /// 禁用：`ImmAssociateContext(hwnd, None)` 把输入上下文从窗口上摘下来。返回的旧 `HIMC`
+    /// 由本状态**保存**（它不会再被系统自动释放）；同时清掉未消费的 `WM_CHAR` 抑制计数 ——
+    /// 否则重新启用后第一次真实输入会被上一次提交的余数吞掉。
+    ///
+    /// 启用：把保存的上下文还回去。没有保存过（禁用时窗口本来就没有关联上下文）则用
+    /// `ImmAssociateContextEx(..., IACE_DEFAULT)` 让系统给窗口关联**默认**上下文。
+    ///
+    /// 两条分支都在 `wndproc_tests` 的隐藏窗口用例里跑过：返回值只用来记账，不重试。
+    pub(crate) fn set_enabled(&mut self, hwnd: HWND, enabled: bool) {
+        if enabled == self.enabled {
+            return;
+        }
+        // 先记账再动 IMM32：`ImmAssociateContext*` 会**同步**派发 `WM_IME_SETCONTEXT`
+        // （wParam = 上下文激活/失活），嵌套进入的 `WndProc` 必须看到新状态 —— 禁用期间
+        // 那条消息要被吞掉，否则默认过程可能把组合窗重新显示出来。
+        self.enabled = enabled;
+        // SAFETY: `hwnd` 由调用方保证是存活窗口；两个 API 只改「窗口 ↔ 输入上下文」的关联，
+        // 不持有 Rust 引用。`saved_context` 里的 HIMC 在恢复时原样还回，不二次释放。
+        unsafe {
+            if enabled {
+                match self.saved_context.take() {
+                    Some(context) => {
+                        let _ = ImmAssociateContext(hwnd, context);
+                    }
+                    None => {
+                        let _ = ImmAssociateContextEx(hwnd, HIMC::default(), IACE_DEFAULT);
+                    }
+                }
+            } else {
+                let previous = ImmAssociateContext(hwnd, HIMC::default());
+                self.saved_context = (!previous.is_invalid()).then_some(previous);
+                self.suppress_chars = 0;
+            }
+        }
+    }
+
+    /// 窗口销毁**之前**把摘下来的上下文还回去，让系统随窗口释放它（避免 `HIMC` 泄漏）。
+    ///
+    /// 必须在 `DestroyWindow` 之前、HWND 仍有效时调用。没有保存过上下文则无事可做：
+    /// 禁用时窗口本来就没有上下文，不存在本层拥有的句柄。
+    pub(crate) fn release_before_destroy(&mut self, hwnd: HWND) {
+        if let Some(context) = self.saved_context.take() {
+            // SAFETY: 同 `set_enabled`；`hwnd` 仍是存活窗口（调用方保证在 DestroyWindow 之前）。
+            unsafe {
+                let _ = ImmAssociateContext(hwnd, context);
+            }
+        }
+        self.enabled = true;
     }
 
     /// 保存并立刻应用 caret 区域（客户区物理像素）。

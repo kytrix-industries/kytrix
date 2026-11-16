@@ -43,14 +43,22 @@ impl ImeState {
             // 一次 `done` = 一批提交；批内的重复才吞掉（GNOME 的部分版本会重复发）。
             self.dedupe.begin_key();
             if self.dedupe.note(commit.as_str()) {
-                events.push(ImeEvent::Commit(SmolStr::new(commit)));
+                events.push(ImeEvent::Commit {
+                    text: SmolStr::new(commit),
+                    replace: None,
+                });
             }
         }
         if let Some(preedit) = self.pending_preedit.take() {
             match preedit {
                 Some(text) if !text.is_empty() => {
                     self.composing = true;
-                    events.push(ImeEvent::Preedit(SmolStr::new(text)));
+                    // `zwp_text_input_v3` 的 preedit 是整串替换，没有 AppKit 那种区间替换；
+                    // `delete_surrounding_text` 属于另一条通路，见 `surface.rs`。
+                    events.push(ImeEvent::Preedit {
+                        text: SmolStr::new(text),
+                        replace: None,
+                    });
                 }
                 _ => {
                     if self.composing {

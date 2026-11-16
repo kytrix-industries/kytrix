@@ -342,6 +342,22 @@ impl NativeWindow {
         }
     }
 
+    /// 同步 IME 启用状态到 IMM32（每轮泵调用；目标状态来自 `App::ime_enabled`）。
+    ///
+    /// 禁用时把输入上下文从窗口上摘下来（`ImmAssociateContext(hwnd, NULL)`），启用时还回去
+    /// （见 `platform/windows/ime.rs`）。状态切换会清空 `ime_area` 缓存：恢复的上下文可能是
+    /// 系统新建的默认上下文，之前写的组合/候选窗表单不保证还在，下一轮
+    /// [`Self::sync_ime_cursor_area`] 必须重发。
+    pub(crate) fn sync_ime_enabled(&mut self, app: &App) {
+        let enabled = app.ime_enabled(self.id);
+        if self.state_mut().ime_enabled() == enabled {
+            return;
+        }
+        let hwnd = self.hwnd;
+        self.state_mut().set_ime_enabled(hwnd, enabled);
+        self.ime_area = None;
+    }
+
     /// 窗口是否已被销毁（`close_requested_windows` 的 retain 判据）。
     pub(crate) fn is_destroyed(&self) -> bool {
         self.hwnd.is_invalid()
@@ -413,6 +429,10 @@ impl NativeWindow {
         if self.hwnd.is_invalid() {
             return;
         }
+        // 应用禁用 IME 时输入上下文被摘下来存在 `WndProcState` 里：窗口销毁时系统只释放
+        // **仍关联**在窗口上的上下文，必须先还回去，否则是 `HIMC` 泄漏（P2-7）。
+        let hwnd = self.hwnd;
+        self.state_mut().release_ime_before_destroy(hwnd);
         // 顺序（`design/DEVIATIONS.md` §36 F-204）：合成目标引用 HWND，必须**在 HWND 仍然存活时**把 visual 从
         // 窗口上摘下来并释放全部 DComp COM 对象（`SetRoot(NULL)` + `Commit`，再逐个 drop）。
         // 关闭顺序保证 GPU 线程已经退出（`pump` 先 drop `App`，`Renderer::drop` join 线程），

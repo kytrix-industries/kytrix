@@ -29,6 +29,11 @@ impl ImeState {
         (0, self.marked.len())
     }
 
+    /// 当前组合串（UTF-16 码元）：`replacementRange` 换算的 clamp 上界 + 代理对边界吸附来源。
+    pub(crate) fn marked_utf16(&self) -> &[u16] {
+        &self.marked
+    }
+
     pub(crate) fn selected_range(&self) -> (usize, usize) {
         self.selected
     }

@@ -6,6 +6,8 @@
 //!
 //! **坐标一律是窗口逻辑像素**（物理像素 → 逻辑的换算只在平台层做一次，I11）。
 
+use std::ops::Range;
+
 use smol_str::SmolStr;
 
 use crate::{
@@ -195,14 +197,33 @@ impl InputEvent {
 }
 
 /// 输入法事件（P09 只到「组合串可见 + 提交」这一层，交互处理归文本 Phase）。
+///
+/// 组合串 / 提交文本可能只替换已有文本的一部分（macOS `NSTextInputClient` 的
+/// `replacementRange`、输入法逐子句更新与重转换），因此两个正文变体都带一个
+/// **UTF-16 码元**替换区间 `replace`：
+///
+/// - `None`：AppKit 的 `{NSNotFound, 0}` —— 没有显式区间，替换**整个**当前组合串
+///   （没有组合串时在插入点插入）；
+/// - `Some(range)`：区间相对**当前组合串起点**（UTF-16 码元），新文本替换该区间里的旧文本，
+///   区间外的组合串余下文本保留。当前平台层给出的端点已吸附到码点边界（不会拆开代理对）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImeEvent {
     /// 开始组合。
     Start,
-    /// 组合中的文本（`None` 表示组合串被清空）。
-    Preedit(SmolStr),
+    /// 组合中的文本。
+    Preedit {
+        /// 组合中的文本。
+        text: SmolStr,
+        /// 要替换的旧文本区间（UTF-16 码元，相对当前组合串起点）；`None` = 整个当前组合串。
+        replace: Option<Range<usize>>,
+    },
     /// 已提交的文本。
-    Commit(SmolStr),
+    Commit {
+        /// 已提交的文本。
+        text: SmolStr,
+        /// 要替换的旧文本区间（UTF-16 码元，相对当前组合串起点）；`None` = 整个当前组合串。
+        replace: Option<Range<usize>>,
+    },
     /// 组合结束。
     End,
 }

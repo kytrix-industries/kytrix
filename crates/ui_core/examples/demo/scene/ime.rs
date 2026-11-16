@@ -5,6 +5,8 @@
 //! Backspace）是应用层的事，这里用值语义的 [`ImeField`] 表达，可脱离窗口单测。P16 另把正文文本节点
 //! 的插入点交给 `App::set_ime_cursor_area`，由引擎计算 caret 并通知三平台 IME。
 
+use std::ops::Range;
+
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     a11y::{A11yAction, A11yOverride, A11yPatch, A11yRole},
@@ -62,14 +64,17 @@ impl ImeField {
                 self.composing = true;
                 self.last_event = SmolStr::new_static("Start");
             }
-            ImeEvent::Preedit(text) => {
+            ImeEvent::Preedit { text, replace } => {
                 self.composing = true;
-                self.preedit = text.clone();
+                // 输入法逐子句更新（macOS `replacementRange`）时只替换组合串的一部分，
+                // 区间外的旧组合串必须保留，否则会丢字。
+                self.preedit = replace_utf16(&self.preedit, replace.as_ref(), text);
                 self.last_event = format_smolstr!("Preedit(\"{text}\")");
             }
-            ImeEvent::Commit(text) => {
+            ImeEvent::Commit { text, replace } => {
                 self.composing = false;
-                self.committed = format_smolstr!("{}{text}", self.committed);
+                let committed = replace_utf16(&self.preedit, replace.as_ref(), text);
+                self.committed = format_smolstr!("{}{committed}", self.committed);
                 self.preedit = SmolStr::default();
                 self.last_event = format_smolstr!("Commit(\"{text}\")");
             }
@@ -187,6 +192,37 @@ impl ImeField {
             format_smolstr!("最近提交：{}", self.submitted)
         }
     }
+}
+
+/// 按 UTF-16 区间把组合串的一段替换成 `replacement`；`replace = None` = 整段替换。
+///
+/// 区间来自 [`ImeEvent::Preedit`] / [`ImeEvent::Commit`]（macOS `NSTextInputClient` 的
+/// `replacementRange`，UTF-16 码元、相对组合串起点；平台层已把端点吸附到码点边界）。
+/// 这里是应用侧消费语义：只替换区间里的旧组合串，区间外的部分原样保留（组合串中间的
+/// 逐子句更新/重转换不会丢字）。异常输入（越界、端点落在代理对中间）向最近的码点边界收缩，
+/// 保证 `&str` 切片永远合法。
+fn replace_utf16(text: &str, replace: Option<&Range<usize>>, replacement: &str) -> SmolStr {
+    let Some(range) = replace else {
+        return SmolStr::new(replacement);
+    };
+    let mut utf16_index = 0;
+    let mut start = None;
+    let mut end = None;
+    for (byte, ch) in text.char_indices() {
+        if start.is_none() && utf16_index >= range.start {
+            start = Some(byte);
+        }
+        if end.is_none() && utf16_index >= range.end {
+            end = Some(byte);
+        }
+        if start.is_some() && end.is_some() {
+            break;
+        }
+        utf16_index += ch.len_utf16();
+    }
+    let start = start.unwrap_or(text.len());
+    let end = end.unwrap_or(text.len()).max(start);
+    format_smolstr!("{}{replacement}{}", &text[..start], &text[end..])
 }
 
 /// 建输入框 + 三行状态 + 提示；返回 `(输入框节点, 正文文本节点)`。
@@ -307,11 +343,17 @@ mod tests {
 
         field.apply(&ImeEvent::Start);
         assert!(field.composing(), "Start 本身就进入组合态（不依赖组合串）");
-        field.apply(&ImeEvent::Preedit("ni".into()));
+        field.apply(&ImeEvent::Preedit {
+            text: "ni".into(),
+            replace: None,
+        });
         assert!(field.composing());
         assert_eq!(field.display(false).as_str(), "ni");
 
-        field.apply(&ImeEvent::Commit("你好".into()));
+        field.apply(&ImeEvent::Commit {
+            text: "你好".into(),
+            replace: None,
+        });
         assert!(!field.composing());
         assert_eq!(field.committed(), "你好");
         assert_eq!(field.display(true).as_str(), "你好|");
@@ -347,12 +389,85 @@ mod tests {
     fn preedit_is_replaced_not_appended() {
         let mut field = ImeField::default();
 
-        field.apply(&ImeEvent::Preedit("s".into()));
-        field.apply(&ImeEvent::Preedit("sh".into()));
-        field.apply(&ImeEvent::Preedit("shi".into()));
+        field.apply(&ImeEvent::Preedit {
+            text: "s".into(),
+            replace: None,
+        });
+        field.apply(&ImeEvent::Preedit {
+            text: "sh".into(),
+            replace: None,
+        });
+        field.apply(&ImeEvent::Preedit {
+            text: "shi".into(),
+            replace: None,
+        });
 
         assert_eq!(field.committed(), "");
         assert_eq!(field.display(false).as_str(), "shi");
+    }
+
+    /// mac-2 回归：`replacementRange` 不是 `{NSNotFound, 0}` 时只替换组合串内的指定区间
+    /// （UTF-16 码元），区间外的组合串余下文本必须保留，不能整段丢弃/追加。
+    #[test]
+    fn preedit_replaces_only_the_requested_utf16_range() {
+        let mut field = ImeField::default();
+        field.apply(&ImeEvent::Preedit {
+            text: "niha".into(),
+            replace: None,
+        });
+
+        // 组合串内 [1, 3)（"ih"）被新的组合串 "í" 替换 → "n" + "í" + "a"。
+        field.apply(&ImeEvent::Preedit {
+            text: "í".into(),
+            replace: Some(1..3),
+        });
+
+        assert_eq!(field.display(false).as_str(), "nía");
+        assert_eq!(field.committed(), "", "组合串不进正文");
+    }
+
+    /// 提交时带替换区间：区间外的组合串余下文本随提交一起落到正文。
+    #[test]
+    fn commit_replaces_only_the_requested_utf16_range() {
+        let mut field = typed("前缀");
+        field.apply(&ImeEvent::Preedit {
+            text: "niha".into(),
+            replace: None,
+        });
+
+        field.apply(&ImeEvent::Commit {
+            text: "í".into(),
+            replace: Some(1..3),
+        });
+
+        assert!(!field.composing());
+        assert_eq!(field.committed(), "前缀nía");
+        assert_eq!(field.display(false).as_str(), "前缀nía");
+    }
+
+    /// UTF-16 代理对边界：区间端点不会拆开 emoji（平台层已吸附，应用侧再防御一层）。
+    #[test]
+    fn preedit_replacement_keeps_surrogate_pairs_intact() {
+        let mut field = ImeField::default();
+        field.apply(&ImeEvent::Preedit {
+            text: "🌍a".into(),
+            replace: None,
+        });
+
+        // 整个 emoji（2 个 UTF-16 码元）被替换；后面的 'a' 保留。
+        field.apply(&ImeEvent::Preedit {
+            text: "🌏".into(),
+            replace: Some(0..2),
+        });
+        assert_eq!(field.display(false).as_str(), "🌏a");
+
+        // 篡改区间（落在代理对中间）时按码点边界收缩，不能 panic/产生非法 UTF-8：
+        // 起点/终点都落在 emoji 的低代理之后 ⇒ 收缩成 emoji 末尾的插入点 "🌏|a" → "🌏xa"。
+        field.apply(&ImeEvent::Preedit {
+            text: "x".into(),
+            replace: Some(1..2),
+        });
+        assert_eq!(field.display(false).as_str(), "🌏xa");
     }
 
     #[test]
@@ -361,7 +476,10 @@ mod tests {
         field.backspace();
         assert_eq!(field.committed(), "ab你", "按 char 而不是字节删除");
 
-        field.apply(&ImeEvent::Preedit("ni".into()));
+        field.apply(&ImeEvent::Preedit {
+            text: "ni".into(),
+            replace: None,
+        });
         field.backspace();
         assert_eq!(
             field.committed(),
@@ -389,7 +507,10 @@ mod tests {
     fn enter_submits_and_clears_but_is_ignored_while_composing() {
         let mut field = typed("hello");
 
-        field.apply(&ImeEvent::Preedit("ni".into()));
+        field.apply(&ImeEvent::Preedit {
+            text: "ni".into(),
+            replace: None,
+        });
         field.submit();
         assert_eq!(field.committed(), "hello", "组合中的 Enter 交给 IME");
 
@@ -408,14 +529,20 @@ mod tests {
         assert_eq!(field.display(false).as_str(), "前缀后缀");
         assert_eq!(field.display(true).as_str(), "前缀后缀|");
 
-        field.apply(&ImeEvent::Preedit("组".into()));
+        field.apply(&ImeEvent::Preedit {
+            text: "组".into(),
+            replace: None,
+        });
         assert_eq!(field.display(true).as_str(), "前缀后缀组|");
     }
 
     #[test]
     fn leaving_the_field_cancels_the_preedit_and_is_idempotent() {
         let mut field = ImeField::default();
-        field.apply(&ImeEvent::Preedit("shi".into()));
+        field.apply(&ImeEvent::Preedit {
+            text: "shi".into(),
+            replace: None,
+        });
         assert!(field.composing());
 
         field.cancel_composition();
@@ -430,7 +557,10 @@ mod tests {
     #[test]
     fn at_set_value_replaces_the_text_and_clears_the_preedit() {
         let mut field = ImeField::default();
-        field.apply(&ImeEvent::Preedit("ni".into()));
+        field.apply(&ImeEvent::Preedit {
+            text: "ni".into(),
+            replace: None,
+        });
         assert!(field.composing());
 
         field.set_text("无障碍输入");
@@ -476,13 +606,23 @@ mod showcase_tests {
         assert_eq!(app.focused(window), Some(focused));
 
         dispatch_event(&mut scene, app, &Event::Ime(ImeEvent::Start));
-        dispatch_event(&mut scene, app, &Event::Ime(ImeEvent::Preedit("ni".into())));
+        dispatch_event(
+            &mut scene,
+            app,
+            &Event::Ime(ImeEvent::Preedit {
+                text: "ni".into(),
+                replace: None,
+            }),
+        );
         assert_eq!(ime_text(&scene, app).as_str(), "", "组合串不进正文");
 
         dispatch_event(
             &mut scene,
             app,
-            &Event::Ime(ImeEvent::Commit("你好".into())),
+            &Event::Ime(ImeEvent::Commit {
+                text: "你好".into(),
+                replace: None,
+            }),
         );
         assert_eq!(ime_text(&scene, app).as_str(), "你好");
 
@@ -504,7 +644,10 @@ mod showcase_tests {
         dispatch_event(
             &mut scene,
             app,
-            &Event::Ime(ImeEvent::Commit("干扰".into())),
+            &Event::Ime(ImeEvent::Commit {
+                text: "干扰".into(),
+                replace: None,
+            }),
         );
         dispatch_event(
             &mut scene,
@@ -538,7 +681,10 @@ mod showcase_tests {
             dispatch_event(
                 &mut scene,
                 app,
-                &Event::Ime(ImeEvent::Commit("你好".into())),
+                &Event::Ime(ImeEvent::Commit {
+                    text: "你好".into(),
+                    replace: None,
+                }),
             );
             tick(&mut scene, app);
         }
@@ -599,7 +745,10 @@ mod showcase_tests {
         dispatch_event(
             &mut scene,
             app,
-            &Event::Ime(ImeEvent::Preedit("shi".into())),
+            &Event::Ime(ImeEvent::Preedit {
+                text: "shi".into(),
+                replace: None,
+            }),
         );
         // Tab 离开输入框：钩子必须收起组合态，否则 Esc 会被一直当成「组合中」。
         let _ = app.focus_next(window);
@@ -619,7 +768,14 @@ mod showcase_tests {
         let app = test.app_mut();
         let _ = app.focus_prev(window).expect("输入框");
 
-        dispatch_event(&mut scene, app, &Event::Ime(ImeEvent::Preedit("ni".into())));
+        dispatch_event(
+            &mut scene,
+            app,
+            &Event::Ime(ImeEvent::Preedit {
+                text: "ni".into(),
+                replace: None,
+            }),
+        );
         dispatch_event(&mut scene, app, &Event::FocusChanged { focused: false });
         dispatch_event(&mut scene, app, &Event::Input(press(Key::Escape)));
 

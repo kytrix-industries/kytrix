@@ -10,12 +10,15 @@ use crate::{
     render::{Allocation, AtlasAllocator},
 };
 
-/// 字形缓存键：字体身份 + 字形 id + 物理 ppem。
+/// 字形缓存键：字体身份 + 字形 id + 物理 ppem + 水平亚像素相位。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct GlyphKey {
     font: FontKey,
     glyph: u32,
     ppem: u32,
+    /// 水平亚像素相位桶（`0..raster::SUBPIXEL_PHASES`）：同一字形在同一 ppem 下每个相位各占
+    /// 一个 tile，绘制时按 `整数基准 + placement.left` 落点（见 `raster::split_subpixel_x`）。
+    subpixel_x: u8,
     /// 实例坐标 / faux bold 的摘要（见 `GlyphVariation`）：同一字形的不同实例各占一个 tile。
     variation: u64,
 }
@@ -77,6 +80,9 @@ impl GlyphAtlas {
 
     /// 取字形 tile；未命中则光栅 + 装箱。
     ///
+    /// `subpixel_x` 是水平相位桶（`0..raster::SUBPIXEL_PHASES`），参与缓存键：同一字形的不同
+    /// 相位必须各占一个 tile，否则亚像素定位会被 tile 复用抹平。
+    ///
     /// `Err(AtlasExhausted)` = 清空重建后单块仍放不下（`EngineError::AtlasExhausted`）。
     pub(crate) fn ensure(
         &mut self,
@@ -85,12 +91,14 @@ impl GlyphAtlas {
         font: &parley::FontData,
         glyph: u32,
         ppem: f32,
+        subpixel_x: u8,
         variation: Option<&crate::text::raster::GlyphVariation>,
     ) -> Result<Option<GlyphTile>, EngineError> {
         let key = GlyphKey {
             font: FontKey::of(font, raster.font_epoch()),
             glyph,
             ppem: ppem.to_bits(),
+            subpixel_x,
             variation: variation.map_or(0, crate::text::raster::GlyphVariation::hash),
         };
         if self.missing.contains(&key) {
@@ -128,6 +136,7 @@ impl GlyphAtlas {
             font,
             glyph,
             ppem,
+            subpixel_x,
             variation.unwrap_or(&crate::text::raster::GlyphVariation::default()),
         ) else {
             self.missing.insert(key);
@@ -318,8 +327,8 @@ mod tests {
         let mut atlas = tiny_glyph_atlas();
         let mut glyphs = GlyphAtlas::new();
 
-        let first = glyphs.ensure(&mut raster, &mut atlas, &font, 36, 16.0, None);
-        let second = glyphs.ensure(&mut raster, &mut atlas, &font, 36, 16.0, None);
+        let first = glyphs.ensure(&mut raster, &mut atlas, &font, 36, 16.0, 0, None);
+        let second = glyphs.ensure(&mut raster, &mut atlas, &font, 36, 16.0, 0, None);
         let first = first.expect("no error").expect("glyph has coverage");
         let second = second.expect("no error").expect("cached");
 
@@ -342,10 +351,10 @@ mod tests {
         let mut glyphs = GlyphAtlas::new();
 
         let small = glyphs
-            .ensure(&mut raster, &mut atlas, &font, 36, 13.0, None)
+            .ensure(&mut raster, &mut atlas, &font, 36, 13.0, 0, None)
             .expect("ok");
         let large = glyphs
-            .ensure(&mut raster, &mut atlas, &font, 36, 26.0, None)
+            .ensure(&mut raster, &mut atlas, &font, 36, 26.0, 0, None)
             .expect("ok");
         let (small, large) = (small.expect("13ppem"), large.expect("26ppem"));
 
@@ -355,6 +364,44 @@ mod tests {
             "different ppem ⇒ different tile"
         );
         assert!(large.width > small.width);
+    }
+
+    /// P2-2：水平亚像素相位必须参与缓存键 —— 否则 x=10.0 与 x=10.4 的字形会共用同一张位图，
+    /// 亚像素定位被 tile 复用抹平。同相位必须继续复用（不能把缓存打成全 miss）。
+    #[test]
+    fn glyph_tile_differs_per_subpixel_phase() {
+        let Some(font) = probe_font() else {
+            eprintln!("skip: no system font available");
+            return;
+        };
+        let mut raster = GlyphRasterizer::new();
+        let mut atlas = tiny_glyph_atlas();
+        let mut glyphs = GlyphAtlas::new();
+
+        let integer = glyphs
+            .ensure(&mut raster, &mut atlas, &font, 36, 16.0, 0, None)
+            .expect("ok")
+            .expect("integer phase");
+        let half = glyphs
+            .ensure(&mut raster, &mut atlas, &font, 36, 16.0, 2, None)
+            .expect("ok")
+            .expect("half phase");
+        assert_ne!(
+            integer.tile.uv(),
+            half.tile.uv(),
+            "1/4 px 相位桶必须各占一个 tile"
+        );
+        let stats = glyphs.take_stats();
+        assert_eq!((stats.misses, stats.rasters, stats.hits), (2, 2, 0));
+        assert_eq!(glyphs.len(), 2);
+
+        let integer_again = glyphs
+            .ensure(&mut raster, &mut atlas, &font, 36, 16.0, 0, None)
+            .expect("ok")
+            .expect("cached integer phase");
+        assert_eq!(integer.tile, integer_again.tile, "同相位必须复用 tile");
+        let stats = glyphs.take_stats();
+        assert_eq!((stats.misses, stats.rasters, stats.hits), (0, 0, 1));
     }
 
     #[test]
@@ -368,13 +415,13 @@ mod tests {
         let mut glyphs = GlyphAtlas::new();
 
         let first = glyphs
-            .ensure(&mut raster, &mut atlas, &font, 36, 16.0, None)
+            .ensure(&mut raster, &mut atlas, &font, 36, 16.0, 0, None)
             .expect("ok")
             .expect("coverage");
         atlas.clear();
         glyphs.clear();
         let second = glyphs
-            .ensure(&mut raster, &mut atlas, &font, 36, 16.0, None)
+            .ensure(&mut raster, &mut atlas, &font, 36, 16.0, 0, None)
             .expect("ok")
             .expect("coverage");
 
@@ -395,6 +442,7 @@ mod tests {
             font: super::FontKey::of(&font, raster.font_epoch()),
             glyph: 36,
             ppem: 16.0f32.to_bits(),
+            subpixel_x: 0,
         };
         raster.set_font_epoch(raster.font_epoch() + 1);
         let second_key = GlyphKey {
@@ -402,6 +450,7 @@ mod tests {
             font: super::FontKey::of(&font, raster.font_epoch()),
             glyph: 36,
             ppem: 16.0f32.to_bits(),
+            subpixel_x: 0,
         };
 
         assert_ne!(first_key, second_key, "epoch bump must change the key");
@@ -420,7 +469,7 @@ mod tests {
         let old_generation = atlas.generation();
 
         let tile = glyphs
-            .ensure(&mut raster, &mut atlas, &font, 36, 16.0, None)
+            .ensure(&mut raster, &mut atlas, &font, 36, 16.0, 0, None)
             .expect("growth must rescue the glyph")
             .expect("glyph has coverage");
 
