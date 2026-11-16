@@ -334,10 +334,13 @@ pub(crate) fn is_hidden(
     over: Option<&A11yOverride>,
     patch: Option<&A11yPatch>,
 ) -> bool {
-    if patch.is_some_and(|patch| patch.hidden == Some(true)) {
-        return true;
-    }
-    if over.is_some_and(|over| over.hidden) {
+    // `patch.hidden = Some(false)` 必须能覆盖静态声明（与 `is_disabled` 的 patch-first
+    // 约定一致；静态 `hidden` / `visible = false` / `display: none` 仍各自生效）。
+    if let Some(hidden) = patch.and_then(|patch| patch.hidden) {
+        if hidden {
+            return true;
+        }
+    } else if over.is_some_and(|over| over.hidden) {
         return true;
     }
     if target.style_patch().visible == Some(false) {

@@ -498,6 +498,10 @@ pub struct NodeTree {
     layout_stats: LayoutStats,
     /// 首条 measure 违规（`InvalidMeasure` 的唯一来源）。
     invalid_measure: Option<EngineError>,
+    /// 几何内容发生「隐藏 / 卸载 / 布局移动」时置位：这些路径拿不到 `GeometryDesc`，
+    /// 无法精确算 `desc.bounds` 的溢出范围，只能保守地升级为全帧 damage（复审 A3）。
+    /// `Window::paint_frame` 每帧取走。
+    geometry_damage_escalation: bool,
 }
 
 /// 一次布局运行的计数器。
@@ -602,6 +606,7 @@ impl NodeTree {
             layout_epoch: 0,
             layout_stats: LayoutStats::default(),
             invalid_measure: None,
+            geometry_damage_escalation: false,
         }
     }
 
@@ -696,6 +701,15 @@ impl NodeTree {
             p.children.retain(|existing| *existing != node);
         }
         let block = self.collect_subtree_ids(node);
+        // 几何节点的可见范围可能超出布局盒：卸载/移动/隐藏三者都拿不到 desc，
+        // 保守升级为全帧 damage（否则溢出部分在「不清屏」前提下长期残影；复审 A3）。
+        if block.iter().any(|id| {
+            self.arena
+                .get(*id)
+                .is_some_and(|target| matches!(target.kind, NodeKind::Geometry(_)))
+        }) {
+            self.geometry_damage_escalation = true;
+        }
         // 旧像素必须重绘：被卸载子树的包围盒并入父的 damage（出流/覆盖节点可能超出父盒，
         // 不能只靠 `mark_structure` 的父盒；P06 §5.5、不加 `LayoutBox.overflow` 的依据）。
         let mut subtree_damage = Rect::default();
@@ -1292,6 +1306,11 @@ impl NodeTree {
         // 旧实现 `mem::take` 每帧都让双方重新分配（复审 P3-2）。
         out.clear();
         out.append(&mut self.text_dirty);
+    }
+
+    /// 取走「几何 damage 需要升级为全帧」的标记（`Window::paint_frame` 每帧读一次）。
+    pub(crate) fn take_geometry_damage_escalation(&mut self) -> bool {
+        std::mem::take(&mut self.geometry_damage_escalation)
     }
 
     /// 本帧待 shape 的文本节点数（诊断 / 测试）。
@@ -2027,6 +2046,14 @@ impl NodeTree {
 
         if changed {
             self.layout_stats.moved += 1;
+            // 几何内容的可见范围可能超出布局盒：布局移动拿不到 `GeometryDesc`，
+            // 保守升级为全帧 damage（复审 A3）。
+            if matches!(
+                self.arena.get(node).map(|target| &target.kind),
+                Some(NodeKind::Geometry(_))
+            ) {
+                self.geometry_damage_escalation = true;
+            }
             if let Some(target) = self.arena.get_mut(node) {
                 target.damage = target.damage.union(old.bounds).union(abs);
                 target.prev_layout = old;

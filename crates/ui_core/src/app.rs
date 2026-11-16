@@ -2492,7 +2492,12 @@ impl App {
             return false;
         }
         self.close_handlers.remove(&id);
-        self.close_window(id)
+        // 处理器可能**自己**已经关掉了窗口：`close_window` 返回 false 但「窗口已关闭」
+        // 正是 `true` 的语义，不能把它当「被拦下」（复审 F8）。
+        let existed = self.windows.contains_key(&id);
+        self.close_window(id);
+        // 自己关掉（原本存在、现在没了）也算关闭成功。
+        existed
     }
 
     /// 关窗：精确退订该窗口全部节点的依赖，然后丢弃。返回 `false` = 窗口不存在。

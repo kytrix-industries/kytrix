@@ -1064,6 +1064,11 @@ impl Window {
         let scale = self.scale;
         let frame = self.frame_rect();
         self.damage.reset(scale);
+        // 几何内容在「隐藏 / 卸载 / 布局移动」路径上无法精确算出溢出范围（拿不到
+        // `GeometryDesc`）：保守升级为全帧 damage，避免溢出部分残影（复审 A3）。
+        if self.tree.take_geometry_damage_escalation() {
+            self.full_damage_pending = true;
+        }
         let has_damage = self.full_damage_pending || self.pending_damage.is_some();
         if self.full_damage_pending {
             self.damage.push_full();

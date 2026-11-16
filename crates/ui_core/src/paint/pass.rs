@@ -308,10 +308,16 @@ fn hide_subtree(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
         };
         let children: SmallVec<[NodeId; 4]> = target.children().iter().copied().collect();
         // damage 与 bounds 都在**内容坐标**：先并集，再减祖先滚动偏移得到屏幕坐标（P10 §7.2）。
-        let damage_rect = target
-            .damage()
-            .union(target.layout().bounds)
-            .translate(negate(offset));
+        let mut damage_rect = target.damage().union(target.layout().bounds);
+        // 几何的可见范围可能超出节点布局盒：隐藏时也必须把 `desc.bounds` 并入
+        // damage，否则溢出部分留下旧像素（「damage 帧不清屏」会长期残留；复审 A3）。
+        if let NodeKind::Geometry(id) = *target.kind()
+            && let Some(desc) = context.geometry.desc_arc(id)
+        {
+            damage_rect = damage_rect.union(desc.bounds);
+        }
+        // damage 与 bounds 都在**内容坐标**：先并集，再减祖先滚动偏移得到屏幕坐标（P10 §7.2）。
+        let damage_rect = damage_rect.translate(negate(offset));
         let child_offset = offset
             + context
                 .tree
