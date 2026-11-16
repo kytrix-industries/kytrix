@@ -243,8 +243,16 @@ struct WindowSurface {
 }
 
 pub(crate) struct WaylandState {
-    /// 唯一的窗口（Stage A：多窗口时改为 `Vec<WindowSurface>` 并按对象 / 焦点路由事件）。
-    window: WindowSurface,
+    /// 全部窗口的 per-surface 状态（P1-2.8 Stage B）。
+    ///
+    /// 事件的归属由对象解析（`wl_surface` / `xdg_toplevel` / `wl_callback` → 窗口下标）；
+    /// seat 的键盘/指针事件不属于任何 surface，按 [`Self::active`] 派发。
+    windows: Vec<WindowSurface>,
+    /// 当前**焦点窗口**在 [`Self::windows`] 里的下标。
+    ///
+    /// 键盘事件、IME、剪贴板属主都跟随它；`wl_keyboard.enter` / `leave` 更新它。
+    /// 单窗口时恒 0；没有窗口时不会访问（构造保证至少一个，关到 0 个就退出循环）。
+    active: usize,
     /// 待泵消费的平台事件。
     events: Vec<Event>,
     connection: Connection,
@@ -413,7 +421,7 @@ impl WaylandState {
 
         let clipboard = Clipboard::new(connection.clone(), data_device.clone(), data_source);
         let mut state = Self {
-            window: WindowSurface {
+            windows: vec![WindowSurface {
                 id,
                 surface,
                 _xdg_surface: xdg_surface,
@@ -435,7 +443,8 @@ impl WaylandState {
                 close_requested: false,
                 frame_gate: FrameGate::new(),
                 frame_callback: None,
-            },
+            }],
+            active: 0,
             events: Vec::with_capacity(16),
             connection,
             queue_handle,
@@ -552,7 +561,7 @@ impl WaylandState {
     /// 当前生效的 scale：fractional 模式下用 `preferred_scale`（未收到时回落到整数 scale），
     /// 否则就是整数回退的当前值。
     fn effective_scale(&self) -> Scale {
-        let fractional = if self.window.uses_viewport {
+        let fractional = if self.windows[self.active].uses_viewport {
             self.fractional_scale_120
                 .and_then(|scale| dpi::scale_from_120(scale).ok())
         } else {
@@ -561,15 +570,15 @@ impl WaylandState {
         fractional.unwrap_or_else(|| Scale::new(self.integer_scale as f32).expect("positive"))
     }
 
-    /// 先推进整数回退的当前值，再按 effective scale 更新 `self.window.scale` 并排队
+    /// 先推进整数回退的当前值，再按 effective scale 更新 `self.windows[self.active].scale` 并排队
     /// `Event::DpiChanged`（事件循环随后 `set_scale` / `set_surface` 并出帧）。
     fn recompute_scale(&mut self) {
         self.integer_scale = self.integer_scale_value();
         let scale = self.effective_scale();
-        if scale == self.window.scale {
+        if scale == self.windows[self.active].scale {
             return;
         }
-        self.window.scale = scale;
+        self.windows[self.active].scale = scale;
         self.events.push(Event::DpiChanged {
             dpi: (scale.factor() * 96.0).round() as u32,
             scale,
@@ -581,7 +590,7 @@ impl WaylandState {
     ///
     /// GPU 线程在 present 前与 attach/commit 同一次生效（[`crate::render::frame::FrameRequest`]）。
     pub(crate) fn buffer_scale(&self) -> i32 {
-        if self.window.uses_viewport {
+        if self.windows[self.active].uses_viewport {
             1
         } else {
             self.integer_scale
@@ -590,7 +599,7 @@ impl WaylandState {
 
     /// `wl_surface` 的代理副本：GPU 线程用它写 `set_buffer_scale`（`WlSurface` 是 `Clone`）。
     pub(crate) fn surface_clone(&self) -> wl_surface::WlSurface {
-        self.window.surface.clone()
+        self.windows[self.active].surface.clone()
     }
 
     /// 当前窗口的稳定 id（与 `App` 的 `WindowId` 同一值）。
@@ -598,7 +607,37 @@ impl WaylandState {
     /// 多窗口路由的锚点：下一步事件循环要按它把 `wl_surface` / `xdg_toplevel` 的事件、
     /// 以及 seat 的键盘/指针事件（按焦点窗口）派发到正确的 `Window`。
     pub(crate) fn id(&self) -> crate::window::WindowId {
-        self.window.id
+        self.windows[self.active].id
+    }
+
+    /// `wl_surface` → 窗口下标（按对象 id 比较；代理对象的 `id()` 是协议对象 id）。
+    ///
+    /// 事件归属**按对象解析**是 Wayland 客户端的正确做法：`Dispatch` 回调拿到的是发起
+    /// 事件的那个代理对象，只有它能无歧义地指出「哪个窗口」。
+    fn window_index_for_surface(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
+        let id = surface.id();
+        self.windows
+            .iter()
+            .position(|window| window.surface.id() == id)
+    }
+
+    /// `xdg_toplevel` → 窗口下标。
+    fn window_index_for_toplevel(&self, toplevel: &xdg_toplevel::XdgToplevel) -> Option<usize> {
+        let id = toplevel.id();
+        self.windows
+            .iter()
+            .position(|window| window.toplevel.id() == id)
+    }
+
+    /// `wl_callback` → 窗口下标（按挂起的 `frame_callback` 对象 id 匹配）。
+    fn window_index_for_callback(&self, callback: &wl_callback::WlCallback) -> Option<usize> {
+        let id = callback.id();
+        self.windows.iter().position(|window| {
+            window
+                .frame_callback
+                .as_ref()
+                .is_some_and(|(pending, _)| *pending == id)
+        })
     }
 
     pub(crate) fn connection(&self) -> &Connection {
@@ -609,16 +648,16 @@ impl WaylandState {
     pub(crate) fn raw_pointers(&self) -> (*mut std::ffi::c_void, *mut std::ffi::c_void) {
         (
             self.connection.display().id().as_ptr().cast(),
-            self.window.surface.id().as_ptr().cast(),
+            self.windows[self.active].surface.id().as_ptr().cast(),
         )
     }
 
     pub(crate) fn size(&self) -> Size {
-        self.window.size
+        self.windows[self.active].size
     }
 
     pub(crate) fn scale(&self) -> Scale {
-        self.window.scale
+        self.windows[self.active].scale
     }
 
     pub(crate) fn serial(&self) -> u32 {
@@ -626,11 +665,11 @@ impl WaylandState {
     }
 
     pub(crate) fn is_configured(&self) -> bool {
-        self.window.configured
+        self.windows[self.active].configured
     }
 
     pub(crate) fn is_focused(&self) -> bool {
-        self.window.focused
+        self.windows[self.active].focused
     }
 
     /// 把 `wp_viewport` 的所有权交给窗口渲染器（`Some` = fractional 模式）。
@@ -645,7 +684,7 @@ impl WaylandState {
     /// 缩放，而且这次 commit 会提前触发 frame callback、破坏 FrameGate。现在 UI 线程不再碰
     /// viewport（也不再 commit `wl_surface`）。
     pub(crate) fn take_viewport(&mut self) -> Option<WpViewport> {
-        self.window.viewport.take()
+        self.windows[self.active].viewport.take()
     }
 
     pub(crate) fn take_events(&mut self) -> Vec<Event> {
@@ -653,26 +692,28 @@ impl WaylandState {
     }
 
     pub(crate) fn take_close_request(&mut self) -> bool {
-        std::mem::take(&mut self.window.close_requested)
+        std::mem::take(&mut self.windows[self.active].close_requested)
     }
 
     /// 最小化（自绘标题栏的“缩小”按钮）。
     pub(crate) fn minimize(&self) {
-        self.window.toplevel.set_minimized();
+        self.windows[self.active].toplevel.set_minimized();
     }
 
     /// 最大化 / 还原切换；最终状态以 compositor 的 configure 为准。
     pub(crate) fn toggle_maximize(&mut self) {
-        if self.window.maximized {
-            self.window.toplevel.unset_maximized();
+        if self.windows[self.active].maximized {
+            self.windows[self.active].toplevel.unset_maximized();
         } else {
-            self.window.toplevel.set_maximized();
+            self.windows[self.active].toplevel.set_maximized();
         }
     }
 
     /// 开始交互式移动；使用触发拖动的指针按键 serial。
     pub(crate) fn begin_move(&self) {
-        self.window.toplevel._move(&self.seat, self.pointer_serial);
+        self.windows[self.active]
+            .toplevel
+            ._move(&self.seat, self.pointer_serial);
     }
 
     /// 开始交互式缩放；使用触发拖动的指针按键 serial。
@@ -691,7 +732,7 @@ impl WaylandState {
             WindowResizeEdge::BottomLeft => ResizeEdge::BottomLeft,
             WindowResizeEdge::BottomRight => ResizeEdge::BottomRight,
         };
-        self.window
+        self.windows[self.active]
             .toplevel
             .resize(&self.seat, self.pointer_serial, edge);
     }
@@ -702,31 +743,33 @@ impl WaylandState {
 
     /// 请求一帧回调（publish 之前调用；已有挂起 callback 时只关好门禁，不重复请求）。
     pub(crate) fn request_frame(&mut self) {
-        let Some(token) = self.window.frame_gate.request(Instant::now()) else {
+        let Some(token) = self.windows[self.active].frame_gate.request(Instant::now()) else {
             return;
         };
-        let callback = self.window.surface.frame(&self.queue_handle, ());
-        self.window.frame_callback = Some((callback.id(), token));
+        let callback = self.windows[self.active]
+            .surface
+            .frame(&self.queue_handle, ());
+        self.windows[self.active].frame_callback = Some((callback.id(), token));
     }
 
     pub(crate) fn frame_ready(&self) -> bool {
-        self.window.frame_gate.is_ready()
+        self.windows[self.active].frame_gate.is_ready()
     }
 
     /// 本帧没有 publish（Idle / 中止）⇒ 不会 commit：把门禁重新打开（F-183 的 Idle 路径）。
     pub(crate) fn note_frame_not_committed(&mut self) {
-        self.window.frame_gate.note_not_committed();
+        self.windows[self.active].frame_gate.note_not_committed();
     }
 
     /// 活性兜底：门禁关闭超过 `GATE_TIMEOUT` 时强制打开。只覆盖「publish 了但没 commit」
     /// （present `OUT_OF_DATE` 等），正常路径不会触发；**不是**呈现节奏（F-183）。
     pub(crate) fn expire_frame_gate(&mut self, now: Instant) -> bool {
-        self.window.frame_gate.expire(now)
+        self.windows[self.active].frame_gate.expire(now)
     }
 
     /// 距离活性兜底还有多久（门禁打开时 `None`）；事件循环用它压缩阻塞等待。
     pub(crate) fn frame_gate_remaining(&self, now: Instant) -> Option<Duration> {
-        self.window.frame_gate.time_until_expiry(now)
+        self.windows[self.active].frame_gate.time_until_expiry(now)
     }
 
     /// IME 的激活/停用（focus 变化时由键盘事件驱动）。
@@ -742,8 +785,7 @@ impl WaylandState {
             text_input.enable();
             // P1-2.11：从这里开始文本由 `commit_string` 送达，`wl_keyboard` 通路必须静默。
             self.ime_enabled = true;
-            let area = self
-                .window
+            let area = self.windows[self.active]
                 .ime_cursor_area
                 .unwrap_or_else(|| Rect::new(0.0, 0.0, 1.0, 1.0));
             text_input.set_cursor_rectangle(
@@ -752,34 +794,34 @@ impl WaylandState {
                 area.size.width.max(1.0).round() as i32,
                 area.size.height.max(1.0).round() as i32,
             );
-            self.window.ime_cursor_applied = Some(area);
+            self.windows[self.active].ime_cursor_applied = Some(area);
         } else {
             text_input.disable();
             self.ime_enabled = false;
-            self.window.ime_cursor_applied = None;
+            self.windows[self.active].ime_cursor_applied = None;
         }
         text_input.commit();
     }
 
     /// 保存 IME caret 区域；已聚焦时立即下发（`commit` 是 v3 的生效点）。
     pub(crate) fn set_ime_cursor_area(&mut self, area: Option<Rect>) {
-        if self.window.ime_cursor_area == area {
+        if self.windows[self.active].ime_cursor_area == area {
             return;
         }
-        self.window.ime_cursor_area = area;
-        if !self.window.focused {
+        self.windows[self.active].ime_cursor_area = area;
+        if !self.windows[self.active].focused {
             return;
         }
         let effective = area.unwrap_or_else(|| Rect::new(0.0, 0.0, 1.0, 1.0));
         if let Some(text_input) = self.text_input.as_ref() {
-            if self.window.ime_cursor_applied != Some(effective) {
+            if self.windows[self.active].ime_cursor_applied != Some(effective) {
                 text_input.set_cursor_rectangle(
                     effective.origin.x.round() as i32,
                     effective.origin.y.round() as i32,
                     effective.size.width.max(1.0).round() as i32,
                     effective.size.height.max(1.0).round() as i32,
                 );
-                self.window.ime_cursor_applied = Some(effective);
+                self.windows[self.active].ime_cursor_applied = Some(effective);
             }
             text_input.commit();
         }
@@ -1062,12 +1104,19 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandState {
 impl Dispatch<wl_surface::WlSurface, ()> for WaylandState {
     fn event(
         state: &mut Self,
-        _: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         event: wl_surface::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        // 窗口归属按对象解析：enter / leave / preferred_buffer_scale 都是**那个 surface**
+        // 的属性。scale 协商状态目前仍是进程级（Stage C 会随窗口一起下移），但归属检查
+        // 现在就必须做 —— 否则将来接第二个 surface 时会静默把别人的 scale 算进本窗口。
+        let Some(index) = state.window_index_for_surface(surface) else {
+            return;
+        };
+        let _ = index;
         // 整数回退的 scale 来源：surface v6 的 `preferred_buffer_scale` 优先，否则取已 enter 的
         // output 最大 scale（多屏窗口跨两个不同 scale 的显示器时取较大者，避免糊）。
         match event {
@@ -1104,7 +1153,12 @@ impl Dispatch<wl_callback::WlCallback, ()> for WaylandState {
         _: &QueueHandle<Self>,
     ) {
         if let wl_callback::Event::Done { .. } = event {
-            let Some((pending, token)) = state.window.frame_callback.as_ref() else {
+            // 窗口归属**按对象解析**，不靠 `active`：`wl_callback` 可能属于任一窗口，
+            // 而 `active` 是键盘焦点窗口（两者在多窗口下并不相同）。
+            let Some(index) = state.window_index_for_callback(callback) else {
+                return;
+            };
+            let Some((pending, token)) = state.windows[index].frame_callback.as_ref() else {
                 return;
             };
             // 被活性兜底放弃的旧 callback 迟到：对象 id 不匹配，不能动当前请求的挂起状态
@@ -1113,8 +1167,8 @@ impl Dispatch<wl_callback::WlCallback, ()> for WaylandState {
                 return;
             }
             let token = *token;
-            state.window.frame_callback = None;
-            state.window.frame_gate.on_callback(token);
+            state.windows[index].frame_callback = None;
+            state.windows[index].frame_gate.on_callback(token);
         }
     }
 }
@@ -1153,12 +1207,16 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for WaylandState {
 impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandState {
     fn event(
         state: &mut Self,
-        _: &xdg_toplevel::XdgToplevel,
+        toplevel: &xdg_toplevel::XdgToplevel,
         event: xdg_toplevel::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        // 窗口归属按对象解析（`Configure` / `Close` 只描述发起它的那个 toplevel）。
+        let Some(index) = state.window_index_for_toplevel(toplevel) else {
+            return;
+        };
         match event {
             xdg_toplevel::Event::Configure {
                 width,
@@ -1167,22 +1225,21 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandState {
             } => {
                 // 0 = 「客户端自己选」；否则用 compositor 给的建议尺寸。
                 if width > 0 && height > 0 {
-                    state.window.size = Size::new(width as f32, height as f32);
+                    state.windows[index].size = Size::new(width as f32, height as f32);
                 }
                 // `states` 是协议数组的原始字节（u32 native-endian 的 state 枚举序列）。
                 let maximized = xdg_toplevel::State::Maximized as u32;
-                state.window.maximized = states
+                state.windows[index].maximized = states
                     .as_chunks::<4>()
                     .0
                     .iter()
                     .any(|chunk| u32::from_ne_bytes(*chunk) == maximized);
-                state.window.configured = true;
-                state.events.push(Event::Resized {
-                    size: state.window.size,
-                });
+                state.windows[index].configured = true;
+                let size = state.windows[index].size;
+                state.events.push(Event::Resized { size });
             }
             xdg_toplevel::Event::Close => {
-                state.window.close_requested = true;
+                state.windows[index].close_requested = true;
             }
             _ => {}
         }
@@ -1281,12 +1338,12 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
             }
             wl_keyboard::Event::Enter { serial, .. } => {
                 state.serial = serial;
-                state.window.focused = true;
+                state.windows[state.active].focused = true;
                 state.events.push(Event::FocusChanged { focused: true });
                 state.set_ime_focus(true);
             }
             wl_keyboard::Event::Leave { .. } => {
-                state.window.focused = false;
+                state.windows[state.active].focused = false;
                 state.events.push(Event::FocusChanged { focused: false });
                 state.set_ime_focus(false);
             }
