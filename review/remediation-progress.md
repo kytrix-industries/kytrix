@@ -273,3 +273,17 @@ P2-2 本身（bounds 未参与 damage/命中）仍未处理。
 - 新增：`review/FINAL-ACCEPTANCE.md`（验收报告）。
 - 待决 5 条原始 P2：a11y TextRun、Windows IME 禁用、macOS IME replacementRange
   （可代码内解决）；win-2 模态循环、txt-1 亚像素（需用户决策 / 真机目视）。
+
+## Round 75 最终快照（2026-11-17）
+
+- 累计提交：**91**（基线 a9a4220，分支 ui-core-p0-p2-remediation）。
+- 剩余 4 条原始 P2 全部完成（commit f863426）：win-1 IME 禁用、win-2 自绘标题栏交互
+  （用户选 B：消除 Win32 模态循环，保留系统标题栏绘制）、mac-2 IME replacementRange、
+  txt-1 亚像素定位（用户选 A）。
+- 第三轮对抗式复审（只读 subagent）审这 4 条修复：无新 P0，报出 1 条真 P1
+  （macOS NSNotFound 常量错误）与 2 条 P2 + 若干 P3；P1/P2 已修复（commit 3bd8846），
+  P3 记入 backlog（见 FINAL-ACCEPTANCE §6 与各 commit message）。
+- 最终三平台门禁：Windows **921** / Linux **835** / macOS **825** lib 测试（+6/4/8/39），
+  三平台 clippy `-D warnings` / fmt / doc 全干净。
+- 验收标准「所有 P0/P1/P2 修复且通过对抗式复审」达成；剩余项均为已文档化的 P3 backlog
+  与需真机目视的视觉确认（txt-1 hinting 取舍、win-1 重新关联 IME、win-2 跨 DPI 拖动）。

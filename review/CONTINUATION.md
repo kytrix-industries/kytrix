@@ -1,56 +1,39 @@
-# 剩余工作交接（Round 69 快照）
+# 剩余工作交接（已完成，2026-11-17）
 
-> 分支 `ui-core-p0-p2-remediation`，HEAD `f65d1cf`，**88 个 commit**（基线 `a9a4220`）。
-> 工作树干净；三平台门禁全绿（Win 893 / Linux 822 / macOS 812 lib 测试 + 54）。
-> 详细台账：`review/remediation-progress.md`；验收报告：`review/FINAL-ACCEPTANCE.md`。
+> 本文件记录 2026-11-16 的剩余工作，**现已全部完成**。
+> 分支 `ui-core-p0-p2-remediation`，累计 91 个 commit（基线 `a9a4220`）。
+> 最终台账与验收结论见 `review/remediation-progress.md`（Round 75 快照）与
+> `review/FINAL-ACCEPTANCE.md`。
 
-## 已完成
+## 完成情况
 
-P0 2/2（+ 本会话新发现 1 条已修）、P1 13/13、两轮对抗式复审新增 P1 15/15、
-复审 P2 26/26（2 条经证实非缺陷）、复审 P3 20+/20+、原始 P2 46/50。
+| 项 | 状态 |
+|---|---|
+| win-1 Windows IME 禁用路径 | ✅ commit `f863426` |
+| mac-2 macOS IME `replacementRange` | ✅ commit `f863426`（P1 常量修复 `3bd8846`） |
+| win-2 自绘标题栏交互（用户选 B） | ✅ commit `f863426`（消除 Win32 模态循环） |
+| txt-1 亚像素定位（用户选 A） | ✅ commit `f863426` |
+| a11y-1 `SetTextSelection` 死动作 | ✅ 范围收敛（已移除默认声明） |
+| 第三轮对抗式复审 | ✅ 1 P1 + 2 P2 修复（`3bd8846`），P3 记入 backlog |
 
-## 剩余 4 条原始 P2（按建议顺序）
+三平台门禁：Windows 921 / Linux 835 / macOS 825 lib 测试（+6/4/8/39），
+clippy `-D warnings` / fmt / doc 全干净。
 
-### 1. win-1：Windows IME 禁用路径
-- **证据**：`review/findings-windows-platform.md` 的 IME 条目。
-- **现状**：`platform/windows/ime.rs` 只有启用态处理（`WM_IME_STARTCOMPOSITION` 等）；
-  没有 `ImmAssociateContext(hwnd, None/prev)` 的禁用/恢复路径。
-- **做法**：`App` 加按窗口的 `ime_enabled` 映射（仿 `cursor_pending`/`capture_request`
-  的单槽模式或 `a11y_delivered` 的 HashMap）；泵每轮取变更并调
-  `ImmAssociateContext`，保存/恢复旧 HIMC；禁用时 `wndproc` 忽略 `WM_IME_*` 且不派发
-  `ImeEvent`。补 `wndproc_tests` 用例（禁用后 `WM_IME_COMPOSITION` 不产生事件）。
+## 剩余 P3 backlog（不阻塞验收）
 
-### 2. mac-2：macOS IME `replacementRange` 被忽略
-- **证据**：`review/findings-macos.md` 的 IME 条目。
-- **现状**：`platform/macos/window.rs` 的 `GuiView` 实现 `NSTextInputClient`，
-  `setMarkedText:replacementRange:` 忽略 replacementRange（总是追加到末尾/替换全部）。
-- **做法**：把 `replacementRange` 转成「字节区间」随 `ImeEvent::Preedit` 一起上报（新增
-  字段或 `PreeditRange`），App/文本输入层按区间替换；无选区时 `{NSNotFound, 0}` 表示插入。
-  补单元测试（纯范围换算逻辑抽成函数可测）。
-
-### 3. win-2：系统菜单 / 标题栏拖动进入 Win32 模态循环阻塞泵（**需用户裁决**）
-- 方案 A（推荐）：接受阻塞并文档化到 `WindowOptions` 与 `review/FINAL-ACCEPTANCE.md` §5。
-- 方案 B：自绘非客户区（WM_NCCALCSIZE + WM_NCHITTEST + 自绘标题栏/按钮），2–3 轮。
-
-### 4. txt-1：亚像素定位 + hint 策略（**需用户裁决**）
-- 方案 A（推荐）：按 Skia 默认（开亚像素定位、关 hinting），改 `text/raster.rs` 的
-  `Render` 选项 + 字形键跟随 `subpixel_x` 量化；标注可回退常量。
-- 方案 B：保持现状，在 `text.rs` 文档写明取舍。
+- win-1：禁用态下系统可能在焦点/输入法切换后重新关联 IME，需 `WM_INPUTLANGCHANGE`/
+  `WM_IME_SETCONTEXT` 幂等再摘除（真机验证丢字风险）。
+- win-2：无 Esc 取消拖动；拖动期间右键/滚轮以客户区形式到达应用；UI 卡顿时快速双击可能
+  退化；`WM_CAPTURECHANGED`/`WM_CANCELMODE`/定时器 tick 无测试；`MIN_VISIBLE_EDGE`
+  是物理常量；最大化还原只按水平比例。
+- txt-1：ppem 仍整数化；端到端亚像素测试只在 1x；无文本像素 golden。
+- mac-2：doc 坐标依赖 `markedRange.location == 0`；surrounding-text 通路待补。
+- 真机目视：高 DPI 下关 hinting 的字形观感、win-2 跨 DPI 拖动、macOS 真实中文/日文 IME。
 
 ## 操作须知（踩坑记录）
 
 - **只用 `edit` 工具改 Rust 源码**。PowerShell 多行字符串替换多次损坏文件（CRLF、
-  反引号、控制字符），事故记录见提交历史里的 `chore` 修复。
-- 三平台验证流程：`tools/remote/rsync.ps1 -Target linux|macos` → `tools/remote/cargo.ps1 -CargoArgs "..."`；
-  macOS 需 `+nightly-2026-11-09`（见 `tools/remote/cargo.ps1`）。
+  反引号、控制字符），事故记录见提交历史里的修复提交。
+- 三平台验证：`tools/remote/rsync.ps1 -Target linux|macos` → `tools/remote/cargo.ps1`；
+  macOS 需 `+nightly-2026-11-09`。
 - 不要对同一远端 target 并发跑两个 cargo。
-- 每次提交前跑：`cargo test -p ui_core --features test-support`、
-  `cargo +nightly clippy -p ui_core --all-targets --all-features -- -D warnings`、
-  `cargo +nightly fmt -p ui_core -- --check`、`cargo doc -p ui_core --no-deps`。
-
-## 完成后的收尾
-
-1. 三平台全量验证（含集成测试与示例 target）。
-2. 更新 `review/FINAL-ACCEPTANCE.md` 的 §5（待决项表清零）与 §1 数量表。
-3. 台账追加最终快照。
-4. 提交后将本目标标记为完成。
