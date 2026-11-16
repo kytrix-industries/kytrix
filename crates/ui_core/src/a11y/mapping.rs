@@ -62,6 +62,8 @@ pub(crate) const fn action_to_accesskit(action: A11yAction) -> accesskit::Action
         A::Click => Action::Click,
         A::Focus => Action::Focus,
         A::SetValue => Action::SetValue,
+        A::Increment => Action::Increment,
+        A::Decrement => Action::Decrement,
         A::SetTextSelection => Action::SetTextSelection,
         A::ScrollUp => Action::ScrollUp,
         A::ScrollDown => Action::ScrollDown,
@@ -86,6 +88,8 @@ pub(crate) const fn action_from_accesskit(action: accesskit::Action) -> Option<A
         Action::Focus => Some(A::Focus),
         Action::SetValue => Some(A::SetValue),
         Action::SetTextSelection => Some(A::SetTextSelection),
+        Action::Increment => Some(A::Increment),
+        Action::Decrement => Some(A::Decrement),
         Action::ScrollUp => Some(A::ScrollUp),
         Action::ScrollDown => Some(A::ScrollDown),
         Action::ScrollLeft => Some(A::ScrollLeft),
@@ -99,8 +103,6 @@ pub(crate) const fn action_from_accesskit(action: accesskit::Action) -> Option<A
         Action::CustomAction
         | Action::Blur
         | Action::ReplaceSelectedText
-        | Action::Decrement
-        | Action::Increment
         | Action::HideTooltip
         | Action::ShowTooltip
         | Action::ScrollToPoint
@@ -140,8 +142,10 @@ pub(crate) fn default_actions(role: A11yRole) -> Vec<A11yAction> {
         R::CheckBox | R::Switch | R::RadioButton | R::MenuItem | R::ListBoxOption => {
             vec![A::Click, A::Focus]
         }
-        // 滑块：数值通过 `numeric_value` 通道暴露，写值走 `SetValue`（P2-8）。
-        R::Slider => vec![A::SetValue, A::Focus],
+        // 滑块：数值通过 `numeric_value` 通道暴露，写值走 `SetValue`（UIA 的
+        // `RangeValuePattern.SetValue` 带 `NumericValue` payload），步进走
+        // Increment/Decrement（P2-8 / review P2-5）。
+        R::Slider => vec![A::SetValue, A::Increment, A::Decrement, A::Focus],
         R::TextInput | R::MultilineTextInput => vec![A::SetValue, A::SetTextSelection],
         R::ScrollView => vec![
             A::ScrollUp,

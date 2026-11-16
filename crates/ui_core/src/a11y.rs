@@ -132,6 +132,9 @@ pub enum A11yAction {
     Focus,
     /// 写输入框的值。
     SetValue,
+    /// 数值步进（`Slider` 等；与 `SetValue` 的文本值区分开）。
+    Increment,
+    Decrement,
     /// 设置文本选区。
     SetTextSelection,
     /// 向上滚动。
@@ -506,6 +509,8 @@ pub enum A11yActionData<'a> {
     },
     /// 滚动偏移。
     ScrollOffset(Point),
+    /// 数值（UIA `RangeValuePattern.SetValue` 传的就是这个，不是文本值）。
+    NumericValue(f64),
     /// 自定义动作 id。
     Custom(i32),
 }

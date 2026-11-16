@@ -84,8 +84,10 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
             A11yActionData::ScrollOffset(offset) => scroll_to(app, window, engine, offset),
             _ => false,
         },
-        // 引擎没有文本模型 / 展开语义 / 菜单模型：只有应用 handler 能落地。
+        // 引擎没有文本模型 / 展开语义 / 菜单模型 / 数值模型：只有应用 handler 能落地。
         A11yAction::SetValue
+        | A11yAction::Increment
+        | A11yAction::Decrement
         | A11yAction::SetTextSelection
         | A11yAction::Expand
         | A11yAction::Collapse
@@ -105,6 +107,10 @@ fn payload_of(data: Option<&ActionData>, action: A11yAction) -> A11yActionData<'
     match (action, data) {
         (A11yAction::Custom(id), _) => A11yActionData::Custom(id),
         (_, Some(ActionData::Value(value))) => A11yActionData::Value(value),
+        // UIA 的 `RangeValuePattern.SetValue` 发的是 `NumericValue(f64)` —— 不是文本值。
+        // 旧实现把它落到 `A11yActionData::None`，应用无法知道 AT 要求的目标数值，
+        // 于是「滑块能被 AT 读到数值、却不能被 AT 设值」（review P2-5）。
+        (_, Some(ActionData::NumericValue(value))) => A11yActionData::NumericValue(*value),
         (_, Some(ActionData::SetTextSelection(selection))) => A11yActionData::Selection {
             anchor: selection.anchor.character_index,
             focus: selection.focus.character_index,
@@ -309,6 +315,61 @@ mod tests {
             target_node: AkNodeId(crate::a11y::A11yNodeId::from_engine(target).get()),
             data,
         }
+    }
+
+    /// review P2-5：UIA `RangeValuePattern.SetValue` 发的是 `NumericValue(f64)`，
+    /// 应用 handler 必须能拿到这个数值 —— 旧实现把它落成 `A11yActionData::None`。
+    #[test]
+    fn numeric_set_value_reaches_the_handler() {
+        let (_runtime, mut app, window) = setup();
+        let root = app.window(window).expect("window").tree().root();
+        let node = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(crate::a11y::A11yRole::Slider),
+                ..A11yOverride::default()
+            })
+            .build(app.window_mut(window).expect("window").tree_mut(), root)
+            .expect("mount");
+        let seen = Rc::new(Cell::new(f64::NAN));
+        let slot = Rc::clone(&seen);
+        app.on_a11y_action(A11yAction::SetValue, move |ctx| {
+            if let A11yActionData::NumericValue(value) = ctx.data() {
+                slot.set(value);
+            }
+        });
+
+        dispatch(
+            &mut app,
+            window,
+            request(
+                AkAction::SetValue,
+                node,
+                Some(ActionData::NumericValue(42.5)),
+            ),
+        );
+
+        assert_eq!(seen.get(), 42.5, "handler 必须收到 UIA 传的数值");
+        assert!(
+            app.a11y_diagnostics().is_empty(),
+            "有 handler 时不得记未处理诊断"
+        );
+    }
+
+    /// review P2-5：`Increment` / `Decrement` 必须能映射到引擎动作（此前被静默忽略）。
+    #[test]
+    fn increment_and_decrement_are_routed_to_the_handler() {
+        let (_runtime, mut app, window) = setup();
+        let root = app.window(window).expect("window").tree().root();
+        let node = NodeBuilder::boxed()
+            .build(app.window_mut(window).expect("window").tree_mut(), root)
+            .expect("mount");
+        let count = Rc::new(Cell::new(0_u32));
+        let counter = Rc::clone(&count);
+        app.on_a11y_action(A11yAction::Increment, move |_ctx| {
+            counter.set(counter.get() + 1);
+        });
+        dispatch(&mut app, window, request(AkAction::Increment, node, None));
+        assert_eq!(count.get(), 1, "Increment 必须落到 handler");
     }
 
     #[test]
