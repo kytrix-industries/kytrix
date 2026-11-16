@@ -19,7 +19,7 @@ use windows::Win32::{
     UI::{
         HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
         Input::KeyboardAndMouse::{
-            GetDoubleClickTime, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT,
+            GetCapture, GetDoubleClickTime, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT,
             TrackMouseEvent,
         },
         WindowsAndMessaging::*,
@@ -345,10 +345,28 @@ impl WndProcState {
         if self.resize.take().is_some() {
             // SAFETY: `id` 由 `begin_resize` 在同一 hwnd 上创建；已过期 / 失败时是 no-op。
             let _ = unsafe { KillTimer(Some(hwnd), RESIZE_TIMER_ID) };
-            // SAFETY: 只释放本线程的捕获；没有捕获时是 no-op。
-            let _ = unsafe { ReleaseCapture() };
+            // 只有确实持有捕获时才置 suppress 并释放（见 `release_capture` 的说明）。
+            release_capture(hwnd, self);
         }
     }
+}
+
+/// 引擎**主动**释放指针捕获（拖拽结束 / 缩放结束）：只有本窗口确实持有捕获时才置
+/// `suppress_capture_cancel` 并释放。
+///
+/// 两处细节都不能省：
+/// - 自己调 `ReleaseCapture` 也会收到 `WM_CAPTURECHANGED`，不置位就会在每次松手后误投
+///   `PointerCancel`（复审 F1）；
+/// - 不持有捕获时 `ReleaseCapture` 不会产生该消息，若仍然置位，残留的 suppress 会把
+///   **下一次真实**的会话丢失当成「自己释放」而吞掉取消（复审 F2）。
+fn release_capture(hwnd: HWND, state: &mut WndProcState) {
+    // SAFETY: `GetCapture` 只读查询当前线程的捕获窗口。
+    if unsafe { GetCapture() } != hwnd {
+        return;
+    }
+    state.suppress_capture_cancel = true;
+    // SAFETY: 只释放本线程的捕获；同线程调用会同步派发 `WM_CAPTURECHANGED`。
+    let _ = unsafe { ReleaseCapture() };
 }
 
 /// 窗口过程。所有分支都先取 `GWLP_USERDATA`；创建期（尚未绑定状态）一律交 `DefWindowProcW`。
@@ -809,9 +827,8 @@ fn pump_loop(
                     // SAFETY: `hwnd` 是本进程创建的窗口；捕获在拖拽结束/失焦时释放。
                     unsafe { SetCapture(hwnd) };
                 } else {
-                    // SAFETY: 同上，释放本线程的捕获。
-                    native.state_mut().suppress_capture_cancel = true;
-                    let _ = unsafe { ReleaseCapture() };
+                    // 只有确实持有捕获时才置 suppress 并释放（见 `release_capture`）。
+                    release_capture(hwnd, native.state_mut());
                 }
             }
         }
@@ -1229,8 +1246,8 @@ mod wndproc_tests {
         System::LibraryLoader::GetModuleHandleW,
         UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, GWLP_USERDATA, GetWindowRect, HTRIGHT, RegisterClassW,
-            SendMessageW, SetWindowLongPtrW, WINDOW_EX_STYLE, WM_LBUTTONUP, WM_MOUSEMOVE,
-            WM_NCLBUTTONDOWN, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+            SendMessageW, SetWindowLongPtrW, WINDOW_EX_STYLE, WM_CAPTURECHANGED, WM_LBUTTONUP,
+            WM_MOUSEMOVE, WM_NCLBUTTONDOWN, WNDCLASSW, WS_OVERLAPPEDWINDOW,
         },
     };
 
@@ -1308,6 +1325,49 @@ mod wndproc_tests {
             .enable_all()
             .build()
             .expect("runtime")
+    }
+
+    /// 复审 F2：不持有捕获时引擎的 `release_capture` 不得留下 suppress 残留
+    /// （否则下一次真实会话丢失会被误当成「自己释放」而吞掉取消）。
+    #[test]
+    fn release_capture_without_ownership_leaves_no_suppress() {
+        let _runtime = runtime();
+        let dispatcher = Dispatcher::new();
+        let (hwnd, state, class_name) = hidden_window("KytrixReleaseCaptureTest", dispatcher);
+        // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
+        let state = unsafe { &mut *state };
+        super::release_capture(hwnd, state);
+        assert!(
+            !state.suppress_capture_cancel,
+            "没有捕获时不得置 suppress（会吞掉下一次真实取消）"
+        );
+        destroy_hidden_window(hwnd, state as *mut WndProcState);
+        // 占位：保证 `class_name` 活到窗口销毁之后。
+        let _ = class_name;
+    }
+
+    /// 复审 F1/F2：suppress 只吞**同一次**自己释放产生的 `WM_CAPTURECHANGED`。
+    #[test]
+    fn suppress_consumes_one_capture_change_and_clears() {
+        let _runtime = runtime();
+        let dispatcher = Dispatcher::new();
+        let (hwnd, state, class_name) = hidden_window("KytrixSuppressTest", dispatcher);
+        // SAFETY: 同上。
+        let raw = unsafe { &mut *state };
+        raw.suppress_capture_cancel = true;
+        // SAFETY: 隐藏窗口存活；消息同步派发到生产 `wndproc`。
+        unsafe {
+            let _ = SendMessageW(hwnd, WM_CAPTURECHANGED, None, None);
+        }
+        assert!(!raw.suppress_capture_cancel, "suppress 必须被消费并清零");
+        assert!(
+            !raw.events
+                .iter()
+                .any(|event| matches!(event, crate::platform::event::PlatformEvent::PointerCancel)),
+            "自己释放产生的捕获变化不得派发 PointerCancel"
+        );
+        destroy_hidden_window(hwnd, state);
+        let _ = class_name;
     }
 
     /// P1-1 回归：`WM_APP_COMPOSITION_WAKE` 只唤醒泵，**不**置帧唤醒位。

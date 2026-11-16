@@ -1064,15 +1064,26 @@ mod tests {
             .find(|primitive| primitive.clip_rect[0] > 0.0)
             .expect("被裁剪的 quad");
         let extent = super::clip_extent(primitive).expect("有限 clip");
-        // xywh ⇒ 右边界 = 100+800、下边界 = 50+600（AABB 误读会得到 800 / 600）。
-        assert!(
-            extent[2] >= 900 && extent[3] >= 650,
-            "clip 范围必须覆盖 x+w / y+h：{extent:?}"
-        );
+        // 编码按 scale 2 把逻辑换成物理：clip (100,50,800,600) ⇒ (200,100,1600,1200)。
+        // xywh ⇒ 右/下边界 = 200+1600 / 100+1200，再各 +1（AA 外扩）= 1801 / 1301；
+        // AABB 误读则得到 1600 / 1200 —— **精确断言**才能区分（旧的 >= 断言两者都通过）。
+        assert_eq!(extent[2], 1801, "右边界必须是 x+w（不是 w）：{extent:?}");
+        assert_eq!(extent[3], 1301, "下边界必须是 y+h（不是 h）：{extent:?}");
         let bounds = super::bounds_of_aabb([100.0, 50.0, 900.0, 650.0]);
-        assert!(
-            bounds.x1 >= 900 && bounds.y1 >= 650,
-            "bounds_of_aabb 必须覆盖整段 AABB：{bounds:?}"
+        assert_eq!(
+            (bounds.x0, bounds.y0, bounds.x1, bounds.y1),
+            (99, 49, 901, 651)
+        );
+        // 边界：NaN / 反向区间 ⇒ EMPTY；零尺寸仍有 1 px 外扩；无裁剪哨兵 ⇒ 全范围。
+        let empty = super::PhysicalBounds::EMPTY;
+        assert_eq!(super::bounds_of_aabb([f32::NAN, 0.0, 1.0, 1.0]), empty);
+        assert_eq!(super::bounds_of_aabb([10.0, 10.0, 5.0, 5.0]), empty);
+        let dot = super::bounds_of_aabb([7.0, 7.0, 7.0, 7.0]);
+        assert_eq!((dot.x0, dot.y0, dot.x1, dot.y1), (6, 6, 8, 8));
+        let all = super::bounds_of_aabb([f32::MIN, f32::MIN, f32::MAX, f32::MAX]);
+        assert_eq!(
+            (all.x0, all.y0, all.x1, all.y1),
+            (i32::MIN, i32::MIN, i32::MAX, i32::MAX)
         );
     }
     #[test]

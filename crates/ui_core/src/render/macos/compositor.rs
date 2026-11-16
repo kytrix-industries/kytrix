@@ -489,12 +489,17 @@ impl GpuRenderer {
                 .renderCommandEncoderWithDescriptor(&pass)
                 .ok_or_else(|| init_error("renderCommandEncoder", "returned nil"))?;
             let root = self.bind(&encoder, slot.index);
+            // 几何绘制会把几何 VBO 绑到 **vertex buffer 0**（实例的槽），需要在本帧
+            // 之后恢复实例绑定。克隆引用（refcount+1）以便同一借用期里再可变借用
+            // `self.geometry`。
+            let instances = self.upload.slot(slot.index).0.clone();
             // 逐 scissor 画：全帧 = 整面一次；局部 = 每个 damage 矩形一次。
             match full {
                 true => {
                     encoder.setScissorRect(whole_scissor(self.surface));
                     draw_calls = draw_ops(
                         &encoder,
+                        &instances,
                         payload,
                         instance_count,
                         [0, 0, self.surface.0 as i32, self.surface.1 as i32],
@@ -518,6 +523,7 @@ impl GpuRenderer {
                             encoder.setScissorRect(scissor);
                             draw_calls = draw_calls.saturating_add(draw_ops(
                                 &encoder,
+                                &instances,
                                 payload,
                                 instance_count,
                                 [rect.x0, rect.y0, rect.x1, rect.y1],
@@ -996,6 +1002,7 @@ fn root_uniform(surface: (u32, u32), scale: f32) -> RootUniform {
 
 fn draw_ops(
     encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+    instances: &Retained<ProtocolObject<dyn MTLBuffer>>,
     payload: &FramePayload,
     instance_count: u32,
     scissor: [i32; 4],
@@ -1081,6 +1088,10 @@ fn draw_ops(
                             entry.index(),
                             0,
                         );
+                    // 恢复实例的 **vertex buffer 0**：几何 VBO 覆盖了同一个槽，而后续
+                    // `FrameOp::Instances` 不会重绑它（旧实现只在 `bind()` 绑一次，导致
+                    // 「几何之后的所有实例绘制」都从几何顶点缓冲读 `GpuPrimitive`）。
+                    encoder.setVertexBuffer_offset_atIndex(Some(instances), 0, 0);
                 }
                 draw_calls = draw_calls.saturating_add(1);
             }

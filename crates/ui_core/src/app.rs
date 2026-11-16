@@ -5285,6 +5285,46 @@ mod interaction_tests {
             assert!(result.is_err(), "line_height={line_height} 必须被拒绝");
         }
     }
+    /// P0 回归（A4）：`App` 注册的几何必须经 `App::frame` 到达编码器。
+    ///
+    /// 旧缺陷是「调用点从未把 `App.geometry` 传给编码器」，只测编码器本身抓不到。
+    #[test]
+    fn app_registered_geometry_reaches_the_encoder() {
+        let (_rt, mut app, window) = setup();
+        let stride = crate::paint::geometry::GeometryPipeline::Ui.vertex_stride() as usize;
+        let desc = crate::paint::geometry::GeometryDesc {
+            vertex_bytes: bytes::Bytes::from(vec![0u8; stride * 3]),
+            index_bytes: bytes::Bytes::from(vec![0u8, 0, 1, 0, 2, 0]),
+            vertex_stride: stride as u32,
+            index_type: crate::paint::geometry::IndexType::U16,
+            topology: crate::paint::geometry::Topology::TriangleList,
+            bounds: Rect::new(0.0, 0.0, 100.0, 100.0),
+            pipeline: crate::paint::geometry::GeometryPipeline::Ui,
+        };
+        let id = app.geometry_mut().insert(desc).expect("valid geometry");
+        let root = app.window(window).expect("window").tree().root();
+        NodeBuilder::geometry(id)
+            .style({
+                let mut style = Style::default();
+                style.inner.size = taffy::geometry::Size {
+                    width: taffy::style::Dimension::length(100.0),
+                    height: taffy::style::Dimension::length(100.0),
+                };
+                style
+            })
+            .build(app.window_mut(window).expect("window").tree_mut(), root)
+            .expect("mount geometry");
+        frame(&mut app, window);
+
+        let draws = app.window(window).expect("window").encoded_geometry();
+        let draw = draws.first().expect("必须编码出一条几何绘制");
+        assert_eq!(
+            draw.desc.vertex_bytes.len(),
+            stride * 3,
+            "App 注册的顶点必须真的到达编码器（旧缺陷：编码器持空表 ⇒ 空 desc）"
+        );
+    }
+
     fn lane_quad_bounds(app: &App, window: WindowId, node: NodeId) -> Vec<Rect> {
         let window = app.window(window).expect("window");
         let Some(lane) = window.tree().lane_of(node) else {

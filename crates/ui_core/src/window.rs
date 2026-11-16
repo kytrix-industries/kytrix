@@ -619,6 +619,12 @@ impl Window {
         Ok(report)
     }
 
+    /// 测试专用：最近一次编码出的几何绘制（校验 `App` 的几何表真的接进了编码器）。
+    #[cfg(test)]
+    pub(crate) fn encoded_geometry(&self) -> &[crate::paint::instance::GeometryDrawGpu] {
+        self.encoder.buffer().geometry()
+    }
+
     /// **不调整 OS 窗口 / 渲染目标**：只改比例与布局失效。平台层随后用 `set_surface` 写入真实
     /// 渲染目标；平台已写过真值时本方法保留它，应用代码不要在活窗口上用本方法改客户区
     /// （F-186 / F-189）。只有平台尚未写入过目标（headless / 快照 / 首帧前）时，`surface` 才
