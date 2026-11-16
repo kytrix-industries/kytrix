@@ -1196,24 +1196,68 @@ impl App {
     ) {
         let hit = self.hit_at(window, position);
         outcome.hit = hit;
-        let container = self.windows.get(&window).and_then(|target| {
-            hit.and_then(|result| scroll::scroll_ancestor(target.tree(), result.node))
-        });
-        let Some((node, slot)) = container else {
+        let Some(result) = hit else {
             return;
         };
-        // 与轴无关的统一规则（§5.1）：Shift ⇒ 横向，否则纵向。
-        let drives = if modifiers.contains(Modifiers::SHIFT) {
-            delta_x
+        // Shift 交换两轴：各平台的约定都是「Shift + 滚轮 = 横向」。交换后每个容器只消费
+        // **自己那条轴**的 delta，另一轴原样留给外层的容器（P2-4）。
+        let (mut dx, mut dy) = if modifiers.contains(Modifiers::SHIFT) {
+            (delta_y, delta_x)
         } else {
-            delta_y
+            (delta_x, delta_y)
         };
-        if drives == 0.0 {
+        if dx == 0.0 && dy == 0.0 {
             return;
         }
-        let target = scroll::wheel_target(&slot, drives);
-        let handle = ScrollHandle::new(window, node);
-        let _ = self.scroll_to_animated(&handle, target);
+        // 由内到外收集滚动祖先（含命中节点自身）：滚轮先给最内层，滚不动才交给外层，
+        // 这就是浏览器的 scroll chaining。旧实现只取**一个**最近祖先，内层到底后滚轮
+        // 直接失效（复杂图表里嵌套的横向 + 纵向容器最明显）。
+        let Some(target) = self.windows.get(&window) else {
+            return;
+        };
+        let mut chain: SmallVec<[(NodeId, crate::interaction::ScrollSlot, Size); 8]> =
+            SmallVec::new();
+        let mut cursor = Some(result.node);
+        while let Some(current) = cursor {
+            if let Some(slot) = target.tree().scroll_slot(current) {
+                let size = scroll::viewport(target.tree(), current).size;
+                chain.push((current, slot, size));
+            }
+            cursor = target
+                .tree()
+                .get(current)
+                .ok()
+                .and_then(|node| node.parent());
+        }
+        for (node, slot, size) in chain {
+            let drives = match slot.axis {
+                ScrollAxis::Vertical => dy,
+                ScrollAxis::Horizontal => dx,
+            };
+            if drives == 0.0 {
+                continue;
+            }
+            // 本容器实际能消费的行数（受 max_offset 夹紧）；吃不完的留给外层。
+            let max = scroll::max_offset(&slot, size);
+            let (before, limit) = match slot.axis {
+                ScrollAxis::Vertical => (slot.offset.y, max.y),
+                ScrollAxis::Horizontal => (slot.offset.x, max.x),
+            };
+            let after = (before - drives * slot.line_height).clamp(0.0, limit);
+            let consumed = (before - after) / slot.line_height;
+            if consumed == 0.0 {
+                continue;
+            }
+            let handle = ScrollHandle::new(window, node);
+            let _ = self.scroll_to_animated(&handle, scroll::wheel_target(&slot, consumed));
+            match slot.axis {
+                ScrollAxis::Vertical => dy -= consumed,
+                ScrollAxis::Horizontal => dx -= consumed,
+            }
+            if dx == 0.0 && dy == 0.0 {
+                break;
+            }
+        }
     }
 
     fn on_key(
@@ -5163,6 +5207,89 @@ mod interaction_tests {
         assert_eq!(
             app.scroll_state(&handle).expect("state").offset,
             Point::new(0.0, 50.0)
+        );
+    }
+
+    /// P2-4 回归：滚轮必须按 scroll chaining 先给最内层容器，滚不动再交给外层。
+    ///
+    /// 旧实现只取**一个**最近的滚动祖先：内层到底后滚轮直接失效，外层永远滚不动
+    /// （嵌套的横向 + 纵向容器、或列表里嵌固定高度面板时最明显）。
+    #[test]
+    fn wheel_falls_through_to_the_outer_container_when_the_inner_cannot_scroll() {
+        let (_rt, mut app, window) = setup();
+        let outer = mount_scroll_container(&mut app, window, 150.0);
+        // 内层：同样要 `Clip::Bounds` 才是可滚动容器（`make_scroll` 的前置条件）。
+        let mut inner_style = Style::default();
+        inner_style.inner.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::length(200.0),
+            height: taffy::style::Dimension::length(100.0),
+        };
+        inner_style.clip = Clip::Bounds;
+        let inner = NodeBuilder::boxed()
+            .style(inner_style)
+            .build(app.window_mut(window).expect("window").tree_mut(), outer)
+            .expect("mount inner");
+        frame(&mut app, window);
+
+        let outer_handle = app
+            .make_scroll(
+                window,
+                outer,
+                ScrollConfig {
+                    axis: ScrollAxis::Vertical,
+                    line_height: 48.0,
+                },
+            )
+            .expect("outer scrollable");
+        app.set_scroll_content(&outer_handle, Size::new(200.0, 400.0))
+            .expect("outer content");
+        // 内层是**恰好装下内容**的容器：max_offset == 0，它一帧都滚不动。
+        let inner_handle = app
+            .make_scroll(
+                window,
+                inner,
+                ScrollConfig {
+                    axis: ScrollAxis::Vertical,
+                    line_height: 48.0,
+                },
+            )
+            .expect("inner scrollable");
+        app.set_scroll_content(&inner_handle, Size::new(200.0, 100.0))
+            .expect("inner content");
+        frame(&mut app, window);
+
+        // 在内层范围内滚一格：内层吃不下，外层必须动。
+        app.dispatch_input(
+            window,
+            InputEvent::Scroll {
+                position: Point::new(50.0, 50.0),
+                delta_x: 0.0,
+                delta_y: -1.0,
+                modifiers: Modifiers::empty(),
+            },
+        );
+
+        // 滚轮走的是动画滚动（`scroll_to_animated`）：把时钟推过动画时长再读回真实偏移。
+        app.advance_clock(std::time::Duration::from_millis(400));
+        frame(&mut app, window);
+        let offset_of = |app: &App, node: NodeId| {
+            app.window(window)
+                .expect("window")
+                .tree()
+                .scroll_slot(node)
+                .map(|slot| slot.offset)
+        };
+        let inner_offset = offset_of(&app, inner);
+        let outer_offset = offset_of(&app, outer);
+        assert_eq!(
+            inner_offset.map(|offset| offset.y),
+            Some(0.0),
+            "内层装得下内容，不得产生偏移"
+        );
+        assert_eq!(
+            outer_offset.map(|offset| offset.y),
+            Some(48.0),
+            "滚轮必须穿透到能滚的外层容器"
         );
     }
 
