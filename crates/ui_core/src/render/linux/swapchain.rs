@@ -177,21 +177,21 @@ impl Swapchain {
             height: size.1.max(1),
         };
         let extent = vk::Extent2D {
-            width: requested
-                .width
-                .clamp(capabilities.min_image_extent.width, capabilities.max_image_extent.width),
-            height: requested
-                .height
-                .clamp(capabilities.min_image_extent.height, capabilities.max_image_extent.height),
+            width: requested.width.clamp(
+                capabilities.min_image_extent.width,
+                capabilities.max_image_extent.width,
+            ),
+            height: requested.height.clamp(
+                capabilities.min_image_extent.height,
+                capabilities.max_image_extent.height,
+            ),
         };
         // usage 必须被 `supported_usage_flags` 覆盖，否则同样是 INITIALIZATION_FAILED。
         // 直通 copy 需要 TRANSFER_DST、渲染需要 COLOR_ATTACHMENT —— 两者缺一就明确报错，
         // 而不是留给驱动吐一个无信息量的失败。
-        let required_usage = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST;
-        if !capabilities
-            .supported_usage_flags
-            .contains(required_usage)
-        {
+        let required_usage =
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST;
+        if !capabilities.supported_usage_flags.contains(required_usage) {
             return Err(EngineError::UnsupportedGpu {
                 os: "linux",
                 required: "COLOR_ATTACHMENT | TRANSFER_DST swapchain images",

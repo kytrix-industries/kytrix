@@ -1557,6 +1557,51 @@ impl App {
         Ok(())
     }
 
+    /// 布局之后把所有滚动容器的偏移重新夹紧（P2-3.3）。
+    ///
+    /// 偏移只在**显式滚动**时被 `clamp_offset` 约束（`scroll_to` 是唯一写点），而可用范围
+    /// `content − viewport` 会随布局变化：列表变短、视口变高、窗口放大都会让它收缩。
+    /// 不重夹就会留下「滚到超过内容末尾」的状态 —— 表现为底部空白、或下一次滚轮只把
+    /// 越界量吃掉而不滚动。虚拟列表的 `rewindow` 也依赖偏移是合法的。
+    ///
+    /// 只在**布局实际重跑过**之后调用（帧内 `layout_if_dirty` 之后）：没有重排时范围不会变，
+    /// 每帧遍历所有滚动槽是纯浪费。
+    fn normalize_scroll_offsets(&mut self, window: WindowId) {
+        let Some(target) = self.windows.get_mut(&window) else {
+            return;
+        };
+        // 先收集（遍历时 `tree_mut` 与 `viewport` 的只读借用会冲突）。
+        let nodes: SmallVec<[crate::node::id::NodeId; 8]> = target
+            .tree()
+            .order()
+            .iter()
+            .copied()
+            .filter(|node| target.tree().scroll_slot(*node).is_some())
+            .collect();
+        let mut changed = false;
+        for node in nodes {
+            let Some(slot) = target.tree().scroll_slot(node) else {
+                continue;
+            };
+            let viewport = scroll::viewport(target.tree(), node);
+            let next = scroll::clamp_offset(&slot, viewport.size);
+            if next == slot.offset {
+                continue;
+            }
+            if let Some(slot) = target.tree_mut().scroll_slot_mut(node) {
+                slot.offset = next;
+            }
+            // damage 是屏幕坐标（要减掉祖先滚动偏移，容器自身偏移不算）。
+            let damage = scroll::to_screen(target.tree(), node, viewport);
+            target.request_damage(damage);
+            target.a11y_note_scroll(node);
+            changed = true;
+        }
+        if changed {
+            self.request_frame();
+        }
+    }
+
     /// 相对滚动。
     ///
     /// # Errors
@@ -2665,6 +2710,11 @@ impl App {
         let committed_at = self.clock;
         #[cfg(feature = "hud")]
         self.prepare_debug_hud(window);
+        // P2-3.3：偏移只在显式滚动时被夹紧，而可用范围 `content − viewport` 会随**内容尺寸**
+        // 与**视口尺寸**变化 —— 两者都不一定触发重排（`set_scroll_content` 只写滚动槽），
+        // 所以这里**每帧**都重夹一次。必须在取唤醒位**之前**：夹紧本身可能请求一帧，
+        // 否则「内容变短」这类不标脏位的变化会停在 Idle 上永远不修。
+        self.normalize_scroll_offsets(window);
         let wake = self.take_wake_request();
         // P10：动画在帧门禁**之前**推进（写 `Transient` + 给注册节点标 `PAINT`），因此「有动画」必然
         // 让 `needs_frame` 为真；动画结束后不再留帧。
@@ -4918,6 +4968,46 @@ mod interaction_tests {
 
     // ── 滚动（paint 期偏移） ───────────────────────────────────────────────────
 
+    /// P2-3.3 回归：内容变短 / 视口变高后必须把滚动偏移重新夹回范围内。
+    ///
+    /// 偏移只在显式滚动时被夹紧，而可用范围随布局变化。不重夹会留下「滚过内容末尾」的
+    /// 状态：底部露出空白，且下一次滚轮先吃掉越界量、看起来像「滚不动」。
+    #[test]
+    fn layout_change_reclamps_the_scroll_offset() {
+        let (_rt, mut app, window, container, _child) = scrollable_app();
+        let handle = app.scroll_handle(window, container).expect("scroll handle");
+        // 内容 200 高、视口 150 高 ⇒ 最多滚 50。
+        app.scroll_to(&handle, Point::new(0.0, 50.0))
+            .expect("scroll to the bottom");
+        frame(&mut app, window);
+        assert_eq!(
+            app.window(window)
+                .expect("window")
+                .tree()
+                .scroll_slot(container)
+                .expect("scroll slot")
+                .offset
+                .y,
+            50.0,
+            "滚到内容末尾"
+        );
+
+        // 内容缩到 80（小于视口）：可用范围变 0 ⇒ 偏移必须回到 0。
+        app.set_scroll_content(&handle, Size::new(200.0, 80.0))
+            .expect("content shrink");
+        frame(&mut app, window);
+        assert_eq!(
+            app.window(window)
+                .expect("window")
+                .tree()
+                .scroll_slot(container)
+                .expect("scroll slot")
+                .offset
+                .y,
+            0.0,
+            "内容变短后偏移必须被重新夹紧（旧实现会停在 50）"
+        );
+    }
     fn scrollable_app() -> (tokio::runtime::Runtime, App, WindowId, NodeId, NodeId) {
         let (rt, mut app, window) = setup();
         let container = mount_scroll_container(&mut app, window, 150.0);

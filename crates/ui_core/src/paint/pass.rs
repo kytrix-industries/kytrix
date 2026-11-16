@@ -212,7 +212,7 @@ fn paint_node(
             }
         }
     } else {
-        rebuild_lane(context, node, clip, offset);
+        rebuild_lane(context, node, clip, offset)?;
     }
 
     let (children, clip_bounds) = {
@@ -304,7 +304,12 @@ fn hide_subtree(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
     }
 }
 
-fn rebuild_lane(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext, offset: Point) {
+fn rebuild_lane(
+    context: &mut PaintContext<'_>,
+    node: NodeId,
+    clip: &ClipContext,
+    offset: Point,
+) -> Result<(), EngineError> {
     #[cfg(feature = "test-support")]
     let created = context.tree.lane_of(node).is_none();
     let lane = match context.tree.lane_of(node) {
@@ -317,15 +322,9 @@ fn rebuild_lane(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
     };
     let _ = context.scene.clear_lane(lane);
 
-    for clip_rect in &clip.rects {
-        let _ = context
-            .scene
-            .push(lane, Primitive::Clip(ClipOp::Push(*clip_rect)));
-    }
-
-    let (bounds, content_offset, patch, spec, content, node_damage, ring) = {
+    let (bounds, content_offset, patch, spec, content, node_damage, ring, content_clip) = {
         let Ok(target) = context.tree.get(node) else {
-            return;
+            return Ok(());
         };
         let content = match target.kind() {
             NodeKind::Box => Content::Box,
@@ -339,6 +338,8 @@ fn rebuild_lane(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
         let spec = target.paint_spec().cloned();
         let node_damage = target.damage();
         let content_offset = context.tree.content_offset(node);
+        let content_clip =
+            (target.clip() == Clip::Bounds).then(|| bounds.inset(target.layout().border));
         let ring = (context.focused == Some(node))
             .then(|| context.tree.focus_ring(node))
             .flatten();
@@ -350,8 +351,25 @@ fn rebuild_lane(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
             content,
             node_damage,
             ring,
+            content_clip,
         )
     };
+
+    // 本节点自身的内容 clip 还会再占一层（见 `emit_content`）：先按最坏情况校验深度，
+    // 超深时返回 `ClipDepthExceeded` 而不是让 `Lane::push` 的 debug 断言在编码期炸掉。
+    let own_clip_levels = usize::from(content_clip.is_some());
+    if clip.rects.len() + own_clip_levels > usize::from(crate::paint::scene::MAX_CLIP_DEPTH) {
+        return Err(EngineError::ClipDepthExceeded {
+            node,
+            depth: clip.rects.len() + own_clip_levels,
+            limit: crate::paint::scene::MAX_CLIP_DEPTH,
+        });
+    }
+    for clip_rect in &clip.rects {
+        let _ = context
+            .scene
+            .push(lane, Primitive::Clip(ClipOp::Push(*clip_rect)));
+    }
 
     let mut emitter = PrimitiveEmitter {
         lane,
@@ -366,6 +384,7 @@ fn rebuild_lane(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
         node_damage,
         offset,
         ring,
+        content_clip,
     };
     emitter.emit(context);
 
@@ -408,6 +427,7 @@ fn rebuild_lane(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
         },
         primitives,
     });
+    Ok(())
 }
 
 /// 逐图元生成 + damage 累积（§6.2 的生成表）。
@@ -428,6 +448,12 @@ struct PrimitiveEmitter {
     offset: Point,
     /// 焦点环（仅焦点节点 + `Style.focus_ring` 时存在）。
     ring: Option<crate::paint::style::FocusRing>,
+    /// 本节点**自身**的 `Clip::Bounds` padding box（屏幕坐标）。
+    ///
+    /// 只作用于**内容**（文本 / Canvas / 几何），不作用于背景/边框/阴影 —— 与 CSS 一致：
+    /// `overflow` 裁剪的是元素内容，不是元素自己的装饰。旧实现只把 clip 压给子树，
+    /// 于是「容器剪不住自己的 Canvas」：图表的柱子会溢出到容器外（P2-3.2）。
+    content_clip: Option<Rect>,
 }
 
 /// 取负（`Point` 没有 `Neg`；屏幕 = 内容 − 偏移）。
@@ -583,6 +609,29 @@ impl PrimitiveEmitter {
     }
 
     fn emit_content(&mut self, context: &mut PaintContext<'_>, opacity: f32) {
+        // 内容按本节点自己的 padding box 裁剪（`Clip::Bounds`）。背景/边框/阴影在
+        // `emit` 里先画、不受这个 clip 影响（CSS 的 `overflow` 语义）。
+        //
+        // 只在**确实有内容**时压括号：`Content::Box`（纯盒子）与还没 shape 好的文本不产生
+        // 图元，白压一对 `Clip` 会白占一层 clip 深度（嵌套容器很容易因此提前触顶）。
+        let has_content = match &self.content {
+            Content::Box => false,
+            Content::Text(line) => line.is_some(),
+            Content::Canvas(_) | Content::Geometry(_) => true,
+        };
+        let content_clip = self
+            .content_clip
+            .filter(|_| has_content)
+            .map(|rect| ClipRect {
+                rect,
+                // 内容裁剪只按轴对齐矩形裁（与子树 clip 同一形状，圆角留空）。
+                corner_radius: [0.0; 4],
+            });
+        if let Some(clip_rect) = content_clip {
+            let _ = context
+                .scene
+                .push(self.lane, Primitive::Clip(ClipOp::Push(clip_rect)));
+        }
         match std::mem::replace(&mut self.content, Content::Box) {
             Content::Box => {}
             Content::Geometry(id) => {
@@ -606,11 +655,14 @@ impl PrimitiveEmitter {
                 context.damage.push(canvas_bounds, 1.0, self.clip);
             }
             Content::Text(line) => {
-                let Some(line) = line else {
-                    return;
-                };
-                self.emit_text(context, &line, opacity);
+                // 不早退：早退会跳过下面的 `Clip(Pop)`，把 clip 泄漏给后续节点。
+                if let Some(line) = line {
+                    self.emit_text(context, &line, opacity);
+                }
             }
+        }
+        if content_clip.is_some() {
+            let _ = context.scene.push(self.lane, Primitive::Clip(ClipOp::Pop));
         }
     }
 
@@ -919,6 +971,71 @@ mod tests {
         );
         let _ = child;
     }
+    /// P2-3.2 回归：`Clip::Bounds` 必须裁剪节点**自身的内容**。
+    ///
+    /// 旧实现只把 clip 压给子树，于是「容器剪不住自己的 Canvas/文本」：图表的柱子会溢出
+    /// 到容器外。CSS 语义里 `overflow` 裁的是内容，装饰（背景/边框）不受影响。
+    #[test]
+    fn own_clip_brackets_the_node_content() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let mut style = fixed_style(60.0, 20.0);
+        style.clip = Clip::Bounds;
+        // 用 Canvas 作内容：paint harness 不做文本 shape，文本内容为空不会产生图元。
+        let mut canvas = crate::paint::canvas::Canvas::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        canvas.push_quad(crate::paint::primitive::Quad {
+            bounds: Rect::new(0.0, 0.0, 200.0, 200.0),
+            corner_radius: [0.0; 4],
+            paint: QuadPaint::Solid {
+                fill: crate::paint::color::Color::WHITE,
+                border: None,
+            },
+        });
+        let clipped = NodeBuilder::canvas(canvas)
+            .style(style)
+            .build(&mut h.tree, root)
+            .expect("挂载");
+        // 对照：同样形状但**不**裁剪的 Canvas 节点不应有额外括号。
+        let mut plain_canvas = crate::paint::canvas::Canvas::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        plain_canvas.push_quad(crate::paint::primitive::Quad {
+            bounds: Rect::new(0.0, 0.0, 200.0, 200.0),
+            corner_radius: [0.0; 4],
+            paint: QuadPaint::Solid {
+                fill: crate::paint::color::Color::WHITE,
+                border: None,
+            },
+        });
+        let plain = NodeBuilder::canvas(plain_canvas)
+            .style(fixed_style(60.0, 20.0))
+            .build(&mut h.tree, root)
+            .expect("挂载");
+        layout_all(&mut h.tree);
+        let _ = h.paint();
+
+        let primitives = lane_primitives(&h, clipped);
+        assert!(
+            matches!(primitives.first(), Some(Primitive::Clip(ClipOp::Push(_)))),
+            "内容前必须有自身 padding box 的 clip：{primitives:?}"
+        );
+        assert!(
+            matches!(primitives.last(), Some(Primitive::Clip(ClipOp::Pop))),
+            "内容 clip 必须闭合：{primitives:?}"
+        );
+        assert!(
+            primitives
+                .iter()
+                .any(|primitive| matches!(primitive, Primitive::Canvas(_))),
+            "Canvas 内容必须在括号内"
+        );
+        let plain_primitives = lane_primitives(&h, plain);
+        assert!(
+            !plain_primitives
+                .iter()
+                .any(|primitive| matches!(primitive, Primitive::Clip(_))),
+            "不裁剪的节点不得额外压 clip：{plain_primitives:?}"
+        );
+    }
+
     #[test]
     fn clip_brackets_lane_and_subtree() {
         let mut h = Harness::new();
