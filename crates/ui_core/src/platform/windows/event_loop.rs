@@ -785,19 +785,23 @@ fn pump_loop(
         }
 
         // ②c 交互反馈：光标 / 指针捕获 / 连续帧定时器（P10 §5.4 / §11.3、P17 HUD）。
-        // 光标是**每窗口**状态（`WM_SETCURSOR` 各自读自己的 `WndProcState`），而
-        // `App::take_cursor_change` 不带窗口 id ⇒ 必须写到**所有**窗口，否则首窗之外的
-        // 窗口永远显示箭头（P2-4）。
-        if let Some(cursor) = app.take_cursor_change() {
-            for native in windows.iter_mut() {
-                native.state_mut().set_cursor(cursor);
-            }
+        // 两者都是**每窗口**状态，请求本身携带 `WindowId`（复审 P1-3 / P2-2）：
+        // - 光标：`WM_SETCURSOR` 各窗口读自己的 `WndProcState`；广播会把 A 窗口的 I-Beam
+        //   写进 B 窗口，而 B 的解析值仍是 Default ⇒ 不会再发变化 ⇒ B 永久显示错光标。
+        // - 捕获：`SetCapture` 只对目标 HWND 生效；固定给首窗会导致非首窗拖拽在鼠标移出
+        //   窗口后收不到 `WM_LBUTTONUP`，会话永久卡住。
+        if let Some((target, cursor)) = app.take_cursor_change()
+            && let Some(native) = windows.iter_mut().find(|native| native.id() == target)
+        {
+            native.state_mut().set_cursor(cursor);
             // SAFETY: 系统光标句柄由 `LoadCursorW` 借用，进程不拥有；`SetCursor` 只影响本线程。
             unsafe { SetCursor(Some(cursor_handle(cursor))) };
         }
-        if let Some(native) = windows.first_mut() {
-            let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
-            if let Some(capture) = app.take_capture_request() {
+        if let Some((target, capture)) = app.take_capture_request()
+            && let Some(native) = windows.iter_mut().find(|native| native.id() == target)
+        {
+            {
+                let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
                 if capture {
                     // SAFETY: `hwnd` 是本进程创建的窗口；捕获在拖拽结束/失焦时释放。
                     unsafe { SetCapture(hwnd) };
@@ -807,6 +811,9 @@ fn pump_loop(
                     let _ = unsafe { ReleaseCapture() };
                 }
             }
+        }
+        if let Some(native) = windows.first_mut() {
+            let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
             // 定时器随宿主窗口销毁而失效：宿主已不是当前首窗 ⇒ 清掉记录，下面在新首窗重建
             // （否则首窗关闭后其余窗口的动画/连续帧永远不再推进，P2-4）。
             if frame_timer.is_some_and(|(owner, _)| owner != native.hwnd_raw()) {

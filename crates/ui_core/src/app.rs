@@ -157,9 +157,11 @@ pub struct App {
     /// 下一个动画 id（单调；`AnimationId` 的代际）。
     next_animation: u32,
     /// 待推给平台的光标变化（`None` = 没变）。
-    cursor_pending: Option<Cursor>,
+    /// 待推给平台的**光标变化**（带窗口 id：光标是每窗口状态，P2 复审）。
+    cursor_pending: Option<(WindowId, Cursor)>,
     /// 待推给平台的捕获请求（`Some(true)` = 取得、`Some(false)` = 释放）。
-    capture_request: Option<bool>,
+    /// 待推给平台的**指针捕获请求**（带窗口 id：SetCapture 是每窗口状态，复审 P1-3）。
+    capture_request: Option<(WindowId, bool)>,
     /// 待执行的 Linux 客户端装饰窗口控制（自绘标题栏的按钮 / 拖动）。
     #[cfg(target_os = "linux")]
     window_control: Option<(WindowId, crate::window::WindowControl)>,
@@ -1032,7 +1034,7 @@ impl App {
                 });
                 pointer.capture = true;
             }
-            self.capture_request = Some(true);
+            self.capture_request = Some((window, true));
             let handled = self.dispatch_action_with_hit(
                 window,
                 node,
@@ -1102,7 +1104,7 @@ impl App {
             }
         }
         if changed {
-            self.cursor_pending = Some(cursor);
+            self.cursor_pending = Some((window, cursor));
         }
     }
 
@@ -1123,7 +1125,7 @@ impl App {
             pointer.end_drag()
         });
         if let Some(session) = session {
-            self.capture_request = Some(false);
+            self.capture_request = Some((window, false));
             let delta = session.delta();
             let action = session.action;
             let handled = self.dispatch_action_with_hit(
@@ -1200,7 +1202,7 @@ impl App {
             }
         }
         if changed {
-            self.cursor_pending = Some(Cursor::Default);
+            self.cursor_pending = Some((window, Cursor::Default));
         }
     }
 
@@ -1377,7 +1379,7 @@ impl App {
             .get_mut(&window)
             .and_then(|target| target.pointer_mut().end_drag());
         if let Some(session) = cancelled {
-            self.capture_request = Some(false);
+            self.capture_request = Some((window, false));
             let delta = session.delta();
             let _ = self.dispatch_action(
                 window,
@@ -2163,7 +2165,7 @@ impl App {
         let Some(session) = session else {
             return false;
         };
-        self.capture_request = Some(false);
+        self.capture_request = Some((window, false));
         let delta = session.delta();
         let action = session.action;
         self.dispatch_action(
@@ -2356,13 +2358,16 @@ impl App {
         self.clock += by;
     }
 
-    /// 取走待推给平台的光标变化。
-    pub(crate) fn take_cursor_change(&mut self) -> Option<Cursor> {
+    /// 取走待推给平台的光标变化（**带窗口 id**：光标是每窗口状态）。
+    pub(crate) fn take_cursor_change(&mut self) -> Option<(WindowId, Cursor)> {
         self.cursor_pending.take()
     }
 
-    /// 取走待推给平台的捕获请求（`Some(true)` = 取得、`Some(false)` = 释放）。
-    pub(crate) fn take_capture_request(&mut self) -> Option<bool> {
+    /// 取走待推给平台的捕获请求（`(窗口, true)` = 取得、`(窗口, false)` = 释放）。
+    ///
+    /// 必须带窗口 id：`SetCapture` 是**每窗口**状态，固定发给首窗会让非首窗的拖拽拿不到
+    /// 捕获，鼠标移出窗口后松手就丢 `WM_LBUTTONUP`，会话永久卡在「按住」（复审 P1-3）。
+    pub(crate) fn take_capture_request(&mut self) -> Option<(WindowId, bool)> {
         self.capture_request.take()
     }
 
@@ -2471,7 +2476,7 @@ impl App {
             // 会话，避免下一次移动被误当成标题栏/边框拖拽。
             target.pointer_mut().end_drag();
             target.pointer_mut().press = None;
-            self.capture_request = Some(false);
+            self.capture_request = Some((window, false));
         }
         self.window_control = Some((window, control));
         Ok(())
@@ -5816,7 +5821,11 @@ mod interaction_tests {
         );
         let state = app.drag_state(window).expect("drag session");
         assert_eq!(state.node(), grip);
-        assert_eq!(app.take_capture_request(), Some(true), "拖拽请求指针捕获");
+        assert_eq!(
+            app.take_capture_request(),
+            Some((window, true)),
+            "拖拽请求指针捕获"
+        );
 
         let moved = app.dispatch_input(
             window,
@@ -5837,7 +5846,7 @@ mod interaction_tests {
             },
         );
         assert_eq!(app.drag_state(window), None);
-        assert_eq!(app.take_capture_request(), Some(false));
+        assert_eq!(app.take_capture_request(), Some((window, false)));
         assert_eq!(up.action, Some(Action::custom("split")), "抬起派发 End");
         assert_eq!(up.click_count, 0, "拖拽后不产生点击");
         assert_eq!(
