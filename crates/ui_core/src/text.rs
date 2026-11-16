@@ -660,8 +660,6 @@ pub struct TextPassReport {
     pub rasterized: usize,
     /// 命中字形 tile 缓存的字形数。
     pub tiles_reused: usize,
-    /// 出现 `glyph.id == 0`（.notdef）的字形数。
-    pub tofu: usize,
     /// 因图集满而走「清空 + 重建」的次数。
     pub atlas_rebuilds: usize,
     /// 本次累积的脏行段数（P07 的增量上传输入）。

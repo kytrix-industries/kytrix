@@ -48,8 +48,8 @@ fn text_frame_records_glyph_run_instances() {
     );
     assert!(record.stats.instances > 0, "字形必须产生实例");
     assert!(
-        record.stats.text.is_some_and(|text| text.tofu == 0),
-        "不能出现 tofu（宿主字体缺失时该断言失败，见 V-46）"
+        record.stats.text.is_some_and(|text| text.shaped > 0),
+        "帧记录必须带上文本统计（形状 pass 真的跑过）"
     );
     assert!(record.damage.iter().all(|rect| !rect.is_empty()));
 }

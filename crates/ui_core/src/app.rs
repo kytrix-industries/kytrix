@@ -3089,6 +3089,16 @@ impl App {
                     || previous.height.to_bits() != measured.height.to_bits());
             tree.set_text_shaped(node, Rc::clone(&shaped), key, epoch, measured, size_changed);
         }
+        // 光栅/图集统计：`GlyphAtlas` 自带计数器，但此前从未接进报告（`rasterized` /
+        // `tiles_reused` / `tofu` / `atlas_rebuilds` 永远是 0）。
+        //
+        // 注意**跨帧**：光栅发生在同帧的 `layout_text`（第二阶段），而本报告在第一阶段产出，
+        // 所以这里取到的是**上一帧**的光栅统计。要拿到同帧数字就得把报告延到帧末，代价是
+        // 报告与 `record.text` 的存放时机都要改；按「诊断用、允许一帧延迟」的定位保持现状。
+        let stats = self.glyph_atlas.take_stats();
+        report.tiles_reused = stats.hits;
+        report.rasterized = stats.rasters;
+        report.atlas_rebuilds = stats.rebuilds;
         report.dirty_spans = pending_dirty.spans().len();
         Some(Ok(report))
     }
