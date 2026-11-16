@@ -54,7 +54,8 @@ impl ImeState {
                 Some(text) if !text.is_empty() => {
                     self.composing = true;
                     // `zwp_text_input_v3` 的 preedit 是整串替换，没有 AppKit 那种区间替换；
-                    // `delete_surrounding_text` 属于另一条通路，见 `surface.rs`。
+                    // `delete_surrounding_text` 目前**未接线**（`surface.rs` 的事件分支里被丢弃）：
+                    // 没有 surrounding-text 通路，暂不支持删除周围文本的输入法语义。
                     events.push(ImeEvent::Preedit {
                         text: SmolStr::new(text),
                         replace: None,

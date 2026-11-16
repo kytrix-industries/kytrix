@@ -206,6 +206,9 @@ impl InputEvent {
 ///   （没有组合串时在插入点插入）；
 /// - `Some(range)`：区间相对**当前组合串起点**（UTF-16 码元），新文本替换该区间里的旧文本，
 ///   区间外的组合串余下文本保留。当前平台层给出的端点已吸附到码点边界（不会拆开代理对）。
+///
+/// **已知限制**（macOS）：本 view 还没有 surrounding-text 通路，指向「已提交文本」的重转换
+/// 区间会被 clamp 到当前组合串边界。逐子句更新组合串与普通提交不受影响。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImeEvent {
     /// 开始组合。

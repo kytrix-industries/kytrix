@@ -10,12 +10,17 @@
 
 use smol_str::SmolStr;
 
-/// AppKit `NSNotFound`（`NSUInteger` 最大值）：`replacementRange` 用它表示「没有显式替换区间」。
+/// AppKit `NSNotFound`：`replacementRange` 用它表示「没有显式替换区间」。
+///
+/// **值是 `NSIntegerMax`（`isize::MAX`），不是 `NSUInteger::MAX`**：objc2-foundation 的
+/// `NSNotFound: NSInteger = NSIntegerMax`，AppKit 传给 `NSUInteger` 形参时是
+/// `0x7FFF_FFFF_FFFF_FFFF`（64 位）。写 `usize::MAX` 会让真实输入法的正常路径
+/// `{NSNotFound, 0}` 不匹配、退化成「在组合串尾部插入」（第三轮复审 P1）。
 ///
 /// 只有 macOS 包装器与跨平台单测用得到；Linux 的 `zwp_text_input_v3` 是整串 preedit，
 /// 没有区间替换概念，因此编译期排除，避免 `dead_code`。
 #[cfg(any(target_os = "macos", test))]
-const NS_NOT_FOUND: usize = usize::MAX;
+const NS_NOT_FOUND: usize = isize::MAX as usize;
 
 /// AppKit `replacementRange`（UTF-16 码元）→ 组合串内要替换的旧文本区间。
 ///
@@ -95,7 +100,7 @@ impl CommitDeduper {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommitDeduper, replacement_range};
+    use super::{CommitDeduper, NS_NOT_FOUND, replacement_range};
 
     /// UTF-16 码元视图（AppKit 的 `NSRange` 单位）。
     fn utf16(text: &str) -> Vec<u16> {
@@ -105,15 +110,18 @@ mod tests {
     #[test]
     fn ns_not_found_means_replace_the_current_marked_text() {
         // AppKit 的 `{NSNotFound, 0}`：没有显式区间，调用方替换整个组合串。
-        assert_eq!(replacement_range(usize::MAX, 0, &utf16("ni")), None);
-        assert_eq!(replacement_range(usize::MAX, 3, &utf16("你好")), None);
-        assert_eq!(replacement_range(usize::MAX, 0, &[]), None);
+        // 真实哨兵是 `NSIntegerMax`，不是 `NSUInteger::MAX`（复审 P1 的回归点）。
+        assert_eq!(NS_NOT_FOUND, isize::MAX as usize);
+        assert_eq!(replacement_range(NS_NOT_FOUND, 0, &utf16("ni")), None);
+        assert_eq!(replacement_range(NS_NOT_FOUND, 3, &utf16("你好")), None);
+        assert_eq!(replacement_range(NS_NOT_FOUND, 0, &[]), None);
+        assert_eq!(replacement_range(1, 0, &utf16("ni")), Some(1..1));
+        assert_eq!(replacement_range(2, 0, &utf16("ni")), Some(2..2));
     }
 
     #[test]
     fn an_empty_range_is_an_insertion_point_inside_the_composition() {
         assert_eq!(replacement_range(0, 0, &utf16("ni")), Some(0..0));
-        assert_eq!(replacement_range(1, 0, &utf16("ni")), Some(1..1));
         assert_eq!(replacement_range(2, 0, &utf16("ni")), Some(2..2));
     }
 
@@ -129,7 +137,7 @@ mod tests {
         assert_eq!(replacement_range(9, 1, &marked), Some(2..2));
         assert_eq!(replacement_range(1, 99, &marked), Some(1..2));
         assert_eq!(replacement_range(0, usize::MAX, &marked), Some(0..2));
-        assert_eq!(replacement_range(usize::MAX - 1, 2, &marked), Some(2..2));
+        assert_eq!(replacement_range(NS_NOT_FOUND - 1, 2, &marked), Some(2..2));
         // 没有组合串时（例如 `insertText:` 在提交前清空）任何区间都收敛成插入点。
         assert_eq!(replacement_range(0, 0, &[]), Some(0..0));
         assert_eq!(replacement_range(3, 2, &[]), Some(0..0));

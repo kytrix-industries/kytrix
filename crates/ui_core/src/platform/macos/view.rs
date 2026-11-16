@@ -327,7 +327,9 @@ define_class!(
         fn selected_range(&self) -> NSRange {
             let ime = self.ivars().ime.borrow();
             if !ime.has_marked() {
-                return NSRange::new(NSUInteger::MAX, 0);
+                // AppKit 的「无范围」是 `NSNotFound`（`NSIntegerMax`），不是 `NSUInteger::MAX`：
+                // 写错会让 AppKit 当成一个巨大的有效 location（第三轮复审 M2，与 ime.rs 同源）。
+                return NSRange::new(isize::MAX as usize, 0);
             }
             let (location, length) = ime.selected_range();
             NSRange::new(location, length)
@@ -337,7 +339,9 @@ define_class!(
         fn marked_range(&self) -> NSRange {
             let ime = self.ivars().ime.borrow();
             if !ime.has_marked() {
-                return NSRange::new(NSUInteger::MAX, 0);
+                // AppKit 的「无范围」是 `NSNotFound`（`NSIntegerMax`），不是 `NSUInteger::MAX`：
+                // 写错会让 AppKit 当成一个巨大的有效 location（第三轮复审 M2，与 ime.rs 同源）。
+                return NSRange::new(isize::MAX as usize, 0);
             }
             let (location, length) = ime.marked_range();
             NSRange::new(location, length)

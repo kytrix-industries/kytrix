@@ -1966,9 +1966,9 @@ mod wndproc_tests {
     /// P2-7 回归：应用禁用 IME 后窗口过程吞掉全部 `WM_IME_*`（不派发 `ImeEvent`），
     /// 重新启用后恢复派发。
     ///
-    /// 只验证窗口过程的状态机（不真正给测试窗口绑 IME）：隐藏窗口没有输入上下文，所以
-    /// 禁用走 `ImmAssociateContext` 返回 NULL 的分支、启用走 `ImmAssociateContextEx(
-    /// IACE_DEFAULT)` 分支 —— 两条边都要覆盖。
+    /// 只验证窗口过程的状态机（不真正给测试窗口绑 IME）。注意：实测隐藏窗口创建时**已有**
+    /// 默认输入上下文，因此禁用走「保存旧 HIMC」分支、启用走「恢复保存值」分支；
+    /// `saved_context == None → IACE_DEFAULT` 分支需要在真机 IME 环境下覆盖。
     #[test]
     fn disabled_ime_swallows_composition_events_until_reenabled() {
         let _runtime = runtime();

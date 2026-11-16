@@ -113,7 +113,9 @@ impl ImeState {
     /// 启用：把保存的上下文还回去。没有保存过（禁用时窗口本来就没有关联上下文）则用
     /// `ImmAssociateContextEx(..., IACE_DEFAULT)` 让系统给窗口关联**默认**上下文。
     ///
-    /// 两条分支都在 `wndproc_tests` 的隐藏窗口用例里跑过：返回值只用来记账，不重试。
+    /// 覆盖情况：`wndproc_tests` 的隐藏窗口用例实际只走**保存/恢复**分支（实测隐藏窗口创建时就有
+    /// 默认 HIMC，`ImmAssociateContext` 返回非 NULL）；`saved_context == None` 的
+    /// `IACE_DEFAULT` 分支只在「禁用时窗口本来无上下文」时出现，暂无自动测试（真机 IME 可覆盖）。
     pub(crate) fn set_enabled(&mut self, hwnd: HWND, enabled: bool) {
         if enabled == self.enabled {
             return;
@@ -128,10 +130,18 @@ impl ImeState {
             if enabled {
                 match self.saved_context.take() {
                     Some(context) => {
+                        // 返回值是「被替换的旧上下文」：窗口刚被摘下，正常为 NULL；
+                        // 若禁用期间系统又给窗口关联了新上下文（焦点/输入法切换），它会在这里
+                        // 被替换出来，随后随窗口释放，不需要本层释放（复审 W1-3）。
                         let _ = ImmAssociateContext(hwnd, context);
                     }
                     None => {
-                        let _ = ImmAssociateContextEx(hwnd, HIMC::default(), IACE_DEFAULT);
+                        let restored = ImmAssociateContextEx(hwnd, HIMC::default(), IACE_DEFAULT);
+                        if !restored.as_bool() {
+                            // 恢复失败：回滚成「禁用」，下一轮泵会重试；否则 `enabled` 已记账、
+                            // 永远不会再试 ⇒ IME 静默失效（复审 W1-4）。
+                            self.enabled = false;
+                        }
                     }
                 }
             } else {

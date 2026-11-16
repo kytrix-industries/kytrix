@@ -13,8 +13,8 @@
 //!   `kNone`（Windows 上 Chrome 同样只做亚像素定位）；hinting 打开时字形内部笔画与 parley
 //!   用小数 advance 排出的位置不一致，CJK 还会被横向挤压。代价是小 ppem（≤ 16）下笔画略软。
 //!
-//! 回退：把 [`SUBPIXEL_PHASES`] 改成 `1`（整像素定位）或 [`HINTING`] 改成 `true`（旧的整 ppem
-//! 全 hinting）。两者都是编译期常量，改完图集缓存自然换代，不需要 migration。
+//! 回退：把 [`SUBPIXEL_PHASES`] 改成 `1`（整像素量化：`floor` 落点，**与旧实现的
+//! `round` 不同**，会有最多 1px 的整体位移）或 [`HINTING`] 改成 `true`（旧的整 ppem
 
 use swash::{
     scale::{Render, ScaleContext, Source},
