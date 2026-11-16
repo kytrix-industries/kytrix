@@ -533,11 +533,15 @@ impl GpuRenderer {
             }
             encoder.endEncoding();
         }
-        // 几何换代的旧缓冲按当前帧序号入 retire 队列（等该帧完成后释放，I4）；同时驱逐
+        // 几何换代的旧缓冲按**当前帧序号**入 retire 队列（等该帧完成后释放，I4）；同时驱逐
         // 长期未绘制的几何（它们的设备对象进同一个 retire 列表）。
+        //
+        // 用 `index` 而不是 `last_index`：后者是**上一次已提交**的帧，按它释放会比「当前帧
+        // 完成」更早 —— 现在恰好安全（被驱逐的几何 180 帧未用、换代旧缓冲也不被本帧引用），
+        // 但这是隐式假设而不是本代码的保证；Windows/Linux 两后端都用当前帧号（复审 P2-3）。
         self.geometry.retain_recent(&mut geometry_retired);
         for handle in geometry_retired {
-            self.queue.retire(self.last_index, handle);
+            self.queue.retire(index, handle);
         }
         if let Some(drawable) = drawable {
             let target = drawable.texture();
