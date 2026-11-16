@@ -19,8 +19,9 @@
 //! - **I3**：节奏来自 `CAMetalDisplayLink`（主 run loop 的 **common modes**）；空闲 `isPaused = true`，
 //!   有帧请求 / 在飞帧 / 连续帧时恢复。
 //!
-//! 关闭握手（§4.5 / F-169）：`Drop` 里停 display link → signal shutdown → `join` GPU 线程；
-//! GPU 线程在退出前自行 drain 在飞帧（完成通知到达后才释放旧资源，I4）。
+//! 关闭握手（§4.5 / F-169）：`Drop` 里停 display link → signal shutdown → **有界等待** GPU 线程
+//! 退出（[`JOIN_TIMEOUT`]，超时 detach，见 [`join_with_deadline`]）；GPU 线程在退出前自行 drain
+//! 在飞帧（完成通知到达后才释放旧资源，I4）。
 
 use std::{
     collections::VecDeque,
@@ -76,12 +77,19 @@ use crate::{
 /// [`SurfaceMismatch`]。
 const MAX_SURFACE_MISMATCHES: u32 = 4;
 
-/// 关闭握手等待在飞帧完成的上界（驱动挂死时 `Drop` 的 `join` 不能无限等待，见
-/// [`Shared::wait_for_work`]）。
+/// GPU 线程自己等待在飞帧完成的上界（驱动挂死时线程不能无限等待，见
+/// [`Shared::wait_for_work`]；主线程的等待另有 [`JOIN_TIMEOUT`]，两者互相独立）。
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// 关闭握手的轮询间隔：只在 `shutdown && in_flight > 0` 时生效。
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
+
+/// 主线程等待 GPU 线程退出的总上限（P2-7）。正常关闭是毫秒级；超过就 detach，
+/// 见 [`join_with_deadline`]。
+const JOIN_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// 主线程等待 GPU 线程退出的轮询间隔（只有关闭路径才睡）。
+const JOIN_POLL: Duration = Duration::from_millis(5);
 
 /// 门面：窗口路径是「最新帧槽 + 最新 drawable 槽 + GPU 线程」，离屏路径是同步渲染器。
 ///
@@ -430,10 +438,15 @@ impl WindowRenderer {
             display_link.addToRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSRunLoopCommonModes);
         }
 
+        // GPU 线程自持一份图层引用（保活）：detach 之后主线程先释放窗口/图层，迟到的
+        // `presentDrawable` 也不会打到已释放的 `CAMetalLayer` 上（见 `join_with_deadline`）。
+        let layer_keep_alive = SendLayer {
+            _layer: layer.clone(),
+        };
         let worker = Arc::clone(&shared);
         let thread = thread::Builder::new()
             .name("kytrix-metal".to_owned())
-            .spawn(move || gpu_loop(gpu, worker))
+            .spawn(move || gpu_loop(gpu, worker, layer_keep_alive))
             .map_err(|error| EngineError::AppInit {
                 detail: format_smolstr!("spawn kytrix-metal thread: {error}"),
             })?;
@@ -558,13 +571,35 @@ impl Drop for WindowRenderer {
         let Some(thread) = self.thread.take() else {
             return;
         };
-        // 关闭握手（F-169）：**直接 join**，不超时 detach。GPU 循环没有无限等待（三槽 semaphore
-        // 用 `DISPATCH_TIME_NOW`、`commit` 立即返回、shutdown 分支在在飞帧 drain 完后退出；
-        // 如果驱动永不回调完成，等待有 [`SHUTDOWN_GRACE`] 上界）。放弃等待会让 GPU 线程在 UI
-        // 归还 `CAMetalLayer` / `App` 之后仍触碰 Metal 对象（use-after-free）。panic 时 `join`
-        // 立即返回 `Err`，错误已由 `PanicGuard` 交给 `poll`。
-        let _ = thread.join();
+        join_with_deadline(thread);
     }
+}
+
+/// 有界等待 GPU 线程退出（P2-7）：超过 [`JOIN_TIMEOUT`] 就 **detach**（丢弃 `JoinHandle`），不让
+/// 驱动挂死把主线程（AppKit 事件循环）拖住。
+///
+/// 参照 Windows 后端的 `join_with_message_pump` / `JOIN_TIMEOUT_MS`：那边边等边泵窗口消息、总上限
+/// 10 s；macOS 的 GPU 线程**不需要主线程**任何帮助（drawable 由 display link 在停表前给出，提交是
+/// 异步的，完成回调来自 Metal），所以主线程只需要一个很短的固定上限，不需要泵事件。
+///
+/// **detach 的安全性**：GPU 线程的闭包按值拥有 `GpuRenderer`（device / queue / persist / 上传
+/// 缓冲 / 图集）与 `Arc<Shared>`，还持有一份 `CAMetalLayer` 强引用（见 [`gpu_loop`] 的
+/// `_keep_alive` 参数）；主线程随后释放自己那一份引用不会让线程手里的任何对象失效。代价只有
+/// 驱动挂死时资源要等进程退出才释放 —— 与 Windows 后端 detach 的取舍一致，好过主线程永久卡住。
+fn join_with_deadline(thread: JoinHandle<()>) {
+    let deadline = Instant::now() + JOIN_TIMEOUT;
+    while !thread.is_finished() {
+        if Instant::now() >= deadline {
+            eprintln!(
+                "kytrix: kytrix-metal thread did not exit within {:?}; detaching it (GPU likely lost)",
+                JOIN_TIMEOUT
+            );
+            return;
+        }
+        thread::sleep(JOIN_POLL);
+    }
+    // 线程已经结束：`join` 立即返回（panic 已由 `PanicGuard` 交给 `poll`）。
+    let _ = thread.join();
 }
 
 /// 命令缓冲跨线程移交（Metal 完成回调 → GPU 线程 drain）。
@@ -579,6 +614,16 @@ struct SendDrawable(Retained<ProtocolObject<dyn CAMetalDrawable>>);
 
 // SAFETY: Metal 对象本身线程安全；放进最新 drawable 槽之后只有 GPU 线程持有引用。
 unsafe impl Send for SendDrawable {}
+
+/// 图层的跨线程**保活**句柄（GPU 线程只持有引用，不解引用、不读写任何属性）。
+struct SendLayer {
+    /// 只为保活：detach 之后线程可能还在提交最后一帧，`presentDrawable` 需要图层还活着。
+    _layer: Retained<CAMetalLayer>,
+}
+
+// SAFETY: 图层属性仍然只有主线程写（§5.3）；GPU 线程这一份引用只用于让 detach 之后仍在收尾的
+// `presentDrawable` 不落到已释放的图层上。`Retained` 的引用计数本身是原子的。
+unsafe impl Send for SendLayer {}
 
 /// UI 线程与 GPU 线程共享的最新帧 / 图集 / 最新 drawable / 完成队列 / 反馈槽 + 唤醒原语。
 struct Shared {
@@ -872,9 +917,10 @@ impl Shared {
 
     /// 空闲：睡在 condvar 上直到「有完成通知 / 有帧且有 drawable / 关闭且无在飞帧」。
     ///
-    /// 关闭后有在飞帧但驱动永不回调完成时，等待必须有上界（否则 `Drop` 的 `join` 永久挂住
-    /// UI）：用 100 ms 超时轮询，从关闭请求起**累计**超过 [`SHUTDOWN_GRACE`] 返回
-    /// [`WaitOutcome::TimedOut`]。正常路径（关闭后在飞帧很快归零、或未关闭）仍然是无超时等待。
+    /// 关闭后有在飞帧但驱动永不回调完成时，等待必须有上界（否则 GPU 线程自己永不退出，
+    /// detach 之后还会一直占着资源）：用 100 ms 超时轮询，从关闭请求起**累计**超过
+    /// [`SHUTDOWN_GRACE`] 返回 [`WaitOutcome::TimedOut`]。正常路径（关闭后在飞帧很快归零、
+    /// 或未关闭）仍然是无超时等待。
     fn wait_for_work(&self) -> WaitOutcome {
         let mut state = self.lock();
         loop {
@@ -1047,7 +1093,11 @@ impl Drop for PanicGuard {
 }
 
 /// GPU 线程主循环（§5.2）。
-fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>) {
+///
+/// `_keep_alive` 是**保活引用**：detach 之后线程可能还在提交最后一帧，而 `presentDrawable` 的目标
+/// 正是这个图层。主线程在 `Drop` 里已经释放了自己的引用，这份引用保证图层活到线程退出（图层属性
+/// 仍然只有主线程写，这里不读不写，§5.3）。
+fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, _keep_alive: SendLayer) {
     enter_gpu_thread();
     // panic 出路：展开时把错误交给 UI（`poll` 不会静默停摆）；正常路径 disarm。
     let guard = PanicGuard::new(Arc::clone(&shared));
@@ -1064,8 +1114,9 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>) {
             renderer.set_background_color(linear);
         }
         if shared.wait_for_work() == WaitOutcome::TimedOut {
-            // 驱动没有回调完成：继续等会让 `Drop` 的 `join` 永久挂住 UI。Metal 的命令缓冲自己
-            // 持有资源引用，退出时释放 device/queue 不会 UAF。
+            // 驱动没有回调完成：线程自己不能永远等下去（detach 之后它会一直占着资源；进程退出前
+            // 也没有人会来救它）。Metal 的命令缓冲自己持有资源引用，退出时释放 device/queue 不会
+            // UAF。
             eprintln!(
                 "kytrix: metal shutdown waited {} s for {} in-flight frame(s) without a completion callback; exiting the GPU thread",
                 SHUTDOWN_GRACE.as_secs(),
@@ -1295,9 +1346,9 @@ mod tests {
     use smol_str::SmolStr;
 
     use super::{
-        AtlasSlots, FeedbackQueue, MAX_SURFACE_MISMATCHES, PanicGuard, SHUTDOWN_GRACE,
-        SendCommandBuffer, Shared, StickyError, SurfaceMismatch, SurfaceVerdict, WaitOutcome,
-        pacing_paused, surface_within_tolerance,
+        AtlasSlots, FeedbackQueue, JOIN_TIMEOUT, MAX_SURFACE_MISMATCHES, PanicGuard,
+        SHUTDOWN_GRACE, SendCommandBuffer, Shared, StickyError, SurfaceMismatch, SurfaceVerdict,
+        WaitOutcome, join_with_deadline, pacing_paused, surface_within_tolerance,
     };
     use crate::{
         error::EngineError,
@@ -1584,9 +1635,46 @@ mod tests {
         assert_eq!(
             receiver.recv_timeout(Duration::from_secs(6)),
             Ok(WaitOutcome::TimedOut),
-            "驱动永不回调完成时关闭等待必须有界（join 不能挂住 UI）"
+            "驱动永不回调完成时 GPU 线程自己的等待必须有界（detach 后它也要能退出）"
         );
         assert!(started.elapsed() >= SHUTDOWN_GRACE, "必须等满 grace 才放弃");
+    }
+
+    /// 正常关闭：GPU 线程已经退出时 `join` 立即返回，主线程不白等 [`JOIN_TIMEOUT`]。
+    #[test]
+    fn a_finished_gpu_thread_is_joined_immediately() {
+        let thread = std::thread::spawn(|| {});
+        let started = Instant::now();
+        join_with_deadline(thread);
+        assert!(
+            started.elapsed() < JOIN_TIMEOUT,
+            "已退出的线程不能被超时拖住：{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// P2-7 回归：GPU 线程卡在驱动里永不返回时，主线程（AppKit 事件循环）必须在
+    /// [`JOIN_TIMEOUT`] 附近放弃等待（detach），不能无限阻塞窗口关闭 / 应用退出。
+    #[test]
+    fn a_hung_gpu_thread_is_detached_after_the_bounded_wait() {
+        // 用一个挂住的线程模拟「驱动没有回调完成、线程永不返回」。
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let _ = wait.recv_timeout(Duration::from_secs(60));
+        });
+        let started = Instant::now();
+        join_with_deadline(thread);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= JOIN_TIMEOUT,
+            "必须等满上限才放弃 join：{elapsed:?}"
+        );
+        assert!(
+            elapsed < JOIN_TIMEOUT + Duration::from_secs(5),
+            "detach 等待必须有界（不能退化成永久 join）：{elapsed:?}"
+        );
+        // 放掉挂住的线程，避免它陪测试进程一起跑到超时。
+        let _ = release.send(());
     }
 
     /// F-169 的「terminated-only」语义：关闭期间必须继续收完成通知（关闭握手靠它把在飞帧

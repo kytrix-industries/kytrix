@@ -25,7 +25,9 @@ use crate::{
 };
 
 /// drawable 池深度：`CAMetalLayer` 只接受 2 / 3；取 3 与三槽上传缓冲、三张在飞帧对齐。
-const MAXIMUM_DRAWABLE_COUNT: usize = 3;
+///
+/// `compositor` 的 drawable 同步表也按这个深度分配容量（同时留下的纹理数与图层池相同）。
+pub(crate) const MAXIMUM_DRAWABLE_COUNT: usize = 3;
 
 /// 旧 drawable 在 live resize 期间的贴放位置：**不缩放**，固定视觉左上角。
 ///

@@ -1,13 +1,26 @@
-//! 帧编排：上传 → 逐 damage scissor 画进持久 offscreen → 整面 blit 到 drawable → present
-//! （`design/async-render-pipeline.md` §5.2 / §5.6）。
+//! 帧编排：上传 → 逐 damage scissor 画进持久 offscreen → 把 persist 与 drawable 的差异 blit
+//! 过去 → present（`design/async-render-pipeline.md` §5.2 / §5.6）。
 //!
 //! **本模块不取 drawable**：窗口路径的 drawable 由 `CAMetalDisplayLink` 的 update 提供，
 //! `CAMetalLayer::nextDrawable` 已删除（§5.7）。离屏/快照路径不给 drawable，只画进 persist。
 //!
 //! **两条与 Windows 不同的硬约束**（F-121）：
-//! 1. `FramePlan::copy_plan()` / `present_dirty()` 是 D3D12 专用：Metal 的 present 目标内容跨帧无保证，
-//!    因此**每帧整面 blit**；`plan()`（scissor）与 `is_full()`（clear）仍是共用语义。
+//! 1. `FramePlan::copy_plan()` / `present_dirty()` 是 D3D12 专用：Metal 没有 dirty present 扩展。
+//!    局部帧的 persist → drawable 同步按 damage 矩形逐块 blit（P2-6）；`plan()`（scissor）与
+//!    `is_full()`（clear）仍是共用语义。
 //! 2. 没有 barrier / 资源状态机：Metal 自动跟踪 hazard。
+//!
+//! **persist ↔ drawable 的同步契约**（P2-6）：`CAMetalLayer` 的 drawable 从内部纹理池轮换
+//! （QuartzCore 头文件：池里的纹理要被复用，前提是上一个 `CAMetalDrawable` 已经释放），所以
+//! 「这一帧拿到的是哪一张、它停在几帧前」只能按**纹理身份**追踪。每张 drawable 记下自己错过的
+//! damage，present 前把它与 persist 的差异一次补齐；**任何无法证明同步的状态**（新纹理、
+//! 全量帧、累计面积达到整面）都整面拷一次（见 [`DrawableSyncs`]）。
+//!
+//! 由此付的代价与前提：
+//! - 局部帧拷的是「这张 drawable 错过的最近几帧 damage 的并集」，最坏约为**单帧 damage 的 3 倍**
+//!   （池深 3），而不是整面；累计面积达到整面时退化为一次整面拷，因此**带宽上界不超过改动前**。
+//! - 同一纹理对象在两次 present 之间保留上次写入的内容（池化复用的直接结果，不是 Apple 的显式
+//!   承诺）。局部同步只在**同一纹理身份**上做：对象换代（resize / 图层换池）后一律整面拷。
 //!
 //! 线程纪律：窗口路径的所有成员只属于 `kytrix-metal` 线程；persist 重建**不等待在飞帧**，
 //! 旧纹理按帧序号进 retire 队列（§4.3 / I4）。图层属性一个都不在这里写（§5.3）。
@@ -35,7 +48,8 @@ use crate::{
         instance::{FrameOp, GpuClipEntry},
     },
     render::{
-        compositor::{FramePlan, Plan},
+        compositor::{DamageRects, FramePlan, MAX_DRAW_PASSES, Plan},
+        damage::MAX_DAMAGE_RECTS,
         frame::{FramePayload, MAX_FRAMES_IN_FLIGHT},
         macos::{
             atlas::AtlasTextures,
@@ -43,6 +57,7 @@ use crate::{
             geometry::GeometryRegistry,
             pipeline::Pipeline,
             queue::Queue,
+            swapchain::MAXIMUM_DRAWABLE_COUNT,
         },
         retire::GpuResourceHandle,
         timer::{FrameTimings, GpuTimerSample, Section},
@@ -66,6 +81,8 @@ pub(crate) struct GpuRenderer {
     pipeline: Pipeline,
     atlas: AtlasTextures,
     persist: Persist,
+    /// persist → drawable 的同步状态（按 drawable 纹理身份；离屏路径没有 drawable，保持空表）。
+    drawable_syncs: DrawableSyncs,
     upload: UploadArena,
     /// 全量帧的 clear color（**linear**：`BGRA8Unorm_sRGB` 的 clear 由硬件做 sRGB 编码）。
     ///
@@ -132,6 +149,7 @@ impl GpuRenderer {
             pipeline,
             atlas,
             persist,
+            drawable_syncs: DrawableSyncs::new(),
             upload,
             clear_color,
             surface: size,
@@ -193,6 +211,9 @@ impl GpuRenderer {
         self.queue.retire(self.last_index, old);
         self.surface = size;
         self.fresh = true;
+        // 新尺寸的 drawable 是图层池里新建的纹理，旧表项持有的是旧尺寸纹理：同步状态整体作废
+        // （否则旧纹理被表项强引用着不会释放，新纹理也会被当成「已同步」）。
+        self.drawable_syncs.entries.clear();
         Ok(true)
     }
 
@@ -211,7 +232,8 @@ impl GpuRenderer {
         self.clear_color = linear;
     }
 
-    /// 窗口路径：把一帧画进 persist 后整面 blit 到 `drawable`，登记完成通知并 `commit`（I2）。
+    /// 窗口路径：把一帧画进 persist 后，把这张 drawable 落后于 persist 的部分 blit 过去，登记
+    /// 完成通知并 `commit`（I2）。
     ///
     /// 调用方（GPU 循环）已经：取到 drawable、非阻塞拿到三槽上传槽、按 drawable 实际尺寸
     /// 调过 [`GpuRenderer::prepare_target`]、并构造好 `frame`。
@@ -358,7 +380,7 @@ impl GpuRenderer {
         self.atlas.pending(kind)
     }
 
-    /// 录制一帧（不呈现、不提交）：取槽 → 上传 → 图集 blit → persist 绘制 → 整面 blit。
+    /// 录制一帧（不呈现、不提交）：取槽 → 上传 → 图集 blit → persist 绘制 → drawable 差异 blit。
     ///
     /// 返回本帧槽位与命令缓冲；调用方决定是异步 `submit` 还是同步 `submit_blocking`。
     fn record_frame(
@@ -382,12 +404,11 @@ impl GpuRenderer {
             index,
             "timings must be reset for this frame"
         );
-        // **不要**按 `copy_plan()` 做局部拷贝：drawable 的内容跨帧无保证（结论 #4 / F-121）。
+        // 局部帧必须带非空 damage 集：drawable 的补拷集完全由它决定（`Plan::Partial` 负责携带；
+        // 断言调用方不是用一个空的「假 Partial」绕过同步追踪）。
         debug_assert!(
-            !matches!(frame.plan(), Plan::Partial(_))
-                || frame.is_full()
-                || frame.present_dirty().is_some(),
-            "partial plans must carry their dirty set"
+            !matches!(frame.plan(), Plan::Partial(damage) if damage.is_empty()),
+            "a partial plan must carry a non-empty dirty set"
         );
         let frame_started = Instant::now();
         // 用 `try_acquire` 已经取到的那个槽：permit 与上传槽必须一一对应（P1-2.12）。
@@ -491,7 +512,7 @@ impl GpuRenderer {
                             // `request.surface` 与 drawable 允许 1 px 取整差：裁剪后可能没有
                             // 面积（`x == surface.0` 等）。0 面积的 scissor 是 Metal validation
                             // 的未定义边缘，直接跳过这个 damage 矩形。
-                            let Some(scissor) = scissor_for(rect, self.surface) else {
+                            let Some(scissor) = clipped_rect(rect, self.surface) else {
                                 continue;
                             };
                             encoder.setScissorRect(scissor);
@@ -520,10 +541,35 @@ impl GpuRenderer {
         }
         if let Some(drawable) = drawable {
             let target = drawable.texture();
+            // `present_dirty()` 就是**本帧要同步进 drawable 的 damage 集**（`None` = 整面：`fresh`、
+            // `Plan::Full`、`Idle`）。非全量的 `Idle` 帧不会带 drawable 走到这里（`gpu_loop` 在提交前
+            // 就拦下），归到整面只影响正确性方向（多拷）。
+            let damage = match frame.present_dirty() {
+                Some(damage) => FrameDamage::Partial(damage),
+                None => FrameDamage::Full,
+            };
+            let copy = self.drawable_syncs.plan(&target, damage, self.surface);
             let blit = command
                 .blitCommandEncoder()
                 .ok_or_else(|| init_error("blitCommandEncoder", "returned nil"))?;
-            blit_persist_to(&blit, self.persist.texture(), &target, self.surface);
+            match copy {
+                DrawableCopy::Full => blit_persist_rect(
+                    &blit,
+                    self.persist.texture(),
+                    &target,
+                    whole_scissor(self.surface),
+                ),
+                DrawableCopy::Rects(rects) => {
+                    for rect in rects.as_slice() {
+                        // `request.surface` 与 drawable 允许 1 px 取整差：裁剪后没有面积的矩形
+                        // 落在目标之外，跳过（与渲染 scissor 同一条裁剪规则）。
+                        let Some(region) = clipped_rect(rect, self.surface) else {
+                            continue;
+                        };
+                        blit_persist_rect(&blit, self.persist.texture(), &target, region);
+                    }
+                }
+            }
             blit.endEncoding();
         }
         Ok((
@@ -572,6 +618,189 @@ impl GpuRenderer {
             });
         }
         root
+    }
+}
+
+/// drawable 同步表容量 = 图层池深度：同时被表项强引用着的纹理数与 `CAMetalLayer` 自己的池相同，
+/// 不会多占显存；表满时淘汰最久未用的条目（它下次出现时按新纹理整面拷）。
+const DRAWABLE_SYNC_SLOTS: usize = MAXIMUM_DRAWABLE_COUNT;
+
+/// 本帧对 persist 的改动（`FramePlan` 的像素语义）。
+#[derive(Clone, Copy, Debug)]
+enum FrameDamage {
+    /// 全量帧：persist 的每个像素都可能变了。
+    Full,
+    /// 局部帧：只有这些矩形变了（`Plan::Partial` 的 damage 集）。
+    Partial(DamageRects),
+}
+
+/// 一帧要往当前 drawable 拷的范围。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrawableCopy {
+    /// 整面：这张 drawable 的内容无法证明与 persist 一致。
+    Full,
+    /// 只拷这些矩形：这张 drawable 自上次同步以来 persist 变化过的区域并集。
+    Rects(DamageRects),
+}
+
+/// 一张 drawable 纹理落后 persist 多少。
+#[derive(Clone, Copy, Debug)]
+struct DrawableSyncState {
+    /// 自上次同步以来错过的 damage（本帧 present 它时必须补拷）。
+    pending: DamageRects,
+    /// 自上次同步以来出现过全量帧 / 内容从未同步过：整面不可信。
+    full: bool,
+}
+
+impl DrawableSyncState {
+    /// 刚插入表项的状态（纹理第一次出现）：内容从未与 persist 同步过，必须整面拷。
+    const fn unsynced() -> Self {
+        Self {
+            pending: DamageRects::new(),
+            full: true,
+        }
+    }
+
+    /// 本帧 present 这张 drawable：返回要补拷的范围，并把状态推进到「内容 = persist」。
+    ///
+    /// 补拷集是「它错过的 `pending`」∪「本帧 damage」——两者都是 persist 的变化，并集就是这张
+    /// drawable 与当前 persist 的全部差异；拷完之后它的每个像素都与 persist 相等，因此后续帧
+    /// 只需继续记录新的变化（`record_missed`）。
+    fn take_copy(&mut self, frame: FrameDamage, surface: (u32, u32)) -> DrawableCopy {
+        let copy = match frame {
+            // 全量帧：整面都变过，逐矩形没有意义。
+            FrameDamage::Full => DrawableCopy::Full,
+            // 期间出现过全量帧：累计矩形没有覆盖整面，内容不可信。
+            FrameDamage::Partial(_) if self.full => DrawableCopy::Full,
+            FrameDamage::Partial(damage) => {
+                let mut rects = self.pending;
+                merge_damage(&mut rects, &damage);
+                // 裁剪后累计面积达到整面：矩形之间可能重叠，一次整面拷反而更便宜。
+                let surface_area = u64::from(surface.0) * u64::from(surface.1);
+                if copy_area(&rects, surface) >= surface_area {
+                    DrawableCopy::Full
+                } else {
+                    DrawableCopy::Rects(rects)
+                }
+            }
+        };
+        *self = Self {
+            pending: DamageRects::new(),
+            full: false,
+        };
+        copy
+    }
+
+    /// 本帧没有 present 这张 drawable：把它又错过的改动记下来。
+    fn record_missed(&mut self, frame: FrameDamage) {
+        match frame {
+            FrameDamage::Full => {
+                self.full = true;
+                self.pending = DamageRects::new();
+            }
+            // 已经整面不可信时累计矩形没有意义（下次反正整面拷）。
+            FrameDamage::Partial(damage) if !self.full => merge_damage(&mut self.pending, &damage),
+            FrameDamage::Partial(_) => {}
+        }
+    }
+}
+
+/// 把 `damage` 并入累计集。容量不够时先按绘制预算合并腾空位（与 `Plan::merge` 同一套规则）。
+fn merge_damage(pending: &mut DamageRects, damage: &DamageRects) {
+    for rect in damage.as_slice() {
+        if pending.push(*rect) {
+            continue;
+        }
+        // 单帧 damage 至多 `MAX_DRAW_PASSES` 个（`plan` / `Plan::merge` 都合并到这个上限），
+        // 合并到该值以下必然腾出足够空位放下本帧剩余的矩形。
+        pending.coalesce(MAX_DAMAGE_RECTS - MAX_DRAW_PASSES);
+        assert!(
+            pending.push(*rect),
+            "a frame's damage set exceeds the draw-pass budget"
+        );
+    }
+}
+
+/// 裁剪到目标后各矩形面积之和（重叠部分重复计）：这次 blit 实际要付的像素带宽。
+fn copy_area(rects: &DamageRects, surface: (u32, u32)) -> u64 {
+    rects
+        .as_slice()
+        .iter()
+        .filter_map(|rect| clipped_rect(rect, surface))
+        .map(|rect| rect.width as u64 * rect.height as u64)
+        .sum()
+}
+
+/// 按 drawable 纹理身份追踪 persist 同步状态的固定容量表（只有窗口路径有内容）。
+///
+/// `CAMetalLayer` 从内部纹理池里按需交出 drawable（3 张轮换），下一帧拿到的纹理通常停在 2~3
+/// 帧前：只拷「本帧 damage」会漏掉它错过的那几帧，屏幕上会闪回旧内容。这里按身份累计每张
+/// drawable 的 [`DrawableSyncState::pending`]，present 前一次补齐；纹理第一次出现或表项被淘汰
+/// 时按新纹理整面拷（正确性优先于命中率）。
+struct DrawableSyncs {
+    /// 顺序 = 最近使用（末尾最新）。
+    entries: Vec<DrawableEntry>,
+}
+
+struct DrawableEntry {
+    /// 纹理身份。**持有强引用**：表项存活期间这个对象不会被释放，地址也就不可能被新纹理复用
+    /// （否则「同址新纹理」会被误判成已同步而留下残影）。
+    texture: Retained<ProtocolObject<dyn MTLTexture>>,
+    state: DrawableSyncState,
+}
+
+impl DrawableSyncs {
+    fn new() -> Self {
+        Self {
+            entries: Vec::with_capacity(DRAWABLE_SYNC_SLOTS),
+        }
+    }
+
+    /// 本帧 present 的 drawable：返回补拷范围，把它推进到「已同步」，并给其它 drawable 记账。
+    fn plan(
+        &mut self,
+        texture: &Retained<ProtocolObject<dyn MTLTexture>>,
+        frame: FrameDamage,
+        surface: (u32, u32),
+    ) -> DrawableCopy {
+        // persist 与 drawable 同尺寸是本模块的同步前提（`prepare_target` 用 drawable 的实际尺寸
+        // 重建 persist）：表里的矩形都在这个坐标系里，尺寸一变表就整体作废。
+        debug_assert_eq!(
+            (texture.width(), texture.height()),
+            (surface.0 as usize, surface.1 as usize),
+            "persist and drawable must share one size"
+        );
+        let current = match self
+            .entries
+            .iter()
+            .position(|entry| Retained::as_ptr(&entry.texture) == Retained::as_ptr(texture))
+        {
+            Some(index) => {
+                // LRU：刚用过的移到队尾。
+                if index + 1 != self.entries.len() {
+                    let entry = self.entries.remove(index);
+                    self.entries.push(entry);
+                }
+                self.entries.len() - 1
+            }
+            None => {
+                if self.entries.len() == DRAWABLE_SYNC_SLOTS {
+                    self.entries.remove(0);
+                }
+                self.entries.push(DrawableEntry {
+                    texture: texture.clone(),
+                    state: DrawableSyncState::unsynced(),
+                });
+                self.entries.len() - 1
+            }
+        };
+        let copy = self.entries[current].state.take_copy(frame, surface);
+        for (index, entry) in self.entries.iter_mut().enumerate() {
+            if index != current {
+                entry.state.record_missed(frame);
+            }
+        }
+        copy
     }
 }
 
@@ -867,29 +1096,39 @@ fn metal_index_type(kind: crate::paint::geometry::IndexType) -> MTLIndexType {
     }
 }
 
-/// 整面 blit（**每帧**，因为 drawable 内容跨帧无保证）。
-fn blit_persist_to(
+/// 把 persist 的 `region` 逐像素 blit 到 drawable 的同名区域。
+///
+/// `region` 由 [`clipped_rect`] 夹到实际目标尺寸内；整面同步传 [`whole_scissor`]。
+///
+/// **为什么选 blit 而不是「用 render pass 重画 damage 矩形」**：persist 里存的是图元绘制结果，
+/// 重画要重新绑定 PSO / 顶点流，而且除了 `plan()` 的 scissor 之外没有「只画一部分」的语义可复用；
+/// 而 `copyFromTexture:...` 在源 / 目标同为同尺寸 `BGRA8Unorm_sRGB` 时是**纯拷贝**：不做颜色
+/// 空间转换（编码由 sRGB 格式本身决定）、不翻转坐标、也不需要 scissor 对齐。也就是说整面 blit
+/// 除了「搬 persist 的像素」不承担任何额外职责，局部化不会破坏别的东西。
+///
+/// 每帧最多 [`MAX_DAMAGE_RECTS`] 次拷贝（累计矩形由 [`merge_damage`] 截到该上限）；面积上界是
+/// 一次整面拷 —— [`copy_area`] 达到整面时直接退化为 [`DrawableCopy::Full`]。
+fn blit_persist_rect(
     blit: &ProtocolObject<dyn MTLBlitCommandEncoder>,
     persist: &ProtocolObject<dyn MTLTexture>,
     target: &ProtocolObject<dyn MTLTexture>,
-    size: (u32, u32),
+    region: MTLScissorRect,
 ) {
-    // SAFETY: 源/目标都是本渲染器独占的纹理；尺寸一致（persist 由 drawable 的实际尺寸决定）。
+    let origin = MTLOrigin {
+        x: region.x,
+        y: region.y,
+        z: 0,
+    };
+    let size = MTLSize {
+        width: region.width,
+        height: region.height,
+        depth: 1,
+    };
+    // SAFETY: 两张纹理同尺寸、同像素格式（persist 由 drawable 的实际尺寸创建）；`region` 已夹到
+    // 实际尺寸内，源与目标使用同一区域。
     unsafe {
         blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
-            persist,
-            0,
-            0,
-            MTLOrigin { x: 0, y: 0, z: 0 },
-            MTLSize {
-                width: size.0 as usize,
-                height: size.1 as usize,
-                depth: 1,
-            },
-            target,
-            0,
-            0,
-            MTLOrigin { x: 0, y: 0, z: 0 },
+            persist, 0, 0, origin, size, target, 0, 0, origin,
         );
     }
 }
@@ -903,13 +1142,15 @@ fn whole_scissor(surface: (u32, u32)) -> MTLScissorRect {
     }
 }
 
-/// damage 矩形 → scissor，**裁剪到实际目标尺寸**；裁剪后没有面积时返回 `None`（调用点跳过）。
+/// damage 矩形 → 目标上的整数像素矩形，**裁剪到实际目标尺寸**；裁剪后没有面积时返回 `None`
+/// （调用点跳过）。
 ///
-/// `request.surface` 与 drawable 之间允许 1 px 的 DPI 取整差（见 `renderer.rs` 的尺寸校验），
-/// 因此 damage 矩形可能比实际目标（drawable 尺寸）多出边界像素。只夹 `width/height` 会把 `x/y`
-/// 留在目标之外（`x == surface.0` 时 `width = 0`），越界或 0 面积的 `MTLScissorRect` 会被 Metal
-/// validation 拒绝；这里先把起止点都夹到 `[0, surface]`，再判断面积。
-fn scissor_for(rect: &crate::math::PhysicalRect, surface: (u32, u32)) -> Option<MTLScissorRect> {
+/// 渲染 scissor 与 persist → drawable 的 blit 区域共用这一条裁剪规则：`request.surface` 与
+/// drawable 之间允许 1 px 的 DPI 取整差（见 `renderer.rs` 的尺寸校验），因此 damage 矩形可能比
+/// 实际目标（drawable 尺寸）多出边界像素。只夹 `width/height` 会把 `x/y` 留在目标之外
+/// （`x == surface.0` 时 `width = 0`），越界或 0 面积的 `MTLScissorRect` 会被 Metal validation
+/// 拒绝、0 面积的 blit region 同样非法；这里先把起止点都夹到 `[0, surface]`，再判断面积。
+fn clipped_rect(rect: &crate::math::PhysicalRect, surface: (u32, u32)) -> Option<MTLScissorRect> {
     let limit_x = surface.0.min(i32::MAX as u32) as i32;
     let limit_y = surface.1.min(i32::MAX as u32) as i32;
     let x0 = rect.x0.clamp(0, limit_x);
@@ -935,47 +1176,79 @@ fn elapsed_ns(started: Instant) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{scissor_for, whole_scissor};
-    use crate::math::PhysicalRect;
+    use super::{
+        DrawableCopy, DrawableSyncState, FrameDamage, clipped_rect, merge_damage, whole_scissor,
+    };
+    use crate::{
+        math::PhysicalRect,
+        render::{
+            compositor::{DamageRects, MAX_DRAW_PASSES},
+            damage::MAX_DAMAGE_RECTS,
+        },
+    };
+
+    fn damage(rects: &[(i32, i32, i32, i32)]) -> DamageRects {
+        let mut set = DamageRects::new();
+        for &(x0, y0, x1, y1) in rects {
+            assert!(set.push(PhysicalRect::new(x0, y0, x1, y1)));
+        }
+        set
+    }
+
+    /// 三张 drawable 轮换的一次 present：当前 drawable 取补拷集，其它 drawable 记下错过的变化
+    /// （与 `DrawableSyncs::plan` 的记账顺序一致，只是省略了纹理身份查表）。
+    fn present(
+        states: &mut [DrawableSyncState; 3],
+        current: usize,
+        frame: FrameDamage,
+        surface: (u32, u32),
+    ) -> DrawableCopy {
+        let copy = states[current].take_copy(frame, surface);
+        for (index, state) in states.iter_mut().enumerate() {
+            if index != current {
+                state.record_missed(frame);
+            }
+        }
+        copy
+    }
 
     #[test]
     fn damage_inside_the_surface_is_preserved() {
-        let scissor = scissor_for(&PhysicalRect::new(4, 6, 40, 60), (100, 80)).expect("scissor");
-        assert_eq!(scissor.x, 4);
-        assert_eq!(scissor.y, 6);
-        assert_eq!(scissor.width, 36);
-        assert_eq!(scissor.height, 54);
+        let rect = clipped_rect(&PhysicalRect::new(4, 6, 40, 60), (100, 80)).expect("rect");
+        assert_eq!(rect.x, 4);
+        assert_eq!(rect.y, 6);
+        assert_eq!(rect.width, 36);
+        assert_eq!(rect.height, 54);
     }
 
     /// Partial damage 与 1 px 容差的交界：damage 坐标在 `request.surface` 空间，drawable 可以比
-    /// 它小 1 px（DPI 取整）。越界像素必须被裁掉，而不是产生越界 / 0 面积的 scissor。
+    /// 它小 1 px（DPI 取整）。越界像素必须被裁掉，而不是产生越界 / 0 面积的区域。
     #[test]
     fn one_pixel_dpi_rounding_clips_damage_to_the_drawable() {
         // 请求 1400 宽，drawable 1399 宽；damage 横跨右边缘。
-        let scissor =
-            scissor_for(&PhysicalRect::new(1398, 10, 1401, 20), (1399, 1040)).expect("scissor");
-        assert_eq!(scissor.x, 1398);
-        assert_eq!(scissor.y, 10);
-        assert_eq!(scissor.width, 1, "只保留落在 drawable 内的 1 px");
-        assert_eq!(scissor.height, 10);
+        let rect =
+            clipped_rect(&PhysicalRect::new(1398, 10, 1401, 20), (1399, 1040)).expect("rect");
+        assert_eq!(rect.x, 1398);
+        assert_eq!(rect.y, 10);
+        assert_eq!(rect.width, 1, "只保留落在 drawable 内的 1 px");
+        assert_eq!(rect.height, 10);
     }
 
     #[test]
     fn a_partial_damage_rect_past_the_edge_is_skipped_not_left_empty() {
-        // `x == surface.0` 会裁剪出 0 宽矩形：不是合法 scissor，调用点必须跳过。
+        // `x == surface.0` 会裁剪出 0 宽矩形：不是合法 scissor / blit 区域，调用点必须跳过。
         let surface = (1399, 1040);
         assert!(
-            scissor_for(&PhysicalRect::new(1399, 0, 1400, 1040), surface).is_none(),
+            clipped_rect(&PhysicalRect::new(1399, 0, 1400, 1040), surface).is_none(),
             "整列都在 drawable 之外"
         );
         // 同一 damage 往左扩展 1 px 后仍可画：不能把整个矩形丢掉。
-        let scissor =
-            scissor_for(&PhysicalRect::new(1398, 0, 1400, 1040), surface).expect("scissor");
-        assert_eq!((scissor.x, scissor.width), (1398, 1));
+        let rect = clipped_rect(&PhysicalRect::new(1398, 0, 1400, 1040), surface).expect("rect");
+        assert_eq!((rect.x, rect.width), (1398, 1));
     }
 
     #[test]
-    fn a_damage_rect_entirely_outside_the_surface_has_no_scissor() {
+    fn a_damage_rect_entirely_outside_the_surface_has_no_region() {
         let surface = (1400, 1040);
         for rect in [
             PhysicalRect::new(1400, 0, 1420, 10),
@@ -985,23 +1258,207 @@ mod tests {
             PhysicalRect::new(2000, 2000, 2010, 2010),
         ] {
             assert!(
-                scissor_for(&rect, surface).is_none(),
-                "{rect:?} 在目标之外必须没有 scissor"
+                clipped_rect(&rect, surface).is_none(),
+                "{rect:?} 在目标之外必须没有区域"
             );
         }
     }
 
     #[test]
     fn damage_straddling_the_origin_is_clamped_to_zero() {
-        let scissor = scissor_for(&PhysicalRect::new(-8, -4, 6, 10), (100, 50)).expect("scissor");
-        assert_eq!((scissor.x, scissor.y), (0, 0));
-        assert_eq!((scissor.width, scissor.height), (6, 10));
+        let rect = clipped_rect(&PhysicalRect::new(-8, -4, 6, 10), (100, 50)).expect("rect");
+        assert_eq!((rect.x, rect.y), (0, 0));
+        assert_eq!((rect.width, rect.height), (6, 10));
     }
 
     #[test]
-    fn the_full_frame_scissor_covers_the_target() {
-        let scissor = whole_scissor((1400, 1040));
-        assert_eq!((scissor.x, scissor.y), (0, 0));
-        assert_eq!((scissor.width, scissor.height), (1400, 1040));
+    fn the_full_frame_region_covers_the_target() {
+        let rect = whole_scissor((1400, 1040));
+        assert_eq!((rect.x, rect.y), (0, 0));
+        assert_eq!((rect.width, rect.height), (1400, 1040));
+    }
+
+    /// 新 drawable（图层刚建 / resize 后 / 表项被淘汰）的内容不可信：整面拷。
+    #[test]
+    fn an_unsynced_drawable_copies_the_whole_surface() {
+        let surface = (100, 80);
+        let mut state = DrawableSyncState::unsynced();
+        assert_eq!(
+            state.take_copy(FrameDamage::Partial(damage(&[(10, 10, 20, 20)])), surface),
+            DrawableCopy::Full
+        );
+        assert!(!state.full, "整面拷之后内容已与 persist 一致");
+        assert!(state.pending.is_empty(), "补拷集已被消费");
+    }
+
+    /// 已同步的 drawable 只补拷本帧 damage：局部更新只付局部带宽。
+    #[test]
+    fn a_synced_drawable_only_copies_this_frames_damage() {
+        let surface = (100, 80);
+        let mut state = DrawableSyncState {
+            pending: DamageRects::new(),
+            full: false,
+        };
+        let current = damage(&[(10, 10, 20, 20)]);
+        assert_eq!(
+            state.take_copy(FrameDamage::Partial(current), surface),
+            DrawableCopy::Rects(current)
+        );
+    }
+
+    /// 三张 drawable 轮换：第 4 帧轮到 A 时，A 的内容停在它上次 present 的时候，必须补上它错过
+    /// 的第 2、3 帧 damage，否则屏幕上会闪回旧内容（残影）。
+    #[test]
+    fn a_rotating_drawable_catches_up_every_damage_it_missed() {
+        let surface = (100, 80);
+        let mut states = [DrawableSyncState::unsynced(); 3];
+        // 第 1 帧：全量帧（fresh）present 给 A，B/C 记下整面不可信。
+        assert_eq!(
+            present(&mut states, 0, FrameDamage::Full, surface),
+            DrawableCopy::Full
+        );
+        // 第 2、3 帧：局部帧分别 present 给 B、C（它们的旧内容不可信，各自整面拷）。
+        let second = damage(&[(0, 0, 10, 10)]);
+        assert_eq!(
+            present(&mut states, 1, FrameDamage::Partial(second), surface),
+            DrawableCopy::Full
+        );
+        let third = damage(&[(10, 0, 20, 10)]);
+        assert_eq!(
+            present(&mut states, 2, FrameDamage::Partial(third), surface),
+            DrawableCopy::Full
+        );
+        // 第 4 帧：又轮到 A。它错过了第 2、3 帧的 damage，本次补拷「错过 ∪ 本帧」。
+        let fourth = damage(&[(20, 0, 30, 10)]);
+        let copy = present(&mut states, 0, FrameDamage::Partial(fourth), surface);
+        assert_eq!(
+            copy,
+            DrawableCopy::Rects(damage(&[(0, 0, 10, 10), (10, 0, 20, 10), (20, 0, 30, 10),]))
+        );
+        // 第 5 帧：A 上一次已经补齐，只需要本帧 damage。
+        let fifth = damage(&[(30, 0, 40, 10)]);
+        assert_eq!(
+            present(&mut states, 0, FrameDamage::Partial(fifth), surface),
+            DrawableCopy::Rects(fifth)
+        );
+    }
+
+    /// 期间出现过全量帧（`fresh` / `Plan::Full` / resize 退化）：其它 drawable 的旧内容再也不可能
+    /// 靠局部矩形补齐，下次 present 必须整面拷。
+    #[test]
+    fn a_full_frame_forces_every_other_drawable_to_copy_the_whole_surface() {
+        let surface = (100, 80);
+        let mut states = [DrawableSyncState::unsynced(); 3];
+        // 第 1 帧 A 整面同步；B/C 记下整面不可信。
+        assert_eq!(
+            present(&mut states, 0, FrameDamage::Full, surface),
+            DrawableCopy::Full
+        );
+        // 第 2 帧 B（旧内容不可信）整面拷，A 记下本帧 damage。
+        let first = damage(&[(0, 0, 10, 10)]);
+        assert_eq!(
+            present(&mut states, 1, FrameDamage::Partial(first), surface),
+            DrawableCopy::Full
+        );
+        // 第 3 帧又是 A：只补它错过的 `first` 与本帧 damage。
+        let second = damage(&[(10, 0, 20, 10)]);
+        assert_eq!(
+            present(&mut states, 0, FrameDamage::Partial(second), surface),
+            DrawableCopy::Rects(damage(&[(0, 0, 10, 10), (10, 0, 20, 10)]))
+        );
+        // 全量帧 present 给 C：A、B 的内容都落后了整整一帧的全屏改动。
+        assert_eq!(
+            present(&mut states, 2, FrameDamage::Full, surface),
+            DrawableCopy::Full
+        );
+        for current in [0, 1] {
+            assert_eq!(
+                present(
+                    &mut states,
+                    current,
+                    FrameDamage::Partial(damage(&[(5, 5, 6, 6)])),
+                    surface
+                ),
+                DrawableCopy::Full
+            );
+        }
+    }
+
+    /// 累计矩形的总面积达到整面：矩形之间可能重叠，一次整面拷比逐块更便宜，也是带宽上界。
+    #[test]
+    fn accumulated_damage_covering_the_whole_surface_falls_back_to_a_full_copy() {
+        let surface = (100, 80);
+        let mut state = DrawableSyncState::unsynced();
+        assert_eq!(
+            state.take_copy(FrameDamage::Full, surface),
+            DrawableCopy::Full
+        );
+        // 错过上半屏 60%，本帧 damage 又是下半屏 60%：总面积 > 整面。
+        state.record_missed(FrameDamage::Partial(damage(&[(0, 0, 100, 48)])));
+        assert_eq!(
+            state.take_copy(FrameDamage::Partial(damage(&[(0, 32, 100, 80)])), surface),
+            DrawableCopy::Full
+        );
+    }
+
+    /// 一张 drawable 可能连续错过很多帧：累计集必须被压回 `MAX_DAMAGE_RECTS` 以内，不能无界增长。
+    #[test]
+    fn missed_damage_stays_within_the_fixed_rect_budget() {
+        let surface = (1000, 1000);
+        let mut state = DrawableSyncState::unsynced();
+        assert_eq!(
+            state.take_copy(FrameDamage::Full, surface),
+            DrawableCopy::Full
+        );
+        // `MAX_DAMAGE_RECTS` 帧、每帧 `MAX_DRAW_PASSES` 个互不重叠的小矩形。
+        for frame in 0..MAX_DAMAGE_RECTS {
+            let mut frame_damage = DamageRects::new();
+            for pass in 0..MAX_DRAW_PASSES {
+                let x = ((frame * MAX_DRAW_PASSES + pass) * 2) as i32;
+                assert!(frame_damage.push(PhysicalRect::new(x, 0, x + 1, 1)));
+            }
+            state.record_missed(FrameDamage::Partial(frame_damage));
+            assert!(
+                state.pending.as_slice().len() <= MAX_DAMAGE_RECTS,
+                "累计集不能超过固定容量"
+            );
+        }
+        match state.take_copy(
+            FrameDamage::Partial(damage(&[(900, 900, 901, 901)])),
+            surface,
+        ) {
+            DrawableCopy::Rects(rects) => {
+                assert!(rects.as_slice().len() <= MAX_DAMAGE_RECTS, "补拷矩形数有界");
+            }
+            other => panic!("expected a bounded rect copy, got {other:?}"),
+        }
+    }
+
+    /// 容量满时先合并再追加：被合并的矩形必须**覆盖**原 damage（不能丢），否则 drawable 会漏拷。
+    #[test]
+    fn merging_into_a_full_set_keeps_every_rect_covered() {
+        let mut pending = DamageRects::new();
+        let mut originals = Vec::with_capacity(MAX_DAMAGE_RECTS + 2);
+        for index in 0..MAX_DAMAGE_RECTS {
+            let x = index as i32 * 2;
+            let rect = PhysicalRect::new(x, 0, x + 1, 1);
+            assert!(pending.push(rect));
+            originals.push(rect);
+        }
+        let extra = damage(&[(100, 100, 101, 101), (102, 100, 103, 101)]);
+        originals.extend(extra.as_slice());
+        merge_damage(&mut pending, &extra);
+        assert!(pending.as_slice().len() <= MAX_DAMAGE_RECTS);
+        for rect in originals {
+            assert!(
+                pending.as_slice().iter().any(|union| {
+                    union.x0 <= rect.x0
+                        && union.y0 <= rect.y0
+                        && union.x1 >= rect.x1
+                        && union.y1 >= rect.y1
+                }),
+                "{rect:?} 必须被某个累计矩形覆盖"
+            );
+        }
     }
 }
