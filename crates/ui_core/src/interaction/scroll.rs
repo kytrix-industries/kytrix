@@ -85,21 +85,9 @@ pub(crate) fn to_screen(tree: &NodeTree, node: NodeId, rect: Rect) -> Rect {
     rect.translate(Point::new(-offset.x, -offset.y))
 }
 
-/// 滚轮事件 → 目标偏移（`drives` 已按 `Shift` 规则选出，§5.1）。
-#[must_use]
-pub(crate) fn wheel_target(slot: &ScrollSlot, drives: f32) -> Point {
-    match slot.axis {
-        ScrollAxis::Vertical => Point::new(0.0, slot.offset.y - drives * slot.line_height),
-        ScrollAxis::Horizontal => Point::new(slot.offset.x - drives * slot.line_height, 0.0),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        ancestor_offset, clamp_offset, max_offset, scroll_ancestor, to_screen, viewport,
-        wheel_target,
-    };
+    use super::{ancestor_offset, clamp_offset, max_offset, scroll_ancestor, to_screen, viewport};
     use crate::{
         interaction::{ScrollAxis, ScrollConfig, ScrollSlot},
         math::{Point, Rect, Size},
@@ -190,15 +178,6 @@ mod tests {
         assert_eq!(ancestor_offset(&tree, inner), Point::new(0.0, 30.0));
         let rect = Rect::new(0.0, 100.0, 50.0, 20.0);
         assert_eq!(to_screen(&tree, inner, rect).origin, Point::new(0.0, 70.0));
-    }
-
-    #[test]
-    fn wheel_target_uses_the_line_height() {
-        let slot = slot(ScrollAxis::Vertical, Size::new(100.0, 500.0));
-
-        // 滚轮向上（drives > 0）= 内容下移 = offset 减小。
-        assert_eq!(wheel_target(&slot, 1.0), Point::new(0.0, -48.0));
-        assert_eq!(wheel_target(&slot, -2.0), Point::new(0.0, 96.0));
     }
 
     #[test]

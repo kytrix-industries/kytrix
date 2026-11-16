@@ -1259,10 +1259,17 @@ impl App {
                 continue;
             }
             // 本容器实际能消费的行数（受 max_offset 夹紧）；吃不完的留给外层。
+            //
+            // 基准是**动画目标**而不是当前 offset：同一帧内的第二个滚轮事件必须累加在第一个
+            // 事件的落点上，否则两次事件用同一个 `from` 重算目标，前一次的 delta 被静默丢弃
+            // （触控板 / 高精度滚轮一个泵批次里常发多个事件，表现为「滚不动」）。
             let max = scroll::max_offset(&slot, size);
+            let pending = self
+                .scroll_animation_target(node, window)
+                .unwrap_or(slot.offset);
             let (before, limit) = match slot.axis {
-                ScrollAxis::Vertical => (slot.offset.y, max.y),
-                ScrollAxis::Horizontal => (slot.offset.x, max.x),
+                ScrollAxis::Vertical => (pending.y, max.y),
+                ScrollAxis::Horizontal => (pending.x, max.x),
             };
             let after = (before - drives * slot.line_height).clamp(0.0, limit);
             let consumed = (before - after) / slot.line_height;
@@ -1270,7 +1277,12 @@ impl App {
                 continue;
             }
             let handle = ScrollHandle::new(window, node);
-            let _ = self.scroll_to_animated(&handle, scroll::wheel_target(&slot, consumed));
+            let mut target = pending;
+            match slot.axis {
+                ScrollAxis::Vertical => target.y = after,
+                ScrollAxis::Horizontal => target.x = after,
+            }
+            let _ = self.scroll_to_animated(&handle, target);
             match slot.axis {
                 ScrollAxis::Vertical => dy -= consumed,
                 ScrollAxis::Horizontal => dx -= consumed,
@@ -1279,6 +1291,19 @@ impl App {
                 break;
             }
         }
+    }
+
+    /// 该节点正在进行中的滚动动画目标（没有动画时 `None`）。
+    fn scroll_animation_target(&self, node: NodeId, window: WindowId) -> Option<Point> {
+        self.animations.iter().rev().find_map(|slot| {
+            if slot.window != window {
+                return None;
+            }
+            match &slot.target {
+                AnimationTarget::Scroll { handle, to, .. } if handle.node() == node => Some(*to),
+                _ => None,
+            }
+        })
     }
 
     fn on_key(
@@ -1565,6 +1590,11 @@ impl App {
             return Err(EngineError::NotScrollable { node });
         }
         let viewport = scroll::viewport(target.tree(), node).size;
+        // `line_height` 是「一行 = 多少像素」的换算系数，除零会让 `on_scroll` 的残量计算
+        // 得到 NaN 并写进 offset（review P2-10）。公开字段没有别的校验点，在这里一次性拒绝。
+        if !config.line_height.is_finite() || config.line_height <= 0.0 {
+            return Err(EngineError::NotScrollable { node });
+        }
         if let Some(slot) = target.tree_mut().ensure_interaction(node) {
             slot.scroll = Some(ScrollSlot {
                 offset: Point::ZERO,
@@ -5045,6 +5075,70 @@ mod interaction_tests {
             .expect("mount")
     }
 
+    /// P2：同一帧内的多个滚轮事件必须**累加**到动画目标，不能互相覆盖。
+    ///
+    /// `scroll_to_animated` 每帧只把 offset 推进一步；一次泵迭代里 drain 到的多个滚轮事件
+    /// 若都以「当前 offset」为基准重算目标，第 1 个事件的 delta 会被静默丢弃（触控板 /
+    /// 高精度滚轮一个批次常发多个事件，表现为「滚不动」）。
+    #[test]
+    fn wheel_events_in_one_frame_accumulate() {
+        let (_rt, mut app, window) = setup();
+        let outer = mount_scroll_container(&mut app, window, 150.0);
+        frame(&mut app, window);
+        let handle = app
+            .make_scroll(
+                window,
+                outer,
+                ScrollConfig {
+                    axis: ScrollAxis::Vertical,
+                    line_height: 48.0,
+                },
+            )
+            .expect("scrollable");
+        app.set_scroll_content(&handle, Size::new(200.0, 400.0))
+            .expect("content");
+
+        // 帧内连滚两格（不插帧）：目标必须是 2 行 = 96 px。
+        for _ in 0..2 {
+            app.dispatch_input(
+                window,
+                InputEvent::Scroll {
+                    position: Point::new(50.0, 50.0),
+                    delta_x: 0.0,
+                    delta_y: -1.0,
+                    modifiers: Modifiers::empty(),
+                },
+            );
+        }
+        app.advance_clock(std::time::Duration::from_millis(400));
+        frame(&mut app, window);
+        let offset = app
+            .window(window)
+            .expect("window")
+            .tree()
+            .scroll_slot(outer)
+            .map(|slot| slot.offset.y);
+        assert_eq!(offset, Some(96.0), "两次滚轮必须累加（各 48 px）");
+    }
+
+    /// P2-10：`line_height <= 0` 必须在 `make_scroll` 处拒绝，否则残量计算会写出 NaN。
+    #[test]
+    fn non_positive_line_height_is_rejected() {
+        let (_rt, mut app, window) = setup();
+        let outer = mount_scroll_container(&mut app, window, 150.0);
+        frame(&mut app, window);
+        for line_height in [0.0, -48.0, f32::NAN] {
+            let result = app.make_scroll(
+                window,
+                outer,
+                ScrollConfig {
+                    axis: ScrollAxis::Vertical,
+                    line_height,
+                },
+            );
+            assert!(result.is_err(), "line_height={line_height} 必须被拒绝");
+        }
+    }
     fn lane_quad_bounds(app: &App, window: WindowId, node: NodeId) -> Vec<Rect> {
         let window = app.window(window).expect("window");
         let Some(lane) = window.tree().lane_of(node) else {
