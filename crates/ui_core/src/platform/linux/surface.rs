@@ -41,7 +41,9 @@ use wayland_client::{
 };
 use wayland_protocols::{
     wp::{
-        fractional_scale::v1::client::{wp_fractional_scale_manager_v1, wp_fractional_scale_v1},
+        fractional_scale::v1::client::{
+            wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1, wp_fractional_scale_v1,
+        },
         text_input::zv3::client::{
             zwp_text_input_manager_v3::ZwpTextInputManagerV3,
             zwp_text_input_v3::{self, ZwpTextInputV3},
@@ -49,7 +51,9 @@ use wayland_protocols::{
         viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
     },
     xdg::{
-        decoration::zv1::client::{zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1},
+        decoration::zv1::client::{
+            zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, zxdg_toplevel_decoration_v1,
+        },
         shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base},
     },
 };
@@ -61,7 +65,6 @@ use crate::{
     event::{Event, ImeEvent, InputEvent, Key, KeyState, Modifiers, PointerButton},
     math::{Point, Rect, Scale, Size},
     platform::linux::{
-        a11y::UnixA11y,
         clipboard::Clipboard,
         dpi,
         frame_gate::{CallbackToken, FrameGate},
@@ -188,28 +191,27 @@ impl ScrollAccum {
 /// 连续 `axis` 的单位→行换算（见 [`ScrollAccum::lines`]）。
 const CONTINUOUS_AXIS_UNITS_PER_LINE: f32 = 10.0;
 
-/// Wayland 侧的全部状态（`Dispatch` 的实现体 + calloop 的 `Data`）。
 /// 一个原生窗口的 Wayland 侧状态（surface / toplevel / 几何 / 帧节流）。
 ///
 /// **进程级 vs 每窗口**（P1-2.8 的分层）：`WaylandState` 持有连接、seat、键盘/指针、
 /// xkb、IME、剪贴板、事件队列 —— 这些跨窗口共享；本结构只放「一个 surface 独有」的东西。
-/// 现在是单窗口（`WaylandState::window`），改成多窗口时它变成 `Vec<WindowSurface>`，
-/// 事件按对象（`wl_surface` / `xdg_toplevel`）或焦点窗口路由。
+/// `WaylandState::windows` 是这些状态的集合，事件按对象（`wl_surface` / `xdg_toplevel` /
+/// `wl_callback`）或焦点窗口路由到其中的某个下标。
 ///
 /// 键盘/指针的事件属于 **seat**，不属于 surface：它们的路由依据是「哪个窗口当前有焦点 /
-/// 指针进入」，那是下一步要做的事，本结构先只负责持有 per-surface 对象。
+/// 指针进入」。
 struct WindowSurface {
     /// 稳定 id（与 `App` 的 `WindowId` 对应）。
     id: crate::window::WindowId,
     surface: wl_surface::WlSurface,
-    /// 只为保活（configure 的 ack 在 handler 里）。
-    _xdg_surface: xdg_surface::XdgSurface,
+    /// `xdg_surface`（首个 configure 的 ack 在 handler 里；析构顺序见 `Drop`）。
+    xdg_surface: xdg_surface::XdgSurface,
     toplevel: xdg_toplevel::XdgToplevel,
     /// 应用声明的 IME caret 区域（surface 逻辑坐标；`None` = 无 hint）。
     ime_cursor_area: Option<Rect>,
     /// 最近一次实际下发给 `zwp_text_input_v3` 的区域（含 None 回退）。
     ime_cursor_applied: Option<Rect>,
-    /// 分数缩放对象：只为保活 + 按它路由 `PreferredScale`（该事件不告诉我们是哪个窗口）。
+    /// 分数缩放对象：按它路由 `PreferredScale`（该事件不告诉我们是哪个窗口）。
     ///
     /// 只有 `wp_viewporter` 也存在时才创建（否则走整数回退，V-110）。
     fractional: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
@@ -224,8 +226,8 @@ struct WindowSurface {
     /// `false` ⇒ 整数回退：`buffer_scale = N`，buffer 是 `round(逻辑 × N)`（V-110）。
     /// `take_viewport` 之后仍保持 `true`。
     uses_viewport: bool,
-    /// 只为保活（`configure` 事件只做记录）。
-    _decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
+    /// `zxdg_toplevel_decoration_v1`（compositor 支持 client-side 装饰时存在）。
+    decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
     size: Size,
     scale: Scale,
     /// 本 surface 已 enter 的 output 对象 id（enter / leave 成对；整数回退取其中最大 scale）。
@@ -261,6 +263,29 @@ struct WindowSurface {
     frame_callback: Option<(ObjectId, CallbackToken)>,
 }
 
+impl Drop for WindowSurface {
+    fn drop(&mut self) {
+        // Wayland 的代理**不会**在 drop 时自动发析构请求（它只是句柄），窗口移除必须显式销毁
+        // 服务端对象，否则 compositor 侧窗口会一直留在屏幕上。顺序按角色的创建逆序：
+        // 装饰 / 分数缩放 / viewport 先于它们引用的 toplevel / surface，`xdg_toplevel` 必须
+        // 先于 `xdg_surface`（协议要求 xdg_surface 在其 role 对象之后销毁），`wl_surface` 最后。
+        //
+        // viewport 在渲染器创建时已移交（`take_viewport`，`None`）；它由渲染器的 `Drop` 销毁。
+        if let Some(decoration) = self.decoration.take() {
+            decoration.destroy();
+        }
+        if let Some(fractional) = self.fractional.take() {
+            fractional.destroy();
+        }
+        if let Some(viewport) = self.viewport.take() {
+            viewport.destroy();
+        }
+        self.toplevel.destroy();
+        self.xdg_surface.destroy();
+        self.surface.destroy();
+    }
+}
+
 pub(crate) struct WaylandState {
     /// 全部窗口的 per-surface 状态（P1-2.8 Stage B）。
     ///
@@ -269,8 +294,8 @@ pub(crate) struct WaylandState {
     windows: Vec<WindowSurface>,
     /// 当前**焦点窗口**在 [`Self::windows`] 里的下标。
     ///
-    /// 键盘事件、IME、剪贴板属主都跟随它；`wl_keyboard.enter` / `leave` 更新它。
-    /// 单窗口时恒 0；没有窗口时不会访问（构造保证至少一个，关到 0 个就退出循环）。
+    /// 键盘事件、IME、剪贴板属主都跟随它；`wl_keyboard.enter` 更新它。
+    /// `remove_window` 会按移除位置修正；没有窗口时不会访问（泵在集合空之前退出）。
     active: usize,
     /// 指针当前进入的窗口下标（`wl_pointer.enter` / `leave` 维护）。
     ///
@@ -283,10 +308,20 @@ pub(crate) struct WaylandState {
     events: Vec<(crate::window::WindowId, Event)>,
     connection: Connection,
     queue_handle: QueueHandle<Self>,
-    /// 只为保活（建 surface 之后不再使用）。
-    _compositor: wl_compositor::WlCompositor,
-    /// 只为保活（`xdg_wm_base::ping` 必须回 pong）。
-    _wm_base: xdg_wm_base::XdgWmBase,
+    /// `wl_compositor`：每个新窗口都从它 `create_surface`（多窗口的生命周期入口）。
+    compositor: wl_compositor::WlCompositor,
+    /// `xdg_wm_base`：每个新窗口都从它 `get_xdg_surface`；`ping` 必须回 pong。
+    wm_base: xdg_wm_base::XdgWmBase,
+    /// `wp_viewporter` 工厂：每个窗口要建自己的 `wp_viewport`（fractional 模式）。
+    ///
+    /// 工厂对象本身只在建子对象时使用，但仍要保留：多窗口下后续窗口的 viewport 都从它创建。
+    viewporter: Option<WpViewporter>,
+    /// `wp_fractional_scale_manager_v1` 工厂：每个窗口要建自己的 `wp_fractional_scale_v1`。
+    ///
+    /// 只有与 `viewporter` **同时**存在才启用 fractional 路径（V-110 / V-122 ④）。
+    fractional_manager: Option<WpFractionalScaleManagerV1>,
+    /// `zxdg_decoration_manager_v1` 工厂：每个窗口要建自己的装饰对象（自绘标题栏）。
+    decoration_manager: Option<ZxdgDecorationManagerV1>,
     seat: wl_seat::WlSeat,
     /// `wl_seat.capabilities` 最近一次声明的能力位：只有声明过的设备才能 `get_keyboard` / `get_pointer`
     /// （否则服务端报 `wl_seat error 0` 并断开连接，见 F-146）。
@@ -328,10 +363,11 @@ pub(crate) struct WaylandState {
 }
 
 impl WaylandState {
-    /// 连上 compositor、绑定必需 global、建 surface/toplevel、装 IME / 剪贴板（§8.1 的 1–4）。
+    /// 连上 compositor、绑定必需 global、建首个 surface/toplevel、装 IME / 剪贴板（§8.1 的 1–4）。
     ///
     /// `size` / `title` 是应用建窗参数：compositor 的 configure 给出 `0×0` 时，客户端用请求的
-    /// 尺寸作为初值（否则会退到固定的 800×600）。
+    /// 尺寸作为初值（否则会退到固定的 800×600）。后续窗口（运行期新增 / 启动时就存在的）都走
+    /// [`Self::add_window`]，本函数只在最后为**首个**窗口调用它一次。
     pub(crate) fn new(
         size: Size,
         title: &str,
@@ -355,14 +391,18 @@ impl WaylandState {
         let data_device_manager: wl_data_device_manager::WlDataDeviceManager =
             bind(&globals, &queue_handle, 3..=3, "wl_data_device_manager")?;
 
-        let surface = compositor.create_surface(&queue_handle, ());
-        let xdg_surface = wm_base.get_xdg_surface(&surface, &queue_handle, ());
-        let toplevel = xdg_surface.get_toplevel(&queue_handle, ());
-        toplevel.set_app_id(APP_ID.to_owned());
-        toplevel.set_title(title.to_owned());
-        // 最小尺寸是 surface-local 逻辑像素，与 scale 无关：只需在首个 commit 前设置一次。
-        window::apply_min_size(&toplevel);
-        surface.commit();
+        // 协议工厂对象**保留在 `WaylandState` 里**：多窗口下每个新窗口都要用它们建子对象
+        // （`wp_viewport` / `wp_fractional_scale_v1` / `zxdg_toplevel_decoration_v1`）。
+        // 绑定失败只是缺对应的可选扩展（`None` ⇒ 整数 scale 回退 / compositor 自选装饰）。
+        let viewporter = globals
+            .bind::<WpViewporter, _, _>(&queue_handle, 1..=1, ())
+            .ok();
+        let fractional_manager = globals
+            .bind::<WpFractionalScaleManagerV1, _, _>(&queue_handle, 1..=1, ())
+            .ok();
+        let decoration_manager = globals
+            .bind::<ZxdgDecorationManagerV1, _, _>(&queue_handle, 1..=1, ())
+            .ok();
 
         let data_device = data_device_manager.get_data_device(&seat, &queue_handle, ());
         let data_source = data_device_manager.create_data_source(&queue_handle, ());
@@ -374,95 +414,21 @@ impl WaylandState {
             .bind::<ZwpTextInputManagerV3, _, _>(&queue_handle, 1..=1, ())
             .ok()
             .map(|manager| manager.get_text_input(&seat, &queue_handle, ()));
-        // 分数缩放只在 `wp_viewporter` 与 `wp_fractional_scale_manager_v1` **同时**存在时启用：
-        // 没有 viewporter 就没有 destination，fractional 的 buffer 会被 compositor 按分数放大
-        // surface 的逻辑尺寸（实测 1.25×），所以此时**不创建** fractional 对象，改走整数回退
-        // （V-110 / V-122 ④）。fractional 对象与 viewport 对象因此成对存在。
-        //
-        // 两个工厂对象只用于创建子对象，创建完立刻 `destroy()`：协议保证工厂的 destroy
-        // **不影响**已创建的 `wp_viewport` / `wp_fractional_scale_v1`（子对象独立存活，分别由
-        // renderer 的 `Drop` 与连接关闭清理），服务端因此不会留下无用的工厂对象。
-        let viewporter = globals
-            .bind::<WpViewporter, _, _>(&queue_handle, 1..=1, ())
-            .ok();
-        let fractional = if viewporter.is_some() {
-            globals
-                .bind::<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1, _, _>(
-                    &queue_handle,
-                    1..=1,
-                    (),
-                )
-                .ok()
-                .map(|manager| {
-                    let fractional = manager.get_fractional_scale(&surface, &queue_handle, ());
-                    manager.destroy();
-                    fractional
-                })
-        } else {
-            None
-        };
-        let viewport = match (&viewporter, &fractional) {
-            (Some(viewporter), Some(_)) => {
-                Some(viewporter.get_viewport(&surface, &queue_handle, ()))
-            }
-            _ => None,
-        };
-        // 无论是否创建了 viewport，viewporter 工厂本身都已无用。
-        if let Some(viewporter) = viewporter {
-            viewporter.destroy();
-        }
-        let uses_viewport = viewport.is_some();
-        let decoration = globals
-            .bind::<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _, _>(
-                &queue_handle,
-                1..=1,
-                (),
-            )
-            .ok()
-            .map(|manager| {
-                let decoration = manager.get_toplevel_decoration(&toplevel, &queue_handle, ());
-                // 自绘标题栏：请求 CLIENT_SIDE（没有该扩展时 compositor 自行决定）。
-                decoration.set_mode(zxdg_toplevel_decoration_v1::Mode::ClientSide);
-                decoration
-            });
 
         let clipboard = Clipboard::new(connection.clone(), data_device.clone(), data_source);
         let mut state = Self {
-            windows: vec![WindowSurface {
-                id,
-                surface,
-                _xdg_surface: xdg_surface,
-                toplevel,
-                ime_cursor_area: None,
-                ime_cursor_applied: None,
-                fractional,
-                viewport,
-                uses_viewport,
-                _decoration: decoration,
-                // Wayland 的 configure / window geometry 是整数，小数的逻辑尺寸在协议层没有表示：
-                // 这里先四舍五入取整，整数回退下 buffer = `round(L × N)` 因而严格是 buffer_scale 的
-                // 整数倍（否则 `wl_surface.attach` 报 `invalid_size`，V-110）。
-                size: Size::new(size.width.round().max(1.0), size.height.round().max(1.0)),
-                scale: Scale::ONE,
-                surface_outputs: Vec::with_capacity(2),
-                preferred_buffer_scale: None,
-                fractional_scale_120: None,
-                integer_scale: 1,
-                entered_once: false,
-                focused: false,
-                configured: false,
-                maximized: false,
-                close_requested: false,
-                frame_gate: FrameGate::new(),
-                frame_callback: None,
-            }],
+            windows: Vec::new(),
+            // `windows` 里第一个窗口由下面的 `add_window` 补齐；此前没有事件派发。
             active: 0,
             pointer_focus: None,
             events: Vec::with_capacity(16),
             connection,
             queue_handle,
-            _compositor: compositor,
-            _wm_base: wm_base,
+            compositor,
+            wm_base,
+            viewporter,
+            fractional_manager,
+            decoration_manager,
             seat,
             seat_caps: wl_seat::Capability::empty(),
             keyboard: None,
@@ -488,7 +454,132 @@ impl WaylandState {
         // `wl_output.scale`，整数回退的首帧因此能按「全部已绑定 output 的最大 scale」兜底
         // （`wl_surface.enter` 要等 surface 映射之后才到，V-110）。
         state.bind_existing_outputs(&globals);
+        state.add_window(id, size, title)?;
         Ok((state, queue))
+    }
+
+    /// 建一个原生窗口的协议对象：`wl_surface` → `xdg_surface` → `xdg_toplevel` → 装饰 /
+    /// fractional / viewport，然后追加进 [`Self::windows`]。
+    ///
+    /// 启动路径（[`Self::new`] 的首个窗口）与运行期新增窗口共用这一条建窗顺序：协议对象之间
+    /// 有严格的创建顺序（toplevel 必须在 surface 首次 commit 之前），任何一处漏掉都会让窗口
+    /// 少掉对应能力（装饰 / 分数缩放）。首个 configure 由 compositor 异步发回，事件循环在收到
+    /// `configured` 之前不会为它建 swapchain / 出帧。
+    pub(crate) fn add_window(
+        &mut self,
+        id: crate::window::WindowId,
+        size: Size,
+        title: &str,
+    ) -> Result<(), EngineError> {
+        let surface = self.compositor.create_surface(&self.queue_handle, ());
+        let xdg_surface = self
+            .wm_base
+            .get_xdg_surface(&surface, &self.queue_handle, ());
+        let toplevel = xdg_surface.get_toplevel(&self.queue_handle, ());
+        toplevel.set_app_id(APP_ID.to_owned());
+        toplevel.set_title(title.to_owned());
+        // 最小尺寸是 surface-local 逻辑像素，与 scale 无关：只需在首个 commit 前设置一次。
+        window::apply_min_size(&toplevel);
+        surface.commit();
+
+        // 装饰：自绘标题栏，请求 CLIENT_SIDE（没有该扩展时 compositor 自行决定）。
+        let decoration = self.decoration_manager.as_ref().map(|manager| {
+            let decoration = manager.get_toplevel_decoration(&toplevel, &self.queue_handle, ());
+            decoration.set_mode(zxdg_toplevel_decoration_v1::Mode::ClientSide);
+            decoration
+        });
+        // 分数缩放只在 `wp_viewporter` 与 `wp_fractional_scale_manager_v1` **同时**存在时启用：
+        // 没有 viewporter 就没有 destination，fractional 的 buffer 会被 compositor 按分数放大
+        // surface 的逻辑尺寸（实测 1.25×），所以此时**不创建** fractional 对象，改走整数回退
+        // （V-110 / V-122 ④）。fractional 对象与 viewport 对象因此成对存在。
+        let fractional = if self.viewporter.is_some() {
+            self.fractional_manager
+                .as_ref()
+                .map(|manager| manager.get_fractional_scale(&surface, &self.queue_handle, ()))
+        } else {
+            None
+        };
+        let viewport = match (&self.viewporter, &fractional) {
+            (Some(viewporter), Some(_)) => {
+                Some(viewporter.get_viewport(&surface, &self.queue_handle, ()))
+            }
+            _ => None,
+        };
+        let uses_viewport = viewport.is_some();
+        self.windows.push(WindowSurface {
+            id,
+            surface,
+            xdg_surface,
+            toplevel,
+            ime_cursor_area: None,
+            ime_cursor_applied: None,
+            fractional,
+            viewport,
+            uses_viewport,
+            decoration,
+            // Wayland 的 configure / window geometry 是整数，小数的逻辑尺寸在协议层没有表示：
+            // 这里先四舍五入取整，整数回退下 buffer = `round(L × N)` 因而严格是 buffer_scale 的
+            // 整数倍（否则 `wl_surface.attach` 报 `invalid_size`，V-110）。
+            size: Size::new(size.width.round().max(1.0), size.height.round().max(1.0)),
+            scale: Scale::ONE,
+            surface_outputs: Vec::with_capacity(2),
+            preferred_buffer_scale: None,
+            fractional_scale_120: None,
+            integer_scale: 1,
+            entered_once: false,
+            focused: false,
+            configured: false,
+            maximized: false,
+            close_requested: false,
+            frame_gate: FrameGate::new(),
+            frame_callback: None,
+        });
+        Ok(())
+    }
+
+    /// 移除一个窗口（从 [`Self::windows`] 摘除；`WindowSurface` 的 `Drop` 按角色逆序销毁协议
+    /// 对象，compositor 侧窗口随之消失）。
+    ///
+    /// 返回 `false` = 没有这个窗口。`active` / `pointer_focus` 都存的是**下标**，移除后
+    /// 后面的窗口整体前移一位，必须按移除位置修正：被移除下标之前的焦点不变，之后的减一；
+    /// 焦点正好是被移除窗口时夹紧到现存范围。指针进入的窗口被移除 ⇒ 指针已不可能在它上面，
+    /// 置 `None`（它的 `wl_surface` 已销毁，后续 `leave` 也路由不到）。
+    pub(crate) fn remove_window(&mut self, id: crate::window::WindowId) -> bool {
+        let Some(index) = self.window_index(id) else {
+            return false;
+        };
+        self.windows.remove(index);
+        if self.windows.is_empty() {
+            self.active = 0;
+            self.pointer_focus = None;
+            return true;
+        }
+        if index < self.active {
+            self.active -= 1;
+        } else if index == self.active {
+            self.active = self.active.min(self.windows.len() - 1);
+        }
+        self.pointer_focus = match self.pointer_focus {
+            Some(focus) if focus == index => None,
+            Some(focus) if focus > index => Some(focus - 1),
+            other => other,
+        };
+        true
+    }
+
+    /// 窗口个数（事件循环逐窗口遍历的边界）。
+    pub(crate) fn window_count(&self) -> usize {
+        self.windows.len()
+    }
+
+    /// 下标 → 稳定 id（与 `App` 的 `WindowId` 同值）。
+    pub(crate) fn window_id(&self, index: usize) -> crate::window::WindowId {
+        self.windows[index].id
+    }
+
+    /// 稳定 id → 下标（`None` = 该窗口没有原生窗口）。
+    pub(crate) fn window_index(&self, id: crate::window::WindowId) -> Option<usize> {
+        self.windows.iter().position(|window| window.id == id)
     }
 
     /// 绑定所有现存 `wl_output`。
@@ -560,7 +651,7 @@ impl WaylandState {
     /// `wl_surface.enter` 要等 surface 首次 attach/commit 之后才到，而首帧前已绑定的
     /// `wl_output.scale` 已经可用（sway 在 1.25 / 1.5 / 1.75 下都报 2），所以 `entered_once ==
     /// false` 时退到全部已绑定 output 的最大值；一旦收到过 enter，列表为空（最小化 / 切工作区）
-    /// 就保留 `self.windows[self.active].integer_scale`，避免虚假的 1× ↔ 2× 抖动。
+    /// 就保留该窗口上一个 `integer_scale`，避免虚假的 1× ↔ 2× 抖动。
     fn integer_scale_value(&self, index: usize) -> i32 {
         let entered_max = self
             .outputs
@@ -597,7 +688,7 @@ impl WaylandState {
         })
     }
 
-    /// 先推进整数回退的当前值，再按 effective scale 更新 `self.windows[self.active].scale` 并排队
+    /// 先推进整数回退的当前值，再按 effective scale 更新该窗口的 `scale` 并排队
     /// `Event::DpiChanged`（事件循环随后 `set_scale` / `set_surface` 并出帧）。
     fn recompute_scale(&mut self, index: usize) {
         self.windows[index].integer_scale = self.integer_scale_value(index);
@@ -620,25 +711,17 @@ impl WaylandState {
     /// 整数回退是 [`Self::recompute_scale`] 当前选出的整数 scale（N=1 时也是 1）。
     ///
     /// GPU 线程在 present 前与 attach/commit 同一次生效（[`crate::render::frame::FrameRequest`]）。
-    pub(crate) fn buffer_scale(&self) -> i32 {
-        if self.windows[self.active].uses_viewport {
+    pub(crate) fn buffer_scale(&self, index: usize) -> i32 {
+        if self.windows[index].uses_viewport {
             1
         } else {
-            self.windows[self.active].integer_scale
+            self.windows[index].integer_scale
         }
     }
 
     /// `wl_surface` 的代理副本：GPU 线程用它写 `set_buffer_scale`（`WlSurface` 是 `Clone`）。
-    pub(crate) fn surface_clone(&self) -> wl_surface::WlSurface {
-        self.windows[self.active].surface.clone()
-    }
-
-    /// 当前窗口的稳定 id（与 `App` 的 `WindowId` 同一值）。
-    ///
-    /// 多窗口路由的锚点：下一步事件循环要按它把 `wl_surface` / `xdg_toplevel` 的事件、
-    /// 以及 seat 的键盘/指针事件（按焦点窗口）派发到正确的 `Window`。
-    pub(crate) fn id(&self) -> crate::window::WindowId {
-        self.windows[self.active].id
+    pub(crate) fn surface_clone(&self, index: usize) -> wl_surface::WlSurface {
+        self.windows[index].surface.clone()
     }
 
     /// 指针当前进入的窗口 id（没有进入任何窗口时 None：Motion/Axis 仍然更新坐标，
@@ -682,31 +765,34 @@ impl WaylandState {
     }
 
     /// `wl_display*` / `wl_surface*`（Vulkan WSI 需要；`system` backend 的真实对象）。
-    pub(crate) fn raw_pointers(&self) -> (*mut std::ffi::c_void, *mut std::ffi::c_void) {
+    pub(crate) fn raw_pointers(
+        &self,
+        index: usize,
+    ) -> (*mut std::ffi::c_void, *mut std::ffi::c_void) {
         (
             self.connection.display().id().as_ptr().cast(),
-            self.windows[self.active].surface.id().as_ptr().cast(),
+            self.windows[index].surface.id().as_ptr().cast(),
         )
     }
 
-    pub(crate) fn size(&self) -> Size {
-        self.windows[self.active].size
+    pub(crate) fn size(&self, index: usize) -> Size {
+        self.windows[index].size
     }
 
-    pub(crate) fn scale(&self) -> Scale {
-        self.windows[self.active].scale
+    pub(crate) fn scale(&self, index: usize) -> Scale {
+        self.windows[index].scale
     }
 
     pub(crate) fn serial(&self) -> u32 {
         self.serial
     }
 
-    pub(crate) fn is_configured(&self) -> bool {
-        self.windows[self.active].configured
+    pub(crate) fn is_configured(&self, index: usize) -> bool {
+        self.windows[index].configured
     }
 
-    pub(crate) fn is_focused(&self) -> bool {
-        self.windows[self.active].focused
+    pub(crate) fn is_focused(&self, index: usize) -> bool {
+        self.windows[index].focused
     }
 
     /// 把 `wp_viewport` 的所有权交给窗口渲染器（`Some` = fractional 模式）。
@@ -720,41 +806,41 @@ impl WaylandState {
     /// `wl_surface.commit()`（未 attach 新 buffer）会让 compositor 立刻把旧 buffer 按新 destination
     /// 缩放，而且这次 commit 会提前触发 frame callback、破坏 FrameGate。现在 UI 线程不再碰
     /// viewport（也不再 commit `wl_surface`）。
-    pub(crate) fn take_viewport(&mut self) -> Option<WpViewport> {
-        self.windows[self.active].viewport.take()
+    pub(crate) fn take_viewport(&mut self, index: usize) -> Option<WpViewport> {
+        self.windows[index].viewport.take()
     }
 
     pub(crate) fn take_events(&mut self) -> Vec<(crate::window::WindowId, Event)> {
         std::mem::take(&mut self.events)
     }
 
-    pub(crate) fn take_close_request(&mut self) -> bool {
-        std::mem::take(&mut self.windows[self.active].close_requested)
+    pub(crate) fn take_close_request(&mut self, index: usize) -> bool {
+        std::mem::take(&mut self.windows[index].close_requested)
     }
 
     /// 最小化（自绘标题栏的“缩小”按钮）。
-    pub(crate) fn minimize(&self) {
-        self.windows[self.active].toplevel.set_minimized();
+    pub(crate) fn minimize(&self, index: usize) {
+        self.windows[index].toplevel.set_minimized();
     }
 
     /// 最大化 / 还原切换；最终状态以 compositor 的 configure 为准。
-    pub(crate) fn toggle_maximize(&mut self) {
-        if self.windows[self.active].maximized {
-            self.windows[self.active].toplevel.unset_maximized();
+    pub(crate) fn toggle_maximize(&mut self, index: usize) {
+        if self.windows[index].maximized {
+            self.windows[index].toplevel.unset_maximized();
         } else {
-            self.windows[self.active].toplevel.set_maximized();
+            self.windows[index].toplevel.set_maximized();
         }
     }
 
     /// 开始交互式移动；使用触发拖动的指针按键 serial。
-    pub(crate) fn begin_move(&self) {
-        self.windows[self.active]
+    pub(crate) fn begin_move(&self, index: usize) {
+        self.windows[index]
             .toplevel
             ._move(&self.seat, self.pointer_serial);
     }
 
     /// 开始交互式缩放；使用触发拖动的指针按键 serial。
-    pub(crate) fn begin_resize(&self, edge: crate::window::WindowResizeEdge) {
+    pub(crate) fn begin_resize(&self, index: usize, edge: crate::window::WindowResizeEdge) {
         use wayland_protocols::xdg::shell::client::xdg_toplevel::ResizeEdge;
 
         use crate::window::WindowResizeEdge;
@@ -769,7 +855,7 @@ impl WaylandState {
             WindowResizeEdge::BottomLeft => ResizeEdge::BottomLeft,
             WindowResizeEdge::BottomRight => ResizeEdge::BottomRight,
         };
-        self.windows[self.active]
+        self.windows[index]
             .toplevel
             .resize(&self.seat, self.pointer_serial, edge);
     }
@@ -779,38 +865,44 @@ impl WaylandState {
     }
 
     /// 请求一帧回调（publish 之前调用；已有挂起 callback 时只关好门禁，不重复请求）。
-    pub(crate) fn request_frame(&mut self) {
-        let Some(token) = self.windows[self.active].frame_gate.request(Instant::now()) else {
+    pub(crate) fn request_frame(&mut self, index: usize) {
+        let Some(token) = self.windows[index].frame_gate.request(Instant::now()) else {
             return;
         };
-        let callback = self.windows[self.active]
-            .surface
-            .frame(&self.queue_handle, ());
-        self.windows[self.active].frame_callback = Some((callback.id(), token));
+        let callback = self.windows[index].surface.frame(&self.queue_handle, ());
+        self.windows[index].frame_callback = Some((callback.id(), token));
     }
 
-    pub(crate) fn frame_ready(&self) -> bool {
-        self.windows[self.active].frame_gate.is_ready()
+    pub(crate) fn frame_ready(&self, index: usize) -> bool {
+        self.windows[index].frame_gate.is_ready()
     }
 
     /// 本帧没有 publish（Idle / 中止）⇒ 不会 commit：把门禁重新打开（F-183 的 Idle 路径）。
-    pub(crate) fn note_frame_not_committed(&mut self) {
-        self.windows[self.active].frame_gate.note_not_committed();
+    pub(crate) fn note_frame_not_committed(&mut self, index: usize) {
+        self.windows[index].frame_gate.note_not_committed();
     }
 
-    /// 活性兜底：门禁关闭超过 `GATE_TIMEOUT` 时强制打开。只覆盖「publish 了但没 commit」
-    /// （present `OUT_OF_DATE` 等），正常路径不会触发；**不是**呈现节奏（F-183）。
-    pub(crate) fn expire_frame_gate(&mut self, now: Instant) -> bool {
-        self.windows[self.active].frame_gate.expire(now)
+    /// 活性兜底：任一窗口的门禁关闭超过 `GATE_TIMEOUT` 时强制打开（返回 `true` = 有窗口被兜底）。
+    /// 只覆盖「publish 了但没 commit」（present `OUT_OF_DATE` 等），正常路径不会触发；
+    /// **不是**呈现节奏（F-183）。
+    pub(crate) fn expire_frame_gates(&mut self, now: Instant) -> bool {
+        let mut expired = false;
+        for window in &mut self.windows {
+            expired |= window.frame_gate.expire(now);
+        }
+        expired
     }
 
-    /// 距离活性兜底还有多久（门禁打开时 `None`）；事件循环用它压缩阻塞等待。
+    /// 所有窗口里最早的活性兜底期限（门禁全开时 `None`）；事件循环用它压缩阻塞等待。
     pub(crate) fn frame_gate_remaining(&self, now: Instant) -> Option<Duration> {
-        self.windows[self.active].frame_gate.time_until_expiry(now)
+        self.windows
+            .iter()
+            .filter_map(|window| window.frame_gate.time_until_expiry(now))
+            .min()
     }
 
     /// IME 的激活/停用（focus 变化时由键盘事件驱动）。
-    fn set_ime_focus(&mut self, focused: bool) {
+    fn set_ime_focus(&mut self, index: usize, focused: bool) {
         let Some(text_input) = self.text_input.as_ref() else {
             return;
         };
@@ -822,7 +914,7 @@ impl WaylandState {
             text_input.enable();
             // P1-2.11：从这里开始文本由 `commit_string` 送达，`wl_keyboard` 通路必须静默。
             self.ime_enabled = true;
-            let area = self.windows[self.active]
+            let area = self.windows[index]
                 .ime_cursor_area
                 .unwrap_or_else(|| Rect::new(0.0, 0.0, 1.0, 1.0));
             text_input.set_cursor_rectangle(
@@ -831,57 +923,50 @@ impl WaylandState {
                 area.size.width.max(1.0).round() as i32,
                 area.size.height.max(1.0).round() as i32,
             );
-            self.windows[self.active].ime_cursor_applied = Some(area);
+            self.windows[index].ime_cursor_applied = Some(area);
         } else {
             text_input.disable();
             self.ime_enabled = false;
-            self.windows[self.active].ime_cursor_applied = None;
+            self.windows[index].ime_cursor_applied = None;
         }
         text_input.commit();
     }
 
     /// 保存 IME caret 区域；已聚焦时立即下发（`commit` 是 v3 的生效点）。
-    pub(crate) fn set_ime_cursor_area(&mut self, area: Option<Rect>) {
-        if self.windows[self.active].ime_cursor_area == area {
+    fn set_ime_cursor_area(&mut self, index: usize, area: Option<Rect>) {
+        if self.windows[index].ime_cursor_area == area {
             return;
         }
-        self.windows[self.active].ime_cursor_area = area;
-        if !self.windows[self.active].focused {
+        self.windows[index].ime_cursor_area = area;
+        if !self.windows[index].focused {
             return;
         }
         let effective = area.unwrap_or_else(|| Rect::new(0.0, 0.0, 1.0, 1.0));
         if let Some(text_input) = self.text_input.as_ref() {
-            if self.windows[self.active].ime_cursor_applied != Some(effective) {
+            if self.windows[index].ime_cursor_applied != Some(effective) {
                 text_input.set_cursor_rectangle(
                     effective.origin.x.round() as i32,
                     effective.origin.y.round() as i32,
                     effective.size.width.max(1.0).round() as i32,
                     effective.size.height.max(1.0).round() as i32,
                 );
-                self.windows[self.active].ime_cursor_applied = Some(effective);
+                self.windows[index].ime_cursor_applied = Some(effective);
             }
             text_input.commit();
         }
     }
 
-    /// 从 `App` 同步当前窗口的 IME caret 区域（每轮泵调用，独立于帧门禁）。
+    /// 从 `App` 同步指定窗口的 IME caret 区域（每轮泵逐窗口调用，独立于帧门禁）。
     pub(crate) fn sync_ime_cursor_area(&mut self, app: &App, window: crate::window::WindowId) {
+        let Some(index) = self.window_index(window) else {
+            return;
+        };
         let area = match app.ime_cursor_area(window) {
             Ok(area) => area,
             // 文本尚未 shape / 文本刚变化：保留上一次有效区域。
             Err(_) => return,
         };
-        self.set_ime_cursor_area(area);
-    }
-
-    /// 交付一笔 a11y 更新（`accesskit_unix` 的 `update_if_active` 无返回值）。
-    pub(crate) fn update_a11y(&mut self, adapter: &mut UnixA11y, app: &mut App) {
-        let Some(id) = app.windows().next().map(|(id, _)| id) else {
-            return;
-        };
-        if app.a11y_pending(id) {
-            adapter.update(|| crate::a11y::adapter::build_update(app, id));
-        }
+        self.set_ime_cursor_area(index, area);
     }
 
     /// 键盘：`wl_keyboard::Event::Key` → `Event`（字符输入 + 非字符键）。
@@ -1097,11 +1182,11 @@ macro_rules! dispatch_unit {
 dispatch_unit!(
     wl_compositor::WlCompositor,
     wl_data_device_manager::WlDataDeviceManager,
-    wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+    WpFractionalScaleManagerV1,
     WpViewporter,
     WpViewport,
     ZwpTextInputManagerV3,
-    zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+    ZxdgDecorationManagerV1,
 );
 
 impl Dispatch<wl_output::WlOutput, u32> for WaylandState {
@@ -1156,12 +1241,10 @@ impl Dispatch<wl_surface::WlSurface, ()> for WaylandState {
         _: &QueueHandle<Self>,
     ) {
         // 窗口归属按对象解析：enter / leave / preferred_buffer_scale 都是**那个 surface**
-        // 的属性。scale 协商状态目前仍是进程级（Stage C 会随窗口一起下移），但归属检查
-        // 现在就必须做 —— 否则将来接第二个 surface 时会静默把别人的 scale 算进本窗口。
+        // 的属性（scale 协商状态在 Stage C-1 已下移到 `WindowSurface`）。
         let Some(index) = state.window_index_for_surface(surface) else {
             return;
         };
-        let _ = index;
         // 整数回退的 scale 来源：surface v6 的 `preferred_buffer_scale` 优先，否则取已 enter 的
         // output 最大 scale（多屏窗口跨两个不同 scale 的显示器时取较大者，避免糊）。
         match event {
@@ -1407,7 +1490,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                 state
                     .events
                     .push((window, Event::FocusChanged { focused: true }));
-                state.set_ime_focus(true);
+                state.set_ime_focus(index, true);
             }
             wl_keyboard::Event::Leave { surface, .. } => {
                 let Some(index) = state.window_index_for_surface(&surface) else {
@@ -1418,7 +1501,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                 state
                     .events
                     .push((window, Event::FocusChanged { focused: false }));
-                state.set_ime_focus(false);
+                state.set_ime_focus(index, false);
             }
             _ => {}
         }
@@ -1665,7 +1748,8 @@ pub(crate) fn initial_roundtrip(
             })?;
     }
     state.dispatch_pending(queue)?;
-    if !state.is_configured() {
+    // 启动路径上 `new` 只建了首个窗口（下标 0）；首帧之前它必须拿到 configure（V-110）。
+    if !state.is_configured(0) {
         return Err(EngineError::WaylandCompositor {
             detail: smol_str::SmolStr::new_static("no xdg_toplevel.configure before first frame"),
         });

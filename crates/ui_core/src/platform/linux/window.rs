@@ -21,8 +21,8 @@ pub(crate) const MIN_SIZE_LOGICAL: (f32, f32) = (320.0, 200.0);
 
 /// 把最小尺寸交给 `xdg_toplevel`：window geometry 的逻辑像素，与 `scale` 无关。
 ///
-/// 只在建窗时（`WaylandState::new` 的首个 commit 之前）调用一次：DPI 变化后重发会把最小客户区
-/// 按 `scale` 放大（V-122 ⑦）。
+/// 每个窗口只在建窗时（`WaylandState::add_window` 的首个 commit 之前）调用一次：DPI 变化后
+/// 重发会把最小客户区按 `scale` 放大（V-122 ⑦）。
 pub(crate) fn apply_min_size(toplevel: &XdgToplevel) {
     toplevel.set_min_size(MIN_SIZE_LOGICAL.0 as i32, MIN_SIZE_LOGICAL.1 as i32);
 }
