@@ -2862,7 +2862,25 @@ GPU 线程只按新内容尺寸重画并 1:1 覆盖，buffer 用 grow-only 高�
 
 `GPU Local` 的 22.2 MB 降幅正是 buffer 桶从 1792×1536 缩到 1280×1024 后的 persist + 3 back buffer
 （4 × 10.5 MiB → 4 × 5.0 MiB）。批次 B 的收益主要在 CPU 拷贝与峰值（字形每帧 4 MiB → 数十 KiB），
-常驻内存基本不变。demo 截图逐项复核正常（CJK 简/繁/日/韩、PNG 图标、色块、HUD）。
+常驻内存基本不变。demo 截图逐项复核正常（CJK 简/繁/日/韩、PNG 图标、色块、HUD），交互复核
+（点击色块 → 选中文案更新、焦点环、F12 切换 HUD）也正常。
+
+### 37.2.1 三平台复测（同一提交 6d1be1a，demo `--features hud`，1200×925 物理内容）
+
+| 平台 / 指标                     | 改前    | 改后        | Δ          |
+|---------------------------------|---------|-------------|------------|
+| Windows 私有提交                | 231.9 MB | **127.6 MB** | −104.3 MB  |
+| Windows 工作集                  | 165.0 MB | **102.2 MB** | −62.8 MB   |
+| Windows `GPU Process Memory\Local` | 113.4 MB | **46.7 MB**  | −66.7 MB   |
+| macOS `footprint`               | 114 MB   | **51 MB**    | −63 MB     |
+| macOS RSS                       | —        | 52.5 MB      | —          |
+| Linux（lavapipe）RSS            | 157 MB   | **134.5 MB** | −22.5 MB   |
+| Linux（lavapipe）Pss            | 101 MB   | **80.2 MB**  | −20.8 MB   |
+
+三平台测试：Windows 803 lib + 62 其他；macOS 734 lib + 62；Linux 735 lib + 62，全部 0 failed
+（macOS / Linux 实机跑 `cargo test -p ui_core --features "hud,test-support"`，Linux 用
+`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json` + headless sway）。
+
 
 ### 37.3 批次 E（CPU 高频分配）复核结论
 
