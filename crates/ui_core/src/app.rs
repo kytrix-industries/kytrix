@@ -5826,6 +5826,83 @@ mod interaction_tests {
 
     /// P2-6 回归：`Above` 定位必须把浮层的**下边缘**贴到锚点上方（减掉自身高度）。
     ///
+    /// 根节点有 border 时浮层纠位仍须**收敛**且落点是窗口绝对坐标。
+    ///
+    /// 复审怀疑 taffy 的绝对定位 `inset` 会再扣一次包含块 border（那样每帧都会判「位置
+    /// 不一致」而重写 inset，永不收敛）。实测：本仓库的 taffy 配置下 `inset` 相对 border
+    /// box 原点、不额外扣 border —— 写 `(x, y)` 就落在 `(x, y)`，原实现正确。本测试作为
+    /// 回归保护：防止未来有人「修」成扣 border 而引入 1 px 偏移，或让纠位失去收敛性。
+    #[test]
+    fn anchor_placement_converges_with_a_root_border() {
+        let (_rt, mut app, window) = setup();
+        let root = root_of(&app, window);
+        // 布局边框来自 taffy 样式（`PaintSpec.border` 只影响绘制）。
+        let mut root_style = Style::default();
+        root_style.inner.border = taffy::geometry::Rect {
+            left: taffy::style::LengthPercentage::length(1.0),
+            right: taffy::style::LengthPercentage::length(1.0),
+            top: taffy::style::LengthPercentage::length(1.0),
+            bottom: taffy::style::LengthPercentage::length(1.0),
+        };
+        app.window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .set_style(root, root_style)
+            .expect("root style");
+        let anchor = mount_override(&mut app, window, root, Rect::new(100.0, 100.0, 40.0, 20.0));
+        frame(&mut app, window);
+
+        let overlay = app
+            .create_overlay(
+                window,
+                OverlayOptions {
+                    placement: OverlayPlacement::Anchor {
+                        node: anchor,
+                        side: crate::interaction::AnchorSide::Below,
+                        gap: 4.0,
+                    },
+                    dismiss: OverlayDismiss::Explicit,
+                },
+            )
+            .expect("overlay");
+        let overlay_node = overlay.node();
+        let mut style = Style::default();
+        style.inner.position = taffy::style::Position::Absolute;
+        style.inner.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::length(60.0),
+            height: taffy::style::Dimension::length(30.0),
+        };
+        app.window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .set_style(overlay_node, style)
+            .expect("style");
+        frame(&mut app, window);
+        frame(&mut app, window);
+
+        let bounds = app
+            .window(window)
+            .expect("window")
+            .tree()
+            .get(overlay_node)
+            .expect("overlay node")
+            .layout()
+            .bounds;
+        assert!(
+            (bounds.origin.x - 100.0).abs() < 0.5 && (bounds.origin.y - 124.0).abs() < 0.5,
+            "浮层落点必须是窗口绝对坐标（Below: y = 100+20+4）：{bounds:?}"
+        );
+
+        // 收敛：再出一帧不应再请求新帧（`resolve_overlay_placements` 早退）。
+        frame(&mut app, window);
+        let _ = app.take_wake_request();
+        frame(&mut app, window);
+        assert!(
+            !app.take_wake_request(),
+            "纠位必须收敛，不得每帧都重写 inset"
+        );
+    }
+
     /// 旧实现返回锚点的上边缘，浮层会整个盖住锚点。新建时浮层尺寸未知，`App` 在布局之后
     /// 用实测尺寸纠正一次。
     #[test]
