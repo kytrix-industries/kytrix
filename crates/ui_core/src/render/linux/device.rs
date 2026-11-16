@@ -156,8 +156,23 @@ impl Device {
         let devices = unsafe { instance.raw().enumerate_physical_devices() }
             .map_err(|error| init_error("enumerate_physical_devices", format!("{error:?}")))?;
         let surface_fn = instance.surface_fn();
-        let mut chosen = None;
+        // **打分选设备**而不是取第一个能用的（P2-3.1）：旧实现在混合显卡机器上可能选中
+        // iGPU，也可能选中 lavapipe（CPU 软件光栅器）—— 前者慢，后者让「有独显却在软件
+        // 渲染」这种问题完全不报。
+        //
+        // 打分顺序：独显 3 > 集显 2 > 虚拟/其它 1 > CPU 软件光栅器 0。**CPU 不排除**：
+        // 无头 CI / 远程主机常常只有 lavapipe，把它彻底拒掉会让引擎在那类环境里完全跑不起来
+        // （Chrome 同样保留 SwiftShader 作为兜底）。硬件与软件都在时硬件必然胜出。
+        let mut best: Option<(u32, vk::PhysicalDevice, u32)> = None;
         for physical in devices {
+            // SAFETY: 句柄由本结构独占，只读查询。
+            let properties = unsafe { instance.raw().get_physical_device_properties(physical) };
+            let score = match properties.device_type {
+                vk::PhysicalDeviceType::CPU => 0,
+                vk::PhysicalDeviceType::DISCRETE_GPU => 3,
+                vk::PhysicalDeviceType::INTEGRATED_GPU => 2,
+                _ => 1,
+            };
             // SAFETY: 句柄与参数都由本结构独占，调用期间有效（Vulkan 的外部同步已由 fence 保证）。
             let family = unsafe {
                 instance
@@ -184,15 +199,17 @@ impl Device {
                 }
                 None => true,
             };
-            if supported {
-                chosen = Some((physical, family as u32));
-                break;
+            if !supported {
+                continue;
+            }
+            if best.is_none_or(|(best_score, _, _)| score > best_score) {
+                best = Some((score, physical, family as u32));
             }
         }
-        let (physical, queue_family) = chosen.ok_or(EngineError::UnsupportedGpu {
+        let (_, physical, queue_family) = best.ok_or(EngineError::UnsupportedGpu {
             os: "linux",
             required: D8_REQUIRED,
-            actual: SmolStr::new_static("no device with a Wayland surface queue"),
+            actual: SmolStr::new_static("no Vulkan device with a Wayland surface queue"),
         })?;
 
         // SAFETY: 只读查询；句柄由本结构独占，返回值在本次调用期间有效。

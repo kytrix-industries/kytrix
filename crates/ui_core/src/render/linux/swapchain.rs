@@ -167,12 +167,58 @@ impl Swapchain {
                 actual: smol_str::format_smolstr!("present modes {present_modes:?}"),
             });
         }
-        // Wayland 的 buffer 尺寸由客户端决定（合成器按 configure 约束），因此直接用请求尺寸：
-        // 与持久目标同尺寸是 `cmd_copy_image` 的前提（`min/max_image_extent` 只作诊断信息）。
-        let extent = vk::Extent2D {
+        // Wayland 的 buffer 尺寸由客户端决定（合成器按 configure 约束），但 **Vulkan 仍要求**
+        // `imageExtent` 落在 `minImageExtent..=maxImageExtent` 内：请求超出上界时
+        // `vkCreateSwapchainKHR` 直接返回 `ERROR_INITIALIZATION_FAILED`（大窗口 / 特殊合成器上
+        // 会命中）。因此这里夹紧，代价是超过上界时内容被 viewport 略微缩小（仍按逻辑尺寸
+        // 布局，只是 pixel 密度下降），比建链失败好得多。
+        let requested = vk::Extent2D {
             width: size.0.max(1),
             height: size.1.max(1),
         };
+        let extent = vk::Extent2D {
+            width: requested
+                .width
+                .clamp(capabilities.min_image_extent.width, capabilities.max_image_extent.width),
+            height: requested
+                .height
+                .clamp(capabilities.min_image_extent.height, capabilities.max_image_extent.height),
+        };
+        // usage 必须被 `supported_usage_flags` 覆盖，否则同样是 INITIALIZATION_FAILED。
+        // 直通 copy 需要 TRANSFER_DST、渲染需要 COLOR_ATTACHMENT —— 两者缺一就明确报错，
+        // 而不是留给驱动吐一个无信息量的失败。
+        let required_usage = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST;
+        if !capabilities
+            .supported_usage_flags
+            .contains(required_usage)
+        {
+            return Err(EngineError::UnsupportedGpu {
+                os: "linux",
+                required: "COLOR_ATTACHMENT | TRANSFER_DST swapchain images",
+                actual: smol_str::format_smolstr!(
+                    "surface supports {:?}",
+                    capabilities.supported_usage_flags
+                ),
+            });
+        }
+        // composite alpha 只能从 `supported_composite_alpha` 里挑：多数合成器只给
+        // OPAQUE/INHERIT，硬写 OPAQUE 在某些环境（如嵌套合成器）会被拒绝。
+        let composite_alpha = [
+            vk::CompositeAlphaFlagsKHR::OPAQUE,
+            vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED,
+            vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED,
+            vk::CompositeAlphaFlagsKHR::INHERIT,
+        ]
+        .into_iter()
+        .find(|candidate| capabilities.supported_composite_alpha.contains(*candidate))
+        .ok_or_else(|| EngineError::UnsupportedGpu {
+            os: "linux",
+            required: "at least one composite alpha mode",
+            actual: smol_str::format_smolstr!(
+                "surface supports {:?}",
+                capabilities.supported_composite_alpha
+            ),
+        })?;
         let image_count =
             (capabilities.min_image_count + 1)
                 .max(3)
@@ -190,10 +236,10 @@ impl Swapchain {
             .image_color_space(chosen.color_space)
             .image_extent(extent)
             .image_array_layers(1)
-            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST)
+            .image_usage(required_usage)
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(capabilities.current_transform)
-            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+            .composite_alpha(composite_alpha)
             .present_mode(PRESENT_MODE)
             .clipped(true);
         // SAFETY: `create` 的指针在本次调用期间有效；swapchain 在本结构 Drop（或调用方延迟 drop）时销毁。

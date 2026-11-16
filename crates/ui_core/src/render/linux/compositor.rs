@@ -492,6 +492,11 @@ impl GpuRenderer {
         self.device.wait_slot(slot)?;
         let (stats, _) = self.record_and_submit(index, slot, payload, frame, None, timings)?;
         self.finish_sync(index, slot, timings)?;
+        // 与 macOS 的 `submit_snapshot` 一致：本帧已经**同步完成**，目标内容是确定的，
+        // 因此不再是「新建/未呈现」状态。旧实现从不清 `fresh`，于是离屏/基准路径每帧
+        // 都走全量（掩盖了 partial 的问题，也让基准测不到真实的分支）。
+        self.fresh = false;
+        frame.presented();
         Ok(stats)
     }
 
