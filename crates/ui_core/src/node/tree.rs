@@ -55,8 +55,8 @@ pub struct LayoutBox {
 pub enum NodeKind {
     /// 普通容器/叶子：由引擎按 `Style`/`StylePatch` 生成图元。
     Box,
-    /// 自绘节点：挂载时提交的画布内容（P02 的 `Canvas`）。
-    Canvas(Canvas),
+    /// 自绘节点：挂载时提交的画布内容（P02 的 `Canvas`；`Rc` 共享，paint 只加引用计数）。
+    Canvas(Rc<Canvas>),
     /// 静态几何节点：引用 P09 的 GPU 几何。
     Geometry(GeometryId),
     /// 文本叶子：载荷是 [`TextContent`]，布局由 `App::refresh_text` 注入的 measure 闭包完成。

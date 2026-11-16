@@ -3,6 +3,8 @@
 //! 坐标全为**绝对窗口逻辑像素**，没有 per-primitive 变换（`GeometryDraw.transform` 是唯一例外）。
 //! 字段语义与「与附录 C 的差异」见 `design/phase-02-paint-foundation.md` §6。
 
+use std::rc::Rc;
+
 use crate::{
     math::{Point, Rect, Size, Transform},
     paint::{atlas::AtlasTile, canvas::Canvas, color::Color, geometry::GeometryId},
@@ -18,7 +20,8 @@ pub enum Primitive {
     Shadow(Shadow),
     Clip(ClipOp),
     Geometry(GeometryDraw),
-    Canvas(Canvas),
+    /// 自绘画布（`Rc` 共享：paint 每帧只加引用计数，不深拷贝画布内容，F-215）。
+    Canvas(Rc<Canvas>),
 }
 
 /// 背景 / 边框 / 渐变。
@@ -142,7 +145,7 @@ pub struct GeometryDraw {
 
 #[cfg(test)]
 mod tests {
-    use std::mem::size_of;
+    use std::{mem::size_of, rc::Rc};
 
     use super::{
         Border, ClipOp, ClipRect, GeometryDraw, GlyphRun, Gradient, GradientKind, Image, Path,
@@ -244,7 +247,7 @@ mod tests {
                     transform: Transform::IDENTITY,
                 }),
             ),
-            ("Canvas", Primitive::Canvas(Canvas::new(rect()))),
+            ("Canvas", Primitive::Canvas(Rc::new(Canvas::new(rect())))),
         ]
     }
 

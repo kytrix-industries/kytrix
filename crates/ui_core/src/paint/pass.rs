@@ -160,7 +160,7 @@ impl ClipContext {
 enum Content {
     Box,
     Text(Option<Rc<ShapedLine>>),
-    Canvas(Box<crate::paint::canvas::Canvas>),
+    Canvas(Rc<crate::paint::canvas::Canvas>),
     Geometry(crate::paint::geometry::GeometryId),
 }
 
@@ -324,7 +324,7 @@ fn rebuild_lane(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
         let content = match target.kind() {
             NodeKind::Box => Content::Box,
             NodeKind::Text(_) => Content::Text(context.tree.text_line(node).cloned()),
-            NodeKind::Canvas(canvas) => Content::Canvas(Box::new(canvas.clone())),
+            NodeKind::Canvas(canvas) => Content::Canvas(Rc::clone(canvas)),
             NodeKind::Geometry(id) => Content::Geometry(*id),
         };
         // 屏幕坐标 = 内容坐标 − 祖先滚动偏移（P10 §7.2）。
@@ -591,7 +591,7 @@ impl PrimitiveEmitter {
             }
             Content::Canvas(canvas) => {
                 let canvas_bounds = canvas.bounds();
-                self.push(context, Primitive::Canvas(*canvas));
+                self.push(context, Primitive::Canvas(Rc::clone(&canvas)));
                 context.damage.push(canvas_bounds, 1.0, self.clip);
             }
             Content::Text(line) => {

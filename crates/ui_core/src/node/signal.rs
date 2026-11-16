@@ -398,6 +398,13 @@ impl StateStore {
             matches!(slot.value, SignalValue::Owned(_)),
             "transient/derived 必须用对应的写入口"
         );
+        // 同类型复用已有的 Box：HUD 每帧写同一批信号，避免每帧一次堆分配（F-214）。
+        if let SignalValue::Owned(existing) = &mut slot.value
+            && let Some(current) = existing.downcast_mut::<T>()
+        {
+            *current = value;
+            return;
+        }
         slot.value = SignalValue::Owned(Box::new(value));
     }
 
@@ -410,6 +417,13 @@ impl StateStore {
             matches!(slot.value, SignalValue::Transient(_)),
             "普通信号必须用 write"
         );
+        // 同上：瞬态值每帧覆盖，类型不变时复用 Box（F-214）。
+        if let SignalValue::Transient(existing) = &mut slot.value
+            && let Some(current) = existing.downcast_mut::<T>()
+        {
+            *current = value;
+            return;
+        }
         slot.value = SignalValue::Transient(Box::new(value));
     }
 
@@ -534,6 +548,21 @@ mod tests {
         let copy = signal;
         let _ = signal;
         assert_eq!(copy.id().index(), 7, "Copy 与 T: Copy 无关");
+    }
+
+    #[test]
+    fn rewriting_an_owned_value_reuses_its_box() {
+        // 每帧写同一批信号时不应每帧分配（F-214）。
+        let mut store = StateStore::with_capacity(1, 0);
+        let id = store.push_owned(String::from("first"));
+        let before = store.owned_ref::<String>(id).expect("value") as *const String;
+        store.set_owned(id, String::from("second-longer-than-inline"));
+        let after = store.owned_ref::<String>(id).expect("value") as *const String;
+        assert_eq!(before, after, "同类型写入必须复用 Box");
+        assert_eq!(
+            store.owned_ref::<String>(id).expect("value"),
+            "second-longer-than-inline"
+        );
     }
 
     #[test]

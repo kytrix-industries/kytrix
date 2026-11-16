@@ -4,6 +4,8 @@
 //! 一个 builder 实例 = 一次挂载（不是可复用的模板）；`build` 时把 6 个部件装成 `NodeSpec` 交给
 //! `NodeTree::insert_child`（`NodeSpec` 的字段私有 —— 见其 rustdoc）。
 
+use std::rc::Rc;
+
 use smol_str::SmolStr;
 
 use crate::{
@@ -149,7 +151,7 @@ impl NodeBuilder {
     #[must_use]
     pub fn canvas(canvas: Canvas) -> Self {
         Self {
-            kind: NodeKind::Canvas(canvas),
+            kind: NodeKind::Canvas(Rc::new(canvas)),
             ..Self::boxed()
         }
     }

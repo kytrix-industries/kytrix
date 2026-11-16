@@ -8,9 +8,10 @@
 //! `FrameIndex` 本身留在 `window.rs`（P06 的公开 API 返回类型，DEVIATIONS F-74）；本模块只提供
 //! 「槽位 + 需要等待/将要 signal 的 fence 值」（`render/windows/queue.rs` 消费）与帧交付数据。
 
-use std::time::{Duration, Instant};
-
-use bytes::Bytes;
+use std::{
+    sync::{Mutex, OnceLock, PoisonError},
+    time::{Duration, Instant},
+};
 
 #[cfg(target_os = "linux")]
 use crate::math::Size;
@@ -28,7 +29,7 @@ use crate::{
 /// 实例字节、绘制序、裁剪表、几何表必须一起过线：GPU 线程拿到的必须是**同一帧**的四份数据。
 /// 每帧一次拷贝是线程边界的所有权转移，不是可选优化（§4.2 的代价说明）。
 pub(crate) struct FramePayload {
-    instances: Bytes,
+    instances: Vec<u8>,
     ops: Vec<FrameOp>,
     clips: Vec<GpuClipEntry>,
     /// 几何绘制表：`FrameOp::Geometry.index` 的下标表，**必须与 `ops` 同帧过线**
@@ -40,16 +41,49 @@ pub(crate) struct FramePayload {
     geometry: Vec<GeometryDraw>,
 }
 
+/// 一帧的四个 CPU 缓冲（`FramePayload` 回收的单位，DEVIATIONS F-213）。
+#[derive(Default)]
+struct PayloadBuffers {
+    instances: Vec<u8>,
+    ops: Vec<FrameOp>,
+    clips: Vec<GpuClipEntry>,
+    geometry: Vec<GeometryDraw>,
+}
+
+/// 回收池上限：最多缓存 4 帧的缓冲（GPU 线程通常只压着一帧，4 个足够且封顶内存）。
+const POOL_LIMIT: usize = 4;
+
+/// 跨线程回收池：GPU 线程 drop `FramePayload` 时把缓冲还回来，UI 线程下一帧直接复用。
+///
+/// `Mutex` 每帧只锁一次、临界区是 4 次 `Vec` 交换，代价远小于 4 次分配。
+fn payload_pool() -> &'static Mutex<Vec<PayloadBuffers>> {
+    static POOL: OnceLock<Mutex<Vec<PayloadBuffers>>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn pool_lock() -> std::sync::MutexGuard<'static, Vec<PayloadBuffers>> {
+    payload_pool()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
 impl FramePayload {
-    /// 从 UI 线程的编码结果复制一份。
+    /// 从 UI 线程的编码结果复制一份（缓冲从回收池取，容量跨帧复用）。
     pub(crate) fn from_buffer(buffer: &InstanceBuffer) -> Self {
-        let mut clips = Vec::with_capacity(buffer.clips().len());
-        buffer.write_clips_gpu(&mut clips);
+        let mut buffers = pool_lock().pop().unwrap_or_default();
+        buffers.instances.clear();
+        buffers.instances.extend_from_slice(buffer.as_bytes());
+        buffers.ops.clear();
+        buffers.ops.extend_from_slice(buffer.ops());
+        buffers.clips.clear();
+        buffer.write_clips_gpu(&mut buffers.clips);
+        buffers.geometry.clear();
+        buffers.geometry.extend_from_slice(buffer.geometry());
         Self {
-            instances: Bytes::copy_from_slice(buffer.as_bytes()),
-            ops: buffer.ops().to_vec(),
-            clips,
-            geometry: buffer.geometry().to_vec(),
+            instances: buffers.instances,
+            ops: buffers.ops,
+            clips: buffers.clips,
+            geometry: buffers.geometry,
         }
     }
 
@@ -78,11 +112,34 @@ impl FramePayload {
     #[cfg(any(windows, test))]
     pub(crate) fn empty() -> Self {
         Self {
-            instances: Bytes::new(),
+            instances: Vec::new(),
             ops: Vec::new(),
             clips: Vec::new(),
             geometry: Vec::new(),
         }
+    }
+}
+
+impl Drop for FramePayload {
+    fn drop(&mut self) {
+        // 只回收有容量的缓冲：`empty()` 的零容量帧不占池位。
+        if self.instances.capacity() == 0
+            && self.ops.capacity() == 0
+            && self.clips.capacity() == 0
+            && self.geometry.capacity() == 0
+        {
+            return;
+        }
+        let mut pool = pool_lock();
+        if pool.len() >= POOL_LIMIT {
+            return;
+        }
+        pool.push(PayloadBuffers {
+            instances: std::mem::take(&mut self.instances),
+            ops: std::mem::take(&mut self.ops),
+            clips: std::mem::take(&mut self.clips),
+            geometry: std::mem::take(&mut self.geometry),
+        });
     }
 }
 
@@ -240,12 +297,36 @@ mod tests {
 
     use super::{
         FramePayload, FrameRequest, FrameSlot, InFlightRing, LatestFrame, MAX_FRAMES_IN_FLIGHT,
+        pool_lock,
     };
     use crate::{
         math::PhysicalRect,
+        paint::instance::InstanceEncoder,
         render::compositor::{DamageRects, Plan},
         window::FrameIndex,
     };
+
+    #[test]
+    fn a_dropped_payload_returns_its_buffers_to_the_pool() {
+        // 回收池是跨线程的：GPU 线程 drop 帧后，UI 线程下一帧直接复用容量（F-213）。
+        let mut seeded = super::PayloadBuffers::default();
+        seeded.instances.reserve(4096);
+        pool_lock().push(seeded);
+
+        let encoder = InstanceEncoder::new();
+        let payload = FramePayload::from_buffer(encoder.buffer());
+        let capacity = payload.instances.capacity();
+        assert!(capacity >= 4096, "from_buffer 必须复用池里的容量");
+        drop(payload);
+        let pooled = pool_lock()
+            .iter()
+            .map(|buffers| buffers.instances.capacity())
+            .max();
+        assert!(
+            pooled.is_some_and(|pooled| pooled >= capacity),
+            "缓冲必须回收到池并保留容量（pooled={pooled:?}）"
+        );
+    }
 
     fn partial(rects: &[PhysicalRect]) -> Plan {
         let mut plan = DamageRects::new();

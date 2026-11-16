@@ -2823,9 +2823,10 @@ GPU 线程只按新内容尺寸重画并 1:1 覆盖，buffer 用 grow-only 高�
 
 ### S-153 图集页尺寸由像素长度推导（不新增跨线程字段）
 
-`AtlasTextures::queue_upload(kind, pixels, rows)` 的 `pixels.len()` 必须等于 `page² × texel_bytes`；
-页尺寸取 `isqrt(len / texel_bytes)`，非平方数/零直接硬断言失败。理由：页尺寸是 `pixels` 的纯函数，
-把它写进 `FramePayload` / 共享槽只会多一份可能不同步的状态。
+**修订（批次 B 之后）**：`pixels` 改为「按 `rows` 顺序紧密打包的行」后，页尺寸不再是
+`pixels.len()` 的纯函数（同样长度可以对应不同行数），因此 `queue_upload(kind, page, pixels, rows)`
+**显式收页尺寸**，并用 `pixels.len() == 行数 × page × texel` 的硬断言兜住契约；页尺寸随上传一起
+过线，不需要从长度反推。
 
 ### V-133 待复核（批次 A 落地后）
 
@@ -2833,6 +2834,24 @@ GPU 线程只按新内容尺寸重画并 1:1 覆盖，buffer 用 grow-only 高�
 2. WARP / lavapipe / Metal validation 对 1×1 占位 → 实际页重建的投诉；
 3. 图片页锁档后大图插入的 `Capacity` 错误路径（应用可见文案）；
 4. 批次 A 的内存收益复测（Windows 私有提交 / GPU Local，macOS footprint，Linux RSS）。
+
+### 37.1 批次 A 实测（Windows 本机，1200×925 物理，demo `--features hud`）
+
+| 指标 | 改前 | 改后 | Δ |
+|------|------|------|---|
+| 私有提交（静止） | 231.9 MB | **131.9 MB** | **−100.0 MB** |
+| 工作集 | 165.0 MB | **102.1 MB** | −62.9 MB |
+| `GPU Process Memory\Local` | 113.4 MB | **68.9 MB** | **−44.5 MB** |
+| 私有已提交（`VirtualQueryEx` 直方图） | 195.2 MB | 98.7 MB | −96.5 MB |
+| `PAGE_NOCACHE`（上传堆） | 88.3 MB | 40.2 MB | −48.1 MB |
+
+资源清单变化（按实测日志）：图片图集 16 MiB 纹理 + 16 MiB CPU 页 + 20 MiB staging → 512² 档的
+1 MiB + 1 MiB + ~3 MiB；字形页 4 MiB 纹理 + 8.5 MiB staging → 512² 档（demo 的 CJK 字形量下）
+0.25 MiB + ~1.5 MiB。内容 persist + 交换链（42 MiB）不变，属批次 C。
+
+功能验证：`cargo test -p ui_core --features "hud,test-support"` 全通过；demo 截图逐项正常
+（CJK 简/繁/日/韩、PNG 图标、色块、HUD）；跨 target `cargo check`（aarch64-apple-darwin /
+x86_64-unknown-linux-gnu，后者按 V-04 的 pkg-config stub）exit 0。
 
 ### F-210 Windows 上传缓冲持久映射（批次 D）
 
@@ -2884,45 +2903,58 @@ GPU 线程只按新内容尺寸重画并 1:1 覆盖，buffer 用 grow-only 高�
 
 ### 37.3 批次 E（CPU 高频分配）复核结论
 
-审计列的 E 项逐条核对现状：
+审计列的 E 项逐条核对现状（2026-11-16 收尾）：
 
 1. `paint/pass.rs` 的文本内容已经是 `Rc<ShapedLine>`（`Content::Text(Option<Rc<ShapedLine>>)`），
    每帧克隆只加引用计数，**不是**深拷贝；
 2. `StylePatch` 全字段 `Copy`、`PaintSpec` 只含 `Color`/`Option<Border>`/`Option<Gradient>`/
    `Option<ShadowSpec>` 等定长值，逐节点 `clone()` 不分配堆；
 3. `Layout` 克隆只在 `measure`/`layout_at`（宽度变化或重新断行）发生，静态文本不每帧重排；
-4. 仍存在的每帧分配：`FramePayload::from_buffer` 的 4 次 Vec/Bytes 构造（约 40 KiB/帧）、
-   `Canvas` 节点深拷贝、`StateStore` 槽位不回收（信号 id 稠密、节点销毁后留槽）。
-   这三项见 V-134。
+4. `FramePayload::from_buffer` 的 4 次分配 → 回收池（F-213）；
+5. `Canvas` 节点每帧深拷贝 → `Rc<Canvas>`（F-215）；
+6. 信号写入每帧 `Box::new` → 同类型原地复用（F-214）；
+7. 未做：`StateStore` 槽位回收（V-134，当前没有释放路径）。
 
-### V-134 批次 D/E 的未完成项（待用户拍板）
+### F-212 macOS / Linux 图集 staging 改为每槽常驻环
 
-1. **macOS / Linux staging 环形缓冲**：当前仍是每帧一次性缓冲（按 `index` retire），只影响上传
-   瞬间的峰值与 CPU 分配，不影响常驻内存。改成「每槽常驻 + 按需扩容」需要三处改动（`record_uploads`
-   收 `slot`、按槽记容量、扩容时 retire 旧缓冲）；Windows 已是常驻 staging。
-2. **`FramePayload` 缓冲池**：`from_buffer` 每帧 4 次分配（实例 `Bytes` + ops/clips/geometry 三个
-   `Vec`，约 40 KiB/帧 ≈ 2.4 MiB/s）。零拷贝需要 GPU 线程把缓冲「还」给 UI 线程（三平台各有一条
-   队列，回收路径不一），属于跨线程所有权改造，收益是 CPU 分配而非常驻内存。
-3. **`Canvas` 深拷贝**：`paint/pass.rs` 每个 canvas 节点每次 paint 都 `Box::new(canvas.clone())`。
-   demo 无 canvas 节点；改成 `Rc<Canvas>` 需要动 `NodeKind::Canvas` 的存储形态。
-4. **`StateStore` 槽位回收**：信号槽是稠密 `Vec`，节点销毁后槽位保留（值仍占内存）。回收需要
-   代际 arena + 句柄失效检查，属于状态系统级改动；静态 demo 下无实际增长。
+| 项       | 内容                                                                                                                                                                                                                                      |
+|----------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 设计原文 | macOS / Linux 每次图集上传分配一块一次性 staging，编码后按帧序号 retire（`OneShotStaging` / 一次性 `MTLBuffer`）。                                                                                                                        |
+| 偏差     | 每张页按 `MAX_FRAMES_IN_FLIGHT` 维护一块常驻 staging：`record_uploads` 收帧槽下标，容量够就复用、不够才重建（扩容换下的旧缓冲按 `index` retire）。macOS 是 `StorageModeShared` 的 `MTLBuffer`，Linux 是 host-visible + **持久映射**的 buffer。 |
+| 依据     | 槽位复用由队列契约保证「上一帧已完成」（macOS 三槽 semaphore / Linux `wait_slot`），因此覆盖写安全；每帧 1–2 次 `newBuffer` / `create_buffer + allocate_memory + bind + map` 全部消掉。                                                       |
+| 释放     | Linux 当前环在 `AtlasTextures::drop` 里 unmap + destroy（扩容换下的旧环走句柄表）；macOS 的 `MTLBuffer` 由句柄表的 ARC 释放。                                                                                                              |
+| 测试     | 三端「两帧在飞」用例改为断言常驻环**不产生 retire** 且像素各自正确；Linux teardown 用例改为「扩容换下的旧环在未提交帧里由 `drain_all_retired` 释放」。                                                                                       |
 
+### F-213 `FramePayload` 缓冲跨线程回收池
 
+| 项       | 内容                                                                                                                                                                                                                        |
+|----------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 设计原文 | `FramePayload::from_buffer` 每帧新建 4 个容器（`Bytes` 实例 + ops/clips/geometry 三个 `Vec`，约 40 KiB/帧 ≈ 2.4 MiB/s）。                                                                                                    |
+| 偏差     | 实例字节改为 `Vec<u8>`；新增跨线程回收池（`OnceLock<Mutex<Vec<PayloadBuffers>>>`，上限 4 帧）：GPU 线程 drop 帧时把四个容器还池，UI 线程下一帧 `from_buffer` 直接取回并复用容量。`empty()` 的零容量帧不进池。                    |
+| 原因     | 三平台队列都各自持有「最新帧槽」，没有归还通道；把回收点放进 `Drop` 是唯一不改三端队列的零拷贝方案（锁每帧一次、临界区只做 4 次 `Vec` 移动）。                                                                                  |
+| 代价     | 池最多常驻 4 帧的容量（实测 ≤ 200 KiB）；`Drop` 里判零容量，纯空帧不占池位。                                                                                                                                                  |
+| 测试     | `a_dropped_payload_returns_its_buffers_to_the_pool`：预置 4096 容量池项 → `from_buffer` 复用 → drop 后回池。                                                                                                                  |
 
-| 指标 | 改前 | 改后 | Δ |
-|------|------|------|---|
-| 私有提交（静止） | 231.9 MB | **131.9 MB** | **−100.0 MB** |
-| 工作集 | 165.0 MB | **102.1 MB** | −62.9 MB |
-| `GPU Process Memory\Local` | 113.4 MB | **68.9 MB** | **−44.5 MB** |
-| 私有已提交（`VirtualQueryEx` 直方图） | 195.2 MB | 98.7 MB | −96.5 MB |
-| `PAGE_NOCACHE`（上传堆） | 88.3 MB | 40.2 MB | −48.1 MB |
+### F-214 信号写入复用值 Box
 
-资源清单变化（按实测日志）：图片图集 16 MiB 纹理 + 16 MiB CPU 页 + 20 MiB staging → 512² 档的
-1 MiB + 1 MiB + ~3 MiB；字形页 4 MiB 纹理 + 8.5 MiB staging → 512² 档（demo 的 CJK 字形量下）
-0.25 MiB + ~1.5 MiB。内容 persist + 交换链（42 MiB）不变，属批次 C。
+| 项       | 内容                                                                                                                                                                                        |
+|----------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 设计原文 | `StateStore::set_owned` / `set_transient` 每次写入都 `Box::new(value)`，HUD 每帧写同一批信号 ⇒ 每帧 N 次堆分配。                                                                              |
+| 偏差     | 类型一致时 `downcast_mut::<T>()` 原地赋值，复用已有 Box；类型不一致（引擎不变量被破坏）才重新装箱。                                                                                            |
+| 未做     | **槽位回收**（删除节点后释放槽）仍未实现：`SignalId` 是稠密下标、没有代际，节点树也没有「释放某节点信号」的路径；引入代际 free list 会改动依赖图与所有句柄类型，风险远大于收益（静态场景下槽数不增长）。见 V-134 ①。                |
+| 测试     | `rewriting_an_owned_value_reuses_its_box`：同类型重写后值的地址不变。                                                                                                                            |
 
-功能验证：`cargo test -p ui_core --features "hud,test-support"` 全通过；demo 截图逐项正常
-（CJK 简/繁/日/韩、PNG 图标、色块、HUD）；跨 target `cargo check`（aarch64-apple-darwin /
-x86_64-unknown-linux-gnu，后者按 V-04 的 pkg-config stub）exit 0。
+### F-215 `Canvas` 改为 `Rc` 共享
 
+| 项       | 内容                                                                                                                                                                        |
+|----------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 设计原文 | `NodeKind::Canvas(Canvas)` / `Primitive::Canvas(Canvas)`；paint 每个 canvas 节点每帧 `Box::new(canvas.clone())` 深拷贝画布的 `Vec<Primitive>`。                                |
+| 偏差     | `NodeKind::Canvas(Rc<Canvas>)`、`Primitive::Canvas(Rc<Canvas>)`、`Content::Canvas(Rc<Canvas>)`：paint 只做 `Rc::clone`，公共构造入口 `NodeBuilder::canvas(Canvas)` 不变。        |
+| 原因     | `Canvas` 内嵌 `Lane { primitives: Vec<Primitive>, .. }`，深拷贝是真实分配；共享后每帧零拷贝。                                                                                 |
+| 测试     | 全部 804 个 lib 用例（含实例编码的 canvas 展开）通过。                                                                                                                         |
+
+### V-134 仍未做（记录）
+
+1. **`StateStore` 槽位回收**：信号槽是稠密 `Vec`，节点销毁后槽位保留（值仍占内存）。回收需要
+   代际 arena + 句柄失效检查，会改动依赖图与所有句柄类型；当前没有「节点删除 ⇒ 释放信号」的
+   路径，静态场景下槽数不增长。等真的出现可释放场景再做（届时按 F-214 的值复用继续省分配）。

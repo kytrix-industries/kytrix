@@ -664,6 +664,8 @@ fn quad_visible(quad: &crate::paint::primitive::Quad) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use super::{
         FLAG_OPAQUE, GRADIENT_HORIZONTAL, GRADIENT_RADIAL, GRADIENT_VERTICAL, GpuPrimitive,
         InstanceBuffer, InstanceEncoder, KIND_GLYPH, KIND_QUAD, KIND_SHADOW, TEXTURE_GLYPH,
@@ -792,7 +794,7 @@ mod tests {
         });
         assert!(canvas.pop_clip());
         let scene = scene_with(|scene, lane| {
-            assert!(scene.push(lane, Primitive::Canvas(canvas)));
+            assert!(scene.push(lane, Primitive::Canvas(Rc::new(canvas))));
         });
         let buffer = encode(&scene);
         let instance = buffer.instances[0];
