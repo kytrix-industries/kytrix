@@ -384,8 +384,6 @@ impl InstanceBuffer {
 /// `Primitive → GpuPrimitive` 的编码器（`Window` 持有，缓冲跨帧复用）。
 pub(crate) struct InstanceEncoder {
     buffer: InstanceBuffer,
-    /// 静态几何注册表的共享句柄（`App` 持有；`Window` 在编码前写入）。
-    store: std::sync::Arc<crate::paint::geometry_store::GeometryStore>,
     stack: SmallVec<[ClipChainId; 8]>,
     chains: ahash::HashMap<(u32, [u32; 4], [u32; 4]), ClipChainId>,
     /// 颜色解析缓存（跨帧保留，每帧 clear）。
@@ -398,7 +396,6 @@ impl InstanceEncoder {
     pub(crate) fn new() -> Self {
         let mut encoder = Self {
             buffer: InstanceBuffer::new(),
-            store: std::sync::Arc::new(crate::paint::geometry_store::GeometryStore::new()),
             stack: SmallVec::new(),
             chains: ahash::HashMap::default(),
             colors: crate::paint::color::ResolveCache::new(),
@@ -419,6 +416,7 @@ impl InstanceEncoder {
         scene: &Scene,
         scale: Scale,
         resolver: &ColorResolver,
+        store: &crate::paint::geometry_store::GeometryStore,
     ) -> &InstanceBuffer {
         self.buffer.clear();
         self.buffer.clips.push(ClipChain {
@@ -439,7 +437,6 @@ impl InstanceEncoder {
             chains,
             colors,
             run_start,
-            store,
         } = self;
         let mut frame = FrameEncoder {
             buffer,
@@ -970,7 +967,12 @@ mod tests {
 
     fn encode(scene: &Scene) -> InstanceBuffer {
         let mut encoder = InstanceEncoder::new();
-        encoder.encode(scene, scale(), &resolver());
+        encoder.encode(
+            scene,
+            scale(),
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        );
         // 取出编码结果，避免继续借用 encoder。
         encoder.buffer
     }
@@ -1373,6 +1375,48 @@ mod tests {
             [200.0, 100.0, 1800.0, 1300.0],
             "geometry op 必须存物理 AABB (x0, y0, x1, y1)（逻辑 × scale）"
         );
+    }
+
+    /// P0 回归：`App` 注册的几何必须真的进编码器（旧实现编码器各持一个空 store，
+    /// `desc_arc` 恒 `None` ⇒ 上传空顶点 ⇒ 几何/Path 永远画不出来）。
+    #[test]
+    fn encoder_uses_the_supplied_geometry_store() {
+        // 一个 3 顶点 / 3 索引的三角形（UI 管线顶点布局）。
+        let stride = crate::paint::geometry::GeometryPipeline::Ui.vertex_stride() as usize;
+        let vertex_bytes = bytes::Bytes::from(vec![0u8; stride * 3]);
+        let index_bytes = bytes::Bytes::from(vec![0u8, 0, 1, 0, 2, 0]);
+        let desc = crate::paint::geometry::GeometryDesc {
+            vertex_bytes,
+            index_bytes,
+            vertex_stride: stride as u32,
+            index_type: crate::paint::geometry::IndexType::U16,
+            topology: crate::paint::geometry::Topology::TriangleList,
+            bounds: rect(0.0, 0.0, 10.0, 10.0),
+            pipeline: crate::paint::geometry::GeometryPipeline::Ui,
+        };
+        let mut store = crate::paint::geometry_store::GeometryStore::new();
+        let id = store.insert(desc).expect("valid geometry");
+
+        let mut scene = Scene::empty();
+        let lane = scene.new_lane();
+        assert!(scene.push(
+            lane,
+            Primitive::Geometry(GeometryDraw {
+                id,
+                transform: Transform::IDENTITY,
+                color: crate::paint::color::Color::WHITE,
+            }),
+        ));
+        scene.set_order(&[lane]);
+        let mut encoder = InstanceEncoder::new();
+        let buffer = encoder.encode(&scene, scale(), &resolver(), &store);
+        let draw = buffer.geometry.first().expect("必须有一条几何绘制");
+        assert_eq!(
+            draw.desc.vertex_bytes.len(),
+            stride * 3,
+            "编码器必须从传入的 store 取到真实顶点（而不是空 MISSING 描述）"
+        );
+        assert_eq!(draw.desc.index_bytes.len(), 6);
     }
 
     #[test]

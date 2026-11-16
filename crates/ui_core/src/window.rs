@@ -1036,7 +1036,10 @@ impl Window {
     /// # Errors
     /// [`EngineError::ClipDepthExceeded`]：clip 嵌套超过上限（release 也失败，见 P14 审查）。
     /// 返回 `Err` 时本帧未提交：调用方必须 `abort_frame`，damage/dirty 保留待重试。
-    pub(crate) fn paint_frame(&mut self) -> Result<PaintReport, EngineError> {
+    pub(crate) fn paint_frame(
+        &mut self,
+        geometry: &crate::paint::geometry_store::GeometryStore,
+    ) -> Result<PaintReport, EngineError> {
         // 借用式取出（保容量）：`tree` 与 `scene` 是不同字段，循环内可同时可变借用。
         for lane in self.tree.drain_removed_lanes() {
             self.scene.release_lane(lane);
@@ -1079,7 +1082,9 @@ impl Window {
             log: PaintLog::default(),
         };
         let mut report = pass.run()?;
-        let buffer = self.encoder.encode(&self.scene, scale, &self.resolver);
+        let buffer = self
+            .encoder
+            .encode(&self.scene, scale, &self.resolver, geometry);
         #[cfg(feature = "test-support")]
         {
             report.instances = buffer.len();
@@ -1278,7 +1283,11 @@ impl Window {
                 return Err(error);
             }
         }
-        let report = match self.paint_frame() {
+        // 无 `App` 的独立窗口（probe / 离屏测试）没有几何注册表：传一个进程级空表。
+        static NO_GEOMETRY: std::sync::OnceLock<crate::paint::geometry_store::GeometryStore> =
+            std::sync::OnceLock::new();
+        let geometry = NO_GEOMETRY.get_or_init(crate::paint::geometry_store::GeometryStore::new);
+        let report = match self.paint_frame(geometry) {
             Ok(report) => report,
             Err(error) => {
                 self.abort_frame(ticket);

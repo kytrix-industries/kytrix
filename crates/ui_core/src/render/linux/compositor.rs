@@ -1913,6 +1913,7 @@ mod tests {
                     &scene,
                     Scale::ONE,
                     &ColorResolver::new(Interpolation::default()),
+                    &crate::paint::geometry_store::GeometryStore::new(),
                 );
                 // 尽量让两个线程的录制 / 提交重叠（真正的并发点）。
                 barrier.wait();

@@ -3046,14 +3046,22 @@ impl App {
         }
         // 图集页上传（P13：逐窗口分发，两张页分开、顺序固定以便帧记录复现）。
         self.upload_atlas_pages();
-        let paint = match self.windows.get_mut(&window) {
-            Some(target) => match target.paint_frame() {
-                Ok(report) => report,
-                Err(error) => {
-                    self.abort_frame(window, ticket);
-                    return Some(Err(error));
-                }
-            },
+        // 借用拆分：`windows` 与 `geometry` 是不同字段，可同时借出（几何表只读）。
+        // 先取结果、结束后再处理错误 —— 解构 `self` 期间不能再调 `self.abort_frame`。
+        let painted = {
+            let Self {
+                windows, geometry, ..
+            } = self;
+            windows
+                .get_mut(&window)
+                .map(|target| target.paint_frame(geometry))
+        };
+        let paint = match painted {
+            Some(Ok(report)) => report,
+            Some(Err(error)) => {
+                self.abort_frame(window, ticket);
+                return Some(Err(error));
+            }
             None => {
                 self.abort_frame(window, ticket);
                 return None;

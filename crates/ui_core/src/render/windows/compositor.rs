@@ -2043,7 +2043,12 @@ mod tests {
             );
             let scene = Scene::empty();
             let mut encoder = InstanceEncoder::new();
-            let buffer = encoder.encode(&scene, Scale::ONE, &resolver());
+            let buffer = encoder.encode(
+                &scene,
+                Scale::ONE,
+                &resolver(),
+                &crate::paint::geometry_store::GeometryStore::new(),
+            );
             let mut frame = full_plan((16, 16));
             let mut timings = FrameTimings::new();
             renderer
@@ -2110,7 +2115,12 @@ mod tests {
                     Color::srgb(1.0, 0.0, 0.0, 1.0),
                 ));
                 let mut encoder = InstanceEncoder::new();
-                let buffer = encoder.encode(&text_free, Scale::ONE, &resolver());
+                let buffer = encoder.encode(
+                    &text_free,
+                    Scale::ONE,
+                    &resolver(),
+                    &crate::paint::geometry_store::GeometryStore::new(),
+                );
                 // 尽量让两个线程的录制 / 提交重叠（真正的并发点）。
                 barrier.wait();
                 let mut timings = FrameTimings::new();
@@ -2329,7 +2339,12 @@ mod tests {
     fn instance_bytes_are_128_per_primitive() {
         let scene = one_lane_scene(quad(Rect::new(0.0, 0.0, 8.0, 8.0), Color::WHITE));
         let mut encoder = InstanceEncoder::new();
-        let buffer = encoder.encode(&scene, Scale::ONE, &resolver());
+        let buffer = encoder.encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        );
         assert_eq!(buffer.as_bytes().len(), 128);
         assert_eq!(buffer.ops().len(), 1);
         assert!(matches!(
@@ -2351,7 +2366,12 @@ mod tests {
         renderer.set_background_color([0.5, 0.5, 0.5, 0.5]);
         let scene = Scene::empty();
         let mut encoder = InstanceEncoder::new();
-        let buffer = encoder.encode(&scene, Scale::ONE, &resolver());
+        let buffer = encoder.encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        );
         let mut frame = full_plan((8, 8));
         let mut timings = FrameTimings::new();
         renderer
@@ -2397,7 +2417,12 @@ mod tests {
             Color::srgb(1.0, 0.0, 0.0, 1.0),
         ));
         let mut encoder = InstanceEncoder::new();
-        let buffer = encoder.encode(&scene, Scale::ONE, &resolver());
+        let buffer = encoder.encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        );
         let mut frame = full_plan((64, 64));
         let mut timings = FrameTimings::new();
         let stats = renderer
@@ -2422,7 +2447,12 @@ mod tests {
             Color::srgb(1.0, 0.0, 0.0, 1.0),
         ));
         let mut encoder = InstanceEncoder::new();
-        let buffer = encoder.encode(&scene, Scale::ONE, &resolver());
+        let buffer = encoder.encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        );
         let mut timings = FrameTimings::new();
 
         let mut first = full_plan((64, 64));
@@ -2505,7 +2535,12 @@ mod tests {
         ));
         scene.set_order(&[lane]);
         let mut encoder = InstanceEncoder::new();
-        let buffer = encoder.encode(&scene, Scale::ONE, &resolver());
+        let buffer = encoder.encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        );
         let mut timings = FrameTimings::new();
 
         let mut first = full_plan((64, 64));
@@ -2539,7 +2574,12 @@ mod tests {
             Color::srgb(0.0, 0.0, 1.0, 1.0),
         ));
         let mut encoder = InstanceEncoder::new();
-        let buffer = encoder.encode(&blue, Scale::ONE, &resolver());
+        let buffer = encoder.encode(
+            &blue,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        );
         let mut first = full_plan(size);
         let mut timings = FrameTimings::new();
         renderer
@@ -2551,7 +2591,12 @@ mod tests {
             Color::srgb(1.0, 0.0, 0.0, 1.0),
         ));
         let mut encoder = InstanceEncoder::new();
-        let buffer = encoder.encode(&red, Scale::ONE, &resolver());
+        let buffer = encoder.encode(
+            &red,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        );
         let damage = [PhysicalRect::new(0, 0, 32, 64)];
         let mut second = partial_plan(&damage, size);
         assert!(matches!(second.plan(), Plan::Partial(_)));
@@ -2602,7 +2647,12 @@ mod tests {
             color: Color::WHITE,
         }));
         let mut encoder = InstanceEncoder::new();
-        let buffer = encoder.encode(&scene, Scale::ONE, &resolver());
+        let buffer = encoder.encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        );
         let mut frame = full_plan((64, 64));
         let mut timings = FrameTimings::new();
         renderer
@@ -2655,7 +2705,12 @@ mod tests {
             modulation: Color::WHITE,
         }));
         let mut encoder = InstanceEncoder::new();
-        let buffer = encoder.encode(&scene, Scale::ONE, &resolver());
+        let buffer = encoder.encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        );
         let mut frame = full_plan((64, 64));
         let mut timings = FrameTimings::new();
         renderer
@@ -2701,7 +2756,12 @@ mod tests {
             }],
         }));
         let mut encoder = InstanceEncoder::new();
-        let buffer = encoder.encode(&scene, Scale::ONE, &resolver());
+        let buffer = encoder.encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        );
         let mut frame = full_plan((64, 64));
         let mut timings = FrameTimings::new();
         if renderer
@@ -2737,7 +2797,12 @@ mod tests {
         };
         let scene = Scene::empty();
         let mut encoder = InstanceEncoder::new();
-        let buffer = encoder.encode(&scene, Scale::ONE, &resolver());
+        let buffer = encoder.encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        );
         let mut frame = full_plan((63, 17));
         let mut timings = FrameTimings::new();
         renderer
@@ -2762,7 +2827,12 @@ mod tests {
             Color::srgb(0.0, 1.0, 0.0, 1.0),
         ));
         let mut encoder = InstanceEncoder::new();
-        let buffer = encoder.encode(&scene, Scale::ONE, &resolver());
+        let buffer = encoder.encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        );
         let mut frame = full_plan((32, 32));
         let mut timings = FrameTimings::new();
         renderer
@@ -2772,7 +2842,12 @@ mod tests {
         renderer.resize((96, 64)).expect("resize");
         assert_eq!(renderer.surface(), (96, 64));
         let mut encoder = InstanceEncoder::new();
-        let buffer = encoder.encode(&scene, Scale::ONE, &resolver());
+        let buffer = encoder.encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        );
         let mut frame = full_plan((96, 64));
         renderer
             .submit_buffer(FrameIndex::from_raw(2), buffer, &mut frame, &mut timings)
@@ -2790,7 +2865,12 @@ mod tests {
         };
         let scene = Scene::empty();
         let mut encoder = InstanceEncoder::new();
-        let buffer = encoder.encode(&scene, Scale::ONE, &resolver());
+        let buffer = encoder.encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        );
         let image = renderer.render_snapshot(buffer).expect("snapshot");
         assert_eq!((image.width, image.height), (16, 8));
         assert_eq!(image.rgba8.len(), 16 * 8 * 4);
@@ -2838,7 +2918,12 @@ mod tests {
             Color::srgb(1.0, 0.0, 0.0, 1.0),
         ));
         let mut encoder = InstanceEncoder::new();
-        let buffer = encoder.encode(&scene, Scale::ONE, &resolver());
+        let buffer = encoder.encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        );
         let mut frame = full_plan((32, 24));
         let mut timings = FrameTimings::new();
         renderer
@@ -3020,7 +3105,12 @@ mod tests {
             Color::srgb(1.0, 0.0, 0.0, 1.0),
         ));
         let mut encoder = InstanceEncoder::new();
-        let buffer = encoder.encode(&red, Scale::ONE, &resolver());
+        let buffer = encoder.encode(
+            &red,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        );
         let mut frame = full_plan((64, 64));
         let mut timings = FrameTimings::new();
         renderer
@@ -3061,7 +3151,12 @@ mod tests {
             Color::srgb(1.0, 0.0, 0.0, 1.0),
         ));
         let mut encoder = InstanceEncoder::new();
-        let buffer = encoder.encode(&red, Scale::ONE, &resolver());
+        let buffer = encoder.encode(
+            &red,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        );
         let mut frame = full_plan((64, 64));
         let mut timings = FrameTimings::new();
         renderer

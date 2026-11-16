@@ -1756,6 +1756,7 @@ mod tests {
             &Scene::empty(),
             Scale::ONE,
             &ColorResolver::new(Interpolation::default()),
+            &crate::paint::geometry_store::GeometryStore::new(),
         );
         let image = renderer.render_snapshot(buffer).expect("snapshot");
         assert_eq!((image.width, image.height), (16, 8));
