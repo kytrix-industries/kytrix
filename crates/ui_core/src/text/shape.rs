@@ -3,8 +3,10 @@
 //! [`ShapedText`] 是一次 shape 的**不可变快照**（parley `Layout` + 内容宽），被 `Rc` 共享：
 //! - measure：`clone()` 后 `break_all_lines` + `align`（宽度变化不重建 `Layout`）；
 //! - 光栅：遍历 `positioned_glyphs()`，按 run 的字体光栅并装箱，产出 [`ShapedLine`]。
-//!   parley 的落点是小数物理坐标；光栅阶段把 x 拆成「整数基准 + 1/4 px 相位」
-//!   （`raster::split_subpixel_x`）后交给字形图集，y 仍按整像素基线。
+//!   parley 的落点 `glyph.x` 是**小数物理坐标**（layout 以 `scale` 构建，`x = 逻辑 × scale`）；
+//!   光栅阶段把它拆成「整数基准 + 1/4 px 相位」（`raster::split_subpixel_x`）后交给字形图集，
+//!   因此相位永远基于**物理**坐标（非整数 scale 下用逻辑坐标算相位会把 1/4 px 网格弄错）。
+//!   ppem 同样取 run 的物理字号并保留小数；y 仍按整像素基线。
 
 use std::borrow::Cow;
 
@@ -263,6 +265,8 @@ impl ShapedText {
     ///
     /// 水平落点按 1/4 px 相位量化后光栅（`raster`），`ShapedGlyphRun::glyphs[].position` 仍是
     /// **整数物理像素**：相位已经烘进位图与 `placement.left`，绘制侧不需要再做亚像素变换。
+    /// 相位与 ppem 都取**物理**量：`glyph.x` 是 parley 以 `scale` 构建布局后的小数物理坐标，
+    /// ppem 是 `run.font_size()`（逻辑字号 × scale，保留小数；见 `atlas::PPEM_KEY_QUANTIZATION`）。
     /// y 方向继续整像素对齐（水平排版不需要竖直亚像素定位）。
     ///
     /// `generation` 是当前字形图集的代际（写进 `ShapedLine`，供 P06 判 stale）。
@@ -298,10 +302,12 @@ impl ShapedText {
                 match item {
                     PositionedLayoutItem::GlyphRun(run) => {
                         let font = run.run().font().clone();
-                        // parley 的 `Run::font_size()` **已是物理值**（B2：不能再乘 scale）。
-                        // ppem 仍取整：本方案只改「定位相位 + 抗锯齿策略」，不改光栅尺寸；
-                        // 落点的小数部分由 `split_subpixel_x` 吸收。
-                        let ppem = run.run().font_size().round().clamp(1.0, 512.0);
+                        // 光栅 ppem = parley 的 `Run::font_size()`，**已是物理值**（B2：不能再乘
+                        // scale），且**保留小数**（P3，txt-1 收尾）：14 px @125% → 17.5 ppem。
+                        // swash 的 `ScalerBuilder::size` 收 f32、skrifa 按小数缩放轮廓；取整会
+                        // 让位图比 parley 的小数 advance 宽/窄最多 0.5 px/em，累积成字距呼吸。
+                        // 图集键只用它的量化值（`atlas::PPEM_KEY_QUANTIZATION`），光栅用原值。
+                        let ppem = run.run().font_size().clamp(1.0, 512.0);
                         let text_range = run.run().text_range();
                         let color = run.style().brush.color;
                         if run.run().synthesis().any() {
@@ -532,6 +538,25 @@ mod tests {
                 ShapedTextItem::InlineBox(_) => None,
             })
             .expect("the first item must be a glyph with coverage")
+    }
+
+    /// 快照里所有已装箱字形（按绘制序）。
+    fn all_glyphs(line: &crate::text::ShapedLine) -> Vec<crate::paint::primitive::PositionedGlyph> {
+        line.glyph_runs()
+            .flat_map(|run| run.glyphs.iter().copied())
+            .collect()
+    }
+
+    /// 布局里第一行第一个字形的**物理** x（parley 坐标；`first_glyph_x_at` 返回的是逻辑值）。
+    fn first_glyph_physical_x(
+        layout: &parley::Layout<crate::paint::color::ColorBrush>,
+    ) -> Option<f32> {
+        layout.lines().next()?.items().find_map(|item| match item {
+            parley::PositionedLayoutItem::GlyphRun(run) => {
+                run.positioned_glyphs().next().map(|glyph| glyph.x)
+            }
+            parley::PositionedLayoutItem::InlineBox(_) => None,
+        })
     }
 
     #[test]
@@ -933,6 +958,312 @@ mod tests {
             first_glyph_tile(&left).uv(),
             first_glyph_tile(&right).uv(),
             "0.4 px 的亚像素位移必须产生不同 tile（相位必须进入 GlyphKey）"
+        );
+    }
+
+    /// P3（txt-1 收尾）：非整数 scale 下，`shape.rs` 必须把 **`x * scale`（物理坐标）** 的相位
+    /// 交给 `subpixel_x`，而不是逻辑坐标的相位。
+    ///
+    /// 1x 的端到端测试（上一条）无法区分两者：逻辑 = 物理。这里在 scale=1.25 下重跑迁移：
+    /// 居中布局物理内容宽 +0.8 px ⇒ 物理落点 +0.4 px、逻辑落点 +0.32 px；相位必须按物理量换桶，
+    /// 落点 `position.x * scale` 仍必须是整数物理像素（相位烘进位图，不能再被 `to_physical`
+    /// 二次取整）。
+    #[test]
+    fn subpixel_phase_at_fractional_scale_follows_physical_positions() {
+        if crate::text::raster::probe_font().is_none() {
+            eprintln!("skip: no system font available");
+            return;
+        }
+        let mut harness = Harness::new();
+        let shaped = harness.shape_scaled(
+            "R",
+            TextStyle::new(16.0).with_alignment(crate::text::TextAlign::Center),
+            1.25,
+        );
+
+        // 居中布局：逻辑内容宽 +0.64 ⇒ 物理内容宽 +0.8 ⇒ 物理落点 +0.4、逻辑落点 +0.32。
+        let (left_width, right_width) = (200.0f32, 200.64f32);
+        let left_physical =
+            first_glyph_physical_x(&shaped.layout_at(left_width)).expect("left glyph");
+        let right_physical =
+            first_glyph_physical_x(&shaped.layout_at(right_width)).expect("right glyph");
+        assert!(
+            (right_physical - left_physical - 0.4).abs() < 0.01,
+            "precondition: 物理落点必须移动 0.4 px（{left_physical} → {right_physical}）"
+        );
+        let left_logical = shaped.first_glyph_x_at(left_width);
+        let right_logical = shaped.first_glyph_x_at(right_width);
+        assert!(
+            (right_logical - left_logical - 0.32).abs() < 0.01,
+            "precondition: 逻辑落点只移动 0.32 px（{left_logical} → {right_logical}）"
+        );
+        assert_ne!(
+            crate::text::raster::split_subpixel_x(left_physical).1,
+            crate::text::raster::split_subpixel_x(right_physical).1,
+            "precondition: 0.4 物理像素必须换到不同相位桶"
+        );
+
+        let mut raster = crate::text::raster::GlyphRasterizer::new();
+        let mut glyphs = crate::text::atlas::GlyphAtlas::new();
+        let mut atlas = crate::render::atlas::AtlasAllocator::with_page(
+            crate::paint::atlas::AtlasKind::Glyph,
+            (512, 512),
+        );
+        let generation = atlas.generation();
+        let (left, _, _) = shaped
+            .rasterize(
+                &shaped.layout_at(left_width),
+                left_width,
+                &mut raster,
+                &mut glyphs,
+                &mut atlas,
+                generation,
+            )
+            .expect("left layout must rasterize");
+        let (right, _, _) = shaped
+            .rasterize(
+                &shaped.layout_at(right_width),
+                right_width,
+                &mut raster,
+                &mut glyphs,
+                &mut atlas,
+                generation,
+            )
+            .expect("right layout must rasterize");
+
+        assert_ne!(
+            first_glyph_tile(&left).uv(),
+            first_glyph_tile(&right).uv(),
+            "物理相位不同 ⇒ 1.25 scale 下必须产生不同 tile"
+        );
+        for line in [&left, &right] {
+            let glyphs = all_glyphs(line);
+            assert_eq!(glyphs.len(), 1, "'R' must have coverage");
+            for glyph in glyphs {
+                let physical_x = glyph.position.x * line.scale;
+                assert!(
+                    (physical_x - physical_x.round()).abs() < 1e-3,
+                    "落点必须是整数物理像素（相位已烘进位图）：{physical_x}"
+                );
+                let physical_width = glyph.size.width * line.scale;
+                assert!(
+                    (physical_width - physical_width.round()).abs() < 1e-3,
+                    "位图物理宽度必须是整数：{physical_width}"
+                );
+            }
+        }
+    }
+
+    /// P3（txt-1 收尾）：相位必须是**物理**坐标派生的 —— 非整数 scale 下用逻辑坐标会静默错位。
+    ///
+    /// 构造一对物理布局完全相同的快照：`16 px @ 1.25` 与 `20 px @ 1.0` 的物理字号都是 20 px、
+    /// 物理换行宽都是 250 px ⇒ parley 的 `glyph.x` 逐位相同。正确实现（相位 = `glyph.x`、
+    /// ppem = `run.font_size()`，两者都是物理量）下第二次光栅 100% 命中第一次的 tile；
+    /// 若实现改用逻辑坐标（`glyph.x / scale`）或逻辑字号，1.25 那侧必然落到不同相位/ppem ⇒
+    /// 必然 miss（各自新 raster 一份）。
+    #[test]
+    fn subpixel_phase_is_derived_from_physical_coordinates() {
+        if crate::text::raster::probe_font().is_none() {
+            eprintln!("skip: no system font available");
+            return;
+        }
+        let mut harness = Harness::new();
+        let centered =
+            |size: f32| TextStyle::new(size).with_alignment(crate::text::TextAlign::Center);
+        let fractional = harness.shape_scaled("R", centered(16.0), 1.25);
+        let integer = harness.shape_scaled("R", centered(20.0), 1.0);
+        // 逻辑 200 × 1.25 == 逻辑 250 × 1.0 == 物理 250。
+        let fractional_layout = fractional.layout_at(200.0);
+        let integer_layout = integer.layout_at(250.0);
+
+        let fractional_physical_x =
+            first_glyph_physical_x(&fractional_layout).expect("fractional glyph");
+        let integer_physical_x = first_glyph_physical_x(&integer_layout).expect("integer glyph");
+        assert!(
+            (fractional_physical_x - integer_physical_x).abs() < 1e-3,
+            "precondition: 两个快照的物理落点必须一致（{fractional_physical_x} → {integer_physical_x}）"
+        );
+        // 逻辑落点按 scale 缩放：这正是「逻辑坐标相位」会算错的来源。
+        let logical_gap = (fractional_physical_x / 1.25 - integer_physical_x).abs();
+        assert!(
+            logical_gap > 0.01,
+            "precondition: 逻辑落点必须不同（差 {logical_gap}）"
+        );
+
+        let mut raster = crate::text::raster::GlyphRasterizer::new();
+        let mut glyphs = crate::text::atlas::GlyphAtlas::new();
+        let mut atlas = crate::render::atlas::AtlasAllocator::with_page(
+            crate::paint::atlas::AtlasKind::Glyph,
+            (512, 512),
+        );
+        let generation = atlas.generation();
+        let (fractional_line, _, fractional_stats) = fractional
+            .rasterize(
+                &fractional_layout,
+                200.0,
+                &mut raster,
+                &mut glyphs,
+                &mut atlas,
+                generation,
+            )
+            .expect("fractional layout must rasterize");
+        let (integer_line, _, integer_stats) = integer
+            .rasterize(
+                &integer_layout,
+                250.0,
+                &mut raster,
+                &mut glyphs,
+                &mut atlas,
+                generation,
+            )
+            .expect("integer layout must rasterize");
+
+        assert_eq!(
+            fractional_stats.rasters, 1,
+            "the single 'R' must raster once"
+        );
+        assert_eq!(
+            (
+                integer_stats.misses,
+                integer_stats.rasters,
+                integer_stats.hits
+            ),
+            (0, 0, 1),
+            "物理布局相同 ⇒ 第二次必须命中第一次的 tile（逻辑坐标/逻辑字号实现会 miss）"
+        );
+        assert_eq!(
+            first_glyph_tile(&fractional_line),
+            first_glyph_tile(&integer_line),
+            "同一物理字形必须复用同一 tile"
+        );
+        // 同一物理字形：逻辑落点按各自 scale 还原后必须一致。
+        let fractional_glyph = all_glyphs(&fractional_line)[0];
+        let integer_glyph = all_glyphs(&integer_line)[0];
+        assert!(
+            (fractional_glyph.position.x * 1.25 - integer_glyph.position.x).abs() < 1e-3,
+            "两种 scale 的逻辑落点必须只差 scale"
+        );
+    }
+
+    /// P3（txt-1 收尾）：ppem 改小数后，parley 的 advance / 内容宽不受光栅影响。
+    ///
+    /// 14 px 逻辑字号 @125% = 17.5 ppem（改之前会被取整成 18）。光栅只是消费 parley 的定位，
+    /// 不得回写任何布局量；否则数字列/断行会漂移。
+    #[test]
+    fn fractional_ppem_keeps_parley_advances() {
+        if crate::text::raster::probe_font().is_none() {
+            eprintln!("skip: no system font available");
+            return;
+        }
+        let mut harness = Harness::new();
+        let shaped = harness.shape_scaled("0123456789", TextStyle::new(14.0), 1.25);
+        let layout = shaped.layout();
+        let layout_width = layout.width();
+        let layout_advance = layout
+            .lines()
+            .next()
+            .expect("single line")
+            .metrics()
+            .advance;
+
+        let mut raster = crate::text::raster::GlyphRasterizer::new();
+        let mut glyphs = crate::text::atlas::GlyphAtlas::new();
+        let mut atlas = crate::render::atlas::AtlasAllocator::with_page(
+            crate::paint::atlas::AtlasKind::Glyph,
+            (1024, 1024),
+        );
+        let generation = atlas.generation();
+        let (line, diagnostics, _) = shaped
+            .rasterize(
+                layout,
+                shaped.widths().max,
+                &mut raster,
+                &mut glyphs,
+                &mut atlas,
+                generation,
+            )
+            .expect("rasterize must not fail");
+
+        assert!(
+            diagnostics.is_empty(),
+            "digits must not produce diagnostics"
+        );
+        assert!(!all_glyphs(&line).is_empty(), "digits must rasterize");
+        assert_eq!(line.width, layout_width / 1.25, "内容宽 = 布局宽 / scale");
+        assert_eq!(
+            line.lines[0].advance,
+            layout_advance / 1.25,
+            "行 advance 必须来自 parley，不受小数 ppem 影响"
+        );
+        let total_advance: f32 = line.lines.iter().map(|line| line.advance).sum();
+        assert!(
+            (total_advance - line.width).abs() < 1e-3,
+            "advance 总和必须等于内容宽：{total_advance} vs {}",
+            line.width
+        );
+    }
+
+    /// P3（txt-1 收尾）：同一逻辑字号在 scale=1 与 1.25 下必须产生不同的 ppem/图集 tile，
+    /// 且 1.25 的位图物理宽度接近 1.25×（光栅尺寸真的乘了 scale，不是只改落点）。
+    #[test]
+    fn fractional_scale_rasterizes_larger_bitmaps_with_distinct_tiles() {
+        if crate::text::raster::probe_font().is_none() {
+            eprintln!("skip: no system font available");
+            return;
+        }
+        let mut harness = Harness::new();
+        let at_1x = harness.shape_scaled("HHHH", TextStyle::new(16.0), 1.0);
+        let at_125 = harness.shape_scaled("HHHH", TextStyle::new(16.0), 1.25);
+
+        let mut raster = crate::text::raster::GlyphRasterizer::new();
+        let mut glyphs = crate::text::atlas::GlyphAtlas::new();
+        let mut atlas = crate::render::atlas::AtlasAllocator::with_page(
+            crate::paint::atlas::AtlasKind::Glyph,
+            (1024, 1024),
+        );
+        let generation = atlas.generation();
+        let (line_1x, _, _) = at_1x
+            .rasterize(
+                at_1x.layout(),
+                at_1x.widths().max,
+                &mut raster,
+                &mut glyphs,
+                &mut atlas,
+                generation,
+            )
+            .expect("1x must rasterize");
+        let (line_125, _, _) = at_125
+            .rasterize(
+                at_125.layout(),
+                at_125.widths().max,
+                &mut raster,
+                &mut glyphs,
+                &mut atlas,
+                generation,
+            )
+            .expect("1.25x must rasterize");
+
+        let glyphs_1x = all_glyphs(&line_1x);
+        let glyphs_125 = all_glyphs(&line_125);
+        assert_eq!(glyphs_1x.len(), 4, "HHHH must produce four covered glyphs");
+        assert_eq!(glyphs_125.len(), 4);
+        assert_ne!(
+            glyphs_1x[0].tile.uv(),
+            glyphs_125[0].tile.uv(),
+            "不同 ppem（16 vs 20）必须占不同 tile"
+        );
+
+        // 位图物理宽度之和 ≈ 1.25×（逐字形位图宽度是整数，用 4 个字形求和摊薄取整误差）。
+        let physical_width_sum =
+            |glyphs: &[crate::paint::primitive::PositionedGlyph], scale: f32| -> f32 {
+                glyphs.iter().map(|glyph| glyph.size.width * scale).sum()
+            };
+        let width_1x = physical_width_sum(&glyphs_1x, 1.0);
+        let width_125 = physical_width_sum(&glyphs_125, 1.25);
+        let ratio = width_125 / width_1x;
+        assert!(
+            (ratio - 1.25).abs() < 0.12,
+            "125% 位图宽度应接近 1.25×：{width_1x} → {width_125}（ratio {ratio}）"
         );
     }
 

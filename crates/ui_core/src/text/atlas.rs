@@ -10,17 +10,38 @@ use crate::{
     render::{Allocation, AtlasAllocator},
 };
 
-/// 字形缓存键：字体身份 + 字形 id + 物理 ppem + 水平亚像素相位。
+/// 字形缓存键：字体身份 + 字形 id + **量化 ppem** + 水平亚像素相位。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct GlyphKey {
     font: FontKey,
     glyph: u32,
-    ppem: u32,
+    /// 光栅 ppem 的量化键（[`PPEM_KEY_QUANTIZATION`]）。光栅用的 ppem 是小数物理字号，
+    /// 但缓存键只保留 1/64 px 的量化值：既让小数 ppem 参与键，又不对 f32 的 1 ulp 抖动敏感。
+    ppem_q: u32,
     /// 水平亚像素相位桶（`0..raster::SUBPIXEL_PHASES`）：同一字形在同一 ppem 下每个相位各占
     /// 一个 tile，绘制时按 `整数基准 + placement.left` 落点（见 `raster::split_subpixel_x`）。
     subpixel_x: u8,
     /// 实例坐标 / faux bold 的摘要（见 `GlyphVariation`）：同一字形的不同实例各占一个 tile。
     variation: u64,
+}
+
+/// `GlyphKey` 的 ppem 量化步长：`ppem_q = (ppem * PPEM_KEY_QUANTIZATION).round()`。
+///
+/// 光栅用的 ppem 是**小数**物理字号（parley 的 `Run::font_size()` = 逻辑字号 × `scale`；
+/// 16 px @125% → 20.0 ppem、14 px @125% → 17.5 ppem，见 `shape::ShapedText::rasterize`），
+/// 但缓存键不能直接存 f32 bits：同一物理字号从不同路径重算 `size * scale` 可能差 1 ulp，
+/// 直接比 bits 会让图集为视觉上完全相同的 ppem 多存一份 tile，`missing` 负缓存也会永远命不中。
+/// 量化到 1/64 px 后，125%/150% DPI 下最常见的 17.5 / 18.75 等值是**精确**整数键（×64 无
+/// 舍入），量化误差 ≤ 1/128 px —— 只有亚像素相位（1/4 px）的 1/32。
+pub(crate) const PPEM_KEY_QUANTIZATION: f32 = 64.0;
+
+/// 光栅 ppem → 可哈希的量化键（[`PPEM_KEY_QUANTIZATION`]）。
+///
+/// 非法值（NaN/±inf/≤0）在 `GlyphRasterizer::rasterize` 里被拒绝，`.round() as u32` 是饱和
+/// 转换（NaN/负数归一为 0），不会 panic；生产路径的 ppem 已被 `clamp(1.0, 512.0)` 钳过，
+/// 键 ∈ `64..=32768`，与非法值的键不可能相撞。
+fn ppem_key(ppem: f32) -> u32 {
+    (ppem * PPEM_KEY_QUANTIZATION).round() as u32
 }
 
 /// 一条缓存记录：tile + swash 的落点（位置要用 `top/left` 才算得出）。
@@ -80,6 +101,11 @@ impl GlyphAtlas {
 
     /// 取字形 tile；未命中则光栅 + 装箱。
     ///
+    /// `ppem` 是**小数**物理字号：光栅按原值进行（`GlyphRasterizer::rasterize` 收 `f32`，
+    /// swash/skrifa 直接按小数缩放轮廓），缓存键只用它的量化值 [`PPEM_KEY_QUANTIZATION`]。
+    /// 相差 < 1/128 px 的两个 ppem 因此共用一份位图 —— 尺寸差不可见，却避免了同一物理字号
+    /// 因 1 ulp 抖动重复光栅。
+    ///
     /// `subpixel_x` 是水平相位桶（`0..raster::SUBPIXEL_PHASES`），参与缓存键：同一字形的不同
     /// 相位必须各占一个 tile，否则亚像素定位会被 tile 复用抹平。
     ///
@@ -97,7 +123,7 @@ impl GlyphAtlas {
         let key = GlyphKey {
             font: FontKey::of(font, raster.font_epoch()),
             glyph,
-            ppem: ppem.to_bits(),
+            ppem_q: ppem_key(ppem),
             subpixel_x,
             variation: variation.map_or(0, crate::text::raster::GlyphVariation::hash),
         };
@@ -306,7 +332,7 @@ fn write_record_rows(page: &mut [u8], page_width: u32, record: &GlyphRecord, row
 
 #[cfg(test)]
 mod tests {
-    use super::{GlyphAtlas, GlyphKey};
+    use super::{GlyphAtlas, GlyphKey, ppem_key};
     use crate::{
         paint::atlas::AtlasKind,
         render::AtlasAllocator,
@@ -366,6 +392,55 @@ mod tests {
         assert!(large.width > small.width);
     }
 
+    /// P3（txt-1 收尾）：ppem 键必须是「小数 + 量化」，而不是整数 ppem 或裸 f32 bits。
+    ///
+    /// 125% DPI 下 14 px 逻辑字号 = 17.5 ppem：它必须与 18 ppem 分开（把 ppem 取整的实现会让
+    /// 两者撞键、125% 下按 18 px 出位图），但 17.5 与 17.5+1e-5（同一物理字号的不同重算路径）
+    /// 必须命中同一 tile（裸 f32 bits 的键会因 1 ulp 差异重复光栅）。
+    #[test]
+    fn fractional_ppem_is_quantized_in_the_glyph_key() {
+        assert_eq!(ppem_key(17.5), 1120, "17.5 × 64 必须精确");
+        assert_eq!(ppem_key(18.0), 1152);
+        assert_eq!(ppem_key(16.0), 1024);
+        assert_eq!(ppem_key(17.5 + 1e-5), 1120, "1/64 px 内的抖动必须同键");
+        assert_eq!(ppem_key(f32::NAN), 0, "NaN 必须归一为固定键");
+        assert_eq!(ppem_key(-1.0), 0);
+
+        let Some(font) = probe_font() else {
+            eprintln!("skip: no system font available");
+            return;
+        };
+        let mut raster = GlyphRasterizer::new();
+        let mut atlas = tiny_glyph_atlas();
+        let mut glyphs = GlyphAtlas::new();
+
+        let half = glyphs
+            .ensure(&mut raster, &mut atlas, &font, 36, 17.5, 0, None)
+            .expect("ok")
+            .expect("17.5 ppem coverage");
+        let eighteen = glyphs
+            .ensure(&mut raster, &mut atlas, &font, 36, 18.0, 0, None)
+            .expect("ok")
+            .expect("18 ppem coverage");
+        assert_ne!(
+            half.tile.uv(),
+            eighteen.tile.uv(),
+            "17.5 与 18 ppem 必须各占一个 tile（取整实现会撞键）"
+        );
+
+        let near = glyphs
+            .ensure(&mut raster, &mut atlas, &font, 36, 17.5 + 1e-5, 0, None)
+            .expect("ok")
+            .expect("quantized hit");
+        assert_eq!(
+            near.tile, half.tile,
+            "1/64 px 内的同一物理字号必须复用 tile"
+        );
+        let stats = glyphs.take_stats();
+        assert_eq!((stats.misses, stats.rasters, stats.hits), (2, 2, 1));
+        assert_eq!(glyphs.len(), 2);
+    }
+
     /// P2-2：水平亚像素相位必须参与缓存键 —— 否则 x=10.0 与 x=10.4 的字形会共用同一张位图，
     /// 亚像素定位被 tile 复用抹平。同相位必须继续复用（不能把缓存打成全 miss）。
     #[test]
@@ -402,6 +477,99 @@ mod tests {
         assert_eq!(integer.tile, integer_again.tile, "同相位必须复用 tile");
         let stats = glyphs.take_stats();
         assert_eq!((stats.misses, stats.rasters, stats.hits), (0, 0, 1));
+    }
+
+    /// P3（txt-1 收尾）：相位 3 → 0 的进位边界（x=10.999）必须与下一个整数完全同键。
+    ///
+    /// `split_subpixel_x(10.999)` 进位成 `(11.0, 0)`；图集侧必须复用相位 0 的 tile，不能把
+    /// 10.999 与 11.0 当成两种位置（那等于凭空多出第 5 档相位/多一份位图）。
+    #[test]
+    fn phase_carry_reuses_the_integer_phase_tile() {
+        let (base, phase) = crate::text::raster::split_subpixel_x(10.999);
+        assert_eq!((base, phase), (11.0, 0), "10.999 必须进位成 x=11 + 相位 0");
+        assert_eq!(
+            crate::text::raster::split_subpixel_x(11.0),
+            (base, phase),
+            "进位后必须与整像素完全同键"
+        );
+
+        let Some(font) = probe_font() else {
+            eprintln!("skip: no system font available");
+            return;
+        };
+        let mut raster = GlyphRasterizer::new();
+        let mut atlas = tiny_glyph_atlas();
+        let mut glyphs = GlyphAtlas::new();
+
+        let integer = glyphs
+            .ensure(&mut raster, &mut atlas, &font, 36, 16.0, 0, None)
+            .expect("ok")
+            .expect("phase 0 coverage");
+        let three_quarter = glyphs
+            .ensure(&mut raster, &mut atlas, &font, 36, 16.0, 3, None)
+            .expect("ok")
+            .expect("phase 3 coverage");
+        assert_ne!(
+            integer.tile.uv(),
+            three_quarter.tile.uv(),
+            "3/4 px 相位必须新建 tile"
+        );
+        assert_eq!(glyphs.len(), 2);
+
+        let carried = glyphs
+            .ensure(&mut raster, &mut atlas, &font, 36, 16.0, phase, None)
+            .expect("ok")
+            .expect("carried phase must hit");
+        assert_eq!(
+            carried.tile, integer.tile,
+            "进位到相位 0 必须复用整像素 tile"
+        );
+        assert_eq!(glyphs.len(), 2, "进位不得新建第 5 档 tile");
+        let stats = glyphs.take_stats();
+        assert_eq!((stats.misses, stats.rasters, stats.hits), (2, 2, 1));
+    }
+
+    /// P3（txt-1 收尾）：`missing` 负缓存键必须包含量化 ppem —— 否则同一无轮廓字形在 125%
+    /// （17.5 ppem）首次失败后，100%（16 ppem）的失败结果会被错误复用（反过来也一样），
+    /// 换成小数 ppem 后负缓存的失效维度就少了一维。
+    #[test]
+    fn missing_cache_is_keyed_by_quantized_ppem() {
+        let Some(font) = probe_font() else {
+            eprintln!("skip: no system font available");
+            return;
+        };
+        let mut raster = GlyphRasterizer::new();
+        let mut atlas = tiny_glyph_atlas();
+        let mut glyphs = GlyphAtlas::new();
+        // 非法 glyph id：swash 取不到轮廓，`rasterize` 返回 None（不依赖宿主字体）。
+        let missing_glyph = u32::from(u16::MAX);
+
+        assert!(
+            glyphs
+                .ensure(&mut raster, &mut atlas, &font, missing_glyph, 17.5, 0, None)
+                .expect("no error")
+                .is_none()
+        );
+        let stats = glyphs.take_stats();
+        assert_eq!((stats.misses, stats.rasters), (1, 0));
+
+        // 同键必须直接命中负缓存：不再尝试光栅、也不计 miss。
+        assert!(
+            glyphs
+                .ensure(&mut raster, &mut atlas, &font, missing_glyph, 17.5, 0, None)
+                .expect("no error")
+                .is_none()
+        );
+        assert_eq!(glyphs.take_stats(), super::GlyphAtlasStats::default());
+
+        // 量化 ppem 是负缓存键的一部分：18.0 必须重新尝试并再次 miss。
+        assert!(
+            glyphs
+                .ensure(&mut raster, &mut atlas, &font, missing_glyph, 18.0, 0, None)
+                .expect("no error")
+                .is_none()
+        );
+        assert_eq!(glyphs.take_stats().misses, 1);
     }
 
     #[test]
@@ -441,7 +609,7 @@ mod tests {
             variation: 0,
             font: super::FontKey::of(&font, raster.font_epoch()),
             glyph: 36,
-            ppem: 16.0f32.to_bits(),
+            ppem_q: ppem_key(16.0),
             subpixel_x: 0,
         };
         raster.set_font_epoch(raster.font_epoch() + 1);
@@ -449,7 +617,7 @@ mod tests {
             variation: 0,
             font: super::FontKey::of(&font, raster.font_epoch()),
             glyph: 36,
-            ppem: 16.0f32.to_bits(),
+            ppem_q: ppem_key(16.0),
             subpixel_x: 0,
         };
 

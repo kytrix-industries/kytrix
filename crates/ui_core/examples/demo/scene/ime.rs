@@ -197,7 +197,8 @@ impl ImeField {
 /// 按 UTF-16 区间把组合串的一段替换成 `replacement`；`replace = None` = 整段替换。
 ///
 /// 区间来自 [`ImeEvent::Preedit`] / [`ImeEvent::Commit`]（macOS `NSTextInputClient` 的
-/// `replacementRange`，UTF-16 码元、相对组合串起点；平台层已把端点吸附到码点边界）。
+/// `replacementRange`；平台层已把 AppKit 的**文档坐标**减去 `markedRange.location` 换算成
+/// 相对组合串起点，并把端点吸附到码点边界）。
 /// 这里是应用侧消费语义：只替换区间里的旧组合串，区间外的部分原样保留（组合串中间的
 /// 逐子句更新/重转换不会丢字）。异常输入（越界、端点落在代理对中间）向最近的码点边界收缩，
 /// 保证 `&str` 切片永远合法。

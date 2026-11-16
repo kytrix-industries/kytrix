@@ -207,8 +207,13 @@ impl InputEvent {
 /// - `Some(range)`：区间相对**当前组合串起点**（UTF-16 码元），新文本替换该区间里的旧文本，
 ///   区间外的组合串余下文本保留。当前平台层给出的端点已吸附到码点边界（不会拆开代理对）。
 ///
-/// **已知限制**（macOS）：本 view 还没有 surrounding-text 通路，指向「已提交文本」的重转换
-/// 区间会被 clamp 到当前组合串边界。逐子句更新组合串与普通提交不受影响。
+/// **已知限制**（macOS）：AppKit 给的 `replacementRange` 是**文档坐标**，平台层按
+/// `markedRange.location`（当前恒为 0）换算成上面的相对区间；但本 view 还没有
+/// surrounding-text 通路 —— 没有实现 `attributedSubstringForProposedRange:`（返回 `nil`），
+/// `selectedRange` / `markedRange` 的文档坐标也只覆盖组合串。因此输入法对**已提交文本**的
+/// 重转换（韩文 Hanja、日文再変換）无法表达：这类区间会被 clamp 到当前组合串边界（区间在
+/// 组合串之前时起点收敛到 0，在组合串之后时收敛到组合串末尾）。逐子句更新组合串与普通提交
+/// 不受影响。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImeEvent {
     /// 开始组合。

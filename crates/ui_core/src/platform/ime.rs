@@ -17,20 +17,29 @@ use smol_str::SmolStr;
 /// `0x7FFF_FFFF_FFFF_FFFF`（64 位）。写 `usize::MAX` 会让真实输入法的正常路径
 /// `{NSNotFound, 0}` 不匹配、退化成「在组合串尾部插入」（第三轮复审 P1）。
 ///
-/// 只有 macOS 包装器与跨平台单测用得到；Linux 的 `zwp_text_input_v3` 是整串 preedit，
-/// 没有区间替换概念，因此编译期排除，避免 `dead_code`。
+/// 只有 macOS 包装器、macOS 绑定测试（`platform/macos/ime.rs`）与跨平台单测用得到；
+/// Linux 的 `zwp_text_input_v3` 是整串 preedit，没有区间替换概念，因此编译期排除，
+/// 避免 `dead_code`。
 #[cfg(any(target_os = "macos", test))]
-const NS_NOT_FOUND: usize = isize::MAX as usize;
+pub(crate) const NS_NOT_FOUND: usize = isize::MAX as usize;
 
-/// AppKit `replacementRange`（UTF-16 码元）→ 组合串内要替换的旧文本区间。
+/// AppKit `replacementRange`（UTF-16 码元，**文档坐标**）→ 组合串内要替换的旧文本区间。
 ///
 /// `setMarkedText:selectedRange:replacementRange:` / `insertText:replacementRange:` 的
 /// `replacementRange` 语义是「用新文本替换掉该区间里的旧文本」；`{NSNotFound, 0}` 表示没有
 /// 显式区间 —— 替换当前的整个 marked text（没有 marked text 时在插入点插入）。
 ///
-/// 本 view 的 `markedRange` / `selectedRange` 把客户端文本存储声明为「从 0 开始的组合串」，
-/// 因此 AppKit 给出的有效区间就是组合串内坐标。`marked` 是**替换前**的组合串（UTF-16 码元）：
+/// `location` / `length` 是 AppKit 的**文档坐标**（与 `markedRange` 同一坐标系），不是组合串
+/// 内坐标：真实的 `NSTextInputClient` 文本存储覆盖整个文档，Qt 的实现同样先减去
+/// `markedRange.location` 再切片。本 view 只把组合串暴露为文本存储，所以
+/// `marked_location` 传 `ImeState::marked_range().0`（当前恒为 0）。**该参数必须与引擎真实
+/// 文本里组合串的起点一致**，否则替换区间会整体偏移；未来接通 surrounding text 时把真实
+/// 起点传进来即可，本函数不用改。
 ///
+/// 先换算成组合串内相对坐标，再按现有规则 clamp：
+///
+/// - `location` 在组合串之前：相对起点饱和到 `0`（起点 clamp 到组合串开头；区间本身无法
+///   表达，属 surrounding-text 未实现的已知限制）；
 /// - 越界 clamp：`start` / `end` 都收敛到 `0..=marked.len()`（输入法在候选/重转换路径上
 ///   可能给出与当前组合串不一致的区间，直接按入参切片会越界）；
 /// - 码点边界吸附：区间端点落在代理对中间时向外扩到整个码点（拆开代理对会得到非法 UTF-16，
@@ -45,10 +54,19 @@ pub(crate) fn replacement_range(
     location: usize,
     length: usize,
     marked: &[u16],
+    marked_location: usize,
 ) -> Option<std::ops::Range<usize>> {
     if location == NS_NOT_FOUND {
         return None;
     }
+    // `marked_location` 是 `markedRange.location`（组合串起点的文档坐标），不可能是
+    // `NSNotFound`：真没有组合串时长度也为 0，起点仍是合法位置。
+    debug_assert_ne!(
+        marked_location, NS_NOT_FOUND,
+        "marked_location 必须是组合串起点的文档坐标，不是 NSNotFound"
+    );
+    // 文档坐标 → 组合串内坐标：起点在组合串之前时饱和到 0（其余 clamp 在下面统一处理）。
+    let location = location.saturating_sub(marked_location);
     let len = marked.len();
     let mut start = location.min(len);
     let mut end = location.saturating_add(length).min(len);
@@ -112,35 +130,60 @@ mod tests {
         // AppKit 的 `{NSNotFound, 0}`：没有显式区间，调用方替换整个组合串。
         // 真实哨兵是 `NSIntegerMax`，不是 `NSUInteger::MAX`（复审 P1 的回归点）。
         assert_eq!(NS_NOT_FOUND, isize::MAX as usize);
-        assert_eq!(replacement_range(NS_NOT_FOUND, 0, &utf16("ni")), None);
-        assert_eq!(replacement_range(NS_NOT_FOUND, 3, &utf16("你好")), None);
-        assert_eq!(replacement_range(NS_NOT_FOUND, 0, &[]), None);
-        assert_eq!(replacement_range(1, 0, &utf16("ni")), Some(1..1));
-        assert_eq!(replacement_range(2, 0, &utf16("ni")), Some(2..2));
+        assert_eq!(replacement_range(NS_NOT_FOUND, 0, &utf16("ni"), 0), None);
+        assert_eq!(replacement_range(NS_NOT_FOUND, 3, &utf16("你好"), 0), None);
+        assert_eq!(replacement_range(NS_NOT_FOUND, 0, &[], 0), None);
+        // `NSNotFound` 与组合串起点无关：文档坐标起点非 0 时同样表示整段替换。
+        assert_eq!(replacement_range(NS_NOT_FOUND, 0, &utf16("ni"), 5), None);
+        assert_eq!(replacement_range(1, 0, &utf16("ni"), 0), Some(1..1));
+        assert_eq!(replacement_range(2, 0, &utf16("ni"), 0), Some(2..2));
     }
 
     #[test]
     fn an_empty_range_is_an_insertion_point_inside_the_composition() {
-        assert_eq!(replacement_range(0, 0, &utf16("ni")), Some(0..0));
-        assert_eq!(replacement_range(2, 0, &utf16("ni")), Some(2..2));
+        assert_eq!(replacement_range(0, 0, &utf16("ni"), 0), Some(0..0));
+        assert_eq!(replacement_range(2, 0, &utf16("ni"), 0), Some(2..2));
     }
 
     #[test]
     fn a_range_inside_the_marked_text_is_kept() {
-        assert_eq!(replacement_range(1, 2, &utf16("shili")), Some(1..3));
-        assert_eq!(replacement_range(0, 4, &utf16("shili")), Some(0..4));
+        assert_eq!(replacement_range(1, 2, &utf16("shili"), 0), Some(1..3));
+        assert_eq!(replacement_range(0, 4, &utf16("shili"), 0), Some(0..4));
     }
 
     #[test]
     fn out_of_bounds_ranges_are_clamped_to_the_marked_text() {
         let marked = utf16("ni");
-        assert_eq!(replacement_range(9, 1, &marked), Some(2..2));
-        assert_eq!(replacement_range(1, 99, &marked), Some(1..2));
-        assert_eq!(replacement_range(0, usize::MAX, &marked), Some(0..2));
-        assert_eq!(replacement_range(NS_NOT_FOUND - 1, 2, &marked), Some(2..2));
+        assert_eq!(replacement_range(9, 1, &marked, 0), Some(2..2));
+        assert_eq!(replacement_range(1, 99, &marked, 0), Some(1..2));
+        assert_eq!(replacement_range(0, usize::MAX, &marked, 0), Some(0..2));
+        assert_eq!(
+            replacement_range(NS_NOT_FOUND - 1, 2, &marked, 0),
+            Some(2..2)
+        );
         // 没有组合串时（例如 `insertText:` 在提交前清空）任何区间都收敛成插入点。
-        assert_eq!(replacement_range(0, 0, &[]), Some(0..0));
-        assert_eq!(replacement_range(3, 2, &[]), Some(0..0));
+        assert_eq!(replacement_range(0, 0, &[], 0), Some(0..0));
+        assert_eq!(replacement_range(3, 2, &[], 0), Some(0..0));
+    }
+
+    /// `replacementRange` 是 AppKit 的**文档坐标**：组合串起点不是 0 时（surrounding text
+    /// 接通后的形态），先减去 `markedRange.location` 再 clamp/吸附。
+    #[test]
+    fn document_coordinates_are_rebased_onto_the_marked_text_start() {
+        let marked = utf16("shili");
+        // 组合串在文档 [5, 10)；文档区间 [7, 8) ⇒ 组合串内 [2, 3)。
+        assert_eq!(replacement_range(7, 1, &marked, 5), Some(2..3));
+        // 文档位置正好等于组合串起点。
+        assert_eq!(replacement_range(5, 2, &marked, 5), Some(0..2));
+        // 区间起点在组合串之前：相对起点饱和到 0（clamp 到组合串开头，不越界）。
+        assert_eq!(replacement_range(3, 0, &marked, 5), Some(0..0));
+        assert_eq!(replacement_range(0, 0, &marked, 5), Some(0..0));
+        // 文档区间跨过组合串末尾：终点 clamp 到组合串长度。
+        assert_eq!(replacement_range(8, 99, &marked, 5), Some(3..5));
+        // 指向组合串之后的已提交文本：收敛成末尾插入点（surrounding text 未实现，已知限制）。
+        assert_eq!(replacement_range(12, 0, &marked, 5), Some(5..5));
+        // `NSNotFound` 与起点无关：仍然表示「替换整个组合串」。
+        assert_eq!(replacement_range(NS_NOT_FOUND, 0, &marked, 5), None);
     }
 
     #[test]
@@ -148,9 +191,9 @@ mod tests {
         // 每个汉字都是 1 个 UTF-16 码元（与 `str::len` 的 3 字节不同）。
         let marked = utf16("你好");
         assert_eq!(marked.len(), 2);
-        assert_eq!(replacement_range(0, 1, &marked), Some(0..1));
-        assert_eq!(replacement_range(1, 1, &marked), Some(1..2));
-        assert_eq!(replacement_range(2, 0, &marked), Some(2..2));
+        assert_eq!(replacement_range(0, 1, &marked, 0), Some(0..1));
+        assert_eq!(replacement_range(1, 1, &marked, 0), Some(1..2));
+        assert_eq!(replacement_range(2, 0, &marked, 0), Some(2..2));
     }
 
     #[test]
@@ -160,17 +203,17 @@ mod tests {
         assert_eq!(marked.len(), 3);
 
         // 起点落在低代理上：边界回到高代理；长度 0 也要覆盖整个代理对。
-        assert_eq!(replacement_range(1, 0, &marked), Some(0..2));
+        assert_eq!(replacement_range(1, 0, &marked, 0), Some(0..2));
         // 终点落在高代理之后：收进低代理。
-        assert_eq!(replacement_range(0, 1, &marked), Some(0..2));
+        assert_eq!(replacement_range(0, 1, &marked, 0), Some(0..2));
         // 整个 emoji 的组合串内替换区间。
-        assert_eq!(replacement_range(0, 2, &marked), Some(0..2));
+        assert_eq!(replacement_range(0, 2, &marked, 0), Some(0..2));
         // 代理对之后的普通字符不受影响。
-        assert_eq!(replacement_range(2, 1, &marked), Some(2..3));
+        assert_eq!(replacement_range(2, 1, &marked, 0), Some(2..3));
         // emoji 在结尾：终点越界 clamp 后再吸附回码点边界。
         let trailing = utf16("a🌍");
-        assert_eq!(replacement_range(1, 1, &trailing), Some(1..3));
-        assert_eq!(replacement_range(1, 9, &trailing), Some(1..3));
+        assert_eq!(replacement_range(1, 1, &trailing, 0), Some(1..3));
+        assert_eq!(replacement_range(1, 9, &trailing, 0), Some(1..3));
     }
 
     #[test]
@@ -181,7 +224,7 @@ mod tests {
             let start = range.start;
             let len = range.end - range.start;
             assert_eq!(
-                replacement_range(start, len, &marked),
+                replacement_range(start, len, &marked, 0),
                 Some(range),
                 "合法区间必须原样返回"
             );

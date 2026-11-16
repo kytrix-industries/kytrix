@@ -13,23 +13,56 @@
 //! （`design/phase-05-text.md` §4.1）。文本的**引擎**（字体库/图集/光栅）在 `App` 内部，
 //! 应用层通过 `App::{refresh_text, set_font_stack, …}` 使用，见 §6.1。
 //!
-//! # 字形定位与 hinting（复审 P2-2，方案 A）
+//! # 字形定位与 hinting（复审 P2-2 方案 A + 第三轮复审 P3 收尾）
 //!
-//! 光栅策略按 Skia/Chrome 的 UI 文本默认：**水平亚像素定位开、hinting 关**。实现与开关都在
-//! `text/raster.rs`：`SUBPIXEL_PHASES = 4`（1/4 px 相位）、`HINTING = false`。
+//! 光栅策略按 Skia/Chrome 的 UI 文本默认：**水平亚像素定位开、hinting 关、ppem 用小数**。
+//! 实现与开关都在 `text/raster.rs`：`SUBPIXEL_PHASES = 4`（1/4 px 相位）、`HINTING = false`；
+//! ppem 直接取 parley 的物理字号（`Run::font_size()`，**保留小数**）。
 //!
-//! - **收益**：parley 的落点与 advance 是小数物理像素；旧实现把每个字形 `round` 到整像素并按
+//! - **收益**：parley 的落点与 advance 是小数物理像素；旧实现把每个字形 `round` 到整像素、按
 //!   整数 ppem 全 hinting，非整数 DPI（125%/150%）下字形内部笔画与字间 advance 不一致，长数字
 //!   列会出现字距跳动/个别字形重叠。现在 x 吸附到最近的 1/4 px 相位（误差 ≤ 1/8 px），位图按
-//!   该相位光栅；关闭 hinting 后不再按整数 ppem 重排笔画，CJK 也不会被横向挤压。
-//! - **代价**：`GlyphKey` 多出 `subpixel_x` 相位维（最多 4 档），同一字形可能占 1–4 个 tile，
-//!   图集命中率下降、容量最多约 4×（512→1024→2048 的阶梯扩容兜底，但可能提前触发一次整页
-//!   换代）；小 ppem（≤ 16）关闭 hinting 后笔画略软。
+//!   该相位光栅；ppem 也用小数（16 px @125% → 20.0、14 px @125% → 17.5），位图尺寸与 parley
+//!   的分数 advance 同源，不再有「按 18 ppem 出位图、按 17.5 px 排 advance」的 2.9% 尺寸差。
+//!   **三者是一致的一套取舍**：关 hinting 才让小数 ppem 有意义（hinting 本身就要求整数 ppem 的
+//!   像素网格）；亚像素定位才接得住 parley 的小数落点；只做其中一项会留下另一种量化误差。
+//! - **代价**：`GlyphKey` 多出 `subpixel_x` 相位维（最多 4 档）与 `ppem_q` 量化维，同一字形可能
+//!   占 1–4 个 tile，图集命中率下降、容量最多约 4×（512→1024→2048 的阶梯扩容兜底，但可能
+//!   提前触发一次整页换代）；小 ppem（≤ 16）关闭 hinting 后笔画略软；非整数 ppem 的位图不再是
+//!   「整数字号的像素完美」，125%/150% 下字形边缘更平滑（与 Skia/Chrome 的同一表现）。
+//!   图集键里的 ppem 只保留 `1/64 px` 量化值（`atlas::PPEM_KEY_QUANTIZATION`）：只影响缓存
+//!   复用，不影响光栅尺寸（光栅收原值 f32）。
 //! - **回退**：把 `raster::SUBPIXEL_PHASES` 改为 `1`（整像素定位）或 `raster::HINTING` 改为
 //!   `true`（旧的全 hinting）。两者都是编译期常量，改完字形图集自然换代，不需要 migration。
-//! - **整数 DPI**：ppem 仍按设备 scale 取整（与旧实现同一个值），advance/行高/断行完全来自
-//!   parley，不受本改动影响；整数 DPI（1x/2x）下不会出现字距/位置跳动，视觉差异仅限关闭
-//!   hinting 带来的抗锯齿细节（方案 A 的预期取舍）。
+//!   回退小数 ppem 则在 `shape.rs` 恢复 `font_size().round()` —— `ppem_q` 的 1/64 量化对整数
+//!   ppem 仍是精确的（其子集），无需额外改动。
+//! - **整数 DPI**：100%/200% 下 ppem 本就是整数，advance/行高/断行完全来自 parley，不受本
+//!   改动影响；视觉差异仅限关闭 hinting 带来的抗锯齿细节（方案 A 的预期取舍）。
+//!
+//! # 为什么没有文本像素 golden
+//!
+//! 仓库**没有**文本光栅的像素级 golden 测试：文本像素同时取决于宿主系统字体（家族解析与
+//! fallback 链）、字体版本、设备 scale、平台 AA/合成策略，三平台 CI 上不可能逐位一致 —— 一张
+//! Windows 的 golden 在 Linux/macOS 上恒失败，改成 skip 又失去回归价值。文本正确性因此由三层
+//! 非像素测试保证：
+//!
+//! 1. 结构与度量断言（`cargo test -p ui_core --features test-support text`）：字形数、advance、
+//!    行高、断行、`GlyphKey` 的相位/ppem 维、`len == w*h` 的 R8 覆盖度；
+//! 2. 光栅不变量（`... atlas` / `... raster`）：同一 key 位图确定、不同相位/ppem 不共用 tile、
+//!    `missing` 负缓存不误命中、小数 ppem 不被取整；
+//! 3. **真机目视**：关 hinting 的视觉取舍必须在真实设备上按 **100% / 125% / 150% / 200%** 查看
+//!    （建议同一屏混排 Latin 数字列 + CJK，检查笔画粗细、字距呼吸、上下标与 thin stroked UI）。
+//!
+//! 若将来要加 golden，必须固定以下变量（否则测试不可复现，也没法跨平台）：
+//!
+//! - **字体文件**：随仓库携带（或按 sha256 校验的测试字体），不复用系统字体栈；家族名、版本、
+//!   可变字体默认实例全部写死；
+//! - **scale**：显式 `1.0 / 1.25 / 1.5 / 2.0` 各一组，不读宿主 DPI；
+//! - **hinting**：`raster::HINTING` 的编译期值写进 golden 文件名，或在测试里断言当前值；
+//! - **相位**：把落点钉在固定布局宽度上（如同一居中宽度），使 `subpixel_x` 确定 —— 同一字形的
+//!   4 个相位应各有一张 golden；
+//! - 其余：光栅后端（CPU vs GPU 采样）、颜色空间（线性/R8 覆盖度）、图集 padding / UV 取整
+//!   规则也必须固定。
 
 use core::ops::Range;
 
@@ -105,7 +138,8 @@ pub enum TextDirection {
 /// 一段文本的样式（**值语义**，不是句柄）。
 ///
 /// `Clone` 而不是 `Copy`：`family` 是 `SmolStr`。字号的单位是**逻辑像素**；物理 ppem 由
-/// 光栅阶段按设备 `scale` 取整（`design/phase-05-text.md` §8.3）。
+/// 光栅阶段按设备 `scale` 换算并**保留小数**（见模块文档「字形定位与 hinting」，如 14 px
+/// @125% → 17.5 ppem）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextStyle {
     /// 字号（逻辑像素）。

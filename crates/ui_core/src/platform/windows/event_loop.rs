@@ -9,8 +9,19 @@
 //!
 //! `WndProc` **不做**任何 `App` 调用：它只把 [`PlatformEvent`] 压进 `WndProcState`，泵在
 //! `DispatchMessageW` 返回后统一消费（Rust 借用规则 + 保持 `WndProc` 廉价）。
+//!
+//! 自绘标题栏拖动（P2-9，win-2 P3 补齐取消语义）：
+//! - `Esc` 取消：窗口回到按下时的矩形（按下时最大化则重新最大化），按键不投递给应用；
+//! - 右键取消：不提供系统菜单，按原生 move 循环「右键结束移动」的语义还原原位；
+//! - 中键 / 滚轮在拖动期间吞掉：捕获后它们以客户区形式到达，坐标相对被拖动的窗口是负的，
+//!   交给应用会派发到错误位置；
+//! - 系统没投递 `WM_NCLBUTTONDBLCLK` 时（UI 线程卡顿）用「时间 + 双击矩形」自计时兜底，
+//!   见 [`is_self_timed_double_click`]。
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use windows::Win32::{
     Foundation::{ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
@@ -20,10 +31,13 @@ use windows::Win32::{
     },
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
     UI::{
-        HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
+        HiDpi::{
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetSystemMetricsForDpi,
+            SetProcessDpiAwarenessContext,
+        },
         Input::KeyboardAndMouse::{
             GetCapture, GetDoubleClickTime, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT,
-            TrackMouseEvent,
+            TrackMouseEvent, VK_ESCAPE,
         },
         WindowsAndMessaging::*,
     },
@@ -33,7 +47,7 @@ use crate::{
     app::App,
     error::EngineError,
     event::{Event, InputEvent},
-    math::PhysicalRect,
+    math::{PhysicalRect, Scale},
     platform::{
         dispatcher::{Dispatcher, WM_APP_COMPOSITION_WAKE, WM_APP_FRAME_WAKE},
         event::{
@@ -62,11 +76,27 @@ const RESIZE_TIMER_ID: usize = 2;
 /// 而不是每个鼠标消息移一次窗口）。
 const CAPTION_TIMER_ID: usize = 3;
 
-/// 窗口被拖到屏幕边缘时至少保留在工作区内的可见尺寸（物理像素）。
+/// 窗口被拖到屏幕边缘时至少保留在工作区内的可见尺寸（**逻辑像素**）。
 ///
 /// 水平方向保证窗口至少有一段可见、垂直方向保证标题栏不会被拖出工作区（Windows 原生
-/// move 循环同样不允许把标题栏拖到顶边之上）。
-const MIN_VISIBLE_EDGE: i32 = 64;
+/// move 循环同样不允许把标题栏拖到顶边之上）。用逻辑像素而不是物理常量：拖动可能发生在
+/// 200% DPI 的显示器上，固定的 64 物理像素在高 DPI 下只剩 32 逻辑像素，窗口会被拖得几乎
+/// 不可见（win-2 P3）。物理值由 [`min_visible_edge`] 按窗口当前 DPI 换算。
+const MIN_VISIBLE_EDGE_LOGICAL: f32 = 64.0;
+
+/// 可见边（物理像素）= 逻辑 64 px × DPI 比例，至少 1 px。
+///
+/// 纯函数：1.0/1.25/1.5/2.0 等比例的换算可以在单测里钉死，不需要真实的高 DPI 显示器。
+fn min_visible_edge(scale: Scale) -> i32 {
+    (MIN_VISIBLE_EDGE_LOGICAL * scale.factor()).round().max(1.0) as i32
+}
+
+/// 窗口当前 DPI 比例（拖动 / 还原的可见边与钳制都按物理像素换算）。
+///
+/// 用**窗口** DPI（`WM_DPICHANGED` 之后窗口已跟着到新显示器）与原生 move 循环一致。
+fn window_scale(hwnd: HWND) -> Scale {
+    dpi::scale_from_dpi(dpi::window_dpi(hwnd)).unwrap_or(Scale::ONE)
+}
 
 /// 用系统设置初始化输入阈值（双击时间 + 拖拽/双击的距离容差，§5.4）。
 fn install_input_thresholds(app: &mut App) {
@@ -126,46 +156,92 @@ fn is_caption_hit(hit: u32) -> bool {
     matches!(hit, HTCAPTION | HTSYSMENU)
 }
 
+/// 自计时双击判定（win-2 P3 的纯函数部分）。
+///
+/// 系统通常在第二次按下时把消息换成 `WM_NCLBUTTONDBLCLK`；但 UI 线程卡顿 / 仍持有捕获时
+/// 可能只送来普通的 `WM_NCLBUTTONDOWN`，双击就退化成「开始拖动」。这里按系统同一套规则
+/// 自己判定：
+/// - 时间：距上次按下**严格小于** `GetDoubleClickTime()`（与系统的「在指定时间内」一致）；
+/// - 距离：第二次按下必须落在以首次按下为中心的**双击矩形**内。`SM_CXDOUBLECLK` /
+///   `SM_CYDOUBLECLK` 是矩形总宽高（MSDN），因此允许偏差是它们的一半。
+fn is_self_timed_double_click(
+    elapsed: Duration,
+    cursor_delta: (i32, i32),
+    double_click_time: Duration,
+    double_click_half_size: (i32, i32),
+) -> bool {
+    // `unsigned_abs`：极端坐标差（`i32::MIN`）在 debug 下用 `abs` 会溢出 panic。
+    elapsed < double_click_time
+        && cursor_delta.0.unsigned_abs() <= double_click_half_size.0.max(0) as u32
+        && cursor_delta.1.unsigned_abs() <= double_click_half_size.1.max(0) as u32
+}
+
 /// 标题栏拖动的新窗口位置：把 `window` 按光标增量平移，并钳制到 `work` 工作区。
 ///
 /// 约束与 Windows 原生 move 循环一致（多显示器时 `work` 是**光标所在**显示器的工作区）：
 /// - 标题栏不能越过工作区顶边（`top >= work.top`），也不能被拖到下边界之外；
-/// - 水平方向允许窗口大部分移出屏幕，但至少留 [`MIN_VISIBLE_EDGE`] 可见。
+/// - 水平方向允许窗口大部分移出屏幕，但至少留 [`min_visible_edge`] 可见。
 ///
-/// 纯函数：多显示器 / 负坐标工作区都能在单测里钉死，不需要真的接第二个显示器。
-fn caption_position(window: RECT, delta: (i32, i32), work: RECT) -> (i32, i32) {
+/// 纯函数：多显示器 / 负坐标 / 不同 DPI 都能在单测里钉死，不需要真的接第二个显示器。
+fn caption_position(window: RECT, delta: (i32, i32), work: RECT, scale: Scale) -> (i32, i32) {
     let width = (window.right - window.left).max(1);
-    clamp_to_work(window.left + delta.0, window.top + delta.1, width, work)
+    clamp_to_work(
+        window.left + delta.0,
+        window.top + delta.1,
+        width,
+        work,
+        scale,
+    )
 }
 
-/// 把窗口左上角钳制到工作区内（标题栏不出顶边、底部/左右至少留 [`MIN_VISIBLE_EDGE`]）。
-fn clamp_to_work(left: i32, top: i32, width: i32, work: RECT) -> (i32, i32) {
+/// 把窗口左上角钳制到工作区内（标题栏不出顶边、底部/左右至少留 [`min_visible_edge`]）。
+fn clamp_to_work(left: i32, top: i32, width: i32, work: RECT, scale: Scale) -> (i32, i32) {
     let width = width.max(1);
+    let edge = min_visible_edge(scale);
     let min_top = work.top;
-    let max_top = (work.bottom - MIN_VISIBLE_EDGE).max(min_top);
-    let min_left = work.left - width + MIN_VISIBLE_EDGE;
-    let max_left = (work.right - MIN_VISIBLE_EDGE).max(min_left);
+    let max_top = (work.bottom - edge).max(min_top);
+    let min_left = work.left - width + edge;
+    let max_left = (work.right - edge).max(min_left);
     (left.clamp(min_left, max_left), top.clamp(min_top, max_top))
 }
 
 /// 最大化窗口被拖动还原后的窗口左上角。
 ///
-/// 与系统/Chrome 一致：水平方向按光标在**最大化标题栏**中的相对位置，让光标落到还原窗口
-/// 标题栏的同一比例处；垂直方向保持光标在标题栏内的偏移（还原顶边 = 最大化顶边）。
+/// 与系统/Chrome 一致：
+/// - 水平方向按光标在**最大化标题栏**中的相对位置，让光标落到还原窗口标题栏的同一比例处；
+/// - 垂直方向保持**按下时**光标在标题栏内的偏移（`press.y - maximized.top`）。标题栏上下沿
+///   在最大化与还原两种状态下的非客户区偏移相同，所以「相对窗口顶边的偏移」等价于「相对
+///   标题栏的偏移」。只按 `maximized.top` 摆位时，还原触发前光标已经移动的那几十像素会被
+///   丢掉，快速拖动（系统阈值刚过、光标已甩出很远）后光标会掉到标题栏外（win-2 P3）。
+///
 /// 结果再钳制到光标所在显示器的工作区。
-fn restored_drag_origin(maximized: RECT, restored: RECT, cursor: POINT, work: RECT) -> (i32, i32) {
+fn restored_drag_origin(
+    maximized: RECT,
+    restored: RECT,
+    press: POINT,
+    cursor: POINT,
+    work: RECT,
+    scale: Scale,
+) -> (i32, i32) {
     let maximized_width = (maximized.right - maximized.left).max(1);
     let ratio = ((cursor.x - maximized.left) as f32 / maximized_width as f32).clamp(0.0, 1.0);
     let restored_width = (restored.right - restored.left).max(1);
     let left = cursor.x - (ratio * restored_width as f32) as i32;
-    clamp_to_work(left, maximized.top, restored_width, work)
+    let top = cursor.y - (press.y - maximized.top);
+    clamp_to_work(left, top, restored_width, work, scale)
 }
 
 /// 最大化窗口在拖动超过系统阈值后还原到上次的还原矩形，并按光标比例摆回光标下。
 ///
 /// 返回 `false` = 还没超过拖拽阈值（单击最大化窗口的标题栏**不得**还原，系统行为），
 /// 或查询失败；调用方保持会话不动，等下一次 tick 再试。
-fn restore_maximized_for_drag(hwnd: HWND, press: POINT, cursor: POINT, work: RECT) -> bool {
+fn restore_maximized_for_drag(
+    hwnd: HWND,
+    press: POINT,
+    cursor: POINT,
+    work: RECT,
+    scale: Scale,
+) -> bool {
     // SAFETY: `GetSystemMetrics` 是无副作用、无指针参数的只读查询。
     let (threshold_x, threshold_y) = unsafe {
         (
@@ -190,7 +266,7 @@ fn restore_maximized_for_drag(hwnd: HWND, press: POINT, cursor: POINT, work: REC
         // 已经还原：摆位失败不能阻止拖动继续。
         return true;
     }
-    let (left, top) = restored_drag_origin(maximized, restored, cursor, work);
+    let (left, top) = restored_drag_origin(maximized, restored, press, cursor, work, scale);
     let width = (restored.right - restored.left).max(1);
     let height = (restored.bottom - restored.top).max(1);
     // SAFETY: `hwnd` 存活；沿用还原尺寸，只改位置（不激活窗口、不改 Z 序）。
@@ -304,6 +380,9 @@ pub(crate) struct WndProcState {
     /// 正在进行的自绘标题栏拖动（拦截 `WM_NCLBUTTONDOWN` 的 `HTCAPTION` 后不再进入
     /// Win32 的 move 模态循环，拖动期间泵继续跑、动画/HUD 不断帧）。
     caption_drag: Option<CaptionDrag>,
+    /// 上一次标题栏按下的时刻 + 光标屏幕坐标：`WM_NCLBUTTONDBLCLK` 缺失时的自计时双击兜底
+    ///（win-2 P3）。
+    last_caption_press: Option<CaptionPress>,
     /// a11y（P11：首显前构造的 `accesskit_windows::Adapter` + `WM_GETOBJECT` 接线）。
     a11y: crate::platform::windows::a11y::WindowsA11y,
     /// 引擎**自己**即将释放指针捕获：下一个 `WM_CAPTURECHANGED` 不能当成
@@ -340,8 +419,22 @@ struct ResizeSession {
 struct CaptionDrag {
     /// 上一次应用移动（或按下）时的光标屏幕坐标（物理像素）。
     cursor: POINT,
+    /// 按下时的窗口矩形（物理像素）：`Esc` / 右键取消时原样还回去（win-2 P3）。
+    origin: RECT,
     /// 按下时窗口是最大化：第一次拖动超过阈值后才还原（单击标题栏不还原，与系统一致）。
     restore: bool,
+    /// 按下时的最大化状态（`restore` 在还原后清零，这个保留整个会话，供取消时决定是
+    /// 恢复矩形还是重新最大化）。
+    origin_zoomed: bool,
+}
+
+/// 上一次标题栏按下（自计时双击兜底，win-2 P3）。
+#[derive(Clone, Copy)]
+struct CaptionPress {
+    /// 按下时刻（单调时钟）。
+    at: Instant,
+    /// 按下时的光标屏幕坐标（双击矩形以它为圆心）。
+    cursor: POINT,
 }
 
 impl WndProcState {
@@ -359,6 +452,7 @@ impl WndProcState {
             mouse_tracking: false,
             resize: None,
             caption_drag: None,
+            last_caption_press: None,
             // **必须在窗口显示之前构造**：`Adapter::new` 内部 `init_uia()`，
             // 且不得在处理 `WM_GETOBJECT` 时构造（adapter.rs:411-441）。
             a11y: crate::platform::windows::a11y::WindowsA11y::new(hwnd, dispatcher, window)?,
@@ -415,6 +509,11 @@ impl WndProcState {
     /// 窗口销毁前把 IME 上下文还回去（避免 `HIMC` 泄漏，见 `NativeWindow::destroy`）。
     pub(crate) fn release_ime_before_destroy(&mut self, hwnd: HWND) {
         self.translate.ime_mut().release_before_destroy(hwnd);
+    }
+
+    /// 禁用态下把系统可能重新关联的 IME 上下文再摘一次（win-1 P3；幂等）。
+    pub(crate) fn reassert_disabled_ime(&mut self, hwnd: HWND) {
+        self.translate.ime_mut().reassert_disabled(hwnd);
     }
 
     /// 当前修饰键（事件投递时随按键一起给应用层）。
@@ -521,15 +620,24 @@ impl WndProcState {
     /// [`Self::apply_caption_drag`] 第一次真正移动时（见 [`restore_maximized_for_drag`]）。
     fn begin_caption_drag(&mut self, hwnd: HWND) {
         let mut cursor = POINT::default();
-        // SAFETY: `cursor` 是本函数栈上的输出值。
-        if unsafe { GetCursorPos(&mut cursor) }.is_err() {
+        let mut origin = RECT::default();
+        // SAFETY: 两个输出指针都指向本函数栈上的值；`hwnd` 由当前消息给出且窗口存活。
+        let captured = unsafe {
+            GetCursorPos(&mut cursor).is_ok() && GetWindowRect(hwnd, &mut origin).is_ok()
+        };
+        if !captured {
             return;
         }
         // SAFETY: `hwnd` 存活；`IsZoomed` 只读窗口状态。
-        let restore = unsafe { IsZoomed(hwnd) }.as_bool();
+        let zoomed = unsafe { IsZoomed(hwnd) }.as_bool();
         // SAFETY: `hwnd` 是本进程创建的窗口；捕获在抬起 / 失去捕获时释放。
         unsafe { SetCapture(hwnd) };
-        self.caption_drag = Some(CaptionDrag { cursor, restore });
+        self.caption_drag = Some(CaptionDrag {
+            cursor,
+            origin,
+            restore: zoomed,
+            origin_zoomed: zoomed,
+        });
         // 1 ms 定时器（probe：实测合并到 16.0 ms，同缩放）。失败不重试：抬起时的最终
         // apply 仍保证窗口落到最后位置，只是拖动中没有中间几何更新。
         // SAFETY: `hwnd` 存活；`KillTimer` 用同一个 id（`end_caption_drag`）。
@@ -556,10 +664,11 @@ impl WndProcState {
         let Some(work) = cursor_work_area(cursor) else {
             return;
         };
+        let scale = window_scale(hwnd);
         if session.restore {
             // 最大化窗口：等位移超过系统拖拽阈值再还原 + 摆回光标下。还没超过就什么都不做
             //（单击标题栏不得还原）；本次位移已经用于「触发还原 + 摆位」，不推进基准。
-            if !restore_maximized_for_drag(hwnd, session.cursor, cursor, work) {
+            if !restore_maximized_for_drag(hwnd, session.cursor, cursor, work, scale) {
                 return;
             }
             session.restore = false;
@@ -572,7 +681,7 @@ impl WndProcState {
         if unsafe { GetWindowRect(hwnd, &mut window) }.is_err() {
             return;
         }
-        let (left, top) = caption_position(window, delta, work);
+        let (left, top) = caption_position(window, delta, work, scale);
         // SAFETY: `hwnd` 存活；只改位置（`SWP_NOSIZE`），不改变 Z 序、不激活窗口。
         let moved = unsafe {
             SetWindowPos(
@@ -602,11 +711,104 @@ impl WndProcState {
         }
     }
 
+    /// 取消标题栏拖动（`Esc` / 右键，win-2 P3）：窗口回到按下时的矩形（按下时最大化则重新
+    /// 最大化），结束会话并释放捕获。
+    ///
+    /// 先 `take()` 会话再动窗口：`SetWindowPos` / `ShowWindow` 会同步派发 `WM_WINDOWPOSCHANGED`
+    /// 等嵌套消息，嵌套进入的 `WndProc` 不得再看到旧会话（与 `end_caption_drag` 同一纪律）。
+    fn cancel_caption_drag(&mut self, hwnd: HWND) {
+        let Some(session) = self.caption_drag.take() else {
+            return;
+        };
+        // 显式取消结束了这次按下序列：下一次按下应当从头开始（否则「右键取消后立刻左键按下」
+        // 会被自计时双击兜底当成双击）。
+        self.last_caption_press = None;
+        // SAFETY: `id` 由 `begin_caption_drag` 在同一 hwnd 上创建；已过期 / 失败时是 no-op。
+        let _ = unsafe { KillTimer(Some(hwnd), CAPTION_TIMER_ID) };
+        let width = (session.origin.right - session.origin.left).max(1);
+        let height = (session.origin.bottom - session.origin.top).max(1);
+        if session.origin_zoomed {
+            if !session.restore {
+                // 拖动中已经把最大化窗口还原，还可能移到了光标所在显示器：先摆回起始矩形
+                // （最大化窗口原来的显示器），再重新最大化 —— 否则会在新显示器上最大化，
+                // 回不到按下前的状态。
+                // SAFETY: `hwnd` 存活；只改位置与尺寸，不改变 Z 序、不激活窗口。
+                let _ = unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        None,
+                        session.origin.left,
+                        session.origin.top,
+                        width,
+                        height,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    )
+                };
+                // SAFETY: `hwnd` 存活；`SW_MAXIMIZE` 只改显示状态，不持有 Rust 引用。
+                let _ = unsafe { ShowWindow(hwnd, SW_MAXIMIZE) };
+            }
+            // `session.restore == true`：窗口本来就还没还原（按下后没有移动过），无需恢复。
+        } else {
+            // SAFETY: `hwnd` 存活；只改位置与尺寸，不改变 Z 序、不激活窗口。
+            let _ = unsafe {
+                SetWindowPos(
+                    hwnd,
+                    None,
+                    session.origin.left,
+                    session.origin.top,
+                    width,
+                    height,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+            };
+        }
+        // SAFETY: 引擎自己的收尾路径：只有确实持有捕获时才置 suppress 并释放。
+        release_capture(hwnd, self);
+    }
+
+    /// 自计时双击判定：系统没投递 `WM_NCLBUTTONDBLCLK` 时（UI 线程卡顿 / 仍持有捕获），
+    /// 按「距上次按下的时间 + 双击矩形」自己判双击（win-2 P3）。返回 `true` = 本次按下应
+    /// 按双击处理（最大化/还原切换），不再开始拖动。
+    ///
+    /// 每次按下都会成为新的「上一次按下」；命中双击后清空，避免第三次快按再次切换。
+    fn self_timed_double_click(&mut self, hwnd: HWND) -> bool {
+        let mut cursor = POINT::default();
+        // SAFETY: `cursor` 是本函数栈上的输出值。
+        if unsafe { GetCursorPos(&mut cursor) }.is_err() {
+            return false;
+        }
+        let now = Instant::now();
+        let double_clicked = self.last_caption_press.is_some_and(|press| {
+            // 系统度量在 per-monitor-v2 进程里必须按**窗口 DPI** 查询：`GetSystemMetrics`
+            // 用的是系统 DPI，高 DPI 显示器上双击矩形会被算小。
+            let dpi = dpi::window_dpi(hwnd);
+            // SAFETY: 三个都是无副作用、无指针参数的只读查询。
+            let (width, height, time) = unsafe {
+                (
+                    GetSystemMetricsForDpi(SM_CXDOUBLECLK, dpi).max(1),
+                    GetSystemMetricsForDpi(SM_CYDOUBLECLK, dpi).max(1),
+                    GetDoubleClickTime().max(1),
+                )
+            };
+            is_self_timed_double_click(
+                now.saturating_duration_since(press.at),
+                (cursor.x - press.cursor.x, cursor.y - press.cursor.y),
+                Duration::from_millis(u64::from(time)),
+                // `SM_CXDOUBLECLK` / `SM_CYDOUBLECLK` 是双击矩形**总**宽高，允许偏差是一半。
+                (width / 2, height / 2),
+            )
+        });
+        self.last_caption_press = (!double_clicked).then_some(CaptionPress { at: now, cursor });
+        double_clicked
+    }
+
     /// 双击标题栏：在最大化与还原之间切换（不进入系统 move / maximize 模态循环）。
     fn toggle_maximize(&mut self, hwnd: HWND) {
         // 双击序列里第二次按下被替换成 `WM_NCLBUTTONDBLCLK`：先收尾第一次按下可能留下的
         // 拖动会话（正常路径已由抬起收尾，这里只防御消息丢失）。
         self.end_caption_drag(hwnd);
+        // 这次按下序列已经被双击消费：清掉自计时记录，避免紧接的第三次按下又被当成双击。
+        self.last_caption_press = None;
         // SAFETY: `hwnd` 存活；两个调用都只改窗口显示状态，不持有 Rust 引用。
         unsafe {
             let zoomed = IsZoomed(hwnd).as_bool();
@@ -695,7 +897,15 @@ pub(crate) extern "system" fn wndproc(
         // 应用主动禁用了本窗口的 IME（P2-7，自绘搜索框的英文直输等）：输入上下文已经从窗口
         // 上摘下，所有 `WM_IME_*` 一律吞掉 —— 不派发 `ImeEvent`、不写 caret 表单，也不交给
         // `DefWindowProcW`（它可能重新初始化/显示组合窗）。普通 `WM_CHAR` / 快捷键不受影响。
-        if !(*state).ime_enabled() && is_any_ime_message(msg) {
+        //
+        // win-1 P3：IMM32 在焦点 / 输入法切换后可能把输入上下文**重新关联**回窗口
+        //（`WM_IME_SETCONTEXT` 就是「上下文关联状态变了」的通知，`WM_INPUTLANGCHANGE` 则是
+        // 输入法本身变了）。这时只吞消息不够：上下文已经挂回去了，字母键会重新被 IME 吃成
+        // 组合输入。先幂等再摘一次，再把消息吞掉。
+        if !(*state).ime_enabled() && (is_any_ime_message(msg) || msg == WM_INPUTLANGCHANGE) {
+            if msg == WM_IME_SETCONTEXT || msg == WM_INPUTLANGCHANGE {
+                (*state).reassert_disabled_ime(hwnd);
+            }
             return LRESULT(0);
         }
         // 应用自己持有的指针捕获被系统收回（Alt+Tab、系统弹窗、别的窗口 SetCapture）：
@@ -732,7 +942,14 @@ pub(crate) extern "system" fn wndproc(
             if is_caption_hit(hit) {
                 match msg {
                     WM_NCLBUTTONDOWN => {
-                        state.begin_caption_drag(hwnd);
+                        // win-2 P3：UI 线程卡顿 / 仍持有捕获时，系统可能不投递
+                        // `WM_NCLBUTTONDBLCLK`，只再来一条 `WM_NCLBUTTONDOWN`。自计时判定命中
+                        // 就按双击处理（最大化/还原切换），否则开始拖动。
+                        if state.self_timed_double_click(hwnd) {
+                            state.toggle_maximize(hwnd);
+                        } else {
+                            state.begin_caption_drag(hwnd);
+                        }
                         return LRESULT(0);
                     }
                     // 双击标题栏：系统行为是最大化/还原切换；自己 `ShowWindow`，
@@ -766,11 +983,29 @@ pub(crate) extern "system" fn wndproc(
                         state.apply_caption_drag(hwnd);
                         return LRESULT(0);
                     }
+                    // `Esc` 取消拖动（win-2 P3）：与原生 move 循环一致 —— 窗口回到按下时的
+                    // 矩形/最大化状态，按键不投递给应用。
+                    WM_KEYDOWN if wparam.0 == VK_ESCAPE.0 as usize => {
+                        state.cancel_caption_drag(hwnd);
+                        return LRESULT(0);
+                    }
                     // 捕获期间抬起是客户区形式（`WM_LBUTTONUP`），非客户区形式一并收尾，
                     // 避免拖动会话停在「按住」。
                     WM_LBUTTONUP | WM_NCLBUTTONUP => {
                         state.apply_caption_drag(hwnd);
                         state.end_caption_drag(hwnd);
+                        return LRESULT(0);
+                    }
+                    // 右键取消拖动（win-2 P3）：原生 move 循环下右键会打开系统菜单并结束
+                    // 移动；引擎不提供系统菜单（见 `WindowOptions` 文档），因此按「取消」处理。
+                    // 捕获后这类消息是**客户区**形式，客户区坐标相对被拖动的窗口是负的，
+                    // 交给应用会派发到错误位置。
+                    WM_RBUTTONDOWN | WM_RBUTTONUP => {
+                        state.cancel_caption_drag(hwnd);
+                        return LRESULT(0);
+                    }
+                    // 中键 / 滚轮在拖动期间一律吞掉（同样避免坐标错乱的应用事件）。
+                    WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
                         return LRESULT(0);
                     }
                     WM_CAPTURECHANGED | WM_CANCELMODE => {
@@ -1603,12 +1838,26 @@ mod resize_tests {
 
 #[cfg(test)]
 mod caption_tests {
+    use std::time::Duration;
+
     use windows::Win32::{
         Foundation::{POINT, RECT},
         UI::WindowsAndMessaging::{HTCAPTION, HTSYSMENU},
     };
 
-    use super::{MIN_VISIBLE_EDGE, caption_position, is_caption_hit, restored_drag_origin};
+    use super::{
+        caption_position, is_caption_hit, is_self_timed_double_click, min_visible_edge,
+        restored_drag_origin,
+    };
+    use crate::math::Scale;
+
+    fn scale_one() -> Scale {
+        Scale::ONE
+    }
+
+    fn scale(factor: f32) -> Scale {
+        Scale::new(factor).expect("scale")
+    }
 
     fn work() -> RECT {
         RECT {
@@ -1636,9 +1885,25 @@ mod caption_tests {
         assert!(!is_caption_hit(0));
     }
 
+    // ── MIN_VISIBLE_EDGE：按 DPI 缩放（win-2 P3） ──────────────────────────────
+
+    #[test]
+    fn min_visible_edge_scales_with_the_dpi() {
+        assert_eq!(min_visible_edge(scale_one()), 64);
+        assert_eq!(
+            min_visible_edge(scale(1.25)),
+            80,
+            "125% DPI 下 64 逻辑像素 = 80 物理像素"
+        );
+        assert_eq!(min_visible_edge(scale(1.5)), 96);
+        assert_eq!(min_visible_edge(scale(2.0)), 128);
+        // 极端小比例也要至少留 1 物理像素（不能钳成 0，更不能为负）。
+        assert_eq!(min_visible_edge(scale(0.001)), 1);
+    }
+
     #[test]
     fn caption_drag_follows_the_cursor_delta() {
-        let (left, top) = caption_position(window(), (50, 30), work());
+        let (left, top) = caption_position(window(), (50, 30), work(), scale_one());
 
         assert_eq!((left, top), (150, 130));
     }
@@ -1646,26 +1911,38 @@ mod caption_tests {
     #[test]
     fn caption_drag_keeps_the_title_bar_below_the_work_area_top() {
         // 往上拖：系统原生 move 同样不允许把标题栏拖到工作区顶边之上。
-        let (_, top) = caption_position(window(), (0, -500), work());
+        let (_, top) = caption_position(window(), (0, -500), work(), scale_one());
 
         assert_eq!(top, 0);
     }
 
     #[test]
     fn caption_drag_leaves_a_visible_sliver_at_the_bottom() {
-        let (_, top) = caption_position(window(), (0, 2000), work());
+        let (_, top) = caption_position(window(), (0, 2000), work(), scale_one());
 
-        assert_eq!(top, work().bottom - MIN_VISIBLE_EDGE);
+        assert_eq!(top, work().bottom - min_visible_edge(scale_one()));
+    }
+
+    #[test]
+    fn caption_drag_keeps_more_physical_pixels_visible_at_high_dpi() {
+        // 同一逻辑目标（标题栏贴底）在 200% DPI 下必须保留 128 物理像素：固定 64 物理像素
+        // 在高 DPI 屏幕上只剩 32 逻辑像素，窗口会被拖得几乎不可见（win-2 P3）。
+        let (_, at_100) = caption_position(window(), (0, 2000), work(), scale_one());
+        let (_, at_200) = caption_position(window(), (0, 2000), work(), scale(2.0));
+
+        assert_eq!(work().bottom - at_100, 64);
+        assert_eq!(work().bottom - at_200, 128);
     }
 
     #[test]
     fn caption_drag_clamps_horizontally_to_the_work_area() {
-        let (far_left, _) = caption_position(window(), (-2000, 0), work());
-        let (far_right, _) = caption_position(window(), (3000, 0), work());
+        let (far_left, _) = caption_position(window(), (-2000, 0), work(), scale_one());
+        let (far_right, _) = caption_position(window(), (3000, 0), work(), scale_one());
 
-        // 至少留 MIN_VISIBLE_EDGE 宽在屏幕里（窗口宽 400）。
-        assert_eq!(far_left, work().left - 400 + MIN_VISIBLE_EDGE);
-        assert_eq!(far_right, work().right - MIN_VISIBLE_EDGE);
+        // 至少留 min_visible_edge 宽在屏幕里（窗口宽 400）。
+        let edge = min_visible_edge(scale_one());
+        assert_eq!(far_left, work().left - 400 + edge);
+        assert_eq!(far_right, work().right - edge);
     }
 
     #[test]
@@ -1684,7 +1961,7 @@ mod caption_tests {
             bottom: 400,
         };
 
-        let (left, top) = caption_position(moved, (100, -200), secondary);
+        let (left, top) = caption_position(moved, (100, -200), secondary, scale_one());
 
         assert_eq!(left, 2000, "跨屏拖动按光标所在显示器平移");
         assert_eq!(top, 0, "垂直仍钳制到第二台显示器的工作区顶边");
@@ -1693,7 +1970,7 @@ mod caption_tests {
     #[test]
     fn caption_drag_does_not_panic_on_a_tiny_work_area() {
         // 退化工作区（多显示器配置异常 / 远程桌面极小分辨率）：钳制区间必须自洽，不能
-        // 触发 `clamp(min > max)` panic。工作区比 MIN_VISIBLE_EDGE 还窄时退化为「靠右边界
+        // 触发 `clamp(min > max)` panic。工作区比 min_visible_edge 还窄时退化为「靠右边界
         // 减去可见边」，窗口 400 宽 ⇒ left = 10 - 64 = -54。
         let tiny = RECT {
             left: 0,
@@ -1702,10 +1979,12 @@ mod caption_tests {
             bottom: 10,
         };
 
-        let (left, top) = caption_position(window(), (1, 1), tiny);
+        let (left, top) = caption_position(window(), (1, 1), tiny, scale_one());
 
-        assert_eq!((left, top), (10 - MIN_VISIBLE_EDGE, 0));
+        assert_eq!((left, top), (10 - min_visible_edge(scale_one()), 0));
     }
+
+    // ── 最大化还原摆位：水平比例 + 竖直偏移（win-2 P3） ──────────────────────
 
     #[test]
     fn restored_drag_origin_keeps_the_cursor_ratio_on_the_title_bar() {
@@ -1723,11 +2002,41 @@ mod caption_tests {
             right: 1000,
             bottom: 700,
         };
-        let cursor = POINT { x: 960, y: 30 };
+        let press = POINT { x: 960, y: 30 };
 
-        let (left, top) = restored_drag_origin(maximized, restored, cursor, work());
+        let (left, top) =
+            restored_drag_origin(maximized, restored, press, press, work(), scale_one());
 
         assert_eq!((left, top), (560, 0));
+    }
+
+    #[test]
+    fn restored_drag_origin_preserves_the_vertical_caption_offset() {
+        // 按下后光标往下甩了 40 px（超过系统拖拽阈值）⇒ 还原窗口顶边也跟着下移 40 px，
+        // 光标相对标题栏的竖直偏移保持不变。旧实现固定 `top = maximized.top`，光标会掉到
+        // 标题栏下方的客户区里（win-2 P3）。
+        let maximized = RECT {
+            left: 0,
+            top: -8,
+            right: 1920,
+            bottom: 1040,
+        };
+        let restored = RECT {
+            left: 0,
+            top: 0,
+            right: 800,
+            bottom: 600,
+        };
+        let press = POINT { x: 500, y: 12 };
+        let cursor = POINT { x: 520, y: 52 };
+
+        let (left, top) =
+            restored_drag_origin(maximized, restored, press, cursor, work(), scale_one());
+
+        // top = cursor.y - (press.y - maximized.top) = 52 - (12 + 8) = 32。
+        assert_eq!(top, 32, "竖直方向必须保留按下时在标题栏内的偏移");
+        // 水平：光标在最大化标题栏 520/1920 比例处 ⇒ 还原标题栏同一比例处。
+        assert_eq!(left, 520 - ((520.0 / 1920.0) * 800.0) as i32);
     }
 
     #[test]
@@ -1752,11 +2061,122 @@ mod caption_tests {
             right: 3840,
             bottom: 1000,
         };
+        let press = POINT { x: 2400, y: 20 };
 
         let (left, top) =
-            restored_drag_origin(maximized, restored, POINT { x: 2400, y: 20 }, secondary);
+            restored_drag_origin(maximized, restored, press, press, secondary, scale_one());
 
         assert_eq!((left, top), (2200, 0));
+    }
+
+    #[test]
+    fn restored_drag_origin_clamps_to_a_negative_coordinate_monitor() {
+        // 主显示器上方的第二台显示器：虚拟坐标 top 为负。还原摆位仍要钳在该显示器工作区内，
+        // 负坐标不能触发任何越界/panic。
+        let above = RECT {
+            left: 0,
+            top: -1080,
+            right: 1920,
+            bottom: 0,
+        };
+        let restored = RECT {
+            left: 0,
+            top: -500,
+            right: 800,
+            bottom: 100,
+        };
+        let press = POINT { x: 300, y: -1050 };
+        let cursor = POINT { x: 320, y: -1020 };
+
+        let (left, top) = restored_drag_origin(above, restored, press, cursor, above, scale_one());
+
+        assert_eq!(top, -1050, "还原顶边 = 最大化顶边 + 光标竖直位移");
+        assert_eq!(left, 320 - 133, "负坐标工作区内的水平比例摆位");
+    }
+
+    #[test]
+    fn restored_drag_origin_handles_extreme_drag_deltas() {
+        // 还原触发前光标已经被甩出工作区（极端拖拽方向 / 卡顿后的积压移动）：竖直方向必须
+        // 钳在 [工作区顶边, 工作区底边 - 可见边]，不能 panic，也不能让标题栏出屏。
+        let maximized = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        let restored = RECT {
+            left: 0,
+            top: 0,
+            right: 800,
+            bottom: 600,
+        };
+        let press = POINT { x: 960, y: 5 };
+
+        let (left, top) = restored_drag_origin(
+            maximized,
+            restored,
+            press,
+            POINT { x: 960, y: 50_000 },
+            work(),
+            scale_one(),
+        );
+        assert_eq!(top, work().bottom - 64);
+        assert_eq!(left, 960 - 400);
+
+        let (_, top) = restored_drag_origin(
+            maximized,
+            restored,
+            press,
+            POINT { x: 960, y: -50_000 },
+            work(),
+            scale_one(),
+        );
+        assert_eq!(top, 0);
+
+        // 200% DPI 下底部可见边按物理像素放大（128 px）。
+        let (_, top_high_dpi) = restored_drag_origin(
+            maximized,
+            restored,
+            press,
+            POINT { x: 960, y: 50_000 },
+            work(),
+            scale(2.0),
+        );
+        assert_eq!(top_high_dpi, work().bottom - 128);
+    }
+
+    // ── 自计时双击兜底（win-2 P3） ──────────────────────────────────────────
+
+    #[test]
+    fn self_timed_double_click_requires_time_and_distance() {
+        let time = Duration::from_millis(500);
+        let tolerance = (2, 2);
+
+        assert!(is_self_timed_double_click(
+            Duration::from_millis(499),
+            (1, -2),
+            time,
+            tolerance
+        ));
+        assert!(
+            !is_self_timed_double_click(Duration::from_millis(500), (0, 0), time, tolerance),
+            "时间必须严格小于双击时间（与系统「在指定时间内」一致）"
+        );
+        assert!(
+            !is_self_timed_double_click(Duration::from_millis(100), (3, 0), time, tolerance),
+            "水平超出双击矩形（半宽 2）"
+        );
+        assert!(
+            !is_self_timed_double_click(Duration::from_millis(100), (0, -3), time, tolerance),
+            "竖直超出双击矩形（半高 2）"
+        );
+        // 极端值：`i32::MIN` 距离不能触发 `abs` 溢出（debug 下会 panic）。
+        assert!(!is_self_timed_double_click(
+            Duration::from_millis(1),
+            (i32::MIN, i32::MAX),
+            time,
+            tolerance
+        ));
     }
 }
 
@@ -1768,18 +2188,23 @@ mod wndproc_tests {
         Foundation::{HWND, LPARAM, POINT, RECT, WPARAM},
         System::LibraryLoader::GetModuleHandleW,
         UI::{
-            Input::Ime::GCS_RESULTSTR,
+            Input::{
+                Ime::{GCS_RESULTSTR, ImmAssociateContext, ImmGetContext, ImmReleaseContext},
+                KeyboardAndMouse::{GetCapture, VK_ESCAPE},
+            },
             WindowsAndMessaging::{
-                CreateWindowExW, DestroyWindow, GWLP_USERDATA, GetWindowRect, HTCAPTION, HTRIGHT,
-                IsZoomed, RegisterClassW, SendMessageW, SetWindowLongPtrW, WINDOW_EX_STYLE,
-                WM_CAPTURECHANGED, WM_IME_CHAR, WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION,
-                WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WNDCLASSW,
-                WS_OVERLAPPEDWINDOW,
+                CreateWindowExW, DestroyWindow, GWLP_USERDATA, GetCursorPos, GetWindowRect,
+                HTCAPTION, HTRIGHT, IsZoomed, RegisterClassW, SendMessageW, SetWindowLongPtrW,
+                WINDOW_EX_STYLE, WM_CANCELMODE, WM_CAPTURECHANGED, WM_IME_CHAR, WM_IME_COMPOSITION,
+                WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_INPUTLANGCHANGE, WM_KEYDOWN,
+                WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+                WM_MOUSEWHEEL, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_RBUTTONDOWN, WM_RBUTTONUP,
+                WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
             },
         },
     };
 
-    use super::{WndProcState, wndproc};
+    use super::{CAPTION_TIMER_ID, WndProcState, wndproc};
     use crate::{
         event::ImeEvent,
         platform::{
@@ -1857,6 +2282,34 @@ mod wndproc_tests {
             .enable_all()
             .build()
             .expect("runtime")
+    }
+
+    /// 拖动测试装配：读出真实光标与当前窗口矩形，并把会话的「上一次应用位置」伪造到真实
+    /// 光标之前 `delta` —— 下一次 apply 会产生确定的位移（测试不能移动真实光标）。
+    fn stage_caption_delta(hwnd: HWND, raw: &mut WndProcState, delta: (i32, i32)) -> (POINT, RECT) {
+        let mut cursor = POINT::default();
+        let mut window = RECT::default();
+        // SAFETY: `hwnd` 由调用方的隐藏窗口保证存活；两个输出都是栈上值。
+        unsafe {
+            GetCursorPos(&mut cursor).expect("GetCursorPos");
+            GetWindowRect(hwnd, &mut window).expect("GetWindowRect");
+        }
+        raw.caption_drag.as_mut().expect("drag session").cursor = POINT {
+            x: cursor.x - delta.0,
+            y: cursor.y - delta.1,
+        };
+        (cursor, window)
+    }
+
+    /// 拖动测试的期望位置：与生产 `apply_caption_drag` 同一个纯函数 + 同一个工作区/DPI。
+    fn expected_caption_position(
+        hwnd: HWND,
+        cursor: POINT,
+        window: RECT,
+        delta: (i32, i32),
+    ) -> (i32, i32) {
+        let work = super::cursor_work_area(cursor).expect("光标所在显示器工作区");
+        super::caption_position(window, delta, work, super::window_scale(hwnd))
     }
 
     /// 复审 F2：不持有捕获时引擎的 `release_capture` 不得留下 suppress 残留
@@ -2024,6 +2477,70 @@ mod wndproc_tests {
         destroy_hidden_window(hwnd, state);
     }
 
+    /// win-1 P3（任务 1）：禁用态下 IMM32 在焦点 / 输入法切换后可能把上下文**重新关联**回
+    /// 窗口；`WM_IME_SETCONTEXT` / `WM_INPUTLANGCHANGE` 必须幂等再摘除，且不覆盖最初保存的
+    /// 上下文（重新启用时恢复的仍是它）。
+    #[test]
+    fn disabled_ime_detaches_a_reassociated_context() {
+        let _runtime = runtime();
+        let dispatcher = Dispatcher::new();
+        let (hwnd, state, _class) = hidden_window("KytrixWndProcImeReattach", dispatcher);
+        // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
+        let raw = unsafe { &mut *state };
+
+        // 基线上下文：禁用前窗口关联的 HIMC（实测隐藏窗口创建时系统就给默认上下文）。
+        // SAFETY: 窗口由本测试创建且仍存活；`ImmGetContext` 的句柄成对释放。
+        let baseline = unsafe { ImmGetContext(hwnd) };
+        if baseline.is_invalid() {
+            eprintln!("skip: hidden window has no IME context");
+            destroy_hidden_window(hwnd, state);
+            return;
+        }
+        unsafe {
+            let _ = ImmReleaseContext(hwnd, baseline);
+        }
+
+        raw.set_ime_enabled(hwnd, false);
+        assert!(
+            unsafe { ImmGetContext(hwnd) }.is_invalid(),
+            "禁用后窗口不得再关联上下文"
+        );
+
+        // 模拟系统的重新关联（焦点 / 输入法切换）。若 `ImmAssociateContext` 本身同步派发了
+        // `WM_IME_SETCONTEXT`，wndproc 会立刻再摘除；这里再显式发一次，覆盖「消息到了但没有
+        // 摘除」的缺陷路径（两种时序都要通过）。
+        // SAFETY: 窗口由本测试创建且仍存活；消息同步派发到生产 `wndproc`。
+        unsafe {
+            let _ = ImmAssociateContext(hwnd, baseline);
+            SendMessageW(hwnd, WM_IME_SETCONTEXT, Some(WPARAM(1)), Some(LPARAM(0)));
+        }
+        assert!(
+            unsafe { ImmGetContext(hwnd) }.is_invalid(),
+            "WM_IME_SETCONTEXT 必须把重新关联的上下文再摘掉"
+        );
+
+        // 再关联 + 输入法切换通知：同样幂等。
+        // SAFETY: 同上。
+        unsafe {
+            let _ = ImmAssociateContext(hwnd, baseline);
+            SendMessageW(hwnd, WM_INPUTLANGCHANGE, Some(WPARAM(0)), Some(LPARAM(0)));
+        }
+        assert!(
+            unsafe { ImmGetContext(hwnd) }.is_invalid(),
+            "WM_INPUTLANGCHANGE 必须把重新关联的上下文再摘掉"
+        );
+
+        // 重新启用：恢复的必须是最初保存的那个上下文（再摘除没有把它覆盖掉）。
+        raw.set_ime_enabled(hwnd, true);
+        let restored = unsafe { ImmGetContext(hwnd) };
+        assert_eq!(restored, baseline, "重新启用必须恢复最初保存的上下文");
+        // SAFETY: 同上。
+        unsafe {
+            let _ = ImmReleaseContext(hwnd, restored);
+        }
+        destroy_hidden_window(hwnd, state);
+    }
+
     /// P2-9 回归：按下标题栏进入自绘拖动（不交给 `DefWindowProcW` 的 move 模态循环），
     /// 拖动期间的 `WM_MOUSEMOVE` 不直接移动窗口（由 1 ms 定时器合并），抬起收尾并释放捕获。
     #[test]
@@ -2053,16 +2570,403 @@ mod wndproc_tests {
             (before.left, before.top, before.right, before.bottom),
             "拖动期间的 WM_MOUSEMOVE 不得直接 SetWindowPos（合并到定时器）"
         );
+        // SAFETY: `GetCapture` 只读查询。
+        assert_eq!(
+            unsafe { GetCapture() },
+            hwnd,
+            "拖动期间窗口必须持有鼠标捕获"
+        );
 
         // SAFETY: 同上。
         unsafe {
             SendMessageW(hwnd, WM_LBUTTONUP, None, None);
         }
         assert!(raw.caption_drag.is_none(), "抬起必须结束拖动");
+        // SAFETY: `GetCapture` 只读查询。
+        assert_ne!(unsafe { GetCapture() }, hwnd, "抬起后必须释放鼠标捕获");
         assert!(
             !raw.suppress_capture_cancel,
             "引擎自己释放捕获产生的 WM_CAPTURECHANGED 必须被消费"
         );
+        destroy_hidden_window(hwnd, state);
+    }
+
+    /// win-2 P3（任务 6）：拖动中的 `WM_TIMER` tick 按光标增量移动窗口；会话不结束、捕获保持。
+    #[test]
+    fn caption_timer_tick_moves_the_window_and_keeps_the_session() {
+        let _runtime = runtime();
+        let dispatcher = Dispatcher::new();
+        let (hwnd, state, _class) = hidden_window("KytrixWndProcCaptionTick", dispatcher);
+        // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
+        let raw = unsafe { &mut *state };
+        // SAFETY: 窗口由本测试创建且仍存活；消息同步派发到生产 `wndproc`。
+        unsafe {
+            SendMessageW(
+                hwnd,
+                WM_NCLBUTTONDOWN,
+                Some(WPARAM(HTCAPTION as usize)),
+                None,
+            );
+        }
+        assert!(raw.caption_drag.is_some(), "前置：拖动会话已开始");
+        let (cursor, before) = stage_caption_delta(hwnd, raw, (40, 30));
+
+        // SAFETY: 同上。
+        unsafe {
+            SendMessageW(hwnd, WM_TIMER, Some(WPARAM(CAPTION_TIMER_ID)), None);
+        }
+        let mut after = RECT::default();
+        // SAFETY: 同上。
+        unsafe {
+            GetWindowRect(hwnd, &mut after).expect("GetWindowRect");
+        }
+        let expected = expected_caption_position(hwnd, cursor, before, (40, 30));
+        assert_eq!(
+            (after.left, after.top),
+            expected,
+            "tick 必须按光标增量平移窗口"
+        );
+        assert!(raw.caption_drag.is_some(), "tick 不得结束拖动会话");
+        // SAFETY: `GetCapture` 只读查询。
+        assert_eq!(unsafe { GetCapture() }, hwnd, "拖动期间必须持有鼠标捕获");
+
+        // 收尾：抬起结束会话并释放捕获。
+        // SAFETY: 同上。
+        unsafe {
+            SendMessageW(hwnd, WM_LBUTTONUP, None, None);
+        }
+        destroy_hidden_window(hwnd, state);
+    }
+
+    /// win-2 P3（任务 6）：`WM_CAPTURECHANGED`（捕获被系统收回）用最新光标位置收尾，
+    /// 会话归零并释放捕获。
+    #[test]
+    fn capture_change_ends_the_caption_drag_at_the_latest_cursor() {
+        let _runtime = runtime();
+        let dispatcher = Dispatcher::new();
+        let (hwnd, state, _class) = hidden_window("KytrixWndProcCaptionCapture", dispatcher);
+        // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
+        let raw = unsafe { &mut *state };
+        // SAFETY: 窗口由本测试创建且仍存活；消息同步派发到生产 `wndproc`。
+        unsafe {
+            SendMessageW(
+                hwnd,
+                WM_NCLBUTTONDOWN,
+                Some(WPARAM(HTCAPTION as usize)),
+                None,
+            );
+        }
+        let (cursor, before) = stage_caption_delta(hwnd, raw, (35, 25));
+
+        // SAFETY: 同上。
+        unsafe {
+            SendMessageW(hwnd, WM_CAPTURECHANGED, None, None);
+        }
+        let mut after = RECT::default();
+        // SAFETY: 同上。
+        unsafe {
+            GetWindowRect(hwnd, &mut after).expect("GetWindowRect");
+        }
+        let expected = expected_caption_position(hwnd, cursor, before, (35, 25));
+        assert_eq!(
+            (after.left, after.top),
+            expected,
+            "失去捕获时必须按最新光标位置收尾"
+        );
+        assert!(raw.caption_drag.is_none(), "失去捕获必须结束拖动会话");
+        // SAFETY: `GetCapture` 只读查询。
+        assert_ne!(unsafe { GetCapture() }, hwnd, "收尾后不得继续持有捕获");
+        assert!(
+            !raw.suppress_capture_cancel,
+            "引擎自己释放捕获产生的 WM_CAPTURECHANGED 必须被消费"
+        );
+        destroy_hidden_window(hwnd, state);
+    }
+
+    /// win-2 P3（任务 6）：`WM_CANCELMODE`（系统取消模态交互）同样按最新光标收尾。
+    #[test]
+    fn cancel_mode_ends_the_caption_drag_at_the_latest_cursor() {
+        let _runtime = runtime();
+        let dispatcher = Dispatcher::new();
+        let (hwnd, state, _class) = hidden_window("KytrixWndProcCaptionCancel", dispatcher);
+        // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
+        let raw = unsafe { &mut *state };
+        // SAFETY: 窗口由本测试创建且仍存活；消息同步派发到生产 `wndproc`。
+        unsafe {
+            SendMessageW(
+                hwnd,
+                WM_NCLBUTTONDOWN,
+                Some(WPARAM(HTCAPTION as usize)),
+                None,
+            );
+        }
+        let (cursor, before) = stage_caption_delta(hwnd, raw, (-30, 20));
+
+        // SAFETY: 同上。
+        unsafe {
+            SendMessageW(hwnd, WM_CANCELMODE, None, None);
+        }
+        let mut after = RECT::default();
+        // SAFETY: 同上。
+        unsafe {
+            GetWindowRect(hwnd, &mut after).expect("GetWindowRect");
+        }
+        let expected = expected_caption_position(hwnd, cursor, before, (-30, 20));
+        assert_eq!(
+            (after.left, after.top),
+            expected,
+            "WM_CANCELMODE 必须按最新光标位置收尾"
+        );
+        assert!(raw.caption_drag.is_none(), "WM_CANCELMODE 必须结束拖动会话");
+        // SAFETY: `GetCapture` 只读查询。
+        assert_ne!(unsafe { GetCapture() }, hwnd, "收尾后不得继续持有捕获");
+        destroy_hidden_window(hwnd, state);
+    }
+
+    /// win-2 P3（任务 3）：拖动中按 `Esc` 还原按下时的窗口矩形、结束会话、释放捕获，
+    /// 且按键不投递给应用（参考原生 move 循环的取消语义）。
+    #[test]
+    fn escape_cancels_the_caption_drag_and_restores_the_origin() {
+        let _runtime = runtime();
+        let dispatcher = Dispatcher::new();
+        let (hwnd, state, _class) = hidden_window("KytrixWndProcCaptionEsc", dispatcher);
+        // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
+        let raw = unsafe { &mut *state };
+        // SAFETY: 窗口由本测试创建且仍存活；消息同步派发到生产 `wndproc`。
+        unsafe {
+            SendMessageW(
+                hwnd,
+                WM_NCLBUTTONDOWN,
+                Some(WPARAM(HTCAPTION as usize)),
+                None,
+            );
+        }
+        let origin = raw.caption_drag.expect("drag session").origin;
+
+        // 先真实移动一次窗口：证明 Esc 会把窗口放回起始矩形，而不只是结束会话。
+        stage_caption_delta(hwnd, raw, (60, 40));
+        // SAFETY: 同上。
+        unsafe {
+            SendMessageW(hwnd, WM_TIMER, Some(WPARAM(CAPTION_TIMER_ID)), None);
+        }
+        let mut moved = RECT::default();
+        // SAFETY: 同上。
+        unsafe {
+            GetWindowRect(hwnd, &mut moved).expect("GetWindowRect");
+        }
+        assert_ne!(
+            (moved.left, moved.top),
+            (origin.left, origin.top),
+            "前置：窗口已被拖动"
+        );
+
+        // SAFETY: 同上；`WM_KEYDOWN` 的 wParam 是虚拟键码。
+        unsafe {
+            SendMessageW(hwnd, WM_KEYDOWN, Some(WPARAM(VK_ESCAPE.0 as usize)), None);
+        }
+        let mut restored = RECT::default();
+        // SAFETY: 同上。
+        unsafe {
+            GetWindowRect(hwnd, &mut restored).expect("GetWindowRect");
+        }
+        assert_eq!(
+            (restored.left, restored.top, restored.right, restored.bottom),
+            (origin.left, origin.top, origin.right, origin.bottom),
+            "Esc 必须还原按下时的窗口矩形"
+        );
+        assert!(raw.caption_drag.is_none(), "Esc 必须结束拖动会话");
+        // SAFETY: `GetCapture` 只读查询。
+        assert_ne!(unsafe { GetCapture() }, hwnd, "Esc 必须释放鼠标捕获");
+        assert!(raw.take_events().is_empty(), "Esc 不得投递给应用");
+        destroy_hidden_window(hwnd, state);
+    }
+
+    /// win-2 P3（任务 3，最大化分支）：按下最大化窗口的标题栏并拖动到已还原之后，`Esc`
+    /// 必须回到**最大化**状态（只还原矩形而不重新最大化会留下一个「还原态但占满屏幕」的窗口）。
+    #[test]
+    fn escape_cancels_a_restored_drag_back_to_maximized() {
+        let _runtime = runtime();
+        let dispatcher = Dispatcher::new();
+        let (hwnd, state, _class) = hidden_window("KytrixWndProcCaptionEscMax", dispatcher);
+        // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
+        let raw = unsafe { &mut *state };
+        // SAFETY: 窗口由本测试创建且仍存活；消息同步派发到生产 `wndproc`。
+        unsafe {
+            // 先最大化（双击标题栏），再按住标题栏拖动。
+            SendMessageW(
+                hwnd,
+                WM_NCLBUTTONDBLCLK,
+                Some(WPARAM(HTCAPTION as usize)),
+                None,
+            );
+            assert!(IsZoomed(hwnd).as_bool(), "前置：窗口已最大化");
+            SendMessageW(
+                hwnd,
+                WM_NCLBUTTONDOWN,
+                Some(WPARAM(HTCAPTION as usize)),
+                None,
+            );
+        }
+        assert!(
+            raw.caption_drag.expect("drag session").restore,
+            "前置：按下时等待还原（仍是最大化）"
+        );
+
+        // 位移超过系统拖拽阈值 ⇒ 还原并按光标摆位。
+        stage_caption_delta(hwnd, raw, (120, 60));
+        // SAFETY: 同上。
+        unsafe {
+            SendMessageW(hwnd, WM_TIMER, Some(WPARAM(CAPTION_TIMER_ID)), None);
+        }
+        // SAFETY: 同上。
+        assert!(
+            !unsafe { IsZoomed(hwnd) }.as_bool(),
+            "前置：拖动已经触发还原"
+        );
+
+        // SAFETY: 同上。
+        unsafe {
+            SendMessageW(hwnd, WM_KEYDOWN, Some(WPARAM(VK_ESCAPE.0 as usize)), None);
+        }
+        // SAFETY: 同上。
+        assert!(
+            unsafe { IsZoomed(hwnd) }.as_bool(),
+            "Esc 必须把通过拖动还原的最大化窗口重新最大化"
+        );
+        assert!(raw.caption_drag.is_none(), "Esc 必须结束拖动会话");
+        // SAFETY: `GetCapture` 只读查询。
+        assert_ne!(unsafe { GetCapture() }, hwnd, "Esc 必须释放鼠标捕获");
+        destroy_hidden_window(hwnd, state);
+    }
+
+    /// win-2 P3（任务 4）：拖动期间右键取消拖动并还原原位；中键 / 滚轮被吞掉（不产生应用
+    /// 事件，也不结束会话）。
+    #[test]
+    fn right_click_cancels_the_caption_drag_and_buttons_are_swallowed() {
+        let _runtime = runtime();
+        let dispatcher = Dispatcher::new();
+        let (hwnd, state, _class) = hidden_window("KytrixWndProcCaptionButtons", dispatcher);
+        // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
+        let raw = unsafe { &mut *state };
+        // SAFETY: 窗口由本测试创建且仍存活；消息同步派发到生产 `wndproc`。
+        unsafe {
+            SendMessageW(
+                hwnd,
+                WM_NCLBUTTONDOWN,
+                Some(WPARAM(HTCAPTION as usize)),
+                None,
+            );
+        }
+        let origin = raw.caption_drag.expect("drag session").origin;
+        stage_caption_delta(hwnd, raw, (50, 30));
+        // SAFETY: 同上。
+        unsafe {
+            SendMessageW(hwnd, WM_TIMER, Some(WPARAM(CAPTION_TIMER_ID)), None);
+        }
+
+        // 中键 / 滚轮：拖动会话继续，应用收不到任何事件（捕获后坐标是负的客户区坐标）。
+        // SAFETY: 同上。
+        unsafe {
+            SendMessageW(hwnd, WM_MBUTTONDOWN, None, None);
+            SendMessageW(hwnd, WM_MBUTTONUP, None, None);
+            SendMessageW(hwnd, WM_MOUSEWHEEL, Some(WPARAM(120 << 16)), None);
+            SendMessageW(hwnd, WM_MOUSEHWHEEL, Some(WPARAM(120 << 16)), None);
+        }
+        assert!(raw.caption_drag.is_some(), "中键 / 滚轮不得结束拖动会话");
+        assert!(raw.take_events().is_empty(), "中键 / 滚轮不得投递给应用");
+
+        // 右键：没有系统菜单，按「取消拖动」处理 —— 还原原位、结束会话、释放捕获。
+        // SAFETY: 同上。
+        unsafe {
+            SendMessageW(hwnd, WM_RBUTTONDOWN, None, None);
+        }
+        assert!(raw.caption_drag.is_none(), "右键必须取消拖动");
+        assert!(raw.take_events().is_empty(), "右键不得投递给应用");
+        // SAFETY: `GetCapture` 只读查询。
+        assert_ne!(unsafe { GetCapture() }, hwnd, "右键取消必须释放鼠标捕获");
+        let mut restored = RECT::default();
+        // SAFETY: 同上。
+        unsafe {
+            GetWindowRect(hwnd, &mut restored).expect("GetWindowRect");
+        }
+        assert_eq!(
+            (restored.left, restored.top),
+            (origin.left, origin.top),
+            "右键取消必须还原按下时的位置"
+        );
+
+        // 重新按一次标题栏，再用右键抬起取消：down / up 两条消息都按「取消」处理
+        //（原生 move 循环里右键按下会打开菜单并结束移动，抬起消息不应漏给应用）。
+        // SAFETY: 同上。
+        unsafe {
+            SendMessageW(
+                hwnd,
+                WM_NCLBUTTONDOWN,
+                Some(WPARAM(HTCAPTION as usize)),
+                None,
+            );
+        }
+        assert!(raw.caption_drag.is_some(), "前置：拖动会话重新开始");
+        // SAFETY: 同上。
+        unsafe {
+            SendMessageW(hwnd, WM_RBUTTONUP, None, None);
+        }
+        assert!(raw.caption_drag.is_none(), "右键抬起也必须取消拖动");
+        destroy_hidden_window(hwnd, state);
+    }
+
+    /// win-2 P3（任务 5）：系统没投递 `WM_NCLBUTTONDBLCLK` 时（UI 线程卡顿），快速第二次
+    /// 按下由自计时兜底判成双击：最大化，而不是开始新的拖动会话。
+    #[test]
+    fn self_timed_second_press_toggles_maximize() {
+        let _runtime = runtime();
+        let dispatcher = Dispatcher::new();
+        let (hwnd, state, _class) = hidden_window("KytrixWndProcSelfTimedDblClick", dispatcher);
+        // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
+        let raw = unsafe { &mut *state };
+        // SAFETY: 窗口由本测试创建且仍存活；消息同步派发到生产 `wndproc`。
+        unsafe {
+            SendMessageW(
+                hwnd,
+                WM_NCLBUTTONDOWN,
+                Some(WPARAM(HTCAPTION as usize)),
+                None,
+            );
+            assert!(raw.caption_drag.is_some(), "第一次按下开始拖动");
+            SendMessageW(hwnd, WM_LBUTTONUP, None, None);
+            // 第二次按下：与第一次在双击时间 / 矩形内，但没有 WM_NCLBUTTONDBLCLK。
+            SendMessageW(
+                hwnd,
+                WM_NCLBUTTONDOWN,
+                Some(WPARAM(HTCAPTION as usize)),
+                None,
+            );
+        }
+        assert!(
+            unsafe { IsZoomed(hwnd) }.as_bool(),
+            "自计时双击必须最大化窗口"
+        );
+        assert!(raw.caption_drag.is_none(), "双击不得开始新的拖动会话");
+
+        // 第三次快按：双击记录已被消费，应按普通按下开始拖动（不再切换最大化状态）。
+        // SAFETY: 同上。
+        unsafe {
+            SendMessageW(
+                hwnd,
+                WM_NCLBUTTONDOWN,
+                Some(WPARAM(HTCAPTION as usize)),
+                None,
+            );
+        }
+        assert!(
+            unsafe { IsZoomed(hwnd) }.as_bool(),
+            "第三次按下不得再次切换最大化状态"
+        );
+        assert!(raw.caption_drag.is_some(), "第三次按下应按普通拖动处理");
+        // SAFETY: 同上。
+        unsafe {
+            SendMessageW(hwnd, WM_LBUTTONUP, None, None);
+        }
         destroy_hidden_window(hwnd, state);
     }
 
@@ -2146,6 +3050,7 @@ mod wndproc_tests {
 
         let press = POINT { x: 600, y: 10 };
         let work = super::cursor_work_area(press).expect("光标所在显示器工作区");
+        let scale = super::window_scale(hwnd);
         assert!(
             !super::restore_maximized_for_drag(
                 hwnd,
@@ -2155,6 +3060,7 @@ mod wndproc_tests {
                     y: press.y + 1,
                 },
                 work,
+                scale,
             ),
             "未超过拖拽阈值时不得还原"
         );
@@ -2170,6 +3076,7 @@ mod wndproc_tests {
                     y: press.y + 60,
                 },
                 work,
+                scale,
             ),
             "超过阈值必须还原"
         );

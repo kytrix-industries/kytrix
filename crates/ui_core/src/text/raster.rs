@@ -12,9 +12,18 @@
 //! - **hinting 关**（[`HINTING`]）：不再让 swash 按整数 ppem 重排笔画。Skia 的 UI 文本默认
 //!   `kNone`（Windows 上 Chrome 同样只做亚像素定位）；hinting 打开时字形内部笔画与 parley
 //!   用小数 advance 排出的位置不一致，CJK 还会被横向挤压。代价是小 ppem（≤ 16）下笔画略软。
+//! - **ppem 用小数**（P3，txt-1 收尾）：光栅字号直接取 run 的**物理**字号（parley 的
+//!   `Run::font_size()` = 逻辑字号 × `scale`，如 16 px @125% → 20.0、14 px @125% → 17.5），
+//!   **不 `round`**。swash 的 `ScalerBuilder::size` 收 `f32`，`skrifa::Size` 按小数缩放轮廓；
+//!   hinting 已关闭，不存在「必须整数 ppem」的假设。把 ppem 取整会引入最多 0.5 px/em 的尺寸
+//!   差（17.5 → 18 是 2.9%），位图逐字形比 parley 的 advance 宽/窄一点，累积成字距呼吸，
+//!   正好抵消亚像素定位的收益。图集键只保留量化值（`GlyphKey::ppem_q`，1/64 px），
+//!   光栅仍用原值。
 //!
 //! 回退：把 [`SUBPIXEL_PHASES`] 改成 `1`（整像素量化：`floor` 落点，**与旧实现的
-//! `round` 不同**，会有最多 1px 的整体位移）或 [`HINTING`] 改成 `true`（旧的整 ppem
+//! `round` 不同**，会有最多 1px 的整体位移）或 [`HINTING`] 改成 `true`（旧的整 ppem + 全
+//! hinting）；回退小数 ppem 则在 `shape.rs` 恢复 `font_size().round()`。三者都是编译期/调用点
+//! 常量，图集按代际自然换代，不需要 migration。
 
 use swash::{
     scale::{Render, ScaleContext, Source},
@@ -130,7 +139,15 @@ impl GlyphVariation {
 /// `1 / SUBPIXEL_PHASES` 像素，余量交给光栅器（`Render::offset`），所以字形内部笔画与
 /// parley 的小数 advance 保持一致。`frac * phase_count` 四舍五入到 `SUBPIXEL_PHASES` 时进位到
 /// 下一个整数档（相位 0），保证桶数恒为 `SUBPIXEL_PHASES` 而不是 `SUBPIXEL_PHASES + 1`。
+///
+/// `x` 必须是**物理**坐标（`run.positioned_glyphs()` 的 `glyph.x`，含 `scale`）；NaN/±inf 没有
+/// 几何意义，返回 `(0.0, 0)` —— 不 panic，也绝不把 NaN 传播进绘制坐标。
 pub(crate) fn split_subpixel_x(x: f32) -> (f32, u8) {
+    if !x.is_finite() {
+        // 防御性回退：旧实现会让 `.floor()`/比较全部吃到 NaN，把 NaN 基准原样返回。布局坐标
+        // 来自 parley（恒有限），这里只保证越界数据不会污染 `PositionedGlyph`。
+        return (0.0, 0);
+    }
     let phase_count = f32::from(SUBPIXEL_PHASES);
     let mut base = x.floor();
     let phase = ((x - base) * phase_count).round();
@@ -171,6 +188,10 @@ impl GlyphRasterizer {
     }
 
     /// 光栅化一个字形。`None` = 空字形（空格/无轮廓）或字体数据坏。
+    ///
+    /// `ppem` 是**小数**物理字号（parley 的 `Run::font_size()`，如 125% DPI 下的 17.5）：
+    /// swash 的 `ScalerBuilder::size` 接受 `f32`，`skrifa::Size` 直接按小数缩放轮廓
+    /// （hinting 关闭时不存在整数 ppem 的假设）。`<= 0` / 非有限值返回 `None`。
     ///
     /// `subpixel_x` 是 `0..SUBPIXEL_PHASES` 的水平相位桶（见 [`split_subpixel_x`]）：轮廓先按
     /// `subpixel_x / SUBPIXEL_PHASES` 像素平移再光栅化，`placement.left` 已包含这段平移
@@ -344,6 +365,32 @@ mod tests {
         );
     }
 
+    /// P3（txt-1 收尾）：非有限落点必须不 panic，并返回有界的 `(0.0, 0)`。
+    ///
+    /// NaN 的所有比较都是 false，旧实现会跳过进位分支、把 `NaN` 基准原样返回给
+    /// `PositionedGlyph.position`（NaN 会污染整条实例数据/裁剪）；`floor()` 的 NaN 也会让
+    /// 相位桶的 `u8` 转换失去意义。
+    #[test]
+    fn split_subpixel_x_is_bounded_for_non_finite_inputs() {
+        for x in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let (base, phase) = split_subpixel_x(x);
+            assert!(base.is_finite(), "{x}: base must stay finite, got {base}");
+            assert!(
+                phase < super::SUBPIXEL_PHASES,
+                "{x}: phase {phase} out of range"
+            );
+            assert_eq!(
+                (base, phase),
+                (0.0, 0),
+                "{x}: non-finite inputs fall back to the bounded integer origin"
+            );
+        }
+        // 极大的有限值仍有有限基准（不 panic、不返回 NaN），保持给上层钳制。
+        let (base, phase) = split_subpixel_x(f32::MAX);
+        assert!(base.is_finite(), "f32::MAX must stay finite: {base}");
+        assert!(phase < super::SUBPIXEL_PHASES);
+    }
+
     /// P2-2：相位必须真的进入光栅。若 `Render::offset` 丢失，同一字形的不同相位会输出同一
     /// 位图，亚像素定位静默失效。
     #[test]
@@ -477,6 +524,64 @@ mod tests {
         );
     }
 
+    /// P3（txt-1 收尾）：ppem 是小数物理字号，光栅不能把它取整。
+    ///
+    /// 125% DPI 下 14 px 逻辑字号 = 17.5 ppem、150% 下 12.5 px = 18.75 ppem。取整实现会把
+    /// 17.5 变成 18（2.9% 尺寸差）—— 位图比 parley 的小数 advance 宽一点，逐字形累积成字距
+    /// 呼吸。回归判据：17.5 与 18.0 的位图必须**不同**（取整后完全相同）。
+    #[test]
+    fn raster_fractional_ppem_is_not_rounded() {
+        let Some(font) = probe_font() else {
+            eprintln!("skip: no system font available");
+            return;
+        };
+        let Some(glyph) = first_glyph(&font, 'A') else {
+            eprintln!("skip: no 'A' glyph");
+            return;
+        };
+        let mut raster = GlyphRasterizer::new();
+        for ppem in [17.5f32, 13.25, 18.75] {
+            let image = raster
+                .rasterize(&font, u32::from(glyph), ppem, 0, &GlyphVariation::default())
+                .unwrap_or_else(|| panic!("{ppem} fractional ppem must rasterize"));
+            assert!(
+                image.placement.width > 0 && image.placement.height > 0,
+                "{ppem} ppem: glyph bitmap must not be empty"
+            );
+            assert_eq!(
+                image.data.len() as u32,
+                image.placement.width * image.placement.height,
+                "{ppem} ppem: R8 stride == width"
+            );
+            assert!(
+                image.data.iter().any(|byte| *byte != 0),
+                "{ppem} ppem: coverage must not be all zero"
+            );
+        }
+
+        let half = raster
+            .rasterize(&font, u32::from(glyph), 17.5, 0, &GlyphVariation::default())
+            .expect("17.5 ppem");
+        let eighteen = raster
+            .rasterize(&font, u32::from(glyph), 18.0, 0, &GlyphVariation::default())
+            .expect("18 ppem");
+        let placement_differs = (
+            half.placement.left,
+            half.placement.top,
+            half.placement.width,
+            half.placement.height,
+        ) != (
+            eighteen.placement.left,
+            eighteen.placement.top,
+            eighteen.placement.width,
+            eighteen.placement.height,
+        );
+        assert!(
+            placement_differs || half.data != eighteen.data,
+            "17.5 ppem must raster as f32, not be rounded to 18 ppem"
+        );
+    }
+
     #[test]
     fn raster_rejects_absurd_inputs() {
         let Some(font) = probe_font() else {
@@ -491,6 +596,14 @@ mod tests {
                 .is_none(),
             "ppem 0 is rejected"
         );
+        for ppem in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(
+                raster
+                    .rasterize(&font, 0, ppem, 0, &GlyphVariation::default())
+                    .is_none(),
+                "non-finite ppem {ppem} is rejected"
+            );
+        }
         let _ = raster.rasterize(
             &font,
             u32::from(u16::MAX),

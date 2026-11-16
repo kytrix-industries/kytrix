@@ -255,11 +255,12 @@ define_class!(
         }
     }
 
-    // 已提交文本的重转换（韩文 Hanja / 日文再変換）需要 `attributedSubstringForProposedRange:`
-    // 返回真实文档文本、`selectedRange` 返回文档坐标；当前 view 只维护组合串（`markedRange`
-    // 从 0 开始），因此 `replacementRange` 按「组合串内 UTF-16 区间」换算
-    // （`platform::ime::replacement_range`）：指向已提交文本的区间无法表达，会 clamp 到组合串边界
-    // （review mac-2 的范围；surrounding text 通路是后续工作）。
+    // `replacementRange` 是**文档坐标**（与 `markedRange` 同一坐标系）；换算成组合串内相对
+    // UTF-16 区间时用 `ImeState::marked_range().0` 作基准（见 `relative_replacement_range`）。
+    // 已提交文本的重转换（韩文 Hanja / 日文再変換）还需要 `attributedSubstringForProposedRange:`
+    // 返回真实文档文本、`selectedRange` / `markedRange` 返回文档坐标：当前 view 只维护组合串，
+    // 因此指向已提交文本的区间无法表达，会被 clamp 到组合串边界（review mac-2 的范围；
+    // surrounding text 通路是后续工作）。
     //
     // SAFETY: `NSTextInputClient` 的每个方法都是 AppKit 在主线程同步调用的；
     // 实现里只碰 `ImeState` 与 view 的事件队列（都没有跨线程访问），签名由 objc2 编译期校验。
@@ -273,10 +274,7 @@ define_class!(
             }
             // `replacementRange` 是 UTF-16 文档区间（`{NSNotFound, 0}` = 替换当前组合串）。
             // 必须在 `clear_marked` 之前换算：clamp 上界是**提交前**的组合串。
-            let replace = {
-                let ime = self.ivars().ime.borrow();
-                replacement_range(range.location, range.length, ime.marked_utf16())
-            };
+            let replace = self.relative_replacement_range(range);
             let first = self.ivars().ime.borrow_mut().note_commit(&value);
             self.ivars().ime.borrow_mut().clear_marked();
             // 只有「真的交付了正文」才抑制本按键的 `Text`；重复回调（`first == false`）时
@@ -301,12 +299,9 @@ define_class!(
         unsafe fn set_marked_text(&self, text: &AnyObject, selected: NSRange, replacement: NSRange) {
             let value = object_text(text);
             let utf16: Vec<u16> = value.encode_utf16().collect();
-            // 只替换当前组合串的一部分（逐子句更新 / 重转换）时，`replacementRange` 给出的是
-            // 组合串内 UTF-16 区间；`{NSNotFound, 0}` 由纯函数换算成 `None`（替换整个组合串）。
-            let replace = {
-                let ime = self.ivars().ime.borrow();
-                replacement_range(replacement.location, replacement.length, ime.marked_utf16())
-            };
+            // 只替换当前组合串的一部分（逐子句更新 / 重转换）时，`replacementRange` 是
+            // 文档坐标；`{NSNotFound, 0}` 由纯函数换算成 `None`（替换整个组合串）。
+            let replace = self.relative_replacement_range(replacement);
             {
                 let mut ime = self.ivars().ime.borrow_mut();
                 ime.set_marked(&utf16, (selected.location, selected.length));
@@ -492,6 +487,37 @@ impl GuiView {
     /// 保存 IME caret 区域（窗口逻辑坐标；`None` = 无 hint，`firstRect` 回退 1×1）。
     pub(crate) fn set_ime_cursor_area(&self, area: Option<Rect>) {
         self.ivars().ime_cursor.set(area);
+    }
+
+    /// `replacementRange`（AppKit **文档坐标**）→ 组合串内相对 UTF-16 区间。
+    ///
+    /// AppKit 的 `replacementRange` 与 `markedRange` 使用同一文档坐标系，因此换算基准是
+    /// `ImeState::marked_range().0` —— 也就是回给 AppKit 的 `markedRange.location`。该值必须
+    /// 与引擎真实文本里组合串的起点一致，否则替换区间会整体偏移。当前 view 把组合串暴露为
+    /// 整个文本存储（没有 surrounding text），起点恒为 0；将来接通
+    /// `attributedSubstringForProposedRange:` 后由 `ImeState` 返回真实起点，本函数与
+    /// `platform::ime::replacement_range` 都不用改。
+    fn relative_replacement_range(&self, range: NSRange) -> Option<std::ops::Range<usize>> {
+        let ime = self.ivars().ime.borrow();
+        let (marked_location, marked_length) = ime.marked_range();
+        // `markedRange` 与 `marked_utf16` 必须描述同一段组合串：前者是 AppKit 看到的范围，
+        // 后者是换算时的 clamp 上界/代理对吸附来源。
+        debug_assert_eq!(
+            marked_length,
+            ime.marked_utf16().len(),
+            "markedRange 必须与 marked_utf16 描述同一段组合串"
+        );
+        debug_assert_eq!(
+            marked_location, 0,
+            "view 目前只把组合串暴露为文本存储，markedRange.location 必须为 0，\
+             且与引擎真实文本里组合串的起点一致；接 surrounding text 后改为真实起点"
+        );
+        replacement_range(
+            range.location,
+            range.length,
+            ime.marked_utf16(),
+            marked_location,
+        )
     }
 
     fn modifiers(&self) -> Modifiers {

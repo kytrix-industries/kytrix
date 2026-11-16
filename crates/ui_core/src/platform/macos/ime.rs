@@ -25,6 +25,13 @@ impl ImeState {
         !self.marked.is_empty()
     }
 
+    /// 当前组合串在 AppKit **文档坐标**下的范围 `(location, length)`（UTF-16 码元）。
+    ///
+    /// `location` 是 `markedRange` 回给 AppKit 的起点，也是 `replacementRange` 换算
+    /// （`platform::ime::replacement_range`）的基准：两者必须处于同一文档坐标系，且该值必须
+    /// 与引擎真实文本里组合串的起点一致。本 view 还没有 surrounding text（文本存储只覆盖
+    /// 组合串），因此起点恒为 0；将来实现 `attributedSubstringForProposedRange:` 时在这里
+    /// 返回真实起点即可，`markedRange` 回包与 `replacementRange` 换算都不用改。
     pub(crate) fn marked_range(&self) -> (usize, usize) {
         (0, self.marked.len())
     }
@@ -63,5 +70,24 @@ impl ImeState {
     /// 记录一次提交；返回 `false` 表示**同一次按键内**的重复回调（调用方应吞掉）。
     pub(crate) fn note_commit(&mut self, text: &str) -> bool {
         self.dedupe.note(text)
+    }
+}
+
+/// `NSNotFound` 哨兵绑定校验（只在 macOS 目标编译：`objc2-foundation` 是 macOS 依赖）。
+///
+/// 引擎的 [`NS_NOT_FOUND`](crate::platform::ime::NS_NOT_FOUND) 必须与 AppKit 绑定的真实值
+/// 完全一致 —— `NSNotFound == NSIntegerMax`（`isize::MAX`）。写错成 `usize::MAX` 会让真实
+/// 输入法的正常路径 `{NSNotFound, 0}` 不匹配、退化成「在组合串尾部插入」（第三轮复审 P1）。
+/// Windows 开发机跑不到本测试，由 `platform/ime.rs` 的单测覆盖常量值本身。
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use crate::platform::ime::NS_NOT_FOUND;
+
+    #[test]
+    fn ns_not_found_matches_the_objc2_foundation_binding() {
+        // 绑定侧：`objc2_foundation` 的 `NSNotFound` 是 `NSIntegerMax`（不是 `NSUInteger::MAX`）。
+        assert_eq!(objc2_foundation::NSNotFound as usize, isize::MAX as usize);
+        // 引擎侧：`replacementRange` 的 `{NSNotFound, 0}` 判断必须用同一个值。
+        assert_eq!(NS_NOT_FOUND, objc2_foundation::NSNotFound as usize);
     }
 }

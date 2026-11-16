@@ -152,6 +152,41 @@ impl ImeState {
         }
     }
 
+    /// 禁用态下收到 `WM_IME_SETCONTEXT` / `WM_INPUTLANGCHANGE` 时，把系统**重新关联**回窗口
+    /// 的输入上下文再摘一次（幂等；win-1 P3）。
+    ///
+    /// IMM32 在焦点 / 输入法切换后可能重新给窗口关联上下文（MSDN：系统默认给每个窗口关联
+    /// 默认输入上下文；`WM_IME_SETCONTEXT` 正是「上下文关联状态变了」的通知）。只摘一次的话，
+    /// 禁用期间窗口又有了上下文 ⇒ 字母键重新被 IME 吃成组合输入、应用收到 `VK_PROCESSKEY`
+    /// 而不是字符。
+    ///
+    /// 返回值合并规则（`saved_context` 是「窗口销毁前要还给系统」的那个上下文）：
+    /// - 还没有保存值（禁用时窗口本来没有上下文）：把这次摘下来的上下文记成待恢复值；
+    /// - 已经有保存值：**不覆盖**。系统这次重新关联出来的上下文只被摘下、不再关联 ——
+    ///   IMM32 的默认输入上下文是线程级的，本层不 `ImmDestroyContext` 它（擅自销毁会让后续
+    ///   IME 输入失效），由输入法/线程生命周期回收。
+    ///
+    /// 没有关联上下文（`ImmGetContext` 返回 NULL）时是 no-op：这是最常见的情况，因为摘除后
+    /// 本来就该没有上下文。
+    pub(crate) fn reassert_disabled(&mut self, hwnd: HWND) {
+        if self.enabled {
+            return;
+        }
+        // SAFETY: `hwnd` 由调用方保证是存活窗口；`ImmGetContext` 的返回值成对
+        // `ImmReleaseContext`，`ImmAssociateContext` 只改「窗口 ↔ 输入上下文」的关联。
+        unsafe {
+            let associated: HIMC = ImmGetContext(hwnd);
+            if associated.is_invalid() {
+                return;
+            }
+            let _ = ImmReleaseContext(hwnd, associated);
+            let previous = ImmAssociateContext(hwnd, HIMC::default());
+            if self.saved_context.is_none() && !previous.is_invalid() {
+                self.saved_context = Some(previous);
+            }
+        }
+    }
+
     /// 窗口销毁**之前**把摘下来的上下文还回去，让系统随窗口释放它（避免 `HIMC` 泄漏）。
     ///
     /// 必须在 `DestroyWindow` 之前、HWND 仍有效时调用。没有保存过上下文则无事可做：
@@ -390,6 +425,55 @@ mod tests {
                 eprintln!("skip: ImmGetCandidateWindow returned false");
             }
             let _ = ImmReleaseContext(hwnd, himc);
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+
+    /// win-1 P3（任务 2）：窗口销毁前的恢复通路必须真的把摘下的上下文还回去。
+    ///
+    /// 覆盖缺口：删掉 `NativeWindow::destroy` 里的 `release_ime_before_destroy` 时，既有用例
+    /// 全绿也抓不到。本用例直接驱动保存/恢复状态机；`platform/windows/window.rs` 的接线用例
+    /// 覆盖 `NativeWindow::sync_ime_enabled` 与 `NativeWindow::destroy` 这两个调用点
+    ///（泵每轮调用它们的**节奏**不在单测范围内，需要真实泵 + 渲染器）。
+    #[test]
+    fn release_before_destroy_restores_the_saved_ime_context() {
+        let (hwnd, _class) = hidden_window("KytrixP16ImeRelease");
+        let mut state = ImeState::default();
+        // SAFETY: 窗口由本用例创建且存活；`ImmGetContext` 的句柄成对释放，窗口最后销毁。
+        unsafe {
+            let baseline = ImmGetContext(hwnd);
+            if baseline.is_invalid() {
+                eprintln!("skip: hidden window has no IME context");
+                let _ = DestroyWindow(hwnd);
+                return;
+            }
+            let _ = ImmReleaseContext(hwnd, baseline);
+
+            state.set_enabled(hwnd, false);
+            assert!(
+                ImmGetContext(hwnd).is_invalid(),
+                "禁用后窗口不得再关联输入上下文"
+            );
+
+            state.release_before_destroy(hwnd);
+            let restored = ImmGetContext(hwnd);
+            assert!(
+                !restored.is_invalid(),
+                "销毁前必须把保存的上下文还回窗口，否则 HIMC 泄漏"
+            );
+            assert_eq!(restored, baseline, "恢复的必须是被摘下的那个上下文");
+            // 恢复后 `enabled` 必须回到 true：窗口销毁阶段不再有禁用态。
+            assert!(state.enabled());
+            let _ = ImmReleaseContext(hwnd, restored);
+
+            // 启用态下「幂等再摘除」不得动上下文（只应在禁用态触发）。
+            state.reassert_disabled(hwnd);
+            let still_attached = ImmGetContext(hwnd);
+            assert!(
+                !still_attached.is_invalid(),
+                "启用态收到 IME 通知不得摘除上下文"
+            );
+            let _ = ImmReleaseContext(hwnd, still_attached);
             let _ = DestroyWindow(hwnd);
         }
     }

@@ -506,3 +506,98 @@ fn window_error(stage: &'static str, error: windows::core::Error) -> EngineError
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use windows::Win32::UI::Input::Ime::{ImmGetContext, ImmReleaseContext};
+
+    use super::NativeWindow;
+    use crate::{
+        app::App,
+        math::{Rect, Scale},
+        platform::dispatcher::Dispatcher,
+        window::WindowOptions,
+    };
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+
+    /// win-1 P3（任务 2）：`NativeWindow::sync_ime_enabled` 必须把 `App` 的目标状态应用到
+    /// IMM32；`NativeWindow::destroy` 必须在 `DestroyWindow` 之前把摘下的上下文还回去。
+    ///
+    /// 这条用例覆盖的是 `NativeWindow` 的**调用点**：删掉 `sync_ime_enabled` 里的目标状态
+    /// 比较 / `ime_area` 清理，或删掉 `destroy` 里的 `release_ime_before_destroy` 时，
+    /// `ImeState` 自己的状态机测试仍会全绿，这里会失败。泵**每轮调用**它们的节奏不在单测
+    /// 范围内（需要真实泵 + 渲染器），属于真机验证项。
+    #[test]
+    fn sync_ime_enabled_applies_the_app_target_state_and_destroy_restores_the_context() {
+        let runtime = runtime();
+        let mut app = App::new(runtime.handle().clone());
+        let options = WindowOptions::default();
+        let id = app.create_window(options.clone());
+        let mut native =
+            NativeWindow::create(id, &options, Dispatcher::new()).expect("NativeWindow::create");
+
+        // SAFETY: 窗口由本用例持有且存活；上下文句柄成对释放。
+        let baseline = unsafe { ImmGetContext(native.hwnd) };
+        if !baseline.is_invalid() {
+            // SAFETY: 同上。
+            unsafe {
+                let _ = ImmReleaseContext(native.hwnd, baseline);
+            }
+        }
+
+        // 目标状态与已应用状态相同：`sync_ime_enabled` 直接返回，不清 caret 缓存。
+        native.ime_area = Some((Rect::new(0.0, 0.0, 1.0, 18.0), Scale::ONE));
+        native.sync_ime_enabled(&app);
+        assert!(
+            native.ime_area.is_some(),
+            "目标状态未变化时不得清 caret 缓存"
+        );
+
+        // 禁用：`App` 目标状态变化 ⇒ 摘除上下文，并清 caret 缓存（恢复的上下文不保证保留
+        // 之前写的组合/候选窗表单，下一轮必须重发）。
+        app.set_ime_enabled(id, false);
+        native.sync_ime_enabled(&app);
+        assert!(
+            !native.state_mut().ime_enabled(),
+            "禁用态必须应用到平台状态"
+        );
+        assert!(native.ime_area.is_none(), "状态切换必须清 caret 缓存");
+        // SAFETY: 窗口仍存活。
+        assert!(
+            unsafe { ImmGetContext(native.hwnd) }.is_invalid(),
+            "禁用后窗口不得再关联输入上下文"
+        );
+
+        // 重新启用：还回保存的上下文（没有保存值则 `IACE_DEFAULT` 让系统关联默认上下文）。
+        app.set_ime_enabled(id, true);
+        native.sync_ime_enabled(&app);
+        assert!(native.state_mut().ime_enabled(), "启用态必须应用到平台状态");
+        // SAFETY: 同上。
+        let restored = unsafe { ImmGetContext(native.hwnd) };
+        assert!(!restored.is_invalid(), "重新启用必须恢复输入上下文");
+        if !baseline.is_invalid() {
+            assert_eq!(restored, baseline, "恢复的必须是被摘下的那个上下文");
+        }
+        // SAFETY: 同上。
+        unsafe {
+            let _ = ImmReleaseContext(native.hwnd, restored);
+        }
+
+        // 销毁前恢复：`destroy` 必须先 `release_ime_before_destroy`（它会把已应用状态置回
+        // 启用）；若这个调用被删掉，状态会停在禁用态。
+        app.set_ime_enabled(id, false);
+        native.sync_ime_enabled(&app);
+        assert!(!native.state_mut().ime_enabled(), "前置：窗口处于禁用态");
+        native.destroy();
+        assert!(
+            native.state_mut().ime_enabled(),
+            "destroy 必须先恢复 IME 关联状态，否则 HIMC 泄漏"
+        );
+    }
+}
