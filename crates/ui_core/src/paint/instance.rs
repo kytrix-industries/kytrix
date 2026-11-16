@@ -240,7 +240,11 @@ fn bounds_of_clip(clip_rect: [f32; 4]) -> PhysicalBounds {
 /// 实例包围盒的整数范围（外扩 1 px 吸收 AA / 抗锯齿边缘）。
 fn instance_extent(primitive: &GpuPrimitive) -> Option<[i32; 4]> {
     let [x, y, w, h] = primitive.bounds;
-    extent_of(x, y, w, h)
+    // 顶点外扩量必须与 shader 用的一致：params0.w 是 a_padding（Quad 1.0、
+    // Shadow lur + 1、图集 0）。只按 1 px 外扩会让**阴影的模糊环**落在包围盒外，
+    // 于是 damage 裁剪可能把阴影整个丢掉（可见缺陷）。
+    let pad = primitive.params0[3];
+    extent_of(x, y, w, h, pad)
 }
 
 /// clip AABB 的整数范围（`clip_rect` 是 `[x0, y0, x1, y1]`）。
@@ -259,16 +263,17 @@ fn clip_extent(primitive: &GpuPrimitive) -> Option<[i32; 4]> {
 }
 
 /// `(x, y, w, h)` 浮点矩形 → 外扩 1 px 的整数范围；非有限或退化时返回 `None`。
-fn extent_of(x: f32, y: f32, w: f32, h: f32) -> Option<[i32; 4]> {
-    if ![x, y, w, h].iter().all(|value| value.is_finite()) {
+fn extent_of(x: f32, y: f32, w: f32, h: f32, pad: f32) -> Option<[i32; 4]> {
+    if ![x, y, w, h, pad].iter().all(|value| value.is_finite()) {
         return None;
     }
-    // 外扩 1 px：SDF 图元的 AA 会溢出 bounds 半个像素，阴影会溢出 blur。
+    // shader 的顶点外扩 = params0.w（见 contract §5），再加 1 px 吸收取整误差。
+    let pad = pad.max(0.0).ceil() as i32 + 1;
     Some([
-        (x.floor() as i32).saturating_sub(1),
-        (y.floor() as i32).saturating_sub(1),
-        ((x + w).ceil() as i32).saturating_add(1),
-        ((y + h).ceil() as i32).saturating_add(1),
+        (x.floor() as i32).saturating_sub(pad),
+        (y.floor() as i32).saturating_sub(pad),
+        ((x + w).ceil() as i32).saturating_add(pad),
+        ((y + h).ceil() as i32).saturating_add(pad),
     ])
 }
 
@@ -1159,6 +1164,36 @@ mod tests {
         assert_eq!(instance.params0[3], 9.0);
         assert_eq!(instance.params1[2], KIND_SHADOW);
         assert_eq!(instance.params1[3], 0.0);
+    }
+
+    /// P2-3.2 回归：damage 裁剪用的 op 包围盒必须覆盖 shader 的**顶点外扩**。
+    ///
+    /// 阴影的顶点外扩是 `blur + 1`（`params0.w`），而旧实现只按 1 px 外扩 —— 模糊环落在
+    /// 包围盒外时，damage 裁剪会把整条阴影丢掉（可见缺陷，不是性能问题）。
+    #[test]
+    fn op_bounds_cover_the_shader_vertex_padding() {
+        let scene = scene_with(|scene, lane| {
+            assert!(scene.push(
+                lane,
+                Primitive::Shadow(Shadow {
+                    rect: rect(10.0, 10.0, 20.0, 20.0),
+                    offset: Point::new(0.0, 0.0),
+                    blur: 8.0,
+                    color: Color::BLACK,
+                }),
+            ));
+        });
+        let buffer = encode(&scene);
+        let crate::paint::instance::FrameOp::Instances { bounds, .. } = buffer.ops[0] else {
+            panic!("阴影应产生一个 Instances op");
+        };
+        // 场景 scale 是 2×：rect 在物理空间是 20..60，blur 8→16，pad = blur+1 = 17，
+        // 再加 1 px 取整余量 = 18 → 2..78。旧实现只外扩 1 px 会得到 19..61（模糊环被切掉）。
+        assert_eq!(
+            (bounds.x0, bounds.y0, bounds.x1, bounds.y1),
+            (2, 2, 78, 78),
+            "op 包围盒必须覆盖阴影的模糊环（blur + 1 的顶点外扩）"
+        );
     }
 
     #[test]
