@@ -12,7 +12,7 @@ use ash::vk;
 
 use crate::{
     error::EngineError,
-    paint::geometry::{GeometryDesc, GeometryId, GeometryPipeline, IndexType, Topology},
+    paint::geometry::{GeometryDesc, GeometryId, GeometryPipeline, IndexType},
     render::linux::device::{Device, GpuObject, init_error},
 };
 
@@ -21,7 +21,7 @@ pub(crate) struct GeometryEntry {
     vertex: vk::Buffer,
     index: vk::Buffer,
     index_count: u32,
-    topology: vk::PrimitiveTopology,
+    /// 图元类型（Vulkan 把它烘进管线状态，绘制时不需要单独绑定，因此只作登记用）。
     pipeline: GeometryPipeline,
     /// 索引格式（`cmd_bind_index_buffer` 需要）。
     index_type: vk::IndexType,
@@ -44,10 +44,6 @@ impl GeometryEntry {
         self.index_count
     }
 
-    pub(crate) fn topology(&self) -> vk::PrimitiveTopology {
-        self.topology
-    }
-
     pub(crate) fn pipeline(&self) -> GeometryPipeline {
         self.pipeline
     }
@@ -55,11 +51,6 @@ impl GeometryEntry {
     /// 索引格式。
     pub(crate) fn index_type(&self) -> vk::IndexType {
         self.index_type
-    }
-
-    /// 卸载时交还的设备对象。
-    pub(crate) fn storage(&self) -> Vec<GpuObject> {
-        self.storage.clone()
     }
 }
 
@@ -124,10 +115,6 @@ fn upload_geometry(
         vertex: vertex.0,
         index: index.0,
         index_count: (desc.index_bytes.len() as u32) / desc.index_type.size(),
-        topology: match desc.topology {
-            Topology::TriangleList => vk::PrimitiveTopology::TRIANGLE_LIST,
-            Topology::TriangleStrip => vk::PrimitiveTopology::TRIANGLE_STRIP,
-        },
         pipeline: desc.pipeline,
         index_type: index_type(desc.index_type),
         generation: id.generation(),

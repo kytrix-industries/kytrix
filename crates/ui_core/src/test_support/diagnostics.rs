@@ -197,7 +197,7 @@ fn instance_dump(instance: &GpuPrimitive) -> InstanceDump {
 
 fn op_dump(op: &FrameOp) -> OpDump {
     match op {
-        FrameOp::Instances { start, len } => OpDump {
+        FrameOp::Instances { start, len, .. } => OpDump {
             instances: Some((*start, *len)),
             geometry: None,
             clip_index: 0,

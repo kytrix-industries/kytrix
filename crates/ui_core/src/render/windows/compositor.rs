@@ -1517,9 +1517,17 @@ fn draw_ops(
     scissor: RECT,
 ) -> Result<u32, EngineError> {
     let mut draw_calls = 0u32;
+    // 局部刷新时跳过与 damage 不相交的 op（P1-2.1）：旧实现对每个 damage 矩形重放**整份**
+    // op 列表，实测使增量帧比全量帧更慢（288 µs vs 222 µs）。
+    let scissor_extent = [scissor.left, scissor.top, scissor.right, scissor.bottom];
+    let mut skipped = 0u32;
     for op in ops {
+        if !op.bounds().intersects(scissor_extent) {
+            skipped = skipped.saturating_add(1);
+            continue;
+        }
         match *op {
-            FrameOp::Instances { start, len } => {
+            FrameOp::Instances { start, len, .. } => {
                 if len == 0 {
                     continue;
                 }
@@ -1547,6 +1555,7 @@ fn draw_ops(
                 index,
                 clip_index,
                 clip_rect,
+                ..
             } => {
                 let draw = payload.geometry().get(index as usize).ok_or_else(|| {
                     EngineError::GeometryRegister {
@@ -2143,7 +2152,11 @@ mod tests {
         assert_eq!(buffer.ops().len(), 1);
         assert!(matches!(
             buffer.ops()[0],
-            FrameOp::Instances { start: 0, len: 1 }
+            FrameOp::Instances {
+                start: 0,
+                len: 1,
+                ..
+            }
         ));
     }
 
@@ -2246,7 +2259,87 @@ mod tests {
             .expect("partial frame");
         assert_eq!(
             stats.draw_calls, 2,
-            "each damage scissor repeats the draw op list"
+            "op 覆盖整个窗口 ⇒ 两个 damage 都与它相交，各画一次（裁剪不适用）"
+        );
+    }
+
+    /// P1-2.1 回归：与 damage 不相交的 op 必须被跳过。
+    ///
+    /// 旧实现对每个 damage 矩形重放**整份** op 列表 —— 这正是实测中
+    /// `frame_incremental_512`（288 µs）比 `frame_full_512`（222 µs）更慢的原因。
+    ///
+    /// op 的边界是 **run**（连续实例段），不是单个图元：同 clip 链的相邻图元会合并进同一 op。
+    /// 这里用一个真实的几何绘制打断 run，让左右两个 quad 落在两个独立的 `Instances` op 里，
+    /// 才能观察到裁剪（否则两个 quad 共用一个 op，其并集包围盒覆盖整个窗口，无从裁起）。
+    #[test]
+    fn ops_outside_the_damage_are_skipped() {
+        let _guard = lock();
+        let Some(mut renderer) = warp_renderer((64, 64)) else {
+            return;
+        };
+        let id = GeometryId::for_test(0, 0);
+        #[rustfmt::skip]
+        let vertices: [f32; 6] = [0.0, 0.0, 8.0, 0.0, 0.0, 8.0];
+        let indices: [u16; 3] = [0, 1, 2];
+        let vertex_bytes: Vec<u8> = vertices.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        renderer
+            .register_geometry(
+                id,
+                &vertex_bytes,
+                &index_bytes,
+                GeometryPipeline::Ui,
+                Topology::TriangleList,
+                IndexType::U16,
+            )
+            .expect("register");
+
+        let mut scene = Scene::empty();
+        let lane = scene.new_lane();
+        assert!(scene.push(
+            lane,
+            quad(
+                Rect::new(0.0, 0.0, 32.0, 64.0),
+                Color::srgb(1.0, 0.0, 0.0, 1.0),
+            )
+        ));
+        // 几何 op 会 flush 当前实例段 ⇒ 后面那个 quad 落进独立的 op。
+        assert!(scene.push(
+            lane,
+            Primitive::Geometry(GeometryDraw {
+                id,
+                transform: Transform::IDENTITY,
+                color: Color::WHITE,
+            })
+        ));
+        assert!(scene.push(
+            lane,
+            quad(
+                // 与左 quad 留出 8 px 间隙：op 包围盒会外扩 1 px 吸收 AA，
+                // 贴边的两个矩形仍会被判为相交（保守正确）。
+                Rect::new(40.0, 0.0, 24.0, 64.0),
+                Color::srgb(0.0, 0.0, 1.0, 1.0),
+            )
+        ));
+        scene.set_order(&[lane]);
+        let mut encoder = InstanceEncoder::new();
+        let buffer = encoder.encode(&scene, Scale::ONE, &resolver());
+        let mut timings = FrameTimings::new();
+
+        let mut first = full_plan((64, 64));
+        let stats = renderer
+            .submit_buffer(FrameIndex::from_raw(1), buffer, &mut first, &mut timings)
+            .expect("full frame");
+        assert_eq!(stats.draw_calls, 3, "两个实例 op + 一个几何 op");
+
+        // 只 damage 左半边 ⇒ 右边那个实例 op 与 damage 不相交，必须跳过。
+        let mut second = partial_plan(&[PhysicalRect::new(0, 0, 32, 64)], (64, 64));
+        let stats = renderer
+            .submit_buffer(FrameIndex::from_raw(2), buffer, &mut second, &mut timings)
+            .expect("partial frame");
+        assert_eq!(
+            stats.draw_calls, 2,
+            "只有与 damage 相交的 op 才产生 draw call（旧的『整份重放』实现会是 3）"
         );
     }
 

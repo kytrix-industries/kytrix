@@ -55,11 +55,6 @@ impl GeometryEntry {
     pub(crate) fn index_type(&self) -> IndexType {
         self.index_type
     }
-
-    /// 卸载时交还的句柄。
-    pub(crate) fn storage(&self) -> [GpuResourceHandle; 2] {
-        self.storage
-    }
 }
 
 /// `GeometryId → GPU 缓冲`（按需创建；代际不匹配即重建）。
@@ -120,7 +115,7 @@ fn upload_geometry(
     let vertex_handle = device.allocate(GpuObject::Buffer(vertex.clone()));
     let index_handle = device.allocate(GpuObject::Buffer(index.clone()));
     Ok(GeometryEntry {
-        vertex: vertex,
+        vertex,
         index,
         index_count: (desc.index_bytes.len() as u32) / desc.index_type.size(),
         topology: desc.topology,

@@ -136,7 +136,12 @@ impl ClipChain {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FrameOp {
     /// `instances[start .. start + len]` 连续；段内 `clip_index` 可不同。
-    Instances { start: u32, len: u32 },
+    Instances {
+        start: u32,
+        len: u32,
+        /// 本段全部实例的可见范围（物理像素 `[x0, y0, x1, y1]`，已与各自的 clip 求交并外扩）。
+        bounds: PhysicalBounds,
+    },
     /// 一次几何绘制（`Primitive::Path` / `Primitive::Geometry`）。
     Geometry {
         /// `geometry` 表的下标。
@@ -145,7 +150,126 @@ pub(crate) enum FrameOp {
         clip_index: u32,
         /// 链交集 AABB（物理浮点）。
         clip_rect: [u32; 4],
+        /// 该几何的可见范围（同 `Instances::bounds`）。
+        bounds: PhysicalBounds,
     },
+}
+
+impl FrameOp {
+    /// 本 op 的可见范围（局部刷新时据此跳过与 damage 不相交的 op）。
+    pub(crate) fn bounds(self) -> PhysicalBounds {
+        match self {
+            Self::Instances { bounds, .. } | Self::Geometry { bounds, .. } => bounds,
+        }
+    }
+}
+
+/// op 的可见范围（物理像素整数 AABB）。
+///
+/// 用整数而不是浮点：与 damage 的比较是纯整数区间相交，且避开 `-0.0 == 0.0` 之类的陷阱。
+/// 空范围用**反向**区间（`x0 > x1`）表示 —— 它与任何 damage 都不相交，因此天然被跳过。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PhysicalBounds {
+    pub x0: i32,
+    pub y0: i32,
+    pub x1: i32,
+    pub y1: i32,
+}
+
+impl PhysicalBounds {
+    /// 反向区间 = 空（不与任何矩形相交）。
+    pub(crate) const EMPTY: Self = Self {
+        x0: i32::MAX,
+        y0: i32::MAX,
+        x1: i32::MIN,
+        y1: i32::MIN,
+    };
+
+    /// 是否与 `[x0, y0, x1, y1]`（半开区间语义上按闭区间处理）相交。
+    ///
+    /// 判定用严格的 `<`：边界贴合（`a.x1 == b.x0`）算作**相交**，宁可多画一次也不漏画 ——
+    /// 漏画会让局部刷新留下旧像素，这是可见的错误；多画只是浪费。
+    pub(crate) fn intersects(self, other: [i32; 4]) -> bool {
+        self.x0 <= other[2] && other[0] <= self.x1 && self.y0 <= other[3] && other[1] <= self.y1
+    }
+
+    /// 并入一个实例的可见范围。
+    fn union_instance(&mut self, primitive: &GpuPrimitive) {
+        let (Some(extent), Some(clip)) = (instance_extent(primitive), clip_extent(primitive))
+        else {
+            return;
+        };
+        // 实例与它自己的 clip 求交；空交集不参与并集（它对像素没有贡献）。
+        let x0 = extent[0].max(clip[0]);
+        let y0 = extent[1].max(clip[1]);
+        let x1 = extent[2].min(clip[2]);
+        let y1 = extent[3].min(clip[3]);
+        if x0 > x1 || y0 > y1 {
+            return;
+        }
+        self.x0 = self.x0.min(x0);
+        self.y0 = self.y0.min(y0);
+        self.x1 = self.x1.max(x1);
+        self.y1 = self.y1.max(y1);
+    }
+}
+
+/// 一段连续实例的可见范围（并集；空段返回 [`PhysicalBounds::EMPTY`]）。
+fn run_bounds(instances: &[GpuPrimitive]) -> PhysicalBounds {
+    let mut bounds = PhysicalBounds::EMPTY;
+    for primitive in instances {
+        bounds.union_instance(primitive);
+    }
+    bounds
+}
+
+/// clip AABB（物理浮点 `[x0, y0, x1, y1]`）→ 整数可见范围；非有限时退化成 [`PhysicalBounds::EMPTY`]
+/// （宁可少画不可错画 —— 非有限 clip 本身就是异常，`self_check` 已单独断言它有限）。
+fn bounds_of_clip(clip_rect: [f32; 4]) -> PhysicalBounds {
+    if !clip_rect.iter().all(|value| value.is_finite()) {
+        return PhysicalBounds::EMPTY;
+    }
+    PhysicalBounds {
+        x0: (clip_rect[0].floor() as i32).saturating_sub(1),
+        y0: (clip_rect[1].floor() as i32).saturating_sub(1),
+        x1: (clip_rect[2].ceil() as i32).saturating_add(1),
+        y1: (clip_rect[3].ceil() as i32).saturating_add(1),
+    }
+}
+
+/// 实例包围盒的整数范围（外扩 1 px 吸收 AA / 抗锯齿边缘）。
+fn instance_extent(primitive: &GpuPrimitive) -> Option<[i32; 4]> {
+    let [x, y, w, h] = primitive.bounds;
+    extent_of(x, y, w, h)
+}
+
+/// clip AABB 的整数范围（`clip_rect` 是 `[x0, y0, x1, y1]`）。
+fn clip_extent(primitive: &GpuPrimitive) -> Option<[i32; 4]> {
+    let [x0, y0, x1, y1] = primitive.clip_rect;
+    let finite = [x0, y0, x1, y1].iter().all(|value| value.is_finite());
+    if !finite {
+        return None;
+    }
+    Some([
+        x0.floor() as i32,
+        y0.floor() as i32,
+        x1.ceil() as i32,
+        y1.ceil() as i32,
+    ])
+}
+
+/// `(x, y, w, h)` 浮点矩形 → 外扩 1 px 的整数范围；非有限或退化时返回 `None`。
+fn extent_of(x: f32, y: f32, w: f32, h: f32) -> Option<[i32; 4]> {
+    if ![x, y, w, h].iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    // 外扩 1 px：SDF 图元的 AA 会溢出 bounds 半个像素，阴影会溢出 blur。
+    Some([
+        (x.floor() as i32).saturating_sub(1),
+        (y.floor() as i32).saturating_sub(1),
+        ((x + w).ceil() as i32).saturating_add(1),
+        ((y + h).ceil() as i32).saturating_add(1),
+    ])
 }
 
 /// 一帧的编码产物（容量跨帧保留）。
@@ -232,6 +356,8 @@ pub(crate) struct InstanceEncoder {
     store: std::sync::Arc<crate::paint::geometry_store::GeometryStore>,
     stack: SmallVec<[ClipChainId; 8]>,
     chains: ahash::HashMap<(u32, [u32; 4], [u32; 4]), ClipChainId>,
+    /// 颜色解析缓存（跨帧保留，每帧 clear）。
+    colors: crate::paint::color::ResolveCache,
     run_start: usize,
 }
 
@@ -243,6 +369,7 @@ impl InstanceEncoder {
             store: std::sync::Arc::new(crate::paint::geometry_store::GeometryStore::new()),
             stack: SmallVec::new(),
             chains: ahash::HashMap::default(),
+            colors: crate::paint::color::ResolveCache::new(),
             run_start: 0,
         };
         encoder.buffer.clips.push(ClipChain {
@@ -271,14 +398,26 @@ impl InstanceEncoder {
         self.chains.clear();
         self.stack.clear();
         self.run_start = 0;
+        self.colors.clear();
+        // 先解构出各字段的独立可变借用：FrameEncoder 同时需要 uffer 与 colors，
+        // 直接写 &mut self.buffer / &mut self.colors 会与后面的 self.flush_run() 冲突。
+        let Self {
+            buffer,
+            stack,
+            chains,
+            colors,
+            run_start,
+            store,
+        } = self;
         let mut frame = FrameEncoder {
-            buffer: &mut self.buffer,
-            stack: &mut self.stack,
-            chains: &mut self.chains,
+            buffer,
+            stack,
+            chains,
             scale,
             resolver,
-            store: &self.store,
-            run_start: &mut self.run_start,
+            colors,
+            store,
+            run_start,
         };
         frame.encode_scene(scene);
         self.flush_run();
@@ -289,9 +428,11 @@ impl InstanceEncoder {
     fn flush_run(&mut self) {
         let len = self.buffer.instances.len() - self.run_start;
         if len > 0 {
+            let bounds = run_bounds(&self.buffer.instances[self.run_start..]);
             self.buffer.ops.push(FrameOp::Instances {
                 start: self.run_start as u32,
                 len: len as u32,
+                bounds,
             });
             self.run_start = self.buffer.instances.len();
         }
@@ -307,7 +448,7 @@ impl InstanceEncoder {
         let mut covered = 0usize;
         for op in &self.buffer.ops {
             match *op {
-                FrameOp::Instances { start, len } => {
+                FrameOp::Instances { start, len, .. } => {
                     covered += len as usize;
                     debug_assert!(
                         (start as usize) + (len as usize) <= self.buffer.instances.len(),
@@ -318,6 +459,7 @@ impl InstanceEncoder {
                     index,
                     clip_index,
                     clip_rect,
+                    ..
                 } => {
                     debug_assert!(
                         (index as usize) < self.buffer.geometry.len(),
@@ -367,6 +509,8 @@ struct FrameEncoder<'a> {
     chains: &'a mut ahash::HashMap<(u32, [u32; 4], [u32; 4]), ClipChainId>,
     scale: Scale,
     resolver: &'a ColorResolver,
+    /// 颜色解析缓存（P1-2.1）：一帧内同色高度重复，宽色域解析要跑 24 步二分。
+    colors: &'a mut crate::paint::color::ResolveCache,
     /// 静态几何的注册表（`GeometryId` → 顶点/索引字节）。
     store: &'a crate::paint::geometry_store::GeometryStore,
     run_start: &'a mut usize,
@@ -425,32 +569,43 @@ impl FrameEncoder<'_> {
             }
             Primitive::Path(path) => {
                 self.flush_run();
+                // 先把颜色与描述算出来，push_geometry 会再次可变借用 self。
+                let color = self.colors.resolve(self.resolver, path.fill).to_array();
+                let desc = self.geometry_desc(path.geometry);
                 let index = self.push_geometry(GeometryDrawGpu {
                     id: path.geometry,
                     transform: Transform::IDENTITY,
-                    color: self.resolver.resolve(path.fill).to_array(),
-                    desc: self.geometry_desc(path.geometry),
+                    color,
+                    desc,
                 });
                 let (clip_index, clip_rect) = self.geometry_clip();
                 self.buffer.ops.push(FrameOp::Geometry {
                     index,
                     clip_index,
                     clip_rect: clip_rect.map(f32::to_bits),
+                    // 几何的可见范围就是它的 clip AABB（顶点在 shader 里变换，
+                    // CPU 侧不知道精确包围盒 —— 用 clip 是保守的上界，不会漏画）。
+                    bounds: bounds_of_clip(clip_rect),
                 });
             }
             Primitive::Geometry(draw) => {
                 self.flush_run();
+                let color = self.colors.resolve(self.resolver, draw.color).to_array();
+                let desc = self.geometry_desc(draw.id);
                 let index = self.push_geometry(GeometryDrawGpu {
                     id: draw.id,
                     transform: draw.transform,
-                    color: self.resolver.resolve(draw.color).to_array(),
-                    desc: self.geometry_desc(draw.id),
+                    color,
+                    desc,
                 });
                 let (clip_index, clip_rect) = self.geometry_clip();
                 self.buffer.ops.push(FrameOp::Geometry {
                     index,
                     clip_index,
                     clip_rect: clip_rect.map(f32::to_bits),
+                    // 几何的可见范围就是它的 clip AABB（顶点在 shader 里变换，
+                    // CPU 侧不知道精确包围盒 —— 用 clip 是保守的上界，不会漏画）。
+                    bounds: bounds_of_clip(clip_rect),
                 });
             }
             Primitive::Canvas(canvas) => {
@@ -500,9 +655,11 @@ impl FrameEncoder<'_> {
     fn flush_run(&mut self) {
         let len = self.buffer.instances.len() - *self.run_start;
         if len > 0 {
+            let bounds = run_bounds(&self.buffer.instances[*self.run_start..]);
             self.buffer.ops.push(FrameOp::Instances {
                 start: *self.run_start as u32,
                 len: len as u32,
+                bounds,
             });
             *self.run_start = self.buffer.instances.len();
         }
@@ -587,17 +744,17 @@ impl FrameEncoder<'_> {
             QuadPaint::Solid { fill, border } => {
                 let width = border.map_or(0.0, |border| border.width * factor);
                 (
-                    self.resolver.resolve(*fill),
+                    self.colors.resolve(self.resolver, *fill),
                     border.map_or(LinearPremulRgba::TRANSPARENT, |border| {
-                        self.resolver.resolve(border.color)
+                        self.colors.resolve(self.resolver, border.color)
                     }),
                     width.clamp(0.0, half_min),
                     GRADIENT_NONE,
                 )
             }
             QuadPaint::Gradient(gradient) => (
-                self.resolver.resolve(gradient.from),
-                self.resolver.resolve(gradient.to),
+                self.colors.resolve(self.resolver, gradient.from),
+                self.colors.resolve(self.resolver, gradient.to),
                 0.0,
                 match gradient.kind {
                     GradientKind::Horizontal => GRADIENT_HORIZONTAL,
@@ -637,7 +794,7 @@ impl FrameEncoder<'_> {
         let instance = GpuPrimitive {
             bounds,
             corner_radius: [0.0; 4],
-            color0: self.resolver.resolve(shadow.color).to_array(),
+            color0: self.colors.resolve(self.resolver, shadow.color).to_array(),
             color1: [0.0; 4],
             params0: [0.0, blur, GRADIENT_NONE, blur + 1.0],
             params1: [self.clip_index(), 0.0, KIND_SHADOW, 0.0],
@@ -649,7 +806,7 @@ impl FrameEncoder<'_> {
 
     fn emit_image(&mut self, image: &crate::paint::primitive::Image) {
         let physical = image.bounds.to_physical(self.scale);
-        let color0 = self.resolver.resolve(image.modulation);
+        let color0 = self.colors.resolve(self.resolver, image.modulation);
         let bounds = physical_to_bounds(physical);
         let instance = GpuPrimitive {
             bounds,
@@ -672,7 +829,7 @@ impl FrameEncoder<'_> {
     fn emit_glyph(&mut self, color: Color, glyph: &crate::paint::primitive::PositionedGlyph) {
         let physical = Rect::from_origin_size(glyph.position, glyph.size).to_physical(self.scale);
         let bounds = physical_to_bounds(physical);
-        let color0 = self.resolver.resolve(color);
+        let color0 = self.colors.resolve(self.resolver, color);
         let instance = GpuPrimitive {
             bounds,
             corner_radius: [0.0; 4],
@@ -1083,7 +1240,11 @@ mod tests {
         assert_eq!(buffer.ops.len(), 3);
         assert!(matches!(
             buffer.ops[0],
-            super::FrameOp::Instances { start: 0, len: 1 }
+            super::FrameOp::Instances {
+                start: 0,
+                len: 1,
+                ..
+            }
         ));
         assert!(matches!(
             buffer.ops[1],
@@ -1091,7 +1252,11 @@ mod tests {
         ));
         assert!(matches!(
             buffer.ops[2],
-            super::FrameOp::Instances { start: 1, len: 1 }
+            super::FrameOp::Instances {
+                start: 1,
+                len: 1,
+                ..
+            }
         ));
     }
 

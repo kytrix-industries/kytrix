@@ -450,6 +450,7 @@ impl GpuRenderer {
                         &encoder,
                         payload,
                         instance_count,
+                        [0, 0, self.surface.0 as i32, self.surface.1 as i32],
                         root,
                         &self.pipeline,
                         &mut self.geometry,
@@ -472,6 +473,7 @@ impl GpuRenderer {
                                 &encoder,
                                 payload,
                                 instance_count,
+                                [rect.x0, rect.y0, rect.x1, rect.y1],
                                 root,
                                 &self.pipeline,
                                 &mut self.geometry,
@@ -735,6 +737,7 @@ fn draw_ops(
     encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     payload: &FramePayload,
     instance_count: u32,
+    scissor: [i32; 4],
     root: RootUniform,
     pipeline: &Pipeline,
     geometry: &mut GeometryRegistry,
@@ -742,9 +745,13 @@ fn draw_ops(
     retired: &mut Vec<GpuResourceHandle>,
 ) -> Result<u32, EngineError> {
     let mut draw_calls = 0u32;
+    // 局部刷新时跳过与 damage 不相交的 op（P1-2.1）：旧实现对每个 damage 矩形重放整份 op 列表。
     for op in payload.ops() {
+        if !op.bounds().intersects(scissor) {
+            continue;
+        }
         match *op {
-            FrameOp::Instances { start, len } => {
+            FrameOp::Instances { start, len, .. } => {
                 if len == 0 {
                     continue;
                 }
@@ -775,6 +782,7 @@ fn draw_ops(
                 index,
                 clip_index,
                 clip_rect,
+                ..
             } => {
                 let draw = payload.geometry().get(index as usize).ok_or_else(|| {
                     EngineError::GeometryRegister {

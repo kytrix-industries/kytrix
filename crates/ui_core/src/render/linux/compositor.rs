@@ -46,7 +46,6 @@ use crate::{
 };
 #[cfg(feature = "test-support")]
 use crate::{
-    paint::geometry::GeometryPipeline,
     paint::instance::InstanceBuffer,
     render::linux::readback::{Readback, ReadbackImage},
 };
@@ -896,6 +895,7 @@ impl GpuRenderer {
                     &mut geometry_retired,
                     payload,
                     root,
+                    [0, 0, extent.width as i32, extent.height as i32],
                 )?;
             }
             false => {
@@ -924,6 +924,7 @@ impl GpuRenderer {
                             &mut geometry_retired,
                             payload,
                             root,
+                            [rect.x0, rect.y0, rect.x1, rect.y1],
                         )?);
                     }
                 }
@@ -1462,11 +1463,16 @@ fn draw_ops(
     retired: &mut Vec<GpuObject>,
     payload: &FramePayload,
     root: RootUniform,
+    scissor: [i32; 4],
 ) -> Result<u32, EngineError> {
     let mut draw_calls = 0u32;
+    // 局部刷新时跳过与 damage 不相交的 op（P1-2.1）：旧实现对每个 damage 矩形重放整份 op 列表。
     for op in payload.ops() {
+        if !op.bounds().intersects(scissor) {
+            continue;
+        }
         match *op {
-            FrameOp::Instances { start, len } => {
+            FrameOp::Instances { start, len, .. } => {
                 if len == 0 {
                     continue;
                 }
@@ -1498,6 +1504,7 @@ fn draw_ops(
                 index,
                 clip_index,
                 clip_rect,
+                ..
             } => {
                 let draw = payload.geometry().get(index as usize).ok_or_else(|| {
                     EngineError::GeometryRegister {

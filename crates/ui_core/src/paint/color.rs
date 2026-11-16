@@ -247,6 +247,80 @@ impl Interpolation {
     }
 }
 
+/// 解析结果缓存（P1-2.1）：一帧内同一个颜色会被几十个图元重复用到（主题色），
+/// 而宽色域颜色的解析要跑 24 步 chroma 二分 —— 实测 256 个**全部不同**的颜色要 55.9 µs。
+///
+/// **按位比较**而不是 `PartialEq`：`Color` 含 `f32`，`PartialEq` 下 `NaN != NaN` 会让缓存
+/// 永不命中，且 `-0.0 == 0.0` 会让两个不同位模式共享条目。按位键让「命中即可用」成立。
+///
+/// 直接映射（64 槽）+ 存**完整键**而不是哈希：无分配、O(1)、零误命中（碰撞只是放弃缓存，
+/// 重算一次，结果仍正确）。典型主题有 10–50 个不同颜色，64 槽足够。
+pub(crate) struct ResolveCache {
+    entries: [Option<(ColorBits, LinearPremulRgba)>; Self::SLOTS],
+}
+
+/// `Color` 的逐位表示（空间标签 + 4 个分量的位模式）。
+type ColorBits = (u8, [u32; 4]);
+
+impl ResolveCache {
+    const SLOTS: usize = 64;
+
+    pub(crate) const fn new() -> Self {
+        Self {
+            entries: [None; Self::SLOTS],
+        }
+    }
+
+    /// 清空（每帧编码开始时调用：主题色可能随帧变化）。
+    pub(crate) fn clear(&mut self) {
+        self.entries = [None; Self::SLOTS];
+    }
+
+    /// 解析（命中直接返回；未命中计算并写入）。
+    pub(crate) fn resolve(&mut self, resolver: &ColorResolver, color: Color) -> LinearPremulRgba {
+        let bits = color_bits(color);
+        // 槽位选择：把 4 个分量的位模式混合成一个下标。分量完全相同 ⇒ 下标相同。
+        let slot = (bits.0 as usize
+            ^ bits.1[0].rotate_left(7) as usize
+            ^ bits.1[1].rotate_left(13) as usize
+            ^ bits.1[2].rotate_left(19) as usize
+            ^ bits.1[3].rotate_left(25) as usize)
+            % Self::SLOTS;
+        if let Some((cached_bits, resolved)) = self.entries[slot]
+            && cached_bits == bits
+        {
+            return resolved;
+        }
+        let resolved = resolver.resolve(color);
+        self.entries[slot] = Some((bits, resolved));
+        resolved
+    }
+}
+
+/// `Color` → 逐位表示（空间标签 + 分量位模式）。
+fn color_bits(color: Color) -> ColorBits {
+    let (space, parts) = color.dynamic_parts();
+    (
+        match space {
+            ColorSpaceTag::Srgb => 0,
+            ColorSpaceTag::LinearSrgb => 1,
+            ColorSpaceTag::DisplayP3 => 2,
+            ColorSpaceTag::Oklab => 3,
+            ColorSpaceTag::Oklch => 4,
+            // `color` crate 的空间是开放的；未知空间退化成「不缓存」（下标恒定 ⇒ 永远不命中
+            // 也不会误命中，因为键里的分量位模式仍然是完整的）。用 255 而不是 0：0 已被
+            // Srgb 占用，混用会让两种不同空间在极端情况下互相命中。
+            _ => u8::MAX,
+        },
+        [
+            parts[0].to_bits(),
+            parts[1].to_bits(),
+            parts[2].to_bits(),
+            parts[3].to_bits(),
+        ],
+    )
+}
+
 /// 主题策略对象：持有插值空间；只做「值 → 值」，不缓存、不持有主题语义（D23）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ColorResolver {
@@ -448,7 +522,7 @@ mod tests {
 
     use super::{
         Color, ColorBrush, ColorResolver, GAMUT_BISECTION_STEPS, HueDirection, Interpolation,
-        LinearPremulRgba, clamp_01, clamp_nonneg, hue_deg,
+        LinearPremulRgba, ResolveCache, clamp_01, clamp_nonneg, hue_deg,
     };
 
     fn resolver() -> ColorResolver {
@@ -865,5 +939,90 @@ mod tests {
         let dynamic = DynamicColor::from_alpha_color(linear);
         let back = dynamic.to_alpha_color::<color::LinearSrgb>();
         assert!((back.components[0] - 0.1).abs() < 1e-6);
+    }
+    /// P1-2.1：缓存必须与直接解析**逐位相同**（否则增量渲染与全量渲染会出不同的像素）。
+    #[test]
+    fn resolve_cache_matches_direct_resolve() {
+        let resolver = resolver();
+        let colors = [
+            Color::TRANSPARENT,
+            Color::BLACK,
+            Color::WHITE,
+            Color::srgb(0.2, 0.4, 0.6, 0.8),
+            Color::linear_srgb(0.1, 0.5, 0.9, 1.0),
+            Color::display_p3(0.3, 0.6, 0.2, 0.5),
+            Color::oklab(0.5, 0.1, -0.1, 1.0),
+            Color::oklch(0.6, 0.3, 30.0, 0.7),
+        ];
+        let mut cache = ResolveCache::new();
+        // 两轮：第一轮全 miss，第二轮全 hit —— 两轮都必须与直接解析逐位相同。
+        for round in 0..2 {
+            for color in colors {
+                let cached = cache.resolve(&resolver, color);
+                let direct = resolver.resolve(color);
+                assert_eq!(
+                    cached.components.map(f32::to_bits),
+                    direct.components.map(f32::to_bits),
+                    "round {round} color {color:?} 的缓存结果必须与直接解析逐位相同"
+                );
+            }
+        }
+    }
+
+    /// 缓存的键是**位模式**：`-0.0` 与 `0.0` 是两个不同的键。
+    ///
+    /// 用 `PartialEq` 做键会让它们共享条目；虽然解析结果恰好相同，但「按位键」是缓存正确性
+    /// 的可依赖契约 —— 它保证「命中 ⇒ 输入的每一位都相同」，未来解析若引入符号相关行为也不会
+    /// 悄悄出错。
+    #[test]
+    fn resolve_cache_keys_on_bits_not_equality() {
+        assert_eq!(
+            Color::srgb(0.0, 0.0, 0.0, 1.0),
+            Color::srgb(-0.0, 0.0, 0.0, 1.0),
+            "PartialEq 认为它们相等（这是 `Color` 的既有语义）"
+        );
+        let (a_space, a) = super::color_bits(Color::srgb(0.0, 0.0, 0.0, 1.0));
+        let (b_space, b) = super::color_bits(Color::srgb(-0.0, 0.0, 0.0, 1.0));
+        assert_eq!(a_space, b_space);
+        assert_ne!(a, b, "位模式必须区分 -0.0 与 0.0");
+    }
+
+    /// 缓存必须在 `clear` 后重新计算（主题切换时颜色会变）。
+    #[test]
+    fn resolve_cache_clear_forces_recompute() {
+        let resolver = resolver();
+        let mut cache = ResolveCache::new();
+        let color = Color::oklch(0.6, 0.3, 30.0, 1.0);
+        let first = cache.resolve(&resolver, color);
+        cache.clear();
+        let second = cache.resolve(&resolver, color);
+        assert_eq!(
+            first.components.map(f32::to_bits),
+            second.components.map(f32::to_bits),
+            "clear 之后重算的结果必须一致"
+        );
+    }
+
+    /// 槽位碰撞不得产生错误结果（碰撞只是放弃缓存）。
+    #[test]
+    fn resolve_cache_survives_slot_collisions() {
+        let resolver = resolver();
+        let mut cache = ResolveCache::new();
+        // 远超槽位数量的不同颜色：必然发生碰撞。
+        for index in 0..ResolveCache::SLOTS * 4 {
+            let color = Color::oklch(
+                0.5,
+                0.05 * (index % 8) as f32,
+                (index * 13 % 360) as f32,
+                1.0,
+            );
+            let cached = cache.resolve(&resolver, color);
+            let direct = resolver.resolve(color);
+            assert_eq!(
+                cached.components.map(f32::to_bits),
+                direct.components.map(f32::to_bits),
+                "碰撞时 index {index} 的结果必须仍然正确"
+            );
+        }
     }
 }

@@ -43,6 +43,40 @@ impl DamageRects {
         &self.rects[..self.len]
     }
 
+    /// 把矩形两两合并到最多 `max_passes` 个（P1-2.1）。
+    ///
+    /// **为什么必须做**：后端对每个 damage 矩形重放**整份** draw op 列表。16 个矩形就是 16 次
+    /// 全量重放 —— 实测使增量帧（288 µs）比全量帧（222 µs）更慢，局部刷新反而更贵。
+    /// 合并后重放次数有上界，代价是被并进来的中间像素多画一遍。
+    ///
+    /// 策略与 Chrome 的区域合并同源：每次合并「并集面积增长最小」的一对（贪心），因此优先
+    /// 合并彼此靠近、形状相近的矩形，尽量少制造空白。合并是安全的：持久纹理里那些像素本来
+    /// 就是上一帧的合法内容，多画一遍同样的图元得到同样的结果；`present`/`copy` 也用同一份
+    /// 矩形，所以屏幕上不会多刷。
+    pub(crate) fn coalesce(&mut self, max_passes: usize) {
+        let max_passes = max_passes.clamp(1, MAX_DAMAGE_RECTS);
+        while self.len > max_passes {
+            // 找「并集面积 − 两者面积之和」最小的一对。
+            let mut best = (0usize, 1usize);
+            let mut best_growth = u64::MAX;
+            for a in 0..self.len {
+                for b in (a + 1)..self.len {
+                    let growth = union_growth(self.rects[a], self.rects[b]);
+                    if growth < best_growth {
+                        best_growth = growth;
+                        best = (a, b);
+                    }
+                }
+            }
+            let (a, b) = best;
+            let union = union_rect(self.rects[a], self.rects[b]);
+            self.rects[a] = union;
+            // 用末尾元素填补被合并掉的槽位（顺序无所谓：damage 矩形之间没有先后语义）。
+            self.rects[b] = self.rects[self.len - 1];
+            self.len -= 1;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.len
@@ -51,6 +85,35 @@ impl DamageRects {
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
     }
+}
+
+/// 局部刷新最多重放多少次 draw op 列表。
+///
+/// 4 是从「重放成本」与「多画的空白」之间取的折中：512 图元的 op 列表一次重放约 4 µs 级别的
+/// 命令录制，4 次仍在预算内；再高就会让增量帧明显慢于全量帧（那正是要修的问题）。
+pub(crate) const MAX_DRAW_PASSES: usize = 4;
+
+/// 两个矩形的并集。
+fn union_rect(a: PhysicalRect, b: PhysicalRect) -> PhysicalRect {
+    PhysicalRect {
+        x0: a.x0.min(b.x0),
+        y0: a.y0.min(b.y0),
+        x1: a.x1.max(b.x1),
+        y1: a.y1.max(b.y1),
+    }
+}
+
+/// 合并两个矩形带来的「多画面积」（并集面积 − 两者面积之和，已去重叠）。
+fn union_growth(a: PhysicalRect, b: PhysicalRect) -> u64 {
+    let union = union_rect(a, b);
+    union_area(union).saturating_sub(union_area(a) + union_area(b))
+}
+
+/// 矩形面积（钳到非负，空矩形为 0）。
+fn union_area(rect: PhysicalRect) -> u64 {
+    let width = (rect.x1 - rect.x0).max(0) as u64;
+    let height = (rect.y1 - rect.y0).max(0) as u64;
+    width.saturating_mul(height)
 }
 
 impl Default for DamageRects {
@@ -183,13 +246,15 @@ pub(crate) fn plan(damage: DamageSummary, merged: &[PhysicalRect], surface: Phys
     if rects.is_empty() {
         Plan::Idle
     } else {
+        // P1-2.1：合并到至多 `MAX_DRAW_PASSES` 个，给「每个矩形重放整份 op 列表」设上界。
+        rects.coalesce(MAX_DRAW_PASSES);
         Plan::Partial(rects)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DamageRects, FramePlan, Plan, plan};
+    use super::{DamageRects, FramePlan, MAX_DRAW_PASSES, Plan, plan, union_growth};
     use crate::{
         math::PhysicalRect,
         render::damage::{DamageSummary, MAX_DAMAGE_RECTS},
@@ -375,5 +440,81 @@ mod tests {
         // 恰好装满不算超限。
         let exactly = partial_plan(&older[..MAX_DAMAGE_RECTS - 1]).merge(partial_plan(&newer));
         assert!(matches!(exactly, Plan::Partial(rects) if rects.len() == MAX_DAMAGE_RECTS));
+    }
+    /// P1-2.1：damage 必须合并到至多 `MAX_DRAW_PASSES` 个（后端按矩形数重放 op 列表）。
+    #[test]
+    fn damage_is_coalesced_to_the_pass_budget() {
+        // 走真实入口 plan()（partial_plan 辅助函数直接构造 Plan::Partial，绕过合并）。
+        let rects: Vec<PhysicalRect> = (0..12)
+            .map(|index| PhysicalRect::new(index * 4, 0, index * 4 + 2, 2))
+            .collect();
+        let coalesced = plan(
+            partial(rects.len()),
+            &rects,
+            PhysicalRect::new(0, 0, 200, 50),
+        );
+        let Plan::Partial(rects) = coalesced else {
+            panic!("expected partial plan, got {coalesced:?}");
+        };
+        assert_eq!(
+            rects.len(),
+            MAX_DRAW_PASSES,
+            "12 个矩形必须被合并到 {MAX_DRAW_PASSES} 个以内"
+        );
+    }
+
+    /// 合并必须**覆盖**原始区域：合并后的矩形并集不得丢掉任何一个原始矩形。
+    #[test]
+    fn coalescing_covers_every_original_rect() {
+        let originals: Vec<PhysicalRect> = (0..10)
+            .map(|index| PhysicalRect::new(index * 7, index * 3, index * 7 + 5, index * 3 + 4))
+            .collect();
+        let coalesced = plan(
+            partial(originals.len()),
+            &originals,
+            PhysicalRect::new(0, 0, 200, 50),
+        );
+        let Plan::Partial(rects) = coalesced else {
+            panic!("expected partial plan");
+        };
+        for original in &originals {
+            let covered = rects.as_slice().iter().any(|merged| {
+                merged.x0 <= original.x0
+                    && merged.y0 <= original.y0
+                    && merged.x1 >= original.x1
+                    && merged.y1 >= original.y1
+            });
+            assert!(
+                covered,
+                "原始矩形 {original:?} 必须被某个合并结果覆盖：{rects:?}"
+            );
+        }
+    }
+
+    /// 少于预算时不得合并（合并会扩大重绘面积）。
+    #[test]
+    fn small_damage_sets_are_left_alone() {
+        let originals = [
+            PhysicalRect::new(0, 0, 4, 4),
+            PhysicalRect::new(50, 50, 54, 54),
+        ];
+        let coalesced = partial_plan(&originals);
+        let Plan::Partial(rects) = coalesced else {
+            panic!("expected partial plan");
+        };
+        assert_eq!(rects.as_slice(), &originals, "两个矩形不应被合并");
+    }
+
+    /// 贪心合并优先选「面积增长最小」的一对。
+    #[test]
+    fn coalescing_prefers_the_tightest_pair() {
+        let near_a = PhysicalRect::new(0, 0, 4, 4);
+        let near_b = PhysicalRect::new(0, 4, 4, 8);
+        let far = PhysicalRect::new(100, 100, 104, 104);
+        assert!(
+            union_growth(near_a, near_b) < union_growth(near_a, far),
+            "相邻矩形的并集增长必须小于远离的矩形"
+        );
+        assert_eq!(union_growth(near_a, near_b), 0, "紧贴的矩形并集不增加面积");
     }
 }
