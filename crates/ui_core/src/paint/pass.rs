@@ -174,8 +174,14 @@ fn paint_node(
     let Ok(target) = context.tree.get(node) else {
         return Ok(());
     };
-    let hidden =
-        parent_hidden || matches!(target.style().inner.display, taffy::style::Display::None);
+    // 不可见的**定义只有一处**：`NodeTree::is_visible_locally`（`display: none` 或
+    // `visible: false`）。命中测试、焦点遍历、a11y 都用它，并且都按「隐藏整棵子树」处理；
+    // 旧实现的 paint 只对 `display: none` 隐藏子树，`visible: false` 仅跳过本节点自身的图元
+    // —— 于是容器的背景消失、子控件仍然画出来，而那些子控件在命中测试里是不可见的
+    // （「看得见但点不动」的死像素，P2-3.2）。
+    let hidden = parent_hidden
+        || matches!(target.style().inner.display, taffy::style::Display::None)
+        || target.style_patch().visible == Some(false);
     if hidden {
         hide_subtree(context, node, clip, offset);
         return Ok(());
@@ -863,13 +869,56 @@ mod tests {
         let _ = h.tree.set_style_patch_for_test(node, patch);
         h.mark_paint(node);
         let _ = h.paint();
+        // 与 `display: none` 同一条 `hide_subtree` 路径：lane 保留分配但被清空，
+        // 因此断言「没有图元」而不是「没有 lane」（后者是旧实现 rebuild_lane 的副作用）。
         assert!(
-            h.tree.lane_of(node).is_none(),
-            "隐藏节点不留 lane（空 lane 只占内存/顺序）"
+            h.tree
+                .lane_of(node)
+                .and_then(|lane| h.scene.lane_primitives(lane))
+                .is_none_or(<[Primitive]>::is_empty),
+            "隐藏节点不得留下任何图元"
         );
+        assert!(h.scene.is_empty(), "隐藏之后场景里不应还有任何内容");
         assert!(!h.damage.finish(frame()).full);
     }
 
+    /// P2-3.2 回归：`visible: false` 隐藏**整棵子树**，与命中测试/焦点遍历/a11y 同一语义。
+    ///
+    /// 旧实现只跳过本节点自身的图元，子控件仍然被画出来 —— 而它们在命中测试里是不可见的，
+    /// 于是出现「看得见但点不动」的死像素。
+    #[test]
+    fn hiding_a_container_hides_its_children() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let container = NodeBuilder::boxed()
+            .style(fixed_style(50.0, 20.0))
+            .paint(with_white())
+            .build(&mut h.tree, root)
+            .expect("挂载容器");
+        let child = NodeBuilder::boxed()
+            .style(fixed_style(10.0, 10.0))
+            .paint(with_white())
+            .build(&mut h.tree, container)
+            .expect("挂载子节点");
+        layout_all(&mut h.tree);
+        let _ = h.paint();
+        assert!(!h.scene.is_empty(), "初始状态两者都画出来");
+
+        let _ = h.tree.set_style_patch_for_test(
+            container,
+            StylePatch {
+                visible: Some(false),
+                ..StylePatch::default()
+            },
+        );
+        h.mark_paint(container);
+        let _ = h.paint();
+        assert!(
+            h.scene.is_empty(),
+            "容器隐藏后子控件也必须消失（旧的『只隐藏自身』会留下子控件）"
+        );
+        let _ = child;
+    }
     #[test]
     fn clip_brackets_lane_and_subtree() {
         let mut h = Harness::new();

@@ -106,11 +106,10 @@ fn pick(
     // 本节点**未**入链前的深度：`clip_chain` 只含祖先的 clip（目标自己的 padding box 由应用自己算）。
     let depth = chain.len();
 
-    // 不可见/隐藏的节点整体不参与命中（对目标自身也成立，与 P06 的「不绘制」一致）。
-    if matches!(slot.style().inner.display, taffy::style::Display::None) {
-        return None;
-    }
-    if slot.style_patch().visible == Some(false) {
+    // 不可见的节点整体不参与命中（对目标自身也成立，与 P06 的「不绘制」一致）。
+    // 规则与焦点遍历共用 `NodeTree::is_visible_locally` —— 两处各写一份是本项目历史上的
+    // 分歧来源（Tab 能落到不可见控件上）。
+    if !tree.is_visible_locally(node) {
         return None;
     }
 

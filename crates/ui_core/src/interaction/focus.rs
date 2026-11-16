@@ -17,9 +17,16 @@ pub(crate) fn accepts_action(tree: &NodeTree, node: NodeId) -> bool {
 }
 
 /// 该节点是否可聚焦：接受动作，或被显式标为 `interactive: Some(true)`。
+///
+/// 先过可见性（**含祖先**）：`visible: false` / `display: none` 按 CSS 语义隐藏整棵子树，
+/// 旧实现只看 `interactive` 与 `tab_stop`，于是 Tab 会落到不可见控件上、Enter 还能触发
+/// 隐藏的 action（P2-3.3）。谓词与命中测试共用 `NodeTree::is_visible_locally`。
 #[must_use]
 pub(crate) fn focusable(tree: &NodeTree, node: NodeId) -> bool {
-    if !tree.is_hittable(node) || !tree.get(node).is_ok_and(|target| target.tab_stop()) {
+    if !tree.is_effectively_visible(node)
+        || !tree.is_hittable(node)
+        || !tree.get(node).is_ok_and(|target| target.tab_stop())
+    {
         return false;
     }
     accepts_action(tree, node) || tree.is_explicitly_interactive(node)
@@ -146,6 +153,47 @@ mod tests {
 
     fn plain(tree: &mut NodeTree, parent: NodeId) -> NodeId {
         NodeBuilder::boxed().build(tree, parent).expect("mount")
+    }
+
+    /// P2-3.3 回归：不可见容器里的控件不能被 Tab 到。
+    ///
+    /// `visible: false` / `display: none` 按 CSS 语义隐藏**整棵子树**，命中测试一直是这样做的，
+    /// 但焦点遍历只查了 `interactive` 与 `tab_stop` —— 于是 Tab 会落到看不见的控件上，
+    /// Enter 还能触发隐藏的 action。
+    #[test]
+    fn invisible_subtrees_are_not_focusable() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        // 可见的按钮：Tab 必须能到。
+        let visible = NodeBuilder::boxed()
+            .on_click(Action::custom("visible"))
+            .build(&mut tree, root)
+            .expect("mount");
+        // 容器 `visible: false`，里面还有一个按钮。
+        let hidden_parent = NodeBuilder::boxed().build(&mut tree, root).expect("mount");
+        let hidden_child = NodeBuilder::boxed()
+            .on_click(Action::custom("hidden"))
+            .build(&mut tree, hidden_parent)
+            .expect("mount");
+        tree.set_style_patch(
+            hidden_parent,
+            StylePatch {
+                visible: Some(false),
+                ..StylePatch::default()
+            },
+        );
+
+        assert!(focusable(&tree, visible), "可见按钮必须可聚焦");
+        assert!(
+            !focusable(&tree, hidden_child),
+            "不可见容器的子节点不得可聚焦"
+        );
+        // 从可见按钮正向 Tab：不得回绕到隐藏子节点。
+        assert_eq!(
+            next_focusable(&tree, Some(visible), false),
+            Some(visible),
+            "Tab 序只含可见节点（单节点时回绕到自己）"
+        );
     }
 
     #[test]

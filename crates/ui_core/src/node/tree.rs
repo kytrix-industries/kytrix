@@ -1646,6 +1646,36 @@ impl NodeTree {
             .is_some_and(|target| target.style_patch.interactive != Some(false))
     }
 
+    /// 该节点**自身**是否可见（`display != None` 且 `visible != Some(false)`）。
+    ///
+    /// 这是「不可见」的**唯一**定义：命中测试、焦点遍历、a11y 用同一条规则。命中测试在递归里
+    /// 对本节点调用它（于是整棵子树被排除）；需要一次性判断某节点时用
+    /// [`NodeTree::is_effectively_visible`]（它还会检查祖先）。
+    #[must_use]
+    pub(crate) fn is_visible_locally(&self, node: NodeId) -> bool {
+        self.arena.get(node).is_some_and(|target| {
+            !matches!(target.style.inner.display, taffy::style::Display::None)
+                && target.style_patch.visible != Some(false)
+        })
+    }
+
+    /// 该节点**及其所有祖先**都可见。
+    ///
+    /// `visible: false` / `display: none` 都按 CSS 语义隐藏整棵子树，因此判断「能不能被聚焦」
+    /// 「能不能被 Tab 到」时不能只看本节点 —— 旧实现的焦点遍历只查了 `interactive`，于是 Tab
+    /// 会落到不可见控件上，Enter 还能触发隐藏的 action（P2-3.3）。
+    #[must_use]
+    pub(crate) fn is_effectively_visible(&self, node: NodeId) -> bool {
+        let mut current = Some(node);
+        while let Some(candidate) = current {
+            if !self.is_visible_locally(candidate) {
+                return false;
+            }
+            current = self.arena.get(candidate).and_then(|target| target.parent);
+        }
+        true
+    }
+
     /// 焦点环（`None` = 不画）。
     #[must_use]
     pub(crate) fn focus_ring(&self, node: NodeId) -> Option<crate::paint::style::FocusRing> {

@@ -147,6 +147,10 @@ impl Plan {
     ///
     /// 规则（逐字对照 §4.2）：任一 `Full` ⇒ `Full`；否则矩形并集；并集超过
     /// `MAX_DAMAGE_RECTS` ⇒ `Full`（`Present1` / scissor 的固定容量不能溢出）。
+    ///
+    /// 拼接之后**按绘制预算合并**（P2-3.2）：GPU 忙时被覆盖的帧会把 damage 一路累积，
+    /// 纯拼接很容易凑到 16 个矩形，而每个矩形都要重放一遍 draw op 列表 —— 合并到
+    /// `MAX_DRAW_PASSES` 个正是为了给这个重放次数设上界（与 `plan()` 里同一套规则）。
     pub(crate) fn merge(self, next: Self) -> Self {
         match (self, next) {
             (Self::Full, _) | (_, Self::Full) => Self::Full,
@@ -158,6 +162,7 @@ impl Plan {
                         return Self::Full;
                     }
                 }
+                merged.coalesce(MAX_DRAW_PASSES);
                 Self::Partial(merged)
             }
         }
@@ -437,9 +442,32 @@ mod tests {
             Plan::Full,
             "17 个矩形超出固定容量 ⇒ 全量"
         );
-        // 恰好装满不算超限。
+        // 恰好在容量内：不再退化成全量，而是**合并到绘制预算**（P2-3.2）。
+        // 旧行为是原样保留 16 个矩形 —— 每个矩形都要重放一遍 draw op 列表。
         let exactly = partial_plan(&older[..MAX_DAMAGE_RECTS - 1]).merge(partial_plan(&newer));
-        assert!(matches!(exactly, Plan::Partial(rects) if rects.len() == MAX_DAMAGE_RECTS));
+        let Plan::Partial(rects) = exactly else {
+            panic!("capacity-fitting merge must stay partial, got {exactly:?}");
+        };
+        assert_eq!(
+            rects.len(),
+            MAX_DRAW_PASSES,
+            "合并结果必须收敛到绘制预算，而不是原样保留 {} 个矩形",
+            MAX_DAMAGE_RECTS
+        );
+        // 合并必须覆盖全部原始矩形（合并只是放大重绘范围，不能丢 damage）。
+        for original in older[..MAX_DAMAGE_RECTS - 1].iter().chain(newer.iter()) {
+            assert!(
+                rects
+                    .as_slice()
+                    .iter()
+                    .any(|merged| merged.x0 <= original.x0
+                        && merged.y0 <= original.y0
+                        && merged.x1 >= original.x1
+                        && merged.y1 >= original.y1),
+                "原始矩形 {original:?} 必须被覆盖：{:?}",
+                rects.as_slice()
+            );
+        }
     }
     /// P1-2.1：damage 必须合并到至多 `MAX_DRAW_PASSES` 个（后端按矩形数重放 op 列表）。
     #[test]
