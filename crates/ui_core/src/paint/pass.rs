@@ -27,7 +27,7 @@ use crate::{
             ClipOp, ClipRect, GeometryDraw, GlyphRun, Gradient, PositionedGlyph, Primitive, Quad,
             QuadPaint, Shadow,
         },
-        scene::{LaneId, MAX_CLIP_DEPTH, Scene},
+        scene::{LaneId, Scene},
         style::{Clip, PaintSpec, StylePatch},
     },
     render::damage::{DamageAccumulator, DamageSummary},
@@ -121,6 +121,9 @@ struct PaintContext<'a> {
 #[derive(Default)]
 struct ClipContext {
     rects: SmallVec<[ClipRect; 8]>,
+    /// 与 push 次数等长的回溯记录：`Some(prev)` = 这次 push 是折叠（`rects` 未增长，
+    /// 需要把栈顶矩形还原成 `prev`）；`None` = 正常压栈，`pop` 时弹掉 `rects` 末尾。
+    pushed: SmallVec<[Option<ClipRect>; 8]>,
     covering: Option<PhysicalRect>,
 }
 
@@ -130,16 +133,44 @@ impl ClipContext {
     }
 
     /// 进入一个 `Clip::Bounds` 节点：按它的 **padding box** 裁剪子树。
+    ///
+    /// 深度达到 `MAX_CLIP_DEPTH` 时**折叠**为「与栈顶求交」而不是失败或丢弃（P2-7）：
+    /// 轴对齐矩形求交是**无损**的（两个矩形 clip 的复合就是它们的交集），而 `covering`
+    /// 本来就是全部矩形的交集。因此 8 层以上嵌套裁剪容器不需要牺牲精度、也不需要让整帧
+    /// 失败 —— 旧实现在这里返回 `ClipDepthExceeded`，8 层嵌套的滚动容器会白屏。
     fn push(&mut self, padding_box: Rect, scale: Scale) {
-        self.rects.push(ClipRect {
+        let clip = ClipRect {
             rect: padding_box,
             corner_radius: [0.0; 4],
-        });
+        };
+        if self.rects.len() >= usize::from(crate::paint::scene::MAX_CLIP_DEPTH) {
+            let last = self.rects.last_mut().expect("刚刚判过非空");
+            let previous = *last;
+            last.rect = last.rect.intersect(clip.rect);
+            last.corner_radius = [0.0; 4];
+            // 回溯时要把求交前的矩形还原，否则父层的 clip 会被子层的矩形永久收窄
+            // （兄弟子树就会被过度裁剪）。
+            self.pushed.push(Some(previous));
+            self.rebuild_covering(scale);
+            return;
+        }
+        self.rects.push(clip);
+        self.pushed.push(None);
         self.rebuild_covering(scale);
     }
 
     fn pop(&mut self, scale: Scale) {
-        let _ = self.rects.pop();
+        match self.pushed.pop() {
+            Some(None) => {
+                let _ = self.rects.pop();
+            }
+            Some(Some(previous)) => {
+                if let Some(last) = self.rects.last_mut() {
+                    *last = previous;
+                }
+            }
+            None => return,
+        }
         self.rebuild_covering(scale);
     }
 
@@ -244,14 +275,8 @@ fn paint_node(
         (children, clip_bounds)
     };
     if let Some(padding_box) = clip_bounds {
-        // release 可见的硬失败：静默丢弃最外层 clip 会让子内容越界可见（P06 二轮 / P14 审查）。
-        if clip.rects.len() >= usize::from(MAX_CLIP_DEPTH) {
-            return Err(EngineError::ClipDepthExceeded {
-                node,
-                depth: clip.rects.len() + 1,
-                limit: MAX_CLIP_DEPTH,
-            });
-        }
+        // 深度上限由 `ClipContext::push` 自己处理：达到上限时与栈顶矩形求交（无损），
+        // 既不失败也不丢弃（P2-7）。
         clip.push(padding_box, context.scale);
     }
     // 子节点的参照系：容器挂了滚动槽时，内容整体按 `offset` 上移（屏幕 = 内容 − 累计偏移）。
@@ -367,17 +392,8 @@ fn rebuild_lane(
         )
     };
 
-    // 本节点自身的内容 clip 还会再占一层（见 `emit_content`）。用**同一个**判据算层数：
-    // 纯盒子 / 还没 shape 好的文本不产图元、也不压 clip，不能在这里虚报一层 —— 否则
-    // 8 层嵌套的空容器会被误判超深。
-    let own_clip_levels = usize::from(content_clip.is_some() && content_needs_clip(&content));
-    if clip.rects.len() + own_clip_levels > usize::from(crate::paint::scene::MAX_CLIP_DEPTH) {
-        return Err(EngineError::ClipDepthExceeded {
-            node,
-            depth: clip.rects.len() + own_clip_levels,
-            limit: crate::paint::scene::MAX_CLIP_DEPTH,
-        });
-    }
+    // 内容 clip 的层数由 `ClipContext::push` 折叠处理（达到上限时求交而不是失败），
+    // 这里不需要再校验深度：8 层以上的嵌套裁剪容器会退化成一条求交后的矩形。
     for clip_rect in &clip.rects {
         let _ = context
             .scene
@@ -1287,22 +1303,25 @@ mod tests {
         let _ = h.paint();
     }
 
+    /// P2-7 回归：超过 `MAX_CLIP_DEPTH` 的嵌套裁剪容器**折叠**而不是失败。
+    ///
+    /// 旧实现在这里返回 `ClipDepthExceeded` 让整帧中止 —— 8 层嵌套的滚动容器（深层
+    /// 面板 + 列表 + 弹层）会直接白屏。矩形 clip 的复合就是交集，求交是无损的，因此
+    /// 折叠既保住精度也不牺牲可用性。
     #[test]
-    fn clip_depth_over_limit_is_an_error() {
-        // release 下也必须硬失败：静默丢最外层 clip 会让子内容越界可见（P14 审查）。
+    fn clip_depth_over_limit_folds_instead_of_failing() {
         let mut h = Harness::new();
         let deepest = nest_clips(&mut h, usize::from(crate::paint::scene::MAX_CLIP_DEPTH) + 1);
-        let error = match h.try_paint() {
-            Err(error) => error,
-            Ok(_) => panic!("9 层 Clip::Bounds 必须报错（不能静默丢最外层）"),
-        };
-        match error {
-            crate::error::EngineError::ClipDepthExceeded { node, depth, limit } => {
-                assert_eq!(node, deepest);
-                assert_eq!(depth, usize::from(crate::paint::scene::MAX_CLIP_DEPTH) + 1);
-                assert_eq!(limit, crate::paint::scene::MAX_CLIP_DEPTH);
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        let report = h.paint();
+        // 折叠后每一层都还在（线段里仍有 clip 图元），关键是没有报错、没有丢绘制。
+        assert!(report.rebuilt > 0, "折叠后必须仍能绘制");
+        // 最深层带内容时也要能画：这里只验证 clip 上下文结构（`clip_key` 深度被折叠到上限）。
+        assert!(
+            h.tree
+                .clip_key(deepest)
+                .is_some_and(|(depth, _)| usize::from(depth)
+                    <= usize::from(crate::paint::scene::MAX_CLIP_DEPTH)),
+            "折叠后每层的 clip 深度不得超过上限"
+        );
     }
 }

@@ -50,17 +50,18 @@ impl ClipChain {
         self.len == 0
     }
 
-    /// 压入一个 clip 矩形；超过深度上限则**丢弃**（不 panic —— 兄弟子树仍可能命中）。
+    /// 压入一个 clip 矩形；达到深度上限时**折叠**为与栈顶求交（P2-7）。
+    ///
+    /// 与 `PaintPass` 的 `ClipContext::push` 同一策略：轴对齐矩形求交无损，因此深层嵌套
+    /// 不会让命中路径丢矩形（旧实现直接丢弃，超深子树的命中判定会比绘制宽松）。
     fn push(&mut self, rect: Rect) {
-        if usize::from(self.len) < MAX_CLIP_DEPTH {
-            self.rects[usize::from(self.len)] = rect;
-            self.len += 1;
+        if usize::from(self.len) >= MAX_CLIP_DEPTH {
+            let last = &mut self.rects[usize::from(self.len) - 1];
+            *last = last.intersect(rect);
+            return;
         }
-    }
-
-    /// 回到 `len` 深度（子树回溯时必须撤销，否则兄弟/自身的 chain 会带上别人的矩形）。
-    fn truncate(&mut self, len: usize) {
-        self.len = self.len.min(len as u8);
+        self.rects[usize::from(self.len)] = rect;
+        self.len += 1;
     }
 }
 
@@ -89,8 +90,7 @@ pub(crate) fn hit_test(tree: &NodeTree, point: Point) -> Option<HitResult> {
     if !tree.get(root).ok()?.layout().bounds.contains(point) {
         return None; // 窗口外（根 100% 撑满 ⇒ 等价于「点在窗口外」）
     }
-    let mut chain = ClipChain::default();
-    pick(tree, root, point, Point::ZERO, &mut chain)
+    pick(tree, root, point, Point::ZERO, ClipChain::default())
 }
 
 fn pick(
@@ -98,13 +98,14 @@ fn pick(
     node: NodeId,
     point: Point,
     offset: Point,
-    chain: &mut ClipChain,
+    mut chain: ClipChain,
 ) -> Option<HitResult> {
     let slot = tree.get(node).ok()?;
     // 本节点的**屏幕**布局盒（内容坐标减去祖先滚动偏移）。
     let bounds = slot.layout().bounds.translate(negate(offset));
-    // 本节点**未**入链前的深度：`clip_chain` 只含祖先的 clip（目标自己的 padding box 由应用自己算）。
-    let depth = chain.len();
+    // 本节点**未**入链前的链：`clip_chain` 只含祖先的 clip（目标自己的 padding box 由应用自己算）。
+    // `ClipChain` 是 `Copy`，按值传递即可，不需要「截断回某深度」这种容易出错的手工回溯。
+    let ancestors = chain;
 
     // 不可见的节点整体不参与命中（对目标自身也成立，与 P06 的「不绘制」一致）。
     // 规则与焦点遍历共用 `NodeTree::is_visible_locally` —— 两处各写一份是本项目历史上的
@@ -144,7 +145,6 @@ fn pick(
                 continue;
             }
             if let Some(hit) = pick(tree, *child, point, child_offset, chain) {
-                chain.truncate(depth);
                 return Some(hit);
             }
         }
@@ -152,29 +152,23 @@ fn pick(
 
     // 自身：先看布局盒（允许溢出后代，但自身不声称盒外命中），再看 `hit_shape`（局部坐标）。
     if !bounds.contains(point) {
-        chain.truncate(depth);
         return None;
     }
     // `interactive: Some(false)` 的节点**不作为目标**（子节点已在上面的循环里独立判定）。
     // 设计 §4.9 把它定义为「命中 / 焦点 / Action 开关」。
     if slot.style_patch().interactive == Some(false) {
-        chain.truncate(depth);
         return None;
     }
     let local_point = Point::new(point.x - bounds.origin.x, point.y - bounds.origin.y);
     if let Some(shape) = slot.hit_shape()
         && !shape(local_point)
     {
-        chain.truncate(depth);
         return None;
     }
-    let mut clip_chain = *chain;
-    clip_chain.truncate(depth);
-    chain.truncate(depth);
     Some(HitResult {
         node,
         local_point,
-        clip_chain,
+        clip_chain: ancestors,
     })
 }
 #[cfg(test)]
@@ -303,6 +297,38 @@ mod tests {
 
         // 父 bounds 之外 ⇒ 落到根背景
         assert_eq!(hit_node(&tree, 60.0, 60.0), Some(root));
+    }
+
+    /// P2-7：超过 `MAX_CLIP_DEPTH` 后，clip 折叠为求交，且**回到兄弟子树时必须还原**。
+    ///
+    /// 折叠把新 clip 求交进栈顶矩形（轴对齐矩形无损）。若不还原，父层的 clip 会被子层的
+    /// 矩形永久收窄，兄弟子树就会被过度裁剪、命中丢失。
+    #[test]
+    fn clip_folding_does_not_leak_into_sibling_subtrees() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        // 先叠满 `MAX_CLIP_DEPTH` 层（外加一层触发折叠）。
+        let mut parent = root;
+        for _ in 0..=super::MAX_CLIP_DEPTH {
+            let mut style = fixed(100.0, 100.0);
+            style.clip = Clip::Bounds;
+            parent = add(&mut tree, parent, style);
+        }
+        // 折叠层下面挂两个兄弟：左窄右宽，右边那个落在左边子树的盒子外。
+        let mut narrow = fixed(10.0, 10.0);
+        narrow.clip = Clip::Bounds;
+        let left = add(&mut tree, parent, narrow);
+        let right = add(&mut tree, parent, fixed(80.0, 80.0));
+        layout(&mut tree);
+
+        // 访问左兄弟会让折叠发生（深度已满）；随后访问右兄弟时必须是**未收窄**的祖先链。
+        let _ = hit_node(&tree, 5.0, 5.0);
+        assert_eq!(
+            hit_node(&tree, 40.0, 40.0),
+            Some(right),
+            "右兄弟的命中不得被左兄弟的折叠 clip 影响"
+        );
+        let _ = left;
     }
 
     #[test]
