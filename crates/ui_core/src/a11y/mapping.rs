@@ -136,12 +136,12 @@ pub(crate) fn default_actions(role: A11yRole) -> Vec<A11yAction> {
 
     match role {
         R::Button => vec![A::Click],
-        // 可勾选控件的默认动作（P2-8）：AT 通过 Click 驱动勾选切换；UIA 的 Toggle /
-        // SelectionItem 模式在 `checked` 有值时已经暴露，但动作表里没有 Click 时
-        // 屏幕阅读器不会提供「按下」操作。
-        R::CheckBox | R::Switch | R::RadioButton | R::MenuItem | R::ListBoxOption => {
-            vec![A::Click, A::Focus]
-        }
+        // 可勾选控件**不**在默认表里声明 `Click`：`ListBoxOption` 这类角色是引擎按节点
+        // 种类**自动推导**的（虚拟列表的每一行），无脑声明 Click 会让没有任何点击处理的
+        // 行也暴露 Invoke 模式 —— 用户按下去什么都不会发生（复审 P2-4）。
+        // 真实能力由 `effective_actions` 统一补：节点声明了 `on_click`/`on_action` 就会得到
+        // `Click`，与角色无关。
+        R::CheckBox | R::Switch | R::RadioButton | R::MenuItem | R::ListBoxOption => Vec::new(),
         // 滑块：数值通过 `numeric_value` 通道暴露，写值走 `SetValue`（UIA 的
         // `RangeValuePattern.SetValue` 带 `NumericValue` payload），步进走
         // Increment/Decrement（P2-8 / review P2-5）。
@@ -156,7 +156,9 @@ pub(crate) fn default_actions(role: A11yRole) -> Vec<A11yAction> {
             A::SetScrollOffset,
         ],
         R::Dialog | R::Menu => vec![A::Expand, A::Collapse],
-        R::Table | R::Grid => vec![A::ScrollIntoView],
+        // 表格/网格的 `ScrollIntoView` 由 `effective_actions` 按「是否真的有滚动容器」补
+        // （无滚动祖先时该动作必然失败）。
+        R::Table | R::Grid => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -237,6 +239,16 @@ pub(crate) fn effective_actions(
                 actions.push(action);
             }
         }
+    }
+    // 表格/网格只有在**真的有滚动容器**（自身滚动槽或滚动祖先）时才提供
+    // `ScrollIntoView`：没有滚动容器时该动作必然失败，暴露出去等于给 AT 一个死按钮
+    // （复审 P2-4）。
+    if matches!(role, A11yRole::Table | A11yRole::Grid)
+        && (tree.scroll_slot(node).is_some()
+            || crate::interaction::scroll::scroll_ancestor(tree, node).is_some())
+        && !actions.contains(&A11yAction::ScrollIntoView)
+    {
+        actions.push(A11yAction::ScrollIntoView);
     }
     // 声明了动作（`on_click` / `on_action`）的节点一定能被 AT 激活，与角色无关。
     if tree
@@ -354,8 +366,8 @@ pub(crate) fn is_disabled(
 #[cfg(test)]
 mod tests {
     use super::{
-        action_from_accesskit, action_to_accesskit, default_actions, is_disabled, is_hidden,
-        role_to_accesskit,
+        action_from_accesskit, action_to_accesskit, default_actions, effective_actions,
+        is_disabled, is_hidden, role_to_accesskit,
     };
     use crate::{
         a11y::{A11yAction, A11yLabel, A11yLabelSource, A11yOverride, A11yPatch, A11yRole},
@@ -453,9 +465,11 @@ mod tests {
         assert!(default_actions(A11yRole::Label).is_empty());
     }
 
-    /// P2-8：可勾选控件与滑块必须暴露可执行动作，否则 AT 不提供「按下 / 设值」操作。
+    /// P2-4：可勾选控件的 `Click` 必须由**真实能力**决定（节点声明了 on_click 才有），
+    /// 而不是角色默认表无条件给出 —— 否则自动推导出的虚拟列表行会暴露死按钮。
     #[test]
-    fn stateful_controls_expose_their_default_actions() {
+    fn click_comes_from_capability_not_role() {
+        // 默认表不再给可勾选角色声明 Click。
         for role in [
             A11yRole::CheckBox,
             A11yRole::Switch,
@@ -465,16 +479,36 @@ mod tests {
         ] {
             let actions = default_actions(role);
             assert!(
-                actions.contains(&A11yAction::Click),
-                "{role:?} 必须暴露 Click（否则屏幕阅读器不提供按下操作）：{actions:?}"
+                !actions.contains(&A11yAction::Click),
+                "{role:?} 的默认表不该声明 Click（能力由 effective_actions 补）：{actions:?}"
             );
-            assert!(actions.contains(&A11yAction::Focus));
         }
-        let slider = default_actions(A11yRole::Slider);
+
+        // 没有交互声明的行：没有任何动作（不暴露死 Click）。
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let plain = NodeBuilder::boxed().build(&mut tree, root).expect("mount");
+        let actions = effective_actions(&tree, plain, A11yRole::ListBoxOption, None, None);
         assert!(
-            slider.contains(&A11yAction::SetValue),
-            "Slider 必须暴露 SetValue（配合 numeric_value 通道）：{slider:?}"
+            !actions.contains(&A11yAction::Click),
+            "无 on_click 的列表项不得暴露 Click：{actions:?}"
         );
+
+        // 声明了 on_click 的节点：Click 由能力规则补上。
+        let clickable = NodeBuilder::boxed()
+            .on_click(crate::event::Action::custom("pick"))
+            .build(&mut tree, root)
+            .expect("mount");
+        let actions = effective_actions(&tree, clickable, A11yRole::ListBoxOption, None, None);
+        assert!(
+            actions.contains(&A11yAction::Click),
+            "有 on_click 的列表项必须暴露 Click：{actions:?}"
+        );
+
+        // 滑块的数值动作不受影响。
+        let slider = default_actions(A11yRole::Slider);
+        assert!(slider.contains(&A11yAction::SetValue));
+        assert!(slider.contains(&A11yAction::Increment));
     }
 
     #[test]
