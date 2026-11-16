@@ -1944,7 +1944,9 @@ impl App {
             return Err(EngineError::UnknownWindow { window });
         };
         let root = target.tree().root();
-        let origin = interaction::resolve_placement(target.tree(), options.placement);
+        // 新建时还不知道浮层尺寸：Above / Left 首帧先按零尺寸定位，布局之后由
+        // esolve_overlay_placements 用实测尺寸纠正（P2-6）。
+        let origin = interaction::resolve_placement(target.tree(), options.placement, Size::ZERO);
         let style = overlay_style(origin);
         let node = NodeBuilder::boxed()
             .style(style)
@@ -1952,6 +1954,7 @@ impl App {
         if let Some(slot) = target.tree_mut().ensure_interaction(node) {
             slot.overlay = Some(OverlaySlot {
                 dismiss: options.dismiss,
+                placement: options.placement,
             });
         }
         #[cfg(feature = "hud")]
@@ -1965,6 +1968,45 @@ impl App {
         self.remove_node(overlay.window(), overlay.node())
     }
 
+    /// 布局之后按浮层**实测尺寸**重新求值锚点定位（P2-6）。
+    ///
+    /// `Above` / `Left` 需要知道浮层自己的宽/高，而尺寸只有布局之后才有；新建时按零尺寸
+    /// 定位会让浮层盖住锚点。这里在每帧布局之后纠一次，只在位置真的变化时才写回（写回会
+    /// 触发重排，必须收敛）。
+    fn resolve_overlay_placements(&mut self, window: WindowId) {
+        let Some(target) = self.windows.get_mut(&window) else {
+            return;
+        };
+        let root = target.tree().root();
+        let children = target.tree().get(root).map_or_else(
+            |_| smallvec::SmallVec::<[NodeId; 4]>::new(),
+            |node| node.children().iter().copied().collect(),
+        );
+        for node in children {
+            let Some(slot) = target.tree().overlay_slot(node) else {
+                continue;
+            };
+            if !matches!(slot.placement, OverlayPlacement::Anchor { .. }) {
+                continue;
+            }
+            let size = target
+                .tree()
+                .get(node)
+                .map_or(Size::ZERO, |target| target.layout().bounds.size);
+            let origin = interaction::resolve_placement(target.tree(), slot.placement, size);
+            let current = target
+                .tree()
+                .get(node)
+                .map_or(Rect::default(), |target| target.layout().bounds);
+            if (current.origin.x - origin.x).abs() < 0.5
+                && (current.origin.y - origin.y).abs() < 0.5
+            {
+                continue;
+            }
+            let _ = target.tree_mut().set_absolute_inset(node, origin);
+        }
+    }
+
     /// 重新定位浮层（相对根的逻辑像素点）。
     pub fn place_overlay(&mut self, overlay: &Overlay, placement: OverlayPlacement) -> bool {
         let window = overlay.window();
@@ -1972,9 +2014,19 @@ impl App {
         let Some(target) = self.windows.get_mut(&window) else {
             return false;
         };
-        let origin = interaction::resolve_placement(target.tree(), placement);
+        let size = target
+            .tree()
+            .get(node)
+            .map_or(Size::ZERO, |target| target.layout().bounds.size);
+        let origin = interaction::resolve_placement(target.tree(), placement, size);
         if !target.tree_mut().set_absolute_inset(node, origin) {
             return false;
+        }
+        if let Some(slot) = target.tree_mut().ensure_interaction(node) {
+            slot.overlay = slot.overlay.map(|overlay| OverlaySlot {
+                placement,
+                ..overlay
+            });
         }
         self.request_frame();
         true
@@ -2773,6 +2825,10 @@ impl App {
         // 所以这里**每帧**都重夹一次。必须在取唤醒位**之前**：夹紧本身可能请求一帧，
         // 否则「内容变短」这类不标脏位的变化会停在 Idle 上永远不修。
         self.normalize_scroll_offsets(window);
+        // 锚点定位的浮层按**上一帧实测尺寸**在这一帧布局之前纠位（P2-6）。不能放在布局之后：
+        // 布局之后写 inset 会被 `settle_frame` 的「本轮已布局」判定清掉 LAYOUT，下一帧变 Idle，
+        // 位置永远不生效。放在布局前则是标准的 measure-then-place：首帧用零尺寸，次帧到位。
+        self.resolve_overlay_placements(window);
         let wake = self.take_wake_request();
         // P10：动画在帧门禁**之前**推进（写 `Transient` + 给注册节点标 `PAINT`），因此「有动画」必然
         // 让 `needs_frame` 为真；动画结束后不再留帧。
@@ -5452,6 +5508,62 @@ mod interaction_tests {
     }
 
     // ── 浮层 ──────────────────────────────────────────────────────────────────
+
+    /// P2-6 回归：`Above` 定位必须把浮层的**下边缘**贴到锚点上方（减掉自身高度）。
+    ///
+    /// 旧实现返回锚点的上边缘，浮层会整个盖住锚点。新建时浮层尺寸未知，`App` 在布局之后
+    /// 用实测尺寸纠正一次。
+    #[test]
+    fn anchored_above_overlay_sits_above_the_anchor() {
+        let (_rt, mut app, window) = setup();
+        let root = root_of(&app, window);
+        let anchor = mount_override(&mut app, window, root, Rect::new(100.0, 100.0, 40.0, 20.0));
+        frame(&mut app, window);
+
+        let overlay = app
+            .create_overlay(
+                window,
+                OverlayOptions {
+                    placement: OverlayPlacement::Anchor {
+                        node: anchor,
+                        side: crate::interaction::AnchorSide::Above,
+                        gap: 4.0,
+                    },
+                    dismiss: OverlayDismiss::Explicit,
+                },
+            )
+            .expect("overlay");
+        let overlay_node = overlay.node();
+        let mut style = Style::default();
+        style.inner.position = taffy::style::Position::Absolute;
+        style.inner.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::length(60.0),
+            height: taffy::style::Dimension::length(30.0),
+        };
+        app.window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .set_style(overlay_node, style)
+            .expect("style");
+        // 布局 → 修正定位 → 再布局（修正会弄脏布局）。
+        frame(&mut app, window);
+        frame(&mut app, window);
+        frame(&mut app, window);
+
+        let bounds = app
+            .window(window)
+            .expect("window")
+            .tree()
+            .get(overlay_node)
+            .expect("overlay")
+            .layout()
+            .bounds;
+        assert_eq!(
+            (bounds.origin.x, bounds.origin.y, bounds.size.height),
+            (100.0, 66.0, 30.0),
+            "Above：y = 锚点顶 - gap - 自身高度（下边缘贴锚点），实际 {bounds:?}"
+        );
+    }
 
     #[test]
     fn overlay_is_last_and_closes_on_outside_click() {

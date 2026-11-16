@@ -425,10 +425,12 @@ impl Overlay {
 }
 
 /// 浮层槽（`Node.interaction.overlay`）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct OverlaySlot {
     /// 关闭策略。
     pub dismiss: OverlayDismiss,
+    /// 打开时的定位：布局之后要按浮层**实测尺寸**重新求值（`Above` / `Left` 依赖它）。
+    pub placement: OverlayPlacement,
 }
 
 /// 动画句柄（`Copy`；`index` 带代际，取消/结束后旧句柄失效）。
@@ -666,9 +668,14 @@ impl std::fmt::Debug for NodeInteraction {
 ///
 /// `Anchor` 读锚点的**屏幕**布局盒（内容坐标减去祖先滚动偏移）：浮层挂在 root 上，必须与屏幕上看到的
 /// 锚点对齐（`design/phase-10-interaction.md` §9.2）。
+///
+/// `size` 是浮层**自身**的测量尺寸：`Above` / `Left` 要把浮层的下/右边缘贴到锚点外侧，
+/// 必须减去自身尺寸（P2-6）。旧实现返回锚点的上/左边缘，浮层会盖住锚点。首帧尺寸未知时
+/// 传 `Size::ZERO`，`App` 在布局之后会自动重新定位一次。
 pub(crate) fn resolve_placement(
     tree: &crate::node::tree::NodeTree,
     placement: OverlayPlacement,
+    size: crate::math::Size,
 ) -> Point {
     match placement {
         OverlayPlacement::Point(origin) => origin,
@@ -679,8 +686,10 @@ pub(crate) fn resolve_placement(
             );
             match side {
                 AnchorSide::Below => Point::new(bounds.origin.x, bounds.max().y + gap),
-                AnchorSide::Above => Point::new(bounds.origin.x, bounds.origin.y - gap),
-                AnchorSide::Left => Point::new(bounds.origin.x - gap, bounds.origin.y),
+                AnchorSide::Above => {
+                    Point::new(bounds.origin.x, bounds.origin.y - gap - size.height)
+                }
+                AnchorSide::Left => Point::new(bounds.origin.x - gap - size.width, bounds.origin.y),
                 AnchorSide::Right => Point::new(bounds.max().x + gap, bounds.origin.y),
             }
         }

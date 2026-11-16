@@ -23,7 +23,11 @@ pub(crate) fn is_in_subtree(tree: &NodeTree, node: NodeId, ancestor: NodeId) -> 
 
 /// 最上层「点击外部即关闭」的浮层：`hit` 不在它的子树里 ⇒ 返回它（调用方负责关闭并消费该次按下）。
 ///
-/// 返回 `None` 表示：没有浮层 / 只有 `Explicit` 浮层 / 命中点落在最上层可关闭浮层内部。
+/// 返回 `None` 表示：没有浮层 / **最上层浮层不可由此关闭**（`Explicit`）/ 命中点落在它的
+/// 子树内部。
+///
+/// **只由最上层浮层裁决**（P2-6）：旧实现会跳过 `Explicit` 浮层继续往下找，于是点击落在
+/// 顶层模态浮层之外、却被压在下面的另一个浮层关掉 —— 模态失去了「挡住下层」的意义。
 #[must_use]
 pub(crate) fn outside_click_target(
     tree: &NodeTree,
@@ -31,19 +35,19 @@ pub(crate) fn outside_click_target(
     hit: Option<NodeId>,
 ) -> Option<(NodeId, OverlaySlot)> {
     let children = tree.get(root).ok()?.children();
-    for child in children.iter().rev() {
-        let Some(slot) = tree.overlay_slot(*child) else {
-            continue;
-        };
-        if slot.dismiss != OverlayDismiss::OutsideClick {
-            continue;
-        }
-        if hit.is_some_and(|node| is_in_subtree(tree, node, *child)) {
-            return None;
-        }
-        return Some((*child, slot));
+    // 顶层浮层说了算：它内部 ⇒ 谁都不关；它不可由此关闭 ⇒ 谁都不关（不越过它）。
+    let top = children
+        .iter()
+        .rev()
+        .find_map(|child| tree.overlay_slot(*child).map(|slot| (*child, slot)));
+    let (topmost, slot) = top?;
+    if slot.dismiss != OverlayDismiss::OutsideClick {
+        return None;
     }
-    None
+    if hit.is_some_and(|node| is_in_subtree(tree, node, topmost)) {
+        return None;
+    }
+    Some((topmost, slot))
 }
 
 /// 最上层「可被 `Dismiss` 关闭」的浮层（任意 `dismiss` 策略）。
@@ -60,13 +64,16 @@ pub(crate) fn topmost(tree: &NodeTree, root: NodeId) -> Option<(NodeId, OverlayS
 mod tests {
     use super::{is_in_subtree, outside_click_target, topmost};
     use crate::{
-        interaction::{OverlayDismiss, OverlaySlot},
+        interaction::{OverlayDismiss, OverlayPlacement, OverlaySlot},
         node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
     };
 
     fn overlay(tree: &mut NodeTree, root: NodeId, dismiss: OverlayDismiss) -> NodeId {
         let node = NodeBuilder::boxed().build(tree, root).expect("mount");
-        tree.ensure_interaction(node).expect("exists").overlay = Some(OverlaySlot { dismiss });
+        tree.ensure_interaction(node).expect("exists").overlay = Some(OverlaySlot {
+            dismiss,
+            placement: OverlayPlacement::Point(crate::math::Point::ZERO),
+        });
         node
     }
 
@@ -104,6 +111,25 @@ mod tests {
             outside_click_target(&tree, root, Some(upper)),
             None,
             "点在浮层内部不关"
+        );
+    }
+
+    /// P2-6 回归：顶层 `Explicit` 浮层必须**挡住**下层的可关闭浮层。
+    ///
+    /// 旧实现会跳过 `Explicit` 继续往下找，于是点击落在顶层模态浮层之外、却把压在下面的
+    /// 另一个浮层关掉 —— 模态失去「挡住下层」的意义。
+    #[test]
+    fn an_explicit_overlay_blocks_outside_click_for_lower_overlays() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let _lower = overlay(&mut tree, root, OverlayDismiss::OutsideClick);
+        let _upper = overlay(&mut tree, root, OverlayDismiss::Explicit);
+        let background = NodeBuilder::boxed().build(&mut tree, root).expect("mount");
+
+        assert_eq!(
+            outside_click_target(&tree, root, Some(background)),
+            None,
+            "顶层是 Explicit ⇒ 点击外部不得关闭任何下层浮层"
         );
     }
 
