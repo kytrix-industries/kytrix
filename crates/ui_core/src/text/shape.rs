@@ -171,6 +171,20 @@ impl ShapedText {
     /// **按字形计**，不是按 run 计：`line.items()` 返回的是 run（一段同一样式/字体的连续
     /// 文本），一个 run 可以含成百上千个字形。旧实现 `items().count() * 32` 会把长单 run
     /// 文本的占用低估 10–100 倍，8 MiB 的预算因此形同虚设 —— 缓存会一直涨到条目上限。
+    /// 该条目的**估算**字节数（形状缓存预算的计费单位）。
+    ///
+    /// 计费口径是「缓存驻留」，不是进程内存上限：`ShapedText` 被树/measure 闭包以 `Rc`
+    /// 持有时，逐出只减少缓存占用、不释放内存。因此这里宁可**高估**，避免缓存条数在
+    /// 预算外无界增长：
+    ///
+    /// - 结构体本身 + 文本；
+    /// - 每个字形约 24 B（advance + cluster + 字体/样式索引）；
+    /// - 每个 run 头部约 96 B；
+    /// - 行内盒：`InlineBoxSpec`（40 B）逐个计；
+    /// - 行内诊断：按 `TextDiagnostic` 的大致尺寸计（`SmolStr` + range ≈ 64 B）；
+    /// - `TextStyleExtras` 是 boxed 的堆对象（字体家族 + 特性列表），按 box 尺寸计。
+    ///
+    /// 早期实现漏了后三项，长文本 / 多行内盒场景会显著低估（复审 P3-1）。
     pub(crate) fn approx_bytes(&self) -> usize {
         let mut glyphs = 0usize;
         let mut runs = 0usize;
@@ -182,8 +196,20 @@ impl ShapedText {
                 }
             }
         }
-        // 每个字形约 24 B（advance + cluster + 字体/样式索引的打包），每个 run 的头部约 96 B。
-        core::mem::size_of::<Self>() + self.text.len() + glyphs * 24 + runs * 96
+        let inline_boxes = core::mem::size_of_val(self.inline_boxes.as_ref());
+        let inline_diagnostics = self.inline_diagnostics.capacity() * 64;
+        let extras = self
+            .style
+            .extras
+            .as_deref()
+            .map_or(0, core::mem::size_of_val);
+        core::mem::size_of::<Self>()
+            + self.text.len()
+            + glyphs * 24
+            + runs * 96
+            + inline_boxes
+            + inline_diagnostics
+            + extras
     }
 
     /// 仅测试：在指定宽度下重排后第一个字形的逻辑 x（验证 `align` 的真实效果）。
@@ -698,6 +724,33 @@ mod tests {
             anywhere.measure(none_known(), definite(30.0)).height
                 > wrap.measure(none_known(), definite(30.0)).height,
             "BreakAll must produce more lines at the same width"
+        );
+    }
+
+    /// P3-1：缓存计费必须包含行内盒 —— 否则多行内盒场景会显著低估预算占用。
+    #[test]
+    fn approx_bytes_counts_inline_boxes() {
+        let mut harness = Harness::new();
+        let plain = harness.shape("abcd", TextStyle::new(16.0));
+        let spec = InlineBoxSpec {
+            id: 9,
+            index: 2,
+            size: crate::math::Size::new(20.0, 18.0),
+            baseline: None,
+            align: InlineAlign::Baseline,
+        };
+        let boxes: Vec<InlineBoxSpec> = (0..8)
+            .map(|index| InlineBoxSpec {
+                index,
+                ..spec
+            })
+            .collect();
+        let with_boxes = harness.shape_with("abcd", TextStyle::new(16.0), &boxes);
+        let extra = with_boxes.approx_bytes() - plain.approx_bytes();
+        assert!(
+            extra >= boxes.len() * core::mem::size_of::<InlineBoxSpec>(),
+            "行内盒必须计入预算（差 {extra}，至少 {}）",
+            boxes.len() * core::mem::size_of::<InlineBoxSpec>()
         );
     }
 
