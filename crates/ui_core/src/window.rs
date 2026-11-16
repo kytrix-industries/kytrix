@@ -126,6 +126,12 @@ pub struct WindowOptions {
     ///
     /// alpha 恒为 1（先置 1 再解析，半透明颜色不会变灰）。
     /// 默认 `Color::BLACK`（**不是** `Color::default()`，后者是透明）。
+    ///
+    /// **局部帧的行为**（复审 P2-5，文档化设计前提）：引擎在 persist 目标上**保留上一帧
+    /// 内容**，damage 帧只重画 damage 区域、**不**先清成背景色。因此 damage 区域内的像素
+    /// 必须由应用内容覆盖 —— 若某块区域本帧没有任何图元，它会保留旧像素。这与 Chrome 的
+    /// layer 重绘语义一致（不是缺陷），但应用若希望「擦除」某块内容，必须显式画一个覆盖
+    /// 它的背景 `Quad`（demo 用铺满窗口的 `demo.background` 节点满足这一点）。
     pub background: Color,
 }
 

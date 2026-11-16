@@ -1283,12 +1283,15 @@ impl NodeTree {
         }
     }
 
-    /// 取出本帧待 shape 的文本节点（**清空集合**，容量保留）。
+    /// 把本帧待 shape 的文本节点追加进 `out` 并清空集合（**两侧容量都保留**）。
     ///
     /// 消费者：`App::refresh_text`。返回的列表可能包含已被卸载的节点 —— 调用方按
     /// 「查不到就跳过」处理（卸载时 `remove` 会尝试清理，但集合是旁路结构，不做强一致）。
-    pub(crate) fn take_text_dirty(&mut self) -> Vec<NodeId> {
-        std::mem::take(&mut self.text_dirty)
+    pub(crate) fn take_text_dirty(&mut self, out: &mut Vec<NodeId>) {
+        // `drain` 保住 `self.text_dirty` 的容量，`out` 由调用方跨帧复用：
+        // 旧实现 `mem::take` 每帧都让双方重新分配（复审 P3-2）。
+        out.clear();
+        out.append(&mut self.text_dirty);
     }
 
     /// 本帧待 shape 的文本节点数（诊断 / 测试）。

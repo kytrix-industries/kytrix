@@ -25,8 +25,10 @@ pub(crate) const MAX_ATLAS_PAGE: u32 = 2048;
 /// 两张页都**懒分配**：没有字形 / 图片时不占 CPU 页、GPU 纹理与 staging。
 pub(crate) const MIN_ATLAS_PAGE: u32 = 512;
 
-/// 页档阶梯：512 → 1024 → 2048（上限）。字形页分配失败时按这个顺序换代扩容；
-/// 图片页在首次插入时按图片尺寸选档（见 [`page_for_tile`]）。
+/// 页档阶梯：512 → 1024 → 2048（上限）。字形页分配失败时按这个顺序换代扩容。
+///
+/// **图片页不走这个阶梯**：它固定用 `MAX_ATLAS_PAGE`（2048）一档，保证容纳能力与插入
+/// 顺序无关（见 `resources::ResourceCache` 的 `PageState`）。
 pub(crate) const ATLAS_PAGE_STEPS: [u32; 3] = [MIN_ATLAS_PAGE, MIN_ATLAS_PAGE * 2, MAX_ATLAS_PAGE];
 
 /// 每 in-flight 槽**常驻** staging 的上限（字节）。

@@ -107,6 +107,8 @@ pub struct App {
     geometry: crate::paint::geometry_store::GeometryStore,
     /// 字形 `key → tile` 缓存（与图集同事务换代）。
     glyph_atlas: GlyphAtlas,
+    /// 文本脏集合的跨帧复用缓冲（`refresh_text` 的 `take_text_dirty` 输出；保容量）。
+    text_dirty_scratch: Vec<crate::node::id::NodeId>,
     /// 每窗口「图集已同步到的 `scale_epoch`」（DPI 变化 ⇒ 图集换代）。
     scale_epochs: ahash::HashMap<WindowId, u32>,
     /// 已按其重绘过文本的图集代际（P1-2.6）。
@@ -364,6 +366,7 @@ impl App {
             resources: ResourceCache::new(),
             geometry: crate::paint::geometry_store::GeometryStore::new(),
             glyph_atlas: GlyphAtlas::new(),
+            text_dirty_scratch: Vec::new(),
             scale_epochs: ahash::HashMap::default(),
             atlas_generation_seen: 0,
             pending_dirty: crate::render::DirtyRows::default(),
@@ -2030,11 +2033,14 @@ impl App {
         self.remove_node(overlay.window(), overlay.node())
     }
 
-    /// 布局之后按浮层**实测尺寸**重新求值锚点定位（P2-6）。
+    /// 帧首按**上一帧布局的实测尺寸**重新求值锚点定位（P2-6）。
     ///
-    /// `Above` / `Left` 需要知道浮层自己的宽/高，而尺寸只有布局之后才有；新建时按零尺寸
-    /// 定位会让浮层盖住锚点。这里在每帧布局之后纠一次，只在位置真的变化时才写回（写回会
-    /// 触发重排，必须收敛）。
+    /// `Above` / `Left` 需要知道浮层自己的宽/高；新建时按零尺寸定位会让浮层盖住锚点。
+    /// 这里是标准的 measure-then-place：**在布局之前**用上一帧的尺寸纠位，纠位写回后本帧
+    /// 布局就会用新位置；只做一次（收敛条件：位置差 < 0.5 px 早退）。
+    ///
+    /// **不能放在布局之后**：布局之后写 inset 会被 `settle_frame` 的「本轮已布局」判定吞掉
+    /// `LAYOUT` 位，下一帧变 `Idle`，位置永远不生效（P1-2.2 的陷阱）。
     fn resolve_overlay_placements(&mut self, window: WindowId) {
         let Some(target) = self.windows.get_mut(&window) else {
             return;
@@ -3175,6 +3181,7 @@ impl App {
             raster,
             atlas,
             glyph_atlas,
+            text_dirty_scratch,
             windows,
             scale_epochs,
             pending_dirty,
@@ -3212,7 +3219,8 @@ impl App {
         //
         // 集合来源：`set_text_content`（`bind_text` 求值 / 静态挂载）与 `mark_all_text_dirty`
         // （字体栈、DPI、图集换代）。
-        let dirty = tree.take_text_dirty();
+        tree.take_text_dirty(text_dirty_scratch);
+        let dirty: &[crate::node::id::NodeId] = text_dirty_scratch;
         while index < dirty.len() {
             let node = dirty[index];
             index += 1;

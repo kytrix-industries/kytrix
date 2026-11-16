@@ -165,7 +165,8 @@ impl fmt::Display for DecodeCause {
 /// 进程级一份（单 GPU 设备），由 `App` 持有（`design/phase-13-resources-snapshot.md` §8）。
 pub struct ResourceCache {
     entries: Arena<Entry, ResourceId>,
-    /// 图片页 + 分配器：**首次 `insert` 时按图片尺寸选档并锁定**（DEVIATIONS F-208）。
+    /// 图片页 + 分配器：**固定用最大档**（`MAX_ATLAS_PAGE` = 2048，见 `insert` 里的说明），
+    /// 因此容纳能力与第一张图片的尺寸无关。
     ///
     /// 没有插入过图片时不分配 CPU 页（16 MiB 量级）、GPU 纹理与 staging。
     page: Option<PageState>,
