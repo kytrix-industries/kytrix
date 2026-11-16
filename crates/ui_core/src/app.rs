@@ -1676,8 +1676,21 @@ impl App {
     /// 只在**布局实际重跑过**之后调用（帧内 `layout_if_dirty` 之后）：没有重排时范围不会变，
     /// 每帧遍历所有滚动槽是纯浪费。
     fn normalize_scroll_offsets(&mut self, window: WindowId) {
+        if self.clamp_scroll_offsets(window) {
+            // 帧首夹紧可能发生在没有其它脏位的帧里（「内容变短」不标任何脏位），
+            // 必须自己请求一帧，否则会停在 Idle 上永远不修。
+            self.request_frame();
+        }
+    }
+
+    /// 把所有滚动槽的偏移夹回 `content − viewport` 范围；返回是否有变化。
+    ///
+    /// 调用点有两个：帧首（用上一帧的视口尺寸）与**布局之后**（用本帧的新视口尺寸）。
+    /// 只做帧首夹紧时，窗口变大导致视口变大的那一帧仍会用旧上限，于是内容上移过多 /
+    /// 底部空白会被画出来，而下一帧不一定存在（泵会因为无脏位而阻塞）——参见复审 P2-8。
+    fn clamp_scroll_offsets(&mut self, window: WindowId) -> bool {
         let Some(target) = self.windows.get_mut(&window) else {
-            return;
+            return false;
         };
         // 先收集（遍历时 `tree_mut` 与 `viewport` 的只读借用会冲突）。
         let nodes: SmallVec<[crate::node::id::NodeId; 8]> = target
@@ -1706,9 +1719,7 @@ impl App {
             target.a11y_note_scroll(node);
             changed = true;
         }
-        if changed {
-            self.request_frame();
-        }
+        changed
     }
 
     /// 相对滚动。
@@ -3026,6 +3037,13 @@ impl App {
         // 布局后（视口尺寸已知/已变）再修一次虚拟列表窗口：首次布局前视口 = 0，不能靠
         // `set_virtual_items` 那一次调用定终身（P10 §8.3 / 评审 #5）。
         self.rewindow_virtuals(window);
+        // 布局之后再夹一次滚动偏移：帧首那次用的是**上一帧**视口，窗口变大时上限变小，
+        // 旧偏移会越界——本帧 paint 就用它，于是内容上移过多/底部空白上屏（复审 P2-8）。
+        // 这里不请求帧：damage 已累积、本帧 paint 会消费它，除非真的没有帧可出。
+        let clamped = self.clamp_scroll_offsets(window);
+        if clamped {
+            self.request_frame();
+        }
         // 图集页上传（P13：逐窗口分发，两张页分开、顺序固定以便帧记录复现）。
         self.upload_atlas_pages();
         let paint = match self.windows.get_mut(&window) {
@@ -5572,6 +5590,65 @@ mod interaction_tests {
             .expect("caret");
         assert!((after.origin.y - before.origin.y + 50.0).abs() < 0.01);
         assert!((after.origin.x - before.origin.x).abs() < 0.01);
+    }
+
+    /// P2-8：窗口变大导致视口变大时，滚动偏移必须在**同一帧**内夹紧。
+    ///
+    /// 只做帧首夹紧时，这一帧用的是上一帧的视口上限，paint 会把越界的偏移画上屏
+    /// （内容上移过多 / 底部空白），而下一次输入之前不一定还有帧。
+    #[test]
+    fn scroll_offset_is_clamped_in_the_same_frame_as_a_resize() {
+        let (_rt, mut app, window) = setup();
+        // 百分比尺寸的滚动容器：视口随窗口变化（固定尺寸容器不会触发这条路径）。
+        let mut style = Style::default();
+        style.inner.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::percent(1.0),
+            height: taffy::style::Dimension::percent(1.0),
+        };
+        style.clip = Clip::Bounds;
+        let tree = app.window_mut(window).expect("window").tree_mut();
+        let root = tree.root();
+        let container = NodeBuilder::boxed()
+            .style(style)
+            .build(tree, root)
+            .expect("mount");
+        app.window_mut(window)
+            .expect("window")
+            .set_size(crate::math::Size::new(200.0, 150.0));
+        frame(&mut app, window);
+        let handle = app
+            .make_scroll(
+                window,
+                container,
+                ScrollConfig {
+                    axis: ScrollAxis::Vertical,
+                    line_height: 48.0,
+                },
+            )
+            .expect("scrollable");
+        app.set_scroll_content(&handle, crate::math::Size::new(200.0, 200.0))
+            .expect("content");
+        frame(&mut app, window);
+        let offset = |app: &App| {
+            app.window(window)
+                .expect("window")
+                .tree()
+                .scroll_slot(container)
+                .expect("slot")
+                .offset
+                .y
+        };
+        app.scroll_to(&handle, Point::new(0.0, 50.0))
+            .expect("scroll");
+        frame(&mut app, window);
+        assert_eq!(offset(&app), 50.0, "前置条件：视口 150 / 内容 200 ⇒ max 50");
+
+        // 窗口长高到 400 ⇒ 视口 400 > 内容 200 ⇒ max 0：偏移必须在同一帧归零。
+        app.window_mut(window)
+            .expect("window")
+            .set_size(crate::math::Size::new(200.0, 400.0));
+        frame(&mut app, window);
+        assert_eq!(offset(&app), 0.0, "resize 那一帧就必须夹紧");
     }
 
     #[test]
