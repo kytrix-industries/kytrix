@@ -164,6 +164,18 @@ enum Content {
     Geometry(crate::paint::geometry::GeometryId),
 }
 
+/// 该内容是否会产生图元（决定要不要为它压一层内容 clip）。
+///
+/// `rebuild_lane` 的 clip 深度校验与 `PrimitiveEmitter::emit_content` 必须用**同一个**
+/// 判据，否则两处对「这一层占不占深度」的判断不一致。
+fn content_needs_clip(content: &Content) -> bool {
+    match content {
+        Content::Box => false,
+        Content::Text(line) => line.is_some(),
+        Content::Canvas(_) | Content::Geometry(_) => true,
+    }
+}
+
 fn paint_node(
     context: &mut PaintContext<'_>,
     node: NodeId,
@@ -355,9 +367,10 @@ fn rebuild_lane(
         )
     };
 
-    // 本节点自身的内容 clip 还会再占一层（见 `emit_content`）：先按最坏情况校验深度，
-    // 超深时返回 `ClipDepthExceeded` 而不是让 `Lane::push` 的 debug 断言在编码期炸掉。
-    let own_clip_levels = usize::from(content_clip.is_some());
+    // 本节点自身的内容 clip 还会再占一层（见 `emit_content`）。用**同一个**判据算层数：
+    // 纯盒子 / 还没 shape 好的文本不产图元、也不压 clip，不能在这里虚报一层 —— 否则
+    // 8 层嵌套的空容器会被误判超深。
+    let own_clip_levels = usize::from(content_clip.is_some() && content_needs_clip(&content));
     if clip.rects.len() + own_clip_levels > usize::from(crate::paint::scene::MAX_CLIP_DEPTH) {
         return Err(EngineError::ClipDepthExceeded {
             node,
@@ -614,11 +627,7 @@ impl PrimitiveEmitter {
         //
         // 只在**确实有内容**时压括号：`Content::Box`（纯盒子）与还没 shape 好的文本不产生
         // 图元，白压一对 `Clip` 会白占一层 clip 深度（嵌套容器很容易因此提前触顶）。
-        let has_content = match &self.content {
-            Content::Box => false,
-            Content::Text(line) => line.is_some(),
-            Content::Canvas(_) | Content::Geometry(_) => true,
-        };
+        let has_content = content_needs_clip(&self.content);
         let content_clip = self
             .content_clip
             .filter(|_| has_content)
@@ -1264,6 +1273,18 @@ mod tests {
                 .clip_key(deepest)
                 .is_some_and(|(depth, _)| depth == 7)
         );
+    }
+
+    #[test]
+    fn empty_clipping_containers_do_not_consume_clip_depth() {
+        // 纯 `Box` 容器不产图元 ⇒ 也不压内容 clip。旧实现按「有 `Clip::Bounds` 就算一层」
+        // 校验深度，8 层嵌套的空容器会被误判超深（`ClipDepthExceeded`），实际它一个图元
+        // 都没有、根本不需要 clip。
+        let mut h = Harness::new();
+        let _ = nest_clips(&mut h, usize::from(crate::paint::scene::MAX_CLIP_DEPTH));
+        // `h.paint()` 内部会 `expect` 成功：这里唯一要验的就是**不报** `ClipDepthExceeded`。
+        // 各层 lane 里仍有「祖先 clip 的括号」原始图元，所以不能断言 rebuilt == 0。
+        let _ = h.paint();
     }
 
     #[test]
