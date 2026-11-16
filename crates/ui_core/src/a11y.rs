@@ -59,6 +59,10 @@ pub enum A11yRole {
     Table,
     /// 网格。
     Grid,
+    /// 表格行 / 网格行（虚拟列表的行也用 `Row`，配合 `row_index` / `row_count`）。
+    Row,
+    /// 单元格（表格 / 网格里的格子，配合 `row_index` / `column_index`）。
+    Cell,
     /// 滚动容器。
     ScrollView,
     /// 滚动条。
@@ -162,6 +166,11 @@ pub struct A11yOverride {
     pub label: Option<SmolStr>,
     /// 值（输入框内容等）。
     pub value: Option<SmolStr>,
+    /// 行/列位置与总数（表格语义；`None` = 不表态，P2-7）。
+    pub row_index: Option<usize>,
+    pub column_index: Option<usize>,
+    pub row_count: Option<usize>,
+    pub column_count: Option<usize>,
     /// 补充说明（`aria-description` 语义）。
     pub description: Option<SmolStr>,
     /// 显式动作表；`None` ⇒ 按角色默认。
@@ -187,6 +196,14 @@ pub struct A11yPatch {
     pub disabled: Option<bool>,
     /// 隐藏。
     pub hidden: Option<bool>,
+    /// 行/列位置与总数（虚拟列表 / 表格的语义，P2-7）。`None` = 不表态。
+    ///
+    /// 屏幕阅读器靠这些字段播报「第 N 行，共 M 行」，并支持按行列导航；虚拟列表的
+    /// `Row` 必须给 `row_index`，否则整棵树会被当成一堆无名容器。
+    pub row_index: Option<usize>,
+    pub column_index: Option<usize>,
+    pub row_count: Option<usize>,
+    pub column_count: Option<usize>,
     /// 勾选/开关状态（`accesskit::Toggled`）。
     ///
     /// `RadioButton` / `CheckBox` / `Switch` 的勾选态都走这个通道：UIA 的 RadioButton 只有
@@ -262,6 +279,11 @@ pub struct A11yNode {
     pub selected: Option<bool>,
     /// 展开（`None` = 不表态）。
     pub expanded: Option<bool>,
+    /// 行/列位置与总数（`None` = 不表态；虚拟列表 / 表格的语义，P2-7）。
+    pub row_index: Option<usize>,
+    pub column_index: Option<usize>,
+    pub row_count: Option<usize>,
+    pub column_count: Option<usize>,
     /// 引擎侧的**直接**子节点（未过滤）。
     pub children: Vec<A11yNodeId>,
     /// 父节点。

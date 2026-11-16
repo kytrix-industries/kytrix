@@ -136,6 +136,19 @@ pub(crate) fn node_a11y(
         checked,
         selected: patch.and_then(|patch| patch.selected),
         expanded: patch.and_then(|patch| patch.expanded),
+        // 行列语义：静态声明优先，其次动态补丁（与 role / label 的合并方向一致）。
+        row_index: over
+            .and_then(|over| over.row_index)
+            .or_else(|| patch.and_then(|patch| patch.row_index)),
+        column_index: over
+            .and_then(|over| over.column_index)
+            .or_else(|| patch.and_then(|patch| patch.column_index)),
+        row_count: over
+            .and_then(|over| over.row_count)
+            .or_else(|| patch.and_then(|patch| patch.row_count)),
+        column_count: over
+            .and_then(|over| over.column_count)
+            .or_else(|| patch.and_then(|patch| patch.column_count)),
         children,
         parent: target.parent().map(A11yNodeId::from_engine),
     })
@@ -191,6 +204,32 @@ mod tests {
         let parent = NodeBuilder::boxed().build(tree, root).expect("parent");
         let child = NodeBuilder::boxed().build(tree, parent).expect("child");
         (root, parent, child)
+    }
+
+    /// P2-7：静态声明的行/列语义必须出现在快照里（虚拟列表 / 表格播报依赖它）。
+    #[test]
+    fn row_and_column_semantics_come_from_the_static_override() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let row = NodeBuilder::boxed()
+            .a11y(crate::a11y::A11yOverride {
+                role: Some(crate::a11y::A11yRole::Row),
+                row_index: Some(3),
+                row_count: Some(100),
+                ..crate::a11y::A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("row");
+        let mut diagnostics = Vec::new();
+        let node = super::node_a11y(&tree, row, crate::math::Scale::ONE, "", &mut diagnostics)
+            .expect("snapshot");
+        assert_eq!(node.row_index, Some(3));
+        assert_eq!(node.row_count, Some(100));
+        assert_eq!(node.column_index, None, "未声明列语义时不得凭空编造");
+        // 快照转 accesskit 后必须真的写到节点上（屏幕阅读器读的是这一层）。
+        let ak = crate::a11y::adapter::to_accesskit(&node);
+        assert_eq!(ak.row_index(), Some(3));
+        assert_eq!(ak.row_count(), Some(100));
     }
 
     #[test]

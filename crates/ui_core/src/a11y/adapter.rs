@@ -278,6 +278,20 @@ pub(crate) fn to_accesskit(record: &crate::a11y::A11yNode) -> accesskit::Node {
     if let Some(expanded) = record.expanded {
         node.set_expanded(expanded);
     }
+    // 表格 / 虚拟列表的行列语义（P2-7）：屏幕阅读器据此播报「第 N 行 / 共 M 行」并支持
+    // 按行列导航。没声明就不写（AccessKit 的 `None` 与「0 行」语义不同）。
+    if let Some(index) = record.row_index {
+        node.set_row_index(index);
+    }
+    if let Some(index) = record.column_index {
+        node.set_column_index(index);
+    }
+    if let Some(count) = record.row_count {
+        node.set_row_count(count);
+    }
+    if let Some(count) = record.column_count {
+        node.set_column_count(count);
+    }
     for action in &record.actions {
         node.add_action(action_to_accesskit(*action));
     }

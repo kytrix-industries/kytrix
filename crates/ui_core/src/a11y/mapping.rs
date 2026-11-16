@@ -40,6 +40,8 @@ pub(crate) const fn role_to_accesskit(role: A11yRole) -> accesskit::Role {
         R::ListBoxOption => Role::ListBoxOption,
         R::Table => Role::Table,
         R::Grid => Role::Grid,
+        R::Row => Role::Row,
+        R::Cell => Role::Cell,
         R::ScrollView => Role::ScrollView,
         R::ScrollBar => Role::ScrollBar,
         R::Image => Role::Image,
