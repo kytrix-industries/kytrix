@@ -37,6 +37,9 @@ use crate::{
 /// 一帧的 lane 重建/复用。字段是 crate 内可见（`pub(crate)` 结构的 `pub` 字段不触发 lint）。
 pub(crate) struct PaintPass<'a> {
     pub tree: &'a mut NodeTree,
+    /// 静态几何注册表：几何内容的 damage 用它自己的 AABB（`GeometryDesc.bounds`），
+    /// 而不是节点布局盒 —— 顶点可以在节点盒之外（`desc.bounds` 才是真实可见范围）。
+    pub geometry: &'a crate::paint::geometry_store::GeometryStore,
     pub scene: &'a mut Scene,
     pub damage: &'a mut DamageAccumulator,
     pub scale: Scale,
@@ -78,6 +81,7 @@ impl PaintPass<'_> {
         #[cfg(feature = "test-support")]
         let log = std::mem::take(&mut self.log);
         let mut context = PaintContext {
+            geometry: self.geometry,
             tree,
             scene,
             damage,
@@ -106,6 +110,7 @@ impl PaintPass<'_> {
 
 /// 一次遍历的借用包（避免 `&mut self` 与 `&self.tree` 的借用冲突）。
 struct PaintContext<'a> {
+    geometry: &'a crate::paint::geometry_store::GeometryStore,
     tree: &'a mut NodeTree,
     scene: &'a mut Scene,
     damage: &'a mut DamageAccumulator,
@@ -490,6 +495,19 @@ fn negate(offset: Point) -> Point {
     Point::new(-offset.x, -offset.y)
 }
 
+/// 几何内容的 damage 范围：优先用注册表里的 `GeometryDesc.bounds`（真实可见范围，
+/// 逻辑窗口坐标），句柄陈旧/未注册时退回节点布局盒。
+fn geometry_damage(
+    geometry: &crate::paint::geometry_store::GeometryStore,
+    id: crate::paint::geometry::GeometryId,
+    node_bounds: Rect,
+    offset: Point,
+) -> Rect {
+    geometry
+        .desc_arc(id)
+        .map_or(node_bounds, |desc| desc.bounds.translate(negate(offset)))
+}
+
 impl PrimitiveEmitter {
     fn push(&mut self, context: &mut PaintContext<'_>, primitive: Primitive) {
         let _ = context.scene.push(self.lane, primitive);
@@ -672,7 +690,12 @@ impl PrimitiveEmitter {
                             .with_opacity(opacity),
                     }),
                 );
-                context.damage.push(self.bounds, 1.0, self.clip);
+                // 几何的可见范围是它**自己的** AABB（`desc.bounds`，逻辑窗口坐标），
+                // 可能超出节点布局盒。旧实现按节点盒推 damage，于是几何溢出部分在局部
+                // 刷新时不会被重画（残影，复审 P2-2）。节点盒仍是命中测试的范围。
+                let geometry_bounds =
+                    geometry_damage(context.geometry, id, self.bounds, self.offset);
+                context.damage.push(geometry_bounds, 1.0, self.clip);
             }
             Content::Canvas(canvas) => {
                 let canvas_bounds = canvas.bounds();
@@ -777,8 +800,10 @@ mod tests {
         fn try_paint(&mut self) -> Result<super::PaintReport, crate::error::EngineError> {
             self.damage.reset(scale());
             self.order.clear();
+            let geometry_store = crate::paint::geometry_store::GeometryStore::new();
             let mut pass = PaintPass {
                 tree: &mut self.tree,
+                geometry: &geometry_store,
                 scene: &mut self.scene,
                 damage: &mut self.damage,
                 scale: scale(),
@@ -835,6 +860,42 @@ mod tests {
     fn lane_primitives(harness: &Harness, node: crate::node::id::NodeId) -> Vec<Primitive> {
         let lane = harness.tree.lane_of(node).expect("lane");
         harness.scene.lane_primitives(lane).expect("存在").to_vec()
+    }
+
+    /// P2-2：几何 damage 必须用 `GeometryDesc.bounds`（真实可见范围），而不是节点布局盒。
+    #[test]
+    fn geometry_damage_uses_the_registered_bounds() {
+        use crate::paint::geometry::{GeometryDesc, GeometryPipeline, IndexType, Topology};
+        let stride = GeometryPipeline::Ui.vertex_stride() as usize;
+        let desc = GeometryDesc {
+            vertex_bytes: bytes::Bytes::from(vec![0u8; stride * 3]),
+            index_bytes: bytes::Bytes::from(vec![0u8, 0, 1, 0, 2, 0]),
+            vertex_stride: stride as u32,
+            index_type: IndexType::U16,
+            topology: Topology::TriangleList,
+            // 几何真实范围 200×200，节点布局盒只有 10×10（溢出）。
+            bounds: Rect::new(0.0, 0.0, 200.0, 200.0),
+            pipeline: GeometryPipeline::Ui,
+        };
+        let mut store = crate::paint::geometry_store::GeometryStore::new();
+        let id = store.insert(desc).expect("valid geometry");
+        let node_bounds = Rect::new(0.0, 0.0, 10.0, 10.0);
+
+        let damage = super::geometry_damage(&store, id, node_bounds, Point::ZERO);
+        assert_eq!(damage, Rect::new(0.0, 0.0, 200.0, 200.0), "用 desc.bounds");
+
+        // 祖先滚动偏移要换算到屏幕坐标。
+        let scrolled = super::geometry_damage(&store, id, node_bounds, Point::new(0.0, 50.0));
+        assert_eq!(scrolled, Rect::new(0.0, -50.0, 200.0, 200.0));
+
+        // 陈旧句柄退回节点盒（不会因为查不到就丢掉 damage）。
+        let stale = super::geometry_damage(
+            &store,
+            crate::paint::geometry::GeometryId::for_test(99, 1),
+            node_bounds,
+            Point::ZERO,
+        );
+        assert_eq!(stale, node_bounds);
     }
 
     #[test]

@@ -1072,6 +1072,7 @@ impl Window {
         let focused = self.focus.focused();
         let mut pass = PaintPass {
             tree: &mut self.tree,
+            geometry,
             scene: &mut self.scene,
             damage: &mut self.damage,
             scale,

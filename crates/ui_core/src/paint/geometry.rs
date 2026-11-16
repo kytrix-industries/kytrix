@@ -110,7 +110,11 @@ pub struct GeometryDesc {
     pub vertex_stride: u32,
     pub index_type: IndexType,
     pub topology: Topology,
-    /// **逻辑像素** AABB（局部空间，未经变换）。damage / 命中 / 裁剪判断的唯一来源。
+    /// **逻辑像素** AABB（几何局部空间 = 逻辑窗口坐标，未经 draw.basis 变换）。
+    ///
+    /// 用途：paint 的 damage 范围（顶点可以画到节点布局盒之外，只有它知道真实
+    /// 可见范围）。**命中测试仍用节点布局盒** —— 几何不参与命中形状计算，
+    /// 交互区域由节点盒决定（应用需要更大的热区时给节点设 size）。
     pub bounds: Rect,
     pub pipeline: GeometryPipeline,
 }
