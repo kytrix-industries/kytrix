@@ -2423,24 +2423,30 @@ impl App {
         self.windows.get_mut(&id)
     }
 
-    /// 关窗：精确退订该窗口全部节点的依赖，然后丢弃。返回 `false` = 窗口不存在。
-    /// 注册窗口的「关闭前」处理器：返回 alse 拦下关闭（P2-8）。
+    /// 注册窗口的「关闭前」处理器：返回 `false` 拦下关闭（P2-8）。
     ///
     /// 平台在用户点 X / Cmd-W 时先调用它；应用可在此保存未提交状态、弹确认框。
+    /// 窗口不存在时**忽略**注册（否则会留下一个永远不会被调用、却持有应用闭包的条目）。
     pub fn on_close(&mut self, id: WindowId, handler: impl FnMut(&mut Self) -> bool + 'static) {
+        if !self.windows.contains_key(&id) {
+            return;
+        }
         self.close_handlers.insert(id, Box::new(handler));
     }
-    /// 平台关闭路径：先问关闭前处理器，允许才关。返回 true = 窗口已关闭。
+
+    /// 平台关闭路径：先问关闭前处理器，允许才关。返回 `true` = 窗口已关闭。
     ///
     /// 处理器用「取出 → 调用 → 放回」的方式调用（与 a11y handler 同一做法）：它需要
-    /// &mut App，不能在使用 self.close_handlers 的借用期内存活。
+    /// `&mut App`，不能在使用 `self.close_handlers` 的借用期内存活。
     pub(crate) fn request_close(&mut self, id: WindowId) -> bool {
         let Some(mut handler) = self.close_handlers.remove(&id) else {
             return self.close_window(id);
         };
         let allow = handler(self);
-        // 处理器里可能已经把窗口关了（例如它自己调用 close_window）：此时不要再放回。
-        if self.windows.contains_key(&id) {
+        // 放回的两条判据：
+        // - 处理器里可能已经把窗口关了（自己调用 `close_window`）⇒ 不要再放回；
+        // - 处理器里可能**重新注册**了新的处理器 ⇒ 不能拿旧闭包覆盖它。
+        if self.windows.contains_key(&id) && !self.close_handlers.contains_key(&id) {
             self.close_handlers.insert(id, handler);
         }
         if !allow {
@@ -2450,10 +2456,14 @@ impl App {
         self.close_window(id)
     }
 
+    /// 关窗：精确退订该窗口全部节点的依赖，然后丢弃。返回 `false` = 窗口不存在。
+    ///
+    /// 同时清理所有按窗口的旁表（关闭处理器 / a11y 限流戳 / scale epoch / 动画槽），
+    /// 否则 create/close 循环下这些表会无界增长。
     pub fn close_window(&mut self, id: WindowId) -> bool {
         // 按窗口的旁表必须一并清掉，否则 create/close 循环下无界增长 —— 尤其是
         // `close_handlers`：它持有应用闭包（可能捕获大量状态）。`WindowId` 单调不复用，
-        // 所以不会串用，但泄漏是真实的（复审发现：上一个提交声称清了，实际没清）。
+        // 所以不会串用，但泄漏是真实的（复审发现：早期提交声称清了，实际没清）。
         self.close_handlers.remove(&id);
         self.a11y_delivered.remove(&id);
         self.scale_epochs.remove(&id);
@@ -4400,6 +4410,42 @@ mod tests {
         let _ = app.a11y_take(window);
     }
     /// P2-8：`on_close` 返回 false 必须拦下关闭，返回 true 才真的关。
+    /// P2-3：给不存在的窗口注册关闭处理器必须被忽略（否则留下永不调用、却持有闭包的条目）。
+    #[test]
+    fn on_close_ignores_unknown_windows() {
+        let (_rt, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        let ghost = app.create_window(WindowOptions::default());
+        assert!(app.close_window(ghost));
+        let called = std::rc::Rc::new(std::cell::Cell::new(0_u32));
+        let counter = called.clone();
+        app.on_close(ghost, move |_app| {
+            counter.set(counter.get() + 1);
+            false
+        });
+        assert!(!app.request_close(ghost), "已关闭的窗口没有可拦的关闭请求");
+        assert_eq!(called.get(), 0, "幽灵处理器不得被调用");
+        // 正常窗口仍可注册。
+        app.on_close(window, |_app| false);
+        assert!(!app.request_close(window));
+    }
+
+    /// P2-3：处理器内部重新注册的处理器，不能被 take→put 的旧闭包覆盖。
+    #[test]
+    fn close_handler_reregistration_is_not_overwritten() {
+        let (_rt, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        app.on_close(window, move |app| {
+            // 第一次询问后换成一个「永远拦下」的新处理器；再点一次时必须走新的。
+            app.on_close(window, |_app| false);
+            false
+        });
+        assert!(!app.request_close(window), "旧处理器拦下");
+        // 新处理器同样是拦下，但关键是它必须在表里（不是旧闭包）。
+        assert!(!app.request_close(window), "新处理器也必须被问到");
+        assert!(app.window(window).is_some(), "两次都拦下，窗口仍在");
+    }
+
     #[test]
     fn close_handler_can_veto_the_close() {
         let (_rt, mut app) = new_app();
