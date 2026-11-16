@@ -282,6 +282,21 @@ impl InFlightRing {
         }
     }
 
+    /// 偷看下一次 [`InFlightRing::acquire`] 会给出的槽位，**不推进**轮转。
+    ///
+    /// 消费者：macOS 的 per-slot 背压（P1-2.12）—— 必须先知道「准备用哪个槽」才能检查
+    /// 该槽自己的 permit 是否已归还，而不是盲目地先取一个 permit。
+    /// Windows / Linux 用单调 fence / timeline，不需要这个入口。
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn peek(&self) -> FrameSlot {
+        let index = self.next_slot;
+        FrameSlot {
+            index,
+            wait_value: self.slot_values[index],
+            signal_value: self.next_value + 1,
+        }
+    }
+
     /// 提交成功后推进该槽的 fence 值。
     pub(crate) fn advance(&mut self, slot: FrameSlot) {
         self.slot_values[slot.index] = slot.signal_value;
@@ -351,6 +366,23 @@ mod tests {
             #[cfg(target_os = "linux")]
             buffer_scale: 1,
             published_at: Instant::now(),
+        }
+    }
+
+    /// `peek` 必须与紧接着的 `acquire` 给出同一个槽（macOS 的 per-slot 背压依赖它，P1-2.12）。
+    #[test]
+    fn peek_matches_the_next_acquire() {
+        let mut ring = InFlightRing::new();
+        for expected in [0, 1, 2, 0] {
+            let peeked = ring.peek();
+            assert_eq!(peeked.index, expected, "peek 不得推进轮转");
+            let acquired = ring.acquire();
+            assert_eq!(acquired.index, peeked.index, "peek 必须先于 acquire 一致");
+            assert_eq!(
+                acquired.signal_value, peeked.signal_value,
+                "peek 给出的 fence 值也必须与 acquire 一致"
+            );
+            ring.advance(acquired);
         }
     }
 

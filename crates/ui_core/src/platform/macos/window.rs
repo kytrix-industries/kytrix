@@ -313,8 +313,12 @@ impl NativeWindow {
     }
 
     /// 动画定时器的开关（`pump` 每轮调用；空闲时移除定时器 ⇒ 不轮询）。
+    ///
+    /// 间隔按**屏幕实际刷新率**取（P1-2.12）：写死 `1/60` 在 120 Hz 屏上会让动画被系统
+    /// 的定时器节流成 60 Hz，而在 50 Hz 屏上又高于刷新率、白跑一轮。
     pub(crate) fn set_animating(&self, active: bool) {
-        wake::set_animating(active, 1.0 / 60.0);
+        let refresh = self.maximum_frames_per_second().max(1.0);
+        wake::set_animating(active, f64::from(1.0 / refresh));
     }
 }
 

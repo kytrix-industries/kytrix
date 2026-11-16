@@ -483,7 +483,8 @@ mod tests {
 
         // 第 1 帧：整页上传（新页必须整页，DEVIATIONS F-211），内容全零。
         atlas.queue_upload(AtlasKind::Image, TEST_PAGE, page(), rows(0, u32::MAX));
-        let (slot_full, command_full) = queue.begin().expect("command full");
+        let slot_full = queue.try_acquire().expect("upload slot full");
+        let command_full = queue.begin().expect("command full");
         atlas
             .prepare(&mut device, &mut queue, FrameIndex::from_raw(1))
             .expect("prepare full");
@@ -517,7 +518,8 @@ mod tests {
         fill_row(&mut first_page, 5, [0x11, 0x22, 0x33, 0xFF]);
         let first_row = first_page[5 * TEST_PAGE as usize * 4..6 * TEST_PAGE as usize * 4].to_vec();
         atlas.queue_upload(AtlasKind::Image, TEST_PAGE, first_row, rows(5, 6));
-        let (slot1, command1) = queue.begin().expect("command 1");
+        let slot1 = queue.try_acquire().expect("upload slot 1");
+        let command1 = queue.begin().expect("command 1");
         atlas
             .prepare(&mut device, &mut queue, FrameIndex::from_raw(2))
             .expect("prepare frame 1");
@@ -540,7 +542,8 @@ mod tests {
         let second_row =
             second_page[7 * TEST_PAGE as usize * 4..8 * TEST_PAGE as usize * 4].to_vec();
         atlas.queue_upload(AtlasKind::Image, TEST_PAGE, second_row, rows(7, 8));
-        let (slot2, command2) = queue.begin().expect("command 2");
+        let slot2 = queue.try_acquire().expect("upload slot 2");
+        let command2 = queue.begin().expect("command 2");
         atlas
             .prepare(&mut device, &mut queue, FrameIndex::from_raw(3))
             .expect("prepare frame 2");

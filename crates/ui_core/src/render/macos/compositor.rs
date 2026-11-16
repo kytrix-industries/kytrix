@@ -58,6 +58,11 @@ const ROOT_UNIFORM_BYTES: usize = 112;
 pub(crate) struct GpuRenderer {
     device: Device,
     queue: Queue,
+    /// 已取到、尚未交给 `begin` 的上传槽（P1-2.12）。
+    ///
+    /// permit 必须与**具体槽**绑定：`try_acquire` 取的是某一槽的许可，`begin` 必须用
+    /// 同一个槽，否则上传会写进别的在飞帧正在读的缓冲。
+    pending_slot: Option<crate::render::frame::FrameSlot>,
     pipeline: Pipeline,
     atlas: AtlasTextures,
     persist: Persist,
@@ -132,6 +137,7 @@ impl GpuRenderer {
             surface: size,
             scale: 1.0,
             geometry: GeometryRegistry::new(),
+            pending_slot: None,
             fresh: true,
             last_index: FrameIndex::default(),
             window_target,
@@ -162,12 +168,15 @@ impl GpuRenderer {
 
     /// 非阻塞取一个上传槽（三缓冲背压，I1）：`false` = 三帧在飞，本帧跳帧。
     pub(crate) fn try_acquire_upload_slot(&mut self) -> bool {
-        self.queue.try_acquire()
+        self.pending_slot = self.queue.try_acquire();
+        self.pending_slot.is_some()
     }
 
     /// 归还一个已经取到、但本帧没有提交的槽位（防御路径）。
     pub(crate) fn release_upload_slot(&mut self) {
-        self.queue.release();
+        if let Some(slot) = self.pending_slot.take() {
+            self.queue.release(slot);
+        }
     }
 
     /// 目标尺寸变化时重建 persist：**不等待在飞帧**（§5.4）。
@@ -381,7 +390,21 @@ impl GpuRenderer {
             "partial plans must carry their dirty set"
         );
         let frame_started = Instant::now();
-        let (slot, command) = self.queue.begin()?;
+        // 用 `try_acquire` 已经取到的那个槽：permit 与上传槽必须一一对应（P1-2.12）。
+        //
+        // 离屏 / 快照路径走 `submit_blocking`（每帧同步等完成），没有窗口路径的背压，
+        // 因此那里不会预先取槽 —— 此时现场取一个即可：上一帧已经 `waitUntilCompleted`，
+        // 该槽必然空闲。取不到说明三槽都在飞，属于状态破坏，按 `AppInit` 上报。
+        let slot = match self.pending_slot.take() {
+            Some(slot) => slot,
+            None => self.queue.try_acquire().ok_or_else(|| EngineError::AppInit {
+                detail: smol_str::format_smolstr!(
+                    "record_frame could not acquire an upload slot (all {} slots busy on a synchronous path)",
+                    crate::render::frame::MAX_FRAMES_IN_FLIGHT
+                ),
+            })?,
+        };
+        let command = self.queue.begin()?;
         let (instance_count, _clip_count) = self.upload.write(
             &mut self.device,
             &mut self.queue,

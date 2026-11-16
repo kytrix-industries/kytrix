@@ -39,8 +39,17 @@ use crate::{
 pub(crate) struct Queue {
     raw: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     ring: InFlightRing,
-    /// 三槽上传缓冲 / GPU 队列深度（Apple「Synchronizing CPU and GPU work」的三缓冲模式）。
-    slots: DispatchRetained<DispatchSemaphore>,
+    /// **每个上传槽一把** semaphore（各 1 个 permit），Apple「Synchronizing CPU and GPU work」
+    /// 三缓冲模式的标准形态。
+    ///
+    /// P1-2.12 修正：旧实现是**一把** 3-permit 的 semaphore，permit 在完成回调里归还，而槽位按
+    /// **提交次数**轮转。Metal 的完成回调**可以乱序**到达 —— 第 3 帧先完成就归还一个 permit，
+    /// 第 4 帧立刻拿到它并轮转回**第 1 槽**，而第 1 帧可能还在 GPU 上读那块上传缓冲，于是在
+    /// CPU 上重写了 GPU 正在读的字节（内容损坏，Metal validation 检测不到）。
+    ///
+    /// 按槽绑定 permit 之后，「这一槽的上一帧完成」是它唯一的复用前提，与其它槽的完成顺序
+    /// 完全无关 —— 不需要 `MTLSharedEvent`，也不需要假设同队列完成有序。
+    slots: [DispatchRetained<DispatchSemaphore>; MAX_FRAMES_IN_FLIGHT],
     /// retire 的完成顺序（Metal 的完成回调可以乱序到达，见 [`CompletionOrder`]）。
     order: CompletionOrder,
     retire: RetireQueue,
@@ -56,44 +65,50 @@ impl Queue {
         Ok(Self {
             raw,
             ring: InFlightRing::new(),
-            slots: DispatchSemaphore::new(MAX_FRAMES_IN_FLIGHT as isize),
+            slots: std::array::from_fn(|_| DispatchSemaphore::new(1)),
             order: CompletionOrder::new(),
             retire: RetireQueue::new(),
             timer: GpuTimer,
         })
     }
 
-    /// 非阻塞取一个上传槽；`false` = 三帧在飞，本帧跳帧（帧请求留在最新帧槽里）。
+    /// 非阻塞取一个上传槽；`None` = 三帧都在飞，本帧跳帧（帧请求留在最新帧槽里）。
     ///
-    /// 成功之后必须由 [`Queue::submit`] 的完成回调 signal，或用 [`Queue::release`] 归还。
-    pub(crate) fn try_acquire(&self) -> bool {
-        self.slots.wait(DispatchTime::NOW) == 0
+    /// 返回的 `FrameSlot` 与成功取得的 permit **一一对应**：调用方必须把它原样交给
+    /// [`Queue::begin`] + [`Queue::submit`]（或用 [`Queue::release`] 归还），否则该槽的
+    /// permit 会永久泄漏、三帧后彻底停止出帧。
+    pub(crate) fn try_acquire(&mut self) -> Option<FrameSlot> {
+        // 先按轮转算出「下一个要用的槽」，只在**该槽自己的**上一帧完成后才放行。
+        let candidate = self.ring.peek();
+        if self.slots[candidate.index].wait(DispatchTime::NOW) != 0 {
+            return None;
+        }
+        Some(self.ring.acquire())
     }
 
     /// 归还一个已经取到、但本帧没有提交的槽位（防御路径，不与 `submit` 同时用）。
-    pub(crate) fn release(&self) {
-        self.slots.signal();
+    pub(crate) fn release(&self, slot: FrameSlot) {
+        self.slots[slot.index].signal();
     }
 
-    /// 取本帧槽位并建一块命令缓冲：**不等待任何 GPU 工作**。
+    /// 建一块命令缓冲：**不等待任何 GPU 工作**。
     ///
-    /// 槽位按**提交次数**轮转，与三槽 semaphore 同源：调用方必须先 `try_acquire` 成功，且每次
-    /// 成功的 permit 对应恰好一次 `begin` + `submit`（否则上传槽会与 permit 错位）。
+    /// 槽位不在这里分配 —— 它由 [`Queue::try_acquire`] 给出，permit 与上传槽必须同一来源
+    /// （P1-2.12）；调用方把那个槽交给 `upload.write` 与 [`Queue::submit`]。
     pub(crate) fn begin(
         &mut self,
-    ) -> Result<(FrameSlot, Retained<ProtocolObject<dyn MTLCommandBuffer>>), EngineError> {
-        let slot = self.ring.acquire();
+    ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, EngineError> {
         let buffer = self
             .raw
             .commandBuffer()
             .ok_or_else(|| init_error("commandBuffer", "returned nil"))?;
-        Ok((slot, buffer))
+        Ok(buffer)
     }
 
     /// 登记完成通知并 `commit`：立即返回（I2）。
     ///
     /// `completed` 在 Metal 的完成回调里执行（任意线程），因此要求 `Send + 'static`；
-    /// 回调先 `signal` 三槽 semaphore，再把命令缓冲交给调用方（GPU 线程用它在 drain 时读 GPU 时间）。
+    /// 回调先归还**本槽**的 permit，再把命令缓冲交给调用方（GPU 线程用它在 drain 时读 GPU 时间）。
     pub(crate) fn submit(
         &mut self,
         index: FrameIndex,
@@ -101,10 +116,11 @@ impl Queue {
         buffer: &Retained<ProtocolObject<dyn MTLCommandBuffer>>,
         completed: impl Fn(Retained<ProtocolObject<dyn MTLCommandBuffer>>) + Send + 'static,
     ) -> Result<(), EngineError> {
-        let slots = self.slots.clone();
+        let permit = self.slots[slot.index].clone();
         let block = RcBlock::new(
             move |buffer: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-                slots.signal();
+                // 只归还**这一槽**的 permit：与其它槽的完成顺序无关（P1-2.12）。
+                permit.signal();
                 // SAFETY: 参数是 `NonNull`（Metal 保证完成回调收到的命令缓冲非空），且回调期间
                 // 该对象存活；这里 retain 一份交给 GPU 线程在 drain 时读 `GPUStartTime`/`GPUEndTime`。
                 let buffer =
@@ -128,6 +144,10 @@ impl Queue {
     /// 离屏/快照：同步提交（`commit` 后等本帧完成），供 readback 保证内容可读。
     ///
     /// 这是**同步语义**，不是背压：窗口路径永远不经过这里（§4.5 下半段）。
+    ///
+    /// 因为 `waitUntilCompleted` 已经保证本帧结束，这里**同步归还**本槽的 permit
+    /// （P1-2.12）—— 走异步路径的 [`Queue::submit`] 才在完成回调里归还。不归还的话
+    /// 每次离屏提交都会永久吃掉一个 permit，三次之后彻底取不到上传槽。
     pub(crate) fn submit_blocking(
         &mut self,
         index: FrameIndex,
@@ -139,6 +159,7 @@ impl Queue {
         self.ring.advance(slot);
         self.order.submit(index);
         buffer.waitUntilCompleted();
+        self.slots[slot.index].signal();
         self.finish(index, buffer, device)
     }
 

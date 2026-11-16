@@ -30,14 +30,6 @@ const GEOMETRY_METALLIB: &str = concat!(env!("OUT_DIR"), "/shaders/geometry.meta
 /// `include_bytes!` 的占位产物前缀（`ui_core_SKIP_SHADERS=1` 或 host ≠ target）。
 const SKIPPED: &[u8] = b"KYTRIX-SHADER-SKIPPED";
 
-/// 三种几何管线的 PSO。
-#[derive(Clone, Copy)]
-pub(crate) struct GeometryPipelines {
-    ui: &'static (),
-    image: &'static (),
-    glyph: &'static (),
-}
-
 /// 加载后的 shader 库（uber-quad 一族 + geometry 一族）。
 pub(crate) struct ShaderSet {
     quad: Retained<ProtocolObject<dyn MTLLibrary>>,

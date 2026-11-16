@@ -855,7 +855,10 @@ impl WaylandState {
     /// 距离下一次需要合成重复还有多久（事件循环据此决定 `dispatch` 的 timeout）。
     ///
     /// `None` = 没有按住键或重复已关闭 ⇒ 不缩短等待。
-    pub(crate) fn next_key_repeat_in(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+    pub(crate) fn next_key_repeat_in(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
         // 重复关闭 ⇒ `None`（不缩短等待）。
         self.key_repeat.interval()?;
         self.held_keys
@@ -1571,7 +1574,11 @@ mod tests {
             continuous_y: CONTINUOUS_AXIS_UNITS_PER_LINE,
             ..ScrollAccum::default()
         };
-        assert_eq!(one_notch.lines().1, 1.0, "一格连续值 = 1 行（旧实现是 0.083）");
+        assert_eq!(
+            one_notch.lines().1,
+            1.0,
+            "一格连续值 = 1 行（旧实现是 0.083）"
+        );
     }
 
     /// 两条通路在同一 frame 内叠加（服务端可能同时发 `axis` 与 `axis_value120`）。
@@ -1598,9 +1605,20 @@ mod tests {
     /// `repeat_info` 的 `rate == 0` = 服务端要求关闭重复。
     #[test]
     fn zero_repeat_rate_disables_repeats() {
-        assert!(KeyRepeat { rate: 0, delay: 500 }.interval().is_none());
+        assert!(
+            KeyRepeat {
+                rate: 0,
+                delay: 500
+            }
+            .interval()
+            .is_none()
+        );
         assert_eq!(
-            KeyRepeat { rate: 25, delay: 500 }.interval(),
+            KeyRepeat {
+                rate: 25,
+                delay: 500
+            }
+            .interval(),
             Some(std::time::Duration::from_millis(40)),
             "25 Hz ⇒ 40 ms 间隔"
         );

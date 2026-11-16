@@ -339,6 +339,10 @@ impl StickyError {
     }
 }
 
+/// `CAFrameRateRange` 的兜底下限：只在拿不到真实刷新率时使用（正常路径来自
+/// `NSScreen.maximumFramesPerSecond`）。**不是**请求的帧率 —— 见 `new_window` 里锁定刷新率的说明。
+const MIN_FRAME_RATE: f32 = 60.0;
+
 /// `CAMetalDisplayLinkDelegate` 的实例变量（主线程独占）。
 struct DisplayLinkIvars {
     shared: Arc<Shared>,
@@ -412,13 +416,12 @@ impl WindowRenderer {
         let display_link =
             CAMetalDisplayLink::initWithMetalLayer(CAMetalDisplayLink::alloc(), &layer);
         display_link.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-        // 30…刷新率：系统可能因低电量 / 散热下调，按系统给的来（§5.3）。
-        let max_frame_rate = max_frame_rate.max(30.0);
-        display_link.setPreferredFrameRateRange(CAFrameRateRange::new(
-            30.0,
-            max_frame_rate,
-            max_frame_rate,
-        ));
+        // `CAFrameRateRange` 的 `minimum` 是「**可以**降到多低」，不是「至少多高」。
+        // 旧实现写 `(30, max, max)` 等于告诉系统「30 fps 也可接受」，ProMotion 上 GPU 跟得上
+        // 时也会被降到 30 而产生 judder（P1-2.12）。正确用法是把三点都钉在目标刷新率上：
+        // Apple GPTK 与 Metal 文档都要求 `CAFrameRateRangeMake(max, max, max)` 锁定刷新率。
+        let target = max_frame_rate.max(MIN_FRAME_RATE);
+        display_link.setPreferredFrameRateRange(CAFrameRateRange::new(target, target, target));
         // 没有帧要画就没有 vsync：初始空闲（`publish` / `sync_pacing` 负责恢复）。
         display_link.setPaused(true);
         // SAFETY: 主线程、主 run loop；common modes 让 live resize（`NSEventTrackingRunLoopMode`）
