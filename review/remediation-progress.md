@@ -287,3 +287,19 @@ P2-2 本身（bounds 未参与 damage/命中）仍未处理。
   三平台 clippy `-D warnings` / fmt / doc 全干净。
 - 验收标准「所有 P0/P1/P2 修复且通过对抗式复审」达成；剩余项均为已文档化的 P3 backlog
   与需真机目视的视觉确认（txt-1 hinting 取舍、win-1 重新关联 IME、win-2 跨 DPI 拖动）。
+
+## Round 76 快照（2026-11-17，P3 清理完成）
+
+- 累计提交：**93**（基线 a9a4220，分支 ui-core-p0-p2-remediation）。
+- 除真机目视/人工验证项外的全部 P3 backlog 已修复（commit 4489d28）：
+  - Windows 8 项：IME 重关联幂等再摘除、IME 接线/销毁恢复测试、Esc 取消拖动、拖动期间
+    右键/中键/滚轮处理、快速双击自计时兜底、WM_TIMER/WM_CAPTURECHANGED/WM_CANCELMODE
+    测试、MIN_VISIBLE_EDGE 按 DPI 缩放、最大化还原保留竖直偏移；
+  - 文本 4 项：小数 ppem（ppem_q 1/64 量化键）、亚像素相位基于物理坐标（1.25 scale
+    端到端测试）、golden 缺失说明与变量清单、split_subpixel_x 非有限输入防护；
+  - macOS 2 项：replacementRange 文档坐标换算（marked_location）、macOS-only
+    NSNotFound 绑定测试 + 公开文档补全。
+- 最终三平台门禁：Windows **947** / Linux **845** / macOS **836** lib 测试（+6/4/8/39），
+  Windows platform::windows 专项 59 条；三平台 clippy -D warnings / fmt / doc 全干净。
+- 仅剩人工项（不阻塞验收）：关 hinting 的视觉观感、win-2 跨 DPI 拖动目视、win-1 真机输入法
+  切换、macOS 真实 IME；以及「泵每轮调用 sync_ime_enabled」一行无自动测试（需真实泵+渲染器）。

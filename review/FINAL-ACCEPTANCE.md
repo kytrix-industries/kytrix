@@ -17,9 +17,9 @@
 
 | 平台 | 测试 | clippy | fmt | doc |
 |---|---|---|---|---|
-| Windows（本机） | **921** + 57 | `-D warnings` 干净 | 干净 | 无警告 |
-| Linux（192.168.130.128） | **835** + 57 | 干净 | 干净 | 干净 |
-| macOS（192.168.1.6） | **825** + 57 | 干净 | 干净 | 干净 |
+| Windows（本机） | **947** + 57 | `-D warnings` 干净 | 干净 | 无警告 |
+| Linux（192.168.130.128） | **845** + 57 | 干净 | 干净 | 干净 |
+| macOS（192.168.1.6） | **836** + 57 | 干净 | 干净 | 干净 |
 
 ## 2. 修复方法论
 
@@ -79,6 +79,24 @@
   P1/P2 已全部修复（commit `3bd8846`，含 `NS_NOT_FOUND == isize::MAX as usize`
   回归断言），P3 记入 backlog。
 
-## 7. 台账
+## 7. P3 backlog 清理（已完成，commit `4489d28`）
+
+除「需真机目视/人工验证」项外的全部 P3 已修复：
+
+- **Windows（8 项）**：禁用态 IME 重关联幂等再摘除、IME 接线/销毁恢复测试、Esc 取消
+  拖动、拖动期间右键/中键/滚轮处理、快速双击自计时兜底、`WM_TIMER`/`WM_CAPTURECHANGED`/
+  `WM_CANCELMODE` 测试、`MIN_VISIBLE_EDGE` 按 DPI 缩放、最大化还原保留光标竖直偏移。
+- **文本（4 项）**：小数 ppem（`ppem_q` 1/64 量化键）、亚像素相位改为基于物理坐标
+  （含 1.25 scale 端到端测试）、文本 golden 缺失说明与未来 golden 变量清单、
+  `split_subpixel_x` 非有限输入防护。
+- **macOS（2 项）**：`replacementRange` 文档坐标 → 组合串坐标（`marked_location` 参数 +
+  `debug_assert` 不变量 + 越界测试）、macOS-only `NSNotFound` 绑定测试 + 公开文档补全。
+
+**仅剩人工项**：关 hinting 的字形观感（100/125/150/200%）、win-2 跨 DPI 拖动目视、
+win-1 真机输入法切换、macOS 真实拼音/日文 IME；以及「泵每轮调用 `sync_ime_enabled`」
+这一行仍无自动测试（需真实泵+渲染器）。
+
+## 8. 台账
 
 逐条状态见 `review/remediation-progress.md`。
+

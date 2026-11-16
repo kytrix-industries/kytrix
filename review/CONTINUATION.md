@@ -19,7 +19,7 @@
 三平台门禁：Windows 921 / Linux 835 / macOS 825 lib 测试（+6/4/8/39），
 clippy `-D warnings` / fmt / doc 全干净。
 
-## 剩余 P3 backlog（不阻塞验收）
+## P3 backlog（已完成，commit `4489d28`；仅剩人工/真机项）
 
 - win-1：禁用态下系统可能在焦点/输入法切换后重新关联 IME，需 `WM_INPUTLANGCHANGE`/
   `WM_IME_SETCONTEXT` 幂等再摘除（真机验证丢字风险）。
