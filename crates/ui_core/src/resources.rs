@@ -165,42 +165,44 @@ impl fmt::Display for DecodeCause {
 /// 进程级一份（单 GPU 设备），由 `App` 持有（`design/phase-13-resources-snapshot.md` §8）。
 pub struct ResourceCache {
     entries: Arena<Entry, ResourceId>,
-    allocator: AtlasAllocator,
+    /// 图片页 + 分配器：**首次 `insert` 时按图片尺寸选档并锁定**（DEVIATIONS F-208）。
+    ///
+    /// 没有插入过图片时不分配 CPU 页（16 MiB 量级）、GPU 纹理与 staging。
+    page: Option<PageState>,
+}
+
+/// 图片页 + 它的分配器（同生同灭：页尺寸锁定后不再变化）。
+struct PageState {
     page: Page,
+    allocator: AtlasAllocator,
 }
 
 impl ResourceCache {
-    /// 新建（页尺寸恒为 `render::atlas::IMAGE_PAGE` = 2048²，BGRA8 = 16 MiB）。
+    /// 新建：图片页在首次 `insert` 时才分配。
     pub(crate) fn new() -> Self {
-        Self::with_page(crate::render::atlas::IMAGE_PAGE)
-    }
-
-    /// 页尺寸注入（单测用小页；生产恒为 `IMAGE_PAGE`）。
-    fn with_page(page: (u32, u32)) -> Self {
-        let mut allocator = {
-            #[cfg(test)]
-            {
-                AtlasAllocator::for_test(AtlasKind::Image, page)
-            }
-            #[cfg(not(test))]
-            {
-                let _ = page;
-                AtlasAllocator::new(AtlasKind::Image)
-            }
-        };
-        // 首次上传必须是整页：GPU 侧新建纹理的内容未定义，而 tile 之外的区域（含 padding）必须是 0。
-        allocator.mark_written(full_page(page));
         Self {
             entries: Arena::new(),
-            allocator,
-            page: Page::new(page.0, page.1),
+            page: None,
         }
     }
 
-    /// 仅测试：小页构造器。
+    /// 仅测试：用指定页尺寸的小页构造（跳过选档，便于穷尽容量路径）。
     #[cfg(test)]
     pub(crate) fn with_page_for_test(page: (u32, u32)) -> Self {
-        Self::with_page(page)
+        let mut cache = Self::new();
+        cache.open_page(page.0);
+        cache
+    }
+
+    /// 建页（首次插入 / 测试注入）：整页先标记为脏，保证 GPU 侧新建纹理的其余区域是 0。
+    fn open_page(&mut self, page: u32) {
+        debug_assert!(self.page.is_none(), "图片页只建一次");
+        let mut allocator = AtlasAllocator::with_page(AtlasKind::Image, (page, page));
+        allocator.mark_written(full_page((page, page)));
+        self.page = Some(PageState {
+            page: Page::new(page, page),
+            allocator,
+        });
     }
 
     /// 解码 `bytes` 并装箱，返回句柄、tile 与像素尺寸。
@@ -211,20 +213,25 @@ impl ResourceCache {
         let decoded =
             image::decode(bytes).map_err(|cause| EngineError::ResourceDecode { cause })?;
         let (width, height) = (decoded.width, decoded.height);
-        let Some(allocation) = self.allocator.allocate((width, height)) else {
+        if self.page.is_none() {
+            self.open_page(crate::render::atlas::page_for_tile(width, height));
+        }
+        let state = self.page.as_mut().expect("page was just ensured");
+        let Some(allocation) = state.allocator.allocate((width, height)) else {
             return Err(EngineError::ResourceDecode {
                 cause: DecodeCause::Capacity {
                     width,
                     height,
-                    page: self.page.dimensions(),
+                    page: state.page.dimensions(),
                 },
             });
         };
         debug_assert_eq!(allocation.tile.atlas, AtlasKind::Image);
         // padding 复用时可能残留上一块的内容：先清整块（含 padding），再写内容区。
-        self.page.clear_rect(allocation.padded);
-        self.allocator.mark_written(allocation.padded);
-        self.page
+        state.page.clear_rect(allocation.padded);
+        state.allocator.mark_written(allocation.padded);
+        state
+            .page
             .write(allocation.content, &decoded.bgra, width as usize * 4);
         let id = self.entries.insert_with(|id| Entry {
             image: ResourceImage {
@@ -252,9 +259,12 @@ impl ResourceCache {
         let Some(entry) = self.entries.remove(id) else {
             return false;
         };
-        self.allocator.deallocate(entry.alloc);
-        self.page.clear_rect(entry.padded);
-        self.allocator.mark_written(entry.padded);
+        let Some(state) = self.page.as_mut() else {
+            return true;
+        };
+        state.allocator.deallocate(entry.alloc);
+        state.page.clear_rect(entry.padded);
+        state.allocator.mark_written(entry.padded);
         true
     }
 
@@ -270,14 +280,18 @@ impl ResourceCache {
         self.len() == 0
     }
 
-    /// 图片页的当前内容（`page.0 * page.1 * 4` 字节，BGRA8 预乘 sRGB）。
-    pub(crate) fn page_pixels(&self) -> ((u32, u32), &[u8]) {
-        (self.page.dimensions(), self.page.bytes())
+    /// 图片页的当前内容（`page.0 * page.1 * 4` 字节，BGRA8 预乘 sRGB）；没插过图片时 `None`。
+    pub(crate) fn page_pixels(&self) -> Option<((u32, u32), &[u8])> {
+        self.page
+            .as_ref()
+            .map(|state| (state.page.dimensions(), state.page.bytes()))
     }
 
-    /// 取走自上次上传以来被写脏的**行**（首次调用返回整页）。
+    /// 取走自上次上传以来被写脏的**行**（首次调用返回整页）；没有图片页时是空集。
     pub(crate) fn take_dirty_rows(&mut self) -> DirtyRows {
-        self.allocator.take_dirty_rows()
+        self.page.as_mut().map_or_else(DirtyRows::default, |state| {
+            state.allocator.take_dirty_rows()
+        })
     }
 }
 
@@ -458,11 +472,11 @@ mod tests {
         let mut cache = cache();
         let image = inserted(&mut cache, [200, 100, 50, 255]);
         let _ = cache.take_dirty_rows(); // 首帧已上传整页
-        let before: Vec<u8> = cache.page_pixels().1.to_vec();
+        let before: Vec<u8> = cache.page_pixels().expect("page").1.to_vec();
         assert!(before.iter().any(|byte| *byte != 0), "插入必须写进页");
 
         assert!(cache.unload(image.id));
-        let after = cache.page_pixels().1;
+        let after = cache.page_pixels().expect("page").1;
         assert!(after.iter().all(|byte| *byte == 0), "卸载后区域必须清零");
         let rows = cache.take_dirty_rows();
         assert!(!rows.spans().is_empty(), "清零区必须上报脏行");
@@ -502,7 +516,7 @@ mod tests {
     fn page_pixels_hold_premultiplied_bgra() {
         let mut cache = cache();
         let image = inserted(&mut cache, [128, 128, 128, 255]);
-        let (dimensions, pixels) = cache.page_pixels();
+        let (dimensions, pixels) = cache.page_pixels().expect("page");
         assert_eq!(dimensions, (16, 16));
 
         // 内容区原点 = tile 的 UV 左边界 × 页宽（不引入内部字段就能定位）。
@@ -515,10 +529,10 @@ mod tests {
     #[test]
     fn failed_insert_leaves_the_page_untouched() {
         let mut cache = cache();
-        let page_before: Vec<u8> = cache.page_pixels().1.to_vec();
+        let page_before: Vec<u8> = cache.page_pixels().expect("page").1.to_vec();
         let _ = insert_error(&mut cache, b"GIF89a\x01\x00\x01\x00\x00\x00\x00");
 
-        assert_eq!(cache.page_pixels().1, page_before.as_slice());
+        assert_eq!(cache.page_pixels().expect("page").1, page_before.as_slice());
         assert_eq!(cache.len(), 0);
     }
 }

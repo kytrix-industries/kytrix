@@ -14,7 +14,7 @@
 //!
 //! 四条实测约束（probe `dpi.log` / `resize.log` / `caps.log`）：
 //! 1. 组合交换链的 `ResizeBuffers` 只在**第一次 `Present` 之前**可用，之后必然 `0x887A0001`；
-//!    所以 buffer 是 **grow-only 高水位**（[`buffer_size`] 按内容 + 512 余量、256 对齐取桶；
+//!    所以 buffer 是 **grow-only 高水位**（[`buffer_size`] 按内容 + 64 余量、256 对齐取桶；
 //!    GPU 侧 `grow` 再与当前 buffer 逐轴取大），只有内容越过它时才重建「持久目标 + 交换链」并
 //!    把 visual 切到新交换链（`GpuRenderer::grow`）；内容静止 `SHRINK_IDLE` 后 `maybe_shrink`
 //!    把高水位缩回当前内容桶（缩容先拷旧内容，F-207）。
@@ -59,8 +59,10 @@ const MAX_BUFFER: u32 = 16384;
 
 /// 内容之外的余量：吸收拖动中的小幅增长，避免每越过一像素就重建一次交换链。
 ///
-/// 它同时把 buffer 的下限抬到 512 px（≥ 需求的 256 px）。
-const BUFFER_HEADROOM: u32 = 512;
+/// 64 px 的物理余量（120 DPI 下约 51 逻辑 px）远大于一次 `WM_SIZE` 的步长；桶同时向上对齐到
+/// 256，因此真实余量在 64…319 px 之间。**不再用 512**：它让 1200×925 的内容常驻 1792×1536 的
+/// 缓冲（≈2.4× 面积），而缩容只回到同一个带余量的桶（DEVIATIONS F-209）。
+const BUFFER_HEADROOM: u32 = 64;
 
 /// buffer 的对齐粒度：把桶限制在有限档位（也符合 DComp / DXGI 的 256 对齐习惯）。
 const BUFFER_ALIGN: u32 = 256;
@@ -326,11 +328,11 @@ fn visual_geometry(content: (u32, u32), client: (u32, u32)) -> VisualGeometry {
 
 /// 组合交换链 / 持久目标的 buffer 尺寸（内容 + 余量、256 对齐的桶）。
 ///
-/// `round_up_256(content + 512)`，至多 [`MAX_BUFFER`]：512 px 余量吸收拖动中的小幅增长（也把
-/// 下限抬到 512 px），256 对齐把桶限制在有限档位。**不再读虚拟屏幕** —— 旧的固定 buffer 在
-/// 6000×3840 的桌面上每个窗口白占 ~352 MiB，且显示配置变大后内容必然越界、无法恢复。
+/// `round_up_256(content + 64)`，至多 [`MAX_BUFFER`]：64 px 余量吸收拖动中的小幅增长，256 对齐
+/// 把桶限制在有限档位。**不再读虚拟屏幕** —— 旧的固定 buffer 在 6000×3840 的桌面上每个窗口
+/// 白占 ~352 MiB，且显示配置变大后内容必然越界、无法恢复。
 ///
-/// GPU 侧的 `grow` 会把这个桶与当前 buffer **逐轴取大**（历史高水位）：`content + 512` 只是
+/// GPU 侧的 `grow` 会把这个桶与当前 buffer **逐轴取大**（历史高水位）：`content + 64` 只是
 /// 「当前内容需要的桶」，不是常驻 VRAM 的精确值。内容静止 `SHRINK_IDLE` 后
 /// `GpuRenderer::maybe_shrink` 把高水位缩回当前内容桶（新目标先 clear、再拷旧内容，然后才切
 /// visual；F-207），所以 VRAM 会回落而不是永久占用。grow 的逐轴取大还有一个正确性原因：视觉
@@ -466,13 +468,15 @@ mod tests {
 
     #[test]
     fn the_buffer_is_content_plus_headroom_rounded_up_to_256() {
-        // 800×600 的内容 ⇒ 1536×1280 —— 不再是 6000×3840 的虚屏。
-        assert_eq!(buffer_size((800, 600)).expect("fits"), (1536, 1280));
-        // 精确落在 256 网格上的内容 + 余量：768+512 = 1280、512+512 = 1024。
-        assert_eq!(buffer_size((768, 512)).expect("fits"), (1280, 1024));
-        // 空内容也有 512 px（余量把下限抬到 512，向上取整到 256 网格）。
-        assert_eq!(buffer_size((0, 0)).expect("fits"), (512, 512));
-        assert_eq!(buffer_size((1, 1)).expect("fits"), (768, 768));
+        // 800×600 的内容 ⇒ 1024×768（64 px 余量后向上取整到 256 网格）。
+        assert_eq!(buffer_size((800, 600)).expect("fits"), (1024, 768));
+        // 精确落在 256 网格上的内容 + 余量：768+64 = 832 → 1024、512+64 = 576 → 768。
+        assert_eq!(buffer_size((768, 512)).expect("fits"), (1024, 768));
+        // 空内容也至少有一格 256。
+        assert_eq!(buffer_size((0, 0)).expect("fits"), (256, 256));
+        assert_eq!(buffer_size((1, 1)).expect("fits"), (256, 256));
+        // demo 的真实内容（1200×925）：桶 1280×1024，而不是旧 512 余量的 1792×1536。
+        assert_eq!(buffer_size((1200, 925)).expect("fits"), (1280, 1024));
         // 同一内容必须给出同一个桶（桶是确定性的，不随时间/桌面漂移）。
         assert_eq!(
             buffer_size((800, 600)).expect("fits"),

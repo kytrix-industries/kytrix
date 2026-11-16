@@ -2785,3 +2785,70 @@ GPU 线程只按新内容尺寸重画并 1:1 覆盖，buffer 用 grow-only 高�
   `ResizeBuffers`」在组合交换链上已实测为固定失败（S-149），当前设计不再调用；V-56 的 HWND
   present 路线已退役；F-86 的 COM 引用泄漏根因仍是 `ManuallyDrop` 双层释放的契约，但不再是
   resize 失败的原因。
+
+---
+
+## 37. 内存占用优化（2026-11-16，用户逐项批准 A+B+C+D+E）
+
+> 触发：demo（960×740 逻辑 @120 DPI → 1200×925 物理）实测 Windows 私有提交 195–234 MB、
+> `GPU Process Memory\Local` 113.4 MB、macOS footprint 114 MB、Linux（lavapipe）RSS 157 MB。
+> 插桩实测的显式 GPU 资源 ≈ 91 MB，其中两张 2048² 图集与它们的 staging ≈ 68 MB、内容
+> persist + 交换链 42 MB（余量占 24 MB）。
+>
+> 批次与用户决定：**A** 图集按需化（单页、按需选档、字形页可增长，**不改 shader**）；
+> **B** 增量上传 / 去重拷贝 / payload 复用；**C** Windows `BUFFER_HEADROOM 512→64`、保留 3 buffers；
+> **D** 持久 Map 与 macOS/Linux staging ring，**保留 persist**（用户否决“每帧全量重绘”的语义变更）；
+> **E** CPU churn（Canvas / ShapedLine / glyph Vec / parley Layout）。
+> 本节先记录批次 A；B/C/D/E 落地时各自追加。
+
+### F-208 图集页懒分配 + 按需选档（取代 P02 §10.3 的“初始化即建 2048² 纹理”）
+
+| 项         | 内容                                                                                                                                                                                                                                                                                                     |
+|------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 设计原文   | `design/phase-02-paint-foundation.md` §10.3：字形页 2048² R8 = 4 MiB、图片页 2048² BGRA8 = 16 MiB；P09 的渲染器初始化即创建两张纹理与每槽 staging。                                                                                                                                                          |
+| 偏差       | ① 两张图集页都改为**首次上传时才创建**（三端渲染器只建 1×1 占位纹理，保证 SRV / 参数缓冲 / 描述符始终有效）；② **图片页**在**首次插入图片时**按该图片尺寸选档（512 / 1024 / 2048，取 `max(512, next_pow2(max(w, h) + 2))` 的上界档），随后**在该进程内锁定**；③ **字形页**从 512² 起步，分配失败时按 512 → 1024 → 2048 换代重排（`generation += 1`），到顶仍放不下才是 `AtlasExhausted`。 |
+| 原因       | demo 只插入一张 16×16 PNG，却常驻 16 MiB 图片纹理 + 16 MiB CPU 页 + 20 MiB staging；未使用图集的应用（headless / 纯色块）也要先付 16 MiB。图片页尺寸变化会让应用长期持有的 `ResourceImage.tile` / `Primitive::Image.tile` 归一化 UV 失效，所以只能选档锁定（用户 2026-11-16 拍板）；字形 tile 由引擎内部持有，换代只触发文本重排。 |
+| 修订后设计 | ① `AtlasAllocator` 新增 `with_page` / `grow`（页档 512/1024/2048，`page()` 是当前页）；② `ResourceCache` 的页与分配器是 `Option`，`insert` 首次调用时建页，`page_pixels()` / `take_dirty_rows()` 在空页时返回 `None` / 默认值；`App::upload_atlas_pages` 在无图片页时**不广播**、也不标记 `image_page_received`；③ 三端 `AtlasTextures` 用 1×1 占位纹理 + `prepare` / `record_uploads` 两段式：页变化时**先**在打开命令列表之前重建纹理（Windows/Linux 需 `wait_idle` 后才能释放旧资源并重写绑定；macOS 用 retire 队列延迟旧纹理），`record_uploads` 只做行上传；Windows / Linux 在重建后调用方重写图集绑定（Windows `Pipeline::write_atlas`、Linux `Pipeline::write_atlas`），macOS 的绑定是每帧 `setFragmentTexture`，无需重写；④ staging 行容量在页变化时清空重建。 |
+| 不变       | 着色器、`GpuPrimitive` 字节布局、UV 语义（仍是 `texel / page` 归一化）、`AtlasKind` 与两页的格式；图片页锁档后 `Capacity` 错误语义不变。                                                                                                                                                                |
+
+### F-209 Windows 合成缓冲余量 512 → 64（批次 C）
+
+| 项         | 内容                                                                                                                                                                                                             |
+|------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 设计原文   | `platform/windows/composition.rs` / `async-render-pipeline.md` §36：`buffer_size(content) = round_up_256(content + 512)`，缩容只回到同一个带 512 余量的桶。                                                          |
+| 偏差       | `BUFFER_HEADROOM = 64`（256 对齐不变，因此真实余量 64…319 px）；`BUFFER_COUNT` 仍为 3（用户明确保留）。                                                                                                          |
+| 原因       | 1200×925 的 demo 内容在 512 余量下常驻 1792×1536（面积 ≈ 2.4×），persist + 3 back buffer = 42 MiB；改 64 后桶是 1280×1024，4 块合计 ≈ 20 MiB（−22 MiB）。64 物理 px 已是拖拽步长的几十倍，且桶只是「重建阈值」，不影响 1:1 呈现语义。 |
+| 代价       | 拖动中越过桶边界的次数变多 ⇒ 每次都要 `wait_idle` + 重建交换链 + prime（纯背景一帧）。这是用户拍板接受的内存/平滑度取舍。                                                                                        |
+| 不变       | 内容 visual 恒 1:1、背景层 1×1、缩容 2 s 延迟、`Present1` dirty rects、桶逐轴取大的正确性约束（P1-A）。                                                                                                          |
+
+### S-153 图集页尺寸由像素长度推导（不新增跨线程字段）
+
+`AtlasTextures::queue_upload(kind, pixels, rows)` 的 `pixels.len()` 必须等于 `page² × texel_bytes`；
+页尺寸取 `isqrt(len / texel_bytes)`，非平方数/零直接硬断言失败。理由：页尺寸是 `pixels` 的纯函数，
+把它写进 `FramePayload` / 共享槽只会多一份可能不同步的状态。
+
+### V-133 待复核（批次 A 落地后）
+
+1. 三平台“首次插入图片选档”与“字形页 512→1024 增长”的实机行为（纹理重建 + 绑定重写 + 首帧内容）；
+2. WARP / lavapipe / Metal validation 对 1×1 占位 → 实际页重建的投诉；
+3. 图片页锁档后大图插入的 `Capacity` 错误路径（应用可见文案）；
+4. 批次 A 的内存收益复测（Windows 私有提交 / GPU Local，macOS footprint，Linux RSS）。
+
+### 37.1 批次 A 实测（Windows 本机，1200×925 物理，demo `--features hud`）
+
+| 指标 | 改前 | 改后 | Δ |
+|------|------|------|---|
+| 私有提交（静止） | 231.9 MB | **131.9 MB** | **−100.0 MB** |
+| 工作集 | 165.0 MB | **102.1 MB** | −62.9 MB |
+| `GPU Process Memory\Local` | 113.4 MB | **68.9 MB** | **−44.5 MB** |
+| 私有已提交（`VirtualQueryEx` 直方图） | 195.2 MB | 98.7 MB | −96.5 MB |
+| `PAGE_NOCACHE`（上传堆） | 88.3 MB | 40.2 MB | −48.1 MB |
+
+资源清单变化（按实测日志）：图片图集 16 MiB 纹理 + 16 MiB CPU 页 + 20 MiB staging → 512² 档的
+1 MiB + 1 MiB + ~3 MiB；字形页 4 MiB 纹理 + 8.5 MiB staging → 512² 档（demo 的 CJK 字形量下）
+0.25 MiB + ~1.5 MiB。内容 persist + 交换链（42 MiB）不变，属批次 C。
+
+功能验证：`cargo test -p ui_core --features "hud,test-support"` 全通过；demo 截图逐项正常
+（CJK 简/繁/日/韩、PNG 图标、色块、HUD）；跨 target `cargo check`（aarch64-apple-darwin /
+x86_64-unknown-linux-gnu，后者按 V-04 的 pkg-config stub）exit 0。
+

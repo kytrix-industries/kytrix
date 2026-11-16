@@ -6,7 +6,7 @@
 //!
 //! **buffer / content 分离 + 内容取桶**（`design/DEVIATIONS.md` §36 F-199）：组合交换链在第一次 present
 //! 之后不能 `ResizeBuffers`（probe `resize.log`），所以持久目标与交换链按
-//! [`buffer_size`] 的桶尺寸创建（内容 + 512 余量、256 对齐），而 [`GpuRenderer::surface`] 是
+//! [`buffer_size`] 的桶尺寸创建（内容 + 64 余量、256 对齐），而 [`GpuRenderer::surface`] 是
 //! **当前内容**尺寸 —— 绘制、viewport、scissor、root uniform、copy、present dirty 全部按内容
 //! 子矩形，只有资源创建与 clear 用 buffer。窗口 resize 因此不需要任何 GPU 等待或资源重建；
 //! 只有内容**越过** buffer 时才走 [`GpuRenderer::grow`]：等 idle → 新建持久目标 + 交换链 →
@@ -81,7 +81,7 @@ use crate::{
     window::FrameIndex,
 };
 
-/// 测试构建的图集页（2048² 在 WARP 上代价过高）。
+/// 测试构建的图集页（2048² 在 WARP 上代价过高；页尺寸由上传的像素长度决定）。
 #[cfg(test)]
 const TEST_ATLAS_PAGE: u32 = 64;
 
@@ -145,7 +145,7 @@ pub(crate) struct GpuRenderer {
     clear_color: [f32; 4],
     /// 合成面尺寸（持久目标 + 组合交换链的高水位，见 `grown_buffer`）。
     ///
-    /// 初值来自 [`buffer_size`]（内容 + 512 余量、256 对齐）；只在内容越过它时按
+    /// 初值来自 [`buffer_size`]（内容 + 64 余量、256 对齐）；只在内容越过它时按
     /// [`GpuRenderer::grow`] 逐轴取大重建。内容静止 [`SHRINK_IDLE`] 之后
     /// [`GpuRenderer::maybe_shrink`] 把它缩回当前内容的桶（组合交换链不能 `ResizeBuffers`，
     /// 只能整条替换）。
@@ -207,27 +207,13 @@ enum PrimePersist {
 impl GpuRenderer {
     /// 产品路径：硬件设备 + 离屏目标（P09 在此之后 attach 原生窗口）。
     pub(crate) fn new_offscreen(size: (u32, u32)) -> Result<Self, EngineError> {
-        Self::with_device(
-            Device::new()?,
-            size,
-            crate::render::windows::atlas::ATLAS_PAGE,
-        )
+        Self::with_device(Device::new()?, size)
     }
 
-    /// 测试用的 WARP 渲染器（图集页 = 测试页尺寸）。
-    #[cfg(test)]
-    pub(crate) fn new_warp_offscreen(size: (u32, u32)) -> Result<Self, EngineError> {
-        Self::with_device(Device::new_warp()?, size, TEST_ATLAS_PAGE)
-    }
-
-    /// WARP + 指定图集页尺寸（`TestApp::snapshot` 必须与 `App` 的分配器同页尺寸，
-    /// 否则字形页的整页上传会被尺寸断言拒绝）。
+    /// 测试用的 WARP 渲染器。
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn new_warp_offscreen_with_page(
-        size: (u32, u32),
-        atlas_page: u32,
-    ) -> Result<Self, EngineError> {
-        Self::with_device(Device::new_warp()?, size, atlas_page)
+    pub(crate) fn new_warp_offscreen(size: (u32, u32)) -> Result<Self, EngineError> {
+        Self::with_device(Device::new_warp()?, size)
     }
 
     /// 组合交换链路径（Windows 窗口）。
@@ -251,11 +237,7 @@ impl GpuRenderer {
     ) -> Result<Self, EngineError> {
         let content = (content.0.max(1), content.1.max(1));
         let buffer = buffer_size(content)?;
-        let mut renderer = Self::with_device(
-            Device::new()?,
-            buffer,
-            crate::render::windows::atlas::ATLAS_PAGE,
-        )?;
+        let mut renderer = Self::with_device(Device::new()?, buffer)?;
         renderer.clear_color = background;
         let mut swapchain = Swapchain::for_composition(&renderer.queue, buffer)?;
         // 背景层是 1×1 的纯色交换链，由 UI 线程的 DComp scale 变换铺满客户区。
@@ -289,10 +271,11 @@ impl GpuRenderer {
         Ok(renderer)
     }
 
-    fn with_device(device: Device, size: (u32, u32), atlas_page: u32) -> Result<Self, EngineError> {
+    fn with_device(mut device: Device, size: (u32, u32)) -> Result<Self, EngineError> {
         let queue = Queue::new(&device)?;
         let pipeline = Pipeline::new(&device)?;
-        let atlas = AtlasTextures::new(&device, atlas_page)?;
+        // 图集页懒分配：初始化只有 1×1 占位纹理，SRV 始终指向有效资源（DEVIATIONS F-208）。
+        let atlas = AtlasTextures::new(&mut device)?;
         pipeline.write_atlas(&device, AtlasKind::Glyph, atlas.texture(AtlasKind::Glyph));
         pipeline.write_atlas(&device, AtlasKind::Image, atlas.texture(AtlasKind::Image));
 
@@ -922,6 +905,27 @@ impl GpuRenderer {
         );
         let frame_started = Instant::now();
 
+        // 图集页尺寸变化必须在打开命令列表之前落地：重建纹理要重写 SRV 堆，而它可能仍被
+        // 在飞命令列表引用 ⇒ `prepare` 内部先 `wait_idle`（DEVIATIONS F-208）。
+        let atlas_rebuilt = self
+            .atlas
+            .prepare(&mut self.device, &mut self.queue)
+            .map_err(|error| self.classify(error))?;
+        if atlas_rebuilt.glyph {
+            self.pipeline.write_atlas(
+                &self.device,
+                AtlasKind::Glyph,
+                self.atlas.texture(AtlasKind::Glyph),
+            );
+        }
+        if atlas_rebuilt.image {
+            self.pipeline.write_atlas(
+                &self.device,
+                AtlasKind::Image,
+                self.atlas.texture(AtlasKind::Image),
+            );
+        }
+
         self.queue
             .reset_slot(slot)
             .map_err(|error| self.classify(error))?;
@@ -985,13 +989,14 @@ impl GpuRenderer {
         Ok((stats, slot))
     }
 
-    /// 图集上传入口：P09 的字形页（整页）与 P15 的图片页共用（GPU 线程消费）。
+    /// 图集上传入口：字形页与图片页共用（GPU 线程消费）。
     ///
-    /// `pixels` 按**所有权**移动进来（`AtlasTextures` 的待上传槽直接持有它），避免槽 → 纹理
-    /// 之间再复制一次整页（2048² 的图片页是 16 MiB）。
+    /// `pixels` 是 `rows` 顺序紧密打包的行（整页上传时就是整页），按**所有权**移动进待上传槽，
+    /// 避免槽 → 纹理之间再复制一次（DEVIATIONS F-211）。
     pub(crate) fn queue_atlas_upload(
         &mut self,
         kind: AtlasKind,
+        page: u32,
         pixels: Vec<u8>,
         rows: crate::render::atlas::DirtyRows,
     ) {
@@ -999,7 +1004,7 @@ impl GpuRenderer {
             self.swapchain.is_none() || on_gpu_thread(),
             "window atlas uploads may only be queued on the kytrix-d3d12 thread"
         );
-        self.atlas.queue_upload(kind, pixels, rows);
+        self.atlas.queue_upload(kind, page, pixels, rows);
     }
 
     /// 读回持久 offscreen（快照；阻塞到 GPU 完成）。
@@ -1167,13 +1172,17 @@ impl FrameRecorder<'_> {
         };
 
         let mut draw_calls = 0u32;
+        // staging 扩容造成的旧句柄：录制块结束后再 retire（`list` 借用 `self.queue`）。
+        let mut atlas_retired: Vec<GpuResourceHandle> = Vec::new();
         {
             let list = self.queue.list(slot);
             if let Some(timer) = self.timer {
                 timer.begin(list, slot.index);
             }
             if self.atlas.has_pending() {
-                self.atlas.record_uploads(self.device, list, slot.index)?;
+                atlas_retired = self
+                    .atlas
+                    .record_uploads(&mut *self.device, list, slot.index)?;
             }
             if full {
                 // `fresh`（交换链刚建好 / prime）必须清整块 buffer：prime 之后、UI 把内容 clip
@@ -1263,6 +1272,9 @@ impl FrameRecorder<'_> {
                 timer.end(list, slot.index);
             }
         }
+        for handle in atlas_retired {
+            self.queue.retire(index, handle);
+        }
 
         Ok(RenderStats {
             draw_calls,
@@ -1321,10 +1333,17 @@ struct UploadSlot {
     instances: ID3D12Resource,
     instance_handle: GpuResourceHandle,
     instance_capacity: u32,
+    /// 持久映射的写入指针（`Map` 一次、整个生命周期不再 `Unmap`；DEVIATIONS F-210）。
+    instance_ptr: *mut u8,
     clips: ID3D12Resource,
     clip_handle: GpuResourceHandle,
     clip_capacity: u32,
+    clip_ptr: *mut u8,
 }
+
+// SAFETY: 指针只用于 GPU 线程独占的 CPU 写入（`UploadArena` 只在 `kytrix-d3d12` 线程上使用），
+// 与 D3D12 的「Map 一次、长期写」用法一致。
+unsafe impl Send for UploadSlot {}
 
 impl UploadArena {
     fn new(device: &mut Device) -> Result<Self, EngineError> {
@@ -1332,15 +1351,19 @@ impl UploadArena {
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
             let instances = create_upload(device, 256 * 128)?;
             let instance_handle = device.allocate(instances.clone());
+            let instance_ptr = map_upload(&instances)?;
             let clips = create_upload(device, 8 * 48)?;
             let clip_handle = device.allocate(clips.clone());
+            let clip_ptr = map_upload(&clips)?;
             slots.push(UploadSlot {
                 instances,
                 instance_handle,
                 instance_capacity: 256,
+                instance_ptr,
                 clips,
                 clip_handle,
                 clip_capacity: 8,
+                clip_ptr,
             });
         }
         Ok(Self { slots })
@@ -1367,10 +1390,12 @@ impl UploadArena {
             let capacity = instance_count.next_power_of_two().max(256);
             let resource = create_upload(device, u64::from(capacity) * 128)?;
             let handle = device.allocate(resource.clone());
+            let pointer = map_upload(&resource)?;
             let old = self.slots[slot].instance_handle;
             self.slots[slot].instances = resource;
             self.slots[slot].instance_handle = handle;
             self.slots[slot].instance_capacity = capacity;
+            self.slots[slot].instance_ptr = pointer;
             queue.retire(index, old);
         }
         let needs_clips = clip_count > self.slots[slot].clip_capacity;
@@ -1378,15 +1403,29 @@ impl UploadArena {
             let capacity = clip_count.next_power_of_two().max(8);
             let resource = create_upload(device, u64::from(capacity) * 48)?;
             let handle = device.allocate(resource.clone());
+            let pointer = map_upload(&resource)?;
             let old = self.slots[slot].clip_handle;
             self.slots[slot].clips = resource;
             self.slots[slot].clip_handle = handle;
             self.slots[slot].clip_capacity = capacity;
+            self.slots[slot].clip_ptr = pointer;
             queue.retire(index, old);
         }
 
-        write_upload(&self.slots[slot].instances, instances)?;
-        write_upload(&self.slots[slot].clips, bytemuck::cast_slice(clips))?;
+        // SAFETY: 槽缓冲的容量已按本次字节数扩容；指针是创建时的持久映射，写入区间在容量内
+        // （D3D12 约定：UPLOAD 堆的 Map 只需一次，之后一直可写）。
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                instances.as_ptr(),
+                self.slots[slot].instance_ptr,
+                instances.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                bytemuck::cast_slice::<GpuClipEntry, u8>(clips).as_ptr(),
+                self.slots[slot].clip_ptr,
+                clip_count as usize * 48,
+            );
+        }
         Ok((instance_count, clip_count))
     }
 }
@@ -1401,20 +1440,16 @@ impl UploadSlot {
     }
 }
 
-fn write_upload(resource: &ID3D12Resource, bytes: &[u8]) -> Result<(), EngineError> {
-    if bytes.is_empty() {
-        return Ok(());
-    }
+/// 把一块 UPLOAD 堆资源持久映射一次，返回长期可写的 CPU 指针（DEVIATIONS F-210）。
+///
+/// D3D12 允许对 UPLOAD 堆 `Map` 一次后长期保留指针（`Unmap` 只表示 CPU 写入结束，GPU 侧
+/// 不受影响）；资源释放时映射随之失效，不需要显式 `Unmap`。
+fn map_upload(resource: &ID3D12Resource) -> Result<*mut u8, EngineError> {
     let mut pointer: *mut core::ffi::c_void = std::ptr::null_mut();
-    // SAFETY: 映射区间由 `Map` 独占，直到同一函数的 `Unmap`；容量由该槽缓冲的创建尺寸保证。
+    // SAFETY: 资源是 `D3D12_HEAP_TYPE_UPLOAD`，整个生命周期只由本函数映射一次。
     unsafe { resource.Map(0, None, Some(&mut pointer)) }
         .map_err(|error| init_error_from("Map(upload)", error))?;
-    // SAFETY: 上传缓冲容量在 `UploadArena::write` 里已按 `bytes.len()` 扩容。
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer.cast::<u8>(), bytes.len());
-        resource.Unmap(0, None);
-    }
-    Ok(())
+    Ok(pointer.cast::<u8>())
 }
 
 fn bind_frame(
@@ -2262,7 +2297,7 @@ mod tests {
         }
         let mut rows = crate::render::atlas::DirtyRows::default();
         rows.mark(0, page);
-        renderer.queue_atlas_upload(AtlasKind::Image, pixels, rows);
+        renderer.queue_atlas_upload(AtlasKind::Image, page, pixels, rows);
 
         let tile = AtlasTile {
             atlas: AtlasKind::Image,
@@ -2295,9 +2330,7 @@ mod tests {
 
     /// 在给定页尺寸上做一次「上传 → 画字形 → 读回」的可见性探测。
     fn glyph_probe(page: u32) -> bool {
-        let Some(mut renderer) =
-            super::GpuRenderer::new_warp_offscreen_with_page((64, 64), page).ok()
-        else {
+        let Some(mut renderer) = super::GpuRenderer::new_warp_offscreen((64, 64)).ok() else {
             return false;
         };
         let mut pixels = vec![0u8; (page * page) as usize];
@@ -2308,7 +2341,7 @@ mod tests {
         }
         let mut rows = crate::render::atlas::DirtyRows::default();
         rows.mark(0, page);
-        renderer.queue_atlas_upload(AtlasKind::Glyph, pixels, rows);
+        renderer.queue_atlas_upload(AtlasKind::Glyph, page, pixels, rows);
         let tile = AtlasTile {
             atlas: AtlasKind::Glyph,
             u0: 1.0 / page as f32,
@@ -2515,9 +2548,9 @@ mod tests {
     /// 旧 buffer，中间帧才不可能采样到未定义像素。
     #[test]
     fn growth_keeps_the_other_axis_at_the_high_water_mark() {
-        // buffer 2560×1792，新内容 2800×600：宽度增长，高度不得按内容缩回 1280。
+        // buffer 2560×1792，新内容 2800×600：宽度增长，高度不得按内容缩回 768。
         let grown = grown_buffer((2560, 1792), (2800, 600)).expect("grows");
-        assert_eq!(grown, (3328, 1792));
+        assert_eq!(grown, (3072, 1792));
         assert!(
             grown.1 >= 1792,
             "高度必须保留旧 buffer（旧 clip 仍可能指向旧内容）: {grown:?}"
@@ -2525,7 +2558,7 @@ mod tests {
         // 另一方向同理。
         assert_eq!(
             grown_buffer((2560, 1792), (1200, 2400)).expect("grows"),
-            (2560, 3072)
+            (2560, 2560)
         );
         // 当前 buffer 比按内容算出的桶大：新桶不得缩小。
         let covered = grown_buffer((3328, 2048), (2000, 600)).expect("fits");
@@ -2570,20 +2603,20 @@ mod tests {
     /// 缩容决策：只在内容桶**严格小于**当前高水位、且渲染器有合成目标时返回新桶。
     #[test]
     fn the_shrink_decision_only_returns_a_smaller_bucket() {
-        // 1200×925 内容 ⇒ 1792×1536；历史高水位 2560×1792（1900×1300 时开出来的桶）。
+        // 1200×925 内容 ⇒ 1280×1024；历史高水位 2560×1792（1900×1300 时开出来的桶）。
         assert_eq!(
             shrink_target((2560, 1792), (1200, 925), true).expect("fits"),
-            Some((1792, 1536)),
+            Some((1280, 1024)),
             "静止缩小时回到当前内容的桶"
         );
-        // 单轴缩小也算：宽度 2000 的桶仍是 2560，高度从 1792 缩到 1280。
+        // 单轴缩小也算：宽度 2000+64 的桶是 2304，高度从 1792 缩到 768。
         assert_eq!(
             shrink_target((2560, 1792), (2000, 600), true).expect("fits"),
-            Some((2560, 1280))
+            Some((2304, 768))
         );
         // 内容桶 == 当前 buffer：已经是最小桶，不缩（否则会每 2 s 重建一次）。
         assert_eq!(
-            shrink_target((2560, 1792), (2000, 1200), true).expect("fits"),
+            shrink_target((2304, 1280), (2000, 1200), true).expect("fits"),
             None
         );
         // 没有合成目标（离屏 / 快照）：永不缩容（离屏由 `resize` 直接重建）。

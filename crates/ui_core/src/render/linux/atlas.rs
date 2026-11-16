@@ -14,36 +14,36 @@ use crate::{
     error::EngineError,
     paint::atlas::AtlasKind,
     render::{
-        atlas::DirtyRows,
+        atlas::{AtlasRebuilt, DirtyRows, texel_bytes},
         linux::device::{Device, GpuObject, init_error},
         retire::GpuResourceHandle,
     },
     window::FrameIndex,
 };
 
-/// 图集页边长（与 Win32 / Metal 同值）。
-pub(crate) const ATLAS_PAGE: u32 = 2048;
+/// 初始化时的占位页（1×1）：让描述符集合里的图集视图在第一次上传之前也有效。
+const PLACEHOLDER_PAGE: u32 = 1;
 
 /// 一张图集页。
 struct AtlasTexture {
+    kind: AtlasKind,
     image: vk::Image,
     /// image 的设备内存（与 `image` 成对释放）。
     memory: vk::DeviceMemory,
     view: vk::ImageView,
     sampler: vk::Sampler,
     page: u32,
-    texel_bytes: u32,
-    /// 首次上传前是 `UNDEFINED`，之后是 `SHADER_READ_ONLY_OPTIMAL`。
+    /// 首次上传前是 `UNDEFINED`，之后是 `SHADER_READ_ONLY_OPTIMAL`；换页后回到 `UNDEFINED`。
     initialized: bool,
     pending: Option<PendingUpload>,
 }
 
-/// 待上传的行（一帧内多次 `queue_upload` 取并集）。
+/// 待上传的行（一帧内多次 `queue_upload` 取并集）+ 该页的页尺寸。
 struct PendingUpload {
-    y0: u32,
-    rows: u32,
-    full: bool,
+    page: u32,
+    /// `rows` 顺序紧密打包的行（整页上传时就是整页）。
     pixels: Vec<u8>,
+    rows: DirtyRows,
 }
 
 /// 两张页。
@@ -51,14 +51,19 @@ pub(crate) struct AtlasTextures {
     device: ash::Device,
     glyph: AtlasTexture,
     image: AtlasTexture,
+    /// `prepare` 重建过纹理的页：本帧必须整页上传（新纹理内容未定义）。
+    force_full: [bool; 2],
 }
 
 impl AtlasTextures {
-    pub(crate) fn new(device: &Device, page: u32) -> Result<Self, EngineError> {
+    /// 建两张 1×1 占位页；真实页在第一次上传前由 [`AtlasTextures::prepare`] 按像素长度创建
+    /// （懒分配，DEVIATIONS F-208）。
+    pub(crate) fn new(device: &mut Device) -> Result<Self, EngineError> {
         Ok(Self {
             device: device.raw().clone(),
-            glyph: AtlasTexture::new(device, AtlasKind::Glyph, page)?,
-            image: AtlasTexture::new(device, AtlasKind::Image, page)?,
+            glyph: AtlasTexture::new(device, AtlasKind::Glyph)?,
+            image: AtlasTexture::new(device, AtlasKind::Image)?,
+            force_full: [false, false],
         })
     }
 
@@ -74,16 +79,61 @@ impl AtlasTextures {
         self.glyph.sampler
     }
 
-    pub(crate) fn queue_upload(&mut self, kind: AtlasKind, pixels: Vec<u8>, rows: DirtyRows) {
+    pub(crate) fn queue_upload(
+        &mut self,
+        kind: AtlasKind,
+        page: u32,
+        pixels: Vec<u8>,
+        rows: DirtyRows,
+    ) {
+        let row_bytes = page as usize * texel_bytes(kind) as usize;
+        let expected = rows.row_count(page) as usize * row_bytes;
+        assert_eq!(
+            pixels.len(),
+            expected,
+            "atlas payload size mismatch for {kind:?}: expected {expected} bytes for {} rows of a {page}² page, got {}",
+            rows.row_count(page),
+            pixels.len()
+        );
         match kind {
-            AtlasKind::Glyph => self.glyph.queue_upload(pixels, rows),
-            AtlasKind::Image => self.image.queue_upload(pixels, rows),
+            AtlasKind::Glyph => self.glyph.queue_upload(page, pixels, rows),
+            AtlasKind::Image => self.image.queue_upload(page, pixels, rows),
         }
     }
 
     /// 本帧是否有待上传的行。
     pub(crate) fn has_pending(&self) -> bool {
         self.glyph.pending.is_some() || self.image.pending.is_some()
+    }
+
+    /// 在录制本帧**之前**把页尺寸变化落地（DEVIATIONS F-208）。
+    ///
+    /// 描述符集合会被重写（`Pipeline::write_atlas`），旧 image / view 也要销毁：两者都要求
+    /// GPU 不再引用它们，因此这里先 `queue_wait_idle`。页变化只发生在首次使用与字形页换代
+    /// （最多两档），等待代价可以接受。
+    pub(crate) fn prepare(&mut self, device: &mut Device) -> Result<AtlasRebuilt, EngineError> {
+        let mut rebuilt = AtlasRebuilt::default();
+        let changes: [Option<u32>; 2] = [self.glyph.page_change(), self.image.page_change()];
+        if changes.iter().all(Option::is_none) {
+            return Ok(rebuilt);
+        }
+        // SAFETY: 设备 / 队列句柄由 `Device` 持有；等待期间不录制任何命令。
+        unsafe { device.raw().queue_wait_idle(device.queue()) }
+            .map_err(|error| init_error("queue_wait_idle(atlas page)", format!("{error:?}")))?;
+        for (index, page) in changes.into_iter().enumerate() {
+            let Some(page) = page else {
+                continue;
+            };
+            let (kind, texture) = if index == 0 {
+                (AtlasKind::Glyph, &mut self.glyph)
+            } else {
+                (AtlasKind::Image, &mut self.image)
+            };
+            texture.recreate(device, page)?;
+            rebuilt.mark(kind);
+            self.force_full[index] = true;
+        }
+        Ok(rebuilt)
     }
 
     /// 给待上传的行分配**本帧专用** staging、写进去并编码 `cmd_copy_buffer_to_image`。
@@ -96,79 +146,20 @@ impl AtlasTextures {
         index: FrameIndex,
         command: vk::CommandBuffer,
     ) -> Result<(), EngineError> {
-        self.glyph.record_upload(device, index, command)?;
-        self.image.record_upload(device, index, command)
+        let glyph_full = std::mem::take(&mut self.force_full[0]);
+        self.glyph
+            .record_upload(device, index, command, glyph_full)?;
+        let image_full = std::mem::take(&mut self.force_full[1]);
+        self.image
+            .record_upload(device, index, command, image_full)?;
+        Ok(())
     }
 }
 
 impl AtlasTexture {
-    fn new(device: &Device, kind: AtlasKind, page: u32) -> Result<Self, EngineError> {
-        let format = texture_format(kind);
-        // 产品路径只采样 / 上传，不读回图集；单测要验证「两帧各自的 staging 落到了自己的行」，
-        // 因此 `cfg(test)` 下额外允许 `TRANSFER_SRC`（usage 是创建参数，测试无法事后追加）。
-        let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
-        #[cfg(test)]
-        let usage = usage | vk::ImageUsageFlags::TRANSFER_SRC;
+    fn new(device: &mut Device, kind: AtlasKind) -> Result<Self, EngineError> {
+        let (image, memory, view) = create_page(device, kind, PLACEHOLDER_PAGE)?;
         // SAFETY: 句柄归本结构独占；`Drop` 里销毁。
-        let image = unsafe {
-            device.raw().create_image(
-                &vk::ImageCreateInfo::default()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .format(format)
-                    .extent(vk::Extent3D {
-                        width: page,
-                        height: page,
-                        depth: 1,
-                    })
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(usage)
-                    .initial_layout(vk::ImageLayout::UNDEFINED),
-                None,
-            )
-        }
-        .map_err(|error| init_error("create_image(atlas)", format!("{error:?}")))?;
-        // SAFETY: 只读查询；句柄由本结构独占，返回值在本次调用期间有效。
-        let requirements = unsafe { device.raw().get_image_memory_requirements(image) };
-        let memory_type = device
-            .memory_type(
-                requirements.memory_type_bits,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            )
-            .ok_or_else(|| init_error("atlas image memory", "no device-local memory type"))?;
-        // SAFETY: `requirements` 来自本 image；`memory_type` 由 memory_type 查询保证合法。
-        let memory = unsafe {
-            device.raw().allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(requirements.size)
-                    .memory_type_index(memory_type),
-                None,
-            )
-        }
-        .map_err(|error| init_error("allocate_memory(atlas)", format!("{error:?}")))?;
-        // SAFETY: 目标句柄已按 Vulkan 校验规则创建，绑定/写入的范围在其分配内。
-        unsafe { device.raw().bind_image_memory(image, memory, 0) }
-            .map_err(|error| init_error("bind_image_memory(atlas)", format!("{error:?}")))?;
-        // SAFETY: 句柄与参数都由本结构独占，调用期间有效（Vulkan 的外部同步已由 fence 保证）。
-        let view = unsafe {
-            device.raw().create_image_view(
-                &vk::ImageViewCreateInfo::default()
-                    .image(image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(format)
-                    .subresource_range(
-                        vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .level_count(1)
-                            .layer_count(1),
-                    ),
-                None,
-            )
-        }
-        .map_err(|error| init_error("create_image_view(atlas)", format!("{error:?}")))?;
-        // SAFETY: 句柄与参数都由本结构独占，调用期间有效（Vulkan 的外部同步已由 fence 保证）。
         let sampler = unsafe {
             device.raw().create_sampler(
                 &vk::SamplerCreateInfo::default()
@@ -184,37 +175,32 @@ impl AtlasTexture {
             )
         }
         .map_err(|error| init_error("create_sampler(atlas)", format!("{error:?}")))?;
-
         Ok(Self {
+            kind,
             image,
             memory,
             view,
             sampler,
-            page,
-            texel_bytes: texel_bytes(kind),
+            page: PLACEHOLDER_PAGE,
             initialized: false,
             pending: None,
         })
     }
 
-    /// 入队一页的脏行（整页 `pixels` 的布局 = `page * page * texel`）。
-    ///
-    /// `pixels` 按**所有权**移动进待上传槽：槽里已经是整页 `Vec<u8>`，再按切片复制一次会白搬
-    /// 16 MiB（图片页）。
-    fn queue_upload(&mut self, pixels: Vec<u8>, rows: DirtyRows) {
-        let spans = rows.spans();
-        if spans.is_empty() {
+    /// 入队一页的脏行（`pixels` 是 `rows` 顺序紧密打包的行，DEVIATIONS F-211）。
+    fn queue_upload(&mut self, page: u32, pixels: Vec<u8>, rows: DirtyRows) {
+        if rows.spans().is_empty() {
             return;
         }
-        let full = rows.is_full();
-        let first = spans.iter().map(|span| span.start).min().unwrap_or(0);
-        let last = spans.iter().map(|span| span.end).max().unwrap_or(first);
-        self.pending = Some(PendingUpload {
-            y0: first,
-            rows: last.saturating_sub(first),
-            full,
-            pixels,
-        });
+        self.pending = Some(PendingUpload { page, pixels, rows });
+    }
+
+    /// 本帧待上传的页与当前纹理页不一致时的目标页（`None` = 不需要重建）。
+    fn page_change(&self) -> Option<u32> {
+        match &self.pending {
+            Some(pending) if pending.page != self.page => Some(pending.page),
+            _ => None,
+        }
     }
 
     fn record_upload(
@@ -222,28 +208,38 @@ impl AtlasTexture {
         device: &mut Device,
         index: FrameIndex,
         command: vk::CommandBuffer,
+        force_full: bool,
     ) -> Result<(), EngineError> {
         let Some(pending) = self.pending.take() else {
             return Ok(());
         };
-        let row_bytes = (self.page * self.texel_bytes) as usize;
-        let first = if pending.full { 0 } else { pending.y0 };
-        let rows = if pending.full {
-            self.page
+        debug_assert_eq!(
+            pending.page, self.page,
+            "page changes must be applied by AtlasTextures::prepare before recording"
+        );
+        // 重建过纹理的那一帧必须是整页上传（新纹理内容未定义）。
+        // 覆盖整页的脏行等价于整页上传（`mark(0, page)` 与 `mark(0, u32::MAX)` 都接受）。
+        let covers_page =
+            pending.rows.is_full() || pending.rows.spans() == std::slice::from_ref(&(0..self.page));
+        assert!(
+            !force_full || covers_page,
+            "a rebuilt atlas page must be uploaded as a full page"
+        );
+        let full = 0..self.page;
+        let spans: &[std::ops::Range<u32>] = if pending.rows.is_full() {
+            std::slice::from_ref(&full)
         } else {
-            pending.rows
+            pending.rows.spans()
         };
-        if rows == 0 {
+        let row_bytes = (self.page * texel_bytes(self.kind)) as usize;
+        let total_rows: u32 = spans.iter().map(|span| span.end - span.start).sum();
+        if total_rows == 0 {
             return Ok(());
         }
-        let offset = first as usize * row_bytes;
-        let length = rows as usize * row_bytes;
-        if offset + length > pending.pixels.len() {
-            return Ok(());
-        }
-        // 一次性 staging 只装本次行区间（`length` 字节）；缓冲在 `index` 完成之前不得释放。
+        let length = total_rows as usize * row_bytes;
+        // 一次性 staging 装本帧所有段；缓冲在 `index` 完成之前不得释放。
         let staging = OneShotStaging::new(device, length as u64)?;
-        if let Err(error) = staging.write(device, offset, &pending.pixels, length) {
+        if let Err(error) = staging.write(device, 0, &pending.pixels, length) {
             // 这一帧不会再 submit（录制被错误中止）：它的序号永远不会出现在 timeline 上，
             // `drain_retire(last_index)` 到不了这里。仍按正常生命周期 retire，由 teardown 的
             // [`Device::drain_all_retired`] 兜底释放（map 失败 / 录制后失败 / device lost 同路）。
@@ -268,7 +264,7 @@ impl AtlasTexture {
             .src_access_mask(vk::AccessFlags::SHADER_READ)
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
         // SAFETY: barrier 与 copy 的目标都是本结构独占的资源，范围在图像边界内；staging 是
-        // 本次上传独占的缓冲，大小 = `length`，行布局与 `image_extent` 一致（紧密排列）。
+        // 本次上传独占的缓冲（装全部段），行布局与 `image_extent` 一致（紧密排列）。
         unsafe {
             device.raw().cmd_pipeline_barrier(
                 command,
@@ -279,34 +275,38 @@ impl AtlasTexture {
                 &[],
                 &[to_dst],
             );
-            device.raw().cmd_copy_buffer_to_image(
-                command,
-                staging.buffer,
-                self.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[vk::BufferImageCopy::default()
-                    // staging 从第 0 字节开始，行紧密排列（`buffer_row_length = 0` 表示按
-                    // `image_extent.width × texel` 紧密排列）。
-                    .buffer_offset(0)
-                    .buffer_row_length(0)
-                    .buffer_image_height(0)
-                    // 局部上传：目标从 `first` 行开始（缺这个字段会从第 0 行覆写整页）。
-                    .image_offset(vk::Offset3D {
-                        x: 0,
-                        y: first as i32,
-                        z: 0,
-                    })
-                    .image_subresource(
-                        vk::ImageSubresourceLayers::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .layer_count(1),
-                    )
-                    .image_extent(vk::Extent3D {
-                        width: self.page,
-                        height: rows,
-                        depth: 1,
-                    })],
-            );
+            let mut staging_row = 0u32;
+            for span in spans {
+                let rows = span.end - span.start;
+                device.raw().cmd_copy_buffer_to_image(
+                    command,
+                    staging.buffer,
+                    self.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[vk::BufferImageCopy::default()
+                        // 每段在 staging 里各有偏移（紧密排列的行）。
+                        .buffer_offset(u64::from(staging_row) * row_bytes as u64)
+                        .buffer_row_length(0)
+                        .buffer_image_height(0)
+                        // 局部上传：目标从 `span.start` 行开始（缺这个字段会从第 0 行覆写整页）。
+                        .image_offset(vk::Offset3D {
+                            x: 0,
+                            y: span.start as i32,
+                            z: 0,
+                        })
+                        .image_subresource(
+                            vk::ImageSubresourceLayers::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .layer_count(1),
+                        )
+                        .image_extent(vk::Extent3D {
+                            width: self.page,
+                            height: rows,
+                            depth: 1,
+                        })],
+                );
+                staging_row += rows;
+            }
             let to_sampled = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                 .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
@@ -330,6 +330,124 @@ impl AtlasTexture {
         self.initialized = true;
         Ok(())
     }
+
+    /// 换页：建新 image / memory / view；调用方已 `queue_wait_idle`，旧句柄立即销毁。
+    fn recreate(&mut self, device: &mut Device, page: u32) -> Result<(), EngineError> {
+        let (image, memory, view) = create_page(device, self.kind, page)?;
+        let old_view = std::mem::replace(&mut self.view, view);
+        let old_image = std::mem::replace(&mut self.image, image);
+        let old_memory = std::mem::replace(&mut self.memory, memory);
+        // SAFETY: GPU 已空闲（prepare 里 queue_wait_idle），句柄不再被任何在飞命令引用。
+        // Vulkan 要求先销毁 view、再销毁 image、最后释放内存。
+        unsafe {
+            device.raw().destroy_image_view(old_view, None);
+            device.raw().destroy_image(old_image, None);
+            device.raw().free_memory(old_memory, None);
+        }
+        self.page = page;
+        self.initialized = false;
+        Ok(())
+    }
+}
+
+/// 建一张 `page × page` 的图集页（image + 设备内存 + view；占位页与真实页共用）。
+fn create_page(
+    device: &mut Device,
+    kind: AtlasKind,
+    page: u32,
+) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView), EngineError> {
+    let format = texture_format(kind);
+    // 产品路径只采样 / 上传，不读回图集；单测要验证「两帧各自的 staging 落到了自己的行」，
+    // 因此 `cfg(test)` 下额外允许 `TRANSFER_SRC`（usage 是创建参数，测试无法事后追加）。
+    let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
+    #[cfg(test)]
+    let usage = usage | vk::ImageUsageFlags::TRANSFER_SRC;
+    // SAFETY: 句柄归调用方独占；`Drop` / retire 队列负责销毁。
+    let image = unsafe {
+        device.raw().create_image(
+            &vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(format)
+                .extent(vk::Extent3D {
+                    width: page,
+                    height: page,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(usage)
+                .initial_layout(vk::ImageLayout::UNDEFINED),
+            None,
+        )
+    }
+    .map_err(|error| init_error("create_image(atlas)", format!("{error:?}")))?;
+    // SAFETY: 只读查询；句柄由本结构独占，返回值在本次调用期间有效。
+    let requirements = unsafe { device.raw().get_image_memory_requirements(image) };
+    let Some(memory_type) = device.memory_type(
+        requirements.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    ) else {
+        // SAFETY: image 已创建且尚未交给任何人。
+        unsafe { device.raw().destroy_image(image, None) };
+        return Err(init_error(
+            "atlas image memory",
+            "no device-local memory type",
+        ));
+    };
+    // SAFETY: `requirements` 来自本 image；`memory_type` 由 memory_type 查询保证合法。
+    let memory = match unsafe {
+        device.raw().allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(requirements.size)
+                .memory_type_index(memory_type),
+            None,
+        )
+    } {
+        Ok(memory) => memory,
+        Err(error) => {
+            // SAFETY: image 已创建且尚未交给任何人。
+            unsafe { device.raw().destroy_image(image, None) };
+            return Err(init_error("allocate_memory(atlas)", format!("{error:?}")));
+        }
+    };
+    // SAFETY: 目标句柄已按 Vulkan 校验规则创建，绑定/写入的范围在其分配内。
+    if let Err(error) = unsafe { device.raw().bind_image_memory(image, memory, 0) } {
+        // SAFETY: 两个句柄都还没有交给任何人。
+        unsafe {
+            device.raw().destroy_image(image, None);
+            device.raw().free_memory(memory, None);
+        }
+        return Err(init_error("bind_image_memory(atlas)", format!("{error:?}")));
+    }
+    // SAFETY: 句柄与参数都由调用方独占，调用期间有效。
+    let view = match unsafe {
+        device.raw().create_image_view(
+            &vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                ),
+            None,
+        )
+    } {
+        Ok(view) => view,
+        Err(error) => {
+            // SAFETY: 三个句柄都还没有交给任何人。
+            unsafe {
+                device.raw().destroy_image(image, None);
+                device.raw().free_memory(memory, None);
+            }
+            return Err(init_error("create_image_view(atlas)", format!("{error:?}")));
+        }
+    };
+    Ok((image, memory, view))
 }
 
 /// 一次上传专用的 staging（大小 = 本次行区间）。
@@ -462,13 +580,6 @@ fn texture_format(kind: AtlasKind) -> vk::Format {
         AtlasKind::Glyph => vk::Format::R8_UNORM,
         // 图片纹素是「linear 预乘 → sRGB 编码」，视图必须是 sRGB（contract §8）。
         AtlasKind::Image => vk::Format::B8G8R8A8_SRGB,
-    }
-}
-
-fn texel_bytes(kind: AtlasKind) -> u32 {
-    match kind {
-        AtlasKind::Glyph => 1,
-        AtlasKind::Image => 4,
     }
 }
 
@@ -708,15 +819,16 @@ mod tests {
     fn consecutive_uploads_do_not_share_staging_while_frames_are_in_flight() {
         let instance = VulkanInstance::new_headless().expect("headless Vulkan instance");
         let mut device = Device::new(&instance).expect("Vulkan device");
-        let mut atlas = AtlasTextures::new(&device, TEST_PAGE).expect("atlas");
+        let mut atlas = AtlasTextures::new(&mut device).expect("atlas");
         let pool = command_pool(&device);
         let commands = allocate(&device, pool, 2);
 
         // 第 1 帧：第 5 行 = 不透明深蓝（BGRA）。先只录制，不提交。
         let mut first_page = page();
         fill_row(&mut first_page, 5, [0x11, 0x22, 0x33, 0xFF]);
-        atlas.queue_upload(AtlasKind::Image, first_page, rows(5, 6));
+        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, first_page, rows(5, 6));
         begin(&device, commands[0]);
+        atlas.prepare(&mut device).expect("prepare frame 1");
         atlas
             .record_uploads(&mut device, FrameIndex::from_raw(1), commands[0])
             .expect("record frame 1");
@@ -726,8 +838,9 @@ mod tests {
         // staging 里的字节。
         let mut second_page = page();
         fill_row(&mut second_page, 5, [0x44, 0x55, 0x66, 0xFF]);
-        atlas.queue_upload(AtlasKind::Image, second_page, rows(5, 6));
+        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, second_page, rows(5, 6));
         begin(&device, commands[1]);
+        atlas.prepare(&mut device).expect("prepare frame 2");
         atlas
             .record_uploads(&mut device, FrameIndex::from_raw(2), commands[1])
             .expect("record frame 2");
@@ -790,15 +903,16 @@ mod tests {
     fn teardown_drain_releases_retired_staging_of_a_frame_that_never_submitted() {
         let instance = VulkanInstance::new_headless().expect("headless Vulkan instance");
         let mut device = Device::new(&instance).expect("Vulkan device");
-        let mut atlas = AtlasTextures::new(&device, TEST_PAGE).expect("atlas");
+        let mut atlas = AtlasTextures::new(&mut device).expect("atlas");
         let pool = command_pool(&device);
         let commands = allocate(&device, pool, 2);
 
         // 第 1 帧真正提交并完成：`last_index` 推进到 1。
         let mut first_page = page();
         fill_row(&mut first_page, 5, [0x11, 0x22, 0x33, 0xFF]);
-        atlas.queue_upload(AtlasKind::Image, first_page, rows(5, 6));
+        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, first_page, rows(5, 6));
         begin(&device, commands[0]);
+        atlas.prepare(&mut device).expect("prepare frame 1");
         atlas
             .record_uploads(&mut device, FrameIndex::from_raw(1), commands[0])
             .expect("record frame 1");
@@ -809,8 +923,9 @@ mod tests {
         // 第 2 帧：staging 已 retire 在序号 2，但录制随后的失败让这一帧从未 submit。
         let mut second_page = page();
         fill_row(&mut second_page, 5, [0x44, 0x55, 0x66, 0xFF]);
-        atlas.queue_upload(AtlasKind::Image, second_page, rows(5, 6));
+        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, second_page, rows(5, 6));
         begin(&device, commands[1]);
+        atlas.prepare(&mut device).expect("prepare frame 2");
         atlas
             .record_uploads(&mut device, FrameIndex::from_raw(2), commands[1])
             .expect("record frame 2");

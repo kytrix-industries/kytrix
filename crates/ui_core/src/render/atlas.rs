@@ -16,10 +16,83 @@ use crate::{
     paint::atlas::{AtlasKind, AtlasTile},
 };
 
-/// 字形页尺寸（纹素）：2048² R8 = 4 MiB（P02 §10.3）。
-pub(crate) const GLYPH_PAGE: (u32, u32) = (2048, 2048);
-/// 图片页尺寸（纹素）：2048² BGRA8 = 16 MiB（P02 §10.3）。
-pub(crate) const IMAGE_PAGE: (u32, u32) = (2048, 2048);
+/// 图集页的**上限**（纹素，边长）：2048²。字形页 R8 = 4 MiB、图片页 BGRA8 = 16 MiB
+/// （P02 §10.3）。两张页的页尺寸都按需选档，最大到这一档。
+pub(crate) const MAX_ATLAS_PAGE: u32 = 2048;
+
+/// 图集页的起始档 / 图片页可选档的下界（DEVIATIONS F-208）。
+///
+/// 两张页都**懒分配**：没有字形 / 图片时不占 CPU 页、GPU 纹理与 staging。
+pub(crate) const MIN_ATLAS_PAGE: u32 = 512;
+
+/// 页档阶梯：512 → 1024 → 2048（上限）。字形页分配失败时按这个顺序换代扩容；
+/// 图片页在首次插入时按图片尺寸选档（见 [`page_for_tile`]）。
+pub(crate) const ATLAS_PAGE_STEPS: [u32; 3] = [MIN_ATLAS_PAGE, MIN_ATLAS_PAGE * 2, MAX_ATLAS_PAGE];
+
+/// 图片页在首次插入时的选档：覆盖 `max(width, height) + 2`（1 纹素 padding）的最小档。
+///
+/// 超出 2048 的请求返回上限档，由 `AtlasAllocator::allocate` 以 `Capacity` 拒绝
+/// （图片页一旦锁定就不能再换页：`ResourceImage.tile` 的 UV 以页尺寸归一化，应用长期持有它）。
+pub(crate) fn page_for_tile(width: u32, height: u32) -> u32 {
+    let needed = width.max(height).saturating_add(2);
+    ATLAS_PAGE_STEPS
+        .iter()
+        .copied()
+        .find(|page| *page >= needed)
+        .unwrap_or(ATLAS_PAGE_STEPS[ATLAS_PAGE_STEPS.len() - 1])
+}
+
+/// 下一档页；`None` = 已到上限。
+fn next_page(page: u32) -> Option<u32> {
+    ATLAS_PAGE_STEPS
+        .iter()
+        .copied()
+        .find(|candidate| *candidate > page)
+}
+
+/// 图集纹素的字节数（字形 `R8` = 1，图片 `BGRA8` = 4；三端同一契约）。
+pub(crate) fn texel_bytes(kind: AtlasKind) -> u32 {
+    match kind {
+        AtlasKind::Glyph => 1,
+        AtlasKind::Image => 4,
+    }
+}
+
+/// 图集纹理重建位：页尺寸变化（懒创建 / 字形页换代）后，调用方必须重写该图集的绑定。
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AtlasRebuilt {
+    pub glyph: bool,
+    pub image: bool,
+}
+
+impl AtlasRebuilt {
+    pub(crate) fn mark(&mut self, kind: AtlasKind) {
+        match kind {
+            AtlasKind::Glyph => self.glyph = true,
+            AtlasKind::Image => self.image = true,
+        }
+    }
+}
+
+/// 把 `page` 里 `rows` 顺序的行**紧密打包**进 `out`（DEVIATIONS F-211）。
+///
+/// 增量上传的源数据只有脏行；后端按「累计行偏移」从打包缓冲取行。`rows.is_full()` 时等价于
+/// 整页拷贝（新窗口 / 页尺寸变化 / 首次上传都走这条）。
+pub(crate) fn pack_rows(page: &[u8], extent: u32, texel: u32, rows: &DirtyRows, out: &mut Vec<u8>) {
+    out.clear();
+    let row_bytes = extent as usize * texel as usize;
+    if rows.is_full() {
+        out.extend_from_slice(page);
+        return;
+    }
+    for span in rows.spans() {
+        let start = (span.start.min(extent) as usize) * row_bytes;
+        let end = (span.end.min(extent) as usize) * row_bytes;
+        if start < end {
+            out.extend_from_slice(&page[start..end]);
+        }
+    }
+}
 
 /// 一个 `AtlasKind` 的**单页**分配器（P02 §10.4）。
 pub(crate) struct AtlasAllocator {
@@ -49,12 +122,8 @@ pub(crate) struct Allocation {
 }
 
 impl AtlasAllocator {
-    /// 新建（页尺寸按 `kind` 的内置常量）。
-    pub(crate) fn new(kind: AtlasKind) -> Self {
-        Self::with_page(kind, page_of(kind))
-    }
-
-    fn with_page(kind: AtlasKind, page: (u32, u32)) -> Self {
+    /// 新建（页尺寸 = `page`；两张页都按需选档，见 DEVIATIONS F-208）。
+    pub(crate) fn with_page(kind: AtlasKind, page: (u32, u32)) -> Self {
         Self {
             kind,
             page,
@@ -64,12 +133,6 @@ impl AtlasAllocator {
             generation: 1,
             dirty: DirtyRows::default(),
         }
-    }
-
-    /// 仅测试：用小页构造（2048² 填满需要几十万次分配）。
-    #[cfg(test)]
-    pub(crate) fn for_test(kind: AtlasKind, page: (u32, u32)) -> Self {
-        Self::with_page(kind, page)
     }
 
     pub(crate) fn kind(&self) -> AtlasKind {
@@ -170,6 +233,19 @@ impl AtlasAllocator {
         self.generation = self.generation.wrapping_add(1);
     }
 
+    /// 换代扩容到下一档（512 → 1024 → 2048）；返回 `false` = 已到上限。
+    ///
+    /// 页尺寸变化 ⇒ 旧 tile 全部失效、整页内容必须重传（`clear` 的语义），
+    /// 调用方负责同步清空自己的缓存（[`crate::text::atlas::GlyphAtlas::clear`]）。
+    pub(crate) fn grow(&mut self) -> bool {
+        let Some(next) = next_page(self.page.0) else {
+            return false;
+        };
+        self.page = (next, next);
+        self.clear();
+        true
+    }
+
     /// 记录「这些行被写脏了」（P02 §10.5）。
     pub(crate) fn mark_written(&mut self, rect: PhysicalRect) {
         if rect.is_empty() {
@@ -184,14 +260,6 @@ impl AtlasAllocator {
         core::mem::take(&mut self.dirty)
     }
 }
-
-const fn page_of(kind: AtlasKind) -> (u32, u32) {
-    match kind {
-        AtlasKind::Glyph => GLYPH_PAGE,
-        AtlasKind::Image => IMAGE_PAGE,
-    }
-}
-
 /// 被写脏的**行区间**集合（y 区间，x 覆盖整页），升序、已合并。
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DirtyRows {
@@ -199,6 +267,17 @@ pub(crate) struct DirtyRows {
 }
 
 impl DirtyRows {
+    /// 本次上传的行数（`full` = 整页 `page` 行；超出页的 span 被钳掉，DEVIATIONS F-211）。
+    pub(crate) fn row_count(&self, page: u32) -> u32 {
+        if self.is_full() {
+            return page;
+        }
+        self.spans
+            .iter()
+            .map(|span| span.end.min(page).saturating_sub(span.start.min(page)))
+            .sum()
+    }
+
     /// 标记 `[y0, y1)` 脏；相邻/重叠都合并；非法区间忽略；段数 > 8 折叠为整页（0..u32::MAX）。
     pub(crate) fn mark(&mut self, y0: u32, y1: u32) {
         if y0 >= y1 || self.is_full() {
@@ -250,11 +329,13 @@ impl DirtyRows {
 
 #[cfg(test)]
 mod tests {
-    use super::{AtlasAllocator, DirtyRows, GLYPH_PAGE, IMAGE_PAGE};
+    use super::{
+        ATLAS_PAGE_STEPS, AtlasAllocator, DirtyRows, MAX_ATLAS_PAGE, MIN_ATLAS_PAGE, page_for_tile,
+    };
     use crate::paint::atlas::AtlasKind;
 
     fn allocator() -> AtlasAllocator {
-        AtlasAllocator::for_test(AtlasKind::Glyph, (64, 64))
+        AtlasAllocator::with_page(AtlasKind::Glyph, (64, 64))
     }
 
     #[test]
@@ -284,7 +365,7 @@ mod tests {
 
     #[test]
     fn uv_uses_edges_and_stays_inside_the_page() {
-        let mut atlas = AtlasAllocator::for_test(AtlasKind::Glyph, (64, 64));
+        let mut atlas = AtlasAllocator::with_page(AtlasKind::Glyph, (64, 64));
         let allocation = atlas.allocate((6, 9)).expect("fits");
         let tile = allocation.tile;
 
@@ -300,19 +381,56 @@ mod tests {
     }
 
     #[test]
-    fn default_page_sizes_match_paint_contract() {
-        assert_eq!(GLYPH_PAGE, (2048, 2048));
-        assert_eq!(
-            IMAGE_PAGE,
-            (2048, 2048),
-            "图片页尺寸是 ResourceCache 的契约"
-        );
-        let glyph = AtlasAllocator::new(AtlasKind::Glyph);
-        assert_eq!(glyph.page(), GLYPH_PAGE);
+    fn default_page_ladder_matches_paint_contract() {
+        assert_eq!(MAX_ATLAS_PAGE, 2048, "两张页的上限都是 2048²");
+        assert_eq!(MIN_ATLAS_PAGE, 512);
+        assert_eq!(ATLAS_PAGE_STEPS, [512, 1024, 2048]);
+        let glyph = AtlasAllocator::with_page(AtlasKind::Glyph, (MIN_ATLAS_PAGE, MIN_ATLAS_PAGE));
+        assert_eq!(glyph.page(), (512, 512));
         assert_eq!(glyph.kind(), AtlasKind::Glyph);
-        let image = AtlasAllocator::new(AtlasKind::Image);
-        assert_eq!(image.page(), IMAGE_PAGE);
+        let image = AtlasAllocator::with_page(AtlasKind::Image, (MIN_ATLAS_PAGE, MIN_ATLAS_PAGE));
         assert_eq!(image.kind(), AtlasKind::Image);
+    }
+
+    #[test]
+    fn grow_walks_the_page_ladder_and_stops_at_the_cap() {
+        let mut atlas = allocator();
+        assert_eq!(atlas.page(), (64, 64));
+        // 64 不在阶梯里：下一档是 512，然后是 1024、2048，之后不再增长。
+        assert!(atlas.grow());
+        assert_eq!(atlas.page(), (512, 512));
+        assert!(atlas.grow());
+        assert_eq!(atlas.page(), (1024, 1024));
+        assert!(atlas.grow());
+        assert_eq!(atlas.page(), (2048, 2048));
+        assert!(!atlas.grow(), "2048² 是上限");
+        assert_eq!(atlas.page(), (2048, 2048));
+    }
+
+    #[test]
+    fn grow_bumps_the_generation_and_drops_old_tiles() {
+        let mut atlas = allocator();
+        let tile = atlas.allocate((8, 8)).expect("fits").tile;
+        let before = atlas.generation();
+        assert!(atlas.grow());
+        assert_eq!(atlas.generation(), before + 1);
+        assert!(tile.is_stale(atlas.generation()));
+        assert!(atlas.allocate((8, 8)).is_some(), "新页可以继续分配");
+    }
+
+    #[test]
+    fn image_page_bucket_covers_the_tile_plus_padding() {
+        assert_eq!(page_for_tile(16, 16), 512);
+        assert_eq!(page_for_tile(510, 16), 512, "510 + 2 = 512 恰好落在起始档");
+        assert_eq!(page_for_tile(511, 16), 1024);
+        assert_eq!(
+            page_for_tile(16, 1022),
+            1024,
+            "1022 + 2 = 1024 恰好落在第二档"
+        );
+        assert_eq!(page_for_tile(16, 1023), 2048);
+        assert_eq!(page_for_tile(2046, 16), 2048);
+        assert_eq!(page_for_tile(4096, 4096), 2048, "超出上限仍给上限档");
     }
 
     #[test]
@@ -329,7 +447,7 @@ mod tests {
 
     #[test]
     fn release_restores_capacity() {
-        let mut atlas = AtlasAllocator::for_test(AtlasKind::Glyph, (16, 16));
+        let mut atlas = AtlasAllocator::with_page(AtlasKind::Glyph, (16, 16));
         let first = atlas.allocate((12, 12)).expect("fits");
         assert!(
             atlas.allocate((12, 12)).is_none(),
@@ -365,7 +483,7 @@ mod tests {
 
     #[test]
     fn exhaustion_then_clear_retry_succeeds() {
-        let mut atlas = AtlasAllocator::for_test(AtlasKind::Glyph, (32, 32));
+        let mut atlas = AtlasAllocator::with_page(AtlasKind::Glyph, (32, 32));
         let mut allocated = 0usize;
         while atlas.allocate((6, 6)).is_some() {
             allocated += 1;

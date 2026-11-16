@@ -31,7 +31,10 @@
 use std::{
     collections::VecDeque,
     path::PathBuf,
-    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -89,20 +92,6 @@ impl Renderer {
     pub(crate) fn new_offscreen(size: (u32, u32)) -> Result<Self, EngineError> {
         Ok(Self {
             target: RenderTarget::Offscreen(GpuRenderer::new_offscreen(size)?),
-            error: None,
-        })
-    }
-
-    /// 测试用离屏渲染器 + 指定图集页（快照必须与 `App` 的分配器同页尺寸）。
-    #[cfg(feature = "test-support")]
-    pub(crate) fn new_offscreen_with_page(
-        size: (u32, u32),
-        atlas_page: u32,
-    ) -> Result<Self, EngineError> {
-        Ok(Self {
-            target: RenderTarget::Offscreen(GpuRenderer::new_offscreen_with_page(
-                size, atlas_page,
-            )?),
             error: None,
         })
     }
@@ -177,10 +166,27 @@ impl Renderer {
     }
 
     /// 把一页图集像素交给 GPU 线程（每 `AtlasKind` 只留最新，§4.2）。
-    pub(crate) fn queue_atlas_upload(&mut self, kind: AtlasKind, pixels: &[u8], rows: DirtyRows) {
+    /// 把一页图集像素交给 GPU 线程（`pixels` 是 `rows` 顺序紧密打包的行）。
+    pub(crate) fn queue_atlas_upload(
+        &mut self,
+        kind: AtlasKind,
+        page: u32,
+        pixels: &[u8],
+        rows: DirtyRows,
+    ) {
         match &mut self.target {
-            RenderTarget::Offscreen(gpu) => gpu.queue_atlas_upload(kind, pixels.to_vec(), rows),
-            RenderTarget::Window(window) => window.queue_atlas_upload(kind, pixels, rows),
+            RenderTarget::Offscreen(gpu) => {
+                gpu.queue_atlas_upload(kind, page, pixels.to_vec(), rows)
+            }
+            RenderTarget::Window(window) => window.queue_atlas_upload(kind, page, pixels, rows),
+        }
+    }
+
+    /// 该图集的共享槽是否空闲（UI 线程据此决定这一帧能否入队，DEVIATIONS F-211）。
+    pub(crate) fn atlas_idle(&self, kind: AtlasKind) -> bool {
+        match &self.target {
+            RenderTarget::Offscreen(_) => true,
+            RenderTarget::Window(window) => window.atlas_idle(kind),
         }
     }
 
@@ -308,6 +314,7 @@ impl WindowRenderer {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::new()),
             work: Condvar::new(),
+            atlas_pending: [AtomicBool::new(false), AtomicBool::new(false)],
         });
         let worker = Arc::clone(&shared);
         let thread = thread::Builder::new()
@@ -334,8 +341,12 @@ impl WindowRenderer {
         self.stats
     }
 
-    fn queue_atlas_upload(&mut self, kind: AtlasKind, pixels: &[u8], rows: DirtyRows) {
-        self.shared.queue_atlas(kind, pixels, rows);
+    fn queue_atlas_upload(&mut self, kind: AtlasKind, page: u32, pixels: &[u8], rows: DirtyRows) {
+        self.shared.queue_atlas(kind, page, pixels, rows);
+    }
+
+    fn atlas_idle(&self, kind: AtlasKind) -> bool {
+        self.shared.atlas_idle(kind)
     }
 
     /// persist clear color（linear）：交给 GPU 线程，在空闲或录制下一帧前应用。
@@ -431,6 +442,8 @@ impl Drop for PanicGuard {
 struct Shared {
     state: Mutex<State>,
     work: Condvar,
+    /// 每 `AtlasKind` 的共享槽是否正在被 GPU 线程消费（`false` = UI 可以入队）。
+    atlas_pending: [AtomicBool; 2],
 }
 
 struct State {
@@ -475,6 +488,8 @@ struct AtlasSlots {
 
 struct AtlasUpload {
     kind: AtlasKind,
+    page: u32,
+    /// `rows` 顺序紧密打包的行（整页上传时就是整页）。
     pixels: Vec<u8>,
     rows: DirtyRows,
 }
@@ -487,30 +502,23 @@ impl AtlasSlots {
         }
     }
 
-    /// 新像素覆盖旧像素；`DirtyRows` 取并集。**发生覆盖时整页标记**：被丢掉的中间上传的
-    /// 脏行永远不会再补，只有整页上传才能保证图集内容正确（§4.2）。
-    fn queue(&mut self, kind: AtlasKind, pixels: &[u8], rows: DirtyRows) {
+    /// 入队一次上传。**槽位由 UI 线程的 `atlas_idle` 保证空闲**（DEVIATIONS F-211）：
+    /// 槽里已有未消费的上传时是契约破坏（会丢行），release 也硬失败。
+    fn queue(&mut self, kind: AtlasKind, page: u32, pixels: &[u8], rows: DirtyRows) {
         let slot = match kind {
             AtlasKind::Glyph => &mut self.glyph,
             AtlasKind::Image => &mut self.image,
         };
-        let mut rows = rows;
-        match slot {
-            Some(existing) => {
-                // 复用已分配的容量，不重新分配。
-                existing.pixels.clear();
-                existing.pixels.extend_from_slice(pixels);
-                existing.rows.merge(&mut rows);
-                existing.rows.mark(0, u32::MAX);
-            }
-            None => {
-                *slot = Some(AtlasUpload {
-                    kind,
-                    pixels: pixels.to_vec(),
-                    rows,
-                });
-            }
-        }
+        assert!(
+            slot.is_none(),
+            "atlas slot must be idle before queueing a new upload (kind {kind:?})"
+        );
+        *slot = Some(AtlasUpload {
+            kind,
+            page,
+            pixels: pixels.to_vec(),
+            rows,
+        });
     }
 
     fn take(&mut self) -> [Option<AtlasUpload>; 2] {
@@ -540,13 +548,20 @@ impl Shared {
         self.wake();
     }
 
-    fn queue_atlas(&self, kind: AtlasKind, pixels: &[u8], rows: DirtyRows) {
+    fn queue_atlas(&self, kind: AtlasKind, page: u32, pixels: &[u8], rows: DirtyRows) {
+        let index = match kind {
+            AtlasKind::Glyph => 0,
+            AtlasKind::Image => 1,
+        };
+        // 先占位再入队：GPU 线程 take 之后才释放（DEVIATIONS F-211）。
+        self.atlas_pending[index].store(true, Ordering::Release);
         let mut state = self.lock();
         if state.shutdown || state.terminated {
+            self.atlas_pending[index].store(false, Ordering::Release);
             return;
         }
         // 不唤醒：图集上传统一在「录制下一帧」之前落地（§4.2），单独唤醒只会空转。
-        state.atlas.queue(kind, pixels, rows);
+        state.atlas.queue(kind, page, pixels, rows);
     }
 
     /// 排队一笔 persist clear color（最新者胜）：GPU 线程空闲或录制下一帧前应用。
@@ -597,7 +612,22 @@ impl Shared {
     }
 
     fn take_atlas(&self) -> [Option<AtlasUpload>; 2] {
-        self.lock().atlas.take()
+        let uploads = self.lock().atlas.take();
+        // 槽空出来了，UI 线程下一帧可以继续入队（DEVIATIONS F-211）。
+        for (index, upload) in uploads.iter().enumerate() {
+            if upload.is_some() {
+                self.atlas_pending[index].store(false, Ordering::Release);
+            }
+        }
+        uploads
+    }
+
+    fn atlas_idle(&self, kind: AtlasKind) -> bool {
+        let index = match kind {
+            AtlasKind::Glyph => 0,
+            AtlasKind::Image => 1,
+        };
+        !self.atlas_pending[index].load(Ordering::Acquire)
     }
 
     fn shutdown_requested(&self) -> bool {
@@ -723,7 +753,7 @@ fn run_gpu_loop(
         }
         // 图集像素在本帧录制前落地（上传先于绘制，§4.2；像素按所有权移交给 GPU）。
         for upload in shared.take_atlas().into_iter().flatten() {
-            renderer.queue_atlas_upload(upload.kind, upload.pixels, upload.rows);
+            renderer.queue_atlas_upload(upload.kind, upload.page, upload.pixels, upload.rows);
         }
         // §4.4：resize 不是独立命令，`FrameRequest.surface` 就是目标尺寸。
         if request.surface != renderer.surface() {
@@ -975,6 +1005,7 @@ mod tests {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::new()),
             work: Condvar::new(),
+            atlas_pending: [AtomicBool::new(false), AtomicBool::new(false)],
         });
         let worker = Arc::clone(&shared);
         // 关掉默认 hook：这条 panic 是测试输入，不是测试失败。
@@ -1005,6 +1036,7 @@ mod tests {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::new()),
             work: Condvar::new(),
+            atlas_pending: [AtomicBool::new(false), AtomicBool::new(false)],
         });
         shared.publish_error(EngineError::Swapchain {
             detail: SmolStr::new_static("recreate_swapchain_khr failed"),

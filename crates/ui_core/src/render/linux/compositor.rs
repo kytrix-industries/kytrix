@@ -30,7 +30,7 @@ use crate::{
         compositor::{FramePlan, Plan},
         frame::{FramePayload, FrameRequest, FrameSlot, MAX_FRAMES_IN_FLIGHT},
         linux::{
-            atlas::{ATLAS_PAGE, AtlasTextures},
+            atlas::AtlasTextures,
             device::{Device, GpuObject, init_error, on_gpu_thread},
             instance::VulkanInstance,
             pipeline::{Pipeline, ROOT_UNIFORM_BYTES},
@@ -165,7 +165,6 @@ impl GpuRenderer {
             device,
             Some(swapchain),
             size,
-            ATLAS_PAGE,
             background,
             viewport,
             Some(surface),
@@ -180,29 +179,15 @@ impl GpuRenderer {
     /// # Errors
     /// 实例 / 设备 / 管线 / 图集 / 持久目标任一创建失败。
     pub(crate) fn new_offscreen(size: (u32, u32)) -> Result<Self, EngineError> {
-        Self::with_headless(size, ATLAS_PAGE)
+        Self::with_headless(size)
     }
 
-    /// 指定图集页（快照必须与 `App` 的分配器同页尺寸）。
-    ///
-    /// # Errors
-    /// 同 [`Self::new_offscreen`]。
-    #[cfg(feature = "test-support")]
-    pub(crate) fn new_offscreen_with_page(
-        size: (u32, u32),
-        atlas_page: u32,
-    ) -> Result<Self, EngineError> {
-        Self::with_headless(size, atlas_page)
-    }
-
-    fn with_headless(size: (u32, u32), atlas_page: u32) -> Result<Self, EngineError> {
+    fn with_headless(size: (u32, u32)) -> Result<Self, EngineError> {
         let size = (size.0.max(1), size.1.max(1));
         let instance = VulkanInstance::new_headless()?;
         let device = Device::new(&instance)?;
         // 离屏路径没有窗口背景色：保持既有的透明黑（golden / 快照不变）。
-        Self::with_device(
-            instance, device, None, size, atlas_page, [0.0; 4], None, None,
-        )
+        Self::with_device(instance, device, None, size, [0.0; 4], None, None)
     }
 
     fn with_device(
@@ -210,7 +195,6 @@ impl GpuRenderer {
         device: Device,
         swapchain: Option<Swapchain>,
         size: (u32, u32),
-        atlas_page: u32,
         clear_color: [f32; 4],
         viewport: Option<WpViewport>,
         wl_surface: Option<wl_surface::WlSurface>,
@@ -220,7 +204,8 @@ impl GpuRenderer {
             .as_ref()
             .map_or(OFFSCREEN_FORMAT, Swapchain::format);
         let pipeline = Pipeline::new(&device, format)?;
-        let atlas = AtlasTextures::new(&device, atlas_page)?;
+        // 图集页懒分配：初始化只有 1×1 占位页，描述符集合始终有效（DEVIATIONS F-208）。
+        let atlas = AtlasTextures::new(&mut device)?;
         pipeline.write_atlas(atlas.glyph_view(), atlas.image_view(), atlas.sampler());
         let persist = Persist::new(&device, &pipeline, size, format)?;
         let upload = UploadArena::new(&mut device)?;
@@ -541,10 +526,11 @@ impl GpuRenderer {
     pub(crate) fn queue_atlas_upload(
         &mut self,
         kind: AtlasKind,
+        page: u32,
         pixels: Vec<u8>,
         rows: crate::render::atlas::DirtyRows,
     ) {
-        self.atlas.queue_upload(kind, pixels, rows);
+        self.atlas.queue_upload(kind, page, pixels, rows);
     }
 
     /// 读回持久 offscreen（快照路径；同步等待 GPU）。
@@ -651,6 +637,17 @@ impl GpuRenderer {
         });
 
         let command = self.commands[slot.index];
+        // 图集页尺寸变化必须在开始录制之前落地：重建 image / view 要重写描述符集合，而旧
+        // image 必须等 GPU 空闲后才能销毁 ⇒ `prepare` 内部先 `queue_wait_idle`
+        // （DEVIATIONS F-208）。
+        let atlas_rebuilt = self.atlas.prepare(&mut self.device)?;
+        if atlas_rebuilt.glyph || atlas_rebuilt.image {
+            self.pipeline.write_atlas(
+                self.atlas.glyph_view(),
+                self.atlas.image_view(),
+                self.atlas.sampler(),
+            );
+        }
         // SAFETY: 命令缓冲由本结构的命令池分配；本槽的上一次提交已由 `wait_slot` 等到。
         unsafe {
             self.device

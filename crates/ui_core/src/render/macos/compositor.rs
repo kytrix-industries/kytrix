@@ -37,7 +37,7 @@ use crate::{
         compositor::{FramePlan, Plan},
         frame::{FramePayload, MAX_FRAMES_IN_FLIGHT},
         macos::{
-            atlas::{ATLAS_PAGE, AtlasTextures},
+            atlas::AtlasTextures,
             device::{Device, GpuObject, init_error, on_gpu_thread},
             pipeline::Pipeline,
             queue::Queue,
@@ -83,18 +83,9 @@ pub(crate) struct GpuRenderer {
 unsafe impl Send for GpuRenderer {}
 
 impl GpuRenderer {
-    /// 产品路径（离屏 / 快照）：系统默认设备 + 默认图集页。
+    /// 产品路径（离屏 / 快照）：系统默认设备；图集页懒分配（DEVIATIONS F-208）。
     pub(crate) fn new_offscreen(size: (u32, u32)) -> Result<Self, EngineError> {
-        Self::with_device(Device::new()?, size, ATLAS_PAGE, false, [0.0; 4])
-    }
-
-    /// 指定图集页（快照必须与 `App` 的分配器同页尺寸）。
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn new_offscreen_with_page(
-        size: (u32, u32),
-        atlas_page: u32,
-    ) -> Result<Self, EngineError> {
-        Self::with_device(Device::new()?, size, atlas_page, false, [0.0; 4])
+        Self::with_device(Device::new()?, size, false, [0.0; 4])
     }
 
     /// 真实窗口：设备由主线程建好（图层已绑定它），这里只接管 GPU 侧对象。
@@ -106,21 +97,21 @@ impl GpuRenderer {
         size: (u32, u32),
         background_linear: [f32; 4],
     ) -> Result<Self, EngineError> {
-        Self::with_device(device, size, ATLAS_PAGE, true, background_linear)
+        Self::with_device(device, size, true, background_linear)
     }
 
     fn with_device(
         device: Device,
         size: (u32, u32),
-        atlas_page: u32,
         window_target: bool,
         clear_color: [f32; 4],
     ) -> Result<Self, EngineError> {
         let size = (size.0.max(1), size.1.max(1));
         let queue = Queue::new(&device)?;
         let pipeline = Pipeline::new(&device, MTLPixelFormat::BGRA8Unorm_sRGB)?;
-        let atlas = AtlasTextures::new(&device, atlas_page)?;
         let mut device = device;
+        // 图集页懒分配：初始化只有 1×1 占位纹理，绑定始终有效（DEVIATIONS F-208）。
+        let atlas = AtlasTextures::new(&mut device)?;
         let persist = Persist::new(&mut device, size)?;
         let upload = UploadArena::new(&mut device)?;
         Ok(Self {
@@ -328,11 +319,12 @@ impl GpuRenderer {
     pub(crate) fn queue_atlas_upload(
         &mut self,
         kind: AtlasKind,
+        page: u32,
         pixels: Vec<u8>,
         rows: crate::render::atlas::DirtyRows,
     ) {
         self.debug_assert_gpu_thread("queue_atlas_upload");
-        self.atlas.queue_upload(kind, pixels, rows);
+        self.atlas.queue_upload(kind, page, pixels, rows);
     }
 
     /// 录制一帧（不呈现、不提交）：取槽 → 上传 → 图集 blit → persist 绘制 → 整面 blit。
@@ -384,6 +376,11 @@ impl GpuRenderer {
 
         let full = frame.is_full();
         let mut draw_calls = 0u32;
+        // 页尺寸变化在编码 blit 之前落地：新纹理建好、旧纹理句柄按本帧序号 retire
+        // （DEVIATIONS F-208）。纹理绑定是每帧 `setFragmentTexture` 现场写的，无需重写。
+        let _rebuilt = self
+            .atlas
+            .prepare(&mut self.device, &mut self.queue, index)?;
         if self.atlas.has_pending() {
             let blit = command
                 .blitCommandEncoder()

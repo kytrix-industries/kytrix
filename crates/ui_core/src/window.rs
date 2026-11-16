@@ -286,13 +286,14 @@ pub struct Window {
     resolver: ColorResolver,
     /// GPU 渲染器（`None` = headless，I7 的默认；P09 的窗口层负责 attach 原生窗口）。
     renderer: Option<Renderer>,
-    /// 该窗口的渲染器是否已经收到过**完整**的字形图集页（新渲染器 ⇒ `false`）。
+    /// 该窗口的渲染器已收到的**完整**字形图集页尺寸（`None` = 还没收到 / 渲染器已换）。
     ///
     /// 图集页是进程级共享数据，但纹理是每窗口一份（`AtlasTextures`），因此必须逐窗口记账：
-    /// 第一次（或渲染器重建后）必须整页上传，之后才允许按脏行增量（P13 §8.2 / 评审阻塞 ②）。
-    glyph_page_received: bool,
+    /// 第一次（或渲染器重建后 / 页尺寸变化后）必须整页上传，之后才允许按脏行增量
+    /// （P13 §8.2 / 评审阻塞 ② / DEVIATIONS F-208）。
+    glyph_page_received: Option<u32>,
     /// 同上，图片图集页。
-    image_page_received: bool,
+    image_page_received: Option<u32>,
     /// 本帧的分段计时（容量跨帧复用）。
     timings: FrameTimings,
     /// 本帧 lane 绘制序的复用缓冲（避免每帧分配）。
@@ -356,8 +357,8 @@ impl Window {
             damage: DamageAccumulator::new(scale),
             resolver: ColorResolver::new(Interpolation::default()),
             renderer: None,
-            glyph_page_received: false,
-            image_page_received: false,
+            glyph_page_received: None,
+            image_page_received: None,
             timings: FrameTimings::new(),
             paint_order: Vec::new(),
             full_damage_pending: false,
@@ -756,39 +757,60 @@ impl Window {
         self.renderer.is_some()
     }
 
-    /// 该窗口的渲染器是否已收到完整字形图集页。
+    /// 该窗口的渲染器是否已收到完整字形图集页（测试诊断）。
+    #[cfg(test)]
     pub(crate) fn glyph_page_received(&self) -> bool {
-        self.glyph_page_received
+        self.glyph_page_received.is_some()
     }
 
-    /// 该窗口的渲染器是否已收到完整图片图集页。
+    /// 该窗口的渲染器是否已收到完整图片图集页（测试诊断）。
+    #[cfg(test)]
     pub(crate) fn image_page_received(&self) -> bool {
-        self.image_page_received
+        self.image_page_received.is_some()
     }
 
-    /// 记账：字形页已整页上传到本窗口的渲染器。
-    pub(crate) fn mark_glyph_page_received(&mut self) {
-        self.glyph_page_received = true;
+    /// 已收到的字形页尺寸是否就是 `page`（否则这一帧必须整页重传）。
+    pub(crate) fn glyph_page_matches(&self, page: u32) -> bool {
+        self.glyph_page_received == Some(page)
     }
 
-    /// 记账：图片页已整页上传到本窗口的渲染器。
-    pub(crate) fn mark_image_page_received(&mut self) {
-        self.image_page_received = true;
+    /// 已收到的图片页尺寸是否就是 `page`。
+    pub(crate) fn image_page_matches(&self, page: u32) -> bool {
+        self.image_page_received == Some(page)
+    }
+
+    /// 记账：字形页已整页上传到本窗口的渲染器（记录页尺寸）。
+    pub(crate) fn mark_glyph_page_received(&mut self, page: u32) {
+        self.glyph_page_received = Some(page);
+    }
+
+    /// 记账：图片页已整页上传到本窗口的渲染器（记录页尺寸）。
+    pub(crate) fn mark_image_page_received(&mut self, page: u32) {
+        self.image_page_received = Some(page);
     }
 
     /// 把一页图集像素交给渲染器（下一次 `submit` 上传；无渲染器时丢弃）。
     ///
-    /// 消费者：`App::upload_atlas_pages`（P13：**广播**给所有窗口的渲染器；
-    /// 图集页是进程级共享数据，纹理是每窗口一份）。
+    /// `pixels` 是 `rows` 顺序**紧密打包**的行（每行 `page * texel` 字节；整页上传时就是整页），
+    /// 因此增量上传只搬脏行（DEVIATIONS F-211）。消费者：`App::upload_atlas_pages`（广播给所有
+    /// 窗口的渲染器；图集页是进程级共享数据，纹理是每窗口一份）。
     pub(crate) fn queue_atlas_upload(
         &mut self,
         kind: crate::paint::atlas::AtlasKind,
+        page: u32,
         pixels: &[u8],
         rows: crate::render::DirtyRows,
     ) {
         if let Some(renderer) = self.renderer.as_mut() {
-            renderer.queue_atlas_upload(kind, pixels, rows);
+            renderer.queue_atlas_upload(kind, page, pixels, rows);
         }
+    }
+
+    /// 该图集的图集上传槽是否空闲（UI 线程据此决定这一帧能否入队，DEVIATIONS F-211）。
+    pub(crate) fn atlas_idle(&self, kind: crate::paint::atlas::AtlasKind) -> bool {
+        self.renderer
+            .as_ref()
+            .is_none_or(|renderer| renderer.atlas_idle(kind))
     }
 
     /// 挂上 GPU 渲染器（平台层在窗口创建之后调用；`Renderer` 已带 HWND swapchain）。
@@ -796,8 +818,8 @@ impl Window {
     /// 换渲染器 = 换一套空纹理（`AtlasTextures`），所以两张图集页都要重新整页上传。
     pub(crate) fn set_renderer(&mut self, renderer: Renderer) {
         self.renderer = Some(renderer);
-        self.glyph_page_received = false;
-        self.image_page_received = false;
+        self.glyph_page_received = None;
+        self.image_page_received = None;
     }
 
     /// 轮询 renderer 的反馈 / 错误（三平台窗口路径；空闲时也要跑）。
@@ -846,8 +868,8 @@ impl Window {
         }
         let surface = self.physical_surface();
         self.renderer = Some(Renderer::new_offscreen(surface)?);
-        self.glyph_page_received = false;
-        self.image_page_received = false;
+        self.glyph_page_received = None;
+        self.image_page_received = None;
         Ok(())
     }
 

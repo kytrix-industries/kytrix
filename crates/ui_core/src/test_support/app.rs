@@ -225,23 +225,27 @@ impl TestApp {
             surface.width().max(1) as u32,
             surface.height().max(1) as u32,
         );
-        // 快照的渲染器是临时建的：图集页尺寸必须与 App 的分配器一致，否则图集页传不进去。
-        let ((page_width, page_height), glyph_pixels) = self.app.glyph_page_pixels();
-        let mut renderer = Self::offscreen_renderer(size, page_width).map_err(gpu_error)?;
+        // 快照的渲染器是临时建的：页尺寸随整页上传一起给出（DEVIATIONS F-211）。
+        let (glyph_page, glyph_pixels) = self.app.glyph_page_pixels();
+        let mut renderer = Self::offscreen_renderer(size).map_err(gpu_error)?;
         let mut rows = crate::render::DirtyRows::default();
         rows.mark(0, u32::MAX);
-        renderer.queue_atlas_upload(crate::paint::atlas::AtlasKind::Glyph, &glyph_pixels, rows);
-        // 图片页：只有插过资源才上传（否则每个快照都白传 16 MiB）。
-        if !self.app.resources().is_empty() {
-            let ((image_width, image_height), image_pixels) = self.app.resource_page_pixels();
-            debug_assert_eq!(
-                (image_width, image_height),
-                (page_width, page_height),
-                "字形页与图片页必须同尺寸（渲染器只有一个 page 参数）"
-            );
+        renderer.queue_atlas_upload(
+            crate::paint::atlas::AtlasKind::Glyph,
+            glyph_page.0,
+            &glyph_pixels,
+            rows,
+        );
+        // 图片页：只有插过资源（页已分配）才上传。
+        if let Some((image_page, image_pixels)) = self.app.resource_page_pixels() {
             let mut rows = crate::render::DirtyRows::default();
             rows.mark(0, u32::MAX);
-            renderer.queue_atlas_upload(crate::paint::atlas::AtlasKind::Image, image_pixels, rows);
+            renderer.queue_atlas_upload(
+                crate::paint::atlas::AtlasKind::Image,
+                image_page.0,
+                image_pixels,
+                rows,
+            );
         }
         let image = renderer
             .render_snapshot(window.instance_buffer())
@@ -257,17 +261,15 @@ impl TestApp {
     #[cfg(windows)]
     fn offscreen_renderer(
         size: (u32, u32),
-        page: u32,
     ) -> Result<crate::render::backend::Renderer, EngineError> {
-        crate::render::backend::Renderer::new_warp_offscreen_with_page(size, page)
+        crate::render::backend::Renderer::new_warp_offscreen(size)
     }
 
     #[cfg(not(windows))]
     fn offscreen_renderer(
         size: (u32, u32),
-        page: u32,
     ) -> Result<crate::render::backend::Renderer, EngineError> {
-        crate::render::backend::Renderer::new_offscreen_with_page(size, page)
+        crate::render::backend::Renderer::new_offscreen(size)
     }
 
     /// 单窗口借用视图（多窗口驱动的入口）。

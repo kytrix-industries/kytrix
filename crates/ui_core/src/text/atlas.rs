@@ -136,11 +136,25 @@ impl GlyphAtlas {
         let content = (width, height);
         let mut allocation: Option<Allocation> = atlas.allocate(content);
         if allocation.is_none() {
-            // 容量逃逸：清空 + 换代 + 重试一次（P02 §10.6）。
-            atlas.clear();
-            self.clear();
+            // 容量逃逸：先按页档阶梯换代扩容（512 → 1024 → 2048），换到放得下为止；
+            // 已是上限则清空同页重试一次（DEVIATIONS F-208）。字形 tile 只由本缓存持有，
+            // 换代只需清空缓存，不向应用暴露失效。
             self.stats.rebuilds += 1;
-            allocation = atlas.allocate(content);
+            let mut resized = false;
+            while atlas.grow() {
+                resized = true;
+                allocation = atlas.allocate(content);
+                if allocation.is_some() {
+                    break;
+                }
+            }
+            if !resized {
+                atlas.clear();
+            }
+            self.clear();
+            if allocation.is_none() {
+                allocation = atlas.allocate(content);
+            }
         }
         let Some(allocation) = allocation else {
             return Err(EngineError::AtlasExhausted {
@@ -249,7 +263,7 @@ mod tests {
     };
 
     fn tiny_glyph_atlas() -> AtlasAllocator {
-        AtlasAllocator::for_test(AtlasKind::Glyph, (256, 256))
+        AtlasAllocator::with_page(AtlasKind::Glyph, (256, 256))
     }
 
     #[test]
@@ -349,26 +363,32 @@ mod tests {
         assert_ne!(first_key, second_key, "epoch bump must change the key");
     }
 
+    /// F-208：起始页放不下时**先换代扩容**，不再直接清空同页重试。
     #[test]
-    fn atlas_exhaustion_reports_the_error_after_a_retry() {
+    fn a_tiny_page_grows_to_the_next_ladder_step() {
         let Some(font) = probe_font() else {
             eprintln!("skip: no system font available");
             return;
         };
         let mut raster = GlyphRasterizer::new();
-        // 1×1 的页放不下任何带 padding 的字形 ⇒ clear+retry 后仍 None ⇒ AtlasExhausted。
-        let mut atlas = AtlasAllocator::for_test(AtlasKind::Glyph, (1, 1));
+        let mut atlas = AtlasAllocator::with_page(AtlasKind::Glyph, (1, 1));
         let mut glyphs = GlyphAtlas::new();
+        let old_generation = atlas.generation();
 
-        let error = glyphs
+        let tile = glyphs
             .ensure(&mut raster, &mut atlas, &font, 36, 16.0)
-            .expect_err("1x1 page cannot hold a glyph");
-        assert!(matches!(
-            error,
-            crate::error::EngineError::AtlasExhausted {
-                kind: AtlasKind::Glyph
-            }
-        ));
-        assert_eq!(glyphs.take_stats().rebuilds, 1, "one clear+retry attempt");
+            .expect("growth must rescue the glyph")
+            .expect("glyph has coverage");
+
+        assert_eq!(atlas.page(), (512, 512), "1×1 长到阶梯的第一档");
+        assert_eq!(
+            atlas.generation(),
+            old_generation + 1,
+            "换代只加一次（单次扩容就放得下）"
+        );
+        assert_eq!(tile.tile.generation, atlas.generation());
+        let stats = glyphs.take_stats();
+        assert_eq!(stats.rebuilds, 1);
+        assert_eq!(stats.rasters, 1);
     }
 }

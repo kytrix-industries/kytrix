@@ -680,7 +680,7 @@ mod tests {
         let shaped = harness.shape("", TextStyle::new(16.0));
         let mut raster = crate::text::raster::GlyphRasterizer::new();
         let mut glyphs = crate::text::atlas::GlyphAtlas::new();
-        let mut atlas = crate::render::atlas::AtlasAllocator::for_test(
+        let mut atlas = crate::render::atlas::AtlasAllocator::with_page(
             crate::paint::atlas::AtlasKind::Glyph,
             (256, 256),
         );
@@ -708,7 +708,7 @@ mod tests {
         let shaped = harness.shape("Ab", TextStyle::new(16.0));
         let mut raster = crate::text::raster::GlyphRasterizer::new();
         let mut glyphs = crate::text::atlas::GlyphAtlas::new();
-        let mut atlas = crate::render::atlas::AtlasAllocator::for_test(
+        let mut atlas = crate::render::atlas::AtlasAllocator::with_page(
             crate::paint::atlas::AtlasKind::Glyph,
             (512, 512),
         );
@@ -756,7 +756,7 @@ mod tests {
             let shaped = harness.shape_scaled("H", TextStyle::new(16.0), scale);
             let mut raster = crate::text::raster::GlyphRasterizer::new();
             let mut glyphs = crate::text::atlas::GlyphAtlas::new();
-            let mut atlas = crate::render::atlas::AtlasAllocator::for_test(
+            let mut atlas = crate::render::atlas::AtlasAllocator::with_page(
                 crate::paint::atlas::AtlasKind::Glyph,
                 (1024, 1024),
             );

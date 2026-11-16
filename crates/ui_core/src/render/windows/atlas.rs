@@ -1,12 +1,13 @@
 //! 图集纹理 + 脏行上传（`design/phase-08-d3d12.md` §5.5；格式与 UV 约定见 P02 §10）。
 //!
-//! 字形图集是 `R8_UNORM`（线性覆盖率），图片图集是 `B8G8R8A8_UNORM_SRGB`；两者都是 2048×2048、
-//! 单 mip、无 MSAA。上传按**行区间**（`DirtyRows`）走每 in-flight 槽独立 staging 的
-//! `CopyTextureRegion`。
+//! 字形图集是 `R8_UNORM`（线性覆盖率），图片图集是 `B8G8R8A8_UNORM_SRGB`；两者都是**懒分配**：
+//! 初始化只建 1×1 占位纹理（描述符始终有效），首次上传时才按页尺寸建真实纹理；页尺寸变化
+//! （字形页换代扩容 / 首次图片页）会重建纹理并 retire 旧资源（DEVIATIONS F-208 / S-153）。
+//! 上传按**行区间**（`DirtyRows`）走每 in-flight 槽独立 staging 的 `CopyTextureRegion`。
 //!
-//! P08 没有 CPU 像素生产者（P06 的字形缓存 / P15 的图片缓存才有）：真正的入队入口是
-//! test/CI 可见的 [`AtlasTextures::queue_upload`]；生产构建只保留录制路径
-//! （[`AtlasTextures::record_uploads`]），像素源接上后 additive 打开。
+//! 页尺寸不跨线程传：它是 `pixels.len()` 的纯函数（`page = isqrt(len / texel)`）。
+
+use std::ops::Range;
 
 use windows::Win32::Graphics::{
     Direct3D12::*,
@@ -20,14 +21,18 @@ use crate::{
     error::EngineError,
     paint::atlas::AtlasKind,
     render::{
-        atlas::DirtyRows,
+        atlas::{AtlasRebuilt, DirtyRows, texel_bytes},
         frame::MAX_FRAMES_IN_FLIGHT,
-        windows::device::{Device, init_error_from},
+        retire::GpuResourceHandle,
+        windows::{
+            device::{Device, init_error_from},
+            queue::Queue,
+        },
     },
 };
 
-/// 图集页尺寸（P02 §10.3：2048×2048）。
-pub(crate) const ATLAS_PAGE: u32 = 2048;
+/// 初始化时的占位页（1×1）：让 SRV 在第一次上传之前也指向有效资源。
+const PLACEHOLDER_PAGE: u32 = 1;
 
 /// staging 的**初始**行数（需要更大时按本次上传的行数扩容）。
 ///
@@ -39,16 +44,53 @@ const STAGING_ROWS: u32 = 256;
 
 const PITCH_ALIGNMENT: u32 = 256;
 
+/// 每 in-flight 槽一块 staging（页变化时整组重建）。
+struct StagingSlot {
+    buffer: ID3D12Resource,
+    handle: GpuResourceHandle,
+    /// 该槽当前的 staging 行数容量。
+    ///
+    /// 必须是按槽的数组语义：只记一个全局值会让「槽 0 已扩容到 N 行、槽 1 仍是 256 行」时
+    /// 槽 1 的写入越界（V-64 的第二个根因）。
+    rows: u32,
+    /// 持久映射的写入指针（DEVIATIONS F-210）：`Map` 一次，整个槽生命周期不再 `Unmap`。
+    ptr: *mut u8,
+}
+
+// SAFETY: 指针只在 `kytrix-d3d12` 线程上写入（`AtlasTextures` 整体独占该线程）。
+unsafe impl Send for StagingSlot {}
+
+impl StagingSlot {
+    fn new(device: &mut Device, row_pitch: u32) -> Result<Self, EngineError> {
+        Self::new_with_rows(device, row_pitch, STAGING_ROWS)
+    }
+
+    fn new_with_rows(device: &mut Device, row_pitch: u32, rows: u32) -> Result<Self, EngineError> {
+        let buffer = create_buffer(
+            device,
+            u64::from(row_pitch) * u64::from(rows),
+            D3D12_HEAP_TYPE_UPLOAD,
+        )?;
+        let handle = device.allocate(buffer.clone());
+        let mut pointer: *mut core::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: UPLOAD 堆；本槽独占该映射，直到槽被替换 / 图集销毁。
+        unsafe { buffer.Map(0, None, Some(&mut pointer)) }
+            .map_err(|error| init_error_from("Map(atlas staging)", error))?;
+        Ok(Self {
+            buffer,
+            handle,
+            rows,
+            ptr: pointer.cast::<u8>(),
+        })
+    }
+}
+
 /// 一张图集纹理 + 每 in-flight 槽的 staging。
 struct AtlasTexture {
+    kind: AtlasKind,
     resource: ID3D12Resource,
     /// 每槽一块 staging；容量按**该槽本次上传的总行数**增长（见 [`STAGING_ROWS`]）。
-    staging: Vec<ID3D12Resource>,
-    /// **每个 in-flight 槽**当前的 staging 行数容量。
-    ///
-    /// 必须是按槽的数组：只记一个全局值会让「槽 0 已扩容到 N 行、槽 1 仍是 256 行」时
-    /// 槽 1 的写入越界（V-64 的第二个根因）。
-    staging_rows: [u32; MAX_FRAMES_IN_FLIGHT],
+    staging: Vec<StagingSlot>,
     page: u32,
     row_pitch: u32,
     texel_bytes: u32,
@@ -57,13 +99,18 @@ struct AtlasTexture {
 /// 一次 staging 写入的行区间：源页起点、staging 起点、行数。
 #[derive(Clone, Copy)]
 struct Chunk {
+    /// 目标纹理里的起始行（`pixels` 打包顺序之外的真实行号）。
     source_row: u32,
+    /// staging 里的起始行。
     staging_row: u32,
     rows: u32,
+    /// 打包缓冲里的累计行号（源数据只有脏行）。
+    packed_row: u32,
 }
 
-/// 待上传的一页内容（整页 `pixels` + 脏行区间）。
+/// 待上传的一页内容（整页 `pixels` + 页尺寸 + 脏行区间）。
 struct PendingUpload {
+    page: u32,
     pixels: Vec<u8>,
     rows: DirtyRows,
 }
@@ -73,15 +120,18 @@ pub(crate) struct AtlasTextures {
     glyph: AtlasTexture,
     image: AtlasTexture,
     pending: [Option<PendingUpload>; 2],
+    /// `prepare` 重建过纹理的页：本帧必须整页上传（新纹理内容未定义）。
+    force_full: [bool; 2],
 }
 
 impl AtlasTextures {
-    /// `page` 在产品路径恒为 [`ATLAS_PAGE`]；测试用更小的页（2048² 的纹理在 WARP 上代价过高）。
-    pub(crate) fn new(device: &Device, page: u32) -> Result<Self, EngineError> {
+    /// 建两张 1×1 占位页；真实页在第一次上传前由 [`AtlasTextures::prepare`] 按像素长度创建。
+    pub(crate) fn new(device: &mut Device) -> Result<Self, EngineError> {
         Ok(Self {
-            glyph: AtlasTexture::new(device, AtlasKind::Glyph, page)?,
-            image: AtlasTexture::new(device, AtlasKind::Image, page)?,
+            glyph: AtlasTexture::new(device, AtlasKind::Glyph)?,
+            image: AtlasTexture::new(device, AtlasKind::Image)?,
             pending: [None, None],
+            force_full: [false, false],
         })
     }
 
@@ -97,37 +147,104 @@ impl AtlasTextures {
         self.pending.iter().any(Option::is_some)
     }
 
-    /// 入队一页的脏行（整页 `pixels` 的布局 = `page * page * texel`）。
+    /// 入队一页的脏行（`pixels` 是 `rows` 顺序**紧密打包**的行，DEVIATIONS F-211）。
     ///
-    /// `pixels` 按**所有权**移动进待上传槽：槽里已经是整页 `Vec<u8>`，再按切片复制一次会白搬
-    /// 16 MiB（图片页）。页尺寸在这里用**始终生效**的断言校验：release 下的越界读会直接读穿
-    /// 堆（`debug_assert_eq!` 只保护调试构建）。
-    pub(crate) fn queue_upload(&mut self, kind: AtlasKind, pixels: Vec<u8>, rows: DirtyRows) {
-        let page = match kind {
-            AtlasKind::Glyph => self.glyph.page,
-            AtlasKind::Image => self.image.page,
-        };
-        let expected = (page * page) as usize * texel_bytes(kind) as usize;
+    /// `pixels` 按**所有权**移动进待上传槽，避免槽 → 纹理之间再复制一次。长度必须等于
+    /// `行数 × page × texel`（release 也硬断言：越界读会读穿堆）。
+    pub(crate) fn queue_upload(
+        &mut self,
+        kind: AtlasKind,
+        page: u32,
+        pixels: Vec<u8>,
+        rows: DirtyRows,
+    ) {
+        let row_bytes = page as usize * texel_bytes(kind) as usize;
+        let expected = rows.row_count(page) as usize * row_bytes;
         assert_eq!(
             pixels.len(),
             expected,
-            "atlas page size mismatch for {kind:?}: expected {expected} bytes for a {page}×{page} page, got {}",
+            "atlas payload size mismatch for {kind:?}: expected {expected} bytes for {} rows of a {page}² page, got {}",
+            rows.row_count(page),
             pixels.len()
         );
         let slot = match kind {
             AtlasKind::Glyph => 0,
             AtlasKind::Image => 1,
         };
-        self.pending[slot] = Some(PendingUpload { pixels, rows });
+        self.pending[slot] = Some(PendingUpload { page, pixels, rows });
+    }
+
+    /// 本帧是否有一页的尺寸要变化（需要在**打开命令列表之前**重建纹理）。
+    fn page_change(&self) -> Option<(AtlasKind, u32)> {
+        for kind in [AtlasKind::Glyph, AtlasKind::Image] {
+            let index = match kind {
+                AtlasKind::Glyph => 0,
+                AtlasKind::Image => 1,
+            };
+            let texture = match kind {
+                AtlasKind::Glyph => &self.glyph,
+                AtlasKind::Image => &self.image,
+            };
+            if let Some(pending) = &self.pending[index]
+                && pending.page != texture.page
+            {
+                return Some((kind, pending.page));
+            }
+        }
+        None
+    }
+
+    /// 在录制本帧**之前**把页尺寸变化落地（DEVIATIONS F-208）。
+    ///
+    /// 页变化会重建纹理并重写 SRV；SRV 堆可能仍被在飞命令列表引用，因此这里先 `wait_idle`
+    /// 并重置 in-flight list，之后旧资源可以立即释放（不需要 retire）。页变化只发生在
+    /// 首次使用与字形页换代（最多两档），等待代价可以接受。
+    pub(crate) fn prepare(
+        &mut self,
+        device: &mut Device,
+        queue: &mut Queue,
+    ) -> Result<AtlasRebuilt, EngineError> {
+        let mut rebuilt = AtlasRebuilt::default();
+        if self.page_change().is_none() {
+            return Ok(rebuilt);
+        }
+        queue.wait_idle()?;
+        queue.reset_in_flight_lists()?;
+        for kind in [AtlasKind::Glyph, AtlasKind::Image] {
+            let index = match kind {
+                AtlasKind::Glyph => 0,
+                AtlasKind::Image => 1,
+            };
+            let Some(pending) = &self.pending[index] else {
+                continue;
+            };
+            let page = pending.page;
+            let texture = match kind {
+                AtlasKind::Glyph => &mut self.glyph,
+                AtlasKind::Image => &mut self.image,
+            };
+            if page == texture.page {
+                continue;
+            }
+            texture.recreate(device, page)?;
+            rebuilt.mark(kind);
+            // 重建那一帧必须整页上传（新纹理内容未定义）。
+            self.force_full[index] = true;
+        }
+        Ok(rebuilt)
     }
 
     /// 在本帧命令列表里录制「staging 写入 + 逐区间 `CopyTextureRegion`」。
+    ///
+    /// 返回因 staging 扩容换下的旧句柄（调用方在本帧录制结束后 retire；D3D12 命令列表
+    /// 不持有资源引用，立即 drop 会让在飞帧读已释放的缓冲）。
     pub(crate) fn record_uploads(
         &mut self,
-        device: &Device,
+        device: &mut Device,
         list: &ID3D12GraphicsCommandList,
         slot: usize,
-    ) -> Result<(), EngineError> {
+    ) -> Result<Vec<GpuResourceHandle>, EngineError> {
+        let mut retired = Vec::new();
         for kind in [AtlasKind::Glyph, AtlasKind::Image] {
             let index = match kind {
                 AtlasKind::Glyph => 0,
@@ -140,44 +257,66 @@ impl AtlasTextures {
                 AtlasKind::Glyph => &mut self.glyph,
                 AtlasKind::Image => &mut self.image,
             };
-            texture.upload(device, list, slot, kind, &pending)?;
+            debug_assert_eq!(
+                pending.page, texture.page,
+                "page changes must be applied by AtlasTextures::prepare before recording"
+            );
+            let force_full = std::mem::take(&mut self.force_full[index]);
+            texture.upload(device, list, slot, kind, &pending, force_full, &mut retired)?;
         }
-        Ok(())
+        Ok(retired)
     }
 }
 
 impl AtlasTexture {
-    fn new(device: &Device, kind: AtlasKind, page: u32) -> Result<Self, EngineError> {
-        let format = texture_format(kind);
+    fn new(device: &mut Device, kind: AtlasKind) -> Result<Self, EngineError> {
         let texel = texel_bytes(kind);
-        let row_pitch = align_up(page * texel, PITCH_ALIGNMENT);
-
+        let row_pitch = align_up(PLACEHOLDER_PAGE * texel, PITCH_ALIGNMENT);
+        let resource = create_texture(
+            device,
+            PLACEHOLDER_PAGE,
+            PLACEHOLDER_PAGE,
+            texture_format(kind),
+        )?;
         let mut staging = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
-            staging.push(create_buffer(
-                device,
-                u64::from(row_pitch) * u64::from(STAGING_ROWS),
-                D3D12_HEAP_TYPE_UPLOAD,
-            )?);
+            staging.push(StagingSlot::new(device, row_pitch)?);
         }
-        let resource = create_texture(device, page, page, format)?;
         Ok(Self {
+            kind,
             resource,
             staging,
-            staging_rows: [STAGING_ROWS; MAX_FRAMES_IN_FLIGHT],
-            page,
+            page: PLACEHOLDER_PAGE,
             row_pitch,
             texel_bytes: texel,
         })
     }
 
+    /// 换页：按新页尺寸建纹理。调用方已 `wait_idle`，旧纹理 / 旧 staging 立即释放。
+    fn recreate(&mut self, device: &mut Device, page: u32) -> Result<(), EngineError> {
+        let row_pitch = align_up(page * self.texel_bytes, PITCH_ALIGNMENT);
+        let resource = create_texture(device, page, page, texture_format(self.kind))?;
+        // 旧纹理：GPU 已空闲（prepare 里 wait_idle），字段替换即释放。
+        self.resource = resource;
+        for slot in &mut self.staging {
+            let old = std::mem::replace(slot, StagingSlot::new(device, row_pitch)?);
+            // 旧 staging 的句柄表项也要一并释放（否则它会把 COM 引用留到设备销毁）。
+            device.release(old.handle);
+        }
+        self.page = page;
+        self.row_pitch = row_pitch;
+        Ok(())
+    }
+
     fn upload(
         &mut self,
-        device: &Device,
+        device: &mut Device,
         list: &ID3D12GraphicsCommandList,
         slot: usize,
         kind: AtlasKind,
         pending: &PendingUpload,
+        force_full: bool,
+        retired: &mut Vec<GpuResourceHandle>,
     ) -> Result<(), EngineError> {
         let resident = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         barrier(
@@ -188,17 +327,26 @@ impl AtlasTexture {
         );
 
         let full = 0..self.page;
-        let spans: &[std::ops::Range<u32>] = if pending.rows.is_full() {
+        // 重建过纹理的那一帧必须是整页上传（新纹理内容未定义）：App 在页尺寸变化时一定发整页。
+        // 覆盖整页的脏行等价于整页上传（`mark(0, page)` 与 `mark(0, u32::MAX)` 都接受）。
+        let covers_page =
+            pending.rows.is_full() || pending.rows.spans() == std::slice::from_ref(&(0..self.page));
+        assert!(
+            !force_full || covers_page,
+            "a rebuilt atlas page must be uploaded as a full page"
+        );
+        let spans: &[Range<u32>] = if pending.rows.is_full() {
             std::slice::from_ref(&full)
         } else {
             pending.rows.spans()
         };
         // 每一段必须在 staging 里**各有位置**：同一 staging 上先写后画的多次拷贝会在 GPU 执行时
         // 读到最后一块的字节（V-64）。因此先按本帧所有段的**总行数**保证容量，再按累计行偏移
-        // 把各段顺序落位。
+        // 把各段顺序落位；`packed_row` 是打包缓冲里的累计行号（源数据只有脏行）。
         let total_rows: u32 = spans.iter().map(|span| span.end - span.start).sum();
-        self.ensure_staging(device, slot, total_rows)?;
+        self.ensure_staging(device, slot, total_rows, retired)?;
         let mut staging_row = 0;
+        let mut packed_row = 0;
         for span in spans {
             let rows = span.end - span.start;
             self.upload_chunk(
@@ -210,9 +358,11 @@ impl AtlasTexture {
                     source_row: span.start,
                     staging_row,
                     rows,
+                    packed_row,
                 },
             )?;
             staging_row += rows;
+            packed_row += rows;
         }
 
         barrier(
@@ -229,17 +379,19 @@ impl AtlasTexture {
     /// 只改**这一个槽**的容量记录：其它槽的缓冲没有变大，必须继续按自己的容量判断（V-64）。
     fn ensure_staging(
         &mut self,
-        device: &Device,
+        device: &mut Device,
         slot: usize,
         rows: u32,
+        retired: &mut Vec<GpuResourceHandle>,
     ) -> Result<(), EngineError> {
-        if rows <= self.staging_rows[slot] {
+        if rows <= self.staging[slot].rows {
             return Ok(());
         }
-        let bytes = u64::from(self.row_pitch) * u64::from(rows);
-        let staging = create_buffer(device, bytes, D3D12_HEAP_TYPE_UPLOAD)?;
-        self.staging[slot] = staging;
-        self.staging_rows[slot] = rows;
+        let staging = StagingSlot::new_with_rows(device, self.row_pitch, rows)?;
+        let old = std::mem::replace(&mut self.staging[slot], staging);
+        // 旧 staging 可能仍被在飞帧的命令列表读取（D3D12 命令列表不持有资源引用）：
+        // 不能立即 drop，交给调用方按当前帧序号 retire。
+        retired.push(old.handle);
         Ok(())
     }
 
@@ -253,21 +405,19 @@ impl AtlasTexture {
         chunk: Chunk,
     ) -> Result<(), EngineError> {
         let staging = &self.staging[slot];
-        let mut pointer: *mut core::ffi::c_void = std::ptr::null_mut();
-        // SAFETY: `staging[slot]` 由 `ensure_staging` 保证容量 ≥ 本帧总行数；
-        // `staging_row + rows` 不超过该容量，源页由 `queue_upload` 的整页尺寸断言保证。
-        unsafe { staging.Map(0, None, Some(&mut pointer)) }
-            .map_err(|error| init_error_from("Map(atlas staging)", error))?;
-        // SAFETY: COM `QueryInterface` 转换：源接口非空且存活，失败以 `Result` 返回。
+        // SAFETY: `staging[slot]` 由 `ensure_staging` 保证容量 ≥ 本帧总行数；指针是该槽的持久
+        // 映射（DEVIATIONS F-210），`staging_row + rows` 不超过容量，源页由 `queue_upload`
+        // 的整页尺寸断言保证。
         unsafe {
             for row in 0..chunk.rows {
                 let source_row = chunk.source_row + row;
+                let _ = source_row;
                 let source = pending
                     .pixels
                     .as_ptr()
-                    .add((source_row * self.page * self.texel_bytes) as usize);
-                let destination = pointer
-                    .cast::<u8>()
+                    .add(((chunk.packed_row + row) * self.page * self.texel_bytes) as usize);
+                let destination = staging
+                    .ptr
                     .add(((chunk.staging_row + row) * self.row_pitch) as usize);
                 std::ptr::copy_nonoverlapping(
                     source,
@@ -276,8 +426,6 @@ impl AtlasTexture {
                 );
             }
         }
-        // SAFETY: 映射区间在 `Map`/`Unmap` 之间独占使用，写入已完成。
-        unsafe { staging.Unmap(0, None) };
 
         let placed = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
             // 每段各自的行偏移（同一 staging 上多段不能再共用 offset 0，否则 GPU 只读到末段）。
@@ -298,7 +446,7 @@ impl AtlasTexture {
             },
         };
         let mut source = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: core::mem::ManuallyDrop::new(Some(staging.clone())),
+            pResource: core::mem::ManuallyDrop::new(Some(staging.buffer.clone())),
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                 PlacedFootprint: placed,
@@ -346,13 +494,6 @@ fn texture_format(kind: AtlasKind) -> windows::Win32::Graphics::Dxgi::Common::DX
     match kind {
         AtlasKind::Glyph => DXGI_FORMAT_R8_UNORM,
         AtlasKind::Image => DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
-    }
-}
-
-fn texel_bytes(kind: AtlasKind) -> u32 {
-    match kind {
-        AtlasKind::Glyph => 1,
-        AtlasKind::Image => 4,
     }
 }
 
@@ -444,7 +585,8 @@ fn create_resource(
 
 #[cfg(test)]
 mod tests {
-    use super::{ATLAS_PAGE, AtlasTextures, align_up};
+    use super::{AtlasTextures, align_up};
+    use crate::render::atlas::MAX_ATLAS_PAGE;
 
     /// 测试页：2048² 的纹理在 WARP 上代价过高（且会拖垮并行的 GPU 测试）。
     const TEST_PAGE: u32 = 64;
@@ -455,8 +597,8 @@ mod tests {
 
     #[test]
     fn row_pitch_is_256_aligned_for_both_texels() {
-        assert_eq!(align_up(ATLAS_PAGE, 256), 2048);
-        assert_eq!(align_up(ATLAS_PAGE * 4, 256), 8192);
+        assert_eq!(align_up(MAX_ATLAS_PAGE, 256), 2048);
+        assert_eq!(align_up(MAX_ATLAS_PAGE * 4, 256), 8192);
     }
 
     #[test]
@@ -466,20 +608,34 @@ mod tests {
 
         use crate::render::windows::{queue::Queue, readback::Readback};
 
-        let device = Device::new_warp().expect("WARP device");
+        let mut device = Device::new_warp().expect("WARP device");
         let mut queue = Queue::new(&device).expect("queue");
-        let mut atlas = AtlasTextures::new(&device, TEST_PAGE).expect("atlas");
+        let mut atlas = AtlasTextures::new(&mut device).expect("atlas");
 
-        let mut page = vec![0u8; (TEST_PAGE * TEST_PAGE) as usize];
-        let row = TEST_PAGE as usize * 5;
-        page[row..row + TEST_PAGE as usize].fill(0xAB);
+        // 第一次必须先整页上传（真实入口：新窗口 / 页尺寸变化都走整页），之后才是增量。
+        let mut rows = DirtyRows::default();
+        rows.mark(0, u32::MAX);
+        atlas.queue_upload(
+            AtlasKind::Glyph,
+            TEST_PAGE,
+            vec![0u8; (TEST_PAGE * TEST_PAGE) as usize],
+            rows,
+        );
+        atlas.prepare(&mut device, &mut queue).expect("prepare");
+        queue
+            .submit_immediate(|list| atlas.record_uploads(&mut device, list, 0).map(|_| ()))
+            .expect("full upload");
+
+        // 增量：只有 1 行（= 页宽字节）的载荷。
+        let page = vec![0xABu8; TEST_PAGE as usize];
         let mut rows = DirtyRows::default();
         rows.mark(5, 6);
-        atlas.queue_upload(AtlasKind::Glyph, page, rows);
+        atlas.queue_upload(AtlasKind::Glyph, TEST_PAGE, page, rows);
         assert!(atlas.has_pending());
 
+        atlas.prepare(&mut device, &mut queue).expect("prepare");
         queue
-            .submit_immediate(|list| atlas.record_uploads(&device, list, 0))
+            .submit_immediate(|list| atlas.record_uploads(&mut device, list, 0).map(|_| ()))
             .expect("upload");
         assert!(
             !atlas.has_pending(),
@@ -507,14 +663,14 @@ mod tests {
     #[test]
     fn queueing_a_dirty_span_marks_pending() {
         let _guard = crate::render::windows::device::gpu_test_lock();
-        let device = Device::new_warp().expect("WARP device");
-        let mut atlas = AtlasTextures::new(&device, TEST_PAGE).expect("atlas");
+        let mut device = Device::new_warp().expect("WARP device");
+        let mut atlas = AtlasTextures::new(&mut device).expect("atlas");
         assert!(!atlas.has_pending());
 
         let mut rows = DirtyRows::default();
         rows.mark(4, 6);
-        let page = vec![0x7Fu8; (TEST_PAGE * TEST_PAGE) as usize];
-        atlas.queue_upload(AtlasKind::Glyph, page, rows);
+        let page = vec![0x7Fu8; 2 * TEST_PAGE as usize];
+        atlas.queue_upload(AtlasKind::Glyph, TEST_PAGE, page, rows);
         assert!(atlas.has_pending());
     }
     /// staging 容量必须**按 in-flight 槽**记录（V-64）。
@@ -534,17 +690,18 @@ mod tests {
 
         use crate::render::windows::{queue::Queue, readback::Readback};
 
-        let device = Device::new_warp().expect("WARP device");
+        let mut device = Device::new_warp().expect("WARP device");
         let mut queue = Queue::new(&device).expect("queue");
-        let mut atlas = AtlasTextures::new(&device, BIG_PAGE).expect("atlas");
+        let mut atlas = AtlasTextures::new(&mut device).expect("atlas");
 
         // 槽 0：字形整页（512 行）。
         let glyph = vec![0x11u8; (BIG_PAGE * BIG_PAGE) as usize];
         let mut rows = DirtyRows::default();
         rows.mark(0, BIG_PAGE);
-        atlas.queue_upload(AtlasKind::Glyph, glyph, rows);
+        atlas.queue_upload(AtlasKind::Glyph, BIG_PAGE, glyph, rows);
+        atlas.prepare(&mut device, &mut queue).expect("prepare");
         queue
-            .submit_immediate(|list| atlas.record_uploads(&device, list, 0))
+            .submit_immediate(|list| atlas.record_uploads(&mut device, list, 0).map(|_| ()))
             .expect("glyph upload");
 
         // 槽 1：图片整页（512 行 × 4 B；行 pitch 2048）。
@@ -554,9 +711,10 @@ mod tests {
         }
         let mut rows = DirtyRows::default();
         rows.mark(0, BIG_PAGE);
-        atlas.queue_upload(AtlasKind::Image, image, rows);
+        atlas.queue_upload(AtlasKind::Image, BIG_PAGE, image, rows);
+        atlas.prepare(&mut device, &mut queue).expect("prepare");
         queue
-            .submit_immediate(|list| atlas.record_uploads(&device, list, 1))
+            .submit_immediate(|list| atlas.record_uploads(&mut device, list, 1).map(|_| ()))
             .expect("image upload");
 
         // 两个独立的读回器：R8 与 BGRA8 的行 pitch 不同（`Readback` 按尺寸/格式缓存）。
@@ -615,25 +773,34 @@ mod tests {
 
         use crate::render::windows::{queue::Queue, readback::Readback};
 
-        let device = Device::new_warp().expect("WARP device");
+        let mut device = Device::new_warp().expect("WARP device");
         let mut queue = Queue::new(&device).expect("queue");
-        let mut atlas = AtlasTextures::new(&device, BIG_PAGE).expect("atlas");
+        let mut atlas = AtlasTextures::new(&mut device).expect("atlas");
 
-        let mut page = vec![0u8; (BIG_PAGE * BIG_PAGE) as usize];
-        for row in 10..20 {
-            let start = (row * BIG_PAGE) as usize;
-            page[start..start + BIG_PAGE as usize].fill(0x44);
-        }
-        for row in 300..320 {
-            let start = (row * BIG_PAGE) as usize;
-            page[start..start + BIG_PAGE as usize].fill(0x55);
-        }
+        // 第一次整页清零（真实入口：新窗口 / 页尺寸变化都走整页）。
+        let mut rows = DirtyRows::default();
+        rows.mark(0, u32::MAX);
+        atlas.queue_upload(
+            AtlasKind::Glyph,
+            BIG_PAGE,
+            vec![0u8; (BIG_PAGE * BIG_PAGE) as usize],
+            rows,
+        );
+        atlas.prepare(&mut device, &mut queue).expect("prepare");
+        queue
+            .submit_immediate(|list| atlas.record_uploads(&mut device, list, 0).map(|_| ()))
+            .expect("full upload");
+
+        // 打包布局：段按行号顺序紧密排列（10 行 0x44 + 20 行 0x55）。
+        let mut page = vec![0x44u8; (10 * BIG_PAGE) as usize];
+        page.extend(std::iter::repeat_n(0x55u8, (20 * BIG_PAGE) as usize));
         let mut rows = DirtyRows::default();
         rows.mark(10, 20);
         rows.mark(300, 320);
-        atlas.queue_upload(AtlasKind::Glyph, page, rows);
+        atlas.queue_upload(AtlasKind::Glyph, BIG_PAGE, page, rows);
+        atlas.prepare(&mut device, &mut queue).expect("prepare");
         queue
-            .submit_immediate(|list| atlas.record_uploads(&device, list, 0))
+            .submit_immediate(|list| atlas.record_uploads(&mut device, list, 0).map(|_| ()))
             .expect("upload");
 
         let mut readback = Readback::new();

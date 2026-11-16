@@ -46,7 +46,7 @@ use crate::{
         style::{Clip, Cursor, StylePatch},
     },
     platform::dispatcher::{Dispatcher, UserTask},
-    render::AtlasAllocator,
+    render::{AtlasAllocator, MIN_ATLAS_PAGE},
     resources::ResourceCache,
     text::{
         FontStack, FontStackStatus, TextContent, TextDiagnostic, TextLayoutReport, TextPassReport,
@@ -101,8 +101,12 @@ pub struct App {
     glyph_atlas: GlyphAtlas,
     /// 每窗口「图集已同步到的 `scale_epoch`」（DPI 变化 ⇒ 图集换代）。
     scale_epochs: ahash::HashMap<WindowId, u32>,
-    /// 累积的图集脏行（P09 的增量上传输入；`layout_text` 合并、`dirty_spans` 计数）。
+    /// 累积的图集脏行（P09 的增量上传输入；`layout_text` 合并、上传后清空）。
     pending_dirty: crate::render::DirtyRows,
+    /// 字形页的整页 CPU 缓冲（跨上传复用，避免每次上传都分配）。
+    glyph_page: Vec<u8>,
+    /// 增量上传的打包缓冲（脏行紧密排列；跨帧复用，避免每次上传都分配）。
+    packed: Vec<u8>,
     /// 跨线程唤醒队列（`AppHandle` 的载荷；主线程之外唯一的引擎入口）。
     dispatcher: Arc<Dispatcher>,
     /// 本帧从平台层收到的、尚未被应用取走的事件。
@@ -322,11 +326,16 @@ impl App {
             runtime,
             text: TextContext::new(),
             raster: GlyphRasterizer::new(),
-            atlas: AtlasAllocator::new(crate::paint::atlas::AtlasKind::Glyph),
+            atlas: AtlasAllocator::with_page(
+                crate::paint::atlas::AtlasKind::Glyph,
+                (MIN_ATLAS_PAGE, MIN_ATLAS_PAGE),
+            ),
             resources: ResourceCache::new(),
             glyph_atlas: GlyphAtlas::new(),
             scale_epochs: ahash::HashMap::default(),
             pending_dirty: crate::render::DirtyRows::default(),
+            glyph_page: Vec::new(),
+            packed: Vec::new(),
             dispatcher: Dispatcher::new(),
             events: Vec::new(),
             frame_hook: None,
@@ -429,72 +438,135 @@ impl App {
     ///
     /// 调用点：`App::frame`（每帧，paint 之前）。`TestApp::snapshot` 走自己的临时渲染器。
     pub(crate) fn upload_atlas_pages(&mut self) {
-        let glyph_dirty = self.glyph_atlas.take_page_dirty();
-        let image_rows = self.resources.take_dirty_rows();
-        let image_dirty = !image_rows.spans().is_empty();
+        self.upload_glyph_page();
+        self.upload_image_page();
+    }
 
-        // 字形页：有脏 ⇒ 所有窗口整页；没脏 ⇒ 只补给从未收到过的窗口。
-        let glyph_needed = glyph_dirty
-            || self
-                .windows
-                .values()
-                .any(|window| window.has_renderer() && !window.glyph_page_received());
-        if glyph_needed {
-            let (_, pixels) = self.glyph_page_pixels();
-            let mut rows = crate::render::DirtyRows::default();
-            rows.mark(0, u32::MAX);
-            for window in self.windows.values_mut() {
-                if !window.has_renderer() {
-                    continue;
-                }
-                if !glyph_dirty && window.glyph_page_received() {
-                    continue;
-                }
-                window.queue_atlas_upload(
-                    crate::paint::atlas::AtlasKind::Glyph,
-                    &pixels,
-                    rows.clone(),
-                );
-                window.mark_glyph_page_received();
-            }
-        }
+    /// 所有带渲染器的窗口在图集共享槽上都空闲（没有 renderer 的窗口不参与上传）。
+    fn atlas_idle_for(&self, kind: crate::paint::atlas::AtlasKind) -> bool {
+        self.windows
+            .values()
+            .all(|window| !window.has_renderer() || window.atlas_idle(kind))
+    }
 
-        // 图片页：有脏行 ⇒ 已收到的窗口拿增量、未收到的拿整页；没脏 ⇒ 只补未收到的窗口。
-        let image_needed = image_dirty
-            || self
-                .windows
-                .values()
-                .any(|window| window.has_renderer() && !window.image_page_received());
-        if !image_needed {
+    /// 字形页广播：真实脏行（`layout_text` 已把 `atlas.take_dirty_rows()` 并进 `pending_dirty`），
+    /// 只有「没收到过这一页尺寸」的窗口拿整页（DEVIATIONS F-211）。
+    fn upload_glyph_page(&mut self) {
+        // 共享槽还在被 GPU 线程消费时跳过这一帧：行留在 `pending_dirty` 里下一帧合并发送，
+        // 不覆盖未消费的上传（会丢行）。
+        if !self.atlas_idle_for(crate::paint::atlas::AtlasKind::Glyph) {
             return;
         }
-        let (_, pixels) = self.resources.page_pixels();
+        let mut rows = std::mem::take(&mut self.pending_dirty);
+        // `page_dirty` 覆盖「换代但没有新字形」的边界：此时没有行可打包，保守整页重传。
+        let page_changed_content = self.glyph_atlas.take_page_dirty();
+        let page = self.atlas.page();
+        debug_assert_eq!(page.0, page.1, "glyph atlas page must stay square");
+        let extent = page.0;
+        let needed = !rows.spans().is_empty()
+            || self
+                .windows
+                .values()
+                .any(|window| window.has_renderer() && !window.glyph_page_matches(extent));
+        if !needed {
+            return;
+        }
+        if rows.spans().is_empty() {
+            // 没有新字形但要补给「还没收到这一页」的窗口（新窗口 / 渲染器重建）：整页重传。
+            // `page_changed_content` 只是记账，不参与决策。
+            let _ = page_changed_content;
+            rows.mark(0, u32::MAX);
+        }
+
+        let len = extent as usize * extent as usize;
+        if self.glyph_page.len() != len {
+            self.glyph_page.resize(len, 0);
+        }
+        self.glyph_atlas.write_page(&mut self.glyph_page, extent);
+        let mut packed = std::mem::take(&mut self.packed);
+        crate::render::atlas::pack_rows(&self.glyph_page, extent, 1, &rows, &mut packed);
         let mut full_rows = crate::render::DirtyRows::default();
         full_rows.mark(0, u32::MAX);
+
         for window in self.windows.values_mut() {
             if !window.has_renderer() {
                 continue;
             }
-            if window.image_page_received() {
-                if image_dirty {
-                    window.queue_atlas_upload(
-                        crate::paint::atlas::AtlasKind::Image,
-                        pixels,
-                        image_rows.clone(),
-                    );
-                }
+            // 新渲染器 / 页尺寸变化 / 整页脏：整页上传并记账新尺寸。
+            if !window.glyph_page_matches(extent) || rows.is_full() {
+                window.queue_atlas_upload(
+                    crate::paint::atlas::AtlasKind::Glyph,
+                    extent,
+                    &self.glyph_page,
+                    full_rows.clone(),
+                );
+                window.mark_glyph_page_received(extent);
+                continue;
+            }
+            window.queue_atlas_upload(
+                crate::paint::atlas::AtlasKind::Glyph,
+                extent,
+                &packed,
+                rows.clone(),
+            );
+        }
+        self.packed = packed;
+    }
+
+    /// 图片页广播：懒分配（没插过图片就没有页）+ 真实脏行（DEVIATIONS F-211）。
+    fn upload_image_page(&mut self) {
+        if !self.atlas_idle_for(crate::paint::atlas::AtlasKind::Image) {
+            return;
+        }
+        // 先取脏行再借页（`take_dirty_rows` 需要 `&mut`）：没有页时脏行必然是空的。
+        let mut rows = self.resources.take_dirty_rows();
+        let Some((page, pixels)) = self.resources.page_pixels() else {
+            return;
+        };
+        debug_assert_eq!(page.0, page.1, "image atlas page must stay square");
+        let extent = page.0;
+        let needed = !rows.spans().is_empty()
+            || self
+                .windows
+                .values()
+                .any(|window| window.has_renderer() && !window.image_page_matches(extent));
+        if !needed {
+            return;
+        }
+        if rows.spans().is_empty() {
+            rows.mark(0, u32::MAX);
+        }
+        let mut packed = std::mem::take(&mut self.packed);
+        crate::render::atlas::pack_rows(pixels, extent, 4, &rows, &mut packed);
+        let mut full_rows = crate::render::DirtyRows::default();
+        full_rows.mark(0, u32::MAX);
+
+        for window in self.windows.values_mut() {
+            if !window.has_renderer() {
+                continue;
+            }
+            if !window.image_page_matches(extent) || rows.is_full() {
+                window.queue_atlas_upload(
+                    crate::paint::atlas::AtlasKind::Image,
+                    extent,
+                    pixels,
+                    full_rows.clone(),
+                );
+                window.mark_image_page_received(extent);
                 continue;
             }
             window.queue_atlas_upload(
                 crate::paint::atlas::AtlasKind::Image,
-                pixels,
-                full_rows.clone(),
+                extent,
+                &packed,
+                rows.clone(),
             );
-            window.mark_image_page_received();
         }
+        self.packed = packed;
     }
 
     /// 字形页的整页像素（`R8`；`upload_glyph_page` 与快照路径共用）。
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn glyph_page_pixels(&self) -> ((u32, u32), Vec<u8>) {
         let page = self.atlas.page();
         let mut pixels = vec![0u8; (page.0 as usize) * (page.1 as usize)];
@@ -502,9 +574,10 @@ impl App {
         (page, pixels)
     }
 
-    /// 图片页的当前内容（BGRA8 预乘 sRGB；`TestApp::snapshot` 的上传源）。
+    /// 图片页的当前内容（BGRA8 预乘 sRGB；`TestApp::snapshot` 的上传源）；没插过图片时 `None`。
     #[cfg(feature = "test-support")]
-    pub(crate) fn resource_page_pixels(&self) -> ((u32, u32), &[u8]) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn resource_page_pixels(&self) -> Option<((u32, u32), &[u8])> {
         self.resources.page_pixels()
     }
 
@@ -5428,7 +5501,11 @@ mod resources_tests {
         let image = app.resources_mut().insert(&png()).expect("insert");
 
         assert_eq!(app.resources().len(), 1);
-        assert_eq!(app.resources().page_pixels().0, (2048, 2048));
+        assert_eq!(
+            app.resources().page_pixels().expect("page").0,
+            (512, 512),
+            "图片页在首次插入时按 16×16 图片选到 512² 档"
+        );
         // 另一窗口共享同一份缓存（单 GPU 设备、进程级一份）。
         let second = app.create_window(WindowOptions {
             title: "second".into(),
@@ -5440,10 +5517,11 @@ mod resources_tests {
         assert_eq!(app.resources().len(), 1);
 
         // 内容区写进了页缓冲（BGR 顺序）。
-        let (_, pixels) = app.resources().page_pixels();
-        let origin_x = (image.tile.u0 * 2048.0).round() as usize;
-        let origin_y = (image.tile.v0 * 2048.0).round() as usize;
-        let offset = origin_y * 2048 * 4 + origin_x * 4;
+        let (page, pixels) = app.resources().page_pixels().expect("page");
+        let page_width = page.0 as usize;
+        let origin_x = (image.tile.u0 * page.0 as f32).round() as usize;
+        let origin_y = (image.tile.v0 * page.0 as f32).round() as usize;
+        let offset = origin_y * page_width * 4 + origin_x * 4;
         assert_eq!(&pixels[offset..offset + 4], &[30, 20, 10, 255]);
     }
 
@@ -5554,8 +5632,15 @@ mod resources_tests {
     }
 
     #[test]
-    fn image_atlas_page_is_16_mib() {
-        let (_rt, app, _window) = setup();
-        assert_eq!(app.resources().page_pixels().1.len(), 16 * 1024 * 1024);
+    fn image_atlas_page_is_lazy_until_the_first_insert() {
+        let (_rt, mut app, _window) = setup();
+        assert!(
+            app.resources().page_pixels().is_none(),
+            "没有插入图片时不得分配图片页（DEVIATIONS F-208）"
+        );
+        let _ = app.resources_mut().insert(&png()).expect("insert");
+        let (page, pixels) = app.resources().page_pixels().expect("page");
+        assert_eq!(page, (512, 512), "4×4 图片选 512² 档");
+        assert_eq!(pixels.len(), 512 * 512 * 4, "整页 = page² × BGRA8");
     }
 }

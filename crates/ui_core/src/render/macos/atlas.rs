@@ -19,46 +19,54 @@ use crate::{
     error::EngineError,
     paint::atlas::AtlasKind,
     render::{
-        atlas::DirtyRows,
+        atlas::{AtlasRebuilt, DirtyRows, texel_bytes},
         macos::{
             device::{Device, GpuObject, init_error},
             queue::Queue,
         },
+        retire::GpuResourceHandle,
     },
     window::FrameIndex,
 };
 
-/// 图集页边长（逻辑页 = 2048²；与 Windows 同值）。
-pub(crate) const ATLAS_PAGE: u32 = 2048;
+/// 初始化时的占位页（1×1）：让参数缓冲里的图集纹理在第一次上传之前也有效。
+const PLACEHOLDER_PAGE: u32 = 1;
 
 /// 一张图集页。
 struct AtlasTexture {
+    kind: AtlasKind,
     texture: Retained<ProtocolObject<dyn MTLTexture>>,
+    /// 占位页没有句柄（它从未进入任何帧）；真实页重建时旧句柄按帧序号 retire。
+    handle: Option<GpuResourceHandle>,
     page: u32,
-    texel_bytes: u32,
     pending: Option<PendingUpload>,
 }
 
-/// 待上传的行区间（一帧内多次 `queue_upload` 取并集）。
+/// 待上传的行区间（一帧内多次 `queue_upload` 取并集）+ 该页的页尺寸。
 #[derive(Debug)]
 struct PendingUpload {
-    y0: u32,
-    rows: u32,
-    full: bool,
+    page: u32,
+    /// `rows` 顺序紧密打包的行（整页上传时就是整页）。
     pixels: Vec<u8>,
+    rows: DirtyRows,
 }
 
 /// 两张页（字形 / 图片）。
 pub(crate) struct AtlasTextures {
     glyph: AtlasTexture,
     image: AtlasTexture,
+    /// `prepare` 重建过纹理的页：本帧必须整页上传（新纹理内容未定义）。
+    force_full: [bool; 2],
 }
 
 impl AtlasTextures {
-    pub(crate) fn new(device: &Device, page: u32) -> Result<Self, EngineError> {
+    /// 建两张 1×1 占位页；真实页在第一次上传前由 [`AtlasTextures::prepare`] 按像素长度创建
+    /// （懒分配，DEVIATIONS F-208）。
+    pub(crate) fn new(device: &mut Device) -> Result<Self, EngineError> {
         Ok(Self {
-            glyph: AtlasTexture::new(device, AtlasKind::Glyph, page)?,
-            image: AtlasTexture::new(device, AtlasKind::Image, page)?,
+            glyph: AtlasTexture::new(device, AtlasKind::Glyph)?,
+            image: AtlasTexture::new(device, AtlasKind::Image)?,
+            force_full: [false, false],
         })
     }
 
@@ -69,32 +77,68 @@ impl AtlasTextures {
         }
     }
 
-    /// 登记一次脏行上传。
+    /// 登记一次脏行上传（`pixels` 是 `rows` 顺序紧密打包的行，DEVIATIONS F-211）。
     ///
-    /// `pixels` 按**所有权**移动进待上传槽：槽里已经是整页 `Vec<u8>`，再按切片复制一次会白搬
-    /// 16 MiB（图片页）；与 Windows 的 `AtlasTextures::queue_upload` 同一约定。
-    pub(crate) fn queue_upload(&mut self, kind: AtlasKind, pixels: Vec<u8>, rows: DirtyRows) {
+    /// 长度必须等于 `行数 × page × texel`（release 也硬断言：越界读会读穿堆）。
+    pub(crate) fn queue_upload(
+        &mut self,
+        kind: AtlasKind,
+        page: u32,
+        pixels: Vec<u8>,
+        rows: DirtyRows,
+    ) {
+        let row_bytes = page as usize * texel_bytes(kind) as usize;
+        let expected = rows.row_count(page) as usize * row_bytes;
+        assert_eq!(
+            pixels.len(),
+            expected,
+            "atlas payload size mismatch for {kind:?}: expected {expected} bytes for {} rows of a {page}² page, got {}",
+            rows.row_count(page),
+            pixels.len()
+        );
         let texture = match kind {
             AtlasKind::Glyph => &mut self.glyph,
             AtlasKind::Image => &mut self.image,
         };
-        let expected = (texture.page * texture.page) as usize * texture.texel_bytes as usize;
-        // 始终生效的断言（与 Windows 同一约定）：`record_upload` 按页布局切出整段行，长度不足
-        // 会读穿堆（`debug_assert_eq!` 只保护调试构建）。
-        assert_eq!(
-            pixels.len(),
-            expected,
-            "atlas page size mismatch for {kind:?}: expected {expected} bytes for a {}×{} page, got {}",
-            texture.page,
-            texture.page,
-            pixels.len()
-        );
-        texture.queue_upload(pixels, rows);
+        texture.queue_upload(page, pixels, rows);
     }
 
     /// 本帧是否有待上传的行。
     pub(crate) fn has_pending(&self) -> bool {
         self.glyph.pending.is_some() || self.image.pending.is_some()
+    }
+
+    /// 在编码本帧 blit **之前**把页尺寸变化落地（DEVIATIONS F-208）。
+    ///
+    /// 旧纹理可能在飞帧仍采样：新纹理建好后把旧纹理句柄按 `index` retire。绑定是每帧
+    /// `setFragmentTexture` 现场写的，不需要额外重写。
+    pub(crate) fn prepare(
+        &mut self,
+        device: &mut Device,
+        queue: &mut Queue,
+        index: FrameIndex,
+    ) -> Result<AtlasRebuilt, EngineError> {
+        let mut rebuilt = AtlasRebuilt::default();
+        for kind in [AtlasKind::Glyph, AtlasKind::Image] {
+            let pending_index = match kind {
+                AtlasKind::Glyph => 0,
+                AtlasKind::Image => 1,
+            };
+            let texture = match kind {
+                AtlasKind::Glyph => &mut self.glyph,
+                AtlasKind::Image => &mut self.image,
+            };
+            let Some(page) = texture.pending.as_ref().map(|pending| pending.page) else {
+                continue;
+            };
+            if page == texture.page {
+                continue;
+            }
+            texture.recreate(device, queue, index, page)?;
+            rebuilt.mark(kind);
+            self.force_full[pending_index] = true;
+        }
+        Ok(rebuilt)
     }
 
     /// 把待上传的行写进**本帧专用**的 staging 并编码 blit（必须在一帧的 command buffer 里调用）。
@@ -108,121 +152,124 @@ impl AtlasTextures {
         index: FrameIndex,
         encoder: &ProtocolObject<dyn MTLBlitCommandEncoder>,
     ) -> Result<(), EngineError> {
-        self.glyph.record_upload(device, queue, index, encoder)?;
-        self.image.record_upload(device, queue, index, encoder)
+        for kind in [AtlasKind::Glyph, AtlasKind::Image] {
+            let pending_index = match kind {
+                AtlasKind::Glyph => 0,
+                AtlasKind::Image => 1,
+            };
+            let force_full = std::mem::take(&mut self.force_full[pending_index]);
+            let texture = match kind {
+                AtlasKind::Glyph => &mut self.glyph,
+                AtlasKind::Image => &mut self.image,
+            };
+            texture.record_upload(device, queue, index, encoder, kind, force_full)?;
+        }
+        Ok(())
     }
 }
 
 impl AtlasTexture {
-    fn new(device: &Device, kind: AtlasKind, page: u32) -> Result<Self, EngineError> {
-        let format = texture_format(kind);
-        // SAFETY: 纯构造函数，参数是本模块给定的合法尺寸/格式。
-        let descriptor = unsafe {
-            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
-                format,
-                page as usize,
-                page as usize,
-                false,
-            )
-        };
-        descriptor.setUsage(MTLTextureUsage::ShaderRead);
-        descriptor.setStorageMode(MTLStorageMode::Private);
-        let texture = device
-            .raw()
-            .newTextureWithDescriptor(&descriptor)
-            .ok_or_else(|| init_error("newTextureWithDescriptor(atlas)", "returned nil"))?;
+    fn new(device: &mut Device, kind: AtlasKind) -> Result<Self, EngineError> {
+        let texture = create_texture(device, kind, PLACEHOLDER_PAGE)?;
         Ok(Self {
+            kind,
             texture,
-            page,
-            texel_bytes: texel_bytes(kind),
+            handle: None,
+            page: PLACEHOLDER_PAGE,
             pending: None,
         })
     }
 
-    fn queue_upload(&mut self, pixels: Vec<u8>, rows: DirtyRows) {
-        let spans = rows.spans();
-        if spans.is_empty() {
+    fn queue_upload(&mut self, page: u32, pixels: Vec<u8>, rows: DirtyRows) {
+        if rows.spans().is_empty() {
             return;
         }
-        let full = rows.is_full();
-        let first = spans.iter().map(|span| span.start).min().unwrap_or(0);
-        let last = spans.iter().map(|span| span.end).max().unwrap_or(first);
-        self.pending = Some(PendingUpload {
-            y0: first,
-            rows: last.saturating_sub(first),
-            full,
-            pixels,
-        });
+        self.pending = Some(PendingUpload { page, pixels, rows });
     }
 
-    /// 分配本帧专用的 staging、拷入行区间、编码一段 buffer→texture blit，并把缓冲交给 retire。
+    /// 把打包好的脏行写进**本帧专用**的 staging、逐段编码 buffer→texture blit，并把缓冲交给 retire。
     fn record_upload(
         &mut self,
         device: &mut Device,
         queue: &mut Queue,
         index: FrameIndex,
         encoder: &ProtocolObject<dyn MTLBlitCommandEncoder>,
+        kind: AtlasKind,
+        force_full: bool,
     ) -> Result<(), EngineError> {
         let Some(pending) = self.pending.take() else {
             return Ok(());
         };
-        let row_bytes = (self.page * self.texel_bytes) as usize;
-        let first = if pending.full { 0 } else { pending.y0 };
-        let rows = if pending.full {
-            self.page
+        debug_assert_eq!(
+            pending.page, self.page,
+            "page changes must be applied by AtlasTextures::prepare before recording"
+        );
+        // 重建过纹理的那一帧必须是整页上传（新纹理内容未定义）。
+        // 覆盖整页的脏行等价于整页上传（`mark(0, page)` 与 `mark(0, u32::MAX)` 都接受）。
+        let covers_page =
+            pending.rows.is_full() || pending.rows.spans() == std::slice::from_ref(&(0..self.page));
+        assert!(
+            !force_full || covers_page,
+            "a rebuilt atlas page must be uploaded as a full page"
+        );
+        let full = 0..self.page;
+        let spans: &[std::ops::Range<u32>] = if pending.rows.is_full() {
+            std::slice::from_ref(&full)
         } else {
-            pending.rows
+            pending.rows.spans()
         };
-        if rows == 0 {
+        let row_bytes = (self.page * texel_bytes(kind)) as usize;
+        let total_rows: u32 = spans.iter().map(|span| span.end - span.start).sum();
+        if total_rows == 0 {
             return Ok(());
         }
-        // 行区间必须落在页内（`DirtyRows` 的契约；越界读是 UB，因此是硬断言而不是 debug）。
-        assert!(
-            first.saturating_add(rows) <= self.page,
-            "atlas upload rows {first}..{} exceed the {}-row page",
-            first.saturating_add(rows),
-            self.page
-        );
-        let length = rows as usize * row_bytes;
-        let start = first as usize * row_bytes;
-        // 一次性 staging：只装本次行区间（Apple 推荐的低频小上传方式）。容量不小于 1 字节
-        // （Metal 拒绝 0 长度缓冲；`rows > 0` 已保证 length > 0）。
+        // 一次性 staging：装本帧所有段（Apple 推荐的低频小上传方式；Metal 拒绝 0 长度缓冲）。
+        let length = total_rows as usize * row_bytes;
         let staging = device
             .raw()
             .newBufferWithLength_options(length, MTLResourceOptions::StorageModeShared)
             .ok_or_else(|| {
                 init_error("newBufferWithLength_options(atlas staging)", "returned nil")
             })?;
-        // SAFETY: staging 恰为 `length` 字节；源切片长度由整页断言 + 页内行断言保证。
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                pending.pixels.as_ptr().add(start),
-                staging.contents().as_ptr().cast::<u8>(),
-                length,
-            );
-        }
-        // SAFETY: blit 的源是本函数独占的 staging（长度 = `length`），目标是本结构的纹理；
-        // 尺寸与 offset 在两者边界内。
-        unsafe {
-            encoder.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
-                &staging,
-                0,
-                row_bytes,
-                length,
-                MTLSize {
-                    width: self.page as usize,
-                    height: rows as usize,
-                    depth: 1,
-                },
-                &self.texture,
-                0,
-                0,
-                MTLOrigin {
-                    x: 0,
-                    y: first as usize,
-                    z: 0,
-                },
-            );
+        let mut staging_row = 0u32;
+        let mut packed_row = 0u32;
+        for span in spans {
+            let rows = span.end - span.start;
+            let source = packed_row as usize * row_bytes;
+            let destination = staging_row as usize * row_bytes;
+            // SAFETY: staging 恰为全部段的总字节数；源切片长度由整页断言 + 页内行断言保证。
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    pending.pixels.as_ptr().add(source),
+                    staging.contents().as_ptr().cast::<u8>().add(destination),
+                    rows as usize * row_bytes,
+                );
+            }
+            // SAFETY: blit 的源是本函数独占的 staging（容量覆盖本段），目标是本结构的纹理；
+            // 尺寸与 offset 在两者边界内。
+            unsafe {
+                encoder.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                    &staging,
+                    destination,
+                    row_bytes,
+                    rows as usize * row_bytes,
+                    MTLSize {
+                        width: self.page as usize,
+                        height: rows as usize,
+                        depth: 1,
+                    },
+                    &self.texture,
+                    0,
+                    0,
+                    MTLOrigin {
+                        x: 0,
+                        y: span.start as usize,
+                        z: 0,
+                    },
+                );
+            }
+            staging_row += rows;
+            packed_row += rows;
         }
         // GPU 读这块 staging 的 blit 与本帧命令缓冲同生命周期：帧完成（连续完成前沿到达
         // `index`）之前不得释放，因此这里只登记句柄，真正的 drop 由完成通知驱动（I4）。
@@ -230,6 +277,49 @@ impl AtlasTexture {
         queue.retire(index, handle);
         Ok(())
     }
+
+    /// 换页：建新纹理、旧纹理按帧序号 retire（可能在飞帧仍采样它）。
+    fn recreate(
+        &mut self,
+        device: &mut Device,
+        queue: &mut Queue,
+        index: FrameIndex,
+        page: u32,
+    ) -> Result<(), EngineError> {
+        let texture = create_texture(device, self.kind, page)?;
+        let handle = device.allocate(GpuObject::Texture(texture.clone()));
+        let old_texture = std::mem::replace(&mut self.texture, texture);
+        if let Some(old_handle) = self.handle.replace(handle) {
+            queue.retire(index, old_handle);
+        }
+        drop(old_texture);
+        self.page = page;
+        Ok(())
+    }
+}
+
+/// 建一张 `page × page` 的图集纹理（占位页与真实页共用）。
+fn create_texture(
+    device: &Device,
+    kind: AtlasKind,
+    page: u32,
+) -> Result<Retained<ProtocolObject<dyn MTLTexture>>, EngineError> {
+    let format = texture_format(kind);
+    // SAFETY: 纯构造函数，参数是本模块给定的合法尺寸/格式。
+    let descriptor = unsafe {
+        MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+            format,
+            page as usize,
+            page as usize,
+            false,
+        )
+    };
+    descriptor.setUsage(MTLTextureUsage::ShaderRead);
+    descriptor.setStorageMode(MTLStorageMode::Private);
+    device
+        .raw()
+        .newTextureWithDescriptor(&descriptor)
+        .ok_or_else(|| init_error("newTextureWithDescriptor(atlas)", "returned nil"))
 }
 
 fn texture_format(kind: AtlasKind) -> MTLPixelFormat {
@@ -238,13 +328,6 @@ fn texture_format(kind: AtlasKind) -> MTLPixelFormat {
         AtlasKind::Glyph => MTLPixelFormat::R8Unorm,
         // 图片纹素是「linear 预乘 → sRGB 编码」，视图必须是 sRGB（contract §8）。
         AtlasKind::Image => MTLPixelFormat::BGRA8Unorm_sRGB,
-    }
-}
-
-fn texel_bytes(kind: AtlasKind) -> u32 {
-    match kind {
-        AtlasKind::Glyph => 1,
-        AtlasKind::Image => 4,
     }
 }
 
@@ -307,13 +390,16 @@ mod tests {
     fn consecutive_uploads_do_not_share_staging_while_frames_are_in_flight() {
         let mut device = Device::new().expect("metal device");
         let mut queue = Queue::new(&device).expect("queue");
-        let mut atlas = AtlasTextures::new(&device, TEST_PAGE).expect("atlas");
+        let mut atlas = AtlasTextures::new(&mut device).expect("atlas");
 
         // 第 1 帧：第 5 行 = 不透明深蓝。
         let mut first_page = page();
         fill_row(&mut first_page, 5, [0x11, 0x22, 0x33, 0xFF]);
-        atlas.queue_upload(AtlasKind::Image, first_page, rows(5, 6));
+        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, first_page, rows(5, 6));
         let (slot1, command1) = queue.begin().expect("command 1");
+        atlas
+            .prepare(&mut device, &mut queue, FrameIndex::from_raw(1))
+            .expect("prepare frame 1");
         {
             let blit = command1.blitCommandEncoder().expect("blit encoder 1");
             atlas
@@ -324,8 +410,11 @@ mod tests {
         // 第 2 帧：第 7 行 = 不透明橙。第 1 帧还没提交/完成。
         let mut second_page = page();
         fill_row(&mut second_page, 7, [0x44, 0x55, 0x66, 0xFF]);
-        atlas.queue_upload(AtlasKind::Image, second_page, rows(7, 8));
+        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, second_page, rows(7, 8));
         let (slot2, command2) = queue.begin().expect("command 2");
+        atlas
+            .prepare(&mut device, &mut queue, FrameIndex::from_raw(2))
+            .expect("prepare frame 2");
         {
             let blit = command2.blitCommandEncoder().expect("blit encoder 2");
             atlas
@@ -367,14 +456,15 @@ mod tests {
         assert_eq!(read_row(&image, 6), [0, 0, 0, 0], "未上传的行保持原样");
     }
 
-    /// 页尺寸断言（与 Windows 同一约定）：长度不符的上传是上游契约破坏，不是可忽略的输入。
+    /// 页尺寸断言（DEVIATIONS S-153）：长度不是 `page² × texel` 的上传是上游契约破坏。
     #[test]
-    #[should_panic(expected = "atlas page size mismatch")]
+    #[should_panic(expected = "is not square")]
     fn an_upload_must_carry_a_full_page() {
-        let device = Device::new().expect("metal device");
-        let mut atlas = AtlasTextures::new(&device, TEST_PAGE).expect("atlas");
+        let mut device = Device::new().expect("metal device");
+        let mut atlas = AtlasTextures::new(&mut device).expect("atlas");
         let mut short = page();
-        short.truncate(16);
-        atlas.queue_upload(AtlasKind::Image, short, rows(0, 1));
+        // 20 字节 = 5 个 BGRA 纹素 ⇒ 不是平方数页。
+        short.truncate(20);
+        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, short, rows(0, 1));
     }
 }
