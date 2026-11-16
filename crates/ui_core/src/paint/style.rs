@@ -115,7 +115,13 @@ pub struct StylePatch {
     pub foreground: Option<Color>,
     /// 边框（复用 `paint::primitive::Border`：宽度 + 颜色；**不**重复定义，F-36）。
     pub border: Option<Border>,
-    /// 整体不透明度（在**预乘空间**缩放，P02 §5.2 的 `Mul<f32>`）。
+    /// 不透明度（在**预乘空间**缩放，P02 §5.2 的 `Mul<f32>`）。
+    ///
+    /// **语义是「逐图元 alpha」，不是组不透明度**（P2-3.2）：本节点的每个图元各自乘以该值，
+    /// 因此重叠的子图元会二次混合（例如半透明的边框叠在背景上会比预期更实）。
+    ///
+    /// 它**不**作用于 `Canvas` / `Geometry` 内容 —— 那些是应用自己生成的图元，引擎不解析其
+    /// 颜色。需要整组淡入淡出时用组不透明度（离屏 layer，尚未实现），不要靠这个字段。
     pub opacity: Option<f32>,
     /// 可见性（`false` 时不绘制、不参与命中，P06/P04）。
     pub visible: Option<bool>,
