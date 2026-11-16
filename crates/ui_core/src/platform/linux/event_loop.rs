@@ -126,6 +126,10 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                 return Ok(());
             }
             // ① 平台事件 → App（IME / 输入 / 尺寸 / 焦点 / DPI）。
+            // 先合成到期的键盘重复：Wayland 不替客户端产生重复，缺少这一步长按
+            // Backspace/方向键只生效一次（P1-2.11）。合成结果直接进 `state.events`，
+            // 与真实输入事件在同一轮一起派发。
+            state.emit_due_key_repeats(Instant::now());
             let events = state.take_events();
             let had_events = !events.is_empty();
             for event in events {
@@ -240,6 +244,12 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                 state
                     .frame_gate_remaining(Instant::now())
                     .unwrap_or(surface::IDLE_TIMEOUT)
+            };
+            // 有按住键时把等待压到下一次重复的到期时刻：否则 `dispatch` 会睡到空闲超时，
+            // 重复键要等到下一个无关事件才被合成（P1-2.11）。
+            let timeout = match state.next_key_repeat_in(Instant::now()) {
+                Some(due) => timeout.min(due),
+                None => timeout,
             };
             // 应用自己关窗（Esc / 标题栏关闭按钮）后不能停在下面 1h 的空闲等待里。
             if app.windows().next().is_none() {

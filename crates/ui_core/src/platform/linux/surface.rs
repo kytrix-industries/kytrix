@@ -106,6 +106,88 @@ fn choose_integer_scale(
     previous.max(1)
 }
 
+/// 键盘重复参数（`wl_keyboard.repeat_info`）。
+///
+/// Wayland 与 X11/Win32/macOS 不同：**服务端不合成重复**，客户端必须自己按 `rate`/`delay`
+/// 产生重复的 Key Down。缺了它长按 Backspace/方向键只生效一次（P1-2.11）。
+#[derive(Clone, Copy, Debug)]
+struct KeyRepeat {
+    /// 重复速率（Hz）；`0` = 服务端要求关闭重复。
+    rate: u32,
+    /// 首次重复前的延迟（毫秒）。
+    delay: u32,
+}
+
+impl Default for KeyRepeat {
+    fn default() -> Self {
+        // 服务端未发 `repeat_info` 时的保守默认（与 GTK 一致：25 Hz / 500 ms）。
+        Self {
+            rate: 25,
+            delay: 500,
+        }
+    }
+}
+
+impl KeyRepeat {
+    /// 重复间隔；`None` = 不重复（`rate == 0`）。
+    fn interval(self) -> Option<std::time::Duration> {
+        (self.rate > 0).then(|| std::time::Duration::from_micros(1_000_000 / u64::from(self.rate)))
+    }
+}
+
+/// 一个处于按下状态的键（合成重复用）。
+#[derive(Clone, Copy, Debug)]
+struct HeldKey {
+    /// evdev keycode（`wl_keyboard.key` 原值，未减 8）。
+    key: u32,
+    /// 下一次应当合成重复的时刻。
+    next: std::time::Instant,
+}
+
+/// 一次 `wl_pointer.frame` 内累积的滚轮增量。
+///
+/// Wayland 的 `axis` 是连续值（surface-local 单位，触控板即像素、滚轮一格通常 10–15），
+/// `axis_value120`（v8+）才是 1/120 行的高精度离散步长 —— 后者与 Windows 的
+/// `WHEEL_DELTA = 120` 同量纲，可以直接除以 120 得到行数。旧实现把 `axis` 除以 120，
+/// 于是滚轮慢约一个数量级（P1-2.11）。
+#[derive(Clone, Copy, Debug, Default)]
+struct ScrollAccum {
+    /// `axis_value120` 累积（1/120 行）。
+    discrete_x: i32,
+    discrete_y: i32,
+    /// 连续 `axis` 累积（surface-local 单位）。
+    continuous_x: f32,
+    continuous_y: f32,
+}
+
+impl ScrollAccum {
+    fn is_empty(self) -> bool {
+        self.discrete_x == 0
+            && self.discrete_y == 0
+            && self.continuous_x == 0.0
+            && self.continuous_y == 0.0
+    }
+
+    /// 换算成「行」。
+    ///
+    /// 离散部分走 `value120 / 120`（精确）；连续部分按 `CONTINUOUS_AXIS_UNITS_PER_LINE`
+    /// 折算 —— Wayland v5 起滚轮一格被规定为 10 个单位，取 10 让连续通路在滚轮上得到 1 行/格，
+    /// 触控板则按手指位移成比例平滑滚动。
+    fn lines(self) -> (f32, f32) {
+        (
+            self.discrete_x as f32 / 120.0 + self.continuous_x / CONTINUOUS_AXIS_UNITS_PER_LINE,
+            self.discrete_y as f32 / 120.0 + self.continuous_y / CONTINUOUS_AXIS_UNITS_PER_LINE,
+        )
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// 连续 `axis` 的单位→行换算（见 [`ScrollAccum::lines`]）。
+const CONTINUOUS_AXIS_UNITS_PER_LINE: f32 = 10.0;
+
 /// Wayland 侧的全部状态（`Dispatch` 的实现体 + calloop 的 `Data`）。
 pub(crate) struct WaylandState {
     /// 待泵消费的平台事件。
@@ -179,8 +261,24 @@ pub(crate) struct WaylandState {
     serial: u32,
     /// 最近一次指针按键的 serial（`xdg_toplevel.move` / `resize` 的隐式抓取凭证）。
     pointer_serial: u32,
-    mods: (u32, u32, u32),
+    /// `wl_keyboard.modifiers` 的原始掩码：`(depressed, latched, locked, group)`。
+    ///
+    /// `group` 是**当前键盘布局组**。之前把它丢成恒 0，切换布局后字符仍按第一布局解析
+    /// （P1-2.11）。xkbcommon 的 `update_mask` 把有效组放在 `locked_layout` 位置。
+    mods: (u32, u32, u32, u32),
     modifiers: Modifiers,
+    /// `zwp_text_input_v3` 是否已对当前 surface `enable()`（P1-2.11）。
+    ///
+    /// 一旦启用 IME，**所有**文本都经 `commit_string` 到达（含普通 ASCII）—— 此时必须抑制
+    /// `wl_keyboard` 那条通路，否则一次按键会产生两份文本（输入 "ni" 得到 "ni你"）。
+    /// 组合器没有 text-input-v3 时保持 `false`，回退到 `wl_keyboard` 取文本。
+    ime_enabled: bool,
+    /// 键盘重复的参数（`wl_keyboard.repeat_info`；v4+）。Wayland 规定重复由**客户端**合成。
+    key_repeat: KeyRepeat,
+    /// 当前按下的键（用于合成重复）。顺序即按下顺序，释放时按 keycode 移除。
+    held_keys: Vec<HeldKey>,
+    /// 本帧尚未提交的滚轮累积（按 `wl_pointer.frame` 成批，P1-2.11）。
+    scroll: ScrollAccum,
     pointer_pos: Point,
     size: Size,
     scale: Scale,
@@ -328,8 +426,12 @@ impl WaylandState {
             xkb_state: None,
             serial: 0,
             pointer_serial: 0,
-            mods: (0, 0, 0),
+            mods: (0, 0, 0, 0),
             modifiers: Modifiers::empty(),
+            ime_enabled: false,
+            key_repeat: KeyRepeat::default(),
+            held_keys: Vec::new(),
+            scroll: ScrollAccum::default(),
             pointer_pos: Point::new(0.0, 0.0),
             // Wayland 的 configure / window geometry 是整数，小数的逻辑尺寸在协议层没有表示：
             // 这里先四舍五入取整，整数回退下 buffer = `round(L × N)` 因而严格是 buffer_scale 的
@@ -608,6 +710,8 @@ impl WaylandState {
             // surface 的 `wl_surface.commit`）。**不** commit `wl_surface`：UI 线程的 commit 会提前
             // 触发 frame callback、破坏 FrameGate 的「≤1 在飞」（D4）。
             text_input.enable();
+            // P1-2.11：从这里开始文本由 `commit_string` 送达，`wl_keyboard` 通路必须静默。
+            self.ime_enabled = true;
             let area = self
                 .ime_cursor_area
                 .unwrap_or_else(|| Rect::new(0.0, 0.0, 1.0, 1.0));
@@ -620,6 +724,7 @@ impl WaylandState {
             self.ime_cursor_applied = Some(area);
         } else {
             text_input.disable();
+            self.ime_enabled = false;
             self.ime_cursor_applied = None;
         }
         text_input.commit();
@@ -674,8 +779,9 @@ impl WaylandState {
         let Some(xkb_state) = self.xkb_state.as_mut() else {
             return;
         };
-        let (depressed, latched, locked) = self.mods;
-        xkb_state.update_mask(depressed, latched, locked, 0, 0, 0);
+        let (depressed, latched, locked, group) = self.mods;
+        // 有效布局组放在 `locked_layout` 位置（Wayland 只给有效组，smithay/winit 同此约定）。
+        xkb_state.update_mask(depressed, latched, locked, 0, 0, group);
         let keycode = xkb::Keycode::new(key);
         let symbol = xkb_state.key_get_one_sym(keycode);
         self.events.push(Event::Input(InputEvent::Key {
@@ -683,7 +789,10 @@ impl WaylandState {
             state,
             modifiers: self.modifiers,
         }));
-        if state == KeyState::Down {
+        // P1-2.11：IME 启用后文本**只**走 `zwp_text_input_v3` 的 `commit_string`。
+        // 两条通路同时生效会让一次按键产生两份文本（输入 "ni" 得到 "ni你"）。
+        // 组合器没有 text-input-v3 时 `ime_enabled` 恒 false，回退到这里的 xkb 通路。
+        if state == KeyState::Down && !self.ime_enabled {
             let text = xkb_state.key_get_utf8(keycode);
             if !text.is_empty() && text.chars().all(|c| !c.is_control()) {
                 self.events.push(Event::Input(InputEvent::Text {
@@ -693,13 +802,75 @@ impl WaylandState {
         }
     }
 
+    /// 记录一次按键的按下/释放状态（合成重复用，P1-2.11）。
+    fn note_key_held(&mut self, xkb_key: u32, key_state: KeyState) {
+        match key_state {
+            KeyState::Down => {
+                if !self.held_keys.iter().any(|held| held.key == xkb_key) {
+                    self.held_keys.push(HeldKey {
+                        key: xkb_key,
+                        next: std::time::Instant::now()
+                            + std::time::Duration::from_millis(u64::from(self.key_repeat.delay)),
+                    });
+                }
+            }
+            KeyState::Up => self.held_keys.retain(|held| held.key != xkb_key),
+        }
+    }
+
+    /// `repeat_info` 变化后重排全部按住键的下次触发时刻。
+    fn reschedule_held_keys(&mut self) {
+        let now = std::time::Instant::now();
+        let delay = std::time::Duration::from_millis(u64::from(self.key_repeat.delay));
+        for held in &mut self.held_keys {
+            held.next = now + delay;
+        }
+    }
+
+    /// 合成到期的重复按键（把 Key Down + Text 推进 `events`）。
+    ///
+    /// 由事件循环每轮调用；`rate == 0` 时不做任何事（服务端要求关闭重复）。
+    pub(crate) fn emit_due_key_repeats(&mut self, now: std::time::Instant) {
+        if self.held_keys.is_empty() {
+            return;
+        }
+        let Some(interval) = self.key_repeat.interval() else {
+            return;
+        };
+        // 收集到期的 keycode，避免在迭代 `held_keys` 时可变借用 `self`。
+        let mut due: Vec<u32> = Vec::new();
+        for held in &mut self.held_keys {
+            if held.next <= now {
+                due.push(held.key);
+                // 按固定间隔推进（不是 `now + interval`）：系统卡顿后不补偿爆发式重复，
+                // 多拍只合成一次 —— 这与 GTK/Qt 的客户端重复实现一致。
+                held.next = now + interval;
+            }
+        }
+        for key in due {
+            self.translate_key(key, KeyState::Down);
+        }
+    }
+
+    /// 距离下一次需要合成重复还有多久（事件循环据此决定 `dispatch` 的 timeout）。
+    ///
+    /// `None` = 没有按住键或重复已关闭 ⇒ 不缩短等待。
+    pub(crate) fn next_key_repeat_in(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        // 重复关闭 ⇒ `None`（不缩短等待）。
+        self.key_repeat.interval()?;
+        self.held_keys
+            .iter()
+            .map(|held| held.next.saturating_duration_since(now))
+            .min()
+    }
+
     fn update_modifiers(&mut self) {
         self.modifiers = Modifiers::empty();
-        let (depressed, latched, locked) = self.mods;
+        let (depressed, latched, locked, group) = self.mods;
         let Some(state) = self.xkb_state.as_mut() else {
             return;
         };
-        state.update_mask(depressed, latched, locked, 0, 0, 0);
+        state.update_mask(depressed, latched, locked, 0, 0, group);
         let effective = xkb::STATE_MODS_EFFECTIVE;
         if state.mod_name_is_active(xkb::MOD_NAME_SHIFT, effective) {
             self.modifiers |= Modifiers::SHIFT;
@@ -1034,9 +1205,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                 mods_depressed,
                 mods_latched,
                 mods_locked,
+                group,
                 ..
             } => {
-                state.mods = (mods_depressed, mods_latched, mods_locked);
+                state.mods = (mods_depressed, mods_latched, mods_locked, group);
                 state.update_modifiers();
             }
             wl_keyboard::Event::Key {
@@ -1057,8 +1229,19 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                 };
                 if let Some(key_state) = key_state {
                     // evdev 码 + 8 = xkb keycode。
-                    state.translate_key(key + 8, key_state);
+                    let xkb_key = key + 8;
+                    state.note_key_held(xkb_key, key_state);
+                    state.translate_key(xkb_key, key_state);
                 }
+            }
+            wl_keyboard::Event::RepeatInfo { rate, delay } => {
+                // Wayland 规定重复由客户端合成（P1-2.11）。`rate == 0` 表示服务端要求关闭重复。
+                state.key_repeat = KeyRepeat {
+                    rate: u32::try_from(rate).unwrap_or(0),
+                    delay: u32::try_from(delay).unwrap_or(0),
+                };
+                // 参数变化后按新参数重排所有按住键的下次触发时刻。
+                state.reschedule_held_keys();
             }
             wl_keyboard::Event::Enter { serial, .. } => {
                 state.serial = serial;
@@ -1136,20 +1319,38 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 }
             }
             wl_pointer::Event::Axis { axis, value, .. } => {
-                // `value` 是 1/120 行；取反对齐 Win32 的「正 = 向上 / 向右」。
-                let delta = -(value as f32) / 120.0;
-                let (delta_x, delta_y) = match axis {
+                // 连续值（触控板即像素；v5 起滚轮一格 = 10 个单位）。**不能**除 120 ——
+                // 那是 `axis_value120` 的量纲（P1-2.11）。
+                match axis {
                     wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll) => {
-                        (delta, 0.0)
+                        state.scroll.continuous_x += value as f32;
                     }
-                    _ => (0.0, delta),
-                };
-                state.events.push(Event::Input(InputEvent::Scroll {
-                    position: state.pointer_pos,
-                    delta_x,
-                    delta_y,
-                    modifiers: state.modifiers,
-                }));
+                    _ => state.scroll.continuous_y += value as f32,
+                }
+            }
+            wl_pointer::Event::AxisValue120 { axis, value120 } => {
+                // v8+ 的高精度离散步长：1/120 行，与 Win32 的 `WHEEL_DELTA = 120` 同量纲。
+                match axis {
+                    wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll) => {
+                        state.scroll.discrete_x = state.scroll.discrete_x.saturating_add(value120);
+                    }
+                    _ => state.scroll.discrete_y = state.scroll.discrete_y.saturating_add(value120),
+                }
+            }
+            wl_pointer::Event::Frame => {
+                // 一次 frame = 一批同属一个逻辑输入的指针事件 ⇒ 只产出一个 Scroll。
+                // 未实现 `axis_value120` 的服务端（v8 以下）只会来连续 `axis`，两条通路在此合并。
+                if !state.scroll.is_empty() {
+                    let (lines_x, lines_y) = state.scroll.lines();
+                    state.scroll.clear();
+                    // 取反对齐 Win32 的「正 = 向上 / 向右」。
+                    state.events.push(Event::Input(InputEvent::Scroll {
+                        position: state.pointer_pos,
+                        delta_x: -lines_x,
+                        delta_y: -lines_y,
+                        modifiers: state.modifiers,
+                    }));
+                }
             }
             wl_pointer::Event::Leave { .. } => {
                 state.events.push(Event::Input(InputEvent::PointerLeave));
@@ -1343,7 +1544,78 @@ fn map_keysym(symbol: xkb::Keysym, evdev: u32) -> Key {
 
 #[cfg(test)]
 mod tests {
-    use super::choose_integer_scale;
+    use super::{CONTINUOUS_AXIS_UNITS_PER_LINE, KeyRepeat, ScrollAccum, choose_integer_scale};
+
+    /// P1-2.11：`axis_value120` 是 1/120 行，一格（120）= 整整一行。
+    ///
+    /// 旧实现把连续的 `axis`（一格 10–15 个单位）除以 120，于是滚轮慢约一个数量级。
+    #[test]
+    fn discrete_scroll_is_one_line_per_120_units() {
+        let one_notch = ScrollAccum {
+            discrete_y: 120,
+            ..ScrollAccum::default()
+        };
+        assert_eq!(one_notch.lines().1, 1.0, "一格 = 120/120 = 1 行");
+
+        let two_notches = ScrollAccum {
+            discrete_y: 240,
+            ..ScrollAccum::default()
+        };
+        assert_eq!(two_notches.lines().1, 2.0, "两格 = 2 行");
+    }
+
+    /// 连续 `axis`（滚轮一格 = 10 个单位）也必须得到 1 行，而不是 10/120 ≈ 0.083 行。
+    #[test]
+    fn continuous_scroll_uses_the_documented_unit() {
+        let one_notch = ScrollAccum {
+            continuous_y: CONTINUOUS_AXIS_UNITS_PER_LINE,
+            ..ScrollAccum::default()
+        };
+        assert_eq!(one_notch.lines().1, 1.0, "一格连续值 = 1 行（旧实现是 0.083）");
+    }
+
+    /// 两条通路在同一 frame 内叠加（服务端可能同时发 `axis` 与 `axis_value120`）。
+    #[test]
+    fn both_axis_paths_accumulate() {
+        let mixed = ScrollAccum {
+            discrete_x: 60,
+            continuous_x: CONTINUOUS_AXIS_UNITS_PER_LINE,
+            ..ScrollAccum::default()
+        };
+        assert_eq!(mixed.lines().0, 1.5, "0.5 行离散 + 1 行连续");
+    }
+
+    #[test]
+    fn an_empty_accumulator_reports_empty() {
+        let mut scroll = ScrollAccum::default();
+        assert!(scroll.is_empty());
+        scroll.continuous_y = -3.0;
+        assert!(!scroll.is_empty());
+        scroll.clear();
+        assert!(scroll.is_empty(), "clear 之后必须回到空态");
+    }
+
+    /// `repeat_info` 的 `rate == 0` = 服务端要求关闭重复。
+    #[test]
+    fn zero_repeat_rate_disables_repeats() {
+        assert!(KeyRepeat { rate: 0, delay: 500 }.interval().is_none());
+        assert_eq!(
+            KeyRepeat { rate: 25, delay: 500 }.interval(),
+            Some(std::time::Duration::from_millis(40)),
+            "25 Hz ⇒ 40 ms 间隔"
+        );
+    }
+
+    /// 默认参数必须在服务端未发 `repeat_info` 时也产生合理重复。
+    #[test]
+    fn default_repeat_is_enabled_and_reasonable() {
+        let interval = KeyRepeat::default().interval().expect("默认必须启用重复");
+        assert!(
+            interval >= std::time::Duration::from_millis(20)
+                && interval <= std::time::Duration::from_millis(100),
+            "默认重复间隔应在 20–100 ms（实际 {interval:?}）"
+        );
+    }
 
     #[test]
     fn preferred_buffer_scale_wins_over_outputs() {
