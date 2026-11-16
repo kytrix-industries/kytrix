@@ -1008,6 +1008,11 @@ fn drain_completed(
 ///
 /// `timeout` 只用于缩容的定时唤醒（内容静止满 `SHRINK_IDLE` 后醒一次再检查）；`None` = 无限等。
 /// 超时不是错误：回到循环顶部重新检查待画帧 / 缩容条件。
+///
+/// **这里的 `INFINITE` 是刻意保留的**（与 P1-2.13 修掉的那几处不同）：这是 GPU 线程「没有
+/// 活干」时的空闲等待，两个事件之一（新帧 / 关闭）出现前本该什么都不做。改成定时轮询只会
+/// 白白唤醒 CPU（60 Hz 空转 = 每秒 60 次无效唤醒），并不会让任何失败更早被发现 ——
+/// 挂死风险在**等 GPU 完成**的路径上（fence / present waitable），那两处已改成有界等待。
 fn wait_for_work_or_completion(
     shared: &Shared,
     timeout: Option<Duration>,
@@ -1053,8 +1058,30 @@ fn wait_for_waitable(
     let Some(waitable) = renderer.waitable() else {
         return Ok(());
     };
+    // 连续超时计数：每次超时说明「present waitable 与关闭信号都没来」。健康情况下 present 在
+    // 一帧内必然完成，连续 `PRESENT_HANG_LIMIT` 次（≈ 4 s）没动静就按设备挂死上报，
+    // 而不是像旧实现那样永久阻塞（P1-2.13）。
+    let mut stalled = 0u32;
     loop {
-        if wait_for_pair(waitable, shared.completion, "waitable, completion")? == 0 {
+        let Some(signalled) = wait_for_pair(waitable, shared.completion, "waitable, completion")?
+        else {
+            if shared.shutdown_requested() {
+                return Ok(());
+            }
+            stalled += 1;
+            if stalled >= PRESENT_HANG_LIMIT {
+                return Err(EngineError::DeviceLost {
+                    reason: format_smolstr!(
+                        "DXGI present waitable did not signal for {} ms",
+                        u64::from(PRESENT_TIMEOUT_MS) * u64::from(PRESENT_HANG_LIMIT)
+                    ),
+                    log_path: std::path::PathBuf::new(),
+                });
+            }
+            continue;
+        };
+        stalled = 0;
+        if signalled == 0 {
             return Ok(());
         }
         drain_completed(renderer, shared, submitted);
@@ -1067,13 +1094,20 @@ fn wait_for_waitable(
 }
 
 /// `WaitForMultipleObjects([low, high])`；返回被 signal 的句柄下标（0 或 1）。
-fn wait_for_pair(low: HANDLE, high: HANDLE, label: &str) -> Result<usize, EngineError> {
+///
+/// **有界等待**（P1-2.13）：旧实现传 `INFINITE`。设备被移除 / 驱动挂死时 DXGI 的 waitable
+/// 对象永远不会 signal，GPU 线程就永久阻塞（关闭时还会连带拖住 UI 线程的消息泵）。
+/// 超时返回 `Ok(None)` 让调用方回到循环顶部重新检查关闭标志，并在连续多次超时后按
+/// `DeviceLost` 上报 —— 这才是可恢复的行为。
+fn wait_for_pair(low: HANDLE, high: HANDLE, label: &str) -> Result<Option<usize>, EngineError> {
     // SAFETY: 两个句柄都由 `Shared`（或 swapchain）持有，调用方保证它们的生命周期覆盖本次等待。
-    let wait = unsafe { WaitForMultipleObjects(&[low, high], false, INFINITE) };
+    let wait = unsafe { WaitForMultipleObjects(&[low, high], false, PRESENT_TIMEOUT_MS) };
     match wait.0 {
-        0 => Ok(0),
-        1 => Ok(1),
-        // 无超时 + 无 mutex：只剩 `WAIT_FAILED`（或驱动返回的异常值）。
+        0 => Ok(Some(0)),
+        1 => Ok(Some(1)),
+        // 超时：不是错误，让调用方重查关闭标志 / 计入挂死判定。
+        timeout if timeout == WAIT_TIMEOUT.0 => Ok(None),
+        // 无 mutex：只剩 `WAIT_FAILED`（或驱动返回的异常值）。
         _ => Err(EngineError::AppInit {
             detail: format_smolstr!(
                 "WaitForMultipleObjects({label}) failed: {wait:?} ({})",
@@ -1083,19 +1117,35 @@ fn wait_for_pair(low: HANDLE, high: HANDLE, label: &str) -> Result<usize, Engine
     }
 }
 
-/// 边泵消息边等 GPU 线程退出（§6.7），**没有超时**。
+/// present waitable 的单次等待上限（P1-2.13）。
+const PRESENT_TIMEOUT_MS: u32 = 1_000;
+/// 连续多少次 present 等待超时判定为设备挂死（1 s x 4 = 4 s）。
+const PRESENT_HANG_LIMIT: u32 = 4;
+/// 关闭时等待 GPU 线程退出的单轮上限（期间继续泵消息）。
+const JOIN_TIMEOUT_MS: u32 = 250;
+/// 关闭时等待 GPU 线程退出的总上限；超过则 detach，避免进程关不掉。
+const JOIN_HANG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 边泵消息边等 GPU 线程退出（§6.7）。
 ///
 /// 不能直接 `join`：DXGI 的 `Present` 可能同步 `SendMessage` 到本线程的消息泵，而本线程正在
 /// join 里等 GPU 线程 —— 互等。这里用 `MsgWaitForMultipleObjects`（对象 = GPU 线程句柄）在
-/// 等待期间继续派发消息，直到线程句柄 signaled；只有 `WAIT_FAILED` 这类异常才记录并放弃。
+/// 等待期间继续派发消息，直到线程句柄 signaled。
+///
+/// **总时长有界**（P1-2.13）：旧实现每轮传 `INFINITE`，如果 GPU 线程卡在设备挂死的 `Present`
+/// 里，关闭流程会永久挂住 UI 线程（用户看到的是「关不掉」）。现在每轮最多等
+/// `JOIN_TIMEOUT_MS` 并派发消息，累计超过 `JOIN_HANG_TIMEOUT` 就放弃 join（detach）并返回 ——
+/// 让进程能退出，代价是可能跳过 GPU 资源的优雅释放。
 fn join_with_message_pump(thread: JoinHandle<()>) {
     // `JoinHandle` 的平台句柄在 join / drop 之前有效；这里只读它（RawHandle 是 Copy）。
     let handle = HANDLE(thread.as_raw_handle());
     let mut quit = None;
+    let deadline = std::time::Instant::now() + JOIN_HANG_TIMEOUT;
     loop {
         // SAFETY: `handle` 由 `thread` 持有；`QS_ALLINPUT` 只观察本线程的消息队列。
-        let wait =
-            unsafe { MsgWaitForMultipleObjects(Some(&[handle]), false, INFINITE, QS_ALLINPUT) };
+        let wait = unsafe {
+            MsgWaitForMultipleObjects(Some(&[handle]), false, JOIN_TIMEOUT_MS, QS_ALLINPUT)
+        };
         if wait == WAIT_OBJECT_0 {
             let _ = thread.join();
             break;
@@ -1105,7 +1155,20 @@ fn join_with_message_pump(thread: JoinHandle<()>) {
             quit = pump_messages().or(quit);
             continue;
         }
-        // 异常（`WAIT_FAILED`；无超时 + 无 mutex，不会出现 `WAIT_TIMEOUT` / `WAIT_ABANDONED_*`）：
+        if wait.0 == WAIT_TIMEOUT.0 {
+            if std::time::Instant::now() >= deadline {
+                // GPU 线程在设备挂死后不会返回：放弃 join（detach）让进程仍能退出。
+                eprintln!(
+                    "kytrix: kytrix-d3d12 thread did not exit within {:?}; detaching it (GPU likely lost)",
+                    JOIN_HANG_TIMEOUT
+                );
+                break;
+            }
+            // 超时后继续泵消息：关闭期间窗口仍然存活，必须保持响应。
+            quit = pump_messages().or(quit);
+            continue;
+        }
+        // 异常（`WAIT_FAILED`；无 mutex，不会出现 `WAIT_ABANDONED_*`）：
         // 记录后放弃 join，避免把 UI 线程一起拖死。`thread` 在此 drop（detach）。
         eprintln!(
             "kytrix: MsgWaitForMultipleObjects while joining the kytrix-d3d12 thread failed: {:?} ({})",

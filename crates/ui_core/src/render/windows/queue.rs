@@ -9,9 +9,9 @@ use std::collections::VecDeque;
 
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
+        Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
         Graphics::Direct3D12::*,
-        System::Threading::{CreateEventW, INFINITE, WaitForSingleObject},
+        System::Threading::{CreateEventW, WaitForSingleObject},
     },
     core::Interface,
 };
@@ -27,8 +27,15 @@ use crate::{
 };
 
 /// 直接队列 + 每槽 allocator/list + fence + 提交记账。
+/// fence 等待的硬上限（P1-2.13）。INFINITE 会在设备被移除时永久挂住 UI 线程；
+/// 2 s 是 GPU watchdog 的常规量级，健康的帧远达不到。
+const FENCE_TIMEOUT_MS: u32 = 2_000;
+
 pub(crate) struct Queue {
     raw: ID3D12CommandQueue,
+    /// 设备句柄（COM 引用计数克隆，几乎零成本）：fence 等待超时时用它取
+    /// `GetDeviceRemovedReason`，把「GPU 不响应」分类成 `DeviceLost` 而不是永久阻塞。
+    device: ID3D12Device,
     allocators: Vec<ID3D12CommandAllocator>,
     lists: Vec<ID3D12GraphicsCommandList>,
     fence: ID3D12Fence,
@@ -61,6 +68,7 @@ impl Queue {
         }
         .map_err(|error| init_error_from("CreateCommandQueue", error))?;
 
+        let raw_device = device.raw().clone();
         let mut allocators = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         let mut lists = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
@@ -94,6 +102,7 @@ impl Queue {
 
         Ok(Self {
             raw,
+            device: raw_device,
             allocators,
             lists,
             fence,
@@ -294,15 +303,39 @@ impl Queue {
         // SAFETY: 队列 / fence / event 句柄由 `Queue` 持有到 `Drop`；命令列表与分配器在提交前独占。
         unsafe { self.fence.SetEventOnCompletion(value, self.event) }
             .map_err(|error| init_error_from("SetEventOnCompletion", error))?;
-        let wait = unsafe { WaitForSingleObject(self.event, INFINITE) };
+        // **有界等待**（P1-2.13）：旧实现传 `INFINITE`。设备被移除 / 驱动挂死时
+        // `SetEventOnCompletion` 永远不会触发，UI 线程就永久阻塞 —— 窗口无响应且没有任何
+        // 错误上报。GPU watchdog 的行业惯例是 1–2 s 量级（Chrome 的 GPU watchdog 默认 1 s），
+        // 这里取 2 s：健康的帧不可能接近这个量级。
+        let wait = unsafe { WaitForSingleObject(self.event, FENCE_TIMEOUT_MS) };
         if wait == WAIT_OBJECT_0 {
-            Ok(())
-        } else {
-            Err(init_error(
+            return Ok(());
+        }
+        if wait.0 != WAIT_TIMEOUT.0 {
+            return Err(init_error(
                 "WaitForSingleObject(fence)",
                 windows::core::HRESULT::from_win32(wait.0),
-            ))
+            ));
         }
+        // 超时：先确认设备是否真的被移除，给出可诊断的原因。**不能**在这里无限重试。
+        // SAFETY: 设备句柄由本结构持有到 `Drop`；查询无副作用。
+        let removed = unsafe { self.device.GetDeviceRemovedReason() };
+        let reason = match removed {
+            Ok(()) => smol_str::format_smolstr!(
+                "GPU fence wait timed out after {FENCE_TIMEOUT_MS} ms (device still present; GPU hung or submission lost)"
+            ),
+            Err(error) => smol_str::format_smolstr!(
+                "GPU fence wait timed out after {FENCE_TIMEOUT_MS} ms (GetDeviceRemovedReason: {:#010X} {})",
+                error.code().0 as u32,
+                error.message()
+            ),
+        };
+        Err(EngineError::DeviceLost {
+            reason,
+            // 这里不写 DRED：本结构拿不到 `Device` 的调试状态；调用方会把粘性 `DeviceLost`
+            // 作为一个整体上报，诊断文件由 `Device::note_failure` 在其它失败路径产出。
+            log_path: std::path::PathBuf::new(),
+        })
     }
 }
 
