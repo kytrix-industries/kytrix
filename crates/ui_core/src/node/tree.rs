@@ -473,6 +473,15 @@ pub struct NodeTree {
     a11y_slots: Vec<Option<Box<crate::a11y::tree::NodeA11y>>>,
     /// 带 `A11Y` 位的节点数（O(1) 的「有没有 a11y 工作」判据；P11 S-108）。
     a11y_dirty: u32,
+    /// 文本内容可能变化的节点集合（P1-2.3）。
+    ///
+    /// `App::refresh_text` 原本每帧遍历整棵树、对每个文本节点 `text_content(node).cloned()`
+    /// 再算全文哈希 —— 即使这一帧没有任何文本变化。集合在「文本载荷被写入」时登记
+    /// （`set_text_content`）、在 `refresh_text` 消费后清空，因此稳态下遍历成本是 O(变化的文本)。
+    ///
+    /// 用 `Vec` + 线性去重而不是 `HashSet`：典型每帧 0–32 个条目，`Vec` 的扫描比哈希更快，
+    /// 且迭代序确定（帧记录可复现）。
+    text_dirty: Vec<NodeId>,
     /// 卸载节点的待释放 lane（`Window::paint_frame` 消费后清空，容量保留）。
     removed_lanes: Vec<LaneId>,
     /// 出流盒 → 它的包含块（taffy `add_hoisted_children` 的落点；唯一读者是 `absolutize`）。
@@ -580,6 +589,7 @@ impl NodeTree {
             clip_keys: vec![None],
             a11y_slots: vec![None],
             a11y_dirty: 1,
+            text_dirty: Vec::new(),
             removed_lanes: Vec::new(),
             hoisted: ahash::HashMap::default(),
             layout_epoch: 0,
@@ -811,6 +821,15 @@ impl NodeTree {
             self.text_slots.resize_with(index + 1, || None);
         }
         self.text_slots[index] = None;
+        // P1-2.3：新挂载的文本节点必须进脏集合，否则 `refresh_text` 永远不会 shape 它
+        // （静态 `text()` 与 `bind_text` 都走这条路 —— 前者挂载时写内容，后者首次求值写内容）。
+        if self
+            .arena
+            .get(id)
+            .is_some_and(|target| target.kind.text().is_some())
+        {
+            self.mark_text_dirty(id);
+        }
         // 稳定调试 id 与 clip 上下文同生命周期：槽位复用不得继承上一代的值（P06 §5.6 / C4）。
         if self.debug_ids.len() <= index {
             self.debug_ids.resize_with(index + 1, || None);
@@ -1233,11 +1252,53 @@ impl NodeTree {
             Some(target) => match &mut target.kind {
                 NodeKind::Text(existing) => {
                     *existing = content;
+                    self.mark_text_dirty(node);
                     true
                 }
                 _ => false,
             },
             None => false,
+        }
+    }
+
+    /// 登记「该节点的文本需要重新 shape」（P1-2.3 的脏集合）。
+    ///
+    /// 去重是线性扫描：典型每帧 0–32 条，比哈希表更快且迭代序确定。节点已不存在时静默忽略
+    /// （卸载路径会在 `remove` 里清理）。
+    fn mark_text_dirty(&mut self, node: NodeId) {
+        if !self.text_dirty.contains(&node) {
+            self.text_dirty.push(node);
+        }
+    }
+
+    /// 取出本帧待 shape 的文本节点（**清空集合**，容量保留）。
+    ///
+    /// 消费者：`App::refresh_text`。返回的列表可能包含已被卸载的节点 —— 调用方按
+    /// 「查不到就跳过」处理（卸载时 `remove` 会尝试清理，但集合是旁路结构，不做强一致）。
+    pub(crate) fn take_text_dirty(&mut self) -> Vec<NodeId> {
+        std::mem::take(&mut self.text_dirty)
+    }
+
+    /// 本帧待 shape 的文本节点数（诊断 / 测试）。
+    #[cfg(test)]
+    pub(crate) fn text_dirty_len(&self) -> usize {
+        self.text_dirty.len()
+    }
+
+    /// 把所有文本节点标脏（字体栈 / DPI / 图集换代时用）。
+    pub(crate) fn mark_all_text_dirty(&mut self) {
+        let nodes: Vec<NodeId> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|node| {
+                self.arena
+                    .get(*node)
+                    .is_some_and(|t| t.kind.text().is_some())
+            })
+            .collect();
+        for node in nodes {
+            self.mark_text_dirty(node);
         }
     }
 

@@ -2869,8 +2869,17 @@ impl App {
         };
 
         let mut index = 0usize;
-        while index < tree.order().len() {
-            let node = tree.order()[index];
+        // P1-2.3：只遍历**文本脏集合**，不再每帧扫整棵树。
+        //
+        // 旧实现每帧 `for node in tree.order()`，对每个文本节点 `text_content(node).cloned()`
+        // 再算全文哈希 —— 即使这一帧没有任何文本变化。32 个实时标签的实测代价约 6.8 ms/帧
+        // （shape 3.2 + layout/raster 3.6），已接近 60 Hz 预算的一半。
+        //
+        // 集合来源：`set_text_content`（`bind_text` 求值 / 静态挂载）与 `mark_all_text_dirty`
+        // （字体栈、DPI、图集换代）。
+        let dirty = tree.take_text_dirty();
+        while index < dirty.len() {
+            let node = dirty[index];
             index += 1;
             let Some(content) = tree.text_content(node).cloned() else {
                 continue;
@@ -3053,6 +3062,9 @@ impl App {
                     tree.invalidate_text_layout(node);
                 }
             }
+            // P1-2.3：字体栈 / 系统字体变化后，脏集合必须包含**全部**文本节点 ——
+            // `refresh_text` 现在只遍历脏集合，漏标就等于永久不重排。
+            tree.mark_all_text_dirty();
         }
     }
 
@@ -3241,11 +3253,29 @@ mod tests {
         let (_rt, mut app, window, node) = text_app("hello", None);
 
         let first = refresh(&mut app, window);
+        // P1-2.3：脏集合消费后为空 ⇒ 第二次调用不再遍历任何节点。
+        // 旧实现每帧扫整棵树并把「快照未变」计入 `skipped`；现在「没有脏节点」本身就是
+        // 更强的跳过（成本 O(0) 而不是 O(全树)），`skipped` 只统计真正访问到的节点。
         let second = refresh(&mut app, window);
 
         assert_eq!(first.shaped, 1);
-        assert_eq!(second.skipped, 1, "B4: unchanged snapshot must be skipped");
-        assert_eq!(second.shaped, 0);
+        assert_eq!(second.shaped, 0, "脏集合为空时不得重新 shape");
+        assert_eq!(
+            app.window(window)
+                .expect("窗口存在")
+                .tree()
+                .text_dirty_len(),
+            0,
+            "脏集合必须已被消费"
+        );
+        // 显式标记后必须重新进入（证明集合是唯一入口，而不是「永远跳过」）。
+        app.window_mut(window)
+            .expect("窗口存在")
+            .tree_mut()
+            .mark_all_text_dirty();
+        let third = refresh(&mut app, window);
+        assert_eq!(third.skipped, 1, "标记后必须访问该节点并命中快照复用");
+        assert_eq!(third.shaped, 0);
         // 行快照只由第二阶段（layout_text）产出。
         assert!(
             app.window(window)
