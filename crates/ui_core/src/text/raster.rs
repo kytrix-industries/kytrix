@@ -44,6 +44,55 @@ pub(crate) struct RasterGlyph {
     pub data: Vec<u8>,
 }
 
+/// 一个 run 的字形变体参数：可变字体实例坐标 + 合成样式（faux bold）。
+///
+/// Parley 用这些参数算 advance，但**光栅必须收到同样的参数**，否则位图与排版对不上：
+/// 可变字体（如 `Segoe UI Variable`）在 weight=700 时 parley 按加粗坐标排版，swash 若按
+/// 默认轴（≈400）出位图，就是「粗体不变粗、字距不匹配」。
+///
+/// `hash` 参与 [`crate::text::atlas::GlyphKey`]：同一字形的不同实例必须各占一个 tile。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct GlyphVariation {
+    /// 归一化实例坐标（`-1..=1` 映射到 `i16::MIN..=i16::MAX`，即 `swash::NormalizedCoord`）。
+    coords: Vec<i16>,
+    /// faux bold 强度（像素；0 = 不合成）。
+    embolden: f32,
+    /// 参与图集缓存键的摘要。
+    hash: u64,
+}
+
+impl GlyphVariation {
+    /// 由 parley 的 run 参数构造（只处理可变字体实例与 faux bold；faux italic 需要 zeno
+    /// `Transform`，当前不在依赖集内，未实现）。
+    pub(crate) fn of(coords: &[i16], synthesis: fontique::Synthesis, ppem: f32) -> Self {
+        use std::hash::{Hash, Hasher};
+        let embolden = if synthesis.embolden() {
+            // FreeType 的 faux bold 默认强度是 1/24 em。
+            ppem / 24.0
+        } else {
+            0.0
+        };
+        let mut hasher = ahash::AHasher::default();
+        coords.hash(&mut hasher);
+        embolden.to_bits().hash(&mut hasher);
+        Self {
+            coords: coords.to_vec(),
+            embolden,
+            hash: hasher.finish(),
+        }
+    }
+
+    /// 参与图集缓存键的摘要。
+    pub(crate) fn hash(&self) -> u64 {
+        self.hash
+    }
+
+    /// 全默认（无实例坐标、无合成）：光栅路径可以省掉额外的 scaler 配置。
+    fn is_identity(&self) -> bool {
+        self.coords.is_empty() && self.embolden <= 0.0
+    }
+}
+
 /// 逐字形光栅器（每线程一个 `ScaleContext`，同 font+ppem 复用 `Scaler`）。
 pub(crate) struct GlyphRasterizer {
     ctx: ScaleContext,
@@ -78,6 +127,7 @@ impl GlyphRasterizer {
         font: &parley::FontData,
         glyph: u32,
         ppem: f32,
+        variation: &GlyphVariation,
     ) -> Option<RasterGlyph> {
         if ppem <= 0.0 || !ppem.is_finite() || glyph > u32::from(u16::MAX) {
             return None;
@@ -91,10 +141,19 @@ impl GlyphRasterizer {
         let bytes = entry.font.data.data();
         let index = entry.font.index as usize;
         let swash_font = swash::FontRef::from_index(bytes, index)?;
-        let mut scaler = ctx.builder(swash_font).size(ppem).hint(true).build();
-        let image = Render::new(&[Source::Outline])
-            .format(Format::Alpha)
-            .render(&mut scaler, glyph as u16)?;
+        let mut builder = ctx.builder(swash_font).size(ppem).hint(true);
+        if !variation.is_identity() {
+            // 可变字体实例坐标必须与 parley 排版用的坐标一致（见 `GlyphVariation`）。
+            builder = builder.normalized_coords(variation.coords.iter());
+        }
+        let mut scaler = builder.build();
+        let mut render = Render::new(&[Source::Outline]);
+        render.format(Format::Alpha);
+        if variation.embolden > 0.0 {
+            // faux bold 是 `Render` 的变换参数（不是 `Scaler` 的）。
+            render.embolden(variation.embolden);
+        }
+        let image = render.render(&mut scaler, glyph as u16)?;
         Some(RasterGlyph {
             placement: image.placement,
             data: image.data,
@@ -133,7 +192,25 @@ pub(crate) fn probe_font() -> Option<parley::FontData> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GlyphRasterizer, probe_font};
+    use super::{GlyphRasterizer, GlyphVariation, probe_font};
+
+    /// P1：实例坐标必须参与缓存键（否则不同字重共用一个 tile）。
+    ///
+    /// faux bold 的 `Synthesis` 字段是私有的（只能由 parley 产出），因此这里只覆盖实例坐标；
+    /// faux bold 的路径由 `is_identity` 分支保证（提交里另有说明）。
+    #[test]
+    fn glyph_variation_distinguishes_instances() {
+        let plain = GlyphVariation::of(&[], Default::default(), 16.0);
+        let heavy = GlyphVariation::of(&[16_384], Default::default(), 16.0);
+        let heavier = GlyphVariation::of(&[-16_384], Default::default(), 16.0);
+        assert_ne!(plain.hash(), heavy.hash(), "实例坐标必须换 tile");
+        assert_ne!(heavy.hash(), heavier.hash(), "不同轴值必须换 tile");
+        assert_eq!(
+            plain.hash(),
+            GlyphVariation::of(&[], Default::default(), 16.0).hash(),
+            "相同参数必须命中同一 tile"
+        );
+    }
 
     #[test]
     fn raster_latin_glyph_produces_alpha_bytes() {
@@ -147,7 +224,7 @@ mod tests {
         };
         let mut raster = GlyphRasterizer::new();
         let image = raster
-            .rasterize(&font, u32::from(glyph), 16.0)
+            .rasterize(&font, u32::from(glyph), 16.0, &GlyphVariation::default())
             .expect("'A' must rasterize");
 
         assert!(image.placement.width > 0 && image.placement.height > 0);
@@ -174,10 +251,10 @@ mod tests {
         };
         let mut raster = GlyphRasterizer::new();
         let first = raster
-            .rasterize(&font, u32::from(glyph), 16.0)
+            .rasterize(&font, u32::from(glyph), 16.0, &GlyphVariation::default())
             .expect("first");
         let second = raster
-            .rasterize(&font, u32::from(glyph), 16.0)
+            .rasterize(&font, u32::from(glyph), 16.0, &GlyphVariation::default())
             .expect("second");
 
         assert_eq!(first.data, second.data);
@@ -210,10 +287,10 @@ mod tests {
         };
         let mut raster = GlyphRasterizer::new();
         let small = raster
-            .rasterize(&font, u32::from(glyph), 13.0)
+            .rasterize(&font, u32::from(glyph), 13.0, &GlyphVariation::default())
             .expect("13ppem");
         let large = raster
-            .rasterize(&font, u32::from(glyph), 26.0)
+            .rasterize(&font, u32::from(glyph), 26.0, &GlyphVariation::default())
             .expect("26ppem");
 
         assert!(
@@ -233,10 +310,12 @@ mod tests {
         let mut raster = GlyphRasterizer::new();
 
         assert!(
-            raster.rasterize(&font, 0, 0.0).is_none(),
+            raster
+                .rasterize(&font, 0, 0.0, &GlyphVariation::default())
+                .is_none(),
             "ppem 0 is rejected"
         );
-        let _ = raster.rasterize(&font, u32::from(u16::MAX), 16.0);
+        let _ = raster.rasterize(&font, u32::from(u16::MAX), 16.0, &GlyphVariation::default());
     }
 
     #[test]
@@ -246,7 +325,7 @@ mod tests {
             return;
         };
         let mut raster = GlyphRasterizer::new();
-        let _ = raster.rasterize(&font, 1, 16.0);
+        let _ = raster.rasterize(&font, 1, 16.0, &GlyphVariation::default());
         assert!(raster.cached_fonts() <= 1);
 
         raster.set_font_epoch(raster.font_epoch() + 1);

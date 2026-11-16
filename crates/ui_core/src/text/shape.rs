@@ -275,6 +275,21 @@ impl ShapedText {
                                 text_range: text_range.clone(),
                             });
                         }
+                        // 可变字体实例 + faux bold：光栅必须收到与 parley 排版一致的参数，
+                        // 否则可变字体（如 `Segoe UI Variable`）的粗体位图仍是常规字重。
+                        // parley 的坐标是 16.16 定点（`to_bits()` = 原始 i16，与
+                        // `swash::NormalizedCoord` 同表示）。
+                        let normalized_coords: Vec<i16> = run
+                            .run()
+                            .normalized_coords()
+                            .iter()
+                            .map(|coord| coord.to_bits())
+                            .collect();
+                        let variation = crate::text::raster::GlyphVariation::of(
+                            &normalized_coords,
+                            run.run().synthesis(),
+                            ppem,
+                        );
                         let mut glyphs = Vec::new();
                         for glyph in run.positioned_glyphs() {
                             if glyph.id == 0 {
@@ -285,7 +300,14 @@ impl ShapedText {
                                 });
                                 continue;
                             }
-                            let tile = glyph_atlas.ensure(raster, atlas, &font, glyph.id, ppem)?;
+                            let tile = glyph_atlas.ensure(
+                                raster,
+                                atlas,
+                                &font,
+                                glyph.id,
+                                ppem,
+                                Some(&variation),
+                            )?;
                             let Some(tile) = tile else {
                                 // 空白/无轮廓：不产生像素，advance 已由 parley 推进。
                                 continue;

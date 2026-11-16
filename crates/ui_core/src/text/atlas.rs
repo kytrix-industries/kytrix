@@ -16,6 +16,8 @@ pub(crate) struct GlyphKey {
     font: FontKey,
     glyph: u32,
     ppem: u32,
+    /// 实例坐标 / faux bold 的摘要（见 `GlyphVariation`）：同一字形的不同实例各占一个 tile。
+    variation: u64,
 }
 
 /// 一条缓存记录：tile + swash 的落点（位置要用 `top/left` 才算得出）。
@@ -83,11 +85,13 @@ impl GlyphAtlas {
         font: &parley::FontData,
         glyph: u32,
         ppem: f32,
+        variation: Option<&crate::text::raster::GlyphVariation>,
     ) -> Result<Option<GlyphTile>, EngineError> {
         let key = GlyphKey {
             font: FontKey::of(font, raster.font_epoch()),
             glyph,
             ppem: ppem.to_bits(),
+            variation: variation.map_or(0, crate::text::raster::GlyphVariation::hash),
         };
         if self.missing.contains(&key) {
             return Ok(None);
@@ -120,7 +124,12 @@ impl GlyphAtlas {
         }
         self.stats.misses += 1;
 
-        let Some(image) = raster.rasterize(font, glyph, ppem) else {
+        let Some(image) = raster.rasterize(
+            font,
+            glyph,
+            ppem,
+            variation.unwrap_or(&crate::text::raster::GlyphVariation::default()),
+        ) else {
             self.missing.insert(key);
             return Ok(None);
         };
@@ -309,8 +318,8 @@ mod tests {
         let mut atlas = tiny_glyph_atlas();
         let mut glyphs = GlyphAtlas::new();
 
-        let first = glyphs.ensure(&mut raster, &mut atlas, &font, 36, 16.0);
-        let second = glyphs.ensure(&mut raster, &mut atlas, &font, 36, 16.0);
+        let first = glyphs.ensure(&mut raster, &mut atlas, &font, 36, 16.0, None);
+        let second = glyphs.ensure(&mut raster, &mut atlas, &font, 36, 16.0, None);
         let first = first.expect("no error").expect("glyph has coverage");
         let second = second.expect("no error").expect("cached");
 
@@ -333,10 +342,10 @@ mod tests {
         let mut glyphs = GlyphAtlas::new();
 
         let small = glyphs
-            .ensure(&mut raster, &mut atlas, &font, 36, 13.0)
+            .ensure(&mut raster, &mut atlas, &font, 36, 13.0, None)
             .expect("ok");
         let large = glyphs
-            .ensure(&mut raster, &mut atlas, &font, 36, 26.0)
+            .ensure(&mut raster, &mut atlas, &font, 36, 26.0, None)
             .expect("ok");
         let (small, large) = (small.expect("13ppem"), large.expect("26ppem"));
 
@@ -359,13 +368,13 @@ mod tests {
         let mut glyphs = GlyphAtlas::new();
 
         let first = glyphs
-            .ensure(&mut raster, &mut atlas, &font, 36, 16.0)
+            .ensure(&mut raster, &mut atlas, &font, 36, 16.0, None)
             .expect("ok")
             .expect("coverage");
         atlas.clear();
         glyphs.clear();
         let second = glyphs
-            .ensure(&mut raster, &mut atlas, &font, 36, 16.0)
+            .ensure(&mut raster, &mut atlas, &font, 36, 16.0, None)
             .expect("ok")
             .expect("coverage");
 
@@ -382,12 +391,14 @@ mod tests {
         };
         let mut raster = GlyphRasterizer::new();
         let first_key = GlyphKey {
+            variation: 0,
             font: super::FontKey::of(&font, raster.font_epoch()),
             glyph: 36,
             ppem: 16.0f32.to_bits(),
         };
         raster.set_font_epoch(raster.font_epoch() + 1);
         let second_key = GlyphKey {
+            variation: 0,
             font: super::FontKey::of(&font, raster.font_epoch()),
             glyph: 36,
             ppem: 16.0f32.to_bits(),
@@ -409,7 +420,7 @@ mod tests {
         let old_generation = atlas.generation();
 
         let tile = glyphs
-            .ensure(&mut raster, &mut atlas, &font, 36, 16.0)
+            .ensure(&mut raster, &mut atlas, &font, 36, 16.0, None)
             .expect("growth must rescue the glyph")
             .expect("glyph has coverage");
 
