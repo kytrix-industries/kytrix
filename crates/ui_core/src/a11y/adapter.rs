@@ -299,6 +299,13 @@ pub(crate) fn to_accesskit(record: &crate::a11y::A11yNode) -> accesskit::Node {
     if let Some(value) = record.max_numeric_value {
         node.set_max_numeric_value(value);
     }
+    // 步进幅度：缺省时 accesskit_windows 的 `SmallChange` 取 0.0，AT 的「加一步」无效。
+    if let Some(value) = record.numeric_value_step {
+        node.set_numeric_value_step(value);
+    }
+    if let Some(value) = record.numeric_value_jump {
+        node.set_numeric_value_jump(value);
+    }
     // 表格 / 虚拟列表的行列语义（P2-7）：屏幕阅读器据此播报「第 N 行 / 共 M 行」并支持
     // 按行列导航。没声明就不写（AccessKit 的 `None` 与「0 行」语义不同）。
     if let Some(index) = record.row_index {

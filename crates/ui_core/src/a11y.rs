@@ -189,6 +189,9 @@ pub struct A11yOverride {
     pub numeric_value: Option<f64>,
     pub min_numeric_value: Option<f64>,
     pub max_numeric_value: Option<f64>,
+    /// 步进/跳转幅度（AT 的「加一步 / 加大步」用；缺省时 UIA 的 `SmallChange` 为 0）。
+    pub numeric_value_step: Option<f64>,
+    pub numeric_value_jump: Option<f64>,
     /// 补充说明（`aria-description` 语义）。
     pub description: Option<SmolStr>,
     /// 显式动作表；`None` ⇒ 按角色默认。
@@ -244,6 +247,9 @@ pub struct A11yPatch {
     pub numeric_value: Option<f64>,
     pub min_numeric_value: Option<f64>,
     pub max_numeric_value: Option<f64>,
+    /// 步进/跳转幅度（AT 的「加一步 / 加大步」用；缺省时 UIA 的 `SmallChange` 为 0）。
+    pub numeric_value_step: Option<f64>,
+    pub numeric_value_jump: Option<f64>,
     /// 覆盖动作表。
     pub actions: Option<Vec<A11yAction>>,
 }
@@ -340,6 +346,9 @@ pub struct A11yNode {
     pub numeric_value: Option<f64>,
     pub min_numeric_value: Option<f64>,
     pub max_numeric_value: Option<f64>,
+    /// 步进/跳转幅度（AT 的「加一步 / 加大步」用；缺省时 UIA 的 `SmallChange` 为 0）。
+    pub numeric_value_step: Option<f64>,
+    pub numeric_value_jump: Option<f64>,
     /// 引擎侧的**直接**子节点（未过滤）。
     pub children: Vec<A11yNodeId>,
     /// 父节点。

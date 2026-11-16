@@ -161,6 +161,12 @@ pub(crate) fn node_a11y(
         max_numeric_value: patch
             .and_then(|patch| patch.max_numeric_value)
             .or_else(|| over.and_then(|over| over.max_numeric_value)),
+        numeric_value_step: patch
+            .and_then(|patch| patch.numeric_value_step)
+            .or_else(|| over.and_then(|over| over.numeric_value_step)),
+        numeric_value_jump: patch
+            .and_then(|patch| patch.numeric_value_jump)
+            .or_else(|| over.and_then(|over| over.numeric_value_jump)),
         row_index: patch
             .and_then(|patch| patch.row_index)
             .or_else(|| over.and_then(|over| over.row_index)),
@@ -282,6 +288,8 @@ mod tests {
                 numeric_value: Some(37.0),
                 min_numeric_value: Some(0.0),
                 max_numeric_value: Some(100.0),
+                numeric_value_step: Some(1.0),
+                numeric_value_jump: Some(10.0),
                 ..crate::a11y::A11yOverride::default()
             })
             .build(&mut tree, root)
@@ -295,6 +303,8 @@ mod tests {
         assert_eq!(ak.numeric_value(), Some(37.0));
         assert_eq!(ak.min_numeric_value(), Some(0.0));
         assert_eq!(ak.max_numeric_value(), Some(100.0));
+        assert_eq!(ak.numeric_value_step(), Some(1.0));
+        assert_eq!(ak.numeric_value_jump(), Some(10.0));
     }
     /// P2-7：静态声明的行/列语义必须出现在快照里（虚拟列表 / 表格播报依赖它）。
     #[test]
