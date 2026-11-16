@@ -2885,7 +2885,7 @@ x86_64-unknown-linux-gnu，后者按 V-04 的 pkg-config stub）exit 0。
 常驻内存基本不变。demo 截图逐项复核正常（CJK 简/繁/日/韩、PNG 图标、色块、HUD），交互复核
 （点击色块 → 选中文案更新、焦点环、F12 切换 HUD）也正常。
 
-### 37.2.1 三平台复测（同一提交 6d1be1a，demo `--features hud`，1200×925 物理内容）
+### 37.2.1 三平台复测（内存表为 b186019 实测；最终修复提交 2885dfa）
 
 | 平台 / 指标                     | 改前     | 最终        | Δ          |
 |---------------------------------|----------|-------------|------------|
@@ -2897,11 +2897,14 @@ x86_64-unknown-linux-gnu，后者按 V-04 的 pkg-config stub）exit 0。
 | Linux（lavapipe）RSS            | 157 MB   | **132.6 MB** | −24.4 MB   |
 | Linux（lavapipe）Pss            | 101 MB   | **82.4 MB**  | −18.6 MB   |
 
-（「最终」= 批次 A–E 全部落地后的提交 f57d739；Windows 另有 `VirtualQueryEx` 私有已提交 94.6 MB /
-`PAGE_NOCACHE` 35.1 MB，较改前的 195.2 MB / 88.3 MB 分别 −100.6 MB / −53.2 MB。）
+（「最终」= 批次 A–E 全部落地后的提交 f57d739 的实测；对抗审查的修复批次 2885dfa 不改变 demo
+（512² 页）的常驻量级，另把图集 staging 的常驻上限压到 1 MiB/槽（F-216）。Windows 另有
+`VirtualQueryEx` 私有已提交 94.6 MB / `PAGE_NOCACHE` 35.1 MB，较改前的 195.2 MB / 88.3 MB
+分别 −100.6 MB / −53.2 MB。）
 
-三平台测试：Windows 803 lib + 62 其他；macOS 734 lib + 62；Linux 735 lib + 62，全部 0 failed
-（macOS / Linux 实机跑 `cargo test -p ui_core --features "hud,test-support"`，Linux 用
+三平台测试（修复提交 2885dfa）：Windows **812 lib + 62 其他**；macOS **738 lib + 62**；
+Linux **739 lib + 62**，全部 0 failed（macOS / Linux 实机跑
+`cargo test -p ui_core --features "hud,test-support"`，Linux 用
 `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json` + headless sway）。
 
 
