@@ -58,6 +58,12 @@ use crate::{
 /// a11y 诊断的环形容量（与 `text_diagnostics` 同口径：超出丢最旧）。
 const A11Y_DIAGNOSTIC_CAPACITY: usize = 64;
 
+/// a11y 交付的最小间隔（按窗口；P2-6）。
+///
+/// 100 ms 对应 10 Hz：屏幕阅读器自身也消化不了更快的变化，而实时行情会让 A11Y`r
+/// 脏位每帧为真 —— 不限流时每帧都要全树扫描并构造 TreeUpdate。
+const A11Y_THROTTLE: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// 一次样式求值 pass 的结果（P06 的 `FrameRecord` 会复用这些字段）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StylePassReport {
@@ -133,6 +139,12 @@ pub struct App {
     thresholds: InputThresholds,
     /// 引擎时钟（生产由平台每轮 `sync_clock`，测试由 `TestApp::advance` 推进）。
     clock: Instant,
+    /// 每个窗口最近一次 a11y 交付的时钟值（节流用，P2-6）。
+    ///
+    /// 高频实时数据（行情数字）会让 A11Y 脏位每帧都为真，而每次交付都要全树扫描 +
+    /// TreeUpdate 构造。按窗口限流到 A11Y_THROTTLE 一次，屏幕阅读器本身也消化不了
+    /// 更快的变化。Assertive live region 同样受此限制（≤100ms 延迟，可接受）。
+    a11y_delivered: ahash::HashMap<WindowId, Instant>,
     /// 最近一次点击（双击判定）。
     last_click: Option<ClickRecord>,
     /// 动画槽（P10；`tick_animations` 推进，结束时删槽）。
@@ -358,6 +370,7 @@ impl App {
             bindings: default_bindings(),
             thresholds: InputThresholds::default(),
             clock: Instant::now(),
+            a11y_delivered: ahash::HashMap::default(),
             last_click: None,
             animations: Vec::new(),
             next_animation: 1,
@@ -2754,7 +2767,12 @@ impl App {
     /// 该窗口本轮是否有 a11y 工作（O(1)；平台泵每轮用它过滤 `update_if_active`）。
     #[must_use]
     pub(crate) fn a11y_pending(&self, window: WindowId) -> bool {
-        self.windows.get(&window).is_some_and(Window::a11y_pending)
+        let dirty = self.windows.get(&window).is_some_and(Window::a11y_pending);
+        dirty
+            && self
+                .a11y_delivered
+                .get(&window)
+                .is_none_or(|last| self.clock.saturating_duration_since(*last) >= A11Y_THROTTLE)
     }
 
     /// 产出一笔 a11y 交付（消费 `A11Y|ORDER` 位与 `full_pending`）。
@@ -2769,6 +2787,9 @@ impl App {
         };
         for diagnostic in diagnostics {
             self.a11y_note(diagnostic);
+        }
+        if snapshot.is_some() {
+            self.a11y_delivered.insert(window, self.clock);
         }
         snapshot
     }
@@ -4257,6 +4278,38 @@ mod tests {
         let _ = derived;
     }
 
+    /// P2-6：a11y 交付按窗口限流，且时间窗过后继续交付。
+    ///
+    /// 实时行情会让 `A11Y` 脏位每帧为真；不限流时每帧都要全树扫描 + 构造 `TreeUpdate`。
+    #[test]
+    fn a11y_delivery_is_throttled_per_window() {
+        let (_rt, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        let root = app.window(window).expect("窗口").tree().root();
+        let node = NodeBuilder::boxed()
+            .build(app.window_mut(window).expect("窗口").tree_mut(), root)
+            .expect("挂载");
+        app.refresh_styles(window).expect("窗口存在");
+
+        assert!(app.a11y_pending(window), "首次交付不受限流影响");
+        assert!(app.a11y_take(window).is_some(), "应产出一笔交付");
+
+        // 立刻再标脏：仍在时间窗内 ⇒ 不交付。
+        app.window_mut(window)
+            .expect("窗口")
+            .tree_mut()
+            .mark_a11y(node);
+        assert!(
+            !app.a11y_pending(window),
+            "时间窗内不得再次交付（高频更新会变成每帧全树扫描）"
+        );
+
+        // 推过时间窗 ⇒ 恢复交付。
+        app.advance_clock(std::time::Duration::from_millis(150));
+        assert!(app.a11y_pending(window), "时间窗过后必须继续交付");
+        let _ = app.a11y_take(window);
+        let _ = node;
+    }
     #[test]
     fn changed_text_marks_a11y() {
         // 文本节点的可访问名/值 = 文本内容。只标 PAINT 时，"70%" → "80%" 这种等宽替换不会触发
