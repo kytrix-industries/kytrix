@@ -56,7 +56,6 @@ struct WindowMirror {
 
 /// `Application::run` 的平台入口。
 pub(crate) fn run(app: App) -> Result<(), EngineError> {
-    let mut app = app;
     let dispatcher = app.dispatcher();
     // 唤醒句柄由本平台的 `wake::install` 安装；`attach` 的 token 只对 Win32 有意义。
     dispatcher.attach(1);
@@ -73,6 +72,12 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
     let (mut state, mut queue) = WaylandState::new(first_size, first_title.as_str(), first_id)?;
     surface::initial_roundtrip(&mut queue, &mut state)?;
     surface::create_devices(&mut state)?;
+    // **`app` 必须作为局部变量声明在 `state` 之后**：Rust 的局部变量按声明逆序析构，而函数
+    // 参数最后析构。旧实现在第一行 `let mut app = app;`，于是 panic 展开时 `state`
+    // （`wl_surface` / `xdg_toplevel` 等协议对象）**先于** `app`（`Window → Renderer`）释放，
+    // GPU 线程随后对已销毁的 surface 调 `wp_viewport.destroy()` / present（V-122 ⑨ 的
+    // 展开路径缺口）。声明顺序改对之后，展开时 `app` 先析构、渲染器 join 早于协议对象销毁。
+    let mut app = app;
 
     // 下面直到 `WaylandSource` 的 setup 全都可以失败，必须排在**任何渲染器创建之前**：
     // `WaylandState` 持有 `wl_surface` / `wl_display`，而 renderer 的 Vulkan WSI surface /
