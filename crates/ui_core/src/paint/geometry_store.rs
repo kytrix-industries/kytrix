@@ -27,8 +27,8 @@
 //! # 代际校验
 //!
 //! 槽位复用后代际 +1，旧句柄永久失效。渲染层查表时必须**同时**比对 index 与 generation
-//! （[`GeometryStore::get`] 已做），否则释放后再注册会让旧图元画成新几何 —— 这是静默的
-//! 视觉错误，不是崩溃。
+//! （各后端的 `GeometryRegistry` 缓存键就是 `(index, generation)`），否则释放后再注册会让旧图元
+//! 画成新几何 —— 这是静默的视觉错误，不是崩溃。
 
 use smol_str::{SmolStr, format_smolstr};
 
