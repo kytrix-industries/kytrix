@@ -209,10 +209,10 @@ struct WindowSurface {
     ime_cursor_area: Option<Rect>,
     /// 最近一次实际下发给 `zwp_text_input_v3` 的区域（含 None 回退）。
     ime_cursor_applied: Option<Rect>,
-    /// 分数缩放（v1 只读 `preferred_scale`；对象必须保活）。
+    /// 分数缩放对象：只为保活 + 按它路由 `PreferredScale`（该事件不告诉我们是哪个窗口）。
     ///
     /// 只有 `wp_viewporter` 也存在时才创建（否则走整数回退，V-110）。
-    _fractional: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
+    fractional: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
     /// 分数缩放的落地窗口（`set_destination` 让 compositor 做非整数缩放，D-5）。
     ///
     /// 建窗后移交给窗口渲染器（[`WaylandState::take_viewport`]）：destination 必须与 buffer 在
@@ -228,6 +228,25 @@ struct WindowSurface {
     _decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
     size: Size,
     scale: Scale,
+    /// 本 surface 已 enter 的 output 对象 id（enter / leave 成对；整数回退取其中最大 scale）。
+    surface_outputs: Vec<ObjectId>,
+    /// `wl_surface.preferred_buffer_scale`（surface v6；收到时优先于 output scale）。
+    preferred_buffer_scale: Option<i32>,
+    /// `wp_fractional_scale_v1.preferred_scale`（120 分之几；只有 fractional 模式才会收到）。
+    ///
+    /// 未收到时回落到整数 scale（`preferred_buffer_scale` / 已 enter 的最大值 / 首次 enter 前
+    /// 全部已绑定的最大值 / 上一个整数 scale）。
+    fractional_scale_120: Option<u32>,
+    /// 当前整数回退 scale（初始 1；每次 `recompute_scale` 推进）。
+    ///
+    /// 独立于 `scale` 保存：leave 清空 entered 列表后要保留上一个值，否则窗口最小化 /
+    /// 切工作区时会从 1× 跳到大屏的 2×、恢复时再跳回，产生两次无意义的全量重排（V-110）。
+    integer_scale: i32,
+    /// 是否收到过至少一个 `wl_surface.enter`（一旦为 `true` 就保持）。
+    ///
+    /// enter 之前整数 scale 用「全部已绑定 output 的最大值」做保守估计；enter 之后若列表为空
+    /// （最小化 / 切工作区）保留上一个值，不再回退到 bound 最大值。
+    entered_once: bool,
     focused: bool,
     configured: bool,
     /// 最近一次 configure 的 `Maximized` 状态（自绘标题栏的切换按钮据此选择 set/unset）。
@@ -272,25 +291,6 @@ pub(crate) struct WaylandState {
     text_input: Option<ZwpTextInputV3>,
     /// 已绑定的 `wl_output`（容量 2：常见单 / 双屏；多屏时扩容，O(n) 扫描无所谓）。
     outputs: Vec<OutputEntry>,
-    /// 本 surface 已 enter 的 output 对象 id（enter / leave 成对；整数回退取其中最大 scale）。
-    surface_outputs: Vec<ObjectId>,
-    /// `wl_surface.preferred_buffer_scale`（surface v6；收到时优先于 output scale）。
-    preferred_buffer_scale: Option<i32>,
-    /// `wp_fractional_scale_v1.preferred_scale`（120 分之几；只有 fractional 模式才会收到）。
-    ///
-    /// 未收到时回落到整数 scale（`preferred_buffer_scale` / 已 enter 的最大值 / 首次 enter 前
-    /// 全部已绑定的最大值 / 上一个整数 scale）。
-    fractional_scale_120: Option<u32>,
-    /// 当前整数回退 scale（初始 1；每次 [`WaylandState::recompute_scale`] 推进）。
-    ///
-    /// 独立于 [`Self::scale`] 保存：leave 清空 entered 列表后要保留上一个值，否则窗口最小化 /
-    /// 切工作区时会从 1× 跳到大屏的 2×、恢复时再跳回，产生两次无意义的全量重排（V-110）。
-    integer_scale: i32,
-    /// 是否收到过至少一个 `wl_surface.enter`（一旦为 `true` 就保持）。
-    ///
-    /// enter 之前整数 scale 用「全部已绑定 output 的最大值」做保守估计；enter 之后若列表为空
-    /// （最小化 / 切工作区）保留上一个值，不再回退到 bound 最大值。
-    entered_once: bool,
     ime: ImeState,
     clipboard: Clipboard,
     xkb_context: xkb::Context,
@@ -428,7 +428,7 @@ impl WaylandState {
                 toplevel,
                 ime_cursor_area: None,
                 ime_cursor_applied: None,
-                _fractional: fractional,
+                fractional,
                 viewport,
                 uses_viewport,
                 _decoration: decoration,
@@ -437,6 +437,11 @@ impl WaylandState {
                 // 整数倍（否则 `wl_surface.attach` 报 `invalid_size`，V-110）。
                 size: Size::new(size.width.round().max(1.0), size.height.round().max(1.0)),
                 scale: Scale::ONE,
+                surface_outputs: Vec::with_capacity(2),
+                preferred_buffer_scale: None,
+                fractional_scale_120: None,
+                integer_scale: 1,
+                entered_once: false,
                 focused: false,
                 configured: false,
                 maximized: false,
@@ -457,9 +462,6 @@ impl WaylandState {
             _data_device: data_device,
             text_input,
             outputs: Vec::with_capacity(2),
-            surface_outputs: Vec::with_capacity(2),
-            preferred_buffer_scale: None,
-            fractional_scale_120: None,
             ime: ImeState::new(),
             clipboard,
             xkb_context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
@@ -473,8 +475,6 @@ impl WaylandState {
             held_keys: Vec::new(),
             scroll: ScrollAccum::default(),
             pointer_pos: Point::new(0.0, 0.0),
-            integer_scale: 1,
-            entered_once: false,
         };
         // 启动时绑定所有现存 `wl_output`：`initial_roundtrip` 的 2 次 roundtrip 会带回它们的
         // `wl_output.scale`，整数回退的首帧因此能按「全部已绑定 output 的最大 scale」兜底
@@ -531,8 +531,20 @@ impl WaylandState {
         if entry.output.version() >= 3 {
             entry.output.release();
         }
-        self.surface_outputs.retain(|entered| *entered != id);
-        self.recompute_scale();
+        for index in 0..self.windows.len() {
+            self.windows[index]
+                .surface_outputs
+                .retain(|entered| *entered != id);
+        }
+        // 一个 output 消失会影响**所有** enter 过它的窗口，逐个重算。
+        self.recompute_all_scales();
+    }
+
+    /// 对所有窗口重算 scale（`wl_output` 层面的变化：output 移除 / output 的 scale 改变）。
+    fn recompute_all_scales(&mut self) {
+        for index in 0..self.windows.len() {
+            self.recompute_scale(index);
+        }
     }
 
     /// 整数回退当前应取的 scale（[`choose_integer_scale`] 的输入来自本状态）。
@@ -540,42 +552,49 @@ impl WaylandState {
     /// `wl_surface.enter` 要等 surface 首次 attach/commit 之后才到，而首帧前已绑定的
     /// `wl_output.scale` 已经可用（sway 在 1.25 / 1.5 / 1.75 下都报 2），所以 `entered_once ==
     /// false` 时退到全部已绑定 output 的最大值；一旦收到过 enter，列表为空（最小化 / 切工作区）
-    /// 就保留 `self.integer_scale`，避免虚假的 1× ↔ 2× 抖动。
-    fn integer_scale_value(&self) -> i32 {
+    /// 就保留 `self.windows[self.active].integer_scale`，避免虚假的 1× ↔ 2× 抖动。
+    fn integer_scale_value(&self, index: usize) -> i32 {
         let entered_max = self
             .outputs
             .iter()
-            .filter(|entry| self.surface_outputs.contains(&entry.output.id()))
+            .filter(|entry| {
+                self.windows[index]
+                    .surface_outputs
+                    .contains(&entry.output.id())
+            })
             .map(|entry| entry.scale)
             .max();
         let bound_max = self.outputs.iter().map(|entry| entry.scale).max();
         choose_integer_scale(
-            self.preferred_buffer_scale,
+            self.windows[index].preferred_buffer_scale,
             entered_max,
             bound_max,
-            self.integer_scale,
-            self.entered_once,
+            self.windows[index].integer_scale,
+            self.windows[index].entered_once,
         )
     }
 
     /// 当前生效的 scale：fractional 模式下用 `preferred_scale`（未收到时回落到整数 scale），
     /// 否则就是整数回退的当前值。
-    fn effective_scale(&self) -> Scale {
-        let fractional = if self.windows[self.active].uses_viewport {
-            self.fractional_scale_120
+    fn effective_scale(&self, index: usize) -> Scale {
+        let fractional = if self.windows[index].uses_viewport {
+            self.windows[index]
+                .fractional_scale_120
                 .and_then(|scale| dpi::scale_from_120(scale).ok())
         } else {
             None
         };
-        fractional.unwrap_or_else(|| Scale::new(self.integer_scale as f32).expect("positive"))
+        fractional.unwrap_or_else(|| {
+            Scale::new(self.windows[index].integer_scale as f32).expect("positive")
+        })
     }
 
     /// 先推进整数回退的当前值，再按 effective scale 更新 `self.windows[self.active].scale` 并排队
     /// `Event::DpiChanged`（事件循环随后 `set_scale` / `set_surface` 并出帧）。
-    fn recompute_scale(&mut self) {
-        self.integer_scale = self.integer_scale_value();
-        let scale = self.effective_scale();
-        if scale == self.windows[self.active].scale {
+    fn recompute_scale(&mut self, index: usize) {
+        self.windows[index].integer_scale = self.integer_scale_value(index);
+        let scale = self.effective_scale(index);
+        if scale == self.windows[index].scale {
             return;
         }
         self.windows[self.active].scale = scale;
@@ -593,7 +612,7 @@ impl WaylandState {
         if self.windows[self.active].uses_viewport {
             1
         } else {
-            self.integer_scale
+            self.windows[self.active].integer_scale
         }
     }
 
@@ -1074,7 +1093,7 @@ impl Dispatch<wl_output::WlOutput, u32> for WaylandState {
             if let Some(entry) = state.outputs.iter_mut().find(|entry| entry.name == *name) {
                 entry.scale = factor.max(1);
             }
-            state.recompute_scale();
+            state.recompute_all_scales();
         }
     }
 }
@@ -1122,21 +1141,23 @@ impl Dispatch<wl_surface::WlSurface, ()> for WaylandState {
         match event {
             wl_surface::Event::Enter { output } => {
                 let id = output.id();
-                if !state.surface_outputs.contains(&id) {
-                    state.surface_outputs.push(id);
+                if !state.windows[index].surface_outputs.contains(&id) {
+                    state.windows[index].surface_outputs.push(id);
                 }
                 // 从这一刻起整数 scale 只信已 enter 的 output（为空时保留上一个值）。
-                state.entered_once = true;
-                state.recompute_scale();
+                state.windows[index].entered_once = true;
+                state.recompute_scale(index);
             }
             wl_surface::Event::Leave { output } => {
                 let id = output.id();
-                state.surface_outputs.retain(|entered| *entered != id);
-                state.recompute_scale();
+                state.windows[index]
+                    .surface_outputs
+                    .retain(|entered| *entered != id);
+                state.recompute_scale(index);
             }
             wl_surface::Event::PreferredBufferScale { factor } => {
-                state.preferred_buffer_scale = Some(factor.max(1));
-                state.recompute_scale();
+                state.windows[index].preferred_buffer_scale = Some(factor.max(1));
+                state.recompute_scale(index);
             }
             _ => {}
         }
@@ -1249,7 +1270,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandState {
 impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for WaylandState {
     fn event(
         state: &mut Self,
-        _: &wp_fractional_scale_v1::WpFractionalScaleV1,
+        fractional: &wp_fractional_scale_v1::WpFractionalScaleV1,
         event: wp_fractional_scale_v1::Event,
         _: &(),
         _: &Connection,
@@ -1258,8 +1279,17 @@ impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for WaylandState 
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event
             && scale != 0
         {
-            state.fractional_scale_120 = Some(scale);
-            state.recompute_scale();
+            // 归属按对象解析（每个窗口有自己的 `wp_fractional_scale_v1`）。
+            let id = fractional.id();
+            let Some(index) = state
+                .windows
+                .iter()
+                .position(|window| window.fractional.as_ref().is_some_and(|f| f.id() == id))
+            else {
+                return;
+            };
+            state.windows[index].fractional_scale_120 = Some(scale);
+            state.recompute_scale(index);
         }
     }
 }
