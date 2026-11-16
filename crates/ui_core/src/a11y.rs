@@ -171,6 +171,13 @@ pub struct A11yOverride {
     pub column_index: Option<usize>,
     pub row_count: Option<usize>,
     pub column_count: Option<usize>,
+    /// 数值通道（`Slider` / `ProgressIndicator` / `ScrollBar` 等，P2-8）。
+    ///
+    /// 屏幕阅读器播报的是**数值**（"50，最大 100"），UIA 的 `RangeValuePattern` 直接读这几个
+    /// 字段；只给字符串 `value` 时滑块既不可调节也不播报数值。
+    pub numeric_value: Option<f64>,
+    pub min_numeric_value: Option<f64>,
+    pub max_numeric_value: Option<f64>,
     /// 补充说明（`aria-description` 语义）。
     pub description: Option<SmolStr>,
     /// 显式动作表；`None` ⇒ 按角色默认。
@@ -215,6 +222,10 @@ pub struct A11yPatch {
     pub selected: Option<bool>,
     /// 展开（`None` = 不表态）。
     pub expanded: Option<bool>,
+    /// 数值通道（滑块 / 进度 / 滚动条的数值与范围，P2-8）。
+    pub numeric_value: Option<f64>,
+    pub min_numeric_value: Option<f64>,
+    pub max_numeric_value: Option<f64>,
     /// 覆盖动作表。
     pub actions: Option<Vec<A11yAction>>,
 }
@@ -284,6 +295,13 @@ pub struct A11yNode {
     pub column_index: Option<usize>,
     pub row_count: Option<usize>,
     pub column_count: Option<usize>,
+    /// 数值通道（`Slider` / `ProgressIndicator` / `ScrollBar` 等，P2-8）。
+    ///
+    /// 屏幕阅读器播报的是**数值**（"50%，最大 100"）而不是字符串，且 UIA 的
+    /// `RangeValuePattern` 直接读这几个字段；只给 `value` 文本时滑块不可调节也不播报。
+    pub numeric_value: Option<f64>,
+    pub min_numeric_value: Option<f64>,
+    pub max_numeric_value: Option<f64>,
     /// 引擎侧的**直接**子节点（未过滤）。
     pub children: Vec<A11yNodeId>,
     /// 父节点。

@@ -137,6 +137,15 @@ pub(crate) fn node_a11y(
         selected: patch.and_then(|patch| patch.selected),
         expanded: patch.and_then(|patch| patch.expanded),
         // 行列语义：静态声明优先，其次动态补丁（与 role / label 的合并方向一致）。
+        numeric_value: over
+            .and_then(|over| over.numeric_value)
+            .or_else(|| patch.and_then(|patch| patch.numeric_value)),
+        min_numeric_value: over
+            .and_then(|over| over.min_numeric_value)
+            .or_else(|| patch.and_then(|patch| patch.min_numeric_value)),
+        max_numeric_value: over
+            .and_then(|over| over.max_numeric_value)
+            .or_else(|| patch.and_then(|patch| patch.max_numeric_value)),
         row_index: over
             .and_then(|over| over.row_index)
             .or_else(|| patch.and_then(|patch| patch.row_index)),
@@ -206,6 +215,34 @@ mod tests {
         (root, parent, child)
     }
 
+    /// P2-8：滑块的数值通道必须同时进快照与 accesskit 节点。
+    ///
+    /// UIA 的 `RangeValuePattern` 读的是 accesskit 那一层；只给字符串值时不播报也不行调节。
+    #[test]
+    fn numeric_value_reaches_the_accesskit_node() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let slider = NodeBuilder::boxed()
+            .a11y(crate::a11y::A11yOverride {
+                role: Some(crate::a11y::A11yRole::Slider),
+                label: Some(smol_str::SmolStr::new_static("volume")),
+                numeric_value: Some(37.0),
+                min_numeric_value: Some(0.0),
+                max_numeric_value: Some(100.0),
+                ..crate::a11y::A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("slider");
+        let mut diagnostics = Vec::new();
+        let node = super::node_a11y(&tree, slider, crate::math::Scale::ONE, "", &mut diagnostics)
+            .expect("snapshot");
+        assert_eq!(node.numeric_value, Some(37.0));
+        assert_eq!(node.max_numeric_value, Some(100.0));
+        let ak = crate::a11y::adapter::to_accesskit(&node);
+        assert_eq!(ak.numeric_value(), Some(37.0));
+        assert_eq!(ak.min_numeric_value(), Some(0.0));
+        assert_eq!(ak.max_numeric_value(), Some(100.0));
+    }
     /// P2-7：静态声明的行/列语义必须出现在快照里（虚拟列表 / 表格播报依赖它）。
     #[test]
     fn row_and_column_semantics_come_from_the_static_override() {
