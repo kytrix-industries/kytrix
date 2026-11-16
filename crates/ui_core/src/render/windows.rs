@@ -4,7 +4,9 @@
 //! （workspace lint `definition_in_module_root`）。
 //!
 //! - [`renderer`]：窗口门面 + 每窗口一条 `kytrix-d3d12` GPU 线程（`design/async-render-pipeline.md` §6）。
-//! - [`compositor`]：GPU 线程独占的 `GpuRenderer`（device / queue / swapchain / persist / 录制）。
+//! - [`compositor`]：`GpuRenderer`，**两层**持有 —— 进程级共享部分（`SharedGpu`：设备 /
+//!   命令队列 / 根签名 + PSO / 共享图集纹理）与每窗口部分（swapchain / DirectComposition
+//!   对象 / persist 内容 / 提交流 / fence），见 `design/phase-08-d3d12.md` §5。
 //!
 //! 设计见 `design/phase-08-d3d12.md` §5、`design/async-render-pipeline.md` §6。
 
