@@ -669,7 +669,7 @@ impl GpuRenderer {
         }
         if self.atlas.has_pending() {
             self.atlas
-                .record_uploads(&mut self.device, index, command)?;
+                .record_uploads(&mut self.device, index, slot.index, command)?;
         }
 
         let full = frame.is_full();

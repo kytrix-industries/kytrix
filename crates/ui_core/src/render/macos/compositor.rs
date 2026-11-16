@@ -385,9 +385,15 @@ impl GpuRenderer {
             let blit = command
                 .blitCommandEncoder()
                 .ok_or_else(|| init_error("blitCommandEncoder(atlas)", "returned nil"))?;
-            // 上传缓冲以本帧序号进入 retire：在飞帧的 staging 不会被下一帧覆盖（见 `atlas.rs`）。
-            self.atlas
-                .record_uploads(&mut self.device, &mut self.queue, index, &blit)?;
+            // 每 in-flight 槽一块常驻 staging（DEVIATIONS F-212）：槽位复用由三槽 semaphore
+            // 保证「上一帧已完成」，因此覆盖写安全。
+            self.atlas.record_uploads(
+                &mut self.device,
+                &mut self.queue,
+                index,
+                slot.index,
+                &blit,
+            )?;
             blit.endEncoding();
         }
         {

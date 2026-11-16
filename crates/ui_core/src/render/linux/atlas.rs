@@ -15,8 +15,8 @@ use crate::{
     paint::atlas::AtlasKind,
     render::{
         atlas::{AtlasRebuilt, DirtyRows, texel_bytes},
+        frame::MAX_FRAMES_IN_FLIGHT,
         linux::device::{Device, GpuObject, init_error},
-        retire::GpuResourceHandle,
     },
     window::FrameIndex,
 };
@@ -28,6 +28,9 @@ const PLACEHOLDER_PAGE: u32 = 1;
 struct AtlasTexture {
     kind: AtlasKind,
     image: vk::Image,
+    /// 每 in-flight 槽一块常驻 staging（DEVIATIONS F-212）：槽位复用由 `wait_slot` 保证
+    /// 「上一帧已完成」，因此覆盖写安全；扩容时旧缓冲按帧序号 retire。
+    staging: [Option<StagingRing>; MAX_FRAMES_IN_FLIGHT],
     /// image 的设备内存（与 `image` 成对释放）。
     memory: vk::DeviceMemory,
     view: vk::ImageView,
@@ -144,14 +147,15 @@ impl AtlasTextures {
         &mut self,
         device: &mut Device,
         index: FrameIndex,
+        slot: usize,
         command: vk::CommandBuffer,
     ) -> Result<(), EngineError> {
         let glyph_full = std::mem::take(&mut self.force_full[0]);
         self.glyph
-            .record_upload(device, index, command, glyph_full)?;
+            .record_upload(device, index, slot, command, glyph_full)?;
         let image_full = std::mem::take(&mut self.force_full[1]);
         self.image
-            .record_upload(device, index, command, image_full)?;
+            .record_upload(device, index, slot, command, image_full)?;
         Ok(())
     }
 }
@@ -178,6 +182,7 @@ impl AtlasTexture {
         Ok(Self {
             kind,
             image,
+            staging: std::array::from_fn(|_| None),
             memory,
             view,
             sampler,
@@ -207,6 +212,7 @@ impl AtlasTexture {
         &mut self,
         device: &mut Device,
         index: FrameIndex,
+        slot: usize,
         command: vk::CommandBuffer,
         force_full: bool,
     ) -> Result<(), EngineError> {
@@ -237,15 +243,22 @@ impl AtlasTexture {
             return Ok(());
         }
         let length = total_rows as usize * row_bytes;
-        // 一次性 staging 装本帧所有段；缓冲在 `index` 完成之前不得释放。
-        let staging = OneShotStaging::new(device, length as u64)?;
-        if let Err(error) = staging.write(device, 0, &pending.pixels, length) {
-            // 这一帧不会再 submit（录制被错误中止）：它的序号永远不会出现在 timeline 上，
-            // `drain_retire(last_index)` 到不了这里。仍按正常生命周期 retire，由 teardown 的
-            // [`Device::drain_all_retired`] 兜底释放（map 失败 / 录制后失败 / device lost 同路）。
-            staging.retire(device, index);
-            return Err(error);
+        // 每槽常驻 staging（持久映射）：容量够就复用，不够才重建并 retire 旧缓冲。
+        self.ensure_staging(device, index, slot, length)?;
+        {
+            let ring = self.staging[slot]
+                .as_ref()
+                .expect("ensure_staging must fill the slot");
+            // SAFETY: 映射在创建时常驻，`length` 不超过容量；`pending.pixels` 长度已由
+            // `queue_upload` 校验。
+            unsafe {
+                std::ptr::copy_nonoverlapping(pending.pixels.as_ptr(), ring.ptr, length);
+            }
         }
+        let staging_buffer = self.staging[slot]
+            .as_ref()
+            .expect("ensure_staging must fill the slot")
+            .buffer;
 
         let range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -280,7 +293,7 @@ impl AtlasTexture {
                 let rows = span.end - span.start;
                 device.raw().cmd_copy_buffer_to_image(
                     command,
-                    staging.buffer,
+                    staging_buffer,
                     self.image,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     &[vk::BufferImageCopy::default()
@@ -324,10 +337,33 @@ impl AtlasTexture {
                 &[to_sampled],
             );
         }
-        // GPU 读这块 staging 的 copy 与本帧提交同生命周期：帧完成（timeline 的连续完成前沿
-        // 到达 `index`）之前不得释放，因此只登记句柄（I4）。
-        staging.retire(device, index);
         self.initialized = true;
+        Ok(())
+    }
+
+    /// 保证第 `slot` 个 staging 至少 `bytes` 字节；扩容时旧缓冲按 `index` retire。
+    fn ensure_staging(
+        &mut self,
+        device: &mut Device,
+        index: FrameIndex,
+        slot: usize,
+        bytes: usize,
+    ) -> Result<(), EngineError> {
+        if self.staging[slot]
+            .as_ref()
+            .is_some_and(|ring| ring.capacity >= bytes as u64)
+        {
+            return Ok(());
+        }
+        let ring = StagingRing::new(device, bytes as u64)?;
+        if let Some(old) = self.staging[slot].replace(ring) {
+            // SAFETY: 解除旧映射；GPU 对缓冲的访问不受 unmap 影响。
+            unsafe { device.raw().unmap_memory(old.memory) };
+            let handle = device.allocate(GpuObject::Buffer(old.buffer));
+            device.retire(index, handle);
+            let handle = device.allocate(GpuObject::Memory(old.memory));
+            device.retire(index, handle);
+        }
         Ok(())
     }
 
@@ -454,16 +490,22 @@ fn create_page(
 ///
 /// 两个句柄以 `GpuResourceHandle` 的形式进入设备的 retire 队列：真正的 `vkDestroyBuffer` /
 /// `vkFreeMemory` 由 timeline 完成推进触发，Atlas 不再持有跨帧的 staging 状态。
-struct OneShotStaging {
+/// 每 in-flight 槽一块常驻 staging（host-visible、持久映射）。
+struct StagingRing {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
-    buffer_handle: GpuResourceHandle,
-    memory_handle: GpuResourceHandle,
+    capacity: u64,
+    /// 持久映射的写入指针（创建时 `map_memory` 一次，扩容/销毁时 `unmap_memory`）。
+    ptr: *mut u8,
 }
 
-impl OneShotStaging {
+// SAFETY: `ptr` 只在 `kytrix-vulkan` GPU 线程上写入（`GpuRenderer` 整体独占该线程），
+// 与 `Map` 一次、长期写的用法一致。
+unsafe impl Send for StagingRing {}
+
+impl StagingRing {
     fn new(device: &mut Device, bytes: u64) -> Result<Self, EngineError> {
-        // SAFETY: 句柄归本结构独占；成功路径交给 retire 队列，失败路径在下面就地销毁。
+        // SAFETY: 句柄归本结构独占；失败路径就地销毁，成功路径交给 retire 队列。
         let buffer = unsafe {
             device.raw().create_buffer(
                 &vk::BufferCreateInfo::default()
@@ -518,51 +560,44 @@ impl OneShotStaging {
                 format!("{error:?}"),
             ));
         }
-        let buffer_handle = device.allocate(GpuObject::Buffer(buffer));
-        let memory_handle = device.allocate(GpuObject::Memory(memory));
+        // SAFETY: 内存是 HOST_VISIBLE|HOST_COHERENT；映射一直持有到扩容 / 销毁。
+        let ptr = unsafe {
+            device
+                .raw()
+                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+        }
+        .map_err(|error| {
+            // SAFETY: 两个句柄都还没有进入 retire 队列。
+            unsafe {
+                device.raw().destroy_buffer(buffer, None);
+                device.raw().free_memory(memory, None);
+            }
+            init_error("map_memory(atlas staging)", format!("{error:?}"))
+        })?;
         Ok(Self {
             buffer,
             memory,
-            buffer_handle,
-            memory_handle,
+            capacity: bytes,
+            ptr: ptr.cast::<u8>(),
         })
-    }
-
-    /// 从 `pixels[offset..offset + length]` 拷进 staging（staging 容量恰为 `length`）。
-    fn write(
-        &self,
-        device: &Device,
-        offset: usize,
-        pixels: &[u8],
-        length: usize,
-    ) -> Result<(), EngineError> {
-        // SAFETY: staging 容量 = length；映射范围在分配内。
-        unsafe {
-            let pointer = device
-                .raw()
-                .map_memory(self.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-                .map_err(|error| init_error("map_memory(atlas staging)", format!("{error:?}")))?;
-            std::ptr::copy_nonoverlapping(
-                pixels.as_ptr().add(offset),
-                pointer.cast::<u8>(),
-                length,
-            );
-            device.raw().unmap_memory(self.memory);
-        }
-        Ok(())
-    }
-
-    /// 本帧完成前不得释放：两个句柄按帧序号进入 retire 队列（先 buffer 后 memory）。
-    fn retire(self, device: &mut Device, index: FrameIndex) {
-        device.retire(index, self.buffer_handle);
-        device.retire(index, self.memory_handle);
     }
 }
 
 impl Drop for AtlasTextures {
     fn drop(&mut self) {
         for texture in [&self.glyph, &self.image] {
-            // SAFETY: 句柄归本结构独占；`Renderer::drop` 先 `wait_idle`。
+            // 当前环的 buffer / memory 由本结构直接持有（扩容换下的旧环在资源表里）；
+            // `vkFreeMemory` 要求先解除映射。
+            for ring in texture.staging.iter().flatten() {
+                // SAFETY: 映射由 `StagingRing::new` 建立，此处是唯一解除点；句柄归本结构独占，
+                // `Renderer::drop` 先 `wait_idle`。
+                unsafe {
+                    self.device.unmap_memory(ring.memory);
+                    self.device.destroy_buffer(ring.buffer, None);
+                    self.device.free_memory(ring.memory, None);
+                }
+            }
+            // SAFETY: 页句柄归本结构独占；`Renderer::drop` 先 `wait_idle`。
             unsafe {
                 self.device.destroy_sampler(texture.sampler, None);
                 self.device.destroy_image_view(texture.view, None);
@@ -828,11 +863,15 @@ mod tests {
         begin(&device, commands[0]);
         atlas.prepare(&mut device).expect("prepare full");
         atlas
-            .record_uploads(&mut device, FrameIndex::from_raw(1), commands[0])
+            .record_uploads(&mut device, FrameIndex::from_raw(1), 0, commands[0])
             .expect("record full");
         end(&device, commands[0]);
         submit_and_wait(&device, commands[0]);
-        assert_eq!(device.drain_retire(FrameIndex::from_raw(1)), 2);
+        assert_eq!(
+            device.drain_retire(FrameIndex::from_raw(1)),
+            0,
+            "常驻 staging 不产生 retire 句柄"
+        );
         assert_eq!(device.pending_retired(), 0);
 
         // 第 2 帧：第 5 行 = 不透明深蓝（BGRA，打包的 1 行）。先只录制，不提交。
@@ -843,7 +882,7 @@ mod tests {
         begin(&device, commands[0]);
         atlas.prepare(&mut device).expect("prepare frame 2");
         atlas
-            .record_uploads(&mut device, FrameIndex::from_raw(2), commands[0])
+            .record_uploads(&mut device, FrameIndex::from_raw(2), 0, commands[0])
             .expect("record frame 2");
         end(&device, commands[0]);
 
@@ -857,7 +896,7 @@ mod tests {
         begin(&device, commands[1]);
         atlas.prepare(&mut device).expect("prepare frame 3");
         atlas
-            .record_uploads(&mut device, FrameIndex::from_raw(3), commands[1])
+            .record_uploads(&mut device, FrameIndex::from_raw(3), 1, commands[1])
             .expect("record frame 3");
         end(&device, commands[1]);
 
@@ -869,33 +908,26 @@ mod tests {
             [0x11, 0x22, 0x33, 0xFF],
             "第 1 帧的 copy 必须读到自己 staging 的字节（旧实现读到的是第 2 帧覆盖后的橙）"
         );
-        // 两帧各自的 staging（buffer + memory）都还在：提交完成 != retire 推进，第 2 帧也
-        // 还没提交。
+        // 每槽常驻 staging：两帧在飞各自写自己的槽，不产生 retire 句柄。
         assert_eq!(
             device.pending_retired(),
-            4,
-            "每次上传各自一块一次性 staging，两帧都在飞时都不得释放"
+            0,
+            "常驻 staging 复用不产生 retire"
         );
-        // 只释放第 1 帧自己的 staging：第 2 帧还没提交，完成前沿到不了它。
         assert_eq!(
             device.drain_retire(FrameIndex::from_raw(2)),
-            2,
-            "第 2 帧只释放自己的 buffer + memory"
-        );
-        assert_eq!(
-            device.pending_retired(),
-            2,
-            "第 3 帧的 staging 必须活到第 3 帧完成"
+            0,
+            "第 2 帧没有待释放的句柄"
         );
 
-        // 第 2 帧完成：后一帧覆盖前一帧，之后再释放它的 staging。
+        // 第 3 帧完成：后一帧覆盖前一帧。
         submit_and_wait(&device, commands[1]);
         assert_eq!(
             read_row(&device, pool, atlas.image.image, 5),
             [0x44, 0x55, 0x66, 0xFF],
             "后一帧的像素覆盖前一帧"
         );
-        assert_eq!(device.drain_retire(FrameIndex::from_raw(3)), 2);
+        assert_eq!(device.drain_retire(FrameIndex::from_raw(3)), 0);
         assert_eq!(device.pending_retired(), 0, "两帧都完成后不得残留句柄");
         assert_eq!(
             read_row(&device, pool, atlas.image.image, 6),
@@ -907,12 +939,10 @@ mod tests {
         unsafe { device.raw().destroy_command_pool(pool, None) };
     }
 
-    /// P2 回归：未提交的帧 retire 的 staging 由 teardown drain 释放。
+    /// P2 回归：未提交的帧 retired 的 staging（扩容换下的旧环）由 teardown drain 释放。
     ///
-    /// `map_memory` 失败无法注入，但失败路径的后果与这里一致：`record_upload` 先把 staging
-    /// `retire(index)` 再返回 `Err`，而该帧永远不会 submit ⇒ timeline 永远到不了这个序号。
-    /// 旧的 teardown（`drain_retire(last_index)`）只推进到最后一个**成功提交**的帧，放不掉它：
-    /// 两个句柄留在 `ResourceTable` 里直到 `vkDestroyDevice`。`Device::drop` 现在先
+    /// 常驻 staging 只在**扩容**时 retire 旧环（buffer + memory）：该序号若从未提交，完成前沿
+    /// 到不了它，旧 teardown（`drain_retire(last_index)`）放不掉。`Device::drop` 先
     /// [`Device::drain_all_retired`]，覆盖 map 失败 / 录制后失败 / device lost 三条错误路径。
     #[test]
     fn teardown_drain_releases_retired_staging_of_a_frame_that_never_submitted() {
@@ -922,33 +952,31 @@ mod tests {
         let pool = command_pool(&device);
         let commands = allocate(&device, pool, 2);
 
-        // 第 1 帧：整页（第 5 行 = 不透明深蓝）上传并完成：`last_index` 推进到 1。
-        let mut first_page = page();
-        fill_row(&mut first_page, 5, [0x11, 0x22, 0x33, 0xFF]);
-        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, first_page, rows(0, u32::MAX));
+        // 第 1 帧：16² 整页上传并完成（环容量 = 16 行 × 64 B）。
+        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, page(), rows(0, u32::MAX));
         begin(&device, commands[0]);
-        atlas.prepare(&mut device).expect("prepare full");
+        atlas.prepare(&mut device).expect("prepare frame 1");
         atlas
-            .record_uploads(&mut device, FrameIndex::from_raw(1), commands[0])
-            .expect("record full");
+            .record_uploads(&mut device, FrameIndex::from_raw(1), 0, commands[0])
+            .expect("record frame 1");
         end(&device, commands[0]);
         submit_and_wait(&device, commands[0]);
-        assert_eq!(device.drain_retire(FrameIndex::from_raw(1)), 2);
+        assert_eq!(device.drain_retire(FrameIndex::from_raw(1)), 0);
+        assert_eq!(device.pending_retired(), 0);
 
-        // 第 2 帧：增量（第 5 行 = 橙）的 staging 已 retire 在序号 2，但录制随后的失败让这一帧
-        // 从未 submit。
-        let mut second_page = page();
-        fill_row(&mut second_page, 5, [0x44, 0x55, 0x66, 0xFF]);
-        let second_row =
-            second_page[5 * TEST_PAGE as usize * 4..6 * TEST_PAGE as usize * 4].to_vec();
-        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, second_row, rows(5, 6));
+        // 第 2 帧：更大的页（32²）⇒ 槽 0 的环扩容，旧 buffer + memory retire 在序号 2；
+        // 但这一帧从未 submit。
+        let big = 32u32;
+        let mut big_page = vec![0u8; (big * big) as usize * 4];
+        big_page.fill(0x22);
+        atlas.queue_upload(AtlasKind::Image, big, big_page, rows(0, u32::MAX));
         begin(&device, commands[1]);
         atlas.prepare(&mut device).expect("prepare frame 2");
         atlas
-            .record_uploads(&mut device, FrameIndex::from_raw(2), commands[1])
+            .record_uploads(&mut device, FrameIndex::from_raw(2), 0, commands[1])
             .expect("record frame 2");
         end(&device, commands[1]);
-        assert_eq!(device.pending_retired(), 2);
+        assert_eq!(device.pending_retired(), 2, "扩容换下的 buffer + memory");
 
         // 旧 teardown 只 drain 到 `last_index`（= 1）：这两个句柄留在表里。
         assert_eq!(
@@ -966,14 +994,9 @@ mod tests {
         assert_eq!(
             device.drain_all_retired(),
             2,
-            "teardown 必须销毁未提交帧的 buffer + memory"
+            "teardown 必须销毁未提交帧换下的 buffer + memory"
         );
         assert_eq!(device.pending_retired(), 0, "teardown 之后不得残留句柄");
-        assert_eq!(
-            read_row(&device, pool, atlas.image.image, 5),
-            [0x11, 0x22, 0x33, 0xFF],
-            "未提交的帧没有改动图集：第 5 行仍是第 1 帧的深蓝"
-        );
 
         // SAFETY: 队列已空闲（每次提交都 wait idle），命令池没有在飞的缓冲。
         unsafe { device.raw().destroy_command_pool(pool, None) };

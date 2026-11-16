@@ -20,6 +20,7 @@ use crate::{
     paint::atlas::AtlasKind,
     render::{
         atlas::{AtlasRebuilt, DirtyRows, texel_bytes},
+        frame::MAX_FRAMES_IN_FLIGHT,
         macos::{
             device::{Device, GpuObject, init_error},
             queue::Queue,
@@ -36,10 +37,20 @@ const PLACEHOLDER_PAGE: u32 = 1;
 struct AtlasTexture {
     kind: AtlasKind,
     texture: Retained<ProtocolObject<dyn MTLTexture>>,
+    /// 每 in-flight 槽一块常驻 staging（DEVIATIONS F-212）：槽位复用由 `Queue::begin` 的
+    /// 三槽 semaphore 保证「上一帧已完成」，因此可以覆盖写，无需按帧 retire。
+    staging: [Option<StagingBuffer>; MAX_FRAMES_IN_FLIGHT],
     /// 占位页没有句柄（它从未进入任何帧）；真实页重建时旧句柄按帧序号 retire。
     handle: Option<GpuResourceHandle>,
     page: u32,
     pending: Option<PendingUpload>,
+}
+
+/// 每 in-flight 槽一块常驻 staging（`StorageModeShared`，CPU 直接写）。
+struct StagingBuffer {
+    buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    handle: GpuResourceHandle,
+    capacity: usize,
 }
 
 /// 待上传的行区间（一帧内多次 `queue_upload` 取并集）+ 该页的页尺寸。
@@ -150,6 +161,7 @@ impl AtlasTextures {
         device: &mut Device,
         queue: &mut Queue,
         index: FrameIndex,
+        slot: usize,
         encoder: &ProtocolObject<dyn MTLBlitCommandEncoder>,
     ) -> Result<(), EngineError> {
         for kind in [AtlasKind::Glyph, AtlasKind::Image] {
@@ -162,7 +174,7 @@ impl AtlasTextures {
                 AtlasKind::Glyph => &mut self.glyph,
                 AtlasKind::Image => &mut self.image,
             };
-            texture.record_upload(device, queue, index, encoder, kind, force_full)?;
+            texture.record_upload(device, queue, index, slot, encoder, kind, force_full)?;
         }
         Ok(())
     }
@@ -174,6 +186,7 @@ impl AtlasTexture {
         Ok(Self {
             kind,
             texture,
+            staging: std::array::from_fn(|_| None),
             handle: None,
             page: PLACEHOLDER_PAGE,
             pending: None,
@@ -187,12 +200,13 @@ impl AtlasTexture {
         self.pending = Some(PendingUpload { page, pixels, rows });
     }
 
-    /// 把打包好的脏行写进**本帧专用**的 staging、逐段编码 buffer→texture blit，并把缓冲交给 retire。
+    /// 把打包好的脏行写进**本帧槽的常驻 staging**、逐段编码 buffer→texture blit。
     fn record_upload(
         &mut self,
         device: &mut Device,
         queue: &mut Queue,
         index: FrameIndex,
+        slot: usize,
         encoder: &ProtocolObject<dyn MTLBlitCommandEncoder>,
         kind: AtlasKind,
         force_full: bool,
@@ -223,14 +237,14 @@ impl AtlasTexture {
         if total_rows == 0 {
             return Ok(());
         }
-        // 一次性 staging：装本帧所有段（Apple 推荐的低频小上传方式；Metal 拒绝 0 长度缓冲）。
+        // 每槽常驻 staging（按需扩容）：容量够就复用，不够才重建并 retire 旧缓冲。
         let length = total_rows as usize * row_bytes;
-        let staging = device
-            .raw()
-            .newBufferWithLength_options(length, MTLResourceOptions::StorageModeShared)
-            .ok_or_else(|| {
-                init_error("newBufferWithLength_options(atlas staging)", "returned nil")
-            })?;
+        self.ensure_staging(device, queue, index, slot, length)?;
+        let staging = self.staging[slot]
+            .as_ref()
+            .expect("ensure_staging must fill the slot")
+            .buffer
+            .clone();
         let mut staging_row = 0u32;
         let mut packed_row = 0u32;
         for span in spans {
@@ -271,10 +285,42 @@ impl AtlasTexture {
             staging_row += rows;
             packed_row += rows;
         }
-        // GPU 读这块 staging 的 blit 与本帧命令缓冲同生命周期：帧完成（连续完成前沿到达
-        // `index`）之前不得释放，因此这里只登记句柄，真正的 drop 由完成通知驱动（I4）。
-        let handle = device.allocate(GpuObject::Buffer(staging));
-        queue.retire(index, handle);
+        Ok(())
+    }
+
+    /// 保证第 `slot` 个 staging 至少 `bytes` 字节；扩容时旧缓冲按 `index` retire。
+    fn ensure_staging(
+        &mut self,
+        device: &mut Device,
+        queue: &mut Queue,
+        index: FrameIndex,
+        slot: usize,
+        bytes: usize,
+    ) -> Result<(), EngineError> {
+        if self.staging[slot]
+            .as_ref()
+            .is_some_and(|staging| staging.capacity >= bytes)
+        {
+            return Ok(());
+        }
+        let buffer = device
+            .raw()
+            .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| {
+                init_error("newBufferWithLength_options(atlas staging)", "returned nil")
+            })?;
+        // SAFETY: `MTLBuffer` 本身没有未定义初始化要求（Metal 不要求清零）。
+        let handle = device.allocate(GpuObject::Buffer(buffer.clone()));
+        let new = StagingBuffer {
+            buffer,
+            handle,
+            capacity: bytes,
+        };
+        if let Some(old) = self.staging[slot].replace(new) {
+            // 该槽的上一帧由 `Queue::begin` 的 semaphore 保证已完成；这里 retire 只是让句柄表
+            // 走与其它资源相同的释放路径（I4）。
+            queue.retire(index, old.handle);
+        }
         Ok(())
     }
 
@@ -403,7 +449,13 @@ mod tests {
                 .blitCommandEncoder()
                 .expect("blit encoder full");
             atlas
-                .record_uploads(&mut device, &mut queue, FrameIndex::from_raw(1), &blit)
+                .record_uploads(
+                    &mut device,
+                    &mut queue,
+                    FrameIndex::from_raw(1),
+                    slot_full.index,
+                    &blit,
+                )
                 .expect("record full");
             blit.endEncoding();
         }
@@ -429,7 +481,13 @@ mod tests {
         {
             let blit = command1.blitCommandEncoder().expect("blit encoder 1");
             atlas
-                .record_uploads(&mut device, &mut queue, FrameIndex::from_raw(2), &blit)
+                .record_uploads(
+                    &mut device,
+                    &mut queue,
+                    FrameIndex::from_raw(2),
+                    slot1.index,
+                    &blit,
+                )
                 .expect("record frame 1");
             blit.endEncoding();
         }
@@ -446,29 +504,29 @@ mod tests {
         {
             let blit = command2.blitCommandEncoder().expect("blit encoder 2");
             atlas
-                .record_uploads(&mut device, &mut queue, FrameIndex::from_raw(3), &blit)
+                .record_uploads(
+                    &mut device,
+                    &mut queue,
+                    FrameIndex::from_raw(3),
+                    slot2.index,
+                    &blit,
+                )
                 .expect("record frame 2");
             blit.endEncoding();
         }
+        // 每槽常驻 staging（DEVIATIONS F-212）：复用不产生 retire，两帧在飞也不会互相覆盖。
         assert_eq!(
             queue.retired_handles(),
-            2,
-            "每次上传各自一块一次性 staging，两帧都在飞时两块都不得释放"
+            0,
+            "常驻 staging 按槽复用，不产生 retire 句柄"
         );
-
-        // 第 2 帧完成：只释放它自己的 staging。
         queue
             .submit_blocking(FrameIndex::from_raw(2), slot1, &command1, &mut device)
             .expect("submit frame 1");
-        assert_eq!(
-            queue.retired_handles(),
-            1,
-            "第 2 帧的 staging 必须活到第 2 帧完成"
-        );
         queue
             .submit_blocking(FrameIndex::from_raw(3), slot2, &command2, &mut device)
             .expect("submit frame 2");
-        assert_eq!(queue.retired_handles(), 0, "两帧都完成后不得残留句柄");
+        assert_eq!(queue.retired_handles(), 0, "两帧完成后同样没有 retire 句柄");
 
         let mut readback = Readback::new();
         let image = readback
