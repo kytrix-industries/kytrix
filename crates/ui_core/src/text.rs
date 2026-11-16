@@ -155,11 +155,6 @@ impl<T> ThinSlice<T> {
     pub fn as_slice(&self) -> &[T] {
         &self.0
     }
-
-    /// 消费并转成 `Vec`（链式追加路径用）。
-    fn into_vec(self) -> Vec<T> {
-        self.0.into_vec()
-    }
 }
 
 /// 由迭代器构造；空集合返回 `None`（不分配）。
