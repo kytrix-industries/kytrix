@@ -4322,7 +4322,7 @@ mod tests {
         let _ = text_layout(&mut app, window);
 
         let mut style = crate::text::TextStyle::new(24.0);
-        style.family = Some(smol_str::SmolStr::new_static("Consolas"));
+        style = style.with_family(smol_str::SmolStr::new_static("Consolas"));
         set_text(&mut app, window, node, "same text", style);
 
         let pass = refresh(&mut app, window);

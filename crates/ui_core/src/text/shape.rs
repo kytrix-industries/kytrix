@@ -78,7 +78,7 @@ impl ShapedText {
         builder.push_default(StyleProperty::Brush(ColorBrush { color: style.color }));
         // OpenType 特性（tnum 等宽数字等）：转成 Parley 的 FontFeature 列表。
         // 无特性时不 push —— 保持「不请求任何特性」与字体默认行为一致。
-        if let Some(features) = &style.font_features {
+        if let Some(features) = style.font_features() {
             let features: Vec<parley::FontFeature> = features
                 .iter()
                 .map(|feature| {

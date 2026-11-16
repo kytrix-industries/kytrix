@@ -2357,8 +2357,8 @@ mod tests {
         );
         assert_eq!(
             size_of::<crate::text::TextContent>(),
-            120,
-            "TextContent 的尺寸基线（P05 S-53 含 inline_boxes；P1-2.3 加了 font_features +8）"
+            96,
+            "TextContent 的尺寸基线（P1-2.3：family + font_features 收进 TextStyleExtras 后从 112 降到 96）"
         );
         assert_eq!(size_of::<Option<NodeId>>(), 8, "Option<NodeId> 必须零开销");
         assert_eq!(size_of::<NodeId>(), 8);

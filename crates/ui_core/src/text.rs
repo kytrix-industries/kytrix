@@ -90,8 +90,6 @@ pub enum TextDirection {
 /// 光栅阶段按设备 `scale` 取整（`design/phase-05-text.md` §8.3）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextStyle {
-    /// 家族名覆盖；`None` = 用引擎 `FontStack`（D17 的 CJK 显式栈）。
-    pub family: Option<SmolStr>,
     /// 字号（逻辑像素）。
     pub size: f32,
     /// CSS 字重（1..=1000；`400` 常规、`700` 粗体）。
@@ -116,12 +114,13 @@ pub struct TextStyle {
     /// 整列就会抖动、表格无法对齐。CSS 对应 `font-variant-numeric: tabular-nums`，
     /// Qt 对应 `QFont::setFeature`，Flutter 对应 `TextStyle.fontFeatures`。
     ///
-    /// 空列表 = 不请求任何特性（字体默认行为）。顺序即请求顺序，参与缓存键。
+    /// 低频字段（家族名覆盖 + OpenType 特性）。None = 两者都用默认。
     ///
-    /// 用 `Option<Box<FeatureSet>>`（8 B）而不是 `Vec`（24 B）或 `Box<[T]>`（16 B）：
-    /// `TextStyle` 内联在 `TextContent` 里、`TextContent` 又内联在 `Node` 里，任何加宽都
-    /// 直接抬高每个节点的内存。`Option<Box<T>>` 有 null 优化，`None` 不分配。
-    pub font_features: Option<Box<FeatureSet>>,
+    /// 用 Blink 的 `RareInheritedData` 模式：这两个字段在绝大多数文本上是空的，却各占
+    /// 24 B / 8 B。TextStyle` 内联在 `TextContent` 里、`TextContent` 又内联在 `Node` 里，
+    /// 每个节点都要为它们付内存。合成一个 `Option<Box<_>>`（8 B，null 优化，`None` 不分配）
+    /// 让 TextStyle 从 80 B 回到 56 B，`Node` 也就重新有了余量。
+    pub extras: Option<Box<TextStyleExtras>>,
 }
 
 /// 一个「薄」的只读切片（8 B：单个指针；`Box<[T]>` 是 16 B 的胖指针）。
@@ -173,6 +172,22 @@ fn thin_slice<T>(items: impl IntoIterator<Item = T>) -> Option<Box<ThinSlice<T>>
     Some(Box::new(ThinSlice(collected.into_boxed_slice())))
 }
 
+/// `TextStyle` 的低频字段（Blink 的 `RareInheritedData` 模式）。
+///
+/// 这两个字段在绝大多数文本上是空的，但 `TextStyle` 内联在 `TextContent` 里、`TextContent`
+/// 又内联在 `Node` 里 —— 直接把它们摊平会让每个节点多付 32 B。合成一个
+/// `Option<Box<TextStyleExtras>>`（8 B，`None` 不分配）后，`TextStyle` 从 80 B 回到 56 B。
+///
+/// 用 `.clone().unwrap_or_default()` 的访问代价换内存：设置家族名 / OpenType 特性是低频操作，
+/// 读取走 [`TextStyle::family`] / [`TextStyle::font_features`] 两个访问器。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TextStyleExtras {
+    /// 家族名覆盖；`None` = 用引擎 `FontStack`（D17 的 CJK 显式栈）。
+    pub family: Option<SmolStr>,
+    /// OpenType 特性（`tnum` 等宽数字等）。空 = 不请求任何特性。
+    pub font_features: Option<Box<FeatureSet>>,
+}
+
 /// 一组 OpenType 特性。
 pub type FeatureSet = ThinSlice<TextFeature>;
 
@@ -216,7 +231,6 @@ impl TextFeature {
 impl Default for TextStyle {
     fn default() -> Self {
         Self {
-            family: None,
             size: 14.0,
             weight: 400,
             slant: TextSlant::Normal,
@@ -226,7 +240,7 @@ impl Default for TextStyle {
             alignment: TextAlign::Start,
             wrap: TextWrap::Wrap,
             direction: TextDirection::Auto,
-            font_features: None,
+            extras: None,
         }
     }
 }
@@ -239,7 +253,6 @@ impl TextStyle {
     #[must_use]
     pub fn new(size: f32) -> Self {
         Self {
-            family: None,
             size,
             weight: 400,
             slant: TextSlant::Normal,
@@ -249,8 +262,30 @@ impl TextStyle {
             alignment: TextAlign::Start,
             wrap: TextWrap::Wrap,
             direction: TextDirection::Auto,
-            font_features: None,
+            extras: None,
         }
+    }
+
+    /// 家族名覆盖（`None` = 用引擎 `FontStack`）。
+    #[must_use]
+    pub fn family(&self) -> Option<&SmolStr> {
+        self.extras
+            .as_ref()
+            .and_then(|extras| extras.family.as_ref())
+    }
+
+    /// OpenType 特性集（`None` = 不请求任何特性）。
+    #[must_use]
+    pub fn font_features(&self) -> Option<&FeatureSet> {
+        self.extras
+            .as_ref()
+            .and_then(|extras| extras.font_features.as_deref())
+    }
+
+    /// 取（必要时创建）低频字段容器。
+    fn extras_mut(&mut self) -> &mut TextStyleExtras {
+        self.extras
+            .get_or_insert_with(|| Box::new(TextStyleExtras::default()))
     }
 
     /// 追加 OpenType 特性（如 [`TextFeature::TABULAR_NUMBERS`]）。
@@ -259,11 +294,13 @@ impl TextStyle {
     #[must_use]
     pub fn with_font_features(mut self, features: impl IntoIterator<Item = TextFeature>) -> Self {
         let mut combined: Vec<TextFeature> = self
-            .font_features
-            .map(|existing| existing.into_vec())
+            .extras
+            .as_ref()
+            .and_then(|extras| extras.font_features.as_ref())
+            .map(|existing| existing.as_slice().to_vec())
             .unwrap_or_default();
         combined.extend(features);
-        self.font_features = thin_slice(combined);
+        self.extras_mut().font_features = thin_slice(combined);
         self
     }
 
@@ -277,7 +314,7 @@ impl TextStyle {
     /// 链式：家族名覆盖。
     #[must_use]
     pub fn with_family(mut self, family: impl Into<SmolStr>) -> Self {
-        self.family = Some(family.into());
+        self.extras_mut().family = Some(family.into());
         self
     }
 
@@ -334,7 +371,7 @@ impl TextStyle {
     pub(crate) fn hash_into(&self, hasher: &mut ahash::AHasher) {
         use core::hash::Hash;
 
-        self.family.as_deref().hash(hasher);
+        self.family().hash(hasher);
         self.size.to_bits().hash(hasher);
         self.weight.hash(hasher);
         (self.slant as u8).hash(hasher);
@@ -345,7 +382,7 @@ impl TextStyle {
         (self.wrap as u8).hash(hasher);
         (self.direction as u8).hash(hasher);
         // 特性参与缓存键：不同特性集必须 shape 出不同的字形位置。
-        self.font_features.as_deref().hash(hasher);
+        self.font_features().map(|set| set.as_slice()).hash(hasher);
     }
 }
 
@@ -715,7 +752,7 @@ mod tests {
         assert_eq!(style.weight, 400);
         assert_eq!(style.alignment, super::TextAlign::Start);
         assert_eq!(style.wrap, TextWrap::Wrap);
-        assert!(style.family.is_none());
+        assert!(style.family().is_none());
         assert_eq!(style.color, Color::BLACK);
         assert_eq!(style.letter_spacing, 0.0);
     }
@@ -769,11 +806,11 @@ mod tests {
 
     #[test]
     fn text_payload_sizes_are_budgeted() {
-        // P1-2.3 把 `TextStyle` 从 72 抬到 80：新增 `font_features`（`Option<Box<FeatureSet>>`，
-        // 8 B）。这是**必需**字段而不是顺手加的 —— 没有它就做不了等宽数字（`tnum`），
-        // 价格 / 成交量列会随内容抖动。`Node` 因此从 1144 到 1152（正好压在上限）。
-        assert_eq!(size_of::<TextStyle>(), 80);
-        assert_eq!(size_of::<TextContent>(), 120);
+        // P1-2.3 新增 font_features（等宽数字 tnum），同时把 amily 与它一起收进
+        // `TextStyleExtras`（Blink 的 RareInheritedData 模式）：TextStyle 反而从 72 降到 56，
+        // `TextContent` 从 112 到 96，`Node` 从 1144 到 1128 —— 既拿到了新能力又腾出了余量。
+        assert_eq!(size_of::<TextStyle>(), 56);
+        assert_eq!(size_of::<TextContent>(), 96);
         assert_eq!(size_of::<InlineBoxSpec>(), 40);
         assert_eq!(size_of::<ShapedLine>(), 80);
     }

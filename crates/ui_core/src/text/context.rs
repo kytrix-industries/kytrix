@@ -103,7 +103,10 @@ impl TextContext {
         if self.family_list.is_none() {
             self.family_list = Some(shape::family_list(&self.font_stack, None));
         }
-        let family = shape::family_list(&self.font_stack, content.style.family.as_deref());
+        let family = shape::family_list(
+            &self.font_stack,
+            content.style.family().map(smol_str::SmolStr::as_str),
+        );
         let shaped = Rc::new(ShapedText::shape(
             &mut self.font_cx,
             &mut self.layout_cx,
