@@ -235,6 +235,16 @@ impl Renderer {
         }
     }
 
+    /// 换屏后把 display link 的偏好帧率钉到新屏幕的刷新率。
+    ///
+    /// 旧实现只在建窗时读一次 `maximumFramesPerSecond`：窗口被拖到 120 Hz 的 ProMotion
+    /// 屏上仍按 60 Hz 请求（反之亦然）。离屏目标从不 present，是 no-op。
+    pub(crate) fn set_frame_rate(&mut self, max_frame_rate: f32) {
+        if let RenderTarget::Window(window) = &mut self.target {
+            window.set_frame_rate(max_frame_rate);
+        }
+    }
+
     /// 改窗口背景色（主线程）：layer 立刻写；persist 的 clear color 交给 GPU 线程。
     ///
     /// 离屏目标没有背景色（从不 present），是 no-op。
@@ -403,6 +413,8 @@ struct WindowRenderer {
     /// 最近一次写进图层的物理尺寸 / DPI（避免每帧重复写 CA 属性，§5.3）。
     layer_size: (u32, u32),
     layer_scale: f64,
+    /// 当前写进 display link 的偏好帧率（换屏时比较用）。
+    frame_rate: f32,
     stats: RenderStats,
     #[cfg(feature = "hud")]
     samples: Vec<GpuTimerSample>,
@@ -459,6 +471,7 @@ impl WindowRenderer {
             surface: size,
             layer_size: size,
             layer_scale: 0.0,
+            frame_rate: target,
             stats: RenderStats::default(),
             #[cfg(feature = "hud")]
             samples: Vec::with_capacity(3),
@@ -500,6 +513,21 @@ impl WindowRenderer {
         swapchain::set_layer_size(&self.layer, size, scale);
         self.layer_size = size;
         self.layer_scale = scale;
+    }
+
+    /// 换屏（或系统刷新率变化）后重新把 display link 的偏好帧率钉到新刷新率。
+    ///
+    /// 旧实现只在建窗时读一次 `maximumFramesPerSecond`：窗口被拖到 120 Hz 的 ProMotion 屏
+    /// 上之后仍按 60 Hz 请求，表现为「高刷屏上依旧 60 fps」。窗口层每轮 `sync_state` 比较
+    /// 当前屏刷新率，变化时调用这里。
+    fn set_frame_rate(&mut self, max_frame_rate: f32) {
+        let target = max_frame_rate.max(MIN_FRAME_RATE);
+        if (target - self.frame_rate).abs() <= f32::EPSILON {
+            return;
+        }
+        self.frame_rate = target;
+        self.display_link
+            .setPreferredFrameRateRange(CAFrameRateRange::new(target, target, target));
     }
 
     /// 先写主线程独占的图层背景色，再把 persist 的 clear color（linear）交给 GPU 线程。

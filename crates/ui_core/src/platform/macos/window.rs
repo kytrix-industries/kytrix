@@ -91,6 +91,8 @@ pub(crate) struct NativeWindow {
     logical_size: Size,
     /// 最近一次同步的快照（用于检测变化）。
     seen_scale: f64,
+    /// 最近一次写进 display link 的屏幕刷新率（换屏检测）。
+    seen_frame_rate: f32,
     seen_size: (f64, f64),
     was_key: bool,
     close_requested: bool,
@@ -190,6 +192,7 @@ impl NativeWindow {
             scale: options.scale,
             logical_size: options.size,
             seen_scale: 1.0,
+            seen_frame_rate: 0.0,
             seen_size: (0.0, 0.0),
             was_key: false,
             close_requested: false,
@@ -272,6 +275,16 @@ impl NativeWindow {
         dispatcher: &std::sync::Arc<Dispatcher>,
     ) -> Result<(), EngineError> {
         let mut events: Vec<Event> = Vec::new();
+        // 换屏（或系统刷新率变化）：display link 的偏好帧率建窗时只写一次，必须每轮比较
+        // 当前屏幕的 `maximumFramesPerSecond` 并更新，否则窗口被拖到 120 Hz 屏上仍按 60
+        // 请求（高刷屏上永远 60 fps），反之在 60 Hz 屏上请求 120（review mac-1）。
+        let refresh = self.maximum_frames_per_second();
+        if (refresh - self.seen_frame_rate).abs() > 0.5 {
+            self.seen_frame_rate = refresh;
+            if let Some(target) = app.window_mut(self.id) {
+                target.set_max_frame_rate(refresh);
+            }
+        }
         // 真实 backing 每轮算一次：Dpi / Resized 都要把它写进渲染目标（与事件顺序无关）。
         let backing = self.backing_size();
         let factor = self.window.backingScaleFactor();

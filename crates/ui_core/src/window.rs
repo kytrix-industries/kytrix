@@ -670,6 +670,18 @@ impl Window {
         self.full_damage_pending = true;
     }
 
+    /// macOS：换屏后把 display link 的偏好帧率更新到新屏幕的刷新率。
+    ///
+    /// 旧实现只在建窗时读一次 `maximumFramesPerSecond`；窗口被拖到不同刷新率的屏幕上之后
+    /// 仍按旧值请求（ProMotion 120 Hz 屏上被限在 60 fps，反之在 60 Hz 屏上请求 120）。
+    /// 其他平台没有「每屏刷新率」概念，方法不定义（平台层按 cfg 调用）。
+    #[cfg(target_os = "macos")]
+    pub(crate) fn set_max_frame_rate(&mut self, max_frame_rate: f32) {
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_frame_rate(max_frame_rate);
+        }
+    }
+
     /// Linux：写入整数回退的 `wl_surface` buffer scale（fractional 路径恒 1）。
     ///
     /// **不**标 damage / layout、**不**动 `scale_epoch`：它只是渲染目标的属性，随
