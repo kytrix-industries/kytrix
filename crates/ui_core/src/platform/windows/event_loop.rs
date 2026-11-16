@@ -172,6 +172,12 @@ pub(crate) struct WndProcState {
     resize: Option<ResizeSession>,
     /// a11y（P11：首显前构造的 `accesskit_windows::Adapter` + `WM_GETOBJECT` 接线）。
     a11y: crate::platform::windows::a11y::WindowsA11y,
+    /// 引擎当前生效的光标（`App::take_cursor_change` 写入）。
+    ///
+    /// Windows 每次鼠标移动都发 `WM_SETCURSOR`，`DefWindowProcW` 会把光标重置成**类光标**
+    /// （恒为 `IDC_ARROW`）—— 只在光标变化时 `SetCursor` 的写法会被系统覆盖掉，自定义光标
+    /// 永远不生效（P2-3）。所以这里记住当前值，在 `WM_SETCURSOR` 里重新应用。
+    cursor: crate::paint::style::Cursor,
 }
 
 /// 一次自绘边框缩放的起点 + 最新光标。
@@ -204,6 +210,7 @@ impl WndProcState {
             // **必须在窗口显示之前构造**：`Adapter::new` 内部 `init_uia()`，
             // 且不得在处理 `WM_GETOBJECT` 时构造（adapter.rs:411-441）。
             a11y: crate::platform::windows::a11y::WindowsA11y::new(hwnd, dispatcher, window)?,
+            cursor: crate::paint::style::Cursor::Default,
         })
     }
 
@@ -250,6 +257,11 @@ impl WndProcState {
     /// 复位瞬时输入状态（修饰键 / 半高代理对）。失焦时由 WndProc 调用（P2-6）。
     pub(crate) fn reset_transient_input(&mut self) {
         self.translate.reset_transient();
+    }
+
+    /// 记录引擎当前光标（`WM_SETCURSOR` 据此重新应用，P2-3）。
+    pub(crate) fn set_cursor(&mut self, cursor: crate::paint::style::Cursor) {
+        self.cursor = cursor;
     }
 
     /// 开始自绘边框缩放：记录起点并抓鼠标（不再把消息交给 `DefWindowProcW` 的模态循环）。
@@ -360,6 +372,19 @@ pub(crate) extern "system" fn wndproc(
                 };
             }
             return LRESULT(0);
+        }
+        // 客户区的光标由引擎决定（P2-3）：每次鼠标移动系统都会问一次，不接管就会被
+        // `DefWindowProcW` 重置成类光标（恒 `IDC_ARROW`），自定义光标永不生效。
+        // 返回 1 = 「已处理，别再改」；非客户区（边框）交给系统，缩放箭头才对。
+        if msg == WM_SETCURSOR {
+            let hit = (lparam.0 as u32) & 0xFFFF;
+            if hit == HTCLIENT && !state.is_null() {
+                // SAFETY: 系统光标句柄由 `LoadCursorW` 借用、进程不拥有；`SetCursor`
+                // 只影响当前线程。
+                SetCursor(Some(cursor_handle((*state).cursor)));
+                return LRESULT(1);
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
         // 引擎自己画：抑制系统擦背景（否则拖动/重绘时闪白）。
         if msg == WM_ERASEBKGND {
@@ -741,6 +766,8 @@ fn pump_loop(
         if let Some(native) = windows.first_mut() {
             let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
             if let Some(cursor) = app.take_cursor_change() {
+                // 记住当前光标：`WM_SETCURSOR` 里要重新应用（否则会被类光标覆盖）。
+                native.state_mut().set_cursor(cursor);
                 // SAFETY: 系统光标句柄由 `LoadCursorW` 借用，进程不拥有；`SetCursor` 只影响本线程。
                 unsafe { SetCursor(Some(cursor_handle(cursor))) };
             }
