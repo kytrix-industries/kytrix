@@ -134,6 +134,14 @@ pub(crate) fn default_actions(role: A11yRole) -> Vec<A11yAction> {
 
     match role {
         R::Button => vec![A::Click],
+        // 可勾选控件的默认动作（P2-8）：AT 通过 Click 驱动勾选切换；UIA 的 Toggle /
+        // SelectionItem 模式在 `checked` 有值时已经暴露，但动作表里没有 Click 时
+        // 屏幕阅读器不会提供「按下」操作。
+        R::CheckBox | R::Switch | R::RadioButton | R::MenuItem | R::ListBoxOption => {
+            vec![A::Click, A::Focus]
+        }
+        // 滑块：数值通过 `numeric_value` 通道暴露，写值走 `SetValue`（P2-8）。
+        R::Slider => vec![A::SetValue, A::Focus],
         R::TextInput | R::MultilineTextInput => vec![A::SetValue, A::SetTextSelection],
         R::ScrollView => vec![
             A::ScrollUp,
@@ -144,6 +152,7 @@ pub(crate) fn default_actions(role: A11yRole) -> Vec<A11yAction> {
             A::SetScrollOffset,
         ],
         R::Dialog | R::Menu => vec![A::Expand, A::Collapse],
+        R::Table | R::Grid => vec![A::ScrollIntoView],
         _ => Vec::new(),
     }
 }
@@ -438,6 +447,30 @@ mod tests {
         assert!(default_actions(A11yRole::ScrollView).contains(&A11yAction::ScrollIntoView));
         assert!(default_actions(A11yRole::Dialog).contains(&A11yAction::Expand));
         assert!(default_actions(A11yRole::Label).is_empty());
+    }
+
+    /// P2-8：可勾选控件与滑块必须暴露可执行动作，否则 AT 不提供「按下 / 设值」操作。
+    #[test]
+    fn stateful_controls_expose_their_default_actions() {
+        for role in [
+            A11yRole::CheckBox,
+            A11yRole::Switch,
+            A11yRole::RadioButton,
+            A11yRole::MenuItem,
+            A11yRole::ListBoxOption,
+        ] {
+            let actions = default_actions(role);
+            assert!(
+                actions.contains(&A11yAction::Click),
+                "{role:?} 必须暴露 Click（否则屏幕阅读器不提供按下操作）：{actions:?}"
+            );
+            assert!(actions.contains(&A11yAction::Focus));
+        }
+        let slider = default_actions(A11yRole::Slider);
+        assert!(
+            slider.contains(&A11yAction::SetValue),
+            "Slider 必须暴露 SetValue（配合 numeric_value 通道）：{slider:?}"
+        );
     }
 
     #[test]
