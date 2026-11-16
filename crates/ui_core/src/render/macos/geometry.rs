@@ -27,6 +27,11 @@ pub(crate) struct GeometryEntry {
     index_type: IndexType,
     /// 该条目对应的代际（槽位复用后必须重建缓冲）。
     generation: u32,
+    /// 最后一次被绘制的帧号（`GeometryRegistry` 的单调帧号）。
+    ///
+    /// 用于驱逐：应用释放几何句柄后本窗口的缓冲仍会驻留，必须按「最近使用」回收，
+    /// 否则「每帧注册新几何、释放旧的」会让显存无界增长（D-1）。
+    last_used_frame: u64,
     /// 卸载时交还的句柄。
     storage: [GpuResourceHandle; 2],
 }
@@ -60,12 +65,44 @@ impl GeometryEntry {
 /// `GeometryId → GPU 缓冲`（按需创建；代际不匹配即重建）。
 pub(crate) struct GeometryRegistry {
     entries: Vec<Option<GeometryEntry>>,
+    /// 单调帧号：每个内容帧录制前自增，`last_used_frame` 与驱逐都基于它。
+    frame: u64,
+}
+
+/// 连续多少帧未被绘制就回收该几何的 GPU 缓冲（180 帧 ≈ 60 Hz 下 3 秒）。
+///
+/// 足够覆盖「隔帧 / 低频动画」的几何，同时让被应用释放的静态几何在几秒内归还显存
+/// （Chrome 的 discardable GPU cache 用同类按使用时间的策略）。
+const EVICT_AFTER_FRAMES: u64 = 180;
+
+/// 该几何是否已连续 `EVICT_AFTER_FRAMES` 帧以上未被绘制（`wrapping_sub` 容忍回绕）。
+fn geometry_is_stale(frame: u64, last_used_frame: u64) -> bool {
+    frame.wrapping_sub(last_used_frame) > EVICT_AFTER_FRAMES
 }
 
 impl GeometryRegistry {
     pub(crate) const fn new() -> Self {
         Self {
             entries: Vec::new(),
+            frame: 0,
+        }
+    }
+
+    /// 推进帧号（每个内容帧录制前调用一次）。
+    pub(crate) fn begin_frame(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
+    }
+
+    /// 驱逐长期未绘制的几何，把设备对象交给调用方 retire。
+    pub(crate) fn retain_recent(&mut self, retired: &mut Vec<GpuResourceHandle>) {
+        let frame = self.frame;
+        for slot in &mut self.entries {
+            let stale = slot
+                .as_ref()
+                .is_some_and(|entry| geometry_is_stale(frame, entry.last_used_frame));
+            if stale && let Some(entry) = slot.take() {
+                retired.extend(entry.storage);
+            }
         }
     }
 
@@ -91,6 +128,10 @@ impl GeometryRegistry {
             }
             let entry = upload_geometry(device, id, desc)?;
             self.entries[slot] = Some(entry);
+        }
+        // 记录使用帧号：`retain_recent` 据此驱逐长期未绘制的几何（D-1）。
+        if let Some(entry) = &mut self.entries[slot] {
+            entry.last_used_frame = self.frame;
         }
         self.entries[slot]
             .as_ref()
@@ -122,6 +163,8 @@ fn upload_geometry(
         pipeline: desc.pipeline,
         index_type: desc.index_type,
         generation: id.generation(),
+        // 由 `ensure` 在返回前立刻写成当前帧号；这里只是构造初值。
+        last_used_frame: 0,
         storage: [vertex_handle, index_handle],
     })
 }
@@ -144,4 +187,22 @@ fn upload_buffer(
         );
     }
     Ok(buffer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EVICT_AFTER_FRAMES, geometry_is_stale};
+
+    /// 驱逐决策的边界（纯逻辑，不需要真实 Metal 设备）。
+    #[test]
+    fn geometry_is_evicted_only_after_the_grace_window() {
+        // 刚用过：一定保留。
+        assert!(!geometry_is_stale(1_000, 1_000));
+        // 刚好差到门槛：保留（判据是 `>` 而不是 `>=`）。
+        assert!(!geometry_is_stale(1_000 + EVICT_AFTER_FRAMES, 1_000));
+        // 越过门槛：驱逐。
+        assert!(geometry_is_stale(1_001 + EVICT_AFTER_FRAMES, 1_000));
+        // 帧号回绕（u64 实际不会发生，但 `wrapping_sub` 必须给出正确差值）。
+        assert!(!geometry_is_stale(0, u64::MAX));
+    }
 }

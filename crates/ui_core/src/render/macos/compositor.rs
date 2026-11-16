@@ -423,6 +423,9 @@ impl GpuRenderer {
         let mut draw_calls = 0u32;
         // 几何换代（槽位复用）产生的旧缓冲：录制块结束后交给 retire 队列。
         let mut geometry_retired: Vec<GpuResourceHandle> = Vec::new();
+        // 推进几何 registry 的帧号：`ensure` 记录 last_used，帧末 `retain_recent` 驱逐
+        // 长期未绘制的几何（D-1：否则应用释放句柄后 GPU 缓冲永不回收）。
+        self.geometry.begin_frame();
         // 页尺寸变化在编码 blit 之前落地：新纹理建好、旧纹理句柄按本帧序号 retire
         // （DEVIATIONS F-208）。纹理绑定是每帧 `setFragmentTexture` 现场写的，无需重写。
         let _rebuilt = self
@@ -509,7 +512,9 @@ impl GpuRenderer {
             }
             encoder.endEncoding();
         }
-        // 几何换代的旧缓冲按当前帧序号入 retire 队列（等该帧完成后释放，I4）。
+        // 几何换代的旧缓冲按当前帧序号入 retire 队列（等该帧完成后释放，I4）；同时驱逐
+        // 长期未绘制的几何（它们的设备对象进同一个 retire 列表）。
+        self.geometry.retain_recent(&mut geometry_retired);
         for handle in geometry_retired {
             self.queue.retire(self.last_index, handle);
         }

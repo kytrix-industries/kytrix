@@ -1206,6 +1206,9 @@ impl FrameRecorder<'_> {
         let atlas_retired: Vec<GpuResourceHandle>;
         // 几何换代（槽位复用）产生的旧缓冲句柄，同样在录制块结束后 retire。
         let mut geometry_retired: Vec<GpuResourceHandle> = Vec::new();
+        // 推进几何 registry 的帧号：`ensure` 记录 last_used，帧末 `retain_recent` 驱逐
+        // 长期未绘制的几何（D-1：否则应用释放句柄后 GPU 缓冲永不回收）。
+        self.geometry.begin_frame();
         {
             let list = self.stream.list(slot);
             if let Some(timer) = self.timer {
@@ -1308,6 +1311,8 @@ impl FrameRecorder<'_> {
                 timer.end(list, slot.index);
             }
         }
+        // 录制完成后驱逐长期未绘制的几何（设备对象进同一个 retire 列表）。
+        self.geometry.retain_recent(&mut geometry_retired);
         for handle in atlas_retired {
             self.stream.retire(index, handle);
         }
