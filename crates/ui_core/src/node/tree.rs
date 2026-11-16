@@ -2357,8 +2357,8 @@ mod tests {
         );
         assert_eq!(
             size_of::<crate::text::TextContent>(),
-            112,
-            "TextContent 的尺寸是 P05 的预算基线（S-53：含 inline_boxes）"
+            120,
+            "TextContent 的尺寸基线（P05 S-53 含 inline_boxes；P1-2.3 加了 font_features +8）"
         );
         assert_eq!(size_of::<Option<NodeId>>(), 8, "Option<NodeId> 必须零开销");
         assert_eq!(size_of::<NodeId>(), 8);
@@ -2843,9 +2843,11 @@ mod tests {
             size <= 1152,
             "Node 超预算：{size} B（备选 style: Box<Style>）"
         );
+        // P1-2.3：TextStyle 新增 font_features（+8 B），Node 从 1144 到 1152。
+        // 这是有意的特性代价（等宽数字），已逼近 1152 的硬上限 —— 再加字段前必须先瘦身。
         assert!(
-            size <= 1144,
-            "P10 的预算是 1144（P06 的 1128 + interaction 8 + lane_offset 8）；超了要更新设计"
+            size <= 1152,
+            "P1-2.3 之后的上限是 1152（P10 的 1144 + font_features 8）；再加字段要先瘦身"
         );
     }
 }

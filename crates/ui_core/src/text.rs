@@ -110,6 +110,107 @@ pub struct TextStyle {
     pub wrap: TextWrap,
     /// 基准方向。
     pub direction: TextDirection,
+    /// OpenType 特性标签（如 `tnum` 等宽数字、`ss01` 风格集）。
+    ///
+    /// **为什么必须有**：价格 / 成交量这类高频数字表格要求每列数字宽度一致，否则内容一变
+    /// 整列就会抖动、表格无法对齐。CSS 对应 `font-variant-numeric: tabular-nums`，
+    /// Qt 对应 `QFont::setFeature`，Flutter 对应 `TextStyle.fontFeatures`。
+    ///
+    /// 空列表 = 不请求任何特性（字体默认行为）。顺序即请求顺序，参与缓存键。
+    ///
+    /// 用 `Option<Box<FeatureSet>>`（8 B）而不是 `Vec`（24 B）或 `Box<[T]>`（16 B）：
+    /// `TextStyle` 内联在 `TextContent` 里、`TextContent` 又内联在 `Node` 里，任何加宽都
+    /// 直接抬高每个节点的内存。`Option<Box<T>>` 有 null 优化，`None` 不分配。
+    pub font_features: Option<Box<FeatureSet>>,
+}
+
+/// 一个「薄」的只读切片（8 B：单个指针；`Box<[T]>` 是 16 B 的胖指针）。
+///
+/// **为什么需要**：`TextStyle` 与 `TextContent` 都内联在 `Node` 里，而 `Node` 有硬性的尺寸
+/// 预算（`node_size_after_p06`：1144 B）。`Box<[T]>` 的胖指针（指针 + 长度）在「几乎总是空」
+/// 的低频配置字段上白占 8 B。`Option<Box<ThinSlice<T>>>` 靠 `Box` 的空指针优化只有 8 B，
+/// 且 `None` 不分配。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ThinSlice<T>(Box<[T]>);
+
+impl<T> ThinSlice<T> {
+    /// 迭代元素。
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.0.iter()
+    }
+
+    /// 元素个数。
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// 是否为空（构造点保证非空，保留此方法给调用方判空）。
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// 只读切片视图。
+    #[must_use]
+    pub fn as_slice(&self) -> &[T] {
+        &self.0
+    }
+
+    /// 消费并转成 `Vec`（链式追加路径用）。
+    fn into_vec(self) -> Vec<T> {
+        self.0.into_vec()
+    }
+}
+
+/// 由迭代器构造；空集合返回 `None`（不分配）。
+fn thin_slice<T>(items: impl IntoIterator<Item = T>) -> Option<Box<ThinSlice<T>>> {
+    let mut collected: Vec<T> = items.into_iter().collect();
+    if collected.is_empty() {
+        return None;
+    }
+    collected.shrink_to_fit();
+    Some(Box::new(ThinSlice(collected.into_boxed_slice())))
+}
+
+/// 一组 OpenType 特性。
+pub type FeatureSet = ThinSlice<TextFeature>;
+
+/// 一组行内盒。
+pub type InlineBoxSet = ThinSlice<InlineBoxSpec>;
+
+/// 一个 OpenType 特性（4 字节标签 + 开关值）。
+///
+/// 标签用 `[u8; 4]` 而不是 `SmolStr`：OpenType 的 tag 恒为 4 个 ASCII 字节，定长表示让
+/// `TextStyle` 保持 `Copy`-友好、比较与哈希都便宜。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TextFeature {
+    /// 4 字节标签（如 `*b"tnum"`）。
+    pub tag: [u8; 4],
+    /// 特性值：`1` = 开启、`0` = 关闭；其它值是字体的特性专属参数。
+    pub value: u16,
+}
+
+impl TextFeature {
+    /// 等宽数字（`tnum`）：让所有数字占据相同 advance。
+    ///
+    /// 这是高频数字表格的硬需求 —— 价格列不抖动才能对齐。
+    pub const TABULAR_NUMBERS: Self = Self {
+        tag: *b"tnum",
+        value: 1,
+    };
+
+    /// 以 4 字节标签 + 值构造。
+    #[must_use]
+    pub const fn new(tag: [u8; 4], value: u16) -> Self {
+        Self { tag, value }
+    }
+
+    /// 标签的字符串形式（调试 / 诊断）。
+    #[must_use]
+    pub fn tag_str(self) -> String {
+        String::from_utf8_lossy(&self.tag).into_owned()
+    }
 }
 
 impl Default for TextStyle {
@@ -125,14 +226,18 @@ impl Default for TextStyle {
             alignment: TextAlign::Start,
             wrap: TextWrap::Wrap,
             direction: TextDirection::Auto,
+            font_features: None,
         }
     }
 }
 
 impl TextStyle {
     /// 以字号建默认样式。
+    ///
+    /// 不是 `const fn`：`font_features` 是 `Box<[TextFeature]>`，空值需要一次`r
+    /// `Box::from([])`（`Box::new` 在 const 上下文不可用）。
     #[must_use]
-    pub const fn new(size: f32) -> Self {
+    pub fn new(size: f32) -> Self {
         Self {
             family: None,
             size,
@@ -144,7 +249,22 @@ impl TextStyle {
             alignment: TextAlign::Start,
             wrap: TextWrap::Wrap,
             direction: TextDirection::Auto,
+            font_features: None,
         }
+    }
+
+    /// 追加 OpenType 特性（如 [`TextFeature::TABULAR_NUMBERS`]）。
+    ///
+    /// 高频数字表格应当请求等宽数字：否则内容一变，整列宽度就抖动。
+    #[must_use]
+    pub fn with_font_features(mut self, features: impl IntoIterator<Item = TextFeature>) -> Self {
+        let mut combined: Vec<TextFeature> = self
+            .font_features
+            .map(|existing| existing.into_vec())
+            .unwrap_or_default();
+        combined.extend(features);
+        self.font_features = thin_slice(combined);
+        self
     }
 
     /// 链式：字号。
@@ -224,6 +344,8 @@ impl TextStyle {
         (self.alignment as u8).hash(hasher);
         (self.wrap as u8).hash(hasher);
         (self.direction as u8).hash(hasher);
+        // 特性参与缓存键：不同特性集必须 shape 出不同的字形位置。
+        self.font_features.as_deref().hash(hasher);
     }
 }
 
@@ -647,8 +769,11 @@ mod tests {
 
     #[test]
     fn text_payload_sizes_are_budgeted() {
-        assert_eq!(size_of::<TextStyle>(), 72);
-        assert_eq!(size_of::<TextContent>(), 112);
+        // P1-2.3 把 `TextStyle` 从 72 抬到 80：新增 `font_features`（`Option<Box<FeatureSet>>`，
+        // 8 B）。这是**必需**字段而不是顺手加的 —— 没有它就做不了等宽数字（`tnum`），
+        // 价格 / 成交量列会随内容抖动。`Node` 因此从 1144 到 1152（正好压在上限）。
+        assert_eq!(size_of::<TextStyle>(), 80);
+        assert_eq!(size_of::<TextContent>(), 120);
         assert_eq!(size_of::<InlineBoxSpec>(), 40);
         assert_eq!(size_of::<ShapedLine>(), 80);
     }

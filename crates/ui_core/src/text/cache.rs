@@ -12,6 +12,20 @@ use ahash::AHasher;
 
 use super::{TextContent, shape::ShapedText};
 
+/// 条目上限（§9.3 的「容量上限显式」）。
+///
+/// **从 256 提到 1024**（P1-2.3）：窗口里不同文本超过 256 条时，LRU 在两次全量扫描之间必然
+/// 逐出，`Rc::ptr_eq` 永不命中 → `set_text_shaped` 清空 `line/broken` → `layout_text` 全量
+/// 重排 + 重光栅。行情表 / 成交明细这类「几百个标签同时存活」的界面会稳定踩到这个上限。
+///
+/// 1024 条配合 16 MiB 字节预算：典型 12–16 px 标签约 1–3 KiB/条，1024 条在预算内。
+const ENTRY_LIMIT: usize = 1024;
+/// 字节上限（16 MiB）。
+///
+/// 与 `ENTRY_LIMIT` 同时提高：`approx_bytes` 修正为按字形计数后，长文本条目会占用更多预算，
+/// 8 MiB 在多窗口 + CJK 场景下会过早逐出。
+const BYTE_BUDGET: usize = 16 * 1024 * 1024;
+
 /// 形状缓存键：文本哈希 + 样式哈希 + scale 位模式 + 字体栈版本。
 ///
 /// 命中后仍要比较 `text`/`style`（防哈希碰撞），比较对象是缓存条目里的 `ShapedText`。
@@ -62,11 +76,6 @@ struct Entry {
     bytes: usize,
 }
 
-/// 条目上限（§9.3 的「容量上限显式」）。
-const ENTRY_LIMIT: usize = 256;
-/// 字节上限（8 MiB）。
-const BYTE_BUDGET: usize = 8 * 1024 * 1024;
-
 impl ShapeCache {
     pub(crate) fn new() -> Self {
         Self {
@@ -77,10 +86,20 @@ impl ShapeCache {
         }
     }
 
-    /// 取条目（命中即提升顺序，并校验文本/样式）。
+    /// 取条目（命中即提升顺序）。
+    ///
+    /// LRU 提升用「从队尾线性查找」而不是全表扫描：命中的条目大概率就在队尾附近（刚用过），
+    /// 因此平均移动距离很小；`position` 从队首扫会在 1024 条时每次命中都走 1000 步。
     pub(crate) fn get(&mut self, key: &ShapeKey) -> Option<std::rc::Rc<ShapedText>> {
         let shaped = self.entries.get(key)?.shaped.clone();
-        if let Some(index) = self.order.iter().position(|candidate| candidate == key) {
+        // 队尾是「最近使用」，从后往前找能让命中项很快被发现。
+        if let Some(offset) = self
+            .order
+            .iter()
+            .rev()
+            .position(|candidate| candidate == key)
+        {
+            let index = self.order.len() - 1 - offset;
             self.order.remove(index);
         }
         self.order.push_back(*key);
@@ -162,5 +181,35 @@ mod tests {
 
         assert_ne!(a, b);
         assert_ne!(a, c);
+    }
+
+    /// P1-2.3：OpenType 特性必须参与缓存键。
+    ///
+    /// `tnum` 会改变每个数字字形的 advance，从而改变整段文本的宽度与断行。若它不在键里，
+    /// 「先 shape 了比例数字、再请求等宽数字」会命中旧条目，价格列依旧抖动 —— 这是静默错误。
+    #[test]
+    fn shape_key_distinguishes_font_features() {
+        use crate::text::TextFeature;
+
+        let plain = TextContent::new("12345", TextStyle::new(16.0));
+        let tabular = TextContent::new(
+            "12345",
+            TextStyle::new(16.0).with_font_features([TextFeature::TABULAR_NUMBERS]),
+        );
+
+        assert_ne!(
+            ShapeKey::new(&plain, 1.0, 1),
+            ShapeKey::new(&tabular, 1.0, 1),
+            "font_features 必须参与缓存键"
+        );
+        // 同样的特性集 ⇒ 同一个键（顺序与内容都相同）。
+        let again = TextContent::new(
+            "12345",
+            TextStyle::new(16.0).with_font_features([TextFeature::TABULAR_NUMBERS]),
+        );
+        assert_eq!(
+            ShapeKey::new(&tabular, 1.0, 1),
+            ShapeKey::new(&again, 1.0, 1)
+        );
     }
 }

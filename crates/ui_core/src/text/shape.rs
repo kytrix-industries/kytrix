@@ -76,6 +76,22 @@ impl ShapedText {
             Some(factor) => ParleyLineHeight::FontSizeRelative(factor),
         }));
         builder.push_default(StyleProperty::Brush(ColorBrush { color: style.color }));
+        // OpenType 特性（tnum 等宽数字等）：转成 Parley 的 FontFeature 列表。
+        // 无特性时不 push —— 保持「不请求任何特性」与字体默认行为一致。
+        if let Some(features) = &style.font_features {
+            let features: Vec<parley::FontFeature> = features
+                .iter()
+                .map(|feature| {
+                    parley::FontFeature::new(
+                        parley::setting::Tag::from_bytes(feature.tag),
+                        feature.value,
+                    )
+                })
+                .collect();
+            builder.push_default(StyleProperty::FontFeatures(parley::FontFeatures::List(
+                std::borrow::Cow::Owned(features),
+            )));
+        }
         builder.push_default(StyleProperty::WhiteSpaceCollapse(
             parley::WhiteSpaceCollapse::Preserve,
         ));
@@ -151,13 +167,23 @@ impl ShapedText {
     }
 
     /// 字节估算（形状缓存的 LRU 预算；只用于逐出决策，不做精确记账）。
+    ///
+    /// **按字形计**，不是按 run 计：`line.items()` 返回的是 run（一段同一样式/字体的连续
+    /// 文本），一个 run 可以含成百上千个字形。旧实现 `items().count() * 32` 会把长单 run
+    /// 文本的占用低估 10–100 倍，8 MiB 的预算因此形同虚设 —— 缓存会一直涨到条目上限。
     pub(crate) fn approx_bytes(&self) -> usize {
-        let glyphs: usize = self
-            .layout
-            .lines()
-            .map(|line| line.items().count() * 32)
-            .sum();
-        core::mem::size_of::<Self>() + self.text.len() + glyphs
+        let mut glyphs = 0usize;
+        let mut runs = 0usize;
+        for line in self.layout.lines() {
+            for item in line.items() {
+                if let parley::PositionedLayoutItem::GlyphRun(run) = item {
+                    runs += 1;
+                    glyphs += run.glyphs().count();
+                }
+            }
+        }
+        // 每个字形约 24 B（advance + cluster + 字体/样式索引的打包），每个 run 的头部约 96 B。
+        core::mem::size_of::<Self>() + self.text.len() + glyphs * 24 + runs * 96
     }
 
     /// 仅测试：在指定宽度下重排后第一个字形的逻辑 x（验证 `align` 的真实效果）。
