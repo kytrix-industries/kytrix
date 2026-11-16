@@ -740,10 +740,7 @@ mod tests {
             align: InlineAlign::Baseline,
         };
         let boxes: Vec<InlineBoxSpec> = (0..8)
-            .map(|index| InlineBoxSpec {
-                index,
-                ..spec
-            })
+            .map(|index| InlineBoxSpec { index, ..spec })
             .collect();
         let with_boxes = harness.shape_with("abcd", TextStyle::new(16.0), &boxes);
         let extra = with_boxes.approx_bytes() - plain.approx_bytes();

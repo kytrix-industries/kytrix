@@ -112,9 +112,13 @@ impl A11yBridge {
         }
 
         // ① 候选集合：全树 = 全部节点；增量 = 脏节点 + 滚动子树 + 每个候选的祖先链。
-        let mut candidates: SmallVec<[NodeId; 16]> = SmallVec::new();
+        //
+        // 增量路径用 `HashSet` 而不是线性 `contains`：旧实现在「建节点」阶段对每个候选做
+        // O(N) 线性查找，滚动子树失效/大规模重排时 M 可接近 N ⇒ O(N×M) + 祖先去重 O(M²)，
+        // 10 Hz 交付下会出现毫秒级突刺（复审 P3-7）。
+        let mut candidate_set: ahash::HashSet<NodeId> = ahash::HashSet::default();
         if full {
-            candidates.extend(tree.order().iter().copied());
+            candidate_set.extend(tree.order().iter().copied());
         } else {
             for node in tree.order() {
                 if tree.get(*node).is_ok_and(|target| {
@@ -122,27 +126,25 @@ impl A11yBridge {
                         .dirty()
                         .intersects(DirtyFlags::A11Y | DirtyFlags::ORDER)
                 }) {
-                    candidates.push(*node);
+                    candidate_set.insert(*node);
                 }
             }
+            let mut subtree_nodes: SmallVec<[NodeId; 16]> = SmallVec::new();
             for root in std::mem::take(&mut self.subtrees) {
-                collect_subtree(tree, root, &mut candidates);
+                collect_subtree(tree, root, &mut subtree_nodes);
             }
+            candidate_set.extend(subtree_nodes.drain(..));
             // 祖先链：结构增删必须同批发父（`accesskit_consumer` 的硬约束），
             // 无条件带上（未变化的节点在消费端不会产生 updated 事件，只付带宽）。
             let mut ancestors: SmallVec<[NodeId; 16]> = SmallVec::new();
-            for node in candidates.iter() {
+            for node in candidate_set.iter() {
                 push_ancestors(tree, *node, &mut ancestors);
             }
-            for ancestor in ancestors {
-                if !candidates.contains(&ancestor) {
-                    candidates.push(ancestor);
-                }
-            }
+            candidate_set.extend(ancestors);
         }
 
         // ② 清位（全树路径同样清，避免位永久累积）。
-        for node in candidates.iter() {
+        for node in candidate_set.iter() {
             tree.clear_a11y(*node);
         }
 
@@ -156,7 +158,7 @@ impl A11yBridge {
             }
         } else {
             for node in tree.order() {
-                if candidates.contains(node)
+                if candidate_set.contains(node)
                     && let Some(record) = node_a11y(tree, *node, scale, title, diagnostics)
                 {
                     nodes.push(record);

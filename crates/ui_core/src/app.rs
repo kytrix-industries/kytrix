@@ -2827,7 +2827,15 @@ impl App {
 
     /// 记录一条 a11y 诊断（唯一入口：计数与容量在这里统一）。
     pub(crate) fn a11y_note(&mut self, diagnostic: crate::a11y::A11yDiagnostic) {
+        // 去重：同一诊断会在**每次** a11y 交付里重复产生（例如同一个缺标签的交互节点）。
+        // 旧实现每条都 push，64 槽环形缓冲很快被同一个问题的重复项占满，把真正的新问题挤出去，
+        // 而且已经修好的旧诊断会长期残留（复审 P3-5）。
+        if self.a11y_diagnostics.contains(&diagnostic) {
+            return;
+        }
         if self.a11y_diagnostics.len() >= A11Y_DIAGNOSTIC_CAPACITY {
+            // 容量固定为 64：这里的一次 memmove 有界，不值得为它引入 VecDeque
+            // （公开访问器返回 `&[A11yDiagnostic]`）。
             self.a11y_diagnostics.remove(0);
         }
         self.a11y_diagnostics.push(diagnostic);
@@ -4473,6 +4481,29 @@ mod tests {
     /// P2-6：a11y 交付按窗口限流，且时间窗过后继续交付。
     ///
     /// 实时行情会让 `A11Y` 脏位每帧为真；不限流时每帧都要全树扫描 + 构造 `TreeUpdate`。
+    /// P3-5：同一诊断重复产生时不得刷屏（64 槽环形缓冲会被同一个问题的重复项占满）。
+    #[test]
+    fn a11y_diagnostics_are_deduplicated() {
+        let (_rt, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        let root = app.window(window).expect("窗口").tree().root();
+        let node = NodeBuilder::boxed()
+            .build(app.window_mut(window).expect("窗口").tree_mut(), root)
+            .expect("挂载");
+        let diagnostic = crate::a11y::A11yDiagnostic::MissingLabel { node };
+        for _ in 0..8 {
+            app.a11y_note(diagnostic.clone());
+        }
+        assert_eq!(
+            app.a11y_diagnostics(),
+            &[diagnostic],
+            "同一条诊断只保留一份"
+        );
+        // 不同诊断仍可追加。
+        app.a11y_note(crate::a11y::A11yDiagnostic::MissingLabel { node: root });
+        assert_eq!(app.a11y_diagnostics().len(), 2);
+    }
+
     #[test]
     fn a11y_delivery_is_throttled_per_window() {
         let (_rt, mut app) = new_app();
