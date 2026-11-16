@@ -1053,7 +1053,11 @@ fn close_requested_windows(
     for native in windows.iter_mut() {
         if native.state_mut().take_close_request() {
             let id = native.id();
-            app.close_window(id);
+            // 先问应用：`App::on_close` 返回 `false` 就拦下这次关闭（P2-8）；被拦下时
+            // **不**销毁原生窗口（窗口继续存在，下一次点 X 还会再问）。
+            if !app.request_close(id) {
+                continue;
+            }
             native.destroy();
             closed = true;
         }

@@ -190,7 +190,10 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                 }
             }
             for id in closing {
-                app.close_window(id);
+                // 先问应用：on_close 返回 false 就拦下这次关闭（P2-8）。
+                if !app.request_close(id) {
+                    continue;
+                }
                 state.remove_window(id);
                 a11ys.retain(|entry| entry.id != id);
                 mirrors.retain(|entry| entry.id != id);

@@ -22,8 +22,8 @@ use crate::test_support::record::{FrameStats, LaneOutcome};
 use crate::{
     error::EngineError,
     event::{
-        Action, ActionHandler, ActionSource, Event, InputEvent, InputOutcome, Key, KeyBinding,
-        KeyState, Modifiers, PointerButton,
+        Action, ActionHandler, ActionSource, CloseHandler, Event, InputEvent, InputOutcome, Key,
+        KeyBinding, KeyState, Modifiers, PointerButton,
     },
     interaction::{
         self, ActionCtx, AnimatedValue, AnimationId, AnimationSpec, DragInfo, DragPhase,
@@ -133,6 +133,11 @@ pub struct App {
     frame_hook: Option<Box<dyn FnMut(&mut App)>>,
     /// 动作处理器表（P10；同 `Action` 后写覆盖）。
     handlers: ahash::HashMap<Action, ActionHandler>,
+    /// 每窗口的「关闭前」处理器（App::on_close）。
+    ///
+    /// 用户点窗口 X / Cmd-W 时平台**先问它**：返回 alse 就拦下这次关闭（用于保存
+    /// 未提交状态、弹确认框）。没有处理器 ⇒ 直接关（旧行为）。
+    close_handlers: ahash::HashMap<WindowId, CloseHandler>,
     /// 键盘绑定表（线性扫描：默认 3 条 + 应用若干）。
     bindings: Vec<KeyBinding>,
     /// 输入判定阈值（probe 真值；平台在 `platform_init` 覆盖）。
@@ -367,6 +372,7 @@ impl App {
             events: Vec::new(),
             frame_hook: None,
             handlers: ahash::HashMap::default(),
+            close_handlers: ahash::HashMap::default(),
             bindings: default_bindings(),
             thresholds: InputThresholds::default(),
             clock: Instant::now(),
@@ -1957,8 +1963,8 @@ impl App {
             return Err(EngineError::UnknownWindow { window });
         };
         let root = target.tree().root();
-        // 新建时还不知道浮层尺寸：Above / Left 首帧先按零尺寸定位，布局之后由
-        // esolve_overlay_placements 用实测尺寸纠正（P2-6）。
+        // 新建时还不知道浮层尺寸：`Above` / `Left` 首帧先按零尺寸定位，布局之后由
+        // resolve_overlay_placements 用实测尺寸纠正（P2-6）。
         let origin = interaction::resolve_placement(target.tree(), options.placement, Size::ZERO);
         let style = overlay_style(origin);
         let node = NodeBuilder::boxed()
@@ -2375,6 +2381,32 @@ impl App {
     }
 
     /// 关窗：精确退订该窗口全部节点的依赖，然后丢弃。返回 `false` = 窗口不存在。
+    /// 注册窗口的「关闭前」处理器：返回 alse 拦下关闭（P2-8）。
+    ///
+    /// 平台在用户点 X / Cmd-W 时先调用它；应用可在此保存未提交状态、弹确认框。
+    pub fn on_close(&mut self, id: WindowId, handler: impl FnMut(&mut Self) -> bool + 'static) {
+        self.close_handlers.insert(id, Box::new(handler));
+    }
+    /// 平台关闭路径：先问关闭前处理器，允许才关。返回 true = 窗口已关闭。
+    ///
+    /// 处理器用「取出 → 调用 → 放回」的方式调用（与 a11y handler 同一做法）：它需要
+    /// &mut App，不能在使用 self.close_handlers 的借用期内存活。
+    pub(crate) fn request_close(&mut self, id: WindowId) -> bool {
+        let Some(mut handler) = self.close_handlers.remove(&id) else {
+            return self.close_window(id);
+        };
+        let allow = handler(self);
+        // 处理器里可能已经把窗口关了（例如它自己调用 close_window）：此时不要再放回。
+        if self.windows.contains_key(&id) {
+            self.close_handlers.insert(id, handler);
+        }
+        if !allow {
+            return false;
+        }
+        self.close_handlers.remove(&id);
+        self.close_window(id)
+    }
+
     pub fn close_window(&mut self, id: WindowId) -> bool {
         // 动画槽引用窗口内的节点与瞬态值：窗口关闭时必须一并清掉（否则 `SetTimer` 永不停）。
         self.animations.retain(|slot| slot.window != id);
@@ -4278,6 +4310,31 @@ mod tests {
         let _ = derived;
     }
 
+    /// P2-8：`on_close` 返回 false 必须拦下关闭，返回 true 才真的关。
+    #[test]
+    fn close_handler_can_veto_the_close() {
+        let (_rt, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        let denied = std::rc::Rc::new(std::cell::Cell::new(0_u32));
+        let seen = denied.clone();
+        app.on_close(window, move |_app| {
+            seen.set(seen.get() + 1);
+            false
+        });
+
+        assert!(!app.request_close(window), "返回 false 必须拦下关闭");
+        assert!(app.window(window).is_some(), "被拦下时窗口必须仍然存在");
+        assert_eq!(denied.get(), 1, "处理器必须被调用");
+
+        // 第二次也拦下（处理器不能被消费掉）。
+        assert!(!app.request_close(window));
+        assert_eq!(denied.get(), 2);
+
+        // 换成允许关闭的处理器。
+        app.on_close(window, |_app| true);
+        assert!(app.request_close(window), "返回 true 必须真的关闭");
+        assert!(app.window(window).is_none());
+    }
     /// P2-6：a11y 交付按窗口限流，且时间窗过后继续交付。
     ///
     /// 实时行情会让 `A11Y` 脏位每帧为真；不限流时每帧都要全树扫描 + 构造 `TreeUpdate`。

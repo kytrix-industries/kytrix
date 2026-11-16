@@ -275,7 +275,10 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
     let mut closed = false;
     for native in state.windows.iter_mut() {
         if native.take_close_request() {
-            app.close_window(native.id());
+            // 先问应用：`App::on_close` 返回 `false` 就拦下这次关闭（P2-8）。
+            if !app.request_close(native.id()) {
+                continue;
+            }
             native.close();
             closed = true;
         }

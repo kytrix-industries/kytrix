@@ -299,6 +299,12 @@ pub struct KeyBinding {
 /// 动作处理器（应用注册；`FnMut`，可写状态）。
 pub type ActionHandler = Box<dyn FnMut(&mut crate::interaction::ActionCtx<'_>)>;
 
+/// 关闭前处理器（`App::on_close`）。返回 `false` = 拦下这次关闭。
+///
+/// 平台在用户点窗口 X / Cmd-W 时**先问它**；应用可以在这里保存未提交状态、弹确认框，
+/// 或直接拒绝关闭。没有处理器 ⇒ 直接关（与旧行为一致）。
+pub type CloseHandler = Box<dyn FnMut(&mut crate::app::App) -> bool>;
+
 /// 一次输入分发的产物（`TestApp::inject` 返回；也是分发路径的可断言结果）。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InputOutcome {
