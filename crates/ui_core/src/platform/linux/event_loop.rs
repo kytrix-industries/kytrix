@@ -126,6 +126,9 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             if app.windows().next().is_none() {
                 return Ok(());
             }
+            // 本轮的「当前窗口」取自 `WaylandState`（`WindowSurface::id`），不再由事件循环
+            // 另存一份 —— 多窗口时它会被逐窗口的循环取代（Stage C-3）。
+            let id = state.id();
             // ① 平台事件 → App（IME / 输入 / 尺寸 / 焦点 / DPI）。
             // 先合成到期的键盘重复：Wayland 不替客户端产生重复，缺少这一步长按
             // Backspace/方向键只生效一次（P1-2.11）。合成结果直接进 `state.events`，
@@ -133,11 +136,10 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             state.emit_due_key_repeats(Instant::now());
             let events = state.take_events();
             let had_events = !events.is_empty();
-            // 派发目标取自 `WaylandState` 自己（`WindowSurface::id`）：多窗口时这里会变成
-            // 「按事件来源窗口派发」，现在就让它成为唯一的 id 来源，避免两处各记一份。
-            let window_id = state.id();
-            for event in events {
-                app.dispatch(window_id, event);
+            // 每个事件**自带**窗口 id（P1-2.8 Stage C-2）：多窗口下同一批里可能混着不同窗口的
+            // 事件，不能再用「当前窗口」统一派发。
+            for (target, event) in events {
+                app.dispatch(target, event);
             }
             if had_events {
                 // 与 Win32 的 pump 一致：每条平台消息之后都要唤醒，否则应用侧的状态变更

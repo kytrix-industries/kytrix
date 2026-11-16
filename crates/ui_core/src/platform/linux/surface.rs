@@ -272,8 +272,15 @@ pub(crate) struct WaylandState {
     /// 键盘事件、IME、剪贴板属主都跟随它；`wl_keyboard.enter` / `leave` 更新它。
     /// 单窗口时恒 0；没有窗口时不会访问（构造保证至少一个，关到 0 个就退出循环）。
     active: usize,
-    /// 待泵消费的平台事件。
-    events: Vec<Event>,
+    /// 指针当前进入的窗口下标（`wl_pointer.enter` / `leave` 维护）。
+    ///
+    /// 与 [`Self::active`]（键盘焦点）**分开**：鼠标在一个窗口、键盘焦点在另一个窗口是常态
+    /// （悬浮预览、非聚焦窗口上的 hover）。指针事件按它派发。
+    pointer_focus: Option<usize>,
+    /// 待泵消费的平台事件，**带窗口 id**（P1-2.8 Stage C-2）。
+    ///
+    /// 事件循环按 id 派发到对应的 `Window`；seat 的键盘/指针事件归 `active` 窗口。
+    events: Vec<(crate::window::WindowId, Event)>,
     connection: Connection,
     queue_handle: QueueHandle<Self>,
     /// 只为保活（建 surface 之后不再使用）。
@@ -450,6 +457,7 @@ impl WaylandState {
                 frame_callback: None,
             }],
             active: 0,
+            pointer_focus: None,
             events: Vec::with_capacity(16),
             connection,
             queue_handle,
@@ -597,11 +605,15 @@ impl WaylandState {
         if scale == self.windows[index].scale {
             return;
         }
-        self.windows[self.active].scale = scale;
-        self.events.push(Event::DpiChanged {
-            dpi: (scale.factor() * 96.0).round() as u32,
-            scale,
-        });
+        self.windows[index].scale = scale;
+        let window = self.windows[index].id;
+        self.events.push((
+            window,
+            Event::DpiChanged {
+                dpi: (scale.factor() * 96.0).round() as u32,
+                scale,
+            },
+        ));
     }
 
     /// 渲染目标的 `wl_surface` buffer scale：fractional 路径恒 1（destination 负责非整数缩放），
@@ -627,6 +639,12 @@ impl WaylandState {
     /// 以及 seat 的键盘/指针事件（按焦点窗口）派发到正确的 `Window`。
     pub(crate) fn id(&self) -> crate::window::WindowId {
         self.windows[self.active].id
+    }
+
+    /// 指针当前进入的窗口 id（没有进入任何窗口时 None：Motion/Axis 仍然更新坐标，
+    /// 但**不派发**事件 —— 指针在窗口外时没有目标）。
+    fn pointer_window(&self) -> Option<crate::window::WindowId> {
+        self.pointer_focus.map(|index| self.windows[index].id)
     }
 
     /// `wl_surface` → 窗口下标（按对象 id 比较；代理对象的 `id()` 是协议对象 id）。
@@ -706,7 +724,7 @@ impl WaylandState {
         self.windows[self.active].viewport.take()
     }
 
-    pub(crate) fn take_events(&mut self) -> Vec<Event> {
+    pub(crate) fn take_events(&mut self) -> Vec<(crate::window::WindowId, Event)> {
         std::mem::take(&mut self.events)
     }
 
@@ -876,20 +894,28 @@ impl WaylandState {
         xkb_state.update_mask(depressed, latched, locked, 0, 0, group);
         let keycode = xkb::Keycode::new(key);
         let symbol = xkb_state.key_get_one_sym(keycode);
-        self.events.push(Event::Input(InputEvent::Key {
-            key: map_keysym(symbol, key),
-            state,
-            modifiers: self.modifiers,
-        }));
+        // seat 事件没有 surface 归属：派发给**焦点窗口**（ctive）。
+        let window = self.windows[self.active].id;
+        self.events.push((
+            window,
+            Event::Input(InputEvent::Key {
+                key: map_keysym(symbol, key),
+                state,
+                modifiers: self.modifiers,
+            }),
+        ));
         // P1-2.11：IME 启用后文本**只**走 `zwp_text_input_v3` 的 `commit_string`。
         // 两条通路同时生效会让一次按键产生两份文本（输入 "ni" 得到 "ni你"）。
         // 组合器没有 text-input-v3 时 `ime_enabled` 恒 false，回退到这里的 xkb 通路。
         if state == KeyState::Down && !self.ime_enabled {
             let text = xkb_state.key_get_utf8(keycode);
             if !text.is_empty() && text.chars().all(|c| !c.is_control()) {
-                self.events.push(Event::Input(InputEvent::Text {
-                    text: SmolStr::new(text),
-                }));
+                self.events.push((
+                    window,
+                    Event::Input(InputEvent::Text {
+                        text: SmolStr::new(text),
+                    }),
+                ));
             }
         }
     }
@@ -1257,7 +1283,8 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandState {
                     .any(|chunk| u32::from_ne_bytes(*chunk) == maximized);
                 state.windows[index].configured = true;
                 let size = state.windows[index].size;
-                state.events.push(Event::Resized { size });
+                let window = state.windows[index].id;
+                state.events.push((window, Event::Resized { size }));
             }
             xdg_toplevel::Event::Close => {
                 state.windows[index].close_requested = true;
@@ -1366,15 +1393,31 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                 // 参数变化后按新参数重排所有按住键的下次触发时刻。
                 state.reschedule_held_keys();
             }
-            wl_keyboard::Event::Enter { serial, .. } => {
+            wl_keyboard::Event::Enter {
+                serial, surface, ..
+            } => {
                 state.serial = serial;
-                state.windows[state.active].focused = true;
-                state.events.push(Event::FocusChanged { focused: true });
+                // 焦点窗口由 `enter` 的 surface 决定（Stage C-2）：seat 事件此后都归它。
+                let Some(index) = state.window_index_for_surface(&surface) else {
+                    return;
+                };
+                state.active = index;
+                state.windows[index].focused = true;
+                let window = state.windows[index].id;
+                state
+                    .events
+                    .push((window, Event::FocusChanged { focused: true }));
                 state.set_ime_focus(true);
             }
-            wl_keyboard::Event::Leave { .. } => {
-                state.windows[state.active].focused = false;
-                state.events.push(Event::FocusChanged { focused: false });
+            wl_keyboard::Event::Leave { surface, .. } => {
+                let Some(index) = state.window_index_for_surface(&surface) else {
+                    return;
+                };
+                state.windows[index].focused = false;
+                let window = state.windows[index].id;
+                state
+                    .events
+                    .push((window, Event::FocusChanged { focused: false }));
                 state.set_ime_focus(false);
             }
             _ => {}
@@ -1394,16 +1437,25 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
         match event {
             wl_pointer::Event::Enter {
                 serial,
+                surface,
                 surface_x,
                 surface_y,
-                ..
             } => {
                 state.serial = serial;
+                // 指针进入的窗口由 surface 决定；之后的指针事件都派发给它（与键盘焦点无关）。
+                let Some(index) = state.window_index_for_surface(&surface) else {
+                    return;
+                };
+                state.pointer_focus = Some(index);
                 state.pointer_pos = Point::new(surface_x as f32, surface_y as f32);
-                state.events.push(Event::Input(InputEvent::PointerMove {
-                    position: state.pointer_pos,
-                    modifiers: state.modifiers,
-                }));
+                let window = state.windows[index].id;
+                state.events.push((
+                    window,
+                    Event::Input(InputEvent::PointerMove {
+                        position: state.pointer_pos,
+                        modifiers: state.modifiers,
+                    }),
+                ));
             }
             wl_pointer::Event::Motion {
                 surface_x,
@@ -1411,10 +1463,15 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 ..
             } => {
                 state.pointer_pos = Point::new(surface_x as f32, surface_y as f32);
-                state.events.push(Event::Input(InputEvent::PointerMove {
-                    position: state.pointer_pos,
-                    modifiers: state.modifiers,
-                }));
+                if let Some(window) = state.pointer_window() {
+                    state.events.push((
+                        window,
+                        Event::Input(InputEvent::PointerMove {
+                            position: state.pointer_pos,
+                            modifiers: state.modifiers,
+                        }),
+                    ));
+                }
             }
             wl_pointer::Event::Button {
                 serial,
@@ -1438,7 +1495,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                             modifiers: state.modifiers,
                         },
                     };
-                    state.events.push(Event::Input(event));
+                    if let Some(window) = state.pointer_window() {
+                        state.events.push((window, Event::Input(event)));
+                    }
                 }
             }
             wl_pointer::Event::Axis { axis, value, .. } => {
@@ -1467,16 +1526,27 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                     let (lines_x, lines_y) = state.scroll.lines();
                     state.scroll.clear();
                     // 取反对齐 Win32 的「正 = 向上 / 向右」。
-                    state.events.push(Event::Input(InputEvent::Scroll {
-                        position: state.pointer_pos,
-                        delta_x: -lines_x,
-                        delta_y: -lines_y,
-                        modifiers: state.modifiers,
-                    }));
+                    if let Some(window) = state.pointer_window() {
+                        state.events.push((
+                            window,
+                            Event::Input(InputEvent::Scroll {
+                                position: state.pointer_pos,
+                                delta_x: -lines_x,
+                                delta_y: -lines_y,
+                                modifiers: state.modifiers,
+                            }),
+                        ));
+                    }
                 }
             }
             wl_pointer::Event::Leave { .. } => {
-                state.events.push(Event::Input(InputEvent::PointerLeave));
+                let window = state.pointer_window();
+                state.pointer_focus = None;
+                if let Some(window) = window {
+                    state
+                        .events
+                        .push((window, Event::Input(InputEvent::PointerLeave)));
+                }
             }
             _ => {}
         }
@@ -1552,8 +1622,11 @@ impl Dispatch<ZwpTextInputV3, ()> for WaylandState {
                 state.ime.note_commit(text);
             }
             zwp_text_input_v3::Event::Done { .. } => {
+                // IME 只服务于**焦点窗口**（text-input-v3 每窗口一个对象，但 `done` 事件不带
+                // 对象信息，因此按 `active` 派发）。
+                let window = state.windows[state.active].id;
                 for event in state.ime.take_events() {
-                    state.events.push(Event::Ime(event as ImeEvent));
+                    state.events.push((window, Event::Ime(event as ImeEvent)));
                 }
             }
             _ => {}
