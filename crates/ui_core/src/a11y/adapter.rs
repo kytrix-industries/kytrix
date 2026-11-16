@@ -282,6 +282,13 @@ pub(crate) fn to_accesskit(record: &crate::a11y::A11yNode) -> accesskit::Node {
     if let Some(live) = record.live {
         node.set_live(crate::a11y::mapping::live_to_accesskit(live));
     }
+    // 集合内位置（P2-6）：虚拟列表行靠它播报「第 N 项，共 M 项」。
+    if let Some(position) = record.pos_in_set {
+        node.set_position_in_set(position);
+    }
+    if let Some(size) = record.size_of_set {
+        node.set_size_of_set(size);
+    }
     // 数值通道（P2-8）：UIA 的 RangeValuePattern 读这几个字段。
     if let Some(value) = record.numeric_value {
         node.set_numeric_value(value);

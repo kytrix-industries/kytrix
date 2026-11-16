@@ -142,6 +142,16 @@ pub(crate) fn node_a11y(
         live: patch
             .and_then(|patch| patch.live)
             .or_else(|| over.and_then(|over| over.live)),
+        // 虚拟列表行：引擎知道「第 N 项 / 共 M 项」，必须自动填 —— 否则应用得自己算，
+        // 而 `VirtualSlot` 是内部状态（review P2-6：修复只做了字段管道，没接线）。
+        pos_in_set: patch
+            .and_then(|patch| patch.pos_in_set)
+            .or_else(|| over.and_then(|over| over.pos_in_set))
+            .or_else(|| virtual_set_position(tree, node).map(|(index, _)| index + 1)),
+        size_of_set: patch
+            .and_then(|patch| patch.size_of_set)
+            .or_else(|| over.and_then(|over| over.size_of_set))
+            .or_else(|| virtual_set_position(tree, node).map(|(_, count)| count)),
         numeric_value: patch
             .and_then(|patch| patch.numeric_value)
             .or_else(|| over.and_then(|over| over.numeric_value)),
@@ -166,6 +176,23 @@ pub(crate) fn node_a11y(
         children,
         parent: target.parent().map(A11yNodeId::from_engine),
     })
+}
+
+/// 该节点是虚拟列表的已挂载行时返回 `(index, count)`（`index` 是 0-based）。
+///
+/// `VirtualSlot` 是引擎内部状态，应用拿不到 —— 所以「第 N 项，共 M 项」必须由引擎自己
+/// 填进 a11y 快照，否则屏幕阅读器只能播报行内容、无法告知位置（复审 P2-6）。
+fn virtual_set_position(tree: &NodeTree, node: NodeId) -> Option<(usize, usize)> {
+    let mut cursor = tree.get(node).ok().and_then(|target| target.parent());
+    while let Some(current) = cursor {
+        if let Some(slot) = tree.virtual_slot(current)
+            && let Some((index, _)) = slot.mounted.iter().find(|(_, row)| *row == node)
+        {
+            return Some((*index, slot.count));
+        }
+        cursor = tree.get(current).ok().and_then(|target| target.parent());
+    }
+    None
 }
 
 /// 把 `root` 及其整棵子树（DFS 先序）推进 `out`（去重由调用方决定）。

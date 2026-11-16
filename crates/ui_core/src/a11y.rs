@@ -59,7 +59,8 @@ pub enum A11yRole {
     Table,
     /// 网格。
     Grid,
-    /// 表格行 / 网格行（虚拟列表的行也用 `Row`，配合 `row_index` / `row_count`）。
+    /// 表格行 / 网格行（**仅**真实表格：`Row` 必须位于 `Table`/`Grid`/`TreeGrid` 内）。
+    /// 虚拟列表的行仍用 `ListBoxOption`，位置走 `pos_in_set` / `size_of_set`。
     Row,
     /// 单元格（表格 / 网格里的格子，配合 `row_index` / `column_index`）。
     Cell,
@@ -173,6 +174,11 @@ pub struct A11yOverride {
     pub column_count: Option<usize>,
     /// 实时区域播报策略（`None` = 不表态，P2-6）。
     pub live: Option<A11yLive>,
+    /// 集合内位置与总数（1-based；`None` = 不表态）。
+    ///
+    /// 列表项 / 虚拟列表行用它表达「第 N 项，共 M 项」；表格行仍用 `row_index`。
+    pub pos_in_set: Option<usize>,
+    pub size_of_set: Option<usize>,
     /// 数值通道（`Slider` / `ProgressIndicator` / `ScrollBar` 等，P2-8）。
     ///
     /// 屏幕阅读器播报的是**数值**（"50，最大 100"），UIA 的 `RangeValuePattern` 直接读这几个
@@ -226,6 +232,11 @@ pub struct A11yPatch {
     pub expanded: Option<bool>,
     /// 实时区域播报策略（`None` = 不表态）。
     pub live: Option<A11yLive>,
+    /// 集合内位置与总数（1-based；`None` = 不表态）。
+    ///
+    /// 列表项 / 虚拟列表行用它表达「第 N 项，共 M 项」；表格行仍用 `row_index`。
+    pub pos_in_set: Option<usize>,
+    pub size_of_set: Option<usize>,
     /// 数值通道（滑块 / 进度 / 滚动条的数值与范围，P2-8）。
     pub numeric_value: Option<f64>,
     pub min_numeric_value: Option<f64>,
@@ -314,6 +325,11 @@ pub struct A11yNode {
     pub column_count: Option<usize>,
     /// 实时区域播报策略（`None` = 不表态，P2-6）。
     pub live: Option<A11yLive>,
+    /// 集合内位置与总数（1-based；`None` = 不表态）。
+    ///
+    /// 列表项 / 虚拟列表行用它表达「第 N 项，共 M 项」；表格行仍用 `row_index`。
+    pub pos_in_set: Option<usize>,
+    pub size_of_set: Option<usize>,
     /// 数值通道（`Slider` / `ProgressIndicator` / `ScrollBar` 等，P2-8）。
     ///
     /// 屏幕阅读器播报的是**数值**（"50%，最大 100"）而不是字符串，且 UIA 的

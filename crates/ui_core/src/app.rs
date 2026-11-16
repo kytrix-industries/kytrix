@@ -5736,6 +5736,48 @@ mod interaction_tests {
         (rt, app, window, container)
     }
 
+    /// P2-6：虚拟列表行必须自动带上「第 N 项 / 共 M 项」，否则屏幕阅读器只播报行内容。
+    ///
+    /// `VirtualSlot` 是引擎内部状态，应用拿不到 —— 所以 a11y 快照必须由引擎自己填。
+    #[test]
+    fn virtual_rows_carry_their_position_in_the_set() {
+        let (_rt, mut app, window, container) = virtual_app();
+        let list = app
+            .make_virtual_list(
+                window,
+                container,
+                VirtualListConfig {
+                    extent: 25.0,
+                    overscan: 0,
+                },
+            )
+            .expect("virtual list");
+        app.set_virtual_items(&list, 100, |index| {
+            NodeBuilder::boxed().id(format!("row{index}"))
+        })
+        .expect("items");
+        frame(&mut app, window);
+        let rows: Vec<(usize, NodeId)> = app
+            .window(window)
+            .expect("window")
+            .tree()
+            .virtual_slot(container)
+            .expect("virtual slot")
+            .mounted
+            .clone();
+        assert!(!rows.is_empty(), "至少挂载一行");
+
+        let snapshot = app.a11y_take(window).expect("a11y snapshot");
+        for (index, row) in rows {
+            let node = snapshot
+                .nodes
+                .iter()
+                .find(|node| node.engine == row)
+                .expect("row 必须在快照里");
+            assert_eq!(node.pos_in_set, Some(index + 1), "1-based 位置");
+            assert_eq!(node.size_of_set, Some(100), "集合总数");
+        }
+    }
     #[test]
     fn virtual_list_mounts_the_visible_window_and_recycles() {
         let (_rt, mut app, window, container) = virtual_app();
