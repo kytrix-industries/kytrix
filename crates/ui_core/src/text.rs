@@ -656,12 +656,6 @@ pub struct TextPassReport {
     pub reused: usize,
     /// 形状快照未变、整节点被跳过的次数（B4：空闲帧必须只走这条路）。
     pub skipped: usize,
-    /// 真正光栅化的字形数。
-    pub rasterized: usize,
-    /// 命中字形 tile 缓存的字形数。
-    pub tiles_reused: usize,
-    /// 因图集满而走「清空 + 重建」的次数。
-    pub atlas_rebuilds: usize,
     /// 本次累积的脏行段数（P07 的增量上传输入）。
     pub dirty_spans: usize,
 }
@@ -675,6 +669,15 @@ pub struct TextLayoutReport {
     pub reused: usize,
     /// 整 pass 因图集换代而重跑的轮数（0 = 未重跑）。
     pub reruns: usize,
+    /// 本 pass 真正光栅化的字形数。
+    ///
+    /// `GlyphAtlas::take_stats` 是**单一消费者**语义：光栅发生在第二阶段，所以统计只能
+    /// 在这里聚合；第一阶段（`TextPassReport`）取到的永远是 0。
+    pub rasterized: usize,
+    /// 命中字形 tile 缓存的字形数。
+    pub tiles_reused: usize,
+    /// 因图集满而走「清空 + 重建」的次数。
+    pub atlas_rebuilds: usize,
 }
 
 /// 字体栈的健康状态（N4：测试与诊断的**唯一**跳过判据，避免散落 `eprintln!`）。

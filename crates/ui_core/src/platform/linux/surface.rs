@@ -1497,6 +1497,11 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                     return;
                 };
                 state.windows[index].focused = false;
+                // 失焦后不再有 `wl_keyboard.key`（含 release）到达：必须**主动清空**按住键，
+                // 否则客户端合成的重复会永久继续（winit/GTK 同此约定）。后果是静默的：
+                // 按住 Backspace 切走 → 后台继续删字；关窗后 `active` 重映射 → 重复键写进
+                // **另一个窗口**。
+                state.held_keys.clear();
                 let window = state.windows[index].id;
                 state
                     .events

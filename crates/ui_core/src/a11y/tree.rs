@@ -136,32 +136,33 @@ pub(crate) fn node_a11y(
         checked,
         selected: patch.and_then(|patch| patch.selected),
         expanded: patch.and_then(|patch| patch.expanded),
-        // 实时区域：静态声明优先，其次动态补丁（与 role / label 的合并方向一致）。
-        live: over
-            .and_then(|over| over.live)
-            .or_else(|| patch.and_then(|patch| patch.live)),
-        // 行列语义：静态声明优先，其次动态补丁（与 role / label 的合并方向一致）。
-        numeric_value: over
-            .and_then(|over| over.numeric_value)
-            .or_else(|| patch.and_then(|patch| patch.numeric_value)),
-        min_numeric_value: over
-            .and_then(|over| over.min_numeric_value)
-            .or_else(|| patch.and_then(|patch| patch.min_numeric_value)),
-        max_numeric_value: over
-            .and_then(|over| over.max_numeric_value)
-            .or_else(|| patch.and_then(|patch| patch.max_numeric_value)),
-        row_index: over
-            .and_then(|over| over.row_index)
-            .or_else(|| patch.and_then(|patch| patch.row_index)),
-        column_index: over
-            .and_then(|over| over.column_index)
-            .or_else(|| patch.and_then(|patch| patch.column_index)),
-        row_count: over
-            .and_then(|over| over.row_count)
-            .or_else(|| patch.and_then(|patch| patch.row_count)),
-        column_count: over
-            .and_then(|over| over.column_count)
-            .or_else(|| patch.and_then(|patch| patch.column_count)),
+        // 以下新增的语义字段一律**动态补丁优先、静态声明兜底** —— 与 `effective_role` /
+        // `effective_label` / `effective_value` 的合并方向一致（复审发现此前写成 over 优先，
+        // 会让静态声明永久压住 `bind_a11y` 的每帧更新，例如滑块数值永远停在初值）。
+        live: patch
+            .and_then(|patch| patch.live)
+            .or_else(|| over.and_then(|over| over.live)),
+        numeric_value: patch
+            .and_then(|patch| patch.numeric_value)
+            .or_else(|| over.and_then(|over| over.numeric_value)),
+        min_numeric_value: patch
+            .and_then(|patch| patch.min_numeric_value)
+            .or_else(|| over.and_then(|over| over.min_numeric_value)),
+        max_numeric_value: patch
+            .and_then(|patch| patch.max_numeric_value)
+            .or_else(|| over.and_then(|over| over.max_numeric_value)),
+        row_index: patch
+            .and_then(|patch| patch.row_index)
+            .or_else(|| over.and_then(|over| over.row_index)),
+        column_index: patch
+            .and_then(|patch| patch.column_index)
+            .or_else(|| over.and_then(|over| over.column_index)),
+        row_count: patch
+            .and_then(|patch| patch.row_count)
+            .or_else(|| over.and_then(|over| over.row_count)),
+        column_count: patch
+            .and_then(|patch| patch.column_count)
+            .or_else(|| over.and_then(|over| over.column_count)),
         children,
         parent: target.parent().map(A11yNodeId::from_engine),
     })

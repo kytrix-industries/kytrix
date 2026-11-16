@@ -2001,6 +2001,7 @@ impl App {
             |_| smallvec::SmallVec::<[NodeId; 4]>::new(),
             |node| node.children().iter().copied().collect(),
         );
+        let mut moved = false;
         for node in children {
             let Some(slot) = target.tree().overlay_slot(node) else {
                 continue;
@@ -2023,6 +2024,13 @@ impl App {
                 continue;
             }
             let _ = target.tree_mut().set_absolute_inset(node, origin);
+            moved = true;
+        }
+        // 纠位写回会弄脏布局，必须再调度一帧让它生效：否则第一帧按「零尺寸」定位后，
+        // 泵在没有后续输入时会直接阻塞，`Above` / `Left` 浮层永久盖住锚点（复审发现）。
+        // 收敛条件在上面（< 0.5 px 早退），所以最多多出两帧。
+        if moved {
+            self.request_frame();
         }
     }
 
@@ -2408,6 +2416,12 @@ impl App {
     }
 
     pub fn close_window(&mut self, id: WindowId) -> bool {
+        // 按窗口的旁表必须一并清掉，否则 create/close 循环下无界增长 —— 尤其是
+        // `close_handlers`：它持有应用闭包（可能捕获大量状态）。`WindowId` 单调不复用，
+        // 所以不会串用，但泄漏是真实的（复审发现：上一个提交声称清了，实际没清）。
+        self.close_handlers.remove(&id);
+        self.a11y_delivered.remove(&id);
+        self.scale_epochs.remove(&id);
         // 动画槽引用窗口内的节点与瞬态值：窗口关闭时必须一并清掉（否则 `SetTimer` 永不停）。
         self.animations.retain(|slot| slot.window != id);
         #[cfg(feature = "hud")]
@@ -3142,16 +3156,9 @@ impl App {
                     || previous.height.to_bits() != measured.height.to_bits());
             tree.set_text_shaped(node, Rc::clone(&shaped), key, epoch, measured, size_changed);
         }
-        // 光栅/图集统计：`GlyphAtlas` 自带计数器，但此前从未接进报告（`rasterized` /
-        // `tiles_reused` / `tofu` / `atlas_rebuilds` 永远是 0）。
-        //
-        // 注意**跨帧**：光栅发生在同帧的 `layout_text`（第二阶段），而本报告在第一阶段产出，
-        // 所以这里取到的是**上一帧**的光栅统计。要拿到同帧数字就得把报告延到帧末，代价是
-        // 报告与 `record.text` 的存放时机都要改；按「诊断用、允许一帧延迟」的定位保持现状。
-        let stats = self.glyph_atlas.take_stats();
-        report.tiles_reused = stats.hits;
-        report.rasterized = stats.rasters;
-        report.atlas_rebuilds = stats.rebuilds;
+        // 光栅/图集统计**不在这里**：光栅发生在同帧的 `layout_text`（第二阶段），而本报告在
+        // 第一阶段产出。`GlyphAtlas::take_stats` 只能取一次，第二阶段才是唯一正确的消费点
+        // （此前这里取到的永远是 0，复审已确认）。见 `TextLayoutReport` 的同名字段。
         report.dirty_spans = pending_dirty.spans().len();
         Some(Ok(report))
     }
@@ -3211,7 +3218,7 @@ impl App {
                 }
 
                 let layout = shaped.layout_at(width);
-                let (line, diagnostics, _stats) = match shaped.rasterize(
+                let (line, diagnostics, stats) = match shaped.rasterize(
                     &layout,
                     width,
                     raster,
@@ -3222,6 +3229,10 @@ impl App {
                     Ok(value) => value,
                     Err(error) => return Some(Err(error)),
                 };
+                // 图集统计的唯一消费点（`take_stats` 在 `rasterize` 内部完成）：按节点累加。
+                report.rasterized += stats.rasters;
+                report.tiles_reused += stats.hits;
+                report.atlas_rebuilds += stats.rebuilds;
                 pending_dirty.merge(&mut atlas.take_dirty_rows());
                 text.push_diagnostics(diagnostics);
                 tree.set_text_line(node, Rc::new(line), layout, width, generation);

@@ -172,6 +172,9 @@ pub(crate) struct WndProcState {
     resize: Option<ResizeSession>,
     /// a11y（P11：首显前构造的 `accesskit_windows::Adapter` + `WM_GETOBJECT` 接线）。
     a11y: crate::platform::windows::a11y::WindowsA11y,
+    /// 引擎**自己**即将释放指针捕获：下一个 WM_CAPTURECHANGED 不能当成`r`n    /// 「系统夺走捕获」，否则每次正常拖拽结束都会误投一次 `PointerCancel`。
+    ///（MSDN 明确：自己调 `ReleaseCapture` 也会收到该消息。）
+    suppress_capture_cancel: bool,
     /// 引擎当前生效的光标（`App::take_cursor_change` 写入）。
     ///
     /// Windows 每次鼠标移动都发 `WM_SETCURSOR`，`DefWindowProcW` 会把光标重置成**类光标**
@@ -210,6 +213,7 @@ impl WndProcState {
             // **必须在窗口显示之前构造**：`Adapter::new` 内部 `init_uia()`，
             // 且不得在处理 `WM_GETOBJECT` 时构造（adapter.rs:411-441）。
             a11y: crate::platform::windows::a11y::WindowsA11y::new(hwnd, dispatcher, window)?,
+            suppress_capture_cancel: false,
             cursor: crate::paint::style::Cursor::Default,
         })
     }
@@ -407,7 +411,15 @@ pub(crate) extern "system" fn wndproc(
         // `PointerCancel` 让交互层作废本次会话（结束拖拽 + 派发 `DragPhase::Cancel`）。
         // 自绘边框缩放有自己的收尾逻辑，走下面的分支，不重复投递。
         if msg == WM_CAPTURECHANGED && (*state).resize.is_none() {
+            if (*state).suppress_capture_cancel {
+                // 引擎自己刚 `ReleaseCapture`（正常拖拽结束 / 缩放结束）：这不是会话丢失。
+                // MSDN 明确「自己调用也会收到该消息」，不区分就会在每次松手后误投一次
+                // `PointerCancel`，把 hover 清掉并给观察者注入幽灵事件。
+                (*state).suppress_capture_cancel = false;
+                return LRESULT(0);
+            }
             (*state).events.push(PlatformEvent::PointerCancel);
+            (*state).wake();
             return LRESULT(0);
         }
 
@@ -791,6 +803,7 @@ fn pump_loop(
                     unsafe { SetCapture(hwnd) };
                 } else {
                     // SAFETY: 同上，释放本线程的捕获。
+                    native.state_mut().suppress_capture_cancel = true;
                     let _ = unsafe { ReleaseCapture() };
                 }
             }

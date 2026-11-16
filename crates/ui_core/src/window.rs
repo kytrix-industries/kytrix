@@ -629,6 +629,12 @@ impl Window {
         self.full_damage_pending = true;
         let root = self.tree.root();
         self.tree.invalidate_layout(root);
+        // **所有文本必须重新 shape**：`font_size` 与 `ppem` 在 shape 时按当时的 `scale`
+        // 烘焙进 parley `Run` 与字形位图。只标 LAYOUT 时 `layout_text` 会"重排"，但用的仍是
+        // 旧 ppem 的 `ShapedText` → 旧位图以新比例放大，文字发虚、字面不一致，直到该文本内容
+        // 再次变化。旧实现每帧全量扫描时靠 `slot.scale_epoch != epoch` 覆盖了这条路径，
+        // 改成脏集合驱动后必须显式标脏（P1 复审发现）。
+        self.tree.mark_all_text_dirty();
         // a11y 的 bounds 全是物理像素 ⇒ 比例变了必须整棵重发（P11 §5.5）。
         self.a11y.note_bounds_changed();
         // 平台真值一旦写入就不再被 covering 覆盖（F-186）。
