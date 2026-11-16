@@ -1054,8 +1054,20 @@ fn apply_event(
                 // `apply_scale` / `place` 已按新 DPI 重排非客户区：回读真实客户区。
                 // 最小化时 `GetClientRect` 是 0×0（`client_size()` 会钳成 1×1）：跳过 `set_surface`，
                 // 目标保持上一次平台写入的真实客户区；恢复窗口的 `WM_SIZE` 会用新客户区覆盖它。
+                //
+                // **逻辑尺寸必须在这里同步写回**（复审 P2-9）：`place` 只是 `SetWindowPos`，
+                // 新客户区要等下一轮的 `WM_SIZE` 才进 `Window`。本泵轮次紧接着就会出帧，
+                // 那时布局仍按旧逻辑尺寸跑、而渲染目标已是新物理尺寸 + 新 scale ⇒ 跨屏拖动
+                // 会有一帧内容被放大/裁切。先按新 DPI 换算并写回，下一轮 `WM_SIZE` 以同值覆盖
+                // （`note_client_resize` 对同值幂等）。
                 if !native.is_minimized() {
-                    window.set_surface(native.client_size());
+                    let client = native.client_size();
+                    native.note_client_resize(client);
+                    window.set_size(crate::math::Size::new(
+                        scale.to_logical(client.0 as f32),
+                        scale.to_logical(client.1 as f32),
+                    ));
+                    window.set_surface(client);
                 }
             }
             dispatcher.wake();
