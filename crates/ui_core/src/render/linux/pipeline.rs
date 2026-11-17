@@ -29,7 +29,10 @@ use crate::{
         atlas::AtlasKind,
         geometry::{GeometryPipeline, Topology},
     },
-    render::{frame::MAX_FRAMES_IN_FLIGHT, linux::device::init_error},
+    render::{
+        frame::MAX_FRAMES_IN_FLIGHT,
+        linux::device::{Device, init_error},
+    },
 };
 
 /// `RootUniform` 的字节数（P07 §2.7）。
@@ -113,11 +116,20 @@ pub(crate) struct Pipeline {
     pass_load: vk::RenderPass,
     quad: vk::Pipeline,
     geometry: GeometryPipelines,
+    /// 进程级 `VkPipelineCache`（R11-14）：启动时从缓存文件恢复，退出时写回。
+    ///
+    /// **声明在最后**：字段按声明顺序 drop，缓存要在全部 PSO 销毁之后才写回 / 销毁。
+    cache: PipelineCache,
 }
 
 impl Pipeline {
-    /// 建 `set 0` 布局、管线布局、两条 render pass（clear / load）与 4 条 PSO。
-    pub(crate) fn new(device: &ash::Device) -> Result<Self, EngineError> {
+    /// 建 `set 0` 布局、管线布局、两条 render pass（clear / load）与全部 PSO。
+    ///
+    /// PSO 走进程级 `VkPipelineCache`（落盘，见 [`PipelineCache`]）：旧实现每次启动都用
+    /// `vk::PipelineCache::null()` 同步编译 4 条 PSO（`create_quad_pipeline` + 6 条 geometry），
+    /// Mesa（radv/anv）与 NVIDIA 上每条几十到几百毫秒，lavapipe 更慢 —— 窗口开出后空白几百
+    /// 毫秒，且每次启动重复付费（R11-14）。
+    pub(crate) fn new(device: &Device) -> Result<Self, EngineError> {
         let bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(BINDING_INSTANCES)
@@ -143,7 +155,7 @@ impl Pipeline {
         ];
         // SAFETY: 描述在本次调用期间有效；句柄在 Drop 里销毁。
         let set_layout = unsafe {
-            device.create_descriptor_set_layout(
+            device.raw().create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
                 None,
             )
@@ -157,7 +169,7 @@ impl Pipeline {
             .size(ROOT_UNIFORM_BYTES)];
         // SAFETY: 句柄与参数都由本结构独占，调用期间有效（Vulkan 的外部同步已由 fence 保证）。
         let layout = unsafe {
-            device.create_pipeline_layout(
+            device.raw().create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
                     .set_layouts(&set_layouts)
                     .push_constant_ranges(&push),
@@ -166,23 +178,28 @@ impl Pipeline {
         }
         .map_err(|error| init_error("create_pipeline_layout", format!("{error:?}")))?;
 
+        // R11-14：进程级 PSO 缓存（落盘）。建在这里而不是 SharedGpu 里，是因为它的生命周期
+        // 正好等于「全部 PSO + render pass 的集合」：drop 时先销毁 PSO，再写回缓存数据。
+        let cache = PipelineCache::new(device);
+
         // CLEAR 通道从 `UNDEFINED` 起（persist 没有预先 transition）；LOAD 通道承接上一帧的布局。
         let pass_clear = create_render_pass(
-            device,
+            device.raw(),
             vk::AttachmentLoadOp::CLEAR,
             vk::ImageLayout::UNDEFINED,
         )?;
         let pass_load = create_render_pass(
-            device,
+            device.raw(),
             vk::AttachmentLoadOp::LOAD,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         )?;
-        let quad = create_quad_pipeline(device, layout, pass_clear)?;
+        let quad = create_quad_pipeline(device.raw(), cache.raw(), layout, pass_clear)?;
         let create_set =
             |topology: vk::PrimitiveTopology| -> Result<GeometryPipelineSet, EngineError> {
                 Ok(GeometryPipelineSet {
                     ui: create_geometry_pipeline(
-                        device,
+                        device.raw(),
+                        cache.raw(),
                         layout,
                         pass_clear,
                         "geometry.vs_ui.spv",
@@ -191,7 +208,8 @@ impl Pipeline {
                         topology,
                     )?,
                     image: create_geometry_pipeline(
-                        device,
+                        device.raw(),
+                        cache.raw(),
                         layout,
                         pass_clear,
                         "geometry.vs_textured.spv",
@@ -200,7 +218,8 @@ impl Pipeline {
                         topology,
                     )?,
                     glyph: create_geometry_pipeline(
-                        device,
+                        device.raw(),
+                        cache.raw(),
                         layout,
                         pass_clear,
                         "geometry.vs_textured.spv",
@@ -216,7 +235,8 @@ impl Pipeline {
         };
 
         Ok(Self {
-            device: device.clone(),
+            device: device.raw().clone(),
+            cache,
             set_layout,
             layout,
             pass_clear,
@@ -345,7 +365,140 @@ impl Drop for Pipeline {
             self.device
                 .destroy_descriptor_set_layout(self.set_layout, None);
         }
+        // 全部 PSO 都已销毁：这时写回的缓存才是完整的一份（R11-14）。
+        self.cache.write_out();
     }
+}
+
+/// `VkPipelineCache` 的落盘缓存文件（R11-14）。
+///
+/// 文件位置：`$XDG_CACHE_HOME/kytrix/pipeline-cache.bin`（没有 `XDG_CACHE_HOME` 时退回
+/// `$HOME/.cache/...`；两者都没有就不落盘，只在进程内复用）。
+///
+/// 头部（自定义，紧跟 Vulkan 的 blob 之前）记录 `pipelineCacheUUID` + `driverVersion` +
+/// `deviceName`：驱动升级 / 换卡之后旧的 blob 必须丢弃 —— 用错缓存轻则编译被跳过（错误的
+/// 机器码），重则驱动崩溃。`VkPipelineCache` 的 blob 本身由驱动校验，但我们无法在
+/// `vkCreatePipelineCache` 失败时避免泄漏，因此**先自己校验头部**再用。
+struct PipelineCache {
+    device: ash::Device,
+    raw: vk::PipelineCache,
+    /// `None` = 没有可写的缓存目录（容器 / 无家目录）。
+    path: Option<PathBuf>,
+    /// 写入文件的自定义头部（设备身份；读盘时用它做前缀比较）。
+    header: Vec<u8>,
+}
+
+/// 缓存文件的魔数（`KYTP` = Kytrix pipeline）。
+const CACHE_MAGIC: [u8; 4] = *b"KYTP";
+/// 头部版本：布局变化时必须前进（旧文件因此被丢弃）。
+const CACHE_VERSION: u32 = 1;
+
+impl PipelineCache {
+    /// 读缓存文件（头部不匹配就丢弃）→ 建 `VkPipelineCache`。
+    ///
+    /// 任何一步失败都退回「没有缓存」：PSO 仍能建出来，只是没有冷启动加速
+    /// （**不做**「缓存坏了就报错」的降级 —— 那会把可选的性能优化变成启动失败）。
+    fn new(device: &Device) -> Self {
+        let properties = device.properties();
+        let uuid = properties.pipeline_cache_uuid;
+        let header = cache_header(&uuid, properties.driver_version, &device_name(properties));
+        let path = cache_file_path();
+        let initial = path
+            .as_ref()
+            .and_then(|path| std::fs::read(path).ok())
+            .filter(|bytes| bytes.starts_with(&header))
+            .map(|bytes| cache_payload(&bytes, header.len()).to_vec());
+        let create = vk::PipelineCacheCreateInfo::default();
+        let create = match initial.as_ref() {
+            Some(blob) => create.initial_data(blob),
+            None => create,
+        };
+        // SAFETY: `create` 的指针在本次调用期间有效；句柄归本结构独占。
+        let raw = unsafe { device.raw().create_pipeline_cache(&create, None) }
+            .unwrap_or(vk::PipelineCache::null());
+        Self {
+            device: device.raw().clone(),
+            raw,
+            path,
+            header,
+        }
+    }
+
+    fn raw(&self) -> vk::PipelineCache {
+        self.raw
+    }
+
+    /// 把当前缓存写回磁盘（`get_pipeline_cache_data` 允许返回比实际更短的 blob）。
+    fn write_out(&self) {
+        if self.raw == vk::PipelineCache::null() {
+            return;
+        }
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        // SAFETY: 缓存句柄归本结构独占；本进程是唯一使用者（没有并发写）。
+        let Ok(data) = (unsafe { self.device.get_pipeline_cache_data(self.raw) }) else {
+            return;
+        };
+        // 空 blob 不值得写盘（驱动不支持序列化时会返回 0 字节）。
+        if data.is_empty() {
+            return;
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut bytes = Vec::with_capacity(self.header.len() + data.len());
+        bytes.extend_from_slice(&self.header);
+        bytes.extend_from_slice(&data);
+        // 写失败（只读 FS / 配额）不影响运行：下次启动重新编译即可。
+        let _ = std::fs::write(path, bytes);
+    }
+}
+
+impl Drop for PipelineCache {
+    fn drop(&mut self) {
+        // 写回由 Pipeline::drop 负责（在全部 PSO 销毁之后）：这里只销毁句柄。
+        if self.raw != vk::PipelineCache::null() {
+            // SAFETY: 句柄归本结构独占；PSO 在 `Pipeline::drop` 里已先销毁。
+            unsafe { self.device.destroy_pipeline_cache(self.raw, None) };
+        }
+    }
+}
+
+/// `VkPhysicalDeviceProperties::deviceName`（NUL 结尾）。
+fn device_name(properties: &vk::PhysicalDeviceProperties) -> String {
+    // SAFETY: `device_name` 是 Vulkan 保证的 NUL 结尾字符串。
+    unsafe { std::ffi::CStr::from_ptr(properties.device_name.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// 缓存文件路径（`$XDG_CACHE_HOME/kytrix/pipeline-cache.bin`，退回 `$HOME/.cache/...`）。
+fn cache_file_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+    Some(base.join("kytrix").join("pipeline-cache.bin"))
+}
+
+/// 头部字节：`magic | version | uuid(16) | driverVersion | nameLen(u8) | name`。
+fn cache_header(uuid: &[u8; 16], driver_version: u32, device_name: &str) -> Vec<u8> {
+    let name = device_name.as_bytes();
+    let name = &name[..name.len().min(u8::MAX as usize)];
+    let mut header = Vec::with_capacity(4 + 4 + 16 + 4 + 1 + name.len());
+    header.extend_from_slice(&CACHE_MAGIC);
+    header.extend_from_slice(&CACHE_VERSION.to_le_bytes());
+    header.extend_from_slice(uuid);
+    header.extend_from_slice(&driver_version.to_le_bytes());
+    header.push(name.len() as u8);
+    header.extend_from_slice(name);
+    header
+}
+
+/// 去掉自定义头部之后的驱动 blob（越界返回空）。
+fn cache_payload(bytes: &[u8], header_len: usize) -> &[u8] {
+    bytes.get(header_len..).unwrap_or(&[])
 }
 
 /// 进程级描述符池：按 `MAX_WINDOWS` 段预分配「每窗口 `MAX_FRAMES_IN_FLIGHT` 个 set」。
@@ -473,8 +626,21 @@ fn create_render_pass(
         .dst_subpass(0)
         .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
         .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-        .src_access_mask(vk::AccessFlags::empty())
-        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
+        // R11-2：`loadOp = LOAD` 会**读**上一帧写进 persist 的像素，`blend` 也会读 dst
+        // （本引擎全局 `ONE / ONE_MINUS_SRC_ALPHA`）。跨 `vkQueueSubmit` 的写→读可见性必须由
+        // memory dependency 建立：
+        //   - `srcAccessMask` release 上一次提交的 color attachment 写；
+        //   - `dstAccessMask` acquire 本帧的读（LOAD / blend）与写。
+        // 旧实现的 `srcAccessMask = empty`、`dstAccessMask = WRITE` 只构成 execution dependency，
+        // 不构成 memory dependency：在带压缩/tiling 元数据的实现（AMD DCC、Intel CCS、部分 Arm）
+        // 上，增量帧会偶发旧值 / 噪声 / 整块颜色错，而全量帧完全正常 —— 正是「CI golden 偶发差异、
+        // 手动复现不了」的形态。sync validation 会在这里报 `SYNC-HAZARD-READ_AFTER_WRITE`。
+        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+        .dst_access_mask(
+            vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        )
+        // `BY_REGION` 让驱动按 tile 处理依赖（CLEAR 通道多 acquire 一个 READ 没有额外成本）。
+        .dependency_flags(vk::DependencyFlags::BY_REGION)];
     // SAFETY: 描述在本次调用期间有效。
     unsafe {
         device.create_render_pass(
@@ -490,6 +656,7 @@ fn create_render_pass(
 
 fn create_quad_pipeline(
     device: &ash::Device,
+    cache: vk::PipelineCache,
     layout: vk::PipelineLayout,
     pass: vk::RenderPass,
 ) -> Result<vk::Pipeline, EngineError> {
@@ -552,8 +719,7 @@ fn create_quad_pipeline(
         .layout(layout)
         .render_pass(pass);
     // SAFETY: `create` 的指针在本次调用期间有效；pipeline 在 Drop 里销毁。
-    let pipelines =
-        unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &[create], None) };
+    let pipelines = unsafe { device.create_graphics_pipelines(cache, &[create], None) };
     // shader module 建完管线即可销毁（管线已持有其副本）。
     // SAFETY: 两个 module 归本函数独占且已不被引用。
     unsafe {
@@ -573,6 +739,7 @@ fn create_quad_pipeline(
 /// 无深度/模板、MSAA 关闭、`ONE / INV_SRC_ALPHA` 混合）逐字相同（`contract.md` §7）。
 fn create_geometry_pipeline(
     device: &ash::Device,
+    cache: vk::PipelineCache,
     layout: vk::PipelineLayout,
     pass: vk::RenderPass,
     vertex_shader: &str,
@@ -688,8 +855,7 @@ fn create_geometry_pipeline(
         .layout(layout)
         .render_pass(pass);
     // SAFETY: `create` 的指针在本次调用期间有效；pipeline 在 Drop 里销毁。
-    let pipelines =
-        unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &[create], None) };
+    let pipelines = unsafe { device.create_graphics_pipelines(cache, &[create], None) };
     // SAFETY: 两个 module 归本函数独占且已不被引用。
     unsafe {
         device.destroy_shader_module(vs, None);
@@ -723,8 +889,65 @@ fn shader_module(
 
 #[cfg(test)]
 mod tests {
-    use super::{DescriptorPool, MAX_FRAMES_IN_FLIGHT, MAX_WINDOWS};
+    use super::{
+        CACHE_MAGIC, CACHE_VERSION, DescriptorPool, MAX_FRAMES_IN_FLIGHT, MAX_WINDOWS,
+        cache_header, cache_payload,
+    };
     use crate::render::linux::device::{SharedGpu, gpu_test_lock};
+
+    /// R11-14：缓存文件的自定义头部必须携带**设备身份**（换卡 / 驱动升级后旧 blob 必须丢弃）。
+    #[test]
+    fn the_pipeline_cache_header_identifies_the_device() {
+        let uuid = [7u8; 16];
+        let header = cache_header(&uuid, 0x1234_5678, "llvmpipe (LLVM 20.1.0)");
+        assert_eq!(&header[..4], &CACHE_MAGIC);
+        assert_eq!(
+            u32::from_le_bytes([header[4], header[5], header[6], header[7]]),
+            CACHE_VERSION
+        );
+        assert_eq!(&header[8..24], &uuid);
+        assert_eq!(
+            u32::from_le_bytes([header[24], header[25], header[26], header[27]]),
+            0x1234_5678
+        );
+        // 设备名长度 + 设备名。
+        let name_len = header[28] as usize;
+        assert_eq!(&header[29..29 + name_len], b"llvmpipe (LLVM 20.1.0)");
+        assert_eq!(header.len(), 29 + name_len);
+
+        // 头部不同（换卡 / 换驱动 / 换驱动版本）⇒ 前缀不匹配 ⇒ 丢弃。
+        let other_uuid = [8u8; 16];
+        let other = cache_header(&other_uuid, 0x1234_5678, "llvmpipe (LLVM 20.1.0)");
+        assert!(!header.starts_with(&other));
+        let other = cache_header(&uuid, 0x9999_9999, "llvmpipe (LLVM 20.1.0)");
+        assert!(!header.starts_with(&other));
+        let other = cache_header(&uuid, 0x1234_5678, "NVIDIA GeForce RTX 4090");
+        assert!(!header.starts_with(&other));
+    }
+
+    /// 超长设备名按 `u8` 截断（头部长度字段只有 1 字节）。
+    #[test]
+    fn an_overlong_device_name_is_truncated() {
+        let long = "x".repeat(4096);
+        let header = cache_header(&[0u8; 16], 1, &long);
+        assert_eq!(header[28], u8::MAX);
+        assert_eq!(header.len(), 29 + u8::MAX as usize);
+    }
+
+    /// 去掉头部之后的 payload 正好是驱动 blob；越界给出空切片（不 panic）。
+    #[test]
+    fn the_pipeline_cache_payload_skips_the_custom_header() {
+        let header = cache_header(&[1u8; 16], 7, "dev");
+        let mut file = header.clone();
+        file.extend_from_slice(b"driver-blob");
+        assert_eq!(
+            cache_payload(&file, header.len()),
+            b"driver-blob",
+            "payload 必须从头部之后开始"
+        );
+        assert!(cache_payload(&header, header.len()).is_empty());
+        assert!(cache_payload(&[], 40).is_empty());
+    }
 
     /// 描述符池按窗口段预分配：段用尽后明确失败、归还后可复用。
     #[test]

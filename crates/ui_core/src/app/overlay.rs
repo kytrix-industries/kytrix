@@ -7,7 +7,7 @@ use crate::{
     error::EngineError,
     interaction,
     interaction::{
-        Overlay, OverlayDismiss, OverlayOptions, OverlayPlacement, OverlaySlot,
+        Overlay, OverlayDismiss, OverlayOptions, OverlayPlacement, OverlaySlot, focus,
         overlay as overlay_util,
     },
     math::{Rect, Size},
@@ -19,8 +19,11 @@ use crate::{
 
 /// 打开一个浮层（root 的最后一个子节点 ⇒ `order` 末尾 ⇒ 命中优先）。
 ///
-/// 记录打开瞬间的焦点节点作为 **opener**（`restore_focus` 时关闭后还给触发按钮，R02-12）；
+/// 记录打开瞬间的**焦点候选**作为 **opener**（`restore_focus` 时关闭后还给触发按钮，R02-12）；
 /// `trap_focus` 置位时该浮层成为焦点作用域根（Tab 只在子树内循环、外部按下被消费）。
+///
+/// `opener` 的求值见函数体第一步：它是「这个浮层属于谁」的唯一依据
+/// （[`crate::interaction::overlay::in_modal_scope`] 沿 `opener` 链判断浮层是否属于模态）。
 ///
 /// # Errors
 /// `UnknownWindow`（窗口已关闭）/ `StaleNode`（树结构被破坏）。
@@ -30,7 +33,28 @@ pub(crate) fn create_overlay(
     window: WindowId,
     options: OverlayOptions,
 ) -> Result<Overlay, EngineError> {
-    let opener = app.focused(window);
+    // opener 取「创建浮层时的焦点候选」，**不能**用 `App::focused`：后者把模态作用域外的焦点
+    // 过滤成 `None`，而 `in_modal_scope` 对 `opener == None` 直接判「作用域外」——于是「同一个
+    // 回调里先开对话框、紧接着开它的下拉/菜单」（模态已建立、焦点还没被 `validate_focus`
+    // 修复）会得到 `opener = None`，菜单永久不可点（AR1b N1a）。
+    //
+    // 求值顺序（每一步都要求节点仍存活）：
+    // 1. **未过滤的原始焦点**（`Window::focus`），但只接受当前作用域内的：模态刚建立时焦点
+    //    仍在背景控件上，此时新开的浮层必须归属模态（top-layer 语义），不能被旧焦点带出作用域；
+    // 2. 本次创建前的**命中节点**（点击/滑过打开菜单，而焦点还没落上去）；
+    // 3. **当前焦点作用域根**（模态本身）：模态之上新开的浮层属于该模态。
+    //
+    // 没有模态时作用域为空，1/2 两步恒成立，行为与旧实现一致。
+    let opener = app.windows.get(&window).and_then(|target| {
+        let tree = target.tree();
+        let scope = overlay_util::focus_scope_root(tree, tree.root());
+        let candidate = |node: Option<NodeId>| {
+            node.filter(|node| tree.get(*node).is_ok() && focus::in_scope(tree, *node, scope))
+        };
+        candidate(target.focus().focused())
+            .or_else(|| candidate(target.pointer().last_hit.map(|hit| hit.node)))
+            .or(scope)
+    });
     let Some(target) = app.windows.get_mut(&window) else {
         return Err(EngineError::UnknownWindow { window });
     };

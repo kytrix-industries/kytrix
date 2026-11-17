@@ -4,22 +4,35 @@
 //! 字形图集是 `R8_UNORM`（线性覆盖率），图片图集是 `B8G8R8A8_UNORM_SRGB`。两张纹理是**进程级
 //! 共享资源**，由 `device::SharedGpu` 持有；每窗口只有自己的**上传路径**：
 //!
-//! - [`SharedAtlas`]：纹理 + 当前页尺寸 + 行 pitch。懒分配：初始化只建 1×1 占位纹理（SRV 始终
-//!   指向有效资源），第一次整页上传或页档换代时由 `SharedGpu::rebuild_atlas_pages` 重建。
+//! - [`SharedAtlas`]：纹理 + 当前页尺寸 + 行 pitch + **CPU 影子页**。懒分配：初始化只建 1×1
+//!   占位纹理（SRV 始终指向有效资源），第一次整页上传或页档换代时由
+//!   `SharedGpu::rebuild_atlas_pages` 重建。
 //! - [`AtlasUploads`]（每窗口）：待上传页 + 每 in-flight 槽的 staging。staging 必须是每窗口的：
 //!   同一份共享纹理会被多个窗口的 GPU 线程并发上传，各窗口的 staging 不能互相覆盖；每个槽的
 //!   staging 又只在本窗口该槽的 fence 完成前复用（与 `UploadArena` 同一套 in-flight 语义）。
 //!
 //! 并发模型：窗口的 GPU 线程在 `SharedGpu` 的图集**读锁**内录制并提交（页在录制期间不会变），
-//! 页重建走**写锁**并等待共享队列 idle（旧纹理 / 旧描述符不再被任何在飞命令列表引用），因此
-//! 多个窗口同时上传同一纹理是安全的：提交到同一队列的命令列表按提交顺序执行，每个列表内部的
-//! `PIXEL_SHADER_RESOURCE → COPY_DEST → PIXEL_SHADER_RESOURCE` 屏障序列因此不会交错。
+//! 页重建走**写锁**。写锁期间不可能出现新的提交（录制与提交都在读锁内），因此页换代只需要等
+//! 各窗口登记的**提交水位**（`queue::StreamWatermark`）而不必等整条共享队列 idle（R08-6）。
+//!
+//! **staging 的释放必须由 fence 保护**（R08-2）：D3D12 **不**替应用保活命令列表引用过的资源
+//! （MSDN：应用必须保证 GPU 完成前不释放被引用资源），所以被本帧列表读过的 staging 句柄一律
+//! 交给 `CommandStream::retire`（按帧序号延迟释放），**只有**调用方已经 `wait_idle` 的路径
+//! （teardown / 回退重建）才允许立即 `shared.release`。
 //!
 //! staging 有两档：**每槽常驻**一小块（≤ 1 MiB，增量上传复用）与**一次性**大块（整页上传，
 //! 录制后按帧 retire）。常驻容量因此不随图集页尺寸放大（DEVIATIONS F-216）。页尺寸随上传
 //! **显式过线**（S-153），不由 `pixels.len()` 反推：增量载荷只有脏行，长度不足以恢复整页尺寸。
+//!
+//! **CPU 影子页**（R08-4）：每张图集的当前页在系统内存里留一份 1:1 拷贝（字形 4 MiB / 图片
+//! 16 MiB）。设备丢失后进程内恢复靠它把图集内容原样重传 —— 否则恢复出来的窗口只有占位纹理，
+//! 所有字形与图片都会消失。写入点就是 [`AtlasUploads::record_uploads`]（CPU 已经有一份字节，
+//! 增量行落位成本与 staging 拷贝同量级）。
 
-use std::ops::Range;
+use std::{
+    ops::Range,
+    sync::{Mutex, MutexGuard, PoisonError},
+};
 
 use windows::Win32::Graphics::{
     Direct3D12::*,
@@ -62,7 +75,7 @@ struct SharedPage {
 
 impl SharedPage {
     fn new(device: &ID3D12Device, kind: AtlasKind, page: u32) -> Result<Self, EngineError> {
-        let row_pitch = align_up(page * texel_bytes(kind), PITCH_ALIGNMENT);
+        let row_pitch = row_pitch_for(kind, page);
         let resource = create_texture(device, page, page, texture_format(kind))?;
         Ok(Self {
             resource,
@@ -76,6 +89,17 @@ impl SharedPage {
 pub(crate) struct SharedAtlas {
     glyph: SharedPage,
     image: SharedPage,
+    /// 每张图集当前页的 CPU 影子（`R08-4`：设备丢失后按它重传；见模块文档）。
+    ///
+    /// 放在 `Mutex` 里而不是复用读写锁：影子只在**录制期**（已经持有图集读锁）被更新，
+    /// 两个窗口并发上传同一页时写的是同一份内容，锁只保证 `Vec` 不被并发破坏。
+    shadow: [Mutex<Option<ShadowPage>>; 2],
+}
+
+/// 一张图集页的 CPU 侧 1:1 拷贝（紧密行，行宽 = `page × texel`）。
+struct ShadowPage {
+    page: u32,
+    pixels: Vec<u8>,
 }
 
 impl SharedAtlas {
@@ -84,6 +108,7 @@ impl SharedAtlas {
         Ok(Self {
             glyph: SharedPage::new(device, AtlasKind::Glyph, PLACEHOLDER_PAGE)?,
             image: SharedPage::new(device, AtlasKind::Image, PLACEHOLDER_PAGE)?,
+            shadow: [Mutex::new(None), Mutex::new(None)],
         })
     }
 
@@ -101,17 +126,71 @@ impl SharedAtlas {
         self.page_ref(kind).row_pitch
     }
 
-    /// 换页：按新页尺寸建纹理并替换本页（旧纹理由 COM 引用计数管理：仍被已提交的命令列表
-    /// 引用的对象在那些列表重置之后才真正销毁）。调用方已保证共享队列 idle（不含在飞引用）。
+    /// 换页：按新页尺寸建纹理并替换本页；返回被换下来的旧纹理（调用方决定立即释放还是挂进
+    /// 延迟销毁表，R08-6 的慢路径）。
+    ///
+    /// 正常路径的调用方（`SharedGpu::rebuild_atlas_pages`）已经等到全部窗口的提交水位，因此
+    /// 旧纹理不再被任何在飞命令列表引用，可以立即 drop。
     pub(crate) fn recreate(
         &mut self,
         device: &ID3D12Device,
         kind: AtlasKind,
         page: u32,
-    ) -> Result<(), EngineError> {
+    ) -> Result<ID3D12Resource, EngineError> {
         let next = SharedPage::new(device, kind, page)?;
-        *self.page_mut(kind) = next;
-        Ok(())
+        let old = std::mem::replace(self.page_mut(kind), next);
+        Ok(old.resource)
+    }
+
+    /// 把一次上传的字节写进 CPU 影子（R08-4）。
+    ///
+    /// `pixels` 是 `rows` 顺序**紧密打包**的行（与 staging 的写入布局同源）；页尺寸变化说明
+    /// App 换代，影子按新页整页重建（整页上传是换代之后的唯一合法载荷，见
+    /// [`AtlasUploads::reconcile_pages`]）。
+    fn update_shadow(&self, kind: AtlasKind, page: u32, pixels: &[u8], rows: &DirtyRows) {
+        let row_bytes = page as usize * texel_bytes(kind) as usize;
+        if row_bytes == 0 || pixels.len() != rows.row_count(page) as usize * row_bytes {
+            return;
+        }
+        let mut shadow = shadow_lock(&self.shadow[kind.index() as usize]);
+        if shadow.as_ref().is_none_or(|shadow| shadow.page != page) {
+            *shadow = Some(ShadowPage {
+                page,
+                pixels: vec![0; row_bytes * page as usize],
+            });
+        }
+        let Some(shadow) = shadow.as_mut() else {
+            return;
+        };
+        let full = 0..page;
+        let spans: &[Range<u32>] = if rows.is_full() {
+            std::slice::from_ref(&full)
+        } else {
+            rows.spans()
+        };
+        let mut packed_row = 0usize;
+        for span in spans {
+            for row in span.clone() {
+                let source = packed_row * row_bytes;
+                let destination = row as usize * row_bytes;
+                if source + row_bytes <= pixels.len()
+                    && destination + row_bytes <= shadow.pixels.len()
+                {
+                    shadow.pixels[destination..destination + row_bytes]
+                        .copy_from_slice(&pixels[source..source + row_bytes]);
+                }
+                packed_row += 1;
+            }
+        }
+    }
+
+    /// 设备丢失恢复用：两张图集当前页的 `(页尺寸, 整页字节)`（没有影子页的图集是 `None`）。
+    pub(crate) fn shadow_snapshot(&self) -> [Option<(u32, Vec<u8>)>; 2] {
+        std::array::from_fn(|index| {
+            shadow_lock(&self.shadow[index])
+                .as_ref()
+                .map(|shadow| (shadow.page, shadow.pixels.clone()))
+        })
     }
 
     fn page_ref(&self, kind: AtlasKind) -> &SharedPage {
@@ -127,6 +206,10 @@ impl SharedAtlas {
             AtlasKind::Image => &mut self.image,
         }
     }
+}
+
+fn shadow_lock(shadow: &Mutex<Option<ShadowPage>>) -> MutexGuard<'_, Option<ShadowPage>> {
+    shadow.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// 每 in-flight 槽一块 staging（页变化时整组重建）。
@@ -209,11 +292,16 @@ impl AtlasStaging {
         })
     }
 
-    /// 整组交还原来的 staging 句柄（旧缓冲可能仍被本窗口在飞的命令列表引用：COM 引用由那些
-    /// 列表持有，这里只释放本结构的句柄表项，等列表 reset 后对象才真正销毁）。
-    fn release(self, shared: &SharedGpu) {
+    /// 把整组 staging 的句柄交给调用方 retire（R08-2）。
+    ///
+    /// D3D12 **不**替应用保活命令列表引用过的资源（MSDN：应用必须保证 GPU 完成前不释放被引用
+    /// 的资源）。这些缓冲可能仍被本窗口其它 in-flight 槽的命令列表在读，立即
+    /// `shared.release` 会把它从设备句柄表里摘掉并由 COM 当场销毁 —— 那正是「in-flight 帧
+    /// 引用已释放 staging」的 use-after-free。所以这里只交出句柄，由调用方按**帧序号**交给
+    /// `CommandStream::retire`。只有调用方已经 `wait_idle` 的路径（teardown）才允许立即释放。
+    fn retire(self, retired: &mut Vec<GpuResourceHandle>) {
         for slot in self.slots {
-            let _ = shared.release(slot.handle);
+            retired.push(slot.handle);
         }
     }
 
@@ -249,7 +337,7 @@ impl AtlasStaging {
         retired: &mut Vec<GpuResourceHandle>,
     ) -> Result<(), EngineError> {
         let resource = atlas.texture(self.kind);
-        barrier(
+        transition(
             list,
             resource,
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
@@ -311,7 +399,7 @@ impl AtlasStaging {
             packed_row += rows;
         }
 
-        barrier(
+        transition(
             list,
             resource,
             D3D12_RESOURCE_STATE_COPY_DEST,
@@ -504,11 +592,13 @@ impl AtlasUploads {
 
     /// 把 staging 对齐到共享页：页尺寸变化（或第一次上传）时整组重建本窗口的 staging。
     ///
-    /// 必须在 `reconcile_pages` 之后、录制之前调用：此时每个待上传页都等于共享页。
+    /// 必须在 `reconcile_pages` 之后、录制之前调用：此时每个待上传页都等于共享页。被换下来的
+    /// 旧 staging 句柄推进 `retired`（调用方按本帧序号 retire，R08-2）。
     pub(crate) fn sync_staging(
         &mut self,
         shared: &SharedGpu,
         atlas: &SharedAtlas,
+        retired: &mut Vec<GpuResourceHandle>,
     ) -> Result<(), EngineError> {
         for kind in [AtlasKind::Glyph, AtlasKind::Image] {
             let index = kind.index() as usize;
@@ -524,14 +614,15 @@ impl AtlasUploads {
             let page = pending.page;
             let staging = AtlasStaging::new(shared, kind, page, atlas.row_pitch(kind))?;
             if let Some(old) = self.staging[index].replace(staging) {
-                old.release(shared);
+                old.retire(retired);
             }
             debug_assert_eq!(atlas.page(kind), page, "图集页与待上传页必须已经对齐");
         }
         Ok(())
     }
 
-    /// 在本帧命令列表里录制全部待上传页（每页 = staging 写入 + 逐区间 `CopyTextureRegion`）。
+    /// 在本帧命令列表里录制全部待上传页（每页 = staging 写入 + 逐区间 `CopyTextureRegion`），
+    /// 同时把字节落进 CPU 影子页（R08-4 的恢复来源）。
     ///
     /// 返回因 staging 扩容换下的旧句柄（调用方在本帧录制结束后 retire；D3D12 命令列表
     /// 不持有资源引用，立即 drop 会让在飞帧读已释放的缓冲）。
@@ -557,6 +648,8 @@ impl AtlasUploads {
                 // 防御：页在录制期间被改（理论上被图集读锁排除）。丢掉而不是画错内容。
                 continue;
             }
+            // 影子页与 GPU 上传用同一份字节：设备丢失后按它重传整页（R08-4）。
+            atlas.update_shadow(kind, pending.page, &pending.pixels, &pending.rows);
             let Some(staging) = self.staging[index].as_mut() else {
                 return Err(EngineError::AppInit {
                     detail: smol_str::format_smolstr!(
@@ -572,7 +665,7 @@ impl AtlasUploads {
     }
 }
 
-fn barrier(
+pub(crate) fn transition(
     list: &ID3D12GraphicsCommandList,
     resource: &ID3D12Resource,
     before: D3D12_RESOURCE_STATES,
@@ -608,6 +701,60 @@ fn texture_format(kind: AtlasKind) -> windows::Win32::Graphics::Dxgi::Common::DX
 
 fn align_up(value: u32, alignment: u32) -> u32 {
     value.div_ceil(alignment) * alignment
+}
+
+/// 该图集在 `page` 尺寸下的 staging 行 pitch（字节，256 对齐）。
+///
+/// 共享纹理、每窗口 staging、设备恢复时的一次性 staging 都用同一个行 pitch：D3D12 的
+/// `PlacedFootprint.RowPitch` 必须 256 对齐，三者不一致会让整页拷贝错行。
+pub(crate) fn row_pitch_for(kind: AtlasKind, page: u32) -> u32 {
+    align_up(page * texel_bytes(kind), PITCH_ALIGNMENT)
+}
+
+/// 把一块 UPLOAD staging 的整页内容拷进图集纹理（设备恢复用，R08-4）。
+///
+/// 调用方负责前后各一次状态过渡（`PIXEL_SHADER_RESOURCE → COPY_DEST → PIXEL_SHADER_RESOURCE`），
+/// 并保证 `staging.pixels.len() == row_pitch × page`。
+pub(crate) fn copy_page(
+    list: &ID3D12GraphicsCommandList,
+    texture: &ID3D12Resource,
+    staging: &ID3D12Resource,
+    kind: AtlasKind,
+    page: u32,
+    row_pitch: u32,
+) {
+    let placed = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+        Offset: 0,
+        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+            Format: texture_format(kind),
+            Width: page,
+            Height: page,
+            Depth: 1,
+            RowPitch: row_pitch,
+        },
+    };
+    let mut destination = D3D12_TEXTURE_COPY_LOCATION {
+        pResource: core::mem::ManuallyDrop::new(Some(texture.clone())),
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: 0,
+        },
+    };
+    let mut source = D3D12_TEXTURE_COPY_LOCATION {
+        pResource: core::mem::ManuallyDrop::new(Some(staging.clone())),
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            PlacedFootprint: placed,
+        },
+    };
+    // SAFETY: 两个 location 与 `placed` 在调用期间有效；整页区间落在纹理与 staging 内
+    // （staging 按 `row_pitch × page` 分配）。
+    unsafe { list.CopyTextureRegion(&destination, 0, 0, 0, &source, None) };
+    // SAFETY: `pResource` 是 `ManuallyDrop`，结构体 drop 不释放 COM 引用（DEVIATIONS F-86）。
+    unsafe {
+        core::mem::ManuallyDrop::drop(&mut destination.pResource);
+        core::mem::ManuallyDrop::drop(&mut source.pResource);
+    }
 }
 
 /// 每槽常驻 staging 的初始行数：受 1 MiB 上限与 [`STAGING_ROWS`] 双重约束。
@@ -702,8 +849,10 @@ mod tests {
         paint::atlas::AtlasKind,
         render::{
             atlas::{DirtyRows, MAX_ATLAS_PAGE, MAX_RESIDENT_STAGING_BYTES},
+            frame::MAX_FRAMES_IN_FLIGHT,
             windows::{device::SharedGpu, queue::CommandStream, readback::Readback},
         },
+        window::FrameIndex,
     };
 
     /// 测试页：2048² 的纹理在 WARP 上代价过高（且会拖垮并行的 GPU 测试）。
@@ -758,20 +907,21 @@ mod tests {
                 self.atlas.page(AtlasKind::Image),
             ]);
             for (kind, page) in rebuild.drain(..) {
-                self.atlas
+                let _old = self
+                    .atlas
                     .recreate(self.shared.raw(), kind, page)
                     .expect("recreate atlas page");
             }
+            let mut retired = Vec::new();
             self.uploads
-                .sync_staging(&self.shared, &self.atlas)
+                .sync_staging(&self.shared, &self.atlas, &mut retired)
                 .expect("sync staging");
             let shared = &self.shared;
             let atlas = &self.atlas;
             let uploads = &mut self.uploads;
-            let mut retired = Vec::new();
             self.stream
                 .submit_immediate(|list| {
-                    retired = uploads.record_uploads(shared, atlas, list, 0)?;
+                    retired.extend(uploads.record_uploads(shared, atlas, list, 0)?);
                     Ok(())
                 })
                 .expect("upload");
@@ -997,6 +1147,89 @@ mod tests {
             [0x55, 0x44, 0x33, 0xFF],
             "image last row"
         );
+    }
+
+    /// R08-2：页换代交出来的旧 staging 句柄必须走 retire，不能当场从共享设备表里摘掉。
+    ///
+    /// D3D12 **不**替应用保活命令列表引用过的资源；旧实现（注释写「COM 引用由那些列表持有」）
+    /// 在页换代时立即 `release`，两个 in-flight 槽仍可能在读这些 UPLOAD 缓冲。
+    #[test]
+    fn a_page_change_retires_the_old_staging_instead_of_releasing_it() {
+        let _guard = crate::render::windows::device::gpu_test_lock();
+        let mut harness = Harness::new();
+        // 页 64：建 3 槽常驻 staging（64² 字形整页 4 KiB ≪ 1 MiB）。
+        let _ = harness.upload(
+            AtlasKind::Glyph,
+            64,
+            vec![0u8; (64 * 64) as usize],
+            full_rows(),
+        );
+        let live = harness.shared.live_resources();
+        assert_eq!(live, MAX_FRAMES_IN_FLIGHT, "页 64 只注册 3 个常驻 staging");
+
+        // 页 128：整页上传 = App 换代 ⇒ 重建共享页 + 整组 staging 换代。
+        let retired = harness.upload(
+            AtlasKind::Glyph,
+            128,
+            vec![0u8; (128 * 128) as usize],
+            full_rows(),
+        );
+        assert_eq!(
+            retired.len(),
+            MAX_FRAMES_IN_FLIGHT,
+            "整组 3 个旧 staging 必须交给 retire（R08-2）"
+        );
+        assert_eq!(
+            harness.shared.live_resources(),
+            live + MAX_FRAMES_IN_FLIGHT,
+            "新增 3 个 staging，而旧的 3 个必须**还活着**（尚未 retire）"
+        );
+
+        // 交给提交流之后仍在 retire 队列里（fence 未到，不能释放）。
+        for handle in retired {
+            harness.stream.retire(FrameIndex::from_raw(1), handle);
+        }
+        assert!(
+            harness.stream.pending_retire() >= MAX_FRAMES_IN_FLIGHT,
+            "retire 队列必须持有这些句柄直到该帧 fence 完成"
+        );
+    }
+
+    /// R08-4：CPU 影子页必须与上传字节一致 —— 设备丢失后靠它把图集内容重传回新设备。
+    #[test]
+    fn the_atlas_shadow_mirrors_full_and_incremental_uploads() {
+        let _guard = crate::render::windows::device::gpu_test_lock();
+        let mut harness = Harness::new();
+        let row_bytes = TEST_PAGE as usize;
+
+        // 整页上传：影子页 = 整页字节（紧密行）。
+        let mut page = vec![0u8; row_bytes * TEST_PAGE as usize];
+        page[5 * row_bytes + 3] = 0xAB;
+        harness.upload(AtlasKind::Glyph, TEST_PAGE, page.clone(), full_rows());
+        let snapshot = harness.atlas.shadow_snapshot();
+        let (size, bytes) = snapshot[0]
+            .as_ref()
+            .expect("glyph shadow after full upload");
+        assert_eq!(*size, TEST_PAGE);
+        assert_eq!(bytes, &page, "影子页必须与整页字节 1:1");
+
+        // 增量上传：只有脏行覆盖，其余像素保持（打包缓冲里只有脏行）。
+        let dirty_row = vec![0x77u8; row_bytes];
+        harness.upload(AtlasKind::Glyph, TEST_PAGE, dirty_row, rows(5, 6));
+        let snapshot = harness.atlas.shadow_snapshot();
+        let bytes = &snapshot[0].as_ref().expect("glyph shadow").1;
+        assert_eq!(bytes[5 * row_bytes + 3], 0x77, "脏行被覆盖");
+        assert_eq!(bytes[4 * row_bytes], 0, "脏行之外保持不变");
+
+        // 页换代：影子页按新页整页重建。
+        harness.upload(AtlasKind::Glyph, 128, vec![0x11u8; 128 * 128], full_rows());
+        let snapshot = harness.atlas.shadow_snapshot();
+        let (size, bytes) = snapshot[0]
+            .as_ref()
+            .expect("glyph shadow after page change");
+        assert_eq!(*size, 128);
+        assert!(bytes.len() == 128 * 128);
+        assert!(bytes.iter().all(|byte| *byte == 0x11));
     }
 
     /// 多脏段必须各自落位：每段写到 staging 自己的行偏移，`CopyTextureRegion` 的

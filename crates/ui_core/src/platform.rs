@@ -10,13 +10,14 @@
 //! 三份实现都必须提供：`run(app)`、`window::NativeWindow`、`dpi`、`ime`、`clipboard`、`a11y`。
 
 pub(crate) mod dispatcher;
-/// IME 的跨平台纯逻辑：组合串子句归一化（三平台共用）、提交去重（macOS / Linux）、
-/// `replacementRange` 换算（macOS）。
+/// IME 的跨平台纯逻辑：组合串子句归一化（Windows 的 `GCS_*` 原始字节 + Linux
+/// `preedit_string` 的字节光标）、提交去重（macOS 按键作用域）、`replacementRange` 换算（macOS）。
 ///
 /// **Windows 也编译**：`GCS_COMPATTR` / `GCS_COMPCLAUSE` 的原始字节在
 /// `platform/ime::preedit_clauses` 里压成 `ImeEvent::Preedit::clauses` 区间，这一段纯逻辑
 /// 因此可以在开发机上单测（而不是只在真机 IME 下才能观察）。macOS / Linux 专用项用
-/// 各自的 `cfg` 关掉，避免 Windows 构建出现死代码。
+/// 各自的 `cfg` 关掉，避免 Windows 构建出现死代码。Linux 的 `preedit_carets`（字节偏移 →
+/// UTF-16 码元）同样与平台类型无关，在 Windows 上被单测覆盖。
 pub(crate) mod ime;
 
 /// 原生主菜单的**平台无关模型**：菜单树、键盘等价物、AppKit 标准 selector、以及

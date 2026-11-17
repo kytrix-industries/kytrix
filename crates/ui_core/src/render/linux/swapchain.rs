@@ -4,9 +4,11 @@
 //! 实例是进程级的（[`VulkanInstance`]），swapchain / surface 是**每窗口**的：多窗口共享同一个
 //! `VkDevice` 与同一条 graphics queue，但各自的 surface 与图像链互不相干。
 //!
-//! **无局部 present**：swapchain image 的内容 present 后未定义 ⇒ 每帧整面 `cmd_copy_image`；
-//! `VK_KHR_incremental_present` 只作为 `pNext` hint（引擎不依赖）。整面 copy 要求 persist 与
-//! swapchain image 同格式，因此 swapchain 固定要求 [`RENDER_FORMAT`]（不做格式回退）。
+//! **没有「必须整面 copy」这回事**（R11-12）：present 之后 swapchain image 的内容对应用不可信，
+//! 但每张 image 相对 persist 还差哪些矩形是**可以记账**的（`render::compositor::ImageCopyPlan`）。
+//! 本模块只负责两件事：把「这次要拷哪些矩形 / 这次要 hint 哪些矩形」翻译成 `VkImageCopy` 与
+//! `VkPresentRegionKHR`，且**两者必须一致**（hint 说没变、实际又写了，是 hint 语义内的浪费；
+//! 反过来「hint 说要变、实际没写」则会让合成器保留旧像素）。
 //!
 //! 同步原语的所有权（§7.2）：
 //! - `image_available` 在每窗口的 `FrameSync` 里**每帧槽一个**（acquire 时 signal、submit 时 wait）；
@@ -16,33 +18,33 @@
 //! 节奏（I3）：`vkAcquireNextImageKHR` 就是 Vulkan 的呈现节奏原语；超时用有限值（100 ms），
 //! 只为在遮挡 / 合成器停摆时仍能响应 shutdown。阻塞只发生在 GPU 线程（§8.2）。
 //!
-//! 销毁（§7.4）：本结构没有「重建」入口。重建由 `GpuRenderer` 用 `oldSwapchain` 创建新结构完成，
-//! 旧结构留在延迟销毁队列里，等新 swapchain 成功 present 至少一帧且该帧完成之后才 drop
-//! （`vkDeviceWaitIdle` **不能**证明 presentation engine 已释放图像，因此不作为释放依据）。
-//!
-//! `VkQueue` 的主机访问来自多个窗口线程（present），因此经 `SharedGpu::with_queue` 串行化
-//! （Vulkan 要求外部同步）。
+//! 销毁（§7.4 / R11-3）：`vkDestroySwapchainKHR` 要求「所有从该 swapchain 获取的 image 的使用
+//! 已完成」，`vkDestroySemaphore` 要求「引用该信号量的批次已完成」—— present 的 `waitSemaphores`
+//! 也算引用。**队列 idle 是这两条的前置条件**，`GpuRenderer` 在销毁前必须做过一次
+//! `SharedGpu::wait_queue_idle`（有界 2 s）。旧注释声称「`vkDeviceWaitIdle` 不能证明 presentation
+//! engine 已释放图像，因此不作为释放依据」，并因此把释放挂在「新链某帧的 timeline」上 —— 那是
+//! **更弱**的同步（两者之间没有任何依赖关系），也正是 R11-3 的成因。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use ash::vk::{self, Handle};
 
 use crate::{
     error::EngineError,
     render::{
-        compositor::{FramePlan, Plan},
+        compositor::DamageRects,
         linux::{
             device::{SharedGpu, on_gpu_thread},
-            pipeline::RENDER_FORMAT,
+            plan::{
+                self, SwapchainKey, choose_composite_alpha, choose_extent, choose_image_count,
+                choose_present_mode, choose_surface_format,
+            },
         },
     },
 };
 
 /// acquire 的有限超时（100 ms）：只用于响应 shutdown（§7.3 / §8.2）。
 const ACQUIRE_TIMEOUT_NS: u64 = 100 * 1_000_000;
-
-/// Wayland surface **必须**报告 `MAILBOX`（WSI 规范；§7.6）：最新帧替换待呈现帧，与最新帧槽同构。
-const PRESENT_MODE: vk::PresentModeKHR = vk::PresentModeKHR::MAILBOX;
 
 /// `vkAcquireNextImageKHR` 的结果（`NOT_READY` 不是错误：回循环检查 shutdown / 新帧）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +55,8 @@ pub(crate) enum Acquire {
     NotReady,
     /// surface 与 swapchain 不匹配：重建后重试。
     OutOfDate,
+    /// surface 永久失效（合成器重启 / 显卡复位）：**重建 `VkSurfaceKHR`** 之后重试（R11-11）。
+    SurfaceLost,
 }
 
 /// `vkQueuePresentKHR` 的结果。
@@ -64,6 +68,8 @@ pub(crate) enum Present {
     Suboptimal,
     /// 本帧没能呈现：重建 swapchain 后重试。
     OutOfDate,
+    /// surface 永久失效：与 acquire 侧同一恢复路径（R11-11）。
+    SurfaceLost,
 }
 
 /// 一个窗口的 `VkSurfaceKHR`（存活期 = 窗口渲染器）。
@@ -128,13 +134,15 @@ impl Drop for Surface {
     }
 }
 
-/// swapchain + **每 image 一个** render-finished 信号量。
+/// swapchain + **每 image 一个** render-finished 信号量 + 建链参数快照。
 pub(crate) struct Swapchain {
     device: ash::Device,
     raw: vk::SwapchainKHR,
     fn_: ash::khr::swapchain::Device,
     images: Vec<vk::Image>,
-    extent: vk::Extent2D,
+    /// 一次成功建链的全部参数（诊断 + 重建必要性判断，R11-7 / R11-8）。
+    key: SwapchainKey,
+    /// `VK_KHR_incremental_present` **是否已启用**（不是「扩展可用」：R11-23）。
     incremental: bool,
     /// 长度 = `images.len()`：按 image index 索引（§7.2 硬规则 1）。
     render_finished: Vec<vk::Semaphore>,
@@ -176,35 +184,28 @@ impl Swapchain {
             .ok_or_else(|| EngineError::Swapchain {
                 detail: smol_str::SmolStr::new_static("swapchain requires a Wayland surface"),
             })?;
-        // SAFETY: 句柄与参数都由本结构独占，调用期间有效（Vulkan 的外部同步已由 fence 保证）。
+        // SAFETY: 句柄与参数都由本结构独占，调用期间有效。
         let formats =
             unsafe { surface_fn.get_physical_device_surface_formats(shared.physical(), surface) }
                 .map_err(|error| EngineError::Swapchain {
                 detail: smol_str::format_smolstr!("get_physical_device_surface_formats: {error:?}"),
             })?;
-        // 渲染目标格式是进程级固定的（PSO / render pass / persist 都按它建）：surface 必须提供
-        // 同一格式，否则整面 `cmdCopyImage` 不合法（B8G8R8A8_SRGB 与 R8G8B8A8_SRGB 不兼容）。
-        // R06-10：`colorSpace` 必须与引擎声明的呈现色彩空间一致（`render::colorspace`）。
-        // 旧实现只查 format、把合成器给的 `colorSpace` 原样透传 —— 在 HDR/P3 合成器上会整屏偏色。
-        // 与 `MAILBOX` 的处理一致：规范要求的硬前提，不满足就按 D8 基线失败，不做静默回退。
-        let chosen = formats
-            .iter()
-            .find(|candidate| {
-                candidate.format == RENDER_FORMAT
-                    && crate::render::colorspace::accepts_color_space(candidate.color_space)
-            })
-            .copied()
-            .ok_or_else(|| EngineError::UnsupportedGpu {
-                os: "linux",
-                required: "B8G8R8A8_SRGB surface format with VK_COLOR_SPACE_SRGB_NONLINEAR_KHR",
-                actual: smol_str::format_smolstr!(
-                    "surface reports {:?}",
-                    formats
-                        .iter()
-                        .map(|format| (format.format, format.color_space))
-                        .collect::<Vec<_>>()
-                ),
-            })?;
+        // R11-8 / R06-10：format 与 colorSpace 必须**同时**匹配引擎声明的呈现契约
+        // （`render::colorspace`）。旧实现只看 format、把合成器给的 colorSpace 原样透传 ——
+        // 在 HDR / P3 合成器上会把 sRGB 编码字节按 PQ/HLG 解释，整屏亮度与对比度错误。
+        let chosen =
+            choose_surface_format(&formats, crate::render::colorspace::accepts_color_space)
+                .ok_or_else(|| EngineError::UnsupportedGpu {
+                    os: "linux",
+                    required: "B8G8R8A8_SRGB surface format with VK_COLOR_SPACE_SRGB_NONLINEAR_KHR",
+                    actual: smol_str::format_smolstr!(
+                        "surface reports {:?}",
+                        formats
+                            .iter()
+                            .map(|format| (format.format, format.color_space))
+                            .collect::<Vec<_>>()
+                    ),
+                })?;
         // SAFETY: 只读查询；surface 由同一实例创建。
         let capabilities = unsafe {
             surface_fn.get_physical_device_surface_capabilities(shared.physical(), surface)
@@ -223,39 +224,45 @@ impl Swapchain {
                 "get_physical_device_surface_present_modes: {error:?}"
             ),
         })?;
-        if !present_modes.contains(&PRESENT_MODE) {
-            // Wayland surface 必须报告 MAILBOX（§7.6）：不报告说明不是规范的 Wayland WSI，不做 FIFO 回退。
-            return Err(EngineError::UnsupportedGpu {
+        let present_mode =
+            choose_present_mode(&present_modes).ok_or_else(|| EngineError::UnsupportedGpu {
                 os: "linux",
                 required: "VK_PRESENT_MODE_MAILBOX_KHR on a Wayland surface",
                 actual: smol_str::format_smolstr!("present modes {present_modes:?}"),
-            });
-        }
-        // Wayland 的 buffer 尺寸由客户端决定（合成器按 configure 约束），但 **Vulkan 仍要求**
-        // `imageExtent` 落在 `minImageExtent..=maxImageExtent` 内：请求超出上界时
-        // `vkCreateSwapchainKHR` 直接返回 `ERROR_INITIALIZATION_FAILED`（大窗口 / 特殊合成器上
-        // 会命中）。因此这里夹紧，代价是超过上界时内容被 viewport 略微缩小（仍按逻辑尺寸
-        // 布局，只是 pixel 密度下降），比建链失败好得多。
-        let requested = vk::Extent2D {
-            width: size.0.max(1),
-            height: size.1.max(1),
-        };
-        let extent = vk::Extent2D {
-            width: requested.width.clamp(
-                capabilities.min_image_extent.width,
-                capabilities.max_image_extent.width,
+            })?;
+        // R11-9：`currentExtent` 有两个合法形态（具体尺寸 / `0xFFFFFFFF`），且必须按
+        // `preTransform` 换轴。旧实现既不用 currentExtent 也不换轴 ⇒ 驱动决定尺寸时永久
+        // SUBOPTIMAL（并叠加 R11-7 变成每帧重建）。
+        let extent = choose_extent(
+            (
+                capabilities.current_extent.width,
+                capabilities.current_extent.height,
             ),
-            height: requested.height.clamp(
+            (
+                capabilities.min_image_extent.width,
                 capabilities.min_image_extent.height,
+            ),
+            (
+                capabilities.max_image_extent.width,
                 capabilities.max_image_extent.height,
             ),
-        };
-        // usage 必须被 `supported_usage_flags` 覆盖，否则同样是 INITIALIZATION_FAILED。
-        // 直通 copy 需要 TRANSFER_DST、渲染需要 COLOR_ATTACHMENT —— 两者缺一就明确报错，
-        // 而不是留给驱动吐一个无信息量的失败。
-        let required_usage =
-            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST;
-        if !capabilities.supported_usage_flags.contains(required_usage) {
+            size,
+            capabilities.current_transform,
+        )
+        .ok_or_else(|| EngineError::UnsupportedGpu {
+            os: "linux",
+            required: "a non-degenerate surface extent range",
+            actual: smol_str::format_smolstr!(
+                "min={:?} max={:?} current={:?}",
+                capabilities.min_image_extent,
+                capabilities.max_image_extent,
+                capabilities.current_extent
+            ),
+        })?;
+        if !capabilities
+            .supported_usage_flags
+            .contains(plan::required_usage())
+        {
             return Err(EngineError::UnsupportedGpu {
                 os: "linux",
                 required: "COLOR_ATTACHMENT | TRANSFER_DST swapchain images",
@@ -265,32 +272,26 @@ impl Swapchain {
                 ),
             });
         }
-        // composite alpha 只能从 `supported_composite_alpha` 里挑：多数合成器只给
-        // OPAQUE/INHERIT，硬写 OPAQUE 在某些环境（如嵌套合成器）会被拒绝。
-        let composite_alpha = [
-            vk::CompositeAlphaFlagsKHR::OPAQUE,
-            vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED,
-            vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED,
-            vk::CompositeAlphaFlagsKHR::INHERIT,
-        ]
-        .into_iter()
-        .find(|candidate| capabilities.supported_composite_alpha.contains(*candidate))
-        .ok_or_else(|| EngineError::UnsupportedGpu {
-            os: "linux",
-            required: "at least one composite alpha mode",
-            actual: smol_str::format_smolstr!(
-                "surface supports {:?}",
-                capabilities.supported_composite_alpha
-            ),
-        })?;
+        let composite_alpha = choose_composite_alpha(capabilities.supported_composite_alpha)
+            .ok_or_else(|| EngineError::UnsupportedGpu {
+                os: "linux",
+                required: "at least one composite alpha mode",
+                actual: smol_str::format_smolstr!(
+                    "surface supports {:?}",
+                    capabilities.supported_composite_alpha
+                ),
+            })?;
         let image_count =
-            (capabilities.min_image_count + 1)
-                .max(3)
-                .min(if capabilities.max_image_count == 0 {
-                    u32::MAX
-                } else {
-                    capabilities.max_image_count
-                });
+            choose_image_count(capabilities.min_image_count, capabilities.max_image_count);
+        let key = SwapchainKey {
+            extent,
+            format: chosen.format,
+            color_space: chosen.color_space,
+            present_mode,
+            composite_alpha,
+            pre_transform: capabilities.current_transform,
+            image_count,
+        };
         let fn_ = ash::khr::swapchain::Device::new(instance.raw(), shared.raw());
         let create = vk::SwapchainCreateInfoKHR::default()
             .surface(surface)
@@ -298,13 +299,16 @@ impl Swapchain {
             .min_image_count(image_count)
             .image_format(chosen.format)
             .image_color_space(chosen.color_space)
-            .image_extent(extent)
+            .image_extent(vk::Extent2D {
+                width: extent.0,
+                height: extent.1,
+            })
             .image_array_layers(1)
-            .image_usage(required_usage)
+            .image_usage(plan::required_usage())
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(capabilities.current_transform)
             .composite_alpha(composite_alpha)
-            .present_mode(PRESENT_MODE)
+            .present_mode(present_mode)
             .clipped(true);
         // SAFETY: `create` 的指针在本次调用期间有效；swapchain 在本结构 Drop（或调用方延迟 drop）
         // 时销毁；`VkQueue` 由共享 GPU 持有且在 `with_queue` 内串行化。
@@ -314,32 +318,53 @@ impl Swapchain {
             }
         })?;
         // SAFETY: `raw` 刚创建；image 句柄的存活期由 swapchain 保证。
-        let images =
-            unsafe { fn_.get_swapchain_images(raw) }.map_err(|error| EngineError::Swapchain {
-                detail: smol_str::format_smolstr!("get_swapchain_images: {error:?}"),
-            })?;
-
+        let images = match unsafe { fn_.get_swapchain_images(raw) } {
+            Ok(images) => images,
+            Err(error) => {
+                // 失败路径不泄漏：swapchain 已创建，必须销毁（R11-29 的同族问题）。
+                // SAFETY: 没有任何 image / 信号量引用它。
+                unsafe { fn_.destroy_swapchain(raw, None) };
+                return Err(EngineError::Swapchain {
+                    detail: smol_str::format_smolstr!("get_swapchain_images: {error:?}"),
+                });
+            }
+        };
         // 每 image 一个 render-finished（§7.2 硬规则 1：不能按帧槽索引）。
         let mut render_finished = Vec::with_capacity(images.len());
         for _ in 0..images.len() {
-            // SAFETY: 句柄归本结构独占；`Drop` 里销毁（调用方保证 presentation engine 已释放它们）。
-            let semaphore = unsafe {
+            // SAFETY: 句柄归本结构独占；`Drop` 里销毁（调用方保证队列已 idle）。
+            let semaphore = match unsafe {
                 shared
                     .raw()
                     .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-            }
-            .map_err(|error| EngineError::Swapchain {
-                detail: smol_str::format_smolstr!("create_semaphore(render_finished): {error:?}"),
-            })?;
+            } {
+                Ok(semaphore) => semaphore,
+                Err(error) => {
+                    // 已创建的信号量与 swapchain 就地回收（失败路径不泄漏）。
+                    // SAFETY: 没有在飞批次引用它们（swapchain 从未 present 过）。
+                    unsafe {
+                        for semaphore in &render_finished {
+                            shared.raw().destroy_semaphore(*semaphore, None);
+                        }
+                        fn_.destroy_swapchain(raw, None);
+                    }
+                    return Err(EngineError::Swapchain {
+                        detail: smol_str::format_smolstr!(
+                            "create_semaphore(render_finished): {error:?}"
+                        ),
+                    });
+                }
+            };
             render_finished.push(semaphore);
         }
-
+        log_plan(&key, &formats);
         Ok(Self {
             device: shared.raw().clone(),
             raw,
             fn_,
             images,
-            extent,
+            key,
+            // 「已启用」而不是「可用」：`VkPresentRegionsKHR` 只有在扩展已启用时才合法（R11-23）。
             incremental: shared.caps().incremental_present,
             render_finished,
         })
@@ -350,7 +375,20 @@ impl Swapchain {
     }
 
     pub(crate) fn extent(&self) -> vk::Extent2D {
-        self.extent
+        vk::Extent2D {
+            width: self.key.extent.0,
+            height: self.key.extent.1,
+        }
+    }
+
+    /// 一次成功建链的全部参数（诊断 + 重建必要性判断）。
+    pub(crate) fn key(&self) -> SwapchainKey {
+        self.key
+    }
+
+    /// swapchain 的 image 数（每 image 的同步状态表按它分配）。
+    pub(crate) fn image_count(&self) -> usize {
+        self.images.len()
     }
 
     pub(crate) fn image(&self, index: u32) -> vk::Image {
@@ -358,7 +396,15 @@ impl Swapchain {
     }
 
     /// acquire：`image_available` 由调用方按帧槽给出（§7.2）。
-    pub(crate) fn acquire(&self, image_available: vk::Semaphore) -> Result<Acquire, EngineError> {
+    ///
+    /// `surface_lost` 与 `out_of_date` 分开上报（R11-11）：前者要重建 `VkSurfaceKHR`，后者只要
+    /// 重建 swapchain。旧实现把两者合并成 `OutOfDate`，于是「合成器重启」这条路径永远走不到
+    /// surface 恢复逻辑，窗口黑屏到 UI 上报错误。
+    pub(crate) fn acquire(
+        &self,
+        shared: &SharedGpu,
+        image_available: vk::Semaphore,
+    ) -> Result<Acquire, EngineError> {
         debug_assert!(on_gpu_thread(), "acquire 只能发生在 kytrix-vulkan 线程");
         debug_assert!(
             !image_available.is_null(),
@@ -378,19 +424,22 @@ impl Swapchain {
             // 超时：信号量不会被 signal（规范），帧请求保留着重试。
             Err(vk::Result::TIMEOUT) | Err(vk::Result::NOT_READY) => Ok(Acquire::NotReady),
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => Ok(Acquire::OutOfDate),
-            // §7.7：surface lost 也走 §7.4 的重建路径（重建会用 `oldSwapchain`；没有新的
-            // `wl_surface` 时创建会失败，并以强类型 `EngineError::Swapchain` 冒泡出去）。
-            Err(vk::Result::ERROR_SURFACE_LOST_KHR) => Ok(Acquire::OutOfDate),
-            Err(error) => Err(classify(error)),
+            Err(vk::Result::ERROR_SURFACE_LOST_KHR) => Ok(Acquire::SurfaceLost),
+            // §7.7：设备丢失统一走 `SharedGpu` 的粘性分类（诊断文件只有一个出口）。
+            Err(error) => Err(shared.classify_failure(error, "acquire_next_image")),
         }
     }
 
-    /// present：等**本 image** 的 render-finished，`incremental_present` 只在有 dirty 集时挂 `pNext`。
+    /// present：等**本 image** 的 render-finished；`incremental_present` 的 region 必须与本次
+    /// 实际拷贝的矩形一致（R11-12）。
+    ///
+    /// `dirty` 是本次真正写进这张 image 的矩形（`None` = 整面 / 没有 hint）：它同时是
+    /// `VkPresentRegionKHR` 的内容与「这一帧搬了多少像素」的事实来源。
     pub(crate) fn present(
         &self,
         shared: &SharedGpu,
         image_index: u32,
-        frame: FramePlan,
+        dirty: Option<DamageRects>,
     ) -> Result<Present, EngineError> {
         debug_assert!(on_gpu_thread(), "present 只能发生在 kytrix-vulkan 线程");
         let swapchains = [self.raw];
@@ -400,7 +449,9 @@ impl Swapchain {
             .wait_semaphores(&waits)
             .swapchains(&swapchains)
             .image_indices(&indices);
-        let rects = present_rects(frame);
+        let rects = dirty
+            .filter(|rects| !rects.is_empty())
+            .map(|rects| present_rects(&rects));
         let mut regions = [vk::PresentRegionKHR::default()];
         let mut regions_info = vk::PresentRegionsKHR::default();
         if self.incremental
@@ -418,7 +469,8 @@ impl Swapchain {
             Ok(false) => Ok(Present::Presented),
             Ok(true) => Ok(Present::Suboptimal),
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => Ok(Present::OutOfDate),
-            Err(error) => Err(classify(error)),
+            Err(vk::Result::ERROR_SURFACE_LOST_KHR) => Ok(Present::SurfaceLost),
+            Err(error) => Err(shared.classify_failure(error, "queue_present")),
         }
     }
 
@@ -430,8 +482,10 @@ impl Swapchain {
 
 impl Drop for Swapchain {
     fn drop(&mut self) {
-        // SAFETY: 调用方保证 presentation engine 已不再使用本 swapchain 的图像与信号量
-        // （退出路径先等本窗口 timeline；重建路径等新 swapchain 的首帧完成，§7.4）。
+        // SAFETY: 调用方保证**队列已 idle**（`SharedGpu::wait_queue_idle`，R11-3）：这是
+        // `vkDestroySwapchainKHR` / `vkDestroySemaphore` 对 presentation engine 与在飞批次的
+        // 共同前置条件。旧实现等的是「新链某一帧的 timeline」，与旧链的 present 之间没有任何
+        // 依赖关系，因此不构成保证。
         unsafe {
             for semaphore in &self.render_finished {
                 self.device.destroy_semaphore(*semaphore, None);
@@ -441,40 +495,77 @@ impl Drop for Swapchain {
     }
 }
 
-fn classify(error: vk::Result) -> EngineError {
-    if error == vk::Result::ERROR_DEVICE_LOST {
-        EngineError::DeviceLost {
-            reason: smol_str::SmolStr::new_static("VK_ERROR_DEVICE_LOST"),
-            log_path: std::env::temp_dir().join(format!("kytrix-vk-{}.txt", std::process::id())),
-        }
-    } else {
-        EngineError::Swapchain {
-            detail: smol_str::format_smolstr!("{error:?}"),
-        }
+/// 建链参数的诊断行：**只在参数变化时打印**（拖动改窗口尺寸时不会刷屏），
+/// 但把每一次变化的全部字段都写出来（R11-7 的「最近一次重建原因」、R11-8 的 colorSpace）。
+fn log_plan(key: &SwapchainKey, formats: &[vk::SurfaceFormatKHR]) {
+    static LAST: Mutex<Option<SwapchainKey>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(PoisonError::into_inner);
+    if last.as_ref() == Some(key) {
+        return;
     }
+    *last = Some(*key);
+    let offered = formats
+        .iter()
+        .map(|format| (format.format, format.color_space))
+        .collect::<Vec<_>>();
+    eprintln!(
+        "kytrix: vulkan swapchain extent={:?} format={:?} color_space={:?} present_mode={:?} composite_alpha={:?} transform={:?} images={} offered={offered:?}",
+        key.extent,
+        key.format,
+        key.color_space,
+        key.present_mode,
+        key.composite_alpha,
+        key.pre_transform,
+        key.image_count
+    );
 }
 
-/// `incremental_present` 的矩形（只在 partial 且非 fresh 时给）。
-fn present_rects(frame: FramePlan) -> Option<Vec<vk::RectLayerKHR>> {
-    if matches!(frame.plan(), Plan::Idle | Plan::Full) {
-        return None;
+/// `incremental_present` 的矩形（与本次实际拷贝的矩形逐一致）。
+fn present_rects(dirty: &DamageRects) -> Vec<vk::RectLayerKHR> {
+    dirty
+        .as_slice()
+        .iter()
+        .map(|rect| vk::RectLayerKHR {
+            offset: vk::Offset2D {
+                x: rect.x0.max(0),
+                y: rect.y0.max(0),
+            },
+            extent: vk::Extent2D {
+                width: rect.width().max(0) as u32,
+                height: rect.height().max(0) as u32,
+            },
+            layer: 0,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{math::PhysicalRect, render::compositor::DamageRects};
+
+    #[test]
+    fn present_rects_mirror_the_copied_rectangles() {
+        let mut dirty = DamageRects::new();
+        assert!(dirty.push(PhysicalRect::new(4, 8, 12, 16)));
+        assert!(dirty.push(PhysicalRect::new(-3, -2, 1, 1)));
+        let rects = super::present_rects(&dirty);
+        assert_eq!(rects.len(), 2);
+        assert_eq!(rects[0].offset, ash::vk::Offset2D { x: 4, y: 8 });
+        assert_eq!(
+            rects[0].extent,
+            ash::vk::Extent2D {
+                width: 8,
+                height: 8
+            }
+        );
+        // 负偏移必须夹到 0（`VkRectLayerKHR` 不允许负 offset）。
+        assert_eq!(rects[1].offset, ash::vk::Offset2D { x: 0, y: 0 });
+        assert_eq!(
+            rects[1].extent,
+            ash::vk::Extent2D {
+                width: 1,
+                height: 1
+            }
+        );
     }
-    let dirty = frame.present_dirty()?;
-    Some(
-        dirty
-            .as_slice()
-            .iter()
-            .map(|rect| vk::RectLayerKHR {
-                offset: vk::Offset2D {
-                    x: rect.x0.max(0),
-                    y: rect.y0.max(0),
-                },
-                extent: vk::Extent2D {
-                    width: rect.width().max(0) as u32,
-                    height: rect.height().max(0) as u32,
-                },
-                layer: 0,
-            })
-            .collect(),
-    )
 }

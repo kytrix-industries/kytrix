@@ -1,24 +1,34 @@
-//! **组合**交换链（`CreateSwapChainForComposition`）/ `Present1` dirty rects
+//! **组合**交换链（`CreateSwapChainForComposition`）/ `ResizeBuffers` / `Present1` 分类
 //! （`design/phase-08-d3d12.md` §5.3 / §6.4、`design/DEVIATIONS.md` §36 F-199）。
 //!
 //! 窗口路径的交换链不是 HWND swapchain：它的内容经 `IDCompositionVisual::SetContent` 交给
 //! DirectComposition（`platform/windows/composition.rs`），窗口的客户区由 DComp 合成。
 //!
-//! 四条实测硬约束（probe `caps.log` / `present.log` / `resize.log`）：
+//! 三条实测硬约束（probe `caps.log` / `present.log` / `resize.log`）：
 //! ① `DXGI_SCALING_STRETCH` 是**唯一**可用的缩放模式（`SCALING_NONE` 创建即 `0x887A0001`）；
-//! ② 组合交换链在**第一次 `Present` 之后不能 `ResizeBuffers`**（`0x887A0001`），所以 buffer 是
-//!    grow-only 高水位桶（`platform/windows/composition.rs` 的 `buffer_size`）：内容越过它时
-//!    整条交换链被替换（`render/windows/compositor.rs` 的 `GpuRenderer::grow`），内容静止 2 s
-//!    后 `maybe_shrink` 换到更小的当前内容桶（先拷旧内容）；窗口 resize 本身只改 visual 几何；
-//! ③ 创建后的**第一次 present 必须全量**（`DirtyRectsCount = 0`）；
-//! ④ dirty rect 必须非空且完全落在 buffer 内（越界 / 负坐标都是 `DXGI_ERROR_INVALID_CALL`）。
+//! ② 创建后的**第一次 present 必须全量**（`DirtyRectsCount = 0`）—— 由调用方的
+//!    [`crate::render::windows::compositor::TargetState`] 保证，本类型不再自己记 `first_present`
+//!    （R08-11：那曾是第三个「必须全量」状态源）；
+//! ③ dirty rect 必须非空且完全落在 buffer 内（越界 / 负坐标都是 `DXGI_ERROR_INVALID_CALL`）——
+//!    调用方在录制前对每个矩形做一次 `intersect(content)`（R08-10），本类型只做精确转换。
+//!
+//! **`ResizeBuffers` 是唯一的重建方式**（R08-1：旧注释断言「组合交换链第一次 present 后
+//! `ResizeBuffers` 必失败」与 MSDN 不符 —— MSDN 列出的失败条件只有「未释放 back buffer 的
+//! 直接/间接引用」「组合链 W/H 传 0」「参数非法」。旧 `grow` 路径做的正是它的前置条件：
+//! `wait_idle` + `reset_in_flight_lists` 已经丢掉了命令列表的间接引用，`GetBuffer` 每帧重取、
+//! 从不缓存 ⇒ 直接/间接引用都已释放）。因此尺寸变化只需要 `ResizeBuffers(3, w, h, UNKNOWN,
+//! 原 flag)` 并重写 back buffer 的 RTV；整条交换链的替换只剩 `ResizeBuffers` 失败后的回退
+//! 开关（[`Swapchain::resize`] 返回的原始 HRESULT 由调用方判定，见
+//! `hresult::resize_fallback_worthwhile`）。
 //!
 //! 呈现节奏来自 `DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT` 的 waitable 对象
 //! （`design/async-render-pipeline.md` §6.2）：`SetMaximumFrameLatency(1)` + 每帧渲染前等一次
 //! 该句柄。`SetBackgroundColor` 在组合交换链上是**惰性**的（probe：返回 OK 但不影响合成），
-//! 因此背景色只走 persist 的 clear（`render/color.rs`）。
+//! 因此背景色只走持久目标的 clear（`render/color.rs`）与 1×1 背景层。
 //!
-//! 格式：`B8G8R8A8_UNORM`（sRGB flip swapchain 在本机创建即失败，DEVIATIONS F-80）。
+//! 格式：`B8G8R8A8_UNORM`（sRGB flip swapchain 在本机创建即失败，DEVIATIONS F-80）。back
+//! buffer 的 RTV 用 `_UNORM_SRGB` **视图**（与持久目标同一套 relaxed format casting 前提，
+//! R08-12）：全量帧直接画进 back buffer 时（R08-8 的直绘路径）必须让硬件做一次 sRGB 编码。
 
 use windows::{
     Win32::{
@@ -26,7 +36,10 @@ use windows::{
         Graphics::{
             Direct3D12::*,
             Dxgi::{
-                Common::{DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
+                Common::{
+                    DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM,
+                    DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+                },
                 *,
             },
         },
@@ -34,35 +47,37 @@ use windows::{
     core::Interface,
 };
 
+use super::hresult::{DXGI_ERROR_INVALID_CALL, PresentOutcome, classify_present};
 use crate::{
     error::EngineError,
-    render::{
-        compositor::{DamageRects, FramePlan},
-        damage::MAX_DAMAGE_RECTS,
-        windows::device::init_error_from,
-    },
+    render::{compositor::DamageRects, damage::MAX_DAMAGE_RECTS, windows::device::init_error_from},
 };
 
 /// flip-model 的 back buffer 数（主设计 §2.4 的 `BufferCount >= 2`；本设计取 3）。
 pub(crate) const BUFFER_COUNT: u32 = 3;
 
-/// 一条组合交换链 + 它的帧延迟 waitable（auto-reset，每帧等一次）。
+/// 一条组合交换链 + 它的帧延迟 waitable + 自己那几个 back buffer 的 RTV。
+///
+/// RTV 堆**每条交换链自带**（不挤共享堆）：内容层与 1×1 背景层各有一条交换链，各自的 back
+/// buffer 身份只在本链内有意义；`ResizeBuffers` 之后重写这一小撮描述符即可。
 pub(crate) struct Swapchain {
     raw: IDXGISwapChain1,
-    /// `GetFrameLatencyWaitableObject` 的句柄；由 swapchain 拥有，本结构 `Drop` 时关闭。
+    /// `GetFrameLatencyWaitableObject` 的句柄（auto-reset，每帧等一次）。
     waitable: HANDLE,
-    /// 首个 present 必须是全量（`DirtyRectsCount = 0`）：back buffer 的内容在第一次 present
-    /// 之前未定义，给局部矩形会让其余区域露出垃圾（F-72 ①）。成功后清除。
-    first_present: bool,
+    /// 当前 back buffer 尺寸（物理像素）。`ResizeBuffers` 之后更新。
+    buffer: (u32, u32),
+    /// back buffer 的 RTV 堆（`BUFFER_COUNT` 个描述符）。
+    rtv_heap: ID3D12DescriptorHeap,
+    rtv_size: u32,
 }
 
 impl Swapchain {
-    /// `buffer` 是这条交换链的尺寸（高水位桶，物理像素）。
+    /// 建链 + 打开 waitable + 显式声明色彩空间 + 写 back buffer 的 RTV。
     ///
-    /// 不能再 `ResizeBuffers`：内容越过 `buffer` 时调用方整条替换交换链（新的
-    /// [`Swapchain::for_composition`]）；内容静止 2 s 后缩容也会替换成更小的桶（先拷旧内容），
-    /// 旧链都在新 `SetContent` + `Commit` 之后丢弃。
+    /// `buffer` 是这条交换链的尺寸（物理像素，已按 [`crate::platform::windows::composition::buffer_size`]
+    /// 取桶）；此后尺寸变化走 [`Swapchain::resize`]。
     pub(crate) fn for_composition(
+        device: &ID3D12Device,
         queue: &ID3D12CommandQueue,
         buffer: (u32, u32),
     ) -> Result<Self, EngineError> {
@@ -81,42 +96,21 @@ impl Swapchain {
                     ),
                 },
             )?;
-        let chain2: IDXGISwapChain2 = raw
-            .cast()
-            .map_err(|error| init_error_from("cast IDXGISwapChain2", error))?;
-        // flag 是创建参数（probe：没有它 `SetMaximumFrameLatency` 直接失败）：CPU 侧排队深度 1。
-        // SAFETY: swapchain 句柄由 `raw` 持有；参数是值。
-        unsafe { chain2.SetMaximumFrameLatency(1) }
-            .map_err(|error| init_error_from("SetMaximumFrameLatency", error))?;
-        // R06-10：**显式声明**呈现面的色彩空间（sRGB / Rec.709）。三端共用
-        // `render::colorspace` 的决定，这里只做 DXGI 翻译 —— 旧实现完全不声明，SDR 屏上
-        // 碰巧正确、广色域 / HDR 环境下取决于 DWM 的隐式推断。
-        let chain3: IDXGISwapChain3 = raw
-            .cast()
-            .map_err(|error| init_error_from("cast IDXGISwapChain3", error))?;
-        let color_space = crate::render::colorspace::dxgi_color_space();
-        // SAFETY: swapchain 句柄由 `raw` 持有；参数是值。
-        let support = unsafe { chain3.CheckColorSpaceSupport(color_space) }
-            .map_err(|error| init_error_from("CheckColorSpaceSupport", error))?;
-        if crate::render::colorspace::support_allows_present(support) {
-            // SAFETY: 同上。
-            unsafe { chain3.SetColorSpace1(color_space) }.map_err(|error| {
-                EngineError::Swapchain {
-                    detail: smol_str::format_smolstr!(
-                        "SetColorSpace1: {:#010X}",
-                        error.code().0 as u32
-                    ),
-                }
-            })?;
-        }
-        // `chain2` 只是访问 `IDXGISwapChain2` 的临时引用：waitable 由 swapchain 本体拥有，
-        // 句柄在 `raw` 存活期间有效，因此这里之后不再需要保存接口指针。
-        let waitable = frame_latency_waitable(&chain2)?;
-        Ok(Self {
+        let waitable = arm_frame_latency(&raw)?;
+        apply_color_space(&raw)?;
+        let rtv_heap = create_rtv_heap(device)?;
+        // SAFETY: 设备 / 堆句柄由调用方持有，调用期间有效；查询无副作用。
+        let rtv_size =
+            unsafe { device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) };
+        let chain = Self {
             raw,
             waitable,
-            first_present: true,
-        })
+            buffer: (desc.Width.max(1), desc.Height.max(1)),
+            rtv_heap,
+            rtv_size,
+        };
+        chain.write_back_buffer_rtvs(device)?;
+        Ok(chain)
     }
 
     /// 帧延迟 waitable（GPU 线程在每帧渲染前等它一次，§6.3 ①）。
@@ -129,11 +123,14 @@ impl Swapchain {
         &self.raw
     }
 
-    /// 当前 back buffer（**每帧重新问 DXGI**；flip model 的 current index 会随 present 轮转）。
-    ///
-    /// 调用方只在录制 copy 期间持有，**不得**跨帧保留。
-    pub(crate) fn back_buffer(&self) -> Result<ID3D12Resource, EngineError> {
-        // flip model 的 current index 在 `IDXGISwapChain3` 上。
+    /// 当前 back buffer 尺寸（= 最近一次 `Create`/`ResizeBuffers` 的 `buffer`）。
+    pub(crate) fn buffer(&self) -> (u32, u32) {
+        self.buffer
+    }
+
+    /// 当前 back buffer：`(索引, 资源)`。**每帧重新问 DXGI**（flip model 的 current index 会随
+    /// present 轮转；不缓存引用也是 `ResizeBuffers` 的前置条件之一）。
+    pub(crate) fn back_buffer(&self) -> Result<(u32, ID3D12Resource), EngineError> {
         let chain: IDXGISwapChain3 = self
             .raw
             .cast()
@@ -141,30 +138,103 @@ impl Swapchain {
         // SAFETY: swapchain 句柄由本结构持有；查询无副作用。
         let index = unsafe { chain.GetCurrentBackBufferIndex() };
         // SAFETY: COM 调用：swapchain 句柄有效，输出指针在调用期间存活，失败按 HRESULT 处理。
-        unsafe { self.raw.GetBuffer(index) }.map_err(|error| EngineError::Swapchain {
-            detail: smol_str::format_smolstr!(
-                "GetBuffer({index}): {:#010X}",
-                error.code().0 as u32
-            ),
-        })
+        let resource =
+            unsafe { self.raw.GetBuffer(index) }.map_err(|error| EngineError::Swapchain {
+                detail: smol_str::format_smolstr!(
+                    "GetBuffer({index}): {:#010X}",
+                    error.code().0 as u32
+                ),
+            })?;
+        Ok((index, resource))
     }
 
-    /// `Present1`：dirty 集由 [`frame_dirty_rects`] 决定（首次全量、全量帧只给内容矩形）。
+    /// 第 `index` 个 back buffer 的 sRGB RTV（全量帧直绘路径的渲染目标）。
+    pub(crate) fn rtv(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        debug_assert!(index < BUFFER_COUNT, "back buffer index out of range");
+        // SAFETY: 堆由本结构持有，句柄在堆生命周期内有效；查询无副作用。
+        let base = unsafe { self.rtv_heap.GetCPUDescriptorHandleForHeapStart() };
+        D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: base.ptr + (u64::from(self.rtv_size) * u64::from(index)) as usize,
+        }
+    }
+
+    /// `ResizeBuffers`：**唯一的**尺寸变化手段（R08-1）。
     ///
-    /// **成功之后**才清除 `first_present` / `FramePlan` 的 fresh：失败时下一帧仍按首帧全量处理。
-    pub(crate) fn present1(
+    /// 前置条件（全部由调用方满足）：
+    /// 1. 本窗口的 GPU 工作已完成（`CommandStream::wait_idle`）且 in-flight 命令列表已重置
+    ///    （`reset_in_flight_lists`）—— 这是「丢掉 back buffer 的间接引用」的唯一手段；
+    /// 2. 不持有任何 `GetBuffer` 引用（本类型每帧重取、从不缓存）。
+    ///
+    /// 之后重设 `SetMaximumFrameLatency(1)`、重写全部 back buffer 的 RTV，并确认 waitable 句柄
+    /// 仍然有效（句柄由同一个交换链对象拥有；`ResizeBuffers` 不换对象）。
+    ///
+    /// 失败时返回**原始** `windows::core::Error`：调用方据 `hresult::resize_fallback_worthwhile`
+    /// 判断是否回退到整链替换（R08-1 的可回退开关），否则包装成 `EngineError::Swapchain`。
+    pub(crate) fn resize(
         &mut self,
-        frame: &mut FramePlan,
-        sync: u32,
-        content: (u32, u32),
-    ) -> Result<(), EngineError> {
+        device: &ID3D12Device,
+        buffer: (u32, u32),
+    ) -> Result<(), windows::core::Error> {
+        let buffer = (buffer.0.max(1), buffer.1.max(1));
+        if buffer == self.buffer {
+            return Ok(());
+        }
+        // flag 必须与创建时一致（DXGI 明确禁止用 ResizeBuffers 增删 WAITABLE 标志）；
+        // 格式传 UNKNOWN 表示保持不变（组合链不接受 sRGB 格式，见模块文档）。
+        // SAFETY: 调用方已释放全部 back buffer 引用；参数是值。
+        unsafe {
+            self.raw.ResizeBuffers(
+                BUFFER_COUNT,
+                buffer.0,
+                buffer.1,
+                DXGI_FORMAT_UNKNOWN,
+                DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
+            )
+        }?;
+        self.buffer = buffer;
+        // 句柄由同一个交换链对象拥有；仍取一次并以新值替换（不同则关闭旧句柄）。
+        let waitable = arm_frame_latency(&self.raw).map_err(|error| match error {
+            EngineError::Swapchain { detail } => windows::core::Error::new(
+                DXGI_ERROR_INVALID_CALL,
+                smol_str::format_smolstr!("frame latency waitable after resize: {detail}"),
+            ),
+            other => windows::core::Error::new(
+                DXGI_ERROR_INVALID_CALL,
+                smol_str::format_smolstr!("frame latency waitable after resize: {other}"),
+            ),
+        })?;
+        if waitable != self.waitable {
+            // SAFETY: 旧句柄由本结构独占；替换之后不再使用。
+            unsafe {
+                let _ = CloseHandle(self.waitable);
+            }
+            self.waitable = waitable;
+        }
+        self.write_back_buffer_rtvs(device).map_err(|error| {
+            windows::core::Error::new(
+                DXGI_ERROR_INVALID_CALL,
+                smol_str::format_smolstr!("back buffer RTVs after resize: {error}"),
+            )
+        })?;
+        Ok(())
+    }
+
+    /// `Present1`：`damage = None` 表示整面（`DirtyRectsCount = 0`），否则只呈现这些矩形。
+    ///
+    /// 返回值是**分类**而不是 `Result`（R08-7）：`DXGI_STATUS_OCCLUDED` 等正 HRESULT 不是
+    /// 失败，调用方必须据此退避/重建，而不是把窗口判死。
+    pub(crate) fn present1(&mut self, damage: Option<&DamageRects>, sync: u32) -> PresentOutcome {
         let mut rects = [RECT {
             left: 0,
             top: 0,
             right: 0,
             bottom: 0,
         }; MAX_DAMAGE_RECTS];
-        let count = frame_dirty_rects(self.first_present, *frame, content, &mut rects);
+        let count = match damage {
+            // 空 dirty 集与整面等价（`Plan::Partial` 里不会出现空集，这里只是防御）。
+            Some(damage) if !damage.is_empty() => fill_rects(damage, &mut rects),
+            _ => 0,
+        };
         let params = DXGI_PRESENT_PARAMETERS {
             DirtyRectsCount: count,
             pDirtyRects: if count == 0 {
@@ -177,63 +247,62 @@ impl Swapchain {
         };
         // SAFETY: COM 调用：swapchain 句柄有效；`rects` / `params` 在调用期间存活。
         let hr = unsafe { self.raw.Present1(sync, DXGI_PRESENT(0), &params) };
-        if hr.is_ok() {
-            frame.presented();
-            self.first_present = false;
-            Ok(())
-        } else {
-            Err(EngineError::Swapchain {
-                detail: smol_str::format_smolstr!(
-                    "Present1({count} dirty rects): {:#010X}",
-                    hr.0 as u32
-                ),
-            })
+        classify_present(hr)
+    }
+
+    fn write_back_buffer_rtvs(&self, device: &ID3D12Device) -> Result<(), EngineError> {
+        let desc = D3D12_RENDER_TARGET_VIEW_DESC {
+            // **视图**格式：资源是 UNORM、视图是 sRGB（R08-12 的 relaxed format casting 前提），
+            // 与持久目标同一套语义 —— 直绘路径写进 back buffer 的字节必须已经过 sRGB 编码。
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_RTV {
+                    MipSlice: 0,
+                    PlaneSlice: 0,
+                },
+            },
+        };
+        for index in 0..BUFFER_COUNT {
+            // SAFETY: swapchain / 设备 / 堆句柄由调用方持有，调用期间有效；索引在堆容量内。
+            let resource: ID3D12Resource =
+                unsafe { self.raw.GetBuffer(index) }.map_err(|error| EngineError::Swapchain {
+                    detail: smol_str::format_smolstr!(
+                        "GetBuffer({index}) for RTVs: {:#010X}",
+                        error.code().0 as u32
+                    ),
+                })?;
+            // SAFETY: 同上；视图描述指向本函数的栈上值。
+            unsafe { device.CreateRenderTargetView(&resource, Some(&desc), self.rtv(index)) };
+            // 不保留 `resource`：RTV 由堆持有，交换链本身拥有 buffer 的生命周期。
+            drop(resource);
         }
+        Ok(())
     }
 }
 
 impl Drop for Swapchain {
     fn drop(&mut self) {
-        // SAFETY: waitable 由本结构独占；`Drop` 只执行一次（swapchain 不重建，句柄不会变）。
+        // SAFETY: waitable 由本结构独占；`Drop` 只执行一次。
         unsafe {
             let _ = CloseHandle(self.waitable);
         }
     }
 }
 
-/// 本帧的 `Present1` dirty 集（返回矩形数；`0` = 整面）。
+/// 打开帧延迟 waitable 并设 `SetMaximumFrameLatency(1)`（CPU 侧排队深度 1）。
 ///
-/// 首次 present 必须整面（约束 ③）；之后的全量帧只呈现**内容子矩形** —— buffer 是内容 + 余量
-/// 的桶，其余部分永远不可见（也就是不该为了它做一次全 buffer 的合成）。
-fn frame_dirty_rects(
-    first_present: bool,
-    frame: FramePlan,
-    content: (u32, u32),
-    out: &mut [RECT; MAX_DAMAGE_RECTS],
-) -> u32 {
-    if first_present {
-        return 0;
-    }
-    if frame.is_full() {
-        out[0] = RECT {
-            left: 0,
-            top: 0,
-            right: content.0.max(1) as i32,
-            bottom: content.1.max(1) as i32,
-        };
-        return 1;
-    }
-    match frame.present_dirty() {
-        Some(damage) => fill_rects(&damage, out),
-        // 非全量、非 fresh 的空帧不会走到 present（GPU 循环把它按 Idle 拦下）。
-        None => 0,
-    }
-}
-
-/// 取帧延迟 waitable；失败（NULL）按强类型 swapchain 错误上报，绝不拿 NULL 去 `INFINITE` 等待。
-fn frame_latency_waitable(chain: &IDXGISwapChain2) -> Result<HANDLE, EngineError> {
-    // SAFETY: swapchain 句柄由调用方持有；返回值按值取出。
-    let waitable = unsafe { chain.GetFrameLatencyWaitableObject() };
+/// `IDXGISwapChain2::SetMaximumFrameLatency` 是唯一正确入口（用 `IDXGIDevice1` 的版本在
+/// waitable 模式下无效，0.1 第 3 条）。
+fn arm_frame_latency(raw: &IDXGISwapChain1) -> Result<HANDLE, EngineError> {
+    let chain2: IDXGISwapChain2 = raw
+        .cast()
+        .map_err(|error| init_error_from("cast IDXGISwapChain2", error))?;
+    // SAFETY: swapchain 句柄有效；参数是值。
+    unsafe { chain2.SetMaximumFrameLatency(1) }
+        .map_err(|error| init_error_from("SetMaximumFrameLatency", error))?;
+    // SAFETY: 句柄由交换链拥有，调用期间有效。
+    let waitable = unsafe { chain2.GetFrameLatencyWaitableObject() };
     if waitable.is_invalid() {
         return Err(EngineError::Swapchain {
             detail: smol_str::SmolStr::new_static(
@@ -242,6 +311,38 @@ fn frame_latency_waitable(chain: &IDXGISwapChain2) -> Result<HANDLE, EngineError
         });
     }
     Ok(waitable)
+}
+
+/// R06-10：**显式声明**呈现面的色彩空间（sRGB / Rec.709）。三端共用
+/// `render::colorspace` 的决定，这里只做 DXGI 翻译。
+fn apply_color_space(raw: &IDXGISwapChain1) -> Result<(), EngineError> {
+    let chain3: IDXGISwapChain3 = raw
+        .cast()
+        .map_err(|error| init_error_from("cast IDXGISwapChain3", error))?;
+    let color_space = crate::render::colorspace::dxgi_color_space();
+    // SAFETY: swapchain 句柄有效；参数是值。
+    let support = unsafe { chain3.CheckColorSpaceSupport(color_space) }
+        .map_err(|error| init_error_from("CheckColorSpaceSupport", error))?;
+    if crate::render::colorspace::support_allows_present(support) {
+        // SAFETY: 同上。
+        unsafe { chain3.SetColorSpace1(color_space) }.map_err(|error| EngineError::Swapchain {
+            detail: smol_str::format_smolstr!("SetColorSpace1: {:#010X}", error.code().0 as u32),
+        })?;
+    }
+    Ok(())
+}
+
+fn create_rtv_heap(device: &ID3D12Device) -> Result<ID3D12DescriptorHeap, EngineError> {
+    // SAFETY: 设备句柄由调用方持有；描述是值参数，失败按 HRESULT 返回。
+    unsafe {
+        device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+            NumDescriptors: BUFFER_COUNT,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+            NodeMask: 0,
+        })
+    }
+    .map_err(|error| init_error_from("CreateDescriptorHeap(back buffer RTVs)", error))
 }
 
 /// 组合交换链描述（probe `caps.log` 的「baseline」行）。
@@ -271,7 +372,7 @@ fn create_factory() -> Result<IDXGIFactory4, EngineError> {
         .map_err(|error| init_error_from("CreateDXGIFactory2", error))
 }
 
-/// `DamageRects` → `RECT`（半开区间 → Win32 的闭区间右/下边界）。
+/// `DamageRects` → `RECT`（半开区间 → Win32 的闭区间右/下边界）。返回矩形数。
 fn fill_rects(damage: &DamageRects, out: &mut [RECT; MAX_DAMAGE_RECTS]) -> u32 {
     let mut count = 0;
     for rect in damage.as_slice() {
@@ -294,13 +395,10 @@ mod tests {
         DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
     };
 
-    use super::{BUFFER_COUNT, composition_desc, frame_dirty_rects};
+    use super::{BUFFER_COUNT, composition_desc, fill_rects};
     use crate::{
         math::PhysicalRect,
-        render::{
-            compositor::{DamageRects, FramePlan, Plan},
-            damage::MAX_DAMAGE_RECTS,
-        },
+        render::{compositor::DamageRects, damage::MAX_DAMAGE_RECTS},
     };
 
     fn rects() -> [windows::Win32::Foundation::RECT; MAX_DAMAGE_RECTS] {
@@ -310,14 +408,6 @@ mod tests {
             right: 0,
             bottom: 0,
         }; MAX_DAMAGE_RECTS]
-    }
-
-    fn partial(rects: &[PhysicalRect]) -> Plan {
-        let mut damage = DamageRects::new();
-        for rect in rects {
-            assert!(damage.push(*rect));
-        }
-        Plan::Partial(damage)
     }
 
     #[test]
@@ -349,35 +439,14 @@ mod tests {
         assert_eq!((desc.Width, desc.Height), (1, 1));
     }
 
+    /// dirty 集 → `RECT` 的边界语义：半开区间换成 Win32 闭区间，顺序不变、数量不丢。
     #[test]
-    fn the_first_present_is_the_whole_surface() {
+    fn dirty_rects_map_to_win32_rects_in_order() {
+        let mut damage = DamageRects::new();
+        assert!(damage.push(PhysicalRect::new(0, 0, 32, 16)));
+        assert!(damage.push(PhysicalRect::new(32, 16, 64, 32)));
         let mut out = rects();
-        // 即便本帧是局部 damage，首次 present 也必须是整面（约束 ③）。
-        let frame = FramePlan::new(partial(&[PhysicalRect::new(0, 0, 10, 10)]), false);
-        assert_eq!(frame_dirty_rects(true, frame, (800, 600), &mut out), 0);
-    }
-
-    #[test]
-    fn a_full_frame_presents_only_the_content_sub_rect() {
-        let mut out = rects();
-        let frame = FramePlan::new(Plan::Full, false);
-        assert_eq!(frame_dirty_rects(false, frame, (800, 600), &mut out), 1);
-        assert_eq!(
-            (out[0].left, out[0].top, out[0].right, out[0].bottom),
-            (0, 0, 800, 600),
-            "buffer 比客户区大，全量帧也只呈现内容那部分"
-        );
-    }
-
-    #[test]
-    fn a_partial_frame_presents_its_damage_rects() {
-        let mut out = rects();
-        let damage = [
-            PhysicalRect::new(0, 0, 32, 16),
-            PhysicalRect::new(32, 16, 64, 32),
-        ];
-        let frame = FramePlan::new(partial(&damage), false);
-        assert_eq!(frame_dirty_rects(false, frame, (800, 600), &mut out), 2);
+        assert_eq!(fill_rects(&damage, &mut out), 2);
         assert_eq!(
             (out[0].left, out[0].top, out[0].right, out[0].bottom),
             (0, 0, 32, 16)
@@ -385,6 +454,26 @@ mod tests {
         assert_eq!(
             (out[1].left, out[1].top, out[1].right, out[1].bottom),
             (32, 16, 64, 32)
+        );
+    }
+
+    /// 没有任何 back buffer 引用被缓存：`back_buffer()` 每帧重取，`ResizeBuffers` 的前置条件
+    /// 因此天然满足（源码级防回归：`Swapchain` 里不得出现 `GetBuffer` 结果的字段）。
+    #[test]
+    fn the_swapchain_never_caches_a_back_buffer_reference() {
+        let source = include_str!("swapchain.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default();
+        assert!(!source.contains("back: ID3D12Resource"));
+        assert!(!source.contains("buffers: [ID3D12Resource"));
+        assert!(
+            source.contains("self.raw.GetBuffer(index)"),
+            "back buffer 必须在每次需要时向 DXGI 重新获取"
+        );
+        assert!(
+            source.contains("ResizeBuffers"),
+            "尺寸变化必须走 ResizeBuffers（R08-1）"
         );
     }
 }

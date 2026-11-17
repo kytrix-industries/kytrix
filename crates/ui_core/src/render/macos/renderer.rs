@@ -4,20 +4,28 @@
 //! ```text
 //! 主线程                                   kytrix-metal 线程（每窗口）
 //! ────────────────────────────────────    ──────────────────────────────────────────
-//! CAMetalLayer（NSView 持有）              循环：等 condvar
-//! CAMetalDisplayLink ── 每 vsync ──┐        → 取完成通知（GPU 计时 / retire / 反馈）
-//!   delegate: 存 update.drawable   │        → 取最新 drawable + 最新帧
-//!             唤醒 GPU 线程        │        → 3 槽 semaphore（非阻塞，失败即跳帧）
-//! 写图层属性（drawableSize/scale） ┘        → 重建 persist → 录制 → presentDrawable
-//! sync_pacing(continuous)                  → addCompletedHandler → commit（立即返回）
+//! CAMetalLayer（NSView 持有）              循环：等 condvar（有工作时才有上界）
+//! CAMetalDisplayLink ── 每 vsync ──┐        → 取完成通知（GPU 计时 / retire）
+//!   delegate: 存 update.drawable   │        → 取呈现通知（presentedTime → 真实呈现时刻）
+//!             + targetPresentation │        → 取最新 drawable + 最新帧
+//!             唤醒 GPU 线程        │        → 目标时刻已过期 ⇒ 跳过本 vsync（R09-6）
+//! 写图层属性（drawableSize/scale） ┘        → 3 槽 semaphore（非阻塞，失败即跳帧）
+//! sync_pacing(continuous)                  → 重建 persist → 录制
+//!                                          → addPresentedHandler + presentDrawable:atTime:
+//!                                          → addCompletedHandler + commit（立即返回）
 //! ```
 //!
 //! 三条硬约束：
 //! - **I1**：主线程只做「加锁拷贝 / 写图层属性 / `setPaused`」，没有 `nextDrawable`、
 //!   `waitUntilCompleted`、`status()` 轮询、semaphore 等待、persist 重建。
-//! - **I2**：`commit` 后立即返回；完成只通过 `addCompletedHandler`。
+//! - **I2**：`commit` 后立即返回；完成只通过 `addCompletedHandler`，呈现时刻只通过
+//!   `addPresentedHandler`（`presentedTime` 是唯一权威值）。
 //! - **I3**：节奏来自 `CAMetalDisplayLink`（主 run loop 的 **common modes**）；空闲 `isPaused = true`，
 //!   有帧请求 / 在飞帧 / 连续帧时恢复。
+//!
+//! 设备级对象（`MTLDevice` / 两个 metallib / 4 条 PSO / 采样器）全部来自进程单例
+//! [`GpuCore`]（R09-5）：本模块的每窗口状态只剩 drawable、persist、上传槽、display link 与
+//! GPU 线程。
 //!
 //! 关闭握手（§4.5 / F-169）：`Drop` 里停 display link → signal shutdown → **有界等待** GPU 线程
 //! 退出（[`JOIN_TIMEOUT`]，超时 detach，见 [`join_with_deadline`]）；GPU 线程在退出前自行 drain
@@ -38,11 +46,12 @@ use objc2::{
     AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
     rc::Retained, runtime::ProtocolObject,
 };
+use objc2_core_foundation::CFTimeInterval;
 use objc2_foundation::{NSObject, NSRunLoop, NSRunLoopCommonModes};
 use objc2_metal::{MTLCommandBuffer, MTLTexture};
 use objc2_quartz_core::{
-    CAFrameRateRange, CAMetalDisplayLink, CAMetalDisplayLinkDelegate, CAMetalDisplayLinkUpdate,
-    CAMetalDrawable, CAMetalLayer,
+    CACurrentMediaTime, CAFrameRateRange, CAMetalDisplayLink, CAMetalDisplayLinkDelegate,
+    CAMetalDisplayLinkUpdate, CAMetalDrawable, CAMetalLayer,
 };
 use smol_str::{SmolStr, format_smolstr};
 
@@ -60,7 +69,9 @@ use crate::{
         frame::{FrameFeedback, FrameRequest, LatestFrame, MAX_FRAMES_IN_FLIGHT},
         macos::{
             compositor::GpuRenderer,
+            core::GpuCore,
             device::{Device, enter_gpu_thread},
+            queue::InFlight,
             swapchain,
         },
         timer::{FrameTimings, GpuTimerSample},
@@ -123,8 +134,13 @@ impl Renderer {
     /// `background` 同时写进图层的 `backgroundColor`（sRGB，旧 drawable 之外）与 persist 的
     /// clear color（linear，新 drawable 内部）。
     ///
+    /// **主线程只做窗口级工作**（R09-5）：设备 / metallib / PSO 全部来自进程单例
+    /// [`GpuCore`]（首次调用后才需要加载，之后是纯读），本函数新建的只有图层、persist、
+    /// 三槽上传缓冲与 1×1 占位图集页 —— 都是 `newTexture` / `newBuffer` 级的小分配。
+    /// PSO 的首次编译（数十毫秒）落在 `kytrix-metal` 线程的首帧录制里，不阻塞开窗。
+    ///
     /// # Errors
-    /// 设备 / 管线创建失败、`CAMetalDisplayLink` 无法创建（`AppInit`），或 GPU 线程无法启动。
+    /// 设备 / 图层创建失败、`CAMetalDisplayLink` 无法创建（`AppInit`），或 GPU 线程无法启动。
     pub(crate) fn new_for_layer(
         size: (u32, u32),
         scale: f64,
@@ -134,9 +150,15 @@ impl Renderer {
         let mtm = MainThreadMarker::new().ok_or(EngineError::AppInit {
             detail: SmolStr::new_static("CAMetalDisplayLink requires the main thread"),
         })?;
+        let core = Arc::clone(GpuCore::shared()?);
         let device = Device::new()?;
         let layer = swapchain::new_layer(&device, size, scale, background)?;
-        let gpu = GpuRenderer::new_window(device, size, background_linear(background))?;
+        // 在飞计数必须在 `Queue` 构造之前建好：提交路径（GPU 线程）与 `sync_pacing`
+        // （主线程）读写同一份（R09-17）。
+        let in_flight = Arc::new(InFlight::new());
+        let shared = Arc::new(Shared::new(Arc::clone(&in_flight)));
+        let gpu =
+            GpuRenderer::new_window(device, core, in_flight, size, background_linear(background))?;
         Ok(Self {
             target: RenderTarget::Window(WindowRenderer::new(
                 mtm,
@@ -144,6 +166,7 @@ impl Renderer {
                 layer,
                 size,
                 max_frame_rate,
+                shared,
             )?),
             error: None,
         })
@@ -367,8 +390,8 @@ struct DisplayLinkIvars {
 }
 
 define_class!(
-    /// display link 的委托：**只做两件事** —— 把 update 里的 drawable 放进最新 drawable 槽、
-    /// 唤醒 GPU 线程。**不在回调里编码**（§5.1 / §5.3）。
+    /// display link 的委托：**只做两件事** —— 把 update 里的 drawable 与它的目标呈现时刻放进
+    /// 最新 drawable 槽、唤醒 GPU 线程。**不在回调里编码**（§5.1 / §5.3）。
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "KytrixMetalDisplayLink"]
@@ -386,7 +409,13 @@ define_class!(
             _link: &CAMetalDisplayLink,
             update: &CAMetalDisplayLinkUpdate,
         ) {
-            self.ivars().shared.publish_drawable(update.drawable());
+            // R09-6：`targetPresentationTimestamp` 是这次 vsync 要求提交的**呈现时刻**
+            // （host time，与 `CACurrentMediaTime()` / `MTLDrawable.presentedTime` 同一时基）。
+            // 提交时必须把它交给 `presentDrawable:atTime:`，否则 CA 自行决定呈现时刻，
+            // commit 晚于层的调度点就被推到下一个 vsync（整整多一帧）。
+            self.ivars()
+                .shared
+                .publish_drawable(update.drawable(), update.targetPresentationTimestamp());
         }
     }
 );
@@ -429,9 +458,9 @@ impl WindowRenderer {
         layer: Retained<CAMetalLayer>,
         size: (u32, u32),
         max_frame_rate: f32,
+        shared: Arc<Shared>,
     ) -> Result<Self, EngineError> {
         let size = (size.0.max(1), size.1.max(1));
-        let shared = Arc::new(Shared::new());
         let delegate = DisplayLinkDelegate::new(mtm, Arc::clone(&shared));
         let display_link =
             CAMetalDisplayLink::initWithMetalLayer(CAMetalDisplayLink::alloc(), &layer);
@@ -637,11 +666,18 @@ struct SendCommandBuffer(Retained<ProtocolObject<dyn MTLCommandBuffer>>);
 // 交出引用后，只有 GPU 线程持有它。
 unsafe impl Send for SendCommandBuffer {}
 
-/// drawable 跨线程移交（主线程 display link delegate → GPU 线程）。
-struct SendDrawable(Retained<ProtocolObject<dyn CAMetalDrawable>>);
+/// display link 交给 GPU 线程的一次呈现机会：drawable + 这次 vsync 要求的呈现时刻。
+///
+/// 目标时刻来自 `CAMetalDisplayLinkUpdate.targetPresentationTimestamp`（host time，R09-6）。
+struct DrawableUpdate {
+    drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
+    /// host time（`CACurrentMediaTime()` 时基）。`0.0` = 系统没给（不该发生，按"不可用"处理）。
+    target_presentation: CFTimeInterval,
+}
 
 // SAFETY: Metal 对象本身线程安全；放进最新 drawable 槽之后只有 GPU 线程持有引用。
-unsafe impl Send for SendDrawable {}
+// `CFTimeInterval` 是 `f64`，天然可跨线程。
+unsafe impl Send for DrawableUpdate {}
 
 /// 图层的跨线程**保活**句柄（GPU 线程只持有引用，不解引用、不读写任何属性）。
 struct SendLayer {
@@ -653,12 +689,15 @@ struct SendLayer {
 // `presentDrawable` 不落到已释放的图层上。`Retained` 的引用计数本身是原子的。
 unsafe impl Send for SendLayer {}
 
-/// UI 线程与 GPU 线程共享的最新帧 / 图集 / 最新 drawable / 完成队列 / 反馈槽 + 唤醒原语。
+/// UI 线程与 GPU 线程共享的最新帧 / 图集 / 最新 drawable / 完成队列 / 呈现队列 / 反馈槽 + 唤醒原语。
 struct Shared {
     state: Mutex<State>,
     work: Condvar,
     /// 每 `AtlasKind` 的共享槽是否正在被 GPU 线程消费（`false` = UI 可以入队）。
     atlas_pending: [AtomicBool; 2],
+    /// 已提交、尚未 drain 的帧数。提交路径在**记账之后**才登记完成回调（R09-17），
+    /// `sync_pacing`（主线程）与关闭握手都读它。
+    in_flight: Arc<InFlight>,
 }
 
 struct State {
@@ -670,12 +709,14 @@ struct State {
     /// （同一把锁里维护）。
     published_surface: Option<(u32, u32)>,
     atlas: AtlasSlots,
-    /// 最新 drawable（display link 每 vsync 覆盖旧的；GPU 线程取走即清空）。
-    drawable: Option<SendDrawable>,
+    /// 最新 drawable 与它被要求呈现的**目标时刻**（display link 每 vsync 覆盖旧的；GPU 线程
+    /// 取走即清空）。目标时刻是 host time（`CACurrentMediaTime()` 时基，R09-6）。
+    drawable: Option<DrawableUpdate>,
     /// 已完成、等 GPU 线程 drain 的命令缓冲（完成回调入队，本队列只增不减）。
     completions: VecDeque<Completion>,
-    /// 已提交、尚未 drain 的帧数（`sync_pacing` 与关闭握手都读它）。
-    in_flight: usize,
+    /// 已提交命令缓冲的**真实呈现时刻**（`addPresentedHandler` 给的 `presentedTime` 换算成
+    /// `Instant`；只增不减，GPU 线程 drain）。
+    presented: VecDeque<(FrameIndex, Instant)>,
     feedback: Option<FrameFeedback>,
     error: Option<EngineError>,
     shutdown: bool,
@@ -695,7 +736,7 @@ impl State {
             atlas: AtlasSlots::new(),
             drawable: None,
             completions: VecDeque::new(),
-            in_flight: 0,
+            presented: VecDeque::new(),
             feedback: None,
             error: None,
             shutdown: false,
@@ -705,18 +746,20 @@ impl State {
         }
     }
 
-    /// GPU 线程的等待条件：有完成通知 / 有帧且有 drawable / 有待应用背景色 / 关闭且已无在飞帧。
+    /// GPU 线程的等待条件：有完成通知 / 有呈现通知 / 有帧且有 drawable / 有待应用背景色 /
+    /// 关闭且已无在飞帧。
     ///
     /// 关闭开始后不再开新帧：只等完成通知（`in_flight` 归零或有通知可 drain）。否则残留的
     /// 「待画帧 + drawable」会让循环空转，也会让 [`Shared::wait_for_work`] 的 grace 永远不生效。
     ///
     /// 待应用背景色也是工作：`set_background` 用 condvar 唤醒，若等待条件不看它，这次唤醒会
     /// 被当作伪唤醒直接睡回去，颜色永远不落地（Windows 的事件句柄没有这个问题）。
-    fn has_work(&self) -> bool {
+    fn has_work(&self, in_flight: usize) -> bool {
         if self.shutdown {
-            return self.in_flight == 0 || !self.completions.is_empty();
+            return in_flight == 0 || !self.completions.is_empty();
         }
         !self.completions.is_empty()
+            || !self.presented.is_empty()
             || self.background.is_some()
             || (self.frame.has_pending() && self.drawable.is_some())
     }
@@ -789,6 +832,87 @@ fn pacing_paused(continuous: bool, pending_frame: bool, in_flight: usize) -> boo
     !(continuous || pending_frame || in_flight > 0)
 }
 
+/// 距离 display link 要求的目标呈现时刻不足这个量，就认为**来不及提交**。
+///
+/// 一个 vsync 是 8.3 ms（120 Hz）/ 16.7 ms（60 Hz）；留 2 ms 给"提交 → CA 收到"的调度。
+/// 过期的提交会被 CA 推到下一个 vsync，表现为固定的 1 帧额外延迟与抖动，所以宁可跳过本 vsync。
+const PRESENT_MARGIN: Duration = Duration::from_millis(2);
+
+/// 连续错过目标呈现时刻的上限：超过就退回"立即呈现"。
+///
+/// 只看 [`PRESENT_MARGIN`] 会在 CPU 持续跟不上（或 display link 给的目标时刻异常）时永远跳过
+/// —— 那等于画面冻结。允许连跳 2 个 vsync 重新对齐，第 3 次照常提交。
+const MAX_MISSED_PRESENTS: u32 = 2;
+
+/// 等 `presentedTime` 的上界：CoreAnimation 可能永远不回调（窗口被遮挡、drawable 被跳过），
+/// 反馈不能永远不发布。超过它就用完成时刻兜底。
+const PRESENTED_WAIT: Duration = Duration::from_millis(32);
+
+/// 本 vsync 的呈现决定（[`PresentPacing::plan`] 的结论）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PresentPlan {
+    /// `presentDrawable:atTime:`：钉到 display link 要求的那一帧。
+    AtTime(CFTimeInterval),
+    /// `presentDrawable:`：目标时刻不可用，或连续错过太多次。
+    Now,
+    /// 跳过本 vsync：目标时刻已经不够提交（提交注定被推到下一帧）。
+    Skip,
+}
+
+/// 呈现时刻判定（R09-6；纯状态机便于单测）。
+///
+/// 输入是 `CACurrentMediaTime()` 与 `CAMetalDisplayLinkUpdate.targetPresentationTimestamp`
+/// （同一 host time 时基）。CPU 落后时**跳过本 vsync**而不是立刻 present，避免"这一帧迟到一
+/// 个 vsync、下一帧又正常"造成的 8~17 ms 级抖动；但连续错过有上界，否则会冻结画面。
+struct PresentPacing {
+    /// 连续错过目标时刻的次数。
+    missed: u32,
+}
+
+impl PresentPacing {
+    const fn new() -> Self {
+        Self { missed: 0 }
+    }
+
+    fn plan(&mut self, now: CFTimeInterval, target: CFTimeInterval) -> PresentPlan {
+        // 系统没给可用目标时刻（headless / 异常值）：回到"尽快呈现"，与改动前行为一致。
+        if !(target.is_finite() && target > 0.0) {
+            self.missed = 0;
+            return PresentPlan::Now;
+        }
+        if now <= target - PRESENT_MARGIN.as_secs_f64() {
+            self.missed = 0;
+            return PresentPlan::AtTime(target);
+        }
+        self.missed = self.missed.saturating_add(1);
+        if self.missed > MAX_MISSED_PRESENTS {
+            // CPU 持续落后：继续跳只会让画面停住，退回立即呈现（迟到的代价小于不呈现）。
+            self.missed = 0;
+            PresentPlan::Now
+        } else {
+            PresentPlan::Skip
+        }
+    }
+}
+
+/// host time（秒，`mach_absolute_time` 时基）→ `Instant`。
+///
+/// `MTLDrawable.presentedTime` 与 `CACurrentMediaTime()` 是同一时基，与 `Instant`（单调时钟）
+/// 只差"采样此刻"这一个点：先算两者的差（`age`），再从 `observed` 往回推。非法值（0 / NaN /
+/// 未来时刻）返回 `None`，调用方退回完成时刻。
+fn host_time_to_instant(
+    presented: CFTimeInterval,
+    observed: Instant,
+    now_host: CFTimeInterval,
+) -> Option<Instant> {
+    if !presented.is_finite() || presented <= 0.0 || !now_host.is_finite() {
+        return None;
+    }
+    // 理论上 presented ≤ now_host；未来时刻按"刚刚"处理，避免 `from_secs_f64` 收到负数。
+    let age = (now_host - presented).max(0.0);
+    observed.checked_sub(Duration::from_secs_f64(age))
+}
+
 /// 请求的目标尺寸与 drawable 的实际尺寸是否一致（容差 1 px）。
 ///
 /// 1 px 只用于吸收 DPI / 图层取整：`set_layer_scale` 写的 `drawableSize` 就是
@@ -857,11 +981,12 @@ impl SurfaceMismatch {
 }
 
 impl Shared {
-    fn new() -> Self {
+    fn new(in_flight: Arc<InFlight>) -> Self {
         Self {
             state: Mutex::new(State::new()),
             work: Condvar::new(),
             atlas_pending: [AtomicBool::new(false), AtomicBool::new(false)],
+            in_flight,
         }
     }
 
@@ -918,13 +1043,21 @@ impl Shared {
         self.lock().background.take()
     }
 
-    /// display link delegate（主线程）：把这一帧的 drawable 放进最新 drawable 槽并唤醒 GPU 线程。
-    fn publish_drawable(&self, drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>) {
+    /// display link delegate（主线程）：把这一帧的 drawable 与它的目标呈现时刻放进最新
+    /// drawable 槽并唤醒 GPU 线程。
+    fn publish_drawable(
+        &self,
+        drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
+        target_presentation: CFTimeInterval,
+    ) {
         let mut state = self.lock();
         if state.shutdown || state.terminated {
             return;
         }
-        state.drawable = Some(SendDrawable(drawable));
+        state.drawable = Some(DrawableUpdate {
+            drawable,
+            target_presentation,
+        });
         drop(state);
         self.wake();
     }
@@ -943,16 +1076,46 @@ impl Shared {
         self.wake();
     }
 
-    /// 空闲：睡在 condvar 上直到「有完成通知 / 有帧且有 drawable / 关闭且无在飞帧」。
+    /// 呈现回调（CoreAnimation 的呈现线程）：记下本帧的**真实呈现时刻**并唤醒 GPU 线程。
+    ///
+    /// `presented_time` 是 `MTLDrawable.presentedTime`（host time，秒）；换算成 `Instant` 需要
+    /// 同一时刻的 host time 采样，因此这里同时取 `CACurrentMediaTime()`。
+    fn push_presented(&self, index: FrameIndex, presented_time: CFTimeInterval) {
+        let observed = Instant::now();
+        let Some(presented_at) =
+            host_time_to_instant(presented_time, observed, CACurrentMediaTime())
+        else {
+            // `presentedTime == 0`：这一帧没有上屏（被 CA 跳过）。不记呈现时刻，
+            // 反馈退回"完成时刻"（HUD 的含义仍是"提交→GPU 完成"）。
+            return;
+        };
+        let mut state = self.lock();
+        if state.terminated {
+            return;
+        }
+        state.presented.push_back((index, presented_at));
+        drop(state);
+        self.wake();
+    }
+
+    /// 取走全部呈现通知（GPU 线程 drain）。
+    fn take_presented(&self) -> Vec<(FrameIndex, Instant)> {
+        self.lock().presented.drain(..).collect()
+    }
+
+    /// 空闲：睡在 condvar 上直到「有完成 / 呈现通知 / 有帧且有 drawable / 关闭且无在飞帧」。
     ///
     /// 关闭后有在飞帧但驱动永不回调完成时，等待必须有上界（否则 GPU 线程自己永不退出，
     /// detach 之后还会一直占着资源）：用 100 ms 超时轮询，从关闭请求起**累计**超过
-    /// [`SHUTDOWN_GRACE`] 返回 [`WaitOutcome::TimedOut`]。正常路径（关闭后在飞帧很快归零、
-    /// 或未关闭）仍然是无超时等待。
-    fn wait_for_work(&self) -> WaitOutcome {
+    /// [`SHUTDOWN_GRACE`] 返回 [`WaitOutcome::TimedOut`]。
+    ///
+    /// `awaiting_presentation` 为真时（已有 GPU 完成、还在等 `presentedTime` 的帧）等待也必须
+    /// 有上界：CoreAnimation 可能永远不回调（窗口被遮挡 / drawable 被跳过），反馈不能永远不发布。
+    /// 这条超时返回 [`WaitOutcome::Work`]，让调用方用完成时刻兜底发布后重新判定。
+    fn wait_for_work(&self, awaiting_presentation: bool) -> WaitOutcome {
         let mut state = self.lock();
         loop {
-            if state.has_work() {
+            if state.has_work(self.in_flight.get()) {
                 return WaitOutcome::Work;
             }
             if state.shutdown {
@@ -967,6 +1130,14 @@ impl Shared {
                     .wait_timeout(state, timeout)
                     .unwrap_or_else(PoisonError::into_inner)
                     .0;
+            } else if awaiting_presentation {
+                // 等呈现通知的上界：睡 [`PRESENTED_WAIT`] 后返回，由调用方用完成时刻兜底发布
+                // （HUD 不允许停在旧值；CoreAnimation 可能永远不回调，例如 drawable 被跳过）。
+                let _ = self
+                    .work
+                    .wait_timeout(state, PRESENTED_WAIT)
+                    .unwrap_or_else(PoisonError::into_inner);
+                return WaitOutcome::Work;
             } else {
                 state = self
                     .work
@@ -1000,7 +1171,7 @@ impl Shared {
         state.frame.take()
     }
 
-    fn take_drawable(&self) -> Option<SendDrawable> {
+    fn take_drawable(&self) -> Option<DrawableUpdate> {
         self.lock().drawable.take()
     }
 
@@ -1020,26 +1191,24 @@ impl Shared {
     }
 
     /// 取走全部完成通知，并把在飞帧数减去同样多（GPU 线程 drain）。
+    ///
+    /// 计数错误（扣得比记的多）是记账 bug，由 [`InFlight::note_drained`] 硬失败 —— 旧实现的
+    /// `saturating_sub` 会把它静默钳到 0（R09-17）。
     fn take_completions(&self) -> Vec<Completion> {
         let mut state = self.lock();
         let completions: Vec<Completion> = state.completions.drain(..).collect();
-        state.in_flight = state.in_flight.saturating_sub(completions.len());
+        self.in_flight.note_drained(completions.len());
         completions
     }
 
-    /// GPU 线程提交成功之后记账（`sync_pacing` 与关闭握手都读它）。
-    fn note_submitted(&self) {
-        self.lock().in_flight += 1;
-    }
-
     fn in_flight(&self) -> usize {
-        self.lock().in_flight
+        self.in_flight.get()
     }
 
     /// `sync_pacing` 的输入：是否有未取走的帧请求、是否有在飞帧。
     fn pacing_state(&self) -> (bool, usize) {
         let state = self.lock();
-        (state.frame.has_pending(), state.in_flight)
+        (state.frame.has_pending(), self.in_flight.get())
     }
 
     fn shutdown_requested(&self) -> bool {
@@ -1134,6 +1303,10 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, _keep_alive: SendLay
     let mut feedback = FeedbackQueue::new();
     // drawable 与请求尺寸不一致的退化状态（P1；粘性，见 [`SurfaceMismatch`]）。
     let mut surface = SurfaceMismatch::new();
+    // display link 的目标呈现时刻判定（R09-6；纯状态机，见 [`PresentPacing`]）。
+    let mut pacing = PresentPacing::new();
+    // 最近一次推进到的连续完成前沿：呈现通知晚到时也要按它发布反馈（见 `FeedbackQueue`）。
+    let mut frontier: Option<FrameIndex> = None;
     // 已从共享槽取走、但还没编码进本帧 command buffer 的图集上传（按 `AtlasKind`）。
     let mut atlas_awaiting = [false; 2];
     loop {
@@ -1141,7 +1314,7 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, _keep_alive: SendLay
         if let Some(linear) = shared.take_background() {
             renderer.set_background_color(linear);
         }
-        if shared.wait_for_work() == WaitOutcome::TimedOut {
+        if shared.wait_for_work(feedback.awaiting_presentation()) == WaitOutcome::TimedOut {
             // 驱动没有回调完成：线程自己不能永远等下去（detach 之后它会一直占着资源；进程退出前
             // 也没有人会来救它）。Metal 的命令缓冲自己持有资源引用，退出时释放 device/queue 不会
             // UAF。
@@ -1152,9 +1325,20 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, _keep_alive: SendLay
             );
             break;
         }
-        if let Err(error) = drain_completions(&mut renderer, &shared, &mut feedback) {
+        // 呈现通知先落地：它可能比完成通知晚到一帧（`presentedTime` 要等真正上屏）。
+        for (index, presented_at) in shared.take_presented() {
+            feedback.presented(index, presented_at);
+        }
+        if let Err(error) = drain_completions(&mut renderer, &shared, &mut feedback, &mut frontier)
+        {
             shared.publish_error(error);
             break;
+        }
+        // 连续完成前缀推进过（或之前推进过）：按提交顺序发布已经拿到呈现时刻的帧；
+        // 等不到呈现时刻的帧由 [`PRESENTED_WAIT`] 兜底用完成时刻发布。
+        if let Some(frontier) = frontier {
+            let now = Instant::now();
+            feedback.pop_ready(frontier, now, |frame| shared.publish_feedback(frame));
         }
         if shared.shutdown_requested() {
             // 退出前 drain 在飞帧（I4）：完成通知到达、旧资源释放之后才销毁 device/queue。
@@ -1167,13 +1351,22 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, _keep_alive: SendLay
         if !shared.has_pending_frame() {
             continue;
         }
-        let Some(drawable) = shared.take_drawable() else {
+        let Some(update) = shared.take_drawable() else {
             continue;
         };
         // ① drawable 的实际像素尺寸就是本帧的渲染尺寸（§5.4）。
-        let texture = drawable.0.texture();
+        let texture = update.drawable.texture();
         let target = (texture.width() as u32, texture.height() as u32);
-        // ② resize 校验（P1）必须在**占槽与取帧之前**：drawable 可能还是上一轮 layout 的产物，
+        // ② 呈现时刻判定（R09-6）：display link 要求本帧在 `target_presentation` 这一帧上屏。
+        //    已经不够提交（CPU 落后）时**跳过本 vsync**，而不是提交一帧注定被推到下一个 vsync 的
+        //    内容 —— 那种"迟到帧"会让画面在 1/2 帧之间抖动。连续落后太多则由 `PresentPacing`
+        //    退回立即呈现，避免永远不呈现（画面冻结）。
+        let present_at = match pacing.plan(CACurrentMediaTime(), update.target_presentation) {
+            PresentPlan::Skip => continue,
+            PresentPlan::AtTime(time) => Some(time),
+            PresentPlan::Now => None,
+        };
+        // ③ resize 校验（P1）必须在**占槽与取帧之前**：drawable 可能还是上一轮 layout 的产物，
         //    用它消费最新帧会把最后一帧按旧尺寸画完并 present；此后 pacing 暂停、没有新帧
         //    ⇒ 窗口永久停在旧尺寸画面。不一致就丢弃这个 drawable、跳过本 vsync，帧留在最新
         //    帧槽里（`pending=true` 让 display link 保持运行），下一个 vsync 再取新尺寸的 drawable。
@@ -1193,7 +1386,7 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, _keep_alive: SendLay
             continue;
         }
         let degrade = verdict == SurfaceVerdict::Degraded;
-        // ③ 三缓冲背压：**非阻塞**；失败就丢掉这个 drawable（帧请求留在槽里，下一个 vsync 再试）。
+        // ④ 三缓冲背压：**非阻塞**；失败就丢掉这个 drawable（帧请求留在槽里，下一个 vsync 再试）。
         //    必须在尺寸校验之后占槽：占槽后放弃会让 semaphore 与 ring 槽位不同源。
         if !renderer.try_acquire_upload_slot() {
             continue;
@@ -1232,7 +1425,18 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, _keep_alive: SendLay
             let shared = Arc::clone(&shared);
             move |buffer| shared.push_completion(index, SendCommandBuffer(buffer))
         };
-        match renderer.submit_frame(&request, &drawable.0, &mut frame, completed) {
+        let presented = {
+            let shared = Arc::clone(&shared);
+            move |presented_time| shared.push_presented(index, presented_time)
+        };
+        match renderer.submit_frame(
+            &request,
+            &update.drawable,
+            present_at,
+            &mut frame,
+            completed,
+            presented,
+        ) {
             Ok((stats, samples)) => {
                 // 上传已经编码进本帧 command buffer：共享槽这才算空，UI 可以入队下一笔。
                 for (index, awaiting) in atlas_awaiting.iter_mut().enumerate() {
@@ -1245,7 +1449,7 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, _keep_alive: SendLay
                     }
                 }
                 // **不**在这里清退化状态：粘性状态只在尺寸重新一致时清除（`SurfaceMismatch`）。
-                shared.note_submitted();
+                // 在飞记账已经在 `Queue::submit` 里、`commit` **之前**完成（R09-17）。
                 feedback.push(index, stats, samples, request.published_at);
             }
             Err(error) => {
@@ -1258,18 +1462,21 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, _keep_alive: SendLay
     guard.disarm();
 }
 
-/// 处理完成通知：读 GPU 时间、推进 retire、按提交顺序发布反馈（**只**在 GPU 线程）。
+/// 处理完成通知：读 GPU 时间、推进 retire（**只**在 GPU 线程）。
+///
+/// 新的连续完成前沿写进 `frontier`（调用方在 drain 之后统一按提交顺序发布反馈）。
 fn drain_completions(
     renderer: &mut GpuRenderer,
     shared: &Shared,
     feedback: &mut FeedbackQueue,
+    frontier: &mut Option<FrameIndex>,
 ) -> Result<(), EngineError> {
     for completion in shared.take_completions() {
         let index = completion.index;
-        let (sample, frontier) = renderer.on_frame_completed(index, &completion.buffer.0)?;
+        let (sample, advanced) = renderer.on_frame_completed(index, &completion.buffer.0)?;
         feedback.complete(index, sample);
-        if let Some(frontier) = frontier {
-            feedback.pop_ready(frontier, |frame| shared.publish_feedback(frame));
+        if advanced.is_some() {
+            *frontier = advanced;
         }
     }
     Ok(())
@@ -1283,6 +1490,8 @@ struct SubmittedFrame {
     published_at: Instant,
     /// 完成通知到达的时刻（`None` = 仍在飞）。
     completed_at: Option<Instant>,
+    /// `MTLDrawable.presentedTime` 换算出的**真实呈现时刻**（`None` = 还没收到呈现通知）。
+    presented_at: Option<Instant>,
 }
 
 /// 按提交顺序发布反馈的队列（`render/frame.rs` 的跨平台契约）。
@@ -1316,10 +1525,11 @@ impl FeedbackQueue {
             samples,
             published_at,
             completed_at: None,
+            presented_at: None,
         });
     }
 
-    /// 完成通知到达：记录 GPU 采样与完成时刻；**不**发布（可能还在等更早的帧）。
+    /// 完成通知到达：记录 GPU 采样与完成时刻；**不**发布（可能还在等更早的帧或呈现时刻）。
     fn complete(&mut self, index: FrameIndex, sample: Option<GpuTimerSample>) {
         let position = self.submitted.iter().position(|frame| frame.index == index);
         debug_assert!(
@@ -1336,29 +1546,64 @@ impl FeedbackQueue {
         frame.completed_at = Some(Instant::now());
     }
 
+    /// 呈现通知到达（`MTLDrawable.presentedTime`）：记下**真实呈现时刻**。
+    ///
+    /// 它通常晚于完成通知（GPU 先跑完、再由 CA 在下一个 vsync 上屏）。也可能落在反馈已经发布
+    /// 之后（帧已出队）或极少数情况下早于提交记账（CA 在另一个线程）：两种情况都直接丢弃，
+    /// 不能倒回去改已经发布的统计。
+    fn presented(&mut self, index: FrameIndex, presented_at: Instant) {
+        let Some(frame) = self.submitted.iter_mut().find(|frame| frame.index == index) else {
+            return;
+        };
+        if frame.presented_at.is_none() {
+            frame.presented_at = Some(presented_at);
+        }
+    }
+
+    /// 是否还有"GPU 已完成、在等呈现通知"的帧：决定 [`Shared::wait_for_work`] 是否必须有上界。
+    fn awaiting_presentation(&self) -> bool {
+        self.submitted
+            .iter()
+            .any(|frame| frame.completed_at.is_some() && frame.presented_at.is_none())
+    }
+
     /// `CompletionOrder` 的连续前缀推进到 `frontier`：按提交顺序弹出已完成帧并发布。
-    fn pop_ready(&mut self, frontier: FrameIndex, mut publish: impl FnMut(FrameFeedback)) {
+    ///
+    /// 一帧在两种情况下发布：
+    /// 1. 拿到了 `presentedTime`（真实呈现时刻，权威值）；
+    /// 2. 完成之后已经等了 [`PRESENTED_WAIT`]（CA 可能永远不回调 —— 遮挡、drawable 被跳过、
+    ///    或者这一帧被后来的 drawable 顶掉）⇒ 用完成时刻兜底，HUD 不会停在旧值。
+    fn pop_ready(
+        &mut self,
+        frontier: FrameIndex,
+        now: Instant,
+        mut publish: impl FnMut(FrameFeedback),
+    ) {
         while let Some(front) = self.submitted.front() {
             if front.index > frontier {
                 break;
             }
-            let completed_at = front.completed_at;
-            debug_assert!(
-                completed_at.is_some(),
-                "completion frontier passed an incomplete frame"
-            );
-            let Some(completed_at) = completed_at else {
+            let Some(completed_at) = front.completed_at else {
+                debug_assert!(false, "completion frontier passed an incomplete frame");
                 break;
+            };
+            let presented_at = match front.presented_at {
+                Some(presented_at) => presented_at,
+                None if now.saturating_duration_since(completed_at) >= PRESENTED_WAIT => {
+                    completed_at
+                }
+                // 还在等呈现通知：停在这里，保序（后面的帧也不能先发布）。
+                None => break,
             };
             let frame = self.submitted.pop_front().expect("front exists");
             publish(FrameFeedback {
                 index: frame.index,
                 stats: frame.stats,
                 samples: frame.samples,
-                // UI 发布 → 观察到 GPU 完成（HUD 的 publish→present）。
-                latency: completed_at.saturating_duration_since(frame.published_at),
-                // 完成通知到达（GPU 线程被唤醒）的时刻，近似呈现时刻。
-                completed_at,
+                // UI 发布 → **呈现**（`presentedTime` 权威值；兜底时是 GPU 完成时刻）。
+                latency: presented_at.saturating_duration_since(frame.published_at),
+                // 真实呈现时刻（R09-6）：HUD 的 publish→present 不再是"完成通知被处理的时刻"。
+                completed_at: presented_at,
             });
         }
     }
@@ -1374,9 +1619,11 @@ mod tests {
     use smol_str::SmolStr;
 
     use super::{
-        AtlasSlots, FeedbackQueue, JOIN_TIMEOUT, MAX_SURFACE_MISMATCHES, PanicGuard,
-        SHUTDOWN_GRACE, SendCommandBuffer, Shared, StickyError, SurfaceMismatch, SurfaceVerdict,
-        WaitOutcome, join_with_deadline, pacing_paused, surface_within_tolerance,
+        AtlasSlots, FeedbackQueue, InFlight, JOIN_TIMEOUT, MAX_MISSED_PRESENTS,
+        MAX_SURFACE_MISMATCHES, PRESENT_MARGIN, PRESENTED_WAIT, PanicGuard, PresentPacing,
+        PresentPlan, SHUTDOWN_GRACE, SendCommandBuffer, Shared, StickyError, SurfaceMismatch,
+        SurfaceVerdict, WaitOutcome, host_time_to_instant, join_with_deadline, pacing_paused,
+        surface_within_tolerance,
     };
     use crate::{
         error::EngineError,
@@ -1464,6 +1711,132 @@ mod tests {
         assert!(pacing_paused(false, false, 0), "空闲：display link 暂停");
     }
 
+    /// R09-6：display link 给的目标呈现时刻必须用 `presentDrawable:atTime:` 钉住。
+    #[test]
+    fn a_fresh_target_presentation_timestamp_is_pinned() {
+        let mut pacing = PresentPacing::new();
+        let target = 1_000.010;
+        assert_eq!(
+            pacing.plan(1_000.0, target),
+            PresentPlan::AtTime(target),
+            "还来得及提交：钉到目标呈现时刻"
+        );
+    }
+
+    /// R09-6：目标时刻已经不够提交（CPU 落后）时**跳过本 vsync**，而不是提交一帧注定迟到的内容；
+    /// 但连续错过有上界，否则画面会冻结。
+    #[test]
+    fn a_missed_target_skips_the_vsync_but_never_forever() {
+        let mut pacing = PresentPacing::new();
+        let target = 1_000.0;
+        let late = target - PRESENT_MARGIN.as_secs_f64() / 2.0;
+        for _ in 0..MAX_MISSED_PRESENTS {
+            assert_eq!(
+                pacing.plan(late, target),
+                PresentPlan::Skip,
+                "落后于目标时刻：跳过本 vsync 重新对齐"
+            );
+        }
+        assert_eq!(
+            pacing.plan(late, target),
+            PresentPlan::Now,
+            "连续错过 {MAX_MISSED_PRESENTS} 次之后退回立即呈现（不允许冻结画面）"
+        );
+        // 重新对齐之后又回到钉时刻。
+        assert_eq!(
+            pacing.plan(1_000.0, target + 0.010),
+            PresentPlan::AtTime(target + 0.010)
+        );
+    }
+
+    /// 系统不给目标时刻（headless / 0）：回到"尽快呈现"，与改动前行为一致。
+    #[test]
+    fn a_missing_target_timestamp_presents_immediately() {
+        for target in [0.0, f64::NAN, f64::INFINITY, -1.0] {
+            let mut pacing = PresentPacing::new();
+            assert_eq!(pacing.plan(123.0, target), PresentPlan::Now, "{target:?}");
+        }
+    }
+
+    /// `presentedTime` 是 host time（秒）：换算成 `Instant` 之后必须能当作反馈的呈现时刻。
+    #[test]
+    fn host_time_is_converted_into_the_monotonic_clock() {
+        let observed = Instant::now();
+        let presented_host = 500.0;
+        let now_host = presented_host + 0.010;
+        let presented = host_time_to_instant(presented_host, observed, now_host).expect("instant");
+        assert!(presented <= observed, "呈现时刻不可能晚于观测时刻");
+        let age = observed.saturating_duration_since(presented);
+        assert!(
+            (Duration::from_millis(9)..=Duration::from_millis(11)).contains(&age),
+            "10 ms 前呈现：换算误差 {age:?}"
+        );
+        // 非法值（MLA 没给 / 被跳过 / NaN）：返回 None，调用方退回完成时刻。
+        assert!(host_time_to_instant(0.0, observed, now_host).is_none());
+        assert!(host_time_to_instant(f64::NAN, observed, now_host).is_none());
+        // 未来时刻（同一时基下不该出现）：按"刚刚"处理而不是溢出。
+        assert_eq!(
+            host_time_to_instant(now_host + 5.0, observed, now_host),
+            Some(observed)
+        );
+    }
+
+    /// R09-6：拿到 `presentedTime` 时，反馈的 `completed_at` / `latency` 必须用**真实呈现时刻**，
+    /// 而不是"完成通知被处理的时刻"（旧实现让 HUD 少报 8~17 ms）。
+    #[test]
+    fn presented_time_overrides_the_completion_time() {
+        let mut feedback = FeedbackQueue::new();
+        let published_at = Instant::now() - Duration::from_millis(100);
+        feedback.push(index(1), stats(1), Vec::new(), published_at);
+        feedback.complete(index(1), None);
+        let presented_at = Instant::now();
+        feedback.presented(index(1), presented_at);
+        assert!(!feedback.awaiting_presentation(), "呈现时刻已到，不必再等");
+        let mut published = Vec::new();
+        feedback.pop_ready(index(1), Instant::now(), |frame| published.push(frame));
+        assert_eq!(published.len(), 1);
+        assert_eq!(
+            published[0].completed_at, presented_at,
+            "completed_at 必须是 presentedTime 换算出的呈现时刻"
+        );
+        assert_eq!(
+            published[0].latency,
+            presented_at.saturating_duration_since(published_at),
+            "latency = 发布 → 呈现"
+        );
+    }
+
+    /// 呈现通知可能永远不来（窗口被遮挡 / drawable 被跳过）：等满 [`PRESENTED_WAIT`] 之后必须
+    /// 用完成时刻兜底发布，HUD 不能停在旧值。
+    #[test]
+    fn a_frame_without_a_presented_time_is_published_after_the_wait() {
+        let mut feedback = FeedbackQueue::new();
+        feedback.push(index(1), stats(1), Vec::new(), Instant::now());
+        feedback.complete(index(1), None);
+        assert!(feedback.awaiting_presentation(), "在等呈现通知");
+        let mut published = Vec::new();
+        // 还没等满：不能发布（保序，后面的帧也不能先出）。
+        feedback.pop_ready(index(1), Instant::now(), |frame| published.push(frame));
+        assert!(published.is_empty(), "等呈现通知期间不发布");
+        assert_eq!(feedback.submitted.len(), 1);
+        // 等满之后兜底发布，completed_at 退回完成时刻。
+        feedback.pop_ready(index(1), Instant::now() + PRESENTED_WAIT * 2, |frame| {
+            published.push(frame)
+        });
+        assert_eq!(published.len(), 1);
+        assert!(feedback.submitted.is_empty());
+    }
+
+    /// 呈现通知可能落在反馈已经发布之后（甚至极少数情况下早于提交记账）：两种情况都必须
+    /// 静默丢弃，不能 panic（CA 在另一个线程回调）。
+    #[test]
+    fn a_presented_notification_for_an_unknown_frame_is_ignored() {
+        let mut feedback = FeedbackQueue::new();
+        feedback.presented(index(9), Instant::now());
+        assert!(feedback.submitted.is_empty());
+        assert!(!feedback.awaiting_presentation());
+    }
+
     #[test]
     fn drawable_size_tolerance_absorbs_one_pixel_of_dpi_rounding() {
         assert!(surface_within_tolerance((1400, 1040), (1400, 1040)));
@@ -1533,7 +1906,7 @@ mod tests {
 
     #[test]
     fn a_stale_drawable_cannot_consume_the_pending_frame() {
-        let shared = Shared::new();
+        let shared = Shared::new(Arc::new(InFlight::new()));
         shared.publish_frame(request(1, (1800, 1400)));
         assert!(
             shared
@@ -1561,7 +1934,7 @@ mod tests {
 
     #[test]
     fn the_degraded_path_can_force_consume_a_mismatched_frame() {
-        let shared = Shared::new();
+        let shared = Shared::new(Arc::new(InFlight::new()));
         shared.publish_frame(request(7, (1800, 1400)));
         let frame = shared
             .take_frame_for_drawable((1920, 1556), true)
@@ -1575,11 +1948,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_pending_background_color_wakes_the_gpu_loop() {
-        let shared = Shared::new();
-        assert!(!shared.lock().has_work(), "空闲：没有工作");
+        let shared = Shared::new(Arc::new(InFlight::new()));
+        assert!(!shared.lock().has_work(0), "空闲：没有工作");
         shared.set_background([0.25, 0.5, 0.75, 1.0]);
         assert_eq!(
-            shared.wait_for_work(),
+            shared.wait_for_work(false),
             WaitOutcome::Work,
             "待应用背景色必须让 GPU 线程从等待中返回"
         );
@@ -1590,7 +1963,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_background_change_after_shutdown_or_termination_is_dropped() {
-        let shared = Shared::new();
+        let shared = Shared::new(Arc::new(InFlight::new()));
         shared.request_shutdown();
         shared.set_background([1.0, 0.0, 0.0, 1.0]);
         assert_eq!(
@@ -1599,7 +1972,7 @@ mod tests {
             "GPU 线程在应用背景色之前已退出"
         );
 
-        let terminated = Shared::new();
+        let terminated = Shared::new(Arc::new(InFlight::new()));
         terminated.mark_terminated();
         terminated.set_background([0.0, 1.0, 0.0, 1.0]);
         assert_eq!(terminated.take_background(), None);
@@ -1625,7 +1998,9 @@ mod tests {
         let mut published = Vec::new();
         // 第 1 帧完成：`CompletionOrder` 的前沿一次推进到 3，按提交顺序发布 1、2、3。
         feedback.complete(index(1), None);
-        feedback.pop_ready(index(3), |frame| published.push(frame));
+        // 已经等满呈现通知的上界：三帧都用完成时刻兜底发布（发布顺序不受影响）。
+        let ready_at = Instant::now() + PRESENTED_WAIT * 2;
+        feedback.pop_ready(index(3), ready_at, |frame| published.push(frame));
 
         assert_eq!(
             published
@@ -1651,13 +2026,13 @@ mod tests {
 
     #[test]
     fn shutdown_wait_is_bounded_when_completions_never_arrive() {
-        let shared = Arc::new(Shared::new());
-        shared.lock().in_flight = 1;
+        let shared = Arc::new(Shared::new(Arc::new(InFlight::new())));
+        shared.in_flight.preset(1);
         shared.request_shutdown();
         let worker = Arc::clone(&shared);
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = sender.send(worker.wait_for_work());
+            let _ = sender.send(worker.wait_for_work(false));
         });
         let started = Instant::now();
         assert_eq!(
@@ -1713,12 +2088,12 @@ mod tests {
 
         use crate::render::macos::device::Device;
 
-        let shared = Shared::new();
+        let shared = Shared::new(Arc::new(InFlight::new()));
         let device = Device::new().expect("metal device");
         let queue = device.raw().newCommandQueue().expect("command queue");
         let buffer = || SendCommandBuffer(queue.commandBuffer().expect("command buffer"));
         shared.request_shutdown();
-        shared.lock().in_flight = 2;
+        shared.in_flight.preset(2);
         shared.push_completion(index(1), buffer());
         let completions = shared.take_completions();
         assert_eq!(
@@ -1791,7 +2166,7 @@ mod tests {
     /// 而不是静默停摆。
     #[test]
     fn a_panicking_gpu_thread_publishes_an_error() {
-        let shared = Arc::new(Shared::new());
+        let shared = Arc::new(Shared::new(Arc::new(InFlight::new())));
         let worker = Arc::clone(&shared);
         // 关掉默认 hook：这条 panic 是测试输入，不是测试失败。
         let hook = std::panic::take_hook();
@@ -1819,7 +2194,7 @@ mod tests {
     /// panic 只填补**空**错误槽：循环已经发布的错误是更具体的原因，不能被覆盖。
     #[test]
     fn a_panic_keeps_an_already_published_error() {
-        let shared = Arc::new(Shared::new());
+        let shared = Arc::new(Shared::new(Arc::new(InFlight::new())));
         shared.publish_error(EngineError::DeviceLost {
             reason: SmolStr::new_static("MTLCommandBufferError(11)"),
             log_path: std::path::PathBuf::from("logs/metal.txt"),

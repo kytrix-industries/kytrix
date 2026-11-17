@@ -10,9 +10,17 @@
 //! [`GeometryRegistry::retain_recent`] 驱逐连续 [`EVICT_AFTER_FRAMES`] 帧未被绘制的条目，
 //! 设备对象推进现有 retire 队列（等该帧完成后再真正释放）。
 //!
-//! 与 Windows 的差别只有内存类型：Vulkan 没有「UPLOAD 堆」这一说，这里用
-//! `HOST_VISIBLE | HOST_COHERENT` 的设备本地缓冲，装载期 `map` 一次写完后 `unmap`
-//! （几何是静态数据，之后只读）。
+//! 与 Windows 的差别只有内存来源：Vulkan 没有「UPLOAD 堆」这一说，这里走 `SharedGpu` 的
+//! **两级子分配器**（R11-6）：
+//!
+//! - 类型选择按「主机可写 + **设备本地优先**」求交（[`MemoryNeed::HOST_WRITABLE`]）：
+//!   BAR / UMA 上几何直接落在设备内存（vertex fetch 走 L2），没有 BAR 的独显才退回主机堆。
+//!   旧实现写死 `HOST_VISIBLE | HOST_COHERENT` 且只取「第一个匹配的类型」——在所有独显上
+//!   顶点/索引都落在系统内存里，每次 draw 的 fetch 都走 PCIe（还与注释自述的「设备本地缓冲」不符）。
+//! - 分配走子分配块：几何条目按 `GeometryId.index()` 增长，几百到上千条是常态，每条两次
+//!   `vkAllocateMemory` 会撞上 `maxMemoryAllocationCount` 的规范下限（4096）。
+//!
+//! 装载期写入是**持久映射**（整块 map 一次，子分配只拿 offset），不再每条 map/unmap。
 
 use ash::vk;
 
@@ -20,7 +28,10 @@ use crate::{
     error::EngineError,
     paint::geometry::{GeometryDesc, GeometryId, GeometryPipeline, IndexType, Topology},
     render::{
-        linux::device::{GpuObject, SharedGpu, init_error},
+        linux::{
+            device::{GpuBuffer, SharedGpu, init_error},
+            memory::MemoryNeed,
+        },
         retire::GpuResourceHandle,
     },
 };
@@ -38,8 +49,9 @@ fn geometry_is_stale(frame: u64, last_used_frame: u64) -> bool {
 
 /// 一条已注册几何的 GPU 视图。
 pub(crate) struct GeometryEntry {
-    vertex: vk::Buffer,
-    index: vk::Buffer,
+    /// 顶点缓冲（子分配：`buffer` + 块内区间 + 主机写入指针 + retire 句柄）。
+    vertex: GpuBuffer,
+    index: GpuBuffer,
     index_count: u32,
     /// 图元类型（Vulkan 把它烘进管线状态：PSO 按它选，绘制时不需要单独绑定）。
     pipeline: GeometryPipeline,
@@ -52,17 +64,15 @@ pub(crate) struct GeometryEntry {
     generation: u32,
     /// 最后一次被绘制的帧号（[`GeometryRegistry`] 的单调帧号；驱逐判据）。
     last_used_frame: u64,
-    /// 卸载时交还共享设备的句柄（顶点 buffer / memory、索引 buffer / memory，按销毁顺序）。
-    storage: Vec<GpuResourceHandle>,
 }
 
 impl GeometryEntry {
     pub(crate) fn vertex(&self) -> vk::Buffer {
-        self.vertex
+        self.vertex.buffer
     }
 
     pub(crate) fn index(&self) -> vk::Buffer {
-        self.index
+        self.index.buffer
     }
 
     pub(crate) fn index_count(&self) -> u32 {
@@ -81,6 +91,11 @@ impl GeometryEntry {
     /// 索引格式。
     pub(crate) fn index_type(&self) -> vk::IndexType {
         self.index_type
+    }
+
+    /// 卸载时交还共享设备的句柄（顶点 + 索引；缓冲销毁与区间归还都在 `SharedGpu::release`）。
+    fn handles(&self) -> [GpuResourceHandle; 2] {
+        [self.vertex.handle, self.index.handle]
     }
 }
 
@@ -112,7 +127,7 @@ impl GeometryRegistry {
                 .as_ref()
                 .is_some_and(|entry| geometry_is_stale(frame, entry.last_used_frame));
             if stale && let Some(entry) = slot.take() {
-                retired.extend(entry.storage);
+                retired.extend(entry.handles());
             }
         }
     }
@@ -120,8 +135,8 @@ impl GeometryRegistry {
     /// teardown：把本窗口几何缓冲的句柄交回共享设备（窗口 GPU 线程已等到自己的提交完成）。
     pub(crate) fn release(&self, shared: &SharedGpu) {
         for entry in self.entries.iter().flatten() {
-            for handle in &entry.storage {
-                let _ = shared.release(*handle);
+            for handle in entry.handles() {
+                let _ = shared.release(handle);
             }
         }
     }
@@ -146,7 +161,7 @@ impl GeometryRegistry {
         };
         if stale {
             if let Some(old) = self.entries[slot].take() {
-                retired.extend(old.storage);
+                retired.extend(old.handles());
             }
             let entry = upload_geometry(shared, id, desc)?;
             self.entries[slot] = Some(entry);
@@ -167,15 +182,14 @@ impl GeometryRegistry {
     }
 }
 
-/// 按注册描述创建顶点/索引缓冲（host-visible；静态数据一次写入）。
+/// 按注册描述创建顶点/索引缓冲（子分配 + 持久映射写入）。
 fn upload_geometry(
     shared: &SharedGpu,
     id: GeometryId,
     desc: &GeometryDesc,
 ) -> Result<GeometryEntry, EngineError> {
-    let (vertex, mut vertex_storage) = upload_buffer(shared, &desc.vertex_bytes)?;
-    let (index, index_storage) = upload_buffer(shared, &desc.index_bytes)?;
-    vertex_storage.extend(index_storage);
+    let vertex = upload_buffer(shared, &desc.vertex_bytes)?;
+    let index = upload_buffer(shared, &desc.index_bytes)?;
     Ok(GeometryEntry {
         vertex,
         index,
@@ -186,79 +200,29 @@ fn upload_geometry(
         generation: id.generation(),
         // 由 `ensure` 在返回前立刻写成当前帧号；这里只是构造初值。
         last_used_frame: 0,
-        storage: vertex_storage,
     })
 }
 
-/// 建一块 host-visible 顶点/索引缓冲并写入 `bytes`。返回 `(buffer, [buffer 句柄, memory 句柄])`。
-fn upload_buffer(
-    shared: &SharedGpu,
-    bytes: &[u8],
-) -> Result<(vk::Buffer, Vec<GpuResourceHandle>), EngineError> {
-    let size = bytes.len().max(4) as u64;
-    let create = vk::BufferCreateInfo::default()
-        .size(size)
-        .usage(vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    // SAFETY: 句柄与参数都由本函数独占，调用期间有效。
-    let buffer = unsafe { shared.raw().create_buffer(&create, None) }
-        .map_err(|error| init_error("create_buffer(geometry)", format!("{error:?}")))?;
-    // SAFETY: 只读查询；句柄有效。
-    let requirements = unsafe { shared.raw().get_buffer_memory_requirements(buffer) };
-    let Some(memory_type) = shared.memory_type(
-        requirements.memory_type_bits,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    ) else {
-        // SAFETY: buffer 已创建且尚未交给任何人。
-        unsafe { shared.raw().destroy_buffer(buffer, None) };
-        return Err(init_error("geometry memory", "no host-visible memory type"));
-    };
-    // SAFETY: 句柄与参数都由本函数独占。
-    let memory = match unsafe {
-        shared.raw().allocate_memory(
-            &vk::MemoryAllocateInfo::default()
-                .allocation_size(requirements.size)
-                .memory_type_index(memory_type),
-            None,
-        )
-    } {
-        Ok(memory) => memory,
-        Err(error) => {
-            // SAFETY: buffer 已创建且尚未交给任何人。
-            unsafe { shared.raw().destroy_buffer(buffer, None) };
-            return Err(init_error(
-                "allocate_memory(geometry)",
-                format!("{error:?}"),
-            ));
-        }
-    };
-    // SAFETY: 目标句柄已按 Vulkan 校验规则创建，绑定范围在其分配内。
-    if let Err(error) = unsafe { shared.raw().bind_buffer_memory(buffer, memory, 0) } {
-        // SAFETY: 两个句柄都还没有交给任何人。
-        unsafe {
-            shared.raw().destroy_buffer(buffer, None);
-            shared.raw().free_memory(memory, None);
-        }
+/// 从子分配器拿一块顶点/索引缓冲并写入 `bytes`（静态数据，写入后不再改）。
+fn upload_buffer(shared: &SharedGpu, bytes: &[u8]) -> Result<GpuBuffer, EngineError> {
+    let buffer = shared.allocate_buffer(
+        bytes.len().max(4) as u64,
+        vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER,
+        MemoryNeed::HOST_WRITABLE,
+    )?;
+    let Some(pointer) = buffer.pointer else {
+        // `HOST_WRITABLE` 要求 `HOST_VISIBLE`，子分配器因此必然给出映射；走到这里说明不变量被破坏。
+        let _ = shared.release(buffer.handle);
         return Err(init_error(
-            "bind_buffer_memory(geometry)",
-            format!("{error:?}"),
+            "geometry memory",
+            "suballocated geometry buffer has no host mapping",
         ));
-    }
-    // SAFETY: 映射区间覆盖 `size`，写入后立即 `unmap`（静态数据，之后只读）。
+    };
+    // SAFETY: 映射范围覆盖整个块，本缓冲的写入区间落在自己的子分配内。
     unsafe {
-        let pointer = shared
-            .raw()
-            .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
-            .map_err(|error| init_error("map_memory(geometry)", format!("{error:?}")))?;
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer.cast::<u8>(), bytes.len());
-        shared.raw().unmap_memory(memory);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer, bytes.len());
     }
-    // 句柄按销毁顺序登记：buffer 先于绑定它的 memory。
-    let handles = vec![
-        shared.allocate(GpuObject::Buffer(buffer)),
-        shared.allocate(GpuObject::Memory(memory)),
-    ];
-    Ok((buffer, handles))
+    Ok(buffer)
 }
 
 /// 索引格式（`vk::IndexType`）。
@@ -276,7 +240,7 @@ mod tests {
     use super::{EVICT_AFTER_FRAMES, GeometryEntry, GeometryRegistry, geometry_is_stale};
     use crate::{
         paint::geometry::{GeometryPipeline, Topology},
-        render::retire::GpuResourceHandle,
+        render::{linux::device::GpuBuffer, retire::GpuResourceHandle},
     };
 
     /// 驱逐判据的边界：恰好到门槛保留、越过门槛驱逐、帧号回绕给出正确差值。
@@ -296,18 +260,26 @@ mod tests {
         GpuResourceHandle::new(1, 0, index)
     }
 
+    /// 测试用的假缓冲：不建真实设备，只验证句柄收集。
+    fn gpu_buffer(handle: GpuResourceHandle) -> GpuBuffer {
+        GpuBuffer {
+            buffer: vk::Buffer::null(),
+            pointer: None,
+            handle,
+        }
+    }
+
     /// 测试用的假条目：不建真实设备，只验证 `retain_recent` 的选择与句柄收集。
-    fn entry(last_used_frame: u64, handles: Vec<GpuResourceHandle>) -> GeometryEntry {
+    fn entry(last_used_frame: u64, handles: [GpuResourceHandle; 2]) -> GeometryEntry {
         GeometryEntry {
-            vertex: vk::Buffer::null(),
-            index: vk::Buffer::null(),
+            vertex: gpu_buffer(handles[0]),
+            index: gpu_buffer(handles[1]),
             index_count: 0,
             pipeline: GeometryPipeline::Ui,
             topology: Topology::TriangleList,
             index_type: vk::IndexType::UINT16,
             generation: 0,
             last_used_frame,
-            storage: handles,
         }
     }
 
@@ -317,9 +289,9 @@ mod tests {
         let mut registry = GeometryRegistry::new();
         registry.frame = 1_000;
         registry.entries = vec![
-            Some(entry(819, vec![handle(1), handle(2)])),
-            Some(entry(820, vec![handle(3)])),
-            Some(entry(900, vec![handle(4)])),
+            Some(entry(819, [handle(1), handle(2)])),
+            Some(entry(820, [handle(3), handle(4)])),
+            Some(entry(900, [handle(5), handle(6)])),
         ];
         let mut retired = Vec::new();
         registry.retain_recent(&mut retired);
@@ -376,9 +348,17 @@ mod tests {
         assert!(retired.is_empty(), "首次创建不产生 retired 句柄");
         assert_eq!(
             shared.live_resources(),
-            4,
-            "顶点 buffer + memory、索引 buffer + memory"
+            2,
+            "顶点缓冲 + 索引缓冲各一个子分配句柄（内存块由内存池持有，不进句柄表）"
         );
+        // R11-6：两次小分配共用同一块 `vkAllocateMemory`（而不是每资源一次）。
+        let (device_allocations, live_bytes, reserved_bytes) = shared.memory_stats();
+        assert_eq!(
+            device_allocations, 1,
+            "顶点与索引必须子分配在同一块设备内存里"
+        );
+        assert_eq!(live_bytes, 28, "24 B 顶点 + 6 B 索引（按 4 B 对齐）");
+        assert!(reserved_bytes >= live_bytes);
         assert_eq!(
             registry.entries[3].as_ref().expect("entry").last_used_frame,
             1
@@ -395,16 +375,21 @@ mod tests {
             2
         );
 
-        // 槽位换代：旧缓冲的句柄进 retired，新缓冲重新登记。
+        // 槽位换代：旧缓冲的句柄进 retired，新缓冲重新登记（仍复用同一块内存）。
         registry.begin_frame();
         registry
             .ensure(&shared, GeometryId::for_test(3, 2), &desc, &mut retired)
             .expect("rebuilt geometry");
-        assert_eq!(retired.len(), 4);
+        assert_eq!(retired.len(), 2, "顶点 + 索引两个句柄");
         assert_eq!(
             shared.live_resources(),
-            8,
+            4,
             "新旧两代缓冲同时驻留到旧句柄释放"
+        );
+        assert_eq!(
+            shared.memory_stats().0,
+            1,
+            "换代不得新增 vkAllocateMemory（这就是子分配器的意义）"
         );
 
         // teardown：当前条目 + retired 的旧句柄都要注销。

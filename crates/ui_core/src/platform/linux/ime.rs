@@ -6,29 +6,49 @@
 //! 1. 用光标替换已有组合串；2. 删除请求的周围文本；3. 在光标处插入提交串；
 //! 4. 计算要发送的 surrounding text；5. 在光标处插入新组合串；6. 定位组合串内光标；7. 动作。
 //!
-//! 本结构只负责 1/3/5/6 里**引擎已有通路**的部分（组合串与提交串）；`delete_surrounding_text`
-//! 依赖 `set_surrounding_text` 通路，而后者需要 `ImeEvent` 提供「删除周围文本」的变体
-//! （由输入波次维护 `crate::event::ImeEvent`），当前未接线 —— 收到时忽略（见 `surface.rs`）。
+//! 本结构负责 1/3/5/6 里**引擎已有通路**的部分（组合串、提交串、组合串内插入点与高亮区间）；
+//! `delete_surrounding_text` 依赖 `set_surrounding_text` 通路，而后者需要 `ImeEvent` 提供
+//! 「删除周围文本」的变体（由输入波次维护 `crate::event::ImeEvent`），当前未接线 —— 收到时
+//! 忽略（见 `surface.rs`）。
+//!
+//! **本平台不做提交去重**（AR1b P3-1）：协议按 `done` 双缓冲交付，一批只有一个
+//! `commit_string`；跨批的相同文本（`ll`、双空格）是用户的真实输入，必须放行。旧的
+//! `CommitDeduper` 在 Linux 上没有消费者（`begin_key` + `note` 恒为真），已删除。
 
 use smol_str::SmolStr;
 
-use crate::{event::ImeEvent, platform::ime::CommitDeduper};
+use crate::{
+    event::ImeEvent,
+    platform::ime::{ClauseRanges, preedit_carets},
+};
+
+/// 一批 `done` 里的组合串：文本 + 串内插入点 + 高亮子句（**双缓冲**，`done` 时原子生效）。
+///
+/// 协议规定 `text` / `cursor_begin` / `cursor_end` 都按 `done` 批次重置为初值，因此三者必须
+/// 一起缓存：只存文本会让光标停在上一批的位置（AR1b N4）。
+#[derive(Debug, Default)]
+struct PendingPreedit {
+    /// `preedit_string` 的 `text`（`None` = 协议发了 `null` 串）。
+    text: Option<String>,
+    /// 串内插入点（UTF-16 码元，已由字节偏移换算）。
+    caret: Option<u32>,
+    /// 高亮区间（`cursor_begin != cursor_end` 时的选区）。
+    clauses: ClauseRanges,
+}
 
 /// 一个窗口的 IME 状态（主线程独占；由 `WindowSurface` 持有，**每窗口一份**，R10-6）。
 #[derive(Debug, Default)]
 pub(crate) struct ImeState {
     /// `done` 之前的 preedit（`None` = 本批没有 preedit 事件）。
-    pending_preedit: Option<Option<String>>,
+    pending_preedit: Option<PendingPreedit>,
     /// `done` 之前的 commit。
     pending_commit: Option<String>,
-    /// 提交去重（同一批 `done` 内的重复回调才吞；跨批的相同文本是合法输入）。
-    dedupe: CommitDeduper,
     /// 当前是否处于组合态。
     composing: bool,
     /// 自上次补 `End` 以来**曾经**有过非空组合串（R10-35 的判据）。
     ///
     /// 不能只看 `composing`：`commit_string` 与 `preedit_string("")` 可能在**同一批**里到达，
-    /// 而提交分支会先把 `composing` 清掉；只有这个latch 才能保证「组合在本批结束」仍补一条
+    /// 而提交分支会先把 `composing` 清掉；只有这个 latch 才能保证「组合在本批结束」仍补一条
     /// [`ImeEvent::End`]，且**恰好一条**。
     had_preedit: bool,
 }
@@ -38,19 +58,35 @@ impl ImeState {
         Self::default()
     }
 
-    pub(crate) fn note_preedit(&mut self, text: Option<String>) {
+    /// 记录一条 `preedit_string`（**不立即生效**，等 `done`）。
+    ///
+    /// `cursor_begin` / `cursor_end` 是协议给的**字节偏移**（`-1` = 隐藏光标），在这里换成
+    /// 引擎的 UTF-16 码元单位并缓存；`done` 时与文本一起交付（AR1b N4：旧实现只取文本，
+    /// 协议已经给出的插入点被静默丢弃，Linux 的 preedit 光标恒在末尾）。
+    pub(crate) fn note_preedit(
+        &mut self,
+        text: Option<String>,
+        cursor_begin: i32,
+        cursor_end: i32,
+    ) {
         // 组合态在**收到** preedit 时即生效（不等 `done`）：键盘通路据此静默，
         // 而组合期按键可能先于 `done` 到达。
-        match text.as_deref() {
+        let (caret, clauses) = match text.as_deref() {
             Some(text) if !text.is_empty() => {
                 self.composing = true;
                 self.had_preedit = true;
+                preedit_carets(text, cursor_begin, cursor_end)
             }
-            _ => self.composing = false,
-        }
-        self.pending_preedit = Some(text);
-        // 新的组合串开始 ⇒ 下一次提交是新的内容。
-        self.dedupe.reset();
+            _ => {
+                self.composing = false;
+                (None, ClauseRanges::new())
+            }
+        };
+        self.pending_preedit = Some(PendingPreedit {
+            text,
+            caret,
+            clauses,
+        });
     }
 
     pub(crate) fn note_commit(&mut self, text: Option<String>) {
@@ -84,27 +120,27 @@ impl ImeState {
         let was_composing = self.composing || self.had_preedit;
         let committed = self.pending_commit.take();
         if let Some(commit) = committed.as_ref() {
-            // 一次 `done` = 一批提交；批内的重复才吞掉（部分 compositor 会重复发）。
-            self.dedupe.begin_key();
-            if self.dedupe.note(commit.as_str()) {
-                events.push(ImeEvent::Commit {
-                    text: SmolStr::new(commit.as_str()),
-                    replace: None,
-                });
-            }
+            events.push(ImeEvent::Commit {
+                text: SmolStr::new(commit.as_str()),
+                replace: None,
+            });
             self.composing = false;
         }
         match self.pending_preedit.take() {
-            Some(Some(text)) if !text.is_empty() => {
+            Some(PendingPreedit {
+                text: Some(text),
+                caret,
+                clauses,
+            }) if !text.is_empty() => {
                 self.composing = true;
                 self.had_preedit = true;
                 // `zwp_text_input_v3` 的 preedit 是整串替换，没有 AppKit 那种区间替换；
-                // 组合串内的插入点与子句信息由输入波次定义（`caret` / `clauses`），本平台
-                // 先按「插入点在末尾、无子句」交付。
+                // 串内插入点与高亮区间来自 `preedit_string` 的 `cursor_begin/end`（字节偏移，
+                // 已在该事件的 `note_preedit` 里换算成 UTF-16 码元）。
                 events.push(ImeEvent::Preedit {
                     text: SmolStr::new(text),
-                    caret: None,
-                    clauses: smallvec::SmallVec::new(),
+                    caret,
+                    clauses,
                     replace: None,
                 });
             }
@@ -140,16 +176,22 @@ mod tests {
         })
     }
 
+    fn preedit(events: &[ImeEvent]) -> Option<&ImeEvent> {
+        events
+            .iter()
+            .find(|event| matches!(event, ImeEvent::Preedit { .. }))
+    }
+
     /// 组合态里收到提交：本批产出 Commit，且组合态结束。
     #[test]
     fn a_commit_ends_the_composition() {
         let mut ime = ImeState::new();
-        ime.note_preedit(Some("ni".to_owned()));
+        ime.note_preedit(Some("ni".to_owned()), 2, 2);
         let events = ime.take_events();
         assert!(matches!(events.as_slice(), [ImeEvent::Preedit { .. }]));
         assert!(ime.composing());
 
-        ime.note_preedit(None);
+        ime.note_preedit(None, -1, -1);
         ime.note_commit(Some("你".to_owned()));
         let events = ime.take_events();
         assert_eq!(commit_text(&events), Some("你"));
@@ -164,7 +206,7 @@ mod tests {
     #[test]
     fn a_commit_only_batch_still_ends_the_composition() {
         let mut ime = ImeState::new();
-        ime.note_preedit(Some("ni".to_owned()));
+        ime.note_preedit(Some("ni".to_owned()), 2, 2);
         let _ = ime.take_events();
         assert!(ime.composing());
 
@@ -191,20 +233,20 @@ mod tests {
     #[test]
     fn an_empty_preedit_ends_the_composition_once() {
         let mut ime = ImeState::new();
-        ime.note_preedit(Some("ni".to_owned()));
+        ime.note_preedit(Some("ni".to_owned()), 0, 0);
         assert!(ime.composing());
-        ime.note_preedit(None);
+        ime.note_preedit(None, -1, -1);
         let events = ime.take_events();
         assert!(events.contains(&ImeEvent::End));
         assert!(!ime.composing());
-        ime.note_preedit(None);
+        ime.note_preedit(None, -1, -1);
         assert!(ime.take_events().is_empty(), "没有状态变化时不出事件");
     }
 
     #[test]
     fn reset_drops_the_pending_batch_and_the_composition() {
         let mut ime = ImeState::new();
-        ime.note_preedit(Some("ni".to_owned()));
+        ime.note_preedit(Some("ni".to_owned()), 2, 2);
         let _ = ime.take_events();
         ime.note_commit(Some("你".to_owned()));
         ime.reset();
@@ -212,17 +254,88 @@ mod tests {
         assert!(ime.take_events().is_empty(), "reset 之后旧批次不得再生效");
     }
 
-    /// 同一批里重复的 `commit_string`（部分 compositor 会发两次）只交付一次；跨批的相同
-    /// 文本是合法输入（例如连打两个 `l`）。
+    /// AR1b N4（P2 回归）：协议给的 `cursor_begin` / `cursor_end` 必须进
+    /// [`ImeEvent::Preedit`]（插入点 + 高亮区间），不得静默丢弃。
     #[test]
-    fn identical_commits_within_one_batch_are_deduped() {
+    fn the_protocol_cursor_positions_reach_the_preedit_event() {
         let mut ime = ImeState::new();
-        ime.note_commit(Some("ll".to_owned()));
-        let first = ime.take_events();
-        assert_eq!(commit_text(&first), Some("ll"));
-        ime.dedupe.begin_key();
-        ime.note_commit(Some("ll".to_owned()));
-        let second = ime.take_events();
-        assert_eq!(commit_text(&second), Some("ll"), "跨批的相同文本必须交付");
+        // "nihao" 的插入点在 3 号字节（UTF-16 码元 3）；没有选区。
+        ime.note_preedit(Some("nihao".to_owned()), 3, 3);
+        let events = ime.take_events();
+        let Some(ImeEvent::Preedit {
+            caret,
+            clauses,
+            text,
+            ..
+        }) = preedit(&events)
+        else {
+            panic!("必须交付 preedit: {events:?}");
+        };
+        assert_eq!(text.as_str(), "nihao");
+        assert_eq!(*caret, Some(3), "插入点来自 cursor_begin");
+        assert!(clauses.is_empty(), "两者相等 ⇒ 没有高亮区间");
+
+        // 选区：cursor_begin=1、cursor_end=4 ⇒ 高亮 [1,4)。
+        ime.note_preedit(Some("nihao".to_owned()), 1, 4);
+        let events = ime.take_events();
+        let Some(ImeEvent::Preedit { caret, clauses, .. }) = preedit(&events) else {
+            panic!("必须交付 preedit: {events:?}");
+        };
+        assert_eq!(*caret, Some(1));
+        assert_eq!(
+            clauses.iter().cloned().collect::<Vec<_>>(),
+            vec![1..4],
+            "cursor_begin != cursor_end ⇒ 高亮区间"
+        );
+    }
+
+    /// AR1b N4 的 Unicode 分支：中文 / emoji 的字节偏移必须先换算成 UTF-16 码元。
+    #[test]
+    fn the_protocol_cursor_is_converted_from_bytes_to_utf16_units() {
+        let mut ime = ImeState::new();
+        // "你好" = 6 字节 / 2 码元：字节 3 是第二个汉字之前 ⇒ 码元 1。
+        ime.note_preedit(Some("你好".to_owned()), 3, 3);
+        let events = ime.take_events();
+        let Some(ImeEvent::Preedit { caret, .. }) = preedit(&events) else {
+            panic!("必须交付 preedit: {events:?}");
+        };
+        assert_eq!(*caret, Some(1));
+
+        // "🌍a" = 5 字节 / 3 码元：字节 4 ⇒ 码元 2。
+        ime.note_preedit(Some("🌍a".to_owned()), 4, 5);
+        let events = ime.take_events();
+        let Some(ImeEvent::Preedit { caret, clauses, .. }) = preedit(&events) else {
+            panic!("必须交付 preedit: {events:?}");
+        };
+        assert_eq!(*caret, Some(2));
+        assert_eq!(clauses.iter().cloned().collect::<Vec<_>>(), vec![2..3]);
+    }
+
+    /// 协议「两者都是 -1」= 隐藏光标：引擎没有该状态，`caret = None`（在 `ImeEvent` 文档写明）。
+    #[test]
+    fn a_hidden_protocol_cursor_yields_a_none_caret() {
+        let mut ime = ImeState::new();
+        ime.note_preedit(Some("ni".to_owned()), -1, -1);
+        let events = ime.take_events();
+        let Some(ImeEvent::Preedit { caret, clauses, .. }) = preedit(&events) else {
+            panic!("必须交付 preedit: {events:?}");
+        };
+        assert_eq!(*caret, None);
+        assert!(clauses.is_empty());
+    }
+
+    /// 跨批的相同文本必须都交付（AR1b P3-1：本平台不做提交去重）。
+    #[test]
+    fn identical_commits_across_batches_are_all_delivered() {
+        let mut ime = ImeState::new();
+        for _ in 0..2 {
+            ime.note_commit(Some("ll".to_owned()));
+            let events = ime.take_events();
+            assert_eq!(
+                commit_text(&events),
+                Some("ll"),
+                "跨批的相同文本是用户的真实输入"
+            );
+        }
     }
 }

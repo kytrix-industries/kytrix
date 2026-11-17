@@ -12,7 +12,10 @@
 
 pub(crate) mod atlas;
 pub(crate) mod compositor;
+pub(crate) mod debug;
 pub(crate) mod device;
+pub(crate) mod diagnostics;
+pub(crate) mod hresult;
 pub(crate) mod pipeline;
 pub(crate) mod queue;
 #[cfg(any(test, feature = "test-support"))]

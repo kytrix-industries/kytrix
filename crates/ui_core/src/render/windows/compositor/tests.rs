@@ -1,11 +1,9 @@
 //! `GpuRenderer` 的单元测试（拆分自 `compositor.rs`，测试代码未改动）。
 
-use windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-
 use super::{
-    GpuRenderer, Persist,
-    persist::{grown_buffer, rtv_handle, shrink_target},
-    plan::{copy_content, copy_extent, copy_plan},
+    GpuRenderer,
+    persist::rtv_handle,
+    plan::TargetState,
     record::{geometry_root, root_uniform},
 };
 use crate::{
@@ -254,25 +252,6 @@ fn instance_segments_use_the_uniform_base_not_the_hardware_base() {
     assert!(
         !source.contains(&format!("{call}start)")),
         "回退到硬件基址会让第二段之后的实例全部错位"
-    );
-}
-
-/// D3D12 的 copy 范围：`fresh` 时全量，`presented()` 之后恢复局部（等价覆盖原共享层单测）。
-#[test]
-fn a_fresh_swapchain_forces_a_full_copy_until_presented() {
-    let rect = PhysicalRect::new(0, 0, 10, 10);
-    let partial = partial_plan(&[rect], (100, 50)).plan();
-    assert!(matches!(partial, Plan::Partial(_)));
-    let mut frame = FramePlan::new(partial, true);
-    assert_eq!(copy_plan(frame), Plan::Full, "fresh ⇒ 全量 copy");
-    frame.presented();
-    assert_eq!(copy_plan(frame), partial, "present 成功后恢复局部 copy");
-    assert_eq!(copy_plan(FramePlan::new(Plan::Full, false)), Plan::Full);
-    assert_eq!(copy_plan(FramePlan::new(Plan::Idle, false)), Plan::Idle);
-    assert_eq!(
-        copy_plan(FramePlan::new(Plan::Idle, true)),
-        Plan::Full,
-        "fresh 的空帧仍然要全量 copy"
     );
 }
 
@@ -585,6 +564,7 @@ fn ops_outside_the_damage_are_skipped() {
     assert_eq!(stats.draw_calls, 3, "两个实例 op + 一个几何 op");
 
     // 只 damage 左半边 ⇒ 右边那个实例 op 与 damage 不相交，必须跳过。
+    let before = crate::render::windows::diagnostics::snapshot();
     let mut second = partial_plan(&[PhysicalRect::new(0, 0, 32, 64)], (64, 64));
     let stats = renderer
         .submit_buffer(FrameIndex::from_raw(2), buffer, &mut second, &mut timings)
@@ -592,6 +572,80 @@ fn ops_outside_the_damage_are_skipped() {
     assert_eq!(
         stats.draw_calls, 2,
         "只有与 damage 相交的 op 才产生 draw call（旧的『整份重放』实现会是 3）"
+    );
+    // R08-13：局部帧实际遍历的 op 数必须少于「整份重放」的预算（3 op × 1 矩形）。
+    let after = crate::render::windows::diagnostics::snapshot();
+    assert_eq!(
+        after.op_visits - before.op_visits,
+        2,
+        "只访问命中的 2 个 op"
+    );
+    assert_eq!(
+        after.op_replay_budget - before.op_replay_budget,
+        3,
+        "整份重放的预算 = 3 op × 1 个 damage 矩形"
+    );
+}
+
+/// R08-5：dev 构建开着调试层，渲染一帧之后 InfoQueue 里不得出现 CORRUPTION 级消息
+/// （资源状态 / 描述符越界 / 命令列表误用都会在这一级报出来）。
+///
+/// ERROR 级不在这里断死：WARP / 驱动会在无关路径上打自己的错误（例如功能探测），把它们当
+/// CI 失败源会让门禁随机红。计数仍进 `Diagnostics::debug_errors` 供现场判读。
+#[test]
+fn a_rendered_frame_produces_no_corruption_messages() {
+    use crate::render::windows::debug;
+
+    let _guard = lock();
+    let Some(mut renderer) = warp_renderer((64, 64)) else {
+        return;
+    };
+    // 让这一帧真的走完整条路径：图集上传 + 全量帧 + 局部帧 + 读回。
+    let page = super::TEST_ATLAS_PAGE;
+    let mut pixels = vec![0u8; (page * page) as usize];
+    for y in 1..11u32 {
+        for x in 1..11u32 {
+            pixels[(y * page + x) as usize] = 255;
+        }
+    }
+    let mut rows = crate::render::DirtyRows::default();
+    rows.mark(0, u32::MAX);
+    renderer.queue_atlas_upload(AtlasKind::Glyph, page, pixels, rows);
+
+    let scene = one_lane_scene(quad(
+        Rect::new(0.0, 0.0, 32.0, 32.0),
+        Color::srgb(1.0, 0.0, 0.0, 1.0),
+    ));
+    let mut encoder = InstanceEncoder::new();
+    let buffer = encoder
+        .encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        )
+        .expect("encode");
+    let mut timings = FrameTimings::new();
+    let mut full = full_plan((64, 64));
+    renderer
+        .submit_buffer(FrameIndex::from_raw(1), buffer, &mut full, &mut timings)
+        .expect("full frame");
+    let mut partial = partial_plan(&[PhysicalRect::new(0, 0, 16, 16)], (64, 64));
+    renderer
+        .submit_buffer(FrameIndex::from_raw(2), buffer, &mut partial, &mut timings)
+        .expect("partial frame");
+    let _ = renderer.readback().expect("readback");
+
+    // 先排空历史（其它测试的 WARP 消息），再看这一帧之后有没有 CORRUPTION。
+    let _ = debug::drain_messages(renderer.shared.raw());
+    let mut after = full_plan((64, 64));
+    renderer
+        .submit_buffer(FrameIndex::from_raw(3), buffer, &mut after, &mut timings)
+        .expect("verify frame");
+    let counts = debug::drain_messages(renderer.shared.raw());
+    assert_eq!(
+        counts.corruption, 0,
+        "调试层报告了 CORRUPTION 级消息（资源状态 / 描述符 / 命令列表误用）"
     );
 }
 
@@ -931,30 +985,12 @@ fn render_snapshot_returns_the_surface_pixels() {
 }
 
 /// 全量帧的 copy 范围：`fresh`（交换链刚建好）整块 buffer，之后只拷内容子矩形。
+/// 离屏目标没有合成树：持久目标恒等于 surface（没有 buffer 桶、也没有交换链）。
+///
+/// 桶（`buffer > content`）只服务**窗口路径**的「拖动中不重建交换链」；帧缓冲直读的离屏
+/// 目标按内容精确分配，读回范围的唯一来源因此仍是 `surface`。
 #[test]
-fn a_full_frame_copies_the_content_unless_the_swapchain_is_fresh() {
-    let buffer = (1000, 700);
-    let content = (800, 600);
-    assert_eq!(
-        copy_extent(FramePlan::new(Plan::Full, true), buffer, content),
-        buffer,
-        "第一次 present 之前 back buffer 的内容未定义"
-    );
-    assert_eq!(
-        copy_extent(FramePlan::new(Plan::Full, false), buffer, content),
-        content,
-        "之后的全量帧只写可见的内容子矩形"
-    );
-    let fresh_partial = FramePlan::new(
-        partial_plan(&[PhysicalRect::new(0, 0, 8, 8)], content).plan(),
-        true,
-    );
-    assert_eq!(copy_extent(fresh_partial, buffer, content), buffer);
-}
-
-/// 内容子矩形：绘制与读回都只按内容尺寸，高水位 buffer 不参与（`design/DEVIATIONS.md` §36 F-199）。
-#[test]
-fn the_content_size_is_independent_of_the_buffer() {
+fn an_offscreen_target_keeps_persist_equal_to_the_surface() {
     let _guard = lock();
     let Some(mut renderer) = warp_renderer((64, 64)) else {
         return;
@@ -962,11 +998,11 @@ fn the_content_size_is_independent_of_the_buffer() {
     assert_eq!(renderer.buffer(), (64, 64));
     renderer
         .set_content_size((32, 24))
-        .expect("shrink the content");
+        .expect("resize the content");
     assert_eq!(renderer.surface(), (32, 24));
-    assert_eq!(renderer.buffer(), (64, 64), "buffer 不随内容变化");
+    assert_eq!(renderer.buffer(), (32, 24), "离屏目标没有 buffer 桶");
 
-    // 铺满整个 buffer 的红块：内容子矩形之外的像素必须不参与本帧。
+    // 铺满整个（新）内容的红块：取样点在内容内部，避开解析 AA 的边缘像素。
     let scene = one_lane_scene(quad(
         Rect::new(0.0, 0.0, 64.0, 64.0),
         Color::srgb(1.0, 0.0, 0.0, 1.0),
@@ -987,30 +1023,11 @@ fn the_content_size_is_independent_of_the_buffer() {
         .expect("content frame");
     let image = renderer.readback().expect("readback");
     assert_eq!((image.width, image.height), (32, 24), "读回范围 = 内容尺寸");
-    assert_eq!(pixel(&image, 32, 31, 23), [255, 0, 0, 255]);
+    assert_eq!(pixel(&image, 32, 20, 16), [255, 0, 0, 255]);
 }
 
-/// 内容越过 grow-only 桶、但渲染器没有合成目标（离屏）：显式 `Composition` 错误，不静默
-/// 裁剪。真实窗口路径的 grow 需要 DComp + HWND，由 release demo 的运行时冒烟覆盖。
-#[test]
-fn growing_beyond_the_buffer_without_a_composition_target_is_an_error() {
-    let _guard = lock();
-    let Some(mut renderer) = warp_renderer((32, 32)) else {
-        return;
-    };
-    match renderer.set_content_size((33, 32)) {
-        Err(EngineError::Composition { detail }) => {
-            assert!(detail.contains("composition target"), "{detail}");
-        }
-        other => panic!("unexpected result: {other:?}"),
-    }
-    assert!(
-        renderer.set_content_size((32, 32)).is_ok(),
-        "同值必须是 no-op"
-    );
-}
-
-/// 内容超过 16384 硬上限：`buffer_size` 的 `Swapchain` 错误必须先于任何 GPU 工作。
+/// 内容超过 16384 硬上限：`buffer_size` 的 `Swapchain` 错误必须先于任何 GPU 工作
+/// （离屏目标也走同一条校验，错误面因此与窗口路径一致）。
 #[test]
 fn content_beyond_the_maximum_buffer_is_an_error() {
     let _guard = lock();
@@ -1025,131 +1042,63 @@ fn content_beyond_the_maximum_buffer_is_an_error() {
     }
 }
 
-/// P1-A：corner drag（一轴变大、另一轴变小）时，另一轴必须保留旧 buffer 的高水位。
+/// R08-1 的尺寸序列：桶只在「内容 + 余量」跨过 256 对齐边界时变化 —— 这正是「拖动不再每
+/// 越一像素就重建交换链」的依据（`ResizeBuffers` 次数 = 桶变化次数）。
 ///
-/// 视觉切换那一帧的旧 clip 仍可能指向旧内容，旧内容 ≤ 旧 buffer；只有新 buffer 逐轴 ≥
-/// 旧 buffer，中间帧才不可能采样到未定义像素。
+/// WARP 上无法创建组合交换链（需要 DComp），因此这里验证的是**决策的纯函数部分**：
+/// `buffer_size` 的序列 + 同一个桶内 `set_content_size` 只做 CPU 记账。真机上的
+/// `ResizeBuffers` 调用次数与结果由 release demo 的运行时冒烟覆盖（见报告「真机验证需求」）。
 #[test]
-fn growth_keeps_the_other_axis_at_the_high_water_mark() {
-    // buffer 2560×1792，新内容 2800×600：宽度增长，高度不得按内容缩回 768。
-    let grown = grown_buffer((2560, 1792), (2800, 600)).expect("grows");
-    assert_eq!(grown, (3072, 1792));
-    assert!(
-        grown.1 >= 1792,
-        "高度必须保留旧 buffer（旧 clip 仍可能指向旧内容）: {grown:?}"
-    );
-    // 另一方向同理。
+fn the_resize_bucket_sequence_only_changes_at_alignment_boundaries() {
+    use crate::platform::windows::composition::buffer_size;
+
+    // 一次 1000 → 1400 px 的连续拖动：只有跨过 1280（1024+64 → 对齐 1280）与 1536 时换桶。
+    let sequence = [1000u32, 1100, 1200, 1280, 1281, 1400];
+    let buckets: Vec<(u32, u32)> = sequence
+        .iter()
+        .map(|width| buffer_size((*width, 700)).expect("inside the limit"))
+        .collect();
+    let mut changes = 0;
+    for pair in buckets.windows(2) {
+        if pair[0] != pair[1] {
+            changes += 1;
+        }
+    }
+    assert!(changes <= 3, "拖动 400 px 至多换 3 次桶：{buckets:?}");
     assert_eq!(
-        grown_buffer((2560, 1792), (1200, 2400)).expect("grows"),
-        (2560, 2560)
+        buffer_size((1000, 700)).expect("fits"),
+        (1280, 768),
+        "1000 + 64 对齐到 1280"
     );
-    // 当前 buffer 比按内容算出的桶大：新桶不得缩小。
-    let covered = grown_buffer((3328, 2048), (2000, 600)).expect("fits");
-    assert!(covered.0 >= 3328 && covered.1 >= 2048, "{covered:?}");
-    // 就算内容完全落在当前 buffer 内，纯函数也不会把桶算小（防御性）。
+    assert_eq!(buffer_size((1281, 700)).expect("fits"), (1536, 768));
+    // 桶内的小幅变化不换桶（经典 1 px 抖动）。
     assert_eq!(
-        grown_buffer((2560, 1792), (2000, 600)).expect("fits"),
-        (2560, 1792)
+        buffer_size((1200, 640)).expect("fits"),
+        buffer_size((1210, 648)).expect("fits")
     );
-    // 上限检查在 max 之后仍然生效。
-    assert!(matches!(
-        grown_buffer((1536, 1280), (16_385, 100)),
-        Err(EngineError::Swapchain { .. })
-    ));
+    // 0 尺寸（最小化）永远给 256×256 或更大，绝不请求 0 尺寸的 buffer。
+    assert!(buffer_size((0, 0)).expect("fits").0 >= 256);
 }
 
-/// RTV 堆固定两个描述符：0 = 内容，1 = 1×1 背景（按 `GetDescriptorHandleIncrementSize`
-/// 偏移）。背景层 prime 只写第二个，主持久目标一个像素都不碰。
+/// RTV 堆里只有一个描述符（持久目标）。back buffer 的 RTV 由**交换链自己**持有
+/// （每条链 3 个）：内容层与 1×1 背景层各有一条链，互相不挤共享堆。
 #[test]
-fn the_rtv_heap_has_a_second_descriptor_for_the_background_layer() {
+fn the_rtv_heap_holds_only_the_persist_descriptor() {
     let _guard = lock();
     let Some(renderer) = warp_renderer((8, 8)) else {
         return;
     };
-    let main = rtv_handle(renderer.shared.raw(), &renderer.rtv_heap, 0);
-    let background = rtv_handle(renderer.shared.raw(), &renderer.rtv_heap, 1);
-    // SAFETY: 设备 / 堆句柄由渲染器持有，调用期间有效；查询无副作用。
-    let size = unsafe {
-        renderer
-            .shared
-            .raw()
-            .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)
-    };
-    assert_eq!(
-        background.ptr,
-        main.ptr + size as usize,
-        "背景 RTV 必须是堆里的第二个描述符"
-    );
-    assert!(background.ptr > main.ptr);
+    let persist = rtv_handle(renderer.shared.raw(), &renderer.rtv_heap, 0);
+    assert_ne!(persist.ptr, 0, "持久目标必须有 RTV");
+    // SAFETY: 堆句柄由渲染器持有；查询无副作用。
+    let desc = unsafe { renderer.rtv_heap.GetDesc() };
+    assert_eq!(desc.NumDescriptors, 1);
 }
 
-/// 缩容决策：只在内容桶**严格小于**当前高水位、且渲染器有合成目标时返回新桶。
-#[test]
-fn the_shrink_decision_only_returns_a_smaller_bucket() {
-    // 1200×925 内容 ⇒ 1280×1024；历史高水位 2560×1792（1900×1300 时开出来的桶）。
-    assert_eq!(
-        shrink_target((2560, 1792), (1200, 925), true).expect("fits"),
-        Some((1280, 1024)),
-        "静止缩小时回到当前内容的桶"
-    );
-    // 单轴缩小也算：宽度 2000+64 的桶是 2304，高度从 1792 缩到 768。
-    assert_eq!(
-        shrink_target((2560, 1792), (2000, 600), true).expect("fits"),
-        Some((2304, 768))
-    );
-    // 内容桶 == 当前 buffer：已经是最小桶，不缩（否则会每 2 s 重建一次）。
-    assert_eq!(
-        shrink_target((2304, 1280), (2000, 1200), true).expect("fits"),
-        None
-    );
-    // 没有合成目标（离屏 / 快照）：永不缩容（离屏由 `resize` 直接重建）。
-    assert_eq!(
-        shrink_target((2560, 1792), (1200, 925), false).expect("fits"),
-        None
-    );
-    // 防御：内容比 buffer 还大（grow-only 不变量被破坏）时不得「缩」成更大的桶。
-    assert_eq!(
-        shrink_target((512, 512), (2000, 900), true).expect("fits"),
-        None
-    );
-    // 上限检查仍然生效（内容 > 16384 是显式错误，不静默裁剪）。
-    assert!(matches!(
-        shrink_target((16384, 16384), (16_385, 100), true),
-        Err(EngineError::Swapchain { .. })
-    ));
-}
-
-/// 离屏目标没有合成树：`maybe_shrink` 是 no-op，高水位保持不变。
-#[test]
-fn an_offscreen_renderer_never_shrinks_the_high_water_bucket() {
-    let _guard = lock();
-    // 1024² 的 buffer 与 32² 的内容桶（768²）才有「可缩」的候选。
-    let Some(mut renderer) = warp_renderer((1024, 1024)) else {
-        return;
-    };
-    renderer
-        .set_content_size((32, 32))
-        .expect("content stays inside the buffer");
-    assert_eq!(renderer.buffer(), (1024, 1024));
-    assert!(
-        renderer.shrink_in().is_none(),
-        "离屏目标没有缩容候选，空闲等待必须保持无限等"
-    );
-    renderer
-        .maybe_shrink()
-        .expect("an offscreen renderer has no composition target to switch");
-    assert_eq!(
-        renderer.buffer(),
-        (1024, 1024),
-        "没有合成目标时不得重建持久目标"
-    );
-}
-
-/// 背景层刷新只碰它自己的 1×1 持久目标：主持久目标里的内容一个像素都不能变。
+/// 背景层刷新只碰它自己的 1×1 交换链：主持久目标里的内容一个像素都不能变。
 ///
-/// 旧实现借主 persist prime 1×1 背景层，每次改色都会把整块内容目标清成背景色；离屏目标
-/// 没有背景持久目标（`background_persist = None`），这条断言同时守住那个不变量与「标记必须
-/// 被消费、不能永真」的既有语义。
+/// 离屏目标没有背景层（`background_swapchain = None`），`refresh_background` 必须消费那个
+/// 「背景色已改」标记（不能永真），否则每帧都会尝试重建。
 #[test]
 fn a_background_refresh_never_touches_the_main_content_persist() {
     let _guard = lock();
@@ -1182,8 +1131,8 @@ fn a_background_refresh_never_touches_the_main_content_persist() {
         .expect("an offscreen renderer has no background layer to rebuild");
     assert!(!renderer.background_dirty, "标记必须被消费");
     assert!(
-        renderer.background_persist.is_none(),
-        "离屏目标不创建 1×1 背景持久目标"
+        renderer.background_swapchain.is_none(),
+        "离屏目标不创建 1×1 背景交换链"
     );
 
     let image = renderer.readback().expect("readback");
@@ -1194,63 +1143,55 @@ fn a_background_refresh_never_touches_the_main_content_persist() {
     );
 }
 
-/// 缩容 prime 的内容保留：新目标先 clear，再把旧目标的 `(0, 0, content)` 拷到左上角；
-/// 内容之外保持背景色。WARP 离屏没有合成目标，所以这里直接测录制片段（真实 DComp 窗口
-/// 的整条 `maybe_shrink` 由 release demo 的运行时冒烟覆盖）。
+/// R08-8 / R08-11：离屏目标的绘制模式与状态机一致 —— 首帧整帧画进 persist，之后局部帧才走
+/// `Incremental`；一次整帧重画把状态推回 `PersistValid`。
 #[test]
-fn a_shrink_prime_copies_the_old_content_into_the_new_persist() {
+fn the_offscreen_target_alternates_between_full_and_incremental_frames() {
+    use super::plan::{FrameDraw, frame_draw};
+
     let _guard = lock();
-    let Some(mut renderer) = warp_renderer((64, 64)) else {
+    let Some(mut renderer) = warp_renderer((16, 16)) else {
         return;
     };
-    // 旧内容：整块红。
-    let red = one_lane_scene(quad(
-        Rect::new(0.0, 0.0, 64.0, 64.0),
-        Color::srgb(1.0, 0.0, 0.0, 1.0),
-    ));
+    assert_eq!(renderer.target_state(), TargetState::Fresh);
+    assert_eq!(
+        frame_draw(renderer.target_state(), Plan::Full, false),
+        FrameDraw::Full,
+        "没有 back buffer 时全量帧只能画进 persist"
+    );
+
+    let scene = Scene::empty();
     let mut encoder = InstanceEncoder::new();
     let buffer = encoder
         .encode(
-            &red,
+            &scene,
             Scale::ONE,
             &resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
         .expect("encode");
-    let mut frame = full_plan((64, 64));
     let mut timings = FrameTimings::new();
+    let mut first = full_plan((16, 16));
     renderer
-        .submit_buffer(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
-        .expect("old content");
-    // 新目标 128×128：离屏路径不建背景层，第二个 RTV 描述符在这里空闲可用。
-    let rtv = rtv_handle(renderer.shared.raw(), &renderer.rtv_heap, 1);
-    let destination = Persist::new(&renderer.shared, (128, 128), rtv).expect("new persist");
-    let source = std::mem::replace(&mut renderer.persist, destination);
-    {
-        let destination = &renderer.persist;
-        let source = &source;
-        renderer
-            .stream
-            .submit_immediate(|list| {
-                // 缩容 prime 的固定顺序：先整块 clear，再从旧目标拷内容。
-                // SAFETY: 两个目标都处于 RENDER_TARGET；清整块不需要矩形。
-                unsafe { list.ClearRenderTargetView(destination.rtv, &[1.0, 1.0, 1.0, 1.0], None) };
-                copy_content(list, source, destination, (64, 64));
-                Ok(())
-            })
-            .expect("record the shrink copy");
-    }
-    renderer.surface = (128, 128);
-    let image = renderer.readback().expect("readback");
-    assert_eq!((image.width, image.height), (128, 128));
+        .submit_buffer(FrameIndex::from_raw(1), buffer, &mut first, &mut timings)
+        .expect("full frame");
     assert_eq!(
-        pixel(&image, 128, 8, 8),
-        [255, 0, 0, 255],
-        "旧内容原样保留在新目标的左上角"
+        renderer.target_state(),
+        TargetState::PersistValid,
+        "整帧画进 persist 之后它可以继续服务局部帧"
     );
     assert_eq!(
-        pixel(&image, 128, 100, 100),
-        [255, 255, 255, 255],
-        "内容之外是 clear 出来的背景色"
+        frame_draw(
+            renderer.target_state(),
+            partial_plan(&[PhysicalRect::new(0, 0, 8, 8)], (16, 16)).plan(),
+            false
+        ),
+        FrameDraw::Incremental
     );
+
+    let mut second = partial_plan(&[PhysicalRect::new(0, 0, 8, 8)], (16, 16));
+    renderer
+        .submit_buffer(FrameIndex::from_raw(2), buffer, &mut second, &mut timings)
+        .expect("partial frame");
+    assert_eq!(renderer.target_state(), TargetState::PersistValid);
 }

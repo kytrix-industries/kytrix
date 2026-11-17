@@ -10,30 +10,35 @@
 //!    `is_full()`（clear）仍是共用语义。
 //! 2. 没有 barrier / 资源状态机：Metal 自动跟踪 hazard。
 //!
-//! **persist ↔ drawable 的同步契约**（P2-6）：`CAMetalLayer` 的 drawable 从内部纹理池轮换
-//! （QuartzCore 头文件：池里的纹理要被复用，前提是上一个 `CAMetalDrawable` 已经释放），所以
-//! 「这一帧拿到的是哪一张、它停在几帧前」只能按**纹理身份**追踪。每张 drawable 记下自己错过的
-//! damage，present 前把它与 persist 的差异一次补齐；**任何无法证明同步的状态**（新纹理、
-//! 全量帧、累计面积达到整面）都整面拷一次（见 [`DrawableSyncs`]）。
+//! **persist ↔ drawable 的同步契约**（P2-6 / R09-12）：`CAMetalLayer` 的 drawable 从内部纹理池
+//! 轮换（QuartzCore 头文件：池里的纹理要被复用，前提是上一个 `CAMetalDrawable` 已经释放），所以
+//! 「这一帧拿到的是哪一张、它停在几帧前」只能按**drawable 身份**（`MTLDrawable.drawableID`）追踪 ——
+//! 不持纹理强引用，因此不会额外常驻 3 张全尺寸 drawable，也不会阻止 CA 回收它们。
+//!
+//! 每张 drawable 记下「已绘制区域是否覆盖整面」与它错过的 damage，present 前把与 persist 的差异
+//! 一次补齐；**任何无法证明同步的状态**（新 drawable、错过全量帧、尺寸不符、累计面积达到整面）
+//! 都退化为整帧拷贝（见 [`DrawableSyncs`] / [`DrawableSyncState`]）。
 //!
 //! 由此付的代价与前提：
 //! - 局部帧拷的是「这张 drawable 错过的最近几帧 damage 的并集」，最坏约为**单帧 damage 的 3 倍**
-//!   （池深 3），而不是整面；累计面积达到整面时退化为一次整面拷，因此**带宽上界不超过改动前**。
-//! - 同一纹理对象在两次 present 之间保留上次写入的内容（池化复用的直接结果，不是 Apple 的显式
-//!   承诺）。局部同步只在**同一纹理身份**上做：对象换代（resize / 图层换池）后一律整面拷。
+//!   （池深 3），而不是整面；累计面积达到整面时退化为一次整面拷，因此**带宽上界不超过整帧拷**。
+//! - **唯一**依赖的未文档化行为：同一张 drawable 纹理在两次 present 之间保留上次写入的内容
+//!   （池化复用的直接结果，Apple 没有显式承诺）。这条依赖只在"已绘制区域覆盖整面"之后才被使用，
+//!   并且换代（resize / 图层换池 / 表项淘汰）后一律整帧拷。
 //!
 //! 线程纪律：窗口路径的所有成员只属于 `kytrix-metal` 线程；persist 重建**不等待在飞帧**，
 //! 旧纹理按帧序号进 retire 队列（§4.3 / I4）。图层属性一个都不在这里写（§5.3）。
 
-use std::{ffi::c_void, ptr::NonNull, time::Instant};
+use std::{ffi::c_void, ptr::NonNull, sync::Arc, time::Instant};
 
 use objc2::{rc::Retained, runtime::ProtocolObject};
+use objc2_core_foundation::CFTimeInterval;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus,
-    MTLCommandEncoder, MTLDevice, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
-    MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLResourceOptions,
-    MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
-    MTLViewport,
+    MTLCommandEncoder, MTLDevice, MTLDrawable, MTLIndexType, MTLLoadAction, MTLOrigin,
+    MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
+    MTLResourceOptions, MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture, MTLTextureDescriptor,
+    MTLTextureUsage, MTLViewport,
 };
 use objc2_quartz_core::CAMetalDrawable;
 
@@ -53,10 +58,11 @@ use crate::{
         frame::{FramePayload, MAX_FRAMES_IN_FLIGHT},
         macos::{
             atlas::AtlasTextures,
+            core::{GpuCore, PersistLease},
             device::{Device, GpuObject, init_error, on_gpu_thread},
             geometry::GeometryRegistry,
-            pipeline::Pipeline,
-            queue::Queue,
+            pipeline::{BlendMode, PipelineSet},
+            queue::{InFlight, Queue},
             swapchain::MAXIMUM_DRAWABLE_COUNT,
         },
         retire::GpuResourceHandle,
@@ -69,8 +75,15 @@ use crate::{
 /// `RootUniform` 的字节数（P07 §2.7：112 B）。
 const ROOT_UNIFORM_BYTES: usize = 112;
 
+/// persist / drawable / PSO 的颜色附件格式（P07 契约的唯一编码点）。
+const TARGET_FORMAT: MTLPixelFormat = MTLPixelFormat::BGRA8Unorm_sRGB;
+
 /// 一个 GPU 渲染器（窗口路径由 `kytrix-metal` 线程独占；离屏路径同步调用）。
 pub(crate) struct GpuRenderer {
+    /// 进程级 GPU 对象（device / metallib / PSO 缓存 / 采样器）：只有窗口级对象留在这里。
+    core: Arc<GpuCore>,
+    /// persist 的进程级显存额度（R09-13 的多窗口上限；drop 时归还）。
+    persist_lease: PersistLease,
     device: Device,
     queue: Queue,
     /// 已取到、尚未交给 `begin` 的上传槽（P1-2.12）。
@@ -78,10 +91,14 @@ pub(crate) struct GpuRenderer {
     /// permit 必须与**具体槽**绑定：`try_acquire` 取的是某一槽的许可，`begin` 必须用
     /// 同一个槽，否则上传会写进别的在飞帧正在读的缓冲。
     pending_slot: Option<crate::render::frame::FrameSlot>,
-    pipeline: Pipeline,
+    /// 四条 PSO（懒解析：进程内首次需要时由 `GpuCore` 编译一次，之后是缓存命中）。
+    ///
+    /// 懒在这里而不是构造时：窗口路径的构造在主线程，PSO 首次编译（数十毫秒）必须落在
+    /// `kytrix-metal` 线程的首帧录制上（R09-5）。
+    pipeline: Option<PipelineSet>,
     atlas: AtlasTextures,
     persist: Persist,
-    /// persist → drawable 的同步状态（按 drawable 纹理身份；离屏路径没有 drawable，保持空表）。
+    /// persist → drawable 的同步状态（按 drawable 身份；离屏路径没有 drawable，保持空表）。
     drawable_syncs: DrawableSyncs,
     upload: UploadArena,
     /// 全量帧的 clear color（**linear**：`BGRA8Unorm_sRGB` 的 clear 由硬件做 sRGB 编码）。
@@ -114,39 +131,56 @@ unsafe impl Send for GpuRenderer {}
 impl GpuRenderer {
     /// 产品路径（离屏 / 快照）：系统默认设备；图集页懒分配（DEVIATIONS F-208）。
     pub(crate) fn new_offscreen(size: (u32, u32)) -> Result<Self, EngineError> {
-        Self::with_device(Device::new()?, size, false, [0.0; 4])
+        let core = Arc::clone(GpuCore::shared()?);
+        // 离屏路径没有 UI 线程读者：在飞计数只被同步提交自己用（记一次、等完扣一次）。
+        Self::with_device(
+            Device::new()?,
+            core,
+            Arc::new(InFlight::new()),
+            size,
+            false,
+            [0.0; 4],
+        )
     }
 
-    /// 真实窗口：设备由主线程建好（图层已绑定它），这里只接管 GPU 侧对象。
+    /// 真实窗口：设备与 PSO 来自进程单例（R09-5），这里只接管**本窗口**的 GPU 侧对象
+    /// （persist / 上传槽 / 图集页）。
     ///
     /// `background_linear` 是 persist clear color（linear）：重建 persist 后新 drawable 内部的
     /// 条带由它填（旧 drawable 之外的条带由 layer 的 `backgroundColor` 填）。
     pub(crate) fn new_window(
         device: Device,
+        core: Arc<GpuCore>,
+        in_flight: Arc<InFlight>,
         size: (u32, u32),
         background_linear: [f32; 4],
     ) -> Result<Self, EngineError> {
-        Self::with_device(device, size, true, background_linear)
+        Self::with_device(device, core, in_flight, size, true, background_linear)
     }
 
     fn with_device(
         device: Device,
+        core: Arc<GpuCore>,
+        in_flight: Arc<InFlight>,
         size: (u32, u32),
         window_target: bool,
         clear_color: [f32; 4],
     ) -> Result<Self, EngineError> {
         let size = (size.0.max(1), size.1.max(1));
-        let queue = Queue::new(&device)?;
-        let pipeline = Pipeline::new(&device, MTLPixelFormat::BGRA8Unorm_sRGB)?;
+        let queue = Queue::new(&device, in_flight)?;
         let mut device = device;
         // 图集页懒分配：初始化只有 1×1 占位纹理，绑定始终有效（DEVIATIONS F-208）。
         let atlas = AtlasTextures::new(&mut device)?;
+        // 先申请显存额度再建纹理：超预算时窗口创建失败，而不是让驱动在显存压力下失败。
+        let persist_lease = PersistLease::new(Arc::clone(&core), size)?;
         let persist = Persist::new(&mut device, size)?;
         let upload = UploadArena::new(&mut device)?;
         Ok(Self {
+            core,
+            persist_lease,
             device,
             queue,
-            pipeline,
+            pipeline: None,
             atlas,
             persist,
             drawable_syncs: DrawableSyncs::new(),
@@ -162,6 +196,28 @@ impl GpuRenderer {
             #[cfg(any(test, feature = "test-support"))]
             readback: Readback::new(),
         })
+    }
+
+    /// 解析四条 PSO（进程内首次需要时编译一次，之后是缓存命中）。
+    ///
+    /// 窗口路径的首次调用发生在 `kytrix-metal` 线程的首帧录制里：PSO 的后端编译（数十毫秒）
+    /// 因此不占主线程（R09-5）。
+    fn ensure_pipeline(&mut self) -> Result<(), EngineError> {
+        if self.pipeline.is_some() {
+            return Ok(());
+        }
+        let set = self
+            .core
+            .pipeline_set(TARGET_FORMAT, BlendMode::Premultiplied)?;
+        self.pipeline = Some(set);
+        Ok(())
+    }
+
+    /// 已解析的四条 PSO（[`GpuRenderer::ensure_pipeline`] 之后必然存在）。
+    fn resolved_pipeline(&self) -> &PipelineSet {
+        self.pipeline
+            .as_ref()
+            .expect("ensure_pipeline must run before recording a frame")
     }
 
     /// §10.1 的线程归属断言：**窗口**渲染器的所有入口只属于 `kytrix-metal` 线程。
@@ -207,6 +263,9 @@ impl GpuRenderer {
         if size == self.surface {
             return Ok(false);
         }
+        // 显存额度先过：超预算时保留旧目标继续渲染（这一帧按旧尺寸提交），而不是进入
+        // "额度已释放、纹理没建"的不一致状态（R09-13）。
+        self.persist_lease.resize(size)?;
         let old = self.persist.recreate(&mut self.device, size)?;
         self.queue.retire(self.last_index, old);
         self.surface = size;
@@ -233,16 +292,26 @@ impl GpuRenderer {
     }
 
     /// 窗口路径：把一帧画进 persist 后，把这张 drawable 落后于 persist 的部分 blit 过去，登记
-    /// 完成通知并 `commit`（I2）。
+    /// 完成通知与呈现通知并 `commit`（I2）。
     ///
-    /// 调用方（GPU 循环）已经：取到 drawable、非阻塞拿到三槽上传槽、按 drawable 实际尺寸
-    /// 调过 [`GpuRenderer::prepare_target`]、并构造好 `frame`。
+    /// 调用方（GPU 循环）已经：取到 drawable、按 target presentation timestamp 判定本 vsync 要
+    /// 提交、非阻塞拿到三槽上传槽、按 drawable 实际尺寸调过 [`GpuRenderer::prepare_target`]，
+    /// 并构造好 `frame`。
+    ///
+    /// `present_at` 是 `CAMetalDisplayLinkUpdate.targetPresentationTimestamp`（host time）：
+    /// `Some` ⇒ `presentDrawable:atTime:`（把呈现钉到 display link 要求的那一帧），`None` ⇒
+    /// 目标时刻不可用 / 已多次错过时的立即呈现（`presentDrawable:`）。
+    ///
+    /// `presented` 在 drawable 真正上屏时由 CoreAnimation 在**它自己的线程**调用，参数是
+    /// `MTLDrawable.presentedTime`（唯一权威的呈现时刻，R09-6）。
     pub(crate) fn submit_frame(
         &mut self,
         request: &crate::render::frame::FrameRequest,
         drawable: &ProtocolObject<dyn CAMetalDrawable>,
+        present_at: Option<CFTimeInterval>,
         frame: &mut FramePlan,
         completed: impl Fn(Retained<ProtocolObject<dyn MTLCommandBuffer>>) + Send + 'static,
+        presented: impl Fn(CFTimeInterval) + Send + 'static,
     ) -> Result<(crate::render::RenderStats, Vec<GpuTimerSample>), EngineError> {
         debug_assert!(
             on_gpu_thread(),
@@ -263,10 +332,29 @@ impl GpuRenderer {
             Some(drawable),
             &mut timings,
         )?;
+        let mtl_drawable: &ProtocolObject<dyn MTLDrawable> = drawable.as_ref();
+        // **先登记呈现回调、再登记呈现**（R09-6）：`presentedTime` 是唯一权威的呈现时刻，
+        // 完成回调（GPU 执行完）比它早一个 vsync 左右，不能代替。
+        //
+        // block 在 CoreAnimation 的呈现线程执行：只把时间交给调用方（入队 + 唤醒 GPU 线程），
+        // 不读 GPU 状态、不碰 retire。
+        let presented_block =
+            block2::RcBlock::new(move |drawable: NonNull<ProtocolObject<dyn MTLDrawable>>| {
+                // SAFETY: 参数是 CA 传进来的这张 drawable，回调期间有效（Metal 保证非空）。
+                let presented_time = unsafe { drawable.as_ref() }.presentedTime();
+                presented(presented_time);
+            });
+        // SAFETY: `addPresentedHandler:` 与 `addCompletedHandler:` 同一约定：只借用 block 指针，
+        // 并在返回前拷贝一份；`presented_block` 在本函数返回前存活。
+        unsafe { mtl_drawable.addPresentedHandler(block2::RcBlock::as_ptr(&presented_block)) };
         // **在 commit 前登记呈现**（Apple 推荐的 Metal 生命周期）：drawable 在 GPU 完成时立即
         // 归还给 `CAMetalLayer`，而不是等某个同步等待之后。
-        let mtl_drawable: &ProtocolObject<dyn objc2_metal::MTLDrawable> = drawable.as_ref();
-        command.presentDrawable(mtl_drawable);
+        match present_at {
+            // 钉到 display link 给出的呈现时刻（R09-6 的核心）：CA 不必再猜本帧属于哪个 vsync。
+            Some(time) => command.presentDrawable_atTime(mtl_drawable, time),
+            // 没有可用的目标时刻（headless / 目标已过期多次）：回到默认的"尽快呈现"。
+            None => command.presentDrawable(mtl_drawable),
+        }
         let present_started = Instant::now();
         self.queue
             .submit(request.index, slot, &command, completed)?;
@@ -411,6 +499,8 @@ impl GpuRenderer {
             "a partial plan must carry a non-empty dirty set"
         );
         let frame_started = Instant::now();
+        // PSO 懒解析（进程内首次编译，之后缓存命中）：必须在绑定之前。
+        self.ensure_pipeline()?;
         // 用 `try_acquire` 已经取到的那个槽：permit 与上传槽必须一一对应（P1-2.12）。
         //
         // 离屏 / 快照路径走 `submit_blocking`（每帧同步等完成），没有窗口路径的背压，
@@ -493,6 +583,12 @@ impl GpuRenderer {
             // 之后恢复实例绑定。克隆引用（refcount+1）以便同一借用期里再可变借用
             // `self.geometry`。
             let instances = self.upload.slot(slot.index).0.clone();
+            // PSO 集只借用 `self.pipeline` 这一个字段（不是整个 `self`）：同一段代码里还要
+            // 可变借用 `self.geometry` / `self.device`（几何缓冲按需创建）。
+            let pipeline = self
+                .pipeline
+                .as_ref()
+                .expect("ensure_pipeline must run before recording a frame");
             // 逐 scissor 画：全帧 = 整面一次；局部 = 每个 damage 矩形一次。
             match full {
                 true => {
@@ -504,7 +600,7 @@ impl GpuRenderer {
                         instance_count,
                         [0, 0, self.surface.0 as i32, self.surface.1 as i32],
                         root,
-                        &self.pipeline,
+                        pipeline,
                         &mut self.geometry,
                         &mut self.device,
                         &mut geometry_retired,
@@ -528,7 +624,7 @@ impl GpuRenderer {
                                 instance_count,
                                 [rect.x0, rect.y0, rect.x1, rect.y1],
                                 root,
-                                &self.pipeline,
+                                pipeline,
                                 &mut self.geometry,
                                 &mut self.device,
                                 &mut geometry_retired,
@@ -558,7 +654,13 @@ impl GpuRenderer {
                 Some(damage) => FrameDamage::Partial(damage),
                 None => FrameDamage::Full,
             };
-            let copy = self.drawable_syncs.plan(&target, damage, self.surface);
+            let mtl_drawable: &ProtocolObject<dyn MTLDrawable> = drawable.as_ref();
+            let copy = self.drawable_syncs.plan(
+                mtl_drawable.drawableID(),
+                (target.width() as u32, target.height() as u32),
+                damage,
+                self.surface,
+            );
             let blit = command
                 .blitCommandEncoder()
                 .ok_or_else(|| init_error("blitCommandEncoder", "returned nil"))?;
@@ -597,7 +699,7 @@ impl GpuRenderer {
         encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
         slot: usize,
     ) -> RootUniform {
-        encoder.setRenderPipelineState(self.pipeline.quad());
+        encoder.setRenderPipelineState(self.resolved_pipeline().quad());
         let (instances, clips) = self.upload.slot(slot);
         // `RootUniform` 用 `setVertexBytes`（≤ 4 KB）在**录制时复制**进命令缓冲：没有跨帧的
         // CPU 可写缓冲，因此在飞帧读到的永远是它自己那一帧的常量（D3D12 root constants /
@@ -617,7 +719,7 @@ impl GpuRenderer {
             encoder.setFragmentBuffer_offset_atIndex(Some(clips), 0, 1);
             encoder.setFragmentTexture_atIndex(Some(self.atlas.texture(AtlasKind::Glyph)), 0);
             encoder.setFragmentTexture_atIndex(Some(self.atlas.texture(AtlasKind::Image)), 1);
-            encoder.setFragmentSamplerState_atIndex(Some(self.pipeline.sampler()), 0);
+            encoder.setFragmentSamplerState_atIndex(Some(self.core.sampler()), 0);
             encoder.setViewport(MTLViewport {
                 originX: 0.0,
                 originY: 0.0,
@@ -631,8 +733,8 @@ impl GpuRenderer {
     }
 }
 
-/// drawable 同步表容量 = 图层池深度：同时被表项强引用着的纹理数与 `CAMetalLayer` 自己的池相同，
-/// 不会多占显存；表满时淘汰最久未用的条目（它下次出现时按新纹理整面拷）。
+/// drawable 同步表容量 = 图层池深度：CA 同时只会交出这么多张 drawable；表满时淘汰最久未用的
+/// 条目（它下次出现时按"新 drawable"整帧拷）。
 const DRAWABLE_SYNC_SLOTS: usize = MAXIMUM_DRAWABLE_COUNT;
 
 /// 本帧对 persist 的改动（`FramePlan` 的像素语义）。
@@ -653,50 +755,76 @@ enum DrawableCopy {
     Rects(DamageRects),
 }
 
-/// 一张 drawable 纹理落后 persist 多少。
+/// 一张 drawable 的**已绘制区域**与它对 persist 的落后程度（R09-12：把未文档化依赖显式化）。
+///
+/// 这里依赖的**唯一**一条 CA 行为是：同一张 drawable 纹理在两次 present 之间保留上次写入的
+/// 内容（drawable 池复用纹理的直接结果，Apple **没有**把它写成显式承诺）。因此本类型只维护
+/// "哪些像素已经被证明等于 persist"，并把它作为允许局部补拷的**前提条件**：
+///
+/// - [`Self::covered`] = false（新 drawable / 表项淘汰后重现 / 尺寸变化）：未写过的像素内容
+///   未定义，局部补拷会在屏幕上留下残影 ⇒ 一律 [`DrawableCopy::Full`]；
+/// - [`Self::stale`] = true（这张 drawable 错过了某次全量帧）：整面都落后，逐矩形补齐没有意义
+///   ⇒ 整帧拷；
+/// - 累计面积达到整面：矩形可能重叠，一次整面拷更便宜（也是带宽上界）⇒ 整帧拷。
+///
+/// 只有"已覆盖整面 + 没错过全量帧"这两条同时成立时，才做局部补拷 —— 也就是说**任何无法证明
+/// 同步的状态都退化到整帧拷**，而不是指望池复用的内容还在。
 #[derive(Clone, Copy, Debug)]
 struct DrawableSyncState {
-    /// 自上次同步以来错过的 damage（本帧 present 它时必须补拷）。
+    /// 已绘制区域覆盖整面：这张纹理的每个像素都被我们写过一次（且内容等于当次 persist）。
+    ///
+    /// 这是局部补拷的唯一前提；它只由整帧拷贝置位（见 [`Self::take_copy`]）。
+    covered: bool,
+    /// 自上次同步以来错过的 persist 改动（本帧 present 它时必须补拷）。
     pending: DamageRects,
-    /// 自上次同步以来出现过全量帧 / 内容从未同步过：整面不可信。
-    full: bool,
+    /// 自上次同步以来出现过全量帧：整面都落后，逐矩形补齐没有意义。
+    stale: bool,
 }
 
 impl DrawableSyncState {
-    /// 刚插入表项的状态（纹理第一次出现）：内容从未与 persist 同步过，必须整面拷。
-    const fn unsynced() -> Self {
+    /// 刚插入表项的状态（这张 drawable 第一次出现）：已绘制区域为空，必须整帧拷。
+    const fn new() -> Self {
         Self {
+            covered: false,
             pending: DamageRects::new(),
-            full: true,
+            stale: false,
         }
     }
 
-    /// 本帧 present 这张 drawable：返回要补拷的范围，并把状态推进到「内容 = persist」。
+    /// 本帧 present 这张 drawable：返回要补拷的范围，并把状态推进到「已绘制区域 = 整面、
+    /// 内容 = persist」。
     ///
     /// 补拷集是「它错过的 `pending`」∪「本帧 damage」——两者都是 persist 的变化，并集就是这张
     /// drawable 与当前 persist 的全部差异；拷完之后它的每个像素都与 persist 相等，因此后续帧
-    /// 只需继续记录新的变化（`record_missed`）。
+    /// 只需继续记录新的变化（[`Self::record_missed`]）。
     fn take_copy(&mut self, frame: FrameDamage, surface: (u32, u32)) -> DrawableCopy {
-        let copy = match frame {
-            // 全量帧：整面都变过，逐矩形没有意义。
-            FrameDamage::Full => DrawableCopy::Full,
-            // 期间出现过全量帧：累计矩形没有覆盖整面，内容不可信。
-            FrameDamage::Partial(_) if self.full => DrawableCopy::Full,
-            FrameDamage::Partial(damage) => {
-                let mut rects = self.pending;
-                merge_damage(&mut rects, &damage);
-                // 裁剪后累计面积达到整面：矩形之间可能重叠，一次整面拷反而更便宜。
-                let surface_area = u64::from(surface.0) * u64::from(surface.1);
-                if copy_area(&rects, surface) >= surface_area {
-                    DrawableCopy::Full
-                } else {
-                    DrawableCopy::Rects(rects)
+        let copy = if !self.covered || self.stale {
+            // 未覆盖整面 / 错过全量帧：无法证明与 persist 一致 ⇒ 整帧拷贝（显式退化）。
+            DrawableCopy::Full
+        } else {
+            match frame {
+                // 全量帧：整面都变过，逐矩形没有意义。
+                FrameDamage::Full => DrawableCopy::Full,
+                FrameDamage::Partial(damage) => {
+                    let mut rects = self.pending;
+                    merge_damage(&mut rects, &damage);
+                    // 裁剪后累计面积达到整面：矩形之间可能重叠，一次整面拷反而更便宜。
+                    let surface_area = u64::from(surface.0) * u64::from(surface.1);
+                    if copy_area(&rects, surface) >= surface_area {
+                        DrawableCopy::Full
+                    } else {
+                        DrawableCopy::Rects(rects)
+                    }
                 }
             }
         };
+        // 拷完之后这张纹理的**每个**像素都等于当前 persist：已绘制区域覆盖整面。
+        // （局部补拷建立在这个前提上：没被本次拷到的像素之所以仍然正确，是因为
+        // `covered` 曾经成立且期间的改动都记在 `pending` 里 —— 这正是本类型的记账契约。）
         *self = Self {
+            covered: true,
             pending: DamageRects::new(),
-            full: false,
+            stale: false,
         };
         copy
     }
@@ -705,11 +833,11 @@ impl DrawableSyncState {
     fn record_missed(&mut self, frame: FrameDamage) {
         match frame {
             FrameDamage::Full => {
-                self.full = true;
+                self.stale = true;
                 self.pending = DamageRects::new();
             }
-            // 已经整面不可信时累计矩形没有意义（下次反正整面拷）。
-            FrameDamage::Partial(damage) if !self.full => merge_damage(&mut self.pending, &damage),
+            // 已经整面落后时累计矩形没有意义（下次反正整面拷）。
+            FrameDamage::Partial(damage) if !self.stale => merge_damage(&mut self.pending, &damage),
             FrameDamage::Partial(_) => {}
         }
     }
@@ -741,21 +869,25 @@ fn copy_area(rects: &DamageRects, surface: (u32, u32)) -> u64 {
         .sum()
 }
 
-/// 按 drawable 纹理身份追踪 persist 同步状态的固定容量表（只有窗口路径有内容）。
+/// 按 drawable 身份追踪 persist 同步状态的固定容量表（只有窗口路径有内容）。
 ///
-/// `CAMetalLayer` 从内部纹理池里按需交出 drawable（3 张轮换），下一帧拿到的纹理通常停在 2~3
+/// `CAMetalLayer` 从内部纹理池里按需交出 drawable（3 张轮换），下一帧拿到的那张通常停在 2~3
 /// 帧前：只拷「本帧 damage」会漏掉它错过的那几帧，屏幕上会闪回旧内容。这里按身份累计每张
-/// drawable 的 [`DrawableSyncState::pending`]，present 前一次补齐；纹理第一次出现或表项被淘汰
-/// 时按新纹理整面拷（正确性优先于命中率）。
+/// drawable 的 [`DrawableSyncState::pending`]，present 前一次补齐。
+///
+/// **身份用 `MTLDrawable.drawableID`，不持纹理强引用**：Apple 文档（objc2-metal
+/// `MTLDrawable::drawableID`）保证它是"同一 `CAMetalLayer` 上创建的 drawable 的单调递增 ID"，
+/// 因此不会复用、可以安全地当身份。旧实现持 `Retained<MTLTexture>` 强引用最多 3 张全尺寸
+/// drawable（Retina 2x 1400×900 ≈ 20 MB/张 ⇒ 额外常驻 ~60 MB），还会阻止 CA 回收它们 —— 那
+/// 笔显存与"依赖未承诺语义"的代价现在都去掉了。
 struct DrawableSyncs {
     /// 顺序 = 最近使用（末尾最新）。
     entries: Vec<DrawableEntry>,
 }
 
 struct DrawableEntry {
-    /// 纹理身份。**持有强引用**：表项存活期间这个对象不会被释放，地址也就不可能被新纹理复用
-    /// （否则「同址新纹理」会被误判成已同步而留下残影）。
-    texture: Retained<ProtocolObject<dyn MTLTexture>>,
+    /// `MTLDrawable.drawableID`（同一 `CAMetalLayer` 内单调递增、不复用）。
+    id: usize,
     state: DrawableSyncState,
 }
 
@@ -767,24 +899,23 @@ impl DrawableSyncs {
     }
 
     /// 本帧 present 的 drawable：返回补拷范围，把它推进到「已同步」，并给其它 drawable 记账。
+    ///
+    /// `size` 是 drawable 纹理的实际尺寸、`surface` 是 persist 的尺寸：两者**必须**相等
+    /// （`prepare_target` 用 drawable 的实际尺寸重建 persist）。旧实现在这里只有
+    /// `debug_assert_eq!`，release 下若两者不同就会用 persist 的坐标系去 blit 一张不同尺寸的
+    /// 纹理；现在**任何尺寸不符都硬性退化为整帧拷贝并作废整表**（正确性优先，代价只是一帧带宽）。
     fn plan(
         &mut self,
-        texture: &Retained<ProtocolObject<dyn MTLTexture>>,
+        id: usize,
+        size: (u32, u32),
         frame: FrameDamage,
         surface: (u32, u32),
     ) -> DrawableCopy {
-        // persist 与 drawable 同尺寸是本模块的同步前提（`prepare_target` 用 drawable 的实际尺寸
-        // 重建 persist）：表里的矩形都在这个坐标系里，尺寸一变表就整体作废。
-        debug_assert_eq!(
-            (texture.width(), texture.height()),
-            (surface.0 as usize, surface.1 as usize),
-            "persist and drawable must share one size"
-        );
-        let current = match self
-            .entries
-            .iter()
-            .position(|entry| Retained::as_ptr(&entry.texture) == Retained::as_ptr(texture))
-        {
+        if size != surface {
+            self.entries.clear();
+            return DrawableCopy::Full;
+        }
+        let current = match self.entries.iter().position(|entry| entry.id == id) {
             Some(index) => {
                 // LRU：刚用过的移到队尾。
                 if index + 1 != self.entries.len() {
@@ -798,8 +929,8 @@ impl DrawableSyncs {
                     self.entries.remove(0);
                 }
                 self.entries.push(DrawableEntry {
-                    texture: texture.clone(),
-                    state: DrawableSyncState::unsynced(),
+                    id,
+                    state: DrawableSyncState::new(),
                 });
                 self.entries.len() - 1
             }
@@ -1007,7 +1138,7 @@ fn draw_ops(
     instance_count: u32,
     scissor: [i32; 4],
     root: RootUniform,
-    pipeline: &Pipeline,
+    pipeline: &PipelineSet,
     geometry: &mut GeometryRegistry,
     device: &mut Device,
     retired: &mut Vec<GpuResourceHandle>,
@@ -1197,7 +1328,8 @@ fn elapsed_ns(started: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DrawableCopy, DrawableSyncState, FrameDamage, clipped_rect, merge_damage, whole_scissor,
+        DRAWABLE_SYNC_SLOTS, DrawableCopy, DrawableSyncState, DrawableSyncs, FrameDamage,
+        clipped_rect, merge_damage, whole_scissor,
     };
     use crate::{
         math::PhysicalRect,
@@ -1298,26 +1430,31 @@ mod tests {
         assert_eq!((rect.width, rect.height), (1400, 1040));
     }
 
-    /// 新 drawable（图层刚建 / resize 后 / 表项被淘汰）的内容不可信：整面拷。
+    /// 新 drawable（图层刚建 / resize 后 / 表项被淘汰）：已绘制区域为空 ⇒ 整帧拷。
     #[test]
-    fn an_unsynced_drawable_copies_the_whole_surface() {
+    fn a_drawable_without_a_painted_region_copies_the_whole_surface() {
         let surface = (100, 80);
-        let mut state = DrawableSyncState::unsynced();
+        let mut state = DrawableSyncState::new();
+        assert!(
+            !state.covered,
+            "新 drawable 的已绘制区域为空：未写像素的内容未定义"
+        );
         assert_eq!(
             state.take_copy(FrameDamage::Partial(damage(&[(10, 10, 20, 20)])), surface),
             DrawableCopy::Full
         );
-        assert!(!state.full, "整面拷之后内容已与 persist 一致");
+        assert!(state.covered, "整面拷之后已绘制区域覆盖整面");
         assert!(state.pending.is_empty(), "补拷集已被消费");
     }
 
-    /// 已同步的 drawable 只补拷本帧 damage：局部更新只付局部带宽。
+    /// 已同步（已绘制区域覆盖整面）的 drawable 只补拷本帧 damage：局部更新只付局部带宽。
     #[test]
-    fn a_synced_drawable_only_copies_this_frames_damage() {
+    fn a_covered_drawable_only_copies_this_frames_damage() {
         let surface = (100, 80);
         let mut state = DrawableSyncState {
+            covered: true,
             pending: DamageRects::new(),
-            full: false,
+            stale: false,
         };
         let current = damage(&[(10, 10, 20, 20)]);
         assert_eq!(
@@ -1331,7 +1468,7 @@ mod tests {
     #[test]
     fn a_rotating_drawable_catches_up_every_damage_it_missed() {
         let surface = (100, 80);
-        let mut states = [DrawableSyncState::unsynced(); 3];
+        let mut states = [DrawableSyncState::new(); 3];
         // 第 1 帧：全量帧（fresh）present 给 A，B/C 记下整面不可信。
         assert_eq!(
             present(&mut states, 0, FrameDamage::Full, surface),
@@ -1368,7 +1505,7 @@ mod tests {
     #[test]
     fn a_full_frame_forces_every_other_drawable_to_copy_the_whole_surface() {
         let surface = (100, 80);
-        let mut states = [DrawableSyncState::unsynced(); 3];
+        let mut states = [DrawableSyncState::new(); 3];
         // 第 1 帧 A 整面同步；B/C 记下整面不可信。
         assert_eq!(
             present(&mut states, 0, FrameDamage::Full, surface),
@@ -1408,7 +1545,7 @@ mod tests {
     #[test]
     fn accumulated_damage_covering_the_whole_surface_falls_back_to_a_full_copy() {
         let surface = (100, 80);
-        let mut state = DrawableSyncState::unsynced();
+        let mut state = DrawableSyncState::new();
         assert_eq!(
             state.take_copy(FrameDamage::Full, surface),
             DrawableCopy::Full
@@ -1425,7 +1562,7 @@ mod tests {
     #[test]
     fn missed_damage_stays_within_the_fixed_rect_budget() {
         let surface = (1000, 1000);
-        let mut state = DrawableSyncState::unsynced();
+        let mut state = DrawableSyncState::new();
         assert_eq!(
             state.take_copy(FrameDamage::Full, surface),
             DrawableCopy::Full
@@ -1452,6 +1589,104 @@ mod tests {
             }
             other => panic!("expected a bounded rect copy, got {other:?}"),
         }
+    }
+
+    /// 表按 `MTLDrawable.drawableID` 认身份：同一张 drawable 第二次出现时只补拷错过的 damage，
+    /// 换一张（不同 id，可能是池重建出来的新纹理）则整帧拷。
+    #[test]
+    fn the_sync_table_keys_on_the_drawable_id() {
+        let surface = (100, 80);
+        let mut syncs = DrawableSyncs::new();
+        assert_eq!(
+            syncs.plan(7, surface, FrameDamage::Full, surface),
+            DrawableCopy::Full
+        );
+        let second = damage(&[(0, 0, 10, 10)]);
+        assert_eq!(
+            syncs.plan(7, surface, FrameDamage::Partial(second), surface),
+            DrawableCopy::Rects(second),
+            "同一张 drawable 已经整面写过：只补本帧 damage"
+        );
+        assert_eq!(
+            syncs.plan(
+                8,
+                surface,
+                FrameDamage::Partial(damage(&[(0, 0, 10, 10)])),
+                surface
+            ),
+            DrawableCopy::Full,
+            "不同的 drawable 已绘制区域为空：必须整帧拷"
+        );
+    }
+
+    /// 表满时淘汰最久未用的条目：被淘汰的 drawable 再出现时按"新 drawable"整帧拷
+    /// （它的已绘制区域记账已经丢了，不能当作已同步）。
+    #[test]
+    fn the_sync_table_evicts_the_least_recently_used_drawable() {
+        let surface = (100, 80);
+        let mut syncs = DrawableSyncs::new();
+        for id in 0..DRAWABLE_SYNC_SLOTS {
+            assert_eq!(
+                syncs.plan(id, surface, FrameDamage::Full, surface),
+                DrawableCopy::Full
+            );
+        }
+        assert_eq!(syncs.entries.len(), DRAWABLE_SYNC_SLOTS);
+        assert_eq!(
+            syncs.plan(DRAWABLE_SYNC_SLOTS, surface, FrameDamage::Full, surface),
+            DrawableCopy::Full
+        );
+        assert_eq!(syncs.entries.len(), DRAWABLE_SYNC_SLOTS, "表容量固定");
+        assert!(
+            !syncs.entries.iter().any(|entry| entry.id == 0),
+            "最久未用的条目被淘汰"
+        );
+        assert_eq!(
+            syncs.plan(
+                0,
+                surface,
+                FrameDamage::Partial(damage(&[(1, 1, 2, 2)])),
+                surface
+            ),
+            DrawableCopy::Full,
+            "淘汰后重现的 drawable 必须整帧拷"
+        );
+    }
+
+    /// 尺寸不符（persist 与 drawable 坐标系不同）在 release 下也必须整帧拷并作废整表 ——
+    /// 旧实现只有 `debug_assert_eq!`，release 下会拿 persist 的坐标系去 blit 另一尺寸的纹理。
+    #[test]
+    fn a_drawable_size_mismatch_invalidates_the_table() {
+        let surface = (100, 80);
+        let mut syncs = DrawableSyncs::new();
+        assert_eq!(
+            syncs.plan(1, surface, FrameDamage::Full, surface),
+            DrawableCopy::Full
+        );
+        assert_eq!(
+            syncs.plan(2, surface, FrameDamage::Full, surface),
+            DrawableCopy::Full
+        );
+        assert_eq!(
+            syncs.plan(
+                1,
+                (90, 70),
+                FrameDamage::Partial(damage(&[(0, 0, 1, 1)])),
+                surface
+            ),
+            DrawableCopy::Full
+        );
+        assert!(syncs.entries.is_empty(), "尺寸不符时整表作废");
+        assert_eq!(
+            syncs.plan(
+                1,
+                surface,
+                FrameDamage::Partial(damage(&[(0, 0, 1, 1)])),
+                surface
+            ),
+            DrawableCopy::Full,
+            "作废之后旧状态不能复活"
+        );
     }
 
     /// 容量满时先合并再追加：被合并的矩形必须**覆盖**原 damage（不能丢），否则 drawable 会漏拷。

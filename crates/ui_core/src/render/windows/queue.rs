@@ -4,15 +4,34 @@
 //! 进程级只有**一条** direct queue（`device::SharedGpu`）。每个窗口保留自己的 in-flight 记账：
 //! 三个 allocator + 三个命令列表 + 自己的 fence（提交后 `Signal`）。D3D12 的 command queue 是
 //! free-threaded 的：不同线程 `ExecuteCommandLists` 到同一队列是合法的，且队列保证先提交的
-//! 工作先完成 —— `ID3D12CommandQueue::ExecuteCommandLists` 文档明确「同一线程或不同线程连续
-//! 调用，前一批必然在后一批之前完成」。命令列表按提交顺序整段执行，因此图集上传的屏障序列
-//! 不会和别的窗口交错。
+//! 工作先完成。命令列表按提交顺序整段执行，因此图集上传的屏障序列不会和别的窗口交错。
 //!
 //! **提交是异步的**（I2）：`submit` 关闭列表、`ExecuteCommandLists`、`Signal` 之后立刻返回，
-//! 完成状态只通过 fence 观察。等待点在调用方（GPU 线程）：复用槽位前 `wait_slot_fence`，
-//! 离屏 resize / 读回 / 退出前 `wait_idle`。
+//! 完成状态只通过 fence 观察。
+//!
+//! **等待的结果分两类**（R08-3）：
+//! - [`WaitOutcome::Signaled`]：fence 到达；
+//! - [`WaitOutcome::TimedOut`]：`FENCE_TIMEOUT_MS` 内没到，但 `GetDeviceRemovedReason()` 是
+//!   `S_OK` ⇒ **设备健康**，只是一次时序现象（锁屏 / 熄屏 / RDP / 合成器停摆 / 提交被挤）。
+//!   这不是错误：调用方退避、跳过这一帧或下一次重试，绝不升级成粘性 `DeviceLost`。
+//!
+//! 只有 `DXGI_ERROR_DEVICE_REMOVED/_HUNG/_RESET/DRIVER_INTERNAL_ERROR`（[`super::hresult`]）
+//! 才会升级成 `EngineError::DeviceLost`（进程级粘性状态，由 `SharedGpu` 持有），并进入 R08-4 的
+//! 恢复路径。
+//!
+//! 另外，每个提交流向 [`SharedGpu`] 登记一条**水位**（[`StreamWatermark`]：fence + 最后一次
+//! 提交的 signal 值）。图集页换代（R08-6）只需要等这些水位，而不是等整条共享队列 idle：
+//! 页换代发生在图集**写锁**内，而所有窗口的「录制 + 提交」都在图集**读锁**内，因此写锁期间
+//! 不可能出现新的提交 —— 快照时的每条水位就覆盖了「引用旧纹理的全部在飞工作」。
 
-use std::{collections::VecDeque, path::PathBuf, sync::Arc};
+use std::{
+    collections::VecDeque,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use windows::{
     Win32::{
@@ -23,6 +42,10 @@ use windows::{
     core::Interface,
 };
 
+use super::{
+    diagnostics,
+    hresult::{is_device_removal, removal_reason_label},
+};
 use crate::{
     error::EngineError,
     render::{
@@ -37,6 +60,55 @@ use crate::{
 /// 2 s 是 GPU watchdog 的常规量级，健康的帧远达不到。
 pub(crate) const FENCE_TIMEOUT_MS: u32 = 2_000;
 
+/// 一次有界等待的结果（R08-3：超时**不是**错误）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WaitOutcome {
+    /// fence 已到达（或等待值为 0，从未使用过的槽）。
+    Signaled,
+    /// 设备健康，但 fence 在 [`FENCE_TIMEOUT_MS`] 内没到。
+    TimedOut,
+}
+
+impl WaitOutcome {
+    /// 是否等到了。
+    pub(crate) fn is_signaled(self) -> bool {
+        matches!(self, Self::Signaled)
+    }
+}
+
+/// 一个提交流的**水位**：它的 fence + 最后一次提交的 signal 值。
+///
+/// 共享侧（[`SharedGpu`]）只持有 `Weak`：窗口销毁后条目自然失效。图集页换代用它界定
+/// 「哪些在飞工作引用了旧纹理」。
+pub(crate) struct StreamWatermark {
+    fence: ID3D12Fence,
+    value: AtomicU64,
+}
+
+impl StreamWatermark {
+    pub(crate) fn new(fence: ID3D12Fence) -> Self {
+        Self {
+            fence,
+            value: AtomicU64::new(0),
+        }
+    }
+
+    /// 该流的 fence（页换代时逐条等水位用）。
+    pub(crate) fn fence(&self) -> ID3D12Fence {
+        self.fence.clone()
+    }
+
+    /// 提交成功后推进水位（`Release`：页换代在写锁内 `Acquire` 读取）。
+    fn publish(&self, value: u64) {
+        self.value.store(value, Ordering::Release);
+    }
+
+    /// 当前水位（0 = 该流从未提交）。
+    pub(crate) fn value(&self) -> u64 {
+        self.value.load(Ordering::Acquire)
+    }
+}
+
 /// 一个窗口在共享队列上的提交流：allocator/list + 自己的 fence + 提交记账 + retire。
 pub(crate) struct CommandStream {
     shared: Arc<SharedGpu>,
@@ -50,10 +122,13 @@ pub(crate) struct CommandStream {
     retire: RetireQueue,
     /// retire 队列里出现过的最大帧序号（teardown 的兜底释放用）。
     last_retire_index: Option<FrameIndex>,
+    /// 向共享设备登记的提交水位（图集页换代的最小等待集，R08-6）。
+    watermark: Arc<StreamWatermark>,
 }
 
 impl Drop for CommandStream {
     fn drop(&mut self) {
+        self.shared.unregister_watermark(&self.watermark);
         // SAFETY: `event` 由本结构独占；`Drop` 只执行一次，关闭后不再使用。
         unsafe {
             let _ = CloseHandle(self.event);
@@ -94,6 +169,7 @@ impl CommandStream {
         let event = unsafe { CreateEventW(None, false, false, None) }
             .map_err(|error| init_error_from("CreateEventW", error))?;
 
+        let watermark = shared.register_watermark(fence.clone());
         Ok(Self {
             shared: Arc::clone(shared),
             allocators,
@@ -104,6 +180,7 @@ impl CommandStream {
             submitted: VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT),
             retire: RetireQueue::new(),
             last_retire_index: None,
+            watermark,
         })
     }
 
@@ -115,12 +192,15 @@ impl CommandStream {
 
     /// 等到 `value` 到达（`0` = 该槽从未使用，直接返回）。
     ///
+    /// 超时返回 [`WaitOutcome::TimedOut`]（**设备健康**；调用方退避或重试），只有真正的设备
+    /// 移除才返回 `Err`。
+    ///
     /// 只允许在 GPU 线程（复用 allocator 的前置条件）或离屏同步路径（读回 / 退出）调用。
-    pub(crate) fn wait_slot_fence(&self, value: u64) -> Result<(), EngineError> {
+    pub(crate) fn wait_slot_fence(&self, value: u64) -> Result<WaitOutcome, EngineError> {
         self.wait_for(value)
     }
 
-    /// 复位该槽的 allocator + list（调用方必须先 `wait_slot_fence(slot.wait_value)`）。
+    /// 复位该槽的 allocator + list（调用方必须先用 `WaitOutcome::Signaled` 等到槽空闲）。
     pub(crate) fn reset_slot(&mut self, slot: FrameSlot) -> Result<(), EngineError> {
         let allocator = &self.allocators[slot.index];
         // SAFETY: 该槽上一次提交已由 `wait_slot_fence` 等到完成，allocator 不再被 GPU 使用。
@@ -157,6 +237,8 @@ impl CommandStream {
             .map_err(|error| init_error_from("CommandQueue::Signal", error))?;
         self.ring.advance(slot);
         self.submitted.push_back((index, slot.signal_value));
+        // 水位与本结构共享：页换代只需要等它，不必等整条队列（R08-6）。
+        self.watermark.publish(slot.signal_value);
         Ok(())
     }
 
@@ -182,12 +264,12 @@ impl CommandStream {
         unsafe { self.fence.GetCompletedValue() }
     }
 
-    /// 等到本窗口最后一次提交完成（离屏 resize / 读回 / 退出）。
+    /// 等到本窗口最后一次提交完成（离屏 resize / 读回 / 退出 / `ResizeBuffers` 前）。
     ///
     /// 只等**本提交流**的 fence：别的窗口在共享队列上还有在飞工作时，本窗口的资源仍可复用
-    /// （allocator / list / persist 都是每窗口对象）。共享图集的页重建走
-    /// `SharedGpu::rebuild_atlas_pages` 的全局 idle 等待，不是这里。
-    pub(crate) fn wait_idle(&mut self) -> Result<(), EngineError> {
+    /// （allocator / list / persist 都是每窗口对象）。共享图集的页换代走
+    /// `SharedGpu::rebuild_atlas_pages` 的**每窗口水位**等待，不是这里。
+    pub(crate) fn wait_idle(&mut self) -> Result<WaitOutcome, EngineError> {
         self.wait_for(self.ring.last_signaled())
     }
 
@@ -195,7 +277,7 @@ impl CommandStream {
     ///
     /// 关闭的 command list 仍记录着它引用过的资源；不 Reset 的话 swapchain 的 back buffer 会一直
     /// 有引用（三个 buffer 全部泄漏，swapchain 也带着引用被销毁，DEVIATIONS F-86）。调用方必须
-    /// 先 `wait_idle`（allocator 在 GPU 未完成时不可 Reset）。
+    /// 先**等到** `wait_idle` 返回 `Signaled`（allocator 在 GPU 未完成时不可 Reset）。
     pub(crate) fn reset_in_flight_lists(&mut self) -> Result<(), EngineError> {
         for index in 0..self.allocators.len() {
             let allocator = &self.allocators[index];
@@ -212,7 +294,7 @@ impl CommandStream {
         Ok(())
     }
 
-    /// 帧外的一次性提交（读回）：等 idle → 用槽 0 录制 → 提交 → 等完成。
+    /// 帧外的一次性提交（读回 / 图集整页上传）：等 idle → 用槽 0 录制 → 提交 → 等完成。
     ///
     /// 调用前后都必须 idle；提交成功后把槽 0 的 fence 记账推进到本次 signal 值。
     #[cfg(any(test, feature = "test-support"))]
@@ -220,7 +302,13 @@ impl CommandStream {
         &mut self,
         record: impl FnOnce(&ID3D12GraphicsCommandList) -> Result<(), EngineError>,
     ) -> Result<(), EngineError> {
-        self.wait_idle()?;
+        if self.wait_idle()? != WaitOutcome::Signaled {
+            return Err(EngineError::AppInit {
+                detail: smol_str::SmolStr::new_static(
+                    "submit_immediate requires an idle command stream",
+                ),
+            });
+        }
         let allocator = &self.allocators[0];
         // SAFETY: 槽 0 空闲（上一提交已等到），allocator 不再被 GPU 使用。
         unsafe { allocator.Reset() }
@@ -243,8 +331,7 @@ impl CommandStream {
         };
         // 帧外提交也占一个单调递增的 fence 值，并把**实际使用的槽 0** 的记账推进到该值：
         // 调用前的 `wait_idle` 已等到最后提交值（≥ 槽 0 的上一帧），因此 `wait_value` 就是那条
-        // 已经满足的前置条件；这不是只推进 `next_value` 的旁路（`InFlightRing::reserve` 已删除，
-        // 共享层不再含 Windows cfg）。
+        // 已经满足的前置条件。
         let slot = FrameSlot {
             index: 0,
             wait_value: self.ring.last_signaled(),
@@ -254,7 +341,15 @@ impl CommandStream {
         unsafe { self.shared.queue().Signal(&self.fence, slot.signal_value) }
             .map_err(|error| init_error_from("CommandQueue::Signal", error))?;
         self.ring.advance(slot);
-        self.wait_for(slot.signal_value)
+        self.watermark.publish(slot.signal_value);
+        match self.wait_for(slot.signal_value)? {
+            WaitOutcome::Signaled => Ok(()),
+            WaitOutcome::TimedOut => Err(EngineError::AppInit {
+                detail: smol_str::SmolStr::new_static(
+                    "submit_immediate timed out while the device is still present",
+                ),
+            }),
+        }
     }
 
     /// 延迟销毁：本帧用过的资源至少要活到 `index` 的 fence 完成。
@@ -313,21 +408,21 @@ impl CommandStream {
             .map_err(|error| init_error_from("GetTimestampFrequency", error))
     }
 
-    fn wait_for(&self, value: u64) -> Result<(), EngineError> {
-        // SAFETY: fence 句柄由本结构持有；查询无副作用。
-        if value == 0 || unsafe { self.fence.GetCompletedValue() } >= value {
-            return Ok(());
+    /// 有界等待（R08-3）：超时只在**设备健康**时返回 [`WaitOutcome::TimedOut`]。
+    fn wait_for(&self, value: u64) -> Result<WaitOutcome, EngineError> {
+        if value == 0 || self.completed_value() >= value {
+            return Ok(WaitOutcome::Signaled);
         }
         // SAFETY: fence / event 句柄由本结构持有，调用期间有效。
         unsafe { self.fence.SetEventOnCompletion(value, self.event) }
             .map_err(|error| init_error_from("SetEventOnCompletion", error))?;
         // **有界等待**（P1-2.13）：旧实现传 `INFINITE`。设备被移除 / 驱动挂死时
         // `SetEventOnCompletion` 永远不会触发，UI 线程就永久阻塞 —— 窗口无响应且没有任何
-        // 错误上报。GPU watchdog 的行业惯例是 1–2 s 量级（Chrome 的 GPU watchdog 默认 1 s），
-        // 这里取 2 s：健康的帧不可能接近这个量级。
+        // 错误上报。
+        // SAFETY: 同上。
         let wait = unsafe { WaitForSingleObject(self.event, FENCE_TIMEOUT_MS) };
         if wait == WAIT_OBJECT_0 {
-            return Ok(());
+            return Ok(WaitOutcome::Signaled);
         }
         if wait.0 != WAIT_TIMEOUT.0 {
             return Err(init_error(
@@ -335,52 +430,48 @@ impl CommandStream {
                 windows::core::HRESULT::from_win32(wait.0),
             ));
         }
-        // 超时：先确认设备是否真的被移除，给出可诊断的原因。**不能**在这里无限重试。
-        // 真正的移除类错误由共享设备升级成粘性 `DeviceLost`（并落 DRED 日志）；其它情况保留
-        // 超时分类。
+        self.classify_timeout()
+    }
+
+    /// 超时分类（R08-3）：**只有**真正的设备移除才升级成粘性 `DeviceLost`。
+    ///
+    /// `GetDeviceRemovedReason() == S_OK` 时设备健康（常见于锁屏 / 熄屏 / RDP 切换 / 合成器
+    /// 停摆），这是一次可恢复的时序现象：计数 + 让调用方退避重试。
+    fn classify_timeout(&self) -> Result<WaitOutcome, EngineError> {
         // SAFETY: 设备句柄由 `SharedGpu` 持有，调用期间有效；查询无副作用。
         let removed = unsafe { self.shared.raw().GetDeviceRemovedReason() };
-        let reason = match removed {
-            Ok(()) => smol_str::format_smolstr!(
-                "GPU fence wait timed out after {FENCE_TIMEOUT_MS} ms (device still present; GPU hung or submission lost)"
-            ),
-            Err(error) => smol_str::format_smolstr!(
-                "GPU fence wait timed out after {FENCE_TIMEOUT_MS} ms (GetDeviceRemovedReason: {:#010X} {})",
-                error.code().0 as u32,
-                error.message()
-            ),
-        };
-        if let Some(error) = self.shared.note_failure() {
-            return Err(error);
+        match removed {
+            Ok(()) => {
+                diagnostics::frame_wait_timeout();
+                Ok(WaitOutcome::TimedOut)
+            }
+            Err(error) => {
+                let hr = error.code();
+                if is_device_removal(hr) {
+                    if let Some(sticky) = self.shared.note_failure() {
+                        return Err(sticky);
+                    }
+                    return Err(EngineError::DeviceLost {
+                        reason: smol_str::format_smolstr!(
+                            "GPU fence wait failed: {:#010X} {} ({})",
+                            hr.0 as u32,
+                            hr.message(),
+                            removal_reason_label(hr)
+                        ),
+                        log_path: PathBuf::new(),
+                    });
+                }
+                // 其它原因（例如 `INVALID_CALL` 之类的驱动怪癖）：设备仍然可用。
+                diagnostics::frame_wait_timeout();
+                Ok(WaitOutcome::TimedOut)
+            }
         }
-        Err(EngineError::DeviceLost {
-            reason,
-            log_path: PathBuf::new(),
-        })
-    }
-}
-
-/// 打开 D3D12 调试层（**仅测试**；本机常缺 SDK 组件，失败静默）。
-#[cfg(test)]
-pub(crate) fn enable_debug_layer_once() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static TOUCHED: AtomicBool = AtomicBool::new(false);
-    if TOUCHED.swap(true, Ordering::Relaxed) {
-        return;
-    }
-    let mut debug: Option<ID3D12Debug> = None;
-    // SAFETY: 调试层接口是可选能力：本机缺 SDK 组件时返回错误并被跳过。
-    if unsafe { D3D12GetDebugInterface(&mut debug) }.is_ok()
-        && let Some(debug) = debug
-    {
-        // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
-        unsafe { debug.EnableDebugLayer() };
     }
 }
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::CommandStream;
+    use super::{CommandStream, WaitOutcome};
     use crate::{render::windows::device::SharedGpu, window::FrameIndex};
 
     fn index(value: u32) -> FrameIndex {
@@ -390,7 +481,7 @@ mod tests {
     #[test]
     fn submits_and_advances_the_fence_for_many_frames() {
         let _guard = crate::render::windows::device::gpu_test_lock();
-        super::enable_debug_layer_once();
+        super::super::debug::enable_debug_layer();
         let shared = SharedGpu::new_warp().expect("WARP shared gpu");
         let mut stream = CommandStream::new(&shared).expect("command stream");
         for value in 1..=7u32 {
@@ -400,13 +491,49 @@ mod tests {
                 (value as usize - 1) % 3,
                 "槽位按提交次数轮转，不从 FrameIndex 取模"
             );
-            stream.wait_slot_fence(slot.wait_value).expect("slot fence");
+            assert_eq!(
+                stream.wait_slot_fence(slot.wait_value).expect("slot fence"),
+                WaitOutcome::Signaled
+            );
             stream.reset_slot(slot).expect("reset slot");
             stream.submit(index(value), slot).expect("submit");
             // 提交本身不等 GPU（I2）：完成状态由调用方按 fence 观察。
-            stream.wait_slot_fence(slot.signal_value).expect("signaled");
+            assert_eq!(
+                stream.wait_slot_fence(slot.signal_value).expect("signaled"),
+                WaitOutcome::Signaled
+            );
         }
-        stream.wait_idle().expect("idle");
+        assert_eq!(stream.wait_idle().expect("idle"), WaitOutcome::Signaled);
         assert_eq!(stream.pending_retire(), 0);
+    }
+
+    /// 水位随提交推进（图集页换代的最小等待集，R08-6）：`SharedGpu` 看到的正是最后 signal 值。
+    #[test]
+    fn the_stream_publishes_its_watermark_on_every_submit() {
+        let _guard = crate::render::windows::device::gpu_test_lock();
+        let shared = SharedGpu::new_warp().expect("WARP shared gpu");
+        assert!(shared.watermark_values().is_empty(), "没有窗口时水位表为空");
+        let mut stream = CommandStream::new(&shared).expect("command stream");
+        assert_eq!(shared.watermark_values(), vec![0], "新流的水位是 0");
+        for value in 1..=3u32 {
+            let slot = stream.acquire_slot();
+            assert_eq!(
+                stream.wait_slot_fence(slot.wait_value).expect("slot fence"),
+                WaitOutcome::Signaled
+            );
+            stream.reset_slot(slot).expect("reset");
+            stream.submit(index(value), slot).expect("submit");
+            assert_eq!(
+                shared.watermark_values(),
+                vec![u64::from(value)],
+                "每次提交都必须推进水位"
+            );
+        }
+        let _ = stream.wait_idle().expect("idle");
+        drop(stream);
+        assert!(
+            shared.watermark_values().is_empty(),
+            "提交流销毁后水位条目必须注销（不留悬空 Weak）"
+        );
     }
 }

@@ -306,7 +306,10 @@ pub(crate) extern "system" fn wndproc(
 
         // R02-14：时间戳取 `MSG.time`（`GetMessageTime`），不是分发时刻。
         let ticks = message_ticks();
-        let stamped = if is_ime_message(msg) {
+        // IME 单独一条路径：一条 `WM_IME_COMPOSITION` 最多产两条事件（`GCS_RESULTSTR |
+        // GCS_COMPSTR` 同时置位 ⇒ Commit → Preedit），必须**逐条**入队（AR1b N5）。这条分支
+        // 不产生 `Close`，因此不需要走下面的单事件收尾。
+        if is_ime_message(msg) {
             // 组合串读取（`ImmGetContext` + `ImmGetCompositionStringW`）不派发消息，可以在借用
             // 内完成；**写**表单/上下文会重入，因此只产命令、出借用后再执行（文件头纪律 1）。
             let outcome = (*state).translate.ime_mut().handle(hwnd, msg, lparam_value);
@@ -314,12 +317,21 @@ pub(crate) extern "system" fn wndproc(
                 let applied = ime::execute(hwnd, command);
                 (*state).note_ime_applied(applied);
             }
-            outcome.event.map(|ime| StampedEvent {
-                event: PlatformEvent::Ime(ime),
-                ticks_ms: ticks,
-                scale: (*state).scale(),
-            })
-        } else if msg == WM_SETTINGCHANGE {
+            if !outcome.events.is_empty() {
+                let scale = (*state).scale();
+                for event in outcome.events {
+                    (*state).push_stamped_event(StampedEvent {
+                        event: PlatformEvent::Ime(event),
+                        ticks_ms: ticks,
+                        scale,
+                    });
+                }
+                (*state).wake();
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+
+        let stamped = if msg == WM_SETTINGCHANGE {
             // 系统滚轮行数（`SPI_GETWHEELSCROLLLINES`）可能变了（R02-10）。
             (*state).refresh_wheel_lines();
             appearance_change(lparam_value).map(|event| StampedEvent {

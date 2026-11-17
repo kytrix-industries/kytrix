@@ -18,6 +18,8 @@ use crate::{
 /// 陈旧焦点一律视为无焦点：虚拟列表回收行之后，旧 `NodeId` 不得再驱动键盘路由。
 /// 模态浮层（`trap_focus`）打开后，落在作用域外的焦点同样视为无焦点 —— 背景控件不得再被
 /// Enter/Space 或 a11y 激活；下一次输入会把它移入作用域内（[`validate_focus`]）。
+/// **完全没有焦点**时同理：模态作用域存在的话，下一次输入会把作用域内第一个可聚焦节点填上
+/// （AR1b N1b：从不可聚焦内容打开对话框后 Enter 必须有落点）。
 /// 消费者：`App::focused`。
 #[must_use]
 pub(crate) fn focused(app: &App, window: WindowId) -> Option<NodeId> {
@@ -51,12 +53,15 @@ pub(crate) fn hovered(app: &App, window: WindowId) -> Option<NodeId> {
 
 /// 清理失效焦点（读取路径都是只读，清理集中在这里）。
 ///
-/// 两条规则（R02-12）：
+/// 三条规则（R02-12 / AR1b N1b）：
 /// 1. 指向**已卸载节点**的焦点 ⇒ 清空；
-/// 2. 落在**模态作用域外**的焦点 ⇒ 移入作用域内第一个可聚焦节点（没有候选则清空）。
+/// 2. **完全没有焦点**且存在模态作用域 ⇒ 移入作用域内第一个可聚焦节点；
+/// 3. 落在**模态作用域外**的焦点 ⇒ 移入作用域内第一个可聚焦节点（没有候选则清空）。
 ///
-/// 规则 2 是「模态打开时把焦点移入对话框」的落点：浮层的子节点在 `create_overlay` 返回之后
+/// 规则 2/3 是「模态打开时把焦点移入对话框」的落点：浮层的子节点在 `create_overlay` 返回之后
 /// 才挂载，创建瞬间求值不到候选，因此修复放在下一次输入/焦点操作（本函数是它们的公共入口）。
+/// 规则 2 覆盖「从不可聚焦内容（图表区 / 自绘画布）打开对话框」：此时焦点本来就是 `None`，
+/// 不修复的话 Enter/Space 没有落点，用户必须先按一次 Tab 或点一下（AR1b 探针 7）。
 /// 常见路径（没有模态）只做一次根子节点扫描，零分配。
 /// 消费者：`App::validate_focus`。
 pub(crate) fn validate_focus(app: &mut App, window: WindowId) {
@@ -65,15 +70,17 @@ pub(crate) fn validate_focus(app: &mut App, window: WindowId) {
             return;
         };
         let tree = target.tree();
-        let Some(node) = target.focus().focused() else {
-            return;
-        };
-        if tree.get(node).is_err() {
-            Some(None)
-        } else {
-            let scope = overlay_util::focus_scope_root(tree, tree.root());
-            (scope.is_some() && !focus::in_scope(tree, node, scope))
-                .then(|| focus::next_focusable(tree, None, false, scope))
+        let scope = overlay_util::focus_scope_root(tree, tree.root());
+        let first_in_scope =
+            || scope.and_then(|scope| focus::next_focusable(tree, None, false, Some(scope)));
+        match target.focus().focused() {
+            // 从不可聚焦内容打开模态：焦点从未存在，必须补一个落点（否则 Enter 无处可去）。
+            None => first_in_scope().map(Some),
+            Some(node) if tree.get(node).is_err() => Some(None),
+            Some(node) if scope.is_some() && !focus::in_scope(tree, node, scope) => {
+                first_in_scope().map(Some)
+            }
+            Some(_) => None,
         }
     };
     match repair {
@@ -83,7 +90,7 @@ pub(crate) fn validate_focus(app: &mut App, window: WindowId) {
                 target.focus_mut().set(None);
             }
         }
-        // 作用域外焦点：走 `set_focus` 的完整路径（焦点环 damage + a11y 标记 + 唤醒）。
+        // 作用域外焦点 / 无焦点：走 `set_focus` 的完整路径（焦点环 damage + a11y 标记 + 唤醒）。
         Some(Some(next)) => {
             app.set_focus(window, Some(next));
         }

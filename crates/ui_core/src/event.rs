@@ -18,7 +18,7 @@
 //! | 事件时间戳 | [`InputEvent`] 各变体的 `timestamp` | Win32 `MSG.time`、AppKit `NSEvent.timestamp`、Wayland `input_event.time`、Chrome `WebInputEvent::TimeTicks` |
 //! | 点击归属按键 | [`ActionSource::Click`] 的 `button` | Win32 `WM_LBUTTONUP` / AppKit `mouseUp:`、Blink `click` vs `auxclick`、Qt `clicked()` 仅左键 |
 //! | 滚动阶段 / 单位 | [`ScrollPhase`] / [`ScrollUnit`] | Chrome `WebMouseWheelEvent.phase`、AppKit `NSEvent.phase`/`momentumPhase`、Qt `QWheelEvent::phase()`、Wayland `axis_value120` |
-//! | 字符文本生成判据 | `should_emit_text`（crate 私有） | Win32 `WM_CHAR`、AppKit `characters`、winit 的 xkb 回退通路 |
+//! | 字符文本生成判据 | [`should_emit_text`]（公开纯函数；调用点 = macOS `characters`、Linux XKB 回退） | AppKit `NSEvent.characters`、winit 的 xkb 回退通路 |
 
 use std::{ops::Range, time::Instant};
 
@@ -607,8 +607,11 @@ impl ScrollPhase {
 ///
 /// 与 [`ScrollPhase`] 分开是因为二者的**生命周期来源不同**：滚动是一串可惯性延续的事件流
 /// （还有 `Momentum`），手势是「按下 → 移动 → 抬起」的封闭会话，平台层必须把开始/结束完整映射，
-/// 应用才能做锚点变换、结束提交与惯性收尾（AppKit `NSEventPhase`、Windows `WM_GESTURE`
-/// 的 `GID_BEGIN`/`GID_END`、Wayland `zwp_pointer_gesture_*` 的 `begin`/`update`/`end` 同构）。
+/// 应用才能做锚点变换、结束提交与惯性收尾。
+///
+/// 语义参照：AppKit `NSEventPhase`、Windows `WM_GESTURE` 的 `GID_BEGIN`/`GID_END`、Wayland
+/// `zwp_pointer_gesture_*` 的 `begin`/`update`/`end`。**当前唯一的生产者是 macOS**
+/// （`platform/macos/view.rs`）；Windows / Linux 后端没有手势生产点（AR1b P3-5）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GesturePhase {
     /// 手势开始（AppKit `NSEventPhaseBegan`）。
@@ -621,11 +624,14 @@ pub enum GesturePhase {
     Cancel,
 }
 
-/// 原生手势事件的阶段位图（AppKit `NSEventPhase`、Windows `WM_GESTURE` 的 `GF_BEGIN`、
-/// Wayland `zwp_pointer_gesture_*` 的 `begin`/`update`/`end`）。
+/// 原生手势事件的阶段位图（语义参照 AppKit `NSEventPhase`、Windows `WM_GESTURE` 的
+/// `GF_BEGIN`、Wayland `zwp_pointer_gesture_*` 的 `begin`/`update`/`end`）。
 ///
 /// 纯数据 + 纯函数，放在平台无关层是为了让「阶段归一化」这条规则能在开发机上单测 ——
 /// 各平台的包装器只在各自目标上编译，测不到。
+///
+/// **当前唯一的生产者是 macOS**（`platform/macos/view.rs` 用 `NSEvent.phase` 填这张位图）；
+/// Windows / Linux 后端没有手势生产点，新接后端时复用本类型即可（AR1b P3-5）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GestureFlags {
     /// 「手势可能开始」的预告阶段（AppKit `NSEventPhaseMayBegin`；没有增量）。
@@ -796,6 +802,11 @@ pub enum InputEvent {
     /// `factor` 是**本次增量**（不是累计倍率）：应用自己累乘到视图缩放上（与 iPadOS /
     /// Windows `WM_GESTURE` 的增量语义一致，平台层不做累积、不猜手势结束时机）。
     /// `1.0` = 无变化，`> 1.0` = 放大，`< 1.0` = 缩小。
+    ///
+    /// **平台覆盖**：当前只有 macOS 后端产生手势事件（触控板捏合 / 旋转 / 双指双击）。
+    /// Windows 的 `WM_GESTURE`（`GID_ZOOM`/`GID_ROTATE`）与 Wayland 的
+    /// `zwp_pointer_gesture_pinch_v1` 都**没有生产点**，两端不会交付本变体 —— 应用要提供
+    /// 按钮/快捷键作为替代入口，不能假设手势一定到达（AR1b P3-5）。
     Magnify {
         /// 本次缩放因子（增量）。
         factor: f32,
@@ -808,7 +819,10 @@ pub enum InputEvent {
         /// 事件时刻。
         timestamp: Instant,
     },
-    /// 旋转手势（macOS `rotateWithEvent:`；Windows `WM_GESTURE` 的 `GID_ROTATE`）。
+    /// 旋转手势（macOS `rotateWithEvent:`）。
+    ///
+    /// 平台覆盖同 [`Self::Magnify`]：当前只有 macOS 产生（Windows 的 `GID_ROTATE` 与
+    /// Wayland 的 `zwp_pointer_gesture_*` 未接线）。
     Rotate {
         /// 本次旋转角度（**度**，增量；正负方向由平台定义）。
         degrees: f32,
@@ -824,6 +838,8 @@ pub enum InputEvent {
     /// 与 [`Self::Magnify`] 分开是因为它**没有增量也没有阶段**：系统已经决定了「缩放到适配/
     /// 原始尺寸」这一整步，应用按自己的语义切换（图表「复位视图」是典型用法）。把它硬塞进
     /// `Magnify` 会逼应用去猜一个魔法 `factor`。
+    ///
+    /// **平台覆盖**：只有 macOS 有这个系统手势，Windows / Linux 永远收不到。
     SmartMagnify {
         /// 缩放中心（窗口逻辑坐标）。
         center: Point,
@@ -1113,18 +1129,26 @@ impl InputEvent {
 
 /// 按键是否产生**字符文本**（[`InputEvent::Text`]）。
 ///
-/// 这是三条文本通路共用的**唯一判据**（Win32 `WM_CHAR`、AppKit `characters`、Wayland xkb
-/// 回退），因此把它做成公开纯函数，让「重复不得抑制文本」这条契约有可执行的定义与回归测试。
+/// 这是**按键通路**生成字符文本的判据，做成公开纯函数，让「重复不得抑制文本」这条契约有可执行
+/// 的定义与回归测试。真实调用点有两个：
+///
+/// - macOS `characters`（`platform/macos/view.rs`）；
+/// - Wayland 的 XKB 回退通路（`platform/linux/surface.rs`：服务端从不重发 `key` 事件，字符
+///   文本由客户端按每次重复合成）。
+///
+/// **Win32 `WM_CHAR` 不走这里**：那是系统按码点/代理对逐条投递的消息，提交抑制靠「码元队列
+/// 逐条比对」（`platform/windows/ime.rs` 的 `queue_commit` / `consume_char`），判据与按键
+/// 通路不同。旧注释把 `WM_CHAR` 列为本函数的消费者，与实际调用点不符（AR1b P3-3）。
 ///
 /// 判据只有三条：
 /// - 必须是**按下**（抬起不产生文本）；
 /// - 文本通路没有被 IME 接管（IME 启用时文本只走 [`ImeEvent::Commit`]，否则一次按键会得到
 ///   两份文本）；
-/// - 不在 IME 组合期（组合串由 `ImeEvent::Preedit` 表达，组合期的物理按键不产生正文）。
+/// - 不在 IME 组合期（组合串由 [`ImeEvent::Preedit`] 表达，组合期的物理按键不产生正文）。
 ///
 /// `repeat` **有意不参与判定**：自动重复只影响绑定/动作派发（`app::input::on_key` 忽略重复），
 /// 不抑制字符生成。Wayland 的字符文本**正是**随客户端合成的重复产生的（服务端从不重发
-/// `key` 事件），Win32 的 `WM_CHAR` 与 AppKit 的 `characters` 同样不受 `isARepeat` 过滤。
+/// `key` 事件），AppKit 的 `characters` 同样不受 `isARepeat` 过滤。
 /// 保留这个形参是契约的一部分：一旦有人重新拿 `repeat` 过滤文本，
 /// `should_emit_text_ignores_auto_repeat` 就会失败。
 #[must_use]
@@ -1216,17 +1240,31 @@ pub enum ImeEvent {
         text: SmolStr,
         /// 组合串内的插入点（**UTF-16 码元**偏移，相对 `text` 起点，`0..=text.encode_utf16().count()`）。
         ///
-        /// Win32 来源是 `ImmGetCompositionStringW(.., GCS_CURSORPOS, ..)`，macOS 来源是
-        /// `setMarkedText:selectedRange:replacementRange:` 的 `selectedRange.location`：用户用
-        /// ←/→/Home/End 在拼音串里改字时，插入点停在串中间，文本层必须按它画插入点（否则光标
-        /// 恒在末尾，用户看不到自己正在改哪个字）。`None` = 平台没有提供该信息（Linux 当前
-        /// 不提供，或本次更新只改了文本）——文本层退化为「插入点在末尾」。
+        /// 三平台的来源与单位：
+        /// - Win32：`ImmGetCompositionStringW(.., GCS_CURSORPOS, ..)`（本身就是 UTF-16 码元）；
+        /// - macOS：`setMarkedText:selectedRange:replacementRange:` 的 `selectedRange.location`
+        ///   （UTF-16 码元）；
+        /// - Wayland：`zwp_text_input_v3.preedit_string` 的 `cursor_begin`（协议单位是**字节**，
+        ///   平台层已换算成 UTF-16 码元）。
+        ///
+        /// 用户用 ←/→/Home/End 在拼音串里改字时，插入点停在串中间，文本层必须按它画插入点
+        /// （否则光标恒在末尾，用户看不到自己正在改哪个字）。
+        ///
+        /// `None` = 本次更新没有该信息：Win32 消息没带 `GCS_CURSORPOS`、macOS 没给选区、
+        /// Wayland 的 `cursor_begin`/`cursor_end` 都是 `-1`（协议用「隐藏光标」表达「不要在串内
+        /// 画插入点」——引擎没有这个状态，统一退化为下面这条）。文本层在 `None` 时把插入点画在
+        /// 末尾。
         caret: Option<u32>,
         /// 组合串内需要**高亮/区分**的子句区间（UTF-16 码元，相对 `text` 起点，按起点升序、
         /// 互不重叠、全部落在 `0..=len`）。
         ///
-        /// Win32 来源是 `GCS_COMPATTR`（每码元一个属性字节）与 `GCS_COMPCLAUSE`（子句边界）：
-        /// 引擎只交付「非 `ATTR_INPUT` 的那几段」，也就是已转换 / 转换中 / 已固定的子句 ——
+        /// 来源：
+        /// - Win32：`GCS_COMPATTR`（每码元一个属性字节）与 `GCS_COMPCLAUSE`（子句边界），引擎
+        ///   只交付「非 `ATTR_INPUT` 的那几段」——已转换 / 转换中 / 已固定的子句；
+        /// - Wayland：`preedit_string` 的 `cursor_begin != cursor_end`（协议：两者不同时客户端
+        ///   可以表示成文本高亮），换算成码元后的单个区间；
+        /// - macOS：不提供（空）。
+        ///
         /// 文本层据此画下划线/加粗，与原生输入法控件观感一致（日文 IME 的按子句跳转也依赖它）。
         /// 空 = 没有子句信息（整串都还在输入中，或平台不提供）。
         clauses: SmallVec<[Range<usize>; 4]>,
@@ -1736,6 +1774,7 @@ mod tests {
 ///
 /// 这两个规则是**跨后端契约**（macOS 的 `NSEventPhase`、Windows `WM_GESTURE`、Wayland 的
 /// gesture 协议都要落到同一套枚举上），因此单独成块钉死，不随 `tests` 里的交互用例漂移。
+/// 归一化是纯函数，与「哪个后端真的产出手势」无关 —— 当前只有 macOS 后端接线（AR1b P3-5）。
 #[cfg(test)]
 mod gesture_tests {
     use std::time::Instant;

@@ -1,6 +1,13 @@
-//! 帧录制：上传写槽 → clear / scissor pass 绘制 → copy 到 back buffer → 提交
+//! 帧录制：上传写槽 → clear / scissor pass 绘制 → （必要时）copy 到 back buffer → 提交
 //! （`FrameRecorder::record`、`submit_recorded`、`prime_detached` 的实现体）。
-//! 实现体由 `compositor.rs` 的薄委托调用（零行为变更的结构拆分）。
+//!
+//! 本帧的绘制模式由 [`super::plan::frame_draw`] 决定（R08-8）：
+//! - `Direct`：整帧**直接画进 back buffer** 并整面 present —— 零拷贝；
+//! - `Full`：整帧画进 persist 再整块拷贝（离屏 / 快照目标，没有 back buffer）；
+//! - `Incremental`：局部画进 persist，按 [`super::plan::BufferSyncs`] 记账只拷矩形。
+//!
+//! damage 在**本模块入口**夹紧到当前内容矩形（R08-10 的后端二次防御），夹紧后的同一份集合
+//! 同时用于 scissor / copy / `Present1` —— 三个消费点不再各自从 `FramePlan` 重取。
 
 use std::{sync::Arc, time::Instant};
 
@@ -10,25 +17,31 @@ use windows::Win32::{
 };
 
 use super::{
-    FrameRecorder, GpuRenderer, Persist, PresentTarget, PrimePersist,
-    plan::{copy_content, copy_to_back},
+    FrameRecorder, GpuRenderer, RecordedFrame,
+    plan::{
+        self, BufferSyncs, CopyExtent, FrameDraw, TargetState, clamp_damage, copy_to_back,
+        transition,
+    },
     timings::elapsed_ns,
 };
 use crate::{
     error::EngineError,
     paint::{
         atlas::AtlasKind,
-        instance::{FrameOp, GeometryDrawGpu},
+        geometry::GeometryPipeline,
+        instance::{FrameOp, GeometryDrawGpu, PhysicalBounds},
     },
     render::{
         RenderStats,
-        compositor::{FramePlan, Plan},
+        compositor::{DamageRects, FramePlan, MAX_DRAW_PASSES, Plan},
         frame::{FramePayload, FrameSlot},
         retire::GpuResourceHandle,
         timer::{FrameTimings, GpuTimerSample, Section},
         uniform::{ROOT_UNIFORM_DWORDS, RootUniform},
         windows::{
             device::SharedGpu,
+            diagnostics,
+            hresult::PresentOutcome,
             pipeline::{GeometryRegistry, Pipeline, SrvHeap},
             swapchain::Swapchain,
         },
@@ -36,78 +49,110 @@ use crate::{
     window::FrameIndex,
 };
 
+/// `RootUniform` 里帧级常量的 dword 数（`frame @0`，32 B；R08-30）。
+const FRAME_DWORDS: usize = 8;
+
 /// 消费者：`GpuRenderer::prime_detached`（`compositor.rs` 的薄委托）。
-/// 把一帧背景色 prime 进 `swapchain`（全量 clear + 等 GPU fence），**不碰 visual**。
 ///
-/// 用于新交换链的第一次 present：组合交换链的第一次 present 必须是全量
-/// （`DirtyRectsCount = 0`），而 `WS_EX_NOREDIRECTIONBITMAP` 的客户区在第一次 present 之前
-/// 完全透明。`new_for_composition` / `grow` / `maybe_shrink` / `refresh_background` 必须在
-/// `SetContent` **之前**调用本方法：已 attach 但从未 present 的交换链在合成器里是透明的，
-/// 若先 `SetContent` + `Commit` 再 prime，中间一次 DWM 合成就会露出桌面（P1-B）。这里用显式
-/// 的 `swapchain` / `persist` / `buffer` / `content`，而不是 `renderer.swapchain`（它可能还是旧的）。
+/// 把一条**还没挂到 visual 上**的交换链 prime 成背景色：clear 整块 back buffer + `Present1`
+/// 整面，等 GPU 完成。用于：首建（内容层 + 1×1 背景层）、`ResizeBuffers` 失败后的回退重建、
+/// 背景色变化时换掉 1×1 背景层。
 ///
-/// 背景层的 1×1 交换链也走这里（`persist = PrimePersist::Background`、
-/// `buffer = content = (1, 1)`）：prime 只 clear 那块独立的 1×1 持久目标，再 copy 左上角
-/// 1×1 —— 拷到的必然是背景色，主持久目标一个像素都不碰。
+/// `WS_EX_NOREDIRECTIONBITMAP` 的客户区在第一次 present 之前完全透明，而「已 attach 但从未
+/// present」的交换链在合成器里也是透明的：所以必须**先** prime、**后** `SetContent` + `Commit`。
 ///
-/// `source` 是缩容 prime 的内容来源（旧主持久目标），在 clear 之后、绘制之前把
-/// `(0, 0, content)` 拷进新目标的左上角；其余 prime 为 `None`。
-///
-/// `sync = 0`：prime 不是用户可见帧，不值得等 vsync —— 但**必须**等这一帧的队列 fence
-/// （P2-1）：`Present1` 返回只是 CPU 侧入队，`ShowWindow` / 后续帧的 waitable 之前必须有
-/// 已完成的合成内容。
+/// prime 走**正常的 `Direct` 直绘路径**（`FramePayload::empty()` + `Plan::Full`）：clear 整块
+/// back buffer 后整面 present，不再借主持久目标 —— 1×1 背景层因此不需要自己的持久目标，
+/// `grow` 那套「prime 用的临时持久目标」也不再存在。`sync = 0`：prime 不是用户可见帧，不值得
+/// 等 vsync。
 pub(super) fn prime_detached(
     renderer: &mut GpuRenderer,
     swapchain: &mut Swapchain,
-    buffer: (u32, u32),
-    content: (u32, u32),
-    persist: PrimePersist,
-    source: Option<&Persist>,
 ) -> Result<(), EngineError> {
     let slot = renderer.stream.acquire_slot();
-    renderer
+    if !renderer
         .stream
         .wait_slot_fence(slot.wait_value)
+        .map_err(|error| renderer.classify(error))?
+        .is_signaled()
+    {
+        return Err(EngineError::AppInit {
+            detail: smol_str::SmolStr::new_static(
+                "prime requires an idle frame slot (device healthy but GPU did not respond)",
+            ),
+        });
+    }
+    renderer
+        .stream
+        .reset_slot(slot)
         .map_err(|error| renderer.classify(error))?;
+    // 空载荷：prime 只 clear + present，不画任何图元（也**不**消费图集上传路径）。
     let payload = FramePayload::empty();
     let mut frame = FramePlan::new(Plan::Full, true);
     let mut timings = FrameTimings::new();
-    // prime 不是内容帧：不要让它把 `last_index`（retire 的 tag）推回 `FrameIndex::default()`。
-    // `grow` / `maybe_shrink` 已经在 prime 之前取好 `retired_index`；背景层刷新则发生在帧
-    // 之间，两者都不该改变「最后一次内容帧」的记账。
-    let last_index = renderer.last_index;
-    renderer.submit_recorded(
-        slot,
-        FrameIndex::default(),
-        &payload,
-        &mut frame,
-        &mut timings,
-        PresentTarget::Detached {
-            swapchain,
-            buffer,
-            content,
-            persist,
-            source,
-        },
-    )?;
-    renderer.last_index = last_index;
-    swapchain
-        .present1(&mut frame, 0, content)
-        .map_err(|error| renderer.classify(error))?;
-    // 等到本帧的 GPU 工作完成（`FrameSlot::signal_value`），不是 `Present1` 的 CPU 返回。
+    let mut target = TargetState::Fresh;
+    let mut syncs = BufferSyncs::new();
+    let mut buckets = OpBuckets::new();
+    let shared = Arc::clone(&renderer.shared);
+    let atlas = shared.atlas();
+    let recorded = {
+        let mut recorder = FrameRecorder {
+            shared: &shared,
+            stream: &mut renderer.stream,
+            pipeline: shared.pipeline(),
+            descriptors: &renderer.descriptors,
+            atlas: &atlas,
+            atlas_uploads: &mut renderer.atlas_uploads,
+            persist: &renderer.persist,
+            upload: &mut renderer.upload,
+            geometry: &mut renderer.geometry,
+            timer: None,
+            swapchain: Some(swapchain),
+            clear_color: renderer.clear_color,
+            content: swapchain.buffer(),
+            scale: renderer.scale,
+            target: &mut target,
+            syncs: &mut syncs,
+            buckets: &mut buckets,
+            prime: true,
+        };
+        recorder.record(
+            slot,
+            FrameIndex::default(),
+            &payload,
+            &mut frame,
+            &mut timings,
+            Instant::now(),
+        )?
+    };
     renderer
         .stream
-        .wait_slot_fence(slot.signal_value)
+        .submit(FrameIndex::default(), slot)
         .map_err(|error| renderer.classify(error))?;
+    match swapchain.present1(recorded.present.as_ref(), 0) {
+        PresentOutcome::Presented | PresentOutcome::Clipped | PresentOutcome::Occluded => {}
+        other => {
+            return Err(EngineError::Swapchain {
+                detail: smol_str::format_smolstr!("prime Present1: {other:?}"),
+            });
+        }
+    }
+    if !renderer
+        .stream
+        .wait_slot_fence(slot.signal_value)
+        .map_err(|error| renderer.classify(error))?
+        .is_signaled()
+    {
+        return Err(EngineError::Swapchain {
+            detail: smol_str::SmolStr::new_static(
+                "prime Present1 did not complete (device healthy but GPU did not respond)",
+            ),
+        });
+    }
     Ok(())
 }
-
 /// 消费者：`GpuRenderer::submit_recorded`（`compositor.rs` 的薄委托）。
 /// 录制 + 提交一帧（不呈现、不等完成）。调用方先取槽并等该槽上一帧完成（§6.5）。
-///
-/// `target` 决定录制的呈现目标：常规帧用自己的交换链；`prime_detached` 用**还没挂到
-/// visual 上**的新交换链 + 显式持久目标（grow / 缩容 prime 用主持久目标，背景层 prime 用
-/// 1×1 背景持久目标）。
 ///
 /// 共享图集的页对齐在录制之前完成：**图集读锁**在整个录制 + 提交区间内持有（共享页在帧内
 /// 不会变；别的窗口的页重建是写锁，会等本帧提交完）。发现待上传页与共享页不一致时先释放
@@ -119,8 +164,7 @@ pub(super) fn submit_recorded(
     payload: &FramePayload,
     frame: &mut FramePlan,
     timings: &mut FrameTimings,
-    target: PresentTarget<'_>,
-) -> Result<(RenderStats, FrameSlot), EngineError> {
+) -> Result<(RecordedFrame, FrameSlot), EngineError> {
     if let Some(error) = renderer.shared.lost_error() {
         return Err(error);
     }
@@ -147,9 +191,11 @@ pub(super) fn submit_recorded(
             continue;
         }
         // staging 对齐到共享页（第一次上传 / 页换代之后整组重建本窗口的 staging）。
+        // 被换下来的旧 staging 句柄必须走 retire（R08-2：D3D12 不替应用保活命令列表引用）。
+        let mut staging_retired: Vec<GpuResourceHandle> = Vec::new();
         renderer
             .atlas_uploads
-            .sync_staging(&shared, &atlas)
+            .sync_staging(&shared, &atlas, &mut staging_retired)
             .map_err(|error| renderer.classify(error))?;
 
         renderer
@@ -157,38 +203,8 @@ pub(super) fn submit_recorded(
             .reset_slot(slot)
             .map_err(|error| renderer.classify(error))?;
 
-        let stats = {
-            let (swapchain, buffer, content, timer, persist, source) = match target {
-                PresentTarget::Own => (
-                    renderer.swapchain.as_ref(),
-                    renderer.buffer,
-                    renderer.surface,
-                    renderer.timer.as_ref(),
-                    &renderer.persist,
-                    None,
-                ),
-                PresentTarget::Detached {
-                    swapchain,
-                    buffer,
-                    content,
-                    persist,
-                    source,
-                } => {
-                    let persist = match persist {
-                        PrimePersist::Main => &renderer.persist,
-                        PrimePersist::Background => renderer
-                            .background_persist
-                            .as_ref()
-                            .ok_or_else(|| EngineError::Composition {
-                                detail: smol_str::SmolStr::new_static(
-                                    "background prime without a 1x1 background persist",
-                                ),
-                            })?,
-                    };
-                    (Some(swapchain), buffer, content, None, persist, source)
-                }
-            };
-            // 借用拆分：录制只碰这些字段，`buffer` / `surface` / `fresh` / `last_index` 留在外层。
+        let recorded = {
+            let swapchain = renderer.swapchain.as_ref();
             let mut recorder = FrameRecorder {
                 shared: &shared,
                 stream: &mut renderer.stream,
@@ -196,16 +212,18 @@ pub(super) fn submit_recorded(
                 descriptors: &renderer.descriptors,
                 atlas: &atlas,
                 atlas_uploads: &mut renderer.atlas_uploads,
-                persist,
+                persist: &renderer.persist,
                 upload: &mut renderer.upload,
                 geometry: &mut renderer.geometry,
-                timer,
+                timer: renderer.timer.as_ref(),
                 swapchain,
-                source,
                 clear_color: renderer.clear_color,
-                buffer,
-                content,
+                content: renderer.surface,
                 scale: renderer.scale,
+                target: &mut renderer.target,
+                syncs: &mut renderer.buffer_syncs,
+                buckets: &mut renderer.op_buckets,
+                prime: false,
             };
             recorder.record(slot, index, payload, frame, timings, frame_started)
         }
@@ -216,12 +234,15 @@ pub(super) fn submit_recorded(
             .submit(index, slot)
             .map_err(|error| renderer.classify(error))?;
         renderer.last_index = index;
-        return Ok((stats, slot));
+        for handle in staging_retired {
+            renderer.stream.retire(index, handle);
+        }
+        return Ok((recorded, slot));
     }
 }
 
 /// 消费者：`FrameRecorder::record`（`compositor.rs` 的薄委托）。
-/// 上传 + 图集 + clear/scissor 绘制 + copy 到 back buffer + 计时（不提交）。
+/// 上传 + 图集 + 绘制（直绘 / persist）+ copy + 计时（不提交）。
 pub(super) fn record(
     recorder: &mut FrameRecorder<'_>,
     slot: FrameSlot,
@@ -230,25 +251,32 @@ pub(super) fn record(
     frame: &mut FramePlan,
     timings: &mut FrameTimings,
     frame_started: Instant,
-) -> Result<RenderStats, EngineError> {
-    let (instance_count, clip_count) = recorder.upload.write(
-        recorder.shared,
-        recorder.stream,
-        index,
-        slot.index,
-        payload.instances(),
-        payload.clips(),
-    )?;
+) -> Result<RecordedFrame, EngineError> {
+    // prime 帧（`FramePayload::empty()`）不画任何图元：不写上传缓冲、也不碰图集上传路径
+    // （prime 与图集页换代的 retire 记账不能混在一起）。
+    let (instance_count, _clip_count) = if recorder.prime {
+        (0, 0)
+    } else {
+        let written = recorder.upload.write(
+            recorder.shared,
+            recorder.stream,
+            index,
+            slot.index,
+            payload.instances(),
+            payload.clips(),
+        )?;
+        recorder.shared.srv_heap().write_slot(
+            recorder.shared.raw(),
+            recorder.descriptors.base(),
+            slot.index,
+            recorder.upload.slot(slot.index).instances(),
+            written.0,
+            recorder.upload.slot(slot.index).clips(),
+            written.1,
+        );
+        written
+    };
     let srv_heap = recorder.shared.srv_heap();
-    srv_heap.write_slot(
-        recorder.shared.raw(),
-        recorder.descriptors.base(),
-        slot.index,
-        recorder.upload.slot(slot.index).instances(),
-        instance_count,
-        recorder.upload.slot(slot.index).clips(),
-        clip_count,
-    );
     timings.push(GpuTimerSample {
         section: Section::Upload,
         cpu_ns: elapsed_ns(frame_started),
@@ -260,141 +288,246 @@ pub(super) fn record(
         recorder.content.1 as f32,
         recorder.scale,
     );
-    let full = frame.is_full();
+    let content = recorder.content;
+    // R08-11：窗口路径上 `FramePlan` 的 fresh 必须与 `TargetState` 同源（唯一状态源的不变量；
+    // 离屏 / 快照路径由调用方显式构造计划，fresh 只影响这里已经不再使用的 present 语义）。
+    debug_assert!(
+        recorder.swapchain.is_none() || frame.is_fresh() == recorder.target.is_fresh(),
+        "FramePlan::fresh must be derived from TargetState (R08-11)"
+    );
+    // R08-10：damage 在这里**夹紧到当前内容**，之后 scissor / copy / present 共用同一份集合。
+    // 夹紧之后没有可画矩形的局部帧**升级为整帧**（不是错误：旧 surface 的 damage 对新 surface
+    // 没有意义，而这一帧的可见区域必然有变化）。
+    let damage = clamp_damage(frame.present_dirty().as_ref(), content);
+    let draw = if plan::requires_full_draw(*frame, damage.as_ref()) {
+        plan::frame_draw(*recorder.target, Plan::Full, recorder.swapchain.is_some())
+    } else {
+        plan::frame_draw(*recorder.target, frame.plan(), recorder.swapchain.is_some())
+    };
     let scissor_whole = RECT {
         left: 0,
         top: 0,
-        right: recorder.content.0 as i32,
-        bottom: recorder.content.1 as i32,
+        right: content.0 as i32,
+        bottom: content.1 as i32,
     };
-    // 几何绘制的下标表与 ops 同帧：`FrameOp::Geometry.index` 只有配合同一帧的表才有意义。
     let mut draw_calls = 0u32;
-    // staging 扩容造成的旧句柄：录制块结束后再 retire（`list` 借用 `recorder.stream`）。
+    // staging 扩容 / 页换代造成的旧句柄：录制块结束后再 retire（`list` 借用 `recorder.stream`）。
     let atlas_retired: Vec<GpuResourceHandle>;
     // 几何换代（槽位复用）产生的旧缓冲句柄，同样在录制块结束后 retire。
     let mut geometry_retired: Vec<GpuResourceHandle> = Vec::new();
     // 推进几何 registry 的帧号：`ensure` 记录 last_used，帧末 `retain_recent` 驱逐
     // 长期未绘制的几何（D-1：否则应用释放句柄后 GPU 缓冲永不回收）。
-    recorder.geometry.begin_frame();
+    if !recorder.prime {
+        recorder.geometry.begin_frame();
+    }
+    let present;
     {
         let list = recorder.stream.list(slot);
         if let Some(timer) = recorder.timer {
             timer.begin(list, slot.index);
         }
-        atlas_retired = recorder.atlas_uploads.record_uploads(
-            recorder.shared,
-            recorder.atlas,
-            list,
-            slot.index,
-        )?;
-        if full {
-            // `fresh`（交换链刚建好 / prime）必须清整块 buffer：prime 之后、UI 把内容 clip
-            // 更新到新尺寸之前，visual 的 clip 可能仍指向旧内容（P1-A 保证它 ≤ 新 buffer），
-            // 只有整块背景色能保证那一帧既不是桌面、也不是未定义像素（P1-B）。
-            // 普通全量帧只清内容矩形：buffer 的其余部分永远不可见（copy / present dirty 都
-            // 夹在内容子矩形内），省掉大 buffer 的全量 clear 带宽。
-            let content_rect = [RECT {
-                left: 0,
-                top: 0,
-                right: recorder.content.0 as i32,
-                bottom: recorder.content.1 as i32,
-            }];
-            let rects = if frame.is_fresh() {
-                None
-            } else {
-                Some(content_rect.as_slice())
-            };
-            // SAFETY: 目标 RT 处于 `RENDER_TARGET`（本帧未拷贝到 swapchain 时恒如此）；
-            // `rects` 在调用期间存活且落在 buffer 内（内容 ≤ buffer）。
-            unsafe {
-                list.ClearRenderTargetView(recorder.persist.rtv, &recorder.clear_color, rects)
-            };
-        }
-        // 缩容 prime：新目标整块已经 clear 成背景色（内容之外不可见），把旧目标的内容原样
-        // 拷进左上角；此后这一帧的绘制 / copy 都发生在新目标上。源目标仍是 `RENDER_TARGET`。
-        if let Some(source) = recorder.source {
-            debug_assert!(
-                full && frame.is_fresh(),
-                "a source-copy prime is a fresh full frame"
-            );
-            copy_content(list, source, recorder.persist, recorder.content);
-        }
-        bind_frame(
-            list,
-            recorder.pipeline,
-            srv_heap,
-            recorder.descriptors.base(),
-            recorder.persist,
-            slot.index,
-            root,
-            recorder.content,
-        );
-        match full {
-            true => {
+        atlas_retired = if recorder.prime {
+            Vec::new()
+        } else {
+            recorder.atlas_uploads.record_uploads(
+                recorder.shared,
+                recorder.atlas,
+                list,
+                slot.index,
+            )?
+        };
+        match draw {
+            FrameDraw::Direct => {
+                // 整帧直绘当前 back buffer：**零拷贝**（R08-8）。
+                let swapchain = recorder.swapchain.ok_or_else(|| EngineError::Swapchain {
+                    detail: smol_str::SmolStr::new_static(
+                        "direct draw requires a composition swapchain",
+                    ),
+                })?;
+                let (buffer_index, back) = swapchain.back_buffer()?;
+                transition(
+                    list,
+                    &back,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                );
+                let rtv = swapchain.rtv(buffer_index);
+                // 整块 buffer 清成背景色（present 是整面，内容之外的像素也必须有定义）。
+                // SAFETY: back buffer 处于 RENDER_TARGET；RTV 由交换链持有且在容量内。
+                unsafe { list.ClearRenderTargetView(rtv, &recorder.clear_color, None) };
+                bind_frame(
+                    list,
+                    recorder.pipeline,
+                    srv_heap,
+                    recorder.descriptors.base(),
+                    rtv,
+                    slot.index,
+                    root,
+                    content,
+                );
+                // SAFETY: 视口 / RTV 由本帧持有；矩形在内容内。
+                unsafe { list.RSSetScissorRects(&[scissor_whole]) };
                 draw_calls = draw_ops(
                     list,
                     recorder.pipeline,
                     payload.ops(),
+                    None,
                     recorder.geometry,
                     recorder.shared,
                     &mut geometry_retired,
                     payload,
                     root,
                     scissor_whole,
-                )?;
+                )?
+                .0;
+                transition(
+                    list,
+                    &back,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                );
+                // 直绘之后 persist 内容过期；全部 buffer 的同步记账作废（下次整帧重画）。
+                recorder.target.on_direct_draw();
+                recorder.syncs.invalidate();
+                present = None;
             }
-            false => {
-                if let Plan::Partial(damage) = frame.plan() {
-                    for rect in damage.as_slice() {
-                        let scissor = RECT {
-                            left: rect.x0,
-                            top: rect.y0,
-                            right: rect.x1,
-                            bottom: rect.y1,
-                        };
-                        // SAFETY: RTV / 视口 / 矩形由本帧持有，调用期间有效。
-                        unsafe { list.RSSetScissorRects(&[scissor]) };
-                        draw_calls = draw_calls.saturating_add(draw_ops(
+            FrameDraw::Full => {
+                // 整帧画进 persist，再整块拷贝（离屏 / 快照目标；交换链路径上的「persist 过期」
+                // 场景已经在 `frame_draw` 里改走直绘）。
+                let content_rect = [RECT {
+                    left: 0,
+                    top: 0,
+                    right: content.0 as i32,
+                    bottom: content.1 as i32,
+                }];
+                // SAFETY: 目标 RT 处于 `RENDER_TARGET`；`content_rect` 落在 buffer 内。
+                unsafe {
+                    list.ClearRenderTargetView(
+                        recorder.persist.rtv,
+                        &recorder.clear_color,
+                        Some(&content_rect),
+                    )
+                };
+                bind_frame(
+                    list,
+                    recorder.pipeline,
+                    srv_heap,
+                    recorder.descriptors.base(),
+                    recorder.persist.rtv,
+                    slot.index,
+                    root,
+                    content,
+                );
+                // SAFETY: 视口 / RTV 由本帧持有；矩形在内容内。
+                unsafe { list.RSSetScissorRects(&[scissor_whole]) };
+                draw_calls = draw_ops(
+                    list,
+                    recorder.pipeline,
+                    payload.ops(),
+                    None,
+                    recorder.geometry,
+                    recorder.shared,
+                    &mut geometry_retired,
+                    payload,
+                    root,
+                    scissor_whole,
+                )?
+                .0;
+                if let Some(swapchain) = recorder.swapchain {
+                    let (buffer_index, back) = swapchain.back_buffer()?;
+                    copy_to_back(list, recorder.persist, &back, CopyExtent::Full)?;
+                    // 当前 buffer 与 persist 一致；其余 buffer 错过了整帧（下一次整块拷）。
+                    let _ = recorder.syncs.take_copy(buffer_index, None, content);
+                    recorder.syncs.record_missed_others(buffer_index, None);
+                } else {
+                    recorder.syncs.invalidate();
+                }
+                recorder.target.on_full_persist_draw();
+                present = None;
+            }
+            FrameDraw::Incremental => {
+                // 局部帧：只在 persist 上按 damage scissor 重画，再按 buffer 记账只拷错过的矩形。
+                // `frame_draw` 只在 persist 有效且本帧是**有矩形的**局部帧时返回
+                // `Incremental`；这里取不到集合说明前面的一致性检查被绕过，按契约硬失败。
+                let Some(damage) = damage else {
+                    debug_assert!(false, "incremental frame requires a clamped damage set");
+                    return Err(EngineError::AppInit {
+                        detail: smol_str::SmolStr::new_static(
+                            "incremental frame without a clamped damage set",
+                        ),
+                    });
+                };
+                bind_frame(
+                    list,
+                    recorder.pipeline,
+                    srv_heap,
+                    recorder.descriptors.base(),
+                    recorder.persist.rtv,
+                    slot.index,
+                    root,
+                    content,
+                );
+                recorder.buckets.build(payload.ops(), &damage);
+                for rect in damage.as_slice() {
+                    let scissor = RECT {
+                        left: rect.x0,
+                        top: rect.y0,
+                        right: rect.x1,
+                        bottom: rect.y1,
+                    };
+                    // SAFETY: RTV / 视口 / 矩形由本帧持有，调用期间有效。
+                    unsafe { list.RSSetScissorRects(&[scissor]) };
+                    draw_calls = draw_calls.saturating_add(
+                        draw_ops(
                             list,
                             recorder.pipeline,
                             payload.ops(),
+                            Some(&*recorder.buckets),
                             recorder.geometry,
                             recorder.shared,
                             &mut geometry_retired,
                             payload,
                             root,
                             scissor,
-                        )?);
-                    }
+                        )?
+                        .0,
+                    );
                 }
+                diagnostics::op_visits(recorder.buckets.visits, recorder.buckets.budget);
+                if let Some(swapchain) = recorder.swapchain {
+                    let (buffer_index, back) = swapchain.back_buffer()?;
+                    let extent = recorder
+                        .syncs
+                        .take_copy(buffer_index, Some(&damage), content);
+                    copy_to_back(list, recorder.persist, &back, extent)?;
+                    recorder
+                        .syncs
+                        .record_missed_others(buffer_index, Some(&damage));
+                }
+                present = Some(damage);
             }
-        }
-        if let Some(swapchain) = recorder.swapchain {
-            copy_to_back(
-                list,
-                recorder.persist,
-                swapchain,
-                *frame,
-                recorder.buffer,
-                recorder.content,
-            )?;
         }
         if let Some(timer) = recorder.timer {
             timer.end(list, slot.index);
         }
     }
     // 录制完成后驱逐长期未绘制的几何（设备对象进同一个 retire 列表）。
-    recorder.geometry.retain_recent(&mut geometry_retired);
-    for handle in atlas_retired {
-        recorder.stream.retire(index, handle);
-    }
-    for handle in geometry_retired {
-        recorder.stream.retire(index, handle);
+    if !recorder.prime {
+        recorder.geometry.retain_recent(&mut geometry_retired);
+        for handle in atlas_retired {
+            recorder.stream.retire(index, handle);
+        }
+        for handle in geometry_retired {
+            recorder.stream.retire(index, handle);
+        }
     }
 
-    Ok(RenderStats {
-        draw_calls,
-        instances: instance_count,
+    Ok(RecordedFrame {
+        stats: RenderStats {
+            draw_calls,
+            instances: instance_count,
+        },
+        present,
     })
 }
 
@@ -404,7 +537,7 @@ pub(super) fn bind_frame(
     pipeline: &Pipeline,
     srv_heap: &SrvHeap,
     descriptor_base: u32,
-    persist: &Persist,
+    rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
     slot: usize,
     root: RootUniform,
     content: (u32, u32),
@@ -422,7 +555,7 @@ pub(super) fn bind_frame(
         );
         list.SetGraphicsRootDescriptorTable(1, srv_heap.slot_table(descriptor_base, slot));
         list.SetGraphicsRootDescriptorTable(2, srv_heap.atlas_table());
-        list.OMSetRenderTargets(1, Some(&persist.rtv), false, None);
+        list.OMSetRenderTargets(1, Some(&rtv), false, None);
         // 视口 = **内容**尺寸（不是 buffer）：Ndc 坐标由 root uniform 的内容尺寸给出，
         // 两者必须是同一个矩形，否则内容会被拉伸到整块 buffer 上。
         list.RSSetViewports(&[D3D12_VIEWPORT {
@@ -436,28 +569,118 @@ pub(super) fn bind_frame(
     }
 }
 
+/// 已绑定的 PSO（quad 与三种 geometry 管线互不相同，不能用 `GeometryPipeline::Ui` 冒充 quad）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PsoTag {
+    Quad,
+    Geometry(GeometryPipeline),
+}
+
+/// 一帧的 op 分桶缓存（R08-13）：按 damage 矩形把 op 下标分组，复用 `Vec` 容量。
+///
+/// 旧实现对每个 damage 矩形重放**整份** op 列表，实测让增量帧（288 µs）比全量帧（222 µs）
+/// 更慢。这里在每帧录制时做一次「op × 矩形」相交（512 × ≤4 次整数比较，微秒级），之后每个
+/// 矩形的绘制只遍历命中项 —— 局部帧遍历次数从 `ops × passes` 降到「命中 op 数」。
+#[derive(Default)]
+pub(super) struct OpBuckets {
+    buckets: Vec<(PhysicalBounds, Vec<u32>)>,
+    /// 本帧实际会遍历的 op 数（诊断指标 `op_visits`）。
+    visits: u32,
+    /// 整份重放会遍历的数量（`ops.len() × passes`，诊断指标 `op_replay_budget`）。
+    budget: u32,
+}
+
+impl OpBuckets {
+    pub(super) fn new() -> Self {
+        Self {
+            buckets: Vec::with_capacity(MAX_DRAW_PASSES),
+            visits: 0,
+            budget: 0,
+        }
+    }
+
+    /// 按本帧的（已夹紧）damage 重建分桶。`rects` 最多 `MAX_DRAW_PASSES` 个。
+    ///
+    /// 内层 `Vec` 跨帧保留容量（稳态零分配）：每帧只做「op × 矩形」整数相交。
+    fn build(&mut self, ops: &[FrameOp], damage: &DamageRects) {
+        let rects = damage.as_slice();
+        self.buckets.truncate(rects.len());
+        self.buckets
+            .resize_with(rects.len(), || (PhysicalBounds::EMPTY, Vec::new()));
+        self.visits = 0;
+        for (slot, rect) in self.buckets.iter_mut().zip(rects) {
+            let extent = [rect.x0, rect.y0, rect.x1, rect.y1];
+            slot.0 = PhysicalBounds {
+                x0: rect.x0,
+                y0: rect.y0,
+                x1: rect.x1,
+                y1: rect.y1,
+            };
+            slot.1.clear();
+            for (index, op) in ops.iter().enumerate() {
+                if op.bounds().intersects(extent) {
+                    slot.1.push(index as u32);
+                }
+            }
+            self.visits = self.visits.saturating_add(slot.1.len() as u32);
+        }
+        self.budget = (ops.len().saturating_mul(rects.len())) as u32;
+    }
+
+    /// 本帧某个 damage 矩形的命中 op 下标（`None` = 没有分桶，退化为整份列表）。
+    fn hits(&self, scissor: RECT) -> Option<&[u32]> {
+        self.buckets
+            .iter()
+            .find(|(bounds, _)| {
+                bounds.x0 == scissor.left
+                    && bounds.y0 == scissor.top
+                    && bounds.x1 == scissor.right
+                    && bounds.y1 == scissor.bottom
+            })
+            .map(|(_, bucket)| bucket.as_slice())
+    }
+}
+
 /// 消费者：`FrameRecorder::record`。
+///
+/// `buckets = Some` 时只遍历该 scissor 对应的命中 op（局部帧）；`None` 时遍历整份列表。
+/// 返回 `(draw_calls, visited)`。
 pub(super) fn draw_ops(
     list: &ID3D12GraphicsCommandList,
     pipeline: &Pipeline,
     ops: &[FrameOp],
+    buckets: Option<&OpBuckets>,
     geometry: &mut GeometryRegistry,
     shared: &SharedGpu,
     retired: &mut Vec<GpuResourceHandle>,
     payload: &FramePayload,
     root: RootUniform,
     scissor: RECT,
-) -> Result<u32, EngineError> {
+) -> Result<(u32, u32), EngineError> {
     let mut draw_calls = 0u32;
-    // 局部刷新时跳过与 damage 不相交的 op（P1-2.1）：旧实现对每个 damage 矩形重放**整份**
-    // op 列表，实测使增量帧比全量帧更慢（288 µs vs 222 µs）。
-    let scissor_extent = [scissor.left, scissor.top, scissor.right, scissor.bottom];
-    let mut skipped = 0u32;
-    for op in ops {
-        if !op.bounds().intersects(scissor_extent) {
-            skipped = skipped.saturating_add(1);
+    let mut visited = 0u32;
+    // PSO / 拓扑只在变化时重设（R08-28：同一 pass 内的重设是纯命令流开销）。
+    let mut last_pipeline: Option<PsoTag> = None;
+    let mut last_topology: Option<i32> = None;
+    // 命中下标（局部帧，零分配借用）或整份列表（整帧）。
+    let hits = buckets.and_then(|buckets| buckets.hits(scissor));
+    let count = hits.map_or(ops.len(), <[u32]>::len);
+    for position in 0..count {
+        let index = match hits {
+            Some(hits) => hits[position],
+            None => position as u32,
+        };
+        let Some(op) = ops.get(index as usize) else {
+            continue;
+        };
+        // 整帧路径没有分桶：仍然按 scissor 过滤（整帧 scissor = 内容，恒命中）。
+        if !op
+            .bounds()
+            .intersects([scissor.left, scissor.top, scissor.right, scissor.bottom])
+        {
             continue;
         }
+        visited = visited.saturating_add(1);
         match *op {
             FrameOp::Instances { start, len, .. } => {
                 if len == 0 {
@@ -468,15 +691,20 @@ pub(super) fn draw_ops(
                 let uniform = root.with_instance_base(start);
                 // SAFETY: PSO / 根常量 / 拓扑 / scissor 都属于同一条已打开的 list。
                 unsafe {
-                    list.SetPipelineState(pipeline.quad());
+                    if last_pipeline != Some(PsoTag::Quad) {
+                        list.SetPipelineState(pipeline.quad());
+                        last_pipeline = Some(PsoTag::Quad);
+                    }
                     list.SetGraphicsRoot32BitConstants(
                         0,
-                        ROOT_UNIFORM_DWORDS as u32,
-                        uniform.words().as_ptr().cast(),
-                        0,
+                        (ROOT_UNIFORM_DWORDS - FRAME_DWORDS) as u32,
+                        uniform.words()[FRAME_DWORDS..].as_ptr().cast(),
+                        FRAME_DWORDS as u32,
                     );
-                    list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-                    list.RSSetScissorRects(&[scissor]);
+                    if last_topology != Some(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP.0) {
+                        list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+                        last_topology = Some(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP.0);
+                    }
                 }
                 // SAFETY: 4 顶点 TriangleStrip + 实例区间 [0, len) 已在编码期校验；
                 // 段起点由 shader 侧的 `draw.clip.y` 承担。
@@ -484,14 +712,16 @@ pub(super) fn draw_ops(
                 draw_calls = draw_calls.saturating_add(1);
             }
             FrameOp::Geometry {
-                index,
+                index: draw_index,
                 clip_index,
                 clip_rect,
                 ..
             } => {
-                let draw = payload.geometry().get(index as usize).ok_or_else(|| {
+                let draw = payload.geometry().get(draw_index as usize).ok_or_else(|| {
                     EngineError::GeometryRegister {
-                        detail: smol_str::format_smolstr!("geometry op index {index} out of range"),
+                        detail: smol_str::format_smolstr!(
+                            "geometry op index {draw_index} out of range"
+                        ),
                     }
                 })?;
                 // 首次见到该 id（或槽位换代）时现场建缓冲；`desc` 随帧过线。
@@ -500,24 +730,30 @@ pub(super) fn draw_ops(
                 // SAFETY: 顶点/索引缓冲由 `GeometryRegistry` 持有到本帧结束；
                 // `entry.topology()` 与注册时的图元类型一致。
                 unsafe {
-                    list.SetPipelineState(pipeline.geometry(entry.pipeline()));
+                    if last_pipeline != Some(PsoTag::Geometry(entry.pipeline())) {
+                        list.SetPipelineState(pipeline.geometry(entry.pipeline()));
+                        last_pipeline = Some(PsoTag::Geometry(entry.pipeline()));
+                    }
                     list.SetGraphicsRoot32BitConstants(
                         0,
-                        ROOT_UNIFORM_DWORDS as u32,
-                        uniform.words().as_ptr().cast(),
-                        0,
+                        (ROOT_UNIFORM_DWORDS - FRAME_DWORDS) as u32,
+                        uniform.words()[FRAME_DWORDS..].as_ptr().cast(),
+                        FRAME_DWORDS as u32,
                     );
-                    list.IASetPrimitiveTopology(entry.topology());
+                    if last_topology != Some(entry.topology().0) {
+                        list.IASetPrimitiveTopology(entry.topology());
+                        last_topology = Some(entry.topology().0);
+                    }
                     list.IASetVertexBuffers(0, Some(&[entry.vertex()]));
                     list.IASetIndexBuffer(Some(&entry.index()));
-                    list.RSSetScissorRects(&[scissor]);
                     list.DrawIndexedInstanced(entry.index_count(), 1, 0, 0, 0);
                 }
                 draw_calls = draw_calls.saturating_add(1);
             }
         }
     }
-    Ok(draw_calls)
+    // 保存一份空桶缓存（下一帧 `build` 会清空复用）。
+    Ok((draw_calls, visited))
 }
 
 /// 消费者：`FrameRecorder::record`。

@@ -431,7 +431,7 @@ mod tests {
             atlas::DirtyRows,
             macos::{
                 device::Device,
-                queue::Queue,
+                queue::{InFlight, Queue},
                 readback::{Readback, ReadbackImage},
             },
         },
@@ -478,7 +478,7 @@ mod tests {
     #[test]
     fn consecutive_uploads_do_not_share_staging_while_frames_are_in_flight() {
         let mut device = Device::new().expect("metal device");
-        let mut queue = Queue::new(&device).expect("queue");
+        let mut queue = Queue::new(&device, std::sync::Arc::new(InFlight::new())).expect("queue");
         let mut atlas = AtlasTextures::new(&mut device).expect("atlas");
 
         // 第 1 帧：整页上传（新页必须整页，DEVIATIONS F-211），内容全零。

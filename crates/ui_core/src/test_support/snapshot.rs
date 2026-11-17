@@ -118,17 +118,21 @@ pub enum SnapshotScene {
     Image,
     /// 嵌套 clip + 溢出子矩形。
     Clip,
+    /// **分数坐标边界**的矩形 clip（AR2b P1-N1 / P2-N4）：容器边界落在 1/4 像素上，
+    /// 子图元向四边溢出 —— 用来钉住「矩形 clip 吸附到整数物理像素」的取舍方向（roundOut）。
+    ClipSubpixel,
 }
 
 impl SnapshotScene {
     /// 全部场景（golden 唯一性断言用）。
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Shapes,
         Self::Shadow,
         Self::Gradient,
         Self::Colors,
         Self::Image,
         Self::Clip,
+        Self::ClipSubpixel,
     ];
 
     /// 文件名用的稳定 token。
@@ -141,6 +145,7 @@ impl SnapshotScene {
             Self::Colors => "colors",
             Self::Image => "image",
             Self::Clip => "clip",
+            Self::ClipSubpixel => "clip_subpixel",
         }
     }
 
@@ -148,7 +153,9 @@ impl SnapshotScene {
     #[must_use]
     pub fn size(self) -> Size {
         match self {
-            Self::Shapes | Self::Shadow | Self::Gradient | Self::Clip => Size::new(240.0, 160.0),
+            Self::Shapes | Self::Shadow | Self::Gradient | Self::Clip | Self::ClipSubpixel => {
+                Size::new(240.0, 160.0)
+            }
             Self::Colors | Self::Image => Size::new(160.0, 120.0),
         }
     }
@@ -164,6 +171,7 @@ impl SnapshotScene {
             Self::Colors => build_colors(app, root, &palette),
             Self::Image => build_image(app, root, &palette),
             Self::Clip => build_clip(app, root, &palette),
+            Self::ClipSubpixel => build_clip_subpixel(app, root, &palette),
         }
     }
 }
@@ -306,6 +314,18 @@ impl Tolerance {
     /// 逐字节相等。
     pub const EXACT: Self = Self {
         per_channel: 0,
+        max_mismatch_ppm: 0,
+    };
+
+    /// **几何边界** case（`clip` / `clip_subpixel`）的容差：不允许任何不匹配像素（`ppm = 0`）。
+    ///
+    /// 这两个 case 的内容是「平涂色块被裁到某一条像素列 / 行」，边界像素的取舍是 0/1 语义
+    /// （AR2b P1-N1 的越界列正是这种像素）。默认的比例容差（0.1% ⇒ 240×160 允许 **38 px**）
+    /// 对它们毫无检测力：整列 20 px 的越界只占 0.05%，会被静默放过；`ppm = 0` 让任何单像素
+    /// 越界/漏裁都立刻变红。`per_channel` 仍是 2：它只吸收三平台 sRGB 量化的 1 级差
+    /// （跨设备不可比性由「各端只跟自己的基线比」保证，见 `tests/golden/README.md`）。
+    pub const GEOMETRY: Self = Self {
+        per_channel: 2,
         max_mismatch_ppm: 0,
     };
 
@@ -1107,6 +1127,45 @@ fn build_clip(app: &mut TestApp, root: NodeId, palette: &Palette) {
     );
 }
 
+/// 分数坐标边界的矩形 clip 场景（AR2b P1-N1 / P2-N4）。
+///
+/// 容器盒是逻辑 `(24.25, 20.5, 132.25, 76.25)`（scale 1 ⇒ 物理同值），右/下边界落在 **1/4 与
+/// 1/2 像素**上；子图元向四边溢出（逻辑框远大于容器），因此可见区域完全由矩形 clip 决定。
+///
+/// 期望（`roundOut` 向外吸附）：`lo = (floor(24.25), floor(20.5)) = (24, 20)`、
+/// `hi = (ceil(156.5), ceil(96.75)) = (157, 97)` ⇒ **ink 恰好覆盖像素列 24..=156、行 20..=96**。
+///
+/// 这个场景专门抓四类回归（都要求**逐像素 0 容差**，见 [`Tolerance::GEOMETRY`]）：
+/// 1. 矩形 clip 没有吸附（仍拿浮点边界做判定）⇒ 边界列随驱动翻面；
+/// 2. 吸附方向错（向内 / trunc / round）⇒ 左右边界各差 1 列、上下各差 1 行；
+/// 3. scissor 被当成 AA（覆盖率不再是 0/1）⇒ 边界列变成混色而不是平涂 ink；
+/// 4. 容器盒子自己不再裁剪子树（越界可见）⇒ 整块 ink 铺满画布。
+///
+/// 场景里**没有任何 AA 边缘**（子图元自己的边远在画布外），因此这三份 golden 在三平台上
+/// 逐像素一致（只有画布右下角属于 backdrop quad 自身的 AA，见 README「跨设备不可比」）。
+fn build_clip_subpixel(app: &mut TestApp, root: NodeId, palette: &Palette) {
+    build_backdrop(app, root, palette);
+    // 容器自身不画背景：场景里唯一的半透明来源就只剩 backdrop quad 的画布角。
+    let outer = style_node(
+        app,
+        root,
+        "clip.subpixel.outer",
+        abs_style(Rect::new(24.25, 20.5, 132.25, 76.25), Clip::Bounds),
+        PaintSpec::default(),
+    );
+    // 溢出子矩形：四边都越过容器（逻辑框 (-40,-30) 400×300）。
+    box_node(
+        app,
+        outer,
+        "clip.subpixel.overflow",
+        Rect::new(-40.0, -30.0, 400.0, 300.0),
+        PaintSpec {
+            background: palette.ink,
+            ..PaintSpec::default()
+        },
+    );
+}
+
 /// 16×16 的合成 PNG（四象限 alpha = 255/170/85/0），供 `Image` 场景走真实解码链路。
 fn snapshot_png() -> Vec<u8> {
     let mut pixels = Vec::with_capacity(16 * 16 * 4);
@@ -1348,6 +1407,10 @@ mod tests {
         let tolerance = Tolerance::default();
         assert_eq!(tolerance.per_channel, 2);
         assert_eq!(tolerance.max_mismatch_ppm, 1_000, "0.1%");
+        // 几何边界 case 的专用容差（README 容差表第三行）：0 个不匹配像素，任何尺寸都不放水。
+        assert_eq!(Tolerance::GEOMETRY.per_channel, 2);
+        assert_eq!(Tolerance::GEOMETRY.max_mismatch_ppm, 0);
+        assert_eq!(Tolerance::GEOMETRY.allowed_mismatches(38_400), 0);
     }
 
     #[test]

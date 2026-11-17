@@ -62,7 +62,11 @@ pub(crate) fn new_layer(
     layer.setMaximumDrawableCount(MAXIMUM_DRAWABLE_COUNT);
     // 异步呈现：present 不等事务、由合成器按 vsync 呈现（两者都是默认值，显式写出契约）。
     layer.setPresentsWithTransaction(false);
-    layer.setDisplaySyncEnabled(true);
+    // **关闭图层自己的 vsync 对齐**（R09-6）：节奏由 `CAMetalDisplayLink` 独占 —— delegate 给出
+    // `targetPresentationTimestamp`、提交用 `presentDrawable:atTime:` 钉住那一帧。图层再对齐一次
+    // 就是两道节流叠加：`displaySyncEnabled = true` 时 CA 会按自己的调度点再挪一帧，把已经钉好的
+    // 呈现时刻又推后（且时序不可观测）。
+    layer.setDisplaySyncEnabled(false);
     // SAFETY: 同别名上的说明：CoreAnimation 的全局字符串常量，进程生命周期内有效。
     layer.setContentsGravity(unsafe { LIVE_RESIZE_GRAVITY });
     // **显式声明图层的颜色空间为 sRGB**（P2-3.1）：`CAMetalLayer` 默认跟随窗口所在屏幕的

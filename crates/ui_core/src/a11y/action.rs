@@ -3,6 +3,12 @@
 //! 执行点**只有主线程**：平台层的 `ActionHandler` 只把请求 `Dispatcher::push` 回主线程，本文件在
 //! drain 时被调用。所有效果都走 P03/P10 已存在的失效闭环（`set_focus` / `dispatch_action` /
 //! `scroll_*` / `App::write`），**不引入第二条写路径**。
+//!
+//! **模态作用域**（AR1b N2）：本文件的 [`dispatch`] 是 a11y 动作的**唯一入口**，入口处统一做
+//! 一次作用域校验（与指针、键盘同一判据 [`crate::interaction::focus::in_scope`]）。`Click` /
+//! `Focus` 之后还会各自经过 `dispatch_action` / `set_focus` 的校验，但 `SetValue` /
+//! `Increment` / `Custom` / `Scroll*` 直接调应用闭包与 `scroll_*`，**不经过**那两个入口 ——
+//! 漏掉入口校验的话，辅助技术在模态打开时仍能改背景控件状态、滚背景容器。
 
 use accesskit::{Action, ActionData, ActionRequest};
 
@@ -13,14 +19,14 @@ use crate::{
     },
     app::App,
     event::ActionSource,
-    interaction::focus::{action_target, focusable},
+    interaction::focus::{action_target, focusable, in_scope},
     math::Point,
     window::WindowId,
 };
 
 /// 分发一条 a11y 动作（主线程）。
 ///
-/// 陈旧 `NodeId` / 未映射动作 / 无 handler 一律**忽略 + 诊断**，不 panic。
+/// 陈旧 `NodeId` / 未映射动作 / 无 handler / **模态作用域外的目标**一律忽略 + 诊断，不 panic。
 pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) {
     if request.target_tree != accesskit::TreeId::ROOT {
         return;
@@ -34,6 +40,22 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
         .is_none_or(|target| target.tree().get(engine).is_err())
     {
         note_stale(app, request.action);
+        return;
+    }
+
+    // 模态作用域（AR1b N2）：与指针按下 / 滚轮 / Enter 同一条判据（`in_scope` = 模态子树
+    // ∪ 属于该模态的浮层链）。`Click` 与 `Focus` 在下面还会各自经过 `dispatch_action` /
+    // `set_focus` 的校验，但本入口是**唯一**能让 `SetValue` / `Increment` / `Custom` /
+    // `Scroll*` 落地的地方，所以校验必须在这里做一次。
+    let scope = app.focus_scope(window);
+    let allowed = app
+        .window(window)
+        .is_some_and(|target| in_scope(target.tree(), engine, scope));
+    if !allowed {
+        app.a11y_note(A11yDiagnostic::UnhandledAction {
+            node: engine,
+            action: action_from_accesskit(request.action),
+        });
         return;
     }
 
@@ -428,6 +450,133 @@ mod tests {
             app.dispatcher().take_frame_wake(),
             "a11y Focus 必须唤醒事件循环（回投任务里改状态）"
         );
+    }
+
+    /// AR1b N2（P2 回归）：**模态作用域外的 a11y 动作一律不生效**。
+    ///
+    /// 失败面：只有 `Click`（经 `dispatch_action`）与 `Focus`（经 `set_focus`）过作用域，
+    /// `SetValue` / `Increment` / `Custom` 直接跑应用闭包、`Scroll*` 直接 `scroll_*` ⇒
+    /// 辅助技术在模态打开时仍能改背景控件状态、滚背景容器。修复点在 a11y 动作的唯一入口
+    /// （本文件的 `dispatch`），判据与指针/键盘相同（模态子树 ∪ 属于该模态的浮层链）。
+    #[test]
+    fn a11y_actions_outside_the_modal_scope_are_rejected() {
+        use crate::interaction::{OverlayDismiss, OverlayOptions};
+
+        let (_runtime, mut app, window) = setup();
+        let root = app.window(window).expect("window").tree().root();
+        let background = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(crate::a11y::A11yRole::Slider),
+                ..A11yOverride::default()
+            })
+            .build(app.window_mut(window).expect("window").tree_mut(), root)
+            .expect("mount");
+        // 背景里的滚动容器（AR1b：`Scroll*` 曾完全绕过作用域）。
+        let mut inner = taffy::Style::<SmolStr>::DEFAULT;
+        inner.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::length(100.0),
+            height: taffy::style::Dimension::length(80.0),
+        };
+        inner.position = taffy::style::Position::Relative;
+        let container = NodeBuilder::boxed()
+            .style(crate::paint::style::Style {
+                inner,
+                clip: crate::paint::style::Clip::Bounds,
+            })
+            .build(app.window_mut(window).expect("window").tree_mut(), root)
+            .expect("container");
+        let handle = app
+            .make_scroll(window, container, ScrollConfig::default())
+            .expect("scroll");
+        app.set_scroll_content(&handle, crate::math::Size::new(100.0, 400.0))
+            .expect("content");
+
+        let set_value_hits = Rc::new(Cell::new(0_u32));
+        let seen_value = Rc::clone(&set_value_hits);
+        app.on_a11y_action(A11yAction::SetValue, move |_ctx| {
+            seen_value.set(seen_value.get() + 1);
+        });
+        let increment_hits = Rc::new(Cell::new(0_u32));
+        let seen_increment = Rc::clone(&increment_hits);
+        app.on_a11y_action(A11yAction::Increment, move |_ctx| {
+            seen_increment.set(seen_increment.get() + 1);
+        });
+
+        // 模态对话框（作用域根）。
+        let modal = app
+            .create_overlay(
+                window,
+                OverlayOptions {
+                    trap_focus: true,
+                    dismiss: OverlayDismiss::Explicit,
+                    ..OverlayOptions::default()
+                },
+            )
+            .expect("modal");
+        let inside = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(crate::a11y::A11yRole::Slider),
+                ..A11yOverride::default()
+            })
+            .build(
+                app.window_mut(window).expect("window").tree_mut(),
+                modal.node(),
+            )
+            .expect("mount");
+
+        // 模态外：SetValue / Increment / Scroll* 全部拒绝。
+        dispatch(
+            &mut app,
+            window,
+            request(
+                AkAction::SetValue,
+                background,
+                Some(ActionData::Value("9".into())),
+            ),
+        );
+        dispatch(
+            &mut app,
+            window,
+            request(AkAction::Increment, background, None),
+        );
+        dispatch(
+            &mut app,
+            window,
+            request(
+                AkAction::ScrollDown,
+                container,
+                Some(ActionData::ScrollUnit(accesskit::ScrollUnit::Item)),
+            ),
+        );
+        assert_eq!(set_value_hits.get(), 0, "模态外的 SetValue 不得生效");
+        assert_eq!(increment_hits.get(), 0, "模态外的 Increment 不得生效");
+        assert_eq!(
+            app.scroll_state(&handle).expect("state").offset.y,
+            0.0,
+            "模态外的容器不得被 AT 滚动"
+        );
+        assert!(
+            app.a11y_diagnostics().iter().any(|diagnostic| matches!(
+                diagnostic,
+                crate::a11y::A11yDiagnostic::UnhandledAction { .. }
+            )),
+            "被作用域拒绝的动作必须记诊断：{:?}",
+            app.a11y_diagnostics()
+        );
+
+        // 作用域内：同一批动作照常落地（证明拦截的是位置，不是动作类型）。
+        dispatch(
+            &mut app,
+            window,
+            request(
+                AkAction::SetValue,
+                inside,
+                Some(ActionData::Value("9".into())),
+            ),
+        );
+        dispatch(&mut app, window, request(AkAction::Increment, inside, None));
+        assert_eq!(set_value_hits.get(), 1);
+        assert_eq!(increment_hits.get(), 1);
     }
 
     #[test]

@@ -1320,7 +1320,9 @@ impl WaylandState {
 
     /// 键盘：`wl_keyboard::Event::Key` → `Event`（字符输入 + 非字符键）。
     ///
-    /// `timestamp` 是事件时刻：`wl_keyboard.key` 带 `time`（毫秒），合成重复用引擎时钟。
+    /// `timestamp` 是**分发时刻**：`wl_keyboard.key` 的 `time` 是 compositor 的毫秒时钟，
+    /// 协议只保证单调、原点未定义，无法与 `Instant` 对齐（P3-4：旧注释写成「事件时刻」，
+    /// 与调用点 `Instant::now()` 相反）。
     /// `repeat` 由调用方明确给出（R02-2）：真实按下为 `false`，客户端合成的重复为 `true`。
     fn translate_key(&mut self, key: u32, state: KeyState, repeat: bool, timestamp: Instant) {
         let Some(xkb_state) = self.xkb_state.as_mut() else {
@@ -2271,10 +2273,20 @@ impl Dispatch<ZwpTextInputV3, ()> for WaylandState {
                     state.apply_ime_target(None);
                 }
             }
-            zwp_text_input_v3::Event::PreeditString { text, .. } => {
+            zwp_text_input_v3::Event::PreeditString {
+                text,
+                cursor_begin,
+                cursor_end,
+            } => {
                 state.text_input_route.note_im_event();
                 if let Some(index) = state.text_input_route.focus() {
-                    state.windows[index as usize].ime.note_preedit(text);
+                    // AR1b N4：`cursor_begin` / `cursor_end` 是协议给的**字节偏移**（相对组合串
+                    // 起点；两者都是 -1 = 隐藏光标，两者不同 = 高亮区间）。它们与文本一起进
+                    // 批次，`done` 时换算成 `ImeEvent::Preedit` 的 `caret` / `clauses` —— 旧实现
+                    // 用 `..` 把它们丢掉了，Linux 的组合串光标因此恒在末尾。
+                    state.windows[index as usize]
+                        .ime
+                        .note_preedit(text, cursor_begin, cursor_end);
                 }
             }
             zwp_text_input_v3::Event::CommitString { text } => {

@@ -39,6 +39,27 @@ impl DamageRects {
         true
     }
 
+    /// 把另一组矩形并入本集合（并集）；容量不足返回 `false`（调用方必须降级成整面，
+    /// **不得**丢弃矩形）。
+    ///
+    /// 完全相同的矩形只留一份：同一块 damage 会被「本帧提交 + 后续每帧的累积」反复并入，
+    /// 不去重的话 3 张 image 的链上很快就会凑满容量并退化成整面拷贝。
+    ///
+    /// 消费方是 [`ImageCopyPlan`]（Linux 的差分拷贝）；Windows / macOS 各自已有等价机制
+    /// （`copy_plan` / `DrawableSyncs`），因此非 Linux 构建只在测试里编译它。
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn extend(&mut self, other: DamageRects) -> bool {
+        for rect in other.as_slice() {
+            if self.as_slice().contains(rect) {
+                continue;
+            }
+            if !self.push(*rect) {
+                return false;
+            }
+        }
+        true
+    }
+
     pub(crate) fn as_slice(&self) -> &[PhysicalRect] {
         &self.rects[..self.len]
     }
@@ -122,6 +143,152 @@ impl Default for DamageRects {
     }
 }
 
+/// 本次要把 persist 的哪一部分同步到一张 presentable image。
+///
+/// 与 [`ImageCopyPlan`] 同源：只有 Linux 的 Vulkan 后端消费（Windows / macOS 各自已有等价机制，
+/// 见 `copy_plan` / `DrawableSyncs`），因此非 Linux 构建只在测试里编译它。
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CopyPlan {
+    /// 整面拷贝（该 image 的内容未知，或差集超出固定容量）。
+    Full,
+    /// 只拷贝这些矩形（已被 accept：拷贝多于此集合永远安全，拷贝少了不安全）。
+    Regions(DamageRects),
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl CopyPlan {
+    /// 本次的拷贝矩形；`None` = 整面（`VkImageCopy` 覆盖整张图）。
+    ///
+    /// 唯一消费者是 Linux 的 Vulkan 后端（`copy_to_swapchain`）。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn regions(self) -> Option<DamageRects> {
+        match self {
+            Self::Full => None,
+            Self::Regions(regions) => Some(regions),
+        }
+    }
+
+    /// 本次是否整面拷贝（测试断言用）。
+    #[cfg(test)]
+    pub(crate) fn is_full(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
+
+/// 单张 presentable image 的同步状态（R11-12，与 D3D12 的 `copy_plan` / Metal 的
+/// `DrawableSyncs` 同构）。
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImageSync {
+    /// 内容未知：新建 / 重建的 swapchain、present 失败之后的 image。本帧必须整面拷贝。
+    Unknown,
+    /// 相对 persist 还差这些矩形（空 = 已追平）。下一次用到这张 image 时只拷它们。
+    Pending(DamageRects),
+}
+
+/// 每张 presentable image 的「相对 persist 还差哪些矩形」（R11-12）。
+///
+/// **为什么需要**：present 之后 swapchain image 的内容对应用不可信，因此后端必须自己保证
+/// 「这张 image 上每个像素至少被正确写过一次，且写过之后每次变化都被再写一次」。旧实现每帧
+/// 整面 `vkCmdCopyImage`（1080p@120Hz ≈ 1.0 GB/s，4K ≈ 4 GB/s 纯带宽），把 damage/scissor
+/// 的收益全部抵消。
+///
+/// 状态机（合法的只有一种推进方式）：
+/// - 新 / 重建的 swapchain：全部 `Unknown`（第一帧整面拷贝，建立基线）；
+/// - 整面拷贝之后：本 image `Pending(空)`，其余 image 累积本帧的 damage；
+/// - 局部拷贝：本 image 记为 `Pending(空)`，其余 image 把本帧 damage 并入自己的 `Pending`
+///   （**必须累积**：中间被跳过的那几帧的 damage 只有落到对应 image 上，该 image 才追得上
+///   persist —— 这正是旧实现「每帧整面」想掩盖的问题）；
+/// - 任何累积超过 [`MAX_DAMAGE_RECTS`] 或整帧 damage：降级成 `Unknown`（整面拷贝），
+///   而不是丢掉 damage（丢 damage 会让下次用到该 image 时少拷一块）。
+///
+/// **假设**：image 的像素内容在 present / acquire 之间保持不变（与 D3D12 的 flip 模型、
+/// Metal 的 drawable 池相同的假设）。规范上这个假设不成立，因此这里是「相对 persist 的差集」，
+/// 而不是「跳过未标脏像素」：一旦累积状态丢失，我们退回整面拷贝，屏幕内容始终正确。
+#[cfg(any(target_os = "linux", test))]
+pub(crate) struct ImageCopyPlan {
+    images: Vec<ImageSync>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl ImageCopyPlan {
+    /// 新链（`count` 张 image，全部 `Unknown`）。
+    pub(crate) fn new(count: usize) -> Self {
+        Self {
+            images: vec![ImageSync::Unknown; count],
+        }
+    }
+
+    /// swapchain 重建 / 尺寸变化：全部回到 `Unknown`（旧表按旧 image 索引，不得复用）。
+    pub(crate) fn reset(&mut self, count: usize) {
+        self.images.clear();
+        self.images.resize(count, ImageSync::Unknown);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.images.len()
+    }
+
+    /// 本帧对 `image` 的拷贝计划。
+    ///
+    /// `written` 是本帧真正写进 persist 的矩形（`None` = 整面）。
+    pub(crate) fn plan(&self, image: u32, written: Option<DamageRects>) -> CopyPlan {
+        let Some(ImageSync::Pending(pending)) = self.images.get(image as usize) else {
+            return CopyPlan::Full;
+        };
+        let Some(written) = written else {
+            // 本帧整面重画了 persist ⇒ 整面拷贝（差集没有意义）。
+            return CopyPlan::Full;
+        };
+        let mut regions = *pending;
+        if !regions.extend(written) {
+            return CopyPlan::Full;
+        }
+        regions.coalesce(MAX_DRAW_PASSES);
+        // 空集是合法结果：本 image 与 persist 已经完全同步，这一帧没有像素需要搬。
+        CopyPlan::Regions(regions)
+    }
+
+    /// present 成功之后推进状态。
+    ///
+    /// `written` 与 [`ImageCopyPlan::plan`] 的入参相同（用来判断「其余 image 是否需要降级成
+    /// 整面」）。返回被降级成整面拷贝的 image 数（诊断）。
+    pub(crate) fn commit(&mut self, image: u32, written: Option<DamageRects>) -> usize {
+        let Some(current) = self.images.get_mut(image as usize) else {
+            return 0;
+        };
+        // 本 image 已经被这一帧追平（整面拷贝也满足这一点）。
+        *current = ImageSync::Pending(DamageRects::new());
+        // 其余 image 累积本帧的 damage：它们的下一次 present 必须把这块补上。
+        let mut degraded = 0usize;
+        for (index, entry) in self.images.iter_mut().enumerate() {
+            if index == image as usize {
+                continue;
+            }
+            match entry {
+                // 内容未知的 image 反正要整面拷贝，累积没有意义。
+                ImageSync::Unknown => {}
+                ImageSync::Pending(pending) => {
+                    let Some(written) = written else {
+                        // 本帧整面重写了 persist：其余 image 一定落后，下一帧整面拷贝。
+                        *entry = ImageSync::Unknown;
+                        degraded += 1;
+                        continue;
+                    };
+                    if !pending.extend(written) {
+                        // 累积超出固定容量：降级成整面拷贝（绝不丢 damage）。
+                        *entry = ImageSync::Unknown;
+                        degraded += 1;
+                    }
+                }
+            }
+        }
+        degraded
+    }
+}
+
 /// 一帧要提交的像素工作。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Plan {
@@ -199,6 +366,7 @@ impl FramePlan {
     /// 还差哪些矩形」（`render/macos/compositor.rs` 的 `DrawableSyncs`，P2-6）。
     /// 任何后端都**不得**把它当作「必须跳过的像素」：present 目标跨帧内容在 Metal/Vulkan 上
     /// 没有保证，draw/persist 侧仍按 `plan()` 的 scissor 处理。
+    #[cfg(any(windows, target_os = "macos", test))]
     pub(crate) fn present_dirty(self) -> Option<DamageRects> {
         if self.fresh {
             return None;
@@ -259,11 +427,11 @@ pub(crate) fn plan(damage: DamageSummary, merged: &[PhysicalRect], surface: Phys
 
 #[cfg(test)]
 mod tests {
-    use super::{DamageRects, FramePlan, MAX_DRAW_PASSES, Plan, plan, union_growth};
-    use crate::{
-        math::PhysicalRect,
-        render::damage::{DamageSummary, MAX_DAMAGE_RECTS},
+    use super::{
+        CopyPlan, DamageRects, FramePlan, ImageCopyPlan, MAX_DAMAGE_RECTS, MAX_DRAW_PASSES, Plan,
+        plan, union_growth,
     };
+    use crate::{math::PhysicalRect, render::damage::DamageSummary};
 
     fn surface() -> PhysicalRect {
         PhysicalRect::new(0, 0, 100, 50)
@@ -544,5 +712,122 @@ mod tests {
             "相邻矩形的并集增长必须小于远离的矩形"
         );
         assert_eq!(union_growth(near_a, near_b), 0, "紧贴的矩形并集不增加面积");
+    }
+
+    // ── R11-12：每 image 的差分拷贝计划 ──────────────────────────────────────
+
+    fn rects(list: &[PhysicalRect]) -> DamageRects {
+        let mut rects = DamageRects::new();
+        for rect in list {
+            assert!(rects.push(*rect));
+        }
+        rects
+    }
+
+    fn regions(plan: CopyPlan) -> Vec<PhysicalRect> {
+        match plan {
+            CopyPlan::Regions(rects) => rects.as_slice().to_vec(),
+            CopyPlan::Full => panic!("expected a region copy, got full"),
+        }
+    }
+
+    /// 新链的每张 image 都是 `Unknown`：第一次用到它必须整面拷贝（建立基线）。
+    #[test]
+    fn a_new_swapchain_copies_every_image_in_full_once() {
+        let mut plan = ImageCopyPlan::new(3);
+        assert_eq!(plan.len(), 3);
+        let damage = rects(&[PhysicalRect::new(0, 0, 8, 8)]);
+        for image in 0..3 {
+            assert!(plan.plan(image, Some(damage)).is_full(), "image {image}");
+            plan.commit(image, Some(damage));
+        }
+        // 全部建立基线之后，同样的 damage 只需要拷那一块。
+        assert_eq!(
+            regions(plan.plan(0, Some(damage))),
+            vec![PhysicalRect::new(0, 0, 8, 8)],
+            "基线建立后只拷 damage"
+        );
+    }
+
+    /// 其余 image 必须**累积**被跳过帧的 damage：否则那张 image 下次被用到时会少拷一块。
+    #[test]
+    fn skipped_frames_accumulate_damage_for_every_image() {
+        let mut plan = ImageCopyPlan::new(2);
+        let baseline = rects(&[PhysicalRect::new(0, 0, 8, 8)]);
+        // 两张 image 各自建立基线（第一帧写到 image 0，第二帧写到 image 1）。
+        plan.commit(0, Some(baseline));
+        plan.commit(1, Some(baseline));
+        // 第三帧只写 image 0：image 1 必须记住那一块还差着。
+        let missed = rects(&[PhysicalRect::new(8, 0, 16, 8)]);
+        plan.commit(0, Some(missed));
+        let pending = regions(plan.plan(1, Some(rects(&[]))));
+        assert!(
+            pending.contains(&PhysicalRect::new(8, 0, 16, 8)),
+            "被跳过帧的 damage 必须累积到未使用的 image 上：{pending:?}"
+        );
+        // 本帧自己的 damage 也在拷贝集合里（与累积的取并集）。
+        let current = rects(&[PhysicalRect::new(0, 8, 8, 16)]);
+        let pending = regions(plan.plan(1, Some(current)));
+        assert!(pending.contains(&PhysicalRect::new(8, 0, 16, 8)));
+        assert!(pending.contains(&PhysicalRect::new(0, 8, 8, 16)));
+    }
+
+    /// 完全同步的 image 不需要任何拷贝（这是差分拷贝的收益来源）。
+    #[test]
+    fn a_fully_synced_image_needs_no_copy() {
+        let mut plan = ImageCopyPlan::new(1);
+        let damage = rects(&[PhysicalRect::new(0, 0, 8, 8)]);
+        plan.commit(0, Some(damage));
+        assert_eq!(
+            regions(plan.plan(0, Some(damage))),
+            vec![PhysicalRect::new(0, 0, 8, 8)]
+        );
+        plan.commit(0, Some(damage));
+        let empty = DamageRects::new();
+        assert_eq!(
+            regions(plan.plan(0, Some(empty))),
+            Vec::new(),
+            "与本帧 damage 无关时不需要搬任何像素"
+        );
+    }
+
+    /// 整帧 damage（`written = None`）必须整面拷贝：这一帧 persist 被整体重写。
+    #[test]
+    fn a_full_frame_forces_a_full_copy() {
+        let mut plan = ImageCopyPlan::new(2);
+        let damage = rects(&[PhysicalRect::new(0, 0, 4, 4)]);
+        plan.commit(0, Some(damage));
+        assert!(plan.plan(0, None).is_full());
+    }
+
+    /// 累积超出固定容量时降级成整面拷贝，**绝不丢 damage**（降级后每张 image 都是 `Unknown`）。
+    #[test]
+    fn accumulating_beyond_capacity_degrades_to_full_copies() {
+        let mut plan = ImageCopyPlan::new(2);
+        let full = rects(&[PhysicalRect::new(0, 0, 4, 4)]);
+        plan.commit(0, Some(full));
+        plan.commit(1, Some(full));
+        // 每帧给 image 0 一块互不相同的小矩形：image 1 的 pending 会不断累积直到溢出。
+        for index in 0..(MAX_DAMAGE_RECTS as i32 + 2) {
+            let damage = rects(&[PhysicalRect::new(index, 0, index + 1, 1)]);
+            plan.commit(0, Some(damage));
+        }
+        assert!(
+            plan.plan(1, Some(full)).is_full(),
+            "累积溢出必须降级成整面拷贝（丢 damage 会少拷像素）"
+        );
+    }
+
+    /// `reset`（swapchain 重建）清掉全部状态：新链的 image 索引与旧链无关。
+    #[test]
+    fn resetting_forgets_every_image() {
+        let mut plan = ImageCopyPlan::new(2);
+        let damage = rects(&[PhysicalRect::new(0, 0, 4, 4)]);
+        plan.commit(0, Some(damage));
+        plan.reset(3);
+        assert_eq!(plan.len(), 3);
+        for image in 0..3 {
+            assert!(plan.plan(image, Some(damage)).is_full(), "image {image}");
+        }
     }
 }

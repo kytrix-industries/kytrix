@@ -16,6 +16,9 @@
 //! 2. **组合串按 flag 分项读取**：`WM_IME_COMPOSITION` 的 lParam 是 bitmask，
 //!    `GCS_COMPSTR` / `GCS_CURSORPOS` / `GCS_COMPATTR` / `GCS_COMPCLAUSE` / `GCS_RESULTSTR`
 //!    各是一次独立的查询；一次消息只 `ImmGetContext` 一次（旧实现每次查询各取一次）。
+//!    位掩码允许**同时**带 `GCS_RESULTSTR` 与 `GCS_COMPSTR`（提交后紧接着开始新组合），因此
+//!    一条消息最多产出**两条**事件，顺序固定为 Commit → Preedit（XML 的求值顺序：先插入提交
+//!    串、再插入新组合串；AR1b N5）。
 //! 3. **提交去重按 UTF-16 码元 + 内容校验**（不是码点计数）：IME 提交后系统补发的 `WM_CHAR`
 //!    是**每码元一条**，提交串里的文本按码元排队，逐条比对 —— 内容不匹配立刻清空队列
 //!    （异常 IME 自愈），失焦 / 重新组合 / 禁用 IME 也清空。
@@ -27,6 +30,7 @@
 
 use std::collections::VecDeque;
 
+use smallvec::{SmallVec, smallvec};
 use smol_str::SmolStr;
 use windows::Win32::{
     Foundation::{HWND, POINT, RECT},
@@ -49,10 +53,13 @@ use crate::{
 };
 
 /// `WM_IME_*` 的产物：应用事件 + 需要**在借用释放后**执行的 IMM32 命令。
+///
+/// `events` 是**有序**列表（一条消息最多两条：Commit → Preedit，见文件头纪律 2）：调用方必须
+/// 按顺序全部入队，不能只取第一条（AR1b N5）。
 #[derive(Debug, Default)]
 pub(crate) struct ImeOutcome {
-    /// 交给应用的 IME 事件。
-    pub event: Option<ImeEvent>,
+    /// 交给应用的 IME 事件（有序；`WM_IME_COMPOSITION` 可能同时带 `RESULTSTR` 与 `COMPSTR`）。
+    pub events: SmallVec<[ImeEvent; 2]>,
     /// 会同步重入 `WndProc` 的 IMM32 操作（由调用方在本模块之外执行）。
     pub command: Option<ImeCommand>,
 }
@@ -119,59 +126,46 @@ impl Default for ImeState {
 }
 
 impl ImeState {
-    /// 处理一条 `WM_IME_*`；返回事件 + 待执行的 IMM32 命令（可能都为空）。
+    /// 处理一条 `WM_IME_*`；返回事件（有序，可能两条）+ 待执行的 IMM32 命令（可能都为空）。
     pub(crate) fn handle(&mut self, hwnd: HWND, msg: u32, lparam: isize) -> ImeOutcome {
         match msg {
             WM_IME_STARTCOMPOSITION => {
+                // 重新组合 ⇒ 上一次提交的待抑制码元已经过期（系统补发的 `WM_CHAR` 早已到达，
+                // 没到达的也不会再来）。清掉队列，避免把新组合之后的真实键入当成残留吞掉
+                // （AR1b P3-2：旧注释承诺了这一点，代码只在失焦/禁用/销毁时清）。
+                self.clear_pending();
                 // 组合开始时重放 caret 位置（上下文可能在禁用/启用之间换过，表单不保证还在）。
                 // 这里的 `ImmSet*Window` 会重入 `WndProc`，所以只产命令、不在这里调用。
                 ImeOutcome {
-                    event: Some(ImeEvent::Start),
+                    events: smallvec![ImeEvent::Start],
                     command: self.cursor_area.map(ImeCommand::SetCaret),
                 }
             }
             WM_IME_COMPOSITION => {
                 let flags = lparam as u32;
-                if flags & GCS_RESULTSTR.0 != 0 {
-                    // `ImmGetContext`/`ImmGetCompositionStringW` 只读组合状态，不派发窗口消息；
-                    // `himc` 在 `composition_string` 内成对释放。
-                    return match composition_string(hwnd, GCS_RESULTSTR) {
-                        Some(text) => {
-                            // 提交去重：按 **UTF-16 码元** 排队（emoji = 2 个码元，中文 = 1 个）。
-                            self.queue_commit(&text);
-                            ImeOutcome {
-                                event: Some(ImeEvent::Commit {
-                                    text,
-                                    // WIN32 `GCS_RESULTSTR` 就是本次提交的完整串：IMM32 没有
-                                    // AppKit `replacementRange` 那种「只替换组合串的一段」的
-                                    // 区间信息，`None` = 替换整个当前组合串。
-                                    replace: None,
-                                }),
-                                command: None,
-                            }
-                        }
-                        None => ImeOutcome::default(),
-                    };
+                // 两个 flag **都**处理（位掩码允许同时置位：提交后紧接着开始新组合）。
+                // 命中 `RESULTSTR` 后直接 return 会让同一消息里的新组合串丢失（AR1b N5）。
+                let committed = if flags & GCS_RESULTSTR.0 != 0 {
+                    composition_string(hwnd, GCS_RESULTSTR)
+                } else {
+                    None
+                };
+                if let Some(text) = committed.as_ref() {
+                    // 提交去重：按 **UTF-16 码元** 排队（emoji = 2 个码元，中文 = 1 个）。
+                    self.queue_commit(text);
                 }
-                if flags & GCS_COMPSTR.0 != 0 {
-                    let Some(read) = read_composition(hwnd, flags) else {
-                        return ImeOutcome::default();
-                    };
-                    return ImeOutcome {
-                        event: Some(ImeEvent::Preedit {
-                            text: read.text,
-                            caret: read.caret,
-                            clauses: read.clauses,
-                            // `GCS_COMPSTR` 是**完整**组合串（不是增量），所以整体替换。
-                            replace: None,
-                        }),
-                        command: None,
-                    };
+                let read = if flags & GCS_COMPSTR.0 != 0 {
+                    read_composition(hwnd, flags)
+                } else {
+                    None
+                };
+                ImeOutcome {
+                    events: composition_events(flags, committed, read),
+                    command: None,
                 }
-                ImeOutcome::default()
             }
             WM_IME_ENDCOMPOSITION => ImeOutcome {
-                event: Some(ImeEvent::End),
+                events: smallvec![ImeEvent::End],
                 command: None,
             },
             _ => ImeOutcome::default(),
@@ -367,6 +361,42 @@ struct CompositionRead {
     /// 组合串内插入点（UTF-16 码元，已夹到 `0..=len`）；`None` = 本次消息没带该 flag。
     caret: Option<u32>,
     clauses: ClauseRanges,
+}
+
+/// 一条 `WM_IME_COMPOSITION` 的**纯**事件组装（顺序固定：Commit → Preedit，XML 求值顺序）。
+///
+/// 抽成纯函数是为了能在开发机上钉住「两个 flag 同时置位时不得丢事件」这条契约（AR1b N5）：
+/// 真实读取（`ImmGetCompositionStringW`）需要活着的 HIMC 与真实输入法的组合态，单测构造不出来；
+/// 这里只负责把**已经读到**的数据按 flag 顺序变成事件，可被任意假数据驱动。
+fn composition_events(
+    flags: u32,
+    committed: Option<SmolStr>,
+    read: Option<CompositionRead>,
+) -> SmallVec<[ImeEvent; 2]> {
+    let mut events = SmallVec::new();
+    if flags & GCS_RESULTSTR.0 != 0
+        && let Some(text) = committed
+    {
+        events.push(ImeEvent::Commit {
+            text,
+            // WIN32 `GCS_RESULTSTR` 就是本次提交的完整串：IMM32 没有 AppKit
+            // `replacementRange` 那种「只替换组合串的一段」的区间信息，
+            // `None` = 替换整个当前组合串。
+            replace: None,
+        });
+    }
+    if flags & GCS_COMPSTR.0 != 0
+        && let Some(read) = read
+    {
+        events.push(ImeEvent::Preedit {
+            text: read.text,
+            caret: read.caret,
+            clauses: read.clauses,
+            // `GCS_COMPSTR` 是**完整**组合串（不是增量），所以整体替换。
+            replace: None,
+        });
+    }
+    events
 }
 
 /// 按 flag 分项读取组合串（**一次** `ImmGetContext` 覆盖全部查询）。
@@ -567,26 +597,28 @@ fn caret_forms(area: PhysicalRect) -> (COMPOSITIONFORM, CANDIDATEFORM) {
 
 #[cfg(test)]
 mod tests {
+    use smol_str::SmolStr;
     use windows::Win32::{
         Foundation::{HWND, LPARAM, LRESULT, WPARAM},
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Input::Ime::{
-                CANDIDATEFORM, CFS_EXCLUDE, CFS_POINT, COMPOSITIONFORM, HIMC,
-                ISC_SHOWUICANDIDATEWINDOW, ISC_SHOWUICOMPOSITIONWINDOW, ISC_SHOWUIGUIDELINE,
+                CANDIDATEFORM, CFS_EXCLUDE, CFS_POINT, COMPOSITIONFORM, GCS_COMPSTR, GCS_RESULTSTR,
+                HIMC, ISC_SHOWUICANDIDATEWINDOW, ISC_SHOWUICOMPOSITIONWINDOW, ISC_SHOWUIGUIDELINE,
                 ImmGetCandidateWindow, ImmGetCompositionWindow, ImmGetContext, ImmReleaseContext,
             },
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, WINDOW_EX_STYLE,
-                WNDCLASSW, WS_OVERLAPPEDWINDOW,
+                WM_IME_STARTCOMPOSITION, WNDCLASSW, WS_OVERLAPPEDWINDOW,
             },
         },
     };
 
     use super::{
-        ImeApplied, ImeCommand, ImeState, caret_forms, clamp_caret, execute, mask_setcontext,
+        CompositionRead, ImeApplied, ImeCommand, ImeState, caret_forms, clamp_caret,
+        composition_events, execute, mask_setcontext,
     };
-    use crate::math::PhysicalRect;
+    use crate::{event::ImeEvent, math::PhysicalRect, platform::ime::ClauseRanges};
 
     unsafe extern "system" fn wndproc(
         hwnd: HWND,
@@ -753,7 +785,10 @@ mod tests {
         assert!(!state.consume_char(u16::from(b'y')), "残留队列必须已清空");
     }
 
-    /// 重新组合 / 失焦 / 禁用都会清空队列（`plan_enabled(false)` 与 `clear_pending`）。
+    /// 禁用 IME 会清空待抑制队列（`plan_enabled(false)`）。
+    ///
+    /// 「重新组合也清空队列」由 `starting_a_new_composition_drops_the_pending_commit_queue`
+    /// 覆盖（AR1b P3-2：旧注释承诺了这条，代码此前只在失焦/禁用/销毁时清）。
     #[test]
     fn disabling_the_ime_drops_the_pending_characters() {
         let mut state = ImeState {
@@ -811,8 +846,102 @@ mod tests {
             0,
         );
 
-        assert!(outcome.event.is_none());
+        assert!(outcome.events.is_empty());
         assert!(outcome.command.is_none());
+    }
+
+    /// AR1b N5（P2 回归）：`GCS_RESULTSTR | GCS_COMPSTR` 同时置位 ⇒ **两条**事件，顺序
+    /// Commit → Preedit。
+    ///
+    /// 失败面：命中 `RESULTSTR` 后直接 `return`，同一消息里的新组合串被丢弃（提交后紧接着开始
+    /// 新组合时，新 preedit 在这一帧消失，最坏表现为拼音首字母闪断）。
+    #[test]
+    fn both_result_and_composition_flags_emit_commit_then_preedit() {
+        let read = CompositionRead {
+            text: SmolStr::new("ni"),
+            caret: Some(2),
+            clauses: ClauseRanges::new(),
+        };
+        let events = composition_events(
+            GCS_RESULTSTR.0 | GCS_COMPSTR.0,
+            Some(SmolStr::new("你")),
+            Some(read),
+        );
+
+        assert_eq!(events.len(), 2, "两个 flag 必须各产一条事件：{events:?}");
+        assert_eq!(
+            events[0],
+            ImeEvent::Commit {
+                text: SmolStr::new("你"),
+                replace: None
+            },
+            "先提交（XML 求值顺序第 3 步）"
+        );
+        assert!(
+            matches!(&events[1], ImeEvent::Preedit { text, caret: Some(2), .. } if text == "ni"),
+            "再交付新组合串：{:?}",
+            events[1]
+        );
+    }
+
+    /// AR1b N5 的另一半：`RESULTSTR` 读取失败（上下文无效 / 空提交）时**不得**连带吞掉同一
+    /// 消息里的 `COMPSTR`。
+    #[test]
+    fn a_missing_commit_still_delivers_the_new_preedit() {
+        let read = CompositionRead {
+            text: SmolStr::new("hao"),
+            caret: None,
+            clauses: ClauseRanges::new(),
+        };
+        let events = composition_events(GCS_RESULTSTR.0 | GCS_COMPSTR.0, None, Some(read));
+
+        assert!(
+            matches!(events.as_slice(), [ImeEvent::Preedit { .. }]),
+            "提交读不到时仍必须交付新组合串：{events:?}"
+        );
+    }
+
+    /// 只有一个 flag 时行为不变；位掩码里没有这两个 flag ⇒ 不产事件。
+    #[test]
+    fn a_single_flag_still_produces_exactly_one_event() {
+        let read = CompositionRead {
+            text: SmolStr::new("ni"),
+            caret: None,
+            clauses: ClauseRanges::new(),
+        };
+        let commit = composition_events(GCS_RESULTSTR.0, Some(SmolStr::new("你")), Some(read));
+        assert!(matches!(commit.as_slice(), [ImeEvent::Commit { .. }]));
+        let preedit = composition_events(
+            GCS_COMPSTR.0,
+            Some(SmolStr::new("你")),
+            Some(CompositionRead {
+                text: SmolStr::new("ni"),
+                caret: None,
+                clauses: ClauseRanges::new(),
+            }),
+        );
+        assert!(matches!(preedit.as_slice(), [ImeEvent::Preedit { .. }]));
+        assert!(
+            composition_events(0, Some(SmolStr::new("你")), None).is_empty(),
+            "没有相关 flag 时不得凭已有数据硬造事件"
+        );
+    }
+
+    /// AR1b P3-2（文档/实现不符）：`WM_IME_STARTCOMPOSITION` 必须清空上一次提交的待抑制队列。
+    ///
+    /// 旧注释承诺「重新组合也清空队列」，代码只在失焦 / 禁用 / 销毁时清 —— 残留码元会让新组合
+    /// 之后的第一批真实键入被误吞。
+    #[test]
+    fn starting_a_new_composition_drops_the_pending_commit_queue() {
+        let mut state = ImeState {
+            pending_chars: "ni".encode_utf16().collect(),
+            ..ImeState::default()
+        };
+        let outcome = state.handle(HWND::default(), WM_IME_STARTCOMPOSITION, 0);
+
+        assert!(matches!(outcome.events.as_slice(), [ImeEvent::Start]));
+        assert!(state.pending_chars.is_empty(), "重新组合必须清空待抑制码元");
+        assert!(!state.consume_char(u16::from(b'n')), "不得再吞真实键入");
     }
 
     #[test]

@@ -350,13 +350,21 @@ const VK_SNAPSHOT_CODE: u16 = 0x2C;
 /// 原生键身份 → [`KeyCode`]（R02-1）。
 ///
 /// 优先用**硬件扫描码**（布局无关：AZERTY 上物理 `Q` 也得到 [`KeyCode::KeyQ`]），扫描码缺失
-/// 或无对应项时退回虚拟键的命名键映射；两者都不认识 ⇒
-/// [`KeyCode::Unidentified`]（Windows 载荷 = 扫描码，bit 8 = `E0` 扩展键；没有扫描码时
-/// `0x8000 | VK`），文档明确它**不可跨平台**。
+/// 时退回虚拟键的命名键映射；两者都不认识 ⇒ [`KeyCode::Unidentified`]（Windows 载荷 =
+/// 扫描码，bit 8 = `E0` 扩展键；没有扫描码时 `0x8000 | VK`），文档明确它**不可跨平台**。
 ///
 /// **扩展行不回落到基础行**：`E0` 前缀的扫描码只查扩展表（见 [`key_code_from_scancode`]），
-/// 因此音量+/浏览器键不会被当成字母/F 键。扫描码缺失（注入消息、无扫描码的虚拟键）时才用
-/// VK 的命名键映射 —— VK 的字母/数字是布局相关的，**不**参与字母身份。
+/// 因此音量+/浏览器键不会被当成字母/F 键。
+///
+/// **VK 兜底只用于非扩展键**（AR1b N3）：`E0` 前缀换的是**整个键的身份**，扩展行的未知
+/// 扫描码一律 [`KeyCode::Unidentified`]，不拿 VK 去「猜」一个命名键 —— 否则
+/// `E0 6E + VK_DELETE` 会报告成 `Delete`、伪 `E0 2A + VK_SHIFT` 会报告成 `ShiftLeft`
+/// （`E0 2A` 在部分键盘上是伪 Shift，物理身份并不是左 Shift）。VK 的字母/数字是布局相关的，
+/// **不**参与字母身份（`key_code_from_vk` 也没有字母项）。
+///
+/// 唯一按 VK 定夺的是扫描码本身有歧义的 [`VK_PAUSE_CODE`] / [`VK_SNAPSHOT_CODE`]：
+/// `Pause` 的扫描码 `0x45` 与 `NumLock` 相同、`PrintScreen` 是 `E0 2A E0 37` 的序列消息，
+/// 只能靠 VK 区分（真实硬件上这两条消息的 VK 一定成立）。
 pub(crate) fn key_code_from_native(vk: u16, scancode: u16, extended: bool) -> KeyCode {
     // 扫描码有歧义的少数键：用 VK 定夺。
     match vk {
@@ -369,7 +377,8 @@ pub(crate) fn key_code_from_native(vk: u16, scancode: u16, extended: bool) -> Ke
     {
         return code;
     }
-    key_code_from_vk(vk).unwrap_or(KeyCode::Unidentified(if scancode != 0 {
+    let fallback = if extended { None } else { key_code_from_vk(vk) };
+    fallback.unwrap_or(KeyCode::Unidentified(if scancode != 0 {
         scancode | if extended { 0x100 } else { 0 }
     } else {
         0x8000 | vk
@@ -513,7 +522,7 @@ fn key_code_from_base_scancode(scancode: u16) -> Option<KeyCode> {
 ///
 /// 扩展行的扫描码**不得**回落到基础行：`E0 30` 是音量+，不是 `KeyB`；`E0 65` 是浏览器搜索，
 /// 不是 `F14`。表里没有的扩展键一律 `Unidentified(0x100 | scancode)`（由
-/// [`key_code_from_native`] 组装），绝不猜成字母/功能键。
+/// [`key_code_from_native`] 组装），绝不猜成字母/功能键 —— **也不拿 VK 兜底**（AR1b N3）。
 fn key_code_from_extended_scancode(scancode: u16) -> Option<KeyCode> {
     let code = match scancode {
         // 编辑键区的另一半（与基础行的小键盘共用扫描码）。
@@ -563,7 +572,11 @@ fn key_code_from_extended_scancode(scancode: u16) -> Option<KeyCode> {
     Some(code)
 }
 
-/// 虚拟键的命名键映射（扫描码缺失时的回退；**不用**它表达字母/数字 —— VK 字母是布局相关的）。
+/// 虚拟键的命名键映射（**仅非扩展键**、扫描码缺失时的回退；不用它表达字母/数字 —— VK 字母
+/// 是布局相关的）。
+///
+/// 「仅非扩展键」由 [`key_code_from_native`] 保证：扩展行拿不到这张表，未知扩展扫描码一律
+/// `Unidentified`（AR1b N3）。
 fn key_code_from_vk(vk: u16) -> Option<KeyCode> {
     let code = match vk {
         0x1B => KeyCode::Escape,
@@ -1100,6 +1113,72 @@ mod tests {
             key_code_from_native(0, 0x2A, true),
             KeyCode::Unidentified(0x100 | 0x2A),
             "E0 2A（部分键盘的伪 Shift）不得报告成 ShiftLeft"
+        );
+    }
+
+    /// AR1b N3（P2 回归）：**VK 兜底只用于非扩展键**。
+    ///
+    /// 失败面（复审探针 8）：扩展表查不到时无条件落到 `key_code_from_vk`，于是
+    /// `E0 6E + VK_DELETE → Delete`、`E0 2A + VK_SHIFT → ShiftLeft` —— 一个不存在的物理键
+    /// 被「美化」成真实命名键，与「未知扩展键一律 `Unidentified`」的契约相反。表驱动测试只传
+    /// `vk = 0`，测不出这条分叉，所以这里全部带**真实 VK**。
+    #[test]
+    fn extended_keys_never_fall_back_to_the_vk_table() {
+        // 已知扩展键 + 真实 VK：扫描码表说了算（VK 不参与，也不能覆盖）。
+        let known: &[(u16, u16, KeyCode)] = &[
+            (0x2E, 0x2E, KeyCode::AudioVolumeDown),
+            (0x30, 0x30, KeyCode::AudioVolumeUp),
+            (0x20, 0x20, KeyCode::AudioVolumeMute),
+            (0x22, 0xB3, KeyCode::MediaPlayPause),
+            (0x10, 0xB1, KeyCode::MediaTrackPrevious),
+            (0x19, 0xB0, KeyCode::MediaTrackNext),
+            (0x24, 0xB2, KeyCode::MediaStop),
+            (0x32, 0xAC, KeyCode::BrowserHome),
+            (0x6A, 0xA6, KeyCode::BrowserBack),
+            (0x6B, 0xB4, KeyCode::LaunchApp1),
+            (0x47, 0x24, KeyCode::Home),
+            (0x53, 0x2E, KeyCode::Delete),
+            (0x1D, 0xA3, KeyCode::ControlRight),
+            (0x38, 0xA5, KeyCode::AltRight),
+            (0x5B, 0x5B, KeyCode::MetaLeft),
+            (0x5D, 0x5D, KeyCode::ContextMenu),
+        ];
+        for (scancode, vk, expected) in known {
+            assert_eq!(
+                key_code_from_native(*vk, *scancode, true),
+                *expected,
+                "E0 {scancode:#04x} + VK {vk:#04x} 必须是 {expected:?}（扫描码表说了算）"
+            );
+        }
+
+        // **反例**：扩展表里没有的扫描码 + 一个「看起来能兜底」的真实 VK ⇒ 一律 `Unidentified`。
+        let unknown: &[(u16, u16, u16)] = &[
+            (0x6E, 0x2E, 0x16E), // 伪 Delete
+            (0x2A, 0x10, 0x12A), // 部分键盘上的伪 Shift（物理身份不是左 Shift）
+            (0x64, 0x70, 0x164), // 伪 F1（VK_F1 = 0x70）
+            (0x46, 0x0D, 0x146), // 伪 Enter
+            (0x37, 0x24, 0x137), // PrtSc 序列里的第一段伪 Home
+            (0x1F, 0x25, 0x11F), // 伪 VK_LEFT（扩展键不得因 VK 变成 ArrowLeft）
+        ];
+        for (scancode, vk, payload) in unknown {
+            assert_eq!(
+                key_code_from_native(*vk, *scancode, true),
+                KeyCode::Unidentified(*payload),
+                "E0 {scancode:#04x} + VK {vk:#04x} 不得被 VK 兜底美化"
+            );
+        }
+
+        // 对照：非扩展键的 VK 兜底仍然成立（扫描码缺失 / 不含对应项时才用）。
+        assert_eq!(key_code_from_native(0x2E, 0, false), KeyCode::Delete);
+        assert_eq!(key_code_from_native(0x0D, 0, false), KeyCode::Enter);
+        assert_eq!(key_code_from_native(0x70, 0, false), KeyCode::F1);
+        // 非扩展 + **未知**扫描码 + 已知 VK：这是「扫描码无对应项」的合法回退点。
+        assert_eq!(key_code_from_native(0x0D, 0x55, false), KeyCode::Enter);
+        // 扩展 + **无扫描码**：同样不给 VK 兜底（扩展键的 VK 与物理身份不可靠）。
+        assert_eq!(
+            key_code_from_native(0x2E, 0, true),
+            KeyCode::Unidentified(0x8000 | 0x2E),
+            "没有扫描码的扩展消息只能用 VK 载荷，不得命名成 Delete"
         );
     }
 

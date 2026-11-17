@@ -18,9 +18,11 @@
 //!   shutdown；等待只发生在 GPU 线程。
 //!
 //! 关闭握手（§4.5 / §7.7）：`Drop` 里 signal shutdown 后**直接 `join`**（无超时）。有界性来自
-//! `vkAcquireNextImageKHR` 的 100 ms 上限：GPU 线程最多再等一个超时周期就会看到 shutdown。
-//! GPU 线程在退出前自己 drain 在飞帧（`GpuRenderer::drop` 的 `vkDeviceWaitIdle` 允许，退出路径），
-//! 而且 **teardown 完成之后**才让 UI 观察到线程结束（`join` 返回即 teardown 完成）。
+//! `vkAcquireNextImageKHR` 的 100 ms 上限与槽 fence 的 2 s 有界等待（R11-5）：GPU 线程最多再等
+//! 一个超时周期就会看到 shutdown。GPU 线程在退出前自己排空在飞帧：`GpuRenderer::drop` 一次**有界**
+//! 的 timeline 等待（等待值 = 最后一次提交时 signal 的那个值，R11-1）加一次**有界**的队列 idle
+//! （`SharedGpu::wait_queue_idle`，presentation engine 的同步，R11-3）；等待失败按设备丢失处理，
+//! 不再假装成功继续销毁。**teardown 完成之后**才让 UI 观察到线程结束（`join` 返回即 teardown 完成）。
 //!
 //! panic 出路：GPU 线程展开时 [`PanicGuard`] 会向共享错误槽发布 `AppInit`，平台泵的 `poll()`
 //! 因此看到错误而不是静默停摆（不覆盖循环已经发布的错误）。
@@ -407,10 +409,11 @@ impl Drop for WindowRenderer {
         let Some(thread) = self.thread.take() else {
             return;
         };
-        // UI 线程唯一允许的等待点（§4.5 / §7.7）：`acquire` 的 100 ms 上限保证 GPU 线程在
-        // 一个超时周期内看到 shutdown，随后 `GpuRenderer::drop` 的 `vkDeviceWaitIdle` 结束在飞
-        // 工作。`join` **没有超时**：放弃等待会让 GPU 线程在 UI 归还 `wl_surface` 之后仍触碰
-        // 已释放资源（use-after-free）；也不再需要单独的退出信号 —— `join` 返回即 teardown 完成。
+        // UI 线程唯一允许的等待点（§4.5 / §7.7）：`acquire` 的 100 ms 上限与槽 fence 的 2 s
+        // 有界等待（R11-5）保证 GPU 线程在一个超时周期内看到 shutdown，随后 `GpuRenderer::drop`
+        // 的 timeline 等待 + 队列 idle 结束在飞工作。`join` **没有超时**：放弃等待会让 GPU 线程
+        // 在 UI 归还 `wl_surface` 之后仍触碰已释放资源（use-after-free）；也不再需要单独的退出
+        // 信号 —— `join` 返回即 teardown 完成。
         // `Err` 只表示 GPU 线程 panic：`PanicGuard` 已把错误交给 `poll`，默认 hook 也已打印。
         let _ = thread.join();
     }
@@ -687,8 +690,8 @@ struct SubmittedFrame {
     samples: Vec<GpuTimerSample>,
     /// HUD 的 `latency` 起点（`FrameRequest::published_at`）。
     published_at: Instant,
-    /// 本帧 submit 时 signal 的 timeline 值（完成判据；**不是** ring 的提交计数）。
-    timeline_value: u64,
+    /// 本帧 submit 时 signal 的 timeline 值（= ring 的提交序号，R11-1）。
+    sequence: u64,
     /// ring 槽位：完成时从该槽的 timestamp 读回缓冲读 GPU 时间。
     slot: usize,
 }
@@ -698,8 +701,8 @@ fn gpu_loop(renderer: GpuRenderer, shared: Arc<Shared>) {
     enter_gpu_thread();
     // panic 出路：展开时把错误交给 UI（`poll` 不会静默停摆）。
     let guard = PanicGuard::new(Arc::clone(&shared));
-    // `GpuRenderer` 必须是**局部** `Option`：循环结束后显式 drop（`vkDeviceWaitIdle` + 销毁
-    // swapchain / persist / 设备），UI 的 `join` 返回时 teardown 一定已经完成（§7.7）。
+    // `GpuRenderer` 必须是**局部** `Option`：循环结束后显式 drop（timeline 等待 + 队列 idle +
+    // 销毁 swapchain / persist / 命令池），UI 的 `join` 返回时 teardown 一定已经完成（§7.7）。
     let mut renderer = Some(renderer);
     let mut submitted = VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT);
     if let Err(error) = run_gpu_loop(
@@ -780,7 +783,7 @@ fn run_gpu_loop(
                 stats,
                 samples,
                 slot,
-                timeline_value,
+                sequence,
             } => {
                 // 上传已经录进本帧命令列表：共享槽这才算空，UI 可以入队下一笔。
                 for (index, awaiting) in atlas_awaiting.iter_mut().enumerate() {
@@ -797,7 +800,7 @@ fn run_gpu_loop(
                     stats,
                     samples,
                     published_at: request.published_at,
-                    timeline_value,
+                    sequence,
                     slot,
                 });
                 pending = None;
@@ -847,7 +850,7 @@ fn completed_frames<'a>(
     std::iter::from_fn(move || {
         if submitted
             .front()
-            .is_some_and(|frame| frame.timeline_value <= completed)
+            .is_some_and(|frame| frame.sequence <= completed)
         {
             submitted.pop_front()
         } else {
@@ -981,7 +984,7 @@ mod tests {
                 stats: RenderStats::default(),
                 samples: Vec::new(),
                 published_at: Instant::now(),
-                timeline_value: u64::from(index),
+                sequence: u64::from(index),
                 slot: 0,
             });
         }

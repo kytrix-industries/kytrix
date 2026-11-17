@@ -242,7 +242,16 @@ pub(crate) struct FrameSlot {
     pub index: usize,
     /// 进入本帧前必须等待到达的 fence 值（0 = 该槽从未使用，无需等待）。
     pub wait_value: u64,
-    /// 本帧提交成功后 signal 的值。
+    /// 本帧提交成功后 signal 的值 —— **这就是 timeline 的 signal 值**（R11-1）。
+    ///
+    /// 三个消费点必须用同一个值，不允许各自推导：
+    /// 1. `vkQueueSubmit` 的 `TimelineSemaphoreSubmitInfo::signalSemaphoreValues`（提交时 signal）；
+    /// 2. retire 队列的键（判断「哪些句柄的提交已完成」）；
+    /// 3. teardown 的等待值（`vkWaitSemaphores` / `submitted_value`）。
+    ///
+    /// 旧实现把 UI 的 `FrameIndex` 当作 timeline 值 signal，而 teardown 等的是 ring 的提交计数：
+    /// 序号一跳号（`Idle` 帧、最新帧槽合并且、`Retry`）两者就永久错位，关窗会在最后一帧仍在飞时
+    /// 销毁资源。ring 的计数器是**唯一**由提交驱动的单调源，`FrameIndex` 只作为反馈 / 诊断标签。
     pub signal_value: u64,
 }
 
@@ -432,6 +441,60 @@ mod tests {
             ring.advance(slot);
         }
         assert_eq!(ring.last_signaled(), 9);
+    }
+
+    /// P0 回归（R11-1）：timeline 的 signal 值 = **提交序号**，与 UI 帧序号解耦。
+    ///
+    /// UI 帧序号会跳号（`Idle` 帧、最新帧槽合并、`Retry`），旧实现把它当 timeline 值 signal，
+    /// 而 teardown 等的是提交计数 ⇒ 序号一跳号两者永久错位。这里模拟「只提交序号 1、4、7 的三帧」：
+    /// 提交序号必须是 1、2、3，且 teardown 的等待值 = 最后一次 signal 的值，而不是帧序号 7。
+    #[test]
+    fn timeline_values_track_submissions_not_ui_frame_indices() {
+        let mut ring = InFlightRing::new();
+        let mut signaled = Vec::new();
+        for ui_index in [1u32, 4, 7] {
+            // 跳过不提交的序号：它们不产生 GPU 工作，也就不消费 ring 的提交序。
+            let slot = ring.acquire();
+            signaled.push((ui_index, slot.signal_value));
+            ring.advance(slot);
+        }
+        assert_eq!(
+            signaled,
+            vec![(1, 1), (4, 2), (7, 3)],
+            "UI 帧序号与提交序号是两条独立序列"
+        );
+        assert_eq!(
+            ring.last_signaled(),
+            3,
+            "teardown 等的是最后一次 signal 的值（3），不是最后的 UI 帧序号（7）"
+        );
+        // 等待 3 覆盖全部三次提交；等待 2 不覆盖第三次（旧实现永远等不到 3）。
+        assert!(
+            signaled
+                .iter()
+                .all(|(_, value)| *value <= ring.last_signaled())
+        );
+    }
+
+    /// R11-22：重试（`NOT_READY` / `OUT_OF_DATE`）会多消费一次 acquire 但不提交；`acquire` 给出的
+    /// 值仍然是「下一次提交的值」，实际提交出的 timeline 值因此严格递增（同一个值不会被 signal
+    /// 两次 —— `vkQueueSubmit` 要求 signal 值大于 timeline 当前值）。
+    #[test]
+    fn retries_never_signal_the_same_timeline_value_twice() {
+        let mut ring = InFlightRing::new();
+        let retried = ring.acquire();
+        // 模拟 acquire 失败（不提交、不 advance）：下一次 acquire 给出同一个待提交值。
+        let submitted = ring.acquire();
+        assert_eq!(
+            submitted.signal_value, retried.signal_value,
+            "未提交的槽不消费提交序"
+        );
+        ring.advance(submitted);
+        // 下一次提交的值严格大于上一次 signal 的值。
+        let next = ring.acquire();
+        assert!(next.signal_value > submitted.signal_value);
+        ring.advance(next);
+        assert_eq!(ring.last_signaled(), next.signal_value);
     }
 
     #[test]

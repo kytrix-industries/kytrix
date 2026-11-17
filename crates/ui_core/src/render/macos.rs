@@ -5,6 +5,8 @@
 
 pub(crate) mod atlas;
 pub(crate) mod compositor;
+/// 进程级 GPU 单例（device / metallib / PSO 缓存 / 采样器）：R09-5 / R09-13。
+pub(crate) mod core;
 pub(crate) mod device;
 /// 静态几何的 GPU 缓冲（按需创建；`GeometryStore` 的 Metal 侧缓存）。
 pub(crate) mod geometry;

@@ -689,6 +689,9 @@ mod tests {
     ///   共 5 处（旧实现只有近边 3 处 ⇒ 小元素四周多出一圈不存在的光晕）；
     /// - `clip_mask` 必须按 `meta.y` 分流，且 `aa_coverage` **只出现一次**（只有圆角项参与
     ///   AA 相乘；矩形项是 0/1 scissor —— 否则同边界的矩形 + 圆角 clip 得到 0.25 暗边）；
+    /// - `clip_mask` 的矩形项必须按**像素索引**判定（`floor(world_px)` 与整数吸附后的
+    ///   `[lo, hi)` 比较），**不得**再出现 `world_px ± 0.5` 的浮点单元比较：`world_px` 是插值
+    ///   属性，1 ulp 就会让边界像素翻面，而覆盖率是 0/1 ⇒ 整列像素越界（AR2b P1-N1）；
     /// - `aa_coverage` 的带宽必须是梯度模长 `length(ddx, ddy)`，不是 `|ddx| + |ddy|`
     ///   （后者让对角边带宽变成 1.41 px）。
     #[test]
@@ -739,11 +742,18 @@ mod tests {
             1,
             "aa_coverage 只能乘一次（矩形项是 0/1 scissor）：{body}"
         );
-        // 4 处是矩形项的像素单元比较（x/y 各 ±0.5），第 5 处是圆角项的 `zw * 0.5`（half_size）。
+        // 矩形项的像素索引判定：`floor(world_px)`。三份 shader 的逐语句等价由 `build.rs`
+        // 守护，这里钉住「判定对象是像素索引」这一条语义（AR2b P1-N1 的回归闸门）。
+        assert!(
+            body.contains("floor(world_px)"),
+            "矩形项必须用像素索引 floor(world_px) 判定（不得直接比 world_px）：{body}"
+        );
+        // 唯一允许的 `0.5` 是圆角项的 `zw * 0.5`（half_size）。矩形项一旦回到
+        // `world_px.x - 0.5 >= hi.x` 这种浮点单元比较，这个计数就会 > 1。
         assert_eq!(
             body.matches("0.5").count(),
-            5,
-            "矩形项需要四个 ±0.5 px 的像素单元比较：{body}"
+            1,
+            "矩形项不得再用 ±0.5 px 的浮点像素单元比较（只剩圆角的 half_size 一处）：{body}"
         );
 
         let aa: Vec<String> = normalized_body(&source, "aa_coverage")

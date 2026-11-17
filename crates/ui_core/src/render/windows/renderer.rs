@@ -8,10 +8,10 @@
 //! publish(FrameRequest) ──► 最新帧槽            → 等 waitable（呈现背压，每帧恰好一次）
 //! queue_atlas_upload ─────► 图集槽              → 取「此刻最新」帧 + 图集槽
 //! poll() ◄──────────────── 反馈槽               → 内容尺寸变化则 set_content_size
-//!                                               （buffer 内纯 CPU；越过则 grow 重建交换链）
-//!                                               → 内容静止 2 s 且无待画帧 ⇒ maybe_shrink
+//!                                               （桶内纯 CPU；越桶则 ResizeBuffers）
+//!                                               → 遮挡 / 最小化 ⇒ 不取帧（R08-7）
 //!                                               → 槽 fence → 录制 → Execute → Signal
-//!                                               → Present1(1, dirty)
+//!                                               → Present1(sync, dirty)（有更新帧时 sync=0）
 //! WM_APP_COMPOSITION_WAKE ◄─ PostMessage       → 完成观测点：retire + 反馈 + presented 尺寸
 //! ```
 //!
@@ -76,12 +76,14 @@ use crate::{
     render::{
         DirtyRows, RenderStats,
         color::background_linear,
-        compositor::FramePlan,
+        compositor::{FramePlan, Plan},
         frame::{FrameFeedback, FrameRequest, LatestFrame, MAX_FRAMES_IN_FLIGHT},
         timer::{FrameTimings, GpuTimerSample},
         windows::{
-            compositor::{GpuRenderer, enter_gpu_thread},
+            compositor::{FrameSubmitError, GpuRenderer, enter_gpu_thread},
             device::init_error_from,
+            diagnostics::Diagnostics,
+            queue::WaitOutcome,
         },
     },
     window::FrameIndex,
@@ -124,11 +126,9 @@ impl Renderer {
 
     /// 真实窗口：构造 GPU 对象（UI 线程）后整体移交给 `kytrix-d3d12` 线程。
     ///
-    /// `composition` 与 `NativeWindow` 共享：内容交换链与 1×1 背景交换链（各自 prime 到独立的
-    /// 持久目标）在这里（GPU 线程启动之前、`ShowWindow` 之前）各自 present 一帧背景色并挂到
-    /// 合成树上；此后 GPU 线程只在内容越过 buffer 时把内容 visual 切到新交换链
-    /// （`GpuRenderer::grow`）、在内容静止后把高水位缩回当前内容的桶
-    /// （`GpuRenderer::maybe_shrink`）、在背景色变化时换掉 1×1 背景层
+    /// `composition` 与 `NativeWindow` 共享：内容交换链与 1×1 背景交换链各 prime 一帧背景色
+    /// （GPU 线程启动之前、`ShowWindow` 之前）并挂到合成树上；此后 GPU 线程只在内容越过 buffer
+    /// 时 `ResizeBuffers`（R08-1：交换链对象不变、visual 不动）、在背景色变化时换掉 1×1 背景层
     /// （`GpuRenderer::refresh_background`），其余 DComp 调用都在 UI 线程，互斥锁串行化。
     ///
     /// # Errors
@@ -174,6 +174,11 @@ impl Renderer {
             RenderTarget::Offscreen(_) => false,
             RenderTarget::Window(window) => window.take_composition_pending(),
         }
+    }
+
+    /// 后端运行期计数器（R08-3 / R08-7 / R08-13 的可观测面；HUD / 日志 / 测试共用）。
+    pub(crate) fn diagnostics(&self) -> Diagnostics {
+        crate::render::windows::diagnostics::snapshot()
     }
 
     /// 发布一帧（**不阻塞**）：窗口路径合并进最新帧槽并唤醒 GPU 线程；离屏路径同步渲染。
@@ -261,6 +266,11 @@ impl Renderer {
         match result {
             Ok(feedback) => Ok(feedback),
             Err(error) => {
+                // 后端失败时把累计计数一并写日志（R08-3 / R08-7 的现场数据；诊断不参与决策）。
+                eprintln!(
+                    "kytrix: d3d12 backend diagnostics after error: {}",
+                    self.diagnostics().describe()
+                );
                 let sticky = StickyError::capture(error);
                 let echo = sticky.to_error();
                 self.error = Some(sticky);
@@ -828,6 +838,10 @@ struct SubmittedFrame {
 }
 
 /// GPU 线程主循环（§6.3）。
+///
+/// 外层只做一件事（R08-4）：`run_gpu_loop` 以 `DeviceLost` 退出时先尝试**进程内恢复**
+/// （重建 device / queue / PSO / 图集 + 本窗口的 swapchain / persist / 提交流），恢复成功就继续
+/// 出帧，失败才把粘性错误交给 UI。一次 TDR / 驱动更新因此不再需要重启应用。
 fn gpu_loop(renderer: GpuRenderer, shared: Arc<Shared>) {
     enter_gpu_thread();
     // panic 出路：展开时把错误交给 UI（`poll()` 不会静默卡死），并标记线程已终止。
@@ -836,14 +850,39 @@ fn gpu_loop(renderer: GpuRenderer, shared: Arc<Shared>) {
     // 引用，再销毁 swapchain / 设备），`join` 返回时 teardown 一定已经完成（§6.7）。
     let mut renderer = Some(renderer);
     let mut submitted = VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT);
-    if let Err(error) = run_gpu_loop(
-        renderer
-            .as_mut()
-            .expect("renderer is present until teardown"),
-        &shared,
-        &mut submitted,
-    ) {
-        shared.publish_error(error);
+    loop {
+        let result = run_gpu_loop(
+            renderer
+                .as_mut()
+                .expect("renderer is present until teardown"),
+            &shared,
+            &mut submitted,
+        );
+        match result {
+            Ok(()) => break,
+            Err(error) => {
+                if !matches!(error, EngineError::DeviceLost { .. }) {
+                    shared.publish_error(error);
+                    break;
+                }
+                // 设备真的被移除了：先尝试一次进程内恢复（限次在 `SharedGpu::recover` 里）。
+                submitted.clear();
+                let current = renderer.take().expect("renderer is present until teardown");
+                match current.recover() {
+                    Ok(recovered) => {
+                        crate::render::windows::diagnostics::device_recovered();
+                        renderer = Some(recovered);
+                        if shared.shutdown_requested() {
+                            break;
+                        }
+                    }
+                    Err(fatal) => {
+                        shared.publish_error(fatal);
+                        break;
+                    }
+                }
+            }
+        }
     }
     drop(renderer.take());
     shared.mark_terminated();
@@ -870,26 +909,26 @@ fn run_gpu_loop(
             renderer.set_background_color(rgba);
             renderer.refresh_background()?;
         }
+        // 遮挡 / 最小化（R08-7）：不取帧、不提交、不 present。帧**留在**最新帧槽里，damage 继续
+        // 合并 —— 恢复可见时一帧就能补上全部变化。这里只睡在 `[work, completion]` 上（定时唤醒
+        // 一次以重查可见性 / 关闭），不消耗 waitable token。
+        if renderer.window_occluded() {
+            crate::render::windows::diagnostics::occluded_skipped();
+            wait_for_work_or_completion(shared, Some(OCCLUDED_POLL_INTERVAL))?;
+            continue;
+        }
         if !shared.has_pending_frame() {
-            // 空闲且高水位还有缩小空间：内容静止满 `SHRINK_IDLE` 之后把 buffer 缩回当前内容的
-            // 桶（缩容 prime 拷贝旧内容，视觉切换那一帧没有背景闪）。缩容会 `wait_idle` 并重置
-            // 全部 in-flight 列表，先把已完成帧的反馈发布掉。
-            if renderer.shrink_due() {
-                drain_completed(renderer, shared, submitted);
-                renderer.maybe_shrink()?;
-                continue;
-            }
             // 空闲：睡在 [work, completion] 上（完成由 fence 的 `SetEventOnCompletion` 明确唤醒，
-            // 不轮询；没有待画帧时也不等 waitable，I3 的「每帧恰好一次」）。还有缩小空间时带一个
-            // 定时唤醒：静止窗口没有帧，否则永远醒不过来缩容；已经是最小桶时仍是无限等。
-            wait_for_work_or_completion(shared, renderer.shrink_in())?;
+            // 不轮询；没有待画帧时也不等 waitable，I3 的「每帧恰好一次」）。
+            wait_for_work_or_completion(shared, None)?;
             continue;
         }
         // I3：先等呈现节奏，再取「此刻最新」的帧 —— 等待期间 UI 的发布覆盖旧请求并合并 damage，
         // 渲染的是最新快照而不是最多等了一个 vsync 的旧快照（§4.2 的「帧是状态不是队列」）。
-        // 等待期间 completion 也可能到达：先发布反馈再继续等同一个 waitable（auto-reset 只能
-        // 消费一次，不能「等到了又重等」；关闭是这条规则的唯一例外，见 `wait_for_waitable`）。
-        wait_for_waitable(renderer, shared, submitted)?;
+        if !wait_for_waitable(renderer, shared, submitted)? {
+            // 没消费到 token（关闭 / 遮挡 / 超时后重查）：回到循环顶重新决策。
+            continue;
+        }
         if shared.shutdown_requested() {
             // 关闭：waitable 可能刚被消费（它与关闭同时到达），本帧不 present —— swapchain 随
             // 线程退出一起销毁，没有下一帧需要这个令牌。
@@ -902,9 +941,9 @@ fn run_gpu_loop(
             debug_assert!(false, "waitable consumed without a pending frame");
             continue;
         };
-        // 取帧之后、可能 `grow` 之前再排空一次完成通知：`grow` 会 `wait_idle` 并用 `prime`
-        // 占用一个 ring 槽，未 drain 的帧的 timestamp 读回缓冲会被 prime 的录制覆盖
-        // （`ResolveQueryData` 的写入与 CPU 读回共用同一块缓冲 → GPU 采样错帧）。
+        // 取帧之后、可能 `resize_target` 之前再排空一次完成通知：`resize_target` 会 `wait_idle`，
+        // 未 drain 的帧的 timestamp 读回缓冲会被后续录制覆盖（`ResolveQueryData` 的写入与 CPU
+        // 读回共用同一块缓冲 → GPU 采样错帧）。
         drain_completed(renderer, shared, submitted);
         // 等 waitable 期间到达的背景色：与帧一起落地（在录制前换掉 1×1 背景层，不引入新的
         // GPU 调用点）。
@@ -920,54 +959,83 @@ fn run_gpu_loop(
             }
         }
         // 内容尺寸变化：buffer 内是纯 CPU 记账（内容 visual 恒 1:1；放大露出的区域由 1×1
-        // 背景层填充，UI 只改内容 clip / 背景 scale）；
-        // 越过高水位 buffer 时在这里重建持久目标 + 交换链（DEVIATIONS §36 F-199 / `GpuRenderer::grow`），
-        // 重建失败（含内容 > 16384）以粘性错误退出，不静默裁剪。
+        // 背景层填充，UI 只改内容 clip / 背景 scale）；越过高水位 buffer 时在这里重建持久目标
+        // 并 `ResizeBuffers`（DEVIATIONS §36 F-199 / R08-1），重建失败（含内容 > 16384）以粘性
+        // 错误退出，不静默裁剪。
         renderer.set_content_size(request.surface)?;
         // DPI 与 `surface` 同帧过线：geometry 通道的顶点是逻辑像素，root uniform 的
         // `frame.params.x` 必须与这一帧的 surface 成对（contract §6）。
         renderer.set_scale(request.scale);
-        // 这一帧的内容尺寸自上次变化起已静止 `SHRINK_IDLE` ⇒ 先缩回当前内容的桶、再录这一帧
-        // （缩容 prime 里旧内容已经就位，这一帧的 damage 照常画进新持久目标）。空闲路径上的
-        // 检查保证静止窗口也缩；这里保证持续出帧（HUD / 动画）时「总有一帧待画」不会饿死缩容。
-        if renderer.shrink_due() {
-            renderer.maybe_shrink()?;
-        }
-        // 没有像素要画（Idle 且内容尺寸未变）⇒ 不产生 GPU 工作；该序号不会出现在完成通知里（§4.3）。
-        // 但 waitable 已经被消费：这样的帧不能走到这里（`window.rs` 在目标未重建时根本不发布
-        // Idle 计划；内容尺寸变化必然伴随全量 damage），因此只作不变量断言。
-        let mut frame = FramePlan::new(request.plan, renderer.is_fresh());
-        if frame.is_idle() {
-            debug_assert!(false, "idle frame consumed a waitable token");
-            continue;
-        }
-        let slot = renderer.acquire_slot();
-        renderer.wait_slot_fence(slot)?;
-        // 该槽的上一帧刚被等到：在录制覆盖它的 timestamp 读回缓冲**之前**发布它的反馈
-        // （`ResolveQueryData` 的写入与 CPU 读回共用这一块缓冲，必须按完成顺序串行化）。
-        drain_completed(renderer, shared, submitted);
-        let (stats, samples) = renderer.submit_frame(&request, &mut frame, slot)?;
-        // 上传已经录进本帧命令列表：共享槽这才算空，UI 可以入队下一笔。
-        for (index, awaiting) in atlas_awaiting.iter_mut().enumerate() {
-            if std::mem::take(awaiting) {
-                shared.atlas_uploaded(if index == 0 {
-                    AtlasKind::Glyph
-                } else {
-                    AtlasKind::Image
-                });
+        // 本帧提交时已经有更新的帧待画 ⇒ `Present1(sync = 0)` 替换队列里的帧（R08-9 方案 C ②）。
+        let replace = shared.has_pending_frame();
+        let mut draw_plan = request.plan;
+        let mut attempts = 0u32;
+        loop {
+            let slot = renderer.acquire_slot();
+            match renderer.wait_slot_fence(slot)? {
+                WaitOutcome::Signaled => {}
+                WaitOutcome::TimedOut => {
+                    // 设备健康但该槽的上一帧还没完成（R08-3）：换下一个槽；全部槽都在飞就跳过
+                    // 这一帧（不提交、不 present，也不销毁任何资源）。UI 的下一帧会带来新的
+                    // damage，帧槽的 damage 合并保证不丢更新。
+                    attempts += 1;
+                    if attempts >= MAX_FRAMES_IN_FLIGHT as u32 {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            // 该槽的上一帧刚被等到：在录制覆盖它的 timestamp 读回缓冲**之前**发布它的反馈
+            // （`ResolveQueryData` 的写入与 CPU 读回共用这一块缓冲，必须按完成顺序串行化）。
+            drain_completed(renderer, shared, submitted);
+            let mut frame = FramePlan::new(draw_plan, renderer.is_fresh());
+            if frame.is_idle() {
+                debug_assert!(false, "idle frame consumed a waitable token");
+                break;
+            }
+            match renderer.submit_frame(&request, &mut frame, slot, replace) {
+                Ok((stats, samples)) => {
+                    // 上传已经录进本帧命令列表：共享槽这才算空，UI 可以入队下一笔。
+                    for (index, awaiting) in atlas_awaiting.iter_mut().enumerate() {
+                        if std::mem::take(awaiting) {
+                            shared.atlas_uploaded(if index == 0 {
+                                AtlasKind::Glyph
+                            } else {
+                                AtlasKind::Image
+                            });
+                        }
+                    }
+                    submitted.push_back(SubmittedFrame {
+                        index: request.index,
+                        stats,
+                        samples,
+                        published_at: request.published_at,
+                        signal_value: slot.signal_value,
+                        slot: slot.index,
+                        surface: request.surface,
+                    });
+                    // 明确唤醒：该帧 GPU 工作完成时 fence 置位 `completion`（auto-reset），不忙轮询。
+                    renderer.set_completion_event(slot.signal_value, shared.completion)?;
+                    break;
+                }
+                Err(FrameSubmitError::NeedsResize) => {
+                    // `Present1` 报告交换链 out of date / 显示模式变化（R08-7）：重建目标
+                    // （`ResizeBuffers`）后重录这一帧。
+                    attempts += 1;
+                    if attempts > RESIZE_ATTEMPTS {
+                        return Err(EngineError::Swapchain {
+                            detail: smol_str::SmolStr::new_static(
+                                "Present1 kept reporting an out-of-date swapchain after resizing",
+                            ),
+                        });
+                    }
+                    renderer.resize_target()?;
+                    draw_plan = Plan::Full;
+                    continue;
+                }
+                Err(FrameSubmitError::Fatal(error)) => return Err(error),
             }
         }
-        submitted.push_back(SubmittedFrame {
-            index: request.index,
-            stats,
-            samples,
-            published_at: request.published_at,
-            signal_value: slot.signal_value,
-            slot: slot.index,
-            surface: request.surface,
-        });
-        // 明确唤醒：该帧 GPU 工作完成时 fence 置位 `completion`（auto-reset），不忙轮询。
-        renderer.set_completion_event(slot.signal_value, shared.completion)?;
     }
 }
 
@@ -1011,8 +1079,8 @@ fn drain_completed(
 
 /// 空闲等待：`[work_event, completion_event]`（都是 auto-reset，不会自旋）。
 ///
-/// `timeout` 只用于缩容的定时唤醒（内容静止满 `SHRINK_IDLE` 后醒一次再检查）；`None` = 无限等。
-/// 超时不是错误：回到循环顶部重新检查待画帧 / 缩容条件。
+/// `timeout` 只用于遮挡期间的可见性重查与缩容之外的定时唤醒；`None` = 无限等。
+/// 超时不是错误：回到循环顶部重新检查待画帧 / 遮挡 / 关闭。
 ///
 /// **这里的 `INFINITE` 是刻意保留的**（与 P1-2.13 修掉的那几处不同）：这是 GPU 线程「没有
 /// 活干」时的空闲等待，两个事件之一（新帧 / 关闭）出现前本该什么都不做。改成定时轮询只会
@@ -1039,7 +1107,7 @@ fn wait_for_work_or_completion(
         WAIT_OBJECT_0 => Ok(()),
         // `WaitForMultipleObjects` 的第二个对象 = completion。
         wait if wait.0 == WAIT_OBJECT_0.0 + 1 => Ok(()),
-        // 缩容定时唤醒：不是错误，也不是待画帧。
+        // 定时唤醒：不是错误，也不是待画帧。
         WAIT_TIMEOUT => Ok(()),
         _ => Err(EngineError::AppInit {
             detail: format_smolstr!(
@@ -1052,48 +1120,42 @@ fn wait_for_work_or_completion(
 
 /// 等帧延迟 waitable；期间 completion 到达就先发布反馈、再继续等（不把反馈拖到下一帧）。
 ///
-/// waitable 是 auto-reset：一旦这个循环消费了它，本帧就不允许再等第二次（否则会白等一个
-/// vsync），因此返回 `Ok` 之后调用方直接开始录制。**只有 waitable 分支才是消费**；completion
-/// 分支（帧完成 / 关闭）没有消费 waitable，返回后调用方必须自己检查 shutdown（§6.3）。
+/// 返回 `true` 表示**消费了** waitable（调用方必须 present 一帧）；`false` 表示提前返回
+/// （关闭 / 遮挡 / 超时后需要重新决策），调用方不得再取帧。
+///
+/// 超时（`None`）**不是错误**（R08-3）：`GetDeviceRemovedReason() == S_OK` 时窗口必须活着。
+/// 旧实现在 4 s 后返回 `DeviceLost`（粘性、进程级），锁一次屏就足以让整个应用永久冻结。
 fn wait_for_waitable(
     renderer: &mut GpuRenderer,
     shared: &Shared,
     submitted: &mut VecDeque<SubmittedFrame>,
-) -> Result<(), EngineError> {
+) -> Result<bool, EngineError> {
     let Some(waitable) = renderer.waitable() else {
-        return Ok(());
+        // 离屏目标没有交换链：节奏由调用方（同步路径）决定。
+        return Ok(true);
     };
-    // 连续超时计数：每次超时说明「present waitable 与关闭信号都没来」。健康情况下 present 在
-    // 一帧内必然完成，连续 `PRESENT_HANG_LIMIT` 次（≈ 4 s）没动静就按设备挂死上报，
-    // 而不是像旧实现那样永久阻塞（P1-2.13）。
-    let mut stalled = 0u32;
     loop {
-        let Some(signalled) = wait_for_pair(waitable, shared.completion, "waitable, completion")?
-        else {
-            if shared.shutdown_requested() {
-                return Ok(());
+        match wait_for_pair(waitable, shared.completion, "waitable, completion")? {
+            Some(0) => return Ok(true),
+            Some(_) => {
+                // completion：先发布反馈再继续等（waitable 还没被消费）。
+                drain_completed(renderer, shared, submitted);
+                if shared.shutdown_requested() || renderer.window_occluded() {
+                    return Ok(false);
+                }
             }
-            stalled += 1;
-            if stalled >= PRESENT_HANG_LIMIT {
-                return Err(EngineError::DeviceLost {
-                    reason: format_smolstr!(
-                        "DXGI present waitable did not signal for {} ms",
-                        u64::from(PRESENT_TIMEOUT_MS) * u64::from(PRESENT_HANG_LIMIT)
-                    ),
-                    log_path: std::path::PathBuf::new(),
-                });
+            None => {
+                // 超时：合成器/GPU 没回话但设备可能仍健康。计数 + 让设备丢失判据去做唯一裁决，
+                // 然后退避重试（不升级成任何粘性错误）。
+                crate::render::windows::diagnostics::present_waitable_timeout();
+                if let Some(error) = renderer.check_device_lost() {
+                    return Err(error);
+                }
+                if shared.shutdown_requested() || renderer.window_occluded() {
+                    return Ok(false);
+                }
+                std::thread::sleep(PRESENT_STALL_BACKOFF);
             }
-            continue;
-        };
-        stalled = 0;
-        if signalled == 0 {
-            return Ok(());
-        }
-        drain_completed(renderer, shared, submitted);
-        // 关闭：`request_shutdown` 置位 completion 把我们从这里唤醒。此时 waitable 没有被
-        // 消费，不能再去等它（驱动/遮挡让它不再 signal 时关闭会永不返回）——直接早退。
-        if shared.shutdown_requested() {
-            return Ok(());
         }
     }
 }
@@ -1102,15 +1164,14 @@ fn wait_for_waitable(
 ///
 /// **有界等待**（P1-2.13）：旧实现传 `INFINITE`。设备被移除 / 驱动挂死时 DXGI 的 waitable
 /// 对象永远不会 signal，GPU 线程就永久阻塞（关闭时还会连带拖住 UI 线程的消息泵）。
-/// 超时返回 `Ok(None)` 让调用方回到循环顶部重新检查关闭标志，并在连续多次超时后按
-/// `DeviceLost` 上报 —— 这才是可恢复的行为。
+/// 超时返回 `Ok(None)` 让调用方重查关闭 / 遮挡标志并交 `GetDeviceRemovedReason` 裁决。
 fn wait_for_pair(low: HANDLE, high: HANDLE, label: &str) -> Result<Option<usize>, EngineError> {
     // SAFETY: 两个句柄都由 `Shared`（或 swapchain）持有，调用方保证它们的生命周期覆盖本次等待。
     let wait = unsafe { WaitForMultipleObjects(&[low, high], false, PRESENT_TIMEOUT_MS) };
     match wait.0 {
         0 => Ok(Some(0)),
         1 => Ok(Some(1)),
-        // 超时：不是错误，让调用方重查关闭标志 / 计入挂死判定。
+        // 超时：不是错误，让调用方重查关闭 / 遮挡标志并计入诊断。
         timeout if timeout == WAIT_TIMEOUT.0 => Ok(None),
         // 无 mutex：只剩 `WAIT_FAILED`（或驱动返回的异常值）。
         _ => Err(EngineError::AppInit {
@@ -1124,8 +1185,13 @@ fn wait_for_pair(low: HANDLE, high: HANDLE, label: &str) -> Result<Option<usize>
 
 /// present waitable 的单次等待上限（P1-2.13）。
 const PRESENT_TIMEOUT_MS: u32 = 1_000;
-/// 连续多少次 present 等待超时判定为设备挂死（1 s x 4 = 4 s）。
-const PRESENT_HANG_LIMIT: u32 = 4;
+/// waitable 超时后的退避（R08-3：不升级成错误，只是让合成器有时间恢复）。
+const PRESENT_STALL_BACKOFF: Duration = Duration::from_millis(16);
+/// 遮挡期间重查可见性的间隔（R08-7）。
+const OCCLUDED_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// `Present1` 报告 out of date 之后最多重试几次（R08-7）。
+const RESIZE_ATTEMPTS: u32 = 2;
+
 /// 关闭时等待 GPU 线程退出的单轮上限（期间继续泵消息）。
 const JOIN_TIMEOUT_MS: u32 = 250;
 /// 关闭时等待 GPU 线程退出的总上限；超过则 detach，避免进程关不掉。

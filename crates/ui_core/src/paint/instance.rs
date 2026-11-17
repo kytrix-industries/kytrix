@@ -105,6 +105,11 @@ pub(crate) const CLIP_KIND_ROUNDED: f32 = 2.0;
 /// 该预算（全部轴对齐矩形 clip 求交合并成一条，无损），于是「8 层圆角 + 祖先矩形 clip」的链长
 /// 是 9 而不是 8。shader 的 clip 循环按真实链长收口，上界必须覆盖这个 9；链长超过 9（等价于
 /// 圆角层数 > 8）在编码期直接报错，绝不静默少裁。
+///
+/// 只被 debug 自检与测试消费（release 生产路径不需要这个数：链长上界由 `push_clip` 的圆角
+/// 预算 + 至多一条矩形项保证），因此按「debug 或测试」收口 —— 否则 release 构建会报
+/// `dead_code`（AR2b P3-N1）。**不是** `#[allow]`：release 下它真的没有读者。
+#[cfg(any(debug_assertions, test))]
 pub(crate) const MAX_CLIP_ITEMS: f32 = 9.0;
 
 /// 圆角半径的**唯一**规范化（R05-8 / AR2 P2-②）：两步、顺序固定。
@@ -158,6 +163,9 @@ fn normalize_corner_radius(radii: [f32; 4], width: f32, height: f32) -> [f32; 4]
 pub(crate) struct ClipChainId(u32);
 
 impl ClipChainId {
+    /// 帧内表项下标。消费者只有 debug 自检与测试（生产路径直接用 `.0` 写进 `meta.x`），
+    /// 因此按「debug 或测试」收口，避免 release 构建的 `dead_code` 警告（AR2b P3-N1）。
+    #[cfg(any(debug_assertions, test))]
     fn index(self) -> usize {
         self.0 as usize
     }
@@ -581,6 +589,44 @@ fn aabb_to_rect(aabb: [f32; 4]) -> [f32; 4] {
     [aabb[0], aabb[1], aabb[2] - aabb[0], aabb[3] - aabb[1]]
 }
 
+/// 矩形 clip 的**像素吸附**（Skia `SkIRect::roundOut`）：`lo = floor(x0)`、`hi = ceil(x1)`。
+///
+/// 为什么必须在编码期吸附：矩形项的覆盖率语义是**像素精确 scissor**（0/1，不参与 AA），
+/// shader 侧只能拿**像素索引**（`floor(world_px)`）与 `[lo, hi)` 比较。`world_px` 是插值得到
+/// 的顶点属性（顶点只夹到 `clip_rect ± KYTRIX_CLIP_VERTEX_SLACK`，所以边界像素确有片元），
+/// 一旦拿它和浮点边界做「±0.5 px 像素单元」的相等判定，1 ulp 的插值误差就会让边界像素翻面；
+/// 覆盖率是 0/1 ⇒ 翻面 = **整列像素以满不透明越出裁剪框**（AR2b P1-N1：lavapipe 上实测 1 px
+/// 实心出框条并被 bless 进基线）。吸附到整数后，`floor(world_px)` 与整数边界之间没有任何平局，
+/// 1 ulp 改不了 `floor` 的结果。
+///
+/// 方向 = **向外**（`roundOut`，保证不漏裁）：这与旧的「片元像素单元（±0.5 px）与矩形有交」
+/// 判定**逐像素等价**（后者本来就等于 `roundOut`），所以吸附不改变任何像素的取舍，只是把同一
+/// 次计算挪到整数上 —— 对 golden 的影响只有「原本落在平局错误一侧的像素归位」（lavapipe 的
+/// 越界列消失）。向内吸附会裁掉与矩形有交的像素（内容被多裁 1 px），没有理由。
+///
+/// 空交集（含零宽高）归宿成 `w = h = 0`（= 全裁，shader 见到非正 w/h 直接返回 0）。不能对空
+/// 交集用 `floor/ceil`：它会把反向区间变成 1 px 的保留区（`floor(10.6) = 10`、`ceil(10.4) = 11`）。
+/// 这样「矩形项恒为整数物理像素」就没有例外，shader 侧的比较也不需要任何 epsilon。
+fn snap_rect_clip_to_pixels(rect: [f32; 4]) -> [f32; 4] {
+    // 空交集 / 零尺寸（`!(w > 0)` 也覆盖 NaN）：`floor/ceil` 会把反向区间变成 1 px 的保留区
+    // （`floor(10.6) = 10`、`ceil(10.4) = 11`），所以直接给 `w = h = 0`（shader 全裁）。
+    if !(rect[2] > 0.0 && rect[3] > 0.0) {
+        return [rect[0].floor(), rect[1].floor(), 0.0, 0.0];
+    }
+    let lo_x = rect[0].floor();
+    let lo_y = rect[1].floor();
+    let hi_x = (rect[0] + rect[2]).ceil();
+    let hi_y = (rect[1] + rect[3]).ceil();
+    let snapped = [lo_x, lo_y, hi_x - lo_x, hi_y - lo_y];
+    // 极端坐标（|x| 接近 f32::MAX）上 `hi - lo` 会溢出成 inf；编码器约定 clip 矩形有限，
+    // 这种输入下退回原值（shader 的比较仍然给出「全裁」，不会画错东西）。
+    if snapped.iter().all(|value| value.is_finite()) {
+        snapped
+    } else {
+        rect
+    }
+}
+
 /// 逻辑矩形经仿射变换后的 AABB（`[x0, y0, x1, y1]`，逻辑像素）。
 ///
 /// 非有限输入返回**反向区间**（= 空），避免 `f32::min/max` 吞掉 NaN 后得到「看起来合法」
@@ -781,6 +827,26 @@ impl InstanceEncoder {
                     "clip chain parent must precede its child"
                 );
             }
+            // AR2b P2-N1：`GpuClipEntry.meta.y`（`ClipKind` 的 GPU 编码）是 shader 分流矩形 /
+            // 圆角的**唯一**依据，但它的取值只由 `ClipKind::gpu()` 决定 —— 把两个值对调后
+            // 覆盖率只是「乘错一次」（矩形项被当圆角做 AA ⇒ 0.25 暗边；圆角项被当矩形硬裁 ⇒
+            // 圆角不被裁），单测与像素 golden 都可能仍然是绿的（复审实测：对调后 1174 单测 +
+            // 8 条 golden 全绿）。因此这里用**几何**不变量交叉校验 `meta.y`：
+            // 四角半径全 0 ⇔ 矩形项（`push_clip` 把全零半径路由到矩形分支，圆角项必有非零半径），
+            // 于是「对调 Rect/Rounded」会立刻打破它。
+            let entry = chain.gpu_entry();
+            let rect_kind = chain.corner_radius.iter().all(|radius| *radius == 0.0);
+            let expected = if rect_kind {
+                CLIP_KIND_RECT as u32
+            } else {
+                CLIP_KIND_ROUNDED as u32
+            };
+            debug_assert_eq!(
+                entry.meta[1], expected,
+                "GpuClipEntry.meta.y 必须与覆盖率语义一致（1 = 矩形 scissor、2 = 圆角 AA）"
+            );
+            debug_assert_eq!(entry.meta[2], 0, "ClipEntry.meta.zw 保留恒 0");
+            debug_assert_eq!(entry.meta[3], 0, "ClipEntry.meta.zw 保留恒 0");
         }
         // 每个实例的 `clip_depth`（params1.w）必须等于它那条链的真实链长：shader 用这个值
         // 收口循环，写错就是静默少裁（R05-5 / R05-11）。链长还必须有界（shader 的循环上界是
@@ -965,9 +1031,14 @@ impl FrameEncoder<'_> {
     ///
     /// 覆盖率相乘在 shader 里与顺序无关，但链必须始终只有**一条**矩形项 —— 否则「矩形
     /// 交集」会被乘两次（正是 R05-10 的 0.25 暗边）。圆角项的矩形/半径不变，只重挂 parent。
+    ///
+    /// 矩形项的表项存的是**吸附到整数物理像素**的矩形（[`snap_rect_clip_to_pixels`]，
+    /// Skia `roundOut` 语义）：shader 的 scissor 判定按像素索引做，浮点边界会让边界像素在
+    /// 1 ulp 上翻面（AR2b P1-N1）。圆角项**不**吸附 —— 它们的几何必须保持精确，AA 带宽逐
+    /// 像素计算。
     fn rebuild_rect_chain(&mut self) {
         let rect_entry = if self.state.has_rect {
-            let rect = aabb_to_rect(self.state.rect_aabb);
+            let rect = snap_rect_clip_to_pixels(aabb_to_rect(self.state.rect_aabb));
             Some(self.chain_entry(None, ClipKind::Rect, rect, [0.0; 4]))
         } else {
             None
@@ -1278,15 +1349,16 @@ mod tests {
     use std::rc::Rc;
 
     use super::{
-        ClipChain, ClipChainId, ClipKind, ClipState, GRADIENT_HORIZONTAL, GRADIENT_RADIAL,
-        GRADIENT_VERTICAL, GpuPrimitive, InstanceBuffer, InstanceEncoder, KIND_GLYPH, KIND_QUAD,
-        KIND_SHADOW, MAX_CLIP_ITEMS, SHADOW_SIGMA_MIN, SHADOW_SIGMA_SCALE, TEXTURE_GLYPH,
-        normalize_corner_radius,
+        CLIP_KIND_RECT, CLIP_KIND_ROUNDED, ClipChain, ClipChainId, ClipKind, ClipState,
+        GRADIENT_HORIZONTAL, GRADIENT_RADIAL, GRADIENT_VERTICAL, GpuPrimitive, InstanceBuffer,
+        InstanceEncoder, KIND_GLYPH, KIND_QUAD, KIND_SHADOW, MAX_CLIP_ITEMS, SHADOW_SIGMA_MIN,
+        SHADOW_SIGMA_SCALE, TEXTURE_GLYPH, normalize_corner_radius, snap_rect_clip_to_pixels,
     };
     use crate::{
         math::{Point, Rect, Scale, Size, Transform},
         paint::{
             atlas::{AtlasKind, AtlasTile},
+            canvas::Canvas,
             color::{Color, ColorResolver},
             geometry::GeometryId,
             primitive::{
@@ -1371,11 +1443,13 @@ mod tests {
         assert!(scene.push(lane, Primitive::Clip(ClipOp::Push(clip))));
     }
 
-    /// shader `clip_mask` 的 **CPU 镜像**（测试 oracle，`pixel` 是片元中心）。
+    /// shader `clip_mask` 的 **CPU 镜像**（测试 oracle，`pixel` 是片元中心，真实取值恒为
+    /// `(k + 0.5, j + 0.5)`）。
     ///
     /// 三份 shader 的逐语句等价由 `build.rs` 的归一化比对守护（`MATH_FUNCTIONS` 含
     /// `clip_mask`），本镜像负责钉住**数值语义**（覆盖率到底是 0.5 还是 0.25）。AA 带宽取
-    /// `length(ddx, ddy)` = 1 px（屏幕对齐几何的导数模长）。
+    /// `length(ddx, ddy)` = 1 px（屏幕对齐几何的导数模长）。矩形项与 shader 同构：**像素索引**
+    /// `floor(pixel)` 与编码期吸附到整数物理像素的 `[lo, hi)` 比较（不是 ±0.5 的浮点单元）。
     fn clip_coverage(clips: &[ClipChain], head: ClipChainId, pixel: (f32, f32)) -> f32 {
         let mut m = 1.0f32;
         let mut cursor = Some(head);
@@ -1386,13 +1460,10 @@ mod tests {
             }
             match entry.kind {
                 ClipKind::Rect => {
+                    let (pixel_x, pixel_y) = (pixel.0.floor(), pixel.1.floor());
                     let (lo_x, lo_y) = (entry.rect[0], entry.rect[1]);
                     let (hi_x, hi_y) = (lo_x + entry.rect[2], lo_y + entry.rect[3]);
-                    if pixel.0 + 0.5 <= lo_x
-                        || pixel.1 + 0.5 <= lo_y
-                        || pixel.0 - 0.5 >= hi_x
-                        || pixel.1 - 0.5 >= hi_y
-                    {
+                    if pixel_x < lo_x || pixel_y < lo_y || pixel_x >= hi_x || pixel_y >= hi_y {
                         return 0.0;
                     }
                 }
@@ -1756,22 +1827,24 @@ mod tests {
     /// `0.5 × 0.5 = 0.25` 的暗边（`Clip::Bounds` 容器 + Canvas 圆角 clip 是行情/图表最常见的嵌套）。
     #[test]
     fn rect_and_rounded_clip_with_the_same_bounds_do_not_darken_the_edge() {
+        // 逻辑 29.75 @scale 2 ⇒ 物理 59.5：右/下边界落在**半像素**上，片元中心 (59.5, …) 恰好压在
+        // 圆角 AA 的等值线上（覆盖率 0.5）。只有这种分数边界才能区分「乘一次 AA」和「乘两次」。
         let scene = scene_with(|scene, lane| {
             // 祖先/容器的矩形 clip（`Clip::Bounds`）。
             push_clip(
                 scene,
                 lane,
                 ClipRect {
-                    rect: rect(0.0, 0.0, 30.0, 30.0),
+                    rect: rect(0.0, 0.0, 29.75, 29.75),
                     corner_radius: [0.0; 4],
                 },
             );
-            // 内部 Canvas 的圆角 clip，边界相同。
+            // 内部 Canvas 的圆角 clip，几何边界相同。
             push_clip(
                 scene,
                 lane,
                 ClipRect {
-                    rect: rect(0.0, 0.0, 30.0, 30.0),
+                    rect: rect(0.0, 0.0, 29.75, 29.75),
                     corner_radius: [2.0; 4],
                 },
             );
@@ -1789,35 +1862,42 @@ mod tests {
         assert_eq!(root.kind, ClipKind::Rect, "矩形项 = scissor，必须是链根");
         assert_eq!(root.parent, None);
         assert_eq!(root.corner_radius, [0.0; 4]);
-        // 物理 (0,0,60,60)：像素 (60,30) 恰好落在右边界上。矩形 scissor 保守保留该像素的
-        // 单元（roundOut），覆盖率完全由圆角 AA 给出 = 0.5。旧实现 rect×rounded = 0.25。
+        // 矩形项吸附到整数物理像素（roundOut：`floor(0)` / `ceil(59.5) = 60`）；
+        // 圆角项**不**吸附（AA 需要精确几何）。
+        assert_eq!(root.rect, [0.0, 0.0, 60.0, 60.0]);
+        assert_eq!(head.rect, [0.0, 0.0, 59.5, 59.5]);
+        // 片元中心 (59.5, 30.5)：圆角 AA = 0.5，矩形 scissor 保留该像素（roundOut 不漏裁）
+        // ⇒ 覆盖率 0.5。旧实现（矩形也做 AA）会得到 0.25 的暗边。
         let coverage = clip_coverage(
             &buffer.clips,
             ClipChainId(instance.params1[0] as u32),
-            (60.0, 30.0),
+            (59.5, 30.5),
         );
         assert!(
             (coverage - 0.5).abs() < 1e-4,
             "同边界的矩形 + 圆角 clip 只能乘一次 AA（0.5），实际 {coverage}"
         );
-        // 边界外一个像素：scissor 全裁（0），不是 0.25 的鬼线。
+        // 边界外一个像素：scissor 与 AA 都裁（0），不是 0.25 的鬼线。
         let outside = clip_coverage(
             &buffer.clips,
             ClipChainId(instance.params1[0] as u32),
-            (61.0, 30.0),
+            (60.5, 30.5),
         );
         assert_eq!(outside, 0.0);
     }
 
-    /// AR2 P1-A ③：纯矩形裁剪的覆盖率只有 0 或 1（像素精确 scissor），边界像素不是 0.5。
+    /// AR2 P1-A ③ / AR2b P2-N2：纯矩形裁剪的覆盖率只有 0 或 1（像素精确 scissor），边界像素
+    /// 不是 0.5。**必须用分数边界**：整数边界下「矩形也走 AA」的实现同样给出 0/1（AA 在整数
+    /// 边界上正好是 0 或 1），测试是假绿（复审 M5 变异证明）。
     #[test]
     fn pure_rect_clip_coverage_is_binary() {
+        // 逻辑 30.3 × 30.7 @scale 2 ⇒ 物理 (0,0,60.6,61.4) ⇒ roundOut 吸附到 [0,61) × [0,62)。
         let scene = scene_with(|scene, lane| {
             push_clip(
                 scene,
                 lane,
                 ClipRect {
-                    rect: rect(0.0, 0.0, 30.0, 30.0),
+                    rect: rect(0.0, 0.0, 30.3, 30.7),
                     corner_radius: [0.0; 4],
                 },
             );
@@ -1827,15 +1907,24 @@ mod tests {
         let buffer = encode(&scene);
         let instance = buffer.instances[0];
         let head = ClipChainId(instance.params1[0] as u32);
-        // 物理盒 (0,0,60,60)，片元中心取 .5 偏移。
-        for pixel in [(0.5, 0.5), (59.5, 30.5), (30.5, 59.5), (30.5, 30.5)] {
+        // 吸附后的表项必须是整数物理像素（shader 按像素索引比较，浮点边界会有 1 ulp 平局）。
+        assert_eq!(buffer.clips[head.index()].rect, [0.0, 0.0, 61.0, 62.0]);
+        // 框内（含 roundOut 保留的边界像素 60 / 61）：覆盖率恰好 1.0。
+        // 分数边界 60.6 上 AA 实现会给 0.6，整数边界下同样会「恰好」通过 ⇒ 这才是活断言。
+        for pixel in [
+            (0.5, 0.5),
+            (60.5, 30.5),
+            (30.5, 61.5),
+            (60.5, 61.5),
+            (30.5, 30.5),
+        ] {
             assert_eq!(
                 clip_coverage(&buffer.clips, head, pixel),
                 1.0,
                 "{pixel:?} 必须全保留"
             );
         }
-        for pixel in [(60.5, 30.5), (30.5, 60.5), (-0.5, 30.5), (30.5, -0.5)] {
+        for pixel in [(61.5, 30.5), (30.5, 62.5), (-0.5, 30.5), (30.5, -0.5)] {
             assert_eq!(
                 clip_coverage(&buffer.clips, head, pixel),
                 0.0,
@@ -1844,9 +1933,103 @@ mod tests {
         }
     }
 
-    /// R05-10 的零尺寸语义：0 宽/高的 clip 必须**全裁**（覆盖率 0），不是 0.5 的鬼线。
+    /// AR2b P1-N1（编码期半边）：矩形 clip 必须吸附到**整数物理像素**且方向为「向外」
+    /// （Skia `SkIRect::roundOut`）—— shader 侧据此按像素索引比较，1 ulp 不再能翻面。
     #[test]
-    fn zero_sized_clip_encodes_as_a_negative_extent() {
+    fn rect_clip_snaps_outward_to_integer_pixels() {
+        // 落在一个像素中间：向外取整 = 覆盖全部与矩形有交的像素（不漏裁）。
+        assert_eq!(
+            snap_rect_clip_to_pixels([10.3, 4.7, 20.4, 9.6]),
+            [10.0, 4.0, 21.0, 11.0]
+        );
+        // 左/上边界取 floor，右/下边界取 ceil（不是 trunc / round）：负坐标同理。
+        assert_eq!(
+            snap_rect_clip_to_pixels([-3.25, -0.75, 5.5, 2.25]),
+            [-4.0, -1.0, 7.0, 3.0]
+        );
+        // 已经是整数：幂等（吸附不改变任何像素的取舍）。
+        assert_eq!(
+            snap_rect_clip_to_pixels([8.0, 8.0, 140.0, 90.0]),
+            [8.0, 8.0, 140.0, 90.0]
+        );
+        // 空交集 / 零尺寸：归宿成 w = h = 0（全裁），不得被向外取整变成 1 px 的保留区。
+        assert_eq!(
+            snap_rect_clip_to_pixels([10.6, 0.0, -0.2, 5.0]),
+            [10.0, 0.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            snap_rect_clip_to_pixels([4.0, 4.0, 0.0, 10.0]),
+            [4.0, 4.0, 0.0, 0.0]
+        );
+        // 极端坐标：`hi - lo` 会溢出成 inf ⇒ 退回原值（不产生 inf 表项）。
+        assert_eq!(
+            snap_rect_clip_to_pixels([3.0e38, 0.0, 3.0e38, 10.0]),
+            [3.0e38, 0.0, 3.0e38, 10.0]
+        );
+    }
+
+    /// AR2b P2-N1：`GpuClipEntry.meta.y` 是 GPU 契约（shader 的 `clip_mask` 据此分流矩形
+    /// scissor / 圆角 AA），必须有 **headless** 断言。变异验证：把 `ClipKind::gpu()` 的
+    /// Rect/Rounded 取值对调 ⇒ 本测试与 debug 自检（`meta.y` 与「半径是否全 0」交叉校验）
+    /// 都红；复审实测对调后 1174 单测 + 8 条 golden **全绿**。
+    #[test]
+    fn gpu_clip_entries_encode_the_kind_in_meta_y() {
+        let scene = scene_with(|scene, lane| {
+            push_clip(
+                scene,
+                lane,
+                ClipRect {
+                    rect: rect(0.0, 0.0, 30.0, 30.0),
+                    corner_radius: [0.0; 4],
+                },
+            );
+            push_clip(
+                scene,
+                lane,
+                ClipRect {
+                    rect: rect(2.0, 2.0, 26.0, 26.0),
+                    corner_radius: [3.0; 4],
+                },
+            );
+            assert!(scene.push(lane, quad_primitive(solid())));
+            assert!(scene.push(lane, Primitive::Clip(ClipOp::Pop)));
+            assert!(scene.push(lane, Primitive::Clip(ClipOp::Pop)));
+        });
+        let buffer = encode(&scene);
+        let instance = buffer.instances[0];
+        let head_id = ClipChainId(instance.params1[0] as u32);
+        let head = buffer.clips[head_id.index()];
+        assert_eq!(head.kind, ClipKind::Rounded);
+        let root_id = head.parent.expect("圆角项挂在矩形项下面");
+        assert_eq!(buffer.clips[root_id.index()].kind, ClipKind::Rect);
+        // 上传路径（`write_clips_gpu` → `GpuClipEntry`）里的 `meta.y` 逐条钉死。
+        let mut uploaded = Vec::new();
+        buffer.write_clips_gpu(&mut uploaded);
+        assert_eq!(uploaded.len(), 3, "哨兵 + 矩形 + 圆角");
+        // 表项 0 = 哨兵：kind 写 Rect 但 `clip_index == 0` 时 shader 直接早退，无副作用。
+        assert_eq!(
+            uploaded[0].meta,
+            [0, CLIP_KIND_RECT as u32, 0, 0],
+            "哨兵项 meta"
+        );
+        assert_eq!(
+            uploaded[root_id.index()].meta,
+            [0, CLIP_KIND_RECT as u32, 0, 0],
+            "矩形项（链根）的 meta：parent = 0、kind = RECT"
+        );
+        assert_eq!(
+            uploaded[head_id.index()].meta,
+            [root_id.index() as u32, CLIP_KIND_ROUNDED as u32, 0, 0],
+            "圆角项的 meta：parent = 矩形项、kind = ROUNDED"
+        );
+    }
+
+    /// R05-10 的零尺寸语义：0 宽/高的 clip 必须**全裁**（覆盖率 0），不是 0.5 的鬼线。
+    ///
+    /// 两个层面都要钉住：① 实例的 `clip_rect`（交集的浮点 AABB）w/h 非正；② 矩形 clip **表项**
+    /// 是整数物理像素的 `w = h = 0`（向外取整不能把空交集变成 1 px 的保留区，AR2b P1-N1）。
+    #[test]
+    fn zero_sized_clip_encodes_as_a_zero_extent() {
         let scene = scene_with(|scene, lane| {
             push_clip(
                 scene,
@@ -1866,6 +2049,13 @@ mod tests {
             instance.clip_rect[2] <= 0.0 || instance.clip_rect[3] <= 0.0,
             "零尺寸交集的 w/h 必须非正（shader 据此返回覆盖率 0）：{:?}",
             instance.clip_rect
+        );
+        let entry = buffer.clips[instance.params1[0] as usize];
+        assert_eq!(entry.kind, ClipKind::Rect);
+        assert_eq!(
+            entry.rect,
+            [8.0, 8.0, 0.0, 0.0],
+            "矩形项必须归宿成整数的零尺寸（scissor 全裁），不得被 roundOut 变成 1 px"
         );
     }
 
@@ -2007,6 +2197,50 @@ mod tests {
             Err(other) => panic!("9 层圆角 + 矩形必须报 ClipDepthExceeded，实际 {other:?}"),
             Ok(_) => panic!("9 层圆角 + 矩形必须报 ClipDepthExceeded"),
         }
+    }
+
+    /// AR2b P3-N3：上面那条「8 圆角 + 祖先矩形」用例走的是 `scene.push(Clip::Push)`，**没有**
+    /// 经过 `Canvas::push_clip` 的门限。这条补上 Canvas 集成用例：同一个 `Canvas` 里压 8 层圆角
+    /// （门限必须允许，因为矩形祖先不占圆角预算）+ 祖先矩形 ⇒ 链长 9，编码成功。
+    #[test]
+    fn canvas_rounded_clips_under_an_ancestor_rect_fit_the_chain_limit() {
+        let mut canvas = Canvas::new(rect(0.0, 0.0, 64.0, 32.0));
+        for index in 0..usize::from(MAX_CLIP_DEPTH) {
+            assert!(
+                canvas.push_clip(ClipRect {
+                    // 逐层不同的矩形：完全相同的圆角层在编码期会去重（`duplicate_rounded`）。
+                    rect: rect(index as f32, 0.0, 30.0, 30.0),
+                    corner_radius: [2.0; 4],
+                }),
+                "Canvas 门限只数圆角层：第 8 层圆角必须允许"
+            );
+        }
+        canvas.push_quad(Quad {
+            bounds: rect(1.0, 2.0, 10.0, 20.0),
+            corner_radius: [0.0; 4],
+            paint: solid(),
+        });
+        for _ in 0..usize::from(MAX_CLIP_DEPTH) {
+            assert!(canvas.pop_clip());
+        }
+
+        let scene = scene_with(|scene, lane| {
+            // 祖先矩形 clip（`Clip::Bounds` 容器走同一条 `ClipOp::Push` 路径）。
+            push_clip(
+                scene,
+                lane,
+                ClipRect {
+                    rect: rect(-10.0, -10.0, 200.0, 200.0),
+                    corner_radius: [0.0; 4],
+                },
+            );
+            assert!(scene.push(lane, Primitive::Canvas(Rc::new(canvas))));
+            assert!(scene.push(lane, Primitive::Clip(ClipOp::Pop)));
+        });
+        let buffer = encode(&scene);
+        let instance = buffer.instances[0];
+        assert_eq!(instance.params1[3], 9.0, "8 层圆角 + 1 条矩形 = 链长 9");
+        assert_eq!(instance.params1[3], MAX_CLIP_ITEMS);
     }
 
     /// R05-11：`params1.w` 携带真实链长（旧实现写 `FLAG_OPAQUE` 而无人读）。

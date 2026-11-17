@@ -42,11 +42,12 @@ pub(crate) fn set_input_thresholds(app: &mut App, thresholds: InputThresholds) {
     app.thresholds = thresholds;
 }
 
-/// 程序性分发（测试 / 菜单桥 / a11y 的 `ActionRequest`）。返回是否被处理。
+/// 程序性分发（测试 / 菜单桥 / a11y 的 `Click`）。返回是否被处理。
 ///
-/// **受模态作用域约束**（R02-12）：目标节点在作用域外 ⇒ `false`（不派发）。a11y 的
-/// `ActionRequest` 与菜单桥都走这里，因此「模态外不可激活」对指针、键盘、辅助技术三条路径
-/// 同时成立（Blink 的 `inert` 背景、Qt 的模态窗口同一语义）。
+/// **受模态作用域约束**（R02-12）：目标节点在作用域外 ⇒ `false`（不派发）。菜单桥与 a11y 的
+/// `Click` 走这里；a11y 的其它动作（`SetValue` / `Increment` / `Custom` / `Scroll*`）不经过
+/// 本函数，它们在 a11y 入口（`crate::a11y::action::dispatch`）用**同一个** `focus::in_scope`
+/// 判据校验 —— 三条路径（指针 / 键盘 / 辅助技术）因此口径一致（AR1b N2）。
 ///
 /// 例外是**引擎级动作**（[`Action::FocusNext`] / [`Action::FocusPrev`] / [`Action::Dismiss`]）：
 /// 它们作用于窗口级状态而不是激活目标节点，模态打开时仍必须可用（Esc 关浮层、Tab 遍历）。
@@ -203,7 +204,8 @@ pub(crate) fn dispatch_input(app: &mut App, window: WindowId, event: InputEvent)
         // 手势（捏合 / 旋转 / 智能缩放，R09-4）：引擎**不发明**默认语义（缩放倍率、旋转锚点、
         // 复位策略全是应用领域知识），因此这里只做交互收尾：手势属于指针会话，取消拖拽/悬停
         // 状态由平台侧的 `PointerCancel` 负责，本事件本身不改变引擎状态。应用通过
-        // `App::drain_events` 观察它们（与 `Text` 同一条观测通路）。
+        // `App::drain_events` 观察它们（与 `Text` 同一条观测通路）。**当前只有 macOS 后端
+        // 产生这些事件**（Windows / Linux 无手势生产点，见 `event::GesturePhase`）。
         InputEvent::Magnify { .. }
         | InputEvent::Rotate { .. }
         | InputEvent::SmartMagnify { .. } => {}

@@ -57,6 +57,18 @@ pub(crate) struct GpuCaps {
 }
 
 impl GpuCaps {
+    /// 采集设备能力（只在 [`super::core::GpuCore`] 的进程级初始化里调用一次）。
+    pub(crate) fn collect(device: &ProtocolObject<dyn MTLDevice>) -> Self {
+        Self {
+            adapter: device_name(device),
+            registry_id: device.registryID(),
+            unified_memory: device.hasUnifiedMemory(),
+            low_power: device.isLowPower(),
+            max_buffer_length: device.maxBufferLength() as u64,
+            argument_buffers_tier: device.argumentBuffersSupport().0 as i32,
+        }
+    }
+
     /// 硬基线：**Argument Buffers Tier 2** + `maxBufferLength >= 256 MiB`
     /// （实例/裁剪/上传缓冲都是大 buffer；`maxBufferLength` 是 Apple GPU 的硬上限）。
     pub(crate) fn baseline_ok(&self) -> bool {
@@ -151,27 +163,13 @@ struct LostInfo {
 }
 
 impl Device {
-    /// 产品路径：系统默认设备 → 采 caps → 校验 D8。
+    /// 底层设备来自进程单例（[`super::core::GpuCore`]）：`MTLCreateSystemDefaultDevice` 与
+    /// caps 基线校验全进程只做一次（R09-5 / R09-36）。本类型只持有**本窗口自己**的句柄表与
+    /// 丢失状态，因此 retire 的语义仍是逐窗口的。
     pub(crate) fn new() -> Result<Self, EngineError> {
-        let raw =
-            objc2_metal::MTLCreateSystemDefaultDevice().ok_or(EngineError::UnsupportedGpu {
-                os: "macos",
-                required: D8_REQUIRED,
-                actual: SmolStr::new_static("no Metal device"),
-            })?;
-        let caps = GpuCaps {
-            adapter: device_name(&raw),
-            registry_id: raw.registryID(),
-            unified_memory: raw.hasUnifiedMemory(),
-            low_power: raw.isLowPower(),
-            max_buffer_length: raw.maxBufferLength() as u64,
-            argument_buffers_tier: raw.argumentBuffersSupport().0 as i32,
-        };
-        caps.check()?;
-        // 诊断行只在启动失败时有消费者；这里断言它可格式化（`AppInit` 的 detail 会带上）。
-        debug_assert!(!caps.describe().is_empty());
+        let core = crate::render::macos::core::GpuCore::shared()?;
         Ok(Self {
-            raw,
+            raw: core.retain_device(),
             resources: ResourceTable::new(),
             lost: None,
         })

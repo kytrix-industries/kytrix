@@ -6,7 +6,7 @@
 |---------------|-----------------------------------|-----------------------------------|
 | `warp/`       | Windows WARP（D3D12 软件设备）    | 既有                              |
 | `lavapipe/`   | Linux Mesa llvmpipe（软件 Vulkan）| 2026-11-13 新增（见下）           |
-| `metal-real/` | macOS 实机 GPU（Intel Iris Plus 655 / Metal 3） | 2026-11-13 新增（13 份） |
+| `metal-real/` | macOS 实机 GPU（Intel Iris Plus 655 / Metal 3） | 2026-11-13 新增（13 份；`clip_subpixel` 待真机重基） |
 
 `SnapshotCase::golden_path()` 按 `device_dir()` 取目录。三个平台都跑；每个平台只和自己的基线比。
 
@@ -29,7 +29,8 @@ golden 是 `SnapshotImage.rgba8` 的**原样**落盘：**预乘 sRGB 编码的 R
 | `gradient` | 线性水平 / 垂直 / 径向（OKLCH + OKLab 端点）                         | 240×160      | 1          | light       |
 | `colors`   | 纯色 / 半透明叠加 / 高彩度 OKLCH（gamut 边界）                       | 160×120      | 1          | light、dark |
 | `image`    | 图片图集：1:1 / 2× / 半透明调制（16×16 四象限 alpha = 255/170/85/0） | 160×120      | 1、2       | light       |
-| `clip`     | 嵌套 clip + 溢出子矩形                                               | 240×160      | 1          | light       |
+| `clip`     | 嵌套 clip + 溢出子矩形（整数边界；**0 容差**，见下）                 | 240×160      | 1          | light       |
+| `clip_subpixel` | 分数坐标边界（容器物理边界 24.25 / 20.5 / 156.5 / 96.75）加四边溢出的子矩形（**0 容差**） | 240×160 | 1 | light |
 
 **没有文字 case**：字形像素依赖宿主字体文件与版本，跨机必然分叉（`../../design/DEVIATIONS.md` F-144 / V-96）。
 字形由 `rendered_text_produces_visible_glyph_pixels`（覆盖率 sanity）与 L2 的 `GlyphRun` 断言覆盖。
@@ -40,6 +41,7 @@ golden 是 `SnapshotImage.rgba8` 的**原样**落盘：**预乘 sRGB 编码的 R
 |-------------------------------------------|---------|-------------------------------------------------|
 | `Tolerance::default().per_channel`        | `2`     | 单通道允许的最大绝对差（`0..=255`，alpha 也参与） |
 | `Tolerance::default().max_mismatch_ppm`   | `1_000` | 不匹配像素的**比例**上限，单位 1e-6（= 0.1%）     |
+| `Tolerance::GEOMETRY.max_mismatch_ppm`    | `0`     | **几何边界 case**（`clip` / `clip_subpixel`）专用：0 个不匹配像素 |
 
 判定规则：
 
@@ -50,11 +52,16 @@ mismatched_pixels <= floor(compared_pixels × max_mismatch_ppm / 1_000_000)
 - **不匹配像素** = 任一通道差 `> per_channel` 的像素（含 alpha 通道）。
 - 240×160 的 case（38400 像素）允许 38 个不匹配像素；160×120（19200）允许 19 个；
   2×2 的小图允许 **0** 个 —— 比例容差不是小图的免死金牌。
+- **`clip` / `clip_subpixel` 用 `Tolerance::GEOMETRY`（`max_mismatch_ppm = 0`）**：这两个 case
+  的内容是「平涂色块被裁到某一条像素列/行」，边界像素的取舍是 0/1 语义。0.1% 的比例容差对
+  它们没有检测力 —— 整列 20 px 的越界只占 0.05%，会被静默放过（AR2b P1-N1 就是这样进基线的）。
+  `per_channel` 仍是 2（只吸收三平台 sRGB 量化的 1 级差），所以它**不是**逐字节比较。
 - `max_channel_diff` / `avg_channel_diff` 只进报告、**不参与判定**：AA 边缘和阴影渐变会让
   它们逐次抖动，拿它们做门禁等于让三个平台比「谁更圆」。
 - 比例用整数 ppm 而不是浮点：容差要能 `Eq` 比较，判定必须逐平台逐次可复现。
 - 数值只允许在**逐张确认**后调整，且必须同时改 `src/test_support/snapshot.rs` 的
-  `Tolerance::default` 与本表（`tolerance_default_is_the_recorded_value` 会钉住两者一致）。
+  `Tolerance::default` / `Tolerance::GEOMETRY` 与本表（`tolerance_default_is_the_recorded_value`
+  会钉住两者一致）。
 
 ## 生成 / 更新（bless）
 
@@ -103,9 +110,19 @@ golden/<case>.png: <为什么必须变>（关联 commit / 设计条目）
 禁止把「看起来差不多」当作重生成理由：容差已经吸收了跨设备的量化差，剩下的差异要么是
 语义回归，要么是确实要改的语义 —— 两者都必须有人读过。
 
+## 边界 case 的额外断言（不依赖 golden）
+
+`tests/snapshot.rs` 的 `clip_content_never_leaks_past_the_rect_clip_boundaries` 直接读**本机读回像素**，
+断言 `clip` 场景的矩形 clip 四条边界：`x = 147` / `y = 97` 必须是内容，`x ≥ 148` / `y ≥ 98`（以及
+`x < 8` / `y < 8`）必须是背景。它不读 golden，所以在**重基之前**就能回答「这次重基是不是把缺陷
+bless 掉了」—— AR2b P1-N1 的越界列（lavapipe 旧基线 `x=148,y=18..37` 的 20 px 满不透明 ink）
+正是这条断言的对象。
+
 ## 跨设备不可比
 
-容差**不**用来让跨设备比同一份 golden 变成绿色。2026-11-17 对现有 13 张 case 实测
+容差**不**用来让跨设备比同一份 golden 变成绿色。2026-11-17 对当时既有的 13 张 case 实测
+（`clip_subpixel` 是后来新增的边界 case，未参与该次跨端实测；它的内容是无 AA 的平涂块，
+预期跨端一致）
 （`per_channel = 2` 口径，mismatch 像素数 / 总像素）：
 
 | 对比                  | `max_channel_diff` | mismatch 比例范围        | 结论 |

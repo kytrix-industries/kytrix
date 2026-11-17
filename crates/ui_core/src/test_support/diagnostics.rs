@@ -86,10 +86,16 @@ pub struct OpDump {
 /// 一条 clip 链的镜像（`GpuClipEntry` 的明文形态）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClipDump {
-    /// `(x, y, w, h)`，物理像素。
+    /// `(x, y, w, h)`，物理像素。矩形项恒为整数（编码期 `roundOut` 吸附）。
     pub rect: [f32; 4],
     /// `(tl, tr, br, bl)`，物理像素。
     pub corner_radius: [f32; 4],
+    /// `meta.y`：`1` = 矩形项（像素精确 scissor）、`2` = 圆角项（解析 AA）。
+    ///
+    /// 暴露成明文是 AR2b P2-N1 的要求：`meta.y` 是 shader 分流两种覆盖率语义的**唯一**依据，
+    /// 但它是 GPU 契约里最容易「写反了也没有像素级断言」的一项，测试必须能直接读到它
+    /// （`ClipKind` 的映射由 `paint/instance.rs` 的 headless 断言钉住）。
+    pub kind: u32,
     /// 父链索引（`None` = 无父）。
     pub parent: Option<u32>,
 }
@@ -140,7 +146,7 @@ impl fmt::Display for FrameDump {
         for (index, clip) in self.clips.iter().enumerate() {
             writeln!(
                 f,
-                "  clip {index} rect={:.4},{:.4},{:.4},{:.4} r={:.4},{:.4},{:.4},{:.4} parent={}",
+                "  clip {index} rect={:.4},{:.4},{:.4},{:.4} r={:.4},{:.4},{:.4},{:.4} kind={} parent={}",
                 clip.rect[0],
                 clip.rect[1],
                 clip.rect[2],
@@ -149,6 +155,7 @@ impl fmt::Display for FrameDump {
                 clip.corner_radius[1],
                 clip.corner_radius[2],
                 clip.corner_radius[3],
+                clip.kind,
                 clip.parent
                     .map_or_else(|| "none".to_string(), |parent| parent.to_string())
             )?;
@@ -218,6 +225,7 @@ fn clip_dump(chain: &crate::paint::instance::ClipChain) -> ClipDump {
     ClipDump {
         rect: entry.rect,
         corner_radius: entry.corner_radius,
+        kind: entry.meta[1],
         parent: (parent != 0).then_some(parent),
     }
 }
@@ -525,6 +533,31 @@ mod tests {
         test_support::{app::TestApp, record::FrameRecord},
     };
 
+    /// 绝对定位的 `Style`（带 `size` / `inset`，可挂 clip）：容器节点需要真实布局盒，
+    /// 而 `layout_override` 会把节点变成布局叶子（禁止挂子节点）。
+    fn absolute_style(
+        rect: crate::math::Rect,
+        clip: crate::paint::style::Clip,
+    ) -> crate::paint::style::Style {
+        crate::paint::style::Style {
+            inner: taffy::Style::<smol_str::SmolStr> {
+                position: taffy::style::Position::Absolute,
+                size: taffy::geometry::Size {
+                    width: taffy::style::Dimension::length(rect.size.width),
+                    height: taffy::style::Dimension::length(rect.size.height),
+                },
+                inset: taffy::geometry::Rect {
+                    left: taffy::style::LengthPercentageAuto::length(rect.origin.x),
+                    top: taffy::style::LengthPercentageAuto::length(rect.origin.y),
+                    right: taffy::style::LengthPercentageAuto::auto(),
+                    bottom: taffy::style::LengthPercentageAuto::auto(),
+                },
+                ..taffy::Style::<smol_str::SmolStr>::DEFAULT
+            },
+            clip,
+        }
+    }
+
     fn app_with_boxes(count: usize) -> TestApp {
         let mut app = TestApp::new();
         let window = app.window_id();
@@ -582,6 +615,86 @@ mod tests {
         assert!(dump.instances.is_empty());
         assert_eq!(dump.clips.len(), 1, "clip 表恒有哨兵项 0");
         assert!(dump.to_string().starts_with("frame 0 "));
+    }
+
+    /// AR2b P2-N1：诊断必须暴露 `meta.y`（`ClipDump.kind`），否则 GPU 契约里最容易写反的
+    /// 一项在 headless 侧根本读不到。顺带钉住「矩形项的表项是整数物理像素」（P1-N1 的吸附）。
+    #[test]
+    fn frame_dump_exposes_the_clip_kind_and_the_snapped_rect() {
+        use crate::paint::{
+            canvas::Canvas,
+            primitive::{ClipRect, Quad, QuadPaint},
+            style::Clip,
+        };
+
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let root = app.app().window(window).expect("window").tree().root();
+        // 分数坐标的 `Clip::Bounds` 容器（矩形项会被 `roundOut` 吸附到整数物理像素）。
+        let container = NodeBuilder::boxed()
+            .style(absolute_style(
+                crate::math::Rect::new(8.25, 4.5, 40.5, 20.25),
+                Clip::Bounds,
+            ))
+            .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
+            .expect("container");
+        // 容器里放一个有像素的盒子：内容 clip 只在子树真会产生图元时压栈。
+        let _ = NodeBuilder::boxed()
+            .layout_override(crate::math::Rect::new(0.0, 0.0, 10.0, 10.0))
+            .paint(PaintSpec {
+                background: Color::WHITE,
+                ..PaintSpec::default()
+            })
+            .id("content")
+            .build(
+                app.app_mut().window_mut(window).unwrap().tree_mut(),
+                container,
+            )
+            .expect("content");
+        // 根层 Canvas 内的圆角 clip：链上第二个表项（`meta.y = ROUNDED`）。
+        let mut canvas = Canvas::new(crate::math::Rect::new(8.0, 4.0, 40.0, 20.0));
+        assert!(canvas.push_clip(ClipRect {
+            rect: crate::math::Rect::new(8.0, 4.0, 40.0, 20.0),
+            corner_radius: [3.0; 4],
+        }));
+        canvas.push_quad(Quad {
+            bounds: crate::math::Rect::new(9.0, 5.0, 10.0, 10.0),
+            corner_radius: [0.0; 4],
+            paint: QuadPaint::Solid {
+                fill: Color::WHITE,
+                border: None,
+            },
+        });
+        assert!(canvas.pop_clip(), "Canvas 必须 clip 平衡");
+        let _ = NodeBuilder::canvas(canvas)
+            .layout_override(crate::math::Rect::new(8.0, 4.0, 40.0, 20.0))
+            .id("canvas")
+            .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
+            .expect("canvas node");
+        let _ = app.drain().expect("frame");
+
+        let dump = frame_dump(&app);
+        assert_eq!(dump.clips.len(), 3, "哨兵 + 矩形 + 圆角：{:?}", dump.clips);
+        // 表项 0 = 哨兵：kind 写 Rect 但 `clip_index == 0` 时 shader 直接早退。
+        assert_eq!((dump.clips[0].kind, dump.clips[0].parent), (1, None));
+        let rect_clip = dump.clips[1];
+        assert_eq!(
+            rect_clip.kind, 1,
+            "矩形项的 meta.y（KYTRIX_CLIP_KIND_RECT）"
+        );
+        assert_eq!(rect_clip.parent, None, "矩形项是链根");
+        assert_eq!(
+            rect_clip.rect,
+            [8.0, 4.0, 41.0, 21.0],
+            "矩形项必须吸附到整数物理像素（floor(8.25)=8 / ceil(48.75)=49）"
+        );
+        let rounded = dump.clips[2];
+        assert_eq!(
+            rounded.kind, 2,
+            "圆角项的 meta.y（KYTRIX_CLIP_KIND_ROUNDED）"
+        );
+        assert_eq!(rounded.parent, None, "根层 Canvas 的圆角 clip 没有父项");
+        assert!(dump.to_string().contains("kind=2"), "{dump}");
     }
 
     #[test]

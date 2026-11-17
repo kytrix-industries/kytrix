@@ -7,7 +7,10 @@ use ash::vk;
 
 use crate::{
     error::EngineError,
-    render::linux::device::{SharedGpu, init_error},
+    render::linux::{
+        device::{SharedGpu, init_error},
+        memory::MemoryNeed,
+    },
 };
 
 /// 读回的一帧像素（RGBA8，预乘，sRGB 编码字节）。
@@ -154,10 +157,7 @@ impl Readback {
                 .map_err(|error| init_error("create_buffer(readback)", format!("{error:?}")))?;
             let requirements = shared.raw().get_buffer_memory_requirements(self.buffer);
             let memory_type = shared
-                .memory_type(
-                    requirements.memory_type_bits,
-                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                )
+                .memory_type(requirements.memory_type_bits, MemoryNeed::READBACK)
                 .ok_or_else(|| init_error("readback memory", "no host-visible memory type"))?;
             self.memory = shared
                 .raw()

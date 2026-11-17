@@ -13,7 +13,11 @@ pub(crate) mod device;
 /// 静态几何的 GPU 缓冲（按需创建；GeometryStore 的 Vulkan 侧缓存）。
 pub(crate) mod geometry;
 pub(crate) mod instance;
+/// 设备内存：类型选择策略 + 两级子分配器（R11-6）。
+pub(crate) mod memory;
 pub(crate) mod pipeline;
+/// swapchain / 设备选择的纯决策（R11-7 / R11-8 / R11-9 / R11-13 / R11-15）。
+pub(crate) mod plan;
 #[cfg(feature = "test-support")]
 pub(crate) mod readback;
 pub(crate) mod renderer;

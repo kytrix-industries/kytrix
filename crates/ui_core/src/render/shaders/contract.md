@@ -67,10 +67,17 @@
 
 **裁剪链的构造规则（R05-10，对齐 Skia `SkClipStack` / WebRender 的 clip rect 合并）**：
 
-1. 全部**轴对齐矩形** clip（四角半径全 0）在编码期求交，链上只有**一条**表项；
-2. **圆角** clip 各占一层（圆角形状的交集不是矩形，无法压成一条）；
+1. 全部**轴对齐矩形** clip（四角半径全 0）在编码期求交，链上只有**一条**表项；该表项的
+   `rect` 被**吸附到整数物理像素**（`lo = floor(x0)`、`hi = ceil(x1)`，Skia `SkIRect::roundOut`
+   语义：向外取整，保证不漏裁）。吸附后 shader 才能用像素索引比较而不出现 1 ulp 的平局
+   （AR2b P1-N1）；方向选「向外」是因为它与旧的「像素单元与矩形有交」判定**逐像素等价**，
+   不改变任何像素的取舍；
+2. **圆角** clip 各占一层（圆角形状的交集不是矩形，无法压成一条）；圆角项的 `rect` **不**吸附
+   —— 解析 AA 的几何必须精确；
 3. 完全相同的圆角 clip 按 `(parent, rect 位模式, radii 位模式)` **去重**；
-4. 交集为空 / 零宽高的表项 ⇒ `w`/`h` 非正 ⇒ shader 直接返回覆盖率 0（全裁）。
+4. 交集为空 / 零宽高的矩形项 ⇒ 吸附后写成 `w = h = 0` ⇒ shader 直接返回覆盖率 0（全裁）。
+   不能对空交集做 `floor/ceil`：那会把反向区间变成 1 px 的保留区（`floor(10.6) = 10`、
+   `ceil(10.4) = 11`）。
 
 这样「滚动容器 + 画布区是同一个矩形」时覆盖率不再相乘（旧实现 0.5 × 0.5 = 0.25 的暗边），
 矩形嵌套多少层都只占一项；`clip_depth` 只有在圆角层数真正超限时才可能触顶，且超限是**编码期
@@ -107,7 +114,7 @@ write_mask = R | G | B | A
 | `shadow_cdf(x)`                             | `0.5 × (1 − erf(x × 0.70710678))` = 标准正态尾概率 Φ(−x)；`erf` 用 Abramowitz–Stegun 7.1.26                        |
 | `analytic_shadow(p, half_size, radii, blur)` | `σ = max(blur × 0.5, 0.35)`（CSS `box-shadow` 的模糊半径语义）；轴对齐矩形部分是**完整的可分离二维高斯**：一维因子 = 两条对边的尾概率之差 `shadow_cdf((|x|-h)/σ) − shadow_cdf((|x|+h)/σ)`（box ⊗ gaussian 的精确解，**不能**只取近边项），角部按「角部圆度 × r/(r+σ)」混合到 `Φ(−sdf/σ)`；`r = 0` 时退化为精确的分离式 |
 | `gradient_eval(kind, p, half_size, c0, c1)` | 线性 `(p.x+hx)/(2hx)`；垂直 `(p.y+hy)/(2hy)`；径向 `length(p)/min(hx,hy)`；`saturate(t)` 后 `lerp`（premultiplied） |
-| `clip_mask(world_px, clip_index, clip_depth)` | `clip_index == 0 ⇒ 1`；否则沿 `parent` 链跑 `min(clip_depth, KYTRIX_MAX_CLIP_ITEMS=9)` 层；**任一层 `w <= 0 或 h <= 0` ⇒ 直接返回 0**（零尺寸 clip 全裁，不是 0.5 的鬼线）。按 `meta.y` 分两种语义：**矩形项**（`KYTRIX_CLIP_KIND_RECT`）= 像素精确 scissor，片元像素单元（±0.5 px，Skia 的 `roundOut`）与矩形无交 ⇒ 返回 0，**不参与 AA 相乘**；**圆角项**（`KYTRIX_CLIP_KIND_ROUNDED`）= `m *= aa_coverage(sd_rounded_rect(...))` |
+| `clip_mask(world_px, clip_index, clip_depth)` | `clip_index == 0 ⇒ 1`；否则沿 `parent` 链跑 `min(clip_depth, KYTRIX_MAX_CLIP_ITEMS=9)` 层；**任一层 `w <= 0 或 h <= 0` ⇒ 直接返回 0**（零尺寸 clip 全裁，不是 0.5 的鬼线）。按 `meta.y` 分两种语义：**矩形项**（`KYTRIX_CLIP_KIND_RECT`）= 像素精确 scissor：`pixel = floor(world_px)` 与**编码期已吸附到整数物理像素**的 `[lo, hi)` 比较（`lo = floor(x0)`、`hi = ceil(x1)`，Skia `SkIRect::roundOut`），落在框外 ⇒ 返回 0，**不参与 AA 相乘**；**不得**用 `world_px ± 0.5` 之类的浮点单元比较（`world_px` 是插值属性，1 ulp 就会翻面，覆盖率 0/1 ⇒ 整列像素越界 = AR2b P1-N1）。**圆角项**（`KYTRIX_CLIP_KIND_ROUNDED`）= `m *= aa_coverage(sd_rounded_rect(...))`（圆角项的 `rect` **不**吸附，AA 需要精确几何） |
 | `apply_gamma(c)`                            | v1 恒等（见 §3）                                                                                                    |
 
 `fwidth` 纪律：只在**实例级一致**的分支里调用（`kind` / `border_width` / `clip_index` 都是逐实例常量）。因此
@@ -193,8 +200,8 @@ API 的硬件实例基址语义**互不相同**：
 
 | offset | 字段            | 语义                                         |
 |--------|-----------------|----------------------------------------------|
-| 0      | `rect`          | 本层 clip `x, y, w, h`（物理像素）           |
-| 16     | `corner_radius` | `tl, tr, br, bl`（物理像素）                 |
+| 0      | `rect`          | 本层 clip `x, y, w, h`（物理像素）。**矩形项恒为整数物理像素**（编码期 `roundOut` 吸附，空交集写成 `w = h = 0`）；圆角项是精确浮点几何 |
+| 16     | `corner_radius` | `tl, tr, br, bl`（物理像素）。矩形项恒为 0，圆角项至少一角 > 0（`meta.y` 与它一一对应，debug 自检交叉校验） |
 | 32     | `meta`          | `.x = parent`（0 = 无裁剪），`.y = KYTRIX_CLIP_KIND_RECT / KYTRIX_CLIP_KIND_ROUNDED`，`.zw` 保留恒 0 |
 
 **哨兵陷阱**：CPU 表项 0 的 `aabb = [f32::MIN, f32::MIN, f32::MAX, f32::MAX]` 按其 `(x,y,w,h)` 语义算出的右/下边界是

@@ -2639,6 +2639,251 @@ fn a_popup_opened_from_a_modal_receives_clicks() {
     assert_eq!(clicks.get(), 1, "菜单项的动作必须派发");
 }
 
+/// AR1b N1a（P2 回归，复审探针 6）：**同一个回调**里先开模态、紧接着开它的下拉菜单。
+///
+/// 失败面：`opener` 取自 `App::focused`（被模态作用域过滤）⇒ 模态刚建立、焦点还没被
+/// `validate_focus` 修复时 `focused()` 返回 `None` ⇒ 菜单 `opener = None` ⇒
+/// `in_modal_scope` 直接判「作用域外」：菜单项命中正确但按下被整体消费（`click_count == 0`）、
+/// 动作不派发，浮层只能被应用重建。
+///
+/// 本用例**故意不**先派发一次输入去修焦点 —— 那正是被绕过的时机。焦点留在背景按钮上，
+/// 新求值顺序先按「作用域内的候选」过滤，把它排除后落到模态本身（top-layer 语义）。
+#[test]
+fn a_popup_opened_in_the_same_callback_as_its_modal_receives_clicks() {
+    let (_rt, mut app, window) = setup();
+    let clicks = Rc::new(Cell::new(0_u32));
+    let seen = clicks.clone();
+    app.on_action(Action::custom("menu.item"), move |_ctx| {
+        seen.set(seen.get() + 1);
+    });
+    let root = root_of(&app, window);
+    let background_button = NodeBuilder::boxed()
+        .layout_override(Rect::new(0.0, 0.0, 200.0, 100.0))
+        .on_click(Action::custom("background"))
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("mount");
+    frame(&mut app, window);
+    assert!(app.set_focus(window, Some(background_button)));
+
+    // 同一个回调：先建模态，紧接着开它的下拉菜单（中间没有任何输入事件）。
+    let modal = app
+        .create_overlay(
+            window,
+            OverlayOptions {
+                placement: OverlayPlacement::Point(Point::new(20.0, 20.0)),
+                dismiss: OverlayDismiss::Explicit,
+                trap_focus: true,
+                restore_focus: true,
+            },
+        )
+        .expect("modal");
+    let menu = app
+        .create_overlay(
+            window,
+            OverlayOptions {
+                placement: OverlayPlacement::Point(Point::new(120.0, 60.0)),
+                dismiss: OverlayDismiss::OutsideClick,
+                ..OverlayOptions::default()
+            },
+        )
+        .expect("menu");
+    let confirm = NodeBuilder::boxed()
+        .layout_override(Rect::new(30.0, 30.0, 60.0, 24.0))
+        .on_click(Action::custom("modal.confirm"))
+        .build(
+            app.window_mut(window).expect("window").tree_mut(),
+            modal.node(),
+        )
+        .expect("mount");
+    let item = NodeBuilder::boxed()
+        .layout_override(Rect::new(10.0, 10.0, 100.0, 20.0))
+        .on_click(Action::custom("menu.item"))
+        .build(
+            app.window_mut(window).expect("window").tree_mut(),
+            menu.node(),
+        )
+        .expect("mount");
+    frame(&mut app, window);
+
+    // 时机：模态已建立，背景焦点还没被修复 ⇒ 读取面是 `None`（这正是 opener 被吞的时刻）。
+    assert_eq!(
+        app.focused(window),
+        None,
+        "模态打开后作用域外的焦点视为无焦点"
+    );
+
+    // 菜单项屏幕位置 = 浮层原点 (120, 60) + 子节点 (10, 10) = (130, 70)。
+    let position = Point::new(140.0, 78.0);
+    assert_eq!(
+        app.hit_at(window, position).map(|hit| hit.node),
+        Some(item),
+        "命中必须落在菜单项上"
+    );
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_down(position, PointerButton::Primary, Modifiers::empty()),
+    );
+    let outcome = app.dispatch_input(
+        window,
+        InputEvent::pointer_up(position, PointerButton::Primary, Modifiers::empty()),
+    );
+    assert_eq!(outcome.click_count, 1, "模态之后立即打开的菜单必须可点");
+    assert_eq!(outcome.target, Some(item));
+    assert_eq!(clicks.get(), 1, "菜单项的动作必须派发");
+    let _ = confirm;
+}
+
+/// AR1b N1a 的对照分支：**完全没有焦点**时同一个回调里连开模态 + 菜单。
+///
+/// `opener` 的候选链此时全部为空，最终退化到「当前作用域根」（模态本身）。失败面与上一个
+/// 用例相同（复审探针 6 的原始观察值 `click_count == 0`）。
+#[test]
+fn a_popup_opened_without_any_focus_still_receives_clicks() {
+    let (_rt, mut app, window) = setup();
+    let clicks = Rc::new(Cell::new(0_u32));
+    let seen = clicks.clone();
+    app.on_action(Action::custom("menu.item"), move |_ctx| {
+        seen.set(seen.get() + 1);
+    });
+    let root = root_of(&app, window);
+    // 纯布局容器：不可聚焦，因此整个窗口**没有焦点**。
+    let _background = NodeBuilder::boxed()
+        .layout_override(Rect::new(0.0, 0.0, 200.0, 100.0))
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("mount");
+    frame(&mut app, window);
+    assert_eq!(app.focused(window), None, "前置：没有焦点");
+
+    let modal = app
+        .create_overlay(
+            window,
+            OverlayOptions {
+                placement: OverlayPlacement::Point(Point::new(20.0, 20.0)),
+                dismiss: OverlayDismiss::Explicit,
+                trap_focus: true,
+                restore_focus: true,
+            },
+        )
+        .expect("modal");
+    let menu = app
+        .create_overlay(
+            window,
+            OverlayOptions {
+                placement: OverlayPlacement::Point(Point::new(120.0, 60.0)),
+                dismiss: OverlayDismiss::OutsideClick,
+                ..OverlayOptions::default()
+            },
+        )
+        .expect("menu");
+    let _confirm = NodeBuilder::boxed()
+        .layout_override(Rect::new(30.0, 30.0, 60.0, 24.0))
+        .on_click(Action::custom("modal.confirm"))
+        .build(
+            app.window_mut(window).expect("window").tree_mut(),
+            modal.node(),
+        )
+        .expect("mount");
+    let item = NodeBuilder::boxed()
+        .layout_override(Rect::new(10.0, 10.0, 100.0, 20.0))
+        .on_click(Action::custom("menu.item"))
+        .build(
+            app.window_mut(window).expect("window").tree_mut(),
+            menu.node(),
+        )
+        .expect("mount");
+    frame(&mut app, window);
+
+    let position = Point::new(140.0, 78.0);
+    assert_eq!(app.hit_at(window, position).map(|hit| hit.node), Some(item));
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_down(position, PointerButton::Primary, Modifiers::empty()),
+    );
+    let outcome = app.dispatch_input(
+        window,
+        InputEvent::pointer_up(position, PointerButton::Primary, Modifiers::empty()),
+    );
+    assert_eq!(outcome.click_count, 1, "无焦点时打开的菜单同样必须可点");
+    assert_eq!(clicks.get(), 1);
+}
+
+/// AR1b N1b（P2 回归，复审探针 7）：**完全没有焦点**时打开模态，Enter 必须落到模态内。
+///
+/// 失败面：`validate_focus` 只在「有焦点但在作用域外」时修复，`focused() == None` 直接返回
+/// ⇒ 从不可聚焦内容（图表区 / 自绘画布）打开对话框后，按 Enter 的 `outcome.target` 是
+/// `None`，必须先按 Tab 或点一下才有落点。
+#[test]
+fn a_modal_opened_without_any_focus_fills_the_first_focusable_node() {
+    let (_rt, mut app, window) = setup();
+    let activations = Rc::new(Cell::new(0_u32));
+    let seen = activations.clone();
+    app.on_action(Action::custom("modal.ok"), move |_ctx| {
+        seen.set(seen.get() + 1);
+    });
+    let root = root_of(&app, window);
+    // 不可聚焦的图表区：只有布局，没有动作 / `interactive`。
+    let chart = NodeBuilder::boxed()
+        .layout_override(Rect::new(0.0, 0.0, 200.0, 100.0))
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("mount");
+    frame(&mut app, window);
+    // 用户点了一下图表区：没有可聚焦候选 ⇒ 焦点保持 `None`。
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_down(
+            Point::new(10.0, 10.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
+    );
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_up(
+            Point::new(10.0, 10.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
+    );
+    assert_eq!(app.focused(window), None, "前置：图表区不抢焦点");
+    let _ = chart;
+
+    // 应用从图表区的回调里打开对话框。
+    let modal = app
+        .create_overlay(
+            window,
+            OverlayOptions {
+                placement: OverlayPlacement::Point(Point::new(40.0, 40.0)),
+                dismiss: OverlayDismiss::Explicit,
+                trap_focus: true,
+                restore_focus: true,
+            },
+        )
+        .expect("modal");
+    let ok = NodeBuilder::boxed()
+        .layout_override(Rect::new(10.0, 10.0, 60.0, 24.0))
+        .on_click(Action::custom("modal.ok"))
+        .build(
+            app.window_mut(window).expect("window").tree_mut(),
+            modal.node(),
+        )
+        .expect("mount");
+    frame(&mut app, window);
+    assert_eq!(
+        app.focused(window),
+        None,
+        "创建瞬间还没有候选（子节点在 create_overlay 之后才挂载）"
+    );
+
+    // 第一次输入就修复焦点并激活模态内第一个可聚焦节点。
+    let outcome = app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::Enter, Modifiers::empty()),
+    );
+    assert_eq!(app.focused(window), Some(ok), "Enter 前焦点必须已移入模态");
+    assert_eq!(outcome.target, Some(ok), "Enter 必须有落点");
+    assert_eq!(activations.get(), 1);
+}
+
 /// R02-12（P1 回归，AR1 探针 2）：**模态外按钮收不到 Enter 激活**。
 ///
 /// 失败面：Enter/Space 激活直接取 `app.focused()` 且不查作用域 ⇒ 焦点留在背景时按 Enter

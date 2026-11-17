@@ -31,7 +31,10 @@ use crate::{
     render::{
         atlas::{DirtyRows, MAX_RESIDENT_STAGING_BYTES, texel_bytes},
         frame::MAX_FRAMES_IN_FLIGHT,
-        linux::device::{Device, GpuObject, SharedGpu, init_error},
+        linux::{
+            device::{Device, GpuObject, SharedGpu, init_error},
+            memory::MemoryNeed,
+        },
         retire::GpuResourceHandle,
     },
 };
@@ -78,10 +81,9 @@ impl SharedPage {
         .map_err(|error| init_error("create_image(atlas)", format!("{error:?}")))?;
         // SAFETY: 只读查询；句柄由本结构独占，返回值在本次调用期间有效。
         let requirements = unsafe { device.raw().get_image_memory_requirements(image) };
-        let Some(memory_type) = device.memory_type(
-            requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        ) else {
+        let Some(memory_type) =
+            device.memory_type(requirements.memory_type_bits, MemoryNeed::DEVICE_IMAGE)
+        else {
             // SAFETY: image 已创建且尚未交给任何人。
             unsafe { device.raw().destroy_image(image, None) };
             return Err(init_error(
@@ -703,10 +705,9 @@ fn create_host_staging(
     .map_err(|error| init_error("create_buffer(atlas staging)", format!("{error:?}")))?;
     // SAFETY: 只读查询；句柄由调用方独占，返回值在本次调用期间有效。
     let requirements = unsafe { shared.raw().get_buffer_memory_requirements(buffer) };
-    let Some(memory_type) = shared.memory_type(
-        requirements.memory_type_bits,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    ) else {
+    let Some(memory_type) =
+        shared.memory_type(requirements.memory_type_bits, MemoryNeed::HOST_WRITABLE)
+    else {
         // SAFETY: buffer 已创建且尚未交给任何人。
         unsafe { shared.raw().destroy_buffer(buffer, None) };
         return Err(init_error(
@@ -780,7 +781,10 @@ mod tests {
         paint::atlas::AtlasKind,
         render::{
             atlas::DirtyRows,
-            linux::device::{FrameSync, GpuObject, SharedGpu, gpu_test_lock},
+            linux::{
+                device::{FrameSync, GpuObject, SharedGpu, gpu_test_lock},
+                memory::MemoryNeed,
+            },
         },
         window::FrameIndex,
     };
@@ -896,10 +900,7 @@ mod tests {
                 .expect("readback buffer");
             let requirements = gpu.raw().get_buffer_memory_requirements(buffer);
             let memory_type = gpu
-                .memory_type(
-                    requirements.memory_type_bits,
-                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                )
+                .memory_type(requirements.memory_type_bits, MemoryNeed::HOST_WRITABLE)
                 .expect("host-visible readback memory");
             let memory = gpu
                 .raw()
@@ -1158,10 +1159,7 @@ mod tests {
                 .expect("buffer");
             let requirements = gpu.raw().get_buffer_memory_requirements(buffer);
             let memory_type = gpu
-                .memory_type(
-                    requirements.memory_type_bits,
-                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                )
+                .memory_type(requirements.memory_type_bits, MemoryNeed::HOST_WRITABLE)
                 .expect("host-visible memory");
             let memory = gpu
                 .raw()

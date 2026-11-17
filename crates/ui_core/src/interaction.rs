@@ -440,9 +440,12 @@ pub struct OverlayOptions {
     /// - Tab / Shift+Tab 只在作用域内循环（含**属于该模态的弹出层**）；
     /// - [`crate::app::App::set_focus`] 拒绝作用域外的节点；
     /// - 浮层外的指针按下 / 滚动被**消费**（不抢焦点、不触发下层动作、不滚背景）；
-    /// - Enter / Space 激活与 a11y `ActionRequest` 拒绝作用域外目标；
+    /// - Enter / Space 激活与 a11y 动作（`ActionRequest`，**全部**动作类型）拒绝作用域外目标；
+    ///   注意作用域只约束**动作**：a11y 树本身仍向外暴露背景节点（读屏可以读到它们，只是
+    ///   操作会被拒绝）—— 把背景置 `inert`（accesskit `hidden`）尚未实现（AR1b N2）；
     /// - 作用域外的焦点在下一次输入/焦点操作时移入模态内第一个可聚焦节点（子节点在
-    ///   `create_overlay` 返回之后才挂载，创建瞬间求值不到候选）。
+    ///   `create_overlay` 返回之后才挂载，创建瞬间求值不到候选）；**完全没有焦点**时同样
+    ///   补一个落点（AR1b N1b）。
     ///
     /// **作用域 ≠ 模态子树**：模态之上打开的弹出层（下拉/菜单/子菜单）只要 `opener` 在模态
     /// 内（可嵌套递归）就仍属于作用域（[`crate::interaction::overlay::in_modal_scope`]）。

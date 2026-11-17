@@ -177,18 +177,22 @@ fn emit_rerun(manifest: &Path, shader_dir: &Path) {
             shader_dir.join(source).display()
         );
     }
-    println!(
-        "cargo:rerun-if-changed={}",
-        manifest.join("src/paint/instance.rs").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        manifest.join("src/paint/scene.rs").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        manifest.join("build.rs").display()
-    );
+    // 静态校验读的**全部** Rust 文件都必须登记，否则增量构建会放过漂移：
+    // - 契约常量 / 结构体布局：`paint/instance.rs`、`paint/scene.rs`；
+    // - 渲染状态锚点：`RENDER_STATE_ANCHORS` / `RENDER_STATE_FORBIDDEN` 指向的三端
+    //   `{pipeline,swapchain}.rs` 与共享层 `colorspace.rs`。这些文件既不在 rerun 清单里、
+    //   也不被 `include!` 进 crate，漏登记 ⇒ 改 blend/cull 后 build script 不重跑、门禁静默
+    //   （AR2b P2-N3 复现：改 `SrcBlend` 后 BUILD-PASS）。
+    //
+    // 清单**从锚点表本身汇聚**，不另立一份手写列表（那正是漂移的来源）。
+    let mut watched: Vec<&str> = vec!["build.rs", "src/paint/instance.rs", "src/paint/scene.rs"];
+    watched.extend(RENDER_STATE_ANCHORS.iter().map(|(file, _, _)| *file));
+    watched.extend(RENDER_STATE_FORBIDDEN.iter().map(|(file, _, _)| *file));
+    watched.sort_unstable();
+    watched.dedup();
+    for source in watched {
+        println!("cargo:rerun-if-changed={}", manifest.join(source).display());
+    }
     println!("cargo:rerun-if-env-changed=ui_core_SKIP_SHADERS");
     println!("cargo:rerun-if-env-changed=KYTRIX_DXC");
 }

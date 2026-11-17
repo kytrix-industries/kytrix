@@ -162,7 +162,6 @@ pub(crate) fn close_window(app: &mut App, id: WindowId) -> bool {
     // 在 `key_down` 里为真。指针捕获请求与待推光标同理 —— 窗口没了，请求没有接收方，
     // 留着只会在 create/close 循环下无界增长。
     app.held_keys.remove(&id);
-    app.capture_requests.remove(&id);
     if app.cursor_pending.is_some_and(|(window, _)| window == id) {
         app.cursor_pending = None;
     }
@@ -172,6 +171,10 @@ pub(crate) fn close_window(app: &mut App, id: WindowId) -> bool {
     if app.windows.contains_key(&id) {
         app.cancel_pointer_session(id);
     }
+    // 捕获请求表必须在 `cancel_pointer_session` **之后**清：收尾本身会写一条
+    // `(window, false)` 请求（结束拖拽 / 释放捕获），先清再收尾会把它留在表里 —— 已关闭窗口
+    // 的请求没有接收方（泵找不到窗口直接跳过），纯属白写一次（AR1b P3-6）。
+    app.capture_requests.remove(&id);
     #[cfg(feature = "hud")]
     app.debug_hud.remove(&id);
     app.last_click = app.last_click.filter(|record| record.window != id);

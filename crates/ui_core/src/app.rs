@@ -683,12 +683,15 @@ impl App {
         scroll::scroll_handle(self, window, node)
     }
 
-    /// 程序性分发（测试 / 菜单桥 / a11y 的 `ActionRequest`）。返回是否被处理。
+    /// 程序性分发（测试 / 菜单桥 / a11y 的 `Click`）。返回是否被处理。
     ///
-    /// **受模态作用域约束**（R02-12）：目标节点在模态作用域外 ⇒ `false`（不派发）。
-    /// a11y 的 `ActionRequest` 与菜单桥都走这里，因此「模态外不可激活」对指针、键盘、
-    /// 辅助技术三条路径同时成立。引擎级动作（`FocusNext` / `FocusPrev` / `Dismiss`）作用于
-    /// 窗口级状态，不受作用域限制（模态打开时 Esc / Tab 仍必须可用）。
+    /// **受模态作用域约束**（R02-12）：目标节点在模态作用域外 ⇒ `false`（不派发）。菜单桥与
+    /// a11y 的 `Click` 走这里；a11y 的其它动作（`SetValue` / `Increment` / `Custom` /
+    /// `Scroll*`）不经过本函数，它们在 a11y 动作的唯一入口
+    /// （`crate::a11y::action::dispatch`）按**同一判据**（`interaction::focus::in_scope`，
+    /// 即模态子树 ∪ 属于该模态的浮层链）校验 —— 因此「模态外不可激活」对指针、键盘、
+    /// 辅助技术三条路径口径一致（AR1b N2）。引擎级动作（`FocusNext` / `FocusPrev` /
+    /// `Dismiss`）作用于窗口级状态，不受作用域限制（模态打开时 Esc / Tab 仍必须可用）。
     pub fn dispatch_action(
         &mut self,
         window: WindowId,

@@ -13,10 +13,12 @@ use crate::{
 
 /// clip 栈深度上限：**类型是 `u8`**，值 8。
 ///
-/// 三处必须一致：`Canvas::push_clip` 的 `bool` 门限、`paint/instance.rs` 编码期的链长判定
-/// （`EngineError::ClipDepthExceeded`）、三套 shader 的 `KYTRIX_MAX_CLIP_DEPTH` 循环上限。
-/// 注意它约束的是**序列化后的链长**（矩形 clip 求交合并成 1 项、圆角 clip 逐层计数），
-/// 不是「嵌套了几层容器」。
+/// 它约束的是**圆角层数**（本文件的 `Lane` 计数、`Canvas::push_clip` 的 `bool` 门限、
+/// `paint/instance.rs` 编码期的 `EngineError::ClipDepthExceeded` 三处同口径）；矩形 clip 在
+/// 编码期求交合并成**一条**像素精确 scissor、不占该预算，所以 GPU 裁剪链的长度上界是
+/// `MAX_CLIP_ITEMS = MAX_CLIP_DEPTH + 1`（三套 shader 的 `KYTRIX_MAX_CLIP_ITEMS` 是那段定长
+/// 循环的上界，由 `build.rs` 与 `paint/instance.rs` 双向校验）。注意它也不是「嵌套了几层容器」：
+/// 祖先容器的矩形 clip 会被折叠。
 pub(crate) const MAX_CLIP_DEPTH: u8 = 8;
 
 /// 一个绘制输出桶。内容按绘制序排列；`clip_depth` 是 C2/C3 的**增量校验状态**。
@@ -39,8 +41,9 @@ impl Lane {
     /// **深度上限不在这里判定**（R05-5）。一个 lane 的 clip 括号 = 祖先 clip（`paint/pass.rs`
     /// 压入）加自身 content clip 加 `Canvas` 内部 clip；三层叠加后是否超限只有编码期知道
     /// （矩形 clip 会被求交合并成一项，圆角 clip 逐层计数）。因此这里只维护计数（供
-    /// `Canvas::push_clip` 的 8 层门限使用），越界由 `InstanceEncoder::encode` 返回
-    /// `EngineError::ClipDepthExceeded`，debug 与 release 行为一致，不再有 debug panic。
+    /// `Canvas::pop_clip` 的空栈判据与 [`Lane::rounded_clip_depth`] 使用），越界由
+    /// `InstanceEncoder::encode` 返回 `EngineError::ClipDepthExceeded`，debug 与 release 行为
+    /// 一致，不再有 debug panic。
     pub(crate) fn push(&mut self, primitive: Primitive) {
         match &primitive {
             Primitive::Clip(ClipOp::Push(_)) => {
@@ -61,9 +64,35 @@ impl Lane {
         self.clip_depth = 0;
     }
 
-    /// 当前 clip 嵌套深度。消费者：`Lane::push`（内部）与 `Canvas` 的 clip 门限。
+    /// 当前 clip 嵌套深度。消费者：`Lane::push`（内部）与 `Canvas` 的 `pop_clip` 空栈判据。
     pub(crate) fn clip_depth(&self) -> u8 {
         self.clip_depth
+    }
+
+    /// 当前**未弹出**的 clip 里，四角半径非全 0（= 编码期会各占一层、计入 `MAX_CLIP_DEPTH`
+    /// 预算）的层数 —— 与编码器的预算口径一致（矩形 clip 求交合并成一条，不占层数）。
+    ///
+    /// 为什么从图元序列回溯而不是另外记一个计数器：`Lane` 只有 32 B 的预算（`Canvas` = 48 B，
+    /// 见 `canvas_size_is_48_bytes`），而 `ClipOp::Pop` **不携带**被弹层的 payload —— 要正确
+    /// 递减就必须再存一个栈，那会把 `Canvas` 撑大。栈深 ≤ `MAX_CLIP_DEPTH`（8），回溯扫描
+    /// 的代价是 O(8)，且只在 `Canvas::push_clip` / 编码期预算判定时调用（每帧至多几次）。
+    pub(crate) fn rounded_clip_depth(&self) -> usize {
+        let mut open = 0usize;
+        let mut rounded = 0usize;
+        for primitive in self.primitives.iter().rev() {
+            match primitive {
+                Primitive::Clip(ClipOp::Pop) => open += 1,
+                Primitive::Clip(ClipOp::Push(clip)) => {
+                    if open > 0 {
+                        open -= 1;
+                    } else if clip.corner_radius.iter().any(|radius| *radius > 0.0) {
+                        rounded += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        rounded
     }
 
     /// 只读切片。消费者：`Canvas::primitives`、`Scene::lane_primitives`。

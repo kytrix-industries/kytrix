@@ -14,7 +14,14 @@
 //! 离屏/快照路径仍是同步语义（§4.5 下半段）：`submit_blocking` 在 GPU 线程上等本帧完成，
 //! 那里没有 UI 线程可阻塞。
 
-use std::{collections::VecDeque, ptr::NonNull};
+use std::{
+    collections::VecDeque,
+    ptr::NonNull,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use block2::RcBlock;
 use dispatch2::{DispatchRetained, DispatchSemaphore, DispatchTime};
@@ -35,9 +42,100 @@ use crate::{
     window::FrameIndex,
 };
 
+/// 在飞帧计数（UI 线程读、GPU 线程写；Metal 的完成回调不碰它）。
+///
+/// 记账语义（R09-17）：`note_submitted` 发生在 `addCompletedHandler` **之前**（Metal 只在
+/// `commit` 之后才可能回调完成），`note_drained` 只由 GPU 线程在 drain 完成队列时按入队数扣减
+/// —— 计数与完成队列因此永远同源，不存在"完成先到、账未记"的窗口期。
+///
+/// 用原子而不是 `Shared` 的互斥量：`sync_pacing`（主线程，每轮）与提交路径（GPU 线程）都要读
+/// 它，而它不需要与其它状态一起原子地读。
+pub(crate) struct InFlight {
+    count: AtomicUsize,
+}
+
+impl InFlight {
+    pub(crate) fn new() -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+        }
+    }
+
+    /// 提交前记账 +1，返回必须在 `commit` 之后 [`SubmissionTicket::commit`] 的令牌。
+    ///
+    /// 令牌是 RAII 的：这条路径上任何提前返回（包括将来新增的失败分支）都会在 `Drop` 里回滚
+    /// 这 +1，因此"先记账"不会留下漏账。
+    ///
+    /// 上界：未 drain 的完成通知最多 `MAX_FRAMES_IN_FLIGHT` 个（每个槽的 permit 在它的完成回调
+    /// 里归还，GPU 线程每轮先 drain 再提交），加上仍在飞的提交最多 `MAX_FRAMES_IN_FLIGHT` 个
+    /// ⇒ 计数上界是 `MAX_FRAMES_IN_FLIGHT * 2`。超过它说明有人绕过 `Queue` 记账。
+    fn note_submitted(self: &Arc<Self>) -> SubmissionTicket {
+        let previous = self.count.fetch_add(1, Ordering::AcqRel);
+        debug_assert!(
+            previous < MAX_FRAMES_IN_FLIGHT * 2,
+            "in-flight accounting exceeded its bound: {previous} submissions are still unaccounted for"
+        );
+        SubmissionTicket {
+            ledger: Arc::clone(self),
+            committed: false,
+        }
+    }
+
+    /// GPU 线程 drain 完成通知：减去同样多。
+    ///
+    /// 计数错误（扣得比记的多）是记账 bug，必须立刻可见 —— 旧实现的 `saturating_sub` 会把它
+    /// 静默钳到 0，让"关闭握手提前退出 / pacing 抖动"这类问题无从复现（R09-17）。
+    pub(crate) fn note_drained(&self, drained: usize) {
+        if drained == 0 {
+            return;
+        }
+        let previous = self.count.fetch_sub(drained, Ordering::AcqRel);
+        assert!(
+            previous >= drained,
+            "in-flight accounting underflow: drained {drained} completions with only {previous} recorded"
+        );
+    }
+
+    /// 已提交、尚未 drain 的帧数。
+    pub(crate) fn get(&self) -> usize {
+        self.count.load(Ordering::Acquire)
+    }
+
+    /// 测试：直接把计数设成 `count`（模拟"有 N 帧在飞"的状态）。
+    #[cfg(test)]
+    pub(crate) fn preset(&self, count: usize) {
+        self.count.store(count, Ordering::Release);
+    }
+}
+
+/// "本次提交已记账、等 `commit` 转正"的令牌（见 [`InFlight::note_submitted`]）。
+struct SubmissionTicket {
+    ledger: Arc<InFlight>,
+    committed: bool,
+}
+
+impl SubmissionTicket {
+    /// `commit` 已返回：记账正式生效，`Drop` 不再回滚。
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for SubmissionTicket {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        // 回滚：这一次提交没有走到 `commit`，它的完成通知永远不会来。
+        self.ledger.count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// 一个命令队列 + 三槽上传背压 + 延迟销毁队列。
 pub(crate) struct Queue {
     raw: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    /// 与 UI 线程共享的在飞帧计数（[`InFlight`]）。
+    in_flight: Arc<InFlight>,
     ring: InFlightRing,
     /// **每个上传槽一把** semaphore（各 1 个 permit），Apple「Synchronizing CPU and GPU work」
     /// 三缓冲模式的标准形态。
@@ -57,13 +155,14 @@ pub(crate) struct Queue {
 }
 
 impl Queue {
-    pub(crate) fn new(device: &Device) -> Result<Self, EngineError> {
+    pub(crate) fn new(device: &Device, in_flight: Arc<InFlight>) -> Result<Self, EngineError> {
         let raw = device
             .raw()
             .newCommandQueue()
             .ok_or_else(|| init_error("newCommandQueue", "returned nil"))?;
         Ok(Self {
             raw,
+            in_flight,
             ring: InFlightRing::new(),
             slots: std::array::from_fn(|_| DispatchSemaphore::new(1)),
             order: CompletionOrder::new(),
@@ -109,6 +208,11 @@ impl Queue {
     ///
     /// `completed` 在 Metal 的完成回调里执行（任意线程），因此要求 `Send + 'static`；
     /// 回调先归还**本槽**的 permit，再把命令缓冲交给调用方（GPU 线程用它在 drain 时读 GPU 时间）。
+    ///
+    /// **记账顺序（R09-17）**：`in_flight += 1` 在 `addCompletedHandler` **之前**。Metal 保证
+    /// 命令缓冲的完成回调只可能在 `commit` 之后被调用，所以"先记账、后提交"不存在"完成先到、
+    /// 账未记"的窗口期；主线程的 `sync_pacing` 不会在刚提交完的那一瞬读到 0 而误暂停 display
+    /// link。任何提前返回都会由 [`SubmissionTicket`] 的 `Drop` 回滚这次记账。
     pub(crate) fn submit(
         &mut self,
         index: FrameIndex,
@@ -116,6 +220,7 @@ impl Queue {
         buffer: &Retained<ProtocolObject<dyn MTLCommandBuffer>>,
         completed: impl Fn(Retained<ProtocolObject<dyn MTLCommandBuffer>>) + Send + 'static,
     ) -> Result<(), EngineError> {
+        let ticket = self.in_flight.note_submitted();
         let permit = self.slots[slot.index].clone();
         let block = RcBlock::new(
             move |buffer: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
@@ -138,6 +243,8 @@ impl Queue {
             slot.signal_value,
             "ring must advance exactly one step per submitted frame"
         );
+        // 到这里命令缓冲已经在队列里：完成通知一定会来，记账转正（`Drop` 不再回滚）。
+        ticket.commit();
         Ok(())
     }
 
@@ -155,11 +262,15 @@ impl Queue {
         buffer: &Retained<ProtocolObject<dyn MTLCommandBuffer>>,
         device: &mut Device,
     ) -> Result<Option<GpuTimerSample>, EngineError> {
+        // 同步路径没有完成回调：记一次、等完之后立刻扣掉，计数在调用返回时回到原值。
+        let ticket = self.in_flight.note_submitted();
         buffer.commit();
         self.ring.advance(slot);
         self.order.submit(index);
         buffer.waitUntilCompleted();
         self.slots[slot.index].signal();
+        ticket.commit();
+        self.in_flight.note_drained(1);
         self.finish(index, buffer, device)
     }
 
@@ -288,8 +399,18 @@ impl CompletionOrder {
 
 #[cfg(test)]
 mod tests {
-    use super::CompletionOrder;
-    use crate::window::FrameIndex;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
+    };
+
+    use objc2_metal::MTLCommandBuffer;
+
+    use super::{CompletionOrder, InFlight, Queue};
+    use crate::{render::macos::device::Device, window::FrameIndex};
 
     fn index(value: u32) -> FrameIndex {
         FrameIndex::from_raw(value)
@@ -333,5 +454,66 @@ mod tests {
         assert_eq!(order.note(index(7)), None);
         assert_eq!(order.note(index(1)), Some(index(1)));
         assert_eq!(order.note(index(4)), Some(index(7)));
+    }
+
+    /// R09-17：完成回调被调用时，`in_flight` 必须**已经**记上了这一次提交。
+    ///
+    /// 旧实现在 `commit` 返回之后、回到 GPU 线程才 `+1`，完成回调可以在那个窗口期里先跑：
+    /// 回调看到 0 ⇒ `sync_pacing` 误判空闲、关闭握手可能提前退出。这里在回调里直接读计数，
+    /// 是这条顺序的最直接回归。
+    #[test]
+    fn the_in_flight_account_is_already_positive_inside_the_completed_handler() {
+        let device = Device::new().expect("metal device");
+        let in_flight = Arc::new(InFlight::new());
+        let mut queue = Queue::new(&device, Arc::clone(&in_flight)).expect("queue");
+        let slot = queue.try_acquire().expect("upload slot");
+        let buffer = queue.begin().expect("command buffer");
+        let observed = Arc::new(AtomicUsize::new(usize::MAX));
+        let counter = Arc::clone(&in_flight);
+        let probe = Arc::clone(&observed);
+        queue
+            .submit(index(1), slot, &buffer, move |_buffer| {
+                probe.store(counter.get(), Ordering::Release);
+            })
+            .expect("submit");
+        // 提交之后计数立刻为 1（不等任何完成回调）。
+        assert_eq!(in_flight.get(), 1, "记账必须在提交路径上、完成回调之前完成");
+        buffer.waitUntilCompleted();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while observed.load(Ordering::Acquire) == usize::MAX && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            observed.load(Ordering::Acquire) >= 1,
+            "完成回调看到 in_flight = 0：记账晚于 commit（R09-17 回归）"
+        );
+        let completions = observed.load(Ordering::Acquire);
+        assert!(completions >= 1);
+        // 完成通知被 GPU 线程 drain：按 drain 数扣减（与 `Shared::take_completions` 同一路径）。
+        in_flight.note_drained(1);
+        assert_eq!(in_flight.get(), 0, "drain 之后归零");
+    }
+
+    /// 没走到 `commit` 的提交必须回滚它记的那一笔（`SubmissionTicket` 的 `Drop`）。
+    #[test]
+    fn a_submission_that_never_commits_rolls_its_account_back() {
+        let in_flight = Arc::new(InFlight::new());
+        {
+            let _ticket = in_flight.note_submitted();
+            assert_eq!(in_flight.get(), 1, "记账在提交开始时转正");
+        }
+        assert_eq!(
+            in_flight.get(),
+            0,
+            "令牌被 drop（没有 commit）必须回滚这次记账"
+        );
+    }
+
+    /// 扣得比记的多是记账 bug：必须是硬错误，不能被静默钳到 0（旧实现用 `saturating_sub`）。
+    #[test]
+    #[should_panic(expected = "in-flight accounting underflow")]
+    fn draining_more_completions_than_submitted_is_a_hard_error() {
+        let in_flight = InFlight::new();
+        in_flight.note_drained(1);
     }
 }

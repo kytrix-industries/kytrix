@@ -97,12 +97,19 @@ impl Canvas {
         self.lane.push(Primitive::Geometry(draw));
     }
 
-    /// 压栈 clip：**本 Canvas 自身**的裁剪层数未超 `MAX_CLIP_DEPTH`（8，crate 私有常量）时压入并
-    /// 返回 `true`，否则**不写入**并返回 `false`。
+    /// 压栈 clip：**本 Canvas 自身**的圆角 clip 层数未超 `MAX_CLIP_DEPTH`（8，crate 私有常量）
+    /// 时压入并返回 `true`，否则**不写入**并返回 `false`。
     ///
-    /// 门限与编码器的预算同口径（圆角层数 ≤ 8）：全部轴对齐矩形 clip 在编码期求交合并成一条
-    /// **像素精确 scissor**，不占该预算；因此「本 Canvas 8 层圆角 + 任意祖先矩形 clip」的链长是
-    /// 9 = `MAX_CLIP_ITEMS`，仍然合法（旧实现按全局链长判 9 > 8 ⇒ 每帧丢帧，AR2 P1-⑥）。
+    /// 门限与编码器的预算**同口径**：只数**圆角**层（全部轴对齐矩形 clip 在编码期求交合并成一条
+    /// **像素精确 scissor**，不占预算，见 `paint/instance.rs` 的 `ClipState`）。因此「本 Canvas
+    /// 8 层圆角 + 任意祖先矩形 clip」的链长是 9 = `MAX_CLIP_ITEMS`，仍然合法（旧实现按**全部**
+    /// push 计数判 9 > 8 ⇒ 每帧丢帧，AR2 P1-⑥ / AR2b P2-N5）。
+    ///
+    /// **已知边界（文档化，不是实现缺陷）**：`Canvas` 在构造期是独立值，看不到祖先的圆角层数，
+    /// 所以这个门限只覆盖**本 Canvas 的子树**；祖先圆角层 + 本 Canvas 圆角层之和超过 8 时，
+    /// 编码期会返回 `EngineError::ClipDepthExceeded`（每帧丢帧，**不**静默少裁）。生产节点树
+    /// 路径只产直角矩形 clip（`paint/pass.rs` 的内容 clip 恒 `corner_radius: [0.0; 4]`，
+    /// 超 8 层折叠成交集），只有应用自己用 `Canvas` 压圆角 clip 才可能撞到。
     ///
     /// debug 构建断言 `clip.rect` 的尺寸非负且坐标/圆角有限（§7.4 C4）；release 构建不做任何检查。
     ///
@@ -113,7 +120,7 @@ impl Canvas {
             is_well_formed(&clip),
             "clip rect must be finite with non-negative size"
         );
-        if usize::from(self.lane.clip_depth()) >= usize::from(MAX_CLIP_DEPTH) {
+        if self.lane.rounded_clip_depth() >= usize::from(MAX_CLIP_DEPTH) {
             return false;
         }
         self.lane.push(Primitive::Clip(ClipOp::Push(clip)));
@@ -192,6 +199,14 @@ mod tests {
         ClipRect {
             rect: bounds(),
             corner_radius: [0.0; 4],
+        }
+    }
+
+    /// 圆角 clip（`corner_radius` 非全 0 ⇒ 编码期各占一层、计入 `MAX_CLIP_DEPTH` 预算）。
+    fn rounded_clip() -> ClipRect {
+        ClipRect {
+            rect: bounds(),
+            corner_radius: [4.0; 4],
         }
     }
 
@@ -285,11 +300,30 @@ mod tests {
     fn push_clip_beyond_limit_returns_false() {
         let mut canvas = Canvas::new(bounds());
         for _ in 0..MAX_CLIP_DEPTH {
-            assert!(canvas.push_clip(clip()));
+            assert!(canvas.push_clip(rounded_clip()));
         }
         let before = canvas.primitives().len();
-        assert!(!canvas.push_clip(clip()));
+        assert!(!canvas.push_clip(rounded_clip()));
         assert_eq!(canvas.primitives().len(), before);
+        // 弹出一层后恢复。
+        assert!(canvas.pop_clip());
+        assert!(canvas.push_clip(rounded_clip()));
+    }
+
+    /// AR2b P2-N5：门限只数**圆角**层（与编码器预算同口径）。直角矩形 clip 在编码期求交合并成
+    /// 一条像素精确 scissor，不占预算 —— 旧实现按**全部** push 计数，12 层矩形会在第 9 层开始
+    /// 被静默丢弃（内容越界可见）。
+    #[test]
+    fn rect_clips_do_not_consume_the_rounded_budget() {
+        let mut canvas = Canvas::new(bounds());
+        for _ in 0..12 {
+            assert!(canvas.push_clip(clip()), "直角矩形 clip 不占圆角预算");
+        }
+        // 圆角层此时仍是 0 ⇒ 8 层圆角全部可压。
+        for _ in 0..MAX_CLIP_DEPTH {
+            assert!(canvas.push_clip(rounded_clip()));
+        }
+        assert!(!canvas.push_clip(rounded_clip()), "圆角层不能超过预算");
     }
 
     #[test]

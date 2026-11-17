@@ -3,39 +3,42 @@
 //! - 组合串子句（highlight runs）与子句边界的归一化：Windows 的 `GCS_COMPATTR` /
 //!   `GCS_COMPCLAUSE` 原始字节在这里被压成 [`crate::event::ImeEvent::Preedit`] 的 `clauses`
 //!   区间（三平台共用一种表示，见 [`preedit_clauses`]）。
+//! - Linux `zwp_text_input_v3.preedit_string` 的**字节偏移光标** → `Preedit.caret` /
+//!   `Preedit.clauses`（UTF-16 码元；协议给的是 UTF-8 字节，见 [`preedit_carets`]）。
 //! - 提交去重：连续相同字符 / 双空格是合法输入，只有**同一作用域内**的重复回调才吞掉。
-//!   作用域有两种来源：Linux 的 `zwp_text_input_v3` 按 `done` 批次（[`CommitDeduper`]），
-//!   macOS 按原生按键（[`ImeCommitScope`]）。后者额外负责「本按键的正文是否已由 IME 交付」
-//!   这一判定（R09-3），因此它在作用域结束时清空**全部**记账。
+//!   macOS 的 `NSTextInputClient` 按原生按键记账（[`ImeCommitScope`]），它额外负责
+//!   「本按键的正文是否已由 IME 交付」这一判定（R09-3），因此作用域结束时清空**全部**记账。
+//!   Linux 的 `zwp_text_input_v3` 一侧**没有**去重：协议按 `done` 双缓冲交付，一批只有一个
+//!   `commit_string`，跨批的相同文本是合法输入（AR1b P3-1：旧的 `CommitDeduper` 在 Linux
+//!   没有消费者，`begin_key + note` 恒为真）。
 //! - AppKit `replacementRange`（UTF-16）→ 组合串内替换区间（macOS `NSTextInputClient` 专用，
 //!   但换算规则是纯整数处理，与 AppKit 类型无关）。
 //!
 //! 放在平台无关层是为了让这些纯逻辑能在开发机（Windows）上被单测覆盖：
 //! macOS 的 `NSTextInputClient` 包装器只在 macOS 目标上编译，测试跑不到。
 
-// 子句区间（`Range`/`SmallVec`）只有 Windows 的 `GCS_COMPATTR`/`GCS_COMPCLAUSE` 消费者与
-// 测试构建用得到；macOS / Linux 不产生子句区间，无条件 import 会变成死导入（-D warnings）。
-// macOS 侧唯一用到 `Range` 的地方（`replacement_range` 的返回类型）用的是全路径。
-#[cfg(any(windows, test))]
+// 子句区间（`Range`/`SmallVec`）的消费者：Windows 的 `GCS_COMPATTR`/`GCS_COMPCLAUSE`、
+// Linux 的 `preedit_string` 高亮区间（`cursor_begin != cursor_end`）与测试构建；macOS 不产生
+// 子句区间，无条件 import 会变成死导入（-D warnings）。macOS 侧唯一用到 `Range` 的地方
+// （`replacement_range` 的返回类型）用的是全路径。
+#[cfg(any(windows, target_os = "linux", test))]
 use std::ops::Range;
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", test))]
 use smallvec::SmallVec;
-#[cfg(any(target_os = "linux", test))]
-use smol_str::SmolStr;
 
 /// 组合串子句区间的最大条数（`SmallVec` 内联容量；超出部分堆分配）。
 ///
 /// 实测输入法的组合串子句数是个位数（日文一次変換常见 1–3 段），4 条内联覆盖绝大多数按键，
 /// 多出来的走堆分配不影响正确性。
 ///
-/// 只在 Windows（`GCS_COMPATTR` / `GCS_COMPCLAUSE` 的消费者）+ 测试构建里编译：
-/// macOS / Linux 不产生子句区间，留着就是死代码。
-#[cfg(any(windows, test))]
+/// 只在 Windows（`GCS_COMPATTR` / `GCS_COMPCLAUSE` 的消费者）、Linux（`preedit_string` 的
+/// 高亮区间）+ 测试构建里编译：macOS 不产生子句区间，留着就是死代码。
+#[cfg(any(windows, target_os = "linux", test))]
 pub(crate) const PREEDIT_CLAUSE_INLINE: usize = 4;
 
 /// 组合串子句区间（UTF-16 码元，相对组合串起点）。
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", test))]
 pub(crate) type ClauseRanges = SmallVec<[Range<usize>; PREEDIT_CLAUSE_INLINE]>;
 
 /// 每码元一个属性字节的原始属性数组 → 「非默认属性的连续区间」。
@@ -188,42 +191,54 @@ pub(crate) fn replacement_range(
     Some(start..end)
 }
 
-/// 提交去重状态机（**批次作用域**：Linux `zwp_text_input_v3` 的一批 `done`）。
+/// `zwp_text_input_v3.preedit_string` 的字节偏移光标 → (`Preedit.caret`, 高亮子句)。
 ///
-/// macOS 用 [`ImeCommitScope`]：那里的作用域是**原生按键**（`keyDown:`），并且还要回答
-/// 「本按键的正文是否已由 IME 交付」——两个语义不能共用一个状态机。这个类型因此只在 Linux
-/// 与测试构建里编译（在 macOS 上编译就是死代码）。
+/// 协议（`text-input-unstable-v3.xml`）：
+///
+/// > The parameters cursor_begin and cursor_end are counted in bytes relative to the beginning
+/// > of the submitted text buffer. Cursor should be hidden when both are equal to -1.
+/// > They could be represented by the client as a line if both values are the same, or as a
+/// > text highlight otherwise.
+///
+/// 引擎的 `caret` / `clauses` 单位是 **UTF-16 码元**（与 Win32 `GCS_CURSORPOS`、AppKit
+/// `selectedRange.location` 同一单位），所以这里做 字节 → UTF-16 码元 的换算：
+///
+/// - 偏移落在多字节字符中间、或越过串尾 ⇒ 收敛到**最近的合法码点边界**（`0..=len`）；
+/// - 两者相等 ⇒ 插入点，`caret = Some(begin)`，无高亮；
+/// - 两者不等 ⇒ 高亮区间，`caret = Some(begin)` 且 `clauses = [begin..end)`；
+/// - 任一为负（协议只有「两者都是 -1」的合法情形）⇒ `caret = None` + 空子句：引擎没有
+///   「隐藏光标」的表示，`None` 让文本层退化为「插入点在末尾」（已在 `ImeEvent` 文档写明）。
 #[cfg(any(target_os = "linux", test))]
-#[derive(Debug, Default)]
-pub(crate) struct CommitDeduper {
-    /// 本按键内最近一次提交。
-    last: SmolStr,
-    /// 本按键是否已经提交过（`begin_key` 复位）。
-    committed_in_key: bool,
-}
-
-#[cfg(any(target_os = "linux", test))]
-impl CommitDeduper {
-    /// 一次新的按键开始：清掉「同一按键」的提交记忆（跨按键的相同文本是合法的）。
-    pub(crate) fn begin_key(&mut self) {
-        self.committed_in_key = false;
+pub(crate) fn preedit_carets(
+    text: &str,
+    cursor_begin: i32,
+    cursor_end: i32,
+) -> (Option<u32>, ClauseRanges) {
+    if cursor_begin < 0 || cursor_end < 0 {
+        return (None, ClauseRanges::new());
     }
-
-    /// 组合态变化：下一次提交是新的内容，不该被上一按键的记录吞掉。
-    pub(crate) fn reset(&mut self) {
-        self.committed_in_key = false;
+    // 字节偏移 → UTF-16 码元偏移：逐码点累加，偏移落在字符中间时停在**该字符之前**。
+    let unit_at = |byte: i32| -> usize {
+        let limit = byte as usize;
+        let mut units = 0;
+        let mut bytes = 0;
+        for ch in text.chars() {
+            let width = ch.len_utf8();
+            if bytes + width > limit {
+                break;
+            }
+            bytes += width;
+            units += ch.len_utf16();
+        }
+        units
+    };
+    let start = unit_at(cursor_begin);
+    let end = unit_at(cursor_end);
+    let mut clauses = ClauseRanges::new();
+    if end > start {
+        clauses.push(start..end);
     }
-
-    /// 记录一次提交；返回 `false` 表示**同一次按键内**的重复回调（调用方应吞掉）。
-    ///
-    /// 跨按键的相同文本（`"ll"`、双空格）返回 `true`：那是用户真的又敲了一次。
-    pub(crate) fn note(&mut self, text: &str) -> bool {
-        let next = SmolStr::new(text);
-        let duplicate = !text.is_empty() && self.committed_in_key && next == self.last;
-        self.committed_in_key = true;
-        self.last = next;
-        !duplicate
-    }
+    (Some(start as u32), clauses)
 }
 
 /// 一次**原生输入事件**的作用域令牌（macOS 的每个 `keyDown:` 一个）。
@@ -317,7 +332,7 @@ impl ImeCommitScope {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommitDeduper, NS_NOT_FOUND, clause_ranges, highlight_runs, preedit_clauses,
+        ClauseRanges, NS_NOT_FOUND, clause_ranges, highlight_runs, preedit_carets, preedit_clauses,
         replacement_range,
     };
 
@@ -517,69 +532,76 @@ mod tests {
         }
     }
 
+    /// Linux `preedit_string` 的字节光标在纯 ASCII 串上就是 UTF-16 码元偏移。
     #[test]
-    fn consecutive_identical_commits_are_delivered() {
-        let mut dedupe = CommitDeduper::default();
-        dedupe.begin_key();
-        assert!(dedupe.note("l"), "first `l` must be delivered");
-        dedupe.begin_key();
-        assert!(
-            dedupe.note("l"),
-            "second `l` is a new keystroke, not a duplicate"
+    fn preedit_caret_is_counted_in_utf16_units() {
+        assert_eq!(preedit_carets("ni", 0, 0), (Some(0), ClauseRanges::new()));
+        assert_eq!(preedit_carets("ni", 1, 1), (Some(1), ClauseRanges::new()));
+        assert_eq!(preedit_carets("ni", 2, 2), (Some(2), ClauseRanges::new()));
+    }
+
+    /// 汉字是 3 字节 / 1 码元：字节偏移必须先换算成码元，否则插入点会越过串尾。
+    #[test]
+    fn preedit_caret_converts_cjk_byte_offsets() {
+        let (caret, clauses) = preedit_carets("你好", 0, 0);
+        assert_eq!((caret, clauses), (Some(0), ClauseRanges::new()));
+        assert_eq!(preedit_carets("你好", 3, 3).0, Some(1));
+        assert_eq!(preedit_carets("你好", 6, 6).0, Some(2));
+        // 停在第一个汉字之后（字节 4 落在第二个汉字中间）⇒ 吸附到码元 1。
+        assert_eq!(preedit_carets("你好", 4, 4).0, Some(1));
+    }
+
+    /// 代理对：emoji 占 4 字节 / 2 码元，插入点必须按码元计数（否则文本层会切错）。
+    #[test]
+    fn preedit_caret_handles_astral_characters() {
+        // "🌍a" = 5 字节 / 3 码元。
+        assert_eq!(preedit_carets("🌍a", 4, 4).0, Some(2));
+        assert_eq!(preedit_carets("🌍a", 5, 5).0, Some(3));
+        // 落在代理对中间（字节 2）⇒ 收敛到 emoji 之前。
+        assert_eq!(preedit_carets("🌍a", 2, 2).0, Some(0));
+    }
+
+    /// `cursor_begin != cursor_end` ⇒ 高亮区间；协议说「两者不同时客户端可以画成文本高亮」。
+    #[test]
+    fn a_selected_preedit_range_becomes_a_clause() {
+        let (caret, clauses) = preedit_carets("你好", 3, 6);
+        assert_eq!(caret, Some(1), "插入点在选区起点");
+        assert_eq!(
+            clauses.into_iter().collect::<Vec<_>>(),
+            vec![1..2],
+            "高亮区间是 UTF-16 码元区间"
         );
+        // 反向区间（越界的第三方实现）：不产出高亮，只保留插入点。
+        let (caret, clauses) = preedit_carets("ni", 2, 1);
+        assert_eq!(caret, Some(2));
+        assert!(clauses.is_empty());
     }
 
+    /// 协议：`cursor_begin == cursor_end == -1` 表示「隐藏光标」。
+    ///
+    /// 引擎的 `Preedit.caret` 没有「隐藏」这个状态，`None` 让文本层退化为「插入点在末尾」
+    /// （已在 `ImeEvent` 文档写明）。任一端为负同样按不可用处理。
     #[test]
-    fn consecutive_spaces_are_delivered() {
-        let mut dedupe = CommitDeduper::default();
-        dedupe.begin_key();
-        assert!(dedupe.note(" "));
-        dedupe.begin_key();
-        assert!(dedupe.note(" "), "double space must not be swallowed");
+    fn a_hidden_cursor_yields_no_caret() {
+        assert_eq!(preedit_carets("ni", -1, -1), (None, ClauseRanges::new()));
+        assert_eq!(preedit_carets("ni", -1, 2), (None, ClauseRanges::new()));
+        assert_eq!(preedit_carets("ni", 0, -1), (None, ClauseRanges::new()));
     }
 
+    /// 越界偏移（组合串已变短 / 第三方 compositor）：夹到 `0..=len`，不 panic、不越界。
     #[test]
-    fn duplicate_commit_within_one_key_is_swallowed() {
-        let mut dedupe = CommitDeduper::default();
-        dedupe.begin_key();
-        assert!(dedupe.note("你"));
-        assert!(
-            !dedupe.note("你"),
-            "same text twice in one keystroke is an IME duplicate"
-        );
-    }
-
-    #[test]
-    fn a_different_text_in_the_same_key_is_delivered() {
-        let mut dedupe = CommitDeduper::default();
-        dedupe.begin_key();
-        assert!(dedupe.note("a"));
-        assert!(dedupe.note("b"));
-    }
-
-    #[test]
-    fn resetting_the_window_makes_the_same_text_legal_again() {
-        let mut dedupe = CommitDeduper::default();
-        dedupe.begin_key();
-        assert!(dedupe.note("ni"));
-        dedupe.reset();
-        assert!(dedupe.note("ni"));
-    }
-
-    #[test]
-    fn three_identical_commits_across_keys_all_pass() {
-        let mut dedupe = CommitDeduper::default();
-        for _ in 0..3 {
-            dedupe.begin_key();
-            assert!(dedupe.note("a"));
-        }
+    fn out_of_range_preedit_offsets_are_clamped() {
+        assert_eq!(preedit_carets("ni", 99, 99).0, Some(2));
+        assert_eq!(preedit_carets("ni", i32::MAX, i32::MAX).0, Some(2));
+        assert_eq!(preedit_carets("", 0, 0), (Some(0), ClauseRanges::new()));
     }
 }
 
 /// 按键作用域（macOS `keyDown:`）的提交记账单测（R09-3）。
 ///
-/// 与上面的 `CommitDeduper` 分开：那是 Linux（`zwp_text_input_v3` 的 `done` 批次）用的批作用域
-/// 去重器，语义不同；这里是原生按键作用域，**必须在作用域结束时清空全部状态**。
+/// 与 Linux 无关：Linux 的 `zwp_text_input_v3` 按 `done` 双缓冲交付、一批只有一个
+/// `commit_string`，没有「同一按键内重复提交」这回事（去重器已删除，见文件头）。这里是
+/// 原生按键作用域，**必须在作用域结束时清空全部状态**。
 #[cfg(test)]
 mod scope_tests {
     use super::{CommitVerdict, ImeCommitScope};

@@ -1,22 +1,29 @@
-//! 帧编排：上传 → 逐 damage scissor 画进持久 offscreen → 整面 copy 到 swapchain → present
+//! 帧编排：上传 → 逐 damage scissor 画进持久 offscreen → **差分 copy** 到 swapchain → present
 //! （`design/phase-12-macos-linux.md` §6.6 / §6.9、`design/async-render-pipeline.md` §7）。
 //!
-//! **两条与 Windows 不同的硬约束**（F-121）：
-//! 1. `FramePlan::copy_plan()` 是 D3D12 专用：swapchain image 的内容 present 后未定义，
-//!    因此**每帧整面 `cmd_copy_image`**；`present_dirty()` 只作为 `VK_KHR_incremental_present` 的 hint。
+//! **两条硬约束**：
+//! 1. swapchain image 的内容在 present 之后对应用不可信 ⇒ 每张 image 相对 persist 还差哪些矩形
+//!    必须**记账**（[`ImageCopyPlan`]，与 D3D12 的 `copy_plan` / Metal 的 `DrawableSyncs` 同构）。
+//!    旧实现每帧整面 `cmd_copy_image`（1080p@120Hz ≈ 1.0 GB/s，4K ≈ 4 GB/s 纯带宽），把
+//!    damage/scissor 的收益全部抵消（R11-12）。`present_dirty()` 现在是**实际拷贝区域**，
+//!    同时作为 `VK_KHR_incremental_present` 的 hint —— 两者必须一致。
 //! 2. 没有自动 barrier：本文件是 barrier 的**唯一**写点（表见 §6.6）。
 //!
 //! 所有权（§3.1 / P1-2.9）：[`GpuRenderer`] 是一个**窗口**的渲染器（GPU 线程独占）。进程级共享
-//! 资源（instance / device / queue / PSO / 描述符池 / 图集纹理）由 [`SharedGpu`] 持有；本结构
-//! 只保留每窗口对象：`VkSurfaceKHR` / swapchain / 持久目标 / 帧同步（fence、`image_available`、
-//! 自己的 timeline）/ 命令池 / 上传缓冲 / 几何缓冲 / 图集 staging / 描述符段。构造发生在窗口
-//! 创建时（UI 线程），构造完成后整体移交给 `kytrix-vulkan` 线程（[`super::renderer`]）。离屏 /
-//! 快照路径不走线程：门面在 UI 线程同步调用，语义与 golden 不变。
+//! 资源（instance / device / queue / PSO / 描述符池 / 图集纹理 / 内存池）由 [`SharedGpu`] 持有；
+//! 本结构只保留每窗口对象：`VkSurfaceKHR` / swapchain / 持久目标 / 帧同步（fence、
+//! `image_available`、自己的 timeline）/ 命令池 / 上传缓冲 / 几何缓冲 / 图集 staging / 描述符段。
+//! 构造发生在窗口创建时（UI 线程），构造完成后整体移交给 `kytrix-vulkan` 线程
+//! （[`super::renderer`]）。离屏 / 快照路径不走线程：门面在 UI 线程同步调用。
+//!
+//! **timeline 值只有一个来源**（R11-1）：`slot.signal_value`（ring 的提交序号）。它同时是
+//! submit 时 signal 的值、retire 队列的键、teardown 的等待值。`FrameIndex`（UI 帧序号）会跳号
+//! （`Idle` 帧 / 最新帧槽合并 / `Retry`），只作为反馈与诊断标签。
 //!
 //! 异步（I1 / I2 / I4）：`vkQueueSubmit` 后立即返回；`resize` 不再等设备空闲（只用
-//! `oldSwapchain` 建新的，旧资源按帧序号延迟释放）；retire 由本窗口 timeline 非阻塞推进。阻塞
-//! 只发生在 GPU 线程上：槽 fence（复用命令/上传缓冲的前置条件）与 `vkAcquireNextImageKHR`
-//! （100 ms 上限）。
+//! `oldSwapchain` 建新的，旧资源按提交序号延迟释放）；retire 由本窗口 timeline 非阻塞推进。
+//! 阻塞只发生在 GPU 线程上：槽 fence（有界 2 s）、`vkAcquireNextImageKHR`（100 ms 上限）、
+//! 以及 swapchain 重建后的队列 idle（有界 2 s，R11-3）。
 //!
 //! 共享图集的并发契约（多窗口）：**读锁**覆盖「页对齐 → 录制 → 提交」整个区间（页在帧内不会
 //! 变）；待上传页与共享页不一致时先释放读锁，在 `SharedGpu::rebuild_atlas_pages` 的**写锁**里
@@ -33,8 +40,9 @@ use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use super::readback::{Readback, ReadbackImage};
 use super::{
     atlas::AtlasUploads,
-    device::{DescriptorLease, FrameSync, GpuObject, SharedGpu, init_error, on_gpu_thread},
+    device::{DescriptorLease, FrameSync, GpuBuffer, SharedGpu, init_error, on_gpu_thread},
     geometry::GeometryRegistry,
+    memory::MemoryNeed,
     pipeline::{Pipeline, RENDER_FORMAT},
     swapchain::{Acquire, Present, Surface, Swapchain},
     timer::GpuTimer,
@@ -46,7 +54,7 @@ use crate::{
     platform::linux::dpi,
     render::{
         RenderStats,
-        compositor::{FramePlan, Plan},
+        compositor::{CopyPlan, DamageRects, FramePlan, ImageCopyPlan, Plan},
         frame::{FramePayload, FrameRequest, FrameSlot, MAX_FRAMES_IN_FLIGHT},
         retire::GpuResourceHandle,
         timer::{FrameTimings, GpuTimerSample, Section},
@@ -58,31 +66,37 @@ use crate::{
 /// `minStorageBufferOffsetAlignment` 的保守上界（256 B）：clips 段在此偏移处开始。
 const CLIP_ALIGN: u64 = 256;
 
-/// 连续 `OUT_OF_DATE` 的重建上限：正常合成器一次重建就能恢复；超过说明 surface 已失效，
-/// 上报强类型错误（不 panic、不无限自旋）。
-const MAX_OUT_OF_DATE_RETRIES: u32 = 4;
+/// 连续 `OUT_OF_DATE` / `SUBOPTIMAL` 的重建上限：正常合成器一次重建就能恢复；超过说明 surface
+/// 已失效或参数始终不匹配（R11-7 的「每帧重建自旋」）。
+const MAX_REBUILDS: u32 = 4;
+
+/// 重建之后至少多少帧不再重建（即使 acquire / present 仍报 `SUBOPTIMAL`）。
+///
+/// `VK_SUBOPTIMAL_KHR` 可以**持续**返回（extent / transform / colorSpace 与合成器期望不符），
+/// 而每次重建都要 `vkCreateSwapchainKHR` + `vkGetSwapchainImagesKHR` + N 个信号量。没有这个门槛
+/// 时，持续 SUBOPTIMAL 会退化成每帧重建：帧率崩塌 + 句柄/显存抖动，现象像「卡顿」而不是错误。
+const REBUILD_COOLDOWN_FRAMES: u64 = 60;
 
 /// 一帧异步提交的结果（窗口路径）。
 pub(crate) enum Submitted {
     /// 已提交（可能已呈现）；`stats` / `samples` 是本帧的，`slot` 是提交用的 ring 槽位
-    /// （完成观测点据此 resolve GPU 采样），`timeline_value` 是本帧 submit 时 signal 的 timeline
+    /// （完成观测点据此 resolve GPU 采样），`sequence` 是本帧 submit 时 signal 的 timeline
     /// 值（完成判据，§4.1）。
     Presented {
         stats: RenderStats,
         samples: Vec<GpuTimerSample>,
         slot: usize,
-        timeline_value: u64,
+        sequence: u64,
     },
     /// 本帧没有产生 GPU 工作（acquire 未就绪 / 刚重建 swapchain）：调用方保留帧请求重试。
     Retry,
 }
 
-/// 已提交、尚未被 timeline 确认完成的帧（timeline 信号值 → 序号）。
-#[derive(Clone, Copy)]
-struct InFlightFrame {
-    signal: u64,
-    index: FrameIndex,
-}
+/// 已提交、尚未被 timeline 确认完成的帧的**提交序号**（timeline 的 signal 值 = ring 的提交序号）。
+///
+/// UI 帧序号（`FrameIndex`）不参与完成判据：它只随反馈 / 诊断走（`renderer::SubmittedFrame`），
+/// 放在这里会诱使后来者拿它去比 timeline 值 —— 那正是 R11-1 的成因。
+type InFlightSequence = u64;
 
 /// 一个窗口的 GPU 渲染器（**GPU 线程独占**；离屏路径由门面同步调用）。
 pub(crate) struct GpuRenderer {
@@ -92,15 +106,21 @@ pub(crate) struct GpuRenderer {
     /// 最后一个 `Arc<SharedGpu>` 的 device / instance。
     swapchain: Option<Swapchain>,
     vk_surface: Option<Surface>,
-    /// 当前持久绘制目标（与 swapchain 同尺寸、同格式）。
+    /// 当前持久绘制目标（尺寸 = swapchain extent，格式 = `RENDER_FORMAT`）。
     persist: Persist,
-    /// 旧 persist 的延迟销毁（I4）：`FrameIndex` 完成之后才 drop（`Persist::drop` 销毁句柄）。
-    retired_persists: Vec<(FrameIndex, Persist)>,
-    /// 旧 swapchain 的延迟销毁（§7.4）：`Some(index)` = 新 swapchain 在该帧成功 present 过；
-    /// `None` = 新 swapchain 还没 present 成功（不能销毁，合成器可能仍在用旧缓冲）。
-    retired_swapchains: Vec<(Option<FrameIndex>, Swapchain)>,
+    /// 旧 persist 的延迟销毁（I4）：`u64` 提交序号完成之后才 drop（`Persist::drop` 销毁句柄）。
+    retired_persists: Vec<(u64, Persist)>,
+    /// 旧 swapchain 的延迟销毁（§7.4 / R11-3）：销毁前必须有一次**队列 idle**（presentation
+    /// engine 与在飞批次都可能仍引用它们）。
+    retired_swapchains: Vec<Swapchain>,
     /// 本窗口在进程级描述符池里的段（`Drop` 归还）。
     descriptors: DescriptorLease,
+    /// 每帧槽上一次写进 descriptor set 的 `(上传缓冲, clips 偏移)`（R11-10）。
+    ///
+    /// `vkUpdateDescriptorSets` 只在句柄真的变化时调用：上传缓冲仅在扩容时换句柄，而
+    /// `vkUpdateDescriptorSets` 要被进程级池锁串行化、在 Mesa/NVIDIA 上会触发 descriptor cache
+    /// 失效。旧实现每帧 2 次持锁写，120 Hz × 多窗口下是纯 CPU 开销。
+    written_slots: [Option<(vk::Buffer, u64)>; MAX_FRAMES_IN_FLIGHT],
     /// 本窗口的图集上传路径（待上传页 + 每槽 staging）。
     atlas_uploads: AtlasUploads,
     upload: UploadArena,
@@ -126,6 +146,7 @@ pub(crate) struct GpuRenderer {
     ///
     /// fractional 模式恒为 1（destination 负责缩放）；整数回退是整数 scale `N`（V-110）。
     last_buffer_scale: i32,
+    /// UI 请求的像素尺寸（GPU 线程据此判断是否要重建；渲染目标尺寸见 [`Self::extent`]）。
     surface: (u32, u32),
     /// 窗口 DPI（root.frame.params.x；geometry 通道的逻辑到物理换算）。
     scale: f32,
@@ -133,19 +154,28 @@ pub(crate) struct GpuRenderer {
     geometry: GeometryRegistry,
     /// 下一次 present 是否必须全量：新建 / 重建之后为 `true`，present 成功后清除。
     fresh: bool,
-    /// 最后一次**真正提交**的帧序号（重建资源入 retire 队列时的 tag，§4.3）。
-    last_index: FrameIndex,
-    /// 已提交、尚未被 timeline 确认完成的 `(timeline 值, 序号)`。
+    /// 最后一次**真正提交**的提交序号（重建资源入 retire 队列时的 tag，§4.3）。
+    last_sequence: u64,
+    /// 已提交、尚未被 timeline 确认完成的提交序号（**不含** UI 帧序号：完成判据只有一套值）。
+    submitted: VecDeque<InFlightSequence>,
+    /// timeline 已确认完成的最大提交序号（retire / 延迟销毁的推进点）。
+    completed_sequence: u64,
+    /// 每张 presentable image 的差分拷贝状态（R11-12）。
+    image_copy_plan: ImageCopyPlan,
+    /// 本帧实际拷贝进 presentable image 的矩形（`None` = 整面）。
     ///
-    /// `FrameIndex` 有跳号（GPU 线程跳过的帧不产生 GPU 工作），因此不能用 timeline 值反推
-    /// 序号：这里记下每个真正提交的帧，完成时直接拿到对应的真实序号。
-    submitted: VecDeque<InFlightFrame>,
-    /// timeline 已确认完成的最大帧序号（retire 的推进点）。
-    completed: FrameIndex,
+    /// `copy_to_swapchain` 写入、`present` 读取：`VK_KHR_incremental_present` 的 region 必须与
+    /// 实际搬运的像素一致（R11-12）。
+    frame_copy: Option<DamageRects>,
     /// present 成功后需要重建 swapchain（`SUBOPTIMAL`，§7.3）。
     rebuild_swapchain: bool,
-    /// 连续 `OUT_OF_DATE` 次数（防自旋）。
+    /// 连续 `OUT_OF_DATE` 次数（每次成功 present 清零）：超上限才报错，不无限自旋。
     out_of_date: u32,
+    /// 最近一段时间的 `SUBOPTIMAL` 重建次数与上次重建的提交序号（R11-7 的门槛）。
+    suboptimal_rebuilds: u32,
+    last_rebuild_sequence: u64,
+    /// 已经放弃重建（`SUBOPTIMAL` 次数超上限）：只记一次诊断，继续用现有 swapchain 呈现。
+    rebuild_abandoned: bool,
     /// 快照帧序号（离屏路径的一次性帧；timeline 值必须单调递增）。
     #[cfg(feature = "test-support")]
     snapshot_index: u32,
@@ -210,12 +240,19 @@ impl GpuRenderer {
         wl_surface: Option<wl_surface::WlSurface>,
     ) -> Result<Self, EngineError> {
         let descriptors = shared.window_descriptors()?;
-        let persist = Persist::new(&shared, size)?;
+        // 渲染目标尺寸的来源：窗口路径用 swapchain 的 `imageExtent`（clamp / currentExtent /
+        // transform 之后），离屏路径用请求尺寸（R11-9）。
+        let target = swapchain.as_ref().map_or(size, |swapchain| {
+            let extent = swapchain.extent();
+            (extent.width, extent.height)
+        });
+        let persist = Persist::new(&shared, target)?;
+        let swapchain_images = swapchain.as_ref().map_or(1, Swapchain::image_count);
         let upload = UploadArena::new(&shared)?;
         let (command_pool, commands) = create_commands(&shared)?;
         let timer = GpuTimer::new(&shared)?;
         let sync = FrameSync::new(&shared)?;
-        Ok(Self {
+        let renderer = Self {
             vk_surface,
             swapchain,
             persist,
@@ -228,6 +265,7 @@ impl GpuRenderer {
             commands,
             timer,
             sync,
+            written_slots: [None; MAX_FRAMES_IN_FLIGHT],
             clear_color,
             viewport,
             last_destination: None,
@@ -237,17 +275,23 @@ impl GpuRenderer {
             scale: 1.0,
             geometry: GeometryRegistry::new(),
             fresh: true,
-            last_index: FrameIndex::default(),
+            last_sequence: 0,
             submitted: VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT),
-            completed: FrameIndex::default(),
+            completed_sequence: 0,
+            image_copy_plan: ImageCopyPlan::new(swapchain_images),
+            frame_copy: None,
             rebuild_swapchain: false,
             out_of_date: 0,
+            suboptimal_rebuilds: 0,
+            last_rebuild_sequence: 0,
+            rebuild_abandoned: false,
             #[cfg(feature = "test-support")]
             snapshot_index: 0,
             #[cfg(feature = "test-support")]
             readback: Readback::new(),
             shared,
-        })
+        };
+        Ok(renderer)
     }
 
     pub(crate) fn surface(&self) -> (u32, u32) {
@@ -268,7 +312,12 @@ impl GpuRenderer {
     }
 
     /// resize（§7.4）：**不排空设备**。新 swapchain 走 `oldSwapchain`，旧 swapchain / 旧 persist
-    /// 进延迟销毁队列（等新 swapchain 的首帧完成，I4）。
+    /// 进延迟销毁队列（旧 swapchain 在下一次队列 idle 时销毁，见 [`Self::drain_retired_swapchains`]；
+    /// 旧 persist 等提交序号完成，I4）。
+    ///
+    /// 渲染目标尺寸的**唯一来源是 swapchain extent**（clamp / `currentExtent` / transform 之后，
+    /// R11-9），不是 UI 请求值 —— 旧实现让 persist 用未 clamp 的请求尺寸，于是 `renderArea` 可能
+    /// 超出 framebuffer（`VUID-VkRenderPassBeginInfo-*`）、`vkCmdCopyImage` 的 extent 可能超出源图。
     pub(crate) fn resize(&mut self, size: (u32, u32)) -> Result<(), EngineError> {
         // 窗口目标的 resize 只能发生在 GPU 线程（§7.3）；离屏目标由门面同步调用。
         debug_assert!(
@@ -279,19 +328,14 @@ impl GpuRenderer {
         if size == self.surface {
             return Ok(());
         }
-        // 先建新 persist：失败时状态完全不变（新 persist 未被任何提交引用，drop 即安全）。
+        if self.swapchain.is_some() {
+            // 窗口路径：`install_swapchain` 按新链的 `imageExtent` 保证 persist 尺寸（单一来源）。
+            return self.replace_swapchain(size);
+        }
+        // 离屏路径：没有 swapchain，渲染目标尺寸就是请求尺寸。
         let persist = Persist::new(&self.shared, size)?;
-        if self.swapchain.is_some() {
-            self.replace_swapchain(size)?;
-        }
-        let old = std::mem::replace(&mut self.persist, persist);
-        if self.swapchain.is_some() {
-            // 窗口路径：旧 persist 可能仍被在飞命令缓冲引用 ⇒ 按帧序号延迟释放（I4）。
-            self.retired_persists.push((self.last_index, old));
-        } else {
-            // 离屏路径本来就同步（`finish_sync` 已等完每次提交）⇒ 旧 persist 可以立刻释放。
-            drop(old);
-        }
+        // 离屏路径本来就同步（`finish_sync` 已等完每次提交）⇒ 旧 persist 可以立刻释放。
+        drop(std::mem::replace(&mut self.persist, persist));
         self.surface = size;
         self.fresh = true;
         Ok(())
@@ -334,37 +378,35 @@ impl GpuRenderer {
         // ② acquire：节奏原语（I3），100 ms 上限只为响应 shutdown。
         let acquire = {
             let swapchain = self.swapchain.as_ref().expect("checked above");
-            swapchain.acquire(self.sync.image_available(slot.index))
+            swapchain.acquire(&self.shared, self.sync.image_available(slot.index))
         };
         let image_index = match acquire {
             Ok(Acquire::Image { index, suboptimal }) => {
                 if suboptimal {
-                    // 本帧照常 present，之后重建（§7.3）。
+                    // 本帧照常 present，之后按门槛重建（§7.3 / R11-7）。
                     self.rebuild_swapchain = true;
                 }
                 index
             }
             Ok(Acquire::NotReady) => return Ok(Submitted::Retry),
             Ok(Acquire::OutOfDate) => {
-                self.out_of_date += 1;
-                if self.out_of_date > MAX_OUT_OF_DATE_RETRIES {
-                    return Err(EngineError::Swapchain {
-                        detail: smol_str::format_smolstr!(
-                            "swapchain stayed out of date after {MAX_OUT_OF_DATE_RETRIES} rebuilds"
-                        ),
-                    });
-                }
-                self.recreate_swapchain()?;
+                self.rebuild_out_of_date("acquire reported OUT_OF_DATE")?;
+                return Ok(Submitted::Retry);
+            }
+            // R11-11：surface 永久失效 ⇒ 重建 `VkSurfaceKHR` + swapchain（旧实现把 acquire 的
+            // `SURFACE_LOST` 混进 `OutOfDate`，于是 present 侧的同类错误直接结束 GPU 线程、窗口黑屏）。
+            Ok(Acquire::SurfaceLost) => {
+                self.recover_surface("acquire reported SURFACE_LOST")?;
                 return Ok(Submitted::Retry);
             }
             Err(error) => return Err(self.classify(error)),
         };
-        self.out_of_date = 0;
 
         // ③ 录制 + 提交（`vkQueueSubmit` 后立即返回）。返回本帧 submit 时 signal 的 timeline 值：
-        // 完成判据必须与 `vkGetSemaphoreCounterValue` 同源，不能拿 ring 的提交计数去比。
+        // 完整判据必须与 `vkGetSemaphoreCounterValue` 同源，且**只能是 `slot.signal_value`**
+        // （R11-1：UI 帧序号会跳号，不能当 timeline 值）。
         let mut timings = FrameTimings::new();
-        let (stats, timeline_value) = self.record_and_submit(
+        let (stats, sequence) = self.record_and_submit(
             request.index,
             slot,
             &request.payload,
@@ -420,10 +462,19 @@ impl GpuRenderer {
         }
 
         // ④ present：等**这张 image** 的 render-finished（§7.2 硬规则 1）。
+        //
+        // `incremental_present` 的 hint 必须与本次**实际拷贝的矩形**一致（R11-12）：旧实现把
+        // UI 的 damage 当 hint、实际又拷整面 —— 改成差分拷贝之后两者必须同源，否则合成器会保留
+        // 我们其实已经重画过的像素（浪费）或反之。
+        // 本帧写进 persist 的矩形：**必须在 `frame.presented()` 之前取**（那会清 `fresh`，
+        // 而 `fresh` 是「整面重画」的判据；取晚了会把整帧误当成局部帧，让其余 image 少拷像素）。
+        let written = frame_written(frame);
         let present_started = Instant::now();
         let presented = {
+            // 本帧的拷贝计划（在 `copy_to_swapchain` 里录制，present 时只读同样的事实）。
+            let copied = self.frame_copy;
             let swapchain = self.swapchain.as_ref().expect("checked above");
-            swapchain.present(&self.shared, image_index, *frame)
+            swapchain.present(&self.shared, image_index, copied)
         };
         let presented = match presented {
             Ok(presented) => presented,
@@ -439,34 +490,40 @@ impl GpuRenderer {
                 if matches!(presented, Present::Suboptimal) {
                     self.rebuild_swapchain = true;
                 }
+                // 成功 present ⇒ 连续 OUT_OF_DATE 计数清零（上界只约束「连续」失败）。
+                self.out_of_date = 0;
                 frame.presented();
                 self.fresh = false;
-                // 新 swapchain 已经成功 present 过一帧 ⇒ 旧 swapchain 的销毁条件已成立（§7.4）。
-                self.arm_retired_swapchains(request.index);
+                // 本 image 已经被这一帧追平；其余 image 累积本帧 damage（R11-12）。
+                self.image_copy_plan.commit(image_index, written);
+                // 旧 swapchain 的释放条件（R11-3）：队列 idle，而不是「新链某帧的 timeline」。
+                self.drain_retired_swapchains()?;
             }
             Present::OutOfDate => {
-                // 本帧已经提交（timeline 会 signal），不能再重录；重建后由下一帧补画。
-                self.rebuild_swapchain = true;
+                // 本帧已经提交（timeline 会 signal），不能再重录；立刻重建，由下一帧补画。
+                self.rebuild_swapchain = false;
+                self.rebuild_out_of_date("present reported OUT_OF_DATE")?;
+            }
+            // R11-11：present 侧的 `SURFACE_LOST_KHR` 走与 acquire 同一条恢复路径。
+            Present::SurfaceLost => {
+                self.recover_surface("present reported SURFACE_LOST")?;
             }
         }
-        self.submitted.push_back(InFlightFrame {
-            signal: timeline_value,
-            index: request.index,
-        });
+        self.submitted.push_back(sequence);
         // GPU 采样**不在这里** resolve：该槽的 timestamp 可能还被在飞帧写；完成观测点
         // （[`Self::resolve_frame_timer`]）只在 timeline 确认之后调用（§4.1）。
         let samples = timings.samples().to_vec();
 
-        // SUBOPTIMAL：present 之后立刻重建（§7.3），旧 swapchain 进延迟销毁队列。
+        // SUBOPTIMAL：present 之后按门槛重建（§7.3 / R11-7），旧 swapchain 进延迟销毁队列。
         if self.rebuild_swapchain {
             self.rebuild_swapchain = false;
-            self.recreate_swapchain()?;
+            self.request_rebuild("present reported SUBOPTIMAL")?;
         }
         Ok(Submitted::Presented {
             stats,
             samples,
             slot: slot.index,
-            timeline_value,
+            sequence,
         })
     }
 
@@ -488,8 +545,9 @@ impl GpuRenderer {
         let slot = self.sync.slot();
         // 离屏路径本来就同步：复用槽位前等 fence（与窗口路径同一前置条件）。
         self.sync.wait_slot(slot)?;
-        let (stats, _) = self.record_and_submit(index, slot, payload, frame, None, timings)?;
-        self.finish_sync(index, slot, timings)?;
+        let (stats, sequence) =
+            self.record_and_submit(index, slot, payload, frame, None, timings)?;
+        self.finish_sync(slot, sequence, timings)?;
         // 与 macOS 的 `submit_snapshot` 一致：本帧已经**同步完成**，目标内容是确定的，
         // 因此不再是「新建/未呈现」状态。旧实现从不清 `fresh`，于是离屏/基准路径每帧
         // 都走全量（掩盖了 partial 的问题，也让基准测不到真实的分支）。
@@ -509,18 +567,19 @@ impl GpuRenderer {
             return Ok(0);
         }
         let value = self.sync.completed_value()?;
-        while let Some(frame) = self.submitted.front().copied() {
-            if frame.signal > value {
+        while let Some(sequence) = self.submitted.front().copied() {
+            if sequence > value {
                 break;
             }
             self.submitted.pop_front();
-            self.completed = frame.index;
+            self.completed_sequence = sequence;
         }
-        if self.completed != FrameIndex::default() {
-            self.sync.drain_retire(self.completed);
-            self.retired_persists.retain(|(at, _)| *at > self.completed);
-            self.retired_swapchains
-                .retain(|(armed, _)| armed.is_none_or(|at| at > self.completed));
+        if self.completed_sequence != 0 {
+            // retire 的键是**提交序号**（R11-1 / R06-1）：`FrameIndex` 是 `u32` 且会饱和，
+            // 饱和后「按帧延迟释放」会退化成「立刻释放」。
+            self.sync.drain_retire(self.completed_sequence);
+            self.retired_persists
+                .retain(|(sequence, _)| *sequence > self.completed_sequence);
         }
         Ok(value)
     }
@@ -567,7 +626,8 @@ impl GpuRenderer {
     pub(crate) fn readback(&mut self) -> Result<ReadbackImage, EngineError> {
         let command = self.commands[0];
         let image = self.persist.image;
-        let size = self.surface;
+        // 读回的尺寸必须与 persist 的实际尺寸一致（= swapchain extent，见 `resize`，R11-9）。
+        let size = self.persist.size;
         // SAFETY: 命令缓冲由本结构独占；上一次使用它的提交已由 `finish_sync` 等过槽 fence。
         unsafe {
             self.shared
@@ -643,6 +703,11 @@ impl GpuRenderer {
 
     /// 录制 + 提交一帧（不呈现、不等完成）。返回本帧的统计与 submit 时 signal 的 timeline 值
     /// （调用方按它判断完成，不自己重复计算）。
+    ///
+    /// **timeline 值只有一个来源**（R11-1）：`slot.signal_value`（ring 的提交序号）。它同时是
+    /// ① submit 的 signal 值、② retire / 延迟销毁的键、③ teardown 的等待值。UI 的 `FrameIndex`
+    /// 只作为反馈标签 —— 旧实现拿它当 timeline 值 signal，而等待侧用 ring 的提交计数，序号一跳号
+    /// 两者永久错位。
     fn record_and_submit(
         &mut self,
         index: FrameIndex,
@@ -657,6 +722,10 @@ impl GpuRenderer {
             timings.frame(),
             index,
             "timings must be reset for this frame"
+        );
+        debug_assert!(
+            slot.signal_value > self.last_sequence,
+            "timeline signal values must be strictly increasing (R11-22)"
         );
         let shared = Arc::clone(&self.shared);
         let upload_started = Instant::now();
@@ -673,7 +742,7 @@ impl GpuRenderer {
             Err(error) => {
                 // 上传缓冲扩容失败：已经换下的旧句柄同样要进 retire 队列（错误路径兜底）。
                 for handle in retired {
-                    self.sync.retire(index, handle);
+                    self.sync.retire(slot.signal_value, handle);
                 }
                 return Err(error);
             }
@@ -685,10 +754,9 @@ impl GpuRenderer {
         });
         // 本帧的几何帧号：`ensure` 记录 last_used，帧末 `retain_recent` 驱逐长期未绘制的几何。
         self.geometry.begin_frame();
-        let timeline_value = u64::from(index.get());
+        self.frame_copy = None;
         let recorded = self.record_frame(
             &shared,
-            index,
             slot,
             payload,
             frame,
@@ -699,7 +767,7 @@ impl GpuRenderer {
         // 无论录制 / 提交是否成功，本帧已经换下的句柄都进 retire 队列：提交失败的帧永远不会
         // 完成，它们的句柄由本窗口 teardown 的 `drain_all_retired` 释放。
         for handle in retired {
-            self.sync.retire(index, handle);
+            self.sync.retire(slot.signal_value, handle);
         }
         let draw_calls = recorded.map_err(|error| self.classify(error))?;
         Ok((
@@ -707,7 +775,7 @@ impl GpuRenderer {
                 draw_calls,
                 instances: (payload.instances().len() / 128) as u32,
             },
-            timeline_value,
+            slot.signal_value,
         ))
     }
 
@@ -715,7 +783,6 @@ impl GpuRenderer {
     fn record_frame(
         &mut self,
         shared: &SharedGpu,
-        index: FrameIndex,
         slot: FrameSlot,
         payload: &FramePayload,
         frame: &mut FramePlan,
@@ -738,13 +805,20 @@ impl GpuRenderer {
                     .map_err(|error| self.classify(error))?;
                 continue;
             }
-            // 本帧的实例/裁剪描述符：在共享描述符池锁内写（`vkUpdateDescriptorSets` 要求池外部同步）。
-            shared.write_slot(
-                self.descriptors.sets(),
-                slot.index,
-                self.upload.buffer(slot.index),
-                clip_offset,
-            );
+            // R11-10：描述符只在句柄真的变化时重写。上传缓冲只在扩容时换句柄，`clips` 的偏移
+            // 随容量固定 ⇒ 大多数帧这里什么都不做（旧实现每帧 2 次 `vkUpdateDescriptorSets`，
+            // 且要持进程级描述符池锁）。
+            let upload_buffer = self.upload.buffer(slot.index);
+            let previous = self.written_slots[slot.index];
+            if previous != Some((upload_buffer, clip_offset)) {
+                shared.write_slot(
+                    self.descriptors.sets(),
+                    slot.index,
+                    upload_buffer,
+                    clip_offset,
+                );
+                self.written_slots[slot.index] = Some((upload_buffer, clip_offset));
+            }
             let command = self.commands[slot.index];
             // SAFETY: 命令缓冲由本结构的命令池分配；本槽的上一次提交已由 `wait_slot` 等到。
             unsafe {
@@ -772,7 +846,7 @@ impl GpuRenderer {
                 self.draw(shared, command, slot.index, payload, frame, full)?;
             retired.extend(geometry_retired);
             if let Some(image_index) = image_index {
-                self.copy_to_swapchain(shared, command, image_index)?;
+                self.copy_to_swapchain(shared, command, image_index, frame_written(frame))?;
             }
             if let Some(timer) = self.timer.as_ref() {
                 timer.end(command, slot.index);
@@ -784,9 +858,9 @@ impl GpuRenderer {
                     .end_command_buffer(command)
                     .map_err(|error| init_error("end_command_buffer", format!("{error:?}")))?;
             }
-            self.submit_commands(shared, slot, command, u64::from(index.get()), image_index)?;
+            self.submit_commands(shared, slot, command, slot.signal_value, image_index)?;
             self.sync.advance(slot);
-            self.last_index = index;
+            self.last_sequence = slot.signal_value;
             // 读锁在这里释放（present 不需要它）。
             drop(atlas);
             return Ok(draw_calls);
@@ -796,8 +870,8 @@ impl GpuRenderer {
     /// 同步路径的收尾：等本帧完成 → 读本帧 GPU 时间 → 推进 retire（I4）。
     fn finish_sync(
         &mut self,
-        index: FrameIndex,
         slot: FrameSlot,
+        sequence: u64,
         timings: &mut FrameTimings,
     ) -> Result<(), EngineError> {
         // 同步语义：本帧命令必须完成，GPU 时间与随后的读回才有意义。
@@ -815,7 +889,11 @@ impl GpuRenderer {
             cpu_ns: elapsed_ns(present_started),
             gpu_ns: 0,
         });
-        self.sync.drain_retire(index);
+        // 同步完成：本帧（以及更早的提交）都已经完成，按提交序号推进 retire。
+        self.completed_sequence = sequence;
+        self.sync.drain_retire(sequence);
+        self.retired_persists
+            .retain(|(retired_at, _)| *retired_at > sequence);
         Ok(())
     }
 
@@ -826,7 +904,7 @@ impl GpuRenderer {
     }
 
     /// 目标尺寸变化时的 swapchain 替换（同尺寸的 `OUT_OF_DATE` / `SUBOPTIMAL` 走
-    /// [`Self::recreate_swapchain`]）。
+    /// [`Self::request_rebuild`]）。
     fn replace_swapchain(&mut self, size: (u32, u32)) -> Result<(), EngineError> {
         let surface = self.vk_surface.as_ref().map(Surface::raw);
         let old = self.swapchain.take();
@@ -844,21 +922,12 @@ impl GpuRenderer {
             }
         };
         match created {
-            Ok(swapchain) => {
-                if let Some(old) = old {
-                    // `None` = 还没在新 swapchain 上 present 成功，暂不销毁（§7.4）。
-                    self.retired_swapchains.push((None, old));
-                }
-                self.swapchain = Some(swapchain);
-                self.fresh = true;
-                self.surface = size;
-                Ok(())
-            }
+            Ok(swapchain) => self.install_swapchain(swapchain, old, size),
             Err(error) => {
                 if let Some(old) = old {
-                    // 规范：传给 `oldSwapchain` 的旧 swapchain 即使创建失败也已 retired，必须销毁；
-                    // 在飞帧的完成由 timeline 记账（等 `last_index` 完成即可释放）。
-                    self.retired_swapchains.push((Some(self.last_index), old));
+                    // 规范：传给 `oldSwapchain` 的旧 swapchain 即使创建失败也已 retired，必须销毁
+                    // （销毁前置条件由 `drain_retired_swapchains` 的队列 idle 保证，R11-3）。
+                    self.retired_swapchains.push(old);
                 }
                 // `VK_ERROR_SURFACE_LOST_KHR` 的恢复：**重建 `VkSurfaceKHR`** 后重试一次。
                 // 合成器重启 / 显卡复位后旧 surface 永久失效，只重建 swapchain 会一直失败；
@@ -871,27 +940,147 @@ impl GpuRenderer {
                 let Some(raw) = raw else {
                     return Err(error);
                 };
-                let retried = Swapchain::new(&self.shared, raw, size);
-                match retried {
-                    Ok(swapchain) => {
-                        self.swapchain = Some(swapchain);
-                        self.fresh = true;
-                        self.surface = size;
-                        Ok(())
-                    }
-                    Err(retried) => Err(retried),
-                }
+                let swapchain = Swapchain::new(&self.shared, raw, size)?;
+                self.install_swapchain(swapchain, None, size)
             }
         }
     }
 
-    /// 新 swapchain 成功 present 之后：旧 swapchain 的销毁条件成立（§7.4）。
-    fn arm_retired_swapchains(&mut self, index: FrameIndex) {
-        for (armed, _) in &mut self.retired_swapchains {
-            if armed.is_none() {
-                *armed = Some(index);
-            }
+    /// 装上新链：旧链进延迟销毁队列，差分拷贝表与描述符记账一起重置。
+    ///
+    /// 渲染目标的尺寸只有一个来源：**swapchain 的 `imageExtent`**（`currentExtent` / clamp /
+    /// transform 之后）。同尺寸重建时它也可能变（合成器改了 `currentExtent`），所以这里比较一次，
+    /// 不同就重建 persist —— 否则 `renderArea` 会超出 framebuffer（R11-9）。
+    fn install_swapchain(
+        &mut self,
+        swapchain: Swapchain,
+        old: Option<Swapchain>,
+        size: (u32, u32),
+    ) -> Result<(), EngineError> {
+        if let Some(old) = old {
+            self.retired_swapchains.push(old);
         }
+        // 新链的 image 索引与旧链无关（R11-12 / R11-9）：差分拷贝表必须整体重置。
+        self.image_copy_plan.reset(swapchain.image_count());
+        // 每张 image 的 render_finished 是新的；每帧槽的 `image_available` 由 `FrameSync` 持有
+        // 且跨重建存活（规范允许），它们的等待值不受影响。
+        let extent = swapchain.extent();
+        self.swapchain = Some(swapchain);
+        self.fresh = true;
+        self.surface = size;
+        self.frame_copy = None;
+        if self.persist.size != (extent.width, extent.height) {
+            let persist = Persist::new(&self.shared, (extent.width, extent.height))?;
+            let previous = std::mem::replace(&mut self.persist, persist);
+            // 旧 persist 仍可能被在飞命令引用 ⇒ 按提交序号延迟释放（I4）。
+            self.retired_persists.push((self.last_sequence, previous));
+        }
+        Ok(())
+    }
+
+    /// 需要重建 swapchain 时的**门槛**入口（R11-7，`SUBOPTIMAL` 专用）。
+    ///
+    /// `VK_SUBOPTIMAL_KHR` 可以**持续**返回（extent / transform / colorSpace 与合成器期望不符），
+    /// 旧实现每收到一次就 `vkCreateSwapchainKHR` + `get_swapchain_images` + N 个新信号量 —— 持续
+    /// SUBOPTIMAL 时退化成每帧重建（帧率崩塌 + 句柄/显存抖动，现象像「卡顿」而不是错误）。两道
+    /// 门槛：
+    /// 1. 冷却期：刚重建过 [`REBUILD_COOLDOWN_FRAMES`] 个提交内不再重建；
+    /// 2. 预算：最近一轮里超过 [`MAX_REBUILDS`] 次就**放弃重建**，记一次诊断后继续用现有链呈现
+    ///    （并由 `swapchain.rs` 的 `log_plan` 打出实际参数）。
+    fn request_rebuild(&mut self, reason: &'static str) -> Result<(), EngineError> {
+        if self.rebuild_abandoned {
+            return Ok(());
+        }
+        let since_last = self
+            .last_sequence
+            .saturating_sub(self.last_rebuild_sequence);
+        if self.suboptimal_rebuilds > 0 && since_last < REBUILD_COOLDOWN_FRAMES {
+            return Ok(());
+        }
+        if since_last >= REBUILD_COOLDOWN_FRAMES {
+            // 一整段稳定期过去了：预算重新计算（健康的会话不应该因为很久以前的几次重建被卡死）。
+            self.suboptimal_rebuilds = 0;
+        }
+        self.suboptimal_rebuilds += 1;
+        if self.suboptimal_rebuilds > MAX_REBUILDS {
+            self.rebuild_abandoned = true;
+            eprintln!(
+                "kytrix: vulkan swapchain keeps reporting {reason} after {MAX_REBUILDS} rebuilds; \
+                 keeping the current swapchain (extent={:?} format={:?} color_space={:?})",
+                self.swapchain.as_ref().map(Swapchain::extent),
+                self.swapchain
+                    .as_ref()
+                    .map(|swapchain| swapchain.key().format),
+                self.swapchain
+                    .as_ref()
+                    .map(|swapchain| swapchain.key().color_space),
+            );
+            return Ok(());
+        }
+        self.last_rebuild_sequence = self.last_sequence;
+        self.recreate_swapchain()
+    }
+
+    /// `OUT_OF_DATE` 的重建入口：**不能**被冷却期拦住（链已经不能 present，等冷却只会继续丢帧），
+    /// 但仍然有上界（[`MAX_REBUILDS`] 次连续失败之后报强类型错误，而不是无限自旋）。
+    fn rebuild_out_of_date(&mut self, reason: &'static str) -> Result<(), EngineError> {
+        self.out_of_date += 1;
+        if self.out_of_date > MAX_REBUILDS {
+            return Err(EngineError::Swapchain {
+                detail: smol_str::format_smolstr!(
+                    "swapchain stayed out of date after {MAX_REBUILDS} rebuilds ({reason})"
+                ),
+            });
+        }
+        self.last_rebuild_sequence = self.last_sequence;
+        self.recreate_swapchain()
+    }
+
+    /// `VK_ERROR_SURFACE_LOST_KHR` 的恢复（R11-11）：重建 `VkSurfaceKHR` 与整条 swapchain。
+    fn recover_surface(&mut self, reason: &'static str) -> Result<(), EngineError> {
+        let Some(surface) = self.vk_surface.as_mut() else {
+            return Err(EngineError::Swapchain {
+                detail: smol_str::format_smolstr!("{reason}: no window surface"),
+            });
+        };
+        eprintln!("kytrix: vulkan {reason}: recreating VkSurfaceKHR");
+        // 旧 swapchain 必须先用掉（它引用旧 surface），随后进延迟销毁队列。
+        let old = self.swapchain.take();
+        if let Some(old) = old {
+            self.retired_swapchains.push(old);
+        }
+        surface.recreate()?;
+        let size = self.surface;
+        let raw =
+            self.vk_surface
+                .as_ref()
+                .map(Surface::raw)
+                .ok_or_else(|| EngineError::Swapchain {
+                    detail: smol_str::SmolStr::new_static("surface recreate lost the surface"),
+                })?;
+        let swapchain = Swapchain::new(&self.shared, raw, size)?;
+        // `install_swapchain` 会在 extent 变化时重建 persist（单一尺寸来源）；旧 surface 的
+        // 所有参数都可能变，因此这里不再重复建 persist。
+        self.install_swapchain(swapchain, None, size)?;
+        self.drain_retired_swapchains()?;
+        Ok(())
+    }
+
+    /// 旧 swapchain 的延迟销毁（§7.4 / R11-3）：销毁前必须有一次**有界队列 idle**。
+    ///
+    /// `vkDestroySwapchainKHR` 要求「所有从该 swapchain 获取的 image 的使用已完成」，
+    /// `vkDestroySemaphore` 要求「引用该信号量的批次已完成」—— present 的 `waitSemaphores`
+    /// 也算引用。队列 idle 是这两条的共同前置条件（旧实现等的是「新链某帧的 timeline」，与旧链
+    /// 的 present 之间没有任何依赖关系，因此不构成保证）。
+    fn drain_retired_swapchains(&mut self) -> Result<(), EngineError> {
+        if self.retired_swapchains.is_empty() {
+            return Ok(());
+        }
+        self.shared
+            .wait_queue_idle()
+            .map_err(|error| self.classify(error))?;
+        self.retired_swapchains.clear();
+        Ok(())
     }
 
     /// 渲染目标的像素尺寸（有 swapchain 时与它一致；离屏时等于 `persist` 尺寸）。
@@ -1008,17 +1197,25 @@ impl GpuRenderer {
             false => {
                 if let Plan::Partial(damage) = frame.plan() {
                     for rect in damage.as_slice() {
+                        // R11-16：damage 由 `render::compositor::plan` 夹到 **UI 的物理 surface**，
+                        // 而 renderArea 是 swapchain extent —— 两者在 clamp / `currentExtent` 生效
+                        // 时不等（R11-9）。scissor 超出 renderArea 会被判
+                        // `VUID-vkCmdSetScissor-None-00595`，因此在这里再夹一次（纯 CPU，零成本）。
+                        let x0 = rect.x0.max(0).min(extent.width as i32);
+                        let y0 = rect.y0.max(0).min(extent.height as i32);
+                        let x1 = rect.x1.max(x0).min(extent.width as i32);
+                        let y1 = rect.y1.max(y0).min(extent.height as i32);
+                        if x1 == x0 || y1 == y0 {
+                            continue;
+                        }
                         let scissor = vk::Rect2D {
-                            offset: vk::Offset2D {
-                                x: rect.x0.max(0),
-                                y: rect.y0.max(0),
-                            },
+                            offset: vk::Offset2D { x: x0, y: y0 },
                             extent: vk::Extent2D {
-                                width: rect.width().max(0) as u32,
-                                height: rect.height().max(0) as u32,
+                                width: (x1 - x0) as u32,
+                                height: (y1 - y0) as u32,
                             },
                         };
-                        // SAFETY: 矩形已由 `render::compositor::plan` 夹到 surface 内。
+                        // SAFETY: 矩形已夹到 renderArea（= framebuffer 尺寸）内。
                         unsafe {
                             shared.raw().cmd_set_scissor(command, 0, &[scissor]);
                         }
@@ -1030,7 +1227,7 @@ impl GpuRenderer {
                             &mut geometry_retired,
                             payload,
                             root,
-                            [rect.x0, rect.y0, rect.x1, rect.y1],
+                            [x0, y0, x1, y1],
                         )?);
                     }
                 }
@@ -1046,32 +1243,54 @@ impl GpuRenderer {
         Ok((draw_calls, geometry_retired))
     }
 
-    /// persist → swapchain 整面 copy + 两侧 barrier（§6.6 的表）。
+    /// persist → swapchain 的**差分** copy + 两侧 barrier（§6.6 的表、R11-12）。
+    ///
+    /// `written` 是本帧真正写进 persist 的矩形（`None` = 整面重画）。拷贝范围由
+    /// [`ImageCopyPlan::plan`] 决定：该 image 内容未知 / 本帧整面重画 / 差集超出容量 ⇒ 整面；
+    /// 否则只拷 `pending ∪ written`。实际拷贝的矩形存进 `frame_copy`，present 用它生成
+    /// `VK_KHR_incremental_present` 的 region（两者必须一致）。
     fn copy_to_swapchain(
-        &self,
+        &mut self,
         shared: &SharedGpu,
         command: vk::CommandBuffer,
         image_index: u32,
+        written: Option<DamageRects>,
     ) -> Result<(), EngineError> {
         let Some(swapchain) = self.swapchain.as_ref() else {
             return Ok(());
         };
         let extent = swapchain.extent();
         let target = swapchain.image(image_index);
-        let layers = vk::ImageSubresourceLayers::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .layer_count(1);
+        // 差分拷贝计划（R11-12）。`regions = None` ⇒ 整面；空集 ⇒ 本帧不需要搬像素。
+        let plan: CopyPlan = self.image_copy_plan.plan(image_index, written);
+        let regions = plan.regions();
+        self.frame_copy = regions;
+        let mut copies: Vec<vk::ImageCopy> = Vec::new();
+        if let Some(regions) = regions.as_ref() {
+            for rect in regions.as_slice() {
+                let x = rect.x0.max(0).min(extent.width as i32);
+                let y = rect.y0.max(0).min(extent.height as i32);
+                let x1 = rect.x1.max(x).min(extent.width as i32);
+                let y1 = rect.y1.max(y).min(extent.height as i32);
+                let width = (x1 - x) as u32;
+                let height = (y1 - y) as u32;
+                if width == 0 || height == 0 {
+                    continue;
+                }
+                copies.push(image_copy(x as u32, y as u32, width, height));
+            }
+        }
+        if copies.is_empty() && regions.is_none() {
+            copies.push(image_copy(0, 0, extent.width, extent.height));
+        }
         let range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .level_count(1)
             .layer_count(1);
-        let to_src = vk::ImageMemoryBarrier::default()
-            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-            .image(self.persist.image)
-            .subresource_range(range)
-            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+        // ① swapchain image 的 layout 转换必须**先**发生（它的首次使用是 TRANSFER 阶段的
+        //    transition + copy）。src/dst 都是 TRANSFER，才能排在 `image_available` 的 acquire
+        //    wait（同样在 TRANSFER 阶段）之后；用 `TOP_OF_PIPE` 会与 acquire 信号量没有依赖链，
+        //    syncval 报 `SYNC-HAZARD-WRITE-AFTER-READ`（F-168）。
         let to_dst = vk::ImageMemoryBarrier::default()
             .old_layout(vk::ImageLayout::UNDEFINED)
             .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
@@ -1084,6 +1303,38 @@ impl GpuRenderer {
             .image(target)
             .subresource_range(range)
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+        if copies.is_empty() {
+            // 该 image 与 persist 已经一致：只做两次 layout 转换（没有像素要搬）。
+            // SAFETY: target 由本窗口的 swapchain 持有；range 是单层单级。
+            unsafe {
+                shared.raw().cmd_pipeline_barrier(
+                    command,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_dst],
+                );
+                shared.raw().cmd_pipeline_barrier(
+                    command,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_present],
+                );
+            }
+            return Ok(());
+        }
+        let to_src = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .image(self.persist.image)
+            .subresource_range(range)
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
         let back = vk::ImageMemoryBarrier::default()
             .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -1091,7 +1342,7 @@ impl GpuRenderer {
             .subresource_range(range)
             .src_access_mask(vk::AccessFlags::TRANSFER_READ)
             .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
-        // SAFETY: 两张 image 都由本结构独占；copy 的范围 = swapchain extent = persist 尺寸。
+        // SAFETY: 两张 image 都由本结构独占；copy 的矩形已夹到 swapchain extent 内。
         unsafe {
             shared.raw().cmd_pipeline_barrier(
                 command,
@@ -1102,10 +1353,6 @@ impl GpuRenderer {
                 &[],
                 &[to_src],
             );
-            // swapchain image 的首次使用是本次 layout transition + 整面 copy（都是 TRANSFER）：
-            // src/dst 都必须是 TRANSFER，才能排在 `image_available` 的 acquire wait（同样在
-            // TRANSFER 阶段）之后。用 `TOP_OF_PIPE` 会与 acquire 信号量没有依赖链，syncval 报
-            // `SYNC-HAZARD-WRITE-AFTER-READ`（F-168）。
             shared.raw().cmd_pipeline_barrier(
                 command,
                 vk::PipelineStageFlags::TRANSFER,
@@ -1121,15 +1368,7 @@ impl GpuRenderer {
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 target,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[vk::ImageCopy::default()
-                    // `default()` 的 subresource 是 aspect=0 / layer_count=0（非法），必须显式给。
-                    .src_subresource(layers)
-                    .dst_subresource(layers)
-                    .extent(vk::Extent3D {
-                        width: extent.width,
-                        height: extent.height,
-                        depth: 1,
-                    })],
+                &copies,
             );
             shared.raw().cmd_pipeline_barrier(
                 command,
@@ -1153,12 +1392,16 @@ impl GpuRenderer {
         Ok(())
     }
 
+    /// 提交本帧命令。
+    ///
+    /// `sequence` 是 `slot.signal_value`（**唯一**的 timeline 值来源，R11-1）：它被写进
+    /// `signalSemaphoreValues` 的最后一个元素（timeline 信号量），并作为诊断文件里的帧标签。
     fn submit_commands(
         &mut self,
         shared: &SharedGpu,
         slot: FrameSlot,
         command: vk::CommandBuffer,
-        timeline_value: u64,
+        sequence: u64,
         image_index: Option<u32>,
     ) -> Result<(), EngineError> {
         let commands = [command];
@@ -1184,7 +1427,7 @@ impl GpuRenderer {
         let signal_values: Vec<u64> = {
             let mut values = vec![0u64; signals.len()];
             if let Some(last) = values.last_mut() {
-                *last = timeline_value;
+                *last = sequence;
             }
             values
         };
@@ -1207,7 +1450,7 @@ impl GpuRenderer {
                 .queue_submit(queue, &[submit], self.sync.fence(slot.index))
         });
         if let Err(error) = result {
-            if let Some(lost) = shared.note_failure(error, timeline_value) {
+            if let Some(lost) = shared.note_failure(error, sequence) {
                 return Err(lost);
             }
             return Err(EngineError::Swapchain {
@@ -1220,10 +1463,9 @@ impl GpuRenderer {
     /// 把底层错误归类为设备丢失（粘性）或原样返回。
     fn classify(&mut self, error: EngineError) -> EngineError {
         if matches!(error, EngineError::DeviceLost { .. })
-            && let Some(sticky) = self.shared.note_failure(
-                vk::Result::ERROR_DEVICE_LOST,
-                u64::from(self.last_index.get()),
-            )
+            && let Some(sticky) = self
+                .shared
+                .note_failure(vk::Result::ERROR_DEVICE_LOST, self.last_sequence)
         {
             return sticky;
         }
@@ -1240,15 +1482,47 @@ impl Drop for GpuRenderer {
         if let Some(viewport) = self.viewport.take() {
             viewport.destroy();
         }
-        // 退出路径（§7.7）：只等**本窗口**的提交完成（共享设备上别的窗口的工作与己无关），
-        // 之后本窗口的延迟销毁资源都可以直接释放。
-        let _ = self.sync.wait_idle();
-        // SAFETY: 队列上的本窗口命令都已提交完成；`VkCommandPool` 由本结构独占。
+        // 退出路径（§7.7 / R11-1 / R11-3）两步，缺一不可：
+        //
+        // ① 等**本窗口**的 timeline 到「最后一次提交时 signal 的那个值」。这个值就是
+        //    `slot.signal_value`（ring 的提交序号）—— 旧实现等的是 ring 的提交计数、signal 的却是
+        //    UI 帧序号，序号一跳号等待值就偏小，最后一帧仍在飞时会立刻返回，随后销毁 command pool /
+        //    persist / swapchain / 信号量（`VUID-vkFreeMemory-memory-00677` 一类）。
+        // ② 队列 idle：`timeline` 到达只证明命令执行完毕，**不证明 presentation engine 已消费
+        //    present**。`vkDestroySwapchainKHR`（VUID-…-01282）与 `vkDestroySemaphore`
+        //    （VUID-…-01137）都要求前者；`wait_queue_idle` 是有界的（2 s），设备挂死时窗口仍能关。
+        //
+        // 两条失败的语义：**设备已经不可用**。此时不再"假装成功"继续销毁（旧实现 `let _ =`
+        // 吞掉错误照样销毁），而是跳过延迟销毁队列（把句柄留给 `SharedGpu::drop` 兜底），
+        // 只记一条诊断。GpuRenderer 的字段仍会 drop，但那时设备已丢失，驱动不会再执行命令。
+        let timeline_idle = self.sync.wait_idle();
+        let queue_idle = self.shared.wait_queue_idle();
+        let teardown_safe = timeline_idle.is_ok() && queue_idle.is_ok();
+        if !teardown_safe {
+            let reason = timeline_idle
+                .err()
+                .or(queue_idle.err())
+                .map(|error| error.to_string())
+                .unwrap_or_default();
+            eprintln!(
+                "kytrix: vulkan teardown could not prove the GPU is idle ({reason}); \
+                 leaking this window's deferred objects instead of destroying in-flight handles"
+            );
+            // 跳过「危险销毁」：不再销毁命令池 / 延迟队列（把句柄留给进程级兜底）。
+            self.retired_persists.clear();
+            self.retired_swapchains.clear();
+            self.geometry.release(&self.shared);
+            self.upload.release(&self.shared);
+            self.sync.drain_all_retired();
+            return;
+        }
+        // SAFETY: ① 本窗口命令已完成；② 队列已 idle ⇒ 没有在飞批次引用命令池。
         unsafe {
             self.shared
                 .raw()
                 .destroy_command_pool(self.command_pool, None);
         }
+        // 旧 swapchain / 旧 persist：队列 idle 之后 presentation engine 与在飞批次都不再引用它们。
         self.retired_persists.clear();
         self.retired_swapchains.clear();
         // 每窗口注册进共享设备句柄表的资源必须主动注销（设备不会随窗口销毁）。
@@ -1269,6 +1543,8 @@ struct Persist {
     memory: vk::DeviceMemory,
     framebuffer_clear: vk::Framebuffer,
     framebuffer_load: vk::Framebuffer,
+    /// 实际尺寸（= 创建时的 swapchain extent；读回与 `renderArea` 的唯一来源，R11-9）。
+    size: (u32, u32),
 }
 
 impl Persist {
@@ -1303,10 +1579,7 @@ impl Persist {
         // SAFETY: 只读查询；句柄由本结构独占，返回值在本次调用期间有效。
         let requirements = unsafe { device.get_image_memory_requirements(image) };
         let memory_type = shared
-            .memory_type(
-                requirements.memory_type_bits,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            )
+            .memory_type(requirements.memory_type_bits, MemoryNeed::DEVICE_IMAGE)
             .ok_or_else(|| init_error("persist memory", "no device-local memory type"))?;
         // SAFETY: 句柄与参数都由本结构独占，调用期间有效（Vulkan 的外部同步已由 fence 保证）。
         let memory = unsafe {
@@ -1350,6 +1623,7 @@ impl Persist {
             memory,
             framebuffer_clear,
             framebuffer_load,
+            size,
         })
     }
 
@@ -1398,29 +1672,24 @@ fn create_framebuffer(
 }
 
 /// 每 in-flight 槽的上传缓冲（实例 + 裁剪共用一块分配，clips 在 256 B 对齐处）。
+///
+/// 走 `SharedGpu` 的子分配器（R11-6）：每槽一块 `vkAllocateMemory` 的时代结束 —— 缓冲只在
+/// 「本槽容量不够」时重建，重建出来的旧块区间由 retire 队列归还（块本身复用，不 `vkFreeMemory`）。
 struct UploadArena {
     shared: Arc<SharedGpu>,
     slots: Vec<UploadSlot>,
 }
 
 struct UploadSlot {
-    buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
-    /// 创建时 map_memory 一次的**持久映射**写入指针（扩容 / 退役时解除）。
+    /// 子分配缓冲：句柄 + 块内区间 + **持久映射**的主机写入指针（整块 map 一次）。
     ///
     /// 旧实现每帧 map/unmap：驱动每次都要走一遍页表操作，是纯开销 —— Windows 后端一直是
-    /// 持久映射。HOST_COHERENT 内存保证写入无需 flush（P2-7）。
-    ptr: *mut u8,
-    buffer_handle: GpuResourceHandle,
-    memory_handle: GpuResourceHandle,
+    /// 持久映射。`HOST_COHERENT` 内存保证写入无需 flush（P2-7）。
+    buffer: GpuBuffer,
     instance_capacity: u32,
     clip_capacity: u32,
     clip_offset: u64,
 }
-
-// SAFETY: `ptr` 是 `vkMapMemory` 的持久映射，只在持有它的 `GpuRenderer` 所在的
-// `kytrix-vulkan` GPU 线程上写入（与 `StagingRing` 同一约定）；结构本身不跨线程共享。
-unsafe impl Send for UploadSlot {}
 
 impl UploadArena {
     fn new(shared: &Arc<SharedGpu>) -> Result<Self, EngineError> {
@@ -1435,7 +1704,7 @@ impl UploadArena {
     }
 
     fn buffer(&self, slot: usize) -> vk::Buffer {
-        self.slots[slot].buffer
+        self.slots[slot].buffer.buffer
     }
 
     /// 写本帧的实例/裁剪字节；容量不够时扩容（旧句柄进 `retired`，本帧完成后释放）。
@@ -1454,21 +1723,21 @@ impl UploadArena {
             || clip_count > self.slots[slot].clip_capacity
         {
             let instances_capacity = instance_count.next_power_of_two().max(256);
-            let clips_capacity = clip_count.next_power_of_two().max(8);
+            let clips_capacity = clip_count.next_power_of_two().max(64);
             let replacement = UploadSlot::new(&self.shared, instances_capacity, clips_capacity)?;
             let old = std::mem::replace(&mut self.slots[slot], replacement);
-            // SAFETY: 映射由 `new` 建立；解除后 GPU 仍可访问该内存（unmap 只影响主机映射）。
-            unsafe { self.shared.raw().unmap_memory(old.memory) };
-            // 旧缓冲/内存在本帧完成之后由 retire 队列销毁（先 buffer 后 memory）。
-            retired.push(old.buffer_handle);
-            retired.push(old.memory_handle);
+            // 旧缓冲在本帧完成之后由 retire 队列销毁（其块区间随之回到内存池）。
+            retired.push(old.buffer.handle);
         }
         let slot_ref = &self.slots[slot];
-        // SAFETY: 缓冲容量已按 `instance_count` / `clip_count` 扩容；映射范围在分配内。
-        // SAFETY: 持久映射在 `UploadSlot::new` 建立、退役时解除；容量已按
-        // `instance_count` / `clip_count` 扩容，写入范围在分配内。
+        let Some(base) = slot_ref.buffer.pointer else {
+            return Err(init_error(
+                "upload memory",
+                "suballocated upload buffer has no host mapping",
+            ));
+        };
+        // SAFETY: 持久映射覆盖整个块；写入范围由本槽容量保证在自己的子分配内（上面的扩容刚做过）。
         unsafe {
-            let base = slot_ref.ptr;
             if !instances.is_empty() {
                 std::ptr::copy_nonoverlapping(instances.as_ptr(), base, instances.len());
             }
@@ -1490,10 +1759,7 @@ impl UploadArena {
     /// teardown：把本窗口上传缓冲的句柄交回共享设备。
     fn release(&self, shared: &SharedGpu) {
         for slot in &self.slots {
-            // SAFETY: 映射由 `new` 建立；解除后 GPU 仍可访问（unmap 只影响主机映射）。
-            unsafe { shared.raw().unmap_memory(slot.memory) };
-            let _ = shared.release(slot.buffer_handle);
-            let _ = shared.release(slot.memory_handle);
+            let _ = shared.release(slot.buffer.handle);
         }
     }
 }
@@ -1507,63 +1773,21 @@ impl UploadSlot {
         let instance_bytes = u64::from(instance_capacity) * 128;
         let clip_offset = instance_bytes.div_ceil(CLIP_ALIGN) * CLIP_ALIGN;
         let size = clip_offset + u64::from(clip_capacity) * 48;
-        // SAFETY: 句柄归本结构独占；扩容时旧句柄走 retire（`UploadArena::write` 已挂）。
-        let buffer = unsafe {
-            shared.raw().create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(size)
-                    .usage(
-                        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-                    )
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                None,
-            )
+        let buffer = shared.allocate_buffer(
+            size,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryNeed::HOST_WRITABLE,
+        )?;
+        if buffer.pointer.is_none() {
+            // `HOST_WRITABLE` 要求 `HOST_VISIBLE` ⇒ 子分配器必然给出映射。
+            let _ = shared.release(buffer.handle);
+            return Err(init_error(
+                "upload memory",
+                "suballocated upload buffer has no host mapping",
+            ));
         }
-        .map_err(|error| init_error("create_buffer(upload)", format!("{error:?}")))?;
-        // SAFETY: 只读查询；句柄由本结构独占，返回值在本次调用期间有效。
-        let requirements = unsafe { shared.raw().get_buffer_memory_requirements(buffer) };
-        let memory_type = shared
-            .memory_type(
-                requirements.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )
-            .ok_or_else(|| init_error("upload memory", "no host-visible memory type"))?;
-        // SAFETY: 句柄与参数都由本结构独占，调用期间有效（Vulkan 的外部同步已由 fence 保证）。
-        let memory = unsafe {
-            shared.raw().allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(requirements.size)
-                    .memory_type_index(memory_type),
-                None,
-            )
-        }
-        .map_err(|error| init_error("allocate_memory(upload)", format!("{error:?}")))?;
-        // SAFETY: 目标句柄已按 Vulkan 校验规则创建，绑定/写入的范围在其分配内。
-        unsafe { shared.raw().bind_buffer_memory(buffer, memory, 0) }
-            .map_err(|error| init_error("bind_buffer_memory(upload)", format!("{error:?}")))?;
-        // SAFETY: 映射范围就是整块分配；失败时两个句柄都还没交给任何人。
-        let ptr = unsafe {
-            shared
-                .raw()
-                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-        }
-        .map_err(|error| {
-            // SAFETY: 句柄由本函数独占、尚未交给任何人。
-            unsafe {
-                shared.raw().destroy_buffer(buffer, None);
-                shared.raw().free_memory(memory, None);
-            }
-            init_error("map_memory(upload)", format!("{error:?}"))
-        })?
-        .cast::<u8>();
-        let buffer_handle = shared.allocate(GpuObject::Buffer(buffer));
-        let memory_handle = shared.allocate(GpuObject::Memory(memory));
         Ok(Self {
             buffer,
-            memory,
-            ptr,
-            buffer_handle,
-            memory_handle,
             instance_capacity,
             clip_capacity,
             clip_offset,
@@ -1724,6 +1948,46 @@ fn root_uniform(extent: vk::Extent2D, scale: f32) -> RootUniform {
 
 fn elapsed_ns(started: Instant) -> u64 {
     started.elapsed().as_nanos() as u64
+}
+
+/// 本帧真正写进 persist 的矩形（`None` = 整面）。
+///
+/// 差分拷贝的输入（R11-12）：`fresh` / `Plan::Full` 意味着这一帧整面重画了 persist，
+/// 任何「只拷差集」的推理都不成立。
+fn frame_written(frame: &FramePlan) -> Option<DamageRects> {
+    if frame.is_full() {
+        return None;
+    }
+    match frame.plan() {
+        Plan::Partial(damage) => Some(damage),
+        Plan::Idle | Plan::Full => None,
+    }
+}
+
+/// 一个 `VkImageCopy`（persist → swapchain image，同格式、单层、无 3D 分量）。
+fn image_copy(x: u32, y: u32, width: u32, height: u32) -> vk::ImageCopy {
+    let layers = vk::ImageSubresourceLayers::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .layer_count(1);
+    vk::ImageCopy::default()
+        // `default()` 的 subresource 是 aspect=0 / layer_count=0（非法），必须显式给。
+        .src_subresource(layers)
+        .dst_subresource(layers)
+        .src_offset(vk::Offset3D {
+            x: x as i32,
+            y: y as i32,
+            z: 0,
+        })
+        .dst_offset(vk::Offset3D {
+            x: x as i32,
+            y: y as i32,
+            z: 0,
+        })
+        .extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })
 }
 
 /// 本帧要写入的 destination（`None` = 与上次相同，不调用协议）。
