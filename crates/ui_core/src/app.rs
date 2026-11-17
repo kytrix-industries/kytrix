@@ -13,6 +13,7 @@ mod debug;
 mod event_queue;
 mod focus;
 mod frame;
+mod geometry;
 mod input;
 mod overlay;
 mod resources;
@@ -552,6 +553,22 @@ impl App {
     /// 静态几何注册表（可变）：`insert` / `release` 的唯一入口。
     pub fn geometry_mut(&mut self) -> &mut crate::paint::geometry_store::GeometryStore {
         resources::geometry_mut(self)
+    }
+
+    /// 设置几何节点的 per-draw 变换（R05-12 / AR2 P1-D4）：顶点**不**重建，只改一个 uniform。
+    ///
+    /// 语义边界：只影响**绘制**，不影响命中（命中用节点布局盒，见 `layout/hit_test.rs`）；
+    /// 变换后旧位置的像素与新位置的像素都会并入该节点的 damage（局部刷新不留残影）。
+    ///
+    /// # Errors
+    /// [`EngineError::UnknownWindow`] / [`EngineError::StaleNode`]（节点不是几何节点）。
+    pub fn set_geometry_transform(
+        &mut self,
+        window: WindowId,
+        node: NodeId,
+        transform: crate::math::Transform,
+    ) -> Result<(), EngineError> {
+        geometry::set_geometry_transform(self, window, node, transform)
     }
 
     /// 依赖图（只读；`test-support` 的 `diagnostics::dependency_dump` 用）。

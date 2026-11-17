@@ -16,6 +16,25 @@ use crate::math::Scale;
 /// DPI 基准（96 = 100%）。
 pub(crate) const BASE_DPI: u32 = 96;
 
+/// 最小客户区（逻辑像素；[`min_track_size`] 换算成 `WM_GETMINMAXINFO` 的外框尺寸）。
+pub(crate) const MIN_SIZE_LOGICAL: (f32, f32) = (320.0, 200.0);
+
+/// 最小客户区尺寸 → `WM_GETMINMAXINFO` 的 `ptMinTrackSize`（**窗口外框**，物理像素）。
+///
+/// `ptMinTrackSize` 是外框尺寸，而应用给的是**客户区**最小尺寸（P2-1）：直接透传会让窗口
+/// 最小尺寸比预期小一个边框 + 标题栏（150% DPI 下尤其明显），于是能缩到客户区只有几十像素。
+/// `WndProcState::note_dpi` 与 `NativeWindow::apply_dpi_and_size` 都走这里，避免两处换算漂移。
+pub(crate) fn min_track_size(dpi: u32) -> (u32, u32) {
+    let scale = scale_from_dpi(dpi).unwrap_or(Scale::ONE);
+    let client = (
+        (MIN_SIZE_LOGICAL.0 * scale.factor()).round() as u32,
+        (MIN_SIZE_LOGICAL.1 * scale.factor()).round() as u32,
+    );
+    let window = window_size_for_client(client, dpi);
+    // 外框尺寸恒为正（`window_size_for_client` 只加边框）。
+    (window.0.max(1) as u32, window.1.max(1) as u32)
+}
+
 /// DPI → [`Scale`]；`0` 或非法值返回 `None`（调用方转 `EngineError::InvalidDpiScale`）。
 pub(crate) fn scale_from_dpi(dpi: u32) -> Option<Scale> {
     Scale::new(dpi as f32 / BASE_DPI as f32)
@@ -62,7 +81,10 @@ pub(crate) fn window_size_for_client(client: (u32, u32), dpi: u32) -> (i32, i32)
 
 #[cfg(test)]
 mod tests {
-    use super::{BASE_DPI, scale_from_dpi, system_dpi, window_size_for_client};
+    use super::{
+        BASE_DPI, MIN_SIZE_LOGICAL, min_track_size, scale_from_dpi, system_dpi,
+        window_size_for_client,
+    };
 
     #[test]
     fn scale_table_matches_the_dpi_ratio() {
@@ -88,5 +110,33 @@ mod tests {
     #[test]
     fn system_dpi_is_positive() {
         assert!(system_dpi() > 0);
+    }
+
+    /// `ptMinTrackSize` 是**外框**尺寸：必须比应用给的客户区最小尺寸大（多出边框 + 标题栏），
+    /// 且随 DPI 单调增长。直接把客户区尺寸当外框会让窗口能缩到客户区只剩几十像素（P2-1）。
+    #[test]
+    fn min_track_size_is_a_window_rect_for_the_logical_minimum() {
+        let at_96 = min_track_size(96);
+        let client_96 = (MIN_SIZE_LOGICAL.0 as u32, MIN_SIZE_LOGICAL.1 as u32);
+        assert!(
+            at_96.0 >= client_96.0 && at_96.1 >= client_96.1,
+            "外框不得小于客户区最小值：{at_96:?}"
+        );
+        assert!(
+            at_96.0 > client_96.0 && at_96.1 > client_96.1,
+            "96 dpi 下也必须有边框/标题栏：{at_96:?}"
+        );
+
+        // 150%：客户区 480×300，外框只可能更大。
+        let at_144 = min_track_size(144);
+        assert!(
+            at_144.0 >= (MIN_SIZE_LOGICAL.0 * 1.5) as u32
+                && at_144.1 >= (MIN_SIZE_LOGICAL.1 * 1.5) as u32,
+            "{at_144:?}"
+        );
+        assert!(
+            at_144.0 >= at_96.0 && at_144.1 >= at_96.1,
+            "更高 DPI 的最小外框不得比 96 dpi 更小"
+        );
     }
 }

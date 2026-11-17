@@ -22,6 +22,7 @@
 
 use std::{ops::Range, time::Instant};
 
+use smallvec::SmallVec;
 use smol_str::SmolStr;
 
 use crate::{
@@ -602,6 +603,100 @@ impl ScrollPhase {
     }
 }
 
+/// 手势（捏合 / 旋转）的阶段。
+///
+/// 与 [`ScrollPhase`] 分开是因为二者的**生命周期来源不同**：滚动是一串可惯性延续的事件流
+/// （还有 `Momentum`），手势是「按下 → 移动 → 抬起」的封闭会话，平台层必须把开始/结束完整映射，
+/// 应用才能做锚点变换、结束提交与惯性收尾（AppKit `NSEventPhase`、Windows `WM_GESTURE`
+/// 的 `GID_BEGIN`/`GID_END`、Wayland `zwp_pointer_gesture_*` 的 `begin`/`update`/`end` 同构）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GesturePhase {
+    /// 手势开始（AppKit `NSEventPhaseBegan`）。
+    Begin,
+    /// 手势进行中（AppKit `NSEventPhaseChanged`；增量事件都落在这里）。
+    Update,
+    /// 手势结束（AppKit `NSEventPhaseEnded`）：本阶段通常携带 0 增量，只作收尾信号。
+    End,
+    /// 手势被取消（AppKit `NSEventPhaseCancelled`）：必须回滚，不得提交。
+    Cancel,
+}
+
+/// 原生手势事件的阶段位图（AppKit `NSEventPhase`、Windows `WM_GESTURE` 的 `GF_BEGIN`、
+/// Wayland `zwp_pointer_gesture_*` 的 `begin`/`update`/`end`）。
+///
+/// 纯数据 + 纯函数，放在平台无关层是为了让「阶段归一化」这条规则能在开发机上单测 ——
+/// 各平台的包装器只在各自目标上编译，测不到。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GestureFlags {
+    /// 「手势可能开始」的预告阶段（AppKit `NSEventPhaseMayBegin`；没有增量）。
+    pub may_begin: bool,
+    /// 开始。
+    pub began: bool,
+    /// 进行中。
+    pub changed: bool,
+    /// 结束。
+    pub ended: bool,
+    /// 取消。
+    pub cancelled: bool,
+}
+
+impl GestureFlags {
+    /// 归一化成引擎的手势阶段；`None` = 本事件没有可交付的阶段（只有「可能开始」的预告）。
+    ///
+    /// 优先级：取消 > 结束 > 开始 > 进行中。空位图（没有阶段信息的离散手势）按「进行中」处理：
+    /// 它带的是一次增量，既不是开始也不是结束信号。
+    #[must_use]
+    pub const fn phase(self) -> Option<GesturePhase> {
+        if self.cancelled {
+            return Some(GesturePhase::Cancel);
+        }
+        if self.ended {
+            return Some(GesturePhase::End);
+        }
+        if self.began {
+            return Some(GesturePhase::Begin);
+        }
+        if self.changed {
+            return Some(GesturePhase::Update);
+        }
+        if self.may_begin {
+            // 「可能开始」不是手势：此时还没有任何增量，交付 `Begin` 会让应用的锚点变换
+            // 以 0 增量开始、并在真正的 `Began` 到来时重复初始化。
+            return None;
+        }
+        Some(GesturePhase::Update)
+    }
+}
+
+/// 原生滚动增量 → 引擎滚动量与单位（R09-8）。
+///
+/// 契约：**同一个 delta 数值在三个后端表示同一件事**，平台层不再用「除一个常数」把物理单位
+/// 藏起来。单位由 [`ScrollUnit`] 表达，应用自己按容器语义使用：
+///
+/// - 精确设备（触控板 / Magic Mouse，`hasPreciseScrollingDeltas == true`）：AppKit 给的
+///   `scrollingDeltaX/Y` 单位是**点**，与引擎的逻辑像素 1:1 ⇒ [`ScrollUnit::Pixel`]，**直传**。
+///   两个轴都为 0 的事件仍要交付（`phase` 的开始/结束标记常常是 0 增量）。
+/// - 传统滚轮（`hasPreciseScrollingDeltas == false`）：单位是**行** ⇒ [`ScrollUnit::Line`]，
+///   **直传**，不再除 3。对齐依据：Win32 一格 `WM_MOUSEWHEEL` = `WHEEL_DELTA`(120) =
+///   `SPI_GETWHEELSCROLLLINES` 行（缺省 3 行，见 `platform::event::lines_per_tick`）—— 也就是
+///   「一格 = 若干行」这个语义在两端一致，差的是**一个物理缺口产生几行**（Windows 的系统设置
+///   可配 1/3/…，macOS 不暴露该设置，AppKit 直接给行数）。旧实现的 `/3` 把 macOS 再缩小 3 倍，
+///   于是同一个滚轮在两端差 3 倍，且触控板的 `/10` 让灵敏度随滑动速度剧烈变化。
+/// - 传统滚轮且两轴都为 0：没有可交付的增量 ⇒ `None`（AppKit 会发这种空事件）。
+#[must_use]
+pub fn scroll_delta(precise: bool, delta_x: f64, delta_y: f64) -> Option<(Point, ScrollUnit)> {
+    if precise {
+        return Some((
+            Point::new(delta_x as f32, delta_y as f32),
+            ScrollUnit::Pixel,
+        ));
+    }
+    if delta_x == 0.0 && delta_y == 0.0 {
+        return None;
+    }
+    Some((Point::new(delta_x as f32, delta_y as f32), ScrollUnit::Line))
+}
+
 /// 一次输入事件。
 ///
 /// 每个变体都带 `timestamp`：**平台的真实事件时刻**（Win32 的 `MSG.time` 经
@@ -696,6 +791,47 @@ pub enum InputEvent {
         /// 事件时刻。
         timestamp: Instant,
     },
+    /// 捏合缩放（macOS `magnifyWithEvent:`；R09-4）。
+    ///
+    /// `factor` 是**本次增量**（不是累计倍率）：应用自己累乘到视图缩放上（与 iPadOS /
+    /// Windows `WM_GESTURE` 的增量语义一致，平台层不做累积、不猜手势结束时机）。
+    /// `1.0` = 无变化，`> 1.0` = 放大，`< 1.0` = 缩小。
+    Magnify {
+        /// 本次缩放因子（增量）。
+        factor: f32,
+        /// 手势阶段。
+        phase: GesturePhase,
+        /// 缩放锚点（窗口逻辑坐标：双指中心）—— 不做锚点变换就只能以左上角为中心缩放。
+        center: Point,
+        /// 当前修饰键。
+        modifiers: Modifiers,
+        /// 事件时刻。
+        timestamp: Instant,
+    },
+    /// 旋转手势（macOS `rotateWithEvent:`；Windows `WM_GESTURE` 的 `GID_ROTATE`）。
+    Rotate {
+        /// 本次旋转角度（**度**，增量；正负方向由平台定义）。
+        degrees: f32,
+        /// 手势阶段。
+        phase: GesturePhase,
+        /// 当前修饰键。
+        modifiers: Modifiers,
+        /// 事件时刻。
+        timestamp: Instant,
+    },
+    /// 系统判定的「智能缩放」双击（macOS `smartMagnifyWithEvent:`：触控板双指双击）。
+    ///
+    /// 与 [`Self::Magnify`] 分开是因为它**没有增量也没有阶段**：系统已经决定了「缩放到适配/
+    /// 原始尺寸」这一整步，应用按自己的语义切换（图表「复位视图」是典型用法）。把它硬塞进
+    /// `Magnify` 会逼应用去猜一个魔法 `factor`。
+    SmartMagnify {
+        /// 缩放中心（窗口逻辑坐标）。
+        center: Point,
+        /// 当前修饰键。
+        modifiers: Modifiers,
+        /// 事件时刻。
+        timestamp: Instant,
+    },
     /// 非字符键。
     Key {
         /// 物理键身份（布局无关）。
@@ -727,7 +863,7 @@ pub enum InputEvent {
 }
 
 impl InputEvent {
-    /// 事件位置（只有指针/滚轮事件有位置）。
+    /// 事件位置（只有指针/滚轮/手势事件有位置）。
     #[must_use]
     pub fn position(&self) -> Option<Point> {
         match self {
@@ -737,7 +873,11 @@ impl InputEvent {
             | Self::PointerUp { position, .. }
             | Self::PointerLeave { position, .. }
             | Self::Scroll { position, .. } => Some(*position),
-            Self::PointerCancel { .. } | Self::Key { .. } | Self::Text { .. } => None,
+            Self::Magnify { center, .. } | Self::SmartMagnify { center, .. } => Some(*center),
+            Self::PointerCancel { .. }
+            | Self::Rotate { .. }
+            | Self::Key { .. }
+            | Self::Text { .. } => None,
         }
     }
 
@@ -751,6 +891,9 @@ impl InputEvent {
             | Self::PointerUp { modifiers, .. }
             | Self::PointerLeave { modifiers, .. }
             | Self::Scroll { modifiers, .. }
+            | Self::Magnify { modifiers, .. }
+            | Self::Rotate { modifiers, .. }
+            | Self::SmartMagnify { modifiers, .. }
             | Self::Key { modifiers, .. } => *modifiers,
             Self::PointerCancel { .. } | Self::Text { .. } => Modifiers::empty(),
         }
@@ -767,6 +910,9 @@ impl InputEvent {
             | Self::PointerLeave { timestamp, .. }
             | Self::PointerCancel { timestamp }
             | Self::Scroll { timestamp, .. }
+            | Self::Magnify { timestamp, .. }
+            | Self::Rotate { timestamp, .. }
+            | Self::SmartMagnify { timestamp, .. }
             | Self::Key { timestamp, .. }
             | Self::Text { timestamp, .. } => *timestamp,
         }
@@ -838,6 +984,37 @@ impl InputEvent {
                 delta,
                 unit,
                 phase,
+                modifiers,
+                timestamp: at,
+            },
+            Self::Magnify {
+                factor,
+                phase,
+                center,
+                modifiers,
+                ..
+            } => Self::Magnify {
+                factor,
+                phase,
+                center,
+                modifiers,
+                timestamp: at,
+            },
+            Self::Rotate {
+                degrees,
+                phase,
+                modifiers,
+                ..
+            } => Self::Rotate {
+                degrees,
+                phase,
+                modifiers,
+                timestamp: at,
+            },
+            Self::SmartMagnify {
+                center, modifiers, ..
+            } => Self::SmartMagnify {
+                center,
                 modifiers,
                 timestamp: at,
             },
@@ -1033,10 +1210,26 @@ pub const MAX_PLAUSIBLE_BEHIND_MS: u32 = 60 * 60 * 1_000;
 pub enum ImeEvent {
     /// 开始组合。
     Start,
-    /// 组合中的文本。
+    /// 组合中的文本 + 组合串内的插入点与子句信息。
     Preedit {
         /// 组合中的文本。
         text: SmolStr,
+        /// 组合串内的插入点（**UTF-16 码元**偏移，相对 `text` 起点，`0..=text.encode_utf16().count()`）。
+        ///
+        /// Win32 来源是 `ImmGetCompositionStringW(.., GCS_CURSORPOS, ..)`，macOS 来源是
+        /// `setMarkedText:selectedRange:replacementRange:` 的 `selectedRange.location`：用户用
+        /// ←/→/Home/End 在拼音串里改字时，插入点停在串中间，文本层必须按它画插入点（否则光标
+        /// 恒在末尾，用户看不到自己正在改哪个字）。`None` = 平台没有提供该信息（Linux 当前
+        /// 不提供，或本次更新只改了文本）——文本层退化为「插入点在末尾」。
+        caret: Option<u32>,
+        /// 组合串内需要**高亮/区分**的子句区间（UTF-16 码元，相对 `text` 起点，按起点升序、
+        /// 互不重叠、全部落在 `0..=len`）。
+        ///
+        /// Win32 来源是 `GCS_COMPATTR`（每码元一个属性字节）与 `GCS_COMPCLAUSE`（子句边界）：
+        /// 引擎只交付「非 `ATTR_INPUT` 的那几段」，也就是已转换 / 转换中 / 已固定的子句 ——
+        /// 文本层据此画下划线/加粗，与原生输入法控件观感一致（日文 IME 的按子句跳转也依赖它）。
+        /// 空 = 没有子句信息（整串都还在输入中，或平台不提供）。
+        clauses: SmallVec<[Range<usize>; 4]>,
         /// 要替换的旧文本区间（UTF-16 码元，相对当前组合串起点）；`None` = 整个当前组合串。
         replace: Option<Range<usize>>,
     },
@@ -1536,5 +1729,159 @@ mod tests {
         assert_eq!(delta, Point::new(-1.0, 2.0));
         assert_eq!(unit, ScrollUnit::Line);
         assert_eq!(phase, ScrollPhase::Discrete);
+    }
+}
+
+/// 手势阶段归一化与滚轮单位换算（R09-4 / R09-8）。
+///
+/// 这两个规则是**跨后端契约**（macOS 的 `NSEventPhase`、Windows `WM_GESTURE`、Wayland 的
+/// gesture 协议都要落到同一套枚举上），因此单独成块钉死，不随 `tests` 里的交互用例漂移。
+#[cfg(test)]
+mod gesture_tests {
+    use std::time::Instant;
+
+    use super::{GestureFlags, GesturePhase, InputEvent, Point, ScrollUnit, scroll_delta};
+    use crate::event::Modifiers;
+
+    fn flags(
+        may_begin: bool,
+        began: bool,
+        changed: bool,
+        ended: bool,
+        cancelled: bool,
+    ) -> GestureFlags {
+        GestureFlags {
+            may_begin,
+            began,
+            changed,
+            ended,
+            cancelled,
+        }
+    }
+
+    /// 四个阶段必须完整映射（平台层不做累积、不猜结束时机）。
+    #[test]
+    fn gesture_flags_map_to_the_four_phases() {
+        assert_eq!(
+            flags(false, true, false, false, false).phase(),
+            Some(GesturePhase::Begin)
+        );
+        assert_eq!(
+            flags(false, false, true, false, false).phase(),
+            Some(GesturePhase::Update)
+        );
+        assert_eq!(
+            flags(false, false, false, true, false).phase(),
+            Some(GesturePhase::End)
+        );
+        assert_eq!(
+            flags(false, false, false, false, true).phase(),
+            Some(GesturePhase::Cancel)
+        );
+    }
+
+    /// 取消优先于其它位（手势被系统打断时绝不能报成 End ⇒ 应用会提交一个被取消的变换）。
+    #[test]
+    fn cancellation_wins_over_any_other_flag() {
+        assert_eq!(
+            flags(false, false, true, true, true).phase(),
+            Some(GesturePhase::Cancel)
+        );
+        assert_eq!(
+            flags(false, true, false, true, true).phase(),
+            Some(GesturePhase::Cancel)
+        );
+    }
+
+    /// `MayBegin` 只是「可能会开始」：没有增量，交付 `Begin` 会让应用的锚点变换重复初始化。
+    #[test]
+    fn a_may_begin_预告_is_not_a_gesture() {
+        assert_eq!(flags(true, false, false, false, false).phase(), None);
+        // 同一事件里既有 `MayBegin` 又有 `Began`（边界情况）⇒ 仍按 `Begin` 交付。
+        assert_eq!(
+            flags(true, true, false, false, false).phase(),
+            Some(GesturePhase::Begin)
+        );
+    }
+
+    /// 没有阶段位图的离散手势按「进行中」处理：它带的是一次增量。
+    #[test]
+    fn a_phaseless_gesture_is_an_update() {
+        assert_eq!(
+            flags(false, false, false, false, false).phase(),
+            Some(GesturePhase::Update)
+        );
+    }
+
+    /// R09-8：精确设备（触控板）单位是像素，**直传**，不除 10。
+    #[test]
+    fn precise_scrolling_is_passed_through_as_pixels() {
+        let (delta, unit) = scroll_delta(true, 3.5, -12.25).expect("precise 事件总是交付");
+        assert_eq!(unit, ScrollUnit::Pixel);
+        assert_eq!(delta, Point::new(3.5, -12.25));
+    }
+
+    /// 精确设备的 0 增量事件仍然要交付：`phase` 的开始/结束标记常常就是 0 增量。
+    #[test]
+    fn a_zero_precise_scroll_still_carries_the_phase() {
+        let (delta, unit) = scroll_delta(true, 0.0, 0.0).expect("phase 载体");
+        assert_eq!(unit, ScrollUnit::Pixel);
+        assert_eq!(delta, Point::ZERO);
+    }
+
+    /// R09-8：传统滚轮单位是**行**，直传，不除 3（Win32 一格 = 系统行数，缺省 3 行）。
+    #[test]
+    fn wheel_notches_are_passed_through_as_lines() {
+        let (delta, unit) = scroll_delta(false, 0.0, 1.0).expect("离散滚轮一格");
+        assert_eq!(unit, ScrollUnit::Line);
+        assert_eq!(delta, Point::new(0.0, 1.0));
+
+        let (delta, unit) = scroll_delta(false, -2.0, 3.0).expect("多格滚轮");
+        assert_eq!(unit, ScrollUnit::Line);
+        assert_eq!(delta, Point::new(-2.0, 3.0));
+    }
+
+    /// 传统滚轮的 0 增量事件没有可交付的语义（AppKit 会发）。
+    #[test]
+    fn a_zero_wheel_event_is_dropped() {
+        assert_eq!(scroll_delta(false, 0.0, 0.0), None);
+    }
+
+    /// 手势事件暴露锚点/角度/阶段，与其它输入事件同构。
+    #[test]
+    fn gesture_events_expose_their_payload() {
+        let stamp = Instant::now();
+        let magnify = InputEvent::Magnify {
+            factor: 1.25,
+            phase: GesturePhase::Update,
+            center: Point::new(40.0, 12.0),
+            modifiers: Modifiers::SHIFT,
+            timestamp: stamp,
+        };
+        assert_eq!(magnify.position(), Some(Point::new(40.0, 12.0)));
+        assert_eq!(magnify.modifiers(), Modifiers::SHIFT);
+        assert_eq!(magnify.timestamp(), stamp);
+
+        // 旋转没有锚点（AppKit 只给角度），`position()` 必须诚实地返回 `None`。
+        let rotate = InputEvent::Rotate {
+            degrees: -12.0,
+            phase: GesturePhase::End,
+            modifiers: Modifiers::empty(),
+            timestamp: stamp,
+        };
+        assert_eq!(rotate.position(), None);
+        assert_eq!(rotate.timestamp(), stamp);
+
+        let smart = InputEvent::SmartMagnify {
+            center: Point::new(1.0, 2.0),
+            modifiers: Modifiers::empty(),
+            timestamp: stamp,
+        };
+        assert_eq!(smart.position(), Some(Point::new(1.0, 2.0)));
+
+        // `with_timestamp` 必须覆盖新增变体（测试注入用可控时钟）。
+        assert_eq!(magnify.with_timestamp(stamp).timestamp(), stamp);
+        assert_eq!(rotate.with_timestamp(stamp).timestamp(), stamp);
+        assert_eq!(smart.with_timestamp(stamp).timestamp(), stamp);
     }
 }

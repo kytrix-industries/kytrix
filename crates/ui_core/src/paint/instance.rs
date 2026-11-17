@@ -6,7 +6,8 @@
 //! 范围（`design/phase-06-paint-runtime.md` §7）：
 //! - 8 类 `Primitive` → `GpuPrimitive`（`GlyphRun` 是唯一的 1→N）；
 //! - `Path`/`Geometry` 0 实例 + `FrameOp::Geometry`；
-//! - clip 链去重（`ClipChainId`，帧内索引）+ **轴对齐矩形求交合并**（Skia `SkClipStack` 语义）；
+//! - clip 链去重（`ClipChainId`，帧内索引）+ **轴对齐矩形求交合并**（Skia `SkClipStack` 语义）+
+//!   矩形/圆角两种覆盖率语义（矩形 = 像素精确 scissor、圆角 = 解析 AA；见 [`ClipKind`]）；
 //! - `InstanceBuffer` 容量 = 历史峰值（`clear` 只截断、不 shrink、不按帧翻倍）。
 //!
 //! **P07 只做上传/批次**：本模块不碰 GPU、不持设备。
@@ -38,7 +39,8 @@ pub(crate) struct GpuPrimitive {
     /// `border_width, shadow_blur, gradient_kind, aa_padding`。
     pub params0: [f32; 4],
     /// `clip_index, texture_index, kind, clip_depth`（整数编码进 f32；`clip_depth` 是 GPU
-    /// 裁剪链的**真实链长**，shader 用它收口 clip 循环 —— 旧实现的 `flags` 位无人消费）。
+    /// 裁剪链的**真实链长** = 至多一条矩形项 + k 条圆角项（k ≤ `MAX_CLIP_DEPTH`），上界
+    /// [`MAX_CLIP_ITEMS`]；shader 用它收口 clip 循环 —— 旧实现的 `flags` 位无人消费）。
     pub params1: [f32; 4],
     /// 图集 tile `(u0, v0, u1, v1)`。
     pub uv: [f32; 4],
@@ -90,29 +92,65 @@ pub(crate) const SHADOW_SIGMA_MIN: f32 = 0.35;
 /// 与 `analytic_shadow` 的可见范围自洽（旧实现是 `blur + 1`，σ 改小后会切掉模糊环）。
 pub(crate) const SHADOW_PAD_SIGMAS: f32 = 3.0;
 
-/// 圆角半径的**唯一**规范化：CSS 规则 `r ≤ min(w, h) / 2`（逐角 clamp，保持四角相对比例）。
+/// clip 链的矩形项（写进 `ClipEntry.meta.y`）：覆盖率只有 0/1 的**像素精确 scissor**。
+pub(crate) const CLIP_KIND_RECT: f32 = 1.0;
+
+/// clip 链的圆角项（写进 `ClipEntry.meta.y`）：参与解析 AA。
+pub(crate) const CLIP_KIND_ROUNDED: f32 = 2.0;
+
+/// GPU clip 链的**总项数**上界 = `MAX_CLIP_DEPTH`（圆角层数）+ 1（至多一条矩形项）。
 ///
-/// clip、quad、shadow 三条路径都走这里（R05-8）。旧实现有两套：quad 用 `min(half)`
-/// clamp、clip **完全不 clamp**；`r > min/2` 时 `sd_rounded_rect` 的 `q = |p| - half + r`
-/// 恒正 ⇒ 等值线反转，裁剪区反而**变大**（内容溢出）。shader 里保留同样的 clamp 作为
-/// 第二道防线（异常数据也不会出现反向错误）。
+/// 与三份 shader 的 `KYTRIX_MAX_CLIP_ITEMS` 逐值相同（`build.rs` 校验）。为什么需要它：
+/// 圆角层数的预算由 `Canvas::push_clip` 与编码器按 `MAX_CLIP_DEPTH` 控制，但矩形项**不参与**
+/// 该预算（全部轴对齐矩形 clip 求交合并成一条，无损），于是「8 层圆角 + 祖先矩形 clip」的链长
+/// 是 9 而不是 8。shader 的 clip 循环按真实链长收口，上界必须覆盖这个 9；链长超过 9（等价于
+/// 圆角层数 > 8）在编码期直接报错，绝不静默少裁。
+pub(crate) const MAX_CLIP_ITEMS: f32 = 9.0;
+
+/// 圆角半径的**唯一**规范化（R05-8 / AR2 P2-②）：两步、顺序固定。
+///
+/// 1. **CSS 比例缩放**（CSS Backgrounds §5.5）：某条边上相邻两角半径之和超过该边长时，
+///    全部半径按 `f = min(side / Σr)` 等比缩小（保持四角相对比例）。例：`100×20, tl=bl=40`
+///    按 `f = 20/80` 缩到 `tl=10, bl=10`；逐角 `min(w,h)/2` 会得到 `tl=1, bl=10`（比例被
+///    破坏），所以旧实现**不是** CSS 算法（AR2 P2-② 的反例）。
+/// 2. **SDF 合法域 clamp** `r ≤ min(w, h) / 2`：`r > min(half)` 会让 `sd_rounded_rect` 的
+///    `q = |p| - half + r` 恒正 ⇒ 等值线反转，裁剪区反而**变大**（内容溢出）。CSS 允许
+///    `r > min(half)` 的椭圆角，本引擎的 SDF 只支持圆角，故第二步必须存在；shader 里保留同一
+///    clamp 作为第二道防线，对已规范化的数据幂等。
+///
+/// clip、quad、shadow 三条路径都走这里（R05-8）。旧实现有两套：quad 用 `min(half)` clamp、
+/// clip **完全不 clamp**；`r > min/2` 时等值线反转，裁剪区反而变大。
 fn normalize_corner_radius(radii: [f32; 4], width: f32, height: f32) -> [f32; 4] {
-    // NaN 必须先挡掉：32::min 会**忽略** NaN（返回另一个操作数），直接算会得到
+    // NaN 必须先挡掉：`f32::min` 会**忽略** NaN（返回另一个操作数），直接算会得到
     // 一个看似合法的 half_min，于是异常尺寸的图形不会被归零。
-    if width.is_nan() || height.is_nan() {
+    if width.is_nan() || height.is_nan() || !width.is_finite() || !height.is_finite() {
         return [0.0; 4];
     }
-    let half_min = 0.5 * width.min(height);
-    if !half_min.is_finite() || half_min <= 0.0 {
+    if width <= 0.0 || height <= 0.0 {
         return [0.0; 4];
     }
-    radii.map(|radius| {
+    let sanitized = radii.map(|radius| {
         if radius.is_nan() {
             0.0
         } else {
-            radius.clamp(0.0, half_min)
+            radius.max(0.0)
         }
-    })
+    });
+    // ① CSS：四条边各自的比例因子取最小值（该边上没有任何半径时不构成约束）。
+    let mut scale = 1.0f32;
+    for (side, sum) in [
+        (width, sanitized[0] + sanitized[1]),
+        (width, sanitized[3] + sanitized[2]),
+        (height, sanitized[0] + sanitized[3]),
+        (height, sanitized[1] + sanitized[2]),
+    ] {
+        if sum > side {
+            scale = scale.min(side / sum);
+        }
+    }
+    // ② SDF 合法域。
+    let half_min = 0.5 * width.min(height);
+    sanitized.map(|radius| (radius * scale).min(half_min))
 }
 
 /// `ClipChain` 的帧内索引；`0` 是「无裁剪」哨兵。
@@ -125,10 +163,30 @@ impl ClipChainId {
     }
 }
 
+/// 一层 clip 的覆盖率语义（写进 `ClipEntry.meta.y`；shader 的 `clip_mask` 据此分支）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClipKind {
+    /// 轴对齐矩形：**像素精确 scissor**（覆盖率只有 0 或 1，不参与 AA 相乘）。
+    Rect,
+    /// 圆角矩形：解析 AA（逐层相乘）。
+    Rounded,
+}
+
+impl ClipKind {
+    /// GPU 侧的 `meta.y` 取值（与 shader 的 `KYTRIX_CLIP_KIND_*` 同值，`build.rs` 校验）。
+    fn gpu(self) -> u32 {
+        match self {
+            Self::Rect => CLIP_KIND_RECT as u32,
+            Self::Rounded => CLIP_KIND_ROUNDED as u32,
+        }
+    }
+}
+
 /// 一层 clip（P02 §8.7）。`rect` 是 `(x, y, w, h)`（物理像素）。
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ClipChain {
     parent: Option<ClipChainId>,
+    kind: ClipKind,
     rect: [f32; 4],
     corner_radius: [f32; 4],
 }
@@ -136,8 +194,8 @@ pub(crate) struct ClipChain {
 /// GPU 侧 `ClipEntry`（P07 §2.6 / DEVIATIONS F-69）：**48 B / 16 B 对齐**。
 ///
 /// 与 CPU 侧 [`ClipChain`] 同构（CPU 侧不算交集的 AABB：交集由 [`ClipState`] 维护），
-/// `parent` 打进 `uint4.x`，`.yzw` 保留恒 0；表项 **0 恒为哨兵**（`clip_index == 0` 时 shader
-/// 直接返回 1）。
+/// `parent` 打进 `meta.x`、`kind` 打进 `meta.y`，`.zw` 保留恒 0；表项 **0 恒为哨兵**
+///（`clip_index == 0` 时 shader 直接返回 1）。
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub(crate) struct GpuClipEntry {
@@ -145,7 +203,7 @@ pub(crate) struct GpuClipEntry {
     pub rect: [f32; 4],
     /// `(tl, tr, br, bl)`，物理像素。
     pub corner_radius: [f32; 4],
-    /// `.x = parent`（0 = 无裁剪），`.yzw` 恒 0。
+    /// `.x = parent`（0 = 无裁剪），`.y = KYTRIX_CLIP_KIND_*`，`.zw` 恒 0。
     pub meta: [u32; 4],
 }
 
@@ -161,7 +219,12 @@ impl ClipChain {
         GpuClipEntry {
             rect: self.rect,
             corner_radius: self.corner_radius,
-            meta: [self.parent.map_or(0, |parent| parent.0), 0, 0, 0],
+            meta: [
+                self.parent.map_or(0, |parent| parent.0),
+                self.kind.gpu(),
+                0,
+                0,
+            ],
         }
     }
 }
@@ -431,17 +494,24 @@ struct RoundedClip {
 
 /// 当前 clip 状态（编码期唯一真相）。
 ///
-/// **轴对齐矩形求交合并（R05-10，对齐 Skia `SkClipStack` / WebRender 的 clip rect 合并）**：
-/// 全部直角矩形 clip 只做一次交集，链上只有**一条**矩形表项；圆角 clip 各自一层。于是
-/// 两层边界重合时不再出现 `0.5 × 0.5 = 0.25` 的暗边（覆盖率相乘只发生在「矩形交集 ×
-/// 圆角形状」之间 —— 圆角形状的交集不是矩形，无法压成一条表项）。
+/// 链的形状恒为「**至多一条矩形项**（链根）+ k 条圆角项（k ≤ `MAX_CLIP_DEPTH`）」：
+///
+/// - 全部轴对齐矩形 clip 只做一次交集（**无损**：矩形交仍是矩形），链上只有一条矩形项。
+///   它的覆盖率语义是**像素精确 scissor**（0/1），不参与 AA 相乘 —— 因此「同边界的
+///   `Clip::Bounds` + Canvas 圆角 clip」只乘一次圆角 AA，不再有 `0.5 × 0.5 = 0.25` 的暗边；
+/// - 圆角 clip 各自一层（圆角形状的交集不是矩形，无法压成一条）。**完全相同的圆角 clip
+///   在栈里出现多次时只保留一层**：交集是幂等的（`A ∩ A = A`），再乘一次覆盖率恒为错。
+///
+/// 轴对齐矩形 clip 早就在 `push_clip` 里折叠了，但**不占 `MAX_CLIP_DEPTH` 预算**：预算是圆角
+/// 层数（`Canvas::push_clip` 与编码器同口径）。于是「8 层圆角 + 祖先矩形」的链长是 9 ——
+/// shader 的循环上界是 `MAX_CLIP_ITEMS = MAX_CLIP_DEPTH + 1`。
 #[derive(Clone, Debug)]
 struct ClipState {
     /// 全部矩形 clip 的交集（`[x0, y0, x1, y1]`，物理像素）。
     rect_aabb: [f32; 4],
     /// 交集是否已存在（`false` ⇒ `rect_aabb` 是无界哨兵、链上没有矩形表项）。
     has_rect: bool,
-    /// 交集在裁剪表里的表项。
+    /// 交集在裁剪表里的表项（链根）。
     rect_entry: Option<ClipChainId>,
     /// 圆角 clip 链（push 顺序；parent 依次指向前一项，链头指向 `rect_entry`）。
     rounded: SmallVec<[RoundedClip; 8]>,
@@ -458,7 +528,7 @@ impl ClipState {
         }
     }
 
-    /// GPU 裁剪链的链长 = 矩形合并项（0/1）+ 圆角层数。
+    /// GPU 裁剪链的链长 = 矩形合并项（0/1）+ 圆角层数；上界 `MAX_CLIP_ITEMS`。
     fn depth(&self) -> usize {
         self.rounded.len() + usize::from(self.rect_entry.is_some())
     }
@@ -469,6 +539,16 @@ impl ClipState {
             .last()
             .map(|clip| clip.entry)
             .or(self.rect_entry)
+    }
+
+    /// 链上是否已有**完全相同**（矩形 + 四角半径逐位相同）的圆角层。
+    ///
+    /// 交集幂等 ⇒ 重复层没有任何视觉效果，只会再乘一次覆盖率（变暗）。`push_clip` 据此跳过。
+    fn duplicate_rounded(&self, rect: [f32; 4], corner_radius: [f32; 4]) -> bool {
+        self.rounded.iter().any(|clip| {
+            clip.rect.map(f32::to_bits) == rect.map(f32::to_bits)
+                && clip.corner_radius.map(f32::to_bits) == corner_radius.map(f32::to_bits)
+        })
     }
 
     /// 全部 clip 的交集 AABB（`[x0, y0, x1, y1]`；无裁剪 = 无界哨兵）。
@@ -557,6 +637,7 @@ fn visible_aabb(logical_aabb: [f32; 4], scale: Scale, clip_aabb: [f32; 4]) -> [f
 /// 哨兵」，不必等第一帧编码。
 const CLIP_SENTINEL: ClipChain = ClipChain {
     parent: None,
+    kind: ClipKind::Rect,
     rect: [0.0; 4],
     corner_radius: [0.0; 4],
 };
@@ -565,9 +646,9 @@ const CLIP_SENTINEL: ClipChain = ClipChain {
 pub(crate) struct InstanceEncoder {
     buffer: InstanceBuffer,
     state: ClipState,
-    /// clip 栈回溯（每层 push 前保存一次完整状态；深度 ≤ `MAX_CLIP_DEPTH`）。
+    /// clip 栈回溯（每层 push 前保存一次完整状态；嵌套深度由调用方决定，不设硬上限）。
     saved: SmallVec<[ClipState; 8]>,
-    chains: ahash::HashMap<(u32, [u32; 4], [u32; 4]), ClipChainId>,
+    chains: ahash::HashMap<(u32, u32, [u32; 4], [u32; 4]), ClipChainId>,
     /// 颜色解析缓存（跨帧保留，每帧 clear）。
     colors: crate::paint::color::ResolveCache,
 }
@@ -702,7 +783,8 @@ impl InstanceEncoder {
             }
         }
         // 每个实例的 `clip_depth`（params1.w）必须等于它那条链的真实链长：shader 用这个值
-        // 收口循环，写错就是静默少裁（R05-5 / R05-11）。
+        // 收口循环，写错就是静默少裁（R05-5 / R05-11）。链长还必须有界（shader 的循环上界是
+        // `KYTRIX_MAX_CLIP_ITEMS`），且链上至多一条矩形项、矩形项只能是链根。
         for primitive in &self.buffer.instances {
             let clip_index = primitive.params1[0] as usize;
             debug_assert!(
@@ -710,17 +792,22 @@ impl InstanceEncoder {
                 "instance clip index out of range"
             );
             let mut depth = 0usize;
+            let mut rects = 0usize;
             let mut cursor = clip_index;
             while cursor != 0 {
                 depth += 1;
                 debug_assert!(
-                    depth <= usize::from(MAX_CLIP_DEPTH),
-                    "clip chain deeper than MAX_CLIP_DEPTH"
+                    depth <= MAX_CLIP_ITEMS as usize,
+                    "clip chain longer than MAX_CLIP_ITEMS"
                 );
-                cursor = self.buffer.clips[cursor]
-                    .parent
-                    .map_or(0, |parent| parent.index());
+                let entry = self.buffer.clips[cursor];
+                if entry.kind == ClipKind::Rect {
+                    rects += 1;
+                    debug_assert_eq!(entry.parent, None, "矩形项必须是链根");
+                }
+                cursor = entry.parent.map_or(0, |parent| parent.index());
             }
+            debug_assert!(rects <= 1, "链上至多一条矩形 clip 项");
             debug_assert_eq!(
                 depth, primitive.params1[3] as usize,
                 "instance clip_depth must match the chain length"
@@ -734,7 +821,7 @@ struct FrameEncoder<'a> {
     buffer: &'a mut InstanceBuffer,
     state: &'a mut ClipState,
     saved: &'a mut SmallVec<[ClipState; 8]>,
-    chains: &'a mut ahash::HashMap<(u32, [u32; 4], [u32; 4]), ClipChainId>,
+    chains: &'a mut ahash::HashMap<(u32, u32, [u32; 4], [u32; 4]), ClipChainId>,
     scale: Scale,
     resolver: &'a ColorResolver,
     /// 颜色解析缓存（P1-2.1）：一帧内同色高度重复，宽色域解析要跑 24 步二分。
@@ -825,7 +912,12 @@ impl FrameEncoder<'_> {
 
     // ── clip 状态机 ────────────────────────────────────────────────────────
 
-    /// 压入一层 clip。直角矩形走**求交合并**（不占新表项），圆角 clip 各占一层。
+    /// 压入一层 clip。
+    ///
+    /// - **轴对齐矩形**（四角半径全 0）走无损求交合并：链上恒只有一条矩形项（scissor 语义），
+    ///   不占 `MAX_CLIP_DEPTH` 预算；
+    /// - **圆角 clip** 各占一层，并计入 `MAX_CLIP_DEPTH` 预算；与栈内已有层**完全相同**时跳过
+    ///   （交集幂等，重复层只会把覆盖率多乘一次 ⇒ 变暗）。
     fn push_clip(&mut self, clip: crate::paint::primitive::ClipRect) -> Result<(), EngineError> {
         self.saved.push(self.state.clone());
         let factor = self.scale.factor();
@@ -844,19 +936,20 @@ impl FrameEncoder<'_> {
             };
             self.state.has_rect = true;
             self.rebuild_rect_chain();
-        } else {
+        } else if !self.state.duplicate_rounded(rect, radii) {
             let parent = self.state.top();
-            let entry = self.chain_entry(parent, rect, radii);
+            let entry = self.chain_entry(parent, ClipKind::Rounded, rect, radii);
             self.state.rounded.push(RoundedClip {
                 rect,
                 corner_radius: radii,
                 entry,
             });
         }
-        let depth = self.state.depth();
-        if depth > usize::from(MAX_CLIP_DEPTH) {
+        // 预算只数圆角层：矩形项是求交合并后的 scissor，不消耗圆角预算（链长 = 圆角层数 + 0/1）。
+        let rounded_depth = self.state.rounded.len();
+        if rounded_depth > usize::from(MAX_CLIP_DEPTH) {
             return Err(EngineError::ClipDepthExceeded {
-                depth: depth as u8,
+                depth: rounded_depth as u8,
                 limit: MAX_CLIP_DEPTH,
             });
         }
@@ -868,14 +961,14 @@ impl FrameEncoder<'_> {
         *self.state = self.saved.pop().unwrap_or_else(ClipState::unbounded);
     }
 
-    /// 矩形交集变化后重建链：矩形项在**链头**，圆角项依次挂在它下面。
+    /// 矩形交集变化后重建链：矩形项在**链根**（scissor），圆角项依次挂在它下面。
     ///
     /// 覆盖率相乘在 shader 里与顺序无关，但链必须始终只有**一条**矩形项 —— 否则「矩形
     /// 交集」会被乘两次（正是 R05-10 的 0.25 暗边）。圆角项的矩形/半径不变，只重挂 parent。
     fn rebuild_rect_chain(&mut self) {
         let rect_entry = if self.state.has_rect {
             let rect = aabb_to_rect(self.state.rect_aabb);
-            Some(self.chain_entry(None, rect, [0.0; 4]))
+            Some(self.chain_entry(None, ClipKind::Rect, rect, [0.0; 4]))
         } else {
             None
         };
@@ -886,22 +979,25 @@ impl FrameEncoder<'_> {
                 let clip = &self.state.rounded[index];
                 (clip.rect, clip.corner_radius)
             };
-            let entry = self.chain_entry(parent, rect, radii);
+            let entry = self.chain_entry(parent, ClipKind::Rounded, rect, radii);
             self.state.rounded[index].entry = entry;
             parent = Some(entry);
         }
     }
 
-    /// 裁剪表项的唯一插入点（按 `(parent, rect 位模式, radii 位模式)` 去重：
-    /// 完全相同的圆角 clip 复用同一表项）。
+    /// 裁剪表项的唯一插入点（按 `(parent, kind, rect 位模式, radii 位模式)` 去重：
+    /// 完全相同的层复用同一表项）。注意**去重不等于覆盖率正确**：嵌套的相同圆角层在
+    /// `ClipState` 里已被跳过（见 `duplicate_rounded`），本函数只复用字节相同的条目。
     fn chain_entry(
         &mut self,
         parent: Option<ClipChainId>,
+        kind: ClipKind,
         rect: [f32; 4],
         corner_radius: [f32; 4],
     ) -> ClipChainId {
         let key = (
             parent.map_or(0, |parent| parent.0),
+            kind.gpu(),
             rect.map(f32::to_bits),
             corner_radius.map(f32::to_bits),
         );
@@ -911,6 +1007,7 @@ impl FrameEncoder<'_> {
         let id = ClipChainId(self.buffer.clips.len() as u32);
         self.buffer.clips.push(ClipChain {
             parent,
+            kind,
             rect,
             corner_radius,
         });
@@ -1181,9 +1278,10 @@ mod tests {
     use std::rc::Rc;
 
     use super::{
-        ClipState, GRADIENT_HORIZONTAL, GRADIENT_RADIAL, GRADIENT_VERTICAL, GpuPrimitive,
-        InstanceBuffer, InstanceEncoder, KIND_GLYPH, KIND_QUAD, KIND_SHADOW, SHADOW_SIGMA_MIN,
-        SHADOW_SIGMA_SCALE, TEXTURE_GLYPH, normalize_corner_radius,
+        ClipChain, ClipChainId, ClipKind, ClipState, GRADIENT_HORIZONTAL, GRADIENT_RADIAL,
+        GRADIENT_VERTICAL, GpuPrimitive, InstanceBuffer, InstanceEncoder, KIND_GLYPH, KIND_QUAD,
+        KIND_SHADOW, MAX_CLIP_ITEMS, SHADOW_SIGMA_MIN, SHADOW_SIGMA_SCALE, TEXTURE_GLYPH,
+        normalize_corner_radius,
     };
     use crate::{
         math::{Point, Rect, Scale, Size, Transform},
@@ -1195,7 +1293,7 @@ mod tests {
                 Border, ClipOp, ClipRect, GeometryDraw, GlyphRun, Gradient, GradientKind,
                 PositionedGlyph, Primitive, Quad, QuadPaint, Shadow,
             },
-            scene::Scene,
+            scene::{MAX_CLIP_DEPTH, Scene},
         },
     };
 
@@ -1273,6 +1371,62 @@ mod tests {
         assert!(scene.push(lane, Primitive::Clip(ClipOp::Push(clip))));
     }
 
+    /// shader `clip_mask` 的 **CPU 镜像**（测试 oracle，`pixel` 是片元中心）。
+    ///
+    /// 三份 shader 的逐语句等价由 `build.rs` 的归一化比对守护（`MATH_FUNCTIONS` 含
+    /// `clip_mask`），本镜像负责钉住**数值语义**（覆盖率到底是 0.5 还是 0.25）。AA 带宽取
+    /// `length(ddx, ddy)` = 1 px（屏幕对齐几何的导数模长）。
+    fn clip_coverage(clips: &[ClipChain], head: ClipChainId, pixel: (f32, f32)) -> f32 {
+        let mut m = 1.0f32;
+        let mut cursor = Some(head);
+        while let Some(id) = cursor {
+            let entry = clips[id.index()];
+            if entry.rect[2] <= 0.0 || entry.rect[3] <= 0.0 {
+                return 0.0;
+            }
+            match entry.kind {
+                ClipKind::Rect => {
+                    let (lo_x, lo_y) = (entry.rect[0], entry.rect[1]);
+                    let (hi_x, hi_y) = (lo_x + entry.rect[2], lo_y + entry.rect[3]);
+                    if pixel.0 + 0.5 <= lo_x
+                        || pixel.1 + 0.5 <= lo_y
+                        || pixel.0 - 0.5 >= hi_x
+                        || pixel.1 - 0.5 >= hi_y
+                    {
+                        return 0.0;
+                    }
+                }
+                ClipKind::Rounded => {
+                    let half = (entry.rect[2] * 0.5, entry.rect[3] * 0.5);
+                    let center = (entry.rect[0] + half.0, entry.rect[1] + half.1);
+                    let d = sd_rounded_rect(
+                        (pixel.0 - center.0, pixel.1 - center.1),
+                        half,
+                        entry.corner_radius,
+                    );
+                    m *= (0.5 - d).clamp(0.0, 1.0);
+                }
+            }
+            cursor = entry.parent;
+        }
+        m
+    }
+
+    /// `sd_rounded_rect` 的测试侧等价实现（与草稿 shader 同一公式；带宽按 1 px 归一）。
+    fn sd_rounded_rect(p: (f32, f32), half: (f32, f32), radii: [f32; 4]) -> f32 {
+        let r = if p.0 > 0.0 {
+            if p.1 > 0.0 { radii[2] } else { radii[1] }
+        } else if p.1 > 0.0 {
+            radii[3]
+        } else {
+            radii[0]
+        };
+        let r = r.clamp(0.0, half.0.min(half.1));
+        let q = (p.0.abs() - half.0 + r, p.1.abs() - half.1 + r);
+        let outside = (q.0.max(0.0).powi(2) + q.1.max(0.0).powi(2)).sqrt();
+        q.0.max(q.1).min(0.0) + outside - r
+    }
+
     #[test]
     fn layout_is_128_by_16() {
         use std::mem::{align_of, offset_of, size_of};
@@ -1325,20 +1479,44 @@ mod tests {
         assert_eq!(instance.color1, [0.0; 4]);
     }
 
-    /// R05-8：圆角半径的唯一规范化是 CSS 规则 `r <= min(w, h) / 2`，clip 与 quad 同一函数。
+    /// R05-8 / AR2 P2-②：圆角半径的唯一规范化 = ① CSS 比例缩放 + ② SDF 合法域 clamp。
+    ///
+    /// 旧实现（逐角 `min(w,h)/2`）被注释写成「CSS 规则」，两者在「同一条边上半径不均衡」时
+    /// 结论不同：CSS 保持四角比例，逐角 clamp 破坏比例。本测试锁住两步的顺序与数值。
     #[test]
-    fn corner_radius_uses_the_css_min_half_rule_everywhere() {
-        // 100x2 的细条 + 半径 4：CSS/Skia 的 `min/2` 给出 1（本项目选定 `min/2` 规则）。
+    fn corner_radius_applies_css_proportional_scaling_then_the_sdf_domain_clamp() {
+        // 100x2 的细条 + 半径 4：上下边和 8 > 2 ⇒ f = 0.25 ⇒ 半径 1 = half_min。
         assert_eq!(normalize_corner_radius([4.0; 4], 100.0, 2.0), [1.0; 4]);
-        // 4x4 + 半径 8：夹到 2（shader 侧不再出现「越裁越大」）。
+        // 4x8 + 半径 8：上边和 16 > 4 ⇒ f = 0.25 ⇒ 2；再夹到 half_min = 2。
         assert_eq!(normalize_corner_radius([8.0; 4], 4.0, 8.0), [2.0; 4]);
-        // 负半径 / NaN / 零尺寸
+        // 30x100 + 上边两角各 20：和 40 > 30 ⇒ f = 0.75 ⇒ 15 = half_min（比例保持不变）。
+        assert_eq!(
+            normalize_corner_radius([20.0, 20.0, 0.0, 0.0], 30.0, 100.0),
+            [15.0, 15.0, 0.0, 0.0]
+        );
+        // 20x100 + tl=10 / tr=30：和 40 > 20 ⇒ f = 0.5 ⇒ (5, 15)；再夹到 half_min = 10。
+        // 逐角 clamp 会得到 (10, 10)（比例被破坏）—— 这是本测试要钉住的差异。
+        assert_eq!(
+            normalize_corner_radius([10.0, 30.0, 0.0, 0.0], 20.0, 100.0),
+            [5.0, 10.0, 0.0, 0.0]
+        );
+        // 左边界越界：100x20 + tl=1 / bl=40：左边和 41 > 20 ⇒ f = 20/41 ⇒ (0.488, 19.51)；
+        // 再夹到 half_min = 10（bl 越过 SDF 合法域 ⇒ 必须夹，否则等值线反转）。
+        let scaled = normalize_corner_radius([1.0, 0.0, 0.0, 40.0], 100.0, 20.0);
+        assert!((scaled[0] - 20.0 / 41.0).abs() < 1e-5, "{scaled:?}");
+        assert_eq!(scaled[3], 10.0);
+        assert_eq!((scaled[1], scaled[2]), (0.0, 0.0));
+        // 负半径 / NaN / 零尺寸 / 非有限尺寸
         assert_eq!(normalize_corner_radius([-3.0; 4], 10.0, 10.0), [0.0; 4]);
         assert_eq!(normalize_corner_radius([f32::NAN; 4], 10.0, 10.0), [0.0; 4]);
         assert_eq!(normalize_corner_radius([2.0; 4], 0.0, 10.0), [0.0; 4]);
         assert_eq!(normalize_corner_radius([2.0; 4], 10.0, f32::NAN), [0.0; 4]);
+        assert_eq!(
+            normalize_corner_radius([2.0; 4], f32::INFINITY, 10.0),
+            [0.0; 4]
+        );
 
-        // quad 路径：10x2 的盒子 + 半径 3（逻辑）@ 2x ⇒ 物理 20x4，half_min = 2。
+        // quad 路径：10x2 的盒子 + 半径 3（逻辑）@ 2x ⇒ 物理 20x4，左/右边和 12 > 4。
         let mut scene = Scene::empty();
         let lane = scene.new_lane();
         assert!(scene.push(
@@ -1369,7 +1547,7 @@ mod tests {
         let buffer = encode(&scene);
         assert_eq!(
             buffer.clips[1].corner_radius, [2.0; 4],
-            "clip 半径必须夹到 min/2"
+            "clip 半径必须走同一规范化（CSS 比例缩放 + SDF 合法域）"
         );
     }
 
@@ -1493,22 +1671,31 @@ mod tests {
         let head = instance.params1[0] as usize;
         assert!(head != 0, "必须有 clip 索引");
         assert_eq!(buffer.clips[head].parent, None, "合并后的矩形项是链根");
+        assert_eq!(
+            buffer.clips[head].kind,
+            ClipKind::Rect,
+            "轴对齐矩形 clip = 像素精确 scissor"
+        );
         // 这条链不带圆角（三层都是直角矩形 ⇒ 全部合并进同一条表项）。
         assert_eq!(buffer.clips[head].corner_radius, [0.0; 4]);
         // 物理 (5,5,10,10) × 2 = (10,10,20,20)，xywh。
         assert_eq!(instance.clip_rect, [10.0, 10.0, 20.0, 20.0]);
     }
 
-    /// 圆角 clip 逐层占表项；完全相同的圆角 clip 复用同一表项（去重）。
+    /// AR2 P1-A（假绿重写）：**完全相同的圆角 clip 在栈里重复出现只保留一层**。
+    ///
+    /// 旧测试名为「去重」，断言却是「链长 2 + 表里两个圆角项」（= 没去重），把
+    /// 「嵌套相同圆角 clip 会重复相乘 ⇒ 变暗」这个缺陷固化成了期望。交集是幂等的
+    /// （`A ∩ A = A`），重复层再乘一次覆盖率恒为错 —— 现在按 rect+radii 位模式去重。
     #[test]
-    fn rounded_clips_keep_one_entry_each_and_dedupe() {
+    fn nested_identical_rounded_clips_keep_a_single_chain_entry() {
         let rounded = ClipRect {
             rect: rect(0.0, 0.0, 30.0, 30.0),
             corner_radius: [2.0; 4],
         };
         let scene = scene_with(|scene, lane| {
             push_clip(scene, lane, rounded);
-            // 同一个圆角 clip 再来一层：必须与上一层共享表项（不能重复入表）。
+            // 同一个圆角 clip 再来一层：交集不变 ⇒ 不得再占一层、也不得再乘一次覆盖率。
             push_clip(scene, lane, rounded);
             assert!(scene.push(lane, quad_primitive(solid())));
             assert!(scene.push(lane, Primitive::Clip(ClipOp::Pop)));
@@ -1516,12 +1703,145 @@ mod tests {
         });
         let buffer = encode(&scene);
         let instance = buffer.instances[0];
-        // 两层相同圆角 clip ⇒ 链长 2，但表项去重后仍然只有 2 条（哨兵 + 1 条圆角项）。
-        assert_eq!(instance.params1[3], 2.0);
-        assert_eq!(buffer.clips.len(), 3, "哨兵 + parent 链上的两个圆角项");
-        // parent 链：链头 = 第二层，它的 parent 是第一层（同一表项的 rect/radii）。
+        assert_eq!(instance.params1[3], 1.0, "重复层不增加链长");
+        assert_eq!(buffer.clips.len(), 2, "哨兵 + 1 条圆角项");
         let head = buffer.clips[instance.params1[0] as usize];
+        assert_eq!(head.kind, ClipKind::Rounded);
         assert_eq!(head.corner_radius, [4.0; 4], "2 逻辑 × scale 2");
+        assert_eq!(head.parent, None);
+        // 覆盖率镜像：像素恰好落在圆角边界上 ⇒ 单层 AA = 0.5（两层相乘会是 0.25）。
+        let coverage = clip_coverage(&buffer.clips, ClipChainId(1), (60.0, 30.0));
+        assert!(
+            (coverage - 0.5).abs() < 1e-4,
+            "嵌套相同圆角 clip 只能乘一次覆盖率，实际 {coverage}"
+        );
+    }
+
+    /// 不同的圆角 clip 仍然逐层相乘（圆角形状的交集不是矩形，无法压成一条）。
+    #[test]
+    fn distinct_nested_rounded_clips_each_keep_their_entry() {
+        let scene = scene_with(|scene, lane| {
+            push_clip(
+                scene,
+                lane,
+                ClipRect {
+                    rect: rect(0.0, 0.0, 30.0, 30.0),
+                    corner_radius: [2.0; 4],
+                },
+            );
+            push_clip(
+                scene,
+                lane,
+                ClipRect {
+                    rect: rect(2.0, 2.0, 26.0, 26.0),
+                    corner_radius: [2.0; 4],
+                },
+            );
+            assert!(scene.push(lane, quad_primitive(solid())));
+            assert!(scene.push(lane, Primitive::Clip(ClipOp::Pop)));
+            assert!(scene.push(lane, Primitive::Clip(ClipOp::Pop)));
+        });
+        let buffer = encode(&scene);
+        let instance = buffer.instances[0];
+        assert_eq!(instance.params1[3], 2.0, "两层都要参与 AA");
+        assert_eq!(buffer.clips.len(), 3, "哨兵 + 2 条圆角项");
+        let head = buffer.clips[instance.params1[0] as usize];
+        assert_eq!(head.kind, ClipKind::Rounded);
+        let root = buffer.clips[head.parent.expect("第二层必须有 parent").index()];
+        assert_eq!(root.kind, ClipKind::Rounded);
+        assert_eq!(root.parent, None);
+    }
+
+    /// AR2 P1-A 的核心回归：矩形 clip 是**像素精确 scissor**，与圆角 clip 同边界时不得出现
+    /// `0.5 × 0.5 = 0.25` 的暗边（`Clip::Bounds` 容器 + Canvas 圆角 clip 是行情/图表最常见的嵌套）。
+    #[test]
+    fn rect_and_rounded_clip_with_the_same_bounds_do_not_darken_the_edge() {
+        let scene = scene_with(|scene, lane| {
+            // 祖先/容器的矩形 clip（`Clip::Bounds`）。
+            push_clip(
+                scene,
+                lane,
+                ClipRect {
+                    rect: rect(0.0, 0.0, 30.0, 30.0),
+                    corner_radius: [0.0; 4],
+                },
+            );
+            // 内部 Canvas 的圆角 clip，边界相同。
+            push_clip(
+                scene,
+                lane,
+                ClipRect {
+                    rect: rect(0.0, 0.0, 30.0, 30.0),
+                    corner_radius: [2.0; 4],
+                },
+            );
+            assert!(scene.push(lane, quad_primitive(solid())));
+            assert!(scene.push(lane, Primitive::Clip(ClipOp::Pop)));
+            assert!(scene.push(lane, Primitive::Clip(ClipOp::Pop)));
+        });
+        let buffer = encode(&scene);
+        let instance = buffer.instances[0];
+        // 链长 2 = 1 条矩形（scissor）+ 1 条圆角（AA），互不重复相乘。
+        assert_eq!(instance.params1[3], 2.0);
+        let head = buffer.clips[instance.params1[0] as usize];
+        assert_eq!(head.kind, ClipKind::Rounded);
+        let root = buffer.clips[head.parent.expect("圆角项挂在矩形项下面").index()];
+        assert_eq!(root.kind, ClipKind::Rect, "矩形项 = scissor，必须是链根");
+        assert_eq!(root.parent, None);
+        assert_eq!(root.corner_radius, [0.0; 4]);
+        // 物理 (0,0,60,60)：像素 (60,30) 恰好落在右边界上。矩形 scissor 保守保留该像素的
+        // 单元（roundOut），覆盖率完全由圆角 AA 给出 = 0.5。旧实现 rect×rounded = 0.25。
+        let coverage = clip_coverage(
+            &buffer.clips,
+            ClipChainId(instance.params1[0] as u32),
+            (60.0, 30.0),
+        );
+        assert!(
+            (coverage - 0.5).abs() < 1e-4,
+            "同边界的矩形 + 圆角 clip 只能乘一次 AA（0.5），实际 {coverage}"
+        );
+        // 边界外一个像素：scissor 全裁（0），不是 0.25 的鬼线。
+        let outside = clip_coverage(
+            &buffer.clips,
+            ClipChainId(instance.params1[0] as u32),
+            (61.0, 30.0),
+        );
+        assert_eq!(outside, 0.0);
+    }
+
+    /// AR2 P1-A ③：纯矩形裁剪的覆盖率只有 0 或 1（像素精确 scissor），边界像素不是 0.5。
+    #[test]
+    fn pure_rect_clip_coverage_is_binary() {
+        let scene = scene_with(|scene, lane| {
+            push_clip(
+                scene,
+                lane,
+                ClipRect {
+                    rect: rect(0.0, 0.0, 30.0, 30.0),
+                    corner_radius: [0.0; 4],
+                },
+            );
+            assert!(scene.push(lane, quad_primitive(solid())));
+            assert!(scene.push(lane, Primitive::Clip(ClipOp::Pop)));
+        });
+        let buffer = encode(&scene);
+        let instance = buffer.instances[0];
+        let head = ClipChainId(instance.params1[0] as u32);
+        // 物理盒 (0,0,60,60)，片元中心取 .5 偏移。
+        for pixel in [(0.5, 0.5), (59.5, 30.5), (30.5, 59.5), (30.5, 30.5)] {
+            assert_eq!(
+                clip_coverage(&buffer.clips, head, pixel),
+                1.0,
+                "{pixel:?} 必须全保留"
+            );
+        }
+        for pixel in [(60.5, 30.5), (30.5, 60.5), (-0.5, 30.5), (30.5, -0.5)] {
+            assert_eq!(
+                clip_coverage(&buffer.clips, head, pixel),
+                0.0,
+                "{pixel:?} 必须全裁"
+            );
+        }
     }
 
     /// R05-10 的零尺寸语义：0 宽/高的 clip 必须**全裁**（覆盖率 0），不是 0.5 的鬼线。
@@ -1619,6 +1939,74 @@ mod tests {
         });
         let buffer = encode(&scene);
         assert_eq!(buffer.instances[0].params1[3], 8.0);
+
+        // AR2 P1-⑥ / P1-D3：**8 层圆角 + 祖先矩形 clip** 必须可渲染（链长 = 9 = MAX_CLIP_ITEMS），
+        // 而不是每帧 `ClipDepthExceeded` 丢帧。矩形项不占圆角预算（求交合并成 scissor）。
+        let scene = scene_with(|scene, lane| {
+            push_clip(
+                scene,
+                lane,
+                ClipRect {
+                    rect: rect(-10.0, -10.0, 200.0, 200.0),
+                    corner_radius: [0.0; 4],
+                },
+            );
+            for index in 0..8 {
+                push_clip(
+                    scene,
+                    lane,
+                    ClipRect {
+                        rect: rect(index as f32, 0.0, 100.0, 100.0),
+                        corner_radius: [2.0; 4],
+                    },
+                );
+            }
+            assert!(scene.push(lane, quad_primitive(solid())));
+            for _ in 0..9 {
+                assert!(scene.push(lane, Primitive::Clip(ClipOp::Pop)));
+            }
+        });
+        let buffer = encode(&scene);
+        let instance = buffer.instances[0];
+        assert_eq!(instance.params1[3], 9.0, "8 层圆角 + 1 条矩形 = 链长 9");
+        assert!(
+            instance.params1[3] <= MAX_CLIP_ITEMS,
+            "链长必须落在 shader 的循环上界内"
+        );
+
+        // 上界与预算的关系：MAX_CLIP_ITEMS = MAX_CLIP_DEPTH + 1（shader 的
+        // KYTRIX_MAX_CLIP_ITEMS 与 KYTRIX_MAX_CLIP_DEPTH 由 build.rs 逐值比对）。
+        assert_eq!(MAX_CLIP_ITEMS, f32::from(MAX_CLIP_DEPTH) + 1.0);
+
+        // 9 层圆角 + 矩形仍然报错（圆角超预算，矩形不背锅）。
+        let scene = scene_with(|scene, lane| {
+            push_clip(
+                scene,
+                lane,
+                ClipRect {
+                    rect: rect(-10.0, -10.0, 200.0, 200.0),
+                    corner_radius: [0.0; 4],
+                },
+            );
+            for index in 0..9 {
+                push_clip(
+                    scene,
+                    lane,
+                    ClipRect {
+                        rect: rect(index as f32, 0.0, 100.0, 100.0),
+                        corner_radius: [2.0; 4],
+                    },
+                );
+            }
+            assert!(scene.push(lane, quad_primitive(solid())));
+        });
+        match try_encode(&scene) {
+            Err(crate::error::EngineError::ClipDepthExceeded { depth, limit }) => {
+                assert_eq!((depth, limit), (9, MAX_CLIP_DEPTH), "报的是圆角层数");
+            }
+            Err(other) => panic!("9 层圆角 + 矩形必须报 ClipDepthExceeded，实际 {other:?}"),
+            Ok(_) => panic!("9 层圆角 + 矩形必须报 ClipDepthExceeded"),
+        }
     }
 
     /// R05-11：`params1.w` 携带真实链长（旧实现写 `FLAG_OPAQUE` 而无人读）。

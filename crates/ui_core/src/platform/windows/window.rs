@@ -27,6 +27,7 @@ use crate::{
             composition::{self, Composition},
             dpi,
             event_loop::{WndProcState, wndproc},
+            ime,
         },
     },
     window::{WindowId, WindowOptions},
@@ -34,9 +35,6 @@ use crate::{
 
 /// 窗口类名（每进程注册一次）。
 const CLASS_NAME: &str = "KytrixGuiWindow";
-
-/// 最小客户区（逻辑像素；`WM_GETMINMAXINFO` 换算成物理像素后生效）。
-pub(crate) const MIN_SIZE_LOGICAL: (f32, f32) = (320.0, 200.0);
 
 /// 类光标（`IDC_ARROW`）：probe 实测「类光标 = null + `HTCLIENT`」会得到**空光标**（不可见）。
 fn load_arrow_cursor() -> HCURSOR {
@@ -228,24 +226,15 @@ impl NativeWindow {
             factor: dpi as f32 / dpi::BASE_DPI as f32,
         })?;
         self.scale = scale;
-        // `WM_GETMINMAXINFO` 的 `ptMinTrackSize` 是**窗口**外框尺寸，而应用给的是**客户区**
-        // 最小尺寸（P2-1）。直接透传会让窗口最小尺寸比预期小一个边框 + 标题栏（在 150% DPI
-        // 下尤其明显），于是能缩到客户区只有几十像素。这里先按真实边框换算成外框。
-        let min = dpi::window_size_for_client(
-            (
-                (MIN_SIZE_LOGICAL.0 * scale.factor()).round() as u32,
-                (MIN_SIZE_LOGICAL.1 * scale.factor()).round() as u32,
-            ),
-            dpi,
-        );
-        // 外框尺寸恒为正（`window_size_for_client` 只加边框）。
-        let min = (min.0.max(1) as u32, min.1.max(1) as u32);
+        // `WM_GETMINMAXINFO` 的 `ptMinTrackSize` 与 `WM_DPICHANGED` 用**同一个**换算
+        // （[`dpi::min_track_size`]）：`WndProcState` 是唯一持有者，两处分别算会在 DPI 变化后
+        // 漂移（P2-1：直接透传客户区尺寸会小一个边框 + 标题栏）。
         // SAFETY: `state` 由本窗口独占（`Drop` 之前一直有效）；WndProc 只在消息处理期读它。
         unsafe {
-            (*self.state).set_min_size(min);
+            (*self.state).note_dpi(dpi, scale);
         }
         // 0×0 的请求尺寸没有可用的窗口矩形（`physical_client` 只会钳成 1 px）：只记账 DPI，
-        // 等平台 resize / `WM_DPICHANGED` 给出真实尺寸。`apply_scale` 有同样的守卫。
+        // 等平台 resize / `WM_DPICHANGED` 给出真实尺寸。
         if size.width <= 0.0 || size.height <= 0.0 {
             self.logical_size = size;
             return Ok(());
@@ -266,32 +255,16 @@ impl NativeWindow {
         .map_err(|error| window_error("SetWindowPos", error))?;
         // 回读：客户区由系统按真实边框算出，逻辑尺寸以它为准（round 之后可能与请求差 1 px）。
         let client = self.client_size();
-        self.logical_size = Size::new(
-            scale.to_logical(client.0 as f32),
-            scale.to_logical(client.1 as f32),
-        );
-        Ok(())
-    }
-
-    /// 用系统建议的矩形移动/缩放（`WM_DPICHANGED` 的 `lParam`）。
-    pub(crate) fn place(&self, rect: (i32, i32, i32, i32)) -> Result<(), EngineError> {
-        // SAFETY: 窗口存活；矩形来自系统建议，只改位置与尺寸。
-        unsafe {
-            SetWindowPos(
-                self.hwnd,
-                None,
-                rect.0,
-                rect.1,
-                rect.2 - rect.0,
-                rect.3 - rect.1,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            )
-        }
-        .map_err(|error| window_error("SetWindowPos(WM_DPICHANGED)", error))?;
+        self.note_client_resize(scale, client);
         Ok(())
     }
 
     /// `WndProc` 状态的独占访问（事件循环消费事件 / 读修饰键）。
+    ///
+    /// **调用方纪律**（R07-7）：拿到 `&mut WndProcState` 之后不得调用任何会同步重入
+    /// `WndProc` 的 Win32 API（`SetWindowPos` / `ShowWindow` / `ImmAssociateContext*` /
+    /// `ImmSet*Window` / 会进模态循环的 `DefWindowProcW`）。这些调用一律走
+    /// 「短借用算命令 → 释放借用执行 → 短借用写回」的两阶段（见 [`Self::sync_ime_enabled`]）。
     pub(crate) fn state_mut(&mut self) -> &mut WndProcState {
         // SAFETY: `state` 由 `create` 的 `Box::into_raw` 产生、`Drop` 回收；窗口存活期内唯一所有者。
         unsafe { &mut *self.state }
@@ -321,6 +294,11 @@ impl NativeWindow {
     }
 
     /// 同步 IME caret 区域到 IMM32（每轮泵调用，独立于帧门禁；缓存键含 Scale，DPI 变化会重发）。
+    ///
+    /// **两阶段**（R07-7）：命令在短借用里算出来，执行时**不持有 `&mut WndProcState`** ——
+    /// `ImmSetCompositionWindow` / `ImmSetCandidateWindow` 会同步派发
+    /// `WM_IME_NOTIFY(IMN_SETCOMPOSITIONWINDOW)`，嵌套进入的 `WndProc` 会再构造
+    /// `&mut WndProcState`，同时持有两个 `&mut` 是别名 UB。
     pub(crate) fn sync_ime_cursor_area(&mut self, app: &App) {
         let area = match app.ime_cursor_area(self.id) {
             Ok(area) => area,
@@ -332,13 +310,12 @@ impl NativeWindow {
             return;
         }
         self.ime_area = next;
-        match area {
-            Some(rect) => {
-                let physical = rect.to_physical(self.scale);
-                let hwnd = self.hwnd;
-                self.state_mut().set_ime_cursor_area(hwnd, physical);
-            }
-            None => self.state_mut().clear_ime_cursor_area(),
+        let hwnd = self.hwnd;
+        let physical = area.map(|rect| rect.to_physical(self.scale));
+        let command = self.state_mut().plan_ime_cursor_area(physical);
+        if let Some(command) = command {
+            let applied = ime::execute(hwnd, command);
+            self.state_mut().note_ime_applied(applied);
         }
     }
 
@@ -348,13 +325,20 @@ impl NativeWindow {
     /// （见 `platform/windows/ime.rs`）。状态切换会清空 `ime_area` 缓存：恢复的上下文可能是
     /// 系统新建的默认上下文，之前写的组合/候选窗表单不保证还在，下一轮
     /// [`Self::sync_ime_cursor_area`] 必须重发。
+    ///
+    /// 两阶段执行的原因同 [`Self::sync_ime_cursor_area`]：`ImmAssociateContext*` 会同步派发
+    /// `WM_IME_SETCONTEXT`。
     pub(crate) fn sync_ime_enabled(&mut self, app: &App) {
         let enabled = app.ime_enabled(self.id);
         if self.state_mut().ime_enabled() == enabled {
             return;
         }
         let hwnd = self.hwnd;
-        self.state_mut().set_ime_enabled(hwnd, enabled);
+        let command = self.state_mut().plan_ime_enabled(enabled);
+        if let Some(command) = command {
+            let applied = ime::execute(hwnd, command);
+            self.state_mut().note_ime_applied(applied);
+        }
         self.ime_area = None;
     }
 
@@ -363,61 +347,23 @@ impl NativeWindow {
         self.hwnd.is_invalid()
     }
 
-    /// 应用新的 DPI 比例（`WM_DPICHANGED`）：更新最小尺寸，并按新 DPI 重算窗口尺寸。
-    /// 按新 DPI 重排窗口：保持逻辑尺寸不变，重算非客户区。
+    /// 只记账新 DPI / scale（**几何已经由 `WndProc` 在 `WM_DPICHANGED` 里改完**，R07-12）。
     ///
-    /// **只在没有系统建议矩形时用**（`WM_DPICHANGED` 带建议矩形时走 [`Self::note_scale`] +
-    /// [`Self::place`]：先按旧尺寸重排一次再套建议矩形会产生可见跳变和一次多余布局）。
-    pub(crate) fn apply_scale(&mut self, scale: Scale, dpi: u32) -> Result<(), EngineError> {
-        if !self.note_scale(scale, dpi) {
-            return Ok(());
-        }
-        let window_size =
-            dpi::window_size_for_client(physical_client(self.logical_size, scale), dpi);
-        // SAFETY: 窗口存活；只改尺寸，不重建。
-        unsafe {
-            SetWindowPos(
-                self.hwnd,
-                None,
-                100,
-                100,
-                window_size.0,
-                window_size.1,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            )
-        }
-        .map_err(|error| window_error("SetWindowPos(WM_DPICHANGED)", error))?;
-        Ok(())
-    }
-
-    /// 只记账新 DPI / scale（不移动、不缩放窗口）。
-    ///
-    /// 返回 `false` = 窗口当前没有可用的逻辑尺寸（最小化 / 尚未布局），调用方不要重排。
-    pub(crate) fn note_scale(&mut self, scale: Scale, dpi: u32) -> bool {
+    /// 同时清掉 caret hint：旧的 `cursor_area` 是旧 DPI 下的物理像素，DPI 变化后在下一次
+    /// `sync_ime_cursor_area` 重新下发前不得被 `WM_IME_STARTCOMPOSITION` 复用。
+    pub(crate) fn note_scale(&mut self, scale: Scale, dpi: u32) {
         self.scale = scale;
-        // 旧 cursor_area 是物理像素；DPI 变化后在下一次 sync 前不得被 WM_IME_START 复用。
-        self.state_mut().clear_ime_cursor_area();
-        // `ptMinTrackSize` 是外框尺寸：与 `apply_dpi_and_size` 用同一条换算（P2-1）。
-        let min = dpi::window_size_for_client(
-            (
-                (MIN_SIZE_LOGICAL.0 * scale.factor()).round() as u32,
-                (MIN_SIZE_LOGICAL.1 * scale.factor()).round() as u32,
-            ),
-            dpi,
-        );
-        // SAFETY: `state` 独占；只写 `min_size`。
-        unsafe {
-            (*self.state).set_min_size((min.0.max(1) as u32, min.1.max(1) as u32));
-        }
-        // 最小化时客户区是 0×0、`logical_size` 保留着上一次真实尺寸：不能拿 0 或最小尺寸去
-        // 重排窗口（那会把恢复后的窗口压成最小尺寸，P2-3）。恢复时的 `WM_SIZE` /
-        // `WM_DPICHANGED` 会重新走到这里。
-        !(self.is_minimized() || self.logical_size.width <= 0.0 || self.logical_size.height <= 0.0)
+        self.state_mut().note_dpi(dpi, scale);
+        // `None` 命令 = 只清 hint（没有要执行的 IMM32 调用）。
+        let _ = self.state_mut().plan_ime_cursor_area(None);
+        self.ime_area = None;
     }
 
     /// 同步 `logical_size` 字段（客户区被用户拖动改变之后由事件循环调用）。
-    pub(crate) fn note_client_resize(&mut self, client: (u32, u32)) {
-        let scale = self.scale;
+    ///
+    /// `scale` 必须是**该 `WM_SIZE` 消息产生时**的比例（R07-12）：`WM_SIZE` 与
+    /// `WM_DPICHANGED` 可能同批到达，用窗口侧的旧 scale 会把逻辑尺寸算错。
+    pub(crate) fn note_client_resize(&mut self, scale: Scale, client: (u32, u32)) {
         self.logical_size = Size::new(
             scale.to_logical(client.0 as f32),
             scale.to_logical(client.1 as f32),
@@ -431,8 +377,13 @@ impl NativeWindow {
         }
         // 应用禁用 IME 时输入上下文被摘下来存在 `WndProcState` 里：窗口销毁时系统只释放
         // **仍关联**在窗口上的上下文，必须先还回去，否则是 `HIMC` 泄漏（P2-7）。
+        // 两阶段：`ImmAssociateContext` 会同步派发 `WM_IME_SETCONTEXT`，执行时不能持有 `&mut`。
         let hwnd = self.hwnd;
-        self.state_mut().release_ime_before_destroy(hwnd);
+        let command = self.state_mut().plan_ime_release();
+        if let Some(command) = command {
+            let applied = ime::execute(hwnd, command);
+            self.state_mut().note_ime_applied(applied);
+        }
         // 顺序（`design/DEVIATIONS.md` §36 F-204）：合成目标引用 HWND，必须**在 HWND 仍然存活时**把 visual 从
         // 窗口上摘下来并释放全部 DComp COM 对象（`SetRoot(NULL)` + `Commit`，再逐个 drop）。
         // 关闭顺序保证 GPU 线程已经退出（`pump` 先 drop `App`，`Renderer::drop` join 线程），
@@ -530,7 +481,7 @@ mod tests {
     /// IMM32；`NativeWindow::destroy` 必须在 `DestroyWindow` 之前把摘下的上下文还回去。
     ///
     /// 这条用例覆盖的是 `NativeWindow` 的**调用点**：删掉 `sync_ime_enabled` 里的目标状态
-    /// 比较 / `ime_area` 清理，或删掉 `destroy` 里的 `release_ime_before_destroy` 时，
+    /// 比较 / `ime_area` 清理，或删掉 `destroy` 里的 `plan_ime_release` 执行时，
     /// `ImeState` 自己的状态机测试仍会全绿，这里会失败。泵**每轮调用**它们的节奏不在单测
     /// 范围内（需要真实泵 + 渲染器），属于真机验证项。
     #[test]
@@ -589,8 +540,8 @@ mod tests {
             let _ = ImmReleaseContext(native.hwnd, restored);
         }
 
-        // 销毁前恢复：`destroy` 必须先 `release_ime_before_destroy`（它会把已应用状态置回
-        // 启用）；若这个调用被删掉，状态会停在禁用态。
+        // 销毁前恢复：`destroy` 必须先执行 `plan_ime_release` 的命令（它会把已应用状态置回
+        // 启用）；若这一步被删掉，状态会停在禁用态。
         app.set_ime_enabled(id, false);
         native.sync_ime_enabled(&app);
         assert!(!native.state_mut().ime_enabled(), "前置：窗口处于禁用态");

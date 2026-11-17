@@ -97,7 +97,12 @@ impl Canvas {
         self.lane.push(Primitive::Geometry(draw));
     }
 
-    /// 压栈 clip：深度未超 `MAX_CLIP_DEPTH`（8，crate 私有常量）时压入并返回 `true`，否则**不写入**并返回 `false`。
+    /// 压栈 clip：**本 Canvas 自身**的裁剪层数未超 `MAX_CLIP_DEPTH`（8，crate 私有常量）时压入并
+    /// 返回 `true`，否则**不写入**并返回 `false`。
+    ///
+    /// 门限与编码器的预算同口径（圆角层数 ≤ 8）：全部轴对齐矩形 clip 在编码期求交合并成一条
+    /// **像素精确 scissor**，不占该预算；因此「本 Canvas 8 层圆角 + 任意祖先矩形 clip」的链长是
+    /// 9 = `MAX_CLIP_ITEMS`，仍然合法（旧实现按全局链长判 9 > 8 ⇒ 每帧丢帧，AR2 P1-⑥）。
     ///
     /// debug 构建断言 `clip.rect` 的尺寸非负且坐标/圆角有限（§7.4 C4）；release 构建不做任何检查。
     ///

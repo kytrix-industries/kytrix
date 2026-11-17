@@ -58,11 +58,12 @@ impl WindowsA11y {
         })
     }
 
-    /// 进入 `WM_GETOBJECT` 处理：`false` = 重入（本次不接管）。
+    /// 进入 `WM_GETOBJECT` 处理：`false` = 重入（本次**不**进第二层 adapter）。
     ///
     /// 旗标由调用方在**释放 `&mut WndProcState` 之前**置位、在 `.into()` **之后**清除：
-    /// `UiaReturnRawElementProvider` 会同步派发嵌套 `WM_GETOBJECT`（`adapter.rs:530-533`），
-    /// 那个嵌套调用只能看到旗标、不得再进第二层。
+    /// `UiaReturnRawElementProvider` 会同步派发嵌套 `WM_GETOBJECT`（`adapter.rs:530-533`）。
+    /// 嵌套请求由 `wndproc` 交给 `DefWindowProcW`（**不是**返回 0，见 R07-8：返回 0 等于告诉
+    /// UIA「本窗口没有 provider」，AT 会判定窗口不可访问）。
     pub(crate) fn begin_getobject(&mut self) -> bool {
         if self.in_getobject.get() {
             return false;

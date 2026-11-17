@@ -50,7 +50,10 @@ const FRAME_FIELDS: [&str; 2] = ["viewport", "params"];
 const DRAW_FIELDS: [&str; 5] = ["basis", "translation", "color0", "clip_rect", "clip"];
 
 /// 与 `paint/instance.rs` 的 `const NAME: f32` 逐一比对的常量（去掉 `KYTRIX_` 前缀）。
-const CONSTANTS: [&str; 10] = [
+///
+/// 覆盖**全部**跨端数值契约：`kind` 取值、clip 项类型 / 链上界、阴影 σ（= blur/2 及其下限）。
+/// AR2 P1-⑤：这张表漏掉任何一个，单端改动都会静默通过（实验 E4/E10b/E15/E16/E13 的教训）。
+const CONSTANTS: [&str; 15] = [
     "KIND_QUAD",
     "KIND_GLYPH",
     "KIND_IMAGE",
@@ -61,7 +64,16 @@ const CONSTANTS: [&str; 10] = [
     "GRADIENT_HORIZONTAL",
     "GRADIENT_VERTICAL",
     "GRADIENT_RADIAL",
+    "CLIP_KIND_RECT",
+    "CLIP_KIND_ROUNDED",
+    "MAX_CLIP_ITEMS",
+    "SHADOW_SIGMA_SCALE",
+    "SHADOW_SIGMA_MIN",
 ];
+
+/// 只在 shader 侧存在的常量：Rust 侧没有同名常量（只被 shader 读），因此三方比对
+/// **只比三份源码之间**。漏掉它们时单端分叉同样静默通过（AR2 实验 E10b / E15）。
+const SHADER_ONLY_CONSTANTS: [&str; 2] = ["KYTRIX_CLIP_VERTEX_SLACK", "KYTRIX_AA_INSIDE"];
 
 /// 禁止出现在任何 shader 源码里的位重解释构造（contract §9）。
 const FORBIDDEN: [&str; 6] = [
@@ -264,6 +276,35 @@ fn validate(manifest: &Path, shader_dir: &Path) {
                 &format!("{rust_depth}（Rust paint/scene.rs）"),
                 &depth.to_string(),
             );
+        }
+        // 4b) 链上界与预算的关系：KYTRIX_MAX_CLIP_ITEMS = KYTRIX_MAX_CLIP_DEPTH + 1
+        //（链上至多一条矩形项 + MAX_CLIP_DEPTH 条圆角项；AR2 P1-A / P1-⑥）。
+        let items = const_value(values, "KYTRIX_MAX_CLIP_ITEMS", file);
+        if items != depth + 1.0 {
+            fail(
+                file,
+                "KYTRIX_MAX_CLIP_ITEMS",
+                &format!("{}（= KYTRIX_MAX_CLIP_DEPTH + 1）", depth + 1.0),
+                &items.to_string(),
+            );
+        }
+    }
+
+    // 4c) 只在 shader 侧存在的常量：三份源码必须逐值相同（Rust 侧没有参照）。
+    for name in SHADER_ONLY_CONSTANTS {
+        let mut reference: Option<(&str, f32)> = None;
+        for (file, values) in &shader_sources {
+            let value = const_value(values, name, file);
+            match reference {
+                None => reference = Some((file, value)),
+                Some((expected_file, expected)) if value != expected => fail(
+                    file,
+                    name,
+                    &format!("{expected}（同 {expected_file}）"),
+                    &value.to_string(),
+                ),
+                Some(_) => {}
+            }
         }
     }
 

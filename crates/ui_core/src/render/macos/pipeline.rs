@@ -106,7 +106,8 @@ impl Pipeline {
         let fs = shaders.function(&shaders.quad, "ps_main", QUAD_METALLIB)?;
         let quad = build_pipeline(device, format, &vs, &fs, None)?;
 
-        // geometry 三族：顶点布局由 stride 决定（`Ui` = 8 B，`Textured` = 16 B）。
+        // geometry 三族：顶点布局由 stride 决定（`Ui` = 12 B，`Textured` = 16 B）。拓扑按
+        // `GeometryDesc.topology` 各建一条 PSO（Metal 的拓扑是 PSO 状态，与 D3D12 的逐 draw 切换不同）。
         let ui_vs = shaders.function(&shaders.geometry, "vs_ui", GEOMETRY_METALLIB)?;
         let textured_vs = shaders.function(&shaders.geometry, "vs_textured", GEOMETRY_METALLIB)?;
         let ui_ps = shaders.function(&shaders.geometry, "ps_ui", GEOMETRY_METALLIB)?;

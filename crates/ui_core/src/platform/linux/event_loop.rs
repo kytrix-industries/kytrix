@@ -2,11 +2,22 @@
 //! （`design/phase-12-macos-linux.md` §8.1）。
 //!
 //! 结构（多窗口，P1-2.8 Stage C-2b）：
-//! 1. 建 `WaylandState`（连接、协议工厂、首个窗口、IME / 剪贴板）→ 首个 roundtrip 拿 configure；
+//! 1. 建 `WaylandState`（连接、协议工厂、首个窗口、IME / 剪贴板 / 光标）→ 首个 roundtrip 拿 configure；
 //! 2. 所有可失败的 setup：calloop 事件循环 / 唤醒句柄 / `WaylandSource`；
 //! 3. 每轮泵开头把 `App` 的窗口集合同步到原生窗口：新增窗口建 `wl_surface` / toplevel 与
 //!    渲染器，`App` 已关闭的窗口销毁协议对象（[`sync_windows`]）；
 //! 4. 循环：drain 事件 → 逐窗口镜像 / 关闭 / 帧 → 钩子 → 任务 → a11y → 阻塞等待。
+//!
+//! R10 整改的四处接线：
+//!
+//! - **光标**（R10-3）：`app.take_cursor_change()` 不再被丢弃，而是写进 `WaylandState`
+//!   （按窗口记账），指针在该窗口上时立即 `set_shape` / `set_cursor`；
+//! - **可见性**（R10-7）：不可见窗口既不请求 frame callback，也不启动 200 ms 活性兜底；
+//! - **剪贴板 send**（R10-17）：`PendingSend` 被注册成 calloop 的可写事件源，主线程永不阻塞；
+//! - **IME 降级**（R10-2）：`enable` 之后 1.5 s 没有 IM 事件 ⇒ 文本通路切回键盘，并把等待时间
+//!   压进 `dispatch` 的 timeout（否则要等下一个无关事件才降级）。
+//! - **强类型错误**（R10-16）：运行期 `dispatch` 失败按 `calloop::Error::IoError` 分类
+//!   （`EPIPE` ⇒ 合成器消失、`EPROTO` ⇒ 协议错误）。
 
 use std::{
     sync::Arc,
@@ -17,12 +28,13 @@ use calloop::{EventLoop, ping::make_ping};
 
 use crate::{
     app::App,
-    error::EngineError,
+    error::{EngineError, WaylandErrorKind},
     math::{Scale, Size},
     platform::{
         dispatcher::Dispatcher,
         linux::{
             a11y::{UnixA11y, window_bounds},
+            clipboard::PendingSend,
             dpi,
             surface::{self, WaylandState},
             wake,
@@ -110,6 +122,8 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
         .map_err(|error| EngineError::AppInit {
             detail: smol_str::format_smolstr!("wayland source: {error}"),
         })?;
+    // calloop 的 LoopHandle：剪贴板的异步写出任务（R10-17）要动态注册可写事件源。
+    let loop_handle = event_loop.handle();
 
     // 每窗口一份的 UI 侧状态：a11y adapter 与平台真值镜像。两者都与 `WaylandState::windows`
     // 一一对应，生命周期统一由 `sync_windows` 维护（新增窗口补、关闭窗口删）。
@@ -181,6 +195,9 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                 window.set_buffer_scale(state.buffer_scale(index));
                 // 每轮写入真实的 Wayland buffer 尺寸（`round(逻辑 × scale)`）；同值 no-op。
                 window.set_surface(dpi::physical_size(size_now, scale_now));
+                // ③ R10-4 / R10-15：compositor 侧的窗口状态（装饰模式、最大化/全屏、可用能力）
+                // 镜像给应用 —— 自绘标题栏据此决定是否画、按钮是否可用。
+                window.set_state(state.window_state(index));
             }
             // ②b 焦点状态 → a11y（键盘焦点窗口可能不同于指针进入窗口）。
             for window_a11y in &mut a11ys {
@@ -189,13 +206,28 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                 };
                 window_a11y.adapter.focus_changed(state.is_focused(index));
             }
-            // 交互反馈：Linux 没有全局光标 API（由客户端自绘），请求直接消费掉。
-            let _ = app.take_cursor_change();
+            // R10-3：光标不再是「丢弃请求」。Wayland 上光标图像只能由客户端提供：
+            // `wp_cursor_shape_v1`（首选，无 buffer 管理）或 `wl_pointer.set_cursor` + 主题图像。
+            // 这里把应用的请求按窗口记账，指针停在该窗口上时立即下发（serial 用最近一次
+            // `wl_pointer.enter`）。
+            if let Some((window, cursor)) = app.take_cursor_change() {
+                state.set_cursor_shape(window, cursor);
+            }
             // 指针捕获（R02-8）：Wayland 的 `wl_pointer` 在按下期间由 compositor 做**隐式抓取**，
             // 客户端没有可调用的捕获 API（协议不提供 `setPointerCapture` 的对应物）；引擎侧的
             // 捕获状态（事件路由 + `PointerCancel` 语义）照常生效。请求被消费是正确行为，
             // 这一点在 `App::capture_pointer` 的文档里明确写出。
             let _ = app.take_capture_requests();
+            // R10-2：`enable` 之后 1.5 s 内没有任何 IM 事件 ⇒ 本 seat 没有输入法引擎，文本
+            // 通路切回键盘（否则字符输入全灭）。降级本身不需要出帧，但会让下一轮 timeout 恢复。
+            state.degrade_text_input_if_silent(Instant::now());
+            // R10-17：剪贴板的 `wl_data_source.send` 不再在主线程 `write_all`。把待写任务交给
+            // calloop 的可写事件源（管道阻塞 fd，每次最多写 PIPE_BUF ⇒ 绝不阻塞事件循环）。
+            for pending in state.clipboard_mut().take_pending_sends() {
+                // 注册失败（例如 fd 已被对端关闭）：源被丢弃 ⇒ fd 关闭 ⇒ 对端读到 EOF，
+                // 这正是协议要求的「不提供数据」。
+                let _ = register_pending_send(&loop_handle, pending);
+            }
 
             // ③ 关闭请求（`xdg_toplevel.close`）：先关 `App` 窗口（drop 渲染器 → GPU 线程
             // join），再销毁原生窗口（drop 协议对象），顺序与窗口销毁的依赖方向一致。
@@ -228,6 +260,7 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                 match control {
                     WindowControl::Minimize => state.minimize(index),
                     WindowControl::ToggleMaximize => state.toggle_maximize(index),
+                    WindowControl::ToggleFullscreen => state.toggle_fullscreen(index),
                     WindowControl::BeginMove => state.begin_move(index),
                     WindowControl::BeginResize(edge) => state.begin_resize(index, edge),
                 }
@@ -257,14 +290,23 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             // `frame_ready` 门控 —— 门禁关闭期间某轮已经消费过唤醒位时，用「唤醒位是否存在」
             // 门控兜底会让它永远不执行（F-183）。
             let now = Instant::now();
+            // R10-7：不可见窗口不参与兜底（`expire_frame_gates` 内部按窗口可见性过滤）。
+            // 可见性恢复（`wl_surface.enter`）由 `redraw` 标记驱动一次唤醒。
             if state.expire_frame_gates(now) {
                 // 兜底强制开门后补一次唤醒：唤醒位可能已被上一轮取走，否则门禁虽开却没有一帧
                 // 驱动重试。本轮 ④ 随后的 `take_frame_wake` 会消费这次唤醒。
                 dispatcher.wake();
             }
+            if state.take_redraw() {
+                dispatcher.wake();
+            }
             let frame_windows: Vec<(usize, WindowId)> = (0..state.window_count())
                 .map(|index| (index, state.window_id(index)))
-                .filter(|(_, id)| app.window(*id).is_some_and(|window| window.has_renderer()))
+                .filter(|(index, id)| {
+                    // R10-7：不可见的 surface 不请求 frame callback（协议允许服务端不回包）。
+                    state.is_visible(*index)
+                        && app.window(*id).is_some_and(|window| window.has_renderer())
+                })
                 .collect();
             // 已关闭的窗口不再补帧（推迟项跟随窗口生命周期）。
             deferred_frames.retain(|id| state.window_index(*id).is_some());
@@ -349,13 +391,27 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                 Some(due) => timeout.min(due),
                 None => timeout,
             };
+            // R10-2：无输入法守护进程的降级判定要看时间 —— 把等待压到判定时刻，否则
+            // 「enable 之后一直没人说话」这个状态要等下一个无关事件才被发现（用户在那之前
+            // 一个字符都打不出来）。
+            let timeout = match state.next_ime_degrade_in(Instant::now()) {
+                Some(due) => timeout.min(due),
+                None => timeout,
+            };
             // 应用自己关窗（Esc / 标题栏关闭按钮）后不能停在下面 1h 的空闲等待里。
             if app.windows().next().is_none() {
                 return Ok(());
             }
+            // R10-16：运行期 `calloop` 失败按 `IoError` 分类 —— `EPIPE` 是合成器消失、
+            // `EPROTO`（`calloop-wayland-source` 把协议错误/坏消息都转成这个 errno）是客户端
+            // bug。两者对用户的提示与对 CI 的意义完全不同，不能再折叠成 `AppInit`。
             event_loop
                 .dispatch(timeout, &mut state)
-                .map_err(|error| EngineError::AppInit {
+                .map_err(|error| EngineError::Wayland {
+                    kind: match &error {
+                        calloop::Error::IoError(io) => WaylandErrorKind::from_io_error(io),
+                        _ => WaylandErrorKind::Protocol,
+                    },
                     detail: smol_str::format_smolstr!("calloop dispatch: {error}"),
                 })?;
         }
@@ -365,6 +421,41 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
     // 可失败步骤（含运行期建窗 / 出帧）都经过这条路径。
     drop(app);
     result
+}
+
+/// 把一个剪贴板写出任务注册成 calloop 的可写事件源（R10-17）。
+///
+/// 为什么不是「写线程」或「阻塞写」：
+/// - 阻塞写会在 UI 线程上停在 `write_all`：对端（刚启动的 Electron 应用等）不读时，整条事件
+///   循环停摆（没有帧、没有输入、没有协议事件）；
+/// - 写线程要多一个线程 + 一次所有权转移，且退出路径要 join；
+/// - calloop 的可写事件是**零线程**方案：epoll 说可写就写一片（≤ `PIPE_BUF`，管道上绝不
+///   阻塞），写完 `PostAction::Remove` 让事件源析构 ⇒ fd 关闭 ⇒ 对端读到 EOF。
+///
+/// 返回 `Err` 表示注册失败（源已被丢弃 ⇒ fd 关闭，对端读到 EOF，语义仍是协议允许的
+/// 「没有数据」）。
+fn register_pending_send(
+    handle: &calloop::LoopHandle<'static, WaylandState>,
+    pending: PendingSend,
+) -> Result<(), calloop::Error> {
+    let source =
+        calloop::generic::Generic::new(pending, calloop::Interest::WRITE, calloop::Mode::Level);
+    let inserted = handle.insert_source(source, |_, pending, _| {
+        match pending.write_more() {
+            // 还没写完：等下一次可写事件（Level 触发会让 epoll 继续报告）。
+            Ok(false) => Ok(calloop::PostAction::Continue),
+            // 写完 / 对端已关闭 / IO 错误：摘掉事件源，fd 随 `PendingSend` 的 drop 关闭。
+            Ok(true) | Err(_) => Ok(calloop::PostAction::Remove),
+        }
+    });
+    match inserted {
+        Ok(_token) => Ok(()),
+        Err(error) => {
+            // `InsertError` 把源还回来；丢掉它即可（`Drop` 关闭 fd）。
+            drop(error.inserted);
+            Err(error.error)
+        }
+    }
 }
 
 /// 把 `App` 的窗口集合同步到 Wayland 原生窗口、渲染器与 a11y adapter（P1-2.8 Stage C-2b）。
@@ -460,6 +551,8 @@ fn sync_windows(
         // `set_size` / `set_scale` 的 covering 只是平台真值写入前的估算；真实的 Wayland buffer
         // 尺寸（`round(逻辑 × scale)`）必须在这里写入（F-186 / V-122）。
         window.set_surface(physical);
+        // R10-4 / R10-15：首次写入 compositor 侧状态（装饰模式 / 最大化 / 全屏 / 可用能力）。
+        window.set_state(state.window_state(index));
         mirrors.push(WindowMirror { id, scale, size });
     }
     Ok(())

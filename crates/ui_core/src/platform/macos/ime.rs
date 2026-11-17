@@ -1,9 +1,11 @@
-//! IME 状态（`NSTextInputClient` 的组合串与提交去重，`design/phase-12-macos-linux.md` §7.5）。
+//! IME 状态（`NSTextInputClient` 的组合串 + 按键作用域的提交记账，
+//! `design/phase-12-macos-linux.md` §7.5）。
 //!
 //! `NSRange` 是 UTF-16 单位，因此组合串与选中范围都按 UTF-16 记录（提交时一次性转 `SmolStr`）。
-//! 提交去重的纯逻辑在平台无关的 [`crate::platform::ime::CommitDeduper`]（可在 Windows 上单测）。
+//! 提交去重与 `Text` 抑制的作用域记账在平台无关的
+//! [`crate::platform::ime::ImeCommitScope`] 里（可在开发机上单测）。
 
-use crate::platform::ime::CommitDeduper;
+use crate::platform::ime::{CommitVerdict, ImeCommitScope, KeyScopeToken};
 
 /// 一个窗口的 IME 状态（`GuiView` 的 ivars）。
 #[derive(Debug, Default)]
@@ -12,8 +14,8 @@ pub(crate) struct ImeState {
     marked: Vec<u16>,
     /// 组合串内的选中范围（`.location` / `.length`，UTF-16）。
     selected: (usize, usize),
-    /// 「一次按键」粒度的提交去重。
-    dedupe: CommitDeduper,
+    /// 按键作用域的提交记账（R09-3）：本按键的正文是否已由 IME 交付。
+    scope: ImeCommitScope,
 }
 
 impl ImeState {
@@ -45,9 +47,19 @@ impl ImeState {
         self.selected
     }
 
-    /// 一次新的按键开始：清掉「同一按键」的提交记忆（跨按键的相同文本是合法的）。
-    pub(crate) fn begin_key(&mut self) {
-        self.dedupe.begin_key();
+    /// 打开一次按键作用域（`keyDown:` 入口），返回用于后续查询/收尾的令牌。
+    pub(crate) fn begin_key(&mut self) -> KeyScopeToken {
+        self.scope.begin_key()
+    }
+
+    /// 关闭按键作用域：清空本按键的全部记账（RAII 守卫调用，panic 也会走到）。
+    pub(crate) fn end_key(&mut self, token: KeyScopeToken) {
+        self.scope.end_key(token);
+    }
+
+    /// 本作用域内是否已交付正文（`keyDown:` 据此抑制同一次按键的 `Text`）。
+    pub(crate) fn takes_text(&self, token: KeyScopeToken) -> bool {
+        self.scope.takes_text(token)
     }
 
     /// `setMarkedText:selectedRange:replacementRange:`（`text` 已是 UTF-16）。
@@ -58,8 +70,6 @@ impl ImeState {
         let location = selected.0.min(len);
         let length = selected.1.min(len - location);
         self.selected = (location, length);
-        // 组合态变化意味着「下一次提交」是新的内容。
-        self.dedupe.reset();
     }
 
     pub(crate) fn clear_marked(&mut self) {
@@ -67,9 +77,9 @@ impl ImeState {
         self.selected = (0, 0);
     }
 
-    /// 记录一次提交；返回 `false` 表示**同一次按键内**的重复回调（调用方应吞掉）。
-    pub(crate) fn note_commit(&mut self, text: &str) -> bool {
-        self.dedupe.note(text)
+    /// 记录一次提交并给出裁决（作用域内/外/重复，见 [`CommitVerdict`]）。
+    pub(crate) fn note_commit(&mut self, text: &str) -> CommitVerdict {
+        self.scope.note_commit(text)
     }
 }
 

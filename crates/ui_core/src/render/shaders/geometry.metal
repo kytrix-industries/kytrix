@@ -51,7 +51,7 @@ fragment float4 ps_ui(GeomVsOut in [[stage_in]],
     float coverage = aa_coverage(in.coverage);
     return apply_gamma(root.draw.color0 * coverage *
                        clip_mask(in.world_px, uint(root.draw.clip.x),
-                                 uint(KYTRIX_MAX_CLIP_DEPTH), clips));
+                                 uint(KYTRIX_MAX_CLIP_ITEMS), clips));
 }
 
 fragment float4 ps_textured_image(GeomVsOut in [[stage_in]],
@@ -62,7 +62,7 @@ fragment float4 ps_textured_image(GeomVsOut in [[stage_in]],
     float4 texel = image_atlas.sample(atlas_sampler, in.uv);
     float4 color = texel * root.draw.color0;
     return apply_gamma(color * clip_mask(in.world_px, uint(root.draw.clip.x),
-                                         uint(KYTRIX_MAX_CLIP_DEPTH), clips));
+                                         uint(KYTRIX_MAX_CLIP_ITEMS), clips));
 }
 
 fragment float4 ps_textured_glyph(GeomVsOut in [[stage_in]],
@@ -73,5 +73,5 @@ fragment float4 ps_textured_glyph(GeomVsOut in [[stage_in]],
     float coverage = glyph_atlas.sample(atlas_sampler, in.uv).r;
     float4 color = root.draw.color0 * coverage;
     return apply_gamma(color * clip_mask(in.world_px, uint(root.draw.clip.x),
-                                         uint(KYTRIX_MAX_CLIP_DEPTH), clips));
+                                         uint(KYTRIX_MAX_CLIP_ITEMS), clips));
 }

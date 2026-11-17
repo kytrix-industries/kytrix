@@ -7,6 +7,7 @@ pub(crate) mod clipboard;
 pub(crate) mod composition;
 pub(crate) mod dpi;
 pub(crate) mod event_loop;
+pub(crate) mod frame_clock;
 pub(crate) mod ime;
 pub(crate) mod window;
 

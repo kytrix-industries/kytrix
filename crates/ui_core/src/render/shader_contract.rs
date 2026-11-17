@@ -193,6 +193,14 @@ const TYPE_ALIASES: &[(&str, &str)] = &[
     ("float", "f"),
     ("uint", "u"),
     ("int", "i"),
+    // 导数：GLSL `dFdx`/`dFdy`、HLSL `ddx`/`ddy`、MSL `dfdx`/`dfdy` 是同一个指令
+    // （token 已被 tokenizer 小写成 `dfdx`/`dfdy`）。AR2 P3-③：归一化必须覆盖等价改写，
+    // 否则合法重写会卡构建。
+    ("dfdx", "ddx"),
+    ("dfdy", "ddy"),
+    // `lerp(a, b, t)` 与 `mix(a, b, t)` 在 HLSL/MSL/GLSL 里逐位等价（HLSL 的 `lerp` 与
+    // GLSL 的 `mix` 都定义为 `a + (b - a) * t`）—— `contract.md` §1 的归一化承诺。
+    ("lerp", "mix"),
 ];
 
 /// 归一化时丢弃的修饰关键字（不影响数学）。
@@ -653,6 +661,101 @@ mod tests {
         // MSL 同样要等价（`inline` 修饰被抹平、`root.` 前缀被抹平）。
         let msl = metal("inline float g() {\n  return root.frame.params.x;\n}\n");
         assert!(compare_function(&left, &msl, "g").is_ok());
+    }
+
+    /// AR2 P3-③：`lerp ↔ mix` 与三语言的导数拼写必须被归一化（等价改写不得误报）。
+    #[test]
+    fn equivalent_rewrites_normalize_away() {
+        let hlsl = hlsl(
+            "float f(float t, float2 a, float2 b, float d) {\n  float w = length(float2(ddx(d), ddy(d)));\n  return lerp(a, b, t).x + mix(t, w, 0.5);\n}\n",
+        );
+        let glsl = glsl(
+            "float f(float t, vec2 a, vec2 b, float d) {\n  float w = length(vec2(dFdx(d), dFdy(d)));\n  return mix(a, b, t).x + lerp(t, w, 0.5);\n}\n",
+        );
+        assert!(
+            compare_function(&hlsl, &glsl, "f").is_ok(),
+            "lerp/mix 与 ddx/dfdx 是等价改写，归一化后必须相同"
+        );
+        let msl = metal(
+            "inline float f(float t, float2 a, float2 b, float d) {\n  float w = length(float2(dfdx(d), dfdy(d)));\n  return lerp(a, b, t).x + mix(t, w, 0.5);\n}\n",
+        );
+        assert!(compare_function(&hlsl, &msl, "f").is_ok());
+    }
+
+    /// AR2 P1-A / P2-① 的语义锁：三份源码的等价性由 `build.rs` 守着，但「三份一起改错」
+    /// 只有这里能抓住 —— 对**真实** shader 源码做归一化后的结构断言。
+    ///
+    /// - `analytic_shadow` 必须是**完整的可分离高斯**：每轴两条 `shadow_cdf`（近边 + 对边），
+    ///   共 5 处（旧实现只有近边 3 处 ⇒ 小元素四周多出一圈不存在的光晕）；
+    /// - `clip_mask` 必须按 `meta.y` 分流，且 `aa_coverage` **只出现一次**（只有圆角项参与
+    ///   AA 相乘；矩形项是 0/1 scissor —— 否则同边界的矩形 + 圆角 clip 得到 0.25 暗边）；
+    /// - `aa_coverage` 的带宽必须是梯度模长 `length(ddx, ddy)`，不是 `|ddx| + |ddy|`
+    ///   （后者让对角边带宽变成 1.41 px）。
+    #[test]
+    fn the_math_contract_keeps_the_two_sided_shadow_and_the_scissor_clip() {
+        let source = ShaderSource::new(
+            Language::Glsl,
+            vec![
+                (
+                    "common.glsl".to_owned(),
+                    include_str!("shaders/common.glsl").to_owned(),
+                ),
+                (
+                    "common.frag.glsl".to_owned(),
+                    include_str!("shaders/common.frag.glsl").to_owned(),
+                ),
+            ],
+        );
+
+        let shadow: Vec<String> = normalized_body(&source, "analytic_shadow")
+            .expect("analytic_shadow 必须可解析")
+            .into_iter()
+            .map(|statement| statement.text)
+            .collect();
+        let body = shadow.join("; ");
+        assert_eq!(
+            body.matches("shadow_cdf(").count(),
+            5,
+            "可分离高斯必须包含两条对边项（每轴 2 条 + SDF 1 条）：{body}"
+        );
+        assert_eq!(
+            body.matches("+ half_size").count(),
+            2,
+            "两条对边项（x/y 轴各一条）必须存在：{body}"
+        );
+
+        let clip: Vec<String> = normalized_body(&source, "clip_mask")
+            .expect("clip_mask 必须可解析")
+            .into_iter()
+            .map(|statement| statement.text)
+            .collect();
+        let body = clip.join("; ");
+        assert!(
+            body.contains("kytrix_clip_kind_rounded"),
+            "clip_mask 必须按 meta.y 区分矩形 / 圆角项（标识符在归一化时小写）：{body}"
+        );
+        assert_eq!(
+            body.matches("aa_coverage(").count(),
+            1,
+            "aa_coverage 只能乘一次（矩形项是 0/1 scissor）：{body}"
+        );
+        // 4 处是矩形项的像素单元比较（x/y 各 ±0.5），第 5 处是圆角项的 `zw * 0.5`（half_size）。
+        assert_eq!(
+            body.matches("0.5").count(),
+            5,
+            "矩形项需要四个 ±0.5 px 的像素单元比较：{body}"
+        );
+
+        let aa: Vec<String> = normalized_body(&source, "aa_coverage")
+            .expect("aa_coverage 必须可解析")
+            .into_iter()
+            .map(|statement| statement.text)
+            .collect();
+        let body = aa.join("; ");
+        assert!(
+            body.contains("length(v2(ddx(d), ddy(d)))"),
+            "AA 带宽必须是梯度模长：{body}"
+        );
     }
 
     /// 数学差异必须被抓住，并指到正确语句（含行号）。

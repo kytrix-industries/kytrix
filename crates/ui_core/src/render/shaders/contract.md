@@ -18,7 +18,7 @@
 | offset  | 字节 | 字段            | 类型                          | 语义                                                                                     |
 |---------|------|-----------------|-------------------------------|------------------------------------------------------------------------------------------|
 | **0**   | 16   | `bounds`        | `[f32;4]` / `float4` / `vec4` | `x, y, w, h`：SDF 图元为**物理像素、未取整浮点**；图集图元为**整数矩形的浮点表示**       |
-| 16      | 16   | `corner_radius` | 同上                          | `tl, tr, br, bl`（物理像素，逐角 `<= min(w,h)/2`；编码器按 CSS 规则 clamp，shader 再有同样的防御性 clamp） |
+| 16      | 16   | `corner_radius` | 同上                          | `tl, tr, br, bl`（物理像素）。规范化是**两步**：① CSS Backgrounds §5.5 的比例缩放（相邻两角半径之和超过边长 ⇒ 全部半径乘 `f = min(side/Σr)`）；② SDF 合法域 clamp `r <= min(w,h)/2`。shader 里保留 ② 作为防御性 clamp |
 | 32      | 16   | `color0`        | 同上                          | **linear premultiplied** sRGB RGBA：实色 / 渐变起色 / 阴影色 / 字形色 / 图片调制色       |
 | 48      | 16   | `color1`        | 同上                          | 渐变终色 **或** 边框色（互斥）；无则全 0                                                 |
 | 64      | 16   | `params0`       | 同上                          | `border_width, shadow_blur, gradient_kind, aa_padding`（物理像素）                       |
@@ -37,8 +37,10 @@
    `(uint)x` / `uint(x)`。**禁止位重解释**：`asuint` / `asfloat` / `as_type<>` / `floatBitsToUint` / `floatBitsToInt` /
    `bitcast` 一律不得出现（f32 存的是数值，不是整数的位模式）。
 4. `params1.w` = **GPU 裁剪链的真实链长**（`clip_index` 指向的链上表项数，`0` = 无裁剪）：shader 用它
-   收口 `clip_mask` 的循环。链长 > `KYTRIX_MAX_CLIP_DEPTH` 时编码期直接返回
-   `EngineError::ClipDepthExceeded`，shader 不会静默少裁。`params1.y` 对非图集 kind 写 0 并忽略；
+   收口 `clip_mask` 的循环。链上恒为「至多一条矩形项 + k 条圆角项（k ≤ `KYTRIX_MAX_CLIP_DEPTH`）」，
+   因此链长上界是 `KYTRIX_MAX_CLIP_ITEMS = KYTRIX_MAX_CLIP_DEPTH + 1`；**圆角层数**超过
+   `KYTRIX_MAX_CLIP_DEPTH` 时编码期直接返回 `EngineError::ClipDepthExceeded`（矩形层不占该预算：
+   轴对齐矩形 clip 求交合并成一条，无损），shader 不会静默少裁。`params1.y` 对非图集 kind 写 0 并忽略；
    `uv` 对非图集 kind 写 0 并忽略；`color1` 无用途时写 0。
 5. `bounds.zw` 必须 `>= 0` 且有限（编码器保证）；shader 仍取 `max(bounds.zw, 0)` 作为防御性一致。
 
@@ -100,16 +102,23 @@ write_mask = R | G | B | A
 
 | 函数                                        | 语义（逐字实现）                                                                                                    |
 |---------------------------------------------|---------------------------------------------------------------------------------------------------------------------|
-| `sd_rounded_rect(p, half_size, radii)`      | 按象限取半径后 `r = clamp(r, 0, min(half_size.x, half_size.y))`（CSS 规则，防 `r > min/2` 时 SDF 反向「越裁越大」）；`q = abs(p) - half_size + r`；`min(max(q.x,q.y),0) + length(max(q,0)) - r` |
-| `aa_coverage(d)`                            | `w = max(fwidth(d), 1e-5); saturate(0.5 - d / w)`（1 px 解析 AA，`d` 单位 = 物理像素）                              |
+| `sd_rounded_rect(p, half_size, radii)`      | 按象限取半径后 `r = clamp(r, 0, min(half_size.x, half_size.y))`（**SDF 合法域**，防 `r > min/2` 时 SDF 反向「越裁越大」；CSS 的比例缩放在编码期做，见 §1）；`q = abs(p) - half_size + r`；`min(max(q.x,q.y),0) + length(max(q,0)) - r` |
+| `aa_coverage(d)`                            | `w = max(length(ddx(d), ddy(d)), 1e-5); saturate(0.5 - d / w)`（1 px 解析 AA，`d` 单位 = 物理像素）。带宽取**梯度模长**（不是 `|ddx| + |ddy|`：后者让对角边的带宽变成 1.41 px） |
 | `shadow_cdf(x)`                             | `0.5 × (1 − erf(x × 0.70710678))` = 标准正态尾概率 Φ(−x)；`erf` 用 Abramowitz–Stegun 7.1.26                        |
-| `analytic_shadow(p, half_size, radii, blur)` | `σ = max(blur × 0.5, 0.35)`（CSS `box-shadow` 的模糊半径语义）；轴对齐矩形部分用**可分离**二维高斯 `Φ(−dx/σ)·Φ(−dy/σ)`（直角时的精确解），角部按「角部圆度 × r/(r+σ)」混合到 `Φ(−sdf/σ)`；`r = 0` 时退化为精确的分离式 |
+| `analytic_shadow(p, half_size, radii, blur)` | `σ = max(blur × 0.5, 0.35)`（CSS `box-shadow` 的模糊半径语义）；轴对齐矩形部分是**完整的可分离二维高斯**：一维因子 = 两条对边的尾概率之差 `shadow_cdf((|x|-h)/σ) − shadow_cdf((|x|+h)/σ)`（box ⊗ gaussian 的精确解，**不能**只取近边项），角部按「角部圆度 × r/(r+σ)」混合到 `Φ(−sdf/σ)`；`r = 0` 时退化为精确的分离式 |
 | `gradient_eval(kind, p, half_size, c0, c1)` | 线性 `(p.x+hx)/(2hx)`；垂直 `(p.y+hy)/(2hy)`；径向 `length(p)/min(hx,hy)`；`saturate(t)` 后 `lerp`（premultiplied） |
-| `clip_mask(world_px, clip_index, clip_depth)` | `clip_index == 0 ⇒ 1`；否则沿 `parent` 链跑 `min(clip_depth, 8)` 层；**任一层 `w <= 0 或 h <= 0` ⇒ 直接返回 0**（零尺寸 clip 全裁，不是 0.5 的鬼线）；`m *= aa_coverage(sd_rounded_rect(...))` |
+| `clip_mask(world_px, clip_index, clip_depth)` | `clip_index == 0 ⇒ 1`；否则沿 `parent` 链跑 `min(clip_depth, KYTRIX_MAX_CLIP_ITEMS=9)` 层；**任一层 `w <= 0 或 h <= 0` ⇒ 直接返回 0**（零尺寸 clip 全裁，不是 0.5 的鬼线）。按 `meta.y` 分两种语义：**矩形项**（`KYTRIX_CLIP_KIND_RECT`）= 像素精确 scissor，片元像素单元（±0.5 px，Skia 的 `roundOut`）与矩形无交 ⇒ 返回 0，**不参与 AA 相乘**；**圆角项**（`KYTRIX_CLIP_KIND_ROUNDED`）= `m *= aa_coverage(sd_rounded_rect(...))` |
 | `apply_gamma(c)`                            | v1 恒等（见 §3）                                                                                                    |
 
 `fwidth` 纪律：只在**实例级一致**的分支里调用（`kind` / `border_width` / `clip_index` 都是逐实例常量）。因此
 `clip_mask` **不做**逐片元 AABB 早退；被完全裁掉的实例由顶点着色器的 `clip_rect` 夹紧退化成零面积四边形解决。
+
+**clip 链的形状（R05-10 / AR2 P1-A）**：链上恒为「**至多一条矩形项**（链根）+ k 条圆角项
+（k ≤ `KYTRIX_MAX_CLIP_DEPTH`）」。全部轴对齐矩形 clip 在编码期**求交合并**成一条（无损），
+因此矩形层的覆盖率只有 0/1；圆角层才做解析 AA。完全相同的圆角层在编码期**去重**（交集幂等：
+`A ∩ A = A`，重复层再乘一次覆盖率恒为错）。链长上界 = `KYTRIX_MAX_CLIP_ITEMS = MAX_CLIP_DEPTH + 1`
+（矩形项不占圆角预算：`Canvas::push_clip` 与编码器都按 `MAX_CLIP_DEPTH` 计圆角层数，所以
+「8 层圆角 + 祖先矩形 clip」合法）；圆角层数超限时编码期返回 `EngineError::ClipDepthExceeded`。
 
 ## 5. 顶点外扩、坐标与 NDC
 
@@ -186,7 +195,7 @@ API 的硬件实例基址语义**互不相同**：
 |--------|-----------------|----------------------------------------------|
 | 0      | `rect`          | 本层 clip `x, y, w, h`（物理像素）           |
 | 16     | `corner_radius` | `tl, tr, br, bl`（物理像素）                 |
-| 32     | `meta`          | `.x = parent`（0 = 无裁剪），`.yzw` 保留恒 0 |
+| 32     | `meta`          | `.x = parent`（0 = 无裁剪），`.y = KYTRIX_CLIP_KIND_RECT / KYTRIX_CLIP_KIND_ROUNDED`，`.zw` 保留恒 0 |
 
 **哨兵陷阱**：CPU 表项 0 的 `aabb = [f32::MIN, f32::MIN, f32::MAX, f32::MAX]` 按其 `(x,y,w,h)` 语义算出的右/下边界是
 `MIN+MAX = 0`，**不是**无穷大矩形。任何对 `clip_rect` 的算术都必须在 `clip_index != 0` 时进行；表项 0 不得被读取。
@@ -220,9 +229,17 @@ geometry 顶点布局（P02 §9.4 冻结）：
 | `Textured { atlas }` | 16 B   | `position: float2` + `uv: float2`（归一化到对应图集页） |
 
 `Ui` 的解析 AA（R05-6）：网格沿形状边界向外扩约 1 物理像素并携带覆盖率距离，片元
-`aa_coverage(coverage × DPI)` 得到覆盖率 —— 与 Skia 的 AA 三角化同一模型，**不依赖 MSAA**
-（三后端一致，无 multisample 目标 / resolve 附件）。`Textured` 没有覆盖率属性，其顶点写
-`KYTRIX_AA_INSIDE` 让覆盖率为 1。
+`aa_coverage(coverage × DPI)` 得到覆盖率 —— **不依赖 MSAA**（三后端一致，无 multisample 目标 /
+resolve 附件）。`Textured` 没有覆盖率属性，其顶点写 `KYTRIX_AA_INSIDE` 让覆盖率为 1。
+
+**覆盖率网格契约（AR2 P2-③，应用侧必须满足）**：顶点携带的是**单个标量**有符号距离，
+因此每顶点只能表达一个梯度方向。要让 AA 带宽恒为 1 px、且不出现「尖角削角 / 共享边双重混合」，
+应用生成的覆盖率网格必须满足：①距离场沿法向 **|∇d| = 1**（线性近似，禁止在 AA 带内插值非线性
+距离）；②AA 带三角形**互不重叠**（相邻三角形共享边时覆盖率只由一侧写入，否则 0.5 ⊕ 0.5 = 0.75
+出现暗线）；③尖角处按 Skia `GrAATriangulator` 的做法为每条边生成独立外扩三角形（顶点携带不同
+覆盖率），而不是复用同一个顶点标量。引擎**不做** tessellation；不满足上述条件的网格不会报错，
+只会出现上面列出的走样。这与「与 Skia 的 AA 三角化一致」的旧表述不同：Skia 在 CPU 侧完成了
+三角化 + 覆盖率顶点生成，本引擎把它交给应用。
 
 ### 呈现色彩空间（R06-10）
 

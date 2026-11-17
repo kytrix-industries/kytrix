@@ -3,7 +3,7 @@
 //! 与 [`crate::render::atlas::AtlasAllocator`] 的分工：本模块**做缓存 + 驱动光栅**，分配器只做装箱 +
 //! 脏行 + 代际。图集 `clear()` 后必须同步 [`GlyphAtlas::clear`]（两级缓存同事务换代）。
 //!
-//! # 容量策略：逐 tile LRU，永不失败（R12-1，对齐 Skia `SkStrikeCache` / WebRender `GlyphCache`）
+//! # 容量策略：逐 tile LRU，不丢帧（R12-1，对齐 Skia `SkStrikeCache` / WebRender `GlyphCache`）
 //!
 //! 旧实现只有两条出路：单页分配成功，或「已到 2048² ⇒ **清空全部** ⇒ 同一 pass 内再填满 ⇒
 //! 再清空」，后者在两轮换代后返回 `EngineError::TextShape` ⇒ 整帧被丢弃 ⇒ 文本永久停止刷新。
@@ -11,11 +11,17 @@
 //!
 //! 1. **阶梯扩容**：512 → 1024 → 2048（保留原有行为，换代递增 `generation`，调用方重跑 pass）；
 //! 2. **逐 tile LRU 淘汰**：到 2048² 上限后按 `last_used_pass` 升序释放最旧的 tile 并重试。
-//!    本帧用过的 tile（`last_used_pass == 当前 pass`）**永不淘汰**，因此淘汰不会破坏本 pass
-//!    已生成的 `ShapedLine`；
-//! 3. **软失败**：整个页都是本帧的工作集 ⇒ 本次该字形**不画**（`skipped` + 诊断），下一帧再试。
-//!    tile 永远有效语义因此变成「本帧有效」，调用方（`App::layout_text`）在淘汰发生时重跑
-//!    pass 并让其它窗口重排。
+//!    **本 pass**（= 本窗口本帧的一次 `App::layout_text`）用过的 tile 不淘汰，因此淘汰不会破坏
+//!    本 pass 已生成的 `ShapedLine`。注意 `pass` 是**逐窗口**递增的：多窗口下同一帧里后跑的
+//!    窗口 pass 号更大，可以淘汰先跑窗口本帧刚用过的 tile —— 「tile 只在本 pass 内有效」就是
+//!    这个代价。`App::layout_text` 在淘汰发生时重跑本 pass，并让**其它窗口**在自己的下一帧
+//!    重排（见 `app/text_pass.rs` 的 `any_eviction` 收尾与 `repaint_text_if_atlas_changed`）；
+//! 3. **软失败**：整个页都是本 pass 的工作集 ⇒ 该字形**本帧不画**，但**不再静默**：
+//!    `GlyphAtlasStats::skipped` 上抛 `TextLayoutReport::skipped_glyphs`，每个节点每轮压一条
+//!    `TextDiagnostic::AtlasFull`，该节点的 `ShapedLine` 带「待重排」标记 ⇒ 下一帧必然重光栅
+//!    重试。连续 [`ATLAS_FULL_ESCALATION_FRAMES`] 个 pass 仍有软失败，则升级为
+//!    `EngineError::AtlasExhausted`（`AtlasKind::Glyph`）—— 可见失败优于静默缺字；计数随即
+//!    清零，避免容量长期不足时每帧都报错。
 //!
 //! 逐 tile 释放不递增 `generation`（只由扩容/整页重建递增）：`generation` 的语义是「页尺寸/
 //! 整页内容换代」，与单个 tile 的生死无关。被淘汰 tile 的矩形由**分配器的脏行**覆盖
@@ -93,7 +99,7 @@ pub(crate) struct GlyphTile {
     pub color: bool,
 }
 
-/// 缓存统计（喂 `TextPassReport`）。
+/// 缓存统计（`App::layout_text` 按节点累加进 `TextLayoutReport`）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct GlyphAtlasStats {
     pub hits: usize,
@@ -102,9 +108,17 @@ pub(crate) struct GlyphAtlasStats {
     pub rebuilds: usize,
     /// 逐 tile LRU 淘汰的字形数（R12-1）。
     pub evictions: usize,
-    /// 因「整页都是本帧工作集」而跳过的字形数（软失败，下一帧重试）。
+    /// 因「整页都是本帧工作集」而跳过的字形数（软失败，下一帧重试；**不进** `missing` 负缓存）。
     pub skipped: usize,
 }
+
+/// 连续多少个文本 pass 仍以「软失败」收尾后，升级为可见错误
+/// [`EngineError::AtlasExhausted`]（`AtlasKind::Glyph`）。
+///
+/// 3 ≈ 3 帧：一次性抖动（工作集瞬时变大 / 前一帧刚淘汰）能自行恢复；连续 3 个 pass 都放不下
+/// 说明容量确实不够 —— 此时静默缺字不可接受（R12-1 的「可见失败优于静默」），宁可让调用方
+/// 丢弃那一帧并上报。判据由 [`GlyphAtlas::note_soft_fail`] 维护。
+pub(crate) const ATLAS_FULL_ESCALATION_FRAMES: u32 = 3;
 
 pub(crate) struct GlyphAtlas {
     records: ahash::HashMap<GlyphKey, GlyphRecord>,
@@ -118,6 +132,9 @@ pub(crate) struct GlyphAtlas {
     pass: u32,
     /// 自上次 [`GlyphAtlas::take_evicted`] 以来被淘汰的 tile 数。
     evicted: u32,
+    /// 连续多少个文本 pass 以「软失败」收尾（[`GlyphAtlas::note_soft_fail`] 维护；一次
+    /// `skipped == 0` 的 pass 清零，达到 [`ATLAS_FULL_ESCALATION_FRAMES`] 时抛出错误并清零）。
+    consecutive_soft_fail_passes: u32,
 }
 
 impl GlyphAtlas {
@@ -129,12 +146,42 @@ impl GlyphAtlas {
             cleared: false,
             pass: 0,
             evicted: 0,
+            consecutive_soft_fail_passes: 0,
         }
     }
 
-    /// 开始一次文本 pass：本 pass 用到的 tile 记 `last_used_pass = pass`，且**永不淘汰**。
+    /// 开始一次文本 pass：本 pass 用到的 tile 记 `last_used_pass = pass`，且在本 pass 内不可淘汰。
+    ///
+    /// `pass` 由**每个窗口每帧**的一次 `App::layout_text` 递增（不是进程级帧号）：同一帧里后跑
+    /// 的窗口 pass 号更大，可以淘汰先跑窗口本 pass 用过的 tile —— 这是「tile 只在本 pass 内
+    /// 有效」的语义，见模块文档第 2 级降级。
     pub(crate) fn begin_pass(&mut self) {
         self.pass = self.pass.wrapping_add(1);
+    }
+
+    /// 一次文本 pass 结束后的软失败记账（R12-1：可见失败优于静默缺字）。
+    ///
+    /// `skipped` = 本 pass **最后一轮重跑**仍没画出的字形数（`0` = 该放下的都放下了）。
+    /// 连续 [`ATLAS_FULL_ESCALATION_FRAMES`] 个 pass 都非零 ⇒ 返回
+    /// [`EngineError::AtlasExhausted`] 并把计数清零：容量真的不够时让失败可见，但不是此后
+    /// 每帧都报错（调用方丢弃那一帧，下一帧仍会尝试恢复）。
+    ///
+    /// 计数放在图集上而不是 `App` 上：图集是**进程级**共享的，软失败也是图集级状态，而
+    /// `GlyphAtlas` 不持有窗口身份。因此任一窗口的一次干净 pass 都会清零 —— 那一次 pass 确实
+    /// 把该放下的字形都放下了。
+    pub(crate) fn note_soft_fail(&mut self, skipped: usize) -> Result<(), EngineError> {
+        if skipped == 0 {
+            self.consecutive_soft_fail_passes = 0;
+            return Ok(());
+        }
+        self.consecutive_soft_fail_passes = self.consecutive_soft_fail_passes.saturating_add(1);
+        if self.consecutive_soft_fail_passes >= ATLAS_FULL_ESCALATION_FRAMES {
+            self.consecutive_soft_fail_passes = 0;
+            return Err(EngineError::AtlasExhausted {
+                kind: AtlasKind::Glyph,
+            });
+        }
+        Ok(())
     }
 
     /// 取走「自上次调用以来淘汰了多少 tile」（淘汰会让旧 `ShapedLine` 的 UV 失效，
@@ -153,7 +200,10 @@ impl GlyphAtlas {
     /// `subpixel_x` 是水平相位桶（`0..raster::SUBPIXEL_PHASES`），参与缓存键：同一字形的不同
     /// 相位必须各占一个 tile，否则亚像素定位会被 tile 复用抹平。
     ///
-    /// **永不失败**（R12-1）：最坏情况是返回 `Ok(None)`（本帧跳过该字形）。
+    /// **永不失败**（R12-1）：最坏情况是返回 `Ok(None)`（本帧跳过该字形）。两种 `None` 语义
+    /// 不同：字体确实没有该字形 ⇒ 写 `missing` 负缓存、之后永久跳过；图集整页都是本帧工作集
+    /// ⇒ `stats.skipped += 1`、**不写**负缓存，由 `App::layout_text` 上抛统计 + 诊断 + 重排，
+    /// 下一帧重试。
     pub(crate) fn ensure(
         &mut self,
         raster: &mut GlyphRasterizer,
@@ -218,8 +268,10 @@ impl GlyphAtlas {
         let content = (width, height);
         let allocation = self.allocate_with_eviction(atlas, content);
         let Some(allocation) = allocation else {
-            // 3) 软失败：整页都是本帧工作集 ⇒ 本帧少画这个字形（下一帧再试）。
-            //    绝不返回错误：图集容量压力不该让整帧失效（R12-1 的硬要求）。
+            // 3) 软失败：整页都是本帧工作集 ⇒ 本帧少画这个字形（**不进**负缓存，下一帧重试）。
+            //    绝不返回错误：图集容量压力不该让整帧失效（R12-1 的硬要求）；可观测性与恢复
+            //    由 `stats.skipped` → `TextLayoutReport::skipped_glyphs` / `AtlasFull` 诊断 /
+            //    待重排标记，以及连续帧的 `EngineError::AtlasExhausted` 升级承担（见模块文档）。
             self.stats.skipped += 1;
             return Ok(None);
         };
@@ -368,7 +420,10 @@ impl GlyphAtlas {
         self.records.get(&key).map(|record| record.data.as_ref())
     }
 
-    /// 取走统计（累加进 `TextPassReport` 后清零）。
+    /// 取走统计（`App::layout_text` 按节点累加进 `TextLayoutReport` 后清零）。
+    ///
+    /// **单一消费者**语义：光栅只发生在第二阶段（`layout_text`），第一阶段（`refresh_text`）
+    /// 取到的永远是空统计。
     pub(crate) fn take_stats(&mut self) -> GlyphAtlasStats {
         core::mem::take(&mut self.stats)
     }
@@ -410,7 +465,7 @@ fn write_record_rows(page: &mut [u8], page_width: u32, record: &GlyphRecord, row
 
 #[cfg(test)]
 mod tests {
-    use super::{GlyphAtlas, GlyphAtlasStats, GlyphKey, ppem_key};
+    use super::{ATLAS_FULL_ESCALATION_FRAMES, GlyphAtlas, GlyphAtlasStats, GlyphKey, ppem_key};
     use crate::{
         paint::atlas::AtlasKind,
         render::AtlasAllocator,
@@ -840,6 +895,124 @@ mod tests {
         assert_eq!(
             protected.tile, protected_again.tile,
             "本 pass 用过的 tile 不得被淘汰（否则本帧早先的 ShapedLine 会画错）"
+        );
+    }
+
+    /// P1-① / R12-1：容量不足时的软失败只是**本帧**跳过 —— 既不写 `missing` 负缓存（否则该
+    /// 字形在之后所有 pass 都永久不画），也不妨碍下一个 pass 把它真正放进图集。
+    ///
+    /// 用 32² 的小页把「整页都是本 pass 工作集」这一支真实触发出来（`cap_page_for_test` 钉死
+    /// 上限，`grow` 无处可扩）。
+    #[test]
+    fn a_full_page_soft_fails_but_never_poisons_the_glyph_cache() {
+        let Some(font) = probe_font() else {
+            eprintln!("skip: no system font available");
+            return;
+        };
+        let mut raster = GlyphRasterizer::new();
+        let mut atlas = AtlasAllocator::with_page(AtlasKind::Glyph, (32, 32));
+        atlas.cap_page_for_test(32);
+        let mut glyphs = GlyphAtlas::new();
+
+        // pass 1：把页塞满（16 ppem 的字形 padded 约 14×16 ⇒ 32² 只放得下几块），直到本 pass
+        // 自己就再也放不下 —— 此时淘汰候选为空（所有 tile 都是本 pass 的）。
+        glyphs.begin_pass();
+        let mut blocked = None;
+        for glyph_id in 36..96u32 {
+            let _tile = glyphs
+                .ensure(&mut raster, &mut atlas, &font, glyph_id, 16.0, 0, None)
+                .expect("容量压力绝不能变成 `ensure` 的错误");
+            let stats = glyphs.take_stats();
+            if stats.skipped > 0 {
+                blocked = Some((glyph_id, stats));
+                break;
+            }
+        }
+        let (blocked, stats) = blocked.expect("32² 的页必须被本 pass 的工作集占满");
+        assert_eq!(stats.skipped, 1);
+        assert_eq!(
+            stats.rasters, 1,
+            "软失败的字形必须先光栅（`skipped <= rasters` 的前提）"
+        );
+
+        // 同一 pass 再要一次：仍然 skip（本 pass 的 tile 不淘汰），而且**重新光栅** —— 这正是
+        // 「没写进 missing 负缓存」的证据：负缓存命中时 misses/rasters 都会是 0。
+        assert!(
+            glyphs
+                .ensure(&mut raster, &mut atlas, &font, blocked, 16.0, 0, None)
+                .expect("no error")
+                .is_none()
+        );
+        let again = glyphs.take_stats();
+        assert_eq!(
+            (again.misses, again.rasters, again.skipped),
+            (1, 1, 1),
+            "软失败不得进 `missing` 负缓存（stats: {again:?}）"
+        );
+
+        // pass 2：上一 pass 的 tile 变成可淘汰 ⇒ 同一个字形这次真的放得下。
+        glyphs.begin_pass();
+        let tile = glyphs
+            .ensure(&mut raster, &mut atlas, &font, blocked, 16.0, 0, None)
+            .expect("no error")
+            .expect("下一 pass 必须补上这个字形（软失败不是永久污染）");
+        let next = glyphs.take_stats();
+        assert_eq!(next.skipped, 0, "淘汰腾位置后不再软失败");
+        assert!(
+            next.evictions > 0,
+            "必须靠逐 tile LRU 淘汰腾位置（stats: {next:?}）"
+        );
+        assert_eq!(tile.tile.generation, atlas.generation());
+        let key = GlyphKey {
+            font: super::FontKey::of(&font, raster.font_epoch()),
+            glyph: blocked,
+            ppem_q: ppem_key(16.0),
+            subpixel_x: 0,
+            variation: 0,
+        };
+        assert!(
+            glyphs.coverage(key).is_some(),
+            "补上的字形必须真的进了缓存（可读回覆盖度）"
+        );
+        assert!(
+            !glyphs.missing.contains(&key),
+            "软失败的字形永远不能出现在负缓存里"
+        );
+    }
+
+    /// P1-① 的可见失败兜底：连续 [`ATLAS_FULL_ESCALATION_FRAMES`] 个 pass 都软失败才升级为
+    /// [`EngineError::AtlasExhausted`]；中间有一次干净 pass（`skipped == 0`）就清零；升级后
+    /// 计数也清零（避免容量长期不足时每帧都报错）。
+    #[test]
+    fn consecutive_soft_fail_passes_escalate_to_atlas_exhausted() {
+        let mut glyphs = GlyphAtlas::new();
+        for pass in 1..ATLAS_FULL_ESCALATION_FRAMES {
+            assert!(
+                glyphs.note_soft_fail(2).is_ok(),
+                "第 {pass} 个连续软失败 pass 还没到阈值"
+            );
+        }
+        // 一次干净 pass 必须清零：下一轮重新从 1 数。
+        assert!(glyphs.note_soft_fail(0).is_ok());
+        for _ in 1..ATLAS_FULL_ESCALATION_FRAMES {
+            assert!(
+                glyphs.note_soft_fail(1).is_ok(),
+                "一次干净 pass 之后必须重新计数"
+            );
+        }
+        let error = glyphs
+            .note_soft_fail(1)
+            .expect_err("连续软失败达到阈值必须升级为 EngineError::AtlasExhausted");
+        assert!(matches!(
+            error,
+            crate::error::EngineError::AtlasExhausted {
+                kind: AtlasKind::Glyph
+            }
+        ));
+        // 升级时清零：紧随其后的一个软失败 pass 不能立刻再报错。
+        assert!(
+            glyphs.note_soft_fail(1).is_ok(),
+            "升级后必须清零，避免每帧都报错"
         );
     }
 }

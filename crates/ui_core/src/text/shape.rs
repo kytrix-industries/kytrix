@@ -23,6 +23,10 @@
 //! `TextStyle::{max_lines, overflow}` 在光栅之后按 CSS 语义应用：`max_lines` 截掉多余行，
 //! `overflow: Ellipsis` 在**最后一个可见行**上按「保留前缀 + 省略号」重排（省略号的 advance
 //! 计入可用宽度，与 Chrome `LayoutNG` / Flutter `TextOverflow.ellipsis` 一致）。
+//!
+//! **布局尺寸与绘制同源**（P1-④）：`measure` 返回的高度走**同一套 clamp**
+//! （`Σ_{i < min(max_lines, 行数)} line_height_i`，见 [`ShapedText::measure`]），
+//! 因此 taffy 拿到的尺寸 == `rasterize` 产出的 `ShapedLine::height`，不会按全文行数留白。
 
 use std::{
     borrow::Cow,
@@ -134,12 +138,15 @@ struct ParleySnapshot {
 
 impl ParleySnapshot {
     /// 建快照：max-content 断一次、`widths.min` 再断一次（各记录实测尺寸），最后回到 max-content。
-    fn new(mut layout: parley::Layout<ColorBrush>) -> Self {
+    ///
+    /// `max_lines` 来自 shape 期的样式（同一快照的 `style` 不变）：两处 `height` 直接存
+    /// **钳制后**的可见高度，于是 `measure` 的 Min/MaxContent 只需读字段（O(1)）。
+    fn new(mut layout: parley::Layout<ColorBrush>, max_lines: Option<u16>) -> Self {
         layout.break_all_lines(None);
-        let max_size = Size::new(layout.width(), layout.height());
+        let max_size = Size::new(layout.width(), visible_height(&layout, max_lines));
         let widths = layout.calculate_content_widths();
         layout.break_all_lines(Some(widths.min));
-        let min_size = Size::new(layout.width(), layout.height());
+        let min_size = Size::new(layout.width(), visible_height(&layout, max_lines));
         layout.break_all_lines(None);
         Self {
             layout,
@@ -150,8 +157,12 @@ impl ParleySnapshot {
         }
     }
 
-    /// 就地断行 + 对齐，返回 `(width, height)`（逻辑像素）。
-    fn break_and_align(&mut self, width: Option<f32>, alignment: Alignment) -> (f32, f32) {
+    /// 就地断行 + 对齐，返回内容宽（逻辑像素）。
+    ///
+    /// **不返回高度**：`measure` 要的是按 `max_lines` 钳制后的可见高度（[`visible_height`]），
+    /// 而 `rasterize` 的高度由 `apply_overflow` 在截断后重算 —— 两个消费者都不需要这里的
+    /// 原始 `Layout::height()`，返回它只会招来一个与 clamp 脱钩的读者。
+    fn break_and_align(&mut self, width: Option<f32>, alignment: Alignment) -> f32 {
         let key = width.map(f32::to_bits);
         if self.broken_at != key {
             self.layout.break_all_lines(width);
@@ -163,8 +174,36 @@ impl ParleySnapshot {
             self.layout.align(alignment, AlignmentOptions::default());
             self.aligned_at = Some(align_key);
         }
-        (self.layout.width(), self.layout.height())
+        self.layout.width()
     }
+
+    /// 当前断行状态下的可见高度（与 `min_size` / `max_size` 用的是同一公式）。
+    fn visible_height(&self, max_lines: Option<u16>) -> f32 {
+        visible_height(&self.layout, max_lines)
+    }
+}
+
+/// `max_lines` 钳制后的可见高度：`Σ_{i < min(max_lines, 行数)} line_height_i`（逻辑像素）。
+///
+/// 与 `rasterize` → `apply_overflow` 的 clamp **同构**：那里先 `lines.truncate(max_lines)`、
+/// 再对保留行的 `line_height` 求和；这里对同一份 parley 布局的前 N 行求和。行高取每行真实的
+/// `LineMetrics::line_height` —— 行内盒 / 混排字体让每行高度不同，不能用「可见行数 × 单一
+/// line_height」。
+///
+/// 不截断（`max_lines` 为 `None` 或 ≥ 行数）时返回 parley 的 `Layout::height()`：保持既有
+/// measure 语义（f64 累加、且不计「文本末尾强制换行产生的空行」），也避免多扫一遍行。
+fn visible_height(layout: &parley::Layout<ColorBrush>, max_lines: Option<u16>) -> f32 {
+    let Some(max_lines) = max_lines else {
+        return layout.height();
+    };
+    let lines = layout.lines();
+    if lines.len() <= usize::from(max_lines) {
+        return layout.height();
+    }
+    lines
+        .take(usize::from(max_lines))
+        .map(|line| line.metrics().line_height)
+        .sum()
 }
 
 impl ShapedText {
@@ -201,7 +240,7 @@ impl ShapedText {
             text: content.text.clone(),
             style: style.clone(),
             font_stack_version,
-            kind: ShapedKind::Parley(RefCell::new(ParleySnapshot::new(layout))),
+            kind: ShapedKind::Parley(RefCell::new(ParleySnapshot::new(layout, style.max_lines()))),
             inline_diagnostics,
             inline_boxes: content.inline_boxes.clone(),
             measure_memo: RefCell::new(None),
@@ -248,6 +287,10 @@ impl ShapedText {
     }
 
     /// max-content 尺寸（逻辑像素）。
+    ///
+    /// **宽度**是全文不折行时的内容宽（`layout_text` 在「无内容宽」时拿它当回退宽度，
+    /// 只读 `.width`）；**高度**已按 `max_lines` 钳制 —— 它与 `measure(MaxContent)` 读的是
+    /// 同一份 `max_size` 字段，两者必须同语义，否则 taffy 与实际绘制会再次脱钩。
     pub(crate) fn max_content_size(&self) -> Size {
         match &self.kind {
             ShapedKind::Parley(snapshot) => snapshot.borrow().max_size,
@@ -256,6 +299,27 @@ impl ShapedText {
     }
 
     /// 按 taffy 语义测量（**零克隆**：Min/MaxContent 直接返回 shape 期实测值）。
+    ///
+    /// 返回值已应用与 `rasterize` → `apply_overflow` **同一套 clamp**（R12-9 / P1-④）：
+    ///
+    /// - **宽度**：`max_lines` / `overflow: Ellipsis` 都不改变宽度上界。省略号只是在最后一个
+    ///   可见行内做「保留前缀 + 省略号」的字形替换（`clip_with_ellipsis`），不会让内容宽超过
+    ///   原来的断行结果。Min/MaxContent 用 shape 期实测的内容宽，Definite 用该宽度下的断行宽。
+    /// - **高度**：`Σ_{i < min(max_lines, 行数)} line_height_i`（`max_lines` 为 `None` 时即全文）。
+    ///   行高取 parley 每行的 `LineMetrics::line_height` —— 行内盒 / 混排字体让各行高度不同，
+    ///   不能用「可见行数 × 单一 line_height」。该定义与 `apply_overflow` 末尾对截断后
+    ///   `Σ line.line_height` 的求和逐位同构，故 taffy 尺寸 == `ShapedLine::height`。
+    /// - `ShapedKind::Simple`（数字快路径）恒为**单行**：`TextStyle::max_lines()` 已把 0 映射成
+    ///   `None`，因此 `max_lines >= 1` ⇒ 可见行数 = 1 ⇒ 不截断，也永远不会把单行钳成 0；
+    ///   该路径直接返回 `simple.size()`，不经过任何 clamp 代码。
+    ///
+    /// O(1) 论证：Min/MaxContent 的钳制后尺寸在 shape 期（`ParleySnapshot::new` 的两次断行之后）
+    /// 算好并存进 `min_size`/`max_size`，`measure` 只读字段；Definite 路径本来就要断行（且按
+    /// 宽度 memo），钳制高度直接取**刚断完行的前 N 行**，不产生额外断行、也不做逐字符扫描。
+    /// 因此 taffy 的高频探测不会引入重复塑形（`measure_breaks` 计数器可证）。
+    ///
+    /// Definite 的 memo 只按宽度缓存：`max_lines` 属于 `ShapeKey` 的一部分，同一 `ShapedText`
+    /// 的 style 不会变，故缓存键不含它是正确的；memo 里存的就是**已钳制**的返回值。
     pub(crate) fn measure(
         &self,
         _known: taffy::Size<Option<f32>>,
@@ -264,6 +328,7 @@ impl ShapedText {
         if self.text.is_empty() {
             return Size::ZERO;
         }
+        let max_lines = self.style.max_lines();
         match &self.kind {
             ShapedKind::Simple(simple) => simple.size(),
             ShapedKind::Parley(snapshot) => match available.width {
@@ -284,9 +349,9 @@ impl ShapedText {
                         snapshot.min_size
                     } else {
                         self.measure_breaks.set(self.measure_breaks.get() + 1);
-                        let (measured_width, measured_height) =
+                        let measured_width =
                             snapshot.break_and_align(Some(width), Alignment::Start);
-                        Size::new(measured_width, measured_height)
+                        Size::new(measured_width, snapshot.visible_height(max_lines))
                     };
                     *self.measure_memo.borrow_mut() = Some((bits, size));
                     size
@@ -364,7 +429,7 @@ impl ShapedText {
             }
             ShapedKind::Parley(snapshot) => {
                 let mut snapshot = snapshot.borrow_mut();
-                let (width, _height) =
+                let width =
                     snapshot.break_and_align(Some(content_width.max(0.0)), align_of(alignment));
                 let (shaped, diagnostics) = rasterize_parley(
                     &snapshot.layout,
@@ -452,7 +517,7 @@ impl ShapedText {
         match &self.kind {
             ShapedKind::Parley(snapshot) => {
                 let mut snapshot = snapshot.borrow_mut();
-                let (_, _) = snapshot.break_and_align(Some(width.max(0.0)), Alignment::Start);
+                snapshot.break_and_align(Some(width.max(0.0)), Alignment::Start);
                 snapshot.layout.clone()
             }
             ShapedKind::Simple(_) => panic!("simple fast-path snapshots have no parley layout"),
@@ -1032,6 +1097,13 @@ mod tests {
         }
     }
 
+    /// 快照的 `(min-content, max-content)` 宽度（parley 的 `calculate_content_widths`）。
+    fn min_max_widths(shaped: &super::ShapedText) -> (f32, f32) {
+        let layout = shaped.layout();
+        let widths = layout.calculate_content_widths();
+        (widths.min, widths.max)
+    }
+
     /// 取第一行第一个有覆盖度的字形的 tile（亚像素相位端到端断言用）。
     fn first_glyph_tile(line: &crate::text::ShapedLine) -> crate::paint::atlas::AtlasTile {
         line.lines[0]
@@ -1052,6 +1124,9 @@ mod tests {
     }
 
     /// 光栅一个快照（测试入口）：`scale` 是设备 scale，`width` 是内容宽（逻辑像素）。
+    ///
+    /// 省略号场景走 [`rasterize_line_with_ellipsis`]：`apply_overflow` 需要 `EllipsisGlyphs`
+    /// 才能真的截断最后一行。
     fn rasterize_line(
         shaped: &super::ShapedText,
         width: f32,
@@ -1059,6 +1134,23 @@ mod tests {
         raster: &mut crate::text::raster::GlyphRasterizer,
         glyph_atlas: &mut crate::text::atlas::GlyphAtlas,
         atlas: &mut crate::render::atlas::AtlasAllocator,
+    ) -> (
+        crate::text::ShapedLine,
+        Vec<crate::text::TextDiagnostic>,
+        crate::text::atlas::GlyphAtlasStats,
+    ) {
+        rasterize_line_with_ellipsis(shaped, width, scale, raster, glyph_atlas, atlas, None)
+    }
+
+    /// [`rasterize_line`] 的省略号版本（`None` = 不提供省略号字形，等价于 `Clip`）。
+    fn rasterize_line_with_ellipsis(
+        shaped: &super::ShapedText,
+        width: f32,
+        scale: f32,
+        raster: &mut crate::text::raster::GlyphRasterizer,
+        glyph_atlas: &mut crate::text::atlas::GlyphAtlas,
+        atlas: &mut crate::render::atlas::AtlasAllocator,
+        ellipsis: Option<&super::EllipsisGlyphs>,
     ) -> (
         crate::text::ShapedLine,
         Vec<crate::text::TextDiagnostic>,
@@ -1078,7 +1170,7 @@ mod tests {
                 shaped.style().alignment,
                 crate::paint::color::Color::BLACK,
                 &mut ctx,
-                None,
+                ellipsis,
             )
             .expect("rasterize must not fail")
     }
@@ -1890,28 +1982,485 @@ mod tests {
         );
     }
 
-    /// R12-9：`max_lines` 截掉多余行，`measure` 的高度同步截断。
+    /// R12-9 / P1-④：`max_lines` 截掉多余行，`measure` 的高度**同步**截断。
+    ///
+    /// 旧版本在 `measure(...)` 之后写 `let _ = size;` 把结果丢弃 ⇒ 对 measure 的截断**零验证**
+    /// （AR2 §5 第 2 条的假绿）。现在锁三层：① 行数被截到 2；② measure 高度 == `rasterize`
+    /// 产出的 `ShapedLine::height`；③ 截掉的行高必须真的从 measure 里消失（严格小于全文）。
     #[test]
     fn max_lines_truncates_lines() {
+        const TEXT: &str = "one two three four five six seven eight nine ten eleven twelve";
         let mut harness = Harness::new();
-        let style = TextStyle::new(16.0).with_overflow(crate::text::TextOverflow::Clip, 2);
-        let shaped = harness.shape("one two three four five six seven eight nine ten", style);
-        let narrow = shaped.max_content_size().width * 0.3;
-        let size = shaped.measure(none_known(), definite(narrow));
-        let line_height = shaped.max_content_size().height;
+        let shaped = harness.shape(
+            TEXT,
+            TextStyle::new(16.0).with_overflow(crate::text::TextOverflow::Clip, 2),
+        );
+        let full = harness.shape(TEXT, TextStyle::new(16.0));
+        // Definite 的**断行区间**：min-content 之上一点 ⇒ 词按行散开（≫3 行），且落在
+        // `min_size.width < narrow < max_size.width` 的中间分支（不是 Min/MaxContent 快路径）。
+        let narrow = min_max_widths(&full).0 + 1.0;
+        assert!(
+            narrow < full.max_content_size().width,
+            "precondition: 必须落在真正的折行区间"
+        );
 
+        let size = shaped.measure(none_known(), definite(narrow));
+        let full_size = full.measure(none_known(), definite(narrow));
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
         let (line, _, _) =
             rasterize_line(&shaped, narrow, 1.0, &mut raster, &mut glyphs, &mut atlas);
+        let (full_line, _, _) =
+            rasterize_line(&full, narrow, 1.0, &mut raster, &mut glyphs, &mut atlas);
 
+        assert!(
+            full_line.lines.len() > 2,
+            "precondition: 全文在该宽度下必须超过 2 行，实得 {}",
+            full_line.lines.len()
+        );
         assert_eq!(line.lines.len(), 2, "max_lines = 2");
         assert!(
-            line.height <= line_height * 2.0 + 0.01,
-            "内容高必须被钳到 2 行：{} vs {}",
-            line.height,
-            line_height
+            (size.height - line.height).abs() < 1e-3,
+            "measure 高度必须等于 rasterize 高度：{} vs {}",
+            size.height,
+            line.height
         );
-        let _ = size;
+        assert!(
+            (full_size.height - full_line.height).abs() < 1e-3,
+            "对照：无 max_lines 时两者也必须一致：{} vs {}",
+            full_size.height,
+            full_line.height
+        );
+        let removed = full_size.height - size.height;
+        assert!(
+            removed > line.lines[0].line_height - 1e-3,
+            "被截掉的行高必须从 measure 里消失（去掉 {removed}，单行高 {}）",
+            line.lines[0].line_height
+        );
+    }
+
+    /// P1-④：Definite 宽度 + `max_lines = 2` 的钳制，与「不设 `max_lines`」的对照。
+    ///
+    /// 断言：① 钳制后 measure 高度 == rasterize 高度，且等于**同一断行结果的前两行真实行高之和**；
+    /// ② 严格小于全文高度；③ `max_lines = None` 时 measure 与 rasterize 完全一致（不回归）。
+    #[test]
+    fn measure_height_matches_rasterized_lines_for_definite_width() {
+        const TEXT: &str = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+        let mut harness = Harness::new();
+        let clamped = harness.shape(
+            TEXT,
+            TextStyle::new(16.0).with_overflow(crate::text::TextOverflow::Clip, 2),
+        );
+        let full = harness.shape(TEXT, TextStyle::new(16.0));
+        let (min_width, max_width) = min_max_widths(&full);
+        let width = min_width + (max_width - min_width) * 0.25;
+
+        let size = clamped.measure(none_known(), definite(width));
+        let full_size = full.measure(none_known(), definite(width));
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (line, _, _) =
+            rasterize_line(&clamped, width, 1.0, &mut raster, &mut glyphs, &mut atlas);
+        let (full_line, _, _) =
+            rasterize_line(&full, width, 1.0, &mut raster, &mut glyphs, &mut atlas);
+
+        assert!(
+            full_line.lines.len() > 2,
+            "precondition: 全文在该宽度下必须超过 2 行，实得 {}",
+            full_line.lines.len()
+        );
+        assert_eq!(line.lines.len(), 2, "max_lines = 2");
+        assert!(
+            (size.height - line.height).abs() < 1e-3,
+            "measure 高度必须等于 rasterize 高度：{} vs {}",
+            size.height,
+            line.height
+        );
+        let expected = full_line.lines[0].line_height + full_line.lines[1].line_height;
+        assert!(
+            (size.height - expected).abs() < 1e-3,
+            "钳制高度必须是前两行的真实行高之和：{} vs {expected}",
+            size.height
+        );
+        assert!(
+            size.height < full_size.height - 1.0,
+            "钳制后必须严格矮于全文：{} vs {}",
+            size.height,
+            full_size.height
+        );
+        // 对照：max_lines = None ⇒ measure 与 rasterize 一致。
+        assert!(
+            (full_size.height - full_line.height).abs() < 1e-3,
+            "max_lines = None 时 measure 必须等于 rasterize：{} vs {}",
+            full_size.height,
+            full_line.height
+        );
+    }
+
+    /// P1-④：Min/MaxContent 路径同样钳制，且**不触发断行**（O(1) 契约不变）。
+    ///
+    /// 硬换行文本让 max-content 本身就有 4 行；`max_lines = 2` 必须把 Min/MaxContent 两条路径
+    /// 的高度都钳到前两行，同时 `measure_breaks` 保持 0（复用
+    /// [`measure_is_o1_for_min_max_content`] 的计数器）。`max_content_size()` 与
+    /// `measure(MaxContent)` 同源，也必须一起钳制。
+    #[test]
+    fn max_lines_clamps_min_and_max_content_height_without_breaking() {
+        const TEXT: &str = "one\ntwo\nthree\nfour";
+        let mut harness = Harness::new();
+        let shaped = harness.shape(
+            TEXT,
+            TextStyle::new(16.0).with_overflow(crate::text::TextOverflow::Clip, 2),
+        );
+        let full = harness.shape(TEXT, TextStyle::new(16.0));
+
+        let max = shaped.measure(
+            none_known(),
+            taffy::Size {
+                width: AvailableSpace::MaxContent,
+                height: AvailableSpace::MaxContent,
+            },
+        );
+        let min = shaped.measure(
+            none_known(),
+            taffy::Size {
+                width: AvailableSpace::MinContent,
+                height: AvailableSpace::MinContent,
+            },
+        );
+        for _ in 0..32 {
+            let _ = shaped.measure(
+                none_known(),
+                taffy::Size {
+                    width: AvailableSpace::MinContent,
+                    height: AvailableSpace::MinContent,
+                },
+            );
+            let _ = shaped.measure(
+                none_known(),
+                taffy::Size {
+                    width: AvailableSpace::MaxContent,
+                    height: AvailableSpace::MaxContent,
+                },
+            );
+        }
+        assert_eq!(
+            shaped.measure_breaks(),
+            0,
+            "Min/MaxContent 的 clamp 不得触发任何断行（O(1) 路径）"
+        );
+
+        // 期望值 = max-content 布局前两行的真实行高之和（硬换行 ⇒ 4 行）。
+        let (expected, full_height) = {
+            let layout = shaped.layout();
+            let mut lines = layout.lines();
+            let first = lines.next().expect("至少一行").metrics().line_height;
+            let second = lines
+                .next()
+                .expect("硬换行 ⇒ 至少两行")
+                .metrics()
+                .line_height;
+            assert_eq!(lines.count() + 2, 4, "硬换行 ⇒ max-content 恰好四行");
+            (first + second, layout.height())
+        };
+        assert!(
+            (max.height - expected).abs() < 1e-3,
+            "MaxContent 高度必须钳到前两行：{} vs {expected}",
+            max.height
+        );
+        assert!(
+            (min.height - max.height).abs() < 1e-3,
+            "MinContent 高度同样钳制（纯文本行行高相同）：{} vs {}",
+            min.height,
+            max.height
+        );
+        assert!(
+            max.height < full_height - 1.0,
+            "钳制后必须严格矮于全文：{} vs {full_height}",
+            max.height
+        );
+        assert_eq!(
+            shaped.max_content_size().height,
+            max.height,
+            "max_content_size 与 measure(MaxContent) 必须同源（都取钳制后的 max_size）"
+        );
+
+        // 与 rasterize 对齐：max-content 宽下光栅 ⇒ 硬换行 4 行、截到 2 行。
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (line, _, _) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        assert_eq!(line.lines.len(), 2, "max_lines = 2");
+        assert!(
+            (line.height - max.height).abs() < 1e-3,
+            "MaxContent 的 measure 高度必须等于 rasterize 高度：{} vs {}",
+            max.height,
+            line.height
+        );
+
+        // 全文对照（同一文本不设 max_lines）。
+        let full_size = full.measure(
+            none_known(),
+            taffy::Size {
+                width: AvailableSpace::MaxContent,
+                height: AvailableSpace::MaxContent,
+            },
+        );
+        assert!(
+            (full_size.height - full_height).abs() < 1e-3,
+            "全文高度回归：{} vs {full_height}",
+            full_size.height
+        );
+        assert!(max.height < full_size.height - 1.0);
+    }
+
+    /// P1-④：`overflow: Ellipsis` 不改变 measure 的宽度上界，高度与实际 `ShapedLine` 一致。
+    ///
+    /// 省略号只在最后一个可见行内做「保留前缀 + 省略号」的字形替换（`clip_with_ellipsis`），
+    /// 只改 `advance` 与字形、**不改行高**，所以宽度上界必须与 `Clip` 样式逐位相同；高度必须
+    /// 等于 rasterize 后 `ShapedLine::height`（单行与 `max_lines` 多行两种场景）。
+    #[test]
+    fn ellipsis_does_not_change_measure_width_and_matches_rasterized_height() {
+        const TEXT: &str = "The quick brown fox jumps over the lazy dog";
+        let mut harness = Harness::new();
+        let ellipsis_shaped = harness.shape(
+            TEXT,
+            TextStyle::new(16.0)
+                .with_wrap(TextWrap::NoWrap)
+                .with_overflow(crate::text::TextOverflow::Ellipsis, 0),
+        );
+        let clip_shaped = harness.shape(
+            TEXT,
+            TextStyle::new(16.0)
+                .with_wrap(TextWrap::NoWrap)
+                .with_overflow(crate::text::TextOverflow::Clip, 0),
+        );
+        let full_width = ellipsis_shaped.max_content_size().width;
+        let content_width = full_width * 0.5;
+        assert!(
+            content_width > 0.0 && content_width < full_width,
+            "precondition: 内容宽必须真的裁剪"
+        );
+
+        let ellipsis_size = ellipsis_shaped.measure(none_known(), definite(content_width));
+        let clip_size = clip_shaped.measure(none_known(), definite(content_width));
+        assert_eq!(
+            ellipsis_size.width.to_bits(),
+            clip_size.width.to_bits(),
+            "省略号不得改变宽度上界：{} vs {}",
+            ellipsis_size.width,
+            clip_size.width
+        );
+        assert_eq!(
+            ellipsis_size.height.to_bits(),
+            clip_size.height.to_bits(),
+            "省略号不得改变高度"
+        );
+        assert!(
+            (ellipsis_size.width - full_width).abs() < 1e-3,
+            "NoWrap 的宽度上界是全文宽（内容宽只做绘制期裁剪）：{} vs {full_width}",
+            ellipsis_size.width
+        );
+
+        let ellipsis = super::measure_ellipsis(
+            &mut harness.font_cx,
+            &mut harness.layout_cx,
+            &harness.family,
+            ellipsis_shaped.style(),
+        )
+        .expect("the host font must provide an ellipsis glyph");
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (line, _, _) = rasterize_line_with_ellipsis(
+            &ellipsis_shaped,
+            content_width,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+            Some(&ellipsis),
+        );
+        assert!(
+            line.width <= content_width + 0.01,
+            "省略号裁剪后宽度必须在内容宽内：{} vs {content_width}",
+            line.width
+        );
+        assert!(
+            line.width < full_width - 1.0,
+            "省略号必须真的缩短内容宽：{} vs {full_width}",
+            line.width
+        );
+        assert!(
+            (line.height - ellipsis_size.height).abs() < 1e-3,
+            "ellipsis 单行高度必须等于 measure：{} vs {}",
+            line.height,
+            ellipsis_size.height
+        );
+        assert!(
+            all_glyphs(&line).len() < TEXT.chars().count(),
+            "必须真的丢掉尾部字形（否则省略号没生效）"
+        );
+
+        // 多行 + max_lines：省略号场景的高度同样 == ShapedLine 高度（截断 + 末行替换）。
+        let multiline_ellipsis = harness.shape(
+            TEXT,
+            TextStyle::new(16.0).with_overflow(crate::text::TextOverflow::Ellipsis, 2),
+        );
+        let multiline_full = harness.shape(TEXT, TextStyle::new(16.0));
+        let (min_width, max_width) = min_max_widths(&multiline_full);
+        let wrap_width = min_width + (max_width - min_width) * 0.25;
+        let multiline_size = multiline_ellipsis.measure(none_known(), definite(wrap_width));
+        let (full_line, _, _) = rasterize_line(
+            &multiline_full,
+            wrap_width,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let (line, _, _) = rasterize_line_with_ellipsis(
+            &multiline_ellipsis,
+            wrap_width,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+            Some(&ellipsis),
+        );
+        assert!(
+            full_line.lines.len() > 2,
+            "precondition: 全文在该宽度下必须超过 2 行，实得 {}",
+            full_line.lines.len()
+        );
+        assert_eq!(line.lines.len(), 2, "max_lines = 2");
+        assert!(
+            (line.height - multiline_size.height).abs() < 1e-3,
+            "ellipsis + max_lines 的高度必须等于 measure：{} vs {}",
+            line.height,
+            multiline_size.height
+        );
+        assert!(
+            multiline_size.height < full_line.height - 1.0,
+            "钳制后必须严格矮于全文：{} vs {}",
+            multiline_size.height,
+            full_line.height
+        );
+    }
+
+    /// P1-④：高度用**真实逐行行高之和**，不是「可见行数 × 单一 line_height」。
+    ///
+    /// 硬换行 + 行内盒：前两行被 40 / 60 px 的行内盒撑高，后两行是纯文本行。`max_lines = 2`
+    /// 后 measure 高度必须是这两行的真实行高之和，且明显偏离 `2 × 纯文本行高` —— 后者正是
+    /// 「用单一 line_height 乘行数」会算出来的错误值。
+    #[test]
+    fn max_lines_height_uses_real_per_line_heights() {
+        const TEXT: &str = "aa\nbb\ncc\ndd";
+        let mut harness = Harness::new();
+        let boxes = [
+            InlineBoxSpec {
+                id: 1,
+                index: 1,
+                size: crate::math::Size::new(30.0, 40.0),
+                baseline: None,
+                align: InlineAlign::Baseline,
+            },
+            InlineBoxSpec {
+                id: 2,
+                index: 4,
+                size: crate::math::Size::new(30.0, 60.0),
+                baseline: None,
+                align: InlineAlign::Baseline,
+            },
+        ];
+        let shaped = harness.shape_with(
+            TEXT,
+            TextStyle::new(16.0).with_overflow(crate::text::TextOverflow::Clip, 2),
+            &boxes,
+        );
+        let full = harness.shape_with(TEXT, TextStyle::new(16.0), &boxes);
+        let width = shaped.max_content_size().width;
+
+        let size = shaped.measure(none_known(), definite(width));
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (line, _, _) =
+            rasterize_line(&shaped, width, 1.0, &mut raster, &mut glyphs, &mut atlas);
+        let (full_line, _, _) =
+            rasterize_line(&full, width, 1.0, &mut raster, &mut glyphs, &mut atlas);
+
+        assert_eq!(line.lines.len(), 2, "max_lines = 2");
+        assert_eq!(full_line.lines.len(), 4, "硬换行 ⇒ 全文四行");
+        let plain_line_height = full_line.lines[2].line_height;
+        assert!(
+            line.lines[0].line_height > plain_line_height + 1.0
+                && line.lines[1].line_height > plain_line_height + 1.0,
+            "precondition: 行内盒必须把前两行撑高（{} / {} vs 纯文本行 {plain_line_height}）",
+            line.lines[0].line_height,
+            line.lines[1].line_height
+        );
+
+        let expected = line.lines[0].line_height + line.lines[1].line_height;
+        assert!(
+            (size.height - expected).abs() < 1e-3,
+            "measure 必须是前两行真实行高之和：{} vs {expected}",
+            size.height
+        );
+        assert!(
+            (size.height - line.height).abs() < 1e-3,
+            "measure 高度必须等于 rasterize 高度：{} vs {}",
+            size.height,
+            line.height
+        );
+        let uniform = 2.0 * plain_line_height;
+        assert!(
+            (size.height - uniform).abs() > 1.0,
+            "不得用「可见行数 × 单一 line_height」：{} vs {uniform}",
+            size.height
+        );
+        assert!(
+            size.height < full_line.height - 1.0,
+            "钳制后必须严格矮于全文：{} vs {}",
+            size.height,
+            full_line.height
+        );
+    }
+
+    /// P1-④：单行文本 + `max_lines = 1` 的可见行数是 `min(1, 1) = 1`，**不得被钳成 0**。
+    ///
+    /// `TextStyle::max_lines()` 已把 0 映射成 `None`；数字快路径（`ShapedKind::Simple`）恒为
+    /// 单行且不经过任何 clamp 代码，所以这里对 parley 路径与快路径共同适用的语义做端到端断言：
+    /// 高度 > 0、等于真实行高、且与不设 `max_lines` 时逐位相同。
+    #[test]
+    fn single_line_with_max_lines_one_keeps_its_height() {
+        let mut harness = Harness::new();
+        let clamped = harness.shape(
+            "Hello",
+            TextStyle::new(16.0).with_overflow(crate::text::TextOverflow::Clip, 1),
+        );
+        let plain = harness.shape("Hello", TextStyle::new(16.0));
+        let size = clamped.measure(none_known(), definite(100.0));
+        let plain_size = plain.measure(none_known(), definite(100.0));
+        let line_height = {
+            let layout = clamped.layout();
+            layout
+                .lines()
+                .next()
+                .expect("Hello 必须有一行")
+                .metrics()
+                .line_height
+        };
+
+        assert!(size.height > 0.0, "单行不得被钳成 0：{:?}", size);
+        assert!(
+            (size.height - line_height).abs() < 1e-3,
+            "单行高度必须等于真实行高：{} vs {line_height}",
+            size.height
+        );
+        assert_eq!(
+            size.height.to_bits(),
+            plain_size.height.to_bits(),
+            "max_lines = 1 与不设上限在单行文本上必须逐位相同"
+        );
     }
 
     #[test]

@@ -100,6 +100,18 @@ impl FrameGate {
         self.closed_at = None;
     }
 
+    /// 窗口不可见（R10-7）：门禁直接回到 Idle 状态，**不**留计时、也不留挂起记录。
+    ///
+    /// 协议允许服务端在 surface 不可见时不回 frame callback；若继续按 200 ms 兜底计时，隐藏
+    /// 窗口会永远以 5 Hz 全量重绘并持续 commit。挂起记录也要清掉：等窗口重新可见时由
+    /// `request` 发一个新的 callback —— 那个旧 callback 可能永远不会回来了（迟到的旧令牌会被
+    /// [`Self::on_callback`] 忽略，语义安全）。
+    pub(crate) fn force_idle(&mut self) {
+        self.ready = true;
+        self.pending = None;
+        self.closed_at = None;
+    }
+
     /// 活性兜底：门禁关闭超过 [`GATE_TIMEOUT`] 时强制开门。返回 `true` = 本次确实超时。
     ///
     /// 放弃挂起记录：那个 callback 可能永远不会回来（present `OUT_OF_DATE` 没有 commit）。
@@ -267,6 +279,41 @@ mod tests {
             !gate.expire(start + GATE_TIMEOUT * 2),
             "门禁已打开，没有可兜底的状态"
         );
+        assert!(gate.is_ready());
+    }
+
+    /// R10-7：窗口不可见时门禁回到 Idle —— 不留计时（不会被兜底反复唤醒），也不留挂起记录
+    /// （重新可见时可以立即发一个新的 `wl_surface.frame`）。
+    #[test]
+    fn an_invisible_window_drops_the_gate_without_a_timer() {
+        let start = Instant::now();
+        let mut gate = FrameGate::new();
+        let stale = gate.request(start).expect("首次请求挂起 callback");
+        assert_eq!(gate.time_until_expiry(start), Some(GATE_TIMEOUT));
+
+        gate.force_idle();
+        assert!(gate.is_ready());
+        assert_eq!(gate.pending, None);
+        assert_eq!(
+            gate.time_until_expiry(start),
+            None,
+            "不可见时不得留下兜底计时（否则 200 ms 后又被唤醒）"
+        );
+        assert!(
+            !gate.expire(start + GATE_TIMEOUT * 3),
+            "没有计时 ⇒ 永不兜底"
+        );
+
+        let fresh = gate
+            .request(start + Duration::from_millis(1))
+            .expect("重新可见后必须能挂新 callback");
+        assert_ne!(fresh, stale, "每次挂号都是新令牌");
+        gate.on_callback(stale);
+        assert!(
+            !gate.is_ready(),
+            "旧的（不可见期间被放弃的）callback 迟到不得提前开门"
+        );
+        gate.on_callback(fresh);
         assert!(gate.is_ready());
     }
 }

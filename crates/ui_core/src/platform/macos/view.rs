@@ -1,8 +1,15 @@
-//! `NSView` 子类：`CAMetalLayer` 宿主 + 输入收集 + `NSTextInputClient` + NSAccessibility
-//! （`design/phase-12-macos-linux.md` §7.2 / §7.5 / §7.7）。
+//! `NSView` 子类：`CAMetalLayer` 宿主 + 输入收集 + `NSTextInputClient` + NSAccessibility +
+//! 主菜单的 responder 动作（`design/phase-12-macos-linux.md` §7.2 / §7.5 / §7.7）。
 //!
-//! 纪律：**平台回调不碰 `App`** —— 事件只 push 进 `ViewIvars.events`，泵在主线程 drain 后 dispatch
-//! （与 Win32 `WndProc` 同一职责边界）。
+//! 纪律：
+//! - **平台回调不碰 `App`** —— 事件只 push 进 `ViewIvars.events`，泵在主线程 drain 后 dispatch
+//!   （与 Win32 `WndProc` 同一职责边界）。菜单动作也一样：它们是**事件**（等价物理按键），
+//!   不是状态改写。
+//! - **IME 组合态只由 `NSTextInputClient` 的四个回调驱动**（`setMarkedText:` / `unmarkText:` /
+//!   `insertText:` / 焦点变化）。`flagsChanged:` 只维护修饰键位图，绝不替输入法做「放弃组合」的
+//!   决定（R09-2：那会让日文/韩文再変換、Shift 临时切换丢字串字）。
+//! - **`Text` 抑制与提交去重是按键作用域状态**（R09-3）：`keyDown:` 开一个作用域，`insertText:`
+//!   只在作用域内记账；作用域外（鼠标点候选窗、听写、表情面板）的提交**不会**影响下一次按键。
 
 use std::{
     cell::{Cell, RefCell},
@@ -13,11 +20,11 @@ use std::{
 use objc2::{
     AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
     rc::Retained,
-    runtime::{AnyObject, Sel},
+    runtime::{AnyObject, ProtocolObject},
 };
 use objc2_app_kit::{
-    NSEvent, NSEventModifierFlags, NSEventPhase, NSTextInputClient, NSTrackingArea,
-    NSTrackingAreaOptions, NSView,
+    NSCursor, NSEvent, NSEventModifierFlags, NSEventPhase, NSTextInputClient, NSTrackingArea,
+    NSTrackingAreaOptions, NSUserInterfaceValidations, NSValidatedUserInterfaceItem, NSView,
 };
 use objc2_foundation::{
     NSArray, NSAttributedString, NSAttributedStringKey, NSPoint, NSProcessInfo, NSRange, NSRect,
@@ -26,13 +33,16 @@ use objc2_foundation::{
 
 use crate::{
     event::{
-        Event, ImeEvent, InputEvent, KeyCode, KeyState, Modifiers, PointerButton, ScrollPhase,
-        ScrollUnit, modifier_key_transitions, should_emit_text, timestamp_from_ticks,
+        Event, GestureFlags, GesturePhase, ImeEvent, InputEvent, KeyCode, KeyState, Modifiers,
+        PointerButton, ScrollPhase, modifier_key_transitions, scroll_delta, should_emit_text,
+        timestamp_from_ticks,
     },
     math::{Point, Rect},
+    paint::style::Cursor,
     platform::{
-        ime::replacement_range,
-        macos::{a11y::MacA11y, ime::ImeState},
+        ime::{CommitVerdict, KeyScopeToken, replacement_range},
+        macos::{a11y::MacA11y, ime::ImeState, menu},
+        menu::MenuCommand,
     },
 };
 
@@ -41,18 +51,21 @@ use crate::{
 pub(crate) struct ViewIvars {
     /// 待泵消费的平台事件（**不**在这里调 `App`）。
     events: RefCell<Vec<Event>>,
-    /// IME 组合状态。
+    /// IME 组合状态 + 按键作用域的提交记账（R09-3）。
     ime: RefCell<ImeState>,
-    /// a11y adapter（首显前构造；`None` = 尚未安装）。
+    /// a11y adapter（首显前构造；`None` = 尚未安装 / 已卸载）。
     a11y: RefCell<Option<MacA11y>>,
     /// 当前修饰键位图（`flagsChanged:` 维护）。
     modifiers: Cell<u8>,
-    /// `insertText:` 刚提交过文本：同一次按键的 `characters` 不能再发一遍。
-    suppress_text: Cell<bool>,
-    /// 最近一次读到的 `backingScaleFactor`。
-    scale: Cell<f64>,
     /// IME caret 区域（窗口逻辑坐标；`None` = 无 hint）。
     ime_cursor: Cell<Option<Rect>>,
+    /// 引擎请求的光标形状（`cursorUpdate:` / `mouseEntered:` 重新 apply 它，R09-11）。
+    cursor: Cell<Cursor>,
+    /// 指针是否在 view 内（决定 `set_cursor` 能否立刻 `NSCursor::set`）。
+    pointer_inside: Cell<bool>,
+    /// 文本编辑态（泵每轮由 `sync_ime_cursor_area` 写入）：`validateUserInterfaceItem:` 据此
+    /// 决定 Edit 菜单项是否启用（R09-1）。
+    text_editing: Cell<bool>,
 }
 
 define_class!(
@@ -83,15 +96,6 @@ define_class!(
             true
         }
 
-        #[unsafe(method(viewDidChangeBackingProperties))]
-        fn backing_properties_changed(&self) {
-            let scale = self
-                .window()
-                .map(|window| window.backingScaleFactor())
-                .unwrap_or(1.0);
-            self.ivars().scale.set(scale);
-        }
-
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
             self.note_modifiers(event.modifierFlags());
@@ -100,15 +104,25 @@ define_class!(
             let repeat = event.isARepeat();
             // R02-14：事件时刻取 `NSEvent.timestamp`（系统启动起的秒），不是分发时刻。
             let timestamp = event_timestamp(event);
-            // 新按键边界：同一按键内的重复 `insertText:` 才去重（`"ll"` / 双空格必须都能进）。
-            self.ivars().ime.borrow_mut().begin_key();
+            // R09-3：**一次 `keyDown:` = 一个按键作用域**。`insertText:` 交付的正文去重与
+            // `Text` 抑制都只在这个作用域内有效；守卫在作用域结束时清空全部记账（panic 也清），
+            // 因此「鼠标点候选窗提交后吞掉下一个真实字符」在结构上不可能再发生。
+            let ivars = self.ivars();
+            let token = ivars.ime.borrow_mut().begin_key();
+            let _scope = KeyScope {
+                ime: &ivars.ime,
+                token,
+            };
             // **IME 先**：输入法可能吞掉这个键（组合/提交走 NSTextInputClient 回调）。
-            if let Some(context) = self.inputContext() {
-                context.handleEvent(event);
-            }
-            let composing = self.ivars().ime.borrow().has_marked();
-            // 本键的正文是否已经由 IME 交付（`insertText:` 真的发出过 `Commit`）。
-            let commit_consumed = self.ivars().suppress_text.replace(false);
+            // `handleEvent:` 的返回值是「输入上下文是否消费了本事件」的**权威**信号；丢掉它
+            // 就只能靠 `has_marked()` 推断，这是 R09-3 的同源缺陷。
+            let ime_handled = self
+                .inputContext()
+                .is_some_and(|context| context.handleEvent(event));
+            let (composing, text_taken) = {
+                let ime = ivars.ime.borrow();
+                (ime.has_marked(), ime.takes_text(token))
+            };
             // `Key` **永不**被 IME 抑制：快捷键要能看到物理按键（与 Win32 一致）。
             self.push_event(Event::Input(InputEvent::Key {
                 code: key_code(event.keyCode()),
@@ -117,11 +131,14 @@ define_class!(
                 modifiers,
                 timestamp,
             }));
-            // `Text` 只在「正文没被 IME 交付」时才发，避免与 `ImeEvent::Commit` 重复插入。
-            // 判据与 Linux 的 XKB 回退通路共用 `should_emit_text`（含「重复不得抑制文本」的
-            // 回归测试）：`commit_consumed` = 本次按键的正文已由 IME 交付。
-            if should_emit_text(KeyState::Down, repeat, commit_consumed, composing)
-                && !modifiers.intersects(Modifiers::CONTROL | Modifiers::META)
+            // `Text` 只在「本按键的正文没被 IME 交付」时才发，避免与 `ImeEvent::Commit` 重复插入。
+            // 判据与 Linux 的 XKB 回退通路共用 `should_emit_text`（含「重复不得抑制文本」的回归）。
+            if should_emit_text(
+                KeyState::Down,
+                repeat,
+                ime_handled || text_taken,
+                composing,
+            ) && !modifiers.intersects(Modifiers::CONTROL | Modifiers::META)
                 && let Some(text) = event.characters()
             {
                 let text = text.to_string();
@@ -137,6 +154,11 @@ define_class!(
         #[unsafe(method(keyUp:))]
         fn key_up(&self, event: &NSEvent) {
             self.note_modifiers(event.modifierFlags());
+            // 输入上下文也收 `keyUp:`：部分输入法在抬起阶段才结束组合/提交（Qt/Chromium 同样
+            // 成对投递；只投 `keyDown:` 会让这些输入法的组合态悬空）。返回值只对按下有意义。
+            if let Some(context) = self.inputContext() {
+                context.handleEvent(event);
+            }
             self.push_event(Event::Input(InputEvent::Key {
                 code: key_code(event.keyCode()),
                 state: KeyState::Up,
@@ -154,6 +176,11 @@ define_class!(
             // 序列，`App::held_keys` / `App::key_down` 才在三个平台语义一致（否则 macOS 上
             // `key_down(ShiftLeft)` 恒为 false）。侧别不可得（`NSEventModifierFlags` 不区分
             // 左右），统一取左变体 —— 与 `Modifiers` 位图本身不区分左右一致。
+            //
+            // 这里**只维护修饰键位图**：绝不碰 `ImeState`。组合串的存在只由
+            // `setMarkedText:`/`unmarkText:`/`insertText:` 决定（R09-2）；旧实现在「松开的
+            // 修饰键不含 Shift」时清 marked text，于是组合中途松 CapsLock/Fn/Option 都会丢字，
+            // 且下一次 `setMarkedText:` 的 `replacementRange` 换算基准被清成 0 → 串字。
             let previous = self.modifiers();
             self.note_modifiers(event.modifierFlags());
             let modifiers = self.modifiers();
@@ -167,13 +194,6 @@ define_class!(
                     modifiers,
                     timestamp,
                 }));
-            }
-            let mut ime = self.ivars().ime.borrow_mut();
-            if ime.has_marked() && !modifiers.intersects(Modifiers::SHIFT) {
-                // 组合态里松开 Shift 视为放弃组合（输入法不会总发 `unmarkText:`）。
-                ime.clear_marked();
-                drop(ime);
-                self.push_event(Event::Ime(ImeEvent::End));
             }
         }
 
@@ -231,6 +251,8 @@ define_class!(
         fn mouse_entered(&self, event: &NSEvent) {
             // R02-4：`NSTrackingArea` 的 enter 半边（Windows 没有独立消息，Wayland 是
             // `wl_pointer.enter`）。它同时带进窗位置，之后的 `mouseMoved:` 才是纯移动。
+            self.ivars().pointer_inside.set(true);
+            self.apply_cursor();
             let position = self.logical_point(event.locationInWindow());
             self.note_modifiers(event.modifierFlags());
             self.push_event(Event::Input(InputEvent::PointerEnter {
@@ -243,6 +265,7 @@ define_class!(
         #[unsafe(method(mouseExited:))]
         fn mouse_exited(&self, event: &NSEvent) {
             // R02-39：`PointerLeave` 带离开点（W3C `pointerleave` 也有坐标）。
+            self.ivars().pointer_inside.set(false);
             let position = self.logical_point(event.locationInWindow());
             self.note_modifiers(event.modifierFlags());
             self.push_event(Event::Input(InputEvent::PointerLeave {
@@ -252,38 +275,125 @@ define_class!(
             }));
         }
 
+        /// `NSTrackingArea` 的 `CursorUpdate` 回调（R09-11）。
+        ///
+        /// AppKit 的光标契约是「视图声明区域 → 光标」：`NSCursor::set()` 只是**瞬时**动作，
+        /// 激活窗口 / 鼠标移动 / 视图重绘都会把它重置回 cursor rect 的结果。因此引擎请求的
+        /// 形状必须能在 `cursorUpdate:` 里被重新 apply —— 这里做的正是这件事。
+        #[unsafe(method(cursorUpdate:))]
+        fn cursor_update(&self, _event: &NSEvent) {
+            self.ivars().pointer_inside.set(true);
+            self.apply_cursor();
+        }
+
+        /// 捏合缩放（R09-4）：`magnification` 是**本次增量**（不是累计），阶段由 `phase` 给出。
+        #[unsafe(method(magnifyWithEvent:))]
+        fn magnify(&self, event: &NSEvent) {
+            let Some(phase) = gesture_phase(event) else {
+                return;
+            };
+            self.note_modifiers(event.modifierFlags());
+            self.push_event(Event::Input(InputEvent::Magnify {
+                factor: event.magnification() as f32,
+                phase,
+                center: self.logical_point(event.locationInWindow()),
+                modifiers: self.modifiers(),
+                timestamp: event_timestamp(event),
+            }));
+        }
+
+        /// 旋转手势（`rotation` 单位是**度**，同样是本次增量）。
+        #[unsafe(method(rotateWithEvent:))]
+        fn rotate(&self, event: &NSEvent) {
+            let Some(phase) = gesture_phase(event) else {
+                return;
+            };
+            self.note_modifiers(event.modifierFlags());
+            self.push_event(Event::Input(InputEvent::Rotate {
+                // `NSEvent.rotation` 本来就是 `c_float`（f32），不需要再 cast。
+                degrees: event.rotation(),
+                phase,
+                modifiers: self.modifiers(),
+                timestamp: event_timestamp(event),
+            }));
+        }
+
+        /// 双指双击缩放（`smartMagnify:`）：离散手势，没有增量与阶段。
+        #[unsafe(method(smartMagnifyWithEvent:))]
+        fn smart_magnify(&self, event: &NSEvent) {
+            self.note_modifiers(event.modifierFlags());
+            self.push_event(Event::Input(InputEvent::SmartMagnify {
+                center: self.logical_point(event.locationInWindow()),
+                modifiers: self.modifiers(),
+                timestamp: event_timestamp(event),
+            }));
+        }
+
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &NSEvent) {
-            let position = self.logical_point(event.locationInWindow());
-            let precise = event.hasPreciseScrollingDeltas();
-            // 精确设备（触控板 / Magic Mouse）给的是像素增量，1:1 跟随；非精确设备（普通滚轮）
-            // 给的是"行"，AppKit 一格约 3 行（`NSEvent.scrollingDeltaY` 的非精确量纲仍是
-            // **需真机确认**的事项，这里保持 P12 的 /3 归一化，不凭空改手感）。
-            let (delta_x, delta_y, unit) = if precise {
-                (
-                    event.scrollingDeltaX() as f32,
-                    event.scrollingDeltaY() as f32,
-                    ScrollUnit::Pixel,
-                )
-            } else {
-                (
-                    (event.scrollingDeltaX() / 3.0) as f32,
-                    (event.scrollingDeltaY() / 3.0) as f32,
-                    ScrollUnit::Line,
-                )
+            // R09-8：单位与 delta 由 `event::scroll_delta` 统一（精确设备 = Pixel 直传、
+            // 传统滚轮 = Line 直传），平台层不再自造 `/10`、`/3` 归一化。
+            let Some((delta, unit)) = scroll_delta(
+                event.hasPreciseScrollingDeltas(),
+                event.scrollingDeltaX(),
+                event.scrollingDeltaY(),
+            ) else {
+                return;
             };
+            let position = self.logical_point(event.locationInWindow());
             // R02-10：保留系统的 `phase` / `momentumPhase`，引擎才能区分「手指在板上」与
             // 「惯性滑行」（Chrome 的 `WebMouseWheelEvent.phase` / `momentumPhase` 同一做法）。
             let phase = scroll_phase(event);
             self.note_modifiers(event.modifierFlags());
             self.push_event(Event::Input(InputEvent::Scroll {
                 position,
-                delta: Point::new(delta_x, delta_y),
+                delta,
                 unit,
                 phase,
                 modifiers: self.modifiers(),
                 timestamp: event_timestamp(event),
             }));
+        }
+
+        // ---- 主菜单的 responder 动作（R09-1）----
+        //
+        // 菜单项用 AppKit **标准 selector**（`copy:` / `paste:` / …）沿 responder chain 找目标：
+        // 引擎是自绘控件，必须自己实现这些方法才参与这条通路（否则 Cmd+C 会「无响应」）。
+        // 动作**不直接改状态**：它被翻译成与物理按键等价的 `Key` 事件，走 `App::dispatch`
+        // 的绑定派发（菜单、快捷键、a11y 动作因此语义一致）。
+        #[unsafe(method(undo:))]
+        fn undo(&self, _sender: Option<&AnyObject>) {
+            self.run_menu_command(MenuCommand::Undo);
+        }
+
+        #[unsafe(method(redo:))]
+        fn redo(&self, _sender: Option<&AnyObject>) {
+            self.run_menu_command(MenuCommand::Redo);
+        }
+
+        #[unsafe(method(cut:))]
+        fn cut(&self, _sender: Option<&AnyObject>) {
+            self.run_menu_command(MenuCommand::Cut);
+        }
+
+        #[unsafe(method(copy:))]
+        fn copy(&self, _sender: Option<&AnyObject>) {
+            self.run_menu_command(MenuCommand::Copy);
+        }
+
+        #[unsafe(method(paste:))]
+        fn paste(&self, _sender: Option<&AnyObject>) {
+            self.run_menu_command(MenuCommand::Paste);
+        }
+
+        #[unsafe(method(delete:))]
+        fn delete(&self, _sender: Option<&AnyObject>) {
+            self.run_menu_command(MenuCommand::Delete);
+        }
+
+        #[unsafe(method(selectAll:))]
+        fn select_all(&self, _sender: Option<&AnyObject>) {
+            self.run_menu_command(MenuCommand::SelectAll);
         }
 
         // ---- NSAccessibility（容器 + 三条查询）----
@@ -319,6 +429,31 @@ define_class!(
         }
     }
 
+    // `NSUserInterfaceValidations`：Edit 菜单项的启用状态（R09-1）。AppKit 的菜单在
+    // `autoenablesItems` 下会问 responder chain 上的第一个 `validateUserInterfaceItem:` 实现；
+    // 没有它，编辑项只能靠「responder 实现了该 selector」判定为**恒启用** —— 于是没有文本焦点时
+    // 点 Copy 会走一遍空动作，而 Cmd+C 也被菜单项吞掉（无法退回 keyDown 通路）。
+    unsafe impl NSUserInterfaceValidations for GuiView {
+        #[unsafe(method(validateUserInterfaceItem:))]
+        fn validate_user_interface_item(
+            &self,
+            item: &ProtocolObject<dyn NSValidatedUserInterfaceItem>,
+        ) -> bool {
+            let Some(action) = item.action() else {
+                return true;
+            };
+            let Ok(name) = action.name().to_str() else {
+                return true;
+            };
+            match MenuCommand::from_selector(name) {
+                // Edit 命令只在文本编辑态启用：没有文本焦点时把 Cmd+C/V/A/Z 还给 keyDown
+                // 通路（应用的绑定仍能收到），而不是被一个什么都不做的菜单项吃掉。
+                Some(command) if command.is_edit() => self.ivars().text_editing.get(),
+                _ => true,
+            }
+        }
+    }
+
     // `replacementRange` 是**文档坐标**（与 `markedRange` 同一坐标系）；换算成组合串内相对
     // UTF-16 区间时用 `ImeState::marked_range().0` 作基准（见 `relative_replacement_range`）。
     // 已提交文本的重转换（韩文 Hanja / 日文再変換）还需要 `attributedSubstringForProposedRange:`
@@ -339,23 +474,28 @@ define_class!(
             // `replacementRange` 是 UTF-16 文档区间（`{NSNotFound, 0}` = 替换当前组合串）。
             // 必须在 `clear_marked` 之前换算：clamp 上界是**提交前**的组合串。
             let replace = self.relative_replacement_range(range);
-            let first = self.ivars().ime.borrow_mut().note_commit(&value);
+            // R09-3：提交记账带**作用域**。`DeliverInScope` = 本按键的正文已由 IME 交付
+            // （同一次 `keyDown:` 的 `Text` 要抑制）；`DeliverOutsideScope` = 提交发生在
+            // 按键之外（鼠标点候选窗 / 听写 / 粘贴）—— 只交付正文，绝不影响任何按键的 `Text`。
+            let verdict = self.ivars().ime.borrow_mut().note_commit(&value);
+            // 提交之后组合串一定结束（输入法不保证再发 `unmarkText:`）。
             self.ivars().ime.borrow_mut().clear_marked();
-            // 只有「真的交付了正文」才抑制本按键的 `Text`；重复回调（`first == false`）时
-            // 同一次按键的正文已经交付过，抑制标记仍然有效。
-            if first {
-                self.ivars().suppress_text.set(true);
-                self.push_event(Event::Ime(ImeEvent::Commit {
-                    text: smol_str::SmolStr::new(value),
-                    replace,
-                }));
+            match verdict {
+                CommitVerdict::Duplicate => {}
+                CommitVerdict::DeliverInScope | CommitVerdict::DeliverOutsideScope => {
+                    self.push_event(Event::Ime(ImeEvent::Commit {
+                        text: smol_str::SmolStr::new(value),
+                        replace,
+                    }));
+                }
             }
         }
 
         #[unsafe(method(doCommandBySelector:))]
         // SAFETY: AppKit 只在本 view 是第一响应者时于主线程调用；参数按 ObjC 约定保证非空。
-        unsafe fn do_command_by_selector(&self, _selector: Sel) {
+        unsafe fn do_command_by_selector(&self, _selector: objc2::runtime::Sel) {
             // 命令选择器（方向键 / 回车等）已由 `keyDown:` 转成 `Key` 事件；这里吞掉。
+            // Esc（`cancelOperation:`）同理：组合态由输入法的下一次回调结束，不由平台层代劳。
         }
 
         #[unsafe(method(setMarkedText:selectedRange:replacementRange:))]
@@ -370,8 +510,15 @@ define_class!(
                 let mut ime = self.ivars().ime.borrow_mut();
                 ime.set_marked(&utf16, (selected.location, selected.length));
             }
+            // `selectedRange` 就是组合串内的插入点（拼音串里用 ←/→ 改字时停在串中间）：
+            // 文本层据此画插入点，否则光标恒在末尾。越界（含 `NSNotFound`）clamp 到串尾。
+            let caret = selected.location.min(utf16.len()) as u32;
             self.push_event(Event::Ime(ImeEvent::Preedit {
                 text: smol_str::SmolStr::new(value),
+                caret: Some(caret),
+                // AppKit 的可视子句由输入法自己的候选窗呈现；引擎文本层只需要插入点，
+                // 组合串高亮暂不提供（`NSMarkedClauseSegment` 的解析是后续工作）。
+                clauses: smallvec::SmallVec::new(),
                 replace,
             }));
         }
@@ -433,7 +580,6 @@ define_class!(
             // SAFETY: AppKit 传进来的 `actualRange` 指向本方法可写的 `NSRange`。
             unsafe { *actual.as_ptr() = range };
             // P16：应用/引擎提供的 caret 区域（窗口逻辑坐标，view 已 isFlipped）→ 屏幕坐标。
-            // 无 hint 时保留 P12 的窗口原点 1×1 回退。
             let local = match self.ivars().ime_cursor.get() {
                 Some(area) => NSRect::new(
                     NSPoint::new(f64::from(area.origin.x), f64::from(area.origin.y)),
@@ -442,17 +588,22 @@ define_class!(
                         f64::from(area.size.height.max(1.0)),
                     ),
                 ),
-                None => NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0)),
+                // 无 hint ⇒ 空矩形：AppKit 明确要求**屏幕坐标**，返回 view 局部坐标
+                // （旧实现）会把候选窗丢到屏幕角落（R09-19）。空矩形用构造函数写：
+                // 绑定里没有 `NSRect::ZERO`（`NSZeroRect` 是 extern static）。
+                None => NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0)),
             };
             let in_window = self.convertRect_toView(local, None);
             self.window()
                 .map(|window| window.convertRectToScreen(in_window))
-                .unwrap_or(local)
+                .unwrap_or(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0)))
         }
 
         #[unsafe(method(characterIndexForPoint:))]
         fn character_index_for_point(&self, _point: NSPoint) -> NSUInteger {
-            0
+            // `NSNotFound`（`NSIntegerMax`）= 「无法映射到字符」；返回 0 会被输入法当成
+            // 「第一个字符」（R09-19）。
+            isize::MAX as usize
         }
     }
 );
@@ -464,6 +615,21 @@ enum PointerPhase {
     Up(PointerButton),
 }
 
+/// 按键作用域的 RAII 守卫：作用域结束时清空本按键的提交记账（R09-3）。
+///
+/// 不变式：`ImeState` 里「本按键的正文已交付」这件事的生命周期 ⊂ 一次 `keyDown:`。守卫保证
+/// 无论正常返回还是 panic 展开，下一个按键都不会继承上一次的抑制位。
+struct KeyScope<'a> {
+    ime: &'a RefCell<ImeState>,
+    token: KeyScopeToken,
+}
+
+impl Drop for KeyScope<'_> {
+    fn drop(&mut self) {
+        self.ime.borrow_mut().end_key(self.token);
+    }
+}
+
 impl GuiView {
     /// 建 view（`frame` 先给 1×1，`NativeWindow` 随后 `setFrame`）。
     pub(crate) fn new(mtm: MainThreadMarker) -> Retained<Self> {
@@ -472,9 +638,10 @@ impl GuiView {
             ime: RefCell::new(ImeState::new()),
             a11y: RefCell::new(None),
             modifiers: Cell::new(0),
-            suppress_text: Cell::new(false),
-            scale: Cell::new(1.0),
             ime_cursor: Cell::new(None),
+            cursor: Cell::new(Cursor::Default),
+            pointer_inside: Cell::new(false),
+            text_editing: Cell::new(false),
         });
         // SAFETY: `initWithFrame:` 是 NSView 的指定初始化器；`this` 由 `alloc` 产生且未初始化。
         let this: Retained<Self> = unsafe {
@@ -485,6 +652,9 @@ impl GuiView {
         };
         // 鼠标移出窗口需要 `NSTrackingArea` 才会产生 `mouseExited:`（§7.2）；`InVisibleRect`
         // 让区域随 view 尺寸自动更新，`ActiveInKeyWindow` 与 Win32 的 hover 语义一致。
+        // `CursorUpdate` 让 AppKit 在「需要更新光标」时回调 `cursorUpdate:`（R09-11）：
+        // `NSCursor::set()` 是瞬时 API，激活/移动/重绘都会把它重置回 cursor rect 的结果，
+        // 只有 tracking area 的这条通路能让引擎请求的形状**持续**生效。
         // 不声明 `.MouseMoved`：窗口的 `acceptsMouseMovedEvents` 已经投递 `mouseMoved:`，
         // 两者同时开启会让每个移动产生两次 `PointerMove`（实机探针复现）。
         //
@@ -496,6 +666,7 @@ impl GuiView {
                 NSTrackingArea::alloc(),
                 NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0)),
                 NSTrackingAreaOptions::MouseEnteredAndExited
+                    | NSTrackingAreaOptions::CursorUpdate
                     | NSTrackingAreaOptions::ActiveInKeyWindow
                     | NSTrackingAreaOptions::InVisibleRect,
                 Some(owner),
@@ -511,8 +682,21 @@ impl GuiView {
         *self.ivars().a11y.borrow_mut() = Some(a11y);
     }
 
+    /// 卸下 a11y adapter（**窗口仍然存活时**调用，R09-7）。
+    ///
+    /// `accesskit_macos::Context::drop` 会对每个 platform node 发
+    /// `NSAccessibilityPostNotification(.., UIElementDestroyed)`，AppKit 会**同步回查**元素的
+    /// parent/frame；而 accesskit 的 `to_ns_rect` 对 `view.window()` 做了 `unwrap()`。若 adapter
+    /// 随 view 的 `dealloc` 析构（旧行为），那一刻 `NSWindow` 已经释放、`window` 为 nil ⇒ panic
+    /// 穿过 ObjC 帧 = `abort()`；即便不 panic，`accessibilityChildren` 也会 `borrow_mut` 正在
+    /// `drop_in_place` 的 ivars（UB）。因此关窗顺序必须是：卸 a11y → 关窗 → 释放 view。
+    pub(crate) fn uninstall_a11y(&self) {
+        // 先取出再 drop：drop 期间的 AppKit 回查看到的是 `None`（返回空，不 panic）。
+        let adapter = self.ivars().a11y.borrow_mut().take();
+        drop(adapter);
+    }
+
     /// 交付一笔 a11y 更新（泵每轮调用；`a11y_pending` 是 O(1) 过滤）。
-    /// 交付一笔 a11y 更新。
     ///
     /// `raise()` 会让 AppKit 同步回调进来（`accessibilityChildren` / `accessibilityHitTest:`），
     /// 那些方法也要 `borrow_mut` ⇒ 这里先把 adapter **取出来**，回调期间 `RefCell` 里是 `None`
@@ -531,6 +715,7 @@ impl GuiView {
         // 第一次点击就被当成组合键。悬停同理：指针离开时 `mouseExited:` 也会被吞掉。
         if !focused {
             self.ivars().modifiers.set(0);
+            self.ivars().pointer_inside.set(false);
         }
         let mut adapter = self.ivars().a11y.take();
         if let Some(a11y) = adapter.as_mut() {
@@ -544,13 +729,72 @@ impl GuiView {
         std::mem::take(&mut *self.ivars().events.borrow_mut())
     }
 
-    pub(crate) fn set_scale(&self, scale: f64) {
-        self.ivars().scale.set(scale);
-    }
-
-    /// 保存 IME caret 区域（窗口逻辑坐标；`None` = 无 hint，`firstRect` 回退 1×1）。
+    /// 保存 IME caret 区域（窗口逻辑坐标；`None` = 无 hint，`firstRect` 回退空矩形）。
     pub(crate) fn set_ime_cursor_area(&self, area: Option<Rect>) {
         self.ivars().ime_cursor.set(area);
+    }
+
+    /// 写入文本编辑态（泵每轮从 `App::ime_cursor_area` 派生；`validateUserInterfaceItem:` 读它）。
+    pub(crate) fn set_text_editing(&self, editing: bool) {
+        self.ivars().text_editing.set(editing);
+    }
+
+    /// 引擎请求的光标形状（R09-11）。指针在窗口内时立刻生效；否则等 `cursorUpdate:`
+    /// / `mouseEntered:` 重新 apply。
+    pub(crate) fn set_cursor(&self, cursor: Cursor) {
+        self.ivars().cursor.set(cursor);
+        if self.ivars().pointer_inside.get() {
+            self.apply_cursor();
+        }
+    }
+
+    /// 把光标形状交给 AppKit（`NSCursor::set`：cursor rect / `cursorUpdate:` 之外唯一有效的
+    /// 即时通路，且会被下一次 cursor 更新覆盖 —— 因此必须在每次 `cursorUpdate:` 里重放）。
+    fn apply_cursor(&self) {
+        ns_cursor(self.ivars().cursor.get()).set();
+    }
+
+    /// 菜单动作 → 引擎事件，或在引擎不处理时沿 responder chain 上抛（R09-1）。
+    ///
+    /// 为什么不在平台层直接「复制/粘贴」：引擎的编辑语义由应用绑定与文本输入层拥有，平台层只
+    /// 负责把菜单点击翻译成同一个按键序列，因此菜单、Cmd+C、a11y 动作三条通路完全一致
+    /// （不会出现「菜单能粘贴、快捷键不能」）。
+    ///
+    /// 没有文本编辑态时（`validateUserInterfaceItem:` 本会把菜单项置灰，但这仍可能被
+    /// AppleScript / `sendAction:` 直接调用）把动作转给 `nextResponder` —— 即 AppKit 的默认
+    /// responder chain 语义（`noResponderFor:` 的那条路），而不是静默吞掉命令。
+    fn run_menu_command(&self, command: MenuCommand) {
+        let Some((code, modifiers)) = command.engine_key() else {
+            return;
+        };
+        if !self.ivars().text_editing.get() {
+            self.forward_to_next_responder(command);
+            return;
+        }
+        // 菜单点击不是 NSEvent：时间戳取分发时刻（双击/连击判定与文本编辑都与它无关）。
+        let timestamp = Instant::now();
+        for state in [KeyState::Down, KeyState::Up] {
+            self.push_event(Event::Input(InputEvent::Key {
+                code,
+                state,
+                repeat: false,
+                modifiers,
+                timestamp,
+            }));
+        }
+    }
+
+    /// 把一条菜单命令转给 responder chain 上的下一个响应者（等价 `[[self nextResponder]
+    /// tryToPerform:_cmd with:sender]`）。
+    fn forward_to_next_responder(&self, command: MenuCommand) {
+        let Some(next) = self.nextResponder() else {
+            return;
+        };
+        // SAFETY: `nextResponder` 返回的是 AppKit 保证存活到下一次 run loop 的对象；
+        // `tryToPerform:with:` 对它自己（以及它之后的链）是同步、安全的调用。返回值只表示
+        // 「链上有响应者处理了」，引擎不据此做决策（没有处理者时保持安静，不 `noResponderFor:`
+        // 的 beep —— 自绘控件不应因程序化调用而响铃）。
+        let _ = unsafe { next.tryToPerform_with(menu::selector(command), None) };
     }
 
     /// `replacementRange`（AppKit **文档坐标**）→ 组合串内相对 UTF-16 区间。
@@ -640,6 +884,23 @@ impl GuiView {
     fn logical_point(&self, point: NSPoint) -> Point {
         let local = self.convertPoint_fromView(point, None);
         Point::new(local.x as f32, local.y as f32)
+    }
+}
+
+/// 引擎 [`Cursor`] → `NSCursor`（R09-11）。
+///
+/// 映射按 AppKit 的语义就近取值：`Grab`/`Grabbing` 是开/合掌，`ResizeHorizontal`/`Vertical`
+/// 用左右/上下双向箭头（与 Win32 `IDC_SIZEWE`/`IDC_SIZENS`、Qt 的对应光标同类）。
+fn ns_cursor(cursor: Cursor) -> Retained<NSCursor> {
+    match cursor {
+        Cursor::Default => NSCursor::arrowCursor(),
+        Cursor::Pointer => NSCursor::pointingHandCursor(),
+        Cursor::Text => NSCursor::IBeamCursor(),
+        Cursor::NotAllowed => NSCursor::operationNotAllowedCursor(),
+        Cursor::Grab => NSCursor::openHandCursor(),
+        Cursor::Grabbing => NSCursor::closedHandCursor(),
+        Cursor::ResizeHorizontal => NSCursor::resizeLeftRightCursor(),
+        Cursor::ResizeVertical => NSCursor::resizeUpDownCursor(),
     }
 }
 
@@ -799,6 +1060,22 @@ fn event_timestamp(event: &NSEvent) -> Instant {
     let now_ms = (NSProcessInfo::processInfo().systemUptime().max(0.0) * 1000.0) as u64;
     let event_ms = (event.timestamp().max(0.0) * 1000.0) as u64;
     timestamp_from_ticks(now, now_ms, event_ms)
+}
+
+/// 手势事件的阶段（`NSEvent.phase`；R09-4）。
+///
+/// `None` = 本事件没有可交付的阶段（`NSEventPhaseMayBegin`：手势**可能**开始，还没有增量）。
+/// 归一化规则在平台无关的 [`GestureFlags::phase`] 里，可在开发机上单测。
+fn gesture_phase(event: &NSEvent) -> Option<GesturePhase> {
+    let phase = event.phase();
+    GestureFlags {
+        may_begin: phase.contains(NSEventPhase::MayBegin),
+        began: phase.contains(NSEventPhase::Began),
+        changed: phase.contains(NSEventPhase::Changed) || phase.contains(NSEventPhase::Stationary),
+        ended: phase.contains(NSEventPhase::Ended),
+        cancelled: phase.contains(NSEventPhase::Cancelled),
+    }
+    .phase()
 }
 
 /// AppKit 的滚动阶段（`phase` 优先，其次是 `momentumPhase`）→ 引擎 [`ScrollPhase`]。

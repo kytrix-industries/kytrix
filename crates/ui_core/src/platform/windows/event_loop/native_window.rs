@@ -10,7 +10,7 @@ use crate::{
     platform::{
         dispatcher::Dispatcher,
         event::{PlatformEvent, PointerKind, StampedEvent},
-        windows::{composition, dpi, window::NativeWindow},
+        windows::{composition, window::NativeWindow},
     },
     render::backend::Renderer,
     window::{WindowId, WindowOptions},
@@ -101,6 +101,11 @@ pub(super) fn collect_events(
 }
 
 /// 消费者：`collect_events`。
+///
+/// **所有坐标换算都用 `stamped.scale`**（该消息产生时的 DPI 比例，R07-12）：`WM_DPICHANGED`
+/// 在 `WndProc` 里同步生效，因此同一条批次里的后续输入已经带上新 scale，不会再出现
+/// 「跨屏拖动时指针坐标跳一下」。`NativeWindow::scale` 只用于渲染目标 / composition 与 IME
+/// 表单换算，不参与事件换算。
 pub(super) fn apply_event(
     app: &mut App,
     native: &mut NativeWindow,
@@ -110,7 +115,7 @@ pub(super) fn apply_event(
     now: std::time::Instant,
     now_ticks: u32,
 ) -> Result<(), EngineError> {
-    let scale = native.scale();
+    let scale = stamped.scale;
     let to_logical = |x: i32, y: i32| {
         crate::math::Point::new(scale.to_logical(x as f32), scale.to_logical(y as f32))
     };
@@ -194,7 +199,11 @@ pub(super) fn apply_event(
             } else {
                 // 只记录尺寸并唤醒（`design/async-render-pipeline.md` §6.7）：内容重画发生在 GPU
                 // 线程按下一帧的 `FrameRequest.surface` 做，UI 线程不等待。
-                native.note_client_resize((width, height));
+                //
+                // 逻辑尺寸用**该消息的 scale** 换算（R07-12）：`WM_SIZE` 与 `WM_DPICHANGED` 可能
+                // 同批到达，用窗口侧的旧 scale 换算会得到错误逻辑尺寸（跨屏拖动的第一帧被
+                // 放大/裁切）。
+                native.note_client_resize(scale, (width, height));
                 let size = native.logical_size();
                 if let Some(window) = app.window_mut(id) {
                     window.set_size(size);
@@ -206,34 +215,23 @@ pub(super) fn apply_event(
             dispatcher.wake();
             Event::Resized { size }
         }
-        PlatformEvent::Dpi { dpi, suggested } => {
-            // DPI 同理：只更新窗口尺寸/比例并唤醒；内容重画由 GPU 线程消费新的 surface，
-            // 几何由 ②b′ 统一应用（P1-2a）。
-            let scale = dpi::scale_from_dpi(dpi).ok_or(EngineError::InvalidDpiScale {
-                factor: dpi as f32 / dpi::BASE_DPI as f32,
-            })?;
-            // 有系统建议矩形时**不要**先按旧尺寸重排（P2-2）：那会先跳一次再套建议矩形，
-            // 可见抖动 + 一次多余布局。只记账新 DPI，位置与尺寸完全交给建议矩形。
-            let resizable = native.note_scale(scale, dpi);
-            match suggested {
-                Some(rect) if resizable && !native.is_minimized() => native.place(rect)?,
-                // 没有可用建议矩形（系统没给 / 窗口最小化）：保持逻辑尺寸，按新 DPI 重排一次。
-                _ => native.apply_scale(scale, dpi)?,
-            }
+        PlatformEvent::Dpi { dpi } => {
+            // DPI 的**几何已经落地**：`WndProc` 在 `WM_DPICHANGED` 里同步 `SetWindowPos` 了系统
+            // 建议矩形（R07-12），这里只做记账与渲染目标更新（P1-2a：内容重画由 GPU 线程按
+            // 新 surface 做，UI 线程不等待）。
+            native.note_scale(scale, dpi);
             if let Some(window) = app.window_mut(id) {
                 window.set_scale(scale);
-                // `apply_scale` / `place` 已按新 DPI 重排非客户区：回读真实客户区。
                 // 最小化时 `GetClientRect` 是 0×0（`client_size()` 会钳成 1×1）：跳过 `set_surface`，
                 // 目标保持上一次平台写入的真实客户区；恢复窗口的 `WM_SIZE` 会用新客户区覆盖它。
                 //
-                // **逻辑尺寸必须在这里同步写回**（复审 P2-9）：`place` 只是 `SetWindowPos`，
-                // 新客户区要等下一轮的 `WM_SIZE` 才进 `Window`。本泵轮次紧接着就会出帧，
-                // 那时布局仍按旧逻辑尺寸跑、而渲染目标已是新物理尺寸 + 新 scale ⇒ 跨屏拖动
-                // 会有一帧内容被放大/裁切。先按新 DPI 换算并写回，下一轮 `WM_SIZE` 以同值覆盖
-                // （`note_client_resize` 对同值幂等）。
+                // **逻辑尺寸必须在这里同步写回**：`SetWindowPos` 只是改窗口，新客户区要等下一轮
+                // `WM_SIZE` 才进 `Window`。本泵轮次紧接着就会出帧，那时布局仍按旧逻辑尺寸跑、
+                // 而渲染目标已是新物理尺寸 + 新 scale ⇒ 跨屏拖动会有一帧内容被放大/裁切。
+                // 先按新 DPI 换算并写回，下一轮 `WM_SIZE` 以同值覆盖（`note_client_resize` 同值幂等）。
                 if !native.is_minimized() {
                     let client = native.client_size();
-                    native.note_client_resize(client);
+                    native.note_client_resize(scale, client);
                     window.set_size(crate::math::Size::new(
                         scale.to_logical(client.0 as f32),
                         scale.to_logical(client.1 as f32),

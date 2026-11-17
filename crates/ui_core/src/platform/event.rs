@@ -19,10 +19,14 @@
 //! 按下（同一 `lParam` 的 bit 16–23 是硬件扫描码，bit 24 是 `E0` 扩展位）。
 
 use smol_str::SmolStr;
-use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::Win32::UI::{
+    Input::KeyboardAndMouse::{VK_PACKET, VK_PROCESSKEY},
+    WindowsAndMessaging::*,
+};
 
 use crate::{
     event::{ImeEvent, KeyCode, KeyState, Modifiers, PointerButton},
+    math::Scale,
     platform::windows::ime::ImeState,
 };
 
@@ -64,9 +68,12 @@ pub(crate) enum PlatformEvent {
         height: u32,
     },
     Dpi {
+        /// 新 DPI（96 基准）。
+        ///
+        /// 系统建议矩形**不在这里**：`WndProc` 在 `WM_DPICHANGED` 处理期间已经用它
+        /// `SetWindowPos`（R07-12：必须在消息处理内应用，winit / Qt 同款），平台事件只负责
+        /// 让应用同步自己的 scale 与渲染目标。
         dpi: u32,
-        /// 系统建议的新窗口矩形（`lParam` 的 `RECT`；消息处理期之外不可读）。
-        suggested: Option<(i32, i32, i32, i32)>,
     },
     Focus(bool),
     Appearance(bool),
@@ -85,21 +92,29 @@ pub(crate) enum PlatformEvent {
 /// `WndProc` 用 `GetMessageTime()` 取到它；平台事件转 `InputEvent` 时经
 /// [`crate::event::timestamp_from_ticks_32`] 换算成引擎单调时钟（「现在」用
 /// `GetTickCount64() as u32`，同源同宽）。
+///
+/// `scale` 是**该消息产生时**的窗口 DPI 比例（R07-12）：`WM_DPICHANGED` 在 `WndProc` 里
+/// 立即生效，同批次后续输入必须按新 scale 换算成逻辑坐标；若像旧实现那样在整批派发之后
+/// 才应用 DPI，同批的鼠标位移会用旧 scale 解释（100% → 200% 跨屏拖动时指针坐标跳变）。
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StampedEvent {
     /// 平台事件。
     pub event: PlatformEvent,
     /// 消息时间（毫秒，32 位回绕域）。
     pub ticks_ms: u32,
+    /// 消息产生时的窗口 scale。
+    pub scale: Scale,
 }
 
-/// 每条消息都要带的输入上下文（时间戳 + 系统滚轮行数）。
+/// 每条消息都要带的输入上下文（时间戳 + 系统滚轮行数 + 当时的 DPI 比例）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct MessageContext {
     /// 消息时间（`GetMessageTime()`，毫秒，32 位回绕域）。
     pub ticks_ms: u32,
     /// 一格滚轮的行数（`SPI_GETWHEELSCROLLLINES`；`0.0` = 未知/按页）。
     pub wheel_lines: f32,
+    /// 该消息产生时的窗口 scale（R07-12：DPI 在 `WndProc` 内同步生效）。
+    pub scale: Scale,
 }
 
 /// 消息之间需要保持的状态（修饰键、代理对、IME 组合）。
@@ -120,15 +135,23 @@ impl TranslateState {
     ///
     /// 修饰键按消息顺序维护：失焦期间抬起消息不再到达本窗口，不清位就会让 Shift/Ctrl
     /// 永久保持按下（Alt+Tab 回来后所有输入都被当成组合键）。半高代理对同理：
-    /// 失焦前残留的高位代理会和回来后的字符拼成乱码。
+    /// 失焦前残留的高位代理会和回来后的字符拼成乱码。IME 的待抑制码元队列也一并清空
+    /// （R07-5：提交后补发的 `WM_CHAR` 可能在失焦后不再到达，残留队列会静默吞掉之后真实
+    /// 键入的字符）。
     pub(crate) fn reset_transient(&mut self) {
         self.modifiers = Modifiers::empty();
         self.high_surrogate = None;
+        self.ime.clear_pending();
     }
 
     /// IME 状态（`event_loop` 在 `WM_IME_*` 分支里驱动它）。
     pub(crate) fn ime_mut(&mut self) -> &mut ImeState {
         &mut self.ime
+    }
+
+    /// IME 状态（只读：泵比较「目标状态 vs 已应用状态」时用，不产生任何 Win32 调用）。
+    pub(crate) fn ime(&self) -> &ImeState {
+        &self.ime
     }
 }
 
@@ -191,6 +214,16 @@ pub(crate) fn translate(
         }
         WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
             let vk = (wparam & 0xFF) as u16;
+            // R07-6：IME 组合期间系统把 `WM_KEYDOWN` 的 wParam 换成 `VK_PROCESSKEY`（真实键码
+            // 要用 `ImmGetVirtualKey` 才拿得到），`VK_PACKET` 则是 `SendInput(KEYEVENTF_UNICODE)`
+            // / 语音输入 / 辅助技术注入的载体（文本由随后的 `WM_CHAR` 给出）。两者都**不是**
+            // 应用可观察的按键：派发出去就是「每敲一个拼音字母，应用收到一次假按键」，
+            // 会让快捷键表与「任意键」处理器误触发（Chrome `ImeInput`、Firefox `IMMHandler`、
+            // winit 都显式跳过）。IME 自己的 `WM_IME_CHAR` / 提交不受影响（走 IME 分支与
+            // `WM_CHAR`）。
+            if matches!(vk, v if v == VK_PROCESSKEY.0 || v == VK_PACKET.0) {
+                return None;
+            }
             let down = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
             update_modifiers(vk, down, &mut state.modifiers);
             let raw = lparam as u32;
@@ -207,8 +240,9 @@ pub(crate) fn translate(
             })
         }
         WM_CHAR => {
-            // IME 提交之后 Windows 会再发同内容的 `WM_CHAR`：跳过，避免文字重复。
-            if state.ime.take_char_suppression() {
+            // IME 提交之后 Windows 会再发同内容的 `WM_CHAR`（**每 UTF-16 码元一条**）：逐码元
+            // 比对后跳过，避免文字重复；内容不匹配时队列自愈（R07-5）。
+            if state.ime.consume_char(wparam as u16) {
                 return None;
             }
             decode_char(wparam as u16, state).map(PlatformEvent::Text)
@@ -228,18 +262,7 @@ pub(crate) fn translate(
         }
         WM_DPICHANGED => {
             let dpi = (wparam as u32) & 0xFFFF;
-            if dpi == 0 {
-                return None;
-            }
-            // SAFETY: `WM_DPICHANGED` 的 `lParam` 指向系统提供的 `RECT`，只在本次消息处理期间有效；
-            // 这里立刻按值拷出（不保存指针）。
-            let suggested = if lparam == 0 {
-                None
-            } else {
-                let rect = unsafe { &*(lparam as *const windows::Win32::Foundation::RECT) };
-                Some((rect.left, rect.top, rect.right, rect.bottom))
-            };
-            Some(PlatformEvent::Dpi { dpi, suggested })
+            (dpi != 0).then_some(PlatformEvent::Dpi { dpi })
         }
         WM_CLOSE => Some(PlatformEvent::Close),
         _ => None,
@@ -247,6 +270,7 @@ pub(crate) fn translate(
     event.map(|event| StampedEvent {
         event,
         ticks_ms: context.ticks_ms,
+        scale: context.scale,
     })
 }
 
@@ -607,13 +631,17 @@ fn f_key(n: u8) -> Option<KeyCode> {
 
 #[cfg(test)]
 mod tests {
+    use smol_str::SmolStr;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     use super::{
         MessageContext, PlatformEvent, PointerKind, TranslateState, key_code_from_native,
         lines_per_tick, translate,
     };
-    use crate::event::{KeyCode, KeyState, Modifiers, PointerButton};
+    use crate::{
+        event::{KeyCode, KeyState, Modifiers, PointerButton},
+        math::Scale,
+    };
 
     /// 一个 KEYDOWN 的 `lParam`：扫描码在 bit 16–23，`E0` 在 bit 24，重复位在 bit 30。
     fn key_lparam(scancode: u16, extended: bool, previous_down: bool) -> isize {
@@ -635,6 +663,7 @@ mod tests {
         MessageContext {
             ticks_ms: 1_000,
             wheel_lines: 3.0,
+            scale: Scale::ONE,
         }
     }
 
@@ -653,6 +682,7 @@ mod tests {
             MessageContext {
                 ticks_ms: 4_321,
                 wheel_lines: 3.0,
+                scale: Scale::ONE,
             },
             &mut state,
         )
@@ -781,13 +811,7 @@ mod tests {
     fn dpi_change_reads_the_low_word() {
         let event = translate_raw(WM_DPICHANGED, (192usize << 16) | 144, 0);
 
-        assert_eq!(
-            event,
-            Some(PlatformEvent::Dpi {
-                dpi: 144,
-                suggested: None
-            })
-        );
+        assert_eq!(event, Some(PlatformEvent::Dpi { dpi: 144 }));
     }
 
     #[test]
@@ -1112,5 +1136,77 @@ mod tests {
             Some(PlatformEvent::Focus(false))
         );
         assert_eq!(translate_raw(WM_CLOSE, 0, 0), Some(PlatformEvent::Close));
+    }
+
+    /// R07-6：`VK_PROCESSKEY`（0xE5）是「这个键被输入法吃了」，`VK_PACKET`（0xE7）是注入文本
+    /// 的载体 —— 两者都**不是**应用可观察的按键，不得派发 `Key::Other`。
+    #[test]
+    fn ime_processed_and_packet_keys_never_become_key_events() {
+        // 组合期间按下/抬起拼音字母：wParam 恒为 VK_PROCESSKEY。
+        assert_eq!(translate_raw(WM_KEYDOWN, 0xE5, 0), None);
+        assert_eq!(translate_raw(WM_KEYUP, 0xE5, 0), None);
+        // SendInput(KEYEVENTF_UNICODE) / 语音输入 / 辅助技术注入。
+        assert_eq!(translate_raw(WM_KEYDOWN, 0xE7, 0), None);
+        assert_eq!(translate_raw(WM_KEYUP, 0xE7, 0), None);
+        // 高 8 位是系统填充的扩展信息：真实 wParam 只有低 8 位是键码。
+        assert_eq!(translate_raw(WM_KEYDOWN, 0x01_00E5, 0), None);
+        // 普通字母不受影响（'A' 的 VK 是 0x41，扫描码 0x1E）。
+        assert!(matches!(
+            translate_raw(WM_KEYDOWN, 0x41, key_lparam(0x1E, false, false)),
+            Some(PlatformEvent::Key {
+                code: KeyCode::KeyA,
+                state: KeyState::Down,
+                ..
+            })
+        ));
+    }
+
+    /// R07-5：提交去重按 **UTF-16 码元** 逐条比对；不匹配时队列自愈，绝不吞真实键入。
+    #[test]
+    fn committed_text_suppresses_only_the_matching_char_units() {
+        let mut state = TranslateState::default();
+        // 模拟 `ImeState` 在 `GCS_RESULTSTR` 提交后排队的内容：「🌍a」= 3 个码元。
+        state.ime_mut().queue_commit("🌍a");
+        // 系统随后补发 3 条 `WM_CHAR`（每码元一条）：全部被抑制。
+        for unit in "🌍a".encode_utf16() {
+            assert_eq!(
+                translate(WM_CHAR, usize::from(unit), 0, context(), &mut state),
+                None,
+                "提交后补发的 WM_CHAR 必须被抑制"
+            );
+        }
+        // 队列已空：真正的键入必须放行。
+        let text = translate(
+            WM_CHAR,
+            usize::from(u16::from(b'x')),
+            0,
+            context(),
+            &mut state,
+        )
+        .expect("WM_CHAR");
+        assert_eq!(text.event, PlatformEvent::Text(SmolStr::new_static("x")));
+    }
+
+    /// 失焦（`reset_transient`）必须清空 IME 待抑制队列：否则残留码元会静默吞掉
+    /// 之后真实键入的字符（R07-5 的核心缺陷）。
+    #[test]
+    fn losing_focus_drops_pending_ime_suppression() {
+        let mut state = TranslateState::default();
+        state.ime_mut().queue_commit("ni");
+
+        state.reset_transient();
+
+        let event = translate(
+            WM_CHAR,
+            usize::from(u16::from(b'n')),
+            0,
+            context(),
+            &mut state,
+        );
+        assert_eq!(
+            event.map(|stamped| stamped.event),
+            Some(PlatformEvent::Text(SmolStr::new_static("n"))),
+            "失焦后第一次键入必须放行"
+        );
     }
 }

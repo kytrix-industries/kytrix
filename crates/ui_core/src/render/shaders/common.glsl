@@ -16,7 +16,14 @@
 #define KYTRIX_GRADIENT_VERTICAL 2u
 #define KYTRIX_GRADIENT_RADIAL 3u
 
+// Canvas / 编码器的**圆角** clip 层数上限（轴对齐矩形 clip 在编码期求交合并，不占层数）。
 #define KYTRIX_MAX_CLIP_DEPTH 8u
+// clip 链的**总项数**上界 = MAX_CLIP_DEPTH（圆角）+ 1（矩形）。shader 的 clip 循环按它收口。
+#define KYTRIX_MAX_CLIP_ITEMS 9u
+// clip 链项的类型（写进 `ClipEntry.meta.y`）：矩形项 = 像素精确 scissor（覆盖率 0/1，
+// 不参与 AA 相乘）；圆角项 = 解析 AA。见 `clip_mask` 与 contract.md §2。
+#define KYTRIX_CLIP_KIND_RECT 1u
+#define KYTRIX_CLIP_KIND_ROUNDED 2u
 #define KYTRIX_CLIP_VERTEX_SLACK 2.0
 // σ = blur × 0.5（CSS `box-shadow` 的「模糊半径」定义；与 Skia `SkBlurMaskFilter` 的
 // σ 同义，Skia 的 radius 换算见 contract.md §4）。
@@ -35,7 +42,7 @@ struct FrameUniform {
 struct ClipEntry {
     vec4  rect;           // (x, y, w, h) 物理像素
     vec4  corner_radius;  // (tl, tr, br, bl) 物理像素
-    uvec4 meta;           // .x = parent（0 = 无裁剪）；.yzw 保留恒 0
+    uvec4 meta;           // .x = parent（0 = 无裁剪）；.y = KYTRIX_CLIP_KIND_*；.zw 保留恒 0
 };
 
 struct GeometryDrawUniform {
@@ -82,9 +89,12 @@ vec2 to_ndc(vec2 world_px) {
 // AA 与 clip_mask 在 `common.frag.glsl`：它们用 `fwidth`，而 GLSL 禁止顶点阶段求导，
 // 本文件又被 3 个 vertex stage 包含（F-145）。
 
-// 圆角矩形 SDF。半径按 CSS 规则夹到 `min(half_size)`：`r > min(half)` 会让
-// `q = |p| - half + r` 恒正 ⇒ 等值线反过来「越裁越大」（内容溢出）。编码器已按
-// 同一规则规范化，这里是第二道防线（数据异常也不出现反向错误）。
+// 圆角矩形 SDF。半径夹到 **SDF 合法域** `min(half_size)`：`r > min(half)` 会让
+// `q = |p| - half + r` 恒正 ⇒ 等值线反过来「越裁越大」（内容溢出）。这不是 CSS 算法：
+// CSS（Backgrounds §5.5）在「一条边上相邻两角半径之和 > 该边长」时按 f = min(side/Σr)
+// 等比缩小**全部**半径；编码器先做那一步，再做本步的合法域 clamp（见
+// `paint::instance::normalize_corner_radius`）。这里保留同一 clamp 作为第二道防线
+// （数据异常也不出现反向错误），对已规范化的数据是幂等的。
 float sd_rounded_rect(vec2 p, vec2 half_size, vec4 radii) {
     float r = (p.x > 0.0) ? ((p.y > 0.0) ? radii.z : radii.y)
                           : ((p.y > 0.0) ? radii.w : radii.x);
@@ -117,16 +127,24 @@ float shadow_cdf(float x) {
 // 用 `σ = radius × 0.57735 + 0.5`（其 SPECULAR/MASK 光栅器的 sigma 换算），因此同一
 // 视觉参数下本式的 σ 比 Skia 的略小 —— 换算关系写在 contract.md §4。
 //
-// 形状：轴对齐矩形的二维高斯响应是**可分离**的
-//   Φ(-dx/σ) × Φ(-dy/σ)   （dx/dy = 到左右/上下边的带符号距离，正 = 外侧）
-// 直角（r = 0）时它就是精确解（旧实现的半平面近似在角部把阴影「填实」约 58%）。
-// 圆角处边界是圆弧，分离式会高估角部覆盖，因此按「角部圆度 × r/(r+σ)」混合到
-// SDF 半平面解 Φ(-sdf/σ)：r = 0 退化为分离式，r >> σ 时角部走圆弧解。
+// 形状：轴对齐矩形经二维高斯模糊后的响应是**可分离**的，一维因子是「两条对边的尾概率
+// 之差」（box ⊗ gaussian 的精确解）：
+//   c(h) = Φ((h - |x|)/σ) − Φ((-h - |x|)/σ) = shadow_cdf((|x|-h)/σ) − shadow_cdf((|x|+h)/σ)
+// 只取近边项（旧实现 `Φ(-dx/σ)·Φ(-dy/σ)`）在小元素上会把阴影铺得过宽：元素尺寸
+// `half ≳ 3σ` 时两边差不多，`half ≪ σ` 时少掉的对边项不可忽略（8×8 元素 + blur 24
+// ⇒ σ=12 时中心被高估约 6 倍，且四周出现不存在的光晕）。
+// 直角（r = 0）时它就是精确解。圆角处边界是圆弧，分离式会高估角部覆盖，因此按
+// 「角部圆度 × r/(r+σ)」混合到 SDF 半平面解 Φ(-sdf/σ)：r = 0 退化为分离式，
+// r >> σ 时角部走圆弧解。
 float analytic_shadow(vec2 p, vec2 half_size, vec4 radii, float blur) {
     float sigma = max(blur * KYTRIX_SHADOW_SIGMA_SCALE, KYTRIX_SHADOW_SIGMA_MIN);
-    float dx = abs(p.x) - half_size.x;
-    float dy = abs(p.y) - half_size.y;
-    float rect_part = shadow_cdf(dx / sigma) * shadow_cdf(dy / sigma);
+    float ax = abs(p.x);
+    float ay = abs(p.y);
+    float dx = ax - half_size.x;
+    float dy = ay - half_size.y;
+    float axis_x = saturate(shadow_cdf(dx / sigma) - shadow_cdf((ax + half_size.x) / sigma));
+    float axis_y = saturate(shadow_cdf(dy / sigma) - shadow_cdf((ay + half_size.y) / sigma));
+    float rect_part = axis_x * axis_y;
     float corner_r = clamp(max(max(radii.x, radii.y), max(radii.z, radii.w)), 0.0,
                          min(half_size.x, half_size.y));
     float sdf_part = shadow_cdf(sd_rounded_rect(p, half_size, radii) / sigma);

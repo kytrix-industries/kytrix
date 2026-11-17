@@ -15,8 +15,9 @@
 //!   `SharedGpu` 的池锁串行化。
 //!
 //! geometry 管线按 `GeometryPipeline` 分成三种（`Ui` / `Textured{Image}` / `Textured{Glyph}`），
-//! 顶点布局由 pipeline 唯一决定（`contract.md` §7）：`Ui` = 8 B（`float2` 位置）、
-//! `Textured` = 16 B（`float2` 位置 + `float2` uv）。
+//! 顶点布局由 pipeline 唯一决定（`contract.md` §7）：`Ui` = **12 B**（`float2` 位置 + `f32`
+//! 覆盖率距离）、`Textured` = 16 B（`float2` 位置 + `float2` uv）。PSO 还必须按
+//! `GeometryDesc.topology` 各建一条（Vulkan 的拓扑是 PSO 状态，不能逐 draw 切换）。
 
 use std::path::PathBuf;
 
@@ -24,7 +25,10 @@ use ash::vk;
 
 use crate::{
     error::EngineError,
-    paint::{atlas::AtlasKind, geometry::GeometryPipeline},
+    paint::{
+        atlas::AtlasKind,
+        geometry::{GeometryPipeline, Topology},
+    },
     render::{frame::MAX_FRAMES_IN_FLIGHT, linux::device::init_error},
 };
 
@@ -56,17 +60,16 @@ const SPIRV_MAGIC: [u8; 4] = [0x03, 0x02, 0x23, 0x07];
 /// 占位产物前缀。
 const SKIPPED: &[u8] = b"KYTRIX-SHADER-SKIPPED";
 
-/// 三种几何管线的 PSO（按 `GeometryPipeline` 与图集种类分派）。
+/// 一套 geometry PSO：三种 pipeline 变体在**同一种拓扑**下的集合。
 #[derive(Clone, Copy)]
-pub(crate) struct GeometryPipelines {
+struct GeometryPipelineSet {
     ui: vk::Pipeline,
     image: vk::Pipeline,
     glyph: vk::Pipeline,
 }
 
-impl GeometryPipelines {
-    /// 按注册描述选 PSO。
-    pub(crate) fn get(self, pipeline: GeometryPipeline) -> vk::Pipeline {
+impl GeometryPipelineSet {
+    fn get(self, pipeline: GeometryPipeline) -> vk::Pipeline {
         match pipeline {
             GeometryPipeline::Ui => self.ui,
             GeometryPipeline::Textured {
@@ -75,6 +78,28 @@ impl GeometryPipelines {
             GeometryPipeline::Textured {
                 atlas: AtlasKind::Glyph,
             } => self.glyph,
+        }
+    }
+}
+
+/// 全部 geometry PSO：**每个 pipeline 变体 × 每种拓扑**各一条（共 6 条）。
+///
+/// Vulkan 的 `VkPipelineInputAssemblyStateCreateInfo::topology` 是 PSO 的烘死状态，不能像 D3D12
+/// 的 `IASetPrimitiveTopology` 那样逐 draw 切换（Metal 也按 `desc.topology` 建两条 PSO）。旧实现
+/// 把拓扑烘成恒 `TRIANGLE_LIST`，于是 `Topology::TriangleStrip` 的几何在 Linux 上被按 list 画
+/// （AR2 P3-② 的跨端几何正确性差异）。
+#[derive(Clone, Copy)]
+pub(crate) struct GeometryPipelines {
+    list: GeometryPipelineSet,
+    strip: GeometryPipelineSet,
+}
+
+impl GeometryPipelines {
+    /// 按注册描述选 PSO（`GeometryDesc.topology` 参与选择，与 D3D12 / Metal 同语义）。
+    pub(crate) fn get(self, pipeline: GeometryPipeline, topology: Topology) -> vk::Pipeline {
+        match topology {
+            Topology::TriangleList => self.list.get(pipeline),
+            Topology::TriangleStrip => self.strip.get(pipeline),
         }
     }
 }
@@ -153,34 +178,41 @@ impl Pipeline {
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         )?;
         let quad = create_quad_pipeline(device, layout, pass_clear)?;
+        let create_set =
+            |topology: vk::PrimitiveTopology| -> Result<GeometryPipelineSet, EngineError> {
+                Ok(GeometryPipelineSet {
+                    ui: create_geometry_pipeline(
+                        device,
+                        layout,
+                        pass_clear,
+                        "geometry.vs_ui.spv",
+                        "geometry.ps_ui.spv",
+                        12,
+                        topology,
+                    )?,
+                    image: create_geometry_pipeline(
+                        device,
+                        layout,
+                        pass_clear,
+                        "geometry.vs_textured.spv",
+                        "geometry.ps_textured_image.spv",
+                        16,
+                        topology,
+                    )?,
+                    glyph: create_geometry_pipeline(
+                        device,
+                        layout,
+                        pass_clear,
+                        "geometry.vs_textured.spv",
+                        "geometry.ps_textured_glyph.spv",
+                        16,
+                        topology,
+                    )?,
+                })
+            };
         let geometry = GeometryPipelines {
-            ui: create_geometry_pipeline(
-                device,
-                layout,
-                pass_clear,
-                "geometry.vs_ui.spv",
-                "geometry.ps_ui.spv",
-                12,
-                vk::PrimitiveTopology::TRIANGLE_LIST,
-            )?,
-            image: create_geometry_pipeline(
-                device,
-                layout,
-                pass_clear,
-                "geometry.vs_textured.spv",
-                "geometry.ps_textured_image.spv",
-                16,
-                vk::PrimitiveTopology::TRIANGLE_LIST,
-            )?,
-            glyph: create_geometry_pipeline(
-                device,
-                layout,
-                pass_clear,
-                "geometry.vs_textured.spv",
-                "geometry.ps_textured_glyph.spv",
-                16,
-                vk::PrimitiveTopology::TRIANGLE_LIST,
-            )?,
+            list: create_set(vk::PrimitiveTopology::TRIANGLE_LIST)?,
+            strip: create_set(vk::PrimitiveTopology::TRIANGLE_STRIP)?,
         };
 
         Ok(Self {
@@ -199,9 +231,9 @@ impl Pipeline {
         self.set_layout
     }
 
-    /// 按注册描述选 geometry PSO。
-    pub(crate) fn geometry(&self, pipeline: GeometryPipeline) -> vk::Pipeline {
-        self.geometry.get(pipeline)
+    /// 按注册描述选 geometry PSO（拓扑也参与选择：Vulkan 的拓扑是 PSO 烘死状态）。
+    pub(crate) fn geometry(&self, pipeline: GeometryPipeline, topology: Topology) -> vk::Pipeline {
+        self.geometry.get(pipeline, topology)
     }
 
     /// 随 `clear` 选择两个渲染通道之一（`loadOp` 是渲染通道的属性，不能逐帧改）。
@@ -302,9 +334,11 @@ impl Drop for Pipeline {
         // SAFETY: 句柄归本结构独占；共享设备由 `SharedGpu` 保活到本结构 drop 之后。
         unsafe {
             self.device.destroy_pipeline(self.quad, None);
-            self.device.destroy_pipeline(self.geometry.ui, None);
-            self.device.destroy_pipeline(self.geometry.image, None);
-            self.device.destroy_pipeline(self.geometry.glyph, None);
+            for set in [self.geometry.list, self.geometry.strip] {
+                self.device.destroy_pipeline(set.ui, None);
+                self.device.destroy_pipeline(set.image, None);
+                self.device.destroy_pipeline(set.glyph, None);
+            }
             self.device.destroy_render_pass(self.pass_clear, None);
             self.device.destroy_render_pass(self.pass_load, None);
             self.device.destroy_pipeline_layout(self.layout, None);
@@ -533,10 +567,10 @@ fn create_quad_pipeline(
 
 /// 建一条 geometry PSO。
 ///
+/// `stride` = 12 时 `POSITION` + 覆盖率距离（`Ui`；解析 AA 的 `float`）；16 时是
+/// `POSITION` + `TEXCOORD`（`Textured`）。拓扑来自 `GeometryDesc.topology`（PSO 烘死状态），
 /// 与 uber-quad 的差别只有顶点输入（`stride` 与属性表）与拓扑：其余状态（cull = NONE、
 /// 无深度/模板、MSAA 关闭、`ONE / INV_SRC_ALPHA` 混合）逐字相同（`contract.md` §7）。
-///
-/// `stride` = 8 时只有 `POSITION`（`Ui`）；16 时再加 `TEXCOORD`（`Textured`）。
 fn create_geometry_pipeline(
     device: &ash::Device,
     layout: vk::PipelineLayout,

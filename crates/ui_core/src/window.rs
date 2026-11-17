@@ -76,10 +76,83 @@ pub enum WindowControl {
     Minimize,
     /// 在最大化与还原之间切换（`set_maximized` / `unset_maximized`）。
     ToggleMaximize,
+    /// 进入 / 退出全屏（`set_fullscreen` / `unset_fullscreen`）。
+    ///
+    /// 最终状态以 compositor 的 `configure` 为准（`xdg_toplevel` 的 `Fullscreen` 状态位）：
+    /// 只发请求不假设结果，两者之间可能被策略拒绝（compositor 忽略请求）。
+    ToggleFullscreen,
     /// 开始交互式移动（`xdg_toplevel._move(seat, serial)`）。
     BeginMove,
     /// 开始交互式缩放（`xdg_toplevel.resize(seat, serial, edge)`）。
     BeginResize(WindowResizeEdge),
+}
+
+/// Linux：compositor 侧的窗口状态镜像（应用自绘标题栏的唯一数据源）。
+///
+/// Wayland 的窗口状态**只由 compositor 决定**（`configure` 的状态位与 `wm_capabilities`），
+/// 应用不能直接假设：请求了最大化不等于真的最大化了。本结构由平台层每轮泵写入，应用在画
+/// 标题栏时读 [`Window::state`]：
+///
+/// - `client_decoration == false` ⇒ compositor 要求服务端装饰（SSD）：**不要画标题栏**，
+///   否则屏幕上出现两条（R10-4）；此时客户区就是整个 surface。
+/// - `can_maximize` / `can_minimize` / `can_fullscreen` ⇒ 对应按钮是否可用（不可用时隐藏或
+///   禁用，否则用户点了没反应，R10-15）。
+/// - `maximized` / `fullscreen` ⇒ 当前真实状态（按钮应显示「还原 / 退出全屏」）。
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowState {
+    /// compositor 是否要求**客户端**装饰（`true` = 自绘标题栏）。
+    pub client_decoration: bool,
+    /// 当前是否最大化。
+    pub maximized: bool,
+    /// 当前是否全屏。
+    pub fullscreen: bool,
+    /// compositor 是否支持最大化请求。
+    pub can_maximize: bool,
+    /// compositor 是否支持最小化请求。
+    pub can_minimize: bool,
+    /// compositor 是否支持全屏请求。
+    pub can_fullscreen: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl Default for WindowState {
+    fn default() -> Self {
+        // 未收到 `wm_capabilities` 时的保守默认：假定全部支持（与旧行为一致，不会凭空禁用
+        // 按钮）；装饰默认为客户端自绘（引擎的一贯行为）。
+        Self {
+            client_decoration: true,
+            maximized: false,
+            fullscreen: false,
+            can_maximize: true,
+            can_minimize: true,
+            can_fullscreen: true,
+        }
+    }
+}
+
+/// Linux/Wayland 文本输入的语义类型（`zwp_text_input_v3.set_content_type`）。
+///
+/// 只有 Linux 需要显式声明：text-input-v3 的默认值是 `hint = none` / `purpose = normal`，
+/// 输入法据此对**密码框**做拼写检查、候选联想与**用户词库学习** —— 对交易终端的 API key /
+/// 密码输入框而言这是安全问题（密钥会被写进用户词库、出现在候选里）。声明为
+/// [`Self::Password`] / [`Self::Pin`] 会同时打开 `sensitive_data` 与 `hidden_text` 两个 hint。
+///
+/// Windows（IMM32）与 macOS（`NSTextInputClient`）由原生控件语义表达，平台层没有对应请求，
+/// 因此本类型只在 Linux 上有消费者（[`Window::set_ime_content_type`]，`#[cfg(target_os =
+/// "linux")]`）。类型本身三平台可见：它同时是平台层映射表（`platform::ime`）的输入，而映射表
+/// 的纯逻辑必须在开发机（Windows）上可单测。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ImeContentType {
+    /// 普通文本（`purpose = normal`，无 hint）。
+    #[default]
+    Text,
+    /// 密码 / API key（`purpose = password` + `sensitive_data | hidden_text`）。
+    Password,
+    /// 纯数字密码（`purpose = pin` + `sensitive_data | hidden_text`）。
+    Pin,
+    /// 金额 / 数量（`purpose = number`，不敏感，允许小数与符号）。
+    Number,
 }
 
 /// 自绘标题栏的缩放边（与 `xdg_toplevel.resize` 的边一一对应）。
@@ -110,25 +183,16 @@ pub enum WindowResizeEdge {
 /// `WS_OVERLAPPEDWINDOW` 的系统标题栏，macOS 保留三个原生交通灯，Linux/Wayland 请求
 /// 客户端装饰并由应用自绘标题栏（`WindowControl` 提供按钮/拖动所需的平台请求）。
 ///
-/// # Windows 标题栏交互（P2-9）
+/// # Windows 标题栏 / 非客户区交互
 ///
-/// 系统标题栏仍由 Windows **绘制**（最小化/最大化/关闭按钮的行为不变），但按下后原本会进入
-/// Win32 模态循环的交互改由引擎消息循环接管：拖动标题栏、双击标题栏最大化/还原都在引擎自己
-/// 的泵里处理，拖动期间事件分发、动画与 HUD 照常推进，不会阻塞。标题栏左上角图标区按普通
-/// 标题栏处理（拖动 / 双击最大化）。
+/// **完全交系统**（R07-2）：引擎不接管 `WM_NCCALCSIZE` / `WM_NCHITTEST` /
+/// `WM_NCLBUTTONDOWN`。拖动标题栏、拖边框缩放、双击标题栏最大化/还原、右键标题栏与图标区的
+/// 系统菜单、`Alt+Space`、以及 **Aero Snap / Win11 Snap Layouts** 都由 `DefWindowProcW` 进入
+/// 的原生 move/size 模态循环提供（Chrome / GPUI / Qt 的选择相同 —— 这些手势只存在于系统循环
+/// 内部，应用自己 `SetWindowPos` 永远无法复现）。
 ///
-/// 代价：拖动不再经过系统的 move 循环，因此没有 Aero Snap（拖到屏幕边缘吸附/最大化）与
-/// 摇动最小化；多显示器拖动按光标所在显示器的工作区钳制（标题栏不会被拖出屏幕）。需要吸附
-/// 行为时由应用在窗口位置上自行实现。
-///
-/// 引擎**不提供**系统菜单：右键标题栏、标题栏左上角图标、`Alt+Space` 都不会弹出菜单
-/// （系统菜单是 `TrackPopupMenu` 的模态循环，会重新引入 P2-9 的泵阻塞），标题栏右键也**不会**
-/// 转成应用事件。需要上下文菜单的应用请用浮层能力在自绘控件上实现。
-///
-/// **无障碍影响**（第三轮复审 W2-1）：系统菜单原本提供键盘可达的「移动 / 大小（方向键）」与
-/// 「最小化 / 最大化 / 关闭」入口，屏蔽后键鼠用户仍可用 `Win+方向键`、`Alt+F4`、双击标题栏与
-/// 系统按钮，但「用方向键移动/缩放窗口」这一 AT/键盘路径不再存在。需要完整键盘窗口管理的应用
-/// 应自行提供对应快捷键并在 UI 中暴露。
+/// 代价（有意取舍）：模态循环期间本线程的消息泵被系统占用，窗口内容在拖动/缩放中**不重绘**
+/// （渲染线程仍在跑，旧内容保持 1:1 呈现）；拖动中推进的动画/HUD 会在松手后补上。
 #[derive(Clone, Debug, PartialEq)]
 pub struct WindowOptions {
     /// 标题（`SmolStr`，AGENTS §2.2）。
@@ -313,6 +377,15 @@ pub struct Window {
     a11y: crate::a11y::adapter::A11yBridge,
     /// IME caret hint（P16：应用声明的文本节点 + UTF-8 字节偏移）。
     ime_cursor: Option<ImeCursorRequest>,
+    /// Linux：当前焦点文本域的语义类型（`zwp_text_input_v3.set_content_type` 的数据源）。
+    ///
+    /// 密码 / API key 输入框必须切到 [`ImeContentType::Password`]：text-input-v3 的默认值
+    /// （`hint = none` / `purpose = normal`）会让输入法对其做联想与**用户词库学习**。
+    #[cfg(target_os = "linux")]
+    ime_content: ImeContentType,
+    /// Linux：compositor 侧的窗口状态镜像（最大化 / 全屏 / 装饰模式 / 可用能力）。
+    #[cfg(target_os = "linux")]
+    state: WindowState,
     /// 最近一帧的实际 GPU 绘制统计（P17 HUD）。
     #[cfg(feature = "hud")]
     render_stats: crate::render::RenderStats,
@@ -370,6 +443,10 @@ impl Window {
             pending_damage: None,
             a11y: crate::a11y::adapter::A11yBridge::new(),
             ime_cursor: None,
+            #[cfg(target_os = "linux")]
+            ime_content: ImeContentType::default(),
+            #[cfg(target_os = "linux")]
+            state: WindowState::default(),
             #[cfg(feature = "hud")]
             render_stats: crate::render::RenderStats::default(),
             #[cfg(feature = "hud")]
@@ -661,6 +738,50 @@ impl Window {
     }
     pub(crate) fn ime_cursor_area(&self) -> Result<Option<Rect>, EngineError> {
         focus::ime_cursor_area(self)
+    }
+
+    // ── Linux：文本输入的语义类型（`zwp_text_input_v3.set_content_type`）──
+
+    /// 声明本窗口当前焦点文本域的语义类型（Linux/Wayland；其它平台由原生控件语义表达）。
+    ///
+    /// 应用在焦点进入敏感输入框（密码 / API key）时调用 [`ImeContentType::Password`]，离开时
+    /// 切回 [`ImeContentType::Text`]。平台层每轮泵读取最新值，变化时下发
+    /// `set_content_type` + `commit`（text-input-v3 的请求是双缓冲状态）。
+    ///
+    /// 语义范围是**整个窗口**（一个 `zwp_text_input_v3` 只描述当前焦点 surface 的上下文），
+    /// 所以同一窗口里密码框与普通输入框并存时，以最后声明的为准 —— 宁可让普通输入框少一点
+    /// 联想，也不能让密钥进入输入法词库。
+    #[cfg(target_os = "linux")]
+    pub fn set_ime_content_type(&mut self, content: ImeContentType) {
+        self.ime_content = content;
+    }
+
+    /// 当前声明的文本输入语义类型（平台层读点）。
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub(crate) fn ime_content_type(&self) -> ImeContentType {
+        self.ime_content
+    }
+
+    // ── Linux：compositor 侧的窗口状态镜像 ──
+
+    /// 平台写入的窗口状态（compositor 说了算；应用画标题栏时读它）。
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn state(&self) -> WindowState {
+        self.state
+    }
+
+    /// 平台层写入新状态；返回是否真的变化（同值 no-op，避免每轮无意义地失效样式）。
+    ///
+    /// 消费者：`platform::linux::event_loop` 的逐窗口镜像。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_state(&mut self, state: WindowState) -> bool {
+        if self.state == state {
+            return false;
+        }
+        self.state = state;
+        true
     }
 
     // ── record：实现见 `record` 子模块的自由函数 ──

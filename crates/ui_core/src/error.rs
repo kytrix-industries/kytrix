@@ -23,6 +23,81 @@ use crate::{
     window::WindowId,
 };
 
+/// Wayland 协议层失败的分类（[`EngineError::Wayland`] 的 `kind`，R10-16）。
+///
+/// 分类依据是**处理策略**，不是错误码来源：
+///
+/// | 分类 | 触发者 | 调用方应做什么 |
+/// |---|---|---|
+/// | [`Self::CompositorGone`] | `EPIPE` / `ENOENT` / 连接被关闭（合成器崩溃、注销、VT 切换） | 提示用户并退出；重连需要重建整条管线 |
+/// | [`Self::Protocol`] | `EPROTO` / `BadMessage`（发给未知对象 id 的事件、非法请求序列） | 客户端 bug：写日志 + 上报，不要重试 |
+/// | [`Self::MissingGlobal`] | 必需 global 缺失 / 版本不足（`xdg_wm_base` / `wl_compositor` / …） | 环境不支持：提示用户（Linux 不回退 X11，I10） |
+/// | [`Self::SurfaceLost`] | 单个 surface / role 对象失效（拿不到首个 configure、事件路由不到窗口） | 关闭该窗口或重建它 —— **不必**杀掉整个进程 |
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WaylandErrorKind {
+    /// 合成器消失 / 连接断开（`EPIPE` / `ENOENT` / 读端 EOF）。
+    CompositorGone,
+    /// 协议错误（`EPROTO` / `BadMessage`）：客户端违反了协议。
+    Protocol,
+    /// 缺少必需的 global，或已绑定的版本低于要求。
+    MissingGlobal,
+    /// 单个 surface / role 对象已失效（窗口级失败）。
+    SurfaceLost,
+}
+
+impl WaylandErrorKind {
+    /// 稳定诊断名（`Display` 用；日志/CI 可 grep）。
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CompositorGone => "compositor gone",
+            Self::Protocol => "protocol error",
+            Self::MissingGlobal => "missing global",
+            Self::SurfaceLost => "surface lost",
+        }
+    }
+
+    /// 是否值得重试（只有窗口级的失效可以重建后重试）。
+    #[must_use]
+    pub const fn is_recoverable(self) -> bool {
+        matches!(self, Self::SurfaceLost)
+    }
+
+    /// 把底层 IO 错误分类成 [`WaylandErrorKind`]（R10-16）。
+    ///
+    /// 依据是**处理策略**而不是错误文本：
+    ///
+    /// - `EPIPE` / `ECONNRESET` / `ENOENT` / `EBADF` ⇒ 连接没了（合成器崩溃、会话注销、
+    ///   `WAYLAND_DISPLAY` 指向的 socket 被删）⇒ [`Self::CompositorGone`]；
+    /// - `EPROTO` ⇒ 协议错误（客户端发了非法请求，或服务端发来了本端不认识的对象事件）
+    ///   ⇒ [`Self::Protocol`]；
+    /// - 其余（含 `WouldBlock` 之类的瞬时错误，调用方不该把它们送进来）归
+    ///   [`Self::Protocol`]：宁可报「客户端 bug」也不要谎称「合成器还在」。
+    #[must_use]
+    pub fn from_io_error(error: &std::io::Error) -> Self {
+        /// Linux `EPROTO`：libwayland 与 `calloop-wayland-source` 都把它当作协议错误上报。
+        const EPROTO: i32 = 71;
+        use std::io::ErrorKind;
+        if error.raw_os_error() == Some(EPROTO) {
+            return Self::Protocol;
+        }
+        match error.kind() {
+            ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::NotFound
+            | ErrorKind::UnexpectedEof => Self::CompositorGone,
+            _ => Self::Protocol,
+        }
+    }
+}
+
+impl std::fmt::Display for WaylandErrorKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// 引擎公开错误枚举。
 ///
 /// 全部变体的 `source()` 均为 `None`：不包装外部错误类型，外部错误码（HRESULT / `VkResult` /
@@ -47,9 +122,18 @@ pub enum EngineError {
     #[error("graphics device lost: {reason}; diagnostics written to {log_path}")]
     DeviceLost { reason: SmolStr, log_path: PathBuf },
 
-    /// Wayland 合成器不满足基线（缺 `xdg_wm_base` / 版本不足 / 无 `wl_output` 等）。Linux 不回退其它窗口系统。
-    #[error("Wayland compositor does not meet requirements: {detail}")]
-    WaylandCompositor { detail: SmolStr },
+    /// Wayland 协议层失败（R10-16）。
+    ///
+    /// **按 `kind` 分派**，不要把运行期断连折叠成 [`EngineError::AppInit`]：合成器消失要提示
+    /// 「合成器断开，请重新登录会话」，协议错误是本客户端的 bug（需要日志 + 上报），两者对用户
+    /// 与对 CI 的意义完全不同。Linux 不回退其它窗口系统（I10）。
+    #[error("Wayland {kind}: {detail}")]
+    Wayland {
+        /// 失败分类（调用方据此决定「退出 / 重连 / 报 bug」）。
+        kind: WaylandErrorKind,
+        /// 具体诊断（含 libwayland 的原始错误文本 / 缺失的 global 名）。
+        detail: SmolStr,
+    },
 
     /// shader 产物加载失败。`target` 为 `"dxil"` / `"metallib"` / `"spirv"`。
     #[error("failed to load shader artifact for {target} at {path}")]
@@ -111,9 +195,10 @@ pub enum EngineError {
          each rounded clip costs one entry)"
     )]
     ClipDepthExceeded {
-        /// 编码期实际链长。
+        /// 编码期的**圆角层数**（矩形项在编码期被求交合并成一条 scissor，不占预算；
+        /// 链长上界 = 该值 + 0/1 条矩形项）。
         depth: u8,
-        /// 上限（`MAX_CLIP_DEPTH`）。
+        /// 圆角层数上限（`MAX_CLIP_DEPTH`）。
         limit: u8,
     },
 
@@ -186,7 +271,8 @@ mod tests {
                 reason: SmolStr::new_static("DXGI_ERROR_DEVICE_REMOVED"),
                 log_path: PathBuf::from("logs/dred.txt"),
             },
-            EngineError::WaylandCompositor {
+            EngineError::Wayland {
+                kind: WaylandErrorKind::MissingGlobal,
                 detail: SmolStr::new_static("xdg_wm_base version 3 required"),
             },
             EngineError::ShaderLoad {
@@ -380,13 +466,57 @@ mod tests {
     }
 
     #[test]
-    fn wayland_compositor_display_includes_detail() {
-        let text = EngineError::WaylandCompositor {
-            detail: SmolStr::new_static("no wl_output"),
+    fn wayland_error_display_names_the_kind_and_detail() {
+        let text = EngineError::Wayland {
+            kind: WaylandErrorKind::MissingGlobal,
+            detail: SmolStr::new_static("xdg_wm_base"),
         }
         .to_string();
 
-        assert!(text.contains("no wl_output"), "{text}");
+        assert!(text.contains("missing global"), "{text}");
+        assert!(text.contains("xdg_wm_base"), "{text}");
+    }
+
+    /// R10-16：分类必须能区分「合成器消失」与「客户端 bug」—— 处理策略不同。
+    #[test]
+    fn wayland_error_kinds_are_classified_by_recovery_strategy() {
+        assert!(!WaylandErrorKind::CompositorGone.is_recoverable());
+        assert!(!WaylandErrorKind::Protocol.is_recoverable());
+        assert!(!WaylandErrorKind::MissingGlobal.is_recoverable());
+        assert!(
+            WaylandErrorKind::SurfaceLost.is_recoverable(),
+            "单个 surface 失效可以重建窗口，不必杀进程"
+        );
+        assert_eq!(WaylandErrorKind::Protocol.as_str(), "protocol error");
+    }
+
+    /// R10-16：`calloop` / libwayland 的 IO 失败必须落进正确的分类。
+    #[test]
+    fn io_errors_map_to_wayland_error_kinds() {
+        use std::io::{Error, ErrorKind};
+
+        for kind in [
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::NotFound,
+            ErrorKind::UnexpectedEof,
+        ] {
+            assert_eq!(
+                WaylandErrorKind::from_io_error(&Error::new(kind, "gone")),
+                WaylandErrorKind::CompositorGone,
+                "{kind:?} 表示连接没了"
+            );
+        }
+        // EPROTO（Linux errno 71）：协议错误 ⇒ 客户端 bug，不能报「合成器消失」。
+        assert_eq!(
+            WaylandErrorKind::from_io_error(&Error::from_raw_os_error(71)),
+            WaylandErrorKind::Protocol
+        );
+        assert_eq!(
+            WaylandErrorKind::from_io_error(&Error::new(ErrorKind::InvalidInput, "bad")),
+            WaylandErrorKind::Protocol
+        );
     }
 
     #[test]

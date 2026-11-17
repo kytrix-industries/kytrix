@@ -1,33 +1,44 @@
 //! `WndProc` 消息分派与 `WndProcState` 的集成单测（真实隐藏窗口）。
+//!
+//! 非客户区（拖动 / 缩放 / 双击最大化 / 系统菜单 / Snap）现在**完全由系统提供**
+//! （R07-2），所以这里不再有自绘拖动/缩放状态机的用例；取而代之的是
+//! `nonclient_hit_table_returns_system_hit_codes` —— 它钉死「`WM_NCHITTEST` 必须返回
+//! **系统命中码**」这个不变量（一旦有人又把它改写/吞掉，系统的模态循环就拿不到
+//! `HTCAPTION`，Snap 与双击最大化会同时失效）。
 
 use std::sync::Arc;
 
 use windows::Win32::{
     Foundation::{HWND, LPARAM, POINT, RECT, WPARAM},
+    Graphics::Gdi::ClientToScreen,
     System::LibraryLoader::GetModuleHandleW,
     UI::{
+        HiDpi::GetSystemMetricsForDpi,
         Input::{
             Ime::{GCS_RESULTSTR, ImmAssociateContext, ImmGetContext, ImmReleaseContext},
-            KeyboardAndMouse::{GetCapture, VK_ESCAPE},
+            KeyboardAndMouse::GetCapture,
         },
         WindowsAndMessaging::{
-            CreateWindowExW, DestroyWindow, GWLP_USERDATA, GetCursorPos, GetWindowRect, HTCAPTION,
-            HTRIGHT, IsZoomed, RegisterClassW, SendMessageW, SetWindowLongPtrW, WINDOW_EX_STYLE,
-            WM_CANCELMODE, WM_CAPTURECHANGED, WM_IME_CHAR, WM_IME_COMPOSITION, WM_IME_SETCONTEXT,
-            WM_IME_STARTCOMPOSITION, WM_INPUTLANGCHANGE, WM_KEYDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-            WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCLBUTTONDBLCLK,
-            WM_NCLBUTTONDOWN, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
-            WS_OVERLAPPEDWINDOW,
+            CreateWindowExW, DestroyWindow, GWLP_USERDATA, GetWindowRect, HTBOTTOMRIGHT, HTCAPTION,
+            HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON, HTMINBUTTON, HTSYSMENU, HTTOPLEFT,
+            RegisterClassW, SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SendMessageW, SetWindowLongPtrW,
+            WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_IME_CHAR, WM_IME_COMPOSITION,
+            WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_INPUTLANGCHANGE, WM_LBUTTONDOWN,
+            WM_MOUSEMOVE, WM_NCHITTEST, WM_SIZE, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
         },
     },
 };
 
-use super::super::{WndProcState, caption::CAPTION_TIMER_ID, wndproc};
+use super::super::{WndProcState, pump::A11Y_TIMER_ID, wndproc};
 use crate::{
     event::ImeEvent,
     platform::{
         dispatcher::{Dispatcher, WM_APP_COMPOSITION_WAKE},
         event::PlatformEvent,
+        windows::{
+            dpi,
+            ime::{self, ImeApplied, ImeCommand},
+        },
     },
     window::WindowId,
 };
@@ -99,37 +110,18 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("runtime")
 }
 
-/// 拖动测试装配：读出真实光标与当前窗口矩形，并把会话的「上一次应用位置」伪造到真实
-/// 光标之前 `delta` —— 下一次 apply 会产生确定的位移（测试不能移动真实光标）。
-fn stage_caption_delta(hwnd: HWND, raw: &mut WndProcState, delta: (i32, i32)) -> (POINT, RECT) {
-    let mut cursor = POINT::default();
-    let mut window = RECT::default();
-    // SAFETY: `hwnd` 由调用方的隐藏窗口保证存活；两个输出都是栈上值。
-    unsafe {
-        GetCursorPos(&mut cursor).expect("GetCursorPos");
-        GetWindowRect(hwnd, &mut window).expect("GetWindowRect");
+/// 两阶段驱动一次 IME 命令（与生产 `NativeWindow::sync_ime_enabled` 同序）。
+fn drive_ime(raw: &mut WndProcState, hwnd: HWND, command: Option<ImeCommand>) {
+    if let Some(command) = command {
+        let applied: ImeApplied = ime::execute(hwnd, command);
+        raw.note_ime_applied(applied);
     }
-    raw.caption_drag.as_mut().expect("drag session").cursor = POINT {
-        x: cursor.x - delta.0,
-        y: cursor.y - delta.1,
-    };
-    (cursor, window)
 }
 
-/// 拖动测试的期望位置：与生产 `apply_caption_drag` 同一个纯函数 + 同一个工作区/DPI。
-fn expected_caption_position(
-    hwnd: HWND,
-    cursor: POINT,
-    window: RECT,
-    delta: (i32, i32),
-) -> (i32, i32) {
-    let work = super::super::caption::cursor_work_area(cursor).expect("光标所在显示器工作区");
-    super::super::caption::caption_position(
-        window,
-        delta,
-        work,
-        super::super::caption::window_scale(hwnd),
-    )
+/// 等价的 `App::set_ime_enabled` 平台侧动作（计划 → 执行 → 写回）。
+fn set_ime_enabled(raw: &mut WndProcState, hwnd: HWND, enabled: bool) {
+    let command = raw.plan_ime_enabled(enabled);
+    drive_ime(raw, hwnd, command);
 }
 
 /// 复审 F2：不持有捕获时引擎的 `release_capture` 不得留下 suppress 残留
@@ -141,7 +133,9 @@ fn release_capture_without_ownership_leaves_no_suppress() {
     let (hwnd, state, class_name) = hidden_window("KytrixReleaseCaptureTest", dispatcher);
     // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
     let state = unsafe { &mut *state };
-    super::super::caption::release_capture(hwnd, state);
+    // SAFETY: 只读查询当前线程的捕获窗口。
+    assert!(unsafe { GetCapture() } != hwnd, "前置：本窗口不持有捕获");
+    super::super::pump::release_capture(hwnd, state);
     assert!(
         !state.suppress_capture_cancel,
         "没有捕获时不得置 suppress（会吞掉下一次真实取消）"
@@ -176,10 +170,51 @@ fn suppress_consumes_one_capture_change_and_clears() {
     let _ = class_name;
 }
 
-/// P1-1 回归：`WM_APP_COMPOSITION_WAKE` 只唤醒泵，**不**置帧唤醒位。
+/// R07-2 的连带语义：没有按键按下时的 `WM_CAPTURECHANGED` 不注入 `PointerCancel`。
 ///
-/// 旧实现调用 `state.wake()`：每次帧完成都会让泵多跑一次 `App::frame`（HUD 下是真实的
-/// paint + present），完成通知因此变成了额外的帧源。
+/// 非客户区交系统之后，原生 move/size 模态循环会自己 `SetCapture`/`ReleaseCapture`，于是每次
+/// 拖动/缩放窗口结束都会收到一条 `WM_CAPTURECHANGED`（此时按键已抬起）。不区分就会给应用打
+/// 一个幽灵「拖拽被取消」事件（清 hover、误触发 `DragPhase::Cancel`）。
+#[test]
+fn a_capture_change_without_buttons_down_is_not_a_cancel() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, class_name) = hidden_window("KytrixCaptureChangeIdle", dispatcher);
+    // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
+    let raw = unsafe { &mut *state };
+    let _ = raw.take_events();
+    // 前提：本用例运行时没有物理按键按下（CI 恒成立；人工跑测试也不会按住鼠标）。
+    assert!(!any_mouse_button_down(), "本用例要求没有物理按键按下");
+
+    // SAFETY: 隐藏窗口存活；消息同步派发到生产 `wndproc`。
+    unsafe {
+        let _ = SendMessageW(hwnd, WM_CAPTURECHANGED, None, None);
+    }
+
+    assert!(
+        !raw.take_events()
+            .iter()
+            .any(|event| matches!(event.event, PlatformEvent::PointerCancel)),
+        "按键已抬起时的捕获变化只是系统收尾，不得注入 PointerCancel"
+    );
+    destroy_hidden_window(hwnd, state);
+    let _ = class_name;
+}
+
+/// 有没有鼠标键处于按下状态（`GetKeyState` 高位）。
+fn any_mouse_button_down() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
+    };
+    [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2]
+        .into_iter()
+        .any(|key| {
+            // SAFETY: 无副作用的线程局部查询。
+            (unsafe { GetKeyState(i32::from(key.0)) }) < 0
+        })
+}
+
+/// P1-1 回归：`WM_APP_COMPOSITION_WAKE` 只唤醒泵，**不**置帧唤醒位。
 #[test]
 fn the_composition_wake_does_not_request_a_frame() {
     let _runtime = runtime();
@@ -201,38 +236,320 @@ fn the_composition_wake_does_not_request_a_frame() {
     destroy_hidden_window(hwnd, state);
 }
 
-/// P1-2b 回归：缩放期间的 `WM_MOUSEMOVE` 只记录光标，不移动窗口（`SetWindowPos` 在定时器
-/// tick / 抬起时合并）。旧实现每个鼠标消息都 `SetWindowPos` ⇒ 348 Hz 上报时 FPS 193.8。
+/// R07-10 回归：**只有** a11y 补发定时器允许经 `WM_TIMER` 唤醒帧。
+///
+/// 连续帧已改由合成器节拍线程驱动；一旦有人把 `WM_TIMER` 又接回帧生产，这条断言会抓住
+/// 「定时器驱动帧」的回归（旧实现的 1 ms 定时器正是 R07-10 的缺陷本体）。
 #[test]
-fn mouse_move_during_a_resize_does_not_move_the_window() {
+fn only_the_a11y_timer_wakes_a_frame() {
     let _runtime = runtime();
     let dispatcher = Dispatcher::new();
-    let (hwnd, state, _class) = hidden_window("KytrixWndProcResizePacing", Arc::clone(&dispatcher));
+    let (hwnd, state, _class) = hidden_window("KytrixWndProcTimer", Arc::clone(&dispatcher));
+    let _ = dispatcher.take_frame_wake();
 
-    let mut before = RECT::default();
     // SAFETY: 窗口由本测试创建且仍存活；`SendMessageW` 同步进入 `wndproc`。
     unsafe {
-        // 按下右边框：进入自绘缩放（定时器启动），不交给 DefWindowProcW 的模态循环。
-        SendMessageW(hwnd, WM_NCLBUTTONDOWN, Some(WPARAM(HTRIGHT as usize)), None);
-        GetWindowRect(hwnd, &mut before).expect("GetWindowRect");
-        SendMessageW(hwnd, WM_MOUSEMOVE, None, None);
+        SendMessageW(hwnd, WM_TIMER, Some(WPARAM(A11Y_TIMER_ID)), None);
     }
-    let mut after = RECT::default();
-    // SAFETY: 同上。
-    unsafe {
-        GetWindowRect(hwnd, &mut after).expect("GetWindowRect");
-    }
-    assert_eq!(
-        (after.left, after.top, after.right, after.bottom),
-        (before.left, before.top, before.right, before.bottom),
-        "WM_MOUSEMOVE 不得直接 SetWindowPos"
+    assert!(
+        dispatcher.take_frame_wake(),
+        "a11y 补发定时器必须能唤醒泵（否则被节流的交付永远不重试）"
     );
 
-    // 抬起：最终 apply（可能按真实光标位置移动窗口）+ 杀定时器 + 释放捕获。
+    // SAFETY: 同上；任意其它 id 的定时器不是帧源。
+    unsafe {
+        SendMessageW(hwnd, WM_TIMER, Some(WPARAM(A11Y_TIMER_ID + 1)), None);
+    }
+    assert!(!dispatcher.take_frame_wake(), "非 a11y 定时器不得唤醒帧");
+    destroy_hidden_window(hwnd, state);
+}
+
+/// R07-13 回归：同一批内的 `WM_MOUSEMOVE` 合并成一条（保留最后一条的位置）。
+///
+/// 系统以最高 1000 Hz 投递鼠标移动；旧实现每条都入队 + 唤醒 + 应用级派发（每条都做命中
+/// 测试与 hover 迁移），一批里 16 条只有最后一条对渲染有意义。
+#[test]
+fn mouse_moves_in_one_batch_coalesce_into_the_latest_position() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, _class) = hidden_window("KytrixWndProcMouseCoalesce", dispatcher);
+    // SAFETY: `state` 由 `hidden_window` 分配。
+    let raw = unsafe { &mut *state };
+    let _ = raw.take_events();
+
+    let point =
+        |x: i32, y: i32| LPARAM(((((y as u32) << 16) | (x as u32 & 0xFFFF)) as i32) as isize);
+    // SAFETY: 窗口由本测试创建且仍存活；`SendMessageW` 同步进入生产 `wndproc`。
+    unsafe {
+        // 预热：第一条移动会注册 `TrackMouseEvent` 并补一条 `PointerEnter`（R02-4），
+        // 它不属于本用例的观测范围。
+        SendMessageW(hwnd, WM_MOUSEMOVE, None, Some(point(0, 0)));
+    }
+    let _ = raw.take_events();
+
     // SAFETY: 同上。
     unsafe {
-        SendMessageW(hwnd, WM_LBUTTONUP, None, None);
+        SendMessageW(hwnd, WM_MOUSEMOVE, None, Some(point(10, 20)));
+        SendMessageW(hwnd, WM_MOUSEMOVE, None, Some(point(30, 40)));
+        SendMessageW(hwnd, WM_MOUSEMOVE, None, Some(point(50, 60)));
     }
+
+    let events = raw.take_events();
+    let moves: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event.event {
+            PlatformEvent::Pointer {
+                x,
+                y,
+                kind: crate::platform::event::PointerKind::Move,
+            } => Some((x, y)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        moves,
+        vec![(50, 60)],
+        "同批次的三条移动必须合并成一条（最后位置）"
+    );
+    destroy_hidden_window(hwnd, state);
+}
+
+/// 合并只在**连续**的移动之间生效：按钮事件必须切断合并链（顺序语义不能变）。
+#[test]
+fn a_button_event_breaks_the_mouse_move_coalescing() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, _class) = hidden_window("KytrixWndProcMouseBreak", dispatcher);
+    // SAFETY: 同上。
+    let raw = unsafe { &mut *state };
+    let _ = raw.take_events();
+
+    let point =
+        |x: i32, y: i32| LPARAM(((((y as u32) << 16) | (x as u32 & 0xFFFF)) as i32) as isize);
+    // SAFETY: 同上。
+    unsafe {
+        // 预热：第一条移动会补一条 `PointerEnter`，它不属于本用例的观测范围。
+        SendMessageW(hwnd, WM_MOUSEMOVE, None, Some(point(0, 0)));
+    }
+    let _ = raw.take_events();
+
+    // SAFETY: 同上。
+    unsafe {
+        SendMessageW(hwnd, WM_MOUSEMOVE, None, Some(point(10, 20)));
+        SendMessageW(hwnd, WM_LBUTTONDOWN, None, Some(point(30, 40)));
+        SendMessageW(hwnd, WM_MOUSEMOVE, None, Some(point(50, 60)));
+    }
+
+    let events = raw.take_events();
+    assert_eq!(
+        events.len(),
+        3,
+        "移动 / 按下 / 移动 必须各自成条（合并链被按钮切断）"
+    );
+    assert!(matches!(
+        events[1].event,
+        PlatformEvent::Pointer {
+            kind: crate::platform::event::PointerKind::Down(_),
+            ..
+        }
+    ));
+    destroy_hidden_window(hwnd, state);
+}
+
+/// R07-12 回归：`WM_DPICHANGED` 在 `WndProc` 内**同步**生效。
+///
+/// 断言三件事：
+/// 1. 窗口按系统建议矩形落位（不等下一轮泵）；
+/// 2. `WndProcState` 的 scale 立刻是新值（`WM_GETMINMAXINFO` 等读到新值）；
+/// 3. **同批次后续**输入事件的 `StampedEvent::scale` 是新 scale（旧实现要等整批派发完
+///    才应用 DPI，同批鼠标位移会用旧 scale 换算 ⇒ 跨屏拖动时指针跳变）。
+#[test]
+fn a_dpi_change_applies_immediately_and_stamps_later_events() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, _class) = hidden_window("KytrixWndProcDpi", dispatcher);
+    // SAFETY: `state` 由 `hidden_window` 分配。
+    let raw = unsafe { &mut *state };
+    let _ = raw.take_events();
+    // 预热鼠标跟踪：第一条 `WM_MOUSEMOVE` 会注册 `TrackMouseEvent` 并补一条 `PointerEnter`，
+    // 后者不属于本用例的观测范围（否则「同批后续移动」会多出一条 enter）。
+    // SAFETY: 窗口由本测试创建且仍存活；`SendMessageW` 同步进入生产 `wndproc`。
+    unsafe {
+        SendMessageW(hwnd, WM_MOUSEMOVE, None, Some(LPARAM(0)));
+    }
+    let _ = raw.take_events();
+    let suggested = RECT {
+        left: 40,
+        top: 50,
+        right: 840,
+        bottom: 650,
+    };
+
+    // SAFETY: 窗口由本测试创建且仍存活；`WM_DPICHANGED` 的 lParam 在消息处理期有效。
+    unsafe {
+        SendMessageW(
+            hwnd,
+            windows::Win32::UI::WindowsAndMessaging::WM_DPICHANGED,
+            Some(WPARAM(192)),
+            Some(LPARAM((&raw const suggested) as isize)),
+        );
+    }
+
+    let events = raw.take_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.event, PlatformEvent::Dpi { dpi: 192 })),
+        "必须派发 Dpi{{192}}，实际 {events:?}"
+    );
+    assert_eq!(
+        raw.scale().factor(),
+        2.0,
+        "WndProcState 必须立刻换到新 scale"
+    );
+
+    let mut placed = RECT::default();
+    // SAFETY: 窗口存活；`placed` 是栈上输出。
+    unsafe {
+        GetWindowRect(hwnd, &mut placed).expect("GetWindowRect");
+    }
+    // 建议矩形（800×600）比 192 dpi 下的最小跟踪尺寸大，系统不会钳制 ⇒ 位置与尺寸逐字落地。
+    assert!(
+        raw.min_size.0 <= 800 && raw.min_size.1 <= 600,
+        "前置：建议矩形必须大于最小跟踪尺寸（否则会被系统钳制），min_size={:?}",
+        raw.min_size
+    );
+    assert_eq!(
+        (
+            placed.left,
+            placed.top,
+            placed.right - placed.left,
+            placed.bottom - placed.top
+        ),
+        (40, 50, 800, 600),
+        "必须同步套用系统建议矩形（不等下一轮泵）"
+    );
+
+    // 同批后续移动：`StampedEvent::scale` 必须是新 scale。
+    // SAFETY: 同上。
+    unsafe {
+        SendMessageW(hwnd, WM_MOUSEMOVE, None, Some(LPARAM(0x000A_0014)));
+    }
+    let later = raw.take_events();
+    assert_eq!(later.len(), 1, "一条移动事件，实际 {later:?}");
+    assert_eq!(
+        later[0].scale.factor(),
+        2.0,
+        "同批后续输入必须用新 scale（R07-12）"
+    );
+    destroy_hidden_window(hwnd, state);
+}
+
+/// R07-2 回归：`WM_NCHITTEST` 必须返回**系统命中码**。
+///
+/// `HTCAPTION` / `HT*` 是系统 move/size 模态循环的入场券：`DefWindowProcW` 只有在按下
+/// `HTCAPTION` 时才进入原生拖动循环（Aero Snap / Snap Layouts / 双击最大化 / 右键系统菜单
+/// 都在里面）。引擎接管过这些区域 ⇒ 全部系统手势消失。这张命中表把「系统拥有非客户区」
+/// 钉死在测试里。
+#[test]
+fn nonclient_hit_table_returns_system_hit_codes() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, _class) = hidden_window("KytrixWndProcHitTest", dispatcher);
+
+    let mut window = RECT::default();
+    let mut client = RECT {
+        right: 320,
+        bottom: 240,
+        ..RECT::default()
+    };
+    // SAFETY: 窗口存活；两个输出都是栈上值。
+    unsafe {
+        GetWindowRect(hwnd, &mut window).expect("GetWindowRect");
+        let mut origin = POINT::default();
+        let _ = ClientToScreen(hwnd, &mut origin);
+        client.left = origin.x;
+        client.top = origin.y;
+        client.right += origin.x;
+        client.bottom += origin.y;
+    }
+    let middle_x = (client.left + client.right) / 2;
+    let middle_y = (client.top + client.bottom) / 2;
+
+    let hit = |point: POINT| -> u32 {
+        // SAFETY: 窗口存活；`WM_NCHITTEST` 的 lParam 是两个 16 位屏幕坐标。
+        let encoded = ((((point.y as u32) << 16) | (point.x as u32 & 0xFFFF)) as i32) as isize;
+        let result = unsafe { SendMessageW(hwnd, WM_NCHITTEST, None, Some(LPARAM(encoded))) };
+        result.0 as u32
+    };
+
+    assert_eq!(
+        hit(POINT {
+            x: middle_x,
+            y: middle_y
+        }),
+        HTCLIENT,
+        "客户区必须是 HTCLIENT（引擎自绘内容区）"
+    );
+    let caption_y = (window.top + client.top) / 2;
+    assert_eq!(
+        hit(POINT {
+            x: middle_x,
+            y: caption_y
+        }),
+        HTCAPTION,
+        "标题栏必须是 HTCAPTION：系统的 move 模态循环（Snap / 双击最大化）只认它"
+    );
+    assert_eq!(
+        hit(POINT {
+            x: window.left + 1,
+            y: middle_y
+        }),
+        HTLEFT,
+        "左边框必须是 HTLEFT：缩放同样由系统模态循环提供"
+    );
+    assert_eq!(
+        hit(POINT {
+            x: window.left + 1,
+            y: window.top + 1
+        }),
+        HTTOPLEFT,
+        "左上角必须是 HTTOPLEFT"
+    );
+    assert_eq!(
+        hit(POINT {
+            x: window.right - 1,
+            y: window.bottom - 1
+        }),
+        HTBOTTOMRIGHT,
+        "窗口右下角必须是 HTBOTTOMRIGHT（系统的缩放模态循环只认 HT*）"
+    );
+    // 系统菜单图标：标题栏最左侧（边框之后）。允许命中 `HTSYSMENU`（双击关闭 / 单击出菜单
+    // 都是系统行为）。
+    let dpi = dpi::window_dpi(hwnd);
+    // SAFETY: 无参数、无副作用的系统度量查询。
+    let frame = unsafe {
+        GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
+    }
+    .max(1);
+    assert_eq!(
+        hit(POINT {
+            x: window.left + frame + 2,
+            y: caption_y
+        }),
+        HTSYSMENU,
+        "标题栏图标区必须是 HTSYSMENU（系统菜单 / 双击关闭）"
+    );
+    // 右侧按钮：具体是哪个取决于标题栏宽度，但必须仍在系统的按钮集合里（引擎不接管）。
+    let button = hit(POINT {
+        x: window.right - frame - 4,
+        y: caption_y,
+    });
+    assert!(
+        matches!(button, h if h == HTCLOSE || h == HTMAXBUTTON || h == HTMINBUTTON),
+        "标题栏右侧按钮必须由系统命中（HTMINBUTTON/HTMAXBUTTON/HTCLOSE 之一），实际 {button}"
+    );
+
     destroy_hidden_window(hwnd, state);
 }
 
@@ -262,7 +579,7 @@ fn disabled_ime_swallows_composition_events_until_reenabled() {
         "启用态必须派发 ImeEvent::Start"
     );
 
-    raw.set_ime_enabled(hwnd, false);
+    set_ime_enabled(raw, hwnd, false);
     assert!(!raw.ime_enabled(), "禁用状态必须被记账");
     // 组合开始 / 提交 / IME 字符三条路径都要被吞掉。
     // SAFETY: 同上。
@@ -281,7 +598,7 @@ fn disabled_ime_swallows_composition_events_until_reenabled() {
         "禁用期间不得派发任何 Ime / Text 事件"
     );
 
-    raw.set_ime_enabled(hwnd, true);
+    set_ime_enabled(raw, hwnd, true);
     assert!(raw.ime_enabled(), "重新启用状态必须被记账");
     // SAFETY: 同上。
     unsafe {
@@ -294,6 +611,58 @@ fn disabled_ime_swallows_composition_events_until_reenabled() {
         "重新启用后必须恢复派发"
     );
 
+    destroy_hidden_window(hwnd, state);
+}
+
+/// R07-3：启用态下 `WM_IME_SETCONTEXT` 只做掩码后交默认过程，**不得**派发应用事件、
+/// 也不得摘掉输入上下文（掩码位本身的断言在 `ime::tests` 的纯函数用例里）。
+#[test]
+fn an_enabled_setcontext_is_forwarded_without_events_or_detaching() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, _class) = hidden_window("KytrixWndProcImeSetContext", dispatcher);
+    // SAFETY: `state` 由 `hidden_window` 分配。
+    let raw = unsafe { &mut *state };
+    let _ = raw.take_events();
+
+    // SAFETY: 窗口由本测试创建且仍存活。
+    let baseline = unsafe { ImmGetContext(hwnd) };
+    if baseline.is_invalid() {
+        eprintln!("skip: hidden window has no IME context");
+        destroy_hidden_window(hwnd, state);
+        return;
+    }
+    // SAFETY: 句柄成对释放。
+    unsafe {
+        let _ = ImmReleaseContext(hwnd, baseline);
+    }
+
+    // SAFETY: 同上；wParam = TRUE（上下文激活），lParam 带组合窗标志。
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_IME_SETCONTEXT,
+            Some(WPARAM(1)),
+            Some(LPARAM(
+                windows::Win32::UI::Input::Ime::ISC_SHOWUICOMPOSITIONWINDOW as isize,
+            )),
+        );
+    }
+
+    assert!(
+        raw.take_events().is_empty(),
+        "WM_IME_SETCONTEXT 不是应用可见事件"
+    );
+    // SAFETY: 只读查询上下文，句柄成对释放。
+    let still_attached = unsafe { ImmGetContext(hwnd) };
+    assert!(
+        !still_attached.is_invalid(),
+        "启用态不得因为 SETCONTEXT 摘掉输入上下文"
+    );
+    // SAFETY: 同上。
+    unsafe {
+        let _ = ImmReleaseContext(hwnd, still_attached);
+    }
     destroy_hidden_window(hwnd, state);
 }
 
@@ -316,11 +685,13 @@ fn disabled_ime_detaches_a_reassociated_context() {
         destroy_hidden_window(hwnd, state);
         return;
     }
+    // SAFETY: 同上。
     unsafe {
         let _ = ImmReleaseContext(hwnd, baseline);
     }
 
-    raw.set_ime_enabled(hwnd, false);
+    set_ime_enabled(raw, hwnd, false);
+    // SAFETY: 窗口存活。
     assert!(
         unsafe { ImmGetContext(hwnd) }.is_invalid(),
         "禁用后窗口不得再关联上下文"
@@ -334,6 +705,7 @@ fn disabled_ime_detaches_a_reassociated_context() {
         let _ = ImmAssociateContext(hwnd, baseline);
         SendMessageW(hwnd, WM_IME_SETCONTEXT, Some(WPARAM(1)), Some(LPARAM(0)));
     }
+    // SAFETY: 窗口存活。
     assert!(
         unsafe { ImmGetContext(hwnd) }.is_invalid(),
         "WM_IME_SETCONTEXT 必须把重新关联的上下文再摘掉"
@@ -345,565 +717,74 @@ fn disabled_ime_detaches_a_reassociated_context() {
         let _ = ImmAssociateContext(hwnd, baseline);
         SendMessageW(hwnd, WM_INPUTLANGCHANGE, Some(WPARAM(0)), Some(LPARAM(0)));
     }
+    // SAFETY: 窗口存活。
     assert!(
         unsafe { ImmGetContext(hwnd) }.is_invalid(),
         "WM_INPUTLANGCHANGE 必须把重新关联的上下文再摘掉"
     );
 
     // 重新启用：恢复的必须是最初保存的那个上下文（再摘除没有把它覆盖掉）。
-    raw.set_ime_enabled(hwnd, true);
+    set_ime_enabled(raw, hwnd, true);
+    // SAFETY: 窗口存活。
     let restored = unsafe { ImmGetContext(hwnd) };
     assert_eq!(restored, baseline, "重新启用必须恢复最初保存的上下文");
-    // SAFETY: 同上。
+    // SAFETY: 句柄成对释放。
     unsafe {
         let _ = ImmReleaseContext(hwnd, restored);
     }
     destroy_hidden_window(hwnd, state);
 }
 
-/// P2-9 回归：按下标题栏进入自绘拖动（不交给 `DefWindowProcW` 的 move 模态循环），
-/// 拖动期间的 `WM_MOUSEMOVE` 不直接移动窗口（由 1 ms 定时器合并），抬起收尾并释放捕获。
+/// `WM_SIZE` 的 `Resized` 事件必须用**该消息的 scale** 换算逻辑尺寸（R07-12 的另一半）：
+/// `WM_SIZE` 与 `WM_DPICHANGED` 同批到达时，用窗口侧旧 scale 会把逻辑尺寸算错。
 #[test]
-fn caption_press_starts_and_ends_the_engine_drag() {
+fn a_resize_event_is_stamped_with_the_message_scale() {
     let _runtime = runtime();
     let dispatcher = Dispatcher::new();
-    let (hwnd, state, _class) = hidden_window("KytrixWndProcCaptionDrag", dispatcher);
-    // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
+    let (hwnd, state, _class) = hidden_window("KytrixWndProcResizeStamp", dispatcher);
+    // SAFETY: `state` 由 `hidden_window` 分配。
     let raw = unsafe { &mut *state };
-    let mut before = RECT::default();
-    let mut after = RECT::default();
+    let _ = raw.take_events();
+
+    // SAFETY: 窗口由本测试创建且仍存活。
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_SIZE,
+            Some(WPARAM(
+                windows::Win32::UI::WindowsAndMessaging::SIZE_RESTORED as usize,
+            )),
+            Some(LPARAM(640 | (480 << 16))),
+        );
+    }
+
+    let events = raw.take_events();
+    assert_eq!(events.len(), 1, "一条 Resize 事件，实际 {events:?}");
+    assert_eq!(events[0].scale, raw.scale());
+    assert!(matches!(
+        events[0].event,
+        PlatformEvent::Resize {
+            width: 640,
+            height: 480
+        }
+    ));
+    destroy_hidden_window(hwnd, state);
+}
+
+/// 任意未识别的消息不得被引擎吞掉：必须落到 `DefWindowProcW`（`WM_APP` 的默认处理是
+/// 「无动作」，但只要我们把返回值改写就会破坏系统语义）。
+#[test]
+fn unhandled_messages_fall_through_to_the_default_procedure() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, _class) = hidden_window("KytrixWndProcFallThrough", dispatcher);
     // SAFETY: 窗口由本测试创建且仍存活；`SendMessageW` 同步进入生产 `wndproc`。
-    unsafe {
-        SendMessageW(
-            hwnd,
-            WM_NCLBUTTONDOWN,
-            Some(WPARAM(HTCAPTION as usize)),
-            None,
-        );
-        assert!(raw.caption_drag.is_some(), "标题栏按下必须进入自绘拖动");
-        GetWindowRect(hwnd, &mut before).expect("GetWindowRect");
-        SendMessageW(hwnd, WM_MOUSEMOVE, None, None);
-        GetWindowRect(hwnd, &mut after).expect("GetWindowRect");
-    }
-    assert_eq!(
-        (after.left, after.top, after.right, after.bottom),
-        (before.left, before.top, before.right, before.bottom),
-        "拖动期间的 WM_MOUSEMOVE 不得直接 SetWindowPos（合并到定时器）"
-    );
-    // SAFETY: `GetCapture` 只读查询。
-    assert_eq!(
-        unsafe { GetCapture() },
-        hwnd,
-        "拖动期间窗口必须持有鼠标捕获"
-    );
+    let result = unsafe { SendMessageW(hwnd, WM_APP + 0x42, None, None) };
+    assert_eq!(result.0, 0, "未识别消息必须按默认过程返回");
 
-    // SAFETY: 同上。
-    unsafe {
-        SendMessageW(hwnd, WM_LBUTTONUP, None, None);
-    }
-    assert!(raw.caption_drag.is_none(), "抬起必须结束拖动");
-    // SAFETY: `GetCapture` 只读查询。
-    assert_ne!(unsafe { GetCapture() }, hwnd, "抬起后必须释放鼠标捕获");
-    assert!(
-        !raw.suppress_capture_cancel,
-        "引擎自己释放捕获产生的 WM_CAPTURECHANGED 必须被消费"
-    );
-    destroy_hidden_window(hwnd, state);
-}
-
-/// win-2 P3（任务 6）：拖动中的 `WM_TIMER` tick 按光标增量移动窗口；会话不结束、捕获保持。
-#[test]
-fn caption_timer_tick_moves_the_window_and_keeps_the_session() {
-    let _runtime = runtime();
-    let dispatcher = Dispatcher::new();
-    let (hwnd, state, _class) = hidden_window("KytrixWndProcCaptionTick", dispatcher);
-    // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
+    // 未识别消息也不得产生应用事件。
+    // SAFETY: `state` 由 `hidden_window` 分配。
     let raw = unsafe { &mut *state };
-    // SAFETY: 窗口由本测试创建且仍存活；消息同步派发到生产 `wndproc`。
-    unsafe {
-        SendMessageW(
-            hwnd,
-            WM_NCLBUTTONDOWN,
-            Some(WPARAM(HTCAPTION as usize)),
-            None,
-        );
-    }
-    assert!(raw.caption_drag.is_some(), "前置：拖动会话已开始");
-    let (cursor, before) = stage_caption_delta(hwnd, raw, (40, 30));
-
-    // SAFETY: 同上。
-    unsafe {
-        SendMessageW(hwnd, WM_TIMER, Some(WPARAM(CAPTION_TIMER_ID)), None);
-    }
-    let mut after = RECT::default();
-    // SAFETY: 同上。
-    unsafe {
-        GetWindowRect(hwnd, &mut after).expect("GetWindowRect");
-    }
-    let expected = expected_caption_position(hwnd, cursor, before, (40, 30));
-    assert_eq!(
-        (after.left, after.top),
-        expected,
-        "tick 必须按光标增量平移窗口"
-    );
-    assert!(raw.caption_drag.is_some(), "tick 不得结束拖动会话");
-    // SAFETY: `GetCapture` 只读查询。
-    assert_eq!(unsafe { GetCapture() }, hwnd, "拖动期间必须持有鼠标捕获");
-
-    // 收尾：抬起结束会话并释放捕获。
-    // SAFETY: 同上。
-    unsafe {
-        SendMessageW(hwnd, WM_LBUTTONUP, None, None);
-    }
-    destroy_hidden_window(hwnd, state);
-}
-
-/// win-2 P3（任务 6）：`WM_CAPTURECHANGED`（捕获被系统收回）用最新光标位置收尾，
-/// 会话归零并释放捕获。
-#[test]
-fn capture_change_ends_the_caption_drag_at_the_latest_cursor() {
-    let _runtime = runtime();
-    let dispatcher = Dispatcher::new();
-    let (hwnd, state, _class) = hidden_window("KytrixWndProcCaptionCapture", dispatcher);
-    // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
-    let raw = unsafe { &mut *state };
-    // SAFETY: 窗口由本测试创建且仍存活；消息同步派发到生产 `wndproc`。
-    unsafe {
-        SendMessageW(
-            hwnd,
-            WM_NCLBUTTONDOWN,
-            Some(WPARAM(HTCAPTION as usize)),
-            None,
-        );
-    }
-    let (cursor, before) = stage_caption_delta(hwnd, raw, (35, 25));
-
-    // SAFETY: 同上。
-    unsafe {
-        SendMessageW(hwnd, WM_CAPTURECHANGED, None, None);
-    }
-    let mut after = RECT::default();
-    // SAFETY: 同上。
-    unsafe {
-        GetWindowRect(hwnd, &mut after).expect("GetWindowRect");
-    }
-    let expected = expected_caption_position(hwnd, cursor, before, (35, 25));
-    assert_eq!(
-        (after.left, after.top),
-        expected,
-        "失去捕获时必须按最新光标位置收尾"
-    );
-    assert!(raw.caption_drag.is_none(), "失去捕获必须结束拖动会话");
-    // SAFETY: `GetCapture` 只读查询。
-    assert_ne!(unsafe { GetCapture() }, hwnd, "收尾后不得继续持有捕获");
-    assert!(
-        !raw.suppress_capture_cancel,
-        "引擎自己释放捕获产生的 WM_CAPTURECHANGED 必须被消费"
-    );
-    destroy_hidden_window(hwnd, state);
-}
-
-/// win-2 P3（任务 6）：`WM_CANCELMODE`（系统取消模态交互）同样按最新光标收尾。
-#[test]
-fn cancel_mode_ends_the_caption_drag_at_the_latest_cursor() {
-    let _runtime = runtime();
-    let dispatcher = Dispatcher::new();
-    let (hwnd, state, _class) = hidden_window("KytrixWndProcCaptionCancel", dispatcher);
-    // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
-    let raw = unsafe { &mut *state };
-    // SAFETY: 窗口由本测试创建且仍存活；消息同步派发到生产 `wndproc`。
-    unsafe {
-        SendMessageW(
-            hwnd,
-            WM_NCLBUTTONDOWN,
-            Some(WPARAM(HTCAPTION as usize)),
-            None,
-        );
-    }
-    let (cursor, before) = stage_caption_delta(hwnd, raw, (-30, 20));
-
-    // SAFETY: 同上。
-    unsafe {
-        SendMessageW(hwnd, WM_CANCELMODE, None, None);
-    }
-    let mut after = RECT::default();
-    // SAFETY: 同上。
-    unsafe {
-        GetWindowRect(hwnd, &mut after).expect("GetWindowRect");
-    }
-    let expected = expected_caption_position(hwnd, cursor, before, (-30, 20));
-    assert_eq!(
-        (after.left, after.top),
-        expected,
-        "WM_CANCELMODE 必须按最新光标位置收尾"
-    );
-    assert!(raw.caption_drag.is_none(), "WM_CANCELMODE 必须结束拖动会话");
-    // SAFETY: `GetCapture` 只读查询。
-    assert_ne!(unsafe { GetCapture() }, hwnd, "收尾后不得继续持有捕获");
-    destroy_hidden_window(hwnd, state);
-}
-
-/// win-2 P3（任务 3）：拖动中按 `Esc` 还原按下时的窗口矩形、结束会话、释放捕获，
-/// 且按键不投递给应用（参考原生 move 循环的取消语义）。
-#[test]
-fn escape_cancels_the_caption_drag_and_restores_the_origin() {
-    let _runtime = runtime();
-    let dispatcher = Dispatcher::new();
-    let (hwnd, state, _class) = hidden_window("KytrixWndProcCaptionEsc", dispatcher);
-    // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
-    let raw = unsafe { &mut *state };
-    // SAFETY: 窗口由本测试创建且仍存活；消息同步派发到生产 `wndproc`。
-    unsafe {
-        SendMessageW(
-            hwnd,
-            WM_NCLBUTTONDOWN,
-            Some(WPARAM(HTCAPTION as usize)),
-            None,
-        );
-    }
-    let origin = raw.caption_drag.expect("drag session").origin;
-
-    // 先真实移动一次窗口：证明 Esc 会把窗口放回起始矩形，而不只是结束会话。
-    stage_caption_delta(hwnd, raw, (60, 40));
-    // SAFETY: 同上。
-    unsafe {
-        SendMessageW(hwnd, WM_TIMER, Some(WPARAM(CAPTION_TIMER_ID)), None);
-    }
-    let mut moved = RECT::default();
-    // SAFETY: 同上。
-    unsafe {
-        GetWindowRect(hwnd, &mut moved).expect("GetWindowRect");
-    }
-    assert_ne!(
-        (moved.left, moved.top),
-        (origin.left, origin.top),
-        "前置：窗口已被拖动"
-    );
-
-    // SAFETY: 同上；`WM_KEYDOWN` 的 wParam 是虚拟键码。
-    unsafe {
-        SendMessageW(hwnd, WM_KEYDOWN, Some(WPARAM(VK_ESCAPE.0 as usize)), None);
-    }
-    let mut restored = RECT::default();
-    // SAFETY: 同上。
-    unsafe {
-        GetWindowRect(hwnd, &mut restored).expect("GetWindowRect");
-    }
-    assert_eq!(
-        (restored.left, restored.top, restored.right, restored.bottom),
-        (origin.left, origin.top, origin.right, origin.bottom),
-        "Esc 必须还原按下时的窗口矩形"
-    );
-    assert!(raw.caption_drag.is_none(), "Esc 必须结束拖动会话");
-    // SAFETY: `GetCapture` 只读查询。
-    assert_ne!(unsafe { GetCapture() }, hwnd, "Esc 必须释放鼠标捕获");
-    assert!(raw.take_events().is_empty(), "Esc 不得投递给应用");
-    destroy_hidden_window(hwnd, state);
-}
-
-/// win-2 P3（任务 3，最大化分支）：按下最大化窗口的标题栏并拖动到已还原之后，`Esc`
-/// 必须回到**最大化**状态（只还原矩形而不重新最大化会留下一个「还原态但占满屏幕」的窗口）。
-#[test]
-fn escape_cancels_a_restored_drag_back_to_maximized() {
-    let _runtime = runtime();
-    let dispatcher = Dispatcher::new();
-    let (hwnd, state, _class) = hidden_window("KytrixWndProcCaptionEscMax", dispatcher);
-    // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
-    let raw = unsafe { &mut *state };
-    // SAFETY: 窗口由本测试创建且仍存活；消息同步派发到生产 `wndproc`。
-    unsafe {
-        // 先最大化（双击标题栏），再按住标题栏拖动。
-        SendMessageW(
-            hwnd,
-            WM_NCLBUTTONDBLCLK,
-            Some(WPARAM(HTCAPTION as usize)),
-            None,
-        );
-        assert!(IsZoomed(hwnd).as_bool(), "前置：窗口已最大化");
-        SendMessageW(
-            hwnd,
-            WM_NCLBUTTONDOWN,
-            Some(WPARAM(HTCAPTION as usize)),
-            None,
-        );
-    }
-    assert!(
-        raw.caption_drag.expect("drag session").restore,
-        "前置：按下时等待还原（仍是最大化）"
-    );
-
-    // 位移超过系统拖拽阈值 ⇒ 还原并按光标摆位。
-    stage_caption_delta(hwnd, raw, (120, 60));
-    // SAFETY: 同上。
-    unsafe {
-        SendMessageW(hwnd, WM_TIMER, Some(WPARAM(CAPTION_TIMER_ID)), None);
-    }
-    // SAFETY: 同上。
-    assert!(
-        !unsafe { IsZoomed(hwnd) }.as_bool(),
-        "前置：拖动已经触发还原"
-    );
-
-    // SAFETY: 同上。
-    unsafe {
-        SendMessageW(hwnd, WM_KEYDOWN, Some(WPARAM(VK_ESCAPE.0 as usize)), None);
-    }
-    // SAFETY: 同上。
-    assert!(
-        unsafe { IsZoomed(hwnd) }.as_bool(),
-        "Esc 必须把通过拖动还原的最大化窗口重新最大化"
-    );
-    assert!(raw.caption_drag.is_none(), "Esc 必须结束拖动会话");
-    // SAFETY: `GetCapture` 只读查询。
-    assert_ne!(unsafe { GetCapture() }, hwnd, "Esc 必须释放鼠标捕获");
-    destroy_hidden_window(hwnd, state);
-}
-
-/// win-2 P3（任务 4）：拖动期间右键取消拖动并还原原位；中键 / 滚轮被吞掉（不产生应用
-/// 事件，也不结束会话）。
-#[test]
-fn right_click_cancels_the_caption_drag_and_buttons_are_swallowed() {
-    let _runtime = runtime();
-    let dispatcher = Dispatcher::new();
-    let (hwnd, state, _class) = hidden_window("KytrixWndProcCaptionButtons", dispatcher);
-    // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
-    let raw = unsafe { &mut *state };
-    // SAFETY: 窗口由本测试创建且仍存活；消息同步派发到生产 `wndproc`。
-    unsafe {
-        SendMessageW(
-            hwnd,
-            WM_NCLBUTTONDOWN,
-            Some(WPARAM(HTCAPTION as usize)),
-            None,
-        );
-    }
-    let origin = raw.caption_drag.expect("drag session").origin;
-    stage_caption_delta(hwnd, raw, (50, 30));
-    // SAFETY: 同上。
-    unsafe {
-        SendMessageW(hwnd, WM_TIMER, Some(WPARAM(CAPTION_TIMER_ID)), None);
-    }
-
-    // 中键 / 滚轮：拖动会话继续，应用收不到任何事件（捕获后坐标是负的客户区坐标）。
-    // SAFETY: 同上。
-    unsafe {
-        SendMessageW(hwnd, WM_MBUTTONDOWN, None, None);
-        SendMessageW(hwnd, WM_MBUTTONUP, None, None);
-        SendMessageW(hwnd, WM_MOUSEWHEEL, Some(WPARAM(120 << 16)), None);
-        SendMessageW(hwnd, WM_MOUSEHWHEEL, Some(WPARAM(120 << 16)), None);
-    }
-    assert!(raw.caption_drag.is_some(), "中键 / 滚轮不得结束拖动会话");
-    assert!(raw.take_events().is_empty(), "中键 / 滚轮不得投递给应用");
-
-    // 右键：没有系统菜单，按「取消拖动」处理 —— 还原原位、结束会话、释放捕获。
-    // SAFETY: 同上。
-    unsafe {
-        SendMessageW(hwnd, WM_RBUTTONDOWN, None, None);
-    }
-    assert!(raw.caption_drag.is_none(), "右键必须取消拖动");
-    assert!(raw.take_events().is_empty(), "右键不得投递给应用");
-    // SAFETY: `GetCapture` 只读查询。
-    assert_ne!(unsafe { GetCapture() }, hwnd, "右键取消必须释放鼠标捕获");
-    let mut restored = RECT::default();
-    // SAFETY: 同上。
-    unsafe {
-        GetWindowRect(hwnd, &mut restored).expect("GetWindowRect");
-    }
-    assert_eq!(
-        (restored.left, restored.top),
-        (origin.left, origin.top),
-        "右键取消必须还原按下时的位置"
-    );
-
-    // 重新按一次标题栏，再用右键抬起取消：down / up 两条消息都按「取消」处理
-    //（原生 move 循环里右键按下会打开菜单并结束移动，抬起消息不应漏给应用）。
-    // SAFETY: 同上。
-    unsafe {
-        SendMessageW(
-            hwnd,
-            WM_NCLBUTTONDOWN,
-            Some(WPARAM(HTCAPTION as usize)),
-            None,
-        );
-    }
-    assert!(raw.caption_drag.is_some(), "前置：拖动会话重新开始");
-    // SAFETY: 同上。
-    unsafe {
-        SendMessageW(hwnd, WM_RBUTTONUP, None, None);
-    }
-    assert!(raw.caption_drag.is_none(), "右键抬起也必须取消拖动");
-    destroy_hidden_window(hwnd, state);
-}
-
-/// win-2 P3（任务 5）：系统没投递 `WM_NCLBUTTONDBLCLK` 时（UI 线程卡顿），快速第二次
-/// 按下由自计时兜底判成双击：最大化，而不是开始新的拖动会话。
-#[test]
-fn self_timed_second_press_toggles_maximize() {
-    let _runtime = runtime();
-    let dispatcher = Dispatcher::new();
-    let (hwnd, state, _class) = hidden_window("KytrixWndProcSelfTimedDblClick", dispatcher);
-    // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
-    let raw = unsafe { &mut *state };
-    // SAFETY: 窗口由本测试创建且仍存活；消息同步派发到生产 `wndproc`。
-    unsafe {
-        SendMessageW(
-            hwnd,
-            WM_NCLBUTTONDOWN,
-            Some(WPARAM(HTCAPTION as usize)),
-            None,
-        );
-        assert!(raw.caption_drag.is_some(), "第一次按下开始拖动");
-        SendMessageW(hwnd, WM_LBUTTONUP, None, None);
-        // 第二次按下：与第一次在双击时间 / 矩形内，但没有 WM_NCLBUTTONDBLCLK。
-        SendMessageW(
-            hwnd,
-            WM_NCLBUTTONDOWN,
-            Some(WPARAM(HTCAPTION as usize)),
-            None,
-        );
-    }
-    assert!(
-        unsafe { IsZoomed(hwnd) }.as_bool(),
-        "自计时双击必须最大化窗口"
-    );
-    assert!(raw.caption_drag.is_none(), "双击不得开始新的拖动会话");
-
-    // 第三次快按：双击记录已被消费，应按普通按下开始拖动（不再切换最大化状态）。
-    // SAFETY: 同上。
-    unsafe {
-        SendMessageW(
-            hwnd,
-            WM_NCLBUTTONDOWN,
-            Some(WPARAM(HTCAPTION as usize)),
-            None,
-        );
-    }
-    assert!(
-        unsafe { IsZoomed(hwnd) }.as_bool(),
-        "第三次按下不得再次切换最大化状态"
-    );
-    assert!(raw.caption_drag.is_some(), "第三次按下应按普通拖动处理");
-    // SAFETY: 同上。
-    unsafe {
-        SendMessageW(hwnd, WM_LBUTTONUP, None, None);
-    }
-    destroy_hidden_window(hwnd, state);
-}
-
-/// P2-9 回归：双击标题栏由引擎自己 `ShowWindow` 最大化/还原，不进入系统 move 模态循环。
-#[test]
-fn double_click_on_the_caption_toggles_maximize() {
-    let _runtime = runtime();
-    let dispatcher = Dispatcher::new();
-    let (hwnd, state, _class) = hidden_window("KytrixWndProcCaptionDblClick", dispatcher);
-    // SAFETY: 窗口由本测试创建且仍存活；消息同步派发到生产 `wndproc`。
-    unsafe {
-        assert!(!IsZoomed(hwnd).as_bool(), "初始不是最大化");
-        SendMessageW(
-            hwnd,
-            WM_NCLBUTTONDBLCLK,
-            Some(WPARAM(HTCAPTION as usize)),
-            None,
-        );
-        assert!(IsZoomed(hwnd).as_bool(), "双击标题栏必须最大化");
-        SendMessageW(
-            hwnd,
-            WM_NCLBUTTONDBLCLK,
-            Some(WPARAM(HTCAPTION as usize)),
-            None,
-        );
-        assert!(!IsZoomed(hwnd).as_bool(), "再次双击必须还原");
-    }
-    destroy_hidden_window(hwnd, state);
-}
-
-/// P2-9 回归：单击（按下 + 抬起、没有拖动）最大化窗口的标题栏**不得**还原 ——
-/// 还原只应发生在拖动超过系统阈值时（与原生 move 循环一致）。
-#[test]
-fn clicking_the_caption_of_a_maximized_window_does_not_restore_it() {
-    let _runtime = runtime();
-    let dispatcher = Dispatcher::new();
-    let (hwnd, state, _class) = hidden_window("KytrixWndProcCaptionClick", dispatcher);
-    // SAFETY: 窗口由本测试创建且仍存活；消息同步派发到生产 `wndproc`。
-    unsafe {
-        SendMessageW(
-            hwnd,
-            WM_NCLBUTTONDBLCLK,
-            Some(WPARAM(HTCAPTION as usize)),
-            None,
-        );
-        assert!(IsZoomed(hwnd).as_bool(), "前置：窗口已最大化");
-        SendMessageW(
-            hwnd,
-            WM_NCLBUTTONDOWN,
-            Some(WPARAM(HTCAPTION as usize)),
-            None,
-        );
-        SendMessageW(hwnd, WM_LBUTTONUP, None, None);
-        assert!(
-            IsZoomed(hwnd).as_bool(),
-            "单击标题栏不得还原最大化窗口（只有拖动才还原）"
-        );
-    }
-    destroy_hidden_window(hwnd, state);
-}
-
-/// P2-9：最大化窗口的标题栏拖动**超过系统阈值**后由引擎还原；阈值内不还原。
-///
-/// 直接驱动 `restore_maximized_for_drag`（拖动分支的唯一还原点），用合成光标位置替代
-/// 真实鼠标，避免测试依赖光标/前台窗口状态。
-#[test]
-fn dragging_a_maximized_caption_restores_it_after_the_threshold() {
-    let _runtime = runtime();
-    let dispatcher = Dispatcher::new();
-    let (hwnd, state, _class) = hidden_window("KytrixWndProcCaptionRestore", dispatcher);
-    // SAFETY: 窗口由本测试创建且仍存活；消息同步派发到生产 `wndproc`。
-    unsafe {
-        SendMessageW(
-            hwnd,
-            WM_NCLBUTTONDBLCLK,
-            Some(WPARAM(HTCAPTION as usize)),
-            None,
-        );
-    }
-    assert!(unsafe { IsZoomed(hwnd) }.as_bool(), "前置：窗口已最大化");
-
-    let press = POINT { x: 600, y: 10 };
-    let work = super::super::caption::cursor_work_area(press).expect("光标所在显示器工作区");
-    let scale = super::super::caption::window_scale(hwnd);
-    assert!(
-        !super::super::caption::restore_maximized_for_drag(
-            hwnd,
-            press,
-            POINT {
-                x: press.x + 1,
-                y: press.y + 1,
-            },
-            work,
-            scale,
-        ),
-        "未超过拖拽阈值时不得还原"
-    );
-    // SAFETY: 窗口仍存活。
-    assert!(unsafe { IsZoomed(hwnd) }.as_bool(), "阈值内不得还原");
-
-    assert!(
-        super::super::caption::restore_maximized_for_drag(
-            hwnd,
-            press,
-            POINT {
-                x: press.x + 120,
-                y: press.y + 60,
-            },
-            work,
-            scale,
-        ),
-        "超过阈值必须还原"
-    );
-    // SAFETY: 同上。
-    assert!(
-        !unsafe { IsZoomed(hwnd) }.as_bool(),
-        "还原后不再处于最大化状态"
-    );
+    assert!(raw.take_events().is_empty());
     destroy_hidden_window(hwnd, state);
 }

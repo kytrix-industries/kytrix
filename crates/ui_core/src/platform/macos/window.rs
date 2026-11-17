@@ -1,9 +1,13 @@
 //! 原生窗口：`NSWindow` + 自绘标题栏 + 交通灯（`design/phase-12-macos-linux.md` §7.3）。
 //!
-//! 状态同步（尺寸 / 缩放 / 焦点）走「每轮快照对比」而不是 delegate 或通知：泵每轮都要读
-//! 一次这些值（O(1)）。**唯一例外是关闭**：`windowShouldClose:` 是 AppKit 在关窗前唯一
-//! 的同步钩子，没有它就无法拦截用户点红点 / Cmd-W（窗口已被 AppKit 关掉，泵事后才观察
-//! 到，veto 也就失去意义）。见 [`CloseDelegate`]。
+//! 状态同步（尺寸 / 缩放 / 焦点 / 可见性）走「每轮快照对比」而不是 delegate 或通知：泵每轮都要
+//! 读一次这些值（O(1)）。**例外是关闭**：`windowShouldClose:` 是 AppKit 在关窗前唯一的同步
+//! 钩子，没有它就无法拦截用户点红点 / Cmd-W（窗口已被 AppKit 关掉，泵事后才观察到，veto 也就
+//! 失去意义）。见 [`WindowDelegate`]。
+//!
+//! 可见性（R09-9）三个来源：最小化（`isMiniaturized`）、应用隐藏（`NSApp.hide`，Cmd+H）、
+//! **被完全遮挡/在别的 Space**（`occlusionState` 不含 `Visible`）。三者任一为真，帧就不再产出、
+//! display link 暂停（见 `event_loop::pump`）——交易终端最小化几小时是常态，120 Hz 唤醒是纯浪费。
 
 use std::{cell::Cell, sync::Arc};
 
@@ -12,10 +16,13 @@ use objc2::{
     runtime::ProtocolObject,
 };
 use objc2_app_kit::{
-    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSCursor, NSWindow,
-    NSWindowCollectionBehavior, NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSWindow,
+    NSWindowCollectionBehavior, NSWindowDelegate, NSWindowOcclusionState, NSWindowStyleMask,
+    NSWindowTitleVisibility,
 };
-use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+};
 use objc2_quartz_core::CAMetalLayer;
 
 use crate::{
@@ -23,6 +30,7 @@ use crate::{
     error::EngineError,
     event::Event,
     math::{Rect, Scale, Size},
+    paint::style::Cursor,
     platform::{
         dispatcher::Dispatcher,
         macos::{a11y::MacA11y, dpi, view::GuiView, wake},
@@ -32,10 +40,10 @@ use crate::{
 
 /// `NSWindowDelegate` 的 ivar：只记「AppKit 请求关窗」这一个事实并唤醒泵。
 ///
-/// 回调里**不碰 `App`**（与 `GuiView` 同一纪律）：置位 + `wake`，由泵在主线程决定
+/// 回调里**不碰 `App`**（与 `GuiView` 同一纪律）：置位 / 唤醒，由泵在主线程决定
 /// `App::request_close` 的裁决。`windowShouldClose:` 恒返回 `false` —— 真正的关闭由泵在
 /// 应用同意之后调 `NSWindow::close`（`close` 不再询问 delegate，因此不会递归）。
-struct CloseIvars {
+struct WindowIvars {
     requested: Cell<bool>,
     dispatcher: Arc<Dispatcher>,
 }
@@ -43,13 +51,13 @@ struct CloseIvars {
 define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
-    #[name = "KytrixCloseDelegate"]
-    #[ivars = CloseIvars]
-    struct CloseDelegate;
+    #[name = "KytrixWindowDelegate"]
+    #[ivars = WindowIvars]
+    struct WindowDelegate;
 
-    unsafe impl NSObjectProtocol for CloseDelegate {}
+    unsafe impl NSObjectProtocol for WindowDelegate {}
 
-    unsafe impl NSWindowDelegate for CloseDelegate {
+    unsafe impl NSWindowDelegate for WindowDelegate {
         #[unsafe(method(windowShouldClose:))]
         fn window_should_close(&self, _sender: &NSWindow) -> bool {
             self.ivars().requested.set(true);
@@ -57,12 +65,31 @@ define_class!(
             // 恒拒绝 AppKit 的默认关闭：由泵在 `App::request_close` 同意后再 `close()`。
             false
         }
+
+        // R09-9：遮挡 / 最小化 / 恢复只**唤醒泵**——可见性是泵每轮快照读的（`sync_state`），
+        // 在 delegate 里回查/缓存反而会与「每轮快照」形成两个真值来源。这里选 delegate 而不是
+        // `NSNotificationCenter` 观察者：窗口本来就有 delegate，多挂四个通知源是重复的注册与
+        // 生命周期负担（delegate 是 weak，我们已持强引用）。
+        #[unsafe(method(windowDidChangeOcclusionState:))]
+        fn window_did_change_occlusion_state(&self, _notification: &NSNotification) {
+            self.ivars().dispatcher.wake();
+        }
+
+        #[unsafe(method(windowDidMiniaturize:))]
+        fn window_did_miniaturize(&self, _notification: &NSNotification) {
+            self.ivars().dispatcher.wake();
+        }
+
+        #[unsafe(method(windowDidDeminiaturize:))]
+        fn window_did_deminiaturize(&self, _notification: &NSNotification) {
+            self.ivars().dispatcher.wake();
+        }
     }
 );
 
-impl CloseDelegate {
+impl WindowDelegate {
     fn new(mtm: MainThreadMarker, dispatcher: Arc<Dispatcher>) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(CloseIvars {
+        let this = Self::alloc(mtm).set_ivars(WindowIvars {
             requested: Cell::new(false),
             dispatcher,
         });
@@ -98,7 +125,7 @@ pub(crate) struct NativeWindow {
     window: Retained<NSWindow>,
     view: Retained<GuiView>,
     /// `delegate` 是 **weak** 属性：必须由门面持有强引用，否则回调会打在已释放对象上。
-    close_delegate: Retained<CloseDelegate>,
+    delegate: Retained<WindowDelegate>,
     scale: Scale,
     logical_size: Size,
     /// 最近一次同步的快照（用于检测变化）。
@@ -107,6 +134,8 @@ pub(crate) struct NativeWindow {
     seen_frame_rate: f32,
     seen_size: (f64, f64),
     was_key: bool,
+    /// 当前是否**可见**（最小化 / 应用隐藏 / 完全遮挡任一为真则为 false，R09-9）。
+    visible: bool,
     /// 「窗口已不可见」的事后观察是否已经报过一次（同步 dispatch 一次给观察者）。
     close_requested: bool,
     destroyed: bool,
@@ -120,7 +149,7 @@ impl NativeWindow {
         mtm: MainThreadMarker,
         id: WindowId,
         options: &WindowOptions,
-        dispatcher: &std::sync::Arc<Dispatcher>,
+        dispatcher: &Arc<Dispatcher>,
     ) -> Result<Self, EngineError> {
         let style = NSWindowStyleMask::Titled
             | NSWindowStyleMask::Closable
@@ -191,28 +220,27 @@ impl NativeWindow {
         let scale = f64::from(options.scale.factor());
         // 关闭拦截：AppKit 的关窗手势（红点 / Cmd-W / performClose:）走 delegate，
         // windowShouldClose: 恒返回 false 并置位，由泵问过 App::request_close 后才真正 close。
-        let close_delegate = CloseDelegate::new(mtm, Arc::clone(dispatcher));
+        let delegate = WindowDelegate::new(mtm, Arc::clone(dispatcher));
         // SAFETY: ProtocolObject::from_ref 要求该对象实现了目标协议 —— 上面刚 impl 过。
-        let delegate: &ProtocolObject<dyn NSWindowDelegate> =
-            ProtocolObject::from_ref(&*close_delegate);
-        window.setDelegate(Some(delegate));
+        let protocol: &ProtocolObject<dyn NSWindowDelegate> = ProtocolObject::from_ref(&*delegate);
+        window.setDelegate(Some(protocol));
         let mut native = Self {
             mtm,
             id,
             window,
             view,
-            close_delegate,
+            delegate,
             scale: options.scale,
             logical_size: options.size,
             seen_scale: 1.0,
             seen_frame_rate: 0.0,
             seen_size: (0.0, 0.0),
             was_key: false,
+            visible: true,
             close_requested: false,
             destroyed: false,
             ime_area: None,
         };
-        native.view.set_scale(scale);
         native.sync_initial(mtm)?;
         Ok(native)
     }
@@ -223,7 +251,6 @@ impl NativeWindow {
         let scale = dpi::scale_from(factor)?;
         self.scale = scale;
         self.seen_scale = factor;
-        self.view.set_scale(factor);
         let size = self.view.frame().size;
         self.seen_size = (size.width, size.height);
         self.logical_size = Size::new(size.width as f32, size.height as f32);
@@ -276,17 +303,25 @@ impl NativeWindow {
             .map_or(60.0, |screen| screen.maximumFramesPerSecond() as f32)
     }
 
+    /// 窗口当前是否可见（最小化 / 应用隐藏 / 完全遮挡任一为真 ⇒ `false`）。
+    ///
+    /// 泵用它门控出帧与 display link（R09-9）：不可见时**不产出帧**，渲染器的
+    /// `pacing_paused()` 才能在「无待画帧 / 无在飞帧」时把 display link 真正停下来。
+    pub(crate) fn is_visible(&self) -> bool {
+        self.visible
+    }
+
     /// 取走本轮平台事件。
     pub(crate) fn take_events(&self) -> Vec<Event> {
         self.view.take_events()
     }
 
     /// 每轮对比窗口状态，按需产生 `DpiChanged` / `Resized` / `FocusChanged` / `CloseRequested`。
-    pub(crate) fn sync_state(
-        &mut self,
-        app: &mut App,
-        dispatcher: &std::sync::Arc<Dispatcher>,
-    ) -> Result<(), EngineError> {
+    ///
+    /// 返回值 = 本轮**产生了状态变化**（事件或可见性边沿）。泵据此在同一个泵周期内出帧：
+    /// 不再从 `sync_state` 里调 `Dispatcher::wake()`（那会 signal 一次 run loop source，
+    /// 让同一轮多跑一次空泵 —— R09-15 的第二个来源）。
+    pub(crate) fn sync_state(&mut self, app: &mut App) -> Result<bool, EngineError> {
         let mut events: Vec<Event> = Vec::new();
         // 换屏（或系统刷新率变化）：display link 的偏好帧率建窗时只写一次，必须每轮比较
         // 当前屏幕的 `maximumFramesPerSecond` 并更新，否则窗口被拖到 120 Hz 屏上仍按 60
@@ -305,7 +340,6 @@ impl NativeWindow {
             let scale = dpi::scale_from(factor)?;
             self.seen_scale = factor;
             self.scale = scale;
-            self.view.set_scale(factor);
             if let Some(window) = app.window_mut(self.id) {
                 window.set_scale(scale);
                 // DPI 变化但 surface 恰好相同时也要刷新 `contentsScale`（`set_surface` 内部先写图层）。
@@ -347,11 +381,39 @@ impl NativeWindow {
             self.close_requested = true;
             events.push(Event::CloseRequested);
         }
+        // R09-9：可见性从同一个快照里派生（不可见 = 最小化 / 应用隐藏 / 被完全遮挡），
+        // 边沿处强制一次全量重绘（drawable 与 persist 的内容在暂停期间都不可信）。
+        let occluded = !self
+            .window
+            .occlusionState()
+            .contains(NSWindowOcclusionState::Visible);
+        let visibility_changed = self.sync_visibility(app, !minimized && !app_hidden && !occluded);
+        let changed = !events.is_empty() || visibility_changed;
         for event in events {
             app.dispatch(self.id, event);
-            dispatcher.wake();
         }
-        Ok(())
+        Ok(changed)
+    }
+
+    /// 可见性边沿的处理：不可见时停帧（泵据此暂停 display link），恢复时请求一次全量重绘。
+    ///
+    /// 返回 `true` = 发生了边沿（调用方需要出帧）。
+    fn sync_visibility(&mut self, app: &mut App, visible: bool) -> bool {
+        if visible == self.visible {
+            return false;
+        }
+        self.visible = visible;
+        if !visible {
+            // 进入不可见：泵不会再为这个窗口产帧，渲染器随之暂停 display link（R09-9）。
+            return true;
+        }
+        // 恢复：暂停期间 drawable 池可能已重建、persist 内容也可能过期 ⇒ 全量重绘一帧。
+        let backing = self.backing_size();
+        if let Some(window) = app.window_mut(self.id) {
+            window.set_surface(backing);
+            window.request_repaint();
+        }
+        true
     }
 
     /// 交付一笔 a11y 更新（`a11y_pending` 为 O(1) 过滤；adapter 不活跃时闭包不执行）。
@@ -365,12 +427,16 @@ impl NativeWindow {
     }
 
     /// 同步 IME caret 区域到 `NSTextInputClient` 的 `firstRect`（每轮泵调用，独立于帧门禁）。
+    ///
+    /// 同一个来源顺带派生 **文本编辑态**（`Ok(Some)` = 有焦点文本节点且有 caret）：Edit 菜单项的
+    /// 启用状态由它决定（R09-1），所以这条通路不能只在 IME 真的激活时才跑。
     pub(crate) fn sync_ime_cursor_area(&mut self, app: &App) {
         let area = match app.ime_cursor_area(self.id) {
             Ok(area) => area,
-            // 文本尚未 shape / 文本刚变化：保留上一次有效区域。
+            // 文本尚未 shape / 文本刚变化：保留上一次有效区域（编辑态也不变）。
             Err(_) => return,
         };
+        self.view.set_text_editing(area.is_some());
         if self.ime_area == area {
             return;
         }
@@ -378,11 +444,24 @@ impl NativeWindow {
         self.view.set_ime_cursor_area(area);
     }
 
+    /// 引擎请求的光标形状（R09-11；`WindowId` 的定向投递在泵里完成）。
+    pub(crate) fn set_cursor(&self, cursor: Cursor) {
+        self.view.set_cursor(cursor);
+    }
+
     /// 关闭窗口（幂等）。
     pub(crate) fn close(&mut self) {
         if self.destroyed {
             return;
         }
+        // R09-7：a11y adapter 必须在**窗口还活着**时卸掉并析构 ——
+        // `accesskit_macos::Context::drop` 会对每个元素发 `NSAccessibilityPostNotification(
+        // UIElementDestroyed)`，AppKit 同步回查 parent/frame；窗口已释放时 accesskit 内部的
+        // `view.window().unwrap()` 会 panic（穿过 ObjC 帧 = abort），且 `accessibilityChildren`
+        // 会 `borrow_mut` 正在 `drop_in_place` 的 ivars（UB）。
+        self.view.uninstall_a11y();
+        // delegate 是 weak：先断掉，避免关闭期间的 AppKit 回调打进来（我们仍持强引用）。
+        self.window.setDelegate(None);
         self.window.close();
         self.destroyed = true;
     }
@@ -392,7 +471,7 @@ impl NativeWindow {
         // 两个来源：AppKit 的关窗手势（delegate 置位）与「窗口已不可见」的事后观察
         // （销毁 / 应用退出等非手势路径）。调用方据此决定要不要补发 `CloseRequested`
         // —— 观察路径已经在 `sync_state` 里发过了，再发就是双投递（复审 F3）。
-        if self.close_delegate.take_request() {
+        if self.delegate.take_request() {
             return Some(CloseRequestSource::Gesture);
         }
         std::mem::take(&mut self.close_requested).then_some(CloseRequestSource::Observed)
@@ -401,11 +480,6 @@ impl NativeWindow {
     /// 窗口是否已被 `close()` 销毁（泵据此从列表移除）。
     pub(crate) fn is_destroyed(&self) -> bool {
         self.destroyed
-    }
-
-    /// 光标形状（v1 只支持系统箭头；`take_cursor_change` 的其余载荷等 P13 接）。
-    pub(crate) fn set_cursor(&self) {
-        NSCursor::arrowCursor().set();
     }
 
     /// 动画定时器的开关（`pump` 每轮调用；空闲时移除定时器 ⇒ 不轮询）。

@@ -4,8 +4,11 @@
 //! 结构：
 //! - **事件循环交给 AppKit**：`NSApplication::run()` 处理 NSEvent、原生全屏转场、live resize、
 //!   菜单与 Space 切换；引擎不再手写 `nextEventMatchingMask`（旧实现无法完成 fullscreen 转场）。
-//! - **泵**由三条 common-modes 路径驱动：`CFRunLoopObserver`（BeforeWaiting/AfterWaiting，处理
-//!   AppKit 事件后的状态同步）、wake `CFRunLoopSource`（跨线程唤醒）、连续帧 `CFRunLoopTimer`
+//! - **应用壳层**（R09-1 / R09-16）：`run()` 在开窗前装好 `NSMenu` 主菜单与
+//!   `NSApplicationDelegate`。菜单提供 Cmd+Q / Cmd+W / Cmd+H / Cmd+C/V/X/A/Z 的承载对象；
+//!   delegate 把 `terminate:` 变成「通知引擎 → 引擎关窗收尾 → 回复 AppKit」的握手。
+//! - **泵**由三条 common-modes 路径驱动：`CFRunLoopObserver`（**只注册 `BeforeWaiting`**，
+//!   每轮 run loop 一次）、wake `CFRunLoopSource`（跨线程唤醒）、连续帧 `CFRunLoopTimer`
 //!   （动画/HUD）。三者都只在主线程执行。
 //! - 退出：泵发现 `exit` 后撤掉 source/timer，投一个空 NSEvent，再 `NSApplication::stop(None)`
 //!   + `CFRunLoop::stop`/`wake_up`；`run()` 返回（F-165）。
@@ -13,7 +16,7 @@
 //! `App` 以 `Box` 存放、地址稳定；C 回调只在主线程、且主线程在 run loop 中时执行
 //! （此时没有其它 `&mut App` 存活），因此用裸指针穿透 ObjC 回调是安全的。
 
-use std::{ffi::c_void, sync::Arc};
+use std::{ffi::c_void, sync::Arc, time::Duration};
 
 use objc2::{MainThreadMarker, rc::Retained};
 use objc2_app_kit::{
@@ -27,9 +30,14 @@ use objc2_foundation::NSPoint;
 use crate::{
     app::App,
     error::EngineError,
+    interaction::InputThresholds,
     platform::{
         dispatcher::Dispatcher,
-        macos::{wake, window::NativeWindow},
+        macos::{
+            app_delegate::{AppDelegate, QuitHandshake},
+            menu, wake,
+            window::NativeWindow,
+        },
     },
     render::backend::Renderer,
     window::{WindowId, WindowOptions},
@@ -43,6 +51,13 @@ struct LoopState {
     dispatcher: Arc<Dispatcher>,
     /// `NSApp.run()` 需要一个稳定的 Retained；退出时 `stop(None)`。
     ns_app: Retained<NSApplication>,
+    /// `NSApplication.delegate` 是 **weak** 属性：必须由门面持有强引用，否则回调会打在已释放
+    /// 对象上（与 `NativeWindow` 的 window delegate 同一个坑）。
+    _delegate: Retained<AppDelegate>,
+    /// 退出握手（delegate 与泵共享）。
+    quit: Arc<QuitHandshake>,
+    /// 最近一次同步给引擎的系统双击间隔（R09-10：系统设置可以在运行中改变）。
+    double_click: Duration,
     exit: bool,
     error: Option<EngineError>,
 }
@@ -54,21 +69,45 @@ impl Drop for LoopState {
     }
 }
 
-/// 用系统设置初始化输入阈值（R02-15）。
+/// 系统设置的用户双击速度（`+[NSEvent doubleClickInterval]`，缺省 0.5 s；R02-15 / R09-10）。
 ///
-/// `+[NSEvent doubleClickInterval]` 是 AppKit 暴露的**用户双击速度**（系统设置 → 辅助功能 →
-/// 指针控制），缺省 0.5 s。读不到时保留 [`crate::interaction::InputThresholds::platform_default`]。
-/// 位置容差与拖拽阈值 AppKit 没有公开查询，保留平台缺省（4 px）。
-fn install_input_thresholds(app: &mut App) {
-    let defaults = crate::interaction::InputThresholds::platform_default();
+/// 这是 AppKit **真正用于判定 `NSEvent.clickCount`** 的间隔，因此引擎的连击推断必须用同一个
+/// 值，否则「系统认为的双击」会被引擎判成两次单击。读不到时退回平台缺省。
+fn double_click_time() -> Duration {
+    let defaults = InputThresholds::platform_default();
     let interval = NSEvent::doubleClickInterval();
-    let double_click_time = if interval.is_finite() && interval > 0.0 {
-        std::time::Duration::from_secs_f64(interval)
+    if interval.is_finite() && interval > 0.0 {
+        Duration::from_secs_f64(interval)
     } else {
         defaults.double_click_time
-    };
-    app.set_input_thresholds(crate::interaction::InputThresholds {
-        double_click_time,
+    }
+}
+
+/// 用系统设置初始化输入阈值（R02-15）。
+///
+/// 位置容差与拖拽阈值 AppKit 没有公开查询，保留平台缺省（4 px）。
+fn install_input_thresholds(app: &mut App) {
+    let defaults = InputThresholds::platform_default();
+    app.set_input_thresholds(InputThresholds {
+        double_click_time: double_click_time(),
+        ..defaults
+    });
+}
+
+/// 运行期跟随系统双击速度（R09-10）。
+///
+/// 用户在「系统设置 → 辅助功能 → 指针控制」里改了双击速度之后，引擎若继续用启动时读到的值，
+/// 连击推断就会与 AppKit 的 `clickCount` 分叉（把双击判成两次单击 = 交易终端里的误操作）。
+/// 每轮读一次 `+doubleClickInterval` 是常量级开销，只在值变化时写回引擎。
+fn sync_double_click_interval(app: &mut App, seen: &mut Duration) {
+    let current = double_click_time();
+    if current == *seen {
+        return;
+    }
+    *seen = current;
+    let defaults = InputThresholds::platform_default();
+    app.set_input_thresholds(InputThresholds {
+        double_click_time: current,
         ..defaults
     });
 }
@@ -81,10 +120,17 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
     let ns_app = NSApplication::sharedApplication(mtm);
     ns_app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     ns_app.finishLaunching();
-    ns_app.activate();
+    // R09-1：主菜单必须**在任何输入之前**就位。AppKit 的键等价分发是
+    // `sendEvent:` → `[mainMenu performKeyEquivalent:]` → 失败才给 key window；主菜单为 nil 时
+    // Cmd+Q / Cmd+W / Cmd+C 全部没有承载对象，只能退化成普通 keyDown 并被丢弃。
+    menu::install(mtm, &ns_app);
 
     let mut app = app;
     let dispatcher = app.dispatcher();
+    // R09-16：退出握手。delegate 必须自己持强引用（`NSApplication.delegate` 是 weak）。
+    let quit = QuitHandshake::new();
+    let delegate = AppDelegate::new(mtm, Arc::clone(&dispatcher), Arc::clone(&quit));
+    ns_app.setDelegate(Some(delegate.protocol()));
     // 唤醒句柄由本平台的 `wake::install` 安装；`attach` 的 token 只对 Win32 有意义。
     dispatcher.attach(1);
     install_input_thresholds(&mut app);
@@ -94,39 +140,20 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
         .collect();
     let mut windows: Vec<NativeWindow> = Vec::with_capacity(requests.len());
     for (id, options) in requests {
-        let native = NativeWindow::create(mtm, id, &options, &dispatcher)?;
-        let scale = native.scale();
-        let size = native.backing_size();
-        let renderer = Renderer::new_for_layer(
-            size,
-            f64::from(scale.factor()),
-            native.maximum_frames_per_second(),
-            options.background,
-        )?;
-        {
-            let layer = renderer
-                .layer_handle()
-                .ok_or_else(|| EngineError::AppInit {
-                    detail: smol_str::SmolStr::new_static("metal renderer has no CAMetalLayer"),
-                })?;
-            native.attach_layer(layer);
-        }
-        if let Some(window) = app.window_mut(id) {
-            window.set_renderer(renderer);
-            window.set_scale(scale);
-            window.set_size(native.logical_size());
-            // `set_size` 不再重算平台真值；这里写入 AppKit 的真实 backing。
-            window.set_surface(size);
-        }
-        native.show();
-        windows.push(native);
+        windows.push(open_window(mtm, &mut app, id, &options, &dispatcher)?);
     }
+    // `activate` 必须在窗口已经存在之后（macOS 14+ 的无参版本不会自己找窗口，
+    // 在首窗之前调用可能「没真正到前台」）。
+    ns_app.activate();
 
     let state = Box::into_raw(Box::new(LoopState {
         app: Box::into_raw(Box::new(app)),
         windows,
         dispatcher: dispatcher.clone(),
         ns_app: ns_app.clone(),
+        _delegate: delegate,
+        quit: Arc::clone(&quit),
+        double_click: double_click_time(),
         exit: false,
         error: None,
     }));
@@ -148,11 +175,21 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             release: None,
             copyDescription: None,
         };
+        // R09-15：**只注册 `BeforeWaiting`**。一个 run loop 周期是
+        // `BeforeWaiting → 睡眠/处理 source → AfterWaiting → BeforeWaiting → …`；同时注册两个
+        // activity 会让同一条完整泵每周期跑**两次**（120 Hz 下 = 240 次/秒，每次含每窗口 6 次
+        // ObjC 调用 + `Vec` 分配 + 每窗口一次锁），而两者语义重复：
+        // - AppKit 事件派发引起的状态变化会在**下一次** `BeforeWaiting` 被看到；
+        // - 跨线程唤醒由 `CFRunLoopSource`（`wake::install`）覆盖；
+        // - 连续帧由 `CFRunLoopTimer` 覆盖。
+        // 因此 `AfterWaiting` 是纯增量开销。winit 的 macOS 事件循环同样只注册
+        // `BeforeWaiting | Exit`。
+        //
         // SAFETY: context 是栈上值，`CFRunLoopObserverCreate` 同步拷贝；info 在卸载前有效。
         unsafe {
             CFRunLoopObserver::new(
                 None,
-                (CFRunLoopActivity::BeforeWaiting | CFRunLoopActivity::AfterWaiting).0,
+                CFRunLoopActivity::BeforeWaiting.0,
                 true,
                 0,
                 Some(observer_callback),
@@ -179,10 +216,65 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
     wake::uninstall();
     // SAFETY: `state` 由本函数独占，且回调已经不可能再被触发；`Drop` 会还原并释放 `App`。
     let mut state = unsafe { Box::from_raw(state) };
-    match state.error.take() {
+    let error = state.error.take();
+    let awaiting_reply = state.quit.pending();
+    let allowed = state.quit.allowed();
+    // R09-16：**先**让 `state` 析构（`App` → 各 `Renderer`（join GPU 线程、invalidate display
+    // link）→ 原生窗口），**再**回复 AppKit。反过来（先进 AppKit 的退出路径）会让所有析构被
+    // `exit()` 跳过。
+    drop(state);
+    if awaiting_reply || allowed {
+        // `NSTerminateLater` 必须被回复，否则 AppKit 会一直等在这个握手上。
+        // 出错时回复 `false`：取消终止握手，让调用方看到 `Err`（进程按正常路径退出）。
+        ns_app.replyToApplicationShouldTerminate(allowed && error.is_none());
+    }
+    match error {
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+/// 建一个原生窗口 + 渲染器，并把平台真值写回 `App` 的窗口。
+///
+/// **顺序**（R09-5 的平台侧一半）：先 `show()` 再同步编译 GPU 对象。渲染器构造里有
+/// `MTLDevice` / 两个 metallib / 4 条 PSO 的同步编译（数十毫秒），放在 `show()` 之前会表现为
+/// 「点了新窗口，整个应用卡一下才出现窗口」；放在之后则是「窗口立刻出现（AppKit 用背景色
+/// 铺底），内容稍后到位」。真正的根治（进程级共享 device/library/PSO）在 `render/macos`
+/// 的 `GpuCore` 重构里。
+fn open_window(
+    mtm: MainThreadMarker,
+    app: &mut App,
+    id: WindowId,
+    options: &WindowOptions,
+    dispatcher: &Arc<Dispatcher>,
+) -> Result<NativeWindow, EngineError> {
+    let native = NativeWindow::create(mtm, id, options, dispatcher)?;
+    // 先显示：用户立刻看到窗口（背景色由 `NSColor` 铺底）。
+    native.show();
+    let scale = native.scale();
+    let size = native.backing_size();
+    let renderer = Renderer::new_for_layer(
+        size,
+        f64::from(scale.factor()),
+        native.maximum_frames_per_second(),
+        options.background,
+    )?;
+    {
+        let layer = renderer
+            .layer_handle()
+            .ok_or_else(|| EngineError::AppInit {
+                detail: smol_str::SmolStr::new_static("metal renderer has no CAMetalLayer"),
+            })?;
+        native.attach_layer(layer);
+    }
+    if let Some(window) = app.window_mut(id) {
+        window.set_renderer(renderer);
+        window.set_scale(scale);
+        window.set_size(native.logical_size());
+        // `set_size` 不再重算平台真值；这里写入 AppKit 的真实 backing。
+        window.set_surface(size);
+    }
+    Ok(native)
 }
 
 /// 泵一次；`tick` = 本次由连续帧定时器触发（而不是 source/observer）。
@@ -224,7 +316,7 @@ fn pump_and_stop(state: &mut LoopState, tick: bool) {
 
 /// 泵：事件 → App，然后提交本帧 / 回投任务 / a11y / 关闭。
 ///
-/// `tick` 只由 60Hz 定时器置位：连续帧不能反过来自己 `dispatcher.wake()`，否则 source
+/// `tick` 只由连续帧定时器置位：连续帧不能反过来自己 `dispatcher.wake()`，否则 source
 /// 会在同一轮 run loop 里反复唤醒，主线程变成忙循环（render 线程异步后实测 830fps）。
 ///
 /// # Errors
@@ -238,43 +330,50 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
     sync_native_windows(app, &mut state.windows, &state.dispatcher)?;
     // 空闲时也要收 render 线程的反馈：设备丢失/提交失败不能等到下一次输入才冒泡。
     app.poll_renderers()?;
+    // R09-10：双击间隔跟随系统设置（用户可能刚在系统设置里改过双击速度）。
+    sync_double_click_interval(app, &mut state.double_click);
 
+    // 本轮的「有变化」标记：输入事件与窗口状态变化都必须在**同一轮**出帧。
+    // R09-15②：这里不再调 `Dispatcher::wake()`（那会 signal run loop source，让同一轮多跑一次
+    // 空泵）—— 状态变化直接送进下面的帧门禁。
+    let mut changed = false;
     for native in state.windows.iter_mut() {
         let id = native.id();
-        let mut delivered = false;
         for event in native.take_events() {
             app.dispatch(id, event);
-            delivered = true;
+            changed = true;
         }
-        native.sync_state(app, &state.dispatcher)?;
-        if delivered {
-            // 与 Win32 的 pump 一致：输入事件之后必须唤醒，否则应用侧状态变更要等下一个
-            // NSEvent 才出帧（macOS 没有「每消息 wake」的默认行为）。
-            state.dispatcher.wake();
-        }
+        changed |= native.sync_state(app)?;
     }
 
     app.run_frame_hook();
-    // 连续帧的节奏由 60Hz 定时器提供；`tick` 为真时直接出帧，不再写回
+    // 连续帧的节奏由定时器（observer 每轮一次）提供；`tick` 为真时直接出帧，不再写回
     // `Dispatcher::wake`。source/observer 路径只响应显式 wake（输入、任务、应用请求）。
     let wake = state.dispatcher.take_frame_wake();
-    if wake || (tick && app.needs_continuous_frames()) {
-        frame_all(app)?;
+    if wake || changed || (tick && app.needs_continuous_frames()) {
+        frame_all(app, &state.windows)?;
     }
 
-    // display link 的节奏（§5.3）：连续帧 / 有帧要画 / 有在飞帧时恢复，否则暂停（空闲 0 唤醒）。
+    // display link 的节奏（§5.3 + R09-9）：连续帧 / 有帧要画 / 有在飞帧时恢复，否则暂停
+    // （空闲 0 唤醒）。**不可见**（最小化 / 应用隐藏 / 被完全遮挡）时无条件停帧 —— 那三种
+    // 状态下窗口一个像素都不显示，却会产生帧请求把 display link 永久钉在 120 Hz。
     let continuous = app.needs_continuous_frames();
     for native in state.windows.iter() {
+        let visible = native.is_visible();
         if let Some(window) = app.window_mut(native.id()) {
-            window.sync_pacing(continuous);
+            window.sync_pacing(continuous && visible);
         }
     }
 
-    // 交互反馈：光标（v1 只支持系统箭头）。
-    if let Some(native) = state.windows.first()
-        && app.take_cursor_change().is_some()
+    // 交互反馈：光标形状按 **WindowId 定向**投递（R09-11 / R09-25）。
+    // 旧实现只把 `Cursor` 施加到第一个窗口，其余窗口的光标请求被静默丢弃。
+    if let Some((target, cursor)) = app.take_cursor_change()
+        && let Some(native) = state
+            .windows
+            .iter()
+            .find(|native| native.id() == target && !native.is_destroyed())
     {
-        native.set_cursor();
+        native.set_cursor(cursor);
     }
     // 指针捕获（R02-8）：AppKit 在 `mouseDown:` 之后**隐式捕获**（dragged/up 事件按按下时命中的
     // view 路由，即使指针移出窗口），所以这里没有需要调用的系统 API —— 请求被消费掉是正确行为，
@@ -294,6 +393,12 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
     if let Some(native) = state.windows.first() {
         // a11y 到期补发也借用这个定时器（同 Windows）：到期交付后自动停表。
         native.set_animating(app.needs_continuous_frames() || app.a11y_retry_pending());
+    }
+
+    // R09-16：退出握手。Dock 退出 / osascript / Cmd+Q 都汇到 `applicationShouldTerminate:`，
+    // 那里只置位 + 唤醒；真正的关闭流程在这里跑（与点红点/Cmd-W 同一个裁决点）。
+    if state.quit.pending() {
+        request_quit(state, app);
     }
 
     // 关闭：请求关闭的窗口真正关闭；一个不剩就退出。
@@ -324,6 +429,29 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// 退出握手：先问应用，再关窗（R09-16）。
+///
+/// 复用用户点窗口红点时的**同一个裁决点**（`App::request_close` → 窗口的关闭处理器），因此
+/// 「有未保存的布局/未确认的订单时不许退出」这类 veto 对 Cmd+Q / Dock 退出同样生效。
+/// 全部同意后关闭所有原生窗口，由泵末尾的「一个不剩 ⇒ exit」收尾；`run()` 在析构完成后回复
+/// AppKit。
+fn request_quit(state: &mut LoopState, app: &mut App) {
+    let ids: Vec<WindowId> = app.windows().map(|(id, _)| id).collect();
+    for id in ids {
+        if !app.request_close(id) {
+            // 应用拒绝退出：必须回复 AppKit「不终止」，否则它会一直等在这个握手上。
+            state.quit.veto();
+            state.ns_app.replyToApplicationShouldTerminate(false);
+            return;
+        }
+    }
+    for native in state.windows.iter_mut() {
+        native.close();
+    }
+    // 允许终止：`run()` 里的 `ns_app.run()` 返回、`App`/`Renderer` 析构完成之后再回复 AppKit。
+    state.quit.allow();
+}
+
 /// 把 `App` 的窗口集合同步到原生窗口（运行时创建 / 应用主动关闭，P1-2.8）。
 ///
 /// 与 Win32 的同名函数同构：
@@ -351,41 +479,22 @@ fn sync_native_windows(
         detail: smol_str::SmolStr::new_static("window creation requires the main thread"),
     })?;
     for (id, options) in pending {
-        let native = NativeWindow::create(mtm, id, &options, dispatcher)?;
-        let scale = native.scale();
-        let size = native.backing_size();
-        let renderer = Renderer::new_for_layer(
-            size,
-            f64::from(scale.factor()),
-            native.maximum_frames_per_second(),
-            options.background,
-        )?;
-        {
-            let layer = renderer
-                .layer_handle()
-                .ok_or_else(|| EngineError::AppInit {
-                    detail: smol_str::SmolStr::new_static("metal renderer has no CAMetalLayer"),
-                })?;
-            native.attach_layer(layer);
-        }
-        if let Some(window) = app.window_mut(id) {
-            // `set_renderer` 清空图集页记账；`set_surface` 置全量 damage（新 drawable 必须整帧）。
-            window.set_renderer(renderer);
-            window.set_scale(scale);
-            window.set_size(native.logical_size());
-            window.set_surface(size);
-        }
-        native.show();
-        windows.push(native);
+        windows.push(open_window(mtm, app, id, &options, dispatcher)?);
     }
     Ok(())
 }
 
 /// 逐窗口提交一帧；`Err` 立刻终止（device lost / swapchain 失败都不可重试）。
-fn frame_all(app: &mut App) -> Result<(), EngineError> {
-    let ids: Vec<WindowId> = app.windows().map(|(id, _)| id).collect();
-    for id in ids {
-        match app.frame(id) {
+///
+/// **不可见窗口不产帧**（R09-9）：不 publish ⇒ 渲染器的 `pending_frame` 保持为假 ⇒
+/// `pacing_paused()` 才有机会为真，display link 才会真正停下来。恢复可见时
+/// `NativeWindow::sync_state` 置全量 damage 并请求一帧。
+fn frame_all(app: &mut App, windows: &[NativeWindow]) -> Result<(), EngineError> {
+    for native in windows {
+        if !native.is_visible() {
+            continue;
+        }
+        match app.frame(native.id()) {
             None | Some(Ok(_)) => {}
             Some(Err(error)) => return Err(error),
         }
@@ -409,6 +518,8 @@ unsafe extern "C-unwind" fn pump_callback(info: *mut c_void) {
 }
 
 /// run loop 观察者：AppKit 处理完一轮事件后同步窗口状态/提交帧（含全屏/live-resize 转场）。
+///
+/// 只注册 `BeforeWaiting`（R09-15）：每轮 run loop 恰好泵一次。
 ///
 /// # Safety
 ///

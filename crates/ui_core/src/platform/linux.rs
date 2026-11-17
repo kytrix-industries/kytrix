@@ -4,6 +4,7 @@
 
 pub(crate) mod a11y;
 pub(crate) mod clipboard;
+pub(crate) mod cursor;
 pub(crate) mod dpi;
 pub(crate) mod event_loop;
 pub(crate) mod frame_gate;

@@ -1,36 +1,69 @@
-//! 消息泵：`run`（建窗 → 挂渲染器 → 显示）、每轮固定步骤、唤醒与帧驱动、连续帧定时器。
-//! 自由函数由 `event_loop.rs` 的 `run` 出口与 `wndproc` 调用（零行为变更的结构拆分）。
+//! 消息泵：`run`（建窗 → 挂渲染器 → 显示）、每轮固定步骤、唤醒与帧驱动、合成器节拍。
+//!
+//! ## 帧节奏（R07-10）
+//!
+//! 连续帧（动画 / HUD）由 [`FramePacer`] 驱动：一条**只在需要时存在**的节拍线程阻塞在
+//! `DCompositionWaitForCompositorClock`（Win10 1809+ / MSDN 最低 Win11 build 22000；
+//! Chrome Viz 的 `DCLayerTree::WaitForCompositorClock` 同款），每个合成器节拍唤醒一次泵。
+//!
+//! 为什么不用 `WM_TIMER`（旧实现）：`WM_TIMER` 是**最低优先级**消息，输入密集时被饿
+//! （1000 Hz 鼠标下动画反而更抖）；`SetTimer` 的最小粒度受系统定时器分辨率限制
+//! （默认 15.6 ms），且不与 DWM 的合成节拍对齐 ⇒ 60 Hz 拍频、120 Hz 显示器用不上。
+//! `WM_TIMER` 现在只保留给 a11y 补发兜底（[`A11Y_TIMER_ID`]），空闲时没有定时器。
+//!
+//! 为什么需要一条独立线程：`DCompositionWaitForCompositorClock` 是阻塞调用，而 UI 线程是
+//! 唯一的消息泵 —— 把它放进泵里就等于暂停输入。Chrome 同样是「合成线程等时钟、UI 线程消费」。
 
-use std::sync::Arc;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::JoinHandle,
+    time::Duration,
+};
 
 use windows::Win32::{
     Foundation::HWND,
     System::SystemInformation::GetTickCount64,
     UI::{
         HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
-        Input::KeyboardAndMouse::{GetDoubleClickTime, SetCapture},
+        Input::KeyboardAndMouse::{GetCapture, GetDoubleClickTime, ReleaseCapture, SetCapture},
         WindowsAndMessaging::*,
     },
 };
 
-use super::{
-    caption::release_capture,
-    native_window::{collect_events, sync_native_windows},
-};
+use super::native_window::{collect_events, sync_native_windows};
 use crate::{
     app::App,
     error::EngineError,
     platform::{
         dispatcher::Dispatcher,
-        windows::{composition, window::NativeWindow},
+        windows::{composition, frame_clock::FrameClock, window::NativeWindow},
     },
     render::backend::Renderer,
     window::{Window, WindowId, WindowOptions},
 };
 
-/// 消费者：`pump_loop` 的定时器管理与 `wndproc` 的 `WM_TIMER` 分支。
-/// 连续帧定时器 id（动画 / P17 HUD 共用；`wndproc` 用它唤醒；P09 probe 实测 1 ms → 16.0 ms）。
-pub(super) const FRAME_TIMER_ID: usize = 1;
+/// 消费者：`wndproc` 的 `WM_TIMER` 分支与 `pump_loop` 的定时器管理。
+/// a11y 补发兜底定时器 id（**唯一**保留的 `WM_TIMER` 用途；连续帧走合成器节拍）。
+pub(super) const A11Y_TIMER_ID: usize = 1;
+
+/// a11y 补发兜底定时器的周期（毫秒）。
+///
+/// 与 `App` 侧的 `A11Y_THROTTLE`（100 ms）一致：被节流的一次交付最多等一个周期就必须重试，
+/// 否则屏幕阅读器会永远收不到最后一笔更新。
+const A11Y_RETRY_MS: u32 = 100;
+
+/// 节拍线程单次等待的**下限**（毫秒）：`DCompositionWaitForCompositorClock` 不接受 0 超时，
+/// 且过小的超时会让线程退化成忙轮询。
+const MIN_PACE_WAIT_MS: u64 = 1;
+
+/// 节拍线程单次等待的**上限**（毫秒）。
+///
+/// 正常路径靠合成器节拍唤醒（120 Hz 下 8.3 ms），这个上限只在合成器停摆时生效；它同时是
+/// 「停止后的最长退出延迟」，所以不能大。
+const MAX_PACE_WAIT_MS: u64 = 100;
 
 /// 消费者：`run`。
 /// 用系统设置初始化输入阈值（R02-15）。
@@ -148,6 +181,113 @@ pub(super) fn install_dpi_awareness() {
     let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 }
 
+/// 消费者：`pump_loop` 的 ③ 关闭步骤与 `release_capture`。
+/// 引擎**主动**释放指针捕获（拖拽结束）：只有本窗口确实持有捕获时才置
+/// `suppress_capture_cancel` 并释放。
+///
+/// 两处细节都不能省：
+/// - 自己调 `ReleaseCapture` 也会收到 `WM_CAPTURECHANGED`，不置位就会在每次松手后误投
+///   `PointerCancel`（复审 F1）；
+/// - 不持有捕获时 `ReleaseCapture` 不会产生该消息，若仍然置位，残留的 suppress 会把
+///   **下一次真实**的会话丢失当成「自己释放」而吞掉取消（复审 F2）。
+pub(super) fn release_capture(hwnd: HWND, state: &mut super::WndProcState) {
+    // SAFETY: `GetCapture` 只读查询当前线程的捕获窗口。
+    if unsafe { GetCapture() } != hwnd {
+        return;
+    }
+    state.suppress_capture_cancel = true;
+    // SAFETY: 只释放本线程的捕获；同线程调用会同步派发 `WM_CAPTURECHANGED`。
+    let _ = unsafe { ReleaseCapture() };
+}
+
+/// 合成器节拍线程（R07-10）。
+///
+/// 生命周期跟随 `App::needs_continuous_frames()`：需要连续帧时起、不需要时停 —— 空闲时
+/// **没有线程、没有定时器、没有周期唤醒**（`DCompositionWaitForCompositorClock` 只用一次）。
+pub(super) struct FramePacer {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+    /// 启动线程时用的窗口句柄（用于刷新率采样）：窗口换过就重启线程。
+    hwnd: isize,
+}
+
+impl FramePacer {
+    pub(super) fn new() -> Self {
+        Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            thread: None,
+            hwnd: 0,
+        }
+    }
+
+    /// 启动/停止/改指向节拍线程（幂等）。
+    pub(super) fn sync(&mut self, active: bool, hwnd: HWND, dispatcher: &Arc<Dispatcher>) {
+        let target = hwnd.0 as isize;
+        if !active {
+            self.shutdown();
+            return;
+        }
+        if self.thread.is_some() && self.hwnd == target {
+            return;
+        }
+        self.shutdown();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let thread_dispatcher = Arc::clone(dispatcher);
+        self.thread = Some(std::thread::spawn(move || {
+            pace(thread_stop, target, thread_dispatcher);
+        }));
+        self.stop = stop;
+        self.hwnd = target;
+    }
+
+    /// 停止并 join（`Drop` 也会调）。
+    pub(super) fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            // 等待上限是 `CLOCK_WAIT_TIMEOUT_MS`：不能因为线程还在等节拍就跳过 join
+            //（跳过会让节拍线程活过 `Dispatcher`）。
+            let _ = thread.join();
+        }
+        self.hwnd = 0;
+    }
+}
+
+impl Default for FramePacer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for FramePacer {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// 消费者：`FramePacer::sync` 的线程体。
+///
+/// 每个合成器节拍唤醒一次泵（`Dispatcher::wake` 是电平信号，天然合并）；时钟不可用
+/// （显示器关闭 / 远程桌面）时按采样给出的「距下一次可呈现时刻」退避，避免忙等。
+fn pace(stop: Arc<AtomicBool>, hwnd: isize, dispatcher: Arc<Dispatcher>) {
+    let mut clock = FrameClock::new(HWND(hwnd as *mut core::ffi::c_void));
+    let floor = Duration::from_millis(MIN_PACE_WAIT_MS);
+    let ceiling = Duration::from_millis(MAX_PACE_WAIT_MS);
+    while !stop.load(Ordering::Acquire) {
+        // 采样决定两件事：这次等待的上限（两个帧间隔，120 Hz ⇒ 16.6 ms），以及合成器停摆时
+        // 的退避量。采样失败不是错误：`sample` 会退回「整整一帧」。
+        let sample = clock.sample();
+        let timeout = (clock.frame_interval() * 2).clamp(floor, ceiling);
+        if clock.wait_next_frame(timeout) {
+            dispatcher.wake();
+        } else if !stop.load(Ordering::Acquire) {
+            // 没有节拍（屏幕不亮 / 会话断开 / DWM 停摆）：睡到下一个可呈现时刻再试，
+            // 绝不忙等，也不永久停摆（屏幕恢复后下一拍就会醒）。
+            std::thread::sleep(sample.until_next_present.clamp(floor, ceiling));
+        }
+    }
+}
+
 /// 消费者：`platform::windows` 的 `pub(crate) use event_loop::run`。
 /// 引擎自有事件循环：建窗口 → 挂渲染器 → 显示 → 泵 → 关闭。
 pub(crate) fn run(mut app: App) -> Result<(), EngineError> {
@@ -218,11 +358,12 @@ pub(super) fn pump_loop(
     dispatcher: &Arc<Dispatcher>,
 ) -> Result<(), EngineError> {
     let mut message = MSG::default();
-    // 定时器随宿主窗口销毁而失效：宿主窗口关闭后必须在新首窗上重建，否则其余窗口的
-    // 动画/连续帧永远不再推进（P2-4）。归属判定用 `WindowId` 而不是 HWND 裸值：
-    // 首窗销毁后系统可能把同一个 HWND 复用给新窗，裸值比较会「看起来仍匹配」而不重建
-    // 定时器（复审 P2-8）。
-    let mut frame_timer: Option<(crate::window::WindowId, isize, usize)> = None;
+    // 合成器节拍线程：只在需要连续帧时存在（空闲时零线程、零定时器）。
+    let mut pacer = FramePacer::new();
+    // a11y 补发兜底定时器的宿主窗口（定时器随窗口销毁失效，首窗换人时要重建，P2-4）。
+    // 归属判定用 `WindowId` 而不是 HWND 裸值：首窗销毁后系统可能把同一个 HWND 复用给新窗，
+    // 裸值比较会「看起来仍匹配」而不重建定时器（复审 P2-8）。
+    let mut a11y_timer: Option<WindowId> = None;
     loop {
         // ① 先 drain：`WM_QUIT` 必须显式识别（`PeekMessageW` 会把它取出来）。
         loop {
@@ -244,9 +385,6 @@ pub(super) fn pump_loop(
         // ② 平台事件 → App。
         app.sync_clock();
         // ②a 运行时窗口生命周期（P1-2.8）：`App` 里新增/移除的窗口要同步到原生窗口。
-        // 旧实现只在 `run` 启动时枚举一次，运行时 `App::create_window` 得到的窗口永远没有
-        // 原生窗口与渲染器（`App::frame` 对着无 renderer 的 Window 空转）；应用自己调
-        // `App::close_window` 也只删 App 状态，留下幽灵原生窗口并继续收事件。
         if sync_native_windows(app, windows, dispatcher)? {
             retarget_wake(windows, dispatcher);
         }
@@ -286,7 +424,7 @@ pub(super) fn pump_loop(
             native.note_composition_geometry((presented, client));
         }
 
-        // ②c 交互反馈：光标 / 指针捕获 / 连续帧定时器（P10 §5.4 / §11.3、P17 HUD）。
+        // ②c 交互反馈：光标 / 指针捕获（P10 §5.4 / §11.3）。
         // 两者都是**每窗口**状态，请求本身携带 `WindowId`（复审 P1-3 / P2-2）：
         // - 光标：`WM_SETCURSOR` 各窗口读自己的 `WndProcState`；广播会把 A 窗口的 I-Beam
         //   写进 B 窗口，而 B 的解析值仍是 Default ⇒ 不会再发变化 ⇒ B 永久显示错光标。
@@ -312,32 +450,33 @@ pub(super) fn pump_loop(
                 release_capture(hwnd, native.state_mut());
             }
         }
+
+        // ②d 帧节奏：合成器节拍线程（只在需要连续帧时存在）+ a11y 补发兜底定时器。
         if let Some(native) = windows.first_mut() {
             let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
+            pacer.sync(app.needs_continuous_frames(), hwnd, dispatcher);
             // 定时器随宿主窗口销毁而失效：宿主已不是当前首窗 ⇒ 清掉记录，下面在新首窗重建
-            // （否则首窗关闭后其余窗口的动画/连续帧永远不再推进，P2-4）。
-            if frame_timer.is_some_and(|(owner, _, _)| owner != native.id()) {
-                frame_timer = None;
+            //（否则首窗关闭后其余窗口的 a11y 补发永远不再触发，P2-4）。
+            if a11y_timer.is_some_and(|owner| owner != native.id()) {
+                a11y_timer = None;
             }
-            // a11y 到期补发也借用这个定时器：`a11y_retry_pending` 最多持续 A11Y_THROTTLE
-            // （100 ms），到期交付后自动停表。
-            let needs_tick = app.needs_continuous_frames() || app.a11y_retry_pending();
-            match (needs_tick, frame_timer) {
+            match (app.a11y_retry_pending(), a11y_timer) {
                 (true, None) => {
-                    // SAFETY: 1 ms 定时器（probe：实测 16.0 ms）；`KillTimer` 在同一线程。
-                    let id = unsafe { SetTimer(Some(hwnd), FRAME_TIMER_ID, 1, None) };
+                    // SAFETY: `hwnd` 是本进程窗口；`KillTimer` 在同一线程（见下面分支）。
+                    let id = unsafe { SetTimer(Some(hwnd), A11Y_TIMER_ID, A11Y_RETRY_MS, None) };
                     if id != 0 {
-                        frame_timer = Some((native.id(), native.hwnd_raw(), id));
+                        a11y_timer = Some(native.id());
                     }
                 }
-                (false, Some((_, owner, id))) => {
-                    // SAFETY: `id` 由本线程在 `owner` 上 `SetTimer` 产生。
-                    let owner = HWND(owner as *mut core::ffi::c_void);
-                    let _ = unsafe { KillTimer(Some(owner), id) };
-                    frame_timer = None;
+                (false, Some(_)) => {
+                    // SAFETY: `A11Y_TIMER_ID` 由本线程在 `hwnd` 上创建；已过期/失败时是 no-op。
+                    let _ = unsafe { KillTimer(Some(hwnd), A11Y_TIMER_ID) };
+                    a11y_timer = None;
                 }
                 _ => {}
             }
+        } else {
+            pacer.sync(false, HWND::default(), dispatcher);
         }
 
         // ③ 关闭：关掉 App 里的窗口与原生窗口；一个不剩就退出。
@@ -366,7 +505,7 @@ pub(super) fn pump_loop(
             task.run(app);
         }
 
-        // ⑥ 阻塞等待（I3）：没有消息时停在这里。
+        // ⑥ 阻塞等待（I3）：没有消息时停在这里。连续帧的唤醒由节拍线程 `PostMessageW` 送来。
         // SAFETY: 同 ①。
         let result = unsafe { GetMessageW(&mut message, None, 0, 0) };
         if result.0 == 0 {

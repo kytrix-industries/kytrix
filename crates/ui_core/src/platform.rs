@@ -10,12 +10,30 @@
 //! 三份实现都必须提供：`run(app)`、`window::NativeWindow`、`dpi`、`ime`、`clipboard`、`a11y`。
 
 pub(crate) mod dispatcher;
-/// IME 提交去重的纯逻辑（macOS / Linux 共用）。
+/// IME 的跨平台纯逻辑：组合串子句归一化（三平台共用）、提交去重（macOS / Linux）、
+/// `replacementRange` 换算（macOS）。
 ///
-/// 只在真正消费它的平台 + 测试构建里编译：Windows 的 lib 构建没有消费者，
-/// 而 `cargo test`（`cfg(test)`）仍能在开发机上跑到这里的单测。
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+/// **Windows 也编译**：`GCS_COMPATTR` / `GCS_COMPCLAUSE` 的原始字节在
+/// `platform/ime::preedit_clauses` 里压成 `ImeEvent::Preedit::clauses` 区间，这一段纯逻辑
+/// 因此可以在开发机上单测（而不是只在真机 IME 下才能观察）。macOS / Linux 专用项用
+/// 各自的 `cfg` 关掉，避免 Windows 构建出现死代码。
 pub(crate) mod ime;
+
+/// 原生主菜单的**平台无关模型**：菜单树、键盘等价物、AppKit 标准 selector、以及
+/// 「selector → 引擎按键」的映射（R09-1）。
+///
+/// 只在 macOS 构建与测试构建里编译：只有 AppKit 有系统菜单栏承载这套 selector，而模型本身是
+/// 纯数据 + 纯函数，开发机（Windows）的 `cargo test` 能覆盖它。
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod menu;
+
+/// Wayland 协议层的纯逻辑（`wl_data_source` 生命周期、IME 焦点路由、光标形状/主题、
+/// `xdg_toplevel` 状态机）。
+///
+/// 只在 Linux 构建与测试构建里编译：`wayland-client` 只在 Linux 目标是依赖，而这几条判据
+/// 必须在开发机（Windows）的 `cargo test` 里跑得到（见模块文档）。
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod wayland;
 
 #[cfg(windows)]
 pub(crate) mod event;

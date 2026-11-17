@@ -923,6 +923,16 @@ pub struct TextLayoutReport {
     pub atlas_rebuilds: usize,
     /// 本次 pass 逐 tile LRU 淘汰的字形数（R12-1：容量逃逸时不再整页清空）。
     pub atlas_evictions: usize,
+    /// 本 pass **最后一轮重跑**仍因「字形图集整页都是本帧工作集」而没画出的字形数（R12-1）。
+    ///
+    /// 与 [`TextLayoutReport::rasterized`] 是同一聚合口径（每轮重跑都清零重算，报告取最后
+    /// 一轮），因此恒 `<= rasterized`：每个被跳过的字形都先光栅过一次。
+    ///
+    /// 这些字形**不进** `missing` 负缓存：对应节点会重新入下一帧的重排队列、带「待重排」标记
+    /// 重光栅，并压一条 [`TextDiagnostic::AtlasFull`]。连续
+    /// `text::atlas::ATLAS_FULL_ESCALATION_FRAMES`（默认 3）个 pass 仍非零时，
+    /// `App::layout_text` 改为返回 [`crate::error::EngineError::AtlasExhausted`]。
+    pub skipped_glyphs: usize,
 }
 
 /// 字体栈的健康状态（N4：测试与诊断的**唯一**跳过判据，避免散落 `eprintln!`）。
@@ -984,6 +994,16 @@ pub enum TextDiagnostic {
         glyph: u32,
         /// 该字形所属 run 的源文本字节区间。
         text_range: Range<usize>,
+    },
+    /// 字形图集整页都是本帧工作集 ⇒ 本帧少画了 `skipped` 个字形，下一帧重试（R12-1 / P1-①）。
+    ///
+    /// **每个节点每轮最多一条**（不按字形刷屏）：`skipped` 是该节点本轮被跳过的字形总数。
+    /// 命中的节点会重新入下一帧的重排队列并重光栅，因此这条诊断通常只连续出现 1–2 帧；
+    /// 连续 `ATLAS_FULL_ESCALATION_FRAMES`（默认 3）个 pass 仍出现则说明容量确实不足，
+    /// `App::layout_text` 改为返回 `EngineError::AtlasExhausted`（可见失败优于静默缺字）。
+    AtlasFull {
+        /// 该节点本轮没画出的字形数（`>= 1`）。
+        skipped: usize,
     },
 }
 

@@ -200,6 +200,13 @@ pub(crate) fn dispatch_input(app: &mut App, window: WindowId, event: InputEvent)
             modifiers,
             ..
         } => app.on_key(window, code, state, repeat, modifiers, &mut outcome),
+        // 手势（捏合 / 旋转 / 智能缩放，R09-4）：引擎**不发明**默认语义（缩放倍率、旋转锚点、
+        // 复位策略全是应用领域知识），因此这里只做交互收尾：手势属于指针会话，取消拖拽/悬停
+        // 状态由平台侧的 `PointerCancel` 负责，本事件本身不改变引擎状态。应用通过
+        // `App::drain_events` 观察它们（与 `Text` 同一条观测通路）。
+        InputEvent::Magnify { .. }
+        | InputEvent::Rotate { .. }
+        | InputEvent::SmartMagnify { .. } => {}
         InputEvent::Text { .. } => {}
     }
     outcome

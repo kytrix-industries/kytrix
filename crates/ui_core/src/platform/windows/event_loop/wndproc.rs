@@ -1,24 +1,40 @@
-//! `WndProc` 消息分派：输入 / IME / DPI / a11y / 捕获 / `WM_NCHITTEST` 各分支。
-//! `wndproc` 由 `NativeWindow::create` 注册为窗口过程（零行为变更的结构拆分）。
+//! `WndProc` 消息分派：输入 / IME / DPI / a11y / 捕获 / 非客户区。
+//! `wndproc` 由 `NativeWindow::create` 注册为窗口过程。
+//!
+//! ## 两条不可违反的纪律
+//!
+//! 1. **不把会重入 `WndProc` 的调用放进 `&mut WndProcState` 的借用里**（R07-7）。
+//!    `SetWindowPos` / `ShowWindow` / `DefWindowProcW`（`WM_NCLBUTTONDOWN` 会进模态循环）/
+//!    `ImmAssociateContext*` / `ImmSet*Window` 都会**同步**派发消息或重新进入本函数；嵌套
+//!    进入时会再取一次 `GWLP_USERDATA` 并构造 `&mut WndProcState` —— 两个活跃 `&mut` 是别名
+//!    UB。因此会重入的调用一律放在**短借用之间**：先算出命令/纯数据，释放借用，执行，再
+//!    短借用写回（IME 的 [`ime::ImeCommand`] 就是这个形状）。
+//! 2. **非客户区完全交系统**（R07-2）：`WM_NCCALCSIZE` / `WM_NCHITTEST` / `WM_NCLBUTTONDOWN`
+//!    都不改写。Aero Snap、Win11 Snap Layouts、拖动/缩放、双击最大化、右键系统菜单都是
+//!    `DefWindowProcW` 在 `WM_NCLBUTTONDOWN` 上进入的**模态循环内部**行为；自己接管
+//!    `HTCAPTION` 就等于放弃这些系统手势（Chrome / GPUI / Qt 的选择都是「要 Snap」）。
 
 use windows::Win32::{
-    Foundation::{ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT, WPARAM},
+    Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
     Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT, ScreenToClient},
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
     UI::{
-        Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE},
+        Input::KeyboardAndMouse::{
+            GetKeyState, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_LBUTTON, VK_MBUTTON,
+            VK_RBUTTON, VK_SPACE, VK_XBUTTON1, VK_XBUTTON2,
+        },
         WindowsAndMessaging::*,
     },
 };
 
 use super::{
     WndProcState,
-    caption::{CAPTION_TIMER_ID, RESIZE_TIMER_ID, is_caption_hit, is_resize_hit},
-    pump::{FRAME_TIMER_ID, cursor_handle, message_ticks},
+    pump::{A11Y_TIMER_ID, cursor_handle, message_ticks},
 };
 use crate::platform::{
     dispatcher::{WM_APP_COMPOSITION_WAKE, WM_APP_FRAME_WAKE},
     event::{PlatformEvent, StampedEvent, hiword_signed, loword_signed, translate},
+    windows::{dpi, ime},
 };
 
 /// 消费者：`NativeWindow::create`（`window.rs` 注册窗口过程）。
@@ -30,26 +46,35 @@ pub(crate) extern "system" fn wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     // SAFETY: `hwnd` 由系统在消息分发时给出；`GWLP_USERDATA` 只由本模块写入（`NativeWindow::create`），
-    // 并在 `NativeWindow::drop` 之前清空（销毁后不会再有消息）。
+    // 并在 `NativeWindow::drop` 之前清空（销毁后不会再有消息）。下面所有对 `state` 的访问都是
+    // **短借用**：会重入 `WndProc` 的调用之前必须已经释放借用（见文件头纪律 1）。
     unsafe {
-        // 非客户区仍由系统**绘制**（P09 不做自绘标题栏）：`WM_NCCALCSIZE` / `WM_NCHITTEST`
-        // 都交给默认过程，最小化/最大化/关闭按钮、边框命中与 DPI 下的标题栏高度继续由系统
-        // 负责；只有「按下后会让默认过程进入模态循环」的拖动/缩放由本过程接管（见下方
-        // `WM_NCLBUTTONDOWN` 分支）。
+        // 客户区**自绘**（DComp 提供全部像素，没有系统重定向表面）：系统仍按系统边框计算
+        // 客户区，因此这里必须交默认过程 —— 自己返回 0 等于要求引擎画标题栏与边框。
         if msg == WM_NCCALCSIZE {
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        // 非客户区命中：**系统命中码**（`HTCAPTION` / `HTTOP` / `HTTOPLEFT` / `HTCLOSE`…）。
+        //
+        // 引擎不改写它，也不接管 `WM_NCLBUTTONDOWN`（R07-2）：拖动 / 缩放 / 双击最大化 /
+        // 右键系统菜单 / Aero Snap / Snap Layouts 全部由 `DefWindowProcW` 的模态循环提供，
+        // 而模态循环**只在按下 `HT*` 时进入**。曾经在这里接管 `HTCAPTION` 的实现因此丢掉了
+        // 全部系统手势（多显示器用户最常用的窗口布局方式）。
+        if msg == WM_NCHITTEST {
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
 
         let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WndProcState;
+        if state.is_null() {
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
 
         if msg == WM_GETMINMAXINFO {
-            if !state.is_null() {
-                let info = &mut *(lparam.0 as *mut MINMAXINFO);
-                info.ptMinTrackSize = POINT {
-                    x: (*state).min_size.0 as i32,
-                    y: (*state).min_size.1 as i32,
-                };
-            }
+            let info = &mut *(lparam.0 as *mut MINMAXINFO);
+            info.ptMinTrackSize = POINT {
+                x: (*state).min_size.0 as i32,
+                y: (*state).min_size.1 as i32,
+            };
             return LRESULT(0);
         }
         // 客户区的光标由引擎决定（P2-3）：每次鼠标移动系统都会问一次，不接管就会被
@@ -57,15 +82,13 @@ pub(crate) extern "system" fn wndproc(
         // 返回 1 = 「已处理，别再改」；非客户区（边框）交给系统，缩放箭头才对。
         if msg == WM_SETCURSOR {
             let hit = (lparam.0 as u32) & 0xFFFF;
-            if hit == HTCLIENT && !state.is_null() {
-                // SAFETY: 系统光标句柄由 `LoadCursorW` 借用、进程不拥有；`SetCursor`
-                // 只影响当前线程。
+            if hit == HTCLIENT {
                 SetCursor(Some(cursor_handle((*state).cursor)));
                 return LRESULT(1);
             }
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
-        // 引擎自己画：抑制系统擦背景（否则拖动/重绘时闪白）。
+        // 引擎自己画：抑制系统擦背景（否则重绘时闪白）。
         if msg == WM_ERASEBKGND {
             return LRESULT(1);
         }
@@ -73,39 +96,98 @@ pub(crate) extern "system" fn wndproc(
             let mut paint = PAINTSTRUCT::default();
             let _ = BeginPaint(hwnd, &mut paint);
             let _ = EndPaint(hwnd, &paint);
-            if !state.is_null() {
-                (*state).wake();
-            }
+            (*state).wake();
             return LRESULT(0);
         }
-        if state.is_null() {
-            return DefWindowProcW(hwnd, msg, wparam, lparam);
-        }
-        // 应用主动禁用了本窗口的 IME（P2-7，自绘搜索框的英文直输等）：输入上下文已经从窗口
-        // 上摘下，所有 `WM_IME_*` 一律吞掉 —— 不派发 `ImeEvent`、不写 caret 表单，也不交给
+        // 应用主动禁用了本窗口的 IME（自绘搜索框的英文直输等）：输入上下文已经从窗口上摘下，
+        // 所有 `WM_IME_*` 一律吞掉 —— 不派发 `ImeEvent`、不写 caret 表单，也不交给
         // `DefWindowProcW`（它可能重新初始化/显示组合窗）。普通 `WM_CHAR` / 快捷键不受影响。
         //
-        // win-1 P3：IMM32 在焦点 / 输入法切换后可能把输入上下文**重新关联**回窗口
-        //（`WM_IME_SETCONTEXT` 就是「上下文关联状态变了」的通知，`WM_INPUTLANGCHANGE` 则是
-        // 输入法本身变了）。这时只吞消息不够：上下文已经挂回去了，字母键会重新被 IME 吃成
-        // 组合输入。先幂等再摘一次，再把消息吞掉。
+        // IMM32 在焦点 / 输入法切换后可能把输入上下文**重新关联**回窗口（`WM_IME_SETCONTEXT`
+        // 就是「上下文关联状态变了」的通知）。这时只吞消息不够：上下文已经挂回去了，字母键会
+        // 重新被 IME 吃成组合输入。先幂等再摘一次（两阶段，见文件头纪律 1），再把消息吞掉。
         if !(*state).ime_enabled() && (is_any_ime_message(msg) || msg == WM_INPUTLANGCHANGE) {
             if msg == WM_IME_SETCONTEXT || msg == WM_INPUTLANGCHANGE {
-                (*state).reassert_disabled_ime(hwnd);
+                let command = (*state).plan_ime_reassert();
+                if let Some(command) = command {
+                    let applied = ime::execute(hwnd, command);
+                    // 重新摘除**不覆盖**已保存的待恢复上下文（见 `ImeState::store_reasserted`）。
+                    (*state).note_ime_reasserted(applied);
+                }
             }
             return LRESULT(0);
         }
-        // 应用自己持有的指针捕获被系统收回（Alt+Tab、系统弹窗、别的窗口 SetCapture）：
-        // 此时**不会**收到 `WM_LBUTTONUP`，拖拽会话会永久停在「按住」。投递一次
-        // `PointerCancel` 让交互层作废本次会话（结束拖拽 + 派发 `DragPhase::Cancel`）。
-        // 自绘边框缩放 / 标题栏拖动有自己的收尾逻辑，走下面的分支，不重复投递。
-        if msg == WM_CAPTURECHANGED && (*state).resize.is_none() && (*state).caption_drag.is_none()
-        {
+        // R07-3：引擎自己画 inline preedit（`ImeEvent::Preedit`），必须清掉 IME 自绘组合窗与
+        // guideline，否则用户看到「输入的拼音出现两遍」；候选窗仍由 IME 画，位不变。
+        if msg == WM_IME_SETCONTEXT {
+            let masked = ime::mask_setcontext(wparam.0, lparam.0);
+            return DefWindowProcW(hwnd, msg, wparam, LPARAM(masked));
+        }
+        // R07-12：`WM_DPICHANGED` **在这里同步生效**，不排队到整批消息派发之后。
+        //
+        // 顺序不能换：先把新 scale / DPI 记进 `WndProcState`（同批次后续消息的坐标换算与
+        // `WM_GETMINMAXINFO` 都读它），再按系统建议矩形 `SetWindowPos`（winit / Qt 同样在消息
+        // 处理内完成），最后才投递应用事件。`SetWindowPos` 会同步派发 `WM_SIZE`，它的
+        // `StampedEvent` 因此带上**新** scale。
+        if msg == WM_DPICHANGED {
+            let dpi = (wparam.0 as u32) & 0xFFFF;
+            let Some(scale) = dpi::scale_from_dpi(dpi) else {
+                // 非法 DPI（0 / 非有限）：丢掉这条消息比按 1.0 重排更安全。
+                return LRESULT(0);
+            };
+            let ticks = message_ticks();
+            (*state).note_dpi(dpi, scale);
+            let context = (*state).context(ticks);
+            if let Some(stamped) =
+                translate(msg, wparam.0, lparam.0, context, &mut (*state).translate)
+            {
+                (*state).push_stamped_event(stamped);
+            }
+            let suggested = (!lparam.0.is_negative() && lparam.0 != 0).then(|| {
+                let rect = &*(lparam.0 as *const windows::Win32::Foundation::RECT);
+                (rect.left, rect.top, rect.right, rect.bottom)
+            });
+            if let Some((left, top, right, bottom)) = suggested {
+                // SAFETY: `hwnd` 存活；系统建议矩形只改位置与尺寸，不激活窗口、不改 Z 序。
+                // 可能重入 `WndProc`（`WM_WINDOWPOSCHANGED` / `WM_SIZE`）：此处不持有 `&mut`。
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    left,
+                    top,
+                    right - left,
+                    bottom - top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            (*state).wake();
+            return LRESULT(0);
+        }
+        // 应用自己持有的指针捕获被系统收回（Alt+Tab、系统弹窗、别的窗口 SetCapture）：此时
+        // **不会**收到 `WM_LBUTTONUP`，拖拽会话会永久停在「按住」。投递一次 `PointerCancel`
+        // 让交互层作废本次会话（结束拖拽 + 派发 `DragPhase::Cancel`）。
+        if msg == WM_CAPTURECHANGED {
             if (*state).suppress_capture_cancel {
-                // 引擎自己刚 `ReleaseCapture`（正常拖拽结束 / 缩放结束）：这不是会话丢失。
+                // 引擎自己刚 `ReleaseCapture`（正常拖拽结束）：这不是会话丢失。
                 // MSDN 明确「自己调用也会收到该消息」，不区分就会在每次松手后误投一次
                 // `PointerCancel`，把 hover 清掉并给观察者注入幽灵事件。
                 (*state).suppress_capture_cancel = false;
+                return LRESULT(0);
+            }
+            // 非客户区交系统之后（R07-2），原生 move/size 模态循环会自己 `SetCapture` 我们的
+            // 窗口、结束时再 `ReleaseCapture`，于是每次拖动/缩放窗口结束都会送来一条
+            // `WM_CAPTURECHANGED`。那不是「拖拽被抢走」：真正的会话丢失一定发生在**按键仍
+            // 按下**时（Alt+Tab / 系统弹窗 / 别的窗口抢捕获），而模态循环收尾时按键已经抬起。
+            // 用按键状态区分，不需要追踪 `WM_ENTERSIZEMOVE`/`WM_EXITSIZEMOVE` 的配对与顺序。
+            let mut button_down = false;
+            for key in [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2] {
+                // SAFETY: `GetKeyState` 是无副作用的线程局部查询（高位置位 = 按下）。
+                if GetKeyState(i32::from(key.0)) < 0 {
+                    button_down = true;
+                    break;
+                }
+            }
+            if !button_down {
                 return LRESULT(0);
             }
             (*state).push_now(PlatformEvent::PointerCancel);
@@ -113,144 +195,21 @@ pub(crate) extern "system" fn wndproc(
             return LRESULT(0);
         }
 
-        // ── 自绘非客户区交互（缩放 + 标题栏拖动，P2-9） ──────────────────────────
-        // 非客户区的缩放/移动不能交给 `DefWindowProcW`：`WM_NCLBUTTONDOWN` 的缩放分支会进入
-        // Win32 的模态 sizing 循环、`HTCAPTION` 会进入 move 模态循环，把我们的泵阻塞在里面，
-        // `WM_SIZE`/`WM_TIMER` 只能排队、画面在拖动期间不更新。这里接管按下/移动/抬起，普通
-        // 消息循环继续跑，下一轮泵就能出帧。
-        //
-        // 系统标题栏**仍然由系统绘制**（`WM_NCCALCSIZE` / `WM_NCHITTEST` 交默认过程），所以
-        // 这里只接管两个「按下后需要进入模态循环」的命中区域：缩放边框 → 自绘缩放；
-        // `HTCAPTION` / `HTSYSMENU` → 自绘拖动。最小化/最大化/关闭按钮（`HTMINBUTTON` 等）
-        // 继续走 `DefWindowProcW`，行为不变；它们不进入模态循环。
-        {
-            let state = &mut *state;
-            let hit = wparam.0 as u32;
-            if is_caption_hit(hit) {
-                match msg {
-                    WM_NCLBUTTONDOWN => {
-                        // win-2 P3：UI 线程卡顿 / 仍持有捕获时，系统可能不投递
-                        // `WM_NCLBUTTONDBLCLK`，只再来一条 `WM_NCLBUTTONDOWN`。自计时判定命中
-                        // 就按双击处理（最大化/还原切换），否则开始拖动。
-                        if state.self_timed_double_click(hwnd) {
-                            state.toggle_maximize(hwnd);
-                        } else {
-                            state.begin_caption_drag(hwnd);
-                        }
-                        return LRESULT(0);
-                    }
-                    // 双击标题栏：系统行为是最大化/还原切换；自己 `ShowWindow`，
-                    // 不让 `DefWindowProcW` 进入 move 模态循环。
-                    WM_NCLBUTTONDBLCLK => {
-                        state.toggle_maximize(hwnd);
-                        return LRESULT(0);
-                    }
-                    // 引擎不提供系统菜单（见 `WindowOptions` 文档）：右键标题栏交给
-                    // `DefWindowProcW` 会调用 `TrackPopupMenu` 的模态循环，直接吞掉。
-                    WM_NCRBUTTONDOWN | WM_NCRBUTTONUP | WM_NCRBUTTONDBLCLK => return LRESULT(0),
-                    _ => {}
-                }
-            }
-            // Alt+Space（或标题栏图标的键盘等价）：默认过程会打开系统菜单的模态循环。
-            if msg == WM_SYSCOMMAND && (wparam.0 as u32 & 0xFFF0) == SC_KEYMENU {
-                return LRESULT(0);
-            }
-            if msg == WM_NCLBUTTONDOWN && is_resize_hit(hit) {
-                state.begin_resize(hwnd, hit);
-                return LRESULT(0);
-            }
-            if state.caption_drag.is_some() {
-                match msg {
-                    // 位置由 1 ms 合并定时器统一 `SetWindowPos`（同 P1-2b）：拖动期间每个
-                    // `WM_MOUSEMOVE` 都移动会产生远高于刷新率的窗口重排。捕获期间系统只发
-                    // 客户区形式（MSDN：捕获后 `WM_NCMOUSEMOVE` 不再发出）；非客户区形式
-                    // 仅作防御（捕获没拿到 / 被系统提前收回）。
-                    WM_MOUSEMOVE | WM_NCMOUSEMOVE | WM_MOVING => return LRESULT(0),
-                    WM_TIMER if wparam.0 == CAPTION_TIMER_ID => {
-                        state.apply_caption_drag(hwnd);
-                        return LRESULT(0);
-                    }
-                    // `Esc` 取消拖动（win-2 P3）：与原生 move 循环一致 —— 窗口回到按下时的
-                    // 矩形/最大化状态，按键不投递给应用。
-                    WM_KEYDOWN if wparam.0 == VK_ESCAPE.0 as usize => {
-                        state.cancel_caption_drag(hwnd);
-                        return LRESULT(0);
-                    }
-                    // 捕获期间抬起是客户区形式（`WM_LBUTTONUP`），非客户区形式一并收尾，
-                    // 避免拖动会话停在「按住」。
-                    WM_LBUTTONUP | WM_NCLBUTTONUP => {
-                        state.apply_caption_drag(hwnd);
-                        state.end_caption_drag(hwnd);
-                        return LRESULT(0);
-                    }
-                    // 右键取消拖动（win-2 P3）：原生 move 循环下右键会打开系统菜单并结束
-                    // 移动；引擎不提供系统菜单（见 `WindowOptions` 文档），因此按「取消」处理。
-                    // 捕获后这类消息是**客户区**形式，客户区坐标相对被拖动的窗口是负的，
-                    // 交给应用会派发到错误位置。
-                    WM_RBUTTONDOWN | WM_RBUTTONUP => {
-                        state.cancel_caption_drag(hwnd);
-                        return LRESULT(0);
-                    }
-                    // 中键 / 滚轮在拖动期间一律吞掉（同样避免坐标错乱的应用事件）。
-                    WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
-                        return LRESULT(0);
-                    }
-                    WM_CAPTURECHANGED | WM_CANCELMODE => {
-                        // 捕获被系统收回（Alt+Tab / 系统弹窗 / 别的窗口 SetCapture）：按最新
-                        // 位置收尾，不留半移动的窗口。
-                        state.apply_caption_drag(hwnd);
-                        state.end_caption_drag(hwnd);
-                        return LRESULT(0);
-                    }
-                    _ => {}
-                }
-            }
-            if state.resize.is_some() {
-                match msg {
-                    // 只记录最新光标：`SetWindowPos` 由定时器 tick / 抬起 / 失去捕获合并（P1-2b）。
-                    WM_MOUSEMOVE => {
-                        state.note_resize_cursor();
-                        return LRESULT(0);
-                    }
-                    WM_TIMER if wparam.0 == RESIZE_TIMER_ID => {
-                        state.apply_resize(hwnd);
-                        // 每个 tick 至多一帧：泵的 ②b′ 会按最终客户区重算几何。
-                        state.wake();
-                        return LRESULT(0);
-                    }
-                    WM_LBUTTONUP => {
-                        state.note_resize_cursor();
-                        state.apply_resize(hwnd);
-                        state.end_resize(hwnd);
-                        state.wake();
-                        return LRESULT(0);
-                    }
-                    WM_CAPTURECHANGED => {
-                        // 捕获被系统收回（Alt+Tab / 弹出菜单等）：用最新位置收尾，不留半移动的窗口。
-                        state.note_resize_cursor();
-                        state.apply_resize(hwnd);
-                        state.end_resize(hwnd);
-                        return LRESULT(0);
-                    }
-                    _ => {}
-                }
-            }
-        }
-
         // ── a11y（P11）：借用纪律 ──────────────────────────────────────────────
         // `UiaReturnRawElementProvider`（转 `LRESULT` 时）与 `QueuedEvents::raise` 都会**同步**
         // 派发嵌套 `WM_GETOBJECT`。所以这两处只能在**不持有 `&mut WndProcState`** 的窗口里做：
         // 短借用块取出「未转换的值」，出了块再 `.into()` / `raise()`（P11 审查 #5）。
         if msg == WM_GETOBJECT {
-            let pending = {
-                // SAFETY: `state` 非空且由本线程独占（`GWLP_USERDATA` 的既有纪律）。
-                let cell = &mut *state;
-                if !cell.a11y_mut().begin_getobject() {
-                    // 重入：本次不接管（不让 UIA 拿到半个 provider）。
-                    return LRESULT(0);
-                }
-                cell.a11y_mut().wm_getobject(wparam, lparam)
-            };
+            if !(*state).a11y_mut().begin_getobject() {
+                // R07-8：嵌套查询必须**正常应答**，不能返回 0。
+                //
+                // 返回值 0 的语义是「本对象没有 provider」，UIA 会判定整个窗口不支持
+                // 无障碍（屏幕阅读器里界面变成空白窗口）。`&mut WndProcState` 在
+                // `.into()` 之前就已释放，重入本身是安全的（与 R07-7 的 IME 路径不同），
+                // 因此这里把嵌套请求交给默认过程（系统默认 provider），而不是拒绝服务。
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
+            let pending = (*state).a11y_mut().wm_getobject(wparam, lparam);
             let result = match pending {
                 Some(value) => value.into(),
                 None => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -262,8 +221,7 @@ pub(crate) extern "system" fn wndproc(
         // 窗口焦点态同步（与 `TranslateState` 的 `PlatformEvent::Focus` 是两条独立的线：
         // 前者给 AT 看「窗口有没有焦点」，后者给引擎做键盘分发）。
         if matches!(msg, WM_SETFOCUS | WM_EXITMENULOOP | WM_EXITSIZEMOVE) {
-            // SAFETY: 短借用；`raise` 在借用释放之后（它可能派发嵌套消息）。
-            let events = { (*state).a11y_mut().focus_changed(true) };
+            let events = (*state).a11y_mut().focus_changed(true);
             if let Some(events) = events {
                 events.raise();
             }
@@ -273,17 +231,15 @@ pub(crate) extern "system" fn wndproc(
             //
             // 修饰键是按消息顺序维护的（按下置位、抬起清位）。失焦期间抬起消息不再到达本窗口，
             // 于是 Alt+Tab / 打开菜单 / 进入模态缩放后，用户实际已经松开的 Shift/Ctrl 会永久
-            // 保持"按下"，之后所有输入都被当成组合键。代理对半高也一并清掉（否则失焦前半个
-            // 代理会和失焦后的字符拼成乱码）。
+            // 保持"按下"，之后所有输入都被当成组合键。代理对半高与 IME 待抑制码元也一并清掉
+            // （否则失焦前半个代理会和失焦后的字符拼成乱码，残留抑制码元会吞掉真实输入）。
             (*state).reset_transient_input();
-            // SAFETY: 同上。
-            let events = { (*state).a11y_mut().focus_changed(false) };
+            let events = (*state).a11y_mut().focus_changed(false);
             if let Some(events) = events {
                 events.raise();
             }
         }
 
-        let state = &mut *state;
         if msg == WM_APP_FRAME_WAKE {
             // `Dispatcher::wake` 已置位，这里只需要返回。
             return LRESULT(0);
@@ -296,15 +252,23 @@ pub(crate) extern "system" fn wndproc(
             return LRESULT(0);
         }
         if msg == WM_TIMER {
-            // 连续帧 tick：只唤醒；动画推进在 `App::frame` 的 `tick_animations`，
-            // P17 HUD 的采样/请求 damage 在 `App::frame` 的 `prepare_debug_hud`。
-            if wparam.0 == FRAME_TIMER_ID {
-                state.wake();
+            // a11y 补发兜底：连续帧由合成器时钟（`pump::FramePacer`）驱动，**不**用 `WM_TIMER`
+            // （R07-10：`WM_TIMER` 是低优先级消息，输入密集时会被饿，且不与 DWM 节拍对齐）。
+            if wparam.0 == A11Y_TIMER_ID {
+                (*state).wake();
                 return LRESULT(0);
             }
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
-        if msg == WM_MOUSEMOVE && !state.mouse_tracking {
+        // Alt+Space（系统菜单的键盘等价）交给默认过程；其余 `SC_KEYMENU`（Alt+字母 的菜单
+        // 激活）吞掉：引擎没有菜单栏，交给默认过程只会在部分配置下响一声提示音（P3-1）。
+        if msg == WM_SYSCOMMAND && (wparam.0 as u32 & 0xFFF0) == SC_KEYMENU {
+            let is_system_menu = lparam.0 == VK_SPACE.0 as isize;
+            if !is_system_menu {
+                return LRESULT(0);
+            }
+        }
+        if msg == WM_MOUSEMOVE && !(*state).mouse_tracking {
             // `PointerLeave` 的生产者：鼠标离开客户区时系统发 `WM_MOUSELEAVE`（0x02A3）。
             let mut track = TRACKMOUSEEVENT {
                 cbSize: core::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -314,7 +278,7 @@ pub(crate) extern "system" fn wndproc(
             };
             // `track` 在栈上，`hwnd` 是本窗口；失败时下一帧再试。
             if TrackMouseEvent(&mut track).is_ok() {
-                state.mouse_tracking = true;
+                (*state).mouse_tracking = true;
                 // R02-4：进入客户区的**第一个**消息就是 `PointerEnter` 的生产点（Win32 没有
                 // 独立的 enter 消息，`TME_LEAVE` 只在离开时通知）。
                 //
@@ -322,8 +286,8 @@ pub(crate) extern "system" fn wndproc(
                 // `last_client_pos` 读取，而它只在下面的 translate 结果里更新 —— 必须先记录
                 // 本次移动的位置再 push，否则第一条 `PointerEnter.position` 是旧位置（首次为
                 // `(0,0)`），并基于它命中一次 hover/光标，随后才被真正的 `PointerMove` 纠正。
-                state.note_client_pos(loword_signed(lparam.0), hiword_signed(lparam.0));
-                state.push_now(PlatformEvent::PointerEnter);
+                (*state).note_client_pos(loword_signed(lparam.0), hiword_signed(lparam.0));
+                (*state).push_now(PlatformEvent::PointerEnter);
             }
         }
 
@@ -343,45 +307,50 @@ pub(crate) extern "system" fn wndproc(
         // R02-14：时间戳取 `MSG.time`（`GetMessageTime`），不是分发时刻。
         let ticks = message_ticks();
         let stamped = if is_ime_message(msg) {
-            state
-                .translate
-                .ime_mut()
-                .handle(hwnd, msg, lparam_value)
-                .map(|ime| StampedEvent {
-                    event: PlatformEvent::Ime(ime),
-                    ticks_ms: ticks,
-                })
+            // 组合串读取（`ImmGetContext` + `ImmGetCompositionStringW`）不派发消息，可以在借用
+            // 内完成；**写**表单/上下文会重入，因此只产命令、出借用后再执行（文件头纪律 1）。
+            let outcome = (*state).translate.ime_mut().handle(hwnd, msg, lparam_value);
+            if let Some(command) = outcome.command {
+                let applied = ime::execute(hwnd, command);
+                (*state).note_ime_applied(applied);
+            }
+            outcome.event.map(|ime| StampedEvent {
+                event: PlatformEvent::Ime(ime),
+                ticks_ms: ticks,
+                scale: (*state).scale(),
+            })
         } else if msg == WM_SETTINGCHANGE {
             // 系统滚轮行数（`SPI_GETWHEELSCROLLLINES`）可能变了（R02-10）。
-            state.refresh_wheel_lines();
+            (*state).refresh_wheel_lines();
             appearance_change(lparam_value).map(|event| StampedEvent {
                 event,
                 ticks_ms: ticks,
+                scale: (*state).scale(),
             })
         } else {
-            let context = state.context(ticks);
+            let context = (*state).context(ticks);
             translate(
                 msg,
                 wparam_value,
                 lparam_value,
                 context,
-                &mut state.translate,
+                &mut (*state).translate,
             )
         };
 
         if let Some(stamped) = stamped {
             match &stamped.event {
-                PlatformEvent::PointerLeave => state.mouse_tracking = false,
+                PlatformEvent::PointerLeave => (*state).mouse_tracking = false,
                 // `WM_MOUSELEAVE` 不带坐标：记下最近位置供 `PointerLeave` 的离开点使用。
-                PlatformEvent::Pointer { x, y, .. } => state.note_client_pos(*x, *y),
+                PlatformEvent::Pointer { x, y, .. } => (*state).note_client_pos(*x, *y),
                 _ => {}
             }
             let is_close = matches!(stamped.event, PlatformEvent::Close);
-            state.push_stamped_event(stamped);
-            state.wake();
+            (*state).push_stamped_event(stamped);
+            (*state).wake();
             if is_close {
                 // 不交给 `DefWindowProcW`：销毁由事件循环在关掉 `App` 里的窗口之后做。
-                state.close_requested = true;
+                (*state).close_requested = true;
                 return LRESULT(0);
             }
         }
@@ -464,7 +433,7 @@ pub(super) fn dark_mode() -> Option<bool> {
             Some(&mut size),
         )
     };
-    if status != ERROR_SUCCESS {
+    if status != windows::Win32::Foundation::ERROR_SUCCESS {
         return None;
     }
     Some(data == 0)

@@ -363,8 +363,23 @@ pub(crate) fn refresh_text(
 ///
 /// 图集逐 tile 淘汰（R12-1）可能让**本次 pass 早先**生成的 `ShapedLine` 里的 tile 被复用：
 /// 一旦淘汰发生，整 pass 重跑（最多 [`MAX_LAYOUT_TEXT_PASSES`] 轮），并把其它窗口的文本
-/// `ShapedLine` 也标记为待重排（图集是进程级共享的）。**任何情况下都不返回 `TextShape`**：
-/// 容量不足时降级为「本帧少画几个字形」+ 诊断，绝不丢帧。
+/// `ShapedLine` 也标记为待重排（图集是进程级共享的）。**任何情况下都不返回 `TextShape`**。
+/// 极端容量不足撞到轮数上限时，本窗口这一帧的行被清空、但节点留在重排队列里 —— 下一帧重建，
+/// 不是永久丢文本。
+///
+/// # 容量不足（软失败）的闭环（R12-1 / P1-①）
+///
+/// `GlyphAtlas::ensure` 在「整页都是本 pass 工作集」时返回 `Ok(None)` 且**不写** `missing`
+/// 负缓存。这类字形在本 pass 里按下面四步处理，任何一步都不丢帧：
+///
+/// 1. **可观测**：`GlyphAtlasStats::skipped` 累加进 [`TextLayoutReport::skipped_glyphs`]；
+/// 2. **有诊断**：该节点本轮压**一条** [`TextDiagnostic::AtlasFull`]（不按字形刷屏；
+///    `TextContext` 的诊断是 64 条环形缓冲，不会无限增长）；
+/// 3. **能恢复**：该节点重新入下一帧的重排队列（`mark_text_layout_dirty`），并且本帧发布的
+///    「少画几个字形」的 `ShapedLine` 带 [`PENDING_ATLAS_RETRY_GENERATION`] 标记 —— 下一帧的
+///    复用判据必然不成立，会真正重光栅重试；
+/// 4. **失败可见**：连续 `text::atlas::ATLAS_FULL_ESCALATION_FRAMES`（3）个 pass 仍有软失败
+///    ⇒ 返回 [`EngineError::AtlasExhausted`]（`AtlasKind::Glyph`），计数随即清零以免每帧都报错。
 ///
 /// 消费者：`App::layout_text`。
 pub(crate) fn layout_text(
@@ -395,6 +410,9 @@ pub(crate) fn layout_text(
             .take_text_layout_dirty(text_layout_scratch);
     }
     if text_layout_scratch.is_empty() {
+        // 本 pass 没有任何重排 ⇒ 没有字形被跳过（`skipped == 0`）：清零连续软失败计数。
+        // `note_soft_fail(0)` 恒返回 `Ok`，这里不可能产生错误。
+        let _ = glyph_atlas.note_soft_fail(0);
         return Some(Ok(report));
     }
 
@@ -404,6 +422,7 @@ pub(crate) fn layout_text(
         report.tiles_reused = 0;
         report.atlas_rebuilds = 0;
         report.atlas_evictions = 0;
+        report.skipped_glyphs = 0;
         let generation = atlas.generation();
         let mut laid = 0usize;
         let mut reused = 0usize;
@@ -446,7 +465,7 @@ pub(crate) fn layout_text(
                 generation,
                 scale,
             };
-            let (line, diagnostics, stats) =
+            let (line, mut diagnostics, stats) =
                 match shaped.rasterize(width, alignment, color, &mut ctx, ellipsis.as_deref()) {
                     Ok(value) => value,
                     Err(error) => return Some(Err(error)),
@@ -456,9 +475,26 @@ pub(crate) fn layout_text(
             report.tiles_reused += stats.hits;
             report.atlas_rebuilds += stats.rebuilds;
             report.atlas_evictions += stats.evictions;
+            report.skipped_glyphs += stats.skipped;
             pending_dirty.merge(&mut atlas.take_dirty_rows());
+            // 软失败（整页都是本 pass 工作集）的闭环：可观测 + 诊断 + 下一帧重试。
+            // 每节点每轮**只**压一条诊断（不按字形刷屏），并重新入下一帧的重排队列。
+            let soft_fail = stats.skipped > 0;
+            if soft_fail {
+                diagnostics.push(TextDiagnostic::AtlasFull {
+                    skipped: stats.skipped,
+                });
+                tree.mark_text_layout_dirty(node);
+            }
             text.push_diagnostics(diagnostics);
-            tree.set_text_line(node, Rc::new(line), width, generation);
+            // 软失败的行不是本代际的完整结果：槽里的代际写「待重排」哨兵，下一帧的复用判据
+            // 必然不成立 ⇒ 真正重光栅重试（本帧照常发布这份少画了几个字形的 `ShapedLine`）。
+            let laid_generation = if soft_fail {
+                PENDING_ATLAS_RETRY_GENERATION
+            } else {
+                generation
+            };
+            tree.set_text_line(node, Rc::new(line), width, laid_generation);
             laid += 1;
         }
         let evicted = glyph_atlas.take_evicted();
@@ -475,14 +511,16 @@ pub(crate) fn layout_text(
         // 不在本帧使用的 tile，工作集放得下就收敛）。
         any_eviction = true;
         tree.invalidate_text_lines();
+        round += 1;
+        if round >= MAX_LAYOUT_TEXT_PASSES {
+            // 兜底：不再重跑本帧。此时行刚被清空、全部文本节点**已入队**（`invalidate_text_lines`），
+            // 下一帧的 `layout_text` 会把它们重建 —— 不要先 `take_text_layout_dirty` 把队列换成
+            // 下一轮的列表（那张列表下一帧会被清空重填，节点就会停在「无行且不在队列」的永久丢文本状态）。
+            break;
+        }
         scratch.clear();
         tree.take_text_layout_dirty(&mut scratch);
         std::mem::swap(&mut scratch, text_layout_scratch);
-        round += 1;
-        if round >= MAX_LAYOUT_TEXT_PASSES {
-            // 兜底：不再重跑，保留最后一轮结果（极端容量不足时少画几个字形，但绝不丢帧）。
-            break;
-        }
     }
 
     // 图集是进程级共享的：本窗口的淘汰会让其它窗口的 `ShapedLine` 引用已失效的矩形。
@@ -495,11 +533,28 @@ pub(crate) fn layout_text(
             other.tree_mut().invalidate_text_lines();
         }
     }
+    // 可见失败兜底：连续 `ATLAS_FULL_ESCALATION_FRAMES` 个 pass 都以软失败收尾 ⇒ 上报
+    // `AtlasExhausted`（调用方丢弃这一帧）。计数在同一次调用里清零，不是每帧都报错；
+    // 一次 `skipped == 0` 的 pass 会把它清零（见 `GlyphAtlas::note_soft_fail`）。
+    if let Err(error) = glyph_atlas.note_soft_fail(report.skipped_glyphs) {
+        return Some(Err(error));
+    }
     Some(Ok(report))
 }
 
 /// 单帧内 `layout_text` 的最大重跑轮数（图集淘汰后整 pass 重来）。
 pub(crate) const MAX_LAYOUT_TEXT_PASSES: usize = 4;
+
+/// 软失败 `ShapedLine` 的「待重排」代际标记（R12-1 / P1-①）。
+///
+/// `layout_text` 的复用判据是「槽里记的 `(内容宽, 图集代际)` 与本次一致，且已有
+/// `ShapedLine`」。因图集放不下而少画了字形的行**不是**本代际的完整结果，必须下一帧重排
+/// 重试：把槽里记的代际写成这个哨兵值，复用判据必然不成立。
+///
+/// 真实代际由 `AtlasAllocator` 换代递增（`wrapping_add(1)`，从 1 起；每次换代都是整页重建），
+/// 需要 2^32−1 次整页重建才会撞上这个值 —— 实际不可能发生；即便发生，也只是少一次重试
+/// （那一行的缺口会在下一次自然失效时补上）。
+const PENDING_ATLAS_RETRY_GENERATION: u32 = u32::MAX;
 
 /// 当前字体栈。
 /// 消费者：`App::font_stack`。
@@ -610,5 +665,228 @@ pub(crate) fn invalidate_all_text(app: &mut App) {
         // P1-2.3：字体栈 / 系统字体变化后，脏集合必须包含**全部**文本节点 ——
         // `refresh_text` 现在只遍历脏集合，漏标就等于永久不重排。
         tree.mark_all_text_dirty();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MAX_LAYOUT_TEXT_PASSES;
+    use crate::{
+        app::App,
+        error::EngineError,
+        node::{builder::NodeBuilder, id::NodeId},
+        paint::atlas::AtlasKind,
+        render::AtlasAllocator,
+        text::{TextDiagnostic, TextStyle, atlas::ATLAS_FULL_ESCALATION_FRAMES},
+        window::{WindowId, WindowOptions},
+    };
+
+    fn new_app() -> (tokio::runtime::Runtime, App) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let app = App::new(rt.handle().clone());
+        (rt, app)
+    }
+
+    fn text_style(width: Option<f32>) -> crate::paint::style::Style {
+        let mut style = crate::paint::style::Style::default();
+        style.inner.align_self = Some(taffy::style::AlignSelf::START);
+        if let Some(width) = width {
+            style.inner.size.width = taffy::style::Dimension::length(width);
+        }
+        style
+    }
+
+    fn text_app(
+        text: &str,
+        width: Option<f32>,
+    ) -> (tokio::runtime::Runtime, App, WindowId, NodeId) {
+        let (rt, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        let w = app.window_mut(window).expect("窗口存在");
+        let root = w.tree().root();
+        let node = NodeBuilder::text(text, TextStyle::new(16.0))
+            .style(text_style(width))
+            .build(w.tree_mut(), root)
+            .expect("挂载成功");
+        (rt, app, window, node)
+    }
+
+    /// 一帧文本链路：`refresh_text` → `compute_layout` → `layout_text`（与 `App::frame` 同序）。
+    fn frame_text(app: &mut App, window: WindowId) -> crate::text::TextLayoutReport {
+        app.refresh_text(window)
+            .expect("窗口存在")
+            .expect("shape 不报错");
+        app.window_mut(window)
+            .expect("窗口存在")
+            .compute_layout()
+            .expect("布局不报错");
+        app.layout_text(window)
+            .expect("窗口存在")
+            .expect("layout_text 不报错")
+    }
+
+    /// 把字形图集钉在 32²（生产最小档是 512²）：几十个字形就能把「整页都是本 pass 工作集」
+    /// 这一支真实触发出来，`grow` 无处可扩。
+    fn constrain_glyph_atlas(app: &mut App) {
+        let mut atlas = AtlasAllocator::with_page(AtlasKind::Glyph, (32, 32));
+        atlas.cap_page_for_test(32);
+        app.atlas = atlas;
+        // 两级缓存必须同事务换代（`text::atlas` 的模块契约）。
+        app.glyph_atlas.clear();
+    }
+
+    /// P1-①：容量不足时的第二阶段软失败必须**统计上抛**（`skipped_glyphs`）、**可观测**
+    /// （`AtlasFull` 诊断）、**下一帧重试**（重新入队 + 待重排标记），并在连续多帧后**升级为
+    /// 可见错误**（`AtlasExhausted`），升级后不得每帧都报错。
+    #[test]
+    fn a_constrained_atlas_reports_skips_and_retries_next_frame() {
+        let (_rt, mut app, window, node) =
+            text_app("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", Some(400.0));
+        constrain_glyph_atlas(&mut app);
+
+        let first = frame_text(&mut app, window);
+        assert!(
+            first.rasterized > 0,
+            "本帧必须真的光栅（report: {first:?}）"
+        );
+        assert!(
+            first.skipped_glyphs > 0,
+            "32² 的页放不下 36 个不同字形（report: {first:?}）"
+        );
+        assert!(
+            first.skipped_glyphs <= first.rasterized,
+            "skipped 恒 <= rasterized（report: {first:?}）"
+        );
+        assert!(
+            app.text_diagnostics().iter().any(|diagnostic| matches!(
+                diagnostic,
+                TextDiagnostic::AtlasFull { skipped } if *skipped > 0
+            )),
+            "软失败必须可观测（diagnostics: {:?}）",
+            app.text_diagnostics()
+        );
+        // 下一帧重试的闭环：节点已重新入队，且槽里记的代际是「待重排」标记（≠ 真实代际）。
+        {
+            let tree = app.window(window).expect("窗口存在").tree();
+            assert_eq!(
+                tree.text_layout_dirty_len(),
+                1,
+                "软失败的节点必须重新入下一帧的重排队列"
+            );
+            assert_ne!(
+                tree.text_slot(node).expect("文本槽").laid_generation(),
+                app.atlas.generation(),
+                "软失败的行必须带「待重排」标记（否则下一帧会直接复用、永不补字形）"
+            );
+        }
+
+        // 下一帧：同一节点必须**重排**（不是 reused），并且缺口仍然可观测。
+        let retry = app
+            .layout_text(window)
+            .expect("窗口存在")
+            .expect("第二次 pass 还没到升级阈值");
+        assert_eq!(
+            (retry.laid, retry.reused),
+            (1, 0),
+            "软失败的行下一帧必须真正重光栅重试（report: {retry:?}）"
+        );
+        assert!(
+            retry.skipped_glyphs > 0,
+            "容量没变，重试仍放不下（report: {retry:?}）"
+        );
+
+        // 连续 `ATLAS_FULL_ESCALATION_FRAMES` 个 pass 都软失败 ⇒ 可见错误。
+        assert_eq!(ATLAS_FULL_ESCALATION_FRAMES, 3, "阈值是「连续 3 个 pass」");
+        let third = app.layout_text(window).expect("窗口存在");
+        let error = third.expect_err("连续软失败达到阈值必须升级为错误");
+        assert!(
+            matches!(
+                error,
+                EngineError::AtlasExhausted {
+                    kind: AtlasKind::Glyph
+                }
+            ),
+            "必须报 AtlasExhausted/Glyph，实际 {error:?}"
+        );
+        // 升级时计数清零：紧随其后的一个 pass 不能立刻再报错（否则等于每帧丢帧）。
+        let fourth = app
+            .layout_text(window)
+            .expect("窗口存在")
+            .expect("升级后计数清零，下一个 pass 不得再报错");
+        assert!(
+            fourth.skipped_glyphs > 0,
+            "容量仍未恢复（report: {fourth:?}）"
+        );
+    }
+
+    /// 宽裕场景：`skipped_glyphs == 0`，且不得压 `AtlasFull` 诊断、不得把节点重新入队。
+    #[test]
+    fn an_ample_atlas_reports_zero_skipped_glyphs() {
+        let (_rt, mut app, window, _node) = text_app("hello", Some(200.0));
+
+        let report = frame_text(&mut app, window);
+        assert!(
+            report.rasterized > 0,
+            "本帧必须真的光栅（report: {report:?}）"
+        );
+        assert_eq!(
+            report.skipped_glyphs, 0,
+            "512² 的页放得下 5 个字形（report: {report:?}）"
+        );
+        assert!(
+            !app.text_diagnostics()
+                .iter()
+                .any(|diagnostic| matches!(diagnostic, TextDiagnostic::AtlasFull { .. })),
+            "没有软失败就不该有 AtlasFull 诊断（diagnostics: {:?}）",
+            app.text_diagnostics()
+        );
+        let tree = app.window(window).expect("窗口存在").tree();
+        assert_eq!(tree.text_layout_dirty_len(), 0, "没有软失败就不该重新入队");
+    }
+
+    /// 重试必须真的能补齐：容量恢复后同一节点重排，`skipped` 归零且 `ShapedLine` 的字形数补齐
+    /// （证明「待重排」标记 + 重新入队确实是可用恢复路径，而不是永远重试永远缺字）。
+    #[test]
+    fn a_retried_line_fills_the_missing_glyphs_once_capacity_returns() {
+        let text = "ABCDEFGHIJ0123456789";
+        let (_rt, mut app, window, node) = text_app(text, Some(400.0));
+        constrain_glyph_atlas(&mut app);
+        let first = frame_text(&mut app, window);
+        assert!(
+            first.skipped_glyphs > 0,
+            "受限图集必须触发软失败（report: {first:?}）"
+        );
+
+        // 容量恢复（模拟 `AtlasAllocator::grow` 成功后的下一档页）；两级缓存同事务换代。
+        app.atlas = AtlasAllocator::with_page(AtlasKind::Glyph, (512, 512));
+        app.glyph_atlas.clear();
+        let retried = app
+            .layout_text(window)
+            .expect("窗口存在")
+            .expect("容量恢复后不得报错");
+        assert_eq!(
+            retried.skipped_glyphs, 0,
+            "容量恢复后不得再软失败（report: {retried:?}）"
+        );
+        assert!(
+            retried.laid >= 1,
+            "软失败的行必须被重排（report: {retried:?}）"
+        );
+        let line = app
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .text_line(node)
+            .expect("行快照")
+            .clone();
+        let drawn: usize = line.glyph_runs().map(|run| run.glyphs.len()).sum();
+        assert_eq!(
+            drawn,
+            text.chars().count(),
+            "重试后必须把少画的字形全部补上（重排轮数上限 {MAX_LAYOUT_TEXT_PASSES}）"
+        );
+        assert_eq!(line.atlas_generation, app.atlas.generation());
     }
 }

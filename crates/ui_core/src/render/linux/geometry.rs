@@ -18,7 +18,7 @@ use ash::vk;
 
 use crate::{
     error::EngineError,
-    paint::geometry::{GeometryDesc, GeometryId, GeometryPipeline, IndexType},
+    paint::geometry::{GeometryDesc, GeometryId, GeometryPipeline, IndexType, Topology},
     render::{
         linux::device::{GpuObject, SharedGpu, init_error},
         retire::GpuResourceHandle,
@@ -41,8 +41,11 @@ pub(crate) struct GeometryEntry {
     vertex: vk::Buffer,
     index: vk::Buffer,
     index_count: u32,
-    /// 图元类型（Vulkan 把它烘进管线状态，绘制时不需要单独绑定，因此只作登记用）。
+    /// 图元类型（Vulkan 把它烘进管线状态：PSO 按它选，绘制时不需要单独绑定）。
     pipeline: GeometryPipeline,
+    /// 三角拓扑（Vulkan 的 `VkPipelineInputAssemblyStateCreateInfo::topology` 是 PSO 烘死状态，
+    /// 不能逐 draw 切换 ⇒ 绘制时必须选对应 PSO，与 D3D12 / Metal 同语义）。
+    topology: Topology,
     /// 索引格式（`cmd_bind_index_buffer` 需要）。
     index_type: vk::IndexType,
     /// 该条目对应的代际（槽位复用后必须重建缓冲）。
@@ -68,6 +71,11 @@ impl GeometryEntry {
 
     pub(crate) fn pipeline(&self) -> GeometryPipeline {
         self.pipeline
+    }
+
+    /// 三角拓扑（PSO 选择的一部分）。
+    pub(crate) fn topology(&self) -> Topology {
+        self.topology
     }
 
     /// 索引格式。
@@ -173,6 +181,7 @@ fn upload_geometry(
         index,
         index_count: (desc.index_bytes.len() as u32) / desc.index_type.size(),
         pipeline: desc.pipeline,
+        topology: desc.topology,
         index_type: index_type(desc.index_type),
         generation: id.generation(),
         // 由 `ensure` 在返回前立刻写成当前帧号；这里只是构造初值。
@@ -291,6 +300,7 @@ mod tests {
             index: vk::Buffer::null(),
             index_count: 0,
             pipeline: GeometryPipeline::Ui,
+            topology: Topology::TriangleList,
             index_type: vk::IndexType::UINT16,
             generation: 0,
             last_used_frame,

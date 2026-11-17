@@ -1636,7 +1636,7 @@ fn draw_ops(
                     shared.raw().cmd_bind_pipeline(
                         command,
                         vk::PipelineBindPoint::GRAPHICS,
-                        pipeline.geometry(entry.pipeline()),
+                        pipeline.geometry(entry.pipeline(), entry.topology()),
                     );
                     shared.raw().cmd_push_constants(
                         command,

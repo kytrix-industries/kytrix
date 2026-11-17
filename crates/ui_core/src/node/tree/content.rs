@@ -471,15 +471,20 @@ pub(crate) fn geometry_transform(tree: &NodeTree, node: NodeId) -> Transform {
 /// 写入几何节点的 per-draw 变换（单位矩阵 = 删除条目）。
 ///
 /// 标 `PAINT`：变换烘在 lane 的 `Primitive::Geometry` 里，因此 lane 必须重建（顶点缓冲按
-/// `(index, generation)` 缓存，不会被这次改动触碰）。damage 由 `touch` 按节点布局盒并入。
+/// `(index, generation)` 缓存，不会被这次改动触碰）。
 ///
-/// **写入口只在测试里可达**：应用层入口（`App::set_geometry_transform`）属 app 层，见报告
-/// R05-12 的遗留项；读路径（`paint/pass.rs` 的 getter + 编码器 + damage）是生产代码。
-#[cfg(test)]
+/// `extra_damage` 是调用方（`app::geometry`）算出的**两侧**可见范围并集（旧变换 ∪ 新变换下的
+/// `GeometryDesc.bounds`，**内容坐标**）：`touch` 只能并入节点布局盒，而几何平移/缩放后旧像素
+/// 可能落在盒外，必须由这里补上，否则局部刷新会留残影（AR2 P1-D4）。传空矩形 = 没有额外范围。
+/// 走的是**同一条** damage 记账（节点的 `damage` 累加器），不是第二条 damage 路径。
+///
+/// # Errors
+/// [`EngineError::StaleNode`]：节点不存在或不是几何节点。
 pub(crate) fn set_geometry_transform(
     tree: &mut NodeTree,
     node: NodeId,
     transform: Transform,
+    extra_damage: Rect,
 ) -> Result<(), EngineError> {
     match tree.arena.get(node).map(|target| target.kind()) {
         Some(NodeKind::Geometry(_)) => {}
@@ -491,6 +496,9 @@ pub(crate) fn set_geometry_transform(
         tree.geometry_transforms.insert(node, transform);
     }
     tree.mark_paint(node);
+    if let Some(target) = tree.arena.get_mut(node) {
+        target.damage = target.damage.union(extra_damage);
+    }
     Ok(())
 }
 

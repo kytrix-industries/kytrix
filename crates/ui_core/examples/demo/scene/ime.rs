@@ -64,7 +64,7 @@ impl ImeField {
                 self.composing = true;
                 self.last_event = SmolStr::new_static("Start");
             }
-            ImeEvent::Preedit { text, replace } => {
+            ImeEvent::Preedit { text, replace, .. } => {
                 self.composing = true;
                 // 输入法逐子句更新（macOS `replacementRange`）时只替换组合串的一部分，
                 // 区间外的旧组合串必须保留，否则会丢字。
@@ -345,6 +345,8 @@ mod tests {
         field.apply(&ImeEvent::Start);
         assert!(field.composing(), "Start 本身就进入组合态（不依赖组合串）");
         field.apply(&ImeEvent::Preedit {
+            caret: None,
+            clauses: smallvec::SmallVec::new(),
             text: "ni".into(),
             replace: None,
         });
@@ -391,14 +393,20 @@ mod tests {
         let mut field = ImeField::default();
 
         field.apply(&ImeEvent::Preedit {
+            caret: None,
+            clauses: smallvec::SmallVec::new(),
             text: "s".into(),
             replace: None,
         });
         field.apply(&ImeEvent::Preedit {
+            caret: None,
+            clauses: smallvec::SmallVec::new(),
             text: "sh".into(),
             replace: None,
         });
         field.apply(&ImeEvent::Preedit {
+            caret: None,
+            clauses: smallvec::SmallVec::new(),
             text: "shi".into(),
             replace: None,
         });
@@ -413,12 +421,16 @@ mod tests {
     fn preedit_replaces_only_the_requested_utf16_range() {
         let mut field = ImeField::default();
         field.apply(&ImeEvent::Preedit {
+            caret: None,
+            clauses: smallvec::SmallVec::new(),
             text: "niha".into(),
             replace: None,
         });
 
         // 组合串内 [1, 3)（"ih"）被新的组合串 "í" 替换 → "n" + "í" + "a"。
         field.apply(&ImeEvent::Preedit {
+            caret: None,
+            clauses: smallvec::SmallVec::new(),
             text: "í".into(),
             replace: Some(1..3),
         });
@@ -432,6 +444,8 @@ mod tests {
     fn commit_replaces_only_the_requested_utf16_range() {
         let mut field = typed("前缀");
         field.apply(&ImeEvent::Preedit {
+            caret: None,
+            clauses: smallvec::SmallVec::new(),
             text: "niha".into(),
             replace: None,
         });
@@ -451,12 +465,16 @@ mod tests {
     fn preedit_replacement_keeps_surrogate_pairs_intact() {
         let mut field = ImeField::default();
         field.apply(&ImeEvent::Preedit {
+            caret: None,
+            clauses: smallvec::SmallVec::new(),
             text: "🌍a".into(),
             replace: None,
         });
 
         // 整个 emoji（2 个 UTF-16 码元）被替换；后面的 'a' 保留。
         field.apply(&ImeEvent::Preedit {
+            caret: None,
+            clauses: smallvec::SmallVec::new(),
             text: "🌏".into(),
             replace: Some(0..2),
         });
@@ -465,6 +483,8 @@ mod tests {
         // 篡改区间（落在代理对中间）时按码点边界收缩，不能 panic/产生非法 UTF-8：
         // 起点/终点都落在 emoji 的低代理之后 ⇒ 收缩成 emoji 末尾的插入点 "🌏|a" → "🌏xa"。
         field.apply(&ImeEvent::Preedit {
+            caret: None,
+            clauses: smallvec::SmallVec::new(),
             text: "x".into(),
             replace: Some(1..2),
         });
@@ -478,6 +498,8 @@ mod tests {
         assert_eq!(field.committed(), "ab你", "按 char 而不是字节删除");
 
         field.apply(&ImeEvent::Preedit {
+            caret: None,
+            clauses: smallvec::SmallVec::new(),
             text: "ni".into(),
             replace: None,
         });
@@ -509,6 +531,8 @@ mod tests {
         let mut field = typed("hello");
 
         field.apply(&ImeEvent::Preedit {
+            caret: None,
+            clauses: smallvec::SmallVec::new(),
             text: "ni".into(),
             replace: None,
         });
@@ -531,6 +555,8 @@ mod tests {
         assert_eq!(field.display(true).as_str(), "前缀后缀|");
 
         field.apply(&ImeEvent::Preedit {
+            caret: None,
+            clauses: smallvec::SmallVec::new(),
             text: "组".into(),
             replace: None,
         });
@@ -541,6 +567,8 @@ mod tests {
     fn leaving_the_field_cancels_the_preedit_and_is_idempotent() {
         let mut field = ImeField::default();
         field.apply(&ImeEvent::Preedit {
+            caret: None,
+            clauses: smallvec::SmallVec::new(),
             text: "shi".into(),
             replace: None,
         });
@@ -559,6 +587,8 @@ mod tests {
     fn at_set_value_replaces_the_text_and_clears_the_preedit() {
         let mut field = ImeField::default();
         field.apply(&ImeEvent::Preedit {
+            caret: None,
+            clauses: smallvec::SmallVec::new(),
             text: "ni".into(),
             replace: None,
         });
@@ -611,6 +641,8 @@ mod showcase_tests {
             &mut scene,
             app,
             &Event::Ime(ImeEvent::Preedit {
+                caret: None,
+                clauses: smallvec::SmallVec::new(),
                 text: "ni".into(),
                 replace: None,
             }),
@@ -753,6 +785,8 @@ mod showcase_tests {
             &mut scene,
             app,
             &Event::Ime(ImeEvent::Preedit {
+                caret: None,
+                clauses: smallvec::SmallVec::new(),
                 text: "shi".into(),
                 replace: None,
             }),
@@ -779,6 +813,8 @@ mod showcase_tests {
             &mut scene,
             app,
             &Event::Ime(ImeEvent::Preedit {
+                caret: None,
+                clauses: smallvec::SmallVec::new(),
                 text: "ni".into(),
                 replace: None,
             }),

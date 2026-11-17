@@ -896,17 +896,21 @@ impl NodeTree {
     }
     /// 设置几何节点的 per-draw 变换（顶点**不**重建：图表平移只改一个 uniform）。
     ///
-    /// 标 `PAINT`（lane 需要重建，因为变换烘在 lane 的图元里）。
+    /// 标 `PAINT`（lane 需要重建，因为变换烘在 lane 的图元里）；`extra_damage` 由调用方
+    /// （`App::set_geometry_transform`）给出「旧变换 ∪ 新变换下的可见范围」，与节点盒一样并进
+    /// 节点的 damage 累加器（同一条 damage 路径，AR2 P1-D4）。
+    ///
+    /// 唯一的生产调用者是 `app::geometry::set_geometry_transform`；测试可直接调。
     ///
     /// # Errors
     /// [`EngineError::StaleNode`]：节点不存在或不是几何节点。
-    #[cfg(test)]
     pub(crate) fn set_geometry_transform(
         &mut self,
         node: NodeId,
         transform: Transform,
+        extra_damage: Rect,
     ) -> Result<(), EngineError> {
-        content::set_geometry_transform(self, node, transform)
+        content::set_geometry_transform(self, node, transform, extra_damage)
     }
     pub(crate) fn content_offset(&self, node: NodeId) -> Point {
         content::content_offset(self, node)

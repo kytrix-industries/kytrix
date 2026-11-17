@@ -89,22 +89,98 @@ pub(crate) fn layer_uses_srgb() -> bool {
 mod tests {
     use super::{PRESENTED_COLOR_SPACE, PresentedColorSpace};
 
-    /// R06-10：引擎唯一的呈现色彩空间是显式声明的 sRGB（不是「各端推断」）。
-    #[test]
-    fn the_presented_color_space_is_explicit_srgb() {
-        assert_eq!(PRESENTED_COLOR_SPACE, PresentedColorSpace::SrgbRec709);
+    /// 三个后端源码（`include_str!` 与 `cfg` 无关：即使在 Windows 上也读得到 macOS / Linux 的
+    /// 源码，因此「某端自己决定色彩空间」可以在本机被抓住）。
+    fn backends() -> [(&'static str, &'static str); 3] {
+        [
+            (
+                "render/windows/swapchain.rs",
+                include_str!("windows/swapchain.rs"),
+            ),
+            (
+                "render/macos/swapchain.rs",
+                include_str!("macos/swapchain.rs"),
+            ),
+            (
+                "render/linux/swapchain.rs",
+                include_str!("linux/swapchain.rs"),
+            ),
+        ]
     }
 
-    /// HDR 是**显式声明的不支持**：枚举只有 sRGB 一个变体（新增 HDR 变体时三端的 `match`
-    /// 会因未覆盖而编译失败，不会静默漏端）。
+    /// 只保留生产代码（`#[cfg(test)]` 之前的部分）：测试自己的字符串常量不该参与扫描。
+    fn production(source: &'static str) -> &'static str {
+        source.split("#[cfg(test)]").next().unwrap_or(source)
+    }
+
+    /// 生产代码**去掉注释**后的正文：文档里说明「HDR 需要哪些常量」是允许的，
+    /// 真正禁止的是把它们写进代码。
+    fn production_code(source: &'static str) -> String {
+        production(source)
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// R06-10：呈现色彩空间由共享层**唯一决定**，三端只做翻译。
+    ///
+    /// 旧版测试是同义反复（断言常量等于它自己）。现在断言的是「消费关系」：三端都读
+    /// `render::colorspace`，且都不得写死广色域 / HDR 常量 —— 这正是旧实现里「Windows 完全不
+    /// 声明、Linux 透传合成器给的 colorSpace」能长期潜伏的原因。
+    #[test]
+    fn the_presented_color_space_is_explicit_srgb_and_consumed_by_all_backends() {
+        assert_eq!(PRESENTED_COLOR_SPACE, PresentedColorSpace::SrgbRec709);
+
+        for (name, source) in backends() {
+            let source = production_code(source);
+            assert!(
+                source.contains("colorspace") || source.contains("color_space"),
+                "{name} 必须消费共享层的色彩空间决定"
+            );
+            for forbidden in ["G2084", "HDR10", "extendedRange", "DISPLAY_P3", "BT2020"] {
+                assert!(
+                    !source.contains(forbidden),
+                    "{name} 不得写死 {forbidden}（HDR / 广色域是显式不支持的决策）"
+                );
+            }
+        }
+        // Linux 曾经把合成器给的 `colorSpace` 原样透传：必须用共享判据筛选、并显式写回声明值。
+        let linux = production_code(include_str!("linux/swapchain.rs"));
+        assert!(
+            linux.contains("accepts_color_space"),
+            "Linux 必须用共享判据筛选 surface format（不得透传合成器给的值）"
+        );
+        assert!(
+            linux.contains("image_color_space"),
+            "创建 swapchain 时必须显式写入声明的 `imageColorSpace`"
+        );
+        // Windows 必须走 `SetColorSpace1`、macOS 必须显式设置 layer 的颜色空间。
+        assert!(production_code(include_str!("windows/swapchain.rs")).contains("SetColorSpace1"));
+        assert!(production_code(include_str!("macos/swapchain.rs")).contains("setColorspace"));
+    }
+
+    /// HDR 是**显式声明的不支持**：枚举只有 sRGB 一个变体，且共享层没有任何 HDR 映射。
+    ///
+    /// 有检测力的部分是第二条：如果有人偷偷在共享模块里加一条 HDR 映射而不新增变体（旧版测试
+    /// 完全看不出来），`match` 分支与 `G2082/HDR` 字符串都会出现在本文件里，测试立刻失败。
     #[test]
     fn hdr_is_explicitly_unsupported() {
-        fn single_variant(color_space: PresentedColorSpace) -> bool {
+        // 穷尽 match（无通配符）：新增变体时这里与三端后端的 match 都会编译失败。
+        fn only_srgb(color_space: PresentedColorSpace) -> bool {
             match color_space {
                 PresentedColorSpace::SrgbRec709 => true,
             }
         }
-        assert!(single_variant(PRESENTED_COLOR_SPACE));
+        assert!(only_srgb(PRESENTED_COLOR_SPACE));
+
+        let shared = production_code(include_str!("colorspace.rs"));
+        for forbidden in ["G2084", "HDR10", "extendedRange", "BT2020", "DISPLAY_P3"] {
+            assert!(
+                !shared.contains(forbidden),
+                "共享决定点不得出现 {forbidden}（HDR 需新增变体 + 三端逐端 match）"
+            );
+        }
     }
 
     #[cfg(windows)]

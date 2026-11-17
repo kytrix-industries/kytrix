@@ -536,7 +536,7 @@ pub enum EngineError {
     #[error("图形设备丢失：{reason}；DRED/诊断信息已写入 {log_path}")]
     DeviceLost { reason: String, log_path: PathBuf },
     #[error("Wayland 合成器不满足要求：{detail}")]
-    WaylandCompositor { detail: String },
+    Wayland { kind: WaylandErrorKind, detail: String },
     #[error("shader 产物加载失败：{target} / {path}")]
     ShaderLoad { target: &'static str, path: PathBuf },
     #[error("swapchain 重建失败：{0}")]
@@ -550,7 +550,7 @@ pub enum EngineError {
 > `Composition` 是 2026-11-15 追加的 Windows DirectComposition **运行时**错误（几何 / `Commit` /
 > `SetContent` / 换链）；`AppInit` 只覆盖 `Composition::new` 的 COM 创建（DEVIATIONS §36 F-204）。
 
-- **不做静默降级**（I10）：`UnsupportedGpu` / `WaylandCompositor` 直接退出，退出码非 0，日志含实际检测值。Linux 若未运行
+- **不做静默降级**（I10）：`UnsupportedGpu` / `Wayland` 直接退出，退出码非 0，日志含实际检测值。Linux 若未运行
   Wayland 会话或 compositor 缺少 `xdg_wm_base`，给出可读错误并退出，**不回退任何其他窗口系统**（I16）。
 - **device lost**：停止提交、走可读错误、保留 DRED / validation layer 输出；不尝试在同进程内重建设备。
 - **尺寸变化**：Windows 窗口目标（2026-11-15 起）是 DirectComposition 组合交换链，resize 只改

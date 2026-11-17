@@ -1282,7 +1282,11 @@ mod tests {
             .build(&mut h.tree, root)
             .expect("挂载");
         h.tree
-            .set_geometry_transform(geometry, crate::math::Transform::translate(4.0, 6.0))
+            .set_geometry_transform(
+                geometry,
+                crate::math::Transform::translate(4.0, 6.0),
+                crate::math::Rect::default(),
+            )
             .expect("几何节点");
         layout_all(&mut h.tree);
         let _ = h.paint();
@@ -1300,8 +1304,11 @@ mod tests {
             .build(&mut h.tree, root)
             .expect("挂载");
         assert!(matches!(
-            h.tree
-                .set_geometry_transform(boxed, crate::math::Transform::IDENTITY),
+            h.tree.set_geometry_transform(
+                boxed,
+                crate::math::Transform::IDENTITY,
+                crate::math::Rect::default()
+            ),
             Err(crate::error::EngineError::StaleNode { .. })
         ));
     }
