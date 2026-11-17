@@ -146,7 +146,6 @@ mod tests {
         const WAKE_DELAY: f64 = 0.007;
         const VSYNCS: u32 = 30;
         let mut pacing = PresentPacing::new();
-        pacing.set_refresh_hz(120.0);
         let mut submitted = 0u32;
         let mut consecutive_skips = 0u32;
         let mut max_consecutive_skips = 0u32;

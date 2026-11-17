@@ -505,6 +505,14 @@ impl WindowRenderer {
         let Some(feedback) = self.shared.take_feedback() else {
             return Ok(None);
         };
+        // 共享契约（B6-2）：`presented_at` 是**真实上屏**时刻，不可能早于 GPU 完成；
+        // 三端都读它，HUD 才能用同一字段区分「发布→完成」与「发布→上屏」。
+        debug_assert!(
+            feedback
+                .presented_at
+                .is_none_or(|presented| presented >= feedback.completed_at),
+            "presented_at must not precede completed_at"
+        );
         self.stats = feedback.stats;
         debug_assert!(
             feedback.index.get() >= 1,
@@ -1134,6 +1142,9 @@ fn drain_completed(
             completed_at,
             // UI 发布 → GPU 完成（HUD 的 publish→present）。
             latency: completed_at.saturating_duration_since(frame.published_at),
+            // 该端没有可靠的呈现时间戳（Windows 的 GetFrameStatistics 未接；Linux 的帧回调未接）：
+            // 共享契约里 `presented_at` 是可空字段，HUD 会退回用 `latency`。
+            presented_at: None,
         });
         // 「交换链里现在有这么大一块内容」：这是 UI 线程重算 DComp 几何的正确时点（合成内容
         // 已经落地），尺寸变化时才 post 唤醒。

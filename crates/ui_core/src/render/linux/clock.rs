@@ -59,7 +59,7 @@ mod tests {
         let tick = clock.wait_next_frame();
         assert!(tick.present_time >= tick.now, "目标呈现时刻不得在过去");
         assert!(
-            clock.refresh_hz() >= 24.0 && clock.refresh_hz() <= 360.0,
+            tick.refresh_hz >= 24.0 && tick.refresh_hz <= 360.0,
             "刷新率必须落在合法区间"
         );
         thread::sleep(Duration::from_millis(1));

@@ -630,6 +630,14 @@ impl WindowRenderer {
         let Some(feedback) = self.shared.take_feedback() else {
             return Ok(None);
         };
+        // 共享契约（B6-2）：`presented_at` 是**真实上屏**时刻，不可能早于 GPU 完成；
+        // 三端都读它，HUD 才能用同一字段区分「发布→完成」与「发布→上屏」。
+        debug_assert!(
+            feedback
+                .presented_at
+                .is_none_or(|presented| presented >= feedback.completed_at),
+            "presented_at must not precede completed_at"
+        );
         self.stats = feedback.stats;
         debug_assert!(
             feedback.index.get() >= 1,
@@ -1613,9 +1621,9 @@ impl FeedbackQueue {
     /// 2. 完成之后已经等了 [`PRESENTED_WAIT`]（CA 可能永远不回调 —— 遮挡、drawable 被跳过、
     ///    或者这一帧被后来的 drawable 顶掉）⇒ 用完成时刻兜底，HUD 不会停在旧值。
     ///
-    /// 发布的 `FrameFeedback` 口径（AR3 §6.3）：`completed_at` = **GPU 工作完成**（共享契约，
-    /// 三端一致）；`latency` = 发布 → **真实呈现**（拿不到 `presentedTime` 时退回完成时刻）。
-    /// HUD 的 `Latency` 消费的就是后者，所以 macOS 上它反映的是「发布 → 上屏」。
+    /// 发布的 `FrameFeedback` 口径（AR3 §6.3 + B6-2 统一）：`completed_at` = **GPU 工作完成**、
+    /// `latency` = 发布 → GPU 完成（三端同义）；`presented_at` = 真实上屏时刻（macOS 独有来源，
+    /// 三端同名字段）。「发布 → 上屏」由 `FrameFeedback::presented_latency` 给出。
     fn pop_ready(
         &mut self,
         frontier: FrameIndex,
@@ -1643,10 +1651,13 @@ impl FeedbackQueue {
                 index: frame.index,
                 stats: frame.stats,
                 samples: frame.samples,
-                // UI 发布 → **真实呈现**（`presentedTime`）；拿不到时是 GPU 完成时刻兜底。
-                latency: presented_at.saturating_duration_since(frame.published_at),
-                // GPU 工作完成时刻（共享契约）；**不是**呈现时刻 —— 后者只进 `latency`。
+                // 共享契约（B6-2 统一）：`latency` 三端同义 = 发布 → **GPU 完成**。
+                latency: completed_at.saturating_duration_since(frame.published_at),
+                // GPU 工作完成时刻（共享契约）；**不是**呈现时刻。
                 completed_at,
+                // 真实上屏时刻（`presentedTime` 换算）；三端同名同义，拿不到就是 `None`。
+                // 拿不到呈现通知时这里是「完成时刻」兜底（见 `pop_ready` 的 PRESENTED_WAIT）。
+                presented_at: Some(presented_at),
             });
         }
     }
@@ -2188,7 +2199,7 @@ mod tests {
             .encode(
                 &Scene::empty(),
                 Scale::ONE,
-                &ColorResolver,
+                ColorResolver,
                 &crate::paint::geometry_store::GeometryStore::new(),
             )
             .expect("encode");

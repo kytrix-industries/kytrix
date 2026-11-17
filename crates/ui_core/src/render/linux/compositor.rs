@@ -2479,7 +2479,7 @@ mod tests {
                     .encode(
                         &scene,
                         Scale::ONE,
-                        &ColorResolver,
+                        ColorResolver,
                         &crate::paint::geometry_store::GeometryStore::new(),
                     )
                     .expect("encode");

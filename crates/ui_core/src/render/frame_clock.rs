@@ -153,7 +153,7 @@ fn usable_target(now: Instant, target: Instant) -> Option<Instant> {
 /// Linux 是 `Instant` 自己），而共享层只认 [`Instant`]：锚点在这里一次性建立，之后
 /// [`TimeAnchor::to_instant`] / [`TimeAnchor::to_native`] 是纯函数（可在任一平台单测）。
 #[derive(Clone, Copy, Debug)]
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) struct TimeAnchor {
     /// 建立锚点时的 `Instant`。
     instant: Instant,
@@ -161,7 +161,7 @@ pub(crate) struct TimeAnchor {
     native: f64,
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", test))]
 impl TimeAnchor {
     /// 建立锚点（`native_seconds` 是平台在**同一时刻**读到的原生时基）。
     pub(crate) fn new(instant: Instant, native_seconds: f64) -> Option<Self> {
@@ -873,6 +873,9 @@ mod tests {
     }
 
     /// 没有回调时按刷新率兜底（不能停帧），且 `IntervalClock` 的相位可被平台重新对齐。
+    ///
+    /// 断言**不依赖墙钟精度**：`Condvar::wait_timeout` 在 Windows 上可能 overshoot 一个定时器
+    /// 周期（~15.6 ms），因此这里钉的是「相位只前进、不回退」而不是「present_time > now」。
     #[test]
     fn an_interval_clock_can_be_realigned_by_the_platform() {
         let now = Instant::now();
@@ -881,12 +884,18 @@ mod tests {
         clock.align(aligned, now);
         // 换屏：刷新率变化立刻生效（周期随之变化）。
         clock.set_refresh_hz(120.0);
-        let tick = clock.wait_next_frame();
-        assert_eq!(tick.refresh_hz, 120.0);
-        // 过期的锚点：退化为「现在 + 一个周期」，不会给出过去的时刻。
+        let first = clock.wait_next_frame();
+        assert_eq!(first.refresh_hz, 120.0);
+        // 过期的锚点（上一帧迟到）：必须退化为「现在 + 一个周期」，即**推进到下一拍**，
+        // 而不是把目标时刻留在过去。
         clock.align(now - Duration::from_millis(50), Instant::now());
         let late = clock.wait_next_frame();
-        assert!(late.present_time > late.now);
+        assert!(
+            late.present_time > first.present_time,
+            "过期锚点必须推进相位（first={:?} late={:?}）",
+            first.present_time,
+            late.present_time
+        );
     }
 
     /// `ManualClock` 的取消：等待立刻返回且标记为「未完成」。

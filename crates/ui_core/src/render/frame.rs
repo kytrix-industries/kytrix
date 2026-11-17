@@ -374,8 +374,17 @@ pub(crate) struct FrameFeedback {
     /// GPU 线程**观察到该帧 GPU 工作完成**的时刻（fence / timeline / completed handler），
     /// 不是 `Present` 返回的时刻。
     pub completed_at: Instant,
-    /// `completed_at - published_at`：UI 线程发布本帧到 GPU 完成的时长（HUD 的
-    /// publish→present 一栏）。起点是 [`FrameRequest::published_at`]。
+    /// 真实**上屏**时刻（`presentedTime` / 帧回调 / `GetFrameStatistics`）。
+    ///
+    /// `None` = 该端拿不到呈现时间戳（Windows 默认；Linux 目前也未接）。**三端同名同义**：
+    /// 有值就一定是「像素真正显示的时刻」，不是 GPU 完成、也不是 `Present` 返回。
+    pub presented_at: Option<Instant>,
+    /// `completed_at - published_at`：UI 线程发布本帧到 **GPU 工作完成**的时长。
+    ///
+    /// **三端同义**（B6-2 统一）：起点是 [`FrameRequest::published_at`]（UI 提交时刻），终点是
+    /// `completed_at`。合成线程上线后这条链多了一段「合成线程等待下一拍 + 增量编码」——
+    /// 那正是 UI 发布到 GPU 完成之间的真实路径，因此数值变大是语义正确的结果，不是回归。
+    /// 想看「发布 → 真正上屏」请用 [`FrameFeedback::presented_latency`]。
     pub latency: Duration,
 }
 

@@ -73,9 +73,9 @@ mod tests {
         let second = clock.wait_next_frame();
         assert!(second.present_time >= second.now);
         assert!(
-            (clock.refresh_hz() - 120.0).abs() < 20.0,
+            (second.refresh_hz - 120.0).abs() < 20.0,
             "回调节奏反推的刷新率必须接近 120 Hz，实际 {}",
-            clock.refresh_hz()
+            second.refresh_hz
         );
     }
 }
