@@ -1196,23 +1196,20 @@ impl GpuRenderer {
             }
             false => {
                 if let Plan::Partial(damage) = frame.plan() {
-                    for rect in damage.as_slice() {
-                        // R11-16：damage 由 `render::compositor::plan` 夹到 **UI 的物理 surface**，
-                        // 而 renderArea 是 swapchain extent —— 两者在 clamp / `currentExtent` 生效
-                        // 时不等（R11-9）。scissor 超出 renderArea 会被判
-                        // `VUID-vkCmdSetScissor-None-00595`，因此在这里再夹一次（纯 CPU，零成本）。
-                        let x0 = rect.x0.max(0).min(extent.width as i32);
-                        let y0 = rect.y0.max(0).min(extent.height as i32);
-                        let x1 = rect.x1.max(x0).min(extent.width as i32);
-                        let y1 = rect.y1.max(y0).min(extent.height as i32);
-                        if x1 == x0 || y1 == y0 {
-                            continue;
-                        }
+                    // R11-16：damage 是相对 **UI 物理 surface** 算的，而 renderArea 是 swapchain
+                    // extent —— 两者在 clamp / `currentExtent` 生效时不等（R11-9）。scissor 超出
+                    // renderArea 会判 `VUID-vkCmdSetScissor-None-00595`；夹紧与 copy / present
+                    // region 共用同一份实现（`DamageRects::clamped`）。
+                    let clamped = damage.clamped(extent.width, extent.height);
+                    for rect in clamped.as_slice() {
                         let scissor = vk::Rect2D {
-                            offset: vk::Offset2D { x: x0, y: y0 },
+                            offset: vk::Offset2D {
+                                x: rect.x0,
+                                y: rect.y0,
+                            },
                             extent: vk::Extent2D {
-                                width: (x1 - x0) as u32,
-                                height: (y1 - y0) as u32,
+                                width: rect.width() as u32,
+                                height: rect.height() as u32,
                             },
                         };
                         // SAFETY: 矩形已夹到 renderArea（= framebuffer 尺寸）内。
@@ -1227,7 +1224,7 @@ impl GpuRenderer {
                             &mut geometry_retired,
                             payload,
                             root,
-                            [x0, y0, x1, y1],
+                            [rect.x0, rect.y0, rect.x1, rect.y1],
                         )?);
                     }
                 }
@@ -1263,21 +1260,23 @@ impl GpuRenderer {
         let target = swapchain.image(image_index);
         // 差分拷贝计划（R11-12）。`regions = None` ⇒ 整面；空集 ⇒ 本帧不需要搬像素。
         let plan: CopyPlan = self.image_copy_plan.plan(image_index, written);
-        let regions = plan.regions();
+        // R11-16：damage 是相对 UI 物理 surface 算的，swapchain 的 `imageExtent` 可能更小
+        // （`currentExtent` / clamp / transform，R11-9）。**夹紧只有一份实现**：这里夹出来的集合
+        // 既是 `vkCmdCopyImage` 的矩形，也是 present 的 `VkPresentRegionKHR`（`frame_copy`）——
+        // 两者逐字一致，合成器不会把没写的像素当成新的（R11-12）。
+        let regions = plan
+            .regions()
+            .map(|regions| regions.clamped(extent.width, extent.height));
         self.frame_copy = regions;
         let mut copies: Vec<vk::ImageCopy> = Vec::new();
         if let Some(regions) = regions.as_ref() {
             for rect in regions.as_slice() {
-                let x = rect.x0.max(0).min(extent.width as i32);
-                let y = rect.y0.max(0).min(extent.height as i32);
-                let x1 = rect.x1.max(x).min(extent.width as i32);
-                let y1 = rect.y1.max(y).min(extent.height as i32);
-                let width = (x1 - x) as u32;
-                let height = (y1 - y) as u32;
-                if width == 0 || height == 0 {
-                    continue;
-                }
-                copies.push(image_copy(x as u32, y as u32, width, height));
+                copies.push(image_copy(
+                    rect.x0 as u32,
+                    rect.y0 as u32,
+                    rect.width() as u32,
+                    rect.height() as u32,
+                ));
             }
         }
         if copies.is_empty() && regions.is_none() {

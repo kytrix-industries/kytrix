@@ -103,6 +103,36 @@ impl DamageRects {
         self.len
     }
 
+    /// 把矩形集合夹到 `width × height` 的可绘制区域内，并丢掉夹空的矩形。
+    ///
+    /// 后端只应把**夹过**的矩形交给 `vkCmdSetScissor` / `vkCmdCopyImage` / `VkRectLayerKHR`：
+    /// 三者的越界都会被判 VUID，而 damage 是相对 **UI 的物理 surface** 算出来的，与 swapchain 的
+    /// `imageExtent`（`currentExtent` / clamp / transform 之后，R11-9）并不总是相等 —— 窗口被
+    /// 合成器夹小、或 `maxImageExtent` 小于请求尺寸时就会越界（R11-16）。
+    ///
+    /// **夹紧只有这一份实现**：`copy_to_swapchain` 用它算真正搬运的矩形，present 的
+    /// `VkPresentRegionKHR` 直接复用同一份结果，因此「拷贝了什么」与「hint 了什么」逐字一致
+    /// （R11-12 要求 hint ⊆ 实际写入；不一致会让合成器保留旧像素或整块重合成）。
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn clamped(self, width: u32, height: u32) -> DamageRects {
+        let width = width.min(i32::MAX as u32) as i32;
+        let height = height.min(i32::MAX as u32) as i32;
+        let mut clamped = DamageRects::new();
+        for rect in self.as_slice() {
+            let x0 = rect.x0.clamp(0, width);
+            let y0 = rect.y0.clamp(0, height);
+            let x1 = rect.x1.clamp(x0, width);
+            let y1 = rect.y1.clamp(y0, height);
+            if x1 == x0 || y1 == y0 {
+                continue;
+            }
+            // 容量只可能变小（每个输入矩形最多映射成一个），因此 `push` 不会失败。
+            let kept = clamped.push(PhysicalRect::new(x0, y0, x1, y1));
+            debug_assert!(kept, "clamping never grows the set");
+        }
+        clamped
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -829,5 +859,38 @@ mod tests {
         for image in 0..3 {
             assert!(plan.plan(image, Some(damage)).is_full(), "image {image}");
         }
+    }
+
+    // ── R11-16：把矩形夹到 swapchain extent（scissor / copy / present region 共用） ──
+
+    /// 负偏移被裁掉、超出右边界的部分被裁掉、夹空的矩形被丢弃。
+    #[test]
+    fn clamping_a_rect_set_keeps_only_the_part_inside_the_image() {
+        let damage = rects(&[
+            // 完全在内：原样保留。
+            PhysicalRect::new(4, 8, 12, 16),
+            // 左上出界：裁成 (0,0)-(1,1)。
+            PhysicalRect::new(-3, -2, 1, 1),
+            // 右下出界：裁成 (58,58)-(64,64)。
+            PhysicalRect::new(58, 58, 100, 100),
+            // 完全在外：丢弃。
+            PhysicalRect::new(80, 80, 90, 90),
+            // 贴边零宽：丢弃。
+            PhysicalRect::new(64, 0, 64, 10),
+        ]);
+        let clamped = damage.clamped(64, 64);
+        assert_eq!(
+            clamped.as_slice(),
+            &[
+                PhysicalRect::new(4, 8, 12, 16),
+                PhysicalRect::new(0, 0, 1, 1),
+                PhysicalRect::new(58, 58, 64, 64),
+            ],
+            "夹紧后的集合只保留落在 image 内的部分，顺序与输入一致"
+        );
+        // 夹紧是幂等的（后端可能对同一集合夹两次）。
+        assert_eq!(clamped.clamped(64, 64).as_slice(), clamped.as_slice());
+        // 空集合仍然是空的。
+        assert!(DamageRects::new().clamped(64, 64).is_empty());
     }
 }

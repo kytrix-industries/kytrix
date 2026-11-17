@@ -786,7 +786,6 @@ mod tests {
                 memory::MemoryNeed,
             },
         },
-        window::FrameIndex,
     };
 
     /// 小页（16²）够验证行落位；真实页 2048² 在单测里代价过高。

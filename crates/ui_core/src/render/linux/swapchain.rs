@@ -520,7 +520,11 @@ fn log_plan(key: &SwapchainKey, formats: &[vk::SurfaceFormatKHR]) {
     );
 }
 
-/// `incremental_present` 的矩形（与本次实际拷贝的矩形逐一致）。
+/// `incremental_present` 的矩形。
+///
+/// **入参必须已经用 `DamageRects::clamped(extent)` 夹过**（`frame_copy` 就是那份集合）：
+/// `VkRectLayerKHR` 不允许负 offset、也不允许超出 image 尺寸（`VUID-VkRectLayerKHR-*`），
+/// 而夹紧只在 `copy_to_swapchain` 里做一次 —— hint 与实际拷贝的矩形因此逐字一致（R11-12）。
 fn present_rects(dirty: &DamageRects) -> Vec<vk::RectLayerKHR> {
     dirty
         .as_slice()
@@ -545,9 +549,11 @@ mod tests {
 
     #[test]
     fn present_rects_mirror_the_copied_rectangles() {
+        // 入参是 `copy_to_swapchain` 夹过之后的集合（hint 必须与**实际拷贝**的矩形一致，
+        // R11-12）；夹紧本身在共享层 `DamageRects::clamped` 的单测里验证。
         let mut dirty = DamageRects::new();
         assert!(dirty.push(PhysicalRect::new(4, 8, 12, 16)));
-        assert!(dirty.push(PhysicalRect::new(-3, -2, 1, 1)));
+        assert!(dirty.push(PhysicalRect::new(0, 0, 1, 1)));
         let rects = super::present_rects(&dirty);
         assert_eq!(rects.len(), 2);
         assert_eq!(rects[0].offset, ash::vk::Offset2D { x: 4, y: 8 });
@@ -558,7 +564,6 @@ mod tests {
                 height: 8
             }
         );
-        // 负偏移必须夹到 0（`VkRectLayerKHR` 不允许负 offset）。
         assert_eq!(rects[1].offset, ash::vk::Offset2D { x: 0, y: 0 });
         assert_eq!(
             rects[1].extent,
@@ -567,5 +572,21 @@ mod tests {
                 height: 1
             }
         );
+        // 出界矩形被夹紧之后只剩落在 image 内的那一块 —— hint 不能声称写了没写的像素。
+        let mut out_of_bounds = DamageRects::new();
+        assert!(out_of_bounds.push(PhysicalRect::new(-3, -2, 1, 1)));
+        let clamped = out_of_bounds.clamped(64, 64);
+        let rects = super::present_rects(&clamped);
+        assert_eq!(rects.len(), 1);
+        // `VkRectLayerKHR` 没有 `PartialEq`：逐字段比较。
+        assert_eq!(rects[0].offset, ash::vk::Offset2D { x: 0, y: 0 });
+        assert_eq!(
+            rects[0].extent,
+            ash::vk::Extent2D {
+                width: 1,
+                height: 1
+            }
+        );
+        assert_eq!(rects[0].layer, 0);
     }
 }

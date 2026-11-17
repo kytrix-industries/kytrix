@@ -450,8 +450,14 @@ impl PipelineCache {
         let mut bytes = Vec::with_capacity(self.header.len() + data.len());
         bytes.extend_from_slice(&self.header);
         bytes.extend_from_slice(&data);
-        // 写失败（只读 FS / 配额）不影响运行：下次启动重新编译即可。
-        let _ = std::fs::write(path, bytes);
+        // **原子落盘**：先写同目录下的临时文件再 rename。直接 `write` 在断电 / 磁盘满时可能留下
+        // 「头部完整、blob 截断」的文件 —— 下次启动头部会通过校验，`vkCreatePipelineCache` 收到
+        // 坏 blob 返回 `ERROR_INVALID_PIPELINE_CACHE_DATA`，而 ash 的 `assume_init_on_success`
+        // 会连**有效句柄**一起丢掉（规范要求这种情况下仍返回可用句柄）⇒ 泄漏一个 cache 句柄，
+        // 且本次运行完全没有 PSO 缓存。rename 之后文件要么是旧的要么是新的，不会截断。
+        let temporary =
+            path.with_extension(smol_str::format_smolstr!("{}.tmp", std::process::id()));
+        let _ = std::fs::write(&temporary, &bytes).and_then(|()| std::fs::rename(&temporary, path));
     }
 }
 

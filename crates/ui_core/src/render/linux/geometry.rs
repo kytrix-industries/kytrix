@@ -351,14 +351,25 @@ mod tests {
             2,
             "顶点缓冲 + 索引缓冲各一个子分配句柄（内存块由内存池持有，不进句柄表）"
         );
-        // R11-6：两次小分配共用同一块 `vkAllocateMemory`（而不是每资源一次）。
+        // R11-6：顶点与索引两次小分配共用**同一块** `vkAllocateMemory`（而不是每资源一次）。
         let (device_allocations, live_bytes, reserved_bytes) = shared.memory_stats();
         assert_eq!(
             device_allocations, 1,
             "顶点与索引必须子分配在同一块设备内存里"
         );
-        assert_eq!(live_bytes, 28, "24 B 顶点 + 6 B 索引（按 4 B 对齐）");
+        // 记账 = 两次 `VkMemoryRequirements.size` 之和。驱动允许把 size 放大到对齐要求，因此
+        // 只能断言下界（= 请求的 24 B 顶点 + 6 B 索引）；上界用来抓「重复记账 / 按整块记账」这类
+        // 回归（两个几十字节的缓冲不可能占超过 64 B 的对齐余量）。
+        assert!(
+            live_bytes >= 30,
+            "24 B 顶点 + 6 B 索引至少占 30 B，实际 {live_bytes}"
+        );
+        assert!(
+            live_bytes <= 30 + 2 * 64,
+            "驱动的对齐余量不应超过每个缓冲 64 B，实际 {live_bytes}"
+        );
         assert!(reserved_bytes >= live_bytes);
+        let first_generation_bytes = live_bytes;
         assert_eq!(
             registry.entries[3].as_ref().expect("entry").last_used_frame,
             1
@@ -391,6 +402,13 @@ mod tests {
             1,
             "换代不得新增 vkAllocateMemory（这就是子分配器的意义）"
         );
+        // 换代后旧句柄还没 release ⇒ 两块几何的记账恰好是上一代的两倍（精确判据，与驱动的
+        // `VkMemoryRequirements.size` 无关）。
+        assert_eq!(
+            shared.memory_stats().1,
+            first_generation_bytes * 2,
+            "两代几何同时驻留时记账必须是单代的两倍"
+        );
 
         // teardown：当前条目 + retired 的旧句柄都要注销。
         registry.release(&shared);
@@ -398,5 +416,12 @@ mod tests {
             assert!(shared.release(handle), "retired handle must be live");
         }
         assert_eq!(shared.live_resources(), 0);
+        // 句柄注销之后，子分配的**区间**也必须还回内存池（否则块内的空洞再也复用不到，
+        // 几何反复换代会让 1 MiB 的块越切越碎）。
+        assert_eq!(
+            shared.memory_stats().1,
+            0,
+            "释放句柄必须把子分配区间还回内存池"
+        );
     }
 }

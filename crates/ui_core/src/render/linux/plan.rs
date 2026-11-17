@@ -420,12 +420,27 @@ mod tests {
         // 常规：min+1 且至少 3。
         assert_eq!(choose_image_count(2, 0), 3);
         assert_eq!(choose_image_count(3, 0), 4);
-        // 异常但要么被排除要么必须满足 min（VUID-VkSwapchainCreateInfoKHR-minImageCount-01271）。
-        assert_eq!(choose_image_count(2, 2), 3, "min+1=3 被 max=2 夹回 min");
+        // `maxImageCount` 是**硬上界**（`VUID-VkSwapchainCreateInfoKHR-imageExtent-...` 同族的
+        // `minImageCount <= maxImageCount` 约束）：min=2/max=2 时唯一合法值是 2。
+        // 「至少 MAX_FRAMES_IN_FLIGHT」只是**期望**，不能压过 surface 的合法区间 —— 只有 2 张图时
+        // 第三帧会先在槽 fence 上等一等（性能损失），但链本身合法。
+        assert_eq!(
+            choose_image_count(2, 2),
+            2,
+            "max=2 时必须夹回 2（3 会被驱动判 VUID）"
+        );
         assert_eq!(choose_image_count(4, 3), 4, "max < min：仍必须满足 min");
         // 无上限。
         assert_eq!(choose_image_count(0, 0), 3, "至少 MAX_FRAMES_IN_FLIGHT");
         assert_eq!(choose_image_count(3, 8), 4);
+        // 不变式：任何输入下都落在 [min, max] 内（max=0 表示无上限）。
+        for (min, max) in [(0, 0), (1, 1), (2, 2), (2, 3), (4, 3), (5, 5), (1, 9)] {
+            let count = choose_image_count(min, max);
+            assert!(count >= min.max(1), "min={min} max={max} count={count}");
+            if max != 0 {
+                assert!(count <= max.max(min), "min={min} max={max} count={count}");
+            }
+        }
     }
 
     // ── R11-8：format / colorSpace ──────────────────────────────────────────

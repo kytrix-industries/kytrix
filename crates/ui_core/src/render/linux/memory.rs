@@ -48,7 +48,8 @@ impl MemoryNeed {
         device_local: true,
     };
 
-    /// 读回缓冲：主机可读、必须一致；设备本地没有意义（本来就要走主机）。
+    /// 读回缓冲：主机可读、必须一致；**不要求**设备本地（读回本来就要把像素搬过总线，占 BAR
+    /// 窗口纯属浪费 —— 见 [`pick_memory_type`] 的打分规则）。
     pub(crate) const READBACK: Self = Self {
         host_visible: true,
         host_coherent: true,
@@ -80,8 +81,13 @@ const PROTECTED: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::PROTECTED;
 /// 规则（与 Dawn 的 `MemoryAllocator` / vulkano 的 `MemoryTypePool` 同一形状）：
 /// 1. 先按**硬需求**过滤：`host_visible` ⇒ `HOST_VISIBLE`、`host_coherent` ⇒ `HOST_COHERENT`；
 ///    同时排除 `LAZILY_ALLOCATED` / `PROTECTED`。
-/// 2. 再按**偏好**打分：`device_local` 要 `DEVICE_LOCAL`（权重最高）；非主机资源落在主机可见
-///    堆上（BAR 窗口）扣分；`HOST_COHERENT` 加分。
+/// 2. 再按**偏好**打分：
+///    - `need.device_local` 且类型是 `DEVICE_LOCAL` ⇒ **最高分**（顶点/索引/纹理不必走 PCIe）；
+///    - 反之（不需要设备本地，例如读回）`DEVICE_LOCAL|HOST_VISIBLE` 是 BAR 窗口，**扣分**：
+///      它稀缺，而读回反正要把数据搬过总线，普通主机堆更合适（wgpu 的 `CpuToGpu`/`GpuToCpu`
+///      同样只要求 host-visible + coherent，不要求 device-local）；
+///    - 纯设备资源落在主机可见堆上同样扣分（BAR 预算）；
+///    - `HOST_COHERENT` 加分（省一次 flush/invalidate）。
 /// 3. 同分取 index 最小者（稳定、可测）。
 ///
 /// 没有任何候选时返回 `None`（调用方给出强类型错误，不做静默回退）。
@@ -90,7 +96,7 @@ pub(crate) fn pick_memory_type(
     types: &MemoryTypeFlags,
     need: MemoryNeed,
 ) -> Option<u32> {
-    let mut best: Option<(u32, u32)> = None; // (score, index)
+    let mut best: Option<(i32, u32)> = None; // (score, index)
     for (index, flags) in types.iter().enumerate() {
         let index = index as u32;
         if type_bits & (1 << index) == 0 {
@@ -105,14 +111,19 @@ pub(crate) fn pick_memory_type(
         if need.host_coherent && !flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT) {
             continue;
         }
-        let mut score = 0u32;
+        let mut score = 0i32;
         if flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL) {
-            // 唯一的「性能」维度：设备本地意味着顶点/索引/纹理不必走 PCIe。
-            score += 4;
+            if need.device_local {
+                // 唯一的「性能」维度：设备本地意味着顶点/索引/纹理不必走 PCIe。
+                score += 4;
+            } else {
+                // BAR 窗口是稀缺资源；「反正要走总线」的用途不该占它。
+                score -= 2;
+            }
         }
         if !need.host_visible && flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE) {
             // 纯设备资源落在主机可见堆上通常是 BAR 窗口：能用，但显存预算更紧张。
-            score = score.saturating_sub(1);
+            score -= 2;
         }
         if flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT) {
             score += 1;

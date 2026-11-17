@@ -840,9 +840,11 @@ fn drain_completed(
 
 /// 按提交顺序取出 timeline 已确认完成的帧。
 ///
-/// 完成判据是本帧 submit 时 signal 的 timeline 值，**不是** ring 的提交计数：槽位按 acquire
-/// 次数轮转（1、2、3…），timeline 值来自帧序号；帧序号会跳号（最新帧槽合并、空闲 / 门禁跳过的帧
-/// 不产生 GPU 工作），两者不同源。拿 ring 计数去比，序号一跳号就会把仍在飞的帧误判为完成。
+/// 完成判据是本帧 submit 时 signal 的 timeline 值（`SubmittedFrame.sequence`，R11-1），
+/// **不是**任何"重新推导出来的序号"：槽位按 acquire 次数轮转、UI 帧序号会跳号（最新帧槽合并、
+/// 空闲 / 门禁跳过的帧不产生 GPU 工作），只有 ring 的提交序号与 signal 值严格同源。用别的计数
+/// 去比，序号一跳号就会把仍在飞的帧误判为完成（completed_at / latency 记到错帧，并在槽 fence
+/// 之前 resolve 在飞 query）。
 fn completed_frames<'a>(
     submitted: &'a mut VecDeque<SubmittedFrame>,
     completed: u64,
@@ -974,9 +976,10 @@ mod tests {
 
     #[test]
     fn only_frames_whose_timeline_value_completed_are_published() {
-        // P1 回归：提交序号 1/4/7（跳号来自最新帧槽合并 / 门禁跳过的帧）。ring 的提交计数是
-        // 1/2/3，若拿它当完成判据，timeline 观测到 4 时会把仍在飞的 7 也发布出去
-        // （completed_at / latency 归属错帧、resolve 读在飞 query）。
+        // 完成判据只能比 `SubmittedFrame.sequence`（提交时 signal 的 timeline 值，R11-1）。
+        // 这里故意用**带空洞**的序号（1/4/7）覆盖防御性场景：观测到 4 时只发布 1 与 4，
+        // 7 仍在飞。用「条数 / 位置 / UI 帧序号」去数都会把 7 也弹出来（把 completed_at 记到
+        // 错帧，并在槽 fence 之前 resolve 在飞 query）。
         let mut submitted = std::collections::VecDeque::new();
         for index in [1u32, 4, 7] {
             submitted.push_back(SubmittedFrame {
