@@ -1764,7 +1764,8 @@ impl UploadArena {
             }
             if !clips.is_empty() {
                 std::ptr::copy_nonoverlapping(
-                    bytemuck::cast_slice::<crate::paint::instance::GpuClipEntry, u8>(clips).as_ptr(),
+                    bytemuck::cast_slice::<crate::paint::instance::GpuClipEntry, u8>(clips)
+                        .as_ptr(),
                     base.add(clip_offset as usize),
                     clips.len() * 48,
                 );
