@@ -43,7 +43,10 @@ impl InstanceChunk {
     }
 
     /// 本块的字节（**仅测试**：等价性用例要断言增量载荷只带变化段）。
-    #[cfg(test)]
+    ///
+    /// 消费者只有 Windows 的 WARP 等价性用例，故按它的 cfg 收窄（否则 macOS/Linux 的
+    /// lib test 会因未使用而触发 dead_code）。
+    #[cfg(all(test, windows))]
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }
