@@ -30,10 +30,7 @@ use accesskit_unix::Adapter;
 use crate::{
     error::EngineError,
     math::{Point, Scale, Size},
-    platform::{
-        dispatcher::{Dispatcher, UserTask},
-        linux::dpi,
-    },
+    platform::dispatcher::{Dispatcher, UserTask},
     window::WindowId,
 };
 
@@ -107,7 +104,7 @@ impl ActionHandler for UnixActions {
 /// 窗口几何 → accesskit 的 `outer`/`inner` 矩形（**物理像素**；`inner` = 客户区）。
 ///
 /// `accesskit_unix` 只把 `inner.origin()` 加到节点 bounds 上（不缩放、不转换），所以：
-/// - 尺寸必须先把逻辑像素换算成物理像素（`dpi::physical_size`，含 `buffer_scale` 语义）；
+/// - 尺寸必须先从逻辑像素换算成**覆盖取整**的物理像素（见下方注释：不能用 buffer 尺寸的 round 规则）；
 /// - `origin` 必须是客户区左上角的屏幕绝对物理像素；未知时传 `Point::ZERO`
 ///   （Wayland，见模块文档）。
 #[must_use]
@@ -116,14 +113,21 @@ pub(crate) fn window_bounds(
     size: Size,
     scale: Scale,
 ) -> (accesskit::Rect, accesskit::Rect) {
-    let (width, height) = dpi::physical_size(size, scale);
+    // 注意：**不能**用 [`dpi::physical_size`]。那条规则是 `wp_fractional_scale_v1` 的
+    // **buffer 尺寸**语义（`round(logical × scale)`，避免 compositor 重采样），而 AT-SPI 的
+    // `BoundingRectangle` 必须**覆盖实际绘制的像素**：取整方向必须是 round-out（ceil），
+    // 否则 401×1.25 = 501.25 会报 501，比真实绘制的第 502 列少 1 px，读屏的命中/高亮框会偏。
+    // 这与布局层「只吸附边界、向外取整」是同一条规则。
+    let scale_factor = f64::from(scale.factor());
+    let width = (f64::from(size.width) * scale_factor).ceil().max(1.0);
+    let height = (f64::from(size.height) * scale_factor).ceil().max(1.0);
     let x = f64::from(origin.x);
     let y = f64::from(origin.y);
     let rect = accesskit::Rect {
         x0: x,
         y0: y,
-        x1: x + f64::from(width),
-        y1: y + f64::from(height),
+        x1: x + width,
+        y1: y + height,
     };
     // 客户端装饰（CSD）不存在时 outer == inner：引擎没有系统装饰，两者一致。
     (rect, rect)

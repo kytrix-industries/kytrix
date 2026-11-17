@@ -1805,10 +1805,18 @@ mod tests {
         let mut published = Vec::new();
         feedback.pop_ready(index(1), Instant::now(), |frame| published.push(frame));
         assert_eq!(published.len(), 1);
+        // 契约（三端一致）：`latency` = 发布 → **GPU 完成**；真实上屏由 `presented_at` 承载。
         assert_eq!(
             published[0].latency,
-            presented_at.saturating_duration_since(published_at),
-            "latency = 发布 → 呈现（HUD 用真实呈现时刻）"
+            published[0]
+                .completed_at
+                .saturating_duration_since(published_at),
+            "latency = 发布 → GPU 完成"
+        );
+        assert_eq!(
+            published[0].presented_at,
+            Some(presented_at),
+            "presented_at 承载真实上屏时刻"
         );
         assert!(
             published[0].completed_at <= presented_at,
