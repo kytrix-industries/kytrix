@@ -21,7 +21,7 @@ use std::{os::fd::AsFd, path::PathBuf};
 
 use wayland_client::{
     QueueHandle,
-    protocol::{wl_buffer, wl_compositor, wl_pointer, wl_shm, wl_shmpool, wl_surface},
+    protocol::{wl_buffer, wl_compositor, wl_pointer, wl_shm, wl_shm_pool, wl_surface},
 };
 use wayland_protocols::wp::cursor_shape::v1::client::{
     wp_cursor_shape_device_v1::{Shape, WpCursorShapeDeviceV1},
@@ -50,7 +50,7 @@ struct CursorImage {
     /// shm 池的底层文件（buffer 的内存来源；shm 池不复制数据，必须活到 buffer 被释放）。
     _file: std::fs::File,
     /// shm 池（`wl_buffer` 引用它的内存）。
-    pool: wl_shmpool::WlShmPool,
+    pool: wl_shm_pool::WlShmPool,
     /// 已上传的 buffer。
     buffer: wl_buffer::WlBuffer,
     /// 热点（buffer 像素坐标）。
@@ -322,7 +322,7 @@ fn upload_image(
         let mut writer = &file;
         writer.write_all(&image.pixels).ok()?;
     }
-    let pool = shm.createpool(file.as_fd(), byte_len as i32, queue, ());
+    let pool = shm.create_pool(file.as_fd(), byte_len as i32, queue, ());
     let buffer = pool.create_buffer(
         0,
         image.width as i32,
