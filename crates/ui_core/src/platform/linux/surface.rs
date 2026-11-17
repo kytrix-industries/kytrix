@@ -1961,7 +1961,7 @@ fn scroll_event(
 ///
 /// 未覆盖的码返回 [`KeyCode::Unidentified`]（载荷是 evdev 码，文档明确**不可跨平台**）。
 fn key_code(evdev: u32) -> KeyCode {
-    let code = match evdev {
+    match evdev {
         1 => KeyCode::Escape,
         2 => KeyCode::Digit1,
         3 => KeyCode::Digit2,
@@ -2086,8 +2086,7 @@ fn key_code(evdev: u32) -> KeyCode {
         193 => KeyCode::F23,
         194 => KeyCode::F24,
         other => KeyCode::Unidentified(other as u16),
-    };
-    code
+    }
 }
 
 #[cfg(test)]

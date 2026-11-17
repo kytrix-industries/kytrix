@@ -656,7 +656,7 @@ fn object_text(object: &AnyObject) -> String {
 ///
 /// 未覆盖的硬件码返回 [`KeyCode::Unidentified`]（载荷是原生 `keyCode`，**不可跨平台**）。
 fn key_code(code: u16) -> KeyCode {
-    let code = match code {
+    match code {
         0x00 => KeyCode::KeyA,
         0x01 => KeyCode::KeyS,
         0x02 => KeyCode::KeyD,
@@ -772,8 +772,7 @@ fn key_code(code: u16) -> KeyCode {
         0x7D => KeyCode::ArrowDown,
         0x7E => KeyCode::ArrowUp,
         other => KeyCode::Unidentified(other),
-    };
-    code
+    }
 }
 
 /// 事件时刻 → 引擎单调时钟（R02-14）。
