@@ -180,7 +180,7 @@ else {
         if (Test-Path $archive) {
             Remove-Item -LiteralPath $archive -Force
         }
-        & git -C $RepoRoot archive --format=tar.gz --output=$archive HEAD 2>&1 | Out-Null
+        & git -C $RepoRoot -c core.autocrlf=false archive --format=tar.gz --output=$archive HEAD 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path $archive)) {
             Write-StepResult -PlatformName $platformName -Step 'archive' -Status 'fail' -Seconds 0
             continue
