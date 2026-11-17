@@ -432,6 +432,11 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
 /// - calloop 的可写事件是**零线程**方案：epoll 说可写就写一片（≤ `PIPE_BUF`，管道上绝不
 ///   阻塞），写完 `PostAction::Remove` 让事件源析构 ⇒ fd 关闭 ⇒ 对端读到 EOF。
 ///
+/// 回调只能拿到 `&mut NoIoDrop<PendingSend>`（`NoIoDrop` 没有 `DerefMut`，
+/// `calloop-0.14.5/src/sources/generic.rs:114-145`），所以 `write_more` 取 `&self`、写入进度用
+/// `Cell` 记账 —— 这样既不需要 `unsafe get_mut()`，也不用把待发队列搬进 `WaylandState`
+/// （那会让回调还得按 fd 反查状态，反而更绕）。
+///
 /// 返回 `Err` 表示注册失败（源已被丢弃 ⇒ fd 关闭，对端读到 EOF，语义仍是协议允许的
 /// 「没有数据」）。
 fn register_pending_send(

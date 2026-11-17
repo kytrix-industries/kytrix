@@ -39,14 +39,9 @@ pub(crate) fn install(mtm: MainThreadMarker, ns_app: &NSApplication) {
             NSString::from_str(section.title)
         };
         // 容器项：`action = nil`、无快捷键。AppKit 只在**有子菜单**时把它按应用菜单渲染。
-        let container = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &title,
-                None,
-                &NSString::from_str(""),
-            )
-        };
+        // 全部走**安全**的属性 API（见 [`item`] 的说明）。
+        let container = NSMenuItem::new(mtm);
+        container.setTitle(&title);
         container.setSubmenu(Some(&submenu));
         main.addItem(&container);
         if section.is_window_menu {
@@ -60,23 +55,22 @@ pub(crate) fn install(mtm: MainThreadMarker, ns_app: &NSApplication) {
 }
 
 /// 一个菜单项（分隔线或命令）。
+///
+/// 构造用 `NSMenuItem::new(mtm)` + 属性 setter，而**不用** `initWithTitle:action:keyEquivalent:`：
+/// 后者是 `unsafe fn` 且需要 `Allocated<Self>`（`alloc(mtm)` 来自 `objc2::MainThreadOnly` trait，
+/// 是"裸分配 + 未校验初始化"的路径）。`new(mtm)` 内部完成 `alloc` + `init`，只留 `setAction:`
+/// 一处真正需要调用方担保的 `unsafe`（任意 selector 的发送目标由我们决定）。
 fn item(mtm: MainThreadMarker, entry: MenuEntry, app_name: &str) -> Retained<NSMenuItem> {
     let MenuEntry::Command(command) = entry else {
         return NSMenuItem::separatorItem(mtm);
     };
-    let title = NSString::from_str(&command.display_title(app_name));
-    let key = NSString::from_str(command.key_equivalent());
-    // SAFETY: `initWithTitle:action:keyEquivalent:` 是 NSMenuItem 的指定初始化器；
-    // `selector` 是 AppKit 已注册的标准 selector（`Sel::register` 幂等），
-    // `key` 是合法 `NSString`（空串 = 无快捷键，AppKit 文档允许）。
-    let item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &title,
-            Some(selector(command)),
-            &key,
-        )
-    };
+    let item = NSMenuItem::new(mtm);
+    item.setTitle(&NSString::from_str(&command.display_title(app_name)));
+    item.setKeyEquivalent(&NSString::from_str(command.key_equivalent()));
+    // SAFETY: selector 来自 `MenuCommand::selector()` —— 全是 AppKit 已注册的标准 responder 动作
+    // （`terminate:` / `copy:` / `performClose:` …），且 target 保持 nil（first responder 路由），
+    // 不会把引擎不认识的方法发给任意对象。
+    unsafe { item.setAction(Some(selector(command))) };
     item.setKeyEquivalentModifierMask(modifiers(command.modifiers()));
     item
 }

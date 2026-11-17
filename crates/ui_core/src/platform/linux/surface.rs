@@ -52,9 +52,9 @@ use wayland_client::{
     event_created_child,
     globals::{GlobalList, GlobalListContents, registry_queue_init},
     protocol::{
-        wl_callback, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
-        wl_data_source, wl_keyboard, wl_keyboard as wl_kb, wl_output, wl_pointer, wl_registry,
-        wl_seat, wl_shm, wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager,
+        wl_data_offer, wl_data_source, wl_keyboard, wl_keyboard as wl_kb, wl_output, wl_pointer,
+        wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
     },
 };
 use wayland_protocols::{
@@ -567,7 +567,7 @@ impl WaylandState {
     ///
     /// ```text
     /// create_surface → get_xdg_surface → get_toplevel
-    ///   → set_app_id / set_title / set_default_size / set_min_size
+    ///   → set_app_id / set_title / set_min_size
     ///   → get_toplevel_decoration + set_mode   ← xdg-decoration v1：必须早于首次 commit
     ///   → get_fractional_scale + get_viewport  ← 尽早创建，避免错过初始 preferred_scale
     ///   → surface.commit()                     ← 唯一触发初始 configure 的 commit
@@ -595,10 +595,12 @@ impl WaylandState {
         // 这里先四舍五入取整，整数回退下 buffer = `round(L × N)` 因而严格是 buffer_scale 的
         // 整数倍（否则 `wl_surface.attach` 报 `invalid_size`，V-110）。
         let size = Size::new(size.width.round().max(1.0), size.height.round().max(1.0));
-        // 首帧尺寸（R10-15）：显式给出 default_size，平铺/居中类 compositor 用它决定初始布局，
-        // 比「只依赖 configure 的 0×0」可控。
-        let (default_width, default_height) = toplevel::default_size(size);
-        toplevel.set_default_size(default_width, default_height);
+        // 首帧尺寸：**xdg-shell 没有 `set_default_size` 请求**（协议原文的 xdg_toplevel 请求只有
+        // set_parent/set_title/set_app_id/show_window_menu/move/resize/set_max_size/set_min_size/
+        // set_maximized/unset_maximized/set_fullscreen/unset_fullscreen/set_minimized，
+        // 见 `wayland-protocols-0.32.13/protocols/stable/xdg-shell/xdg-shell.xml:622-1247`）。
+        // 初始尺寸因此只有两条合法途径：compositor 在首个 `configure` 里给尺寸，或它给 0×0 表示
+        // 「客户端自选」—— 后者由下面的 `Configure` 分支保留本结构里的 `size`（我们不覆盖它）。
         // 最小尺寸是 window geometry 的逻辑像素（含 CSD 阴影边距），与 scale 无关：只需在首个
         // commit 前设置一次。
         window::apply_min_size(&toplevel);
@@ -1593,6 +1595,12 @@ dispatch_unit!(
     wl_compositor::WlCompositor,
     wl_data_device_manager::WlDataDeviceManager,
     wl_shm::WlShm,
+    // 光标回退路径会 `wl_shm.create_pool` + `wl_shm_pool.create_buffer`：两个子对象都要求
+    // `WaylandState: Dispatch<_, ()>`（`create_*` 的 `qh` 参数），否则编译不过。
+    // `wl_shm_pool` 没有事件；`wl_buffer` 只有 `release` —— 本仓自己缓存并销毁 buffer，
+    // 因此忽略 `release`（`dispatch_unit!` 的空 handler 正是这个语义）。
+    wl_shm_pool::WlShmPool,
+    wl_buffer::WlBuffer,
     WpFractionalScaleManagerV1,
     WpViewporter,
     WpViewport,

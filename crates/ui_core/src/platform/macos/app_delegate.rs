@@ -96,15 +96,20 @@ define_class!(
     unsafe impl NSApplicationDelegate for AppDelegate {
         #[unsafe(method(applicationShouldTerminate:))]
         fn should_terminate(&self, _sender: &NSApplication) -> NSApplicationTerminateReply {
+            // 注意：`define_class!` 的方法体被塞进 `extern "C-unwind" fn -> <Ret as
+            // ConvertReturn<()>>::Inner` 里，方法体里的 `return` 会直接返回**归一化后的类型**。
+            // `NSApplicationTerminateReply` 的 `Inner` 是它自己（恒等），`return` 碰巧可用，
+            // 但这里统一写成表达式，避免以后换成 `bool`/`Retained` 返回类型时踩同一个坑。
             if self.ivars().quit.allowed() {
                 // 泵已经关完窗口、`App`/`Renderer` 也已析构：放行（willTerminate → exit）。
-                return NSApplicationTerminateReply::TerminateNow;
+                NSApplicationTerminateReply::TerminateNow
+            } else {
+                // 首次请求（或正在处理中）：转成引擎的关闭流程并**延迟**退出。协议要求随后调用
+                // `replyToApplicationShouldTerminate:`，那一拍在 `run()` 收尾之后。
+                self.ivars().quit.request();
+                self.ivars().dispatcher.wake();
+                NSApplicationTerminateReply::TerminateLater
             }
-            // 首次请求（或正在处理中）：转成引擎的关闭流程并**延迟**退出。协议要求随后调用
-            // `replyToApplicationShouldTerminate:`，那一拍在 `run()` 收尾之后。
-            self.ivars().quit.request();
-            self.ivars().dispatcher.wake();
-            NSApplicationTerminateReply::TerminateLater
         }
 
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]

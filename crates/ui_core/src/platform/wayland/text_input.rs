@@ -89,25 +89,6 @@ impl TextInputRoute {
         change
     }
 
-    /// `zwp_text_input_v3.leave`：只有离开的 surface 正是当前焦点时才动状态。
-    ///
-    /// XML：`After leave event, compositor must ignore requests from any text input instances
-    /// until next enter event.` —— 因此 leave 之后**不得**再下发任何状态，
-    /// 这也解释了为什么必须按 surface 路由而不是按「当前窗口」。
-    pub(crate) fn leave(&mut self, window: u32) -> FocusChange {
-        if self.focus != Some(window) {
-            return FocusChange::default();
-        }
-        self.focus = None;
-        self.degraded = false;
-        self.saw_im_event = false;
-        self.enabled_at = None;
-        FocusChange {
-            disable: true,
-            enable: false,
-        }
-    }
-
     /// 关闭窗口 / 退出：无条件停用（`remove_window` 不能再误伤焦点窗口，见 `is_focus`）。
     pub(crate) fn disable(&mut self) -> FocusChange {
         if self.focus.is_none() {
@@ -176,12 +157,6 @@ impl TextInputRoute {
     #[must_use]
     pub(crate) fn takes_text(&self) -> bool {
         self.focus.is_some() && !self.degraded
-    }
-
-    /// 是否已经降级（诊断/测试）。
-    #[must_use]
-    pub(crate) fn degraded(&self) -> bool {
-        self.degraded
     }
 
     /// 到期降级：返回 `true` 表示**本次**判定降级（一次性，之后 `takes_text` 恒 `false`）。
@@ -320,27 +295,31 @@ mod tests {
         assert_eq!(route.enter(3, now), super::FocusChange::default());
     }
 
-    /// R10-6 的核心回归：关闭**非焦点**窗口不得 disable 焦点窗口的 IME。
+    /// R10-6 的核心回归：`is_focus` 是「该不该为这个窗口停用 IME」的唯一判据 —— 关闭/失焦
+    /// **非焦点**窗口时平台层不得动焦点窗口的 IME。
     #[test]
-    fn leaving_a_non_focused_surface_does_not_disable_the_focused_one() {
+    fn only_the_focused_window_is_reported_as_the_ime_target() {
         let now = Instant::now();
         let mut route = TextInputRoute::default();
-        route.enter(5, now);
-        assert!(!route.is_focus(4));
         assert_eq!(
-            route.leave(4),
-            super::FocusChange::default(),
-            "离开别的 surface 不得动当前 target"
+            route.enter(5, now),
+            super::FocusChange {
+                disable: false,
+                enable: true
+            }
         );
+        assert!(!route.is_focus(4), "别的窗口离开时不得停用当前 IME");
+        assert!(route.is_focus(5));
         assert_eq!(route.focus(), Some(5), "焦点窗口的 IME 必须继续有效");
         assert_eq!(
-            route.leave(5),
+            route.disable(),
             super::FocusChange {
                 disable: true,
                 enable: false
             }
         );
         assert_eq!(route.focus(), None);
+        assert!(!route.is_focus(5), "停用之后不再报告为焦点");
     }
 
     /// `remove_window` 只在被移除窗口就是焦点时才停用。
@@ -414,7 +393,6 @@ mod tests {
         );
 
         assert!(route.should_degrade(now + NO_IM_FALLBACK), "到期降级");
-        assert!(route.degraded());
         assert!(!route.takes_text(), "降级后键盘通路必须产生字符");
         assert!(
             !route.should_degrade(now + NO_IM_FALLBACK * 2),
@@ -448,17 +426,17 @@ mod tests {
         assert!(route.takes_text(), "IM 一旦说话就必须重新独占文本通路");
     }
 
-    /// 换焦点重新计时：新 surface 的 IM 可能完全不同（不同 seat/不同窗口）。
+    /// 换焦点重新计时：新 surface 的 IM 可能完全不同（不同窗口可能挂不同输入法）。
     #[test]
     fn switching_focus_restarts_the_fallback_timer() {
         let now = Instant::now();
         let mut route = route_with_focus(now);
         assert!(route.should_degrade(now + NO_IM_FALLBACK));
+        assert!(!route.takes_text(), "降级后键盘通路接管");
         route.note_commit();
         let later = now + NO_IM_FALLBACK * 2;
         route.enter(8, later);
-        assert!(!route.degraded());
-        assert!(route.takes_text());
+        assert!(route.takes_text(), "换焦点后重新给新目标的 IME 一个窗口期");
         assert!(!route.should_degrade(later + Duration::from_millis(10)));
         assert!(route.should_degrade(later + NO_IM_FALLBACK));
     }

@@ -217,7 +217,6 @@ impl NativeWindow {
         let a11y = MacA11y::new(&view, dispatcher.clone(), id)?;
         view.install_a11y(a11y);
 
-        let scale = f64::from(options.scale.factor());
         // 关闭拦截：AppKit 的关窗手势（红点 / Cmd-W / performClose:）走 delegate，
         // windowShouldClose: 恒返回 false 并置位，由泵问过 App::request_close 后才真正 close。
         let delegate = WindowDelegate::new(mtm, Arc::clone(dispatcher));

@@ -41,26 +41,22 @@ impl DecorationMode {
     }
 }
 
-/// `xdg_toplevel.configure` 的 `states` 数组里引擎关心的位。
+/// `xdg_toplevel.configure` 的 `states` 数组里引擎**实际消费**的三个位。
 ///
 /// 注意协议里这些是**枚举值列表**（maximized=1 … suspended=9），不是位掩码：同一个数组里
 /// 每个 u32 表示一个状态存在。
+///
+/// 只解析被消费的状态（AGENTS §4：不再使用的字段直接删除）。`resizing` / `activated` /
+/// `tiled_*` 目前没有消费者：resize 期重建的抑制属于 `render/linux/**`（R10-19，wave-4 写域），
+/// 平铺态的圆角/阴影也还没有实现；等有消费者时再加回来，而不是先存着不用。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ToplevelStates {
-    /// 最大化。
+    /// 最大化（自绘标题栏的切换按钮据此选择 set/unset）。
     pub maximized: bool,
-    /// 全屏。
+    /// 全屏（`set_fullscreen` / `unset_fullscreen` 的判据）。
     pub fullscreen: bool,
-    /// 正在被交互式 resize（可用于抑制 resize 期的重建，R10-19）。
-    pub resizing: bool,
-    /// 已激活（键盘焦点由 compositor 视角给出，可作为 a11y 的焦点信号）。
-    pub activated: bool,
     /// 不可见：compositor 明确要求停止绘制（xdg-shell v6）。
     pub suspended: bool,
-    /// 左侧被平铺。
-    pub tiled_left: bool,
-    /// 右侧被平铺。
-    pub tiled_right: bool,
 }
 
 impl ToplevelStates {
@@ -72,24 +68,13 @@ impl ToplevelStates {
             match u32::from_ne_bytes(*chunk) {
                 1 => states.maximized = true,
                 2 => states.fullscreen = true,
-                3 => states.resizing = true,
-                4 => states.activated = true,
-                5 => states.tiled_left = true,
-                6 => states.tiled_right = true,
                 9 => states.suspended = true,
-                // 7/8 是 tiled_top/bottom，与 left/right 合并成「被平铺」即可；
-                // 其余是未来版本的枚举值，忽略。
-                7 | 8 => {}
+                // 3=resizing, 4=activated, 5..=8=tiled_*：当前没有消费者，见类型文档。
+                // 其余是未来版本的枚举值，同样忽略。
                 _ => {}
             }
         }
         states
-    }
-
-    /// 是否被平铺（任意方向）。平铺状态下不应自绘圆角/阴影（compositor 会把窗口贴边）。
-    #[must_use]
-    pub(crate) fn tiled(self) -> bool {
-        self.tiled_left || self.tiled_right
     }
 }
 
@@ -180,14 +165,15 @@ pub(crate) fn min_size_with_shadow(minimum: (f32, f32), shadow: f32) -> (i32, i3
     )
 }
 
-/// `xdg_toplevel.wm_capabilities`（xdg-shell v5）解析结果。
+/// `xdg_toplevel.wm_capabilities`（xdg-shell v5）解析结果 —— 只保留**有消费者**的三项。
 ///
 /// 协议：*"If a capability isn't supported, clients should hide or disable the UI elements that
 /// expose this functionality."* 事件体是 native-endian u32 数组（枚举值列表，不是位掩码）。
+///
+/// `window_menu` 不在其中：本仓没有实现 `show_window_menu`（`WindowControl` 没有该请求），
+/// 存了也没有消费者（AGENTS §4）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WmCapabilities {
-    /// `show_window_menu` 可用。
-    pub window_menu: bool,
     /// `set_maximized` / `unset_maximized` 可用。
     pub maximize: bool,
     /// `set_fullscreen` / `unset_fullscreen` 可用。
@@ -202,7 +188,6 @@ impl WmCapabilities {
     /// `wm_capabilities` 只在 xdg-shell v5+ 存在；绑定到 v6 但与老 compositor 通信时永远收不到。
     /// 那时按「全部支持」处理与旧行为一致（请求被忽略，不会出错），不会凭空禁用按钮。
     pub(crate) const ASSUMED: Self = Self {
-        window_menu: true,
         maximize: true,
         fullscreen: true,
         minimize: true,
@@ -212,17 +197,16 @@ impl WmCapabilities {
     #[must_use]
     pub(crate) fn parse(bytes: &[u8]) -> Self {
         let mut capabilities = Self {
-            window_menu: false,
             maximize: false,
             fullscreen: false,
             minimize: false,
         };
         for chunk in bytes.as_chunks::<4>().0 {
             match u32::from_ne_bytes(*chunk) {
-                1 => capabilities.window_menu = true,
                 2 => capabilities.maximize = true,
                 3 => capabilities.fullscreen = true,
                 4 => capabilities.minimize = true,
+                // 1 = window_menu：本仓不实现 show_window_menu。
                 _ => {}
             }
         }
@@ -230,22 +214,10 @@ impl WmCapabilities {
     }
 }
 
-/// 首帧尺寸：`xdg_toplevel.set_default_size` 的参数（R10-15）。
-///
-/// `0×0` 表示「让 compositor 决定」，本仓总是给出应用的请求尺寸（取整、至少 1 px）：
-/// 平铺/居中类 compositor 会优先用 `default_size` 决定首帧，比「只依赖 configure」更可控。
-#[must_use]
-pub(crate) fn default_size(size: Size) -> (i32, i32) {
-    (
-        size.width.round().max(1.0) as i32,
-        size.height.round().max(1.0) as i32,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        DecorationMode, ToplevelStates, Visibility, WmCapabilities, default_size, is_visible,
+        DecorationMode, ToplevelStates, Visibility, WmCapabilities, is_visible,
         min_size_with_shadow, window_geometry,
     };
     use crate::math::Size;
@@ -281,20 +253,17 @@ mod tests {
     fn toplevel_states_are_parsed_from_the_protocol_array() {
         assert_eq!(ToplevelStates::parse(&[]), ToplevelStates::default());
         let parsed = ToplevelStates::parse(&states(&[1, 4]));
-        assert!(parsed.maximized && parsed.activated);
+        assert!(parsed.maximized);
         assert!(!parsed.fullscreen && !parsed.suspended);
 
         let parsed = ToplevelStates::parse(&states(&[2, 9]));
         assert!(parsed.fullscreen);
         assert!(parsed.suspended, "xdg-shell v6 的 Suspended");
 
-        let parsed = ToplevelStates::parse(&states(&[5]));
-        assert!(parsed.tiled() && parsed.tiled_left);
-        let parsed = ToplevelStates::parse(&states(&[6]));
-        assert!(parsed.tiled() && parsed.tiled_right);
-        assert!(
-            !ToplevelStates::parse(&states(&[7])).tiled(),
-            "上下平铺不算"
+        // 没有消费者的状态（resizing / activated / tiled_*）被忽略，不影响已知状态。
+        assert_eq!(
+            ToplevelStates::parse(&states(&[3, 4, 5, 6, 7, 8])),
+            ToplevelStates::default()
         );
     }
 
@@ -405,41 +374,20 @@ mod tests {
     /// R10-15：`wm_capabilities` 是枚举值列表（不是位掩码），未收到时假定全部支持。
     #[test]
     fn wm_capabilities_are_parsed_as_a_value_list() {
-        assert_eq!(
-            WmCapabilities::parse(&[]),
-            WmCapabilities {
-                window_menu: false,
-                maximize: false,
-                fullscreen: false,
-                minimize: false
-            }
-        );
+        let none = WmCapabilities {
+            maximize: false,
+            fullscreen: false,
+            minimize: false,
+        };
+        assert_eq!(WmCapabilities::parse(&[]), none);
         let parsed = WmCapabilities::parse(&states(&[2, 3]));
         assert!(parsed.maximize && parsed.fullscreen);
-        assert!(!parsed.minimize && !parsed.window_menu);
+        assert!(!parsed.minimize);
         assert_eq!(
             WmCapabilities::parse(&states(&[1, 2, 3, 4])),
             WmCapabilities::ASSUMED,
-            "全部支持时与默认值一致"
+            "1 是 window_menu（本仓不消费），其余三项与默认值一致"
         );
-        assert_eq!(
-            WmCapabilities::parse(&states(&[9])),
-            WmCapabilities {
-                window_menu: false,
-                maximize: false,
-                fullscreen: false,
-                minimize: false
-            },
-            "未知能力值忽略"
-        );
-    }
-
-    /// 首帧尺寸必须取整且 ≥1（0 会变成「让 compositor 决定」）。
-    #[test]
-    fn default_size_is_rounded_and_never_zero() {
-        assert_eq!(default_size(Size::new(800.0, 600.0)), (800, 600));
-        assert_eq!(default_size(Size::new(800.6, 600.4)), (801, 600));
-        assert_eq!(default_size(Size::new(0.0, 0.0)), (1, 1));
-        assert_eq!(default_size(Size::new(f32::NAN, -3.0)), (1, 1));
+        assert_eq!(WmCapabilities::parse(&states(&[9])), none, "未知能力值忽略");
     }
 }

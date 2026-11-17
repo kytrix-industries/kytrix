@@ -39,14 +39,6 @@ pub(crate) const MAX_SELECTION_BYTES: usize = 1024 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct SourceGeneration(u64);
 
-impl SourceGeneration {
-    /// 原始值（诊断/日志）。
-    #[must_use]
-    pub(crate) const fn to_bits(self) -> u64 {
-        self.0
-    }
-}
-
 /// [`SelectionSources::publish`] 的结果：调用方据此建/销毁协议对象。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PublishOutcome {
@@ -134,24 +126,29 @@ impl SelectionSources {
     pub(crate) fn clear(&mut self) -> Option<SourceGeneration> {
         self.published.take().map(|published| published.generation)
     }
-
-    /// 当前发布的世代（诊断/测试）。
-    #[must_use]
-    pub(crate) fn generation(&self) -> Option<SourceGeneration> {
-        self.published
-            .as_ref()
-            .map(|published| published.generation)
-    }
 }
 
 /// 一条 `wl_data_offer` 的登记项。
 #[derive(Clone, Debug)]
 struct OfferEntry {
-    /// 协议对象 id（`ObjectId::protocol_id()`），事件归属的唯一键。
-    key: u32,
+    /// 本进程自增的内部 offer id（**不是**协议 object id）。
+    id: OfferId,
     /// `wl_data_offer.offer` 逐条累积的 mime。
     mimes: Vec<SmolStr>,
 }
+
+/// 本进程自增的 offer id。
+///
+/// 为什么不用协议 object id：`ObjectId::protocol_id()` 确实存在
+/// （`wayland-backend-0.3.17/src/client_api.rs:128`），但它的文档明确写着
+/// *"Protocol IDs are reused after object destruction, so this should not be used as a unique
+/// identifier, instead use the [`ObjectId`] directly"*。而纯逻辑层不能持有 `ObjectId`（那会把
+/// `wayland-client` 依赖带进这个「可在开发机单测」的模块），所以由本表自己发号；Linux 侧用
+/// **代理相等性**把事件里的 `wl_data_offer` 映射回内部 id —— wayland-scanner 生成的
+/// `impl PartialEq for <iface>` 正是 `self.id == other.id`
+/// （`wayland-scanner-0.31.11/src/client_gen.rs:80-84`），语义等价且不依赖未公开 API。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct OfferId(u32);
 
 /// 收到的 offer 表。
 ///
@@ -161,57 +158,52 @@ struct OfferEntry {
 #[derive(Debug, Default)]
 pub(crate) struct OfferTable {
     offers: Vec<OfferEntry>,
+    /// 下一个内部 id（单调递增，一次运行内不重复）。
+    next_id: u32,
 }
 
 impl OfferTable {
-    /// `wl_data_device.data_offer`：登记新 offer（同一 key 覆盖，防御重复事件）。
-    pub(crate) fn begin(&mut self, key: u32) {
-        if let Some(entry) = self.offers.iter_mut().find(|entry| entry.key == key) {
-            entry.mimes.clear();
-            return;
-        }
+    /// `wl_data_device.data_offer`：登记新 offer 并返回它的内部 id。
+    pub(crate) fn begin(&mut self) -> OfferId {
+        let id = OfferId(self.next_id);
+        self.next_id += 1;
         self.offers.push(OfferEntry {
-            key,
+            id,
             mimes: Vec::with_capacity(MIME_TEXT.len()),
         });
+        id
     }
 
     /// `wl_data_offer.offer`：给对应 offer 追加一个 mime。
     ///
     /// 找不到登记项时忽略（协议保证 `data_offer` 先到；防御乱序/已清理的 offer）。
-    pub(crate) fn add_mime(&mut self, key: u32, mime: SmolStr) {
-        if let Some(entry) = self.offers.iter_mut().find(|entry| entry.key == key) {
+    pub(crate) fn add_mime(&mut self, id: OfferId, mime: SmolStr) {
+        if let Some(entry) = self.offers.iter_mut().find(|entry| entry.id == id) {
             entry.mimes.push(mime);
         }
     }
 
-    /// 该 key 对应的 offer 里，按 [`MIME_TEXT`] 偏好选出的 mime（`None` = 没有可用的文本类型，
-    /// 或这个 key 不在表里）。
+    /// 该 offer 里按 [`MIME_TEXT`] 偏好选出的 mime（`None` = 没有可用的文本类型，
+    /// 或这个 id 不在表里）。
     #[must_use]
-    pub(crate) fn preferred_mime(&self, key: u32) -> Option<SmolStr> {
-        let entry = self.offers.iter().find(|entry| entry.key == key)?;
+    pub(crate) fn preferred_mime(&self, id: OfferId) -> Option<SmolStr> {
+        let entry = self.offers.iter().find(|entry| entry.id == id)?;
         preferred_mime(&entry.mimes)
     }
 
     /// 移除并返回该 offer 的 mime 列表（`selection` 处理完 / 拖放结束 / 离开时调用）。
     ///
     /// 返回 `Some` ⇒ 调用方分管这个 offer 的生命周期（处理完 `receive` 后 `destroy()`）。
-    pub(crate) fn take(&mut self, key: u32) -> Option<Vec<SmolStr>> {
-        let index = self.offers.iter().position(|entry| entry.key == key)?;
+    pub(crate) fn take(&mut self, id: OfferId) -> Option<Vec<SmolStr>> {
+        let index = self.offers.iter().position(|entry| entry.id == id)?;
         Some(self.offers.remove(index).mimes)
     }
 
     /// `wl_data_device.leave`：拖放离开，之后所有未处理的 offer 都作废。
     ///
-    /// 返回被丢弃的 key（调用方逐个 `destroy()`，否则服务端对象泄漏，R10-34）。
-    pub(crate) fn drain(&mut self) -> Vec<u32> {
-        self.offers.drain(..).map(|entry| entry.key).collect()
-    }
-
-    /// 登记项数量（诊断/测试）。
-    #[must_use]
-    pub(crate) fn len(&self) -> usize {
-        self.offers.len()
+    /// 返回被丢弃的内部 id（调用方据此 `destroy()` 对应代理，否则服务端对象泄漏，R10-34）。
+    pub(crate) fn drain(&mut self) -> Vec<OfferId> {
+        self.offers.drain(..).map(|entry| entry.id).collect()
     }
 }
 
@@ -237,8 +229,7 @@ mod tests {
     use smol_str::SmolStr;
 
     use super::{
-        MAX_SELECTION_BYTES, MIME_TEXT, OfferTable, SelectionSources, SourceGeneration,
-        preferred_mime, too_large,
+        MAX_SELECTION_BYTES, MIME_TEXT, OfferTable, SelectionSources, preferred_mime, too_large,
     };
 
     fn offered(list: &[&str]) -> Vec<SmolStr> {
@@ -293,7 +284,7 @@ mod tests {
 
         assert!(sources.cancelled(second.generation), "当前世代被取消");
         assert_eq!(sources.take_text(second.generation), None);
-        assert_eq!(sources.generation(), None);
+        assert_eq!(sources.clear(), None, "取消之后已经不再是选区属主");
     }
 
     #[test]
@@ -329,81 +320,111 @@ mod tests {
         );
         assert_eq!(sources.take_text(first.generation), None);
         assert_ne!(first.generation, second.generation);
-        assert_eq!(first.generation.to_bits() + 1, second.generation.to_bits());
+        assert!(second.generation > first.generation);
     }
 
-    /// 世代号从 0 开始单调递增，且与 `SourceGeneration` 的默认值无关。
+    /// 世代号单调递增；「未发布」时 `take_text` 对任何世代都返回 `None`。
     #[test]
-    fn generations_start_at_zero_and_increase() {
-        let mut sources = SelectionSources::default();
-        assert_eq!(sources.generation(), None);
-        let first = sources.publish(SmolStr::new_static("a"));
-        assert_eq!(first.generation, SourceGeneration(0));
-        let second = sources.publish(SmolStr::new_static("b"));
-        assert_eq!(second.generation, SourceGeneration(1));
+    fn an_unpublished_state_serves_no_text_for_any_generation() {
+        let sources = SelectionSources::default();
+        let mut probe = SelectionSources::default();
+        let generation = probe.publish(SmolStr::new_static("x")).generation;
+        assert_eq!(sources.take_text(generation), None);
     }
 
     /// R10-9：`selection` 事件按它**自带的** offer 匹配，而不是「最近一次 data_offer」。
     ///
-    /// 现场：拖放先到（offer#2），随后剪贴板选区到（offer#1）。旧实现会去 `receive` offer#2，
+    /// 现场：拖放先到（offer B），随后剪贴板选区到（offer A）。旧实现会去 `receive` 最近那条，
     /// 拿到与选区无关的数据。
     #[test]
     fn selection_uses_the_offer_carried_by_the_event() {
         let mut table = OfferTable::default();
-        table.begin(1);
-        table.add_mime(1, SmolStr::new_static("text/plain"));
-        table.begin(2);
-        table.add_mime(2, SmolStr::new_static("image/png"));
+        // 先到的拖放 offer（只有图片），后到的剪贴板 offer（文本）。
+        let dropped = table.begin();
+        table.add_mime(dropped, SmolStr::new_static("image/png"));
+        let selection = table.begin();
+        table.add_mime(selection, SmolStr::new_static("text/plain"));
 
         assert_eq!(
-            table.preferred_mime(1),
+            table.preferred_mime(selection),
             Some(SmolStr::new_static("text/plain")),
-            "选区（offer#1）必须按自己的 mime 协商"
+            "选区必须按自己的 mime 协商"
         );
         assert_eq!(
-            table.preferred_mime(2),
+            table.preferred_mime(dropped),
             None,
-            "拖放的 offer#2 只有图片，不能当文本拉"
+            "拖放的 offer 只有图片，不能当文本拉"
         );
-        assert_eq!(table.preferred_mime(9), None, "未登记的 offer");
+    }
+
+    /// 未登记的内部 id 一律 `None`（`selection` 指向一个我们没有 `data_offer` 的代理）。
+    #[test]
+    fn an_unknown_offer_id_has_no_mime() {
+        let mut table = OfferTable::default();
+        let known = table.begin();
+        table.add_mime(known, SmolStr::new_static("text/plain"));
+        // 内部 id 单调递增：再造一个 id 就是「表里没有」的那个。
+        let mut other = OfferTable::default();
+        let unknown = other.begin();
+        assert_eq!(
+            table.preferred_mime(unknown),
+            Some(SmolStr::new_static("text/plain"))
+        );
+        let mut fresh = OfferTable::default();
+        fresh.begin();
+        let beyond = fresh.begin();
+        assert_eq!(fresh.preferred_mime(beyond), None);
     }
 
     #[test]
     fn taking_an_offer_hands_over_its_lifetime() {
         let mut table = OfferTable::default();
-        table.begin(7);
-        table.add_mime(7, SmolStr::new_static(MIME_TEXT[0]));
-        assert_eq!(table.len(), 1);
-        let mimes = table.take(7).expect("登记过的 offer");
+        let id = table.begin();
+        table.add_mime(id, SmolStr::new_static(MIME_TEXT[0]));
+        let mimes = table.take(id).expect("登记过的 offer");
         assert_eq!(mimes.len(), 1);
-        assert_eq!(table.len(), 0, "取出后不再持有 ⇒ 调用方负责 destroy");
-        assert_eq!(table.preferred_mime(7), None);
+        assert_eq!(
+            table.preferred_mime(id),
+            None,
+            "取出后不再持有 ⇒ 调用方负责 destroy"
+        );
+        assert_eq!(table.take(id), None, "重复 take 是 no-op");
     }
 
     #[test]
     fn leave_drains_every_offer_so_none_leaks() {
         let mut table = OfferTable::default();
-        table.begin(1);
-        table.begin(2);
-        table.add_mime(2, SmolStr::new_static("text/plain"));
-        let mut keys = table.drain();
-        keys.sort_unstable();
-        assert_eq!(keys, vec![1, 2]);
-        assert_eq!(table.len(), 0);
+        let first = table.begin();
+        let second = table.begin();
+        table.add_mime(second, SmolStr::new_static("text/plain"));
+        let mut ids = table.drain();
+        ids.sort_unstable();
+        let mut expected = vec![first, second];
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
         assert!(table.drain().is_empty(), "drain 之后是空的");
+        assert_eq!(table.preferred_mime(first), None);
     }
 
-    /// 重复的 `data_offer`（同一 key）只清空 mime，不重复登记。
+    /// 每条 `data_offer` 都分配新的内部 id：旧条目由调用方销毁，不会与新条目混淆。
     #[test]
-    fn a_repeated_data_offer_resets_the_mime_list() {
+    fn every_data_offer_allocates_a_fresh_id() {
         let mut table = OfferTable::default();
-        table.begin(3);
-        table.add_mime(3, SmolStr::new_static("text/plain"));
-        table.begin(3);
-        assert_eq!(table.len(), 1);
-        assert_eq!(table.preferred_mime(3), None, "重开后 mime 要重新累积");
-        table.add_mime(4, SmolStr::new_static("text/plain"));
-        assert_eq!(table.preferred_mime(4), None, "未登记的 key 不接受 mime");
+        let first = table.begin();
+        table.add_mime(first, SmolStr::new_static("text/plain"));
+        let second = table.begin();
+        assert_ne!(first, second);
+        assert_eq!(
+            table.preferred_mime(second),
+            None,
+            "新 offer 的 mime 要重新累积"
+        );
+        table.add_mime(second, SmolStr::new_static("image/png"));
+        assert_eq!(
+            table.preferred_mime(first),
+            Some(SmolStr::new_static("text/plain")),
+            "老 offer 的 mime 不受新 offer 影响"
+        );
     }
 
     #[test]

@@ -13,8 +13,13 @@
 //! 放在平台无关层是为了让这些纯逻辑能在开发机（Windows）上被单测覆盖：
 //! macOS 的 `NSTextInputClient` 包装器只在 macOS 目标上编译，测试跑不到。
 
+// 子句区间（`Range`/`SmallVec`）只有 Windows 的 `GCS_COMPATTR`/`GCS_COMPCLAUSE` 消费者与
+// 测试构建用得到；macOS / Linux 不产生子句区间，无条件 import 会变成死导入（-D warnings）。
+// macOS 侧唯一用到 `Range` 的地方（`replacement_range` 的返回类型）用的是全路径。
+#[cfg(any(windows, test))]
 use std::ops::Range;
 
+#[cfg(any(windows, test))]
 use smallvec::SmallVec;
 #[cfg(any(target_os = "linux", test))]
 use smol_str::SmolStr;

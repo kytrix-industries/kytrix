@@ -274,7 +274,10 @@ mod tests {
     use ash::vk;
 
     use super::{EVICT_AFTER_FRAMES, GeometryEntry, GeometryRegistry, geometry_is_stale};
-    use crate::{paint::geometry::GeometryPipeline, render::retire::GpuResourceHandle};
+    use crate::{
+        paint::geometry::{GeometryPipeline, Topology},
+        render::retire::GpuResourceHandle,
+    };
 
     /// 驱逐判据的边界：恰好到门槛保留、越过门槛驱逐、帧号回绕给出正确差值。
     #[test]

@@ -439,13 +439,15 @@ define_class!(
             &self,
             item: &ProtocolObject<dyn NSValidatedUserInterfaceItem>,
         ) -> bool {
-            let Some(action) = item.action() else {
-                return true;
-            };
-            let Ok(name) = action.name().to_str() else {
-                return true;
-            };
-            match MenuCommand::from_selector(name) {
+            // `define_class!` 的方法体返回值会经 `ConvertReturn` 归一化（`bool` 的 `Inner` 是
+            // objc2 的 `Bool`），方法体被塞进一个 `extern "C-unwind" fn(..) -> Bool` 里 ⇒
+            // **不能**在这里写 `return true;`（那会从 `-> Bool` 的函数里返回 `bool`，E0308）。
+            // 因此判定全部写成表达式（`?` 在这里也不可用，同理）。
+            let command = item
+                .action()
+                .and_then(|action| action.name().to_str().ok())
+                .and_then(MenuCommand::from_selector);
+            match command {
                 // Edit 命令只在文本编辑态启用：没有文本焦点时把 Cmd+C/V/A/Z 还给 keyDown
                 // 通路（应用的绑定仍能收到），而不是被一个什么都不做的菜单项吃掉。
                 Some(command) if command.is_edit() => self.ivars().text_editing.get(),
@@ -787,13 +789,17 @@ impl GuiView {
     /// 把一条菜单命令转给 responder chain 上的下一个响应者（等价 `[[self nextResponder]
     /// tryToPerform:_cmd with:sender]`）。
     fn forward_to_next_responder(&self, command: MenuCommand) {
-        let Some(next) = self.nextResponder() else {
+        // SAFETY: objc2 把 `nextResponder` 标为 `unsafe`（响应链上的对象类型由运行时决定，
+        // 绑定无法静态保证）；这里只取指针并立刻用 `NSResponder` 自己的 `tryToPerform:with:`
+        // 转发，不假设下一个响应者的具体类型。
+        let Some(next) = (unsafe { self.nextResponder() }) else {
             return;
         };
-        // SAFETY: `nextResponder` 返回的是 AppKit 保证存活到下一次 run loop 的对象；
-        // `tryToPerform:with:` 对它自己（以及它之后的链）是同步、安全的调用。返回值只表示
-        // 「链上有响应者处理了」，引擎不据此做决策（没有处理者时保持安静，不 `noResponderFor:`
-        // 的 beep —— 自绘控件不应因程序化调用而响铃）。
+        // SAFETY: 同上：`next` 是 AppKit 保证存活到下一次 run loop 的响应者对象，
+        // `tryToPerform:with:` 对它与它之后的链是同步、安全的调用；`object` 传 `None`
+        //（菜单命令没有 sender 语义需求）。返回值只表示「链上有响应者处理了」，引擎不据此
+        // 做决策（没有处理者时保持安静，不触发 `noResponderFor:` 的 beep —— 自绘控件不应因
+        // 程序化调用而响铃）。
         let _ = unsafe { next.tryToPerform_with(menu::selector(command), None) };
     }
 
@@ -889,8 +895,12 @@ impl GuiView {
 
 /// 引擎 [`Cursor`] → `NSCursor`（R09-11）。
 ///
-/// 映射按 AppKit 的语义就近取值：`Grab`/`Grabbing` 是开/合掌，`ResizeHorizontal`/`Vertical`
-/// 用左右/上下双向箭头（与 Win32 `IDC_SIZEWE`/`IDC_SIZENS`、Qt 的对应光标同类）。
+/// 全部用**非废弃**类方法：`resizeLeftRightCursor` / `resizeUpDownCursor` 在 macOS 15 已被
+/// 标记 deprecated（消息明确指向 `columnResizeCursorInDirections:` / `frameResizeCursorFromPosition:inDirections:`），
+/// 而 `columnResizeCursor()` / `rowResizeCursor()` 是"拖动分隔条"场景的**官方替代**且未废弃，
+/// 也不需要额外 feature（`columnResizeCursorInDirections:` 要 `NSDirection` feature + macOS 15）。
+/// 其余（`arrowCursor` / `pointingHandCursor` / `IBeamCursor` / `operationNotAllowedCursor` /
+/// `openHandCursor` / `closedHandCursor`）都不在绑定文件的 deprecated 段里。
 fn ns_cursor(cursor: Cursor) -> Retained<NSCursor> {
     match cursor {
         Cursor::Default => NSCursor::arrowCursor(),
@@ -899,8 +909,8 @@ fn ns_cursor(cursor: Cursor) -> Retained<NSCursor> {
         Cursor::NotAllowed => NSCursor::operationNotAllowedCursor(),
         Cursor::Grab => NSCursor::openHandCursor(),
         Cursor::Grabbing => NSCursor::closedHandCursor(),
-        Cursor::ResizeHorizontal => NSCursor::resizeLeftRightCursor(),
-        Cursor::ResizeVertical => NSCursor::resizeUpDownCursor(),
+        Cursor::ResizeHorizontal => NSCursor::columnResizeCursor(),
+        Cursor::ResizeVertical => NSCursor::rowResizeCursor(),
     }
 }
 
