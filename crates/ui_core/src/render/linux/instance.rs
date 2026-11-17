@@ -236,6 +236,10 @@ impl VulkanInstance {
         let mut messenger_create = debug_messenger_create_info();
         let create = ash::vk::InstanceCreateInfo::default()
             .application_info(&application)
+            // `VK_EXT_debug_utils` 必须同时出现在 `ppEnabledExtensionNames` 与 `pNext` 的
+            // `VkDebugUtilsMessengerCreateInfoEXT` 里（`VUID-VkInstanceCreateInfo-pNext-04926`）：
+            // 前者漏了会在 `vkCreateInstance` 报验证错误，随后的 messenger 调用 panic。
+            .enabled_extension_names(&extension_pointers)
             .enabled_layer_names(&layers);
         let create = if debug_utils {
             create.push_next(&mut messenger_create)
