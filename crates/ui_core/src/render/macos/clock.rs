@@ -13,10 +13,20 @@
 
 use std::{sync::OnceLock, time::Instant};
 
-use crate::render::frame_clock::{SignaledIntervalClock, TimeAnchor, publish_platform_tick};
+use crate::render::frame_clock::{
+    FALLBACK_REFRESH_HZ, FrameClock, SignaledIntervalClock, TimeAnchor, publish_platform_tick,
+};
 
 /// 合成线程的帧时钟（平台回调驱动 + 单调间隔兜底）。
 pub(crate) type CompositorClock = SignaledIntervalClock;
+
+/// 合成线程的时钟（平台入口：三平台签名一致，差异只在本模块内部）。
+///
+/// macOS 的刷新率**不在这里读**（AppKit 的 `maximumFramesPerSecond` 只能在主线程取）：
+/// 先用 60 Hz 兜底，display link 的回调节奏会把它反推到真实值（`estimate_refresh_hz`）。
+pub(crate) fn compositor_clock() -> Box<dyn FrameClock> {
+    Box::new(CompositorClock::new(FALLBACK_REFRESH_HZ))
+}
 
 /// host time 锚点（进程级只建一次；首次回调时建立）。
 fn host_anchor() -> &'static OnceLock<Option<TimeAnchor>> {

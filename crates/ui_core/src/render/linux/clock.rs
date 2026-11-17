@@ -12,10 +12,20 @@
 
 use std::time::Instant;
 
-use crate::render::frame_clock::{SignaledIntervalClock, publish_platform_tick};
+use crate::render::frame_clock::{
+    FALLBACK_REFRESH_HZ, FrameClock, SignaledIntervalClock, publish_platform_tick,
+};
 
 /// 合成线程的帧时钟（平台回调驱动 + 单调间隔兜底）。
 pub(crate) type CompositorClock = SignaledIntervalClock;
+
+/// 合成线程的时钟（平台入口：三平台签名一致，差异只在本模块内部）。
+///
+/// Wayland 没有刷新率查询接口：先用 60 Hz 兜底，`wl_surface.frame` 的回调节奏会把它反推到
+/// 真实值（`estimate_refresh_hz`）。
+pub(crate) fn compositor_clock() -> Box<dyn FrameClock> {
+    Box::new(CompositorClock::new(FALLBACK_REFRESH_HZ))
+}
 
 /// `wl_surface.frame` 回调入口。
 ///

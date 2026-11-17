@@ -360,7 +360,7 @@ pub(crate) fn compositor() -> &'static Arc<CompositorHandle> {
 
 /// 合成线程主循环。
 fn run(shared: Arc<CompositorShared>) {
-    let mut clock = crate::render::frame_clock::platform_clock();
+    let mut clock = crate::render::frame_clock::compositor_clock();
     // 关闭路径的时钟打断句柄必须在线程等待之前注册。
     *shared.cancel.lock().unwrap_or_else(PoisonError::into_inner) = Some(clock.signal_handle());
     let mut pacing = FramePacing::new();

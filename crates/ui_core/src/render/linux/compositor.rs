@@ -765,7 +765,7 @@ impl GpuRenderer {
         // 一次性帧的序号在渲染器内部单调递增：timeline 的 signal 值必须严格递增。
         self.snapshot_index += 1;
         let index = FrameIndex::from_raw(self.snapshot_index);
-        let payload = FramePayload::full(buffer);
+        let payload = FramePayload::full(buffer, Vec::new());
         let mut timings = FrameTimings::new();
         let mut frame = FramePlan::new(Plan::Full, true);
         self.submit_snapshot(index, &payload, &mut frame, &mut timings)?;

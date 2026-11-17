@@ -14,15 +14,7 @@ use std::{sync::OnceLock, time::Instant};
 
 use objc2_core_foundation::CFTimeInterval;
 
-use crate::render::frame_clock::{
-    FALLBACK_REFRESH_HZ, FramePacing, FrameTick, PRESENT_MARGIN, TimeAnchor, normalize_refresh_hz,
-};
-
-/// 距离目标呈现时刻不足这个量就认为**来不及提交**（共享层的定义，秒制视图）。
-pub(crate) const PRESENT_MARGIN_SECS: f64 = PRESENT_MARGIN.as_secs_f64();
-
-/// 连续跳过本 vsync 的上限（共享层的定义）。
-pub(crate) const MAX_CONSECUTIVE_SKIPS: u32 = crate::render::frame_clock::MAX_CONSECUTIVE_SKIPS;
+use crate::render::frame_clock::{FALLBACK_REFRESH_HZ, FramePacing, FrameTick, TimeAnchor};
 
 /// 本 vsync 的呈现决定（[`PresentPacing::plan`] 的结论）。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -51,21 +43,13 @@ fn host_now() -> f64 {
 /// 呈现时刻判定（薄壳：状态在共享层的 [`FramePacing`] 里）。
 pub(crate) struct PresentPacing {
     inner: FramePacing,
-    /// 本帧的刷新率（display link 的节奏；共享层只把它带在 `FrameTick` 里）。
-    refresh_hz: f32,
 }
 
 impl PresentPacing {
     pub(crate) const fn new() -> Self {
         Self {
             inner: FramePacing::new(),
-            refresh_hz: FALLBACK_REFRESH_HZ,
         }
-    }
-
-    /// 刷新率（换屏 / ProMotion 之后由调用方更新）。
-    pub(crate) fn set_refresh_hz(&mut self, refresh_hz: f32) {
-        self.refresh_hz = normalize_refresh_hz(refresh_hz);
     }
 
     /// **录制之前**的判定：本 vsync 提交不提交、提交时钉不钉目标时刻。
@@ -87,7 +71,7 @@ impl PresentPacing {
         Some(FrameTick {
             now: anchor.to_instant(now)?,
             present_time: anchor.to_instant(target)?,
-            refresh_hz: self.refresh_hz,
+            refresh_hz: FALLBACK_REFRESH_HZ,
             completed: true,
         })
     }
@@ -110,9 +94,8 @@ pub(crate) fn clamp_present_time(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        MAX_CONSECUTIVE_SKIPS, PRESENT_MARGIN_SECS, PresentPacing, PresentPlan, clamp_present_time,
-    };
+    use super::{PresentPacing, PresentPlan, clamp_present_time};
+    use crate::render::frame_clock::{MAX_CONSECUTIVE_SKIPS, PRESENT_MARGIN};
 
     /// 120 Hz 的 vsync 周期（秒）。
     const VSYNC_120: f64 = 1.0 / 120.0;
@@ -131,7 +114,7 @@ mod tests {
     fn a_late_target_skips_once_then_presents_immediately() {
         let mut pacing = PresentPacing::new();
         let target = 1_000.0;
-        let late = target - PRESENT_MARGIN_SECS / 2.0;
+        let late = target - PRESENT_MARGIN.as_secs_f64() / 2.0;
         assert_eq!(pacing.plan(late, target), PresentPlan::Skip, "落后：跳一次");
         for _ in 0..5 {
             assert_eq!(
@@ -204,7 +187,7 @@ mod tests {
         );
         // 只剩一半余量：已经不够提交（用「明显不足」而不是卡在浮点边界上）。
         assert_eq!(
-            clamp_present_time(target, target - PRESENT_MARGIN_SECS / 2.0),
+            clamp_present_time(target, target - PRESENT_MARGIN.as_secs_f64() / 2.0),
             None
         );
         // 已经过期：立即呈现。

@@ -77,6 +77,11 @@ impl CompositorClock {
 // **构造并独占使用**，`Send` 只为满足 `Box<dyn FrameClock>` 的移交约束。
 unsafe impl Send for CompositorClock {}
 
+/// 合成线程的时钟（平台入口：三平台签名一致，差异只在本模块内部）。
+pub(crate) fn compositor_clock() -> Box<dyn FrameClock> {
+    Box::new(CompositorClock::new())
+}
+
 impl FrameClock for CompositorClock {
     fn wait_next_frame(&mut self) -> FrameTick {
         let completed = self.wait_for_a_beat();

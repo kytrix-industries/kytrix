@@ -877,6 +877,10 @@ fn drain_completed(
         }
         // 观察到完成的时刻（timeline 非阻塞查询），不是 `Present` 返回的时刻。
         let completed_at = Instant::now();
+        // B6-2：这一拍同时是**合成线程帧时钟**的来源 —— Wayland 的 `wl_surface.frame` 回调在平台层
+        // 消费（`platform/linux/surface.rs`），而 GPU 完成观测点是同一节奏的等价信号：每 present
+        // 一帧就发布一拍，合成线程据此对齐出帧相位并反推刷新率（`render/linux/clock.rs`）。
+        crate::render::linux::clock::note_frame_callback();
         shared.publish_feedback(FrameFeedback {
             index: frame.index,
             stats: frame.stats,

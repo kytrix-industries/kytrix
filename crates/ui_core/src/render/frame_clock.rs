@@ -191,14 +191,6 @@ impl TimeAnchor {
                 .checked_sub(Duration::try_from_secs_f64(-delta).ok()?)
         }
     }
-
-    /// `Instant` → 原生时基（秒）。
-    pub(crate) fn to_native(self, instant: Instant) -> f64 {
-        match instant.checked_duration_since(self.instant) {
-            Some(ahead) => self.native + ahead.as_secs_f64(),
-            None => self.native - self.instant.duration_since(instant).as_secs_f64(),
-        }
-    }
 }
 
 /// Linux：`wl_surface.frame` 回调之后**下一拍**的目标呈现时刻。
@@ -303,16 +295,6 @@ impl SignaledIntervalClock {
             last_publish: None,
         }
     }
-
-    /// 下一拍的目标呈现时刻。
-    pub(crate) fn present_time(&self) -> Instant {
-        self.interval.present_time()
-    }
-
-    /// 显示器刷新率（由回调节奏反推，兜底 60 Hz）。
-    pub(crate) fn refresh_hz(&self) -> f32 {
-        self.interval.refresh_hz()
-    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -341,25 +323,17 @@ impl FrameClock for SignaledIntervalClock {
     }
 }
 
-/// 平台时钟工厂：三平台各一份来源，语义由本模块统一。
+#[cfg(target_os = "linux")]
+pub(crate) use crate::render::linux::clock::compositor_clock;
+#[cfg(target_os = "macos")]
+pub(crate) use crate::render::macos::clock::compositor_clock;
+/// 平台时钟入口（三平台**签名一致**：`fn() -> Box<dyn FrameClock>`）。
 ///
-/// - Windows：DWM 合成器节拍（`render/windows/clock.rs`）；
-/// - macOS / Linux：平台回调 + 单调间隔（[`SignaledIntervalClock`]），回调入口分别在
-///   `render/macos/clock.rs` / `render/linux/clock.rs`。
-pub(crate) fn platform_clock() -> Box<dyn FrameClock> {
-    #[cfg(windows)]
-    {
-        Box::new(crate::render::windows::clock::CompositorClock::new())
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Box::new(crate::render::macos::clock::CompositorClock::new())
-    }
-    #[cfg(target_os = "linux")]
-    {
-        Box::new(crate::render::linux::clock::CompositorClock::new())
-    }
-}
+/// 这里只做「选哪个模块」，不做「怎么构造」：每个平台模块自己决定要不要刷新率初值
+/// （Windows 从 DWM 采样、macOS/Linux 先用 60 Hz 兜底再由回调反推）。这样以后改构造参数只会
+/// 落在**一个**平台文件里，不会出现「共享文件里两个 cfg 分支签名不一致」的漏改。
+#[cfg(windows)]
+pub(crate) use crate::render::windows::clock::compositor_clock;
 
 /// 时钟等待原语：**粘滞**的取消位 + 条件变量（关闭路径的打断只能生效一次，之后永远醒来）。
 pub(crate) struct ClockWait {
@@ -386,6 +360,7 @@ impl ClockWait {
         self.condvar.notify_all();
     }
 
+    #[cfg(windows)]
     pub(crate) fn is_cancelled(&self) -> bool {
         *self.lock()
     }
@@ -492,12 +467,8 @@ impl IntervalClock {
         }
     }
 
-    /// 下一拍的目标呈现时刻（未出过帧时是「上一拍 + 1 周期」）。
-    pub(crate) fn present_time(&self) -> Instant {
-        self.anchor
-    }
-
-    /// 显示器刷新率（Hz）。
+    /// 显示器刷新率（Hz）：`SignaledIntervalClock` 的相位对齐要用（换屏 / ProMotion 之后由
+    /// 回调节奏更新）。
     pub(crate) fn refresh_hz(&self) -> f32 {
         self.refresh_hz
     }
@@ -797,7 +768,7 @@ mod tests {
                 >= first.present_time + frame_interval(60.0) - Duration::from_millis(1),
             "两拍之间至少一个刷新周期"
         );
-        assert_eq!(clock.refresh_hz(), 60.0);
+        assert_eq!(second.refresh_hz, 60.0);
     }
 
     // ── 平台时基换算（纯函数：三平台共用同一套判据）──────────────────────
@@ -815,9 +786,10 @@ mod tests {
             anchor.to_instant(999.75),
             instant.checked_sub(Duration::from_millis(500))
         );
-        assert!((anchor.to_native(instant) - 1_000.25).abs() < 1e-9);
+        // 往返：原生 → Instant → 原生 必须逐位回到原值。
         let later = instant + Duration::from_millis(250);
-        assert!((anchor.to_native(later) - 1_000.5).abs() < 1e-9);
+        let native = 1_000.5;
+        assert_eq!(anchor.to_instant(native), Some(later));
     }
 
     #[test]
@@ -888,17 +860,16 @@ mod tests {
         publish_platform_tick(Some(base + Duration::from_secs_f64(1.0 / 120.0)));
         let second = clock.wait_next_frame();
         assert!(
-            (clock.refresh_hz() - 120.0).abs() < 20.0,
+            (second.refresh_hz - 120.0).abs() < 20.0,
             "回调节奏反推的刷新率必须接近 120 Hz，实际 {}",
-            clock.refresh_hz()
+            second.refresh_hz
         );
         // 目标时刻必须来自「回调之后的一拍」，不是随便一个过去时刻。
         assert!(
-            clock.present_time() >= base,
+            second.present_time >= base,
             "相位必须对齐到回调时刻（present={:?} base={base:?}）",
-            clock.present_time()
+            second.present_time
         );
-        assert!(second.refresh_hz >= 24.0);
     }
 
     /// 没有回调时按刷新率兜底（不能停帧），且 `IntervalClock` 的相位可被平台重新对齐。
@@ -908,15 +879,14 @@ mod tests {
         let mut clock = IntervalClock::new(60.0, now);
         let aligned = now + Duration::from_millis(5);
         clock.align(aligned, now);
-        assert_eq!(clock.present_time(), aligned);
         // 换屏：刷新率变化立刻生效（周期随之变化）。
         clock.set_refresh_hz(120.0);
-        assert!((clock.refresh_hz() - 120.0).abs() < f32::EPSILON);
         let tick = clock.wait_next_frame();
         assert_eq!(tick.refresh_hz, 120.0);
         // 过期的锚点：退化为「现在 + 一个周期」，不会给出过去的时刻。
         clock.align(now - Duration::from_millis(50), Instant::now());
-        assert!(clock.present_time() > Instant::now());
+        let late = clock.wait_next_frame();
+        assert!(late.present_time > late.now);
     }
 
     /// `ManualClock` 的取消：等待立刻返回且标记为「未完成」。

@@ -439,9 +439,11 @@ define_class!(
             // （host time，与 `CACurrentMediaTime()` / `MTLDrawable.presentedTime` 同一时基）。
             // 提交时必须把它交给 `presentDrawable:atTime:`，否则 CA 自行决定呈现时刻，
             // commit 晚于层的调度点就被推到下一个 vsync（整整多一帧）。
-            self.ivars()
-                .shared
-                .publish_drawable(update.drawable(), update.targetPresentationTimestamp());
+            let target = update.targetPresentationTimestamp();
+            // B6-2：同一时刻也交给**合成线程**的帧时钟 —— 合成线程据此对齐出帧相位，并按回调节奏
+            // 反推刷新率（`SignaledIntervalClock`）。这是 macOS 时钟源的唯一接线点。
+            crate::render::macos::clock::note_display_link_target(target);
+            self.ivars().shared.publish_drawable(update.drawable(), target);
         }
     }
 );
