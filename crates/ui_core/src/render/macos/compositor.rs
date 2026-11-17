@@ -1558,7 +1558,7 @@ mod tests {
     #[test]
     fn the_presented_handler_table_never_grows_without_bound() {
         let mut handlers = PresentedHandlers::new();
-        for id in 0..(PRESENTED_HANDLER_SLOTS as usize * 3) {
+        for id in 0..(PRESENTED_HANDLER_SLOTS * 3) {
             assert!(handlers.register(id), "新对象只登记一次");
             assert!(!handlers.register(id), "同一对象重复使用不登记");
         }
