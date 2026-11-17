@@ -9,39 +9,216 @@
 //! 「槽位 + 需要等待/将要 signal 的 fence 值」（`render/windows/queue.rs` 消费）与帧交付数据。
 
 use std::{
-    sync::{Mutex, OnceLock, PoisonError},
+    mem::size_of,
+    ops::Range,
+    sync::{Arc, Mutex, OnceLock, PoisonError},
     time::{Duration, Instant},
 };
 
 #[cfg(target_os = "linux")]
 use crate::math::Size;
 use crate::{
-    paint::instance::{FrameOp, GeometryDrawGpu, GpuClipEntry, InstanceBuffer},
+    paint::instance::{FrameOp, GeometryDrawGpu, GpuClipEntry, GpuPrimitive, InstanceBuffer},
     render::{compositor::Plan, stats::RenderStats, timer::GpuTimerSample},
     window::FrameIndex,
 };
 
+/// 一个实例的字节数（`GpuPrimitive` = 128 B 布局，静态断言在 `paint::instance`）。
+const INSTANCE_BYTES: usize = size_of::<GpuPrimitive>();
+
+/// 一帧实例字节的一段（**增量载荷**的单位）。
+///
+/// `bytes` 是 `Arc<[u8]>`：UI 线程从实例环切出来时只拷贝一次，之后跨线程移交、被覆盖帧的
+/// 合并、GPU 线程的欠账补写都只 `Arc::clone`（零二次拷贝）。
+pub(crate) struct InstanceChunk {
+    /// 实例环下标（首实例）。
+    start: u32,
+    bytes: Arc<[u8]>,
+}
+
+impl InstanceChunk {
+    /// 本块覆盖的实例区间。
+    fn range(&self) -> Range<u32> {
+        self.start..self.start + (self.bytes.len() / INSTANCE_BYTES) as u32
+    }
+
+    /// 本块的字节（**仅测试**：等价性用例要断言增量载荷只带变化段）。
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 /// 一帧的 CPU→GPU 快照（`design/async-render-pipeline.md` §4.1）。
 ///
-/// 实例字节、绘制序、裁剪表、几何表必须一起过线：GPU 线程拿到的必须是**同一帧**的四份数据。
-/// 每帧一次拷贝是线程边界的所有权转移，不是可选优化（§4.2 的代价说明）。
+/// 实例数据是**增量**的：`chunks` 只含自上次载荷以来变化的实例段，**应用顺序 = 旧 → 新**
+/// （重叠区间后者覆盖）。GPU 线程侧的实例缓冲是持久的（`InstanceMirror`），未变化的段保留
+/// 上次内容。绘制序、裁剪表、几何表仍然全量过线 —— 它们是小数据（op 数 × 24 B），且
+/// 「同一帧的四份数据」这个不变量不能拆。
 pub(crate) struct FramePayload {
-    instances: Vec<u8>,
+    /// 实例块（**应用顺序：旧 → 新**）。全量载荷 = 一个覆盖 `[0, instance_count)` 的块。
+    chunks: Vec<InstanceChunk>,
+    /// 实例环总实例数（含空洞；GPU 侧槽缓冲的容量 / SRV 尺寸判据）。
+    instance_count: u32,
+    /// 本帧绘制序真正引用的实例数（存活实例；绘制统计 `RenderStats.instances`）。
+    drawn_instances: u32,
     ops: Vec<FrameOp>,
     clips: Vec<GpuClipEntry>,
     /// 几何绘制表：`FrameOp::Geometry.index` 的下标表，**必须与 `ops` 同帧过线**
     /// （`ops` 里的下标只有配合同一帧的表才有意义）。
-    ///
-    /// 目前只有 Windows 的录制路径消费它（macOS / Linux 的 `FrameOp::Geometry` 还没有 GPU
-    /// 缓冲来源），但三平台的 payload 形状保持一致：它是「一帧的全部 CPU 侧数据」，不是按
-    /// 平台裁剪的数据包。
     geometry: Vec<GeometryDrawGpu>,
+}
+
+impl FramePayload {
+    /// 增量载荷：只带自上次载荷以来变化的实例段（`InstanceBuffer` 的变化区间被取走）。
+    ///
+    /// # Panics
+    /// `InstanceBuffer` 的实例数与变化区间不一致（编码器不变量被破坏）。
+    pub(crate) fn from_buffer_delta(buffer: &mut InstanceBuffer) -> Self {
+        let mut buffers = pool_lock().pop().unwrap_or_default();
+        buffers.chunks.clear();
+        let count = buffer.instance_count();
+        let ranges = buffer.changes().len();
+        for index in 0..ranges {
+            let range = buffer.changes()[index].clone();
+            let bytes = &buffer.as_bytes()
+                [range.start as usize * INSTANCE_BYTES..range.end as usize * INSTANCE_BYTES];
+            buffers.chunks.push(InstanceChunk {
+                start: range.start,
+                bytes: Arc::from(bytes),
+            });
+        }
+        buffer.clear_changes();
+        buffers.ops.clear();
+        buffers.ops.extend_from_slice(buffer.ops());
+        buffers.clips.clear();
+        buffer.write_clips_gpu(&mut buffers.clips);
+        buffers.geometry.clear();
+        buffers.geometry.extend_from_slice(buffer.geometry());
+        Self {
+            chunks: buffers.chunks,
+            instance_count: count,
+            drawn_instances: buffer.len() as u32,
+            ops: buffers.ops,
+            clips: buffers.clips,
+            geometry: buffers.geometry,
+        }
+    }
+
+    /// 全量载荷：一个覆盖整张实例环的块（快照 / 首帧 / 重建后）。
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn full(buffer: &InstanceBuffer) -> Self {
+        let mut buffers = pool_lock().pop().unwrap_or_default();
+        buffers.chunks.clear();
+        let count = buffer.instance_count();
+        if count > 0 {
+            buffers.chunks.push(InstanceChunk {
+                start: 0,
+                bytes: Arc::from(buffer.as_bytes()),
+            });
+        }
+        buffers.ops.clear();
+        buffers.ops.extend_from_slice(buffer.ops());
+        buffers.clips.clear();
+        buffer.write_clips_gpu(&mut buffers.clips);
+        buffers.geometry.clear();
+        buffers.geometry.extend_from_slice(buffer.geometry());
+        Self {
+            chunks: buffers.chunks,
+            instance_count: count,
+            drawn_instances: buffer.len() as u32,
+            ops: buffers.ops,
+            clips: buffers.clips,
+            geometry: buffers.geometry,
+        }
+    }
+
+    /// 把**被覆盖帧**（从未到达 GPU）的实例块并进来：旧块在前、新块在后。
+    ///
+    /// 新块里已经被更新版本覆盖的旧块直接丢弃（同样的区间以新块为准）；旧块里**没有被新块
+    /// 完整覆盖**的区间必须保留，否则那段变化永远不会出现在任何 GPU 缓冲里。
+    pub(crate) fn absorb(&mut self, mut dropped: Self) {
+        // `FramePayload` 有 `Drop`（回收池），所以先 `take` 出块表再消费。
+        let dropped_chunks = std::mem::take(&mut dropped.chunks);
+        if dropped_chunks.is_empty() {
+            return;
+        }
+        let mut kept: Vec<InstanceChunk> = Vec::with_capacity(dropped_chunks.len());
+        // 极端情况（GPU 长时间停摆、每帧都改大片 lane）下不做逐块覆盖判定：保留全部旧块
+        // 仍是正确的（只是块数更多），比 O(n·m) 的判定便宜。
+        let exhaustive = dropped_chunks.len().saturating_mul(self.chunks.len()) <= 4096;
+        for older in dropped_chunks {
+            let covered = exhaustive
+                && self.chunks.iter().any(|newer| {
+                    newer.range().start <= older.start && older.range().end <= newer.range().end
+                });
+            if !covered {
+                kept.push(older);
+            }
+        }
+        kept.append(&mut self.chunks);
+        self.chunks = kept;
+    }
+
+    /// 本帧的实例块（应用顺序：旧 → 新）。
+    pub(crate) fn chunks(&self) -> &[InstanceChunk] {
+        &self.chunks
+    }
+
+    /// 实例环总实例数（含空洞）。
+    pub(crate) fn instance_count(&self) -> u32 {
+        self.instance_count
+    }
+
+    /// 本帧绘制序真正引用的实例数（`RenderStats.instances`；不含空洞）。
+    pub(crate) fn drawn_instances(&self) -> u32 {
+        self.drawn_instances
+    }
+
+    /// 本帧的绘制序。
+    pub(crate) fn ops(&self) -> &[FrameOp] {
+        &self.ops
+    }
+
+    /// 本帧的裁剪表（GPU 布局，表项 0 是哨兵）。
+    pub(crate) fn clips(&self) -> &[GpuClipEntry] {
+        &self.clips
+    }
+
+    /// `FrameOp::Geometry.index` 的下标表（与 [`FramePayload::ops`] 同帧）。
+    pub(crate) fn geometry(&self) -> &[GeometryDrawGpu] {
+        &self.geometry
+    }
+
+    /// 本帧交给 GPU 的实例字节数（增量载荷 = 变化段；`FrameRecord.uploaded_bytes`）。
+    #[cfg(feature = "test-support")]
+    pub(crate) fn uploaded_bytes(&self) -> usize {
+        self.chunks
+            .iter()
+            .map(|chunk| chunk.bytes.len())
+            .sum::<usize>()
+    }
+
+    /// 空载荷（窗口首帧 priming 与槽位/线程单元测试用；真实帧必须走
+    /// [`FramePayload::from_buffer_delta`] / [`FramePayload::full`]）。只有 Windows 的首帧
+    /// priming 在产品构建里需要它。
+    #[cfg(any(windows, test))]
+    pub(crate) fn empty() -> Self {
+        Self {
+            chunks: Vec::new(),
+            instance_count: 0,
+            drawn_instances: 0,
+            ops: Vec::new(),
+            clips: Vec::new(),
+            geometry: Vec::new(),
+        }
+    }
 }
 
 /// 一帧的四个 CPU 缓冲（`FramePayload` 回收的单位，DEVIATIONS F-213）。
 #[derive(Default)]
 struct PayloadBuffers {
-    instances: Vec<u8>,
+    chunks: Vec<InstanceChunk>,
     ops: Vec<FrameOp>,
     clips: Vec<GpuClipEntry>,
     geometry: Vec<GeometryDrawGpu>,
@@ -64,63 +241,10 @@ fn pool_lock() -> std::sync::MutexGuard<'static, Vec<PayloadBuffers>> {
         .unwrap_or_else(PoisonError::into_inner)
 }
 
-impl FramePayload {
-    /// 从 UI 线程的编码结果复制一份（缓冲从回收池取，容量跨帧复用）。
-    pub(crate) fn from_buffer(buffer: &InstanceBuffer) -> Self {
-        let mut buffers = pool_lock().pop().unwrap_or_default();
-        buffers.instances.clear();
-        buffers.instances.extend_from_slice(buffer.as_bytes());
-        buffers.ops.clear();
-        buffers.ops.extend_from_slice(buffer.ops());
-        buffers.clips.clear();
-        buffer.write_clips_gpu(&mut buffers.clips);
-        buffers.geometry.clear();
-        buffers.geometry.extend_from_slice(buffer.geometry());
-        Self {
-            instances: buffers.instances,
-            ops: buffers.ops,
-            clips: buffers.clips,
-            geometry: buffers.geometry,
-        }
-    }
-
-    /// 本帧的实例字节（`GpuPrimitive` 数组，128 B 布局）。
-    pub(crate) fn instances(&self) -> &[u8] {
-        &self.instances
-    }
-
-    /// 本帧的绘制序。
-    pub(crate) fn ops(&self) -> &[FrameOp] {
-        &self.ops
-    }
-
-    /// 本帧的裁剪表（GPU 布局，表项 0 是哨兵）。
-    pub(crate) fn clips(&self) -> &[GpuClipEntry] {
-        &self.clips
-    }
-
-    /// `FrameOp::Geometry.index` 的下标表（与 [`FramePayload::ops`] 同帧）。
-    pub(crate) fn geometry(&self) -> &[GeometryDrawGpu] {
-        &self.geometry
-    }
-
-    /// 空载荷（窗口首帧 priming 与槽位/线程单元测试用；真实帧必须走
-    /// [`FramePayload::from_buffer`]）。只有 Windows 的首帧 priming 在产品构建里需要它。
-    #[cfg(any(windows, test))]
-    pub(crate) fn empty() -> Self {
-        Self {
-            instances: Vec::new(),
-            ops: Vec::new(),
-            clips: Vec::new(),
-            geometry: Vec::new(),
-        }
-    }
-}
-
 impl Drop for FramePayload {
     fn drop(&mut self) {
         // 只回收有容量的缓冲：`empty()` 的零容量帧不占池位。
-        if self.instances.capacity() == 0
+        if self.chunks.capacity() == 0
             && self.ops.capacity() == 0
             && self.clips.capacity() == 0
             && self.geometry.capacity() == 0
@@ -132,7 +256,7 @@ impl Drop for FramePayload {
             return;
         }
         pool.push(PayloadBuffers {
-            instances: std::mem::take(&mut self.instances),
+            chunks: std::mem::take(&mut self.chunks),
             ops: std::mem::take(&mut self.ops),
             clips: std::mem::take(&mut self.clips),
             geometry: std::mem::take(&mut self.geometry),
@@ -211,14 +335,19 @@ impl LatestFrame {
 
     /// 放入一帧；已有未取走的帧时保留**新**的 payload/surface，把旧的 damage 合并进新的
     /// plan（[`Plan::merge`]），旧请求的 `index` 丢弃 —— 它不会产生任何 GPU 工作。
+    ///
+    /// **实例增量同样必须合并**（否则被覆盖帧的变化永远到不了 GPU）：旧载荷的块按「旧 → 新」
+    /// 的顺序并进新载荷（[`FramePayload::absorb`]），GPU 线程写缓冲时按顺序覆盖，内容与
+    /// 「只交付新帧」逐字节一致。
     pub(crate) fn publish(&mut self, request: FrameRequest) {
-        let Some(previous) = self.pending.as_mut() else {
+        let Some(previous) = self.pending.take() else {
             self.pending = Some(request);
             return;
         };
         let mut next = request;
         next.plan = previous.plan.merge(next.plan);
-        *previous = next;
+        next.payload.absorb(previous.payload);
+        self.pending = Some(next);
     }
 
     /// 取走当前帧（没有则 `None`）。
@@ -230,6 +359,211 @@ impl LatestFrame {
     pub(crate) fn has_pending(&self) -> bool {
         self.pending.is_some()
     }
+}
+
+/// 单槽欠账区间数上限：超过就整块重写（代价封顶，不让欠账表无限增长）。
+const MAX_PENDING_RANGES: usize = 128;
+
+/// GPU 线程侧的持久实例镜像（三平台共用：纯数据 + 纯逻辑，不碰平台句柄）。
+///
+/// 每个 in-flight 槽的实例缓冲是**持久**的（只扩容，不按帧重写全部内容）：本帧只把变化的
+/// 区间写进去，未变化的段保留该槽上次的内容。三个槽各自落后于镜像不同的帧，因此每个槽记一份
+/// 「欠账区间」；写某个槽时把欠账一次性从镜像补上（欠账来自**别的**槽的帧，字节仍保存在镜像
+/// 里）。这是「帧间增量实例编码」在 GPU 线程侧的落点：payload 只带变化段
+/// （[`FramePayload::chunks`]），镜像负责把它们补齐到每个槽。
+///
+/// **为什么需要镜像**：载荷之间是增量关系，而被覆盖的帧（[`LatestFrame`]）不会到达 GPU；
+/// 另外槽是轮转使用的，A 槽写过的字节 B 槽没见过。镜像 + 每槽欠账把这两件事一起解决，
+/// 且写 GPU 缓冲时永远只写**当前槽** —— 绝不写别的在飞槽（那会与 GPU 读并发）。
+pub(crate) struct InstanceMirror {
+    /// 完整实例字节（长度 = `instance_count × 128`）。
+    bytes: Vec<u8>,
+    slots: Vec<SlotMirror>,
+    /// 本帧要写进当前槽的区间（[`InstanceMirror::prepare`] 填充）。
+    writes: Vec<Range<u32>>,
+    /// 本帧是否整块写（首帧 / 扩容重建 / 欠账太多）。
+    write_full: bool,
+    /// 本帧载荷覆盖的区间（已合并；[`InstanceMirror::finish`] 把它们记为其它槽的欠账）。
+    payload_ranges: Vec<Range<u32>>,
+}
+
+/// 一个槽的欠账。
+struct SlotMirror {
+    /// 该槽缓冲需要整块重写（新建 / 扩容重建 / 欠账溢出）。
+    needs_full: bool,
+    /// 该槽缓冲落后于镜像的区间（无序、已合并的小表）。
+    pending: Vec<Range<u32>>,
+}
+
+impl InstanceMirror {
+    pub(crate) fn new(slots: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            slots: (0..slots)
+                .map(|_| SlotMirror {
+                    needs_full: true,
+                    pending: Vec::new(),
+                })
+                .collect(),
+            writes: Vec::new(),
+            write_full: false,
+            payload_ranges: Vec::new(),
+        }
+    }
+
+    /// 槽缓冲被重建（扩容 / 设备恢复）：内容丢失，下一次使用必须整块重写。
+    pub(crate) fn invalidate(&mut self, slot: usize) {
+        let state = &mut self.slots[slot];
+        state.needs_full = true;
+        state.pending.clear();
+    }
+
+    /// 应用本帧载荷进镜像，并算出「当前槽要写哪些区间」。
+    ///
+    /// 返回 `true` = 整块写（此时 [`InstanceMirror::bytes`] 就是全部内容，长度足以覆盖当前槽）；
+    /// `false` = 只写 [`InstanceMirror::writes`] 里的区间。
+    pub(crate) fn prepare(&mut self, slot: usize, payload: &FramePayload) -> bool {
+        let Self {
+            bytes,
+            slots,
+            writes,
+            write_full,
+            payload_ranges,
+        } = self;
+        let count = payload.instance_count();
+        let needed = count as usize * INSTANCE_BYTES;
+        if bytes.len() < needed {
+            bytes.resize(needed, 0);
+        } else {
+            bytes.truncate(needed);
+        }
+        // 应用本帧载荷（顺序 = 旧 → 新，重叠区间后者覆盖）。
+        payload_ranges.clear();
+        for chunk in payload.chunks() {
+            let range = chunk.range();
+            let start = range.start as usize * INSTANCE_BYTES;
+            let end = start + chunk.bytes.len();
+            debug_assert!(
+                end <= bytes.len(),
+                "payload chunk escapes the instance arena"
+            );
+            if end > bytes.len() {
+                continue;
+            }
+            bytes[start..end].copy_from_slice(&chunk.bytes);
+            payload_ranges.push(range);
+        }
+        normalize_ranges(payload_ranges);
+        // 镜像缩短时，越界的欠账一并丢弃（它们指向的段已不存在）。
+        for state in slots.iter_mut() {
+            state
+                .pending
+                .retain(|range| range.start < count && range.end <= count);
+        }
+        writes.clear();
+        *write_full = false;
+        let state = &mut slots[slot];
+        let outstanding: u32 = state
+            .pending
+            .iter()
+            .map(|range| range.end - range.start)
+            .sum();
+        // 整块写与区间写的取舍：欠账已经超过半个实例环时，整块 memcpy 更快。
+        if state.needs_full || outstanding.saturating_mul(2) >= count {
+            *write_full = true;
+            return true;
+        }
+        writes.extend(state.pending.iter().cloned());
+        writes.extend(payload_ranges.iter().cloned());
+        normalize_ranges(writes);
+        let written: u32 = writes.iter().map(|range| range.end - range.start).sum();
+        if written.saturating_mul(2) >= count {
+            *write_full = true;
+        }
+        *write_full
+    }
+
+    /// 本帧要写进当前槽的区间（`prepare` 返回 `false` 时有效）。
+    pub(crate) fn writes(&self) -> &[Range<u32>] {
+        &self.writes
+    }
+
+    /// 镜像的完整实例字节（`prepare` 返回 `true` 时，整块写它的前 `instance_count × 128` 字节）。
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// 当前槽写完之后推进记账：本帧载荷覆盖的区间记到其它槽的欠账里。
+    ///
+    /// **为什么不按「本帧是否整块写」传播 `needs_full`**：整块写可能只是因为**当前槽自己**
+    /// 的缓冲是新建的（首帧）或欠账太多，与其它槽无关；它们的欠账永远等于
+    /// 「本帧载荷覆盖的区间」—— 载荷的旧块（例如全量基准块）同样必须补写到每个槽，
+    /// 因为它才是该槽内容的来源。
+    pub(crate) fn finish(&mut self, slot: usize) {
+        let Self {
+            slots,
+            write_full,
+            payload_ranges,
+            writes,
+            ..
+        } = self;
+        for (index, state) in slots.iter_mut().enumerate() {
+            if index == slot {
+                state.needs_full = false;
+                state.pending.clear();
+                continue;
+            }
+            for range in payload_ranges.iter() {
+                push_range(&mut state.pending, range.clone());
+            }
+            if state.pending.len() > MAX_PENDING_RANGES {
+                state.needs_full = true;
+                state.pending.clear();
+            }
+        }
+        writes.clear();
+        *write_full = false;
+    }
+}
+
+/// 把一个区间并入「无序、已合并」的欠账表（先向前合并所有重叠/相邻项）。
+fn push_range(ranges: &mut Vec<Range<u32>>, range: Range<u32>) {
+    if range.is_empty() {
+        return;
+    }
+    let mut start = range.start;
+    let mut end = range.end;
+    let mut index = 0usize;
+    while index < ranges.len() {
+        let current = &ranges[index];
+        if current.end < start || current.start > end {
+            index += 1;
+            continue;
+        }
+        start = start.min(current.start);
+        end = end.max(current.end);
+        ranges.remove(index);
+    }
+    ranges.push(start..end);
+}
+
+/// 排序 + 合并重叠/相邻区间（原地，容量保留）。
+fn normalize_ranges(ranges: &mut Vec<Range<u32>>) {
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut out = 0usize;
+    for read in 0..ranges.len() {
+        let range = ranges[read].clone();
+        if out > 0 {
+            let last = &mut ranges[out - 1];
+            if range.start <= last.end {
+                last.end = last.end.max(range.end);
+                continue;
+            }
+        }
+        ranges[out] = range;
+        out += 1;
+    }
+    ranges.truncate(out);
 }
 
 /// in-flight 帧数（主设计 §2.4；同步提交下实际最多 1 帧在飞，但 ring 结构不依赖这一点）。
@@ -320,11 +654,11 @@ impl InFlightRing {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::{sync::Arc, time::Instant};
 
     use super::{
-        FramePayload, FrameRequest, FrameSlot, InFlightRing, LatestFrame, MAX_FRAMES_IN_FLIGHT,
-        pool_lock,
+        FramePayload, FrameRequest, FrameSlot, InFlightRing, InstanceChunk, InstanceMirror,
+        LatestFrame, MAX_FRAMES_IN_FLIGHT, pool_lock,
     };
     use crate::{
         math::PhysicalRect,
@@ -337,17 +671,17 @@ mod tests {
     fn a_dropped_payload_returns_its_buffers_to_the_pool() {
         // 回收池是跨线程的：GPU 线程 drop 帧后，UI 线程下一帧直接复用容量（F-213）。
         let mut seeded = super::PayloadBuffers::default();
-        seeded.instances.reserve(4096);
+        seeded.chunks.reserve(4096);
         pool_lock().push(seeded);
 
         let encoder = InstanceEncoder::new();
-        let payload = FramePayload::from_buffer(encoder.buffer());
-        let capacity = payload.instances.capacity();
+        let payload = FramePayload::full(encoder.buffer());
+        let capacity = payload.chunks.capacity();
         assert!(capacity >= 4096, "from_buffer 必须复用池里的容量");
         drop(payload);
         let pooled = pool_lock()
             .iter()
-            .map(|buffers| buffers.instances.capacity())
+            .map(|buffers| buffers.chunks.capacity())
             .max();
         assert!(
             pooled.is_some_and(|pooled| pooled >= capacity),
@@ -647,5 +981,150 @@ mod tests {
             "destination 与 buffer 必须同帧成对"
         );
         assert_eq!(frame.buffer_scale, 2, "buffer scale 与 buffer 必须同帧成对");
+    }
+    // ── B6：实例增量载荷 + GPU 线程侧的持久镜像 ─────────────────────────────
+
+    /// 构造一份载荷：`chunks` 是 `(实例下标, 字节)`，`count` 是实例环总数。
+    fn manual_payload(chunks: &[(u32, &[u8])], count: u32) -> FramePayload {
+        FramePayload {
+            chunks: chunks
+                .iter()
+                .map(|(start, bytes)| InstanceChunk {
+                    start: *start,
+                    bytes: Arc::from(*bytes),
+                })
+                .collect(),
+            instance_count: count,
+            drawn_instances: count,
+            ops: Vec::new(),
+            clips: Vec::new(),
+            geometry: Vec::new(),
+        }
+    }
+
+    /// 按镜像的写计划把内容写进一块**模拟的** GPU 缓冲（与三个后端 `write` 同一逻辑）。
+    fn apply_mirror(mirror: &InstanceMirror, full: bool, target: &mut [u8]) {
+        if full {
+            target.copy_from_slice(&mirror.bytes()[..target.len()]);
+            return;
+        }
+        for range in mirror.writes() {
+            let start = range.start as usize * 128;
+            let end = range.end as usize * 128;
+            target[start..end].copy_from_slice(&mirror.bytes()[start..end]);
+        }
+    }
+
+    /// 被覆盖帧的实例块必须并进后继帧（旧 → 新），否则那段变化永远到不了 GPU。
+    #[test]
+    fn a_replaced_frame_absorbs_its_instance_chunks() {
+        // 生产路径：`next.payload.absorb(previous.payload)`（self = 新帧）。
+        let mut newer = manual_payload(&[(0, &[9u8; 128])], 8);
+        let older = manual_payload(&[(2, &[7u8; 256])], 8);
+        newer.absorb(older);
+        let starts: Vec<u32> = newer.chunks.iter().map(|chunk| chunk.start).collect();
+        assert_eq!(
+            starts,
+            vec![2, 0],
+            "应用顺序必须是「旧块在前、新块在后」（重叠时新块覆盖）"
+        );
+    }
+
+    /// 旧块被新块**完整覆盖**时直接丢弃（新块是最新版本）。
+    #[test]
+    fn absorb_drops_chunks_fully_covered_by_newer_bytes() {
+        let mut newer = manual_payload(&[(0, &[2u8; 512])], 8);
+        let older = manual_payload(&[(1, &[1u8; 256])], 8);
+        newer.absorb(older);
+        assert_eq!(
+            newer.chunks.len(),
+            1,
+            "被覆盖的旧块必须丢掉：{:?}",
+            newer
+                .chunks
+                .iter()
+                .map(InstanceChunk::range)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(newer.chunks[0].start, 0);
+    }
+
+    /// 最新帧槽被覆盖时，增量块与 damage 一起合并（旧帧不产生 GPU 工作，但它的变化不能丢）。
+    #[test]
+    fn replacing_a_pending_frame_merges_its_instance_chunks() {
+        let mut slot = LatestFrame::new();
+        let mut first = request(1, Plan::Full);
+        first.payload = manual_payload(&[(4, &[1u8; 128])], 8);
+        slot.publish(first);
+        let mut second = request(2, partial(&[PhysicalRect::new(0, 0, 8, 8)]));
+        second.payload = manual_payload(&[(0, &[2u8; 128])], 8);
+        slot.publish(second);
+
+        let frame = slot.take().expect("latest frame");
+        assert_eq!(frame.index.get(), 2, "新序号胜出");
+        let starts: Vec<u32> = frame.payload.chunks().iter().map(|c| c.start).collect();
+        assert_eq!(starts, vec![4, 0], "旧帧的实例块必须并进新帧");
+    }
+
+    /// 镜像：三个槽轮转使用时，每个槽被写入之后都必须与镜像的完整内容一致。
+    #[test]
+    fn the_instance_mirror_converges_every_slot_after_rotation() {
+        let mut mirror = InstanceMirror::new(3);
+        // 16 个实例；首帧写整表，之后只改 1~2 个实例（凑出「欠账 + 本帧变化」的合并）。
+        let first = manual_payload(&[(0, &[1u8; 16 * 128])], 16);
+        assert!(mirror.prepare(0, &first), "从未写过的槽必须整块写");
+        let mut gpu = [
+            vec![0u8; 16 * 128],
+            vec![0u8; 16 * 128],
+            vec![0u8; 16 * 128],
+        ];
+        apply_mirror(&mirror, true, &mut gpu[0]);
+        mirror.finish(0);
+        assert_eq!(gpu[0], mirror.bytes(), "槽 0 与镜像一致");
+
+        // 第二帧用槽 1（它也没写过）⇒ 整块写；镜像 = 首帧 + 本帧变化。
+        let second = manual_payload(&[(3, &[2u8; 128])], 16);
+        assert!(mirror.prepare(1, &second));
+        apply_mirror(&mirror, true, &mut gpu[1]);
+        mirror.finish(1);
+        assert_eq!(gpu[1], mirror.bytes());
+
+        // 第三帧回到槽 0：它欠着「槽 1 那一帧的 3..4」，本帧再改 0..1 ⇒ 只写这两段。
+        let third = manual_payload(&[(0, &[3u8; 128])], 16);
+        assert!(!mirror.prepare(0, &third), "欠账 + 本帧变化不足以整块写");
+        let writes: Vec<std::ops::Range<u32>> = mirror.writes().to_vec();
+        assert_eq!(writes, vec![0..1, 3..4], "只写「欠账 ∪ 本帧变化」的区间");
+        apply_mirror(&mirror, false, &mut gpu[0]);
+        mirror.finish(0);
+        assert_eq!(gpu[0], mirror.bytes(), "增量补写之后槽 0 与镜像一致");
+
+        // 槽 2 第一次用：整块写，内容同样是镜像全量（含前几帧的所有变化）。
+        let fourth = manual_payload(&[(8, &[4u8; 128])], 16);
+        assert!(mirror.prepare(2, &fourth));
+        apply_mirror(&mirror, true, &mut gpu[2]);
+        mirror.finish(2);
+        assert_eq!(gpu[2], mirror.bytes());
+        // 镜像内容：0..1 = 3、3..4 = 2、8..9 = 4、其余 = 1。
+        assert_eq!(mirror.bytes()[0], 3);
+        assert_eq!(mirror.bytes()[128 * 3], 2);
+        assert_eq!(mirror.bytes()[128 * 8], 4);
+        assert_eq!(mirror.bytes()[128 * 5], 1);
+    }
+
+    /// 槽缓冲被重建（扩容 / 设备恢复）之后必须整块重写，不能沿用旧欠账。
+    #[test]
+    fn an_invalidated_slot_is_rewritten_in_full() {
+        let mut mirror = InstanceMirror::new(1);
+        let first = manual_payload(&[(0, &[5u8; 4 * 128])], 4);
+        assert!(mirror.prepare(0, &first));
+        mirror.finish(0);
+        // 无变化的一帧：正常路径不会整块写。
+        let idle = manual_payload(&[], 4);
+        assert!(!mirror.prepare(0, &idle));
+        mirror.finish(0);
+        // 缓冲重建 ⇒ 整块写。
+        mirror.invalidate(0);
+        assert!(mirror.prepare(0, &idle), "重构过的槽必须整块重写");
+        mirror.finish(0);
     }
 }

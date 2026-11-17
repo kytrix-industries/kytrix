@@ -57,12 +57,12 @@ use crate::render::compositor::Plan;
 use crate::render::windows::readback::{Readback, ReadbackImage};
 use crate::{
     error::EngineError,
-    paint::{atlas::AtlasKind, instance::GpuClipEntry},
+    paint::atlas::AtlasKind,
     platform::windows::composition::{self, Composition, buffer_size},
     render::{
         RenderStats,
         compositor::{DamageRects, FramePlan},
-        frame::{FramePayload, FrameRequest, FrameSlot},
+        frame::{FramePayload, FrameRequest, FrameSlot, InstanceMirror, MAX_FRAMES_IN_FLIGHT},
         retire::GpuResourceHandle,
         timer::{FrameTimings, GpuTimerSample},
         windows::{
@@ -126,6 +126,8 @@ pub(crate) struct GpuRenderer {
     atlas_uploads: AtlasUploads,
     persist: Persist,
     upload: UploadArena,
+    /// 实例缓冲的持久镜像（增量写：只写变化区间，见 `render/frame.rs` 的 `InstanceMirror`）。
+    mirror: InstanceMirror,
     geometry: GeometryRegistry,
     timer: Option<GpuTimer>,
     /// 内容层组合交换链（窗口路径）。尺寸变化走 `ResizeBuffers`（R08-1）。
@@ -279,6 +281,7 @@ impl GpuRenderer {
         let size = (size.0.max(1), size.1.max(1));
         let persist = Persist::new(&shared, size, rtv)?;
         let upload = UploadArena::new(&shared)?;
+        let mirror = InstanceMirror::new(MAX_FRAMES_IN_FLIGHT);
         let timer = GpuTimer::new(&shared, &stream)?;
 
         Ok(Self {
@@ -288,6 +291,7 @@ impl GpuRenderer {
             atlas_uploads: AtlasUploads::new(),
             persist,
             upload,
+            mirror,
             geometry: GeometryRegistry::new(),
             timer,
             swapchain: None,
@@ -472,7 +476,7 @@ impl GpuRenderer {
         frame: &mut FramePlan,
         timings: &mut FrameTimings,
     ) -> Result<RenderStats, EngineError> {
-        let payload = FramePayload::from_buffer(buffer);
+        let payload = FramePayload::full(buffer);
         self.submit_snapshot(index, &payload, frame, timings)
     }
 
@@ -706,6 +710,8 @@ struct FrameRecorder<'a> {
     atlas_uploads: &'a mut AtlasUploads,
     persist: &'a Persist,
     upload: &'a mut UploadArena,
+    /// GPU 线程侧的持久实例镜像（本帧只写变化区间）。
+    mirror: &'a mut InstanceMirror,
     geometry: &'a mut GeometryRegistry,
     timer: Option<&'a GpuTimer>,
     /// 内容层交换链（离屏目标为 `None`：既不能直绘，也没有 present）。
@@ -809,17 +815,17 @@ impl UploadArena {
         }
     }
 
-    /// 实现在 `upload::write_uploads`（薄委托）。
+    /// 实现在 `upload::write_uploads`（薄委托）：实例走增量写（持久镜像），裁剪表全量写。
     fn write(
         &mut self,
+        mirror: &mut InstanceMirror,
         shared: &SharedGpu,
         stream: &mut CommandStream,
         index: FrameIndex,
         slot: usize,
-        instances: &[u8],
-        clips: &[GpuClipEntry],
+        payload: &FramePayload,
     ) -> Result<(u32, u32), EngineError> {
-        upload::write_uploads(self, shared, stream, index, slot, instances, clips)
+        upload::write_uploads(self, mirror, shared, stream, index, slot, payload)
     }
 }
 

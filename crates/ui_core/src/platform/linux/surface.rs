@@ -91,16 +91,10 @@ use crate::{
     math::{Point, Rect, Scale, Size},
     paint::style::Cursor,
     platform::{
-        linux::{
-            clipboard::Clipboard,
-            cursor::CursorManager,
-            dpi,
-            frame_gate::{CallbackToken, FrameGate},
-            ime::ImeState,
-            window,
-        },
+        linux::{clipboard::Clipboard, cursor::CursorManager, dpi, ime::ImeState, window},
         wayland::{
-            text_input::{self, ContentTypeBits, TextInputRoute},
+            frame_gate::{CallbackToken, FrameGate},
+            text_input::{self, ImeStateSnapshot, TextInputRoute},
             toplevel::{
                 self, DecorationMode, ToplevelStates, Visibility, WindowGeometry, WmCapabilities,
             },
@@ -255,10 +249,11 @@ struct WindowSurface {
     toplevel: xdg_toplevel::XdgToplevel,
     /// 应用声明的 IME caret 区域（surface 逻辑坐标；`None` = 无 hint）。
     ime_cursor_area: Option<Rect>,
-    /// 最近一次实际下发给 `zwp_text_input_v3` 的区域（含 None 回退）。
-    ime_cursor_applied: Option<Rect>,
-    /// 最近一次下发的 `content_type`（`None` = 还没发过；变化时才重发，R10-12）。
-    ime_content_applied: Option<ContentTypeBits>,
+    /// **上次已提交**的 text-input 状态快照（`set_cursor_rectangle` + `set_content_type`）。
+    ///
+    /// `done` 里回写的判据：只有当前状态与它不同才允许再 `commit()`（AR3 §3.3）；`None` ⇒
+    /// 还没提交过（`enable()` 之后必须整份重发，R10-12 / R10-13）。
+    ime_applied: Option<ImeStateSnapshot>,
     /// 应用声明的文本输入语义（密码 / PIN 必须开 `sensitive_data`，R10-12）。
     ime_content: crate::window::ImeContentType,
     /// 本窗口的 IME 批次状态（`done` 时原子生效；**每窗口一份**，R10-6）。
@@ -316,12 +311,13 @@ struct WindowSurface {
     /// 指针进入本窗口时应使用的光标（应用通过 `take_cursor_change` 设置，R10-3）。
     cursor: Cursor,
     close_requested: bool,
-    /// 帧节流：上一次请求的 `wl_callback` 回来之前不再提交（Idle / 超时兜底见 `frame_gate`）。
+    /// 帧节流：上一次请求的 `wl_callback` 回来之前不再提交（Idle / 可见性见 `frame_gate`）。
     frame_gate: FrameGate,
     /// 最近一次 `wl_surface.frame` 的回调对象 id 与门禁令牌。
     ///
-    /// 门禁的活性兜底会放弃旧 callback 再挂新的；回调事件只带自己这个对象，因此靠 id 区分
-    /// 「当前请求的 callback」与「被兜底放弃、迟到的旧 callback」，令牌只对匹配的回调生效。
+    /// `force_idle`（窗口转不可见）会放弃旧 callback 再挂新的；回调事件只带自己这个对象，
+    /// 因此靠 id 区分「当前请求的 callback」与「被放弃、迟到的旧 callback」，令牌只对匹配的
+    /// 回调生效。
     frame_callback: Option<(ObjectId, CallbackToken)>,
 }
 
@@ -636,8 +632,7 @@ impl WaylandState {
             xdg_surface,
             toplevel,
             ime_cursor_area: None,
-            ime_cursor_applied: None,
-            ime_content_applied: None,
+            ime_applied: None,
             ime_content: crate::window::ImeContentType::Text,
             ime: ImeState::new(),
             fractional,
@@ -972,6 +967,11 @@ impl WaylandState {
     /// 参数是 surface-local 逻辑像素，扣除 CSD 阴影边距（当前无阴影 ⇒ 整个 surface）。
     /// window geometry 是**双缓冲状态**：本次调用在 GPU 线程的下一次 commit 里生效，
     /// 因此它必须发生在 `request_frame`/`app.frame` 之前（`add_window` / configure 里都是）。
+    ///
+    /// 与之配对的 `wl_surface.set_input_region` / `set_opaque_region`（R10-11）本仓**有意不设**：
+    /// 当前 geometry 等于整个 surface、且 surface 里没有「视觉上不存在」的像素，协议的默认值
+    /// （整个 surface 都是输入区）恰好正确。取舍依据、残留风险与四个触发条件见
+    /// [`window`]（`platform/linux/window.rs`）的模块文档。
     fn apply_window_geometry(&mut self, index: usize) {
         let geometry = toplevel::window_geometry(self.windows[index].size, window::SHADOW_MARGIN);
         if self.windows[index].geometry == Some(geometry) {
@@ -1095,7 +1095,7 @@ impl WaylandState {
 
     /// 请求一帧回调（publish 之前调用；已有挂起 callback 时只关好门禁，不重复请求）。
     pub(crate) fn request_frame(&mut self, index: usize) {
-        let Some(token) = self.windows[index].frame_gate.request(Instant::now()) else {
+        let Some(token) = self.windows[index].frame_gate.request() else {
             return;
         };
         let callback = self.windows[index].surface.frame(&self.queue_handle, ());
@@ -1111,30 +1111,16 @@ impl WaylandState {
         self.windows[index].frame_gate.note_not_committed();
     }
 
-    /// 活性兜底：可见窗口里门禁关闭超过 `GATE_TIMEOUT` 时强制打开。
+    /// 可见性变化后的门禁同步（R10-7）：不可见 ⇒ 门禁直接回 Idle，不留挂起记录。
     ///
-    /// 只覆盖「publish 了但没 commit」（present `OUT_OF_DATE` 等），正常路径不会触发；
-    /// **不是**呈现节奏（F-183）。**不可见的窗口不参与**（R10-7）：协议允许服务端在 surface
-    /// 不可见时不回 callback，若继续计时，隐藏窗口会永远以 5 Hz 全量重绘（并持续 commit）。
-    /// 不可见窗口的门禁被直接置为 Idle（不留下「关闭中」的状态与计时）。
-    pub(crate) fn expire_frame_gates(&mut self, now: Instant) -> bool {
-        let mut expired = false;
-        for index in 0..self.windows.len() {
-            if !self.is_visible(index) {
-                self.windows[index].frame_gate.force_idle();
-                continue;
-            }
-            expired |= self.windows[index].frame_gate.expire(now);
+    /// 协议允许服务端在 surface 不可见时不回 `wl_frame_callback`；而**没有**任何基于时间的
+    /// 兜底（AR3 §3.7），所以「不可见」必须在这两个入口（`wl_surface.leave` /
+    /// `xdg_toplevel.configure` 的 `Suspended`）当场把门禁归位，否则一个在不可见之前发出的
+    /// callback 永远不回来，窗口重新可见时会卡在「门禁关闭」上再也不出帧。
+    fn sync_frame_gate_visibility(&mut self, index: usize) {
+        if !self.is_visible(index) {
+            self.windows[index].frame_gate.force_idle();
         }
-        expired
-    }
-
-    /// 可见窗口里最早的活性兜底期限（门禁全开时 `None`）；事件循环用它压缩阻塞等待。
-    pub(crate) fn frame_gate_remaining(&self, now: Instant) -> Option<Duration> {
-        (0..self.windows.len())
-            .filter(|index| self.is_visible(*index))
-            .filter_map(|index| self.windows[index].frame_gate.time_until_expiry(now))
-            .min()
     }
 
     /// 把 text-input 焦点切到 `target`（`None` = 停用），按**差分**下发 `enable`/`disable`。
@@ -1165,45 +1151,67 @@ impl WaylandState {
         {
             text_input.enable();
             // XML `set_content_type` / `set_cursor_rectangle`：状态「保持到下一次 commit 的
-            // enable/disable 为止」⇒ 新 enable 之后必须重发（缓存清空）。
-            self.windows[index].ime_cursor_applied = None;
-            self.windows[index].ime_content_applied = None;
+            // enable/disable 为止」⇒ 新 enable 之后必须重发（快照清空）。
+            self.windows[index].ime_applied = None;
             self.push_ime_state(index, &text_input);
         }
+        // `enable` / `disable` 本身也要 `commit()` 才生效（与上面的状态合成同一批）。
         text_input.commit();
         self.text_input_route.note_commit();
     }
 
-    /// 下发该窗口的 IME 状态（caret 矩形 + `content_type`），变化才发（R10-12）。
+    /// 下发该窗口**攒下的** IME 状态（caret 矩形 + `content_type`），返回是否真的写了新的。
     ///
     /// 调用方保证当前 text-input 焦点就是这个窗口（`leave` 之后的请求会被 compositor 忽略）。
-    fn push_ime_state(&mut self, index: usize, text_input: &ZwpTextInputV3) {
-        let area = self.windows[index]
-            .ime_cursor_area
-            .unwrap_or_else(|| Rect::new(0.0, 0.0, 1.0, 1.0));
-        if self.windows[index].ime_cursor_applied != Some(area) {
-            text_input.set_cursor_rectangle(
-                area.origin.x.round() as i32,
-                area.origin.y.round() as i32,
-                area.size.width.max(1.0).round() as i32,
-                area.size.height.max(1.0).round() as i32,
-            );
-            self.windows[index].ime_cursor_applied = Some(area);
+    /// 差异判定在纯逻辑层（`ImeStateSnapshot::diff_from`，AR3 §3.3）：**没有差异就什么都没写**，
+    /// 调用方因此不能再 `commit()`（否则每个 `done` 都会制造下一次 `done`）。返回值就是
+    /// `diff_from().is_some()`。
+    fn push_ime_state(&mut self, index: usize, text_input: &ZwpTextInputV3) -> bool {
+        let current = ImeStateSnapshot {
+            cursor_area: self.windows[index].ime_cursor_area,
+            content: text_input::content_type_bits(self.windows[index].ime_content),
+        };
+        let Some(diff) = current.diff_from(self.windows[index].ime_applied) else {
+            return false;
+        };
+        if let Some((x, y, width, height)) = diff.cursor_rect {
+            text_input.set_cursor_rectangle(x, y, width, height);
         }
         // 密码 / API key 输入框：`hidden_text | sensitive_data`（输入法不得存词库）。
-        let content = self.windows[index].ime_content;
-        let bits = text_input::content_type_bits(content);
-        if self.windows[index].ime_content_applied != Some(bits) {
+        if let Some(bits) = diff.content {
             text_input.set_content_type(
                 zwp_text_input_v3::ContentHint::from_bits_truncate(bits.hint),
                 zwp_text_input_v3::ContentPurpose::try_from(bits.purpose)
                     .unwrap_or(zwp_text_input_v3::ContentPurpose::Normal),
             );
-            self.windows[index].ime_content_applied = Some(bits);
         }
+        self.windows[index].ime_applied = Some(current);
+        true
     }
 
-    /// 保存 IME caret 区域；焦点正是这个窗口时立即下发（`commit` 是 v3 的生效点）。
+    /// 把攒下的 IME 状态推给 compositor 并 `commit()`：**真的写了新状态才提交**。
+    ///
+    /// `commit()` 次数是 `done.serial` 的期望值（`text_input_route.note_commit`），所以「没有
+    /// 新状态」时既不能发请求也不能计数（AR3 §3.3 的自激就长在这里）。
+    fn flush_ime_state(&mut self, index: usize, text_input: &ZwpTextInputV3) -> bool {
+        if !self.push_ime_state(index, text_input) {
+            return false;
+        }
+        text_input.commit();
+        // `commit()` 次数是 `done.serial` 的期望值；不计数就无法在 `done` 里判断「compositor
+        // 是否已经应用了我们上一批状态」（R10-13 问题 2）。
+        self.text_input_route.note_commit();
+        true
+    }
+
+    /// 保存 IME caret 区域；焦点正是这个窗口时下发（`commit` 是 v3 的生效点）。
+    ///
+    /// 有批在飞时**只记账、不提交**：协议要求 pending state 在收到匹配 serial 的 `done` 之后
+    /// 再发（AR3 §3.3），由 `done` 处理器统一回写；这同时把「一次焦点切换」的协议往返压到一轮。
+    ///
+    /// 依赖 compositor 遵守「每个 `commit()` 回一条 `done`」（协议硬要求）。违约的 compositor
+    /// 会让 caret 更新停在上一批 —— 同一条违约也意味着 `commit_string` 永远不生效（IME 文本
+    /// 根本用不了），因此这不是本状态机新引入的失效面。
     fn set_ime_cursor_area(
         &mut self,
         index: usize,
@@ -1221,14 +1229,13 @@ impl WaylandState {
         if self.text_input_route.focus() != Some(index as u32) {
             return;
         }
+        if self.text_input_route.commit_in_flight() {
+            return;
+        }
         let Some(text_input) = self.text_input.clone() else {
             return;
         };
-        self.push_ime_state(index, &text_input);
-        text_input.commit();
-        // `commit()` 次数是 `done.serial` 的期望值；不计数就无法在 `done` 里判断「compositor
-        // 是否已经应用了我们上一批状态」（R10-13 问题 2）。
-        self.text_input_route.note_commit();
+        self.flush_ime_state(index, &text_input);
     }
 
     /// 从 `App` 同步指定窗口的 IME caret 区域与 `content_type`（每轮泵逐窗口调用）。
@@ -1253,7 +1260,8 @@ impl WaylandState {
 
     /// 无输入法守护进程时的降级判定（R10-2）；返回 `true` ⇒ 文本通路已切回键盘。
     ///
-    /// 判据在 [`TextInputRoute`]：`enable` 之后 1.5 s 内没有任何 IM 事件 ⇒ 本 seat 没有引擎。
+    /// 判据在 [`TextInputRoute`]：本进程首次 `enable` 之后 1.5 s 内没有任何 IM 事件 ⇒ 本 seat
+    /// 没有引擎。计时与降级状态都按 **seat** 记账，换焦点不重置（AR3 §3.2）。
     pub(crate) fn degrade_text_input_if_silent(&mut self, now: Instant) -> bool {
         if !self.text_input_route.should_degrade(now) {
             return false;
@@ -1680,8 +1688,8 @@ impl Dispatch<wl_surface::WlSurface, ()> for WaylandState {
                 state.windows[index].entered_once = true;
                 state.recompute_scale(index);
                 // R10-7：重新可见 ⇒ 门禁与帧驱动恢复，主动补一帧（不可见期间我们不请求帧）。
-                let visible = state.is_visible(index);
-                if visible {
+                state.sync_frame_gate_visibility(index);
+                if state.is_visible(index) {
                     state.redraw = true;
                 }
             }
@@ -1691,10 +1699,8 @@ impl Dispatch<wl_surface::WlSurface, ()> for WaylandState {
                     .surface_outputs
                     .retain(|entered| *entered != id);
                 state.recompute_scale(index);
-                // 离开全部 output ⇒ 不可见：门禁回到 Idle（不保留兜底计时，R10-7）。
-                if !state.is_visible(index) {
-                    state.windows[index].frame_gate.force_idle();
-                }
+                // 离开全部 output ⇒ 不可见：门禁回到 Idle（不留挂起 callback，R10-7）。
+                state.sync_frame_gate_visibility(index);
             }
             wl_surface::Event::PreferredBufferScale { factor } => {
                 state.windows[index].preferred_buffer_scale = Some(factor.max(1));
@@ -1803,9 +1809,13 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandState {
                 if size != previous || !was_configured {
                     state.events.push((window, Event::Resized { size }));
                 }
-                // 可见性可能刚变化（`Suspended` 出现/消失）：恢复可见时要主动补一帧。
-                let visible = state.is_visible(index);
-                state.redraw |= visible;
+                // 可见性可能刚变化（`Suspended` 出现/消失）：不可见时门禁必须当场归位
+                // （否则不可见之前发出的 callback 永远不回来，恢复后卡在门禁关闭上），
+                // 恢复可见时主动补一帧。
+                state.sync_frame_gate_visibility(index);
+                if state.is_visible(index) {
+                    state.redraw = true;
+                }
             }
             xdg_toplevel::Event::WmCapabilities { capabilities } => {
                 // R10-15：compositor 声明的能力（枚举值列表，不是位掩码）。
@@ -2313,13 +2323,15 @@ impl Dispatch<ZwpTextInputV3, ()> for WaylandState {
                 for event in state.windows[index].ime.take_events() {
                     state.events.push((window, Event::Ime(event as ImeEvent)));
                 }
-                if matches {
+                if matches && let Some(text_input) = state.text_input.clone() {
                     // serial 对上：把攒下的状态（caret / content_type）发出去（R10-13 问题 2）。
-                    if let Some(text_input) = state.text_input.clone() {
-                        state.push_ime_state(index, &text_input);
-                        text_input.commit();
-                        state.text_input_route.note_commit();
-                    }
+                    //
+                    // **只在这批状态真的和上次已提交的快照不同时才 `commit()`**（AR3 §3.3）：
+                    // 协议保证 compositor 对每个 `commit()` 回一条 `done`，无条件回写就是
+                    // done → commit → done 的永久自激，事件循环被协议往返钉住、与 R10-7 的
+                    // 「空闲零唤醒」目标直接冲突。`flush_ime_state` 返回 `false` ⇒ 没有差异
+                    // ⇒ 这里什么都不发，自激终止。
+                    state.flush_ime_state(index, &text_input);
                 }
             }
             _ => {}

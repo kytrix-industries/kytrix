@@ -16,7 +16,7 @@ use crate::{
     error::EngineError,
     paint::{atlas::AtlasKind, instance::GpuClipEntry},
     render::{
-        frame::MAX_FRAMES_IN_FLIGHT,
+        frame::{FramePayload, InstanceMirror, MAX_FRAMES_IN_FLIGHT},
         windows::{
             device::{SharedGpu, init_error_from},
             queue::CommandStream,
@@ -74,16 +74,21 @@ pub(super) fn create_arena(shared: &SharedGpu) -> Result<UploadArena, EngineErro
 
 /// 消费者：`UploadArena::write`（`compositor.rs` 的薄委托）。
 /// 写入本帧的实例/裁剪字节；容量不够时扩容（旧缓冲交 retire 队列）。返回 `(实例数, 裁剪层数)`。
+///
+/// **实例是增量写**：`InstanceMirror` 持有完整实例字节，本帧只把「变化区间」（或整块，当该槽
+/// 需要整块重写时）拷进当前槽的 UPLOAD 缓冲；未变化的段保留该槽上次的内容。裁剪表仍然全量
+/// 写（它是小表，且表项索引必须与实例里内嵌的 `clip_index` 同帧一致）。
 pub(super) fn write_uploads(
     arena: &mut UploadArena,
+    mirror: &mut InstanceMirror,
     shared: &SharedGpu,
     stream: &mut CommandStream,
     index: FrameIndex,
     slot: usize,
-    instances: &[u8],
-    clips: &[GpuClipEntry],
+    payload: &FramePayload,
 ) -> Result<(u32, u32), EngineError> {
-    let instance_count = (instances.len() / 128) as u32;
+    let instance_count = payload.instance_count();
+    let clips = payload.clips();
     let clip_count = clips.len() as u32;
     let needs_instances = instance_count > arena.slots[slot].instance_capacity;
     if needs_instances {
@@ -97,6 +102,8 @@ pub(super) fn write_uploads(
         arena.slots[slot].instance_capacity = capacity;
         arena.slots[slot].instance_ptr = pointer;
         stream.retire(index, old);
+        // 新缓冲内容未定义：这个槽的增量欠账全部作废，下一次必须整块重写。
+        mirror.invalidate(slot);
     }
     let needs_clips = clip_count > arena.slots[slot].clip_capacity;
     if needs_clips {
@@ -112,20 +119,32 @@ pub(super) fn write_uploads(
         stream.retire(index, old);
     }
 
-    // SAFETY: 槽缓冲的容量已按本次字节数扩容；指针是创建时的持久映射，写入区间在容量内
-    // （D3D12 约定：UPLOAD 堆的 Map 只需一次，之后一直可写）。
+    let full = mirror.prepare(slot, payload);
+    let instance_ptr = arena.slots[slot].instance_ptr;
+    // SAFETY: 槽缓冲的容量已按本帧实例数扩容（`instance_count × 128`），写入区间都在容量内；
+    // 指针是创建时的持久映射（D3D12 约定：UPLOAD 堆的 Map 只需一次，之后一直可写）。
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            instances.as_ptr(),
-            arena.slots[slot].instance_ptr,
-            instances.len(),
-        );
+        if full {
+            let bytes = &mirror.bytes()[..instance_count as usize * 128];
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), instance_ptr, bytes.len());
+        } else {
+            for range in mirror.writes() {
+                let start = range.start as usize * 128;
+                let end = range.end as usize * 128;
+                std::ptr::copy_nonoverlapping(
+                    mirror.bytes()[start..end].as_ptr(),
+                    instance_ptr.add(start),
+                    end - start,
+                );
+            }
+        }
         std::ptr::copy_nonoverlapping(
             bytemuck::cast_slice::<GpuClipEntry, u8>(clips).as_ptr(),
             arena.slots[slot].clip_ptr,
             clip_count as usize * 48,
         );
     }
+    mirror.finish(slot);
     Ok((instance_count, clip_count))
 }
 

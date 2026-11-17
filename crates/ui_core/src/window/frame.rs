@@ -270,9 +270,15 @@ pub(crate) fn submit_gpu(
     renderer.set_layer_scale(surface, window.scale.factor());
     // 窗口路径的 GPU 采样来自 `poll` 的反馈；本帧的同步采样表清空以免 HUD 显示过期数据。
     window.timings.reset(index);
+    // 增量载荷：只带自上次载荷以来变化的实例段（变化区间在这里被取走）。
+    let payload = FramePayload::from_buffer_delta(window.instance_buffer_mut());
+    #[cfg(feature = "test-support")]
+    {
+        window.stats.uploaded_bytes = payload.uploaded_bytes();
+    }
     renderer.publish(FrameRequest {
         index,
-        payload: FramePayload::from_buffer(window.instance_buffer()),
+        payload,
         plan,
         surface,
         scale: window.scale.factor(),

@@ -162,8 +162,15 @@ pub struct FrameStats {
     pub reused_lanes: usize,
     /// 本帧进入 `Scene` 的图元数。
     pub primitives: usize,
-    /// 本帧编码出的实例数。
+    /// 本帧编码出的实例数（存活实例，不含实例环空洞）。
     pub instances: usize,
+    /// 本帧**重编码**的 lane 数（增量实例编码：`0` = 全部实例段整段复用）。
+    pub encoded_lanes: usize,
+    /// 本帧整段复用的 lane 段数。
+    pub reused_segments: usize,
+    /// 本帧增量上传的实例字节数：渲染器路径 = 载荷实际字节数（变化段之和），
+    /// headless = 编码器写入实例环的字节数（两者在「只改 1 条 lane」时相同）。
+    pub uploaded_bytes: usize,
 }
 
 impl FrameRecord {
@@ -367,5 +374,89 @@ mod tests {
             "不得出现全树扫描：{} vs {node_count}",
             record.scanned_nodes
         );
+    }
+    /// B6：增量帧的编码统计必须可断言 —— 只有脏 lane 被重编码，其余实例段整段复用。
+    #[test]
+    fn an_incremental_frame_reencodes_only_the_dirty_lane() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let mut app = App::new(runtime.handle().clone());
+        let window = app.create_window(WindowOptions {
+            title: smol_str::SmolStr::new_static("encode"),
+            size: Size::new(400.0, 300.0),
+            scale: Scale::ONE,
+            ..WindowOptions::default()
+        });
+        let root = app.window(window).expect("窗口存在").tree().root();
+        for index in 0..64 {
+            NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, index as f32 * 4.0, 80.0, 3.0))
+                .paint(crate::paint::style::PaintSpec {
+                    background: crate::paint::color::Color::WHITE,
+                    ..crate::paint::style::PaintSpec::default()
+                })
+                .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
+                .expect("静态 box");
+        }
+        let value = app.signal(0u8);
+        let source = value;
+        let _bound = NodeBuilder::boxed()
+            .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
+            // 背景让这条 lane 真的产生实例（否则「只有背景色变化」的节点没有 lane）。
+            .paint(crate::paint::style::PaintSpec {
+                background: crate::paint::color::Color::WHITE,
+                ..crate::paint::style::PaintSpec::default()
+            })
+            .bind_style(move |cx| StylePatch {
+                opacity: Some(f32::from(cx.read(&source)) / 255.0),
+                ..StylePatch::default()
+            })
+            .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
+            .expect("绑定节点");
+
+        // 首帧：全部 lane 首次编码。
+        assert!(matches!(
+            app.frame(window).expect("窗口存在").expect("首帧"),
+            FrameOutcome::Committed(_)
+        ));
+        let first = app
+            .window(window)
+            .expect("窗口存在")
+            .record()
+            .expect("提交帧必须有记录")
+            .clone();
+        assert!(
+            first.stats.encoded_lanes >= 64,
+            "首帧必须编码全部 lane：{}",
+            first.stats.encoded_lanes
+        );
+        assert_eq!(first.stats.reused_segments, 0);
+
+        // 增量帧：只有绑了信号的那一个节点被重建 lane。
+        assert!(app.write(&value, 255), "值变化必须失效");
+        assert!(matches!(
+            app.frame(window).expect("窗口存在").expect("增量帧"),
+            FrameOutcome::Committed(_)
+        ));
+        let second = app
+            .window(window)
+            .expect("窗口存在")
+            .record()
+            .expect("提交帧必须有记录")
+            .clone();
+        assert_eq!(
+            second.stats.encoded_lanes, 1,
+            "只有脏 lane 被重编码（其余 {} 条整段复用）",
+            second.stats.reused_segments
+        );
+        assert!(
+            second.stats.reused_segments >= 64,
+            "静态 lane 的实例段必须整段复用：{}",
+            second.stats.reused_segments
+        );
+        // headless 不构建 `FramePayload`：这里是编码器侧的增量字节数 —— 一条 lane 的一个
+        // 四边实例 = 128 B（旧实现每帧是全量 128 × N）。
+        assert_eq!(second.stats.uploaded_bytes, 128);
     }
 }

@@ -48,14 +48,11 @@ use crate::paint::instance::InstanceBuffer;
 use crate::render::macos::readback::{Readback, ReadbackImage};
 use crate::{
     error::EngineError,
-    paint::{
-        atlas::AtlasKind,
-        instance::{FrameOp, GpuClipEntry},
-    },
+    paint::{atlas::AtlasKind, instance::FrameOp},
     render::{
         compositor::{DamageRects, FramePlan, MAX_DRAW_PASSES, Plan},
         damage::MAX_DAMAGE_RECTS,
-        frame::{FramePayload, MAX_FRAMES_IN_FLIGHT},
+        frame::{FramePayload, InstanceMirror, MAX_FRAMES_IN_FLIGHT},
         macos::{
             atlas::AtlasTextures,
             core::{GpuCore, PersistLease},
@@ -101,6 +98,8 @@ pub(crate) struct GpuRenderer {
     /// persist → drawable 的同步状态（按 drawable 身份；离屏路径没有 drawable，保持空表）。
     drawable_syncs: DrawableSyncs,
     upload: UploadArena,
+    /// 实例缓冲的持久镜像（增量写：只写变化区间，见 `render/frame.rs` 的 `InstanceMirror`）。
+    mirror: InstanceMirror,
     /// 全量帧的 clear color（**linear**：`BGRA8Unorm_sRGB` 的 clear 由硬件做 sRGB 编码）。
     ///
     /// 窗口路径 = `WindowOptions.background` 的 linear 值（persist 重建后新 drawable 内的条带）；
@@ -175,6 +174,7 @@ impl GpuRenderer {
         let persist_lease = PersistLease::new(Arc::clone(&core), size)?;
         let persist = Persist::new(&mut device, size)?;
         let upload = UploadArena::new(&mut device)?;
+        let mirror = InstanceMirror::new(MAX_FRAMES_IN_FLIGHT);
         Ok(Self {
             core,
             persist_lease,
@@ -185,6 +185,7 @@ impl GpuRenderer {
             persist,
             drawable_syncs: DrawableSyncs::new(),
             upload,
+            mirror,
             clear_color,
             surface: size,
             scale: 1.0,
@@ -441,7 +442,7 @@ impl GpuRenderer {
         &mut self,
         buffer: &InstanceBuffer,
     ) -> Result<ReadbackImage, EngineError> {
-        let payload = FramePayload::from_buffer(buffer);
+        let payload = FramePayload::full(buffer);
         let mut timings = FrameTimings::new();
         let mut frame = FramePlan::new(Plan::Full, true);
         self.submit_snapshot(FrameIndex::from_raw(1), &payload, &mut frame, &mut timings)?;
@@ -519,10 +520,10 @@ impl GpuRenderer {
         let (instance_count, _clip_count) = self.upload.write(
             &mut self.device,
             &mut self.queue,
+            &mut self.mirror,
             index,
             slot.index,
-            payload.instances(),
-            payload.clips(),
+            payload,
         )?;
         timings.push(GpuTimerSample {
             section: Section::Upload,
@@ -689,7 +690,7 @@ impl GpuRenderer {
             command,
             crate::render::RenderStats {
                 draw_calls,
-                instances: instance_count,
+                instances: payload.drawn_instances(),
             },
         ))
     }
@@ -1043,16 +1044,21 @@ impl UploadArena {
     }
 
     /// 写入本帧的实例/裁剪字节；容量不够时扩容（旧缓冲交 retire 队列）。
+    ///
+    /// 实例走**增量写**：`InstanceMirror` 持有完整实例字节，本帧只把变化区间（或整块，当该槽
+    /// 需要整块重写时）拷进当前槽的 `MTLBuffer`；未变化的段保留该槽上次的内容。裁剪表仍然
+    /// 全量写（小表，且表项索引必须与实例里内嵌的 `clip_index` 同帧一致）。
     fn write(
         &mut self,
         device: &mut Device,
         queue: &mut Queue,
+        mirror: &mut InstanceMirror,
         index: FrameIndex,
         slot: usize,
-        instances: &[u8],
-        clips: &[GpuClipEntry],
+        payload: &FramePayload,
     ) -> Result<(u32, u32), EngineError> {
-        let instance_count = (instances.len() / 128) as u32;
+        let instance_count = payload.instance_count();
+        let clips = payload.clips();
         let clip_count = clips.len() as u32;
         if instance_count > self.slots[slot].instance_capacity {
             let capacity = instance_count.next_power_of_two().max(256);
@@ -1063,6 +1069,8 @@ impl UploadArena {
             self.slots[slot].instance_handle = handle;
             self.slots[slot].instance_capacity = capacity;
             queue.retire(index, old);
+            // 新缓冲内容未定义：这个槽的增量欠账全部作废，下一次必须整块重写。
+            mirror.invalidate(slot);
         }
         if clip_count > self.slots[slot].clip_capacity {
             let capacity = clip_count.next_power_of_two().max(8);
@@ -1074,7 +1082,18 @@ impl UploadArena {
             self.slots[slot].clip_capacity = capacity;
             queue.retire(index, old);
         }
-        write_upload(&self.slots[slot].instances, instances);
+        let buffer = &self.slots[slot].instances;
+        let full = mirror.prepare(slot, payload);
+        if full {
+            write_upload(buffer, &mirror.bytes()[..instance_count as usize * 128]);
+        } else {
+            for range in mirror.writes() {
+                let start = range.start as usize * 128;
+                let end = range.end as usize * 128;
+                write_upload_at(buffer, start, &mirror.bytes()[start..end]);
+            }
+        }
+        mirror.finish(slot);
         write_upload(&self.slots[slot].clips, bytemuck::cast_slice(clips));
         Ok((instance_count, clip_count))
     }
@@ -1099,6 +1118,22 @@ fn write_upload(buffer: &ProtocolObject<dyn MTLBuffer>, bytes: &[u8]) {
         std::ptr::copy_nonoverlapping(
             bytes.as_ptr(),
             buffer.contents().as_ptr().cast::<u8>(),
+            bytes.len(),
+        );
+    }
+}
+
+/// 从 `offset` 字节处写入一段（增量实例段；容量由 `UploadArena::write` 保证）。
+fn write_upload_at(buffer: &ProtocolObject<dyn MTLBuffer>, offset: usize, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    // SAFETY: 调用方保证 `offset + bytes.len()` 落在缓冲容量内（实例环的总字节数）；
+    // shared 内存 CPU 可见。
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            buffer.contents().as_ptr().cast::<u8>().add(offset),
             bytes.len(),
         );
     }

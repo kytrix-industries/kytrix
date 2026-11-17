@@ -48,7 +48,12 @@ pub(crate) enum MenuCommand {
     ShowAll,
     /// Quit（`Cmd+Q`）。
     Quit,
-    // ── Edit 菜单（`GuiView` 在文本编辑态实现，其余情况由 responder chain 继续上抛）──
+    // ── Edit 菜单（`GuiView` 只在「应用真的能执行它」时接住，否则菜单项置灰）──
+    //
+    // 可用性由 [`EditAvailability`] 决定，判据是**能力**而不是「有文本焦点」：引擎没有内建
+    // 文本控件，剪贴板/撤销语义由应用绑定拥有（`engine_key` 把菜单动作翻译成等价按键）。
+    // 因此「文本编辑态为真、但应用没绑定该键」的菜单项必须置灰 —— 启用一个点了什么都不做的
+    // 菜单项，比置灰更糟（用户会认为剪贴板/撤销坏了）。
     /// Undo。
     Undo,
     /// Redo。
@@ -179,18 +184,38 @@ impl MenuCommand {
         }
     }
 
-    /// 是否是 Edit 菜单命令（选框/剪贴板/撤销 —— 由拥有文本编辑态的 responder 处理）。
+    /// 是否是 Edit 菜单命令（选框/剪贴板/撤销 —— `GuiView` 只在应用绑定了对应按键时接住）。
+    ///
+    /// 定义成 [`Self::edit_index`] 的成员判定，唯一真值是那张位序表（测试
+    /// `every_edit_command_has_its_own_bit` 用 `COMMANDS` 全表钉住它与 `engine_key` 对齐）。
     pub(crate) const fn is_edit(self) -> bool {
-        matches!(
-            self,
-            Self::Undo
-                | Self::Redo
-                | Self::Cut
-                | Self::Copy
-                | Self::Paste
-                | Self::Delete
-                | Self::SelectAll
-        )
+        self.edit_index().is_some()
+    }
+
+    /// Edit 命令在 [`EditAvailability`] 位图里的位序；非 Edit 命令 ⇒ `None`。
+    ///
+    /// 位序是纯内部约定（0 = Undo，…，6 = SelectAll）。放在这里的理由是它必须与
+    /// [`Self::is_edit`] / [`Self::engine_key`] 逐条对齐：测试
+    /// `every_edit_command_has_its_own_bit` 用 `COMMANDS` 全表钉住三者一致。
+    pub(crate) const fn edit_index(self) -> Option<usize> {
+        match self {
+            Self::Undo => Some(0),
+            Self::Redo => Some(1),
+            Self::Cut => Some(2),
+            Self::Copy => Some(3),
+            Self::Paste => Some(4),
+            Self::Delete => Some(5),
+            Self::SelectAll => Some(6),
+            Self::About
+            | Self::Hide
+            | Self::HideOthers
+            | Self::ShowAll
+            | Self::Quit
+            | Self::Minimize
+            | Self::Zoom
+            | Self::ToggleFullScreen
+            | Self::Close => None,
+        }
     }
 
     /// Edit 命令 → 引擎按键事件（`None` = 纯 AppKit 命令，不经过引擎）。
@@ -229,6 +254,69 @@ impl MenuCommand {
         COMMANDS
             .into_iter()
             .find(|command| command.selector() == selector)
+    }
+}
+
+/// Edit 菜单项的**可用性快照**（R09-1 收尾 / AR3 macOS P2-11）。
+///
+/// AppKit 在 `autoenablesItems` 下逐项问 responder chain 的 `validateUserInterfaceItem:`，
+/// 而那个回调里拿不到 `App`（平台回调不碰引擎状态的纪律）：可用性必须**预先算成快照**，
+/// 由泵每轮写进 view。唯一生产者是 `App::edit_menu_availability`。
+///
+/// 语义：某一位为真 ⇔ 该命令**既有文本编辑态、又有引擎侧接收者**（应用 `bind_key` 绑定了它，
+/// 且 `on_action` 注册了处理器）。没有接收者时置灰：启用一个「点了什么都不做」的菜单项比置灰
+/// 更糟。`validateUserInterfaceItem:` 与 `GuiView::run_menu_command` 共用同一份快照，因此
+/// 「菜单可点但快捷键不响应」这类分叉在结构上不可能出现。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EditAvailability(u8);
+
+impl EditAvailability {
+    /// 全部置灰（没有文本编辑态）。
+    pub(crate) const NONE: Self = Self(0);
+
+    /// 计算快照：`text_editing` 为假 ⇒ 全部置灰（连绑定都不问：非编辑态下菜单动作会被上抛给
+    /// responder chain，启用它没有意义）；否则逐条 Edit 命令问 `handled`「这个键组合在引擎侧
+    /// 有没有接收者」。
+    ///
+    /// 参数是闭包而不是 `&App`：本模块是纯数据 + 纯函数，能在开发机（Windows）上单测（见模块
+    /// 文档）；`App` 侧的读取（绑定表 + 处理器表）由 `App::edit_menu_availability` 完成。
+    pub(crate) fn resolve(
+        text_editing: bool,
+        mut handled: impl FnMut(KeyCode, Modifiers) -> bool,
+    ) -> Self {
+        if !text_editing {
+            return Self::NONE;
+        }
+        let mut bits = 0_u8;
+        for command in COMMANDS {
+            let Some(index) = command.edit_index() else {
+                continue;
+            };
+            // 全部 Edit 命令都有 `engine_key`（`edit_index` 与它逐条对齐，见测试）。
+            let Some((key, modifiers)) = command.engine_key() else {
+                continue;
+            };
+            if handled(key, modifiers) {
+                bits |= 1 << index;
+            }
+        }
+        Self(bits)
+    }
+
+    /// 该命令的菜单项是否启用。
+    ///
+    /// 非 Edit 命令恒为 `true`：它们由 AppKit 自己实现（`MenuCommand::engine_key` 返回 `None`），
+    /// 不受应用的编辑能力影响。
+    pub(crate) fn allows(self, command: MenuCommand) -> bool {
+        if !command.is_edit() {
+            return true;
+        }
+        let Some(index) = command.edit_index() else {
+            // 不可达：`is_edit` 就是 `edit_index().is_some()`。兜底成「可用」而不是 panic ——
+            // 菜单可用性算错不应让整个应用崩掉。
+            return true;
+        };
+        self.0 & (1 << index) != 0
     }
 }
 
@@ -298,7 +386,7 @@ pub(crate) const MAIN_MENU: [MenuSection; 3] = [
 
 #[cfg(test)]
 mod tests {
-    use super::{COMMANDS, MAIN_MENU, MenuCommand, MenuEntry, MenuModifiers};
+    use super::{COMMANDS, EditAvailability, MAIN_MENU, MenuCommand, MenuEntry, MenuModifiers};
     use crate::event::{KeyCode, Modifiers};
 
     /// 菜单树里出现的全部命令（按出现顺序）。
@@ -534,6 +622,134 @@ mod tests {
                 previous_separator = separator;
             }
             assert!(!previous_separator, "禁止以分隔线结尾");
+        }
+    }
+
+    /// Edit 命令的位序、菜单树位置与 `engine_key` 必须逐条对齐：任一处单独改动都会让
+    /// `validateUserInterfaceItem:` 把启用状态打到错误的菜单项上。
+    ///
+    /// 成员判据用**菜单树里的 Edit 段**当第二来源（而不是 `is_edit` 自己），否则这条测试只是
+    /// 自证。
+    #[test]
+    fn every_edit_command_has_its_own_bit() {
+        let in_edit_menu: Vec<MenuCommand> = MAIN_MENU[1]
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                MenuEntry::Command(command) => Some(*command),
+                MenuEntry::Separator => None,
+            })
+            .collect();
+        let mut seen = Vec::new();
+        for command in COMMANDS {
+            assert_eq!(
+                in_edit_menu.contains(&command),
+                command.edit_index().is_some(),
+                "{command:?} 是否出现在 Edit 菜单段，必须与位序表一致"
+            );
+            let Some(index) = command.edit_index() else {
+                continue;
+            };
+            assert!(index < 8, "{command:?} 的位序超出 u8 位图");
+            assert!(
+                !seen.contains(&index),
+                "{command:?} 与其它命令共用位 {index}"
+            );
+            seen.push(index);
+            assert!(
+                command.engine_key().is_some(),
+                "{command:?} 是 Edit 命令，必须能翻译成引擎按键"
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            in_edit_menu.len(),
+            "位序表条数必须等于 Edit 菜单项数"
+        );
+    }
+
+    /// AR3 macOS P2-11：**只有引擎侧真有接收者的项才启用**，其余置灰（不能「可点却没动作」）。
+    #[test]
+    fn edit_availability_greys_out_commands_without_a_receiver() {
+        // 应用只绑了 Cmd+C（处理器由 `App` 侧保证存在）。
+        let only_copy = EditAvailability::resolve(true, |key, modifiers| {
+            key == KeyCode::KeyC && modifiers == Modifiers::META
+        });
+        assert!(only_copy.allows(MenuCommand::Copy));
+        for grey in [
+            MenuCommand::Cut,
+            MenuCommand::Paste,
+            MenuCommand::Undo,
+            MenuCommand::Redo,
+            MenuCommand::Delete,
+            MenuCommand::SelectAll,
+        ] {
+            assert!(!only_copy.allows(grey), "{grey:?} 没有接收者，必须置灰");
+        }
+        // 非 Edit 命令不受应用编辑能力影响（由 AppKit 自己实现）。
+        for command in [
+            MenuCommand::About,
+            MenuCommand::Hide,
+            MenuCommand::Quit,
+            MenuCommand::Minimize,
+            MenuCommand::Zoom,
+            MenuCommand::ToggleFullScreen,
+            MenuCommand::Close,
+        ] {
+            assert!(only_copy.allows(command), "{command:?} 不受编辑能力影响");
+        }
+    }
+
+    /// 没有文本编辑态时 Edit 命令全部置灰（连绑定都不问）：菜单动作在非编辑态会被上抛给
+    /// responder chain。
+    #[test]
+    fn edit_availability_requires_text_editing() {
+        let everything_bound = EditAvailability::resolve(false, |_, _| true);
+        for command in COMMANDS {
+            assert_eq!(
+                everything_bound.allows(command),
+                !command.is_edit(),
+                "{command:?} 的启用状态只由「是否 Edit 命令」决定"
+            );
+        }
+        assert_eq!(everything_bound, EditAvailability::NONE);
+
+        let all = EditAvailability::resolve(true, |_, _| true);
+        for command in COMMANDS {
+            if command.is_edit() {
+                assert!(all.allows(command), "{command:?} 全部绑定 ⇒ 启用");
+            }
+        }
+    }
+
+    /// 键组合必须**精确**匹配（修饰键不同就是另一个绑定）：只绑 Cmd+Shift+Z 时 Undo 不能启用。
+    #[test]
+    fn edit_availability_matches_the_exact_modifiers() {
+        let redo_only = EditAvailability::resolve(
+            true,
+            |key, modifiers| matches!(MenuCommand::Redo.engine_key(), Some((k, m)) if k == key && m == modifiers),
+        );
+        assert!(
+            redo_only.allows(MenuCommand::Redo),
+            "Cmd+Shift+Z ⇒ Redo 启用"
+        );
+        assert!(!redo_only.allows(MenuCommand::Undo), "Cmd+Z 是另一个绑定");
+
+        // 只有 Cmd（无 Shift）：命中的是五条 Cmd+X 命令，Redo（Cmd+Shift+Z）与 Delete
+        // （无修饰键）都不能被误命中。
+        let command_only =
+            EditAvailability::resolve(true, |_, modifiers| modifiers == Modifiers::META);
+        for allowed in [
+            MenuCommand::Undo,
+            MenuCommand::Cut,
+            MenuCommand::Copy,
+            MenuCommand::Paste,
+            MenuCommand::SelectAll,
+        ] {
+            assert!(command_only.allows(allowed), "{allowed:?} 是 Cmd+X");
+        }
+        for greyed in [MenuCommand::Redo, MenuCommand::Delete] {
+            assert!(!command_only.allows(greyed), "{greyed:?} 的修饰键不同");
         }
     }
 }

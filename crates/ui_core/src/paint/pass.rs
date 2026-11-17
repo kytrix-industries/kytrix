@@ -60,6 +60,15 @@ pub(crate) struct PaintReport {
     /// 本帧编码出的实例数（仅 `test-support`；`Window::paint_frame` 编码后回填）。
     #[cfg(feature = "test-support")]
     pub instances: usize,
+    /// 本帧**重编码**的 lane 数（增量实例编码的断言面；`0` = 全部段都复用）。
+    #[cfg(feature = "test-support")]
+    pub encoded_lanes: usize,
+    /// 本帧整段复用的 lane 段数。
+    #[cfg(feature = "test-support")]
+    pub reused_segments: usize,
+    /// 本帧重编码写入实例环的字节数（增量上传量的编码器侧值）。
+    #[cfg(feature = "test-support")]
+    pub uploaded_bytes: usize,
     #[cfg(feature = "test-support")]
     pub log: PaintLog,
 }
@@ -101,6 +110,12 @@ impl PaintPass<'_> {
             damage,
             #[cfg(feature = "test-support")]
             instances: 0,
+            #[cfg(feature = "test-support")]
+            encoded_lanes: 0,
+            #[cfg(feature = "test-support")]
+            reused_segments: 0,
+            #[cfg(feature = "test-support")]
+            uploaded_bytes: 0,
             #[cfg(feature = "test-support")]
             log: context.log,
         })

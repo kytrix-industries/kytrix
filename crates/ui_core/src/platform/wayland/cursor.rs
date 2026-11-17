@@ -8,8 +8,9 @@
 //! *"The cursor actually changes only if the pointer focus … is one of the requesting client's
 //! surfaces"*，而 enter 的 serial 是新焦点下第一个合法凭证）。
 //!
-//! 本模块只做纯逻辑：形状映射表、Xcursor 文件解析、主题目录/继承链解析、尺寸选择。协议对象
-//! 与 `wl_shm` 上传在 `platform/linux/cursor.rs`。
+//! 本模块只做纯逻辑：形状映射表、Xcursor 文件解析、主题目录/继承链解析、尺寸选择、以及
+//! **下发去重键**（[`CursorApplyState`]：设备代数 + 形状 + 尺寸，AR3 §3.6）。协议对象与
+//! `wl_shm` 上传在 `platform/linux/cursor.rs`。
 
 use std::path::PathBuf;
 
@@ -101,6 +102,74 @@ pub(crate) fn theme_size(hint: Option<u32>, scale: i32) -> u32 {
     let base = hint.unwrap_or(DEFAULT_CURSOR_SIZE);
     let scaled = base.saturating_mul(scale.max(1) as u32);
     scaled.clamp(MIN_CURSOR_SIZE, MAX_CURSOR_SIZE)
+}
+
+// ── 下发去重（AR3 §3.6）────────────────────────────────────────────────────
+
+/// 一次光标下发的去重键：**pointer 设备代数** + 形状 + 回退图像尺寸。
+///
+/// 为什么不能只按形状去重：`wl_pointer.set_cursor` 与 `wp_cursor_shape_device_v1.set_shape`
+/// 都是 **per-pointer（per-device）状态**，不是「本进程的光标属性」：
+///
+/// - `zwp_cursor_shape_device_v1` 是 `wl_pointer.get_pointer` 的**子对象**，pointer 被重建
+///   （seat 能力撤销后恢复）之后旧 device 随之销毁，新 device 上是空白状态；
+/// - `wl_pointer.leave` 之后 compositor 隐藏光标（我们也主动 `set_cursor(None)`），下一帧的
+///   `enter` 不带任何光标信息，必须重新下发一次，即使形状没变；
+/// - 回退路径的图像按尺寸选档，窗口换到另一个 scale 的输出上时同一形状要换一张图。
+///
+/// 因此去重键带上「设备代数」与「尺寸」，代数在 pointer 创建 / 销毁时前进。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CursorApplyKey {
+    /// pointer 设备代数（`pointer_created` / `pointer_gone` 各前进一次）。
+    pub generation: u32,
+    /// 引擎光标形状。
+    pub cursor: Cursor,
+    /// 回退路径选中的图像像素尺寸（cursor-shape 路径不消费它，但多一次重发无害）。
+    pub size: u32,
+}
+
+/// 光标下发去重状态机（纯逻辑；协议对象在 `platform/linux/cursor.rs`）。
+#[derive(Debug, Default)]
+pub(crate) struct CursorApplyState {
+    /// 当前 pointer 设备的代数（每次重建前进一次）。
+    generation: u32,
+    /// 最近一次**成功下发**的键（`None` = 未下发 / 已隐藏）。
+    applied: Option<CursorApplyKey>,
+}
+
+impl CursorApplyState {
+    /// pointer 被创建 / 销毁：代数前进，已下发记录作废（新设备上是空白状态）。
+    pub(crate) fn pointer_recreated(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.applied = None;
+    }
+
+    /// `wl_pointer.leave`（或 `set_cursor(None)`）：compositor 侧光标已隐藏，
+    /// 再次 `enter` 时必须重新下发，即使形状没变。
+    pub(crate) fn hidden(&mut self) {
+        self.applied = None;
+    }
+
+    /// 这次是否**必须**下发（同 `(代数, 形状, 尺寸)` 已经下发过 ⇒ 不必）。
+    #[must_use]
+    pub(crate) fn needs_apply(&self, cursor: Cursor, size: u32) -> bool {
+        self.applied
+            != Some(CursorApplyKey {
+                generation: self.generation,
+                cursor,
+                size,
+            })
+    }
+
+    /// 下发成功后记账。**只在真的发出请求之后调用**（两条通道都不可用时不能记账，
+    /// 否则下一次 enter 会被误判为「已下发」而永远不重试）。
+    pub(crate) fn note_applied(&mut self, cursor: Cursor, size: u32) {
+        self.applied = Some(CursorApplyKey {
+            generation: self.generation,
+            cursor,
+            size,
+        });
+    }
 }
 
 // ── Xcursor 文件解析（回退路径）─────────────────────────────────────────────
@@ -356,9 +425,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        CursorSpec, DEFAULT_CURSOR_SIZE, MAX_CURSOR_SIZE, MIN_CURSOR_SIZE, XcursorError,
-        XcursorImage, choose_image, cursor_candidates, icon_roots, inherits, parse_xcursor, spec,
-        theme_chain, theme_size,
+        CursorApplyState, CursorSpec, DEFAULT_CURSOR_SIZE, MAX_CURSOR_SIZE, MIN_CURSOR_SIZE,
+        XcursorError, XcursorImage, choose_image, cursor_candidates, icon_roots, inherits,
+        parse_xcursor, spec, theme_chain, theme_size,
     };
     use crate::paint::style::Cursor;
 
@@ -704,5 +773,106 @@ mod tests {
             "/usr/share/pixmaps/default/cursors/xterm".into(),
         ];
         assert_eq!(candidates, expected);
+    }
+
+    // ── 下发去重键（AR3 §3.6）────────────────────────────────────────────
+
+    /// 同一形状、同一尺寸重复下发是纯浪费（每次 enter / 每帧都可能走到）。
+    #[test]
+    fn the_same_shape_and_size_is_not_resent() {
+        let mut state = CursorApplyState::default();
+        assert!(state.needs_apply(Cursor::Text, 24));
+        state.note_applied(Cursor::Text, 24);
+        assert!(
+            !state.needs_apply(Cursor::Text, 24),
+            "没变就不该再发 set_shape / set_cursor"
+        );
+        assert!(state.needs_apply(Cursor::Pointer, 24), "形状变了必须重发");
+        state.note_applied(Cursor::Pointer, 24);
+        assert!(
+            !state.needs_apply(Cursor::Pointer, 24),
+            "切回同一个形状（未重新下发）仍视为已下发"
+        );
+        assert!(
+            state.needs_apply(Cursor::Text, 24),
+            "Text 是更早下发的那个形状，当前 surface 上是 Pointer ⇒ 必须重发"
+        );
+    }
+
+    /// AR3 §3.6 P2：8 种形状都缓存之后，`Text → Pointer → Text` 必须每次都重发 ——
+    /// 回退路径所有形状复用一个光标 surface，命中缓存不重新 attach 就会显示上一个形状。
+    #[test]
+    fn every_shape_switch_reapplies_even_when_all_shapes_are_cached() {
+        let mut state = CursorApplyState::default();
+        for cursor in [Cursor::Default, Cursor::Pointer, Cursor::Text] {
+            assert!(state.needs_apply(cursor, 24), "{cursor:?} 首次下发");
+            state.note_applied(cursor, 24);
+        }
+        // 稳态：三种形状都缓存过，surface 当前挂的是 Default。
+        assert!(
+            state.needs_apply(Cursor::Default, 24),
+            "缓存命中不等于已下发：surface 上现在是 Text 的 buffer"
+        );
+        state.note_applied(Cursor::Default, 24);
+        // 全部「已缓存」之后再切回来：形状不同 ⇒ 必须重发（命中缓存也要重新 attach）。
+        assert!(state.needs_apply(Cursor::Text, 24));
+        state.note_applied(Cursor::Text, 24);
+        assert!(state.needs_apply(Cursor::Pointer, 24));
+    }
+
+    /// 设备代数前进（pointer 重建 / 能力撤销恢复）⇒ 即使形状与尺寸都没变也必须重发：
+    /// `wp_cursor_shape_device_v1` 是 pointer 的子对象，新 device 上是空白状态。
+    #[test]
+    fn a_recreated_pointer_device_forces_a_reapply() {
+        let mut state = CursorApplyState::default();
+        state.note_applied(Cursor::Grab, 32);
+        assert!(!state.needs_apply(Cursor::Grab, 32));
+
+        state.pointer_recreated();
+        assert!(
+            state.needs_apply(Cursor::Grab, 32),
+            "pointer 重建后旧 device 已销毁 ⇒ 必须重新 set_shape / set_cursor"
+        );
+        state.note_applied(Cursor::Grab, 32);
+
+        state.pointer_recreated();
+        state.pointer_recreated();
+        assert!(
+            state.needs_apply(Cursor::Grab, 32),
+            "代数只增不减，连续重建仍然要求重发"
+        );
+    }
+
+    /// `wl_pointer.leave` 之后光标已被隐藏：下一次 enter 即使形状没变也要重新下发。
+    #[test]
+    fn a_hidden_cursor_is_reapplied_on_the_next_enter() {
+        let mut state = CursorApplyState::default();
+        state.note_applied(Cursor::Text, 24);
+        state.hidden();
+        assert!(
+            state.needs_apply(Cursor::Text, 24),
+            "离开时我们把光标设成 None，回来必须重新给图像"
+        );
+    }
+
+    /// 窗口换到另一个 scale 的输出上：回退路径的图像尺寸变了，同一形状也要换图。
+    #[test]
+    fn a_scale_change_reapplies_the_theme_image() {
+        let mut state = CursorApplyState::default();
+        state.note_applied(Cursor::Default, theme_size(None, 1));
+        assert!(!state.needs_apply(Cursor::Default, theme_size(None, 1)));
+        assert!(
+            state.needs_apply(Cursor::Default, theme_size(None, 2)),
+            "2× 输出上必须换成 2 倍像素的图（否则光标糊）"
+        );
+    }
+
+    /// 两条通道都不可用时**不得**记账：否则下一次 enter 会被误判成「已下发」而永不重试。
+    #[test]
+    fn an_unsent_shape_is_not_recorded_as_applied() {
+        let state = CursorApplyState::default();
+        // 没有调用 note_applied（下发失败）⇒ 下一次仍然要求下发。
+        assert!(state.needs_apply(Cursor::NotAllowed, 24));
+        assert!(state.needs_apply(Cursor::NotAllowed, 24));
     }
 }

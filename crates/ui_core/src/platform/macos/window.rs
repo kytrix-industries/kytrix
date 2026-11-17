@@ -427,15 +427,23 @@ impl NativeWindow {
 
     /// 同步 IME caret 区域到 `NSTextInputClient` 的 `firstRect`（每轮泵调用，独立于帧门禁）。
     ///
-    /// 同一个来源顺带派生 **文本编辑态**（`Ok(Some)` = 有焦点文本节点且有 caret）：Edit 菜单项的
-    /// 启用状态由它决定（R09-1），所以这条通路不能只在 IME 真的激活时才跑。
+    /// 同一个来源顺带派生 **Edit 菜单项的可用性快照**（R09-1 收尾 / AR3 P2-11）：
+    /// `Ok(Some)` = 有焦点文本节点且有 caret ⇒ 文本编辑态。可用性**不等于**编辑态——还要求
+    /// 该命令的按键在引擎侧真有接收者（`App::edit_menu_availability`），因此「启用了却没动作」
+    /// 不可能出现（应用没绑定 Cmd+C 时 Copy 项置灰，而不是可点却什么都不做）。
+    ///
+    /// 已知口径（AR3 P2-10）：编辑态由 **IME caret hint** 派生，即「应用是否声明过文本插入点」，
+    /// 而不是「焦点节点是否可编辑」。引擎没有内建文本控件（编辑语义归应用），只有应用自己知道
+    /// 插入点在哪，因此当前这是唯一能跨应用工作的判据；它现在只会与「应用已绑定该命令」合取，
+    /// 所以误差方向是**偏保守**（宁可置灰）。
     pub(crate) fn sync_ime_cursor_area(&mut self, app: &App) {
         let area = match app.ime_cursor_area(self.id) {
             Ok(area) => area,
             // 文本尚未 shape / 文本刚变化：保留上一次有效区域（编辑态也不变）。
             Err(_) => return,
         };
-        self.view.set_text_editing(area.is_some());
+        self.view
+            .set_edit_availability(app.edit_menu_availability(area.is_some()));
         if self.ime_area == area {
             return;
         }

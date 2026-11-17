@@ -283,20 +283,12 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             //
             // 门禁原本会在两种「publish 了但不会 commit」的情况下永久关闭（F-183）：
             // Idle（`App::frame` 返回 `Idle`，没有 publish/commit）由 `note_frame_not_committed`
-            // 立即重开；present `OUT_OF_DATE`（WSI 没有 attach/commit）由下面的 200 ms 活性
-            // 兜底覆盖。兜底**不是**呈现节奏：正常帧的 callback 在合成器 vsync 内返回。
-            //
-            // 兜底必须**每轮无条件**检查：唤醒位只在 `take_frame_wake` 被消费，而它又被
-            // `frame_ready` 门控 —— 门禁关闭期间某轮已经消费过唤醒位时，用「唤醒位是否存在」
-            // 门控兜底会让它永远不执行（F-183）。
-            let now = Instant::now();
-            // R10-7：不可见窗口不参与兜底（`expire_frame_gates` 内部按窗口可见性过滤）。
-            // 可见性恢复（`wl_surface.enter`）由 `redraw` 标记驱动一次唤醒。
-            if state.expire_frame_gates(now) {
-                // 兜底强制开门后补一次唤醒：唤醒位可能已被上一轮取走，否则门禁虽开却没有一帧
-                // 驱动重试。本轮 ④ 随后的 `take_frame_wake` 会消费这次唤醒。
-                dispatcher.wake();
-            }
+            // 立即重开；present `OUT_OF_DATE`（WSI 没有 attach/commit）由 GPU 线程**保留待画帧
+            // 重试**覆盖（`render/linux/renderer.rs` 的 `Submitted::Retry`），下一次 acquire 成功
+            // 就会 commit —— 因此这里**没有**也不再需要 200 ms 活性兜底（AR3 §3.7：那条兜底的
+            // 唯一作用是让「可见但被完全遮挡」的窗口退化成 5 Hz 全量重绘）。不可见窗口的
+            // callback 丢失由可见性入口（`wl_surface.leave` / `configure` 的 `Suspended`）
+            // 直接 `force_idle` 处理，见 `WaylandState::sync_frame_gate_visibility`。
             if state.take_redraw() {
                 dispatcher.wake();
             }
@@ -372,11 +364,9 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             let timeout = if app.needs_continuous_frames() {
                 FRAME_TICK
             } else {
-                // 门禁关闭时必须睡到最早的兜底到期（不能睡 `IDLE_TIMEOUT`）：兜底每轮无条件
-                // 检查，不再依赖唤醒位留在队列里。门禁全开时 `None` ⇒ 回到事件驱动。
-                state
-                    .frame_gate_remaining(Instant::now())
-                    .unwrap_or(surface::IDLE_TIMEOUT)
+                // 门禁关闭时不再按「兜底到期」醒来（AR3 §3.7：那条 200 ms 兜底已删除）：
+                // 帧回调到达、输入、协议事件都会唤醒 dispatch，其余时间真正睡到空闲超时。
+                surface::IDLE_TIMEOUT
             };
             // a11y 到期补发：被 `A11Y_THROTTLE` 挡下的最后一次变化必须有人在窗口结束时叫醒
             // 泵，否则它会一直停在旧值（复审 P1-4）。醒来后 `a11y_pending` 变真即交付。

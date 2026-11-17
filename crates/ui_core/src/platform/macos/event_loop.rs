@@ -5,8 +5,10 @@
 //! - **事件循环交给 AppKit**：`NSApplication::run()` 处理 NSEvent、原生全屏转场、live resize、
 //!   菜单与 Space 切换；引擎不再手写 `nextEventMatchingMask`（旧实现无法完成 fullscreen 转场）。
 //! - **应用壳层**（R09-1 / R09-16）：`run()` 在开窗前装好 `NSMenu` 主菜单与
-//!   `NSApplicationDelegate`。菜单提供 Cmd+Q / Cmd+W / Cmd+H / Cmd+C/V/X/A/Z 的承载对象；
-//!   delegate 把 `terminate:` 变成「通知引擎 → 引擎关窗收尾 → 回复 AppKit」的握手。
+//!   `NSApplicationDelegate`。菜单提供 Cmd+Q / Cmd+W / Cmd+H 的承载对象；Edit 菜单项
+//!   （Cmd+C/V/X/A/Z）**只在应用真的绑定了对应按键时启用**（`App::edit_menu_availability`），
+//!   否则置灰 —— 引擎没有内建文本控件，编辑语义由应用绑定拥有。
+//!   delegate 把 `terminate:` 变成「通知引擎 → 引擎两阶段询问+关窗收尾 → 回复 AppKit」的握手。
 //! - **泵**由三条 common-modes 路径驱动：`CFRunLoopObserver`（**只注册 `BeforeWaiting`**，
 //!   每轮 run loop 一次）、wake `CFRunLoopSource`（跨线程唤醒）、连续帧 `CFRunLoopTimer`
 //!   （动画/HUD）。三者都只在主线程执行。
@@ -58,6 +60,10 @@ struct LoopState {
     quit: Arc<QuitHandshake>,
     /// 最近一次同步给引擎的系统双击间隔（R09-10：系统设置可以在运行中改变）。
     double_click: Duration,
+    /// 退出握手正在跑（P1-2 的另一半防线）：关闭处理器里弹 `NSAlert` 之类会起**嵌套 run loop**，
+    /// `BeforeWaiting` 观察者会在里面再泵一次；若那里再看到 `quit.pending()`，就会把同一批关闭
+    /// 处理器问第二遍，并对 AppKit 回复两次 `replyToApplicationShouldTerminate:`（协议只允许一次）。
+    quitting: bool,
     exit: bool,
     error: Option<EngineError>,
 }
@@ -154,6 +160,7 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
         _delegate: delegate,
         quit: Arc::clone(&quit),
         double_click: double_click_time(),
+        quitting: false,
         exit: false,
         error: None,
     }));
@@ -397,8 +404,12 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
 
     // R09-16：退出握手。Dock 退出 / osascript / Cmd+Q 都汇到 `applicationShouldTerminate:`，
     // 那里只置位 + 唤醒；真正的关闭流程在这里跑（与点红点/Cmd-W 同一个裁决点）。
-    if state.quit.pending() {
+    if state.quit.pending() && !state.quitting {
+        // 处理器里可能弹模态面板（嵌套 run loop ⇒ 本函数重入）：`quitting` 保证同一时刻只有
+        // 一次询问在进行，且 `replyToApplicationShouldTerminate:` 只发一次（见 `LoopState.quitting`）。
+        state.quitting = true;
         request_quit(state, app);
+        state.quitting = false;
     }
 
     // 关闭：请求关闭的窗口真正关闭；一个不剩就退出。
@@ -429,21 +440,28 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
     Ok(())
 }
 
-/// 退出握手：先问应用，再关窗（R09-16）。
+/// 退出握手：先询问全部窗口，再关窗（R09-16 / AR3 P1-2）。
 ///
-/// 复用用户点窗口红点时的**同一个裁决点**（`App::request_close` → 窗口的关闭处理器），因此
-/// 「有未保存的布局/未确认的订单时不许退出」这类 veto 对 Cmd+Q / Dock 退出同样生效。
+/// 复用用户点窗口红点时的**同一个裁决点**（窗口的关闭处理器），因此「有未保存的布局/未确认的
+/// 订单时不许退出」这类 veto 对 Cmd+Q / Dock 退出同样生效。
+///
+/// **两阶段**（AR3 macOS P1-2）：旧实现逐窗 `App::request_close`，而它在批准时会**立刻**关窗，
+/// 于是「窗口 A 同意、窗口 B veto」的退出会留下已经被拆掉的 A（Renderer 已 drop、应用状态
+/// 丢失），而用户看到的是「退出已取消」；下一轮 `sync_native_windows` 还会把 A 的原生窗口也
+/// 销毁。现在询问阶段**没有任何副作用**（只跑关闭处理器），全部同意后才统一关闭；任一 veto
+/// 则整个握手回滚 —— 一个窗口都不关。`App::request_close_all` 是这条策略的唯一实现（可在
+/// 开发机上用无窗口逻辑层单测）。
+///
 /// 全部同意后关闭所有原生窗口，由泵末尾的「一个不剩 ⇒ exit」收尾；`run()` 在析构完成后回复
 /// AppKit。
 fn request_quit(state: &mut LoopState, app: &mut App) {
     let ids: Vec<WindowId> = app.windows().map(|(id, _)| id).collect();
-    for id in ids {
-        if !app.request_close(id) {
-            // 应用拒绝退出：必须回复 AppKit「不终止」，否则它会一直等在这个握手上。
-            state.quit.veto();
-            state.ns_app.replyToApplicationShouldTerminate(false);
-            return;
-        }
+    if !app.request_close_all(&ids) {
+        // 应用拒绝退出：必须回复 AppKit「不终止」，否则它会一直等在这个握手上。
+        // 询问阶段没有关任何窗口，因此这里不需要回滚窗口状态。
+        state.quit.veto();
+        state.ns_app.replyToApplicationShouldTerminate(false);
+        return;
     }
     for native in state.windows.iter_mut() {
         native.close();

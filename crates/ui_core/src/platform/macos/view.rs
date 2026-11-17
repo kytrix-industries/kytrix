@@ -42,7 +42,7 @@ use crate::{
     platform::{
         ime::{CommitVerdict, KeyScopeToken, replacement_range},
         macos::{a11y::MacA11y, ime::ImeState, menu},
-        menu::MenuCommand,
+        menu::{EditAvailability, MenuCommand},
     },
 };
 
@@ -63,9 +63,13 @@ pub(crate) struct ViewIvars {
     cursor: Cell<Cursor>,
     /// 指针是否在 view 内（决定 `set_cursor` 能否立刻 `NSCursor::set`）。
     pointer_inside: Cell<bool>,
-    /// 文本编辑态（泵每轮由 `sync_ime_cursor_area` 写入）：`validateUserInterfaceItem:` 据此
-    /// 决定 Edit 菜单项是否启用（R09-1）。
-    text_editing: Cell<bool>,
+    /// Edit 菜单项的可用性快照（泵每轮由 `sync_ime_cursor_area` 写入）：`validateUserInterfaceItem:`
+    /// 与菜单动作（`run_menu_command`）据此决定启用/上抛（R09-1 收尾 / AR3 P2-11）。
+    ///
+    /// 存快照而不是「文本编辑态」一个 bool：启用判据是「文本编辑态 **且** 该命令的按键在引擎
+    /// 侧有接收者」，而平台回调里拿不到 `App`（见文件头的纪律）。唯一生产者是
+    /// `App::edit_menu_availability`。
+    edit: Cell<EditAvailability>,
 }
 
 define_class!(
@@ -448,10 +452,13 @@ define_class!(
                 .and_then(|action| action.name().to_str().ok())
                 .and_then(MenuCommand::from_selector);
             match command {
-                // Edit 命令只在文本编辑态启用：没有文本焦点时把 Cmd+C/V/A/Z 还给 keyDown
-                // 通路（应用的绑定仍能收到），而不是被一个什么都不做的菜单项吃掉。
-                Some(command) if command.is_edit() => self.ivars().text_editing.get(),
-                _ => true,
+                // Edit 菜单项只在「应用真的能执行它」时启用（R09-1 收尾 / AR3 P2-11）：
+                // 没有文本编辑态、或该命令的按键在引擎侧没有接收者 ⇒ 置灰。置灰不只是诚实：
+                // AppKit 对不可用的项**不消费**键等价物，Cmd+C 会退回 keyDown 通路，应用的
+                // 绑定仍然收得到（见 `run_menu_command` 与文件头）。
+                Some(command) => self.ivars().edit.get().allows(command),
+                // 不是主菜单里的命令（应用自定义菜单项 / 系统 selector）：不干预。
+                None => true,
             }
         }
     }
@@ -643,7 +650,7 @@ impl GuiView {
             ime_cursor: Cell::new(None),
             cursor: Cell::new(Cursor::Default),
             pointer_inside: Cell::new(false),
-            text_editing: Cell::new(false),
+            edit: Cell::new(EditAvailability::NONE),
         });
         // SAFETY: `initWithFrame:` 是 NSView 的指定初始化器；`this` 由 `alloc` 产生且未初始化。
         let this: Retained<Self> = unsafe {
@@ -736,9 +743,12 @@ impl GuiView {
         self.ivars().ime_cursor.set(area);
     }
 
-    /// 写入文本编辑态（泵每轮从 `App::ime_cursor_area` 派生；`validateUserInterfaceItem:` 读它）。
-    pub(crate) fn set_text_editing(&self, editing: bool) {
-        self.ivars().text_editing.set(editing);
+    /// 写入 Edit 菜单项的可用性快照（来源：`App::edit_menu_availability`；泵每轮调用一次）。
+    ///
+    /// `validateUserInterfaceItem:` 与 `run_menu_command` 都读这一份，因此「菜单可点但没有
+    /// 动作」在结构上不可能出现（R09-1 收尾 / AR3 P2-11）。
+    pub(crate) fn set_edit_availability(&self, availability: EditAvailability) {
+        self.ivars().edit.set(availability);
     }
 
     /// 引擎请求的光标形状（R09-11）。指针在窗口内时立刻生效；否则等 `cursorUpdate:`
@@ -762,14 +772,16 @@ impl GuiView {
     /// 负责把菜单点击翻译成同一个按键序列，因此菜单、Cmd+C、a11y 动作三条通路完全一致
     /// （不会出现「菜单能粘贴、快捷键不能」）。
     ///
-    /// 没有文本编辑态时（`validateUserInterfaceItem:` 本会把菜单项置灰，但这仍可能被
-    /// AppleScript / `sendAction:` 直接调用）把动作转给 `nextResponder` —— 即 AppKit 的默认
-    /// responder chain 语义（`noResponderFor:` 的那条路），而不是静默吞掉命令。
+    /// 判据与 `validateUserInterfaceItem:` 完全一致（同一份 [`EditAvailability`] 快照，AR3
+    /// P2-11）：没有文本编辑态、或应用没绑定该命令的按键 ⇒ 动作转给 `nextResponder`
+    /// （AppKit 的 responder chain 语义），而不是**静默吞掉**命令 —— 后者正是「菜单项可点却
+    /// 什么都不发生」的成因。AppleScript / `sendAction:` 可以绕过校验直接打进来，所以这里也
+    /// 必须再判一次。
     fn run_menu_command(&self, command: MenuCommand) {
         let Some((code, modifiers)) = command.engine_key() else {
             return;
         };
-        if !self.ivars().text_editing.get() {
+        if !self.ivars().edit.get().allows(command) {
             self.forward_to_next_responder(command);
             return;
         }

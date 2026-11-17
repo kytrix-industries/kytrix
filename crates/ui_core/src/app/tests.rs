@@ -1063,6 +1063,151 @@ fn close_handler_can_veto_the_close() {
     assert!(app.request_close(window), "返回 true 必须真的关闭");
     assert!(app.window(window).is_none());
 }
+
+/// AR3 macOS P1-2：退出握手必须**两阶段** —— 任一窗口 veto 时一个窗口都不许关。
+///
+/// 旧实现逐窗 `App::request_close`（批准即关窗）：`[A, B, C]` 里 B veto 时 A 已经被拆掉
+/// （Renderer 已 drop、应用状态丢失），而用户看到的是「退出已取消」。
+#[test]
+fn batch_close_rolls_back_every_window_on_veto() {
+    let (_rt, mut app) = new_app();
+    let first = app.create_window(WindowOptions::default());
+    let second = app.create_window(WindowOptions::default());
+    let third = app.create_window(WindowOptions::default());
+    let asked_first = Rc::new(Cell::new(0_u32));
+    let asked_second = Rc::new(Cell::new(0_u32));
+    let asked_third = Rc::new(Cell::new(0_u32));
+    let counter = asked_first.clone();
+    app.on_close(first, move |_app| {
+        counter.set(counter.get() + 1);
+        true
+    });
+    // 第二个窗口 veto（例如「退出确认框」被用户取消）。
+    let counter = asked_second.clone();
+    app.on_close(second, move |_app| {
+        counter.set(counter.get() + 1);
+        false
+    });
+    let counter = asked_third.clone();
+    app.on_close(third, move |_app| {
+        counter.set(counter.get() + 1);
+        true
+    });
+
+    assert!(
+        !app.request_close_all(&[first, second, third]),
+        "第二个窗口 veto ⇒ 整个退出握手回滚"
+    );
+    assert!(
+        app.window(first).is_some(),
+        "已经被问过的窗口不得被拆掉（旧实现的数据丢失）"
+    );
+    assert!(app.window(second).is_some());
+    assert!(app.window(third).is_some());
+    assert_eq!(asked_first.get(), 1, "询问阶段必须真的问过应用");
+    assert_eq!(asked_second.get(), 1);
+    assert_eq!(
+        asked_third.get(),
+        0,
+        "已经否决之后不再打扰后面的窗口（它们的处理器一次都不该跑）"
+    );
+}
+
+/// 全部同意时才统一关闭，且每个关闭处理器**恰好跑一次**（关之前再问一遍 = 两次确认框）。
+#[test]
+fn batch_close_closes_every_window_when_all_allow() {
+    let (_rt, mut app) = new_app();
+    let first = app.create_window(WindowOptions::default());
+    let second = app.create_window(WindowOptions::default());
+    let asked_first = Rc::new(Cell::new(0_u32));
+    let asked_second = Rc::new(Cell::new(0_u32));
+    let counter = asked_first.clone();
+    app.on_close(first, move |_app| {
+        counter.set(counter.get() + 1);
+        true
+    });
+    let counter = asked_second.clone();
+    app.on_close(second, move |_app| {
+        counter.set(counter.get() + 1);
+        true
+    });
+
+    assert!(app.request_close_all(&[first, second]), "全部同意 ⇒ 关闭");
+    assert!(app.window(first).is_none());
+    assert!(app.window(second).is_none());
+    assert_eq!(asked_first.get(), 1, "批准后不得再问一次");
+    assert_eq!(asked_second.get(), 1);
+
+    // 已经关掉的窗口再进入批量（例如退出握手重跑）：没有可拦的东西，不能否决退出。
+    assert!(
+        app.request_close_all(&[first, second]),
+        "幽灵窗口不得否决退出（复审 §2.3 的 P3）"
+    );
+}
+
+/// 处理器在询问阶段自己把窗口关掉：按「已经关了」处理，不算 veto（否则退出被一个不存在的
+/// 窗口永久挡住）。
+#[test]
+fn a_window_that_closes_itself_during_the_inquiry_does_not_veto_the_quit() {
+    let (_rt, mut app) = new_app();
+    let kept = app.create_window(WindowOptions::default());
+    let closed_by_app = app.create_window(WindowOptions::default());
+    app.on_close(closed_by_app, move |app| {
+        app.close_window(closed_by_app);
+        // 故意返回 false：窗口已经不在了，这个 false 不应再否决整个退出。
+        false
+    });
+
+    assert!(
+        app.request_close_all(&[kept, closed_by_app]),
+        "窗口已被应用自己关掉 ⇒ 没有可拦的对象"
+    );
+    assert!(app.window(kept).is_none(), "其余窗口仍必须被关闭");
+    assert!(app.window(closed_by_app).is_none());
+}
+
+/// AR3 macOS P2-11：Edit 菜单项「启用 ⇔ 应用真的能执行它」。
+///
+/// 引擎没有内建文本控件，复制/粘贴/撤销由应用绑定拥有；菜单点击只是把命令翻译成等价按键
+/// （`MenuCommand::engine_key`）。所以**只有绑定没有处理器**时按键本身会被静默丢弃，菜单项
+/// 必须保持置灰，否则就是「可点但点了没反应」。
+#[test]
+fn edit_menu_availability_requires_a_binding_with_a_handler() {
+    use crate::{
+        event::{Action, KeyBinding, KeyCode, Modifiers},
+        platform::menu::MenuCommand,
+    };
+
+    let (_rt, mut app) = new_app();
+    // 没有绑定：即使处于文本编辑态，Edit 菜单也全部置灰。
+    let nothing_bound = app.edit_menu_availability(true);
+    assert!(!nothing_bound.allows(MenuCommand::Copy));
+
+    // 只绑定 Cmd+C、没注册处理器 ⇒ 按键会被 `dispatch_action_with_hit` 丢掉，仍然置灰。
+    let copy = Action::custom("edit.copy");
+    app.bind_key(KeyBinding {
+        key: KeyCode::KeyC,
+        modifiers: Modifiers::META,
+        action: copy.clone(),
+    });
+    assert!(
+        !app.edit_menu_availability(true).allows(MenuCommand::Copy),
+        "只有绑定、没有处理器 ⇒ 必须置灰"
+    );
+
+    // 注册处理器后才启用：此时点菜单项与按 Cmd+C 走同一条绑定通路，真的会执行。
+    app.on_action(copy, |_ctx| {});
+    let available = app.edit_menu_availability(true);
+    assert!(available.allows(MenuCommand::Copy), "绑定 + 处理器 ⇒ 启用");
+    assert!(
+        !available.allows(MenuCommand::Paste),
+        "没有绑定 Cmd+V ⇒ Paste 仍置灰"
+    );
+    assert!(
+        !app.edit_menu_availability(false).allows(MenuCommand::Copy),
+        "没有文本编辑态时一律置灰（动作会被上抛给 responder chain）"
+    );
+}
 /// P2-6：a11y 交付按窗口限流，且时间窗过后继续交付。
 ///
 /// 实时行情会让 `A11Y` 脏位每帧为真；不限流时每帧都要全树扫描 + 构造 `TreeUpdate`。

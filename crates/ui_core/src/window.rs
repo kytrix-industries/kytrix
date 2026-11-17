@@ -570,6 +570,10 @@ impl Window {
     pub(crate) fn instance_buffer(&self) -> &InstanceBuffer {
         paint::instance_buffer(self)
     }
+    /// 编码结果的可变视图（`FramePayload` 的增量载荷构建要取走变化区间）。
+    pub(crate) fn instance_buffer_mut(&mut self) -> &mut InstanceBuffer {
+        paint::instance_buffer_mut(self)
+    }
     /// 实现见子模块 `paint::instance_bytes`（本文件只保留签名）。
     #[must_use]
     pub fn instance_bytes(&self) -> &[u8] {
@@ -800,6 +804,15 @@ impl Window {
     #[cfg(feature = "test-support")]
     pub(crate) fn set_frame_stats(&mut self, stats: FrameStats) {
         record::set_frame_stats(self, stats)
+    }
+    /// 最近一帧的 pass / 编码统计（**仅 `test-support`**：基准与集成测试用它断言增量编码的
+    /// 事实 —— `encoded_lanes` / `reused_segments` / `uploaded_bytes`）。
+    ///
+    /// 来源是**帧记录**（`self.stats` 在提交时被 `capture` 取走，不能直接读）。
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn frame_stats(&self) -> Option<&FrameStats> {
+        self.record.as_ref().map(|record| &record.stats)
     }
     #[cfg(feature = "hud")]
     pub(crate) fn reset_debug_hud_timing(&mut self) {

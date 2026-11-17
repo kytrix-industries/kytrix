@@ -55,7 +55,7 @@ use crate::{
     render::{
         RenderStats,
         compositor::{CopyPlan, DamageRects, FramePlan, ImageCopyPlan, Plan},
-        frame::{FramePayload, FrameRequest, FrameSlot, MAX_FRAMES_IN_FLIGHT},
+        frame::{FramePayload, FrameRequest, FrameSlot, InstanceMirror, MAX_FRAMES_IN_FLIGHT},
         retire::GpuResourceHandle,
         timer::{FrameTimings, GpuTimerSample, Section},
         uniform::RootUniform,
@@ -124,6 +124,8 @@ pub(crate) struct GpuRenderer {
     /// 本窗口的图集上传路径（待上传页 + 每槽 staging）。
     atlas_uploads: AtlasUploads,
     upload: UploadArena,
+    /// 实例缓冲的持久镜像（增量写：只写变化区间，见 `render/frame.rs` 的 `InstanceMirror`）。
+    mirror: InstanceMirror,
     command_pool: vk::CommandPool,
     commands: [vk::CommandBuffer; MAX_FRAMES_IN_FLIGHT],
     timer: Option<GpuTimer>,
@@ -249,6 +251,7 @@ impl GpuRenderer {
         let persist = Persist::new(&shared, target)?;
         let swapchain_images = swapchain.as_ref().map_or(1, Swapchain::image_count);
         let upload = UploadArena::new(&shared)?;
+        let mirror = InstanceMirror::new(MAX_FRAMES_IN_FLIGHT);
         let (command_pool, commands) = create_commands(&shared)?;
         let timer = GpuTimer::new(&shared)?;
         let sync = FrameSync::new(&shared)?;
@@ -261,6 +264,7 @@ impl GpuRenderer {
             descriptors,
             atlas_uploads: AtlasUploads::new(),
             upload,
+            mirror,
             command_pool,
             commands,
             timer,
@@ -694,7 +698,7 @@ impl GpuRenderer {
         // 一次性帧的序号在渲染器内部单调递增：timeline 的 signal 值必须严格递增。
         self.snapshot_index += 1;
         let index = FrameIndex::from_raw(self.snapshot_index);
-        let payload = FramePayload::from_buffer(buffer);
+        let payload = FramePayload::full(buffer);
         let mut timings = FrameTimings::new();
         let mut frame = FramePlan::new(Plan::Full, true);
         self.submit_snapshot(index, &payload, &mut frame, &mut timings)?;
@@ -731,12 +735,9 @@ impl GpuRenderer {
         let upload_started = Instant::now();
         // 本帧换代 / 扩容换下的句柄：在录制尝试之后统一挂 retire（错误路径由 teardown 兜底）。
         let mut retired: Vec<GpuResourceHandle> = Vec::new();
-        let upload = self.upload.write(
-            slot.index,
-            payload.instances(),
-            bytemuck::cast_slice(payload.clips()),
-            &mut retired,
-        );
+        let upload = self
+            .upload
+            .write(&mut self.mirror, slot.index, payload, &mut retired);
         let (_instance_bytes, clip_offset, _clip_bytes) = match upload {
             Ok(values) => values,
             Err(error) => {
@@ -773,7 +774,7 @@ impl GpuRenderer {
         Ok((
             RenderStats {
                 draw_calls,
-                instances: (payload.instances().len() / 128) as u32,
+                instances: payload.drawn_instances(),
             },
             slot.signal_value,
         ))
@@ -1708,16 +1709,21 @@ impl UploadArena {
 
     /// 写本帧的实例/裁剪字节；容量不够时扩容（旧句柄进 `retired`，本帧完成后释放）。
     ///
-    /// 返回 `(instance_bytes, clip_offset, clip_bytes)`。
+    /// 实例走**增量写**：`InstanceMirror` 持有完整实例字节，本帧只把变化区间（或整块，当该槽
+    /// 需要整块重写时）拷进当前槽的持久映射；未变化的段保留该槽上次的内容。裁剪表仍然全量写
+    /// （小表，且表项索引必须与实例里内嵌的 `clip_index` 同帧一致）。
+    ///
+    /// 返回 `(instance_count, clip_offset, clip_bytes)`。
     fn write(
         &mut self,
+        mirror: &mut InstanceMirror,
         slot: usize,
-        instances: &[u8],
-        clips: &[u8],
+        payload: &FramePayload,
         retired: &mut Vec<GpuResourceHandle>,
-    ) -> Result<(u64, u64, u64), EngineError> {
-        let instance_count = (instances.len() / 128) as u32;
-        let clip_count = (clips.len() / 48) as u32;
+    ) -> Result<(u32, u64, u64), EngineError> {
+        let instance_count = payload.instance_count();
+        let clips = payload.clips();
+        let clip_count = clips.len() as u32;
         if instance_count > self.slots[slot].instance_capacity
             || clip_count > self.slots[slot].clip_capacity
         {
@@ -1727,6 +1733,8 @@ impl UploadArena {
             let old = std::mem::replace(&mut self.slots[slot], replacement);
             // 旧缓冲在本帧完成之后由 retire 队列销毁（其块区间随之回到内存池）。
             retired.push(old.buffer.handle);
+            // 新缓冲内容未定义：这个槽的增量欠账全部作废，下一次必须整块重写。
+            mirror.invalidate(slot);
         }
         let slot_ref = &self.slots[slot];
         let Some(base) = slot_ref.buffer.pointer else {
@@ -1735,24 +1743,35 @@ impl UploadArena {
                 "suballocated upload buffer has no host mapping",
             ));
         };
+        let full = mirror.prepare(slot, payload);
+        let instance_bytes = instance_count as usize * 128;
+        let clip_offset = slot_ref.clip_offset;
         // SAFETY: 持久映射覆盖整个块；写入范围由本槽容量保证在自己的子分配内（上面的扩容刚做过）。
         unsafe {
-            if !instances.is_empty() {
-                std::ptr::copy_nonoverlapping(instances.as_ptr(), base, instances.len());
+            if full {
+                let bytes = &mirror.bytes()[..instance_bytes];
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), base, bytes.len());
+            } else {
+                for range in mirror.writes() {
+                    let start = range.start as usize * 128;
+                    let end = range.end as usize * 128;
+                    std::ptr::copy_nonoverlapping(
+                        mirror.bytes()[start..end].as_ptr(),
+                        base.add(start),
+                        end - start,
+                    );
+                }
             }
             if !clips.is_empty() {
                 std::ptr::copy_nonoverlapping(
-                    clips.as_ptr(),
-                    base.add(slot_ref.clip_offset as usize),
-                    clips.len(),
+                    bytemuck::cast_slice::<GpuClipEntry, u8>(clips).as_ptr(),
+                    base.add(clip_offset as usize),
+                    clips.len() * 48,
                 );
             }
         }
-        Ok((
-            instances.len() as u64,
-            slot_ref.clip_offset,
-            clips.len() as u64,
-        ))
+        mirror.finish(slot);
+        Ok((instance_count, clip_offset, clips.len() as u64))
     }
 
     /// teardown：把本窗口上传缓冲的句柄交回共享设备。

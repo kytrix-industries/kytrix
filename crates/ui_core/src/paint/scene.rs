@@ -28,12 +28,25 @@ pub(crate) const MAX_CLIP_DEPTH: u8 = 8;
 pub(crate) struct Lane {
     primitives: Vec<Primitive>,
     clip_depth: u8,
+    /// 内容版本（**增量实例编码的复用判据**，`docs` B6 §2）：
+    ///
+    /// 任何会改变 lane 内容（图元序列）的操作都 `+1`：`push`（追加图元）与 `clear`
+    /// （重建 / 隐藏清空 / `clear_frame`）。编码器把「版本未变」当作「实例段可以整段复用」，
+    /// 因此**严禁**在任何内容修改点漏掉版本递增 —— 漏掉会让下游一直画旧像素。
+    ///
+    /// `u32` 环绕是安全的：判据是「与上次编码的版本相等」，不依赖顺序。
+    version: u32,
 }
 
 impl Lane {
     /// 空 lane。消费者：`Canvas::new`。
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// 当前内容版本（消费者：`InstanceEncoder` 的 lane 复用判据）。
+    pub(crate) fn version(&self) -> u32 {
+        self.version
     }
 
     /// 唯一的压入点：更新 `clip_depth`（消费者：`Canvas` 的 `push_*`、`Scene::push`）。
@@ -55,6 +68,7 @@ impl Lane {
             }
             _ => {}
         }
+        self.version = self.version.wrapping_add(1);
         self.primitives.push(primitive);
     }
 
@@ -62,6 +76,7 @@ impl Lane {
     pub(crate) fn clear(&mut self) {
         self.primitives.clear();
         self.clip_depth = 0;
+        self.version = self.version.wrapping_add(1);
     }
 
     /// 当前 clip 嵌套深度。消费者：`Lane::push`（内部）与 `Canvas` 的 `pop_clip` 空栈判据。
@@ -126,16 +141,20 @@ impl ArenaKey for LaneId {
 }
 
 impl LaneId {
+    /// arena 槽位下标（**crate 内**：编码器的段表按它索引；应用层不暴露，避免依赖槽位布局）。
+    pub(crate) const fn slot(self) -> u32 {
+        self.index
+    }
+
+    /// 代际（**crate 内**：编码器用它判定「槽位已被新 lane 复用 ⇒ 旧段失效」）。
+    pub(crate) const fn generation(self) -> u32 {
+        self.generation
+    }
+
     /// arena 槽位下标（**仅测试**：公开面不暴露内部下标，避免应用层依赖槽位布局）。
     #[cfg(test)]
     pub(crate) const fn index(self) -> u32 {
         self.index
-    }
-
-    /// 代际（**仅测试**：同上）。
-    #[cfg(test)]
-    pub(crate) const fn generation(self) -> u32 {
-        self.generation
     }
 
     /// 仅测试：直接构造句柄（layout 侧表与 `remove` 的 lane 归还用例需要）。
@@ -231,6 +250,17 @@ impl Scene {
     #[must_use]
     pub fn lane_primitives(&self, id: LaneId) -> Option<&[Primitive]> {
         self.lanes.get(id).map(Lane::primitives)
+    }
+
+    /// 一条 lane 的**内容版本 + 图元切片**（增量实例编码的复用判据）。
+    ///
+    /// 编码器热路径只查一次 arena：`None` = 句柄陈旧/已释放；版本与上次编码时相同 ⇒ 该 lane
+    /// 的实例段整段复用（不重编码、不重传）。
+    #[must_use]
+    pub(crate) fn lane_state(&self, id: LaneId) -> Option<(u32, &[Primitive])> {
+        self.lanes
+            .get(id)
+            .map(|lane| (lane.version(), lane.primitives()))
     }
 
     /// 已分配的 lane 数。
@@ -574,5 +604,41 @@ mod tests {
         assert_eq!(scene.order(), &[a, b], "空 lane 保留在绘制序里");
         assert_eq!(scene.primitive_count(), 1, "空 lane 不贡献图元");
         assert!(!scene.is_empty());
+    }
+
+    // ── B6：lane 版本（增量实例编码的复用判据）──────────────────────────────
+
+    /// 任何内容修改都必须推进版本：`push` / `clear_lane` / `clear_frame`。
+    ///
+    /// 漏掉任何一处都会让下游（`InstanceEncoder`）把「内容已变」的 lane 当成可复用段，
+    /// 于是画面停在旧内容上 —— 这条测试就是那个不变量的守卫。
+    #[test]
+    fn lane_version_advances_on_every_content_mutation() {
+        let mut scene = Scene::empty();
+        let lane = scene.new_lane();
+        let version = |scene: &Scene| scene.lane_state(lane).map(|(version, _)| version);
+        let initial = version(&scene).expect("lane 存在");
+
+        assert!(scene.push(lane, quad()));
+        let after_push = version(&scene).expect("lane 存在");
+        assert_ne!(after_push, initial, "push 必须推进版本");
+
+        assert!(scene.clear_lane(lane));
+        let after_clear = version(&scene).expect("lane 存在");
+        assert_ne!(after_clear, after_push, "clear_lane 必须推进版本");
+
+        assert!(scene.push(lane, quad()));
+        scene.clear_frame();
+        assert_ne!(
+            version(&scene).expect("lane 存在"),
+            after_clear,
+            "clear_frame 必须推进版本"
+        );
+
+        scene.release_lane(lane);
+        assert!(
+            version(&scene).is_none(),
+            "释放之后版本查询给 None（陈旧句柄不得命中复用判据）"
+        );
     }
 }

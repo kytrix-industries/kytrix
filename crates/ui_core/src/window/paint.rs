@@ -26,6 +26,8 @@ pub(crate) fn paint_frame(
     // 借用式取出（保容量）：`tree` 与 `scene` 是不同字段，循环内可同时可变借用。
     for lane in window.tree.drain_removed_lanes() {
         window.scene.release_lane(lane);
+        // 编码器的实例段也同步回收：否则它的实例环要等 arena 槽位被新 lane 复用才释放。
+        window.encoder.release_lane(lane);
     }
     let scale = window.scale;
     let frame = window.frame_rect();
@@ -53,6 +55,12 @@ pub(crate) fn paint_frame(
             #[cfg(feature = "test-support")]
             instances: 0,
             #[cfg(feature = "test-support")]
+            encoded_lanes: 0,
+            #[cfg(feature = "test-support")]
+            reused_segments: 0,
+            #[cfg(feature = "test-support")]
+            uploaded_bytes: 0,
+            #[cfg(feature = "test-support")]
             log: crate::test_support::record::PaintLog::default(),
         });
     }
@@ -77,6 +85,9 @@ pub(crate) fn paint_frame(
     #[cfg(feature = "test-support")]
     {
         report.instances = buffer.len();
+        report.encoded_lanes = window.encoder.encoded_lanes();
+        report.reused_segments = window.encoder.reused_segments();
+        report.uploaded_bytes = window.encoder.written_bytes();
     }
     #[cfg(not(feature = "test-support"))]
     {
@@ -103,6 +114,12 @@ pub(crate) fn needs_node_repaint(window: &Window) -> bool {
 /// 最近一帧的编码结果（渲染层上传源；P08 的 `Renderer` 消费）。
 pub(crate) fn instance_buffer(window: &Window) -> &InstanceBuffer {
     window.encoder.buffer()
+}
+
+// 消费者：`impl Window::instance_buffer_mut` 的薄委托（外部调用点见该方法文档）。
+/// 编码结果的可变视图：`FramePayload` 的增量载荷构建要取走并清空变化区间。
+pub(crate) fn instance_buffer_mut(window: &mut Window) -> &mut InstanceBuffer {
+    window.encoder.buffer_mut()
 }
 
 // 消费者：`impl Window::instance_bytes` 的薄委托（外部调用点见该方法文档）。

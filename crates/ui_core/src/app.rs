@@ -654,6 +654,37 @@ impl App {
         style_pass::unbind_key(self, key, modifiers)
     }
 
+    /// Edit 菜单项的可用性快照（R09-1 收尾 / AR3 macOS P2-11）。
+    ///
+    /// 判据是**能力**，不是「有文本焦点」：某命令启用 ⇔ `text_editing` 为真 **且** 该命令的
+    /// 键组合在引擎侧真有接收者（应用 `bind_key` 绑定了它，并且 `on_action` 注册了处理器）。
+    /// 否则菜单项置灰 —— 「可点但点了没反应」比置灰更糟（用户会以为剪贴板/撤销坏了）。
+    ///
+    /// 为什么引擎不自己实现复制/粘贴/撤销：引擎没有内建文本控件，文本模型与选区归应用所有
+    /// （`design/phase-12-macos-linux.md` §7.2）；菜单动作只被翻译成与物理按键等价的
+    /// [`crate::event::InputEvent::Key`]，能执行它的只有应用注册的那条绑定。
+    ///
+    /// 与 `app::input::dispatch_action_with_hit` 的「引擎内置动作」名单保持同一份：那边新增
+    /// 内置动作时这里必须同步（否则绑到内置动作上的命令会被误判成没有接收者）。
+    ///
+    /// 只在 macOS 与测试构建里编译：其它平台没有由应用承载的系统菜单栏。
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn edit_menu_availability(
+        &self,
+        text_editing: bool,
+    ) -> crate::platform::menu::EditAvailability {
+        crate::platform::menu::EditAvailability::resolve(text_editing, |key, modifiers| {
+            self.bindings.iter().any(|binding| {
+                binding.key == key
+                    && binding.modifiers == modifiers
+                    && (matches!(
+                        binding.action,
+                        Action::FocusNext | Action::FocusPrev | Action::Dismiss
+                    ) || self.handlers.contains_key(&binding.action))
+            })
+        })
+    }
+
     /// 非追踪读一个信号（handler 不是渲染 pass，不登记依赖）。
     ///
     /// # Panics
@@ -1304,6 +1335,25 @@ impl App {
     /// `&mut App`，不能在使用 `self.close_handlers` 的借用期内存活。
     pub(crate) fn request_close(&mut self, id: WindowId) -> bool {
         window_set::request_close(self, id)
+    }
+
+    /// 两阶段批量关闭（AR3 macOS P1-2）：**先询问全部窗口，全部同意后才统一关闭**。
+    ///
+    /// 返回 `false` = 有窗口的关闭处理器 veto ⇒ **一个窗口都没有被关闭**，调用方必须回滚整个
+    /// 流程（macOS 退出握手就此回复 AppKit「不终止」）。
+    ///
+    /// 退出握手必须用它而不是逐窗 [`Self::request_close`]：后者在批准时**立刻**关窗，于是
+    /// 「窗口 A 同意、窗口 B veto」的退出会留下「A 已被拆掉（Renderer 已 drop、应用状态丢失）
+    /// 却告诉用户『退出已取消』」——用户点取消，另一个窗口已经没了。
+    ///
+    /// 每个关闭处理器在一次调用里恰好跑一次（批准后第二阶段直接关窗，不再问一遍：否则就会
+    /// 两次弹确认框）。
+    ///
+    /// 只在 macOS 与测试构建里编译：唯一消费者是 macOS 的 `request_quit`（其它平台一次只处理
+    /// 一个窗口的关闭请求，没有「一次性关掉全部窗口」的入口）。
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn request_close_all(&mut self, ids: &[WindowId]) -> bool {
+        window_set::request_close_all(self, ids)
     }
 
     /// 关窗：精确退订该窗口全部节点的依赖，然后丢弃。返回 `false` = 窗口不存在。

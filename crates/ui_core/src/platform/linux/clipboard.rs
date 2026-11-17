@@ -23,6 +23,7 @@ use std::{
     io::Read,
     os::fd::{AsFd, OwnedFd},
     sync::{Mutex, OnceLock},
+    time::Instant,
 };
 
 use smol_str::SmolStr;
@@ -34,7 +35,8 @@ use wayland_client::{
 use crate::{
     error::EngineError,
     platform::wayland::selection::{
-        MAX_SELECTION_BYTES, MIME_TEXT, OfferId, OfferTable, SelectionSources, SourceGeneration,
+        LiveSource, MAX_PENDING_SEND_BYTES, MAX_SELECTION_BYTES, MIME_TEXT, OfferId, OfferTable,
+        SEND_DEADLINE, SelectionBackend, SelectionSources, SendBudget, publish_selection,
         too_large,
     },
 };
@@ -52,6 +54,15 @@ const PIPE_BUF: usize = 4096;
 fn outgoing() -> &'static Mutex<Option<SmolStr>> {
     static OUTGOING: OnceLock<Mutex<Option<SmolStr>>> = OnceLock::new();
     OUTGOING.get_or_init(|| Mutex::new(None))
+}
+
+/// 进程内未完成 `wl_data_source.send` 的字节预算（R10-17 / AR3 §3.4）。
+///
+/// 任务被交给 calloop 事件源之后就不再由 `Clipboard` 持有，所以预算必须是进程级的共享状态：
+/// [`PendingSend`] 创建时预留、`Drop` 时归还。
+fn send_budget() -> &'static Mutex<SendBudget> {
+    static BUDGET: OnceLock<Mutex<SendBudget>> = OnceLock::new();
+    BUDGET.get_or_init(|| Mutex::new(SendBudget::new(MAX_PENDING_SEND_BYTES)))
 }
 
 /// 最近一次从选区收到的文本（读回线程写、`App::clipboard_text` 读）。
@@ -114,6 +125,8 @@ pub(crate) struct PendingSend {
     bytes: bytes::Bytes,
     /// 已写出的字节数（`&File: Write` 允许在 `&self` 上推进写指针）。
     written: Cell<usize>,
+    /// 放弃时刻（`SEND_DEADLINE`）：读得太慢的对端不能永久占住 fd（AR3 §3.4）。
+    deadline: Instant,
 }
 
 impl AsFd for PendingSend {
@@ -125,13 +138,17 @@ impl AsFd for PendingSend {
 impl PendingSend {
     /// 可写事件：写一片数据，返回 `true` = 写完了（调用方应把事件源摘掉 ⇒ drop 关闭 fd）。
     ///
-    /// `Ok(true)`：全部写完；`Ok(false)`：还有剩余（下一次可写事件继续）；
+    /// `Ok(true)`：全部写完 / 已到截止时间（放弃）；`Ok(false)`：还有剩余（下一次可写事件继续）；
     /// `Err(_)`：对端已关闭（`EPIPE`）或 IO 错误 —— 按协议直接关闭 fd 即可。
     pub(crate) fn write_more(&self) -> std::io::Result<bool> {
         use std::io::Write;
         let written = self.written.get();
         if written >= self.bytes.len() {
             // 已经写完（正常路径不会走到：写完就返回 `Ok(true)` 摘掉事件源）。
+            return Ok(true);
+        }
+        if Instant::now() >= self.deadline {
+            // 读得太慢：放弃剩余数据（关闭 fd ⇒ 对端读到 EOF），把预算还回去。
             return Ok(true);
         }
         let remaining = &self.bytes[written..];
@@ -151,6 +168,15 @@ impl PendingSend {
     }
 }
 
+impl Drop for PendingSend {
+    fn drop(&mut self) {
+        // fd 随 `file` 关闭；预算归还（写完 / 出错 / 被截止 / 被淘汰都走这里）。
+        if let Ok(mut budget) = send_budget().lock() {
+            budget.release(self.bytes.len());
+        }
+    }
+}
+
 /// 协议侧状态（`WaylandState` 持有；主线程独占）。
 pub(crate) struct Clipboard {
     /// 数据设备（`set_selection` 在它上面，需要 source + serial）。
@@ -161,17 +187,48 @@ pub(crate) struct Clipboard {
     /// 发布方向的状态机（世代号 ↔ 文本）。
     sources: SelectionSources,
     /// 当前持有的 `wl_data_source` 与它的世代（`None` = 我们不是选区属主）。
-    source: Option<(SourceGeneration, wl_data_source::WlDataSource)>,
+    source: Option<LiveSource<wl_data_source::WlDataSource>>,
     /// 收到的 offer：内部 id ↔ 协议代理（顺序即到达顺序；`selection` 用代理相等性反查）。
     offer_proxies: Vec<(OfferId, wl_data_offer::WlDataOffer)>,
     /// offer 的 mime 表（`selection` 事件**自带**的 offer 是唯一权威来源，R10-9）。
     offers: OfferTable,
-    /// 待交给事件循环的写出任务（带上限：对端不读时会攒起来，超限直接关闭最老的）。
+    /// 待交给事件循环的写出任务（字节总量由进程级预算封顶，见 `send_budget`）。
     pending_sends: Vec<PendingSend>,
 }
 
 /// 未完成写出任务的并发上限（每个任务占一个 fd；对端不读时不能无限攒 fd）。
 const MAX_PENDING_SENDS: usize = 8;
+
+/// `wl_data_source` 的生产实现：把 [`SelectionBackend`] 的动作落到真实协议对象上。
+///
+/// 三个协议对象以**字段级借用**传入（而不是借用整个 `Clipboard`），这样
+/// [`publish_selection`] 可以同时可变借用 `sources` / `source` 两个字段。
+struct SourceOps<'a> {
+    manager: &'a wl_data_device_manager::WlDataDeviceManager,
+    device: &'a wl_data_device::WlDataDevice,
+    queue: &'a QueueHandle<crate::platform::linux::surface::WaylandState>,
+}
+
+impl SelectionBackend for SourceOps<'_> {
+    type Source = wl_data_source::WlDataSource;
+
+    fn create_source(&mut self) -> Self::Source {
+        let source = self.manager.create_data_source(self.queue, ());
+        // 顺序即偏好（`preferred_mime` 按同一份常量挑）。
+        for mime in MIME_TEXT {
+            source.offer(mime.to_owned());
+        }
+        source
+    }
+
+    fn destroy_source(&mut self, source: Self::Source) {
+        source.destroy();
+    }
+
+    fn set_selection(&mut self, source: &Self::Source, serial: u32) {
+        self.device.set_selection(Some(source), serial);
+    }
+}
 
 impl Clipboard {
     pub(crate) fn new(
@@ -195,6 +252,9 @@ impl Clipboard {
     ///
     /// `serial` 必须是最近的输入 serial：**serial 为 0 时不能 `take`**，否则文本会被静默丢弃
     /// （启动后第一个循环还没有任何输入事件，`serial` 恒为 0）。等到下一次带 serial 的事件再发布。
+    ///
+    /// 协议动作的**顺序**由 [`publish_selection`] 决定（旧 source 先 `destroy`、再新建、再
+    /// `set_selection`），单测在 `platform/wayland/selection.rs`（AR3 §3.1 / P2-7）。
     pub(crate) fn apply_pending(&mut self, serial: u32) {
         if serial == 0 {
             return;
@@ -202,19 +262,12 @@ impl Clipboard {
         let Some(text) = outgoing().lock().ok().and_then(|mut slot| slot.take()) else {
             return;
         };
-        let outcome = self.sources.publish(text);
-        // 旧 source 已经失效（协议：一个 source 只服务一次选区）⇒ 立即销毁，绝不能复用。
-        if outcome.replaced_live_source
-            && let Some((_, previous)) = self.source.take()
-        {
-            previous.destroy();
-        }
-        let source = self.manager.create_data_source(&self.queue, ());
-        for mime in MIME_TEXT {
-            source.offer(mime.to_owned());
-        }
-        self.device.set_selection(Some(&source), serial);
-        self.source = Some((outcome.generation, source));
+        let mut ops = SourceOps {
+            manager: &self.manager,
+            device: &self.device,
+            queue: &self.queue,
+        };
+        publish_selection(&mut ops, &mut self.sources, &mut self.source, text, serial);
     }
 
     /// `wl_data_device` 事件：新 offer / 选区变化 / 拖放离开。
@@ -295,7 +348,9 @@ impl Clipboard {
 
     /// `wl_data_source.send`：把文本交给**异步**写出队列（R10-17），绝不在这里阻塞。
     ///
-    /// `data_source` 决定用哪一份已发布文本（R10-1：按 source 归属）。
+    /// `data_source` 决定用哪一份已发布文本（R10-1：按 source 归属）。字节预算（
+    /// [`MAX_PENDING_SEND_BYTES`]）不够时按协议直接关闭 fd：对端读到 EOF，主线程与内存都不
+    /// 受影响（AR3 §3.4）。
     pub(crate) fn handle_send(
         &mut self,
         data_source: &wl_data_source::WlDataSource,
@@ -305,18 +360,27 @@ impl Clipboard {
         let generation = self
             .source
             .as_ref()
-            .filter(|(_, source)| source.id() == data_source.id())
-            .map(|(generation, _)| *generation);
+            .filter(|live| live.source.id() == data_source.id())
+            .map(|live| live.generation);
         let Some(text) = generation.and_then(|generation| self.sources.take_text(generation))
         else {
             // source 已经 cancelled（或不是我们的 source）：按协议直接关闭 fd，对端读到 EOF。
             return;
         };
         let bytes = bytes::Bytes::copy_from_slice(text.as_bytes());
+        // 先记账再排队：`PendingSend` 的 `Drop` 负责归还，未排队的失败路径不会漏账。
+        let admitted = send_budget()
+            .lock()
+            .map(|mut budget| budget.admit(bytes.len()))
+            .unwrap_or(false);
+        if !admitted {
+            return;
+        }
         let send = PendingSend {
             file: std::fs::File::from(fd),
             bytes,
             written: Cell::new(0),
+            deadline: Instant::now() + SEND_DEADLINE,
         };
         // 积压保护：对端迟迟不读时，先关掉最老的 fd（对端读到 EOF）而不是无限攒 fd。
         while self.pending_sends.len() >= MAX_PENDING_SENDS {
@@ -330,15 +394,15 @@ impl Clipboard {
     /// 无论这条事件属于哪一代，**都必须销毁这个 source**（协议原文 "The client should clean up
     /// and destroy this data source"）；只有当前世代才清空已发布文本。
     pub(crate) fn handle_cancelled(&mut self, data_source: &wl_data_source::WlDataSource) {
-        let Some((generation, source)) = self
+        let Some(live) = self
             .source
-            .take_if(|(_, source)| source.id() == data_source.id())
+            .take_if(|live| live.source.id() == data_source.id())
         else {
             data_source.destroy();
             return;
         };
-        self.sources.cancelled(generation);
-        source.destroy();
+        self.sources.cancelled(live.generation);
+        live.source.destroy();
     }
 
     /// 取出待写出的任务（事件循环把它们注册成 calloop 的可写事件源）。
@@ -362,8 +426,8 @@ impl Drop for Clipboard {
         // 退出路径：显式销毁 source（协议要求「不再需要时 destroy」，服务端对象不会随客户端
         // 代理 drop 消失）并清空已发布状态；未写完的 send 由 `PendingSend` 的 drop 关闭 fd。
         self.sources.clear();
-        if let Some((_, source)) = self.source.take() {
-            source.destroy();
+        if let Some(live) = self.source.take() {
+            live.source.destroy();
         }
         self.destroy_offers();
     }

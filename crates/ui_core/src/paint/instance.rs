@@ -3,12 +3,16 @@
 //! 本文是 `render/shaders/contract.md` 的**权威来源**（I2/I8）：字段顺序、offset、`kind`/`params`
 //! 取值表的任何改动都必须同时改 Rust、三套 shader、`contract.md`，并触发像素快照回归。
 //!
-//! 范围（`design/phase-06-paint-runtime.md` §7）：
+//! 范围（`design/phase-06-paint-runtime.md` §7、`ui_core-架构决策-B3B6.md` §2）：
 //! - 8 类 `Primitive` → `GpuPrimitive`（`GlyphRun` 是唯一的 1→N）；
 //! - `Path`/`Geometry` 0 实例 + `FrameOp::Geometry`；
-//! - clip 链去重（`ClipChainId`，帧内索引）+ **轴对齐矩形求交合并**（Skia `SkClipStack` 语义）+
-//!   矩形/圆角两种覆盖率语义（矩形 = 像素精确 scissor、圆角 = 解析 AA；见 [`ClipKind`]）；
-//! - `InstanceBuffer` 容量 = 历史峰值（`clear` 只截断、不 shrink、不按帧翻倍）。
+//! - clip 链去重（`ClipChainId`，**跨帧稳定索引**）+ **轴对齐矩形求交合并**（Skia `SkClipStack`
+//!   语义）+ 矩形/圆角两种覆盖率语义（矩形 = 像素精确 scissor、圆角 = 解析 AA；见 [`ClipKind`]）；
+//! - **按 lane 分段 + 版本复用**的增量编码：`Scene` 的每条 lane 有内容版本，版本未变 ⇒ 整段
+//!   复用（不重编码、不重传）；版本变化才重编码那一条 lane 并只上传它的实例段。实例环 =
+//!   「lane 段 + 空洞」，容量按历史峰值保留（`compaction` 在无脏帧压实）；
+//! - 绘制序 op 按**连续 lane 段**合并（一条 draw call 画多条 lane），每条 op 带真实包围盒，
+//!   damage 的 op 级跳过因此真正生效。
 //!
 //! **P07 只做上传/批次**：本模块不碰 GPU、不持设备。
 
@@ -158,7 +162,7 @@ fn normalize_corner_radius(radii: [f32; 4], width: f32, height: f32) -> [f32; 4]
     sanitized.map(|radius| (radius * scale).min(half_min))
 }
 
-/// `ClipChain` 的帧内索引；`0` 是「无裁剪」哨兵。
+/// `ClipChain` 在裁剪表里的索引（**跨帧稳定**：表只追加 / 按内容去重，`0` 是「无裁剪」哨兵）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ClipChainId(u32);
 
@@ -303,6 +307,16 @@ impl PhysicalBounds {
         self.x0 <= other[2] && other[0] <= self.x1 && self.y0 <= other[3] && other[1] <= self.y1
     }
 
+    /// 并入另一个可见范围（`build_ops` 的 lane 段合并）。
+    fn union(self, other: Self) -> Self {
+        Self {
+            x0: self.x0.min(other.x0),
+            y0: self.y0.min(other.y0),
+            x1: self.x1.max(other.x1),
+            y1: self.y1.max(other.y1),
+        }
+    }
+
     /// 并入一个实例的可见范围。
     fn union_instance(&mut self, primitive: &GpuPrimitive) {
         let (Some(extent), Some(clip)) = (instance_extent(primitive), clip_extent(primitive))
@@ -412,12 +426,140 @@ fn extent_of(x: f32, y: f32, w: f32, h: f32, pad: f32) -> Option<[i32; 4]> {
     ])
 }
 
-/// 一帧的编码产物（容量跨帧保留）。
+/// 绘制序里一条 op 最多合并多少条**实例环连续**的 lane。
+///
+/// 为什么不「一条 lane 一条 op」：10k lane 的整帧会产生 10k 次 draw call（三个后端的单次提交
+/// 是微秒级），整帧绘制反而更慢。合并后一条 op 覆盖一段连续的 lane 段，`bounds` 是这些段的
+/// 实例包围盒并集 —— damage 的 op 级跳过照旧生效（代价只是同一组内的邻居多画一遍，仍被
+/// scissor 夹住）。
+const MAX_LANES_PER_OP: u32 = 64;
+
+/// 裁剪表条数上限：超过就**整表重建**（重置 ⇒ 下一帧全量重编码）。
+///
+/// 裁剪表跨帧持久（复用实例段里内嵌的 `clip_index` 必须继续有效），因此只增不减；动画 /
+/// 滚动每帧产生的旧表项是垃圾。上限把「每帧整表上传」的字节数钉住（2048 × 48 B ≈ 96 KiB），
+/// 重置的代价是一帧全量编码 —— 只有长动画才会触发。
+const CLIP_TABLE_LIMIT: usize = 2048;
+
+/// 变化区间的合并间隙（实例数）：距离小于该值的两个区间并成一块上传。
+///
+/// 间隙里的字节是垃圾（没有任何 op 引用它），多搬几个实例（每条 128 B）比多一次 chunk
+/// 记账便宜。取 8 = 1 KiB 一次 `memcpy` 的零头。
+const CHANGE_MERGE_GAP: u32 = 8;
+
+/// 一条 lane 的实例段（跨帧保留：版本一致时整段复用，不重编码）。
+struct LaneSegment {
+    /// 编码时的 lane 代际（arena 槽位被新 lane 复用时旧段作废）。
+    generation: u32,
+    /// 编码时的 lane 版本；与 `Scene::lane_state` 不等 ⇒ 重编码。
+    version: u32,
+    /// 实例环下标区间 `[start, end)`（`end - start` = 本 lane 的实例数）。
+    start: u32,
+    end: u32,
+    /// 段内绘制项（实例 run 与几何绘制按绘制序交错）。
+    parts: SmallVec<[LanePart; 2]>,
+}
+
+impl LaneSegment {
+    fn range(&self) -> std::ops::Range<u32> {
+        self.start..self.end
+    }
+
+    fn len(&self) -> u32 {
+        self.end - self.start
+    }
+}
+
+/// lane 内的一个绘制项。
+///
+/// 几何项**装箱**：`GeometryDrawGpu` 带 24 B 变换 + `Arc`，内联会把 `LanePart` 撑到 ~100 B
+/// （每 lane 一个段，10k lane 就是 MB 级常驻）。装箱后每个绘制项 24 B。
+enum LanePart {
+    /// 段内连续 `len` 个实例。
+    Instances { len: u32, bounds: PhysicalBounds },
+    /// 一次几何绘制；每帧生成 op 表时把 `draw` 复制进 `InstanceBuffer::geometry`。
+    Geometry(Box<LaneGeometry>),
+}
+
+/// 几何绘制项（`LanePart::Geometry` 的载荷）。
+struct LaneGeometry {
+    draw: GeometryDrawGpu,
+    clip_index: u32,
+    clip_rect: [u32; 4],
+    bounds: PhysicalBounds,
+}
+
+/// 自上次取走以来内容变化的实例区间（**增量载荷**的唯一来源）。
+#[derive(Default)]
+struct ChangeSet {
+    ranges: Vec<std::ops::Range<u32>>,
+    /// `ranges` 是否已按 `start` 升序（按绘制序写入时天然有序，只有段搬移才乱序）。
+    sorted: bool,
+}
+
+impl ChangeSet {
+    fn clear(&mut self) {
+        self.ranges.clear();
+        self.sorted = true;
+    }
+
+    fn push(&mut self, range: std::ops::Range<u32>) {
+        if range.is_empty() {
+            return;
+        }
+        if self
+            .ranges
+            .last()
+            .is_some_and(|last| last.start > range.start)
+        {
+            self.sorted = false;
+        }
+        self.ranges.push(range);
+    }
+
+    /// 排序 + 合并（间隙 < `CHANGE_MERGE_GAP` 的并成一块），返回合并后的区间。
+    fn merged(&mut self) -> &[std::ops::Range<u32>] {
+        if !self.sorted {
+            self.ranges.sort_unstable_by_key(|range| range.start);
+            self.sorted = true;
+        }
+        let mut out = 0usize;
+        for read in 0..self.ranges.len() {
+            let range = self.ranges[read].clone();
+            if out > 0 {
+                let last = &mut self.ranges[out - 1];
+                if range.start <= last.end.saturating_add(CHANGE_MERGE_GAP) {
+                    last.end = last.end.max(range.end);
+                    continue;
+                }
+            }
+            self.ranges[out] = range;
+            out += 1;
+        }
+        self.ranges.truncate(out);
+        &self.ranges
+    }
+}
+
+/// 一帧的编码产物：实例环 + 裁剪表（两者**跨帧持久**）与每帧重建的绘制序 / 几何表。
+///
+/// 实例环是「lane 段 + 空洞」的拼接（按长度精确打包、首次适配复用底层空闲块）。**不留对齐
+/// 填充**：相邻 lane 的段必须首尾相接，绘制序才能把连续 lane 合并成一条 op（对齐填充会
+/// 让 10k lane 变成 10k 次 draw call）。空洞里的字节是垃圾，没有任何 op 引用它；压缩只在
+/// 无脏帧执行。裁剪表跨帧持久的原因见 [`InstanceEncoder`]。
 pub(crate) struct InstanceBuffer {
     instances: Vec<GpuPrimitive>,
+    /// 空闲实例块（升序、不重叠、不相邻）。
+    free: Vec<std::ops::Range<u32>>,
+    /// 实例环已分配到的末尾（= 已分配块的长度之和）。
+    used: u32,
     clips: Vec<ClipChain>,
     geometry: Vec<GeometryDrawGpu>,
     ops: Vec<FrameOp>,
+    /// lane arena 槽位下标 → 实例段（陈旧代际的项在下一次命中的槽位时回收）。
+    segments: Vec<Option<Box<LaneSegment>>>,
+    /// 自上次取走以来内容变化的区间。
+    changed: ChangeSet,
 }
 
 /// 几何绘制的**帧内**表示：颜色已由 UI 线程解析成 linear premultiplied RGBA。
@@ -443,28 +585,51 @@ pub(crate) struct GeometryDrawGpu {
 
 impl InstanceBuffer {
     fn new() -> Self {
-        Self {
+        let mut buffer = Self {
             instances: Vec::with_capacity(256),
+            free: Vec::new(),
+            used: 0,
             clips: Vec::with_capacity(8),
             geometry: Vec::with_capacity(8),
             ops: Vec::with_capacity(16),
-        }
+            segments: Vec::new(),
+            changed: ChangeSet {
+                ranges: Vec::new(),
+                sorted: true,
+            },
+        };
+        buffer.clips.push(CLIP_SENTINEL);
+        buffer
     }
 
-    fn clear(&mut self) {
+    /// 全量重建：清空实例环 / 段表 / 裁剪表（保留容量）。调用方负责随后重编码全部 lane。
+    fn reset(&mut self) {
         self.instances.clear();
+        self.free.clear();
+        self.used = 0;
         self.clips.clear();
+        self.clips.push(CLIP_SENTINEL);
         self.geometry.clear();
         self.ops.clear();
+        self.segments.clear();
+        self.changed.clear();
     }
 
-    /// 本帧实例数（`test-support` 的 `FrameStats`；P07 会按它切批）。
-    #[cfg(feature = "test-support")]
+    /// 本帧存活实例数（**不含空洞**；绘制统计与 `FrameDump` 的实例计数）。
     pub(crate) fn len(&self) -> usize {
-        self.instances.len()
+        self.segments
+            .iter()
+            .flatten()
+            .map(|segment| segment.len() as usize)
+            .sum()
     }
 
-    /// `GpuPrimitive` 数组的字节视图（P02 §8.1 的 128 B 布局；P07 的上传源，零拷贝）。
+    /// 实例环总实例数（含空洞；GPU 侧缓冲容量 / SRV 尺寸的判据）。
+    pub(crate) fn instance_count(&self) -> u32 {
+        self.used
+    }
+
+    /// `GpuPrimitive` 数组的字节视图（P02 §8.1 的 128 B 布局；全量载荷的上传源）。
     pub(crate) fn as_bytes(&self) -> &[u8] {
         bytemuck::cast_slice(&self.instances)
     }
@@ -488,6 +653,99 @@ impl InstanceBuffer {
     pub(crate) fn write_clips_gpu(&self, out: &mut Vec<GpuClipEntry>) {
         out.clear();
         out.extend(self.clips().iter().copied().map(ClipChain::gpu_entry));
+    }
+
+    /// 自上次取走以来变化的实例区间（升序、已合并；**增量载荷的来源**）。
+    pub(crate) fn changes(&mut self) -> &[std::ops::Range<u32>] {
+        self.changed.merged()
+    }
+
+    /// 变化区间已被载荷取走：本帧之后的变化从这个基线重新累计。
+    pub(crate) fn clear_changes(&mut self) {
+        self.changed.clear();
+    }
+
+    /// 存活实例切片（按实例环下标升序；诊断导出用，非热路径）。
+    #[cfg(feature = "test-support")]
+    pub(crate) fn live_instances(&self) -> impl Iterator<Item = &[GpuPrimitive]> + '_ {
+        let mut ranges: Vec<std::ops::Range<u32>> = self
+            .segments
+            .iter()
+            .flatten()
+            .filter(|segment| !segment.range().is_empty())
+            .map(|segment| segment.range())
+            .collect();
+        ranges.sort_unstable_by_key(|range| range.start);
+        ranges
+            .into_iter()
+            .map(move |range| &self.instances[range.start as usize..range.end as usize])
+    }
+
+    /// 分配 `len` 个实例；返回实际下标区间。
+    ///
+    /// 首次适配：优先复用空闲块（按长度精确切分，多出来的部分留在空闲表里），否则在末尾
+    /// 顺延增长。**不做对齐填充** —— 精确打包是「相邻 lane 段连续」的前提，绘制序的 op
+    /// 合并（一条 draw call 画多条 lane）依赖它。
+    fn allocate(&mut self, len: u32) -> std::ops::Range<u32> {
+        if len == 0 {
+            return self.used..self.used;
+        }
+        for index in 0..self.free.len() {
+            let range = self.free[index].clone();
+            if range.end - range.start < len {
+                continue;
+            }
+            let start = range.start;
+            if range.end - start > len {
+                self.free[index] = start + len..range.end;
+            } else {
+                self.free.remove(index);
+            }
+            return start..start + len;
+        }
+        let start = self.used;
+        self.used += len;
+        if self.instances.len() < self.used as usize {
+            self.instances
+                .resize(self.used as usize, bytemuck::Zeroable::zeroed());
+        }
+        start..start + len
+    }
+
+    /// 归还一段实例（与相邻空闲块合并）。
+    fn release(&mut self, range: std::ops::Range<u32>) {
+        if range.is_empty() {
+            return;
+        }
+        let mut index = 0;
+        while index < self.free.len() && self.free[index].start < range.start {
+            index += 1;
+        }
+        self.free.insert(index, range);
+        if index + 1 < self.free.len() && self.free[index].end == self.free[index + 1].start {
+            let next = self.free.remove(index + 1);
+            self.free[index].end = next.end;
+        }
+        if index > 0 && self.free[index - 1].end == self.free[index].start {
+            let current = self.free.remove(index);
+            self.free[index - 1].end = current.end;
+        }
+    }
+
+    /// 写入一段实例（`range` 必须来自 [`InstanceBuffer::allocate`]，长度相等）。
+    fn write_instances(&mut self, range: std::ops::Range<u32>, source: &[GpuPrimitive]) {
+        debug_assert_eq!(range.len(), source.len());
+        self.instances[range.start as usize..range.end as usize].copy_from_slice(source);
+        self.changed.push(range);
+    }
+
+    /// 实例环是否值得压实：空闲块合计 ≥ 25% 且至少 64 个实例的碎片。
+    ///
+    /// 门槛取「25% + 64 实例」：低于它的空洞不值得一次整环搬运（compaction 只在无脏帧执行，
+    /// 但仍有 ~1.28 MB 级的内存带宽成本）。
+    fn needs_compaction(&self) -> bool {
+        let free: u32 = self.free.iter().map(|range| range.end - range.start).sum();
+        free >= 64 && free * 4 >= self.used
     }
 }
 
@@ -679,7 +937,7 @@ fn visible_aabb(logical_aabb: [f32; 4], scale: Scale, clip_aabb: [f32; 4]) -> [f
 
 /// 裁剪表的哨兵项（表项 0：shader 看到 `clip_index == 0` 时直接返回覆盖率 1）。
 ///
-/// `InstanceEncoder::new` 就把它写进去：`FramePayload` 的 dump / 健康检查可以假定「clip 表恒有
+/// `InstanceBuffer::new` / `reset` 都会先写入它：`FramePayload` 的 dump / 健康检查可以假定「clip 表恒有
 /// 哨兵」，不必等第一帧编码。
 const CLIP_SENTINEL: ClipChain = ClipChain {
     parent: None,
@@ -689,6 +947,22 @@ const CLIP_SENTINEL: ClipChain = ClipChain {
 };
 
 /// `Primitive → GpuPrimitive` 的编码器（`Window` 持有，缓冲跨帧复用）。
+///
+/// # 增量模型（B6 §2「按层保留 + 只重编码脏层」）
+///
+/// 编码产物是**按 lane 分段**的：`Scene` 每条 lane 有内容版本（`Scene::lane_state`），编码器
+/// 记住每条 lane 上次编码的版本与实例段；版本一致 ⇒ 整段复用（连实例字节都不碰），版本变化才
+/// 重编码那一条 lane，并把新段记进「变化区间」交给 `FramePayload` 做增量上传。
+///
+/// 三个跨帧持久的状态必须同时成立：
+/// 1. **实例环**（`InstanceBuffer::instances`）—— 段地址稳定，未变的段内容不动；
+/// 2. **裁剪表**（`InstanceBuffer::clips`）—— 实例里内嵌的 `clip_index` 指向它，段复用时索引
+///    必须继续有效，所以表**不按帧清空**，只按内容去重追加（超过 [`CLIP_TABLE_LIMIT`] 整表
+///    重建 ⇒ 全量重编码）；
+/// 3. **段表**（`InstanceBuffer::segments`）—— lane arena 槽位 → 段。
+///
+/// 全量与增量的产物**逐字节一致**：两条路径用同一个 [`LaneEncoder`] 与同一套裁剪表去重逻辑，
+/// 差别只是「哪些 lane 被重新编码」。全量路径的触发条件见 [`InstanceEncoder::encode`]。
 pub(crate) struct InstanceEncoder {
     buffer: InstanceBuffer,
     state: ClipState,
@@ -697,23 +971,49 @@ pub(crate) struct InstanceEncoder {
     chains: ahash::HashMap<(u32, u32, [u32; 4], [u32; 4]), ClipChainId>,
     /// 颜色解析缓存（跨帧保留，每帧 clear）。
     colors: crate::paint::color::ResolveCache,
+    /// 上次编码的 DPI（变化 ⇒ 物理坐标全变 ⇒ 全量重编码）。
+    scale: Option<Scale>,
+    /// 单 lane 编码的实例工作区（容量跨 lane 复用；编码完成后整段搬进实例环）。
+    scratch: Vec<GpuPrimitive>,
+    /// 单 lane 编码的绘制项工作区。
+    scratch_parts: SmallVec<[LanePart; 2]>,
+    /// 本帧重编码的 lane 数（`FrameRecord.encoded_lanes`）。
+    encoded_lanes: usize,
+    /// 本帧重编码写进实例环的字节数（`FrameRecord.uploaded_bytes` 的编码器侧值）。
+    #[cfg(any(test, feature = "test-support"))]
+    written_bytes: usize,
+    /// 本帧整段复用的 lane 段数（`FrameRecord.reused_segments`）。
+    reused_segments: usize,
 }
 
 impl InstanceEncoder {
     /// 消费者：`Window::new`。
     pub(crate) fn new() -> Self {
-        let mut buffer = InstanceBuffer::new();
-        buffer.clips.push(CLIP_SENTINEL);
         Self {
-            buffer,
+            buffer: InstanceBuffer::new(),
             state: ClipState::unbounded(),
             saved: SmallVec::new(),
             chains: ahash::HashMap::default(),
             colors: crate::paint::color::ResolveCache::new(),
+            scale: None,
+            scratch: Vec::with_capacity(64),
+            scratch_parts: SmallVec::new(),
+            encoded_lanes: 0,
+            reused_segments: 0,
+            #[cfg(any(test, feature = "test-support"))]
+            written_bytes: 0,
         }
     }
 
-    /// 编码整帧；内部缓冲复用。消费者：`Window::paint_frame`。
+    /// 编码整帧（增量：只重编码版本变化的 lane）。消费者：`Window::paint_frame`。
+    ///
+    /// **回退全量的条件**（不确定 ⇒ 宁可全量，不可画错）：
+    /// - DPI 变化（`scale` 不同）：物理坐标、缩放后的圆角与 clip 全部变了；
+    /// - 裁剪表超过 [`CLIP_TABLE_LIMIT`]：需要重置表 ⇒ 已缓存段里的 `clip_index` 全部失效。
+    ///
+    /// 其余「看起来可能不确定」的情形不需要这里判断：窗口 resize / 滚动 / 文案变化都会让
+    /// paint pass 重建相关 lane（版本 +1），增量路径自然覆盖；图集换代同理会让文本节点重建
+    /// lane（`App::repaint_text_if_atlas_changed`）。
     ///
     /// # Errors
     /// [`EngineError::ClipDepthExceeded`]：GPU 裁剪链超过 `MAX_CLIP_DEPTH`。轴对齐矩形 clip
@@ -726,41 +1026,188 @@ impl InstanceEncoder {
         resolver: &ColorResolver,
         store: &crate::paint::geometry_store::GeometryStore,
     ) -> Result<&InstanceBuffer, EngineError> {
-        self.buffer.clear();
-        self.buffer.clips.push(CLIP_SENTINEL);
-        self.chains.clear();
-        self.state = ClipState::unbounded();
-        self.saved.clear();
-        self.colors.clear();
+        self.encoded_lanes = 0;
+        self.reused_segments = 0;
+        #[cfg(any(test, feature = "test-support"))]
         {
-            // 先解构出各字段的独立可变借用：FrameEncoder 同时需要 buffer 与 colors，
-            // 直接写 &mut self.buffer / &mut self.colors 会与后面的 flush_run() 冲突。
+            self.written_bytes = 0;
+        }
+        self.colors.clear();
+        let reset = self.scale != Some(scale) || self.buffer.clips.len() > CLIP_TABLE_LIMIT;
+        if reset {
+            self.buffer.reset();
+            self.chains.clear();
+            self.scale = Some(scale);
+        }
+        let order = scene.order();
+        {
             let Self {
                 buffer,
                 state,
                 saved,
                 chains,
                 colors,
+                scratch,
+                scratch_parts,
+                encoded_lanes,
+                reused_segments,
+                #[cfg(any(test, feature = "test-support"))]
+                written_bytes,
+                ..
             } = self;
-            let mut frame = FrameEncoder {
-                buffer,
-                state,
-                saved,
-                chains,
-                scale,
-                resolver,
-                colors,
-                store,
-                run_start: 0,
-            };
-            frame.encode_scene(scene)?;
-            frame.flush_run();
+            // 绘制序在**同一次 lane 遍历**里生成（消掉 10k lane 的第二次 O(n) 扫描）：
+            // op / 几何表先借出，循环结束时再放回（compaction 之后才需要重建）。
+            let mut ops = std::mem::take(&mut buffer.ops);
+            ops.clear();
+            let mut geometry = std::mem::take(&mut buffer.geometry);
+            geometry.clear();
+            let mut group = OpGroup::new();
+            for lane_id in order {
+                let slot = lane_id.slot() as usize;
+                // arena 槽位被**新** lane 复用（代际不同）：旧段属于已释放的 lane，回收。
+                let stale = buffer.segments.get(slot).is_some_and(|entry| {
+                    entry
+                        .as_ref()
+                        .is_some_and(|segment| segment.generation != lane_id.generation())
+                });
+                if stale && let Some(old) = buffer.segments[slot].take() {
+                    buffer.release(old.range());
+                }
+                let Some((version, primitives)) = scene.lane_state(*lane_id) else {
+                    continue;
+                };
+                // 复用判据：段存在 + 版本一致 ⇒ 整段不重编码（连实例字节都不碰）。
+                let reusable = buffer
+                    .segments
+                    .get(slot)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|segment| segment.version == version);
+                if reusable {
+                    *reused_segments += 1;
+                } else {
+                    scratch.clear();
+                    scratch_parts.clear();
+                    {
+                        let mut lane = LaneEncoder {
+                            instances: scratch,
+                            parts: scratch_parts,
+                            clips: &mut buffer.clips,
+                            chains,
+                            state,
+                            saved,
+                            scale,
+                            resolver,
+                            colors,
+                            store,
+                            run_start: 0,
+                        };
+                        lane.encode_lane(primitives)?;
+                    }
+                    let len = scratch.len() as u32;
+                    let previous = buffer.segments.get_mut(slot).and_then(Option::take);
+                    // 段框（`Box`）跨帧复用：整帧重编码时 10k 条 lane 每帧 new/drop 一次 Box 是
+                    // 六位数的分配开销（`frame_full_10k` 实测 ~15%）。只有首次为某条 lane 建段
+                    // 才真正分配；`parts` 也用 `swap` 复用（SmallVec 的内联容量直接换手）。
+                    let (mut segment, range) = match previous {
+                        // 实例数不变 ⇒ 原地重写：段地址不动，op 分组的连续性也不受影响。
+                        Some(old) if old.len() == len => {
+                            let range = old.range();
+                            buffer.write_instances(range.clone(), scratch);
+                            (old, range)
+                        }
+                        // 实例数变了：旧段归还（空洞留给下次分配 / compaction），新段重新分配。
+                        Some(old) => {
+                            buffer.release(old.range());
+                            let range = buffer.allocate(len);
+                            buffer.write_instances(range.clone(), scratch);
+                            (old, range)
+                        }
+                        None => {
+                            let range = buffer.allocate(len);
+                            buffer.write_instances(range.clone(), scratch);
+                            (
+                                Box::new(LaneSegment {
+                                    generation: lane_id.generation(),
+                                    version,
+                                    start: 0,
+                                    end: 0,
+                                    parts: SmallVec::new(),
+                                }),
+                                range,
+                            )
+                        }
+                    };
+                    segment.generation = lane_id.generation();
+                    segment.version = version;
+                    segment.start = range.start;
+                    segment.end = range.start + len;
+                    segment.parts.clear();
+                    std::mem::swap(&mut segment.parts, scratch_parts);
+                    if buffer.segments.len() <= slot {
+                        buffer.segments.resize_with(slot + 1, || None);
+                    }
+                    buffer.segments[slot] = Some(segment);
+                    *encoded_lanes += 1;
+                    #[cfg(any(test, feature = "test-support"))]
+                    {
+                        *written_bytes += len as usize * 128;
+                    }
+                }
+                // 本 lane 的 op 追加进绘制序（复用与新编码走同一条路径）。
+                if let Some(segment) = buffer.segments.get(slot).and_then(Option::as_deref)
+                    && segment.generation == lane_id.generation()
+                {
+                    append_segment_ops(&mut ops, &mut geometry, &mut group, segment);
+                }
+            }
+            flush_group(&mut ops, &mut group);
+            buffer.ops = ops;
+            buffer.geometry = geometry;
+            // compaction 只在**没有任何 lane 被重编码**的帧执行：它要重排整张实例环
+            // （一次 1.28 MB 级搬运），绝不抢增量帧的预算。压实会改段起点 ⇒ 重建 op 表。
+            if *encoded_lanes == 0 && *reused_segments > 0 && buffer.needs_compaction() {
+                compact(buffer, order);
+                build_ops(buffer, order);
+            }
         }
         // 自检只在 debug 构建里跑：循环本身（遍历全部 op / clip / instance）不是
         // `debug_assert!` 的宏体，release 下也会白跑 —— 10k 图元 ≈ 40 µs/帧。
         #[cfg(debug_assertions)]
-        self.self_check();
+        self.self_check(order);
         Ok(&self.buffer)
+    }
+
+    /// 引擎侧释放一条 lane（节点不再持有它）：立刻回收实例段（否则要等 arena 槽位被复用）。
+    ///
+    /// 消费者：`Window::paint_frame` 的 `drain_removed_lanes`。
+    pub(crate) fn release_lane(&mut self, lane: crate::paint::scene::LaneId) {
+        let slot = lane.slot() as usize;
+        let matches = self.buffer.segments.get(slot).is_some_and(|entry| {
+            entry
+                .as_ref()
+                .is_some_and(|segment| segment.generation == lane.generation())
+        });
+        if matches && let Some(segment) = self.buffer.segments[slot].take() {
+            self.buffer.release(segment.range());
+        }
+    }
+
+    /// 本帧重编码的 lane 数（`FrameRecord.encoded_lanes`；测试与 `test-support` 读取）。
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn encoded_lanes(&self) -> usize {
+        self.encoded_lanes
+    }
+
+    /// 本帧增量上传的实例字节数（编码器侧值；渲染器路径会用载荷的实际字节数覆盖它）。
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn written_bytes(&self) -> usize {
+        self.written_bytes
+    }
+
+    /// 本帧整段复用的 lane 段数（`FrameRecord.reused_segments`；测试与 `test-support` 读取）。
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn reused_segments(&self) -> usize {
+        self.reused_segments
     }
 
     /// 本帧的编码结果（消费者：`Window::instance_bytes`，P07 上传）。
@@ -768,19 +1215,26 @@ impl InstanceEncoder {
         &self.buffer
     }
 
+    /// 可变借出（消费者：`FramePayload` 的增量载荷构建 —— 要取走并清空变化区间）。
+    pub(crate) fn buffer_mut(&mut self) -> &mut InstanceBuffer {
+        &mut self.buffer
+    }
+
     /// 编码器自检（P02 §8.8 的不变量）。
     ///
     /// 只在 debug 构建里编译：release 下这些循环没有任何副作用，却是 O(op + clip + instance)
     /// 的纯开销。
     #[cfg(debug_assertions)]
-    fn self_check(&self) {
+    fn self_check(&self, order: &[crate::paint::scene::LaneId]) {
+        let buffer = &self.buffer;
         let mut covered = 0usize;
-        for op in &self.buffer.ops {
+        for op in &buffer.ops {
             match *op {
                 FrameOp::Instances { start, len, .. } => {
                     covered += len as usize;
+                    debug_assert!(len > 0, "FrameOp::Instances must not be empty");
                     debug_assert!(
-                        (start as usize) + (len as usize) <= self.buffer.instances.len(),
+                        (start as usize) + (len as usize) <= buffer.instances.len(),
                         "FrameOp::Instances out of range"
                     );
                 }
@@ -791,11 +1245,11 @@ impl InstanceEncoder {
                     ..
                 } => {
                     debug_assert!(
-                        (index as usize) < self.buffer.geometry.len(),
+                        (index as usize) < buffer.geometry.len(),
                         "FrameOp::Geometry out of range"
                     );
                     debug_assert!(
-                        (clip_index as usize) < self.buffer.clips.len(),
+                        (clip_index as usize) < buffer.clips.len(),
                         "FrameOp::Geometry clip out of range"
                     );
                     debug_assert!(
@@ -807,12 +1261,60 @@ impl InstanceEncoder {
                 }
             }
         }
-        debug_assert_eq!(
-            covered,
-            self.buffer.instances.len(),
-            "FrameOp must cover every instance"
-        );
-        for (index, chain) in self.buffer.clips.iter().enumerate() {
+        // 段表不变量：范围在环内、绘制项与段长一致、段之间不重叠。
+        //
+        // 注意：段表里可以有**不在本帧绘制序**的段（lane 被 `Scene::release_lane` 释放、
+        // 但 arena 槽位还没被复用的孤儿）。它们不参与 op、由 compaction 丢弃，因此覆盖判据
+        // 只统计绘制序引用到的段。
+        let mut live = 0usize;
+        let mut ranges: Vec<std::ops::Range<u32>> = Vec::new();
+        for (slot, entry) in buffer.segments.iter().enumerate() {
+            let Some(segment) = entry.as_deref() else {
+                continue;
+            };
+            debug_assert_eq!(
+                segment.end,
+                segment.start + segment.len(),
+                "segment {slot} range mismatch"
+            );
+            debug_assert!(
+                (segment.end as usize) <= buffer.instances.len(),
+                "segment {slot} escapes the instance arena"
+            );
+            let parts_len: u32 = segment
+                .parts
+                .iter()
+                .map(|part| match part {
+                    LanePart::Instances { len, .. } => *len,
+                    LanePart::Geometry(_) => 0,
+                })
+                .sum();
+            debug_assert_eq!(
+                parts_len,
+                segment.len(),
+                "segment {slot} parts disagree with its length"
+            );
+            if !segment.range().is_empty() {
+                ranges.push(segment.range());
+            }
+        }
+        for lane_id in order {
+            let slot = lane_id.slot() as usize;
+            if let Some(segment) = buffer.segments.get(slot).and_then(Option::as_deref)
+                && segment.generation == lane_id.generation()
+            {
+                live += segment.len() as usize;
+            }
+        }
+        debug_assert_eq!(covered, live, "FrameOp must cover every live instance");
+        ranges.sort_unstable_by_key(|range| range.start);
+        for pair in ranges.windows(2) {
+            debug_assert!(
+                pair[0].end <= pair[1].start,
+                "instance segments must not overlap"
+            );
+        }
+        for (index, chain) in buffer.clips.iter().enumerate() {
             debug_assert!(
                 chain.rect.iter().all(|value| value.is_finite()),
                 "clip rect must be finite"
@@ -848,43 +1350,216 @@ impl InstanceEncoder {
             debug_assert_eq!(entry.meta[2], 0, "ClipEntry.meta.zw 保留恒 0");
             debug_assert_eq!(entry.meta[3], 0, "ClipEntry.meta.zw 保留恒 0");
         }
-        // 每个实例的 `clip_depth`（params1.w）必须等于它那条链的真实链长：shader 用这个值
-        // 收口循环，写错就是静默少裁（R05-5 / R05-11）。链长还必须有界（shader 的循环上界是
+        // 每个**存活**实例的 `clip_depth`（params1.w）必须等于它那条链的真实链长：shader 用这个
+        // 值收口循环，写错就是静默少裁（R05-5 / R05-11）。链长还必须有界（shader 的循环上界是
         // `KYTRIX_MAX_CLIP_ITEMS`），且链上至多一条矩形项、矩形项只能是链根。
-        for primitive in &self.buffer.instances {
-            let clip_index = primitive.params1[0] as usize;
-            debug_assert!(
-                clip_index < self.buffer.clips.len(),
-                "instance clip index out of range"
-            );
-            let mut depth = 0usize;
-            let mut rects = 0usize;
-            let mut cursor = clip_index;
-            while cursor != 0 {
-                depth += 1;
+        for segment in buffer.segments.iter().flatten() {
+            for primitive in &buffer.instances[segment.start as usize..segment.end as usize] {
+                let clip_index = primitive.params1[0] as usize;
                 debug_assert!(
-                    depth <= MAX_CLIP_ITEMS as usize,
-                    "clip chain longer than MAX_CLIP_ITEMS"
+                    clip_index < buffer.clips.len(),
+                    "instance clip index out of range"
                 );
-                let entry = self.buffer.clips[cursor];
-                if entry.kind == ClipKind::Rect {
-                    rects += 1;
-                    debug_assert_eq!(entry.parent, None, "矩形项必须是链根");
+                let mut depth = 0usize;
+                let mut rects = 0usize;
+                let mut cursor = clip_index;
+                while cursor != 0 {
+                    depth += 1;
+                    debug_assert!(
+                        depth <= MAX_CLIP_ITEMS as usize,
+                        "clip chain longer than MAX_CLIP_ITEMS"
+                    );
+                    let entry = buffer.clips[cursor];
+                    if entry.kind == ClipKind::Rect {
+                        rects += 1;
+                        debug_assert_eq!(entry.parent, None, "矩形项必须是链根");
+                    }
+                    cursor = entry.parent.map_or(0, |parent| parent.index());
                 }
-                cursor = entry.parent.map_or(0, |parent| parent.index());
+                debug_assert!(rects <= 1, "链上至多一条矩形 clip 项");
+                debug_assert_eq!(
+                    depth, primitive.params1[3] as usize,
+                    "instance clip_depth must match the chain length"
+                );
             }
-            debug_assert!(rects <= 1, "链上至多一条矩形 clip 项");
-            debug_assert_eq!(
-                depth, primitive.params1[3] as usize,
-                "instance clip_depth must match the chain length"
-            );
         }
     }
 }
 
-/// 单帧编码的借用包（把 `&mut` 字段拆开，避免整结构可变借用冲突）。
-struct FrameEncoder<'a> {
-    buffer: &'a mut InstanceBuffer,
+/// 正在累积的实例 op（[`append_segment_ops`] / [`build_ops`] 的内部状态）。
+struct OpGroup {
+    active: bool,
+    start: u32,
+    len: u32,
+    /// 已并入的 lane 条数（合并上限 `MAX_LANES_PER_OP`）。
+    lanes: u32,
+    bounds: PhysicalBounds,
+}
+
+impl OpGroup {
+    fn new() -> Self {
+        Self {
+            active: false,
+            start: 0,
+            len: 0,
+            lanes: 0,
+            bounds: PhysicalBounds::EMPTY,
+        }
+    }
+}
+
+/// 把一条 lane 的绘制项追加进绘制序。
+///
+/// **合并规则**：实例环里**连续**的相邻 lane 段合并成一条 [`FrameOp::Instances`]（上限
+/// [`MAX_LANES_PER_OP`] 条 lane），`bounds` 是这些段的实例包围盒并集 —— 于是 damage 的
+/// op 级跳过真正生效（旧实现整个 UI 只有一条 `bounds == 整屏` 的 op，跳过永远失效）。
+/// 几何绘制切断合并并插在它自己的绘制位置上（形状/几何 op 的先后关系不变）。
+fn append_segment_ops(
+    ops: &mut Vec<FrameOp>,
+    geometry: &mut Vec<GeometryDrawGpu>,
+    group: &mut OpGroup,
+    segment: &LaneSegment,
+) {
+    let mut cursor = segment.start;
+    let mut lane_counted = false;
+    for part in &segment.parts {
+        match part {
+            LanePart::Instances { len, bounds } => {
+                if *len == 0 {
+                    continue;
+                }
+                let contiguous = group.active
+                    && group.start + group.len == cursor
+                    && group.lanes < MAX_LANES_PER_OP;
+                if group.active && !contiguous {
+                    flush_group(ops, group);
+                }
+                if !group.active {
+                    *group = OpGroup {
+                        active: true,
+                        start: cursor,
+                        ..OpGroup::new()
+                    };
+                }
+                if !lane_counted {
+                    group.lanes += 1;
+                    lane_counted = true;
+                }
+                group.len += *len;
+                group.bounds = group.bounds.union(*bounds);
+                cursor += *len;
+            }
+            LanePart::Geometry(part) => {
+                flush_group(ops, group);
+                let index = geometry.len() as u32;
+                geometry.push(part.draw.clone());
+                ops.push(FrameOp::Geometry {
+                    index,
+                    clip_index: part.clip_index,
+                    clip_rect: part.clip_rect,
+                    bounds: part.bounds,
+                });
+            }
+        }
+    }
+}
+
+/// 从段表重建整份绘制序（compaction 改变段起点之后调用；正常帧在 `encode` 的 lane 遍历里
+/// 增量追加，不走这里）。
+fn build_ops(buffer: &mut InstanceBuffer, order: &[crate::paint::scene::LaneId]) {
+    // 先把两张每帧重建的表借出（容量跨帧保留，稳态零分配）：循环里只读段表，不再与
+    // `&mut buffer` 冲突。
+    let mut ops = std::mem::take(&mut buffer.ops);
+    ops.clear();
+    let mut geometry = std::mem::take(&mut buffer.geometry);
+    geometry.clear();
+    let mut group = OpGroup::new();
+    for lane_id in order {
+        let slot = lane_id.slot() as usize;
+        let Some(segment) = buffer.segments.get(slot).and_then(Option::as_deref) else {
+            continue;
+        };
+        if segment.generation != lane_id.generation() {
+            continue;
+        }
+        append_segment_ops(&mut ops, &mut geometry, &mut group, segment);
+    }
+    flush_group(&mut ops, &mut group);
+    buffer.ops = ops;
+    buffer.geometry = geometry;
+}
+
+fn flush_group(ops: &mut Vec<FrameOp>, group: &mut OpGroup) {
+    if group.active && group.len > 0 {
+        ops.push(FrameOp::Instances {
+            start: group.start,
+            len: group.len,
+            bounds: group.bounds,
+        });
+    }
+    group.active = false;
+    group.len = 0;
+    group.lanes = 0;
+}
+
+/// 压实实例环：按绘制序把段搬到前部（消除空洞），段起点随之更新。
+///
+/// 只在**无脏帧**执行（`InstanceEncoder::encode` 的门禁）：字节搬运量 = 存活实例数，
+/// 10k 图元 ≈ 1.28 MB。搬完之后整张环都是「变化区间」（下一次载荷必然包含全部存活段）。
+///
+/// 不在绘制序里的段（已释放、但 arena 槽位还没被复用的老 lane）在这里丢弃：它的内容不再被
+/// 任何 op 引用，下次进绘制序时会因「无段」而重编码。
+fn compact(buffer: &mut InstanceBuffer, order: &[crate::paint::scene::LaneId]) {
+    let mut packed: Vec<GpuPrimitive> = Vec::with_capacity(buffer.instances.len());
+    let mut starts: Vec<(usize, u32)> = Vec::with_capacity(order.len());
+    let mut seen: Vec<bool> = vec![false; buffer.segments.len()];
+    let mut cursor = 0u32;
+    for lane_id in order {
+        let slot = lane_id.slot() as usize;
+        let Some(segment) = buffer.segments.get(slot).and_then(Option::as_deref) else {
+            continue;
+        };
+        if segment.generation != lane_id.generation() {
+            continue;
+        }
+        let range = segment.range();
+        packed.extend_from_slice(&buffer.instances[range.start as usize..range.end as usize]);
+        starts.push((slot, cursor));
+        seen[slot] = true;
+        cursor += segment.len();
+    }
+    for (live, entry) in seen.iter().zip(buffer.segments.iter_mut()) {
+        if !*live {
+            *entry = None;
+        }
+    }
+    buffer.instances.clear();
+    buffer.instances.extend_from_slice(&packed);
+    buffer.used = cursor;
+    buffer
+        .instances
+        .resize(buffer.used as usize, bytemuck::Zeroable::zeroed());
+    buffer.free.clear();
+    for (slot, start) in starts {
+        if let Some(segment) = buffer.segments[slot].as_mut() {
+            let len = segment.len();
+            segment.start = start;
+            segment.end = start + len;
+        }
+    }
+    buffer.changed.clear();
+    buffer.changed.push(0..cursor);
+}
+
+/// 单 lane 编码的借用包（把 `&mut` 字段拆开，避免整结构可变借用冲突）。
+///
+/// 每条 lane 独立编码（lane 在 `Canvas` 契约里是 clip 平衡的，C1），实例先写进
+/// `instances` 工作区，编码完成后由调用方整段搬进实例环。裁剪表项**直接追加到跨帧持久的
+/// 裁剪表**（`clips`）：复用的段里内嵌的 `clip_index` 因此继续有效。
+struct LaneEncoder<'a> {
+    instances: &'a mut Vec<GpuPrimitive>,
+    parts: &'a mut SmallVec<[LanePart; 2]>,
+    clips: &'a mut Vec<ClipChain>,
     state: &'a mut ClipState,
     saved: &'a mut SmallVec<[ClipState; 8]>,
     chains: &'a mut ahash::HashMap<(u32, u32, [u32; 4], [u32; 4]), ClipChainId>,
@@ -897,22 +1572,16 @@ struct FrameEncoder<'a> {
     run_start: usize,
 }
 
-impl FrameEncoder<'_> {
-    fn encode_scene(&mut self, scene: &Scene) -> Result<(), EngineError> {
-        for lane in scene.order() {
-            let entry_depth = self.state.depth();
-            let Some(primitives) = scene.lane_primitives(*lane) else {
-                continue;
-            };
-            for primitive in primitives {
-                self.encode_primitive(primitive, 0)?;
-            }
-            debug_assert_eq!(
-                self.state.depth(),
-                entry_depth,
-                "lane must be clip-balanced (C1)"
-            );
+impl LaneEncoder<'_> {
+    /// 编码一条 lane 的全部图元（clip 状态从「无裁剪」开始，结束时必须回到 0 层）。
+    fn encode_lane(&mut self, primitives: &[Primitive]) -> Result<(), EngineError> {
+        *self.state = ClipState::unbounded();
+        self.saved.clear();
+        for primitive in primitives {
+            self.encode_primitive(primitive, 0)?;
         }
+        debug_assert_eq!(self.state.depth(), 0, "lane must be clip-balanced (C1)");
+        self.flush_run();
         Ok(())
     }
 
@@ -1075,8 +1744,8 @@ impl FrameEncoder<'_> {
         if let Some(existing) = self.chains.get(&key) {
             return *existing;
         }
-        let id = ClipChainId(self.buffer.clips.len() as u32);
-        self.buffer.clips.push(ClipChain {
+        let id = ClipChainId(self.clips.len() as u32);
+        self.clips.push(ClipChain {
             parent,
             kind,
             rect,
@@ -1113,15 +1782,14 @@ impl FrameEncoder<'_> {
     }
 
     fn flush_run(&mut self) {
-        let len = self.buffer.instances.len() - self.run_start;
+        let len = self.instances.len() - self.run_start;
         if len > 0 {
-            let bounds = run_bounds(&self.buffer.instances[self.run_start..]);
-            self.buffer.ops.push(FrameOp::Instances {
-                start: self.run_start as u32,
+            let bounds = run_bounds(&self.instances[self.run_start..]);
+            self.parts.push(LanePart::Instances {
                 len: len as u32,
                 bounds,
             });
-            self.run_start = self.buffer.instances.len();
+            self.run_start = self.instances.len();
         }
     }
 
@@ -1150,7 +1818,7 @@ impl FrameEncoder<'_> {
         }))
     }
 
-    /// 追加一条几何绘制并 push `FrameOp::Geometry`。
+    /// 追加一条几何绘制项（每帧生成 op 表时按绘制序复制进 `InstanceBuffer::geometry`）。
     ///
     /// `op_bounds`：给定则用它（`Path` 自带逻辑 AABB），否则用 `desc.bounds` 经
     /// `transform` 变换后的 AABB（R05-12 / R05-19：旧实现对无 clip 的几何给出「全屏」
@@ -1177,19 +1845,17 @@ impl FrameEncoder<'_> {
             // 未注册：拿不到真实范围，保守地用 clip 上界（GPU 侧会报 GeometryRegister）。
             (None, None) => clip_aabb,
         };
-        let index = self.buffer.geometry.len() as u32;
-        self.buffer.geometry.push(GeometryDrawGpu {
-            id,
-            transform,
-            color,
-            desc: registered.unwrap_or_else(Self::missing_desc),
-        });
-        self.buffer.ops.push(FrameOp::Geometry {
-            index,
+        self.parts.push(LanePart::Geometry(Box::new(LaneGeometry {
+            draw: GeometryDrawGpu {
+                id,
+                transform,
+                color,
+                desc: registered.unwrap_or_else(Self::missing_desc),
+            },
             clip_index: self.clip_index() as u32,
             clip_rect: clip_aabb.map(f32::to_bits),
             bounds: bounds_of_aabb(visible),
-        });
+        })));
     }
 
     // ── 实例发射 ───────────────────────────────────────────────────────────
@@ -1239,7 +1905,7 @@ impl FrameEncoder<'_> {
             uv: [0.0; 4],
             clip_rect: self.clip_rect(),
         };
-        self.buffer.instances.push(instance);
+        self.instances.push(instance);
     }
 
     fn emit_shadow(&mut self, shadow: &crate::paint::primitive::Shadow) {
@@ -1268,7 +1934,7 @@ impl FrameEncoder<'_> {
             uv: [0.0; 4],
             clip_rect: self.clip_rect(),
         };
-        self.buffer.instances.push(instance);
+        self.instances.push(instance);
     }
 
     fn emit_image(&mut self, image: &crate::paint::primitive::Image) {
@@ -1290,7 +1956,7 @@ impl FrameEncoder<'_> {
             uv: image.tile.uv(),
             clip_rect: self.clip_rect(),
         };
-        self.buffer.instances.push(instance);
+        self.instances.push(instance);
     }
 
     fn emit_glyph(
@@ -1315,7 +1981,7 @@ impl FrameEncoder<'_> {
             uv: glyph.tile.uv(),
             clip_rect: self.clip_rect(),
         };
-        self.buffer.instances.push(instance);
+        self.instances.push(instance);
     }
 }
 
@@ -1350,9 +2016,9 @@ mod tests {
 
     use super::{
         CLIP_KIND_RECT, CLIP_KIND_ROUNDED, ClipChain, ClipChainId, ClipKind, ClipState,
-        GRADIENT_HORIZONTAL, GRADIENT_RADIAL, GRADIENT_VERTICAL, GpuPrimitive, InstanceBuffer,
-        InstanceEncoder, KIND_GLYPH, KIND_QUAD, KIND_SHADOW, MAX_CLIP_ITEMS, SHADOW_SIGMA_MIN,
-        SHADOW_SIGMA_SCALE, TEXTURE_GLYPH, normalize_corner_radius, snap_rect_clip_to_pixels,
+        GRADIENT_HORIZONTAL, GRADIENT_RADIAL, GRADIENT_VERTICAL, GpuPrimitive, InstanceEncoder,
+        KIND_GLYPH, KIND_QUAD, KIND_SHADOW, MAX_CLIP_ITEMS, SHADOW_SIGMA_MIN, SHADOW_SIGMA_SCALE,
+        TEXTURE_GLYPH, normalize_corner_radius, snap_rect_clip_to_pixels,
     };
     use crate::{
         math::{Point, Rect, Scale, Size, Transform},
@@ -1396,26 +2062,26 @@ mod tests {
         }
     }
 
-    fn encode(scene: &Scene) -> InstanceBuffer {
-        let mut encoder = InstanceEncoder::new();
-        let buffer = encoder
-            .encode(
-                scene,
-                scale(),
-                &resolver(),
-                &crate::paint::geometry_store::GeometryStore::new(),
-            )
-            .expect("encode");
-        // 复制出编码结果，避免继续借用 encoder。
-        InstanceBuffer {
-            instances: buffer.instances.clone(),
-            clips: buffer.clips.clone(),
-            geometry: buffer.geometry.clone(),
-            ops: buffer.ops.clone(),
+    /// 编码结果的只读快照（测试专用：编码器的 `InstanceBuffer` 跨帧持久，不能整体克隆）。
+    struct Encoded {
+        instances: Vec<GpuPrimitive>,
+        ops: Vec<super::FrameOp>,
+        clips: Vec<ClipChain>,
+    }
+
+    impl Encoded {
+        /// 裁剪表的 GPU 布局（与生产路径 `InstanceBuffer::write_clips_gpu` 同一转换）。
+        fn write_clips_gpu(&self, out: &mut Vec<super::GpuClipEntry>) {
+            out.clear();
+            out.extend(self.clips.iter().copied().map(ClipChain::gpu_entry));
         }
     }
 
-    fn try_encode(scene: &Scene) -> Result<InstanceBuffer, crate::error::EngineError> {
+    fn encode(scene: &Scene) -> Encoded {
+        try_encode(scene).expect("encode")
+    }
+
+    fn try_encode(scene: &Scene) -> Result<Encoded, crate::error::EngineError> {
         let mut encoder = InstanceEncoder::new();
         let buffer = encoder.encode(
             scene,
@@ -1423,10 +2089,9 @@ mod tests {
             &resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )?;
-        Ok(InstanceBuffer {
+        Ok(Encoded {
             instances: buffer.instances.clone(),
             clips: buffer.clips.clone(),
-            geometry: buffer.geometry.clone(),
             ops: buffer.ops.clone(),
         })
     }
@@ -2764,5 +3429,367 @@ mod tests {
         let state = ClipState::unbounded();
         assert_eq!(state.depth(), 0);
         assert!(state.top().is_none());
+    }
+
+    // ── B6：帧间增量实例编码 ───────────────────────────────────────────────
+
+    fn empty_store() -> crate::paint::geometry_store::GeometryStore {
+        crate::paint::geometry_store::GeometryStore::new()
+    }
+
+    /// `count` 条 lane 的网格场景（每 lane 一个 10×20 的 quad，位置随下标错开）。
+    fn grid_scene(count: usize) -> (Scene, Vec<crate::paint::scene::LaneId>) {
+        let mut scene = Scene::empty();
+        let mut lanes = Vec::with_capacity(count);
+        for index in 0..count {
+            let lane = scene.new_lane();
+            assert!(scene.push(
+                lane,
+                Primitive::Quad(Quad {
+                    bounds: Rect::new(
+                        (index % 8) as f32 * 16.0,
+                        (index / 8) as f32 * 24.0,
+                        10.0,
+                        20.0
+                    ),
+                    corner_radius: [0.0; 4],
+                    paint: solid(),
+                })
+            ));
+            lanes.push(lane);
+        }
+        scene.set_order(&lanes);
+        (scene, lanes)
+    }
+
+    /// 一条 lane 里所有实例的字节（按实例环区间取；空洞不参与）。
+    fn lane_instance_bytes(
+        encoder: &InstanceEncoder,
+        lane: crate::paint::scene::LaneId,
+    ) -> Vec<u8> {
+        let segment = encoder
+            .buffer()
+            .segments
+            .get(lane.slot() as usize)
+            .and_then(Option::as_deref)
+            .expect("lane 必须有实例段");
+        assert_eq!(segment.generation, lane.generation());
+        encoder.buffer().as_bytes()[segment.start as usize * 128..segment.end as usize * 128]
+            .to_vec()
+    }
+
+    /// 没有任何 lane 变化的帧：所有段整段复用，实例字节与绘制序逐字节不变。
+    #[test]
+    fn an_unchanged_frame_reuses_every_segment() {
+        let (scene, lanes) = grid_scene(8);
+        let mut encoder = InstanceEncoder::new();
+        encoder
+            .encode(&scene, scale(), &resolver(), &empty_store())
+            .expect("初帧");
+        assert_eq!(encoder.encoded_lanes(), 8);
+        assert_eq!(encoder.reused_segments(), 0);
+        let instances = encoder.buffer().as_bytes().to_vec();
+        let ops = encoder.buffer().ops().to_vec();
+        assert_eq!(encoder.buffer().instance_count(), 8);
+        // 初帧的载荷已经交付（取走变化区间），之后的帧才能断言「没有新增变化」。
+        encoder.buffer_mut().clear_changes();
+
+        encoder
+            .encode(&scene, scale(), &resolver(), &empty_store())
+            .expect("空闲帧");
+        assert_eq!(encoder.encoded_lanes(), 0, "无变化帧不得重编码任何 lane");
+        assert_eq!(encoder.reused_segments(), lanes.len());
+        assert_eq!(encoder.buffer().as_bytes(), instances.as_slice());
+        assert_eq!(encoder.buffer().ops(), ops.as_slice());
+        assert!(
+            encoder.buffer_mut().changes().is_empty(),
+            "无变化帧不得产生增量载荷"
+        );
+    }
+
+    /// 只改一条 lane：只有那一条被重编码，变化区间就是它的段。
+    #[test]
+    fn a_dirty_lane_only_reencodes_itself() {
+        let (mut scene, lanes) = grid_scene(8);
+        let mut encoder = InstanceEncoder::new();
+        encoder
+            .encode(&scene, scale(), &resolver(), &empty_store())
+            .expect("初帧");
+        encoder.buffer_mut().clear_changes();
+
+        let lane = lanes[3];
+        let segment = encoder.buffer().segments[lane.slot() as usize]
+            .as_deref()
+            .expect("段存在")
+            .range();
+        assert!(scene.clear_lane(lane));
+        assert!(scene.push(
+            lane,
+            Primitive::Quad(Quad {
+                bounds: Rect::new(1.0, 2.0, 10.0, 20.0),
+                corner_radius: [0.0; 4],
+                paint: solid(),
+            })
+        ));
+        encoder
+            .encode(&scene, scale(), &resolver(), &empty_store())
+            .expect("增量帧");
+
+        assert_eq!(encoder.encoded_lanes(), 1, "只有脏 lane 被重编码");
+        assert_eq!(
+            encoder.written_bytes(),
+            128,
+            "只上传那一条 lane 的实例字节（1 个实例 = 128 B）"
+        );
+        assert_eq!(encoder.reused_segments(), lanes.len() - 1);
+        assert_eq!(
+            encoder.buffer_mut().changes(),
+            &[segment],
+            "变化区间 = 那条 lane 的段（实例数不变 ⇒ 原地重写）"
+        );
+    }
+
+    /// **全量 / 增量等价**：同一场景，「多帧增量」与「一次全量」的实例字节逐字节一致。
+    #[test]
+    fn incremental_and_full_encodes_agree_byte_for_byte() {
+        let (mut scene, lanes) = grid_scene(6);
+        let mut incremental = InstanceEncoder::new();
+        let store = empty_store();
+        incremental
+            .encode(&scene, scale(), &resolver(), &store)
+            .expect("初帧");
+        // 两帧增量：每帧只改一条 lane（形状/位置变、实例数不变 ⇒ 原地重写）。
+        for (round, lane) in [lanes[2], lanes[4]].into_iter().enumerate() {
+            assert!(scene.clear_lane(lane));
+            assert!(scene.push(
+                lane,
+                Primitive::Quad(Quad {
+                    bounds: Rect::new(1.0 + round as f32, 2.0, 10.0, 20.0),
+                    corner_radius: [1.0; 4],
+                    paint: solid(),
+                })
+            ));
+            incremental
+                .encode(&scene, scale(), &resolver(), &store)
+                .expect("增量帧");
+        }
+
+        let mut full = InstanceEncoder::new();
+        full.encode(&scene, scale(), &resolver(), &store)
+            .expect("全量帧");
+
+        assert_eq!(
+            incremental.buffer().as_bytes(),
+            full.buffer().as_bytes(),
+            "全量与增量的实例环必须逐字节一致"
+        );
+        assert_eq!(incremental.buffer().ops(), full.buffer().ops());
+        assert_eq!(
+            incremental.buffer().instance_count(),
+            full.buffer().instance_count()
+        );
+        for lane in &lanes {
+            assert_eq!(
+                lane_instance_bytes(&incremental, *lane),
+                lane_instance_bytes(&full, *lane),
+                "lane {lane:?} 的实例字节必须一致"
+            );
+        }
+    }
+
+    /// 实例数变化（段搬移）之后：每条 lane 的内容仍与全量编码一致。
+    #[test]
+    fn moved_lanes_keep_their_content() {
+        let (mut scene, lanes) = grid_scene(4);
+        let mut incremental = InstanceEncoder::new();
+        let store = empty_store();
+        incremental
+            .encode(&scene, scale(), &resolver(), &store)
+            .expect("初帧");
+        // 把一条 lane 从一个实例改成三个（段长度变化 ⇒ 搬段）。
+        let lane = lanes[1];
+        assert!(scene.clear_lane(lane));
+        for index in 0..3 {
+            assert!(scene.push(
+                lane,
+                Primitive::Quad(Quad {
+                    bounds: Rect::new(index as f32, 0.0, 4.0, 4.0),
+                    corner_radius: [0.0; 4],
+                    paint: solid(),
+                })
+            ));
+        }
+        incremental
+            .encode(&scene, scale(), &resolver(), &store)
+            .expect("增量帧");
+        assert_eq!(incremental.encoded_lanes(), 1);
+
+        let mut full = InstanceEncoder::new();
+        full.encode(&scene, scale(), &resolver(), &store)
+            .expect("全量帧");
+        for lane in &lanes {
+            assert_eq!(
+                lane_instance_bytes(&incremental, *lane),
+                lane_instance_bytes(&full, *lane),
+                "lane {lane:?} 的内容必须与全量编码一致"
+            );
+        }
+    }
+
+    /// 裁剪表超上限 ⇒ 整表重建 + 全量重编码（缓存段的 `clip_index` 全部失效）。
+    #[test]
+    fn overflowing_the_clip_table_forces_a_full_reencode() {
+        let (mut scene, lanes) = grid_scene(3);
+        let mut encoder = InstanceEncoder::new();
+        let store = empty_store();
+        encoder
+            .encode(&scene, scale(), &resolver(), &store)
+            .expect("初帧");
+        // 直接灌表项把表撑到上限之上（等价于长动画每帧追加新 clip 的累积效应）。
+        let filler = encoder.buffer().clips[0];
+        while encoder.buffer().clips.len() <= super::CLIP_TABLE_LIMIT {
+            encoder.buffer_mut().clips.push(filler);
+        }
+        // 再来一条脏 lane：不为它重编码，但表超限会让整帧回退全量。
+        let lane = lanes[0];
+        assert!(scene.clear_lane(lane));
+        assert!(scene.push(lane, quad_primitive(solid())));
+        encoder
+            .encode(&scene, scale(), &resolver(), &store)
+            .expect("重置帧");
+        assert_eq!(
+            encoder.encoded_lanes(),
+            lanes.len(),
+            "裁剪表重置必须让所有 lane 重编码"
+        );
+        assert_eq!(
+            encoder.buffer().clips.len(),
+            1,
+            "重置后裁剪表只剩哨兵（本场景无 clip）"
+        );
+    }
+
+    /// DPI 变化 ⇒ 物理坐标全变 ⇒ 全量重编码。
+    #[test]
+    fn a_dpi_change_forces_a_full_reencode() {
+        let (mut scene, lanes) = grid_scene(4);
+        let mut encoder = InstanceEncoder::new();
+        let store = empty_store();
+        encoder
+            .encode(&scene, Scale::ONE, &resolver(), &store)
+            .expect("1× 帧");
+        // 改一条 lane 之后切 2×：即使只有一条脏 lane，也必须全部重编码。
+        let lane = lanes[2];
+        assert!(scene.clear_lane(lane));
+        assert!(scene.push(lane, quad_primitive(solid())));
+        encoder
+            .encode(&scene, scale(), &resolver(), &store)
+            .expect("2× 帧");
+        assert_eq!(encoder.encoded_lanes(), lanes.len());
+        // 物理化的 bounds：1× 下是 10×20，2× 下是 20×40。
+        let bytes = lane_instance_bytes(&encoder, lanes[0]);
+        let instance: &[super::GpuPrimitive] = bytemuck::cast_slice(&bytes);
+        assert_eq!(instance[0].bounds, [0.0, 0.0, 20.0, 40.0]);
+    }
+
+    /// 压实：碎片超过门槛的**无脏帧**会把段前移、空洞消失，内容与绘制序不变。
+    #[test]
+    fn compaction_packs_the_arena_on_a_clean_frame() {
+        // 100 条 lane、每条 2 个实例（实例环 = 200）；随后每条减到 1 个实例：
+        // 每条搬走一个 2 实例的旧段、在空闲块里切出 1 个 ⇒ 实例环膨胀到 ~300、碎片 ~100。
+        let (mut scene, lanes) = grid_scene(100);
+        let mut encoder = InstanceEncoder::new();
+        let store = empty_store();
+        for lane in &lanes {
+            assert!(scene.push(
+                *lane,
+                Primitive::Quad(Quad {
+                    bounds: Rect::new(8.0, 0.0, 4.0, 4.0),
+                    corner_radius: [0.0; 4],
+                    paint: solid(),
+                })
+            ));
+        }
+        encoder
+            .encode(&scene, scale(), &resolver(), &store)
+            .expect("初帧");
+        for lane in &lanes {
+            assert!(scene.clear_lane(*lane));
+            assert!(scene.push(
+                *lane,
+                Primitive::Quad(Quad {
+                    bounds: Rect::new(0.0, 0.0, 4.0, 4.0),
+                    corner_radius: [0.0; 4],
+                    paint: solid(),
+                })
+            ));
+        }
+        encoder
+            .encode(&scene, scale(), &resolver(), &store)
+            .expect("搬段帧");
+        let used_before = encoder.buffer().instance_count();
+        let free_before: u32 = encoder
+            .buffer()
+            .free
+            .iter()
+            .map(|range| range.end - range.start)
+            .sum();
+        assert!(free_before >= 64, "100 条 lane 搬段必须留下足够碎片");
+
+        // 无脏帧 ⇒ compaction。
+        encoder
+            .encode(&scene, scale(), &resolver(), &store)
+            .expect("压实帧");
+        assert_eq!(encoder.encoded_lanes(), 0);
+        assert!(encoder.buffer().free.is_empty(), "压实之后不得留下空闲块");
+        let live: u32 = 100;
+        assert_eq!(encoder.buffer().instance_count(), live);
+        assert!(used_before > live, "压实前必须有空洞");
+        assert_eq!(encoder.buffer().len() as u32, live);
+
+        // 内容与绘制序必须与全量编码一致。
+        let mut full = InstanceEncoder::new();
+        full.encode(&scene, scale(), &resolver(), &store)
+            .expect("全量帧");
+        assert_eq!(encoder.buffer().as_bytes(), full.buffer().as_bytes());
+        assert_eq!(encoder.buffer().ops(), full.buffer().ops());
+    }
+
+    /// op 级跳过：op 的 bounds 是真实局部范围（不是整屏），且连续 lane 合并后 op 数远小于 lane 数。
+    #[test]
+    fn op_bounds_are_local_and_ops_are_coalesced() {
+        let (scene, _lanes) = grid_scene(200);
+        let buffer = encode(&scene);
+        let instances_ops: Vec<super::PhysicalBounds> = buffer
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                super::FrameOp::Instances { bounds, .. } => Some(*bounds),
+                super::FrameOp::Geometry { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            instances_ops.len(),
+            200usize.div_ceil(super::MAX_LANES_PER_OP as usize),
+            "连续 lane 必须合并成 op（不是一条 lane 一条 op）"
+        );
+        // 第一条 op 只覆盖它的 64 条 lane（8 列 × 8 行，物理像素 = 逻辑 × 2），不是整屏。
+        let first = instances_ops[0];
+        assert_eq!(
+            (first.x0, first.y0),
+            (-2, -2),
+            "包围盒含 AA 外扩 1 px + 取整余量 1 px"
+        );
+        assert!(
+            first.x1 <= (8 * 16 + 10) * 2 + 2,
+            "op bounds 不得扩散到整屏：{first:?}"
+        );
+        // damage 只在最后一组附近：前面的 op 必须判定为不相交（真正跳过）。
+        let bottom = instances_ops.last().expect("至少一条 op");
+        let damage = [bottom.x0, bottom.y0, bottom.x1, bottom.y1];
+        assert!(
+            !first.intersects(damage),
+            "顶部 op 与底部 damage 不相交（op 级跳过生效）"
+        );
     }
 }

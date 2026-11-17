@@ -113,32 +113,100 @@ pub(crate) fn on_close(
     app.close_handlers.insert(id, Box::new(handler));
 }
 
+/// 关闭询问的裁决（两阶段关闭的第一阶段结果；AR3 macOS P1-2）。
+///
+/// [`can_close_window`] 只**询问**、不动窗口状态；[`request_close`] 与 [`request_close_all`]
+/// 共用它，差别只在询问之后要不要真的关。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CloseVerdict {
+    /// 允许关闭：窗口仍在，由调用方在第二阶段真正关闭它。
+    Allowed,
+    /// 应用拦下（关闭处理器返回 `false`，且窗口仍然存在）。
+    Vetoed,
+    /// 窗口已不存在（调用时就没有，或关闭处理器自己关掉了它）：没有可拦的东西。
+    ///
+    /// 与 `Vetoed` 分开的理由：批量关闭（退出握手）里「窗口已经没了」不是否决，把退出整个
+    /// 取消是语义错误（复审 §2.3 的 P3）。
+    Gone,
+}
+
+/// 只询问、不关闭：跑一次关闭处理器并返回裁决（两阶段关闭的第一阶段）。
+///
+/// 处理器用「取出 → 调用 → 放回」的方式调用（与 [`request_close`] 同款）：它需要 `&mut App`，
+/// 不能在使用 `app.close_handlers` 的借用期内存活。放回的两条判据也相同：处理器里可能已经把
+/// 窗口关了，也可能**重新注册**了新的处理器（不能拿旧闭包覆盖它）。
+///
+/// 消费者：[`request_close`]、[`request_close_all`]。
+pub(crate) fn can_close_window(app: &mut App, id: WindowId) -> CloseVerdict {
+    let Some(mut handler) = app.close_handlers.remove(&id) else {
+        // 没有处理器：不会 veto。窗口在 ⇒ 可关；不在 ⇒ 无事可做。
+        return if app.windows.contains_key(&id) {
+            CloseVerdict::Allowed
+        } else {
+            CloseVerdict::Gone
+        };
+    };
+    let allow = handler(app);
+    if app.windows.contains_key(&id) && !app.close_handlers.contains_key(&id) {
+        app.close_handlers.insert(id, handler);
+    }
+    // 处理器自己关掉了窗口：没有可拦的对象，按「已经关了」处理（与 `allow` 无关 ——
+    // 窗口已经不在了，再否决退出只会让用户卡在一个关不掉的退出流程里）。
+    if !app.windows.contains_key(&id) {
+        return CloseVerdict::Gone;
+    }
+    if allow {
+        CloseVerdict::Allowed
+    } else {
+        CloseVerdict::Vetoed
+    }
+}
+
 /// 平台关闭路径：先问关闭前处理器，允许才关。返回 `true` = 窗口已关闭。
 ///
 /// 处理器用「取出 → 调用 → 放回」的方式调用（与 a11y handler 同一做法）：它需要
 /// `&mut App`，不能在使用 `self.close_handlers` 的借用期内存活。
 /// 消费者：`App::request_close`。
 pub(crate) fn request_close(app: &mut App, id: WindowId) -> bool {
-    let Some(mut handler) = app.close_handlers.remove(&id) else {
-        return app.close_window(id);
-    };
-    let allow = handler(app);
-    // 放回的两条判据：
-    // - 处理器里可能已经把窗口关了（自己调用 `close_window`）⇒ 不要再放回；
-    // - 处理器里可能**重新注册**了新的处理器 ⇒ 不能拿旧闭包覆盖它。
-    if app.windows.contains_key(&id) && !app.close_handlers.contains_key(&id) {
-        app.close_handlers.insert(id, handler);
+    match can_close_window(app, id) {
+        // 询问通过 ⇒ 窗口仍在 ⇒ `close_window` 一定返回 true。
+        CloseVerdict::Allowed => app.close_window(id),
+        // 既有语义保持不变：被拦下与「窗口本来就不在」都返回 false（单窗口路径的调用方据此
+        // 判断「这次关闭没有发生」；批量路径用 [`CloseVerdict::Gone`] 区分两者）。
+        CloseVerdict::Vetoed | CloseVerdict::Gone => false,
     }
-    if !allow {
-        return false;
+}
+
+/// 两阶段批量关闭（AR3 macOS P1-2）：**先询问全部窗口，全部同意后才统一关闭**。
+///
+/// 返回 `false` = 某个窗口 veto ⇒ **一个窗口都没有被关闭**，调用方必须回滚整个流程
+/// （macOS 退出握手就此回复 AppKit「不终止」）；返回 `true` = 全部批准且都已关闭。
+///
+/// 两个阶段的边界是**副作用**：询问阶段只跑关闭处理器（应用可能在此保存状态 / 弹确认框），
+/// 不动任何窗口状态。这正是「逐窗 `request_close`」不能用于退出握手的原因 —— 它在批准时立刻
+/// 关窗，于是「A 同意、B veto」会留下已经关掉的 A，而用户被告知「退出已取消」。
+///
+/// 每个处理器在一次调用里恰好跑一次：批准后第二阶段直接 `close_window`，不再问一遍（否则
+/// 会两次弹确认框）。窗口已不存在（[`CloseVerdict::Gone`]）不算 veto：没有可拦的东西。
+///
+/// 只在 macOS 与测试构建里编译（唯一消费者是 macOS 的退出握手；其它平台一次只处理一个窗口
+/// 的关闭请求）。
+/// 消费者：`App::request_close_all`。
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn request_close_all(app: &mut App, ids: &[WindowId]) -> bool {
+    let mut approved: Vec<WindowId> = Vec::with_capacity(ids.len());
+    for &id in ids {
+        match can_close_window(app, id) {
+            CloseVerdict::Allowed => approved.push(id),
+            // 任一窗口否决 ⇒ 整个握手回滚。询问阶段没有任何副作用，因此这里什么都不用撤销。
+            CloseVerdict::Vetoed => return false,
+            CloseVerdict::Gone => {}
+        }
     }
-    app.close_handlers.remove(&id);
-    // 处理器可能**自己**已经关掉了窗口：`close_window` 返回 false 但「窗口已关闭」
-    // 正是 `true` 的语义，不能把它当「被拦下」（复审 F8）。
-    let existed = app.windows.contains_key(&id);
-    app.close_window(id);
-    // 自己关掉（原本存在、现在没了）也算关闭成功。
-    existed
+    for id in approved {
+        app.close_window(id);
+    }
+    true
 }
 
 /// 关窗：精确退订该窗口全部节点的依赖，然后丢弃。返回 `false` = 窗口不存在。

@@ -1195,3 +1195,99 @@ fn the_offscreen_target_alternates_between_full_and_incremental_frames() {
         .expect("partial frame");
     assert_eq!(renderer.target_state(), TargetState::PersistValid);
 }
+/// B6：**增量实例上传与全量上传的像素等价性**（同机 WARP 逐字节比较）。
+///
+/// 同一个渲染器先整帧渲染（建立持久实例缓冲的内容），再改一条 lane、只上传它的实例段；
+/// 与「另起一个渲染器把最终场景一次全量渲染」的读回像素逐字节比较。
+#[test]
+fn incremental_instance_upload_matches_a_full_upload() {
+    let _guard = lock();
+    let Some(mut incremental) = warp_renderer((64, 64)) else {
+        return;
+    };
+    let store = crate::paint::geometry_store::GeometryStore::new();
+
+    // 两条 lane：红块 + 蓝块。
+    let mut scene = Scene::empty();
+    let red = scene.new_lane();
+    assert!(scene.push(
+        red,
+        quad(
+            Rect::new(8.0, 8.0, 16.0, 16.0),
+            Color::srgb(1.0, 0.0, 0.0, 1.0)
+        )
+    ));
+    let blue = scene.new_lane();
+    assert!(scene.push(
+        blue,
+        quad(
+            Rect::new(32.0, 8.0, 16.0, 16.0),
+            Color::srgb(0.0, 0.0, 1.0, 1.0)
+        )
+    ));
+    scene.set_order(&[red, blue]);
+
+    let mut encoder = InstanceEncoder::new();
+    encoder
+        .encode(&scene, Scale::ONE, &resolver(), &store)
+        .expect("初帧");
+    let mut timings = FrameTimings::new();
+    let mut frame = full_plan((64, 64));
+    // 首帧也走增量载荷（与窗口路径一致；`full()` 不会取走变化区间）。
+    let first = crate::render::frame::FramePayload::from_buffer_delta(encoder.buffer_mut());
+    let stats = incremental
+        .submit_snapshot(FrameIndex::from_raw(1), &first, &mut frame, &mut timings)
+        .expect("首帧");
+    assert_eq!(stats.instances, 2);
+
+    // 改蓝块（位置 + 颜色变、实例数不变 ⇒ 原地重写那一个段）→ 增量载荷只带 128 B。
+    assert!(scene.clear_lane(blue));
+    assert!(scene.push(
+        blue,
+        quad(
+            Rect::new(32.0, 32.0, 16.0, 16.0),
+            Color::srgb(0.0, 1.0, 0.0, 1.0)
+        )
+    ));
+    encoder
+        .encode(&scene, Scale::ONE, &resolver(), &store)
+        .expect("增量帧");
+    let payload = crate::render::frame::FramePayload::from_buffer_delta(encoder.buffer_mut());
+    assert_eq!(payload.instance_count(), 2);
+    assert_eq!(
+        payload
+            .chunks()
+            .iter()
+            .map(|chunk| chunk.bytes().len())
+            .sum::<usize>(),
+        128,
+        "只改一条 lane 的增量载荷必须只有它的实例段"
+    );
+    let mut frame = full_plan((64, 64));
+    incremental
+        .submit_snapshot(FrameIndex::from_raw(2), &payload, &mut frame, &mut timings)
+        .expect("增量帧");
+    let incremental_image = incremental.readback().expect("readback(增量)");
+
+    // 对照：全新渲染器把最终场景一次全量渲染。
+    let Some(mut reference) = warp_renderer((64, 64)) else {
+        return;
+    };
+    let mut frame = full_plan((64, 64));
+    let mut timings = FrameTimings::new();
+    let full = crate::render::frame::FramePayload::full(encoder.buffer());
+    reference
+        .submit_snapshot(FrameIndex::from_raw(1), &full, &mut frame, &mut timings)
+        .expect("全量参考帧");
+    let reference_image = reference.readback().expect("readback(全量)");
+
+    assert_eq!(
+        incremental_image.rgba8, reference_image.rgba8,
+        "增量上传与全量上传的像素必须逐字节一致"
+    );
+    assert_eq!(
+        pixel(&reference_image, 64, 40, 40),
+        [0, 255, 0, 255],
+        "绿块必须真的画出来了（否则比较没有意义）"
+    );
+}

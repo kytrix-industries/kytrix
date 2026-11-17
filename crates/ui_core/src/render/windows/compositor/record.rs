@@ -105,6 +105,7 @@ pub(super) fn prime_detached(
             atlas_uploads: &mut renderer.atlas_uploads,
             persist: &renderer.persist,
             upload: &mut renderer.upload,
+            mirror: &mut renderer.mirror,
             geometry: &mut renderer.geometry,
             timer: None,
             swapchain: Some(swapchain),
@@ -214,6 +215,7 @@ pub(super) fn submit_recorded(
                 atlas_uploads: &mut renderer.atlas_uploads,
                 persist: &renderer.persist,
                 upload: &mut renderer.upload,
+                mirror: &mut renderer.mirror,
                 geometry: &mut renderer.geometry,
                 timer: renderer.timer.as_ref(),
                 swapchain,
@@ -254,16 +256,16 @@ pub(super) fn record(
 ) -> Result<RecordedFrame, EngineError> {
     // prime 帧（`FramePayload::empty()`）不画任何图元：不写上传缓冲、也不碰图集上传路径
     // （prime 与图集页换代的 retire 记账不能混在一起）。
-    let (instance_count, _clip_count) = if recorder.prime {
+    let (_instance_count, _clip_count) = if recorder.prime {
         (0, 0)
     } else {
         let written = recorder.upload.write(
+            recorder.mirror,
             recorder.shared,
             recorder.stream,
             index,
             slot.index,
-            payload.instances(),
-            payload.clips(),
+            payload,
         )?;
         recorder.shared.srv_heap().write_slot(
             recorder.shared.raw(),
@@ -525,7 +527,7 @@ pub(super) fn record(
     Ok(RecordedFrame {
         stats: RenderStats {
             draw_calls,
-            instances: instance_count,
+            instances: payload.drawn_instances(),
         },
         present,
     })

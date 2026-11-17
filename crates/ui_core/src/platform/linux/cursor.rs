@@ -31,11 +31,15 @@ use wayland_protocols::wp::cursor_shape::v1::client::{
 use crate::platform::{
     linux::surface::WaylandState,
     wayland::cursor::{
-        self, choose_image, cursor_candidates, icon_roots, parse_xcursor, theme_chain, theme_size,
+        self, CursorApplyState, choose_image, cursor_candidates, icon_roots, parse_xcursor,
+        theme_chain, theme_size,
     },
 };
 
 /// 回退路径里缓存的最大条目数（每个 `(cursor, size)` 一份 shm 池；8 个形状 × 64 KiB 上限）。
+///
+/// 等于形状数 ⇒ 稳态下每次切换都命中缓存；命中同样要重新 `attach`（见
+/// [`CursorManager::apply_from_theme`]），缓存只省掉「读主题文件 + 上传」。
 const MAX_CACHED_IMAGES: usize = 8;
 
 /// 单张光标图像的字节上限（128×128×4 = 64 KiB；超过说明主题文件不可信）。
@@ -71,8 +75,8 @@ pub(crate) struct CursorManager {
     surface: Option<wl_surface::WlSurface>,
     /// 已上传图像缓存。
     images: Vec<CursorImage>,
-    /// 最近一次下发的形状（同值不重复下发；`None` = 未下发 / 已隐藏）。
-    applied: Option<crate::paint::style::Cursor>,
+    /// 下发去重（设备代数 + 形状 + 尺寸，AR3 §3.6）：纯逻辑在 `platform/wayland/cursor.rs`。
+    apply: CursorApplyState,
 }
 
 impl CursorManager {
@@ -86,11 +90,11 @@ impl CursorManager {
             shm,
             surface: None,
             images: Vec::with_capacity(MAX_CACHED_IMAGES),
-            applied: None,
+            apply: CursorApplyState::default(),
         }
     }
 
-    /// pointer 被创建 / 重建：重建它的 shape device。
+    /// pointer 被创建 / 重建：重建它的 shape device，并作废「已下发」记录。
     pub(crate) fn pointer_created(
         &mut self,
         pointer: &wl_pointer::WlPointer,
@@ -99,7 +103,7 @@ impl CursorManager {
         if let Some(device) = self.shape_device.take() {
             device.destroy();
         }
-        self.applied = None;
+        self.apply.pointer_recreated();
         self.shape_device = self
             .shape_manager
             .as_ref()
@@ -111,19 +115,19 @@ impl CursorManager {
         if let Some(device) = self.shape_device.take() {
             device.destroy();
         }
-        self.applied = None;
+        self.apply.pointer_recreated();
     }
 
     /// `wl_pointer.leave`：隐藏光标，避免指针移到别的 surface 上时残留。
     ///
-    /// 之后 `applied` 归零：再次 enter 时即使形状没变也要重新下发（否则会一直隐藏）。
+    /// 之后「已下发」记录作废：再次 enter 时即使形状没变也要重新下发（否则会一直隐藏）。
     pub(crate) fn hide(&mut self, pointer: Option<&wl_pointer::WlPointer>, serial: u32) {
         if let Some(pointer) = pointer
             && serial != 0
         {
             pointer.set_cursor(serial, None, 0, 0);
         }
-        self.applied = None;
+        self.apply.hidden();
     }
 
     /// 下发光标形状：cursor-shape-v1 优先，否则读主题 + shm 上传。
@@ -142,73 +146,83 @@ impl CursorManager {
         let (Some(pointer), true) = (pointer, serial != 0) else {
             return false;
         };
-        if self.applied == Some(cursor) {
+        let size = theme_size(env_cursor_size(), scale);
+        if !self.apply.needs_apply(cursor, size) {
             return true;
         }
-        if let Some(device) = self.shape_device.as_ref() {
+        let applied = if let Some(device) = self.shape_device.as_ref() {
             let Ok(shape) = Shape::try_from(cursor::spec(cursor).shape) else {
                 return false;
             };
             device.set_shape(serial, shape);
-            self.applied = Some(cursor);
-            return true;
+            true
+        } else {
+            self.apply_from_theme(pointer, serial, cursor, size, compositor, queue)
+        };
+        if applied {
+            // 只有真的发出请求才记账：否则下一次 enter 被误判成「已下发」而永不重试。
+            self.apply.note_applied(cursor, size);
         }
-        self.apply_from_theme(pointer, serial, cursor, scale, compositor, queue)
+        applied
     }
 
     /// 回退路径：主题文件 → shm buffer → `attach` + `commit` + `set_cursor`。
+    ///
+    /// **命中缓存也必须重新 `attach`**（AR3 §3.6）：所有形状复用同一个光标 surface，而
+    /// `set_cursor` 让 compositor 读的是 surface **当前**的内容 —— 命中时 surface 上挂的很可能
+    /// 是别的形状的 buffer。8 种形状都上传过之后稳态几乎必然命中，不重新 attach 就会一直显示
+    /// 最后一次上传的那个形状（`Text → Pointer → Text` 给出手形）。
     fn apply_from_theme(
         &mut self,
         pointer: &wl_pointer::WlPointer,
         serial: u32,
         cursor: crate::paint::style::Cursor,
-        scale: i32,
+        size: u32,
         compositor: &wl_compositor::WlCompositor,
         queue: &QueueHandle<WaylandState>,
     ) -> bool {
         let Some(shm) = self.shm.clone() else {
             return false;
         };
-        let size = theme_size(env_cursor_size(), scale);
-        // 缓存命中：surface 上已经 attach 过这张 buffer，只要重新 set_cursor。
-        let cached = self
-            .images
-            .iter()
-            .find(|entry| entry.cursor == cursor && entry.size == size)
-            .map(|entry| (entry.hotspot, entry.pixels));
-        if let Some((hotspot, _)) = cached {
-            let Some(surface) = self.surface.as_ref() else {
-                return false;
-            };
-            pointer.set_cursor(serial, Some(surface), hotspot.0, hotspot.1);
-            self.applied = Some(cursor);
-            return true;
-        }
-        let Some(image) = load_theme_image(cursor, size) else {
-            return false;
-        };
-        let Some(entry) = upload_image(&shm, cursor, size, &image, queue) else {
-            return false;
-        };
         if self.surface.is_none() {
             self.surface = Some(compositor.create_surface(queue, ()));
         }
-        let Some(surface) = self.surface.as_ref() else {
+        let Some(surface) = self.surface.clone() else {
             return false;
         };
-        let hotspot = entry.hotspot;
-        let pixels = entry.pixels;
-        surface.attach(Some(&entry.buffer), 0, 0);
+        let index = match self
+            .images
+            .iter()
+            .position(|entry| entry.cursor == cursor && entry.size == size)
+        {
+            Some(index) => index,
+            None => {
+                let Some(image) = load_theme_image(cursor, size) else {
+                    return false;
+                };
+                let Some(entry) = upload_image(&shm, cursor, size, &image, queue) else {
+                    return false;
+                };
+                self.images.push(entry);
+                self.images.len() - 1
+            }
+        };
+        // 这一张图像的 buffer / 热点是**这次**要显示的内容：命中与未命中走同一条路。
+        let (buffer, hotspot, pixels) = {
+            let entry = &self.images[index];
+            (entry.buffer.clone(), entry.hotspot, entry.pixels)
+        };
+        surface.attach(Some(&buffer), 0, 0);
         surface.damage(0, 0, pixels.0, pixels.1);
         surface.commit();
-        pointer.set_cursor(serial, Some(surface), hotspot.0, hotspot.1);
-        self.images.push(entry);
+        pointer.set_cursor(serial, Some(&surface), hotspot.0, hotspot.1);
+        // 淘汰放在 attach 之后：先让 surface 换到新 buffer，再销毁最老的（它可能正是 surface
+        // 上一次 attach 的那张，销毁请求排在 commit 之后，compositor 已不再引用它）。
         while self.images.len() > MAX_CACHED_IMAGES {
             let stale = self.images.remove(0);
             stale.buffer.destroy();
             stale.pool.destroy();
         }
-        self.applied = Some(cursor);
         true
     }
 }

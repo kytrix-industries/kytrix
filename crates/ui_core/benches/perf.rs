@@ -303,9 +303,15 @@ fn bench_frame_full(c: &mut Criterion) {
                 if let Some(window) = fixture.app.window_mut(fixture.window) {
                     window.set_size(sizes[toggle % 2]);
                 }
-                black_box(fixture.app.frame(fixture.window))
+                let outcome = black_box(fixture.app.frame(fixture.window));
+                // **必须把 fixture 作为输出交回**：routine 拥有它时 drop 落在计时区内，
+                // 10k 节点树的析构（~0.9 ms）会把帧成本淹没。交回后 criterion 在计时区外
+                // 释放输出（`LargeInput` 只多留 1 个 fixture 在内存里）。
+                (fixture, outcome)
             },
-            BatchSize::SmallInput,
+            // 帧的成本与输入规模无关地大，但 batch 里只保留 1 个 fixture：`LargeInput` 的
+            // 批量是按 `iters/1000` 取整（这里恒 1），既不计 setup 也不计 teardown。
+            BatchSize::LargeInput,
         );
     });
 }
@@ -331,9 +337,12 @@ fn bench_frame_incremental(c: &mut Criterion) {
                 // 改一个节点：测 lane 复用 + damage 合并的增量帧。
                 toggle += 1;
                 fixture.app.write(&signal, (toggle % 2) as u8);
-                black_box(fixture.app.frame(fixture.window))
+                let outcome = black_box(fixture.app.frame(fixture.window));
+                // 见 `frame_full_512`：fixture 必须交回，否则 drop 落在计时区内。
+                (fixture, outcome)
             },
-            BatchSize::SmallInput,
+            // 测帧本身（teardown / setup 不计时，见 `frame_full_512`）。
+            BatchSize::LargeInput,
         );
     });
 }
@@ -387,6 +396,10 @@ fn bench_tree_build_scale(c: &mut Criterion) {
 }
 
 /// 增量帧规模：`count` 个静态 box（lane 可整桶复用）+ 1 个绑信号的节点（本帧唯一被标脏的）。
+///
+/// `--features test-support` 下，setup 里额外跑一帧真增量并打印
+/// `encoded_lanes / reused_segments / uploaded_bytes`（「只重编码 1 条 lane、只上传它的实例段」
+/// 这两个事实的基准侧证据；setup 不计时）。
 fn bench_frame_incremental_scale(c: &mut Criterion) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -398,6 +411,9 @@ fn bench_frame_incremental_scale(c: &mut Criterion) {
         ("frame_incremental_10k", 10_000usize),
     ] {
         let mut toggle = 0usize;
+        // 统计只打印一次（setup 每个样本都会跑）；默认特性下没有 `test-support` 的记录可读。
+        #[cfg(feature = "test-support")]
+        let stats_printed = std::sync::Once::new();
         c.bench_function(name, |b| {
             b.iter_batched(
                 || {
@@ -405,15 +421,67 @@ fn bench_frame_incremental_scale(c: &mut Criterion) {
                     let _ = mount_boxes(&mut fixture, count);
                     let signal = mount_fanout(&mut fixture, 1);
                     let _ = fixture.app.frame(fixture.window);
+                    #[cfg(feature = "test-support")]
+                    {
+                        // 统计探针：一个**带背景**的绑定节点 —— 改它的 opacity 真的会重编码
+                        // 1 条 lane（`mount_fanout` 的盒子没有 paint，改它不产生实例）。
+                        let probe = fixture.app.signal(0u8);
+                        {
+                            let Fixture { app, window } = &mut fixture;
+                            let root = app.window(*window).expect("window").tree().root();
+                            let value = probe;
+                            let _ = NodeBuilder::boxed()
+                                .layout_override(Rect::new(0.0, 0.0, 12.0, 12.0))
+                                .paint(PaintSpec {
+                                    background: Color::from_rgba8([0xFF, 0xFF, 0xFF, 0xFF]),
+                                    ..PaintSpec::default()
+                                })
+                                .bind_style(move |cx| StylePatch {
+                                    opacity: Some(f32::from(cx.read(&value)) / 255.0),
+                                    ..StylePatch::default()
+                                })
+                                .build(
+                                    app.window_mut(*window).expect("window").tree_mut(),
+                                    root,
+                                )
+                                .expect("probe box");
+                        }
+                        // 先让探针节点编码一次（首帧全量），再推一帧真增量读统计。
+                        let _ = fixture.app.frame(fixture.window);
+                        fixture.app.write(&probe, 255);
+                        let _ = fixture.app.frame(fixture.window);
+                        let stats = fixture
+                            .app
+                            .window(fixture.window)
+                            .and_then(ui_core::window::Window::frame_stats)
+                            .copied();
+                        stats_printed.call_once(|| {
+                            if let Some(stats) = stats {
+                                eprintln!(
+                                    "{name}: encoded_lanes={} reused_segments={} uploaded_bytes={} instances={}",
+                                    stats.encoded_lanes,
+                                    stats.reused_segments,
+                                    stats.uploaded_bytes,
+                                    stats.instances
+                                );
+                            }
+                        });
+                        // 复位探针（不参与计时帧）。
+                        fixture.app.write(&probe, 0);
+                        let _ = fixture.app.frame(fixture.window);
+                    }
                     (fixture, signal)
                 },
                 |(mut fixture, signal)| {
                     // 改一个节点：测 lane 复用 + damage 合并的增量帧。
                     toggle += 1;
                     fixture.app.write(&signal, (toggle % 2) as u8);
-                    black_box(fixture.app.frame(fixture.window))
+                    let outcome = black_box(fixture.app.frame(fixture.window));
+                    // 见 `frame_full_512`：fixture 必须交回，否则 drop 落在计时区内。
+                    (fixture, outcome)
                 },
-                BatchSize::SmallInput,
+                // 测帧本身（teardown / setup 不计时，见 `frame_full_512`）。
+                BatchSize::LargeInput,
             );
         });
     }
@@ -441,9 +509,12 @@ fn bench_frame_full_10k(c: &mut Criterion) {
                 if let Some(window) = fixture.app.window_mut(fixture.window) {
                     window.set_size(sizes[toggle % 2]);
                 }
-                black_box(fixture.app.frame(fixture.window))
+                let outcome = black_box(fixture.app.frame(fixture.window));
+                // 见 `frame_full_512`：fixture 必须交回，否则 drop 落在计时区内。
+                (fixture, outcome)
             },
-            BatchSize::SmallInput,
+            // 测帧本身（teardown / setup 不计时，见 `frame_full_512`）。
+            BatchSize::LargeInput,
         );
     });
 }

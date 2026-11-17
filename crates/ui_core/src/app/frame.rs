@@ -178,6 +178,11 @@ pub(crate) fn frame(app: &mut App, window: WindowId) -> Option<Result<FrameOutco
                 .count(),
             primitives: target.scene().primitive_count(),
             instances: paint.instances,
+            encoded_lanes: paint.encoded_lanes,
+            reused_segments: paint.reused_segments,
+            // 编码器侧的增量字节数；渲染器路径会用载荷的实际字节数覆盖它
+            // （`Window::submit_gpu`；headless 保持编码器侧值）。
+            uploaded_bytes: paint.uploaded_bytes,
         };
         let Some(target) = app.windows.get_mut(&window) else {
             app.abort_frame(window, ticket);

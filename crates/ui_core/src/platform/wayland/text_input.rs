@@ -16,11 +16,28 @@
 //!
 //! ```text
 //! 文本走 IME  ⟺  焦点 surface 已 enable  ∧  未被降级
-//! 降级        =   enable 之后 NO_IM_FALLBACK 内**没有任何** IM 事件（preedit/commit/delete）
+//! 降级        =  本进程首次 enable 之后 NO_IM_FALLBACK 内**没有任何** IM 事件（preedit/commit/delete）
 //! 升级        =  降级后收到任何 IM 事件 ⇒ 立刻交回 IME
 //! ```
 //!
 //! 「无任何 IM 事件」是唯一可观测的存活信号，所以降级必须是**启发式 + 可逆**的。
+//!
+//! # 降级计时属于 **seat**，不属于 surface（AR3 §3.2）
+//!
+//! 输入法是 **per-seat** 的：`zwp_text_input_v3` 只有一个对象，`enter`/`leave` 只是把它的
+//! *焦点* 在 surface 之间搬动，**它背后的输入法引擎没有变**。因此「本 seat 没有输入法」这个
+//! 判定不能跟着焦点走：旧实现每次 `enter` 都把 `degraded` / `saw_im_event` / 计时起点复位，
+//! 于是在没有输入法守护进程的 compositor（sway / Hyprland 默认只暴露 text-input-v3、不跑
+//! 输入法）上，用户**每切一次文本焦点就再吃一次 1.5 s 的键盘文本真空**。
+//!
+//! 现在三样都按 seat 记账、跨焦点切换保持：
+//!
+//! - `first_enable_at`：本进程**第一次** `enable` 的时刻（降级计时的唯一起点，只设一次）；
+//! - `degraded`：一旦判定就保持，只有 `note_im_event`（输入法真的说话了）才撤销；
+//! - `saw_im_event`：一旦见过 IM 事件就永久为真（这个 seat 有输入法）。
+//!
+//! 慢启动的输入法仍然能升回来（[`TextInputRoute::note_im_event`]），因为组合期的
+//! `preedit_string` 会立刻把文本通路交回 IME。
 //!
 //! # `done` 的 serial（R10-13）
 //!
@@ -33,11 +50,16 @@
 //!
 //! 即：文本变化**总是**应用；只有「我们自己发的状态」要等 serial 对上再发。本状态机因此把
 //! 两件事分开：`done` 的文本路由恒走 [`TextInputRoute::focus`]，状态刷新由
-//! [`TextInputRoute::settle`] 的返回值决定。
+//! [`TextInputRoute::settle`] 的返回值决定 —— **并且只有真的攒下了新状态才允许 `commit()`**：
+//! 协议要求 compositor 对每个 `commit()` 回一条 `done`，若 `done` 里无条件再 `commit()`，
+//! 就是 done → commit → done 的永久自激（AR3 §3.3）。因此「要不要回写」由调用方用
+//! [`ImeStateSnapshot`] 与上次已提交快照做差来决定，本模块只提供两个计数：
+//! `commits`（已发出的 `commit()` 次数 = 下一个 `done` 的期望 serial）与 `acked`
+//! （最后一次匹配上的 serial）；`commits != acked` ⇒ 有批在飞，新的状态更新应等 `done`。
 
 use std::time::{Duration, Instant};
 
-use crate::{event::Modifiers, window::ImeContentType};
+use crate::{event::Modifiers, math::Rect, window::ImeContentType};
 
 /// `enable()` 之后等待「本 seat 有输入法引擎」证据的窗口。
 ///
@@ -63,16 +85,30 @@ pub(crate) struct TextInputRoute {
     focus: Option<u32>,
     /// 已发出的 `commit()` 次数（`done.serial` 的期望值）。
     commits: u32,
+    /// 最后一次**匹配上的** `done.serial`（= 最近一次被 compositor 确认的 `commit()`）。
+    ///
+    /// `commits == acked` ⇒ 没有批在飞；否则新的状态更新应等 `done`（协议：*"All pending state
+    /// requests … should be sent and committed after receiving a done event with a matching
+    /// serial."*）。
+    acked: u32,
     /// 本 seat 是否观察到过 IM 事件（preedit / commit / delete_surrounding）。
+    ///
+    /// **跨焦点保持**：输入法属于 seat，不属于 surface（AR3 §3.2）。
     saw_im_event: bool,
-    /// 无 IM 守护进程的降级（键盘文本通路接管）。
+    /// 无 IM 守护进程的降级（键盘文本通路接管）。跨焦点保持，只有 [`Self::note_im_event`] 撤销。
     degraded: bool,
-    /// `enable()` 的时刻（降级计时起点）。
-    enabled_at: Option<Instant>,
+    /// 本进程**第一次** `enable()` 的时刻（降级计时的唯一起点）。
+    ///
+    /// 只设一次、从不因焦点切换复位：否则「每换一次焦点重新给 1.5 s 窗口期」会让无输入法的
+    /// compositor 上每次换焦点都有 1.5 s 文本真空（AR3 §3.2）。
+    first_enable_at: Option<Instant>,
 }
 
 impl TextInputRoute {
     /// `zwp_text_input_v3.enter`（或 `wl_keyboard.enter` 的 IME 侧）：把焦点设到 `window`。
+    ///
+    /// **不重置降级状态与计时**（per-seat 判据，见模块文档）：换 surface 只换协议对象的焦点，
+    /// 背后的输入法引擎没变。
     pub(crate) fn enter(&mut self, window: u32, now: Instant) -> FocusChange {
         if self.focus == Some(window) {
             return FocusChange::default();
@@ -82,22 +118,20 @@ impl TextInputRoute {
             enable: true,
         };
         self.focus = Some(window);
-        // 新目标重新判定存活：上一次降级不影响新窗口（不同的 surface 可能挂不同输入法）。
-        self.saw_im_event = false;
-        self.degraded = false;
-        self.enabled_at = Some(now);
+        // 计时起点只在这里**第一次**落定；之后的焦点切换不改它。
+        self.first_enable_at.get_or_insert(now);
         change
     }
 
     /// 关闭窗口 / 退出：无条件停用（`remove_window` 不能再误伤焦点窗口，见 `is_focus`）。
+    ///
+    /// 降级状态**不清**：本 seat 有没有输入法不因「当前没有文本焦点」而改变（下一次 enable
+    /// 若重新计时，就又把 1.5 s 真空还给了没有输入法的 compositor）。
     pub(crate) fn disable(&mut self) -> FocusChange {
         if self.focus.is_none() {
             return FocusChange::default();
         }
         self.focus = None;
-        self.degraded = false;
-        self.saw_im_event = false;
-        self.enabled_at = None;
         FocusChange {
             disable: true,
             enable: false,
@@ -125,7 +159,6 @@ impl TextInputRoute {
         };
         if focus == removed {
             self.focus = None;
-            self.enabled_at = None;
         } else if focus > removed {
             self.focus = Some(focus - 1);
         }
@@ -136,16 +169,29 @@ impl TextInputRoute {
         self.commits = self.commits.saturating_add(1);
     }
 
-    /// `done.serial` 是否与本对象已发出的 `commit()` 次数一致。
+    /// 是否有已发出、还没被 `done` 确认的 `commit()`。
+    ///
+    /// `true` ⇒ 新的状态更新应等这一轮 `done`（否则会与 compositor 的双缓冲状态错位，也会
+    /// 让「done 之后再 commit」的判据失去意义）。
+    #[must_use]
+    pub(crate) fn commit_in_flight(&self) -> bool {
+        self.commits != self.acked
+    }
+
+    /// `done.serial` 是否与本对象已发出的 `commit()` 次数一致（匹配 ⇒ 记下 ack）。
     ///
     /// `true` ⇒ 可以下发上一轮攒下的状态（`set_content_type` / `set_cursor_rectangle` 等）。
     /// `false` ⇒ 按协议**仍然应用文本变化**，但不要下发新状态（会与 compositor 的已知状态错位）。
     #[must_use]
     pub(crate) fn settle(&mut self, serial: u32) -> bool {
-        serial == self.commits
+        if serial != self.commits {
+            return false;
+        }
+        self.acked = serial;
+        true
     }
 
-    /// 收到任何 IM 事件：证明本 seat 有输入法引擎 ⇒ 撤销降级。
+    /// 收到任何 IM 事件：证明本 seat 有输入法引擎 ⇒ 撤销降级（永久，直到进程结束）。
     pub(crate) fn note_im_event(&mut self) {
         self.saw_im_event = true;
         self.degraded = false;
@@ -164,10 +210,10 @@ impl TextInputRoute {
         if self.degraded || self.saw_im_event {
             return false;
         }
-        let Some(enabled_at) = self.enabled_at else {
+        let Some(first_enable_at) = self.first_enable_at else {
             return false;
         };
-        if now.duration_since(enabled_at) < NO_IM_FALLBACK {
+        if now.duration_since(first_enable_at) < NO_IM_FALLBACK {
             return false;
         }
         self.degraded = true;
@@ -180,9 +226,74 @@ impl TextInputRoute {
         if self.degraded || self.saw_im_event {
             return None;
         }
-        let enabled_at = self.enabled_at?;
-        Some(NO_IM_FALLBACK.saturating_sub(now.duration_since(enabled_at)))
+        let first_enable_at = self.first_enable_at?;
+        Some(NO_IM_FALLBACK.saturating_sub(now.duration_since(first_enable_at)))
     }
+}
+
+// ── 已提交状态的快照（`done` 回写的「脏」判据，AR3 §3.3）──────────────────────
+
+/// 一次 `commit()` 会下发的 text-input 状态（`set_surrounding_text` 本平台没有通路）。
+///
+/// 用途只有一件：和**上次已提交的快照**做差。`done` 之后只有快照真的变了才允许再
+/// `commit()`；否则每个 `done` 都会制造下一次 `commit()`，而协议保证 compositor 对每个
+/// `commit()` 必回 `done` ⇒ 事件循环被 done→commit→done 永久钉住（AR3 §3.3 / P1）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ImeStateSnapshot {
+    /// 应用声明的 caret 区域（surface 逻辑坐标；`None` = 应用没有 hint）。
+    pub cursor_area: Option<Rect>,
+    /// `set_content_type` 的 `(content_hint, content_purpose)`。
+    pub content: ContentTypeBits,
+}
+
+impl ImeStateSnapshot {
+    /// `set_cursor_rectangle` 的四个参数（`x, y, width, height`）。
+    ///
+    /// 协议要求宽高 ≥ 1；应用没有 hint 时退化到原点 1×1（候选窗不会跑到屏幕角落之外）。
+    #[must_use]
+    pub(crate) fn cursor_rect(self) -> (i32, i32, i32, i32) {
+        let area = self
+            .cursor_area
+            .unwrap_or_else(|| Rect::new(0.0, 0.0, 1.0, 1.0));
+        (
+            area.origin.x.round() as i32,
+            area.origin.y.round() as i32,
+            area.size.width.max(1.0).round() as i32,
+            area.size.height.max(1.0).round() as i32,
+        )
+    }
+
+    /// 相对**上次已提交快照**的差异：`None` ⇒ 完全一致 ⇒ 调用方**不得** `commit()`。
+    ///
+    /// 这就是 AR3 §3.3 的自激闸门，落在纯逻辑层：`done` 处理里拿当前状态与 `applied` 做差，
+    /// 空 diff 就什么都不发 ⇒ 不会再制造下一个 `done` ⇒ done → commit → done 的环断在这里。
+    ///
+    /// `applied == None`（从没提交过，例如 `enable()` 之后）⇒ 整份重发；注意
+    /// `applied: Some { cursor_area: None }` 与 `applied: None` **不是**一回事：前者表示
+    /// "提交过『没有 caret hint』"，后者表示"一次都没提交过"。
+    #[must_use]
+    pub(crate) fn diff_from(self, applied: Option<Self>) -> Option<ImeStateDiff> {
+        let applied_cursor = applied.map(|snapshot| snapshot.cursor_area);
+        let applied_content = applied.map(|snapshot| snapshot.content);
+        let cursor_rect = (applied_cursor != Some(self.cursor_area)).then(|| self.cursor_rect());
+        let content = (applied_content != Some(self.content)).then_some(self.content);
+        if cursor_rect.is_none() && content.is_none() {
+            return None;
+        }
+        Some(ImeStateDiff {
+            cursor_rect,
+            content,
+        })
+    }
+}
+
+/// 一次 `commit()` 要下发的差异（只发变了的那几项；`None` 的项不发请求）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ImeStateDiff {
+    /// 要 `set_cursor_rectangle` 的参数（`None` = caret 没变）。
+    pub cursor_rect: Option<(i32, i32, i32, i32)>,
+    /// 要 `set_content_type` 的位（`None` = 内容语义没变）。
+    pub content: Option<ContentTypeBits>,
 }
 
 // ── `content_type` 映射（R10-12）──────────────────────────────────────────
@@ -254,7 +365,7 @@ mod tests {
         CONTENT_HINT_HIDDEN_TEXT, CONTENT_HINT_SENSITIVE_DATA, NO_IM_FALLBACK, TextInputRoute,
         content_type_bits, text_blocked_by_modifiers,
     };
-    use crate::{event::Modifiers, window::ImeContentType};
+    use crate::{event::Modifiers, math::Rect, window::ImeContentType};
 
     fn route_with_focus(now: Instant) -> TextInputRoute {
         let mut route = TextInputRoute::default();
@@ -357,12 +468,18 @@ mod tests {
         assert_eq!(route.focus(), Some(1));
     }
 
-    /// R10-13：`done` 的文本恒应用，但只有 serial 对上才允许下发新状态。
+    /// R10-13：`done` 的文本恒应用，但只有 serial 对上才允许下发新状态；匹配之后
+    /// 「有没有批在飞」必须归零，否则 `done` 里就会再 `commit()` 一次（AR3 §3.3 的自激）。
     #[test]
     fn only_a_matching_done_serial_allows_new_state_to_be_sent() {
         let now = Instant::now();
         let mut route = route_with_focus(now);
+        assert!(route.commit_in_flight(), "刚 commit 过 ⇒ 有批在飞");
         assert!(route.settle(1), "commit 次数 = 1 ⇒ serial 1 匹配");
+        assert!(
+            !route.commit_in_flight(),
+            "匹配的 done 之后不得再有「在飞的批」，否则 done 会继续制造 commit"
+        );
         route.note_commit();
         assert!(route.settle(2));
         assert!(
@@ -370,6 +487,7 @@ mod tests {
             "过期的 serial ⇒ 文本照常应用，但不得下发 set_content_type 等状态"
         );
         assert!(!route.settle(3), "未来的 serial 同样不匹配");
+        assert!(!route.commit_in_flight(), "不匹配的 done 不得改动 ack 进度");
     }
 
     /// R10-2：无 IM 守护进程时必须在 NO_IM_FALLBACK 后把文本交回键盘通路。
@@ -426,19 +544,214 @@ mod tests {
         assert!(route.takes_text(), "IM 一旦说话就必须重新独占文本通路");
     }
 
-    /// 换焦点重新计时：新 surface 的 IM 可能完全不同（不同窗口可能挂不同输入法）。
+    /// AR3 §3.2 P1：换焦点**不得**重置降级计时。
+    ///
+    /// 计时的起点是「本进程第一次 enable」，之后 `enter`/`leave`/`disable` 都不动它：否则没有
+    /// 输入法的 compositor 上每换一次焦点都要重新等 1.5 s，而输入法根本不可能出现。
     #[test]
-    fn switching_focus_restarts_the_fallback_timer() {
+    fn switching_focus_does_not_restart_the_fallback_timer() {
+        let now = Instant::now();
+        let mut route = route_with_focus(now);
+        // 在窗口 7 上启用后立刻换到窗口 8（例如 Tab 到下一个输入框）。
+        route.note_commit();
+        let switched_at = now + Duration::from_millis(100);
+        route.enter(8, switched_at);
+        assert_eq!(
+            route.next_degrade_in(switched_at),
+            Some(NO_IM_FALLBACK - Duration::from_millis(100)),
+            "换焦点不能把 1.5 s 的窗口期重新发一遍"
+        );
+        assert!(
+            route.should_degrade(now + NO_IM_FALLBACK),
+            "降级时刻仍以首次 enable 为起点"
+        );
+        assert!(!route.takes_text());
+    }
+
+    /// AR3 §3.2 P1：已经降级之后换焦点不得把文本真空再发一次。
+    #[test]
+    fn switching_focus_does_not_undo_a_degraded_seat() {
         let now = Instant::now();
         let mut route = route_with_focus(now);
         assert!(route.should_degrade(now + NO_IM_FALLBACK));
-        assert!(!route.takes_text(), "降级后键盘通路接管");
-        route.note_commit();
+        assert!(!route.takes_text());
+
         let later = now + NO_IM_FALLBACK * 2;
+        route.note_commit();
         route.enter(8, later);
-        assert!(route.takes_text(), "换焦点后重新给新目标的 IME 一个窗口期");
-        assert!(!route.should_degrade(later + Duration::from_millis(10)));
-        assert!(route.should_degrade(later + NO_IM_FALLBACK));
+        assert!(
+            !route.takes_text(),
+            "换焦点后键盘文本必须继续产生（旧实现会在这里再开一个 1.5 s 的真空）"
+        );
+        assert!(
+            !route.should_degrade(later + NO_IM_FALLBACK),
+            "降级状态是 per-seat 的，不会因为换 surface 重新判定一次"
+        );
+        assert_eq!(route.next_degrade_in(later), None, "已经判定过，不再计时");
+    }
+
+    /// 停用（窗口关闭 / 全部失焦）也不得清掉 seat 判定：下一次 enable 若重新计时，
+    /// 没有输入法的 compositor 上每次重新聚焦都再吃 1.5 s。
+    #[test]
+    fn disabling_the_focus_does_not_forget_the_seat_verdict() {
+        let now = Instant::now();
+        let mut route = route_with_focus(now);
+        assert!(route.should_degrade(now + NO_IM_FALLBACK));
+        route.disable();
+        assert!(!route.takes_text(), "没有焦点时键盘通路本来就该产生文本");
+
+        route.enter(2, now + NO_IM_FALLBACK * 3);
+        assert!(
+            !route.takes_text(),
+            "重新聚焦不得再开一个 1.5 s 的 IME 窗口期"
+        );
+        assert_eq!(route.next_degrade_in(now + NO_IM_FALLBACK * 3), None);
+    }
+
+    /// 输入法是 per-seat 的：任何一次 IM 事件都永久证明这个 seat 有引擎，
+    /// 即使随后换了焦点、降级过也不会再回到键盘接管。
+    #[test]
+    fn an_im_event_is_remembered_for_the_whole_seat() {
+        let now = Instant::now();
+        let mut route = route_with_focus(now);
+        route.note_im_event();
+        route.disable();
+        route.enter(3, now + Duration::from_secs(10));
+        assert!(route.takes_text());
+        assert!(!route.should_degrade(now + Duration::from_secs(60)));
+        assert_eq!(route.next_degrade_in(now + Duration::from_secs(60)), None);
+    }
+
+    /// AR3 §3.3：`ImeStateSnapshot` 是「要不要在 `done` 里回写」的唯一判据 ——
+    /// 快照相同必须相等（调用方据此跳过 `commit()`），任何一项变化都要被看见。
+    #[test]
+    fn ime_state_snapshots_only_differ_when_a_field_changes() {
+        let area = super::ImeStateSnapshot {
+            cursor_area: Some(Rect::new(10.0, 20.0, 2.0, 18.0)),
+            content: content_type_bits(ImeContentType::Text),
+        };
+        assert_eq!(
+            area, area,
+            "同一批状态必须相等（否则每个 done 都会 commit）"
+        );
+        assert_ne!(
+            area,
+            super::ImeStateSnapshot {
+                cursor_area: Some(Rect::new(11.0, 20.0, 2.0, 18.0)),
+                ..area
+            },
+            "caret 移动必须被看见"
+        );
+        assert_ne!(
+            area,
+            super::ImeStateSnapshot {
+                cursor_area: None,
+                ..area
+            },
+            "应用撤销 caret hint 也必须回写"
+        );
+        assert_ne!(
+            area,
+            super::ImeStateSnapshot {
+                content: content_type_bits(ImeContentType::Password),
+                ..area
+            },
+            "内容语义变化（密码框）必须回写"
+        );
+    }
+
+    /// 没有 caret hint 时 `set_cursor_rectangle` 退化到原点 1×1（协议要求宽高 ≥ 1）。
+    #[test]
+    fn a_missing_caret_hint_falls_back_to_a_one_pixel_rect() {
+        let snapshot = super::ImeStateSnapshot {
+            cursor_area: None,
+            content: content_type_bits(ImeContentType::Text),
+        };
+        assert_eq!(snapshot.cursor_rect(), (0, 0, 1, 1));
+
+        let hinted = super::ImeStateSnapshot {
+            cursor_area: Some(Rect::new(12.4, 30.6, 0.0, 17.2)),
+            ..snapshot
+        };
+        assert_eq!(
+            hinted.cursor_rect(),
+            (12, 31, 1, 17),
+            "坐标四舍五入、宽高至少 1（0 宽是非法参数）"
+        );
+    }
+
+    /// AR3 §3.3 P1 的核心回归：**连续喂入相同的状态不得产生第二次 `commit()`**。
+    ///
+    /// 判据就是 `ImeStateSnapshot::diff_from`：
+    ///
+    /// - `applied == None`（`enable()` 之后）⇒ 整份重发（一次）；
+    /// - 之后每个 `done` 回来时状态没变 ⇒ `None` ⇒ `surface.rs` 的 `done` 处理**什么都不发**，
+    ///   因此不会再有下一次 `done`（协议：compositor 对每个 `commit()` 必回 `done`）；
+    /// - 只有真的变了（caret 移动 / 内容语义变化）才有非空 diff —— 这时**才**允许 `commit()`。
+    #[test]
+    fn the_same_state_is_never_committed_twice() {
+        let text = content_type_bits(ImeContentType::Text);
+        let snapshot = super::ImeStateSnapshot {
+            cursor_area: Some(Rect::new(10.0, 20.0, 2.0, 18.0)),
+            content: text,
+        };
+
+        // 第一次（enable 之后）：整份重发。
+        let first = snapshot.diff_from(None).expect("enable 之后必须整份重发");
+        assert_eq!(first.cursor_rect, Some((10, 20, 2, 18)));
+        assert_eq!(first.content, Some(text));
+
+        // 第二个 done：状态没变 ⇒ 空 diff ⇒ 不得 commit（自激环在这里断掉）。
+        assert_eq!(
+            snapshot.diff_from(Some(snapshot)),
+            None,
+            "连续相同状态不得产生第二次 commit"
+        );
+        // 再喂一次也一样（不会因为「喂了几次」而变化）。
+        assert_eq!(snapshot.diff_from(Some(snapshot)), None);
+
+        // 真的变了才有 diff，而且只带变了的那一项。
+        let moved = super::ImeStateSnapshot {
+            cursor_area: Some(Rect::new(10.0, 40.0, 2.0, 18.0)),
+            ..snapshot
+        };
+        assert_eq!(
+            moved.diff_from(Some(snapshot)),
+            Some(super::ImeStateDiff {
+                cursor_rect: Some((10, 40, 2, 18)),
+                content: None,
+            }),
+            "caret 移动只重发 caret 矩形"
+        );
+        let password = super::ImeStateSnapshot {
+            content: content_type_bits(ImeContentType::Password),
+            ..snapshot
+        };
+        assert_eq!(
+            password.diff_from(Some(snapshot)),
+            Some(super::ImeStateDiff {
+                cursor_rect: None,
+                content: Some(content_type_bits(ImeContentType::Password)),
+            }),
+            "密码框只重发 content_type（安全语义）"
+        );
+    }
+
+    /// 「从没提交过」与「提交过『没有 caret hint』」必须区分：
+    /// 后者不得因为 `Option` 的嵌套被当成没提交过而每次 `done` 都重发。
+    #[test]
+    fn a_committed_empty_caret_hint_is_not_resent() {
+        let no_hint = super::ImeStateSnapshot {
+            cursor_area: None,
+            content: content_type_bits(ImeContentType::Text),
+        };
+        let first = no_hint.diff_from(None).expect("第一次必须发");
+        assert_eq!(first.cursor_rect, Some((0, 0, 1, 1)));
+        assert_eq!(
+            no_hint.diff_from(Some(no_hint)),
+            None,
+            "已经提交过「无 hint」⇒ 退化的 1×1 不该每个 done 都重发"
+        );
     }
 
     #[test]

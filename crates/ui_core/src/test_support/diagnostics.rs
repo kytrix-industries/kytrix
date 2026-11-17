@@ -172,7 +172,12 @@ pub fn frame_dump(app: &TestApp) -> FrameDump {
         .window(app.window_id())
         .expect("TestApp's window must exist");
     let buffer = window.instance_buffer();
-    let instances: &[GpuPrimitive] = bytemuck::cast_slice(buffer.as_bytes());
+    // 实例环有空洞（增量编码的段搬移会留下），诊断只导出**存活**实例（按实例环下标升序）。
+    let instances: Vec<InstanceDump> = buffer
+        .live_instances()
+        .flatten()
+        .map(instance_dump)
+        .collect();
     // 不能用 `TestApp::frame_record()`：它在从未 `drain()` 时会 panic（`record` 是 `Option`）。
     let record = window.record();
     FrameDump {
@@ -181,7 +186,7 @@ pub fn frame_dump(app: &TestApp) -> FrameDump {
             .to_physical_covering(window.scale()),
         scale: window.scale().factor(),
         damage: record.map_or_else(Vec::new, |record| record.damage.clone()),
-        instances: instances.iter().map(instance_dump).collect(),
+        instances,
         ops: buffer.ops().iter().map(op_dump).collect(),
         clips: buffer.clips().iter().map(clip_dump).collect(),
     }

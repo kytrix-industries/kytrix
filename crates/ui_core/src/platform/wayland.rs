@@ -8,7 +8,8 @@
 //! - R10-1 `wl_data_source` 复用且不销毁 ⇒ 第二次复制后粘贴为空；
 //! - R10-2/R10-6/R10-13 IME 的焦点路由、无 IM 守护进程时无回退、`done` 按 `active` 路由；
 //! - R10-3 完全没有光标实现（形状映射表 + Xcursor 主题解析都在这里）；
-//! - R10-7 不可见窗口的活性兜底退化成永久 5 Hz 渲染。
+//! - R10-7 不可见窗口的活性兜底退化成永久 5 Hz 渲染（帧门禁状态机 `frame_gate` 在这里，
+//!   它只认 `wl_callback` / 可见性，不认时间）。
 //!
 //! 因此这些判断被抽成「输入是协议里的整数码 / 纯 Rust 状态，输出是可直接下发的决定」的纯
 //! 函数与纯状态机，由 [`mod@self`] 的单测覆盖（开发机跑得到）。协议对象（`wl_data_source`、
@@ -17,6 +18,7 @@
 //! 编译条件与 `platform/ime` 同款：Linux 构建 + 测试构建（`cfg(test)` 让 Windows 也能测）。
 
 pub(crate) mod cursor;
+pub(crate) mod frame_gate;
 pub(crate) mod selection;
 pub(crate) mod text_input;
 pub(crate) mod toplevel;
