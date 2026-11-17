@@ -17,6 +17,7 @@ use ui_core::{
         app::TestApp,
         probe::Selector,
         record::{LaneOutcome, PrimitiveKind},
+        script::{FrameScript, ScriptFrame},
     },
     text::TextStyle,
     window::FrameOutcome,
@@ -154,45 +155,56 @@ fn damage_is_local_and_idle_is_zero_frame() {
         .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
         .expect("挂载成功");
 
-    let first = app.drain().expect("首帧").clone();
-    assert!(first.rendered);
+    // 三帧脚本：首帧提交 → 只改一个 label 的颜色 → 空闲零帧（L2.5 脚手架）。
+    let mut script = FrameScript::new(app);
+    script.push(ScriptFrame::new("首帧"));
+    script.push(ScriptFrame::new("只改 label 的颜色").write(background, Color::BLACK));
+    script.push(ScriptFrame::new("空闲帧"));
+    script.run().expect("帧脚本");
+    let report = script.report();
+
+    report.assert_rendered(0);
     assert_eq!(
-        app.probe().by_selector(Selector::Id("label")),
+        script.app().probe().by_selector(Selector::Id("label")),
         Some(label),
         "稳定 id 必须可查"
     );
-    let first_index = first.frame_index;
+    let first_index = report.frame(0).record.frame_index;
 
     // 只改一个 label 的颜色：damage 必须局部。
-    app.app_mut().write(&background, Color::BLACK);
-    let second = app.drain().expect("第二帧").clone();
-    assert!(second.rendered);
+    report.assert_rendered(1);
     let frame_area = Rect::new(0.0, 0.0, 800.0, 600.0)
         .to_physical_covering(Scale::new(1.0).expect("scale"))
         .area();
+    let damage = &report.frame(1).record.damage;
     assert!(
-        second
-            .damage
-            .iter()
-            .all(|rect| rect.area() < frame_area / 50),
-        "damage 必须局部：{:?}",
-        second.damage
+        damage.iter().all(|rect| rect.area() < frame_area / 50),
+        "damage 必须局部：{damage:?}"
     );
     assert!(
-        second
+        report
+            .frame(1)
+            .record
             .paint_log
             .lanes
             .iter()
             .any(|entry| entry.outcome == LaneOutcome::Reused),
         "未变化的节点必须复用 lane"
     );
+    // 脚手架断言：只改一个节点 ⇒ damage 只允许一块矩形。
+    report.assert_damage_rects_at_most(1, 1);
 
-    // 空闲零帧：不提交、序号不变。
-    let third = app.drain().expect("空闲帧").clone();
-    assert!(!third.rendered);
-    assert_eq!(third.frame_index, second.frame_index);
-    assert_eq!(second.frame_index.get(), first_index.get() + 1);
-    assert!(third.damage.is_empty());
+    // 空闲零帧：不提交、序号不变、无 damage。
+    report.assert_idle(2);
+    assert_eq!(
+        report.frame(2).record.frame_index,
+        report.frame(1).record.frame_index
+    );
+    assert_eq!(
+        report.frame(1).record.frame_index.get(),
+        first_index.get() + 1
+    );
+    assert!(report.frame(2).record.damage.is_empty());
 }
 
 #[test]

@@ -6,6 +6,9 @@
 //!
 //! 平台策略（§9.6 / D14）：golden 按**设备类型**分目录；三个平台各自产出并与自己的基线比对
 //! （跨设备比同一份 golden 会永久红）。`golden` 的字节是读回原样（预乘 sRGB RGBA8），不反预乘。
+//!
+//! 容差（D19）：逐通道最大差 + **不匹配像素比例上限**（[`Tolerance`]），失败信息带不匹配像素数、
+//! 最大通道差、首个差异坐标与差异区域包围盒。`UI_CORE_BLESS` 存在时重生成**当前平台**的 golden。
 
 use std::{
     fmt,
@@ -283,29 +286,46 @@ pub enum SnapshotError {
     },
 }
 
-/// 逐通道容差（D19：**不冻结数值**，见 `design/phase-13-resources-snapshot.md` §9.5）。
+/// 像素容差：逐通道最大差 + **不匹配像素比例上限**（D19：数值可校准，机制冻结）。
+///
+/// 判定规则：`mismatched_pixels <= allowed_mismatches(compared_pixels)` 才算通过。
+/// `max_channel_diff` / `avg_channel_diff` 只进报告，不参与判定（它们对 AA 边缘极度敏感，
+/// 拿来做门禁会让每个平台都变成「比谁更圆」）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tolerance {
     /// 单通道允许的最大绝对差（`0..=255`）。
     pub per_channel: u8,
-    /// 允许「有任一通道超出 `per_channel`」的**像素数**上限。
-    pub max_over_tolerance_pixels: u32,
+    /// 允许「有任一通道超出 `per_channel`」的像素**比例**上限，单位 1e-6（`1_000` = 0.1%）。
+    ///
+    /// 用整数 ppm 而不是 `f32`/`f64`：容差要能 `Eq` 比较，且判定必须逐平台逐次可复现
+    /// （浮点比较在边界上会因为编译目标不同而翻面）。
+    pub max_mismatch_ppm: u32,
 }
 
 impl Tolerance {
     /// 逐字节相等。
     pub const EXACT: Self = Self {
         per_channel: 0,
-        max_over_tolerance_pixels: 0,
+        max_mismatch_ppm: 0,
     };
+
+    /// 给定参与比较的像素总数时，允许的不匹配像素数（`floor(pixels × ppm / 1e6)`）。
+    ///
+    /// 向下取整：容差宁可紧一点也不要放过整像素级的回归。
+    #[must_use]
+    pub fn allowed_mismatches(&self, pixels: u32) -> u32 {
+        let allowed = u64::from(pixels) * u64::from(self.max_mismatch_ppm) / 1_000_000;
+        u32::try_from(allowed).unwrap_or(u32::MAX)
+    }
 }
 
 impl Default for Tolerance {
     fn default() -> Self {
-        // P08 §7.7 的提案值；校正属 L3/P7（D19 不预设数值）。
+        // 大整改基线：逐通道 2（覆盖三平台 sRGB 量化差）+ 0.1% 像素（覆盖 AA 边缘与阴影渐变，
+        // 见 `tests/golden/README.md`）。改这里必须同时改 README 的容差表。
         Self {
-            per_channel: 1,
-            max_over_tolerance_pixels: 0,
+            per_channel: 2,
+            max_mismatch_ppm: 1_000,
         }
     }
 }
@@ -318,11 +338,39 @@ pub struct SnapshotDiff {
     /// 全图所有通道差的均值（`0..=255` 标度）。
     pub avg_channel_diff: f32,
     /// 有任一通道差 `> tolerance.per_channel` 的像素数。
-    pub over_tolerance_pixels: u32,
+    pub mismatched_pixels: u32,
     /// 参与比较的像素数（`width * height`）。
     pub compared_pixels: u32,
-    /// 第一个超容差像素的坐标 `(x, y)`。
-    pub first_over_tolerance: Option<(u32, u32)>,
+    /// 第一个不匹配像素的坐标 `(x, y)`（读序：先行后列）。
+    pub first_mismatch: Option<(u32, u32)>,
+    /// 全部不匹配像素的包围盒（`None` = 一个都不匹配）。
+    pub mismatch_bounds: Option<PixelBounds>,
+}
+
+/// 不匹配像素的包围盒（像素坐标，**闭区间**）。
+///
+/// 失败诊断用：`first_mismatch` 只给一个点，包围盒给出「错在多大一片、错在哪儿」，
+/// 一张 240×160 的 golden 里定位到 (12,84)-(71,107) 比定位到一个点快得多。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PixelBounds {
+    /// 最左列。
+    pub min_x: u32,
+    /// 最上行。
+    pub min_y: u32,
+    /// 最右列（含）。
+    pub max_x: u32,
+    /// 最下行（含）。
+    pub max_y: u32,
+}
+
+impl fmt::Display for PixelBounds {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "({},{})-({},{})",
+            self.min_x, self.min_y, self.max_x, self.max_y
+        )
+    }
 }
 
 /// golden 层错误（**不** `derive(Eq)`：`Diff.diff` 含 `f32`）。
@@ -363,12 +411,14 @@ pub enum GoldenError {
         /// 诊断文本。
         detail: SmolStr,
     },
-    /// 超容差（含统计与热力图路径）。
+    /// 不匹配像素数超过容差（含统计与热力图路径）。
     Diff {
         /// golden 文件名主干。
         case: SmolStr,
         /// 统计。
         diff: SnapshotDiff,
+        /// 本次容差允许的不匹配像素数（`0` 表示逐像素严格）。
+        allowed: u32,
         /// golden 路径。
         golden: PathBuf,
         /// 失败热力图路径（`target/golden-diff/`）。
@@ -400,17 +450,32 @@ impl fmt::Display for GoldenError {
             Self::Diff {
                 case,
                 diff,
+                allowed,
                 golden,
                 heatmap,
-            } => write!(
-                f,
-                "golden `{case}` differs: max={} avg={:.3} over={} (golden {}, heatmap {})",
-                diff.max_channel_diff,
-                diff.avg_channel_diff,
-                diff.over_tolerance_pixels,
-                golden.display(),
-                heatmap.display()
-            ),
+            } => {
+                let percent = 100.0 * f64::from(diff.mismatched_pixels)
+                    / f64::from(diff.compared_pixels.max(1));
+                let first = diff.first_mismatch.map_or_else(
+                    || SmolStr::new_static("-"),
+                    |(x, y)| format_smolstr!("{x},{y}"),
+                );
+                let bounds = diff.mismatch_bounds.map_or_else(
+                    || SmolStr::new_static("-"),
+                    |bounds| format_smolstr!("{bounds}"),
+                );
+                write!(
+                    f,
+                    "golden `{case}` differs: {} mismatched of {} pixels ({percent:.3}%, allowed {allowed}), \
+                     max channel diff {}, first mismatch ({first}), mismatch bounds {bounds}, \
+                     golden {}, heatmap {}",
+                    diff.mismatched_pixels,
+                    diff.compared_pixels,
+                    diff.max_channel_diff,
+                    golden.display(),
+                    heatmap.display()
+                )
+            }
         }
     }
 }
@@ -448,8 +513,9 @@ pub fn compare(
 
     let mut max_channel_diff = 0u8;
     let mut sum = 0u64;
-    let mut over_tolerance_pixels = 0u32;
-    let mut first_over_tolerance = None;
+    let mut mismatched_pixels = 0u32;
+    let mut first_mismatch = None;
+    let mut mismatch_bounds: Option<PixelBounds> = None;
     for (index, (actual_pixel, golden_pixel)) in actual
         .rgba8
         .as_chunks::<4>()
@@ -466,21 +532,36 @@ pub fn compare(
         }
         max_channel_diff = max_channel_diff.max(pixel_max);
         if pixel_max > tolerance.per_channel {
-            over_tolerance_pixels += 1;
-            if first_over_tolerance.is_none() {
-                let x = (index % actual.width as usize) as u32;
-                let y = (index / actual.width as usize) as u32;
-                first_over_tolerance = Some((x, y));
+            mismatched_pixels += 1;
+            let x = (index % actual.width as usize) as u32;
+            let y = (index / actual.width as usize) as u32;
+            if first_mismatch.is_none() {
+                first_mismatch = Some((x, y));
             }
+            mismatch_bounds = Some(match mismatch_bounds {
+                None => PixelBounds {
+                    min_x: x,
+                    min_y: y,
+                    max_x: x,
+                    max_y: y,
+                },
+                Some(bounds) => PixelBounds {
+                    min_x: bounds.min_x.min(x),
+                    min_y: bounds.min_y.min(y),
+                    max_x: bounds.max_x.max(x),
+                    max_y: bounds.max_y.max(y),
+                },
+            });
         }
     }
     let channels = (pixels * 4).max(1) as f32;
     Ok(SnapshotDiff {
         max_channel_diff,
         avg_channel_diff: sum as f32 / channels,
-        over_tolerance_pixels,
+        mismatched_pixels,
         compared_pixels: pixels as u32,
-        first_over_tolerance,
+        first_mismatch,
+        mismatch_bounds,
     })
 }
 
@@ -515,7 +596,10 @@ pub fn write_golden(case: SnapshotCase, image: &SnapshotImage) -> Result<(), Gol
     image.save_png(&case.golden_path())
 }
 
-/// 比较一个 case（`UPDATE_GOLDEN` 存在时先写 golden，再读回比较）。
+/// 比较一个 case（`UI_CORE_BLESS` 存在时先重生成 golden，再读回比较）。
+///
+/// `UI_CORE_BLESS` 只写**当前平台**目录（[`device_dir`]）：跨平台覆盖别人的基线是事故，
+/// 不是便利。每个被覆盖的文件都打印一行 `blessed by UI_CORE_BLESS` 作为改动记录占位。
 ///
 /// # Errors
 /// [`GoldenError`]：`Snapshot` / `Frame` / `Io`（缺 golden）/ `Dimensions` / `Diff`。
@@ -524,17 +608,24 @@ pub fn assert_golden(
     tolerance: Tolerance,
 ) -> Result<SnapshotDiff, GoldenError> {
     let actual = capture(case)?;
-    if update_requested() {
+    if bless_requested() {
         write_golden(case, &actual)?;
+        eprintln!(
+            "blessed by UI_CORE_BLESS: {} -> {}",
+            case.golden_name(),
+            case.golden_path().display()
+        );
     }
     let path = case.golden_path();
     let golden = SnapshotImage::load_png(&path)?;
     let diff = compare(&actual, &golden, tolerance)?;
-    if diff.over_tolerance_pixels > tolerance.max_over_tolerance_pixels {
+    let allowed = tolerance.allowed_mismatches(diff.compared_pixels);
+    if diff.mismatched_pixels > allowed {
         let heatmap = write_heatmap(&case.golden_name(), &actual, &golden, tolerance)?;
         return Err(GoldenError::Diff {
             case: case.golden_name(),
             diff,
+            allowed,
             golden: path,
             heatmap,
         });
@@ -548,9 +639,9 @@ pub fn gpu_guard() -> MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
-/// `UPDATE_GOLDEN` 存在即写（不看值）。
-fn update_requested() -> bool {
-    std::env::var_os("UPDATE_GOLDEN").is_some()
+/// `UI_CORE_BLESS` 存在即重生成（不看值）。
+fn bless_requested() -> bool {
+    std::env::var_os("UI_CORE_BLESS").is_some()
 }
 
 /// 小数点后最多两位、去尾零（`1.0 → "1"`、`1.25 → "1.25"`、`2.0 → "2"`）。
@@ -1040,7 +1131,9 @@ fn snapshot_png() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+
+    use smol_str::SmolStr;
 
     use super::{
         GoldenError, SnapshotCase, SnapshotDiff, SnapshotImage, SnapshotScene, SnapshotTheme,
@@ -1109,28 +1202,56 @@ mod tests {
             SnapshotDiff {
                 max_channel_diff: 0,
                 avg_channel_diff: 0.0,
-                over_tolerance_pixels: 0,
+                mismatched_pixels: 0,
                 compared_pixels: 6,
-                first_over_tolerance: None,
+                first_mismatch: None,
+                mismatch_bounds: None,
             }
         );
     }
 
     #[test]
-    fn compare_counts_over_tolerance_pixels() {
+    fn compare_counts_mismatched_pixels() {
         let actual = image(2, 2, [100, 100, 100, 255]);
         let mut golden = actual.clone();
-        // 一个像素差 2（超过 per_channel = 1），另一个差 1（在容差内）。
-        golden.rgba8[0] = 102;
-        golden.rgba8[5] = 101;
+        // 一个像素差 3（超过 per_channel = 2），另一个差 2（在容差内）。
+        golden.rgba8[0] = 103;
+        golden.rgba8[5] = 102;
 
         let diff = compare(&actual, &golden, Tolerance::default()).expect("compare");
-        assert_eq!(diff.over_tolerance_pixels, 1);
-        assert_eq!(diff.max_channel_diff, 2);
-        assert_eq!(diff.first_over_tolerance, Some((0, 0)));
+        assert_eq!(diff.mismatched_pixels, 1);
+        assert_eq!(diff.max_channel_diff, 3);
+        assert_eq!(diff.first_mismatch, Some((0, 0)));
 
         let exact = compare(&actual, &golden, Tolerance::EXACT).expect("compare");
-        assert_eq!(exact.over_tolerance_pixels, 2, "EXACT 容差下两处都算超差");
+        assert_eq!(exact.mismatched_pixels, 2, "EXACT 容差下两处都不匹配");
+    }
+
+    #[test]
+    fn compare_reports_the_mismatch_bounds() {
+        // 3×2 图：只有 (0,0)、(2,0)、(1,1) 三个像素超差 ⇒ 包围盒 (0,0)-(2,1)。
+        let actual = image(3, 2, [0, 0, 0, 255]);
+        let mut golden = actual.clone();
+        golden.rgba8[0] = 9;
+        golden.rgba8[8] = 9;
+        golden.rgba8[17] = 9;
+
+        let diff = compare(&actual, &golden, Tolerance::default()).expect("compare");
+        assert_eq!(diff.mismatched_pixels, 3);
+        assert_eq!(diff.first_mismatch, Some((0, 0)));
+        assert_eq!(
+            diff.mismatch_bounds,
+            Some(super::PixelBounds {
+                min_x: 0,
+                min_y: 0,
+                max_x: 2,
+                max_y: 1,
+            })
+        );
+        assert_eq!(
+            diff.mismatch_bounds.map(|bounds| bounds.to_string()),
+            Some("(0,0)-(2,1)".to_string())
+        );
     }
 
     #[test]
@@ -1153,7 +1274,7 @@ mod tests {
         golden.rgba8[8] = 200; // 第 3 个像素的第一个通道
 
         let diff = compare(&actual, &golden, Tolerance::default()).expect("compare");
-        assert_eq!(diff.first_over_tolerance, Some((2, 0)));
+        assert_eq!(diff.first_mismatch, Some((2, 0)));
     }
 
     #[test]
@@ -1188,11 +1309,56 @@ mod tests {
     }
 
     #[test]
+    fn diff_error_reports_count_max_first_and_bounds() {
+        // 失败信息是诊断面的一部分：四项（不匹配像素数 / 最大通道差 / 首个坐标 / 包围盒）
+        // 缺一项就得让人去翻热力图。
+        let error = GoldenError::Diff {
+            case: SmolStr::new_static("shapes_1_light"),
+            diff: SnapshotDiff {
+                max_channel_diff: 9,
+                avg_channel_diff: 0.5,
+                mismatched_pixels: 3,
+                compared_pixels: 4,
+                first_mismatch: Some((1, 0)),
+                mismatch_bounds: Some(super::PixelBounds {
+                    min_x: 1,
+                    min_y: 0,
+                    max_x: 1,
+                    max_y: 1,
+                }),
+            },
+            allowed: 0,
+            golden: PathBuf::from("golden.png"),
+            heatmap: PathBuf::from("heatmap.png"),
+        };
+        let text = error.to_string();
+        assert!(text.contains("3 mismatched of 4 pixels"), "{text}");
+        assert!(text.contains("allowed 0"), "{text}");
+        assert!(text.contains("max channel diff 9"), "{text}");
+        assert!(text.contains("first mismatch (1,0)"), "{text}");
+        assert!(text.contains("mismatch bounds (1,0)-(1,1)"), "{text}");
+        assert!(text.contains("golden.png"), "{text}");
+        assert!(text.contains("heatmap.png"), "{text}");
+    }
+
+    #[test]
     fn tolerance_default_is_the_recorded_value() {
-        // D19：数值不冻结，但默认值必须与 design/phase-13 §9.5 的记录一致（改这里也要改文档）。
+        // D19：数值可校准，但默认值必须与 `tests/golden/README.md` 的容差表一致
+        // （改这里也要改文档）。
         let tolerance = Tolerance::default();
-        assert_eq!(tolerance.per_channel, 1);
-        assert_eq!(tolerance.max_over_tolerance_pixels, 0);
+        assert_eq!(tolerance.per_channel, 2);
+        assert_eq!(tolerance.max_mismatch_ppm, 1_000, "0.1%");
+    }
+
+    #[test]
+    fn tolerance_allows_a_ratio_of_mismatched_pixels() {
+        let tolerance = Tolerance::default();
+        // 240×160 = 38400 像素 ⇒ 0.1% = 38.4 ⇒ 向下取整 38。
+        assert_eq!(tolerance.allowed_mismatches(38_400), 38);
+        assert_eq!(tolerance.allowed_mismatches(1_000), 1);
+        // 小图（2×2）在 0.1% 下**不允许**任何像素不匹配：比例容差不是小图的免死金牌。
+        assert_eq!(tolerance.allowed_mismatches(4), 0);
+        assert_eq!(Tolerance::EXACT.allowed_mismatches(38_400), 0);
     }
 
     #[test]

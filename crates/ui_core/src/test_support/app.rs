@@ -84,10 +84,29 @@ impl TestApp {
 
     /// 推进**一帧**（空闲帧也返回记录：`rendered == false`）。
     ///
+    /// 捕获打开时，本帧的 a11y 交付**立即**挂到记录上（不看 `A11Y_THROTTLE`）：
+    /// 这是断言面最直接的语义（「本帧有没有 a11y 工作」）。
+    ///
     /// # Errors
     /// `EngineError::InvalidMeasure` / `TextShape` / `AtlasExhausted`：本帧已中止（未提交），
     /// damage/dirty 保留，下一次 `drain` 重试。
     pub fn drain(&mut self) -> Result<&FrameRecord, EngineError> {
+        self.step(A11yGate::Immediate)
+    }
+
+    /// 推进一帧，a11y 交付走**平台泵**的闸门：脏位在 `A11Y_THROTTLE`（100 ms）内不交付。
+    ///
+    /// 帧脚本（[`super::script`]）用它断言「第 k 帧的 a11y 交付被节流」——节流是平台泵的行为，
+    /// [`Self::drain`] 的立即交付抓不到它。
+    ///
+    /// # Errors
+    /// 同 [`Self::drain`]。
+    pub fn drain_pump(&mut self) -> Result<&FrameRecord, EngineError> {
+        self.step(A11yGate::Pump)
+    }
+
+    /// 两条 drain 路径的共同实现（a11y 交付闸门是唯一差异）。
+    fn step(&mut self, gate: A11yGate) -> Result<&FrameRecord, EngineError> {
         let outcome = self
             .app
             .frame(self.window)
@@ -95,9 +114,12 @@ impl TestApp {
         outcome?;
         // P11：a11y 交付在**帧之后**（与平台泵的 `update_a11y` 同序）。纯 `A11Y` 变化不提交帧，
         // 所以这一步与 `FrameOutcome` 无关（`FrameRecord.a11y` 在空闲帧也存在）。
-        if self.a11y_capture
-            && let Some(snapshot) = self.app.a11y_take(self.window)
-        {
+        let deliver = self.a11y_capture
+            && match gate {
+                A11yGate::Immediate => true,
+                A11yGate::Pump => self.app.a11y_pending(self.window),
+            };
+        if deliver && let Some(snapshot) = self.app.a11y_take(self.window) {
             self.app.attach_a11y(self.window, snapshot);
         }
         if let Some(frame) = self.frame_record().frame.clone() {
@@ -285,6 +307,15 @@ fn gpu_error(error: EngineError) -> SnapshotError {
     SnapshotError::Gpu {
         detail: smol_str::SmolStr::new(error.to_string()),
     }
+}
+
+/// 一帧的 a11y 交付闸门（平台泵与测试捕获是两条消费路径）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum A11yGate {
+    /// 捕获打开即交付（`TestApp::drain` 的既有语义）。
+    Immediate,
+    /// 与平台泵一致：`App::a11y_pending` 为假（含 `A11Y_THROTTLE` 未到期）就不交付。
+    Pump,
 }
 
 /// 多窗口驱动：借用 `App` + 一个 `WindowId`。

@@ -5,6 +5,10 @@
 //! 不应为 bench 扩公开面），因此由 `frame_*` 组顺带测量——见
 //! `design/phase-13-resources-snapshot.md` §10.2。
 //!
+//! 规模档位（大整改的基线面）：`tree_build_{1k,10k}`、`frame_incremental_{1k,10k}`、
+//! `frame_full_10k`、`text_update_320`（40 行 × 8 列，每帧全部变化）。
+//! 基准只读引擎的公开 API，**不**为好看改生产代码；数值不进 CI 判定（D19）。
+//!
 //! 可复现性：headless（`renderer = None`）⇒ 不受窗口前台化 / 组合器影响；输入全字面量；
 //! 每组在 setup 里建 `current_thread` runtime + `App`（**不计时**，`iter_batched` 的 setup 段）。
 //! 采样：50 samples / 1 s warmup / 3 s 测量——`frame_*` 单次 ~1 ms、setup ~2 ms，50 是
@@ -13,7 +17,7 @@
 use std::{hint::black_box, time::Duration};
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use smol_str::SmolStr;
+use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
     math::{Rect, Scale, Size},
@@ -28,6 +32,10 @@ use ui_core::{
 
 /// 逻辑视口（固定，避免窗口尺寸影响布局成本）。
 const VIEWPORT: Size = Size::new(800.0, 600.0);
+
+/// 文本网格：40 行 × 8 列 = 320 个文本节点（`text_update_320`）。
+const TEXT_GRID_ROWS: usize = 40;
+const TEXT_GRID_COLUMNS: usize = 8;
 
 /// 一次基准的夹具：runtime 由调用方持有（`App` 只持 `Handle`）。
 struct Fixture {
@@ -81,6 +89,31 @@ fn mount_text(fixture: &mut Fixture, count: usize) -> Signal<SmolStr> {
             .bind_text(move |cx| cx.read(&source))
             .build(app.window_mut(*window).expect("window").tree_mut(), root)
             .expect("bench text");
+    }
+    text
+}
+
+/// 40 行 × 8 列的文本网格：每个单元格的文本都读同一个信号，写一次信号 ⇒ 320 个节点全部重排重塑形。
+fn mount_text_grid(fixture: &mut Fixture) -> Signal<SmolStr> {
+    let text = fixture.app.signal(SmolStr::new_static("frame a"));
+    let Fixture { app, window } = fixture;
+    let root = app.window(*window).expect("window").tree().root();
+    for row in 0..TEXT_GRID_ROWS {
+        for column in 0..TEXT_GRID_COLUMNS {
+            let source = text;
+            let cell = format_smolstr!("{row},{column}");
+            let initial = format_smolstr!("{cell} frame a");
+            let _ = NodeBuilder::text(initial, TextStyle::new(11.0))
+                .layout_override(Rect::new(
+                    column as f32 * 96.0,
+                    row as f32 * 14.0,
+                    92.0,
+                    13.0,
+                ))
+                .bind_text(move |cx| format_smolstr!("{cell} {}", cx.read(&source)))
+                .build(app.window_mut(*window).expect("window").tree_mut(), root)
+                .expect("bench text cell");
+        }
     }
     text
 }
@@ -329,6 +362,124 @@ fn bench_signal_write(c: &mut Criterion) {
     });
 }
 
+/// 建树规模：1k / 10k 个绝对定位 box（不含布局成本，纯节点 + 树结构）。
+fn bench_tree_build_scale(c: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("bench runtime");
+    let handle = runtime.handle().clone();
+    for (name, count) in [
+        ("tree_build_1k", 1_000usize),
+        ("tree_build_10k", 10_000usize),
+    ] {
+        c.bench_function(name, |b| {
+            b.iter_batched(
+                || new_app(&handle),
+                |mut fixture| {
+                    let nodes = mount_boxes(&mut fixture, count);
+                    black_box(nodes.len())
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+}
+
+/// 增量帧规模：`count` 个静态 box（lane 可整桶复用）+ 1 个绑信号的节点（本帧唯一被标脏的）。
+fn bench_frame_incremental_scale(c: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("bench runtime");
+    let handle = runtime.handle().clone();
+    for (name, count) in [
+        ("frame_incremental_1k", 1_000usize),
+        ("frame_incremental_10k", 10_000usize),
+    ] {
+        let mut toggle = 0usize;
+        c.bench_function(name, |b| {
+            b.iter_batched(
+                || {
+                    let mut fixture = new_app(&handle);
+                    let _ = mount_boxes(&mut fixture, count);
+                    let signal = mount_fanout(&mut fixture, 1);
+                    let _ = fixture.app.frame(fixture.window);
+                    (fixture, signal)
+                },
+                |(mut fixture, signal)| {
+                    // 改一个节点：测 lane 复用 + damage 合并的增量帧。
+                    toggle += 1;
+                    fixture.app.write(&signal, (toggle % 2) as u8);
+                    black_box(fixture.app.frame(fixture.window))
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+}
+
+/// 全帧 10k：交替窗口尺寸强制全帧 damage（整帧重建 + 编码 + 合并）。
+fn bench_frame_full_10k(c: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("bench runtime");
+    let handle = runtime.handle().clone();
+    let sizes = [VIEWPORT, Size::new(801.0, 601.0)];
+    let mut toggle = 0usize;
+    c.bench_function("frame_full_10k", |b| {
+        b.iter_batched(
+            || {
+                let mut fixture = new_app(&handle);
+                let _ = mount_boxes(&mut fixture, 10_000);
+                let _ = fixture.app.frame(fixture.window);
+                fixture
+            },
+            |mut fixture| {
+                toggle += 1;
+                if let Some(window) = fixture.app.window_mut(fixture.window) {
+                    window.set_size(sizes[toggle % 2]);
+                }
+                black_box(fixture.app.frame(fixture.window))
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+/// 文本全量更新：320 个文本节点每帧全部变化（塑形 + 文本重排 + 绘制）。
+fn bench_text_update_320(c: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("bench runtime");
+    let handle = runtime.handle().clone();
+    let values = [
+        SmolStr::new_static("frame a"),
+        SmolStr::new_static("frame b"),
+    ];
+    let mut toggle = 0usize;
+    c.bench_function("text_update_320", |b| {
+        b.iter_batched(
+            || {
+                let mut fixture = new_app(&handle);
+                let signal = mount_text_grid(&mut fixture);
+                // 预热：首帧把 320 个节点全部塑形（本帧不计时）。
+                let _ = fixture.app.frame(fixture.window);
+                (fixture, signal)
+            },
+            |(mut fixture, signal)| {
+                toggle += 1;
+                // `SmolStr` 是内联短串（≤22 字节）⇒ clone 是一次 memcpy，不产生堆分配。
+                fixture.app.write(&signal, values[toggle % 2].clone());
+                black_box(fixture.app.frame(fixture.window))
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default()
@@ -343,6 +494,10 @@ criterion_group! {
         bench_layout,
         bench_frame_full,
         bench_frame_incremental,
-        bench_signal_write
+        bench_signal_write,
+        bench_tree_build_scale,
+        bench_frame_incremental_scale,
+        bench_frame_full_10k,
+        bench_text_update_320
 }
 criterion_main!(benches);

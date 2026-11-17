@@ -1,0 +1,290 @@
+//! 样式求值 pass、脏标记失效、动作 handler 表与键盘绑定表。
+//!
+//! `app.rs` 的 `impl App` 只保留同名薄委托，方法体在这里（零行为变更的纯拆分）。
+
+use smallvec::{SmallVec, smallvec};
+
+use super::{App, StylePassReport};
+use crate::{
+    event::{Action, Key, KeyBinding, Modifiers},
+    interaction::ActionCtx,
+    node::{
+        dependency::{Owner, ReadCtx, ReadTracker},
+        dirty::DirtyFlags,
+        signal::SignalId,
+    },
+    paint::style::StylePatch,
+    text::{TextContent, TextStyle},
+    window::WindowId,
+};
+
+// ── P10：动作（Action）与键盘绑定 ──────────────────────────────────────────
+
+/// 注册/替换一个动作的处理器（同 `Action` 后写覆盖）。
+/// 消费者：`App::on_action`。
+pub(crate) fn on_action(
+    app: &mut App,
+    action: Action,
+    handler: impl FnMut(&mut ActionCtx<'_>) + 'static,
+) {
+    app.handlers.insert(action, Box::new(handler));
+}
+
+/// 删除处理器（返回是否真的删了）。
+/// 消费者：`App::off_action`。
+pub(crate) fn off_action(app: &mut App, action: &Action) -> bool {
+    app.handlers.remove(action).is_some()
+}
+
+/// 添加/替换一条键盘绑定（同 `(key, modifiers)` 后写覆盖）。
+/// 消费者：`App::bind_key`。
+pub(crate) fn bind_key(app: &mut App, binding: KeyBinding) {
+    app.bindings.retain(|existing| {
+        !(existing.key == binding.key && existing.modifiers == binding.modifiers)
+    });
+    app.bindings.push(binding);
+}
+
+/// 删除一条键盘绑定（返回是否真的删了）。
+/// 消费者：`App::unbind_key`。
+pub(crate) fn unbind_key(app: &mut App, key: Key, modifiers: Modifiers) -> bool {
+    let before = app.bindings.len();
+    app.bindings
+        .retain(|binding| !(binding.key == key && binding.modifiers == modifiers));
+    app.bindings.len() != before
+}
+
+// ── 帧内：样式求值 pass ────────────────────────────────────────────────────
+
+/// P03 的「样式求值 pass」：对指定窗口中**带 `PAINT` 且有 `bind_style`** 的节点求值。
+///
+/// 它做四件事：求值闭包、差分替换依赖、写回 patch、按需升级 `LAYOUT` / 标 `A11Y`。
+/// **不产生任何 Scene 图元**（那是 P06 的 paint 阶段；两者共用本实现的前半段）。
+///
+/// 返回 `None` = 窗口不存在（P03 的冻结错误表里没有「未知窗口」变体，`Option` 是唯一诚实的表达）。
+/// P11 追加：`bind_a11y` 与另两条动态通道同批求值（同一 `ReadCtx` / `ReadTracker` / 依赖边集）。
+/// 消费者：`App::refresh_styles`。
+pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePassReport> {
+    let App {
+        store,
+        graph,
+        windows,
+        eval_stack,
+        wake_requested,
+        ..
+    } = app;
+    // P11：本 pass 会求值全部 `bind_a11y`，旗标在这里消费。
+    if let Some(target) = windows.get_mut(&window) {
+        target.a11y_clear_bind_work();
+    }
+    let window_state = windows.get_mut(&window)?;
+    let tree = window_state.tree_mut();
+    debug_assert!(eval_stack.is_empty(), "上一帧的派生求值栈泄漏");
+    eval_stack.clear();
+
+    let mut evaluated = 0usize;
+    let mut text_evaluated = 0usize;
+    let mut text_changed = 0usize;
+    let mut index = 0usize;
+    while index < tree.order().len() {
+        let node = tree.order()[index];
+        index += 1;
+
+        let needs_eval = tree.get(node).is_ok_and(|n| {
+            n.dirty().contains(DirtyFlags::PAINT)
+                // 只有 `bind_a11y` 的节点没有 PAINT（写信号只标 A11Y），但补丁仍要重算。
+                || (n.dirty().contains(DirtyFlags::A11Y) && tree.has_a11y_bind(node))
+        });
+        if !needs_eval {
+            continue;
+        }
+        let old_patch = tree
+            .get(node)
+            .map_or_else(|_| StylePatch::default(), |n| n.style_patch().clone());
+        let compute = tree.take_bind_style(node);
+        let bind_text = tree.take_bind_text(node);
+        let bind_a11y = tree.take_bind_a11y(node);
+        if compute.is_none() && bind_text.is_none() && bind_a11y.is_none() {
+            // 闭包不见了 ⇒ 上次求值 **panic** 后没放回（`build` 之后必然有闭包）。
+            // 那次 pass 在 `replace_deps` 之前就中断了，所以节点仍带着**上一次成功的** deps：
+            // 它们是「幽灵边」—— 节点已不会再求值，但写这些信号仍会把它标脏。
+            // 这里显式退订，把状态收敛成「静态节点」。
+            let ghost_deps = tree.deps(node).unwrap_or(&[]);
+            graph.replace_deps(Owner::Node { window, node }, ghost_deps, &[]);
+            tree.set_deps(node, SmallVec::new());
+            tree.clear_paint(node);
+            continue;
+        }
+
+        let (values, derived) = store.split();
+        let mut tracker = ReadTracker::new();
+        // 作用域块结束即释放 `ReadCtx` 的借用（`ReadCtx` 不是 `Drop` 类型，不能用 `drop`）。
+        let (patch, text_value, a11y_value, owner) = {
+            let mut ctx = ReadCtx::new(
+                values,
+                derived,
+                graph,
+                &mut tracker,
+                &mut *eval_stack,
+                Owner::Node { window, node },
+            );
+            let patch = compute
+                .as_ref()
+                .map_or_else(StylePatch::default, |compute| compute(&mut ctx));
+            let text_value = bind_text.as_ref().map(|bind| bind(&mut ctx));
+            let a11y_value = bind_a11y
+                .as_ref()
+                .map_or_else(crate::a11y::A11yPatch::default, |bind| bind(&mut ctx));
+            (patch, text_value, a11y_value, ctx.owner())
+        };
+        if compute.is_some() {
+            evaluated += 1;
+        }
+        if text_value.is_some() {
+            text_evaluated += 1;
+        }
+
+        let old_deps = tree.deps(node).unwrap_or(&[]);
+        graph.replace_deps(owner, old_deps, tracker.as_slice());
+        tree.set_deps(node, tracker.into_inner());
+
+        if let Some(compute) = compute {
+            let layout_changed = patch.affects_layout || old_patch.affects_layout;
+            let a11y_changed =
+                patch.interactive != old_patch.interactive || patch.visible != old_patch.visible;
+            tree.set_style_patch(node, patch);
+            tree.put_bind_style(node, compute);
+            if layout_changed {
+                tree.mark_layout(node);
+            }
+            if a11y_changed {
+                tree.mark_a11y(node);
+            }
+        }
+        let mut text_changed_here = false;
+        if let Some(bind) = bind_text {
+            tree.put_bind_text(node, bind);
+        }
+        if let Some(value) = text_value {
+            let style = tree
+                .text_content(node)
+                .map_or_else(TextStyle::default, |content| content.style.clone());
+            let changed = tree
+                .text_content(node)
+                .is_none_or(|content| content.text != value);
+            if changed {
+                // 只换 text/style，**保留** inline_boxes（N1 回归）。
+                let mut content = tree
+                    .text_content(node)
+                    .cloned()
+                    .unwrap_or_else(|| TextContent::new(value.clone(), style.clone()));
+                content.text = value;
+                content.style = style;
+                tree.set_text_content(node, content);
+                text_changed += 1;
+                text_changed_here = true;
+            }
+        }
+        // P11：`bind_a11y` 的差分与写回（与 `bind_style` 同一个依赖集，见方法文档）。
+        if let Some(bind) = bind_a11y {
+            let previous = tree
+                .a11y_of(node)
+                .map_or_else(crate::a11y::A11yPatch::default, |slot| slot.patch.clone());
+            if a11y_value != previous {
+                tree.set_a11y_patch(node, a11y_value);
+                // 只标 `A11Y`：不产生视觉 damage、不清 `REUSABLE`（P03 §9.3 表第 9 行）。
+                tree.mark_a11y(node);
+            }
+            tree.put_bind_a11y(node, bind);
+        }
+        tree.clear_paint(node);
+        if text_changed_here {
+            // 文本变了 ⇒ 必须重画（PAINT 不能被本 pass 的「消费」吞掉）。
+            tree.mark_paint(node);
+            // 文本节点的可访问名/值就是文本内容：内容变了 a11y 必须重发。只标 PAINT 时，
+            // 新字符串与旧串度量相同（例如 "70%" → "80%"）不会触发 LAYOUT，AT 会读到旧值。
+            tree.mark_a11y(node);
+        }
+    }
+
+    Some(StylePassReport {
+        evaluated,
+        layout_dirty: tree.any_node(|n| n.dirty().contains(DirtyFlags::LAYOUT)),
+        paint_dirty: tree.any_node(|n| !n.dirty().contains(DirtyFlags::REUSABLE)),
+        wake_requested: *wake_requested,
+        text_evaluated,
+        text_changed,
+    })
+}
+
+/// 沿依赖图失效：节点标脏（或经派生级联），有节点变脏则置唤醒位。
+/// 消费者：`App::invalidate`。
+pub(crate) fn invalidate(app: &mut App, signal: SignalId) {
+    let App {
+        store,
+        graph,
+        windows,
+        wake_requested,
+        dispatcher,
+        ..
+    } = app;
+    let mut worklist: SmallVec<[SignalId; 8]> = smallvec![signal];
+    let mut marked = 0usize;
+
+    while let Some(current) = worklist.pop() {
+        let Some(owners) = graph.dependents_mut(current) else {
+            continue;
+        };
+        owners.retain(|owner| match owner {
+            Owner::Node { window, node } => windows
+                .get(window)
+                .is_some_and(|w| w.tree().get(*node).is_ok()),
+            Owner::Derived(_) => true,
+        });
+        let empty = owners.is_empty();
+        let snapshot: SmallVec<[Owner; 8]> = owners.iter().copied().collect();
+        if empty {
+            graph.remove_signal(current);
+            continue;
+        }
+
+        for owner in snapshot {
+            match owner {
+                Owner::Node { window, node } => {
+                    let Some(target) = windows.get_mut(&window) else {
+                        continue;
+                    };
+                    // P11：只有 `bind_a11y` 的节点（没有视觉绑定）被写信号时，**不得**产像素：
+                    // 标 `A11Y` 并让下一帧仍跑 `refresh_styles`（帧末门禁会退回 `Idle`）。
+                    let a11y_only =
+                        target.tree().has_a11y_bind(node) && !target.tree().has_visual_bind(node);
+                    let affects_layout = target
+                        .tree()
+                        .get(node)
+                        .is_ok_and(|n| n.style_patch().affects_layout);
+                    let alive = if a11y_only {
+                        target.a11y_note_bind_work();
+                        target.tree_mut().mark_a11y(node)
+                    } else if affects_layout {
+                        target.tree_mut().mark_layout(node)
+                    } else {
+                        target.tree_mut().mark_paint(node)
+                    };
+                    if alive {
+                        marked += 1;
+                    }
+                }
+                Owner::Derived(derived) => {
+                    if store.mark_derived_dirty(derived) {
+                        worklist.push(store.derived_handle(derived));
+                    }
+                }
+            }
+        }
+    }
+
+    if marked > 0 {
+        *wake_requested = true;
+        dispatcher.wake();
+    }
+}

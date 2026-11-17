@@ -6,19 +6,29 @@
 //! 写路径是 push 模型（§7.5）：一次 `write` 沿依赖图把 owner 标脏，**不**遍历整棵树；
 //! 帧内唯一的重活是 `refresh_styles`（样式求值 pass，P06 的 paint 阶段复用同一实现）。
 
+mod a11y;
+mod animation;
+#[cfg(feature = "hud")]
+mod debug;
+mod focus;
+mod frame;
+mod input;
+mod overlay;
+mod resources;
+mod scroll;
+mod signal_api;
+mod style_pass;
+mod text_pass;
+mod virtual_list;
+mod window_set;
+
 use std::{
-    any::Any,
-    rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use smallvec::{SmallVec, smallvec};
-
 #[cfg(feature = "hud")]
-use crate::debug_hud::{self, DebugHudState};
-#[cfg(feature = "test-support")]
-use crate::test_support::record::{FrameStats, LaneOutcome};
+use crate::debug_hud::DebugHudState;
 use crate::{
     error::EngineError,
     event::{
@@ -26,31 +36,28 @@ use crate::{
         KeyBinding, KeyState, Modifiers, PointerButton,
     },
     interaction::{
-        self, ActionCtx, AnimatedValue, AnimationId, AnimationSpec, DragInfo, DragPhase,
-        DragSession, DragState, Easing, InputThresholds, Overlay, OverlayDismiss, OverlayOptions,
-        OverlayPlacement, OverlaySlot, PressRecord, ScrollAxis, ScrollConfig, ScrollHandle,
-        ScrollSlot, ScrollState, VirtualList, VirtualListConfig, VirtualListState, VirtualSlot,
-        animation as anim, drag as drag_util, focus, overlay as overlay_util, scroll, virtual_list,
+        ActionCtx, AnimatedValue, AnimationId, AnimationSpec, DragInfo, DragState, Easing,
+        InputThresholds, Overlay, OverlayDismiss, OverlayOptions, OverlayPlacement, ScrollConfig,
+        ScrollHandle, ScrollState, VirtualList, VirtualListConfig, VirtualListState,
     },
     layout::hit_test::HitResult,
     math::{Point, Rect, Size},
     node::{
         builder::NodeBuilder,
-        dependency::{DependencyGraph, EvalStack, Owner, ReadCtx, ReadTracker},
-        dirty::DirtyFlags,
+        dependency::{DependencyGraph, EvalStack, ReadCtx},
         id::NodeId,
         signal::{Derived, Signal, SignalId, StateStore, Transient},
     },
     paint::{
         color::Color,
-        style::{Clip, Cursor, StylePatch},
+        style::{Clip, Cursor},
     },
     platform::dispatcher::{Dispatcher, UserTask},
     render::{AtlasAllocator, MIN_ATLAS_PAGE},
     resources::ResourceCache,
     text::{
-        FontStack, FontStackStatus, TextContent, TextDiagnostic, TextLayoutReport, TextPassReport,
-        TextStyle, atlas::GlyphAtlas, context::TextContext, raster::GlyphRasterizer,
+        FontStack, FontStackStatus, TextDiagnostic, TextLayoutReport, TextPassReport,
+        atlas::GlyphAtlas, context::TextContext, raster::GlyphRasterizer,
     },
     window::{FrameOutcome, FrameTicket, Window, WindowId, WindowOptions},
 };
@@ -408,35 +415,29 @@ impl App {
     /// 形态是 `&mut App`（可以建信号 / 改树 / 关窗），因此钩子内部**不能**再调用
     /// `Application::run`。重复注册会替换上一个钩子。
     pub fn on_frame(&mut self, hook: impl FnMut(&mut App) + 'static) {
-        self.frame_hook = Some(Box::new(hook));
+        resources::on_frame(self, hook)
     }
 
     /// 调用一次帧钩子（crate 私有；临时 take 以避免 `&mut self` 与闭包参数重叠）。
     pub(crate) fn run_frame_hook(&mut self) {
-        if let Some(mut hook) = self.frame_hook.take() {
-            hook(self);
-            self.frame_hook = Some(hook);
-        }
+        resources::run_frame_hook(self)
     }
 
     /// 跨线程句柄（`AppHandle`）。
     #[must_use]
     pub fn handle(&self) -> AppHandle {
-        AppHandle {
-            dispatcher: self.dispatcher.clone(),
-            runtime: self.runtime.clone(),
-        }
+        resources::handle(self)
     }
 
     /// 平台层共享的唤醒队列（crate 私有）。
     pub(crate) fn dispatcher(&self) -> Arc<Dispatcher> {
-        self.dispatcher.clone()
+        resources::dispatcher(self)
     }
 
     /// 取走本帧的平台事件（`Application::run` 每帧填充；顺序即产生顺序）。
     #[must_use]
     pub fn drain_events(&mut self) -> Vec<(WindowId, Event)> {
-        std::mem::take(&mut self.events)
+        resources::drain_events(self)
     }
 
     /// 平台层投递一个事件（`crate::platform::native` 唯一写入点）。
@@ -444,15 +445,7 @@ impl App {
     /// `Event::Input` 除了进观测缓冲，还会**立刻**走一次交互分发（P10 §5.3）；观测缓冲只用于
     /// `drain_events`（应用读事件），不承担分发。
     pub(crate) fn dispatch(&mut self, window: WindowId, event: Event) {
-        match &event {
-            Event::Input(input) => {
-                self.sync_clock();
-                self.dispatch_input(window, input.clone());
-            }
-            Event::FocusChanged { focused: false } => self.on_window_focus_lost(window),
-            _ => {}
-        }
-        self.events.push((window, event));
+        resources::dispatch(self, window, event)
     }
 
     /// 写剪贴板文本（Win32 `CF_UNICODETEXT` / macOS `NSPasteboard` / Wayland `wl_data_source`）。
@@ -460,7 +453,7 @@ impl App {
     /// # Errors
     /// `EngineError::Clipboard`：平台拒绝（剪贴板被占用、分配失败、无 owner 窗口）。
     pub fn set_clipboard_text(&self, text: &str) -> Result<(), EngineError> {
-        crate::platform::native::clipboard::set_text(text)
+        resources::set_clipboard_text(self, text)
     }
 
     /// 读剪贴板文本（无文本内容时是空串）。
@@ -469,7 +462,7 @@ impl App {
     /// `EngineError::Clipboard`：平台拒绝；Wayland 下「尚未收到过选区内容」也走这里
     /// （剪贴板是异步拉模型，`design/phase-12-macos-linux.md` F-130）。
     pub fn clipboard_text(&self) -> Result<smol_str::SmolStr, EngineError> {
-        crate::platform::native::clipboard::get_text()
+        resources::clipboard_text(self)
     }
 
     /// 把两张图集页分发给所有窗口的渲染器（P13 §8.2；评审阻塞 ②）。
@@ -485,242 +478,57 @@ impl App {
     ///
     /// 调用点：`App::frame`（每帧，paint 之前）。`TestApp::snapshot` 走自己的临时渲染器。
     pub(crate) fn upload_atlas_pages(&mut self) {
-        self.upload_glyph_page();
-        self.upload_image_page();
+        text_pass::upload_atlas_pages(self)
     }
 
     /// 字形页分发：页级变化（尺寸 / 清空）走整页，其余按脏行增量。
     fn upload_glyph_page(&mut self) {
-        use crate::paint::atlas::AtlasKind;
-
-        let page = self.atlas.page();
-        debug_assert_eq!(page.0, page.1, "glyph atlas page must stay square");
-        let extent = page.0;
-        let len = extent as usize * extent as usize;
-
-        // 图集被清空过（DPI 换代 / 容量逃逸重排）：旧代际的 tile 全部失效，CPU 页与每个
-        // 窗口的纹理都要整页重建（padding 里可能残留旧字形的覆盖度）。
-        let cleared = self.glyph_atlas.take_cleared();
-        if cleared {
-            self.pending_dirty.clear();
-            self.glyph_page_extent = None;
-            for window in self.windows.values_mut() {
-                window.clear_atlas_rows(AtlasKind::Glyph);
-                window.mark_atlas_page_stale(AtlasKind::Glyph);
-            }
-        }
-        // 页尺寸变化：整页缓冲按新尺寸重建并**清零**。旧页的行宽不同，直接沿用会把旧字节
-        // 解释成错位内容，1 纹素 padding 的线性采样会把它读进 tile 边缘。
-        let page_changed = self.glyph_page_extent != Some(extent);
-        if page_changed {
-            self.pending_dirty.clear();
-            self.glyph_page.clear();
-            self.glyph_page.resize(len, 0);
-            self.glyph_page_extent = Some(extent);
-        }
-        // 横跨页变化的行不再有意义（整页会覆盖全部内容），但整页必须由当前记录重建。
-        let refresh = cleared || page_changed;
-
-        let dirty = std::mem::take(&mut self.pending_dirty);
-        let has_rows = !dirty.spans().is_empty();
-        let any_missing = self.windows.values().any(|window| {
-            window.has_renderer() && !window.atlas_page_matches(AtlasKind::Glyph, extent)
-        });
-        // 只有「缺页且空闲」的窗口会在本帧拿整页；忙的缺页窗口等它空闲那一帧再重建整页
-        // （否则一个长期忙的窗口会让 `write_page` 每帧重写整页）。
-        let any_stale_idle = self.windows.values().any(|window| {
-            window.has_renderer()
-                && !window.atlas_page_matches(AtlasKind::Glyph, extent)
-                && window.atlas_idle(AtlasKind::Glyph)
-        });
-        let any_queued = self
-            .windows
-            .values()
-            .any(|window| window.has_renderer() && !window.atlas_rows(AtlasKind::Glyph).is_empty());
-        if !has_rows && !any_missing && !any_queued {
-            return;
-        }
-        // 整页重传（新窗口 / 页尺寸变化 / 图集清空）必须按**当前**记录重建整页；
-        // 纯增量帧只写脏行覆盖到的字形（代价随脏行数而不是字形总数增长）。
-        if refresh || any_stale_idle {
-            self.glyph_atlas.write_page(&mut self.glyph_page, extent);
-        } else if has_rows {
-            self.glyph_atlas
-                .write_rows(&mut self.glyph_page, extent, &dirty);
-        }
-        let mut full_rows = crate::render::DirtyRows::default();
-        full_rows.mark(0, u32::MAX);
-
-        for window in self.windows.values_mut() {
-            if !window.has_renderer() {
-                continue;
-            }
-            if !window.atlas_page_matches(AtlasKind::Glyph, extent) {
-                // 整页是唯一正确的来源：页尺寸变了 / 图集清空过 / 新渲染器。
-                if !window.atlas_idle(AtlasKind::Glyph) {
-                    continue;
-                }
-                let uploaded = window.queue_atlas_upload(
-                    AtlasKind::Glyph,
-                    extent,
-                    &self.glyph_page,
-                    full_rows.clone(),
-                );
-                if uploaded {
-                    window.mark_atlas_page_received(AtlasKind::Glyph, extent);
-                    window.clear_atlas_rows(AtlasKind::Glyph);
-                }
-                continue;
-            }
-            if has_rows {
-                window.atlas_rows_mut(AtlasKind::Glyph).merge_from(&dirty);
-            }
-            if window.atlas_rows(AtlasKind::Glyph).is_empty()
-                || !window.atlas_idle(AtlasKind::Glyph)
-            {
-                continue;
-            }
-            // 整页脏（多段折叠）：直接用整页缓冲，省掉「打包再复制」的一整页拷贝。
-            if window.atlas_rows(AtlasKind::Glyph).is_full() {
-                if window.queue_atlas_upload(
-                    AtlasKind::Glyph,
-                    extent,
-                    &self.glyph_page,
-                    full_rows.clone(),
-                ) {
-                    window.clear_atlas_rows(AtlasKind::Glyph);
-                }
-                continue;
-            }
-            let mut packed = std::mem::take(&mut self.packed);
-            crate::render::atlas::pack_rows(
-                &self.glyph_page,
-                extent,
-                1,
-                window.atlas_rows(AtlasKind::Glyph),
-                &mut packed,
-            );
-            let rows = window.atlas_rows(AtlasKind::Glyph).clone();
-            if window.queue_atlas_upload(AtlasKind::Glyph, extent, &packed, rows) {
-                window.clear_atlas_rows(AtlasKind::Glyph);
-            }
-            self.packed = packed;
-        }
+        text_pass::upload_glyph_page(self)
     }
 
     /// 图片页分发：懒分配（没插过图片就没有页）+ 按脏行增量（DEVIATIONS F-211）。
     fn upload_image_page(&mut self) {
-        use crate::paint::atlas::AtlasKind;
-
-        // 先取脏行再借页（`take_dirty_rows` 需要 `&mut`）：没有页时脏行必然是空的。
-        let dirty = self.resources.take_dirty_rows();
-        let Some((page, pixels)) = self.resources.page_pixels() else {
-            return;
-        };
-        debug_assert_eq!(page.0, page.1, "image atlas page must stay square");
-        let extent = page.0;
-        let has_rows = !dirty.spans().is_empty();
-        let any_missing = self.windows.values().any(|window| {
-            window.has_renderer() && !window.atlas_page_matches(AtlasKind::Image, extent)
-        });
-        let any_queued = self
-            .windows
-            .values()
-            .any(|window| window.has_renderer() && !window.atlas_rows(AtlasKind::Image).is_empty());
-        if !has_rows && !any_missing && !any_queued {
-            return;
-        }
-        let mut full_rows = crate::render::DirtyRows::default();
-        full_rows.mark(0, u32::MAX);
-
-        for window in self.windows.values_mut() {
-            if !window.has_renderer() {
-                continue;
-            }
-            if !window.atlas_page_matches(AtlasKind::Image, extent) {
-                if !window.atlas_idle(AtlasKind::Image) {
-                    continue;
-                }
-                let uploaded =
-                    window.queue_atlas_upload(AtlasKind::Image, extent, pixels, full_rows.clone());
-                if uploaded {
-                    window.mark_atlas_page_received(AtlasKind::Image, extent);
-                    window.clear_atlas_rows(AtlasKind::Image);
-                }
-                continue;
-            }
-            if has_rows {
-                window.atlas_rows_mut(AtlasKind::Image).merge_from(&dirty);
-            }
-            if window.atlas_rows(AtlasKind::Image).is_empty()
-                || !window.atlas_idle(AtlasKind::Image)
-            {
-                continue;
-            }
-            // 整页脏（多段折叠）：直接用整页缓冲，省掉「打包再复制」的一整页拷贝。
-            if window.atlas_rows(AtlasKind::Image).is_full() {
-                if window.queue_atlas_upload(AtlasKind::Image, extent, pixels, full_rows.clone()) {
-                    window.clear_atlas_rows(AtlasKind::Image);
-                }
-                continue;
-            }
-            let mut packed = std::mem::take(&mut self.packed);
-            crate::render::atlas::pack_rows(
-                pixels,
-                extent,
-                4,
-                window.atlas_rows(AtlasKind::Image),
-                &mut packed,
-            );
-            let rows = window.atlas_rows(AtlasKind::Image).clone();
-            if window.queue_atlas_upload(AtlasKind::Image, extent, &packed, rows) {
-                window.clear_atlas_rows(AtlasKind::Image);
-            }
-            self.packed = packed;
-        }
+        text_pass::upload_image_page(self)
     }
 
     /// 字形页的整页像素（`R8`；快照路径用；只在 `test-support` 构建里存在）。
     #[cfg(feature = "test-support")]
     pub(crate) fn glyph_page_pixels(&self) -> ((u32, u32), Vec<u8>) {
-        let page = self.atlas.page();
-        let mut pixels = vec![0u8; (page.0 as usize) * (page.1 as usize)];
-        self.glyph_atlas.write_page(&mut pixels, page.0);
-        (page, pixels)
+        text_pass::glyph_page_pixels(self)
     }
 
     /// 图片页的当前内容（BGRA8 预乘 sRGB；`TestApp::snapshot` 的上传源）；没插过图片时 `None`。
     #[cfg(feature = "test-support")]
     pub(crate) fn resource_page_pixels(&self) -> Option<((u32, u32), &[u8])> {
-        self.resources.page_pixels()
+        text_pass::resource_page_pixels(self)
     }
 
     /// 图片资源缓存（只读）。应用层在**建树时**用 [`App::resources_mut`] 换 `AtlasTile`。
     #[must_use]
     pub fn resources(&self) -> &ResourceCache {
-        &self.resources
+        resources::resources(self)
     }
 
     /// 图片资源缓存（可变）：`insert` / `unload` 的唯一入口。
     pub fn resources_mut(&mut self) -> &mut ResourceCache {
-        &mut self.resources
+        resources::resources_mut(self)
     }
 
     /// 静态几何注册表（只读）。
     #[must_use]
     pub fn geometry(&self) -> &crate::paint::geometry_store::GeometryStore {
-        &self.geometry
+        resources::geometry(self)
     }
 
     /// 静态几何注册表（可变）：`insert` / `release` 的唯一入口。
     pub fn geometry_mut(&mut self) -> &mut crate::paint::geometry_store::GeometryStore {
-        &mut self.geometry
+        resources::geometry_mut(self)
     }
 
     /// 依赖图（只读；`test-support` 的 `diagnostics::dependency_dump` 用）。
     #[cfg(feature = "test-support")]
     pub(crate) fn dependency_graph(&self) -> &DependencyGraph {
-        &self.graph
+        signal_api::dependency_graph(self)
     }
 
     /// 本 App 绑定的 tokio 句柄（**借用**，不 clone）。
@@ -728,21 +536,17 @@ impl App {
     /// 命名：不占用 `handle()` —— P09 会加 `App::handle() -> AppHandle`（那时是纯新增，零破坏）。
     #[must_use]
     pub fn runtime_handle(&self) -> &tokio::runtime::Handle {
-        &self.runtime
+        resources::runtime_handle(self)
     }
-
-    // ── 状态注册 ──────────────────────────────────────────────────────────────
 
     /// 建一个普通信号（id 稠密递增，条目永不删除）。
     pub fn signal<T: Clone + 'static>(&mut self, initial: T) -> Signal<T> {
-        let id = self.store.push_owned(initial);
-        Signal::new(id)
+        signal_api::signal(self, initial)
     }
 
     /// 建一个瞬态值（读不登记、写不失效）。
     pub fn transient<T: Clone + 'static>(&mut self, initial: T) -> Transient<T> {
-        let id = self.store.push_transient(initial);
-        Transient::new(id)
+        signal_api::transient(self, initial)
     }
 
     /// 注册一个派生值（**不**立即求值；环在运行期检测）。
@@ -750,13 +554,8 @@ impl App {
         &mut self,
         compute: impl Fn(&mut ReadCtx<'_>) -> T + 'static,
     ) -> Derived<T> {
-        let boxed: Box<dyn Fn(&mut ReadCtx<'_>) -> Box<dyn Any>> =
-            Box::new(move |cx| Box::new(compute(cx)));
-        let (id, _handle) = self.store.push_derived(boxed);
-        Derived::new(id)
+        signal_api::derived(self, compute)
     }
-
-    // ── 写路径 ────────────────────────────────────────────────────────────────
 
     /// 写一个信号。返回 `true` = 值变了（并已沿依赖图失效）；`false` = 值相等，**短路**。
     ///
@@ -765,25 +564,17 @@ impl App {
     /// **应用层契约**：`T` 必须是不可变值语义。若 `T` 内部可变（`Rc<RefCell<_>>`/`Cell`/`Mutex`）而
     /// `PartialEq` 只比较外层，则内部变化会被短路吞掉（不重绘）。见 S-35 / R9。
     pub fn write<T: Clone + PartialEq + 'static>(&mut self, signal: &Signal<T>, value: T) -> bool {
-        let id = signal.id();
-        if self.store.owned_ref::<T>(id) == Some(&value) {
-            return false;
-        }
-        self.store.set_owned(id, value);
-        self.invalidate(id);
-        true
+        signal_api::write(self, signal, value)
     }
 
     /// 写一个瞬态值：**不**失效、**不**请求唤醒（滚动偏移/悬浮态，§3.7）。
     pub fn write_transient<T: 'static>(&mut self, transient: &Transient<T>, value: T) {
-        self.store.set_transient(transient.id(), value);
+        signal_api::write_transient(self, transient, value)
     }
 
     /// 取走「需要一帧」的请求位（取走即清零）。
     pub fn take_wake_request(&mut self) -> bool {
-        let requested = self.wake_requested;
-        self.wake_requested = false;
-        requested
+        frame::take_wake_request(self)
     }
 
     /// 置「需要一帧」并**唤醒平台事件循环**（合并位由 `Dispatcher::wake` 保证幂等）。
@@ -794,36 +585,27 @@ impl App {
     /// （画面与 a11y 更新都迟到）——P15 用 UIA 客户端实测 `SelectionItemPattern.Select()`
     /// 不生效时定位到这一点（`design/DEVIATIONS.md` F-152）。
     fn request_frame(&mut self) {
-        self.wake_requested = true;
-        self.dispatcher.wake();
+        frame::request_frame(self)
     }
-
-    // ── P10：动作（Action）与键盘绑定 ──────────────────────────────────────────
 
     /// 注册/替换一个动作的处理器（同 `Action` 后写覆盖）。
     pub fn on_action(&mut self, action: Action, handler: impl FnMut(&mut ActionCtx<'_>) + 'static) {
-        self.handlers.insert(action, Box::new(handler));
+        style_pass::on_action(self, action, handler)
     }
 
     /// 删除处理器（返回是否真的删了）。
     pub fn off_action(&mut self, action: &Action) -> bool {
-        self.handlers.remove(action).is_some()
+        style_pass::off_action(self, action)
     }
 
     /// 添加/替换一条键盘绑定（同 `(key, modifiers)` 后写覆盖）。
     pub fn bind_key(&mut self, binding: KeyBinding) {
-        self.bindings.retain(|existing| {
-            !(existing.key == binding.key && existing.modifiers == binding.modifiers)
-        });
-        self.bindings.push(binding);
+        style_pass::bind_key(self, binding)
     }
 
     /// 删除一条键盘绑定（返回是否真的删了）。
     pub fn unbind_key(&mut self, key: Key, modifiers: Modifiers) -> bool {
-        let before = self.bindings.len();
-        self.bindings
-            .retain(|binding| !(binding.key == key && binding.modifiers == modifiers));
-        self.bindings.len() != before
+        style_pass::unbind_key(self, key, modifiers)
     }
 
     /// 非追踪读一个信号（handler 不是渲染 pass，不登记依赖）。
@@ -832,15 +614,12 @@ impl App {
     /// `signal` 的槽位不是普通信号（引擎不变量被破坏时才会发生）。
     #[must_use]
     pub fn read<T: Clone + 'static>(&self, signal: &Signal<T>) -> T {
-        self.store
-            .owned_ref::<T>(signal.id())
-            .cloned()
-            .expect("signal slot is not a plain signal")
+        signal_api::read(self, signal)
     }
 
     /// 覆盖输入阈值（平台层用 `GetDoubleClickTime` / `SM_CXDRAG` 初始化；测试也可显式设置）。
     pub fn set_input_thresholds(&mut self, thresholds: InputThresholds) {
-        self.thresholds = thresholds;
+        input::set_input_thresholds(self, thresholds)
     }
 
     /// 非追踪读一个瞬态值（动画进度 / 滚动偏移的公开读取面）。
@@ -849,20 +628,13 @@ impl App {
     /// 槽位不是瞬态值（引擎不变量被破坏时才会发生）。
     #[must_use]
     pub fn read_transient<T: Clone + 'static>(&self, transient: &Transient<T>) -> T {
-        self.store
-            .transient_ref::<T>(transient.id())
-            .cloned()
-            .expect("signal slot is not a transient value")
+        signal_api::read_transient(self, transient)
     }
 
     /// 已有滚动容器节点的句柄（`None` = 该节点不是滚动容器）。
     #[must_use]
     pub fn scroll_handle(&self, window: WindowId, node: NodeId) -> Option<ScrollHandle> {
-        self.windows
-            .get(&window)?
-            .tree()
-            .scroll_slot(node)
-            .map(|_| ScrollHandle::new(window, node))
+        scroll::scroll_handle(self, window, node)
     }
 
     /// 程序性分发（测试 / 菜单桥 / a11y 的 `ActionRequest`）。返回是否被处理。
@@ -873,7 +645,7 @@ impl App {
         action: Action,
         source: ActionSource,
     ) -> bool {
-        self.dispatch_action_with_hit(window, node, action, source, None, Modifiers::empty())
+        input::dispatch_action(self, window, node, action, source)
     }
 
     /// 以当前焦点节点为 target 分发（无焦点 ⇒ `false`）。
@@ -883,10 +655,7 @@ impl App {
         action: Action,
         source: ActionSource,
     ) -> bool {
-        let Some(node) = self.focused(window) else {
-            return false;
-        };
-        self.dispatch_action(window, node, action, source)
+        input::dispatch_action_focused(self, window, action, source)
     }
 
     /// 分发的唯一实现（`hit` 只有指针路径会带；`modifiers` 由调用方显式给出 —— 键盘路径必须是
@@ -900,84 +669,16 @@ impl App {
         hit: Option<HitResult>,
         modifiers: Modifiers,
     ) -> bool {
-        let Some(target) = self.windows.get(&window) else {
-            return false;
-        };
-        if target.tree().get(node).is_err() {
-            return false;
-        }
-        if let Some(mut handler) = self.handlers.remove(&action) {
-            {
-                let mut ctx = ActionCtx::new(self, window, node, hit, modifiers, source);
-                handler(&mut ctx);
-            }
-            self.handlers.insert(action, handler);
-            return true;
-        }
-        match action {
-            Action::FocusNext => {
-                self.focus_next(window);
-                true
-            }
-            Action::FocusPrev => {
-                self.focus_prev(window);
-                true
-            }
-            Action::Dismiss => self.dismiss_overlay(window),
-            Action::Custom(_) => false,
-        }
+        input::dispatch_action_with_hit(self, window, node, action, source, hit, modifiers)
     }
-
-    // ── P10：事件分发 ──────────────────────────────────────────────────────────
 
     /// 分发一次输入事件（平台泵与 `TestApp::inject` 的**唯一**入口）。
     pub(crate) fn dispatch_input(&mut self, window: WindowId, event: InputEvent) -> InputOutcome {
-        let mut outcome = InputOutcome::default();
-        if !self.windows.contains_key(&window) {
-            return outcome;
-        }
-        self.validate_focus(window);
-        match event {
-            InputEvent::PointerDown {
-                position,
-                button,
-                modifiers,
-            } => self.on_pointer_down(window, position, button, modifiers, &mut outcome),
-            InputEvent::PointerMove {
-                position,
-                modifiers,
-            } => {
-                self.on_pointer_move(window, position, modifiers, &mut outcome);
-            }
-            InputEvent::PointerUp {
-                position,
-                button,
-                modifiers,
-            } => self.on_pointer_up(window, position, button, modifiers, &mut outcome),
-            InputEvent::PointerLeave => self.on_pointer_leave(window),
-            // 系统取消指针会话（捕获丢失 / 系统弹窗夺走输入）：与失焦同一套收尾，但**不**动
-            // 焦点与 a11y 焦点态 —— 焦点没有变，只是这次指针交互作废。
-            InputEvent::PointerCancel => self.cancel_pointer_session(window),
-            InputEvent::Scroll {
-                position,
-                delta_x,
-                delta_y,
-                modifiers,
-            } => self.on_scroll(window, position, delta_x, delta_y, modifiers, &mut outcome),
-            InputEvent::Key {
-                key,
-                state,
-                modifiers,
-            } => self.on_key(window, key, state, modifiers, &mut outcome),
-            InputEvent::Text { .. } => {}
-        }
-        outcome
+        input::dispatch_input(self, window, event)
     }
 
     fn hit_at(&self, window: WindowId, position: Point) -> Option<HitResult> {
-        self.windows
-            .get(&window)
-            .and_then(|target| target.tree().hit_test(position))
+        input::hit_at(self, window, position)
     }
 
     fn on_pointer_down(
@@ -988,79 +689,7 @@ impl App {
         modifiers: Modifiers,
         outcome: &mut InputOutcome,
     ) {
-        if self
-            .windows
-            .get(&window)
-            .is_some_and(|target| target.pointer().drag.is_some())
-        {
-            // 拖拽进行中：忽略二次按下（会话只由抬起 / 取消 / 失焦结束）。
-            return;
-        }
-        let hit = self.hit_at(window, position);
-        outcome.hit = hit;
-        if let Some(target) = self.windows.get_mut(&window) {
-            let pointer = target.pointer_mut();
-            pointer.modifiers = modifiers;
-            pointer.last_hit = hit;
-            pointer.hover = hit.map(|result| result.node);
-            pointer.press = Some(PressRecord {
-                node: hit.map(|result| result.node),
-                position,
-                button,
-                at: self.clock,
-            });
-        }
-        // ① 浮层外部点击（优先于焦点：否则会同时关浮层 + 触发下层按钮）。
-        let outside = self.windows.get(&window).and_then(|target| {
-            let tree = target.tree();
-            overlay_util::outside_click_target(tree, tree.root(), hit.map(|result| result.node))
-        });
-        if let Some((node, _)) = outside {
-            // 关闭浮层的这一次按下必须**整体消费**：抬起时不得再派发给下层。
-            if let Some(target) = self.windows.get_mut(&window) {
-                target.pointer_mut().press = None;
-            }
-            self.remove_node(window, node);
-            return;
-        }
-        // ② 焦点：命中链上最近的可聚焦祖先（没有 ⇒ 清空）。
-        let focus_target = self.windows.get(&window).and_then(|target| {
-            hit.and_then(|result| focus::nearest_focusable(target.tree(), result.node))
-        });
-        self.set_focus(window, focus_target);
-        // ③ 拖拽：命中链上第一条 `on_drag`。
-        let drag = self.windows.get(&window).and_then(|target| {
-            hit.and_then(|result| focus::drag_target(target.tree(), result.node))
-        });
-        if let Some((node, action)) = drag {
-            if let Some(target) = self.windows.get_mut(&window) {
-                let pointer = target.pointer_mut();
-                pointer.drag = Some(DragSession {
-                    node,
-                    action: action.clone(),
-                    origin: position,
-                    current: position,
-                    phase: DragPhase::Start,
-                });
-                pointer.capture = true;
-            }
-            self.capture_request = Some((window, true));
-            let handled = self.dispatch_action_with_hit(
-                window,
-                node,
-                action.clone(),
-                ActionSource::Drag {
-                    phase: DragPhase::Start,
-                    delta: Point::ZERO,
-                },
-                hit,
-                modifiers,
-            );
-            if handled {
-                outcome.action = Some(action);
-                outcome.target = Some(node);
-            }
-        }
+        input::on_pointer_down(self, window, position, button, modifiers, outcome)
     }
 
     fn on_pointer_move(
@@ -1070,52 +699,7 @@ impl App {
         modifiers: Modifiers,
         outcome: &mut InputOutcome,
     ) {
-        let hit = self.hit_at(window, position);
-        outcome.hit = hit;
-        let session = self.windows.get_mut(&window).and_then(|target| {
-            let pointer = target.pointer_mut();
-            pointer.modifiers = modifiers;
-            pointer.last_hit = hit;
-            pointer.hover = hit.map(|result| result.node);
-            pointer.drag.as_mut().map(|session| {
-                session.current = position;
-                session.phase = DragPhase::Move;
-                session.clone()
-            })
-        });
-        if let Some(session) = session {
-            let delta = session.delta();
-            let handled = self.dispatch_action_with_hit(
-                window,
-                session.node,
-                session.action.clone(),
-                ActionSource::Drag {
-                    phase: DragPhase::Move,
-                    delta,
-                },
-                hit,
-                modifiers,
-            );
-            if handled {
-                outcome.action = Some(session.action);
-                outcome.target = Some(session.node);
-            }
-            return;
-        }
-        let cursor = self.windows.get(&window).map_or(Cursor::Default, |target| {
-            focus::resolve_cursor(target.tree(), hit.map(|result| result.node))
-        });
-        let mut changed = false;
-        if let Some(target) = self.windows.get_mut(&window) {
-            let pointer = target.pointer_mut();
-            if pointer.cursor != cursor {
-                pointer.cursor = cursor;
-                changed = true;
-            }
-        }
-        if changed {
-            self.cursor_pending = Some((window, cursor));
-        }
+        input::on_pointer_move(self, window, position, modifiers, outcome)
     }
 
     fn on_pointer_up(
@@ -1126,94 +710,11 @@ impl App {
         modifiers: Modifiers,
         outcome: &mut InputOutcome,
     ) {
-        let hit = self.hit_at(window, position);
-        outcome.hit = hit;
-        let session = self.windows.get_mut(&window).and_then(|target| {
-            let pointer = target.pointer_mut();
-            pointer.modifiers = modifiers;
-            pointer.last_hit = hit;
-            pointer.end_drag()
-        });
-        if let Some(session) = session {
-            self.capture_request = Some((window, false));
-            let delta = session.delta();
-            let action = session.action;
-            let handled = self.dispatch_action_with_hit(
-                window,
-                session.node,
-                action.clone(),
-                ActionSource::Drag {
-                    phase: DragPhase::End,
-                    delta,
-                },
-                hit,
-                modifiers,
-            );
-            if handled {
-                outcome.action = Some(action);
-                outcome.target = Some(session.node);
-            }
-            return;
-        }
-        let press = self
-            .windows
-            .get_mut(&window)
-            .and_then(|target| target.pointer_mut().press.take());
-        let Some(press) = press else {
-            return;
-        };
-        if press.button != button {
-            return;
-        }
-        let Some(press_node) = press.node else {
-            return;
-        };
-        let moved = Point::new(position.x - press.position.x, position.y - press.position.y);
-        if drag_util::crosses_threshold(moved, self.thresholds.drag_distance) {
-            return;
-        }
-        if hit.map(|result| result.node) != Some(press_node) {
-            return;
-        }
-        let count = self.click_count(window, press_node, position);
-        outcome.click_count = count;
-        let target_action = self
-            .windows
-            .get(&window)
-            .and_then(|target| focus::action_target(target.tree(), press_node));
-        if let Some((node, action)) = target_action {
-            let handled = self.dispatch_action_with_hit(
-                window,
-                node,
-                action.clone(),
-                ActionSource::Click { click_count: count },
-                hit,
-                modifiers,
-            );
-            if handled {
-                outcome.action = Some(action);
-                outcome.target = Some(node);
-            }
-        }
+        input::on_pointer_up(self, window, position, button, modifiers, outcome)
     }
 
     fn on_pointer_leave(&mut self, window: WindowId) {
-        let mut changed = false;
-        if let Some(target) = self.windows.get_mut(&window) {
-            let pointer = target.pointer_mut();
-            let capture = pointer.capture;
-            pointer.hover = None;
-            if !capture {
-                pointer.press = None;
-            }
-            if pointer.cursor != Cursor::Default {
-                pointer.cursor = Cursor::Default;
-                changed = true;
-            }
-        }
-        if changed {
-            self.cursor_pending = Some((window, Cursor::Default));
-        }
+        input::on_pointer_leave(self, window)
     }
 
     fn on_scroll(
@@ -1225,100 +726,12 @@ impl App {
         modifiers: Modifiers,
         outcome: &mut InputOutcome,
     ) {
-        let hit = self.hit_at(window, position);
-        outcome.hit = hit;
-        let Some(result) = hit else {
-            return;
-        };
-        // Shift 交换两轴：各平台的约定都是「Shift + 滚轮 = 横向」。交换后每个容器只消费
-        // **自己那条轴**的 delta，另一轴原样留给外层的容器（P2-4）。
-        let (mut dx, mut dy) = if modifiers.contains(Modifiers::SHIFT) {
-            (delta_y, delta_x)
-        } else {
-            (delta_x, delta_y)
-        };
-        if dx == 0.0 && dy == 0.0 {
-            return;
-        }
-        // 由内到外收集滚动祖先（含命中节点自身）：滚轮先给最内层，滚不动才交给外层，
-        // 这就是浏览器的 scroll chaining。旧实现只取**一个**最近祖先，内层到底后滚轮
-        // 直接失效（复杂图表里嵌套的横向 + 纵向容器最明显）。
-        let Some(target) = self.windows.get(&window) else {
-            return;
-        };
-        let mut chain: SmallVec<[(NodeId, crate::interaction::ScrollSlot, Size); 8]> =
-            SmallVec::new();
-        let mut cursor = Some(result.node);
-        while let Some(current) = cursor {
-            if let Some(slot) = target.tree().scroll_slot(current) {
-                let size = scroll::viewport(target.tree(), current).size;
-                chain.push((current, slot, size));
-            }
-            cursor = target
-                .tree()
-                .get(current)
-                .ok()
-                .and_then(|node| node.parent());
-        }
-        for (node, slot, size) in chain {
-            let drives = match slot.axis {
-                ScrollAxis::Vertical => dy,
-                ScrollAxis::Horizontal => dx,
-            };
-            if drives == 0.0 {
-                continue;
-            }
-            // 本容器实际能消费的行数（受 max_offset 夹紧）；吃不完的留给外层。
-            //
-            // 基准是**动画目标**而不是当前 offset：同一帧内的第二个滚轮事件必须累加在第一个
-            // 事件的落点上，否则两次事件用同一个 `from` 重算目标，前一次的 delta 被静默丢弃
-            // （触控板 / 高精度滚轮一个泵批次里常发多个事件，表现为「滚不动」）。
-            let max = scroll::max_offset(&slot, size);
-            let pending = self
-                .scroll_animation_target(node, window)
-                .unwrap_or(slot.offset);
-            let (before, limit) = match slot.axis {
-                ScrollAxis::Vertical => (pending.y, max.y),
-                ScrollAxis::Horizontal => (pending.x, max.x),
-            };
-            // 基准必须钳在**当前**可滚范围内：动画 `to` 不会随内容收缩 / 视口变大而重定向
-            // （`clamp_scroll_offsets` 只改 offset）。不钳的话 `before` 可能是越界值，
-            // `consumed = (before - after) / line_height` 会放大成十几行，把**反向**残量
-            // 传给外层容器（内层缩内容后向上滚一格，外层却往下滚；第二轮复审 P2-2）。
-            let before = before.clamp(0.0, limit);
-            let after = (before - drives * slot.line_height).clamp(0.0, limit);
-            let consumed = (before - after) / slot.line_height;
-            if consumed == 0.0 {
-                continue;
-            }
-            let handle = ScrollHandle::new(window, node);
-            let mut target = Point::new(0.0, 0.0);
-            match slot.axis {
-                ScrollAxis::Vertical => target.y = after,
-                ScrollAxis::Horizontal => target.x = after,
-            }
-            let _ = self.scroll_to_animated(&handle, target);
-            match slot.axis {
-                ScrollAxis::Vertical => dy -= consumed,
-                ScrollAxis::Horizontal => dx -= consumed,
-            }
-            if dx == 0.0 && dy == 0.0 {
-                break;
-            }
-        }
+        input::on_scroll(self, window, position, delta_x, delta_y, modifiers, outcome)
     }
 
     /// 该节点正在进行中的滚动动画目标（没有动画时 `None`）。
     fn scroll_animation_target(&self, node: NodeId, window: WindowId) -> Option<Point> {
-        self.animations.iter().rev().find_map(|slot| {
-            if slot.window != window {
-                return None;
-            }
-            match &slot.target {
-                AnimationTarget::Scroll { handle, to, .. } if handle.node() == node => Some(*to),
-                _ => None,
-            }
-        })
+        animation::scroll_animation_target(self, node, window)
     }
 
     fn on_key(
@@ -1329,81 +742,15 @@ impl App {
         modifiers: Modifiers,
         outcome: &mut InputOutcome,
     ) {
-        if state != KeyState::Down {
-            return;
-        }
-        // ① 焦点激活：Enter / Space 走「点击」的同一条冒泡（没声明就落到 ②，不吞键）。
-        if matches!(key, Key::Enter | Key::Space) {
-            let focused = self.focused(window);
-            let activation = self.windows.get(&window).and_then(|target| {
-                focused.and_then(|node| focus::action_target(target.tree(), node))
-            });
-            if let Some((node, action)) = activation {
-                let handled = self.dispatch_action_with_hit(
-                    window,
-                    node,
-                    action.clone(),
-                    ActionSource::Click { click_count: 1 },
-                    None,
-                    modifiers,
-                );
-                if handled {
-                    outcome.action = Some(action);
-                    outcome.target = Some(node);
-                }
-                return;
-            }
-        }
-        // ② 全局绑定（精确匹配 key + modifiers）。
-        let binding = self
-            .bindings
-            .iter()
-            .find(|binding| binding.key == key && binding.modifiers == modifiers)
-            .map(|binding| binding.action.clone());
-        let Some(action) = binding else {
-            return;
-        };
-        let node = self
-            .focused(window)
-            .or_else(|| self.windows.get(&window).map(|target| target.tree().root()));
-        let Some(node) = node else {
-            return;
-        };
-        if self.dispatch_action(window, node, action.clone(), ActionSource::Key) {
-            outcome.action = Some(action);
-            outcome.target = Some(node);
-        }
+        input::on_key(self, window, key, state, modifiers, outcome)
     }
 
     fn click_count(&mut self, window: WindowId, node: NodeId, position: Point) -> u8 {
-        let count = match self.last_click {
-            Some(last)
-                if last.window == window
-                    && last.node == Some(node)
-                    && self.clock.saturating_duration_since(last.at)
-                        <= self.thresholds.double_click_time
-                    && drag_util::within(
-                        last.position,
-                        position,
-                        self.thresholds.double_click_distance,
-                    ) =>
-            {
-                last.count.saturating_add(1)
-            }
-            _ => 1,
-        };
-        self.last_click = Some(ClickRecord {
-            window,
-            node: Some(node),
-            position,
-            at: self.clock,
-            count,
-        });
-        count
+        input::click_count(self, window, node, position)
     }
 
     fn on_window_focus_lost(&mut self, window: WindowId) {
-        self.cancel_pointer_session(window);
+        input::on_window_focus_lost(self, window)
     }
 
     /// 作废本窗口当前的指针会话：结束拖拽（派发 `DragPhase::Cancel`）、清按压/悬停/光标、
@@ -1414,89 +761,25 @@ impl App {
     /// macOS 的窗口失去 key、Linux 的指针 `leave`）。缺了这条路径，拖拽中 Alt+Tab 会让会话
     /// 永久停在「按住」，用户只能重启应用。
     fn cancel_pointer_session(&mut self, window: WindowId) {
-        let cancelled = self
-            .windows
-            .get_mut(&window)
-            .and_then(|target| target.pointer_mut().end_drag());
-        if let Some(session) = cancelled {
-            self.capture_request = Some((window, false));
-            let delta = session.delta();
-            let _ = self.dispatch_action(
-                window,
-                session.node,
-                session.action,
-                ActionSource::Drag {
-                    phase: DragPhase::Cancel,
-                    delta,
-                },
-            );
-        }
-        if let Some(target) = self.windows.get_mut(&window) {
-            let pointer = target.pointer_mut();
-            pointer.hover = None;
-            pointer.press = None;
-            pointer.cursor = Cursor::Default;
-        }
+        input::cancel_pointer_session(self, window)
     }
-
-    // ── P10：焦点 ──────────────────────────────────────────────────────────────
 
     /// 当前焦点（`None` = 无焦点 / 窗口不存在 / **焦点节点已卸载**）。
     ///
     /// 陈旧焦点一律视为无焦点：虚拟列表回收行之后，旧 `NodeId` 不得再驱动键盘路由。
     #[must_use]
     pub fn focused(&self, window: WindowId) -> Option<NodeId> {
-        let target = self.windows.get(&window)?;
-        let node = target.focus().focused()?;
-        target.tree().get(node).ok().map(|_| node)
+        focus::focused(self, window)
     }
 
     /// 清掉指向已卸载节点的焦点（读取路径都是只读，清理集中在这里）。
     fn validate_focus(&mut self, window: WindowId) {
-        let stale = self.windows.get(&window).and_then(|target| {
-            let node = target.focus().focused()?;
-            target.tree().get(node).is_err().then_some(())
-        });
-        if stale.is_some()
-            && let Some(target) = self.windows.get_mut(&window)
-        {
-            target.focus_mut().set(None);
-        }
+        focus::validate_focus(self, window)
     }
 
     /// 设置焦点。不可聚焦 / 同值 ⇒ `false`（不标脏、不唤醒）。
     pub fn set_focus(&mut self, window: WindowId, node: Option<NodeId>) -> bool {
-        let Some(target) = self.windows.get_mut(&window) else {
-            return false;
-        };
-        if let Some(node) = node
-            && !focus::focusable(target.tree(), node)
-        {
-            return false;
-        }
-        let old = target.focus().focused();
-        if !target.focus_mut().set(node) {
-            return false;
-        }
-        // 旧焦点环超出节点 bounds：清环时把环的外扩并入 damage（否则边缘残留 1px）。
-        if let Some(previous) = old
-            && let Some(ring) = target.tree().focus_ring(previous)
-            && let Ok(slot) = target.tree().get(previous)
-        {
-            let bounds = slot.layout().bounds;
-            let screen =
-                scroll::to_screen(target.tree(), previous, bounds).outset(ring.offset + ring.width);
-            target.request_damage(screen);
-        }
-        for changed in [old, node].into_iter().flatten() {
-            let has_ring = target.tree().focus_ring(changed).is_some();
-            target.tree_mut().mark_a11y(changed);
-            if has_ring {
-                target.tree_mut().mark_paint(changed);
-            }
-        }
-        self.request_frame();
-        true
+        focus::set_focus(self, window, node)
     }
 
     /// 设置 IME caret hint（P16）：`node` 是该窗口内的文本节点，`byte_index` 是 UTF-8 字节偏移。
@@ -1513,36 +796,12 @@ impl App {
         node: NodeId,
         byte_index: usize,
     ) -> Result<(), EngineError> {
-        let changed = {
-            let Some(target) = self.windows.get_mut(&window) else {
-                return Err(EngineError::UnknownWindow { window });
-            };
-            let Some(slot) = target.tree().get(node).ok() else {
-                return Err(EngineError::StaleNode { node });
-            };
-            if slot.kind().text().is_none() {
-                return Err(EngineError::TextShape {
-                    node,
-                    detail: smol_str::SmolStr::new_static("node is not a text node"),
-                });
-            }
-            target.set_ime_cursor_request(node, byte_index)
-        };
-        if changed {
-            self.dispatcher.wake();
-        }
-        Ok(())
+        focus::set_ime_cursor_area(self, window, node, byte_index)
     }
 
     /// 清除 IME caret hint（P16）；不存在的窗口是 no-op。
     pub fn clear_ime_cursor_area(&mut self, window: WindowId) {
-        let changed = self
-            .windows
-            .get_mut(&window)
-            .is_some_and(Window::clear_ime_cursor_request);
-        if changed {
-            self.dispatcher.wake();
-        }
+        focus::clear_ime_cursor_area(self, window)
     }
 
     /// 启用/禁用某个窗口的输入法（IME，P2-7）。
@@ -1564,17 +823,7 @@ impl App {
     ///
     /// 平台支持：目前只有 Windows 落实（macOS / Linux 保持系统默认 IME 行为）。
     pub fn set_ime_enabled(&mut self, window: WindowId, enabled: bool) {
-        if !self.windows.contains_key(&window) {
-            return;
-        }
-        let changed = if enabled {
-            self.ime_disabled.remove(&window)
-        } else {
-            self.ime_disabled.insert(window)
-        };
-        if changed {
-            self.dispatcher.wake();
-        }
+        focus::set_ime_enabled(self, window, enabled)
     }
 
     /// 当前 IME caret hint 对应的窗口客户区逻辑矩形（P16）。
@@ -1585,39 +834,18 @@ impl App {
     /// # Errors
     /// `UnknownWindow`：窗口不存在；`StaleNode` / `TextShape`：hint 指向的文本节点不可解析。
     pub fn ime_cursor_area(&self, window: WindowId) -> Result<Option<Rect>, EngineError> {
-        self.windows
-            .get(&window)
-            .ok_or(EngineError::UnknownWindow { window })?
-            .ime_cursor_area()
+        focus::ime_cursor_area(self, window)
     }
 
     /// 焦点移到下一个可聚焦节点（末尾回绕）。
     pub fn focus_next(&mut self, window: WindowId) -> Option<NodeId> {
-        self.validate_focus(window);
-        let next = self.windows.get(&window).and_then(|target| {
-            focus::next_focusable(target.tree(), target.focus().focused(), false)
-        });
-        if self.set_focus(window, next) {
-            next
-        } else {
-            None
-        }
+        focus::focus_next(self, window)
     }
 
     /// 焦点移到上一个可聚焦节点（开头回绕）。
     pub fn focus_prev(&mut self, window: WindowId) -> Option<NodeId> {
-        self.validate_focus(window);
-        let next = self.windows.get(&window).and_then(|target| {
-            focus::next_focusable(target.tree(), target.focus().focused(), true)
-        });
-        if self.set_focus(window, next) {
-            next
-        } else {
-            None
-        }
+        focus::focus_prev(self, window)
     }
-
-    // ── P10：滚动 ──────────────────────────────────────────────────────────────
 
     /// 让一个节点成为滚动容器（要求 `Style.clip == Clip::Bounds`）。
     ///
@@ -1629,28 +857,7 @@ impl App {
         node: NodeId,
         config: ScrollConfig,
     ) -> Result<ScrollHandle, EngineError> {
-        let Some(target) = self.windows.get_mut(&window) else {
-            return Err(EngineError::NotScrollable { node });
-        };
-        let slot = target.tree().get(node)?;
-        if slot.clip() != Clip::Bounds {
-            return Err(EngineError::NotScrollable { node });
-        }
-        let viewport = scroll::viewport(target.tree(), node).size;
-        // `line_height` 是「一行 = 多少像素」的换算系数，除零会让 `on_scroll` 的残量计算
-        // 得到 NaN 并写进 offset（review P2-10）。公开字段没有别的校验点，在这里一次性拒绝。
-        if !config.line_height.is_finite() || config.line_height <= 0.0 {
-            return Err(EngineError::NotScrollable { node });
-        }
-        if let Some(slot) = target.tree_mut().ensure_interaction(node) {
-            slot.scroll = Some(ScrollSlot {
-                offset: Point::ZERO,
-                content: viewport,
-                axis: config.axis,
-                line_height: config.line_height,
-            });
-        }
-        Ok(ScrollHandle::new(window, node))
+        scroll::make_scroll(self, window, node, config)
     }
 
     /// 内容尺寸（滚动范围的来源；虚拟列表由引擎写）。
@@ -1662,24 +869,7 @@ impl App {
         handle: &ScrollHandle,
         content: Size,
     ) -> Result<(), EngineError> {
-        let window = handle.window();
-        let node = handle.node();
-        let Some(target) = self.windows.get_mut(&window) else {
-            return Ok(());
-        };
-        let Some(slot) = target.tree_mut().scroll_slot_mut(node) else {
-            return Err(EngineError::NotScrollable { node });
-        };
-        // 非有限尺寸会让 `max_offset` 算出 NaN，之后每帧 `next == slot.offset` 恒 false
-        // ⇒ 永久请求帧（与 `line_height = 0` 同一机制；第二轮复审 P2-3）。入口处拒绝。
-        if ![content.width, content.height]
-            .iter()
-            .all(|value| value.is_finite())
-        {
-            return Err(EngineError::NotScrollable { node });
-        }
-        slot.content = content;
-        Ok(())
+        scroll::set_scroll_content(self, handle, content)
     }
 
     /// 程序化滚动（clamp 后写入；同值 ⇒ 完全 no-op）。
@@ -1689,43 +879,7 @@ impl App {
     /// # Errors
     /// `StaleNode`（节点已卸载）/ `NotScrollable`（不是滚动容器）。
     pub fn scroll_to(&mut self, handle: &ScrollHandle, offset: Point) -> Result<(), EngineError> {
-        // NaN/inf 偏移会在 `clamp` 后原样保留（`f32::clamp` 对 NaN 返回 NaN），随后
-        // `next == slot.offset` 恒 false ⇒ 每帧自请求重绘（第二轮复审 P2-3）。入口处拒绝。
-        if ![offset.x, offset.y].iter().all(|value| value.is_finite()) {
-            return Err(EngineError::NotScrollable {
-                node: handle.node(),
-            });
-        }
-        let window = handle.window();
-        let node = handle.node();
-        let Some(target) = self.windows.get_mut(&window) else {
-            return Ok(());
-        };
-        if target.tree().get(node).is_err() {
-            return Err(EngineError::StaleNode { node });
-        }
-        let Some(slot) = target.tree().scroll_slot(node) else {
-            return Err(EngineError::NotScrollable { node });
-        };
-        let viewport = scroll::viewport(target.tree(), node);
-        let mut probe = slot;
-        probe.offset = offset;
-        let next = scroll::clamp_offset(&probe, viewport.size);
-        if next == slot.offset {
-            return Ok(());
-        }
-        if let Some(slot) = target.tree_mut().scroll_slot_mut(node) {
-            slot.offset = next;
-        }
-        // damage 是**屏幕坐标**：视口在内容坐标里，必须减掉祖先滚动偏移（容器自身偏移不算）。
-        let damage = scroll::to_screen(target.tree(), node, viewport);
-        target.request_damage(damage);
-        // P11：a11y 的 bounds 也是屏幕化的内容坐标 ⇒ 偏移变了，整棵子树必须重发。
-        // 唯一写点在 `scroll_to`（`scroll_by` / 滚轮 / 动画滚动 / a11y action 全汇到这里）。
-        target.a11y_note_scroll(node);
-        self.request_frame();
-        self.rewindow_virtual(window, node);
-        Ok(())
+        scroll::scroll_to(self, handle, offset)
     }
 
     /// 布局之后把所有滚动容器的偏移重新夹紧（P2-3.3）。
@@ -1738,11 +892,7 @@ impl App {
     /// 只在**布局实际重跑过**之后调用（帧内 `layout_if_dirty` 之后）：没有重排时范围不会变，
     /// 每帧遍历所有滚动槽是纯浪费。
     fn normalize_scroll_offsets(&mut self, window: WindowId) {
-        if self.clamp_scroll_offsets(window) {
-            // 帧首夹紧可能发生在没有其它脏位的帧里（「内容变短」不标任何脏位），
-            // 必须自己请求一帧，否则会停在 Idle 上永远不修。
-            self.request_frame();
-        }
+        scroll::normalize_scroll_offsets(self, window)
     }
 
     /// 把所有滚动槽的偏移夹回 `content − viewport` 范围；返回是否有变化。
@@ -1751,37 +901,7 @@ impl App {
     /// 只做帧首夹紧时，窗口变大导致视口变大的那一帧仍会用旧上限，于是内容上移过多 /
     /// 底部空白会被画出来，而下一帧不一定存在（泵会因为无脏位而阻塞）——参见复审 P2-8。
     fn clamp_scroll_offsets(&mut self, window: WindowId) -> bool {
-        let Some(target) = self.windows.get_mut(&window) else {
-            return false;
-        };
-        // 先收集（遍历时 `tree_mut` 与 `viewport` 的只读借用会冲突）。
-        let nodes: SmallVec<[crate::node::id::NodeId; 8]> = target
-            .tree()
-            .order()
-            .iter()
-            .copied()
-            .filter(|node| target.tree().scroll_slot(*node).is_some())
-            .collect();
-        let mut changed = false;
-        for node in nodes {
-            let Some(slot) = target.tree().scroll_slot(node) else {
-                continue;
-            };
-            let viewport = scroll::viewport(target.tree(), node);
-            let next = scroll::clamp_offset(&slot, viewport.size);
-            if next == slot.offset {
-                continue;
-            }
-            if let Some(slot) = target.tree_mut().scroll_slot_mut(node) {
-                slot.offset = next;
-            }
-            // damage 是屏幕坐标（要减掉祖先滚动偏移，容器自身偏移不算）。
-            let damage = scroll::to_screen(target.tree(), node, viewport);
-            target.request_damage(damage);
-            target.a11y_note_scroll(node);
-            changed = true;
-        }
-        changed
+        scroll::clamp_scroll_offsets(self, window)
     }
 
     /// 相对滚动。
@@ -1789,24 +909,13 @@ impl App {
     /// # Errors
     /// 同 [`App::scroll_to`]。
     pub fn scroll_by(&mut self, handle: &ScrollHandle, delta: Point) -> Result<(), EngineError> {
-        let current = self
-            .scroll_state(handle)
-            .map_or(Point::ZERO, |state| state.offset);
-        self.scroll_to(handle, Point::new(current.x + delta.x, current.y + delta.y))
+        scroll::scroll_by(self, handle, delta)
     }
 
     /// 滚动状态快照。
     #[must_use]
     pub fn scroll_state(&self, handle: &ScrollHandle) -> Option<ScrollState> {
-        let target = self.windows.get(&handle.window())?;
-        let node = handle.node();
-        let slot = target.tree().scroll_slot(node)?;
-        Some(ScrollState {
-            offset: slot.offset,
-            content: slot.content,
-            viewport: scroll::viewport(target.tree(), node).size,
-            axis: slot.axis,
-        })
+        scroll::scroll_state(self, handle)
     }
 
     /// 滚轮 → 平滑滚动（登记/重定向一个 `Scroll` 动画槽）。
@@ -1815,37 +924,8 @@ impl App {
         handle: &ScrollHandle,
         target: Point,
     ) -> Result<(), EngineError> {
-        let Some(state) = self.scroll_state(handle) else {
-            return Err(EngineError::NotScrollable {
-                node: handle.node(),
-            });
-        };
-        let spec = AnimationSpec::short();
-        let window = handle.window();
-        // 已有同 handle 的滚动动画 ⇒ 从当前偏移重新起步。
-        self.animations.retain(|slot| {
-            !matches!(&slot.target, AnimationTarget::Scroll { handle: existing, .. } if *existing == *handle)
-        });
-        let id = self.next_animation;
-        self.next_animation = self.next_animation.wrapping_add(1);
-        self.animations.push(AnimationSlot {
-            id,
-            window,
-            target: AnimationTarget::Scroll {
-                handle: *handle,
-                from: state.offset,
-                to: target,
-            },
-            start: self.clock,
-            duration: spec.duration,
-            easing: spec.easing,
-            nodes: Vec::new(),
-        });
-        self.request_frame();
-        Ok(())
+        scroll::scroll_to_animated(self, handle, target)
     }
-
-    // ── P10：虚拟列表 ──────────────────────────────────────────────────────────
 
     /// 让一个滚动容器变成虚拟列表（要求 `Clip::Bounds` + `position: relative`）。
     ///
@@ -1857,33 +937,7 @@ impl App {
         container: NodeId,
         config: VirtualListConfig,
     ) -> Result<VirtualList, EngineError> {
-        let Some(target) = self.windows.get_mut(&window) else {
-            return Err(EngineError::NotVirtualList { node: container });
-        };
-        let node = target.tree().get(container)?;
-        if node.clip() != Clip::Bounds
-            || node.style().inner.position != taffy::style::Position::Relative
-        {
-            return Err(EngineError::NotVirtualList { node: container });
-        }
-        let viewport = scroll::viewport(target.tree(), container).size;
-        let Some(slot) = target.tree_mut().ensure_interaction(container) else {
-            return Err(EngineError::StaleNode { node: container });
-        };
-        slot.scroll = Some(ScrollSlot {
-            offset: Point::ZERO,
-            content: viewport,
-            axis: ScrollAxis::Vertical,
-            line_height: ScrollConfig::default().line_height,
-        });
-        slot.virtual_list = Some(VirtualSlot {
-            extent: config.extent.max(1.0),
-            overscan: config.overscan,
-            count: 0,
-            builder: None,
-            mounted: Vec::new(),
-        });
-        Ok(VirtualList::new(window, container))
+        virtual_list::make_virtual_list(self, window, container, config)
     }
 
     /// 设置条目总数与行工厂，并重建可见窗口（只在**新建行**时调用 `build`）。
@@ -1896,165 +950,30 @@ impl App {
         count: usize,
         build: impl FnMut(usize) -> NodeBuilder + 'static,
     ) -> Result<(), EngineError> {
-        let window = list.window();
-        let node = list.node();
-        let Some(target) = self.windows.get_mut(&window) else {
-            return Ok(());
-        };
-        let Some(slot) = target.tree_mut().virtual_slot_mut(node) else {
-            return Err(EngineError::NotVirtualList { node });
-        };
-        slot.count = count;
-        slot.builder = Some(Box::new(build));
-        // 条目总数是容器自身的 a11y 属性（`size_of_set`）：变了必须重发快照。
-        target.tree_mut().mark_a11y(node);
-        self.rewindow_virtual(window, node);
-        Ok(())
+        virtual_list::set_virtual_items(self, list, count, build)
     }
 
     /// 虚拟列表状态快照。
     #[must_use]
     pub fn virtual_list_state(&self, list: &VirtualList) -> Option<VirtualListState> {
-        let target = self.windows.get(&list.window())?;
-        let node = list.node();
-        let slot = target.tree().virtual_slot(node)?;
-        let scroll = target.tree().scroll_slot(node)?;
-        let viewport = scroll::viewport(target.tree(), node).size;
-        let range = virtual_list::visible_range(
-            scroll.offset.y,
-            viewport.height,
-            slot.extent,
-            slot.count,
-            slot.overscan,
-        );
-        Some(VirtualListState {
-            count: slot.count,
-            first: range.start,
-            last: range.end,
-            mounted: slot.mounted.len(),
-            offset: scroll.offset,
-            viewport,
-        })
+        virtual_list::virtual_list_state(self, list)
     }
 
     /// 行节点 → 条目下标（a11y 的 `pos_in_set`）。
     #[must_use]
     pub fn virtual_row_index(&self, list: &VirtualList, row: NodeId) -> Option<usize> {
-        let target = self.windows.get(&list.window())?;
-        let slot = target.tree().virtual_slot(list.node())?;
-        slot.mounted
-            .iter()
-            .find(|(_, mounted)| *mounted == row)
-            .map(|(index, _)| *index)
+        virtual_list::virtual_row_index(self, list, row)
     }
 
     /// 布局后/视口变化后修复所有虚拟列表的可见窗口（幂等：区间不变则零工作）。
     fn rewindow_virtuals(&mut self, window: WindowId) {
-        let containers: Vec<NodeId> = self.windows.get(&window).map_or_else(Vec::new, |target| {
-            target
-                .tree()
-                .order()
-                .iter()
-                .copied()
-                .filter(|node| target.tree().virtual_slot(*node).is_some())
-                .collect()
-        });
-        for node in containers {
-            self.rewindow_virtual(window, node);
-        }
+        virtual_list::rewindow_virtuals(self, window)
     }
 
     /// 按当前偏移重建可见窗口（挂载缺的、回收多的）。
     fn rewindow_virtual(&mut self, window: WindowId, node: NodeId) {
-        let Some(target) = self.windows.get_mut(&window) else {
-            return;
-        };
-        let Some(slot) = target.tree().virtual_slot(node) else {
-            return;
-        };
-        let (extent, overscan, count) = (slot.extent, slot.overscan, slot.count);
-        let Some(scroll) = target.tree().scroll_slot(node) else {
-            return;
-        };
-        let viewport = scroll::viewport(target.tree(), node).size;
-        let range =
-            virtual_list::visible_range(scroll.offset.y, viewport.height, extent, count, overscan);
-        // 回收
-        let stale: Vec<(usize, NodeId)> = target
-            .tree()
-            .virtual_slot(node)
-            .map(|slot| {
-                slot.mounted
-                    .iter()
-                    .copied()
-                    .filter(|(index, _)| !range.contains(index))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut changed = false;
-        for (_, row) in &stale {
-            // 回收行同样必须解开依赖边（P1-2.5）：滚动是最高频操作，留下的死边会线性放大
-            // 每一次 `App::write`。
-            if let Ok(detached) = target.tree_mut().remove(*row) {
-                for (removed, deps) in detached {
-                    for signal in deps {
-                        self.graph.detach(
-                            signal,
-                            Owner::Node {
-                                window,
-                                node: removed,
-                            },
-                        );
-                    }
-                }
-                changed = true;
-            }
-        }
-        if let Some(slot) = target.tree_mut().virtual_slot_mut(node) {
-            slot.mounted.retain(|(index, _)| range.contains(index));
-        }
-        // 挂载
-        for index in range {
-            let exists = target
-                .tree()
-                .virtual_slot(node)
-                .is_some_and(|slot| slot.mounted.iter().any(|(mounted, _)| *mounted == index));
-            if exists {
-                continue;
-            }
-            let Some(mut builder) = target
-                .tree_mut()
-                .virtual_slot_mut(node)
-                .and_then(|slot| slot.builder.take())
-            else {
-                break;
-            };
-            let built = builder(index).build(target.tree_mut(), node);
-            if let Some(slot) = target.tree_mut().virtual_slot_mut(node) {
-                slot.builder = Some(builder);
-            }
-            let Ok(row) = built else {
-                break;
-            };
-            target
-                .tree_mut()
-                .set_virtual_row(row, index as f32 * extent, extent);
-            if let Some(slot) = target.tree_mut().virtual_slot_mut(node) {
-                slot.mounted.push((index, row));
-            }
-            changed = true;
-        }
-        // 内容尺寸 + 结构脏位
-        if let Some(slot) = target.tree_mut().scroll_slot_mut(node) {
-            slot.content = Size::new(viewport.width, count as f32 * extent);
-        }
-        if changed {
-            target.tree_mut().mark_structure(node);
-            self.request_frame();
-        }
+        virtual_list::rewindow_virtual(self, window, node)
     }
-
-    // ── P10：浮层 ──────────────────────────────────────────────────────────────
 
     /// 打开一个浮层（root 的最后一个子节点 ⇒ `order` 末尾 ⇒ 命中优先）。
     ///
@@ -2066,32 +985,12 @@ impl App {
         window: WindowId,
         options: OverlayOptions,
     ) -> Result<Overlay, EngineError> {
-        let Some(target) = self.windows.get_mut(&window) else {
-            return Err(EngineError::UnknownWindow { window });
-        };
-        let root = target.tree().root();
-        // 新建时还不知道浮层尺寸：`Above` / `Left` 首帧先按零尺寸定位，布局之后由
-        // resolve_overlay_placements 用实测尺寸纠正（P2-6）。
-        let origin = interaction::resolve_placement(target.tree(), options.placement, Size::ZERO);
-        let style = overlay_style(origin);
-        let node = NodeBuilder::boxed()
-            .style(style)
-            .build(target.tree_mut(), root)?;
-        if let Some(slot) = target.tree_mut().ensure_interaction(node) {
-            slot.overlay = Some(OverlaySlot {
-                dismiss: options.dismiss,
-                placement: options.placement,
-            });
-        }
-        #[cfg(feature = "hud")]
-        self.raise_debug_hud(window);
-        self.request_frame();
-        Ok(Overlay::new(window, node))
+        overlay::create_overlay(self, window, options)
     }
 
     /// 关闭浮层（节点不存在 ⇒ `false`）。
     pub fn close_overlay(&mut self, overlay: &Overlay) -> bool {
-        self.remove_node(overlay.window(), overlay.node())
+        overlay::close_overlay(self, overlay)
     }
 
     /// 帧首按**上一帧布局的实测尺寸**重新求值锚点定位（P2-6）。
@@ -2103,192 +1002,49 @@ impl App {
     /// **不能放在布局之后**：布局之后写 inset 会被 `settle_frame` 的「本轮已布局」判定吞掉
     /// `LAYOUT` 位，下一帧变 `Idle`，位置永远不生效（P1-2.2 的陷阱）。
     fn resolve_overlay_placements(&mut self, window: WindowId) {
-        let Some(target) = self.windows.get_mut(&window) else {
-            return;
-        };
-        let root = target.tree().root();
-        let children = target.tree().get(root).map_or_else(
-            |_| smallvec::SmallVec::<[NodeId; 4]>::new(),
-            |node| node.children().iter().copied().collect(),
-        );
-        let mut moved = false;
-        for node in children {
-            let Some(slot) = target.tree().overlay_slot(node) else {
-                continue;
-            };
-            if !matches!(slot.placement, OverlayPlacement::Anchor { .. }) {
-                continue;
-            }
-            let size = target
-                .tree()
-                .get(node)
-                .map_or(Size::ZERO, |target| target.layout().bounds.size);
-            let origin = interaction::resolve_placement(target.tree(), slot.placement, size);
-            let current = target
-                .tree()
-                .get(node)
-                .map_or(Rect::default(), |target| target.layout().bounds);
-            if (current.origin.x - origin.x).abs() < 0.5
-                && (current.origin.y - origin.y).abs() < 0.5
-            {
-                continue;
-            }
-            let _ = target.tree_mut().set_absolute_inset(node, origin);
-            moved = true;
-        }
-        // 纠位写回会弄脏布局，必须再调度一帧让它生效：否则第一帧按「零尺寸」定位后，
-        // 泵在没有后续输入时会直接阻塞，`Above` / `Left` 浮层永久盖住锚点（复审发现）。
-        // 收敛条件在上面（< 0.5 px 早退），所以最多多出两帧。
-        if moved {
-            self.request_frame();
-        }
+        overlay::resolve_overlay_placements(self, window)
     }
 
     /// 重新定位浮层（相对根的逻辑像素点）。
     pub fn place_overlay(&mut self, overlay: &Overlay, placement: OverlayPlacement) -> bool {
-        let window = overlay.window();
-        let node = overlay.node();
-        let Some(target) = self.windows.get_mut(&window) else {
-            return false;
-        };
-        let size = target
-            .tree()
-            .get(node)
-            .map_or(Size::ZERO, |target| target.layout().bounds.size);
-        let origin = interaction::resolve_placement(target.tree(), placement, size);
-        if !target.tree_mut().set_absolute_inset(node, origin) {
-            return false;
-        }
-        if let Some(slot) = target.tree_mut().ensure_interaction(node) {
-            slot.overlay = slot.overlay.map(|overlay| OverlaySlot {
-                placement,
-                ..overlay
-            });
-        }
-        self.request_frame();
-        true
+        overlay::place_overlay(self, overlay, placement)
     }
 
     /// 把浮层提到最上层（重挂到 root 末尾）。
     pub fn bring_overlay_to_front(&mut self, overlay: &Overlay) -> bool {
-        let window = overlay.window();
-        let node = overlay.node();
-        let Some(target) = self.windows.get_mut(&window) else {
-            return false;
-        };
-        let root = target.tree().root();
-        if target.tree_mut().append_child(root, node).is_err() {
-            return false;
-        }
-        #[cfg(feature = "hud")]
-        self.raise_debug_hud(window);
-        self.request_frame();
-        true
+        overlay::bring_overlay_to_front(self, overlay)
     }
 
     /// 当前窗口的浮层（自下而上）。
     pub fn overlays(&self, window: WindowId) -> Vec<(NodeId, OverlayDismiss)> {
-        let Some(target) = self.windows.get(&window) else {
-            return Vec::new();
-        };
-        let tree = target.tree();
-        let Ok(root) = tree.get(tree.root()) else {
-            return Vec::new();
-        };
-        root.children()
-            .iter()
-            .filter_map(|child| tree.overlay_slot(*child).map(|slot| (*child, slot.dismiss)))
-            .collect()
+        overlay::overlays(self, window)
     }
 
     /// `Dismiss` 动作：关掉最上层浮层（含 `Explicit`）。
     fn dismiss_overlay(&mut self, window: WindowId) -> bool {
-        let node = self.windows.get(&window).and_then(|target| {
-            let tree = target.tree();
-            overlay_util::topmost(tree, tree.root()).map(|(node, _)| node)
-        });
-        match node {
-            Some(node) => self.remove_node(window, node),
-            None => false,
-        }
+        overlay::dismiss_overlay(self, window)
     }
 
     fn remove_node(&mut self, window: WindowId, node: NodeId) -> bool {
-        let Some(target) = self.windows.get_mut(&window) else {
-            return false;
-        };
-        // 卸载子树必须同步解开依赖边（P1-2.5）：`NodeTree::remove` 把被删节点的 deps 交还，
-        // 这里逐条 detach。否则死边会随「挂载/卸载」次数无界累积，而 `App::write` 是最高频
-        // 热路径 —— 成本会从 O(活跃读者) 退化成 O(历史挂载过的所有读者)。
-        let removed = match target.tree_mut().remove(node) {
-            Ok(detached) => {
-                for (node, deps) in detached {
-                    for signal in deps {
-                        self.graph.detach(signal, Owner::Node { window, node });
-                    }
-                }
-                true
-            }
-            Err(_) => false,
-        };
-        if removed {
-            self.request_frame();
-        }
-        removed
+        window_set::remove_node(self, window, node)
     }
-
-    // ── P10：拖拽 ──────────────────────────────────────────────────────────────
 
     /// 当前拖拽会话。
     #[must_use]
     pub fn drag_state(&self, window: WindowId) -> Option<DragState> {
-        let target = self.windows.get(&window)?;
-        let session = target.pointer().drag.as_ref()?;
-        Some(DragState::new(window, session.node))
+        input::drag_state(self, window)
     }
 
     /// 拖拽的只读快照。
     #[must_use]
     pub fn drag(&self, state: &DragState) -> Option<DragInfo> {
-        let target = self.windows.get(&state.window())?;
-        let session = target.pointer().drag.as_ref()?;
-        if session.node != state.node() {
-            return None;
-        }
-        Some(DragInfo {
-            origin: session.origin,
-            current: session.current,
-            delta: session.delta(),
-            phase: session.phase,
-        })
+        input::drag(self, state)
     }
 
     /// 取消拖拽（派发 `Cancel` 阶段并释放捕获）。
     pub fn cancel_drag(&mut self, state: &DragState) -> bool {
-        let window = state.window();
-        let session = self
-            .windows
-            .get_mut(&window)
-            .and_then(|target| target.pointer_mut().end_drag());
-        let Some(session) = session else {
-            return false;
-        };
-        self.capture_request = Some((window, false));
-        let delta = session.delta();
-        let action = session.action;
-        self.dispatch_action(
-            window,
-            session.node,
-            action,
-            ActionSource::Drag {
-                phase: DragPhase::Cancel,
-                delta,
-            },
-        );
-        true
+        input::cancel_drag(self, state)
     }
-
-    // ── P10：动画 ──────────────────────────────────────────────────────────────
 
     /// 注册一个动画（起点 = 目标瞬态值的当前值；同目标已有动画 ⇒ 替换）。
     ///
@@ -2303,172 +1059,53 @@ impl App {
         nodes: &[NodeId],
         spec: AnimationSpec,
     ) -> Result<AnimationId, EngineError> {
-        if !self.windows.contains_key(&window) {
-            return Err(EngineError::UnknownWindow { window });
-        }
-        let id = self.next_animation;
-        self.next_animation = self.next_animation.wrapping_add(1);
-        let target = match value {
-            AnimatedValue::Scalar { target, to } => {
-                let from = self
-                    .store
-                    .transient_ref::<f32>(target.id())
-                    .copied()
-                    .unwrap_or(0.0);
-                if spec.duration.is_zero() {
-                    self.store.set_transient(target.id(), to);
-                    self.mark_nodes_paint(window, nodes);
-                    self.request_frame();
-                    return Ok(AnimationId::new(window, id));
-                }
-                AnimationTarget::Scalar {
-                    transient: target,
-                    from,
-                    to,
-                }
-            }
-            AnimatedValue::Color { target, to } => {
-                let from = self
-                    .store
-                    .transient_ref::<Color>(target.id())
-                    .copied()
-                    .unwrap_or(Color::TRANSPARENT);
-                if spec.duration.is_zero() {
-                    self.store.set_transient(target.id(), to);
-                    self.mark_nodes_paint(window, nodes);
-                    self.request_frame();
-                    return Ok(AnimationId::new(window, id));
-                }
-                AnimationTarget::Color {
-                    transient: target,
-                    from,
-                    to,
-                }
-            }
-        };
-        // 同一目标重定向：旧槽必须让位（否则两条插值同时写同一个瞬态值 ⇒ 回弹/抖动）。
-        self.animations
-            .retain(|slot| !slot.target.same_target(&target));
-        self.animations.push(AnimationSlot {
-            id,
-            window,
-            target,
-            start: self.clock,
-            duration: spec.duration,
-            easing: spec.easing,
-            nodes: nodes.to_vec(),
-        });
-        self.request_frame();
-        Ok(AnimationId::new(window, id))
+        animation::animate(self, window, value, nodes, spec)
     }
 
     /// 取消动画（幂等）。
     pub fn cancel_animation(&mut self, id: &AnimationId) -> bool {
-        let before = self.animations.len();
-        self.animations
-            .retain(|slot| !(slot.window == id.window() && slot.id == id.generation()));
-        self.animations.len() != before
+        animation::cancel_animation(self, id)
     }
 
     /// 该窗口是否还有未完成的动画。
     #[must_use]
     pub fn animations_running(&self, window: WindowId) -> bool {
-        self.animations.iter().any(|slot| slot.window == window)
+        animation::animations_running(self, window)
     }
 
     /// 全部窗口是否还有未完成的动画（平台泵用它决定 `SetTimer(1)` / `KillTimer`）。
     pub(crate) fn has_animations(&self) -> bool {
-        !self.animations.is_empty()
+        animation::has_animations(self)
     }
 
     /// 平台是否需要持续出帧：动画，或任一窗口的 Debug HUD 可见。
     pub(crate) fn needs_continuous_frames(&self) -> bool {
-        #[cfg(feature = "hud")]
-        {
-            self.has_animations()
-                || self.debug_hud.iter().any(|(window, state)| {
-                    self.windows
-                        .get(window)
-                        .is_some_and(|target| target.tree().get(state.root()).is_ok())
-                })
-        }
-        #[cfg(not(feature = "hud"))]
-        {
-            self.has_animations()
-        }
+        animation::needs_continuous_frames(self)
     }
 
     fn mark_nodes_paint(&mut self, window: WindowId, nodes: &[NodeId]) {
-        if let Some(target) = self.windows.get_mut(&window) {
-            for node in nodes {
-                target.tree_mut().mark_paint(*node);
-            }
-        }
+        animation::mark_nodes_paint(self, window, nodes)
     }
 
     /// 推进本窗口的动画（`App::frame` 在帧门禁**之前**调用）。
     fn tick_animations(&mut self, window: WindowId) {
-        if !self.animations_running(window) {
-            return;
-        }
-        let now = self.clock;
-        let slots = std::mem::take(&mut self.animations);
-        let mut keep = Vec::with_capacity(slots.len());
-        for slot in slots {
-            if slot.window != window {
-                keep.push(slot);
-                continue;
-            }
-            let t = anim::progress(now.saturating_duration_since(slot.start), slot.duration);
-            let eased = slot.easing.sample(t);
-            match &slot.target {
-                AnimationTarget::Scalar {
-                    transient,
-                    from,
-                    to,
-                } => {
-                    self.store
-                        .set_transient(transient.id(), anim::lerp(*from, *to, eased));
-                }
-                AnimationTarget::Color {
-                    transient,
-                    from,
-                    to,
-                } => {
-                    self.store
-                        .set_transient(transient.id(), anim::lerp_color(*from, *to, eased));
-                }
-                AnimationTarget::Scroll { handle, from, to } => {
-                    let point = anim::lerp_point(*from, *to, eased);
-                    let _ = self.scroll_to(handle, point);
-                }
-            }
-            for node in &slot.nodes {
-                if let Some(target) = self.windows.get_mut(&window) {
-                    target.tree_mut().mark_paint(*node);
-                }
-            }
-            if t < 1.0 {
-                keep.push(slot);
-            }
-        }
-        self.animations = keep;
+        animation::tick_animations(self, window)
     }
 
     /// 把引擎时钟推进到真实时间（平台泵每轮一次；测试用 `TestApp::advance`）。
     pub(crate) fn sync_clock(&mut self) {
-        self.clock = Instant::now();
+        animation::sync_clock(self)
     }
 
     /// 推进测试时钟（`TestApp::advance` 的唯一实现；只在测试构建里存在）。
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn advance_clock(&mut self, by: Duration) {
-        self.clock += by;
+        animation::advance_clock(self, by)
     }
 
     /// 取走待推给平台的光标变化（**带窗口 id**：光标是每窗口状态）。
     pub(crate) fn take_cursor_change(&mut self) -> Option<(WindowId, Cursor)> {
-        self.cursor_pending.take()
+        input::take_cursor_change(self)
     }
 
     /// 取走待推给平台的捕获请求（`(窗口, true)` = 取得、`(窗口, false)` = 释放）。
@@ -2476,7 +1113,7 @@ impl App {
     /// 必须带窗口 id：`SetCapture` 是**每窗口**状态，固定发给首窗会让非首窗的拖拽拿不到
     /// 捕获，鼠标移出窗口后松手就丢 `WM_LBUTTONUP`，会话永久卡在「按住」（复审 P1-3）。
     pub(crate) fn take_capture_request(&mut self) -> Option<(WindowId, bool)> {
-        self.capture_request.take()
+        input::take_capture_request(self)
     }
 
     /// 本窗口的 IME 目标状态（Windows 平台泵每轮读它与已应用状态比较，P2-7）。
@@ -2485,29 +1122,24 @@ impl App {
     /// 没有读取方（也就不会出现 dead_code 警告）。
     #[cfg(target_os = "windows")]
     pub(crate) fn ime_enabled(&self, window: WindowId) -> bool {
-        !self.ime_disabled.contains(&window)
+        focus::ime_enabled(self, window)
     }
-
-    // ── 窗口 ──────────────────────────────────────────────────────────────────
 
     /// 建一个窗口（headless：只建树与空场景）。`WindowId` 从 **1** 起单调 +1、永不复用
     /// （0 保留为非法句柄，见 `WindowId::from_raw`）。
     pub fn create_window(&mut self, options: WindowOptions) -> WindowId {
-        let id = WindowId::from_raw(self.next_window_id);
-        self.next_window_id = self.next_window_id.wrapping_add(1);
-        self.windows.insert(id, Window::new(id, options));
-        id
+        window_set::create_window(self, options)
     }
 
     /// 只读窗口。
     #[must_use]
     pub fn window(&self, id: WindowId) -> Option<&Window> {
-        self.windows.get(&id)
+        window_set::window(self, id)
     }
 
     /// 可写窗口（应用层建树的入口）。
     pub fn window_mut(&mut self, id: WindowId) -> Option<&mut Window> {
-        self.windows.get_mut(&id)
+        window_set::window_mut(self, id)
     }
 
     /// 注册窗口的「关闭前」处理器：返回 `false` 拦下关闭（P2-8）。
@@ -2515,10 +1147,7 @@ impl App {
     /// 平台在用户点 X / Cmd-W 时先调用它；应用可在此保存未提交状态、弹确认框。
     /// 窗口不存在时**忽略**注册（否则会留下一个永远不会被调用、却持有应用闭包的条目）。
     pub fn on_close(&mut self, id: WindowId, handler: impl FnMut(&mut Self) -> bool + 'static) {
-        if !self.windows.contains_key(&id) {
-            return;
-        }
-        self.close_handlers.insert(id, Box::new(handler));
+        window_set::on_close(self, id, handler)
     }
 
     /// 平台关闭路径：先问关闭前处理器，允许才关。返回 `true` = 窗口已关闭。
@@ -2526,26 +1155,7 @@ impl App {
     /// 处理器用「取出 → 调用 → 放回」的方式调用（与 a11y handler 同一做法）：它需要
     /// `&mut App`，不能在使用 `self.close_handlers` 的借用期内存活。
     pub(crate) fn request_close(&mut self, id: WindowId) -> bool {
-        let Some(mut handler) = self.close_handlers.remove(&id) else {
-            return self.close_window(id);
-        };
-        let allow = handler(self);
-        // 放回的两条判据：
-        // - 处理器里可能已经把窗口关了（自己调用 `close_window`）⇒ 不要再放回；
-        // - 处理器里可能**重新注册**了新的处理器 ⇒ 不能拿旧闭包覆盖它。
-        if self.windows.contains_key(&id) && !self.close_handlers.contains_key(&id) {
-            self.close_handlers.insert(id, handler);
-        }
-        if !allow {
-            return false;
-        }
-        self.close_handlers.remove(&id);
-        // 处理器可能**自己**已经关掉了窗口：`close_window` 返回 false 但「窗口已关闭」
-        // 正是 `true` 的语义，不能把它当「被拦下」（复审 F8）。
-        let existed = self.windows.contains_key(&id);
-        self.close_window(id);
-        // 自己关掉（原本存在、现在没了）也算关闭成功。
-        existed
+        window_set::request_close(self, id)
     }
 
     /// 关窗：精确退订该窗口全部节点的依赖，然后丢弃。返回 `false` = 窗口不存在。
@@ -2553,37 +1163,7 @@ impl App {
     /// 同时清理所有按窗口的旁表（关闭处理器 / a11y 限流戳 / scale epoch / 动画槽），
     /// 否则 create/close 循环下这些表会无界增长。
     pub fn close_window(&mut self, id: WindowId) -> bool {
-        // 按窗口的旁表必须一并清掉，否则 create/close 循环下无界增长 —— 尤其是
-        // `close_handlers`：它持有应用闭包（可能捕获大量状态）。`WindowId` 单调不复用，
-        // 所以不会串用，但泄漏是真实的（复审发现：早期提交声称清了，实际没清）。
-        self.close_handlers.remove(&id);
-        self.a11y_delivered.remove(&id);
-        self.scale_epochs.remove(&id);
-        // 平台 IME 目标状态：窗口没了就没有「已应用状态」可对齐，留着只会在 create/close
-        // 循环下无界增长（WindowId 不复用，不会串到新窗口）。
-        self.ime_disabled.remove(&id);
-        // 动画槽引用窗口内的节点与瞬态值：窗口关闭时必须一并清掉（否则 `SetTimer` 永不停）。
-        self.animations.retain(|slot| slot.window != id);
-        #[cfg(feature = "hud")]
-        self.debug_hud.remove(&id);
-        self.last_click = self.last_click.filter(|record| record.window != id);
-        let Some(window) = self.windows.remove(&id) else {
-            return false;
-        };
-        for node in window.tree().order() {
-            if let Some(deps) = window.tree().deps(*node) {
-                for signal in deps {
-                    self.graph.detach(
-                        *signal,
-                        Owner::Node {
-                            window: id,
-                            node: *node,
-                        },
-                    );
-                }
-            }
-        }
-        true
+        window_set::close_window(self, id)
     }
 
     /// 请求一次 Linux 客户端装饰的窗口控制（自绘标题栏专用）。
@@ -2600,21 +1180,7 @@ impl App {
         window: WindowId,
         control: crate::window::WindowControl,
     ) -> Result<(), EngineError> {
-        let Some(target) = self.windows.get_mut(&window) else {
-            return Err(EngineError::UnknownWindow { window });
-        };
-        if matches!(
-            control,
-            crate::window::WindowControl::BeginMove | crate::window::WindowControl::BeginResize(_)
-        ) {
-            // 移动/缩放一旦交给 compositor，客户端就收不到后续指针抬起：主动结束本地拖拽
-            // 会话，避免下一次移动被误当成标题栏/边框拖拽。
-            target.pointer_mut().end_drag();
-            target.pointer_mut().press = None;
-            self.capture_request = Some((window, false));
-        }
-        self.window_control = Some((window, control));
-        Ok(())
+        window_set::request_window_control(self, window, control)
     }
 
     /// 取走待执行的窗口控制请求（Wayland 事件循环的唯一读点）。
@@ -2622,7 +1188,7 @@ impl App {
     pub(crate) fn take_window_control(
         &mut self,
     ) -> Option<(WindowId, crate::window::WindowControl)> {
-        self.window_control.take()
+        window_set::take_window_control(self)
     }
 
     /// 遍历全部窗口（顺序不保证）并带出 `WindowId`。
@@ -2630,7 +1196,7 @@ impl App {
     /// 带上 id 是必要的：帧是**按窗口**推进的（`refresh_styles(window)` / P06 的 paint），只有 `&Window`
     /// 拿不到「这是哪个窗口」（消费者：P09 的帧驱动、测试）。
     pub fn windows(&self) -> impl Iterator<Item = (WindowId, &Window)> {
-        self.windows.iter().map(|(id, window)| (*id, window))
+        window_set::windows(self)
     }
 
     /// 显示或隐藏内置 Debug HUD（P17；需要 `hud` feature）。
@@ -2644,91 +1210,33 @@ impl App {
     /// 且不会留下半棵 HUD 子树。
     #[cfg(feature = "hud")]
     pub fn set_debug_hud(&mut self, window: WindowId, enabled: bool) -> Result<(), EngineError> {
-        if !self.windows.contains_key(&window) {
-            return Err(EngineError::UnknownWindow { window });
-        }
-        let mut changed = false;
-        if enabled {
-            if let Some(root) = self.debug_hud.get(&window).map(DebugHudState::root) {
-                // 外部若删掉了 HUD 子树，map 里的句柄会陈旧；重新安装而不是假装成功。
-                let valid = self
-                    .windows
-                    .get(&window)
-                    .is_some_and(|target| target.tree().get(root).is_ok());
-                if valid {
-                    return Ok(());
-                }
-                self.debug_hud.remove(&window);
-            }
-            let Some(target) = self.windows.get_mut(&window) else {
-                return Err(EngineError::UnknownWindow { window });
-            };
-            let state = debug_hud::install(target, self.clock)?;
-            self.debug_hud.insert(window, state);
-            changed = true;
-        } else if let Some(state) = self.debug_hud.remove(&window) {
-            self.remove_node(window, state.root());
-            changed = true;
-        }
-        if changed {
-            self.request_frame();
-        }
-        Ok(())
+        debug::set_debug_hud(self, window, enabled)
     }
 
     /// 该窗口是否安装了 Debug HUD（未知窗口返回 `false`）。
     #[cfg(feature = "hud")]
     #[must_use]
     pub fn debug_hud_enabled(&self, window: WindowId) -> bool {
-        let Some(state) = self.debug_hud.get(&window) else {
-            return false;
-        };
-        self.windows
-            .get(&window)
-            .is_some_and(|target| target.tree().get(state.root()).is_ok())
+        debug::debug_hud_enabled(self, window)
     }
 
     /// 帧门禁前更新 HUD 的采样/文本暂存，并请求 HUD damage。
     #[cfg(feature = "hud")]
     fn prepare_debug_hud(&mut self, window: WindowId) {
-        let now = self.clock;
-        let Some(state) = self.debug_hud.get_mut(&window) else {
-            return;
-        };
-        let Some(target) = self.windows.get_mut(&window) else {
-            return;
-        };
-        debug_hud::prepare_frame(state, target, now);
+        debug::prepare_debug_hud(self, window)
     }
 
     /// `refresh_styles` 之后、`refresh_text` 之前写入 HUD 文本。
     #[cfg(feature = "hud")]
     fn apply_debug_hud(&mut self, window: WindowId) {
-        let Some(state) = self.debug_hud.get_mut(&window) else {
-            return;
-        };
-        let Some(target) = self.windows.get_mut(&window) else {
-            return;
-        };
-        debug_hud::apply_frame(state, target);
+        debug::apply_debug_hud(self, window)
     }
 
     /// 新 overlay 会 append 到 root 末尾；HUD 必须保持在最上层。
     #[cfg(feature = "hud")]
     fn raise_debug_hud(&mut self, window: WindowId) {
-        let Some(state) = self.debug_hud.get(&window) else {
-            return;
-        };
-        let hud = state.root();
-        let Some(target) = self.windows.get_mut(&window) else {
-            return;
-        };
-        let tree = target.tree_mut();
-        let root = tree.root();
-        let _ = tree.append_child(root, hud);
+        debug::raise_debug_hud(self, window)
     }
-
-    // ── 帧内：样式求值 pass ────────────────────────────────────────────────────
 
     /// P03 的「样式求值 pass」：对指定窗口中**带 `PAINT` 且有 `bind_style`** 的节点求值。
     ///
@@ -2738,159 +1246,8 @@ impl App {
     /// 返回 `None` = 窗口不存在（P03 的冻结错误表里没有「未知窗口」变体，`Option` 是唯一诚实的表达）。
     /// P11 追加：`bind_a11y` 与另两条动态通道同批求值（同一 `ReadCtx` / `ReadTracker` / 依赖边集）。
     pub fn refresh_styles(&mut self, window: WindowId) -> Option<StylePassReport> {
-        let Self {
-            store,
-            graph,
-            windows,
-            eval_stack,
-            wake_requested,
-            ..
-        } = self;
-        // P11：本 pass 会求值全部 `bind_a11y`，旗标在这里消费。
-        if let Some(target) = windows.get_mut(&window) {
-            target.a11y_clear_bind_work();
-        }
-        let window_state = windows.get_mut(&window)?;
-        let tree = window_state.tree_mut();
-        debug_assert!(eval_stack.is_empty(), "上一帧的派生求值栈泄漏");
-        eval_stack.clear();
-
-        let mut evaluated = 0usize;
-        let mut text_evaluated = 0usize;
-        let mut text_changed = 0usize;
-        let mut index = 0usize;
-        while index < tree.order().len() {
-            let node = tree.order()[index];
-            index += 1;
-
-            let needs_eval = tree.get(node).is_ok_and(|n| {
-                n.dirty().contains(DirtyFlags::PAINT)
-                    // 只有 `bind_a11y` 的节点没有 PAINT（写信号只标 A11Y），但补丁仍要重算。
-                    || (n.dirty().contains(DirtyFlags::A11Y) && tree.has_a11y_bind(node))
-            });
-            if !needs_eval {
-                continue;
-            }
-            let old_patch = tree
-                .get(node)
-                .map_or_else(|_| StylePatch::default(), |n| n.style_patch().clone());
-            let compute = tree.take_bind_style(node);
-            let bind_text = tree.take_bind_text(node);
-            let bind_a11y = tree.take_bind_a11y(node);
-            if compute.is_none() && bind_text.is_none() && bind_a11y.is_none() {
-                // 闭包不见了 ⇒ 上次求值 **panic** 后没放回（`build` 之后必然有闭包）。
-                // 那次 pass 在 `replace_deps` 之前就中断了，所以节点仍带着**上一次成功的** deps：
-                // 它们是「幽灵边」—— 节点已不会再求值，但写这些信号仍会把它标脏。
-                // 这里显式退订，把状态收敛成「静态节点」。
-                let ghost_deps = tree.deps(node).unwrap_or(&[]);
-                graph.replace_deps(Owner::Node { window, node }, ghost_deps, &[]);
-                tree.set_deps(node, SmallVec::new());
-                tree.clear_paint(node);
-                continue;
-            }
-
-            let (values, derived) = store.split();
-            let mut tracker = ReadTracker::new();
-            // 作用域块结束即释放 `ReadCtx` 的借用（`ReadCtx` 不是 `Drop` 类型，不能用 `drop`）。
-            let (patch, text_value, a11y_value, owner) = {
-                let mut ctx = ReadCtx::new(
-                    values,
-                    derived,
-                    graph,
-                    &mut tracker,
-                    &mut *eval_stack,
-                    Owner::Node { window, node },
-                );
-                let patch = compute
-                    .as_ref()
-                    .map_or_else(StylePatch::default, |compute| compute(&mut ctx));
-                let text_value = bind_text.as_ref().map(|bind| bind(&mut ctx));
-                let a11y_value = bind_a11y
-                    .as_ref()
-                    .map_or_else(crate::a11y::A11yPatch::default, |bind| bind(&mut ctx));
-                (patch, text_value, a11y_value, ctx.owner())
-            };
-            if compute.is_some() {
-                evaluated += 1;
-            }
-            if text_value.is_some() {
-                text_evaluated += 1;
-            }
-
-            let old_deps = tree.deps(node).unwrap_or(&[]);
-            graph.replace_deps(owner, old_deps, tracker.as_slice());
-            tree.set_deps(node, tracker.into_inner());
-
-            if let Some(compute) = compute {
-                let layout_changed = patch.affects_layout || old_patch.affects_layout;
-                let a11y_changed = patch.interactive != old_patch.interactive
-                    || patch.visible != old_patch.visible;
-                tree.set_style_patch(node, patch);
-                tree.put_bind_style(node, compute);
-                if layout_changed {
-                    tree.mark_layout(node);
-                }
-                if a11y_changed {
-                    tree.mark_a11y(node);
-                }
-            }
-            let mut text_changed_here = false;
-            if let Some(bind) = bind_text {
-                tree.put_bind_text(node, bind);
-            }
-            if let Some(value) = text_value {
-                let style = tree
-                    .text_content(node)
-                    .map_or_else(TextStyle::default, |content| content.style.clone());
-                let changed = tree
-                    .text_content(node)
-                    .is_none_or(|content| content.text != value);
-                if changed {
-                    // 只换 text/style，**保留** inline_boxes（N1 回归）。
-                    let mut content = tree
-                        .text_content(node)
-                        .cloned()
-                        .unwrap_or_else(|| TextContent::new(value.clone(), style.clone()));
-                    content.text = value;
-                    content.style = style;
-                    tree.set_text_content(node, content);
-                    text_changed += 1;
-                    text_changed_here = true;
-                }
-            }
-            // P11：`bind_a11y` 的差分与写回（与 `bind_style` 同一个依赖集，见方法文档）。
-            if let Some(bind) = bind_a11y {
-                let previous = tree
-                    .a11y_of(node)
-                    .map_or_else(crate::a11y::A11yPatch::default, |slot| slot.patch.clone());
-                if a11y_value != previous {
-                    tree.set_a11y_patch(node, a11y_value);
-                    // 只标 `A11Y`：不产生视觉 damage、不清 `REUSABLE`（P03 §9.3 表第 9 行）。
-                    tree.mark_a11y(node);
-                }
-                tree.put_bind_a11y(node, bind);
-            }
-            tree.clear_paint(node);
-            if text_changed_here {
-                // 文本变了 ⇒ 必须重画（PAINT 不能被本 pass 的「消费」吞掉）。
-                tree.mark_paint(node);
-                // 文本节点的可访问名/值就是文本内容：内容变了 a11y 必须重发。只标 PAINT 时，
-                // 新字符串与旧串度量相同（例如 "70%" → "80%"）不会触发 LAYOUT，AT 会读到旧值。
-                tree.mark_a11y(node);
-            }
-        }
-
-        Some(StylePassReport {
-            evaluated,
-            layout_dirty: tree.any_node(|n| n.dirty().contains(DirtyFlags::LAYOUT)),
-            paint_dirty: tree.any_node(|n| !n.dirty().contains(DirtyFlags::REUSABLE)),
-            wake_requested: *wake_requested,
-            text_evaluated,
-            text_changed,
-        })
+        style_pass::refresh_styles(self, window)
     }
-
-    // ── P11：无障碍（动作 / 诊断 / 交付） ──────────────────────────────────
 
     /// 注册 a11y 动作的处理器（同 `A11yAction` 后写覆盖）。
     ///
@@ -2902,43 +1259,28 @@ impl App {
         action: crate::a11y::A11yAction,
         handler: impl FnMut(&mut crate::a11y::A11yActionCtx<'_>) + 'static,
     ) -> bool {
-        if action == crate::a11y::A11yAction::Click {
-            return false;
-        }
-        self.a11y_handlers.insert(action, Box::new(handler));
-        true
+        a11y::on_a11y_action(self, action, handler)
     }
 
     /// 删除 a11y 动作的处理器（返回是否真的删了）。
     pub fn off_a11y_action(&mut self, action: crate::a11y::A11yAction) -> bool {
-        self.a11y_handlers.remove(&action).is_some()
+        a11y::off_a11y_action(self, action)
     }
 
     /// a11y 诊断（与 `text_diagnostics` 同型；上限 `A11Y_DIAGNOSTIC_CAPACITY`，超出丢最旧）。
     #[must_use]
     pub fn a11y_diagnostics(&self) -> &[crate::a11y::A11yDiagnostic] {
-        &self.a11y_diagnostics
+        a11y::a11y_diagnostics(self)
     }
 
     /// 记录一条 a11y 诊断（唯一入口：计数与容量在这里统一）。
     pub(crate) fn a11y_note(&mut self, diagnostic: crate::a11y::A11yDiagnostic) {
-        // 去重：同一诊断会在**每次** a11y 交付里重复产生（例如同一个缺标签的交互节点）。
-        // 旧实现每条都 push，64 槽环形缓冲很快被同一个问题的重复项占满，把真正的新问题挤出去，
-        // 而且已经修好的旧诊断会长期残留（复审 P3-5）。
-        if self.a11y_diagnostics.contains(&diagnostic) {
-            return;
-        }
-        if self.a11y_diagnostics.len() >= A11Y_DIAGNOSTIC_CAPACITY {
-            // 容量固定为 64：这里的一次 memmove 有界，不值得为它引入 VecDeque
-            // （公开访问器返回 `&[A11yDiagnostic]`）。
-            self.a11y_diagnostics.remove(0);
-        }
-        self.a11y_diagnostics.push(diagnostic);
+        a11y::a11y_note(self, diagnostic)
     }
 
     /// 该动作是否注册了 handler（`a11y::action` 的分派判据）。
     pub(crate) fn a11y_has_handler(&self, action: crate::a11y::A11yAction) -> bool {
-        self.a11y_handlers.contains_key(&action)
+        a11y::a11y_has_handler(self, action)
     }
 
     /// 摘出 handler（借用纪律：调用期间它不在表里）。
@@ -2946,7 +1288,7 @@ impl App {
         &mut self,
         action: crate::a11y::A11yAction,
     ) -> Option<Box<dyn FnMut(&mut crate::a11y::A11yActionCtx<'_>)>> {
-        self.a11y_handlers.remove(&action)
+        a11y::a11y_take_handler(self, action)
     }
 
     /// 放回 handler。
@@ -2955,18 +1297,13 @@ impl App {
         action: crate::a11y::A11yAction,
         handler: Box<dyn FnMut(&mut crate::a11y::A11yActionCtx<'_>)>,
     ) {
-        self.a11y_handlers.insert(action, handler);
+        a11y::a11y_put_handler(self, action, handler)
     }
 
     /// 该窗口本轮是否有 a11y 工作（O(1)；平台泵每轮用它过滤 `update_if_active`）。
     #[must_use]
     pub(crate) fn a11y_pending(&self, window: WindowId) -> bool {
-        let dirty = self.windows.get(&window).is_some_and(Window::a11y_pending);
-        dirty
-            && self
-                .a11y_delivered
-                .get(&window)
-                .is_none_or(|last| self.clock.saturating_duration_since(*last) >= A11Y_THROTTLE)
+        a11y::a11y_pending(self, window)
     }
 
     /// 是否有窗口「a11y 脏但正被限流」——平台泵据此安排**到期补发**唤醒。
@@ -2974,13 +1311,7 @@ impl App {
     /// 没有这条，被限流挡下的最后一次变化永远不会交付：脏位留着，但没有任何机制在
     /// `A11Y_THROTTLE` 之后把泵叫醒（复审 P1-4）。
     pub(crate) fn a11y_retry_pending(&self) -> bool {
-        self.windows.keys().any(|window| {
-            self.windows.get(window).is_some_and(Window::a11y_pending)
-                && self
-                    .a11y_delivered
-                    .get(window)
-                    .is_some_and(|last| self.clock.saturating_duration_since(*last) < A11Y_THROTTLE)
-        })
+        a11y::a11y_retry_pending(self)
     }
 
     /// 产出一笔 a11y 交付（消费 `A11Y|ORDER` 位与 `full_pending`）。
@@ -2988,26 +1319,13 @@ impl App {
     /// **必须在 `accesskit_windows::Adapter::update_if_active` 的闭包里调用**（adapter 不活跃时
     /// 闭包不执行 ⇒ 零开销），或由 `test-support` 的捕获路径调用。
     pub(crate) fn a11y_take(&mut self, window: WindowId) -> Option<crate::a11y::A11yTreeSnapshot> {
-        let mut diagnostics = Vec::new();
-        let snapshot = {
-            let Self { windows, .. } = self;
-            windows.get_mut(&window)?.a11y_take(&mut diagnostics)
-        };
-        for diagnostic in diagnostics {
-            self.a11y_note(diagnostic);
-        }
-        if snapshot.is_some() {
-            self.a11y_delivered.insert(window, self.clock);
-        }
-        snapshot
+        a11y::a11y_take(self, window)
     }
 
     /// 打开/关闭某个窗口的 a11y 快照捕获（`TestApp` 专用）。
     #[cfg(feature = "test-support")]
     pub(crate) fn set_a11y_capture(&mut self, window: WindowId, on: bool) {
-        if let Some(target) = self.windows.get_mut(&window) {
-            target.set_a11y_capture(on);
-        }
+        a11y::set_a11y_capture(self, window, on)
     }
 
     /// 该窗口的捕获是否打开。
@@ -3017,22 +1335,15 @@ impl App {
         window: WindowId,
         snapshot: crate::a11y::A11yTreeSnapshot,
     ) {
-        if let Some(target) = self.windows.get_mut(&window) {
-            target.attach_a11y(snapshot);
-        }
+        a11y::attach_a11y(self, window, snapshot)
     }
 
     /// 轮询每个窗口的 GPU 线程反馈（三平台窗口路径；设备丢失 / 呈现失败在这里冒泡）。
     ///
     /// 平台泵**每轮**调用（空闲时也要跑）：错误是粘性的，早一轮读到就能早一轮退出。
     pub(crate) fn poll_renderers(&mut self) -> Result<(), EngineError> {
-        for window in self.windows.values_mut() {
-            window.poll_renderer()?;
-        }
-        Ok(())
+        resources::poll_renderers(self)
     }
-
-    // ── P06：完整帧（styles → text → layout → layout_text → paint → commit）────────
 
     /// 完整帧：`refresh_styles` → `refresh_text` → `compute_layout`（仅 LAYOUT 脏）→ `layout_text`
     /// → paint → commit。
@@ -3042,206 +1353,18 @@ impl App {
     ///
     /// 产品路径：含 `bind_style`/`bind_text` 的窗口只能走这里；`Window::frame` 是它的无 App 通道版本。
     pub fn frame(&mut self, window: WindowId) -> Option<Result<FrameOutcome, EngineError>> {
-        if !self.windows.contains_key(&window) {
-            return None;
-        }
-        #[cfg(feature = "hud")]
-        let committed_at = self.clock;
-        #[cfg(feature = "hud")]
-        self.prepare_debug_hud(window);
-        // P2-3.3：偏移只在显式滚动时被夹紧，而可用范围 `content − viewport` 会随**内容尺寸**
-        // 与**视口尺寸**变化 —— 两者都不一定触发重排（`set_scroll_content` 只写滚动槽），
-        // 所以这里**每帧**都重夹一次。必须在取唤醒位**之前**：夹紧本身可能请求一帧，
-        // 否则「内容变短」这类不标脏位的变化会停在 Idle 上永远不修。
-        self.normalize_scroll_offsets(window);
-        // 锚点定位的浮层按**上一帧实测尺寸**在这一帧布局之前纠位（P2-6）。不能放在布局之后：
-        // 布局之后写 inset 会被 `settle_frame` 的「本轮已布局」判定清掉 LAYOUT，下一帧变 Idle，
-        // 位置永远不生效。放在布局前则是标准的 measure-then-place：首帧用零尺寸，次帧到位。
-        self.resolve_overlay_placements(window);
-        let wake = self.take_wake_request();
-        // P10：动画在帧门禁**之前**推进（写 `Transient` + 给注册节点标 `PAINT`），因此「有动画」必然
-        // 让 `needs_frame` 为真；动画结束后不再留帧。
-        self.tick_animations(window);
-        let needs_frame = self
-            .windows
-            .get(&window)
-            .is_some_and(|candidate| candidate.needs_frame(wake));
-        if !needs_frame {
-            self.record_idle(window);
-            return Some(Ok(FrameOutcome::Idle));
-        }
-        let Some(ticket) = self.windows.get_mut(&window).and_then(Window::begin_frame) else {
-            return Some(Ok(FrameOutcome::Idle));
-        };
-        let Some(styles) = self.refresh_styles(window) else {
-            self.abort_frame(window, ticket);
-            return None;
-        };
-        // P17：必须在 refresh_styles 之后写 HUD 文本，否则 `clear_paint` 会吞掉脏位；
-        // 又必须在 refresh_text 之前，让新文本在同一帧完成 shape。
-        #[cfg(feature = "hud")]
-        self.apply_debug_hud(window);
-        let text = match self.refresh_text(window) {
-            Some(Ok(report)) => report,
-            Some(Err(error)) => {
-                self.abort_frame(window, ticket);
-                return Some(Err(error));
-            }
-            None => {
-                self.abort_frame(window, ticket);
-                return None;
-            }
-        };
-        // P1-2.6：`refresh_text` 可能已让图集换代（DPI 变化 / 字形容量逃逸）。图集是进程级
-        // 共享的，页内 tile 已全部重排，而各窗口文本 lane 里存的是旧 `AtlasTile` —— 必须让
-        // **所有窗口**的文本节点重绘。放在 `layout_text` 之前：本帧就会用新 UV 重建 lane。
-        self.repaint_text_if_atlas_changed();
-        let layout = match self.windows.get_mut(&window).map(Window::layout_if_dirty) {
-            Some(Ok(report)) => report,
-            Some(Err(error)) => {
-                self.abort_frame(window, ticket);
-                return Some(Err(error));
-            }
-            None => {
-                self.abort_frame(window, ticket);
-                return None;
-            }
-        };
-        let text_layout = match self.layout_text(window) {
-            Some(Ok(report)) => report,
-            Some(Err(error)) => {
-                self.abort_frame(window, ticket);
-                return Some(Err(error));
-            }
-            None => {
-                self.abort_frame(window, ticket);
-                return None;
-            }
-        };
-        // 布局后（视口尺寸已知/已变）再修一次虚拟列表窗口：首次布局前视口 = 0，不能靠
-        // `set_virtual_items` 那一次调用定终身（P10 §8.3 / 评审 #5）。
-        self.rewindow_virtuals(window);
-        // 布局之后再夹一次滚动偏移：帧首那次用的是**上一帧**视口，窗口变大时上限变小，
-        // 旧偏移会越界——本帧 paint 就用它，于是内容上移过多/底部空白上屏（复审 P2-8）。
-        // 这里不请求帧：damage 已累积、本帧 paint 会消费它，除非真的没有帧可出。
-        let clamped = self.clamp_scroll_offsets(window);
-        if clamped {
-            self.request_frame();
-        }
-        // 图集页上传（P13：逐窗口分发，两张页分开、顺序固定以便帧记录复现）。
-        self.upload_atlas_pages();
-        // 借用拆分：`windows` 与 `geometry` 是不同字段，可同时借出（几何表只读）。
-        // 先取结果、结束后再处理错误 —— 解构 `self` 期间不能再调 `self.abort_frame`。
-        let painted = {
-            let Self {
-                windows, geometry, ..
-            } = self;
-            windows
-                .get_mut(&window)
-                .map(|target| target.paint_frame(geometry))
-        };
-        let paint = match painted {
-            Some(Ok(report)) => report,
-            Some(Err(error)) => {
-                self.abort_frame(window, ticket);
-                return Some(Err(error));
-            }
-            None => {
-                self.abort_frame(window, ticket);
-                return None;
-            }
-        };
-        #[cfg(feature = "test-support")]
-        {
-            let Some(target) = self.windows.get(&window) else {
-                self.abort_frame(window, ticket);
-                return None;
-            };
-            let stats = FrameStats {
-                styles,
-                text: Some(text),
-                text_layout: Some(text_layout),
-                layout,
-                painted_lanes: paint.rebuilt,
-                reused_lanes: paint
-                    .log
-                    .lanes
-                    .iter()
-                    .filter(|entry| entry.outcome == LaneOutcome::Reused)
-                    .count(),
-                primitives: target.scene().primitive_count(),
-                instances: paint.instances,
-            };
-            let Some(target) = self.windows.get_mut(&window) else {
-                self.abort_frame(window, ticket);
-                return None;
-            };
-            target.set_frame_stats(stats);
-        }
-        #[cfg(not(feature = "test-support"))]
-        {
-            let _ = (&styles, &text, &text_layout, &layout);
-        }
-        let Some(target) = self.windows.get_mut(&window) else {
-            self.abort_frame(window, ticket);
-            return None;
-        };
-        let outcome = target.commit_frame(ticket, paint);
-        #[cfg(feature = "hud")]
-        if matches!(outcome, FrameOutcome::Committed(_)) {
-            if let Some(state) = self.debug_hud.get_mut(&window) {
-                debug_hud::finish_frame(state);
-            }
-            target.note_debug_hud_commit(committed_at);
-        }
-        // 图集行/整页没赶上本帧（窗口的共享槽还在消费上一笔）：这一帧会以旧图集呈现，因此
-        // 立刻再要一帧（全量 damage），槽空后把内容补发——否则静态窗口会把缺字的画面一直
-        // 留着。槽长期不空（GPU 卡住 / 窗口不再出帧）时最多补 `MAX_ATLAS_FOLLOWUPS` 帧，不空转。
-        let glyph_extent = self.atlas.page().0;
-        let image_extent = self.resources.page_pixels().map(|(page, _)| page.0);
-        let deferred = self.windows.get(&window).is_some_and(|target| {
-            use crate::paint::atlas::AtlasKind;
-            target.has_renderer()
-                && (target.atlas_rows_pending()
-                    || !target.atlas_page_matches(AtlasKind::Glyph, glyph_extent)
-                    || image_extent
-                        .is_some_and(|extent| !target.atlas_page_matches(AtlasKind::Image, extent)))
-        });
-        if deferred {
-            let retry = self
-                .windows
-                .get_mut(&window)
-                .is_some_and(Window::note_atlas_deferral);
-            if retry {
-                if let Some(target) = self.windows.get_mut(&window) {
-                    target.request_repaint();
-                }
-                self.dispatcher.wake();
-            }
-        } else if let Some(target) = self.windows.get_mut(&window) {
-            target.reset_atlas_deferrals();
-        }
-        Some(Ok(outcome))
+        frame::frame(self, window)
     }
 
     /// 中止本帧（不结算、不递增 `FrameIndex`）。
     fn abort_frame(&mut self, window: WindowId, ticket: FrameTicket) {
-        if let Some(target) = self.windows.get_mut(&window) {
-            target.abort_frame(ticket);
-        }
+        frame::abort_frame(self, window, ticket)
     }
 
     /// 记录一次空闲帧（仅 `test-support`；其余构建是空操作）。
     fn record_idle(&mut self, window: WindowId) {
-        #[cfg(feature = "test-support")]
-        if let Some(target) = self.windows.get_mut(&window) {
-            target.record_idle();
-        }
-        #[cfg(not(feature = "test-support"))]
-        let _ = window;
+        frame::record_idle(self, window)
     }
-
-    // ── P05：文本 pass / 字体栈 / 诊断 ────────────────────────────────────────
 
     /// 文本 pass：形状（缓存）→ 光栅 → 图集 → `ShapedLine`，尺寸变化时置 `LAYOUT`。
     ///
@@ -3254,92 +1377,7 @@ impl App {
         &mut self,
         window: WindowId,
     ) -> Option<Result<TextPassReport, EngineError>> {
-        let Self {
-            text,
-            raster,
-            atlas,
-            glyph_atlas,
-            text_dirty_scratch,
-            windows,
-            scale_epochs,
-            pending_dirty,
-            ..
-        } = self;
-        let window = windows.get_mut(&window)?;
-        let window_id = window.id();
-        let scale = window.scale().factor();
-        let epoch = window.scale_epoch();
-
-        if scale_epochs.get(&window_id).copied().unwrap_or(0) != epoch {
-            atlas.clear();
-            glyph_atlas.clear();
-            scale_epochs.insert(window_id, epoch);
-        }
-        raster.set_font_epoch(text.font_epoch());
-
-        let tree = window.tree_mut();
-        let mut report = TextPassReport::default();
-        let known = taffy::Size {
-            width: None,
-            height: None,
-        };
-        let available = taffy::Size {
-            width: taffy::AvailableSpace::MaxContent,
-            height: taffy::AvailableSpace::MaxContent,
-        };
-
-        let mut index = 0usize;
-        // P1-2.3：只遍历**文本脏集合**，不再每帧扫整棵树。
-        //
-        // 旧实现每帧 `for node in tree.order()`，对每个文本节点 `text_content(node).cloned()`
-        // 再算全文哈希 —— 即使这一帧没有任何文本变化。32 个实时标签的实测代价约 6.8 ms/帧
-        // （shape 3.2 + layout/raster 3.6），已接近 60 Hz 预算的一半。
-        //
-        // 集合来源：`set_text_content`（`bind_text` 求值 / 静态挂载）与 `mark_all_text_dirty`
-        // （字体栈、DPI、图集换代）。
-        tree.take_text_dirty(text_dirty_scratch);
-        let dirty: &[crate::node::id::NodeId] = text_dirty_scratch;
-        while index < dirty.len() {
-            let node = dirty[index];
-            index += 1;
-            let Some(content) = tree.text_content(node).cloned() else {
-                continue;
-            };
-            let (shaped, hit) = text.shape_cached(&content, scale);
-            if hit {
-                report.reused += 1;
-            } else {
-                report.shaped += 1;
-            }
-            let key = crate::text::cache::ShapeKey::new(&content, scale, text.font_stack_version());
-            if let Some(slot) = tree.text_slot(node)
-                && slot.key() == key
-                && slot.scale_epoch() == epoch
-                && Rc::ptr_eq(slot.shaped(), &shaped)
-            {
-                // B4：快照未变 ⇒ 不重建、不清缓存、不重挂（空闲帧只走这条路）。
-                report.skipped += 1;
-                continue;
-            }
-
-            let measured = shaped.measure(known, available);
-            let previous = tree.text_measured_size(node).unwrap_or(Size::ZERO);
-            // `LayoutOverride` 节点的尺寸由应用固定，文本 intrinsic size 变化不可能影响布局；
-            // 不置 LAYOUT，避免 HUD 每 500 ms 触发一次全窗口重排。`layout_text` 仍会按新
-            // ShapedText 重排/重建 ShapedLine（`set_text_shaped` 已清 line/width）。
-            let fixed_layout = tree
-                .get(node)
-                .is_ok_and(|target| target.layout_override().is_some());
-            let size_changed = !fixed_layout
-                && (previous.width.to_bits() != measured.width.to_bits()
-                    || previous.height.to_bits() != measured.height.to_bits());
-            tree.set_text_shaped(node, Rc::clone(&shaped), key, epoch, measured, size_changed);
-        }
-        // 光栅/图集统计**不在这里**：光栅发生在同帧的 `layout_text`（第二阶段），而本报告在
-        // 第一阶段产出。`GlyphAtlas::take_stats` 只能取一次，第二阶段才是唯一正确的消费点
-        // （此前这里取到的永远是 0，复审已确认）。见 `TextLayoutReport` 的同名字段。
-        report.dirty_spans = pending_dirty.spans().len();
-        Some(Ok(report))
+        text_pass::refresh_text(self, window)
     }
 
     /// 文本的**第二阶段**：`compute_layout` 之后，按每个文本节点的**内容宽**重排、光栅、装箱。
@@ -3354,130 +1392,41 @@ impl App {
         &mut self,
         window: WindowId,
     ) -> Option<Result<TextLayoutReport, EngineError>> {
-        let Self {
-            text,
-            raster,
-            atlas,
-            glyph_atlas,
-            windows,
-            pending_dirty,
-            ..
-        } = self;
-        let window = windows.get_mut(&window)?;
-        let scale = window.scale().factor();
-        let mut report = TextLayoutReport::default();
-
-        for attempt in 0..2 {
-            // 统计按**本轮**计：图集换代会让整 pass 重跑，累加器必须清空，否则报告里的
-            // `rasterized` 等约等于实际值的 2 倍，而 `laid/reused` 只反映最后一轮（复审 F7）。
-            report.rasterized = 0;
-            report.tiles_reused = 0;
-            report.atlas_rebuilds = 0;
-            let generation = atlas.generation();
-            let mut laid = 0usize;
-            let mut reused = 0usize;
-            let tree = window.tree_mut();
-            let mut index = 0usize;
-            while index < tree.order().len() {
-                let node = tree.order()[index];
-                index += 1;
-                let Some(shaped) = tree.text_slot(node).map(|slot| Rc::clone(slot.shaped())) else {
-                    continue;
-                };
-                let width = {
-                    let width = tree.text_content_width(node);
-                    if width > 0.0 {
-                        width
-                    } else {
-                        shaped.widths().max / scale
-                    }
-                };
-                let current = tree
-                    .text_slot(node)
-                    .map(|slot| (slot.laid_width_bits(), slot.laid_generation()));
-                if current == Some((width.to_bits(), generation)) && tree.text_line(node).is_some()
-                {
-                    reused += 1;
-                    continue;
-                }
-
-                let layout = shaped.layout_at(width);
-                let (line, diagnostics, stats) = match shaped.rasterize(
-                    &layout,
-                    width,
-                    raster,
-                    glyph_atlas,
-                    atlas,
-                    generation,
-                ) {
-                    Ok(value) => value,
-                    Err(error) => return Some(Err(error)),
-                };
-                // 图集统计的唯一消费点（`take_stats` 在 `rasterize` 内部完成）：按节点累加。
-                report.rasterized += stats.rasters;
-                report.tiles_reused += stats.hits;
-                report.atlas_rebuilds += stats.rebuilds;
-                pending_dirty.merge(&mut atlas.take_dirty_rows());
-                text.push_diagnostics(diagnostics);
-                tree.set_text_line(node, Rc::new(line), layout, width, generation);
-                laid += 1;
-            }
-            if atlas.generation() == generation {
-                report.laid = laid;
-                report.reused = reused;
-                report.reruns = attempt;
-                return Some(Ok(report));
-            }
-        }
-        Some(Err(EngineError::TextShape {
-            node: window.tree().root(),
-            detail: smol_str::SmolStr::new_static(
-                "atlas generation changed twice within one text pass",
-            ),
-        }))
+        text_pass::layout_text(self, window)
     }
+
     /// 当前字体栈。
     #[must_use]
     pub fn font_stack(&self) -> &FontStack {
-        self.text.font_stack()
+        text_pass::font_stack(self)
     }
 
     /// 当前字体栈版本（形状缓存键的一部分）。
     #[must_use]
     pub fn font_stack_version(&self) -> u32 {
-        self.text.font_stack_version()
+        text_pass::font_stack_version(self)
     }
 
     /// 文本诊断（tofu / 行内盒边界 / 超宽 / 合成样式）。
     #[must_use]
     pub fn text_diagnostics(&self) -> &[TextDiagnostic] {
-        self.text.diagnostics()
+        text_pass::text_diagnostics(self)
     }
 
     /// 字体栈的健康状态（N4：测试与诊断的**唯一**跳过判据）。
     pub fn font_stack_status(&mut self) -> FontStackStatus {
-        self.text.font_stack_status()
+        text_pass::font_stack_status(self)
     }
 
     /// 换字体栈：版本 +1、字体代际 +1、清形状缓存与字形图集、所有窗口的文本节点
     /// `LAYOUT | PAINT`。返回新版本号。
     pub fn set_font_stack(&mut self, stack: FontStack) -> u32 {
-        let version = self.text.set_font_stack(stack);
-        self.glyph_atlas.clear();
-        self.atlas.clear();
-        self.raster.set_font_epoch(self.text.font_epoch());
-        self.invalidate_all_text();
-        version
+        text_pass::set_font_stack(self, stack)
     }
 
     /// 系统字体安装/卸载/语言切换后调用：重载 + 与 [`App::set_font_stack`] 相同的失效。
     pub fn reload_system_fonts(&mut self) -> u32 {
-        let version = self.text.reload_system_fonts();
-        self.glyph_atlas.clear();
-        self.atlas.clear();
-        self.raster.set_font_epoch(self.text.font_epoch());
-        self.invalidate_all_text();
-        version
+        text_pass::reload_system_fonts(self)
     }
 
     /// 所有窗口的文本节点标 `LAYOUT | PAINT` 并清 `node..root` 缓存。
@@ -3492,3938 +1441,35 @@ impl App {
     ///
     /// 对照 Skia：glyph atlas / strike cache 换代时会让所有引用旧 strike 的绘制数据失效。
     fn repaint_text_if_atlas_changed(&mut self) {
-        let generation = self.atlas.generation();
-        if generation == self.atlas_generation_seen {
-            return;
-        }
-        self.atlas_generation_seen = generation;
-        for window in self.windows.values_mut() {
-            window.tree_mut().mark_all_text_paint();
-        }
+        text_pass::repaint_text_if_atlas_changed(self)
     }
 
     fn invalidate_all_text(&mut self) {
-        let ids: SmallVec<[WindowId; 4]> = self.windows.keys().copied().collect();
-        for id in ids {
-            let Some(window) = self.windows.get_mut(&id) else {
-                continue;
-            };
-            let tree = window.tree_mut();
-            let order: SmallVec<[crate::node::id::NodeId; 8]> =
-                tree.order().iter().copied().collect();
-            for node in order {
-                if tree.text_content(node).is_some() {
-                    tree.invalidate_text_layout(node);
-                }
-            }
-            // P1-2.3：字体栈 / 系统字体变化后，脏集合必须包含**全部**文本节点 ——
-            // `refresh_text` 现在只遍历脏集合，漏标就等于永久不重排。
-            tree.mark_all_text_dirty();
-        }
+        text_pass::invalidate_all_text(self)
     }
 
     /// 沿依赖图失效：节点标脏（或经派生级联），有节点变脏则置唤醒位。
     fn invalidate(&mut self, signal: SignalId) {
-        let Self {
-            store,
-            graph,
-            windows,
-            wake_requested,
-            dispatcher,
-            ..
-        } = self;
-        let mut worklist: SmallVec<[SignalId; 8]> = smallvec![signal];
-        let mut marked = 0usize;
-
-        while let Some(current) = worklist.pop() {
-            let Some(owners) = graph.dependents_mut(current) else {
-                continue;
-            };
-            owners.retain(|owner| match owner {
-                Owner::Node { window, node } => windows
-                    .get(window)
-                    .is_some_and(|w| w.tree().get(*node).is_ok()),
-                Owner::Derived(_) => true,
-            });
-            let empty = owners.is_empty();
-            let snapshot: SmallVec<[Owner; 8]> = owners.iter().copied().collect();
-            if empty {
-                graph.remove_signal(current);
-                continue;
-            }
-
-            for owner in snapshot {
-                match owner {
-                    Owner::Node { window, node } => {
-                        let Some(target) = windows.get_mut(&window) else {
-                            continue;
-                        };
-                        // P11：只有 `bind_a11y` 的节点（没有视觉绑定）被写信号时，**不得**产像素：
-                        // 标 `A11Y` 并让下一帧仍跑 `refresh_styles`（帧末门禁会退回 `Idle`）。
-                        let a11y_only = target.tree().has_a11y_bind(node)
-                            && !target.tree().has_visual_bind(node);
-                        let affects_layout = target
-                            .tree()
-                            .get(node)
-                            .is_ok_and(|n| n.style_patch().affects_layout);
-                        let alive = if a11y_only {
-                            target.a11y_note_bind_work();
-                            target.tree_mut().mark_a11y(node)
-                        } else if affects_layout {
-                            target.tree_mut().mark_layout(node)
-                        } else {
-                            target.tree_mut().mark_paint(node)
-                        };
-                        if alive {
-                            marked += 1;
-                        }
-                    }
-                    Owner::Derived(derived) => {
-                        if store.mark_derived_dirty(derived) {
-                            worklist.push(store.derived_handle(derived));
-                        }
-                    }
-                }
-            }
-        }
-
-        if marked > 0 {
-            *wake_requested = true;
-            dispatcher.wake();
-        }
+        style_pass::invalidate(self, signal)
     }
 
     /// 仅测试：求值栈是否为空（验证 `EvalGuard` 在 panic 后仍然出栈）。
     #[cfg(test)]
     pub(crate) fn eval_stack_is_empty_for_test(&self) -> bool {
-        self.eval_stack.is_empty()
+        signal_api::eval_stack_is_empty_for_test(self)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{cell::Cell, panic::AssertUnwindSafe, rc::Rc};
-
-    use super::App;
-    use crate::{
-        node::{
-            builder::NodeBuilder,
-            dependency::ReadCtx,
-            dirty::DirtyFlags,
-            id::NodeId,
-            signal::{Derived, Signal, SignalId},
-        },
-        paint::style::StylePatch,
-        window::{FrameOutcome, WindowId, WindowOptions},
-    };
-
-    fn new_app() -> (tokio::runtime::Runtime, App) {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("current-thread runtime");
-        let app = App::new(rt.handle().clone());
-        (rt, app)
-    }
-
-    // ── P05：文本 pass / 字体栈 / B1 失效纪律 ────────────────────────────────
-
-    fn text_style(width: Option<f32>) -> crate::paint::style::Style {
-        let mut style = crate::paint::style::Style::default();
-        style.inner.align_self = Some(taffy::style::AlignSelf::START);
-        if let Some(width) = width {
-            style.inner.size.width = taffy::style::Dimension::length(width);
-        }
-        style
-    }
-
-    /// P2-9：文本快照被重写后必须标 `PAINT`，否则 lane 复用旧 UV（新纹理 + 旧坐标）。
-    #[test]
-    fn re_laid_text_marks_paint_for_the_lane() {
-        let (_rt, mut app, window, node) = text_app("hello", Some(400.0));
-        refresh(&mut app, window);
-        layout(&mut app, window);
-        text_layout(&mut app, window);
-
-        // 改文本 ⇒ 宽度变化 ⇒ 下一次 `layout_text` 会重写快照。
-        set_text(
-            &mut app,
-            window,
-            node,
-            "hello brave new world",
-            crate::text::TextStyle::new(16.0),
-        );
-        refresh(&mut app, window);
-        layout(&mut app, window);
-        // 清掉所有脏位，模拟「lane 仍可复用」的稳态：此时没有任何业务脏位。
-        clear_dirty(&mut app, window);
-
-        let report = text_layout(&mut app, window);
-        assert!(report.laid > 0, "必须重排一次");
-        assert!(
-            app.window(window)
-                .expect("窗口存在")
-                .tree()
-                .get(node)
-                .expect("节点存在")
-                .dirty()
-                .contains(DirtyFlags::PAINT),
-            "重排后必须标 PAINT（否则 paint 复用旧 UV）"
-        );
-    }
-
-    fn text_app(
-        text: &str,
-        width: Option<f32>,
-    ) -> (tokio::runtime::Runtime, App, WindowId, NodeId) {
-        let (rt, mut app) = new_app();
-        let window = app.create_window(WindowOptions::default());
-        let w = app.window_mut(window).expect("窗口存在");
-        let root = w.tree().root();
-        let node = NodeBuilder::text(text, crate::text::TextStyle::new(16.0))
-            .style(text_style(width))
-            .build(w.tree_mut(), root)
-            .expect("挂载成功");
-        (rt, app, window, node)
-    }
-
-    fn refresh(app: &mut App, window: WindowId) -> crate::text::TextPassReport {
-        app.refresh_text(window)
-            .expect("窗口存在")
-            .expect("文本 pass 不报错")
-    }
-
-    fn set_text(
-        app: &mut App,
-        window: WindowId,
-        node: NodeId,
-        text: &str,
-        style: crate::text::TextStyle,
-    ) {
-        app.window_mut(window)
-            .expect("窗口存在")
-            .tree_mut()
-            .set_text_content(node, crate::text::TextContent::new(text, style));
-    }
-
-    fn text_layout(app: &mut App, window: WindowId) -> crate::text::TextLayoutReport {
-        app.layout_text(window)
-            .expect("窗口存在")
-            .expect("文本重排不报错")
-    }
-
-    fn layout(app: &mut App, window: WindowId) -> crate::layout::LayoutReport {
-        app.window_mut(window)
-            .expect("窗口存在")
-            .compute_layout()
-            .expect("布局不报错")
-    }
-
-    fn layout_height(app: &App, window: WindowId, node: NodeId) -> f32 {
-        app.window(window)
-            .expect("窗口存在")
-            .tree()
-            .get(node)
-            .expect("节点存在")
-            .layout()
-            .bounds
-            .size
-            .height
-    }
-
-    #[test]
-    fn refresh_text_requires_an_existing_window() {
-        let (_rt, mut app) = new_app();
-
-        assert!(app.refresh_text(WindowId::for_test(0)).is_none());
-    }
-
-    #[test]
-    fn refresh_text_shapes_once_then_reuses() {
-        let (_rt, mut app, window, node) = text_app("hello", None);
-
-        let first = refresh(&mut app, window);
-        // P1-2.3：脏集合消费后为空 ⇒ 第二次调用不再遍历任何节点。
-        // 旧实现每帧扫整棵树并把「快照未变」计入 `skipped`；现在「没有脏节点」本身就是
-        // 更强的跳过（成本 O(0) 而不是 O(全树)），`skipped` 只统计真正访问到的节点。
-        let second = refresh(&mut app, window);
-
-        assert_eq!(first.shaped, 1);
-        assert_eq!(second.shaped, 0, "脏集合为空时不得重新 shape");
-        assert_eq!(
-            app.window(window)
-                .expect("窗口存在")
-                .tree()
-                .text_dirty_len(),
-            0,
-            "脏集合必须已被消费"
-        );
-        // 显式标记后必须重新进入（证明集合是唯一入口，而不是「永远跳过」）。
-        app.window_mut(window)
-            .expect("窗口存在")
-            .tree_mut()
-            .mark_all_text_dirty();
-        let third = refresh(&mut app, window);
-        assert_eq!(third.skipped, 1, "标记后必须访问该节点并命中快照复用");
-        assert_eq!(third.shaped, 0);
-        // 行快照只由第二阶段（layout_text）产出。
-        assert!(
-            app.window(window)
-                .expect("窗口存在")
-                .tree()
-                .text_line(node)
-                .is_none(),
-            "refresh_text must not attach a line snapshot (B1)"
-        );
-        let laid = text_layout(&mut app, window);
-        assert_eq!(laid.laid, 1);
-        assert!(
-            app.window(window)
-                .expect("窗口存在")
-                .tree()
-                .text_line(node)
-                .is_some(),
-            "layout_text must attach the final snapshot"
-        );
-    }
-
-    #[test]
-    fn bind_text_reevaluation_updates_content_and_marks_paint() {
-        let (_rt, mut app) = new_app();
-        let window = app.create_window(WindowOptions::default());
-        let signal = app.signal(smol_str::SmolStr::new_static("first"));
-        let node = {
-            let w = app.window_mut(window).expect("窗口存在");
-            let root = w.tree().root();
-            NodeBuilder::text("", crate::text::TextStyle::new(16.0))
-                .bind_text(move |cx| cx.read(&signal))
-                .build(w.tree_mut(), root)
-                .expect("挂载成功")
-        };
-
-        let report = app.refresh_styles(window).expect("窗口存在");
-        assert_eq!(report.text_evaluated, 1);
-        assert_eq!(report.text_changed, 1);
-        clear_dirty(&mut app, window);
-        let report = app.refresh_styles(window).expect("窗口存在");
-        assert_eq!(report.text_changed, 0, "unchanged value must not re-mark");
-
-        app.write(&signal, smol_str::SmolStr::new_static("second"));
-        let report = app.refresh_styles(window).expect("窗口存在");
-        assert_eq!(report.text_changed, 1);
-        let content = app
-            .window(window)
-            .expect("窗口存在")
-            .tree()
-            .text_content(node)
-            .expect("文本节点")
-            .clone();
-        assert_eq!(content.text, "second");
-        assert!(
-            app.window(window)
-                .expect("窗口存在")
-                .tree()
-                .get(node)
-                .expect("节点存在")
-                .dirty()
-                .contains(DirtyFlags::PAINT)
-        );
-    }
-
-    #[test]
-    fn text_size_change_marks_layout() {
-        let (_rt, mut app, window, node) = text_app("ab", None);
-        let _ = refresh(&mut app, window);
-        let _ = layout(&mut app, window);
-        clear_dirty(&mut app, window);
-
-        set_text(
-            &mut app,
-            window,
-            node,
-            "a much longer text that wraps",
-            crate::text::TextStyle::new(16.0),
-        );
-        let _ = refresh(&mut app, window);
-
-        assert!(
-            app.window(window)
-                .expect("窗口存在")
-                .tree()
-                .get(node)
-                .expect("节点存在")
-                .dirty()
-                .contains(DirtyFlags::LAYOUT),
-            "a size change must set LAYOUT"
-        );
-    }
-
-    #[test]
-    fn text_same_size_still_clears_the_taffy_cache() {
-        // B1：尺寸没变（"ab" → "ba"）也必须清 node..root 的 taffy 缓存，否则陈旧 measure 会留存。
-        let (_rt, mut app, window, node) = text_app("ab", None);
-        let _ = refresh(&mut app, window);
-        let _ = layout(&mut app, window);
-        let warm = layout(&mut app, window);
-        assert_eq!(warm.cache_misses, 0, "second layout must hit the cache");
-        assert!(warm.cache_hits > 0);
-        clear_dirty(&mut app, window);
-
-        set_text(
-            &mut app,
-            window,
-            node,
-            "ba",
-            crate::text::TextStyle::new(16.0),
-        );
-        let _ = refresh(&mut app, window);
-        let dirty = app
-            .window(window)
-            .expect("窗口存在")
-            .tree()
-            .get(node)
-            .expect("节点存在")
-            .dirty();
-        assert!(
-            !dirty.contains(DirtyFlags::LAYOUT),
-            "same measured size must not set LAYOUT"
-        );
-
-        let cold = layout(&mut app, window);
-        assert!(
-            cold.cache_misses >= 1,
-            "the measure cache must be cleared even when the size is unchanged"
-        );
-    }
-
-    #[test]
-    fn text_wrap_change_same_max_width_relayouts() {
-        // B1 的反例：Wrap → Anywhere 的 max-content 宽相同，但定宽（40 px）下的行数/高度不同。
-        let (_rt, mut app, window, node) = text_app("aaaaaaaaaa", Some(40.0));
-        let _ = refresh(&mut app, window);
-        let _ = layout(&mut app, window);
-        let height_before = layout_height(&app, window, node);
-
-        let mut style = crate::text::TextStyle::new(16.0);
-        style.wrap = crate::text::TextWrap::Anywhere;
-        set_text(&mut app, window, node, "aaaaaaaaaa", style);
-        let _ = refresh(&mut app, window);
-        let relayout = layout(&mut app, window);
-        let height_after = layout_height(&app, window, node);
-
-        assert!(
-            relayout.cache_misses >= 1,
-            "snapshot change must invalidate the measure cache"
-        );
-        assert!(
-            height_after > height_before,
-            "BreakAll wraps into more lines at 40 px: {height_after} vs {height_before}"
-        );
-    }
-
-    #[test]
-    fn set_font_stack_invalidates_all_text_and_drops_the_shape_cache() {
-        let (_rt, mut app, window, node) = text_app("hello", None);
-        let _ = refresh(&mut app, window);
-
-        let version = app.set_font_stack(crate::text::FontStack::new(["Segoe UI"]));
-
-        assert_eq!(version, 2);
-        assert_eq!(app.font_stack_version(), 2);
-        assert!(app.font_stack().families().count() == 1);
-        let dirty = app
-            .window(window)
-            .expect("窗口存在")
-            .tree()
-            .get(node)
-            .expect("节点存在")
-            .dirty();
-        assert!(dirty.contains(DirtyFlags::LAYOUT | DirtyFlags::PAINT));
-        // 形状缓存被清空 ⇒ 下一次 refresh_text 重新 shape。
-        let report = refresh(&mut app, window);
-        assert_eq!(report.shaped, 1);
-    }
-
-    #[test]
-    fn reload_system_fonts_is_idempotent_but_bumps_the_version() {
-        let (_rt, mut app, window, _node) = text_app("x", None);
-        let before = app.font_stack_version();
-
-        let after = app.reload_system_fonts();
-
-        assert_eq!(after, before + 1);
-        assert!(app.refresh_text(window).is_some());
-    }
-
-    /// P1-2.6 回归：图集换代必须让**所有窗口**的文本节点重绘。
-    ///
-    /// 图集是进程级共享的，但文本 lane 里存的是生成时的 `AtlasTile`（旧 UV）。旧实现里
-    /// `set_text_line` 不标 `PAINT`，paint 的 lane 复用只看 `REUSABLE`/`clip_key` —— 于是
-    /// 窗口 A 改 DPI 让图集换代后，窗口 B 仍在使用旧 UV（错字/花字）。
-    #[test]
-    fn atlas_generation_change_repaints_text_in_every_window() {
-        let (_rt, mut app, window_a, node_a) = text_app("alpha", None);
-        // 第二个窗口：同样的文本节点，但一直不出帧 —— 它的 lane 会保留旧 AtlasTile。
-        let window_b = app.create_window(WindowOptions::default());
-        let node_b = {
-            let tree = app.window_mut(window_b).expect("窗口存在").tree_mut();
-            let root = tree.root();
-            NodeBuilder::text("beta", crate::text::TextStyle::new(16.0))
-                .build(tree, root)
-                .expect("挂载")
-        };
-
-        // 两个窗口都完成一次 shape + layout（建立各自的文本 lane / ShapedLine）。
-        for window in [window_a, window_b] {
-            let _ = refresh(&mut app, window);
-            let _ = layout(&mut app, window);
-            let _ = text_layout(&mut app, window);
-        }
-        let generation_before = app
-            .window(window_b)
-            .expect("窗口存在")
-            .tree()
-            .text_line(node_b)
-            .expect("快照存在")
-            .atlas_generation;
-
-        // 窗口 A 改 DPI ⇒ 全局图集换代。
-        app.window_mut(window_a)
-            .expect("窗口存在")
-            .set_scale(crate::math::Scale::new(2.0).expect("finite scale"));
-        let _ = refresh(&mut app, window_a);
-        let _ = layout(&mut app, window_a);
-        let _ = text_layout(&mut app, window_a);
-        let generation_after = app
-            .window(window_a)
-            .expect("窗口存在")
-            .tree()
-            .text_line(node_a)
-            .expect("快照存在")
-            .atlas_generation;
-        assert!(
-            generation_after > generation_before,
-            "DPI change must bump the global atlas generation"
-        );
-
-        // 关键断言：窗口 B 的文本节点必须已被标 PAINT，从而在下一帧重建 lane（新 UV）。
-        let dirty_b = app
-            .window(window_b)
-            .expect("窗口存在")
-            .tree()
-            .get(node_b)
-            .expect("节点存在")
-            .dirty();
-        assert!(
-            dirty_b.contains(crate::node::dirty::DirtyFlags::PAINT),
-            "图集换代后，其它窗口的文本节点必须被标 PAINT（否则继续用旧 UV）：{dirty_b:?}"
-        );
-        assert!(
-            !dirty_b.contains(crate::node::dirty::DirtyFlags::LAYOUT),
-            "换代不改变断行，不应触发重排：{dirty_b:?}"
-        );
-    }
-
-    #[test]
-    fn scale_change_clears_the_atlas_generation() {
-        let (_rt, mut app, window, node) = text_app("hello", None);
-        let _ = refresh(&mut app, window);
-        let _ = layout(&mut app, window);
-        let first = text_layout(&mut app, window);
-        assert!(first.laid > 0);
-        let generation_before = app
-            .window(window)
-            .expect("窗口存在")
-            .tree()
-            .text_line(node)
-            .expect("快照存在")
-            .atlas_generation;
-
-        app.window_mut(window)
-            .expect("窗口存在")
-            .set_scale(crate::math::Scale::new(2.0).expect("finite scale"));
-        let _ = refresh(&mut app, window);
-        let _ = layout(&mut app, window);
-        let second = text_layout(&mut app, window);
-        let generation_after = app
-            .window(window)
-            .expect("窗口存在")
-            .tree()
-            .text_line(node)
-            .expect("快照存在")
-            .atlas_generation;
-
-        assert!(
-            generation_after > generation_before,
-            "DPI change bumps the atlas"
-        );
-        assert!(second.laid > 0, "the text is re-laid at the new ppem");
-    }
-
-    #[test]
-    fn text_diagnostics_start_empty_for_supported_text() {
-        let (_rt, mut app, window, _node) = text_app("ascii only", None);
-        let _ = refresh(&mut app, window);
-
-        // 具体诊断依宿主字体而定；这里只要求 API 可用且不 panic。
-        let _ = app.text_diagnostics();
-    }
-
-    fn node_with<F>(app: &mut App, window: WindowId, bind: F) -> NodeId
-    where
-        F: Fn(&mut ReadCtx<'_>) -> StylePatch + 'static,
-    {
-        let w = app.window_mut(window).expect("窗口存在");
-        let root = w.tree().root();
-        NodeBuilder::boxed()
-            .bind_style(bind)
-            .build(w.tree_mut(), root)
-            .expect("挂载成功")
-    }
-
-    fn flags(app: &App, window: WindowId, node: NodeId) -> DirtyFlags {
-        app.window(window)
-            .expect("窗口存在")
-            .tree()
-            .get(node)
-            .expect("节点存在")
-            .dirty()
-    }
-
-    fn root_flags(app: &App, window: WindowId) -> DirtyFlags {
-        let root = app.window(window).expect("窗口存在").tree().root();
-        flags(app, window, root)
-    }
-
-    fn deps(app: &App, window: WindowId, node: NodeId) -> Vec<SignalId> {
-        app.window(window)
-            .expect("窗口存在")
-            .tree()
-            .deps(node)
-            .expect("节点存在")
-            .to_vec()
-    }
-
-    fn clear_dirty(app: &mut App, window: WindowId) {
-        app.window_mut(window)
-            .expect("窗口存在")
-            .tree_mut()
-            .clear_all_dirty_for_test();
-    }
-
-    #[test]
-    fn new_app_has_no_windows() {
-        let (_rt, app) = new_app();
-
-        assert_eq!(app.windows().count(), 0);
-        assert!(app.window(WindowId::for_test(0)).is_none());
-        assert!(app.eval_stack_is_empty_for_test());
-        let joined = app.runtime_handle().spawn(async { 7u8 });
-        drop(joined);
-    }
-
-    #[test]
-    fn write_only_reaches_the_owning_window() {
-        let (_rt, mut app) = new_app();
-        let signal: Signal<u32> = app.signal(0);
-        let window_a = app.create_window(WindowOptions::default());
-        let window_b = app.create_window(WindowOptions::default());
-        let node_a = node_with(&mut app, window_a, move |cx: &mut ReadCtx<'_>| StylePatch {
-            opacity: Some(cx.read(&signal) as f32),
-            ..StylePatch::default()
-        });
-        let node_b = node_with(&mut app, window_b, |_cx| StylePatch::default());
-        app.refresh_styles(window_a).expect("窗口存在");
-        app.refresh_styles(window_b).expect("窗口存在");
-
-        assert_eq!(
-            node_a.index(),
-            node_b.index(),
-            "两窗口的 arena 索引相同 ⇒ 必须靠 Owner 的 window 消歧"
-        );
-        clear_dirty(&mut app, window_a);
-        clear_dirty(&mut app, window_b);
-
-        assert!(app.write(&signal, 1));
-
-        assert!(flags(&app, window_a, node_a).contains(DirtyFlags::PAINT));
-        assert!(
-            !flags(&app, window_b, node_b).contains(DirtyFlags::PAINT),
-            "不得命中另一个窗口的同号节点"
-        );
-    }
-
-    #[test]
-    fn write_marks_layout_when_patch_affects_layout() {
-        let (_rt, mut app) = new_app();
-        let signal: Signal<u32> = app.signal(0);
-        let window = app.create_window(WindowOptions::default());
-        let node = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-            affects_layout: true,
-            opacity: Some(cx.read(&signal) as f32),
-            ..StylePatch::default()
-        });
-        app.refresh_styles(window).expect("窗口存在");
-        clear_dirty(&mut app, window);
-
-        assert!(app.write(&signal, 1));
-
-        assert!(
-            flags(&app, window, node).contains(DirtyFlags::LAYOUT),
-            "affects_layout → 标 LAYOUT 而非只标 PAINT"
-        );
-        assert!(
-            root_flags(&app, window).contains(DirtyFlags::LAYOUT),
-            "必须冒泡"
-        );
-    }
-
-    #[test]
-    fn write_skips_stale_owner_without_panicking() {
-        let (_rt, mut app) = new_app();
-        let signal: Signal<u32> = app.signal(0);
-        let window = app.create_window(WindowOptions::default());
-        let node = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-            opacity: Some(cx.read(&signal) as f32),
-            ..StylePatch::default()
-        });
-        app.refresh_styles(window).expect("窗口存在");
-        app.window_mut(window)
-            .expect("窗口存在")
-            .tree_mut()
-            .remove(node)
-            .expect("卸载成功");
-        let _ = app.take_wake_request();
-
-        assert!(app.write(&signal, 1), "值确实变了");
-        assert!(
-            !app.take_wake_request(),
-            "没有存活的 owner → 不请求唤醒（陈旧 owner 已被 retain 剔除）"
-        );
-    }
-
-    #[test]
-    fn refresh_styles_only_reevaluates_dirty_nodes() {
-        let (_rt, mut app) = new_app();
-        let calls = Rc::new(Cell::new(0u32));
-        let a = Rc::clone(&calls);
-        let signal: Signal<u32> = app.signal(0);
-        let window = app.create_window(WindowOptions::default());
-        let node = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| {
-            a.set(a.get() + 1);
-            StylePatch {
-                opacity: Some(cx.read(&signal) as f32),
-                ..StylePatch::default()
-            }
-        });
-
-        let first = app.refresh_styles(window).expect("窗口存在");
-        assert_eq!(first.evaluated, 1, "只有带 bind_style 的节点被求值");
-        assert_eq!(calls.get(), 1);
-
-        let second = app.refresh_styles(window).expect("窗口存在");
-        assert_eq!(second.evaluated, 0, "PAINT 已消费 → 不重复求值");
-        assert_eq!(calls.get(), 1);
-
-        assert!(app.write(&signal, 3));
-        let third = app.refresh_styles(window).expect("窗口存在");
-        assert_eq!(third.evaluated, 1);
-        assert_eq!(calls.get(), 2);
-        assert_eq!(
-            app.window(window)
-                .expect("窗口存在")
-                .tree()
-                .get(node)
-                .expect("存在")
-                .style_patch()
-                .opacity,
-            Some(3.0)
-        );
-    }
-
-    #[test]
-    fn refresh_styles_is_idempotent() {
-        let (_rt, mut app) = new_app();
-        let signal: Signal<u32> = app.signal(0);
-        let window = app.create_window(WindowOptions::default());
-        let node = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-            opacity: Some(cx.read(&signal) as f32),
-            ..StylePatch::default()
-        });
-
-        app.refresh_styles(window).expect("窗口存在");
-        let deps_before = deps(&app, window, node);
-        let patch_before = app
-            .window(window)
-            .expect("窗口存在")
-            .tree()
-            .get(node)
-            .expect("存在")
-            .style_patch()
-            .clone();
-
-        let second = app.refresh_styles(window).expect("窗口存在");
-
-        assert_eq!(second.evaluated, 0);
-        assert_eq!(deps(&app, window, node), deps_before);
-        assert_eq!(
-            app.window(window)
-                .expect("窗口存在")
-                .tree()
-                .get(node)
-                .expect("存在")
-                .style_patch(),
-            &patch_before
-        );
-    }
-
-    #[test]
-    fn refresh_styles_escalates_layout_when_patch_affects_layout() {
-        // 双向都要升级（`new || old`）：false→true 本帧开始变；true→false 要把尺寸收回来。
-        let (_rt, mut app) = new_app();
-        let resized: Signal<bool> = app.signal(false);
-        let window = app.create_window(WindowOptions::default());
-        let node = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-            affects_layout: cx.read(&resized),
-            ..StylePatch::default()
-        });
-
-        let quiet = app.refresh_styles(window).expect("窗口存在");
-        assert_eq!(quiet.evaluated, 1);
-        assert!(quiet.layout_dirty, "新建节点本身带 LAYOUT");
-
-        clear_dirty(&mut app, window);
-        assert!(app.write(&resized, true));
-        let escalate = app.refresh_styles(window).expect("窗口存在");
-        assert!(escalate.layout_dirty, "false → true 必须升级");
-        assert!(flags(&app, window, node).contains(DirtyFlags::LAYOUT));
-        assert!(root_flags(&app, window).contains(DirtyFlags::LAYOUT));
-
-        clear_dirty(&mut app, window);
-        assert!(app.write(&resized, false));
-        let settle = app.refresh_styles(window).expect("窗口存在");
-        assert!(
-            settle.layout_dirty,
-            "true → false 也必须升级（旧值声明过尺寸会变）"
-        );
-        assert!(flags(&app, window, node).contains(DirtyFlags::LAYOUT));
-    }
-
-    #[test]
-    fn refresh_styles_unknown_window_returns_none() {
-        let (_rt, mut app) = new_app();
-
-        assert!(app.refresh_styles(WindowId::for_test(99)).is_none());
-    }
-
-    #[test]
-    fn refresh_styles_updates_deps() {
-        let (_rt, mut app) = new_app();
-        let flag: Signal<bool> = app.signal(true);
-        let a: Signal<u32> = app.signal(1);
-        let b: Signal<u32> = app.signal(2);
-        let window = app.create_window(WindowOptions::default());
-        let node = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| {
-            let use_a = cx.read(&flag);
-            let value = if use_a { cx.read(&a) } else { cx.read(&b) };
-            StylePatch {
-                opacity: Some(value as f32),
-                ..StylePatch::default()
-            }
-        });
-
-        app.refresh_styles(window).expect("窗口存在");
-        let first = deps(&app, window, node);
-        assert!(first.contains(&flag.id()) && first.contains(&a.id()));
-        assert!(!first.contains(&b.id()));
-
-        let _ = app.take_wake_request();
-        assert!(app.write(&flag, false));
-        app.refresh_styles(window).expect("窗口存在");
-        let second = deps(&app, window, node);
-        assert!(
-            second.contains(&b.id()) && !second.contains(&a.id()),
-            "条件分支切换后必须退订 a、订阅 b"
-        );
-
-        clear_dirty(&mut app, window);
-        let _ = app.take_wake_request();
-        assert!(app.write(&a, 99));
-        assert!(
-            !flags(&app, window, node).contains(DirtyFlags::PAINT),
-            "已退订的信号不得再标脏该节点"
-        );
-    }
-
-    /// P1-2.5 回归：卸载节点必须同步解开依赖边。
-    ///
-    /// 旧实现只在 `close_window` 里退订仍存活的节点；`remove_node`（以及虚拟列表回收行）
-    /// 直接 `tree_mut().remove()`，留下永久死边。死边会随「挂载/卸载」次数无界累积，而
-    /// `App::write` 是最高频热路径 —— 每次写都要遍历并过滤这些死 owner。
-    #[test]
-    fn removing_a_node_detaches_its_dependencies() {
-        let (_rt, mut app) = new_app();
-        let signal: Signal<u32> = app.signal(0);
-        let window = app.create_window(WindowOptions::default());
-
-        // 两个独立读者：一个用裸 `tree.remove` 卸载（分层上不负责依赖图），一个走
-        // `App::remove_node`（必须在删除的同时 detach）。断言后者不残留、前者残留。
-        let bare = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-            opacity: Some(cx.read(&signal) as f32),
-            ..StylePatch::default()
-        });
-        let managed = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-            opacity: Some(cx.read(&signal) as f32),
-            ..StylePatch::default()
-        });
-        app.refresh_styles(window).expect("窗口存在");
-        let _ = app.take_wake_request();
-        let before = crate::test_support::diagnostics::dependency_dump(&app);
-        assert_eq!(before.edges, 2, "两个节点各一条边：{before:?}");
-
-        app.window_mut(window)
-            .expect("window")
-            .tree_mut()
-            .remove(bare)
-            .expect("裸卸载");
-        assert!(app.remove_node(window, managed), "App 路径卸载");
-
-        let after = crate::test_support::diagnostics::dependency_dump(&app);
-        assert_eq!(
-            after.edges, 1,
-            "`remove_node` 必须解开该节点的边；只剩裸卸载留下的那一条：{after:?}"
-        );
-        let _ = app.take_wake_request();
-        assert!(app.write(&signal, 1), "写本身仍成功");
-    }
-
-    #[test]
-    fn close_window_detaches_dependencies() {
-        let (_rt, mut app) = new_app();
-        let signal: Signal<u32> = app.signal(0);
-        let window = app.create_window(WindowOptions::default());
-        let _node = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-            opacity: Some(cx.read(&signal) as f32),
-            ..StylePatch::default()
-        });
-        app.refresh_styles(window).expect("窗口存在");
-        let _ = app.take_wake_request();
-
-        assert!(app.close_window(window));
-        assert!(app.window(window).is_none());
-        assert!(app.write(&signal, 1), "写本身仍成功");
-        assert!(
-            !app.take_wake_request(),
-            "关窗必须精确退订，不得再命中死节点"
-        );
-        assert!(!app.close_window(window), "重复关窗返回 false");
-    }
-
-    #[test]
-    fn refresh_styles_marks_a11y_on_interactive_change() {
-        let (_rt, mut app) = new_app();
-        let enabled: Signal<bool> = app.signal(false);
-        let window = app.create_window(WindowOptions::default());
-        let node = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-            interactive: Some(cx.read(&enabled)),
-            ..StylePatch::default()
-        });
-        app.refresh_styles(window).expect("窗口存在");
-        clear_dirty(&mut app, window);
-
-        assert!(app.write(&enabled, true));
-        app.refresh_styles(window).expect("窗口存在");
-
-        assert!(
-            flags(&app, window, node).contains(DirtyFlags::A11Y),
-            "interactive 变化必须标 A11Y"
-        );
-    }
-
-    #[test]
-    fn eval_guard_pops_on_panic_and_cache_survives() {
-        let (_rt, mut app) = new_app();
-        let bad: Derived<f32> = app.derived(|_cx| -> f32 { panic!("派生闭包炸了") });
-        let window = app.create_window(WindowOptions::default());
-        // 第一个节点：本次求值会 panic（它的 `bind_style` 随后丢失 → 退化为静态节点）。
-        let doomed = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-            opacity: Some(cx.read_derived(&bad).unwrap_or(0.0)),
-            ..StylePatch::default()
-        });
-        // 第二个节点：求值面相同，但它没在 panic 里丢闭包 —— 用来证明后续读返回 `CyclicDerived` 而不是 panic。
-        let survivor = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-            opacity: Some(cx.read_derived(&bad).unwrap_or(0.0)),
-            ..StylePatch::default()
-        });
-
-        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let _ = app.refresh_styles(window);
-        }));
-        assert!(outcome.is_err(), "闭包 panic 必须向上传播");
-        assert!(
-            app.eval_stack_is_empty_for_test(),
-            "EvalGuard::drop 必须在 panic 展开时出栈"
-        );
-
-        let report = app.refresh_styles(window).expect("窗口仍在");
-        assert_eq!(
-            report.evaluated, 1,
-            "panic 的那个节点闭包已丢（跳过），另一个节点仍被求值"
-        );
-        assert!(
-            app.window(window)
-                .expect("窗口存在")
-                .tree()
-                .get(survivor)
-                .expect("存在")
-                .style_patch()
-                .opacity
-                .is_some(),
-            "read_derived 返回 CyclicDerived 后走了 unwrap_or，patch 仍被写入"
-        );
-        assert!(
-            app.window(window)
-                .expect("窗口存在")
-                .tree()
-                .get(doomed)
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn write_isolates_sibling_nodes() {
-        // D16/I3 的核心断言：一次写入只沿依赖图命中**读过它的**节点。
-        let (_rt, mut app) = new_app();
-        let signal_a: Signal<u32> = app.signal(0);
-        let signal_b: Signal<u32> = app.signal(0);
-        let window = app.create_window(WindowOptions::default());
-        let node_a = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-            opacity: Some(cx.read(&signal_a) as f32),
-            ..StylePatch::default()
-        });
-        let node_b = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-            opacity: Some(cx.read(&signal_b) as f32),
-            ..StylePatch::default()
-        });
-        app.refresh_styles(window).expect("窗口存在");
-        let before = flags(&app, window, node_b);
-        let _ = app.take_wake_request();
-
-        assert!(app.write(&signal_a, 1));
-
-        assert!(
-            flags(&app, window, node_a).contains(DirtyFlags::PAINT),
-            "读者必须被标脏"
-        );
-        assert_eq!(
-            flags(&app, window, node_b),
-            before,
-            "非读者（含 REUSABLE）必须完全不变"
-        );
-        assert!(app.take_wake_request(), "有节点变脏 ⇒ 必须请求唤醒");
-    }
-
-    #[test]
-    fn write_only_derived_does_not_wake() {
-        // 只有派生失效、没有节点变脏 ⇒ 不该提交帧（I3「空闲不提交帧」）。
-        let (_rt, mut app) = new_app();
-        let signal: Signal<u32> = app.signal(1);
-        let derived: Derived<u32> = app.derived(move |cx| cx.read(&signal) * 2);
-        let window = app.create_window(WindowOptions::default());
-
-        assert!(app.write(&signal, 2));
-        assert!(!app.take_wake_request(), "只有派生失效 → 不唤醒");
-
-        let report = app.refresh_styles(window).expect("窗口存在");
-        assert_eq!(report.evaluated, 0, "没有节点读该派生");
-        assert!(!report.wake_requested);
-        assert!(app.write(&signal, 3));
-        let _ = derived;
-    }
-
-    /// P1-4：被限流挡下的 a11y 变化必须让平台泵「到期补发」。
-    #[test]
-    fn a11y_retry_pending_reports_throttled_changes() {
-        let (_rt, mut app) = new_app();
-        let window = app.create_window(WindowOptions::default());
-        let root = app.window(window).expect("窗口").tree().root();
-        let node = NodeBuilder::boxed()
-            .build(app.window_mut(window).expect("窗口").tree_mut(), root)
-            .expect("挂载");
-        app.refresh_styles(window).expect("窗口存在");
-        assert!(app.a11y_take(window).is_some(), "首笔交付");
-
-        // 限流窗口内再标脏：不能立即交付，但必须有「到期补发」信号。
-        app.window_mut(window)
-            .expect("窗口")
-            .tree_mut()
-            .mark_a11y(node);
-        assert!(!app.a11y_pending(window), "限流窗口内不立即交付");
-        assert!(
-            app.a11y_retry_pending(),
-            "必须有到期补发信号，否则最后一次变化永远交付不出去"
-        );
-
-        // 时间窗过后：可交付，补发信号消失。
-        app.advance_clock(std::time::Duration::from_millis(150));
-        assert!(app.a11y_pending(window), "到期后可交付");
-        assert!(!app.a11y_retry_pending(), "可交付时不再需要补发信号");
-        let _ = app.a11y_take(window);
-    }
-    /// P2-8：`on_close` 返回 false 必须拦下关闭，返回 true 才真的关。
-    /// P2-3：给不存在的窗口注册关闭处理器必须被忽略（否则留下永不调用、却持有闭包的条目）。
-    #[test]
-    fn on_close_ignores_unknown_windows() {
-        let (_rt, mut app) = new_app();
-        let window = app.create_window(WindowOptions::default());
-        let ghost = app.create_window(WindowOptions::default());
-        assert!(app.close_window(ghost));
-        let called = std::rc::Rc::new(std::cell::Cell::new(0_u32));
-        let counter = called.clone();
-        app.on_close(ghost, move |_app| {
-            counter.set(counter.get() + 1);
-            false
-        });
-        assert!(!app.request_close(ghost), "已关闭的窗口没有可拦的关闭请求");
-        assert_eq!(called.get(), 0, "幽灵处理器不得被调用");
-        // 正常窗口仍可注册。
-        app.on_close(window, |_app| false);
-        assert!(!app.request_close(window));
-    }
-
-    /// P2-3：处理器内部重新注册的处理器，不能被 take→put 的旧闭包覆盖。
-    #[test]
-    fn close_handler_reregistration_is_not_overwritten() {
-        let (_rt, mut app) = new_app();
-        let window = app.create_window(WindowOptions::default());
-        app.on_close(window, move |app| {
-            // 第一次询问后换成一个「永远拦下」的新处理器；再点一次时必须走新的。
-            app.on_close(window, |_app| false);
-            false
-        });
-        assert!(!app.request_close(window), "旧处理器拦下");
-        // 新处理器同样是拦下，但关键是它必须在表里（不是旧闭包）。
-        assert!(!app.request_close(window), "新处理器也必须被问到");
-        assert!(app.window(window).is_some(), "两次都拦下，窗口仍在");
-    }
-
-    #[test]
-    fn close_handler_can_veto_the_close() {
-        let (_rt, mut app) = new_app();
-        let window = app.create_window(WindowOptions::default());
-        let denied = std::rc::Rc::new(std::cell::Cell::new(0_u32));
-        let seen = denied.clone();
-        app.on_close(window, move |_app| {
-            seen.set(seen.get() + 1);
-            false
-        });
-
-        assert!(!app.request_close(window), "返回 false 必须拦下关闭");
-        assert!(app.window(window).is_some(), "被拦下时窗口必须仍然存在");
-        assert_eq!(denied.get(), 1, "处理器必须被调用");
-
-        // 第二次也拦下（处理器不能被消费掉）。
-        assert!(!app.request_close(window));
-        assert_eq!(denied.get(), 2);
-
-        // 换成允许关闭的处理器。
-        app.on_close(window, |_app| true);
-        assert!(app.request_close(window), "返回 true 必须真的关闭");
-        assert!(app.window(window).is_none());
-    }
-    /// P2-6：a11y 交付按窗口限流，且时间窗过后继续交付。
-    ///
-    /// 实时行情会让 `A11Y` 脏位每帧为真；不限流时每帧都要全树扫描 + 构造 `TreeUpdate`。
-    /// P3-5：同一诊断重复产生时不得刷屏（64 槽环形缓冲会被同一个问题的重复项占满）。
-    #[test]
-    fn a11y_diagnostics_are_deduplicated() {
-        let (_rt, mut app) = new_app();
-        let window = app.create_window(WindowOptions::default());
-        let root = app.window(window).expect("窗口").tree().root();
-        let node = NodeBuilder::boxed()
-            .build(app.window_mut(window).expect("窗口").tree_mut(), root)
-            .expect("挂载");
-        let diagnostic = crate::a11y::A11yDiagnostic::MissingLabel { node };
-        for _ in 0..8 {
-            app.a11y_note(diagnostic.clone());
-        }
-        assert_eq!(
-            app.a11y_diagnostics(),
-            &[diagnostic],
-            "同一条诊断只保留一份"
-        );
-        // 不同诊断仍可追加。
-        app.a11y_note(crate::a11y::A11yDiagnostic::MissingLabel { node: root });
-        assert_eq!(app.a11y_diagnostics().len(), 2);
-    }
-
-    #[test]
-    fn a11y_delivery_is_throttled_per_window() {
-        let (_rt, mut app) = new_app();
-        let window = app.create_window(WindowOptions::default());
-        let root = app.window(window).expect("窗口").tree().root();
-        let node = NodeBuilder::boxed()
-            .build(app.window_mut(window).expect("窗口").tree_mut(), root)
-            .expect("挂载");
-        app.refresh_styles(window).expect("窗口存在");
-
-        assert!(app.a11y_pending(window), "首次交付不受限流影响");
-        assert!(app.a11y_take(window).is_some(), "应产出一笔交付");
-
-        // 立刻再标脏：仍在时间窗内 ⇒ 不交付。
-        app.window_mut(window)
-            .expect("窗口")
-            .tree_mut()
-            .mark_a11y(node);
-        assert!(
-            !app.a11y_pending(window),
-            "时间窗内不得再次交付（高频更新会变成每帧全树扫描）"
-        );
-
-        // 推过时间窗 ⇒ 恢复交付。
-        app.advance_clock(std::time::Duration::from_millis(150));
-        assert!(app.a11y_pending(window), "时间窗过后必须继续交付");
-        let _ = app.a11y_take(window);
-        let _ = node;
-    }
-    #[test]
-    fn changed_text_marks_a11y() {
-        // 文本节点的可访问名/值 = 文本内容。只标 PAINT 时，"70%" → "80%" 这种等宽替换不会触发
-        // LAYOUT，AT 会一直读到旧值（P15 F-153）。
-        use smol_str::SmolStr;
-
-        let (_rt, mut app) = new_app();
-        let signal: Signal<SmolStr> = app.signal(SmolStr::new_static("A"));
-        let window = app.create_window(WindowOptions::default());
-        let root = app.window(window).expect("窗口存在").tree().root();
-        let node = NodeBuilder::text("A", crate::text::TextStyle::new(12.0))
-            .bind_text(move |cx| cx.read(&signal))
-            .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
-            .expect("挂载");
-        app.refresh_styles(window).expect("窗口存在");
-        // 消费首帧的 A11Y 位（新节点初始就带 LAYOUT|PAINT|A11Y）。
-        let _ = app.a11y_take(window);
-        let _ = app.take_wake_request();
-        assert!(
-            !flags(&app, window, node).contains(DirtyFlags::A11Y),
-            "前置条件：A11Y 位已消费"
-        );
-
-        assert!(app.write(&signal, SmolStr::new_static("B")));
-        app.refresh_styles(window).expect("窗口存在");
-
-        assert!(
-            flags(&app, window, node).contains(DirtyFlags::A11Y),
-            "文本内容变化必须标 A11Y（AT 读的是文本值）"
-        );
-    }
-
-    #[test]
-    fn writing_a_signal_wakes_the_platform_loop() {
-        // 回投任务（`AppHandle::send` / a11y `ActionRequest`）里写状态时，平台泵已经过了帧门禁；
-        // 只置 `wake_requested` 不唤醒 dispatcher，会让画面与 a11y 更新等到下一条无关消息（F-152）。
-        let (_rt, mut app) = new_app();
-        let signal: Signal<u32> = app.signal(0);
-        let window = app.create_window(WindowOptions::default());
-        let root = app.window(window).expect("窗口存在").tree().root();
-        let _ = NodeBuilder::boxed()
-            .bind_style(move |cx| StylePatch {
-                opacity: Some(cx.read(&signal) as f32),
-                ..StylePatch::default()
-            })
-            .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
-            .expect("挂载");
-        // 先求值一次样式：依赖边在 `refresh_styles` 里建立，没有边就无从失效。
-        app.refresh_styles(window).expect("窗口存在");
-        let _ = app.take_wake_request();
-        let _ = app.dispatcher().take_frame_wake();
-
-        assert!(app.write(&signal, 1));
-
-        assert!(
-            app.dispatcher().take_frame_wake(),
-            "写信号必须唤醒平台事件循环（否则回投任务里的状态不会出帧）"
-        );
-    }
-
-    #[test]
-    fn write_marks_across_windows() {
-        let (_rt, mut app) = new_app();
-        let signal: Signal<u32> = app.signal(0);
-        let window_a = app.create_window(WindowOptions::default());
-        let window_b = app.create_window(WindowOptions::default());
-        let node_a = node_with(&mut app, window_a, move |cx: &mut ReadCtx<'_>| StylePatch {
-            opacity: Some(cx.read(&signal) as f32),
-            ..StylePatch::default()
-        });
-        let node_b = node_with(&mut app, window_b, move |cx: &mut ReadCtx<'_>| StylePatch {
-            opacity: Some(cx.read(&signal) as f32),
-            ..StylePatch::default()
-        });
-        app.refresh_styles(window_a).expect("窗口存在");
-        app.refresh_styles(window_b).expect("窗口存在");
-        clear_dirty(&mut app, window_a);
-        clear_dirty(&mut app, window_b);
-
-        assert!(app.write(&signal, 9));
-
-        assert!(flags(&app, window_a, node_a).contains(DirtyFlags::PAINT));
-        assert!(flags(&app, window_b, node_b).contains(DirtyFlags::PAINT));
-        assert!(app.take_wake_request());
-    }
-
-    #[test]
-    fn create_window_ids_are_unique_and_monotonic() {
-        let (_rt, mut app) = new_app();
-        let first = app.create_window(WindowOptions::default());
-        let second = app.create_window(WindowOptions::default());
-        let third = app.create_window(WindowOptions::default());
-
-        assert_eq!(
-            (first.to_bits(), second.to_bits(), third.to_bits()),
-            (1, 2, 3),
-            "WindowId 从 1 起单调递增（0 非法）"
-        );
-        assert_eq!(app.windows().count(), 3);
-        for (id, window) in app.windows() {
-            assert_eq!(id, window.id(), "windows() 带出的 id 必须与窗口自身一致");
-            assert!(app.window(id).is_some());
-        }
-    }
-
-    #[test]
-    fn close_window_unknown_returns_false() {
-        let (_rt, mut app) = new_app();
-
-        assert!(!app.close_window(WindowId::for_test(42)));
-    }
-
-    #[test]
-    fn bind_style_panic_clears_ghost_deps() {
-        let (_rt, mut app) = new_app();
-        let signal: Signal<u32> = app.signal(0);
-        let calls = Rc::new(Cell::new(0u32));
-        let counter = Rc::clone(&calls);
-        let window = app.create_window(WindowOptions::default());
-        let node = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| {
-            counter.set(counter.get() + 1);
-            let value = cx.read(&signal);
-            assert!(counter.get() <= 1, "第二次求值故意 panic");
-            StylePatch {
-                opacity: Some(value as f32),
-                ..StylePatch::default()
-            }
-        });
-        app.refresh_styles(window).expect("窗口存在");
-        assert_eq!(deps(&app, window, node), vec![signal.id()]);
-
-        assert!(app.write(&signal, 4));
-        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let _ = app.refresh_styles(window);
-        }));
-        assert!(outcome.is_err(), "panic 必须向上传播");
-        assert_eq!(
-            deps(&app, window, node),
-            vec![signal.id()],
-            "panic 打断了 replace_deps ⇒ 旧边仍在（幽灵边）"
-        );
-
-        let report = app.refresh_styles(window).expect("窗口仍在");
-        assert_eq!(report.evaluated, 0, "闭包已丢 → 不算求值");
-        assert!(deps(&app, window, node).is_empty(), "幽灵边必须被显式退订");
-
-        let _ = app.take_wake_request();
-        assert!(app.write(&signal, 5), "值仍然会变");
-        assert!(!app.take_wake_request(), "退订后再写旧信号不得再命中该节点");
-    }
-
-    #[test]
-    fn layout_text_breaks_at_the_content_width() {
-        // B1：60 px 宽、16 px 字号的 4 个单词必须断成多行，且选区矩形逐行对齐。
-        let (_rt, mut app, window, node) = text_app("aaaa aaaa aaaa aaaa", Some(60.0));
-        let _ = refresh(&mut app, window);
-        let _ = layout(&mut app, window);
-        let report = text_layout(&mut app, window);
-
-        assert_eq!(report.laid, 1);
-        let tree = app.window(window).expect("窗口存在").tree();
-        let line = tree.text_line(node).expect("行快照").clone();
-        assert!(
-            line.lines.len() >= 3,
-            "content width 60 must wrap into several lines, got {}",
-            line.lines.len()
-        );
-        let rects = tree
-            .text_selection_rects(node, 0, line.text.len())
-            .expect("选区");
-        assert!(
-            rects.len() >= 3,
-            "selection rects must cover the broken lines"
-        );
-        assert!(
-            line.width <= 60.5,
-            "the line box must respect the content width"
-        );
-    }
-
-    #[test]
-    fn ime_cursor_area_requires_text_shape_and_can_be_cleared() {
-        let (_rt, mut app, window, node) = text_app("abc", None);
-        let unknown = WindowId::for_test(999);
-        assert!(matches!(
-            app.set_ime_cursor_area(unknown, node, 0),
-            Err(crate::error::EngineError::UnknownWindow { .. })
-        ));
-        let root = app.window(window).expect("窗口").tree().root();
-        assert!(matches!(
-            app.set_ime_cursor_area(window, root, 0),
-            Err(crate::error::EngineError::TextShape { .. })
-        ));
-        assert!(matches!(app.set_ime_cursor_area(window, node, 4), Ok(())));
-        assert!(matches!(app.set_ime_cursor_area(window, node, 1), Ok(())));
-        assert!(matches!(
-            app.ime_cursor_area(window),
-            Err(crate::error::EngineError::TextShape { .. })
-        ));
-
-        let _ = refresh(&mut app, window);
-        let _ = layout(&mut app, window);
-        let _ = text_layout(&mut app, window);
-        let area = app
-            .ime_cursor_area(window)
-            .expect("窗口存在")
-            .expect("已 shape 后有 hint");
-        assert!(area.size.width >= 1.0);
-        assert!(area.size.height > 0.0);
-
-        assert!(app.set_ime_cursor_area(window, node, 4).is_ok());
-        assert!(matches!(
-            app.ime_cursor_area(window),
-            Err(crate::error::EngineError::TextShape { .. })
-        ));
-        assert!(app.set_ime_cursor_area(window, node, 3).is_ok());
-
-        app.clear_ime_cursor_area(window);
-        assert_eq!(app.ime_cursor_area(window).expect("窗口存在"), None);
-
-        assert!(app.set_ime_cursor_area(window, node, 3).is_ok());
-        set_text(
-            &mut app,
-            window,
-            node,
-            "abcd",
-            crate::text::TextStyle::new(16.0),
-        );
-        assert!(
-            matches!(
-                app.ime_cursor_area(window),
-                Err(crate::error::EngineError::TextShape { .. })
-            ),
-            "文本内容变化后、下一次 text pass 前不得返回旧 caret"
-        );
-    }
-
-    #[test]
-    fn ime_cursor_area_resolves_after_the_first_frame() {
-        let (_rt, mut app, window, node) = text_app("abc", None);
-        assert!(app.set_ime_cursor_area(window, node, 3).is_ok());
-
-        let outcome = app.frame(window).expect("窗口存在").expect("首帧成功");
-        assert!(matches!(outcome, FrameOutcome::Committed(_)));
-        assert!(
-            app.ime_cursor_area(window).expect("窗口存在").is_some(),
-            "首帧 text/layout 完成后应能解析 caret"
-        );
-    }
-
-    #[test]
-    fn ime_cursor_area_rejects_a_non_boundary_byte_index() {
-        let (_rt, mut app, window, node) = text_app("a中b", None);
-        let _ = refresh(&mut app, window);
-        let _ = layout(&mut app, window);
-        let _ = text_layout(&mut app, window);
-
-        assert!(app.set_ime_cursor_area(window, node, 2).is_ok());
-        assert!(matches!(
-            app.ime_cursor_area(window),
-            Err(crate::error::EngineError::TextShape { .. })
-        ));
-    }
-
-    #[test]
-    fn text_caret_rect_includes_border_padding_and_node_origin() {
-        let (_rt, mut app) = new_app();
-        let window = app.create_window(WindowOptions::default());
-        let root = app.window(window).expect("窗口").tree().root();
-        let mut style = text_style(Some(200.0));
-        style.inner.padding = taffy::geometry::Rect {
-            left: taffy::style::LengthPercentage::length(9.0),
-            right: taffy::style::LengthPercentage::length(0.0),
-            top: taffy::style::LengthPercentage::length(7.0),
-            bottom: taffy::style::LengthPercentage::length(0.0),
-        };
-        style.inner.border = taffy::geometry::Rect {
-            left: taffy::style::LengthPercentage::length(2.0),
-            right: taffy::style::LengthPercentage::length(0.0),
-            top: taffy::style::LengthPercentage::length(3.0),
-            bottom: taffy::style::LengthPercentage::length(0.0),
-        };
-        let node = NodeBuilder::text("abc", crate::text::TextStyle::new(16.0))
-            .style(style)
-            .build(app.window_mut(window).expect("窗口").tree_mut(), root)
-            .expect("挂载");
-        let _ = refresh(&mut app, window);
-        let _ = layout(&mut app, window);
-        let _ = text_layout(&mut app, window);
-
-        let rect = app
-            .window(window)
-            .expect("窗口")
-            .text_caret_rect(node, 0)
-            .expect("caret");
-        assert!((rect.origin.x - 11.0).abs() < 0.01, "{rect:?}");
-        assert!((rect.origin.y - 10.0).abs() < 0.01, "{rect:?}");
-    }
-
-    #[test]
-    fn close_window_forgets_the_scale_epoch() {
-        let (_rt, mut app, window, _node) = text_app("x", None);
-        let _ = refresh(&mut app, window);
-        assert!(app.close_window(window));
-        assert!(!app.close_window(window), "second close is a no-op");
-    }
-
-    #[test]
-    fn changed_text_always_relayouts_the_snapshot() {
-        let (_rt, mut app, window, node) = text_app("aaaa aaaa aaaa aaaa", Some(60.0));
-        let _ = refresh(&mut app, window);
-        let _ = layout(&mut app, window);
-        let _ = text_layout(&mut app, window);
-
-        for text in ["bbbb", "aaaa aaaa aaaa aaaa bbbb", "WWWW"] {
-            set_text(
-                &mut app,
-                window,
-                node,
-                text,
-                crate::text::TextStyle::new(16.0),
-            );
-            let pass = refresh(&mut app, window);
-            assert_eq!(pass.shaped, 1, "new text must reshape");
-            let laid = text_layout(&mut app, window);
-            assert_eq!(laid.laid, 1, "B4: changed text must relayout ({text})");
-            assert_eq!(laid.reused, 0);
-            let tree = app.window(window).expect("window").tree();
-            assert_eq!(tree.text_line(node).expect("line").text, text);
-        }
-    }
-
-    #[test]
-    fn style_and_family_changes_relayout() {
-        let (_rt, mut app, window, node) = text_app("same text", Some(60.0));
-        let _ = refresh(&mut app, window);
-        let _ = layout(&mut app, window);
-        let _ = text_layout(&mut app, window);
-
-        let mut style = crate::text::TextStyle::new(24.0);
-        style = style.with_family(smol_str::SmolStr::new_static("Consolas"));
-        set_text(&mut app, window, node, "same text", style);
-
-        let pass = refresh(&mut app, window);
-        assert_eq!(pass.shaped, 1, "style/family is part of the shape key");
-        assert_eq!(text_layout(&mut app, window).laid, 1);
-    }
-
-    #[test]
-    fn inline_boxes_changes_relayout() {
-        let (_rt, mut app) = new_app();
-        let window = app.create_window(WindowOptions::default());
-        let spec = crate::text::InlineBoxSpec {
-            id: 7,
-            index: 1,
-            size: crate::math::Size::new(20.0, 20.0),
-            baseline: None,
-            align: crate::text::InlineAlign::Baseline,
-        };
-        let node = {
-            let w = app.window_mut(window).expect("window");
-            let root = w.tree().root();
-            NodeBuilder::text("a b", crate::text::TextStyle::new(16.0))
-                .inline_boxes([spec])
-                .build(w.tree_mut(), root)
-                .expect("build")
-        };
-        let _ = refresh(&mut app, window);
-        let _ = layout(&mut app, window);
-        assert_eq!(text_layout(&mut app, window).laid, 1);
-
-        let spec2 = crate::text::InlineBoxSpec {
-            id: 9,
-            index: 1,
-            size: crate::math::Size::new(40.0, 10.0),
-            baseline: Some(8.0),
-            align: crate::text::InlineAlign::Top,
-        };
-        {
-            let tree = app.window_mut(window).expect("window").tree_mut();
-            let mut content = tree.text_content(node).expect("text").clone();
-            content.inline_boxes = Box::new([spec2]);
-            tree.set_text_content(node, content);
-        }
-        let pass = refresh(&mut app, window);
-        assert_eq!(pass.shaped, 1, "inline boxes are part of the shape key");
-        assert_eq!(text_layout(&mut app, window).laid, 1);
-    }
-
-    #[test]
-    fn bind_text_preserves_inline_boxes() {
-        let (_rt, mut app) = new_app();
-        let window = app.create_window(WindowOptions::default());
-        let signal = app.signal(smol_str::SmolStr::new_static("first"));
-        let spec = crate::text::InlineBoxSpec {
-            id: 3,
-            index: 0,
-            size: crate::math::Size::new(16.0, 16.0),
-            baseline: None,
-            align: crate::text::InlineAlign::Baseline,
-        };
-        let node = {
-            let w = app.window_mut(window).expect("window");
-            let root = w.tree().root();
-            NodeBuilder::text("", crate::text::TextStyle::new(16.0))
-                .bind_text(move |cx| cx.read(&signal))
-                .inline_boxes([spec])
-                .build(w.tree_mut(), root)
-                .expect("build")
-        };
-
-        for value in ["first", "second"] {
-            let _ = app.refresh_styles(window);
-            let content = app
-                .window(window)
-                .expect("window")
-                .tree()
-                .text_content(node)
-                .expect("text")
-                .clone();
-            assert_eq!(
-                content.inline_boxes.len(),
-                1,
-                "inline boxes survive bind_text"
-            );
-            assert_eq!(content.text, value);
-            if value == "first" {
-                app.write(&signal, smol_str::SmolStr::new_static("second"));
-            }
-        }
-    }
-
-    // ── P06：完整帧 ──
-
-    #[test]
-    fn app_frame_runs_styles_then_paints() {
-        let (_rt, mut app) = new_app();
-        let window = app.create_window(WindowOptions::default());
-        let root = app.window(window).expect("窗口").tree().root();
-        let background = app.signal(crate::paint::color::Color::WHITE);
-        {
-            let _ = NodeBuilder::boxed()
-                .layout_override(crate::math::Rect::new(0.0, 0.0, 20.0, 10.0))
-                .bind_style(move |cx| StylePatch {
-                    background: Some(cx.read(&background)),
-                    ..StylePatch::default()
-                })
-                .build(app.window_mut(window).expect("窗口").tree_mut(), root)
-                .expect("挂载成功");
-        }
-
-        let outcome = app.frame(window).expect("窗口存在").expect("帧成功");
-        assert!(matches!(outcome, FrameOutcome::Committed(_)));
-
-        // 改信号 → 下一帧的 Quad 颜色必须变（证明 styles pass 在 paint 之前跑过）。
-        app.write(&background, crate::paint::color::Color::BLACK);
-        let _ = app.frame(window).expect("窗口存在").expect("帧成功");
-        let scene = app.window(window).expect("窗口").scene();
-        let quad_color = scene
-            .iter()
-            .find_map(|primitive| match primitive {
-                crate::paint::primitive::Primitive::Quad(quad) => match &quad.paint {
-                    crate::paint::primitive::QuadPaint::Solid { fill, .. } => Some(*fill),
-                    crate::paint::primitive::QuadPaint::Gradient(_) => None,
-                },
-                _ => None,
-            })
-            .expect("必须有背景 Quad");
-        assert_eq!(quad_color, crate::paint::color::Color::BLACK);
-    }
-
-    #[test]
-    fn app_frame_unknown_window_is_none() {
-        let (_rt, mut app) = new_app();
-        assert!(app.frame(WindowId::for_test(99)).is_none());
-    }
-
-    #[test]
-    fn app_frame_is_idle_without_work() {
-        let (_rt, mut app) = new_app();
-        let window = app.create_window(WindowOptions::default());
-        // 首帧有布局移动（根从 0 尺寸撑满窗口）⇒ 提交一次；之后无写、无脏 ⇒ 空闲零帧。
-        let first = app.frame(window).expect("窗口存在");
-        assert!(matches!(first, Ok(FrameOutcome::Committed(_))));
-
-        let second = app.frame(window).expect("窗口存在");
-        assert!(matches!(second, Ok(FrameOutcome::Idle)));
-        assert_eq!(
-            app.window(window).expect("窗口").frame_index().get(),
-            1,
-            "空闲帧不得递增序号"
-        );
-    }
-}
+mod tests;
 
 /// P10 交互机制的 App 级用例（分发 / 焦点 / 滚动 / 虚拟列表 / 浮层 / 拖拽 / 动画）。
 ///
 /// 只走公开 + `pub(crate)` 面；`FrameRecord` 的断言（damage、primitives→node）在
 /// `test_support::app` 的 `--features test-support` 用例里。
 #[cfg(test)]
-mod interaction_tests {
-    use std::{cell::Cell, rc::Rc};
-
-    use super::App;
-    use crate::{
-        error::EngineError,
-        event::{
-            Action, ActionSource, InputEvent, Key, KeyBinding, KeyState, Modifiers, PointerButton,
-        },
-        interaction::{
-            AnimatedValue, AnimationSpec, DragPhase, Easing, InputThresholds, OverlayDismiss,
-            OverlayOptions, OverlayPlacement, ScrollAxis, ScrollConfig, VirtualListConfig,
-        },
-        math::{Point, Rect, Scale, Size},
-        node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId},
-        paint::{
-            color::Color,
-            primitive::Primitive,
-            style::{Clip, FocusRing, PaintSpec, Style, StylePatch},
-        },
-        window::{FrameOutcome, WindowId, WindowOptions},
-    };
-
-    fn setup() -> (tokio::runtime::Runtime, App, WindowId) {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("current-thread runtime");
-        let mut app = App::new(rt.handle().clone());
-        let window = app.create_window(WindowOptions {
-            title: "p10".into(),
-            size: Size::new(400.0, 300.0),
-            scale: Scale::ONE,
-            ..WindowOptions::default()
-        });
-        (rt, app, window)
-    }
-
-    fn frame(app: &mut App, window: WindowId) -> FrameOutcome {
-        app.frame(window)
-            .expect("window exists")
-            .expect("frame succeeds")
-    }
-
-    /// P2-3.2 回归：深层节点的布局变化**不得**把祖先（尤其根）的整块盒子并入 damage。
-    ///
-    /// 旧实现的 `bubble_layout` 复用 `touch(LAYOUT)`，每个祖先都会把自己的盒子并进
-    /// damage，一路到根 ⇒ 根盒 = 整个窗口 ⇒ 一段文本宽度变化就整帧重绘（价格图每 tick
-    /// 全帧重写的直接原因）。祖先只需要重跑布局，像素变化由 `place_subtree` 精确产出。
-    #[test]
-    fn a_deep_layout_change_does_not_damage_the_whole_window() {
-        let (_rt, mut app, window) = setup();
-        let tree = app.window_mut(window).expect("window").tree_mut();
-        let root = tree.root();
-        // 三层容器，最内层是文本。
-        let outer = NodeBuilder::boxed().build(tree, root).expect("mount");
-        let inner = NodeBuilder::boxed().build(tree, outer).expect("mount");
-        let label = NodeBuilder::text("100.00", crate::text::TextStyle::new(12.0))
-            .build(tree, inner)
-            .expect("mount");
-        frame(&mut app, window);
-        let _ = app.take_wake_request();
-
-        // 文本内容变长 ⇒ LAYOUT 冒泡到根。
-        let tree = app.window_mut(window).expect("window").tree_mut();
-        tree.set_text_content(
-            label,
-            crate::text::TextContent::new("1000000.00", crate::text::TextStyle::new(12.0)),
-        );
-        frame(&mut app, window);
-
-        let tree = app.window(window).expect("window").tree();
-        // 根自己的 damage 必须是空的：它没有移动，也不该为后代的布局变化背 damage。
-        assert!(
-            tree.get(root).expect("root").damage().is_empty(),
-            "根不应因深层布局变化产生 damage（否则整帧重绘）：{:?}",
-            tree.get(root).expect("root").damage()
-        );
-        // 中间容器同样不该有 damage。
-        assert!(
-            tree.get(outer).expect("outer").damage().is_empty(),
-            "中间容器不应有 damage：{:?}",
-            tree.get(outer).expect("outer").damage()
-        );
-        let _ = inner;
-    }
-    fn root_of(app: &App, window: WindowId) -> NodeId {
-        app.window(window).expect("window").tree().root()
-    }
-
-    fn background() -> PaintSpec {
-        PaintSpec {
-            background: Color::from_rgba8([200, 40, 40, 255]),
-            ..PaintSpec::default()
-        }
-    }
-
-    fn mount_override(app: &mut App, window: WindowId, parent: NodeId, rect: Rect) -> NodeId {
-        NodeBuilder::boxed()
-            .layout_override(rect)
-            .paint(background())
-            .build(app.window_mut(window).expect("window").tree_mut(), parent)
-            .expect("mount")
-    }
-
-    fn mount_scroll_container(app: &mut App, window: WindowId, height: f32) -> NodeId {
-        let mut style = Style::default();
-        style.inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(200.0),
-            height: taffy::style::Dimension::length(height),
-        };
-        style.clip = Clip::Bounds;
-        let tree = app.window_mut(window).expect("window").tree_mut();
-        let root = tree.root();
-        NodeBuilder::boxed()
-            .style(style)
-            .build(tree, root)
-            .expect("mount")
-    }
-
-    /// P2：同一帧内的多个滚轮事件必须**累加**到动画目标，不能互相覆盖。
-    ///
-    /// `scroll_to_animated` 每帧只把 offset 推进一步；一次泵迭代里 drain 到的多个滚轮事件
-    /// 若都以「当前 offset」为基准重算目标，第 1 个事件的 delta 会被静默丢弃（触控板 /
-    /// 高精度滚轮一个批次常发多个事件，表现为「滚不动」）。
-    #[test]
-    fn wheel_events_in_one_frame_accumulate() {
-        let (_rt, mut app, window) = setup();
-        let outer = mount_scroll_container(&mut app, window, 150.0);
-        frame(&mut app, window);
-        let handle = app
-            .make_scroll(
-                window,
-                outer,
-                ScrollConfig {
-                    axis: ScrollAxis::Vertical,
-                    line_height: 48.0,
-                },
-            )
-            .expect("scrollable");
-        app.set_scroll_content(&handle, Size::new(200.0, 400.0))
-            .expect("content");
-
-        // 帧内连滚两格（不插帧）：目标必须是 2 行 = 96 px。
-        for _ in 0..2 {
-            app.dispatch_input(
-                window,
-                InputEvent::Scroll {
-                    position: Point::new(50.0, 50.0),
-                    delta_x: 0.0,
-                    delta_y: -1.0,
-                    modifiers: Modifiers::empty(),
-                },
-            );
-        }
-        app.advance_clock(std::time::Duration::from_millis(400));
-        frame(&mut app, window);
-        let offset = app
-            .window(window)
-            .expect("window")
-            .tree()
-            .scroll_slot(outer)
-            .map(|slot| slot.offset.y);
-        assert_eq!(offset, Some(96.0), "两次滚轮必须累加（各 48 px）");
-    }
-
-    /// P2-10：`line_height <= 0` 必须在 `make_scroll` 处拒绝，否则残量计算会写出 NaN。
-    /// 复审 P2-3：公开入口的 NaN 必须在 API 边界拒绝（否则 `clamp` 保留 NaN，
-    /// `next == slot.offset` 恒 false ⇒ 每帧自请求重绘）。
-    #[test]
-    fn non_finite_scroll_inputs_are_rejected() {
-        let (_rt, mut app, window) = setup();
-        let outer = mount_scroll_container(&mut app, window, 150.0);
-        frame(&mut app, window);
-        let handle = app
-            .make_scroll(
-                window,
-                outer,
-                ScrollConfig {
-                    axis: ScrollAxis::Vertical,
-                    line_height: 48.0,
-                },
-            )
-            .expect("scrollable");
-        assert!(app.scroll_to(&handle, Point::new(f32::NAN, 0.0)).is_err());
-        assert!(
-            app.scroll_to(&handle, Point::new(0.0, f32::INFINITY))
-                .is_err()
-        );
-        assert!(
-            app.set_scroll_content(&handle, crate::math::Size::new(f32::NAN, 100.0))
-                .is_err()
-        );
-        assert!(
-            app.set_scroll_content(&handle, crate::math::Size::new(100.0, f32::INFINITY))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn non_positive_line_height_is_rejected() {
-        let (_rt, mut app, window) = setup();
-        let outer = mount_scroll_container(&mut app, window, 150.0);
-        frame(&mut app, window);
-        for line_height in [0.0, -48.0, f32::NAN] {
-            let result = app.make_scroll(
-                window,
-                outer,
-                ScrollConfig {
-                    axis: ScrollAxis::Vertical,
-                    line_height,
-                },
-            );
-            assert!(result.is_err(), "line_height={line_height} 必须被拒绝");
-        }
-    }
-    /// P0 回归（A4）：`App` 注册的几何必须经 `App::frame` 到达编码器。
-    ///
-    /// 旧缺陷是「调用点从未把 `App.geometry` 传给编码器」，只测编码器本身抓不到。
-    #[test]
-    fn app_registered_geometry_reaches_the_encoder() {
-        let (_rt, mut app, window) = setup();
-        let stride = crate::paint::geometry::GeometryPipeline::Ui.vertex_stride() as usize;
-        let desc = crate::paint::geometry::GeometryDesc {
-            vertex_bytes: bytes::Bytes::from(vec![0u8; stride * 3]),
-            index_bytes: bytes::Bytes::from(vec![0u8, 0, 1, 0, 2, 0]),
-            vertex_stride: stride as u32,
-            index_type: crate::paint::geometry::IndexType::U16,
-            topology: crate::paint::geometry::Topology::TriangleList,
-            bounds: Rect::new(0.0, 0.0, 100.0, 100.0),
-            pipeline: crate::paint::geometry::GeometryPipeline::Ui,
-        };
-        let id = app.geometry_mut().insert(desc).expect("valid geometry");
-        let root = app.window(window).expect("window").tree().root();
-        NodeBuilder::geometry(id)
-            .style({
-                let mut style = Style::default();
-                style.inner.size = taffy::geometry::Size {
-                    width: taffy::style::Dimension::length(100.0),
-                    height: taffy::style::Dimension::length(100.0),
-                };
-                style
-            })
-            .build(app.window_mut(window).expect("window").tree_mut(), root)
-            .expect("mount geometry");
-        frame(&mut app, window);
-
-        let draws = app.window(window).expect("window").encoded_geometry();
-        let draw = draws.first().expect("必须编码出一条几何绘制");
-        assert_eq!(
-            draw.desc.vertex_bytes.len(),
-            stride * 3,
-            "App 注册的顶点必须真的到达编码器（旧缺陷：编码器持空表 ⇒ 空 desc）"
-        );
-    }
-
-    fn lane_quad_bounds(app: &App, window: WindowId, node: NodeId) -> Vec<Rect> {
-        let window = app.window(window).expect("window");
-        let Some(lane) = window.tree().lane_of(node) else {
-            return Vec::new();
-        };
-        window
-            .scene()
-            .lane_primitives(lane)
-            .unwrap_or(&[])
-            .iter()
-            .filter_map(|primitive| match primitive {
-                Primitive::Quad(quad) => Some(quad.bounds),
-                _ => None,
-            })
-            .collect()
-    }
-
-    // ── 动作 / 分发 ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn click_dispatches_the_action_and_marks_only_the_target() {
-        let (_rt, mut app, window) = setup();
-        let calls = Rc::new(Cell::new(0_u32));
-        let seen = calls.clone();
-        app.on_action(Action::custom("hit"), move |_ctx| seen.set(seen.get() + 1));
-        let root = root_of(&app, window);
-        let node = NodeBuilder::boxed()
-            .layout_override(Rect::new(10.0, 10.0, 80.0, 40.0))
-            .paint(background())
-            .on_click(Action::custom("hit"))
-            .build(app.window_mut(window).expect("window").tree_mut(), root)
-            .expect("mount");
-        let tree = app.window_mut(window).expect("window").tree_mut();
-        let _ = tree.set_style_patch_for_test(
-            node,
-            StylePatch {
-                interactive: Some(true),
-                ..StylePatch::default()
-            },
-        );
-        frame(&mut app, window);
-        app.window_mut(window)
-            .expect("window")
-            .tree_mut()
-            .clear_all_dirty_for_test();
-
-        let down = app.dispatch_input(
-            window,
-            InputEvent::PointerDown {
-                position: Point::new(20.0, 20.0),
-                button: PointerButton::Primary,
-                modifiers: Modifiers::empty(),
-            },
-        );
-        let up = app.dispatch_input(
-            window,
-            InputEvent::PointerUp {
-                position: Point::new(20.0, 20.0),
-                button: PointerButton::Primary,
-                modifiers: Modifiers::empty(),
-            },
-        );
-
-        assert_eq!(calls.get(), 1, "点击必须分发一次");
-        assert_eq!(up.action, Some(Action::custom("hit")));
-        assert_eq!(up.target, Some(node));
-        assert_eq!(up.click_count, 1);
-        assert_eq!(down.hit.map(|hit| hit.node), Some(node));
-        // 最小失效：只有 A11Y 脏位（焦点移动），没有 PAINT。
-        let tree = app.window(window).expect("window").tree();
-        assert!(
-            tree.get(node)
-                .expect("node")
-                .dirty()
-                .contains(DirtyFlags::A11Y)
-        );
-        assert!(
-            !tree
-                .get(node)
-                .expect("node")
-                .dirty()
-                .contains(DirtyFlags::PAINT)
-        );
-    }
-
-    #[test]
-    fn enter_activates_the_focused_node() {
-        let (_rt, mut app, window) = setup();
-        let calls = Rc::new(Cell::new(0_u32));
-        let seen = calls.clone();
-        app.on_action(Action::custom("activate"), move |_ctx| {
-            seen.set(seen.get() + 1)
-        });
-        let root = root_of(&app, window);
-        let node = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 50.0, 50.0))
-            .on_action(Action::custom("activate"))
-            .build(app.window_mut(window).expect("window").tree_mut(), root)
-            .expect("mount");
-        frame(&mut app, window);
-        assert!(app.set_focus(window, Some(node)));
-
-        let outcome = app.dispatch_input(
-            window,
-            InputEvent::Key {
-                key: Key::Enter,
-                state: KeyState::Down,
-                modifiers: Modifiers::empty(),
-            },
-        );
-
-        assert_eq!(calls.get(), 1);
-        assert_eq!(outcome.action, Some(Action::custom("activate")));
-        assert_eq!(outcome.target, Some(node));
-    }
-
-    #[test]
-    fn key_binding_reports_the_key_source() {
-        let (_rt, mut app, window) = setup();
-        let source = Rc::new(Cell::new(false));
-        let seen = source.clone();
-        app.on_action(Action::custom("save"), move |ctx| {
-            seen.set(matches!(ctx.source(), ActionSource::Key));
-        });
-        app.bind_key(KeyBinding {
-            key: Key::Other(0x53),
-            modifiers: Modifiers::CONTROL,
-            action: Action::custom("save"),
-        });
-
-        let outcome = app.dispatch_input(
-            window,
-            InputEvent::Key {
-                key: Key::Other(0x53),
-                state: KeyState::Down,
-                modifiers: Modifiers::CONTROL,
-            },
-        );
-
-        assert!(source.get(), "handler 必须看到 ActionSource::Key");
-        assert_eq!(outcome.action, Some(Action::custom("save")));
-    }
-
-    #[test]
-    fn unhandled_action_is_false_and_engine_actions_need_no_handler() {
-        let (_rt, mut app, window) = setup();
-        let root = root_of(&app, window);
-
-        assert!(!app.dispatch_action(
-            window,
-            root,
-            Action::custom("nobody"),
-            ActionSource::Programmatic
-        ));
-        assert!(app.dispatch_action(window, root, Action::FocusNext, ActionSource::Programmatic));
-        // 没有浮层时 Dismiss 是 no-op。
-        assert!(!app.dispatch_action(window, root, Action::Dismiss, ActionSource::Programmatic));
-    }
-
-    // ── 焦点 ──────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn tab_moves_focus_and_marks_a11y_only() {
-        let (_rt, mut app, window) = setup();
-        let root = root_of(&app, window);
-        let first = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
-            .on_click(Action::custom("a"))
-            .build(app.window_mut(window).expect("window").tree_mut(), root)
-            .expect("mount");
-        let second = NodeBuilder::boxed()
-            .layout_override(Rect::new(60.0, 0.0, 40.0, 40.0))
-            .on_click(Action::custom("b"))
-            .build(app.window_mut(window).expect("window").tree_mut(), root)
-            .expect("mount");
-        frame(&mut app, window);
-        app.window_mut(window)
-            .expect("window")
-            .tree_mut()
-            .clear_all_dirty_for_test();
-
-        app.dispatch_input(
-            window,
-            InputEvent::Key {
-                key: Key::Tab,
-                state: KeyState::Down,
-                modifiers: Modifiers::empty(),
-            },
-        );
-        assert_eq!(app.focused(window), Some(first));
-        {
-            let tree = app.window(window).expect("window").tree();
-            assert!(
-                tree.get(first)
-                    .expect("node")
-                    .dirty()
-                    .contains(DirtyFlags::A11Y)
-            );
-            assert!(
-                !tree
-                    .get(first)
-                    .expect("node")
-                    .dirty()
-                    .contains(DirtyFlags::PAINT),
-                "无 ring ⇒ 零像素脏位"
-            );
-        }
-
-        app.dispatch_input(
-            window,
-            InputEvent::Key {
-                key: Key::Tab,
-                state: KeyState::Down,
-                modifiers: Modifiers::empty(),
-            },
-        );
-        assert_eq!(app.focused(window), Some(second));
-        app.dispatch_input(
-            window,
-            InputEvent::Key {
-                key: Key::Tab,
-                state: KeyState::Down,
-                modifiers: Modifiers::SHIFT,
-            },
-        );
-        assert_eq!(app.focused(window), Some(first), "Shift+Tab 回绕");
-    }
-
-    #[test]
-    fn focus_ring_marks_paint() {
-        let (_rt, mut app, window) = setup();
-        let root = root_of(&app, window);
-        let node = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
-            .on_click(Action::custom("a"))
-            .focus_ring(FocusRing::new(
-                2.0,
-                2.0,
-                Color::from_rgba8([0, 120, 255, 255]),
-            ))
-            .build(app.window_mut(window).expect("window").tree_mut(), root)
-            .expect("mount");
-        frame(&mut app, window);
-        app.window_mut(window)
-            .expect("window")
-            .tree_mut()
-            .clear_all_dirty_for_test();
-
-        assert!(app.set_focus(window, Some(node)));
-
-        let tree = app.window(window).expect("window").tree();
-        let dirty = tree.get(node).expect("node").dirty();
-        assert!(dirty.contains(DirtyFlags::PAINT), "有 ring ⇒ PAINT");
-        assert!(!dirty.contains(DirtyFlags::REUSABLE));
-    }
-
-    // ── 滚动（paint 期偏移） ───────────────────────────────────────────────────
-
-    /// P2-3.3 回归：内容变短 / 视口变高后必须把滚动偏移重新夹回范围内。
-    ///
-    /// 偏移只在显式滚动时被夹紧，而可用范围随布局变化。不重夹会留下「滚过内容末尾」的
-    /// 状态：底部露出空白，且下一次滚轮先吃掉越界量、看起来像「滚不动」。
-    #[test]
-    fn layout_change_reclamps_the_scroll_offset() {
-        let (_rt, mut app, window, container, _child) = scrollable_app();
-        let handle = app.scroll_handle(window, container).expect("scroll handle");
-        // 内容 200 高、视口 150 高 ⇒ 最多滚 50。
-        app.scroll_to(&handle, Point::new(0.0, 50.0))
-            .expect("scroll to the bottom");
-        frame(&mut app, window);
-        assert_eq!(
-            app.window(window)
-                .expect("window")
-                .tree()
-                .scroll_slot(container)
-                .expect("scroll slot")
-                .offset
-                .y,
-            50.0,
-            "滚到内容末尾"
-        );
-
-        // 内容缩到 80（小于视口）：可用范围变 0 ⇒ 偏移必须回到 0。
-        app.set_scroll_content(&handle, Size::new(200.0, 80.0))
-            .expect("content shrink");
-        frame(&mut app, window);
-        assert_eq!(
-            app.window(window)
-                .expect("window")
-                .tree()
-                .scroll_slot(container)
-                .expect("scroll slot")
-                .offset
-                .y,
-            0.0,
-            "内容变短后偏移必须被重新夹紧（旧实现会停在 50）"
-        );
-    }
-    fn scrollable_app() -> (tokio::runtime::Runtime, App, WindowId, NodeId, NodeId) {
-        let (rt, mut app, window) = setup();
-        let container = mount_scroll_container(&mut app, window, 150.0);
-        let child = mount_override(
-            &mut app,
-            window,
-            container,
-            Rect::new(0.0, 0.0, 200.0, 100.0),
-        );
-        let _second = mount_override(
-            &mut app,
-            window,
-            container,
-            Rect::new(0.0, 100.0, 200.0, 100.0),
-        );
-        frame(&mut app, window);
-        let handle = app
-            .make_scroll(
-                window,
-                container,
-                ScrollConfig {
-                    axis: ScrollAxis::Vertical,
-                    line_height: 48.0,
-                },
-            )
-            .expect("scrollable");
-        app.set_scroll_content(&handle, Size::new(200.0, 200.0))
-            .expect("content");
-        (rt, app, window, container, child)
-    }
-
-    #[test]
-    fn text_caret_rect_follows_ancestor_scroll() {
-        let (_rt, mut app, window, container, _child) = scrollable_app();
-        let text = NodeBuilder::text("abc", crate::text::TextStyle::new(16.0))
-            .layout_override(Rect::new(10.0, 20.0, 100.0, 20.0))
-            .build(
-                app.window_mut(window).expect("window").tree_mut(),
-                container,
-            )
-            .expect("text");
-        frame(&mut app, window);
-        let before = app
-            .window(window)
-            .expect("window")
-            .text_caret_rect(text, 3)
-            .expect("caret");
-        let handle = app.scroll_handle(window, container).expect("scroll");
-        app.scroll_to(&handle, Point::new(0.0, 50.0))
-            .expect("scroll");
-        frame(&mut app, window);
-        let after = app
-            .window(window)
-            .expect("window")
-            .text_caret_rect(text, 3)
-            .expect("caret");
-        assert!((after.origin.y - before.origin.y + 50.0).abs() < 0.01);
-        assert!((after.origin.x - before.origin.x).abs() < 0.01);
-    }
-
-    /// P2-8：窗口变大导致视口变大时，滚动偏移必须在**同一帧**内夹紧。
-    ///
-    /// 只做帧首夹紧时，这一帧用的是上一帧的视口上限，paint 会把越界的偏移画上屏
-    /// （内容上移过多 / 底部空白），而下一次输入之前不一定还有帧。
-    #[test]
-    fn scroll_offset_is_clamped_in_the_same_frame_as_a_resize() {
-        let (_rt, mut app, window) = setup();
-        // 百分比尺寸的滚动容器：视口随窗口变化（固定尺寸容器不会触发这条路径）。
-        let mut style = Style::default();
-        style.inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::percent(1.0),
-            height: taffy::style::Dimension::percent(1.0),
-        };
-        style.clip = Clip::Bounds;
-        let tree = app.window_mut(window).expect("window").tree_mut();
-        let root = tree.root();
-        let container = NodeBuilder::boxed()
-            .style(style)
-            .build(tree, root)
-            .expect("mount");
-        app.window_mut(window)
-            .expect("window")
-            .set_size(crate::math::Size::new(200.0, 150.0));
-        frame(&mut app, window);
-        let handle = app
-            .make_scroll(
-                window,
-                container,
-                ScrollConfig {
-                    axis: ScrollAxis::Vertical,
-                    line_height: 48.0,
-                },
-            )
-            .expect("scrollable");
-        app.set_scroll_content(&handle, crate::math::Size::new(200.0, 200.0))
-            .expect("content");
-        frame(&mut app, window);
-        let offset = |app: &App| {
-            app.window(window)
-                .expect("window")
-                .tree()
-                .scroll_slot(container)
-                .expect("slot")
-                .offset
-                .y
-        };
-        app.scroll_to(&handle, Point::new(0.0, 50.0))
-            .expect("scroll");
-        frame(&mut app, window);
-        assert_eq!(offset(&app), 50.0, "前置条件：视口 150 / 内容 200 ⇒ max 50");
-
-        // 窗口长高到 400 ⇒ 视口 400 > 内容 200 ⇒ max 0：偏移必须在同一帧归零。
-        app.window_mut(window)
-            .expect("window")
-            .set_size(crate::math::Size::new(200.0, 400.0));
-        frame(&mut app, window);
-        assert_eq!(offset(&app), 0.0, "resize 那一帧就必须夹紧");
-    }
-
-    #[test]
-    fn scroll_shifts_primitives_without_touching_layout() {
-        let (_rt, mut app, window, container, child) = scrollable_app();
-        let layout_before = app
-            .window(window)
-            .expect("window")
-            .tree()
-            .get(child)
-            .expect("child")
-            .layout()
-            .bounds;
-        let before = lane_quad_bounds(&app, window, child);
-        assert!(!before.is_empty(), "子节点必须有背景图元");
-
-        let handle = app.scroll_handle(window, container).expect("scroll handle");
-        app.scroll_to(&handle, Point::new(0.0, 50.0))
-            .expect("scroll");
-        frame(&mut app, window);
-
-        let after = lane_quad_bounds(&app, window, child);
-        assert_eq!(after.len(), before.len());
-        for (old, new) in before.iter().zip(after.iter()) {
-            assert_eq!(new.origin.y, old.origin.y - 50.0, "滚动 N 后图元 y 平移 −N");
-            assert_eq!(new.origin.x, old.origin.x);
-        }
-        assert_eq!(
-            app.window(window)
-                .expect("window")
-                .tree()
-                .get(child)
-                .expect("child")
-                .layout()
-                .bounds,
-            layout_before,
-            "layout.bounds 是内容坐标：滚动不得改它"
-        );
-        assert_eq!(
-            app.scroll_state(&handle).expect("state").offset,
-            Point::new(0.0, 50.0)
-        );
-    }
-
-    /// P2-4 回归：滚轮必须按 scroll chaining 先给最内层容器，滚不动再交给外层。
-    ///
-    /// 旧实现只取**一个**最近的滚动祖先：内层到底后滚轮直接失效，外层永远滚不动
-    /// （嵌套的横向 + 纵向容器、或列表里嵌固定高度面板时最明显）。
-    #[test]
-    fn wheel_falls_through_to_the_outer_container_when_the_inner_cannot_scroll() {
-        let (_rt, mut app, window) = setup();
-        let outer = mount_scroll_container(&mut app, window, 150.0);
-        // 内层：同样要 `Clip::Bounds` 才是可滚动容器（`make_scroll` 的前置条件）。
-        let mut inner_style = Style::default();
-        inner_style.inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(200.0),
-            height: taffy::style::Dimension::length(100.0),
-        };
-        inner_style.clip = Clip::Bounds;
-        let inner = NodeBuilder::boxed()
-            .style(inner_style)
-            .build(app.window_mut(window).expect("window").tree_mut(), outer)
-            .expect("mount inner");
-        frame(&mut app, window);
-
-        let outer_handle = app
-            .make_scroll(
-                window,
-                outer,
-                ScrollConfig {
-                    axis: ScrollAxis::Vertical,
-                    line_height: 48.0,
-                },
-            )
-            .expect("outer scrollable");
-        app.set_scroll_content(&outer_handle, Size::new(200.0, 400.0))
-            .expect("outer content");
-        // 内层是**恰好装下内容**的容器：max_offset == 0，它一帧都滚不动。
-        let inner_handle = app
-            .make_scroll(
-                window,
-                inner,
-                ScrollConfig {
-                    axis: ScrollAxis::Vertical,
-                    line_height: 48.0,
-                },
-            )
-            .expect("inner scrollable");
-        app.set_scroll_content(&inner_handle, Size::new(200.0, 100.0))
-            .expect("inner content");
-        frame(&mut app, window);
-
-        // 在内层范围内滚一格：内层吃不下，外层必须动。
-        app.dispatch_input(
-            window,
-            InputEvent::Scroll {
-                position: Point::new(50.0, 50.0),
-                delta_x: 0.0,
-                delta_y: -1.0,
-                modifiers: Modifiers::empty(),
-            },
-        );
-
-        // 滚轮走的是动画滚动（`scroll_to_animated`）：把时钟推过动画时长再读回真实偏移。
-        app.advance_clock(std::time::Duration::from_millis(400));
-        frame(&mut app, window);
-        let offset_of = |app: &App, node: NodeId| {
-            app.window(window)
-                .expect("window")
-                .tree()
-                .scroll_slot(node)
-                .map(|slot| slot.offset)
-        };
-        let inner_offset = offset_of(&app, inner);
-        let outer_offset = offset_of(&app, outer);
-        assert_eq!(
-            inner_offset.map(|offset| offset.y),
-            Some(0.0),
-            "内层装得下内容，不得产生偏移"
-        );
-        assert_eq!(
-            outer_offset.map(|offset| offset.y),
-            Some(48.0),
-            "滚轮必须穿透到能滚的外层容器"
-        );
-    }
-
-    #[test]
-    fn scroll_commits_a_frame() {
-        let (_rt, mut app, window, container, _child) = scrollable_app();
-        let handle = app.scroll_handle(window, container).expect("scroll handle");
-        let before = app.window(window).expect("window").frame_index();
-        app.scroll_to(&handle, Point::new(0.0, 30.0))
-            .expect("scroll");
-        let outcome = frame(&mut app, window);
-
-        assert!(
-            matches!(outcome, FrameOutcome::Committed(_)),
-            "滚动必须提交一帧"
-        );
-        assert!(app.window(window).expect("window").frame_index() > before);
-        assert!(!app.take_wake_request(), "帧已消费唤醒位");
-    }
-
-    #[test]
-    fn same_offset_is_a_total_noop() {
-        let (_rt, mut app, window, container, _child) = scrollable_app();
-        let handle = app.scroll_handle(window, container).expect("scroll handle");
-        app.scroll_to(&handle, Point::new(0.0, 10.0))
-            .expect("scroll");
-        frame(&mut app, window);
-        let _ = app.take_wake_request();
-
-        app.scroll_to(&handle, Point::new(0.0, 10.0)).expect("same");
-
-        assert!(!app.take_wake_request(), "同值滚动不得唤醒");
-    }
-
-    #[test]
-    fn hit_test_follows_the_scroll_offset() {
-        let (_rt, mut app, window, container, _child) = scrollable_app();
-        let handle = app.scroll_handle(window, container).expect("scroll handle");
-        let before = app
-            .window(window)
-            .expect("window")
-            .tree()
-            .hit_test(Point::new(50.0, 120.0))
-            .map(|hit| hit.local_point);
-        assert!(before.is_some(), "滚动前 (50,120) 命中第二个子节点");
-
-        app.scroll_to(&handle, Point::new(0.0, 50.0))
-            .expect("scroll");
-        let after = app
-            .window(window)
-            .expect("window")
-            .tree()
-            .hit_test(Point::new(50.0, 120.0))
-            .map(|hit| hit.local_point);
-
-        assert!(after.is_some(), "滚动后同一点仍命中内容");
-        assert_eq!(
-            after.expect("hit").y,
-            before.expect("hit").y + 50.0,
-            "local_point 反应内容位移"
-        );
-    }
-
-    #[test]
-    fn scroll_never_reevaluates_bind_style() {
-        let (_rt, mut app, window) = setup();
-        let calls = Rc::new(Cell::new(0_u32));
-        let counter = calls.clone();
-        let container = mount_scroll_container(&mut app, window, 100.0);
-        let _child = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 200.0, 80.0))
-            .bind_style(move |_cx| {
-                counter.set(counter.get() + 1);
-                StylePatch::default()
-            })
-            .build(
-                app.window_mut(window).expect("window").tree_mut(),
-                container,
-            )
-            .expect("mount");
-        frame(&mut app, window);
-        let evaluated_once = calls.get();
-        assert!(evaluated_once > 0, "首帧必须求值一次");
-
-        let handle = app
-            .make_scroll(window, container, ScrollConfig::default())
-            .expect("scrollable");
-        app.set_scroll_content(&handle, Size::new(200.0, 400.0))
-            .expect("content");
-        app.scroll_to(&handle, Point::new(0.0, 20.0))
-            .expect("scroll");
-        frame(&mut app, window);
-
-        assert_eq!(calls.get(), evaluated_once, "滚动不得触发 refresh_styles");
-    }
-
-    // ── 虚拟列表 ──────────────────────────────────────────────────────────────
-
-    fn virtual_app() -> (tokio::runtime::Runtime, App, WindowId, NodeId) {
-        let (rt, mut app, window) = setup();
-        let mut style = Style::default();
-        style.inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(200.0),
-            height: taffy::style::Dimension::length(100.0),
-        };
-        style.inner.position = taffy::style::Position::Relative;
-        style.clip = Clip::Bounds;
-        let tree = app.window_mut(window).expect("window").tree_mut();
-        let root = tree.root();
-        let container = NodeBuilder::boxed()
-            .style(style)
-            .build(tree, root)
-            .expect("mount");
-        frame(&mut app, window);
-        (rt, app, window, container)
-    }
-
-    /// P2-6：虚拟列表行必须自动带上「第 N 项 / 共 M 项」，否则屏幕阅读器只播报行内容。
-    ///
-    /// `VirtualSlot` 是引擎内部状态，应用拿不到 —— 所以 a11y 快照必须由引擎自己填。
-    #[test]
-    fn virtual_rows_carry_their_position_in_the_set() {
-        let (_rt, mut app, window, container) = virtual_app();
-        let list = app
-            .make_virtual_list(
-                window,
-                container,
-                VirtualListConfig {
-                    extent: 25.0,
-                    overscan: 0,
-                },
-            )
-            .expect("virtual list");
-        app.set_virtual_items(&list, 100, |index| {
-            NodeBuilder::boxed().id(format!("row{index}"))
-        })
-        .expect("items");
-        frame(&mut app, window);
-        let rows: Vec<(usize, NodeId)> = app
-            .window(window)
-            .expect("window")
-            .tree()
-            .virtual_slot(container)
-            .expect("virtual slot")
-            .mounted
-            .clone();
-        assert!(!rows.is_empty(), "至少挂载一行");
-
-        let snapshot = app.a11y_take(window).expect("a11y snapshot");
-        for (index, row) in rows {
-            let node = snapshot
-                .nodes
-                .iter()
-                .find(|node| node.engine == row)
-                .expect("row 必须在快照里");
-            // AccessKit `pos_in_set` 是 0-based（适配层 +1）。
-            assert_eq!(node.pos_in_set, Some(index), "0-based 位置");
-            assert_eq!(node.size_of_set, None, "size 在容器上，不在行上");
-            // 经过 adapter 之后 AT 拿到的仍是 0-based（UIA/AT-SPI 自己 +1）。
-            let ak = crate::a11y::adapter::to_accesskit(node);
-            assert_eq!(ak.position_in_set(), Some(index));
-        }
-        // 容器节点携带集合总数（consumer 只从祖先读取）。
-        let container_node = snapshot
-            .nodes
-            .iter()
-            .find(|node| node.engine == container)
-            .expect("容器必须在快照里");
-        assert_eq!(container_node.size_of_set, Some(100), "集合总数在容器上");
-    }
-    #[test]
-    fn virtual_list_mounts_the_visible_window_and_recycles() {
-        let (_rt, mut app, window, container) = virtual_app();
-        let list = app
-            .make_virtual_list(
-                window,
-                container,
-                VirtualListConfig {
-                    extent: 25.0,
-                    overscan: 0,
-                },
-            )
-            .expect("virtual list");
-        let built = Rc::new(Cell::new(0_u32));
-        let counter = built.clone();
-        app.set_virtual_items(&list, 100, move |index| {
-            counter.set(counter.get() + 1);
-            NodeBuilder::boxed()
-                .paint(background())
-                .id(format!("row{index}"))
-        })
-        .expect("items");
-        frame(&mut app, window);
-
-        let state = app.virtual_list_state(&list).expect("state");
-        assert_eq!(state.count, 100);
-        assert_eq!(
-            (state.first, state.last),
-            (0, 4),
-            "视口 100 / 行高 25 ⇒ 4 行"
-        );
-        assert_eq!(state.mounted, 4);
-        assert_eq!(built.get(), 4, "只挂载可见行");
-
-        let handle = app.scroll_handle(window, container).expect("scroll handle");
-        app.scroll_to(&handle, Point::new(0.0, 250.0))
-            .expect("scroll");
-        frame(&mut app, window);
-        let state = app.virtual_list_state(&list).expect("state");
-        assert_eq!((state.first, state.last), (10, 14));
-        assert_eq!(state.mounted, 4);
-        assert_eq!(built.get(), 8, "只有新进入的 4 行被构建");
-    }
-
-    // ── 浮层 ──────────────────────────────────────────────────────────────────
-
-    /// P2-6 回归：`Above` 定位必须把浮层的**下边缘**贴到锚点上方（减掉自身高度）。
-    ///
-    /// 根节点有 border 时浮层纠位仍须**收敛**且落点是窗口绝对坐标。
-    ///
-    /// 复审怀疑 taffy 的绝对定位 `inset` 会再扣一次包含块 border（那样每帧都会判「位置
-    /// 不一致」而重写 inset，永不收敛）。实测：本仓库的 taffy 配置下 `inset` 相对 border
-    /// box 原点、不额外扣 border —— 写 `(x, y)` 就落在 `(x, y)`，原实现正确。本测试作为
-    /// 回归保护：防止未来有人「修」成扣 border 而引入 1 px 偏移，或让纠位失去收敛性。
-    #[test]
-    fn anchor_placement_converges_with_a_root_border() {
-        let (_rt, mut app, window) = setup();
-        let root = root_of(&app, window);
-        // 布局边框来自 taffy 样式（`PaintSpec.border` 只影响绘制）。
-        let mut root_style = Style::default();
-        root_style.inner.border = taffy::geometry::Rect {
-            left: taffy::style::LengthPercentage::length(1.0),
-            right: taffy::style::LengthPercentage::length(1.0),
-            top: taffy::style::LengthPercentage::length(1.0),
-            bottom: taffy::style::LengthPercentage::length(1.0),
-        };
-        app.window_mut(window)
-            .expect("window")
-            .tree_mut()
-            .set_style(root, root_style)
-            .expect("root style");
-        let anchor = mount_override(&mut app, window, root, Rect::new(100.0, 100.0, 40.0, 20.0));
-        frame(&mut app, window);
-
-        let overlay = app
-            .create_overlay(
-                window,
-                OverlayOptions {
-                    placement: OverlayPlacement::Anchor {
-                        node: anchor,
-                        side: crate::interaction::AnchorSide::Below,
-                        gap: 4.0,
-                    },
-                    dismiss: OverlayDismiss::Explicit,
-                },
-            )
-            .expect("overlay");
-        let overlay_node = overlay.node();
-        let mut style = Style::default();
-        style.inner.position = taffy::style::Position::Absolute;
-        style.inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(60.0),
-            height: taffy::style::Dimension::length(30.0),
-        };
-        app.window_mut(window)
-            .expect("window")
-            .tree_mut()
-            .set_style(overlay_node, style)
-            .expect("style");
-        frame(&mut app, window);
-        frame(&mut app, window);
-
-        let bounds = app
-            .window(window)
-            .expect("window")
-            .tree()
-            .get(overlay_node)
-            .expect("overlay node")
-            .layout()
-            .bounds;
-        assert!(
-            (bounds.origin.x - 100.0).abs() < 0.5 && (bounds.origin.y - 124.0).abs() < 0.5,
-            "浮层落点必须是窗口绝对坐标（Below: y = 100+20+4）：{bounds:?}"
-        );
-
-        // 收敛：再出一帧不应再请求新帧（`resolve_overlay_placements` 早退）。
-        frame(&mut app, window);
-        let _ = app.take_wake_request();
-        frame(&mut app, window);
-        assert!(
-            !app.take_wake_request(),
-            "纠位必须收敛，不得每帧都重写 inset"
-        );
-    }
-
-    /// 旧实现返回锚点的上边缘，浮层会整个盖住锚点。新建时浮层尺寸未知，`App` 在布局之后
-    /// 用实测尺寸纠正一次。
-    #[test]
-    fn anchored_above_overlay_sits_above_the_anchor() {
-        let (_rt, mut app, window) = setup();
-        let root = root_of(&app, window);
-        let anchor = mount_override(&mut app, window, root, Rect::new(100.0, 100.0, 40.0, 20.0));
-        frame(&mut app, window);
-
-        let overlay = app
-            .create_overlay(
-                window,
-                OverlayOptions {
-                    placement: OverlayPlacement::Anchor {
-                        node: anchor,
-                        side: crate::interaction::AnchorSide::Above,
-                        gap: 4.0,
-                    },
-                    dismiss: OverlayDismiss::Explicit,
-                },
-            )
-            .expect("overlay");
-        let overlay_node = overlay.node();
-        let mut style = Style::default();
-        style.inner.position = taffy::style::Position::Absolute;
-        style.inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(60.0),
-            height: taffy::style::Dimension::length(30.0),
-        };
-        app.window_mut(window)
-            .expect("window")
-            .tree_mut()
-            .set_style(overlay_node, style)
-            .expect("style");
-        // 布局 → 修正定位 → 再布局（修正会弄脏布局）。
-        frame(&mut app, window);
-        frame(&mut app, window);
-        frame(&mut app, window);
-
-        let bounds = app
-            .window(window)
-            .expect("window")
-            .tree()
-            .get(overlay_node)
-            .expect("overlay")
-            .layout()
-            .bounds;
-        assert_eq!(
-            (bounds.origin.x, bounds.origin.y, bounds.size.height),
-            (100.0, 66.0, 30.0),
-            "Above：y = 锚点顶 - gap - 自身高度（下边缘贴锚点），实际 {bounds:?}"
-        );
-    }
-
-    #[test]
-    fn overlay_is_last_and_closes_on_outside_click() {
-        let (_rt, mut app, window) = setup();
-        let root = root_of(&app, window);
-        let _background = mount_override(&mut app, window, root, Rect::new(0.0, 0.0, 100.0, 100.0));
-        frame(&mut app, window);
-        let overlay = app
-            .create_overlay(
-                window,
-                OverlayOptions {
-                    placement: OverlayPlacement::Point(Point::new(200.0, 10.0)),
-                    dismiss: OverlayDismiss::OutsideClick,
-                },
-            )
-            .expect("overlay");
-        let overlay_node = overlay.node();
-        let mut style = Style::default();
-        style.inner.position = taffy::style::Position::Absolute;
-        style.inner.inset = taffy::geometry::Rect {
-            left: taffy::style::LengthPercentageAuto::length(200.0),
-            top: taffy::style::LengthPercentageAuto::length(10.0),
-            right: taffy::style::LengthPercentageAuto::auto(),
-            bottom: taffy::style::LengthPercentageAuto::auto(),
-        };
-        style.inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(80.0),
-            height: taffy::style::Dimension::length(80.0),
-        };
-        app.window_mut(window)
-            .expect("window")
-            .tree_mut()
-            .set_style(overlay_node, style)
-            .expect("style");
-        frame(&mut app, window);
-
-        assert_eq!(
-            app.window(window)
-                .expect("window")
-                .tree()
-                .order()
-                .last()
-                .copied(),
-            Some(overlay_node),
-            "浮层必须是 order 的最后一个子树"
-        );
-        assert_eq!(app.overlays(window).len(), 1);
-        assert_eq!(
-            app.window(window)
-                .expect("window")
-                .tree()
-                .hit_test(Point::new(210.0, 20.0))
-                .map(|hit| hit.node),
-            Some(overlay_node),
-            "浮层优先命中"
-        );
-
-        // 点外部 ⇒ 关闭并消费（不再派递给背景）。
-        app.dispatch_input(
-            window,
-            InputEvent::PointerDown {
-                position: Point::new(10.0, 10.0),
-                button: PointerButton::Primary,
-                modifiers: Modifiers::empty(),
-            },
-        );
-        assert!(app.overlays(window).is_empty(), "点击外部关闭");
-    }
-
-    #[test]
-    fn dismiss_action_closes_the_topmost_overlay_including_explicit() {
-        let (_rt, mut app, window) = setup();
-        frame(&mut app, window);
-        let overlay = app
-            .create_overlay(
-                window,
-                OverlayOptions {
-                    placement: OverlayPlacement::Point(Point::ZERO),
-                    dismiss: OverlayDismiss::Explicit,
-                },
-            )
-            .expect("overlay");
-        let root = root_of(&app, window);
-
-        assert!(app.dispatch_action(window, root, Action::Dismiss, ActionSource::Programmatic));
-        assert!(app.overlays(window).is_empty(), "Dismiss 关 Explicit 浮层");
-        assert!(!app.close_overlay(&overlay), "重复关闭返回 false");
-    }
-
-    // ── 拖拽 ──────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn drag_streams_deltas_and_suppresses_the_click() {
-        let (_rt, mut app, window) = setup();
-        let phases = Rc::new(Cell::new(Vec::<DragPhase>::new()));
-        let seen = phases.clone();
-        app.on_action(Action::custom("split"), move |ctx| {
-            if let ActionSource::Drag { phase, .. } = ctx.source() {
-                let mut list = seen.take();
-                list.push(phase);
-                seen.set(list);
-            }
-        });
-        let root = root_of(&app, window);
-        let grip = NodeBuilder::boxed()
-            .layout_override(Rect::new(100.0, 0.0, 6.0, 100.0))
-            .on_drag(Action::custom("split"))
-            .build(app.window_mut(window).expect("window").tree_mut(), root)
-            .expect("mount");
-        frame(&mut app, window);
-
-        app.dispatch_input(
-            window,
-            InputEvent::PointerDown {
-                position: Point::new(102.0, 50.0),
-                button: PointerButton::Primary,
-                modifiers: Modifiers::empty(),
-            },
-        );
-        let state = app.drag_state(window).expect("drag session");
-        assert_eq!(state.node(), grip);
-        assert_eq!(
-            app.take_capture_request(),
-            Some((window, true)),
-            "拖拽请求指针捕获"
-        );
-
-        let moved = app.dispatch_input(
-            window,
-            InputEvent::PointerMove {
-                position: Point::new(122.0, 50.0),
-                modifiers: Modifiers::empty(),
-            },
-        );
-        assert_eq!(moved.action, Some(Action::custom("split")));
-        assert!(app.drag(&state).is_some_and(|info| info.delta.x == 20.0));
-
-        let up = app.dispatch_input(
-            window,
-            InputEvent::PointerUp {
-                position: Point::new(122.0, 50.0),
-                button: PointerButton::Primary,
-                modifiers: Modifiers::empty(),
-            },
-        );
-        assert_eq!(app.drag_state(window), None);
-        assert_eq!(app.take_capture_request(), Some((window, false)));
-        assert_eq!(up.action, Some(Action::custom("split")), "抬起派发 End");
-        assert_eq!(up.click_count, 0, "拖拽后不产生点击");
-        assert_eq!(
-            phases.take(),
-            vec![DragPhase::Start, DragPhase::Move, DragPhase::End]
-        );
-    }
-
-    // ── 动画 ──────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn animation_ticks_write_the_transient_and_end_in_idle() {
-        let (_rt, mut app, window) = setup();
-        let root = root_of(&app, window);
-        let node = mount_override(&mut app, window, root, Rect::new(0.0, 0.0, 40.0, 40.0));
-        frame(&mut app, window);
-        let progress = app.transient(0.0_f32);
-        let id = app
-            .animate(
-                window,
-                AnimatedValue::Scalar {
-                    target: progress,
-                    to: 1.0,
-                },
-                &[node],
-                AnimationSpec {
-                    duration: std::time::Duration::from_millis(100),
-                    easing: Easing::Linear,
-                },
-            )
-            .expect("animate");
-        let _ = app.take_wake_request();
-        app.advance_clock(std::time::Duration::from_millis(50));
-        let outcome = frame(&mut app, window);
-
-        assert!(
-            (app.read_transient(&progress) - 0.5).abs() < 1e-3,
-            "中点 = 0.5"
-        );
-        assert!(
-            matches!(outcome, FrameOutcome::Committed(_)),
-            "注册节点每帧重绘 ⇒ 动画期间必然提交"
-        );
-        let _ = node;
-
-        app.advance_clock(std::time::Duration::from_millis(60));
-        frame(&mut app, window);
-        assert_eq!(app.read_transient(&progress), 1.0);
-        assert!(!app.animations_running(window), "结束即删槽");
-        assert!(!app.cancel_animation(&id), "槽已删");
-
-        app.advance_clock(std::time::Duration::from_millis(100));
-        assert!(
-            matches!(frame(&mut app, window), FrameOutcome::Idle),
-            "动画结束后帧回到 Idle（I3）"
-        );
-    }
-
-    // ── 评审 #1…#9 的回归用例 ────────────────────────────────────────────────
-
-    #[test]
-    fn closed_window_returns_unknown_window() {
-        let (_rt, mut app, window) = setup();
-        let overlay = app
-            .create_overlay(
-                window,
-                OverlayOptions {
-                    placement: OverlayPlacement::Point(Point::ZERO),
-                    dismiss: OverlayDismiss::Explicit,
-                },
-            )
-            .expect("overlay");
-        let transient = app.transient(0.0_f32);
-        assert!(app.close_window(window));
-        let _ = overlay;
-
-        let error = app
-            .create_overlay(
-                window,
-                OverlayOptions {
-                    placement: OverlayPlacement::Point(Point::ZERO),
-                    dismiss: OverlayDismiss::Explicit,
-                },
-            )
-            .expect_err("窗口已关闭");
-        assert!(matches!(error, EngineError::UnknownWindow { window: closed } if closed == window));
-
-        let error = app
-            .animate(
-                window,
-                AnimatedValue::Scalar {
-                    target: transient,
-                    to: 1.0,
-                },
-                &[],
-                AnimationSpec::short(),
-            )
-            .expect_err("窗口已关闭");
-        assert!(matches!(error, EngineError::UnknownWindow { .. }));
-    }
-
-    #[test]
-    fn hit_after_scrolling_50_lands_on_the_second_row() {
-        let (_rt, mut app, window, container, _child) = scrollable_app();
-        let handle = app.scroll_handle(window, container).expect("scroll handle");
-        app.scroll_to(&handle, Point::new(0.0, 50.0))
-            .expect("scroll");
-
-        // 第二行原本占内容 y = 100..200；滚 50 后屏幕上占 50..150，本地 y = 60 − 50 = 10。
-        let hit = app
-            .window(window)
-            .expect("window")
-            .tree()
-            .hit_test(Point::new(50.0, 60.0))
-            .expect("hit");
-        assert_eq!(hit.local_point, Point::new(50.0, 10.0));
-    }
-
-    #[test]
-    fn overlay_outside_click_consumes_the_whole_press() {
-        let (_rt, mut app, window) = setup();
-        let calls = Rc::new(Cell::new(0_u32));
-        let seen = calls.clone();
-        app.on_action(Action::custom("under"), move |_ctx| {
-            seen.set(seen.get() + 1)
-        });
-        let root = root_of(&app, window);
-        let button = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 100.0, 100.0))
-            .paint(background())
-            .on_click(Action::custom("under"))
-            .build(app.window_mut(window).expect("window").tree_mut(), root)
-            .expect("mount");
-        frame(&mut app, window);
-        app.create_overlay(
-            window,
-            OverlayOptions {
-                placement: OverlayPlacement::Point(Point::new(200.0, 10.0)),
-                dismiss: OverlayDismiss::OutsideClick,
-            },
-        )
-        .expect("overlay");
-        frame(&mut app, window);
-
-        app.dispatch_input(
-            window,
-            InputEvent::PointerDown {
-                position: Point::new(20.0, 20.0),
-                button: PointerButton::Primary,
-                modifiers: Modifiers::empty(),
-            },
-        );
-        let up = app.dispatch_input(
-            window,
-            InputEvent::PointerUp {
-                position: Point::new(20.0, 20.0),
-                button: PointerButton::Primary,
-                modifiers: Modifiers::empty(),
-            },
-        );
-
-        assert!(app.overlays(window).is_empty(), "按下即关浮层");
-        assert_eq!(calls.get(), 0, "这次按下必须整体消费");
-        assert_eq!(up.action, None);
-        assert_eq!(up.click_count, 0);
-        let _ = button;
-    }
-
-    #[test]
-    fn stale_focus_is_cleared_and_tab_recovers() {
-        let (_rt, mut app, window) = setup();
-        let root = root_of(&app, window);
-        let first = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
-            .on_click(Action::custom("a"))
-            .build(app.window_mut(window).expect("window").tree_mut(), root)
-            .expect("mount");
-        let second = NodeBuilder::boxed()
-            .layout_override(Rect::new(60.0, 0.0, 40.0, 40.0))
-            .on_click(Action::custom("b"))
-            .build(app.window_mut(window).expect("window").tree_mut(), root)
-            .expect("mount");
-        frame(&mut app, window);
-        assert!(app.set_focus(window, Some(first)));
-
-        app.window_mut(window)
-            .expect("window")
-            .tree_mut()
-            .remove(first)
-            .expect("remove");
-
-        assert_eq!(app.focused(window), None, "陈旧焦点必须视为无焦点");
-        // Tab 不能卡死：从「无焦点」重新开始，干净地落到第二个节点。
-        app.dispatch_input(
-            window,
-            InputEvent::Key {
-                key: Key::Tab,
-                state: KeyState::Down,
-                modifiers: Modifiers::empty(),
-            },
-        );
-        assert_eq!(app.focused(window), Some(second));
-    }
-
-    #[test]
-    fn virtual_list_mounts_rows_on_the_first_frame_and_grows_on_resize() {
-        let (_rt, mut app, window) = setup();
-        let mut style = Style::default();
-        style.inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(200.0),
-            height: taffy::style::Dimension::length(100.0),
-        };
-        style.inner.position = taffy::style::Position::Relative;
-        style.clip = Clip::Bounds;
-        let tree = app.window_mut(window).expect("window").tree_mut();
-        let root = tree.root();
-        let container = NodeBuilder::boxed()
-            .style(style)
-            .build(tree, root)
-            .expect("mount");
-        // 注意：**先**建列表、再布局（首帧视口还是 0）。
-        let list = app
-            .make_virtual_list(
-                window,
-                container,
-                VirtualListConfig {
-                    extent: 25.0,
-                    overscan: 0,
-                },
-            )
-            .expect("virtual list");
-        app.set_virtual_items(&list, 100, |index| {
-            NodeBuilder::boxed()
-                .paint(background())
-                .id(format!("row{index}"))
-        })
-        .expect("items");
-        frame(&mut app, window);
-
-        let state = app.virtual_list_state(&list).expect("state");
-        assert!(state.mounted > 0, "首帧后必须挂载可见行：{state:?}");
-        assert_eq!((state.first, state.last), (0, 4));
-
-        // 视口长高 ⇒ 布局后再修窗口（不能停留在旧区间）。
-        app.window_mut(window)
-            .expect("window")
-            .set_size(Size::new(400.0, 300.0));
-        app.window_mut(window)
-            .expect("window")
-            .tree_mut()
-            .set_style(container, {
-                let mut style = Style::default();
-                style.inner.size = taffy::geometry::Size {
-                    width: taffy::style::Dimension::length(200.0),
-                    height: taffy::style::Dimension::length(200.0),
-                };
-                style.inner.position = taffy::style::Position::Relative;
-                style.clip = Clip::Bounds;
-                style
-            })
-            .expect("style");
-        frame(&mut app, window);
-        let state = app.virtual_list_state(&list).expect("state");
-        assert_eq!(
-            (state.first, state.last),
-            (0, 8),
-            "视口 200 / 行高 25 ⇒ 8 行"
-        );
-        assert_eq!(state.mounted, 8);
-    }
-
-    /// P1-2.2 回归：首帧补挂的行**必须**有真实布局高度。
-    ///
-    /// 旧实现里 `rewindow_virtuals` 在 `layout_if_dirty` **之后**挂载行，而帧尾
-    /// `settle_frame` 无条件清掉全树 `LAYOUT` —— 这些行本帧从未参与 taffy 布局，脏位却被清掉，
-    /// 于是永久停在 0×0、不产生任何图元。`virtual_list_mounts_rows_on_the_first_frame_and_grows_on_resize`
-    /// 只断言挂载区间（`state.first/last`），所以没暴露这个 bug。
-    #[test]
-    fn virtual_rows_are_laid_out_with_the_configured_extent() {
-        let (_rt, mut app, window) = setup();
-        let mut style = Style::default();
-        style.inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(200.0),
-            height: taffy::style::Dimension::length(100.0),
-        };
-        style.inner.position = taffy::style::Position::Relative;
-        style.clip = Clip::Bounds;
-        let tree = app.window_mut(window).expect("window").tree_mut();
-        let root = tree.root();
-        let container = NodeBuilder::boxed()
-            .style(style)
-            .build(tree, root)
-            .expect("mount");
-        let list = app
-            .make_virtual_list(
-                window,
-                container,
-                VirtualListConfig {
-                    extent: 25.0,
-                    overscan: 0,
-                },
-            )
-            .expect("virtual list");
-        app.set_virtual_items(&list, 100, |index| {
-            NodeBuilder::boxed()
-                .paint(background())
-                .id(format!("row{index}"))
-        })
-        .expect("items");
-        frame(&mut app, window);
-        // 再出一帧：若首帧把补挂行的 LAYOUT 清掉了，这里也救不回来（脏位已丢）。
-        frame(&mut app, window);
-
-        let rows: Vec<(usize, crate::node::id::NodeId)> = app
-            .window(window)
-            .expect("window")
-            .tree()
-            .virtual_slot(list.node())
-            .expect("slot")
-            .mounted
-            .clone();
-        assert!(!rows.is_empty(), "必须挂载了可见行");
-        for (index, row) in rows {
-            let bounds = app
-                .window(window)
-                .expect("window")
-                .tree()
-                .get(row)
-                .expect("row exists")
-                .layout()
-                .bounds;
-            assert_eq!(
-                bounds.size.height, 25.0,
-                "行 {index} 的高度必须等于 extent（实际 {bounds:?}）"
-            );
-            assert!(
-                bounds.size.width > 0.0,
-                "行 {index} 的宽度必须 > 0（实际 {bounds:?}）"
-            );
-        }
-    }
-
-    #[test]
-    fn key_modifiers_reach_the_handler() {
-        let (_rt, mut app, window) = setup();
-        let seen = Rc::new(Cell::new(Modifiers::empty()));
-        let slot = seen.clone();
-        app.on_action(Action::custom("activate"), move |ctx| {
-            slot.set(ctx.modifiers());
-        });
-        let root = root_of(&app, window);
-        let node = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
-            .on_action(Action::custom("activate"))
-            .build(app.window_mut(window).expect("window").tree_mut(), root)
-            .expect("mount");
-        frame(&mut app, window);
-        assert!(app.set_focus(window, Some(node)));
-
-        app.dispatch_input(
-            window,
-            InputEvent::Key {
-                key: Key::Enter,
-                state: KeyState::Down,
-                modifiers: Modifiers::SHIFT | Modifiers::CONTROL,
-            },
-        );
-
-        assert_eq!(
-            seen.get(),
-            Modifiers::SHIFT | Modifiers::CONTROL,
-            "handler 必须拿到本次按键的修饰键"
-        );
-    }
-
-    #[test]
-    fn animation_retarget_replaces_the_previous_slot() {
-        let (_rt, mut app, window) = setup();
-        let root = root_of(&app, window);
-        let node = mount_override(&mut app, window, root, Rect::new(0.0, 0.0, 40.0, 40.0));
-        frame(&mut app, window);
-        let value = app.transient(0.0_f32);
-        let spec = AnimationSpec {
-            duration: std::time::Duration::from_millis(100),
-            easing: Easing::Linear,
-        };
-        app.animate(
-            window,
-            AnimatedValue::Scalar {
-                target: value,
-                to: 1.0,
-            },
-            &[node],
-            spec,
-        )
-        .expect("first");
-        app.advance_clock(std::time::Duration::from_millis(50));
-        frame(&mut app, window);
-        assert!((app.read_transient(&value) - 0.5).abs() < 1e-3);
-
-        // 半途改主意：1 → 0。旧槽必须让位（否则两条插值互相覆盖 ⇒ 回弹）。
-        app.animate(
-            window,
-            AnimatedValue::Scalar {
-                target: value,
-                to: 0.0,
-            },
-            &[node],
-            spec,
-        )
-        .expect("retarget");
-        app.advance_clock(std::time::Duration::from_millis(50));
-        frame(&mut app, window);
-        // 从当前值 0.5 重新起步：走一半 ⇔ 0.5 + (0 − 0.5) × 0.5 = 0.25。
-        assert!(
-            (app.read_transient(&value) - 0.25).abs() < 1e-3,
-            "重定向必须从当前值起步：{}",
-            app.read_transient(&value)
-        );
-
-        app.advance_clock(std::time::Duration::from_millis(60));
-        frame(&mut app, window);
-        assert_eq!(app.read_transient(&value), 0.0, "终点是 0，不得回弹到 1");
-        assert!(!app.animations_running(window));
-    }
-
-    /// P2-5 回归：系统取消指针会话时，拖拽必须结束并派发 `Cancel`，不能卡在「按住」。
-    ///
-    /// Windows 的 `WM_CAPTURECHANGED`（Alt+Tab / 系统弹窗 / 别的窗口 `SetCapture`）之后
-    /// 不会再有 `WM_LBUTTONUP`；平台层把它翻译成 `InputEvent::PointerCancel`。缺失这条路径
-    /// 时拖拽会话永久存活，用户只能重启应用。
-    #[test]
-    fn pointer_cancel_ends_the_drag_without_committing_a_click() {
-        let (_rt, mut app, window) = setup();
-        let root = root_of(&app, window);
-        let phases = Rc::new(std::cell::RefCell::new(Vec::new()));
-        let seen = phases.clone();
-        let grip = NodeBuilder::boxed()
-            .layout_override(Rect::new(100.0, 0.0, 6.0, 100.0))
-            .on_drag(Action::custom("split"))
-            .build(app.window_mut(window).expect("window").tree_mut(), root)
-            .expect("mount");
-        app.on_action(Action::custom("split"), move |ctx| {
-            if let ActionSource::Drag { phase, .. } = ctx.source() {
-                seen.borrow_mut().push(phase);
-            }
-        });
-        frame(&mut app, window);
-
-        app.dispatch_input(
-            window,
-            InputEvent::PointerDown {
-                position: Point::new(102.0, 50.0),
-                button: PointerButton::Primary,
-                modifiers: Modifiers::empty(),
-            },
-        );
-        app.dispatch_input(
-            window,
-            InputEvent::PointerMove {
-                position: Point::new(160.0, 50.0),
-                modifiers: Modifiers::empty(),
-            },
-        );
-        assert!(app.drag_state(window).is_some(), "拖拽应已开始");
-
-        // 系统夺走捕获：没有 PointerUp，只有取消。
-        app.dispatch_input(window, InputEvent::PointerCancel);
-
-        assert!(app.drag_state(window).is_none(), "取消后不得残留拖拽会话");
-        assert_eq!(
-            phases.borrow().last().copied(),
-            Some(DragPhase::Cancel),
-            "必须派发 Cancel 阶段：{:?}",
-            phases.borrow()
-        );
-        let _ = grip;
-    }
-
-    #[test]
-    fn second_pointer_down_during_drag_is_ignored() {
-        let (_rt, mut app, window) = setup();
-        let root = root_of(&app, window);
-        let grip = NodeBuilder::boxed()
-            .layout_override(Rect::new(100.0, 0.0, 6.0, 100.0))
-            .on_drag(Action::custom("split"))
-            .build(app.window_mut(window).expect("window").tree_mut(), root)
-            .expect("mount");
-        app.on_action(Action::custom("split"), |_ctx| {});
-        frame(&mut app, window);
-
-        app.dispatch_input(
-            window,
-            InputEvent::PointerDown {
-                position: Point::new(102.0, 50.0),
-                button: PointerButton::Primary,
-                modifiers: Modifiers::empty(),
-            },
-        );
-        let before = app.drag_state(window).expect("drag");
-        app.dispatch_input(
-            window,
-            InputEvent::PointerDown {
-                position: Point::new(300.0, 200.0),
-                button: PointerButton::Primary,
-                modifiers: Modifiers::empty(),
-            },
-        );
-        let after = app.drag_state(window).expect("drag");
-        assert_eq!(before, after, "拖拽中的二次按下不得重开会话");
-        assert_eq!(after.node(), grip);
-    }
-
-    #[test]
-    fn moving_past_the_drag_threshold_suppresses_the_click() {
-        let (_rt, mut app, window) = setup();
-        let clicks = Rc::new(Cell::new(0_u32));
-        let seen = clicks.clone();
-        app.on_action(Action::custom("hit"), move |_ctx| seen.set(seen.get() + 1));
-        let root = root_of(&app, window);
-        let node = NodeBuilder::boxed()
-            .layout_override(Rect::new(10.0, 10.0, 100.0, 100.0))
-            .paint(background())
-            .on_click(Action::custom("hit"))
-            .build(app.window_mut(window).expect("window").tree_mut(), root)
-            .expect("mount");
-        frame(&mut app, window);
-        app.set_input_thresholds(InputThresholds {
-            double_click_time: std::time::Duration::from_millis(500),
-            double_click_distance: 4.0,
-            drag_distance: 4.0,
-        });
-
-        app.dispatch_input(
-            window,
-            InputEvent::PointerDown {
-                position: Point::new(20.0, 20.0),
-                button: PointerButton::Primary,
-                modifiers: Modifiers::empty(),
-            },
-        );
-        let up = app.dispatch_input(
-            window,
-            InputEvent::PointerUp {
-                position: Point::new(40.0, 20.0),
-                button: PointerButton::Primary,
-                modifiers: Modifiers::empty(),
-            },
-        );
-
-        assert_eq!(clicks.get(), 0, "超过阈值 ⇒ 不是点击");
-        assert_eq!(up.click_count, 0);
-        let _ = node;
-    }
-
-    #[test]
-    fn stale_scroll_handle_reports_stale_node() {
-        let (_rt, mut app, window, container, _child) = scrollable_app();
-        let handle = app.scroll_handle(window, container).expect("scroll handle");
-        app.window_mut(window)
-            .expect("window")
-            .tree_mut()
-            .remove(container)
-            .expect("remove");
-
-        let error = app
-            .scroll_to(&handle, Point::new(0.0, 10.0))
-            .expect_err("节点已卸载");
-        assert!(matches!(error, EngineError::StaleNode { node } if node == container));
-    }
-
-    /// P2-7：IME 启用状态是**每窗口**目标状态，默认启用；关窗时从旁表清掉。
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn ime_enabled_is_per_window_and_cleared_with_the_window() {
-        let (_rt, mut app, window) = setup();
-        let other = app.create_window(WindowOptions::default());
-        assert!(app.ime_enabled(window), "默认启用");
-        assert!(app.ime_enabled(other), "默认启用");
-
-        app.set_ime_enabled(window, false);
-        assert!(!app.ime_enabled(window), "只禁用目标窗口");
-        assert!(app.ime_enabled(other), "其它窗口不受影响");
-
-        app.set_ime_enabled(window, true);
-        assert!(app.ime_enabled(window), "可以重新启用");
-
-        app.set_ime_enabled(other, false);
-        assert!(app.close_window(other));
-        assert!(
-            !app.ime_disabled.contains(&other),
-            "关窗必须清掉 IME 旁表，否则 create/close 循环无界增长"
-        );
-        let third = app.create_window(WindowOptions::default());
-        assert!(app.ime_enabled(third), "新窗口默认启用");
-    }
-}
+mod interaction_tests;
 
 /// P13：`ResourceCache` 接入 `App` 的边界用例（图片页上传 / 进程级缓存 / 零副作用）。
 #[cfg(test)]
-mod resources_tests {
-    use super::App;
-    use crate::{
-        math::{Rect, Size},
-        node::builder::NodeBuilder,
-        paint::style::PaintSpec,
-        window::{WindowId, WindowOptions},
-    };
-
-    fn setup() -> (tokio::runtime::Runtime, App, WindowId) {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("current-thread runtime");
-        let mut app = App::new(rt.handle().clone());
-        let window = app.create_window(WindowOptions {
-            title: "resources".into(),
-            size: Size::new(200.0, 120.0),
-            scale: crate::math::Scale::ONE,
-            ..WindowOptions::default()
-        });
-        (rt, app, window)
-    }
-
-    /// 4×4 的不透明 PNG（解码后逐字节可预测：BGRA = 源 RGB 交换）。
-    fn png() -> Vec<u8> {
-        let pixels: Vec<u8> = std::iter::repeat_n([10u8, 20, 30, 255], 16)
-            .flatten()
-            .collect();
-        let image = image::RgbaImage::from_raw(4, 4, pixels).expect("raw");
-        let mut out = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgba8(image)
-            .write_to(&mut out, image::ImageFormat::Png)
-            .expect("encode png");
-        out.into_inner()
-    }
-
-    #[test]
-    fn resources_are_process_level() {
-        let (_rt, mut app, window) = setup();
-        let image = app.resources_mut().insert(&png()).expect("insert");
-
-        assert_eq!(app.resources().len(), 1);
-        assert_eq!(
-            app.resources().page_pixels().expect("page").0,
-            (2048, 2048),
-            "图片页固定最大档（P1-2.7：页尺寸与插入顺序无关）"
-        );
-        // 另一窗口共享同一份缓存（单 GPU 设备、进程级一份）。
-        let second = app.create_window(WindowOptions {
-            title: "second".into(),
-            size: Size::new(64.0, 64.0),
-            scale: crate::math::Scale::ONE,
-            ..WindowOptions::default()
-        });
-        assert_ne!(second, window);
-        assert_eq!(app.resources().len(), 1);
-
-        // 内容区写进了页缓冲（BGR 顺序）。
-        let (page, pixels) = app.resources().page_pixels().expect("page");
-        let page_width = page.0 as usize;
-        let origin_x = (image.tile.u0 * page.0 as f32).round() as usize;
-        let origin_y = (image.tile.v0 * page.0 as f32).round() as usize;
-        let offset = origin_y * page_width * 4 + origin_x * 4;
-        assert_eq!(&pixels[offset..offset + 4], &[30, 20, 10, 255]);
-    }
-
-    #[test]
-    fn insert_does_not_touch_node_dirty_flags() {
-        let (_rt, mut app, window) = setup();
-        let root = app.window(window).expect("window").tree().root();
-        let node = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 20.0, 20.0))
-            .paint(PaintSpec {
-                background: crate::paint::color::Color::WHITE,
-                ..PaintSpec::default()
-            })
-            .build(app.window_mut(window).expect("window").tree_mut(), root)
-            .expect("box");
-        let _ = app.frame(window).expect("frame").expect("ok");
-        let before = app
-            .window(window)
-            .expect("window")
-            .tree()
-            .get(node)
-            .expect("node")
-            .dirty();
-
-        let _ = app.resources_mut().insert(&png()).expect("insert");
-
-        let after = app
-            .window(window)
-            .expect("window")
-            .tree()
-            .get(node)
-            .expect("node")
-            .dirty();
-        assert_eq!(before, after, "插入资源不得改动任何节点的脏位");
-    }
-
-    #[test]
-    fn atlas_upload_without_renderers_keeps_windows_unsynced() {
-        let (_rt, mut app, window) = setup();
-        let _ = app.resources_mut().insert(&png()).expect("insert");
-
-        // headless：没有 renderer ⇒ 不上传，窗口保持「未收到整页」（换渲染器后会自动补整页）。
-        app.upload_atlas_pages();
-        app.upload_atlas_pages();
-        let target = app.window(window).expect("window");
-        assert!(!target.glyph_page_received());
-        assert!(!target.image_page_received());
-        assert_eq!(app.resources().len(), 1, "上传不影响缓存内容");
-    }
-
-    #[test]
-    fn atlas_upload_marks_only_windows_with_a_renderer() {
-        let (_rt, mut app, first) = setup();
-        let second = app.create_window(WindowOptions {
-            title: "second".into(),
-            size: Size::new(64.0, 64.0),
-            scale: crate::math::Scale::ONE,
-            ..WindowOptions::default()
-        });
-        app.upload_atlas_pages();
-
-        for window in [first, second] {
-            let target = app.window(window).expect("window");
-            assert!(!target.has_renderer());
-            assert!(
-                !target.image_page_received(),
-                "没有渲染器的窗口不得被记账为已同步"
-            );
-        }
-    }
-
-    /// 评审阻塞 ②：`frame_all` 逐窗提交，图集页必须**广播**给每个窗口的渲染器，
-    /// 否则第一个窗口消费脏行后，其余窗口的纹理永远收不到内容。
-    #[cfg(windows)]
-    #[test]
-    fn atlas_pages_are_broadcast_to_every_window() {
-        let _guard = crate::render::windows::device::gpu_test_lock();
-        let (_rt, mut app, first) = setup();
-        app.window_mut(first)
-            .expect("window")
-            .enable_offscreen_renderer()
-            .expect("offscreen renderer");
-        let second = app.create_window(WindowOptions {
-            title: "second".into(),
-            size: Size::new(64.0, 64.0),
-            scale: crate::math::Scale::ONE,
-            ..WindowOptions::default()
-        });
-        app.window_mut(second)
-            .expect("window")
-            .enable_offscreen_renderer()
-            .expect("offscreen renderer");
-
-        let _ = app.resources_mut().insert(&png()).expect("insert");
-        app.upload_atlas_pages();
-
-        for window in [first, second] {
-            let target = app.window(window).expect("window");
-            assert!(target.glyph_page_received(), "字形页必须广播到每个窗口");
-            assert!(target.image_page_received(), "图片页必须广播到每个窗口");
-        }
-
-        // 第二次调用：没有新写入 ⇒ 不重复上传（脏旗标已被统一消费）。
-        app.upload_atlas_pages();
-        for window in [first, second] {
-            assert!(app.window(window).expect("window").image_page_received());
-        }
-    }
-
-    /// 忙窗口不能拖住其它窗口：它的共享槽还没录制完时，本帧脏行攒在它自己的队列里，
-    /// 空闲窗口照常收到增量（DEVIATIONS F-211 的 BLOCKER 回归面）。
-    #[cfg(windows)]
-    #[test]
-    fn a_busy_window_queues_its_rows_without_blocking_idle_windows() {
-        use crate::{paint::atlas::AtlasKind, render::DirtyRows};
-
-        let _guard = crate::render::windows::device::gpu_test_lock();
-        let (_rt, mut app, first) = setup();
-        let second = app.create_window(WindowOptions {
-            title: "second".into(),
-            size: Size::new(64.0, 64.0),
-            scale: crate::math::Scale::ONE,
-            ..WindowOptions::default()
-        });
-        for window in [first, second] {
-            app.window_mut(window)
-                .expect("window")
-                .enable_offscreen_renderer()
-                .expect("offscreen renderer");
-        }
-        let page = app.atlas.page().0;
-        // 图集缓冲已经按这一页尺寸建好（真实路径由上一帧的上传完成）。
-        app.glyph_page_extent = Some(page);
-        app.glyph_page = vec![0u8; (page * page) as usize];
-        for window in [first, second] {
-            app.window_mut(window)
-                .expect("window")
-                .mark_atlas_page_received(AtlasKind::Glyph, page);
-        }
-        // 让 second 的共享槽停在「已入队、未录制」：这就是忙窗口。
-        let mut full = DirtyRows::default();
-        full.mark(0, u32::MAX);
-        assert!(
-            app.window_mut(second).expect("second").queue_atlas_upload(
-                AtlasKind::Glyph,
-                page,
-                &vec![0u8; (page * page) as usize],
-                full,
-            ),
-            "offscreen 渲染器必须接受入队"
-        );
-        assert!(
-            !app.window(second)
-                .expect("second")
-                .atlas_idle(AtlasKind::Glyph),
-            "入队之后、录制之前必须是忙的"
-        );
-
-        app.pending_dirty.mark(0, 4);
-        app.upload_atlas_pages();
-
-        assert!(
-            app.window(first)
-                .expect("first")
-                .atlas_rows(AtlasKind::Glyph)
-                .is_empty(),
-            "空闲窗口的行必须已经发出"
-        );
-        let second_rows = app
-            .window(second)
-            .expect("second")
-            .atlas_rows(AtlasKind::Glyph);
-        assert_eq!(second_rows.spans().len(), 1);
-        assert_eq!(
-            second_rows.spans()[0],
-            0..4,
-            "忙窗口必须把这一帧的行攒在自己的队列里"
-        );
-    }
-
-    /// 页尺寸变化必须重建并清零整页缓冲：旧页的行宽不同，残留字节会被当成新页内容上传
-    /// （1 纹素 padding 的线性采样会把它读进 tile 边缘）。
-    #[test]
-    fn a_page_change_rebuilds_the_glyph_page_buffer_from_zero() {
-        let (_rt, mut app, _window) = setup();
-        app.glyph_page = vec![0xFF; 512 * 512];
-        app.glyph_page_extent = Some(512);
-        assert!(app.atlas.grow());
-
-        app.upload_atlas_pages();
-
-        assert_eq!(app.glyph_page.len(), 1024 * 1024);
-        assert!(
-            app.glyph_page.iter().all(|byte| *byte == 0),
-            "旧页字节不得残留在新页缓冲里"
-        );
-    }
-
-    /// 图集行没赶上帧时，App 必须请求补帧：否则静态窗口会把缺字的画面一直留着。
-    #[cfg(windows)]
-    #[test]
-    fn a_deferred_atlas_frame_requests_a_follow_up() {
-        use crate::{paint::atlas::AtlasKind, render::DirtyRows};
-
-        let _guard = crate::render::windows::device::gpu_test_lock();
-        let (_rt, mut app, window) = setup();
-        app.window_mut(window)
-            .expect("window")
-            .enable_offscreen_renderer()
-            .expect("offscreen renderer");
-        let page = app.atlas.page().0;
-        app.glyph_page_extent = Some(page);
-        app.glyph_page = vec![0u8; (page * page) as usize];
-        app.window_mut(window)
-            .expect("window")
-            .mark_atlas_page_received(AtlasKind::Glyph, page);
-        // 共享槽停在「已入队、未录制」：本帧的图集行只能攒着。
-        let mut full = DirtyRows::default();
-        full.mark(0, u32::MAX);
-        assert!(app.window_mut(window).expect("window").queue_atlas_upload(
-            AtlasKind::Glyph,
-            page,
-            &vec![0u8; (page * page) as usize],
-            full,
-        ));
-        app.window_mut(window).expect("window").request_repaint();
-        app.pending_dirty.mark(0, 4);
-
-        let _ = app.frame(window).expect("frame").expect("ok");
-        assert!(
-            app.window(window).expect("window").atlas_rows_pending(),
-            "忙窗口的图集行必须留在队列里"
-        );
-        assert!(
-            app.dispatcher.take_frame_wake(),
-            "补帧必须请求一次帧唤醒（否则静态窗口不会重试）"
-        );
-
-        // 补帧：上一帧的 publish 已经消费了共享槽，这一帧必须把行入队并清掉。
-        let _ = app.frame(window).expect("follow-up").expect("ok");
-        assert!(
-            !app.window(window).expect("window").atlas_rows_pending(),
-            "补帧之后图集行必须已经入队"
-        );
-    }
-
-    /// 平台层在窗口创建之后才挂渲染器：这一帧没有新脏行，但整页必须包含**已有**字形
-    /// （否则新窗口永远拿到一张空页，且记账为已同步）。
-    #[cfg(windows)]
-    #[test]
-    fn a_late_renderer_receives_the_current_glyph_page() {
-        let _guard = crate::render::windows::device::gpu_test_lock();
-        let (_rt, mut app, window) = setup();
-        let root = app.window(window).expect("window").tree().root();
-        let _text = NodeBuilder::text("Ag", crate::text::TextStyle::new(14.0))
-            .layout_override(Rect::new(0.0, 0.0, 120.0, 40.0))
-            .build(app.window_mut(window).expect("window").tree_mut(), root)
-            .expect("text");
-        // 没有渲染器的帧：字形记录进 `GlyphAtlas`，整页缓冲此时还不能代表它。
-        let _ = app.frame(window).expect("frame").expect("headless frame");
-
-        app.window_mut(window)
-            .expect("window")
-            .enable_offscreen_renderer()
-            .expect("offscreen renderer");
-        app.upload_atlas_pages();
-
-        assert!(
-            app.glyph_page.iter().any(|byte| *byte != 0),
-            "晚挂上的渲染器必须拿到当前字形页，而不是空页"
-        );
-    }
-
-    #[test]
-    fn image_atlas_page_is_lazy_until_the_first_insert() {
-        let (_rt, mut app, _window) = setup();
-        assert!(
-            app.resources().page_pixels().is_none(),
-            "没有插入图片时不得分配图片页（DEVIATIONS F-208）"
-        );
-        let _ = app.resources_mut().insert(&png()).expect("insert");
-        let (page, pixels) = app.resources().page_pixels().expect("page");
-        assert_eq!(
-            page,
-            (2048, 2048),
-            "图片页固定最大档（P1-2.7：页尺寸与插入顺序无关）"
-        );
-        assert_eq!(pixels.len(), 2048 * 2048 * 4, "整页 = page² × BGRA8");
-    }
-}
+mod resources_tests;

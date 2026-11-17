@@ -2,7 +2,8 @@
 //!
 //! 入口：`test_support::app::TestApp`（无 GPU 的帧驱动）、`test_support::probe::{Probe, Selector}`
 //! （L1 元素探针）、`test_support::record::{FrameRecord, RenderedFrame, PaintLog}`（L2 帧记录）、
-//! `event::InputOutcome`（注入结果）、`test_support::snapshot`（L3 接口，GPU 实现留 P09）。
+//! `test_support::script::{FrameScript, ScriptFrame}`（L2.5 多帧脚本执行器 + 逐帧断言）、
+//! `event::InputOutcome`（注入结果）、`test_support::snapshot`（L3 golden + 容差比较）。
 //!
 //! 本文件只做模块声明：`pub use` 被 workspace lint 禁止（M-02），公开路径是
 //! `ui_core::test_support::app::TestApp` 这类模块限定形式。
@@ -11,4 +12,5 @@ pub mod app;
 pub mod diagnostics;
 pub mod probe;
 pub mod record;
+pub mod script;
 pub mod snapshot;

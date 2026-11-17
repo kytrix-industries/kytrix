@@ -1,0 +1,218 @@
+//! 动画槽与引擎时钟：注册 / 推进 / 取消，以及「是否需要持续出帧」。
+//!
+//! `app.rs` 的 `impl App` 只保留同名薄委托，方法体在这里（零行为变更的纯拆分）。
+
+#[cfg(any(test, feature = "test-support"))]
+use std::time::Duration;
+use std::time::Instant;
+
+use super::{AnimationSlot, AnimationTarget, App};
+use crate::{
+    error::EngineError,
+    interaction::{AnimatedValue, AnimationId, AnimationSpec, animation as anim},
+    math::Point,
+    node::id::NodeId,
+    paint::color::Color,
+    window::WindowId,
+};
+
+/// 该节点正在进行中的滚动动画目标（没有动画时 `None`）。
+/// 消费者：`App::scroll_animation_target`。
+pub(crate) fn scroll_animation_target(app: &App, node: NodeId, window: WindowId) -> Option<Point> {
+    app.animations.iter().rev().find_map(|slot| {
+        if slot.window != window {
+            return None;
+        }
+        match &slot.target {
+            AnimationTarget::Scroll { handle, to, .. } if handle.node() == node => Some(*to),
+            _ => None,
+        }
+    })
+}
+
+// ── P10：动画 ──────────────────────────────────────────────────────────────
+
+/// 注册一个动画（起点 = 目标瞬态值的当前值；同目标已有动画 ⇒ 替换）。
+///
+/// `nodes` 是**显式注册**的「每帧要重绘的节点集合」（对应设计 §3.7）。
+///
+/// # Errors
+/// `UnknownWindow`（窗口已关闭）。
+/// 消费者：`App::animate`。
+pub(crate) fn animate(
+    app: &mut App,
+    window: WindowId,
+    value: AnimatedValue,
+    nodes: &[NodeId],
+    spec: AnimationSpec,
+) -> Result<AnimationId, EngineError> {
+    if !app.windows.contains_key(&window) {
+        return Err(EngineError::UnknownWindow { window });
+    }
+    let id = app.next_animation;
+    app.next_animation = app.next_animation.wrapping_add(1);
+    let target = match value {
+        AnimatedValue::Scalar { target, to } => {
+            let from = app
+                .store
+                .transient_ref::<f32>(target.id())
+                .copied()
+                .unwrap_or(0.0);
+            if spec.duration.is_zero() {
+                app.store.set_transient(target.id(), to);
+                app.mark_nodes_paint(window, nodes);
+                app.request_frame();
+                return Ok(AnimationId::new(window, id));
+            }
+            AnimationTarget::Scalar {
+                transient: target,
+                from,
+                to,
+            }
+        }
+        AnimatedValue::Color { target, to } => {
+            let from = app
+                .store
+                .transient_ref::<Color>(target.id())
+                .copied()
+                .unwrap_or(Color::TRANSPARENT);
+            if spec.duration.is_zero() {
+                app.store.set_transient(target.id(), to);
+                app.mark_nodes_paint(window, nodes);
+                app.request_frame();
+                return Ok(AnimationId::new(window, id));
+            }
+            AnimationTarget::Color {
+                transient: target,
+                from,
+                to,
+            }
+        }
+    };
+    // 同一目标重定向：旧槽必须让位（否则两条插值同时写同一个瞬态值 ⇒ 回弹/抖动）。
+    app.animations
+        .retain(|slot| !slot.target.same_target(&target));
+    app.animations.push(AnimationSlot {
+        id,
+        window,
+        target,
+        start: app.clock,
+        duration: spec.duration,
+        easing: spec.easing,
+        nodes: nodes.to_vec(),
+    });
+    app.request_frame();
+    Ok(AnimationId::new(window, id))
+}
+
+/// 取消动画（幂等）。
+/// 消费者：`App::cancel_animation`。
+pub(crate) fn cancel_animation(app: &mut App, id: &AnimationId) -> bool {
+    let before = app.animations.len();
+    app.animations
+        .retain(|slot| !(slot.window == id.window() && slot.id == id.generation()));
+    app.animations.len() != before
+}
+
+/// 该窗口是否还有未完成的动画。
+/// 消费者：`App::animations_running`。
+#[must_use]
+pub(crate) fn animations_running(app: &App, window: WindowId) -> bool {
+    app.animations.iter().any(|slot| slot.window == window)
+}
+
+/// 全部窗口是否还有未完成的动画（平台泵用它决定 `SetTimer(1)` / `KillTimer`）。
+/// 消费者：`App::has_animations`。
+pub(crate) fn has_animations(app: &App) -> bool {
+    !app.animations.is_empty()
+}
+
+/// 平台是否需要持续出帧：动画，或任一窗口的 Debug HUD 可见。
+/// 消费者：`App::needs_continuous_frames`。
+pub(crate) fn needs_continuous_frames(app: &App) -> bool {
+    #[cfg(feature = "hud")]
+    {
+        app.has_animations()
+            || app.debug_hud.iter().any(|(window, state)| {
+                app.windows
+                    .get(window)
+                    .is_some_and(|target| target.tree().get(state.root()).is_ok())
+            })
+    }
+    #[cfg(not(feature = "hud"))]
+    {
+        app.has_animations()
+    }
+}
+
+/// 消费者：`App::mark_nodes_paint`。
+pub(crate) fn mark_nodes_paint(app: &mut App, window: WindowId, nodes: &[NodeId]) {
+    if let Some(target) = app.windows.get_mut(&window) {
+        for node in nodes {
+            target.tree_mut().mark_paint(*node);
+        }
+    }
+}
+
+/// 推进本窗口的动画（`App::frame` 在帧门禁**之前**调用）。
+/// 消费者：`App::tick_animations`。
+pub(crate) fn tick_animations(app: &mut App, window: WindowId) {
+    if !app.animations_running(window) {
+        return;
+    }
+    let now = app.clock;
+    let slots = std::mem::take(&mut app.animations);
+    let mut keep = Vec::with_capacity(slots.len());
+    for slot in slots {
+        if slot.window != window {
+            keep.push(slot);
+            continue;
+        }
+        let t = anim::progress(now.saturating_duration_since(slot.start), slot.duration);
+        let eased = slot.easing.sample(t);
+        match &slot.target {
+            AnimationTarget::Scalar {
+                transient,
+                from,
+                to,
+            } => {
+                app.store
+                    .set_transient(transient.id(), anim::lerp(*from, *to, eased));
+            }
+            AnimationTarget::Color {
+                transient,
+                from,
+                to,
+            } => {
+                app.store
+                    .set_transient(transient.id(), anim::lerp_color(*from, *to, eased));
+            }
+            AnimationTarget::Scroll { handle, from, to } => {
+                let point = anim::lerp_point(*from, *to, eased);
+                let _ = app.scroll_to(handle, point);
+            }
+        }
+        for node in &slot.nodes {
+            if let Some(target) = app.windows.get_mut(&window) {
+                target.tree_mut().mark_paint(*node);
+            }
+        }
+        if t < 1.0 {
+            keep.push(slot);
+        }
+    }
+    app.animations = keep;
+}
+
+/// 把引擎时钟推进到真实时间（平台泵每轮一次；测试用 `TestApp::advance`）。
+/// 消费者：`App::sync_clock`。
+pub(crate) fn sync_clock(app: &mut App) {
+    app.clock = Instant::now();
+}
+
+/// 推进测试时钟（`TestApp::advance` 的唯一实现；只在测试构建里存在）。
+/// 消费者：`App::advance_clock`。
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn advance_clock(app: &mut App, by: Duration) {
+    app.clock += by;
+}

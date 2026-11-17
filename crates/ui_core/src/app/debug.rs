@@ -1,0 +1,114 @@
+//! 内置 Debug HUD 的安装、采样与提层（`hud` feature）。
+//!
+//! `app.rs` 的 `impl App` 只保留同名薄委托，方法体在这里（零行为变更的纯拆分）。
+
+use super::App;
+#[cfg(feature = "hud")]
+use crate::debug_hud;
+#[cfg(feature = "hud")]
+use crate::debug_hud::DebugHudState;
+use crate::{error::EngineError, window::WindowId};
+
+/// 显示或隐藏内置 Debug HUD（P17；需要 `hud` feature）。
+///
+/// HUD 是窗口 root 末尾的普通子树：右上角浮动、不参与文档流、命中穿透、a11y 隐藏。
+/// 可见时平台泵会持续出帧，数字每 500 ms 汇总一次。应用应在建完静态场景后开启 HUD；
+/// 之后再追加的 root 子节点可能盖在它上面。
+///
+/// # Errors
+/// `EngineError::UnknownWindow`：窗口不存在。建树失败时返回底层 `StaleNode` 等错误，
+/// 且不会留下半棵 HUD 子树。
+/// 消费者：`App::set_debug_hud`。
+#[cfg(feature = "hud")]
+pub(crate) fn set_debug_hud(
+    app: &mut App,
+    window: WindowId,
+    enabled: bool,
+) -> Result<(), EngineError> {
+    if !app.windows.contains_key(&window) {
+        return Err(EngineError::UnknownWindow { window });
+    }
+    let mut changed = false;
+    if enabled {
+        if let Some(root) = app.debug_hud.get(&window).map(DebugHudState::root) {
+            // 外部若删掉了 HUD 子树，map 里的句柄会陈旧；重新安装而不是假装成功。
+            let valid = app
+                .windows
+                .get(&window)
+                .is_some_and(|target| target.tree().get(root).is_ok());
+            if valid {
+                return Ok(());
+            }
+            app.debug_hud.remove(&window);
+        }
+        let Some(target) = app.windows.get_mut(&window) else {
+            return Err(EngineError::UnknownWindow { window });
+        };
+        let state = debug_hud::install(target, app.clock)?;
+        app.debug_hud.insert(window, state);
+        changed = true;
+    } else if let Some(state) = app.debug_hud.remove(&window) {
+        app.remove_node(window, state.root());
+        changed = true;
+    }
+    if changed {
+        app.request_frame();
+    }
+    Ok(())
+}
+
+/// 该窗口是否安装了 Debug HUD（未知窗口返回 `false`）。
+/// 消费者：`App::debug_hud_enabled`。
+#[cfg(feature = "hud")]
+#[must_use]
+pub(crate) fn debug_hud_enabled(app: &App, window: WindowId) -> bool {
+    let Some(state) = app.debug_hud.get(&window) else {
+        return false;
+    };
+    app.windows
+        .get(&window)
+        .is_some_and(|target| target.tree().get(state.root()).is_ok())
+}
+
+/// 帧门禁前更新 HUD 的采样/文本暂存，并请求 HUD damage。
+/// 消费者：`App::prepare_debug_hud`。
+#[cfg(feature = "hud")]
+pub(crate) fn prepare_debug_hud(app: &mut App, window: WindowId) {
+    let now = app.clock;
+    let Some(state) = app.debug_hud.get_mut(&window) else {
+        return;
+    };
+    let Some(target) = app.windows.get_mut(&window) else {
+        return;
+    };
+    debug_hud::prepare_frame(state, target, now);
+}
+
+/// `refresh_styles` 之后、`refresh_text` 之前写入 HUD 文本。
+/// 消费者：`App::apply_debug_hud`。
+#[cfg(feature = "hud")]
+pub(crate) fn apply_debug_hud(app: &mut App, window: WindowId) {
+    let Some(state) = app.debug_hud.get_mut(&window) else {
+        return;
+    };
+    let Some(target) = app.windows.get_mut(&window) else {
+        return;
+    };
+    debug_hud::apply_frame(state, target);
+}
+
+/// 新 overlay 会 append 到 root 末尾；HUD 必须保持在最上层。
+/// 消费者：`App::raise_debug_hud`。
+#[cfg(feature = "hud")]
+pub(crate) fn raise_debug_hud(app: &mut App, window: WindowId) {
+    let Some(state) = app.debug_hud.get(&window) else {
+        return;
+    };
+    let hud = state.root();
+    let Some(target) = app.windows.get_mut(&window) else {
+        return;
+    };
+    let tree = target.tree_mut();
+    let root = tree.root();
+    let _ = tree.append_child(root, hud);
+}
