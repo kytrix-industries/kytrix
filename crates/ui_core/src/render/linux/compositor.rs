@@ -5,9 +5,24 @@
 //! 1. swapchain image 的内容在 present 之后对应用不可信 ⇒ 每张 image 相对 persist 还差哪些矩形
 //!    必须**记账**（[`ImageCopyPlan`]，与 D3D12 的 `copy_plan` / Metal 的 `DrawableSyncs` 同构）。
 //!    旧实现每帧整面 `cmd_copy_image`（1080p@120Hz ≈ 1.0 GB/s，4K ≈ 4 GB/s 纯带宽），把
-//!    damage/scissor 的收益全部抵消（R11-12）。`present_dirty()` 现在是**实际拷贝区域**，
-//!    同时作为 `VK_KHR_incremental_present` 的 hint —— 两者必须一致。
-//! 2. 没有自动 barrier：本文件是 barrier 的**唯一**写点（表见 §6.6）。
+//!    damage/scissor 的收益全部抵消（R11-12）。present 的 hint 现在是**实际拷贝区域**，
+//!    同时作为 `VK_KHR_incremental_present` 的 region —— 两者必须一致。
+//! 2. **差分拷贝与 `UNDEFINED` 互斥**（AR3 §5.2 的 P1）：`oldLayout = UNDEFINED` 的转场声明
+//!    「整张 image 的内容允许丢弃」，而差分帧只覆盖 `pending ∪ written` 这些矩形 —— 两者同时
+//!    出现时，矩形之外的全是未定义内容（直扫输出 / 压缩 framebuffer 的驱动上整窗花屏，lavapipe
+//!    离屏 golden 测不到）。因此布局按拷贝范围选择（[`plan_swapchain_copy`]）：
+//!    整面拷贝才用 `UNDEFINED`；差分拷贝用 `PRESENT_SRC_KHR` 作 `oldLayout` 声明**内容保留**
+//!    （acquire 之后 image 的真实布局，Chrome / wgpu 的 WSI 标准写法）；没有像素要搬时连布局
+//!    都不碰。这条不变量的直接后果：**`CopyPlan::Regions` ⇒ 必然 `PRESENT_SRC_KHR`**，
+//!    单测钉死在 `plan_swapchain_copy` 上（[`ImageSyncStep`]）。
+//!
+//!    差分拷贝本身依赖「WSI 在 present → acquire 之间保留 image 内容」这一前提（D3D12 的 flip
+//!    模型、Metal 的 drawable 池是同一前提；`VK_KHR_incremental_present` 的语义就建立在这上面）。
+//!    这里把它写清楚，是因为它**不再**被「每帧 `UNDEFINED` 整面拷贝」掩盖：一旦某驱动丢弃内容，
+//!    症状是差分帧里没搬的矩形显示旧内容 —— 只有真机肉眼 / 合成器截图能发现（离屏 golden 走不到
+//!    present）。彻底不依赖该前提的唯一办法是关掉差分（AR3 §5.2 的选项 b），本波不做（R11-12 的
+//!    收益正是差分）。
+//! 3. 没有自动 barrier：本文件是 barrier 的**唯一**写点（表见 §6.6）。
 //!
 //! 所有权（§3.1 / P1-2.9）：[`GpuRenderer`] 是一个**窗口**的渲染器（GPU 线程独占）。进程级共享
 //! 资源（instance / device / queue / PSO / 描述符池 / 图集纹理 / 内存池）由 [`SharedGpu`] 持有；
@@ -40,7 +55,10 @@ use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use super::readback::{Readback, ReadbackImage};
 use super::{
     atlas::AtlasUploads,
-    device::{DescriptorLease, FrameSync, GpuBuffer, SharedGpu, init_error, on_gpu_thread},
+    device::{
+        DeferredHandles, DescriptorLease, FrameSync, GpuBuffer, SharedGpu, init_error,
+        on_gpu_thread,
+    },
     geometry::GeometryRegistry,
     memory::MemoryNeed,
     pipeline::{Pipeline, RENDER_FORMAT},
@@ -97,6 +115,36 @@ pub(crate) enum Submitted {
 /// UI 帧序号（`FrameIndex`）不参与完成判据：它只随反馈 / 诊断走（`renderer::SubmittedFrame`），
 /// 放在这里会诱使后来者拿它去比 timeline 值 —— 那正是 R11-1 的成因。
 type InFlightSequence = u64;
+
+/// 本帧要把 persist 的哪些像素同步进 presentable image，以及**允许丢弃哪些内容**。
+///
+/// 这是 AR3 §5.2 那条 P1 的落点：`VK_KHR_incremental_present` 的差分拷贝只有在「没搬的像素
+/// 仍然是上一次写进去的内容」时才成立，而 `oldLayout = UNDEFINED` 的转场**恰好声明了相反的东西**
+/// （整张 image 的内容允许丢弃）。两者不能同时存在，因此：
+///
+/// - 整面拷贝（每个像素都会被重写）⇒ `UNDEFINED`（省掉一次读，内容本来就要丢）；
+/// - 差分拷贝 ⇒ `PRESENT_SRC_KHR` 作 `oldLayout`（**内容保留**：这是 acquire 之后 image 的真实
+///   布局，也是 WSI 的标准写法）；
+/// - 没有像素要搬 ⇒ 连布局都不碰（image 已经在 `PRESENT_SRC_KHR`，present 照样合法）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImageSyncStep {
+    /// 整面拷贝：`UNDEFINED → TRANSFER_DST_OPTIMAL` + 一个覆盖整张 image 的 `vkCmdCopyImage`。
+    Full,
+    /// 差分拷贝：`PRESENT_SRC_KHR → TRANSFER_DST_OPTIMAL`（内容保留）+ 只拷这些矩形
+    /// （**已夹到 swapchain extent**，非空）。
+    Rects(DamageRects),
+    /// 一个像素都不搬（本帧 damage 全部落在 swapchain extent 之外）：不做任何布局转场与拷贝。
+    Nothing,
+}
+
+/// 本帧 copy 步骤的完整决策（[`plan_swapchain_copy`] 的结果）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SwapchainCopy {
+    /// 布局转场 + 搬运范围。
+    step: ImageSyncStep,
+    /// present 的 hint（`None` = 整面语义 / 不挂 `VkPresentRegionKHR`）。
+    hint: Option<DamageRects>,
+}
 
 /// 一个窗口的 GPU 渲染器（**GPU 线程独占**；离屏路径由门面同步调用）。
 pub(crate) struct GpuRenderer {
@@ -164,11 +212,18 @@ pub(crate) struct GpuRenderer {
     completed_sequence: u64,
     /// 每张 presentable image 的差分拷贝状态（R11-12）。
     image_copy_plan: ImageCopyPlan,
-    /// 本帧实际拷贝进 presentable image 的矩形（`None` = 整面）。
+    /// 本帧 present 的 `VK_KHR_incremental_present` hint（`None` = 整面语义）。
     ///
-    /// `copy_to_swapchain` 写入、`present` 读取：`VK_KHR_incremental_present` 的 region 必须与
-    /// 实际搬运的像素一致（R11-12）。
-    frame_copy: Option<DamageRects>,
+    /// **事实来源**：`copy_to_swapchain` 写、`present` 读 —— hint 必须与实际搬运的像素一致
+    /// （R11-12）。唯一的例外是「本帧没有任何像素要搬」（damage 全落在 swapchain extent 之外）：
+    /// 扩展没有「什么都没变」的编码（空 region 数组会被解释成整面），所以沿用上一次的 hint
+    /// 而不是声称整张 image 都变了（AR3 §5.3）。
+    present_hint: Option<DamageRects>,
+    /// 本帧对 presentable image 做的同步动作（`copy_to_swapchain` 写、present 之后消费）。
+    ///
+    /// 只有 [`ImageSyncStep::Nothing`] 会让 present 之后的 `ImageCopyPlan` 推进走
+    /// [`ImageCopyPlan::commit_without_copy`]（那张 image 的欠账必须保留）。
+    image_sync: ImageSyncStep,
     /// present 成功后需要重建 swapchain（`SUBOPTIMAL`，§7.3）。
     rebuild_swapchain: bool,
     /// 连续 `OUT_OF_DATE` 次数（每次成功 present 清零）：超上限才报错，不无限自旋。
@@ -283,7 +338,8 @@ impl GpuRenderer {
             submitted: VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT),
             completed_sequence: 0,
             image_copy_plan: ImageCopyPlan::new(swapchain_images),
-            frame_copy: None,
+            present_hint: None,
+            image_sync: ImageSyncStep::Full,
             rebuild_swapchain: false,
             out_of_date: 0,
             suboptimal_rebuilds: 0,
@@ -469,16 +525,17 @@ impl GpuRenderer {
         //
         // `incremental_present` 的 hint 必须与本次**实际拷贝的矩形**一致（R11-12）：旧实现把
         // UI 的 damage 当 hint、实际又拷整面 —— 改成差分拷贝之后两者必须同源，否则合成器会保留
-        // 我们其实已经重画过的像素（浪费）或反之。
+        // 我们其实已经重画过的像素（浪费）或反之。唯一的例外是「本帧没有像素要搬」（空集）：
+        // 那时 hint 沿用上一次的声明（扩展没有「什么都没变」的编码，AR3 §5.3）。
         // 本帧写进 persist 的矩形：**必须在 `frame.presented()` 之前取**（那会清 `fresh`，
         // 而 `fresh` 是「整面重画」的判据；取晚了会把整帧误当成局部帧，让其余 image 少拷像素）。
         let written = frame_written(frame);
         let present_started = Instant::now();
         let presented = {
             // 本帧的拷贝计划（在 `copy_to_swapchain` 里录制，present 时只读同样的事实）。
-            let copied = self.frame_copy;
+            let hint = self.present_hint;
             let swapchain = self.swapchain.as_ref().expect("checked above");
-            swapchain.present(&self.shared, image_index, copied)
+            swapchain.present(&self.shared, image_index, hint)
         };
         let presented = match presented {
             Ok(presented) => presented,
@@ -499,7 +556,17 @@ impl GpuRenderer {
                 frame.presented();
                 self.fresh = false;
                 // 本 image 已经被这一帧追平；其余 image 累积本帧 damage（R11-12）。
-                self.image_copy_plan.commit(image_index, written);
+                // 例外：本帧一个像素都没搬（`Nothing`）⇒ 欠账必须原样累积（AR3 §5.3），否则
+                // 「persist 里变了、这张 image 上没变」的矩形会被当成已同步。
+                match self.image_sync {
+                    ImageSyncStep::Nothing => {
+                        self.image_copy_plan
+                            .commit_without_copy(image_index, written);
+                    }
+                    ImageSyncStep::Full | ImageSyncStep::Rects(_) => {
+                        self.image_copy_plan.commit(image_index, written);
+                    }
+                }
                 // 旧 swapchain 的释放条件（R11-3）：队列 idle，而不是「新链某帧的 timeline」。
                 self.drain_retired_swapchains()?;
             }
@@ -755,7 +822,9 @@ impl GpuRenderer {
         });
         // 本帧的几何帧号：`ensure` 记录 last_used，帧末 `retain_recent` 驱逐长期未绘制的几何。
         self.geometry.begin_frame();
-        self.frame_copy = None;
+        // 防御性默认值：`copy_to_swapchain` 会覆盖它（离屏帧没有 swapchain，也就不会 present，
+        // 不读这个值）。`present_hint` 相反，必须**跨帧保留**（空集帧沿用上一次的 hint）。
+        self.image_sync = ImageSyncStep::Full;
         let recorded = self.record_frame(
             &shared,
             slot,
@@ -969,7 +1038,9 @@ impl GpuRenderer {
         self.swapchain = Some(swapchain);
         self.fresh = true;
         self.surface = size;
-        self.frame_copy = None;
+        // 上一次 present 的 hint 属于旧链的 image：新链的 image 内容未定义，第一帧必然整面拷贝
+        // （`fresh` ⇒ `Plan::Full`），hint 一并作废。
+        self.present_hint = None;
         if self.persist.size != (extent.width, extent.height) {
             let persist = Persist::new(&self.shared, (extent.width, extent.height))?;
             let previous = std::mem::replace(&mut self.persist, persist);
@@ -1245,8 +1316,10 @@ impl GpuRenderer {
     ///
     /// `written` 是本帧真正写进 persist 的矩形（`None` = 整面重画）。拷贝范围由
     /// [`ImageCopyPlan::plan`] 决定：该 image 内容未知 / 本帧整面重画 / 差集超出容量 ⇒ 整面；
-    /// 否则只拷 `pending ∪ written`。实际拷贝的矩形存进 `frame_copy`，present 用它生成
-    /// `VK_KHR_incremental_present` 的 region（两者必须一致）。
+    /// 否则只拷 `pending ∪ written`。**布局也在这一步决定**（[`plan_swapchain_copy`]）：只有整面
+    /// 拷贝才允许 `UNDEFINED`（内容可丢弃），差分拷贝必须声明内容保留 —— 否则没搬的像素在
+    /// 差分帧里是未定义的（AR3 §5.2 的 P1）。实际搬运的矩形成为 present 的
+    /// `VK_KHR_incremental_present` hint（两者必须一致）。
     fn copy_to_swapchain(
         &mut self,
         shared: &SharedGpu,
@@ -1259,30 +1332,35 @@ impl GpuRenderer {
         };
         let extent = swapchain.extent();
         let target = swapchain.image(image_index);
-        // 差分拷贝计划（R11-12）。`regions = None` ⇒ 整面；空集 ⇒ 本帧不需要搬像素。
-        let plan: CopyPlan = self.image_copy_plan.plan(image_index, written);
-        // R11-16：damage 是相对 UI 物理 surface 算的，swapchain 的 `imageExtent` 可能更小
-        // （`currentExtent` / clamp / transform，R11-9）。**夹紧只有一份实现**：这里夹出来的集合
-        // 既是 `vkCmdCopyImage` 的矩形，也是 present 的 `VkPresentRegionKHR`（`frame_copy`）——
-        // 两者逐字一致，合成器不会把没写的像素当成新的（R11-12）。
-        let regions = plan
-            .regions()
-            .map(|regions| regions.clamped(extent.width, extent.height));
-        self.frame_copy = regions;
-        let mut copies: Vec<vk::ImageCopy> = Vec::new();
-        if let Some(regions) = regions.as_ref() {
-            for rect in regions.as_slice() {
-                copies.push(image_copy(
-                    rect.x0 as u32,
-                    rect.y0 as u32,
-                    rect.width() as u32,
-                    rect.height() as u32,
-                ));
-            }
-        }
-        if copies.is_empty() && regions.is_none() {
-            copies.push(image_copy(0, 0, extent.width, extent.height));
-        }
+        // 差分拷贝计划（R11-12）+ 布局策略（AR3 §5.2 的 P1）：两者必须同时决定 —— 差分拷贝只在
+        // 「没搬的像素保持原内容」时才成立，所以差分路径绝不能再用 `UNDEFINED` 转场。
+        let copy = plan_swapchain_copy(
+            self.image_copy_plan.plan(image_index, written),
+            extent,
+            self.present_hint,
+        );
+        self.image_sync = copy.step;
+        self.present_hint = copy.hint;
+        let copies = match copy.step {
+            // 没有像素要搬（damage 全在 swapchain extent 之外，AR3 §5.3）：image 已经在
+            // `PRESENT_SRC_KHR`（上一次 present 留下的），连布局转场都不需要 —— present 照样合法，
+            // 而 `present_hint` 保持上一次的声明（扩展没有「什么都没变」的编码）。
+            ImageSyncStep::Nothing => return Ok(()),
+            ImageSyncStep::Full => vec![image_copy(0, 0, extent.width, extent.height)],
+            ImageSyncStep::Rects(regions) => regions
+                .as_slice()
+                .iter()
+                .map(|rect| {
+                    image_copy(
+                        rect.x0 as u32,
+                        rect.y0 as u32,
+                        rect.width() as u32,
+                        rect.height() as u32,
+                    )
+                })
+                .collect(),
+        };
+        debug_assert!(!copies.is_empty(), "a copy step must move pixels");
         let range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .level_count(1)
@@ -1291,8 +1369,18 @@ impl GpuRenderer {
         //    transition + copy）。src/dst 都是 TRANSFER，才能排在 `image_available` 的 acquire
         //    wait（同样在 TRANSFER 阶段）之后；用 `TOP_OF_PIPE` 会与 acquire 信号量没有依赖链，
         //    syncval 报 `SYNC-HAZARD-WRITE-AFTER-READ`（F-168）。
+        //
+        //    `old_layout` 就是 AR3 §5.2 的修复点：整面拷贝用 `UNDEFINED`（每个像素都会被重写，
+        //    旧内容允许丢弃）；差分拷贝必须用 `PRESENT_SRC_KHR` 声明**内容保留**（那是 acquire
+        //    之后 image 的真实布局）。`src_access` 恒空：上一次写它的调用已经结束，与 presentation
+        //    engine 的读由 acquire 信号量同步（WSI 的标准写法，barrier 不参与那次同步）。
+        let discards_content = matches!(copy.step, ImageSyncStep::Full);
         let to_dst = vk::ImageMemoryBarrier::default()
-            .old_layout(vk::ImageLayout::UNDEFINED)
+            .old_layout(if discards_content {
+                vk::ImageLayout::UNDEFINED
+            } else {
+                vk::ImageLayout::PRESENT_SRC_KHR
+            })
             .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .image(target)
             .subresource_range(range)
@@ -1303,31 +1391,6 @@ impl GpuRenderer {
             .image(target)
             .subresource_range(range)
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-        if copies.is_empty() {
-            // 该 image 与 persist 已经一致：只做两次 layout 转换（没有像素要搬）。
-            // SAFETY: target 由本窗口的 swapchain 持有；range 是单层单级。
-            unsafe {
-                shared.raw().cmd_pipeline_barrier(
-                    command,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[to_dst],
-                );
-                shared.raw().cmd_pipeline_barrier(
-                    command,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[to_present],
-                );
-            }
-            return Ok(());
-        }
         let to_src = vk::ImageMemoryBarrier::default()
             .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
@@ -1471,6 +1534,32 @@ impl GpuRenderer {
         }
         error
     }
+
+    /// teardown 无法证明「GPU 已空闲」时的兜底：把本窗口**全部** Vulkan 句柄标记成「交给进程级
+    /// 兜底」（AR3 §5.1 / P2-5）。
+    ///
+    /// 调用之后各持有者的 `Drop` 变成空操作，句柄由 `SharedGpu` 的 `vkDestroyDevice` 在进程级
+    /// 兜底回收。理由：`vkDestroySwapchainKHR`（presentation engine 必须已释放）、
+    /// `vkDestroySemaphore` / `vkDestroyFence`（相关提交必须已完成）、`vkDestroyImage` /
+    /// `vkFreeMemory` / `vkDestroySurfaceKHR`（引用它们的命令必须已完成、swapchain 必须先销毁）
+    /// 的前置条件此刻都无法证明。**描述符段不在其中**：它是纯 CPU 记账，`DescriptorLease` 的
+    /// `Drop` 只把段还给共享池，不产生任何 Vulkan 销毁。
+    fn leak_gpu_handles(&mut self) {
+        if let Some(swapchain) = self.swapchain.as_mut() {
+            swapchain.leak();
+        }
+        if let Some(surface) = self.vk_surface.as_mut() {
+            surface.leak();
+        }
+        self.persist.leak();
+        for (_, persist) in &mut self.retired_persists {
+            persist.leak();
+        }
+        for swapchain in &mut self.retired_swapchains {
+            swapchain.leak();
+        }
+        self.sync.leak();
+    }
 }
 
 impl Drop for GpuRenderer {
@@ -1492,9 +1581,9 @@ impl Drop for GpuRenderer {
         //    present**。`vkDestroySwapchainKHR`（VUID-…-01282）与 `vkDestroySemaphore`
         //    （VUID-…-01137）都要求前者；`wait_queue_idle` 是有界的（2 s），设备挂死时窗口仍能关。
         //
-        // 两条失败的语义：**设备已经不可用**。此时不再"假装成功"继续销毁（旧实现 `let _ =`
-        // 吞掉错误照样销毁），而是跳过延迟销毁队列（把句柄留给 `SharedGpu::drop` 兜底），
-        // 只记一条诊断。GpuRenderer 的字段仍会 drop，但那时设备已丢失，驱动不会再执行命令。
+        // 两条失败的语义：**设备已经不可用**（或至少无法证明空闲）。此时**不销毁**任何 Vulkan
+        // 句柄（旧实现 `let _ =` 吞掉错误照样销毁；随后又把两个延迟销毁队列 `clear()` —— 那正是
+        // 逐个 `vkDestroy*`，与注释承诺相反，AR3 §5.1 / P2-5）。见 [`Self::leak_gpu_handles`]。
         let timeline_idle = self.sync.wait_idle();
         let queue_idle = self.shared.wait_queue_idle();
         let teardown_safe = timeline_idle.is_ok() && queue_idle.is_ok();
@@ -1508,12 +1597,11 @@ impl Drop for GpuRenderer {
                 "kytrix: vulkan teardown could not prove the GPU is idle ({reason}); \
                  leaking this window's deferred objects instead of destroying in-flight handles"
             );
-            // 跳过「危险销毁」：不再销毁命令池 / 延迟队列（把句柄留给进程级兜底）。
+            self.leak_gpu_handles();
+            // `Drop` 无法取消字段的 drop，所以「泄漏」只能靠每个持有者的 `handles.leaked()`
+            // 守卫（`Swapchain` / `Surface` / `Persist` / `FrameSync`）。这里只剩 CPU 内存要放掉。
             self.retired_persists.clear();
             self.retired_swapchains.clear();
-            self.geometry.release(&self.shared);
-            self.upload.release(&self.shared);
-            self.sync.drain_all_retired();
             return;
         }
         // SAFETY: ① 本窗口命令已完成；② 队列已 idle ⇒ 没有在飞批次引用命令池。
@@ -1545,6 +1633,8 @@ struct Persist {
     framebuffer_load: vk::Framebuffer,
     /// 实际尺寸（= 创建时的 swapchain extent；读回与 `renderArea` 的唯一来源，R11-9）。
     size: (u32, u32),
+    /// teardown 的兜底标记（AR3 §5.1 / P2-5）：`leaked()` 为真时 `Drop` 不销毁任何句柄。
+    handles: DeferredHandles,
 }
 
 impl Persist {
@@ -1624,7 +1714,16 @@ impl Persist {
             framebuffer_clear,
             framebuffer_load,
             size,
+            handles: DeferredHandles::default(),
         })
+    }
+
+    /// teardown 兜底（AR3 §5.1 / P2-5）：不再销毁 image / view / memory / framebuffer。
+    ///
+    /// 调用方（`GpuRenderer::drop`）在无法证明 GPU 已空闲时调用：`vkDestroyImage` /
+    /// `vkFreeMemory` 都要求引用它们的命令已完成，否则是规范违规。
+    fn leak(&mut self) {
+        self.handles.leak();
     }
 
     fn framebuffer(&self, clear: bool) -> vk::Framebuffer {
@@ -1638,6 +1737,10 @@ impl Persist {
 
 impl Drop for Persist {
     fn drop(&mut self) {
+        // teardown 无法证明 GPU 已空闲：句柄已交给进程级兜底（AR3 §5.1 / P2-5）。
+        if self.handles.leaked() {
+            return;
+        }
         // SAFETY: 句柄归本结构独占；调用前队列已空闲（退出路径）或该帧已完成（延迟销毁）。
         unsafe {
             self.device
@@ -1969,6 +2072,46 @@ fn elapsed_ns(started: Instant) -> u64 {
     started.elapsed().as_nanos() as u64
 }
 
+/// 本帧 copy 步骤的决策：布局转场、搬运范围、present 的 hint（**纯函数**，可单测）。
+///
+/// 三条规则（AR3 §5.2 / §5.3）：
+/// 1. `CopyPlan::Full` ⇒ 整面拷贝 ⇒ `oldLayout` 可以用 `UNDEFINED`：这一帧每个像素都会被重写，
+///    旧内容允许丢弃（也省掉一次整图读）。
+/// 2. `CopyPlan::Regions` 夹到 extent 后**非空** ⇒ 差分拷贝 ⇒ `oldLayout` 必须是
+///    `PRESENT_SRC_KHR`（内容保留）：没搬的像素仍要显示上一次写进去的内容，而 `UNDEFINED` 转场
+///    会把它们变成未定义。
+/// 3. `CopyPlan::Regions` 夹到 extent 后**为空**（damage 全在可见区域之外）⇒ 一个像素都不搬，
+///    连布局都不碰：image 已经在 `PRESENT_SRC_KHR`（上一次 present 留下的）。此时 hint 沿用
+///    `previous_hint` —— `VK_KHR_incremental_present` 没有「什么都没变」的编码（空 region 数组
+///    = 整面），声称整张 image 都变了只会让合成器白重合成一遍。
+fn plan_swapchain_copy(
+    plan: CopyPlan,
+    extent: vk::Extent2D,
+    previous_hint: Option<DamageRects>,
+) -> SwapchainCopy {
+    let Some(regions) = plan.regions() else {
+        return SwapchainCopy {
+            step: ImageSyncStep::Full,
+            hint: None,
+        };
+    };
+    // R11-16：damage 是相对 UI 物理 surface 算的，swapchain 的 `imageExtent` 可能更小
+    // （`currentExtent` / clamp / transform，R11-9）。**夹紧只有一份实现**：这里夹出来的集合
+    // 既是 `vkCmdCopyImage` 的矩形，也是 present 的 `VkPresentRegionKHR` —— 两者逐字一致，
+    // 合成器不会把没写的像素当成新的（R11-12）。
+    let clamped = regions.clamped(extent.width, extent.height);
+    if clamped.is_empty() {
+        return SwapchainCopy {
+            step: ImageSyncStep::Nothing,
+            hint: previous_hint,
+        };
+    }
+    SwapchainCopy {
+        step: ImageSyncStep::Rects(clamped),
+        hint: Some(clamped),
+    }
+}
+
 /// 本帧真正写进 persist 的矩形（`None` = 整面）。
 ///
 /// 差分拷贝的输入（R11-12）：`fresh` / `Plan::Full` 意味着这一帧整面重画了 persist，
@@ -2023,19 +2166,150 @@ fn destination_update(last: Option<(i32, i32)>, surface_local: Size) -> Option<(
 mod tests {
     use std::sync::Arc;
 
-    use super::{GpuRenderer, destination_update};
+    use ash::vk;
+
+    use super::{GpuRenderer, ImageSyncStep, destination_update, plan_swapchain_copy};
     use crate::{
-        math::Size,
+        math::{PhysicalRect, Size},
         paint::atlas::AtlasKind,
         render::{
             DirtyRows,
-            compositor::{FramePlan, Plan},
+            compositor::{CopyPlan, DamageRects, FramePlan, Plan},
             frame::FramePayload,
             linux::device::{SharedGpu, gpu_test_lock},
             timer::FrameTimings,
         },
         window::FrameIndex,
     };
+
+    /// 建一组矩形（容量内）。
+    fn rects(list: &[PhysicalRect]) -> DamageRects {
+        let mut rects = DamageRects::new();
+        for rect in list {
+            assert!(rects.push(*rect));
+        }
+        rects
+    }
+
+    /// AR3 §5.2 的 P1：布局策略必须跟着拷贝范围走 —— **只有整面拷贝才允许丢弃 image 内容**。
+    ///
+    /// 差分帧只覆盖 `pending ∪ written`，若此时仍用 `oldLayout = UNDEFINED`，矩形之外的像素就是
+    /// 未定义内容（离屏 golden 走不到 present，测不出来）。
+    #[test]
+    fn only_a_full_surface_copy_may_discard_the_image_content() {
+        let extent = vk::Extent2D {
+            width: 64,
+            height: 64,
+        };
+        let region = rects(&[PhysicalRect::new(4, 8, 12, 16)]);
+        // 整面拷贝：每个像素都会被重写 ⇒ `UNDEFINED` 合法（也省掉一次整图读）。
+        let full = plan_swapchain_copy(CopyPlan::Full, extent, Some(region));
+        assert_eq!(full.step, ImageSyncStep::Full);
+        assert_eq!(full.hint, None, "整面拷贝不挂 region（整面语义）");
+        // 差分拷贝：必须声明内容保留，否则没搬的像素是未定义内容。
+        let partial = plan_swapchain_copy(CopyPlan::Regions(region), extent, None);
+        assert_eq!(
+            partial.step,
+            ImageSyncStep::Rects(region),
+            "差分帧只允许 `PRESENT_SRC_KHR`（内容保留）作 oldLayout"
+        );
+        assert_eq!(partial.hint, Some(region), "hint 与实际拷贝的矩形逐字一致");
+    }
+
+    /// AR3 §5.3：damage 全部落在 swapchain extent 之外 ⇒ 一个像素都不搬、连布局都不碰，
+    /// present 的 hint 沿用上一次（`VK_KHR_incremental_present` 没有「什么都没变」的编码）。
+    #[test]
+    fn damage_entirely_outside_the_extent_copies_nothing_and_keeps_the_previous_hint() {
+        let extent = vk::Extent2D {
+            width: 32,
+            height: 32,
+        };
+        let outside = rects(&[PhysicalRect::new(40, 0, 60, 20)]);
+        let previous = rects(&[PhysicalRect::new(0, 0, 8, 8)]);
+        let step = plan_swapchain_copy(CopyPlan::Regions(outside), extent, Some(previous));
+        assert_eq!(step.step, ImageSyncStep::Nothing, "没有像素要搬，不碰布局");
+        assert_eq!(
+            step.hint,
+            Some(previous),
+            "沿用上一次的 hint，而不是声称整张 image 都变了"
+        );
+        // 没有上一次的 hint 时只让 present 走「不挂 region」这条（比整面声明更保守的那一边）。
+        let step = plan_swapchain_copy(CopyPlan::Regions(outside), extent, None);
+        assert_eq!(step.step, ImageSyncStep::Nothing);
+        assert_eq!(step.hint, None);
+        // 部分在外的矩形：只搬夹进来的那一块，hint 必须是夹过之后的同一份集合（R11-16）。
+        let straddling = rects(&[PhysicalRect::new(28, 0, 40, 8)]);
+        let clamped = rects(&[PhysicalRect::new(28, 0, 32, 8)]);
+        let step = plan_swapchain_copy(CopyPlan::Regions(straddling), extent, None);
+        assert_eq!(step.step, ImageSyncStep::Rects(clamped));
+        assert_eq!(step.hint, Some(clamped));
+    }
+
+    /// AR3 §5.6 / R11-4 的 CI 门禁：验证层在跑时，一帧 headless 渲染不得产生 **ERROR** 级消息。
+    ///
+    /// 只能比较**增量**（同一进程里别的 GPU 测试可能先触发过消息）。真机门禁命令是
+    /// `KYTRIX_VK_VALIDATION=strict cargo test --all-features`：`strict` 模式下 ERROR 直接 panic，
+    /// 这条断言是同一判据的非 panic 版本（也覆盖 `on` 模式 —— 那里错误只打日志、不会 fail）。
+    #[test]
+    fn a_headless_frame_produces_no_validation_errors() {
+        let _guard = gpu_test_lock();
+        let mut renderer = GpuRenderer::new_offscreen((32, 32)).expect("offscreen renderer");
+        if !renderer.shared.caps().validation {
+            eprintln!(
+                "skip: Vulkan validation layer is not enabled \
+                 (release build or KYTRIX_VK_VALIDATION=off)"
+            );
+            return;
+        }
+        let (errors_before, _) = crate::render::linux::instance::validation_counts();
+        let mut frame = FramePlan::new(Plan::Full, true);
+        let mut timings = FrameTimings::new();
+        renderer
+            .submit_snapshot(
+                FrameIndex::from_raw(1),
+                &FramePayload::empty(),
+                &mut frame,
+                &mut timings,
+            )
+            .expect("headless frame");
+        let (errors_after, _) = crate::render::linux::instance::validation_counts();
+        assert_eq!(
+            errors_after, errors_before,
+            "验证层报了 ERROR 级消息（VUID 见 stderr；strict 模式会直接 panic）"
+        );
+    }
+
+    /// AR3 §5.1 / P2-5 的静态防回归：teardown 的「无法证明 GPU 空闲」分支必须**先**把句柄标记成
+    /// 「交给进程级兜底」，再清空延迟销毁队列 —— 反过来（旧实现）`clear()` 就是逐个 `vkDestroy*`，
+    /// 销毁的正是可能仍被在飞命令 / presentation engine 引用的对象。
+    ///
+    /// 该分支只能在真机「设备健康但挂起」时进入，普通 GPU 测试覆盖不到，因此用源码级断言钉住
+    /// 顺序（与 D3D12 `swapchain.rs` 的 `include_str!` 防回归测试同一手法）。
+    #[test]
+    fn an_unsafe_teardown_marks_the_handles_leaked_before_clearing_the_queues() {
+        let source = include_str!("compositor.rs");
+        let leak = source
+            .find("self.leak_gpu_handles();")
+            .expect("不安全 teardown 必须调用 leak_gpu_handles()");
+        let clear = source
+            .find("self.retired_persists.clear();")
+            .expect("延迟销毁队列仍必须被释放（只放 CPU 内存）");
+        assert!(
+            leak < clear,
+            "必须先标记泄漏再清队列：否则 clear() 会在泄漏标记之前销毁在飞句柄"
+        );
+        // 每个持有者的 `Drop` 都必须看这个标记（否则「泄漏」只是注释里的话）。
+        for (file, source) in [
+            ("compositor.rs", source),
+            ("swapchain.rs", include_str!("swapchain.rs")),
+            ("device.rs", include_str!("device.rs")),
+        ] {
+            assert!(
+                source.contains("handles.leaked()"),
+                "{file}: 持有 Vulkan 句柄的 Drop 必须有 leaked() 守卫"
+            );
+        }
+    }
 
     #[test]
     fn a_destination_is_written_only_when_it_changes() {

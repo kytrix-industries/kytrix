@@ -1272,6 +1272,33 @@ impl Drop for DescriptorLease {
     }
 }
 
+/// teardown 的「句柄交给进程级兜底」标记（AR3 §5.1 / P2-5）。
+///
+/// **为什么需要它**：`Drop for GpuRenderer` 一旦进入「无法证明 GPU 已空闲」的分支，就必须
+/// **不销毁**任何可能仍被在飞命令 / presentation engine 引用的句柄，但 Rust **不能取消字段的
+/// drop** —— 从 `Drop::drop` 里 `return` 之后，`swapchain` / `persist` / `sync` 三个字段照样会被
+/// 逐个 `vkDestroy*`。旧实现正是在这里自相矛盾：注释说「把句柄留给进程级兜底」，代码却
+/// `clear()` 了两个延迟销毁队列（`clear()` = 逐个 drop = 逐个销毁），三个字段也照常销毁。
+///
+/// 唯一的可靠做法是让每个持有者的 `Drop` 看到这个标记后提前返回；句柄本身留给
+/// `SharedGpu` 的 `vkDestroyDevice`（进程级兜底）回收。
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DeferredHandles {
+    leaked: bool,
+}
+
+impl DeferredHandles {
+    /// 标记「不再销毁，交给进程级兜底」。
+    pub(crate) fn leak(&mut self) {
+        self.leaked = true;
+    }
+
+    /// 是否已经交给进程级兜底（`Drop` 必须据此跳过全部 `vkDestroy*`）。
+    pub(crate) fn leaked(&self) -> bool {
+        self.leaked
+    }
+}
+
 /// 每窗口的帧同步原语：每帧槽 fence、`image_available` 二值信号量、retire timeline（§7.2）。
 ///
 /// 这些**不能**进程级共享：timeline 的 signal 值必须按每个窗口自己的帧序号单调递增；fence /
@@ -1287,6 +1314,8 @@ pub(crate) struct FrameSync {
     image_available: [vk::Semaphore; MAX_FRAMES_IN_FLIGHT],
     ring: InFlightRing,
     retire: RetireQueue,
+    /// teardown 的兜底标记：`leaked()` 为真时 `Drop` 不销毁任何信号量 / fence。
+    handles: DeferredHandles,
 }
 
 impl FrameSync {
@@ -1333,7 +1362,16 @@ impl FrameSync {
             image_available,
             ring: InFlightRing::new(),
             retire: RetireQueue::new(),
+            handles: DeferredHandles::default(),
         })
+    }
+
+    /// teardown 兜底（AR3 §5.1 / P2-5）：不再销毁 timeline / fence / `image_available`。
+    ///
+    /// 调用方（`GpuRenderer::drop`）在无法证明 GPU 已空闲时调用 —— 此时销毁这些同步原语会违反
+    /// `vkDestroySemaphore` / `vkDestroyFence` 的前置条件（相关命令必须已完成）。
+    pub(crate) fn leak(&mut self) {
+        self.handles.leak();
     }
 
     /// 取本帧的 ring 槽位（**纯记账**，不碰 GPU；提交成功后才 [`FrameSync::advance`]）。
@@ -1508,6 +1546,11 @@ impl FrameSync {
 
 impl Drop for FrameSync {
     fn drop(&mut self) {
+        // teardown 无法证明 GPU 已空闲：句柄已交给进程级兜底（`vkDestroyDevice` 回收），
+        // 销毁它们会违反 `vkDestroySemaphore` / `vkDestroyFence` 的前置条件（AR3 §5.1）。
+        if self.handles.leaked() {
+            return;
+        }
         // SAFETY: 句柄归本结构独占；窗口 teardown 已等到本窗口最后一次提交完成。
         unsafe {
             for fence in self.fences {

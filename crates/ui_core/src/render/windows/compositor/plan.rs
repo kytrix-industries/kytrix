@@ -30,6 +30,7 @@ use crate::{
     render::{
         compositor::{DamageRects, FramePlan, MAX_DRAW_PASSES, Plan},
         damage::MAX_DAMAGE_RECTS,
+        windows::swapchain::BUFFER_COUNT,
     },
 };
 
@@ -159,8 +160,11 @@ impl BufferSyncState {
     };
 }
 
-/// flip 模型的 back buffer 池深度（与 `swapchain::BUFFER_COUNT` 同源）。
-const SYNC_SLOTS: usize = 3;
+/// flip 模型的 back buffer 池深度。
+///
+/// **派生自** [`BUFFER_COUNT`]（不是重复的 `3`）：R08-14 若要改 buffer 数量，这里的槽表必须
+/// 一起变，否则 `index % SYNC_SLOTS` 会静默把两张 buffer 映射到同一个槽（AR3 §4.2 缺口 2）。
+const SYNC_SLOTS: usize = BUFFER_COUNT as usize;
 
 /// 按 **back buffer 身份**追踪 persist 同步状态的固定容量表（照搬 macOS 的 `DrawableSyncs`）。
 ///

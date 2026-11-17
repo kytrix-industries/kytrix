@@ -312,7 +312,11 @@ pub(crate) extern "system" fn wndproc(
         if is_ime_message(msg) {
             // 组合串读取（`ImmGetContext` + `ImmGetCompositionStringW`）不派发消息，可以在借用
             // 内完成；**写**表单/上下文会重入，因此只产命令、出借用后再执行（文件头纪律 1）。
-            let outcome = (*state).translate.ime_mut().handle(hwnd, msg, lparam_value);
+            // `ticks` 随消息进入 IME 状态：提交抑制队列用它做时间戳（AR3 §1.5）。
+            let outcome = (*state)
+                .translate
+                .ime_mut()
+                .handle(hwnd, msg, lparam_value, ticks);
             if let Some(command) = outcome.command {
                 let applied = ime::execute(hwnd, command);
                 (*state).note_ime_applied(applied);

@@ -9,7 +9,7 @@ use crate::{
     error::EngineError,
     render::{
         RenderStats,
-        compositor::FramePlan,
+        compositor::{DamageRects, FramePlan},
         frame::{FrameRequest, FrameSlot},
         timer::{FrameTimings, GpuTimerSample, Section},
         windows::{diagnostics, hresult::PresentOutcome},
@@ -19,7 +19,8 @@ use crate::{
 /// `Present1` 失败之后要执行的动作（R08-7）。
 ///
 /// 关键分类（见 [`super::super::hresult::classify_present`]）：
-/// - `InvalidCall`：用「整面 dirty」重试一次（多半是驱动拒绝了某个矩形）；
+/// - `InvalidCall`：只有**整帧重录**是安全的（见 [`invalid_call_recovery`]）
+///   ⇒ [`FrameSubmitError::RetryFull`]，由 GPU 循环用 `Plan::Full` 重录这一帧；
 /// - `ModeChanged`：交换链 out of date ⇒ 重建目标后重录这一帧（[`FrameSubmitError::NeedsResize`]）；
 /// - 设备级错误：**唯一**进设备丢失路径的类别；
 /// - 其它负 HRESULT：致命（保留分类，窗口上报错误）。
@@ -27,12 +28,43 @@ pub(crate) enum FrameSubmitError {
     Fatal(EngineError),
     /// 交换链 out of date / 显示模式变化：调用方 `resize_target` 之后重录这一帧。
     NeedsResize,
+    /// `Present1` 拒绝了本帧（`DXGI_ERROR_INVALID_CALL`）：调用方把这一帧**整帧重录**
+    /// （`Plan::Full` ⇒ `Direct`：整块 clear + 全内容重画 + 整面 present）后再 present。
+    RetryFull,
 }
 
 impl FrameSubmitError {
     fn fatal(error: EngineError) -> Self {
         Self::Fatal(error)
     }
+}
+
+/// `Present1` 返回 `DXGI_ERROR_INVALID_CALL` 之后的动作（AR3 §4.2 缺口 1 / P2-4）。
+///
+/// **为什么不能「换成整面 dirty 再 present 一次」**：增量帧的当前 back buffer 只同步了
+/// `pending ∪ damage` 这些矩形（`plan::BufferSyncs`），而 `Present1` 的 dirty 参数只是
+/// **声明**、不会让未同步的像素变得有内容。整面 present 会把那些区域直接上屏 —— flip 模型下
+/// 它们是这张 buffer 上一次呈现的内容（可能 3 帧前），`Fresh` 时甚至是未定义内容。所以：
+///
+/// - 增量帧（`presented = Some`）⇒ 必须**整帧重录**：`Direct` 路径整块 clear + 全内容重画 +
+///   整面 present，back buffer 的每个像素都有定义（复用三模式里已有的路径，不新增模式）；
+/// - 整帧（`presented = None`）⇒ back buffer 已经整块与 persist 一致（`Direct` 清屏重画 /
+///   `Full` 整块拷贝），**不存在**未同步区域；此时「整面重试」就是刚才那次失败的调用本身，
+///   重试没有意义 ⇒ 按致命错误上报。
+pub(crate) fn invalid_call_recovery(presented: Option<&DamageRects>) -> PresentRetry {
+    match presented {
+        Some(_) => PresentRetry::FullRerecord,
+        None => PresentRetry::Fatal,
+    }
+}
+
+/// [`invalid_call_recovery`] 的返回值（纯决策，单测覆盖）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PresentRetry {
+    /// 本帧整帧重录（`Plan::Full`）后再 present。
+    FullRerecord,
+    /// 没有安全的退路：按致命错误上报。
+    Fatal,
 }
 
 /// 消费者：`GpuRenderer::finish_sync`（`compositor.rs` 的薄委托）。
@@ -107,10 +139,14 @@ pub(super) fn submit_frame(
         // 有新帧待画 ⇒ `sync = 0`（取消上一帧剩余时间）；否则 `sync = 1` 保持 vsync 节奏。
         let sync = if replace { 0 } else { 1 };
         outcome = swapchain.present1(recorded.present.as_ref(), sync);
-        if outcome == PresentOutcome::InvalidCall {
-            // R08-7：驱动拒绝了某个矩形（越界 / 参数），退化为整面再试一次。
+        if outcome == PresentOutcome::InvalidCall
+            && invalid_call_recovery(recorded.present.as_ref()) == PresentRetry::FullRerecord
+        {
+            // R08-7 / AR3 P2-4：**不**换参数重试（整面 present 会把未同步区域上屏），而是交给
+            // GPU 循环整帧重录。这里已经发生的状态推进必须跟着回退：这一帧没有上屏。
             diagnostics::present_retried();
-            outcome = swapchain.present1(None, sync);
+            renderer.target.on_present_failed();
+            return Err(FrameSubmitError::RetryFull);
         }
     }
     // R08-11 的不变量：全量帧必须整面 present（`DirtyRectsCount = 0`）。
@@ -167,4 +203,30 @@ pub(super) fn submit_frame(
 /// 消费者：`FrameRecorder::record` / `finish_sync` / `submit_frame`。
 pub(super) fn elapsed_ns(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PresentRetry, invalid_call_recovery};
+    use crate::{math::PhysicalRect, render::compositor::DamageRects};
+
+    /// AR3 §4.2 缺口 1 / P2-4：`Present1(InvalidCall)` 之后**不允许**「整面重试」——
+    /// 增量帧的 back buffer 只同步了 `pending ∪ damage`（整面 present 会把 3 帧前的旧内容 /
+    /// fresh 时的未定义内容上屏），所以唯一安全的退路是整帧重录；整帧本身没有未同步区域，
+    /// 「整面重试」只是把刚才失败的调用再发一遍，按致命处理。
+    #[test]
+    fn invalid_call_only_has_a_safe_retry_for_incremental_frames() {
+        let mut damage = DamageRects::new();
+        assert!(damage.push(PhysicalRect::new(0, 0, 8, 8)));
+        assert_eq!(
+            invalid_call_recovery(Some(&damage)),
+            PresentRetry::FullRerecord,
+            "增量帧必须整帧重录，不得整面 present"
+        );
+        assert_eq!(
+            invalid_call_recovery(None),
+            PresentRetry::Fatal,
+            "整帧没有未同步区域：重试同一个调用没有意义"
+        );
+    }
 }

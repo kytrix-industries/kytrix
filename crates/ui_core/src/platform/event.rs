@@ -153,6 +153,14 @@ impl TranslateState {
     pub(crate) fn ime(&self) -> &ImeState {
         &self.ime
     }
+
+    /// 一轮消息排空结束（泵每轮 ① 之前调用）：推进 IME 提交抑制队列的消息批次号。
+    ///
+    /// 队列只在「入队批次 + 紧随其后的一轮」内匹配（`ImeState::consume_char`），这样「提交后
+    /// 系统不补发 `WM_CHAR`」的残留不会跨会话留到下一次真实键入（AR3 §1.5）。
+    pub(crate) fn end_message_batch(&mut self) {
+        self.ime.end_message_batch();
+    }
 }
 
 /// 一条消息 → 至多一个平台事件。`None` = 该消息不影响应用层。
@@ -213,6 +221,13 @@ pub(crate) fn translate(
             })
         }
         WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
+            // AR3 §1.5：**真实键入优先**。任何键按下都作废上一批的提交抑制队列 —— 候选窗提交
+            // 之后系统不补发 `WM_CHAR` 时，残留队列会在用户下一次键入（与提交首码元相同）时吞掉
+            // 一次按键。放在 VK 过滤之前：`VK_PROCESSKEY` / `VK_PACKET` 的按下同样代表一次真实
+            // 输入会话（注入文本也走 `VK_PACKET` + `WM_CHAR`）。
+            if matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN) {
+                state.ime.clear_pending();
+            }
             let vk = (wparam & 0xFF) as u16;
             // R07-6：IME 组合期间系统把 `WM_KEYDOWN` 的 wParam 换成 `VK_PROCESSKEY`（真实键码
             // 要用 `ImmGetVirtualKey` 才拿得到），`VK_PACKET` 则是 `SendInput(KEYEVENTF_UNICODE)`
@@ -241,8 +256,9 @@ pub(crate) fn translate(
         }
         WM_CHAR => {
             // IME 提交之后 Windows 会再发同内容的 `WM_CHAR`（**每 UTF-16 码元一条**）：逐码元
-            // 比对后跳过，避免文字重复；内容不匹配时队列自愈（R07-5）。
-            if state.ime.consume_char(wparam as u16) {
+            // 比对后跳过，避免文字重复；内容不匹配 / 过了抑制有效期时队列自愈（R07-5 /
+            // AR3 §1.5：队列带消息批次与时间戳，不会跨到用户之后的真实键入）。
+            if state.ime.consume_char(wparam as u16, context.ticks_ms) {
                 return None;
             }
             decode_char(wparam as u16, state).map(PlatformEvent::Text)
@@ -1245,7 +1261,8 @@ mod tests {
     fn committed_text_suppresses_only_the_matching_char_units() {
         let mut state = TranslateState::default();
         // 模拟 `ImeState` 在 `GCS_RESULTSTR` 提交后排队的内容：「🌍a」= 3 个码元。
-        state.ime_mut().queue_commit("🌍a");
+        // 入队时间取 `context()` 的 `MSG.time`（同一批消息共享时间域）。
+        state.ime_mut().queue_commit("🌍a", context().ticks_ms);
         // 系统随后补发 3 条 `WM_CHAR`（每码元一条）：全部被抑制。
         for unit in "🌍a".encode_utf16() {
             assert_eq!(
@@ -1266,12 +1283,70 @@ mod tests {
         assert_eq!(text.event, PlatformEvent::Text(SmolStr::new_static("x")));
     }
 
+    /// AR3 §1.5（P2-2）：候选窗提交后系统**不**补发 `WM_CHAR`，用户随即键入与提交首码元相同
+    /// 的字符 —— 真实键入 = `WM_KEYDOWN` + `WM_CHAR`，按键按下必须清空抑制队列。
+    ///
+    /// 失败面：残留队列留到下一次组合 / 失焦；用户键入同首码元字符时 `consume_char` 命中，
+    /// 真实按键被吞掉一次（「提交后直接键入丢一个字符」）。
+    #[test]
+    fn a_real_key_press_after_a_commit_is_never_swallowed() {
+        let mut state = TranslateState::default();
+        // 提交字面量 "a"（微软拼音 a+Enter 的形态）但系统没有补发 WM_CHAR。
+        state.ime_mut().queue_commit("a", context().ticks_ms);
+        // 用户立刻真实键入 'a'：keydown 先到（0x41 = VK_A，扫描码 0x1E）。
+        let key = translate(
+            WM_KEYDOWN,
+            0x41,
+            key_lparam(0x1E, false, false),
+            context(),
+            &mut state,
+        )
+        .expect("按键");
+        assert!(matches!(
+            key.event,
+            PlatformEvent::Key {
+                state: KeyState::Down,
+                ..
+            }
+        ));
+        // 随后 TranslateMessage 产生的 WM_CHAR：不得被残留抑制队列吞掉。
+        let text = translate(
+            WM_CHAR,
+            usize::from(u16::from(b'a')),
+            0,
+            context(),
+            &mut state,
+        )
+        .expect("真实键入必须放行");
+        assert_eq!(text.event, PlatformEvent::Text(SmolStr::new_static("a")));
+    }
+
+    /// AR3 §1.5：跨过「入队批次 + 紧随其后的一轮」后，残留队列（提交后系统没补发 `WM_CHAR`）
+    /// 必须作废，不能吞掉更晚的真实键入（真实键入即使没有 keydown —— 例如粘贴后的 WM_CHAR）。
+    #[test]
+    fn a_queue_left_over_from_an_older_message_batch_is_dropped() {
+        let mut state = TranslateState::default();
+        state.ime_mut().queue_commit("a", context().ticks_ms);
+        // 两轮消息排空之后：不是补发字符了。
+        state.end_message_batch();
+        state.end_message_batch();
+        let text = translate(
+            WM_CHAR,
+            usize::from(u16::from(b'a')),
+            0,
+            context(),
+            &mut state,
+        )
+        .expect("过期队列必须放行");
+        assert_eq!(text.event, PlatformEvent::Text(SmolStr::new_static("a")));
+    }
+
     /// 失焦（`reset_transient`）必须清空 IME 待抑制队列：否则残留码元会静默吞掉
     /// 之后真实键入的字符（R07-5 的核心缺陷）。
     #[test]
     fn losing_focus_drops_pending_ime_suppression() {
         let mut state = TranslateState::default();
-        state.ime_mut().queue_commit("ni");
+        state.ime_mut().queue_commit("ni", context().ticks_ms);
 
         state.reset_transient();
 

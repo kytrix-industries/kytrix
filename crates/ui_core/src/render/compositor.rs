@@ -281,6 +281,48 @@ impl ImageCopyPlan {
         CopyPlan::Regions(regions)
     }
 
+    /// present **成功、但这一帧一个像素都没有搬进这张 image** 之后推进状态。
+    ///
+    /// 触发条件是 [`ImageCopyPlan::plan`] 返回 `Regions`（即这张 image 之前已经建立过基线），
+    /// 而夹到 swapchain extent 之后集合为空 —— 本帧的 damage 全部落在可见区域之外
+    /// （`currentExtent` 被合成器夹小，AR3 §5.3）。此时 present 仍然会发生（image 已经 acquire，
+    /// 没有「交还」的语义），但**欠账不能清**：`Pending` 的语义是「这张 image 相对 persist 还差
+    /// 这些矩形」，这一帧没搬像素，所以它仍然欠着。把集合当成「已追平」会让不变量变成假的
+    /// （那些矩形在 persist 里是新的、在这张 image 上是旧的），一旦可见区域变大就会少拷一块。
+    ///
+    /// 其余 image 的推进规则与 [`ImageCopyPlan::commit`] 完全一致（直接复用它），返回的也是
+    /// 「被降级成整面拷贝的 image 数」（诊断，含本 image）。
+    pub(crate) fn commit_without_copy(
+        &mut self,
+        image: u32,
+        written: Option<DamageRects>,
+    ) -> usize {
+        let index = image as usize;
+        let carried = self.images.get(index).copied();
+        let degraded = self.commit(image, written);
+        let Some(ImageSync::Pending(pending)) = carried else {
+            // `Unknown`（内容未知 ⇒ 反正整面拷贝）：`commit` 已把它置成 `Pending(空)`，
+            // 这里还原成「仍然未知」，否则下一帧会少拷整面。
+            if carried.is_some() {
+                self.images[index] = ImageSync::Unknown;
+            }
+            return degraded;
+        };
+        let Some(written) = written else {
+            // 本帧整面重写了 persist：这张 image 一定落后（与 `commit` 里的降级规则一致）。
+            self.images[index] = ImageSync::Unknown;
+            return degraded + 1;
+        };
+        let mut merged = pending;
+        if !merged.extend(written) {
+            // 累积超出固定容量：降级成整面拷贝（绝不丢 damage）。
+            self.images[index] = ImageSync::Unknown;
+            return degraded + 1;
+        }
+        self.images[index] = ImageSync::Pending(merged);
+        degraded
+    }
+
     /// present 成功之后推进状态。
     ///
     /// `written` 与 [`ImageCopyPlan::plan`] 的入参相同（用来判断「其余 image 是否需要降级成
@@ -818,6 +860,44 @@ mod tests {
             regions(plan.plan(0, Some(empty))),
             Vec::new(),
             "与本帧 damage 无关时不需要搬任何像素"
+        );
+    }
+
+    /// AR3 §5.3：**空集 present**（damage 全部落在 swapchain extent 之外，一个像素都没搬）
+    /// 之后不得把这张 image 的欠账清掉，其余 image 仍必须照常累积本帧 damage。
+    #[test]
+    fn a_present_without_any_copy_keeps_the_pending_rects() {
+        let mut plan = ImageCopyPlan::new(2);
+        let baseline = rects(&[PhysicalRect::new(0, 0, 8, 8)]);
+        // 两张 image 都建立基线（`commit` 之后才是 `Pending`，第一次用到时仍然是整面）。
+        plan.commit(0, Some(baseline));
+        plan.commit(1, Some(baseline));
+        // image 0 错过了一帧：image 1 的欠账 = 右下那一块（假设它在可见区域之外）。
+        let missed = rects(&[PhysicalRect::new(90, 90, 100, 100)]);
+        plan.commit(0, Some(missed));
+        assert_eq!(
+            regions(plan.plan(1, Some(rects(&[])))),
+            vec![PhysicalRect::new(90, 90, 100, 100)]
+        );
+
+        // 轮到 image 1：本帧又写了一块（同样在可见区域之外），但**没有搬像素**就 present 了。
+        let also_outside = rects(&[PhysicalRect::new(90, 0, 100, 10)]);
+        plan.commit_without_copy(1, Some(also_outside));
+        let mut carried = regions(plan.plan(1, Some(rects(&[]))));
+        carried.sort_by_key(|rect| (rect.x0, rect.y0));
+        assert_eq!(
+            carried,
+            vec![
+                PhysicalRect::new(90, 0, 100, 10),
+                PhysicalRect::new(90, 90, 100, 100),
+            ],
+            "没搬像素的 present 不得把欠账清成空集（那会让可见区域变大后少拷一块）"
+        );
+        // 其余 image 照常累积本帧的 damage（它们也没同步到 `also_outside`）。
+        assert_eq!(
+            regions(plan.plan(0, Some(rects(&[])))),
+            vec![PhysicalRect::new(90, 0, 100, 10)],
+            "空集 early-return 不得跳过其余 image 的累积"
         );
     }
 

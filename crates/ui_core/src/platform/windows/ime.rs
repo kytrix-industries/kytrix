@@ -21,7 +21,9 @@
 //!    串、再插入新组合串；AR1b N5）。
 //! 3. **提交去重按 UTF-16 码元 + 内容校验**（不是码点计数）：IME 提交后系统补发的 `WM_CHAR`
 //!    是**每码元一条**，提交串里的文本按码元排队，逐条比对 —— 内容不匹配立刻清空队列
-//!    （异常 IME 自愈），失焦 / 重新组合 / 禁用 IME 也清空。
+//!    （异常 IME 自愈）。队列还带**事件流位置（消息批次）+ 时间戳**：只在入队批次与其后一轮
+//!    内匹配，失焦 / 重新组合 / 禁用 IME / **任何键按下**（真实键入优先）都清空。这样「候选窗
+//!    提交后系统不补发 `WM_CHAR`、用户随即键入同首码元字符」不会吞键（AR3 §1.5 / P2-2）。
 //!
 //! 应用还可以**主动关闭**本窗口的 IME（自绘搜索框的英文直输模式）：
 //! [`ImeState::plan_enabled`] 用 `ImmAssociateContext(hwnd, NULL)` 把输入上下文从窗口上摘下来
@@ -110,9 +112,35 @@ pub(crate) struct ImeState {
     ///
     /// 用队列而不是计数（R07-5）：计数不知道吞的是什么，异常 IME / TSF 通路少发或重发一条
     /// `WM_CHAR` 就会把余数留给**用户之后真实键入**的字符（「输入 10 手，界面收到 1 手」）。
-    /// 队列逐码元比对，不匹配即清空自愈。
+    /// 队列逐码元比对，不匹配即清空自愈；多次提交**追加**而不是覆盖（AR3 §1.5 P3：同一批里
+    /// 两次 `GCS_RESULTSTR` 之间可能没有 `WM_CHAR`，覆盖会丢掉第一次的抑制）。
     pending_chars: VecDeque<u16>,
+    /// 队列所属的**消息批次**（[`Self::end_message_batch`] 每轮递增，见 `pump_loop`）。
+    ///
+    /// 队列只在「入队批次 + 紧随其后的一轮」内有效（AR3 §1.5 / P2-2）：规范路径下应用处理
+    /// `GCS_RESULTSTR` 后系统**不会**再补 `WM_CHAR`，残留队列若一直留着，就会在用户之后真实
+    /// 键入与提交首码元相同的字符时吞掉一次按键。
+    pending_batch: Option<u64>,
+    /// 队列入队时的消息时间（`MSG.time`，32 位回绕域）：第二个生命周期判据。
+    ///
+    /// 同一批内系统补发的 `WM_CHAR` 紧随提交到达（毫秒级）；跨出 [`PENDING_COMMIT_WINDOW_MS`]
+    /// 的字符不可能是补发，按真实键入放行。
+    pending_ticks: u32,
+    /// 当前消息批次序号。
+    batch: u64,
 }
+
+/// 提交抑制队列跨过的**批次**上限：入队批次 + 紧随其后的一轮。
+///
+/// 系统补发的 `WM_CHAR` 可能与提交落在同一次消息排空里，也可能因为 `PostMessage` 落到下一次
+/// 排空；再多一轮就不是补发，而是「提交后系统根本没补发」的残留。
+const PENDING_BATCH_LIFETIME: u64 = 1;
+
+/// 提交抑制队列的**时间窗**（毫秒，`MSG.time` 域）。
+///
+/// 同一次输入事件触发的补发字符必然在毫秒级内到达；这个上界只是第二道保险（第一道是批次号，
+/// 真实键入则由 `WM_KEYDOWN` 直接清空队列），取 250 ms 足以覆盖高负载下的调度抖动。
+const PENDING_COMMIT_WINDOW_MS: u32 = 250;
 
 impl Default for ImeState {
     fn default() -> Self {
@@ -121,13 +149,24 @@ impl Default for ImeState {
             saved_context: None,
             cursor_area: None,
             pending_chars: VecDeque::new(),
+            pending_batch: None,
+            pending_ticks: 0,
+            batch: 0,
         }
     }
 }
 
 impl ImeState {
     /// 处理一条 `WM_IME_*`；返回事件（有序，可能两条）+ 待执行的 IMM32 命令（可能都为空）。
-    pub(crate) fn handle(&mut self, hwnd: HWND, msg: u32, lparam: isize) -> ImeOutcome {
+    ///
+    /// `ticks_ms` 是消息的 `MSG.time`：提交入队时记为抑制队列的时间基准（AR3 §1.5）。
+    pub(crate) fn handle(
+        &mut self,
+        hwnd: HWND,
+        msg: u32,
+        lparam: isize,
+        ticks_ms: u32,
+    ) -> ImeOutcome {
         match msg {
             WM_IME_STARTCOMPOSITION => {
                 // 重新组合 ⇒ 上一次提交的待抑制码元已经过期（系统补发的 `WM_CHAR` 早已到达，
@@ -152,7 +191,7 @@ impl ImeState {
                 };
                 if let Some(text) = committed.as_ref() {
                     // 提交去重：按 **UTF-16 码元** 排队（emoji = 2 个码元，中文 = 1 个）。
-                    self.queue_commit(text);
+                    self.queue_commit(text, ticks_ms);
                 }
                 let read = if flags & GCS_COMPSTR.0 != 0 {
                     read_composition(hwnd, flags)
@@ -175,19 +214,40 @@ impl ImeState {
     /// `WM_CHAR` 是否应被 IME 提交吞掉（提交后 Windows 会再发同样的字符）。
     ///
     /// 只吞**与队首一致**的码元；不一致立刻清空队列并放行（异常 IME 自愈，绝不吞掉真实键入）。
-    pub(crate) fn consume_char(&mut self, unit: u16) -> bool {
+    /// 过了队列的有效期（批次 / 时间窗，见 [`Self::queue_commit`]）同样清空放行：那不是系统
+    /// 补发，而是用户之后的真实字符（AR3 §1.5）。
+    pub(crate) fn consume_char(&mut self, unit: u16, ticks_ms: u32) -> bool {
+        if self.pending_chars.is_empty() {
+            return false;
+        }
+        if !self.pending_is_live(ticks_ms) {
+            self.clear_pending();
+            return false;
+        }
         match self.pending_chars.front() {
             Some(&expected) if expected == unit => {
                 self.pending_chars.pop_front();
+                if self.pending_chars.is_empty() {
+                    self.pending_batch = None;
+                }
                 true
             }
             Some(_) => {
                 // 提交文本与真实到达的字符不一致：队列作废（剩下的码元不会再来）。
-                self.pending_chars.clear();
+                self.clear_pending();
                 false
             }
             None => false,
         }
+    }
+
+    /// 队列是否仍在有效期内（批次号 + 时间窗，两道判据）。
+    fn pending_is_live(&self, ticks_ms: u32) -> bool {
+        let Some(queued_batch) = self.pending_batch else {
+            return false;
+        };
+        self.batch.saturating_sub(queued_batch) <= PENDING_BATCH_LIFETIME
+            && ticks_ms.wrapping_sub(self.pending_ticks) <= PENDING_COMMIT_WINDOW_MS
     }
 
     /// 把一次提交的文本排进待抑制队列（随后的 `WM_CHAR` 逐码元比对后跳过）。
@@ -195,13 +255,29 @@ impl ImeState {
     /// 单位是 **UTF-16 码元**：系统在 IME 提交之后补发的 `WM_CHAR` 每码元一条，
     /// 「🌍a」= 3 条。用码点数（旧实现的 `chars().count()`）会让 emoji 提交后重复插入
     /// 或漏抑制（R07-5 / R02-13）。
-    pub(crate) fn queue_commit(&mut self, text: &str) {
-        self.pending_chars = text.encode_utf16().collect();
+    ///
+    /// 每笔提交都带自己的**事件流位置**（消息批次号）与**时间戳**（`MSG.time`）：队列只在
+    /// 「入队批次 + 紧随其后的一轮」内匹配，再晚的 `WM_CHAR` 一律按真实键入放行
+    /// （AR3 §1.5：提交后系统不补发时，残留队列会吞掉用户之后键入的同首码元字符）。
+    pub(crate) fn queue_commit(&mut self, text: &str, ticks_ms: u32) {
+        // 追加而不是覆盖：同一批里两次提交之间可能没有 `WM_CHAR`（P3）。
+        self.pending_chars.extend(text.encode_utf16());
+        self.pending_batch = Some(self.batch);
+        self.pending_ticks = ticks_ms;
     }
 
-    /// 清空待抑制队列（失焦 / 重新组合 / 禁用 IME）。
+    /// 一轮消息排空结束（泵在每轮 ① 之前调用）：推进消息批次号。
+    ///
+    /// **不**在这里清队列：入队批次 + 紧随其后的一轮内的 `WM_CHAR` 仍要能匹配（`PostMessage`
+    /// 补发的字符可能落在下一次排空里）；更晚的批次由 [`Self::consume_char`] 的批次判据作废。
+    pub(crate) fn end_message_batch(&mut self) {
+        self.batch = self.batch.wrapping_add(1);
+    }
+
+    /// 清空待抑制队列（失焦 / 重新组合 / 禁用 IME / 真实按键）。
     pub(crate) fn clear_pending(&mut self) {
         self.pending_chars.clear();
+        self.pending_batch = None;
     }
 
     /// 本窗口的 IME 当前是否启用（`WndProc` 据此吞掉 `WM_IME_*`）。
@@ -228,7 +304,7 @@ impl ImeState {
         } else {
             // 禁用：摘下上下文，并清掉未消费的抑制队列（否则重新启用后第一次真实输入会被
             // 上一次提交的余数吞掉）。
-            self.pending_chars.clear();
+            self.clear_pending();
             Some(ImeCommand::Associate(None))
         }
     }
@@ -252,7 +328,7 @@ impl ImeState {
     /// 禁用时窗口本来就没有上下文，不存在本层拥有的句柄。
     pub(crate) fn plan_release_before_destroy(&mut self) -> Option<ImeCommand> {
         self.enabled = true;
-        self.pending_chars.clear();
+        self.clear_pending();
         self.saved_context
             .take()
             .map(|context| ImeCommand::Associate(Some(context)))
@@ -426,20 +502,37 @@ fn read_composition(hwnd: HWND, flags: u32) -> Option<CompositionRead> {
             // 已固定/输入错误）都交给文本层高亮。
             ATTR_INPUT as u8,
         );
+        // `caret` 先算：`clamp_caret` 还要借用 `text`（吸附代理对），不能等结构体里先移动它。
+        let caret = caret.map(|position| clamp_caret(position, &text));
         Some(CompositionRead {
             text,
-            caret: caret.map(|position| clamp_caret(position, len)),
+            caret,
             clauses,
         })
     }
 }
 
-/// 组合串内插入点夹到 `0..=len`。
+/// 组合串内插入点夹到 `0..=len`，并**吸附到 UTF-16 码点边界**。
 ///
 /// `GCS_CURSORPOS` 在第三方 IME / 组合串刚清空时会给出越界值（甚至超过 `i16::MAX` 的伪造值），
 /// 直接交给文本层会切在非码点边界或越界 panic；夹住即可（视觉上退化为末尾）。
-fn clamp_caret(position: u32, len: usize) -> u32 {
-    (position as usize).min(len) as u32
+///
+/// 代理对（emoji 等 4 字节字符 = 2 个 UTF-16 码元）**不得被从中间切开**：落在低代理码元上的
+/// 插入点向低位挪一格（回到高代理之前），否则应用按 `caret` 切片会得到非法 UTF-16，候选窗
+/// 定位 / 串内插入点也会错位（AR3 §1.4 / P2-1）。
+fn clamp_caret(position: u32, text: &str) -> u32 {
+    let len = text.encode_utf16().count();
+    let mut caret = (position as usize).min(len);
+    if caret > 0 && caret < len && text.encode_utf16().nth(caret).is_some_and(is_low_surrogate) {
+        caret -= 1;
+    }
+    caret as u32
+}
+
+/// UTF-16 低代理码元（`0xDC00..=0xDFFF`）：它前面必然是一个高代理，切在它上面就是切在
+/// 代理对中间。
+fn is_low_surrogate(unit: u16) -> bool {
+    (0xDC00..=0xDFFF).contains(&unit)
 }
 
 /// `ImmGetCompositionStringW(GCS_CURSORPOS)`：**返回值就是插入点**，不是字节数。
@@ -615,8 +708,8 @@ mod tests {
     };
 
     use super::{
-        CompositionRead, ImeApplied, ImeCommand, ImeState, caret_forms, clamp_caret,
-        composition_events, execute, mask_setcontext,
+        CompositionRead, ImeApplied, ImeCommand, ImeState, PENDING_COMMIT_WINDOW_MS, caret_forms,
+        clamp_caret, composition_events, execute, mask_setcontext,
     };
     use crate::{event::ImeEvent, math::PhysicalRect, platform::ime::ClauseRanges};
 
@@ -753,21 +846,20 @@ mod tests {
     }
 
     /// R07-5 / R02-13：提交去重按 **UTF-16 码元** 排队，emoji（2 码元）之后不能多吞。
+    ///
+    /// 走**生产** `queue_commit`（AR3 §9 变异实验 #10：旧用例直接构造私有字段，把生产实现改回
+    /// 码点截断仍然全绿）。
     #[test]
     fn committed_astral_text_queues_one_unit_per_utf16_code_unit() {
-        // 生产路径：`pending_chars = text.encode_utf16().collect()`；这里直接模拟同样的
-        // 队列（避免构造真实 HIMC）：「🌍a」= 高代理 + 低代理 + 'a'。
-        let mut state = ImeState {
-            pending_chars: "🌍a".encode_utf16().collect(),
-            ..ImeState::default()
-        };
-        assert_eq!(state.pending_chars.len(), 3, "🌍a = 3 个码元");
+        let mut state = ImeState::default();
+        state.queue_commit("🌍a", 0);
+        assert_eq!(state.pending_chars.len(), 3, "🌍a = 高代理 + 低代理 + 'a'");
 
-        assert!(state.consume_char(0xD83C));
-        assert!(state.consume_char(0xDF0D));
-        assert!(state.consume_char(u16::from(b'a')));
+        assert!(state.consume_char(0xD83C, 0));
+        assert!(state.consume_char(0xDF0D, 0));
+        assert!(state.consume_char(u16::from(b'a'), 0));
         assert!(
-            !state.consume_char(u16::from(b'b')),
+            !state.consume_char(u16::from(b'b'), 0),
             "队列清空后必须放行真实键入"
         );
     }
@@ -775,14 +867,78 @@ mod tests {
     /// 内容不匹配立即自愈：不能把余数留给用户之后真实键入的字符。
     #[test]
     fn a_mismatched_char_clears_the_queue_instead_of_swallowing_later_input() {
-        let mut state = ImeState {
-            pending_chars: "你好".encode_utf16().collect(),
-            ..ImeState::default()
-        };
+        let mut state = ImeState::default();
+        state.queue_commit("你好", 0);
 
         // IME 通路没送来提交后的 `WM_CHAR`，用户直接键入 'x'：不吞、并清空队列。
-        assert!(!state.consume_char(u16::from(b'x')));
-        assert!(!state.consume_char(u16::from(b'y')), "残留队列必须已清空");
+        assert!(!state.consume_char(u16::from(b'x'), 0));
+        assert!(
+            !state.consume_char(u16::from(b'y'), 0),
+            "残留队列必须已清空"
+        );
+    }
+
+    /// AR3 §1.5（P2-2）：提交抑制队列的生命周期**限制在入队批次 + 紧随其后的一轮**。
+    ///
+    /// 失败面：候选窗提交后系统不补发 `WM_CHAR`，队列原样留到下一次组合 / 失焦；用户随后键入
+    /// 与提交首码元相同的字符时 `consume_char` 命中，真实按键被吞掉一次。
+    #[test]
+    fn a_commit_only_suppresses_chars_in_the_following_message_batch() {
+        let mut state = ImeState::default();
+        // 第 0 批提交；系统补发的字符落在同批或紧随其后的一轮（第 1 批）都还能抑制。
+        state.queue_commit("a", 0);
+        assert!(state.consume_char(u16::from(b'a'), 0), "同批补发被抑制");
+
+        state.queue_commit("a", 0);
+        state.end_message_batch();
+        assert!(
+            state.consume_char(u16::from(b'a'), 0),
+            "PostMessage 补发的字符可能落在下一次消息排空里"
+        );
+
+        // 再往后（第 2 批）就不是补发了：必须放行并清空。
+        state.queue_commit("a", 0);
+        state.end_message_batch();
+        state.end_message_batch();
+        assert!(
+            !state.consume_char(u16::from(b'a'), 0),
+            "超过『紧随其后的一轮』的残留不得吞掉真实键入"
+        );
+        assert!(state.pending_chars.is_empty(), "过期队列必须被清空");
+    }
+
+    /// AR3 §1.5：队列还带**消息时间戳**，超出时间窗的 `WM_CHAR` 同样按真实键入放行。
+    #[test]
+    fn a_commit_queue_expires_outside_the_message_time_window() {
+        let mut state = ImeState::default();
+        let committed_at = 1_000;
+        state.queue_commit("a", committed_at);
+        // 同一批但时间已过窗（异常 IME 补发迟到 / 消息时间被伪造）。
+        assert!(
+            !state.consume_char(u16::from(b'a'), committed_at + PENDING_COMMIT_WINDOW_MS + 1),
+            "时间窗之外不是补发字符"
+        );
+        assert!(state.pending_chars.is_empty());
+        // 时间戳是 32 位回绕域：跨 0 的时间差仍要算对。
+        state.queue_commit("b", u32::MAX - 5);
+        assert!(
+            state.consume_char(u16::from(b'b'), 3),
+            "wrapping 时间差（u32::MAX-5 → 3）只有 9 ms"
+        );
+    }
+
+    /// AR3 §1.5（P3）：同一批里两次提交之间可能没有 `WM_CHAR`，队列必须**追加**而不是覆盖。
+    #[test]
+    fn a_second_commit_in_the_same_batch_appends_to_the_queue() {
+        let mut state = ImeState::default();
+        state.queue_commit("a", 0);
+        state.queue_commit("b", 0);
+        assert!(
+            state.consume_char(u16::from(b'a'), 0),
+            "第一次提交的字符不能丢"
+        );
+        assert!(state.consume_char(u16::from(b'b'), 0));
+        assert!(state.pending_chars.is_empty());
     }
 
     /// 禁用 IME 会清空待抑制队列（`plan_enabled(false)`）。
@@ -791,10 +947,8 @@ mod tests {
     /// 覆盖（AR1b P3-2：旧注释承诺了这条，代码此前只在失焦/禁用/销毁时清）。
     #[test]
     fn disabling_the_ime_drops_the_pending_characters() {
-        let mut state = ImeState {
-            pending_chars: "ni".encode_utf16().collect(),
-            ..ImeState::default()
-        };
+        let mut state = ImeState::default();
+        state.queue_commit("ni", 0);
 
         let command = state.plan_enabled(false);
 
@@ -809,11 +963,37 @@ mod tests {
     /// `GCS_CURSORPOS` 越界（第三方 IME / 组合串刚清空）时必须夹到 `0..=len`。
     #[test]
     fn the_composition_caret_is_clamped_to_the_composition_length() {
-        assert_eq!(clamp_caret(0, 3), 0);
-        assert_eq!(clamp_caret(2, 3), 2);
-        assert_eq!(clamp_caret(3, 3), 3);
-        assert_eq!(clamp_caret(99, 3), 3, "越界值退化为末尾");
-        assert_eq!(clamp_caret(u32::MAX, 0), 0);
+        let text = "abc";
+        assert_eq!(clamp_caret(0, text), 0);
+        assert_eq!(clamp_caret(2, text), 2);
+        assert_eq!(clamp_caret(3, text), 3);
+        assert_eq!(clamp_caret(99, text), 3, "越界值退化为末尾");
+        assert_eq!(clamp_caret(u32::MAX, ""), 0);
+    }
+
+    /// AR3 §1.4 / P2-1：`caret` 不得落在**代理对中间**（向低位挪一格）。
+    ///
+    /// 「🌍a」= `[D83C, DF0D, 0061]`；`GCS_CURSORPOS == 1` 是代理对中点，切片会得到非法
+    /// UTF-16，候选窗定位 / 串内插入点也会错位。所有索引逐个覆盖（含越界）。
+    #[test]
+    fn the_composition_caret_is_snapped_out_of_surrogate_pairs() {
+        let text = "🌍a";
+        let expected = [
+            (0, 0),  // 组合串开头
+            (1, 0),  // 代理对中间 ⇒ 挪回高代理之前
+            (2, 2),  // emoji 之后
+            (3, 3),  // 串尾
+            (4, 3),  // 越界 ⇒ 末尾
+            (99, 3), // 越界 ⇒ 末尾
+        ];
+        for (raw, want) in expected {
+            assert_eq!(clamp_caret(raw, text), want, "caret {raw} → {want}");
+        }
+        // 代理对相邻边界（合法码点边界）原样保留，不会被多挪。
+        assert_eq!(clamp_caret(2, text), 2);
+        // 纯代理对串：中点吸附到 0，尾点不动。
+        assert_eq!(clamp_caret(1, "🌍"), 0);
+        assert_eq!(clamp_caret(2, "🌍"), 2);
     }
 
     /// 启用态下 `plan_reassert_disabled` 不得产出命令（只在禁用态摘上下文）。
@@ -843,6 +1023,7 @@ mod tests {
         let outcome = state.handle(
             HWND::default(),
             windows::Win32::UI::WindowsAndMessaging::WM_PAINT,
+            0,
             0,
         );
 
@@ -933,15 +1114,13 @@ mod tests {
     /// 之后的第一批真实键入被误吞。
     #[test]
     fn starting_a_new_composition_drops_the_pending_commit_queue() {
-        let mut state = ImeState {
-            pending_chars: "ni".encode_utf16().collect(),
-            ..ImeState::default()
-        };
-        let outcome = state.handle(HWND::default(), WM_IME_STARTCOMPOSITION, 0);
+        let mut state = ImeState::default();
+        state.queue_commit("ni", 0);
+        let outcome = state.handle(HWND::default(), WM_IME_STARTCOMPOSITION, 0, 0);
 
         assert!(matches!(outcome.events.as_slice(), [ImeEvent::Start]));
         assert!(state.pending_chars.is_empty(), "重新组合必须清空待抑制码元");
-        assert!(!state.consume_char(u16::from(b'n')), "不得再吞真实键入");
+        assert!(!state.consume_char(u16::from(b'n'), 0), "不得再吞真实键入");
     }
 
     #[test]

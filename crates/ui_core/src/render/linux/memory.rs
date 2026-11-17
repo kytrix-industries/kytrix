@@ -214,13 +214,26 @@ impl Block {
     }
 
     /// 归还一个区间，并与相邻空闲区间合并。
-    fn give_back(&mut self, offset: u64, size: u64) {
+    ///
+    /// 返回 `false` = 该区间与空闲表里的某个区间**重叠**（重复释放 / 伪造区间）：空闲表**不变**。
+    /// 没有这道检查时，同一段字节会被归还两次并合并进空闲表，随后被两次 `take` 交给两个使用者
+    /// （R11-6 的 P2，AR3 §5.5）。合法的归还永远不会重叠：`take` 会把切出去的区间从空闲表移走。
+    fn give_back(&mut self, offset: u64, size: u64) -> bool {
         debug_assert!(size > 0, "a zero-sized suballocation is never handed out");
         debug_assert!(
             offset + size <= self.size,
             "suballocation {offset}+{size} exceeds block {}",
             self.size
         );
+        let end = offset + size;
+        // 空闲表按 offset 升序（`take` / `give_back` 都保持有序）：相交 ⇔ 左侧起点 < 右侧终点。
+        if self
+            .free
+            .iter()
+            .any(|range| range.offset < end && offset < range.offset + range.size)
+        {
+            return false;
+        }
         let position = self.free.partition_point(|range| range.offset < offset);
         self.free.insert(position, FreeRange { offset, size });
         self.live = self.live.saturating_sub(size);
@@ -240,6 +253,7 @@ impl Block {
                 index += 1;
             }
         }
+        true
     }
 }
 
@@ -390,6 +404,9 @@ impl MemoryArena {
 
     /// 归还一个子分配（块内合并空闲区间；块永不提前释放 —— 复用它比反复
     /// `vkAllocateMemory`/`vkFreeMemory` 便宜，而几何条目会反复换代）。
+    ///
+    /// 返回 `false` = 块句柄未知，或该区间与空闲表重叠（**重复释放**）：两种情况下空闲表都不变，
+    /// 同一段字节不会被交给两个使用者。
     pub(crate) fn free(&mut self, allocation: Suballocation) -> bool {
         let Some(entry) = self
             .blocks
@@ -398,8 +415,7 @@ impl MemoryArena {
         else {
             return false;
         };
-        entry.block.give_back(allocation.offset, allocation.size);
-        true
+        entry.block.give_back(allocation.offset, allocation.size)
     }
 
     /// teardown：销毁全部块（调用方保证队列已空闲，没有在飞命令引用它们）。
@@ -671,6 +687,45 @@ mod tests {
                 size: 16,
             }),
             "未知块必须拒绝归还"
+        );
+    }
+
+    /// AR3 §5.5 / R11-6 的 P2：**重复释放**（或伪造区间）必须被拒绝 —— 否则同一段字节会同时
+    /// 出现在空闲表里两次，随后被两次 `take` 交给两个使用者（同一区间两个写入者 = 数据错乱）。
+    #[test]
+    fn a_double_free_is_rejected_instead_of_handing_the_same_bytes_to_two_owners() {
+        let mut block = block(256);
+        assert_eq!(block.take(64, 1), Some(0));
+        assert!(block.give_back(0, 64), "第一次归还是合法的");
+        assert_eq!(block.live, 0);
+        // 同一区间再归还一次：必须被拒绝，且空闲表与记账都不变。
+        assert!(!block.give_back(0, 64), "重复归还必须被拒绝");
+        assert_eq!(block.live, 0, "被拒绝的归还不改变记账");
+        assert_eq!(
+            block.free,
+            vec![FreeRange {
+                offset: 0,
+                size: 256
+            }]
+        );
+        // 部分重叠（伪造区间）同样拒绝：它一半是已分配字节、一半已经在空闲表里。
+        assert_eq!(block.take(32, 1), Some(0));
+        assert!(!block.give_back(16, 32), "与空闲区间重叠的归还必须被拒绝");
+        assert_eq!(
+            block.free,
+            vec![FreeRange {
+                offset: 32,
+                size: 224
+            }]
+        );
+        // 合法归还仍然成功（这道检查不能把正常路径也挡掉）。
+        assert!(block.give_back(0, 32));
+        assert_eq!(
+            block.free,
+            vec![FreeRange {
+                offset: 0,
+                size: 256
+            }]
         );
     }
 }

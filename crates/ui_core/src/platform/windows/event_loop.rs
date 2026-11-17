@@ -278,6 +278,14 @@ impl WndProcState {
         self.translate.reset_transient();
     }
 
+    /// 一轮消息排空结束：推进 IME 提交抑制队列的消息批次号（泵每轮 ① 之前调用）。
+    ///
+    /// 队列只在「入队批次 + 紧随其后的一轮」内匹配，避免「提交后系统不补发 `WM_CHAR`」的残留
+    /// 跨会话吞掉用户真实键入（AR3 §1.5 / P2-2）。
+    pub(crate) fn end_message_batch(&mut self) {
+        self.translate.end_message_batch();
+    }
+
     /// 记录引擎当前光标（`WM_SETCURSOR` 据此重新应用，P2-3）。
     pub(crate) fn set_cursor(&mut self, cursor: crate::paint::style::Cursor) {
         self.cursor = cursor;

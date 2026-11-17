@@ -89,7 +89,10 @@ pub(crate) struct DebugHudMetrics {
     pub gpu_time: Option<Duration>,
     /// 后端的 Present CPU 时间。
     pub present_time: Option<Duration>,
-    /// UI 发布 → GPU 完成的时长（`FrameFeedback::latency`；窗口路径只有落后 ≤1 帧的值）。
+    /// UI 发布 → 本帧反馈给出的延迟（`FrameFeedback::latency`；窗口路径只有落后 ≤1 帧的值）。
+    ///
+    /// 口径按后端：Windows / Linux 是「发布 → **GPU 完成**」；macOS 是「发布 → **真实呈现**」
+    /// （`MTLDrawable.presentedTime`，拿不到时退回 GPU 完成）。HUD 的 `Latency` 一行就显示它。
     pub latency: Option<Duration>,
     /// 实际发出的 draw call 数。
     pub draw_calls: u32,

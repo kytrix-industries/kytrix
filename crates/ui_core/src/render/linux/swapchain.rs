@@ -34,7 +34,7 @@ use crate::{
     render::{
         compositor::DamageRects,
         linux::{
-            device::{SharedGpu, on_gpu_thread},
+            device::{DeferredHandles, SharedGpu, on_gpu_thread},
             plan::{
                 self, SwapchainKey, choose_composite_alpha, choose_extent, choose_image_count,
                 choose_present_mode, choose_surface_format,
@@ -86,6 +86,8 @@ pub(crate) struct Surface {
     /// 所以这里只借不持有。
     display: *mut std::ffi::c_void,
     wl_surface: *mut std::ffi::c_void,
+    /// teardown 的兜底标记（AR3 §5.1 / P2-5）：`leaked()` 为真时 `Drop` 不销毁 surface。
+    handles: DeferredHandles,
 }
 
 impl Surface {
@@ -100,7 +102,13 @@ impl Surface {
             raw: gpu.instance().create_surface(display, surface)?,
             display,
             wl_surface: surface,
+            handles: DeferredHandles::default(),
         })
+    }
+
+    /// teardown 兜底（AR3 §5.1 / P2-5）：不再销毁 `VkSurfaceKHR`（它的 swapchain 也没被销毁）。
+    pub(crate) fn leak(&mut self) {
+        self.handles.leak();
     }
 
     pub(crate) fn raw(&self) -> vk::SurfaceKHR {
@@ -129,6 +137,12 @@ unsafe impl Send for Surface {}
 
 impl Drop for Surface {
     fn drop(&mut self) {
+        // teardown 无法证明队列已 idle：句柄已交给进程级兜底（AR3 §5.1 / P2-5）。
+        // `vkDestroySurfaceKHR` 要求它的 swapchain 全部先销毁（VUID-vkDestroySurfaceKHR-surface-01266），
+        // 而那条链此刻只能在进程退出时回收。
+        if self.handles.leaked() {
+            return;
+        }
         // 该 surface 的 swapchain 已先于本结构销毁（`GpuRenderer` 的字段顺序 / teardown 顺序）。
         self.gpu.instance().destroy_surface(self.raw);
     }
@@ -146,6 +160,8 @@ pub(crate) struct Swapchain {
     incremental: bool,
     /// 长度 = `images.len()`：按 image index 索引（§7.2 硬规则 1）。
     render_finished: Vec<vk::Semaphore>,
+    /// teardown 的兜底标记（AR3 §5.1 / P2-5）：`leaked()` 为真时 `Drop` 不销毁任何句柄。
+    handles: DeferredHandles,
 }
 
 impl Swapchain {
@@ -367,7 +383,17 @@ impl Swapchain {
             // 「已启用」而不是「可用」：`VkPresentRegionsKHR` 只有在扩展已启用时才合法（R11-23）。
             incremental: shared.caps().incremental_present,
             render_finished,
+            handles: DeferredHandles::default(),
         })
+    }
+
+    /// teardown 兜底（AR3 §5.1 / P2-5）：不再销毁本链与它的 render-finished 信号量。
+    ///
+    /// 调用方（`GpuRenderer::drop`）在无法证明队列已 idle 时调用：`vkDestroySwapchainKHR` 要求
+    /// presentation engine 已释放该链（VUID-…-01282），`vkDestroySemaphore` 要求相关提交已完成。
+    /// 句柄留给 `SharedGpu` 的 `vkDestroyDevice` 回收。
+    pub(crate) fn leak(&mut self) {
+        self.handles.leak();
     }
 
     pub(crate) fn raw(&self) -> vk::SwapchainKHR {
@@ -435,6 +461,11 @@ impl Swapchain {
     ///
     /// `dirty` 是本次真正写进这张 image 的矩形（`None` = 整面 / 没有 hint）：它同时是
     /// `VkPresentRegionKHR` 的内容与「这一帧搬了多少像素」的事实来源。
+    ///
+    /// **唯一的例外**（AR3 §5.3）：本帧一个像素都没搬（damage 全落在 `imageExtent` 之外）时，
+    /// 调用方传的是**上一次**的 hint —— 扩展没有「什么都没变」的编码（空 region 数组 = 整面），
+    /// 声称整张 image 都变了只会让合成器白重合成一遍。两种情况下 region 都落在 image 内、
+    /// 且都不小于「实际变化」，所以合成结果都正确。
     pub(crate) fn present(
         &self,
         shared: &SharedGpu,
@@ -482,6 +513,10 @@ impl Swapchain {
 
 impl Drop for Swapchain {
     fn drop(&mut self) {
+        // teardown 无法证明队列已 idle：句柄已交给进程级兜底（AR3 §5.1 / P2-5）。
+        if self.handles.leaked() {
+            return;
+        }
         // SAFETY: 调用方保证**队列已 idle**（`SharedGpu::wait_queue_idle`，R11-3）：这是
         // `vkDestroySwapchainKHR` / `vkDestroySemaphore` 对 presentation engine 与在飞批次的
         // 共同前置条件。旧实现等的是「新链某一帧的 timeline」，与旧链的 present 之间没有任何
@@ -522,7 +557,7 @@ fn log_plan(key: &SwapchainKey, formats: &[vk::SurfaceFormatKHR]) {
 
 /// `incremental_present` 的矩形。
 ///
-/// **入参必须已经用 `DamageRects::clamped(extent)` 夹过**（`frame_copy` 就是那份集合）：
+/// **入参必须已经用 `DamageRects::clamped(extent)` 夹过**（`present_hint` 就是那份集合）：
 /// `VkRectLayerKHR` 不允许负 offset、也不允许超出 image 尺寸（`VUID-VkRectLayerKHR-*`），
 /// 而夹紧只在 `copy_to_swapchain` 里做一次 —— hint 与实际拷贝的矩形因此逐字一致（R11-12）。
 fn present_rects(dirty: &DamageRects) -> Vec<vk::RectLayerKHR> {

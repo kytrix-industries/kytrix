@@ -181,23 +181,73 @@ pub(super) fn install_dpi_awareness() {
     let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 }
 
-/// 消费者：`pump_loop` 的 ③ 关闭步骤与 `release_capture`。
+/// 消费者：`pump_loop` 的 ②c 与 `plan_release_capture`。
 /// 引擎**主动**释放指针捕获（拖拽结束）：只有本窗口确实持有捕获时才置
-/// `suppress_capture_cancel` 并释放。
+/// `suppress_capture_cancel`，并告诉调用方需要在不持借用时执行 `ReleaseCapture`。
 ///
 /// 两处细节都不能省：
 /// - 自己调 `ReleaseCapture` 也会收到 `WM_CAPTURECHANGED`，不置位就会在每次松手后误投
 ///   `PointerCancel`（复审 F1）；
 /// - 不持有捕获时 `ReleaseCapture` 不会产生该消息，若仍然置位，残留的 suppress 会把
 ///   **下一次真实**的会话丢失当成「自己释放」而吞掉取消（复审 F2）。
-pub(super) fn release_capture(hwnd: HWND, state: &mut super::WndProcState) {
-    // SAFETY: `GetCapture` 只读查询当前线程的捕获窗口。
+///
+/// **本函数只做记账，不调用任何 Win32 API**（AR3 §1.2 P1）：`ReleaseCapture` 会**同步**派发
+/// `WM_CAPTURECHANGED`、重入生产 `WndProc`，而重入路径会从 `GWLP_USERDATA` 再构造一个
+/// `&mut WndProcState` —— 在持有 `&mut WndProcState` 时调用它就是别名 UB（与 R07-7 修 IMM32
+/// 时同一条纪律）。调用方必须把返回的 `true` 变成动作、**离开借用作用域后**再执行。
+///
+/// 返回 `true` = 已置 suppress、需要调用 `ReleaseCapture()`。
+pub(super) fn plan_release_capture(hwnd: HWND, state: &mut super::WndProcState) -> bool {
+    // SAFETY: `GetCapture` 只读查询当前线程的捕获窗口（不派发消息）。
     if unsafe { GetCapture() } != hwnd {
-        return;
+        return false;
     }
     state.suppress_capture_cancel = true;
-    // SAFETY: 只释放本线程的捕获；同线程调用会同步派发 `WM_CAPTURECHANGED`。
-    let _ = unsafe { ReleaseCapture() };
+    true
+}
+
+/// 消费者：`pump_loop` 的 ②c。
+/// ②c 收集到的「会同步重入 `WndProc` 的本地动作」——**两阶段执行**（R07-7 / AR3 §1.2）。
+///
+/// `ReleaseCapture` 会同步派发 `WM_CAPTURECHANGED`；`SetCapture` 会把同一消息派给**失去**捕获
+/// 的窗口（也可能是本窗口）；`SetCursor` 也可能引发 `WM_SETCURSOR`。重入的 `WndProc` 会再构造
+/// 一次 `&mut WndProcState`，所以这些调用既不能落在 `&mut WndProcState` 借用里，也不该落在
+/// `&mut NativeWindow` 借用里：先在短借用里只做记账、把动作收集起来，离开借用后统一执行
+/// （[`apply_interaction_actions`]）。
+enum InteractionAction {
+    /// 本窗口的引擎光标 → 系统光标。
+    SetCursor(HCURSOR),
+    /// 让目标窗口取得指针捕获。
+    SetCapture(HWND),
+    /// 释放本窗口持有的指针捕获（suppress 已在计划阶段置位）。
+    ReleaseCapture(HWND),
+}
+
+/// 执行 [`InteractionAction`]（**调用方不得持有任何 `WndProcState` / `NativeWindow` 借用**）。
+fn apply_interaction_actions(actions: Vec<InteractionAction>) {
+    for action in actions {
+        match action {
+            InteractionAction::SetCursor(cursor) => {
+                // SAFETY: 系统光标句柄由 `LoadCursorW` 借用，进程不拥有；`SetCursor` 只影响本线程。
+                unsafe { SetCursor(Some(cursor)) };
+            }
+            InteractionAction::SetCapture(hwnd) => {
+                // SAFETY: `hwnd` 是本进程创建的窗口；捕获在拖拽结束/释放/失焦时释放。
+                unsafe { SetCapture(hwnd) };
+            }
+            InteractionAction::ReleaseCapture(hwnd) => {
+                debug_assert_eq!(
+                    // SAFETY: 只读查询当前线程的捕获窗口（不派发消息）。
+                    unsafe { GetCapture() },
+                    hwnd,
+                    "计划与执行之间捕获窗口变了：suppress / 释放的目标会错位"
+                );
+                // SAFETY: `hwnd` 由计划阶段确认持有捕获；只释放本线程的捕获，同线程调用会同步
+                // 派发 `WM_CAPTURECHANGED`（这正是它必须在这里、而不是在借用里执行的原因）。
+                let _ = unsafe { ReleaseCapture() };
+            }
+        }
+    }
 }
 
 /// 合成器节拍线程（R07-10）。
@@ -365,6 +415,15 @@ pub(super) fn pump_loop(
     // 裸值比较会「看起来仍匹配」而不重建定时器（复审 P2-8）。
     let mut a11y_timer: Option<WindowId> = None;
     loop {
+        // ①′ 新消息批开始：推进 IME 提交抑制队列的批次号（AR3 §1.5 / P2-2）。
+        //
+        // 队列只在「入队批次 + 紧随其后的一轮」内匹配：系统补发的 `WM_CHAR` 可能落在下一次
+        // 消息排空里（`PostMessage`），所以不能在本轮排空结束时清；再晚的批次由
+        // `ImeState::consume_char` 的批次判据作废。没有这道边界，「提交后系统不补发
+        // `WM_CHAR`」的残留队列会一直留到用户下一次真实键入并吞掉一次按键。
+        for native in windows.iter_mut() {
+            native.state_mut().end_message_batch();
+        }
         // ① 先 drain：`WM_QUIT` 必须显式识别（`PeekMessageW` 会把它取出来）。
         loop {
             // SAFETY: `message` 是栈上值；过滤范围 0..0 = 本线程全部消息。
@@ -430,12 +489,17 @@ pub(super) fn pump_loop(
         //   写进 B 窗口，而 B 的解析值仍是 Default ⇒ 不会再发变化 ⇒ B 永久显示错光标。
         // - 捕获：`SetCapture` 只对目标 HWND 生效；固定给首窗会导致非首窗拖拽在鼠标移出
         //   窗口后收不到 `WM_LBUTTONUP`，会话永久卡住。
+        //
+        // **两阶段**（R07-7 纪律 / AR3 §1.2 P1）：`SetCursor` / `SetCapture` / `ReleaseCapture`
+        // 都会**同步**派发消息、重入生产 `WndProc`，而重入路径会再构造一个 `&mut WndProcState`。
+        // 所以这里只在短借用里做记账（`set_cursor` / `plan_release_capture`），把动作收进
+        // `Vec`，离开借用作用域后由 [`apply_interaction_actions`] 统一执行。
+        let mut actions: Vec<InteractionAction> = Vec::with_capacity(4);
         if let Some((target, cursor)) = app.take_cursor_change()
             && let Some(native) = windows.iter_mut().find(|native| native.id() == target)
         {
             native.state_mut().set_cursor(cursor);
-            // SAFETY: 系统光标句柄由 `LoadCursorW` 借用，进程不拥有；`SetCursor` 只影响本线程。
-            unsafe { SetCursor(Some(cursor_handle(cursor))) };
+            actions.push(InteractionAction::SetCursor(cursor_handle(cursor)));
         }
         for (target, capture) in app.take_capture_requests() {
             let Some(native) = windows.iter_mut().find(|native| native.id() == target) else {
@@ -443,13 +507,13 @@ pub(super) fn pump_loop(
             };
             let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
             if capture {
-                // SAFETY: `hwnd` 是本进程创建的窗口；捕获在拖拽结束/释放/失焦时释放。
-                unsafe { SetCapture(hwnd) };
-            } else {
-                // 只有确实持有捕获时才置 suppress 并释放（见 `release_capture`）。
-                release_capture(hwnd, native.state_mut());
+                actions.push(InteractionAction::SetCapture(hwnd));
+            } else if plan_release_capture(hwnd, native.state_mut()) {
+                // 只有确实持有捕获时才置 suppress 并计划释放（见 `plan_release_capture`）。
+                actions.push(InteractionAction::ReleaseCapture(hwnd));
             }
         }
+        apply_interaction_actions(actions);
 
         // ②d 帧节奏：合成器节拍线程（只在需要连续帧时存在）+ a11y 补发兜底定时器。
         if let Some(native) = windows.first_mut() {

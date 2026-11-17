@@ -16,7 +16,7 @@ use windows::Win32::{
         HiDpi::GetSystemMetricsForDpi,
         Input::{
             Ime::{GCS_RESULTSTR, ImmAssociateContext, ImmGetContext, ImmReleaseContext},
-            KeyboardAndMouse::GetCapture,
+            KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture},
         },
         WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, GWLP_USERDATA, GetWindowRect, HTBOTTOMRIGHT, HTCAPTION,
@@ -124,7 +124,7 @@ fn set_ime_enabled(raw: &mut WndProcState, hwnd: HWND, enabled: bool) {
     drive_ime(raw, hwnd, command);
 }
 
-/// 复审 F2：不持有捕获时引擎的 `release_capture` 不得留下 suppress 残留
+/// 复审 F2：不持有捕获时引擎的 `plan_release_capture` 不得留下 suppress 残留
 /// （否则下一次真实会话丢失会被误当成「自己释放」而吞掉取消）。
 #[test]
 fn release_capture_without_ownership_leaves_no_suppress() {
@@ -135,13 +135,62 @@ fn release_capture_without_ownership_leaves_no_suppress() {
     let state = unsafe { &mut *state };
     // SAFETY: 只读查询当前线程的捕获窗口。
     assert!(unsafe { GetCapture() } != hwnd, "前置：本窗口不持有捕获");
-    super::super::pump::release_capture(hwnd, state);
     assert!(
-        !state.suppress_capture_cancel,
-        "没有捕获时不得置 suppress（会吞掉下一次真实取消）"
+        !super::super::pump::plan_release_capture(hwnd, state),
+        "没有捕获时不得计划释放（也不得置 suppress：会吞掉下一次真实取消）"
     );
+    assert!(!state.suppress_capture_cancel);
     destroy_hidden_window(hwnd, state as *mut WndProcState);
     // 占位：保证 `class_name` 活到窗口销毁之后。
+    let _ = class_name;
+}
+
+/// AR3 §1.2 P1：`ReleaseCapture` 必须**两阶段**执行 —— 计划阶段只置 suppress（不持有借用时
+/// 才真正调用 API）。
+///
+/// 失败面：在 `&mut WndProcState` 借用里直接调 `ReleaseCapture`，它会**同步**派发
+/// `WM_CAPTURECHANGED` 并重入生产 `WndProc`，后者从 `GWLP_USERDATA` 再构造一个
+/// `&mut WndProcState` ⇒ 同一对象两个活跃 `&mut`（别名 UB，与 R07-7 的 IMM32 同一条纪律）。
+/// 本用例钉住「第一阶段不释放、suppress 先到位；第二阶段才释放、且 suppress 被消费」。
+#[test]
+fn releasing_the_pointer_capture_is_two_phase() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, class_name) = hidden_window("KytrixReleaseCaptureTwoPhase", dispatcher);
+    // SAFETY: 只在当前线程设置/查询捕获；`hwnd` 由本用例独占。
+    unsafe { SetCapture(hwnd) };
+    // SAFETY: 只读查询；上一步已把捕获交给本窗口。
+    assert!(unsafe { GetCapture() } == hwnd, "前置：本窗口持有捕获");
+    let raw = unsafe { &mut *state };
+    assert!(
+        super::super::pump::plan_release_capture(hwnd, raw),
+        "持有捕获时必须计划释放"
+    );
+    // SAFETY: 只读查询 —— 计划阶段不能已经调用过 `ReleaseCapture`。
+    assert!(
+        unsafe { GetCapture() } == hwnd,
+        "第一阶段不得调用 ReleaseCapture（会在持有 &mut WndProcState 时重入 WndProc）"
+    );
+    assert!(
+        raw.suppress_capture_cancel,
+        "第一阶段必须先置 suppress：重入的 WndProc 才能吞掉自己释放产生的 WM_CAPTURECHANGED"
+    );
+    // 第二阶段：不持有任何借用，执行 ReleaseCapture（同步派发 WM_CAPTURECHANGED → 生产 WndProc）。
+    // SAFETY: 本线程持有捕获；调用只影响本线程，同步派发的消息由已注册的生产 WndProc 处理。
+    let _ = unsafe { ReleaseCapture() };
+    // SAFETY: 只读查询。
+    assert!(unsafe { GetCapture() } != hwnd, "第二阶段真正释放");
+    assert!(
+        !raw.suppress_capture_cancel,
+        "重入的 WndProc 必须消费掉 suppress（否则下一次真实会话丢失会被吞）"
+    );
+    assert!(
+        !raw.events
+            .iter()
+            .any(|event| matches!(event.event, PlatformEvent::PointerCancel)),
+        "自己释放产生的捕获变化不得派发 PointerCancel"
+    );
+    destroy_hidden_window(hwnd, state);
     let _ = class_name;
 }
 

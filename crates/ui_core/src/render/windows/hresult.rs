@@ -6,7 +6,7 @@
 //! | 类别 | 例子 | 后端动作 |
 //! | --- | --- | --- |
 //! | 时序（正 HRESULT，`S_FALSE` 家族） | `DXGI_STATUS_OCCLUDED`、`MODE_CHANGED` | 不是错误：退避 / 重建，本帧算「未呈现」 |
-//! | 可恢复调用错误 | `DXGI_ERROR_INVALID_CALL`、`OUT_OF_DATE` | 换参重试一次 / 重建交换链 |
+//! | 可恢复调用错误 | `DXGI_ERROR_INVALID_CALL`、`OUT_OF_DATE` | 整帧重录一次（不是换 present 参数）/ 重建交换链 |
 //! | 设备级错误 | `DEVICE_REMOVED` / `HUNG` / `RESET` / `DRIVER_INTERNAL_ERROR` | 唯一可以置**粘性** `DeviceLost` 的判据 |
 //!
 //! `windows` crate 只提供了一部分 DXGI 错误常量（没有 `DXGI_STATUS_*`），且本后端需要在
@@ -87,7 +87,9 @@ pub(crate) enum PresentOutcome {
     Clipped,
     /// 显示模式变化（正 HRESULT）：需要重建交换链。
     ModeChanged,
-    /// `DXGI_ERROR_INVALID_CALL`：换「整面 dirty」再试一次（多半是驱动拒绝了某个矩形）。
+    /// `DXGI_ERROR_INVALID_CALL`：**不要**换成「整面 dirty」再试（增量帧的 back buffer 只同步了
+    /// 一部分，整面 present 会把未同步区域上屏，AR3 P2-4）；后端必须整帧重录
+    /// （`compositor::timings::invalid_call_recovery`）。
     InvalidCall,
     /// 设备级错误：只有这一类可以进设备丢失路径。
     DeviceLost,

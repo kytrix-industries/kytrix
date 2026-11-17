@@ -970,6 +970,7 @@ fn run_gpu_loop(
         let replace = shared.has_pending_frame();
         let mut draw_plan = request.plan;
         let mut attempts = 0u32;
+        let mut full_records = 0u32;
         loop {
             let slot = renderer.acquire_slot();
             match renderer.wait_slot_fence(slot)? {
@@ -1030,6 +1031,23 @@ fn run_gpu_loop(
                         });
                     }
                     renderer.resize_target()?;
+                    draw_plan = Plan::Full;
+                    continue;
+                }
+                Err(FrameSubmitError::RetryFull) => {
+                    // `Present1` 拒绝了本帧的 dirty 矩形（AR3 P2-4）：增量帧的 back buffer 只同步了
+                    // `pending ∪ damage`，整面 present 会把未同步区域（3 帧前的旧内容 / fresh 时的
+                    // 未定义内容）上屏。安全退路只有**整帧重录**：`Plan::Full` 让 `record` 走
+                    // `Direct`（整块 clear + 全内容重画 + 整面 present），back buffer 每个像素都有
+                    // 定义。这是错误路径上的一次额外录制/提交，稳态不受影响。
+                    full_records += 1;
+                    if full_records > FULL_RECORD_ATTEMPTS {
+                        return Err(EngineError::Swapchain {
+                            detail: smol_str::SmolStr::new_static(
+                                "Present1 kept rejecting the frame after a full re-record",
+                            ),
+                        });
+                    }
                     draw_plan = Plan::Full;
                     continue;
                 }
@@ -1191,6 +1209,12 @@ const PRESENT_STALL_BACKOFF: Duration = Duration::from_millis(16);
 const OCCLUDED_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// `Present1` 报告 out of date 之后最多重试几次（R08-7）。
 const RESIZE_ATTEMPTS: u32 = 2;
+/// `Present1(InvalidCall)` 之后允许**整帧重录**几次（AR3 P2-4）。
+///
+/// 正常只需要一次：整帧重录走 `Direct`（`present = None`），再被拒会直接落到
+/// `invalid_call_recovery` 的 `Fatal` 分支。这个上界只为「重录之后又变成增量帧」这类组合兜底 ——
+/// 没有它，任何让该错误分支可重入的改动都会变成无限重试。
+const FULL_RECORD_ATTEMPTS: u32 = 1;
 
 /// 关闭时等待 GPU 线程退出的单轮上限（期间继续泵消息）。
 const JOIN_TIMEOUT_MS: u32 = 250;

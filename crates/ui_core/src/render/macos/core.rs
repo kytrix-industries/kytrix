@@ -32,6 +32,7 @@ use objc2_metal::{
     MTLDevice, MTLPixelFormat, MTLRenderPipelineState, MTLSamplerAddressMode, MTLSamplerDescriptor,
     MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLSamplerState,
 };
+use smol_str::SmolStr;
 
 use crate::{
     error::EngineError,
@@ -165,19 +166,18 @@ impl GpuCore {
 
     /// 为一张 persist 纹理申请显存额度（R09-13 的"多窗口资源上限"）。
     ///
-    /// 超预算时**明确失败**（`AppInit` + 具体字节数），而不是让驱动在显存压力下失败或换页。
-    fn reserve_persist(&self, bytes: u64) -> Result<(), EngineError> {
+    /// 超预算时**明确失败**（`detail` 带「已用 / 请求 / 上限」三个数字），而不是让驱动在显存
+    /// 压力下失败或换页。公开错误的分类由调用方的阶段决定（见 [`PersistPhase`]）。
+    fn reserve_persist(&self, bytes: u64) -> Result<(), SmolStr> {
         let mut used = self.persist_bytes.load(Ordering::Acquire);
         loop {
             if !budget_allows(used, bytes) {
-                return Err(EngineError::AppInit {
-                    detail: smol_str::format_smolstr!(
-                        "persist budget exceeded: {} MiB in use + {} MiB requested > {} MiB",
-                        used / (1024 * 1024),
-                        bytes / (1024 * 1024),
-                        MAX_PERSIST_BUDGET / (1024 * 1024)
-                    ),
-                });
+                return Err(smol_str::format_smolstr!(
+                    "persist budget exceeded: {} MiB in use + {} MiB requested > {} MiB",
+                    used / (1024 * 1024),
+                    bytes / (1024 * 1024),
+                    MAX_PERSIST_BUDGET / (1024 * 1024)
+                ));
             }
             match self.persist_bytes.compare_exchange(
                 used,
@@ -214,10 +214,36 @@ fn budget_allows(used: u64, requested: u64) -> bool {
     used.saturating_add(requested) <= MAX_PERSIST_BUDGET
 }
 
+/// 一次 persist 额度申请所处的阶段：决定超预算时归到哪个公开错误。
+///
+/// 与 `EngineError::Composition` 同一条纪律：`AppInit` **只给「窗口还建不出来」**的阶段；
+/// 窗口已经存在、只是渲染目标重建失败，归 `Swapchain`（调用方据错误类型决定提示/上报策略）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistPhase {
+    /// 建窗 / 建渲染器（`PersistLease::new`）：失败时窗口根本建不出来。
+    Create,
+    /// 窗口已存在的目标重建（`PersistLease::resize`）：GPU 线程据此停止出帧。
+    Rebuild,
+}
+
+/// persist 显存额度不足的公开错误（`detail` 带「已用 / 请求 / 上限」三个数字）。
+fn budget_error(detail: SmolStr, phase: PersistPhase) -> EngineError {
+    match phase {
+        PersistPhase::Create => EngineError::AppInit { detail },
+        PersistPhase::Rebuild => EngineError::Swapchain { detail },
+    }
+}
+
 /// 一次 persist 显存额度的 RAII 占用（`GpuRenderer` 持有，drop 时归还）。
 ///
-/// resize 时先申请新额度、成功后才释放旧额度：申请失败（超预算）时窗口保留原目标继续渲染，
-/// 而不是进入"额度已释放、纹理没建"的不一致状态。
+/// resize 时先申请新额度、成功后才释放旧额度：申请失败时**旧额度与旧 persist 都保持原样**，
+/// 不会进入「额度已释放、纹理没建」的不一致状态。
+///
+/// **失败的实际行为是「停」而不是「降级」**（AR3 §6.5 / P2-13）：`resize` 的 `Err` 冒泡到
+/// GPU 循环后由 `publish_error` 变成粘性错误、GPU 线程退出、该窗口停止出帧。旧注释/报告说的
+/// 「保留旧目标继续渲染」与代码相反，已按实现改正：
+/// - 512 MiB 预算被打满属于「配置 / 尺寸异常」，静默按旧尺寸继续画会把真实问题藏起来；
+/// - 新 drawable 里 persist 覆盖不到的区域**没有 clear 路径**，继续 present 会露出未初始化像素。
 pub(crate) struct PersistLease {
     core: Arc<GpuCore>,
     bytes: u64,
@@ -227,17 +253,21 @@ impl PersistLease {
     /// 申请初始额度。
     pub(crate) fn new(core: Arc<GpuCore>, size: (u32, u32)) -> Result<Self, EngineError> {
         let bytes = persist_bytes(size);
-        core.reserve_persist(bytes)?;
+        core.reserve_persist(bytes)
+            .map_err(|detail| budget_error(detail, PersistPhase::Create))?;
         Ok(Self { core, bytes })
     }
 
-    /// 改成新尺寸的额度（窗口 resize / DPI 变化）。失败时保留原额度。
+    /// 改成新尺寸的额度（窗口 resize / DPI 变化）。失败时保留原额度（但调用方必须停止出帧，
+    /// 见类型文档）。
     pub(crate) fn resize(&mut self, size: (u32, u32)) -> Result<(), EngineError> {
         let bytes = persist_bytes(size);
         if bytes == self.bytes {
             return Ok(());
         }
-        self.core.reserve_persist(bytes)?;
+        self.core
+            .reserve_persist(bytes)
+            .map_err(|detail| budget_error(detail, PersistPhase::Rebuild))?;
         self.core.release_persist(self.bytes);
         self.bytes = bytes;
         Ok(())
@@ -319,6 +349,29 @@ mod tests {
         assert!(!super::budget_allows(max, 1));
         assert!(!super::budget_allows(max - 1, 2));
         assert!(!super::budget_allows(u64::MAX, u64::MAX), "不能溢出成 0");
+    }
+
+    /// AR3 §6.5 / P2-13：超预算的错误分类必须按**阶段**区分（`AppInit` 只给「窗口还建不出来」），
+    /// 并如实表达「重建失败」——而不是旧注释承诺的「保留旧目标继续渲染」。
+    #[test]
+    fn persist_budget_failures_are_classified_by_phase() {
+        use smol_str::SmolStr;
+
+        use super::{PersistPhase, budget_error};
+        use crate::error::EngineError;
+
+        let detail = SmolStr::new_static("persist budget exceeded: 1 MiB");
+        assert!(matches!(
+            budget_error(detail.clone(), PersistPhase::Create),
+            EngineError::AppInit { .. }
+        ));
+        let rebuild = budget_error(detail, PersistPhase::Rebuild);
+        assert!(
+            matches!(rebuild, EngineError::Swapchain { .. }),
+            "窗口已存在时的目标重建失败必须归 Swapchain（不是 AppInit）：{rebuild:?}"
+        );
+        // 错误文案带具体数字，调用方不需要再拼诊断。
+        assert!(rebuild.to_string().contains("persist budget exceeded"));
     }
 
     /// R09-5：第二个"窗口"（第二个渲染器）必须拿到同一个 `GpuCore`，而不是重建设备。

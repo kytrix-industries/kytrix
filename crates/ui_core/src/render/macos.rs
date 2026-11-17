@@ -11,6 +11,8 @@ pub(crate) mod device;
 /// 静态几何的 GPU 缓冲（按需创建；`GeometryStore` 的 Metal 侧缓存）。
 pub(crate) mod geometry;
 pub(crate) mod pipeline;
+/// 呈现节奏状态机（display link 目标时刻 → 本 vsync 的呈现决定）：R09-6 / AR3 §6.2。
+pub(crate) mod present;
 pub(crate) mod queue;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) mod readback;

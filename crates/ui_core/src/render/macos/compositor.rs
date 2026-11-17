@@ -29,7 +29,7 @@
 //! 线程纪律：窗口路径的所有成员只属于 `kytrix-metal` 线程；persist 重建**不等待在飞帧**，
 //! 旧纹理按帧序号进 retire 队列（§4.3 / I4）。图层属性一个都不在这里写（§5.3）。
 
-use std::{ffi::c_void, ptr::NonNull, sync::Arc, time::Instant};
+use std::{collections::VecDeque, ffi::c_void, ptr::NonNull, sync::Arc, time::Instant};
 
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_core_foundation::CFTimeInterval;
@@ -40,7 +40,7 @@ use objc2_metal::{
     MTLResourceOptions, MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture, MTLTextureDescriptor,
     MTLTextureUsage, MTLViewport,
 };
-use objc2_quartz_core::CAMetalDrawable;
+use objc2_quartz_core::{CACurrentMediaTime, CAMetalDrawable};
 
 #[cfg(any(test, feature = "test-support"))]
 use crate::paint::instance::InstanceBuffer;
@@ -59,6 +59,7 @@ use crate::{
             device::{Device, GpuObject, init_error, on_gpu_thread},
             geometry::GeometryRegistry,
             pipeline::{BlendMode, PipelineSet},
+            present,
             queue::{InFlight, Queue},
             swapchain::MAXIMUM_DRAWABLE_COUNT,
         },
@@ -97,6 +98,8 @@ pub(crate) struct GpuRenderer {
     persist: Persist,
     /// persist → drawable 的同步状态（按 drawable 身份；离屏路径没有 drawable，保持空表）。
     drawable_syncs: DrawableSyncs,
+    /// 已经登记过呈现回调的 drawable 身份（每张 drawable **只登记一次**，见 [`PresentedHandlers`]）。
+    presented: PresentedHandlers,
     upload: UploadArena,
     /// 实例缓冲的持久镜像（增量写：只写变化区间，见 `render/frame.rs` 的 `InstanceMirror`）。
     mirror: InstanceMirror,
@@ -184,6 +187,7 @@ impl GpuRenderer {
             atlas,
             persist,
             drawable_syncs: DrawableSyncs::new(),
+            presented: PresentedHandlers::new(),
             upload,
             mirror,
             clear_color,
@@ -258,14 +262,23 @@ impl GpuRenderer {
     ///
     /// 旧 persist 可能仍被在飞命令缓冲引用，因此它按「当前最后提交序号」入 retire 队列，
     /// 完成通知到达后才释放（I4）。返回 `true` 表示本帧必须全量。
+    ///
+    /// `Err` = 显存额度不足 / 纹理创建失败：调用方必须把它当**致命错误**（GPU 循环
+    /// `publish_error` 后退出），**不要**退回「按旧目标继续渲染」—— 理由见下面的注释。
     pub(crate) fn prepare_target(&mut self, size: (u32, u32)) -> Result<bool, EngineError> {
         self.debug_assert_gpu_thread("prepare_target");
         let size = (size.0.max(1), size.1.max(1));
         if size == self.surface {
             return Ok(false);
         }
-        // 显存额度先过：超预算时保留旧目标继续渲染（这一帧按旧尺寸提交），而不是进入
-        // "额度已释放、纹理没建"的不一致状态（R09-13）。
+        // 显存额度先过（R09-13）：`resize` 失败时**旧额度与旧 persist 都不动**（不会出现
+        // "额度已还、纹理没建"的不一致态），错误原样冒泡给 GPU 循环 —— 那里把它当**粘性错误**
+        // 上报后退出（`renderer.rs` 的 `prepare_target` 失败分支），该窗口**停止出帧**。
+        //
+        // 这是有意的取舍（AR3 §6.5 / P2-13 的「如实」口径）：
+        // - 512 MiB 预算被打满属于「配置 / 尺寸异常」，静默按旧尺寸继续画会把真实问题藏起来；
+        // - 新 drawable 里 persist 覆盖不到的区域**没有 clear 路径**，按旧尺寸继续 present 会
+        //   看到未初始化像素（比停帧更糟）。
         self.persist_lease.resize(size)?;
         let old = self.persist.recreate(&mut self.device, size)?;
         self.queue.retire(self.last_index, old);
@@ -301,10 +314,16 @@ impl GpuRenderer {
     ///
     /// `present_at` 是 `CAMetalDisplayLinkUpdate.targetPresentationTimestamp`（host time）：
     /// `Some` ⇒ `presentDrawable:atTime:`（把呈现钉到 display link 要求的那一帧），`None` ⇒
-    /// 目标时刻不可用 / 已多次错过时的立即呈现（`presentDrawable:`）。
+    /// 目标时刻不可用 / 已经来不及提交时的立即呈现（`presentDrawable:`）。
+    ///
+    /// **录制之后还有一次夹紧**（AR3 §6.2）：判定发生在录制之前，而录制可能吃掉整个余量
+    /// （resize 重建 persist、首帧同步编译 PSO、整页图集上传）；`present_at` 在这里再用
+    /// `CACurrentMediaTime()` 过一遍 [`present::clamp_present_time`]，过期就退回「尽快呈现」。
     ///
     /// `presented` 在 drawable 真正上屏时由 CoreAnimation 在**它自己的线程**调用，参数是
-    /// `MTLDrawable.presentedTime`（唯一权威的呈现时刻，R09-6）。
+    /// **这张 drawable 的身份**与 `MTLDrawable.presentedTime`（唯一权威的呈现时刻，R09-6）。
+    /// 回调**每张 drawable 只登记一次**（[`PresentedHandlers`]），因此这里传引用而不是按帧的
+    /// 一次性闭包；帧序号的配对在 GPU 线程的反馈队列里按提交顺序完成。
     pub(crate) fn submit_frame(
         &mut self,
         request: &crate::render::frame::FrameRequest,
@@ -312,7 +331,7 @@ impl GpuRenderer {
         present_at: Option<CFTimeInterval>,
         frame: &mut FramePlan,
         completed: impl Fn(Retained<ProtocolObject<dyn MTLCommandBuffer>>) + Send + 'static,
-        presented: impl Fn(CFTimeInterval) + Send + 'static,
+        presented: &Arc<dyn Fn(usize, CFTimeInterval) + Send + Sync>,
     ) -> Result<(crate::render::RenderStats, Vec<GpuTimerSample>), EngineError> {
         debug_assert!(
             on_gpu_thread(),
@@ -334,26 +353,36 @@ impl GpuRenderer {
             &mut timings,
         )?;
         let mtl_drawable: &ProtocolObject<dyn MTLDrawable> = drawable.as_ref();
+        // **提交前的二次夹紧**（AR3 §6.2）：录制耗时可能已经吃掉判定时的余量。
+        let present_at =
+            present_at.and_then(|target| present::clamp_present_time(target, CACurrentMediaTime()));
         // **先登记呈现回调、再登记呈现**（R09-6）：`presentedTime` 是唯一权威的呈现时刻，
         // 完成回调（GPU 执行完）比它早一个 vsync 左右，不能代替。
         //
-        // block 在 CoreAnimation 的呈现线程执行：只把时间交给调用方（入队 + 唤醒 GPU 线程），
-        // 不读 GPU 状态、不碰 retire。
-        let presented_block =
-            block2::RcBlock::new(move |drawable: NonNull<ProtocolObject<dyn MTLDrawable>>| {
-                // SAFETY: 参数是 CA 传进来的这张 drawable，回调期间有效（Metal 保证非空）。
-                let presented_time = unsafe { drawable.as_ref() }.presentedTime();
-                presented(presented_time);
-            });
-        // SAFETY: `addPresentedHandler:` 与 `addCompletedHandler:` 同一约定：只借用 block 指针，
-        // 并在返回前拷贝一份；`presented_block` 在本函数返回前存活。
-        unsafe { mtl_drawable.addPresentedHandler(block2::RcBlock::as_ptr(&presented_block)) };
+        // 每张 drawable **只登记一次**（AR3 §6.4）：Apple 只承诺「同一张 drawable 可以登记多个
+        // handler」，没有「呈现后自动移除 / 可移除」的语义；drawable 会被图层池复用，每帧登记
+        // 会让 block 数随帧数线性增长（每个 block 还持一份 `Arc<Shared>`）。
+        // block 在 CoreAnimation 的呈现线程执行：只把 (drawable 身份, 时间) 交给调用方（入队 +
+        // 唤醒 GPU 线程），不读 GPU 状态、不碰 retire。
+        let drawable_id = mtl_drawable.drawableID();
+        if self.presented.register(drawable_id) {
+            let presented = Arc::clone(presented);
+            let presented_block =
+                block2::RcBlock::new(move |drawable: NonNull<ProtocolObject<dyn MTLDrawable>>| {
+                    // SAFETY: 参数是 CA 传进来的这张 drawable，回调期间有效（Metal 保证非空）。
+                    let presented_time = unsafe { drawable.as_ref() }.presentedTime();
+                    presented(drawable_id, presented_time);
+                });
+            // SAFETY: `addPresentedHandler:` 与 `addCompletedHandler:` 同一约定：只借用 block
+            // 指针，并在返回前拷贝一份；`presented_block` 在本函数返回前存活。
+            unsafe { mtl_drawable.addPresentedHandler(block2::RcBlock::as_ptr(&presented_block)) };
+        }
         // **在 commit 前登记呈现**（Apple 推荐的 Metal 生命周期）：drawable 在 GPU 完成时立即
         // 归还给 `CAMetalLayer`，而不是等某个同步等待之后。
         match present_at {
             // 钉到 display link 给出的呈现时刻（R09-6 的核心）：CA 不必再猜本帧属于哪个 vsync。
             Some(time) => command.presentDrawable_atTime(mtl_drawable, time),
-            // 没有可用的目标时刻（headless / 目标已过期多次）：回到默认的"尽快呈现"。
+            // 没有可用的目标时刻（headless / 目标已被录制吃掉）：回到默认的"尽快呈现"。
             None => command.presentDrawable(mtl_drawable),
         }
         let present_started = Instant::now();
@@ -946,6 +975,45 @@ impl DrawableSyncs {
     }
 }
 
+/// 登记表容量：池深（3）×4 的余量。正常运行时恒 ≤ 3；多出来的容量只吸收「图层重建 / 换池」
+/// 这类一次性事件，不改变「每张 drawable 只登记一次」的正确性（ID 在同一个 layer 内不复用）。
+const PRESENTED_HANDLER_SLOTS: usize = MAXIMUM_DRAWABLE_COUNT * 4;
+
+/// 呈现回调（`addPresentedHandler:`）的登记表：**每张 drawable 只登记一次**（AR3 §6.4 / P1-9）。
+///
+/// Apple 的 `addPresentedHandler:` 文档只承诺「同一张 drawable 可以登记多个 handler」，**没有**
+/// 「呈现后自动移除」或「可移除」的语义；而本设计的前提恰恰是「drawable 被图层池复用」
+/// （见 [`DrawableSyncs`]）。每帧登记一次会让同一对象上的 block 数随帧数线性增长（每个 block
+/// 还持一份 `Arc<Shared>`），长跑下回调次数与常驻内存都随 N 增长。
+///
+/// 因此按 `MTLDrawable.drawableID` 记账：第一次见到某张 drawable 时登记，之后复用不再登记。
+/// 回调闭包因此**不能**捕获「本帧序号」（登记时还不知道未来哪些帧会用它），只上报
+/// 「drawable 身份 + `presentedTime`」；帧序号的配对在 GPU 线程的反馈队列里按提交顺序完成。
+struct PresentedHandlers {
+    /// 登记先后（末尾最新）；容量满时淘汰最旧的条目。
+    ids: VecDeque<usize>,
+}
+
+impl PresentedHandlers {
+    fn new() -> Self {
+        Self {
+            ids: VecDeque::with_capacity(PRESENTED_HANDLER_SLOTS),
+        }
+    }
+
+    /// 本帧拿到 `id` 时**是否需要**登记呈现回调（首次见到 ⇒ `true`）。
+    fn register(&mut self, id: usize) -> bool {
+        if self.ids.contains(&id) {
+            return false;
+        }
+        if self.ids.len() == PRESENTED_HANDLER_SLOTS {
+            self.ids.pop_front();
+        }
+        self.ids.push_back(id);
+        true
+    }
+}
+
 /// 持久 offscreen（唯一绘制目标；`BGRA8Unorm_sRGB` / Private）。
 struct Persist {
     texture: Retained<ProtocolObject<dyn MTLTexture>>,
@@ -1364,7 +1432,7 @@ fn elapsed_ns(started: Instant) -> u64 {
 mod tests {
     use super::{
         DRAWABLE_SYNC_SLOTS, DrawableCopy, DrawableSyncState, DrawableSyncs, FrameDamage,
-        clipped_rect, merge_damage, whole_scissor,
+        PRESENTED_HANDLER_SLOTS, PresentedHandlers, clipped_rect, merge_damage, whole_scissor,
     };
     use crate::{
         math::PhysicalRect,
@@ -1463,6 +1531,42 @@ mod tests {
         let rect = whole_scissor((1400, 1040));
         assert_eq!((rect.x, rect.y), (0, 0));
         assert_eq!((rect.width, rect.height), (1400, 1040));
+    }
+
+    /// AR3 §6.4 / P1-9：呈现回调**每张 drawable 只登记一次**（Apple 不承诺呈现后自动清除，
+    /// 而 drawable 会被池复用；每帧登记会让 block 数随帧数线性增长）。
+    #[test]
+    fn each_drawable_registers_a_presented_handler_exactly_once() {
+        let mut handlers = PresentedHandlers::new();
+        // 池深 3 的轮转：前 3 个 ID 各登记一次，之后复用不再登记。
+        assert!(handlers.register(0));
+        assert!(handlers.register(1));
+        assert!(handlers.register(2));
+        for _ in 0..100 {
+            for id in [0, 1, 2] {
+                assert!(
+                    !handlers.register(id),
+                    "drawable {id} 复用同一对象时不能重复登记呈现回调"
+                );
+            }
+        }
+        assert_eq!(handlers.ids.len(), 3, "登记表按 drawable 身份去重");
+    }
+
+    /// 防御路径：若系统每帧给新 drawable（ID 单调递增、不复用），登记表按固定容量淘汰最旧项，
+    /// 不会无界增长；每个 ID 在它被淘汰之前也只登记一次。
+    #[test]
+    fn the_presented_handler_table_never_grows_without_bound() {
+        let mut handlers = PresentedHandlers::new();
+        for id in 0..(PRESENTED_HANDLER_SLOTS as usize * 3) {
+            assert!(handlers.register(id), "新对象只登记一次");
+            assert!(!handlers.register(id), "同一对象重复使用不登记");
+        }
+        assert_eq!(handlers.ids.len(), PRESENTED_HANDLER_SLOTS);
+        // 最旧的 ID 已被淘汰：再出现时按"新 drawable"重新登记（正确性方向：多一次回调而不是
+        // 少了回调），但仍然不会超过容量。
+        assert!(handlers.register(0));
+        assert_eq!(handlers.ids.len(), PRESENTED_HANDLER_SLOTS);
     }
 
     /// 新 drawable（图层刚建 / resize 后 / 表项被淘汰）：已绘制区域为空 ⇒ 整帧拷。

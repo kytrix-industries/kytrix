@@ -62,11 +62,17 @@ pub(crate) fn new_layer(
     layer.setMaximumDrawableCount(MAXIMUM_DRAWABLE_COUNT);
     // 异步呈现：present 不等事务、由合成器按 vsync 呈现（两者都是默认值，显式写出契约）。
     layer.setPresentsWithTransaction(false);
-    // **关闭图层自己的 vsync 对齐**（R09-6）：节奏由 `CAMetalDisplayLink` 独占 —— delegate 给出
-    // `targetPresentationTimestamp`、提交用 `presentDrawable:atTime:` 钉住那一帧。图层再对齐一次
-    // 就是两道节流叠加：`displaySyncEnabled = true` 时 CA 会按自己的调度点再挪一帧，把已经钉好的
-    // 呈现时刻又推后（且时序不可观测）。
-    layer.setDisplaySyncEnabled(false);
+    // **保留图层自己的 vsync 对齐**（R09-6 / AR3 §6.1）：节奏由 `CAMetalDisplayLink` 独占 ——
+    // delegate 给出 `targetPresentationTimestamp`、提交用 `presentDrawable:atTime:` 钉住那一帧。
+    //
+    // Apple 的《Frame Pacing》把节奏源与这个开关**成对绑定**：
+    // - VSync-On ⇒ 用 `CAMetalDisplayLink` **且** `displaySyncEnabled = YES`；
+    // - VSync-Off ⇒ 用 semaphore 定时循环 **且** `displaySyncEnabled = NO`。
+    // 本后端是前者（display link + `presentDrawable:atTime:`），所以这里必须是 `true`。
+    // `false` 的文档化代价是「present 更快，但**可能出现短暂视觉撕裂**」
+    // （`CAMetalLayer.displaySyncEnabled`）；而 `present(at:)` 只承诺「命令及时完成就按指定时刻
+    // 呈现」，不会因为图层开着 vsync 就把已钉住的时刻再推后 —— 旧注释「两道节流叠加」没有依据。
+    layer.setDisplaySyncEnabled(true);
     // SAFETY: 同别名上的说明：CoreAnimation 的全局字符串常量，进程生命周期内有效。
     layer.setContentsGravity(unsafe { LIVE_RESIZE_GRAVITY });
     // **显式声明图层的颜色空间为 sRGB**（P2-3.1）：`CAMetalLayer` 默认跟随窗口所在屏幕的
@@ -122,5 +128,25 @@ mod tests {
         // SAFETY: CoreAnimation 的全局字符串常量，进程生命周期内有效。
         let gravity = unsafe { LIVE_RESIZE_GRAVITY };
         assert_eq!(gravity.to_string(), "bottomLeft");
+    }
+
+    /// AR3 §6.1（P1-5）：本后端是 VSync-On（`CAMetalDisplayLink` + `presentDrawable:atTime:`），
+    /// 图层必须保留 vsync 对齐（`displaySyncEnabled = true`）。
+    ///
+    /// 失败面：`false` 会把"尽快呈现"路径（`PresentPlan::Now` / 目标时刻不可用）变成无 vsync
+    /// 的 ASAP 上屏。Apple《Frame Pacing》把 `displaySyncEnabled = NO` 与 VSync-Off 的 semaphore
+    /// 定时循环成对绑定；`CAMetalLayer.displaySyncEnabled` 文档写明 `false` 可能产生撕裂。
+    /// 这条断言直接读回图层属性，是这次 `true → false` 回归的单一守卫。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_layer_keeps_display_sync_enabled_for_the_display_link_path() {
+        use crate::{paint::color::Color, render::macos::device::Device};
+
+        let device = Device::new().expect("metal device");
+        let layer = super::new_layer(&device, (64, 48), 1.0, Color::default()).expect("layer");
+        assert!(
+            layer.displaySyncEnabled(),
+            "VSync-On + CAMetalDisplayLink 必须 displaySyncEnabled = true（否则有撕裂风险）"
+        );
     }
 }
