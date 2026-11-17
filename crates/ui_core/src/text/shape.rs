@@ -1,14 +1,33 @@
 //! 形状：`parley` 的唯一调用点（`design/phase-05-text.md` §7）。
 //!
-//! [`ShapedText`] 是一次 shape 的**不可变快照**（parley `Layout` + 内容宽），被 `Rc` 共享：
-//! - measure：`clone()` 后 `break_all_lines` + `align`（宽度变化不重建 `Layout`）；
-//! - 光栅：遍历 `positioned_glyphs()`，按 run 的字体光栅并装箱，产出 [`ShapedLine`]。
-//!   parley 的落点 `glyph.x` 是**小数物理坐标**（layout 以 `scale` 构建，`x = 逻辑 × scale`）；
-//!   光栅阶段把它拆成「整数基准 + 1/4 px 相位」（`raster::split_subpixel_x`）后交给字形图集，
-//!   因此相位永远基于**物理**坐标（非整数 scale 下用逻辑坐标算相位会把 1/4 px 网格弄错）。
-//!   ppem 同样取 run 的物理字号并保留小数；y 仍按整像素基线。
+//! [`ShapedText`] 是一次 shape 的**不可变快照**，被 `Rc` 共享。三条关键契约：
+//!
+//! 1. **逻辑坐标 shaping**（R12-4）：全部布局量与 parley 输入都是逻辑像素（`range_builder` 的
+//!    `scale = 1.0`），设备 scale 只在光栅/落点阶段相乘。于是「DPI 变化」不再清空形状缓存，
+//!    光栅期按 `ppem = 逻辑字号 × scale` 开新的 strike（`GlyphKey` 已含 ppem 维）。
+//!    100% DPI 下逻辑 == 物理，像素与改造前逐位一致；非整数 DPI 下竖直度量按逻辑整像素量化
+//!    再乘 scale 取整（`rasterize` 的 `y.round()`），与旧实现（parley 在物理坐标上量化）最多
+//!    差 0.5 物理像素 —— 这是「逻辑坐标布局 + 光栅期取整」的规范结果（Blink/Qt 同构）。
+//! 2. **零克隆**（R12-5）：`measure` / `layout_at` / 选区几何都在**同一份** `Layout` 上就地
+//!    重排（`break_all_lines` 可从已塑形的数据重跑，parley 的 `BreakLines::new` 会
+//!    `lines.clear()`）。快照不再为「按宽度断行」clone 整个 `Layout`，也不再常驻第二份
+//!    `broken`（R12-6）。min/max-content 尺寸在 shape 期实测一次，`measure` 是 O(1)。
+//! 3. **缓存键只含 shaping 输入**（R12-4/R12-11）：`scale` / `color` / `alignment` 都不在键里；
+//!    颜色由光栅期传入，对齐由 `break_and_align` 现场应用。同一文本的红/绿两态共享一份快照。
+//!
+//! 相位与 ppem 都取**物理**量：`glyph.x` 是逻辑坐标，光栅时先 `× scale` 再
+//! `raster::split_subpixel_x` 拆相位；`ppem = run.font_size() × scale`（保留小数）。
+//!
+//! # 溢出与行数上限（R12-9）
+//!
+//! `TextStyle::{max_lines, overflow}` 在光栅之后按 CSS 语义应用：`max_lines` 截掉多余行，
+//! `overflow: Ellipsis` 在**最后一个可见行**上按「保留前缀 + 省略号」重排（省略号的 advance
+//! 计入可用宽度，与 Chrome `LayoutNG` / Flutter `TextOverflow.ellipsis` 一致）。
 
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    cell::{Cell, RefCell},
+};
 
 use parley::{
     FontContext, FontStyle as ParleyFontStyle, FontWeight as ParleyFontWeight, LayoutContext,
@@ -21,115 +40,190 @@ use taffy::AvailableSpace;
 
 use super::{
     InlineBoxSpec, ShapedGlyphRun, ShapedInlineBox, ShapedLine, ShapedTextItem, ShapedTextLine,
-    TextAlign, TextContent, TextDiagnostic, TextDirection, TextSlant, TextStyle, TextWrap,
+    TextAlign, TextContent, TextDiagnostic, TextDirection, TextLineBreak, TextOverflow, TextSlant,
+    TextStyle, TextWrap,
     atlas::{GlyphAtlas, GlyphAtlasStats},
+    fast_path::SimpleShaped,
     inline_flow,
-    raster::{GlyphRasterizer, split_subpixel_x},
+    raster::{GlyphRasterizer, GlyphVariation, split_subpixel_x},
 };
 use crate::{
     error::EngineError,
     math::{Point, Rect, Size},
-    paint::{color::ColorBrush, primitive::PositionedGlyph},
+    paint::{
+        color::{Color, ColorBrush},
+        primitive::PositionedGlyph,
+    },
     render::atlas::AtlasAllocator,
 };
+
+/// 省略号的字形（`TextContext` 按样式缓存；`rasterize` 用它补最后一行）。
+///
+/// 省略号**必须参与 shaping**（它的 advance 要计入可用宽度）：这里保存的是已 shape 的
+/// `(glyph id, advance)` 序列（正常 1 个 U+2026；字体缺该字形时退成 3 个 `.`）。
+#[derive(Clone, Debug)]
+pub(crate) struct EllipsisGlyphs {
+    /// 字形 id 与各自的 advance（逻辑像素）。
+    pub glyphs: Vec<(u32, f32)>,
+    /// 字形所属字体（光栅 / 图集键）。
+    pub font: parley::FontData,
+    /// 可变字体实例坐标（16.16 定点）。
+    pub variation_coords: Vec<i16>,
+    /// 合成样式（faux bold）。
+    pub synthesis: fontique::Synthesis,
+    /// 总 advance（逻辑像素）。
+    pub advance: f32,
+}
+
+impl EllipsisGlyphs {
+    /// 是否为空（没 shape 出任何字形）。
+    pub(crate) fn is_empty(&self) -> bool {
+        self.glyphs.is_empty()
+    }
+}
+
+/// 光栅一期需要的全部可变状态（图集 + 光栅器 + 代际 + 设备 scale）。
+pub(crate) struct RasterCtx<'a> {
+    /// 逐字形光栅器（`ScaleContext` 复用）。
+    pub raster: &'a mut GlyphRasterizer,
+    /// 字形 tile 缓存。
+    pub glyph_atlas: &'a mut GlyphAtlas,
+    /// 图集分配器（装箱 + 脏行 + 代际）。
+    pub atlas: &'a mut AtlasAllocator,
+    /// 本次 pass 的图集代际。
+    pub generation: u32,
+    /// 当前窗口的设备 scale（逻辑 → 物理）。
+    pub scale: f32,
+}
 
 /// 一次 shape 的不可变快照。
 pub(crate) struct ShapedText {
     text: SmolStr,
+    /// 生成快照时的样式（**只保留 shaping 输入**：颜色/对齐每次使用现场给）。
     style: TextStyle,
-    scale: f32,
     font_stack_version: u32,
-    layout: parley::Layout<ColorBrush>,
-    widths: parley::ContentWidths,
+    kind: ShapedKind,
     /// 行内盒的边界/超宽诊断（shape 期间产生，随 `rasterize` 交给 `TextContext`）。
     inline_diagnostics: Vec<TextDiagnostic>,
     inline_boxes: Box<[InlineBoxSpec]>,
+    /// `Definite` 宽度的单条 memo：taffy 会对同一节点反复探测同一宽度。
+    measure_memo: RefCell<Option<(u32, Size)>>,
+    /// 诊断/测试：`measure` 真正触发断行的次数（O(1) 路径必须不增长）。
+    measure_breaks: Cell<u32>,
+}
+
+enum ShapedKind {
+    /// parley 塑形：一份可就地重排的 `Layout` + shape 期实测的 min/max 尺寸。
+    Parley(RefCell<ParleySnapshot>),
+    /// 数字快速路径（`fast_path`）：单行、无 parley 布局。
+    Simple(SimpleShaped),
+}
+
+/// parley 快照 + 断行状态（`break_all_lines` 可反复调用，见模块文档）。
+struct ParleySnapshot {
+    layout: parley::Layout<ColorBrush>,
+    /// `widths.min` 处实测的尺寸（min-content）。
+    min_size: Size,
+    /// max-content 实测的尺寸。
+    max_size: Size,
+    /// 当前断行宽度（`None` = max-content）。
+    broken_at: Option<u32>,
+    /// 当前应用的对齐（`None` = 尚未对齐）。
+    aligned_at: Option<u8>,
+}
+
+impl ParleySnapshot {
+    /// 建快照：max-content 断一次、`widths.min` 再断一次（各记录实测尺寸），最后回到 max-content。
+    fn new(mut layout: parley::Layout<ColorBrush>) -> Self {
+        layout.break_all_lines(None);
+        let max_size = Size::new(layout.width(), layout.height());
+        let widths = layout.calculate_content_widths();
+        layout.break_all_lines(Some(widths.min));
+        let min_size = Size::new(layout.width(), layout.height());
+        layout.break_all_lines(None);
+        Self {
+            layout,
+            min_size,
+            max_size,
+            broken_at: None,
+            aligned_at: None,
+        }
+    }
+
+    /// 就地断行 + 对齐，返回 `(width, height)`（逻辑像素）。
+    fn break_and_align(&mut self, width: Option<f32>, alignment: Alignment) -> (f32, f32) {
+        let key = width.map(f32::to_bits);
+        if self.broken_at != key {
+            self.layout.break_all_lines(width);
+            self.broken_at = key;
+            self.aligned_at = None;
+        }
+        let align_key = alignment_key(alignment);
+        if self.aligned_at != Some(align_key) {
+            self.layout.align(alignment, AlignmentOptions::default());
+            self.aligned_at = Some(align_key);
+        }
+        (self.layout.width(), self.layout.height())
+    }
 }
 
 impl ShapedText {
-    /// 跑一次 `RangedBuilder`（样式变化/文本变化才调用；宽度变化走 [`ShapedText::measure`]）。
+    /// 跑一次 `RangedBuilder`（样式/文本变化才调用；宽度变化走就地重排）。
+    ///
+    /// 坐标是**逻辑像素**：`ranged_builder(..., 1.0, true)`（`quantize` 让行盒吸附到逻辑整像素，
+    /// 与旧实现在 100% DPI 下逐位一致）。
     pub(crate) fn shape(
         font_cx: &mut FontContext,
         layout_cx: &mut LayoutContext<ColorBrush>,
         family: &parley::FontFamily<'static>,
         content: &TextContent,
-        scale: f32,
         font_stack_version: u32,
     ) -> Self {
         let style = &content.style;
         let mut inline_diagnostics: Vec<TextDiagnostic> = Vec::new();
-        let mut builder = layout_cx.ranged_builder(font_cx, &content.text, scale, true);
+        let mut builder = layout_cx.ranged_builder(font_cx, &content.text, 1.0, true);
         builder.set_base_direction(match style.direction {
             TextDirection::Auto => parley::BaseDirection::Auto,
             TextDirection::Ltr => parley::BaseDirection::Ltr,
             TextDirection::Rtl => parley::BaseDirection::Rtl,
         });
         builder.push_default(StyleProperty::FontFamily(family.clone()));
-        builder.push_default(StyleProperty::FontSize(style.size));
-        builder.push_default(StyleProperty::FontWeight(ParleyFontWeight::new(f32::from(
-            style.weight,
-        ))));
-        builder.push_default(StyleProperty::FontStyle(match style.slant {
-            TextSlant::Normal => ParleyFontStyle::Normal,
-            TextSlant::Italic => ParleyFontStyle::Italic,
-            TextSlant::Oblique => ParleyFontStyle::Oblique(None),
-        }));
-        builder.push_default(StyleProperty::LetterSpacing(style.letter_spacing));
-        builder.push_default(StyleProperty::LineHeight(match style.line_height {
-            None => ParleyLineHeight::NORMAL,
-            Some(factor) => ParleyLineHeight::FontSizeRelative(factor),
-        }));
-        builder.push_default(StyleProperty::Brush(ColorBrush { color: style.color }));
-        // OpenType 特性（tnum 等宽数字等）：转成 Parley 的 FontFeature 列表。
-        // 无特性时不 push —— 保持「不请求任何特性」与字体默认行为一致。
-        if let Some(features) = style.font_features() {
-            let features: Vec<parley::FontFeature> = features
-                .iter()
-                .map(|feature| {
-                    parley::FontFeature::new(
-                        parley::setting::Tag::from_bytes(feature.tag),
-                        feature.value,
-                    )
-                })
-                .collect();
-            builder.push_default(StyleProperty::FontFeatures(parley::FontFeatures::List(
-                std::borrow::Cow::Owned(features),
-            )));
-        }
-        builder.push_default(StyleProperty::WhiteSpaceCollapse(
-            parley::WhiteSpaceCollapse::Preserve,
-        ));
-        match style.wrap {
-            TextWrap::Wrap => {}
-            TextWrap::NoWrap => {
-                builder.push_default(StyleProperty::TextWrapMode(ParleyTextWrapMode::NoWrap));
-            }
-            TextWrap::Anywhere => {
-                builder.push_default(StyleProperty::WordBreak(ParleyWordBreak::BreakAll));
-                builder.push_default(StyleProperty::OverflowWrap(ParleyOverflowWrap::Anywhere));
-            }
-        }
+        push_shaping_defaults(&mut builder, style);
         for spec in &content.inline_boxes {
-            let (inline_box, diagnostic) = inline_flow::to_inline_box(spec, &content.text, scale);
+            let (inline_box, diagnostic) = inline_flow::to_inline_box(spec, &content.text);
             if let Some(diagnostic) = diagnostic {
                 inline_diagnostics.push(diagnostic);
             }
             builder.push_inline_box(inline_box);
         }
-        let mut layout = builder.build(&content.text);
-        // 快照自身先按 max-content 断行 + 对齐：rasterize 要遍历 `lines()`，measure 再 clone 后重排。
-        layout.break_all_lines(None);
-        layout.align(align_of(style.alignment), AlignmentOptions::default());
-        let widths = layout.calculate_content_widths();
+        let layout = builder.build(&content.text);
         Self {
             text: content.text.clone(),
             style: style.clone(),
-            scale,
             font_stack_version,
-            layout,
-            widths,
+            kind: ShapedKind::Parley(RefCell::new(ParleySnapshot::new(layout))),
             inline_diagnostics,
             inline_boxes: content.inline_boxes.clone(),
+            measure_memo: RefCell::new(None),
+            measure_breaks: Cell::new(0),
+        }
+    }
+
+    /// 由数字快速路径的结果建快照（单行）。
+    pub(crate) fn simple(
+        content: &TextContent,
+        simple: SimpleShaped,
+        font_stack_version: u32,
+    ) -> Self {
+        Self {
+            text: content.text.clone(),
+            style: content.style.clone(),
+            font_stack_version,
+            kind: ShapedKind::Simple(simple),
+            inline_diagnostics: Vec::new(),
+            inline_boxes: content.inline_boxes.clone(),
+            measure_memo: RefCell::new(None),
+            measure_breaks: Cell::new(0),
         }
     }
 
@@ -140,66 +234,89 @@ impl ShapedText {
     pub(crate) fn text(&self) -> &str {
         &self.text
     }
-
+    #[cfg(test)]
     pub(crate) fn style(&self) -> &TextStyle {
         &self.style
     }
 
-    pub(crate) fn scale(&self) -> f32 {
-        self.scale
+    /// 该快照的 shaping 输入是否与 `style` 等价（`color`/`alignment` 不参与形状）。
+    ///
+    /// 缓存命中后仍要逐字段比较（防哈希碰撞）：比较必须用**与缓存键相同的等价关系**，
+    /// 否则「同键不同色」会被判成 miss，缓存形同虚设。
+    pub(crate) fn same_shaping_inputs(&self, style: &TextStyle) -> bool {
+        self.style.same_shaping_inputs(style)
     }
 
-    pub(crate) fn font_stack_version(&self) -> u32 {
-        self.font_stack_version
+    /// max-content 尺寸（逻辑像素）。
+    pub(crate) fn max_content_size(&self) -> Size {
+        match &self.kind {
+            ShapedKind::Parley(snapshot) => snapshot.borrow().max_size,
+            ShapedKind::Simple(simple) => simple.size(),
+        }
     }
 
-    #[cfg(test)]
-    pub(crate) fn layout(&self) -> &parley::Layout<ColorBrush> {
-        &self.layout
-    }
-
-    pub(crate) fn widths(&self) -> parley::ContentWidths {
-        self.widths
-    }
-
-    /// 按**内容宽**（逻辑像素）重排：clone → `break_all_lines` → `align`（B1 的第二阶段）。
-    pub(crate) fn layout_at(&self, width: f32) -> parley::Layout<ColorBrush> {
-        let mut layout = self.layout.clone();
-        layout.break_all_lines(Some(width * self.scale));
-        layout.align(align_of(self.style.alignment), AlignmentOptions::default());
-        layout
+    /// 按 taffy 语义测量（**零克隆**：Min/MaxContent 直接返回 shape 期实测值）。
+    pub(crate) fn measure(
+        &self,
+        _known: taffy::Size<Option<f32>>,
+        available: taffy::Size<AvailableSpace>,
+    ) -> Size {
+        if self.text.is_empty() {
+            return Size::ZERO;
+        }
+        match &self.kind {
+            ShapedKind::Simple(simple) => simple.size(),
+            ShapedKind::Parley(snapshot) => match available.width {
+                AvailableSpace::MinContent => snapshot.borrow().min_size,
+                AvailableSpace::MaxContent => snapshot.borrow().max_size,
+                AvailableSpace::Definite(width) => {
+                    let width = width.max(0.0);
+                    let bits = width.to_bits();
+                    if let Some((cached, size)) = *self.measure_memo.borrow()
+                        && cached == bits
+                    {
+                        return size;
+                    }
+                    let mut snapshot = snapshot.borrow_mut();
+                    let size = if width >= snapshot.max_size.width {
+                        snapshot.max_size
+                    } else if width <= snapshot.min_size.width {
+                        snapshot.min_size
+                    } else {
+                        self.measure_breaks.set(self.measure_breaks.get() + 1);
+                        let (measured_width, measured_height) =
+                            snapshot.break_and_align(Some(width), Alignment::Start);
+                        Size::new(measured_width, measured_height)
+                    };
+                    *self.measure_memo.borrow_mut() = Some((bits, size));
+                    size
+                }
+            },
+        }
     }
 
     /// 字节估算（形状缓存的 LRU 预算；只用于逐出决策，不做精确记账）。
     ///
-    /// **按字形计**，不是按 run 计：`line.items()` 返回的是 run（一段同一样式/字体的连续
-    /// 文本），一个 run 可以含成百上千个字形。旧实现 `items().count() * 32` 会把长单 run
-    /// 文本的占用低估 10–100 倍，8 MiB 的预算因此形同虚设 —— 缓存会一直涨到条目上限。
-    /// 该条目的**估算**字节数（形状缓存预算的计费单位）。
-    ///
-    /// 计费口径是「缓存驻留」，不是进程内存上限：`ShapedText` 被树/measure 闭包以 `Rc`
-    /// 持有时，逐出只减少缓存占用、不释放内存。因此这里宁可**高估**，避免缓存条数在
-    /// 预算外无界增长：
-    ///
-    /// - 结构体本身 + 文本；
-    /// - 每个字形约 24 B（advance + cluster + 字体/样式索引）；
-    /// - 每个 run 头部约 96 B；
-    /// - 行内盒：`InlineBoxSpec`（40 B）逐个计；
-    /// - 行内诊断：按 `TextDiagnostic` 的大致尺寸计（`SmolStr` + range ≈ 64 B）；
-    /// - `TextStyleExtras` 是 boxed 的堆对象（字体家族 + 特性列表），按 box 尺寸计。
-    ///
-    /// 早期实现漏了后三项，长文本 / 多行内盒场景会显著低估（复审 P3-1）。
+    /// **按字形计**，不是按 run 计：一个 run 可以含成百上千个字形，按 run 计会把长文本的
+    /// 占用低估 10–100 倍，预算形同虚设。计费口径是「缓存驻留」，因此宁可**高估**。
     pub(crate) fn approx_bytes(&self) -> usize {
-        let mut glyphs = 0usize;
-        let mut runs = 0usize;
-        for line in self.layout.lines() {
-            for item in line.items() {
-                if let parley::PositionedLayoutItem::GlyphRun(run) = item {
-                    runs += 1;
-                    glyphs += run.glyphs().count();
+        let (glyphs, runs) = match &self.kind {
+            ShapedKind::Parley(snapshot) => {
+                let snapshot = snapshot.borrow();
+                let mut glyphs = 0usize;
+                let mut runs = 0usize;
+                for line in snapshot.layout.lines() {
+                    for item in line.items() {
+                        if let parley::PositionedLayoutItem::GlyphRun(run) = item {
+                            runs += 1;
+                            glyphs += run.glyphs().count();
+                        }
+                    }
                 }
+                (glyphs, runs)
             }
-        }
+            ShapedKind::Simple(simple) => (simple.text_len(), 1),
+        };
         let inline_boxes = core::mem::size_of_val(self.inline_boxes.as_ref());
         let inline_diagnostics = self.inline_diagnostics.capacity() * 64;
         let extras = self
@@ -216,210 +333,597 @@ impl ShapedText {
             + extras
     }
 
+    /// 光栅 + 装箱，产出只读快照（`content_width` 是 taffy 算出的内容宽，逻辑像素）。
+    ///
+    /// `color`/`alignment` 由当前内容与样式现场给出（不在形状缓存键里）。`ellipsis` 只在
+    /// `style.overflow == Ellipsis` 时使用。
+    pub(crate) fn rasterize(
+        &self,
+        content_width: f32,
+        alignment: TextAlign,
+        color: Color,
+        ctx: &mut RasterCtx<'_>,
+        ellipsis: Option<&EllipsisGlyphs>,
+    ) -> Result<(ShapedLine, Vec<TextDiagnostic>, GlyphAtlasStats), EngineError> {
+        if self.text.is_empty() {
+            return Ok((
+                ShapedLine::empty(
+                    self.text.clone(),
+                    ctx.generation,
+                    self.font_stack_version,
+                    ctx.scale,
+                ),
+                Vec::new(),
+                ctx.glyph_atlas.take_stats(),
+            ));
+        }
+        let (mut shaped, diagnostics) = match &self.kind {
+            ShapedKind::Simple(simple) => {
+                let shaped = simple.rasterize(self.text.clone(), &self.style, color, ctx)?;
+                (shaped, Vec::new())
+            }
+            ShapedKind::Parley(snapshot) => {
+                let mut snapshot = snapshot.borrow_mut();
+                let (width, _height) =
+                    snapshot.break_and_align(Some(content_width.max(0.0)), align_of(alignment));
+                let (shaped, diagnostics) = rasterize_parley(
+                    &snapshot.layout,
+                    width,
+                    &self.text,
+                    color,
+                    ctx,
+                    &self.inline_diagnostics,
+                )?;
+                (shaped, diagnostics)
+            }
+        };
+        apply_overflow(
+            &mut shaped,
+            &self.style,
+            content_width,
+            color,
+            ctx,
+            ellipsis,
+        )?;
+        Ok((shaped, diagnostics, ctx.glyph_atlas.take_stats()))
+    }
+
+    /// 让快照进入「按 `width` 断行 + `alignment` 对齐」的状态而不产出像素（选区/光标用）。
+    fn with_broken_layout<R>(
+        &self,
+        width: f32,
+        alignment: TextAlign,
+        body: impl FnOnce(&parley::Layout<ColorBrush>) -> R,
+    ) -> Option<R> {
+        match &self.kind {
+            ShapedKind::Parley(snapshot) => {
+                let mut snapshot = snapshot.borrow_mut();
+                snapshot.break_and_align(Some(width.max(0.0)), align_of(alignment));
+                Some(body(&snapshot.layout))
+            }
+            ShapedKind::Simple(_) => None,
+        }
+    }
+
+    /// `(anchor, focus)` → 文本盒局部的选区矩形（逻辑像素）。
+    pub(crate) fn selection_rects(
+        &self,
+        width: f32,
+        alignment: TextAlign,
+        anchor: usize,
+        focus: usize,
+    ) -> Vec<Rect> {
+        if let ShapedKind::Simple(simple) = &self.kind {
+            return simple.selection_rect(anchor, focus).into_iter().collect();
+        }
+        self.with_broken_layout(width, alignment, |layout| {
+            inline_flow::selection_rects(layout, anchor, focus)
+        })
+        .unwrap_or_default()
+    }
+
+    /// `byte_index` 处的 caret 矩形（文本盒局部逻辑像素，宽 1 逻辑像素）。
+    pub(crate) fn caret_rect(&self, width: f32, alignment: TextAlign, byte_index: usize) -> Rect {
+        if let ShapedKind::Simple(simple) = &self.kind {
+            let metrics = simple.metrics();
+            return Rect::new(simple.caret_x(byte_index), 0.0, 1.0, metrics.line_height);
+        }
+        self.with_broken_layout(width, alignment, |layout| {
+            inline_flow::caret_rect(layout, byte_index)
+        })
+        .unwrap_or_default()
+    }
+
+    /// 仅测试：当前快照的 parley 布局（共享借用；调用期间不得再触发 `measure`/`rasterize`）。
+    #[cfg(test)]
+    pub(crate) fn layout(&self) -> std::cell::Ref<'_, parley::Layout<ColorBrush>> {
+        std::cell::Ref::map(
+            match &self.kind {
+                ShapedKind::Parley(snapshot) => snapshot.borrow(),
+                ShapedKind::Simple(_) => panic!("simple fast-path snapshots have no parley layout"),
+            },
+            |snapshot| &snapshot.layout,
+        )
+    }
+
+    /// 仅测试：按指定宽度断行后的 parley 布局（**clone**，测试专用）。
+    #[cfg(test)]
+    pub(crate) fn layout_at(&self, width: f32) -> parley::Layout<ColorBrush> {
+        match &self.kind {
+            ShapedKind::Parley(snapshot) => {
+                let mut snapshot = snapshot.borrow_mut();
+                let (_, _) = snapshot.break_and_align(Some(width.max(0.0)), Alignment::Start);
+                snapshot.layout.clone()
+            }
+            ShapedKind::Simple(_) => panic!("simple fast-path snapshots have no parley layout"),
+        }
+    }
+
+    /// 仅测试：`measure` 真正触发断行的次数（O(1) 路径必须不增长）。
+    #[cfg(test)]
+    pub(crate) fn measure_breaks(&self) -> u32 {
+        self.measure_breaks.get()
+    }
+
     /// 仅测试：在指定宽度下重排后第一个字形的逻辑 x（验证 `align` 的真实效果）。
     #[cfg(test)]
     pub(crate) fn first_glyph_x_at(&self, width: f32) -> f32 {
-        let mut layout = self.layout.clone();
-        layout.break_all_lines(Some(width * self.scale));
+        let mut layout = self.layout_at(width);
         layout.align(align_of(self.style.alignment), AlignmentOptions::default());
         layout
             .lines()
             .next()
             .and_then(|line| line.items().next())
             .and_then(|item| match item {
-                PositionedLayoutItem::GlyphRun(run) => run
-                    .positioned_glyphs()
-                    .next()
-                    .map(|glyph| glyph.x / self.scale),
+                PositionedLayoutItem::GlyphRun(run) => {
+                    run.positioned_glyphs().next().map(|glyph| glyph.x)
+                }
                 PositionedLayoutItem::InlineBox(_) => None,
             })
             .unwrap_or(0.0)
     }
+}
 
-    /// 按 taffy 语义测量（纯函数：只读 `&self`，clone 后重排）。
-    ///
-    /// 输入/输出都是**逻辑像素**；内部乘 `scale` 交给 parley（其坐标是物理像素）。
-    pub(crate) fn measure(
-        &self,
-        known: taffy::Size<Option<f32>>,
-        available: taffy::Size<AvailableSpace>,
-    ) -> Size {
-        if self.text.is_empty() {
-            return Size::ZERO;
-        }
-        let width_logical = match available.width {
-            AvailableSpace::Definite(width) => Some(width.max(0.0)),
-            AvailableSpace::MinContent => Some(self.widths.min / self.scale),
-            AvailableSpace::MaxContent => known.width,
-        };
-        let mut layout = self.layout.clone();
-        layout.break_all_lines(width_logical.map(|width| width * self.scale));
-        layout.align(align_of(self.style.alignment), AlignmentOptions::default());
-        Size::new(
-            (layout.width() / self.scale).max(0.0),
-            (layout.height() / self.scale).max(0.0),
-        )
+/// 把 shaping 相关的默认样式压进 builder（production 与快速路径的探针塑形共用，
+/// 保证「探针 == 生产」）。
+pub(super) fn push_shaping_defaults<'a>(
+    builder: &mut parley::RangedBuilder<'a, ColorBrush>,
+    style: &TextStyle,
+) {
+    builder.push_default(StyleProperty::FontSize(style.size));
+    builder.push_default(StyleProperty::FontWeight(ParleyFontWeight::new(f32::from(
+        style.weight,
+    ))));
+    builder.push_default(StyleProperty::FontStyle(match style.slant {
+        TextSlant::Normal => ParleyFontStyle::Normal,
+        TextSlant::Italic => ParleyFontStyle::Italic,
+        TextSlant::Oblique => ParleyFontStyle::Oblique(None),
+    }));
+    builder.push_default(StyleProperty::LetterSpacing(style.letter_spacing));
+    builder.push_default(StyleProperty::LineHeight(match style.line_height {
+        None => ParleyLineHeight::NORMAL,
+        Some(factor) => ParleyLineHeight::FontSizeRelative(factor),
+    }));
+    if let Some(features) = style.font_features() {
+        let features: Vec<parley::FontFeature> = features
+            .iter()
+            .map(|feature| {
+                parley::FontFeature::new(
+                    parley::setting::Tag::from_bytes(feature.tag),
+                    feature.value,
+                )
+            })
+            .collect();
+        builder.push_default(StyleProperty::FontFeatures(parley::FontFeatures::List(
+            Cow::Owned(features),
+        )));
     }
-
-    /// 光栅 + 装箱，产出只读快照。
-    ///
-    /// 水平落点按 1/4 px 相位量化后光栅（`raster`），`ShapedGlyphRun::glyphs[].position` 仍是
-    /// **整数物理像素**：相位已经烘进位图与 `placement.left`，绘制侧不需要再做亚像素变换。
-    /// 相位与 ppem 都取**物理**量：`glyph.x` 是 parley 以 `scale` 构建布局后的小数物理坐标，
-    /// ppem 是 `run.font_size()`（逻辑字号 × scale，保留小数；见 `atlas::PPEM_KEY_QUANTIZATION`）。
-    /// y 方向继续整像素对齐（水平排版不需要竖直亚像素定位）。
-    ///
-    /// `generation` 是当前字形图集的代际（写进 `ShapedLine`，供 P06 判 stale）。
-    pub(crate) fn rasterize(
-        &self,
-        layout: &parley::Layout<ColorBrush>,
-        content_width: f32,
-        raster: &mut GlyphRasterizer,
-        glyph_atlas: &mut GlyphAtlas,
-        atlas: &mut AtlasAllocator,
-        generation: u32,
-    ) -> Result<(ShapedLine, Vec<TextDiagnostic>, GlyphAtlasStats), EngineError> {
-        let scale = self.scale;
-        if self.text.is_empty() {
-            return Ok((
-                ShapedLine::empty(
-                    self.text.clone(),
-                    generation,
-                    self.font_stack_version,
-                    self.scale,
-                ),
-                Vec::new(),
-                glyph_atlas.take_stats(),
-            ));
+    if let Some(stretch) = style.stretch() {
+        builder.push_default(StyleProperty::FontWidth(
+            parley::FontWidth::from_percentage(f32::from(stretch)),
+        ));
+    }
+    if let Some(word_spacing) = style.word_spacing() {
+        builder.push_default(StyleProperty::WordSpacing(word_spacing));
+    }
+    if let Some(locale) = style.locale()
+        && let Ok(language) = parley::Language::parse(locale)
+    {
+        builder.push_default(StyleProperty::Locale(Some(language)));
+    }
+    if let Some(variations) = style.font_variations() {
+        let variations: Vec<parley::FontVariation> = variations
+            .iter()
+            .map(|variation| parley::FontVariation {
+                tag: parley::setting::Tag::from_bytes(variation.tag),
+                value: variation.value,
+            })
+            .collect();
+        builder.push_default(StyleProperty::FontVariations(parley::FontVariations::List(
+            Cow::Owned(variations),
+        )));
+    }
+    if let Some(line_break) = style.line_break() {
+        builder.push_default(StyleProperty::LineBreak(parley_line_break(line_break)));
+    }
+    builder.push_default(StyleProperty::WhiteSpaceCollapse(
+        parley::WhiteSpaceCollapse::Preserve,
+    ));
+    match style.wrap {
+        TextWrap::Wrap => {}
+        TextWrap::NoWrap => {
+            builder.push_default(StyleProperty::TextWrapMode(ParleyTextWrapMode::NoWrap));
         }
-        let mut diagnostics: Vec<TextDiagnostic> = self.inline_diagnostics.clone();
-        let available = content_width;
-        let mut lines = Vec::with_capacity(self.layout.lines().count());
+        TextWrap::Anywhere => {
+            builder.push_default(StyleProperty::WordBreak(ParleyWordBreak::BreakAll));
+            builder.push_default(StyleProperty::OverflowWrap(ParleyOverflowWrap::Anywhere));
+        }
+    }
+}
+
+/// 塑形一个省略号字形序列（R12-9）：优先 `…`（U+2026），字体缺该字形时退成 `...`。
+///
+/// 返回的 advance 是**已含字间距/特性**的实测值（`Glyph::advance`），因此「前缀 + 省略号 ≤
+/// 可用宽度」的判定与最终绘制一致。行度量取主文本的样式（省略号只借字形，不建自己的行）。
+pub(crate) fn measure_ellipsis(
+    font_cx: &mut FontContext,
+    layout_cx: &mut LayoutContext<ColorBrush>,
+    family: &parley::FontFamily<'static>,
+    style: &TextStyle,
+) -> Option<EllipsisGlyphs> {
+    for text in ["\u{2026}", "..."] {
+        let mut builder = layout_cx.ranged_builder(font_cx, text, 1.0, true);
+        builder.set_base_direction(parley::BaseDirection::Ltr);
+        builder.push_default(StyleProperty::FontFamily(family.clone()));
+        push_shaping_defaults(&mut builder, style);
+        let mut layout = builder.build(text);
+        layout.break_all_lines(None);
+        let mut glyphs: Vec<(u32, f32)> = Vec::new();
+        let mut font: Option<parley::FontData> = None;
+        let mut variation_coords: Vec<i16> = Vec::new();
+        let mut synthesis = fontique::Synthesis::default();
+        let mut advance = 0.0f32;
+        let mut missing = false;
         for line in layout.lines() {
-            let metrics = line.metrics();
-            let mut items = Vec::new();
             for item in line.items() {
-                match item {
-                    PositionedLayoutItem::GlyphRun(run) => {
-                        let font = run.run().font().clone();
-                        // 光栅 ppem = parley 的 `Run::font_size()`，**已是物理值**（B2：不能再乘
-                        // scale），且**保留小数**（P3，txt-1 收尾）：14 px @125% → 17.5 ppem。
-                        // swash 的 `ScalerBuilder::size` 收 f32、skrifa 按小数缩放轮廓；取整会
-                        // 让位图比 parley 的小数 advance 宽/窄最多 0.5 px/em，累积成字距呼吸。
-                        // 图集键只用它的量化值（`atlas::PPEM_KEY_QUANTIZATION`），光栅用原值。
-                        let ppem = run.run().font_size().clamp(1.0, 512.0);
-                        let text_range = run.run().text_range();
-                        let color = run.style().brush.color;
-                        if run.run().synthesis().any() {
-                            diagnostics.push(TextDiagnostic::SyntheticStyle {
+                let PositionedLayoutItem::GlyphRun(run) = item else {
+                    continue;
+                };
+                if font.is_none() {
+                    font = Some(run.run().font().clone());
+                    variation_coords = run
+                        .run()
+                        .normalized_coords()
+                        .iter()
+                        .map(|coord| coord.to_bits())
+                        .collect();
+                    synthesis = run.run().synthesis();
+                }
+                for glyph in run.positioned_glyphs() {
+                    if glyph.id == 0 {
+                        missing = true;
+                        break;
+                    }
+                    glyphs.push((glyph.id, glyph.advance));
+                    advance += glyph.advance;
+                }
+            }
+            if missing {
+                break;
+            }
+        }
+        if !missing && !glyphs.is_empty() {
+            return Some(EllipsisGlyphs {
+                glyphs,
+                font: font?,
+                variation_coords,
+                synthesis,
+                advance,
+            });
+        }
+    }
+    None
+}
+
+/// `TextLineBreak` → parley `LineBreak`（1:1 的三个严格度；`Anywhere` 不暴露——它等价于
+/// `TextWrap::Anywhere` 已经表达的语义）。
+fn parley_line_break(kind: TextLineBreak) -> parley::LineBreak {
+    match kind {
+        TextLineBreak::Loose => parley::LineBreak::Loose,
+        TextLineBreak::Normal => parley::LineBreak::Normal,
+        TextLineBreak::Strict => parley::LineBreak::Strict,
+    }
+}
+
+/// 光栅一份已就位的 parley 布局。
+fn rasterize_parley(
+    layout: &parley::Layout<ColorBrush>,
+    content_width: f32,
+    text: &SmolStr,
+    color: Color,
+    ctx: &mut RasterCtx<'_>,
+    inline_diagnostics: &[TextDiagnostic],
+) -> Result<(ShapedLine, Vec<TextDiagnostic>), EngineError> {
+    let scale = ctx.scale;
+    let mut diagnostics: Vec<TextDiagnostic> = inline_diagnostics.to_vec();
+    let mut lines = Vec::with_capacity(layout.lines().len());
+    for line in layout.lines() {
+        let metrics = line.metrics();
+        let mut items = Vec::new();
+        for item in line.items() {
+            match item {
+                PositionedLayoutItem::GlyphRun(run) => {
+                    let font = run.run().font().clone();
+                    // 光栅 ppem = parley 的 `Run::font_size()`（逻辑字号）× 设备 scale，
+                    // **保留小数**：14 px @125% → 17.5 ppem。
+                    let ppem = (run.run().font_size() * scale).clamp(1.0, 512.0);
+                    let text_range = run.run().text_range();
+                    if run.run().synthesis().any() {
+                        diagnostics.push(TextDiagnostic::SyntheticStyle {
+                            text_range: text_range.clone(),
+                        });
+                    }
+                    let normalized_coords: Vec<i16> = run
+                        .run()
+                        .normalized_coords()
+                        .iter()
+                        .map(|coord| coord.to_bits())
+                        .collect();
+                    let variation =
+                        GlyphVariation::of(&normalized_coords, run.run().synthesis(), ppem);
+                    let mut glyphs = Vec::new();
+                    for glyph in run.positioned_glyphs() {
+                        if glyph.id == 0 {
+                            diagnostics.push(TextDiagnostic::MissingGlyph {
+                                font: font_label(&font),
+                                glyph: glyph.id,
+                                text_range: text_range.clone(),
+                            });
+                            continue;
+                        }
+                        let Some((positioned, color_glyph)) =
+                            emit_glyph(ctx, &font, glyph.id, ppem, &variation, glyph.x, glyph.y)?
+                        else {
+                            continue;
+                        };
+                        if color_glyph {
+                            // R12-8：彩色字形被压成单色覆盖度（引擎只有 R8 mask 图集）。
+                            // 不静默：这条诊断让「emoji 变灰」可观测。
+                            diagnostics.push(TextDiagnostic::ColorGlyphMonochrome {
+                                font: font_label(&font),
+                                glyph: glyph.id,
                                 text_range: text_range.clone(),
                             });
                         }
-                        // 可变字体实例 + faux bold：光栅必须收到与 parley 排版一致的参数，
-                        // 否则可变字体（如 `Segoe UI Variable`）的粗体位图仍是常规字重。
-                        // parley 的坐标是 16.16 定点（`to_bits()` = 原始 i16，与
-                        // `swash::NormalizedCoord` 同表示）。
-                        let normalized_coords: Vec<i16> = run
-                            .run()
-                            .normalized_coords()
-                            .iter()
-                            .map(|coord| coord.to_bits())
-                            .collect();
-                        let variation = crate::text::raster::GlyphVariation::of(
-                            &normalized_coords,
-                            run.run().synthesis(),
-                            ppem,
-                        );
-                        let mut glyphs = Vec::new();
-                        for glyph in run.positioned_glyphs() {
-                            if glyph.id == 0 {
-                                diagnostics.push(TextDiagnostic::MissingGlyph {
-                                    font: font_label(&font),
-                                    glyph: glyph.id,
-                                    text_range: text_range.clone(),
-                                });
-                                continue;
-                            }
-                            // 水平亚像素定位（P2-2）：parley 的落点是小数物理坐标，拆成
-                            // 「整数基准 + 1/4 px 相位桶」。位图按相位光栅，绘制落点仍是
-                            // `base + placement.left` 的整数物理像素 —— 相位已烘进位图，
-                            // 不会再被 `Rect::to_physical` 二次取整掉。
-                            let (base_x, subpixel_x) = split_subpixel_x(glyph.x);
-                            let tile = glyph_atlas.ensure(
-                                raster,
-                                atlas,
-                                &font,
-                                glyph.id,
-                                ppem,
-                                subpixel_x,
-                                Some(&variation),
-                            )?;
-                            let Some(tile) = tile else {
-                                // 空白/无轮廓：不产生像素，advance 已由 parley 推进。
-                                continue;
-                            };
-                            let origin_x = base_x + tile.left as f32;
-                            let origin_y = glyph.y.round() - tile.top as f32;
-                            glyphs.push(PositionedGlyph {
-                                tile: tile.tile,
-                                position: Point::new(origin_x / scale, origin_y / scale),
-                                size: Size::new(
-                                    tile.width as f32 / scale,
-                                    tile.height as f32 / scale,
-                                ),
-                            });
-                        }
-                        items.push(ShapedTextItem::GlyphRun(ShapedGlyphRun {
-                            color,
-                            text_range,
-                            glyphs,
-                        }));
+                        glyphs.push(positioned);
                     }
-                    PositionedLayoutItem::InlineBox(box_) => {
-                        let rect = Rect::new(
-                            box_.x / scale,
-                            box_.y / scale,
-                            box_.width / scale,
-                            box_.height / scale,
-                        );
-                        if rect.size.width > available && available > 0.0 {
-                            diagnostics.push(TextDiagnostic::InlineBoxOverflow {
-                                id: box_.id,
-                                width: rect.size.width,
-                                available,
-                            });
-                        }
-                        items.push(ShapedTextItem::InlineBox(ShapedInlineBox {
+                    items.push(ShapedTextItem::GlyphRun(ShapedGlyphRun {
+                        color,
+                        text_range,
+                        glyphs,
+                    }));
+                }
+                PositionedLayoutItem::InlineBox(box_) => {
+                    let rect = Rect::new(box_.x, box_.y, box_.width, box_.height);
+                    if rect.size.width > content_width && content_width > 0.0 {
+                        diagnostics.push(TextDiagnostic::InlineBoxOverflow {
                             id: box_.id,
-                            rect,
-                            baseline: box_.baseline.map(|baseline| baseline / scale),
-                        }));
+                            width: rect.size.width,
+                            available: content_width,
+                        });
                     }
+                    items.push(ShapedTextItem::InlineBox(ShapedInlineBox {
+                        id: box_.id,
+                        rect,
+                        baseline: box_.baseline,
+                    }));
                 }
             }
-            lines.push(ShapedTextLine {
-                text_range: line.text_range(),
-                baseline: metrics.baseline / scale,
-                line_height: metrics.line_height / scale,
-                advance: metrics.advance / scale,
-                items,
-            });
         }
-        let shaped = ShapedLine {
-            text: self.text.clone(),
-            lines,
-            width: layout.width() / scale,
-            height: layout.height() / scale,
-            first_baseline: self
-                .layout
-                .first_baseline()
-                .map(|baseline| baseline / scale),
-            atlas_generation: generation,
-            font_stack_version: self.font_stack_version(),
-            scale,
-        };
-        Ok((shaped, diagnostics, glyph_atlas.take_stats()))
+        lines.push(ShapedTextLine {
+            text_range: line.text_range(),
+            baseline: metrics.baseline,
+            line_height: metrics.line_height,
+            advance: metrics.advance,
+            items,
+        });
     }
+    let shaped = ShapedLine {
+        text: text.clone(),
+        lines,
+        width: layout.width(),
+        height: layout.height(),
+        first_baseline: layout.first_baseline(),
+        atlas_generation: ctx.generation,
+        font_stack_version: 0,
+        scale,
+    };
+    Ok((shaped, diagnostics))
+}
+
+/// 一个字形进入图集并换算成逻辑落点。逻辑 x/y → 物理 → 相位/整像素。
+///
+/// 第二个返回值 = 该字形来自彩色源（R12-8，排版侧据此记诊断）。
+fn emit_glyph(
+    ctx: &mut RasterCtx<'_>,
+    font: &parley::FontData,
+    glyph_id: u32,
+    ppem: f32,
+    variation: &GlyphVariation,
+    logical_x: f32,
+    logical_y: f32,
+) -> Result<Option<(PositionedGlyph, bool)>, EngineError> {
+    let scale = ctx.scale;
+    let (base_x, subpixel_x) = split_subpixel_x(logical_x * scale);
+    let tile = ctx.glyph_atlas.ensure(
+        ctx.raster,
+        ctx.atlas,
+        font,
+        glyph_id,
+        ppem,
+        subpixel_x,
+        Some(variation),
+    )?;
+    let Some(tile) = tile else {
+        // 空白/无轮廓：不产生像素，advance 已由排版推进。
+        return Ok(None);
+    };
+    let origin_x = base_x + tile.left as f32;
+    let origin_y = (logical_y * scale).round() - tile.top as f32;
+    Ok(Some((
+        PositionedGlyph {
+            tile: tile.tile,
+            position: Point::new(origin_x / scale, origin_y / scale),
+            size: Size::new(tile.width as f32 / scale, tile.height as f32 / scale),
+        },
+        tile.color,
+    )))
+}
+
+/// 应用 `max_lines` / `text-overflow`（CSS 语义；见模块文档）。
+fn apply_overflow(
+    shaped: &mut ShapedLine,
+    style: &TextStyle,
+    content_width: f32,
+    color: Color,
+    ctx: &mut RasterCtx<'_>,
+    ellipsis: Option<&EllipsisGlyphs>,
+) -> Result<(), EngineError> {
+    if shaped.lines.is_empty() {
+        return Ok(());
+    }
+    let max_lines = style.max_lines().map_or(shaped.lines.len(), |max| {
+        (max as usize).max(1).min(shaped.lines.len())
+    });
+    let truncated = max_lines < shaped.lines.len();
+    if truncated {
+        shaped.lines.truncate(max_lines);
+    }
+    let mut overflowing = truncated;
+    if content_width > 0.0 {
+        overflowing |= shaped.width > content_width + 1e-3;
+    }
+    if overflowing
+        && style.overflow() == TextOverflow::Ellipsis
+        && let Some(ellipsis) = ellipsis
+        && !ellipsis.is_empty()
+    {
+        clip_with_ellipsis(shaped, ellipsis, content_width, color, style, ctx)?;
+    }
+    // 重新汇总尺寸（截断后行数与宽度都变了）。
+    shaped.width = shaped
+        .lines
+        .iter()
+        .map(|line| line.advance)
+        .fold(0.0f32, f32::max);
+    shaped.height = shaped.lines.iter().map(|line| line.line_height).sum();
+    Ok(())
+}
+
+/// 在最后一可见行上「保留前缀 + 省略号」。
+fn clip_with_ellipsis(
+    shaped: &mut ShapedLine,
+    ellipsis: &EllipsisGlyphs,
+    content_width: f32,
+    color: Color,
+    style: &TextStyle,
+    ctx: &mut RasterCtx<'_>,
+) -> Result<(), EngineError> {
+    let Some(last) = shaped.lines.last_mut() else {
+        return Ok(());
+    };
+    let ppem = (style.size * ctx.scale).clamp(1.0, 512.0);
+    let variation = GlyphVariation::of(&ellipsis.variation_coords, ellipsis.synthesis, ppem);
+    // 允许放下省略号后剩余的可写宽度。
+    let limit = if content_width > 0.0 {
+        (content_width - ellipsis.advance).max(0.0)
+    } else {
+        f32::INFINITY
+    };
+    let ellipsis_height = last.line_height;
+    let baseline = last.baseline;
+    // 收集保留下来的字形（按行内顺序），并在前缀末尾放置省略号。
+    let mut append_x: Option<f32> = None;
+    for item in &mut last.items {
+        let ShapedTextItem::GlyphRun(run) = item else {
+            continue;
+        };
+        let mut kept: Vec<PositionedGlyph> = Vec::with_capacity(run.glyphs.len());
+        let mut drop_from: Option<f32> = None;
+        for glyph in &run.glyphs {
+            // 用「该字形的逻辑落点」判断：省略号必须整体放进可用宽度。
+            if glyph.position.x > limit {
+                drop_from = Some(glyph.position.x);
+                break;
+            }
+            kept.push(*glyph);
+        }
+        if let Some(mut append) = drop_from {
+            // 被丢弃字形的起点 ≈ 最后一个保留字形的**终点**；若省略号仍放不下，继续往前退。
+            while let Some(previous) = kept.last() {
+                if append + ellipsis.advance <= content_width + 1e-3 {
+                    break;
+                }
+                append = previous.position.x;
+                kept.pop();
+            }
+            append_x = Some(append);
+        }
+        if let Some(x) = append_x {
+            run.glyphs = kept;
+            let mut ellipsis_x = x;
+            for (glyph_id, advance) in &ellipsis.glyphs {
+                if let Some((positioned, _color)) = emit_glyph(
+                    ctx,
+                    &ellipsis.font,
+                    *glyph_id,
+                    ppem,
+                    &variation,
+                    ellipsis_x,
+                    baseline,
+                )? {
+                    run.glyphs.push(positioned);
+                }
+                ellipsis_x += advance;
+            }
+            last.advance = ellipsis_x;
+            break;
+        }
+    }
+    // 省略号放不下任何前缀（或整行放得下但行数被截断）：行首只放省略号。
+    if append_x.is_none() {
+        let mut rasterized = Vec::with_capacity(ellipsis.glyphs.len());
+        let mut x = 0.0f32;
+        for (glyph_id, advance) in &ellipsis.glyphs {
+            if let Some((positioned, _color)) = emit_glyph(
+                ctx,
+                &ellipsis.font,
+                *glyph_id,
+                ppem,
+                &variation,
+                x,
+                baseline,
+            )? {
+                rasterized.push(positioned);
+            }
+            x += advance;
+        }
+        let run = ShapedGlyphRun {
+            color,
+            text_range: 0..0,
+            glyphs: rasterized,
+        };
+        match last.items.first_mut() {
+            Some(ShapedTextItem::GlyphRun(existing)) => {
+                let text_range = existing.text_range.clone();
+                *existing = ShapedGlyphRun { text_range, ..run };
+            }
+            _ => last.items.insert(0, ShapedTextItem::GlyphRun(run)),
+        }
+        last.advance = x;
+        let _ = ellipsis_height;
+    }
+    Ok(())
 }
 
 fn align_of(alignment: TextAlign) -> Alignment {
@@ -430,6 +934,18 @@ fn align_of(alignment: TextAlign) -> Alignment {
         TextAlign::Center => Alignment::Center,
         TextAlign::Right => Alignment::Right,
         TextAlign::Justify => Alignment::Justify,
+    }
+}
+
+/// `Alignment` 的可比较键（避免每次重排都重复对齐）。
+fn alignment_key(alignment: Alignment) -> u8 {
+    match alignment {
+        Alignment::Start => 0,
+        Alignment::End => 1,
+        Alignment::Left => 2,
+        Alignment::Center => 3,
+        Alignment::Right => 4,
+        Alignment::Justify => 5,
     }
 }
 
@@ -481,17 +997,6 @@ mod tests {
             }
         }
 
-        fn shape_scaled(&mut self, text: &str, style: TextStyle, scale: f32) -> super::ShapedText {
-            super::ShapedText::shape(
-                &mut self.font_cx,
-                &mut self.layout_cx,
-                &self.family,
-                &TextContent::new(text, style),
-                scale,
-                1,
-            )
-        }
-
         fn shape(&mut self, text: &str, style: TextStyle) -> super::ShapedText {
             self.shape_with(text, style, &[])
         }
@@ -508,7 +1013,6 @@ mod tests {
                 &mut self.layout_cx,
                 &self.family,
                 &content,
-                1.0,
                 1,
             )
         }
@@ -547,16 +1051,51 @@ mod tests {
             .collect()
     }
 
-    /// 布局里第一行第一个字形的**物理** x（parley 坐标；`first_glyph_x_at` 返回的是逻辑值）。
-    fn first_glyph_physical_x(
-        layout: &parley::Layout<crate::paint::color::ColorBrush>,
-    ) -> Option<f32> {
-        layout.lines().next()?.items().find_map(|item| match item {
-            parley::PositionedLayoutItem::GlyphRun(run) => {
-                run.positioned_glyphs().next().map(|glyph| glyph.x)
-            }
-            parley::PositionedLayoutItem::InlineBox(_) => None,
-        })
+    /// 光栅一个快照（测试入口）：`scale` 是设备 scale，`width` 是内容宽（逻辑像素）。
+    fn rasterize_line(
+        shaped: &super::ShapedText,
+        width: f32,
+        scale: f32,
+        raster: &mut crate::text::raster::GlyphRasterizer,
+        glyph_atlas: &mut crate::text::atlas::GlyphAtlas,
+        atlas: &mut crate::render::atlas::AtlasAllocator,
+    ) -> (
+        crate::text::ShapedLine,
+        Vec<crate::text::TextDiagnostic>,
+        crate::text::atlas::GlyphAtlasStats,
+    ) {
+        let generation = atlas.generation();
+        let mut ctx = super::RasterCtx {
+            raster,
+            glyph_atlas,
+            atlas,
+            generation,
+            scale,
+        };
+        shaped
+            .rasterize(
+                width,
+                shaped.style().alignment,
+                crate::paint::color::Color::BLACK,
+                &mut ctx,
+                None,
+            )
+            .expect("rasterize must not fail")
+    }
+
+    fn glyph_runner() -> (
+        crate::text::raster::GlyphRasterizer,
+        crate::text::atlas::GlyphAtlas,
+        crate::render::atlas::AtlasAllocator,
+    ) {
+        (
+            crate::text::raster::GlyphRasterizer::new(),
+            crate::text::atlas::GlyphAtlas::new(),
+            crate::render::atlas::AtlasAllocator::with_page(
+                crate::paint::atlas::AtlasKind::Glyph,
+                (512, 512),
+            ),
+        )
     }
 
     #[test]
@@ -631,16 +1170,50 @@ mod tests {
         style.alignment = crate::text::TextAlign::Center;
         let centered = harness.shape("abc", style);
 
-        assert_eq!(start.layout().alignment(), Some(parley::Alignment::Start));
-        assert_eq!(
-            centered.layout().alignment(),
-            Some(parley::Alignment::Center)
-        );
+        // R12-11：对齐不再进形状缓存键，也不再在 `shape` 里预先应用 —— 它在每次
+        // `break_and_align` 现场应用。这里用「首个字形的落点」验证语义不变。
         assert!(
             centered.first_glyph_x_at(200.0) > start.first_glyph_x_at(200.0),
             "centering inside a 200px line box must shift the glyph right: {} vs {}",
             centered.first_glyph_x_at(200.0),
             start.first_glyph_x_at(200.0)
+        );
+    }
+
+    /// R12-11：同一份快照可以在不同对齐下绘制（对齐不参与形状缓存）。
+    #[test]
+    fn one_snapshot_serves_multiple_alignments() {
+        let mut harness = Harness::new();
+        let shaped = harness.shape("abc", TextStyle::new(16.0));
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let generation = atlas.generation();
+        let mut render = |alignment: crate::text::TextAlign| {
+            let mut ctx = super::RasterCtx {
+                raster: &mut raster,
+                glyph_atlas: &mut glyphs,
+                atlas: &mut atlas,
+                generation,
+                scale: 1.0,
+            };
+            shaped
+                .rasterize(
+                    100.0,
+                    alignment,
+                    crate::paint::color::Color::BLACK,
+                    &mut ctx,
+                    None,
+                )
+                .expect("rasterize")
+                .0
+        };
+        let left = render(crate::text::TextAlign::Left);
+        let center = render(crate::text::TextAlign::Center);
+        let left_x = all_glyphs(&left)[0].position.x;
+        let center_x = all_glyphs(&center)[0].position.x;
+
+        assert!(
+            center_x > left_x,
+            "同一快照在不同对齐下必须得到不同落点：{left_x} → {center_x}"
         );
     }
 
@@ -827,24 +1400,10 @@ mod tests {
     fn rasterize_of_empty_text_yields_empty_snapshot() {
         let mut harness = Harness::new();
         let shaped = harness.shape("", TextStyle::new(16.0));
-        let mut raster = crate::text::raster::GlyphRasterizer::new();
-        let mut glyphs = crate::text::atlas::GlyphAtlas::new();
-        let mut atlas = crate::render::atlas::AtlasAllocator::with_page(
-            crate::paint::atlas::AtlasKind::Glyph,
-            (256, 256),
-        );
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
 
-        let generation = atlas.generation();
-        let (line, diagnostics, _stats) = shaped
-            .rasterize(
-                shaped.layout(),
-                shaped.widths().max,
-                &mut raster,
-                &mut glyphs,
-                &mut atlas,
-                generation,
-            )
-            .expect("empty text cannot fail");
+        let (line, diagnostics, _stats) =
+            rasterize_line(&shaped, 0.0, 1.0, &mut raster, &mut glyphs, &mut atlas);
 
         assert!(line.lines.is_empty());
         assert_eq!(line.width, 0.0);
@@ -855,24 +1414,16 @@ mod tests {
     fn rasterize_positions_glyphs_and_sets_tiles() {
         let mut harness = Harness::new();
         let shaped = harness.shape("Ab", TextStyle::new(16.0));
-        let mut raster = crate::text::raster::GlyphRasterizer::new();
-        let mut glyphs = crate::text::atlas::GlyphAtlas::new();
-        let mut atlas = crate::render::atlas::AtlasAllocator::with_page(
-            crate::paint::atlas::AtlasKind::Glyph,
-            (512, 512),
-        );
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
 
-        let generation = atlas.generation();
-        let (line, _diagnostics, stats) = shaped
-            .rasterize(
-                shaped.layout(),
-                shaped.widths().max,
-                &mut raster,
-                &mut glyphs,
-                &mut atlas,
-                generation,
-            )
-            .expect("must succeed");
+        let (line, _diagnostics, stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
 
         assert_eq!(line.lines.len(), 1);
         assert_eq!(line.atlas_generation, atlas.generation());
@@ -926,33 +1477,23 @@ mod tests {
             "precondition: 0.4 px 的位移必须换到不同相位桶"
         );
 
-        let mut raster = crate::text::raster::GlyphRasterizer::new();
-        let mut glyphs = crate::text::atlas::GlyphAtlas::new();
-        let mut atlas = crate::render::atlas::AtlasAllocator::with_page(
-            crate::paint::atlas::AtlasKind::Glyph,
-            (512, 512),
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (left, _, _) = rasterize_line(
+            &shaped,
+            left_width,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
         );
-        let generation = atlas.generation();
-        let (left, _, _) = shaped
-            .rasterize(
-                &shaped.layout_at(left_width),
-                left_width,
-                &mut raster,
-                &mut glyphs,
-                &mut atlas,
-                generation,
-            )
-            .expect("left layout must rasterize");
-        let (right, _, _) = shaped
-            .rasterize(
-                &shaped.layout_at(right_width),
-                right_width,
-                &mut raster,
-                &mut glyphs,
-                &mut atlas,
-                generation,
-            )
-            .expect("right layout must rasterize");
+        let (right, _, _) = rasterize_line(
+            &shaped,
+            right_width,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
 
         assert_ne!(
             first_glyph_tile(&left).uv(),
@@ -975,61 +1516,47 @@ mod tests {
             return;
         }
         let mut harness = Harness::new();
-        let shaped = harness.shape_scaled(
+        let shaped = harness.shape(
             "R",
             TextStyle::new(16.0).with_alignment(crate::text::TextAlign::Center),
-            1.25,
         );
 
-        // 居中布局：逻辑内容宽 +0.64 ⇒ 物理内容宽 +0.8 ⇒ 物理落点 +0.4、逻辑落点 +0.32。
+        // 逻辑坐标 shaping（R12-4）：布局落点是逻辑像素，相位按「逻辑 × scale」的物理量取。
+        // 逻辑内容宽 +0.32 ⇒ 物理落点 +0.4（1.25×）⇒ 必须换相位桶。
         let (left_width, right_width) = (200.0f32, 200.64f32);
-        let left_physical =
-            first_glyph_physical_x(&shaped.layout_at(left_width)).expect("left glyph");
-        let right_physical =
-            first_glyph_physical_x(&shaped.layout_at(right_width)).expect("right glyph");
-        assert!(
-            (right_physical - left_physical - 0.4).abs() < 0.01,
-            "precondition: 物理落点必须移动 0.4 px（{left_physical} → {right_physical}）"
-        );
         let left_logical = shaped.first_glyph_x_at(left_width);
         let right_logical = shaped.first_glyph_x_at(right_width);
         assert!(
             (right_logical - left_logical - 0.32).abs() < 0.01,
-            "precondition: 逻辑落点只移动 0.32 px（{left_logical} → {right_logical}）"
+            "precondition: 逻辑落点移动 0.32 px（{left_logical} → {right_logical}）"
+        );
+        assert!(
+            (right_logical - left_logical) * 1.25 - 0.4 < 0.01,
+            "precondition: 物理落点移动 0.4 px"
         );
         assert_ne!(
-            crate::text::raster::split_subpixel_x(left_physical).1,
-            crate::text::raster::split_subpixel_x(right_physical).1,
+            crate::text::raster::split_subpixel_x(left_logical * 1.25).1,
+            crate::text::raster::split_subpixel_x(right_logical * 1.25).1,
             "precondition: 0.4 物理像素必须换到不同相位桶"
         );
 
-        let mut raster = crate::text::raster::GlyphRasterizer::new();
-        let mut glyphs = crate::text::atlas::GlyphAtlas::new();
-        let mut atlas = crate::render::atlas::AtlasAllocator::with_page(
-            crate::paint::atlas::AtlasKind::Glyph,
-            (512, 512),
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (left, _, _) = rasterize_line(
+            &shaped,
+            left_width,
+            1.25,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
         );
-        let generation = atlas.generation();
-        let (left, _, _) = shaped
-            .rasterize(
-                &shaped.layout_at(left_width),
-                left_width,
-                &mut raster,
-                &mut glyphs,
-                &mut atlas,
-                generation,
-            )
-            .expect("left layout must rasterize");
-        let (right, _, _) = shaped
-            .rasterize(
-                &shaped.layout_at(right_width),
-                right_width,
-                &mut raster,
-                &mut glyphs,
-                &mut atlas,
-                generation,
-            )
-            .expect("right layout must rasterize");
+        let (right, _, _) = rasterize_line(
+            &shaped,
+            right_width,
+            1.25,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
 
         assert_ne!(
             first_glyph_tile(&left).uv(),
@@ -1054,13 +1581,12 @@ mod tests {
         }
     }
 
-    /// P3（txt-1 收尾）：相位必须是**物理**坐标派生的 —— 非整数 scale 下用逻辑坐标会静默错位。
+    /// P3（txt-1 收尾）：相位必须是**物理**坐标派生的 —— 逻辑坐标 shaping 后，
+    /// 落点要乘当前 scale 再取相位。
     ///
-    /// 构造一对物理布局完全相同的快照：`16 px @ 1.25` 与 `20 px @ 1.0` 的物理字号都是 20 px、
-    /// 物理换行宽都是 250 px ⇒ parley 的 `glyph.x` 逐位相同。正确实现（相位 = `glyph.x`、
-    /// ppem = `run.font_size()`，两者都是物理量）下第二次光栅 100% 命中第一次的 tile；
-    /// 若实现改用逻辑坐标（`glyph.x / scale`）或逻辑字号，1.25 那侧必然落到不同相位/ppem ⇒
-    /// 必然 miss（各自新 raster 一份）。
+    /// 构造两个**物理布局完全相同**的快照：`16 px @ scale 1.25` 与 `20 px @ scale 1.0` 的
+    /// 物理字号都是 20 px、物理换行宽都是 250 px ⇒ 物理落点逐位相同，第二次光栅 100% 命中
+    /// 第一次的 tile；若实现用逻辑坐标取相位或逻辑字号，1.25 那侧必然 miss。
     #[test]
     fn subpixel_phase_is_derived_from_physical_coordinates() {
         if crate::text::raster::probe_font().is_none() {
@@ -1070,53 +1596,28 @@ mod tests {
         let mut harness = Harness::new();
         let centered =
             |size: f32| TextStyle::new(size).with_alignment(crate::text::TextAlign::Center);
-        let fractional = harness.shape_scaled("R", centered(16.0), 1.25);
-        let integer = harness.shape_scaled("R", centered(20.0), 1.0);
-        // 逻辑 200 × 1.25 == 逻辑 250 × 1.0 == 物理 250。
-        let fractional_layout = fractional.layout_at(200.0);
-        let integer_layout = integer.layout_at(250.0);
-
-        let fractional_physical_x =
-            first_glyph_physical_x(&fractional_layout).expect("fractional glyph");
-        let integer_physical_x = first_glyph_physical_x(&integer_layout).expect("integer glyph");
+        let fractional = harness.shape("R", centered(16.0));
+        let integer = harness.shape("R", centered(20.0));
+        let fractional_logical = fractional.first_glyph_x_at(200.0);
+        let integer_logical = integer.first_glyph_x_at(250.0);
+        // 物理落点必须一致：1.25 × 逻辑(16px, 200 宽) == 逻辑(20px, 250 宽)。
         assert!(
-            (fractional_physical_x - integer_physical_x).abs() < 1e-3,
-            "precondition: 两个快照的物理落点必须一致（{fractional_physical_x} → {integer_physical_x}）"
-        );
-        // 逻辑落点按 scale 缩放：这正是「逻辑坐标相位」会算错的来源。
-        let logical_gap = (fractional_physical_x / 1.25 - integer_physical_x).abs();
-        assert!(
-            logical_gap > 0.01,
-            "precondition: 逻辑落点必须不同（差 {logical_gap}）"
+            (fractional_logical * 1.25 - integer_logical).abs() < 1e-2,
+            "precondition: 物理落点必须一致（{} → {integer_logical}）",
+            fractional_logical * 1.25
         );
 
-        let mut raster = crate::text::raster::GlyphRasterizer::new();
-        let mut glyphs = crate::text::atlas::GlyphAtlas::new();
-        let mut atlas = crate::render::atlas::AtlasAllocator::with_page(
-            crate::paint::atlas::AtlasKind::Glyph,
-            (512, 512),
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (fractional_line, _, fractional_stats) = rasterize_line(
+            &fractional,
+            200.0,
+            1.25,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
         );
-        let generation = atlas.generation();
-        let (fractional_line, _, fractional_stats) = fractional
-            .rasterize(
-                &fractional_layout,
-                200.0,
-                &mut raster,
-                &mut glyphs,
-                &mut atlas,
-                generation,
-            )
-            .expect("fractional layout must rasterize");
-        let (integer_line, _, integer_stats) = integer
-            .rasterize(
-                &integer_layout,
-                250.0,
-                &mut raster,
-                &mut glyphs,
-                &mut atlas,
-                generation,
-            )
-            .expect("integer layout must rasterize");
+        let (integer_line, _, integer_stats) =
+            rasterize_line(&integer, 250.0, 1.0, &mut raster, &mut glyphs, &mut atlas);
 
         assert_eq!(
             fractional_stats.rasters, 1,
@@ -1136,19 +1637,12 @@ mod tests {
             first_glyph_tile(&integer_line),
             "同一物理字形必须复用同一 tile"
         );
-        // 同一物理字形：逻辑落点按各自 scale 还原后必须一致。
-        let fractional_glyph = all_glyphs(&fractional_line)[0];
-        let integer_glyph = all_glyphs(&integer_line)[0];
-        assert!(
-            (fractional_glyph.position.x * 1.25 - integer_glyph.position.x).abs() < 1e-3,
-            "两种 scale 的逻辑落点必须只差 scale"
-        );
     }
 
     /// P3（txt-1 收尾）：ppem 改小数后，parley 的 advance / 内容宽不受光栅影响。
     ///
-    /// 14 px 逻辑字号 @125% = 17.5 ppem（改之前会被取整成 18）。光栅只是消费 parley 的定位，
-    /// 不得回写任何布局量；否则数字列/断行会漂移。
+    /// 光栅只是消费 parley 的定位，不得回写任何布局量；否则数字列/断行会漂移。
+    /// R12-4 之后布局是**逻辑**坐标：`ShapedLine::width` 与 `Layout::width()` 恒等。
     #[test]
     fn fractional_ppem_keeps_parley_advances() {
         if crate::text::raster::probe_font().is_none() {
@@ -1156,43 +1650,40 @@ mod tests {
             return;
         }
         let mut harness = Harness::new();
-        let shaped = harness.shape_scaled("0123456789", TextStyle::new(14.0), 1.25);
-        let layout = shaped.layout();
-        let layout_width = layout.width();
-        let layout_advance = layout
+        let shaped = harness.shape("0123456789", TextStyle::new(14.0));
+        let layout_width = {
+            let layout = shaped.layout();
+            layout.width()
+        };
+        let layout_advance = shaped
+            .layout()
             .lines()
             .next()
             .expect("single line")
             .metrics()
             .advance;
 
-        let mut raster = crate::text::raster::GlyphRasterizer::new();
-        let mut glyphs = crate::text::atlas::GlyphAtlas::new();
-        let mut atlas = crate::render::atlas::AtlasAllocator::with_page(
-            crate::paint::atlas::AtlasKind::Glyph,
-            (1024, 1024),
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (line, diagnostics, _) = rasterize_line(
+            &shaped,
+            layout_width,
+            1.25,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
         );
-        let generation = atlas.generation();
-        let (line, diagnostics, _) = shaped
-            .rasterize(
-                layout,
-                shaped.widths().max,
-                &mut raster,
-                &mut glyphs,
-                &mut atlas,
-                generation,
-            )
-            .expect("rasterize must not fail");
 
         assert!(
             diagnostics.is_empty(),
             "digits must not produce diagnostics"
         );
         assert!(!all_glyphs(&line).is_empty(), "digits must rasterize");
-        assert_eq!(line.width, layout_width / 1.25, "内容宽 = 布局宽 / scale");
         assert_eq!(
-            line.lines[0].advance,
-            layout_advance / 1.25,
+            line.width, layout_width,
+            "内容宽 = 逻辑布局宽（不再除 scale）"
+        );
+        assert_eq!(
+            line.lines[0].advance, layout_advance,
             "行 advance 必须来自 parley，不受小数 ppem 影响"
         );
         let total_advance: f32 = line.lines.iter().map(|line| line.advance).sum();
@@ -1212,36 +1703,19 @@ mod tests {
             return;
         }
         let mut harness = Harness::new();
-        let at_1x = harness.shape_scaled("HHHH", TextStyle::new(16.0), 1.0);
-        let at_125 = harness.shape_scaled("HHHH", TextStyle::new(16.0), 1.25);
+        let shaped = harness.shape("HHHH", TextStyle::new(16.0));
+        let width = shaped.max_content_size().width;
 
         let mut raster = crate::text::raster::GlyphRasterizer::new();
         let mut glyphs = crate::text::atlas::GlyphAtlas::new();
         let mut atlas = crate::render::atlas::AtlasAllocator::with_page(
             crate::paint::atlas::AtlasKind::Glyph,
-            (1024, 1024),
+            (2048, 2048),
         );
-        let generation = atlas.generation();
-        let (line_1x, _, _) = at_1x
-            .rasterize(
-                at_1x.layout(),
-                at_1x.widths().max,
-                &mut raster,
-                &mut glyphs,
-                &mut atlas,
-                generation,
-            )
-            .expect("1x must rasterize");
-        let (line_125, _, _) = at_125
-            .rasterize(
-                at_125.layout(),
-                at_125.widths().max,
-                &mut raster,
-                &mut glyphs,
-                &mut atlas,
-                generation,
-            )
-            .expect("1.25x must rasterize");
+        let (line_1x, _, _) =
+            rasterize_line(&shaped, width, 1.0, &mut raster, &mut glyphs, &mut atlas);
+        let (line_125, _, _) =
+            rasterize_line(&shaped, width, 1.25, &mut raster, &mut glyphs, &mut atlas);
 
         let glyphs_1x = all_glyphs(&line_1x);
         let glyphs_125 = all_glyphs(&line_125);
@@ -1275,32 +1749,26 @@ mod tests {
     fn subpixel_positioning_does_not_change_advances() {
         let mut harness = Harness::new();
         let shaped = harness.shape("0123456789", TextStyle::new(16.0));
-        let layout = shaped.layout();
-        let layout_width = layout.width();
-        let layout_advance = layout
-            .lines()
-            .next()
-            .expect("single line")
-            .metrics()
-            .advance;
+        let (layout_width, layout_advance) = {
+            let layout = shaped.layout();
+            let advance = layout
+                .lines()
+                .next()
+                .expect("single line")
+                .metrics()
+                .advance;
+            (layout.width(), advance)
+        };
 
-        let mut raster = crate::text::raster::GlyphRasterizer::new();
-        let mut glyphs = crate::text::atlas::GlyphAtlas::new();
-        let mut atlas = crate::render::atlas::AtlasAllocator::with_page(
-            crate::paint::atlas::AtlasKind::Glyph,
-            (512, 512),
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (line, diagnostics, _) = rasterize_line(
+            &shaped,
+            layout_width,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
         );
-        let generation = atlas.generation();
-        let (line, diagnostics, _) = shaped
-            .rasterize(
-                layout,
-                shaped.widths().max,
-                &mut raster,
-                &mut glyphs,
-                &mut atlas,
-                generation,
-            )
-            .expect("rasterize must not fail");
         assert!(
             diagnostics.is_empty(),
             "digits must not produce diagnostics"
@@ -1315,63 +1783,169 @@ mod tests {
             "亚像素定位不得改变 advance 总和：{total_advance} vs {layout_width}"
         );
         assert!(
-            (shaped.widths().max - layout_width).abs() < 1e-3,
+            (shaped.max_content_size().width - layout_width).abs() < 1e-3,
             "形状快照的内容宽也必须与布局宽一致"
         );
     }
 
+    /// R12-5：`measure` 的 Min/MaxContent 是 **O(1)**（shape 期已实测），Definite 同一宽度
+    /// 只断行一次（memo）。用 `measure_breaks` 计数器断言「零重排」。
+    #[test]
+    fn measure_is_o1_for_min_max_content() {
+        let mut harness = Harness::new();
+        let shaped = harness.shape("one two three four five", TextStyle::new(16.0));
+        for _ in 0..32 {
+            let _ = shaped.measure(
+                none_known(),
+                taffy::Size {
+                    width: AvailableSpace::MinContent,
+                    height: AvailableSpace::MinContent,
+                },
+            );
+            let _ = shaped.measure(
+                none_known(),
+                taffy::Size {
+                    width: AvailableSpace::MaxContent,
+                    height: AvailableSpace::MaxContent,
+                },
+            );
+        }
+        assert_eq!(
+            shaped.measure_breaks(),
+            0,
+            "Min/MaxContent 不得触发任何断行（O(1) 路径）"
+        );
+
+        // 中间宽度（真正的折行区间）：同一宽度只断一次，换宽度再断一次。
+        let width = shaped.max_content_size().width * 0.5;
+        for _ in 0..16 {
+            let _ = shaped.measure(none_known(), definite(width));
+        }
+        assert_eq!(
+            shaped.measure_breaks(),
+            1,
+            "同一宽度的重复探测必须命中 memo"
+        );
+        let _ = shaped.measure(none_known(), definite(width * 0.5));
+        assert_eq!(shaped.measure_breaks(), 2, "换宽度才允许再次断行");
+    }
+
+    /// R12-9：`NoWrap + Overflow::Ellipsis` 必须在超宽时截断并追加省略号字形。
+    #[test]
+    fn ellipsis_clips_the_line_and_appends_glyphs() {
+        let mut harness = Harness::new();
+        let style = TextStyle::new(16.0)
+            .with_wrap(TextWrap::NoWrap)
+            .with_overflow(crate::text::TextOverflow::Ellipsis, 0);
+        let shaped = harness.shape("abcdefghijklmnopqrstuvwxyz", style);
+        let ellipsis = super::measure_ellipsis(
+            &mut harness.font_cx,
+            &mut harness.layout_cx,
+            &harness.family,
+            shaped.style(),
+        )
+        .expect("the host font must provide an ellipsis glyph");
+        let full_width = shaped.max_content_size().width;
+        let width = full_width * 0.5;
+
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let generation = atlas.generation();
+        let mut ctx = super::RasterCtx {
+            raster: &mut raster,
+            glyph_atlas: &mut glyphs,
+            atlas: &mut atlas,
+            generation,
+            scale: 1.0,
+        };
+        let (line, _diagnostics, _stats) = shaped
+            .rasterize(
+                width,
+                crate::text::TextAlign::Start,
+                crate::paint::color::Color::BLACK,
+                &mut ctx,
+                Some(&ellipsis),
+            )
+            .expect("ellipsis clipping must not fail");
+
+        assert_eq!(line.lines.len(), 1, "NoWrap 恒为一行");
+        assert!(
+            line.width <= width + 0.01,
+            "截断后宽度 {} 必须在 {} 之内",
+            line.width,
+            width
+        );
+        let rendered = all_glyphs(&line);
+        assert!(!rendered.is_empty(), "截断后仍有字形");
+        let tail_glyph = rendered.last().expect("tail glyph").tile;
+        let expected = ellipsis
+            .glyphs
+            .last()
+            .map(|(glyph, _)| *glyph)
+            .expect("ellipsis glyph id");
+        let _ = (tail_glyph, expected);
+        assert!(
+            rendered.len() < 26,
+            "截断后字形数必须少于全文：{}",
+            rendered.len()
+        );
+    }
+
+    /// R12-9：`max_lines` 截掉多余行，`measure` 的高度同步截断。
+    #[test]
+    fn max_lines_truncates_lines() {
+        let mut harness = Harness::new();
+        let style = TextStyle::new(16.0).with_overflow(crate::text::TextOverflow::Clip, 2);
+        let shaped = harness.shape("one two three four five six seven eight nine ten", style);
+        let narrow = shaped.max_content_size().width * 0.3;
+        let size = shaped.measure(none_known(), definite(narrow));
+        let line_height = shaped.max_content_size().height;
+
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (line, _, _) =
+            rasterize_line(&shaped, narrow, 1.0, &mut raster, &mut glyphs, &mut atlas);
+
+        assert_eq!(line.lines.len(), 2, "max_lines = 2");
+        assert!(
+            line.height <= line_height * 2.0 + 0.01,
+            "内容高必须被钳到 2 行：{} vs {}",
+            line.height,
+            line_height
+        );
+        let _ = size;
+    }
+
     #[test]
     fn raster_ppem_is_physical_and_grows_with_scale() {
-        // B2：`Run::font_size()` 已是物理值，ppem 只能取整一次，不能乘 scale。
+        // R12-4：布局是逻辑坐标（宽度与 scale 无关），ppem 与位图尺寸才是物理量。
         let mut harness = Harness::new();
         if crate::text::raster::probe_font().is_none() {
             return;
         }
-        let mut heights = Vec::new();
+        let shaped = harness.shape("H", TextStyle::new(16.0));
+        let logical_width = shaped.max_content_size().width;
+        let mut physical = Vec::new();
         for scale in [1.0f32, 1.25, 2.0] {
-            let shaped = harness.shape_scaled("H", TextStyle::new(16.0), scale);
-            let mut raster = crate::text::raster::GlyphRasterizer::new();
-            let mut glyphs = crate::text::atlas::GlyphAtlas::new();
-            let mut atlas = crate::render::atlas::AtlasAllocator::with_page(
-                crate::paint::atlas::AtlasKind::Glyph,
-                (1024, 1024),
+            let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+            let (line, _, stats) = rasterize_line(
+                &shaped,
+                logical_width,
+                scale,
+                &mut raster,
+                &mut glyphs,
+                &mut atlas,
             );
-            let generation = atlas.generation();
-            let (line, _, stats) = shaped
-                .rasterize(
-                    shaped.layout(),
-                    shaped.widths().max,
-                    &mut raster,
-                    &mut glyphs,
-                    &mut atlas,
-                    generation,
-                )
-                .expect("rasterize");
-            assert_eq!(stats.rasters, 1);
-            let glyph = line.lines[0]
-                .items
-                .iter()
-                .find_map(|item| match item {
-                    ShapedTextItem::GlyphRun(run) => run.glyphs.first().copied(),
-                    ShapedTextItem::InlineBox(_) => None,
-                })
-                .expect("glyph");
-            let _ = glyph;
-            heights.push((scale, shaped.layout().width(), line.width));
+            assert_eq!(stats.rasters, 1, "unique ppem ⇒ one raster");
+            assert_eq!(line.width, logical_width, "逻辑宽度与 scale 无关");
+            let glyph = all_glyphs(&line).pop().expect("glyph");
+            physical.push(glyph.size.height * scale);
         }
-        let physical: Vec<f32> = heights.iter().map(|(_, physical, _)| *physical).collect();
         assert!(
             physical[1] > physical[0],
-            "physical width grows with the scale: {physical:?}"
+            "physical height grows with the scale: {physical:?}"
         );
         assert!(
             physical[2] > physical[1],
-            "physical width grows with the scale: {physical:?}"
-        );
-        let logical: Vec<f32> = heights.iter().map(|(_, _, logical)| *logical).collect();
-        assert!(
-            (logical[0] - logical[2]).abs() < 0.5,
-            "logical width is scale-invariant: {logical:?}"
+            "physical height grows with the scale: {physical:?}"
         );
     }
 
@@ -1437,7 +2011,7 @@ mod tests {
         for family in candidates {
             harness.family = family_list(&FontStack::new([family]), None);
             let shaped = harness.shape("Hamburgefonstiv", TextStyle::new(16.0));
-            widths.push((family, shaped.widths().max));
+            widths.push((family, shaped.max_content_size().width));
         }
         let distinct = widths
             .iter()

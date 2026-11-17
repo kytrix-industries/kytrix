@@ -31,21 +31,24 @@ const ENTRY_LIMIT: usize = 1024;
 /// 8 MiB 在多窗口 + CJK 场景下会过早逐出。
 const BYTE_BUDGET: usize = 16 * 1024 * 1024;
 
-/// 形状缓存键：文本哈希 + 样式哈希 + scale 位模式 + 字体栈版本。
+/// 形状缓存键：文本哈希 + 样式哈希 + 字体栈版本。
 ///
-/// 命中后仍要比较 `text`/`style`（防哈希碰撞），比较对象是缓存条目里的 `ShapedText`。
+/// **不含** `scale`（R12-4：逻辑坐标 shaping，DPI 变化不再清缓存）、**不含** `color` /
+/// `alignment`（R12-11：两者不影响 glyph id / advance / 断行）。
+///
+/// 命中后仍要比较 `text`/`style`（防哈希碰撞），比较对象是缓存条目里的 `ShapedText`；
+/// 等价关系必须与键一致 —— 见 `TextStyle::same_shaping_inputs`。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ShapeKey {
     text_hash: u64,
     text_len: u32,
     style_hash: u64,
-    scale_bits: u32,
     font_stack_version: u32,
 }
 
 impl ShapeKey {
-    /// 由内容 + 设备 scale + 字体栈版本构造。
-    pub(crate) fn new(content: &TextContent, scale: f32, font_stack_version: u32) -> Self {
+    /// 由内容 + 字体栈版本构造。
+    pub(crate) fn new(content: &TextContent, font_stack_version: u32) -> Self {
         let mut text_hasher = AHasher::default();
         text_hasher.write(content.text.as_bytes());
         let mut style_hasher = AHasher::default();
@@ -62,7 +65,6 @@ impl ShapeKey {
             text_hash: text_hasher.finish(),
             text_len: content.text.len() as u32,
             style_hash: style_hasher.finish(),
-            scale_bits: scale.to_bits(),
             font_stack_version,
         }
     }
@@ -156,31 +158,92 @@ mod tests {
     use crate::text::{TextContent, TextStyle, TextWrap};
 
     #[test]
-    fn shape_key_distinguishes_scale_and_stack_version() {
+    fn shape_key_distinguishes_stack_version() {
         let content = TextContent::new("hello", TextStyle::new(16.0));
-        let base = ShapeKey::new(&content, 1.0, 1);
+        let base = ShapeKey::new(&content, 1);
 
-        assert_eq!(base, ShapeKey::new(&content, 1.0, 1));
+        assert_eq!(base, ShapeKey::new(&content, 1));
         assert_ne!(
             base,
-            ShapeKey::new(&content, 1.25, 1),
-            "scale is part of the key"
-        );
-        assert_ne!(
-            base,
-            ShapeKey::new(&content, 1.0, 2),
+            ShapeKey::new(&content, 2),
             "stack version is part of the key"
         );
+    }
+
+    /// R12-11：颜色与对齐不是 shaping 输入 ⇒ 不进缓存键（红/绿两态共享一份快照）。
+    #[test]
+    fn shape_key_ignores_color_and_alignment() {
+        use crate::{paint::color::Color, text::TextAlign};
+
+        let base = TextContent::new("1,234.56", TextStyle::new(13.0));
+        let red = TextContent::new(
+            "1,234.56",
+            TextStyle::new(13.0).with_color(Color::Srgb {
+                r: 1.0,
+                g: 0.0,
+                b: 0.0,
+                alpha: 1.0,
+            }),
+        );
+        let centered = TextContent::new(
+            "1,234.56",
+            TextStyle::new(13.0).with_alignment(TextAlign::Center),
+        );
+
+        assert_eq!(ShapeKey::new(&base, 1), ShapeKey::new(&red, 1));
+        assert_eq!(ShapeKey::new(&base, 1), ShapeKey::new(&centered, 1));
+        assert!(
+            base.style.same_shaping_inputs(&red.style),
+            "命中判据必须与键的等价关系一致"
+        );
+        assert!(base.style.same_shaping_inputs(&centered.style));
+    }
+
+    /// R12-10：新增的 shaping 输入必须参与缓存键（否则历史条目会被静默误命中）。
+    #[test]
+    fn shape_key_distinguishes_new_shaping_inputs() {
+        use crate::text::{TextFontVariation, TextLineBreak};
+
+        let base = TextContent::new("1,234.56", TextStyle::new(13.0));
+        let locale = TextContent::new("1,234.56", TextStyle::new(13.0).with_locale("zh-Hans"));
+        let stretched = TextContent::new("1,234.56", TextStyle::new(13.0).with_stretch(80));
+        let spaced = TextContent::new("1,234.56", TextStyle::new(13.0).with_word_spacing(2.0));
+        let line_break = TextContent::new(
+            "1,234.56",
+            TextStyle::new(13.0).with_line_break(TextLineBreak::Loose),
+        );
+        let variations = TextContent::new(
+            "1,234.56",
+            TextStyle::new(13.0).with_font_variations([TextFontVariation::new(*b"wght", 700.0)]),
+        );
+
+        let base_key = ShapeKey::new(&base, 1);
+        for (name, content) in [
+            ("locale", &locale),
+            ("stretch", &stretched),
+            ("word_spacing", &spaced),
+            ("line_break", &line_break),
+            ("font_variations", &variations),
+        ] {
+            assert_ne!(
+                base_key,
+                ShapeKey::new(content, 1),
+                "{name} 必须参与形状缓存键"
+            );
+            assert!(
+                !base.style.same_shaping_inputs(&content.style),
+                "{name} 必须让命中判据失配"
+            );
+        }
     }
 
     #[test]
     fn shape_key_distinguishes_text_and_style() {
         let style = TextStyle::new(16.0);
-        let a = ShapeKey::new(&TextContent::new("ab", style.clone()), 1.0, 1);
-        let b = ShapeKey::new(&TextContent::new("ba", style.clone()), 1.0, 1);
+        let a = ShapeKey::new(&TextContent::new("ab", style.clone()), 1);
+        let b = ShapeKey::new(&TextContent::new("ba", style.clone()), 1);
         let c = ShapeKey::new(
             &TextContent::new("ab", style.with_wrap(TextWrap::NoWrap)),
-            1.0,
             1,
         );
 
@@ -203,8 +266,8 @@ mod tests {
         );
 
         assert_ne!(
-            ShapeKey::new(&plain, 1.0, 1),
-            ShapeKey::new(&tabular, 1.0, 1),
+            ShapeKey::new(&plain, 1),
+            ShapeKey::new(&tabular, 1),
             "font_features 必须参与缓存键"
         );
         // 同样的特性集 ⇒ 同一个键（顺序与内容都相同）。
@@ -212,9 +275,6 @@ mod tests {
             "12345",
             TextStyle::new(16.0).with_font_features([TextFeature::TABULAR_NUMBERS]),
         );
-        assert_eq!(
-            ShapeKey::new(&tabular, 1.0, 1),
-            ShapeKey::new(&again, 1.0, 1)
-        );
+        assert_eq!(ShapeKey::new(&tabular, 1), ShapeKey::new(&again, 1));
     }
 }

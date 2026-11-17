@@ -161,16 +161,16 @@ mod showcase_tests {
         // 色块 2 的中心：卡片原点 + 卡片内 (202,42,150,88)。
         let card = crate::scene::FOCUS_CARD.origin;
         let center = Point::new(card.x + 202.0 + 75.0, card.y + 42.0 + 44.0);
-        let _ = test.inject(InputEvent::PointerDown {
-            position: center,
-            button: PointerButton::Primary,
-            modifiers: Modifiers::empty(),
-        });
-        let _ = test.inject(InputEvent::PointerUp {
-            position: center,
-            button: PointerButton::Primary,
-            modifiers: Modifiers::empty(),
-        });
+        let _ = test.inject(InputEvent::pointer_down(
+            center,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        let _ = test.inject(InputEvent::pointer_up(
+            center,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
         frame(&mut test);
 
         let focused = test

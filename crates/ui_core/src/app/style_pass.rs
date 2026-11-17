@@ -6,7 +6,7 @@ use smallvec::{SmallVec, smallvec};
 
 use super::{App, StylePassReport};
 use crate::{
-    event::{Action, Key, KeyBinding, Modifiers},
+    event::{Action, KeyBinding, KeyCode, Modifiers},
     interaction::ActionCtx,
     node::{
         dependency::{Owner, ReadCtx, ReadTracker},
@@ -47,7 +47,7 @@ pub(crate) fn bind_key(app: &mut App, binding: KeyBinding) {
 
 /// 删除一条键盘绑定（返回是否真的删了）。
 /// 消费者：`App::unbind_key`。
-pub(crate) fn unbind_key(app: &mut App, key: Key, modifiers: Modifiers) -> bool {
+pub(crate) fn unbind_key(app: &mut App, key: KeyCode, modifiers: Modifiers) -> bool {
     let before = app.bindings.len();
     app.bindings
         .retain(|binding| !(binding.key == key && binding.modifiers == modifiers));

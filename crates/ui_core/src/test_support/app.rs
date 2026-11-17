@@ -170,8 +170,13 @@ impl TestApp {
     }
 
     /// 注入一个输入事件：走**与平台泵相同**的 `App::dispatch_input`（命中 / 焦点 / 拖拽 / 动作 / 滚动）。
+    ///
+    /// 事件时间戳被换成**可控时钟**（`App::clock`）：双击窗口、连击计数与拖拽判定都以事件时刻
+    /// 为基准（R02-14），不这样做测试就无法用 `advance` 模拟「两次点击间隔 1 秒」。
     pub fn inject(&mut self, event: InputEvent) -> InputOutcome {
-        self.app.dispatch_input(self.window, event)
+        let stamp = self.app.clock();
+        self.app
+            .dispatch_input(self.window, event.with_timestamp(stamp))
     }
 
     /// 推进测试时钟（双击窗口 / 动画 / 拖拽时间都读它；不改任何状态）。
@@ -363,7 +368,7 @@ mod tests {
         math::{Point, Rect, Scale},
         node::builder::NodeBuilder,
         paint::{
-            color::{Color, ColorResolver, Interpolation, LinearPremulRgba},
+            color::{Color, ColorResolver, LinearPremulRgba},
             style::{PaintSpec, StylePatch},
         },
         test_support::{
@@ -454,8 +459,7 @@ mod tests {
         assert_eq!(rendered.quads.len(), 1);
         let quad = rendered.quads[0];
         assert_eq!(quad.bounds, RECT);
-        let expected: LinearPremulRgba =
-            ColorResolver::new(Interpolation::default()).resolve(Color::WHITE);
+        let expected: LinearPremulRgba = ColorResolver.resolve(Color::WHITE);
         assert_eq!(quad.fill, expected);
         assert!(quad.border.is_none());
         assert!(
@@ -699,7 +703,7 @@ mod tests {
 mod p10_tests {
     use super::TestApp;
     use crate::{
-        event::{Action, InputEvent, Key, KeyState, Modifiers, PointerButton},
+        event::{Action, InputEvent, KeyCode, Modifiers, PointerButton},
         math::{Point, Rect},
         node::builder::NodeBuilder,
         paint::style::{Clip, PaintSpec, Style, StylePatch},
@@ -727,16 +731,16 @@ mod p10_tests {
     #[test]
     fn inject_click_reports_the_action_and_the_target() {
         let (mut app, node) = app_with_button();
-        app.inject(InputEvent::PointerDown {
-            position: Point::new(20.0, 20.0),
-            button: PointerButton::Primary,
-            modifiers: Modifiers::empty(),
-        });
-        let outcome = app.inject(InputEvent::PointerUp {
-            position: Point::new(20.0, 20.0),
-            button: PointerButton::Primary,
-            modifiers: Modifiers::empty(),
-        });
+        app.inject(InputEvent::pointer_down(
+            Point::new(20.0, 20.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        let outcome = app.inject(InputEvent::pointer_up(
+            Point::new(20.0, 20.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
 
         assert_eq!(outcome.hit.map(|hit| hit.node), Some(node));
         assert_eq!(outcome.action, Some(Action::custom("press")));
@@ -806,16 +810,16 @@ mod p10_tests {
     fn inject_double_click_reports_two() {
         let (mut app, node) = app_with_button();
         let click = |app: &mut TestApp| {
-            app.inject(InputEvent::PointerDown {
-                position: Point::new(20.0, 20.0),
-                button: PointerButton::Primary,
-                modifiers: Modifiers::empty(),
-            });
-            app.inject(InputEvent::PointerUp {
-                position: Point::new(20.0, 20.0),
-                button: PointerButton::Primary,
-                modifiers: Modifiers::empty(),
-            })
+            app.inject(InputEvent::pointer_down(
+                Point::new(20.0, 20.0),
+                PointerButton::Primary,
+                Modifiers::empty(),
+            ));
+            app.inject(InputEvent::pointer_up(
+                Point::new(20.0, 20.0),
+                PointerButton::Primary,
+                Modifiers::empty(),
+            ))
         };
 
         assert_eq!(click(&mut app).click_count, 1);
@@ -862,11 +866,7 @@ mod p10_tests {
     fn tab_focus_is_visible_through_the_probe() {
         let (_app_unused, _node_unused) = app_with_button();
         let (mut app, node) = app_with_button();
-        app.inject(InputEvent::Key {
-            key: Key::Tab,
-            state: KeyState::Down,
-            modifiers: Modifiers::empty(),
-        });
+        app.inject(InputEvent::key_down(KeyCode::Tab, Modifiers::empty()));
         assert_eq!(app.app().focused(app.window_id()), Some(node));
         assert!(
             !app.app()

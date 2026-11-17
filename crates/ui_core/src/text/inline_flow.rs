@@ -18,7 +18,6 @@ use crate::{math::Rect, paint::color::ColorBrush};
 pub(crate) fn to_inline_box(
     spec: &InlineBoxSpec,
     text: &str,
-    scale: f32,
 ) -> (InlineBox, Option<TextDiagnostic>) {
     let (index, diagnostic) = if spec.index <= text.len() && text.is_char_boundary(spec.index) {
         (spec.index, None)
@@ -31,13 +30,14 @@ pub(crate) fn to_inline_box(
             }),
         )
     };
+    // 逻辑坐标（R12-4）：行内盒尺寸/基线与文本一样用逻辑像素，scale 只在光栅/落点阶段相乘。
     let inline_box = InlineBox {
         id: spec.id,
         kind: InlineBoxKind::InFlow,
         index,
-        width: spec.size.width * scale,
-        height: spec.size.height * scale,
-        baseline: spec.baseline.map(|baseline| baseline * scale),
+        width: spec.size.width,
+        height: spec.size.height,
+        baseline: spec.baseline,
         vertical_align: vertical_align(spec.align),
     };
     (inline_box, diagnostic)
@@ -73,7 +73,6 @@ pub(crate) fn selection_rects(
     layout: &parley::Layout<ColorBrush>,
     anchor: usize,
     focus: usize,
-    scale: f32,
 ) -> Vec<Rect> {
     let anchor_cursor = Cursor::from_byte_index(layout, anchor, Affinity::Downstream);
     let focus_cursor = Cursor::from_byte_index(layout, focus, Affinity::Upstream);
@@ -84,28 +83,23 @@ pub(crate) fn selection_rects(
     selection
         .geometry(layout)
         .into_iter()
-        .map(|(bounds, _line)| to_rect(bounds, scale))
+        .map(|(bounds, _line): (BoundingBox, usize)| to_rect(bounds))
         .collect()
 }
 
 /// `byte_index` 处的 caret 矩形（文本盒局部逻辑像素，宽 1 逻辑像素）。
-pub(crate) fn caret_rect(
-    layout: &parley::Layout<ColorBrush>,
-    byte_index: usize,
-    scale: f32,
-) -> Rect {
-    let width = if scale > 0.0 { scale } else { 1.0 };
+pub(crate) fn caret_rect(layout: &parley::Layout<ColorBrush>, byte_index: usize) -> Rect {
     let cursor = Cursor::from_byte_index(layout, byte_index, Affinity::Downstream);
-    to_rect(cursor.geometry(layout, width), scale)
+    to_rect(cursor.geometry(layout, 1.0))
 }
 
-fn to_rect(bounds: BoundingBox, scale: f32) -> Rect {
-    let scale = f64::from(if scale > 0.0 { scale } else { 1.0 });
+/// parley 的 bounding box → 逻辑像素矩形（布局本身已是逻辑坐标，R12-4）。
+fn to_rect(bounds: BoundingBox) -> Rect {
     Rect::new(
-        (bounds.x0 / scale) as f32,
-        (bounds.y0 / scale) as f32,
-        ((bounds.x1 - bounds.x0) / scale) as f32,
-        ((bounds.y1 - bounds.y0) / scale) as f32,
+        bounds.x0 as f32,
+        bounds.y0 as f32,
+        (bounds.x1 - bounds.x0) as f32,
+        (bounds.y1 - bounds.y0) as f32,
     )
 }
 
@@ -128,19 +122,15 @@ mod tests {
         }
     }
 
-    /// 直接建一个 parley 布局（不经过 `ShapedText`，避免测试互相依赖）。
+    /// 直接建一个 parley 布局（不经过 `ShapedText`，避免测试互相依赖）；逻辑坐标（scale = 1）。
     fn layout_of(text: &str) -> parley::Layout<ColorBrush> {
-        layout_of_scaled(text, 1.0)
-    }
-
-    fn layout_of_scaled(text: &str, scale: f32) -> parley::Layout<ColorBrush> {
         let mut font_cx = parley::FontContext::new();
         let mut layout_cx: parley::LayoutContext<ColorBrush> = parley::LayoutContext::new();
-        let mut builder = layout_cx.ranged_builder(&mut font_cx, text, scale, true);
+        let mut builder = layout_cx.ranged_builder(&mut font_cx, text, 1.0, true);
         builder.push_default(parley::StyleProperty::FontSize(16.0));
         builder.push_default(parley::StyleProperty::Brush(ColorBrush::default()));
         let mut layout = builder.build(text);
-        layout.break_all_lines(Some(400.0 * scale));
+        layout.break_all_lines(Some(400.0));
         layout.align(
             parley::Alignment::Start,
             parley::AlignmentOptions::default(),
@@ -165,10 +155,10 @@ mod tests {
 
     #[test]
     fn inline_box_converts_units_and_reports_off_boundary() {
-        let (inline_box, diagnostic) = to_inline_box(&spec(2), "a中b", 2.0);
+        let (inline_box, diagnostic) = to_inline_box(&spec(2), "a中b");
 
-        assert_eq!(inline_box.width, 20.0);
-        assert_eq!(inline_box.height, 20.0);
+        assert_eq!(inline_box.width, 10.0, "逻辑像素：不再乘 scale（R12-4）");
+        assert_eq!(inline_box.height, 10.0);
         assert_eq!(inline_box.index, 1, "snapped back to a boundary");
         assert!(matches!(
             diagnostic,
@@ -180,9 +170,9 @@ mod tests {
     fn inline_box_keeps_baseline_scaled_and_needs_no_diagnostic() {
         let mut spec = spec(0);
         spec.baseline = Some(4.0);
-        let (inline_box, diagnostic) = to_inline_box(&spec, "x", 2.0);
+        let (inline_box, diagnostic) = to_inline_box(&spec, "x");
 
-        assert_eq!(inline_box.baseline, Some(8.0));
+        assert_eq!(inline_box.baseline, Some(4.0), "基线也是逻辑像素");
         assert_eq!(inline_box.index, 0);
         assert!(diagnostic.is_none());
     }
@@ -220,7 +210,7 @@ mod tests {
     #[test]
     fn selection_rects_cover_the_requested_range() {
         let layout = layout_of("abcdef");
-        let rects = selection_rects(&layout, 0, 3, 1.0);
+        let rects = selection_rects(&layout, 0, 3);
 
         assert_eq!(rects.len(), 1);
         assert!(rects[0].origin.x.abs() < 0.01);
@@ -232,7 +222,7 @@ mod tests {
     fn selection_rects_are_empty_for_a_collapsed_range() {
         let layout = layout_of("abcdef");
 
-        assert!(selection_rects(&layout, 2, 2, 1.0).is_empty());
+        assert!(selection_rects(&layout, 2, 2).is_empty());
     }
 
     #[test]
@@ -240,23 +230,25 @@ mod tests {
         let layout = layout_of("abcdef");
 
         assert_eq!(
-            selection_rects(&layout, 0, 4, 1.0),
-            selection_rects(&layout, 4, 0, 1.0)
+            selection_rects(&layout, 0, 4),
+            selection_rects(&layout, 4, 0)
         );
     }
 
+    /// R12-4：布局是逻辑坐标 ⇒ 选区几何**不再除以 scale**（旧实现把物理坐标除回逻辑）。
+    ///
+    /// 这里用「同一布局的 caret 位移」做交叉验证：选区右边界必须等于 focus 处的 caret x。
     #[test]
-    fn selection_rects_scale_down_to_logical_pixels() {
+    fn selection_geometry_matches_caret_offsets() {
         let layout = layout_of("abcdef");
-        let unit = selection_rects(&layout, 0, 3, 1.0);
-        let doubled = selection_rects(&layout, 0, 3, 2.0);
+        let rects = selection_rects(&layout, 0, 3);
+        let caret = caret_rect(&layout, 3);
 
-        assert_eq!(unit.len(), doubled.len());
+        assert_eq!(rects.len(), 1);
         assert!(
-            (unit[0].size.width - doubled[0].size.width * 2.0).abs() < 0.01,
-            "{} vs {}",
-            unit[0].size.width,
-            doubled[0].size.width
+            (rects[0].origin.x + rects[0].size.width - caret.origin.x).abs() < 0.01,
+            "{:?} vs {caret:?}",
+            rects[0]
         );
     }
 
@@ -264,7 +256,7 @@ mod tests {
     fn caret_rect_reaches_the_end_of_the_text() {
         let layout = layout_of("abc");
 
-        let rect = caret_rect(&layout, 3, 1.0);
+        let rect = caret_rect(&layout, 3);
 
         assert!((rect.size.width - 1.0).abs() < 0.01);
         assert!(
@@ -279,27 +271,28 @@ mod tests {
     fn caret_rect_handles_cjk_bytes() {
         let layout = layout_of("你好");
 
-        let rect = caret_rect(&layout, "你好".len(), 1.0);
+        let rect = caret_rect(&layout, "你好".len());
 
         assert!(rect.origin.x > 0.0);
         assert!(rect.size.height > 0.0);
     }
 
+    /// R12-4：caret 宽度恒为 1 **逻辑**像素（布局逻辑化后不再有 `scale` 参数）。
     #[test]
-    fn caret_rect_scales_back_to_one_logical_pixel() {
-        let layout = layout_of_scaled("abc", 2.0);
+    fn caret_rect_is_one_logical_pixel_wide() {
+        let layout = layout_of("abc");
 
-        let rect = caret_rect(&layout, 3, 2.0);
+        let rect = caret_rect(&layout, 3);
 
         assert!((rect.size.width - 1.0).abs() < 0.01, "{rect:?}");
-        assert!((rect.origin.x - layout.width() / 2.0).abs() < 0.01);
+        assert!((rect.origin.x - layout.width()).abs() < 0.01, "{rect:?}");
     }
 
     #[test]
     fn caret_rect_for_empty_text_still_has_a_line_height() {
         let layout = layout_of("");
 
-        let rect = caret_rect(&layout, 0, 1.0);
+        let rect = caret_rect(&layout, 0);
 
         assert_eq!(rect.origin.x, 0.0);
         assert!((rect.size.width - 1.0).abs() < 0.01, "{rect:?}");

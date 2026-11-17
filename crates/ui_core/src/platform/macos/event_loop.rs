@@ -54,6 +54,25 @@ impl Drop for LoopState {
     }
 }
 
+/// 用系统设置初始化输入阈值（R02-15）。
+///
+/// `+[NSEvent doubleClickInterval]` 是 AppKit 暴露的**用户双击速度**（系统设置 → 辅助功能 →
+/// 指针控制），缺省 0.5 s。读不到时保留 [`crate::interaction::InputThresholds::platform_default`]。
+/// 位置容差与拖拽阈值 AppKit 没有公开查询，保留平台缺省（4 px）。
+fn install_input_thresholds(app: &mut App) {
+    let defaults = crate::interaction::InputThresholds::platform_default();
+    let interval = NSEvent::doubleClickInterval();
+    let double_click_time = if interval.is_finite() && interval > 0.0 {
+        std::time::Duration::from_secs_f64(interval)
+    } else {
+        defaults.double_click_time
+    };
+    app.set_input_thresholds(crate::interaction::InputThresholds {
+        double_click_time,
+        ..defaults
+    });
+}
+
 /// `Application::run` 的平台入口。
 pub(crate) fn run(app: App) -> Result<(), EngineError> {
     let mtm = MainThreadMarker::new().ok_or(EngineError::AppInit {
@@ -68,6 +87,7 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
     let dispatcher = app.dispatcher();
     // 唤醒句柄由本平台的 `wake::install` 安装；`attach` 的 token 只对 Win32 有意义。
     dispatcher.attach(1);
+    install_input_thresholds(&mut app);
     let requests: Vec<(WindowId, WindowOptions)> = app
         .windows()
         .map(|(id, window)| (id, window.options().clone()))
@@ -250,13 +270,17 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
         }
     }
 
-    // 交互反馈：光标（v1 只支持系统箭头）；macOS 的指针捕获是隐式的，请求直接丢弃。
+    // 交互反馈：光标（v1 只支持系统箭头）。
     if let Some(native) = state.windows.first()
         && app.take_cursor_change().is_some()
     {
         native.set_cursor();
     }
-    let _ = app.take_capture_request();
+    // 指针捕获（R02-8）：AppKit 在 `mouseDown:` 之后**隐式捕获**（dragged/up 事件按按下时命中的
+    // view 路由，即使指针移出窗口），所以这里没有需要调用的系统 API —— 请求被消费掉是正确行为，
+    // 引擎侧的捕获状态（事件路由 / `PointerCancel` 语义）照常生效。这一点在
+    // `App::capture_pointer` 的文档里明确写出，不假装平台请求成功。
+    let _ = app.take_capture_requests();
 
     for native in state.windows.iter_mut() {
         native.update_a11y(app);

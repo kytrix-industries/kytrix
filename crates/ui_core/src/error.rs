@@ -101,8 +101,21 @@ pub enum EngineError {
     #[error("atlas {kind:?} is exhausted: no free tile fits after a clear and rebuild")]
     AtlasExhausted { kind: AtlasKind },
 
-    /// clip 嵌套超过 `MAX_CLIP_DEPTH`（8 层，`design/phase-02-paint-foundation.md` §7.2）。
+    /// clip 链超过 `MAX_CLIP_DEPTH`（8 项，`paint/scene.rs`；三套 shader 的固定循环上限）。
     ///
+    /// **编码期硬失败**：轴对齐矩形 clip 在编码期求交合并成一条表项（Skia `SkClipStack`
+    /// 语义），只有圆角 clip 逐层占项；链长确实超限时 shader 只能少裁，静默丢最外层会让
+    /// 子内容越界可见，因此这里明确报错（debug / release 行为一致）。
+    #[error(
+        "clip chain depth {depth} exceeds the limit {limit} (rect clips are merged at encode time; \
+         each rounded clip costs one entry)"
+    )]
+    ClipDepthExceeded {
+        /// 编码期实际链长。
+        depth: u8,
+        /// 上限（`MAX_CLIP_DEPTH`）。
+        limit: u8,
+    },
 
     /// 静态几何注册 / 查找失败（设计 §4.8）。首个生产者是 P08 的渲染层：
     /// `FrameOp::Geometry` 的 `GeometryId` 没有对应的 GPU 缓冲（`GeometryStore` 属 P09）。
@@ -222,6 +235,7 @@ mod tests {
                     width: 900,
                     height: 700,
                     page: (2048, 2048),
+                    cause: crate::resources::CapacityCause::PageFull,
                 },
             },
         ]
@@ -250,6 +264,7 @@ mod tests {
                 width: 900,
                 height: 700,
                 page: (2048, 2048),
+                cause: crate::resources::CapacityCause::PageFull,
             },
         }
         .to_string();

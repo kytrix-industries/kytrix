@@ -211,6 +211,7 @@ mod tests {
             offset: Point::new(0.0, 1.0),
             blur: 2.0,
             color: Color::BLACK,
+            corner_radius: [0.0; 4],
         }
     }
 

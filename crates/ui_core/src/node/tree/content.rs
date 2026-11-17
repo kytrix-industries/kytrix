@@ -11,10 +11,10 @@ use crate::paint::style::Style;
 use crate::{
     error::EngineError,
     interaction::{NodeInteraction, OverlaySlot, ScrollSlot, VirtualSlot},
-    math::{PhysicalRect, Point, Rect, Size},
+    math::{PhysicalRect, Point, Rect, Size, Transform},
     node::{dependency::ReadCtx, dirty::DirtyFlags, id::NodeId, signal::SignalId},
     paint::{scene::LaneId, style::StylePatch},
-    text::{ShapedLine, TextContent},
+    text::{ShapedLine, TextContent, shape::ShapedText},
 };
 
 // 消费者：`impl NodeTree::text_content` 的薄委托（外部调用点见该方法文档）。
@@ -44,12 +44,11 @@ pub(crate) fn set_text_content(tree: &mut NodeTree, node: NodeId, content: TextC
 // 消费者：`impl NodeTree::mark_text_dirty` 的薄委托（外部调用点见该方法文档）。
 /// 登记「该节点的文本需要重新 shape」（P1-2.3 的脏集合）。
 ///
-/// 去重是线性扫描：典型每帧 0–32 条，比哈希表更快且迭代序确定。节点已不存在时静默忽略
-/// （卸载路径会在 `remove` 里清理）。
+/// **O(1) 去重**（R12-13）：旧实现用 `Vec::contains`（O(n)），行情表整表 tick 时一帧 5000 次
+/// 插入 ⇒ 约 1250 万次 `NodeId` 比较（5–15 ms 纯浪费）。现在用一个与队列同寿命的
+/// `ahash::HashSet` 去重：插入 O(1)，`take` 时一次性清空（清空 = `clear()`，容量保留）。
 pub(crate) fn mark_text_dirty(tree: &mut NodeTree, node: NodeId) {
-    if !tree.text_dirty.contains(&node) {
-        tree.text_dirty.push(node);
-    }
+    tree.text_dirty.push(node);
 }
 
 // 消费者：`impl NodeTree::take_text_dirty` 的薄委托（外部调用点见该方法文档）。
@@ -58,10 +57,7 @@ pub(crate) fn mark_text_dirty(tree: &mut NodeTree, node: NodeId) {
 /// 消费者：`App::refresh_text`。返回的列表可能包含已被卸载的节点 —— 调用方按
 /// 「查不到就跳过」处理（卸载时 `remove` 会尝试清理，但集合是旁路结构，不做强一致）。
 pub(crate) fn take_text_dirty(tree: &mut NodeTree, out: &mut Vec<NodeId>) {
-    // `drain` 保住 `tree.text_dirty` 的容量，`out` 由调用方跨帧复用：
-    // 旧实现 `mem::take` 每帧都让双方重新分配（复审 P3-2）。
-    out.clear();
-    out.append(&mut tree.text_dirty);
+    tree.text_dirty.take_into(out);
 }
 
 // 消费者：`impl NodeTree::text_dirty_len` 的薄委托（外部调用点见该方法文档）。
@@ -69,6 +65,58 @@ pub(crate) fn take_text_dirty(tree: &mut NodeTree, out: &mut Vec<NodeId>) {
 #[cfg(test)]
 pub(crate) fn text_dirty_len(tree: &NodeTree) -> usize {
     tree.text_dirty.len()
+}
+
+// 消费者：`impl NodeTree::mark_text_layout_dirty` 的薄委托（外部调用点见该方法文档）。
+/// 登记「该文本节点的 `ShapedLine` 需要重建」（R12-14 的第二阶段脏集合）。
+pub(crate) fn mark_text_layout_dirty(tree: &mut NodeTree, node: NodeId) {
+    tree.text_layout_dirty.push(node);
+}
+
+// 消费者：`impl NodeTree::take_text_layout_dirty` 的薄委托（外部调用点见该方法文档）。
+/// 取走本帧需要重建 `ShapedLine` 的文本节点集合（消费后清空，容量保留）。
+pub(crate) fn take_text_layout_dirty(tree: &mut NodeTree, out: &mut Vec<NodeId>) {
+    tree.text_layout_dirty.take_into(out);
+}
+
+// 消费者：`impl NodeTree::text_layout_dirty_len` 的薄委托（外部调用点见该方法文档）。
+/// 本帧待重排的文本节点数（诊断 / 测试）。
+#[cfg(test)]
+pub(crate) fn text_layout_dirty_len(tree: &NodeTree) -> usize {
+    tree.text_layout_dirty.len()
+}
+
+// 消费者：`impl NodeTree::invalidate_text_lines` 的薄委托（外部调用点见该方法文档）。
+/// 让所有文本节点的 `ShapedLine` 失效并进入重排队列（图集逐 tile 淘汰 / 字体换代用）。
+///
+/// 与 [`invalidate_text_layout`] 的区别：这里**不动 measure 闭包、不置 `LAYOUT`** —— 断行宽度
+/// 与字形宽度都没变，只需要重新光栅装箱。返回被失效的节点数。
+pub(crate) fn invalidate_text_lines(tree: &mut NodeTree) -> usize {
+    let nodes: SmallVec<[NodeId; 64]> = tree
+        .order
+        .iter()
+        .copied()
+        .filter(|node| {
+            tree.arena
+                .get(*node)
+                .is_some_and(|target| target.kind.text().is_some())
+        })
+        .collect();
+    let mut invalidated = 0;
+    for node in nodes {
+        let index = node.index() as usize;
+        let Some(slot) = tree.text_slots.get_mut(index).and_then(Option::as_mut) else {
+            continue;
+        };
+        if slot.line.take().is_some() {
+            invalidated += 1;
+        }
+        slot.laid_width_bits = 0;
+        slot.laid_generation = 0;
+        tree.mark_text_layout_dirty(node);
+        tree.mark_paint(node);
+    }
+    invalidated
 }
 
 // 消费者：`impl NodeTree::set_text_shaped` 的薄委托（外部调用点见该方法文档）。
@@ -103,10 +151,9 @@ pub(crate) fn set_text_shaped(
             slot.shaped = shaped;
             slot.key = key;
             slot.scale_epoch = scale_epoch;
-            // 新快照 ⇒ 旧的断行/选区/布局依据全部作废（B4）：`layout_text` 的复用判据是
+            // 新快照 ⇒ 旧的断行/布局依据全部作废（B4）：`layout_text` 的复用判据是
             // `line.is_some() && width_bits && generation`，任一不成立就重排。
             slot.line = None;
-            slot.broken = None;
             slot.laid_width_bits = 0;
             slot.laid_generation = 0;
         }
@@ -117,13 +164,15 @@ pub(crate) fn set_text_shaped(
                     key,
                     scale_epoch,
                     line: None,
-                    broken: None,
                     laid_width_bits: 0,
                     laid_generation: 0,
                 });
             }
         }
     }
+    // R12-14：只有「新快照」的节点需要重建 `ShapedLine`，因此只把它们入重排队列
+    // （第二阶段不再每帧遍历整棵树）。
+    tree.mark_text_layout_dirty(node);
 
     tree.invalidate_caches_upwards(node);
     if size_changed {
@@ -135,11 +184,14 @@ pub(crate) fn set_text_shaped(
 
 // 消费者：`impl NodeTree::set_text_line` 的薄委托（外部调用点见该方法文档）。
 /// 挂上只读快照（P06 的 paint 输入）；`width`/`generation` 记下这次重排的依据。
+///
+/// **不再常驻第二份 parley `Layout`**（R12-6）：选区/光标几何在需要时按 `laid_width_bits`
+/// 就地重排（`ShapedText` 内部一份 `Layout`，零 clone），常态下每个文本节点只留
+/// `Rc<ShapedLine>`。
 pub(crate) fn set_text_line(
     tree: &mut NodeTree,
     node: NodeId,
     line: Rc<ShapedLine>,
-    broken: parley::Layout<crate::paint::color::ColorBrush>,
     width: f32,
     generation: u32,
 ) -> bool {
@@ -148,7 +200,6 @@ pub(crate) fn set_text_line(
         return false;
     };
     slot.line = Some(line);
-    slot.broken = Some(Box::new(broken));
     slot.laid_width_bits = width.to_bits();
     slot.laid_generation = generation;
     // 快照变了 ⇒ 文本 lane 里的 UV/尺寸必须重建。`set_text_line` 的调用方
@@ -216,18 +267,12 @@ pub(crate) fn text_selection_rects(
             detail: SmolStr::new_static("text has not been shaped yet"),
         });
     };
-    let Some(broken) = slot.broken() else {
-        return Err(EngineError::TextShape {
-            node,
-            detail: SmolStr::new_static("text has no final layout yet"),
-        });
+    let shaped = slot.shaped();
+    let Some(content) = tree.text_content(node) else {
+        return Err(EngineError::StaleNode { node });
     };
-    Ok(crate::text::inline_flow::selection_rects(
-        broken,
-        anchor,
-        focus,
-        slot.shaped().scale(),
-    ))
+    let width = expected_layout_width(tree, shaped, node);
+    Ok(shaped.selection_rects(width, content.style.alignment, anchor, focus))
 }
 
 // 消费者：`impl NodeTree::text_caret_rect` 的薄委托（外部调用点见该方法文档）。
@@ -258,19 +303,13 @@ pub(crate) fn text_caret_rect(
             detail: SmolStr::new_static("text has not been shaped yet"),
         });
     };
-    let Some(broken) = slot.broken() else {
-        return Err(EngineError::TextShape {
-            node,
-            detail: SmolStr::new_static("text has no final layout yet"),
-        });
-    };
     let shaped = slot.shaped();
     let Some(content) = tree.text_content(node) else {
         return Err(EngineError::StaleNode { node });
     };
     let text = content.text.as_str();
     if shaped.text() != text
-        || shaped.style() != &content.style
+        || !shaped.same_shaping_inputs(&content.style)
         || shaped.inline_boxes() != content.inline_boxes.as_ref()
     {
         return Err(EngineError::TextShape {
@@ -292,14 +331,7 @@ pub(crate) fn text_caret_rect(
             detail: SmolStr::new_static("byte index is not a char boundary"),
         });
     }
-    let expected_width = {
-        let width = tree.text_content_width(node);
-        if width > 0.0 {
-            width
-        } else {
-            shaped.widths().max / shaped.scale()
-        }
-    };
+    let expected_width = expected_layout_width(tree, shaped, node);
     if slot.laid_width_bits() != expected_width.to_bits() {
         return Err(EngineError::TextShape {
             node,
@@ -309,7 +341,7 @@ pub(crate) fn text_caret_rect(
         });
     }
 
-    let mut rect = crate::text::inline_flow::caret_rect(broken, byte_index, shaped.scale());
+    let mut rect = shaped.caret_rect(expected_width, content.style.alignment, byte_index);
     if rect.size.width <= 0.0 {
         rect.size.width = 1.0;
     }
@@ -319,6 +351,19 @@ pub(crate) fn text_caret_rect(
         rect.size.height = (style_size * line_height).max(1.0);
     }
     Ok(rect)
+}
+
+/// 断行宽度（逻辑像素）：taffy 算出的内容宽，未布局时退回 max-content 宽。
+///
+/// 与 `layout_text` 的取值完全一致 —— 选区/光标查询必须与该次重排用同一个宽度，
+/// 否则 `caret_rect` 的宽度校验会误报「wait for the text pass」。
+fn expected_layout_width(tree: &NodeTree, shaped: &ShapedText, node: NodeId) -> f32 {
+    let width = tree.text_content_width(node);
+    if width > 0.0 {
+        width
+    } else {
+        shaped.max_content_size().width
+    }
 }
 
 // 消费者：`impl NodeTree::invalidate_text_layout` 的薄委托（外部调用点见该方法文档）。
@@ -331,7 +376,9 @@ pub(crate) fn invalidate_text_layout(tree: &mut NodeTree, node: NodeId) -> bool 
 }
 
 // 消费者：`impl NodeTree::mark_all_text_dirty` 的薄委托（外部调用点见该方法文档）。
-/// 把所有文本节点标脏（字体栈 / DPI / 图集换代时用）。
+/// 把所有文本节点标脏（字体栈 / 系统字体 / 图集换代时用）。
+///
+/// 两个阶段都要重做：`shape`（第一阶段）与 `layout`（第二阶段，重建 `ShapedLine`）。
 pub(crate) fn mark_all_text_dirty(tree: &mut NodeTree) {
     let nodes: Vec<NodeId> = tree
         .order
@@ -345,6 +392,7 @@ pub(crate) fn mark_all_text_dirty(tree: &mut NodeTree) {
         .collect();
     for node in nodes {
         tree.mark_text_dirty(node);
+        tree.mark_text_layout_dirty(node);
     }
 }
 
@@ -407,6 +455,44 @@ pub(crate) fn put_bind_text(
 /// 取走「几何 damage 需要升级为全帧」的标记（`Window::paint_frame` 每帧读一次）。
 pub(crate) fn take_geometry_damage_escalation(tree: &mut NodeTree) -> bool {
     std::mem::take(&mut tree.geometry_damage_escalation)
+}
+
+// 消费者：`impl NodeTree::geometry_transform` 的薄委托（外部调用点见该方法文档）。
+/// 几何节点的 per-draw 变换（R05-12）。未设置 / 非几何节点 ⇒ 单位矩阵。
+pub(crate) fn geometry_transform(tree: &NodeTree, node: NodeId) -> Transform {
+    tree.geometry_transforms
+        .get(&node)
+        .copied()
+        .unwrap_or(Transform::IDENTITY)
+}
+
+// 消费者：`impl NodeTree::set_geometry_transform` 的薄委托（外部调用点见该方法文档）。
+/// 写入几何节点的 per-draw 变换（单位矩阵 = 删除条目）。
+///
+/// 标 `PAINT | GEOMETRY`：变换烘在 lane 的 `Primitive::Geometry` 里，因此 lane 必须重建；
+/// `GEOMETRY` 是「只换 uniform、顶点不动」的语义标记（顶点缓冲按 `(index, generation)`
+/// 缓存，不会被这次改动触碰）。damage 由 `touch` 按节点布局盒并入。
+///
+/// **写入口只在测试里可达**：应用层入口（`App::set_geometry_transform`）属 app 层，见报告
+/// R05-12 的遗留项；读路径（`paint/pass.rs` 的 getter + 编码器 + damage）是生产代码。
+#[cfg(test)]
+pub(crate) fn set_geometry_transform(
+    tree: &mut NodeTree,
+    node: NodeId,
+    transform: Transform,
+) -> Result<(), EngineError> {
+    match tree.arena.get(node).map(|target| target.kind()) {
+        Some(NodeKind::Geometry(_)) => {}
+        _ => return Err(EngineError::StaleNode { node }),
+    }
+    if transform == Transform::IDENTITY {
+        tree.geometry_transforms.remove(&node);
+    } else {
+        tree.geometry_transforms.insert(node, transform);
+    }
+    tree.mark_paint(node);
+    tree.touch(node, DirtyFlags::GEOMETRY);
+    Ok(())
 }
 
 // 消费者：`impl NodeTree::content_offset` 的薄委托（外部调用点见该方法文档）。
@@ -767,16 +853,66 @@ pub(crate) fn edit_style_for_test(
 }
 
 // 消费者：本模块的文本方法（`set_text_shaped` / `set_text_line` / `text_*`）。
+/// 文本脏队列：`Vec`（保序、保容量）+ `ahash::HashSet`（O(1) 去重；R12-13）。
+///
+/// `take_into` 一次性取出全部条目并清空去重集合（容量保留）—— 同一节点在同一帧的同一阶段
+/// 只入队一次，消费之后可以再次入队（例如第一阶段 shape 完 → 第二阶段重排）。
+///
+/// 为什么不是「按节点位的位图」：`mark_text_dirty` 可能在该节点还没有 `TextSlot` 时被调用
+/// （第一次 `set_text_content`），位图需要改 `Node` 布局（`Node` 有 1128 B 的硬预算）。
+/// 集合的峰值大小 = 单帧脏文本数，行情表整表 tick 时也就几千个 `NodeId`（8 B/条）。
+pub(crate) struct TextDirtyQueue {
+    nodes: Vec<NodeId>,
+    seen: ahash::HashSet<NodeId>,
+}
+
+impl TextDirtyQueue {
+    /// 空队列。
+    pub(crate) fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            seen: ahash::HashSet::default(),
+        }
+    }
+
+    /// 入队（去重）。
+    pub(crate) fn push(&mut self, node: NodeId) {
+        if self.seen.insert(node) {
+            self.nodes.push(node);
+        }
+    }
+
+    /// 取走全部条目（`out` 与队列自身的容量都保留）。
+    pub(crate) fn take_into(&mut self, out: &mut Vec<NodeId>) {
+        self.seen.clear();
+        out.clear();
+        out.append(&mut self.nodes);
+    }
+
+    /// 待处理条目数。
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.nodes.len()
+    }
+}
+
+impl Default for TextDirtyQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// 一个文本节点的快照（P05）：`shaped` 供 measure/选区，`line` 供 P06 的 paint。
 ///
 /// `key`/`scale_epoch`/`laid_*` 是「本帧是否需要重做」的判据（B4）：三者全等 ⇒ 整节点跳过。
+///
+/// **不再持有第二份 parley `Layout`**（R12-6）：选区/光标几何由 `ShapedText` 在同一份
+/// `Layout` 上就地重排（零 clone），每个文本节点的常驻成本只剩 `Rc<ShapedLine>`。
 pub(crate) struct TextSlot {
     shaped: Rc<crate::text::shape::ShapedText>,
     key: crate::text::cache::ShapeKey,
     scale_epoch: u32,
     line: Option<Rc<ShapedLine>>,
-    /// 最终（按内容宽断行 + 对齐）的 parley 布局：选区映射的唯一真相（B1）。
-    broken: Option<Box<parley::Layout<crate::paint::color::ColorBrush>>>,
     laid_width_bits: u32,
     laid_generation: u32,
 }
@@ -805,8 +941,78 @@ impl TextSlot {
     pub(crate) fn laid_generation(&self) -> u32 {
         self.laid_generation
     }
+}
 
-    pub(crate) fn broken(&self) -> Option<&parley::Layout<crate::paint::color::ColorBrush>> {
-        self.broken.as_deref()
+#[cfg(test)]
+mod tests {
+    use super::TextDirtyQueue;
+    use crate::{
+        node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
+        text::{TextContent, TextStyle},
+    };
+
+    fn text_tree(count: usize) -> (NodeTree, Vec<NodeId>) {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let mut nodes = Vec::with_capacity(count);
+        for index in 0..count {
+            let node = NodeBuilder::text(format!("t{index}"), TextStyle::new(12.0))
+                .build(&mut tree, root)
+                .expect("text node");
+            nodes.push(node);
+        }
+        (tree, nodes)
+    }
+
+    /// R12-13：`mark_text_dirty` 去重是 **O(1)**（同一节点重复标脏只入队一次）。
+    ///
+    /// 旧实现是 `Vec::contains`（O(n)）：行情表整表 tick 时一帧 5000 次插入 ⇒ 约 1250 万次比较。
+    /// 这里用「大规模重复标记 + 长度断言」把语义钉死：正确性由集合去重保证，成本由 `HashSet`
+    /// 保证（1000 次标记 10 个节点 ⇒ 队列恒为 10）。
+    #[test]
+    fn text_dirty_queue_dedupes_in_constant_time() {
+        let (tree, nodes) = text_tree(10);
+        let mut queue = TextDirtyQueue::new();
+        for _ in 0..100 {
+            for node in &nodes {
+                queue.push(*node);
+            }
+        }
+        assert_eq!(queue.len(), nodes.len(), "去重后恒为节点数");
+        let mut out = Vec::new();
+        queue.take_into(&mut out);
+        assert_eq!(out.len(), nodes.len());
+        assert_eq!(queue.len(), 0, "take 之后队列为空");
+        // 消费之后同一节点可以再次入队（第二阶段 / 下一帧）。
+        queue.push(nodes[0]);
+        assert_eq!(queue.len(), 1);
+        let _ = tree;
+    }
+
+    /// R12-14：`set_text_content` 只进 shape 阶段；`ShapedLine` 的重排由 `refresh_text`
+    /// （`set_text_shaped`）与内容宽变化（`set_local_layout`）入队。
+    #[test]
+    fn text_content_and_layout_queues_are_separate() {
+        let (mut tree, nodes) = text_tree(2);
+        // 构造时静态文本已入 shape 队列；layout 队列要等 shape 出快照才入队。
+        assert_eq!(tree.text_dirty_len(), 2);
+        assert_eq!(tree.text_layout_dirty_len(), 0);
+
+        let node = nodes[0];
+        let content = TextContent::new("changed", TextStyle::new(12.0));
+        assert!(tree.set_text_content(node, content));
+        assert_eq!(
+            tree.text_dirty_len(),
+            2,
+            "同一节点重复标脏被 O(1) 去重（R12-13）"
+        );
+
+        let mut shaped = Vec::new();
+        tree.take_text_dirty(&mut shaped);
+        assert_eq!(tree.text_dirty_len(), 0);
+        let mut layout = Vec::new();
+        tree.take_text_layout_dirty(&mut layout);
+        assert!(layout.is_empty(), "还没有快照 ⇒ 没有待重排的节点");
+        assert_eq!(tree.invalidate_text_lines(), 0, "还没有 line 可失效");
     }
 }

@@ -80,18 +80,23 @@ pub enum Topology {
 /// v1 的内置管线。顶点布局由变体唯一决定（见 [`GeometryPipeline::vertex_stride`]）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GeometryPipeline {
-    /// 实色三角：`[f32; 2]` 位置（逻辑像素，8 B/顶点）。`Primitive::Path` 固定用这个。
+    /// 实色三角 + **解析抗锯齿**：`[f32; 2]` 位置（逻辑像素）+ `f32` 覆盖率距离（逻辑像素，
+    /// 负 = 形状内部），12 B/顶点。`Primitive::Path` 固定用这个。
+    ///
+    /// 覆盖率距离的语义与 Skia 的 AA 三角化一致：网格沿形状边界向外扩约 1 物理像素，顶点
+    /// 携带「到真实边界的有符号距离」，片元用 `aa_coverage` 换算成覆盖率（R05-6）。内部顶点
+    /// 写一个足够小的负数（例如 -1.0）即可。
     Ui,
     /// 纹理三角：`[f32; 2]` 位置 + `[f32; 2]` 归一化 UV（16 B/顶点），采样 `atlas` 指定的图集页。
     Textured { atlas: AtlasKind },
 }
 
 impl GeometryPipeline {
-    /// 该 pipeline 要求的每顶点字节数（`Ui` = 8，`Textured` = 16）。
+    /// 该 pipeline 要求的每顶点字节数（`Ui` = 12，`Textured` = 16）。
     #[must_use]
     pub const fn vertex_stride(self) -> u32 {
         match self {
-            Self::Ui => 8,
+            Self::Ui => 12,
             Self::Textured { .. } => 16,
         }
     }
@@ -135,7 +140,8 @@ mod tests {
 
     #[test]
     fn pipeline_strides() {
-        assert_eq!(GeometryPipeline::Ui.vertex_stride(), 8);
+        // R05-6：Ui 顶点 = position(f32×2) + 解析 AA 的覆盖率距离(f32)，共 12 B。
+        assert_eq!(GeometryPipeline::Ui.vertex_stride(), 12);
         assert_eq!(
             GeometryPipeline::Textured {
                 atlas: AtlasKind::Image
@@ -166,7 +172,8 @@ mod tests {
         let mut set = HashSet::default();
         assert!(set.insert(id));
         assert!(!set.insert(id));
-        // 代际不同即不同句柄（旧句柄失效的依据）。\n        assert!(set.insert(GeometryId::for_test(1, 3)));
+        // 代际不同即不同句柄（旧句柄失效的依据）。
+        assert!(set.insert(GeometryId::for_test(1, 3)));
     }
 
     #[test]
@@ -174,7 +181,7 @@ mod tests {
         let desc = GeometryDesc {
             vertex_bytes: Bytes::from_static(&[0, 0, 0, 0, 0, 0, 0, 0]),
             index_bytes: Bytes::from_static(&[0, 0, 1, 0, 2, 0]),
-            vertex_stride: 8,
+            vertex_stride: 12,
             index_type: IndexType::U16,
             topology: Topology::TriangleList,
             bounds: Rect::new(0.0, 0.0, 8.0, 8.0),

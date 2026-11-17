@@ -55,6 +55,12 @@ struct WindowMirror {
 }
 
 /// `Application::run` 的平台入口。
+///
+/// 输入阈值（R02-15）在 Linux 上**没有**可移植的系统查询通路：GTK 的 `gtk-double-click-time`
+/// 在 XSettings 里（需要 xsettings 后端），Qt 也走同样的后端。因此这里保留
+/// [`crate::interaction::InputThresholds::platform_default`] 的平台缺省（400 ms / 4 px）而不是
+/// 静默地沿用 Windows 的 500 ms —— 阈值来自平台的意图由缺省值表达，读取系统值的通路留待
+/// 引入 XSettings 客户端后补上（届时与 Windows 的 `install_input_thresholds` 同形态）。
 pub(crate) fn run(app: App) -> Result<(), EngineError> {
     let dispatcher = app.dispatcher();
     // 唤醒句柄由本平台的 `wake::install` 安装；`attach` 的 token 只对 Win32 有意义。
@@ -184,7 +190,11 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             }
             // 交互反馈：Linux 没有全局光标 API（由客户端自绘），请求直接消费掉。
             let _ = app.take_cursor_change();
-            let _ = app.take_capture_request();
+            // 指针捕获（R02-8）：Wayland 的 `wl_pointer` 在按下期间由 compositor 做**隐式抓取**，
+            // 客户端没有可调用的捕获 API（协议不提供 `setPointerCapture` 的对应物）；引擎侧的
+            // 捕获状态（事件路由 + `PointerCancel` 语义）照常生效。请求被消费是正确行为，
+            // 这一点在 `App::capture_pointer` 的文档里明确写出。
+            let _ = app.take_capture_requests();
 
             // ③ 关闭请求（`xdg_toplevel.close`）：先关 `App` 窗口（drop 渲染器 → GPU 线程
             // join），再销毁原生窗口（drop 协议对象），顺序与窗口销毁的依赖方向一致。

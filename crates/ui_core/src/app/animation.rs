@@ -30,6 +30,20 @@ pub(crate) fn scroll_animation_target(app: &App, node: NodeId, window: WindowId)
     })
 }
 
+/// 取消某个滚动槽上的动画（精确滚动接管时用；R02-10）。
+///
+/// 触控板的像素级滚动必须 1:1 跟随手指：若上一次离散滚轮登记的动画还在跑，它会在同一帧
+/// 继续写 `offset`，与手指位移互相打断（表现为「黏手」）。所以精确滚动一开始就接管目标。
+/// 消费者：`app::input::on_scroll`。
+pub(crate) fn cancel_scroll_animation(app: &mut App, handle: &crate::interaction::ScrollHandle) {
+    app.animations.retain(|slot| {
+        !matches!(
+            &slot.target,
+            AnimationTarget::Scroll { handle: target, .. } if *target == *handle
+        )
+    });
+}
+
 // ── P10：动画 ──────────────────────────────────────────────────────────────
 
 /// 注册一个动画（起点 = 目标瞬态值的当前值；同目标已有动画 ⇒ 替换）。

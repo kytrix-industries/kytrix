@@ -19,7 +19,9 @@ use crate::{
 
 /// 打开一个浮层（root 的最后一个子节点 ⇒ `order` 末尾 ⇒ 命中优先）。
 ///
-/// # Errors
+/// 记录打开瞬间的焦点节点作为 **opener**（`restore_focus` 时关闭后还给触发按钮，R02-12）；
+/// `trap_focus` 置位时该浮层成为焦点作用域根（Tab 只在子树内循环、外部按下被消费）。
+///
 /// # Errors
 /// `UnknownWindow`（窗口已关闭）/ `StaleNode`（树结构被破坏）。
 /// 消费者：`App::create_overlay`。
@@ -28,6 +30,7 @@ pub(crate) fn create_overlay(
     window: WindowId,
     options: OverlayOptions,
 ) -> Result<Overlay, EngineError> {
+    let opener = app.focused(window);
     let Some(target) = app.windows.get_mut(&window) else {
         return Err(EngineError::UnknownWindow { window });
     };
@@ -43,6 +46,9 @@ pub(crate) fn create_overlay(
         slot.overlay = Some(OverlaySlot {
             dismiss: options.dismiss,
             placement: options.placement,
+            trap_focus: options.trap_focus,
+            opener,
+            restore_focus: options.restore_focus,
         });
     }
     #[cfg(feature = "hud")]

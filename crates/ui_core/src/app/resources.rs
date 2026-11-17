@@ -45,16 +45,19 @@ pub(crate) fn dispatcher(app: &App) -> Arc<Dispatcher> {
 }
 
 /// 取走本帧的平台事件（`Application::run` 每帧填充；顺序即产生顺序）。
+///
+/// 队列有界（[`super::event_queue::EVENT_QUEUE_CAPACITY`]），取走不影响累计的丢弃计数。
 /// 消费者：`App::drain_events`。
 #[must_use]
 pub(crate) fn drain_events(app: &mut App) -> Vec<(WindowId, Event)> {
-    std::mem::take(&mut app.events)
+    app.events.drain()
 }
 
 /// 平台层投递一个事件（`crate::platform::native` 唯一写入点）。
 ///
 /// `Event::Input` 除了进观测缓冲，还会**立刻**走一次交互分发（P10 §5.3）；观测缓冲只用于
-/// `drain_events`（应用读事件），不承担分发。
+/// `drain_events`（应用读事件），不承担分发。缓冲是**有界**环形队列：超限丢最旧并计数
+/// （R02-5），因此应用忘记 drain 也不会无界增长。
 /// 消费者：`App::dispatch`。
 pub(crate) fn dispatch(app: &mut App, window: WindowId, event: Event) {
     match &event {
@@ -65,7 +68,7 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, event: Event) {
         Event::FocusChanged { focused: false } => app.on_window_focus_lost(window),
         _ => {}
     }
-    app.events.push((window, event));
+    app.events.push(window, event);
 }
 
 /// 写剪贴板文本（Win32 `CF_UNICODETEXT` / macOS `NSPasteboard` / Wayland `wl_data_source`）。

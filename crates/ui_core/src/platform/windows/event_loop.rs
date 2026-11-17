@@ -27,7 +27,7 @@ use crate::{
     math::PhysicalRect,
     platform::{
         dispatcher::Dispatcher,
-        event::{PlatformEvent, TranslateState},
+        event::{MessageContext, PlatformEvent, StampedEvent, TranslateState},
     },
     window::WindowId,
 };
@@ -46,8 +46,17 @@ mod tests;
 /// `WndProc` 的每窗口状态（`GWLP_USERDATA` 指向它）。
 pub(crate) struct WndProcState {
     dispatcher: Arc<Dispatcher>,
-    events: Vec<PlatformEvent>,
+    /// 待泵消费的平台事件（**带消息时间**：R02-14 的时间戳来源是 `MSG.time`，不是分发时刻）。
+    events: Vec<StampedEvent>,
     translate: TranslateState,
+    /// 一格滚轮对应的行数（`SPI_GETWHEELSCROLLLINES`；`0.0` = 未知/按页，见
+    /// [`pump::wheel_lines_from_system`]）。
+    wheel_lines: f32,
+    /// 最近一次客户区鼠标位置（物理像素）。
+    ///
+    /// `WM_MOUSELEAVE` 不带坐标，而 `PointerLeave`（R02-39）要给出离开点；用最近一次移动的
+    /// 位置是主流做法（Chromium 的 `WebMouseEvent.position_in_widget` 同源）。
+    last_client_pos: (i32, i32),
     /// `WM_GETMINMAXINFO` 的 `ptMinTrackSize`（物理像素）。
     min_size: (u32, u32),
     close_requested: bool,
@@ -126,6 +135,8 @@ impl WndProcState {
             dispatcher: dispatcher.clone(),
             events: Vec::with_capacity(8),
             translate: TranslateState::default(),
+            wheel_lines: pump::wheel_lines_from_system(),
+            last_client_pos: (0, 0),
             min_size: (1, 1),
             close_requested: false,
             mouse_tracking: false,
@@ -153,11 +164,47 @@ impl WndProcState {
         self.dispatcher.wake();
     }
 
-    fn push(&mut self, event: PlatformEvent) {
+    /// 每条消息的翻译上下文（消息时间 + 系统滚轮行数）。
+    pub(crate) fn context(&self, ticks_ms: u64) -> MessageContext {
+        MessageContext {
+            ticks_ms,
+            wheel_lines: self.wheel_lines,
+        }
+    }
+
+    /// 重新读取 `SPI_GETWHEELSCROLLLINES`（`WM_SETTINGCHANGE` 之后系统值可能变了）。
+    pub(crate) fn refresh_wheel_lines(&mut self) {
+        self.wheel_lines = pump::wheel_lines_from_system();
+    }
+
+    /// 记录最近一次客户区鼠标位置（`PointerLeave` 的离开点）。
+    pub(crate) fn note_client_pos(&mut self, x: i32, y: i32) {
+        self.last_client_pos = (x, y);
+    }
+
+    /// 最近一次客户区鼠标位置。
+    pub(crate) fn client_pos(&self) -> (i32, i32) {
+        self.last_client_pos
+    }
+
+    /// 压入一条带明确消息时间的平台事件（`WndProc` 的常规路径）。
+    pub(crate) fn push_stamped(&mut self, event: PlatformEvent, ticks_ms: u64) {
+        self.events.push(StampedEvent { event, ticks_ms });
+    }
+
+    /// 压入一条**引擎合成**的平台事件：时间取当前消息时间（`GetMessageTime()`），
+    /// 因为合成发生在处理该消息的过程中，与消息时刻同源。
+    pub(crate) fn push_now(&mut self, event: PlatformEvent) {
+        let ticks_ms = pump::message_ticks();
+        self.push_stamped(event, ticks_ms);
+    }
+
+    /// 压入一条已经带时间的平台事件（`WndProc` 的翻译产物）。
+    pub(crate) fn push_stamped_event(&mut self, event: StampedEvent) {
         self.events.push(event);
     }
 
-    pub(crate) fn take_events(&mut self) -> Vec<PlatformEvent> {
+    pub(crate) fn take_events(&mut self) -> Vec<StampedEvent> {
         std::mem::take(&mut self.events)
     }
 

@@ -1,11 +1,11 @@
-//! 焦点与 IME：焦点权威源读写、Tab 序、IME caret hint 与每窗口 IME 目标状态。
+//! 焦点与 IME：焦点权威源读写、Tab 序、焦点作用域、悬停读点、IME caret hint 与每窗口 IME 目标状态。
 //!
 //! `app.rs` 的 `impl App` 只保留同名薄委托，方法体在这里（零行为变更的纯拆分）。
 
 use super::App;
 use crate::{
     error::EngineError,
-    interaction::{focus, scroll},
+    interaction::{focus, overlay as overlay_util, scroll},
     math::Rect,
     node::id::NodeId,
     window::{Window, WindowId},
@@ -24,6 +24,24 @@ pub(crate) fn focused(app: &App, window: WindowId) -> Option<NodeId> {
     target.tree().get(node).ok().map(|_| node)
 }
 
+/// 当前的焦点作用域根（最上层模态浮层的子树根；R02-12）。
+/// 消费者：`App::focus_scope`。
+#[must_use]
+pub(crate) fn focus_scope(app: &App, window: WindowId) -> Option<NodeId> {
+    let target = app.windows.get(&window)?;
+    let tree = target.tree();
+    overlay_util::focus_scope_root(tree, tree.root())
+}
+
+/// 指针当前悬停的节点（陈旧节点视为无悬停）。
+/// 消费者：`App::hovered`。
+#[must_use]
+pub(crate) fn hovered(app: &App, window: WindowId) -> Option<NodeId> {
+    let target = app.windows.get(&window)?;
+    let node = target.pointer().hovered?;
+    target.tree().get(node).ok().map(|_| node)
+}
+
 /// 清掉指向已卸载节点的焦点（读取路径都是只读，清理集中在这里）。
 /// 消费者：`App::validate_focus`。
 pub(crate) fn validate_focus(app: &mut App, window: WindowId) {
@@ -38,14 +56,15 @@ pub(crate) fn validate_focus(app: &mut App, window: WindowId) {
     }
 }
 
-/// 设置焦点。不可聚焦 / 同值 ⇒ `false`（不标脏、不唤醒）。
+/// 设置焦点。不可聚焦 / 同值 / 作用域外 ⇒ `false`（不标脏、不唤醒）。
 /// 消费者：`App::set_focus`。
 pub(crate) fn set_focus(app: &mut App, window: WindowId, node: Option<NodeId>) -> bool {
+    let scope = focus_scope(app, window);
     let Some(target) = app.windows.get_mut(&window) else {
         return false;
     };
     if let Some(node) = node
-        && !focus::focusable(target.tree(), node)
+        && !focus::focusable_in_scope(target.tree(), node, scope)
     {
         return false;
     }
@@ -72,6 +91,25 @@ pub(crate) fn set_focus(app: &mut App, window: WindowId, node: Option<NodeId>) -
     }
     app.request_frame();
     true
+}
+
+/// 关闭浮层后把焦点还给**打开者**（R02-12）；返回是否真的改了焦点。
+///
+/// `opener` 已被卸载（带动画的对话框把触发按钮一起拆了）或已不可聚焦时保持现状 ——
+/// 静默恢复到「无焦点」比指到一个不存在的节点更糟（a11y 焦点会漂移）。
+/// 消费者：`App::close_overlay` / `App::dismiss_overlay`。
+pub(crate) fn restore_focus(app: &mut App, window: WindowId, opener: Option<NodeId>) -> bool {
+    let Some(opener) = opener else {
+        return false;
+    };
+    let alive = app
+        .windows
+        .get(&window)
+        .is_some_and(|target| target.tree().get(opener).is_ok());
+    if !alive {
+        return false;
+    }
+    app.set_focus(window, Some(opener))
 }
 
 /// 设置 IME caret hint（P16）：`node` 是该窗口内的文本节点，`byte_index` 是 UTF-8 字节偏移。
@@ -170,14 +208,14 @@ pub(crate) fn ime_cursor_area(app: &App, window: WindowId) -> Result<Option<Rect
         .ime_cursor_area()
 }
 
-/// 焦点移到下一个可聚焦节点（末尾回绕）。
+/// 焦点移到下一个可聚焦节点（末尾回绕；模态浮层内循环，R02-12）。
 /// 消费者：`App::focus_next`。
 pub(crate) fn focus_next(app: &mut App, window: WindowId) -> Option<NodeId> {
     app.validate_focus(window);
-    let next = app
-        .windows
-        .get(&window)
-        .and_then(|target| focus::next_focusable(target.tree(), target.focus().focused(), false));
+    let scope = focus_scope(app, window);
+    let next = app.windows.get(&window).and_then(|target| {
+        focus::next_focusable(target.tree(), target.focus().focused(), false, scope)
+    });
     if app.set_focus(window, next) {
         next
     } else {
@@ -185,14 +223,14 @@ pub(crate) fn focus_next(app: &mut App, window: WindowId) -> Option<NodeId> {
     }
 }
 
-/// 焦点移到上一个可聚焦节点（开头回绕）。
+/// 焦点移到上一个可聚焦节点（开头回绕；模态浮层内循环，R02-12）。
 /// 消费者：`App::focus_prev`。
 pub(crate) fn focus_prev(app: &mut App, window: WindowId) -> Option<NodeId> {
     app.validate_focus(window);
-    let next = app
-        .windows
-        .get(&window)
-        .and_then(|target| focus::next_focusable(target.tree(), target.focus().focused(), true));
+    let scope = focus_scope(app, window);
+    let next = app.windows.get(&window).and_then(|target| {
+        focus::next_focusable(target.tree(), target.focus().focused(), true, scope)
+    });
     if app.set_focus(window, next) {
         next
     } else {

@@ -26,9 +26,23 @@
 //! 常量，图集按代际自然换代，不需要 migration。
 
 use swash::{
-    scale::{Render, ScaleContext, Source},
+    scale::{Render, ScaleContext, Source, StrikeWith, image::Content},
     zeno::{Format, Placement, Vector},
 };
+
+/// BGRA8（彩色字形）→ R8 覆盖度：取 alpha 通道。
+///
+/// `Content::Color` 的字节序是 **B,G,R,A**（zeno 的 `Format::Alpha` 请求对彩色源不生效）。
+/// 取 alpha 而非亮度：彩色 emoji 的轮廓信息全在 alpha 里（透明背景 + 不透明笔画），亮度会
+/// 把浅色字形（黄色/白色）变成近白导致看不见。
+fn bgra_to_coverage(data: &[u8]) -> Vec<u8> {
+    let (pixels, remainder) = data.as_chunks::<4>();
+    if !remainder.is_empty() {
+        // 非预期的载荷（理论上不会发生）：退化成原样返回，绝不让长度不合法。
+        return data.to_vec();
+    }
+    pixels.iter().map(|pixel| pixel[3]).collect()
+}
 
 /// 水平亚像素定位的相位档数（Skia/Chrome 默认 1/4 px）。
 ///
@@ -77,6 +91,11 @@ pub(crate) struct RasterGlyph {
     pub placement: Placement,
     /// R8 覆盖度，`len == width * height`，行 stride = width。
     pub data: Vec<u8>,
+    /// 该字形来自**彩色**源（COLR/CBDT/sbix，R12-8）：
+    ///
+    /// 引擎只有 R8 mask 图集，彩色字形在这里按 alpha 投影成单色覆盖度（形状可见，不是空白），
+    /// 并在排版侧产生 [`crate::text::TextDiagnostic::ColorGlyphMonochrome`]，让这个降级可观测。
+    pub color: bool,
 }
 
 /// 一个 run 的字形变体参数：可变字体实例坐标 + 合成样式（faux bold）。
@@ -227,7 +246,14 @@ impl GlyphRasterizer {
             builder = builder.normalized_coords(variation.coords.iter());
         }
         let mut scaler = builder.build();
-        let mut render = Render::new(&[Source::Outline]);
+        // R12-8：彩色字形源优先（COLR 轮廓 / CBDT-sbix 位图），最后才是普通轮廓。
+        // 只给 `Source::Outline` 时，彩色字体（Segoe UI Emoji 的 COLR、Noto Color Emoji 的
+        // CBDT）要么得到 0×0 空轮廓、要么 `has_outlines()` 为 false ⇒ **静默空白**。
+        let mut render = Render::new(&[
+            Source::ColorOutline(0),
+            Source::ColorBitmap(StrikeWith::BestFit),
+            Source::Outline,
+        ]);
         render.format(Format::Alpha);
         if subpixel_x != 0 {
             // 只动 x：水平排版的落点需要亚像素相位，竖直方向保持整像素基线（与旧实现一致）。
@@ -241,9 +267,19 @@ impl GlyphRasterizer {
             render.embolden(variation.embolden);
         }
         let image = render.render(&mut scaler, glyph as u16)?;
+        let color = image.content == Content::Color;
+        let data = if color {
+            // 彩色位图是 BGRA8（zeno 的 `Content::Color`）：引擎只有 R8 mask 图集，
+            // 取 alpha 通道当作覆盖度 —— 彩色 emoji 的形状因此可见（不再静默空白），
+            // 排字侧会记 `ColorGlyphMonochrome` 诊断。RGBA 彩色图集是后续项。
+            bgra_to_coverage(&image.data)
+        } else {
+            image.data
+        };
         Some(RasterGlyph {
             placement: image.placement,
-            data: image.data,
+            data,
+            color,
         })
     }
 

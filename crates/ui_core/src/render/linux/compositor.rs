@@ -1860,7 +1860,7 @@ mod tests {
         use crate::{
             math::{Rect, Scale},
             paint::{
-                color::{Color, ColorResolver, Interpolation},
+                color::{Color, ColorResolver},
                 instance::InstanceEncoder,
                 primitive::{Primitive, Quad, QuadPaint},
                 scene::Scene,
@@ -1909,12 +1909,14 @@ mod tests {
                 renderer.queue_atlas_upload(AtlasKind::Glyph, 64, vec![0x40u8; 64 * 64], rows);
                 let scene = red_quad_scene();
                 let mut encoder = InstanceEncoder::new();
-                let buffer = encoder.encode(
-                    &scene,
-                    Scale::ONE,
-                    &ColorResolver::new(Interpolation::default()),
-                    &crate::paint::geometry_store::GeometryStore::new(),
-                );
+                let buffer = encoder
+                    .encode(
+                        &scene,
+                        Scale::ONE,
+                        &ColorResolver,
+                        &crate::paint::geometry_store::GeometryStore::new(),
+                    )
+                    .expect("encode");
                 // 尽量让两个线程的录制 / 提交重叠（真正的并发点）。
                 barrier.wait();
                 let image = renderer

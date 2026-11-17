@@ -74,7 +74,7 @@ pub(crate) fn paint_frame(
     let mut report = pass.run()?;
     let buffer = window
         .encoder
-        .encode(&window.scene, scale, &window.resolver, geometry);
+        .encode(&window.scene, scale, &window.resolver, geometry)?;
     #[cfg(feature = "test-support")]
     {
         report.instances = buffer.len();

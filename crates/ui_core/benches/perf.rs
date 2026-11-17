@@ -23,7 +23,7 @@ use ui_core::{
     math::{Rect, Scale, Size},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::{
-        color::{Color, ColorResolver, Interpolation},
+        color::{Color, ColorResolver},
         style::{PaintSpec, StylePatch},
     },
     text::TextStyle,
@@ -173,7 +173,7 @@ fn palette() -> Vec<Color> {
 }
 
 fn bench_color_resolve(c: &mut Criterion) {
-    let resolver = ColorResolver::new(Interpolation::default());
+    let resolver = ColorResolver;
     let colors = palette();
     c.bench_function("color_resolve_256", |b| {
         b.iter(|| {
@@ -480,6 +480,127 @@ fn bench_text_update_320(c: &mut Criterion) {
     });
 }
 
+/// 只测**文本 pass**（shape 阶段）的收益：320 个单元格全变，但不跑 layout/paint/encode。
+///
+/// - `text_pass_320_parley`：字母文本（必然走 parley）；
+/// - `text_pass_320_digit`：数字文本（`DigitFastPath` 命中）。
+///
+/// 两者的差值就是「跳过 parley itemize/shaping」的直接收益；`digit_fast_path_*` 那两条是
+/// 全帧基准（被布局/绘制/编码摊薄，收益比例自然更小）。
+fn bench_text_pass_320(c: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("bench runtime");
+    let handle = runtime.handle().clone();
+    for (name, values) in [
+        (
+            "text_pass_320_parley",
+            [
+                SmolStr::new_static("frame a"),
+                SmolStr::new_static("frame b"),
+            ],
+        ),
+        (
+            "text_pass_320_digit",
+            [
+                SmolStr::new_static("1,234.56"),
+                SmolStr::new_static("1,234.57"),
+            ],
+        ),
+    ] {
+        let mut toggle = 0usize;
+        c.bench_function(name, |b| {
+            b.iter_batched(
+                || {
+                    let mut fixture = new_app(&handle);
+                    let signal = if name.ends_with("digit") {
+                        mount_digit_grid(&mut fixture)
+                    } else {
+                        mount_text_grid(&mut fixture)
+                    };
+                    let _ = fixture.app.frame(fixture.window);
+                    (fixture, signal)
+                },
+                |(mut fixture, signal)| {
+                    toggle += 1;
+                    fixture.app.write(&signal, values[toggle % 2].clone());
+                    black_box(fixture.app.refresh_text(fixture.window))
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+}
+
+/// 挂载 `TEXT_GRID_ROWS × TEXT_GRID_COLUMNS` 的数字网格（`text_update_320` 的夹具）。
+fn mount_digit_grid(fixture: &mut Fixture) -> Signal<SmolStr> {
+    let text = fixture.app.signal(SmolStr::new_static("1,234.56"));
+    let Fixture { app, window } = fixture;
+    let root = app.window(*window).expect("window").tree().root();
+    for row in 0..TEXT_GRID_ROWS {
+        for column in 0..TEXT_GRID_COLUMNS {
+            let source = text;
+            let _ = NodeBuilder::text(
+                "1,234.56",
+                TextStyle::new(11.0).with_wrap(ui_core::text::TextWrap::NoWrap),
+            )
+            .layout_override(Rect::new(
+                column as f32 * 96.0,
+                row as f32 * 14.0,
+                92.0,
+                13.0,
+            ))
+            .bind_text(move |cx| cx.read(&source))
+            .build(app.window_mut(*window).expect("window").tree_mut(), root)
+            .expect("bench digit cell");
+        }
+    }
+    text
+}
+
+/// `DigitFastPath` 的收益基准：同样的 320 个单元格全变，但文本落在数字字符集里。
+///
+/// - `digit_fast_path_320`：快速路径**开启**（默认）—— 命中时跳过 parley 的 itemize/shaping；
+/// - `digit_fast_path_off_320`：同一场景显式关闭快速路径（`App::set_digit_fast_path(false)`），
+///   作为同机同场景的对照基线。
+fn bench_digit_fast_path_320(c: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("bench runtime");
+    let handle = runtime.handle().clone();
+    let values = [
+        SmolStr::new_static("1,234.56"),
+        SmolStr::new_static("1,234.57"),
+    ];
+    for (name, enabled) in [
+        ("digit_fast_path_320", true),
+        ("digit_fast_path_off_320", false),
+    ] {
+        let mut toggle = 0usize;
+        c.bench_function(name, |b| {
+            b.iter_batched(
+                || {
+                    let mut fixture = new_app(&handle);
+                    if !enabled {
+                        fixture.app.set_digit_fast_path(false);
+                    }
+                    let signal = mount_digit_grid(&mut fixture);
+                    let _ = fixture.app.frame(fixture.window);
+                    (fixture, signal)
+                },
+                |(mut fixture, signal)| {
+                    toggle += 1;
+                    fixture.app.write(&signal, values[toggle % 2].clone());
+                    black_box(fixture.app.frame(fixture.window))
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default()
@@ -498,6 +619,8 @@ criterion_group! {
         bench_tree_build_scale,
         bench_frame_incremental_scale,
         bench_frame_full_10k,
-        bench_text_update_320
+        bench_text_update_320,
+        bench_text_pass_320,
+        bench_digit_fast_path_320
 }
 criterion_main!(benches);

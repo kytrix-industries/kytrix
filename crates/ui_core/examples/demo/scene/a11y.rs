@@ -399,7 +399,7 @@ mod tests {
 mod showcase_tests {
     use ui_core::{
         a11y::{A11yAction, A11yRole},
-        event::{Event, Key},
+        event::{Event, KeyCode},
     };
 
     use crate::scene::{
@@ -481,13 +481,13 @@ mod showcase_tests {
             let _ = app.focus_prev(window).expect("输入框");
             let focused = app.focus_prev(window).expect("滑块");
             assert_eq!(app.focused(window), Some(focused));
-            dispatch_event(&mut scene, app, &Event::Input(press(Key::ArrowRight)));
+            dispatch_event(&mut scene, app, &Event::Input(press(KeyCode::ArrowRight)));
         }
         frame(&mut test);
         // 第二步：70% → 80%，状态行与上一笔**等宽**（只靠 LAYOUT 变化触发 a11y 重发是不够的）。
         {
             let app = test.app_mut();
-            dispatch_event(&mut scene, app, &Event::Input(press(Key::ArrowRight)));
+            dispatch_event(&mut scene, app, &Event::Input(press(KeyCode::ArrowRight)));
         }
         frame(&mut test);
 

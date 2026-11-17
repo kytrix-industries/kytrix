@@ -447,7 +447,7 @@ mod tests {
     use super::{A11yCapture, FrameScript, ScriptFrame};
     use crate::{
         a11y::A11yOverride,
-        event::{Action, InputEvent, Key, KeyState, Modifiers, PointerButton},
+        event::{Action, InputEvent, KeyCode, Modifiers, PointerButton},
         math::{Point, Rect, Scale, Size},
         node::{builder::NodeBuilder, signal::Signal},
         paint::{
@@ -526,11 +526,11 @@ mod tests {
         let (app, _background) = painted_app();
         let mut script = FrameScript::new(app);
         script.push(ScriptFrame::new("首帧"));
-        script.push(ScriptFrame::new("点击").input(InputEvent::PointerDown {
-            position: Point::new(4.0, 4.0),
-            button: PointerButton::Primary,
-            modifiers: Modifiers::empty(),
-        }));
+        script.push(ScriptFrame::new("点击").input(InputEvent::pointer_down(
+            Point::new(4.0, 4.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        )));
         script.push(ScriptFrame::new("改尺寸").resize(Size::new(400.0, 300.0)));
         script.push(ScriptFrame::new("改 DPI").scale(Scale::new(2.0).expect("scale")));
         script.push(ScriptFrame::new("全量重绘").invalidate_lanes());
@@ -597,11 +597,9 @@ mod tests {
         let window = app.window_id();
         let mut script = FrameScript::new(app);
         script.push(ScriptFrame::new("首帧"));
-        script.push(ScriptFrame::new("Tab").input(InputEvent::Key {
-            key: Key::Tab,
-            state: KeyState::Down,
-            modifiers: Modifiers::empty(),
-        }));
+        script.push(
+            ScriptFrame::new("Tab").input(InputEvent::key_down(KeyCode::Tab, Modifiers::empty())),
+        );
         script.run().expect("帧脚本");
         let report = script.report();
         report.assert_rendered(0);

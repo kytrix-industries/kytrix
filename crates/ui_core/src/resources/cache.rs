@@ -1,10 +1,52 @@
-//! 图片页的 CPU 缓冲与条目记录（P13 §7）。
+//! 图片页的 CPU 缓冲与缓存索引（P13 §7）。
 //!
 //! 页缓冲是图片图集的**唯一**上传源：`Page` 恒为整页（`width * height * 4` 字节，BGRA8），
-//! tile 内容在 `ResourceCache::insert` 时直接写进页（不为每条资源保存一份像素副本），
-//! `unload` 时把该块连同 1 纹素 padding 一起清零。
+//! tile 内容在 `ResourceCache::place` 时直接写进页（不为每条资源保存一份像素副本），
+//! 引用计数归零（`unload` / `release_window`）时把该块连同 1 纹素 padding 一起清零。
+//!
+//! 两张索引表（R12-16）：
+//! - [`Entry`]：存活资源（tile + 引用计数 + LRU epoch）；
+//! - [`ContentKey`] / [`DedupeEntry`]：内容的哈希索引 + 原始字节，命中去重时**不重新解码**。
 
-use crate::{math::PhysicalRect, resources::ResourceImage};
+use std::hash::Hasher;
+
+use ahash::AHasher;
+use bytes::Bytes;
+
+use crate::{
+    math::PhysicalRect,
+    resources::{ResourceId, ResourceImage},
+};
+
+/// 图片内容的哈希键：`(len, 64 bit 哈希)`。
+///
+/// 哈希本身**不能**证明相等：命中后调用方必须用原始字节 memcmp（见 [`DedupeEntry::bytes`]）。
+/// `len` 在键里，长度不同的字节连 memcmp 都不用做。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ContentKey {
+    len: u32,
+    hash: u64,
+}
+
+impl ContentKey {
+    /// 对一份字节做内容键（`ahash`，固定 keys；只用于索引，不用于任何安全判定）。
+    pub(crate) fn new(bytes: &[u8]) -> Self {
+        let mut hasher = AHasher::default();
+        hasher.write(bytes);
+        Self {
+            len: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
+            hash: hasher.finish(),
+        }
+    }
+}
+
+/// 去重表的一条：内容 → 资源 + 原始字节（memcmp 用）。
+pub(crate) struct DedupeEntry {
+    /// 该内容当前的资源句柄（回收时置空整条）。
+    pub id: ResourceId,
+    /// 原始输入字节（`Bytes`：`insert_async` 路径零拷贝共享）。
+    pub bytes: Bytes,
+}
 
 /// 一条存活资源。
 pub(crate) struct Entry {
@@ -14,6 +56,12 @@ pub(crate) struct Entry {
     pub alloc: etagere::AllocId,
     /// 分配到的整块（含 padding；卸载时清零它）。
     pub padded: PhysicalRect,
+    /// 引用计数：同一内容每被引用一次 +1，归零才回收 tile。
+    pub refcount: u32,
+    /// 最近一次被引用的 LRU epoch（`ResourceCache::release_window` 的回收顺序）。
+    pub last_used: u64,
+    /// 内容键（回收时用它删去重表项）。
+    pub key: ContentKey,
 }
 
 /// 图片页的 CPU 缓冲（BGRA8 预乘 sRGB，行主序，行宽 `width * 4`）。
@@ -95,7 +143,7 @@ impl Page {
 
 #[cfg(test)]
 mod tests {
-    use super::Page;
+    use super::{ContentKey, Page};
     use crate::math::PhysicalRect;
 
     fn page(width: u32, height: u32) -> Page {
@@ -181,5 +229,16 @@ mod tests {
         page.write(PhysicalRect::new(0, 0, 2, 2), &[6u8; 16], 8);
         page.clear_rect(PhysicalRect::new(1, 1, 1, 1));
         assert_eq!(page.bytes(), &[6u8; 16]);
+    }
+
+    #[test]
+    fn content_key_is_stable_for_equal_bytes_and_splits_different_lengths() {
+        let first = ContentKey::new(b"logo");
+        let second = ContentKey::new(b"logo");
+        let longer = ContentKey::new(b"logos");
+
+        assert_eq!(first, second, "同一份字节的内容键必须相同");
+        assert_ne!(first, longer, "长度进键：不同长度不该互相命中");
+        assert_ne!(ContentKey::new(b"logo"), ContentKey::new(b"olgo"));
     }
 }

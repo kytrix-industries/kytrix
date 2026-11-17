@@ -77,6 +77,7 @@ use crate::{
 pub(crate) mod atlas;
 pub(crate) mod cache;
 pub(crate) mod context;
+pub(crate) mod fast_path;
 pub(crate) mod inline_flow;
 pub(crate) mod raster;
 pub(crate) mod shape;
@@ -135,6 +136,38 @@ pub enum TextDirection {
     Rtl,
 }
 
+/// 溢出裁剪策略（CSS `text-overflow`；R12-9）。
+///
+/// | 值 | 语义 | 对照 |
+/// |---|---|---|
+/// | `Clip` | 直接裁剪，不追加任何字形（默认） | CSS `text-overflow: clip`、Qt 默认 |
+/// | `Ellipsis` | 在最后一可见行末尾追加省略号（`…`，缺字形时退成 `...`） | CSS `text-overflow: ellipsis`、Flutter `TextOverflow.ellipsis`、`Qt::ElideRight` |
+///
+/// 省略号的 advance **计入可用宽度**（`shape` 期已塑形，见 `text/shape.rs` 的
+/// `clip_with_ellipsis`），与 Chrome `LayoutNG` 一致。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum TextOverflow {
+    /// 直接裁剪（默认）。
+    #[default]
+    Clip,
+    /// 末尾加省略号。
+    Ellipsis,
+}
+
+/// 断行严格度（CSS `line-break`；映射到 parley `LineBreak`）。
+///
+/// 影响 CJK 行首禁则：`Strict`（默认）禁止行首出现 `。」` 等，`Loose` 放宽，
+/// `Normal` 居中。多语言行情终端需要按语言切换（与 `locale` 一起决定）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TextLineBreak {
+    /// 最宽松（CSS `line-break: loose`）。
+    Loose,
+    /// 常规（CSS `line-break: normal`）。
+    Normal,
+    /// 最严格（CSS `line-break: strict`，parley 默认）。
+    Strict,
+}
+
 /// 一段文本的样式（**值语义**，不是句柄）。
 ///
 /// `Clone` 而不是 `Copy`：`family` 是 `SmolStr`。字号的单位是**逻辑像素**；物理 ppem 由
@@ -160,6 +193,13 @@ pub struct TextStyle {
     pub wrap: TextWrap,
     /// 基准方向。
     pub direction: TextDirection,
+    /// 溢出裁剪策略（R12-9）。
+    pub overflow: TextOverflow,
+    /// 行数上限（`0` = 不限；CSS `-webkit-line-clamp`，R12-9）。
+    ///
+    /// 超过上限的行被丢弃；`overflow == Ellipsis` 时在最后一个可见行末尾加省略号。
+    /// 用 `0` 表示「不限」而不是 `Option<u16>`：后者占 4 B，而这一维在建表时几乎恒为 0。
+    pub max_lines: u16,
     /// OpenType 特性标签（如 `tnum` 等宽数字、`ss01` 风格集）。
     ///
     /// **为什么必须有**：价格 / 成交量这类高频数字表格要求每列数字宽度一致，否则内容一变
@@ -168,10 +208,9 @@ pub struct TextStyle {
     ///
     /// 低频字段（家族名覆盖 + OpenType 特性）。None = 两者都用默认。
     ///
-    /// 用 Blink 的 `RareInheritedData` 模式：这两个字段在绝大多数文本上是空的，却各占
-    /// 24 B / 8 B。TextStyle` 内联在 `TextContent` 里、`TextContent` 又内联在 `Node` 里，
-    /// 每个节点都要为它们付内存。合成一个 `Option<Box<_>>`（8 B，null 优化，`None` 不分配）
-    /// 让 TextStyle 从 80 B 回到 56 B，`Node` 也就重新有了余量。
+    /// 用 Blink 的 `RareInheritedData` 模式：这些字段在绝大多数文本上是空的，却各占
+    /// 8–24 B。`TextStyle` 内联在 `TextContent` 里、`TextContent` 又内联在 `Node` 里，
+    /// 每个节点都要为它们付内存。合成一个 `Option<Box<_>>`（8 B，null 优化，`None` 不分配）。
     pub extras: Option<Box<TextStyleExtras>>,
 }
 
@@ -233,10 +272,44 @@ pub struct TextStyleExtras {
     pub family: Option<SmolStr>,
     /// OpenType 特性（`tnum` 等宽数字等）。空 = 不请求任何特性。
     pub font_features: Option<Box<FeatureSet>>,
+    /// BCP-47 语言标签（如 `zh-Hans`/`ja`/`ko`）：决定 CJK 字形变体、标点宽度与 `locl`。
+    ///
+    /// 用 `SmolStr` 而不是 `fontique::Language`：`TextStyle` 是**公开**类型，把 fontique 的
+    /// 类型放进去等于把字体库拉进公开面（与 `TextContext` 的 crate 私有同理）。
+    /// 解析发生在 `shape`（每个样式每次 shape 一次），不在缓存键之外引入隐藏维度。
+    pub locale: Option<SmolStr>,
+    /// 可变字体轴值（`wght`/`opsz`/`wdth`…）：`None` = 用字体默认实例。
+    pub font_variations: Option<Box<FontVariationSet>>,
+    /// `font-stretch` 百分比（`100` = 常规；CSS `font-stretch: 87.5%`）。
+    pub stretch: Option<u16>,
+    /// 词间距（逻辑像素；CSS `word-spacing`）。
+    pub word_spacing: Option<f32>,
+    /// 断行严格度（CSS `line-break`）。
+    pub line_break: Option<TextLineBreak>,
 }
 
 /// 一组 OpenType 特性。
 pub type FeatureSet = ThinSlice<TextFeature>;
+
+/// 一组可变字体轴值。
+pub type FontVariationSet = ThinSlice<TextFontVariation>;
+
+/// 一个可变字体轴值（4 字节标签 + 轴值，如 `wght = 700.0`）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextFontVariation {
+    /// 4 字节轴标签（如 `*b"wght"`）。
+    pub tag: [u8; 4],
+    /// 轴值（字体 fvar 轴的空间，如 `wght` 的 100..=900）。
+    pub value: f32,
+}
+
+impl TextFontVariation {
+    /// 以 4 字节标签 + 轴值构造。
+    #[must_use]
+    pub const fn new(tag: [u8; 4], value: f32) -> Self {
+        Self { tag, value }
+    }
+}
 
 /// 一组行内盒。
 pub type InlineBoxSet = ThinSlice<InlineBoxSpec>;
@@ -287,6 +360,8 @@ impl Default for TextStyle {
             alignment: TextAlign::Start,
             wrap: TextWrap::Wrap,
             direction: TextDirection::Auto,
+            overflow: TextOverflow::Clip,
+            max_lines: 0,
             extras: None,
         }
     }
@@ -295,21 +370,13 @@ impl Default for TextStyle {
 impl TextStyle {
     /// 以字号建默认样式。
     ///
-    /// 不是 `const fn`：`font_features` 是 `Box<[TextFeature]>`，空值需要一次`r
-    /// `Box::from([])`（`Box::new` 在 const 上下文不可用）。
+    /// 不是 `const fn`：`extras` 是 `Option<Box<_>>`，`None` 虽不分配，但保持构造函数可演进
+    /// （与 `Default` 同一字段集）。
     #[must_use]
     pub fn new(size: f32) -> Self {
         Self {
             size,
-            weight: 400,
-            slant: TextSlant::Normal,
-            line_height: None,
-            letter_spacing: 0.0,
-            color: Color::BLACK,
-            alignment: TextAlign::Start,
-            wrap: TextWrap::Wrap,
-            direction: TextDirection::Auto,
-            extras: None,
+            ..Self::default()
         }
     }
 
@@ -327,6 +394,71 @@ impl TextStyle {
         self.extras
             .as_ref()
             .and_then(|extras| extras.font_features.as_deref())
+    }
+
+    /// BCP-47 语言标签（`None` = 用引擎/系统默认）。
+    #[must_use]
+    pub fn locale(&self) -> Option<&str> {
+        self.extras
+            .as_ref()
+            .and_then(|extras| extras.locale.as_deref())
+    }
+
+    /// 可变字体轴值集（`None` = 用字体默认实例）。
+    #[must_use]
+    pub fn font_variations(&self) -> Option<&FontVariationSet> {
+        self.extras
+            .as_ref()
+            .and_then(|extras| extras.font_variations.as_deref())
+    }
+
+    /// `font-stretch` 百分比（`None` = 常规 100%）。
+    #[must_use]
+    pub fn stretch(&self) -> Option<u16> {
+        self.extras.as_ref().and_then(|extras| extras.stretch)
+    }
+
+    /// 词间距（逻辑像素；`None` = 0）。
+    #[must_use]
+    pub fn word_spacing(&self) -> Option<f32> {
+        self.extras.as_ref().and_then(|extras| extras.word_spacing)
+    }
+
+    /// 断行严格度（`None` = parley 默认 `Strict`）。
+    #[must_use]
+    pub fn line_break(&self) -> Option<TextLineBreak> {
+        self.extras.as_ref().and_then(|extras| extras.line_break)
+    }
+
+    /// 行数上限（`None` = 不限）。
+    #[must_use]
+    pub fn max_lines(&self) -> Option<u16> {
+        (self.max_lines > 0).then_some(self.max_lines)
+    }
+
+    /// 溢出裁剪策略。
+    #[must_use]
+    pub const fn overflow(&self) -> TextOverflow {
+        self.overflow
+    }
+
+    /// 该样式是否与 `other` 产生**相同的形状结果**（R12-11：忽略 `color` 与 `alignment`）。
+    ///
+    /// 形状缓存键的等价类就是这个函数：`color` 只影响 run 的 brush、`alignment` 只影响
+    /// `align()` 之后的偏移，两者都不改变 glyph id / advance / 断行。缓存命中后必须用
+    /// **同一个**等价关系复验（否则「同键不同色」会被判成 miss）。
+    #[must_use]
+    pub fn same_shaping_inputs(&self, other: &Self) -> bool {
+        self.size.to_bits() == other.size.to_bits()
+            && self.weight == other.weight
+            && self.slant == other.slant
+            && self.line_height.map(f32::to_bits) == other.line_height.map(f32::to_bits)
+            && self.letter_spacing.to_bits() == other.letter_spacing.to_bits()
+            && self.wrap == other.wrap
+            && self.direction == other.direction
+            && self.overflow == other.overflow
+            && self.max_lines == other.max_lines
+            && self.extras == other.extras
     }
 
     /// 取（必要时创建）低频字段容器。
@@ -414,7 +546,63 @@ impl TextStyle {
         self
     }
 
+    /// 链式：溢出裁剪策略 + 行数上限（R12-9）。
+    #[must_use]
+    pub const fn with_overflow(mut self, overflow: TextOverflow, max_lines: u16) -> Self {
+        self.overflow = overflow;
+        self.max_lines = max_lines;
+        self
+    }
+
+    /// 链式：语言标签（BCP-47）。
+    #[must_use]
+    pub fn with_locale(mut self, locale: impl Into<SmolStr>) -> Self {
+        self.extras_mut().locale = Some(locale.into());
+        self
+    }
+
+    /// 链式：可变字体轴值。
+    #[must_use]
+    pub fn with_font_variations(
+        mut self,
+        variations: impl IntoIterator<Item = TextFontVariation>,
+    ) -> Self {
+        let mut combined: Vec<TextFontVariation> = self
+            .extras
+            .as_ref()
+            .and_then(|extras| extras.font_variations.as_ref())
+            .map(|existing| existing.as_slice().to_vec())
+            .unwrap_or_default();
+        combined.extend(variations);
+        self.extras_mut().font_variations = thin_slice(combined);
+        self
+    }
+
+    /// 链式：`font-stretch` 百分比（`100` = 常规）。
+    #[must_use]
+    pub fn with_stretch(mut self, stretch: u16) -> Self {
+        self.extras_mut().stretch = Some(stretch);
+        self
+    }
+
+    /// 链式：词间距（逻辑像素）。
+    #[must_use]
+    pub fn with_word_spacing(mut self, word_spacing: f32) -> Self {
+        self.extras_mut().word_spacing = Some(word_spacing);
+        self
+    }
+
+    /// 链式：断行严格度。
+    #[must_use]
+    pub fn with_line_break(mut self, line_break: TextLineBreak) -> Self {
+        self.extras_mut().line_break = Some(line_break);
+        self
+    }
+
     /// 形状缓存的样式哈希（f32 全部按 `to_bits`；字段集即缓存契约，改动即失效）。
+    ///
+    /// **不含 `color` / `alignment`**（R12-11）：两者不改变 glyph id / advance / 断行。
+    /// 等价关系见 [`TextStyle::same_shaping_inputs`]。
     pub(crate) fn hash_into(&self, hasher: &mut ahash::AHasher) {
         use core::hash::Hash;
 
@@ -424,28 +612,24 @@ impl TextStyle {
         (self.slant as u8).hash(hasher);
         self.line_height.map(f32::to_bits).hash(hasher);
         self.letter_spacing.to_bits().hash(hasher);
-        hash_color(self.color, hasher);
-        (self.alignment as u8).hash(hasher);
         (self.wrap as u8).hash(hasher);
         (self.direction as u8).hash(hasher);
+        (self.overflow as u8).hash(hasher);
+        self.max_lines.hash(hasher);
         // 特性参与缓存键：不同特性集必须 shape 出不同的字形位置。
         self.font_features().map(|set| set.as_slice()).hash(hasher);
-    }
-}
-
-fn hash_color(color: Color, hasher: &mut ahash::AHasher) {
-    use core::hash::Hash;
-
-    let (tag, components): (u8, [f32; 4]) = match color {
-        Color::Srgb { r, g, b, alpha } => (0, [r, g, b, alpha]),
-        Color::LinearSrgb { r, g, b, alpha } => (1, [r, g, b, alpha]),
-        Color::DisplayP3 { r, g, b, alpha } => (2, [r, g, b, alpha]),
-        Color::Oklab { l, a, b, alpha } => (3, [l, a, b, alpha]),
-        Color::Oklch { l, c, h, alpha } => (4, [l, c, h, alpha]),
-    };
-    tag.hash(hasher);
-    for component in components {
-        component.to_bits().hash(hasher);
+        // R12-10：新增的 shaping 输入同样必须进键（否则历史条目会被静默误命中）。
+        self.locale().hash(hasher);
+        self.stretch().hash(hasher);
+        self.word_spacing().map(f32::to_bits).hash(hasher);
+        self.line_break().map(|kind| kind as u8).hash(hasher);
+        self.font_variations()
+            .map(|set| {
+                set.iter()
+                    .map(|variation| (variation.tag, variation.value.to_bits()))
+                    .collect::<Vec<_>>()
+            })
+            .hash(hasher);
     }
 }
 
@@ -713,6 +897,10 @@ pub struct TextPassReport {
     pub skipped: usize,
     /// 本次累积的脏行段数（P07 的增量上传输入）。
     pub dirty_spans: usize,
+    /// 走数字快速路径完成的塑形次数（R12 的 `DigitFastPath` 命中数）。
+    pub fast_path_shaped: usize,
+    /// 进入快速路径判定的塑形次数（命中率分母：`fast_path_shaped / fast_path_queries`）。
+    pub fast_path_queries: usize,
 }
 
 /// `App::layout_text` 的统计（B1 的第二阶段：按内容宽重排 + 光栅）。
@@ -733,6 +921,8 @@ pub struct TextLayoutReport {
     pub tiles_reused: usize,
     /// 因图集满而走「清空 + 重建」的次数。
     pub atlas_rebuilds: usize,
+    /// 本次 pass 逐 tile LRU 淘汰的字形数（R12-1：容量逃逸时不再整页清空）。
+    pub atlas_evictions: usize,
 }
 
 /// 字体栈的健康状态（N4：测试与诊断的**唯一**跳过判据，避免散落 `eprintln!`）。
@@ -781,6 +971,18 @@ pub enum TextDiagnostic {
     /// 该 run 依赖平台的合成粗体/斜体（v1 **不应用** 合成，只记录限制）。
     SyntheticStyle {
         /// 该 run 覆盖的源文本字节区间。
+        text_range: Range<usize>,
+    },
+    /// 彩色字形（COLR/CBDT/sbix）被压成**单色覆盖度**渲染（R12-8）。
+    ///
+    /// 引擎当前只有 R8 mask 图集；彩色字形按 alpha 投影后仍能看见形状（不再是静默空白），
+    /// RGBA 彩色图集是后续项。这条诊断的作用是：不让「彩色 → 单色」这个降级不可观测。
+    ColorGlyphMonochrome {
+        /// 字体标签（`<blob 字节数>#<TTC 索引>`）。
+        font: SmolStr,
+        /// 字形 id。
+        glyph: u32,
+        /// 该字形所属 run 的源文本字节区间。
         text_range: Range<usize>,
     },
 }
@@ -858,8 +1060,12 @@ mod tests {
     #[test]
     fn text_payload_sizes_are_budgeted() {
         // P1-2.3 新增 font_features（等宽数字 tnum），同时把 family 与它一起收进
-        // `TextStyleExtras`（Blink 的 RareInheritedData 模式）：TextStyle 反而从 72 降到 56，
-        // `TextContent` 从 112 到 96，`Node` 从 1144 到 1128 —— 既拿到了新能力又腾出了余量。
+        // `TextStyleExtras`（Blink 的 RareInheritedData 模式）：TextStyle 反而从 72 降到 56。
+        // R12-9/R12-10 的新字段全部收进 `extras` 的 `Box` 与既有 padding
+        // （`overflow`/`max_lines` 3 B 落在 f32/Option<Box> 的尾巴里）⇒ 尺寸不变：
+        // 既拿到了 ellipsis/截断与 locale/变体轴/字宽/词距/断行严格度，又不给 `Node` 加负担。
+        // word_spacing / line_break 全部收进 `extras` 的 `Box`，不占内联空间）。
+        // `TextContent` 随之内联 +8。`ShapedLine` 不变（80 B）。
         assert_eq!(size_of::<TextStyle>(), 56);
         assert_eq!(size_of::<TextContent>(), 96);
         assert_eq!(size_of::<InlineBoxSpec>(), 40);

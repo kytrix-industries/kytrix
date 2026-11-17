@@ -11,10 +11,16 @@ pub(crate) mod atlas;
 /// 背景色编码（三平台消费：Windows 用 sRGB 字节、macOS 用 layer + linear、Linux 用 linear；
 /// 各平台未使用的编码函数按 `cfg` 不参与编译 —— 避免 dead_code）。
 pub(crate) mod color;
+/// 呈现色彩空间的**唯一**声明点（三端只做翻译，不得各自决定；R06-10）。
+pub(crate) mod colorspace;
 pub(crate) mod compositor;
 pub(crate) mod damage;
 pub(crate) mod frame;
 pub(crate) mod retire;
+/// 三套 shader 的构建期契约校验（R06-5）的唯一实现：`build.rs` 用 `include!` 编进去执行，
+/// 单元测试（`#[cfg(test)]`）覆盖它的**失败路径**。生产构建不引用它的任何符号。
+#[cfg(test)]
+mod shader_contract;
 pub(crate) mod stats;
 pub(crate) mod timer;
 /// `RootUniform`（112 B）的唯一 CPU 构造点（三平台共用；contract.md §6）。

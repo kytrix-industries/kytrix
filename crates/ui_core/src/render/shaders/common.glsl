@@ -1,13 +1,12 @@
 // common.glsl -- 由 7 个 stage 文件 #include（无 #version）。
-// 与 common.hlsl 逐行等价；契约：src/render/shaders/contract.md
+// 与 common.hlsl / common.metal 逐行等价；契约：src/render/shaders/contract.md
+// 任何数学函数体的改动必须三份同步（build.rs 的归一化逐行比对会拦住漂移）。
 
 // <kytrix-constants>
 #define KYTRIX_KIND_QUAD 0u
 #define KYTRIX_KIND_GLYPH 1u
 #define KYTRIX_KIND_IMAGE 2u
 #define KYTRIX_KIND_SHADOW 3u
-
-#define KYTRIX_FLAG_OPAQUE 1u
 
 #define KYTRIX_TEXTURE_GLYPH 0u
 #define KYTRIX_TEXTURE_IMAGE 1u
@@ -19,8 +18,13 @@
 
 #define KYTRIX_MAX_CLIP_DEPTH 8u
 #define KYTRIX_CLIP_VERTEX_SLACK 2.0
-#define KYTRIX_SHADOW_SIGMA_DIVISOR 3.0
+// σ = blur × 0.5（CSS `box-shadow` 的「模糊半径」定义；与 Skia `SkBlurMaskFilter` 的
+// σ 同义，Skia 的 radius 换算见 contract.md §4）。
+#define KYTRIX_SHADOW_SIGMA_SCALE 0.5
 #define KYTRIX_SHADOW_SIGMA_MIN 0.35
+// 解析 AA 的「完全覆盖」距离（逻辑像素）：几何通道的纹理管线没有覆盖率属性，
+// 用它把 aa_coverage 推到 1.0。
+#define KYTRIX_AA_INSIDE -65536.0
 // </kytrix-constants>
 
 struct FrameUniform {
@@ -61,6 +65,7 @@ layout(set = 0, binding = 5) uniform sampler2D image_atlas;
 
 // GLSL 没有 lerp / saturate：提供同名包装，保证函数体与 HLSL 逐行一致。
 float saturate(float x) { return clamp(x, 0.0, 1.0); }
+float lerp(float a, float b, float t) { return mix(a, b, t); }
 vec2 lerp(vec2 a, vec2 b, vec2 t) { return mix(a, b, t); }
 vec4 lerp(vec4 a, vec4 b, float t) { return mix(a, b, t); }
 
@@ -77,9 +82,13 @@ vec2 to_ndc(vec2 world_px) {
 // AA 与 clip_mask 在 `common.frag.glsl`：它们用 `fwidth`，而 GLSL 禁止顶点阶段求导，
 // 本文件又被 3 个 vertex stage 包含（F-145）。
 
+// 圆角矩形 SDF。半径按 CSS 规则夹到 `min(half_size)`：`r > min(half)` 会让
+// `q = |p| - half + r` 恒正 ⇒ 等值线反过来「越裁越大」（内容溢出）。编码器已按
+// 同一规则规范化，这里是第二道防线（数据异常也不出现反向错误）。
 float sd_rounded_rect(vec2 p, vec2 half_size, vec4 radii) {
     float r = (p.x > 0.0) ? ((p.y > 0.0) ? radii.z : radii.y)
                           : ((p.y > 0.0) ? radii.w : radii.x);
+    r = clamp(r, 0.0, min(half_size.x, half_size.y));
     vec2 q = abs(p) - half_size + r;
     return min(max(q.x, q.y), 0.0) + length(max(q, vec2(0.0))) - r;
 }
@@ -96,14 +105,38 @@ float erf_approx(float x) {
     return (x < 0.0) ? -e : e;
 }
 
-// sigma = blur / 3：3 sigma = blur 与 params0.w = blur + 1 的外扩一致。
-float analytic_shadow(float d, float blur) {
-    float sigma = max(blur / KYTRIX_SHADOW_SIGMA_DIVISOR, KYTRIX_SHADOW_SIGMA_MIN);
-    return 0.5 * (1.0 - erf_approx(d / (sigma * 1.41421356)));
+// 标准正态的尾概率 Φ(-x)：半平面高斯模糊的**精确**覆盖率。
+float shadow_cdf(float x) {
+    return 0.5 * (1.0 - erf_approx(x * 0.70710678));
+}
+
+// 解析阴影覆盖率：可分离 2D 高斯。
+//
+// σ = blur × KYTRIX_SHADOW_SIGMA_SCALE（= blur / 2），与 CSS `box-shadow` /
+// `filter: blur(r)` 的「模糊半径」定义一致（Figma 同）。Skia 的 `SkBlurMaskFilter`
+// 用 `σ = radius × 0.57735 + 0.5`（其 SPECULAR/MASK 光栅器的 sigma 换算），因此同一
+// 视觉参数下本式的 σ 比 Skia 的略小 —— 换算关系写在 contract.md §4。
+//
+// 形状：轴对齐矩形的二维高斯响应是**可分离**的
+//   Φ(-dx/σ) × Φ(-dy/σ)   （dx/dy = 到左右/上下边的带符号距离，正 = 外侧）
+// 直角（r = 0）时它就是精确解（旧实现的半平面近似在角部把阴影「填实」约 58%）。
+// 圆角处边界是圆弧，分离式会高估角部覆盖，因此按「角部圆度 × r/(r+σ)」混合到
+// SDF 半平面解 Φ(-sdf/σ)：r = 0 退化为分离式，r >> σ 时角部走圆弧解。
+float analytic_shadow(vec2 p, vec2 half_size, vec4 radii, float blur) {
+    float sigma = max(blur * KYTRIX_SHADOW_SIGMA_SCALE, KYTRIX_SHADOW_SIGMA_MIN);
+    float dx = abs(p.x) - half_size.x;
+    float dy = abs(p.y) - half_size.y;
+    float rect_part = shadow_cdf(dx / sigma) * shadow_cdf(dy / sigma);
+    float corner_r = clamp(max(max(radii.x, radii.y), max(radii.z, radii.w)), 0.0,
+                         min(half_size.x, half_size.y));
+    float sdf_part = shadow_cdf(sd_rounded_rect(p, half_size, radii) / sigma);
+    float corner = saturate(min(dx + corner_r, dy + corner_r) / max(corner_r, 1.0e-4));
+    return lerp(rect_part, sdf_part, corner * (corner_r / (corner_r + sigma)));
 }
 
 // ---- 渐变 ----------------------------------------------------------------
 
+// 双色渐变：线性预乘空间插值（与合成/AA 同一个空间；R05-7 的唯一插值空间）。
 vec4 gradient_eval(uint kind, vec2 p, vec2 half_size, vec4 c0, vec4 c1) {
     float t;
     if (kind == KYTRIX_GRADIENT_HORIZONTAL) {

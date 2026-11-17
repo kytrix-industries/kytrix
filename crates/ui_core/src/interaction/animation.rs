@@ -5,7 +5,7 @@
 
 use crate::{
     math::Point,
-    paint::color::{Color, ColorResolver, Interpolation},
+    paint::color::{Color, ColorResolver},
 };
 
 /// 进度（`0..=1`；`duration == 0` ⇒ 立即 1.0）。
@@ -33,10 +33,11 @@ pub(crate) fn lerp_point(from: Point, to: Point, t: f32) -> Point {
     Point::new(lerp(from.x, to.x, t), lerp(from.y, to.y, t))
 }
 
-/// 颜色插值：**sRGB 分量**线性插值（设计 §11.2：主题色过渡要按感知/屏幕空间走，而不是线性光空间）。
+/// 颜色插值：**线性预乘空间**（R05-7：与合成 / AA / 渐变同一套数学）。
 ///
-/// 步骤：各端点解析成线性预乘 → 反预乘 + gamma 编码到 sRGB → 逐分量插值 → gamma 解码回线性 →
-/// 用非预乘的结果构造 `Color`（端点精确相等，`t` 只会落在两者之间）。
+/// 直接委托 [`ColorResolver::lerp_color`]：两端各自解析成线性预乘 → 在预乘分量上插值 →
+/// 解回非预乘线性色。旧实现在 **sRGB 编码空间**插值（注释自述「按感知/屏幕空间走」），
+/// 于是同一个主题色过渡到一半时，它作为背景（线性合成）与作为动画值（sRGB 插值）是两种颜色。
 #[must_use]
 pub(crate) fn lerp_color(from: Color, to: Color, t: f32) -> Color {
     if t >= 1.0 {
@@ -45,61 +46,7 @@ pub(crate) fn lerp_color(from: Color, to: Color, t: f32) -> Color {
     if t <= 0.0 {
         return from;
     }
-    let resolver = ColorResolver::new(Interpolation::default());
-    let start = resolver.resolve(from).to_array();
-    let end = resolver.resolve(to).to_array();
-    let start = to_srgb(start);
-    let end = to_srgb(end);
-    let mixed = [
-        lerp(start[0], end[0], t),
-        lerp(start[1], end[1], t),
-        lerp(start[2], end[2], t),
-        lerp(start[3], end[3], t),
-    ];
-    let alpha = mixed[3];
-    if alpha <= 0.0 {
-        return Color::linear_srgb(0.0, 0.0, 0.0, 0.0);
-    }
-    let linear = [
-        from_srgb(mixed[0]),
-        from_srgb(mixed[1]),
-        from_srgb(mixed[2]),
-    ];
-    Color::linear_srgb(linear[0], linear[1], linear[2], alpha)
-}
-
-/// 线性预乘 → 非预乘 + sRGB 编码（gamma 传输函数，逐分量）。
-fn to_srgb(premultiplied: [f32; 4]) -> [f32; 4] {
-    let alpha = premultiplied[3];
-    if alpha <= 0.0 {
-        return [0.0; 4];
-    }
-    [
-        srgb_encode(premultiplied[0] / alpha),
-        srgb_encode(premultiplied[1] / alpha),
-        srgb_encode(premultiplied[2] / alpha),
-        alpha,
-    ]
-}
-
-/// sRGB 编码（线性 → sRGB；IEC 61966-2-1 分段函数）。
-fn srgb_encode(value: f32) -> f32 {
-    let value = value.clamp(0.0, 1.0);
-    if value <= 0.003_130_8 {
-        value * 12.92
-    } else {
-        1.055 * value.powf(1.0 / 2.4) - 0.055
-    }
-}
-
-/// sRGB 解码（sRGB → 线性）。
-fn from_srgb(value: f32) -> f32 {
-    let value = value.clamp(0.0, 1.0);
-    if value <= 0.040_45 {
-        value / 12.92
-    } else {
-        ((value + 0.055) / 1.055).powf(2.4)
-    }
+    ColorResolver.lerp_color(from, to, t)
 }
 
 #[cfg(test)]
@@ -143,9 +90,7 @@ mod tests {
         assert_eq!(lerp_color(from, to, 1.0), to);
 
         let mid = lerp_color(from, to, 0.5);
-        let components = crate::paint::color::ColorResolver::new(Default::default())
-            .resolve(mid)
-            .to_array();
+        let components = crate::paint::color::ColorResolver.resolve(mid).to_array();
         // 线性空间的中点亮度介于两端之间（sRGB 非线性 ⇒ 不会正好是 0.5 的 8 位值）。
         assert!(components[3] > 0.99, "alpha 必须保持不透明");
         for axis in &components[..3] {
@@ -164,9 +109,7 @@ mod tests {
         let mixed = lerp_color(clear, solid, 0.0);
         assert!(mixed.is_transparent(), "t=0 原样返回 from");
         let half = lerp_color(clear, solid, 0.5);
-        let alpha = crate::paint::color::ColorResolver::new(Default::default())
-            .resolve(half)
-            .to_array()[3];
+        let alpha = crate::paint::color::ColorResolver.resolve(half).to_array()[3];
         assert!(alpha > 0.0, "半途必须有 alpha");
     }
 }

@@ -72,13 +72,15 @@ pub(crate) fn new() -> NodeTree {
         subtree_bounds: vec![Rect::default()],
         a11y_slots: vec![None],
         a11y_dirty: 1,
-        text_dirty: Vec::new(),
+        text_dirty: crate::node::tree::content::TextDirtyQueue::new(),
+        text_layout_dirty: crate::node::tree::content::TextDirtyQueue::new(),
         removed_lanes: Vec::new(),
         hoisted: ahash::HashMap::default(),
         layout_epoch: 0,
         layout_stats: LayoutStats::default(),
         invalid_measure: None,
         geometry_damage_escalation: false,
+        geometry_transforms: ahash::HashMap::default(),
     }
 }
 
@@ -298,6 +300,7 @@ pub(crate) fn remove(
             tree.a11y_dirty = tree.a11y_dirty.saturating_sub(1);
         }
         tree.hoisted.remove(id);
+        tree.geometry_transforms.remove(id);
         if let Some(target) = tree.arena.remove(*id)
             && !target.deps.is_empty()
         {

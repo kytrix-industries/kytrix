@@ -61,7 +61,7 @@ fn opaque(color: Color) -> Color {
 /// IEC 61966-2-1 的传递函数编码。
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn background_srgb(color: Color) -> [f32; 4] {
-    let linear = ColorResolver::default().resolve(opaque(color)).components;
+    let linear = ColorResolver.resolve(opaque(color)).components;
     let encode = |component: f32| {
         let c = component.clamp(0.0, 1.0);
         if c <= 0.003_130_8 {
@@ -80,7 +80,7 @@ pub(crate) fn background_srgb(color: Color) -> [f32; 4] {
 /// [`background_srgb`]（按字节直写）。
 #[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 pub(crate) fn background_linear(color: Color) -> [f32; 4] {
-    let linear = ColorResolver::default().resolve(opaque(color)).components;
+    let linear = ColorResolver.resolve(opaque(color)).components;
     [linear[0], linear[1], linear[2], 1.0]
 }
 

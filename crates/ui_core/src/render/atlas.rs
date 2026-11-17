@@ -39,10 +39,11 @@ pub(crate) const ATLAS_PAGE_STEPS: [u32; 3] = [MIN_ATLAS_PAGE, MIN_ATLAS_PAGE * 
 pub(crate) const MAX_RESIDENT_STAGING_BYTES: u64 = 1 << 20;
 
 /// 下一档页；`None` = 已到上限。
-fn next_page(page: u32) -> Option<u32> {
+fn next_page(page: u32, max_page: u32) -> Option<u32> {
     ATLAS_PAGE_STEPS
         .iter()
         .copied()
+        .filter(|candidate| *candidate <= max_page)
         .find(|candidate| *candidate > page)
 }
 
@@ -98,6 +99,9 @@ pub(crate) fn pack_rows(page: &[u8], extent: u32, texel: u32, rows: &DirtyRows, 
 
 /// 一个 `AtlasKind` 的**单页**分配器（P02 §10.4）。
 pub(crate) struct AtlasAllocator {
+    /// 页档阶梯的上限（生产 = `MAX_ATLAS_PAGE`；测试可以调小，用于在几十个 tile 内验证
+    /// 逐 tile LRU 淘汰与软失败，而不必真的塞满一张 2048² 页）。
+    max_page: u32,
     kind: AtlasKind,
     page: (u32, u32),
     allocator: EtagereAllocator,
@@ -127,6 +131,7 @@ impl AtlasAllocator {
     /// 新建（页尺寸 = `page`；字形页由 `text::atlas` 选档，图片页固定最大档）。
     pub(crate) fn with_page(kind: AtlasKind, page: (u32, u32)) -> Self {
         Self {
+            max_page: MAX_ATLAS_PAGE,
             kind,
             page,
             allocator: EtagereAllocator::new(size2(page.0 as i32, page.1 as i32)),
@@ -135,6 +140,15 @@ impl AtlasAllocator {
             generation: 1,
             dirty: DirtyRows::default(),
         }
+    }
+
+    /// 仅测试：把页档上限钉在 `page`（调小阶梯，用来在少量 tile 内触发 LRU 淘汰/软失败）。
+    #[cfg(test)]
+    pub(crate) fn cap_page_for_test(&mut self, page: u32) {
+        debug_assert!(page > 0);
+        self.max_page = page;
+        self.page = (page, page);
+        self.clear();
     }
 
     pub(crate) fn kind(&self) -> AtlasKind {
@@ -240,7 +254,7 @@ impl AtlasAllocator {
     /// 页尺寸变化 ⇒ 旧 tile 全部失效、整页内容必须重传（`clear` 的语义），
     /// 调用方负责同步清空自己的缓存（[`crate::text::atlas::GlyphAtlas::clear`]）。
     pub(crate) fn grow(&mut self) -> bool {
-        let Some(next) = next_page(self.page.0) else {
+        let Some(next) = next_page(self.page.0, self.max_page) else {
             return false;
         };
         self.page = (next, next);

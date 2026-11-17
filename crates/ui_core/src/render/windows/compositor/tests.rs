@@ -13,7 +13,7 @@ use crate::{
     math::{PhysicalRect, Point, Rect, Scale, Size, Transform},
     paint::{
         atlas::{AtlasKind, AtlasTile},
-        color::{Color, ColorResolver, Interpolation},
+        color::{Color, ColorResolver},
         geometry::{GeometryId, GeometryPipeline, IndexType, Topology},
         instance::{FrameOp, GeometryDrawGpu, InstanceEncoder},
         primitive::{GeometryDraw, GlyphRun, Image, PositionedGlyph, Primitive, Quad, QuadPaint},
@@ -64,12 +64,14 @@ fn dropping_a_renderer_releases_its_shared_device_resources() {
         );
         let scene = Scene::empty();
         let mut encoder = InstanceEncoder::new();
-        let buffer = encoder.encode(
-            &scene,
-            Scale::ONE,
-            &resolver(),
-            &crate::paint::geometry_store::GeometryStore::new(),
-        );
+        let buffer = encoder
+            .encode(
+                &scene,
+                Scale::ONE,
+                &resolver(),
+                &crate::paint::geometry_store::GeometryStore::new(),
+            )
+            .expect("encode");
         let mut frame = full_plan((16, 16));
         let mut timings = FrameTimings::new();
         renderer
@@ -136,12 +138,14 @@ fn two_renderers_render_concurrently_on_one_shared_gpu() {
                 Color::srgb(1.0, 0.0, 0.0, 1.0),
             ));
             let mut encoder = InstanceEncoder::new();
-            let buffer = encoder.encode(
-                &text_free,
-                Scale::ONE,
-                &resolver(),
-                &crate::paint::geometry_store::GeometryStore::new(),
-            );
+            let buffer = encoder
+                .encode(
+                    &text_free,
+                    Scale::ONE,
+                    &resolver(),
+                    &crate::paint::geometry_store::GeometryStore::new(),
+                )
+                .expect("encode");
             // 尽量让两个线程的录制 / 提交重叠（真正的并发点）。
             barrier.wait();
             let mut timings = FrameTimings::new();
@@ -161,7 +165,7 @@ fn two_renderers_render_concurrently_on_one_shared_gpu() {
     }
 }
 fn resolver() -> ColorResolver {
-    ColorResolver::new(Interpolation::default())
+    ColorResolver
 }
 
 fn full_plan(size: (u32, u32)) -> FramePlan {
@@ -277,7 +281,7 @@ fn test_desc() -> crate::paint::geometry::GeometryDesc {
     crate::paint::geometry::GeometryDesc {
         vertex_bytes: bytes::Bytes::new(),
         index_bytes: bytes::Bytes::new(),
-        vertex_stride: 8,
+        vertex_stride: 12,
         index_type: IndexType::U16,
         topology: Topology::TriangleList,
         bounds: Rect::new(0.0, 0.0, 1.0, 1.0),
@@ -360,12 +364,14 @@ fn geometry_root_without_clip_uses_the_viewport() {
 fn instance_bytes_are_128_per_primitive() {
     let scene = one_lane_scene(quad(Rect::new(0.0, 0.0, 8.0, 8.0), Color::WHITE));
     let mut encoder = InstanceEncoder::new();
-    let buffer = encoder.encode(
-        &scene,
-        Scale::ONE,
-        &resolver(),
-        &crate::paint::geometry_store::GeometryStore::new(),
-    );
+    let buffer = encoder
+        .encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        )
+        .expect("encode");
     assert_eq!(buffer.as_bytes().len(), 128);
     assert_eq!(buffer.ops().len(), 1);
     assert!(matches!(
@@ -387,12 +393,14 @@ fn clear_half_encodes_once_to_srgb() {
     renderer.set_background_color([0.5, 0.5, 0.5, 0.5]);
     let scene = Scene::empty();
     let mut encoder = InstanceEncoder::new();
-    let buffer = encoder.encode(
-        &scene,
-        Scale::ONE,
-        &resolver(),
-        &crate::paint::geometry_store::GeometryStore::new(),
-    );
+    let buffer = encoder
+        .encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        )
+        .expect("encode");
     let mut frame = full_plan((8, 8));
     let mut timings = FrameTimings::new();
     renderer
@@ -438,12 +446,14 @@ fn quad_pixels_are_srgb_encoded_and_clipped_by_bounds() {
         Color::srgb(1.0, 0.0, 0.0, 1.0),
     ));
     let mut encoder = InstanceEncoder::new();
-    let buffer = encoder.encode(
-        &scene,
-        Scale::ONE,
-        &resolver(),
-        &crate::paint::geometry_store::GeometryStore::new(),
-    );
+    let buffer = encoder
+        .encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        )
+        .expect("encode");
     let mut frame = full_plan((64, 64));
     let mut timings = FrameTimings::new();
     let stats = renderer
@@ -468,12 +478,14 @@ fn draw_calls_follow_full_and_partial_scissor_passes() {
         Color::srgb(1.0, 0.0, 0.0, 1.0),
     ));
     let mut encoder = InstanceEncoder::new();
-    let buffer = encoder.encode(
-        &scene,
-        Scale::ONE,
-        &resolver(),
-        &crate::paint::geometry_store::GeometryStore::new(),
-    );
+    let buffer = encoder
+        .encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        )
+        .expect("encode");
     let mut timings = FrameTimings::new();
 
     let mut first = full_plan((64, 64));
@@ -556,12 +568,14 @@ fn ops_outside_the_damage_are_skipped() {
     ));
     scene.set_order(&[lane]);
     let mut encoder = InstanceEncoder::new();
-    let buffer = encoder.encode(
-        &scene,
-        Scale::ONE,
-        &resolver(),
-        &crate::paint::geometry_store::GeometryStore::new(),
-    );
+    let buffer = encoder
+        .encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        )
+        .expect("encode");
     let mut timings = FrameTimings::new();
 
     let mut first = full_plan((64, 64));
@@ -595,12 +609,14 @@ fn damage_isolates_pixels_across_two_real_frames() {
         Color::srgb(0.0, 0.0, 1.0, 1.0),
     ));
     let mut encoder = InstanceEncoder::new();
-    let buffer = encoder.encode(
-        &blue,
-        Scale::ONE,
-        &resolver(),
-        &crate::paint::geometry_store::GeometryStore::new(),
-    );
+    let buffer = encoder
+        .encode(
+            &blue,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        )
+        .expect("encode");
     let mut first = full_plan(size);
     let mut timings = FrameTimings::new();
     renderer
@@ -612,12 +628,14 @@ fn damage_isolates_pixels_across_two_real_frames() {
         Color::srgb(1.0, 0.0, 0.0, 1.0),
     ));
     let mut encoder = InstanceEncoder::new();
-    let buffer = encoder.encode(
-        &red,
-        Scale::ONE,
-        &resolver(),
-        &crate::paint::geometry_store::GeometryStore::new(),
-    );
+    let buffer = encoder
+        .encode(
+            &red,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        )
+        .expect("encode");
     let damage = [PhysicalRect::new(0, 0, 32, 64)];
     let mut second = partial_plan(&damage, size);
     assert!(matches!(second.plan(), Plan::Partial(_)));
@@ -646,8 +664,9 @@ fn geometry_ui_triangle_renders_white() {
         return;
     };
     let id = GeometryId::for_test(0, 0);
+    // `Ui` 顶点 = position(f32×2) + 解析 AA 的覆盖率距离(f32)；-1 = 形状内部（R05-6）。
     #[rustfmt::skip]
-    let vertices: [f32; 6] = [0.0, 0.0, 32.0, 0.0, 0.0, 32.0];
+    let vertices: [f32; 9] = [0.0, 0.0, -1.0, 32.0, 0.0, -1.0, 0.0, 32.0, -1.0];
     let indices: [u16; 3] = [0, 1, 2];
     let vertex_bytes: Vec<u8> = vertices.iter().flat_map(|v| v.to_ne_bytes()).collect();
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_ne_bytes()).collect();
@@ -668,12 +687,14 @@ fn geometry_ui_triangle_renders_white() {
         color: Color::WHITE,
     }));
     let mut encoder = InstanceEncoder::new();
-    let buffer = encoder.encode(
-        &scene,
-        Scale::ONE,
-        &resolver(),
-        &crate::paint::geometry_store::GeometryStore::new(),
-    );
+    let buffer = encoder
+        .encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        )
+        .expect("encode");
     let mut frame = full_plan((64, 64));
     let mut timings = FrameTimings::new();
     renderer
@@ -726,12 +747,14 @@ fn image_primitive_samples_the_image_atlas() {
         modulation: Color::WHITE,
     }));
     let mut encoder = InstanceEncoder::new();
-    let buffer = encoder.encode(
-        &scene,
-        Scale::ONE,
-        &resolver(),
-        &crate::paint::geometry_store::GeometryStore::new(),
-    );
+    let buffer = encoder
+        .encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        )
+        .expect("encode");
     let mut frame = full_plan((64, 64));
     let mut timings = FrameTimings::new();
     renderer
@@ -777,12 +800,14 @@ fn glyph_probe(page: u32) -> bool {
         }],
     }));
     let mut encoder = InstanceEncoder::new();
-    let buffer = encoder.encode(
-        &scene,
-        Scale::ONE,
-        &resolver(),
-        &crate::paint::geometry_store::GeometryStore::new(),
-    );
+    let buffer = encoder
+        .encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        )
+        .expect("encode");
     let mut frame = full_plan((64, 64));
     let mut timings = FrameTimings::new();
     if renderer
@@ -818,12 +843,14 @@ fn odd_surface_readback_has_no_row_padding() {
     };
     let scene = Scene::empty();
     let mut encoder = InstanceEncoder::new();
-    let buffer = encoder.encode(
-        &scene,
-        Scale::ONE,
-        &resolver(),
-        &crate::paint::geometry_store::GeometryStore::new(),
-    );
+    let buffer = encoder
+        .encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        )
+        .expect("encode");
     let mut frame = full_plan((63, 17));
     let mut timings = FrameTimings::new();
     renderer
@@ -848,12 +875,14 @@ fn resize_then_submit_keeps_the_capacity_contract() {
         Color::srgb(0.0, 1.0, 0.0, 1.0),
     ));
     let mut encoder = InstanceEncoder::new();
-    let buffer = encoder.encode(
-        &scene,
-        Scale::ONE,
-        &resolver(),
-        &crate::paint::geometry_store::GeometryStore::new(),
-    );
+    let buffer = encoder
+        .encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        )
+        .expect("encode");
     let mut frame = full_plan((32, 32));
     let mut timings = FrameTimings::new();
     renderer
@@ -863,12 +892,14 @@ fn resize_then_submit_keeps_the_capacity_contract() {
     renderer.resize((96, 64)).expect("resize");
     assert_eq!(renderer.surface(), (96, 64));
     let mut encoder = InstanceEncoder::new();
-    let buffer = encoder.encode(
-        &scene,
-        Scale::ONE,
-        &resolver(),
-        &crate::paint::geometry_store::GeometryStore::new(),
-    );
+    let buffer = encoder
+        .encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        )
+        .expect("encode");
     let mut frame = full_plan((96, 64));
     renderer
         .submit_buffer(FrameIndex::from_raw(2), buffer, &mut frame, &mut timings)
@@ -886,12 +917,14 @@ fn render_snapshot_returns_the_surface_pixels() {
     };
     let scene = Scene::empty();
     let mut encoder = InstanceEncoder::new();
-    let buffer = encoder.encode(
-        &scene,
-        Scale::ONE,
-        &resolver(),
-        &crate::paint::geometry_store::GeometryStore::new(),
-    );
+    let buffer = encoder
+        .encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        )
+        .expect("encode");
     let image = renderer.render_snapshot(buffer).expect("snapshot");
     assert_eq!((image.width, image.height), (16, 8));
     assert_eq!(image.rgba8.len(), 16 * 8 * 4);
@@ -939,12 +972,14 @@ fn the_content_size_is_independent_of_the_buffer() {
         Color::srgb(1.0, 0.0, 0.0, 1.0),
     ));
     let mut encoder = InstanceEncoder::new();
-    let buffer = encoder.encode(
-        &scene,
-        Scale::ONE,
-        &resolver(),
-        &crate::paint::geometry_store::GeometryStore::new(),
-    );
+    let buffer = encoder
+        .encode(
+            &scene,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        )
+        .expect("encode");
     let mut frame = full_plan((32, 24));
     let mut timings = FrameTimings::new();
     renderer
@@ -1126,12 +1161,14 @@ fn a_background_refresh_never_touches_the_main_content_persist() {
         Color::srgb(1.0, 0.0, 0.0, 1.0),
     ));
     let mut encoder = InstanceEncoder::new();
-    let buffer = encoder.encode(
-        &red,
-        Scale::ONE,
-        &resolver(),
-        &crate::paint::geometry_store::GeometryStore::new(),
-    );
+    let buffer = encoder
+        .encode(
+            &red,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        )
+        .expect("encode");
     let mut frame = full_plan((64, 64));
     let mut timings = FrameTimings::new();
     renderer
@@ -1172,12 +1209,14 @@ fn a_shrink_prime_copies_the_old_content_into_the_new_persist() {
         Color::srgb(1.0, 0.0, 0.0, 1.0),
     ));
     let mut encoder = InstanceEncoder::new();
-    let buffer = encoder.encode(
-        &red,
-        Scale::ONE,
-        &resolver(),
-        &crate::paint::geometry_store::GeometryStore::new(),
-    );
+    let buffer = encoder
+        .encode(
+            &red,
+            Scale::ONE,
+            &resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        )
+        .expect("encode");
     let mut frame = full_plan((64, 64));
     let mut timings = FrameTimings::new();
     renderer

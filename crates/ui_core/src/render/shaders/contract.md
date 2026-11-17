@@ -18,11 +18,11 @@
 | offset  | 字节 | 字段            | 类型                          | 语义                                                                                     |
 |---------|------|-----------------|-------------------------------|------------------------------------------------------------------------------------------|
 | **0**   | 16   | `bounds`        | `[f32;4]` / `float4` / `vec4` | `x, y, w, h`：SDF 图元为**物理像素、未取整浮点**；图集图元为**整数矩形的浮点表示**       |
-| 16      | 16   | `corner_radius` | 同上                          | `tl, tr, br, bl`（物理像素，逐角 `<= min(w,h)/2`，编码器已 clamp）                       |
+| 16      | 16   | `corner_radius` | 同上                          | `tl, tr, br, bl`（物理像素，逐角 `<= min(w,h)/2`；编码器按 CSS 规则 clamp，shader 再有同样的防御性 clamp） |
 | 32      | 16   | `color0`        | 同上                          | **linear premultiplied** sRGB RGBA：实色 / 渐变起色 / 阴影色 / 字形色 / 图片调制色       |
 | 48      | 16   | `color1`        | 同上                          | 渐变终色 **或** 边框色（互斥）；无则全 0                                                 |
 | 64      | 16   | `params0`       | 同上                          | `border_width, shadow_blur, gradient_kind, aa_padding`（物理像素）                       |
-| 80      | 16   | `params1`       | 同上                          | `clip_index, texture_index, kind, flags`（**整数编码进 f32**）                           |
+| 80      | 16   | `params1`       | 同上                          | `clip_index, texture_index, kind, clip_depth`（**整数编码进 f32**）                       |
 | 96      | 16   | `uv`            | 同上                          | 图集 tile `u0, v0, u1, v1`（归一化，**用边**，无半纹素偏移）                             |
 | 112     | 16   | `clip_rect`     | 同上                          | clip 链**交集 AABB**（物理浮点，`x, y, w, h`）                                           |
 | **128** | —    | **总计**        | —                             | `size_of == 128`、`align_of == 16`、8 个 `offset_of!` 断言（已落地 `paint/instance.rs`） |
@@ -36,8 +36,10 @@
 3. `params1` 的四个分量是**整数编码进 f32**（`value as f32`，取值 `[0, 2^24)`）。shader 一律用**数值转换**取回：
    `(uint)x` / `uint(x)`。**禁止位重解释**：`asuint` / `asfloat` / `as_type<>` / `floatBitsToUint` / `floatBitsToInt` /
    `bitcast` 一律不得出现（f32 存的是数值，不是整数的位模式）。
-4. `flags` bit 0 = `OPAQUE`，bit 1..=23 **保留恒 0**；`params1.y` 对非图集 kind 写 0 并忽略；`uv` 对非图集 kind 写 0 并忽略；
-   `color1` 无用途时写 0。shader **不得**读取保留位/保留字段来决定分支。
+4. `params1.w` = **GPU 裁剪链的真实链长**（`clip_index` 指向的链上表项数，`0` = 无裁剪）：shader 用它
+   收口 `clip_mask` 的循环。链长 > `KYTRIX_MAX_CLIP_DEPTH` 时编码期直接返回
+   `EngineError::ClipDepthExceeded`，shader 不会静默少裁。`params1.y` 对非图集 kind 写 0 并忽略；
+   `uv` 对非图集 kind 写 0 并忽略；`color1` 无用途时写 0。
 5. `bounds.zw` 必须 `>= 0` 且有限（编码器保证）；shader 仍取 `max(bounds.zw, 0)` 作为防御性一致。
 
 ## 2. `kind` / `texture_index` / `gradient_kind` / `flags`
@@ -54,15 +56,23 @@
 
 `texture_index`：`TEXTURE_GLYPH = 0`（R8 覆盖度图集）、`TEXTURE_IMAGE = 1`（BGRA8 sRGB 图集）。
 `gradient_kind`：`NONE = 0`、`HORIZONTAL = 1`、`VERTICAL = 2`、`RADIAL = 3`。
-`flags`：`FLAG_OPAQUE = 1`（bit 0）。判据由编码器唯一实现：
+`clip_depth`（`params1.w`）：链长，见 §1 硬约束 4。
 
-```text
-opaque = kind ∈ {QUAD, GLYPH, IMAGE} && gradient_kind == 0 && color0.is_opaque()
-         && (kind != QUAD || border_width == 0 || color1.is_opaque())
-```
+> **已删除** `FLAG_OPAQUE`（R05-11）：它原本只被编码器写、没有任何读者（shader 不读、后端也没有
+> 无混合管线变体），而判据本身对 AA 边缘/边框也不成立（圆角边与边框环在任何像素上都不是
+> 完全不透明）。`params1.w` 现在承载 `clip_depth` —— 有读者的语义，并且让「链长与 shader 循环
+> 不一致」变成编码期可观测的错误，而不是静默少裁。
 
-shader **不使用** `FLAG_OPAQUE`：它只供 P09 选「无混合管线变体」。`src.a == 1` 时
-`src + dst×(1−src.a) ≡ src`，两个变体的结果逐位相同。
+**裁剪链的构造规则（R05-10，对齐 Skia `SkClipStack` / WebRender 的 clip rect 合并）**：
+
+1. 全部**轴对齐矩形** clip（四角半径全 0）在编码期求交，链上只有**一条**表项；
+2. **圆角** clip 各占一层（圆角形状的交集不是矩形，无法压成一条）；
+3. 完全相同的圆角 clip 按 `(parent, rect 位模式, radii 位模式)` **去重**；
+4. 交集为空 / 零宽高的表项 ⇒ `w`/`h` 非正 ⇒ shader 直接返回覆盖率 0（全裁）。
+
+这样「滚动容器 + 画布区是同一个矩形」时覆盖率不再相乘（旧实现 0.5 × 0.5 = 0.25 的暗边），
+矩形嵌套多少层都只占一项；`clip_depth` 只有在圆角层数真正超限时才可能触顶，且超限是**编码期
+错误**（不是 release 下静默丢最外层）。
 
 ## 3. 颜色空间与混合（唯一转换点）
 
@@ -73,6 +83,7 @@ shader **不使用** `FLAG_OPAQUE`：它只供 P09 选「无混合管线变体�
 | 输出     | 片元输出 **linear premultiplied RGBA**，写进 **sRGB 格式**的渲染目标：D3D12 `*_UNORM_SRGB` / Metal `*.bgra8Unorm_srgb` / Vulkan `*_SRGB` |
 | 编码     | linear→sRGB 由目标格式在写回时完成**一次**；混合发生在编码前的 linear 值上                                                               |
 | 禁止     | shader 内 `pow(x, 2.2)` / `pow(x, 1/2.2)` / 手写 sRGB 曲线；对 R8 字形图集声明 sRGB 格式；对 sRGB 纹理再手动解码                         |
+| 插值空间 | **唯一**：线性预乘。合成、AA、`gradient_eval`、CPU 侧 `ColorResolver::lerp` 全部同一套数学；引擎不提供第二种插值空间（旧的 `Interpolation::Oklab/Oklch` 是只影响死代码的伪配置，已删除，R05-7） |
 | 函数锚点 | `apply_gamma(linear)` 在 v1 是**恒等函数**（`return c;`）：编码点只有目标格式一处                                                        |
 
 blend state（三平台逐字相同）：
@@ -89,11 +100,12 @@ write_mask = R | G | B | A
 
 | 函数                                        | 语义（逐字实现）                                                                                                    |
 |---------------------------------------------|---------------------------------------------------------------------------------------------------------------------|
-| `sd_rounded_rect(p, half_size, radii)`      | 按象限取半径；`q = abs(p) - half_size + r`；`min(max(q.x,q.y),0) + length(max(q,0)) - r`                            |
+| `sd_rounded_rect(p, half_size, radii)`      | 按象限取半径后 `r = clamp(r, 0, min(half_size.x, half_size.y))`（CSS 规则，防 `r > min/2` 时 SDF 反向「越裁越大」）；`q = abs(p) - half_size + r`；`min(max(q.x,q.y),0) + length(max(q,0)) - r` |
 | `aa_coverage(d)`                            | `w = max(fwidth(d), 1e-5); saturate(0.5 - d / w)`（1 px 解析 AA，`d` 单位 = 物理像素）                              |
-| `analytic_shadow(d, blur)`                  | `σ = max(blur/3, 0.35)`；`0.5 × (1 − erf(d / (σ√2)))`；`erf` 用 Abramowitz–Stegun 7.1.26                            |
+| `shadow_cdf(x)`                             | `0.5 × (1 − erf(x × 0.70710678))` = 标准正态尾概率 Φ(−x)；`erf` 用 Abramowitz–Stegun 7.1.26                        |
+| `analytic_shadow(p, half_size, radii, blur)` | `σ = max(blur × 0.5, 0.35)`（CSS `box-shadow` 的模糊半径语义）；轴对齐矩形部分用**可分离**二维高斯 `Φ(−dx/σ)·Φ(−dy/σ)`（直角时的精确解），角部按「角部圆度 × r/(r+σ)」混合到 `Φ(−sdf/σ)`；`r = 0` 时退化为精确的分离式 |
 | `gradient_eval(kind, p, half_size, c0, c1)` | 线性 `(p.x+hx)/(2hx)`；垂直 `(p.y+hy)/(2hy)`；径向 `length(p)/min(hx,hy)`；`saturate(t)` 后 `lerp`（premultiplied） |
-| `clip_mask(world_px, clip_index)`           | `clip_index == 0 ⇒ 1`；否则沿 `parent` 链 ≤ 8 层，`m *= aa_coverage(sd_rounded_rect(...))`                          |
+| `clip_mask(world_px, clip_index, clip_depth)` | `clip_index == 0 ⇒ 1`；否则沿 `parent` 链跑 `min(clip_depth, 8)` 层；**任一层 `w <= 0 或 h <= 0` ⇒ 直接返回 0**（零尺寸 clip 全裁，不是 0.5 的鬼线）；`m *= aa_coverage(sd_rounded_rect(...))` |
 | `apply_gamma(c)`                            | v1 恒等（见 §3）                                                                                                    |
 
 `fwidth` 纪律：只在**实例级一致**的分支里调用（`kind` / `border_width` / `clip_index` 都是逐实例常量）。因此
@@ -116,7 +128,8 @@ uv_t     = (world_px - full_lo) / max(full_hi - full_lo, 1e-6)
 uv       = lerp(uv.xy, uv.zw, uv_t)      // 注意：**不是** corner01
 ```
 
-`params0.w`（aa_padding，编码器唯一来源）：Quad **1.0**、Shadow **blur + 1.0**、图集（Glyph/Image）**0.0**。
+`params0.w`（aa_padding，编码器唯一来源）：Quad **1.0**、Shadow **3σ + 1.0**（`σ = blur/2`）、图集
+（Glyph/Image）**0.0**。
 片元用**真实** `bounds` 求 `local_px = world_px − (bounds.xy + bounds.zw/2)`；扩出去的边缘覆盖率自然为 0。
 
 **UV 必须按未夹紧的四边形求比例**：`clip_rect` 夹紧只为省片元，它改变的是几何覆盖范围，
@@ -203,8 +216,28 @@ geometry 顶点布局（P02 §9.4 冻结）：
 
 | pipeline             | stride | 布局                                                    |
 |----------------------|--------|---------------------------------------------------------|
-| `Ui`                 | 8 B    | `position: float2`（逻辑像素）                          |
+| `Ui`                 | 12 B   | `position: float2`（逻辑像素）+ `coverage: float`（到形状边界的**有符号距离**，逻辑像素，负 = 内部） |
 | `Textured { atlas }` | 16 B   | `position: float2` + `uv: float2`（归一化到对应图集页） |
+
+`Ui` 的解析 AA（R05-6）：网格沿形状边界向外扩约 1 物理像素并携带覆盖率距离，片元
+`aa_coverage(coverage × DPI)` 得到覆盖率 —— 与 Skia 的 AA 三角化同一模型，**不依赖 MSAA**
+（三后端一致，无 multisample 目标 / resolve 附件）。`Textured` 没有覆盖率属性，其顶点写
+`KYTRIX_AA_INSIDE` 让覆盖率为 1。
+
+### 呈现色彩空间（R06-10）
+
+引擎只产出一件事：**sRGB 编码的 8-bit RGBA**（`apply_gamma` 恒等，编码由 sRGB 渲染目标完成一次）。
+呈现面必须**显式声明**它是 sRGB / Rec.709，决定点在共享层 `render/colorspace.rs`：
+
+| 平台 | 显式声明 | API |
+|------|----------|-----|
+| Windows | `DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709` | `IDXGISwapChain3::SetColorSpace1`（+ `CheckColorSpaceSupport`） |
+| macOS | `kCGColorSpaceSRGB` | `CAMetalLayer.setColorspace` |
+| Linux | `VK_COLOR_SPACE_SRGB_NONLINEAR_KHR` | surface format 筛选 + `VkSwapchainCreateInfoKHR::imageColorSpace` |
+
+三端不得各自决定；HDR（`G2084_NONE_P2020` / `extendedRange`）**显式不支持**：接入时需要新增
+`PresentedColorSpace` 变体并让三端的 `match` 逐端处理（渲染目标格式、混合空间、背景色绝对值、
+图集纹理格式都要重估）。
 
 ## 8. 图集采样
 

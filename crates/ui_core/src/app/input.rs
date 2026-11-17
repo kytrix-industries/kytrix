@@ -1,26 +1,42 @@
-//! 指针 / 键盘 / 滚轮输入分发与指针会话（含拖拽、点击计数、光标与捕获请求）。
+//! 指针 / 键盘 / 滚轮输入分发与指针会话（含拖拽、点击计数、悬停、捕获与光标请求）。
 //!
 //! `app.rs` 的 `impl App` 只保留同名薄委托，方法体在这里（零行为变更的纯拆分）。
+//!
+//! ## 语义（R02 分区的修复点）
+//!
+//! - **只有主键产生 `click`、抢焦点**（R02-3）：次键（右键/中键/侧键）只更新 press 记录与
+//!   hover，不派发 `ActionSource::Click`、不改焦点。
+//! - **自动重复不触发绑定**（R02-2）：`repeat == true` 的按键只更新「按住」状态与默认导航
+//!   行为，不查绑定表、不激活焦点控件 —— 长按 Enter 不会重复下单。
+//! - **悬停可观测**（R02-4）：悬停节点变化时派生 [`Event::HoverChanged`]、给变化的节点标
+//!   `PAINT` 并请求一帧；读点是 [`crate::app::App::hovered`]。
+//! - **拖拽有启动阈值**（R02-9）：按下只登记候选，位移越过 `InputThresholds::drag_distance`
+//!   才派发 `DragPhase::Start`（delta 用真实位移）并取得指针捕获。
+//! - **指针捕获是公开 API**（R02-8）：`App::capture_pointer` / `App::release_pointer`。
+//! - **滚动带阶段/单位/二维 delta**（R02-10/11）；**事件时间戳**贯穿点击与拖拽判定（R02-14）。
+
+use std::time::Instant;
 
 use smallvec::SmallVec;
 
 use super::{App, ClickRecord};
 use crate::{
     event::{
-        Action, ActionSource, InputEvent, InputOutcome, Key, KeyState, Modifiers, PointerButton,
+        Action, ActionSource, Event, InputEvent, InputOutcome, KeyCode, KeyState, Modifiers,
+        PointerButton, ScrollPhase, ScrollUnit,
     },
     interaction::{
-        ActionCtx, DragInfo, DragPhase, DragSession, DragState, InputThresholds, PressRecord,
-        ScrollAxis, ScrollHandle, drag as drag_util, focus, overlay as overlay_util, scroll,
+        ActionCtx, DragInfo, DragPhase, DragSession, DragState, InputThresholds, PendingDrag,
+        PressRecord, ScrollHandle, drag as drag_util, focus, overlay as overlay_util, scroll,
     },
     layout::hit_test::HitResult,
-    math::{Point, Size},
+    math::Point,
     node::id::NodeId,
     paint::style::Cursor,
     window::WindowId,
 };
 
-/// 覆盖输入阈值（平台层用 `GetDoubleClickTime` / `SM_CXDRAG` 初始化；测试也可显式设置）。
+/// 覆盖输入阈值（平台层用系统真值初始化；测试也可显式设置）。
 /// 消费者：`App::set_input_thresholds`。
 pub(crate) fn set_input_thresholds(app: &mut App, thresholds: InputThresholds) {
     app.thresholds = thresholds;
@@ -103,37 +119,57 @@ pub(crate) fn dispatch_input(app: &mut App, window: WindowId, event: InputEvent)
     }
     app.validate_focus(window);
     match event {
+        // 进入客户区与移动走同一条路径：两者都要重算命中、悬停与光标。区别只在**应用侧**：
+        // `PointerEnter` 让观测者能区分「刚刚进入」与「在窗口内移动」。
+        InputEvent::PointerEnter {
+            position,
+            modifiers,
+            ..
+        }
+        | InputEvent::PointerMove {
+            position,
+            modifiers,
+            ..
+        } => app.on_pointer_move(window, position, modifiers, &mut outcome),
         InputEvent::PointerDown {
             position,
             button,
             modifiers,
-        } => app.on_pointer_down(window, position, button, modifiers, &mut outcome),
-        InputEvent::PointerMove {
-            position,
-            modifiers,
-        } => {
-            app.on_pointer_move(window, position, modifiers, &mut outcome);
-        }
+            timestamp,
+        } => app.on_pointer_down(window, position, button, modifiers, timestamp, &mut outcome),
         InputEvent::PointerUp {
             position,
             button,
             modifiers,
-        } => app.on_pointer_up(window, position, button, modifiers, &mut outcome),
-        InputEvent::PointerLeave => app.on_pointer_leave(window),
+            timestamp,
+        } => app.on_pointer_up(window, position, button, modifiers, timestamp, &mut outcome),
+        InputEvent::PointerLeave { modifiers, .. } => app.on_pointer_leave(window, modifiers),
         // 系统取消指针会话（捕获丢失 / 系统弹窗夺走输入）：与失焦同一套收尾，但**不**动
         // 焦点与 a11y 焦点态 —— 焦点没有变，只是这次指针交互作废。
-        InputEvent::PointerCancel => app.cancel_pointer_session(window),
+        InputEvent::PointerCancel { .. } => app.cancel_pointer_session(window),
         InputEvent::Scroll {
             position,
-            delta_x,
-            delta_y,
+            delta,
+            unit,
+            phase,
             modifiers,
-        } => app.on_scroll(window, position, delta_x, delta_y, modifiers, &mut outcome),
+            ..
+        } => app.on_scroll(
+            window,
+            position,
+            delta,
+            unit,
+            phase,
+            modifiers,
+            &mut outcome,
+        ),
         InputEvent::Key {
-            key,
+            code,
             state,
+            repeat,
             modifiers,
-        } => app.on_key(window, key, state, modifiers, &mut outcome),
+            ..
+        } => app.on_key(window, code, state, repeat, modifiers, &mut outcome),
         InputEvent::Text { .. } => {}
     }
     outcome
@@ -153,6 +189,7 @@ pub(crate) fn on_pointer_down(
     position: Point,
     button: PointerButton,
     modifiers: Modifiers,
+    timestamp: Instant,
     outcome: &mut InputOutcome,
 ) {
     if app
@@ -165,18 +202,6 @@ pub(crate) fn on_pointer_down(
     }
     let hit = app.hit_at(window, position);
     outcome.hit = hit;
-    if let Some(target) = app.windows.get_mut(&window) {
-        let pointer = target.pointer_mut();
-        pointer.modifiers = modifiers;
-        pointer.last_hit = hit;
-        pointer.hover = hit.map(|result| result.node);
-        pointer.press = Some(PressRecord {
-            node: hit.map(|result| result.node),
-            position,
-            button,
-            at: app.clock,
-        });
-    }
     // ① 浮层外部点击（优先于焦点：否则会同时关浮层 + 触发下层按钮）。
     let outside = app.windows.get(&window).and_then(|target| {
         let tree = target.tree();
@@ -186,48 +211,57 @@ pub(crate) fn on_pointer_down(
         // 关闭浮层的这一次按下必须**整体消费**：抬起时不得再派发给下层。
         if let Some(target) = app.windows.get_mut(&window) {
             target.pointer_mut().press = None;
+            target.pointer_mut().pending_drag = None;
         }
         app.remove_node(window, node);
         return;
     }
-    // ② 焦点：命中链上最近的可聚焦祖先（没有 ⇒ 清空）。
-    let focus_target = app.windows.get(&window).and_then(|target| {
-        hit.and_then(|result| focus::nearest_focusable(target.tree(), result.node))
-    });
-    app.set_focus(window, focus_target);
-    // ③ 拖拽：命中链上第一条 `on_drag`。
+    // ② 模态浮层的焦点作用域（R02-12）：作用域外的按下整体消费 —— 不抢焦点、不激活下层
+    //    动作（Blink `<dialog showModal>` 的 `inert` 背景、Qt 对话框的作用域同义）。
+    if let Some(scope) = app.focus_scope(window) {
+        let inside = app.windows.get(&window).is_some_and(|target| {
+            hit.is_some_and(|result| {
+                crate::interaction::overlay::is_in_subtree(target.tree(), result.node, scope)
+            })
+        });
+        if !inside {
+            return;
+        }
+    }
+    // ③ 记录按下（点击判定与拖拽抑制的输入）。
+    if let Some(target) = app.windows.get_mut(&window) {
+        let pointer = target.pointer_mut();
+        pointer.modifiers = modifiers;
+        pointer.last_hit = hit;
+        pointer.press = Some(PressRecord {
+            node: hit.map(|result| result.node),
+            position,
+            button,
+            at: timestamp,
+        });
+    }
+    update_hover(app, window, hit.map(|result| result.node));
+    // ④ 焦点：只有**主键**抢焦点（R02-3）。右键唤起上下文菜单不该改变焦点。
+    if button.is_primary() {
+        let focus_target = app.windows.get(&window).and_then(|target| {
+            hit.and_then(|result| focus::nearest_focusable(target.tree(), result.node))
+        });
+        app.set_focus(window, focus_target);
+    }
+    // ⑤ 拖拽候选：命中链上第一条 `on_drag`。此时**不**派发 `DragPhase::Start`，也不捕获指针
+    //    —— 位移越过阈值才转正（R02-9）。
     let drag = app
         .windows
         .get(&window)
         .and_then(|target| hit.and_then(|result| focus::drag_target(target.tree(), result.node)));
-    if let Some((node, action)) = drag {
-        if let Some(target) = app.windows.get_mut(&window) {
-            let pointer = target.pointer_mut();
-            pointer.drag = Some(DragSession {
-                node,
-                action: action.clone(),
-                origin: position,
-                current: position,
-                phase: DragPhase::Start,
-            });
-            pointer.capture = true;
-        }
-        app.capture_request = Some((window, true));
-        let handled = app.dispatch_action_with_hit(
-            window,
+    if let Some((node, action)) = drag
+        && let Some(target) = app.windows.get_mut(&window)
+    {
+        target.pointer_mut().pending_drag = Some(PendingDrag {
             node,
-            action.clone(),
-            ActionSource::Drag {
-                phase: DragPhase::Start,
-                delta: Point::ZERO,
-            },
-            hit,
-            modifiers,
-        );
-        if handled {
-            outcome.action = Some(action);
-            outcome.target = Some(node);
-        }
+            action,
+            origin: position,
+        });
     }
 }
 
@@ -241,49 +275,71 @@ pub(crate) fn on_pointer_move(
 ) {
     let hit = app.hit_at(window, position);
     outcome.hit = hit;
-    let session = app.windows.get_mut(&window).and_then(|target| {
+    let thresholds = app.thresholds;
+    // 拖拽候选是否转正（越阈值的首次移动）。取出待派发的 `Start` 与进行中的 `Move`。
+    let mut promote: Option<(NodeId, Action, Point)> = None;
+    let mut moved: Option<(NodeId, Action, Point)> = None;
+    if let Some(target) = app.windows.get_mut(&window) {
         let pointer = target.pointer_mut();
         pointer.modifiers = modifiers;
         pointer.last_hit = hit;
-        pointer.hover = hit.map(|result| result.node);
-        pointer.drag.as_mut().map(|session| {
+        if let Some(session) = pointer.drag.as_mut() {
             session.current = position;
             session.phase = DragPhase::Move;
-            session.clone()
-        })
-    });
-    if let Some(session) = session {
-        let delta = session.delta();
-        let handled = app.dispatch_action_with_hit(
+            moved = Some((session.node, session.action.clone(), session.delta()));
+        } else if let Some(pending) = pointer.pending_drag.as_ref() {
+            let dx = position.x - pending.origin.x;
+            let dy = position.y - pending.origin.y;
+            if drag_util::crosses_threshold(Point::new(dx, dy), thresholds.drag_distance) {
+                let pending = pointer.pending_drag.take().expect("刚检查过");
+                pointer.drag = Some(DragSession {
+                    node: pending.node,
+                    action: pending.action.clone(),
+                    origin: pending.origin,
+                    current: position,
+                    phase: DragPhase::Start,
+                });
+                pointer.capture = Some(pending.node);
+                promote = Some((pending.node, pending.action, Point::new(dx, dy)));
+            }
+        }
+    }
+    update_hover(app, window, hit.map(|result| result.node));
+    update_cursor(app, window, hit);
+    if let Some((node, action, delta)) = promote {
+        // 转正：取得指针捕获（Windows `SetCapture`；macOS/Wayland 是平台隐式捕获）。
+        app.capture_requests.insert(window, true);
+        if app.dispatch_action_with_hit(
             window,
-            session.node,
-            session.action.clone(),
+            node,
+            action.clone(),
+            ActionSource::Drag {
+                phase: DragPhase::Start,
+                delta,
+            },
+            hit,
+            modifiers,
+        ) {
+            outcome.action = Some(action);
+            outcome.target = Some(node);
+        }
+        return;
+    }
+    if let Some((node, action, delta)) = moved
+        && app.dispatch_action_with_hit(
+            window,
+            node,
+            action.clone(),
             ActionSource::Drag {
                 phase: DragPhase::Move,
                 delta,
             },
             hit,
             modifiers,
-        );
-        if handled {
-            outcome.action = Some(session.action);
-            outcome.target = Some(session.node);
-        }
-        return;
-    }
-    let cursor = app.windows.get(&window).map_or(Cursor::Default, |target| {
-        focus::resolve_cursor(target.tree(), hit.map(|result| result.node))
-    });
-    let mut changed = false;
-    if let Some(target) = app.windows.get_mut(&window) {
-        let pointer = target.pointer_mut();
-        if pointer.cursor != cursor {
-            pointer.cursor = cursor;
-            changed = true;
-        }
-    }
-    if changed {
-        app.cursor_pending = Some((window, cursor));
+        )
+    {
+        outcome.action = Some(action);
+        outcome.target = Some(node);
     }
 }
 
@@ -294,6 +350,7 @@ pub(crate) fn on_pointer_up(
     position: Point,
     button: PointerButton,
     modifiers: Modifiers,
+    timestamp: Instant,
     outcome: &mut InputOutcome,
 ) {
     let hit = app.hit_at(window, position);
@@ -302,13 +359,14 @@ pub(crate) fn on_pointer_up(
         let pointer = target.pointer_mut();
         pointer.modifiers = modifiers;
         pointer.last_hit = hit;
+        pointer.pending_drag = None;
         pointer.end_drag()
     });
     if let Some(session) = session {
-        app.capture_request = Some((window, false));
+        app.capture_requests.insert(window, false);
         let delta = session.delta();
         let action = session.action;
-        let handled = app.dispatch_action_with_hit(
+        if app.dispatch_action_with_hit(
             window,
             session.node,
             action.clone(),
@@ -318,8 +376,7 @@ pub(crate) fn on_pointer_up(
             },
             hit,
             modifiers,
-        );
-        if handled {
+        ) {
             outcome.action = Some(action);
             outcome.target = Some(session.node);
         }
@@ -335,6 +392,12 @@ pub(crate) fn on_pointer_up(
     if press.button != button {
         return;
     }
+    // R02-3：只有主键产生 click。次键在抬起时**不**走点击判定（Win32 只有 `WM_LBUTTONUP`
+    // 对应 `BN_CLICKED`、AppKit 的 target/action 只挂左键、Qt 的 `clicked()` 只认左键、
+    // Blink 的 `click` 同样只由主键产生）。
+    if !button.is_primary() {
+        return;
+    }
     let Some(press_node) = press.node else {
         return;
     };
@@ -345,7 +408,7 @@ pub(crate) fn on_pointer_up(
     if hit.map(|result| result.node) != Some(press_node) {
         return;
     }
-    let count = app.click_count(window, press_node, position);
+    let count = app.click_count(window, press_node, position, button, timestamp);
     outcome.click_count = count;
     let target_action = app
         .windows
@@ -356,7 +419,10 @@ pub(crate) fn on_pointer_up(
             window,
             node,
             action.clone(),
-            ActionSource::Click { click_count: count },
+            ActionSource::Click {
+                click_count: count,
+                button,
+            },
             hit,
             modifiers,
         );
@@ -368,20 +434,23 @@ pub(crate) fn on_pointer_up(
 }
 
 /// 消费者：`App::on_pointer_leave`。
-pub(crate) fn on_pointer_leave(app: &mut App, window: WindowId) {
+pub(crate) fn on_pointer_leave(app: &mut App, window: WindowId, modifiers: Modifiers) {
     let mut changed = false;
     if let Some(target) = app.windows.get_mut(&window) {
         let pointer = target.pointer_mut();
-        let capture = pointer.capture;
-        pointer.hover = None;
+        pointer.modifiers = modifiers;
+        let capture = pointer.capture.is_some();
         if !capture {
             pointer.press = None;
+            pointer.pending_drag = None;
         }
         if pointer.cursor != Cursor::Default {
             pointer.cursor = Cursor::Default;
             changed = true;
         }
     }
+    // 离开客户区 ⇒ 悬停链全部离开（W3C pointerleave；离开点由平台事件自己携带给观察者）。
+    update_hover(app, window, None);
     if changed {
         app.cursor_pending = Some((window, Cursor::Default));
     }
@@ -392,8 +461,9 @@ pub(crate) fn on_scroll(
     app: &mut App,
     window: WindowId,
     position: Point,
-    delta_x: f32,
-    delta_y: f32,
+    delta: Point,
+    unit: ScrollUnit,
+    phase: ScrollPhase,
     modifiers: Modifiers,
     outcome: &mut InputOutcome,
 ) {
@@ -404,21 +474,27 @@ pub(crate) fn on_scroll(
     };
     // Shift 交换两轴：各平台的约定都是「Shift + 滚轮 = 横向」。交换后每个容器只消费
     // **自己那条轴**的 delta，另一轴原样留给外层的容器（P2-4）。
-    let (mut dx, mut dy) = if modifiers.contains(Modifiers::SHIFT) {
-        (delta_y, delta_x)
+    let (delta_x, delta_y) = if modifiers.contains(Modifiers::SHIFT) {
+        (delta.y, delta.x)
     } else {
-        (delta_x, delta_y)
+        (delta.x, delta.y)
     };
-    if dx == 0.0 && dy == 0.0 {
+    if delta_x == 0.0 && delta_y == 0.0 {
         return;
     }
+    // 连续设备的阶段（触控板 / 系统惯性）1:1 跟随；离散滚轮走平滑动画（R02-10）。
+    //
+    // `unit == Line` 时 delta 已经是**行**（平台按 `lines_per_tick` 折算过了），
+    // `unit == Pixel` 时就是逻辑像素 —— 两者都只需容器自己的 `line_height` 做行→像素换算。
+    let direct = unit == ScrollUnit::Pixel || phase.is_continuous();
     // 由内到外收集滚动祖先（含命中节点自身）：滚轮先给最内层，滚不动才交给外层，
     // 这就是浏览器的 scroll chaining。旧实现只取**一个**最近祖先，内层到底后滚轮
     // 直接失效（复杂图表里嵌套的横向 + 纵向容器最明显）。
     let Some(target) = app.windows.get(&window) else {
         return;
     };
-    let mut chain: SmallVec<[(NodeId, crate::interaction::ScrollSlot, Size); 8]> = SmallVec::new();
+    let mut chain: SmallVec<[(NodeId, crate::interaction::ScrollSlot, crate::math::Size); 8]> =
+        SmallVec::new();
     let mut cursor = Some(result.node);
     while let Some(current) = cursor {
         if let Some(slot) = target.tree().scroll_slot(current) {
@@ -431,47 +507,65 @@ pub(crate) fn on_scroll(
             .ok()
             .and_then(|node| node.parent());
     }
+    let mut dx = delta_x;
+    let mut dy = delta_y;
     for (node, slot, size) in chain {
         let drives = match slot.axis {
-            ScrollAxis::Vertical => dy,
-            ScrollAxis::Horizontal => dx,
+            crate::interaction::ScrollAxis::Vertical => dy,
+            crate::interaction::ScrollAxis::Horizontal => dx,
         };
         if drives == 0.0 {
             continue;
         }
-        // 本容器实际能消费的行数（受 max_offset 夹紧）；吃不完的留给外层。
+        // 本容器实际能消费的量（受 max_offset 夹紧）；吃不完的留给外层。
         //
         // 基准是**动画目标**而不是当前 offset：同一帧内的第二个滚轮事件必须累加在第一个
         // 事件的落点上，否则两次事件用同一个 `from` 重算目标，前一次的 delta 被静默丢弃
         // （触控板 / 高精度滚轮一个泵批次里常发多个事件，表现为「滚不动」）。
         let max = scroll::max_offset(&slot, size);
-        let pending = app
-            .scroll_animation_target(node, window)
-            .unwrap_or(slot.offset);
+        let pending = if direct {
+            // 精确滚动（触控板 / 惯性）立即接管：先取消本槽上的平滑动画，基准用**当前**偏移，
+            // 否则动画目标与手指位移会互相打断（R02-10）。
+            let handle = ScrollHandle::new(window, node);
+            super::animation::cancel_scroll_animation(app, &handle);
+            slot.offset
+        } else {
+            app.scroll_animation_target(node, window)
+                .unwrap_or(slot.offset)
+        };
         let (before, limit) = match slot.axis {
-            ScrollAxis::Vertical => (pending.y, max.y),
-            ScrollAxis::Horizontal => (pending.x, max.x),
+            crate::interaction::ScrollAxis::Vertical => (pending.y, max.y),
+            crate::interaction::ScrollAxis::Horizontal => (pending.x, max.x),
         };
         // 基准必须钳在**当前**可滚范围内：动画 `to` 不会随内容收缩 / 视口变大而重定向
         // （`clamp_scroll_offsets` 只改 offset）。不钳的话 `before` 可能是越界值，
         // `consumed = (before - after) / line_height` 会放大成十几行，把**反向**残量
         // 传给外层容器（内层缩内容后向上滚一格，外层却往下滚；第二轮复审 P2-2）。
         let before = before.clamp(0.0, limit);
-        let after = (before - drives * slot.line_height).clamp(0.0, limit);
-        let consumed = (before - after) / slot.line_height;
+        let step = if unit == ScrollUnit::Line {
+            slot.line_height
+        } else {
+            1.0
+        };
+        let after = (before - drives * step).clamp(0.0, limit);
+        let consumed = (before - after) / step;
         if consumed == 0.0 {
             continue;
         }
         let handle = ScrollHandle::new(window, node);
-        let mut target = Point::new(0.0, 0.0);
+        let mut goal = Point::new(0.0, 0.0);
         match slot.axis {
-            ScrollAxis::Vertical => target.y = after,
-            ScrollAxis::Horizontal => target.x = after,
+            crate::interaction::ScrollAxis::Vertical => goal.y = after,
+            crate::interaction::ScrollAxis::Horizontal => goal.x = after,
         }
-        let _ = app.scroll_to_animated(&handle, target);
+        if direct {
+            let _ = app.scroll_to(&handle, goal);
+        } else {
+            let _ = app.scroll_to_animated(&handle, goal);
+        }
         match slot.axis {
-            ScrollAxis::Vertical => dy -= consumed,
-            ScrollAxis::Horizontal => dx -= consumed,
+            crate::interaction::ScrollAxis::Vertical => dy -= consumed,
+            crate::interaction::ScrollAxis::Horizontal => dx -= consumed,
         }
         if dx == 0.0 && dy == 0.0 {
             break;
@@ -483,65 +577,148 @@ pub(crate) fn on_scroll(
 pub(crate) fn on_key(
     app: &mut App,
     window: WindowId,
-    key: Key,
+    code: KeyCode,
     state: KeyState,
+    repeat: bool,
     modifiers: Modifiers,
     outcome: &mut InputOutcome,
 ) {
-    if state != KeyState::Down {
-        return;
+    // ① 「按住集合」（R02-16）：`KeyState::Up` 不再被丢弃 —— 应用可以直接查
+    //    [`crate::app::App::key_down`] 实现「按住连续」语义。`Unidentified` 也进集合：
+    //    它可能对应一个真实按下的键，只是引擎不认识。
+    match state {
+        KeyState::Down => {
+            app.held_keys.insert(code);
+        }
+        KeyState::Up => {
+            app.held_keys.remove(&code);
+            return;
+        }
     }
-    // ① 焦点激活：Enter / Space 走「点击」的同一条冒泡（没声明就落到 ②，不吞键）。
-    if matches!(key, Key::Enter | Key::Space) {
-        let focused = app.focused(window);
-        let activation = app
-            .windows
-            .get(&window)
-            .and_then(|target| focused.and_then(|node| focus::action_target(target.tree(), node)));
-        if let Some((node, action)) = activation {
-            let handled = app.dispatch_action_with_hit(
-                window,
-                node,
-                action.clone(),
-                ActionSource::Click { click_count: 1 },
-                None,
-                modifiers,
-            );
-            if handled {
+    // 自动重复（R02-2）：**绑定与激活都忽略**重复 —— 操作系统把重复定义为输入法/文本/导航的
+    // 便利机制，而不是「重新按下」。旧实现对每个 Down 都查绑定，长按 Enter 会重复下单。
+    if !repeat {
+        // ② 焦点激活：Enter / Space 走「点击」的同一条冒泡（没声明就落到 ③，不吞键）。
+        if matches!(code, KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space) {
+            let focused = app.focused(window);
+            let activation = app.windows.get(&window).and_then(|target| {
+                focused.and_then(|node| focus::action_target(target.tree(), node))
+            });
+            if let Some((node, action)) = activation {
+                let handled = app.dispatch_action_with_hit(
+                    window,
+                    node,
+                    action.clone(),
+                    ActionSource::Click {
+                        click_count: 1,
+                        button: PointerButton::Primary,
+                    },
+                    None,
+                    modifiers,
+                );
+                if handled {
+                    outcome.action = Some(action);
+                    outcome.target = Some(node);
+                }
+                return;
+            }
+        }
+        // ③ 全局绑定（精确匹配 key + modifiers）。
+        let binding = app
+            .bindings
+            .iter()
+            .find(|binding| binding.key == code && binding.modifiers == modifiers)
+            .map(|binding| binding.action.clone());
+        if let Some(action) = binding {
+            let node = app
+                .focused(window)
+                .or_else(|| app.windows.get(&window).map(|target| target.tree().root()));
+            let Some(node) = node else {
+                return;
+            };
+            if app.dispatch_action(window, node, action.clone(), ActionSource::Key) {
                 outcome.action = Some(action);
                 outcome.target = Some(node);
             }
             return;
         }
     }
-    // ② 全局绑定（精确匹配 key + modifiers）。
-    let binding = app
-        .bindings
-        .iter()
-        .find(|binding| binding.key == key && binding.modifiers == modifiers)
-        .map(|binding| binding.action.clone());
-    let Some(action) = binding else {
-        return;
-    };
-    let node = app
-        .focused(window)
-        .or_else(|| app.windows.get(&window).map(|target| target.tree().root()));
-    let Some(node) = node else {
-        return;
-    };
-    if app.dispatch_action(window, node, action.clone(), ActionSource::Key) {
-        outcome.action = Some(action);
-        outcome.target = Some(node);
+    // ④ 默认键盘行为（R02-16）：焦点落在滚动容器里时方向键/翻页键滚动它。放在绑定之后，
+    //    因此应用可以用自己的绑定**拦截**任意一个（「可被应用拦截」）。
+    if modifiers.is_empty() {
+        default_key_scroll(app, window, code);
     }
 }
 
+/// 焦点节点的默认键盘滚动（R02-16）。
+///
+/// 语义与 `QAbstractScrollArea::keyPressEvent`、`GtkScrolledWindow` 的键盘处理一致：
+/// 方向键一行（容器的 `line_height`）、PageUp/PageDown 一页（视口）、Home/End 到两端。
+/// 只动**容器自己声明的轴**；没有滚动祖先时什么也不做（不吞键）。
+fn default_key_scroll(app: &mut App, window: WindowId, code: KeyCode) -> bool {
+    use crate::interaction::ScrollAxis;
+    let Some(focused) = app.focused(window) else {
+        return false;
+    };
+    let Some(target) = app.windows.get(&window) else {
+        return false;
+    };
+    let Some((node, slot)) = scroll::scroll_ancestor(target.tree(), focused) else {
+        return false;
+    };
+    let viewport = scroll::viewport(target.tree(), node).size;
+    let max = scroll::max_offset(&slot, viewport);
+    let limit = match slot.axis {
+        ScrollAxis::Vertical => max.y,
+        ScrollAxis::Horizontal => max.x,
+    };
+    let line = slot.line_height;
+    let page = match slot.axis {
+        ScrollAxis::Vertical => viewport.height,
+        ScrollAxis::Horizontal => viewport.width,
+    };
+    // 目标位置（`None` = 该键对本容器没有默认行为）。
+    let goal = match (slot.axis, code) {
+        (ScrollAxis::Vertical, KeyCode::ArrowUp) => Some(-line),
+        (ScrollAxis::Vertical, KeyCode::ArrowDown) => Some(line),
+        (ScrollAxis::Horizontal, KeyCode::ArrowLeft) => Some(-line),
+        (ScrollAxis::Horizontal, KeyCode::ArrowRight) => Some(line),
+        (_, KeyCode::PageUp) => Some(-page),
+        (_, KeyCode::PageDown) => Some(page),
+        (_, KeyCode::Home) => Some(-limit),
+        (_, KeyCode::End) => Some(limit),
+        _ => None,
+    };
+    let Some(delta) = goal else {
+        return false;
+    };
+    let handle = ScrollHandle::new(window, node);
+    let mut movement = Point::new(0.0, 0.0);
+    match slot.axis {
+        ScrollAxis::Vertical => movement.y = delta,
+        ScrollAxis::Horizontal => movement.x = delta,
+    }
+    app.scroll_by(&handle, movement).is_ok()
+}
+
 /// 消费者：`App::click_count`。
-pub(crate) fn click_count(app: &mut App, window: WindowId, node: NodeId, position: Point) -> u8 {
+///
+/// 连击判定基准是**事件时间戳**（R02-14）与按键（R02-23 的共享部分）：`(窗口, 节点, 按键)`
+/// 三元组一致、时间与位移都在阈值内才累加。左右键交替点击不再被算成双击。
+pub(crate) fn click_count(
+    app: &mut App,
+    window: WindowId,
+    node: NodeId,
+    position: Point,
+    button: PointerButton,
+    timestamp: Instant,
+) -> u8 {
     let count = match app.last_click {
         Some(last)
             if last.window == window
                 && last.node == Some(node)
-                && app.clock.saturating_duration_since(last.at)
+                && last.button == button
+                && timestamp.saturating_duration_since(last.at)
                     <= app.thresholds.double_click_time
                 && drag_util::within(
                     last.position,
@@ -556,8 +733,9 @@ pub(crate) fn click_count(app: &mut App, window: WindowId, node: NodeId, positio
     app.last_click = Some(ClickRecord {
         window,
         node: Some(node),
+        button,
         position,
-        at: app.clock,
+        at: timestamp,
         count,
     });
     count
@@ -565,6 +743,9 @@ pub(crate) fn click_count(app: &mut App, window: WindowId, node: NodeId, positio
 
 /// 消费者：`App::on_window_focus_lost`。
 pub(crate) fn on_window_focus_lost(app: &mut App, window: WindowId) {
+    // 失焦期间抬起消息不再到达本窗口：按住集合必须清空，否则 `key_down` 会永久为真
+    //（与 `TranslateState::reset_transient` 对修饰键的处理同源）。
+    app.held_keys.clear();
     app.cancel_pointer_session(window);
 }
 
@@ -582,7 +763,7 @@ pub(crate) fn cancel_pointer_session(app: &mut App, window: WindowId) {
         .get_mut(&window)
         .and_then(|target| target.pointer_mut().end_drag());
     if let Some(session) = cancelled {
-        app.capture_request = Some((window, false));
+        app.capture_requests.insert(window, false);
         let delta = session.delta();
         let _ = app.dispatch_action(
             window,
@@ -596,10 +777,145 @@ pub(crate) fn cancel_pointer_session(app: &mut App, window: WindowId) {
     }
     if let Some(target) = app.windows.get_mut(&window) {
         let pointer = target.pointer_mut();
-        pointer.hover = None;
         pointer.press = None;
+        pointer.pending_drag = None;
         pointer.cursor = Cursor::Default;
     }
+    update_hover(app, window, None);
+}
+
+// ── 悬停（R02-4） ──────────────────────────────────────────────────────────
+
+/// 从 `node` 到根的祖先链（由外到内）。悬停链就是 CSS `:hover` 的作用集合。
+fn hover_chain(tree: &crate::node::tree::NodeTree, node: Option<NodeId>) -> SmallVec<[NodeId; 8]> {
+    let mut chain = SmallVec::new();
+    let mut cursor = node;
+    while let Some(current) = cursor {
+        if tree.get(current).is_err() {
+            break;
+        }
+        chain.push(current);
+        cursor = tree.get(current).ok().and_then(|target| target.parent());
+    }
+    chain.reverse();
+    chain
+}
+
+/// 更新悬停节点；有迁移时派生 [`Event::HoverChanged`]、标 `PAINT` 并请求一帧。
+fn update_hover(app: &mut App, window: WindowId, next: Option<NodeId>) {
+    let (left, entered) = {
+        let Some(target) = app.windows.get(&window) else {
+            return;
+        };
+        let tree = target.tree();
+        // 陈旧节点（已被卸载）视为「无悬停」：虚拟列表回收行之后旧 id 会留在槽里。
+        let previous = target
+            .pointer()
+            .hovered
+            .filter(|node| tree.get(*node).is_ok());
+        if previous == next {
+            return;
+        }
+        let old = hover_chain(tree, previous);
+        let new = hover_chain(tree, next);
+        let left: Vec<NodeId> = old
+            .iter()
+            .rev()
+            .filter(|node| !new.contains(node))
+            .copied()
+            .collect();
+        let entered: Vec<NodeId> = new
+            .iter()
+            .filter(|node| !old.contains(node))
+            .copied()
+            .collect();
+        (left, entered)
+    };
+    if let Some(target) = app.windows.get_mut(&window) {
+        target.pointer_mut().hovered = next;
+        // 悬停是**样式输入**：变化节点必须标 `PAINT`，否则 `bind_style` 不会再求值，
+        // 「悬停高亮」永远不会出现（旧实现只写槽、不标脏，R02-4 的根因）。
+        //
+        // 只标**挂了动态绑定**的节点：没有 `bind_style` / `bind_text` 的节点外观不随悬停变化，
+        // 标脏只会白跑一次 lane 重建 —— 而悬停是高频事件，祖先链上尤其明显。
+        let marked: SmallVec<[NodeId; 8]> = left
+            .iter()
+            .chain(entered.iter())
+            .copied()
+            .filter(|node| {
+                target
+                    .tree()
+                    .get(*node)
+                    .is_ok_and(|slot| slot.has_bindings())
+            })
+            .collect();
+        for node in marked {
+            target.tree_mut().mark_paint(node);
+        }
+    }
+    app.events.push(
+        window,
+        Event::HoverChanged {
+            hovered: next,
+            left,
+            entered,
+        },
+    );
+    app.request_frame();
+}
+
+/// 悬停变化后重新解析光标（只有变化时才推给平台）。
+fn update_cursor(app: &mut App, window: WindowId, hit: Option<HitResult>) {
+    let cursor = app.windows.get(&window).map_or(Cursor::Default, |target| {
+        focus::resolve_cursor(target.tree(), hit.map(|result| result.node))
+    });
+    let mut changed = false;
+    if let Some(target) = app.windows.get_mut(&window) {
+        let pointer = target.pointer_mut();
+        if pointer.cursor != cursor {
+            pointer.cursor = cursor;
+            changed = true;
+        }
+    }
+    if changed {
+        app.cursor_pending = Some((window, cursor));
+    }
+}
+
+// ── 指针捕获（R02-8） ──────────────────────────────────────────────────────
+
+/// 消费者：`App::capture_pointer`。
+pub(crate) fn capture_pointer(app: &mut App, window: WindowId, node: NodeId) -> bool {
+    let Some(target) = app.windows.get_mut(&window) else {
+        return false;
+    };
+    if target.tree().get(node).is_err() {
+        return false;
+    }
+    if target.pointer().capture == Some(node) {
+        return false;
+    }
+    target.pointer_mut().capture = Some(node);
+    app.capture_requests.insert(window, true);
+    true
+}
+
+/// 消费者：`App::release_pointer`。
+pub(crate) fn release_pointer(app: &mut App, window: WindowId) -> bool {
+    let Some(target) = app.windows.get_mut(&window) else {
+        return false;
+    };
+    if target.pointer_mut().capture.take().is_none() {
+        return false;
+    }
+    app.capture_requests.insert(window, false);
+    true
+}
+
+/// 消费者：`App::pointer_captured`。
+#[must_use]
+pub(crate) fn pointer_captured(app: &App, window: WindowId) -> Option<NodeId> {
+    app.windows.get(&window)?.pointer().capture
 }
 
 // ── P10：拖拽 ──────────────────────────────────────────────────────────────
@@ -641,7 +957,7 @@ pub(crate) fn cancel_drag(app: &mut App, state: &DragState) -> bool {
     let Some(session) = session else {
         return false;
     };
-    app.capture_request = Some((window, false));
+    app.capture_requests.insert(window, false);
     let delta = session.delta();
     let action = session.action;
     app.dispatch_action(
@@ -664,9 +980,11 @@ pub(crate) fn take_cursor_change(app: &mut App) -> Option<(WindowId, Cursor)> {
 
 /// 取走待推给平台的捕获请求（`(窗口, true)` = 取得、`(窗口, false)` = 释放）。
 ///
-/// 必须带窗口 id：`SetCapture` 是**每窗口**状态，固定发给首窗会让非首窗的拖拽拿不到
-/// 捕获，鼠标移出窗口后松手就丢 `WM_LBUTTONUP`，会话永久卡在「按住」（复审 P1-3）。
-/// 消费者：`App::take_capture_request`。
-pub(crate) fn take_capture_request(app: &mut App) -> Option<(WindowId, bool)> {
-    app.capture_request.take()
+/// 每窗口**目标状态**（R02-8/R02-22）：旧实现是单槽 `Option<(WindowId, bool)>`，同一泵轮里
+/// A 窗口的请求会被 B 覆盖丢失；多窗口下 `SetCapture` 是每窗口状态，覆盖就等于丢请求。
+/// 消费者：`App::take_capture_requests`。
+pub(crate) fn take_capture_requests(app: &mut App) -> Vec<(WindowId, bool)> {
+    std::mem::take(&mut app.capture_requests)
+        .into_iter()
+        .collect()
 }

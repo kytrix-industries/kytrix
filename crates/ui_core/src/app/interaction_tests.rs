@@ -4,7 +4,8 @@ use super::App;
 use crate::{
     error::EngineError,
     event::{
-        Action, ActionSource, InputEvent, Key, KeyBinding, KeyState, Modifiers, PointerButton,
+        Action, ActionSource, Event, InputEvent, KeyBinding, KeyCode, KeyState, Modifiers,
+        PointerButton, ScrollPhase, ScrollUnit,
     },
     interaction::{
         AnimatedValue, AnimationSpec, DragPhase, Easing, InputThresholds, OverlayDismiss,
@@ -143,12 +144,11 @@ fn wheel_events_in_one_frame_accumulate() {
     for _ in 0..2 {
         app.dispatch_input(
             window,
-            InputEvent::Scroll {
-                position: Point::new(50.0, 50.0),
-                delta_x: 0.0,
-                delta_y: -1.0,
-                modifiers: Modifiers::empty(),
-            },
+            InputEvent::scroll_lines(
+                Point::new(50.0, 50.0),
+                Point::new(0.0, -1.0),
+                Modifiers::empty(),
+            ),
         );
     }
     app.advance_clock(std::time::Duration::from_millis(400));
@@ -300,19 +300,19 @@ fn click_dispatches_the_action_and_marks_only_the_target() {
 
     let down = app.dispatch_input(
         window,
-        InputEvent::PointerDown {
-            position: Point::new(20.0, 20.0),
-            button: PointerButton::Primary,
-            modifiers: Modifiers::empty(),
-        },
+        InputEvent::pointer_down(
+            Point::new(20.0, 20.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
     );
     let up = app.dispatch_input(
         window,
-        InputEvent::PointerUp {
-            position: Point::new(20.0, 20.0),
-            button: PointerButton::Primary,
-            modifiers: Modifiers::empty(),
-        },
+        InputEvent::pointer_up(
+            Point::new(20.0, 20.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
     );
 
     assert_eq!(calls.get(), 1, "点击必须分发一次");
@@ -356,11 +356,7 @@ fn enter_activates_the_focused_node() {
 
     let outcome = app.dispatch_input(
         window,
-        InputEvent::Key {
-            key: Key::Enter,
-            state: KeyState::Down,
-            modifiers: Modifiers::empty(),
-        },
+        InputEvent::key_down(KeyCode::Enter, Modifiers::empty()),
     );
 
     assert_eq!(calls.get(), 1);
@@ -377,18 +373,14 @@ fn key_binding_reports_the_key_source() {
         seen.set(matches!(ctx.source(), ActionSource::Key));
     });
     app.bind_key(KeyBinding {
-        key: Key::Other(0x53),
+        key: KeyCode::KeyS,
         modifiers: Modifiers::CONTROL,
         action: Action::custom("save"),
     });
 
     let outcome = app.dispatch_input(
         window,
-        InputEvent::Key {
-            key: Key::Other(0x53),
-            state: KeyState::Down,
-            modifiers: Modifiers::CONTROL,
-        },
+        InputEvent::key_down(KeyCode::KeyS, Modifiers::CONTROL),
     );
 
     assert!(source.get(), "handler 必须看到 ActionSource::Key");
@@ -435,11 +427,7 @@ fn tab_moves_focus_and_marks_a11y_only() {
 
     app.dispatch_input(
         window,
-        InputEvent::Key {
-            key: Key::Tab,
-            state: KeyState::Down,
-            modifiers: Modifiers::empty(),
-        },
+        InputEvent::key_down(KeyCode::Tab, Modifiers::empty()),
     );
     assert_eq!(app.focused(window), Some(first));
     {
@@ -462,21 +450,10 @@ fn tab_moves_focus_and_marks_a11y_only() {
 
     app.dispatch_input(
         window,
-        InputEvent::Key {
-            key: Key::Tab,
-            state: KeyState::Down,
-            modifiers: Modifiers::empty(),
-        },
+        InputEvent::key_down(KeyCode::Tab, Modifiers::empty()),
     );
     assert_eq!(app.focused(window), Some(second));
-    app.dispatch_input(
-        window,
-        InputEvent::Key {
-            key: Key::Tab,
-            state: KeyState::Down,
-            modifiers: Modifiers::SHIFT,
-        },
-    );
+    app.dispatch_input(window, InputEvent::key_down(KeyCode::Tab, Modifiers::SHIFT));
     assert_eq!(app.focused(window), Some(first), "Shift+Tab 回绕");
 }
 
@@ -762,12 +739,11 @@ fn wheel_falls_through_to_the_outer_container_when_the_inner_cannot_scroll() {
     // 在内层范围内滚一格：内层吃不下，外层必须动。
     app.dispatch_input(
         window,
-        InputEvent::Scroll {
-            position: Point::new(50.0, 50.0),
-            delta_x: 0.0,
-            delta_y: -1.0,
-            modifiers: Modifiers::empty(),
-        },
+        InputEvent::scroll_lines(
+            Point::new(50.0, 50.0),
+            Point::new(0.0, -1.0),
+            Modifiers::empty(),
+        ),
     );
 
     // 滚轮走的是动画滚动（`scroll_to_animated`）：把时钟推过动画时长再读回真实偏移。
@@ -1045,6 +1021,7 @@ fn anchor_placement_converges_with_a_root_border() {
                     gap: 4.0,
                 },
                 dismiss: OverlayDismiss::Explicit,
+                ..OverlayOptions::default()
             },
         )
         .expect("overlay");
@@ -1105,6 +1082,7 @@ fn anchored_above_overlay_sits_above_the_anchor() {
                     gap: 4.0,
                 },
                 dismiss: OverlayDismiss::Explicit,
+                ..OverlayOptions::default()
             },
         )
         .expect("overlay");
@@ -1152,6 +1130,7 @@ fn overlay_is_last_and_closes_on_outside_click() {
             OverlayOptions {
                 placement: OverlayPlacement::Point(Point::new(200.0, 10.0)),
                 dismiss: OverlayDismiss::OutsideClick,
+                ..OverlayOptions::default()
             },
         )
         .expect("overlay");
@@ -1199,11 +1178,11 @@ fn overlay_is_last_and_closes_on_outside_click() {
     // 点外部 ⇒ 关闭并消费（不再派递给背景）。
     app.dispatch_input(
         window,
-        InputEvent::PointerDown {
-            position: Point::new(10.0, 10.0),
-            button: PointerButton::Primary,
-            modifiers: Modifiers::empty(),
-        },
+        InputEvent::pointer_down(
+            Point::new(10.0, 10.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
     );
     assert!(app.overlays(window).is_empty(), "点击外部关闭");
 }
@@ -1218,6 +1197,7 @@ fn dismiss_action_closes_the_topmost_overlay_including_explicit() {
             OverlayOptions {
                 placement: OverlayPlacement::Point(Point::ZERO),
                 dismiss: OverlayDismiss::Explicit,
+                ..OverlayOptions::default()
             },
         )
         .expect("overlay");
@@ -1252,46 +1232,45 @@ fn drag_streams_deltas_and_suppresses_the_click() {
 
     app.dispatch_input(
         window,
-        InputEvent::PointerDown {
-            position: Point::new(102.0, 50.0),
-            button: PointerButton::Primary,
-            modifiers: Modifiers::empty(),
-        },
+        InputEvent::pointer_down(
+            Point::new(102.0, 50.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
+    );
+    // R02-9：按下只登记拖拽候选，越阈值才成立（并同时取得捕获）。
+    assert_eq!(app.drag_state(window), None, "未越阈值前不得成立拖拽会话");
+    assert!(app.take_capture_requests().is_empty(), "按下不请求指针捕获");
+
+    let moved = app.dispatch_input(
+        window,
+        InputEvent::pointer_move(Point::new(122.0, 50.0), Modifiers::empty()),
     );
     let state = app.drag_state(window).expect("drag session");
     assert_eq!(state.node(), grip);
     assert_eq!(
-        app.take_capture_request(),
-        Some((window, true)),
-        "拖拽请求指针捕获"
-    );
-
-    let moved = app.dispatch_input(
-        window,
-        InputEvent::PointerMove {
-            position: Point::new(122.0, 50.0),
-            modifiers: Modifiers::empty(),
-        },
+        app.take_capture_requests(),
+        vec![(window, true)],
+        "拖拽成立时请求指针捕获"
     );
     assert_eq!(moved.action, Some(Action::custom("split")));
     assert!(app.drag(&state).is_some_and(|info| info.delta.x == 20.0));
 
     let up = app.dispatch_input(
         window,
-        InputEvent::PointerUp {
-            position: Point::new(122.0, 50.0),
-            button: PointerButton::Primary,
-            modifiers: Modifiers::empty(),
-        },
+        InputEvent::pointer_up(
+            Point::new(122.0, 50.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
     );
     assert_eq!(app.drag_state(window), None);
-    assert_eq!(app.take_capture_request(), Some((window, false)));
+    assert_eq!(app.take_capture_requests(), vec![(window, false)]);
     assert_eq!(up.action, Some(Action::custom("split")), "抬起派发 End");
     assert_eq!(up.click_count, 0, "拖拽后不产生点击");
-    assert_eq!(
-        phases.take(),
-        vec![DragPhase::Start, DragPhase::Move, DragPhase::End]
-    );
+    // R02-9：`Start` 在越过阈值的那次移动上派发（这就是「拖拽成立」的时刻），之后才是 `Move`。
+    // 本例只移动了一次就越过阈值，因此没有 `Move`。
+    assert_eq!(phases.take(), vec![DragPhase::Start, DragPhase::End]);
 }
 
 // ── 动画 ──────────────────────────────────────────────────────────────────
@@ -1355,6 +1334,7 @@ fn closed_window_returns_unknown_window() {
             OverlayOptions {
                 placement: OverlayPlacement::Point(Point::ZERO),
                 dismiss: OverlayDismiss::Explicit,
+                ..OverlayOptions::default()
             },
         )
         .expect("overlay");
@@ -1368,6 +1348,7 @@ fn closed_window_returns_unknown_window() {
             OverlayOptions {
                 placement: OverlayPlacement::Point(Point::ZERO),
                 dismiss: OverlayDismiss::Explicit,
+                ..OverlayOptions::default()
             },
         )
         .expect_err("窗口已关闭");
@@ -1425,6 +1406,7 @@ fn overlay_outside_click_consumes_the_whole_press() {
         OverlayOptions {
             placement: OverlayPlacement::Point(Point::new(200.0, 10.0)),
             dismiss: OverlayDismiss::OutsideClick,
+            ..OverlayOptions::default()
         },
     )
     .expect("overlay");
@@ -1432,19 +1414,19 @@ fn overlay_outside_click_consumes_the_whole_press() {
 
     app.dispatch_input(
         window,
-        InputEvent::PointerDown {
-            position: Point::new(20.0, 20.0),
-            button: PointerButton::Primary,
-            modifiers: Modifiers::empty(),
-        },
+        InputEvent::pointer_down(
+            Point::new(20.0, 20.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
     );
     let up = app.dispatch_input(
         window,
-        InputEvent::PointerUp {
-            position: Point::new(20.0, 20.0),
-            button: PointerButton::Primary,
-            modifiers: Modifiers::empty(),
-        },
+        InputEvent::pointer_up(
+            Point::new(20.0, 20.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
     );
 
     assert!(app.overlays(window).is_empty(), "按下即关浮层");
@@ -1481,11 +1463,7 @@ fn stale_focus_is_cleared_and_tab_recovers() {
     // Tab 不能卡死：从「无焦点」重新开始，干净地落到第二个节点。
     app.dispatch_input(
         window,
-        InputEvent::Key {
-            key: Key::Tab,
-            state: KeyState::Down,
-            modifiers: Modifiers::empty(),
-        },
+        InputEvent::key_down(KeyCode::Tab, Modifiers::empty()),
     );
     assert_eq!(app.focused(window), Some(second));
 }
@@ -1647,11 +1625,7 @@ fn key_modifiers_reach_the_handler() {
 
     app.dispatch_input(
         window,
-        InputEvent::Key {
-            key: Key::Enter,
-            state: KeyState::Down,
-            modifiers: Modifiers::SHIFT | Modifiers::CONTROL,
-        },
+        InputEvent::key_down(KeyCode::Enter, Modifiers::SHIFT | Modifiers::CONTROL),
     );
 
     assert_eq!(
@@ -1737,23 +1711,25 @@ fn pointer_cancel_ends_the_drag_without_committing_a_click() {
 
     app.dispatch_input(
         window,
-        InputEvent::PointerDown {
-            position: Point::new(102.0, 50.0),
-            button: PointerButton::Primary,
-            modifiers: Modifiers::empty(),
-        },
+        InputEvent::pointer_down(
+            Point::new(102.0, 50.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
     );
     app.dispatch_input(
         window,
-        InputEvent::PointerMove {
-            position: Point::new(160.0, 50.0),
-            modifiers: Modifiers::empty(),
-        },
+        InputEvent::pointer_move(Point::new(160.0, 50.0), Modifiers::empty()),
     );
     assert!(app.drag_state(window).is_some(), "拖拽应已开始");
 
     // 系统夺走捕获：没有 PointerUp，只有取消。
-    app.dispatch_input(window, InputEvent::PointerCancel);
+    app.dispatch_input(
+        window,
+        InputEvent::PointerCancel {
+            timestamp: std::time::Instant::now(),
+        },
+    );
 
     assert!(app.drag_state(window).is_none(), "取消后不得残留拖拽会话");
     assert_eq!(
@@ -1779,20 +1755,25 @@ fn second_pointer_down_during_drag_is_ignored() {
 
     app.dispatch_input(
         window,
-        InputEvent::PointerDown {
-            position: Point::new(102.0, 50.0),
-            button: PointerButton::Primary,
-            modifiers: Modifiers::empty(),
-        },
+        InputEvent::pointer_down(
+            Point::new(102.0, 50.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
+    );
+    // R02-9：拖拽会话在越阈值时才成立。
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(Point::new(130.0, 50.0), Modifiers::empty()),
     );
     let before = app.drag_state(window).expect("drag");
     app.dispatch_input(
         window,
-        InputEvent::PointerDown {
-            position: Point::new(300.0, 200.0),
-            button: PointerButton::Primary,
-            modifiers: Modifiers::empty(),
-        },
+        InputEvent::pointer_down(
+            Point::new(300.0, 200.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
     );
     let after = app.drag_state(window).expect("drag");
     assert_eq!(before, after, "拖拽中的二次按下不得重开会话");
@@ -1821,19 +1802,19 @@ fn moving_past_the_drag_threshold_suppresses_the_click() {
 
     app.dispatch_input(
         window,
-        InputEvent::PointerDown {
-            position: Point::new(20.0, 20.0),
-            button: PointerButton::Primary,
-            modifiers: Modifiers::empty(),
-        },
+        InputEvent::pointer_down(
+            Point::new(20.0, 20.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
     );
     let up = app.dispatch_input(
         window,
-        InputEvent::PointerUp {
-            position: Point::new(40.0, 20.0),
-            button: PointerButton::Primary,
-            modifiers: Modifiers::empty(),
-        },
+        InputEvent::pointer_up(
+            Point::new(40.0, 20.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
     );
 
     assert_eq!(clicks.get(), 0, "超过阈值 ⇒ 不是点击");
@@ -1881,4 +1862,677 @@ fn ime_enabled_is_per_window_and_cleared_with_the_window() {
     );
     let third = app.create_window(WindowOptions::default());
     assert!(app.ime_enabled(third), "新窗口默认启用");
+}
+
+// ── R02 输入模型（P0/P1）的端到端回归 ──────────────────────────────────────
+
+/// R02-2：自动重复不触发绑定，也不重复激活焦点控件（长按 Enter 只执行一次）。
+#[test]
+fn auto_repeat_neither_fires_bindings_nor_activation() {
+    let (_rt, mut app, window) = setup();
+    let calls = Rc::new(Cell::new(0_u32));
+    let seen = calls.clone();
+    app.on_action(Action::custom("save"), move |_ctx| seen.set(seen.get() + 1));
+    app.bind_key(KeyBinding {
+        key: KeyCode::KeyS,
+        modifiers: Modifiers::CONTROL,
+        action: Action::custom("save"),
+    });
+    frame(&mut app, window);
+
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::KeyS, Modifiers::CONTROL),
+    );
+    assert_eq!(calls.get(), 1, "首次按下必须触发绑定");
+    // 同一次按住的自动重复：必须被忽略。
+    app.dispatch_input(
+        window,
+        InputEvent::Key {
+            code: KeyCode::KeyS,
+            state: KeyState::Down,
+            repeat: true,
+            modifiers: Modifiers::CONTROL,
+            timestamp: std::time::Instant::now(),
+        },
+    );
+    assert_eq!(calls.get(), 1, "自动重复不得重复触发绑定动作");
+
+    // 焦点控件的 Enter 激活同理：重复不重复激活。
+    let activations = Rc::new(Cell::new(0_u32));
+    let seen = activations.clone();
+    app.on_action(Action::custom("activate"), move |_ctx| {
+        seen.set(seen.get() + 1)
+    });
+    let root = root_of(&app, window);
+    let node = NodeBuilder::boxed()
+        .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
+        .on_action(Action::custom("activate"))
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("mount");
+    frame(&mut app, window);
+    assert!(app.set_focus(window, Some(node)));
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::Enter, Modifiers::empty()),
+    );
+    assert_eq!(activations.get(), 1);
+    app.dispatch_input(
+        window,
+        InputEvent::Key {
+            code: KeyCode::Enter,
+            state: KeyState::Down,
+            repeat: true,
+            modifiers: Modifiers::empty(),
+            timestamp: std::time::Instant::now(),
+        },
+    );
+    assert_eq!(activations.get(), 1, "长按回车不得重复下单式激活");
+}
+
+/// R02-3：次键**不**产生 click、**不**抢焦点；主键的 click 携带 button。
+#[test]
+fn secondary_button_neither_clicks_nor_takes_focus() {
+    let (_rt, mut app, window) = setup();
+    let clicks = Rc::new(Cell::new(0_u32));
+    let seen = clicks.clone();
+    let button_source = Rc::new(Cell::new(None::<PointerButton>));
+    let source_slot = button_source.clone();
+    app.on_action(Action::custom("hit"), move |ctx| {
+        seen.set(seen.get() + 1);
+        if let ActionSource::Click { button, .. } = ctx.source() {
+            source_slot.set(Some(button));
+        }
+    });
+    let root = root_of(&app, window);
+    let other = NodeBuilder::boxed()
+        .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
+        .on_click(Action::custom("other"))
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("mount");
+    let target = NodeBuilder::boxed()
+        .layout_override(Rect::new(100.0, 0.0, 60.0, 60.0))
+        .paint(background())
+        .on_click(Action::custom("hit"))
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("mount");
+    frame(&mut app, window);
+    assert!(app.set_focus(window, Some(other)));
+
+    // 右键：不派发 click、不改焦点。
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_down(
+            Point::new(120.0, 20.0),
+            PointerButton::Secondary,
+            Modifiers::empty(),
+        ),
+    );
+    let up = app.dispatch_input(
+        window,
+        InputEvent::pointer_up(
+            Point::new(120.0, 20.0),
+            PointerButton::Secondary,
+            Modifiers::empty(),
+        ),
+    );
+    assert_eq!(clicks.get(), 0, "右键不得触发 on_click");
+    assert_eq!(up.click_count, 0);
+    assert_eq!(app.focused(window), Some(other), "次键不得抢焦点");
+    let _ = target;
+
+    // 主键：派发 click，并且来源里带的是主键。
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_down(
+            Point::new(120.0, 20.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
+    );
+    let up = app.dispatch_input(
+        window,
+        InputEvent::pointer_up(
+            Point::new(120.0, 20.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
+    );
+    assert_eq!(clicks.get(), 1);
+    assert_eq!(up.click_count, 1);
+    assert_eq!(button_source.get(), Some(PointerButton::Primary));
+}
+
+/// R02-4：悬停迁移可观测 —— `App::hovered` + `Event::HoverChanged` + 变化节点标 `PAINT`。
+#[test]
+fn hover_transitions_are_observable_and_mark_paint() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    // `layout_override` 是叶子节点（不能有子节点），容器要用普通样式撑出尺寸。
+    let mut outer_style = Style::default();
+    outer_style.inner.size = taffy::geometry::Size {
+        width: taffy::style::Dimension::length(100.0),
+        height: taffy::style::Dimension::length(100.0),
+    };
+    let outer = NodeBuilder::boxed()
+        .style(outer_style)
+        .bind_style(|_| StylePatch::default())
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("mount");
+    let inner = NodeBuilder::boxed()
+        .layout_override(Rect::new(10.0, 10.0, 40.0, 40.0))
+        .bind_style(|_| StylePatch::default())
+        .build(app.window_mut(window).expect("window").tree_mut(), outer)
+        .expect("mount");
+    frame(&mut app, window);
+    let _ = app.drain_events();
+    app.window_mut(window)
+        .expect("window")
+        .tree_mut()
+        .clear_all_dirty_for_test();
+
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(Point::new(20.0, 20.0), Modifiers::empty()),
+    );
+    assert_eq!(app.hovered(window), Some(inner), "悬停读点必须可用");
+    let (hovered, entered, left) = app
+        .drain_events()
+        .into_iter()
+        .find_map(|(_, event)| match event {
+            Event::HoverChanged {
+                hovered,
+                entered,
+                left,
+            } => Some((hovered, entered, left)),
+            _ => None,
+        })
+        .expect("悬停变化必须派生事件");
+    assert_eq!(hovered, Some(inner));
+    // 进入链由外到内，且包含**根与祖先**（CSS `:hover` 的传播语义：子节点悬停时父容器也高亮）。
+    assert_eq!(entered.last().copied(), Some(inner));
+    assert!(
+        entered.contains(&outer) && entered.contains(&root),
+        "祖先与根也必须收到 enter：{entered:?}"
+    );
+    assert!(left.is_empty());
+    {
+        let tree = app.window(window).expect("window").tree();
+        for node in [outer, inner] {
+            assert!(
+                tree.get(node)
+                    .expect("node")
+                    .dirty()
+                    .contains(DirtyFlags::PAINT),
+                "悬停变化节点必须标 PAINT，否则 bind_style 不会重算"
+            );
+        }
+    }
+
+    // 移到空白处：离开链由内到外。
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(Point::new(500.0, 500.0), Modifiers::empty()),
+    );
+    assert_eq!(app.hovered(window), None);
+    let (_, entered, left) = app
+        .drain_events()
+        .into_iter()
+        .find_map(|(_, event)| match event {
+            Event::HoverChanged {
+                hovered,
+                entered,
+                left,
+            } => Some((hovered, entered, left)),
+            _ => None,
+        })
+        .expect("离开也要派生事件");
+    assert!(entered.is_empty());
+    // 离开链由内到外：先是悬停节点，最后是根。
+    assert_eq!(left.first().copied(), Some(inner));
+    assert_eq!(left.last().copied(), Some(root));
+    assert!(left.contains(&outer));
+}
+
+/// R02-9：位移未越阈值 ⇒ 是点击，**不**派发 `DragPhase::Start`。
+#[test]
+fn a_press_below_the_drag_threshold_is_a_click() {
+    let (_rt, mut app, window) = setup();
+    let phases = Rc::new(Cell::new(Vec::<DragPhase>::new()));
+    let seen = phases.clone();
+    app.on_action(Action::custom("split"), move |ctx| {
+        if let ActionSource::Drag { phase, .. } = ctx.source() {
+            let mut list = seen.take();
+            list.push(phase);
+            seen.set(list);
+        }
+    });
+    let hits = Rc::new(Cell::new(0_u32));
+    let seen = hits.clone();
+    app.on_action(Action::custom("click"), move |_ctx| {
+        seen.set(seen.get() + 1)
+    });
+    let root = root_of(&app, window);
+    let grip = NodeBuilder::boxed()
+        .layout_override(Rect::new(100.0, 0.0, 60.0, 100.0))
+        .on_click(Action::custom("click"))
+        .on_drag(Action::custom("split"))
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("mount");
+    frame(&mut app, window);
+    app.set_input_thresholds(InputThresholds {
+        double_click_time: std::time::Duration::from_millis(500),
+        double_click_distance: 4.0,
+        drag_distance: 4.0,
+    });
+
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_down(
+            Point::new(120.0, 50.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
+    );
+    // 手抖 1 px：不该开始拖拽。
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(Point::new(121.0, 51.0), Modifiers::empty()),
+    );
+    assert!(phases.take().is_empty(), "未越阈值不得派发 Drag");
+    assert_eq!(app.drag_state(window), None);
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_up(
+            Point::new(121.0, 51.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
+    );
+    assert_eq!(hits.get(), 1, "未开始拖拽 ⇒ 仍然是点击");
+    let _ = grip;
+}
+
+/// R02-9：越过阈值才派发 `Start`，delta 是真实位移，并取得指针捕获。
+#[test]
+fn the_drag_start_waits_for_the_threshold_and_carries_the_real_delta() {
+    let (_rt, mut app, window) = setup();
+    let starts = Rc::new(Cell::new(Vec::<f32>::new()));
+    let seen = starts.clone();
+    app.on_action(Action::custom("split"), move |ctx| {
+        if let ActionSource::Drag { phase, delta } = ctx.source()
+            && phase == DragPhase::Start
+        {
+            let mut list = seen.take();
+            list.push(delta.x);
+            seen.set(list);
+        }
+    });
+    let root = root_of(&app, window);
+    let grip = NodeBuilder::boxed()
+        .layout_override(Rect::new(100.0, 0.0, 60.0, 100.0))
+        .on_drag(Action::custom("split"))
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("mount");
+    frame(&mut app, window);
+    let _ = app.take_capture_requests();
+
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_down(
+            Point::new(120.0, 50.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
+    );
+    assert!(
+        app.take_capture_requests().is_empty(),
+        "按下不请求捕获（还没确认拖拽意图）"
+    );
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(Point::new(124.0, 50.0), Modifiers::empty()),
+    );
+    assert!(starts.take().is_empty(), "4 px 恰好不越阈值");
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(Point::new(140.0, 50.0), Modifiers::empty()),
+    );
+    assert_eq!(starts.take(), vec![20.0], "Start 必须带真实位移");
+    assert_eq!(app.take_capture_requests(), vec![(window, true)]);
+    let _ = grip;
+}
+
+/// R02-8：指针捕获是公开 API，生命周期可观测。
+#[test]
+fn pointer_capture_api_has_an_explicit_lifecycle() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let node = NodeBuilder::boxed()
+        .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("mount");
+    frame(&mut app, window);
+
+    let stale = NodeBuilder::boxed()
+        .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("mount");
+    app.window_mut(window)
+        .expect("window")
+        .tree_mut()
+        .remove(stale)
+        .expect("remove");
+    assert!(
+        !app.capture_pointer(window, stale),
+        "已卸载的节点不得成为捕获目标"
+    );
+    assert!(app.capture_pointer(window, node));
+    assert_eq!(app.pointer_captured(window), Some(node));
+    assert_eq!(app.take_capture_requests(), vec![(window, true)]);
+    assert!(
+        !app.capture_pointer(window, node),
+        "同一节点重复捕获是幂等的"
+    );
+    assert!(app.release_pointer(window));
+    assert_eq!(app.pointer_captured(window), None);
+    assert_eq!(app.take_capture_requests(), vec![(window, false)]);
+    assert!(!app.release_pointer(window), "没有捕获时释放返回 false");
+}
+
+/// R02-16：`KeyState::Up` 落地 + 按住查询；焦点容器上的方向键默认滚动。
+#[test]
+fn key_up_lands_and_arrow_keys_scroll_the_focused_container() {
+    let (_rt, mut app, window) = setup();
+    let container = scrollable_container(&mut app, window);
+    let button = NodeBuilder::boxed()
+        .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
+        .on_click(Action::custom("row"))
+        .build(
+            app.window_mut(window).expect("window").tree_mut(),
+            container,
+        )
+        .expect("mount");
+    frame(&mut app, window);
+    let handle = app
+        .make_scroll(
+            window,
+            container,
+            ScrollConfig {
+                axis: ScrollAxis::Vertical,
+                line_height: 48.0,
+            },
+        )
+        .expect("scrollable");
+    app.set_scroll_content(&handle, Size::new(200.0, 400.0))
+        .expect("content");
+    frame(&mut app, window);
+    assert!(app.set_focus(window, Some(button)));
+
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::ArrowDown, Modifiers::empty()),
+    );
+    assert!(
+        app.key_down(window, KeyCode::ArrowDown),
+        "按下期间必须可查询"
+    );
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset.y,
+        48.0,
+        "方向键默认滚动一行"
+    );
+    app.dispatch_input(
+        window,
+        InputEvent::key_up(KeyCode::ArrowDown, Modifiers::empty()),
+    );
+    assert!(
+        !app.key_down(window, KeyCode::ArrowDown),
+        "抬起后不再是按住"
+    );
+
+    // PageDown 一页（视口 150，内容 400 ⇒ max 250，夹到 250 之前是 150）。
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::PageDown, Modifiers::empty()),
+    );
+    assert_eq!(app.scroll_state(&handle).expect("state").offset.y, 148.0);
+
+    // 应用可以用自己的绑定拦截默认行为。
+    let intercepted = Rc::new(Cell::new(0_u32));
+    let seen = intercepted.clone();
+    app.on_action(Action::custom("intercept"), move |_ctx| {
+        seen.set(seen.get() + 1)
+    });
+    app.bind_key(KeyBinding {
+        key: KeyCode::Home,
+        modifiers: Modifiers::empty(),
+        action: Action::custom("intercept"),
+    });
+    let before = app.scroll_state(&handle).expect("state").offset.y;
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::Home, Modifiers::empty()),
+    );
+    assert_eq!(intercepted.get(), 1, "绑定优先于默认滚动");
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset.y,
+        before,
+        "被拦截后不得再走默认滚动"
+    );
+}
+
+/// R02-12：模态浮层的焦点陷阱 + 关闭后焦点恢复。
+#[test]
+fn a_modal_overlay_traps_focus_and_restores_it_on_close() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let opener = NodeBuilder::boxed()
+        .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
+        .on_click(Action::custom("opener"))
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("mount");
+    let background = NodeBuilder::boxed()
+        .layout_override(Rect::new(50.0, 0.0, 40.0, 40.0))
+        .on_click(Action::custom("background"))
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("mount");
+    frame(&mut app, window);
+    assert!(app.set_focus(window, Some(opener)));
+    let _ = app.drain_events();
+
+    let overlay = app
+        .create_overlay(
+            window,
+            OverlayOptions {
+                placement: OverlayPlacement::Point(Point::new(100.0, 100.0)),
+                dismiss: OverlayDismiss::Explicit,
+                trap_focus: true,
+                restore_focus: true,
+            },
+        )
+        .expect("overlay");
+    let first = NodeBuilder::boxed()
+        .layout_override(Rect::new(110.0, 110.0, 40.0, 20.0))
+        .on_click(Action::custom("first"))
+        .build(
+            app.window_mut(window).expect("window").tree_mut(),
+            overlay.node(),
+        )
+        .expect("mount");
+    let second = NodeBuilder::boxed()
+        .layout_override(Rect::new(160.0, 110.0, 40.0, 20.0))
+        .on_click(Action::custom("second"))
+        .build(
+            app.window_mut(window).expect("window").tree_mut(),
+            overlay.node(),
+        )
+        .expect("mount");
+    frame(&mut app, window);
+
+    // 作用域外不可聚焦。
+    assert!(
+        !app.set_focus(window, Some(background)),
+        "模态外节点不可聚焦"
+    );
+    // Tab 只在浮层内循环。
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::Tab, Modifiers::empty()),
+    );
+    assert_eq!(app.focused(window), Some(first));
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::Tab, Modifiers::empty()),
+    );
+    assert_eq!(app.focused(window), Some(second));
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::Tab, Modifiers::empty()),
+    );
+    assert_eq!(app.focused(window), Some(first), "Tab 在浮层内回绕");
+
+    // 关闭后焦点还给打开者。
+    assert!(app.close_overlay(&overlay));
+    assert_eq!(
+        app.focused(window),
+        Some(opener),
+        "关闭必须恢复 opener 焦点"
+    );
+}
+
+/// R02-5：`App::events` 有界（超限丢最旧并计数）。
+#[test]
+fn the_event_buffer_is_bounded() {
+    let (_rt, mut app, window) = setup();
+    let capacity = super::event_queue::EVENT_QUEUE_CAPACITY;
+    for _ in 0..capacity + 3 {
+        app.dispatch(window, Event::CloseRequested);
+    }
+    assert_eq!(app.drain_events().len(), capacity, "容量是硬上限");
+    assert_eq!(app.events_dropped(), 3, "溢出条数必须可观测");
+}
+
+/// R02-10：`unit = Pixel` 立即到位（不建动画）；`unit = Line` 走平滑动画。
+#[test]
+fn pixel_scroll_follows_immediately_while_line_scroll_is_animated() {
+    let (_rt, mut app, window) = setup();
+    let container = scrollable_container(&mut app, window);
+    frame(&mut app, window);
+    let handle = app
+        .make_scroll(
+            window,
+            container,
+            ScrollConfig {
+                axis: ScrollAxis::Vertical,
+                line_height: 48.0,
+            },
+        )
+        .expect("scrollable");
+    app.set_scroll_content(&handle, Size::new(200.0, 400.0))
+        .expect("content");
+    frame(&mut app, window);
+
+    // 行单位：登记动画，位移在本帧还看不到。
+    app.dispatch_input(
+        window,
+        InputEvent::scroll_lines(
+            Point::new(50.0, 50.0),
+            Point::new(0.0, -1.0),
+            Modifiers::empty(),
+        ),
+    );
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset.y,
+        0.0,
+        "行单位走动画（同帧内还没动）"
+    );
+
+    // 像素单位：1:1 立即跟随（触控板手感）。
+    app.dispatch_input(
+        window,
+        InputEvent::Scroll {
+            position: Point::new(50.0, 50.0),
+            delta: Point::new(0.0, -30.0),
+            unit: ScrollUnit::Pixel,
+            phase: ScrollPhase::Update,
+            lines_per_tick: 0.0,
+            modifiers: Modifiers::empty(),
+            timestamp: std::time::Instant::now(),
+        },
+    );
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset.y,
+        30.0,
+        "像素单位必须立即到位"
+    );
+}
+
+/// R02-14：连击判定用**事件时间戳**，而不是分发时刻。
+#[test]
+fn click_count_uses_the_event_time_stamp() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let node = NodeBuilder::boxed()
+        .layout_override(Rect::new(0.0, 0.0, 100.0, 100.0))
+        .paint(background())
+        .on_click(Action::custom("hit"))
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("mount");
+    frame(&mut app, window);
+    app.set_input_thresholds(InputThresholds {
+        double_click_time: std::time::Duration::from_millis(500),
+        double_click_distance: 4.0,
+        drag_distance: 4.0,
+    });
+    let base = std::time::Instant::now();
+    let click = |app: &mut App, at: std::time::Instant| {
+        app.dispatch_input(
+            window,
+            InputEvent::pointer_down(
+                Point::new(20.0, 20.0),
+                PointerButton::Primary,
+                Modifiers::empty(),
+            )
+            .with_timestamp(at),
+        );
+        app.dispatch_input(
+            window,
+            InputEvent::pointer_up(
+                Point::new(20.0, 20.0),
+                PointerButton::Primary,
+                Modifiers::empty(),
+            )
+            .with_timestamp(at),
+        )
+    };
+    assert_eq!(click(&mut app, base).click_count, 1);
+    // 100 ms 之后：仍是双击的第二个。
+    assert_eq!(
+        click(&mut app, base + std::time::Duration::from_millis(100)).click_count,
+        2
+    );
+    // 事件时间戳间隔 1 s（超过阈值，即使分发几乎同时）：不得算成双击。
+    assert_eq!(
+        click(&mut app, base + std::time::Duration::from_millis(1_100)).click_count,
+        1,
+        "阈值必须按事件时刻判定，不是分发时刻"
+    );
+    let _ = node;
+}
+
+/// 建一个可滚动容器（100×100 视口），不带内容。
+fn scrollable_container(app: &mut App, window: WindowId) -> NodeId {
+    let mut style = Style::default();
+    style.inner.size = taffy::geometry::Size {
+        width: taffy::style::Dimension::length(100.0),
+        height: taffy::style::Dimension::length(100.0),
+    };
+    style.clip = Clip::Bounds;
+    let tree = app.window_mut(window).expect("window").tree_mut();
+    let root = tree.root();
+    NodeBuilder::boxed()
+        .style(style)
+        .build(tree, root)
+        .expect("mount")
 }

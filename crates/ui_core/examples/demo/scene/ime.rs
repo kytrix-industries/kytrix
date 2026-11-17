@@ -588,7 +588,7 @@ mod tests {
 
 #[cfg(all(test, feature = "test-support"))]
 mod showcase_tests {
-    use ui_core::event::{Event, ImeEvent, InputEvent, Key};
+    use ui_core::event::{Event, ImeEvent, InputEvent, KeyCode};
 
     use crate::scene::{
         dispatch_event, ime_text,
@@ -630,14 +630,17 @@ mod showcase_tests {
         dispatch_event(
             &mut scene,
             app,
-            &Event::Input(InputEvent::Text { text: "a".into() }),
+            &Event::Input(InputEvent::Text {
+                text: "a".into(),
+                timestamp: std::time::Instant::now(),
+            }),
         );
         assert_eq!(ime_text(&scene, app).as_str(), "你好a");
 
-        dispatch_event(&mut scene, app, &Event::Input(press(Key::Backspace)));
+        dispatch_event(&mut scene, app, &Event::Input(press(KeyCode::Backspace)));
         assert_eq!(ime_text(&scene, app).as_str(), "你好");
 
-        dispatch_event(&mut scene, app, &Event::Input(press(Key::Enter)));
+        dispatch_event(&mut scene, app, &Event::Input(press(KeyCode::Enter)));
         assert_eq!(ime_text(&scene, app).as_str(), "", "Enter 提交后清空输入");
 
         // 焦点移走后，IME / 文本事件都必须被忽略。
@@ -653,7 +656,10 @@ mod showcase_tests {
         dispatch_event(
             &mut scene,
             app,
-            &Event::Input(InputEvent::Text { text: "x".into() }),
+            &Event::Input(InputEvent::Text {
+                text: "x".into(),
+                timestamp: std::time::Instant::now(),
+            }),
         );
         assert_eq!(ime_text(&scene, app).as_str(), "");
     }
@@ -724,14 +730,14 @@ mod showcase_tests {
         // 覆盖「平台在组合开始时发 Start」的路径（Windows IMM32 IME）；Linux/macOS 平台层不发 Start，
         // 经 Preedit 进入组合态。本机 Windows 11 MSPY 组合期间不发 Start，属 V-104 的平台边界。
         dispatch_event(&mut scene, app, &Event::Ime(ImeEvent::Start));
-        dispatch_event(&mut scene, app, &Event::Input(press(Key::Escape)));
+        dispatch_event(&mut scene, app, &Event::Input(press(KeyCode::Escape)));
         assert!(
             app.window(window).is_some(),
             "组合中的 Esc 是取消组合（平台处理），不得关窗"
         );
 
         dispatch_event(&mut scene, app, &Event::Ime(ImeEvent::End));
-        dispatch_event(&mut scene, app, &Event::Input(press(Key::Escape)));
+        dispatch_event(&mut scene, app, &Event::Input(press(KeyCode::Escape)));
         assert!(app.window(window).is_none(), "组合结束后的 Esc 关窗退出");
     }
 
@@ -754,7 +760,7 @@ mod showcase_tests {
         // Tab 离开输入框：钩子必须收起组合态，否则 Esc 会被一直当成「组合中」。
         let _ = app.focus_next(window);
         tick(&mut scene, app);
-        dispatch_event(&mut scene, app, &Event::Input(press(Key::Escape)));
+        dispatch_event(&mut scene, app, &Event::Input(press(KeyCode::Escape)));
 
         assert!(
             app.window(window).is_none(),
@@ -778,7 +784,7 @@ mod showcase_tests {
             }),
         );
         dispatch_event(&mut scene, app, &Event::FocusChanged { focused: false });
-        dispatch_event(&mut scene, app, &Event::Input(press(Key::Escape)));
+        dispatch_event(&mut scene, app, &Event::Input(press(KeyCode::Escape)));
 
         assert!(
             app.window(window).is_none(),

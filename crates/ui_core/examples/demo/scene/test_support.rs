@@ -3,7 +3,7 @@
 //! 只在 `cfg(all(test, feature = "test-support"))` 下编译；生产 example 不包含。
 
 use ui_core::{
-    event::{InputEvent, Key, KeyState, Modifiers},
+    event::{InputEvent, KeyCode, Modifiers},
     math::Scale,
     test_support::app::TestApp,
     window::{WindowId, WindowOptions},
@@ -37,10 +37,6 @@ pub(super) fn frame(test: &mut TestApp) {
 }
 
 /// 无修饰键的按下事件。
-pub(super) fn press(key: Key) -> InputEvent {
-    InputEvent::Key {
-        key,
-        state: KeyState::Down,
-        modifiers: Modifiers::empty(),
-    }
+pub(super) fn press(code: KeyCode) -> InputEvent {
+    InputEvent::key_down(code, Modifiers::empty())
 }

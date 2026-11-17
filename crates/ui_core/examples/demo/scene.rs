@@ -29,7 +29,7 @@ use ime::ImeField;
 use smol_str::SmolStr;
 use ui_core::{
     app::App,
-    event::{Event, InputEvent, Key, KeyState},
+    event::{Event, InputEvent, KeyCode, KeyState},
     math::{Rect, Size},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::{
@@ -531,7 +531,7 @@ impl Scene {
         match event {
             #[cfg(feature = "hud")]
             Event::Input(InputEvent::Key {
-                key: Key::Function(12),
+                code: KeyCode::F12,
                 state: KeyState::Down,
                 modifiers,
                 ..
@@ -540,7 +540,7 @@ impl Scene {
                 let _ = app.set_debug_hud(self.window, enabled);
             }
             Event::Input(InputEvent::Key {
-                key: Key::Escape,
+                code: KeyCode::Escape,
                 state: KeyState::Down,
                 ..
             }) => {
@@ -561,13 +561,13 @@ impl Scene {
                     self.update_ime(app, |field| field.apply(ime_event));
                 }
             }
-            Event::Input(InputEvent::Text { text }) => {
+            Event::Input(InputEvent::Text { text, .. }) => {
                 if focused == Some(self.ime_field) {
                     self.update_ime(app, |field| field.insert(text));
                 }
             }
             Event::Input(InputEvent::Key {
-                key: Key::Backspace,
+                code: KeyCode::Backspace,
                 state: KeyState::Down,
                 ..
             }) => {
@@ -576,7 +576,7 @@ impl Scene {
                 }
             }
             Event::Input(InputEvent::Key {
-                key: Key::Enter,
+                code: KeyCode::Enter,
                 state: KeyState::Down,
                 ..
             }) => {
@@ -585,12 +585,12 @@ impl Scene {
                 }
             }
             Event::Input(InputEvent::Key {
-                key: key @ (Key::ArrowLeft | Key::ArrowRight),
+                code: key @ (KeyCode::ArrowLeft | KeyCode::ArrowRight),
                 state: KeyState::Down,
                 modifiers,
                 ..
             }) if modifiers.is_empty() && focused == Some(self.slider) => {
-                self.step_scale(app, if *key == Key::ArrowLeft { -1 } else { 1 });
+                self.step_scale(app, if *key == KeyCode::ArrowLeft { -1 } else { 1 });
             }
             _ => {}
         }
@@ -812,7 +812,7 @@ mod tests {
     #[cfg(feature = "hud")]
     #[test]
     fn f12_toggles_the_hud_and_snapshot_build_has_none() {
-        use ui_core::event::{Event, Key};
+        use ui_core::event::{Event, KeyCode};
 
         use super::{
             dispatch_event,
@@ -833,7 +833,7 @@ mod tests {
         dispatch_event(
             &mut scene,
             test.app_mut(),
-            &Event::Input(press(Key::Function(12))),
+            &Event::Input(press(KeyCode::F12)),
         );
         frame(&mut test);
         assert!(!test.app().debug_hud_enabled(window), "F12 必须隐藏 HUD");
@@ -841,7 +841,7 @@ mod tests {
         dispatch_event(
             &mut scene,
             test.app_mut(),
-            &Event::Input(press(Key::Function(12))),
+            &Event::Input(press(KeyCode::F12)),
         );
         frame(&mut test);
         assert!(

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use windows::Win32::{
     Foundation::HWND,
+    System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
     UI::{
         HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
         Input::KeyboardAndMouse::{GetDoubleClickTime, SetCapture},
@@ -32,22 +33,89 @@ use crate::{
 pub(super) const FRAME_TIMER_ID: usize = 1;
 
 /// 消费者：`run`。
-/// 用系统设置初始化输入阈值（双击时间 + 拖拽/双击的距离容差，§5.4）。
+/// 用系统设置初始化输入阈值（R02-15）。
+///
+/// 四个系统值**分开**读（R02-38）：双击矩形是 `SM_CXDOUBLECLK`/`SM_CYDOUBLECLK`，拖拽阈值是
+/// `SM_CXDRAG`/`SM_CYDRAG`，两者是独立的用户设置。旧实现把 `SM_CXDRAG` 同时当作双击容差与拖拽
+/// 阈值，于是「双击容差」被「拖拽阈值」绑死。
 pub(super) fn install_input_thresholds(app: &mut App) {
     // SAFETY: 两个都是无副作用、无指针参数的系统查询。
-    let (double_click, drag_x, drag_y) = unsafe {
+    let (double_click, double_x, double_y, drag_x, drag_y) = unsafe {
         (
             GetDoubleClickTime(),
+            GetSystemMetrics(SM_CXDOUBLECLK),
+            GetSystemMetrics(SM_CYDOUBLECLK),
             GetSystemMetrics(SM_CXDRAG),
             GetSystemMetrics(SM_CYDRAG),
         )
     };
-    let distance = drag_x.max(drag_y).max(1) as f32;
+    let defaults = crate::interaction::InputThresholds::platform_default();
+    let double_click_time = if double_click == 0 {
+        defaults.double_click_time
+    } else {
+        std::time::Duration::from_millis(u64::from(double_click))
+    };
     app.set_input_thresholds(crate::interaction::InputThresholds {
-        double_click_time: std::time::Duration::from_millis(u64::from(double_click.max(1))),
-        double_click_distance: distance,
-        drag_distance: distance,
+        double_click_time,
+        double_click_distance: positive(double_x.max(double_y))
+            .unwrap_or(defaults.double_click_distance),
+        drag_distance: positive(drag_x.max(drag_y)).unwrap_or(defaults.drag_distance),
     });
+}
+
+/// 系统度量值 → 正数阈值（`0` / 负数（未设置）时返回 `None`，调用方保留平台缺省）。
+fn positive(value: i32) -> Option<f32> {
+    (value > 0).then_some(value as f32)
+}
+
+/// 一格滚轮的行数（`SPI_GETWHEELSCROLLLINES`，R02-10）。
+///
+/// 返回 `0.0` 表示「系统值不可用或按页滚动」（`WHEEL_PAGESCROLL = UINT_MAX`）：引擎无法用行
+/// 表达一页，交给 [`crate::platform::event::lines_per_tick`] 回退到 Win32 缺省的 3 行。
+pub(super) fn wheel_lines_from_system() -> f32 {
+    let mut lines: u32 = 3;
+    // SAFETY: `pvparam` 指向栈上的 `u32`；`SPI_GETWHEELSCROLLLINES` 只写这个值，不保留指针。
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWHEELSCROLLLINES,
+            0,
+            Some((&raw mut lines).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    if ok.is_err() || lines == u32::MAX {
+        return 0.0;
+    }
+    lines as f32
+}
+
+/// 当前消息的时间（`GetMessageTime()`，毫秒，与 `GetTickCount` 同源）。
+///
+/// **必须**在处理消息期间调用（系统记录的是「最近一次 `GetMessage`/`PeekMessage` 取到的
+/// 消息」的时间），正是 `WndProc` 与合成事件所处的时机。
+pub(super) fn message_ticks() -> u64 {
+    // SAFETY: 无参数、无线程副作用的查询。
+    u64::from(unsafe { GetMessageTime() } as u32)
+}
+
+/// 单调毫秒（`QueryPerformanceCounter` / `QueryPerformanceFrequency`）。
+///
+/// 用于把 `MSG.time` 换算成 `Instant`（R02-14）：两者都以系统启动为原点，
+/// 因此同一个事件可以按「现在 −（现在 tick − 消息 tick）」回推。
+pub(super) fn monotonic_millis() -> u64 {
+    let mut frequency = 0i64;
+    let mut counter = 0i64;
+    // SAFETY: 两个都是无副作用的计时器查询。
+    let ok = unsafe {
+        (
+            QueryPerformanceFrequency(&raw mut frequency),
+            QueryPerformanceCounter(&raw mut counter),
+        )
+    };
+    if ok.0.is_err() || ok.1.is_err() || frequency <= 0 || counter < 0 {
+        return 0;
+    }
+    (u128::from(counter as u64) * 1_000 / u128::from(frequency as u64)) as u64
 }
 
 /// 消费者：`pump_loop` 与 `wndproc` 的 `WM_SETCURSOR`。
@@ -231,18 +299,17 @@ pub(super) fn pump_loop(
             // SAFETY: 系统光标句柄由 `LoadCursorW` 借用，进程不拥有；`SetCursor` 只影响本线程。
             unsafe { SetCursor(Some(cursor_handle(cursor))) };
         }
-        if let Some((target, capture)) = app.take_capture_request()
-            && let Some(native) = windows.iter_mut().find(|native| native.id() == target)
-        {
-            {
-                let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
-                if capture {
-                    // SAFETY: `hwnd` 是本进程创建的窗口；捕获在拖拽结束/失焦时释放。
-                    unsafe { SetCapture(hwnd) };
-                } else {
-                    // 只有确实持有捕获时才置 suppress 并释放（见 `release_capture`）。
-                    release_capture(hwnd, native.state_mut());
-                }
+        for (target, capture) in app.take_capture_requests() {
+            let Some(native) = windows.iter_mut().find(|native| native.id() == target) else {
+                continue;
+            };
+            let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
+            if capture {
+                // SAFETY: `hwnd` 是本进程创建的窗口；捕获在拖拽结束/释放/失焦时释放。
+                unsafe { SetCapture(hwnd) };
+            } else {
+                // 只有确实持有捕获时才置 suppress 并释放（见 `release_capture`）。
+                release_capture(hwnd, native.state_mut());
             }
         }
         if let Some(native) = windows.first_mut() {

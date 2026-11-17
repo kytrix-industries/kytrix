@@ -1,12 +1,18 @@
 //! D23：引擎一等颜色。
 //!
 //! 唯一职责：把 [`Color`] 解析成 GPU 消费的 **linear sRGB + premultiplied alpha**（[`LinearPremulRgba`]），
-//! 并提供 CPU 侧的显式空间插值。`color` crate 只在本文件出现（I15 的可验证形式）。
+//! 并在**同一个**空间里插值（[`ColorResolver::lerp`]）。`color` crate 只在本文件出现（I15 的可验证形式）。
+//!
+//! **颜色语义只有一套（R05-7）**：合成（sRGB RT + `ONE / INV_SRC_ALPHA`）、AA（覆盖率在预乘空间
+//! 相乘）、shader 渐变（`gradient_eval` 的 `mix`）、CPU 动画（[`ColorResolver::lerp`]）全部在
+//! **线性预乘**空间完成。引擎不提供第二种插值空间 —— 旧的 `Interpolation::Oklab/Oklch` 是只作用于
+//! 死代码的伪配置，已删除。CSS/Skia 默认在 sRGB **编码**空间插值；本引擎刻意选线性光（物理正确，
+//! 代价是同一对颜色的中点比 Chrome 更亮，取舍记录见 `.docs/ui_core-审查报告.md` §5.6）。
 //!
 //! 算法与边界（自建 CSS Color 4 chroma 二分、NaN/clamp 规则）见
 //! `design/phase-02-paint-foundation.md` §5.4–§5.5。
 
-use color::{ColorSpaceTag, DynamicColor, Flags, HueDirection as ColorHueDirection};
+use color::{ColorSpaceTag, DynamicColor, Flags};
 
 /// 自建 gamut mapping 的 in-gamut 容差（只吸收 f32 噪声，不改变视觉结果）。
 const GAMUT_EPSILON: f32 = 1e-6;
@@ -186,6 +192,22 @@ impl LinearPremulRgba {
     pub fn is_transparent(self) -> bool {
         self.components[3] <= 0.0
     }
+
+    /// 线性预乘空间的插值：**引擎唯一的颜色插值**（R05-7）。
+    ///
+    /// 预乘分量直接插值等价于「按 alpha 加权的线性空间混合」，因此端点全透明时不会把颜色
+    /// 带进结果（无 color leak）；`t` 先 clamp 到 `[0, 1]`（两端点精确）。
+    /// shader 的 `gradient_eval` 用的就是这个数学（预乘分量上的 `mix`）。
+    #[must_use]
+    pub fn lerp(from: Self, to: Self, t: f32) -> Self {
+        let t = clamp_01(t);
+        let mut components = [0.0f32; 4];
+        for (index, component) in components.iter_mut().enumerate() {
+            let start = from.components[index];
+            *component = start + (to.components[index] - start) * t;
+        }
+        Self { components }
+    }
 }
 
 impl std::ops::Mul<f32> for LinearPremulRgba {
@@ -200,49 +222,6 @@ impl std::ops::Mul<f32> for LinearPremulRgba {
                 self.components[2] * rhs,
                 self.components[3] * rhs,
             ],
-        }
-    }
-}
-
-/// CSS Color 4 的色相方向（与 `color::HueDirection` 同名同义，但不把外部类型放进公开 API）。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum HueDirection {
-    #[default]
-    Shorter,
-    Longer,
-    Increasing,
-    Decreasing,
-}
-
-impl HueDirection {
-    fn into_color(self) -> ColorHueDirection {
-        match self {
-            Self::Shorter => ColorHueDirection::Shorter,
-            Self::Longer => ColorHueDirection::Longer,
-            Self::Increasing => ColorHueDirection::Increasing,
-            Self::Decreasing => ColorHueDirection::Decreasing,
-        }
-    }
-}
-
-/// 插值空间（必须显式记录：OKLab 与 linear sRGB 的渐变视觉不同）。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Interpolation {
-    /// OKLab（线性 Lab，无 hue 环绕问题）。v1 默认。
-    #[default]
-    Oklab,
-    /// OKLCH（柱坐标，hue 按 [`HueDirection`] 环绕）。
-    Oklch(HueDirection),
-    /// 线性 sRGB。
-    LinearSrgb,
-}
-
-impl Interpolation {
-    fn tag_and_direction(self) -> (ColorSpaceTag, ColorHueDirection) {
-        match self {
-            Self::Oklab => (ColorSpaceTag::Oklab, ColorHueDirection::Shorter),
-            Self::Oklch(direction) => (ColorSpaceTag::Oklch, direction.into_color()),
-            Self::LinearSrgb => (ColorSpaceTag::LinearSrgb, ColorHueDirection::Shorter),
         }
     }
 }
@@ -321,18 +300,16 @@ fn color_bits(color: Color) -> ColorBits {
     )
 }
 
-/// 主题策略对象：持有插值空间；只做「值 → 值」，不缓存、不持有主题语义（D23）。
+/// 主题策略对象：把 [`Color`] 解析成 GPU 消费的线性预乘值，并在这**唯一**的空间里插值。
+///
+/// 引擎的插值空间只有一个：**线性预乘 sRGB**（与合成、AA、渐变同一套）。CPU 侧的
+/// `resolve`/`lerp` 与 shader 的 `gradient_eval` 是同一份数学（R05-7）。因此本类型没有
+/// 「插值空间」配置 —— 旧的 `Interpolation::Oklab/Oklch` 是一份只作用于死代码的伪配置，已删除；
+/// 渐变（shader 内 `mix`）与动画（[`ColorResolver::lerp`]）现在走同一条路径。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ColorResolver {
-    interpolation: Interpolation,
-}
+pub struct ColorResolver;
 
 impl ColorResolver {
-    #[must_use]
-    pub const fn new(interpolation: Interpolation) -> Self {
-        Self { interpolation }
-    }
-
     /// 解析成 GPU 消费的线性预乘 RGBA。
     ///
     /// 声明在 sRGB 族空间（`Srgb`/`LinearSrgb`）的颜色只做**逐通道 clamp**；
@@ -345,20 +322,26 @@ impl ColorResolver {
         premultiply(linear, alpha)
     }
 
-    /// 在 `self.interpolation` 空间、**预乘 alpha** 下插值，返回线性预乘结果。
+    /// 两端各自 `resolve` 后，在**线性预乘空间**插值（`t` 先 clamp 到 `[0, 1]`）。
     ///
-    /// 端点归一化与 `resolve` 共用 `normalized_dynamic`，且插值结果**一律**走
-    /// chroma 二分 gamut mapping（即使插值空间是 `LinearSrgb`），因此恒有
-    /// `interpolate(a, b, 0.0) == resolve(a)` 与 `interpolate(a, b, 1.0) == resolve(b)`。
+    /// 恒有 `lerp(a, b, 0.0) == resolve(a)`、`lerp(a, b, 1.0) == resolve(b)`；这也是 shader 的
+    /// `gradient_eval` 所用的数学（`mix` 在预乘分量上），因此渐变、动画、合成、AA 的语义完全一致。
     #[must_use]
-    pub fn interpolate(&self, from: Color, to: Color, t: f32) -> LinearPremulRgba {
-        let start = normalized_dynamic(from);
-        let end = normalized_dynamic(to);
-        let (space, direction) = self.interpolation.tag_and_direction();
-        let mid = start.interpolate(end, space, direction).eval(clamp_01(t));
-        let alpha = clamp_01(mid.components[3]);
-        let linear = gamut_mapped_linear(mid);
-        premultiply(linear, alpha)
+    pub fn lerp(&self, from: Color, to: Color, t: f32) -> LinearPremulRgba {
+        LinearPremulRgba::lerp(self.resolve(from), self.resolve(to), t)
+    }
+
+    /// 同 [`Self::lerp`]，但把线性预乘结果解回**非预乘的线性** [`Color`]（动画驱动的样式值用它）。
+    ///
+    /// `alpha == 0` 时返回全透明（避免除零把颜色分量放大成 inf）。
+    #[must_use]
+    pub fn lerp_color(&self, from: Color, to: Color, t: f32) -> Color {
+        let mixed = self.lerp(from, to, t).components;
+        let alpha = mixed[3];
+        if alpha <= 0.0 {
+            return Color::linear_srgb(0.0, 0.0, 0.0, 0.0);
+        }
+        Color::linear_srgb(mixed[0] / alpha, mixed[1] / alpha, mixed[2] / alpha, alpha)
     }
 }
 
@@ -521,12 +504,12 @@ mod tests {
     use color::{AlphaColor, ColorSpaceTag, DynamicColor, Flags};
 
     use super::{
-        Color, ColorBrush, ColorResolver, GAMUT_BISECTION_STEPS, HueDirection, Interpolation,
-        LinearPremulRgba, ResolveCache, clamp_01, clamp_nonneg, hue_deg,
+        Color, ColorBrush, ColorResolver, GAMUT_BISECTION_STEPS, LinearPremulRgba, ResolveCache,
+        clamp_01, clamp_nonneg, hue_deg,
     };
 
     fn resolver() -> ColorResolver {
-        ColorResolver::default()
+        ColorResolver
     }
 
     /// 把线性预乘结果解回「线性、非预乘」三分量（测试断言用）。
@@ -686,205 +669,127 @@ mod tests {
         );
     }
 
+    /// R05-7：引擎唯一的插值空间是**线性预乘**（与 shader `gradient_eval`、合成、AA 同一套）。
     #[test]
-    fn interpolate_premultiplied_no_color_leak() {
-        let from = Color::srgb(1.0, 0.0, 0.0, 0.0);
-        let to = Color::srgb(0.0, 0.0, 1.0, 1.0);
-        let start = resolver().interpolate(from, to, 0.0);
+    fn lerp_is_linear_premultiplied() {
+        let mid = resolver().lerp(Color::BLACK, Color::WHITE, 0.5);
+        // 线性光中点 = 0.5（sRGB 编码空间的中点会得到 0.2140 的线性值 ⇒ 视觉上更暗）。
+        for value in &mid.components[..3] {
+            assert!((value - 0.5).abs() < 1e-6, "channel {value}");
+        }
+        assert!((mid.components[3] - 1.0).abs() < f32::EPSILON);
+        // 端点精确。
+        assert_eq!(
+            resolver().lerp(Color::BLACK, Color::WHITE, 0.0).components,
+            resolver().resolve(Color::BLACK).components
+        );
+        assert_eq!(
+            resolver().lerp(Color::BLACK, Color::WHITE, 1.0).components,
+            resolver().resolve(Color::WHITE).components
+        );
+    }
+
+    /// 预乘空间插值不会把「透明端的颜色」泄漏到结果里（旧的 sRGB 空间实现在这里会出灰边）。
+    #[test]
+    fn lerp_has_no_color_leak_from_transparent_endpoints() {
+        let start = resolver().lerp(
+            Color::srgb(1.0, 0.0, 0.0, 0.0),
+            Color::srgb(0.0, 0.0, 1.0, 1.0),
+            0.0,
+        );
         assert!(start.components[3].abs() < f32::EPSILON);
         for value in &start.components[..3] {
             assert!(value.abs() < 1e-6, "channel {value}");
         }
+        let end = resolver().lerp(
+            Color::srgb(1.0, 0.0, 0.0, 0.0),
+            Color::srgb(0.0, 0.0, 1.0, 1.0),
+            1.0,
+        );
+        assert!((end.components[2] - 1.0).abs() < 1e-6);
+        assert!(end.components[0].abs() < 1e-6);
     }
 
     #[test]
-    fn interpolate_clamps_t() {
+    fn lerp_clamps_t() {
         let from = Color::srgb(0.1, 0.2, 0.3, 1.0);
         let to = Color::oklch(0.8, 0.1, 120.0, 1.0);
-        let low = resolver().interpolate(from, to, -1.0).components;
-        let zero = resolver().interpolate(from, to, 0.0).components;
+        let low = resolver().lerp(from, to, -1.0).components;
+        let zero = resolver().lerp(from, to, 0.0).components;
         for index in 0..4 {
             assert_eq!(low[index].to_bits(), zero[index].to_bits());
         }
-        let high = resolver().interpolate(from, to, 2.0).components;
-        let one = resolver().interpolate(from, to, 1.0).components;
+        let high = resolver().lerp(from, to, 2.0).components;
+        let one = resolver().lerp(from, to, 1.0).components;
         for index in 0..4 {
             assert_eq!(high[index].to_bits(), one[index].to_bits());
         }
-    }
-
-    #[test]
-    fn interpolate_oklab_lightness_monotone() {
-        let resolver = ColorResolver::new(Interpolation::Oklab);
-        let mut previous = -1.0_f32;
-        for step in 0..=4 {
-            let t = step as f32 / 4.0;
-            let channel = resolver
-                .interpolate(Color::BLACK, Color::WHITE, t)
-                .components[0];
-            assert!(channel > previous, "t={t} channel={channel}");
-            previous = channel;
+        let nan = resolver().lerp(from, to, f32::NAN).components;
+        for index in 0..4 {
+            assert!(nan[index].is_finite(), "NaN 的 t 必须收敛：{nan:?}");
         }
     }
 
+    /// 端点必须等于 `resolve` 的同色结果（宽色域输入也要先 gamut-map）。
     #[test]
-    fn interpolate_linear_srgb_space() {
-        let resolver = ColorResolver::new(Interpolation::LinearSrgb);
-        let mid = resolver.interpolate(
-            Color::linear_srgb(0.0, 0.0, 0.0, 1.0),
-            Color::linear_srgb(1.0, 1.0, 1.0, 1.0),
-            0.5,
-        );
-        for value in &mid.components[..3] {
-            assert!((value - 0.5).abs() < 1e-6, "channel {value}");
-        }
-    }
-
-    /// B1 回归：任意插值空间下，端点必须等于 `resolve` 的同色结果。
-    #[test]
-    fn interpolate_endpoints_match_resolve() {
+    fn lerp_endpoints_match_resolve() {
         let colors = [
             Color::display_p3(0.1, 0.9, 0.2, 1.0),
             Color::display_p3(1.0, 0.0, 0.0, 0.6),
             Color::srgb(0.2, 0.4, 0.6, 1.0),
             Color::oklch(0.7, 0.2, 140.0, 1.0),
         ];
-        let spaces = [
-            Interpolation::Oklab,
-            Interpolation::Oklch(HueDirection::Shorter),
-            Interpolation::Oklch(HueDirection::Longer),
-            Interpolation::LinearSrgb,
-        ];
         let other = Color::oklch(0.5, 0.1, 20.0, 0.8);
-        for space in spaces {
-            let resolver = ColorResolver::new(space);
-            for color in colors {
-                let expected = resolver.resolve(color).components;
-                for t in [0.0_f32, 1.0] {
-                    let (from, to) = if t == 0.0 {
-                        (color, other)
-                    } else {
-                        (other, color)
-                    };
-                    let actual = resolver.interpolate(from, to, t).components;
-                    for index in 0..4 {
-                        assert!(
-                            (actual[index] - expected[index]).abs() < 1e-5,
-                            "space={space:?} color={color:?} t={t} channel={index}: {} vs {}",
-                            actual[index],
-                            expected[index]
-                        );
-                    }
+        for color in colors {
+            let expected = resolver().resolve(color).components;
+            for t in [0.0_f32, 1.0] {
+                let (from, to) = if t == 0.0 {
+                    (color, other)
+                } else {
+                    (other, color)
+                };
+                let actual = resolver().lerp(from, to, t).components;
+                for index in 0..4 {
+                    assert!(
+                        (actual[index] - expected[index]).abs() < 1e-6,
+                        "color={color:?} t={t} channel={index}: {} vs {}",
+                        actual[index],
+                        expected[index]
+                    );
                 }
             }
         }
     }
 
-    /// B1 回归：`LinearSrgb` 空间的 P3 端点 t=0 必须等于 `resolve`（修复前会差 0.08）。
+    /// alpha 参与加权（预乘插值）：0.5 alpha 的白与不透明黑的中点 = alpha 0.75、预乘 rgb 0.25。
     #[test]
-    fn linear_srgb_space_matches_resolve_for_p3_endpoint() {
-        let resolver = ColorResolver::new(Interpolation::LinearSrgb);
-        let from = Color::display_p3(0.1, 0.9, 0.2, 1.0);
-        let to = Color::srgb(0.0, 0.0, 0.0, 1.0);
-        let actual = resolver.interpolate(from, to, 0.0).components;
-        let expected = resolver.resolve(from).components;
-        for index in 0..4 {
-            assert!(
-                (actual[index] - expected[index]).abs() < 1e-6,
-                "channel {index}: {} vs {}",
-                actual[index],
-                expected[index]
-            );
+    fn lerp_blends_premultiplied_alpha() {
+        let mid = resolver().lerp(Color::srgb(1.0, 1.0, 1.0, 0.5), Color::BLACK, 0.5);
+        for value in &mid.components[..3] {
+            assert!((value - 0.25).abs() < 1e-6, "channel {value}");
         }
+        assert!((mid.components[3] - 0.75).abs() < 1e-6);
     }
 
-    /// 独立期望值（用另一条代码路径算出的字面量，见 phase-02 §14.1）：P3 绿 + 黑在 LinearSrgb
-    /// 空间的中点必须先 gamut-map。
+    /// `lerp_color` 把线性预乘结果解回非预乘的线性色（动画驱动的样式值用它）。
     #[test]
-    fn p3_green_midpoint_is_gamut_mapped() {
-        let resolver = ColorResolver::new(Interpolation::LinearSrgb);
-        let from = Color::display_p3(0.1, 0.9, 0.2, 1.0);
-        let to = Color::srgb(0.0, 0.0, 0.0, 1.0);
-        let mid = resolver.interpolate(from, to, 0.5).components;
-        let expected = [0.0, 0.368_988_1, 0.042_837_59];
-        for (index, value) in expected.iter().enumerate() {
-            assert!(
-                (mid[index] - value).abs() < 1e-4,
-                "channel {index}: {} vs {value}",
-                mid[index]
-            );
-        }
-    }
-
-    /// 同上的蓝色端点。
-    #[test]
-    fn p3_blue_midpoint_is_gamut_mapped() {
-        let resolver = ColorResolver::new(Interpolation::LinearSrgb);
-        let from = Color::display_p3(0.05, 0.2, 0.95, 1.0);
-        let to = Color::srgb(0.0, 0.0, 0.0, 1.0);
-        let mid = resolver.interpolate(from, to, 0.5).components;
-        let expected = [0.0, 0.025_642_38, 0.423_737_44];
-        for (index, value) in expected.iter().enumerate() {
-            assert!(
-                (mid[index] - value).abs() < 1e-4,
-                "channel {index}: {} vs {value}",
-                mid[index]
-            );
-        }
-    }
-
-    #[test]
-    fn hue_direction_longer_midpoint_is_opposite() {
-        let from = Color::oklch(0.7, 0.2, 350.0, 1.0);
-        let to = Color::oklch(0.7, 0.2, 10.0, 1.0);
-        // Longer：350 → -350（-340 度），中点 180 度。
-        let longer = ColorResolver::new(Interpolation::Oklch(HueDirection::Longer));
-        let mid = longer.interpolate(from, to, 0.5);
-        let hue = {
-            let back = DynamicColor {
-                cs: ColorSpaceTag::LinearSrgb,
-                flags: Flags::default(),
-                components: [mid.components[0], mid.components[1], mid.components[2], 1.0],
-            }
-            .convert(ColorSpaceTag::Oklch);
-            back.components[2]
-        };
-        assert!((hue - 180.0).abs() < 6.0, "hue {hue}");
-        // Shorter：350 → 370（+20 度），中点 0 度。
-        let shorter = ColorResolver::new(Interpolation::Oklch(HueDirection::Shorter));
-        let short_mid = shorter.interpolate(from, to, 0.5).components;
-        assert!(
-            (short_mid[0] - mid.components[0]).abs() > 1e-3
-                || (short_mid[2] - mid.components[2]).abs() > 1e-3,
-            "Shorter 与 Longer 的中点不应相同"
+    fn lerp_color_unpremultiplies() {
+        let mid = resolver().lerp_color(
+            Color::linear_srgb(0.0, 0.0, 0.0, 1.0),
+            Color::linear_srgb(1.0, 1.0, 1.0, 1.0),
+            0.5,
         );
-    }
-
-    #[test]
-    fn hue_direction_increasing_and_decreasing() {
-        let from = Color::oklch(0.7, 0.2, 10.0, 1.0);
-        let to = Color::oklch(0.7, 0.2, 350.0, 1.0);
-        let hue_at = |direction: HueDirection| {
-            let resolver = ColorResolver::new(Interpolation::Oklch(direction));
-            let mid = resolver.interpolate(from, to, 0.5);
-            DynamicColor {
-                cs: ColorSpaceTag::LinearSrgb,
-                flags: Flags::default(),
-                components: [mid.components[0], mid.components[1], mid.components[2], 1.0],
-            }
-            .convert(ColorSpaceTag::Oklch)
-            .components[2]
-        };
-        // Increasing：10 → 350（+340），中点 180。
-        assert!((hue_at(HueDirection::Increasing) - 180.0).abs() < 6.0);
-        // Decreasing：10 → -10（-20），中点 0。
-        let decreasing = hue_at(HueDirection::Decreasing);
-        assert!(
-            decreasing < 6.0 || decreasing > 354.0,
-            "decreasing hue {decreasing}"
+        assert_eq!(mid, Color::linear_srgb(0.5, 0.5, 0.5, 1.0));
+        // 全透明端点 ⇒ 全透明（不产生 inf）。
+        let clear = resolver().lerp_color(
+            Color::srgb(1.0, 0.0, 0.0, 0.0),
+            Color::srgb(0.0, 1.0, 0.0, 0.0),
+            0.5,
         );
+        assert!(clear.is_transparent());
+        let text = format!("{clear:?}");
+        assert!(!text.contains("inf"), "不得出现 inf：{text}");
     }
-
     #[test]
     fn hue_extremes_are_normalized() {
         // h = 1e9 与归一化后的 h 必须给出同一结果（B-N6）。
@@ -906,8 +811,7 @@ mod tests {
     fn defaults_are_explicit() {
         assert_eq!(Color::default(), Color::TRANSPARENT);
         assert_eq!(ColorBrush::default().color, Color::BLACK);
-        assert_eq!(Interpolation::default(), Interpolation::Oklab);
-        assert_eq!(<HueDirection as Default>::default(), HueDirection::Shorter);
+        assert_eq!(ColorResolver, ColorResolver);
     }
 
     #[test]

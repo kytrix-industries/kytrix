@@ -49,6 +49,9 @@ pub(crate) fn frame(app: &mut App, window: WindowId) -> Option<Result<FrameOutco
     if !app.windows.contains_key(&window) {
         return None;
     }
+    // R02-5：把未消费的事件在交给 `on_frame` 钩子之后再兜底有界化一次（正常推入就已经有界，
+    // 这里是 O(1) 的防御；钩子可能持有上一轮的事件引用做重放，所以裁剪放在帧入口）。
+    app.events.trim();
     #[cfg(feature = "hud")]
     let committed_at = app.clock;
     #[cfg(feature = "hud")]

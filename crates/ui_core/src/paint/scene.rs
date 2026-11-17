@@ -13,8 +13,10 @@ use crate::{
 
 /// clip 栈深度上限：**类型是 `u8`**，值 8。
 ///
-/// 三处必须一致：本模块 `Lane::push` 的 debug 断言、`Canvas::push_clip` 的 `bool` 门限、
-/// P10 三套 shader 的固定数组长度。
+/// 三处必须一致：`Canvas::push_clip` 的 `bool` 门限、`paint/instance.rs` 编码期的链长判定
+/// （`EngineError::ClipDepthExceeded`）、三套 shader 的 `KYTRIX_MAX_CLIP_DEPTH` 循环上限。
+/// 注意它约束的是**序列化后的链长**（矩形 clip 求交合并成 1 项、圆角 clip 逐层计数），
+/// 不是「嵌套了几层容器」。
 pub(crate) const MAX_CLIP_DEPTH: u8 = 8;
 
 /// 一个绘制输出桶。内容按绘制序排列；`clip_depth` 是 C2/C3 的**增量校验状态**。
@@ -32,11 +34,16 @@ impl Lane {
         Self::default()
     }
 
-    /// 唯一的压入点：更新 `clip_depth` 并做 C2/C3 的 debug 断言。消费者：`Canvas` 的 `push_*`、`Scene::push`。
+    /// 唯一的压入点：更新 `clip_depth`（消费者：`Canvas` 的 `push_*`、`Scene::push`）。
+    ///
+    /// **深度上限不在这里判定**（R05-5）。一个 lane 的 clip 括号 = 祖先 clip（`paint/pass.rs`
+    /// 压入）加自身 content clip 加 `Canvas` 内部 clip；三层叠加后是否超限只有编码期知道
+    /// （矩形 clip 会被求交合并成一项，圆角 clip 逐层计数）。因此这里只维护计数（供
+    /// `Canvas::push_clip` 的 8 层门限使用），越界由 `InstanceEncoder::encode` 返回
+    /// `EngineError::ClipDepthExceeded`，debug 与 release 行为一致，不再有 debug panic。
     pub(crate) fn push(&mut self, primitive: Primitive) {
         match &primitive {
             Primitive::Clip(ClipOp::Push(_)) => {
-                debug_assert!(usize::from(self.clip_depth()) < usize::from(MAX_CLIP_DEPTH));
                 self.clip_depth = self.clip_depth.saturating_add(1);
             }
             Primitive::Clip(ClipOp::Pop) => {
@@ -277,6 +284,7 @@ mod tests {
             offset: Point::new(0.0, 1.0),
             blur: 2.0,
             color: Color::BLACK,
+            corner_radius: [0.0; 4],
         })
     }
 
@@ -333,16 +341,22 @@ mod tests {
         lane.push(Primitive::Clip(ClipOp::Pop));
     }
 
+    /// R05-5：深度上限**不在 Lane 上判定**（不再 debug panic / release 静默分叉）。
+    ///
+    /// Lane::push 只计数（Canvas::push_clip 的 8 层门限用它）；真正的上限是编码期的
+    /// **序列化链长**（矩形 clip 合并 ⇒ 常见嵌套远低于 8），越界由
+    /// EngineError::ClipDepthExceeded 返回，debug 与 release 行为一致。
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "assertion failed")]
-    fn depth_cap_is_debug_assert() {
+    fn depth_cap_is_not_enforced_on_the_lane() {
         let mut lane = Lane::new();
         for _ in 0..MAX_CLIP_DEPTH {
             lane.push(Primitive::Clip(ClipOp::Push(clip())));
         }
         assert_eq!(lane.clip_depth(), MAX_CLIP_DEPTH);
+        // 第 9 层不 panic（也不再饱和成错误值）：计数如实反映已压入的层数。
         lane.push(Primitive::Clip(ClipOp::Push(clip())));
+        assert_eq!(lane.clip_depth(), MAX_CLIP_DEPTH + 1);
+        assert_eq!(lane.primitives().len(), usize::from(MAX_CLIP_DEPTH) + 1);
     }
 
     #[test]

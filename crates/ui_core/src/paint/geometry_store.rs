@@ -176,20 +176,23 @@ mod tests {
         },
     };
 
-    /// 一个合法的 8 B/顶点 + u16 索引描述（单位三角形：3 顶点 × 8 B = 24 B）。
+    /// 一个合法的 12 B/顶点 + u16 索引描述（单位三角形：3 顶点 × 12 B = 36 B）。
+    ///
+    /// `Ui` 的顶点布局是 `position: [f32; 2]` + 解析 AA 的 `coverage: f32`（R05-6）。
     fn triangle_desc() -> GeometryDesc {
-        let mut vertex_bytes = [0u8; 24];
-        // 三个 `[f32; 2]` 顶点：(0,0)、(1,0)、(0,2)。
-        let points: [[f32; 2]; 3] = [[0.0, 0.0], [1.0, 0.0], [0.0, 2.0]];
-        for (slot, point) in vertex_bytes.as_chunks_mut::<8>().0.iter_mut().zip(points) {
+        let mut vertex_bytes = [0u8; 36];
+        // 三个顶点：(0,0)、(1,0)、(0,2)；覆盖率距离 -1（内部）。
+        let points: [[f32; 3]; 3] = [[0.0, 0.0, -1.0], [1.0, 0.0, -1.0], [0.0, 2.0, -1.0]];
+        for (slot, point) in vertex_bytes.as_chunks_mut::<12>().0.iter_mut().zip(points) {
             slot[..4].copy_from_slice(&point[0].to_le_bytes());
-            slot[4..].copy_from_slice(&point[1].to_le_bytes());
+            slot[4..8].copy_from_slice(&point[1].to_le_bytes());
+            slot[8..].copy_from_slice(&point[2].to_le_bytes());
         }
         GeometryDesc {
             vertex_bytes: Bytes::copy_from_slice(&vertex_bytes),
             // 3 个 u16 索引。
             index_bytes: Bytes::from_static(&[0, 0, 1, 0, 2, 0]),
-            vertex_stride: 8,
+            vertex_stride: 12,
             index_type: IndexType::U16,
             topology: Topology::TriangleList,
             bounds: Rect::new(0.0, 0.0, 1.0, 2.0),
@@ -204,7 +207,7 @@ mod tests {
         let id = store.insert(triangle_desc()).expect("valid desc");
         assert_eq!(store.len(), 1);
         let record = store.get(id).expect("registered");
-        assert_eq!(record.desc.vertex_bytes.len(), 24);
+        assert_eq!(record.desc.vertex_bytes.len(), 36);
         assert_eq!(record.desc.index_bytes.len(), 6);
         assert_eq!(record.desc.bounds, Rect::new(0.0, 0.0, 1.0, 2.0));
     }
@@ -291,6 +294,29 @@ mod tests {
             desc.bounds = bounds;
             assert!(store.insert(desc).is_err(), "bounds {bounds:?} 必须被拒绝");
         }
+    }
+
+    /// R05-6：`Ui` 顶点必须带解析 AA 的覆盖率属性（12 B / 顶点）。
+    ///
+    /// 旧的 8 B 布局（只有 `position`）会让 `geometry.ui.*` 的顶点着色器读到垃圾覆盖率 ——
+    /// 这里在注册期就拒绝，而不是让它悄悄画成半透明或全透明。
+    #[test]
+    fn ui_pipeline_rejects_the_legacy_8_byte_layout() {
+        let mut store = GeometryStore::new();
+        let mut desc = triangle_desc();
+        desc.vertex_stride = 8;
+        desc.vertex_bytes = Bytes::from_static(&[0; 24]); // 3 × 8 B（旧布局）
+        let error = store.insert(desc).expect_err("8 B 的 Ui 顶点必须被拒绝");
+        let text = error.to_string();
+        assert!(text.contains("vertex_stride"), "{text}");
+        assert!(!store.len().eq(&1), "拒绝后不得占用槽位");
+        // 12 B / 顶点（position + coverage）才是合法布局。
+        let mut store = GeometryStore::new();
+        let id = store.insert(triangle_desc()).expect("12 B 布局合法");
+        assert_eq!(
+            store.get(id).expect("record").desc.vertex_stride,
+            GeometryPipeline::Ui.vertex_stride()
+        );
     }
 
     #[test]

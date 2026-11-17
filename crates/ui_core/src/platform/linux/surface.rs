@@ -62,7 +62,10 @@ use xkbcommon::xkb;
 use crate::{
     app::App,
     error::EngineError,
-    event::{Event, ImeEvent, InputEvent, Key, KeyState, Modifiers, PointerButton},
+    event::{
+        Event, ImeEvent, InputEvent, KeyCode, KeyState, Modifiers, PointerButton, ScrollPhase,
+        ScrollUnit,
+    },
     math::{Point, Rect, Scale, Size},
     platform::linux::{
         clipboard::Clipboard,
@@ -180,6 +183,17 @@ impl ScrollAccum {
         (
             self.discrete_x as f32 / 120.0 + self.continuous_x / CONTINUOUS_AXIS_UNITS_PER_LINE,
             self.discrete_y as f32 / 120.0 + self.continuous_y / CONTINUOUS_AXIS_UNITS_PER_LINE,
+        )
+    }
+
+    /// 连续部分按**像素**（触控板 / `axis_source = finger` 的 1:1 跟随，R02-10）。
+    ///
+    /// 手指输入的 `axis` 值本来就是「手指移动量 × 加速度」，不做行换算才能与系统惯性对齐；
+    /// 方便起见把同时到达的离散分量按一格 = 10 个单位折算进来（正常不会同时出现）。
+    fn continuous_pixels(self) -> (f32, f32) {
+        (
+            self.continuous_x + self.discrete_x as f32 / 120.0 * CONTINUOUS_AXIS_UNITS_PER_LINE,
+            self.continuous_y + self.discrete_y as f32 / 120.0 * CONTINUOUS_AXIS_UNITS_PER_LINE,
         )
     }
 
@@ -337,6 +351,12 @@ pub(crate) struct WaylandState {
     clipboard: Clipboard,
     xkb_context: xkb::Context,
     xkb_state: Option<xkb::State>,
+    /// 键盘布局的 keymap（`xkb_state` 的父对象）。
+    ///
+    /// 保留它是为了 `xkb_keymap_key_repeats`（R02-2 / R10-14）：Wayland 的按键重复由客户端
+    /// 合成，"哪些键该重复"由布局决定（修饰键、锁定键不该重复）。`xkb::State` 不提供这个查询，
+    /// 只有 `xkb::Keymap` 有。
+    xkb_keymap: Option<xkb::Keymap>,
     /// 最近的输入 serial（IME / 剪贴板 / 拖拽都要）。
     serial: u32,
     /// 最近一次指针按键的 serial（`xdg_toplevel.move` / `resize` 的隐式抓取凭证）。
@@ -359,6 +379,11 @@ pub(crate) struct WaylandState {
     held_keys: Vec<HeldKey>,
     /// 本帧尚未提交的滚轮累积（按 `wl_pointer.frame` 成批，P1-2.11）。
     scroll: ScrollAccum,
+    /// 当前滚动是否来自**触控板 / 手指**（`wl_pointer.axis_source = finger`，R02-10）：
+    /// 是 ⇒ 像素单位、连续阶段；否 ⇒ 行单位、离散滚轮。
+    scroll_finger: bool,
+    /// 连续滚动手势是否进行中（`axis_source` 之后、`axis_stop` 之前）。
+    scroll_active: bool,
     pointer_pos: Point,
 }
 
@@ -440,6 +465,7 @@ impl WaylandState {
             clipboard,
             xkb_context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
             xkb_state: None,
+            xkb_keymap: None,
             serial: 0,
             pointer_serial: 0,
             mods: (0, 0, 0, 0),
@@ -448,6 +474,8 @@ impl WaylandState {
             key_repeat: KeyRepeat::default(),
             held_keys: Vec::new(),
             scroll: ScrollAccum::default(),
+            scroll_finger: false,
+            scroll_active: false,
             pointer_pos: Point::new(0.0, 0.0),
         };
         // 启动时绑定所有现存 `wl_output`：`initial_roundtrip` 的 2 次 roundtrip 会带回它们的
@@ -975,7 +1003,10 @@ impl WaylandState {
     }
 
     /// 键盘：`wl_keyboard::Event::Key` → `Event`（字符输入 + 非字符键）。
-    fn translate_key(&mut self, key: u32, state: KeyState) {
+    ///
+    /// `timestamp` 是事件时刻：`wl_keyboard.key` 带 `time`（毫秒），合成重复用引擎时钟。
+    /// `repeat` 由调用方明确给出（R02-2）：真实按下为 `false`，客户端合成的重复为 `true`。
+    fn translate_key(&mut self, key: u32, state: KeyState, repeat: bool, timestamp: Instant) {
         let Some(xkb_state) = self.xkb_state.as_mut() else {
             return;
         };
@@ -983,27 +1014,31 @@ impl WaylandState {
         // 有效布局组放在 `locked_layout` 位置（Wayland 只给有效组，smithay/winit 同此约定）。
         xkb_state.update_mask(depressed, latched, locked, 0, 0, group);
         let keycode = xkb::Keycode::new(key);
-        let symbol = xkb_state.key_get_one_sym(keycode);
         // seat 事件没有 surface 归属：派发给**焦点窗口**（active）。
         let window = self.windows[self.active].id;
         self.events.push((
             window,
             Event::Input(InputEvent::Key {
-                key: map_keysym(symbol, key),
+                // R02-1：物理键身份取自 **evdev 码**（布局无关），不是 keysym（布局相关）。
+                code: key_code(key.saturating_sub(8)),
                 state,
+                repeat,
                 modifiers: self.modifiers,
+                timestamp,
             }),
         ));
         // P1-2.11：IME 启用后文本**只**走 `zwp_text_input_v3` 的 `commit_string`。
         // 两条通路同时生效会让一次按键产生两份文本（输入 "ni" 得到 "ni你"）。
         // 组合器没有 text-input-v3 时 `ime_enabled` 恒 false，回退到这里的 xkb 通路。
-        if state == KeyState::Down && !self.ime_enabled {
+        // 重复按键不再产生文本（系统重复是"按住不放"，文本早已插入）。
+        if state == KeyState::Down && !repeat && !self.ime_enabled {
             let text = xkb_state.key_get_utf8(keycode);
             if !text.is_empty() && text.chars().all(|c| !c.is_control()) {
                 self.events.push((
                     window,
                     Event::Input(InputEvent::Text {
                         text: SmolStr::new(text),
+                        timestamp,
                     }),
                 ));
             }
@@ -1026,6 +1061,17 @@ impl WaylandState {
         }
     }
 
+    /// 该 xkb keycode 是否支持重复（`xkb_keymap_key_repeats`，R02-2 / R10-14）。
+    ///
+    /// Wayland 的重复由**客户端**合成，但"哪些键该重复"由键盘布局决定：布告栏里的
+    /// `repeat` 属性（`xkb_keymap_key_repeats`）把修饰键、锁定键排除在外。不查它就会让
+    /// 按住 Ctrl 不断产生 Ctrl 的重复事件（winit / GTK 都查这个函数）。
+    fn key_repeats(&self, xkb_key: u32) -> bool {
+        self.xkb_keymap
+            .as_ref()
+            .is_none_or(|keymap| keymap.key_repeats(xkb::Keycode::new(xkb_key)))
+    }
+
     /// `repeat_info` 变化后重排全部按住键的下次触发时刻。
     fn reschedule_held_keys(&mut self) {
         let now = std::time::Instant::now();
@@ -1038,6 +1084,7 @@ impl WaylandState {
     /// 合成到期的重复按键（把 Key Down + Text 推进 `events`）。
     ///
     /// 由事件循环每轮调用；`rate == 0` 时不做任何事（服务端要求关闭重复）。
+    /// 产物带 `repeat = true`（R02-2）：引擎的绑定派发会忽略它，只有默认的导航/滚动行为允许重复。
     pub(crate) fn emit_due_key_repeats(&mut self, now: std::time::Instant) {
         if self.held_keys.is_empty() {
             return;
@@ -1056,7 +1103,10 @@ impl WaylandState {
             }
         }
         for key in due {
-            self.translate_key(key, KeyState::Down);
+            // R02-2：不支持重复的键（修饰键 / 锁定键）不合成 —— 判据是 xkb 的 keymap。
+            if self.key_repeats(key) {
+                self.translate_key(key, KeyState::Down, true, now);
+            }
         }
     }
 
@@ -1435,7 +1485,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                         )
                     };
                     if let Ok(Some(keymap)) = keymap {
+                        // R02-2：keymap 要留着做 `xkb_keymap_key_repeats`（见 `key_repeats`）。
                         state.xkb_state = Some(xkb::State::new(&keymap));
+                        state.xkb_keymap = Some(keymap);
                     }
                 }
             }
@@ -1469,7 +1521,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                     // evdev 码 + 8 = xkb keycode。
                     let xkb_key = key + 8;
                     state.note_key_held(xkb_key, key_state);
-                    state.translate_key(xkb_key, key_state);
+                    // R02-14：`wl_keyboard.key` 的 `time` 是 compositor 的毫秒时钟，原点未定义
+                    // （协议只保证单调），无法与 `Instant` 对齐 ⇒ 用分发时刻并**在此标注**：
+                    // 键盘事件的时刻精度因此是本轮泵的取出时刻（Wayland 的已知限制）。
+                    state.translate_key(xkb_key, key_state, false, Instant::now());
                 }
             }
             wl_keyboard::Event::RepeatInfo { rate, delay } => {
@@ -1545,11 +1600,14 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 state.pointer_focus = Some(index);
                 state.pointer_pos = Point::new(surface_x as f32, surface_y as f32);
                 let window = state.windows[index].id;
+                // R02-4：`wl_pointer.enter` 是进窗事件（与 Win32 的 TrackMouseEvent 首次移动、
+                // AppKit 的 `mouseEntered:` 对齐）；之后的 `motion` 才是纯移动。
                 state.events.push((
                     window,
-                    Event::Input(InputEvent::PointerMove {
+                    Event::Input(InputEvent::PointerEnter {
                         position: state.pointer_pos,
                         modifiers: state.modifiers,
+                        timestamp: Instant::now(),
                     }),
                 ));
             }
@@ -1565,6 +1623,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                         Event::Input(InputEvent::PointerMove {
                             position: state.pointer_pos,
                             modifiers: state.modifiers,
+                            timestamp: Instant::now(),
                         }),
                     ));
                 }
@@ -1576,6 +1635,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 ..
             } => {
                 if let Some(button) = Self::pointer_button(button) {
+                    let timestamp = Instant::now();
                     let event = match button_state {
                         wayland_client::WEnum::Value(wl_pointer::ButtonState::Pressed) => {
                             state.pointer_serial = serial;
@@ -1583,18 +1643,28 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                                 position: state.pointer_pos,
                                 button,
                                 modifiers: state.modifiers,
+                                timestamp,
                             }
                         }
                         _ => InputEvent::PointerUp {
                             position: state.pointer_pos,
                             button,
                             modifiers: state.modifiers,
+                            timestamp,
                         },
                     };
                     if let Some(window) = state.pointer_window() {
                         state.events.push((window, Event::Input(event)));
                     }
                 }
+            }
+            wl_pointer::Event::AxisSource { axis_source } => {
+                // R02-10：`axis_source` 区分「滚轮 / 手指 / 连续设备」——只有手指（触控板）才是
+                // 像素级 1:1 跟随 + 连续阶段；滚轮是离散行。
+                state.scroll_finger = matches!(
+                    axis_source,
+                    wayland_client::WEnum::Value(wl_pointer::AxisSource::Finger)
+                );
             }
             wl_pointer::Event::Axis { axis, value, .. } => {
                 // 连续值（触控板即像素；v5 起滚轮一格 = 10 个单位）。**不能**除 120 ——
@@ -1615,22 +1685,57 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                     _ => state.scroll.discrete_y = state.scroll.discrete_y.saturating_add(value120),
                 }
             }
+            wl_pointer::Event::AxisStop { .. } => {
+                // 一次连续手势结束：补一条 `phase = End` 的空增量事件，引擎据此结束惯性/动画
+                // （Chrome 的 `WebMouseWheelEvent.phase = kScrollPhaseEnded` 同义）。
+                state.scroll_active = false;
+                if let Some(window) = state.pointer_window() {
+                    state.events.push((
+                        window,
+                        Event::Input(scroll_event(
+                            state.pointer_pos,
+                            (0.0, 0.0),
+                            state.scroll_finger,
+                            ScrollPhase::End,
+                            state.modifiers,
+                        )),
+                    ));
+                }
+            }
             wl_pointer::Event::Frame => {
                 // 一次 frame = 一批同属一个逻辑输入的指针事件 ⇒ 只产出一个 Scroll。
                 // 未实现 `axis_value120` 的服务端（v8 以下）只会来连续 `axis`，两条通路在此合并。
                 if !state.scroll.is_empty() {
-                    let (lines_x, lines_y) = state.scroll.lines();
+                    // 手指（触控板）：连续值就是像素增量，1:1 跟随；滚轮：换算成行。
+                    let (delta_x, delta_y) = if state.scroll_finger {
+                        let (x, y) = state.scroll.continuous_pixels();
+                        (-x, -y)
+                    } else {
+                        let (x, y) = state.scroll.lines();
+                        (-x, -y)
+                    };
                     state.scroll.clear();
-                    // 取反对齐 Win32 的「正 = 向上 / 向右」。
+                    let phase = if state.scroll_finger {
+                        let phase = if state.scroll_active {
+                            ScrollPhase::Update
+                        } else {
+                            ScrollPhase::Begin
+                        };
+                        state.scroll_active = true;
+                        phase
+                    } else {
+                        ScrollPhase::Discrete
+                    };
                     if let Some(window) = state.pointer_window() {
                         state.events.push((
                             window,
-                            Event::Input(InputEvent::Scroll {
-                                position: state.pointer_pos,
-                                delta_x: -lines_x,
-                                delta_y: -lines_y,
-                                modifiers: state.modifiers,
-                            }),
+                            Event::Input(scroll_event(
+                                state.pointer_pos,
+                                (delta_x, delta_y),
+                                state.scroll_finger,
+                                phase,
+                                state.modifiers,
+                            )),
                         ));
                     }
                 }
@@ -1639,21 +1744,27 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 let window = state.pointer_window();
                 state.pointer_focus = None;
                 if let Some(window) = window {
-                    state
-                        .events
-                        .push((window, Event::Input(InputEvent::PointerLeave)));
+                    state.events.push((
+                        window,
+                        Event::Input(InputEvent::PointerLeave {
+                            position: state.pointer_pos,
+                            modifiers: state.modifiers,
+                            timestamp: Instant::now(),
+                        }),
+                    ));
                     // wayland 的隐式 grab 正常期间不会发 `leave`，所以多数拖拽仍会收到 release；
                     // 但 grab 被合成器撤销（屏幕锁定、Super 概览、别的客户端抢 grab、Alt+Tab 的
                     // 某些实现）时会**先收到 leave 而没有 release**。此时 app 侧
-                    // `on_pointer_leave` 在 capture=true 时保留会话 ⇒ 拖拽永久停在「按住」，
-                    // 之后所有按下都被忽略（复审 P2-7）。
-                    //
-                    // 所以 leave 之后再投一次 `PointerCancel`：无拖拽时是幂等 no-op（只清
-                    // hover），有拖拽时结束会话并派发 `DragPhase::Cancel`。与 Windows 的
-                    // `WM_CAPTURECHANGED → PointerCancel` 路径对称。
-                    state
-                        .events
-                        .push((window, Event::Input(InputEvent::PointerCancel)));
+                    // `on_pointer_leave` 在捕获态下保留会话 ⇒ 拖拽永久停在「按住」，
+                    // 之后所有按下都被忽略（复审 P2-7）。R02-8 要求把这条语义明确成
+                    // `PointerCancel`：它在无捕获时是幂等 no-op（只清 hover），有捕获时结束会话
+                    // 并派发 `DragPhase::Cancel`，与 Windows 的 `WM_CAPTURECHANGED` 路径对称。
+                    state.events.push((
+                        window,
+                        Event::Input(InputEvent::PointerCancel {
+                            timestamp: Instant::now(),
+                        }),
+                    ));
                 }
             }
             _ => {}
@@ -1814,47 +1925,181 @@ pub(crate) fn create_devices(state: &mut WaylandState) -> Result<(), EngineError
 /// 空闲等待的兜底超时（`ping` / 协议事件会提前返回；3600 s 只是防御）。
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
 
-/// `Keysym → Key` 映射（未映射 ⇒ `Key::Other(evdev)`）。
-fn map_keysym(symbol: xkb::Keysym, evdev: u32) -> Key {
-    let code = u32::from(symbol);
-    match code {
-        xkb::keysyms::KEY_Escape => Key::Escape,
-        xkb::keysyms::KEY_Return | xkb::keysyms::KEY_KP_Enter => Key::Enter,
-        xkb::keysyms::KEY_Tab => Key::Tab,
-        xkb::keysyms::KEY_BackSpace => Key::Backspace,
-        xkb::keysyms::KEY_Delete => Key::Delete,
-        xkb::keysyms::KEY_space => Key::Space,
-        xkb::keysyms::KEY_Up => Key::ArrowUp,
-        xkb::keysyms::KEY_Down => Key::ArrowDown,
-        xkb::keysyms::KEY_Left => Key::ArrowLeft,
-        xkb::keysyms::KEY_Right => Key::ArrowRight,
-        xkb::keysyms::KEY_Home => Key::Home,
-        xkb::keysyms::KEY_End => Key::End,
-        xkb::keysyms::KEY_Prior => Key::PageUp,
-        xkb::keysyms::KEY_Next => Key::PageDown,
-        xkb::keysyms::KEY_Shift_L | xkb::keysyms::KEY_Shift_R => Key::Shift,
-        xkb::keysyms::KEY_Control_L | xkb::keysyms::KEY_Control_R => Key::Control,
-        xkb::keysyms::KEY_Alt_L | xkb::keysyms::KEY_Alt_R => Key::Alt,
-        xkb::keysyms::KEY_Super_L | xkb::keysyms::KEY_Super_R => Key::Meta,
-        xkb::keysyms::KEY_F1 => Key::Function(1),
-        xkb::keysyms::KEY_F2 => Key::Function(2),
-        xkb::keysyms::KEY_F3 => Key::Function(3),
-        xkb::keysyms::KEY_F4 => Key::Function(4),
-        xkb::keysyms::KEY_F5 => Key::Function(5),
-        xkb::keysyms::KEY_F6 => Key::Function(6),
-        xkb::keysyms::KEY_F7 => Key::Function(7),
-        xkb::keysyms::KEY_F8 => Key::Function(8),
-        xkb::keysyms::KEY_F9 => Key::Function(9),
-        xkb::keysyms::KEY_F10 => Key::Function(10),
-        xkb::keysyms::KEY_F11 => Key::Function(11),
-        xkb::keysyms::KEY_F12 => Key::Function(12),
-        _ => Key::Other((evdev.saturating_sub(8)) as u16),
+/// 一条滚动事件的构造（`unit` / `phase` / `lines_per_tick` 三处共用，避免手抄漏字段）。
+///
+/// `finger` = 触控板 / 连续设备（`axis_source = finger`）：像素单位、连续阶段；否则是离散滚轮，
+/// 行单位、`ScrollPhase::Discrete`。
+fn scroll_event(
+    position: Point,
+    delta: (f32, f32),
+    finger: bool,
+    phase: ScrollPhase,
+    modifiers: Modifiers,
+) -> InputEvent {
+    InputEvent::Scroll {
+        position,
+        delta: Point::new(delta.0, delta.1),
+        unit: if finger {
+            ScrollUnit::Pixel
+        } else {
+            ScrollUnit::Line
+        },
+        phase,
+        // 离散通路已经用 `axis_value120 / 120` 折成行，一格 = 1 行；连续通路不需要换算。
+        lines_per_tick: if finger { 0.0 } else { 1.0 },
+        modifiers,
+        timestamp: Instant::now(),
     }
+}
+
+/// `evdev` 键码 → 引擎 [`KeyCode`]（W3C `KeyboardEvent.code` 语义，R02-1）。
+///
+/// **必须用 evdev 码而不是 keysym**：`xkb_state.key_get_one_sym()` 返回的是**布局相关**的
+/// keysym（AZERTY 上物理 `Q` 位置的 keysym 是 `q`），按它做快捷键就跨不了布局；evdev 码是硬件
+/// 位置，与键盘布局无关。这样同一个物理键在三平台都是同一个 `KeyCode`（Linux `KEY_S` = 31 ⇒
+/// `KeyS`、Windows 扫描码 0x1F ⇒ `KeyS`、macOS `kVK_ANSI_S` ⇒ `KeyS`）。
+///
+/// 未覆盖的码返回 [`KeyCode::Unidentified`]（载荷是 evdev 码，文档明确**不可跨平台**）。
+fn key_code(evdev: u32) -> KeyCode {
+    let code = match evdev {
+        1 => KeyCode::Escape,
+        2 => KeyCode::Digit1,
+        3 => KeyCode::Digit2,
+        4 => KeyCode::Digit3,
+        5 => KeyCode::Digit4,
+        6 => KeyCode::Digit5,
+        7 => KeyCode::Digit6,
+        8 => KeyCode::Digit7,
+        9 => KeyCode::Digit8,
+        10 => KeyCode::Digit9,
+        11 => KeyCode::Digit0,
+        12 => KeyCode::Minus,
+        13 => KeyCode::Equal,
+        14 => KeyCode::Backspace,
+        15 => KeyCode::Tab,
+        16 => KeyCode::KeyQ,
+        17 => KeyCode::KeyW,
+        18 => KeyCode::KeyE,
+        19 => KeyCode::KeyR,
+        20 => KeyCode::KeyT,
+        21 => KeyCode::KeyY,
+        22 => KeyCode::KeyU,
+        23 => KeyCode::KeyI,
+        24 => KeyCode::KeyO,
+        25 => KeyCode::KeyP,
+        26 => KeyCode::BracketLeft,
+        27 => KeyCode::BracketRight,
+        28 => KeyCode::Enter,
+        29 => KeyCode::ControlLeft,
+        30 => KeyCode::KeyA,
+        31 => KeyCode::KeyS,
+        32 => KeyCode::KeyD,
+        33 => KeyCode::KeyF,
+        34 => KeyCode::KeyG,
+        35 => KeyCode::KeyH,
+        36 => KeyCode::KeyJ,
+        37 => KeyCode::KeyK,
+        38 => KeyCode::KeyL,
+        39 => KeyCode::Semicolon,
+        40 => KeyCode::Quote,
+        41 => KeyCode::Backquote,
+        42 => KeyCode::ShiftLeft,
+        43 => KeyCode::Backslash,
+        44 => KeyCode::KeyZ,
+        45 => KeyCode::KeyX,
+        46 => KeyCode::KeyC,
+        47 => KeyCode::KeyV,
+        48 => KeyCode::KeyB,
+        49 => KeyCode::KeyN,
+        50 => KeyCode::KeyM,
+        51 => KeyCode::Comma,
+        52 => KeyCode::Period,
+        53 => KeyCode::Slash,
+        54 => KeyCode::ShiftRight,
+        55 => KeyCode::NumpadMultiply,
+        56 => KeyCode::AltLeft,
+        57 => KeyCode::Space,
+        58 => KeyCode::CapsLock,
+        59 => KeyCode::F1,
+        60 => KeyCode::F2,
+        61 => KeyCode::F3,
+        62 => KeyCode::F4,
+        63 => KeyCode::F5,
+        64 => KeyCode::F6,
+        65 => KeyCode::F7,
+        66 => KeyCode::F8,
+        67 => KeyCode::F9,
+        68 => KeyCode::F10,
+        69 => KeyCode::NumLock,
+        70 => KeyCode::ScrollLock,
+        71 => KeyCode::Numpad7,
+        72 => KeyCode::Numpad8,
+        73 => KeyCode::Numpad9,
+        74 => KeyCode::NumpadSubtract,
+        75 => KeyCode::Numpad4,
+        76 => KeyCode::Numpad5,
+        77 => KeyCode::Numpad6,
+        78 => KeyCode::NumpadAdd,
+        79 => KeyCode::Numpad1,
+        80 => KeyCode::Numpad2,
+        81 => KeyCode::Numpad3,
+        82 => KeyCode::Numpad0,
+        83 => KeyCode::NumpadDecimal,
+        86 => KeyCode::IntlBackslash,
+        87 => KeyCode::F11,
+        88 => KeyCode::F12,
+        89 => KeyCode::IntlRo,
+        96 => KeyCode::NumpadEnter,
+        97 => KeyCode::ControlRight,
+        98 => KeyCode::NumpadDivide,
+        99 => KeyCode::PrintScreen,
+        100 => KeyCode::AltRight,
+        102 => KeyCode::Home,
+        103 => KeyCode::ArrowUp,
+        104 => KeyCode::PageUp,
+        105 => KeyCode::ArrowLeft,
+        106 => KeyCode::ArrowRight,
+        107 => KeyCode::End,
+        108 => KeyCode::ArrowDown,
+        109 => KeyCode::PageDown,
+        110 => KeyCode::Insert,
+        111 => KeyCode::Delete,
+        117 => KeyCode::NumpadEqual,
+        119 => KeyCode::Pause,
+        121 => KeyCode::NumpadComma,
+        124 => KeyCode::IntlYen,
+        138 => KeyCode::Help,
+        139 => KeyCode::ContextMenu,
+        125 => KeyCode::MetaLeft,
+        126 => KeyCode::MetaRight,
+        127 => KeyCode::ContextMenu,
+        183 => KeyCode::F13,
+        184 => KeyCode::F14,
+        185 => KeyCode::F15,
+        186 => KeyCode::F16,
+        187 => KeyCode::F17,
+        188 => KeyCode::F18,
+        189 => KeyCode::F19,
+        190 => KeyCode::F20,
+        191 => KeyCode::F21,
+        192 => KeyCode::F22,
+        193 => KeyCode::F23,
+        194 => KeyCode::F24,
+        other => KeyCode::Unidentified(other as u16),
+    };
+    code
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CONTINUOUS_AXIS_UNITS_PER_LINE, KeyRepeat, ScrollAccum, choose_integer_scale};
+    use super::{
+        CONTINUOUS_AXIS_UNITS_PER_LINE, KeyRepeat, ScrollAccum, choose_integer_scale, key_code,
+        scroll_event,
+    };
+    use crate::{
+        event::{KeyCode, Modifiers, ScrollPhase, ScrollUnit},
+        math::Point,
+    };
 
     /// P1-2.11：`axis_value120` 是 1/120 行，一格（120）= 整整一行。
     ///
@@ -1996,5 +2241,75 @@ mod tests {
         assert_eq!(choose_integer_scale(None, None, Some(0), 1, false), 1);
         assert_eq!(choose_integer_scale(None, None, None, 0, true), 1);
         assert_eq!(choose_integer_scale(None, None, None, -3, true), 1);
+    }
+
+    /// R02-1：物理键身份取自 **evdev 码**（布局无关），不是 keysym（布局相关）。
+    ///
+    /// AZERTY 上物理 `Q` 位置的 keysym 是 `q`、键位码仍是 `KEY_Q`(16) ⇒ 三平台都得到
+    /// `KeyCode::KeyQ`，同一张 `KeyBinding` 表跨布局成立。
+    #[test]
+    fn physical_key_identity_is_layout_independent() {
+        assert_eq!(key_code(31), KeyCode::KeyS);
+        assert_eq!(key_code(30), KeyCode::KeyA);
+        assert_eq!(key_code(16), KeyCode::KeyQ);
+        assert_eq!(key_code(96), KeyCode::NumpadEnter);
+        assert_eq!(key_code(28), KeyCode::Enter);
+        assert_eq!(key_code(105), KeyCode::ArrowLeft);
+        assert_eq!(key_code(58), KeyCode::CapsLock);
+        assert_eq!(key_code(42), KeyCode::ShiftLeft);
+        assert_eq!(key_code(54), KeyCode::ShiftRight);
+        // 未覆盖的码：载荷是 evdev 码，文档明确**不可跨平台**。
+        assert_eq!(key_code(4242), KeyCode::Unidentified(4242));
+    }
+
+    /// R02-10：滚轮是行单位 + 离散阶段；触控板是像素单位 + 连续阶段。
+    #[test]
+    fn scroll_events_carry_the_unit_and_the_phase() {
+        let wheel = scroll_event(
+            Point::ZERO,
+            (0.0, -1.0),
+            false,
+            ScrollPhase::Discrete,
+            Modifiers::empty(),
+        );
+        let finger = scroll_event(
+            Point::ZERO,
+            (0.0, -10.0),
+            true,
+            ScrollPhase::Update,
+            Modifiers::empty(),
+        );
+
+        let crate::event::InputEvent::Scroll {
+            delta,
+            unit,
+            phase,
+            lines_per_tick,
+            ..
+        } = wheel
+        else {
+            panic!("必须是滚动事件");
+        };
+        assert_eq!(delta, Point::new(0.0, -1.0));
+        assert_eq!(unit, ScrollUnit::Line);
+        assert_eq!(phase, ScrollPhase::Discrete);
+        assert_eq!(lines_per_tick, 1.0);
+
+        let crate::event::InputEvent::Scroll { unit, phase, .. } = finger else {
+            panic!("必须是滚动事件");
+        };
+        assert_eq!(unit, ScrollUnit::Pixel);
+        assert_eq!(phase, ScrollPhase::Update);
+    }
+
+    /// `ScrollAccum` 的像素通路（触控板 1:1 跟随）与行通路互相独立。
+    #[test]
+    fn continuous_pixels_are_not_converted_to_lines() {
+        let touchpad = ScrollAccum {
+            continuous_y: -24.0,
+            ..ScrollAccum::default()
+        };
+        assert_eq!(touchpad.continuous_pixels().1, -24.0);
+        assert_eq!(touchpad.lines().1, -2.4);
     }
 }

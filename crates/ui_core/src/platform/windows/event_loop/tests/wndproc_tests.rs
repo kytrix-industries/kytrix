@@ -166,9 +166,10 @@ fn suppress_consumes_one_capture_change_and_clears() {
     }
     assert!(!raw.suppress_capture_cancel, "suppress 必须被消费并清零");
     assert!(
-        !raw.events
-            .iter()
-            .any(|event| matches!(event, crate::platform::event::PlatformEvent::PointerCancel)),
+        !raw.events.iter().any(|event| matches!(
+            event.event,
+            crate::platform::event::PlatformEvent::PointerCancel
+        )),
         "自己释放产生的捕获变化不得派发 PointerCancel"
     );
     destroy_hidden_window(hwnd, state);
@@ -257,7 +258,7 @@ fn disabled_ime_swallows_composition_events_until_reenabled() {
     assert!(
         raw.take_events()
             .iter()
-            .any(|event| matches!(event, PlatformEvent::Ime(ImeEvent::Start))),
+            .any(|event| matches!(event.event, PlatformEvent::Ime(ImeEvent::Start))),
         "启用态必须派发 ImeEvent::Start"
     );
 
@@ -289,7 +290,7 @@ fn disabled_ime_swallows_composition_events_until_reenabled() {
     assert!(
         raw.take_events()
             .iter()
-            .any(|event| matches!(event, PlatformEvent::Ime(ImeEvent::Start))),
+            .any(|event| matches!(event.event, PlatformEvent::Ime(ImeEvent::Start))),
         "重新启用后必须恢复派发"
     );
 

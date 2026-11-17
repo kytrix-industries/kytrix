@@ -160,7 +160,7 @@ impl Pipeline {
                 pass_clear,
                 "geometry.vs_ui.spv",
                 "geometry.ps_ui.spv",
-                8,
+                12,
                 vk::PrimitiveTopology::TRIANGLE_LIST,
             )?,
             image: create_geometry_pipeline(
@@ -600,10 +600,16 @@ fn create_geometry_pipeline(
         .binding(0)
         .format(vk::Format::R32G32_SFLOAT)
         .offset(8);
-    let attributes: Vec<vk::VertexInputAttributeDescription> = if stride == 16 {
-        vec![position, texcoord]
-    } else {
-        vec![position]
+    // 12 B = `Ui`：第二个属性是解析 AA 的覆盖率距离（单个 float）。
+    let coverage = vk::VertexInputAttributeDescription::default()
+        .location(1)
+        .binding(0)
+        .format(vk::Format::R32_SFLOAT)
+        .offset(8);
+    let attributes: Vec<vk::VertexInputAttributeDescription> = match stride {
+        16 => vec![position, texcoord],
+        12 => vec![position, coverage],
+        _ => vec![position],
     };
     let bindings = [vk::VertexInputBindingDescription::default()
         .binding(0)

@@ -255,26 +255,26 @@ pub(crate) fn refresh_text(
     let App {
         text,
         raster,
-        atlas,
-        glyph_atlas,
         text_dirty_scratch,
         windows,
         scale_epochs,
         pending_dirty,
         ..
     } = app;
-    let window = windows.get_mut(&window)?;
-    let window_id = window.id();
-    let scale = window.scale().factor();
-    let epoch = window.scale_epoch();
-
-    if scale_epochs.get(&window_id).copied().unwrap_or(0) != epoch {
-        atlas.clear();
-        glyph_atlas.clear();
-        scale_epochs.insert(window_id, epoch);
+    let window_id = window;
+    let scale_epoch = windows.get(&window_id)?.scale_epoch();
+    // R12-4：DPI 变化**不再**清形状缓存（布局在逻辑坐标里，与 scale 无关），也**不再**清字形
+    // 图集（新 ppem 的 tile 直接加入，旧 ppem 的由逐 tile LRU 淘汰，见 R12-1）。只需让该窗口
+    // 的 `ShapedLine` 重排一次：tile 落点/尺寸是「物理取整后除回逻辑」的量，scale 变了要重算。
+    if scale_epochs.get(&window_id).copied().unwrap_or(0) != scale_epoch {
+        scale_epochs.insert(window_id, scale_epoch);
+        if let Some(target) = windows.get_mut(&window_id) {
+            target.tree_mut().invalidate_text_lines();
+        }
     }
     raster.set_font_epoch(text.font_epoch());
 
+    let window = windows.get_mut(&window_id)?;
     let tree = window.tree_mut();
     let mut report = TextPassReport::default();
     let known = taffy::Size {
@@ -294,7 +294,7 @@ pub(crate) fn refresh_text(
     // （shape 3.2 + layout/raster 3.6），已接近 60 Hz 预算的一半。
     //
     // 集合来源：`set_text_content`（`bind_text` 求值 / 静态挂载）与 `mark_all_text_dirty`
-    // （字体栈、DPI、图集换代）。
+    // （字体栈、系统字体、图集换代）。
     tree.take_text_dirty(text_dirty_scratch);
     let dirty: &[crate::node::id::NodeId] = text_dirty_scratch;
     while index < dirty.len() {
@@ -303,16 +303,16 @@ pub(crate) fn refresh_text(
         let Some(content) = tree.text_content(node).cloned() else {
             continue;
         };
-        let (shaped, hit) = text.shape_cached(&content, scale);
+        let (shaped, hit) = text.shape_cached(&content);
         if hit {
             report.reused += 1;
         } else {
             report.shaped += 1;
         }
-        let key = crate::text::cache::ShapeKey::new(&content, scale, text.font_stack_version());
+        let key = crate::text::cache::ShapeKey::new(&content, text.font_stack_version());
         if let Some(slot) = tree.text_slot(node)
             && slot.key() == key
-            && slot.scale_epoch() == epoch
+            && slot.scale_epoch() == scale_epoch
             && Rc::ptr_eq(slot.shaped(), &shaped)
         {
             // B4：快照未变 ⇒ 不重建、不清缓存、不重挂（空闲帧只走这条路）。
@@ -331,8 +331,20 @@ pub(crate) fn refresh_text(
         let size_changed = !fixed_layout
             && (previous.width.to_bits() != measured.width.to_bits()
                 || previous.height.to_bits() != measured.height.to_bits());
-        tree.set_text_shaped(node, Rc::clone(&shaped), key, epoch, measured, size_changed);
+        tree.set_text_shaped(
+            node,
+            Rc::clone(&shaped),
+            key,
+            scale_epoch,
+            measured,
+            size_changed,
+        );
     }
+    // 数字快速路径的命中率（R12 的核心性能指标）：分子 = 走快速路径的塑形数，
+    // 分母 = 进入快速路径判定的塑形数。
+    let fast = text.take_fast_path_stats();
+    report.fast_path_shaped = fast.hits;
+    report.fast_path_queries = fast.queries;
     // 光栅/图集统计**不在这里**：光栅发生在同帧的 `layout_text`（第二阶段），而本报告在
     // 第一阶段产出。`GlyphAtlas::take_stats` 只能取一次，第二阶段才是唯一正确的消费点
     // （此前这里取到的永远是 0，复审已确认）。见 `TextLayoutReport` 的同名字段。
@@ -344,10 +356,16 @@ pub(crate) fn refresh_text(
 ///
 /// 帧序（B1）：`refresh_styles` → `refresh_text` → `Window::compute_layout` → `layout_text` → paint。
 /// 与 `refresh_text` 的分工：前者只 shape + 量固有尺寸（给 measure 用），后者拿 taffy 算出的
-/// **内容宽**做最终断行（`break_all_lines` + `align`）并产出 `ShapedLine`。
+/// **内容宽**做最终断行（就地重排，零 clone）并产出 `ShapedLine`。
 ///
-/// 图集代际在一次 pass 内必须稳定（N3）：若中途换代（容量逃逸），整 pass **重跑一次**；
-/// 第二次仍换代则返回 `TextShape`（调用方丢弃本帧）。
+/// **只遍历重排脏集合**（R12-14）：`set_text_shaped` / 内容宽变化 / 图集淘汰 / 全量失效
+/// 才入队，因此「没有文本变化的帧」这里是 O(1)。
+///
+/// 图集逐 tile 淘汰（R12-1）可能让**本次 pass 早先**生成的 `ShapedLine` 里的 tile 被复用：
+/// 一旦淘汰发生，整 pass 重跑（最多 [`MAX_LAYOUT_TEXT_PASSES`] 轮），并把其它窗口的文本
+/// `ShapedLine` 也标记为待重排（图集是进程级共享的）。**任何情况下都不返回 `TextShape`**：
+/// 容量不足时降级为「本帧少画几个字形」+ 诊断，绝不丢帧。
+///
 /// 消费者：`App::layout_text`。
 pub(crate) fn layout_text(
     app: &mut App,
@@ -360,25 +378,42 @@ pub(crate) fn layout_text(
         glyph_atlas,
         windows,
         pending_dirty,
+        text_layout_scratch,
         ..
     } = app;
-    let window = windows.get_mut(&window)?;
-    let scale = window.scale().factor();
+    let window_id = window;
+    let scale = windows.get(&window_id)?.scale().factor();
     let mut report = TextLayoutReport::default();
+    let mut any_eviction = false;
+    let mut scratch = Vec::new();
+    // LRU 的 pass 边界：本 pass 用到的 tile 记 `last_used_pass = pass`，且在本 pass 内不可淘汰。
+    glyph_atlas.begin_pass();
+    {
+        let window = windows.get_mut(&window_id)?;
+        window
+            .tree_mut()
+            .take_text_layout_dirty(text_layout_scratch);
+    }
+    if text_layout_scratch.is_empty() {
+        return Some(Ok(report));
+    }
 
-    for attempt in 0..2 {
-        // 统计按**本轮**计：图集换代会让整 pass 重跑，累加器必须清空，否则报告里的
-        // `rasterized` 等约等于实际值的 2 倍，而 `laid/reused` 只反映最后一轮（复审 F7）。
+    let mut round = 0usize;
+    loop {
         report.rasterized = 0;
         report.tiles_reused = 0;
         report.atlas_rebuilds = 0;
+        report.atlas_evictions = 0;
         let generation = atlas.generation();
         let mut laid = 0usize;
         let mut reused = 0usize;
+        // 先取走上一轮的淘汰计数，才能只统计本轮新增的淘汰。
+        let _previous_evictions = glyph_atlas.take_evicted();
+        let window = windows.get_mut(&window_id)?;
         let tree = window.tree_mut();
         let mut index = 0usize;
-        while index < tree.order().len() {
-            let node = tree.order()[index];
+        while index < text_layout_scratch.len() {
+            let node = text_layout_scratch[index];
             index += 1;
             let Some(shaped) = tree.text_slot(node).map(|slot| Rc::clone(slot.shaped())) else {
                 continue;
@@ -388,7 +423,7 @@ pub(crate) fn layout_text(
                 if width > 0.0 {
                     width
                 } else {
-                    shaped.widths().max / scale
+                    shaped.max_content_size().width
                 }
             };
             let current = tree
@@ -398,10 +433,21 @@ pub(crate) fn layout_text(
                 reused += 1;
                 continue;
             }
-
-            let layout = shaped.layout_at(width);
+            let Some(content) = tree.text_content(node) else {
+                continue;
+            };
+            let color = content.style.color;
+            let alignment = content.style.alignment;
+            let ellipsis = text.ellipsis_for(&content.style);
+            let mut ctx = crate::text::shape::RasterCtx {
+                raster,
+                glyph_atlas,
+                atlas,
+                generation,
+                scale,
+            };
             let (line, diagnostics, stats) =
-                match shaped.rasterize(&layout, width, raster, glyph_atlas, atlas, generation) {
+                match shaped.rasterize(width, alignment, color, &mut ctx, ellipsis.as_deref()) {
                     Ok(value) => value,
                     Err(error) => return Some(Err(error)),
                 };
@@ -409,25 +455,51 @@ pub(crate) fn layout_text(
             report.rasterized += stats.rasters;
             report.tiles_reused += stats.hits;
             report.atlas_rebuilds += stats.rebuilds;
+            report.atlas_evictions += stats.evictions;
             pending_dirty.merge(&mut atlas.take_dirty_rows());
             text.push_diagnostics(diagnostics);
-            tree.set_text_line(node, Rc::new(line), layout, width, generation);
+            tree.set_text_line(node, Rc::new(line), width, generation);
             laid += 1;
         }
-        if atlas.generation() == generation {
-            report.laid = laid;
-            report.reused = reused;
-            report.reruns = attempt;
-            return Some(Ok(report));
+        let evicted = glyph_atlas.take_evicted();
+        let generation_changed = atlas.generation() != generation;
+        report.laid = laid;
+        report.reused = reused;
+        report.reruns = round;
+        if evicted == 0 && !generation_changed {
+            any_eviction |= report.atlas_evictions > 0;
+            break;
+        }
+        // 有 tile 被淘汰 / 图集换代：本 pass 早先的 `ShapedLine` 可能引用已失效的矩形。
+        // 把全部文本重新入队后重跑（有界：淘汰只发生在容量不足时，第二轮会优先淘汰
+        // 不在本帧使用的 tile，工作集放得下就收敛）。
+        any_eviction = true;
+        tree.invalidate_text_lines();
+        scratch.clear();
+        tree.take_text_layout_dirty(&mut scratch);
+        std::mem::swap(&mut scratch, text_layout_scratch);
+        round += 1;
+        if round >= MAX_LAYOUT_TEXT_PASSES {
+            // 兜底：不再重跑，保留最后一轮结果（极端容量不足时少画几个字形，但绝不丢帧）。
+            break;
         }
     }
-    Some(Err(EngineError::TextShape {
-        node: window.tree().root(),
-        detail: smol_str::SmolStr::new_static(
-            "atlas generation changed twice within one text pass",
-        ),
-    }))
+
+    // 图集是进程级共享的：本窗口的淘汰会让其它窗口的 `ShapedLine` 引用已失效的矩形。
+    // 让它们在自己的下一帧重排（各自的 `layout_text` 都在 paint 之前，所以不会画旧 UV）。
+    if any_eviction {
+        for (id, other) in windows.iter_mut() {
+            if *id == window_id {
+                continue;
+            }
+            other.tree_mut().invalidate_text_lines();
+        }
+    }
+    Some(Ok(report))
 }
+
+/// 单帧内 `layout_text` 的最大重跑轮数（图集淘汰后整 pass 重来）。
+pub(crate) const MAX_LAYOUT_TEXT_PASSES: usize = 4;
 
 /// 当前字体栈。
 /// 消费者：`App::font_stack`。
@@ -441,6 +513,21 @@ pub(crate) fn font_stack(app: &App) -> &FontStack {
 #[must_use]
 pub(crate) fn font_stack_version(app: &App) -> u32 {
     app.text.font_stack_version()
+}
+
+/// 数字快速路径开关（回退验证用；R12 的 `DigitFastPath`）。
+///
+/// 关闭后所有文本都走 parley，形状缓存被清空（两种模式的快照不混用）。
+/// 消费者：`App::set_digit_fast_path`。
+pub(crate) fn set_digit_fast_path(app: &mut App, enabled: bool) {
+    app.text.set_digit_fast_path(enabled);
+}
+
+/// 数字快速路径是否开启。
+/// 消费者：`App::digit_fast_path_enabled`。
+#[must_use]
+pub(crate) fn digit_fast_path_enabled(app: &App) -> bool {
+    app.text.digit_fast_path_enabled()
 }
 
 /// 文本诊断（tofu / 行内盒边界 / 超宽 / 合成样式）。

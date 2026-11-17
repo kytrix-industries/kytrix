@@ -8,10 +8,13 @@ struct GeomVsOut {
     float4 position [[position]];
     float2 world_px;
     float2 uv;
+    float coverage;
 };
 
 struct GeomVsInUi {
     float2 position [[attribute(0)]];
+    // 解析 AA 的覆盖率输入：到形状边界的有符号距离（逻辑像素，负 = 内部）。
+    float coverage [[attribute(1)]];
 };
 
 struct GeomVsInTextured {
@@ -19,37 +22,36 @@ struct GeomVsInTextured {
     float2 uv [[attribute(1)]];
 };
 
-inline float2 geometry_world(float2 local, constant RootUniform& root) {
-    float2 p = float2(root.draw.basis.x * local.x + root.draw.basis.z * local.y +
-                          root.draw.translation.x,
-                      root.draw.basis.y * local.x + root.draw.basis.w * local.y +
-                          root.draw.translation.y);
-    return p * root.frame.params.x;
-}
 
-inline GeomVsOut geometry_vertex(float2 local, float2 uv, constant RootUniform& root) {
+inline GeomVsOut geometry_vertex(float2 local, float2 uv, float coverage,
+                                 constant RootUniform& root) {
     GeomVsOut o;
     o.world_px = geometry_world(local, root);
     o.position = float4(to_ndc(o.world_px, root.frame), 0.0, 1.0);
     o.uv = uv;
+    // 逻辑像素 -> 物理像素：aa_coverage 的 d 必须是设备像素。
+    o.coverage = coverage * root.frame.params.x;
     return o;
 }
 
 vertex GeomVsOut vs_ui(GeomVsInUi in [[stage_in]],
                        constant RootUniform& root [[buffer(2)]]) {
-    return geometry_vertex(in.position, float2(0.0, 0.0), root);
+    return geometry_vertex(in.position, float2(0.0, 0.0), in.coverage, root);
 }
 
 vertex GeomVsOut vs_textured(GeomVsInTextured in [[stage_in]],
                              constant RootUniform& root [[buffer(2)]]) {
-    return geometry_vertex(in.position, in.uv, root);
+    return geometry_vertex(in.position, in.uv, KYTRIX_AA_INSIDE, root);
 }
 
 fragment float4 ps_ui(GeomVsOut in [[stage_in]],
                       device const ClipEntry* clips [[buffer(1)]],
                       constant RootUniform& root [[buffer(2)]]) {
-    return apply_gamma(root.draw.color0 *
-                       clip_mask(in.world_px, uint(root.draw.clip.x), clips));
+    // 解析 AA：覆盖率由**顶点距离插值**给出，不依赖 MSAA / 后处理（三后端一致）。
+    float coverage = aa_coverage(in.coverage);
+    return apply_gamma(root.draw.color0 * coverage *
+                       clip_mask(in.world_px, uint(root.draw.clip.x),
+                                 uint(KYTRIX_MAX_CLIP_DEPTH), clips));
 }
 
 fragment float4 ps_textured_image(GeomVsOut in [[stage_in]],
@@ -59,7 +61,8 @@ fragment float4 ps_textured_image(GeomVsOut in [[stage_in]],
                                   sampler atlas_sampler [[sampler(0)]]) {
     float4 texel = image_atlas.sample(atlas_sampler, in.uv);
     float4 color = texel * root.draw.color0;
-    return apply_gamma(color * clip_mask(in.world_px, uint(root.draw.clip.x), clips));
+    return apply_gamma(color * clip_mask(in.world_px, uint(root.draw.clip.x),
+                                         uint(KYTRIX_MAX_CLIP_DEPTH), clips));
 }
 
 fragment float4 ps_textured_glyph(GeomVsOut in [[stage_in]],
@@ -69,5 +72,6 @@ fragment float4 ps_textured_glyph(GeomVsOut in [[stage_in]],
                                   sampler atlas_sampler [[sampler(0)]]) {
     float coverage = glyph_atlas.sample(atlas_sampler, in.uv).r;
     float4 color = root.draw.color0 * coverage;
-    return apply_gamma(color * clip_mask(in.world_px, uint(root.draw.clip.x), clips));
+    return apply_gamma(color * clip_mask(in.world_px, uint(root.draw.clip.x),
+                                         uint(KYTRIX_MAX_CLIP_DEPTH), clips));
 }

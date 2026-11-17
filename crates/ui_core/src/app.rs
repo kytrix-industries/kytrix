@@ -10,6 +10,7 @@ mod a11y;
 mod animation;
 #[cfg(feature = "hud")]
 mod debug;
+mod event_queue;
 mod focus;
 mod frame;
 mod input;
@@ -32,8 +33,8 @@ use crate::debug_hud::DebugHudState;
 use crate::{
     error::EngineError,
     event::{
-        Action, ActionHandler, ActionSource, CloseHandler, Event, InputEvent, InputOutcome, Key,
-        KeyBinding, KeyState, Modifiers, PointerButton,
+        Action, ActionHandler, ActionSource, CloseHandler, Event, InputEvent, InputOutcome,
+        KeyBinding, KeyCode, KeyState, Modifiers, PointerButton,
     },
     interaction::{
         ActionCtx, AnimatedValue, AnimationId, AnimationSpec, DragInfo, DragState, Easing,
@@ -116,6 +117,9 @@ pub struct App {
     glyph_atlas: GlyphAtlas,
     /// 文本脏集合的跨帧复用缓冲（`refresh_text` 的 `take_text_dirty` 输出；保容量）。
     text_dirty_scratch: Vec<crate::node::id::NodeId>,
+    /// 「需要重建 `ShapedLine`」的文本节点集合的跨帧复用缓冲（R12-14；`layout_text` 的
+    /// `take_text_layout_dirty` 输出，保容量）。
+    text_layout_scratch: Vec<crate::node::id::NodeId>,
     /// 每窗口「图集已同步到的 `scale_epoch`」（DPI 变化 ⇒ 图集换代）。
     scale_epochs: ahash::HashMap<WindowId, u32>,
     /// 已按其重绘过文本的图集代际（P1-2.6）。
@@ -136,8 +140,13 @@ pub struct App {
     packed: Vec<u8>,
     /// 跨线程唤醒队列（`AppHandle` 的载荷；主线程之外唯一的引擎入口）。
     dispatcher: Arc<Dispatcher>,
-    /// 本帧从平台层收到的、尚未被应用取走的事件。
-    events: Vec<(WindowId, Event)>,
+    /// 本帧从平台层收到的、尚未被应用取走的事件（**有界**环形队列，R02-5）。
+    events: event_queue::EventQueue,
+    /// 当前按住的物理键集合（R02-16；`KeyState::Up` 落地后的权威源）。
+    ///
+    /// 用 `HashSet` 而不是位图：`KeyCode` 含 `Unidentified(u16)`，位图需要先为它分配序号，
+    /// 而按住集合的规模是个位数 —— 直接哈希正好。窗口失焦时整体清空（抬起消息不再到达）。
+    held_keys: ahash::HashSet<KeyCode>,
     /// 每轮事件循环调用一次的应用钩子（读事件 / 写状态；`Application::run` 唯一调用点）。
     frame_hook: Option<Box<dyn FnMut(&mut App)>>,
     /// 动作处理器表（P10；同 `Action` 后写覆盖）。
@@ -168,9 +177,11 @@ pub struct App {
     /// 待推给平台的光标变化（`None` = 没变）。
     /// 待推给平台的**光标变化**（带窗口 id：光标是每窗口状态，P2 复审）。
     cursor_pending: Option<(WindowId, Cursor)>,
-    /// 待推给平台的捕获请求（`Some(true)` = 取得、`Some(false)` = 释放）。
-    /// 待推给平台的**指针捕获请求**（带窗口 id：SetCapture 是每窗口状态，复审 P1-3）。
-    capture_request: Option<(WindowId, bool)>,
+    /// 待推给平台的**指针捕获目标状态**（每窗口：`SetCapture` 是每窗口状态，R02-8/R02-22）。
+    ///
+    /// 用「每窗口目标状态」而不是单槽请求：同一泵轮里多个窗口各自改一次捕获时单槽会丢请求。
+    /// 平台泵每轮 `take_capture_requests()` 取走并应用。
+    capture_requests: ahash::HashMap<WindowId, bool>,
     /// IME 被应用**禁用**的窗口集合（P2-7；默认启用）。
     ///
     /// 按窗口的**目标状态**：平台泵每轮把它与本窗口已应用状态比较，只有变化才调
@@ -197,6 +208,8 @@ pub struct App {
 struct ClickRecord {
     window: WindowId,
     node: Option<NodeId>,
+    /// 产生这次点击的按键（连击要求按键一致：左右键交替不算双击）。
+    button: PointerButton,
     position: Point,
     at: Instant,
     count: u8,
@@ -262,20 +275,23 @@ impl AnimationTarget {
 }
 
 /// 默认键盘绑定（Tab / Shift+Tab / Esc；应用可 `unbind_key` 或覆盖）。
+///
+/// 键位身份是布局无关的 [`KeyCode`]（W3C `KeyboardEvent.code`）：同一张表在三个平台、任意
+/// 键盘布局下命中同一物理键。
 fn default_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding {
-            key: Key::Tab,
+            key: KeyCode::Tab,
             modifiers: Modifiers::empty(),
             action: Action::FocusNext,
         },
         KeyBinding {
-            key: Key::Tab,
+            key: KeyCode::Tab,
             modifiers: Modifiers::SHIFT,
             action: Action::FocusPrev,
         },
         KeyBinding {
-            key: Key::Escape,
+            key: KeyCode::Escape,
             modifiers: Modifiers::empty(),
             action: Action::Dismiss,
         },
@@ -369,17 +385,18 @@ impl App {
             eval_stack: EvalStack::new(),
             wake_requested: false,
             next_window_id: 1,
-            runtime,
+            runtime: runtime.clone(),
             text: TextContext::new(),
             raster: GlyphRasterizer::new(),
             atlas: AtlasAllocator::with_page(
                 crate::paint::atlas::AtlasKind::Glyph,
                 (MIN_ATLAS_PAGE, MIN_ATLAS_PAGE),
             ),
-            resources: ResourceCache::new(),
+            resources: ResourceCache::new(runtime),
             geometry: crate::paint::geometry_store::GeometryStore::new(),
             glyph_atlas: GlyphAtlas::new(),
             text_dirty_scratch: Vec::new(),
+            text_layout_scratch: Vec::new(),
             scale_epochs: ahash::HashMap::default(),
             atlas_generation_seen: 0,
             pending_dirty: crate::render::DirtyRows::default(),
@@ -387,19 +404,20 @@ impl App {
             glyph_page: Vec::new(),
             packed: Vec::new(),
             dispatcher: Dispatcher::new(),
-            events: Vec::new(),
+            events: event_queue::EventQueue::new(),
+            held_keys: ahash::HashSet::default(),
             frame_hook: None,
             handlers: ahash::HashMap::default(),
             close_handlers: ahash::HashMap::default(),
             bindings: default_bindings(),
-            thresholds: InputThresholds::default(),
+            thresholds: InputThresholds::platform_default(),
             clock: Instant::now(),
             a11y_delivered: ahash::HashMap::default(),
             last_click: None,
             animations: Vec::new(),
             next_animation: 1,
             cursor_pending: None,
-            capture_request: None,
+            capture_requests: ahash::HashMap::default(),
             ime_disabled: ahash::HashSet::default(),
             #[cfg(target_os = "linux")]
             window_control: None,
@@ -435,9 +453,18 @@ impl App {
     }
 
     /// 取走本帧的平台事件（`Application::run` 每帧填充；顺序即产生顺序）。
+    ///
+    /// 队列**有界**（`EVENT_QUEUE_CAPACITY` = 1024 条，超出丢最旧并计入
+    /// [`App::events_dropped`]）：应用忘了每帧 drain 也不会无界增长（R02-5）。
     #[must_use]
     pub fn drain_events(&mut self) -> Vec<(WindowId, Event)> {
         resources::drain_events(self)
+    }
+
+    /// 累计被丢弃的事件条数（队列溢出诊断；单调递增）。
+    #[must_use]
+    pub fn events_dropped(&self) -> u64 {
+        self.events.dropped()
     }
 
     /// 平台层投递一个事件（`crate::platform::native` 唯一写入点）。
@@ -604,7 +631,7 @@ impl App {
     }
 
     /// 删除一条键盘绑定（返回是否真的删了）。
-    pub fn unbind_key(&mut self, key: Key, modifiers: Modifiers) -> bool {
+    pub fn unbind_key(&mut self, key: KeyCode, modifiers: Modifiers) -> bool {
         style_pass::unbind_key(self, key, modifiers)
     }
 
@@ -687,9 +714,12 @@ impl App {
         position: Point,
         button: PointerButton,
         modifiers: Modifiers,
+        timestamp: Instant,
         outcome: &mut InputOutcome,
     ) {
-        input::on_pointer_down(self, window, position, button, modifiers, outcome)
+        input::on_pointer_down(
+            self, window, position, button, modifiers, timestamp, outcome,
+        )
     }
 
     fn on_pointer_move(
@@ -708,25 +738,31 @@ impl App {
         position: Point,
         button: PointerButton,
         modifiers: Modifiers,
+        timestamp: Instant,
         outcome: &mut InputOutcome,
     ) {
-        input::on_pointer_up(self, window, position, button, modifiers, outcome)
+        input::on_pointer_up(
+            self, window, position, button, modifiers, timestamp, outcome,
+        )
     }
 
-    fn on_pointer_leave(&mut self, window: WindowId) {
-        input::on_pointer_leave(self, window)
+    fn on_pointer_leave(&mut self, window: WindowId, modifiers: Modifiers) {
+        input::on_pointer_leave(self, window, modifiers)
     }
 
     fn on_scroll(
         &mut self,
         window: WindowId,
         position: Point,
-        delta_x: f32,
-        delta_y: f32,
+        delta: Point,
+        unit: crate::event::ScrollUnit,
+        phase: crate::event::ScrollPhase,
         modifiers: Modifiers,
         outcome: &mut InputOutcome,
     ) {
-        input::on_scroll(self, window, position, delta_x, delta_y, modifiers, outcome)
+        input::on_scroll(
+            self, window, position, delta, unit, phase, modifiers, outcome,
+        )
     }
 
     /// 该节点正在进行中的滚动动画目标（没有动画时 `None`）。
@@ -737,16 +773,24 @@ impl App {
     fn on_key(
         &mut self,
         window: WindowId,
-        key: Key,
+        code: KeyCode,
         state: KeyState,
+        repeat: bool,
         modifiers: Modifiers,
         outcome: &mut InputOutcome,
     ) {
-        input::on_key(self, window, key, state, modifiers, outcome)
+        input::on_key(self, window, code, state, repeat, modifiers, outcome)
     }
 
-    fn click_count(&mut self, window: WindowId, node: NodeId, position: Point) -> u8 {
-        input::click_count(self, window, node, position)
+    fn click_count(
+        &mut self,
+        window: WindowId,
+        node: NodeId,
+        position: Point,
+        button: PointerButton,
+        timestamp: Instant,
+    ) -> u8 {
+        input::click_count(self, window, node, position, button, timestamp)
     }
 
     fn on_window_focus_lost(&mut self, window: WindowId) {
@@ -777,7 +821,61 @@ impl App {
         focus::validate_focus(self, window)
     }
 
-    /// 设置焦点。不可聚焦 / 同值 ⇒ `false`（不标脏、不唤醒）。
+    /// 当前的**焦点作用域根**（R02-12）：最上层带 `trap_focus` 的模态浮层子树根。
+    ///
+    /// `None` = 没有模态浮层，整棵树都在作用域内。
+    #[must_use]
+    pub(crate) fn focus_scope(&self, window: WindowId) -> Option<NodeId> {
+        focus::focus_scope(self, window)
+    }
+
+    /// 指针当前悬停的节点（R02-4；`None` = 空白处 / 窗口外 / 节点已卸载）。
+    ///
+    /// 悬停变化时引擎会派生 [`Event::HoverChanged`]、给变化节点标 `PAINT` 并请求一帧，因此
+    /// 应用可以在 `bind_style` 里读一个由悬停事件驱动的信号来实现 `:hover` 高亮。
+    #[must_use]
+    pub fn hovered(&self, window: WindowId) -> Option<NodeId> {
+        focus::hovered(self, window)
+    }
+
+    /// 取得**指针捕获**（R02-8）：此后该窗口的指针事件即便落在命中区外也仍按指针位置分发，
+    /// 直到 [`App::release_pointer`] / 指针抬起 / 会话取消。
+    ///
+    /// 平台落地：
+    /// - Windows：`SetCapture(hwnd)`（引擎在乎的正是它：移出客户区后仍能收到
+    ///   `WM_MOUSEMOVE`/`WM_LBUTTONUP`）；
+    /// - macOS：AppKit 在 `mouseDown:` 之后的 dragged/up 事件上**隐式捕获**（事件按按下时
+    ///   命中的 view 路由），引擎不需要也不应该额外请求；
+    /// - Wayland：`wl_pointer` 在按下期间**隐式抓取**（协议由 compositor 保证），同样无需请求。
+    ///
+    /// 因此本调用在三个平台都成立，但只有 Windows 会真正调用系统 API；其余两个平台的语义由
+    /// 系统保证（R02-8 要求「在文档与类型上诚实表达」而不是假装请求成功）。
+    ///
+    /// 返回 `false` = 窗口/节点不存在，或已经捕获到同一节点（幂等）。
+    pub fn capture_pointer(&mut self, window: WindowId, node: NodeId) -> bool {
+        input::capture_pointer(self, window, node)
+    }
+
+    /// 释放指针捕获（没有捕获 ⇒ `false`）。
+    pub fn release_pointer(&mut self, window: WindowId) -> bool {
+        input::release_pointer(self, window)
+    }
+
+    /// 当前捕获目标（`None` = 没有捕获）。
+    #[must_use]
+    pub fn pointer_captured(&self, window: WindowId) -> Option<NodeId> {
+        input::pointer_captured(self, window)
+    }
+
+    /// 该物理键当前是否**按住**（R02-16；`KeyState::Up` 落地后的查询面）。
+    ///
+    /// 窗口失焦时按住集合整体清空（抬起消息不再到达本窗口）。
+    #[must_use]
+    pub fn key_down(&self, window: WindowId, code: KeyCode) -> bool {
+        self.windows.contains_key(&window) && self.held_keys.contains(&code)
+    }
+
+    /// 设置焦点。不可聚焦 / 同值 / **在模态浮层作用域之外** ⇒ `false`（不标脏、不唤醒）。
     pub fn set_focus(&mut self, window: WindowId, node: Option<NodeId>) -> bool {
         focus::set_focus(self, window, node)
     }
@@ -1108,12 +1206,18 @@ impl App {
         input::take_cursor_change(self)
     }
 
-    /// 取走待推给平台的捕获请求（`(窗口, true)` = 取得、`(窗口, false)` = 释放）。
+    /// 取走待推给平台的捕获请求（每窗口目标状态，R02-8/R02-22）。
     ///
     /// 必须带窗口 id：`SetCapture` 是**每窗口**状态，固定发给首窗会让非首窗的拖拽拿不到
     /// 捕获，鼠标移出窗口后松手就丢 `WM_LBUTTONUP`，会话永久卡在「按住」（复审 P1-3）。
-    pub(crate) fn take_capture_request(&mut self) -> Option<(WindowId, bool)> {
-        input::take_capture_request(self)
+    pub(crate) fn take_capture_requests(&mut self) -> Vec<(WindowId, bool)> {
+        input::take_capture_requests(self)
+    }
+
+    /// 引擎时钟（`TestApp::inject` 用它给合成事件盖时间戳；R02-14）。
+    #[cfg(feature = "test-support")]
+    pub(crate) fn clock(&self) -> Instant {
+        self.clock
     }
 
     /// 本窗口的 IME 目标状态（Windows 平台泵每轮读它与已应用状态比较，P2-7）。
@@ -1427,6 +1531,22 @@ impl App {
     /// 系统字体安装/卸载/语言切换后调用：重载 + 与 [`App::set_font_stack`] 相同的失效。
     pub fn reload_system_fonts(&mut self) -> u32 {
         text_pass::reload_system_fonts(self)
+    }
+
+    /// 数字快速路径开关（`DigitFastPath`，R12 的性能项）。
+    ///
+    /// 默认开启：文本全为 `[0-9 . , + - % / :]`、字体栈解析出唯一字体、无 letter-spacing /
+    /// OpenType 特性时，跳过 parley 的 itemize+shaping，直接「字符 → glyph id → advance」。
+    /// 每个 `(字体, 字号, 字重, 倾斜)` 组合首次使用时做一次**验证性塑形**（逐字符 + 全部有序
+    /// 字符对，容差 0.01 px），不成立就永久降级到 parley。关闭它可做 A/B 对照（会清形状缓存）。
+    pub fn set_digit_fast_path(&mut self, enabled: bool) {
+        text_pass::set_digit_fast_path(self, enabled);
+    }
+
+    /// 数字快速路径是否开启（回退验证 / 诊断）。
+    #[must_use]
+    pub fn digit_fast_path_enabled(&self) -> bool {
+        text_pass::digit_fast_path_enabled(self)
     }
 
     /// 所有窗口的文本节点标 `LAYOUT | PAINT` 并清 `node..root` 缓存。

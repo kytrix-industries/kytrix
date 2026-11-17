@@ -26,7 +26,7 @@ use crate::{
     event::Action,
     interaction::{NodeInteraction, OverlaySlot, ScrollSlot, VirtualSlot},
     layout::{Axis, LayoutOverride, LayoutReport, MeasureFn, hit_test::HitResult},
-    math::{Edges, PhysicalRect, Point, Rect, Size},
+    math::{Edges, PhysicalRect, Point, Rect, Size, Transform},
     node::{
         dependency::ReadCtx,
         dirty::DirtyFlags,
@@ -350,9 +350,15 @@ pub struct NodeTree {
     /// 再算全文哈希 —— 即使这一帧没有任何文本变化。集合在「文本载荷被写入」时登记
     /// （`set_text_content`）、在 `refresh_text` 消费后清空，因此稳态下遍历成本是 O(变化的文本)。
     ///
-    /// 用 `Vec` + 线性去重而不是 `HashSet`：典型每帧 0–32 个条目，`Vec` 的扫描比哈希更快，
-    /// 且迭代序确定（帧记录可复现）。
-    text_dirty: Vec<NodeId>,
+    /// **O(1) 去重**（R12-13）：`Vec` + `ahash::HashSet`。旧实现的 `Vec::contains` 在「行情表
+    /// 整表 tick」（一帧 5000 次 `set_text_content`）下是 O(n²)：约 1250 万次比较，5–15 ms。
+    text_dirty: content::TextDirtyQueue,
+    /// 「需要重建 `ShapedLine`」的文本节点集合（R12-14）。
+    ///
+    /// `App::layout_text` 原本每帧遍历整棵树（含容器/图标），即使零文本变化也要走一遍；
+    /// 现在只遍历本集合：`set_text_shaped`（新快照） / 内容宽变化（`set_local_layout`） /
+    /// 图集逐 tile 淘汰（`invalidate_text_lines`） / 全量失效（字体栈、系统字体）时入队。
+    text_layout_dirty: content::TextDirtyQueue,
     /// 卸载节点的待释放 lane（`Window::paint_frame` 消费后清空，容量保留）。
     removed_lanes: Vec<LaneId>,
     /// 出流盒 → 它的包含块（taffy `add_hoisted_children` 的落点；唯一读者是 `absolutize`）。
@@ -367,6 +373,12 @@ pub struct NodeTree {
     /// 无法精确算 `desc.bounds` 的溢出范围，只能保守地升级为全帧 damage（复审 A3）。
     /// `Window::paint_frame` 每帧取走。
     geometry_damage_escalation: bool,
+    /// 几何节点的 per-draw 变换旁表（R05-12：`Primitive::Geometry.transform` 的来源）。
+    ///
+    /// 旁表而不是 `Node` 字段：绝大多数节点没有几何变换，`Node` 的 1152 B 预算不该为此
+    /// 付 24 B（与 `layout_cache` / `a11y_slots` 同型）。只在 `set_geometry_transform`
+    /// 写入时分配条目，单位矩阵 = 无条目。`DirtyFlags::GEOMETRY` 由它置位。
+    geometry_transforms: ahash::HashMap<NodeId, Transform>,
 }
 
 impl Default for NodeTree {
@@ -615,6 +627,19 @@ impl NodeTree {
     pub(crate) fn text_dirty_len(&self) -> usize {
         content::text_dirty_len(self)
     }
+    pub(crate) fn mark_text_layout_dirty(&mut self, node: NodeId) {
+        content::mark_text_layout_dirty(self, node)
+    }
+    pub(crate) fn take_text_layout_dirty(&mut self, out: &mut Vec<NodeId>) {
+        content::take_text_layout_dirty(self, out)
+    }
+    #[cfg(test)]
+    pub(crate) fn text_layout_dirty_len(&self) -> usize {
+        content::text_layout_dirty_len(self)
+    }
+    pub(crate) fn invalidate_text_lines(&mut self) -> usize {
+        content::invalidate_text_lines(self)
+    }
     pub(crate) fn set_text_shaped(
         &mut self,
         node: NodeId,
@@ -630,11 +655,10 @@ impl NodeTree {
         &mut self,
         node: NodeId,
         line: Rc<ShapedLine>,
-        broken: parley::Layout<crate::paint::color::ColorBrush>,
         width: f32,
         generation: u32,
     ) -> bool {
-        content::set_text_line(self, node, line, broken, width, generation)
+        content::set_text_line(self, node, line, width, generation)
     }
     pub(crate) fn text_content_width(&self, node: NodeId) -> f32 {
         content::text_content_width(self, node)
@@ -685,6 +709,28 @@ impl NodeTree {
     }
     pub(crate) fn take_geometry_damage_escalation(&mut self) -> bool {
         content::take_geometry_damage_escalation(self)
+    }
+    /// 几何节点的 per-draw 变换（R05-12；单位矩阵 = 未设置）。
+    ///
+    /// 消费者：`paint/pass.rs` 生成 `Primitive::Geometry` 时写入 `GeometryDraw.transform`，
+    /// 编码器据此算 `FrameOp::Geometry.bounds`（变换后的 AABB ∩ clip）。
+    #[must_use]
+    pub(crate) fn geometry_transform(&self, node: NodeId) -> Transform {
+        content::geometry_transform(self, node)
+    }
+    /// 设置几何节点的 per-draw 变换（顶点**不**重建：图表平移只改一个 uniform）。
+    ///
+    /// 标 `PAINT`（lane 需要重建，因为变换烘在 lane 的图元里）与 `GEOMETRY`（语义标记）。
+    ///
+    /// # Errors
+    /// [`EngineError::StaleNode`]：节点不存在或不是几何节点。
+    #[cfg(test)]
+    pub(crate) fn set_geometry_transform(
+        &mut self,
+        node: NodeId,
+        transform: Transform,
+    ) -> Result<(), EngineError> {
+        content::set_geometry_transform(self, node, transform)
     }
     pub(crate) fn content_offset(&self, node: NodeId) -> Point {
         content::content_offset(self, node)

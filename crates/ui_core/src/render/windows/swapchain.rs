@@ -88,6 +88,27 @@ impl Swapchain {
         // SAFETY: swapchain 句柄由 `raw` 持有；参数是值。
         unsafe { chain2.SetMaximumFrameLatency(1) }
             .map_err(|error| init_error_from("SetMaximumFrameLatency", error))?;
+        // R06-10：**显式声明**呈现面的色彩空间（sRGB / Rec.709）。三端共用
+        // `render::colorspace` 的决定，这里只做 DXGI 翻译 —— 旧实现完全不声明，SDR 屏上
+        // 碰巧正确、广色域 / HDR 环境下取决于 DWM 的隐式推断。
+        let chain3: IDXGISwapChain3 = raw
+            .cast()
+            .map_err(|error| init_error_from("cast IDXGISwapChain3", error))?;
+        let color_space = crate::render::colorspace::dxgi_color_space();
+        // SAFETY: swapchain 句柄由 `raw` 持有；参数是值。
+        let support = unsafe { chain3.CheckColorSpaceSupport(color_space) }
+            .map_err(|error| init_error_from("CheckColorSpaceSupport", error))?;
+        if crate::render::colorspace::support_allows_present(support) {
+            // SAFETY: 同上。
+            unsafe { chain3.SetColorSpace1(color_space) }.map_err(|error| {
+                EngineError::Swapchain {
+                    detail: smol_str::format_smolstr!(
+                        "SetColorSpace1: {:#010X}",
+                        error.code().0 as u32
+                    ),
+                }
+            })?;
+        }
         // `chain2` 只是访问 `IDXGISwapChain2` 的临时引用：waitable 由 swapchain 本体拥有，
         // 句柄在 `raw` 存活期间有效，因此这里之后不再需要保存接口指针。
         let waitable = frame_latency_waitable(&chain2)?;

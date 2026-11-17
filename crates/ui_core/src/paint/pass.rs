@@ -370,7 +370,17 @@ fn rebuild_lane(
     };
     let _ = context.scene.clear_lane(lane);
 
-    let (bounds, content_offset, patch, spec, content, node_damage, ring, content_clip) = {
+    let (
+        bounds,
+        content_offset,
+        patch,
+        spec,
+        content,
+        node_damage,
+        ring,
+        content_clip,
+        geometry_transform,
+    ) = {
         let Ok(target) = context.tree.get(node) else {
             return Ok(());
         };
@@ -391,6 +401,12 @@ fn rebuild_lane(
         let ring = (context.focused == Some(node))
             .then(|| context.tree.focus_ring(node))
             .flatten();
+        // R05-12：几何节点的 per-draw 变换（旁表，未设置 = 单位矩阵）。只在几何节点上查表，
+        // 避免每帧每节点一次 HashMap 查找（热路径）。
+        let geometry_transform = match &content {
+            Content::Geometry(_) => context.tree.geometry_transform(node),
+            _ => crate::math::Transform::IDENTITY,
+        };
         (
             bounds,
             content_offset,
@@ -400,6 +416,7 @@ fn rebuild_lane(
             node_damage,
             ring,
             content_clip,
+            geometry_transform,
         )
     };
 
@@ -425,6 +442,7 @@ fn rebuild_lane(
         offset,
         ring,
         content_clip,
+        geometry_transform,
     };
     emitter.emit(context);
 
@@ -488,6 +506,8 @@ struct PrimitiveEmitter {
     offset: Point,
     /// 焦点环（仅焦点节点 + `Style.focus_ring` 时存在）。
     ring: Option<crate::paint::style::FocusRing>,
+    /// 本节点几何内容的 per-draw 变换（R05-12；`Content::Geometry` 才有意义）。
+    geometry_transform: crate::math::Transform,
     /// 本节点**自身**的 `Clip::Bounds` padding box（屏幕坐标）。
     ///
     /// 只作用于**内容**（文本 / Canvas / 几何），不作用于背景/边框/阴影 —— 与 CSS 一致：
@@ -501,17 +521,56 @@ fn negate(offset: Point) -> Point {
     Point::new(-offset.x, -offset.y)
 }
 
-/// 几何内容的 damage 范围：优先用注册表里的 `GeometryDesc.bounds`（真实可见范围，
-/// 逻辑窗口坐标），句柄陈旧/未注册时退回节点布局盒。
+/// 几何内容的 damage 范围：`transform(GeometryDesc.bounds)`（真实可见范围，逻辑窗口坐标），
+/// 句柄陈旧/未注册时退回节点布局盒。
+///
+/// R05-12：旧实现忽略 per-draw `transform` —— 平移后 damage 用的是**未变换**的 bounds，
+/// 溢出部分在局部刷新时不会被重画（残影）。
 fn geometry_damage(
     geometry: &crate::paint::geometry_store::GeometryStore,
     id: crate::paint::geometry::GeometryId,
     node_bounds: Rect,
     offset: Point,
+    transform: crate::math::Transform,
 ) -> Rect {
-    geometry
-        .desc_arc(id)
-        .map_or(node_bounds, |desc| desc.bounds.translate(negate(offset)))
+    let Some(desc) = geometry.desc_arc(id) else {
+        return node_bounds;
+    };
+    let bounds = desc.bounds;
+    // 轴对齐仿射变换后的 AABB（与编码器 `transformed_aabb` 同一算法；四角取极值）。
+    let far = Point::new(
+        bounds.origin.x + bounds.size.width,
+        bounds.origin.y + bounds.size.height,
+    );
+    let corners = [
+        transform.apply(bounds.origin),
+        transform.apply(Point::new(far.x, bounds.origin.y)),
+        transform.apply(Point::new(bounds.origin.x, far.y)),
+        transform.apply(far),
+    ];
+    if !corners
+        .iter()
+        .all(|point| point.x.is_finite() && point.y.is_finite())
+    {
+        return node_bounds;
+    }
+    let min_x = corners
+        .iter()
+        .map(|point| point.x)
+        .fold(f32::INFINITY, f32::min);
+    let min_y = corners
+        .iter()
+        .map(|point| point.y)
+        .fold(f32::INFINITY, f32::min);
+    let max_x = corners
+        .iter()
+        .map(|point| point.x)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let max_y = corners
+        .iter()
+        .map(|point| point.y)
+        .fold(f32::NEG_INFINITY, f32::max);
+    Rect::new(min_x, min_y, max_x - min_x, max_y - min_y).translate(negate(offset))
 }
 
 impl PrimitiveEmitter {
@@ -540,18 +599,25 @@ impl PrimitiveEmitter {
         if let Some(shadow) = spec.shadow {
             let color = shadow.color.with_opacity(opacity);
             if !color.is_transparent() {
+                // 阴影跟随圆角（R05-9）：`box-shadow` 的轮廓就是 `border-radius` 的轮廓，
+                // 半径与背景/边框用同一份 `spec.corner_radius`（编码器再按 CSS 规则 clamp）。
                 let primitive = Shadow {
                     rect: self.bounds,
                     offset: shadow.offset,
                     blur: shadow.blur.max(0.0),
                     color,
+                    corner_radius: radii,
                 };
                 self.push(context, Primitive::Shadow(primitive));
-                context.damage.push(
-                    primitive.rect.translate(primitive.offset),
-                    primitive.blur * self.scale.factor() + 1.0,
-                    self.clip,
-                );
+                // damage 外扩 = 3σ + 1（σ = blur / 2，物理像素）：与 shader 的顶点外扩一致。
+                // 旧的 `blur + 1` 在 σ 改小后会切掉模糊环（可见缺陷）。
+                let sigma = (primitive.blur * crate::paint::instance::SHADOW_SIGMA_SCALE)
+                    .max(crate::paint::instance::SHADOW_SIGMA_MIN);
+                let pad =
+                    crate::paint::instance::SHADOW_PAD_SIGMAS * sigma * self.scale.factor() + 1.0;
+                context
+                    .damage
+                    .push(primitive.rect.translate(primitive.offset), pad, self.clip);
             }
         }
 
@@ -688,7 +754,7 @@ impl PrimitiveEmitter {
                     context,
                     Primitive::Geometry(GeometryDraw {
                         id,
-                        transform: crate::math::Transform::IDENTITY,
+                        transform: self.geometry_transform,
                         color: self
                             .patch
                             .foreground
@@ -699,8 +765,13 @@ impl PrimitiveEmitter {
                 // 几何的可见范围是它**自己的** AABB（`desc.bounds`，逻辑窗口坐标），
                 // 可能超出节点布局盒。旧实现按节点盒推 damage，于是几何溢出部分在局部
                 // 刷新时不会被重画（残影，复审 P2-2）。节点盒仍是命中测试的范围。
-                let geometry_bounds =
-                    geometry_damage(context.geometry, id, self.bounds, self.offset);
+                let geometry_bounds = geometry_damage(
+                    context.geometry,
+                    id,
+                    self.bounds,
+                    self.offset,
+                    self.geometry_transform,
+                );
                 context.damage.push(geometry_bounds, 1.0, self.clip);
             }
             Content::Canvas(canvas) => {
@@ -887,12 +958,34 @@ mod tests {
         let id = store.insert(desc).expect("valid geometry");
         let node_bounds = Rect::new(0.0, 0.0, 10.0, 10.0);
 
-        let damage = super::geometry_damage(&store, id, node_bounds, Point::ZERO);
+        let damage = super::geometry_damage(
+            &store,
+            id,
+            node_bounds,
+            Point::ZERO,
+            crate::math::Transform::IDENTITY,
+        );
         assert_eq!(damage, Rect::new(0.0, 0.0, 200.0, 200.0), "用 desc.bounds");
 
         // 祖先滚动偏移要换算到屏幕坐标。
-        let scrolled = super::geometry_damage(&store, id, node_bounds, Point::new(0.0, 50.0));
+        let scrolled = super::geometry_damage(
+            &store,
+            id,
+            node_bounds,
+            Point::new(0.0, 50.0),
+            crate::math::Transform::IDENTITY,
+        );
         assert_eq!(scrolled, Rect::new(0.0, -50.0, 200.0, 200.0));
+
+        // R05-12：per-draw transform 必须进入 damage 范围（否则平移后残影）。
+        let moved = super::geometry_damage(
+            &store,
+            id,
+            node_bounds,
+            Point::ZERO,
+            crate::math::Transform::translate(30.0, 40.0),
+        );
+        assert_eq!(moved, Rect::new(30.0, 40.0, 200.0, 200.0));
 
         // 陈旧句柄退回节点盒（不会因为查不到就丢掉 damage）。
         let stale = super::geometry_damage(
@@ -900,6 +993,7 @@ mod tests {
             crate::paint::geometry::GeometryId::for_test(99, 1),
             node_bounds,
             Point::ZERO,
+            crate::math::Transform::IDENTITY,
         );
         assert_eq!(stale, node_bounds);
     }
@@ -1192,6 +1286,41 @@ mod tests {
         assert!(matches!(
             lane_primitives(&h, geometry).first(),
             Some(Primitive::Geometry(_))
+        ));
+    }
+
+    #[test]
+    fn geometry_node_transform_reaches_the_primitive() {
+        // R05-12：节点级几何的 per-draw 变换必须进 `Primitive::Geometry`（旧实现硬编码
+        // `Transform::IDENTITY`，图表平移只能重建顶点）。顶点缓冲不动，只换 uniform。
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let geometry = NodeBuilder::geometry(GeometryId::for_test(0, 1))
+            .style(fixed_style(10.0, 10.0))
+            .build(&mut h.tree, root)
+            .expect("挂载");
+        h.tree
+            .set_geometry_transform(geometry, crate::math::Transform::translate(4.0, 6.0))
+            .expect("几何节点");
+        layout_all(&mut h.tree);
+        let _ = h.paint();
+        let Some(Primitive::Geometry(draw)) = lane_primitives(&h, geometry).first().cloned() else {
+            panic!("必须产生一条几何绘制");
+        };
+        assert_eq!(
+            draw.transform,
+            crate::math::Transform::translate(4.0, 6.0),
+            "节点级几何的 transform 必须是 setter 写入的那个"
+        );
+        // 非几何节点：setter 必须报 StaleNode（不能静默写到错误节点上）。
+        let boxed = NodeBuilder::boxed()
+            .style(fixed_style(10.0, 10.0))
+            .build(&mut h.tree, root)
+            .expect("挂载");
+        assert!(matches!(
+            h.tree
+                .set_geometry_transform(boxed, crate::math::Transform::IDENTITY),
+            Err(crate::error::EngineError::StaleNode { .. })
         ));
     }
 

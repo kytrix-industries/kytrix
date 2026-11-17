@@ -201,7 +201,10 @@ pub(crate) fn set_local_layout(tree: &mut NodeTree, node: NodeId, layout: &taffy
         - layout.padding.left
         - layout.padding.right)
         .max(0.0);
+    let mut width_changed = false;
     if let Some(target) = tree.arena.get_mut(node) {
+        width_changed = target.kind.text().is_some()
+            && target.text_content_width.to_bits() != content_width.to_bits();
         target.local = local;
         target.local_border = border;
         target.text_content_width = content_width;
@@ -212,6 +215,11 @@ pub(crate) fn set_local_layout(tree: &mut NodeTree, node: NodeId, layout: &taffy
         target.laid_out_epoch = epoch;
         // `LAYOUT` 位的唯一消费点：被 taffy 布局过 ⇒ 不再需要重排。
         target.dirty.remove(DirtyFlags::LAYOUT);
+    }
+    // R12-14：容器宽度变化 ⇒ 该文本节点的断行依据变了，必须进第二阶段脏集合。
+    // 这里**不动** `LAYOUT`/`PAINT` 位（由 `layout_text` 的重排自己标），只登记「要重排」。
+    if width_changed {
+        tree.mark_text_layout_dirty(node);
     }
 }
 

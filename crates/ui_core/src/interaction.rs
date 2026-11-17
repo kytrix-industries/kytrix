@@ -84,6 +84,24 @@ pub(crate) struct DragSession {
     pub phase: DragPhase,
 }
 
+/// 「已按下、但位移还没超过阈值」的拖拽候选（R02-9）。
+///
+/// 按下时只登记候选，**不**派发 [`DragPhase::Start`]；指针移动首次越过
+/// [`InputThresholds::drag_distance`] 时才转成 [`DragSession`] 并派发 `Start`（delta 用真实
+/// 位移）。这正是 Qt（`QApplication::startDragDistance()` 之后才 `QDrag`）、GTK
+/// （`gtk_drag_check_threshold`）、Blink（`mousemove` 超过阈值才 `dragstart`）、GPUI
+/// （`on_drag` 在 `moved` 超阈值后触发）的仲裁方式：**拖拽 vs 点击由引擎裁决**，应用不必
+/// 自己实现同一套状态机，也不会在「假拖拽」里先把状态改掉却无法撤回。
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PendingDrag {
+    /// 声明 `on_drag` 的节点。
+    pub node: NodeId,
+    /// 该节点声明的动作。
+    pub action: Action,
+    /// 按下位置（阈值判定的基准）。
+    pub origin: Point,
+}
+
 impl DragSession {
     /// 相对起点的位移。
     #[must_use]
@@ -98,11 +116,12 @@ impl DragSession {
 /// 拖拽阶段。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DragPhase {
-    /// 按下即开始（`delta == 0`）。
+    /// 拖拽**成立**：指针移动首次越过 [`InputThresholds::drag_distance`] 时派发，`delta` 是
+    /// 真实位移（不再是 0）。按下本身不派发本阶段（R02-9）。
     Start,
     /// 指针移动。
     Move,
-    /// 抬起结束。
+    /// 抬起结束（位移已超过阈值）。
     End,
     /// 失焦 / 显式取消。
     Cancel,
@@ -152,16 +171,24 @@ impl DragState {
 /// 字段级 `pub(crate)`）。
 #[derive(Clone, Debug)]
 pub(crate) struct PointerState {
-    /// 光标下的节点（`None` = 空白处或窗口外）。
-    pub hover: Option<NodeId>,
+    /// 光标下的节点（`None` = 空白处或窗口外）；公开读点是
+    /// [`crate::app::App::hovered`]（R02-4）。
+    pub hovered: Option<NodeId>,
     /// 当前解析出的光标（只有变化时才推给平台）。
     pub cursor: Cursor,
     /// 最近一次按下的记录。
     pub press: Option<PressRecord>,
+    /// 已按下但还没越过拖拽阈值的候选（R02-9）。
+    pub pending_drag: Option<PendingDrag>,
     /// 正在进行的拖拽会话。
     pub drag: Option<DragSession>,
-    /// 是否请求了指针捕获（拖拽期间）。
-    pub capture: bool,
+    /// 指针捕获的目标节点（`None` = 没有捕获；R02-8）。
+    ///
+    /// 捕获期间指针事件即使落在窗口外/命中区外也仍路由到该节点（W3C
+    /// `setPointerCapture`、Qt `QWidget::grabMouse` 的语义）。它同时替代了旧实现里那个
+    /// 「引擎以为捕获了、平台其实丢弃了请求」的假 `bool`：平台能力差异由
+    /// [`crate::app::App::capture_pointer`] 的文档与平台实现表达。
+    pub capture: Option<NodeId>,
     /// 最近一次命中的原始结果（`ActionCtx::hit` 的来源）。
     pub last_hit: Option<HitResult>,
     /// 最近一次输入事件的修饰键（`ActionCtx::modifiers` 的来源）。
@@ -171,11 +198,12 @@ pub(crate) struct PointerState {
 impl PointerState {
     pub(crate) fn new() -> Self {
         Self {
-            hover: None,
+            hovered: None,
             cursor: Cursor::Default,
             press: None,
+            pending_drag: None,
             drag: None,
-            capture: false,
+            capture: None,
             last_hit: None,
             modifiers: Modifiers::empty(),
         }
@@ -183,7 +211,8 @@ impl PointerState {
 
     /// 结束拖拽并释放捕获；返回是否真的结束了一个会话。
     pub(crate) fn end_drag(&mut self) -> Option<DragSession> {
-        self.capture = false;
+        self.capture = None;
+        self.pending_drag = None;
         self.drag.take()
     }
 }
@@ -388,6 +417,20 @@ pub struct OverlayOptions {
     pub placement: OverlayPlacement,
     /// 关闭策略。
     pub dismiss: OverlayDismiss,
+    /// 是否**模态**（R02-12）：把键盘焦点作用域限制在浮层子树内。
+    ///
+    /// 置位时（对应 Blink `<dialog>.showModal()` 的 top layer + `inert` 背景、Qt
+    /// `QDialog` 的对话框焦点作用域、GTK `GtkWindow` 的 modal）：
+    /// - Tab / Shift+Tab 只在浮层子树内循环；
+    /// - [`crate::app::App::set_focus`] 拒绝作用域外的节点；
+    /// - 浮层外的指针按下被**消费**（不抢焦点、不触发下层动作）。
+    pub trap_focus: bool,
+    /// 关闭时是否把焦点还给**打开者**（R02-12）。
+    ///
+    /// 打开时记录当时的焦点节点，关闭（[`crate::app::App::close_overlay`] / `Dismiss` 动作 /
+    /// 外部点击）后若该节点仍存在且可聚焦就恢复。平台与 a11y 的惯例是「焦点回到 opener」：
+    /// Blink 的 `<dialog>` 关闭、Qt `QDialog::done`、GTK `GtkPopover` 的 `autohide` 都这样做。
+    pub restore_focus: bool,
 }
 
 impl Default for OverlayOptions {
@@ -395,6 +438,8 @@ impl Default for OverlayOptions {
         Self {
             placement: OverlayPlacement::Point(Point::ZERO),
             dismiss: OverlayDismiss::OutsideClick,
+            trap_focus: false,
+            restore_focus: false,
         }
     }
 }
@@ -431,6 +476,12 @@ pub(crate) struct OverlaySlot {
     pub dismiss: OverlayDismiss,
     /// 打开时的定位：布局之后要按浮层**实测尺寸**重新求值（`Above` / `Left` 依赖它）。
     pub placement: OverlayPlacement,
+    /// 是否模态（焦点作用域，R02-12）。
+    pub trap_focus: bool,
+    /// 打开时的焦点节点（关闭时恢复，R02-12）。
+    pub opener: Option<NodeId>,
+    /// 关闭时是否把焦点还给 `opener`。
+    pub restore_focus: bool,
 }
 
 /// 动画句柄（`Copy`；`index` 带代际，取消/结束后旧句柄失效）。
@@ -520,14 +571,30 @@ pub enum AnimatedValue {
     },
 }
 
-/// 输入判定的系统阈值（默认值 = 本机 probe 实测；平台在 `platform_init` 覆盖为系统真值）。
+/// 输入判定的系统阈值（默认值 = 各平台的系统缺省；平台在 `platform_init` 覆盖为系统真值）。
+///
+/// R02-15：阈值是**用户偏好**而不是常数。三个平台都必须有可用的默认值，并且都必须在
+/// `run()` 里按同一形态覆盖成系统真值：
+///
+/// | 字段 | Win32 | AppKit | Wayland/GTK |
+/// |---|---|---|---|
+/// | `double_click_time` | `GetDoubleClickTime()` | `+[NSEvent doubleClickInterval]` | 无系统查询（GTK 的 `gtk-double-click-time`/Qt 的 400 ms 缺省） |
+/// | `double_click_distance` | `SM_CXDOUBLECLK`/`SM_CYDOUBLECLK` | 无系统查询 | 无系统查询 |
+/// | `drag_distance` | `SM_CXDRAG`/`SM_CYDRAG` | 无系统查询 | 无系统查询 |
+///
+/// 读不到系统值时保留默认值并留一条诊断（不静默）：macOS/Linux 用户在系统设置里调过双击速度
+/// 时，引擎的判定会与其它应用不一致 —— 这是必须被看见的偏离。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InputThresholds {
-    /// 双击的时间窗口（`GetDoubleClickTime()` = 500 ms）。
+    /// 双击的时间窗口（系统缺省 500 ms）。
     pub double_click_time: Duration,
-    /// 双击的位置容差（`SM_CXDOUBLECLK` = 4 px）。
+    /// 双击的位置容差（系统缺省 4 px；X/Y 取同一个值）。
     pub double_click_distance: f32,
-    /// 「拖动 vs 点击」的位移阈值（`SM_CXDRAG` = 4 px）。
+    /// 「拖动 vs 点击」的位移阈值（系统缺省 4 px）。
+    ///
+    /// 两处语义**共用**同一个阈值：越过它 ⇒ 抑制 click（点击仲裁）且拖拽会话转正
+    /// （`DragPhase::Start`）。旧实现把同一阈值只用于抑制 click、拖拽按下即 Start，
+    /// 二者行为不一致（R02-9）。
     pub drag_distance: f32,
 }
 
@@ -537,6 +604,42 @@ impl Default for InputThresholds {
             double_click_time: Duration::from_millis(500),
             double_click_distance: 4.0,
             drag_distance: 4.0,
+        }
+    }
+}
+
+impl InputThresholds {
+    /// 平台缺省（`platform_init` 读系统值失败时保留它）。
+    ///
+    /// 数值来源：Win32 的 `GetDoubleClickTime()` 缺省 500 ms、`SM_CXDRAG`/`SM_CYDRAG` 缺省
+    /// 4 px；AppKit 的 `+[NSEvent doubleClickInterval]` 缺省 0.5 s；Linux 桌面按 GTK
+    /// (`gtk-double-click-time` 250 ms)/Qt (`QStyleHints::mouseDoubleClickInterval` 400 ms)
+    /// 的缺省取中间值 —— 没有 XSettings 通路时它是唯一稳定的选择。
+    #[must_use]
+    pub const fn platform_default() -> Self {
+        #[cfg(windows)]
+        {
+            Self {
+                double_click_time: Duration::from_millis(500),
+                double_click_distance: 4.0,
+                drag_distance: 4.0,
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Self {
+                double_click_time: Duration::from_millis(500),
+                double_click_distance: 4.0,
+                drag_distance: 4.0,
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            Self {
+                double_click_time: Duration::from_millis(400),
+                double_click_distance: 4.0,
+                drag_distance: 4.0,
+            }
         }
     }
 }

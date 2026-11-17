@@ -345,7 +345,7 @@ mod tests {
         let desc = GeometryDesc {
             vertex_bytes: Bytes::from_static(&[0u8; 24]),
             index_bytes: Bytes::from_static(&[0, 0, 1, 0, 2, 0]),
-            vertex_stride: 8,
+            vertex_stride: 12,
             index_type: IndexType::U16,
             topology: Topology::TriangleList,
             bounds: Rect::new(0.0, 0.0, 8.0, 8.0),

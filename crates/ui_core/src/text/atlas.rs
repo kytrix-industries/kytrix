@@ -2,6 +2,24 @@
 //!
 //! 与 [`crate::render::atlas::AtlasAllocator`] 的分工：本模块**做缓存 + 驱动光栅**，分配器只做装箱 +
 //! 脏行 + 代际。图集 `clear()` 后必须同步 [`GlyphAtlas::clear`]（两级缓存同事务换代）。
+//!
+//! # 容量策略：逐 tile LRU，永不失败（R12-1，对齐 Skia `SkStrikeCache` / WebRender `GlyphCache`）
+//!
+//! 旧实现只有两条出路：单页分配成功，或「已到 2048² ⇒ **清空全部** ⇒ 同一 pass 内再填满 ⇒
+//! 再清空」，后者在两轮换代后返回 `EngineError::TextShape` ⇒ 整帧被丢弃 ⇒ 文本永久停止刷新。
+//! 现在按三级降级，**任何一级都不产生 `TextShape` / 不丢帧**：
+//!
+//! 1. **阶梯扩容**：512 → 1024 → 2048（保留原有行为，换代递增 `generation`，调用方重跑 pass）；
+//! 2. **逐 tile LRU 淘汰**：到 2048² 上限后按 `last_used_pass` 升序释放最旧的 tile 并重试。
+//!    本帧用过的 tile（`last_used_pass == 当前 pass`）**永不淘汰**，因此淘汰不会破坏本 pass
+//!    已生成的 `ShapedLine`；
+//! 3. **软失败**：整个页都是本帧的工作集 ⇒ 本次该字形**不画**（`skipped` + 诊断），下一帧再试。
+//!    tile 永远有效语义因此变成「本帧有效」，调用方（`App::layout_text`）在淘汰发生时重跑
+//!    pass 并让其它窗口重排。
+//!
+//! 逐 tile 释放不递增 `generation`（只由扩容/整页重建递增）：`generation` 的语义是「页尺寸/
+//! 整页内容换代」，与单个 tile 的生死无关。被淘汰 tile 的矩形由**分配器的脏行**覆盖
+//! （`allocate` 会 `mark_written`），所以上传路径不需要额外处理。
 
 use super::raster::{FontKey, GlyphRasterizer};
 use crate::{
@@ -55,6 +73,12 @@ struct GlyphRecord {
     origin: (u32, u32),
     /// R8 覆盖度（**已加 padding 的内容区**，P09 的上传源；N2）。
     data: Box<[u8]>,
+    /// 分配器的句柄（逐 tile 淘汰的唯一释放键）。
+    alloc: etagere::AllocId,
+    /// 该字形来自彩色源（R12-8；排版侧据此记 `ColorGlyphMonochrome` 诊断）。
+    color: bool,
+    /// 最近一次被使用的 pass 号（LRU 依据；`begin_pass` 递增）。
+    last_used_pass: u32,
 }
 
 /// `ensure` 的返回值：tile 与落点。
@@ -65,6 +89,8 @@ pub(crate) struct GlyphTile {
     pub top: i32,
     pub width: u32,
     pub height: u32,
+    /// 该字形来自彩色源（R12-8）：排版侧据此记一条 `ColorGlyphMonochrome` 诊断。
+    pub color: bool,
 }
 
 /// 缓存统计（喂 `TextPassReport`）。
@@ -74,29 +100,47 @@ pub(crate) struct GlyphAtlasStats {
     pub misses: usize,
     pub rasters: usize,
     pub rebuilds: usize,
+    /// 逐 tile LRU 淘汰的字形数（R12-1）。
+    pub evictions: usize,
+    /// 因「整页都是本帧工作集」而跳过的字形数（软失败，下一帧重试）。
+    pub skipped: usize,
 }
 
 pub(crate) struct GlyphAtlas {
     records: ahash::HashMap<GlyphKey, GlyphRecord>,
-    /// 反查（P09/P15 的逐字形逐出预留；`clear` 读它，保证不是死字段）。
-    ids: ahash::HashMap<GlyphKey, etagere::AllocId>,
-    /// 空白/无轮廓字形的**负缓存**（N5：不再每帧重光栅空格）。
+    /// 空白/无轮廓/彩色字形的**负缓存**（N5 + R12-7：不再每帧重光栅空格与零尺寸字形）。
     missing: ahash::HashSet<GlyphKey>,
     stats: GlyphAtlasStats,
     /// 整张字形页被清空过（DPI 换代 / 容量逃逸重排）⇒ 旧代际的 tile 全部失效，
     /// 上传侧必须把整页内容重写到 GPU（padding 里可能残留旧字形的覆盖度）。
     cleared: bool,
+    /// 当前 pass 号（每次 `App::layout_text` 递增；LRU 淘汰与「本帧不可淘汰」判据）。
+    pass: u32,
+    /// 自上次 [`GlyphAtlas::take_evicted`] 以来被淘汰的 tile 数。
+    evicted: u32,
 }
 
 impl GlyphAtlas {
     pub(crate) fn new() -> Self {
         Self {
             records: ahash::HashMap::default(),
-            ids: ahash::HashMap::default(),
             missing: ahash::HashSet::default(),
             stats: GlyphAtlasStats::default(),
             cleared: false,
+            pass: 0,
+            evicted: 0,
         }
+    }
+
+    /// 开始一次文本 pass：本 pass 用到的 tile 记 `last_used_pass = pass`，且**永不淘汰**。
+    pub(crate) fn begin_pass(&mut self) {
+        self.pass = self.pass.wrapping_add(1);
+    }
+
+    /// 取走「自上次调用以来淘汰了多少 tile」（淘汰会让旧 `ShapedLine` 的 UV 失效，
+    /// `App::layout_text` 据此重跑 pass 并让其它窗口重排）。
+    pub(crate) fn take_evicted(&mut self) -> u32 {
+        core::mem::take(&mut self.evicted)
     }
 
     /// 取字形 tile；未命中则光栅 + 装箱。
@@ -109,7 +153,7 @@ impl GlyphAtlas {
     /// `subpixel_x` 是水平相位桶（`0..raster::SUBPIXEL_PHASES`），参与缓存键：同一字形的不同
     /// 相位必须各占一个 tile，否则亚像素定位会被 tile 复用抹平。
     ///
-    /// `Err(AtlasExhausted)` = 清空重建后单块仍放不下（`EngineError::AtlasExhausted`）。
+    /// **永不失败**（R12-1）：最坏情况是返回 `Ok(None)`（本帧跳过该字形）。
     pub(crate) fn ensure(
         &mut self,
         raster: &mut GlyphRasterizer,
@@ -130,30 +174,19 @@ impl GlyphAtlas {
         if self.missing.contains(&key) {
             return Ok(None);
         }
-        if let Some(found) = self.records.get(&key).map(|record| {
-            (
-                record.tile,
-                record.left,
-                record.top,
-                record.width,
-                record.height,
-                record.data.len(),
-            )
-        }) && !found.0.is_stale(atlas.generation())
+        if let Some(found) = self.records.get_mut(&key)
+            && !found.tile.is_stale(atlas.generation())
         {
-            let (tile, left, top, width, height, data_len) = found;
-            debug_assert_eq!(
-                data_len as u32,
-                width * height,
-                "cached R8 coverage must stay complete (N2)"
-            );
+            found.last_used_pass = self.pass;
+            let record = &*found;
             self.stats.hits += 1;
             return Ok(Some(GlyphTile {
-                tile,
-                left,
-                top,
-                width,
-                height,
+                tile: record.tile,
+                left: record.left,
+                top: record.top,
+                width: record.width,
+                height: record.height,
+                color: record.color,
             }));
         }
         self.stats.misses += 1;
@@ -165,10 +198,11 @@ impl GlyphAtlas {
             subpixel_x,
             variation.unwrap_or(&crate::text::raster::GlyphVariation::default()),
         ) else {
+            // R12-8：彩色字形（COLR/CBDT/sbix）在光栅层已经按 alpha 投影成 R8 覆盖度；
+            // 连轮廓都没有的字形（真空白）才进负缓存。
             self.missing.insert(key);
             return Ok(None);
         };
-        self.stats.rasters += 1;
         let (width, height) = (image.placement.width, image.placement.height);
         debug_assert_eq!(
             image.data.len() as u32,
@@ -176,35 +210,18 @@ impl GlyphAtlas {
             "R8 alpha must be width * height bytes"
         );
         if width == 0 || height == 0 {
+            // R12-7：空格等零尺寸字形必须进负缓存，否则每个 pass 都重光栅一遍。
+            self.missing.insert(key);
             return Ok(None);
         }
+        self.stats.rasters += 1;
         let content = (width, height);
-        let mut allocation: Option<Allocation> = atlas.allocate(content);
-        if allocation.is_none() {
-            // 容量逃逸：先按页档阶梯换代扩容（512 → 1024 → 2048），换到放得下为止；
-            // 已是上限则清空同页重试一次（DEVIATIONS F-208）。字形 tile 只由本缓存持有，
-            // 换代只需清空缓存，不向应用暴露失效。
-            self.stats.rebuilds += 1;
-            let mut resized = false;
-            while atlas.grow() {
-                resized = true;
-                allocation = atlas.allocate(content);
-                if allocation.is_some() {
-                    break;
-                }
-            }
-            if !resized {
-                atlas.clear();
-            }
-            self.clear();
-            if allocation.is_none() {
-                allocation = atlas.allocate(content);
-            }
-        }
+        let allocation = self.allocate_with_eviction(atlas, content);
         let Some(allocation) = allocation else {
-            return Err(EngineError::AtlasExhausted {
-                kind: AtlasKind::Glyph,
-            });
+            // 3) 软失败：整页都是本帧工作集 ⇒ 本帧少画这个字形（下一帧再试）。
+            //    绝不返回错误：图集容量压力不该让整帧失效（R12-1 的硬要求）。
+            self.stats.skipped += 1;
+            return Ok(None);
         };
         // 读全 `Allocation` 的四个字段（P02 §10.4 的契约；P09 的上传目标是 `content`）。
         debug_assert_eq!(allocation.tile.atlas, AtlasKind::Glyph);
@@ -222,6 +239,9 @@ impl GlyphAtlas {
                 allocation.content.y0.max(0) as u32,
             ),
             data: image.data.into_boxed_slice(),
+            color: image.color,
+            alloc: allocation.id,
+            last_used_pass: self.pass,
         };
         let tile = GlyphTile {
             tile: record.tile,
@@ -229,9 +249,9 @@ impl GlyphAtlas {
             top: record.top,
             width: record.width,
             height: record.height,
+            color: record.color,
         };
         self.records.insert(key, record);
-        self.ids.insert(key, allocation.id);
         debug_assert_eq!(
             self.coverage(key).map_or(0, |data| data.len()) as u32,
             width * height,
@@ -240,10 +260,62 @@ impl GlyphAtlas {
         Ok(Some(tile))
     }
 
+    /// 三级降级分配（R12-1）：直接分配 → 阶梯扩容 → 逐 tile LRU 淘汰。`None` = 本帧放不下。
+    ///
+    /// 淘汰只针对 `last_used_pass < self.pass` 的 tile：本帧用过的 tile 一旦被复用，本 pass
+    /// 早先生成的 `ShapedLine` 就会画到别人的位图。淘汰是**批量**的（一次至少释放
+    /// `records.len() / 8` 个），避免「每来一个字形就重新排序一次」。
+    fn allocate_with_eviction(
+        &mut self,
+        atlas: &mut AtlasAllocator,
+        content: (u32, u32),
+    ) -> Option<Allocation> {
+        if let Some(allocation) = atlas.allocate(content) {
+            return Some(allocation);
+        }
+        // 1) 阶梯扩容（512 → 1024 → 2048）：整页重建 ⇒ 记录必须同步清空（同事务换代）。
+        let mut grown = false;
+        while atlas.grow() {
+            grown = true;
+            if let Some(allocation) = atlas.allocate(content) {
+                self.stats.rebuilds += 1;
+                self.clear();
+                return Some(allocation);
+            }
+        }
+        if grown {
+            self.stats.rebuilds += 1;
+            self.clear();
+        }
+        // 2) 已到上限：逐 tile LRU 淘汰最旧的、**非本帧**的 tile，直到放得下。
+        loop {
+            let mut candidates: Vec<(u32, GlyphKey)> = self
+                .records
+                .iter()
+                .filter(|(_, record)| record.last_used_pass < self.pass)
+                .map(|(key, record)| (record.last_used_pass, *key))
+                .collect();
+            if candidates.is_empty() {
+                return None;
+            }
+            candidates.sort_unstable_by_key(|(last_used, _)| *last_used);
+            let batch = (candidates.len() / 8).max(1);
+            for (_, key) in candidates.into_iter().take(batch) {
+                if let Some(record) = self.records.remove(&key) {
+                    atlas.deallocate(record.alloc);
+                    self.evicted = self.evicted.wrapping_add(1);
+                    self.stats.evictions += 1;
+                }
+            }
+            if let Some(allocation) = atlas.allocate(content) {
+                return Some(allocation);
+            }
+        }
+    }
+
     /// 与 `AtlasAllocator::clear()` 同一事务调用。
     pub(crate) fn clear(&mut self) {
         self.records.clear();
-        self.ids.clear();
         self.missing.clear();
         // 换代之后整页内容都要重传（旧代际的 tile 全失效）。
         self.cleared = true;
@@ -306,6 +378,12 @@ impl GlyphAtlas {
     pub(crate) fn len(&self) -> usize {
         self.records.len()
     }
+
+    /// 仅测试：负缓存条目数。
+    #[cfg(test)]
+    pub(crate) fn missing_len(&self) -> usize {
+        self.missing.len()
+    }
 }
 
 impl Default for GlyphAtlas {
@@ -332,12 +410,21 @@ fn write_record_rows(page: &mut [u8], page_width: u32, record: &GlyphRecord, row
 
 #[cfg(test)]
 mod tests {
-    use super::{GlyphAtlas, GlyphKey, ppem_key};
+    use super::{GlyphAtlas, GlyphAtlasStats, GlyphKey, ppem_key};
     use crate::{
         paint::atlas::AtlasKind,
         render::AtlasAllocator,
         text::raster::{GlyphRasterizer, probe_font},
     };
+
+    /// 空格（U+0020）的 glyph id（字体缺该字形时 `None`）。
+    ///
+    /// 空格是「有字形、但轮廓为空 ⇒ 0×0 位图」的真实路径，正是 R12-7 的回归面。
+    fn space_glyph(font: &parley::FontData) -> Option<u32> {
+        let font_ref = swash::FontRef::from_index(font.data.data(), font.index as usize)?;
+        let id = font_ref.charmap().map(' ');
+        (id != 0).then_some(u32::from(id))
+    }
 
     fn tiny_glyph_atlas() -> AtlasAllocator {
         AtlasAllocator::with_page(AtlasKind::Glyph, (256, 256))
@@ -651,5 +738,108 @@ mod tests {
         let stats = glyphs.take_stats();
         assert_eq!(stats.rebuilds, 1);
         assert_eq!(stats.rasters, 1);
+    }
+
+    /// R12-7：零尺寸字形（空格）必须进负缓存 —— 第二次 `ensure` 不得再光栅、不得计 miss。
+    ///
+    /// 旧实现在 `width == 0 || height == 0` 分支直接返回，没写 `missing`，于是价格文本里的每个
+    /// 空格在每个 pass 都重走一遍 swash 光栅（"123.45 USDT" 每条 1–3 个空格）。
+    #[test]
+    fn zero_size_glyphs_are_negatively_cached() {
+        let Some(font) = probe_font() else {
+            eprintln!("skip: no system font available");
+            return;
+        };
+        let mut raster = GlyphRasterizer::new();
+        let mut atlas = tiny_glyph_atlas();
+        let mut glyphs = GlyphAtlas::new();
+        // 空格（U+0020）的 glyph id：走真实路径（有字形但零轮廓）。
+        let Some(space) = space_glyph(&font) else {
+            eprintln!("skip: the probe font has no space glyph");
+            return;
+        };
+
+        let first = glyphs
+            .ensure(&mut raster, &mut atlas, &font, space, 16.0, 0, None)
+            .expect("space must not fail");
+        assert!(first.is_none(), "空格没有覆盖度");
+        let stats = glyphs.take_stats();
+        assert_eq!(
+            (stats.misses, stats.rasters),
+            (1, 0),
+            "零尺寸字形不得计入 rasters"
+        );
+        assert_eq!(glyphs.missing_len(), 1, "必须写入负缓存");
+
+        let second = glyphs
+            .ensure(&mut raster, &mut atlas, &font, space, 16.0, 0, None)
+            .expect("space must not fail");
+        assert!(second.is_none());
+        assert_eq!(
+            glyphs.take_stats(),
+            GlyphAtlasStats::default(),
+            "第二次必须直接命中负缓存（不再光栅）"
+        );
+    }
+
+    /// R12-1：图集到上限后**逐 tile LRU 淘汰**，永不失败；淘汰最旧的、且保留本 pass 用过的。
+    ///
+    /// 用 `cap_page_for_test` 把页档钉在 32²（生产是 2048²），这样十几个 tile 就能触发淘汰路径。
+    #[test]
+    fn lru_evicts_the_oldest_tiles_and_never_fails() {
+        let Some(font) = probe_font() else {
+            eprintln!("skip: no system font available");
+            return;
+        };
+        let mut raster = GlyphRasterizer::new();
+        let mut atlas = AtlasAllocator::with_page(AtlasKind::Glyph, (32, 32));
+        atlas.cap_page_for_test(32);
+        let mut glyphs = GlyphAtlas::new();
+
+        // pass 1：塞满一小页（16 ppem 的字形 padded 约 12×16 ⇒ 32² 只放得下几块）。
+        glyphs.begin_pass();
+        let mut live = Vec::new();
+        for glyph_id in 36..64u32 {
+            let tile = glyphs
+                .ensure(&mut raster, &mut atlas, &font, glyph_id, 16.0, 0, None)
+                .expect("capacity pressure must never surface as an error");
+            if let Some(tile) = tile {
+                live.push((glyph_id, tile));
+            }
+        }
+        assert!(!live.is_empty(), "some glyphs must fit a 32² page");
+        let filled = glyphs.len();
+
+        // pass 2：先取一个本 pass 的 tile，再用新字形挤占 ⇒ 只能淘汰 pass 1 的。
+        glyphs.begin_pass();
+        let (protected_id, protected) = live[0];
+        let again = glyphs
+            .ensure(&mut raster, &mut atlas, &font, protected_id, 16.0, 0, None)
+            .expect("ok")
+            .expect("still cached");
+        assert_eq!(protected.tile, again.tile, "命中缓存不换 tile");
+        for index in 0..24u32 {
+            let tile = glyphs
+                .ensure(&mut raster, &mut atlas, &font, 200 + index, 16.0, 0, None)
+                .expect("LRU eviction must keep `ensure` infallible");
+            let _ = tile;
+        }
+        let stats = glyphs.take_stats();
+        assert!(
+            stats.evictions > 0 || glyphs.len() <= filled,
+            "淘汰路径必须被走到（stats: {stats:?}, 之前 {filled} 条）"
+        );
+        assert!(
+            stats.skipped == 0 || stats.evictions > 0,
+            "skip 只能发生在淘汰之后（stats: {stats:?}）"
+        );
+        let protected_again = glyphs
+            .ensure(&mut raster, &mut atlas, &font, protected_id, 16.0, 0, None)
+            .expect("ok")
+            .expect("the current-pass tile must survive");
+        assert_eq!(
+            protected.tile, protected_again.tile,
+            "本 pass 用过的 tile 不得被淘汰（否则本帧早先的 ShapedLine 会画错）"
+        );
     }
 }

@@ -1742,22 +1742,20 @@ mod tests {
     fn offscreen_snapshot_round_trips_pixels() {
         use crate::{
             math::Scale,
-            paint::{
-                color::{ColorResolver, Interpolation},
-                instance::InstanceEncoder,
-                scene::Scene,
-            },
+            paint::{color::ColorResolver, instance::InstanceEncoder, scene::Scene},
         };
 
         let mut renderer =
             super::Renderer::new_offscreen((16, 8)).expect("metal offscreen renderer");
         let mut encoder = InstanceEncoder::new();
-        let buffer = encoder.encode(
-            &Scene::empty(),
-            Scale::ONE,
-            &ColorResolver::new(Interpolation::default()),
-            &crate::paint::geometry_store::GeometryStore::new(),
-        );
+        let buffer = encoder
+            .encode(
+                &Scene::empty(),
+                Scale::ONE,
+                &ColorResolver,
+                &crate::paint::geometry_store::GeometryStore::new(),
+            )
+            .expect("encode");
         let image = renderer.render_snapshot(buffer).expect("snapshot");
         assert_eq!((image.width, image.height), (16, 8));
         assert_eq!(image.rgba8.len(), 16 * 8 * 4);

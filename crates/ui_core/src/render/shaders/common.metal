@@ -11,8 +11,6 @@ using namespace metal;
 #define KYTRIX_KIND_IMAGE 2u
 #define KYTRIX_KIND_SHADOW 3u
 
-#define KYTRIX_FLAG_OPAQUE 1u
-
 #define KYTRIX_TEXTURE_GLYPH 0u
 #define KYTRIX_TEXTURE_IMAGE 1u
 
@@ -23,8 +21,13 @@ using namespace metal;
 
 #define KYTRIX_MAX_CLIP_DEPTH 8u
 #define KYTRIX_CLIP_VERTEX_SLACK 2.0
-#define KYTRIX_SHADOW_SIGMA_DIVISOR 3.0
+// σ = blur × 0.5（CSS `box-shadow` 的「模糊半径」定义；与 Skia `SkBlurMaskFilter` 的
+// σ 同义，Skia 的 radius 换算见 contract.md §4）。
+#define KYTRIX_SHADOW_SIGMA_SCALE 0.5
 #define KYTRIX_SHADOW_SIGMA_MIN 0.35
+// 解析 AA 的「完全覆盖」距离（逻辑像素）：几何通道的纹理管线没有覆盖率属性，
+// 用它把 aa_coverage 推到 1.0。
+#define KYTRIX_AA_INSIDE -65536.0
 // </kytrix-constants>
 
 struct FrameUniform {
@@ -63,6 +66,11 @@ struct RootUniform {
     GeometryDrawUniform draw;
 };
 
+// MSL 没有 lerp：提供同名包装，保证函数体与 HLSL 逐行一致。
+inline float lerp(float a, float b, float t) { return mix(a, b, t); }
+inline float2 lerp(float2 a, float2 b, float2 t) { return mix(a, b, t); }
+inline float4 lerp(float4 a, float4 b, float t) { return mix(a, b, t); }
+
 // ---- 坐标 ----------------------------------------------------------------
 
 // 物理像素（左上原点、Y 向下）-> Metal NDC（Y 向上）。
@@ -79,9 +87,13 @@ inline float aa_coverage(float d) {
     return saturate(0.5 - d / w);
 }
 
+// 圆角矩形 SDF。半径按 CSS 规则夹到 `min(half_size)`：`r > min(half)` 会让
+// `q = |p| - half + r` 恒正 ⇒ 等值线反过来「越裁越大」（内容溢出）。编码器已按
+// 同一规则规范化，这里是第二道防线（数据异常也不出现反向错误）。
 inline float sd_rounded_rect(float2 p, float2 half_size, float4 radii) {
     float r = (p.x > 0.0) ? ((p.y > 0.0) ? radii.z : radii.y)
                           : ((p.y > 0.0) ? radii.w : radii.x);
+    r = clamp(r, 0.0, min(half_size.x, half_size.y));
     float2 q = abs(p) - half_size + r;
     return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
 }
@@ -98,14 +110,38 @@ inline float erf_approx(float x) {
     return (x < 0.0) ? -e : e;
 }
 
-// sigma = blur / 3：3 sigma = blur 与 params0.w = blur + 1 的外扩一致。
-inline float analytic_shadow(float d, float blur) {
-    float sigma = max(blur / KYTRIX_SHADOW_SIGMA_DIVISOR, KYTRIX_SHADOW_SIGMA_MIN);
-    return 0.5 * (1.0 - erf_approx(d / (sigma * 1.41421356)));
+// 标准正态的尾概率 Φ(-x)：半平面高斯模糊的**精确**覆盖率。
+inline float shadow_cdf(float x) {
+    return 0.5 * (1.0 - erf_approx(x * 0.70710678));
+}
+
+// 解析阴影覆盖率：可分离 2D 高斯。
+//
+// σ = blur × KYTRIX_SHADOW_SIGMA_SCALE（= blur / 2），与 CSS `box-shadow` /
+// `filter: blur(r)` 的「模糊半径」定义一致（Figma 同）。Skia 的 `SkBlurMaskFilter`
+// 用 `σ = radius × 0.57735 + 0.5`（其 SPECULAR/MASK 光栅器的 sigma 换算），因此同一
+// 视觉参数下本式的 σ 比 Skia 的略小 —— 换算关系写在 contract.md §4。
+//
+// 形状：轴对齐矩形的二维高斯响应是**可分离**的
+//   Φ(-dx/σ) × Φ(-dy/σ)   （dx/dy = 到左右/上下边的带符号距离，正 = 外侧）
+// 直角（r = 0）时它就是精确解（旧实现的半平面近似在角部把阴影「填实」约 58%）。
+// 圆角处边界是圆弧，分离式会高估角部覆盖，因此按「角部圆度 × r/(r+σ)」混合到
+// SDF 半平面解 Φ(-sdf/σ)：r = 0 退化为分离式，r >> σ 时角部走圆弧解。
+inline float analytic_shadow(float2 p, float2 half_size, float4 radii, float blur) {
+    float sigma = max(blur * KYTRIX_SHADOW_SIGMA_SCALE, KYTRIX_SHADOW_SIGMA_MIN);
+    float dx = abs(p.x) - half_size.x;
+    float dy = abs(p.y) - half_size.y;
+    float rect_part = shadow_cdf(dx / sigma) * shadow_cdf(dy / sigma);
+    float corner_r = clamp(max(max(radii.x, radii.y), max(radii.z, radii.w)), 0.0,
+                           min(half_size.x, half_size.y));
+    float sdf_part = shadow_cdf(sd_rounded_rect(p, half_size, radii) / sigma);
+    float corner = saturate(min(dx + corner_r, dy + corner_r) / max(corner_r, 1.0e-4));
+    return lerp(rect_part, sdf_part, corner * (corner_r / (corner_r + sigma)));
 }
 
 // ---- 渐变 ----------------------------------------------------------------
 
+// 双色渐变：线性预乘空间插值（与合成/AA 同一个空间；R05-7 的唯一插值空间）。
 inline float4 gradient_eval(uint kind, float2 p, float2 half_size, float4 c0, float4 c1) {
     float t;
     if (kind == KYTRIX_GRADIENT_HORIZONTAL) {
@@ -117,21 +153,42 @@ inline float4 gradient_eval(uint kind, float2 p, float2 half_size, float4 c0, fl
     } else {
         return c0;
     }
-    return mix(c0, c1, saturate(t));
+    return lerp(c0, c1, saturate(t));
+}
+
+// ---- geometry ------------------------------------------------------------
+
+inline float2 geometry_world(float2 local, constant RootUniform& root) {
+    float2 p = float2(root.draw.basis.x * local.x + root.draw.basis.z * local.y +
+                          root.draw.translation.x,
+                      root.draw.basis.y * local.x + root.draw.basis.w * local.y +
+                          root.draw.translation.y);
+    return p * root.frame.params.x;
 }
 
 // ---- clip ----------------------------------------------------------------
 
 // clip_index == 0 = 无裁剪（表项 0 不是可用矩形，禁止对它做数学运算）。
-inline float clip_mask(float2 world_px, uint clip_index, device const ClipEntry* clips) {
+//
+// 覆盖率语义（R05-10）：CPU 侧已把**全部轴对齐矩形 clip 求交合并为链上的一条**，
+// 因此逐层相乘只发生在「矩形交集 × 圆角形状」之间 —— 两层边界重合不再得到
+// 0.5 × 0.5 = 0.25（Skia `SkClipStack` 的矩形求交语义）。零尺寸 clip 的覆盖率恒为 0
+//（全裁）：它不是 0.5 的鬼线。`clip_depth` 是链长（编码器写入 params1.w）：循环按
+// 真实链长收口，链长 > KYTRIX_MAX_CLIP_DEPTH 时编码期直接报错，不会静默少裁。
+inline float clip_mask(float2 world_px, uint clip_index, uint clip_depth,
+                       device const ClipEntry* clips) {
     if (clip_index == 0u) {
         return 1.0;
     }
     float m = 1.0;
     uint idx = clip_index;
-    for (uint i = 0u; i < KYTRIX_MAX_CLIP_DEPTH && idx != 0u; ++i) {
+    uint limit = min(clip_depth, KYTRIX_MAX_CLIP_DEPTH);
+    for (uint i = 0u; i < limit && idx != 0u; ++i) {
         ClipEntry e = clips[idx];
-        float2 half_size = max(e.rect.zw, 0.0) * 0.5;
+        if (e.rect.z <= 0.0 || e.rect.w <= 0.0) {
+            return 0.0;
+        }
+        float2 half_size = e.rect.zw * 0.5;
         float2 center = e.rect.xy + half_size;
         m *= aa_coverage(sd_rounded_rect(world_px - center, half_size, e.corner_radius));
         idx = e.meta.x;

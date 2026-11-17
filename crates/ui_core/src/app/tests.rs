@@ -353,9 +353,9 @@ fn reload_system_fonts_is_idempotent_but_bumps_the_version() {
 /// `set_text_line` 不标 `PAINT`，paint 的 lane 复用只看 `REUSABLE`/`clip_key` —— 于是
 /// 窗口 A 改 DPI 让图集换代后，窗口 B 仍在使用旧 UV（错字/花字）。
 #[test]
-fn atlas_generation_change_repaints_text_in_every_window() {
+fn dpi_change_relays_text_without_rebuilding_the_shared_atlas() {
     let (_rt, mut app, window_a, node_a) = text_app("alpha", None);
-    // 第二个窗口：同样的文本节点，但一直不出帧 —— 它的 lane 会保留旧 AtlasTile。
+    // 第二个窗口：同样的文本节点，但一直不出帧 —— 它的 lane 保留上一帧的 AtlasTile。
     let window_b = app.create_window(WindowOptions::default());
     let node_b = {
         let tree = app.window_mut(window_b).expect("窗口存在").tree_mut();
@@ -379,7 +379,7 @@ fn atlas_generation_change_repaints_text_in_every_window() {
         .expect("快照存在")
         .atlas_generation;
 
-    // 窗口 A 改 DPI ⇒ 全局图集换代。
+    // 窗口 A 改 DPI：新 ppem 只是**新增** tile（R12-4/R12-1），不清页、不换代。
     app.window_mut(window_a)
         .expect("窗口存在")
         .set_scale(crate::math::Scale::new(2.0).expect("finite scale"));
@@ -393,31 +393,30 @@ fn atlas_generation_change_repaints_text_in_every_window() {
         .text_line(node_a)
         .expect("快照存在")
         .atlas_generation;
-    assert!(
-        generation_after > generation_before,
-        "DPI change must bump the global atlas generation"
+    assert_eq!(
+        generation_after, generation_before,
+        "DPI 变化不得让全局图集换代（R12-4：逻辑坐标 shaping + 多 ppem 共存）"
     );
 
-    // 关键断言：窗口 B 的文本节点必须已被标 PAINT，从而在下一帧重建 lane（新 UV）。
-    let dirty_b = app
-        .window(window_b)
-        .expect("窗口存在")
-        .tree()
-        .get(node_b)
-        .expect("节点存在")
-        .dirty();
-    assert!(
-        dirty_b.contains(crate::node::dirty::DirtyFlags::PAINT),
-        "图集换代后，其它窗口的文本节点必须被标 PAINT（否则继续用旧 UV）：{dirty_b:?}"
+    // 窗口 B 不受影响：它的 tile 仍然有效，既不需要 PAINT 也不需要重排。
+    let tree_b = app.window(window_b).expect("窗口存在").tree();
+    assert_eq!(
+        tree_b.text_layout_dirty_len(),
+        0,
+        "图集没换代 ⇒ 其它窗口的文本节点不得进入重排队列"
     );
-    assert!(
-        !dirty_b.contains(crate::node::dirty::DirtyFlags::LAYOUT),
-        "换代不改变断行，不应触发重排：{dirty_b:?}"
+    assert_eq!(
+        tree_b
+            .text_line(node_b)
+            .expect("快照仍然有效")
+            .atlas_generation,
+        generation_before,
+        "其它窗口的 ShapedLine 必须原样保留（不重排）"
     );
 }
 
 #[test]
-fn scale_change_clears_the_atlas_generation() {
+fn scale_change_relays_the_same_snapshot_at_the_new_ppem() {
     let (_rt, mut app, window, node) = text_app("hello", None);
     let _ = refresh(&mut app, window);
     let _ = layout(&mut app, window);
@@ -445,11 +444,49 @@ fn scale_change_clears_the_atlas_generation() {
         .expect("快照存在")
         .atlas_generation;
 
-    assert!(
-        generation_after > generation_before,
-        "DPI change bumps the atlas"
+    assert_eq!(
+        generation_after, generation_before,
+        "DPI 变化不再让图集换代（R12-4）：新 ppem 的 tile 直接加入，旧 tile 由 LRU 淘汰"
     );
-    assert!(second.laid > 0, "the text is re-laid at the new ppem");
+    assert!(
+        second.laid > 0,
+        "同一份形状快照必须按新 scale 重新光栅（落点/位图尺寸都变）"
+    );
+    assert!(
+        second.rasterized > 0,
+        "新 ppem 必须真正光栅（复用旧 ppem 的 tile 是错的）"
+    );
+}
+
+/// R12 的 `DigitFastPath` 命中率必须**可观测**（`TextPassReport`）：分母 = 进入判定的塑形数。
+#[test]
+fn digit_fast_path_hit_rate_is_observable() {
+    // 数字文本：进入判定一次、命中一次。
+    let (_rt, mut app, window, _node) = text_app("1,234.56", None);
+    let report = refresh(&mut app, window);
+    if report.fast_path_queries == 0 || report.fast_path_shaped == 0 {
+        // 宿主字体对该字号的数字/标点组合验证失败（例如带 kerning）：这是合法的降级，
+        // 不是失败；命中率的可观测性由下面「字母文本不计入判定」的断言保证。
+        eprintln!("skip: the host font rejects the digit fast path");
+    } else {
+        assert_eq!(report.fast_path_queries, 1);
+        assert_eq!(report.fast_path_shaped, 1);
+        assert!(app.digit_fast_path_enabled());
+    }
+
+    // 字母文本：不满足字符集 ⇒ 根本不计入判定（命中率分母为 0）。
+    let (_rt2, mut app2, window2, _node2) = text_app("frame a", None);
+    let report2 = refresh(&mut app2, window2);
+    assert_eq!(report2.fast_path_queries, 0, "字母文本不进入快速路径判定");
+    assert_eq!(report2.fast_path_shaped, 0);
+
+    // 开关关闭 ⇒ 连判定都不做（回退验证路径）。
+    let (_rt3, mut app3, window3, _node3) = text_app("1,234.56", None);
+    app3.set_digit_fast_path(false);
+    assert!(!app3.digit_fast_path_enabled());
+    let report3 = refresh(&mut app3, window3);
+    assert_eq!(report3.fast_path_queries, 0);
+    assert_eq!(report3.fast_path_shaped, 0);
 }
 
 #[test]

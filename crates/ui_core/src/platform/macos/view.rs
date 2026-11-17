@@ -7,6 +7,7 @@
 use std::{
     cell::{Cell, RefCell},
     ptr::NonNull,
+    time::Instant,
 };
 
 use objc2::{
@@ -15,15 +16,19 @@ use objc2::{
     runtime::{AnyObject, Sel},
 };
 use objc2_app_kit::{
-    NSEvent, NSEventModifierFlags, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSView,
+    NSEvent, NSEventModifierFlags, NSEventPhase, NSTextInputClient, NSTrackingArea,
+    NSTrackingAreaOptions, NSView,
 };
 use objc2_foundation::{
-    NSArray, NSAttributedString, NSAttributedStringKey, NSPoint, NSRange, NSRect, NSSize, NSString,
-    NSUInteger,
+    NSArray, NSAttributedString, NSAttributedStringKey, NSPoint, NSProcessInfo, NSRange, NSRect,
+    NSSize, NSString, NSUInteger,
 };
 
 use crate::{
-    event::{Event, ImeEvent, InputEvent, Key, KeyState, Modifiers, PointerButton},
+    event::{
+        Event, ImeEvent, InputEvent, KeyCode, KeyState, Modifiers, PointerButton, ScrollPhase,
+        ScrollUnit, timestamp_from_ticks,
+    },
     math::{Point, Rect},
     platform::{
         ime::replacement_range,
@@ -91,6 +96,10 @@ define_class!(
         fn key_down(&self, event: &NSEvent) {
             self.note_modifiers(event.modifierFlags());
             let modifiers = self.modifiers();
+            // R02-2：`NSEvent.isARepeat` 是 AppKit 的自动重复标志（长按产生的重复 `keyDown:`）。
+            let repeat = event.isARepeat();
+            // R02-14：事件时刻取 `NSEvent.timestamp`（系统启动起的秒），不是分发时刻。
+            let timestamp = event_timestamp(event);
             // 新按键边界：同一按键内的重复 `insertText:` 才去重（`"ll"` / 双空格必须都能进）。
             self.ivars().ime.borrow_mut().begin_key();
             // **IME 先**：输入法可能吞掉这个键（组合/提交走 NSTextInputClient 回调）。
@@ -101,13 +110,13 @@ define_class!(
             // 本键的正文是否已经由 IME 交付（`insertText:` 真的发出过 `Commit`）。
             let commit_consumed = self.ivars().suppress_text.replace(false);
             // `Key` **永不**被 IME 抑制：快捷键要能看到物理按键（与 Win32 一致）。
-            if let Some(key) = map_keycode(event.keyCode()) {
-                self.push_event(Event::Input(InputEvent::Key {
-                    key,
-                    state: KeyState::Down,
-                    modifiers,
-                }));
-            }
+            self.push_event(Event::Input(InputEvent::Key {
+                code: key_code(event.keyCode()),
+                state: KeyState::Down,
+                repeat,
+                modifiers,
+                timestamp,
+            }));
             // `Text` 只在「正文没被 IME 交付」时才发，避免与 `ImeEvent::Commit` 重复插入。
             if !composing
                 && !commit_consumed
@@ -118,6 +127,7 @@ define_class!(
                 if !text.is_empty() && text.chars().all(|c| !c.is_control()) {
                     self.push_event(Event::Input(InputEvent::Text {
                         text: smol_str::SmolStr::new(text),
+                        timestamp,
                     }));
                 }
             }
@@ -126,13 +136,14 @@ define_class!(
         #[unsafe(method(keyUp:))]
         fn key_up(&self, event: &NSEvent) {
             self.note_modifiers(event.modifierFlags());
-            if let Some(key) = map_keycode(event.keyCode()) {
-                self.push_event(Event::Input(InputEvent::Key {
-                    key,
-                    state: KeyState::Up,
-                    modifiers: self.modifiers(),
-                }));
-            }
+            self.push_event(Event::Input(InputEvent::Key {
+                code: key_code(event.keyCode()),
+                state: KeyState::Up,
+                // 抬起没有重复语义。
+                repeat: false,
+                modifiers: self.modifiers(),
+                timestamp: event_timestamp(event),
+            }));
         }
 
         #[unsafe(method(flagsChanged:))]
@@ -200,25 +211,65 @@ define_class!(
             self.push_pointer(event, PointerPhase::Up(PointerButton::Middle));
         }
 
+        #[unsafe(method(mouseEntered:))]
+        fn mouse_entered(&self, event: &NSEvent) {
+            // R02-4：`NSTrackingArea` 的 enter 半边（Windows 没有独立消息，Wayland 是
+            // `wl_pointer.enter`）。它同时带进窗位置，之后的 `mouseMoved:` 才是纯移动。
+            let position = self.logical_point(event.locationInWindow());
+            self.note_modifiers(event.modifierFlags());
+            self.push_event(Event::Input(InputEvent::PointerEnter {
+                position,
+                modifiers: self.modifiers(),
+                timestamp: event_timestamp(event),
+            }));
+        }
+
         #[unsafe(method(mouseExited:))]
-        fn mouse_exited(&self, _event: &NSEvent) {
-            self.push_event(Event::Input(InputEvent::PointerLeave));
+        fn mouse_exited(&self, event: &NSEvent) {
+            // R02-39：`PointerLeave` 带离开点（W3C `pointerleave` 也有坐标）。
+            let position = self.logical_point(event.locationInWindow());
+            self.note_modifiers(event.modifierFlags());
+            self.push_event(Event::Input(InputEvent::PointerLeave {
+                position,
+                modifiers: self.modifiers(),
+                timestamp: event_timestamp(event),
+            }));
         }
 
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &NSEvent) {
             let position = self.logical_point(event.locationInWindow());
             let precise = event.hasPreciseScrollingDeltas();
-            let per_line = if precise { 10.0 } else { 3.0 };
-            // macOS 的 `scrollingDeltaY > 0` = 向上滚（与 Win32 的 `WM_MOUSEWHEEL` 正方向一致）。
-            let delta_x = (event.scrollingDeltaX() / per_line) as f32;
-            let delta_y = (event.scrollingDeltaY() / per_line) as f32;
+            // 精确设备（触控板 / Magic Mouse）给的是像素增量，1:1 跟随；非精确设备（普通滚轮）
+            // 给的是"行"，AppKit 一格约 3 行（`NSEvent.scrollingDeltaY` 的非精确量纲仍是
+            // **需真机确认**的事项，这里保持 P12 的 /3 归一化，不凭空改手感）。
+            let (delta_x, delta_y, unit, width) = if precise {
+                (
+                    event.scrollingDeltaX() as f32,
+                    event.scrollingDeltaY() as f32,
+                    ScrollUnit::Pixel,
+                    0.0,
+                )
+            } else {
+                (
+                    (event.scrollingDeltaX() / 3.0) as f32,
+                    (event.scrollingDeltaY() / 3.0) as f32,
+                    ScrollUnit::Line,
+                    1.0,
+                )
+            };
+            // R02-10：保留系统的 `phase` / `momentumPhase`，引擎才能区分「手指在板上」与
+            // 「惯性滑行」（Chrome 的 `WebMouseWheelEvent.phase` / `momentumPhase` 同一做法）。
+            let phase = scroll_phase(event);
             self.note_modifiers(event.modifierFlags());
             self.push_event(Event::Input(InputEvent::Scroll {
                 position,
-                delta_x,
-                delta_y,
+                delta: Point::new(delta_x, delta_y),
+                unit,
+                phase,
+                lines_per_tick: if precise { 0.0 } else { width },
                 modifiers: self.modifiers(),
+                timestamp: event_timestamp(event),
             }));
         }
 
@@ -549,20 +600,24 @@ impl GuiView {
         let position = self.logical_point(event.locationInWindow());
         self.note_modifiers(event.modifierFlags());
         let modifiers = self.modifiers();
+        let timestamp = event_timestamp(event);
         let input = match phase {
             PointerPhase::Move => InputEvent::PointerMove {
                 position,
                 modifiers,
+                timestamp,
             },
             PointerPhase::Down(button) => InputEvent::PointerDown {
                 position,
                 button,
                 modifiers,
+                timestamp,
             },
             PointerPhase::Up(button) => InputEvent::PointerUp {
                 position,
                 button,
                 modifiers,
+                timestamp,
             },
         };
         self.push_event(Event::Input(input));
@@ -593,42 +648,170 @@ fn object_text(object: &AnyObject) -> String {
     description.to_string()
 }
 
-/// `NSEvent.keyCode`（硬件码）→ 引擎 `Key`（未映射 ⇒ `Key::Other`，与 Win32 的 `Key::Other(VK)` 同约定）。
-fn map_keycode(code: u16) -> Option<Key> {
-    let key = match code {
-        53 => Key::Escape,
-        36 | 76 => Key::Enter,
-        48 => Key::Tab,
-        51 => Key::Backspace,
-        117 => Key::Delete,
-        49 => Key::Space,
-        126 => Key::ArrowUp,
-        125 => Key::ArrowDown,
-        123 => Key::ArrowLeft,
-        124 => Key::ArrowRight,
-        115 => Key::Home,
-        119 => Key::End,
-        116 => Key::PageUp,
-        121 => Key::PageDown,
-        122 => Key::Function(1),
-        120 => Key::Function(2),
-        99 => Key::Function(3),
-        118 => Key::Function(4),
-        96 => Key::Function(5),
-        97 => Key::Function(6),
-        98 => Key::Function(7),
-        100 => Key::Function(8),
-        101 => Key::Function(9),
-        109 => Key::Function(10),
-        103 => Key::Function(11),
-        111 => Key::Function(12),
-        56 | 60 => Key::Shift,
-        59 | 62 => Key::Control,
-        58 | 61 => Key::Alt,
-        55 | 54 => Key::Meta,
-        other => Key::Other(other),
+/// `NSEvent.keyCode`（**布局无关**的硬件码）→ 引擎 [`KeyCode`]（W3C `KeyboardEvent.code`）。
+///
+/// 与 Win32 用扫描码、Wayland 用 evdev 码同一个理由：`keyCode` 是物理键位，键盘布局（US /
+/// AZERTY / 俄语）不改变它，因此快捷键表可以跨布局、跨平台共用（R02-1）。用
+/// `NSEvent.characters` 拿到的才是布局相关字符，那条通路走 [`InputEvent::Text`]。
+///
+/// 未覆盖的硬件码返回 [`KeyCode::Unidentified`]（载荷是原生 `keyCode`，**不可跨平台**）。
+fn key_code(code: u16) -> KeyCode {
+    let code = match code {
+        0x00 => KeyCode::KeyA,
+        0x01 => KeyCode::KeyS,
+        0x02 => KeyCode::KeyD,
+        0x03 => KeyCode::KeyF,
+        0x04 => KeyCode::KeyH,
+        0x05 => KeyCode::KeyG,
+        0x06 => KeyCode::KeyZ,
+        0x07 => KeyCode::KeyX,
+        0x08 => KeyCode::KeyC,
+        0x09 => KeyCode::KeyV,
+        0x0A => KeyCode::IntlBackslash,
+        0x0B => KeyCode::KeyB,
+        0x0C => KeyCode::KeyQ,
+        0x0D => KeyCode::KeyW,
+        0x0E => KeyCode::KeyE,
+        0x0F => KeyCode::KeyR,
+        0x10 => KeyCode::KeyY,
+        0x11 => KeyCode::KeyT,
+        0x12 => KeyCode::Digit1,
+        0x13 => KeyCode::Digit2,
+        0x14 => KeyCode::Digit3,
+        0x15 => KeyCode::Digit4,
+        0x16 => KeyCode::Digit6,
+        0x17 => KeyCode::Digit5,
+        0x18 => KeyCode::Equal,
+        0x19 => KeyCode::Digit9,
+        0x1A => KeyCode::Digit7,
+        0x1B => KeyCode::Minus,
+        0x1C => KeyCode::Digit8,
+        0x1D => KeyCode::Digit0,
+        0x1E => KeyCode::BracketRight,
+        0x1F => KeyCode::KeyO,
+        0x20 => KeyCode::KeyU,
+        0x21 => KeyCode::BracketLeft,
+        0x22 => KeyCode::KeyI,
+        0x23 => KeyCode::KeyP,
+        0x24 => KeyCode::Enter,
+        0x25 => KeyCode::KeyL,
+        0x26 => KeyCode::KeyJ,
+        0x27 => KeyCode::Quote,
+        0x28 => KeyCode::KeyK,
+        0x29 => KeyCode::Semicolon,
+        0x2A => KeyCode::Backslash,
+        0x2B => KeyCode::Comma,
+        0x2C => KeyCode::Slash,
+        0x2D => KeyCode::KeyN,
+        0x2E => KeyCode::KeyM,
+        0x2F => KeyCode::Period,
+        0x30 => KeyCode::Tab,
+        0x31 => KeyCode::Space,
+        0x32 => KeyCode::Backquote,
+        0x33 => KeyCode::Backspace,
+        0x35 => KeyCode::Escape,
+        0x36 => KeyCode::MetaRight,
+        0x37 => KeyCode::MetaLeft,
+        0x38 => KeyCode::ShiftLeft,
+        0x39 => KeyCode::CapsLock,
+        0x3A => KeyCode::AltLeft,
+        0x3B => KeyCode::ControlLeft,
+        0x3C => KeyCode::ShiftRight,
+        0x3D => KeyCode::AltRight,
+        0x3E => KeyCode::ControlRight,
+        0x3F => KeyCode::Fn,
+        0x40 => KeyCode::F17,
+        0x41 => KeyCode::NumpadDecimal,
+        0x42 => KeyCode::NumpadMultiply,
+        0x43 => KeyCode::NumpadAdd,
+        0x47 => KeyCode::NumLock,
+        0x4B => KeyCode::NumpadDivide,
+        0x4C => KeyCode::NumpadEnter,
+        0x4E => KeyCode::NumpadSubtract,
+        0x4F => KeyCode::F18,
+        0x50 => KeyCode::F19,
+        0x51 => KeyCode::NumpadEqual,
+        0x52 => KeyCode::Numpad0,
+        0x53 => KeyCode::Numpad1,
+        0x54 => KeyCode::Numpad2,
+        0x55 => KeyCode::Numpad3,
+        0x56 => KeyCode::Numpad4,
+        0x57 => KeyCode::Numpad5,
+        0x58 => KeyCode::Numpad6,
+        0x59 => KeyCode::Numpad7,
+        0x5A => KeyCode::F20,
+        0x5B => KeyCode::Numpad8,
+        0x5C => KeyCode::Numpad9,
+        0x5D => KeyCode::IntlYen,
+        0x5E => KeyCode::IntlRo,
+        0x5F => KeyCode::NumpadComma,
+        0x60 => KeyCode::F5,
+        0x61 => KeyCode::F6,
+        0x62 => KeyCode::F7,
+        0x63 => KeyCode::F3,
+        0x64 => KeyCode::F8,
+        0x65 => KeyCode::F9,
+        0x67 => KeyCode::F11,
+        0x69 => KeyCode::F13,
+        0x6A => KeyCode::F16,
+        0x6B => KeyCode::F14,
+        0x6D => KeyCode::F10,
+        0x6F => KeyCode::F12,
+        0x71 => KeyCode::F15,
+        0x72 => KeyCode::Help,
+        0x73 => KeyCode::Home,
+        0x74 => KeyCode::PageUp,
+        0x75 => KeyCode::Delete,
+        0x76 => KeyCode::F4,
+        0x77 => KeyCode::End,
+        0x78 => KeyCode::F2,
+        0x79 => KeyCode::PageDown,
+        0x7A => KeyCode::F1,
+        0x7B => KeyCode::ArrowLeft,
+        0x7C => KeyCode::ArrowRight,
+        0x7D => KeyCode::ArrowDown,
+        0x7E => KeyCode::ArrowUp,
+        other => KeyCode::Unidentified(other),
     };
-    Some(key)
+    code
+}
+
+/// 事件时刻 → 引擎单调时钟（R02-14）。
+///
+/// `NSEvent.timestamp` 是「系统启动起的秒数」，与 `NSProcessInfo.systemUptime` 同源；`Instant`
+/// 的原点未定义，所以按「现在 −（现在 uptime − 事件 uptime）」回推（[`timestamp_from_ticks`]）。
+/// 取不到 uptime 时退化为分发时刻（不 panic）。
+fn event_timestamp(event: &NSEvent) -> Instant {
+    let now = Instant::now();
+    let now_ms = (NSProcessInfo::processInfo().systemUptime().max(0.0) * 1000.0) as u64;
+    let event_ms = (event.timestamp().max(0.0) * 1000.0) as u64;
+    timestamp_from_ticks(now, now_ms, event_ms)
+}
+
+/// AppKit 的滚动阶段（`phase` 优先，其次是 `momentumPhase`）→ 引擎 [`ScrollPhase`]。
+///
+/// 惯性阶段必须单独表达：`phase` 为空而 `momentumPhase` 有值就是「手指已离开触控板」，
+/// 丢了它引擎只能把惯性当成新的手势（R02-10）。
+fn scroll_phase(event: &NSEvent) -> ScrollPhase {
+    let momentum = event.momentumPhase();
+    if momentum.contains(NSEventPhase::Cancelled) {
+        return ScrollPhase::Cancel;
+    }
+    if !momentum.is_empty() {
+        return ScrollPhase::Momentum;
+    }
+    let phase = event.phase();
+    if phase.contains(NSEventPhase::Cancelled) {
+        ScrollPhase::Cancel
+    } else if phase.contains(NSEventPhase::Began) || phase.contains(NSEventPhase::MayBegin) {
+        ScrollPhase::Begin
+    } else if phase.contains(NSEventPhase::Ended) {
+        ScrollPhase::End
+    } else if phase.contains(NSEventPhase::Changed) || phase.contains(NSEventPhase::Stationary) {
+        ScrollPhase::Update
+    } else {
+        ScrollPhase::Discrete
+    }
 }
 
 #[cfg(test)]
@@ -637,7 +820,8 @@ mod tests {
     use objc2_app_kit::NSUnderlineStyleAttributeName;
     use objc2_foundation::{NSMutableAttributedString, NSNumber, NSRange, NSString};
 
-    use super::object_text;
+    use super::{key_code, object_text};
+    use crate::event::KeyCode;
 
     fn as_any_object<T>(object: &T) -> &AnyObject {
         // SAFETY: 测试里传入的都是 NSObject 子类；AnyObject 是同一对象的类型擦除视图。
@@ -672,5 +856,24 @@ mod tests {
             "attributed fixture must carry attributes: {description}"
         );
         assert_eq!(object_text(as_any_object(&*attributed)), "ni'hao");
+    }
+
+    /// R02-1：`NSEvent.keyCode` 是**布局无关**的硬件码，映射到 W3C `code` 语义的物理键身份。
+    ///
+    /// 同一物理键在三个平台都得到同一个 `KeyCode`（macOS `kVK_ANSI_S` = 1 ⇒ `KeyS`；Windows
+    /// 扫描码 0x1F ⇒ `KeyS`；Linux `KEY_S` ⇒ `KeyS`），因此 `KeyBinding` 只需一张表。
+    #[test]
+    fn keycodes_map_to_physical_identities() {
+        assert_eq!(key_code(0x01), KeyCode::KeyS);
+        assert_eq!(key_code(0x00), KeyCode::KeyA);
+        assert_eq!(key_code(0x12), KeyCode::Digit1);
+        assert_eq!(key_code(0x24), KeyCode::Enter);
+        assert_eq!(key_code(0x4C), KeyCode::NumpadEnter);
+        assert_eq!(key_code(0x7A), KeyCode::F1);
+        assert_eq!(key_code(0x7E), KeyCode::ArrowUp);
+        assert_eq!(key_code(0x38), KeyCode::ShiftLeft);
+        assert_eq!(key_code(0x3C), KeyCode::ShiftRight);
+        // 未覆盖的硬件码：载荷是原生 keyCode，文档明确**不可跨平台**。
+        assert_eq!(key_code(0xFFFF), KeyCode::Unidentified(0xFFFF));
     }
 }

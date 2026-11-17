@@ -106,16 +106,22 @@ pub struct Path {
     pub fill: Color,
 }
 
-/// 解析阴影。
+/// 解析阴影：可分离 2D 高斯（σ = blur / 2）的解析近似。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Shadow {
     /// 投影盒：**未偏移、未模糊**的矩形（逻辑像素）。
     pub rect: Rect,
     /// 偏移（逻辑像素）。
     pub offset: Point,
-    /// 高斯模糊半径（逻辑像素，`>= 0`）。
+    /// 高斯**模糊半径**（逻辑像素，`>= 0`）。CSS `box-shadow` 的 `blur-radius` 语义：
+    /// `σ = blur / 2`（Figma / Skia 的 `blur` 同义，见 `contract.md` §4）。
     pub blur: f32,
+    /// 阴影色。
     pub color: Color,
+    /// 四角半径 `[tl, tr, br, bl]`（逻辑像素，CSS 顺序）。与 quad 共用同一套规范化
+    /// （`r <= min(w, h) / 2`）：`box-shadow` 跟随 `border-radius`，旧实现丢掉了这一项，
+    /// 圆角卡片背后会露出尖角阴影（R05-9）。
+    pub corner_radius: [f32; 4],
 }
 
 /// clip 栈指令。
@@ -237,6 +243,7 @@ mod tests {
                     offset: Point::new(0.0, 2.0),
                     blur: 4.0,
                     color: Color::BLACK,
+                    corner_radius: [1.0, 2.0, 3.0, 4.0],
                 }),
             ),
             (
@@ -329,6 +336,7 @@ mod tests {
             offset: Point::new(10.0, 20.0),
             blur: 2.0,
             color: Color::BLACK,
+            corner_radius: [0.0; 4],
         };
         assert_eq!(shadow.rect, rect);
     }

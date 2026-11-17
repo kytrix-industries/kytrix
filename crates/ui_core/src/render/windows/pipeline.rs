@@ -38,7 +38,8 @@ use windows::{
         Direct3D12::*,
         Dxgi::Common::{
             DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R16_UINT,
-            DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+            DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G32_FLOAT,
+            DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
         },
     },
     core::PCSTR,
@@ -132,7 +133,11 @@ impl Pipeline {
                 None,
             )
         }?;
-        let ui_layout = [input_element(c"POSITION", DXGI_FORMAT_R32G32_FLOAT, 0, 0)];
+        // geometry `Ui`：position float2 @0 + 覆盖率距离 float @8（解析 AA，R05-6）。
+        let ui_layout = [
+            input_element(c"POSITION", DXGI_FORMAT_R32G32_FLOAT, 0, 0),
+            input_element(c"TEXCOORD", DXGI_FORMAT_R32_FLOAT, 0, 8),
+        ];
         // SAFETY: 同上。
         let geometry_ui = unsafe {
             create_pipeline_state(
@@ -887,7 +892,8 @@ mod tests {
         let _guard = crate::render::windows::device::gpu_test_lock();
         let shared = super::super::device::SharedGpu::new_warp().expect("WARP shared gpu");
         let mut registry = super::GeometryRegistry::new();
-        let vertices = [0.0f32, 0.0, 32.0, 0.0, 0.0, 32.0]
+        // Ui 顶点 = position(f32×2) + 解析 AA 的覆盖率距离(f32)，12 B/顶点（R05-6）。
+        let vertices = [0.0f32, 0.0, -1.0, 32.0, 0.0, -1.0, 0.0, 32.0, -1.0]
             .iter()
             .flat_map(|value| value.to_ne_bytes())
             .collect::<Vec<u8>>();
@@ -910,7 +916,7 @@ mod tests {
             .ensure(&shared, id, &desc, &mut retired)
             .expect("ensure");
         assert_eq!(entry.index_count(), 3);
-        assert_eq!(entry.vertex().StrideInBytes, 8);
+        assert_eq!(entry.vertex().StrideInBytes, 12);
         assert_eq!(entry.topology(), D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         assert_eq!(entry.storage().len(), 2);
         assert!(retired.is_empty(), "首次创建不产生退役句柄");

@@ -11,5 +11,6 @@ layout(location = 0) out vec4 out_color;
 void main() {
     float coverage = texture(glyph_atlas, v_uv).r;
     vec4 color = root.draw.color0 * coverage;
-    out_color = apply_gamma(color * clip_mask(v_world_px, uint(root.draw.clip.x)));
+    out_color = apply_gamma(color * clip_mask(v_world_px, uint(root.draw.clip.x),
+                                              KYTRIX_MAX_CLIP_DEPTH));
 }

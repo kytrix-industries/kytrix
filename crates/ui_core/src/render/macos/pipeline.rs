@@ -114,7 +114,7 @@ impl Pipeline {
             shaders.function(&shaders.geometry, "ps_textured_image", GEOMETRY_METALLIB)?;
         let glyph_ps =
             shaders.function(&shaders.geometry, "ps_textured_glyph", GEOMETRY_METALLIB)?;
-        let geometry_ui = build_pipeline(device, format, &ui_vs, &ui_ps, Some(8))?;
+        let geometry_ui = build_pipeline(device, format, &ui_vs, &ui_ps, Some(12))?;
         let geometry_image = build_pipeline(device, format, &textured_vs, &image_ps, Some(16))?;
         let geometry_glyph = build_pipeline(device, format, &textured_vs, &glyph_ps, Some(16))?;
 
@@ -188,13 +188,16 @@ fn build_pipeline(
             position.setFormat(MTLVertexFormat::Float2);
             position.setOffset(0);
             position.setBufferIndex(0);
+            // 索引 1 恒存在（顶点描述符至少两个属性槽）。
+            // 16 B = `Textured`（uv float2）；12 B = `Ui`（解析 AA 的覆盖率距离 float）。
+            let second = layout.attributes().objectAtIndexedSubscript(1);
             if stride == 16 {
-                // 索引 1 恒存在（顶点描述符至少两个属性槽）。
-                let texcoord = layout.attributes().objectAtIndexedSubscript(1);
-                texcoord.setFormat(MTLVertexFormat::Float2);
-                texcoord.setOffset(8);
-                texcoord.setBufferIndex(0);
+                second.setFormat(MTLVertexFormat::Float2);
+            } else if stride == 12 {
+                second.setFormat(MTLVertexFormat::Float);
             }
+            second.setOffset(8);
+            second.setBufferIndex(0);
         }
         descriptor.setVertexDescriptor(Some(&layout));
     }

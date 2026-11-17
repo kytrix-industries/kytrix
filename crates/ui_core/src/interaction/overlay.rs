@@ -60,20 +60,53 @@ pub(crate) fn topmost(tree: &NodeTree, root: NodeId) -> Option<(NodeId, OverlayS
         .find_map(|child| tree.overlay_slot(*child).map(|slot| (*child, slot)))
 }
 
+/// 当前的**焦点作用域根**（R02-12）：最上层带 `trap_focus` 的浮层子树根。
+///
+/// 作用域是「栈顶决定一切」：模态浮层一开，键盘焦点只能在它内部循环，`Tab` 不会走到被遮挡
+/// 的背景控件上，`set_focus` 也会拒绝作用域外的节点（Blink `<dialog showModal>` 的 top
+/// layer + `inert` 背景、Qt 对话框焦点作用域、GTK `GtkWindow` 的 modal 都是这个语义）。
+/// 非模态浮层不改变作用域。
+#[must_use]
+pub(crate) fn focus_scope_root(tree: &NodeTree, root: NodeId) -> Option<NodeId> {
+    let children = tree.get(root).ok()?.children();
+    children.iter().rev().find_map(|child| {
+        tree.overlay_slot(*child)
+            .filter(|slot| slot.trap_focus)
+            .map(|_| *child)
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_in_subtree, outside_click_target, topmost};
+    use super::{focus_scope_root, is_in_subtree, outside_click_target, topmost};
     use crate::{
         interaction::{OverlayDismiss, OverlayPlacement, OverlaySlot},
         node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
     };
 
-    fn overlay(tree: &mut NodeTree, root: NodeId, dismiss: OverlayDismiss) -> NodeId {
-        let node = NodeBuilder::boxed().build(tree, root).expect("mount");
-        tree.ensure_interaction(node).expect("exists").overlay = Some(OverlaySlot {
+    fn overlay_slot(dismiss: OverlayDismiss) -> OverlaySlot {
+        OverlaySlot {
             dismiss,
             placement: OverlayPlacement::Point(crate::math::Point::ZERO),
-        });
+            trap_focus: false,
+            opener: None,
+            restore_focus: false,
+        }
+    }
+
+    fn overlay(tree: &mut NodeTree, root: NodeId, dismiss: OverlayDismiss) -> NodeId {
+        let node = NodeBuilder::boxed().build(tree, root).expect("mount");
+        tree.ensure_interaction(node).expect("exists").overlay = Some(overlay_slot(dismiss));
+        node
+    }
+
+    fn modal_overlay(tree: &mut NodeTree, root: NodeId) -> NodeId {
+        let node = NodeBuilder::boxed().build(tree, root).expect("mount");
+        let slot = OverlaySlot {
+            trap_focus: true,
+            ..overlay_slot(OverlayDismiss::Explicit)
+        };
+        tree.ensure_interaction(node).expect("exists").overlay = Some(slot);
         node
     }
 
@@ -152,5 +185,33 @@ mod tests {
         let child = NodeBuilder::boxed().build(&mut tree, panel).expect("mount");
 
         assert_eq!(outside_click_target(&tree, root, Some(child)), None);
+    }
+
+    /// R02-12：焦点作用域由**最上层的模态浮层**决定，非模态浮层不改变它。
+    #[test]
+    fn the_topmost_modal_overlay_owns_the_focus_scope() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let lower = modal_overlay(&mut tree, root);
+        let _plain = overlay(&mut tree, root, OverlayDismiss::OutsideClick);
+
+        assert_eq!(
+            focus_scope_root(&tree, root),
+            Some(lower),
+            "非模态浮层不影响作用域，仍然是最上层模态浮层"
+        );
+
+        let upper = modal_overlay(&mut tree, root);
+        assert_eq!(focus_scope_root(&tree, root), Some(upper), "栈顶说了算");
+    }
+
+    #[test]
+    fn a_window_without_modals_has_no_focus_scope() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let _plain = overlay(&mut tree, root, OverlayDismiss::OutsideClick);
+        let _background = NodeBuilder::boxed().build(&mut tree, root).expect("mount");
+
+        assert_eq!(focus_scope_root(&tree, root), None);
     }
 }

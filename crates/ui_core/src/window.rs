@@ -31,7 +31,7 @@ use crate::{
     node::{id::NodeId, tree::NodeTree},
     paint::{
         atlas::AtlasKind,
-        color::{Color, ColorResolver, Interpolation},
+        color::{Color, ColorResolver},
         instance::{InstanceBuffer, InstanceEncoder},
         pass::PaintReport,
         scene::Scene,
@@ -352,7 +352,7 @@ impl Window {
             scheduler: FrameScheduler::new(),
             encoder: InstanceEncoder::new(),
             damage: DamageAccumulator::new(scale),
-            resolver: ColorResolver::new(Interpolation::default()),
+            resolver: ColorResolver,
             renderer: None,
             glyph_page_received: None,
             image_page_received: None,

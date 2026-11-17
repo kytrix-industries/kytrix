@@ -1,12 +1,26 @@
 //! 平台事件、输入与动作契约（公开面；`design/phase-09-win32-demo.md` §4、`design/phase-10-interaction.md` §4/§5）。
 //!
-//! 平台层（`crate::platform`，私有，I9）把 `WM_*` 翻译成 [`InputEvent`] / [`ImeEvent`]，应用层通过
-//! [`crate::app::App::drain_events`] 收到 [`Event`]；**交互分发**由引擎自己完成（[`crate::app::App`] 的
-//! `dispatch_input`），动作见 [`Action`]。
+//! 平台层（`crate::platform`，私有，I9）把 `WM_*` / `NSEvent` / `wl_*` 翻译成 [`InputEvent`] /
+//! [`ImeEvent`]，应用层通过 [`crate::app::App::drain_events`] 收到 [`Event`]；**交互分发**由引擎
+//! 自己完成（[`crate::app::App`] 的 `dispatch_input`），动作见 [`Action`]。
 //!
 //! **坐标一律是窗口逻辑像素**（物理像素 → 逻辑的换算只在平台层做一次，I11）。
+//!
+//! ## 事件模型的语义来源
+//!
+//! 输入模型按成熟实现对齐，不按平台直觉发明：
+//!
+//! | 概念 | 本文件的类型 | 参照 |
+//! |---|---|---|
+//! | 物理键身份（布局无关） | [`KeyCode`] | W3C UI Events `KeyboardEvent.code`、Chrome `ui::DomCode`、winit `KeyCode`、SDL3 `SDL_Scancode` |
+//! | 逻辑键身份 | [`Key`] | W3C `KeyboardEvent.key`（命名部分）、Chrome `ui::DomKey`、winit `Key` |
+//! | 自动重复 | [`InputEvent::Key`] 的 `repeat` | winit `KeyEvent.repeat`、Qt `QKeyEvent::isAutoRepeat`、Flutter `KeyEvent.repeat` |
+//! | 事件时间戳 | [`InputEvent`] 各变体的 `timestamp` | Win32 `MSG.time`、AppKit `NSEvent.timestamp`、Wayland `input_event.time`、Chrome `WebInputEvent::TimeTicks` |
+//! | 点击归属按键 | [`ActionSource::Click`] 的 `button` | Win32 `WM_LBUTTONUP` / AppKit `mouseUp:`、Blink `click` vs `auxclick`、Qt `clicked()` 仅左键 |
+//! | 滚动阶段 / 单位 | [`ScrollPhase`] / [`ScrollUnit`] | Chrome `WebMouseWheelEvent.phase`、AppKit `NSEvent.phase`/`momentumPhase`、Qt `QWheelEvent::phase()`、Wayland `axis_value120` |
+//! | 输入法提交去重 | [`ImeCommitToken`] | Blink `TextInputClient::InsertText` 的 `native_key_code` 关联、Qt `QInputMethodEvent` |
 
-use std::ops::Range;
+use std::{ops::Range, time::Instant};
 
 use smol_str::SmolStr;
 
@@ -47,25 +61,316 @@ pub enum PointerButton {
     X2,
 }
 
-/// 按键状态。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum KeyState {
-    /// 按下（含自动重复）。
-    Down,
-    /// 抬起。
-    Up,
+impl PointerButton {
+    /// 是否是**主键**：只有主键产生 `click` / 抢焦点（Win32 的 `WM_LBUTTONUP`、AppKit 的
+    /// `mouseUp:`、Qt `QAbstractButton::mouseReleaseEvent` 的 `Qt::LeftButton` 判定、
+    /// Blink 的 `click`（次键走 `auxclick`））。
+    #[must_use]
+    pub const fn is_primary(self) -> bool {
+        matches!(self, Self::Primary)
+    }
 }
 
-/// 与布局无关的键（字符输入走 [`InputEvent::Text`]）。
+/// 物理键身份（W3C UI Events `KeyboardEvent.code`；**布局无关**）。
 ///
-/// 不含字母/数字：它们的**字符**由操作系统翻译（`WM_CHAR`）后经 [`InputEvent::Text`] 到达，
-/// 引擎不做 VK → 字符的布局映射（`design/phase-09-win32-demo.md` A4）。键位**身份**（快捷键）用
-/// [`Key::Other`] 的虚拟键码，两者不混用。
+/// 同一个物理键在**所有键盘布局**下都是同一个 `KeyCode`：US 布局的字母 `S`、Dvorak 的同一个
+/// 物理位置、俄语布局的同一个物理位置都映射到 [`KeyCode::KeyS`]。因此 [`KeyBinding`] 只写一份
+/// 就能跨布局、跨平台生效。
+///
+/// 这与 Chrome（`ui::DomCode`，由 USB HID usage 派生）、winit（`KeyCode`）、SDL3
+/// （`SDL_Scancode`）的选择一致。**平台私有码**（Win32 `VK_*` / macOS `NSEvent.keyCode` /
+/// Linux evdev）只出现在平台层，不再泄漏进公共契约 —— 旧 `Key::Other(u16)` 的缺陷是同一物理
+/// `S` 在三个平台分别得到 `83` / `1` / `23`，`KeyBinding` 无法同时命中，错平台的值还会静默
+/// 绑到另一个键。
+///
+/// 字符输入**不**走这里：字符由操作系统按当前布局翻译后经 [`InputEvent::Text`] 到达
+/// （引擎不做 VK → 字符的布局映射）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KeyCode {
+    // ── 书写区（W3C `KeyboardEvent.code` 的 "writing system keys"）──
+    /// `` ` ``/`~`（W3C `Backquote`）。
+    Backquote,
+    /// `\`/`|`（W3C `Backslash`）。
+    Backslash,
+    /// `[`/`{`（W3C `BracketLeft`）。
+    BracketLeft,
+    /// `]`/`}`（W3C `BracketRight`）。
+    BracketRight,
+    /// `,`/`<`（W3C `Comma`）。
+    Comma,
+    /// `=`/`+`（W3C `Equal`）。
+    Equal,
+    /// ISO 键盘左边多出来的那个 `\`/`|`（W3C `IntlBackslash`；UK/DE/FR 布局）。
+    IntlBackslash,
+    /// 日本键盘的 `\`/`_`（W3C `IntlRo`）。
+    IntlRo,
+    /// 日本键盘的 `¥`/`|`（W3C `IntlYen`）。
+    IntlYen,
+    /// `-`/`_`（W3C `Minus`）。
+    Minus,
+    /// `.`/`>`（W3C `Period`）。
+    Period,
+    /// `'`/`"`（W3C `Quote`）。
+    Quote,
+    /// `;`/`:`（W3C `Semicolon`）。
+    Semicolon,
+    /// `/`/`?`（W3C `Slash`）。
+    Slash,
+    /// 字母 `A` 的物理位置（W3C `KeyA`）。
+    KeyA,
+    /// 字母 `B` 的物理位置（W3C `KeyB`）。
+    KeyB,
+    /// 字母 `C` 的物理位置（W3C `KeyC`）。
+    KeyC,
+    /// 字母 `D` 的物理位置（W3C `KeyD`）。
+    KeyD,
+    /// 字母 `E` 的物理位置（W3C `KeyE`）。
+    KeyE,
+    /// 字母 `F` 的物理位置（W3C `KeyF`）。
+    KeyF,
+    /// 字母 `G` 的物理位置（W3C `KeyG`）。
+    KeyG,
+    /// 字母 `H` 的物理位置（W3C `KeyH`）。
+    KeyH,
+    /// 字母 `I` 的物理位置（W3C `KeyI`）。
+    KeyI,
+    /// 字母 `J` 的物理位置（W3C `KeyJ`）。
+    KeyJ,
+    /// 字母 `K` 的物理位置（W3C `KeyK`）。
+    KeyK,
+    /// 字母 `L` 的物理位置（W3C `KeyL`）。
+    KeyL,
+    /// 字母 `M` 的物理位置（W3C `KeyM`）。
+    KeyM,
+    /// 字母 `N` 的物理位置（W3C `KeyN`）。
+    KeyN,
+    /// 字母 `O` 的物理位置（W3C `KeyO`）。
+    KeyO,
+    /// 字母 `P` 的物理位置（W3C `KeyP`）。
+    KeyP,
+    /// 字母 `Q` 的物理位置（W3C `KeyQ`）。
+    KeyQ,
+    /// 字母 `R` 的物理位置（W3C `KeyR`）。
+    KeyR,
+    /// 字母 `S` 的物理位置（W3C `KeyS`）。
+    KeyS,
+    /// 字母 `T` 的物理位置（W3C `KeyT`）。
+    KeyT,
+    /// 字母 `U` 的物理位置（W3C `KeyU`）。
+    KeyU,
+    /// 字母 `V` 的物理位置（W3C `KeyV`）。
+    KeyV,
+    /// 字母 `W` 的物理位置（W3C `KeyW`）。
+    KeyW,
+    /// 字母 `X` 的物理位置（W3C `KeyX`）。
+    KeyX,
+    /// 字母 `Y` 的物理位置（W3C `KeyY`）。
+    KeyY,
+    /// 字母 `Z` 的物理位置（W3C `KeyZ`）。
+    KeyZ,
+    /// 主键盘区的数字 `1`（W3C `Digit1`）。
+    Digit0,
+    /// 主键盘区的数字 `1`（W3C `Digit1`）。
+    Digit1,
+    /// 主键盘区的数字 `2`（W3C `Digit2`）。
+    Digit2,
+    /// 主键盘区的数字 `3`（W3C `Digit3`）。
+    Digit3,
+    /// 主键盘区的数字 `4`（W3C `Digit4`）。
+    Digit4,
+    /// 主键盘区的数字 `5`（W3C `Digit5`）。
+    Digit5,
+    /// 主键盘区的数字 `6`（W3C `Digit6`）。
+    Digit6,
+    /// 主键盘区的数字 `7`（W3C `Digit7`）。
+    Digit7,
+    /// 主键盘区的数字 `8`（W3C `Digit8`）。
+    Digit8,
+    /// 主键盘区的数字 `9`（W3C `Digit9`）。
+    Digit9,
+
+    // ── 功能键区（W3C "functional keys"）──
+    /// 左 Alt（W3C `AltLeft`）。
+    AltLeft,
+    /// 右 Alt / AltGr（W3C `AltRight`）。
+    AltRight,
+    /// 退格（W3C `Backspace`）。
+    Backspace,
+    /// Caps Lock（W3C `CapsLock`）。
+    CapsLock,
+    /// 菜单键（W3C `ContextMenu`）。
+    ContextMenu,
+    /// 左 Control（W3C `ControlLeft`）。
+    ControlLeft,
+    /// 右 Control（W3C `ControlRight`）。
+    ControlRight,
+    /// 主键盘区回车（W3C `Enter`）。
+    Enter,
+    /// 左 Windows / Command 键（W3C `MetaLeft`）。
+    MetaLeft,
+    /// 右 Windows / Command 键（W3C `MetaRight`）。
+    MetaRight,
+    /// 左 Shift（W3C `ShiftLeft`）。
+    ShiftLeft,
+    /// 右 Shift（W3C `ShiftRight`）。
+    ShiftRight,
+    /// 空格（W3C `Space`）。
+    Space,
+    /// Tab（W3C `Tab`）。
+    Tab,
+    // ── 控制键区与方向键 ──
+    /// Delete（W3C `Delete`）。
+    Delete,
+    /// End（W3C `End`）。
+    End,
+    /// Help（W3C `Help`）。
+    Help,
+    /// Home（W3C `Home`）。
+    Home,
+    /// Insert（W3C `Insert`）。
+    Insert,
+    /// Page Down（W3C `PageDown`）。
+    PageDown,
+    /// Page Up（W3C `PageUp`）。
+    PageUp,
+    /// ↓（W3C `ArrowDown`）。
+    ArrowDown,
+    /// ←（W3C `ArrowLeft`）。
+    ArrowLeft,
+    /// →（W3C `ArrowRight`）。
+    ArrowRight,
+    /// ↑（W3C `ArrowUp`）。
+    ArrowUp,
+
+    // ── 小键盘（W3C "Numpad"）──
+    /// Num Lock（W3C `NumLock`）。
+    NumLock,
+    /// 小键盘 `0`（W3C `Numpad0`）。
+    Numpad0,
+    /// 小键盘 `1`（W3C `Numpad1`）。
+    Numpad1,
+    /// 小键盘 `2`（W3C `Numpad2`）。
+    Numpad2,
+    /// 小键盘 `3`（W3C `Numpad3`）。
+    Numpad3,
+    /// 小键盘 `4`（W3C `Numpad4`）。
+    Numpad4,
+    /// 小键盘 `5`（W3C `Numpad5`）。
+    Numpad5,
+    /// 小键盘 `6`（W3C `Numpad6`）。
+    Numpad6,
+    /// 小键盘 `7`（W3C `Numpad7`）。
+    Numpad7,
+    /// 小键盘 `8`（W3C `Numpad8`）。
+    Numpad8,
+    /// 小键盘 `9`（W3C `Numpad9`）。
+    Numpad9,
+    /// 小键盘 `+`（W3C `NumpadAdd`）。
+    NumpadAdd,
+    /// 小键盘 `,`（W3C `NumpadComma`；欧洲布局）。
+    NumpadComma,
+    /// 小键盘 `.`（W3C `NumpadDecimal`）。
+    NumpadDecimal,
+    /// 小键盘 `/`（W3C `NumpadDivide`）。
+    NumpadDivide,
+    /// 小键盘回车（W3C `NumpadEnter`）。
+    NumpadEnter,
+    /// 小键盘 `=`（W3C `NumpadEqual`；macOS 的小键盘 `=`）。
+    NumpadEqual,
+    /// 小键盘 `*`（W3C `NumpadMultiply`）。
+    NumpadMultiply,
+    /// 小键盘 `-`（W3C `NumpadSubtract`）。
+    NumpadSubtract,
+
+    // ── 功能键 ──
+    /// Esc（W3C `Escape`）。
+    Escape,
+    /// F1（W3C `F1`）。
+    F1,
+    /// F2（W3C `F2`）。
+    F2,
+    /// F3（W3C `F3`）。
+    F3,
+    /// F4（W3C `F4`）。
+    F4,
+    /// F5（W3C `F5`）。
+    F5,
+    /// F6（W3C `F6`）。
+    F6,
+    /// F7（W3C `F7`）。
+    F7,
+    /// F8（W3C `F8`）。
+    F8,
+    /// F9（W3C `F9`）。
+    F9,
+    /// F10（W3C `F10`）。
+    F10,
+    /// F11（W3C `F11`）。
+    F11,
+    /// F12（W3C `F12`）。
+    F12,
+    /// F13（W3C `F13`）。
+    F13,
+    /// F14（W3C `F14`）。
+    F14,
+    /// F15（W3C `F15`）。
+    F15,
+    /// F16（W3C `F16`）。
+    F16,
+    /// F17（W3C `F17`）。
+    F17,
+    /// F18（W3C `F18`）。
+    F18,
+    /// F19（W3C `F19`）。
+    F19,
+    /// F20（W3C `F20`）。
+    F20,
+    /// F21（W3C `F21`）。
+    F21,
+    /// F22（W3C `F22`）。
+    F22,
+    /// F23（W3C `F23`）。
+    F23,
+    /// F24（W3C `F24`）。
+    F24,
+    /// Fn（W3C `Fn`；Mac 的 Globe/Fn 键）。
+    Fn,
+    /// Fn Lock（W3C `FnLock`）。
+    FnLock,
+    /// Pause / Break（W3C `Pause`）。
+    Pause,
+    /// Print Screen / SysRq（W3C `PrintScreen`）。
+    PrintScreen,
+    /// Scroll Lock（W3C `ScrollLock`）。
+    ScrollLock,
+
+    // ── 未识别 ──
+    /// 平台给了本枚举没有覆盖的键；载荷是**平台私有码**，**不可跨平台**。
+    ///
+    /// 编码：Windows 是扫描码（bit 8 置位表示 `E0` 扩展键）；macOS 是 `NSEvent.keyCode`；
+    /// Linux 是 evdev 码。`Unidentified(83)` 在 Windows 是字母 `S` 的扫描码，在 macOS 是别的
+    /// 键 —— 应用**不得**把它写进跨平台绑定表（引擎自己的默认绑定只用命名变体）。
+    Unidentified(u16),
+}
+
+/// 逻辑键（W3C `KeyboardEvent.key` 的**命名**部分）。
+///
+/// 与 [`KeyCode`] 的分工和 Chrome（`DomCode`/`DomKey`）、winit（`KeyCode`/`Key`）、SDL3
+/// （`Scancode`/`Keycode`）相同：
+///
+/// - [`KeyCode`] = **物理**身份，布局无关，用于快捷键绑定与「按住集合」；
+/// - [`Key`] = **逻辑**身份，即「这个键在语义上是什么」（回车 / Esc / F5 / 方向键…），
+///   用于「按语义区分」的默认行为。
+///
+/// 可打印字符的逻辑身份依赖键盘布局（US 布局的物理 `KeyS` 是 `s`，俄语布局是 `ы`），
+/// 因此字符键**没有** `Key` —— 字符输入一律走 [`InputEvent::Text`]。
+///
+/// 由 [`KeyCode`] 投影得到（[`Key::from_code`]），所以三个平台不需要各写一份逻辑键映射表。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Key {
     /// Esc。
     Escape,
-    /// 回车。
+    /// 回车（含小键盘回车）。
     Enter,
     /// Tab。
     Tab,
@@ -73,6 +378,8 @@ pub enum Key {
     Backspace,
     /// Delete。
     Delete,
+    /// Insert。
+    Insert,
     /// 空格。
     Space,
     /// ↑。
@@ -91,7 +398,7 @@ pub enum Key {
     PageUp,
     /// PageDown。
     PageDown,
-    /// F1…F24。
+    /// F1…F24（`1..=24`）。
     Function(u8),
     /// 左/右 Shift。
     Shift,
@@ -99,21 +406,149 @@ pub enum Key {
     Control,
     /// 左/右 Alt。
     Alt,
-    /// 左/右 Windows 键。
+    /// 左/右 Windows 键 / Command。
     Meta,
-    /// 未映射的平台键（载荷是平台虚拟键码；[`KeyBinding`] 用它表达字母/数字键位）。
-    Other(u16),
+}
+
+impl Key {
+    /// 物理键 → 逻辑键（`None` = 该物理键没有命名逻辑身份，字符输入走 [`InputEvent::Text`]）。
+    ///
+    /// 左右修饰键在逻辑层合并（`Modifiers` 位图也表达不了左右；需要区分左右时用 [`KeyCode`]）。
+    #[must_use]
+    pub const fn from_code(code: KeyCode) -> Option<Self> {
+        let key = match code {
+            KeyCode::Escape => Self::Escape,
+            KeyCode::Enter | KeyCode::NumpadEnter => Self::Enter,
+            KeyCode::Tab => Self::Tab,
+            KeyCode::Backspace => Self::Backspace,
+            KeyCode::Delete => Self::Delete,
+            KeyCode::Insert => Self::Insert,
+            KeyCode::Space => Self::Space,
+            KeyCode::ArrowUp => Self::ArrowUp,
+            KeyCode::ArrowDown => Self::ArrowDown,
+            KeyCode::ArrowLeft => Self::ArrowLeft,
+            KeyCode::ArrowRight => Self::ArrowRight,
+            KeyCode::Home => Self::Home,
+            KeyCode::End => Self::End,
+            KeyCode::PageUp => Self::PageUp,
+            KeyCode::PageDown => Self::PageDown,
+            KeyCode::F1 => Self::Function(1),
+            KeyCode::F2 => Self::Function(2),
+            KeyCode::F3 => Self::Function(3),
+            KeyCode::F4 => Self::Function(4),
+            KeyCode::F5 => Self::Function(5),
+            KeyCode::F6 => Self::Function(6),
+            KeyCode::F7 => Self::Function(7),
+            KeyCode::F8 => Self::Function(8),
+            KeyCode::F9 => Self::Function(9),
+            KeyCode::F10 => Self::Function(10),
+            KeyCode::F11 => Self::Function(11),
+            KeyCode::F12 => Self::Function(12),
+            KeyCode::F13 => Self::Function(13),
+            KeyCode::F14 => Self::Function(14),
+            KeyCode::F15 => Self::Function(15),
+            KeyCode::F16 => Self::Function(16),
+            KeyCode::F17 => Self::Function(17),
+            KeyCode::F18 => Self::Function(18),
+            KeyCode::F19 => Self::Function(19),
+            KeyCode::F20 => Self::Function(20),
+            KeyCode::F21 => Self::Function(21),
+            KeyCode::F22 => Self::Function(22),
+            KeyCode::F23 => Self::Function(23),
+            KeyCode::F24 => Self::Function(24),
+            KeyCode::ShiftLeft | KeyCode::ShiftRight => Self::Shift,
+            KeyCode::ControlLeft | KeyCode::ControlRight => Self::Control,
+            KeyCode::AltLeft | KeyCode::AltRight => Self::Alt,
+            KeyCode::MetaLeft | KeyCode::MetaRight => Self::Meta,
+            _ => return None,
+        };
+        Some(key)
+    }
+
+    /// 是否是修饰键（`Shift`/`Control`/`Alt`/`Meta`）。
+    #[must_use]
+    pub const fn is_modifier(self) -> bool {
+        matches!(self, Self::Shift | Self::Control | Self::Alt | Self::Meta)
+    }
+}
+
+/// 按键状态。
+///
+/// 自动重复**不是**第三种状态：它是「按下」的一种属性，由 [`InputEvent::Key`] 的 `repeat`
+/// 字段表达（winit `KeyEvent.repeat`、Qt `QKeyEvent::isAutoRepeat` 同一建模）。这样
+/// `state` 的取值只有物理上的两态，不会出现「`Repeat` 之后又收到 `Up`」这种需要额外状态机
+/// 才能对齐的序列。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KeyState {
+    /// 按下（自动重复时 `repeat == true`）。
+    Down,
+    /// 抬起。
+    Up,
+}
+
+/// 滚动单位。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollUnit {
+    /// `delta` 的单位是**行**（离散滚轮；`1` 行 = 容器自己的 `line_height`）。
+    Line,
+    /// `delta` 的单位是**逻辑像素**（触控板 / 精确滚动设备 1:1 跟随）。
+    Pixel,
+}
+
+/// 滚动阶段（Chrome `WebMouseWheelEvent::Phase`、Qt `QWheelEvent::phase()`、
+/// AppKit `NSEvent.phase` + `momentumPhase`、Blink `WebMouseWheelEvent.phase`）。
+///
+/// 离散滚轮（一格 = 一条消息）用 [`ScrollPhase::Discrete`]；触控板 / 精确设备才区分
+/// 开始 / 更新 / 结束 / 惯性，引擎据此决定「立刻到位」还是「交给系统惯性」。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollPhase {
+    /// 离散输入（滚轮一格）：单条事件自成一笔，没有阶段。
+    Discrete,
+    /// 连续手势开始（AppKit `NSEventPhaseBegan`）。
+    Begin,
+    /// 连续手势进行中（AppKit `NSEventPhaseChanged`）。
+    Update,
+    /// 连续手势结束（AppKit `NSEventPhaseEnded`）。
+    End,
+    /// 系统惯性滑行（AppKit `momentumPhase`）。
+    Momentum,
+    /// 手势被取消（AppKit `NSEventPhaseCancelled`）。
+    Cancel,
+}
+
+impl ScrollPhase {
+    /// 是否是**连续设备**的阶段（触控板 / 精确滚动）。离散滚轮为 `false`。
+    #[must_use]
+    pub const fn is_continuous(self) -> bool {
+        !matches!(self, Self::Discrete)
+    }
 }
 
 /// 一次输入事件。
+///
+/// 每个变体都带 `timestamp`：**平台的真实事件时刻**（[`timestamp_from_ticks`] 把 Win32
+/// `MSG.time` / AppKit `NSEvent.timestamp` / Wayland `input_event.time` 换算成单调时钟）。
+/// 双击判定、连击计数、拖拽起点都用它，而不是「分发时刻」——UI 线程卡顿时两者能差几十毫秒。
 #[derive(Clone, Debug, PartialEq)]
 pub enum InputEvent {
+    /// 指针进入窗口客户区（W3C `pointerenter` 的窗口级对应；AppKit `mouseEntered:` /
+    /// Win32 `TrackMouseEvent` 的首次 `WM_MOUSEMOVE` / Wayland `wl_pointer.enter`）。
+    PointerEnter {
+        /// 窗口逻辑坐标。
+        position: Point,
+        /// 当前修饰键。
+        modifiers: Modifiers,
+        /// 事件时刻。
+        timestamp: Instant,
+    },
     /// 指针移动。
     PointerMove {
         /// 窗口逻辑坐标。
         position: Point,
         /// 当前修饰键。
         modifiers: Modifiers,
+        /// 事件时刻。
+        timestamp: Instant,
     },
     /// 指针按下。
     PointerDown {
@@ -123,6 +558,8 @@ pub enum InputEvent {
         button: PointerButton,
         /// 当前修饰键。
         modifiers: Modifiers,
+        /// 事件时刻。
+        timestamp: Instant,
     },
     /// 指针抬起。
     PointerUp {
@@ -132,40 +569,80 @@ pub enum InputEvent {
         button: PointerButton,
         /// 当前修饰键。
         modifiers: Modifiers,
+        /// 事件时刻。
+        timestamp: Instant,
     },
-    /// 指针离开客户区。
-    PointerLeave,
+    /// 指针离开客户区（W3C `pointerleave`；带离开点，AppKit `mouseExited:` /
+    /// Wayland `wl_pointer.leave` 都能给出，Win32 `WM_MOUSELEAVE` 没有坐标时用最近一次位置）。
+    PointerLeave {
+        /// 离开时的窗口逻辑坐标（最近一次已知位置）。
+        position: Point,
+        /// 当前修饰键。
+        modifiers: Modifiers,
+        /// 事件时刻。
+        timestamp: Instant,
+    },
     /// 指针会话被系统**取消**（不是用户松手）：指针捕获丢失、窗口失焦、系统弹窗夺走输入。
     ///
     /// 与 [`Self::PointerUp`] 的区别是语义：`Up` 可能触发点击，`Cancel` 必须**不**触发任何
     /// 提交，只结束拖拽/按压并派发 `DragPhase::Cancel`。丢了这个事件，拖拽会话会永久卡在
     /// 「按住」状态（Windows 的 `WM_CAPTURECHANGED`、macOS 的 `resignKey`、Linux 的指针
     /// `leave` 都可能在没有 `Up` 的情况下结束一次拖拽）。
-    PointerCancel,
-    /// 滚轮：`delta_*` 以「行」为单位（Windows 一格 = 120 → 1.0 行，符号即方向）。
+    PointerCancel {
+        /// 事件时刻。
+        timestamp: Instant,
+    },
+    /// 滚轮 / 触控板滚动。
     Scroll {
         /// 窗口逻辑坐标。
         position: Point,
-        /// 水平滚动（正 = 向右）。
-        delta_x: f32,
-        /// 垂直滚动（正 = 向上）。
-        delta_y: f32,
+        /// 二维滚动量（正 = 内容向右 / 向上移动；`y` 与 Win32 `WM_MOUSEWHEEL` 的正方向一致）。
+        ///
+        /// 单位由 [`Self::Scroll`] 的 `unit` 决定：`Line` 时 `1.0` = 一格（再乘容器的
+        /// `line_height`），`Pixel` 时就是逻辑像素。二维 delta 是**必须**可达的：
+        /// K 线图 / 深度图的双指平移要同时消费两轴。
+        delta: Point,
+        /// 单位。
+        unit: ScrollUnit,
+        /// 阶段。
+        phase: ScrollPhase,
+        /// 一格滚轮对应多少行（`> 0`；`0.0` = 平台没给，调用方按容器默认）。
+        ///
+        /// 来源：Win32 `SPI_GETWHEELSCROLLLINES`、macOS 非精确设备的行高换算、
+        /// Wayland `axis_value120` 的 1/120 离散步长。
+        lines_per_tick: f32,
         /// 当前修饰键（`Shift + 滚轮` 的横向滚动走它）。
         modifiers: Modifiers,
+        /// 事件时刻。
+        timestamp: Instant,
     },
     /// 非字符键。
     Key {
-        /// 键。
-        key: Key,
+        /// 物理键身份（布局无关）。
+        code: KeyCode,
         /// 按下/抬起。
         state: KeyState,
+        /// 是否**自动重复**（操作系统合成的重复按键，不是新的按下）。
+        ///
+        /// 来源：Win32 `WM_KEYDOWN.lParam` bit 30、AppKit `NSEvent.isARepeat`、
+        /// Wayland 客户端合成（`wl_keyboard.repeat_info` + `xkb_keymap_key_repeats`）。
+        /// 引擎的绑定派发**忽略重复**（长按不会重复触发动作），只有默认的导航/滚动行为
+        /// 允许重复执行。
+        repeat: bool,
         /// 当前修饰键。
         modifiers: Modifiers,
+        /// 事件时刻。
+        timestamp: Instant,
     },
-    /// 字符输入（`WM_CHAR` / IME 提交；死键组合已由平台完成）。
+    /// 字符输入（`WM_CHAR`、AppKit `characters`、xkb `key_get_utf8`；死键组合已由平台完成）。
+    ///
+    /// **不含** IME 提交文本：已确认的输入法文本走 [`ImeEvent::Commit`]（两者由平台层保证
+    /// 互斥，见 [`ImeCommitToken`]）。
     Text {
         /// 一个或多个 `char`（代理对已合并）。
         text: SmolStr,
+        /// 事件时刻。
+        timestamp: Instant,
     },
 }
 
@@ -174,11 +651,13 @@ impl InputEvent {
     #[must_use]
     pub fn position(&self) -> Option<Point> {
         match self {
-            Self::PointerMove { position, .. }
+            Self::PointerEnter { position, .. }
+            | Self::PointerMove { position, .. }
             | Self::PointerDown { position, .. }
             | Self::PointerUp { position, .. }
+            | Self::PointerLeave { position, .. }
             | Self::Scroll { position, .. } => Some(*position),
-            Self::PointerLeave | Self::PointerCancel | Self::Key { .. } | Self::Text { .. } => None,
+            Self::PointerCancel { .. } | Self::Key { .. } | Self::Text { .. } => None,
         }
     }
 
@@ -186,13 +665,321 @@ impl InputEvent {
     #[must_use]
     pub fn modifiers(&self) -> Modifiers {
         match self {
-            Self::PointerMove { modifiers, .. }
+            Self::PointerEnter { modifiers, .. }
+            | Self::PointerMove { modifiers, .. }
             | Self::PointerDown { modifiers, .. }
             | Self::PointerUp { modifiers, .. }
+            | Self::PointerLeave { modifiers, .. }
             | Self::Scroll { modifiers, .. }
             | Self::Key { modifiers, .. } => *modifiers,
-            Self::PointerLeave | Self::PointerCancel | Self::Text { .. } => Modifiers::empty(),
+            Self::PointerCancel { .. } | Self::Text { .. } => Modifiers::empty(),
         }
+    }
+
+    /// 平台的**事件时刻**（所有变体都有；双击/连击/拖拽起点以它为基准）。
+    #[must_use]
+    pub fn timestamp(&self) -> Instant {
+        match self {
+            Self::PointerEnter { timestamp, .. }
+            | Self::PointerMove { timestamp, .. }
+            | Self::PointerDown { timestamp, .. }
+            | Self::PointerUp { timestamp, .. }
+            | Self::PointerLeave { timestamp, .. }
+            | Self::PointerCancel { timestamp }
+            | Self::Scroll { timestamp, .. }
+            | Self::Key { timestamp, .. }
+            | Self::Text { timestamp, .. } => *timestamp,
+        }
+    }
+
+    /// 换掉事件时间戳（`TestApp::inject` 用**可控时钟**盖戳，双击/连击/拖拽判定才可测）。
+    #[must_use]
+    pub fn with_timestamp(self, at: Instant) -> Self {
+        match self {
+            Self::PointerEnter {
+                position,
+                modifiers,
+                ..
+            } => Self::PointerEnter {
+                position,
+                modifiers,
+                timestamp: at,
+            },
+            Self::PointerMove {
+                position,
+                modifiers,
+                ..
+            } => Self::PointerMove {
+                position,
+                modifiers,
+                timestamp: at,
+            },
+            Self::PointerDown {
+                position,
+                button,
+                modifiers,
+                ..
+            } => Self::PointerDown {
+                position,
+                button,
+                modifiers,
+                timestamp: at,
+            },
+            Self::PointerUp {
+                position,
+                button,
+                modifiers,
+                ..
+            } => Self::PointerUp {
+                position,
+                button,
+                modifiers,
+                timestamp: at,
+            },
+            Self::PointerLeave {
+                position,
+                modifiers,
+                ..
+            } => Self::PointerLeave {
+                position,
+                modifiers,
+                timestamp: at,
+            },
+            Self::PointerCancel { .. } => Self::PointerCancel { timestamp: at },
+            Self::Scroll {
+                position,
+                delta,
+                unit,
+                phase,
+                lines_per_tick,
+                modifiers,
+                ..
+            } => Self::Scroll {
+                position,
+                delta,
+                unit,
+                phase,
+                lines_per_tick,
+                modifiers,
+                timestamp: at,
+            },
+            Self::Key {
+                code,
+                state,
+                repeat,
+                modifiers,
+                ..
+            } => Self::Key {
+                code,
+                state,
+                repeat,
+                modifiers,
+                timestamp: at,
+            },
+            Self::Text { text, .. } => Self::Text {
+                text,
+                timestamp: at,
+            },
+        }
+    }
+
+    /// 指针移动事件（时间戳 = 当前时刻）。
+    ///
+    /// 供**测试与程序化注入**使用；平台层必须用平台时间戳构造具体变体，否则双击判定会退化
+    /// 成「分发时刻」。
+    #[must_use]
+    pub fn pointer_move(position: Point, modifiers: Modifiers) -> Self {
+        Self::PointerMove {
+            position,
+            modifiers,
+            timestamp: Instant::now(),
+        }
+    }
+
+    /// 指针按下事件（时间戳 = 当前时刻；供测试与程序化注入）。
+    #[must_use]
+    pub fn pointer_down(position: Point, button: PointerButton, modifiers: Modifiers) -> Self {
+        Self::PointerDown {
+            position,
+            button,
+            modifiers,
+            timestamp: Instant::now(),
+        }
+    }
+
+    /// 指针抬起事件（时间戳 = 当前时刻；供测试与程序化注入）。
+    #[must_use]
+    pub fn pointer_up(position: Point, button: PointerButton, modifiers: Modifiers) -> Self {
+        Self::PointerUp {
+            position,
+            button,
+            modifiers,
+            timestamp: Instant::now(),
+        }
+    }
+
+    /// 滚轮事件（离散一格，单位 = 行，时间戳 = 当前时刻；供测试与程序化注入）。
+    #[must_use]
+    pub fn scroll_lines(position: Point, delta: Point, modifiers: Modifiers) -> Self {
+        Self::Scroll {
+            position,
+            delta,
+            unit: ScrollUnit::Line,
+            phase: ScrollPhase::Discrete,
+            lines_per_tick: 1.0,
+            modifiers,
+            timestamp: Instant::now(),
+        }
+    }
+
+    /// 按键按下事件（时间戳 = 当前时刻；供测试与程序化注入）。
+    #[must_use]
+    pub fn key_down(code: KeyCode, modifiers: Modifiers) -> Self {
+        Self::Key {
+            code,
+            state: KeyState::Down,
+            repeat: false,
+            modifiers,
+            timestamp: Instant::now(),
+        }
+    }
+
+    /// 按键抬起事件（时间戳 = 当前时刻；供测试与程序化注入）。
+    #[must_use]
+    pub fn key_up(code: KeyCode, modifiers: Modifiers) -> Self {
+        Self::Key {
+            code,
+            state: KeyState::Up,
+            repeat: false,
+            modifiers,
+            timestamp: Instant::now(),
+        }
+    }
+}
+
+/// 平台毫秒时钟 → [`Instant`]（R02-14：事件时间戳）。
+///
+/// 三个平台的原生事件时间戳都是「单调毫秒 tick」，但原点不同（Win32 `MSG.time` 与
+/// `GetTickCount64` 同源、AppKit `NSEvent.timestamp` 是系统启动起的秒、Wayland
+/// `input_event.time` 是毫秒）；`Instant` 的原点**未定义且跨进程不可比较**。因此换算方式是
+/// 在同一处同时取一次 `Instant::now()` 与平台 tick，再把事件 tick 按差值回推：
+///
+/// ```text
+/// event_instant ≈ now - (now_ticks - event_ticks)
+/// ```
+///
+/// 差值为负（事件比「现在」还新，例如时钟源不同步）时饱和到 `now`；平台 tick 回绕或事件
+/// 时间过旧时同理钳到 `now` 之前能表示的最远点 —— 绝不 panic，最坏退化成分发时刻。
+#[must_use]
+pub fn timestamp_from_ticks(now: Instant, now_ticks_ms: u64, event_ticks_ms: u64) -> Instant {
+    let behind = now_ticks_ms.saturating_sub(event_ticks_ms);
+    now.checked_sub(std::time::Duration::from_millis(behind))
+        .unwrap_or(now)
+}
+
+/// 输入法提交的**事件级令牌**（R02-13 的共享部分；平台实现在后续 WP 落地）。
+///
+/// 问题：平台在 IME 提交之后还会补发同内容的原生字符消息（Windows `WM_CHAR`、macOS
+/// `characters`），引擎必须跳过它们，否则同一段文本被插入两次。旧实现的判据是「计数」
+/// （Windows 按 Unicode 码点数、macOS 用一个 bool），既不可靠（码点 vs UTF-16 码元，emoji
+/// 一并提交时错配）也无法表达「这条原生消息属于哪一次提交」。
+///
+/// 语义：平台层每次 IME 提交生成一个新令牌，随后的原生字符消息携带**同一令牌**；引擎只对
+/// 「令牌匹配且内容能被该次提交的 UTF-16 前缀解释」的消息去重。令牌与平台类型无关，平台层
+/// 只需在提交时取号、在字符消息里带上它。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ImeCommitToken(u64);
+
+impl ImeCommitToken {
+    /// 生成下一个令牌（单调递增；`0` 保留为「没有令牌」）。
+    #[must_use]
+    pub fn next(self) -> Self {
+        Self(self.0.wrapping_add(1).max(1))
+    }
+
+    /// 起始令牌。
+    #[must_use]
+    pub const fn first() -> Self {
+        Self(1)
+    }
+
+    /// 原始值（平台层可以把令牌塞进消息参数做关联）。
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// 测试用构造（令牌值直接给定）。
+    #[cfg(test)]
+    pub(crate) const fn from_test(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+/// 提交去重状态机：**事件级令牌 + UTF-16 前缀匹配**（R02-13 的共享部分）。
+///
+/// 问题：平台在 IME 提交之后还会补发同内容的原生字符消息（Windows `WM_CHAR`、macOS
+/// `characters`），引擎必须跳过它们，否则同一段文本被插入两次。旧实现的判据是「同一按键内的
+/// 相同文本」（内容去重）—— 既会误吞用户真的又敲了一次的内容，也无法把原生消息与产生它的那次
+/// 提交对应起来。
+///
+/// 这里的语义：一次提交 = 一个 [`ImeCommitToken`] + 一段待抑制的 **UTF-16 码元序列**
+/// （`WM_CHAR` 与 AppKit 的 `characters` 都以 UTF-16 码元为单位投递，emoji 是两个码元）。
+/// 随后的原生字符消息只要**携带同一令牌**且码元能按顺序拼出该序列，就被判定为重复并抑制；
+/// 令牌不符、或码元对不上（说明这条消息属于另一次输入）时立刻停止抑制 —— 绝不靠数字计数去猜。
+///
+/// 平台接线（Windows 的 `WM_CHAR` 抑制、macOS 的 `suppress_text`、Linux xkb 回退通路）是后续
+/// WP 的工作；在此之前应用实现自绘文本框时可以直接用它把 [`ImeEvent::Commit`] 与
+/// [`InputEvent::Text`] 去重。
+#[derive(Debug, Default)]
+pub struct ImeCommitDedup {
+    /// 当前待抑制的提交令牌。
+    token: Option<ImeCommitToken>,
+    /// 该次提交的 UTF-16 码元序列。
+    pending: Vec<u16>,
+    /// 已抑制的码元数。
+    consumed: usize,
+}
+
+impl ImeCommitDedup {
+    /// 记录一次 IME 提交：令牌 + 需要抑制的文本。
+    pub fn begin(&mut self, token: ImeCommitToken, text: &str) {
+        self.pending.clear();
+        self.pending.extend(text.encode_utf16());
+        self.consumed = 0;
+        self.token = (!self.pending.is_empty()).then_some(token);
+    }
+
+    /// 当前待抑制的令牌（`None` = 没有待抑制的提交）。
+    #[must_use]
+    pub fn token(&self) -> Option<ImeCommitToken> {
+        self.token
+    }
+
+    /// 这条原生字符消息（一个 UTF-16 码元 + 它携带的令牌）是否应当被**抑制**（= 已被 IME
+    /// 提交覆盖）。
+    ///
+    /// 序列耗尽或码元不匹配时都会清掉令牌：之后的消息不再被吞。
+    pub fn should_suppress(&mut self, token: Option<ImeCommitToken>, unit: u16) -> bool {
+        let Some(expected) = self.token else {
+            return false;
+        };
+        if token != Some(expected) || self.pending.get(self.consumed) != Some(&unit) {
+            self.end();
+            return false;
+        }
+        self.consumed += 1;
+        if self.consumed >= self.pending.len() {
+            self.end();
+        }
+        true
+    }
+
+    /// 作废当前令牌（下一次按键 / 组合开始 / 超时）。
+    pub fn end(&mut self) {
+        self.token = None;
+        self.pending.clear();
+        self.consumed = 0;
     }
 }
 
@@ -265,6 +1052,21 @@ pub enum Event {
         /// 新的逻辑尺寸。
         size: Size,
     },
+    /// 节点级悬停迁移（**引擎派生**，R02-4；对应 W3C `pointerover`/`pointerout` 的节点级语义
+    /// 与 CSS `:hover` 的传播方式）。
+    ///
+    /// 指针的悬停节点从旧链变成新链时产生一条：`left` 是离开链的部分（由内到外），
+    /// `entered` 是进入链的部分（由外到内）。祖先节点因此也能收到自己的 enter/leave ——
+    /// 「子节点悬停时父容器也高亮」不需要应用自己走祖先链。同一批变化的节点由引擎标
+    /// `PAINT` 并请求一帧，应用只需在自己的 `bind_style` 里读 [`crate::app::App::hovered`]。
+    HoverChanged {
+        /// 指针当前悬停的节点（`None` = 空白处 / 窗口外）。
+        hovered: Option<NodeId>,
+        /// 离开悬停链的节点（由内到外）。
+        left: Vec<NodeId>,
+        /// 进入悬停链的节点（由外到内）。
+        entered: Vec<NodeId>,
+    },
     /// 窗口被要求关闭（平台已处理，事件只作通知）。
     CloseRequested,
 }
@@ -296,10 +1098,18 @@ impl Action {
 /// 动作来源（把「怎么触发的」从 [`Action`] 里剥出来）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ActionSource {
-    /// 指针点击，或焦点节点的 Enter/Space 激活：连击计数（1 = 单击）。
+    /// 指针点击（**只有主键**），或焦点节点的 Enter/Space 激活：连击计数（1 = 单击）。
     Click {
         /// 连击计数（1 起；双击 = 2）。
         click_count: u8,
+        /// 产生这次点击的按键（键盘激活恒为 [`PointerButton::Primary`]）。
+        ///
+        /// 次键（右键/中键）**不**产生 `Click`：Win32 只有 `WM_LBUTTONUP` 对应按钮的
+        /// `BN_CLICKED`、AppKit 的 target/action 只挂左键、Qt 的
+        /// `QAbstractButton::mouseReleaseEvent` 显式 `if (e->button() != Qt::LeftButton) return`、
+        /// Blink 的 `click` 也只由主键产生。携带 button 是为了让应用能区分「键盘激活」与
+        /// 「指针点击」（`source()` 是 `Copy`，可安全比较）。
+        button: PointerButton,
     },
     /// 键盘绑定命中。
     Key,
@@ -317,8 +1127,8 @@ pub enum ActionSource {
 /// 一条键盘绑定（全应用一份表；快捷键是应用级语义）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyBinding {
-    /// 物理键（`Key::Other(vk)` 覆盖字母/数字：字符输入走 [`InputEvent::Text`]）。
-    pub key: Key,
+    /// 物理键（[`KeyCode`]：布局无关，三平台同一张表；字符输入走 [`InputEvent::Text`]）。
+    pub key: KeyCode,
     /// **精确**修饰键集合（`Ctrl+S` 不匹配 `Ctrl+Shift+S`；未按的修饰键必须为空）。
     pub modifiers: Modifiers,
     /// 命中的动作。
@@ -352,11 +1162,13 @@ mod tests {
     use std::{
         collections::hash_map::DefaultHasher,
         hash::{Hash, Hasher},
+        time::{Duration, Instant},
     };
 
     use super::{
-        Action, ActionSource, InputEvent, InputOutcome, Key, KeyBinding, KeyState, Modifiers,
-        PointerButton,
+        Action, ActionSource, ImeCommitDedup, ImeCommitToken, InputEvent, InputOutcome, Key,
+        KeyBinding, KeyCode, KeyState, Modifiers, PointerButton, ScrollPhase, ScrollUnit,
+        timestamp_from_ticks,
     };
     use crate::math::Point;
 
@@ -372,6 +1184,7 @@ mod tests {
             position: Point::new(12.5, 8.0),
             button: PointerButton::Primary,
             modifiers: Modifiers::SHIFT,
+            timestamp: Instant::now(),
         };
 
         assert_eq!(event.position(), Some(Point::new(12.5, 8.0)));
@@ -380,26 +1193,76 @@ mod tests {
 
     #[test]
     fn non_pointer_events_have_no_position() {
-        let event = InputEvent::Key {
-            key: Key::Escape,
-            state: KeyState::Down,
-            modifiers: Modifiers::SHIFT | Modifiers::CONTROL,
-        };
+        let event = InputEvent::key_down(KeyCode::Escape, Modifiers::SHIFT | Modifiers::CONTROL);
 
         assert_eq!(event.position(), None);
-        assert!(event_modifiers_include_control(&event));
+        assert!(matches!(
+            event,
+            InputEvent::Key {
+                modifiers: ref value,
+                ..
+            } if value.contains(Modifiers::CONTROL)
+        ));
     }
 
-    fn event_modifiers_include_control(event: &InputEvent) -> bool {
-        match event {
-            InputEvent::Key { modifiers, .. } => modifiers.contains(Modifiers::CONTROL),
-            _ => false,
+    #[test]
+    fn pointer_leave_keeps_the_leave_point() {
+        let event = InputEvent::PointerLeave {
+            position: Point::new(3.0, 4.0),
+            modifiers: Modifiers::empty(),
+            timestamp: Instant::now(),
+        };
+
+        assert_eq!(event.position(), Some(Point::new(3.0, 4.0)));
+    }
+
+    #[test]
+    fn every_event_carries_a_timestamp() {
+        let stamp = Instant::now();
+        let events = [
+            InputEvent::PointerMove {
+                position: Point::ZERO,
+                modifiers: Modifiers::empty(),
+                timestamp: stamp,
+            },
+            InputEvent::PointerCancel { timestamp: stamp },
+            InputEvent::Key {
+                code: KeyCode::KeyA,
+                state: KeyState::Up,
+                repeat: false,
+                modifiers: Modifiers::empty(),
+                timestamp: stamp,
+            },
+            InputEvent::Text {
+                text: "a".into(),
+                timestamp: stamp,
+            },
+            InputEvent::Scroll {
+                position: Point::ZERO,
+                delta: Point::new(0.0, 1.0),
+                unit: ScrollUnit::Line,
+                phase: ScrollPhase::Discrete,
+                lines_per_tick: 3.0,
+                modifiers: Modifiers::empty(),
+                timestamp: stamp,
+            },
+        ];
+
+        for event in &events {
+            assert_eq!(event.timestamp(), stamp, "每个变体都必须带事件时刻");
         }
     }
 
     #[test]
-    fn pointer_leave_is_positionless() {
-        assert_eq!(InputEvent::PointerLeave.position(), None);
+    fn platform_ticks_are_mapped_onto_the_engine_clock() {
+        let now = Instant::now();
+        // 事件 20 ms 之前发生。
+        let stamp = timestamp_from_ticks(now, 5_000, 4_980);
+        assert_eq!(stamp, now - Duration::from_millis(20));
+        // 同一时刻。
+        assert_eq!(timestamp_from_ticks(now, 5_000, 5_000), now);
+        // tick 倒退（时钟源不同步 / 回绕）：饱和到 `now`，绝不 panic。
+        assert_eq!(timestamp_from_ticks(now, 5_000, 9_000), now);
     }
 
     #[test]
@@ -419,14 +1282,13 @@ mod tests {
     #[test]
     fn key_binding_modifiers_are_exact() {
         let binding = KeyBinding {
-            key: Key::Other(0x53),
+            key: KeyCode::KeyS,
             modifiers: Modifiers::CONTROL,
             action: Action::custom("save"),
         };
 
-        let matches = |modifiers: Modifiers| {
-            binding.key == Key::Other(0x53) && binding.modifiers == modifiers
-        };
+        let matches =
+            |modifiers: Modifiers| binding.key == KeyCode::KeyS && binding.modifiers == modifiers;
 
         assert!(matches(Modifiers::CONTROL));
         assert!(!matches(Modifiers::CONTROL | Modifiers::SHIFT), "精确匹配");
@@ -434,15 +1296,32 @@ mod tests {
     }
 
     #[test]
-    fn key_binding_distinguishes_other_vk() {
+    fn key_bindings_use_layout_independent_identities() {
         let binding = KeyBinding {
-            key: Key::Other(0x41),
+            key: KeyCode::KeyA,
             modifiers: Modifiers::empty(),
             action: Action::custom("a"),
         };
 
-        assert_eq!(binding.key, Key::Other(0x41));
-        assert_ne!(binding.key, Key::Other(0x42));
+        assert_eq!(binding.key, KeyCode::KeyA);
+        assert_ne!(binding.key, KeyCode::KeyB);
+        // R02-1：绑定表的键是布局无关的 `KeyCode`，不是平台私有码。
+        assert_ne!(binding.key, KeyCode::Unidentified(0x41));
+    }
+
+    #[test]
+    fn logical_keys_project_from_physical_codes() {
+        assert_eq!(Key::from_code(KeyCode::Enter), Some(Key::Enter));
+        assert_eq!(Key::from_code(KeyCode::NumpadEnter), Some(Key::Enter));
+        assert_eq!(Key::from_code(KeyCode::ArrowUp), Some(Key::ArrowUp));
+        assert_eq!(Key::from_code(KeyCode::F12), Some(Key::Function(12)));
+        assert_eq!(Key::from_code(KeyCode::ShiftLeft), Some(Key::Shift));
+        assert_eq!(Key::from_code(KeyCode::ControlRight), Some(Key::Control));
+        assert!(Key::from_code(KeyCode::ShiftLeft).is_some_and(Key::is_modifier));
+        assert!(!Key::from_code(KeyCode::Enter).is_some_and(Key::is_modifier));
+        // 字符键没有命名逻辑身份：字符输入走 `InputEvent::Text`。
+        assert_eq!(Key::from_code(KeyCode::KeyS), None);
+        assert_eq!(Key::from_code(KeyCode::Digit1), None);
     }
 
     #[test]
@@ -457,21 +1336,139 @@ mod tests {
 
     #[test]
     fn pointer_events_carry_modifiers() {
-        let event = InputEvent::PointerDown {
-            position: Point::new(1.0, 2.0),
-            button: PointerButton::Secondary,
-            modifiers: Modifiers::CONTROL | Modifiers::ALT,
-        };
+        let event = InputEvent::pointer_down(
+            Point::new(1.0, 2.0),
+            PointerButton::Secondary,
+            Modifiers::CONTROL | Modifiers::ALT,
+        );
 
         assert_eq!(event.modifiers(), Modifiers::CONTROL | Modifiers::ALT);
         assert_eq!(event.position(), Some(Point::new(1.0, 2.0)));
     }
 
     #[test]
-    fn click_source_carries_the_count() {
-        let source = ActionSource::Click { click_count: 2 };
+    fn click_source_carries_the_count_and_the_button() {
+        let source = ActionSource::Click {
+            click_count: 2,
+            button: PointerButton::Primary,
+        };
 
-        assert_eq!(source, ActionSource::Click { click_count: 2 });
+        assert_eq!(
+            source,
+            ActionSource::Click {
+                click_count: 2,
+                button: PointerButton::Primary
+            }
+        );
+        assert_ne!(
+            source,
+            ActionSource::Click {
+                click_count: 2,
+                button: PointerButton::Secondary
+            }
+        );
         assert_ne!(source, ActionSource::Key);
+        // 只有主键是「click」语义。
+        assert!(PointerButton::Primary.is_primary());
+        assert!(!PointerButton::Secondary.is_primary());
+        assert!(!PointerButton::Middle.is_primary());
+    }
+
+    #[test]
+    fn scroll_phases_distinguish_discrete_from_continuous() {
+        assert!(!ScrollPhase::Discrete.is_continuous());
+        for phase in [
+            ScrollPhase::Begin,
+            ScrollPhase::Update,
+            ScrollPhase::End,
+            ScrollPhase::Momentum,
+            ScrollPhase::Cancel,
+        ] {
+            assert!(phase.is_continuous(), "{phase:?} 是连续设备阶段");
+        }
+    }
+
+    #[test]
+    fn scroll_events_carry_two_dimensional_deltas() {
+        let event = InputEvent::scroll_lines(
+            Point::new(5.0, 5.0),
+            Point::new(-1.0, 2.0),
+            Modifiers::empty(),
+        );
+
+        let InputEvent::Scroll {
+            delta,
+            unit,
+            phase,
+            lines_per_tick,
+            ..
+        } = event
+        else {
+            panic!("必须是滚动事件");
+        };
+        assert_eq!(delta, Point::new(-1.0, 2.0));
+        assert_eq!(unit, ScrollUnit::Line);
+        assert_eq!(phase, ScrollPhase::Discrete);
+        assert_eq!(lines_per_tick, 1.0);
+    }
+
+    #[test]
+    fn ime_commit_tokens_are_monotonic_and_never_zero() {
+        let mut token = ImeCommitToken::first();
+        assert_eq!(token.get(), 1);
+        token = token.next();
+        assert_eq!(token.get(), 2);
+        // 回绕时跳过 0（0 保留为「没有令牌」）。
+        let wrapped = ImeCommitToken::next(ImeCommitToken::from_test(u64::MAX));
+        assert_eq!(wrapped.get(), 1);
+    }
+
+    /// R02-13：提交去重按**事件级令牌 + UTF-16 码元前缀**判定。
+    ///
+    /// 回归点：`"🌍a"` 是 2 个码点但 **3 个 UTF-16 码元**，旧实现按 `chars().count()` 计数，
+    /// 于是 emoji 提交后第 3 条 `WM_CHAR`（`a`）无人抑制、被插入第二次。
+    #[test]
+    fn commit_dedup_matches_utf16_units_not_code_points() {
+        let token = ImeCommitToken::first();
+        let mut dedup = ImeCommitDedup::default();
+        dedup.begin(token, "🌍a");
+        assert_eq!(dedup.token(), Some(token));
+
+        // 🌍 = D83C DF0D，'a' = 0x61：三条码元全部被抑制。
+        for unit in [0xD83C, 0xDF0D, 0x61] {
+            assert!(
+                dedup.should_suppress(Some(token), unit),
+                "code unit {unit:#06x} 属于本次提交，必须抑制"
+            );
+        }
+        assert_eq!(dedup.token(), None, "序列耗尽后令牌作废");
+        assert!(
+            !dedup.should_suppress(Some(token), 0x62),
+            "之后的真实输入不得被吞"
+        );
+    }
+
+    #[test]
+    fn commit_dedup_ignores_other_tokens_and_mismatches() {
+        let token = ImeCommitToken::first();
+        let mut dedup = ImeCommitDedup::default();
+        dedup.begin(token, "ni");
+        // 令牌不同 ⇒ 不是这次提交的重复消息。
+        assert!(!dedup.should_suppress(Some(token.next()), 0x6E));
+        // 不匹配会作废令牌，之后的码元不再被吞。
+        assert!(!dedup.should_suppress(Some(token), 0x6E + 1));
+        assert!(!dedup.should_suppress(Some(token), 0x6E));
+        assert_eq!(dedup.token(), None);
+        // 没有待抑制的提交时永远不抑制。
+        assert!(!dedup.should_suppress(None, 0x61));
+    }
+
+    #[test]
+    fn an_empty_commit_suppresses_nothing() {
+        let token = ImeCommitToken::first();
+        let mut dedup = ImeCommitDedup::default();
+        dedup.begin(token, "");
+        assert_eq!(dedup.token(), None);
+        assert!(!dedup.should_suppress(Some(token), 0x61));
     }
 }

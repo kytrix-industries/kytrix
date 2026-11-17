@@ -6,10 +6,10 @@ use std::sync::Arc;
 use crate::{
     app::App,
     error::EngineError,
-    event::{Event, InputEvent},
+    event::{Event, InputEvent, ScrollPhase, ScrollUnit, timestamp_from_ticks},
     platform::{
         dispatcher::Dispatcher,
-        event::{PlatformEvent, PointerKind},
+        event::{PlatformEvent, PointerKind, StampedEvent},
         windows::{composition, dpi, window::NativeWindow},
     },
     render::backend::Renderer,
@@ -77,16 +77,22 @@ pub(super) fn sync_native_windows(
 
 /// 消费者：`pump_loop` 的 ② 步骤。
 /// 把 `WndProc` 收集的事件应用到 `App`（几何/DPI 先落地，再投递事件）。
+///
+/// 时间戳换算的基准（`Instant::now()` + `QueryPerformanceCounter`）每批取**一次**：R02-14 要的
+/// 是「事件之间的相对时刻」，同一批共用一个基准既省两次系统调用，也避免同批事件的时间戳互相
+/// 跳变。
 pub(super) fn collect_events(
     app: &mut App,
     windows: &mut [NativeWindow],
     dispatcher: &Arc<Dispatcher>,
 ) -> Result<(), EngineError> {
+    let now = std::time::Instant::now();
+    let now_ticks = super::pump::monotonic_millis();
     for native in windows.iter_mut() {
         let id = native.id();
         let events = native.state_mut().take_events();
-        for event in events {
-            apply_event(app, native, dispatcher, id, event)?;
+        for stamped in events {
+            apply_event(app, native, dispatcher, id, stamped, now, now_ticks)?;
         }
     }
     Ok(())
@@ -98,53 +104,86 @@ pub(super) fn apply_event(
     native: &mut NativeWindow,
     dispatcher: &Arc<Dispatcher>,
     id: WindowId,
-    event: PlatformEvent,
+    stamped: StampedEvent,
+    now: std::time::Instant,
+    now_ticks: u64,
 ) -> Result<(), EngineError> {
     let scale = native.scale();
     let to_logical = |x: i32, y: i32| {
         crate::math::Point::new(scale.to_logical(x as f32), scale.to_logical(y as f32))
     };
     let modifiers = native.state_mut().modifiers();
-    let app_event = match event {
+    // R02-14：事件时刻 = 消息时刻（`MSG.time`），而不是分发时刻。
+    let timestamp = timestamp_from_ticks(now, now_ticks, stamped.ticks_ms);
+    let app_event = match stamped.event {
         PlatformEvent::Pointer { x, y, kind } => {
             let position = to_logical(x, y);
             let input = match kind {
                 PointerKind::Move => InputEvent::PointerMove {
                     position,
                     modifiers,
+                    timestamp,
                 },
                 PointerKind::Down(button) => InputEvent::PointerDown {
                     position,
                     button,
                     modifiers,
+                    timestamp,
                 },
                 PointerKind::Up(button) => InputEvent::PointerUp {
                     position,
                     button,
                     modifiers,
+                    timestamp,
                 },
             };
             Event::Input(input)
         }
+        PlatformEvent::PointerEnter => {
+            let (x, y) = native.state_mut().client_pos();
+            Event::Input(InputEvent::PointerEnter {
+                position: to_logical(x, y),
+                modifiers,
+                timestamp,
+            })
+        }
         PlatformEvent::Scroll {
             x,
             y,
-            dx_ticks,
-            dy_ticks,
+            dx_lines,
+            dy_lines,
+            lines_per_tick,
         } => Event::Input(InputEvent::Scroll {
             position: to_logical(x, y),
-            delta_x: dx_ticks,
-            delta_y: dy_ticks,
+            delta: crate::math::Point::new(dx_lines, dy_lines),
+            // Windows 的 `WM_MOUSEWHEEL` 只有离散格，没有阶段/精确模式（R02-10）。
+            unit: ScrollUnit::Line,
+            phase: ScrollPhase::Discrete,
+            lines_per_tick,
             modifiers,
+            timestamp,
         }),
-        PlatformEvent::PointerLeave => Event::Input(InputEvent::PointerLeave),
-        PlatformEvent::PointerCancel => Event::Input(InputEvent::PointerCancel),
-        PlatformEvent::Key { key, state } => Event::Input(InputEvent::Key {
-            key,
+        PlatformEvent::PointerLeave => {
+            let (x, y) = native.state_mut().client_pos();
+            Event::Input(InputEvent::PointerLeave {
+                position: to_logical(x, y),
+                modifiers,
+                timestamp,
+            })
+        }
+        PlatformEvent::PointerCancel => Event::Input(InputEvent::PointerCancel { timestamp }),
+        PlatformEvent::Key {
+            code,
             state,
+            repeat,
+        } => Event::Input(InputEvent::Key {
+            code,
+            state,
+            repeat,
             modifiers: native.state_mut().modifiers(),
+            timestamp,
         }),
-        PlatformEvent::Text(text) => Event::Input(InputEvent::Text { text }),
+        PlatformEvent::Text(text) => Event::Input(InputEvent::Text { text, timestamp }),
         PlatformEvent::Ime(ime) => Event::Ime(ime),
         PlatformEvent::Resize { width, height } => {
             // 最小化时 `WM_SIZE` 是 0×0：**保留上一次真实逻辑尺寸**，不写 `set_size` /

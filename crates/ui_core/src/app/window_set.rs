@@ -11,7 +11,18 @@ use crate::{
 };
 
 /// 消费者：`App::remove_node`。
+///
+/// 删除浮层时顺带处理**焦点恢复**（R02-12）：`App::close_overlay`、`Dismiss` 动作与
+/// 「点击外部关闭」三条路径都经过这里，把恢复集中在此才不会漏掉其中一条。
 pub(crate) fn remove_node(app: &mut App, window: WindowId, node: NodeId) -> bool {
+    // 先取浮层的 opener（删除之后槽随节点一起消失）。
+    let opener = app.windows.get(&window).and_then(|target| {
+        target
+            .tree()
+            .overlay_slot(node)
+            .filter(|slot| slot.restore_focus)
+            .and_then(|slot| slot.opener)
+    });
     let Some(target) = app.windows.get_mut(&window) else {
         return false;
     };
@@ -31,6 +42,7 @@ pub(crate) fn remove_node(app: &mut App, window: WindowId, node: NodeId) -> bool
     };
     if removed {
         app.request_frame();
+        super::focus::restore_focus(app, window, opener);
     }
     removed
 }
@@ -169,7 +181,7 @@ pub(crate) fn request_window_control(
         // 会话，避免下一次移动被误当成标题栏/边框拖拽。
         target.pointer_mut().end_drag();
         target.pointer_mut().press = None;
-        app.capture_request = Some((window, false));
+        app.capture_requests.insert(window, false);
     }
     app.window_control = Some((window, control));
     Ok(())

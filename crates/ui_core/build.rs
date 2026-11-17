@@ -50,12 +50,11 @@ const FRAME_FIELDS: [&str; 2] = ["viewport", "params"];
 const DRAW_FIELDS: [&str; 5] = ["basis", "translation", "color0", "clip_rect", "clip"];
 
 /// 与 `paint/instance.rs` 的 `const NAME: f32` 逐一比对的常量（去掉 `KYTRIX_` 前缀）。
-const CONSTANTS: [&str; 11] = [
+const CONSTANTS: [&str; 10] = [
     "KIND_QUAD",
     "KIND_GLYPH",
     "KIND_IMAGE",
     "KIND_SHADOW",
-    "FLAG_OPAQUE",
     "TEXTURE_GLYPH",
     "TEXTURE_IMAGE",
     "GRADIENT_NONE",
@@ -308,6 +307,323 @@ fn validate(manifest: &Path, shader_dir: &Path) {
                 "实例基址",
                 "读取 `draw.clip.y` 作为 instance_base",
                 "找不到",
+            );
+        }
+    }
+
+    // 8) 数学函数体跨语言等价（R06-5 a）：归一化后逐语句比对，首个差异带文件与行号。
+    validate_math_equivalence(shader_dir);
+
+    // 9) 渲染状态 / 色彩空间的文本锚点（R06-5 c / R06-10）。
+    validate_render_state(manifest);
+}
+
+/// 三套 shader 的数学函数体必须逐语句等价（只允许语言拼写差异）。
+fn validate_math_equivalence(shader_dir: &Path) {
+    let load = |files: &[&str]| {
+        files
+            .iter()
+            .map(|file| ((*file).to_owned(), read(&shader_dir.join(file))))
+            .collect::<Vec<_>>()
+    };
+    let hlsl = ShaderSource::new(
+        Language::Hlsl,
+        load(&["common.hlsl", "geometry.hlsl", "quad.hlsl"]),
+    );
+    let metal = ShaderSource::new(
+        Language::Metal,
+        load(&["common.metal", "geometry.metal", "quad.metal"]),
+    );
+    let glsl = ShaderSource::new(
+        Language::Glsl,
+        load(&[
+            "common.glsl",
+            "common.frag.glsl",
+            "geometry.ui.vert.glsl",
+            "geometry.ui.frag.glsl",
+            "geometry.textured.vert.glsl",
+            "geometry.textured_image.frag.glsl",
+            "geometry.textured_glyph.frag.glsl",
+            "quad.vert.glsl",
+            "quad.frag.glsl",
+        ]),
+    );
+    if let Err(mismatch) = compare_math_functions(&hlsl, &[&metal, &glsl]) {
+        panic!(
+            "\nui_core: 三套 shader 的数学函数体不一致（R06-5）{mismatch}\n  \
+             修复: 三份源码必须逐语句等价（只允许语言拼写差异：类型名 / lerp↔mix / root. 前缀）\n  \
+             契约: src/render/shaders/contract.md §4\n"
+        );
+    }
+}
+
+/// 渲染状态与呈现色彩空间的锚点：三端源码必须同时出现同一组取值。
+///
+/// 文本锚点而不是"读结构体值"：D3D12 / Metal / Vulkan 的状态枚举类型互不兼容，抽成共享常量
+/// 会强迫三端共享一个抽象层（`render::state`），而真正要守的是「三端语义相同」这一条。
+/// 锚点缺失即构建失败，因此任何一端被改成别的因子/格式都会立刻暴露（R06-5 c）。
+const RENDER_STATE_ANCHORS: &[(&str, &str, &str)] = &[
+    // ── Windows / D3D12 ──
+    (
+        "src/render/windows/pipeline.rs",
+        "blend enable",
+        "BlendEnable: true.into()",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "blend src",
+        "SrcBlend: D3D12_BLEND_ONE",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "blend dst",
+        "DestBlend: D3D12_BLEND_INV_SRC_ALPHA",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "blend op",
+        "BlendOp: D3D12_BLEND_OP_ADD",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "alpha src",
+        "SrcBlendAlpha: D3D12_BLEND_ONE",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "alpha dst",
+        "DestBlendAlpha: D3D12_BLEND_INV_SRC_ALPHA",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "alpha op",
+        "BlendOpAlpha: D3D12_BLEND_OP_ADD",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "颜色写掩码",
+        "RenderTargetWriteMask: 0x0F",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "cull",
+        "CullMode: D3D12_CULL_MODE_NONE",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "fill",
+        "FillMode: D3D12_FILL_MODE_SOLID",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "quad 拓扑",
+        "D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "RT 格式（sRGB）",
+        "rtv_formats[0] = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "MSAA",
+        "SampleDesc: DXGI_SAMPLE_DESC {",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "geometry Ui 覆盖率属性",
+        "DXGI_FORMAT_R32_FLOAT, 0, 8",
+    ),
+    (
+        "src/render/windows/swapchain.rs",
+        "呈现面字节格式",
+        "Format: DXGI_FORMAT_B8G8R8A8_UNORM",
+    ),
+    (
+        "src/render/windows/swapchain.rs",
+        "呈现色彩空间（R06-10）",
+        "SetColorSpace1",
+    ),
+    // ── macOS / Metal ──
+    (
+        "src/render/macos/pipeline.rs",
+        "blend enable",
+        "attachment.setBlendingEnabled(true)",
+    ),
+    (
+        "src/render/macos/pipeline.rs",
+        "blend src",
+        "setSourceRGBBlendFactor(MTLBlendFactor::One)",
+    ),
+    (
+        "src/render/macos/pipeline.rs",
+        "blend dst",
+        "setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha)",
+    ),
+    (
+        "src/render/macos/pipeline.rs",
+        "blend op",
+        "setRgbBlendOperation(MTLBlendOperation::Add)",
+    ),
+    (
+        "src/render/macos/pipeline.rs",
+        "alpha src",
+        "setSourceAlphaBlendFactor(MTLBlendFactor::One)",
+    ),
+    (
+        "src/render/macos/pipeline.rs",
+        "alpha dst",
+        "setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha)",
+    ),
+    (
+        "src/render/macos/pipeline.rs",
+        "alpha op",
+        "setAlphaBlendOperation(MTLBlendOperation::Add)",
+    ),
+    (
+        "src/render/macos/pipeline.rs",
+        "颜色写掩码",
+        "setWriteMask(MTLColorWriteMask::All)",
+    ),
+    (
+        "src/render/macos/pipeline.rs",
+        "geometry Ui 顶点布局（12 B）",
+        "Some(12)",
+    ),
+    (
+        "src/render/macos/swapchain.rs",
+        "呈现面格式（sRGB）",
+        "MTLPixelFormat::BGRA8Unorm_sRGB",
+    ),
+    (
+        "src/render/macos/swapchain.rs",
+        "呈现色彩空间（R06-10）",
+        "kCGColorSpaceSRGB",
+    ),
+    // ── Linux / Vulkan ──
+    (
+        "src/render/linux/pipeline.rs",
+        "blend enable",
+        ".blend_enable(true)",
+    ),
+    (
+        "src/render/linux/pipeline.rs",
+        "blend src",
+        ".src_color_blend_factor(vk::BlendFactor::ONE)",
+    ),
+    (
+        "src/render/linux/pipeline.rs",
+        "blend dst",
+        ".dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)",
+    ),
+    (
+        "src/render/linux/pipeline.rs",
+        "blend op",
+        ".color_blend_op(vk::BlendOp::ADD)",
+    ),
+    (
+        "src/render/linux/pipeline.rs",
+        "alpha src",
+        ".src_alpha_blend_factor(vk::BlendFactor::ONE)",
+    ),
+    (
+        "src/render/linux/pipeline.rs",
+        "alpha dst",
+        ".dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)",
+    ),
+    (
+        "src/render/linux/pipeline.rs",
+        "alpha op",
+        ".alpha_blend_op(vk::BlendOp::ADD)",
+    ),
+    (
+        "src/render/linux/pipeline.rs",
+        "颜色写掩码",
+        ".color_write_mask(vk::ColorComponentFlags::RGBA)",
+    ),
+    (
+        "src/render/linux/pipeline.rs",
+        "cull",
+        ".cull_mode(vk::CullModeFlags::NONE)",
+    ),
+    (
+        "src/render/linux/pipeline.rs",
+        "fill",
+        ".polygon_mode(vk::PolygonMode::FILL)",
+    ),
+    (
+        "src/render/linux/pipeline.rs",
+        "quad 拓扑",
+        ".topology(vk::PrimitiveTopology::TRIANGLE_STRIP)",
+    ),
+    (
+        "src/render/linux/pipeline.rs",
+        "RT 格式（sRGB）",
+        "vk::Format::B8G8R8A8_SRGB",
+    ),
+    (
+        "src/render/linux/pipeline.rs",
+        "MSAA",
+        ".samples(vk::SampleCountFlags::TYPE_1)",
+    ),
+    (
+        "src/render/linux/pipeline.rs",
+        "geometry Ui 覆盖率属性",
+        "12 => vec![position, coverage]",
+    ),
+    (
+        "src/render/linux/swapchain.rs",
+        "呈现色彩空间（R06-10）",
+        "SRGB_NONLINEAR",
+    ),
+    // ── 共享层：色彩空间的唯一决定点 ──
+    (
+        "src/render/colorspace.rs",
+        "唯一呈现色彩空间声明",
+        "PRESENTED_COLOR_SPACE: PresentedColorSpace = PresentedColorSpace::SrgbRec709",
+    ),
+];
+
+/// 不得出现的东西：某端偷偷加 cull / 换 fill 模式会让三端像素分叉。
+const RENDER_STATE_FORBIDDEN: &[(&str, &str, &str)] = &[
+    (
+        "src/render/macos/pipeline.rs",
+        "cull（Metal 默认 none，不得显式设置）",
+        "setCullMode",
+    ),
+    (
+        "src/render/macos/pipeline.rs",
+        "fill 模式（Metal 默认 fill）",
+        "setTriangleFillMode",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "cull 回退",
+        "D3D12_CULL_MODE_BACK",
+    ),
+    (
+        "src/render/linux/pipeline.rs",
+        "cull 回退",
+        "vk::CullModeFlags::BACK",
+    ),
+];
+
+fn validate_render_state(manifest: &Path) {
+    for (file, what, expected) in RENDER_STATE_ANCHORS {
+        let contents = read(&manifest.join(file));
+        if let Err(detail) = check_anchors(file, &contents, &[(what, expected)]) {
+            panic!(
+                "\nui_core: 渲染状态漂移（R06-5）\n  {detail}\n  \
+                 修复: 三端渲染状态必须语义一致（contract.md §7）；改一处必须三端同步\n"
+            );
+        }
+    }
+    for (file, what, token) in RENDER_STATE_FORBIDDEN {
+        let contents = read(&manifest.join(file));
+        if let Err(detail) = check_forbidden(file, &contents, &[(what, token)]) {
+            panic!(
+                "\nui_core: 渲染状态漂移（R06-5）\n  {detail}\n  \
+                 修复: 三端渲染状态必须语义一致（contract.md §7）\n"
             );
         }
     }
@@ -691,3 +1007,11 @@ fn fail(file: &str, item: &str, expected: &str, actual: &str) -> ! {
         "\nui_core: 着色器契约漂移\n  文件:   {file}\n  对象:   {item}\n  期望:   {expected}\n  实际:   {actual}\n  修复:   同时改 Rust 与三套源码，并跑像素快照回归（src/render/shaders/contract.md）\n"
     )
 }
+
+// 三套 shader 的构建期契约校验（归一化函数体比对 / 渲染状态锚点）的唯一实现：
+// 与 lib 测试共用同一份源码（`src/render/shader_contract.rs`），`#[cfg(test)]` 的测试
+// 在 build script 里不参与编译。只用 std，不得依赖 crate 内符号。
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/render/shader_contract.rs"
+));

@@ -14,9 +14,9 @@
 use std::{io::Cursor, sync::OnceLock};
 
 use image::{
-    DynamicImage, ImageDecoder, ImageError, ImageFormat, ImageReader, imageops::FilterType,
+    DynamicImage, ImageError, ImageFormat, ImageReader, error::LimitErrorKind, imageops::FilterType,
 };
-use smol_str::SmolStr;
+use smol_str::{SmolStr, format_smolstr};
 
 use crate::resources::DecodeCause;
 
@@ -25,6 +25,26 @@ pub(crate) const MAX_TILE_DIM: u32 = 2046;
 
 /// 源图单边上限。再大属解压炸弹/资产错误，应用层应预缩放。
 pub(crate) const MAX_SOURCE_DIM: u32 = 8192;
+
+/// 源图像素上限（R12-15：判据从「单边 8192」改成像素数）。
+///
+/// 16 M px ≈ 64 MiB RGBA8 / 128 MiB RGBA16 的峰值，一张 4096×4096 的图正好卡满；
+/// 单边判据（[`MAX_SOURCE_DIM`]）只作为解码器 `Limits` 的纵深防御保留。
+pub(crate) const MAX_SOURCE_PIXELS: u64 = 4096 * 4096;
+
+/// 输入字节上限（`insert` / `insert_async` 的**轻量**校验：UI 线程不做格式嗅探，但不会为
+/// 荒谬大的缓冲投递解码任务）。
+///
+/// 取 [`MAX_SOURCE_PIXELS`] 的 RGBA8 解码尺寸（16 M px × 4 B = 64 MiB）：任何能通过像素判据的
+/// 合法 PNG / JPEG / WebP 压缩字节都不会超过它，因此这条上限只拦「明显不是图片 / 解压炸弹」的输入。
+pub(crate) const MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
+
+/// 解码器的瞬时分配上限（`image::Limits::max_alloc`）。
+///
+/// `image` 的默认值是 512 MiB：一张 8192×8192 的 RGBA16 PNG 正好卡在那里，会以
+/// `Corrupt`（而非「内存不足」）失败。256 MiB 让 [`MAX_SOURCE_PIXELS`] 之内的正常图都放得下，
+/// 命中时映射成 [`DecodeCause::OutOfMemory`]。
+pub(crate) const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
 
 /// 解码结果：**预乘 sRGB 编码**的 BGRA8（行主序，行宽 `width * 4`）。
 pub(crate) struct DecodedImage {
@@ -38,32 +58,31 @@ pub(crate) struct DecodedImage {
 
 /// 字节 → BGRA8 预乘 sRGB。
 ///
+/// 两段式（R12-15）：先只读文件头拿尺寸（**不分配整图**），像素 / 单边超限在这里就报
+/// [`DecodeCause::TooLarge`]；再带显式 [`decode_limits`] 解码，`max_alloc` 命中映射成
+/// [`DecodeCause::OutOfMemory`]。
+///
 /// # Errors
-/// [`DecodeCause`]：格式不支持 / 字节损坏 / 源图过大（四类里除 `Capacity` 外都可能出现）。
+/// [`DecodeCause`]：格式不支持 / 字节损坏 / 源图过大 / 解码器内存不足
+/// （四类里除 `Capacity` 外都可能出现）。
 pub(crate) fn decode(bytes: &[u8]) -> Result<DecodedImage, DecodeCause> {
     let format = format_of(bytes)?;
     let tag = format_tag(format);
-    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
-    // 只保留默认的 `max_alloc`（512 MiB）防炸弹；尺寸上限由我们自己判，才能报出精确的 `width/height`。
-    reader.limits(image::Limits::default());
-    let decoder = reader
-        .into_decoder()
+    let (width, height) = ImageReader::with_format(Cursor::new(bytes), format)
+        .into_dimensions()
         .map_err(|error| classify(tag, error))?;
-    let (width, height) = decoder.dimensions();
     if width == 0 || height == 0 {
         return Err(DecodeCause::Corrupt {
             format: SmolStr::new_static(tag),
             detail: SmolStr::new_static("image has a zero dimension"),
         });
     }
-    if width > MAX_SOURCE_DIM || height > MAX_SOURCE_DIM {
-        return Err(DecodeCause::TooLarge {
-            width,
-            height,
-            limit: MAX_SOURCE_DIM,
-        });
-    }
-    let mut image = DynamicImage::from_decoder(decoder).map_err(|error| classify(tag, error))?;
+    check_source_size(width, height)?;
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
+    reader.limits(decode_limits());
+    // `ImageReader::decode` 会先把 `decoder.total_bytes()` 记进 `max_alloc` 再读像素，
+    // 因此「整图分配」本身也受 [`MAX_DECODE_ALLOC`] 约束（不只是解码器的中间缓冲）。
+    let mut image: DynamicImage = reader.decode().map_err(|error| classify(tag, error))?;
     if image.width() > MAX_TILE_DIM || image.height() > MAX_TILE_DIM {
         let (target_width, target_height) = fit_within(image.width(), image.height());
         image = image.resize_exact(target_width, target_height, FilterType::Triangle);
@@ -76,6 +95,45 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<DecodedImage, DecodeCause> {
         height,
         bgra: premultiply(rgba.as_raw()),
     })
+}
+
+/// 解码器的显式限制：`max_alloc` = [`MAX_DECODE_ALLOC`]，单边上限 = [`MAX_SOURCE_DIM`]（strict）。
+///
+/// 尺寸上限只是纵深防御（精确的 `width` / `height` 由 [`check_source_size`] 报出），
+/// 真正要拦住的是「合法单边但总分配爆掉」的输入。
+fn decode_limits() -> image::Limits {
+    // `image::Limits` 是 `#[non_exhaustive]`，不能用结构体字面量构造。
+    let mut limits = image::Limits::no_limits();
+    limits.max_image_width = Some(MAX_SOURCE_DIM);
+    limits.max_image_height = Some(MAX_SOURCE_DIM);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+    limits
+}
+
+/// 源图尺寸判据：像素数上限（主判据）+ 单边上限（纵深防御）。
+fn check_source_size(width: u32, height: u32) -> Result<(), DecodeCause> {
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > MAX_SOURCE_PIXELS || width > MAX_SOURCE_DIM || height > MAX_SOURCE_DIM {
+        return Err(DecodeCause::TooLarge {
+            width,
+            height,
+            pixels,
+            limit: MAX_SOURCE_PIXELS,
+            dim_limit: MAX_SOURCE_DIM,
+        });
+    }
+    Ok(())
+}
+
+/// 输入字节判据（`insert_async` 的轻量校验；UI 线程不做格式嗅探）。
+pub(crate) fn check_source_bytes(len: usize) -> Result<(), DecodeCause> {
+    if len > MAX_SOURCE_BYTES {
+        return Err(DecodeCause::SourceTooLarge {
+            bytes: len as u64,
+            limit: MAX_SOURCE_BYTES as u64,
+        });
+    }
+    Ok(())
 }
 
 /// 格式判定 + 策略：只放行 PNG / JPEG / WebP。
@@ -108,29 +166,35 @@ fn format_tag(format: ImageFormat) -> &'static str {
 /// `image` 的错误 → 强类型分类。穷尽 match：`image` 升级新增变体会编译失败（期望行为）。
 fn classify(format: &'static str, error: ImageError) -> DecodeCause {
     match error {
-        // 走到这里的 `Limits` 只可能是解码器内存上限（尺寸上限已被我们自己拦下）。
-        ImageError::Limits(inner) => DecodeCause::Corrupt {
-            format: SmolStr::new_static(format),
-            detail: SmolStr::new(format!("decoder limits exceeded: {inner}")),
+        // 走到这里的 `Limits` 是 `max_alloc` 或尺寸上限命中：前者是内存不足，后者是纵深防御
+        // （尺寸已由 `check_source_size` 判过，正常路径不该走到，仍如实分类成 `Corrupt`）。
+        ImageError::Limits(inner) => match inner.kind() {
+            LimitErrorKind::InsufficientMemory => DecodeCause::OutOfMemory {
+                limit_bytes: MAX_DECODE_ALLOC,
+            },
+            other => DecodeCause::Corrupt {
+                format: SmolStr::new_static(format),
+                detail: format_smolstr!("decoder limits rejected the image: {other:?}"),
+            },
         },
         ImageError::Unsupported(_) => DecodeCause::UnsupportedFormat {
             format: SmolStr::new_static(format),
         },
         ImageError::Decoding(inner) => DecodeCause::Corrupt {
             format: SmolStr::new_static(format),
-            detail: SmolStr::new(inner.to_string()),
+            detail: format_smolstr!("{inner}"),
         },
         ImageError::Encoding(inner) => DecodeCause::Corrupt {
             format: SmolStr::new_static(format),
-            detail: SmolStr::new(inner.to_string()),
+            detail: format_smolstr!("{inner}"),
         },
         ImageError::Parameter(inner) => DecodeCause::Corrupt {
             format: SmolStr::new_static(format),
-            detail: SmolStr::new(inner.to_string()),
+            detail: format_smolstr!("{inner}"),
         },
         ImageError::IoError(inner) => DecodeCause::Corrupt {
             format: SmolStr::new_static(format),
-            detail: SmolStr::new(inner.to_string()),
+            detail: format_smolstr!("{inner}"),
         },
     }
 }
@@ -214,9 +278,12 @@ fn srgb_encode(linear: f32) -> u8 {
 mod tests {
     use std::io::Cursor;
 
+    use image::error::LimitErrorKind;
+
     use super::{
-        MAX_SOURCE_DIM, MAX_TILE_DIM, decode, fit_within, premultiply_channel, srgb_decode,
-        srgb_encode, transfer_lut,
+        MAX_DECODE_ALLOC, MAX_SOURCE_BYTES, MAX_SOURCE_DIM, MAX_SOURCE_PIXELS, MAX_TILE_DIM,
+        check_source_bytes, check_source_size, classify, decode, decode_limits, fit_within,
+        premultiply_channel, srgb_decode, srgb_encode, transfer_lut,
     };
     use crate::resources::DecodeCause;
 
@@ -379,6 +446,7 @@ mod tests {
         );
     }
 
+    /// R12-15：超过**单边**上限（8193×1 只有 8193 px，像素数远没超，但单边超了）。
     #[test]
     fn decode_rejects_oversize_source() {
         let wide = solid(MAX_SOURCE_DIM + 1, 1, [1, 2, 3, 255]);
@@ -387,8 +455,87 @@ mod tests {
             DecodeCause::TooLarge {
                 width: MAX_SOURCE_DIM + 1,
                 height: 1,
-                limit: MAX_SOURCE_DIM
+                pixels: u64::from(MAX_SOURCE_DIM) + 1,
+                limit: MAX_SOURCE_PIXELS,
+                dim_limit: MAX_SOURCE_DIM,
             }
+        );
+    }
+
+    /// 判据单测：像素数超限（单边合法）与单边超限都在**分配整图之前**被拦下。
+    #[test]
+    fn source_size_predicate_covers_pixels_and_single_sides() {
+        assert!(check_source_size(1, 1).is_ok());
+        assert!(check_source_size(4096, 4096).is_ok(), "16 M px 正好是上限");
+        assert!(
+            check_source_size(8192, 1).is_ok(),
+            "8192×1 = 8192 px：单边合法、像素数远低于上限"
+        );
+
+        // 4097×4097 = 16.8 M px > 16 M px：**单边合法但像素超限**（R12-15 的核心场景）。
+        assert_eq!(
+            check_source_size(4097, 4097),
+            Err(DecodeCause::TooLarge {
+                width: 4097,
+                height: 4097,
+                pixels: 4097 * 4097,
+                limit: MAX_SOURCE_PIXELS,
+                dim_limit: MAX_SOURCE_DIM,
+            })
+        );
+        assert!(check_source_size(MAX_SOURCE_DIM + 1, 1).is_err());
+        assert!(check_source_size(1, MAX_SOURCE_DIM + 1).is_err());
+        assert_eq!(MAX_SOURCE_PIXELS, 16 * 1024 * 1024, "像素上限 16 M px");
+    }
+
+    /// 异步插入的轻量校验：压缩字节 16 MiB。
+    #[test]
+    fn source_bytes_predicate_rejects_oversize_input() {
+        assert!(check_source_bytes(0).is_ok());
+        assert!(check_source_bytes(MAX_SOURCE_BYTES).is_ok());
+        assert_eq!(
+            check_source_bytes(MAX_SOURCE_BYTES + 1),
+            Err(DecodeCause::SourceTooLarge {
+                bytes: MAX_SOURCE_BYTES as u64 + 1,
+                limit: MAX_SOURCE_BYTES as u64,
+            })
+        );
+    }
+
+    /// 解码器限制必须**显式**覆盖默认值（默认 512 MiB 会让 8192² RGBA16 以 `Corrupt` 失败）。
+    #[test]
+    fn decode_limits_cap_memory_and_single_sides() {
+        let limits = decode_limits();
+        assert_eq!(limits.max_alloc, Some(MAX_DECODE_ALLOC));
+        assert_eq!(limits.max_image_width, Some(MAX_SOURCE_DIM));
+        assert_eq!(limits.max_image_height, Some(MAX_SOURCE_DIM));
+        assert_eq!(MAX_DECODE_ALLOC, 256 * 1024 * 1024);
+        assert!(
+            MAX_DECODE_ALLOC < image::Limits::default().max_alloc.expect("默认上限"),
+            "必须比 image 的默认 512 MiB 更严"
+        );
+    }
+
+    /// `Limits` 命中按 `LimitErrorKind` 分类：内存不足走 `OutOfMemory`，其余是 `Corrupt`。
+    #[test]
+    fn classify_distinguishes_decoder_memory_from_corruption() {
+        let out_of_memory = classify(
+            "png",
+            image::ImageError::Limits(LimitErrorKind::InsufficientMemory.into()),
+        );
+        assert_eq!(
+            out_of_memory,
+            DecodeCause::OutOfMemory {
+                limit_bytes: MAX_DECODE_ALLOC,
+            }
+        );
+        let dimension = classify(
+            "png",
+            image::ImageError::Limits(LimitErrorKind::DimensionError.into()),
+        );
+        assert!(
+            matches!(&dimension, DecodeCause::Corrupt { format, .. } if format == "png"),
+            "{dimension:?}"
         );
     }
 

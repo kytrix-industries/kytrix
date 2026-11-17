@@ -184,18 +184,24 @@ impl Swapchain {
             })?;
         // 渲染目标格式是进程级固定的（PSO / render pass / persist 都按它建）：surface 必须提供
         // 同一格式，否则整面 `cmdCopyImage` 不合法（B8G8R8A8_SRGB 与 R8G8B8A8_SRGB 不兼容）。
+        // R06-10：`colorSpace` 必须与引擎声明的呈现色彩空间一致（`render::colorspace`）。
+        // 旧实现只查 format、把合成器给的 `colorSpace` 原样透传 —— 在 HDR/P3 合成器上会整屏偏色。
+        // 与 `MAILBOX` 的处理一致：规范要求的硬前提，不满足就按 D8 基线失败，不做静默回退。
         let chosen = formats
             .iter()
-            .find(|candidate| candidate.format == RENDER_FORMAT)
+            .find(|candidate| {
+                candidate.format == RENDER_FORMAT
+                    && crate::render::colorspace::accepts_color_space(candidate.color_space)
+            })
             .copied()
             .ok_or_else(|| EngineError::UnsupportedGpu {
                 os: "linux",
-                required: "B8G8R8A8_SRGB surface format (the process render target format)",
+                required: "B8G8R8A8_SRGB surface format with VK_COLOR_SPACE_SRGB_NONLINEAR_KHR",
                 actual: smol_str::format_smolstr!(
-                    "surface reports formats {:?}",
+                    "surface reports {:?}",
                     formats
                         .iter()
-                        .map(|format| format.format)
+                        .map(|format| (format.format, format.color_space))
                         .collect::<Vec<_>>()
                 ),
             })?;

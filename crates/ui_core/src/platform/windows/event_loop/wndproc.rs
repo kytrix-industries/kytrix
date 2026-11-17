@@ -14,11 +14,11 @@ use windows::Win32::{
 use super::{
     WndProcState,
     caption::{CAPTION_TIMER_ID, RESIZE_TIMER_ID, is_caption_hit, is_resize_hit},
-    pump::{FRAME_TIMER_ID, cursor_handle},
+    pump::{FRAME_TIMER_ID, cursor_handle, message_ticks},
 };
 use crate::platform::{
     dispatcher::{WM_APP_COMPOSITION_WAKE, WM_APP_FRAME_WAKE},
-    event::{PlatformEvent, hiword_signed, loword_signed, translate},
+    event::{PlatformEvent, StampedEvent, hiword_signed, loword_signed, translate},
 };
 
 /// 消费者：`NativeWindow::create`（`window.rs` 注册窗口过程）。
@@ -108,7 +108,7 @@ pub(crate) extern "system" fn wndproc(
                 (*state).suppress_capture_cancel = false;
                 return LRESULT(0);
             }
-            (*state).events.push(PlatformEvent::PointerCancel);
+            (*state).push_now(PlatformEvent::PointerCancel);
             (*state).wake();
             return LRESULT(0);
         }
@@ -315,6 +315,9 @@ pub(crate) extern "system" fn wndproc(
             // `track` 在栈上，`hwnd` 是本窗口；失败时下一帧再试。
             if TrackMouseEvent(&mut track).is_ok() {
                 state.mouse_tracking = true;
+                // R02-4：进入客户区的**第一个**消息就是 `PointerEnter` 的生产点（Win32 没有
+                // 独立的 enter 消息，`TME_LEAVE` 只在离开时通知）。
+                state.push_now(PlatformEvent::PointerEnter);
             }
         }
 
@@ -331,24 +334,44 @@ pub(crate) extern "system" fn wndproc(
             lparam_value
         };
 
-        let event = if is_ime_message(msg) {
+        // R02-14：时间戳取 `MSG.time`（`GetMessageTime`），不是分发时刻。
+        let ticks = message_ticks();
+        let stamped = if is_ime_message(msg) {
             state
                 .translate
                 .ime_mut()
                 .handle(hwnd, msg, lparam_value)
-                .map(PlatformEvent::Ime)
+                .map(|ime| StampedEvent {
+                    event: PlatformEvent::Ime(ime),
+                    ticks_ms: ticks,
+                })
         } else if msg == WM_SETTINGCHANGE {
-            appearance_change(lparam_value)
+            // 系统滚轮行数（`SPI_GETWHEELSCROLLLINES`）可能变了（R02-10）。
+            state.refresh_wheel_lines();
+            appearance_change(lparam_value).map(|event| StampedEvent {
+                event,
+                ticks_ms: ticks,
+            })
         } else {
-            translate(msg, wparam_value, lparam_value, &mut state.translate)
+            let context = state.context(ticks);
+            translate(
+                msg,
+                wparam_value,
+                lparam_value,
+                context,
+                &mut state.translate,
+            )
         };
 
-        if let Some(event) = event {
-            if matches!(event, PlatformEvent::PointerLeave) {
-                state.mouse_tracking = false;
+        if let Some(stamped) = stamped {
+            match &stamped.event {
+                PlatformEvent::PointerLeave => state.mouse_tracking = false,
+                // `WM_MOUSELEAVE` 不带坐标：记下最近位置供 `PointerLeave` 的离开点使用。
+                PlatformEvent::Pointer { x, y, .. } => state.note_client_pos(*x, *y),
+                _ => {}
             }
-            let is_close = matches!(event, PlatformEvent::Close);
-            state.push(event);
+            let is_close = matches!(stamped.event, PlatformEvent::Close);
+            state.push_stamped_event(stamped);
             state.wake();
             if is_close {
                 // 不交给 `DefWindowProcW`：销毁由事件循环在关掉 `App` 里的窗口之后做。

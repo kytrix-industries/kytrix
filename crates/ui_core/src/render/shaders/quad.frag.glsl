@@ -22,28 +22,27 @@ void main() {
         color = p.color0 * coverage;
     } else if (kind == KYTRIX_KIND_IMAGE) {
         color = texture(image_atlas, v_uv) * p.color0;
+    } else if (kind == KYTRIX_KIND_SHADOW) {
+        // 可分离 2D 高斯（σ = blur / 2）：矩形部分是精确解，角部按圆角半径混合。
+        color = p.color0 * analytic_shadow(v_local_px, half_size, p.corner_radius, p.params0.y);
     } else {
         float d_outer = sd_rounded_rect(v_local_px, half_size, p.corner_radius);
-        if (kind == KYTRIX_KIND_SHADOW) {
-            color = p.color0 * analytic_shadow(d_outer, p.params0.y);
-        } else {
-            float coverage = aa_coverage(d_outer);
-            uint gradient = uint(p.params0.z);
-            vec4 fill = (gradient == KYTRIX_GRADIENT_NONE)
-                            ? p.color0
-                            : gradient_eval(gradient, v_local_px, half_size, p.color0, p.color1);
-            color = fill * coverage;
-            float border = p.params0.x;
-            if (border > 0.0) {
-                vec4 inner_radii = max(p.corner_radius - border, vec4(0.0));
-                vec2 inner_half = max(half_size - border, vec2(0.0));
-                float inner = aa_coverage(sd_rounded_rect(v_local_px, inner_half, inner_radii));
-                float ring = max(coverage - inner, 0.0);
-                color += (p.color1 - fill * p.color1.a) * ring;
-            }
+        float coverage = aa_coverage(d_outer);
+        uint gradient = uint(p.params0.z);
+        vec4 fill = (gradient == KYTRIX_GRADIENT_NONE)
+                        ? p.color0
+                        : gradient_eval(gradient, v_local_px, half_size, p.color0, p.color1);
+        color = fill * coverage;
+        float border = p.params0.x;
+        if (border > 0.0) {
+            vec4 inner_radii = max(p.corner_radius - border, vec4(0.0));
+            vec2 inner_half = max(half_size - border, vec2(0.0));
+            float inner = aa_coverage(sd_rounded_rect(v_local_px, inner_half, inner_radii));
+            float ring = max(coverage - inner, 0.0);
+            color += (p.color1 - fill * p.color1.a) * ring;
         }
     }
 
-    color *= clip_mask(world_px, uint(p.params1.x));
+    color *= clip_mask(world_px, uint(p.params1.x), uint(p.params1.w));
     out_color = apply_gamma(color);
 }
