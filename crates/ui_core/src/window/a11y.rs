@@ -11,7 +11,7 @@ pub(crate) fn a11y_pending(window: &Window) -> bool {
 }
 
 // 消费者：`impl Window::a11y_take` 的薄委托（外部调用点见该方法文档）。
-/// 产出一笔 a11y 交付（消费 `A11Y|ORDER` 位与 `full_pending`）。
+/// 产出一笔 a11y 交付（消费 `A11Y` 反向集合与 `full_pending`）。
 ///
 /// 调用方：平台层的 `update_if_active` 闭包（生产）、`App::frame` 的捕获路径（测试）。
 pub(crate) fn a11y_take(

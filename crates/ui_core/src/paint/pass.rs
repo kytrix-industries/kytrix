@@ -1,7 +1,7 @@
 //! paint pass：把节点树 + 样式 + 文本 + 自绘图元变成 `Scene` 的 lane 与 damage。
 //!
 //! 契约见 `design/phase-06-paint-runtime.md` §5–§6：
-//! - **一节点一 lane**（`Node.lanes[0]`，粘性保留）；
+//! - **一节点一 lane**（`Node.lane`，粘性保留）；
 //! - lane 内桶序 = 祖先 clip 前缀 → Shadow → 背景/渐变 → 边框 → 内容 → 祖先 clip 后缀；
 //! - 复用判据 = `REUSABLE` + lane 存在 + **clip 上下文一致**（`clip_key`，审查 B1 的守卫）；
 //! - 隐藏子树（自身/祖先 `display: none`）清空 lane、不产生像素、`clip_key` 置空（重新显示必重建）；
@@ -17,7 +17,6 @@ use crate::{
     error::EngineError,
     math::{PhysicalRect, Point, Rect, Scale},
     node::{
-        dirty::DirtyFlags,
         id::NodeId,
         tree::{NodeKind, NodeTree},
     },
@@ -219,31 +218,26 @@ fn paint_node(
     clip: &mut ClipContext,
     offset: Point,
 ) -> Result<(), EngineError> {
-    let Ok(target) = context.tree.get(node) else {
+    // 一次取全本节点的只读状态（不可见 / 复用判据 / lane / 子节点数 / clip 盒 / 滚动偏移）。
+    //
+    // 不可见的**定义只有一处**：`display: none` 或 `visible: false`。命中测试、焦点遍历、
+    // a11y 都用同一规则，并且都按「隐藏整棵子树」处理；旧实现的 paint 只对 `display: none`
+    // 隐藏子树，`visible: false` 仅跳过本节点自身的图元 —— 于是容器的背景消失、子控件仍然
+    // 画出来，而那些子控件在命中测试里是不可见的（「看得见但点不动」的死像素，P2-3.2）。
+    //
+    // 复用判据（§5.6 + P10 §7.6）：`REUSABLE` + clip 上下文一致 + **滚动偏移戳一致**（祖先滚动会
+    // 移动全部后代图元，因此偏移变化必须重建）。**不要求** lane 存在：从未产生图元的节点没有
+    // lane，但它的 `clip_key` 已写回，仍可整帧跳过（否则空节点每帧都要重建）。
+    let current_key = clip.key();
+    let Some(state) = context.tree.paint_state(node, offset, current_key) else {
         return Ok(());
     };
-    // 不可见的**定义只有一处**：`NodeTree::is_visible_locally`（`display: none` 或
-    // `visible: false`）。命中测试、焦点遍历、a11y 都用它，并且都按「隐藏整棵子树」处理；
-    // 旧实现的 paint 只对 `display: none` 隐藏子树，`visible: false` 仅跳过本节点自身的图元
-    // —— 于是容器的背景消失、子控件仍然画出来，而那些子控件在命中测试里是不可见的
-    // （「看得见但点不动」的死像素，P2-3.2）。
-    let hidden = parent_hidden
-        || matches!(target.style().inner.display, taffy::style::Display::None)
-        || target.style_patch().visible == Some(false);
-    if hidden {
+    if parent_hidden || state.hidden {
         hide_subtree(context, node, clip, offset);
         return Ok(());
     }
-    let current_key = clip.key();
-    // 复用判据（§5.6 + P10 §7.6）：`REUSABLE` + clip 上下文一致 + **滚动偏移戳一致**（祖先滚动会移动
-    // 全部后代图元，因此偏移变化必须重建）。**不要求** lane 存在：从未产生图元的节点没有 lane，
-    // 但它的 `clip_key` 已写回，仍可整帧跳过（否则空节点每帧都要重建）。
-    let reusable = target.dirty().contains(DirtyFlags::REUSABLE)
-        && context.tree.clip_key(node) == Some(current_key)
-        && context.tree.lane_offset(node) == offset;
-
-    if reusable {
-        if let Some(lane) = context.tree.lane_of(node) {
+    if state.reusable {
+        if let Some(lane) = state.lane {
             context.order.push(lane);
             #[cfg(feature = "test-support")]
             {
@@ -263,34 +257,22 @@ fn paint_node(
         rebuild_lane(context, node, clip, offset)?;
     }
 
-    let (children, clip_bounds) = {
-        let Ok(target) = context.tree.get(node) else {
-            return Ok(());
-        };
-        let children: SmallVec<[NodeId; 4]> = target.children().iter().copied().collect();
-        // B1：0×0 的 padding box **也要入栈**（depth+1、covering 交空）——子 lane 由此带空前缀、
-        // damage 全部被裁空，与 `hit_test` 的 clip 链语义一致；跳过它会让子内容"越界可见"。
-        let clip_bounds = (target.clip() == Clip::Bounds).then(|| {
-            target
-                .layout()
-                .bounds
-                .translate(negate(offset))
-                .inset(target.layout().border)
-        });
-        (children, clip_bounds)
-    };
+    // B1：0×0 的 padding box **也要入栈**（depth+1、covering 交空）——子 lane 由此带空前缀、
+    // damage 全部被裁空，与 `hit_test` 的 clip 链语义一致；跳过它会让子内容"越界可见"。
+    let child_count = state.children;
+    let clip_bounds = state.clip_bounds;
     if let Some(padding_box) = clip_bounds {
         // 深度上限由 `ClipContext::push` 自己处理：达到上限时与栈顶矩形求交（无损），
         // 既不失败也不丢弃（P2-7）。
         clip.push(padding_box, context.scale);
     }
     // 子节点的参照系：容器挂了滚动槽时，内容整体按 `offset` 上移（屏幕 = 内容 − 累计偏移）。
-    let child_offset = offset
-        + context
-            .tree
-            .scroll_slot(node)
-            .map_or(Point::ZERO, |slot| slot.offset);
-    for child in children {
+    let child_offset = offset + state.scroll_offset;
+    for index in 0..child_count {
+        let child = match context.tree.get(node) {
+            Ok(target) => target.children()[index],
+            Err(_) => break,
+        };
         paint_node(context, child, false, clip, child_offset)?;
     }
     if clip_bounds.is_some() {
@@ -459,7 +441,7 @@ fn rebuild_lane(
     context.tree.set_lane_offset(node, offset);
     context.tree.clear_paint(node);
 
-    // 「没有东西要画」的节点不留 lane（空 lane 只占 order/内存）：丢弃句柄并释放分配。
+    // 「没有东西要画」的节点不留 lane（空 lane 只占绘制序/内存）：丢弃句柄并释放分配。
     // 它的 `clip_key` 已写回，下一帧仍可命中复用判据（无需每帧重建）。
     if primitives == 0 {
         context.scene.release_lane(lane);
@@ -923,14 +905,14 @@ mod tests {
 
     /// 给每个节点写一个固定的绝对布局盒（paint 只读 `layout`，不需要 taffy）。
     fn layout_all(tree: &mut NodeTree) {
-        let order: Vec<_> = tree.order().to_vec();
+        let order: Vec<_> = tree.dfs_ids();
         for (index, id) in order.iter().enumerate() {
             let bounds = Rect::new(0.0, (index as f32) * 20.0, 100.0, 20.0);
             let layout = crate::node::tree::LayoutBox {
                 bounds,
                 border: crate::math::Edges::ZERO,
             };
-            let _ = tree.set_layout_for_test(*id, layout, crate::node::tree::LayoutBox::default());
+            let _ = tree.set_layout_for_test(*id, layout);
         }
     }
 
@@ -1352,9 +1334,7 @@ mod tests {
             bounds: Rect::new(0.0, 0.0, 60.0, 60.0),
             border: crate::math::Edges::ZERO,
         };
-        let _ =
-            h.tree
-                .set_layout_for_test(clipped, resize, crate::node::tree::LayoutBox::default());
+        let _ = h.tree.set_layout_for_test(clipped, resize);
         let report = h.paint();
         assert!(report.rebuilt > 0, "clip 容器尺寸变化必须触发重建");
         let after = lane_primitives(&h, child);
@@ -1416,9 +1396,7 @@ mod tests {
             bounds: Rect::default(),
             border: crate::math::Edges::ZERO,
         };
-        let _ = h
-            .tree
-            .set_layout_for_test(clipped, empty, crate::node::tree::LayoutBox::default());
+        let _ = h.tree.set_layout_for_test(clipped, empty);
         let report = h.paint();
 
         let primitives = lane_primitives(&h, child);

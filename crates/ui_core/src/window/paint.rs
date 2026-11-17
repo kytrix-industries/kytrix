@@ -6,7 +6,6 @@ use crate::test_support::record::PaintLog;
 use crate::{
     error::EngineError,
     math::Rect,
-    node::dirty::DirtyFlags,
     paint::{
         instance::InstanceBuffer,
         pass::{PaintPass, PaintReport},
@@ -96,11 +95,8 @@ pub(crate) fn paint_frame(
 ///
 /// `A11Y` 不在判据里：a11y 更新不产生 damage（`design §7.5` / P03 §9.3 表第 9 行）。
 pub(crate) fn needs_node_repaint(window: &Window) -> bool {
-    window.tree.any_node(|node| {
-        let dirty = node.dirty();
-        dirty.intersects(DirtyFlags::LAYOUT | DirtyFlags::PAINT)
-            || !dirty.contains(DirtyFlags::REUSABLE)
-    })
+    // O(1) 门禁（R03-1）：读 `dirty_paint` 反向集合是否为空，不再全树扫描。
+    window.tree.has_paint_work()
 }
 
 // 消费者：`impl Window::instance_buffer` 的薄委托（外部调用点见该方法文档）。

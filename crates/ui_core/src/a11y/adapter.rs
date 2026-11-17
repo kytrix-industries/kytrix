@@ -4,7 +4,7 @@
 //! 1. **懒激活**：`TreeUpdate` 只在 `accesskit_windows` 的 `update_if_active` 闭包里构造
 //!    （adapter 不活跃时闭包不执行 ⇒ 零 accesskit 开销）。引擎侧的 [`A11yBridge::take`] 只做
 //!    「收集 id + 清位 + 建快照」，不构造任何 `accesskit::Node`。
-//! 2. **单一 drainer**：`take` 会消费 `A11Y|ORDER` 位与 `full_pending`，同一时刻只能有一个消费者
+//! 2. **单一 drainer**：`take` 会消费 `A11Y` 位（与 `dirty_a11y` 反向集合）及 `full_pending`，同一时刻只能有一个消费者
 //!    （生产 = 平台层；`test-support` 的捕获路径只在 `TestApp` 里打开）。
 
 use accesskit::{NodeId as AkNodeId, Rect as AkRect, TreeId, TreeInfo, TreeUpdate};
@@ -18,7 +18,7 @@ use crate::{
     },
     app::App,
     math::Scale,
-    node::{dirty::DirtyFlags, id::NodeId, tree::NodeTree},
+    node::{id::NodeId, tree::NodeTree},
     window::WindowId,
 };
 
@@ -97,7 +97,7 @@ impl A11yBridge {
         self.capture = on;
     }
 
-    /// 产出一笔交付（同时消费 `A11Y|ORDER` 位与 `subtrees`）。`None` = 没有工作。
+    /// 产出一笔交付（同时消费 `A11Y` 反向集合与 `subtrees`）。`None` = 没有工作。
     pub(crate) fn take(
         &mut self,
         tree: &mut NodeTree,
@@ -111,36 +111,43 @@ impl A11yBridge {
             return None;
         }
 
-        // ① 候选集合：全树 = 全部节点；增量 = 脏节点 + 滚动子树 + 每个候选的祖先链。
+        // ① 候选集合：全树 = 全部节点；增量 = `A11Y` 反向集合 + 滚动子树 + 每个候选的祖先链。
         //
-        // 增量路径用 `HashSet` 而不是线性 `contains`：旧实现在「建节点」阶段对每个候选做
-        // O(N) 线性查找，滚动子树失效/大规模重排时 M 可接近 N ⇒ O(N×M) + 祖先去重 O(M²)，
-        // 10 Hz 交付下会出现毫秒级突刺（复审 P3-7）。
+        // 增量路径不再全树过滤脏位（R03-1 / R03-21）：`dirty_a11y` 就是"候选集"，成本
+        // O(脏节点)；顺序用按发现序去重的 `Vec` 固定下来（可复现），不用哈希迭代序。
         let mut candidate_set: ahash::HashSet<NodeId> = ahash::HashSet::default();
-        if full {
-            candidate_set.extend(tree.order().iter().copied());
-        } else {
-            for node in tree.order() {
-                if tree.get(*node).is_ok_and(|target| {
-                    target
-                        .dirty()
-                        .intersects(DirtyFlags::A11Y | DirtyFlags::ORDER)
-                }) {
-                    candidate_set.insert(*node);
-                }
+        let mut candidates: Vec<NodeId> = Vec::new();
+        let push = |node: NodeId,
+                    candidate_set: &mut ahash::HashSet<NodeId>,
+                    candidates: &mut Vec<NodeId>| {
+            if candidate_set.insert(node) {
+                candidates.push(node);
             }
+        };
+        if full {
+            tree.for_each_dfs(|node| push(node, &mut candidate_set, &mut candidates));
+        } else {
+            let dirty = tree.take_a11y();
+            for node in dirty.iter().copied() {
+                push(node, &mut candidate_set, &mut candidates);
+            }
+            tree.recycle(dirty);
             let mut subtree_nodes: SmallVec<[NodeId; 16]> = SmallVec::new();
             for root in std::mem::take(&mut self.subtrees) {
                 collect_subtree(tree, root, &mut subtree_nodes);
             }
-            candidate_set.extend(subtree_nodes.drain(..));
+            for node in subtree_nodes.drain(..) {
+                push(node, &mut candidate_set, &mut candidates);
+            }
             // 祖先链：结构增删必须同批发父（`accesskit_consumer` 的硬约束），
             // 无条件带上（未变化的节点在消费端不会产生 updated 事件，只付带宽）。
             let mut ancestors: SmallVec<[NodeId; 16]> = SmallVec::new();
-            for node in candidate_set.iter() {
+            for node in &candidates {
                 push_ancestors(tree, *node, &mut ancestors);
             }
-            candidate_set.extend(ancestors);
+            for node in ancestors {
+                push(node, &mut candidate_set, &mut candidates);
+            }
         }
 
         // ② 清位（全树路径同样清，避免位永久累积）。
@@ -148,21 +155,24 @@ impl A11yBridge {
             tree.clear_a11y(*node);
         }
 
-        // ③ 建节点：按 `order()` 序（快照的确定性来自这里）。
-        let mut nodes = Vec::new();
-        if full {
-            for node in tree.order() {
-                if let Some(record) = node_a11y(tree, *node, scale, title, diagnostics) {
-                    nodes.push(record);
-                }
+        // ③ 建节点：**祖先先于后代**（depth 升序；同深度保持发现序）。
+        //
+        // `TreeUpdate.nodes` 本身是按 id 索引的无序表，但祖先先行的顺序让快照/诊断可读，
+        // 也让增量笔的节点序与全树笔（DFS 先序）一致。旧实现为此每笔都扫全树取 `order`
+        // 位置；这里按 parent 链算 depth（O(候选 × 深度)），与节点总数无关。
+        candidates.sort_by_key(|node| {
+            let mut depth = 0u32;
+            let mut cursor = tree.get(*node).ok().and_then(|target| target.parent());
+            while let Some(parent) = cursor {
+                depth += 1;
+                cursor = tree.get(parent).ok().and_then(|target| target.parent());
             }
-        } else {
-            for node in tree.order() {
-                if candidate_set.contains(node)
-                    && let Some(record) = node_a11y(tree, *node, scale, title, diagnostics)
-                {
-                    nodes.push(record);
-                }
+            depth
+        });
+        let mut nodes = Vec::with_capacity(candidates.len());
+        for node in candidates {
+            if let Some(record) = node_a11y(tree, node, scale, title, diagnostics) {
+                nodes.push(record);
             }
         }
 
@@ -378,7 +388,7 @@ mod tests {
 
         let full = take(&mut bridge, &mut tree, None).expect("首笔");
         assert!(full.full);
-        assert_eq!(full.nodes.len(), tree.order().len());
+        assert_eq!(full.nodes.len(), tree.len());
         assert_eq!(full.focus, crate::a11y::A11yNodeId::from_engine(root));
         assert_eq!(
             full.node_for(button).expect("button").role,
@@ -718,7 +728,6 @@ mod tests {
                 bounds: crate::math::Rect::new(1.0, 2.0, 10.0, 20.0),
                 border: crate::math::Edges::ZERO,
             },
-            crate::node::tree::LayoutBox::default(),
         );
         let snapshot = take(&mut bridge, &mut tree, None).expect("首笔");
         let record = snapshot.node_for(node).expect("node");

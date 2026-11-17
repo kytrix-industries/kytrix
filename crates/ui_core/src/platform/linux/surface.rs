@@ -64,7 +64,7 @@ use crate::{
     error::EngineError,
     event::{
         Event, ImeEvent, InputEvent, KeyCode, KeyState, Modifiers, PointerButton, ScrollPhase,
-        ScrollUnit,
+        ScrollUnit, should_emit_text,
     },
     math::{Point, Rect, Scale, Size},
     platform::linux::{
@@ -960,6 +960,9 @@ impl WaylandState {
         } else {
             text_input.disable();
             self.ime_enabled = false;
+            // 停用即丢弃组合：否则 `composing` 残留为真，XKB 回退通路会永久静默
+            // （`should_emit_text` 的组合态判据）。
+            self.ime.reset();
             self.windows[index].ime_cursor_applied = None;
         }
         text_input.commit();
@@ -1030,8 +1033,13 @@ impl WaylandState {
         // P1-2.11：IME 启用后文本**只**走 `zwp_text_input_v3` 的 `commit_string`。
         // 两条通路同时生效会让一次按键产生两份文本（输入 "ni" 得到 "ni你"）。
         // 组合器没有 text-input-v3 时 `ime_enabled` 恒 false，回退到这里的 xkb 通路。
-        // 重复按键不再产生文本（系统重复是"按住不放"，文本早已插入）。
-        if state == KeyState::Down && !repeat && !self.ime_enabled {
+        //
+        // R02-2（P0 回归）：**`repeat` 不得参与文本判定**。Wayland 的按键重复由客户端合成
+        // （服务端从不重发 `key` 事件），字符文本也只能由客户端按每次重复生成；旧实现写成
+        // `!repeat` ⇒ 在默认的 XKB 回退通路（`ime_enabled == false`）里按住可打印键只输入
+        // 一个字符。判据统一走 `should_emit_text`（含单测），`repeat` 只影响绑定/动作派发。
+        let composing = self.ime.composing();
+        if should_emit_text(state, repeat, self.ime_enabled, composing) {
             let text = xkb_state.key_get_utf8(keycode);
             if !text.is_empty() && text.chars().all(|c| !c.is_control()) {
                 self.events.push((
@@ -1925,7 +1933,7 @@ pub(crate) fn create_devices(state: &mut WaylandState) -> Result<(), EngineError
 /// 空闲等待的兜底超时（`ping` / 协议事件会提前返回；3600 s 只是防御）。
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
 
-/// 一条滚动事件的构造（`unit` / `phase` / `lines_per_tick` 三处共用，避免手抄漏字段）。
+/// 一条滚动事件的构造（`unit` / `phase` 两处共用，避免手抄漏字段）。
 ///
 /// `finger` = 触控板 / 连续设备（`axis_source = finger`）：像素单位、连续阶段；否则是离散滚轮，
 /// 行单位、`ScrollPhase::Discrete`。
@@ -1945,8 +1953,6 @@ fn scroll_event(
             ScrollUnit::Line
         },
         phase,
-        // 离散通路已经用 `axis_value120 / 120` 折成行，一格 = 1 行；连续通路不需要换算。
-        lines_per_tick: if finger { 0.0 } else { 1.0 },
         modifiers,
         timestamp: Instant::now(),
     }
@@ -2073,6 +2079,28 @@ fn key_code(evdev: u32) -> KeyCode {
         125 => KeyCode::MetaLeft,
         126 => KeyCode::MetaRight,
         127 => KeyCode::ContextMenu,
+        // 媒体 / 浏览器 / 电源键（与 Windows 的 `E0` 扩展行同一组身份）。
+        113 => KeyCode::AudioVolumeMute,
+        114 => KeyCode::AudioVolumeDown,
+        115 => KeyCode::AudioVolumeUp,
+        163 => KeyCode::MediaTrackNext,
+        164 => KeyCode::MediaPlayPause,
+        165 => KeyCode::MediaTrackPrevious,
+        166 => KeyCode::MediaStop,
+        362 => KeyCode::MediaSelect,
+        155 => KeyCode::LaunchMail,
+        148 => KeyCode::LaunchApp1,
+        149 => KeyCode::LaunchApp2,
+        158 => KeyCode::BrowserBack,
+        159 => KeyCode::BrowserForward,
+        172 => KeyCode::BrowserHome,
+        173 => KeyCode::BrowserRefresh,
+        128 => KeyCode::BrowserStop,
+        217 => KeyCode::BrowserSearch,
+        156 => KeyCode::BrowserFavorites,
+        116 => KeyCode::Power,
+        142 => KeyCode::Sleep,
+        143 => KeyCode::WakeUp,
         183 => KeyCode::F13,
         184 => KeyCode::F14,
         185 => KeyCode::F15,
@@ -2280,11 +2308,7 @@ mod tests {
         );
 
         let crate::event::InputEvent::Scroll {
-            delta,
-            unit,
-            phase,
-            lines_per_tick,
-            ..
+            delta, unit, phase, ..
         } = wheel
         else {
             panic!("必须是滚动事件");
@@ -2292,13 +2316,48 @@ mod tests {
         assert_eq!(delta, Point::new(0.0, -1.0));
         assert_eq!(unit, ScrollUnit::Line);
         assert_eq!(phase, ScrollPhase::Discrete);
-        assert_eq!(lines_per_tick, 1.0);
 
         let crate::event::InputEvent::Scroll { unit, phase, .. } = finger else {
             panic!("必须是滚动事件");
         };
         assert_eq!(unit, ScrollUnit::Pixel);
         assert_eq!(phase, ScrollPhase::Update);
+    }
+
+    /// R02-2（P0 回归，Linux）：合成重复必须继续产生字符文本。
+    ///
+    /// Wayland 的按键重复由**客户端**合成（服务端从不重发 `key` 事件），字符文本也只能由
+    /// 客户端按每次重复生成；而默认通路是 XKB 回退（`ime_enabled == false`）。旧实现把
+    /// `!repeat` 写进文本条件 ⇒ 按住可打印键只输入一个字符。
+    ///
+    /// 判据在 `crate::event::should_emit_text`（平台无关、有独立单测），这里钉住 Linux 侧的
+    /// 参数组合：XKB 回退通路（IME 未接管、非组合期）在 `repeat = true` 时仍必须产生文本。
+    #[test]
+    fn repeated_key_down_still_emits_text_on_the_xkb_fallback() {
+        use crate::event::{KeyState, should_emit_text};
+
+        assert!(should_emit_text(KeyState::Down, false, false, false));
+        assert!(
+            should_emit_text(KeyState::Down, true, false, false),
+            "合成重复必须继续产生文本（P0 回归）"
+        );
+        // IME 接管后 XKB 通路必须静默（文本只走 text-input-v3 的 commit_string）。
+        assert!(!should_emit_text(KeyState::Down, true, true, false));
+    }
+
+    /// R02-1：媒体键在 Linux 上也映射到与 Windows `E0` 扩展行**相同**的物理身份。
+    #[test]
+    fn media_keys_map_to_the_same_identities_as_windows() {
+        assert_eq!(key_code(115), KeyCode::AudioVolumeUp);
+        assert_eq!(key_code(114), KeyCode::AudioVolumeDown);
+        assert_eq!(key_code(113), KeyCode::AudioVolumeMute);
+        assert_eq!(key_code(164), KeyCode::MediaPlayPause);
+        assert_eq!(key_code(163), KeyCode::MediaTrackNext);
+        assert_eq!(key_code(165), KeyCode::MediaTrackPrevious);
+        assert_eq!(key_code(166), KeyCode::MediaStop);
+        assert_eq!(key_code(172), KeyCode::BrowserHome);
+        assert_eq!(key_code(158), KeyCode::BrowserBack);
+        assert_eq!(key_code(159), KeyCode::BrowserForward);
     }
 
     /// `ScrollAccum` 的像素通路（触控板 1:1 跟随）与行通路互相独立。

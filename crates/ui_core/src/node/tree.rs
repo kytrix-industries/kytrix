@@ -1,20 +1,29 @@
 //! 持久节点树：`Node` / `NodeKind` / `LayoutBox` / `NodeTree`。
 //!
 //! 设计见 `design/phase-03-node-state.md` §11。要点：
-//! - 唯一的一棵树（I5）：节点树 + arena（`NodeId` 带代际）+ DFS 先序数组 `order`；
-//! - 子树在 `order` 里是**连续块**，因此结构变更只做局部拼接（`Vec::insert`/`drain` 的一段）；
-//! - 所有写路径都走 `mark_*`（§9.3 的表），`touch` 顺带并 damage 并清 `REUSABLE`；
-//! - `taffy::Cache` **不**内联（P04 在 `NodeTree` 旁建旁表，见 §11.1）。
+//! - 唯一的一棵树（I5）：节点树 + arena（`NodeId` 带代际）；**不维护全序平坦数组**
+//!   （Chrome / Qt / Flutter 都不维护：绘制、命中、a11y、Tab 序全部由 `children` 的 DFS 遍历直接
+//!   决定，结构插入/删除因此是 O(子树) 而不是 O(N) 拼接）；
+//! - 所有写路径都走 `mark_*`（§9.3 的表 + `node::dirty` 的脏位表），`touch` 顺带并 damage 并清
+//!   `REUSABLE`；
+//! - **反向脏集合**（`dirty_bind` / `dirty_layout` / `dirty_paint` / `dirty_a11y` + 帧尾结算集合）
+//!   让所有帧门禁是 O(1)、帧内工作与"变化量"成正比（Flutter `PipelineOwner` 模型）；
+//! - `taffy::Cache` 与其余每节点旁表都在 `Node` 外（`layout_cache` 为按需 `HashMap`）。
+//!
+//! `Node` 的体积受 `node/tree/tests.rs` 的 `size_of` 断言约束（≤320 B）：冷字段
+//! （`Style` / `StylePatch` / 文本载荷 / 依赖集合）全部装箱，热字段（dirty / damage / 布局盒 /
+//! lane 状态）留在主存储里。
 
 mod arena;
 mod content;
 mod dirty;
 mod layout;
-mod order;
 #[cfg(test)]
 mod tests;
 mod traverse;
 
+#[cfg(feature = "test-support")]
+use std::cell::RefCell;
 use std::{fmt, rc::Rc};
 
 use smallvec::SmallVec;
@@ -29,7 +38,7 @@ use crate::{
     math::{Edges, PhysicalRect, Point, Rect, Size, Transform},
     node::{
         dependency::ReadCtx,
-        dirty::DirtyFlags,
+        dirty::{DirtyFlags, DirtySet},
         id::{Arena, NodeId},
         signal::SignalId,
     },
@@ -57,7 +66,8 @@ pub struct LayoutBox {
 
 /// 节点的种类（决定叶子性与绘制路径）。
 ///
-/// 内部按平台无关的几何/画布形式存放（尚无平台窗口）。
+/// 内部按平台无关的几何/画布形式存放（尚无平台窗口）。文本载荷装箱（`Box<TextContent>`）：
+/// 它只出现在文本叶子上，却让每个容器节点白付 ~100 B。
 #[derive(Clone, Debug, PartialEq)]
 pub enum NodeKind {
     /// 普通容器/叶子：由引擎按 `Style`/`StylePatch` 生成图元。
@@ -69,7 +79,7 @@ pub enum NodeKind {
     /// 文本叶子：载荷是 [`TextContent`]，布局由 `App::refresh_text` 注入的 measure 闭包完成。
     ///
     /// 在首次 `refresh_text` 之前它的 measure 为 `0×0`（`NodeBuilder::text` 不伪造闭包）。
-    Text(TextContent),
+    Text(Box<TextContent>),
 }
 
 impl NodeKind {
@@ -113,16 +123,32 @@ pub(crate) struct NodeSpec {
     tab_stop: bool,
 }
 
+/// 空补丁的静态实例：`style_patch` 用 `Option<Box<StylePatch>>` 存（`None` = 空补丁），
+/// 读路径回落到它，因此**每个节点都不为默认补丁付内联体积或一次分配**。
+static EMPTY_STYLE_PATCH: StylePatch = StylePatch {
+    background: None,
+    foreground: None,
+    border: None,
+    opacity: None,
+    visible: None,
+    interactive: None,
+    cursor: None,
+    affects_layout: false,
+};
+
 /// 一个持久节点（跨帧存活）。**字段全私有**（I6：应用层不得持 `&mut Node`）。
+///
+/// 字段按"热 / 冷"分组：每帧被读的 `dirty` / `damage` / 布局盒 / lane 状态在主存储里，
+/// 挂载后基本不变的 `Style` / `StylePatch` / 文本载荷 / 依赖集合被装箱（`Node` ≤ 320 B）。
 pub struct Node {
     id: NodeId,
     parent: Option<NodeId>,
-    children: SmallVec<[NodeId; 4]>,
+    children: Vec<NodeId>,
     kind: NodeKind,
-    /// 静态结构（挂载时一次写入，之后只有结构变更才重写）。
-    style: Style,
-    /// 动态属性补丁（`bind_style` 的**上次求值**结果）。
-    style_patch: StylePatch,
+    /// 静态结构（挂载时一次写入，之后只有结构变更才重写）。冷字段：装箱。
+    style: Box<Style>,
+    /// 动态属性补丁（`bind_style` 的**上次求值**结果）；`None` = 空补丁（见 `EMPTY_STYLE_PATCH`）。
+    style_patch: Option<Box<StylePatch>>,
     /// 动态属性闭包（`None` = 静态节点）。
     bind_style: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> StylePatch>>,
     /// 自定义叶子测量（P05 的文本入口；见 [`MeasureFn`] 的纯函数契约）。
@@ -144,25 +170,26 @@ pub struct Node {
     /// 最近一次布局的**内容宽**（逻辑像素；`App::layout_text` 的断行宽度，B1）。
     text_content_width: f32,
     /// 当前布局盒（逻辑像素；窗口绝对）。消费者：`Probe`/P06/P04 的命中测试。
+    ///
+    /// **不再保存"上一次布局盒"**：damage 的旧一侧由 `place_subtree` 在写新盒时精确并入
+    /// （`damage ∪ old ∪ new`），因此 `prev_layout` 是冗余的 32 B（R03-3 的瘦身项）。
     layout: LayoutBox,
-    /// 上一次布局盒（damage 的「旧」一侧）。
-    prev_layout: LayoutBox,
     /// taffy 写入的**父相对** border box（`set_unrounded_layout` 的唯一落点）。
     local: Rect,
     /// taffy 写入的四边 border 宽度。
     local_border: Edges,
-    /// 最近一次被 taffy 布局的 epoch（`== NodeTree::layout_epoch` ⇒ 本轮布局过）。
+    /// 最近一次被 taffy 布局的 epoch（`place_subtree` 的「本轮是否新布局」判据）。
     laid_out_epoch: u32,
     /// 本帧累积的逻辑 damage AABB（§9.4）。
     damage: Rect,
-    /// 该节点的绘制输出桶（按绘制序；P06 的 paint 分配）。
-    lanes: SmallVec<[LaneId; 2]>,
-    /// 上次求值实际读过的信号（差分清理用；`replace_deps` 的 `old`）。
-    deps: SmallVec<[SignalId; 8]>,
+    /// 该节点的绘制桶（一节点一 lane；`None` = 尚无绘制输出）。
+    lane: Option<LaneId>,
+    /// 上次求值实际读过的信号（差分清理用；`replace_deps` 的 `old`）。只有挂 `bind_*` 的节点非空。
+    deps: Option<Box<SmallVec<[SignalId; 8]>>>,
     dirty: DirtyFlags,
     /// 交互槽（点击/拖拽声明、滚动、虚拟列表、浮层）；`None` = 非交互节点。
     ///
-    /// 一个 `Box` 装下全部字段（`Node` 只 +8 B，P10 预算 1136 ≤ 1152）。
+    /// 一个 `Box` 装下全部字段（`Node` 只 +8 B）。
     interaction: Option<Box<NodeInteraction>>,
     /// 该节点 lane 上次生成时的**累计滚动偏移**（paint 的复用判据，§7.6）。`Point::ZERO` = 未滚动。
     lane_offset: Point,
@@ -179,7 +206,7 @@ impl fmt::Debug for Node {
             .field("children", &self.children)
             .field("kind", &self.kind)
             .field("style", &self.style)
-            .field("style_patch", &self.style_patch)
+            .field("style_patch", &self.style_patch())
             .field("bind_style", &self.bind_style.as_ref().map(|_| "<closure>"))
             .field("measure", &self.measure.as_ref().map(|_| "<closure>"))
             .field("hit_shape", &self.hit_shape.as_ref().map(|_| "<closure>"))
@@ -190,13 +217,12 @@ impl fmt::Debug for Node {
             .field("text_measured_size", &self.text_measured_size)
             .field("text_content_width", &self.text_content_width)
             .field("layout", &self.layout)
-            .field("prev_layout", &self.prev_layout)
             .field("local", &self.local)
             .field("local_border", &self.local_border)
             .field("laid_out_epoch", &self.laid_out_epoch)
             .field("damage", &self.damage)
-            .field("lanes", &self.lanes)
-            .field("deps", &self.deps)
+            .field("lane", &self.lane)
+            .field("deps", &self.deps())
             .field("dirty", &self.dirty)
             .field("interaction", &self.interaction)
             .field("lane_offset", &self.lane_offset)
@@ -226,7 +252,7 @@ impl Node {
     /// 上次求值的动态属性补丁（消费者：`App::refresh_styles`、`App::write` 的 `affects_layout`）。
     #[must_use]
     pub fn style_patch(&self) -> &StylePatch {
-        &self.style_patch
+        self.style_patch.as_deref().unwrap_or(&EMPTY_STYLE_PATCH)
     }
 
     /// 失效集合（消费者：`App::refresh_styles`、`StylePassReport`）。
@@ -265,16 +291,10 @@ impl Node {
         self.layout
     }
 
-    /// 上一次布局盒（P04 写入；damage 的「旧」一侧）。
+    /// 该节点的绘制桶（P06 的 paint 分配；`Probe` 读取）。
     #[must_use]
-    pub fn prev_layout(&self) -> LayoutBox {
-        self.prev_layout
-    }
-
-    /// 该节点占用的绘制桶（P06 的 paint 分配；`Probe` 读取）。
-    #[must_use]
-    pub fn lanes(&self) -> &[LaneId] {
-        &self.lanes
+    pub fn lane(&self) -> Option<LaneId> {
+        self.lane
     }
 
     /// 子树裁剪策略（P04 的命中测试与 P06 的 `Clip` 图元都读它）。
@@ -295,37 +315,66 @@ impl Node {
         self.layout_override
     }
 
+    /// 是否挂了动态闭包（`bind_style` / `bind_text`）。消费者：悬停标脏（`app/input.rs`）
+    /// 与 `Window::frame` 的 debug 断言（无 App 通道的窗口帧不跑样式/文本 pass）。
+    #[must_use]
+    pub(crate) fn has_bindings(&self) -> bool {
+        self.bind_style.is_some() || self.text_bind.is_some()
+    }
+
     /// 静态绘制属性（消费者：`paint/pass.rs`）。
     #[must_use]
     pub(crate) fn paint_spec(&self) -> Option<&PaintSpec> {
         self.paint.as_deref()
     }
 
-    /// 是否挂了动态闭包（`bind_style` / `bind_text`）。消费者：`Window::frame` 的 `debug_assert`
-    /// （无 App 通道的窗口帧不跑样式/文本 pass，挂绑定就会读到过期补丁）。
+    /// 上次求值读过的信号（`Option` = 从未求值 / 没有依赖）。
     #[must_use]
-    pub(crate) fn has_bindings(&self) -> bool {
-        self.bind_style.is_some() || self.text_bind.is_some()
+    pub(crate) fn deps(&self) -> Option<&[SignalId]> {
+        self.deps.as_deref().map(SmallVec::as_slice)
     }
 
-    /// 把 `prev_layout ∪ layout` 并入 damage（§9.4：位置变化时新旧都要重画）。
+    /// 把当前布局盒并入 damage（§9.4）。
+    ///
+    /// 位置变化的"旧一侧"由 `place_subtree` 在写新盒时并入（`damage ∪ old ∪ new`），
+    /// 这里只补当前盒。
     fn accumulate_damage(&mut self) {
-        self.damage = self
-            .damage
-            .union(self.prev_layout.bounds)
-            .union(self.layout.bounds);
+        self.damage = self.damage.union(self.layout.bounds);
     }
+}
+
+/// 一次 paint 遍历所需的**只读**节点状态（单次 arena 查找算出全部，避免每节点 3–4 次重复查找）。
+///
+/// 消费者：`paint::pass::paint_node`。旧实现逐个访问器取数（`style` / `style_patch` / `dirty` /
+/// `clip_key` / `lane_offset` / `lane_of` / `scroll_slot`），每个都各自做一次 arena 槽位查找 +
+/// 选项解引用 —— 10k 节点每帧因此多付 ~1 ms（R03-10 的同源浪费）。
+pub(crate) struct PaintNodeState {
+    /// 自身不可见（`display: none` 或 `visible: false`）——调用方负责"祖先隐藏"。
+    pub hidden: bool,
+    /// lane 可整桶复用（`REUSABLE` + clip 上下文一致 + 滚动偏移戳一致）。
+    pub reusable: bool,
+    /// 节点的绘制桶（`None` = 尚无绘制输出）。
+    pub lane: Option<LaneId>,
+    /// 直接子节点数（循环里按下标取，不拷 `children`）。
+    pub children: usize,
+    /// 该节点 `Clip::Bounds` 的 padding box（屏幕坐标；`None` = 不裁剪子树）。
+    pub clip_bounds: Option<Rect>,
+    /// 该节点滚动槽的偏移（`Point::ZERO` = 非滚动容器）。
+    pub scroll_offset: Point,
 }
 
 /// 唯一的一棵节点树（I5）。
 ///
-/// `order` 是 DFS 先序数组：任何节点的子树在数组里占**连续**一段，因此结构变更只需拼接一段。
+/// 没有全序数组：任何"全树顺序"都由 [`NodeTree::for_each_dfs`] / [`NodeTree::dfs_ids`] 从
+/// `children` 现算（DFS 先序）。反向脏集合与容器登记表让每帧只碰"变化的部分"。
 pub struct NodeTree {
     arena: Arena<Node>,
     root: NodeId,
-    order: Vec<NodeId>,
-    /// taffy 布局缓存旁表（按 arena 槽位下标索引；`Node` 不内联 `Cache`，见 P03 N6 / P04 §6.1）。
-    layout_cache: Vec<Option<taffy::Cache>>,
+    /// taffy 布局缓存（**按需**：只有真正参与过布局的节点才有条目）。
+    ///
+    /// 按 `NodeId`（含代际）索引，卸载即删除；`taffy::Cache` 约 0.5 KB，所以不能像旁表那样
+    /// 按 arena 槽位预分配 —— 20 万节点静态树的槽位表会白付 ~100 MB（R03-3）。
+    layout_cache: ahash::HashMap<NodeId, taffy::Cache>,
     /// 文本形状快照旁表（按 arena 槽位下标；只有文本节点非空，16 B/槽）。
     text_slots: Vec<Option<TextSlot>>,
     /// 稳定调试 id 旁表（`NodeBuilder::id`；按 arena 槽位，槽位复用不继承）。
@@ -339,25 +388,39 @@ pub struct NodeTree {
     /// 每次 absolutize 末尾自底向上重算（O(N)，与布局同阶）。
     subtree_bounds: Vec<Rect>,
     /// a11y 载荷旁表（`NodeBuilder::{a11y,bind_a11y}`；按 arena 槽位，槽位复用不继承）。
-    ///
-    /// 与 `layout_cache` / `clip_keys` 同型：`Node` 因此保持 1144 B（P11 F-114）。
     a11y_slots: Vec<Option<Box<crate::a11y::tree::NodeA11y>>>,
-    /// 带 `A11Y` 位的节点数（O(1) 的「有没有 a11y 工作」判据；P11 S-108）。
-    a11y_dirty: u32,
-    /// 文本内容可能变化的节点集合（P1-2.3）。
+    /// 动态属性待重算（`BIND`）的节点集合。消费者：`App::refresh_styles`。
+    dirty_bind: DirtySet,
+    /// 待重排（`LAYOUT`）的节点集合。消费者：`layout_if_dirty` 门禁 + taffy 布局；
+    /// 清除点是 `set_local_layout`。
+    dirty_layout: DirtySet,
+    /// 待重建 lane（`PAINT`）的节点集合。消费者：paint pass（`clear_paint` 清除）。
+    dirty_paint: DirtySet,
+    /// 待重发 a11y（`A11Y`）的节点集合（O(1) 的「有没有 a11y 工作」判据）。
+    dirty_a11y: DirtySet,
+    /// 帧尾结算集合：本帧动过（标了 `LAYOUT|PAINT` 或布局移动）的节点。
     ///
-    /// `App::refresh_text` 原本每帧遍历整棵树、对每个文本节点 `text_content(node).cloned()`
-    /// 再算全文哈希 —— 即使这一帧没有任何文本变化。集合在「文本载荷被写入」时登记
-    /// （`set_text_content`）、在 `refresh_text` 消费后清空，因此稳态下遍历成本是 O(变化的文本)。
+    /// 唯一消费者 + 清除点：`settle_frame`（damage 归零 / 置 `REUSABLE`）。
+    /// 旧实现遍历整个全序数组，帧成本因此是 O(N)。
+    dirty_settle: DirtySet,
+    /// 本轮布局中**位置或尺寸真的变了**的节点（`mark_moved_a11y` 的输入）。
+    /// 由 `place_subtree` 登记、布局 post-pass 之后消费 —— 不再为了补 a11y 而全树扫描。
+    moved_nodes: DirtySet,
+    /// 滚动容器的登记表（挂载时登记、卸载时剔除）。
     ///
-    /// **O(1) 去重**（R12-13）：`Vec` + `ahash::HashSet`。旧实现的 `Vec::contains` 在「行情表
-    /// 整表 tick」（一帧 5000 次 `set_text_content`）下是 O(n²)：约 1250 万次比较，5–15 ms。
+    /// `App::clamp_scroll_offsets` 每帧要重夹所有滚动偏移，旧实现为此遍历全树；登记表让它是
+    /// O(滚动容器数) —— 与节点数无关。
+    scroll_containers: Vec<NodeId>,
+    /// 虚拟列表容器的登记表（同上；`App::rewindow_virtuals` 每帧的输入）。
+    virtual_containers: Vec<NodeId>,
+    /// 浮层容器的登记表（同上；`App::resolve_overlay_placements` 每帧的输入）。
+    ///
+    /// 旧的实现每帧拷贝 root 的**全部子节点**再过滤 `overlay_slot`：10k 行的盘口表
+    /// 因此每帧白付一次 10k 元素的收集 + 80 KB 分配。
+    overlay_containers: Vec<NodeId>,
+    /// 文本内容可能变化的节点集合（P1-2.3；`set_text_content` 登记、`refresh_text` 消费）。
     text_dirty: content::TextDirtyQueue,
-    /// 「需要重建 `ShapedLine`」的文本节点集合（R12-14）。
-    ///
-    /// `App::layout_text` 原本每帧遍历整棵树（含容器/图标），即使零文本变化也要走一遍；
-    /// 现在只遍历本集合：`set_text_shaped`（新快照） / 内容宽变化（`set_local_layout`） /
-    /// 图集逐 tile 淘汰（`invalidate_text_lines`） / 全量失效（字体栈、系统字体）时入队。
+    /// 「需要重建 `ShapedLine`」的文本节点集合（R12-14；`layout_text` 只遍历它）。
     text_layout_dirty: content::TextDirtyQueue,
     /// 卸载节点的待释放 lane（`Window::paint_frame` 消费后清空，容量保留）。
     removed_lanes: Vec<LaneId>,
@@ -374,11 +437,17 @@ pub struct NodeTree {
     /// `Window::paint_frame` 每帧取走。
     geometry_damage_escalation: bool,
     /// 几何节点的 per-draw 变换旁表（R05-12：`Primitive::Geometry.transform` 的来源）。
-    ///
-    /// 旁表而不是 `Node` 字段：绝大多数节点没有几何变换，`Node` 的 1152 B 预算不该为此
-    /// 付 24 B（与 `layout_cache` / `a11y_slots` 同型）。只在 `set_geometry_transform`
-    /// 写入时分配条目，单位矩阵 = 无条目。`DirtyFlags::GEOMETRY` 由它置位。
+    /// 只在 `set_geometry_transform` 写入时分配条目，单位矩阵 = 无条目。
     geometry_transforms: ahash::HashMap<NodeId, Transform>,
+    /// 消费脏集合时把条目搬过来再遍历的复用缓冲（`mem::take` / `recycle` 成对使用，保容量）。
+    dirty_scratch: Vec<NodeId>,
+    /// 本帧"被引擎簿记访问过的不同节点"集合（仅 `test-support`；`FrameRecord::scanned_nodes`）。
+    ///
+    /// 用 `RefCell` 而不是 `&mut`：DFS 遍历函数只拿 `&self`，而计数不应改变借用形状。
+    #[cfg(feature = "test-support")]
+    scanned: RefCell<ahash::HashSet<NodeId>>,
+    /// 挂了动态闭包（`bind_style` / `bind_text`）的节点数（O(1)：`Window::frame` 的 debug 断言）。
+    bound_nodes: usize,
 }
 
 impl Default for NodeTree {
@@ -422,35 +491,78 @@ impl NodeTree {
     pub fn debug_id(&self, node: NodeId) -> Option<&str> {
         arena::debug_id(self, node)
     }
-
-    // ── order：实现见 `order` 子模块的自由函数 ──
-    /// 实现见子模块 `order::order`（本文件只保留签名）。
-    #[must_use]
-    pub fn order(&self) -> &[NodeId] {
-        order::order(self)
-    }
-    /// 实现见子模块 `order::append_child`（本文件只保留签名）。
+    /// 实现见子模块 `arena::append_child`（本文件只保留签名）。
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) -> Result<(), EngineError> {
-        order::append_child(self, parent, child)
+        arena::append_child(self, parent, child)
     }
-    fn order_insert(&mut self, parent: NodeId, child: NodeId) {
-        order::order_insert(self, parent, child)
+    /// 存活节点数（O(1)；消费者：probe / 诊断 / 遍历容量预估）。
+    #[must_use]
+    pub fn len(&self) -> usize {
+        arena::len(self)
     }
-    fn order_remove_subtree(&mut self, node: NodeId) {
-        order::order_remove_subtree(self, node)
+    /// 是否只有根节点（`clippy::len_without_is_empty` 的配对）。
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() <= 1
     }
-    fn order_pos(&self, node: NodeId) -> Option<usize> {
-        order::order_pos(self, node)
+
+    // ── traverse：实现见 `traverse` 子模块的自由函数 ──
+    /// 实现见子模块 `traverse::for_each_dfs`（本文件只保留签名）。
+    pub(crate) fn for_each_dfs(&self, visit: impl FnMut(NodeId)) {
+        traverse::for_each_dfs(self, visit)
     }
-    fn subtree_len(&self, node: NodeId) -> usize {
-        order::subtree_len(self, node)
+    /// 实现见子模块 `traverse::dfs_ids`（本文件只保留签名）。
+    #[must_use]
+    pub(crate) fn dfs_ids(&self) -> Vec<NodeId> {
+        traverse::dfs_ids(self)
     }
-    fn collect_subtree_ids(&self, node: NodeId) -> SmallVec<[NodeId; 16]> {
-        order::collect_subtree_ids(self, node)
+    /// 实现见子模块 `traverse::for_each_subtree`（本文件只保留签名）。
+    pub(crate) fn for_each_subtree(&self, root: NodeId, visit: impl FnMut(NodeId)) {
+        traverse::for_each_subtree(self, root, visit)
     }
-    #[cfg(debug_assertions)]
-    fn debug_assert_order_matches_tree(&self) {
-        order::debug_assert_order_matches_tree(self)
+    #[must_use]
+    pub(crate) fn is_visible_locally(&self, node: NodeId) -> bool {
+        traverse::is_visible_locally(self, node)
+    }
+    #[must_use]
+    pub(crate) fn is_effectively_visible(&self, node: NodeId) -> bool {
+        traverse::is_effectively_visible(self, node)
+    }
+    fn is_ancestor(&self, ancestor: NodeId, node: NodeId) -> bool {
+        traverse::is_ancestor(self, ancestor, node)
+    }
+    pub(crate) fn hoisted_clear(&mut self, node: NodeId) {
+        traverse::hoisted_clear(self, node)
+    }
+    pub(crate) fn hoisted_push(&mut self, node: NodeId, hoisted: &[NodeId]) {
+        traverse::hoisted_push(self, node, hoisted)
+    }
+    /// 实现见子模块 `traverse::note_scroll_container`（本文件只保留签名）。
+    pub(crate) fn note_scroll_container(&mut self, node: NodeId) {
+        traverse::note_scroll_container(self, node)
+    }
+    /// 实现见子模块 `traverse::note_virtual_container`（本文件只保留签名）。
+    pub(crate) fn note_virtual_container(&mut self, node: NodeId) {
+        traverse::note_virtual_container(self, node)
+    }
+    /// 实现见子模块 `traverse::note_overlay_container`（本文件只保留签名）。
+    pub(crate) fn note_overlay_container(&mut self, node: NodeId) {
+        traverse::note_overlay_container(self, node)
+    }
+    /// 实现见子模块 `traverse::scroll_containers`（本文件只保留签名）。
+    #[must_use]
+    pub(crate) fn scroll_containers(&self) -> &[NodeId] {
+        &self.scroll_containers
+    }
+    /// 实现见子模块 `traverse::virtual_containers`（本文件只保留签名）。
+    #[must_use]
+    pub(crate) fn virtual_containers(&self) -> &[NodeId] {
+        &self.virtual_containers
+    }
+    /// 实现见子模块 `traverse::overlay_containers`（本文件只保留签名）。
+    #[must_use]
+    pub(crate) fn overlay_containers(&self) -> &[NodeId] {
+        &self.overlay_containers
     }
 
     // ── layout：实现见 `layout` 子模块的自由函数 ──
@@ -555,16 +667,19 @@ impl NodeTree {
         layout::hit_test(self, point)
     }
     #[cfg(test)]
-    pub(crate) fn set_layout_for_test(
-        &mut self,
-        node: NodeId,
-        layout: LayoutBox,
-        prev_layout: LayoutBox,
-    ) -> bool {
-        layout::set_layout_for_test(self, node, layout, prev_layout)
+    pub(crate) fn set_layout_for_test(&mut self, node: NodeId, layout: LayoutBox) -> bool {
+        layout::set_layout_for_test(self, node, layout)
+    }
+    /// 实现见子模块 `layout::layout_cache`（本文件只保留签名；测试读点）。
+    #[cfg(test)]
+    pub(crate) fn layout_cache(&self, node: NodeId) -> Option<&taffy::Cache> {
+        layout::layout_cache(self, node)
     }
 
     // ── dirty：实现见 `dirty` 子模块的自由函数 ──
+    pub(crate) fn mark_bind(&mut self, node: NodeId) -> bool {
+        dirty::mark_bind(self, node)
+    }
     pub(crate) fn mark_paint(&mut self, node: NodeId) -> bool {
         dirty::mark_paint(self, node)
     }
@@ -580,6 +695,9 @@ impl NodeTree {
     fn mark_subtree_paint(&mut self, node: NodeId) {
         dirty::mark_subtree_paint(self, node)
     }
+    pub(crate) fn clear_bind(&mut self, node: NodeId) -> bool {
+        dirty::clear_bind(self, node)
+    }
     pub(crate) fn clear_paint(&mut self, node: NodeId) -> bool {
         dirty::clear_paint(self, node)
     }
@@ -589,7 +707,8 @@ impl NodeTree {
     pub(crate) fn clear_a11y(&mut self, node: NodeId) -> bool {
         dirty::clear_a11y(self, node)
     }
-    pub(crate) fn a11y_dirty(&self) -> u32 {
+    #[must_use]
+    pub(crate) fn a11y_dirty(&self) -> usize {
         dirty::a11y_dirty(self)
     }
     fn touch(&mut self, node: NodeId, flags: DirtyFlags) -> bool {
@@ -598,16 +717,73 @@ impl NodeTree {
     fn touch_layout_only(&mut self, node: NodeId) -> bool {
         dirty::touch_layout_only(self, node)
     }
-    pub(crate) fn any_node(&self, predicate: impl FnMut(&Node) -> bool) -> bool {
-        dirty::any_node(self, predicate)
+    /// 本帧是否有待布局的节点（O(1)；`layout_if_dirty` 的门禁）。
+    #[must_use]
+    pub(crate) fn has_layout_work(&self) -> bool {
+        !self.dirty_layout.is_empty()
     }
+    /// 本帧是否有待重建 lane 的节点（O(1)；`needs_node_repaint` 的门禁）。
+    #[must_use]
+    pub(crate) fn has_paint_work(&self) -> bool {
+        !self.dirty_paint.is_empty()
+    }
+    /// 本帧是否有待重算动态属性的节点（O(1)；`needs_frame` 的门禁）。
+    #[must_use]
+    pub(crate) fn has_bind_work(&self) -> bool {
+        !self.dirty_bind.is_empty()
+    }
+
+    /// 实现见子模块 `dirty::take_dirty_bind`（本文件只保留签名）。
+    pub(crate) fn take_dirty_bind(&mut self) -> Vec<NodeId> {
+        dirty::take_dirty_bind(self)
+    }
+    /// 实现见子模块 `dirty::take_settle`（本文件只保留签名）。
+    pub(crate) fn take_settle(&mut self) -> Vec<NodeId> {
+        dirty::take_settle(self)
+    }
+    /// 实现见子模块 `dirty::take_a11y`（本文件只保留签名）。
+    pub(crate) fn take_a11y(&mut self) -> Vec<NodeId> {
+        dirty::take_a11y(self)
+    }
+    /// 实现见子模块 `dirty::take_moved`（本文件只保留签名）。
+    pub(crate) fn take_moved(&mut self) -> Vec<NodeId> {
+        dirty::take_moved(self)
+    }
+    /// 归还 [`NodeTree::take_dirty_bind`] 等借用走的复用缓冲（容量保留，避免每帧分配）。
+    pub(crate) fn recycle(&mut self, mut buffer: Vec<NodeId>) {
+        buffer.clear();
+        self.dirty_scratch = buffer;
+    }
+    /// 是否还有节点挂着动态闭包（O(1)；`Window::frame` 的 debug 断言，取代旧的全树扫描）。
+    #[must_use]
+    pub(crate) fn has_bound_nodes(&self) -> bool {
+        self.bound_nodes > 0
+    }
+    /// 仅测试：把某节点的位与反向集合彻底清空（测试的"从干净状态开始"）。
     #[cfg(test)]
     pub(crate) fn clear_all_dirty_for_test(&mut self) {
         dirty::clear_all_dirty_for_test(self)
     }
+    /// 仅测试：直接设置失效位（不经过 mark_* 的副作用）。
     #[cfg(test)]
     pub(crate) fn set_dirty_for_test(&mut self, node: NodeId, flags: DirtyFlags) -> bool {
         dirty::set_dirty_for_test(self, node, flags)
+    }
+    /// 记录"引擎簿记访问过该节点"（仅 `test-support`；`FrameRecord::scanned_nodes` 的输入）。
+    #[cfg(feature = "test-support")]
+    pub(crate) fn note_scanned(&self, node: NodeId) {
+        self.scanned.borrow_mut().insert(node);
+    }
+    /// 本帧被簿记访问过的不同节点数（仅 `test-support`）。
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub(crate) fn scanned_nodes(&self) -> usize {
+        self.scanned.borrow().len()
+    }
+    /// 帧初重置扫描计数（仅 `test-support`；`Window::begin_frame` 调用）。
+    #[cfg(feature = "test-support")]
+    pub(crate) fn reset_scanned_nodes(&self) {
+        self.scanned.borrow_mut().clear();
     }
 
     // ── content：实现见 `content` 子模块的自由函数 ──
@@ -720,7 +896,7 @@ impl NodeTree {
     }
     /// 设置几何节点的 per-draw 变换（顶点**不**重建：图表平移只改一个 uniform）。
     ///
-    /// 标 `PAINT`（lane 需要重建，因为变换烘在 lane 的图元里）与 `GEOMETRY`（语义标记）。
+    /// 标 `PAINT`（lane 需要重建，因为变换烘在 lane 的图元里）。
     ///
     /// # Errors
     /// [`EngineError::StaleNode`]：节点不存在或不是几何节点。
@@ -741,15 +917,20 @@ impl NodeTree {
     pub(crate) fn set_lane(&mut self, node: NodeId, lane: LaneId) {
         content::set_lane(self, node, lane)
     }
-    #[must_use]
-    pub(crate) fn lane_offset(&self, node: NodeId) -> Point {
-        content::lane_offset(self, node)
-    }
     pub(crate) fn set_lane_offset(&mut self, node: NodeId, offset: Point) {
         content::set_lane_offset(self, node, offset)
     }
     pub(crate) fn clip_key(&self, node: NodeId) -> Option<(u8, Option<PhysicalRect>)> {
         content::clip_key(self, node)
+    }
+    /// 一次取全 paint 所需的只读状态（消费者：`paint::pass::paint_node`）。
+    pub(crate) fn paint_state(
+        &self,
+        node: NodeId,
+        offset: Point,
+        clip_key: (u8, Option<PhysicalRect>),
+    ) -> Option<PaintNodeState> {
+        content::paint_state(self, node, offset, clip_key)
     }
     pub(crate) fn set_clip_key(&mut self, node: NodeId, key: (u8, Option<PhysicalRect>)) {
         content::set_clip_key(self, node, key)
@@ -761,8 +942,8 @@ impl NodeTree {
         content::set_reusable(self, node)
     }
     #[cfg(feature = "test-support")]
-    pub(crate) fn clear_all_reusable(&mut self) {
-        content::clear_all_reusable(self)
+    pub(crate) fn force_repaint_all(&mut self) {
+        content::force_repaint_all(self)
     }
     pub(crate) fn clear_lane(&mut self, node: NodeId) {
         content::clear_lane(self, node)
@@ -806,7 +987,7 @@ impl NodeTree {
         content::put_bind_style(self, node, bind_style)
     }
     pub(crate) fn deps(&self, node: NodeId) -> Option<&[SignalId]> {
-        content::deps(self, node)
+        self.arena.get(node).and_then(Node::deps)
     }
     pub(crate) fn set_deps(&mut self, node: NodeId, deps: SmallVec<[SignalId; 8]>) -> bool {
         content::set_deps(self, node, deps)
@@ -865,24 +1046,5 @@ impl NodeTree {
     #[cfg(test)]
     pub(crate) fn edit_style_for_test(&mut self, node: NodeId, edit: impl FnOnce(&mut Style)) {
         content::edit_style_for_test(self, node, edit)
-    }
-
-    // ── traverse：实现见 `traverse` 子模块的自由函数 ──
-    #[must_use]
-    pub(crate) fn is_visible_locally(&self, node: NodeId) -> bool {
-        traverse::is_visible_locally(self, node)
-    }
-    #[must_use]
-    pub(crate) fn is_effectively_visible(&self, node: NodeId) -> bool {
-        traverse::is_effectively_visible(self, node)
-    }
-    fn is_ancestor(&self, ancestor: NodeId, node: NodeId) -> bool {
-        traverse::is_ancestor(self, ancestor, node)
-    }
-    pub(crate) fn hoisted_clear(&mut self, node: NodeId) {
-        traverse::hoisted_clear(self, node)
-    }
-    pub(crate) fn hoisted_push(&mut self, node: NodeId, hoisted: &[NodeId]) {
-        traverse::hoisted_push(self, node, hoisted)
     }
 }

@@ -56,11 +56,12 @@ struct WindowMirror {
 
 /// `Application::run` 的平台入口。
 ///
-/// 输入阈值（R02-15）在 Linux 上**没有**可移植的系统查询通路：GTK 的 `gtk-double-click-time`
-/// 在 XSettings 里（需要 xsettings 后端），Qt 也走同样的后端。因此这里保留
-/// [`crate::interaction::InputThresholds::platform_default`] 的平台缺省（400 ms / 4 px）而不是
-/// 静默地沿用 Windows 的 500 ms —— 阈值来自平台的意图由缺省值表达，读取系统值的通路留待
-/// 引入 XSettings 客户端后补上（届时与 Windows 的 `install_input_thresholds` 同形态）。
+/// 输入阈值（R02-15）在 Linux 上**没有**系统查询通路，本引擎也**不引入** XSettings / GTK
+/// 依赖：GTK 的 `gtk-double-click-time` 在 XSettings 里（需要 xsettings 后端），Qt 走同一后端。
+/// 因此这里保留 [`crate::interaction::InputThresholds::platform_default`] 的平台缺省
+/// （400 ms / 4 px），而不是静默地沿用 Windows 的 500 ms —— 这是一个**明确声明**的偏离：
+/// 用户在系统设置里调过双击速度时，引擎的判定会与其它应用不一致（见
+/// [`crate::interaction::InputThresholds`] 的文档表）。
 pub(crate) fn run(app: App) -> Result<(), EngineError> {
     let dispatcher = app.dispatcher();
     // 唤醒句柄由本平台的 `wake::install` 安装；`attach` 的 token 只对 Win32 有意义。

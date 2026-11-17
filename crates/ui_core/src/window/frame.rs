@@ -8,7 +8,6 @@ use super::{FrameIndex, FrameOutcome, FrameTicket, Window};
 use crate::{
     error::EngineError,
     layout::LayoutReport,
-    node::dirty::DirtyFlags,
     paint::pass::PaintReport,
     render::{
         backend::Renderer,
@@ -104,14 +103,15 @@ impl FrameScheduler {
 pub(crate) fn needs_frame(window: &Window, wake: bool) -> bool {
     // `a11y_bind_pending`：只有 `bind_a11y` 的节点被写信号时**没有**像素要画，但
     // `refresh_styles` 仍必须跑一次（否则补丁永远不更新）。帧末的门禁会把它退回 `Idle`。
+    //
+    // 全部判据都是 O(1)：读的是 `NodeTree` 的反向脏集合是否为空（R03-1 / S1）。旧实现用
+    // `any_node(|n| LAYOUT|PAINT || !REUSABLE)` 做全树扫描，10k 节点每帧白付 ~50 µs。
     wake || window.full_damage_pending
         || window.pending_damage.is_some()
         || window.a11y.bind_work()
-        || window.tree.any_node(|node| {
-            let dirty = node.dirty();
-            dirty.intersects(DirtyFlags::LAYOUT | DirtyFlags::PAINT)
-                || !dirty.contains(DirtyFlags::REUSABLE)
-        })
+        || window.tree.has_bind_work()
+        || window.tree.has_layout_work()
+        || window.tree.has_paint_work()
 }
 
 // 消费者：`impl Window::begin_frame` 的薄委托（外部调用点见该方法文档）。
@@ -122,6 +122,9 @@ pub(crate) fn begin_frame(window: &mut Window) -> Option<FrameTicket> {
         return None;
     }
     let ticket = window.scheduler.begin()?;
+    // 帧簿记的扫描计数从本帧开始重新统计（`FrameRecord::scanned_nodes`，仅 test-support）。
+    #[cfg(feature = "test-support")]
+    window.tree.reset_scanned_nodes();
     #[cfg(feature = "hud")]
     {
         window.frame_started_at = Some(std::time::Instant::now());
@@ -132,10 +135,8 @@ pub(crate) fn begin_frame(window: &mut Window) -> Option<FrameTicket> {
 // 消费者：`impl Window::layout_if_dirty` 的薄委托（外部调用点见该方法文档）。
 /// 仅当有 `LAYOUT` 时才重排（纯颜色变化不跑布局）。
 pub(crate) fn layout_if_dirty(window: &mut Window) -> Result<Option<LayoutReport>, EngineError> {
-    if !window
-        .tree
-        .any_node(|node| node.dirty().contains(DirtyFlags::LAYOUT))
-    {
+    // O(1) 门禁（R03-1）：读 `dirty_layout` 反向集合，不再全树扫描。
+    if !window.tree.has_layout_work() {
         return Ok(None);
     }
     window.compute_layout().map(Some)
@@ -188,7 +189,7 @@ pub(crate) fn commit_frame(
     let plan = surface_change_plan(plan, renderer_surface, window.surface);
     if !frame_reaches_gpu(plan, renderer_surface, window.surface) {
         // paint 已经消费了 lane 重建与 damage：即使不发布，也必须像已提交的帧一样结算节点
-        // 状态（damage / prev_layout / REUSABLE），否则后续会 over-damage、a11y 多标（P2-1）。
+        // 状态（damage / REUSABLE），否则后续会 over-damage、a11y 多标（P2-1）。
         // 只是不推进 `FrameIndex`、不发布（V-122 ⑧ / F-183）。
         window.tree.settle_frame();
         window.scheduler.abort(ticket);
@@ -222,11 +223,12 @@ pub(crate) fn commit_frame(
             &window.scene,
             &window.tree,
             &window.resolver,
-            &report,
+            report,
             window.damage.rects(),
             frame,
             index,
             stats,
+            window.tree.scanned_nodes(),
         );
         window.record = Some(record);
     }
@@ -314,7 +316,7 @@ pub(crate) fn frame(window: &mut Window) -> Result<FrameOutcome, EngineError> {
         return Ok(FrameOutcome::Idle);
     }
     debug_assert!(
-        !window.tree.any_node(crate::node::tree::Node::has_bindings),
+        !window.tree.has_bound_nodes(),
         "Window::frame does not run style/text passes; use App::frame for bound nodes"
     );
     let Some(ticket) = window.begin_frame() else {

@@ -1,11 +1,10 @@
-//! 焦点：可聚焦谓词、Tab 序（`order` 过滤）、焦点作用域与焦点移动的纯逻辑。
+//! 焦点：可聚焦谓词、Tab 序（DFS 先序过滤）、焦点作用域与焦点移动的纯逻辑。
 //!
 //! 状态（`focused`）在 [`crate::interaction::FocusScope`]；写入口是 `App::{set_focus, focus_next, focus_prev}`
 //! （`design/phase-10-interaction.md` §6）。
 
 use crate::{
     event::Action,
-    interaction::overlay::is_in_subtree,
     node::{id::NodeId, tree::NodeTree},
 };
 
@@ -38,9 +37,13 @@ pub(crate) fn focusable(tree: &NodeTree, node: NodeId) -> bool {
 /// 作用域根是最上层带 `trap_focus` 的浮层（[`crate::interaction::overlay::focus_scope_root`]）。
 /// R02-12：模态浮层一开，Tab 序、`set_focus` 与指针抢焦点都只认作用域内的节点 —— 否则
 /// `Explicit` 策略的「模态」在用户按 Tab / 点时形同虚设。
+///
+/// 「作用域内」不只是子树：模态之上打开的**弹出层**（`opener` 在模态内，含嵌套）也在作用域
+/// 内（[`crate::interaction::overlay::in_modal_scope`]）—— 否则对话框里的下拉菜单里的控件
+/// 无法获得焦点。
 #[must_use]
 pub(crate) fn in_scope(tree: &NodeTree, node: NodeId, scope: Option<NodeId>) -> bool {
-    scope.is_none_or(|root| is_in_subtree(tree, node, root))
+    crate::interaction::overlay::in_modal_scope(tree, node, scope)
 }
 
 /// 可聚焦 **且** 在当前作用域内。
@@ -49,9 +52,9 @@ pub(crate) fn focusable_in_scope(tree: &NodeTree, node: NodeId, scope: Option<No
     in_scope(tree, node, scope) && focusable(tree, node)
 }
 
-/// 从 `from` 出发按 `order` 找下一个可聚焦节点（`backwards` = 反向；末尾回绕）。
+/// 从 `from` 出发按 DFS 先序找下一个可聚焦节点（`backwards` = 反向；末尾回绕）。
 ///
-/// `from == None` ⇒ 正向取第一个 / 反向取最后一个。`order` 是 DFS 先序（P03 §11.5），因此 Tab 序 = 阅读顺序。
+/// `from == None` ⇒ 正向取第一个 / 反向取最后一个。遍历序是 `children` 的 DFS 先序，因此 Tab 序 = 阅读顺序。
 /// `scope` 限定候选集（模态浮层的焦点陷阱，R02-12）：`from` 不在作用域内时按「无焦点」处理。
 pub(crate) fn next_focusable(
     tree: &NodeTree,
@@ -59,7 +62,8 @@ pub(crate) fn next_focusable(
     backwards: bool,
     scope: Option<NodeId>,
 ) -> Option<NodeId> {
-    let order = tree.order();
+    // Tab 序 = `children` 的 DFS 先序（阅读顺序），由 `dfs_ids` 现算；不再有全序数组。
+    let order = tree.dfs_ids();
     let candidate = |node: &NodeId| focusable_in_scope(tree, *node, scope);
     // 焦点不在候选集里（禁用 / 已卸载 / 无焦点 / 在作用域外）：正向取第一个、反向取最后一个。
     let Some(from) = from.filter(|node| candidate(node)) else {
@@ -77,8 +81,7 @@ pub(crate) fn next_focusable(
             order.iter().copied().find(candidate)
         };
     };
-    // 单趟环形扫描（末尾回绕）：零分配。旧的「先收集全部候选再取相邻」每次 Tab 都要
-    // 分配一个与节点数同阶的 `Vec` 并扫描两遍（P2-3）。
+    // 单趟环形扫描（末尾回绕）：零额外分配。
     let len = order.len();
     for step in 1..=len {
         let index = if backwards {

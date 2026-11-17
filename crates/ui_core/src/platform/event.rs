@@ -51,8 +51,6 @@ pub(crate) enum PlatformEvent {
         dx_lines: f32,
         /// 垂直滚动**行数**（正 = 向上，与 `WM_MOUSEWHEEL` 的正方向一致）。
         dy_lines: f32,
-        /// 一格滚轮对应的行数（`SPI_GETWHEELSCROLLLINES`；`0.0` = 未知）。
-        lines_per_tick: f32,
     },
     Key {
         code: KeyCode,
@@ -83,22 +81,23 @@ pub(crate) enum PlatformEvent {
 
 /// 一条消息 → 平台事件的**带时间戳**产物（R02-14）。
 ///
-/// `ticks_ms` 是消息的 `MSG.time`（与 `GetTickCount64` 同源、系统启动为原点），
+/// `ticks_ms` 是消息的 `MSG.time`（与 `GetTickCount` 同源的 **32 位**毫秒，49.7 天回绕），
 /// `WndProc` 用 `GetMessageTime()` 取到它；平台事件转 `InputEvent` 时经
-/// [`crate::event::timestamp_from_ticks`] 换算成引擎单调时钟。
+/// [`crate::event::timestamp_from_ticks_32`] 换算成引擎单调时钟（「现在」用
+/// `GetTickCount64() as u32`，同源同宽）。
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StampedEvent {
     /// 平台事件。
     pub event: PlatformEvent,
-    /// 消息时间（毫秒）。
-    pub ticks_ms: u64,
+    /// 消息时间（毫秒，32 位回绕域）。
+    pub ticks_ms: u32,
 }
 
 /// 每条消息都要带的输入上下文（时间戳 + 系统滚轮行数）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct MessageContext {
-    /// 消息时间（`GetMessageTime()`，毫秒）。
-    pub ticks_ms: u64,
+    /// 消息时间（`GetMessageTime()`，毫秒，32 位回绕域）。
+    pub ticks_ms: u32,
     /// 一格滚轮的行数（`SPI_GETWHEELSCROLLLINES`；`0.0` = 未知/按页）。
     pub wheel_lines: f32,
 }
@@ -178,7 +177,6 @@ pub(crate) fn translate(
                 y,
                 dx_lines: 0.0,
                 dy_lines: ticks * lines,
-                lines_per_tick: lines,
             })
         }
         WM_MOUSEHWHEEL => {
@@ -189,7 +187,6 @@ pub(crate) fn translate(
                 y,
                 dx_lines: ticks * lines,
                 dy_lines: 0.0,
-                lines_per_tick: lines,
             })
         }
         WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
@@ -332,6 +329,10 @@ const VK_SNAPSHOT_CODE: u16 = 0x2C;
 /// 或无对应项时退回虚拟键的命名键映射；两者都不认识 ⇒
 /// [`KeyCode::Unidentified`]（Windows 载荷 = 扫描码，bit 8 = `E0` 扩展键；没有扫描码时
 /// `0x8000 | VK`），文档明确它**不可跨平台**。
+///
+/// **扩展行不回落到基础行**：`E0` 前缀的扫描码只查扩展表（见 [`key_code_from_scancode`]），
+/// 因此音量+/浏览器键不会被当成字母/F 键。扫描码缺失（注入消息、无扫描码的虚拟键）时才用
+/// VK 的命名键映射 —— VK 的字母/数字是布局相关的，**不**参与字母身份。
 pub(crate) fn key_code_from_native(vk: u16, scancode: u16, extended: bool) -> KeyCode {
     // 扫描码有歧义的少数键：用 VK 定夺。
     match vk {
@@ -353,127 +354,186 @@ pub(crate) fn key_code_from_native(vk: u16, scancode: u16, extended: bool) -> Ke
 
 /// 扫描码（set 1）+ `E0` 扩展位 → [`KeyCode`]（W3C `KeyboardEvent.code` 语义）。
 ///
-/// 小键盘与导航键共用扫描码（0x47 既是 `Numpad7` 也是 `Home`），由 `E0` 区分 —— 这正是
+/// **基础行与扩展行是两张独立的表**（P1：媒体键误映射）。`E0` 前缀换的是**整个键的身份**，
+/// 而不是「同一个键的另一种形式」：
+///
+/// - 基础行（无 `E0`）：字母/数字/标点/功能键/小键盘；
+/// - 扩展行（`E0`）：右 Ctrl/Alt、小键盘回车与 `/`、导航键、Meta/菜单键，以及
+///   **媒体/浏览器/电源键**（`E0 10` 上一曲、`E0 19` 下一曲、`E0 20` 静音、`E0 22` 播放/暂停、
+///   `E0 24` 停止、`E0 2E` 音量-、`E0 30` 音量+、`E0 32` 主页、`E0 65..6D` 浏览器/邮件键）。
+///
+/// 旧实现用 `(scancode, _)` 匹配字母行，于是 `E0 30`（音量+）被当成扫描码 `0x30` ⇒ `KeyB`、
+/// `E0 65`（浏览器搜索）⇒ `F14`：音量键以**无修饰的 `KeyB`** 进入应用，会命中交易终端的
+/// 裸键绑定（`B` 买入），并且打破了「同一物理键三平台同一 `KeyCode`」的承诺。
+///
+/// 小键盘与导航键共用扫描码（`0x47` 既是 `Numpad7` 也是 `Home`），由 `E0` 区分 —— 这正是
 /// W3C 的划分：`code` 表达**物理键位**（`Numpad7`），NumLock 只影响 `key`（`7` / `Home`）。
 fn key_code_from_scancode(scancode: u16, extended: bool) -> Option<KeyCode> {
-    let code = match (scancode, extended) {
-        (0x01, _) => KeyCode::Escape,
-        (0x02, _) => KeyCode::Digit1,
-        (0x03, _) => KeyCode::Digit2,
-        (0x04, _) => KeyCode::Digit3,
-        (0x05, _) => KeyCode::Digit4,
-        (0x06, _) => KeyCode::Digit5,
-        (0x07, _) => KeyCode::Digit6,
-        (0x08, _) => KeyCode::Digit7,
-        (0x09, _) => KeyCode::Digit8,
-        (0x0A, _) => KeyCode::Digit9,
-        (0x0B, _) => KeyCode::Digit0,
-        (0x0C, _) => KeyCode::Minus,
-        (0x0D, _) => KeyCode::Equal,
-        (0x0E, _) => KeyCode::Backspace,
-        (0x0F, _) => KeyCode::Tab,
-        (0x10, _) => KeyCode::KeyQ,
-        (0x11, _) => KeyCode::KeyW,
-        (0x12, _) => KeyCode::KeyE,
-        (0x13, _) => KeyCode::KeyR,
-        (0x14, _) => KeyCode::KeyT,
-        (0x15, _) => KeyCode::KeyY,
-        (0x16, _) => KeyCode::KeyU,
-        (0x17, _) => KeyCode::KeyI,
-        (0x18, _) => KeyCode::KeyO,
-        (0x19, _) => KeyCode::KeyP,
-        (0x1A, _) => KeyCode::BracketLeft,
-        (0x1B, _) => KeyCode::BracketRight,
-        (0x1C, false) => KeyCode::Enter,
-        (0x1C, true) => KeyCode::NumpadEnter,
-        (0x1D, false) => KeyCode::ControlLeft,
-        (0x1D, true) => KeyCode::ControlRight,
-        (0x1E, _) => KeyCode::KeyA,
-        (0x1F, _) => KeyCode::KeyS,
-        (0x20, _) => KeyCode::KeyD,
-        (0x21, _) => KeyCode::KeyF,
-        (0x22, _) => KeyCode::KeyG,
-        (0x23, _) => KeyCode::KeyH,
-        (0x24, _) => KeyCode::KeyJ,
-        (0x25, _) => KeyCode::KeyK,
-        (0x26, _) => KeyCode::KeyL,
-        (0x27, _) => KeyCode::Semicolon,
-        (0x28, _) => KeyCode::Quote,
-        (0x29, _) => KeyCode::Backquote,
-        (0x2A, _) => KeyCode::ShiftLeft,
-        (0x2B, _) => KeyCode::Backslash,
-        (0x2C, _) => KeyCode::KeyZ,
-        (0x2D, _) => KeyCode::KeyX,
-        (0x2E, _) => KeyCode::KeyC,
-        (0x2F, _) => KeyCode::KeyV,
-        (0x30, _) => KeyCode::KeyB,
-        (0x31, _) => KeyCode::KeyN,
-        (0x32, _) => KeyCode::KeyM,
-        (0x33, _) => KeyCode::Comma,
-        (0x34, _) => KeyCode::Period,
-        (0x35, false) => KeyCode::Slash,
-        (0x35, true) => KeyCode::NumpadDivide,
-        (0x36, _) => KeyCode::ShiftRight,
-        (0x37, false) => KeyCode::NumpadMultiply,
-        (0x38, false) => KeyCode::AltLeft,
-        (0x38, true) => KeyCode::AltRight,
-        (0x39, _) => KeyCode::Space,
-        (0x3A, _) => KeyCode::CapsLock,
-        (0x3B, _) => KeyCode::F1,
-        (0x3C, _) => KeyCode::F2,
-        (0x3D, _) => KeyCode::F3,
-        (0x3E, _) => KeyCode::F4,
-        (0x3F, _) => KeyCode::F5,
-        (0x40, _) => KeyCode::F6,
-        (0x41, _) => KeyCode::F7,
-        (0x42, _) => KeyCode::F8,
-        (0x43, _) => KeyCode::F9,
-        (0x44, _) => KeyCode::F10,
-        (0x45, _) => KeyCode::NumLock,
-        (0x46, _) => KeyCode::ScrollLock,
-        (0x47, false) => KeyCode::Numpad7,
-        (0x47, true) => KeyCode::Home,
-        (0x48, false) => KeyCode::Numpad8,
-        (0x48, true) => KeyCode::ArrowUp,
-        (0x49, false) => KeyCode::Numpad9,
-        (0x49, true) => KeyCode::PageUp,
-        (0x4A, _) => KeyCode::NumpadSubtract,
-        (0x4B, false) => KeyCode::Numpad4,
-        (0x4B, true) => KeyCode::ArrowLeft,
-        (0x4C, _) => KeyCode::Numpad5,
-        (0x4D, false) => KeyCode::Numpad6,
-        (0x4D, true) => KeyCode::ArrowRight,
-        (0x4E, _) => KeyCode::NumpadAdd,
-        (0x4F, false) => KeyCode::Numpad1,
-        (0x4F, true) => KeyCode::End,
-        (0x50, false) => KeyCode::Numpad2,
-        (0x50, true) => KeyCode::ArrowDown,
-        (0x51, false) => KeyCode::Numpad3,
-        (0x51, true) => KeyCode::PageDown,
-        (0x52, false) => KeyCode::Numpad0,
-        (0x52, true) => KeyCode::Insert,
-        (0x53, false) => KeyCode::NumpadDecimal,
-        (0x53, true) => KeyCode::Delete,
-        (0x56, _) => KeyCode::IntlBackslash,
-        (0x57, _) => KeyCode::F11,
-        (0x58, _) => KeyCode::F12,
-        (0x5B, true) => KeyCode::MetaLeft,
-        (0x5C, true) => KeyCode::MetaRight,
-        (0x5D, true) => KeyCode::ContextMenu,
-        (0x64, _) => KeyCode::F13,
-        (0x65, _) => KeyCode::F14,
-        (0x66, _) => KeyCode::F15,
-        (0x67, _) => KeyCode::F16,
-        (0x68, _) => KeyCode::F17,
-        (0x69, _) => KeyCode::F18,
-        (0x6A, _) => KeyCode::F19,
-        (0x6B, _) => KeyCode::F20,
-        (0x6C, _) => KeyCode::F21,
-        (0x6D, _) => KeyCode::F22,
-        (0x6E, _) => KeyCode::F23,
-        (0x6F, _) => KeyCode::F24,
-        (0x73, _) => KeyCode::IntlRo,
-        (0x7D, _) => KeyCode::IntlYen,
+    if extended {
+        return key_code_from_extended_scancode(scancode);
+    }
+    key_code_from_base_scancode(scancode)
+}
+
+/// 基础行（无 `E0`）扫描码 → [`KeyCode`]。
+fn key_code_from_base_scancode(scancode: u16) -> Option<KeyCode> {
+    let code = match scancode {
+        0x01 => KeyCode::Escape,
+        0x02 => KeyCode::Digit1,
+        0x03 => KeyCode::Digit2,
+        0x04 => KeyCode::Digit3,
+        0x05 => KeyCode::Digit4,
+        0x06 => KeyCode::Digit5,
+        0x07 => KeyCode::Digit6,
+        0x08 => KeyCode::Digit7,
+        0x09 => KeyCode::Digit8,
+        0x0A => KeyCode::Digit9,
+        0x0B => KeyCode::Digit0,
+        0x0C => KeyCode::Minus,
+        0x0D => KeyCode::Equal,
+        0x0E => KeyCode::Backspace,
+        0x0F => KeyCode::Tab,
+        0x10 => KeyCode::KeyQ,
+        0x11 => KeyCode::KeyW,
+        0x12 => KeyCode::KeyE,
+        0x13 => KeyCode::KeyR,
+        0x14 => KeyCode::KeyT,
+        0x15 => KeyCode::KeyY,
+        0x16 => KeyCode::KeyU,
+        0x17 => KeyCode::KeyI,
+        0x18 => KeyCode::KeyO,
+        0x19 => KeyCode::KeyP,
+        0x1A => KeyCode::BracketLeft,
+        0x1B => KeyCode::BracketRight,
+        0x1C => KeyCode::Enter,
+        0x1D => KeyCode::ControlLeft,
+        0x1E => KeyCode::KeyA,
+        0x1F => KeyCode::KeyS,
+        0x20 => KeyCode::KeyD,
+        0x21 => KeyCode::KeyF,
+        0x22 => KeyCode::KeyG,
+        0x23 => KeyCode::KeyH,
+        0x24 => KeyCode::KeyJ,
+        0x25 => KeyCode::KeyK,
+        0x26 => KeyCode::KeyL,
+        0x27 => KeyCode::Semicolon,
+        0x28 => KeyCode::Quote,
+        0x29 => KeyCode::Backquote,
+        0x2A => KeyCode::ShiftLeft,
+        0x2B => KeyCode::Backslash,
+        0x2C => KeyCode::KeyZ,
+        0x2D => KeyCode::KeyX,
+        0x2E => KeyCode::KeyC,
+        0x2F => KeyCode::KeyV,
+        0x30 => KeyCode::KeyB,
+        0x31 => KeyCode::KeyN,
+        0x32 => KeyCode::KeyM,
+        0x33 => KeyCode::Comma,
+        0x34 => KeyCode::Period,
+        0x35 => KeyCode::Slash,
+        0x36 => KeyCode::ShiftRight,
+        0x37 => KeyCode::NumpadMultiply,
+        0x38 => KeyCode::AltLeft,
+        0x39 => KeyCode::Space,
+        0x3A => KeyCode::CapsLock,
+        0x3B => KeyCode::F1,
+        0x3C => KeyCode::F2,
+        0x3D => KeyCode::F3,
+        0x3E => KeyCode::F4,
+        0x3F => KeyCode::F5,
+        0x40 => KeyCode::F6,
+        0x41 => KeyCode::F7,
+        0x42 => KeyCode::F8,
+        0x43 => KeyCode::F9,
+        0x44 => KeyCode::F10,
+        0x45 => KeyCode::NumLock,
+        0x46 => KeyCode::ScrollLock,
+        0x47 => KeyCode::Numpad7,
+        0x48 => KeyCode::Numpad8,
+        0x49 => KeyCode::Numpad9,
+        0x4A => KeyCode::NumpadSubtract,
+        0x4B => KeyCode::Numpad4,
+        0x4C => KeyCode::Numpad5,
+        0x4D => KeyCode::Numpad6,
+        0x4E => KeyCode::NumpadAdd,
+        0x4F => KeyCode::Numpad1,
+        0x50 => KeyCode::Numpad2,
+        0x51 => KeyCode::Numpad3,
+        0x52 => KeyCode::Numpad0,
+        0x53 => KeyCode::NumpadDecimal,
+        0x56 => KeyCode::IntlBackslash,
+        0x57 => KeyCode::F11,
+        0x58 => KeyCode::F12,
+        0x59 => KeyCode::NumpadEqual,
+        0x64 => KeyCode::F13,
+        0x65 => KeyCode::F14,
+        0x66 => KeyCode::F15,
+        0x67 => KeyCode::F16,
+        0x68 => KeyCode::F17,
+        0x69 => KeyCode::F18,
+        0x6A => KeyCode::F19,
+        0x6B => KeyCode::F20,
+        0x6C => KeyCode::F21,
+        0x6D => KeyCode::F22,
+        0x6E => KeyCode::F23,
+        0x6F => KeyCode::F24,
+        0x73 => KeyCode::IntlRo,
+        0x7D => KeyCode::IntlYen,
+        0x7E => KeyCode::NumpadComma,
+        _ => return None,
+    };
+    Some(code)
+}
+
+/// `E0` 扩展行扫描码 → [`KeyCode`]。
+///
+/// 扩展行的扫描码**不得**回落到基础行：`E0 30` 是音量+，不是 `KeyB`；`E0 65` 是浏览器搜索，
+/// 不是 `F14`。表里没有的扩展键一律 `Unidentified(0x100 | scancode)`（由
+/// [`key_code_from_native`] 组装），绝不猜成字母/功能键。
+fn key_code_from_extended_scancode(scancode: u16) -> Option<KeyCode> {
+    let code = match scancode {
+        // 编辑键区的另一半（与基础行的小键盘共用扫描码）。
+        0x1C => KeyCode::NumpadEnter,
+        0x1D => KeyCode::ControlRight,
+        0x35 => KeyCode::NumpadDivide,
+        0x38 => KeyCode::AltRight,
+        0x47 => KeyCode::Home,
+        0x48 => KeyCode::ArrowUp,
+        0x49 => KeyCode::PageUp,
+        0x4B => KeyCode::ArrowLeft,
+        0x4D => KeyCode::ArrowRight,
+        0x4F => KeyCode::End,
+        0x50 => KeyCode::ArrowDown,
+        0x51 => KeyCode::PageDown,
+        0x52 => KeyCode::Insert,
+        0x53 => KeyCode::Delete,
+        0x5B => KeyCode::MetaLeft,
+        0x5C => KeyCode::MetaRight,
+        0x5D => KeyCode::ContextMenu,
+        // 媒体键（Win32 的 `VK_MEDIA_*` / `VK_VOLUME_*` 与扫描码一一对应）。
+        0x10 => KeyCode::MediaTrackPrevious,
+        0x19 => KeyCode::MediaTrackNext,
+        0x20 => KeyCode::AudioVolumeMute,
+        0x21 => KeyCode::LaunchApp2,
+        0x22 => KeyCode::MediaPlayPause,
+        0x24 => KeyCode::MediaStop,
+        0x2E => KeyCode::AudioVolumeDown,
+        0x30 => KeyCode::AudioVolumeUp,
+        0x32 => KeyCode::BrowserHome,
+        // 电源管理（系统通常自己消费，但按键确实以 E0 消息到达前台窗口）。
+        0x5E => KeyCode::Power,
+        0x5F => KeyCode::Sleep,
+        0x63 => KeyCode::WakeUp,
+        // 浏览器 / 邮件键。
+        0x65 => KeyCode::BrowserSearch,
+        0x66 => KeyCode::BrowserFavorites,
+        0x67 => KeyCode::BrowserRefresh,
+        0x68 => KeyCode::BrowserStop,
+        0x69 => KeyCode::BrowserForward,
+        0x6A => KeyCode::BrowserBack,
+        0x6B => KeyCode::LaunchApp1,
+        0x6C => KeyCode::LaunchMail,
+        0x6D => KeyCode::MediaSelect,
         _ => return None,
     };
     Some(code)
@@ -498,6 +558,7 @@ fn key_code_from_vk(vk: u16) -> Option<KeyCode> {
         0x21 => KeyCode::PageUp,
         0x22 => KeyCode::PageDown,
         0x2C => KeyCode::PrintScreen,
+        0x2F => KeyCode::Help,
         0x90 => KeyCode::NumLock,
         0x91 => KeyCode::ScrollLock,
         0x5B => KeyCode::MetaLeft,
@@ -681,7 +742,6 @@ mod tests {
                 y: 20,
                 dx_lines: 0.0,
                 dy_lines: 3.0,
-                lines_per_tick: 3.0,
             })
         );
         assert!(matches!(
@@ -924,6 +984,114 @@ mod tests {
             key_code_from_native(0xA2, 0x1D, false),
             KeyCode::ControlLeft
         );
+    }
+
+    /// R02-1（P1 回归）：`E0` 扩展行**不得**命中字母/功能键行。
+    ///
+    /// 旧实现用 `(scancode, _)` 匹配字母行：`E0 30`（音量+）⇒ `KeyB`、`E0 2E`（音量-）⇒
+    /// `KeyC`、`E0 20`（静音）⇒ `KeyD`、`E0 22`（播放/暂停）⇒ `KeyG`、`E0 24`（停止）⇒
+    /// `KeyJ`、`E0 19`（下一曲）⇒ `KeyP`、`E0 10`（上一曲）⇒ `KeyQ`、`E0 32`（主页）⇒
+    /// `KeyM`，`E0 65..6F`（浏览器/邮件键）⇒ `F14..F24`。后果是音量键以**无修饰的 `KeyB`**
+    /// 按下/抬起进入应用（交易终端里 `B` 买入是常见裸键绑定），且同一物理键三平台身份不同
+    /// （Linux 是 `Unidentified(115)`）。
+    #[test]
+    fn extended_row_media_keys_never_fall_through_to_letters_or_function_keys() {
+        // 扩展行全部已知键：扫描码 → 期望身份。
+        let table: &[(u16, KeyCode)] = &[
+            (0x10, KeyCode::MediaTrackPrevious),
+            (0x19, KeyCode::MediaTrackNext),
+            (0x20, KeyCode::AudioVolumeMute),
+            (0x21, KeyCode::LaunchApp2),
+            (0x22, KeyCode::MediaPlayPause),
+            (0x24, KeyCode::MediaStop),
+            (0x2E, KeyCode::AudioVolumeDown),
+            (0x30, KeyCode::AudioVolumeUp),
+            (0x32, KeyCode::BrowserHome),
+            (0x5E, KeyCode::Power),
+            (0x5F, KeyCode::Sleep),
+            (0x63, KeyCode::WakeUp),
+            (0x65, KeyCode::BrowserSearch),
+            (0x66, KeyCode::BrowserFavorites),
+            (0x67, KeyCode::BrowserRefresh),
+            (0x68, KeyCode::BrowserStop),
+            (0x69, KeyCode::BrowserForward),
+            (0x6A, KeyCode::BrowserBack),
+            (0x6B, KeyCode::LaunchApp1),
+            (0x6C, KeyCode::LaunchMail),
+            (0x6D, KeyCode::MediaSelect),
+            // 扩展行的编辑键（与基础行小键盘共用扫描码）。
+            (0x1C, KeyCode::NumpadEnter),
+            (0x1D, KeyCode::ControlRight),
+            (0x35, KeyCode::NumpadDivide),
+            (0x38, KeyCode::AltRight),
+            (0x47, KeyCode::Home),
+            (0x48, KeyCode::ArrowUp),
+            (0x49, KeyCode::PageUp),
+            (0x4B, KeyCode::ArrowLeft),
+            (0x4D, KeyCode::ArrowRight),
+            (0x4F, KeyCode::End),
+            (0x50, KeyCode::ArrowDown),
+            (0x51, KeyCode::PageDown),
+            (0x52, KeyCode::Insert),
+            (0x53, KeyCode::Delete),
+            (0x5B, KeyCode::MetaLeft),
+            (0x5C, KeyCode::MetaRight),
+            (0x5D, KeyCode::ContextMenu),
+        ];
+        for (scancode, expected) in table {
+            assert_eq!(
+                key_code_from_native(0, *scancode, true),
+                *expected,
+                "E0 {scancode:#04x} 必须是 {expected:?}"
+            );
+        }
+
+        // 反例：**非扩展**的同扫描码仍是字母/数字/功能键。
+        let base: &[(u16, KeyCode)] = &[
+            (0x30, KeyCode::KeyB),
+            (0x2E, KeyCode::KeyC),
+            (0x20, KeyCode::KeyD),
+            (0x22, KeyCode::KeyG),
+            (0x24, KeyCode::KeyJ),
+            (0x19, KeyCode::KeyP),
+            (0x10, KeyCode::KeyQ),
+            (0x32, KeyCode::KeyM),
+            (0x65, KeyCode::F14),
+            (0x6F, KeyCode::F24),
+        ];
+        for (scancode, expected) in base {
+            assert_eq!(
+                key_code_from_native(0, *scancode, false),
+                *expected,
+                "基础行 {scancode:#04x} 必须是 {expected:?}"
+            );
+        }
+
+        // 扩展行的未知键：**绝不**猜成字母/F 键，载荷带 `0x100` 标记。
+        assert_eq!(
+            key_code_from_native(0, 0x6E, true),
+            KeyCode::Unidentified(0x100 | 0x6E)
+        );
+        assert_eq!(
+            key_code_from_native(0, 0x2A, true),
+            KeyCode::Unidentified(0x100 | 0x2A),
+            "E0 2A（部分键盘的伪 Shift）不得报告成 ShiftLeft"
+        );
+    }
+
+    /// AR1 §2-14：Windows 缺的 `NumpadComma` / `NumpadEqual` 补齐。
+    #[test]
+    fn numpad_comma_and_equal_are_reachable() {
+        assert_eq!(
+            key_code_from_native(0x7E, 0x7E, false),
+            KeyCode::NumpadComma
+        );
+        assert_eq!(
+            key_code_from_native(0x59, 0x59, false),
+            KeyCode::NumpadEqual
+        );
+        // `VK_HELP`（0x2F）没有扫描码时也能给出 `Help`。
+        assert_eq!(key_code_from_native(0x2F, 0, false), KeyCode::Help);
     }
 
     #[test]

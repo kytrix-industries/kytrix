@@ -107,7 +107,7 @@ pub(crate) fn a11y_retry_pending(app: &App) -> bool {
     })
 }
 
-/// 产出一笔 a11y 交付（消费 `A11Y|ORDER` 位与 `full_pending`）。
+/// 产出一笔 a11y 交付（消费 `A11Y` 反向集合与 `full_pending`）。
 ///
 /// **必须在 `accesskit_windows::Adapter::update_if_active` 的闭包里调用**（adapter 不活跃时
 /// 闭包不执行 ⇒ 零开销），或由 `test-support` 的捕获路径调用。

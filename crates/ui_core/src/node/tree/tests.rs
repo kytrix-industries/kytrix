@@ -17,7 +17,7 @@ fn new_tree_has_root() {
     let tree = NodeTree::new();
     let root = tree.root();
 
-    assert_eq!(tree.order(), [root].as_slice());
+    assert_eq!(tree.dfs_ids(), vec![root]);
     assert_eq!(tree.get(root).expect("root 存在").kind(), &NodeKind::Box);
     assert_eq!(
         tree.get(root).expect("root 存在").parent(),
@@ -34,7 +34,7 @@ fn append_child_keeps_dfs_preorder() {
     let a1 = boxed(&mut tree, a);
     let b = boxed(&mut tree, root);
 
-    assert_eq!(tree.order(), [root, a, a1, b].as_slice());
+    assert_eq!(tree.dfs_ids(), vec![root, a, a1, b]);
     assert_eq!(tree.get(a).expect("存在").parent(), Some(root));
     assert_eq!(tree.get(a1).expect("存在").parent(), Some(a));
 }
@@ -51,9 +51,9 @@ fn append_child_reparents_and_splices() {
     tree.append_child(a, b).expect("重挂成功");
 
     assert_eq!(
-        tree.order(),
-        [root, a, a1, b, b1].as_slice(),
-        "子树块必须整体搬到新父的末尾，且不重复"
+        tree.dfs_ids(),
+        vec![root, a, a1, b, b1],
+        "DFS 先序：重挂后的子树排在父的末尾，且不重复"
     );
     assert_eq!(tree.get(b).expect("存在").parent(), Some(a));
     assert_eq!(tree.get(b1).expect("存在").parent(), Some(b));
@@ -83,7 +83,7 @@ fn remove_unmounts_subtree() {
 
     tree.remove(a).expect("卸载成功");
 
-    assert_eq!(tree.order(), [root, b].as_slice());
+    assert_eq!(tree.dfs_ids(), vec![root, b]);
     for stale in [a, a1, a2] {
         assert!(
             matches!(tree.get(stale), Err(EngineError::StaleNode { .. })),
@@ -102,7 +102,7 @@ fn remove_root_is_error() {
         tree.remove(root),
         Err(EngineError::StaleNode { node }) if node == root
     ));
-    assert_eq!(tree.order(), [root].as_slice(), "root 必须还在");
+    assert_eq!(tree.dfs_ids(), vec![root], "root 必须还在");
 }
 
 #[test]
@@ -142,7 +142,7 @@ fn insert_child_and_bind_style_roundtrip() {
     assert!(tree.put_bind_style(node, Box::new(|_cx| StylePatch::default())));
     assert!(tree.take_bind_style(node).is_some());
 
-    assert_eq!(tree.deps(node), Some([].as_slice()));
+    assert_eq!(tree.deps(node), None, "从未求值 ⇒ 没有依赖集合");
     assert!(tree.set_deps(node, smallvec![SignalId::for_test(0)]));
     assert_eq!(tree.deps(node).map(<[SignalId]>::len), Some(1));
     assert!(tree.set_style_patch(node, StylePatch::default()));
@@ -158,9 +158,35 @@ fn node_and_handle_sizes() {
         "size_of::<TextContent>() = {}",
         size_of::<crate::text::TextContent>()
     );
+    println!(
+        "size_of::<Option<LayoutOverride>>() = {}",
+        size_of::<Option<crate::layout::LayoutOverride>>()
+    );
+    println!(
+        "size_of::<Option<LaneId>>() = {}",
+        size_of::<Option<crate::paint::scene::LaneId>>()
+    );
+    println!("size_of::<Option<Node>>() = {}", size_of::<Option<Node>>());
+    println!(
+        "size_of::<Option<TextSlot>>() = {}",
+        size_of::<Option<super::content::TextSlot>>()
+    );
+    println!(
+        "size_of::<Option<SmolStr>>() = {}",
+        size_of::<Option<smol_str::SmolStr>>()
+    );
+    println!(
+        "size_of::<Option<(u8, Option<PhysicalRect>)>>() = {}",
+        size_of::<Option<(u8, Option<crate::math::PhysicalRect>)>>()
+    );
+    println!("size_of::<taffy::Cache>() = {}", size_of::<taffy::Cache>());
+    println!(
+        "size_of::<Option<Box<crate::a11y::tree::NodeA11y>>>() = {}",
+        size_of::<Option<Box<crate::a11y::tree::NodeA11y>>>()
+    );
     assert!(
-        node_size <= 1152,
-        "Node 尺寸超预算: {node_size} B（过 1152 → 备选 style: Box<Style>，见 V-31）"
+        node_size <= 320,
+        "Node 尺寸超预算: {node_size} B（上限 320 B：冷字段必须装箱，见 R03-3）"
     );
     assert_eq!(
         size_of::<crate::text::TextContent>(),
@@ -201,21 +227,18 @@ fn slot_reuse_drops_cache() {
     let index = doomed.index();
     // 建一个缓存条目
     let _ = tree.taffy_cache(doomed);
-    assert!(
-        tree.layout_cache[index as usize].is_some(),
-        "缓存条目必须建立"
-    );
+    assert!(tree.layout_cache(doomed).is_some(), "缓存条目必须建立");
 
     tree.remove(doomed).expect("卸载成功");
     assert!(
-        tree.layout_cache[index as usize].is_none(),
+        tree.layout_cache(doomed).is_none(),
         "卸载必须清掉槽位的缓存"
     );
 
     let reused = boxed(&mut tree, root);
     assert_eq!(reused.index(), index, "槽位必须复用");
     assert!(
-        tree.layout_cache[index as usize].is_none(),
+        tree.layout_cache(doomed).is_none(),
         "复用槽位不得继承上一代节点的缓存"
     );
 }
@@ -233,24 +256,19 @@ fn set_style_clears_caches_to_root() {
             height: Some(100.0),
         })
         .expect("布局成功");
-    let sibling_index = sibling.index() as usize;
     assert!(
-        tree.layout_cache[sibling_index].is_some(),
+        tree.layout_cache(sibling).is_some(),
         "布局后兄弟必须有缓存条目"
     );
 
     tree.set_style(child, Style::default()).expect("节点存活");
 
     for node in [root, parent, child] {
-        let index = node.index() as usize;
-        let empty = tree.layout_cache[index]
-            .as_ref()
-            .is_none_or(taffy::Cache::is_empty);
+        let empty = tree.layout_cache(node).is_none_or(taffy::Cache::is_empty);
         assert!(empty, "node {node:?} 的缓存必须被清空");
     }
     assert!(
-        tree.layout_cache[sibling_index]
-            .as_ref()
+        tree.layout_cache(sibling)
             .is_some_and(|cache| !cache.is_empty()),
         "无关兄弟的缓存必须保留"
     );
@@ -262,15 +280,14 @@ fn remove_drops_cache_and_hoisted_entries() {
     let root = tree.root();
     let parent = boxed(&mut tree, root);
     let child = boxed(&mut tree, parent);
-    let child_index = child.index() as usize;
     let _ = tree.taffy_cache(child);
     tree.hoisted_push(parent, &[child]);
 
     tree.remove(parent).expect("卸载成功");
 
     assert!(
-        tree.layout_cache[child_index].is_none(),
-        "子树内每个槽位的缓存都要清"
+        tree.layout_cache(child).is_none(),
+        "子树内每个节点的缓存都要清"
     );
     assert!(
         !tree.hoisted.contains_key(&parent),
@@ -327,7 +344,10 @@ fn node_debug_prints_layout_fields() {
 }
 
 #[test]
-fn damage_unions_prev_and_current() {
+fn damage_covers_current_layout_on_touch() {
+    // B5 之后不再保存 `prev_layout`：**旧位置**由 `place_subtree` 在写新盒时并入
+    // （`damage ∪ old ∪ new`，见 `layout::place_subtree` 与 taffy 侧的
+    // `set_layout_override_updates_bounds_and_damage`）。`touch` 只补当前盒。
     let mut tree = NodeTree::new();
     let root = tree.root();
     let node = boxed(&mut tree, root);
@@ -336,10 +356,6 @@ fn damage_unions_prev_and_current() {
         LayoutBox {
             border: Edges::ZERO,
             bounds: Rect::new(10.0, 0.0, 4.0, 4.0),
-        },
-        LayoutBox {
-            border: Edges::ZERO,
-            bounds: Rect::new(0.0, 0.0, 4.0, 4.0),
         },
     );
     assert!(
@@ -352,8 +368,8 @@ fn damage_unions_prev_and_current() {
     let damage = tree.get(node).expect("存在").damage();
     assert_eq!(
         damage,
-        Rect::new(0.0, 0.0, 14.0, 4.0),
-        "旧位置与新位置的并集必须都覆盖"
+        Rect::new(10.0, 0.0, 4.0, 4.0),
+        "touch 必须把当前布局盒并入 damage"
     );
 }
 
@@ -369,12 +385,7 @@ fn remove_marks_parent_structure() {
     tree.remove(child).expect("卸载成功");
 
     let parent_flags = tree.get(parent).expect("存在").dirty();
-    for expected in [
-        DirtyFlags::LAYOUT,
-        DirtyFlags::PAINT,
-        DirtyFlags::ORDER,
-        DirtyFlags::A11Y,
-    ] {
+    for expected in [DirtyFlags::LAYOUT, DirtyFlags::PAINT, DirtyFlags::A11Y] {
         assert!(
             parent_flags.contains(expected),
             "结构变更必须标 {expected:?}（实际 {parent_flags:?}）"
@@ -421,7 +432,8 @@ fn append_child_marks_moved_subtree_paint() {
         tree.get(to)
             .expect("存在")
             .dirty()
-            .contains(DirtyFlags::ORDER)
+            .contains(DirtyFlags::A11Y),
+        "重挂是结构变更 ⇒ a11y 父链必须重发"
     );
 }
 
@@ -542,11 +554,7 @@ fn settle_frame_resets_damage_bits_and_prev_layout() {
     let mut tree = NodeTree::new();
     let root = tree.root();
     let child = boxed(&mut tree, root);
-    let _ = tree.set_layout_for_test(
-        child,
-        layout_box(Rect::new(1.0, 2.0, 3.0, 4.0)),
-        LayoutBox::default(),
-    );
+    let _ = tree.set_layout_for_test(child, layout_box(Rect::new(1.0, 2.0, 3.0, 4.0)));
     let _ = tree.mark_paint(child);
     let _ = tree.mark_a11y(child);
     let flags = tree.get(child).expect("存在").dirty();
@@ -557,10 +565,15 @@ fn settle_frame_resets_damage_bits_and_prev_layout() {
 
     let node = tree.get(child).expect("存在");
     assert!(node.damage().is_empty(), "damage 归零");
-    assert_eq!(node.prev_layout(), node.layout(), "prev_layout = layout");
+    assert!(
+        !node.layout().bounds.is_empty(),
+        "布局盒保留（不再有 prev_layout 字段）"
+    );
     assert!(node.dirty().contains(DirtyFlags::REUSABLE));
-    assert!(!node.dirty().contains(DirtyFlags::PAINT));
-    assert!(!node.dirty().contains(DirtyFlags::LAYOUT));
+    // R03-9：帧结算**不再**清 `PAINT`（唯一清除点是 paint pass）与 `LAYOUT`（唯一清除点是
+    // `set_local_layout`）。这里保留脏位是正确语义：本测试没有跑 paint / layout pass。
+    assert!(node.dirty().contains(DirtyFlags::PAINT));
+    assert!(node.dirty().contains(DirtyFlags::LAYOUT));
     assert!(
         node.dirty().contains(DirtyFlags::A11Y),
         "A11Y 的消费者不在本帧（P11），结算必须保留"
@@ -574,13 +587,9 @@ fn remove_unions_subtree_bounds_into_parent_damage() {
     let parent = boxed(&mut tree, root);
     let child = boxed(&mut tree, parent);
     // 出流子节点在父盒之外。
-    let _ = tree.set_layout_for_test(
-        parent,
-        layout_box(Rect::new(0.0, 0.0, 10.0, 10.0)),
-        LayoutBox::default(),
-    );
+    let _ = tree.set_layout_for_test(parent, layout_box(Rect::new(0.0, 0.0, 10.0, 10.0)));
     let outside = Rect::new(100.0, 100.0, 20.0, 20.0);
-    let _ = tree.set_layout_for_test(child, layout_box(outside), LayoutBox::default());
+    let _ = tree.set_layout_for_test(child, layout_box(outside));
     tree.settle_frame();
 
     tree.remove(child).expect("卸载成功");

@@ -12,7 +12,7 @@ use crate::{
     math::{Edges, Point, Rect, Size},
     node::{
         dependency::ReadCtx,
-        dirty::DirtyFlags,
+        dirty::{DirtyFlags, DirtySet},
         id::{Arena, NodeId},
         signal::SignalId,
     },
@@ -35,10 +35,10 @@ pub(crate) fn new() -> NodeTree {
     let root = arena.insert_with(|id| Node {
         id,
         parent: None,
-        children: SmallVec::new(),
+        children: Vec::new(),
         kind: NodeKind::Box,
-        style: root_style,
-        style_patch: StylePatch::default(),
+        style: Box::new(root_style),
+        style_patch: None,
         bind_style: None,
         measure: None,
         hit_shape: None,
@@ -50,28 +50,42 @@ pub(crate) fn new() -> NodeTree {
         text_measured_size: Size::ZERO,
         text_content_width: 0.0,
         layout: LayoutBox::default(),
-        prev_layout: LayoutBox::default(),
         local: Rect::default(),
         local_border: Edges::ZERO,
         laid_out_epoch: 0,
         damage: Rect::default(),
-        lanes: SmallVec::new(),
-        deps: SmallVec::new(),
+        lane: None,
+        deps: None,
         dirty: DirtyFlags::LAYOUT | DirtyFlags::PAINT | DirtyFlags::A11Y,
         interaction: None,
         lane_offset: Point::ZERO,
     });
+    let mut dirty_layout = DirtySet::new();
+    dirty_layout.insert(root);
+    let mut dirty_paint = DirtySet::new();
+    dirty_paint.insert(root);
+    let mut dirty_a11y = DirtySet::new();
+    dirty_a11y.insert(root);
+    let mut dirty_settle = DirtySet::new();
+    dirty_settle.insert(root);
     NodeTree {
         arena,
         root,
-        order: vec![root],
-        layout_cache: vec![None],
+        layout_cache: ahash::HashMap::default(),
         text_slots: vec![None],
         debug_ids: vec![None],
         clip_keys: vec![None],
         subtree_bounds: vec![Rect::default()],
         a11y_slots: vec![None],
-        a11y_dirty: 1,
+        dirty_bind: DirtySet::new(),
+        dirty_layout,
+        dirty_paint,
+        dirty_a11y,
+        dirty_settle,
+        moved_nodes: DirtySet::new(),
+        scroll_containers: Vec::new(),
+        virtual_containers: Vec::new(),
+        overlay_containers: Vec::new(),
         text_dirty: crate::node::tree::content::TextDirtyQueue::new(),
         text_layout_dirty: crate::node::tree::content::TextDirtyQueue::new(),
         removed_lanes: Vec::new(),
@@ -81,6 +95,10 @@ pub(crate) fn new() -> NodeTree {
         invalid_measure: None,
         geometry_damage_escalation: false,
         geometry_transforms: ahash::HashMap::default(),
+        dirty_scratch: Vec::new(),
+        #[cfg(feature = "test-support")]
+        scanned: std::cell::RefCell::new(ahash::HashSet::default()),
+        bound_nodes: 0,
     }
 }
 
@@ -99,11 +117,20 @@ pub(crate) fn get(tree: &NodeTree, node: NodeId) -> Result<&Node, EngineError> {
     tree.arena.get(node).ok_or(EngineError::StaleNode { node })
 }
 
+// 消费者：`impl NodeTree::len` 的薄委托（外部调用点见该方法文档）。
+/// 存活节点数（O(1)：`Arena::len` = 槽位数 − 自由表长度）。
+pub(crate) fn len(tree: &NodeTree) -> usize {
+    tree.arena.len()
+}
+
 // 消费者：`impl NodeTree::insert_child` 的薄委托（外部调用点见该方法文档）。
 /// 铸一个新节点并挂到 `parent` 末尾（消费者：`NodeBuilder::build`）。
 ///
 /// 参数是 [`NodeSpec`]（部件）而不是半成品 `Node`：`Node` 的全部字段都是本模块私有的，
 /// 只有这里能构造（P03 F-43 / P04 S-40）。
+///
+/// **成本 O(深度)**：不再维护全序数组，挂载只做「arena 分配 + 父的 `children` 追加 +
+/// 标脏冒泡」，与已有兄弟数量无关（旧实现的 `order_insert` 是 O(N²) 建树，R03-2）。
 pub(crate) fn insert_child(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -127,6 +154,9 @@ pub(crate) fn insert_child(
         bind_a11y,
         tab_stop,
     } = spec;
+    // 初值：挂了动态闭包的节点必须进 `dirty_bind`（否则首帧 `refresh_styles` 不会求值它，
+    // 旧实现靠"新节点带 PAINT"间接达到同一效果 —— 那是 BIND/PAINT 混用的遗产，R03-9）。
+    let bound = bind_style.is_some() || bind_text.is_some() || bind_a11y.is_some();
     let interaction = (action.is_some() || drag.is_some() || focus_ring.is_some()).then(|| {
         let mut slot = NodeInteraction::new();
         slot.action = action;
@@ -137,10 +167,10 @@ pub(crate) fn insert_child(
     let id = tree.arena.insert_with(move |id| Node {
         id,
         parent: None,
-        children: SmallVec::new(),
+        children: Vec::new(),
         kind,
-        style,
-        style_patch: StylePatch::default(),
+        style: Box::new(style),
+        style_patch: None,
         bind_style,
         measure,
         hit_shape,
@@ -152,23 +182,19 @@ pub(crate) fn insert_child(
         text_measured_size: Size::ZERO,
         text_content_width: 0.0,
         layout: LayoutBox::default(),
-        prev_layout: LayoutBox::default(),
         local: Rect::default(),
         local_border: Edges::ZERO,
         laid_out_epoch: 0,
         damage: Rect::default(),
-        lanes: SmallVec::new(),
-        deps: SmallVec::new(),
+        lane: None,
+        deps: None,
         dirty: DirtyFlags::LAYOUT | DirtyFlags::PAINT | DirtyFlags::A11Y,
         interaction,
         lane_offset: Point::ZERO,
     });
     // 槽位复用：上一代节点的 taffy 缓存必须丢弃，否则新节点继承陈旧布局（P04 §6.1）。
+    tree.layout_cache.remove(&id);
     let index = id.index() as usize;
-    if tree.layout_cache.len() <= index {
-        tree.layout_cache.resize_with(index + 1, || None);
-    }
-    tree.layout_cache[index] = None;
     // N5：文本形状快照与 taffy 缓存同生命周期 —— 复用槽位时必须丢弃上一代的 `Rc<ShapedText>`。
     if tree.text_slots.len() <= index {
         tree.text_slots.resize_with(index + 1, || None);
@@ -182,6 +208,10 @@ pub(crate) fn insert_child(
         .is_some_and(|target| target.kind.text().is_some())
     {
         tree.mark_text_dirty(id);
+    }
+    if bound {
+        tree.bound_nodes += 1;
+        let _ = tree.touch(id, DirtyFlags::BIND);
     }
     // 稳定调试 id 与 clip 上下文同生命周期：槽位复用不得继承上一代的值（P06 §5.6 / C4）。
     if tree.debug_ids.len() <= index {
@@ -203,10 +233,12 @@ pub(crate) fn insert_child(
     }
     tree.a11y_slots[index] = (a11y.is_some() || bind_a11y.is_some())
         .then(|| Box::new(crate::a11y::tree::NodeA11y::new(a11y, bind_a11y)));
-    // 新节点恒带 `A11Y`（`dirty` 的初值），计数必须同步。
-    tree.a11y_dirty = tree.a11y_dirty.saturating_add(1);
+    // 新节点的初值脏位是 `LAYOUT | PAINT | A11Y`：反向集合必须同步（否则门禁看不到它）。
+    tree.dirty_layout.insert(id);
+    tree.dirty_paint.insert(id);
+    tree.dirty_a11y.insert(id);
+    tree.dirty_settle.insert(id);
     tree.hoisted.remove(&id);
-    tree.order_insert(parent, id);
     if let Some(node) = tree.arena.get_mut(id) {
         node.parent = Some(parent);
     }
@@ -214,9 +246,51 @@ pub(crate) fn insert_child(
         node.children.push(id);
     }
     tree.mark_structure(parent);
-    #[cfg(debug_assertions)]
-    tree.debug_assert_order_matches_tree();
     Ok(id)
+}
+
+// 消费者：`impl NodeTree::append_child` 的薄委托（外部调用点见该方法文档）。
+/// 把 `child`（连同子树）挂到 `parent` 的末尾；`child` 已有父则先摘下。
+///
+/// 没有全序数组要拼接（R03-2）：成本 O(子树 + 深度)，与兄弟数量无关。
+///
+/// # Errors
+/// `EngineError::StaleNode`：`parent`/`child` 任一陈旧。
+///
+/// # Panics (debug)
+/// 形成结构环（`child` 是 `parent` 的祖先或二者相同）：debug 断言失败，release 下**不改结构**。
+pub(crate) fn append_child(
+    tree: &mut NodeTree,
+    parent: NodeId,
+    child: NodeId,
+) -> Result<(), EngineError> {
+    tree.get(parent)?;
+    tree.get(child)?;
+    if parent == child || tree.is_ancestor(child, parent) {
+        debug_assert!(
+            false,
+            "structural cycle: cannot append an ancestor as a child"
+        );
+        return Ok(());
+    }
+
+    if let Some(old_parent) = tree.get(child)?.parent {
+        if let Some(p) = tree.arena.get_mut(old_parent) {
+            p.children.retain(|existing| *existing != child);
+        }
+        tree.mark_structure(old_parent);
+        // 整棵被移动的子树都要重画：它的绘制顺序在搬动后可能改变。
+        tree.mark_subtree_paint(child);
+    }
+
+    if let Some(node) = tree.arena.get_mut(child) {
+        node.parent = Some(parent);
+    }
+    if let Some(node) = tree.arena.get_mut(parent) {
+        node.children.push(child);
+    }
+    tree.mark_structure(parent);
+    Ok(())
 }
 
 // 消费者：`impl NodeTree::remove` 的薄委托（外部调用点见该方法文档）。
@@ -245,11 +319,13 @@ pub(crate) fn remove(
         .get(node)?
         .parent
         .expect("non-root node always has a parent");
-    tree.order_remove_subtree(node);
     if let Some(p) = tree.arena.get_mut(parent) {
         p.children.retain(|existing| *existing != node);
     }
-    let block = tree.collect_subtree_ids(node);
+    // 子树句柄快照（DFS 先序）。之后 arena 里就查不到了。
+    let mut block: Vec<NodeId> = Vec::with_capacity(16);
+    tree.for_each_subtree(node, |id| block.push(id));
+    let removed: ahash::HashSet<NodeId> = block.iter().copied().collect();
     // 几何节点的可见范围可能超出布局盒：卸载/移动/隐藏三者都拿不到 desc，
     // 保守升级为全帧 damage（否则溢出部分在「不清屏」前提下长期残影；复审 A3）。
     if block.iter().any(|id| {
@@ -260,14 +336,16 @@ pub(crate) fn remove(
         tree.geometry_damage_escalation = true;
     }
     // 旧像素必须重绘：被卸载子树的包围盒并入父的 damage（出流/覆盖节点可能超出父盒，
-    // 不能只靠 `mark_structure` 的父盒；P06 §5.5、不加 `LayoutBox.overflow` 的依据）。
+    // 不能只靠 `mark_structure` 的父盒；P06 §5.5）。
     let mut subtree_damage = Rect::default();
     for id in &block {
         if let Some(target) = tree.arena.get(*id) {
             subtree_damage = subtree_damage
                 .union(target.damage)
                 .union(target.layout.bounds);
-            tree.removed_lanes.extend(target.lanes.iter().copied());
+            if let Some(lane) = target.lane {
+                tree.removed_lanes.push(lane);
+            }
         }
     }
     if let Some(p) = tree.arena.get_mut(parent) {
@@ -277,9 +355,7 @@ pub(crate) fn remove(
     let mut detached: Vec<(NodeId, SmallVec<[SignalId; 8]>)> = Vec::with_capacity(block.len());
     for id in block.iter().rev() {
         let index = id.index() as usize;
-        if let Some(slot) = tree.layout_cache.get_mut(index) {
-            *slot = None;
-        }
+        tree.layout_cache.remove(id);
         if let Some(slot) = tree.text_slots.get_mut(index) {
             *slot = None;
         }
@@ -292,36 +368,66 @@ pub(crate) fn remove(
         if let Some(slot) = tree.a11y_slots.get_mut(index) {
             *slot = None;
         }
-        if tree
-            .arena
-            .get(*id)
-            .is_some_and(|target| target.dirty().contains(DirtyFlags::A11Y))
-        {
-            tree.a11y_dirty = tree.a11y_dirty.saturating_sub(1);
-        }
+        // 反向脏集合必须同步：陈旧节点若留在集合里，O(1) 门禁会永远为真（空转帧）。
+        tree.dirty_bind.remove(*id);
+        tree.dirty_layout.remove(*id);
+        tree.dirty_paint.remove(*id);
+        tree.dirty_a11y.remove(*id);
+        tree.dirty_settle.remove(*id);
+        tree.moved_nodes.remove(*id);
         tree.hoisted.remove(id);
         tree.geometry_transforms.remove(id);
+        let had_bind = tree
+            .arena
+            .get(*id)
+            .is_some_and(|target| target.bind_style.is_some() || target.text_bind.is_some())
+            || tree
+                .a11y_slots
+                .get(id.index() as usize)
+                .and_then(|slot| slot.as_deref())
+                .is_some_and(|slot| slot.bind.is_some());
+        if had_bind {
+            tree.bound_nodes = tree.bound_nodes.saturating_sub(1);
+        }
         if let Some(target) = tree.arena.remove(*id)
-            && !target.deps.is_empty()
+            && let Some(deps) = target.deps
+            && !deps.is_empty()
         {
-            detached.push((*id, target.deps));
+            detached.push((*id, *deps));
         }
     }
     // 别的包含块可能把被卸载的节点记在自己的 hoisted 列表里（出流孙节点）⇒ 逐表剔除。
-    tree.hoisted.retain(|_, list| {
-        list.retain(|child| !block.contains(child));
-        !list.is_empty()
-    });
+    if !tree.hoisted.is_empty() {
+        tree.hoisted.retain(|_, list| {
+            list.retain(|child| !removed.contains(child));
+            !list.is_empty()
+        });
+    }
+    // 容器登记表同样剔除（否则每帧的 clamp/rewindow 会一直空转在陈旧句柄上）。
+    if !tree.scroll_containers.is_empty() {
+        tree.scroll_containers.retain(|id| !removed.contains(id));
+    }
+    if !tree.virtual_containers.is_empty() {
+        tree.virtual_containers.retain(|id| !removed.contains(id));
+    }
+    if !tree.overlay_containers.is_empty() {
+        tree.overlay_containers.retain(|id| !removed.contains(id));
+    }
+    // 集合里可能留了大量陈旧条目（子树整块卸载）：顺手压缩，保持迭代成本与内容一致。
+    tree.dirty_bind.shrink_stale();
+    tree.dirty_layout.shrink_stale();
+    tree.dirty_paint.shrink_stale();
+    tree.dirty_a11y.shrink_stale();
+    tree.dirty_settle.shrink_stale();
+    tree.moved_nodes.shrink_stale();
     tree.mark_structure(parent);
-    #[cfg(debug_assertions)]
-    tree.debug_assert_order_matches_tree();
     Ok(detached)
 }
 
 // 消费者：`impl NodeTree::debug_id` 的薄委托（外部调用点见该方法文档）。
 /// 稳定调试 id（`NodeBuilder::id` 的只读面；消费者：`Probe`、诊断日志）。
 ///
-/// 同一棵树内**允许重复**：`Selector::Id` 取 `order()` 的第一个（确定性），不做唯一性检查。
+/// 同一棵树内**允许重复**：`Selector::Id` 取 DFS 先序的第一个（确定性），不做唯一性检查。
 pub(crate) fn debug_id(tree: &NodeTree, node: NodeId) -> Option<&str> {
     tree.debug_ids
         .get(node.index() as usize)

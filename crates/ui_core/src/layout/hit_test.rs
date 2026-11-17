@@ -81,7 +81,7 @@ fn negate(offset: Point) -> Point {
     Point::new(-offset.x, -offset.y)
 }
 
-/// 逆绘制序（`order` 是 DFS 先序 ⇒ 兄弟逆序 + 先子树后自身）+ 按布局盒与 clip 剪枝。
+/// 逆绘制序（`children` 的 DFS 先序 ⇒ 兄弟逆序 + 先子树后自身）+ 按布局盒与 clip 剪枝。
 ///
 /// **屏幕坐标**：`point` 是窗口逻辑像素；布局盒是**内容坐标**，因此进入滚动容器的子树时按它的 `offset`
 /// 把点换算到内容空间（`design/phase-10-interaction.md` §7.3）。根不是滚动容器 ⇒ 顶层偏移恒为零。
@@ -490,7 +490,7 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let base = add(&mut tree, root, fixed(100.0, 100.0));
-        // 浮层：绝对定位在最后，尺寸小 ⇒ 必须 append 到 order 末尾（P10 的 Overlay 契约）
+        // 浮层：绝对定位在最后，尺寸小 ⇒ 必须 append 到父的 children 末尾（P10 的 Overlay 契约）
         let overlay = add(&mut tree, root, absolute(20.0));
         layout(&mut tree);
 

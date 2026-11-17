@@ -13,7 +13,7 @@ use crate::{
     paint::scene::LaneId,
 };
 
-/// 元素选择器（强类型；同一选择器多个命中时取 `tree.order()` 的第一个）。
+/// 元素选择器（强类型；同一选择器多个命中时取 DFS 先序的第一个）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Selector {
     /// 稳定调试 id（`NodeBuilder::id`）。
@@ -42,11 +42,10 @@ impl<'a> Probe<'a> {
         match selector {
             Selector::Id(id) => self
                 .tree
-                .order()
-                .iter()
-                .copied()
+                .dfs_ids()
+                .into_iter()
                 .find(|node| self.tree.debug_id(*node) == Some(id)),
-            Selector::Text(text) => self.tree.order().iter().copied().find(|node| {
+            Selector::Text(text) => self.tree.dfs_ids().into_iter().find(|node| {
                 self.tree
                     .get(*node)
                     .is_ok_and(|target| matches!(target.kind(), NodeKind::Text(content) if content.text == text))
@@ -80,16 +79,16 @@ impl<'a> Probe<'a> {
         match selector {
             Selector::Id(id) => self
                 .tree
-                .order()
-                .iter()
-                .filter(|node| self.tree.debug_id(**node) == Some(id))
+                .dfs_ids()
+                .into_iter()
+                .filter(|node| self.tree.debug_id(*node) == Some(id))
                 .count(),
             Selector::Text(text) => self
                 .tree
-                .order()
-                .iter()
+                .dfs_ids()
+                .into_iter()
                 .filter(|node| {
-                    self.tree.get(**node).is_ok_and(|target| {
+                    self.tree.get(*node).is_ok_and(|target| {
                         matches!(target.kind(), NodeKind::Text(content) if content.text == text)
                     })
                 })

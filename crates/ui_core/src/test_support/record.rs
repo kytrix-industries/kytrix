@@ -31,8 +31,14 @@ pub struct FrameRecord {
     pub damage: Vec<PhysicalRect>,
     /// 是否退化为全帧。
     pub damage_full: bool,
-    /// 本帧被重建 lane 的节点（`tree.order()` 序）。
+    /// 本帧被重建 lane 的节点（DFS 先序 = 绘制序）。
     pub dirty_nodes: Vec<NodeId>,
+    /// 本帧**引擎簿记访问过的不同节点数**（脏集合消费 + 全树/子树遍历的并集）。
+    ///
+    /// 用于把"增量帧不做全树扫描"变成可断言的事实：单节点变更帧应满足
+    /// `scanned_nodes <= 1 + 祖先链长度`（R03-1 / S1 的验收）。旧实现每帧有 6–12 次全树
+    /// 遍历，该值会是节点总数的数倍。
+    pub scanned_nodes: usize,
     /// lane 级重建/复用记录。
     pub paint_log: PaintLog,
     /// 本帧产出的一笔 a11y 交付（`None` = 无 a11y 工作，或捕获未打开）。
@@ -47,8 +53,6 @@ pub struct FrameRecord {
 pub struct RenderedFrame {
     /// 提交序号（与 `FrameRecord.frame_index` 相等）。
     pub frame_index: FrameIndex,
-    /// 节点的逻辑布局盒（来源是节点树，不是绘制动作）。
-    pub debug_bounds: ahash::HashMap<NodeId, Rect>,
     /// 全部 `Quad` 图元（按绘制序，含解析后的颜色）。
     pub quads: Vec<QuadRecord>,
     /// 全部 8 类图元的只读快照（按绘制序，含 `Clip` 指令）。
@@ -111,7 +115,7 @@ pub enum PrimitiveKind {
 /// lane 级重建/复用记录。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PaintLog {
-    /// 本帧访问过的每条 lane 一条记录（`tree.order()` 序）。
+    /// 本帧访问过的每条 lane 一条记录（DFS 先序 = 绘制序）。
     pub lanes: Vec<LanePaintEntry>,
 }
 
@@ -174,6 +178,7 @@ impl FrameRecord {
             damage: Vec::new(),
             damage_full: false,
             dirty_nodes: Vec::new(),
+            scanned_nodes: 0,
             paint_log: PaintLog::default(),
             a11y: None,
         }
@@ -185,11 +190,12 @@ pub(crate) fn capture(
     scene: &Scene,
     tree: &NodeTree,
     resolver: &ColorResolver,
-    report: &PaintReport,
+    report: PaintReport,
     damage_rects: &[PhysicalRect],
     frame_rect: PhysicalRect,
     frame_index: FrameIndex,
     stats: FrameStats,
+    scanned_nodes: usize,
 ) -> FrameRecord {
     let mut lane_nodes: ahash::HashMap<LaneId, NodeId> = ahash::HashMap::default();
     let mut reused_lanes = Vec::new();
@@ -200,16 +206,6 @@ pub(crate) fn capture(
             reused_lanes.push(entry.lane);
         } else {
             dirty_nodes.push(entry.node);
-        }
-    }
-
-    let mut debug_bounds = ahash::HashMap::default();
-    for node in tree.order() {
-        if let Ok(target) = tree.get(*node) {
-            let bounds = target.layout().bounds;
-            if !bounds.is_empty() {
-                debug_bounds.insert(*node, bounds);
-            }
         }
     }
 
@@ -241,7 +237,6 @@ pub(crate) fn capture(
         rendered: true,
         frame: Some(RenderedFrame {
             frame_index,
-            debug_bounds,
             quads,
             primitives,
             reused_lanes,
@@ -250,7 +245,8 @@ pub(crate) fn capture(
         damage,
         damage_full: report.damage.full,
         dirty_nodes,
-        paint_log: report.log.clone(),
+        scanned_nodes,
+        paint_log: report.log,
         a11y: None,
     }
 }
@@ -298,5 +294,78 @@ fn quad_record(
         fill,
         border,
         gradient,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FrameRecord;
+    use crate::{
+        app::App,
+        math::{Rect, Scale, Size},
+        node::builder::NodeBuilder,
+        paint::style::StylePatch,
+        window::{FrameOutcome, WindowOptions},
+    };
+
+    /// R03-1 / S1 的验收：**单节点变更帧**的引擎簿记只碰"变化节点 + 祖先链"，
+    /// 不随节点总数增长。旧实现每帧 6–12 次全树扫描，`scanned_nodes` 会是节点数的数倍。
+    #[test]
+    fn incremental_frame_scans_only_dirty_nodes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let mut app = App::new(runtime.handle().clone());
+        let window = app.create_window(WindowOptions {
+            title: smol_str::SmolStr::new_static("scan"),
+            size: Size::new(400.0, 300.0),
+            scale: Scale::ONE,
+            ..WindowOptions::default()
+        });
+        let root = app.window(window).expect("窗口存在").tree().root();
+        for index in 0..200 {
+            NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, index as f32 * 12.0, 100.0, 10.0))
+                .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
+                .expect("静态 box");
+        }
+        let value = app.signal(0u8);
+        let source = value;
+        let bound = NodeBuilder::boxed()
+            .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
+            .bind_style(move |cx| StylePatch {
+                opacity: Some(f32::from(cx.read(&source)) / 255.0),
+                ..StylePatch::default()
+            })
+            .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
+            .expect("绑定节点");
+        let node_count = app.window(window).expect("窗口存在").tree().len();
+        assert!(matches!(
+            app.frame(window).expect("窗口存在").expect("预热帧"),
+            FrameOutcome::Committed(_)
+        ));
+
+        assert!(app.write(&value, 255), "值变化必须失效");
+        assert!(matches!(
+            app.frame(window).expect("窗口存在").expect("增量帧"),
+            FrameOutcome::Committed(_)
+        ));
+
+        let record: &FrameRecord = app
+            .window(window)
+            .expect("窗口存在")
+            .record()
+            .expect("提交帧必须有记录");
+        assert_eq!(record.dirty_nodes, vec![bound], "只有变化节点被重建 lane");
+        assert!(
+            record.scanned_nodes <= 2,
+            "单节点变更帧的簿记访问数必须 ≤ 1 + 祖先链（root）：{}（树共 {node_count} 节点）",
+            record.scanned_nodes
+        );
+        assert!(
+            record.scanned_nodes * 10 < node_count,
+            "不得出现全树扫描：{} vs {node_count}",
+            record.scanned_nodes
+        );
     }
 }

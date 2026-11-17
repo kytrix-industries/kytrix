@@ -165,7 +165,7 @@ impl WndProcState {
     }
 
     /// 每条消息的翻译上下文（消息时间 + 系统滚轮行数）。
-    pub(crate) fn context(&self, ticks_ms: u64) -> MessageContext {
+    pub(crate) fn context(&self, ticks_ms: u32) -> MessageContext {
         MessageContext {
             ticks_ms,
             wheel_lines: self.wheel_lines,
@@ -188,14 +188,18 @@ impl WndProcState {
     }
 
     /// 压入一条带明确消息时间的平台事件（`WndProc` 的常规路径）。
-    pub(crate) fn push_stamped(&mut self, event: PlatformEvent, ticks_ms: u64) {
+    pub(crate) fn push_stamped(&mut self, event: PlatformEvent, ticks_ms: u32) {
         self.events.push(StampedEvent { event, ticks_ms });
     }
 
-    /// 压入一条**引擎合成**的平台事件：时间取当前消息时间（`GetMessageTime()`），
-    /// 因为合成发生在处理该消息的过程中，与消息时刻同源。
+    /// 压入一条**引擎合成**的平台事件：时间取当前 tick（`GetTickCount64() as u32`）。
+    ///
+    /// **不能**用 `GetMessageTime()`（R02-14）：合成点可能在消息循环之外（泵在
+    /// `take_capture_requests` 里调 `SetCapture`/`ReleaseCapture`），此时它返回的是上一条
+    /// 已取出消息的时间 —— 陈旧值。`tick_now` 与 `MSG.time` 同源同宽（32 位、同回绕），
+    /// 因此与消息时间可以直接相减。
     pub(crate) fn push_now(&mut self, event: PlatformEvent) {
-        let ticks_ms = pump::message_ticks();
+        let ticks_ms = pump::tick_now();
         self.push_stamped(event, ticks_ms);
     }
 

@@ -1,9 +1,23 @@
-//! 脏位：`mark_*` 系列、向上冒泡、`touch` / `any_node`、a11y 脏位计数。
+//! 脏位：`mark_*` 系列、向上冒泡、反向集合的维护与消费。
+//!
+//! 位语义表见 [`crate::node::dirty`] 的模块文档：每个位只有一个写者集合、一个消费者、
+//! 一个清除点。本模块只做"登记 + 冒泡"，**不**在这里清除 `LAYOUT`（taffy 布局写回时清）
+//! 或 `PAINT`（paint pass 消费时清）。
+//!
+//! 反向集合（`dirty_layout` / `dirty_paint` / `dirty_a11y` / `dirty_bind` / 帧尾结算集合）
+//! 要么在 `touch` 里同步登记（本模块），要么由 `place_subtree`（布局移动）登记；所有门禁
+//! 只读集合的 `is_empty()` / `len()`，因此是 O(1)。
 
-use smallvec::SmallVec;
+use crate::node::{dirty::DirtyFlags, id::NodeId, tree::NodeTree};
 
-use super::{Node, NodeTree};
-use crate::node::{dirty::DirtyFlags, id::NodeId};
+// 消费者：`impl NodeTree::mark_bind` 的薄委托（外部调用点见该方法文档）。
+/// 标 `BIND`：动态属性（`bind_style` / `bind_text` / `bind_a11y`）需要重算。
+///
+/// 唯一消费者是 `App::refresh_styles`；它**不**产生像素、不清 `REUSABLE`（R03-9：BIND 与 PAINT
+/// 必须是两条独立通道，否则 `refresh_styles` 会吞掉绘制请求）。
+pub(crate) fn mark_bind(tree: &mut NodeTree, node: NodeId) -> bool {
+    tree.touch(node, DirtyFlags::BIND)
+}
 
 // 消费者：`impl NodeTree::mark_paint` 的薄委托（外部调用点见该方法文档）。
 /// 标 `PAINT`（不冒泡）。返回 `false` = 句柄陈旧。
@@ -35,11 +49,14 @@ pub(crate) fn mark_a11y(tree: &mut NodeTree, node: NodeId) -> bool {
 }
 
 // 消费者：`impl NodeTree::mark_structure` 的薄委托（外部调用点见该方法文档）。
-/// 结构变更：标 `LAYOUT|PAINT|ORDER|A11Y` 并向上冒泡，同时清 `node..root` 的 taffy 缓存。
+/// 结构变更：标 `LAYOUT|PAINT|A11Y` 并向上冒泡，同时清 `node..root` 的 taffy 缓存。
+///
+/// 旧的 `ORDER` 位已删除（R03-13）：a11y 的结构重发由 `A11Y` 位 + 祖先链承担（`adapter.rs`），
+/// 绘制序由 `children` 的 DFS 遍历直接决定，不需要任何"序变化"位。
 pub(crate) fn mark_structure(tree: &mut NodeTree, node: NodeId) -> bool {
     if !tree.touch(
         node,
-        DirtyFlags::LAYOUT | DirtyFlags::PAINT | DirtyFlags::ORDER | DirtyFlags::A11Y,
+        DirtyFlags::LAYOUT | DirtyFlags::PAINT | DirtyFlags::A11Y,
     ) {
         return false;
     }
@@ -49,84 +66,112 @@ pub(crate) fn mark_structure(tree: &mut NodeTree, node: NodeId) -> bool {
 }
 
 // 消费者：`impl NodeTree::mark_subtree_paint` 的薄委托（外部调用点见该方法文档）。
-/// 整棵子树标 `PAINT | A11Y`（并清 `REUSABLE`）—— 重挂后绘制桶顺序与 a11y 父链都可能变化
+/// 整棵子树标 `PAINT | A11Y`（并清 `REUSABLE`）—— 重挂后绘制顺序与 a11y 父链都可能变化
 /// （消费者：`append_child`；`A11Y` 是 P11 追加，见 `design/phase-11-a11y.md` §6.4）。
 pub(crate) fn mark_subtree_paint(tree: &mut NodeTree, node: NodeId) {
-    let ids = tree.collect_subtree_ids(node);
+    let mut ids: Vec<NodeId> = Vec::new();
+    tree.for_each_subtree(node, |id| ids.push(id));
     for id in ids {
         let _ = tree.touch(id, DirtyFlags::PAINT | DirtyFlags::A11Y);
     }
 }
 
+// 消费者：`impl NodeTree::clear_bind` 的薄委托（外部调用点见该方法文档）。
+/// 消费 `BIND`（`refresh_styles` 求值完一个节点后调用：唯一清除点）。
+pub(crate) fn clear_bind(tree: &mut NodeTree, node: NodeId) -> bool {
+    let present = match tree.arena.get_mut(node) {
+        Some(target) => {
+            target.dirty.remove(DirtyFlags::BIND);
+            true
+        }
+        None => false,
+    };
+    tree.dirty_bind.remove(node);
+    present
+}
+
 // 消费者：`impl NodeTree::clear_paint` 的薄委托（外部调用点见该方法文档）。
-/// 消费 `PAINT`（`refresh_styles` 求值完一个节点后调用）。
+/// 消费 `PAINT`（paint pass 重建 / 隐藏完一个节点后调用：唯一清除点）。
 pub(crate) fn clear_paint(tree: &mut NodeTree, node: NodeId) -> bool {
-    match tree.arena.get_mut(node) {
+    let present = match tree.arena.get_mut(node) {
         Some(target) => {
             target.dirty.remove(DirtyFlags::PAINT);
             true
         }
         None => false,
-    }
+    };
+    tree.dirty_paint.remove(node);
+    present
 }
 
 // 消费者：`impl NodeTree::mark_moved_a11y` 的薄委托（外部调用点见该方法文档）。
-/// 布局 post-pass：把「布局盒与上一帧不同」的节点标 `A11Y`，返回条数。
+/// 布局 post-pass：把「本轮布局位置/尺寸真的变了」的节点标 `A11Y`，返回条数。
 ///
 /// `set_size` / `set_scale` 只标根，子树节点的 `layout.bounds` 由布局 pass 写入而不经过
-/// `mark_*` —— 不在这里补标，窗口 resize 后子孙的 a11y bounds 就是旧值（P11 审查 #1）。
-/// `prev_layout` 只在 `settle_frame` 前进，所以本函数在「布局后、提交前」是准确的。
+/// `mark_*` —— 由 `place_subtree` 在写新盒时登记，这里只是消费。旧实现为此每轮布局后扫全树
+/// （R03-20），现在成本是 O(移动节点数)。
 pub(crate) fn mark_moved_a11y(tree: &mut NodeTree) -> usize {
-    let mut moved: SmallVec<[NodeId; 8]> = SmallVec::new();
-    for node in &tree.order {
-        if let Some(target) = tree.arena.get(*node)
-            && target.layout != target.prev_layout
-        {
-            moved.push(*node);
-        }
-    }
+    let moved = tree.take_moved();
     let count = moved.len();
-    for node in moved {
+    for node in moved.iter().copied() {
         let _ = tree.touch(node, DirtyFlags::A11Y);
     }
+    tree.recycle(moved);
     count
 }
 
 // 消费者：`impl NodeTree::clear_a11y` 的薄委托（外部调用点见该方法文档）。
-/// 消费 `A11Y | ORDER`（a11y pass 交付完一笔后调用；`P11` 起 `ORDER` 终于有清除者）。
+/// 消费 `A11Y`（a11y pass 交付完一笔后调用：唯一清除点）。
 pub(crate) fn clear_a11y(tree: &mut NodeTree, node: NodeId) -> bool {
-    let Some(target) = tree.arena.get_mut(node) else {
-        return false;
+    let present = match tree.arena.get_mut(node) {
+        Some(target) => {
+            target.dirty.remove(DirtyFlags::A11Y);
+            true
+        }
+        None => false,
     };
-    let had = target.dirty.contains(DirtyFlags::A11Y);
-    target.dirty.remove(DirtyFlags::A11Y | DirtyFlags::ORDER);
-    if had {
-        tree.a11y_dirty = tree.a11y_dirty.saturating_sub(1);
-    }
-    true
+    tree.dirty_a11y.remove(node);
+    present
 }
 
 // 消费者：`impl NodeTree::a11y_dirty` 的薄委托（外部调用点见该方法文档）。
 /// 带 `A11Y` 位的节点数（O(1)；平台层每轮用它判「有没有 a11y 工作」）。
-pub(crate) fn a11y_dirty(tree: &NodeTree) -> u32 {
-    tree.a11y_dirty
+pub(crate) fn a11y_dirty(tree: &NodeTree) -> usize {
+    tree.dirty_a11y.len()
 }
 
 // 消费者：`impl NodeTree::touch` 的薄委托（外部调用点见该方法文档）。
-/// 标记 + damage 并集 + 清 `REUSABLE`（唯一的写入口，§9.3）。
+/// 标记 + damage 并集 + 清 `REUSABLE` + 反向集合同步（唯一的写入口，§9.3）。
 pub(crate) fn touch(tree: &mut NodeTree, node: NodeId, flags: DirtyFlags) -> bool {
-    let Some(target) = tree.arena.get_mut(node) else {
+    let NodeTree {
+        arena,
+        dirty_bind,
+        dirty_layout,
+        dirty_paint,
+        dirty_a11y,
+        dirty_settle,
+        ..
+    } = tree;
+    let Some(target) = arena.get_mut(node) else {
         return false;
     };
-    let had_a11y = target.dirty.contains(DirtyFlags::A11Y);
     target.dirty.insert(flags);
     if flags.intersects(DirtyFlags::LAYOUT | DirtyFlags::PAINT) {
         target.dirty.remove(DirtyFlags::REUSABLE);
         target.accumulate_damage();
+        dirty_settle.insert(node);
     }
-    // `A11Y` 是累积位（`settle_frame` 不清它），计数必须与位同步（P11 S-108）。
-    if flags.contains(DirtyFlags::A11Y) && !had_a11y {
-        tree.a11y_dirty = tree.a11y_dirty.saturating_add(1);
+    if flags.contains(DirtyFlags::BIND) {
+        dirty_bind.insert(node);
+    }
+    if flags.contains(DirtyFlags::LAYOUT) {
+        dirty_layout.insert(node);
+    }
+    if flags.contains(DirtyFlags::PAINT) {
+        dirty_paint.insert(node);
+    }
+    if flags.contains(DirtyFlags::A11Y) {
+        dirty_a11y.insert(node);
     }
     true
 }
@@ -146,37 +191,137 @@ pub(crate) fn touch_layout_only(tree: &mut NodeTree, node: NodeId) -> bool {
         return false;
     };
     target.dirty.insert(DirtyFlags::LAYOUT);
+    tree.dirty_layout.insert(node);
     true
 }
 
-// 消费者：`impl NodeTree::any_node` 的薄委托（外部调用点见该方法文档）。
-/// 遍历全部存活节点并测试谓词（消费者：`StylePassReport` 的 `layout_dirty`/`paint_dirty`）。
-pub(crate) fn any_node(tree: &NodeTree, mut predicate: impl FnMut(&Node) -> bool) -> bool {
-    tree.order
-        .iter()
-        .any(|id| tree.arena.get(*id).is_some_and(&mut predicate))
+// 消费者：`impl NodeTree::take_dirty_bind` 的薄委托（外部调用点见该方法文档）。
+/// 快照 `BIND` 集合（插入序）与复用缓冲；消费方必须 `recycle` 归还缓冲。
+///
+/// **不**清空集合：每个节点在 `refresh_styles` 里被处理后由 `clear_bind` 单独出集合。
+/// 这样应用闭包 panic 展开时，未处理的节点仍留在集合里（下一次 pass 继续），而不会像
+/// "整体 drain" 那样把工作丢掉（R03-12 的 panic-safety）。
+pub(crate) fn take_dirty_bind(tree: &mut NodeTree) -> Vec<NodeId> {
+    let NodeTree {
+        dirty_scratch,
+        dirty_bind,
+        ..
+    } = tree;
+    let mut out = std::mem::take(dirty_scratch);
+    dirty_bind.snapshot_into(&mut out);
+    #[cfg(feature = "test-support")]
+    for node in &out {
+        tree.note_scanned(*node);
+    }
+    out
+}
+
+// 消费者：`impl NodeTree::take_settle` 的薄委托（外部调用点见该方法文档）。
+/// 取走帧尾结算集合（`settle_frame` 的唯一输入）。
+pub(crate) fn take_settle(tree: &mut NodeTree) -> Vec<NodeId> {
+    let NodeTree {
+        dirty_scratch,
+        dirty_settle,
+        ..
+    } = tree;
+    let mut out = std::mem::take(dirty_scratch);
+    dirty_settle.take_into(&mut out);
+    #[cfg(feature = "test-support")]
+    for node in &out {
+        tree.note_scanned(*node);
+    }
+    out
+}
+
+// 消费者：`impl NodeTree::take_a11y` 的薄委托（外部调用点见该方法文档）。
+/// 取走 `A11Y` 集合（a11y 增量交付的候选集）。
+pub(crate) fn take_a11y(tree: &mut NodeTree) -> Vec<NodeId> {
+    let NodeTree {
+        dirty_scratch,
+        dirty_a11y,
+        ..
+    } = tree;
+    let mut out = std::mem::take(dirty_scratch);
+    dirty_a11y.take_into(&mut out);
+    #[cfg(feature = "test-support")]
+    for node in &out {
+        tree.note_scanned(*node);
+    }
+    out
+}
+
+// 消费者：`impl NodeTree::take_moved` 的薄委托（外部调用点见该方法文档）。
+/// 取走「本轮布局移动过」的节点（`mark_moved_a11y` 的唯一输入）。
+pub(crate) fn take_moved(tree: &mut NodeTree) -> Vec<NodeId> {
+    let NodeTree {
+        dirty_scratch,
+        moved_nodes,
+        ..
+    } = tree;
+    let mut out = std::mem::take(dirty_scratch);
+    moved_nodes.take_into(&mut out);
+    #[cfg(feature = "test-support")]
+    for node in &out {
+        tree.note_scanned(*node);
+    }
+    out
 }
 
 // 消费者：`impl NodeTree::clear_all_dirty_for_test` 的薄委托（外部调用点见该方法文档）。
-/// 仅测试：清掉全部节点的失效位（让「标了什么」可被观察）。
+/// 仅测试：清掉全部节点的失效位与全部反向集合（让「标了什么」可被观察）。
 #[cfg(test)]
 pub(crate) fn clear_all_dirty_for_test(tree: &mut NodeTree) {
-    for id in &tree.order {
-        if let Some(target) = tree.arena.get_mut(*id) {
+    let mut ids: Vec<NodeId> = Vec::new();
+    tree.for_each_dfs(|id| ids.push(id));
+    for id in ids {
+        if let Some(target) = tree.arena.get_mut(id) {
             target.dirty = DirtyFlags::empty();
         }
     }
+    clear_sets(tree);
 }
 
 // 消费者：`impl NodeTree::set_dirty_for_test` 的薄委托（外部调用点见该方法文档）。
-/// 仅测试：直接设置失效位。
+/// 仅测试：直接设置失效位（反向集合同步，便于后续 mark_* 的观察）。
 #[cfg(test)]
 pub(crate) fn set_dirty_for_test(tree: &mut NodeTree, node: NodeId, flags: DirtyFlags) -> bool {
-    match tree.arena.get_mut(node) {
-        Some(target) => {
-            target.dirty = flags;
-            true
-        }
-        None => false,
+    if let Some(target) = tree.arena.get_mut(node) {
+        target.dirty = flags;
+    } else {
+        return false;
+    }
+    clear_sets(tree);
+    sync_set(tree, node, flags);
+    true
+}
+
+/// 仅测试：清空全部反向集合。
+#[cfg(test)]
+fn clear_sets(tree: &mut NodeTree) {
+    tree.dirty_bind.clear();
+    tree.dirty_layout.clear();
+    tree.dirty_paint.clear();
+    tree.dirty_a11y.clear();
+    tree.dirty_settle.clear();
+    tree.moved_nodes.clear();
+}
+
+/// 仅测试：按位把节点登记进对应集合。
+#[cfg(test)]
+fn sync_set(tree: &mut NodeTree, node: NodeId, flags: DirtyFlags) {
+    if flags.contains(DirtyFlags::BIND) {
+        tree.dirty_bind.insert(node);
+    }
+    if flags.contains(DirtyFlags::LAYOUT) {
+        tree.dirty_layout.insert(node);
+    }
+    if flags.contains(DirtyFlags::PAINT) {
+        tree.dirty_paint.insert(node);
+    }
+    if flags.contains(DirtyFlags::A11Y) {
+        tree.dirty_a11y.insert(node);
+    }
+    if flags.intersects(DirtyFlags::LAYOUT | DirtyFlags::PAINT) {
+        tree.dirty_settle.insert(node);
     }
 }

@@ -35,6 +35,20 @@ impl ImeState {
         self.pending_commit = text;
     }
 
+    /// 当前是否处于组合态（XKB 回退通路据此静默：组合串由 [`ImeEvent::Preedit`] 表达，
+    /// 组合期的物理按键不产生正文）。
+    pub(crate) fn composing(&self) -> bool {
+        self.composing
+    }
+
+    /// 丢弃当前组合与待生效批次（IME 被停用时调用）。
+    ///
+    /// 组合态必须一起丢掉：回到 XKB 回退通路后 `composing` 若仍为真，文本会被永久抑制
+    /// （与 R02-2 的 P0 回归同一类失效）。
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
     /// `done`：把本批的事件原子转换成 `ImeEvent`（按「commit → preedit」顺序）。
     pub(crate) fn take_events(&mut self) -> Vec<ImeEvent> {
         let mut events = Vec::with_capacity(2);

@@ -27,7 +27,7 @@ use objc2_foundation::{
 use crate::{
     event::{
         Event, ImeEvent, InputEvent, KeyCode, KeyState, Modifiers, PointerButton, ScrollPhase,
-        ScrollUnit, timestamp_from_ticks,
+        ScrollUnit, modifier_key_transitions, should_emit_text, timestamp_from_ticks,
     },
     math::{Point, Rect},
     platform::{
@@ -118,8 +118,9 @@ define_class!(
                 timestamp,
             }));
             // `Text` 只在「正文没被 IME 交付」时才发，避免与 `ImeEvent::Commit` 重复插入。
-            if !composing
-                && !commit_consumed
+            // 判据与 Linux 的 XKB 回退通路共用 `should_emit_text`（含「重复不得抑制文本」的
+            // 回归测试）：`commit_consumed` = 本次按键的正文已由 IME 交付。
+            if should_emit_text(KeyState::Down, repeat, commit_consumed, composing)
                 && !modifiers.intersects(Modifiers::CONTROL | Modifiers::META)
                 && let Some(text) = event.characters()
             {
@@ -148,10 +149,25 @@ define_class!(
 
         #[unsafe(method(flagsChanged:))]
         fn flags_changed(&self, event: &NSEvent) {
-            // 只维护修饰键位图。macOS 的修饰键**不产生** `keyDown:`/`keyUp:`，若在这里合成
-            // `Key::Shift`，应用会收到 Win32 上不存在的按键序列（Win32 的 Shift 是独立 VK 消息）。
+            // AppKit 不为修饰键发 `keyDown:`/`keyUp:`，只发 `flagsChanged:`；Win32 与 Wayland
+            // 都把 Shift/Ctrl/Alt/Meta 当普通按键投递。这里按位图变化**合成**同样的 `Key`
+            // 序列，`App::held_keys` / `App::key_down` 才在三个平台语义一致（否则 macOS 上
+            // `key_down(ShiftLeft)` 恒为 false）。侧别不可得（`NSEventModifierFlags` 不区分
+            // 左右），统一取左变体 —— 与 `Modifiers` 位图本身不区分左右一致。
+            let previous = self.modifiers();
             self.note_modifiers(event.modifierFlags());
             let modifiers = self.modifiers();
+            let timestamp = event_timestamp(event);
+            for (code, state) in modifier_key_transitions(previous, modifiers) {
+                self.push_event(Event::Input(InputEvent::Key {
+                    code,
+                    state,
+                    // 修饰键的 `flagsChanged:` 没有重复语义。
+                    repeat: false,
+                    modifiers,
+                    timestamp,
+                }));
+            }
             let mut ime = self.ivars().ime.borrow_mut();
             if ime.has_marked() && !modifiers.intersects(Modifiers::SHIFT) {
                 // 组合态里松开 Shift 视为放弃组合（输入法不会总发 `unmarkText:`）。
@@ -243,19 +259,17 @@ define_class!(
             // 精确设备（触控板 / Magic Mouse）给的是像素增量，1:1 跟随；非精确设备（普通滚轮）
             // 给的是"行"，AppKit 一格约 3 行（`NSEvent.scrollingDeltaY` 的非精确量纲仍是
             // **需真机确认**的事项，这里保持 P12 的 /3 归一化，不凭空改手感）。
-            let (delta_x, delta_y, unit, width) = if precise {
+            let (delta_x, delta_y, unit) = if precise {
                 (
                     event.scrollingDeltaX() as f32,
                     event.scrollingDeltaY() as f32,
                     ScrollUnit::Pixel,
-                    0.0,
                 )
             } else {
                 (
                     (event.scrollingDeltaX() / 3.0) as f32,
                     (event.scrollingDeltaY() / 3.0) as f32,
                     ScrollUnit::Line,
-                    1.0,
                 )
             };
             // R02-10：保留系统的 `phase` / `momentumPhase`，引擎才能区分「手指在板上」与
@@ -267,7 +281,6 @@ define_class!(
                 delta: Point::new(delta_x, delta_y),
                 unit,
                 phase,
-                lines_per_tick: if precise { 0.0 } else { width },
                 modifiers: self.modifiers(),
                 timestamp: event_timestamp(event),
             }));
@@ -756,6 +769,7 @@ fn key_code(code: u16) -> KeyCode {
         0x6A => KeyCode::F16,
         0x6B => KeyCode::F14,
         0x6D => KeyCode::F10,
+        0x6E => KeyCode::ContextMenu,
         0x6F => KeyCode::F12,
         0x71 => KeyCode::F15,
         0x72 => KeyCode::Help,

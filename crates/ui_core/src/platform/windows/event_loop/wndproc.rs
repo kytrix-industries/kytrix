@@ -317,6 +317,12 @@ pub(crate) extern "system" fn wndproc(
                 state.mouse_tracking = true;
                 // R02-4：进入客户区的**第一个**消息就是 `PointerEnter` 的生产点（Win32 没有
                 // 独立的 enter 消息，`TME_LEAVE` 只在离开时通知）。
+                //
+                // R02-14 / P2 回归：`PointerEnter` 的坐标由 `native_window::apply_event` 从
+                // `last_client_pos` 读取，而它只在下面的 translate 结果里更新 —— 必须先记录
+                // 本次移动的位置再 push，否则第一条 `PointerEnter.position` 是旧位置（首次为
+                // `(0,0)`），并基于它命中一次 hover/光标，随后才被真正的 `PointerMove` 纠正。
+                state.note_client_pos(loword_signed(lparam.0), hiword_signed(lparam.0));
                 state.push_now(PlatformEvent::PointerEnter);
             }
         }

@@ -20,7 +20,7 @@ fn new_window_has_root_and_empty_scene() {
     let window = window();
 
     assert_eq!(window.id(), WindowId::for_test(1));
-    assert_eq!(window.tree().order().len(), 1, "初始只有 root");
+    assert_eq!(window.tree().len(), 1, "初始只有 root");
     assert_eq!(window.scene().lane_count(), 0);
     assert!(window.scene().is_empty());
     assert_eq!(window.scale(), Scale::ONE);

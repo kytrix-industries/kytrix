@@ -56,10 +56,13 @@ pub(crate) fn unbind_key(app: &mut App, key: KeyCode, modifiers: Modifiers) -> b
 
 // ── 帧内：样式求值 pass ────────────────────────────────────────────────────
 
-/// P03 的「样式求值 pass」：对指定窗口中**带 `PAINT` 且有 `bind_style`** 的节点求值。
+/// P03 的「样式求值 pass」：对指定窗口中**带 `BIND`** 的节点求值。
 ///
 /// 它做四件事：求值闭包、差分替换依赖、写回 patch、按需升级 `LAYOUT` / 标 `A11Y`。
 /// **不产生任何 Scene 图元**（那是 P06 的 paint 阶段；两者共用本实现的前半段）。
+///
+/// 只遍历 `dirty_bind` 反向集合（R03-1 / R03-9）：旧实现每帧遍历全序 `order` 并对每个节点
+/// 查 `PAINT` 位 —— 既是 O(N)，又把"重算动态属性"和"重建 lane"压在同一个位上。
 ///
 /// 返回 `None` = 窗口不存在（P03 的冻结错误表里没有「未知窗口」变体，`Option` 是唯一诚实的表达）。
 /// P11 追加：`bind_a11y` 与另两条动态通道同批求值（同一 `ReadCtx` / `ReadTracker` / 依赖边集）。
@@ -85,17 +88,16 @@ pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePas
     let mut evaluated = 0usize;
     let mut text_evaluated = 0usize;
     let mut text_changed = 0usize;
-    let mut index = 0usize;
-    while index < tree.order().len() {
-        let node = tree.order()[index];
-        index += 1;
-
+    let nodes = tree.take_dirty_bind();
+    for node in nodes.iter().copied() {
+        // 集合的成员资格是权威判据；防御性再确认一次位（`take` 之后位可能已被消费）。
         let needs_eval = tree.get(node).is_ok_and(|n| {
-            n.dirty().contains(DirtyFlags::PAINT)
+            n.dirty().contains(DirtyFlags::BIND)
                 // 只有 `bind_a11y` 的节点没有 PAINT（写信号只标 A11Y），但补丁仍要重算。
                 || (n.dirty().contains(DirtyFlags::A11Y) && tree.has_a11y_bind(node))
         });
         if !needs_eval {
+            tree.clear_bind(node);
             continue;
         }
         let old_patch = tree
@@ -112,7 +114,7 @@ pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePas
             let ghost_deps = tree.deps(node).unwrap_or(&[]);
             graph.replace_deps(Owner::Node { window, node }, ghost_deps, &[]);
             tree.set_deps(node, SmallVec::new());
-            tree.clear_paint(node);
+            tree.clear_bind(node);
             continue;
         }
 
@@ -197,20 +199,23 @@ pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePas
             }
             tree.put_bind_a11y(node, bind);
         }
-        tree.clear_paint(node);
+        // `BIND` 的唯一清除点：本 pass 求值完即消费（`PAINT` 不归这里管）。
+        tree.clear_bind(node);
         if text_changed_here {
-            // 文本变了 ⇒ 必须重画（PAINT 不能被本 pass 的「消费」吞掉）。
+            // 文本变了 ⇒ 必须重画（`PAINT` 是 paint pass 的通道，本 pass 只登记）。
             tree.mark_paint(node);
             // 文本节点的可访问名/值就是文本内容：内容变了 a11y 必须重发。只标 PAINT 时，
             // 新字符串与旧串度量相同（例如 "70%" → "80%"）不会触发 LAYOUT，AT 会读到旧值。
             tree.mark_a11y(node);
         }
     }
+    tree.recycle(nodes);
 
     Some(StylePassReport {
         evaluated,
-        layout_dirty: tree.any_node(|n| n.dirty().contains(DirtyFlags::LAYOUT)),
-        paint_dirty: tree.any_node(|n| !n.dirty().contains(DirtyFlags::REUSABLE)),
+        // O(1)：读反向集合长度，不再为被丢弃的诊断字段做两次全树扫描（R03-1 / R01-4）。
+        layout_dirty: tree.has_layout_work(),
+        paint_dirty: tree.has_paint_work(),
         wake_requested: *wake_requested,
         text_evaluated,
         text_changed,
@@ -262,12 +267,17 @@ pub(crate) fn invalidate(app: &mut App, signal: SignalId) {
                         .tree()
                         .get(node)
                         .is_ok_and(|n| n.style_patch().affects_layout);
+                    // `BIND` 是"重算动态属性"的唯一通道（R03-9）；`PAINT`/`LAYOUT`/`A11Y`
+                    // 是它可能引发的下游失效，三者按语义各自独立登记。
                     let alive = if a11y_only {
                         target.a11y_note_bind_work();
-                        target.tree_mut().mark_a11y(node)
+                        target.tree_mut().mark_a11y(node);
+                        target.tree_mut().mark_bind(node)
                     } else if affects_layout {
+                        target.tree_mut().mark_bind(node);
                         target.tree_mut().mark_layout(node)
                     } else {
+                        target.tree_mut().mark_bind(node);
                         target.tree_mut().mark_paint(node)
                     };
                     if alive {

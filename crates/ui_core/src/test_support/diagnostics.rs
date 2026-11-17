@@ -704,6 +704,7 @@ mod tests {
                 PhysicalRect::new(0, 0, 4, 4),
             ],
             damage_full: false,
+            scanned_nodes: 0,
             dirty_nodes: Vec::new(),
             paint_log: crate::test_support::record::PaintLog::default(),
             a11y: None,

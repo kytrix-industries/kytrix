@@ -1158,11 +1158,11 @@ fn overlay_is_last_and_closes_on_outside_click() {
         app.window(window)
             .expect("window")
             .tree()
-            .order()
+            .dfs_ids()
             .last()
             .copied(),
         Some(overlay_node),
-        "浮层必须是 order 的最后一个子树"
+        "浮层必须是 DFS 先序的最后一个子树"
     );
     assert_eq!(app.overlays(window).len(), 1);
     assert_eq!(
@@ -2375,12 +2375,22 @@ fn a_modal_overlay_traps_focus_and_restores_it_on_close() {
         !app.set_focus(window, Some(background)),
         "模态外节点不可聚焦"
     );
-    // Tab 只在浮层内循环。
+    // R02-12：作用域外的焦点视为无焦点，并在下一次输入时移入模态内第一个可聚焦节点。
+    assert_eq!(
+        app.focused(window),
+        None,
+        "模态打开后作用域外的焦点不得再被报告"
+    );
     app.dispatch_input(
         window,
-        InputEvent::key_down(KeyCode::Tab, Modifiers::empty()),
+        InputEvent::pointer_move(Point::new(5.0, 5.0), Modifiers::empty()),
     );
-    assert_eq!(app.focused(window), Some(first));
+    assert_eq!(
+        app.focused(window),
+        Some(first),
+        "焦点修复：移入模态内第一个可聚焦节点"
+    );
+    // Tab 只在浮层内循环（从修复后的 first 出发）。
     app.dispatch_input(
         window,
         InputEvent::key_down(KeyCode::Tab, Modifiers::empty()),
@@ -2456,7 +2466,6 @@ fn pixel_scroll_follows_immediately_while_line_scroll_is_animated() {
             delta: Point::new(0.0, -30.0),
             unit: ScrollUnit::Pixel,
             phase: ScrollPhase::Update,
-            lines_per_tick: 0.0,
             modifiers: Modifiers::empty(),
             timestamp: std::time::Instant::now(),
         },
@@ -2535,4 +2544,479 @@ fn scrollable_container(app: &mut App, window: WindowId) -> NodeId {
         .style(style)
         .build(tree, root)
         .expect("mount")
+}
+
+// ── AR1 返工回归（wave-2） ────────────────────────────────────────────────
+
+/// R02-12（P1 回归，AR1 探针 1）：**模态之上的弹出层点击必须命中**。
+///
+/// 失败面：`create_overlay` 恒把浮层挂 root，旧判据只认 `is_in_subtree(hit, scope)` ⇒ 对话框里
+/// 的下拉/菜单必然落在作用域外，按下被整体 `return`，菜单项永远点不动（实测 click=0）。
+/// 正确语义：浮层的 `opener` 在模态内（可嵌套递归）⇒ 该浮层仍在作用域内。
+#[test]
+fn a_popup_opened_from_a_modal_receives_clicks() {
+    let (_rt, mut app, window) = setup();
+    let clicks = Rc::new(Cell::new(0_u32));
+    let seen = clicks.clone();
+    app.on_action(Action::custom("menu.item"), move |_ctx| {
+        seen.set(seen.get() + 1);
+    });
+    let root = root_of(&app, window);
+    let background = NodeBuilder::boxed()
+        .layout_override(Rect::new(0.0, 0.0, 400.0, 300.0))
+        .on_click(Action::custom("background"))
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("mount");
+    frame(&mut app, window);
+    assert!(app.set_focus(window, Some(background)));
+
+    // 模态对话框（子节点在 `create_overlay` 返回后才挂载）。
+    let modal = app
+        .create_overlay(
+            window,
+            OverlayOptions {
+                placement: OverlayPlacement::Point(Point::new(20.0, 20.0)),
+                dismiss: OverlayDismiss::Explicit,
+                trap_focus: true,
+                restore_focus: true,
+            },
+        )
+        .expect("modal");
+    let confirm = NodeBuilder::boxed()
+        .layout_override(Rect::new(10.0, 10.0, 80.0, 24.0))
+        .on_click(Action::custom("modal.confirm"))
+        .build(
+            app.window_mut(window).expect("window").tree_mut(),
+            modal.node(),
+        )
+        .expect("mount");
+    frame(&mut app, window);
+
+    // 焦点修复：作用域外的焦点在下一次输入时移入模态内第一个可聚焦节点。
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(Point::new(5.0, 5.0), Modifiers::empty()),
+    );
+    assert_eq!(app.focused(window), Some(confirm), "焦点必须移入模态");
+
+    // 对话框里的下拉菜单：浮层挂 root，opener = 模态内的按钮。
+    let menu = app
+        .create_overlay(
+            window,
+            OverlayOptions {
+                placement: OverlayPlacement::Point(Point::new(120.0, 60.0)),
+                dismiss: OverlayDismiss::OutsideClick,
+                ..OverlayOptions::default()
+            },
+        )
+        .expect("menu");
+    let item = NodeBuilder::boxed()
+        .layout_override(Rect::new(10.0, 10.0, 100.0, 20.0))
+        .on_click(Action::custom("menu.item"))
+        .build(
+            app.window_mut(window).expect("window").tree_mut(),
+            menu.node(),
+        )
+        .expect("mount");
+    frame(&mut app, window);
+
+    // 菜单项屏幕位置 = 浮层原点 (120, 60) + 子节点 (10, 10) = (130, 70)。
+    let position = Point::new(140.0, 78.0);
+    assert_eq!(
+        app.hit_at(window, position).map(|hit| hit.node),
+        Some(item),
+        "命中必须落在菜单项上"
+    );
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_down(position, PointerButton::Primary, Modifiers::empty()),
+    );
+    let outcome = app.dispatch_input(
+        window,
+        InputEvent::pointer_up(position, PointerButton::Primary, Modifiers::empty()),
+    );
+    assert_eq!(outcome.click_count, 1, "模态之上的菜单项必须收到点击");
+    assert_eq!(clicks.get(), 1, "菜单项的动作必须派发");
+}
+
+/// R02-12（P1 回归，AR1 探针 2）：**模态外按钮收不到 Enter 激活**。
+///
+/// 失败面：Enter/Space 激活直接取 `app.focused()` 且不查作用域 ⇒ 焦点留在背景时按 Enter
+/// 仍会触发背景按钮（实测 activations=1）。a11y 的 `ActionRequest` 走 `dispatch_action`，
+/// 同一路径也必须被作用域拦住。
+#[test]
+fn enter_cannot_activate_a_background_button_behind_a_modal() {
+    let (_rt, mut app, window) = setup();
+    let background_hits = Rc::new(Cell::new(0_u32));
+    let modal_hits = Rc::new(Cell::new(0_u32));
+    let seen_background = background_hits.clone();
+    app.on_action(Action::custom("background"), move |_ctx| {
+        seen_background.set(seen_background.get() + 1);
+    });
+    let seen_modal = modal_hits.clone();
+    app.on_action(Action::custom("modal.ok"), move |_ctx| {
+        seen_modal.set(seen_modal.get() + 1);
+    });
+
+    let root = root_of(&app, window);
+    let background = NodeBuilder::boxed()
+        .layout_override(Rect::new(0.0, 0.0, 100.0, 40.0))
+        .on_click(Action::custom("background"))
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("mount");
+    frame(&mut app, window);
+    assert!(app.set_focus(window, Some(background)));
+
+    let modal = app
+        .create_overlay(
+            window,
+            OverlayOptions {
+                placement: OverlayPlacement::Point(Point::new(200.0, 100.0)),
+                dismiss: OverlayDismiss::Explicit,
+                trap_focus: true,
+                restore_focus: true,
+            },
+        )
+        .expect("modal");
+    let ok = NodeBuilder::boxed()
+        .layout_override(Rect::new(10.0, 10.0, 60.0, 24.0))
+        .on_click(Action::custom("modal.ok"))
+        .build(
+            app.window_mut(window).expect("window").tree_mut(),
+            modal.node(),
+        )
+        .expect("mount");
+    frame(&mut app, window);
+
+    let outcome = app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::Enter, Modifiers::empty()),
+    );
+    assert_eq!(background_hits.get(), 0, "背景按钮不得被 Enter 激活");
+    assert_eq!(
+        outcome.target,
+        Some(ok),
+        "Enter 必须激活模态内第一个可聚焦节点"
+    );
+    assert_eq!(modal_hits.get(), 1);
+
+    // 程序化 / a11y 分发同样受作用域约束。
+    assert!(
+        !app.dispatch_action(
+            window,
+            background,
+            Action::custom("background"),
+            ActionSource::Programmatic,
+        ),
+        "作用域外的程序化动作必须被拒绝"
+    );
+    assert_eq!(background_hits.get(), 0);
+    // 作用域内的程序化动作照常。
+    assert!(app.dispatch_action(
+        window,
+        ok,
+        Action::custom("modal.ok"),
+        ActionSource::Programmatic
+    ));
+    assert_eq!(modal_hits.get(), 2);
+
+    // 引擎级动作不受作用域限制：模态打开时 `Dismiss` 仍能关掉它（Esc 走同一语义）。
+    let root = root_of(&app, window);
+    assert!(app.dispatch_action(window, root, Action::Dismiss, ActionSource::Programmatic));
+    assert!(app.overlays(window).is_empty(), "Dismiss 必须关掉模态");
+}
+
+/// R02-8（P1 回归，AR1 探针 3）：捕获目标被卸载后必须**释放捕获并派发 `PointerCancel`**。
+///
+/// 失败面：`remove_node` 只做焦点恢复，`pointer_captured()` 不校验存活 ⇒ 永久返回已卸载
+/// `NodeId`，平台 `SetCapture` 不释放，`on_pointer_leave` 因 `capture.is_some()` 保留按下记录。
+#[test]
+fn removing_the_captured_node_releases_the_capture() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    // 普通容器（可以挂子节点；`LayoutOverride` 节点是叶子，不能有子节点）。
+    let panel = NodeBuilder::boxed()
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("mount");
+    let handle = NodeBuilder::boxed()
+        .layout_override(Rect::new(10.0, 10.0, 20.0, 20.0))
+        .build(app.window_mut(window).expect("window").tree_mut(), panel)
+        .expect("mount");
+    frame(&mut app, window);
+    assert!(app.capture_pointer(window, handle));
+    assert_eq!(app.pointer_captured(window), Some(handle));
+    let _ = app.take_capture_requests();
+    let _ = app.drain_events();
+
+    // 删掉**祖先**：捕获目标随之卸载。
+    assert!(app.remove_node(window, panel));
+    assert_eq!(
+        app.pointer_captured(window),
+        None,
+        "不得返回已卸载的捕获目标"
+    );
+    assert_eq!(
+        app.take_capture_requests(),
+        vec![(window, false)],
+        "必须请求平台释放捕获"
+    );
+    let events = app.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|(_, event)| matches!(event, Event::Input(InputEvent::PointerCancel { .. }))),
+        "必须派发 PointerCancel 观测事件：{events:?}"
+    );
+}
+
+/// R02-10（P1 回归，AR1 探针 4）：键盘/程序化滚动必须**取消残留的滚轮动画**。
+///
+/// 失败面：`scroll_to` 不取消 `AnimationTarget::Scroll` ⇒ 滚轮动画在后续帧继续插值，把
+/// 键盘 `End`（300.0）拉回动画目标（16.75），画面「回弹」。
+#[test]
+fn programmatic_scroll_cancels_a_pending_wheel_animation() {
+    let (_rt, mut app, window) = setup();
+    let container = scrollable_container(&mut app, window);
+    frame(&mut app, window);
+    let handle = app
+        .make_scroll(
+            window,
+            container,
+            ScrollConfig {
+                axis: ScrollAxis::Vertical,
+                line_height: 48.0,
+            },
+        )
+        .expect("scrollable");
+    app.set_scroll_content(&handle, Size::new(100.0, 400.0))
+        .expect("content");
+    frame(&mut app, window);
+
+    // 离散滚轮：登记 120 ms 平滑动画（同帧 offset 还不动）。
+    app.dispatch_input(
+        window,
+        InputEvent::scroll_lines(
+            Point::new(50.0, 50.0),
+            Point::new(0.0, -1.0),
+            Modifiers::empty(),
+        ),
+    );
+    assert_eq!(app.scroll_state(&handle).expect("state").offset.y, 0.0);
+    assert!(app.animations_running(window), "滚轮动画已登记");
+
+    // 程序化跳到底（键盘 End 也走这条：`scroll_by → scroll_to`）。
+    app.scroll_to(&handle, Point::new(0.0, 300.0))
+        .expect("scroll");
+    assert_eq!(app.scroll_state(&handle).expect("state").offset.y, 300.0);
+    assert!(
+        !app.animations_running(window),
+        "scroll_to 必须取消同槽动画"
+    );
+
+    // 后续帧不得把偏移拉回。
+    app.advance_clock(std::time::Duration::from_millis(200));
+    frame(&mut app, window);
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset.y,
+        300.0,
+        "残留动画不得回弹"
+    );
+}
+
+/// R02-16：按住集合是**每窗口**的；关窗必须清理该窗口的集合。
+#[test]
+fn held_keys_are_per_window_and_cleared_on_close() {
+    let (_rt, mut app, window) = setup();
+    let other = app.create_window(WindowOptions {
+        title: "other".into(),
+        size: Size::new(200.0, 200.0),
+        scale: Scale::ONE,
+        ..WindowOptions::default()
+    });
+    frame(&mut app, window);
+    frame(&mut app, other);
+
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::KeyA, Modifiers::empty()),
+    );
+    assert!(app.key_down(window, KeyCode::KeyA));
+    assert!(
+        !app.key_down(other, KeyCode::KeyA),
+        "A 窗按住的键不得让 B 窗的查询为真"
+    );
+
+    assert!(app.close_window(window));
+    assert!(
+        !app.key_down(window, KeyCode::KeyA),
+        "关窗必须清理该窗口的按住集合"
+    );
+}
+
+/// R02-3 / R02-9：**只有主键**驱动拖拽 —— 次键不登记候选，次键抬起也不结束主键的拖拽。
+#[test]
+fn only_the_primary_button_drives_drag_sessions() {
+    let (_rt, mut app, window) = setup();
+    let phases = Rc::new(Cell::new(Vec::<DragPhase>::new()));
+    let seen = phases.clone();
+    app.on_action(Action::custom("grip"), move |ctx| {
+        if let ActionSource::Drag { phase, .. } = ctx.source() {
+            let mut list = seen.take();
+            list.push(phase);
+            seen.set(list);
+        }
+    });
+    let root = root_of(&app, window);
+    let grip = NodeBuilder::boxed()
+        .layout_override(Rect::new(0.0, 0.0, 100.0, 100.0))
+        .on_drag(Action::custom("grip"))
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("mount");
+    frame(&mut app, window);
+
+    // 次键按下 + 越阈值移动：不得成立拖拽会话。
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_down(
+            Point::new(10.0, 10.0),
+            PointerButton::Secondary,
+            Modifiers::empty(),
+        ),
+    );
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(Point::new(40.0, 10.0), Modifiers::empty()),
+    );
+    assert_eq!(app.drag_state(window), None, "次键不得启动拖拽");
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_up(
+            Point::new(40.0, 10.0),
+            PointerButton::Secondary,
+            Modifiers::empty(),
+        ),
+    );
+
+    // 主键：越阈值成立。
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_down(
+            Point::new(10.0, 10.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
+    );
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(Point::new(40.0, 10.0), Modifiers::empty()),
+    );
+    assert_eq!(
+        app.drag_state(window).map(|state| state.node()),
+        Some(grip),
+        "主键必须启动拖拽"
+    );
+
+    // 次键抬起不得结束会话。
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_up(
+            Point::new(40.0, 10.0),
+            PointerButton::Secondary,
+            Modifiers::empty(),
+        ),
+    );
+    assert!(
+        app.drag_state(window).is_some(),
+        "次键抬起不得结束主键的拖拽"
+    );
+    assert_eq!(phases.take(), vec![DragPhase::Start]);
+
+    // 主键抬起：结束（派发 End）。
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_up(
+            Point::new(40.0, 10.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
+    );
+    assert_eq!(app.drag_state(window), None);
+    assert_eq!(phases.take(), vec![DragPhase::End]);
+}
+
+/// R02-11（文档化的语义，回归钉住）：二维 `delta` 按轴拆分，沿滚动链逐层消费。
+///
+/// 内层 `Horizontal` + 外层 `Vertical` = 两轴同时平移（K 线图/深度图的 2D 手势表达方式）。
+/// 引擎的容器是单轴的，这里同时钉住「另一轴不被内层吃掉、原样交给外层」。
+#[test]
+fn a_two_dimensional_wheel_delta_is_split_across_the_scroll_chain() {
+    let (_rt, mut app, window) = setup();
+    let outer = mount_scroll_container(&mut app, window, 100.0);
+    // 内层：嵌在外层里的横向容器（视口 100×50）。
+    let mut inner_style = Style::default();
+    inner_style.inner.size = taffy::geometry::Size {
+        width: taffy::style::Dimension::length(100.0),
+        height: taffy::style::Dimension::length(50.0),
+    };
+    inner_style.clip = Clip::Bounds;
+    let inner = NodeBuilder::boxed()
+        .style(inner_style)
+        .build(app.window_mut(window).expect("window").tree_mut(), outer)
+        .expect("mount");
+    frame(&mut app, window);
+
+    let outer_handle = app
+        .make_scroll(
+            window,
+            outer,
+            ScrollConfig {
+                axis: ScrollAxis::Vertical,
+                line_height: 48.0,
+            },
+        )
+        .expect("outer scrollable");
+    app.set_scroll_content(&outer_handle, Size::new(200.0, 400.0))
+        .expect("outer content");
+    let inner_handle = app
+        .make_scroll(
+            window,
+            inner,
+            ScrollConfig {
+                axis: ScrollAxis::Horizontal,
+                line_height: 48.0,
+            },
+        )
+        .expect("inner scrollable");
+    app.set_scroll_content(&inner_handle, Size::new(400.0, 50.0))
+        .expect("inner content");
+    frame(&mut app, window);
+
+    // 二维像素 delta：横向 -12（内层吃）、纵向 -3（内层不吃，传给外层）。
+    app.dispatch_input(
+        window,
+        InputEvent::Scroll {
+            position: Point::new(20.0, 20.0),
+            delta: Point::new(-12.0, -3.0),
+            unit: ScrollUnit::Pixel,
+            phase: ScrollPhase::Update,
+            modifiers: Modifiers::empty(),
+            timestamp: std::time::Instant::now(),
+        },
+    );
+    assert_eq!(
+        app.scroll_state(&inner_handle)
+            .expect("inner state")
+            .offset
+            .x,
+        12.0,
+        "内层横向容器消费 dx"
+    );
+    assert_eq!(
+        app.scroll_state(&outer_handle)
+            .expect("outer state")
+            .offset
+            .y,
+        3.0,
+        "纵向分量必须传给外层容器"
+    );
 }

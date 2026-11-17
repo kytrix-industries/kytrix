@@ -43,6 +43,17 @@ pub(crate) fn set_input_thresholds(app: &mut App, thresholds: InputThresholds) {
 }
 
 /// 程序性分发（测试 / 菜单桥 / a11y 的 `ActionRequest`）。返回是否被处理。
+///
+/// **受模态作用域约束**（R02-12）：目标节点在作用域外 ⇒ `false`（不派发）。a11y 的
+/// `ActionRequest` 与菜单桥都走这里，因此「模态外不可激活」对指针、键盘、辅助技术三条路径
+/// 同时成立（Blink 的 `inert` 背景、Qt 的模态窗口同一语义）。
+///
+/// 例外是**引擎级动作**（[`Action::FocusNext`] / [`Action::FocusPrev`] / [`Action::Dismiss`]）：
+/// 它们作用于窗口级状态而不是激活目标节点，模态打开时仍必须可用（Esc 关浮层、Tab 遍历）。
+///
+/// 引擎内部路径（点击 / 拖拽 / 取消）不走本函数：它们直接调
+/// [`dispatch_action_with_hit`]，因为指针在 `on_pointer_down` 已按作用域裁决过，而取消类
+/// 事件必须无条件送达。
 /// 消费者：`App::dispatch_action`。
 pub(crate) fn dispatch_action(
     app: &mut App,
@@ -51,10 +62,29 @@ pub(crate) fn dispatch_action(
     action: Action,
     source: ActionSource,
 ) -> bool {
+    // 引擎级动作（关浮层 / 移动焦点）不是「激活某个节点」：它们作用于**窗口级状态**，
+    // 因此不受模态作用域限制（否则模态打开时 `dispatch_action(root, Dismiss)` 会被拒绝，
+    // 而 Esc 的默认绑定恰恰走这条语义）。`Custom` 是节点/应用动作，必须过作用域。
+    if !matches!(
+        action,
+        Action::FocusNext | Action::FocusPrev | Action::Dismiss
+    ) {
+        let scope = app.focus_scope(window);
+        let in_scope = app
+            .windows
+            .get(&window)
+            .is_some_and(|target| focus::in_scope(target.tree(), node, scope));
+        if !in_scope {
+            return false;
+        }
+    }
     app.dispatch_action_with_hit(window, node, action, source, None, Modifiers::empty())
 }
 
-/// 以当前焦点节点为 target 分发（无焦点 ⇒ `false`）。
+/// 以当前焦点节点为 target 分发（无焦点 / 焦点在作用域外 ⇒ `false`）。
+///
+/// 作用域校验有两层：[`App::focused`] 已把作用域外的焦点过滤成 `None`，[`dispatch_action`]
+/// 再做一次显式校验（R02-12：背景按钮不得被 Enter/Space 或 AT 激活）。
 /// 消费者：`App::dispatch_action_focused`。
 pub(crate) fn dispatch_action_focused(
     app: &mut App,
@@ -218,10 +248,14 @@ pub(crate) fn on_pointer_down(
     }
     // ② 模态浮层的焦点作用域（R02-12）：作用域外的按下整体消费 —— 不抢焦点、不激活下层
     //    动作（Blink `<dialog showModal>` 的 `inert` 背景、Qt 对话框的作用域同义）。
+    //
+    //    作用域 = 模态子树 **∪ 属于该模态的浮层链**：`create_overlay` 恒把浮层挂 root，所以
+    //    对话框里的下拉/菜单必然落在模态子树之外；它们的 `opener` 在模态内（可嵌套递归），
+    //    因此仍属于可交互范围（`in_modal_scope`）。旧实现只认子树 ⇒ 菜单项永远点不动。
     if let Some(scope) = app.focus_scope(window) {
         let inside = app.windows.get(&window).is_some_and(|target| {
             hit.is_some_and(|result| {
-                crate::interaction::overlay::is_in_subtree(target.tree(), result.node, scope)
+                overlay_util::in_modal_scope(target.tree(), result.node, Some(scope))
             })
         });
         if !inside {
@@ -249,19 +283,21 @@ pub(crate) fn on_pointer_down(
         app.set_focus(window, focus_target);
     }
     // ⑤ 拖拽候选：命中链上第一条 `on_drag`。此时**不**派发 `DragPhase::Start`，也不捕获指针
-    //    —— 位移越过阈值才转正（R02-9）。
-    let drag = app
-        .windows
-        .get(&window)
-        .and_then(|target| hit.and_then(|result| focus::drag_target(target.tree(), result.node)));
-    if let Some((node, action)) = drag
-        && let Some(target) = app.windows.get_mut(&window)
-    {
-        target.pointer_mut().pending_drag = Some(PendingDrag {
-            node,
-            action,
-            origin: position,
+    //    —— 位移越过阈值才转正（R02-9）。**只有主键**登记候选：次键按下不改变交互状态
+    //    （R02-3；否则右键也能拖，与「只有主键走 click」自相矛盾）。
+    if button.is_primary() {
+        let drag = app.windows.get(&window).and_then(|target| {
+            hit.and_then(|result| focus::drag_target(target.tree(), result.node))
         });
+        if let Some((node, action)) = drag
+            && let Some(target) = app.windows.get_mut(&window)
+        {
+            target.pointer_mut().pending_drag = Some(PendingDrag {
+                node,
+                action,
+                origin: position,
+            });
+        }
     }
 }
 
@@ -355,15 +391,25 @@ pub(crate) fn on_pointer_up(
 ) {
     let hit = app.hit_at(window, position);
     outcome.hit = hit;
+    // 拖拽会话只由**起始按键**结束（R02-3）：左键拖拽进行中，右键抬起既不得 `end_drag`
+    // 也不得清掉待定候选（Win32 的 `WM_LBUTTONUP` / `WM_RBUTTONUP` 是两条独立消息，
+    // Qt / Blink 同样按按键配对）。次键抬起走下面的 press 分支（且不匹配 ⇒ 直接返回）。
     let session = app.windows.get_mut(&window).and_then(|target| {
         let pointer = target.pointer_mut();
         pointer.modifiers = modifiers;
         pointer.last_hit = hit;
+        if !button.is_primary() {
+            return None;
+        }
         pointer.pending_drag = None;
         pointer.end_drag()
     });
     if let Some(session) = session {
         app.capture_requests.insert(window, false);
+        // 拖拽结束：按下记录随之作废（否则下一次无按下事件的抬起会误判成点击）。
+        if let Some(target) = app.windows.get_mut(&window) {
+            target.pointer_mut().press = None;
+        }
         let delta = session.delta();
         let action = session.action;
         if app.dispatch_action_with_hit(
@@ -382,16 +428,19 @@ pub(crate) fn on_pointer_up(
         }
         return;
     }
-    let press = app
-        .windows
-        .get_mut(&window)
-        .and_then(|target| target.pointer_mut().press.take());
+    // 只取**同一按键**的按下记录：次键抬起不得清掉主键的按下（否则主键随后抬起不再产生
+    // click，多键并按时表现为「点了没反应」）。
+    let press = app.windows.get_mut(&window).and_then(|target| {
+        let pointer = target.pointer_mut();
+        if pointer.press.is_some_and(|press| press.button == button) {
+            pointer.press.take()
+        } else {
+            None
+        }
+    });
     let Some(press) = press else {
         return;
     };
-    if press.button != button {
-        return;
-    }
     // R02-3：只有主键产生 click。次键在抬起时**不**走点击判定（Win32 只有 `WM_LBUTTONUP`
     // 对应 `BN_CLICKED`、AppKit 的 target/action 只挂左键、Qt 的 `clicked()` 只认左键、
     // Blink 的 `click` 同样只由主键产生）。
@@ -472,6 +521,16 @@ pub(crate) fn on_scroll(
     let Some(result) = hit else {
         return;
     };
+    // 模态作用域（R02-12）：作用域外的滚动整体消费 —— `inert` 的背景不得被滚轮/触控板滚动
+    //（与按下同一条判定，含「属于该模态的弹出层」）。
+    if let Some(scope) = app.focus_scope(window) {
+        let inside = app.windows.get(&window).is_some_and(|target| {
+            overlay_util::in_modal_scope(target.tree(), result.node, Some(scope))
+        });
+        if !inside {
+            return;
+        }
+    }
     // Shift 交换两轴：各平台的约定都是「Shift + 滚轮 = 横向」。交换后每个容器只消费
     // **自己那条轴**的 delta，另一轴原样留给外层的容器（P2-4）。
     let (delta_x, delta_y) = if modifiers.contains(Modifiers::SHIFT) {
@@ -586,12 +645,17 @@ pub(crate) fn on_key(
     // ① 「按住集合」（R02-16）：`KeyState::Up` 不再被丢弃 —— 应用可以直接查
     //    [`crate::app::App::key_down`] 实现「按住连续」语义。`Unidentified` 也进集合：
     //    它可能对应一个真实按下的键，只是引擎不认识。
+    //
+    //    集合是**每窗口**的：平台把按键投递给拥有键盘焦点的窗口，`key_down(window, code)`
+    //    必须只回答该窗口的状态（旧实现全 App 一份 ⇒ A 窗按住的键在 B 窗查询也为真）。
     match state {
         KeyState::Down => {
-            app.held_keys.insert(code);
+            app.held_keys.entry(window).or_default().insert(code);
         }
         KeyState::Up => {
-            app.held_keys.remove(&code);
+            if let Some(held) = app.held_keys.get_mut(&window) {
+                held.remove(&code);
+            }
             return;
         }
     }
@@ -599,10 +663,16 @@ pub(crate) fn on_key(
     // 便利机制，而不是「重新按下」。旧实现对每个 Down 都查绑定，长按 Enter 会重复下单。
     if !repeat {
         // ② 焦点激活：Enter / Space 走「点击」的同一条冒泡（没声明就落到 ③，不吞键）。
+        //
+        //    作用域校验（R02-12）：`App::focused` 已把模态作用域外的焦点过滤成 `None`，因此
+        //    背景按钮收不到 Enter；这里再显式校验一次作用域，防止焦点在两次读取之间变化。
         if matches!(code, KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space) {
             let focused = app.focused(window);
+            let scope = app.focus_scope(window);
             let activation = app.windows.get(&window).and_then(|target| {
-                focused.and_then(|node| focus::action_target(target.tree(), node))
+                focused
+                    .filter(|node| focus::in_scope(target.tree(), *node, scope))
+                    .and_then(|node| focus::action_target(target.tree(), node))
             });
             if let Some((node, action)) = activation {
                 let handled = app.dispatch_action_with_hit(
@@ -624,6 +694,11 @@ pub(crate) fn on_key(
             }
         }
         // ③ 全局绑定（精确匹配 key + modifiers）。
+        //
+        //    绑定是**应用级**语义（`Ctrl+S`、`Tab`、`Esc`），不是「激活某个节点」：它不受模态
+        //    作用域限制（对话框里仍要能按 Esc 关闭、Tab 遍历模态内控件）。target 只是
+        //    `ActionCtx::node` 的落点，因此直接走 `dispatch_action_with_hit`，绕开
+        //    `dispatch_action` 的作用域校验。
         let binding = app
             .bindings
             .iter()
@@ -636,7 +711,14 @@ pub(crate) fn on_key(
             let Some(node) = node else {
                 return;
             };
-            if app.dispatch_action(window, node, action.clone(), ActionSource::Key) {
+            if app.dispatch_action_with_hit(
+                window,
+                node,
+                action.clone(),
+                ActionSource::Key,
+                None,
+                modifiers,
+            ) {
                 outcome.action = Some(action);
                 outcome.target = Some(node);
             }
@@ -655,8 +737,14 @@ pub(crate) fn on_key(
 /// 语义与 `QAbstractScrollArea::keyPressEvent`、`GtkScrolledWindow` 的键盘处理一致：
 /// 方向键一行（容器的 `line_height`）、PageUp/PageDown 一页（视口）、Home/End 到两端。
 /// 只动**容器自己声明的轴**；没有滚动祖先时什么也不做（不吞键）。
+///
+/// 判定用**逻辑键**（[`crate::event::Key`]）而不是物理码：默认导航关心的是「语义上是方向键/
+/// 翻页键」，这正是逻辑层存在的理由（`NumpadEnter` 与 `Enter` 同义、左右修饰键合并）。
 fn default_key_scroll(app: &mut App, window: WindowId, code: KeyCode) -> bool {
-    use crate::interaction::ScrollAxis;
+    use crate::{event::Key, interaction::ScrollAxis};
+    let Some(key) = Key::from_code(code) else {
+        return false;
+    };
     let Some(focused) = app.focused(window) else {
         return false;
     };
@@ -678,15 +766,15 @@ fn default_key_scroll(app: &mut App, window: WindowId, code: KeyCode) -> bool {
         ScrollAxis::Horizontal => viewport.width,
     };
     // 目标位置（`None` = 该键对本容器没有默认行为）。
-    let goal = match (slot.axis, code) {
-        (ScrollAxis::Vertical, KeyCode::ArrowUp) => Some(-line),
-        (ScrollAxis::Vertical, KeyCode::ArrowDown) => Some(line),
-        (ScrollAxis::Horizontal, KeyCode::ArrowLeft) => Some(-line),
-        (ScrollAxis::Horizontal, KeyCode::ArrowRight) => Some(line),
-        (_, KeyCode::PageUp) => Some(-page),
-        (_, KeyCode::PageDown) => Some(page),
-        (_, KeyCode::Home) => Some(-limit),
-        (_, KeyCode::End) => Some(limit),
+    let goal = match (slot.axis, key) {
+        (ScrollAxis::Vertical, Key::ArrowUp) => Some(-line),
+        (ScrollAxis::Vertical, Key::ArrowDown) => Some(line),
+        (ScrollAxis::Horizontal, Key::ArrowLeft) => Some(-line),
+        (ScrollAxis::Horizontal, Key::ArrowRight) => Some(line),
+        (_, Key::PageUp) => Some(-page),
+        (_, Key::PageDown) => Some(page),
+        (_, Key::Home) => Some(-limit),
+        (_, Key::End) => Some(limit),
         _ => None,
     };
     let Some(delta) = goal else {
@@ -743,9 +831,10 @@ pub(crate) fn click_count(
 
 /// 消费者：`App::on_window_focus_lost`。
 pub(crate) fn on_window_focus_lost(app: &mut App, window: WindowId) {
-    // 失焦期间抬起消息不再到达本窗口：按住集合必须清空，否则 `key_down` 会永久为真
-    //（与 `TranslateState::reset_transient` 对修饰键的处理同源）。
-    app.held_keys.clear();
+    // 失焦期间抬起消息不再到达本窗口：该窗口的按住集合必须清空，否则 `key_down` 会永久为真
+    //（与 `TranslateState::reset_transient` 对修饰键的处理同源）。其它窗口的集合不受影响
+    //（集合是每窗口的，R02-16）。
+    app.held_keys.remove(&window);
     app.cancel_pointer_session(window);
 }
 
@@ -758,14 +847,24 @@ pub(crate) fn on_window_focus_lost(app: &mut App, window: WindowId) {
 /// 永久停在「按住」，用户只能重启应用。
 /// 消费者：`App::cancel_pointer_session`。
 pub(crate) fn cancel_pointer_session(app: &mut App, window: WindowId) {
+    // 捕获可能只由 `capture_pointer` 置位（没有拖拽会话）：无论是否在拖拽，会话作废都必须
+    // 请求平台释放捕获（R02-8：`SetCapture` 不释放会让窗口外的事件继续进来）。
+    let had_capture = app
+        .windows
+        .get(&window)
+        .is_some_and(|target| target.pointer().capture.is_some());
     let cancelled = app
         .windows
         .get_mut(&window)
         .and_then(|target| target.pointer_mut().end_drag());
-    if let Some(session) = cancelled {
+    if cancelled.is_some() || had_capture {
         app.capture_requests.insert(window, false);
+    }
+    if let Some(session) = cancelled {
         let delta = session.delta();
-        let _ = app.dispatch_action(
+        // 取消必须**无条件**送达（`dispatch_action` 会拒绝作用域外目标；模态恰好在拖拽中
+        // 打开时，取消事件仍要落到原拖拽节点上，否则应用永远收不到 `DragPhase::Cancel`）。
+        let _ = app.dispatch_action_with_hit(
             window,
             session.node,
             session.action,
@@ -773,6 +872,8 @@ pub(crate) fn cancel_pointer_session(app: &mut App, window: WindowId) {
                 phase: DragPhase::Cancel,
                 delta,
             },
+            None,
+            Modifiers::empty(),
         );
     }
     if let Some(target) = app.windows.get_mut(&window) {
@@ -850,6 +951,8 @@ fn update_hover(app: &mut App, window: WindowId, next: Option<NodeId>) {
             })
             .collect();
         for node in marked {
+            // 悬停是**动态属性**输入：`BIND` 负责重算闭包，`PAINT` 负责重建 lane（R03-9 的两条通道）。
+            target.tree_mut().mark_bind(node);
             target.tree_mut().mark_paint(node);
         }
     }
@@ -912,10 +1015,17 @@ pub(crate) fn release_pointer(app: &mut App, window: WindowId) -> bool {
     true
 }
 
+/// 当前捕获目标（`None` = 没有捕获 / 窗口不存在 / **捕获节点已卸载**）。
+///
+/// 与 [`hovered`](crate::app::App::hovered) / [`focused`](crate::app::App::focused) 同一纪律：
+/// 读点过滤陈旧 id。捕获目标被应用卸载（虚拟列表回收、切换面板）时，`remove_node` 会主动
+/// 释放并派发 `PointerCancel`；这里的校验是第二道防线（树被直接改写等路径）。
 /// 消费者：`App::pointer_captured`。
 #[must_use]
 pub(crate) fn pointer_captured(app: &App, window: WindowId) -> Option<NodeId> {
-    app.windows.get(&window)?.pointer().capture
+    let target = app.windows.get(&window)?;
+    let node = target.pointer().capture?;
+    target.tree().get(node).is_ok().then_some(node)
 }
 
 // ── P10：拖拽 ──────────────────────────────────────────────────────────────
@@ -960,7 +1070,8 @@ pub(crate) fn cancel_drag(app: &mut App, state: &DragState) -> bool {
     app.capture_requests.insert(window, false);
     let delta = session.delta();
     let action = session.action;
-    app.dispatch_action(
+    // 取消必须无条件送达（同 `cancel_pointer_session`：作用域校验不得吞掉收尾事件）。
+    let _ = app.dispatch_action_with_hit(
         window,
         session.node,
         action,
@@ -968,6 +1079,8 @@ pub(crate) fn cancel_drag(app: &mut App, state: &DragState) -> bool {
             phase: DragPhase::Cancel,
             delta,
         },
+        None,
+        Modifiers::empty(),
     );
     true
 }

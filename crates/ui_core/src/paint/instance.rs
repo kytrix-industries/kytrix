@@ -629,6 +629,9 @@ impl InstanceEncoder {
             frame.encode_scene(scene)?;
             frame.flush_run();
         }
+        // 自检只在 debug 构建里跑：循环本身（遍历全部 op / clip / instance）不是
+        // `debug_assert!` 的宏体，release 下也会白跑 —— 10k 图元 ≈ 40 µs/帧。
+        #[cfg(debug_assertions)]
         self.self_check();
         Ok(&self.buffer)
     }
@@ -638,7 +641,11 @@ impl InstanceEncoder {
         &self.buffer
     }
 
-    /// 编码器自检（P02 §8.8 的不变量；也是 `InstanceBuffer` 内部字段的非 test 读点，S-65）。
+    /// 编码器自检（P02 §8.8 的不变量）。
+    ///
+    /// 只在 debug 构建里编译：release 下这些循环没有任何副作用，却是 O(op + clip + instance)
+    /// 的纯开销。
+    #[cfg(debug_assertions)]
     fn self_check(&self) {
         let mut covered = 0usize;
         for op in &self.buffer.ops {

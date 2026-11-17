@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use windows::Win32::{
     Foundation::HWND,
-    System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
+    System::SystemInformation::GetTickCount64,
     UI::{
         HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
         Input::KeyboardAndMouse::{GetDoubleClickTime, SetCapture},
@@ -89,33 +89,33 @@ pub(super) fn wheel_lines_from_system() -> f32 {
     lines as f32
 }
 
-/// 当前消息的时间（`GetMessageTime()`，毫秒，与 `GetTickCount` 同源）。
+/// 当前消息的时间（`GetMessageTime()`，毫秒，与 `GetTickCount` 同源、**32 位回绕**）。
 ///
 /// **必须**在处理消息期间调用（系统记录的是「最近一次 `GetMessage`/`PeekMessage` 取到的
-/// 消息」的时间），正是 `WndProc` 与合成事件所处的时机。
-pub(super) fn message_ticks() -> u64 {
+/// 消息」的时间），正是 `WndProc` 所处的时机。消息循环之外调用拿到的是**上一条已取出消息**
+/// 的时间（陈旧值）：合成事件必须用 [`tick_now`]，不能用本函数。
+pub(super) fn message_ticks() -> u32 {
     // SAFETY: 无参数、无线程副作用的查询。
-    u64::from(unsafe { GetMessageTime() } as u32)
+    unsafe { GetMessageTime() as u32 }
 }
 
-/// 单调毫秒（`QueryPerformanceCounter` / `QueryPerformanceFrequency`）。
+/// 当前单调 tick（`GetTickCount64` 截成 **32 位**，与 `MSG.time` 同源、同宽、同回绕）。
 ///
-/// 用于把 `MSG.time` 换算成 `Instant`（R02-14）：两者都以系统启动为原点，
-/// 因此同一个事件可以按「现在 −（现在 tick − 消息 tick）」回推。
-pub(super) fn monotonic_millis() -> u64 {
-    let mut frequency = 0i64;
-    let mut counter = 0i64;
-    // SAFETY: 两个都是无副作用的计时器查询。
-    let ok = unsafe {
-        (
-            QueryPerformanceFrequency(&raw mut frequency),
-            QueryPerformanceCounter(&raw mut counter),
-        )
-    };
-    if ok.0.is_err() || ok.1.is_err() || frequency <= 0 || counter < 0 {
-        return 0;
-    }
-    (u128::from(counter as u64) * 1_000 / u128::from(frequency as u64)) as u64
+/// R02-14：公开事件时间戳的换算是 `timestamp_from_ticks_32(now, tick_now(), MSG.time)`。
+/// 「现在」必须取**同一来源同一宽度**的 tick：
+///
+/// - 旧实现用 `QueryPerformanceCounter` 的毫秒当「现在 tick」—— QPC 的原点与宽度都和
+///   `GetTickCount` 不同，所有时间戳被系统性平移 K ms（`Instant::now() - event.timestamp()`
+///   的延迟统计全错），跨 API 不可比；
+/// - `MSG.time` 是 32 位、49.7 天回绕。截成 32 位后 `wrapping_sub` 在回绕两侧仍得到正确
+///   差值（见 `timestamp_from_ticks_32` 的单测），长跑（交易终端常态）不再静默退化。
+///
+/// 引擎合成的平台事件（`PointerEnter` / `PointerCancel`）也用它：它们可能发生在消息循环
+/// **之外**（泵在 `take_capture_requests` 里调 `SetCapture`/`ReleaseCapture`），此时
+/// `GetMessageTime()` 是上一条消息的陈旧时间。
+pub(super) fn tick_now() -> u32 {
+    // SAFETY: 无参数、无副作用的计时器查询（64 位值截断到 32 位与 `MSG.time` 同域）。
+    unsafe { GetTickCount64() as u32 }
 }
 
 /// 消费者：`pump_loop` 与 `wndproc` 的 `WM_SETCURSOR`。

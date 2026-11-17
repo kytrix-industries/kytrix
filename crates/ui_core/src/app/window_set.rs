@@ -6,6 +6,7 @@ use super::App;
 #[cfg(target_os = "linux")]
 use crate::error::EngineError;
 use crate::{
+    interaction,
     node::{dependency::Owner, id::NodeId},
     window::{Window, WindowId, WindowOptions},
 };
@@ -14,6 +15,9 @@ use crate::{
 ///
 /// 删除浮层时顺带处理**焦点恢复**（R02-12）：`App::close_overlay`、`Dismiss` 动作与
 /// 「点击外部关闭」三条路径都经过这里，把恢复集中在此才不会漏掉其中一条。
+///
+/// 删除子树时还必须**作废落在子树内的指针会话**（R02-8）：捕获目标被卸载后，旧实现让
+/// `pointer_captured()` 永久返回死节点、平台捕获永不释放、按下记录卡在「按住」。
 pub(crate) fn remove_node(app: &mut App, window: WindowId, node: NodeId) -> bool {
     // 先取浮层的 opener（删除之后槽随节点一起消失）。
     let opener = app.windows.get(&window).and_then(|target| {
@@ -23,6 +27,27 @@ pub(crate) fn remove_node(app: &mut App, window: WindowId, node: NodeId) -> bool
             .filter(|slot| slot.restore_focus)
             .and_then(|slot| slot.opener)
     });
+    // 捕获目标（含「被删节点是捕获目标的祖先」）⇒ 先收尾会话：结束拖拽（派发
+    // `DragPhase::Cancel`）、清按压/待定拖拽、请求平台释放捕获、清悬停。
+    let captured = app.windows.get(&window).is_some_and(|target| {
+        let tree = target.tree();
+        tree.get(node).is_ok()
+            && target
+                .pointer()
+                .capture
+                .is_some_and(|captured| interaction::overlay::is_in_subtree(tree, captured, node))
+    });
+    if captured {
+        app.cancel_pointer_session(window);
+        // 观察者必须看到会话被系统/引擎取消（与平台 `PointerCancel` 同一语义），否则应用
+        // 侧的「捕获中」状态永远等不到结束信号。
+        app.events.push(
+            window,
+            crate::event::Event::Input(crate::event::InputEvent::PointerCancel {
+                timestamp: std::time::Instant::now(),
+            }),
+        );
+    }
     let Some(target) = app.windows.get_mut(&window) else {
         return false;
     };
@@ -133,22 +158,32 @@ pub(crate) fn close_window(app: &mut App, id: WindowId) -> bool {
     app.ime_disabled.remove(&id);
     // 动画槽引用窗口内的节点与瞬态值：窗口关闭时必须一并清掉（否则 `SetTimer` 永不停）。
     app.animations.retain(|slot| slot.window != id);
+    // 「按住集合」是每窗口状态（R02-16）：关掉持有键盘焦点的窗口后，它按住的键不得继续
+    // 在 `key_down` 里为真。指针捕获请求与待推光标同理 —— 窗口没了，请求没有接收方，
+    // 留着只会在 create/close 循环下无界增长。
+    app.held_keys.remove(&id);
+    app.capture_requests.remove(&id);
+    if app.cursor_pending.is_some_and(|(window, _)| window == id) {
+        app.cursor_pending = None;
+    }
+    // 窗口关闭 = 整个指针会话作废：先收尾（结束拖拽并派发 `DragPhase::Cancel`、清按压/悬停），
+    // 再丢弃窗口。单节点的「捕获目标被卸载」由 `remove_node` 处理；关窗时平台捕获随
+    // `DestroyWindow` 一起释放（Windows 语义），这里只需让应用看到会话取消。
+    if app.windows.contains_key(&id) {
+        app.cancel_pointer_session(id);
+    }
     #[cfg(feature = "hud")]
     app.debug_hud.remove(&id);
     app.last_click = app.last_click.filter(|record| record.window != id);
     let Some(window) = app.windows.remove(&id) else {
         return false;
     };
-    for node in window.tree().order() {
-        if let Some(deps) = window.tree().deps(*node) {
+    // 关窗是冷路径：一次 DFS 收集句柄（不再有全序数组可借）。
+    let nodes = window.tree().dfs_ids();
+    for node in nodes {
+        if let Some(deps) = window.tree().deps(node) {
             for signal in deps {
-                app.graph.detach(
-                    *signal,
-                    Owner::Node {
-                        window: id,
-                        node: *node,
-                    },
-                );
+                app.graph.detach(*signal, Owner::Node { window: id, node });
             }
         }
     }

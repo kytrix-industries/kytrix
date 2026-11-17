@@ -27,7 +27,7 @@ use crate::{
 
 /// 一个窗口的焦点状态（**唯一**权威源：键盘路由、焦点环、a11y 的 `TreeUpdate.focus` 都读它）。
 ///
-/// v1 只有一个作用域（单窗口）；Tab 序不缓存（`order()` 过滤，见 [`crate::interaction::focus`]）。
+/// v1 只有一个作用域（单窗口）；Tab 序不缓存（`dfs_ids()` 过滤，见 [`crate::interaction::focus`]）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FocusScope {
     focused: Option<NodeId>,
@@ -92,6 +92,8 @@ pub(crate) struct DragSession {
 /// （`gtk_drag_check_threshold`）、Blink（`mousemove` 超过阈值才 `dragstart`）、GPUI
 /// （`on_drag` 在 `moved` 超阈值后触发）的仲裁方式：**拖拽 vs 点击由引擎裁决**，应用不必
 /// 自己实现同一套状态机，也不会在「假拖拽」里先把状态改掉却无法撤回。
+///
+/// **只有主键**登记候选（R02-3）：次键按下不改变交互状态；拖拽会话也只由主键抬起结束。
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PendingDrag {
     /// 声明 `on_drag` 的节点。
@@ -184,10 +186,11 @@ pub(crate) struct PointerState {
     pub drag: Option<DragSession>,
     /// 指针捕获的目标节点（`None` = 没有捕获；R02-8）。
     ///
-    /// 捕获期间指针事件即使落在窗口外/命中区外也仍路由到该节点（W3C
-    /// `setPointerCapture`、Qt `QWidget::grabMouse` 的语义）。它同时替代了旧实现里那个
-    /// 「引擎以为捕获了、平台其实丢弃了请求」的假 `bool`：平台能力差异由
-    /// [`crate::app::App::capture_pointer`] 的文档与平台实现表达。
+    /// 语义是**平台级捕获**（W3C `setPointerCapture`、Qt `QWidget::grabMouse` 的对应物）：
+    /// 让系统继续把指针事件投递给本窗口（Windows `SetCapture`；macOS / Wayland 由系统在按下
+    /// 期间隐式保证），引擎**不**做「命名节点路由」—— 事件仍按指针位置命中，`ActionCtx::hit`
+    /// 在窗口外是 `None`。捕获目标被卸载时 `remove_node` 会释放捕获并派发 `PointerCancel`，
+    /// [`crate::app::App::pointer_captured`] 也会过滤陈旧 id。
     pub capture: Option<NodeId>,
     /// 最近一次命中的原始结果（`ActionCtx::hit` 的来源）。
     pub last_hit: Option<HitResult>,
@@ -217,7 +220,16 @@ impl PointerState {
     }
 }
 
-/// 滚动轴（v1 单轴）。
+/// 滚动轴（**容器是单轴的**；R02-11 的取舍）。
+///
+/// 引擎的滚动容器只声明**一条**轴：纵向列表、横向图表各自一个容器。二维 `delta`
+/// （[`crate::event::InputEvent::Scroll`]）按轴拆分后沿滚动链逐层消费：内层容器只吃自己
+/// 声明的轴，另一轴原样传给外层（浏览器的 scroll chaining）。
+///
+/// **需要同时平移两轴的区域由两层容器表达**：内层 [`ScrollAxis::Horizontal`] + 外层
+/// [`ScrollAxis::Vertical`]，每轴各由一个容器消费（K 线图 / 深度图的双指平移就是这样做的）。
+/// 「单个容器同时吃两轴」不在本引擎的契约内 —— 旧文档只写了「二维 delta 必须可达」却没写
+/// 消费方式，属于半截语义（AR1 §2-11）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScrollAxis {
     /// 垂直滚动。
@@ -229,7 +241,7 @@ pub enum ScrollAxis {
 /// 滚动容器的构造参数。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScrollConfig {
-    /// 轴。
+    /// 轴（单轴，见 [`ScrollAxis`]）。
     pub axis: ScrollAxis,
     /// 一格滚轮对应的逻辑像素（默认 48）。
     pub line_height: f32,
@@ -272,17 +284,21 @@ impl ScrollHandle {
 /// 滚动状态快照（应用读偏移的唯一公开面；读的是 tree 侧槽，不存在第二份）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScrollState {
-    /// 当前偏移（逻辑像素，内容坐标 → 屏幕坐标的位移量）。
+    /// 当前偏移（逻辑像素，内容坐标 → 屏幕坐标的位移量）。**另一轴恒为 0**（容器单轴）。
     pub offset: Point,
     /// 内容尺寸（应用 / 虚拟列表显式给）。
     pub content: Size,
     /// 视口尺寸（`bounds.inset(border)`，现算）。
     pub viewport: Size,
-    /// 轴。
+    /// 轴（单轴容器：另一轴的可用范围恒 0）。
     pub axis: ScrollAxis,
 }
 
 /// 滚动槽（`Node.interaction.scroll`）。
+///
+/// 单轴：`offset` 只有 [`ScrollSlot::axis`] 那一条轴可能非零，`max_offset` / `clamp_offset`
+/// 把另一轴强制为 0（写另一轴会被静默夹掉）。二维 `delta` 的跨轴外传在
+/// [`crate::app::input::on_scroll`] 的滚动链里完成。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ScrollSlot {
     /// 当前偏移（已 clamp）。
@@ -421,9 +437,17 @@ pub struct OverlayOptions {
     ///
     /// 置位时（对应 Blink `<dialog>.showModal()` 的 top layer + `inert` 背景、Qt
     /// `QDialog` 的对话框焦点作用域、GTK `GtkWindow` 的 modal）：
-    /// - Tab / Shift+Tab 只在浮层子树内循环；
+    /// - Tab / Shift+Tab 只在作用域内循环（含**属于该模态的弹出层**）；
     /// - [`crate::app::App::set_focus`] 拒绝作用域外的节点；
-    /// - 浮层外的指针按下被**消费**（不抢焦点、不触发下层动作）。
+    /// - 浮层外的指针按下 / 滚动被**消费**（不抢焦点、不触发下层动作、不滚背景）；
+    /// - Enter / Space 激活与 a11y `ActionRequest` 拒绝作用域外目标；
+    /// - 作用域外的焦点在下一次输入/焦点操作时移入模态内第一个可聚焦节点（子节点在
+    ///   `create_overlay` 返回之后才挂载，创建瞬间求值不到候选）。
+    ///
+    /// **作用域 ≠ 模态子树**：模态之上打开的弹出层（下拉/菜单/子菜单）只要 `opener` 在模态
+    /// 内（可嵌套递归）就仍属于作用域（[`crate::interaction::overlay::in_modal_scope`]）。
+    /// 这是 Qt 模态对话框的「子窗口/弹窗归属」与 Chrome top layer 的同一语义；旧实现只认
+    /// 子树，于是对话框里的下拉菜单永远点不动（AR1 探针 1）。
     pub trap_focus: bool,
     /// 关闭时是否把焦点还给**打开者**（R02-12）。
     ///
@@ -444,7 +468,7 @@ impl Default for OverlayOptions {
     }
 }
 
-/// 浮层句柄（`Copy`；浮层永远是 root 的子节点 ⇒ 在 `order` 末尾，命中优先）。
+/// 浮层句柄（`Copy`；浮层永远是 root 的子节点 ⇒ 在 DFS 先序末尾，命中优先）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Overlay {
     window: WindowId,
@@ -571,22 +595,28 @@ pub enum AnimatedValue {
     },
 }
 
-/// 输入判定的系统阈值（默认值 = 各平台的系统缺省；平台在 `platform_init` 覆盖为系统真值）。
+/// 输入判定的系统阈值（默认值 = 各平台的系统缺省；平台在 `run()` 覆盖为系统真值）。
 ///
 /// R02-15：阈值是**用户偏好**而不是常数。三个平台都必须有可用的默认值，并且都必须在
 /// `run()` 里按同一形态覆盖成系统真值：
 ///
 /// | 字段 | Win32 | AppKit | Wayland/GTK |
 /// |---|---|---|---|
-/// | `double_click_time` | `GetDoubleClickTime()` | `+[NSEvent doubleClickInterval]` | 无系统查询（GTK 的 `gtk-double-click-time`/Qt 的 400 ms 缺省） |
-/// | `double_click_distance` | `SM_CXDOUBLECLK`/`SM_CYDOUBLECLK` | 无系统查询 | 无系统查询 |
-/// | `drag_distance` | `SM_CXDRAG`/`SM_CYDRAG` | 无系统查询 | 无系统查询 |
+/// | `double_click_time` | `GetDoubleClickTime()` | `+[NSEvent doubleClickInterval]` | **无系统查询**（用平台缺省） |
+/// | `double_click_distance` | `SM_CXDOUBLECLK`/`SM_CYDOUBLECLK` | **无系统查询**（用平台缺省） | **无系统查询**（用平台缺省） |
+/// | `drag_distance` | `SM_CXDRAG`/`SM_CYDRAG` | **无系统查询**（用平台缺省） | **无系统查询**（用平台缺省） |
 ///
-/// 读不到系统值时保留默认值并留一条诊断（不静默）：macOS/Linux 用户在系统设置里调过双击速度
-/// 时，引擎的判定会与其它应用不一致 —— 这是必须被看见的偏离。
+/// **Linux 没有系统查询通路**（XSettings / GTK 的 `gtk-double-click-time` 需要额外依赖，
+/// 本引擎不引入）：`platform_default()` 的 400 ms 是 GTK 250 ms 与 Qt 400 ms 之间的稳定
+/// 取值，引擎**静默**使用它 —— 这里明确声明「Linux 不读系统设置」，不留「会留一条诊断」
+/// 之类的空承诺。macOS 同理只有双击间隔可读。
+///
+/// [`Default`] 实现与 [`InputThresholds::platform_default`] **完全一致**：应用自己构造
+/// `InputThresholds::default()` 得到的值与引擎缺省相同（旧实现 `Default` 恒 500 ms，与
+/// Linux 的 400 ms 分叉）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InputThresholds {
-    /// 双击的时间窗口（系统缺省 500 ms）。
+    /// 双击的时间窗口（系统缺省 500 ms；Linux 400 ms）。
     pub double_click_time: Duration,
     /// 双击的位置容差（系统缺省 4 px；X/Y 取同一个值）。
     pub double_click_distance: f32,
@@ -600,21 +630,18 @@ pub struct InputThresholds {
 
 impl Default for InputThresholds {
     fn default() -> Self {
-        Self {
-            double_click_time: Duration::from_millis(500),
-            double_click_distance: 4.0,
-            drag_distance: 4.0,
-        }
+        Self::platform_default()
     }
 }
 
 impl InputThresholds {
-    /// 平台缺省（`platform_init` 读系统值失败时保留它）。
+    /// 平台缺省（平台读系统值失败时保留它；[`Default`] 直接返回它）。
     ///
     /// 数值来源：Win32 的 `GetDoubleClickTime()` 缺省 500 ms、`SM_CXDRAG`/`SM_CYDRAG` 缺省
-    /// 4 px；AppKit 的 `+[NSEvent doubleClickInterval]` 缺省 0.5 s；Linux 桌面按 GTK
-    /// (`gtk-double-click-time` 250 ms)/Qt (`QStyleHints::mouseDoubleClickInterval` 400 ms)
-    /// 的缺省取中间值 —— 没有 XSettings 通路时它是唯一稳定的选择。
+    /// 4 px；AppKit 的 `+[NSEvent doubleClickInterval]` 缺省 0.5 s；**Linux 没有系统查询**
+    /// （本引擎不引入 XSettings / GTK 依赖），取 GTK `gtk-double-click-time` 250 ms 与
+    /// Qt `QStyleHints::mouseDoubleClickInterval` 400 ms 之间的 400 ms —— 这是没有
+    /// 系统通路时唯一稳定的选择，且与 `Default` 一致。
     #[must_use]
     pub const fn platform_default() -> Self {
         #[cfg(windows)]
@@ -831,13 +858,22 @@ mod tests {
         assert_eq!(Easing::Linear.sample(0.5), 0.5);
     }
 
+    /// R02-15：`Default` 与 `platform_default()` 必须同值（旧实现 `Default` 恒 500 ms，
+    /// 与 Linux 的 400 ms 分叉 —— 应用自己构造的阈值和引擎缺省不一样）。
     #[test]
-    fn thresholds_default_to_the_probed_values() {
+    fn thresholds_default_matches_the_platform_defaults() {
         let thresholds = InputThresholds::default();
+        let platform = InputThresholds::platform_default();
 
-        assert_eq!(thresholds.double_click_time.as_millis(), 500);
+        assert_eq!(thresholds, platform);
         assert_eq!(thresholds.double_click_distance, 4.0);
         assert_eq!(thresholds.drag_distance, 4.0);
+        // 双击窗口是平台相关值：Windows/macOS 500 ms、Linux 400 ms（无系统查询通路）。
+        assert!(
+            matches!(thresholds.double_click_time.as_millis(), 400 | 500),
+            "双击窗口必须是平台缺省之一（实际 {:?}）",
+            thresholds.double_click_time
+        );
     }
 
     #[test]

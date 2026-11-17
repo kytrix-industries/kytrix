@@ -54,6 +54,8 @@ pub(crate) fn make_virtual_list(
         builder: None,
         mounted: Vec::new(),
     });
+    // 反向索引：`App::rewindow_virtuals` 每帧只需要遍历虚拟列表容器，不再扫全树（R03-1）。
+    target.tree_mut().note_virtual_container(container);
     Ok(VirtualList::new(window, container))
 }
 
@@ -125,14 +127,9 @@ pub(crate) fn virtual_row_index(app: &App, list: &VirtualList, row: NodeId) -> O
 /// 布局后/视口变化后修复所有虚拟列表的可见窗口（幂等：区间不变则零工作）。
 /// 消费者：`App::rewindow_virtuals`。
 pub(crate) fn rewindow_virtuals(app: &mut App, window: WindowId) {
+    // 反向索引（挂载时登记）：成本 O(虚拟列表数)，与节点总数无关。
     let containers: Vec<NodeId> = app.windows.get(&window).map_or_else(Vec::new, |target| {
-        target
-            .tree()
-            .order()
-            .iter()
-            .copied()
-            .filter(|node| target.tree().virtual_slot(*node).is_some())
-            .collect()
+        target.tree().virtual_containers().to_vec()
     });
     for node in containers {
         app.rewindow_virtual(window, node);

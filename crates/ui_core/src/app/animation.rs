@@ -163,6 +163,9 @@ pub(crate) fn needs_continuous_frames(app: &App) -> bool {
 pub(crate) fn mark_nodes_paint(app: &mut App, window: WindowId, nodes: &[NodeId]) {
     if let Some(target) = app.windows.get_mut(&window) {
         for node in nodes {
+            // 动画写的是 `Transient`，而 `bind_style` 读它 ⇒ 必须重算动态属性（`BIND`）并重绘
+            // （`PAINT`）。这是 `BIND` / `PAINT` 拆开后的两个独立通道（R03-9）。
+            target.tree_mut().mark_bind(*node);
             target.tree_mut().mark_paint(*node);
         }
     }
@@ -208,6 +211,8 @@ pub(crate) fn tick_animations(app: &mut App, window: WindowId) {
         }
         for node in &slot.nodes {
             if let Some(target) = app.windows.get_mut(&window) {
+                // 同上：瞬态值变了 ⇒ 读到它的 `bind_style` 必须重算，然后才谈重绘。
+                target.tree_mut().mark_bind(*node);
                 target.tree_mut().mark_paint(*node);
             }
         }

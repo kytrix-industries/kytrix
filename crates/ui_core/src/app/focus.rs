@@ -13,15 +13,22 @@ use crate::{
 
 // ── P10：焦点 ──────────────────────────────────────────────────────────────
 
-/// 当前焦点（`None` = 无焦点 / 窗口不存在 / **焦点节点已卸载**）。
+/// 当前焦点（`None` = 无焦点 / 窗口不存在 / **焦点节点已卸载** / **焦点在模态作用域外**）。
 ///
 /// 陈旧焦点一律视为无焦点：虚拟列表回收行之后，旧 `NodeId` 不得再驱动键盘路由。
+/// 模态浮层（`trap_focus`）打开后，落在作用域外的焦点同样视为无焦点 —— 背景控件不得再被
+/// Enter/Space 或 a11y 激活；下一次输入会把它移入作用域内（[`validate_focus`]）。
 /// 消费者：`App::focused`。
 #[must_use]
 pub(crate) fn focused(app: &App, window: WindowId) -> Option<NodeId> {
     let target = app.windows.get(&window)?;
     let node = target.focus().focused()?;
-    target.tree().get(node).ok().map(|_| node)
+    let tree = target.tree();
+    if tree.get(node).is_err() {
+        return None;
+    }
+    let scope = overlay_util::focus_scope_root(tree, tree.root());
+    focus::in_scope(tree, node, scope).then_some(node)
 }
 
 /// 当前的焦点作用域根（最上层模态浮层的子树根；R02-12）。
@@ -42,17 +49,45 @@ pub(crate) fn hovered(app: &App, window: WindowId) -> Option<NodeId> {
     target.tree().get(node).ok().map(|_| node)
 }
 
-/// 清掉指向已卸载节点的焦点（读取路径都是只读，清理集中在这里）。
+/// 清理失效焦点（读取路径都是只读，清理集中在这里）。
+///
+/// 两条规则（R02-12）：
+/// 1. 指向**已卸载节点**的焦点 ⇒ 清空；
+/// 2. 落在**模态作用域外**的焦点 ⇒ 移入作用域内第一个可聚焦节点（没有候选则清空）。
+///
+/// 规则 2 是「模态打开时把焦点移入对话框」的落点：浮层的子节点在 `create_overlay` 返回之后
+/// 才挂载，创建瞬间求值不到候选，因此修复放在下一次输入/焦点操作（本函数是它们的公共入口）。
+/// 常见路径（没有模态）只做一次根子节点扫描，零分配。
 /// 消费者：`App::validate_focus`。
 pub(crate) fn validate_focus(app: &mut App, window: WindowId) {
-    let stale = app.windows.get(&window).and_then(|target| {
-        let node = target.focus().focused()?;
-        target.tree().get(node).is_err().then_some(())
-    });
-    if stale.is_some()
-        && let Some(target) = app.windows.get_mut(&window)
-    {
-        target.focus_mut().set(None);
+    let repair = {
+        let Some(target) = app.windows.get(&window) else {
+            return;
+        };
+        let tree = target.tree();
+        let Some(node) = target.focus().focused() else {
+            return;
+        };
+        if tree.get(node).is_err() {
+            Some(None)
+        } else {
+            let scope = overlay_util::focus_scope_root(tree, tree.root());
+            (scope.is_some() && !focus::in_scope(tree, node, scope))
+                .then(|| focus::next_focusable(tree, None, false, scope))
+        }
+    };
+    match repair {
+        // 陈旧焦点：只清位（节点已卸载，没有可标脏/发 a11y 的对象）。
+        Some(None) => {
+            if let Some(target) = app.windows.get_mut(&window) {
+                target.focus_mut().set(None);
+            }
+        }
+        // 作用域外焦点：走 `set_focus` 的完整路径（焦点环 damage + a11y 标记 + 唤醒）。
+        Some(Some(next)) => {
+            app.set_focus(window, Some(next));
+        }
+        None => {}
     }
 }
 

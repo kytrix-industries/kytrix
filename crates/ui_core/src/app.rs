@@ -77,12 +77,12 @@ const A11Y_THROTTLE: std::time::Duration = std::time::Duration::from_millis(100)
 pub struct StylePassReport {
     /// 实际求值的 `bind_style` 闭包个数（不区分「补丁是否变化」）。
     pub evaluated: usize,
-    /// pass 结束后该窗口内是否仍有节点带 `LAYOUT`（含冒泡）。
+    /// pass 结束后该窗口内是否仍有节点待重排（读 `dirty_layout` 反向集合，O(1)）。
     pub layout_dirty: bool,
-    /// pass 结束后该窗口内是否仍有节点 `!REUSABLE`。
+    /// pass 结束后该窗口内是否仍有节点待重建 lane（读 `dirty_paint` 反向集合，O(1)）。
     ///
-    /// **P03 恒为 `true`**：`REUSABLE` 在 P03 只有清除者（`mark_*`），帧初重置属 P06 的
-    /// `NodeTree::begin_frame`。因此除空窗口外该字段没有区分度。
+    /// 两个字段都是 O(1) 的集合判空（R03-1 / R01-4）：旧实现为它们各做一次全树扫描，
+    /// 而报告在非 test 构建里被直接丢弃。
     pub paint_dirty: bool,
     /// pass 结束后 `App::take_wake_request()` 会返回的值（**本报告不消费它**）。
     pub wake_requested: bool,
@@ -142,11 +142,13 @@ pub struct App {
     dispatcher: Arc<Dispatcher>,
     /// 本帧从平台层收到的、尚未被应用取走的事件（**有界**环形队列，R02-5）。
     events: event_queue::EventQueue,
-    /// 当前按住的物理键集合（R02-16；`KeyState::Up` 落地后的权威源）。
+    /// 每个窗口当前按住的物理键集合（R02-16；`KeyState::Up` 落地后的权威源）。
     ///
     /// 用 `HashSet` 而不是位图：`KeyCode` 含 `Unidentified(u16)`，位图需要先为它分配序号，
-    /// 而按住集合的规模是个位数 —— 直接哈希正好。窗口失焦时整体清空（抬起消息不再到达）。
-    held_keys: ahash::HashSet<KeyCode>,
+    /// 而按住集合的规模是个位数 —— 直接哈希正好。**按窗口**：平台只把按键投递给拥有键盘
+    /// 焦点的窗口，`App::key_down(window, code)` 必须只回答该窗口的状态。窗口失焦 / 关窗时
+    /// 清空该窗口的集合（抬起消息不再到达）。
+    held_keys: ahash::HashMap<WindowId, ahash::HashSet<KeyCode>>,
     /// 每轮事件循环调用一次的应用钩子（读事件 / 写状态；`Application::run` 唯一调用点）。
     frame_hook: Option<Box<dyn FnMut(&mut App)>>,
     /// 动作处理器表（P10；同 `Action` 后写覆盖）。
@@ -405,7 +407,7 @@ impl App {
             packed: Vec::new(),
             dispatcher: Dispatcher::new(),
             events: event_queue::EventQueue::new(),
-            held_keys: ahash::HashSet::default(),
+            held_keys: ahash::HashMap::default(),
             frame_hook: None,
             handlers: ahash::HashMap::default(),
             close_handlers: ahash::HashMap::default(),
@@ -665,6 +667,11 @@ impl App {
     }
 
     /// 程序性分发（测试 / 菜单桥 / a11y 的 `ActionRequest`）。返回是否被处理。
+    ///
+    /// **受模态作用域约束**（R02-12）：目标节点在模态作用域外 ⇒ `false`（不派发）。
+    /// a11y 的 `ActionRequest` 与菜单桥都走这里，因此「模态外不可激活」对指针、键盘、
+    /// 辅助技术三条路径同时成立。引擎级动作（`FocusNext` / `FocusPrev` / `Dismiss`）作用于
+    /// 窗口级状态，不受作用域限制（模态打开时 Esc / Tab 仍必须可用）。
     pub fn dispatch_action(
         &mut self,
         window: WindowId,
@@ -675,7 +682,7 @@ impl App {
         input::dispatch_action(self, window, node, action, source)
     }
 
-    /// 以当前焦点节点为 target 分发（无焦点 ⇒ `false`）。
+    /// 以当前焦点节点为 target 分发（无焦点 / 焦点在模态作用域外 ⇒ `false`）。
     pub fn dispatch_action_focused(
         &mut self,
         window: WindowId,
@@ -808,9 +815,11 @@ impl App {
         input::cancel_pointer_session(self, window)
     }
 
-    /// 当前焦点（`None` = 无焦点 / 窗口不存在 / **焦点节点已卸载**）。
+    /// 当前焦点（`None` = 无焦点 / 窗口不存在 / **焦点节点已卸载** / **焦点在模态作用域外**）。
     ///
     /// 陈旧焦点一律视为无焦点：虚拟列表回收行之后，旧 `NodeId` 不得再驱动键盘路由。
+    /// 模态浮层（`trap_focus`）打开后，落在作用域外的焦点同样视为无焦点 —— 背景控件不得再被
+    /// Enter/Space 或 a11y 激活；下一次输入/焦点操作会把它移入作用域内第一个可聚焦节点。
     #[must_use]
     pub fn focused(&self, window: WindowId) -> Option<NodeId> {
         focus::focused(self, window)
@@ -838,8 +847,11 @@ impl App {
         focus::hovered(self, window)
     }
 
-    /// 取得**指针捕获**（R02-8）：此后该窗口的指针事件即便落在命中区外也仍按指针位置分发，
-    /// 直到 [`App::release_pointer`] / 指针抬起 / 会话取消。
+    /// 取得**指针捕获**（R02-8）：请求平台继续把指针事件投递给本窗口，直到
+    /// [`App::release_pointer`] / 指针抬起 / 会话取消 / **捕获节点被卸载**。
+    ///
+    /// 这是**平台级捕获**，不是「命名节点路由」：引擎不做 `setPointerCapture` 那种把事件
+    /// 强制投给某个节点的重定向，事件仍按指针位置命中（`ActionCtx::hit` 在窗口外是 `None`）。
     ///
     /// 平台落地：
     /// - Windows：`SetCapture(hwnd)`（引擎在乎的正是它：移出客户区后仍能收到
@@ -851,6 +863,9 @@ impl App {
     /// 因此本调用在三个平台都成立，但只有 Windows 会真正调用系统 API；其余两个平台的语义由
     /// 系统保证（R02-8 要求「在文档与类型上诚实表达」而不是假装请求成功）。
     ///
+    /// 捕获目标被 [`App::close_overlay`] 等路径卸载时，引擎释放捕获并派发一次
+    /// `PointerCancel` 观测事件（应用侧「捕获中」状态不会永远悬空）。
+    ///
     /// 返回 `false` = 窗口/节点不存在，或已经捕获到同一节点（幂等）。
     pub fn capture_pointer(&mut self, window: WindowId, node: NodeId) -> bool {
         input::capture_pointer(self, window, node)
@@ -861,18 +876,21 @@ impl App {
         input::release_pointer(self, window)
     }
 
-    /// 当前捕获目标（`None` = 没有捕获）。
+    /// 当前捕获目标（`None` = 没有捕获 / 窗口不存在 / **捕获节点已卸载**）。
     #[must_use]
     pub fn pointer_captured(&self, window: WindowId) -> Option<NodeId> {
         input::pointer_captured(self, window)
     }
 
-    /// 该物理键当前是否**按住**（R02-16；`KeyState::Up` 落地后的查询面）。
+    /// 该物理键在**该窗口**当前是否按住（R02-16；`KeyState::Up` 落地后的查询面）。
     ///
-    /// 窗口失焦时按住集合整体清空（抬起消息不再到达本窗口）。
+    /// 集合是每窗口的：平台只把按键投递给拥有键盘焦点的窗口，A 窗按住的键不会让
+    /// `key_down(B, code)` 为真。窗口失焦或关闭时该窗口的集合清空（抬起消息不再到达）。
     #[must_use]
     pub fn key_down(&self, window: WindowId, code: KeyCode) -> bool {
-        self.windows.contains_key(&window) && self.held_keys.contains(&code)
+        self.held_keys
+            .get(&window)
+            .is_some_and(|held| held.contains(&code))
     }
 
     /// 设置焦点。不可聚焦 / 同值 / **在模态浮层作用域之外** ⇒ `false`（不标脏、不唤醒）。
@@ -974,6 +992,9 @@ impl App {
     ///
     /// 只产生**视口矩形**的 damage：不写脏位、不跑布局、不跑样式求值。
     ///
+    /// 写入前会**取消该滚动槽上的滚轮平滑动画**（R02-10 / P1 回归）：否则动画在后续帧继续
+    /// 插值，把键盘 / 程序化滚动拉回原处（例如按 `End` 跳到底后被残留动画拽回）。
+    ///
     /// # Errors
     /// `StaleNode`（节点已卸载）/ `NotScrollable`（不是滚动容器）。
     pub fn scroll_to(&mut self, handle: &ScrollHandle, offset: Point) -> Result<(), EngineError> {
@@ -1073,9 +1094,12 @@ impl App {
         virtual_list::rewindow_virtual(self, window, node)
     }
 
-    /// 打开一个浮层（root 的最后一个子节点 ⇒ `order` 末尾 ⇒ 命中优先）。
+    /// 打开一个浮层（root 的最后一个子节点 ⇒ DFS 先序末尾 ⇒ 命中优先）。
     ///
-    /// # Errors
+    /// 打开瞬间的焦点节点被记为 **opener**（`restore_focus` 时关闭后还给触发按钮，R02-12；
+    /// 它同时决定该浮层是否属于某个模态的交互作用域 —— 模态里打开的下拉/菜单，`opener` 在
+    /// 模态内，因此仍在作用域内）。`trap_focus` 置位时该浮层成为焦点作用域根。
+    ///
     /// # Errors
     /// `UnknownWindow`（窗口已关闭）/ `StaleNode`（树结构被破坏）。
     pub fn create_overlay(
@@ -1418,7 +1442,7 @@ impl App {
         a11y::a11y_retry_pending(self)
     }
 
-    /// 产出一笔 a11y 交付（消费 `A11Y|ORDER` 位与 `full_pending`）。
+    /// 产出一笔 a11y 交付（消费 `A11Y` 反向集合与 `full_pending`）。
     ///
     /// **必须在 `accesskit_windows::Adapter::update_if_active` 的闭包里调用**（adapter 不活跃时
     /// 闭包不执行 ⇒ 零开销），或由 `test-support` 的捕获路径调用。

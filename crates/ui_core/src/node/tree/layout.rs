@@ -85,7 +85,7 @@ pub(crate) fn set_style(
     let Some(target) = tree.arena.get_mut(node) else {
         return Err(EngineError::StaleNode { node });
     };
-    target.style = style;
+    *target.style = style;
     tree.invalidate_layout(node);
     Ok(())
 }
@@ -171,16 +171,27 @@ pub(crate) fn taffy_children(tree: &NodeTree, node: NodeId) -> &[NodeId] {
 
 // 消费者：`impl NodeTree::taffy_cache` 的薄委托（外部调用点见该方法文档）。
 /// 旁表里的 taffy 缓存（首次访问即建）。
+///
+/// **按需分配**：只有真正参与过布局的节点才有条目（`taffy::Cache` 约 0.5 KB，按 arena 槽位
+/// 预分配会让每个节点白付这个体积 —— 20 万节点 ≈ 100 MB，R03-3）。
 pub(crate) fn taffy_cache(tree: &mut NodeTree, node: NodeId) -> &mut taffy::Cache {
-    let index = node.index() as usize;
-    if tree.layout_cache.len() <= index {
-        tree.layout_cache.resize_with(index + 1, || None);
-    }
-    tree.layout_cache[index].get_or_insert_with(taffy::Cache::new)
+    tree.layout_cache.entry(node).or_default()
+}
+
+// 消费者：`impl NodeTree::layout_cache` 的薄委托（仅测试）。
+/// 节点的 taffy 缓存（`None` = 从未参与布局 / 已失效并释放）。
+#[cfg(test)]
+pub(crate) fn layout_cache(tree: &NodeTree, node: NodeId) -> Option<&taffy::Cache> {
+    tree.layout_cache.get(&node)
 }
 
 // 消费者：`impl NodeTree::set_local_layout` 的薄委托（外部调用点见该方法文档）。
 /// `LayoutPartialTree::set_unrounded_layout` 的落点：写**父相对**几何 + 消费 `LAYOUT`。
+///
+/// **`LAYOUT` 的唯一清除点**（脏位表）。taffy 每轮布局对"缓存未命中"的节点写回一次，
+/// 因此"本轮真的被重算过"与"`LAYOUT` 位被这次布局消费"是同一件事。布局之后（
+/// `rewindow_virtuals` / `clamp_scroll_offsets`）新产生的 `LAYOUT` 不会被吞掉：帧尾
+/// `settle_frame` 不再清它。
 pub(crate) fn set_local_layout(tree: &mut NodeTree, node: NodeId, layout: &taffy::Layout) {
     let epoch = tree.layout_epoch;
     let local = Rect::new(
@@ -216,6 +227,7 @@ pub(crate) fn set_local_layout(tree: &mut NodeTree, node: NodeId, layout: &taffy
         // `LAYOUT` 位的唯一消费点：被 taffy 布局过 ⇒ 不再需要重排。
         target.dirty.remove(DirtyFlags::LAYOUT);
     }
+    tree.dirty_layout.remove(node);
     // R12-14：容器宽度变化 ⇒ 该文本节点的断行依据变了，必须进第二阶段脏集合。
     // 这里**不动** `LAYOUT`/`PAINT` 位（由 `layout_text` 的重排自己标），只登记「要重排」。
     if width_changed {
@@ -339,8 +351,8 @@ pub(crate) fn place_subtree(
             tree.geometry_damage_escalation = true;
         }
         if let Some(target) = tree.arena.get_mut(node) {
+            // damage 的旧一侧在这里精确并入（`prev_layout` 字段因此可以删掉，省 32 B/节点）。
             target.damage = target.damage.union(old.bounds).union(abs);
-            target.prev_layout = old;
             target.layout = LayoutBox {
                 bounds: abs,
                 border: target.local_border,
@@ -349,6 +361,9 @@ pub(crate) fn place_subtree(
             // 旧 lane 也已过期（新位置的像素没人写）。
             target.dirty.remove(DirtyFlags::REUSABLE);
         }
+        // 反向集合：a11y 要重发（`mark_moved_a11y` 的唯一输入）+ 帧尾要结算 damage/REUSABLE。
+        tree.moved_nodes.insert(node);
+        tree.dirty_settle.insert(node);
     } else if fresh {
         // 尺寸/位置没变但 border 宽可能变了（样式改 border）。
         if let Some(target) = tree.arena.get_mut(node) {
@@ -430,8 +445,7 @@ pub(crate) fn subtree_bounds(tree: &NodeTree, node: NodeId) -> Rect {
 pub(crate) fn invalidate_caches_upwards(tree: &mut NodeTree, node: NodeId) {
     let mut cursor = Some(node);
     while let Some(current) = cursor {
-        let index = current.index() as usize;
-        if let Some(cache) = tree.layout_cache.get_mut(index).and_then(Option::as_mut) {
+        if let Some(cache) = tree.layout_cache.get_mut(&current) {
             cache.clear();
         }
         cursor = tree.arena.get(current).and_then(|target| target.parent);
@@ -439,33 +453,25 @@ pub(crate) fn invalidate_caches_upwards(tree: &mut NodeTree, node: NodeId) {
 }
 
 // 消费者：`impl NodeTree::settle_frame` 的薄委托（外部调用点见该方法文档）。
-/// 帧结算（**唯一**的复位点，P06 §9.4 / F-59）：damage 归零、`prev_layout = layout`、
-/// 置 `REUSABLE`、清本帧已消费的 `LAYOUT | PAINT`。
+/// 帧结算（**唯一**的 damage / `REUSABLE` 复位点，P06 §9.4 / F-59）。
 ///
-/// **只在 `Window::commit_frame` 里、paint 已消费 lane 与 damage 之后调用**：drain 阶段的
-/// `touch` 发生在帧前，帧初归零会吞掉已累积的 damage。帧内不得 `mark_*`（`&mut self` 已把
-/// 写操作挡在帧外）。
+/// 只遍历**本帧动过的节点**（`dirty_settle`）：damage 归零、置 `REUSABLE`。
+/// 旧实现遍历整个全序数组（每帧 O(N)），是 R03-1 的 #12。
 ///
-/// `LAYOUT` 只对本轮**真正参与过布局**的节点清除（`laid_out_epoch == layout_epoch`）。
-/// 这一条是 P1-2.2 的修复：虚拟列表在布局**之后**补挂可见行，那些行本帧从未进 taffy；
-/// 无条件清 `LAYOUT` 会让它们的脏位凭空消失，于是永久停在 0×0（帧尾不再重排、下一帧
-/// `needs_frame` 也看不到脏位）。保留脏位让下一帧的 `layout_if_dirty` 把它们排上。
+/// **不**在这里清 `LAYOUT` / `PAINT`（R03-9）：`LAYOUT` 的唯一清除点是 `set_local_layout`，
+/// `PAINT` 的唯一清除点是 paint pass。帧尾无脑清 LAYOUT 会吞掉「布局之后新产生的布局请求」
+/// （`rewindow_virtuals` / `clamp_scroll_offsets`），正是 R03-9 现象 B。
+///
+/// **只在 `Window::commit_frame` 里、paint 已消费 lane 与 damage 之后调用**。
 pub(crate) fn settle_frame(tree: &mut NodeTree) {
-    let epoch = tree.layout_epoch;
-    for id in &tree.order {
+    let ids = tree.take_settle();
+    for id in &ids {
         if let Some(target) = tree.arena.get_mut(*id) {
             target.damage = Rect::default();
-            target.prev_layout = target.layout;
             target.dirty.insert(DirtyFlags::REUSABLE);
-            // 本轮布局过的节点：`LAYOUT` 已由 `set_layout` 消费（那里就 remove 了），
-            // 这里只需清 `PAINT`。没布局过的节点保留 `LAYOUT`，等下一帧重排。
-            target.dirty.remove(DirtyFlags::PAINT);
-            if target.laid_out_epoch != epoch {
-                continue;
-            }
-            target.dirty.remove(DirtyFlags::LAYOUT);
         }
     }
+    tree.recycle(ids);
 }
 
 // 消费者：`impl NodeTree::bubble_layout` 的薄委托（外部调用点见该方法文档）。
@@ -511,16 +517,10 @@ pub(crate) fn hit_test(tree: &NodeTree, point: Point) -> Option<HitResult> {
 // 消费者：`impl NodeTree::set_layout_for_test` 的薄委托（外部调用点见该方法文档）。
 /// 仅测试：直接写布局盒（P04 的 `set_layout` 之前的唯一写点，damage 用例需要）。
 #[cfg(test)]
-pub(crate) fn set_layout_for_test(
-    tree: &mut NodeTree,
-    node: NodeId,
-    layout: LayoutBox,
-    prev_layout: LayoutBox,
-) -> bool {
+pub(crate) fn set_layout_for_test(tree: &mut NodeTree, node: NodeId, layout: LayoutBox) -> bool {
     match tree.arena.get_mut(node) {
         Some(target) => {
             target.layout = layout;
-            target.prev_layout = prev_layout;
             true
         }
         None => false,

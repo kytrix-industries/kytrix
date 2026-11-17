@@ -125,6 +125,6 @@ pub(crate) fn debug_hud_metrics(window: &Window) -> crate::debug_hud::DebugHudMe
 /// 强制全量重绘（oracle 的「全量」路径）：清 `REUSABLE` + 清空所有 lane 的内容。
 #[cfg(feature = "test-support")]
 pub(crate) fn force_full_repaint(window: &mut Window) {
-    window.tree.clear_all_reusable();
+    window.tree.force_repaint_all();
     window.scene.clear_frame();
 }

@@ -31,7 +31,7 @@ pub(crate) fn set_text_content(tree: &mut NodeTree, node: NodeId, content: TextC
     match tree.arena.get_mut(node) {
         Some(target) => match &mut target.kind {
             NodeKind::Text(existing) => {
-                *existing = content;
+                **existing = content;
                 tree.mark_text_dirty(node);
                 true
             }
@@ -92,16 +92,16 @@ pub(crate) fn text_layout_dirty_len(tree: &NodeTree) -> usize {
 /// 与 [`invalidate_text_layout`] 的区别：这里**不动 measure 闭包、不置 `LAYOUT`** —— 断行宽度
 /// 与字形宽度都没变，只需要重新光栅装箱。返回被失效的节点数。
 pub(crate) fn invalidate_text_lines(tree: &mut NodeTree) -> usize {
-    let nodes: SmallVec<[NodeId; 64]> = tree
-        .order
-        .iter()
-        .copied()
-        .filter(|node| {
-            tree.arena
-                .get(*node)
-                .is_some_and(|target| target.kind.text().is_some())
-        })
-        .collect();
+    let mut nodes: Vec<NodeId> = Vec::new();
+    tree.for_each_dfs(|node| {
+        if tree
+            .arena
+            .get(node)
+            .is_some_and(|target| target.kind.text().is_some())
+        {
+            nodes.push(node);
+        }
+    });
     let mut invalidated = 0;
     for node in nodes {
         let index = node.index() as usize;
@@ -379,17 +379,18 @@ pub(crate) fn invalidate_text_layout(tree: &mut NodeTree, node: NodeId) -> bool 
 /// 把所有文本节点标脏（字体栈 / 系统字体 / 图集换代时用）。
 ///
 /// 两个阶段都要重做：`shape`（第一阶段）与 `layout`（第二阶段，重建 `ShapedLine`）。
+/// 这是冷路径（换字体 / 系统字体变化），因此允许一次 DFS 收集；稳态帧不经过这里。
 pub(crate) fn mark_all_text_dirty(tree: &mut NodeTree) {
-    let nodes: Vec<NodeId> = tree
-        .order
-        .iter()
-        .copied()
-        .filter(|node| {
-            tree.arena
-                .get(*node)
-                .is_some_and(|t| t.kind.text().is_some())
-        })
-        .collect();
+    let mut nodes: Vec<NodeId> = Vec::new();
+    tree.for_each_dfs(|node| {
+        if tree
+            .arena
+            .get(node)
+            .is_some_and(|target| target.kind.text().is_some())
+        {
+            nodes.push(node);
+        }
+    });
     for node in nodes {
         tree.mark_text_dirty(node);
         tree.mark_text_layout_dirty(node);
@@ -407,16 +408,16 @@ pub(crate) fn mark_all_text_dirty(tree: &mut NodeTree) {
 /// 只标 `PAINT` 不标 `LAYOUT`：图集换代不改变字形宽度/行数，不需要重排（重排是纯损失）。
 /// 返回被标记的节点数（诊断 / 测试）。
 pub(crate) fn mark_all_text_paint(tree: &mut NodeTree) -> usize {
-    let nodes: SmallVec<[NodeId; 32]> = tree
-        .order
-        .iter()
-        .copied()
-        .filter(|node| {
-            tree.arena
-                .get(*node)
-                .is_some_and(|t| t.kind.text().is_some())
-        })
-        .collect();
+    let mut nodes: Vec<NodeId> = Vec::new();
+    tree.for_each_dfs(|node| {
+        if tree
+            .arena
+            .get(node)
+            .is_some_and(|target| target.kind.text().is_some())
+        {
+            nodes.push(node);
+        }
+    });
     let mut marked = 0;
     for node in nodes {
         if tree.mark_paint(node) {
@@ -469,9 +470,8 @@ pub(crate) fn geometry_transform(tree: &NodeTree, node: NodeId) -> Transform {
 // 消费者：`impl NodeTree::set_geometry_transform` 的薄委托（外部调用点见该方法文档）。
 /// 写入几何节点的 per-draw 变换（单位矩阵 = 删除条目）。
 ///
-/// 标 `PAINT | GEOMETRY`：变换烘在 lane 的 `Primitive::Geometry` 里，因此 lane 必须重建；
-/// `GEOMETRY` 是「只换 uniform、顶点不动」的语义标记（顶点缓冲按 `(index, generation)`
-/// 缓存，不会被这次改动触碰）。damage 由 `touch` 按节点布局盒并入。
+/// 标 `PAINT`：变换烘在 lane 的 `Primitive::Geometry` 里，因此 lane 必须重建（顶点缓冲按
+/// `(index, generation)` 缓存，不会被这次改动触碰）。damage 由 `touch` 按节点布局盒并入。
 ///
 /// **写入口只在测试里可达**：应用层入口（`App::set_geometry_transform`）属 app 层，见报告
 /// R05-12 的遗留项；读路径（`paint/pass.rs` 的 getter + 编码器 + damage）是生产代码。
@@ -491,7 +491,6 @@ pub(crate) fn set_geometry_transform(
         tree.geometry_transforms.insert(node, transform);
     }
     tree.mark_paint(node);
-    tree.touch(node, DirtyFlags::GEOMETRY);
     Ok(())
 }
 
@@ -508,29 +507,15 @@ pub(crate) fn content_offset(tree: &NodeTree, node: NodeId) -> Point {
 
 /// 节点的绘制桶句柄（`P06` 每节点最多一条；消费者：`paint/pass.rs`）。
 pub(crate) fn lane_of(tree: &NodeTree, node: NodeId) -> Option<LaneId> {
-    tree.arena
-        .get(node)
-        .and_then(|target| target.lanes.first().copied())
+    tree.arena.get(node).and_then(|target| target.lane)
 }
 
 // 消费者：`impl NodeTree::set_lane` 的薄委托（外部调用点见该方法文档）。
-/// 记录节点的绘制桶（首个 lane；消费者：`paint/pass.rs`）。
+/// 记录节点的绘制桶（一节点一 lane；消费者：`paint/pass.rs`）。
 pub(crate) fn set_lane(tree: &mut NodeTree, node: NodeId, lane: LaneId) {
     if let Some(target) = tree.arena.get_mut(node) {
-        if target.lanes.is_empty() {
-            target.lanes.push(lane);
-        } else {
-            target.lanes[0] = lane;
-        }
+        target.lane = Some(lane);
     }
-}
-
-// 消费者：`impl NodeTree::lane_offset` 的薄委托（外部调用点见该方法文档）。
-/// 该节点 lane 上次生成时的累计滚动偏移（paint 的复用判据）。
-pub(crate) fn lane_offset(tree: &NodeTree, node: NodeId) -> Point {
-    tree.arena
-        .get(node)
-        .map_or(Point::ZERO, |target| target.lane_offset)
 }
 
 // 消费者：`impl NodeTree::set_lane_offset` 的薄委托（外部调用点见该方法文档）。
@@ -539,6 +524,44 @@ pub(crate) fn set_lane_offset(tree: &mut NodeTree, node: NodeId, offset: Point) 
     if let Some(target) = tree.arena.get_mut(node) {
         target.lane_offset = offset;
     }
+}
+
+// 消费者：`impl NodeTree::paint_state` 的薄委托（外部调用点见该方法文档）。
+/// 一次 arena 查找算出 paint 遍历需要的全部只读状态（见 [`super::PaintNodeState`]）。
+///
+/// `offset` 是**祖先滚动偏移的累计值**；`clip_key` 是本帧当前的祖先 clip 上下文。
+pub(crate) fn paint_state(
+    tree: &NodeTree,
+    node: NodeId,
+    offset: Point,
+    clip_key: (u8, Option<PhysicalRect>),
+) -> Option<super::PaintNodeState> {
+    let target = tree.arena.get(node)?;
+    let hidden = matches!(target.style.inner.display, taffy::style::Display::None)
+        || target.style_patch().visible == Some(false);
+    let reusable = target.dirty.contains(DirtyFlags::REUSABLE)
+        && tree.clip_key(node) == Some(clip_key)
+        && target.lane_offset == offset;
+    let clip_bounds = (target.style.clip == crate::paint::style::Clip::Bounds).then(|| {
+        target
+            .layout
+            .bounds
+            .translate(Point::new(-offset.x, -offset.y))
+            .inset(target.layout.border)
+    });
+    let scroll_offset = target
+        .interaction
+        .as_deref()
+        .and_then(|slot| slot.scroll)
+        .map_or(Point::ZERO, |slot| slot.offset);
+    Some(super::PaintNodeState {
+        hidden,
+        reusable,
+        lane: target.lane,
+        children: target.children.len(),
+        clip_bounds,
+        scroll_offset,
+    })
 }
 
 // 消费者：`impl NodeTree::clip_key` 的薄委托（外部调用点见该方法文档）。
@@ -574,12 +597,19 @@ pub(crate) fn set_reusable(tree: &mut NodeTree, node: NodeId) {
     }
 }
 
-// 消费者：`impl NodeTree::clear_all_reusable` 的薄委托（外部调用点见该方法文档）。
-/// 全树清 `REUSABLE`（消费者：`Window::force_full_repaint` 的 oracle 全量路径）。
+// 消费者：`impl NodeTree::force_repaint_all` 的薄委托（外部调用点见该方法文档）。
+/// 全树强制重绘（消费者：`Window::force_full_repaint` 的 oracle 全量路径 / 测试基建）。
+///
+/// 清 `REUSABLE` 并把**每个节点**登记进 `dirty_paint`：paint pass 的复用判据因此全部失配，
+/// 逐节点重建（`clear_paint` 会把它们移出集合）。只清位不入集合会让
+/// `needs_node_repaint`（O(1) 门禁）看不到工作 ⇒ 帧被判空闲（旧实现靠全树扫描才发现）。
 #[cfg(feature = "test-support")]
-pub(crate) fn clear_all_reusable(tree: &mut NodeTree) {
-    for id in &tree.order {
-        if let Some(target) = tree.arena.get_mut(*id) {
+pub(crate) fn force_repaint_all(tree: &mut NodeTree) {
+    let mut ids: Vec<NodeId> = Vec::new();
+    tree.for_each_dfs(|id| ids.push(id));
+    for id in ids {
+        let _ = tree.mark_paint(id);
+        if let Some(target) = tree.arena.get_mut(id) {
             target.dirty.remove(DirtyFlags::REUSABLE);
         }
     }
@@ -589,7 +619,7 @@ pub(crate) fn clear_all_reusable(tree: &mut NodeTree) {
 /// 丢弃节点的 lane 句柄（不放回 `Scene`；重建路径在"无图元"时先 `Scene::release_lane` 再调它）。
 pub(crate) fn clear_lane(tree: &mut NodeTree, node: NodeId) {
     if let Some(target) = tree.arena.get_mut(node) {
-        target.lanes.clear();
+        target.lane = None;
     }
 }
 
@@ -696,34 +726,36 @@ pub(crate) fn put_bind_style(
     }
 }
 
-// 消费者：`impl NodeTree::deps` 的薄委托（外部调用点见该方法文档）。
-/// 上次求值的依赖（`replace_deps` 的 `old`；关窗退订）。
-pub(crate) fn deps(tree: &NodeTree, node: NodeId) -> Option<&[SignalId]> {
-    tree.arena.get(node).map(|target| target.deps.as_slice())
-}
-
 // 消费者：`impl NodeTree::set_deps` 的薄委托（外部调用点见该方法文档）。
 /// 写回本次求值的依赖。
+///
+/// **复用容量**（R03-15）：旧实现整体赋值 `target.deps = deps`，每个「依赖数 > 内联容量」的
+/// 节点每帧都会 free + alloc 一次；这里 `clear` + `extend_from_slice`，第二轮起零分配。
 pub(crate) fn set_deps(tree: &mut NodeTree, node: NodeId, deps: SmallVec<[SignalId; 8]>) -> bool {
     match tree.arena.get_mut(node) {
-        Some(target) => {
-            target.deps = deps;
-            true
-        }
-        None => false,
+        Some(target) => match &mut target.deps {
+            Some(existing) => {
+                existing.clear();
+                existing.extend_from_slice(&deps);
+            }
+            None => target.deps = Some(Box::new(deps)),
+        },
+        None => return false,
     }
+    true
 }
 
 // 消费者：`impl NodeTree::set_style_patch` 的薄委托（外部调用点见该方法文档）。
-/// 写回动态属性补丁。
+/// 写回动态属性补丁（`None` 语义 = 空补丁，见 `EMPTY_STYLE_PATCH`）。
 pub(crate) fn set_style_patch(tree: &mut NodeTree, node: NodeId, patch: StylePatch) -> bool {
     match tree.arena.get_mut(node) {
-        Some(target) => {
-            target.style_patch = patch;
-            true
-        }
-        None => false,
+        Some(target) => match &mut target.style_patch {
+            Some(existing) => **existing = patch,
+            None => target.style_patch = Some(Box::new(patch)),
+        },
+        None => return false,
     }
+    true
 }
 
 // 消费者：`impl NodeTree::has_visual_bind` 的薄委托（外部调用点见该方法文档）。
@@ -765,7 +797,7 @@ pub(crate) fn ensure_interaction(
 pub(crate) fn is_hittable(tree: &NodeTree, node: NodeId) -> bool {
     tree.arena
         .get(node)
-        .is_some_and(|target| target.style_patch.interactive != Some(false))
+        .is_some_and(|target| target.style_patch().interactive != Some(false))
 }
 
 // 消费者：`impl NodeTree::focus_ring` 的薄委托（外部调用点见该方法文档）。
@@ -779,7 +811,7 @@ pub(crate) fn focus_ring(tree: &NodeTree, node: NodeId) -> Option<crate::paint::
 pub(crate) fn is_explicitly_interactive(tree: &NodeTree, node: NodeId) -> bool {
     tree.arena
         .get(node)
-        .is_some_and(|target| target.style_patch.interactive == Some(true))
+        .is_some_and(|target| target.style_patch().interactive == Some(true))
 }
 
 // 消费者：`impl NodeTree::scroll_slot` 的薄委托（外部调用点见该方法文档）。
@@ -821,7 +853,7 @@ pub(crate) fn virtual_slot_mut(tree: &mut NodeTree, node: NodeId) -> Option<&mut
 pub(crate) fn set_style_for_test(tree: &mut NodeTree, node: NodeId, style: Style) -> bool {
     match tree.arena.get_mut(node) {
         Some(target) => {
-            target.style = style;
+            *target.style = style;
             true
         }
         None => false,

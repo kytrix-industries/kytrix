@@ -187,11 +187,7 @@ mod tests {
         let node = clipped_box(&mut tree, root);
         let bounds = crate::math::Rect::new(10.0, 20.0, 100.0, 80.0);
         let border = crate::math::Edges::uniform(2.0);
-        tree.set_layout_for_test(
-            node,
-            crate::node::tree::LayoutBox { bounds, border },
-            crate::node::tree::LayoutBox::default(),
-        );
+        tree.set_layout_for_test(node, crate::node::tree::LayoutBox { bounds, border });
 
         assert_eq!(
             viewport(&tree, node),

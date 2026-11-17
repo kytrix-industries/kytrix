@@ -383,7 +383,7 @@ impl A11yNode {
 pub struct A11yTreeSnapshot {
     /// 本次是否发出全树。
     pub full: bool,
-    /// 本次发出的节点（`NodeTree::order()` 序）。
+    /// 本次发出的节点（祖先先于后代；全树笔是 DFS 先序）。
     pub nodes: Vec<A11yNode>,
     /// 焦点身份（恒存在，见设计 §6.3）。
     pub focus: A11yNodeId,

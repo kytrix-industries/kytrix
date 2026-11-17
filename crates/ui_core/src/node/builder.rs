@@ -172,7 +172,7 @@ impl NodeBuilder {
     #[must_use]
     pub fn text(text: impl Into<SmolStr>, style: TextStyle) -> Self {
         Self {
-            kind: NodeKind::Text(TextContent::new(text, style)),
+            kind: NodeKind::Text(Box::new(TextContent::new(text, style))),
             ..Self::boxed()
         }
     }
@@ -259,7 +259,7 @@ impl NodeBuilder {
 
     /// 稳定调试 id（P06）：`Probe::by_selector(Selector::Id(..))` 与诊断日志的锚点。
     ///
-    /// 同一棵树内**允许重复**（多个命中取 `order()` 的第一个）；引擎不做唯一性检查。
+    /// 同一棵树内**允许重复**（多个命中取 DFS 先序的第一个）；引擎不做唯一性检查。
     #[must_use]
     pub fn id(self, id: impl Into<SmolStr>) -> Self {
         Self {
@@ -395,7 +395,7 @@ mod tests {
             .build(&mut tree, root)
             .expect("挂载成功");
         tree.remove(doomed).expect("卸载成功");
-        let before = tree.order().len();
+        let before = tree.len();
 
         let error = NodeBuilder::boxed()
             .build(&mut tree, doomed)
@@ -405,7 +405,7 @@ mod tests {
             error,
             EngineError::StaleNode { node } if node == doomed
         ));
-        assert_eq!(tree.order().len(), before, "失败不得留下孤儿节点");
+        assert_eq!(tree.len(), before, "失败不得留下孤儿节点");
     }
 
     #[test]

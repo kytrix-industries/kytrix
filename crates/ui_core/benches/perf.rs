@@ -448,6 +448,81 @@ fn bench_frame_full_10k(c: &mut Criterion) {
     });
 }
 
+/// 滚动 1 px：10k 行挂在一个滚动容器里，每帧只改 1 px 偏移。
+///
+/// 这是 `scroll_1px_10k`（架构决策 §7 的「滚动不该重建任何 lane」）的基线：B5 完成前
+/// 每次滚动都会让全部行的 lane 因 `lane_offset` 变化而重建。
+fn bench_scroll_1px(c: &mut Criterion) {
+    use ui_core::{
+        interaction::{ScrollConfig, ScrollHandle},
+        paint::style::{Clip, Style},
+    };
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("bench runtime");
+    let handle = runtime.handle().clone();
+    const ROWS: usize = 10_000;
+    const ROW_HEIGHT: f32 = 20.0;
+    let mut toggle = 0usize;
+    c.bench_function("scroll_1px_10k", |b| {
+        b.iter_batched(
+            || {
+                let mut fixture = new_app(&handle);
+                let Fixture { app, window } = &mut fixture;
+                let root = app.window(*window).expect("window").tree().root();
+                let mut inner = taffy::Style::<SmolStr>::DEFAULT;
+                inner.size = taffy::geometry::Size {
+                    width: taffy::style::Dimension::length(VIEWPORT.width),
+                    height: taffy::style::Dimension::length(VIEWPORT.height),
+                };
+                let viewport = NodeBuilder::boxed()
+                    .style(Style {
+                        inner,
+                        clip: Clip::Bounds,
+                    })
+                    .build(app.window_mut(*window).expect("window").tree_mut(), root)
+                    .expect("scroll viewport");
+                for index in 0..ROWS {
+                    NodeBuilder::boxed()
+                        .layout_override(Rect::new(
+                            0.0,
+                            index as f32 * ROW_HEIGHT,
+                            VIEWPORT.width,
+                            ROW_HEIGHT - 2.0,
+                        ))
+                        .build(
+                            app.window_mut(*window).expect("window").tree_mut(),
+                            viewport,
+                        )
+                        .expect("scroll row");
+                }
+                let scroll: ScrollHandle = app
+                    .make_scroll(*window, viewport, ScrollConfig::default())
+                    .expect("scroll container");
+                app.set_scroll_content(
+                    &scroll,
+                    Size::new(VIEWPORT.width, ROWS as f32 * ROW_HEIGHT),
+                )
+                .expect("scroll content");
+                let _ = app.frame(*window);
+                (fixture, scroll)
+            },
+            |(mut fixture, scroll)| {
+                toggle += 1;
+                let y = if toggle.is_multiple_of(2) { 1.0 } else { 0.0 };
+                fixture
+                    .app
+                    .scroll_to(&scroll, ui_core::math::Point::new(0.0, y))
+                    .expect("scroll 1px");
+                black_box(fixture.app.frame(fixture.window))
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 /// 文本全量更新：320 个文本节点每帧全部变化（塑形 + 文本重排 + 绘制）。
 fn bench_text_update_320(c: &mut Criterion) {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -619,6 +694,7 @@ criterion_group! {
         bench_tree_build_scale,
         bench_frame_incremental_scale,
         bench_frame_full_10k,
+        bench_scroll_1px,
         bench_text_update_320,
         bench_text_pass_320,
         bench_digit_fast_path_320

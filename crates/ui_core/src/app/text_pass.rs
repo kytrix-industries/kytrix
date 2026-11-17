@@ -597,11 +597,15 @@ pub(crate) fn invalidate_all_text(app: &mut App) {
             continue;
         };
         let tree = window.tree_mut();
-        let order: SmallVec<[crate::node::id::NodeId; 8]> = tree.order().iter().copied().collect();
-        for node in order {
+        // 冷路径（换字体栈 / 系统字体变化）：一次 DFS 收集文本节点，不保留全序数组。
+        let mut nodes: Vec<crate::node::id::NodeId> = Vec::new();
+        tree.for_each_dfs(|node| {
             if tree.text_content(node).is_some() {
-                tree.invalidate_text_layout(node);
+                nodes.push(node);
             }
+        });
+        for node in nodes {
+            tree.invalidate_text_layout(node);
         }
         // P1-2.3：字体栈 / 系统字体变化后，脏集合必须包含**全部**文本节点 ——
         // `refresh_text` 现在只遍历脏集合，漏标就等于永久不重排。

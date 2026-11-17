@@ -18,7 +18,7 @@
 //! | 事件时间戳 | [`InputEvent`] 各变体的 `timestamp` | Win32 `MSG.time`、AppKit `NSEvent.timestamp`、Wayland `input_event.time`、Chrome `WebInputEvent::TimeTicks` |
 //! | 点击归属按键 | [`ActionSource::Click`] 的 `button` | Win32 `WM_LBUTTONUP` / AppKit `mouseUp:`、Blink `click` vs `auxclick`、Qt `clicked()` 仅左键 |
 //! | 滚动阶段 / 单位 | [`ScrollPhase`] / [`ScrollUnit`] | Chrome `WebMouseWheelEvent.phase`、AppKit `NSEvent.phase`/`momentumPhase`、Qt `QWheelEvent::phase()`、Wayland `axis_value120` |
-//! | 输入法提交去重 | [`ImeCommitToken`] | Blink `TextInputClient::InsertText` 的 `native_key_code` 关联、Qt `QInputMethodEvent` |
+//! | 字符文本生成判据 | `should_emit_text`（crate 私有） | Win32 `WM_CHAR`、AppKit `characters`、winit 的 xkb 回退通路 |
 
 use std::{ops::Range, time::Instant};
 
@@ -344,12 +344,62 @@ pub enum KeyCode {
     /// Scroll Lock（W3C `ScrollLock`）。
     ScrollLock,
 
+    // ── 媒体 / 浏览器 / 系统键（W3C `KeyboardEvent.code` 的专有键）──
+    //
+    // 平台可达性：Windows 全部由 `E0` 扩展扫描码给出（见 `platform::event` 的扩展行表）；
+    // Linux 由 evdev 的 `KEY_VOLUME*` / `KEY_PLAYPAUSE` / `KEY_BROWSER_*` 等给出。
+    // **macOS 不可达**：AppKit 把媒体键作为 `NSSystemDefined` 事件交给系统处理，不产生
+    // `keyDown:` / `NSEvent.keyCode`（引擎不接管系统媒体控制，这是有意的）。
+    /// 音量加（W3C `AudioVolumeUp`；Win32 `VK_VOLUME_UP`、Linux `KEY_VOLUMEUP`）。
+    AudioVolumeUp,
+    /// 音量减（W3C `AudioVolumeDown`）。
+    AudioVolumeDown,
+    /// 静音（W3C `AudioVolumeMute`）。
+    AudioVolumeMute,
+    /// 播放/暂停（W3C `MediaPlayPause`）。
+    MediaPlayPause,
+    /// 停止播放（W3C `MediaStop`）。
+    MediaStop,
+    /// 下一曲（W3C `MediaTrackNext`）。
+    MediaTrackNext,
+    /// 上一曲（W3C `MediaTrackPrevious`）。
+    MediaTrackPrevious,
+    /// 媒体选择（W3C `MediaSelect`）。
+    MediaSelect,
+    /// 邮件（W3C `LaunchMail`）。
+    LaunchMail,
+    /// 应用键 1（W3C `LaunchApp1`）。
+    LaunchApp1,
+    /// 应用键 2（W3C `LaunchApp2`）。
+    LaunchApp2,
+    /// 浏览器后退（W3C `BrowserBack`）。
+    BrowserBack,
+    /// 浏览器前进（W3C `BrowserForward`）。
+    BrowserForward,
+    /// 浏览器主页（W3C `BrowserHome`）。
+    BrowserHome,
+    /// 浏览器刷新（W3C `BrowserRefresh`）。
+    BrowserRefresh,
+    /// 浏览器停止（W3C `BrowserStop`）。
+    BrowserStop,
+    /// 浏览器搜索（W3C `BrowserSearch`）。
+    BrowserSearch,
+    /// 浏览器收藏夹（W3C `BrowserFavorites`）。
+    BrowserFavorites,
+    /// 电源（W3C `Power`）。
+    Power,
+    /// 睡眠（W3C `Sleep`）。
+    Sleep,
+    /// 唤醒（W3C `WakeUp`）。
+    WakeUp,
+
     // ── 未识别 ──
     /// 平台给了本枚举没有覆盖的键；载荷是**平台私有码**，**不可跨平台**。
     ///
-    /// 编码：Windows 是扫描码（bit 8 置位表示 `E0` 扩展键）；macOS 是 `NSEvent.keyCode`；
-    /// Linux 是 evdev 码。`Unidentified(83)` 在 Windows 是字母 `S` 的扫描码，在 macOS 是别的
-    /// 键 —— 应用**不得**把它写进跨平台绑定表（引擎自己的默认绑定只用命名变体）。
+    /// 编码：Windows 是扫描码（bit 8 置位表示 `E0` 扩展键；**没有**扫描码时是
+    /// `0x8000 | VK`）；macOS 是 `NSEvent.keyCode`；Linux 是 evdev 码。
+    /// `Unidentified(31)` 在 Windows 是字母 `S` 的扫描码（`0x1F` = 31），在 macOS 是别的键
+    /// —— 应用**不得**把它写进跨平台绑定表（引擎自己的默认绑定只用命名变体）。
     Unidentified(u16),
 }
 
@@ -472,6 +522,34 @@ impl Key {
     }
 }
 
+/// 修饰键位图变化 → 需要合成的 `Key` 事件 `(物理键身份, 按下/抬起)`。
+///
+/// AppKit **不**为修饰键投递 `keyDown:` / `keyUp:`（只有 `flagsChanged:`），而 Win32 与
+/// Wayland 都把 Shift/Ctrl/Alt/Meta 当普通按键投递。macOS 平台层据此把修饰键补成同样的
+/// 序列，否则 `App::held_keys` / `App::key_down` 在 macOS 上永远不含修饰键 —— 三平台语义
+/// 分叉（Win/Linux 为 true、macOS 恒 false）。
+///
+/// 位图不区分左右（[`Modifiers`] 只有四个位）⇒ 统一返回**左**变体；需要区分左右时用平台
+/// 原生码（[`KeyCode`]）。
+pub fn modifier_key_transitions(
+    previous: Modifiers,
+    current: Modifiers,
+) -> impl Iterator<Item = (KeyCode, KeyState)> {
+    // 顺序固定（Shift、Control、Alt、Meta）：同一次 `flagsChanged:` 可能同时改变多个位，
+    // 事件顺序必须稳定，应用的 `key_down` 观察才可预期。
+    const MODIFIER_KEYS: [(Modifiers, KeyCode); 4] = [
+        (Modifiers::SHIFT, KeyCode::ShiftLeft),
+        (Modifiers::CONTROL, KeyCode::ControlLeft),
+        (Modifiers::ALT, KeyCode::AltLeft),
+        (Modifiers::META, KeyCode::MetaLeft),
+    ];
+    MODIFIER_KEYS.into_iter().filter_map(move |(flag, code)| {
+        let was = previous.contains(flag);
+        let now = current.contains(flag);
+        (was != now).then_some((code, if now { KeyState::Down } else { KeyState::Up }))
+    })
+}
+
 /// 按键状态。
 ///
 /// 自动重复**不是**第三种状态：它是「按下」的一种属性，由 [`InputEvent::Key`] 的 `repeat`
@@ -526,8 +604,9 @@ impl ScrollPhase {
 
 /// 一次输入事件。
 ///
-/// 每个变体都带 `timestamp`：**平台的真实事件时刻**（[`timestamp_from_ticks`] 把 Win32
-/// `MSG.time` / AppKit `NSEvent.timestamp` / Wayland `input_event.time` 换算成单调时钟）。
+/// 每个变体都带 `timestamp`：**平台的真实事件时刻**（Win32 的 `MSG.time` 经
+/// [`timestamp_from_ticks_32`]、AppKit 的 `NSEvent.timestamp` 经 [`timestamp_from_ticks`]、
+/// Wayland 的 `input_event.time` 换算成单调时钟）。
 /// 双击判定、连击计数、拖拽起点都用它，而不是「分发时刻」——UI 线程卡顿时两者能差几十毫秒。
 #[derive(Clone, Debug, PartialEq)]
 pub enum InputEvent {
@@ -601,16 +680,17 @@ pub enum InputEvent {
         /// 单位由 [`Self::Scroll`] 的 `unit` 决定：`Line` 时 `1.0` = 一格（再乘容器的
         /// `line_height`），`Pixel` 时就是逻辑像素。二维 delta 是**必须**可达的：
         /// K 线图 / 深度图的双指平移要同时消费两轴。
+        ///
+        /// **容器是单轴的**（[`crate::interaction::ScrollAxis`]）：引擎按轴拆分二维 delta 并
+        /// 沿滚动链逐层消费 —— 内层容器只吃自己声明的轴，另一轴原样传给外层（浏览器的
+        /// scroll chaining）。需要同时平移两轴的区域由**两层容器**表达（内层
+        /// `Horizontal` + 外层 `Vertical`，每轴各由一个容器消费）；单容器同时吃两轴不在
+        /// 本引擎的契约内（R02-11 的取舍，见 `design/phase-10-interaction.md` §7）。
         delta: Point,
         /// 单位。
         unit: ScrollUnit,
         /// 阶段。
         phase: ScrollPhase,
-        /// 一格滚轮对应多少行（`> 0`；`0.0` = 平台没给，调用方按容器默认）。
-        ///
-        /// 来源：Win32 `SPI_GETWHEELSCROLLLINES`、macOS 非精确设备的行高换算、
-        /// Wayland `axis_value120` 的 1/120 离散步长。
-        lines_per_tick: f32,
         /// 当前修饰键（`Shift + 滚轮` 的横向滚动走它）。
         modifiers: Modifiers,
         /// 事件时刻。
@@ -637,7 +717,7 @@ pub enum InputEvent {
     /// 字符输入（`WM_CHAR`、AppKit `characters`、xkb `key_get_utf8`；死键组合已由平台完成）。
     ///
     /// **不含** IME 提交文本：已确认的输入法文本走 [`ImeEvent::Commit`]（两者由平台层保证
-    /// 互斥，见 [`ImeCommitToken`]）。
+    /// 互斥：IME 启用时 `Text` 通路静默）。自动重复**不**抑制本事件。
     Text {
         /// 一个或多个 `char`（代理对已合并）。
         text: SmolStr,
@@ -751,7 +831,6 @@ impl InputEvent {
                 delta,
                 unit,
                 phase,
-                lines_per_tick,
                 modifiers,
                 ..
             } => Self::Scroll {
@@ -759,7 +838,6 @@ impl InputEvent {
                 delta,
                 unit,
                 phase,
-                lines_per_tick,
                 modifiers,
                 timestamp: at,
             },
@@ -826,7 +904,6 @@ impl InputEvent {
             delta,
             unit: ScrollUnit::Line,
             phase: ScrollPhase::Discrete,
-            lines_per_tick: 1.0,
             modifiers,
             timestamp: Instant::now(),
         }
@@ -857,7 +934,36 @@ impl InputEvent {
     }
 }
 
+/// 按键是否产生**字符文本**（[`InputEvent::Text`]）。
+///
+/// 这是三条文本通路共用的**唯一判据**（Win32 `WM_CHAR`、AppKit `characters`、Wayland xkb
+/// 回退），因此把它做成公开纯函数，让「重复不得抑制文本」这条契约有可执行的定义与回归测试。
+///
+/// 判据只有三条：
+/// - 必须是**按下**（抬起不产生文本）；
+/// - 文本通路没有被 IME 接管（IME 启用时文本只走 [`ImeEvent::Commit`]，否则一次按键会得到
+///   两份文本）；
+/// - 不在 IME 组合期（组合串由 `ImeEvent::Preedit` 表达，组合期的物理按键不产生正文）。
+///
+/// `repeat` **有意不参与判定**：自动重复只影响绑定/动作派发（`app::input::on_key` 忽略重复），
+/// 不抑制字符生成。Wayland 的字符文本**正是**随客户端合成的重复产生的（服务端从不重发
+/// `key` 事件），Win32 的 `WM_CHAR` 与 AppKit 的 `characters` 同样不受 `isARepeat` 过滤。
+/// 保留这个形参是契约的一部分：一旦有人重新拿 `repeat` 过滤文本，
+/// `should_emit_text_ignores_auto_repeat` 就会失败。
+#[must_use]
+pub fn should_emit_text(
+    state: KeyState,
+    _repeat: bool,
+    ime_takes_text: bool,
+    composing: bool,
+) -> bool {
+    matches!(state, KeyState::Down) && !ime_takes_text && !composing
+}
+
 /// 平台毫秒时钟 → [`Instant`]（R02-14：事件时间戳）。
+///
+/// 用于**不回绕**的 64 位 tick 域（AppKit `NSEvent.timestamp` / `NSProcessInfo.systemUptime`
+/// 的毫秒）。Win32 的 `MSG.time` 是 32 位回绕域，必须用 [`timestamp_from_ticks_32`]。
 ///
 /// 三个平台的原生事件时间戳都是「单调毫秒 tick」，但原点不同（Win32 `MSG.time` 与
 /// `GetTickCount64` 同源、AppKit `NSEvent.timestamp` 是系统启动起的秒、Wayland
@@ -868,8 +974,8 @@ impl InputEvent {
 /// event_instant ≈ now - (now_ticks - event_ticks)
 /// ```
 ///
-/// 差值为负（事件比「现在」还新，例如时钟源不同步）时饱和到 `now`；平台 tick 回绕或事件
-/// 时间过旧时同理钳到 `now` 之前能表示的最远点 —— 绝不 panic，最坏退化成分发时刻。
+/// 差值为负（事件比「现在」还新，例如时钟源不同步）时饱和到 `now`；事件时间过旧时同理钳到
+/// `now` 之前能表示的最远点 —— 绝不 panic，最坏退化成分发时刻。
 #[must_use]
 pub fn timestamp_from_ticks(now: Instant, now_ticks_ms: u64, event_ticks_ms: u64) -> Instant {
     let behind = now_ticks_ms.saturating_sub(event_ticks_ms);
@@ -877,111 +983,33 @@ pub fn timestamp_from_ticks(now: Instant, now_ticks_ms: u64, event_ticks_ms: u64
         .unwrap_or(now)
 }
 
-/// 输入法提交的**事件级令牌**（R02-13 的共享部分；平台实现在后续 WP 落地）。
+/// 平台毫秒 tick（**32 位回绕域**）→ [`Instant`]（R02-14：Win32 `MSG.time` / `GetTickCount`）。
 ///
-/// 问题：平台在 IME 提交之后还会补发同内容的原生字符消息（Windows `WM_CHAR`、macOS
-/// `characters`），引擎必须跳过它们，否则同一段文本被插入两次。旧实现的判据是「计数」
-/// （Windows 按 Unicode 码点数、macOS 用一个 bool），既不可靠（码点 vs UTF-16 码元，emoji
-/// 一并提交时错配）也无法表达「这条原生消息属于哪一次提交」。
+/// Win32 的事件时间戳是 `MSG.time`：与 `GetTickCount` 同源的 32 位毫秒，**49.7 天回绕一次**。
+/// 因此「现在」也必须取同一来源、同一宽度的 tick（`GetTickCount64() as u32`），差值用
+/// `wrapping_sub` 计算：回绕两侧（事件在回绕前、现在在回绕后）仍然得到正确的短差值，
+/// 而不是把 49.7 天的量当成「很久以前」。
 ///
-/// 语义：平台层每次 IME 提交生成一个新令牌，随后的原生字符消息携带**同一令牌**；引擎只对
-/// 「令牌匹配且内容能被该次提交的 UTF-16 前缀解释」的消息去重。令牌与平台类型无关，平台层
-/// 只需在提交时取号、在字符消息里带上它。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ImeCommitToken(u64);
-
-impl ImeCommitToken {
-    /// 生成下一个令牌（单调递增；`0` 保留为「没有令牌」）。
-    #[must_use]
-    pub fn next(self) -> Self {
-        Self(self.0.wrapping_add(1).max(1))
+/// 混用两套时钟原点（旧实现的 QPC 毫秒 + `MSG.time`）会**系统性地**平移所有时间戳，且回绕后
+/// 静默退化；这条约束由 [`timestamp_from_ticks_32`] 的签名与单测钉住。
+///
+/// 差值大于 [`MAX_PLAUSIBLE_BEHIND_MS`]（事件比现在早 1 h 以上，说明时钟源不一致或事件陈旧）
+/// 时退化为「现在」：宁可把陈旧事件当成刚发生，也不返回一个 49 天前的时间戳。
+#[must_use]
+pub fn timestamp_from_ticks_32(now: Instant, now_ticks_ms: u32, event_ticks_ms: u32) -> Instant {
+    let behind = now_ticks_ms.wrapping_sub(event_ticks_ms);
+    if behind > MAX_PLAUSIBLE_BEHIND_MS {
+        return now;
     }
-
-    /// 起始令牌。
-    #[must_use]
-    pub const fn first() -> Self {
-        Self(1)
-    }
-
-    /// 原始值（平台层可以把令牌塞进消息参数做关联）。
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-
-    /// 测试用构造（令牌值直接给定）。
-    #[cfg(test)]
-    pub(crate) const fn from_test(value: u64) -> Self {
-        Self(value)
-    }
+    now.checked_sub(std::time::Duration::from_millis(u64::from(behind)))
+        .unwrap_or(now)
 }
 
-/// 提交去重状态机：**事件级令牌 + UTF-16 前缀匹配**（R02-13 的共享部分）。
+/// [`timestamp_from_ticks_32`] 认为「可信」的最大落后量（1 小时）。
 ///
-/// 问题：平台在 IME 提交之后还会补发同内容的原生字符消息（Windows `WM_CHAR`、macOS
-/// `characters`），引擎必须跳过它们，否则同一段文本被插入两次。旧实现的判据是「同一按键内的
-/// 相同文本」（内容去重）—— 既会误吞用户真的又敲了一次的内容，也无法把原生消息与产生它的那次
-/// 提交对应起来。
-///
-/// 这里的语义：一次提交 = 一个 [`ImeCommitToken`] + 一段待抑制的 **UTF-16 码元序列**
-/// （`WM_CHAR` 与 AppKit 的 `characters` 都以 UTF-16 码元为单位投递，emoji 是两个码元）。
-/// 随后的原生字符消息只要**携带同一令牌**且码元能按顺序拼出该序列，就被判定为重复并抑制；
-/// 令牌不符、或码元对不上（说明这条消息属于另一次输入）时立刻停止抑制 —— 绝不靠数字计数去猜。
-///
-/// 平台接线（Windows 的 `WM_CHAR` 抑制、macOS 的 `suppress_text`、Linux xkb 回退通路）是后续
-/// WP 的工作；在此之前应用实现自绘文本框时可以直接用它把 [`ImeEvent::Commit`] 与
-/// [`InputEvent::Text`] 去重。
-#[derive(Debug, Default)]
-pub struct ImeCommitDedup {
-    /// 当前待抑制的提交令牌。
-    token: Option<ImeCommitToken>,
-    /// 该次提交的 UTF-16 码元序列。
-    pending: Vec<u16>,
-    /// 已抑制的码元数。
-    consumed: usize,
-}
-
-impl ImeCommitDedup {
-    /// 记录一次 IME 提交：令牌 + 需要抑制的文本。
-    pub fn begin(&mut self, token: ImeCommitToken, text: &str) {
-        self.pending.clear();
-        self.pending.extend(text.encode_utf16());
-        self.consumed = 0;
-        self.token = (!self.pending.is_empty()).then_some(token);
-    }
-
-    /// 当前待抑制的令牌（`None` = 没有待抑制的提交）。
-    #[must_use]
-    pub fn token(&self) -> Option<ImeCommitToken> {
-        self.token
-    }
-
-    /// 这条原生字符消息（一个 UTF-16 码元 + 它携带的令牌）是否应当被**抑制**（= 已被 IME
-    /// 提交覆盖）。
-    ///
-    /// 序列耗尽或码元不匹配时都会清掉令牌：之后的消息不再被吞。
-    pub fn should_suppress(&mut self, token: Option<ImeCommitToken>, unit: u16) -> bool {
-        let Some(expected) = self.token else {
-            return false;
-        };
-        if token != Some(expected) || self.pending.get(self.consumed) != Some(&unit) {
-            self.end();
-            return false;
-        }
-        self.consumed += 1;
-        if self.consumed >= self.pending.len() {
-            self.end();
-        }
-        true
-    }
-
-    /// 作废当前令牌（下一次按键 / 组合开始 / 超时）。
-    pub fn end(&mut self) {
-        self.token = None;
-        self.pending.clear();
-        self.consumed = 0;
-    }
-}
+/// UI 线程卡顿 / 事件排队最多是秒级；超过 1 h 只可能来自时钟源不一致（原点不同）或
+/// 32 位 tick 回绕后差值算错 —— 两种情况都必须退化而不是产出错误时间。
+pub const MAX_PLAUSIBLE_BEHIND_MS: u32 = 60 * 60 * 1_000;
 
 /// 输入法事件（P09 只到「组合串可见 + 提交」这一层，交互处理归文本 Phase）。
 ///
@@ -1166,9 +1194,9 @@ mod tests {
     };
 
     use super::{
-        Action, ActionSource, ImeCommitDedup, ImeCommitToken, InputEvent, InputOutcome, Key,
-        KeyBinding, KeyCode, KeyState, Modifiers, PointerButton, ScrollPhase, ScrollUnit,
-        timestamp_from_ticks,
+        Action, ActionSource, InputEvent, InputOutcome, Key, KeyBinding, KeyCode, KeyState,
+        Modifiers, PointerButton, ScrollPhase, ScrollUnit, modifier_key_transitions,
+        should_emit_text, timestamp_from_ticks, timestamp_from_ticks_32,
     };
     use crate::math::Point;
 
@@ -1242,7 +1270,6 @@ mod tests {
                 delta: Point::new(0.0, 1.0),
                 unit: ScrollUnit::Line,
                 phase: ScrollPhase::Discrete,
-                lines_per_tick: 3.0,
                 modifiers: Modifiers::empty(),
                 timestamp: stamp,
             },
@@ -1263,6 +1290,55 @@ mod tests {
         assert_eq!(timestamp_from_ticks(now, 5_000, 5_000), now);
         // tick 倒退（时钟源不同步 / 回绕）：饱和到 `now`，绝不 panic。
         assert_eq!(timestamp_from_ticks(now, 5_000, 9_000), now);
+    }
+
+    /// R02-14（Windows）：`MSG.time` 是 **32 位**、49.7 天回绕的 tick，与「现在」同源同宽。
+    ///
+    /// 回归点：旧实现拿 `QueryPerformanceCounter` 的毫秒当「现在 tick」—— 原点与宽度都与
+    /// `MSG.time` 不同，所有公开时间戳被系统性平移；回绕之后差值变成 49.7 天、整批退化。
+    #[test]
+    fn wrapping_32_bit_ticks_convert_without_drifting_across_the_wrap() {
+        let now = Instant::now();
+        // 普通情况：20 ms 之前。
+        assert_eq!(
+            timestamp_from_ticks_32(now, 5_000, 4_980),
+            now - Duration::from_millis(20)
+        );
+        // 回绕两侧：现在在 0x0000_0005，事件在 0xFFFF_FFF0（回绕前 21 ms）。
+        assert_eq!(
+            timestamp_from_ticks_32(now, 5, u32::MAX - 15),
+            now - Duration::from_millis(21),
+            "回绕必须用 wrapping_sub 计算差值，不能当成 49.7 天"
+        );
+        // 事件比现在还新（时钟源不一致）：退化成分发时刻，绝不返回未来时间。
+        assert_eq!(timestamp_from_ticks_32(now, 5_000, 9_000), now);
+        // 差值大得不合理（> 1 h，说明原点不同）：同样退化，而不是产出 49 天前的时间戳。
+        assert_eq!(
+            timestamp_from_ticks_32(now, 0, 2 * crate::event::MAX_PLAUSIBLE_BEHIND_MS),
+            now
+        );
+    }
+
+    /// R02-2（P0 回归，Linux）：自动重复**不得**抑制字符文本。
+    ///
+    /// Wayland 的字符文本正是随客户端合成的重复产生的（服务端从不重发 `key` 事件），而
+    /// `ime_enabled` 默认 `false`（XKB 回退是默认通路）。旧实现把 `!repeat` 写进文本条件，
+    /// 于是按住可打印键只输入一个字符；Win32 `WM_CHAR` / AppKit `characters` 不受
+    /// `isARepeat` 过滤，三平台行为因此分叉。
+    #[test]
+    fn should_emit_text_ignores_auto_repeat() {
+        // 按下 + 未启用 IME + 不在组合期 ⇒ 产生文本；重复位不影响。
+        assert!(should_emit_text(KeyState::Down, false, false, false));
+        assert!(
+            should_emit_text(KeyState::Down, true, false, false),
+            "合成重复必须继续产生文本（P0 回归）"
+        );
+        // 抬起不产生文本。
+        assert!(!should_emit_text(KeyState::Up, false, false, false));
+        // IME 接管文本时 XKB/字符通路必须静默（否则一次按键两份文本）。
+        assert!(!should_emit_text(KeyState::Down, false, true, false));
+        // 组合期的物理按键不产生正文。
+        assert!(!should_emit_text(KeyState::Down, false, false, true));
     }
 
     #[test]
@@ -1307,6 +1383,61 @@ mod tests {
         assert_ne!(binding.key, KeyCode::KeyB);
         // R02-1：绑定表的键是布局无关的 `KeyCode`，不是平台私有码。
         assert_ne!(binding.key, KeyCode::Unidentified(0x41));
+    }
+
+    /// macOS `flagsChanged:` 的合成判据（R02-16）：修饰键必须进「按住集合」。
+    ///
+    /// 回归点：AppKit 不为修饰键发 `keyDown:`/`keyUp:`，旧实现只更新位图 ⇒
+    /// `App::key_down(ShiftLeft)` 在 macOS 上恒为 false（Win32/Wayland 为 true）。
+    #[test]
+    fn modifier_transitions_synthesize_left_sided_key_events() {
+        let collect = |previous: Modifiers, current: Modifiers| {
+            modifier_key_transitions(previous, current).collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            collect(Modifiers::empty(), Modifiers::SHIFT),
+            vec![(KeyCode::ShiftLeft, KeyState::Down)],
+            "按下 Shift ⇒ 合成 ShiftLeft Down"
+        );
+        assert_eq!(
+            collect(Modifiers::SHIFT, Modifiers::empty()),
+            vec![(KeyCode::ShiftLeft, KeyState::Up)],
+            "松开 Shift ⇒ 合成 ShiftLeft Up"
+        );
+        assert_eq!(
+            collect(Modifiers::empty(), Modifiers::CONTROL | Modifiers::META),
+            vec![
+                (KeyCode::ControlLeft, KeyState::Down),
+                (KeyCode::MetaLeft, KeyState::Down),
+            ],
+            "顺序固定：Shift、Control、Alt、Meta"
+        );
+        assert_eq!(
+            collect(Modifiers::ALT, Modifiers::ALT),
+            vec![],
+            "位图没变 ⇒ 不合成事件"
+        );
+    }
+
+    /// 媒体 / 浏览器键没有逻辑 `Key` 投影：默认导航（方向键/翻页键）不会被音量键触发，
+    /// 应用也只能通过 [`KeyCode`] 绑定它们。
+    #[test]
+    fn media_keys_have_no_logical_projection() {
+        for code in [
+            KeyCode::AudioVolumeUp,
+            KeyCode::AudioVolumeDown,
+            KeyCode::AudioVolumeMute,
+            KeyCode::MediaPlayPause,
+            KeyCode::MediaTrackNext,
+            KeyCode::MediaTrackPrevious,
+            KeyCode::MediaStop,
+            KeyCode::BrowserHome,
+            KeyCode::BrowserBack,
+            KeyCode::BrowserForward,
+        ] {
+            assert_eq!(Key::from_code(code), None, "{code:?} 没有命名逻辑身份");
+        }
     }
 
     #[test]
@@ -1397,11 +1528,7 @@ mod tests {
         );
 
         let InputEvent::Scroll {
-            delta,
-            unit,
-            phase,
-            lines_per_tick,
-            ..
+            delta, unit, phase, ..
         } = event
         else {
             panic!("必须是滚动事件");
@@ -1409,66 +1536,5 @@ mod tests {
         assert_eq!(delta, Point::new(-1.0, 2.0));
         assert_eq!(unit, ScrollUnit::Line);
         assert_eq!(phase, ScrollPhase::Discrete);
-        assert_eq!(lines_per_tick, 1.0);
-    }
-
-    #[test]
-    fn ime_commit_tokens_are_monotonic_and_never_zero() {
-        let mut token = ImeCommitToken::first();
-        assert_eq!(token.get(), 1);
-        token = token.next();
-        assert_eq!(token.get(), 2);
-        // 回绕时跳过 0（0 保留为「没有令牌」）。
-        let wrapped = ImeCommitToken::next(ImeCommitToken::from_test(u64::MAX));
-        assert_eq!(wrapped.get(), 1);
-    }
-
-    /// R02-13：提交去重按**事件级令牌 + UTF-16 码元前缀**判定。
-    ///
-    /// 回归点：`"🌍a"` 是 2 个码点但 **3 个 UTF-16 码元**，旧实现按 `chars().count()` 计数，
-    /// 于是 emoji 提交后第 3 条 `WM_CHAR`（`a`）无人抑制、被插入第二次。
-    #[test]
-    fn commit_dedup_matches_utf16_units_not_code_points() {
-        let token = ImeCommitToken::first();
-        let mut dedup = ImeCommitDedup::default();
-        dedup.begin(token, "🌍a");
-        assert_eq!(dedup.token(), Some(token));
-
-        // 🌍 = D83C DF0D，'a' = 0x61：三条码元全部被抑制。
-        for unit in [0xD83C, 0xDF0D, 0x61] {
-            assert!(
-                dedup.should_suppress(Some(token), unit),
-                "code unit {unit:#06x} 属于本次提交，必须抑制"
-            );
-        }
-        assert_eq!(dedup.token(), None, "序列耗尽后令牌作废");
-        assert!(
-            !dedup.should_suppress(Some(token), 0x62),
-            "之后的真实输入不得被吞"
-        );
-    }
-
-    #[test]
-    fn commit_dedup_ignores_other_tokens_and_mismatches() {
-        let token = ImeCommitToken::first();
-        let mut dedup = ImeCommitDedup::default();
-        dedup.begin(token, "ni");
-        // 令牌不同 ⇒ 不是这次提交的重复消息。
-        assert!(!dedup.should_suppress(Some(token.next()), 0x6E));
-        // 不匹配会作废令牌，之后的码元不再被吞。
-        assert!(!dedup.should_suppress(Some(token), 0x6E + 1));
-        assert!(!dedup.should_suppress(Some(token), 0x6E));
-        assert_eq!(dedup.token(), None);
-        // 没有待抑制的提交时永远不抑制。
-        assert!(!dedup.should_suppress(None, 0x61));
-    }
-
-    #[test]
-    fn an_empty_commit_suppresses_nothing() {
-        let token = ImeCommitToken::first();
-        let mut dedup = ImeCommitDedup::default();
-        dedup.begin(token, "");
-        assert_eq!(dedup.token(), None);
-        assert!(!dedup.should_suppress(Some(token), 0x61));
     }
 }

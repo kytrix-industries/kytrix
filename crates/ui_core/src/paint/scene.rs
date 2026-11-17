@@ -185,6 +185,10 @@ impl Scene {
     ///
     /// **契约**：`order` 由调用方（P06 的 paint 阶段）保证**无重复**；本方法不查重（查重是 O(n)）。
     pub fn set_order(&mut self, order: &[LaneId]) {
+        // 增量帧的绘制序通常与上一帧完全一致（只有内容变化）：相等时跳过 10k × 8 B 的拷贝。
+        if self.order == order {
+            return;
+        }
         self.order.clear();
         self.order.extend_from_slice(order);
     }

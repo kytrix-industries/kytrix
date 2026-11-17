@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::{
     app::App,
     error::EngineError,
-    event::{Event, InputEvent, ScrollPhase, ScrollUnit, timestamp_from_ticks},
+    event::{Event, InputEvent, ScrollPhase, ScrollUnit, timestamp_from_ticks_32},
     platform::{
         dispatcher::Dispatcher,
         event::{PlatformEvent, PointerKind, StampedEvent},
@@ -78,16 +78,18 @@ pub(super) fn sync_native_windows(
 /// 消费者：`pump_loop` 的 ② 步骤。
 /// 把 `WndProc` 收集的事件应用到 `App`（几何/DPI 先落地，再投递事件）。
 ///
-/// 时间戳换算的基准（`Instant::now()` + `QueryPerformanceCounter`）每批取**一次**：R02-14 要的
-/// 是「事件之间的相对时刻」，同一批共用一个基准既省两次系统调用，也避免同批事件的时间戳互相
-/// 跳变。
+/// 时间戳换算的基准（`Instant::now()` + `GetTickCount64() as u32`）每批取**一次**：R02-14
+/// 要的是「事件之间的相对时刻」，同一批共用一个基准既省两次系统调用，也避免同批事件的
+/// 时间戳互相跳变。两者与 `MSG.time` **同源同宽**（32 位回绕域，见
+/// [`timestamp_from_ticks_32`]）—— 旧实现用 QPC 毫秒当「现在」，原点/宽度都与 `MSG.time`
+/// 不同，所有公开时间戳被系统性平移。
 pub(super) fn collect_events(
     app: &mut App,
     windows: &mut [NativeWindow],
     dispatcher: &Arc<Dispatcher>,
 ) -> Result<(), EngineError> {
     let now = std::time::Instant::now();
-    let now_ticks = super::pump::monotonic_millis();
+    let now_ticks = super::pump::tick_now();
     for native in windows.iter_mut() {
         let id = native.id();
         let events = native.state_mut().take_events();
@@ -106,7 +108,7 @@ pub(super) fn apply_event(
     id: WindowId,
     stamped: StampedEvent,
     now: std::time::Instant,
-    now_ticks: u64,
+    now_ticks: u32,
 ) -> Result<(), EngineError> {
     let scale = native.scale();
     let to_logical = |x: i32, y: i32| {
@@ -114,7 +116,7 @@ pub(super) fn apply_event(
     };
     let modifiers = native.state_mut().modifiers();
     // R02-14：事件时刻 = 消息时刻（`MSG.time`），而不是分发时刻。
-    let timestamp = timestamp_from_ticks(now, now_ticks, stamped.ticks_ms);
+    let timestamp = timestamp_from_ticks_32(now, now_ticks, stamped.ticks_ms);
     let app_event = match stamped.event {
         PlatformEvent::Pointer { x, y, kind } => {
             let position = to_logical(x, y);
@@ -152,14 +154,12 @@ pub(super) fn apply_event(
             y,
             dx_lines,
             dy_lines,
-            lines_per_tick,
         } => Event::Input(InputEvent::Scroll {
             position: to_logical(x, y),
             delta: crate::math::Point::new(dx_lines, dy_lines),
             // Windows 的 `WM_MOUSEWHEEL` 只有离散格，没有阶段/精确模式（R02-10）。
             unit: ScrollUnit::Line,
             phase: ScrollPhase::Discrete,
-            lines_per_tick,
             modifiers,
             timestamp,
         }),

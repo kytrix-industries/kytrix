@@ -72,7 +72,7 @@ pub enum Clip {
 
 /// 静态绘制属性（`design/phase-06-paint-runtime.md` §6.1）。
 ///
-/// 与 [`Style`] 分开存放（`Node.paint`）：`Style` 内联会让 `Node` 超过 1152 B 的预算（F-58），
+/// 与 [`Style`] 分开存放（`Node.paint`）：绘制属性与布局属性是两条独立的失效通道（F-58）；
 /// 且绘制属性与布局属性是两条独立的失效通道。动态覆盖走 [`StylePatch`]（`background`/`border`/
 /// `opacity`/`foreground`），合并规则是「patch 覆盖 spec」。
 ///

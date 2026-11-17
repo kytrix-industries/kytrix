@@ -1,7 +1,7 @@
 //! a11y 树的侧表载荷与「节点 → `A11yNode`」的构建（`design/phase-11-a11y.md` §5 / §7.1）。
 //!
 //! 侧表（`NodeTree::a11y_slots`）与 `layout_cache` / `clip_keys` / `text_slots` / `debug_ids` 同型：
-//! 按 arena 槽位索引、槽位复用时清空、`remove` 时逐槽清空。`Node` 因此保持 1144 B（F-114）。
+//! 按 arena 槽位索引、槽位复用时清空、`remove` 时逐槽清空。`Node` 因此保持 ≤ 320 B（B5 之后为 312 B）。
 
 use smallvec::SmallVec;
 

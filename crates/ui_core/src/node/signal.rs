@@ -588,10 +588,11 @@ mod tests {
             ..StylePatch::default()
         });
         app.refresh_styles(window).expect("窗口存在");
-        assert!(!dirty(&app, window, node).contains(DirtyFlags::PAINT));
+        // R03-9：`refresh_styles` 只消费 `BIND`；`PAINT` 的唯一消费者是 paint pass。
+        assert!(!dirty(&app, window, node).contains(DirtyFlags::BIND));
 
         assert!(!app.write(&signal, 7), "等值写入必须短路");
-        assert!(!dirty(&app, window, node).contains(DirtyFlags::PAINT));
+        assert!(!dirty(&app, window, node).contains(DirtyFlags::BIND));
         assert!(!app.take_wake_request(), "等值写入不得请求唤醒");
     }
 

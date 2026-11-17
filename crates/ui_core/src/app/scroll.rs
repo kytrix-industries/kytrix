@@ -59,6 +59,8 @@ pub(crate) fn make_scroll(
             line_height: config.line_height,
         });
     }
+    // 反向索引：`clamp_scroll_offsets` 每帧遍历滚动容器，不再扫全树（R03-1）。
+    target.tree_mut().note_scroll_container(node);
     Ok(ScrollHandle::new(window, node))
 }
 
@@ -96,6 +98,11 @@ pub(crate) fn set_scroll_content(
 ///
 /// 只产生**视口矩形**的 damage：不写脏位、不跑布局、不跑样式求值。
 ///
+/// **唯一写点 ⇒ 唯一取消点**（R02-10 / P1 回归）：写入前先取消该槽上的滚轮平滑动画。
+/// 否则「滚轮动画还在跑时按 End / PageDown / 应用调用 `scroll_to`」会被下一帧的动画插值
+/// 拉回原处（探针：`End` 到 300.0 后一帧被拉回 16.75）。动画自己的 tick 也经过这里
+/// （`tick_animations` 已把槽取出，取消是 no-op），因此不会自我打断。
+///
 /// # Errors
 /// `StaleNode`（节点已卸载）/ `NotScrollable`（不是滚动容器）。
 /// 消费者：`App::scroll_to`。
@@ -113,12 +120,24 @@ pub(crate) fn scroll_to(
     }
     let window = handle.window();
     let node = handle.node();
+    // 先做只读校验（不存在/非滚动容器 ⇒ 不碰动画），再取消动画（需要 `&mut App`）。
+    {
+        let Some(target) = app.windows.get(&window) else {
+            return Ok(());
+        };
+        if target.tree().get(node).is_err() {
+            return Err(EngineError::StaleNode { node });
+        }
+        if target.tree().scroll_slot(node).is_none() {
+            return Err(EngineError::NotScrollable { node });
+        }
+    }
+    // 程序化/键盘滚动接管：残留的滚轮动画必须作废（同值写入也要取消 —— 否则「已经到底」
+    // 的 End 会让动画继续把偏移拉回）。
+    super::animation::cancel_scroll_animation(app, handle);
     let Some(target) = app.windows.get_mut(&window) else {
         return Ok(());
     };
-    if target.tree().get(node).is_err() {
-        return Err(EngineError::StaleNode { node });
-    }
     let Some(slot) = target.tree().scroll_slot(node) else {
         return Err(EngineError::NotScrollable { node });
     };
@@ -171,14 +190,9 @@ pub(crate) fn clamp_scroll_offsets(app: &mut App, window: WindowId) -> bool {
     let Some(target) = app.windows.get_mut(&window) else {
         return false;
     };
-    // 先收集（遍历时 `tree_mut` 与 `viewport` 的只读借用会冲突）。
-    let nodes: SmallVec<[crate::node::id::NodeId; 8]> = target
-        .tree()
-        .order()
-        .iter()
-        .copied()
-        .filter(|node| target.tree().scroll_slot(*node).is_some())
-        .collect();
+    // 反向索引（挂载 `ScrollSlot` 时登记）：成本 O(滚动容器数)，与节点总数无关。
+    let nodes: SmallVec<[crate::node::id::NodeId; 8]> =
+        target.tree().scroll_containers().iter().copied().collect();
     let mut changed = false;
     for node in nodes {
         let Some(slot) = target.tree().scroll_slot(node) else {

@@ -51,6 +51,8 @@ pub(crate) fn create_overlay(
             restore_focus: options.restore_focus,
         });
     }
+    // 反向索引：锚点纠位每帧只遍历浮层（`resolve_overlay_placements`）。
+    target.tree_mut().note_overlay_container(node);
     #[cfg(feature = "hud")]
     app.raise_debug_hud(window);
     app.request_frame();
@@ -76,11 +78,9 @@ pub(crate) fn resolve_overlay_placements(app: &mut App, window: WindowId) {
     let Some(target) = app.windows.get_mut(&window) else {
         return;
     };
-    let root = target.tree().root();
-    let children = target.tree().get(root).map_or_else(
-        |_| smallvec::SmallVec::<[NodeId; 4]>::new(),
-        |node| node.children().iter().copied().collect(),
-    );
+    // 反向索引（`create_overlay` 时登记）：成本 O(浮层数)，与 root 的子节点数无关。
+    let children: smallvec::SmallVec<[NodeId; 4]> =
+        target.tree().overlay_containers().iter().copied().collect();
     let mut moved = false;
     for node in children {
         let Some(slot) = target.tree().overlay_slot(node) else {
