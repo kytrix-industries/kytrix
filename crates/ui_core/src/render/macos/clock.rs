@@ -56,9 +56,24 @@ mod tests {
     #[test]
     fn the_default_clock_falls_back_to_the_refresh_interval() {
         let mut clock = CompositorClock::new(FALLBACK_REFRESH_HZ);
-        let tick = clock.wait_next_frame();
-        assert!(tick.present_time > tick.now);
-        assert_eq!(tick.refresh_hz, FALLBACK_REFRESH_HZ);
+        let first = clock.wait_next_frame();
+        assert_eq!(first.refresh_hz, FALLBACK_REFRESH_HZ);
+        // 不要断言 `present_time > now`：等待用的 condvar/定时器会 overshoot 一个周期，
+        // 于是 `now` 可能已经越过目标（Windows 上是 ~15.6 ms 的定时器粒度，macOS 是
+        // condvar 唤醒抖动）。真正要钉住的是**相位单调**与**兜底周期**。
+        let second = clock.wait_next_frame();
+        assert!(
+            second.present_time > first.present_time,
+            "没有 display link 时兜底时钟必须持续推进相位"
+        );
+        let period = second
+            .present_time
+            .saturating_duration_since(first.present_time);
+        let expected = std::time::Duration::from_secs_f64(1.0 / f64::from(FALLBACK_REFRESH_HZ));
+        assert!(
+            period <= expected * 3,
+            "兜底周期应约为 {expected:?}，实际 {period:?}"
+        );
     }
 
     /// 两次相邻的 display link 目标（120 Hz ⇒ 8.3 ms）把刷新率反推到 120 Hz 附近。
