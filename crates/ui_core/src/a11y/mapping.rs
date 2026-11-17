@@ -1,4 +1,4 @@
-//! 节点 → a11y 的映射表与判据（`design/phase-11-a11y.md` §4.1 / §5）。
+//! 节点 → a11y 的映射表与判据。
 //!
 //! 全部是**纯函数**（只读 `&NodeTree` / `&Node`），没有状态、没有走帧。`accesskit` 的类型只在这里
 //! 与 `a11y::adapter` 出现（角色 / 动作的枚举对译）。
@@ -42,6 +42,12 @@ pub(crate) const fn role_to_accesskit(role: A11yRole) -> accesskit::Role {
         R::Grid => Role::Grid,
         R::Row => Role::Row,
         R::Cell => Role::Cell,
+        // 表头（R13-3）：UIA 的 `ITableItemProvider::GetColumnHeaderItems` / AT-SPI 的
+        // `getColumnHeader` 由角色推导，缺这两个角色时交易表格的列名永远到不了 AT。
+        R::ColumnHeader => Role::ColumnHeader,
+        R::RowHeader => Role::RowHeader,
+        // 文本运行：`character_lengths` / `word_starts` / `text_selection` 的合法宿主。
+        R::TextRun => Role::TextRun,
         R::ScrollView => Role::ScrollView,
         R::ScrollBar => Role::ScrollBar,
         R::Image => Role::Image,
@@ -110,7 +116,6 @@ pub(crate) const fn action_from_accesskit(action: accesskit::Action) -> Option<A
     }
 }
 
-/// 窗口相对、**物理像素**的边界盒（逻辑 × scale，逐边 round；含祖先滚动偏移的屏幕化）。
 /// 实时区域播报策略 → accesskit::Live。
 pub(crate) const fn live_to_accesskit(live: crate::a11y::A11yLive) -> accesskit::Live {
     match live {
@@ -119,6 +124,28 @@ pub(crate) const fn live_to_accesskit(live: crate::a11y::A11yLive) -> accesskit:
     }
 }
 
+/// 表头排序状态 → `accesskit::SortDirection`（`aria-sort` 的等价物）。
+///
+/// `aria-sort="none"`（可排序、当前未排序）映射到 `SortDirection::Other`：AccessKit 没有
+/// `None` 变体，`Other` 是它表达"未排序"的方式。
+pub(crate) const fn sort_to_accesskit(sort: crate::a11y::A11ySort) -> accesskit::SortDirection {
+    match sort {
+        crate::a11y::A11ySort::Ascending => accesskit::SortDirection::Ascending,
+        crate::a11y::A11ySort::Descending => accesskit::SortDirection::Descending,
+        crate::a11y::A11ySort::None => accesskit::SortDirection::Other,
+    }
+}
+
+/// 窗口客户区相对、**物理像素**的边界盒（逻辑 × scale，逐边 round；含祖先滚动偏移的屏幕化）。
+///
+/// 三个平台桥接都要求这个坐标系（逐条核对过上游实现）：
+/// - Windows UIA（`accesskit_windows`）用 `ClientToScreen(hwnd)` 自己加上屏幕原点 ⇒ 这里必须是
+///   客户区相对、物理像素（PMv2 感知进程里 `ClientToScreen` 返回物理像素）。
+/// - macOS NSAccessibility（`accesskit_macos`）除以 `backingScaleFactor` 换算到逻辑点，
+///   再经 view/window 转换到屏幕 ⇒ 这里必须是 view 相对、物理像素、y 向下。
+/// - Linux AT-SPI（`accesskit_unix` + `atspi_common`）把节点 bounds 原样加 `inner.origin()`
+///   （见 `a11y::platform` 文档段）⇒ 节点 bounds 是**物理像素/客户区相对**，屏幕原点是
+///   `set_root_window_bounds` 的职责，不在本函数里。
 pub(crate) fn bounds_of(tree: &NodeTree, node: NodeId, scale: Scale) -> PhysicalRect {
     let content = tree
         .get(node)
@@ -168,7 +195,7 @@ pub(crate) fn default_actions(role: A11yRole) -> Vec<A11yAction> {
     }
 }
 
-/// 由节点种类推导角色（`by_kind`；`design §5.2` 的判定顺序）。
+/// 由节点种类推导角色（`by_kind` 的判定顺序：特殊种类 → 虚拟列表 → 滚动 → 浮层 → 可交互 → 兜底）。
 pub(crate) fn role_by_kind(tree: &NodeTree, node: NodeId, target: &Node) -> A11yRole {
     use A11yRole as R;
 
@@ -177,7 +204,16 @@ pub(crate) fn role_by_kind(tree: &NodeTree, node: NodeId, target: &Node) -> A11y
     }
     match target.kind() {
         NodeKind::Canvas(_) | NodeKind::Geometry(_) => return R::Image,
-        NodeKind::Text(_) => return R::Label,
+        // 文本节点的角色取决于父节点：文本输入框里的文本是 **`TextRun`**（AccessKit 的
+        // `TextPosition.node` 硬性要求 `Role::TextRun` 才承认 `text_selection`），其余场合
+        // 是 `Label`（可访问名走 `value`）。
+        NodeKind::Text(_) => {
+            return if is_text_run_in_input(tree, node) {
+                R::TextRun
+            } else {
+                R::Label
+            };
+        }
         NodeKind::Box => {}
     }
     // 虚拟列表**先判**：它也带滚动槽，但语义是 `List`（滚动动作由 `effective_actions` 补）。
@@ -211,6 +247,26 @@ fn is_virtual_row(tree: &NodeTree, node: NodeId) -> bool {
         .is_some_and(|parent| tree.virtual_slot(parent).is_some())
 }
 
+/// 该文本节点是否位于文本输入框内（⇒ 角色 `TextRun`）。
+///
+/// 只看**直接父节点**：引擎没有内联文本子树模型，输入框 = 「声明 `TextInput` 角色的盒子 +
+/// 一个文本子节点」。父角色用同一套合并规则求（`patch.role` > `over.role` > `by_kind`），
+/// 但**不再向下递归**文本分支（父不是文本节点），所以深度恒为 2。
+fn is_text_run_in_input(tree: &NodeTree, node: NodeId) -> bool {
+    let Some(parent) = tree.get(node).ok().and_then(|target| target.parent()) else {
+        return false;
+    };
+    let Ok(parent_node) = tree.get(parent) else {
+        return false;
+    };
+    let slot = tree.a11y_of(parent);
+    let role = slot
+        .and_then(|slot| slot.patch.role)
+        .or_else(|| slot.and_then(|slot| slot.over.as_ref().and_then(|over| over.role)))
+        .unwrap_or_else(|| role_by_kind(tree, parent, parent_node));
+    matches!(role, A11yRole::TextInput | A11yRole::MultilineTextInput)
+}
+
 /// 合并后的角色（`patch.role` > `override.role` > `by_kind`）。
 pub(crate) fn effective_role(
     tree: &NodeTree,
@@ -226,12 +282,18 @@ pub(crate) fn effective_role(
 }
 
 /// 合并后的动作表（`patch.actions` > `override.actions` > `by_role`，再按可聚焦性补 `Focus`）。
+///
+/// `disabled` 为真时剔除**改变状态**的动作（`Click` / `Focus` / `SetValue` / `Increment` /
+/// `Decrement` / `SetTextSelection` / `Expand` / `Collapse`）：a11y 级 `disabled` 与动作能力
+/// 必须同源，否则 AT 读到 `IsEnabled == false` 却仍能通过"激活"触发下单（R13-16）。
+/// 滚动动作保留 —— 只改视口、不改被禁用控件的数据，且阅读长列表本身不该被禁用阻断。
 pub(crate) fn effective_actions(
     tree: &NodeTree,
     node: NodeId,
     role: A11yRole,
     over: Option<&A11yOverride>,
     patch: Option<&A11yPatch>,
+    disabled: bool,
 ) -> Vec<A11yAction> {
     let mut actions = patch
         .and_then(|patch| patch.actions.clone())
@@ -270,7 +332,45 @@ pub(crate) fn effective_actions(
     if !wants_focus {
         actions.retain(|action| *action != A11yAction::Focus);
     }
+    if disabled {
+        actions.retain(|action| {
+            !matches!(
+                action,
+                A11yAction::Click
+                    | A11yAction::Focus
+                    | A11yAction::SetValue
+                    | A11yAction::Increment
+                    | A11yAction::Decrement
+                    | A11yAction::SetTextSelection
+                    | A11yAction::Expand
+                    | A11yAction::Collapse
+            )
+        });
+    }
     actions
+}
+
+/// 节点的 a11y "禁用"状态（`node_a11y` 与动作分发**共用同一判据**）。
+///
+/// 两条来源（任一为真即禁用）：
+/// 1. 本地判据（`is_disabled`）：`A11yPatch/A11yOverride::disabled` 或 `StylePatch::interactive
+///    == Some(false)`；
+/// 2. **祖先继承**（C12）：`NodeTree::is_effectively_interactive` —— 任一祖先 `interactive:
+///    Some(false)` ⇒ 子树不可交互。命中测试与 `focus::focusable` 已经是这个语义；a11y 若只看
+///    本地，就会出现"指针/键盘点不动、AT 却宣告可点击"的死按钮（R13-16 的同一类不一致）。
+///
+/// 动作分发（`a11y::action::dispatch`）必须在执行任何 handler / 内置映射之前用它挡一道。
+pub(crate) fn a11y_disabled(tree: &NodeTree, node: NodeId) -> bool {
+    let Ok(target) = tree.get(node) else {
+        return false;
+    };
+    if !tree.is_effectively_interactive(node) {
+        return true;
+    }
+    let slot = tree.a11y_of(node);
+    let over = slot.and_then(|slot| slot.over.as_ref());
+    let patch = slot.map(|slot| &slot.patch);
+    is_disabled(target, over, patch)
 }
 
 /// 合并后的可访问名 + 写入通道。
@@ -290,13 +390,18 @@ pub(crate) fn effective_label(
         return Some(crate::a11y::A11yLabel::new(text, A11yLabelSource::Override));
     }
     match target.kind() {
-        NodeKind::Text(content) if !content.text.is_empty() => {
-            let source = if role == A11yRole::Label {
-                A11yLabelSource::TextContent
-            } else {
-                A11yLabelSource::Override
-            };
-            Some(crate::a11y::A11yLabel::new(content.text.clone(), source))
+        // `TextRun` 的文本走 `value`（AccessKit 的 `character_lengths` 以 `value` 为基准）；
+        // 再写一份 `label` 会让 AT 把同一段文字读两遍。
+        NodeKind::Text(content) if role == A11yRole::Label && !content.text.is_empty() => Some(
+            crate::a11y::A11yLabel::new(content.text.clone(), A11yLabelSource::TextContent),
+        ),
+        NodeKind::Text(content)
+            if role != A11yRole::Label && role != A11yRole::TextRun && !content.text.is_empty() =>
+        {
+            Some(crate::a11y::A11yLabel::new(
+                content.text.clone(),
+                A11yLabelSource::Override,
+            ))
         }
         _ => None,
     }
@@ -314,7 +419,11 @@ pub(crate) fn effective_value(
         .or_else(|| over.and_then(|over| over.value.clone()))
         .or_else(|| match target.kind() {
             // `Role::Label` 的可访问名走 value（`accesskit_consumer` 的 `label_comes_from_value`）。
-            NodeKind::Text(content) if role == A11yRole::Label && !content.text.is_empty() => {
+            // `Role::TextRun` 的文本也走 value —— `character_lengths` 的求和基准就是它。
+            NodeKind::Text(content)
+                if matches!(role, A11yRole::Label | A11yRole::TextRun)
+                    && !content.text.is_empty() =>
+            {
                 Some(content.text.clone())
             }
             _ => None,
@@ -331,7 +440,7 @@ pub(crate) fn effective_description(
         .or_else(|| over.and_then(|over| over.description.clone()))
 }
 
-/// 隐藏判定（`design §4.3` 的「与 `StylePatch` 的一致性」表）。
+/// 隐藏判定：`patch.hidden` > `over.hidden` > `StylePatch::visible` > `display:none` > 自绘缺替代文本。
 pub(crate) fn is_hidden(
     target: &Node,
     role: A11yRole,
@@ -374,60 +483,123 @@ pub(crate) fn is_disabled(
 #[cfg(test)]
 mod tests {
     use super::{
-        action_from_accesskit, action_to_accesskit, default_actions, effective_actions,
-        is_disabled, is_hidden, role_to_accesskit,
+        a11y_disabled, action_from_accesskit, action_to_accesskit, default_actions,
+        effective_actions, is_disabled, is_hidden, role_by_kind, role_to_accesskit,
+        sort_to_accesskit,
     };
     use crate::{
-        a11y::{A11yAction, A11yLabel, A11yLabelSource, A11yOverride, A11yPatch, A11yRole},
+        a11y::{
+            A11yAction, A11yLabel, A11yLabelSource, A11yOverride, A11yPatch, A11yRole, A11ySort,
+        },
         node::{builder::NodeBuilder, tree::NodeTree},
         paint::{
             canvas::Canvas,
             style::{Clip, Style, StylePatch},
         },
+        text::{TextContent, TextStyle},
     };
 
+    /// 角色映射：**每个** `A11yRole` 变体必须恰好出现一次，且映射到互不相同的
+    /// `accesskit::Role`。
+    ///
+    /// 旧实现手写 27 项数组、而枚举有 29 个变体（漏了 `Row`/`Cell` —— 恰好是表格语义最关键
+    /// 的两个），却因为 `unique.len() == roles.len()` 而永远绿（R13-3/§7.2 自查）。
+    /// 现在两道防线：
+    /// 1. `count_role` 是**穷举 `match`**：加变体不补分支 ⇒ 编译失败；
+    /// 2. `A11yRole::ALL` 漏列变体 ⇒ 求和 != `ALL.len()` ⇒ 测试红。
     #[test]
-    fn every_role_maps_to_a_distinct_accesskit_role() {
-        let roles = [
-            A11yRole::Window,
-            A11yRole::Application,
-            A11yRole::GenericContainer,
-            A11yRole::Group,
-            A11yRole::Label,
-            A11yRole::Paragraph,
-            A11yRole::Heading,
-            A11yRole::Button,
-            A11yRole::TextInput,
-            A11yRole::MultilineTextInput,
-            A11yRole::CheckBox,
-            A11yRole::Switch,
-            A11yRole::RadioButton,
-            A11yRole::Slider,
-            A11yRole::ProgressIndicator,
-            A11yRole::List,
-            A11yRole::ListBoxOption,
-            A11yRole::Table,
-            A11yRole::Grid,
-            A11yRole::ScrollView,
-            A11yRole::ScrollBar,
-            A11yRole::Image,
-            A11yRole::Menu,
-            A11yRole::MenuBar,
-            A11yRole::MenuItem,
-            A11yRole::Dialog,
-            A11yRole::Tooltip,
-        ];
-        let mut mapped = Vec::new();
-        for role in roles {
+    fn every_role_is_included_exactly_once_in_all() {
+        /// 穷举计数：每个变体返回 1。`match` 没有 `_` 分支，所以漏一个变体编译失败。
+        fn count_role(role: A11yRole) -> usize {
+            match role {
+                A11yRole::Window
+                | A11yRole::Application
+                | A11yRole::GenericContainer
+                | A11yRole::Group
+                | A11yRole::Label
+                | A11yRole::Paragraph
+                | A11yRole::Heading
+                | A11yRole::Button
+                | A11yRole::TextInput
+                | A11yRole::MultilineTextInput
+                | A11yRole::CheckBox
+                | A11yRole::Switch
+                | A11yRole::RadioButton
+                | A11yRole::Slider
+                | A11yRole::ProgressIndicator
+                | A11yRole::List
+                | A11yRole::ListBoxOption
+                | A11yRole::Table
+                | A11yRole::Grid
+                | A11yRole::Row
+                | A11yRole::Cell
+                | A11yRole::ColumnHeader
+                | A11yRole::RowHeader
+                | A11yRole::TextRun
+                | A11yRole::ScrollView
+                | A11yRole::ScrollBar
+                | A11yRole::Image
+                | A11yRole::Menu
+                | A11yRole::MenuBar
+                | A11yRole::MenuItem
+                | A11yRole::Dialog
+                | A11yRole::Tooltip => 1,
+            }
+        }
+
+        let counted: usize = A11yRole::ALL.iter().copied().map(count_role).sum();
+        assert_eq!(
+            counted,
+            A11yRole::ALL.len(),
+            "A11yRole::ALL 必须覆盖每个变体恰好一次（漏列 ⇒ 求和偏小 ⇒ 恒红）"
+        );
+
+        let mut mapped = Vec::with_capacity(A11yRole::ALL.len());
+        for role in A11yRole::ALL {
             mapped.push(role_to_accesskit(role));
         }
         let unique: std::collections::BTreeSet<_> = mapped.iter().collect();
-        assert_eq!(unique.len(), roles.len(), "角色映射必须一一对应");
+        assert_eq!(
+            unique.len(),
+            mapped.len(),
+            "两个 A11yRole 不得映射到同一个 accesskit::Role"
+        );
         assert_eq!(role_to_accesskit(A11yRole::Image), accesskit::Role::Image);
         assert_eq!(
             role_to_accesskit(A11yRole::ScrollView),
             accesskit::Role::ScrollView,
             "不是 ScrollArea（不存在）"
+        );
+        // 表格语义（R13-3）：这三个角色是交易表格读屏路径的核心。
+        assert_eq!(
+            role_to_accesskit(A11yRole::ColumnHeader),
+            accesskit::Role::ColumnHeader
+        );
+        assert_eq!(
+            role_to_accesskit(A11yRole::RowHeader),
+            accesskit::Role::RowHeader
+        );
+        assert_eq!(
+            role_to_accesskit(A11yRole::TextRun),
+            accesskit::Role::TextRun
+        );
+    }
+
+    /// `aria-sort` 的三个状态都必须有映射（UIA/AT-SPI 靠它播报"按价格升序"）。
+    #[test]
+    fn sort_directions_map_to_accesskit() {
+        assert_eq!(
+            sort_to_accesskit(A11ySort::Ascending),
+            accesskit::SortDirection::Ascending
+        );
+        assert_eq!(
+            sort_to_accesskit(A11ySort::Descending),
+            accesskit::SortDirection::Descending
+        );
+        assert_eq!(
+            sort_to_accesskit(A11ySort::None),
+            accesskit::SortDirection::Other,
+            "AccessKit 没有 None 变体：未排序 = Other"
         );
     }
 
@@ -496,7 +668,7 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let plain = NodeBuilder::boxed().build(&mut tree, root).expect("mount");
-        let actions = effective_actions(&tree, plain, A11yRole::ListBoxOption, None, None);
+        let actions = effective_actions(&tree, plain, A11yRole::ListBoxOption, None, None, false);
         assert!(
             !actions.contains(&A11yAction::Click),
             "无 on_click 的列表项不得暴露 Click：{actions:?}"
@@ -507,7 +679,8 @@ mod tests {
             .on_click(crate::event::Action::custom("pick"))
             .build(&mut tree, root)
             .expect("mount");
-        let actions = effective_actions(&tree, clickable, A11yRole::ListBoxOption, None, None);
+        let actions =
+            effective_actions(&tree, clickable, A11yRole::ListBoxOption, None, None, false);
         assert!(
             actions.contains(&A11yAction::Click),
             "有 on_click 的列表项必须暴露 Click：{actions:?}"
@@ -614,5 +787,141 @@ mod tests {
             None
         ));
         let _ = (Style::default(), Clip::None);
+    }
+
+    /// R13-16：a11y 级 `disabled` 必须与**动作能力**同源。
+    ///
+    /// 失败面：`bind_a11y(disabled: Some(true))` 宣告"不可用"后，节点仍然宣告 `Click`/`Focus`，
+    /// AT 的"激活"会真的执行 `on_click`（下单）。
+    #[test]
+    fn disabled_nodes_do_not_advertise_state_changing_actions() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let button = NodeBuilder::boxed()
+            .on_click(crate::event::Action::custom("buy"))
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Button),
+                label: Some(smol_str::SmolStr::new_static("买入")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("mount");
+
+        // 启用态：Click + Focus 都在。
+        let enabled = effective_actions(&tree, button, A11yRole::Button, None, None, false);
+        assert!(enabled.contains(&A11yAction::Click));
+        assert!(enabled.contains(&A11yAction::Focus));
+
+        // 动态 `disabled` 补丁（最自然的写法）⇒ 能力必须同步消失。
+        tree.set_a11y_patch(
+            button,
+            A11yPatch {
+                disabled: Some(true),
+                ..A11yPatch::default()
+            },
+        );
+        assert!(
+            a11y_disabled(&tree, button),
+            "动作分发与 node_a11y 必须共用同一判据"
+        );
+        let slot = tree.a11y_of(button).expect("a11y slot");
+        let disabled = effective_actions(
+            &tree,
+            button,
+            A11yRole::Button,
+            slot.over.as_ref(),
+            Some(&slot.patch),
+            a11y_disabled(&tree, button),
+        );
+        assert!(
+            !disabled.contains(&A11yAction::Click),
+            "disabled 节点不得宣告 Click：{disabled:?}"
+        );
+        assert!(
+            !disabled.contains(&A11yAction::Focus),
+            "disabled 节点不得宣告 Focus：{disabled:?}"
+        );
+
+        // 滚动动作保留（只改视口，不改被禁用控件的数据）。
+        let view = effective_actions(&tree, button, A11yRole::ScrollView, None, None, true);
+        assert!(view.contains(&A11yAction::ScrollDown), "{view:?}");
+    }
+
+    /// C12 一致化：祖先 `interactive: false` ⇒ 整个子树在 a11y 里也是 disabled（与命中/焦点同一
+    /// 语义），后代不得再宣告 `Click`/`Focus`，否则 AT 会看到一个"点不动的可点击按钮"。
+    #[test]
+    fn a_disabled_ancestor_disables_the_subtree_for_a11y() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let panel = NodeBuilder::boxed().build(&mut tree, root).expect("panel");
+        let child = NodeBuilder::boxed()
+            .on_click(crate::event::Action::custom("buy"))
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Button),
+                label: Some(smol_str::SmolStr::new_static("买入")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, panel)
+            .expect("child");
+        tree.set_style_patch_for_test(
+            panel,
+            StylePatch {
+                interactive: Some(false),
+                ..StylePatch::default()
+            },
+        );
+        assert!(
+            a11y_disabled(&tree, child),
+            "祖先禁用必须继承到 a11y disabled"
+        );
+        assert!(
+            !crate::interaction::focus::focusable(&tree, child),
+            "与焦点系统同源"
+        );
+        let actions = effective_actions(
+            &tree,
+            child,
+            A11yRole::Button,
+            None,
+            None,
+            a11y_disabled(&tree, child),
+        );
+        assert!(
+            !actions.contains(&A11yAction::Click) && !actions.contains(&A11yAction::Focus),
+            "继承 disabled 的后代不得宣告动作：{actions:?}"
+        );
+    }
+
+    /// 文本输入框里的文本节点自动成为 `TextRun`（`text_selection` 的合法宿主），
+    /// 其它文本节点仍是 `Label`。
+    #[test]
+    fn text_inside_an_input_becomes_a_text_run() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let input = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::TextInput),
+                label: Some(smol_str::SmolStr::new_static("价格")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("input");
+        let inner = NodeBuilder::text("42150", TextStyle::new(12.0))
+            .build(&mut tree, input)
+            .expect("text");
+        let label = NodeBuilder::text("最新价", TextStyle::new(12.0))
+            .build(&mut tree, root)
+            .expect("label");
+        assert_eq!(
+            role_by_kind(&tree, inner, tree.get(inner).expect("inner")),
+            A11yRole::TextRun,
+            "输入框内的文本必须是 TextRun"
+        );
+        assert_eq!(
+            role_by_kind(&tree, label, tree.get(label).expect("label")),
+            A11yRole::Label,
+            "普通文本仍是 Label"
+        );
+        let _ = TextContent::new("x", TextStyle::new(12.0));
     }
 }

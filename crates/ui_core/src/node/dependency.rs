@@ -5,7 +5,7 @@
 //! - 读取集合是**本帧替换**（不是累积），差分清理见 `replace_deps`；
 //! - 环检测在运行时求值栈上，入/出栈由 `EvalGuard` 的 `Drop` 保证 panic 安全。
 
-use std::any::Any;
+use std::{any::Any, rc::Rc};
 
 use smallvec::SmallVec;
 
@@ -13,7 +13,9 @@ use crate::{
     error::EngineError,
     node::{
         id::NodeId,
-        signal::{Derived, DerivedId, DerivedStore, Signal, SignalId, SignalSlot, Transient},
+        signal::{
+            Derived, DerivedId, DerivedStore, Signal, SignalId, SignalRef, SignalSlot, Transient,
+        },
     },
     window::WindowId,
 };
@@ -102,6 +104,12 @@ impl DependencyGraph {
     /// 删除整条表项（空集合清理；`App::write` 的 `retain` 之后）。
     pub(crate) fn remove_signal(&mut self, id: SignalId) -> Option<OwnerSet> {
         self.dependents.remove(&id)
+    }
+
+    /// 当前有依赖边的信号数（仅测试：作用域释放「立即删边」的可测证据）。
+    #[cfg(test)]
+    pub(crate) fn signal_count(&self) -> usize {
+        self.dependents.len()
     }
 }
 
@@ -233,24 +241,29 @@ impl<'a> ReadCtx<'a> {
         self.owner
     }
 
-    /// 读普通信号：登记依赖 + 克隆值。
+    /// 读普通信号：登记依赖 + 返回**读守卫**（`Rc` 递增，不克隆值）。
+    ///
+    /// 返回的 [`SignalRef`] 不借用 `self`：同一个 `ReadCtx` 上可以连续取多个守卫，
+    /// 守卫也可以在 `ReadCtx` 销毁后继续存活（只冻结被读的那一格值）。
     ///
     /// # Panics
-    /// `SignalSlot::owned` 的不变量断言（槽位类型与 `T` 不一致）。
-    pub fn read<T: Clone + 'static>(&mut self, signal: &Signal<T>) -> T {
-        self.tracker.record(signal.id());
-        self.slot(signal.id()).owned::<T>()
+    /// `SignalSlot` 的不变量断言（槽位类型与 `T` 不一致）。
+    pub fn read<T: 'static>(&mut self, signal: &Signal<T>) -> SignalRef<T> {
+        let id = signal.id();
+        self.tracker.record(id);
+        self.slot(id).read_owned(id)
     }
 
     /// 读瞬态值：**不登记**依赖。
     ///
     /// # Panics
-    /// `SignalSlot::transient` 的不变量断言。
-    pub fn read_transient<T: Clone + 'static>(&mut self, transient: &Transient<T>) -> T {
-        self.slot(transient.id()).transient::<T>()
+    /// `SignalSlot` 的不变量断言。
+    pub fn read_transient<T: 'static>(&mut self, transient: &Transient<T>) -> SignalRef<T> {
+        let id = transient.id();
+        self.slot(id).read_transient(id)
     }
 
-    /// 读派生值：登记依赖 + 惰性求值。
+    /// 读派生值：登记依赖 + 惰性求值 + 返回缓存快照守卫。
     ///
     /// # Errors
     /// - `EngineError::CyclicDerived { derived }`：求值栈上再次遇到同一个 `DerivedId`（真环），
@@ -259,24 +272,24 @@ impl<'a> ReadCtx<'a> {
     ///
     /// # Panics
     /// 缓存/闭包的类型与 `T` 不符（不变量破坏）；派生闭包自身 panic 会原样向上传播。
-    pub fn read_derived<T: Clone + 'static>(
+    pub fn read_derived<T: 'static>(
         &mut self,
         derived: &Derived<T>,
-    ) -> Result<T, EngineError> {
+    ) -> Result<SignalRef<T>, EngineError> {
         let id = derived.id();
         let handle = self.derived.handle(id);
         self.tracker.record(handle);
         if self.derived.is_dirty(id) {
             self.eval_derived(id)?;
         }
-        Ok(self.derived.value::<T>(id))
+        Ok(self.derived.read_value::<T>(id))
     }
 
-    /// 诊断/测试专用：读值但**不登记**依赖。
+    /// 诊断/测试专用：读值但**不登记**依赖（仍返回读守卫）。
     #[cfg(test)]
     #[must_use]
-    pub fn peek<T: Clone + 'static>(&self, signal: &Signal<T>) -> T {
-        self.slot(signal.id()).owned::<T>()
+    pub fn peek<T: 'static>(&self, signal: &Signal<T>) -> SignalRef<T> {
+        self.slot(signal.id()).read_owned(signal.id())
     }
 
     fn slot(&self, id: SignalId) -> &SignalSlot {
@@ -312,7 +325,7 @@ impl<'a> ReadCtx<'a> {
         };
 
         self.derived.put_compute(id, compute);
-        self.derived.store_value(id, value);
+        self.derived.store_value(id, Rc::from(value));
 
         let old = self.derived.deps(id);
         self.graph
@@ -471,7 +484,7 @@ mod tests {
             node_owner(0),
         );
 
-        assert_eq!(ctx.peek(&signal), 7);
+        assert_eq!(*ctx.peek(&signal), 7);
         assert!(tracker.as_slice().is_empty(), "peek 不得登记依赖");
     }
 }

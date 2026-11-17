@@ -193,8 +193,12 @@ fn node_and_handle_sizes() {
         96,
         "TextContent 的尺寸基线（P1-2.3：family + font_features 收进 TextStyleExtras 后从 112 降到 96）"
     );
-    assert_eq!(size_of::<Option<NodeId>>(), 8, "Option<NodeId> 必须零开销");
-    assert_eq!(size_of::<NodeId>(), 8);
+    assert_eq!(
+        size_of::<Option<NodeId>>(),
+        12,
+        "Option<NodeId> 与 NodeId 同尺寸（NonZeroU32 的 niche ⇒ 零开销包装）"
+    );
+    assert_eq!(size_of::<NodeId>(), 12, "index + 窗口 tag + 代际（R03-7）");
 }
 
 #[test]
@@ -655,14 +659,129 @@ fn clip_key_roundtrip_and_clear() {
 fn node_size_after_p06() {
     let size = size_of::<Node>();
     println!("size_of::<Node>() = {size}");
+    // wave-2 瘦身后预算 320 B；wave-6 的 NodeId 带窗口身份（8→12 B）后仍必须守住
+    // （`Node.id` 与 `Node.parent` 各 +4 B；`Option<NodeId>` 靠 NonZeroU32 的 niche 保持 12 B）。
     assert!(
-        size <= 1152,
-        "Node 超预算：{size} B（备选 style: Box<Style>）"
+        size <= 320,
+        "Node 超预算：{size} B（备选瘦身：删掉未被读取的 `Node.id` 字段）"
     );
-    // P1-2.3：TextStyle 新增 font_features（+8 B），Node 从 1144 到 1152。
-    // 这是有意的特性代价（等宽数字），已逼近 1152 的硬上限 —— 再加字段前必须先瘦身。
-    assert!(
-        size <= 1152,
-        "P1-2.3 之后的上限是 1152（P10 的 1144 + font_features 8）；再加字段要先瘦身"
+}
+
+// ── B7：设备像素吸附（只吸附边界）────────────────────────────────────────
+
+fn fixed_style(width: f32, height: f32) -> Style {
+    let mut inner = taffy::Style::<smol_str::SmolStr>::DEFAULT;
+    inner.size = taffy::geometry::Size {
+        width: taffy::style::Dimension::length(width),
+        height: taffy::style::Dimension::length(height),
+    };
+    Style {
+        inner,
+        clip: Clip::None,
+    }
+}
+
+fn layout_to(tree: &mut NodeTree, width: f32, height: f32) {
+    let _ = tree
+        .compute_layout(taffy::geometry::Size {
+            width: Some(width),
+            height: Some(height),
+        })
+        .expect("布局成功");
+}
+
+fn bounds_of(tree: &NodeTree, node: NodeId) -> Rect {
+    tree.get(node).expect("存在").layout().bounds
+}
+
+#[test]
+fn device_scale_snaps_committed_bounds_not_taffy_layout() {
+    let mut tree = NodeTree::new();
+    let root = tree.root();
+    let child = NodeBuilder::boxed()
+        .style(fixed_style(10.3, 4.4))
+        .build(&mut tree, root)
+        .expect("挂载成功");
+    tree.set_device_scale(Some(2.0));
+    layout_to(&mut tree, 200.0, 200.0);
+
+    // 10.3dp × 2 = 20.6px → 21px → 10.5dp；高度同理。
+    assert_eq!(bounds_of(&tree, child), Rect::new(0.0, 0.0, 10.5, 4.5));
+}
+
+#[test]
+fn device_scale_off_keeps_fractional_layout() {
+    let mut tree = NodeTree::new();
+    let root = tree.root();
+    let child = NodeBuilder::boxed()
+        .style(fixed_style(10.3, 4.4))
+        .build(&mut tree, root)
+        .expect("挂载成功");
+    layout_to(&mut tree, 200.0, 200.0);
+
+    assert_eq!(
+        bounds_of(&tree, child),
+        Rect::new(0.0, 0.0, 10.3, 4.4),
+        "未开启吸附时机 taffy 的布局盒原样保留"
+    );
+}
+
+#[test]
+fn device_scale_does_not_accumulate_rounding_across_depth() {
+    // 三层嵌套、每层偏移 0.3dp：递归引用系必须是**未圆整**坐标，否则误差逐层累积。
+    let mut tree = NodeTree::new();
+    let root = tree.root();
+    let mut parent = root;
+    let mut chain = Vec::new();
+    for _ in 0..3 {
+        let node = NodeBuilder::boxed()
+            .style({
+                let mut style = fixed_style(50.0, 50.0);
+                style.inner.margin = taffy::geometry::Rect {
+                    left: taffy::style::LengthPercentageAuto::length(0.3),
+                    right: taffy::style::LengthPercentageAuto::length(0.0),
+                    top: taffy::style::LengthPercentageAuto::length(0.3),
+                    bottom: taffy::style::LengthPercentageAuto::length(0.0),
+                };
+                style
+            })
+            .build(&mut tree, parent)
+            .expect("挂载成功");
+        chain.push(node);
+        parent = node;
+    }
+    tree.set_device_scale(Some(1.0));
+    layout_to(&mut tree, 200.0, 200.0);
+
+    // 未圆整的绝对坐标：0.3 / 0.6 / 0.9 → 吸附后 0 / 1 / 1（floor(v+0.5)）。
+    let origins: Vec<f32> = chain
+        .iter()
+        .map(|node| bounds_of(&tree, *node).origin.x)
+        .collect();
+    assert_eq!(
+        origins,
+        vec![0.0, 1.0, 1.0],
+        "每层边界只做一次舍入（不是父的已舍入值 + 偏移的链式舍入）"
+    );
+}
+
+#[test]
+fn device_scale_change_republishes_bounds() {
+    let mut tree = NodeTree::new();
+    let root = tree.root();
+    let child = NodeBuilder::boxed()
+        .style(fixed_style(10.3, 4.4))
+        .build(&mut tree, root)
+        .expect("挂载成功");
+    layout_to(&mut tree, 200.0, 200.0);
+    assert_eq!(bounds_of(&tree, child).size.width, 10.3);
+
+    tree.set_device_scale(Some(1.0));
+    layout_to(&mut tree, 200.0, 200.0);
+
+    assert_eq!(
+        bounds_of(&tree, child).size.width,
+        10.0,
+        "开启/切换吸附比例后必须重新提交全部边界"
     );
 }

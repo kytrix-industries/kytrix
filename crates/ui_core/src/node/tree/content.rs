@@ -467,6 +467,12 @@ pub(crate) fn geometry_transform(tree: &NodeTree, node: NodeId) -> Transform {
         .unwrap_or(Transform::IDENTITY)
 }
 
+// 消费者：`impl NodeTree::has_geometry_transforms` 的薄委托（外部调用点见该方法文档）。
+/// 是否存在任何 per-draw 几何变换（O(1)；命中测试的"快路径"判定：通常一张窗口一个都没有）。
+pub(crate) fn has_geometry_transforms(tree: &NodeTree) -> bool {
+    !tree.geometry_transforms.is_empty()
+}
+
 // 消费者：`impl NodeTree::set_geometry_transform` 的薄委托（外部调用点见该方法文档）。
 /// 写入几何节点的 per-draw 变换（单位矩阵 = 删除条目）。
 ///
@@ -806,6 +812,44 @@ pub(crate) fn is_hittable(tree: &NodeTree, node: NodeId) -> bool {
     tree.arena
         .get(node)
         .is_some_and(|target| target.style_patch().interactive != Some(false))
+}
+
+// 消费者：`impl NodeTree::is_effectively_interactive` 的薄委托（外部调用点见该方法文档）。
+/// 该节点**及其所有祖先**都未被 `interactive: Some(false)` 禁用。
+///
+/// 这是「可交互」的**唯一**继承规则（命中 / 焦点 / Action 三处共用）：
+/// - 命中测试沿途把 `disabled` 传下去，禁用子树整体不命中（`layout::hit_test`）；
+/// - 焦点遍历用本方法判定候选，禁用节点不会被 Tab 到（`interaction::focus`）；
+/// - a11y 的 `disabled` 属性在同一节点上取同一判据（`a11y::mapping::is_disabled`），
+///   祖先禁用由 AT 的父节点 `disabled` 语义继承。
+///
+/// 与 CSS `pointer-events` 的差别（有意）：**没有**子节点重新启用（`pointer-events:auto`）
+/// 的逃生口 —— 内核要把「祖先禁用 ⇒ 子树不命中」做成确定性规则，而不是两套可组合取值。
+pub(crate) fn is_effectively_interactive(tree: &NodeTree, node: NodeId) -> bool {
+    let mut cursor = Some(node);
+    while let Some(current) = cursor {
+        let Some(target) = tree.arena.get(current) else {
+            return false;
+        };
+        if target.style_patch().interactive == Some(false) {
+            return false;
+        }
+        cursor = target.parent;
+    }
+    true
+}
+
+// 消费者：`impl NodeTree::note_hit_test_skip` 的薄委托（外部调用点见该方法文档）。
+/// 记一次「命中因不可逆变换 / 非有限几何而跳过」（C11/C13 诊断计数）。
+pub(crate) fn note_hit_test_skip(tree: &NodeTree) {
+    tree.hit_test_skips
+        .set(tree.hit_test_skips.get().saturating_add(1));
+}
+
+// 消费者：`impl NodeTree::hit_test_skips` 的薄委托（外部调用点见该方法文档）。
+/// 累计的命中跳过次数（单调递增；诊断 / 测试断言用）。
+pub(crate) fn hit_test_skips(tree: &NodeTree) -> u64 {
+    tree.hit_test_skips.get()
 }
 
 // 消费者：`impl NodeTree::focus_ring` 的薄委托（外部调用点见该方法文档）。

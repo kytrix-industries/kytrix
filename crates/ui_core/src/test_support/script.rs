@@ -159,6 +159,10 @@ pub struct FrameSample {
     pub record: FrameRecord,
     /// a11y 交付摘要。
     pub a11y: A11yDelivery,
+    /// 该帧交付的 `TreeUpdate`（与生产 `build_update` 同一条组装路径；未交付 = `None`）。
+    pub a11y_update: Option<accesskit::TreeUpdate>,
+    /// 该帧 `TreeUpdate` 的 AccessKit 契约校验错误（`None` = 合法）。
+    pub a11y_contract: Option<String>,
 }
 
 /// 一次（或多次 `run`）的逐帧结果。
@@ -293,6 +297,71 @@ impl ScriptReport {
             sample.a11y.pending_after
         );
     }
+
+    /// 第 `index` 帧交付的 `TreeUpdate`（未交付 = `None`）。
+    #[must_use]
+    pub fn a11y_update(&self, index: usize) -> Option<&accesskit::TreeUpdate> {
+        self.frame(index).a11y_update.as_ref()
+    }
+
+    /// 第 `index` 帧的 `TreeUpdate` 不能违反 AccessKit 契约。
+    ///
+    /// # Panics
+    /// 契约失败（`accesskit` 的硬约束：父在树里或同批 / `children` 可达 / 删掉的节点不得再出现 /
+    /// 焦点必须在树里）。
+    pub fn assert_a11y_contract_ok(&self, index: usize) {
+        let sample = self.frame(index);
+        assert!(
+            sample.a11y_contract.is_none(),
+            "frame {index} ({}) delivered an invalid TreeUpdate: {}",
+            sample.label,
+            sample.a11y_contract.as_deref().unwrap_or("")
+        );
+    }
+
+    /// 第 `index` 帧的 `TreeUpdate` 必须是增量（节点数 ≤ `max`；预算/增量回归用）。
+    ///
+    /// # Panics
+    /// 未交付，或节点数超限。
+    pub fn assert_a11y_incremental_at_most(&self, index: usize, max: usize) {
+        let sample = self.frame(index);
+        let update = sample
+            .a11y_update
+            .as_ref()
+            .unwrap_or_else(|| panic!("frame {index} ({}) delivered no TreeUpdate", sample.label));
+        crate::test_support::a11y::assert_incremental_within(update, max);
+    }
+
+    /// 第 `index` 帧的 a11y 交付摘要（`pending_before / delivered / full / nodes`）。
+    #[must_use]
+    pub fn a11y(&self, index: usize) -> A11yDelivery {
+        self.frame(index).a11y
+    }
+
+    /// 整份脚本里所有交付的 `TreeUpdate` 都必须合法（链式应用在影子树上）。
+    ///
+    /// # Panics
+    /// 任一帧违约（打印该帧与失败规则）。
+    pub fn assert_a11y_contract_all(&self) {
+        for index in 0..self.samples.len() {
+            self.assert_a11y_contract_ok(index);
+        }
+    }
+
+    /// 第 `index` 帧的 `TreeUpdate` 语义快照（机器可读文本；见
+    /// [`crate::test_support::a11y::tree_update_snapshot`]）。
+    ///
+    /// # Panics
+    /// 本帧没有交付。
+    #[must_use]
+    pub fn a11y_snapshot(&self, index: usize) -> String {
+        let sample = self.frame(index);
+        let update = sample
+            .a11y_update
+            .as_ref()
+            .unwrap_or_else(|| panic!("frame {index} ({}) delivered no TreeUpdate", sample.label));
+        crate::test_support::a11y::tree_update_snapshot(update)
+    }
 }
 
 /// 帧脚本执行器：持有 `TestApp`，按顺序执行排队的帧并累积报告。
@@ -413,6 +482,8 @@ impl FrameScript {
             label,
             record,
             a11y,
+            a11y_update: self.app.a11y_update().cloned(),
+            a11y_contract: self.app.a11y_contract_error().map(String::from),
         })
     }
 
@@ -446,7 +517,7 @@ mod tests {
 
     use super::{A11yCapture, FrameScript, ScriptFrame};
     use crate::{
-        a11y::A11yOverride,
+        a11y::{A11yOverride, A11yRole},
         event::{Action, InputEvent, KeyCode, Modifiers, PointerButton},
         math::{Point, Rect, Scale, Size},
         node::{builder::NodeBuilder, signal::Signal},
@@ -472,7 +543,7 @@ mod tests {
             })
             .on_click(Action::custom("press"))
             .bind_style(move |cx| StylePatch {
-                background: Some(cx.read(&source)),
+                background: Some(*cx.read(&source)),
                 ..StylePatch::default()
             })
             .id("label")
@@ -549,8 +620,15 @@ mod tests {
         report.assert_rendered(4);
     }
 
+    /// 多帧脚本钉住 a11y 的两条节奏语义（lead 要求的两条都必须在）：
+    ///
+    /// 1. **焦点变化不节流**：Tab/点击造成的焦点变化在下一轮泵就交付（R13-5）；
+    /// 2. **数据更新仍节流**：高频数据类更新按 `A11Y_THROTTLE` 合并，到期补发（省电目标不变）。
+    ///
+    /// 变异验证：把 `focus_dirty` 旁路去掉 ⇒ 第 1 帧变红（节流）；把节流去掉 ⇒ 第 2 帧变红
+    /// （不该交付却交付了）。
     #[test]
-    fn script_reports_throttled_a11y_delivery() {
+    fn focus_is_delivered_immediately_but_data_updates_stay_throttled() {
         let mut app = TestApp::new();
         let window = app.window_id();
         let root = app.app().window(window).expect("窗口").tree().root();
@@ -571,24 +649,48 @@ mod tests {
 
         let mut script = FrameScript::new(app).with_a11y_capture(A11yCapture::Pump);
         script.push(ScriptFrame::new("首帧"));
-        script.push(ScriptFrame::new("只移焦点").mutate(move |app| {
-            app.set_focus(window, Some(button));
+        script.push(
+            ScriptFrame::new("只移焦点（必须立即交付）").mutate(move |app| {
+                app.set_focus(window, Some(button));
+            }),
+        );
+        script.push(ScriptFrame::new("改数据（必须被节流）").mutate(move |app| {
+            let tree = app.window_mut(window).expect("窗口").tree_mut();
+            tree.set_a11y_patch(
+                button,
+                crate::a11y::A11yPatch {
+                    label: Some(smol_str::SmolStr::new_static("提交（改）")),
+                    ..crate::a11y::A11yPatch::default()
+                },
+            );
+            tree.mark_a11y(button);
         }));
-        script.push(ScriptFrame::new("节流未到期"));
         script.push(ScriptFrame::new("时钟推进 100ms").advance(Duration::from_millis(100)));
         script.run().expect("帧脚本");
         let report = script.report();
 
         report.assert_a11y_full(0);
-        report.assert_a11y_throttled(1);
+        // ① 焦点：同帧交付、不节流、增量、不提交像素。
+        report.assert_a11y_delivered(1);
+        assert!(!report.a11y(1).full, "焦点笔必须是增量");
+        assert!(!report.frame(1).record.rendered, "纯焦点变化不得提交像素");
+        let focus_update = report.a11y_update(1).expect("焦点笔的 TreeUpdate");
+        assert!(
+            focus_update
+                .nodes
+                .iter()
+                .any(|(id, _)| *id == focus_update.focus),
+            "焦点节点必须与 focus 同笔送达（A3：否则 consumer 指向不存在的节点）"
+        );
+        // ② 数据：同一时钟窗口内必须被节流，到期后补发。
         report.assert_a11y_throttled(2);
         report.assert_a11y_delivered(3);
         assert!(
-            !report.frame(3).a11y.full,
-            "补发必须是增量（焦点变化），实际 full={}",
-            report.frame(3).a11y.full
+            report.a11y_snapshot(3).contains("提交（改）"),
+            "补发必须携带最终值（推迟而非丢弃）：{}",
+            report.a11y_snapshot(3)
         );
-        assert!(!report.frame(1).record.rendered, "纯焦点变化不得提交像素");
+        report.assert_a11y_contract_all();
     }
 
     #[test]
@@ -607,5 +709,147 @@ mod tests {
             script.app().app().focused(window).is_some(),
             "Tab 必须把焦点落到可聚焦节点上"
         );
+    }
+
+    /// 多帧覆盖"跨帧状态"：大树的 a11y 首树是**分批**交付的，每一笔都必须自洽
+    /// （AccessKit 契约），且分完之后影子树里的节点集合必须与引擎树一致。
+    ///
+    /// 这条用例同时守住三件事：
+    /// 1. 单笔超预算 ⇒ 红（`A11Y_BATCH_BUDGET` 被改成无限/全量时）；
+    /// 2. 分批把子节点排到父节点之前 ⇒ 红（契约校验）；
+    /// 3. 分批丢节点 / 重复交付导致影子树与引擎树不一致 ⇒ 红。
+    #[test]
+    fn multi_frame_a11y_delivery_is_budgeted_and_valid() {
+        use crate::test_support::a11y::ShadowTree;
+
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let root = app.app().window(window).expect("窗口").tree().root();
+        for _ in 0..3000 {
+            NodeBuilder::boxed()
+                .build(
+                    app.app_mut().window_mut(window).expect("窗口").tree_mut(),
+                    root,
+                )
+                .expect("node");
+        }
+        let nodes = app.app().window(window).expect("窗口").tree().len();
+
+        let mut script = FrameScript::new(app).with_a11y_capture(A11yCapture::Pump);
+        for index in 0..4 {
+            script.push(
+                ScriptFrame::new(format!("分批 {index}")).advance(Duration::from_millis(100)),
+            );
+        }
+        script.run().expect("帧脚本");
+        let report = script.report();
+
+        report.assert_a11y_full(0);
+        let mut shadow = ShadowTree::new();
+        let mut delivered = 0usize;
+        for index in 0..report.len() {
+            let Some(update) = report.a11y_update(index) else {
+                continue;
+            };
+            assert!(
+                update.nodes.len() <= crate::a11y::adapter::A11Y_BATCH_BUDGET,
+                "frame {index} 单笔超预算：{}",
+                update.nodes.len()
+            );
+            shadow
+                .apply(update)
+                .unwrap_or_else(|error| panic!("frame {index} 违反 AccessKit 契约：{error}"));
+            delivered += 1;
+        }
+        assert!(delivered >= 2, "3000 节点必须分批（实际 {delivered} 笔）");
+        assert_eq!(shadow.len(), nodes, "分批不得丢节点");
+        assert_eq!(
+            script.app().a11y_shadow_summaries().len(),
+            nodes,
+            "TestApp 的影子树与脚本里独立应用的影子树必须一致"
+        );
+        report.assert_a11y_contract_all();
+    }
+
+    /// B9：`TreeUpdate` 的机器可读快照（语义变更可审查）。
+    ///
+    /// 断言的是**语义**而不是字节：表格结构、`aria-sort`、文本的 grapheme 长度、焦点 id
+    /// 都必须出现在文本快照里。
+    #[test]
+    fn a11y_update_snapshot_is_human_reviewable() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let root = app.app().window(window).expect("窗口").tree().root();
+        let table = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Table),
+                label: Some(smol_str::SmolStr::new_static("行情")),
+                ..A11yOverride::default()
+            })
+            .build(
+                app.app_mut().window_mut(window).expect("窗口").tree_mut(),
+                root,
+            )
+            .expect("table");
+        let header = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Row),
+                ..A11yOverride::default()
+            })
+            .build(
+                app.app_mut().window_mut(window).expect("窗口").tree_mut(),
+                table,
+            )
+            .expect("row");
+        NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::ColumnHeader),
+                label: Some(smol_str::SmolStr::new_static("价格")),
+                sort: Some(crate::a11y::A11ySort::Descending),
+                ..A11yOverride::default()
+            })
+            .build(
+                app.app_mut().window_mut(window).expect("窗口").tree_mut(),
+                header,
+            )
+            .expect("header");
+        let input = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::TextInput),
+                label: Some(smol_str::SmolStr::new_static("数量")),
+                ..A11yOverride::default()
+            })
+            .build(
+                app.app_mut().window_mut(window).expect("窗口").tree_mut(),
+                root,
+            )
+            .expect("input");
+        NodeBuilder::text("价🌍ab", crate::text::TextStyle::new(12.0))
+            .build(
+                app.app_mut().window_mut(window).expect("窗口").tree_mut(),
+                input,
+            )
+            .expect("text");
+        let _ = app.drain().expect("首帧");
+
+        let snapshot = crate::test_support::a11y::tree_update_snapshot(
+            app.a11y_update().expect("首帧必须有 TreeUpdate"),
+        );
+        for expected in [
+            "role=Table",
+            "role=ColumnHeader",
+            "sort=Descending",
+            "role=TextRun",
+            "character_lengths=[3, 4, 1, 1]",
+            "rows=1",
+        ] {
+            assert!(
+                snapshot.contains(expected),
+                "快照必须包含 {expected}：\n{snapshot}"
+            );
+        }
+        assert!(snapshot.contains("focus: #"), "{snapshot}");
     }
 }

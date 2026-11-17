@@ -86,7 +86,7 @@ fn mount_text(fixture: &mut Fixture, count: usize) -> Signal<SmolStr> {
         let source = text;
         let _ = NodeBuilder::text("Kytrix benchmark 0123", TextStyle::new(13.0))
             .layout_override(Rect::new(0.0, y, 400.0, 18.0))
-            .bind_text(move |cx| cx.read(&source))
+            .bind_text(move |cx| (*cx.read(&source)).clone())
             .build(app.window_mut(*window).expect("window").tree_mut(), root)
             .expect("bench text");
     }
@@ -110,7 +110,7 @@ fn mount_text_grid(fixture: &mut Fixture) -> Signal<SmolStr> {
                     92.0,
                     13.0,
                 ))
-                .bind_text(move |cx| format_smolstr!("{cell} {}", cx.read(&source)))
+                .bind_text(move |cx| format_smolstr!("{cell} {}", *cx.read(&source)))
                 .build(app.window_mut(*window).expect("window").tree_mut(), root)
                 .expect("bench text cell");
         }
@@ -129,7 +129,7 @@ fn mount_fanout(fixture: &mut Fixture, count: usize) -> Signal<u8> {
         let _ = NodeBuilder::boxed()
             .layout_override(Rect::new(0.0, y, 100.0, 10.0))
             .bind_style(move |cx| StylePatch {
-                opacity: Some(f32::from(cx.read(&value)) / 255.0),
+                opacity: Some(f32::from(*cx.read(&value)) / 255.0),
                 ..StylePatch::default()
             })
             .build(app.window_mut(*window).expect("window").tree_mut(), root)
@@ -437,7 +437,7 @@ fn bench_frame_incremental_scale(c: &mut Criterion) {
                                     ..PaintSpec::default()
                                 })
                                 .bind_style(move |cx| StylePatch {
-                                    opacity: Some(f32::from(cx.read(&value)) / 255.0),
+                                    opacity: Some(f32::from(*cx.read(&value)) / 255.0),
                                     ..StylePatch::default()
                                 })
                                 .build(
@@ -697,7 +697,7 @@ fn mount_digit_grid(fixture: &mut Fixture) -> Signal<SmolStr> {
                 92.0,
                 13.0,
             ))
-            .bind_text(move |cx| cx.read(&source))
+            .bind_text(move |cx| (*cx.read(&source)).clone())
             .build(app.window_mut(*window).expect("window").tree_mut(), root)
             .expect("bench digit cell");
         }
@@ -747,6 +747,81 @@ fn bench_digit_fast_path_320(c: &mut Criterion) {
     }
 }
 
+/// **B6-2：UI 线程 vs 合成线程的工作拆分**（`--features test-support`）。
+///
+/// 同一个 fixture 跑两次：
+/// - `frame_incremental_10k`（上面那条）：inline 合成 ⇒ UI 线程 = 绘制 + **编码** + 载荷；
+/// - `frame_incremental_10k_ui_thread`：摘掉 inline 合成器 ⇒ UI 线程只到 `SceneDelta` 为止
+///   （编码与载荷构造发生在合成线程里，本机 headless 没有下游可分发的载荷）。
+///
+/// 两个数的差值就是「编码搬离 UI 线程」省下的时间；`encoded_lanes` 仍为 0 证明增量复用没退化。
+fn bench_frame_incremental_10k_ui_thread(c: &mut Criterion) {
+    #[cfg(not(feature = "test-support"))]
+    {
+        // 摘掉 inline 合成器是 `test-support` 的测试入口；默认特性下这条基准不存在。
+        let _ = c;
+    }
+    #[cfg(feature = "test-support")]
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("bench runtime");
+        let handle = runtime.handle().clone();
+        let count = 10_000usize;
+        let mut toggle = 0usize;
+        c.bench_function("frame_incremental_10k_ui_thread", |b| {
+            b.iter_batched(
+                || {
+                    let mut fixture = new_app(&handle);
+                    let _ = mount_boxes(&mut fixture, count);
+                    let signal = mount_fanout(&mut fixture, 1);
+                    let _ = fixture.app.frame(fixture.window);
+                    // 关键：编码器不在 UI 线程（模拟真实窗口的合成线程路径）。
+                    if let Some(window) = fixture.app.window_mut(fixture.window) {
+                        window.detach_composer();
+                    }
+                    (fixture, signal)
+                },
+                |(mut fixture, signal)| {
+                    toggle += 1;
+                    fixture.app.write(&signal, (toggle % 2) as u8);
+                    let outcome = black_box(fixture.app.frame(fixture.window));
+                    (fixture, outcome)
+                },
+                // 先例 `frame_incremental_10k`：fixture 必须交回，否则 drop 落在计时区内。
+                BatchSize::LargeInput,
+            );
+        });
+    }
+}
+
+/// 空转：`idle` 场景的 UI 线程开销（B6-2 的「空闲 CPU <1%」在进程层面由合成线程的空闲等待
+/// 保证；这条基准守住 UI 侧「没有脏位就不做任何工作」）。
+fn bench_idle_frame(c: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("bench runtime");
+    let handle = runtime.handle().clone();
+    c.bench_function("idle_frame", |b| {
+        b.iter_batched(
+            || {
+                let mut fixture = new_app(&handle);
+                let _ = mount_boxes(&mut fixture, 1_000);
+                let _ = fixture.app.frame(fixture.window);
+                fixture
+            },
+            |mut fixture| {
+                // 没有任何脏位：帧门禁必须直接退化为 Idle（零工作）。
+                let outcome = black_box(fixture.app.frame(fixture.window));
+                (fixture, outcome)
+            },
+            BatchSize::LargeInput,
+        );
+    });
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default()
@@ -768,6 +843,8 @@ criterion_group! {
         bench_scroll_1px,
         bench_text_update_320,
         bench_text_pass_320,
-        bench_digit_fast_path_320
+        bench_digit_fast_path_320,
+        bench_frame_incremental_10k_ui_thread,
+        bench_idle_frame
 }
 criterion_main!(benches);

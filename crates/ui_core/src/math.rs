@@ -30,6 +30,12 @@ impl Point {
     pub const fn new(x: f32, y: f32) -> Self {
         Self { x, y }
     }
+
+    /// 两个分量都有限（命中测试的 NaN/∞ 防御入口）。
+    #[must_use]
+    pub fn is_finite(self) -> bool {
+        self.x.is_finite() && self.y.is_finite()
+    }
 }
 
 impl Add for Point {
@@ -139,6 +145,54 @@ impl Rect {
     /// 同 [`Size::is_empty`]（非有限或 `<= 0`）；另外原点非有限（无法绘制）也判空。
     pub fn is_empty(self) -> bool {
         self.size.is_empty() || !self.origin.x.is_finite() || !self.origin.y.is_finite()
+    }
+
+    /// 四边与尺寸都有限（命中测试的 NaN/∞ 防御入口）。
+    #[must_use]
+    pub fn is_finite(self) -> bool {
+        self.origin.x.is_finite()
+            && self.origin.y.is_finite()
+            && self.size.width.is_finite()
+            && self.size.height.is_finite()
+    }
+
+    /// **设备像素对齐**（B7）：四边各自吸附到 `round(dp × scale) / scale`，宽高由吸附后的
+    /// 两条边界**相减**得到。
+    ///
+    /// 语义边界（与"内部尺寸不吸附"配套，见 `NodeTree::set_device_scale`）：
+    /// - 只吸附**边界坐标**（左/上/右/下），因此相邻兄弟共享同一条边界时吸附到同一个设备像素，
+    ///   **不会产生 0.5 px 缝**；
+    /// - 宽高**不**单独 `round(宽 × scale)`：那会让"边界对齐了、内部尺寸却被单独圆整"的两套
+    ///   真相叠加，多层嵌套后误差累积（Skia 的 `roundOut` 只用于外接矩形，也是先算边界）；
+    /// - 非有限 / 非正 scale / 非有限矩形 ⇒ **原样返回**（防御，不做半吊子吸附）。
+    ///
+    /// 取整规则：`floor(v·scale + 0.5)`，与 Skia `SkScalarRoundToScalar`
+    /// （`floorf(x + 0.5f)`）逐位一致；CSS `roundOut`/`roundIn` 是把矩形**向外/向内**扩到像素网格，
+    /// 对相邻盒会同时引入缝隙或重叠，因此引擎用"每边就近吸附"而不是 `roundOut`。
+    #[must_use]
+    pub fn snap_to_device(self, scale: f32) -> Self {
+        if !scale.is_finite() || scale <= 0.0 || !self.is_finite() {
+            return self;
+        }
+        let snap = |value: f32| {
+            let scaled = value * scale;
+            if scaled.is_finite() {
+                (scaled + 0.5).floor() / scale
+            } else {
+                value
+            }
+        };
+        let x0 = snap(self.origin.x);
+        let y0 = snap(self.origin.y);
+        let x1 = snap(self.origin.x + self.size.width);
+        let y1 = snap(self.origin.y + self.size.height);
+        Self {
+            origin: Point { x: x0, y: y0 },
+            size: Size {
+                width: x1 - x0,
+                height: y1 - y0,
+            },
+        }
     }
 
     /// 半开区间判定：`min <= p < max`；空矩形恒 `false`。
@@ -426,6 +480,21 @@ impl Transform {
         }
     }
 
+    /// 绕原点旋转 `radians`（顺时针为正，与屏幕 y 向下一致）。
+    ///
+    /// 只在命中测试的语义测试与应用的 per-draw 变换里用；布局本身不做旋转。
+    pub fn rotate(radians: f32) -> Self {
+        let (sin, cos) = radians.sin_cos();
+        Self {
+            m11: cos,
+            m12: sin,
+            m21: -sin,
+            m22: cos,
+            tx: 0.0,
+            ty: 0.0,
+        }
+    }
+
     /// 复合：先应用 `self`，再应用 `next`（即 `next × self`）。
     pub fn then(self, next: Self) -> Self {
         Self {
@@ -443,6 +512,81 @@ impl Transform {
             x: self.m11 * point.x + self.m21 * point.y + self.tx,
             y: self.m12 * point.x + self.m22 * point.y + self.ty,
         }
+    }
+
+    /// 逆变换（命中测试的必经路径，B7/C11）。
+    ///
+    /// 返回 `None` = **不可逆**：
+    /// - 行列式为 0 / 非有限（`scale(0, …)`、退化投影、NaN 输入）；
+    /// - 相对奇异（`|det| <= ε·‖A‖²`）：吸附到机器精度的"压扁"变换，求逆会放大成 1e7 级坐标，
+    ///   命中判定失去意义。调用方（`layout::hit_test`）必须**跳过该子树并记账诊断**，
+    ///   不得 panic，也不得把点当作命中。
+    ///
+    /// 数学：列向量约定 `p' = A·p + t` ⇒ `p = A⁻¹·(p' − t)`，
+    /// `A⁻¹ = 1/det · [m22, −m21; −m12, m11]`。
+    #[must_use]
+    pub fn inverse(self) -> Option<Self> {
+        let det = self.m11 * self.m22 - self.m12 * self.m21;
+        let norm = self
+            .m11
+            .abs()
+            .max(self.m12.abs())
+            .max(self.m21.abs())
+            .max(self.m22.abs());
+        if !det.is_finite() || !norm.is_finite() {
+            return None;
+        }
+        if norm == 0.0 || det.abs() <= f32::EPSILON * norm * norm {
+            return None;
+        }
+        let inv = 1.0 / det;
+        Some(Self {
+            m11: self.m22 * inv,
+            m12: -self.m12 * inv,
+            m21: -self.m21 * inv,
+            m22: self.m11 * inv,
+            tx: (self.m21 * self.ty - self.m22 * self.tx) * inv,
+            ty: (self.m12 * self.tx - self.m11 * self.ty) * inv,
+        })
+    }
+
+    /// 该变换是否可逆（[`Transform::inverse`] 的谓词形态；诊断/测试用）。
+    #[must_use]
+    pub fn is_invertible(self) -> bool {
+        self.inverse().is_some()
+    }
+
+    /// 矩形经该变换后的**轴对齐包围盒**（四角变换后取 min/max）。
+    ///
+    /// 非有限输入 / 非有限输出 ⇒ 返回空矩形（调用方必须把它当"不可命中"而不是"命中原点"）。
+    #[must_use]
+    pub fn transform_rect(self, rect: Rect) -> Rect {
+        let corners = [
+            self.apply(rect.min()),
+            self.apply(Point::new(rect.max().x, rect.min().y)),
+            self.apply(rect.max()),
+            self.apply(Point::new(rect.min().x, rect.max().y)),
+        ];
+        if corners.iter().any(|corner| !corner.is_finite()) {
+            return Rect::default();
+        }
+        let x0 = corners
+            .iter()
+            .map(|corner| corner.x)
+            .fold(f32::INFINITY, f32::min);
+        let y0 = corners
+            .iter()
+            .map(|corner| corner.y)
+            .fold(f32::INFINITY, f32::min);
+        let x1 = corners
+            .iter()
+            .map(|corner| corner.x)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let y1 = corners
+            .iter()
+            .map(|corner| corner.y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        Rect::new(x0, y0, x1 - x0, y1 - y0)
     }
 
     /// `[m11, m12, m21, m22, tx, ty]`，与 uniform 契约前 6 项同序。
@@ -1103,7 +1247,104 @@ mod tests {
     fn size_is_empty_non_finite() {
         assert!(Size::new(f32::INFINITY, 4.0).is_empty());
         assert!(Size::new(4.0, f32::NEG_INFINITY).is_empty());
-        assert!(Size::new(f32::NAN, 4.0).is_empty());
+        assert!(Size::new(4.0, f32::NAN).is_empty());
         assert!(!Size::new(4.0, 4.0).is_empty());
+    }
+
+    // ── B7：设备像素吸附（只吸附边界）────────────────────────────────────
+
+    #[test]
+    fn snap_rounds_edges_not_sizes() {
+        // 10.3dp @2x = 20.6px → 21px → 10.5dp；宽高由吸附后的边相减（10.6 − 0 = 10.5）。
+        let snapped = Rect::new(0.0, 0.0, 10.3, 4.4).snap_to_device(2.0);
+        assert_eq!(snapped, Rect::new(0.0, 0.0, 10.5, 4.5));
+
+        // 边界坐标 3.3 @1x → 3；宽 2.6 → 右边界 5.9 → 6 ⇒ 宽 3（不是 round(2.6)=3 的巧合）。
+        let fractional = Rect::new(3.3, 0.7, 2.6, 1.2).snap_to_device(1.0);
+        assert_eq!(fractional, Rect::new(3.0, 1.0, 3.0, 1.0));
+
+        // **区分"吸附边界"与"吸附尺寸"的判例**：原点与宽都 < 0.5，但右边界跨过半像素。
+        // 边界语义：左 0.3→0、右 0.6→1 ⇒ 宽 1（0.3 + 0.3 会得到宽 0 —— 那是错误实现）。
+        let edge_only = Rect::new(0.3, 0.0, 0.3, 0.3).snap_to_device(1.0);
+        assert_eq!(
+            edge_only,
+            Rect::new(0.0, 0.0, 1.0, 0.0),
+            "必须吸附右/下**边界**（0.6 → 1），而不是把宽度 0.3 单独圆整成 0"
+        );
+    }
+
+    #[test]
+    fn snap_keeps_adjacent_edges_coincident() {
+        // 相邻兄弟共享同一条逻辑边界 ⇒ 吸附后仍然逐位相同（无 0.5px 缝）。
+        let left = Rect::new(0.0, 0.0, 10.3, 5.0).snap_to_device(1.0);
+        let right = Rect::new(10.3, 0.0, 9.7, 5.0).snap_to_device(1.0);
+        assert_eq!(left.max().x, right.min().x);
+        assert_eq!(left.size.width + right.size.width, 20.0);
+    }
+
+    #[test]
+    fn snap_is_idempotent_and_defensive() {
+        let rect = Rect::new(1.3, 2.7, 3.1, 4.9);
+        let once = rect.snap_to_device(1.5);
+        assert_eq!(once.snap_to_device(1.5), once, "吸附必须幂等");
+        // NaN 与自身不相等：逐字段断言"原样返回"。
+        let nan = Rect::new(f32::NAN, 0.0, 1.0, 1.0).snap_to_device(1.5);
+        assert!(
+            nan.origin.x.is_nan() && nan.origin.y == 0.0 && nan.size.width == 1.0,
+            "非有限矩形原样返回（不制造半吊子吸附）：{nan:?}"
+        );
+        assert_eq!(rect.snap_to_device(0.0), rect, "非法 scale 原样返回");
+        assert_eq!(rect.snap_to_device(f32::NAN), rect);
+    }
+
+    // ── C11：Transform::inverse / transform_rect ─────────────────────────
+
+    #[test]
+    fn transform_inverse_roundtrips_points() {
+        let transform = Transform::translate(12.0, -7.0)
+            .then(Transform::scale(2.0, 0.5))
+            .then(Transform::rotate(std::f32::consts::FRAC_PI_4));
+        let inverse = transform.inverse().expect("仿射可逆");
+        for point in [
+            Point::new(0.0, 0.0),
+            Point::new(13.0, 21.0),
+            Point::new(-5.5, 3.25),
+        ] {
+            let roundtrip = inverse.apply(transform.apply(point));
+            assert!(
+                (roundtrip.x - point.x).abs() < 1e-4 && (roundtrip.y - point.y).abs() < 1e-4,
+                "{point:?} → {roundtrip:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn degenerate_transforms_have_no_inverse() {
+        assert!(
+            Transform::scale(0.0, 1.0).inverse().is_none(),
+            "压扁到零面积的变换不可逆"
+        );
+        assert!(!Transform::scale(0.0, 1.0).is_invertible());
+        assert!(
+            Transform::scale(f32::NAN, 1.0).inverse().is_none(),
+            "NaN 变换不可逆（不得 panic）"
+        );
+        assert!(
+            Transform::scale(f32::INFINITY, 1.0).inverse().is_none(),
+            "∞ 变换不可逆"
+        );
+        assert_eq!(
+            Transform::scale(0.0, 1.0).transform_rect(Rect::new(0.0, 0.0, 10.0, 10.0)),
+            Rect::new(0.0, 0.0, 0.0, 10.0),
+            "退化变换的包围盒是零宽矩形（不是 NaN）"
+        );
+    }
+
+    #[test]
+    fn transform_rect_is_aabb_of_corners() {
+        let rotated = Transform::rotate(std::f32::consts::FRAC_PI_4);
+        let bounds = rotated.transform_rect(Rect::new(0.0, 0.0, 10.0, 10.0));
+        assert!((bounds.size.width - 14.1421).abs() < 1e-3, "{bounds:?}");
+        assert!((bounds.size.height - 14.1421).abs() < 1e-3, "{bounds:?}");
     }
 }

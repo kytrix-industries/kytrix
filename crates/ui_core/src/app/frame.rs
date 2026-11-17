@@ -49,6 +49,12 @@ pub(crate) fn frame(app: &mut App, window: WindowId) -> Option<Result<FrameOutco
     if !app.windows.contains_key(&window) {
         return None;
     }
+    // B6-2：合成线程的**内容错误**（clip 链超限等）在这里冒泡。编码已不在 UI 线程，错误只能
+    // 经合成线程的错误槽回到 UI；本帧不再推进（错误是粘性的，调用方处理之后下一帧重试）。
+    if let Some(error) = crate::render::compositor_thread::compositor().take_error() {
+        app.record_idle(window);
+        return Some(Err(error));
+    }
     // R02-5：把未消费的事件在交给 `on_frame` 钩子之后再兜底有界化一次（正常推入就已经有界，
     // 这里是 O(1) 的防御；钩子可能持有上一轮的事件引用做重放，所以裁剪放在帧入口）。
     app.events.trim();
@@ -183,6 +189,11 @@ pub(crate) fn frame(app: &mut App, window: WindowId) -> Option<Result<FrameOutco
             // 编码器侧的增量字节数；渲染器路径会用载荷的实际字节数覆盖它
             // （`Window::submit_gpu`；headless 保持编码器侧值）。
             uploaded_bytes: paint.uploaded_bytes,
+            // B6-2 的三个合成观测字段：`submit_gpu` 在发布时按合成路径回填
+            // （inline ⇒ encode_on_compositor = false；threaded ⇒ 读合成线程计数）。
+            compositor_thread_wait: None,
+            encode_on_compositor: false,
+            scroll_offset_frames: 0,
         };
         let Some(target) = app.windows.get_mut(&window) else {
             app.abort_frame(window, ticket);

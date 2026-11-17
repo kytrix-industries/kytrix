@@ -1,5 +1,16 @@
-//! a11y 直连：`accesskit_windows::Adapter` + `WM_GETOBJECT` 接线
-//! （`design/phase-11-a11y.md` §8）。
+//! a11y 直连：`accesskit_windows::Adapter` + `WM_GETOBJECT` 接线。
+//!
+//! # 坐标系（UIA 的屏幕绝对像素）
+//!
+//! `accesskit_windows` 负责把节点 bounds 换算到 UIA 的屏幕坐标：`util.rs` 的
+//! `client_top_left(hwnd)` 调 `ClientToScreen`，节点 bounds 是**客户区相对物理像素**，
+//! UIA 侧得到的是**屏幕绝对物理像素**（逐条核对过 `accesskit_windows-0.35.2` 源码）。
+//! 因此引擎侧只需保证：`a11y::mapping::bounds_of` 输出客户区相对、物理像素（逻辑 ×
+//! `Window::scale`，逐边 round）—— exe 内嵌 PMv2 清单 + 运行时 DPI 感知调用保证
+//! `ClientToScreen` 在 per-monitor DPI 下返回物理像素。
+//!
+//! 真机验证项（本仓 CI 断言不到）：讲述人 / NVDA 读到 `BoundingRectangle` 与窗口在屏幕上的
+//! 实际位置一致（跨 DPI 混合屏拖动窗口后再读一次）。
 //!
 //! 三条纪律：
 //! 1. **首显前构造**：`Adapter::new` 必须在 `ShowWindow` 之前调用（它内部 `init_uia()`，

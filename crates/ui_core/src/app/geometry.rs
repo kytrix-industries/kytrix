@@ -171,7 +171,7 @@ mod tests {
         app: &TestApp,
         window: crate::window::WindowId,
     ) -> Option<crate::paint::instance::PhysicalBounds> {
-        let payload = app.app().window(window)?.instance_buffer();
+        let payload = app.app().window(window)?.instance_buffer()?;
         payload.ops().iter().find_map(|op| match op {
             FrameOp::Geometry { bounds, .. } => Some(*bounds),
             FrameOp::Instances { .. } => None,

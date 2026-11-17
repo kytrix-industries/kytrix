@@ -136,7 +136,7 @@ fn damage_is_local_and_idle_is_zero_frame() {
                 ..PaintSpec::default()
             })
             .bind_style(move |cx| StylePatch {
-                background: Some(cx.read(&background)),
+                background: Some(*cx.read(&background)),
                 ..StylePatch::default()
             })
             .id("label")

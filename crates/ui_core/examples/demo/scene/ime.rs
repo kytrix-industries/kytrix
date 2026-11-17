@@ -280,7 +280,7 @@ pub(crate) fn build(
         text_style(17.0, 400, TEXT_RGBA),
         move |cx| {
             let value = cx.read(&field);
-            value.display(cx.read(&focused))
+            value.display(*cx.read(&focused))
         },
     );
     let _ = card::bound_label(

@@ -42,7 +42,9 @@ VsOut vs_main(uint vertex_id : SV_VertexID, uint instance_id : SV_InstanceID) {
     float2 uv_t = (world_px - full_lo) / max(full_hi - full_lo, float2(1e-6, 1e-6));
 
     VsOut o;
-    o.position = float4(to_ndc(world_px), 0.0, 1.0);
+    // B6-2 合成端滚动偏移：偏移只作用在最终的屏幕映射上，local_px / uv / clip 判定全部留在
+    // **烘焙坐标空间**（实例字节里与偏移无关），因此滚动帧不需要重编码任何实例。
+    o.position = float4(to_ndc(world_px + frame.params.yz), 0.0, 1.0);
     o.local_px = world_px - center;
     o.uv = lerp(p.uv.xy, p.uv.zw, uv_t);
     o.instance = instance_id + base;

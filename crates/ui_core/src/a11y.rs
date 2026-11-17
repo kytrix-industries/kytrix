@@ -1,4 +1,4 @@
-//! 无障碍（AccessKit）契约：角色、节点、补丁、动作与快照（`design/phase-11-a11y.md`）。
+//! 无障碍（AccessKit）契约：角色、节点、补丁、动作与快照。
 //!
 //! 本文件是**公共模块根**：全部公开契约类型定义在这里，实现放子模块
 //! （`tree` 快照构建 / `mapping` 映射表 / `adapter` `TreeUpdate` 组装 / `action` 动作分发）。
@@ -17,15 +17,19 @@ use crate::{
 
 /// a11y 角色（引擎侧，`accesskit::Role` 的子集）。
 ///
-/// 只包含引擎**真实会产生**的角色（27 个）；不含 `Unknown`，也不含 130+ 个 HTML/Doc 角色——
-/// 加变体必须同时给 `a11y::mapping` 的穷举 `match` 补分支（编译期强制，不会静默落到 `Unknown`）。
+/// 只包含引擎**真实会产生或应用会显式声明**的角色（表头 / 文本运行 / 表格三级都在内）；
+/// 不含 `Unknown`，也不含 130+ 个 HTML/Doc 角色 —— 加变体必须同时给 `a11y::mapping` 的穷举
+/// `match` 补分支（编译期强制，不会静默落到 `Unknown`），并把变体加进 [`A11yRole::ALL`]
+/// （`every_role_is_included_exactly_once_in_all` 用它做编译期锚定；不要在任何地方写死角色个数）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum A11yRole {
     /// 窗口根（`TreeInfo.root`）。
     Window,
     /// 应用本身（少见，显式声明时用）。
     Application,
-    /// 纯布局容器（AccessKit 侧透明：子节点上提到祖父）。
+    /// 纯布局容器。AccessKit 消费端会把它当作 `none`/`presentation` 语义忽略，但引擎仍会为
+    /// 它发节点（带宽成本）—— 这条注释以前写成"子节点上提到祖父"，实现里从未做过（R13-15），
+    /// 现在按事实描述：**引擎不做上提**，`children` 只过滤 `hidden`，不折叠容器。
     GenericContainer,
     /// 语义分组（容器要「出现」在 AT 树里时用）。
     Group,
@@ -61,9 +65,26 @@ pub enum A11yRole {
     Grid,
     /// 表格行 / 网格行（**仅**真实表格：`Row` 必须位于 `Table`/`Grid`/`TreeGrid` 内）。
     /// 虚拟列表的行仍用 `ListBoxOption`，位置走 `pos_in_set` / `size_of_set`。
+    ///
+    /// 表格语境下的 `row_index` 由引擎从"在父节点 children 里的序号"**自动推导**（应用显式
+    /// 声明优先），`row_count` 由表节点的行数推导 —— 交易表格不必逐行手填。
     Row,
     /// 单元格（表格 / 网格里的格子，配合 `row_index` / `column_index`）。
+    ///
+    /// `column_index` / `row_index` 同样自动推导：列 = 在父行 children 里的序号，行 = 父行的行号。
     Cell,
+    /// 列头单元格（表格的 `<th>`；`aria-sort` 挂在它上面）。
+    ///
+    /// UIA 的 `ITableItemProvider::GetColumnHeaderItems` / AT-SPI 的 `getColumnHeader` 由角色
+    /// 推导出来，没有这个角色时列名永远到不了 AT（R13-3）。
+    ColumnHeader,
+    /// 行头单元格（表格最左列的行标题）。
+    RowHeader,
+    /// 文本运行（一段可被逐字符/逐词选择的文本；`character_lengths` / `word_starts` /
+    /// `text_selection` 的唯一合法宿主，见 AccessKit 的 `TextPosition.node` 约束）。
+    ///
+    /// 引擎**自动**把"父节点角色是 `TextInput`/`MultilineTextInput` 的文本节点"推导成它。
+    TextRun,
     /// 滚动容器。
     ScrollView,
     /// 滚动条。
@@ -80,6 +101,99 @@ pub enum A11yRole {
     Dialog,
     /// 工具提示。
     Tooltip,
+}
+
+impl A11yRole {
+    /// 全部角色（**唯一**的"角色全集"来源）。
+    ///
+    /// 这个常量是穷举测试的锚点：`every_role_is_included_exactly_once_in_all`
+    /// （`a11y::mapping`）用一个**穷举 `match`** 给每个变体计数并与本数组求和比对 ——
+    /// 少列一个变体 ⇒ 求和偏小 ⇒ 测试红；加一个变体忘了加进 `ALL` ⇒ 编译期
+    /// `non-exhaustive patterns` 先报错。这正是 R13-11 要求的"手写数组不再假绿"。
+    pub const ALL: [Self; 32] = [
+        Self::Window,
+        Self::Application,
+        Self::GenericContainer,
+        Self::Group,
+        Self::Label,
+        Self::Paragraph,
+        Self::Heading,
+        Self::Button,
+        Self::TextInput,
+        Self::MultilineTextInput,
+        Self::CheckBox,
+        Self::Switch,
+        Self::RadioButton,
+        Self::Slider,
+        Self::ProgressIndicator,
+        Self::List,
+        Self::ListBoxOption,
+        Self::Table,
+        Self::Grid,
+        Self::Row,
+        Self::Cell,
+        Self::ColumnHeader,
+        Self::RowHeader,
+        Self::TextRun,
+        Self::ScrollView,
+        Self::ScrollBar,
+        Self::Image,
+        Self::Menu,
+        Self::MenuBar,
+        Self::MenuItem,
+        Self::Dialog,
+        Self::Tooltip,
+    ];
+}
+
+/// 表格表头的排序状态（`aria-sort` 的等价物；`accesskit::SortDirection` 的子集）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum A11ySort {
+    /// 升序。
+    Ascending,
+    /// 降序。
+    Descending,
+    /// 可排序但当前未排序（`aria-sort="none"`）。
+    None,
+}
+
+/// 文本选区（**UTF-8 字节偏移**，落在文本自身；引擎在 a11y 层换算成 grapheme 下标）。
+///
+/// 退化选区（`anchor == focus`）就是 caret。偏移不必落在 char boundary：换算时向下吸附到
+/// 所在 grapheme 的起点（AT 传进来的位置来自它自己维护的字符表，可能是旧快照）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct A11yTextSelection {
+    /// 选区起点（不随扩展/收缩改变）。
+    pub anchor: usize,
+    /// 活动端（无选区时 = caret 位置）。
+    pub focus: usize,
+}
+
+/// 一个自定义动作（`accesskit::CustomAction` 的 id + 给 AT 读的名字）。
+///
+/// `A11yAction::Custom(id)` 只是"能力"（`Copy + Eq + Hash` 的 handler 键）；要真正出现在
+/// 读屏器的动作列表里，必须用本结构注册 id 与人类可读名字（R13-4）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct A11yCustomAction {
+    /// 动作 id（与 `A11yAction::Custom(id)` 对应）。
+    pub id: i32,
+    /// 给 AT 读的动作名（"加入自选" / "取消订单"）。
+    pub label: SmolStr,
+}
+
+/// 滚动容器的 a11y 状态（`accesskit::Node` 的 `scroll_*` 属性组）。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct A11yScroll {
+    /// 水平偏移（逻辑像素，向 AT 报告的是**物理像素**）。
+    pub x: f32,
+    /// 垂直偏移。
+    pub y: f32,
+    /// 水平可用范围上界（`content - viewport`，`>= 0`）。
+    pub x_max: f32,
+    /// 垂直可用范围上界。
+    pub y_max: f32,
+    /// 轴向（`true` = 垂直）。
+    pub vertical: bool,
 }
 
 /// 可访问名的**写入通道**：决定 `accesskit::Node` 侧写 `set_label` 还是 `set_value`。
@@ -161,7 +275,7 @@ pub enum A11yAction {
 
 /// 挂载时一次写入的**静态** a11y 声明（`NodeBuilder::a11y`）。
 ///
-/// 与 [`A11yPatch`] 同构：静态给默认值、动态覆盖（合并规则见 `design/phase-11-a11y.md` §4.3）。
+/// 与 [`A11yPatch`] 同构：静态给默认值、动态覆盖（`patch` > `over` > 由节点种类/结构推导）。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct A11yOverride {
     /// 覆盖由节点种类推导出的角色（唯一的「强制角色」入口）。
@@ -204,6 +318,34 @@ pub struct A11yOverride {
     pub hidden: bool,
     /// 应用强制禁用。
     pub disabled: bool,
+    /// **稳定身份键**（与 `A11yPatch::key` 同义）：节点被删掉重建时用它把 a11y id 固定下来。
+    ///
+    /// 引擎对虚拟列表的行**自动**生成键（容器 + 条目下标）；只有"自己管理节点生命周期、
+    /// 又希望 AT 认为它是同一个元素"的应用才需要显式给（例如应用层虚拟化的表格）。
+    pub key: Option<u64>,
+    /// 表头排序状态（`aria-sort`）。
+    pub sort: Option<A11ySort>,
+    /// 文本选区 / caret（UTF-8 字节偏移；只对文本节点有意义）。
+    pub selection: Option<A11yTextSelection>,
+    /// 自定义动作（id + 名字）：`A11yAction::Custom(id)` 的能力登记。
+    pub custom_actions: Vec<A11yCustomAction>,
+    /// 只读（`accesskit::Node::set_read_only`）。
+    pub read_only: bool,
+    /// 模态（`set_modal`；对话框/浮层用）。
+    pub modal: bool,
+    /// 忙碌（`set_busy`；异步加载中的区域）。
+    pub busy: bool,
+    /// 非法值（`set_invalid`；表单校验失败的字段）。
+    pub invalid: bool,
+    /// 错误信息节点（`set_error_message` 收的是**节点关系**：指向展示错误文本的节点）。
+    ///
+    /// AccessKit 的 `ErrorMessage` 是 `NodeId` 关系（对应 `aria-errormessage`），不是字符串；
+    /// 引擎在构建时把引擎句柄换算成稳定 a11y id（目标已卸载则丢弃）。
+    pub error_message: Option<NodeId>,
+    /// 占位符（`set_placeholder`；输入框的预期输入提示）。
+    pub placeholder: Option<SmolStr>,
+    /// 标题层级（`set_level`；`Heading` 用）。
+    pub level: Option<usize>,
 }
 
 /// `bind_a11y` 每帧求值的**动态**补丁（值语义；`None` = 本帧不覆盖）。
@@ -260,6 +402,28 @@ pub struct A11yPatch {
     pub numeric_value_jump: Option<f64>,
     /// 覆盖动作表。
     pub actions: Option<Vec<A11yAction>>,
+    /// **稳定身份键**（与 `A11yOverride::key` 同义；虚拟列表行由引擎自动生成）。
+    pub key: Option<u64>,
+    /// 表头排序状态（`aria-sort`）。
+    pub sort: Option<A11ySort>,
+    /// 文本选区 / caret（UTF-8 字节偏移）。
+    pub selection: Option<A11yTextSelection>,
+    /// 自定义动作（id + 名字）。
+    pub custom_actions: Option<Vec<A11yCustomAction>>,
+    /// 只读。
+    pub read_only: Option<bool>,
+    /// 模态。
+    pub modal: Option<bool>,
+    /// 忙碌。
+    pub busy: Option<bool>,
+    /// 非法值。
+    pub invalid: Option<bool>,
+    /// 错误信息节点（节点关系；目标必须在树里，否则本笔丢弃）。
+    pub error_message: Option<NodeId>,
+    /// 占位符。
+    pub placeholder: Option<SmolStr>,
+    /// 标题层级。
+    pub level: Option<usize>,
 }
 
 /// 实时区域（live region）的播报策略。
@@ -275,34 +439,26 @@ pub enum A11yLive {
     Assertive,
 }
 
-/// a11y 侧的节点身份：编码 = 引擎 `NodeId::to_bits()`（`(generation << 32) | index`）。
+/// a11y 侧的节点身份：由 [`identity`] 的分配器发放的**稳定 id**（`1..`，永不复用）。
 ///
-/// 与 `accesskit::NodeId(pub u64)` **同构**（后者字段是 pub），因此不需要 node→NodeId 的映射表，
-/// 并且天然带代际：陈旧句柄解码后 `tree.get(..)` 失败 ⇒ 该 `ActionRequest` 被忽略。
+/// 与渲染 `NodeId` **解耦**：`NodeId` 编码的是 arena `(generation, index)`，槽位复用与虚拟列表
+/// 回收都会变；AT 依赖"同一语义元素 = 同一 id"，因此 a11y 身份必须跨重建稳定（审查 §5.7 /
+/// R13-1）。反查表（稳定 id → 引擎句柄）在 `A11yBridge` 的分配器里，`ActionRequest` 解码走它，
+/// 陈旧 / 未挂载的 id 返回 `None` ⇒ `StaleAction` 诊断。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct A11yNodeId(u64);
 
 impl A11yNodeId {
-    /// 从引擎句柄构造。
+    /// 从分配器发放的稳定 id 构造（`a11y::identity` 是唯一生产者）。
     #[must_use]
-    pub const fn from_engine(node: NodeId) -> Self {
-        Self(node.to_bits())
+    pub(crate) const fn from_stable(id: u64) -> Self {
+        Self(id)
     }
 
     /// 原始位模式（逐字节与 `accesskit::NodeId` 相同）。
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
-    }
-
-    /// 从原始位模式构造（crate 内：解码 `accesskit::NodeId` 时用）。
-    pub(crate) const fn from_bits(bits: u64) -> Self {
-        Self(bits)
-    }
-
-    /// 解码回引擎句柄（代际 0 的编码非法 ⇒ `None`）。
-    pub(crate) const fn to_engine(self) -> Option<NodeId> {
-        NodeId::from_bits(self.0)
     }
 }
 
@@ -361,6 +517,37 @@ pub struct A11yNode {
     /// 步进/跳转幅度（AT 的「加一步 / 加大步」用；缺省时 UIA 的 `SmallChange` 为 0）。
     pub numeric_value_step: Option<f64>,
     pub numeric_value_jump: Option<f64>,
+    /// 表头排序状态（`aria-sort`；`None` = 不表态）。
+    pub sort: Option<A11ySort>,
+    /// 滚动状态（`ScrollView` / 虚拟列表容器；`None` = 不是滚动容器）。
+    pub scroll: Option<A11yScroll>,
+    /// 该节点裁剪后代（`Clip::Bounds` 的滚动容器 / 裁剪盒）：`set_clips_children`。
+    pub clips_children: bool,
+    /// 自定义动作注册表（id + 名字；`to_accesskit` 用它写 `push_custom_action`）。
+    pub custom_actions: Vec<A11yCustomAction>,
+    /// 文本的**逐字符（grapheme）UTF-8 字节长度**（`accesskit::Node::character_lengths`）。
+    ///
+    /// 仅在该节点的 `value` 就是这段文本时有意义（`Label` / `TextRun` / 文本输入框）：
+    /// `Σ character_lengths == value.len()` 是 AccessKit 的硬约束。
+    pub character_lengths: Vec<u8>,
+    /// 每个词的起始字符下标（`accesskit::Node::word_starts`；升序，`u8` 上限见 AccessKit）。
+    pub word_starts: Vec<u8>,
+    /// 文本选区 / caret（**grapheme 下标**，已由字节偏移换算；`None` = 不表态）。
+    pub text_selection: Option<A11yTextSelection>,
+    /// 只读（`set_read_only`）。
+    pub read_only: bool,
+    /// 模态（`set_modal`）。
+    pub modal: bool,
+    /// 忙碌（`set_busy`）。
+    pub busy: bool,
+    /// 非法值（`set_invalid`）。
+    pub invalid: bool,
+    /// 错误信息节点（`set_error_message` 的 NodeId 关系）。
+    pub error_message: Option<A11yNodeId>,
+    /// 占位符（`set_placeholder`）。
+    pub placeholder: Option<SmolStr>,
+    /// 标题层级（`set_level`）。
+    pub level: Option<usize>,
     /// 引擎侧的**直接**子节点（未过滤）。
     pub children: Vec<A11yNodeId>,
     /// 父节点。
@@ -383,6 +570,8 @@ impl A11yNode {
 pub struct A11yTreeSnapshot {
     /// 本次是否发出全树。
     pub full: bool,
+    /// 窗口根的稳定 id（`TreeInfo.root` 用它；根恒在树里）。
+    pub root: A11yNodeId,
     /// 本次发出的节点（祖先先于后代；全树笔是 DFS 先序）。
     pub nodes: Vec<A11yNode>,
     /// 焦点身份（恒存在，见设计 §6.3）。
@@ -429,11 +618,30 @@ impl A11yTreeSnapshot {
         &self.focus_node
     }
 
+    /// 引擎句柄 → 本快照里的稳定 id（查 `nodes` 与独立的 `focus_node`）。
+    ///
+    /// 测试与诊断从引擎句柄出发断言 a11y 语义时用它，而不是自己编码 id
+    /// （身份由 `a11y::identity` 分配，编码细节不是公开契约）。
+    #[must_use]
+    pub fn id_for_engine(&self, engine: NodeId) -> Option<A11yNodeId> {
+        self.nodes
+            .iter()
+            .find(|node| node.engine == engine)
+            .map(|node| node.id)
+            .or_else(|| (self.focus_node.engine == engine).then_some(self.focus_node.id))
+    }
+
+    /// 本批里某角色的全部节点（语义断言用："所有 `Cell` 的列号必须从 0 连续"）。
+    pub fn nodes_with_role(&self, role: A11yRole) -> impl Iterator<Item = &A11yNode> {
+        self.nodes.iter().filter(move |node| node.role == role)
+    }
+
     /// 未被 `hidden` 覆盖的节点：**自身与祖先链**在本快照内都没有 `hidden`。
     ///
-    /// 增量的快照只含变更节点 + 祖先，因此「祖先不在本笔里」的节点按可见处理
-    /// （平台侧的 `set_hidden` 才是权威；这里给测试一个不撒谎的可见性视图）。
-    pub fn visible_nodes(&self) -> impl Iterator<Item = &A11yNode> {
+    /// 名字里的 `in_batch` 是刻意的（R13-28）：增量的快照只含变更节点 + 祖先，因此
+    /// 「祖先不在本笔里」的节点按可见处理 —— 这个视图描述的是**本批**，不是整棵树。整棵树的
+    /// 可见性断言请用 `full == true` 的那一笔，或直接用平台侧的 `set_hidden` 语义。
+    pub fn visible_nodes_in_batch(&self) -> impl Iterator<Item = &A11yNode> {
         let hidden: ahash::HashSet<A11yNodeId> = self
             .nodes
             .iter()
@@ -512,6 +720,33 @@ pub enum A11yDiagnostic {
         /// 原焦点节点。
         node: NodeId,
     },
+    /// 两个**同时存活**的节点声明了同一个稳定身份键（`A11yOverride::key` / `A11yPatch::key`）。
+    ///
+    /// 后到的节点拿新 id 并保留本诊断（不顶替前者：顶替会让 AT 把两行当成同一行）。
+    DuplicateKey {
+        /// 声明冲突键的节点。
+        node: NodeId,
+    },
+    /// 节点宣告了 `A11yAction::Custom(id)`，但没有登记对应的 `A11yCustomAction { id, label }`。
+    ///
+    /// 这种"半残动作"在 AT 侧不可见（AccessKit 只暴露 `CustomAction` 类别，动作名来自
+    /// `push_custom_action`），旧实现完全静默（R13-4）。
+    UnregisteredCustomAction {
+        /// 节点。
+        node: NodeId,
+        /// 未登记的 id。
+        id: i32,
+    },
+    /// 对**禁用**节点发来的会改变状态的动作（已忽略，R13-16）。
+    ///
+    /// 宣告 `disabled` 后 AT 仍可能发 `Click`（NVDA 的"激活"）；引擎必须在唯一入口挡下，
+    /// 而不是让应用 handler 真的下单。
+    DisabledAction {
+        /// 节点。
+        node: NodeId,
+        /// 被拒绝的动作。
+        action: A11yAction,
+    },
 }
 
 /// a11y 动作的 payload（强类型；替代 `accesskit::ActionData` 的公开面）。
@@ -587,18 +822,39 @@ impl<'a> A11yActionCtx<'a> {
         self.data
     }
 
-    /// **非追踪**读（handler 不是渲染 pass，不登记依赖）。
-    pub fn read<T: Clone + 'static>(&self, signal: &crate::node::signal::Signal<T>) -> T {
+    /// **非追踪**读（handler 不是渲染 pass，不登记依赖），返回读守卫（零拷贝）。
+    ///
+    /// 借用规则见 `node::signal` 模块文档：守卫不借用 `A11yActionCtx`，但存活期间对同一信号的
+    /// 写会 panic（显式借用冲突，不静默拷贝）。
+    pub fn read<T: 'static>(
+        &self,
+        signal: &crate::node::signal::Signal<T>,
+    ) -> crate::node::signal::SignalRef<T> {
         self.app.read(signal)
     }
 
     /// 写状态（`App::write` 的转调：等值短路 + 依赖反查 + 唤醒）。
+    ///
+    /// # Panics
+    /// 该信号存在活跃读守卫。
     pub fn write<T: Clone + PartialEq + 'static>(
         &mut self,
         signal: &crate::node::signal::Signal<T>,
         value: T,
     ) -> bool {
         self.app.write(signal, value)
+    }
+
+    /// 原地更新状态（`App::update` 的转调：无等值短路）。
+    ///
+    /// # Panics
+    /// 该信号存在活跃读守卫。
+    pub fn update<T: 'static>(
+        &mut self,
+        signal: &crate::node::signal::Signal<T>,
+        update: impl FnOnce(&mut T),
+    ) -> bool {
+        self.app.update(signal, update)
     }
 
     /// 其余能力（滚动 / 焦点 / 浮层）走 `&mut App`。
@@ -620,5 +876,7 @@ impl std::fmt::Debug for A11yActionCtx<'_> {
 
 pub(crate) mod action;
 pub(crate) mod adapter;
+pub(crate) mod identity;
 pub(crate) mod mapping;
+pub(crate) mod textrun;
 pub(crate) mod tree;

@@ -9,7 +9,7 @@ use super::App;
 use crate::node::dependency::DependencyGraph;
 use crate::node::{
     dependency::ReadCtx,
-    signal::{Derived, Signal, Transient},
+    signal::{Derived, Signal, SignalRef, SignalScope, Transient},
 };
 
 /// 依赖图（只读；`test-support` 的 `diagnostics::dependency_dump` 用）。
@@ -21,10 +21,23 @@ pub(crate) fn dependency_graph(app: &App) -> &DependencyGraph {
 
 // ── 状态注册 ──────────────────────────────────────────────────────────────
 
-/// 建一个普通信号（id 稠密递增，条目永不删除）。
+/// 建一个普通信号（id 稠密递增，条目永不删除；归属根作用域，永不释放）。
 /// 消费者：`App::signal`。
 pub(crate) fn signal<T: Clone + 'static>(app: &mut App, initial: T) -> Signal<T> {
     let id = app.store.push_owned(initial);
+    Signal::new(id)
+}
+
+/// 建一个**作用域内**的普通信号（窗口 / 面板 / 对话框的生命周期）。
+///
+/// 作用域释放后写是 no-op（不标脏、不唤醒），见 [`SignalScope`]。
+/// 消费者：`App::signal_scoped`。
+pub(crate) fn signal_scoped<T: Clone + 'static>(
+    app: &mut App,
+    scope: SignalScope,
+    initial: T,
+) -> Signal<T> {
+    let id = app.store.push_owned_scoped(scope, initial);
     Signal::new(id)
 }
 
@@ -47,14 +60,40 @@ pub(crate) fn derived<T: Clone + 'static>(
     Derived::new(id)
 }
 
+/// 新建一个信号作用域（窗口 / 面板 / 对话框的自有生命周期）。
+/// 消费者：`App::signal_scope`。
+pub(crate) fn signal_scope(app: &mut App) -> SignalScope {
+    app.store.new_scope()
+}
+
+/// 释放信号作用域：其信号的写从此是 no-op，依赖图里以它们为键的边**立即**删除。
+///
+/// 返回被释放的信号数。重复释放返回 0（幂等）。
+/// 消费者：`App::release_scope` / `App::close_window`。
+pub(crate) fn release_scope(app: &mut App, scope: SignalScope) -> usize {
+    let Some(signals) = app.store.release_scope(scope) else {
+        return 0;
+    };
+    let released = signals.len();
+    for signal in signals {
+        // 立即删边（不是"等下次写时惰性清理"）：释放的价值就是之后的写不再遍历任何 owner。
+        app.graph.remove_signal(signal);
+    }
+    released
+}
+
 // ── 写路径 ────────────────────────────────────────────────────────────────
 
-/// 写一个信号。返回 `true` = 值变了（并已沿依赖图失效）；`false` = 值相等，**短路**。
+/// 写一个信号。返回 `true` = 值变了（并已沿依赖图失效）；`false` = 值相等（短路）
+/// **或**该信号的作用域已释放（no-op）。
 ///
 /// 返回值不表示「有节点被标脏」（只写派生时没有节点变脏）。
 ///
 /// **应用层契约**：`T` 必须是不可变值语义。若 `T` 内部可变（`Rc<RefCell<_>>`/`Cell`/`Mutex`）而
 /// `PartialEq` 只比较外层，则内部变化会被短路吞掉（不重绘）。见 S-35 / R9。
+///
+/// # Panics
+/// 该信号存在活跃 [`SignalRef`] 读守卫（借用冲突是显式失败，不静默拷贝，见 `node::signal` 模块文档）。
 /// 消费者：`App::write`。
 pub(crate) fn write<T: Clone + PartialEq + 'static>(
     app: &mut App,
@@ -62,44 +101,65 @@ pub(crate) fn write<T: Clone + PartialEq + 'static>(
     value: T,
 ) -> bool {
     let id = signal.id();
-    if app.store.owned_ref::<T>(id) == Some(&value) {
-        return false;
+    match app.store.write_owned(id, value) {
+        None => false,        // 作用域已释放：no-op（不失效、不唤醒）
+        Some(false) => false, // 等值短路
+        Some(true) => {
+            app.invalidate(id);
+            true
+        }
     }
-    app.store.set_owned(id, value);
-    app.invalidate(id);
-    true
+}
+
+/// 原地更新一个信号（**无等值短路**：调用方声明这次修改必须生效）。
+///
+/// 适合大对象（列表 / 图）的局部修改：不 clone 旧值、不做 `PartialEq` 比较，改完直接失效。
+///
+/// # Panics
+/// 同 [`write`]（活跃读守卫 / 类型不符）。
+/// 消费者：`App::update`。
+pub(crate) fn update<T: 'static>(
+    app: &mut App,
+    signal: &Signal<T>,
+    update: impl FnOnce(&mut T),
+) -> bool {
+    let id = signal.id();
+    match app.store.update_owned(id, update) {
+        None => false, // 作用域已释放：no-op
+        Some(_) => {
+            app.invalidate(id);
+            true
+        }
+    }
 }
 
 /// 写一个瞬态值：**不**失效、**不**请求唤醒（滚动偏移/悬浮态，§3.7）。
+///
+/// # Panics
+/// 存在活跃读守卫 / 槽位不是瞬态值。
 /// 消费者：`App::write_transient`。
 pub(crate) fn write_transient<T: 'static>(app: &mut App, transient: &Transient<T>, value: T) {
     app.store.set_transient(transient.id(), value);
 }
 
-/// 非追踪读一个信号（handler 不是渲染 pass，不登记依赖）。
+/// 非追踪读一个信号，返回**读守卫**（零拷贝）。
 ///
 /// # Panics
 /// `signal` 的槽位不是普通信号（引擎不变量被破坏时才会发生）。
 /// 消费者：`App::read`。
 #[must_use]
-pub(crate) fn read<T: Clone + 'static>(app: &App, signal: &Signal<T>) -> T {
-    app.store
-        .owned_ref::<T>(signal.id())
-        .cloned()
-        .expect("signal slot is not a plain signal")
+pub(crate) fn read<T: 'static>(app: &App, signal: &Signal<T>) -> SignalRef<T> {
+    app.store.read_owned(signal.id())
 }
 
-/// 非追踪读一个瞬态值（动画进度 / 滚动偏移的公开读取面）。
+/// 非追踪读一个瞬态值，返回读守卫（动画进度 / 滚动偏移的公开读取面）。
 ///
 /// # Panics
 /// 槽位不是瞬态值（引擎不变量被破坏时才会发生）。
 /// 消费者：`App::read_transient`。
 #[must_use]
-pub(crate) fn read_transient<T: Clone + 'static>(app: &App, transient: &Transient<T>) -> T {
-    app.store
-        .transient_ref::<T>(transient.id())
-        .cloned()
-        .expect("signal slot is not a transient value")
+pub(crate) fn read_transient<T: 'static>(app: &App, transient: &Transient<T>) -> SignalRef<T> {
+    app.store.read_transient(transient.id())
 }
 
 /// 仅测试：求值栈是否为空（验证 `EvalGuard` 在 panic 后仍然出栈）。
@@ -107,4 +167,11 @@ pub(crate) fn read_transient<T: Clone + 'static>(app: &App, transient: &Transien
 #[cfg(test)]
 pub(crate) fn eval_stack_is_empty_for_test(app: &App) -> bool {
     app.eval_stack.is_empty()
+}
+
+/// 仅测试：依赖图当前的表项数（作用域释放「立即删边」的可测证据）。
+/// 消费者：`App::dependency_edge_count_for_test`。
+#[cfg(test)]
+pub(crate) fn dependency_edge_count(app: &App) -> usize {
+    app.graph.signal_count()
 }

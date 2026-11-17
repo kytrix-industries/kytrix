@@ -24,9 +24,47 @@ use crate::{
     paint::{
         color::{ColorResolver, LinearPremulRgba},
         primitive::{ClipOp, GradientKind, Primitive, QuadPaint},
-        scene::{MAX_CLIP_DEPTH, Scene},
+        scene::MAX_CLIP_DEPTH,
     },
 };
+
+/// 编码器的**帧源**：绘制序 + 每条 lane 的内容版本与图元（B6-2）。
+///
+/// 两个实现：`Scene`（UI 线程的 inline 合成路径）与 `LaneStore`（合成线程的 delta 应用结果）。
+/// 编码器只依赖这个窄接口，因此「编码发生在哪个线程」对编码逻辑完全透明 —— 全量与增量的产物
+/// 逐字节一致的可验证性就建立在这上面。
+pub(crate) trait LaneSource {
+    /// 一条 lane 的内容版本 + 图元切片（`None` = 句柄陈旧/已释放）。
+    fn lane_state(&self, id: crate::paint::scene::LaneId) -> Option<(u32, &[Primitive])>;
+
+    /// 本帧的 lane 绘制序。
+    fn order(&self) -> &[crate::paint::scene::LaneId];
+
+    /// 该 lane 属于哪个滚动槽（`0` = 不随滚动偏移；见 `render/delta.rs` 的坐标系约定）。
+    ///
+    /// 合成线程只按「槽位 → 偏移表」在绘制期平移，因此**滚动不改变 lane 内容**；这里返回的槽位
+    /// 参与段的复用判据（槽位变了必须重编码，因为 op 的归属变了）。
+    fn lane_scroll(&self, _id: crate::paint::scene::LaneId) -> u32 {
+        0
+    }
+}
+
+/// 编码期的几何描述查表（`GeometryStore` 在 UI 线程；合成线程用自己的 `GeometryCatalog`）。
+pub(crate) trait GeometryLookup {
+    fn desc_arc(
+        &self,
+        id: crate::paint::geometry::GeometryId,
+    ) -> Option<std::sync::Arc<crate::paint::geometry::GeometryDesc>>;
+}
+
+impl GeometryLookup for crate::paint::geometry_store::GeometryStore {
+    fn desc_arc(
+        &self,
+        id: crate::paint::geometry::GeometryId,
+    ) -> Option<std::sync::Arc<crate::paint::geometry::GeometryDesc>> {
+        crate::paint::geometry_store::GeometryStore::desc_arc(self, id)
+    }
+}
 
 /// uber-quad 的单实例。**128 B / 16 B 对齐**，三平台共用同一份字节布局（P02 §8.1 / 附录 B）。
 #[repr(C, align(16))]
@@ -252,7 +290,16 @@ pub(crate) enum FrameOp {
         start: u32,
         len: u32,
         /// 本段全部实例的可见范围（物理像素 `[x0, y0, x1, y1]`，已与各自的 clip 求交并外扩）。
+        ///
+        /// **烘焙坐标空间**：bounds 是编码时实例数据里的坐标，不含滚动偏移；合成端偏移
+        /// （`scroll`）在绘制期由 `RootUniform::with_scroll` 加到顶点上，`bounds` 因此对
+        /// damage / op 跳过是保守的（滚动只改变 op 落在屏幕上的位置，不改变它的大小）。
         bounds: PhysicalBounds,
+        /// 滚动槽（`0` = 不随滚动偏移）。
+        ///
+        /// 同一条 op 里的实例**必须属于同一个滚动槽**：`append_segment_ops` 在槽位变化时切断
+        /// 合并（否则一个 draw call 会把两组不同的偏移加到同一批顶点上）。
+        scroll: u32,
     },
     /// 一次几何绘制（`Primitive::Path` / `Primitive::Geometry`）。
     Geometry {
@@ -451,8 +498,10 @@ const CHANGE_MERGE_GAP: u32 = 8;
 struct LaneSegment {
     /// 编码时的 lane 代际（arena 槽位被新 lane 复用时旧段作废）。
     generation: u32,
-    /// 编码时的 lane 版本；与 `Scene::lane_state` 不等 ⇒ 重编码。
+    /// 编码时的 lane 版本；与 `LaneSource::lane_state` 不等 ⇒ 重编码。
     version: u32,
+    /// 编码时的滚动槽（与 `LaneSource::lane_scroll` 不等 ⇒ 重编码）。
+    scroll: u32,
     /// 实例环下标区间 `[start, end)`（`end - start` = 本 lane 的实例数）。
     start: u32,
     end: u32,
@@ -980,7 +1029,8 @@ pub(crate) struct InstanceEncoder {
     /// 本帧重编码的 lane 数（`FrameRecord.encoded_lanes`）。
     encoded_lanes: usize,
     /// 本帧重编码写进实例环的字节数（`FrameRecord.uploaded_bytes` 的编码器侧值）。
-    #[cfg(any(test, feature = "test-support"))]
+    ///
+    /// 生产路径也保留：合成线程的 `ComposeStats`（HUD / 帧记录）在 release 构建里读它。
     written_bytes: usize,
     /// 本帧整段复用的 lane 段数（`FrameRecord.reused_segments`）。
     reused_segments: usize,
@@ -1000,7 +1050,6 @@ impl InstanceEncoder {
             scratch_parts: SmallVec::new(),
             encoded_lanes: 0,
             reused_segments: 0,
-            #[cfg(any(test, feature = "test-support"))]
             written_bytes: 0,
         }
     }
@@ -1019,19 +1068,16 @@ impl InstanceEncoder {
     /// [`EngineError::ClipDepthExceeded`]：GPU 裁剪链超过 `MAX_CLIP_DEPTH`。轴对齐矩形 clip
     /// 已在编码期求交合并（只占一项），因此普通嵌套容器不会触顶；只有圆角 clip 逐层计数。
     /// 超限时**必须失败**：shader 的循环是定长，静默丢最外层 clip 会让子内容越界可见。
-    pub(crate) fn encode(
+    pub(crate) fn encode<S: LaneSource>(
         &mut self,
-        scene: &Scene,
+        source: &S,
         scale: Scale,
-        resolver: &ColorResolver,
-        store: &crate::paint::geometry_store::GeometryStore,
+        resolver: ColorResolver,
+        geometry: &dyn GeometryLookup,
     ) -> Result<&InstanceBuffer, EngineError> {
         self.encoded_lanes = 0;
         self.reused_segments = 0;
-        #[cfg(any(test, feature = "test-support"))]
-        {
-            self.written_bytes = 0;
-        }
+        self.written_bytes = 0;
         self.colors.clear();
         let reset = self.scale != Some(scale) || self.buffer.clips.len() > CLIP_TABLE_LIMIT;
         if reset {
@@ -1039,7 +1085,7 @@ impl InstanceEncoder {
             self.chains.clear();
             self.scale = Some(scale);
         }
-        let order = scene.order();
+        let order = source.order();
         {
             let Self {
                 buffer,
@@ -1051,7 +1097,6 @@ impl InstanceEncoder {
                 scratch_parts,
                 encoded_lanes,
                 reused_segments,
-                #[cfg(any(test, feature = "test-support"))]
                 written_bytes,
                 ..
             } = self;
@@ -1059,8 +1104,8 @@ impl InstanceEncoder {
             // op / 几何表先借出，循环结束时再放回（compaction 之后才需要重建）。
             let mut ops = std::mem::take(&mut buffer.ops);
             ops.clear();
-            let mut geometry = std::mem::take(&mut buffer.geometry);
-            geometry.clear();
+            let mut geometry_ops = std::mem::take(&mut buffer.geometry);
+            geometry_ops.clear();
             let mut group = OpGroup::new();
             for lane_id in order {
                 let slot = lane_id.slot() as usize;
@@ -1073,15 +1118,19 @@ impl InstanceEncoder {
                 if stale && let Some(old) = buffer.segments[slot].take() {
                     buffer.release(old.range());
                 }
-                let Some((version, primitives)) = scene.lane_state(*lane_id) else {
+                let Some((version, primitives)) = source.lane_state(*lane_id) else {
                     continue;
                 };
-                // 复用判据：段存在 + 版本一致 ⇒ 整段不重编码（连实例字节都不碰）。
+                // 滚动槽：段复用时**段本身**的滚动槽必须与本次一致，否则要重编码（段落归属变了）。
+                let scroll_slot = source.lane_scroll(*lane_id);
+                // 复用判据：段存在 + 版本一致 + 滚动槽一致 ⇒ 整段不重编码（连实例字节都不碰）。
                 let reusable = buffer
                     .segments
                     .get(slot)
                     .and_then(Option::as_ref)
-                    .is_some_and(|segment| segment.version == version);
+                    .is_some_and(|segment| {
+                        segment.version == version && segment.scroll == scroll_slot
+                    });
                 if reusable {
                     *reused_segments += 1;
                 } else {
@@ -1098,7 +1147,7 @@ impl InstanceEncoder {
                             scale,
                             resolver,
                             colors,
-                            store,
+                            geometry,
                             run_start: 0,
                         };
                         lane.encode_lane(primitives)?;
@@ -1129,6 +1178,7 @@ impl InstanceEncoder {
                                 Box::new(LaneSegment {
                                     generation: lane_id.generation(),
                                     version,
+                                    scroll: scroll_slot,
                                     start: 0,
                                     end: 0,
                                     parts: SmallVec::new(),
@@ -1139,6 +1189,7 @@ impl InstanceEncoder {
                     };
                     segment.generation = lane_id.generation();
                     segment.version = version;
+                    segment.scroll = scroll_slot;
                     segment.start = range.start;
                     segment.end = range.start + len;
                     segment.parts.clear();
@@ -1148,21 +1199,18 @@ impl InstanceEncoder {
                     }
                     buffer.segments[slot] = Some(segment);
                     *encoded_lanes += 1;
-                    #[cfg(any(test, feature = "test-support"))]
-                    {
-                        *written_bytes += len as usize * 128;
-                    }
+                    *written_bytes += len as usize * 128;
                 }
                 // 本 lane 的 op 追加进绘制序（复用与新编码走同一条路径）。
                 if let Some(segment) = buffer.segments.get(slot).and_then(Option::as_deref)
                     && segment.generation == lane_id.generation()
                 {
-                    append_segment_ops(&mut ops, &mut geometry, &mut group, segment);
+                    append_segment_ops(&mut ops, &mut geometry_ops, &mut group, segment);
                 }
             }
             flush_group(&mut ops, &mut group);
             buffer.ops = ops;
-            buffer.geometry = geometry;
+            buffer.geometry = geometry_ops;
             // compaction 只在**没有任何 lane 被重编码**的帧执行：它要重排整张实例环
             // （一次 1.28 MB 级搬运），绝不抢增量帧的预算。压实会改段起点 ⇒ 重建 op 表。
             if *encoded_lanes == 0 && *reused_segments > 0 && buffer.needs_compaction() {
@@ -1192,22 +1240,41 @@ impl InstanceEncoder {
         }
     }
 
-    /// 本帧重编码的 lane 数（`FrameRecord.encoded_lanes`；测试与 `test-support` 读取）。
-    #[cfg(any(test, feature = "test-support"))]
+    /// 本帧重编码的 lane 数（`FrameRecord.encoded_lanes` / `ComposeStats.encoded_lanes`）。
     pub(crate) fn encoded_lanes(&self) -> usize {
         self.encoded_lanes
     }
 
     /// 本帧增量上传的实例字节数（编码器侧值；渲染器路径会用载荷的实际字节数覆盖它）。
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn written_bytes(&self) -> usize {
         self.written_bytes
     }
 
-    /// 本帧整段复用的 lane 段数（`FrameRecord.reused_segments`；测试与 `test-support` 读取）。
-    #[cfg(any(test, feature = "test-support"))]
+    /// 本帧整段复用的 lane 段数（`FrameRecord.reused_segments`）。
     pub(crate) fn reused_segments(&self) -> usize {
         self.reused_segments
+    }
+
+    /// 下一次 `encode` 是否会整帧重建（DPI 变化 / 裁剪表超限）。
+    ///
+    /// 合成线程用它判断「没有 lane 变化但必须重编码」的帧（否则会漏掉一次全量重建）。
+    pub(crate) fn needs_reset(&self, scale: Scale) -> bool {
+        self.scale != Some(scale) || self.buffer.clips.len() > CLIP_TABLE_LIMIT
+    }
+
+    /// 丢弃全部跨帧持久状态（整帧重建：首帧 / DPI 变化 / 合成侧 lane 表重置）。
+    ///
+    /// 与 `encode` 内部的 `reset` 同一套清理；差别是调用方**显式**要求（delta 的 `full`），不靠
+    /// 版本探测。
+    pub(crate) fn invalidate(&mut self) {
+        self.buffer.reset();
+        self.chains.clear();
+        self.state = ClipState::unbounded();
+        self.saved.clear();
+        self.scale = None;
+        self.encoded_lanes = 0;
+        self.reused_segments = 0;
+        self.written_bytes = 0;
     }
 
     /// 本帧的编码结果（消费者：`Window::instance_bytes`，P07 上传）。
@@ -1394,6 +1461,8 @@ struct OpGroup {
     /// 已并入的 lane 条数（合并上限 `MAX_LANES_PER_OP`）。
     lanes: u32,
     bounds: PhysicalBounds,
+    /// 本组统一的滚动槽（不同槽必须切断合并）。
+    scroll: u32,
 }
 
 impl OpGroup {
@@ -1404,6 +1473,7 @@ impl OpGroup {
             len: 0,
             lanes: 0,
             bounds: PhysicalBounds::EMPTY,
+            scroll: 0,
         }
     }
 }
@@ -1430,7 +1500,8 @@ fn append_segment_ops(
                 }
                 let contiguous = group.active
                     && group.start + group.len == cursor
-                    && group.lanes < MAX_LANES_PER_OP;
+                    && group.lanes < MAX_LANES_PER_OP
+                    && group.scroll == segment.scroll;
                 if group.active && !contiguous {
                     flush_group(ops, group);
                 }
@@ -1438,6 +1509,7 @@ fn append_segment_ops(
                     *group = OpGroup {
                         active: true,
                         start: cursor,
+                        scroll: segment.scroll,
                         ..OpGroup::new()
                     };
                 }
@@ -1495,6 +1567,7 @@ fn flush_group(ops: &mut Vec<FrameOp>, group: &mut OpGroup) {
             start: group.start,
             len: group.len,
             bounds: group.bounds,
+            scroll: group.scroll,
         });
     }
     group.active = false;
@@ -1564,11 +1637,11 @@ struct LaneEncoder<'a> {
     saved: &'a mut SmallVec<[ClipState; 8]>,
     chains: &'a mut ahash::HashMap<(u32, u32, [u32; 4], [u32; 4]), ClipChainId>,
     scale: Scale,
-    resolver: &'a ColorResolver,
+    resolver: ColorResolver,
     /// 颜色解析缓存（P1-2.1）：一帧内同色高度重复，宽色域解析要跑 24 步二分。
     colors: &'a mut crate::paint::color::ResolveCache,
-    /// 静态几何的注册表（`GeometryId` → 顶点/索引字节）。
-    store: &'a crate::paint::geometry_store::GeometryStore,
+    /// 几何描述查表（UI 线程是 `GeometryStore`，合成线程是 `GeometryCatalog`）。
+    geometry: &'a dyn GeometryLookup,
     run_start: usize,
 }
 
@@ -1611,7 +1684,7 @@ impl LaneEncoder<'_> {
             Primitive::GlyphRun(run) => {
                 if !run.color.is_transparent() {
                     // 整 run 的颜色解析一次（旧实现在 per-glyph 的 emit_glyph 里重复 resolve）。
-                    let color0 = self.colors.resolve(self.resolver, run.color);
+                    let color0 = self.colors.resolve(&self.resolver, run.color);
                     for glyph in &run.glyphs {
                         self.emit_glyph(color0, glyph);
                     }
@@ -1619,14 +1692,14 @@ impl LaneEncoder<'_> {
             }
             Primitive::Path(path) => {
                 self.flush_run();
-                let color = self.colors.resolve(self.resolver, path.fill).to_array();
+                let color = self.colors.resolve(&self.resolver, path.fill).to_array();
                 // Path 的顶点在逻辑窗口空间、无 per-primitive 变换（`Path` 没有 transform
                 // 字段）；damage 用它自己的 bounds 而不是 clip AABB（R05-19）。
                 self.push_geometry_op(path.geometry, Transform::IDENTITY, color, Some(path.bounds));
             }
             Primitive::Geometry(draw) => {
                 self.flush_run();
-                let color = self.colors.resolve(self.resolver, draw.color).to_array();
+                let color = self.colors.resolve(&self.resolver, draw.color).to_array();
                 self.push_geometry_op(draw.id, draw.transform, color, None);
             }
             Primitive::Canvas(canvas) => {
@@ -1799,7 +1872,7 @@ impl LaneEncoder<'_> {
         &self,
         id: crate::paint::geometry::GeometryId,
     ) -> Option<std::sync::Arc<crate::paint::geometry::GeometryDesc>> {
-        self.store.desc_arc(id)
+        self.geometry.desc_arc(id)
     }
 
     fn missing_desc() -> std::sync::Arc<crate::paint::geometry::GeometryDesc> {
@@ -1876,17 +1949,17 @@ impl LaneEncoder<'_> {
             QuadPaint::Solid { fill, border } => {
                 let width = border.map_or(0.0, |border| border.width * factor);
                 (
-                    self.colors.resolve(self.resolver, *fill),
+                    self.colors.resolve(&self.resolver, *fill),
                     border.map_or(LinearPremulRgba::TRANSPARENT, |border| {
-                        self.colors.resolve(self.resolver, border.color)
+                        self.colors.resolve(&self.resolver, border.color)
                     }),
                     width.clamp(0.0, half_min),
                     GRADIENT_NONE,
                 )
             }
             QuadPaint::Gradient(gradient) => (
-                self.colors.resolve(self.resolver, gradient.from),
-                self.colors.resolve(self.resolver, gradient.to),
+                self.colors.resolve(&self.resolver, gradient.from),
+                self.colors.resolve(&self.resolver, gradient.to),
                 0.0,
                 match gradient.kind {
                     GradientKind::Horizontal => GRADIENT_HORIZONTAL,
@@ -1927,7 +2000,7 @@ impl LaneEncoder<'_> {
         let instance = GpuPrimitive {
             bounds,
             corner_radius: radii,
-            color0: self.colors.resolve(self.resolver, shadow.color).to_array(),
+            color0: self.colors.resolve(&self.resolver, shadow.color).to_array(),
             color1: [0.0; 4],
             params0: [0.0, blur, GRADIENT_NONE, pad],
             params1: [self.clip_index(), 0.0, KIND_SHADOW, self.clip_depth()],
@@ -1939,7 +2012,7 @@ impl LaneEncoder<'_> {
 
     fn emit_image(&mut self, image: &crate::paint::primitive::Image) {
         let physical = image.bounds.to_physical(self.scale);
-        let color0 = self.colors.resolve(self.resolver, image.modulation);
+        let color0 = self.colors.resolve(&self.resolver, image.modulation);
         let bounds = physical_to_bounds(physical);
         let instance = GpuPrimitive {
             bounds,
@@ -2012,7 +2085,7 @@ fn quad_visible(quad: &crate::paint::primitive::Quad) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     use super::{
         CLIP_KIND_RECT, CLIP_KIND_ROUNDED, ClipChain, ClipChainId, ClipKind, ClipState,
@@ -2086,7 +2159,7 @@ mod tests {
         let buffer = encoder.encode(
             scene,
             scale(),
-            &resolver(),
+            resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )?;
         Ok(Encoded {
@@ -2305,7 +2378,7 @@ mod tests {
         });
         assert!(canvas.pop_clip());
         let scene = scene_with(|scene, lane| {
-            assert!(scene.push(lane, Primitive::Canvas(Rc::new(canvas))));
+            assert!(scene.push(lane, Primitive::Canvas(Arc::new(canvas))));
         });
         let buffer = encode(&scene);
         let primitive = buffer
@@ -2353,7 +2426,7 @@ mod tests {
         });
         assert!(canvas.pop_clip());
         let scene = scene_with(|scene, lane| {
-            assert!(scene.push(lane, Primitive::Canvas(Rc::new(canvas))));
+            assert!(scene.push(lane, Primitive::Canvas(Arc::new(canvas))));
         });
         let buffer = encode(&scene);
         let instance = buffer.instances[0];
@@ -2899,7 +2972,7 @@ mod tests {
                     corner_radius: [0.0; 4],
                 },
             );
-            assert!(scene.push(lane, Primitive::Canvas(Rc::new(canvas))));
+            assert!(scene.push(lane, Primitive::Canvas(Arc::new(canvas))));
             assert!(scene.push(lane, Primitive::Clip(ClipOp::Pop)));
         });
         let buffer = encode(&scene);
@@ -3272,7 +3345,7 @@ mod tests {
 
         let mut encoder = InstanceEncoder::new();
         let buffer = encoder
-            .encode(&scene, scale(), &resolver(), &store)
+            .encode(&scene, scale(), resolver(), &store)
             .expect("encode");
         let Some(super::FrameOp::Geometry { bounds, .. }) = buffer
             .ops
@@ -3323,7 +3396,7 @@ mod tests {
         scene.set_order(&[lane]);
         let mut encoder = InstanceEncoder::new();
         let buffer = encoder
-            .encode(&scene, scale(), &resolver(), &store)
+            .encode(&scene, scale(), resolver(), &store)
             .expect("encode");
         let draw = buffer.geometry.first().expect("必须有一条几何绘制");
         assert_eq!(
@@ -3484,7 +3557,7 @@ mod tests {
         let (scene, lanes) = grid_scene(8);
         let mut encoder = InstanceEncoder::new();
         encoder
-            .encode(&scene, scale(), &resolver(), &empty_store())
+            .encode(&scene, scale(), resolver(), &empty_store())
             .expect("初帧");
         assert_eq!(encoder.encoded_lanes(), 8);
         assert_eq!(encoder.reused_segments(), 0);
@@ -3495,7 +3568,7 @@ mod tests {
         encoder.buffer_mut().clear_changes();
 
         encoder
-            .encode(&scene, scale(), &resolver(), &empty_store())
+            .encode(&scene, scale(), resolver(), &empty_store())
             .expect("空闲帧");
         assert_eq!(encoder.encoded_lanes(), 0, "无变化帧不得重编码任何 lane");
         assert_eq!(encoder.reused_segments(), lanes.len());
@@ -3513,7 +3586,7 @@ mod tests {
         let (mut scene, lanes) = grid_scene(8);
         let mut encoder = InstanceEncoder::new();
         encoder
-            .encode(&scene, scale(), &resolver(), &empty_store())
+            .encode(&scene, scale(), resolver(), &empty_store())
             .expect("初帧");
         encoder.buffer_mut().clear_changes();
 
@@ -3532,7 +3605,7 @@ mod tests {
             })
         ));
         encoder
-            .encode(&scene, scale(), &resolver(), &empty_store())
+            .encode(&scene, scale(), resolver(), &empty_store())
             .expect("增量帧");
 
         assert_eq!(encoder.encoded_lanes(), 1, "只有脏 lane 被重编码");
@@ -3556,7 +3629,7 @@ mod tests {
         let mut incremental = InstanceEncoder::new();
         let store = empty_store();
         incremental
-            .encode(&scene, scale(), &resolver(), &store)
+            .encode(&scene, scale(), resolver(), &store)
             .expect("初帧");
         // 两帧增量：每帧只改一条 lane（形状/位置变、实例数不变 ⇒ 原地重写）。
         for (round, lane) in [lanes[2], lanes[4]].into_iter().enumerate() {
@@ -3570,12 +3643,12 @@ mod tests {
                 })
             ));
             incremental
-                .encode(&scene, scale(), &resolver(), &store)
+                .encode(&scene, scale(), resolver(), &store)
                 .expect("增量帧");
         }
 
         let mut full = InstanceEncoder::new();
-        full.encode(&scene, scale(), &resolver(), &store)
+        full.encode(&scene, scale(), resolver(), &store)
             .expect("全量帧");
 
         assert_eq!(
@@ -3604,7 +3677,7 @@ mod tests {
         let mut incremental = InstanceEncoder::new();
         let store = empty_store();
         incremental
-            .encode(&scene, scale(), &resolver(), &store)
+            .encode(&scene, scale(), resolver(), &store)
             .expect("初帧");
         // 把一条 lane 从一个实例改成三个（段长度变化 ⇒ 搬段）。
         let lane = lanes[1];
@@ -3620,12 +3693,12 @@ mod tests {
             ));
         }
         incremental
-            .encode(&scene, scale(), &resolver(), &store)
+            .encode(&scene, scale(), resolver(), &store)
             .expect("增量帧");
         assert_eq!(incremental.encoded_lanes(), 1);
 
         let mut full = InstanceEncoder::new();
-        full.encode(&scene, scale(), &resolver(), &store)
+        full.encode(&scene, scale(), resolver(), &store)
             .expect("全量帧");
         for lane in &lanes {
             assert_eq!(
@@ -3643,7 +3716,7 @@ mod tests {
         let mut encoder = InstanceEncoder::new();
         let store = empty_store();
         encoder
-            .encode(&scene, scale(), &resolver(), &store)
+            .encode(&scene, scale(), resolver(), &store)
             .expect("初帧");
         // 直接灌表项把表撑到上限之上（等价于长动画每帧追加新 clip 的累积效应）。
         let filler = encoder.buffer().clips[0];
@@ -3655,7 +3728,7 @@ mod tests {
         assert!(scene.clear_lane(lane));
         assert!(scene.push(lane, quad_primitive(solid())));
         encoder
-            .encode(&scene, scale(), &resolver(), &store)
+            .encode(&scene, scale(), resolver(), &store)
             .expect("重置帧");
         assert_eq!(
             encoder.encoded_lanes(),
@@ -3676,14 +3749,14 @@ mod tests {
         let mut encoder = InstanceEncoder::new();
         let store = empty_store();
         encoder
-            .encode(&scene, Scale::ONE, &resolver(), &store)
+            .encode(&scene, Scale::ONE, resolver(), &store)
             .expect("1× 帧");
         // 改一条 lane 之后切 2×：即使只有一条脏 lane，也必须全部重编码。
         let lane = lanes[2];
         assert!(scene.clear_lane(lane));
         assert!(scene.push(lane, quad_primitive(solid())));
         encoder
-            .encode(&scene, scale(), &resolver(), &store)
+            .encode(&scene, scale(), resolver(), &store)
             .expect("2× 帧");
         assert_eq!(encoder.encoded_lanes(), lanes.len());
         // 物理化的 bounds：1× 下是 10×20，2× 下是 20×40。
@@ -3711,7 +3784,7 @@ mod tests {
             ));
         }
         encoder
-            .encode(&scene, scale(), &resolver(), &store)
+            .encode(&scene, scale(), resolver(), &store)
             .expect("初帧");
         for lane in &lanes {
             assert!(scene.clear_lane(*lane));
@@ -3725,7 +3798,7 @@ mod tests {
             ));
         }
         encoder
-            .encode(&scene, scale(), &resolver(), &store)
+            .encode(&scene, scale(), resolver(), &store)
             .expect("搬段帧");
         let used_before = encoder.buffer().instance_count();
         let free_before: u32 = encoder
@@ -3738,7 +3811,7 @@ mod tests {
 
         // 无脏帧 ⇒ compaction。
         encoder
-            .encode(&scene, scale(), &resolver(), &store)
+            .encode(&scene, scale(), resolver(), &store)
             .expect("压实帧");
         assert_eq!(encoder.encoded_lanes(), 0);
         assert!(encoder.buffer().free.is_empty(), "压实之后不得留下空闲块");
@@ -3749,7 +3822,7 @@ mod tests {
 
         // 内容与绘制序必须与全量编码一致。
         let mut full = InstanceEncoder::new();
-        full.encode(&scene, scale(), &resolver(), &store)
+        full.encode(&scene, scale(), resolver(), &store)
             .expect("全量帧");
         assert_eq!(encoder.buffer().as_bytes(), full.buffer().as_bytes());
         assert_eq!(encoder.buffer().ops(), full.buffer().ops());

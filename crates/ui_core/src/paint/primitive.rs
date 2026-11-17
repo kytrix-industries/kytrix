@@ -3,7 +3,7 @@
 //! 坐标全为**绝对窗口逻辑像素**，没有 per-primitive 变换（`GeometryDraw.transform` 是唯一例外）。
 //! 字段语义与「与附录 C 的差异」见 `design/phase-02-paint-foundation.md` §6。
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::{
     math::{Point, Rect, Size, Transform},
@@ -20,8 +20,11 @@ pub enum Primitive {
     Shadow(Shadow),
     Clip(ClipOp),
     Geometry(GeometryDraw),
-    /// 自绘画布（`Rc` 共享：paint 每帧只加引用计数，不深拷贝画布内容，F-215）。
-    Canvas(Rc<Canvas>),
+    /// 自绘画布（`Arc` 共享：paint 每帧只加引用计数，不深拷贝画布内容，F-215）。
+    ///
+    /// **必须是 `Arc` 而不是 `Rc`**：图元要跨线程交给合成线程（B6-2 的 `SceneDelta`），
+    /// `Rc` 会让整棵图元树 `!Send`。
+    Canvas(Arc<Canvas>),
 }
 
 /// 背景 / 边框 / 渐变。
@@ -157,7 +160,7 @@ pub struct GeometryDraw {
 
 #[cfg(test)]
 mod tests {
-    use std::{mem::size_of, rc::Rc};
+    use std::{mem::size_of, sync::Arc};
 
     use super::{
         Border, ClipOp, ClipRect, GeometryDraw, GlyphRun, Gradient, GradientKind, Image, Path,
@@ -261,7 +264,7 @@ mod tests {
                     color: Color::WHITE,
                 }),
             ),
-            ("Canvas", Primitive::Canvas(Rc::new(Canvas::new(rect())))),
+            ("Canvas", Primitive::Canvas(Arc::new(Canvas::new(rect())))),
         ]
     }
 

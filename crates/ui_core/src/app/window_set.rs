@@ -76,11 +76,30 @@ pub(crate) fn remove_node(app: &mut App, window: WindowId, node: NodeId) -> bool
 
 /// 建一个窗口（headless：只建树与空场景）。`WindowId` 从 **1** 起单调 +1、永不复用
 /// （0 保留为非法句柄，见 `WindowId::from_raw`）。
+///
+/// 同时铸造该窗口的**信号作用域**（`App::window_signal` 的归属；关窗时自动释放）。
+///
+/// # Panics
+/// 窗口句柄空间用尽（已建过 `u32::MAX` 个窗口）：`WindowId` 是 u32 的**单调不复用**句柄，
+/// 没有回绕语义 —— 回绕会与早已关闭的窗口 id 冲突。这是「句柄用尽」的显式行为（A5）。
 /// 消费者：`App::create_window`。
 pub(crate) fn create_window(app: &mut App, options: WindowOptions) -> WindowId {
     let id = WindowId::from_raw(app.next_window_id);
-    app.next_window_id = app.next_window_id.wrapping_add(1);
-    app.windows.insert(id, Window::new(id, options));
+    app.next_window_id = app
+        .next_window_id
+        .checked_add(1)
+        .expect("window handle space exhausted (u32::MAX windows created)");
+    let scope = app.store.new_scope();
+    app.window_scopes.insert(id, scope);
+    let scale = options.scale;
+    let mut window = Window::new(id, options);
+    // R03-7：树绑定窗口（之后铸出的 NodeId 带窗口身份，跨窗口误用确定性失败）。
+    window.tree_mut().bind_window(id);
+    // B7：非整数 DPI 才开启布局像素吸附（见 `NodeTree::set_device_scale` 的取舍说明）。
+    window
+        .tree_mut()
+        .set_device_scale((scale.factor() != 1.0).then_some(scale.factor()));
+    app.windows.insert(id, window);
     id
 }
 
@@ -257,6 +276,12 @@ pub(crate) fn close_window(app: &mut App, id: WindowId) -> bool {
                 app.graph.detach(*signal, Owner::Node { window: id, node });
             }
         }
+    }
+    // 窗口的信号作用域：释放后其信号的写是 no-op、依赖边被立即删除。
+    // 这是「关窗之后的迟到写入（异步任务 / 定时器回投）不得产生僵尸唤醒」的可观测半边
+    // （R03-6 / wave-6）：节点退订处理了**读侧**，作用域释放处理了**写侧**。
+    if let Some(scope) = app.window_scopes.remove(&id) {
+        super::signal_api::release_scope(app, scope);
     }
     true
 }

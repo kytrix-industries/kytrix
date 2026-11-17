@@ -1301,7 +1301,7 @@ fn animation_ticks_write_the_transient_and_end_in_idle() {
     let outcome = frame(&mut app, window);
 
     assert!(
-        (app.read_transient(&progress) - 0.5).abs() < 1e-3,
+        (*app.read_transient(&progress) - 0.5).abs() < 1e-3,
         "中点 = 0.5"
     );
     assert!(
@@ -1312,7 +1312,7 @@ fn animation_ticks_write_the_transient_and_end_in_idle() {
 
     app.advance_clock(std::time::Duration::from_millis(60));
     frame(&mut app, window);
-    assert_eq!(app.read_transient(&progress), 1.0);
+    assert_eq!(*app.read_transient(&progress), 1.0);
     assert!(!app.animations_running(window), "结束即删槽");
     assert!(!app.cancel_animation(&id), "槽已删");
 
@@ -1658,7 +1658,7 @@ fn animation_retarget_replaces_the_previous_slot() {
     .expect("first");
     app.advance_clock(std::time::Duration::from_millis(50));
     frame(&mut app, window);
-    assert!((app.read_transient(&value) - 0.5).abs() < 1e-3);
+    assert!((*app.read_transient(&value) - 0.5).abs() < 1e-3);
 
     // 半途改主意：1 → 0。旧槽必须让位（否则两条插值互相覆盖 ⇒ 回弹）。
     app.animate(
@@ -1675,14 +1675,14 @@ fn animation_retarget_replaces_the_previous_slot() {
     frame(&mut app, window);
     // 从当前值 0.5 重新起步：走一半 ⇔ 0.5 + (0 − 0.5) × 0.5 = 0.25。
     assert!(
-        (app.read_transient(&value) - 0.25).abs() < 1e-3,
+        (*app.read_transient(&value) - 0.25).abs() < 1e-3,
         "重定向必须从当前值起步：{}",
         app.read_transient(&value)
     );
 
     app.advance_clock(std::time::Duration::from_millis(60));
     frame(&mut app, window);
-    assert_eq!(app.read_transient(&value), 0.0, "终点是 0，不得回弹到 1");
+    assert_eq!(*app.read_transient(&value), 0.0, "终点是 0，不得回弹到 1");
     assert!(!app.animations_running(window));
 }
 

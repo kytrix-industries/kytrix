@@ -137,8 +137,10 @@ impl DirtySet {
         self.live.clear();
     }
 
-    /// 清空（容量保留；仅测试用：生产路径都经 `take_into` 消费）。
-    #[cfg(test)]
+    /// 清空（容量保留）。
+    ///
+    /// 生产消费者：`NodeTree::bind_window`（绑定窗口时把按旧根句柄登记的集合换成带窗口 tag 的键）；
+    /// 测试也用它复位。
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
         self.live.clear();

@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use super::{
+    a11y::ShadowTree,
     probe::Probe,
     record::{FrameRecord, RenderedFrame},
     snapshot::{SnapshotCase, SnapshotError, SnapshotImage},
@@ -28,6 +29,14 @@ pub struct TestApp {
     last_rendered: Option<RenderedFrame>,
     /// 是否在每帧之后交付一笔 a11y 快照（`enable_a11y_capture` 打开）。
     a11y_capture: bool,
+    /// 最近一笔 a11y 交付对应的 **`TreeUpdate`**（与生产 `build_update` 同一条组装路径）。
+    ///
+    /// R13-10：全仓此前没有一处 `TreeUpdate` 断言，语义 bug 全部停在"快照"这一层。
+    last_a11y_update: Option<accesskit::TreeUpdate>,
+    /// a11y 影子树（逐笔应用 `TreeUpdate` 并校验 AccessKit 契约）。
+    a11y_shadow: ShadowTree,
+    /// 上一笔 `TreeUpdate` 的契约校验错误（`Some` ⇒ 本帧的更新违反 AccessKit 契约）。
+    a11y_contract_error: Option<String>,
 }
 
 impl Default for TestApp {
@@ -61,6 +70,9 @@ impl TestApp {
             window,
             last_rendered: None,
             a11y_capture: false,
+            last_a11y_update: None,
+            a11y_shadow: ShadowTree::new(),
+            a11y_contract_error: None,
         }
     }
 
@@ -119,7 +131,15 @@ impl TestApp {
                 A11yGate::Immediate => true,
                 A11yGate::Pump => self.app.a11y_pending(self.window),
             };
+        self.last_a11y_update = None;
+        self.a11y_contract_error = None;
         if deliver && let Some(snapshot) = self.app.a11y_take(self.window) {
+            // 与生产**完全同一条**组装路径：`to_tree_update` 是平台泵闭包里的那个函数。
+            let update = crate::a11y::adapter::to_tree_update(&snapshot);
+            if let Err(error) = self.a11y_shadow.apply(&update) {
+                self.a11y_contract_error = Some(error);
+            }
+            self.last_a11y_update = Some(update);
             self.app.attach_a11y(self.window, snapshot);
         }
         if let Some(frame) = self.frame_record().frame.clone() {
@@ -157,7 +177,7 @@ impl TestApp {
     /// 打开 a11y 快照捕获：之后每次 `drain` 都把本帧的交付写进 `FrameRecord.a11y`。
     ///
     /// 首帧恒为全树（`A11yBridge.full_pending`），捕获开关只允许一个 drainer（生产里是平台
-    /// adapter），见 `design/phase-11-a11y.md` S-112。
+    /// adapter）：同一时刻只允许一个 drainer。
     pub fn enable_a11y_capture(&mut self) {
         self.a11y_capture = true;
         self.app.set_a11y_capture(self.window, true);
@@ -167,6 +187,118 @@ impl TestApp {
     #[must_use]
     pub fn a11y(&self) -> Option<&crate::a11y::A11yTreeSnapshot> {
         self.frame_record().a11y.as_ref()
+    }
+
+    /// 最近一帧的 **`TreeUpdate`**（生产 `build_update` 的同一条组装路径）。
+    ///
+    /// 与 [`Self::a11y`] 的区别是"测试面与生产面统一"：AT 实际收到的是 `TreeUpdate`，
+    /// 快照只是引擎侧的中间表示（R13-5/R13-10）。
+    #[must_use]
+    pub fn a11y_update(&self) -> Option<&accesskit::TreeUpdate> {
+        self.last_a11y_update.as_ref()
+    }
+
+    /// 最近一帧 `TreeUpdate` 的契约校验错误（`None` = 合法）。
+    #[must_use]
+    pub fn a11y_contract_error(&self) -> Option<&str> {
+        self.a11y_contract_error.as_deref()
+    }
+
+    /// 最近一帧的 `TreeUpdate` 必须是**合法**的 AccessKit 更新。
+    ///
+    /// # Panics
+    /// 违反契约（错误信息指出哪个 id、哪条规则）。
+    pub fn assert_a11y_contract(&self) {
+        if let Some(error) = &self.a11y_contract_error {
+            panic!("TreeUpdate violates the AccessKit contract: {error}");
+        }
+    }
+
+    /// a11y 影子树的摘要（`id -> 语义摘要`；全量/增量一致性见 [`Self::a11y_oracle_diff`]）。
+    #[must_use]
+    pub fn a11y_shadow_summaries(&self) -> ahash::HashMap<accesskit::NodeId, String> {
+        self.a11y_shadow.summaries()
+    }
+
+    /// a11y oracle：**增量累积**出来的树 vs **强制全树**重建的树。
+    ///
+    /// 这是 a11y 版的 `assert_oracle`（R13-11）：所有"忘记 `mark_a11y`"的 bug 都会让两条路径
+    /// 分叉，变成红灯。比较项：节点集合 / 每节点语义摘要 / 父子结构。
+    ///
+    /// 需要先 `enable_a11y_capture()`（否则没有交付可以比较）。
+    pub fn a11y_oracle_diff(&mut self) -> Option<String> {
+        assert!(
+            self.a11y_capture,
+            "a11y oracle requires enable_a11y_capture()"
+        );
+        // ① 增量侧：当前状态照常交付，影子树是"逐笔累积"的结果。
+        let _ = self.drain().expect("incremental a11y frame");
+        let incremental = self.a11y_shadow.summaries();
+        let incremental_structure = self.a11y_shadow.structure();
+        // ② 全量侧：强制全树交付，用一份新的影子树描述"从头建"的结果。
+        self.app
+            .window_mut(self.window)
+            .expect("TestApp's window must exist")
+            .a11y_force_full();
+        let _ = self.drain().expect("full a11y frame");
+        let Some(update) = self.last_a11y_update.clone() else {
+            return Some(String::from(
+                "forced full a11y delivery produced no TreeUpdate",
+            ));
+        };
+        let mut full = ShadowTree::new();
+        if let Err(error) = full.apply(&update) {
+            return Some(format!(
+                "forced full TreeUpdate violates the contract: {error}"
+            ));
+        }
+        let complete = full.summaries();
+        if let Some(error) = self.a11y_contract_error.as_ref() {
+            return Some(format!(
+                "incremental TreeUpdate violates the contract: {error}"
+            ));
+        }
+        if incremental.len() != complete.len() {
+            return Some(format!(
+                "incremental shadow has {} node(s), full rebuild has {}",
+                incremental.len(),
+                complete.len()
+            ));
+        }
+        let mut ids: Vec<&accesskit::NodeId> = complete.keys().collect();
+        ids.sort_by_key(|id| id.0);
+        for id in ids {
+            match incremental.get(id) {
+                None => {
+                    return Some(format!(
+                        "node {id:?} exists in the full rebuild but not in the incremental tree"
+                    ));
+                }
+                Some(actual) if actual != &complete[id] => {
+                    return Some(format!(
+                        "node {id:?} differs:\n  incremental: {actual}\n  full:        {}",
+                        complete[id]
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        if incremental_structure != full.structure() {
+            return Some(String::from(
+                "parent/children structure differs between incremental and full delivery",
+            ));
+        }
+        None
+    }
+
+    /// 差异即 panic（a11y 版 `assert_oracle`）。
+    ///
+    /// # Panics
+    /// 增量与全量描述的状态不一致（打印第一处差异）。
+    pub fn assert_a11y_oracle(&mut self) {
+        if let Some(diff) = self.a11y_oracle_diff() {
+            panic!("inconsistent a11y tree: {diff}");
+        }
     }
 
     /// 注入一个输入事件：走**与平台泵相同**的 `App::dispatch_input`（命中 / 焦点 / 拖拽 / 动作 / 滚动）。
@@ -234,7 +366,7 @@ impl TestApp {
     }
 
     /// 像素快照：Windows 上用 WARP 真渲染当前 `Scene`；macOS 用离屏 Metal；Linux 恒 `Gpu`
-    /// （`new_offscreen` 需要真实 `wl_surface`，见 `design/phase-12-macos-linux.md` F-137）。
+    /// （`new_offscreen` 在 Wayland 下需要真实 `wl_surface`，因此 Linux 上没有离屏渲染器）。
     ///
     /// 两张图集页都会上传：字形页恒上传，图片页只在 `App::resources` 非空时上传（P13 §8.3）。
     ///
@@ -275,7 +407,11 @@ impl TestApp {
             );
         }
         let image = renderer
-            .render_snapshot(window.instance_buffer())
+            .render_snapshot(
+                window
+                    .instance_buffer()
+                    .expect("render_snapshot requires an inline (headless) window"),
+            )
             .map_err(gpu_error)?;
         Ok(SnapshotImage {
             width: image.width,
@@ -481,7 +617,7 @@ mod tests {
             let _ = NodeBuilder::boxed()
                 .layout_override(RECT)
                 .bind_style(move |cx| StylePatch {
-                    background: Some(cx.read(&color)),
+                    background: Some(*cx.read(&color)),
                     ..StylePatch::default()
                 })
                 .id("a")
@@ -853,7 +989,7 @@ mod p10_tests {
         app.advance(std::time::Duration::from_millis(60));
         app.drain().expect("final frame");
 
-        assert_eq!(app.app().read_transient(&transient), 1.0);
+        assert_eq!(*app.app().read_transient(&transient), 1.0);
         assert!(!app.app().animations_running(window));
         // 再推进一帧：没有脏位 ⇒ Idle（不提交、FrameIndex 不变）。
         let before = app.app().window(window).expect("window").frame_index();
@@ -1029,10 +1165,7 @@ mod p11_tests {
 
     use super::TestApp;
     use crate::{
-        a11y::{
-            A11yAction, A11yDiagnostic, A11yNodeId, A11yOverride, A11yPatch, A11yRole,
-            A11yTreeSnapshot,
-        },
+        a11y::{A11yAction, A11yDiagnostic, A11yOverride, A11yPatch, A11yRole, A11yTreeSnapshot},
         event::Action,
         math::{Point, Rect, Scale},
         node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId},
@@ -1161,7 +1294,7 @@ mod p11_tests {
                 .paint(white())
                 .on_click(Action::custom("press"))
                 .bind_a11y(move |cx| A11yPatch {
-                    label: Some(cx.read(&label_signal)),
+                    label: Some(cx.read(&label_signal).clone()),
                     ..A11yPatch::default()
                 })
                 .id("press")
@@ -1213,7 +1346,11 @@ mod p11_tests {
         let record = app.drain().expect("focus frame");
         assert!(!record.rendered, "纯 A11Y 变化必须让本帧保持 Idle");
         let snap = record.a11y.as_ref().expect("Idle 帧也要有 a11y 交付");
-        assert_eq!(snap.focus(), A11yNodeId::from_engine(button));
+        assert_eq!(
+            snap.focus(),
+            snap.id_for_engine(button).expect("焦点节点的稳定 id"),
+            "TreeUpdate.focus 必须是稳定 id"
+        );
         assert_eq!(snap.focus_node().engine, button, "焦点节点必须在快照里");
     }
 
@@ -1221,7 +1358,6 @@ mod p11_tests {
     fn a11y_structure_matches_the_tree() {
         let mut app = TestApp::new();
         app.enable_a11y_capture();
-        let window = app.window_id();
         let panel = mount(&mut app, |tree, root| {
             NodeBuilder::boxed()
                 .id("panel")
@@ -1238,21 +1374,19 @@ mod p11_tests {
                 .expect("child")
         });
         let _ = app.drain().expect("second");
-        let expected: Vec<A11yNodeId> = app
-            .app()
-            .window(window)
-            .expect("window")
-            .tree()
-            .get(panel)
-            .expect("panel")
-            .children()
-            .iter()
-            .map(|child| A11yNodeId::from_engine(*child))
-            .collect();
         let snap = snapshot(&app);
-        let actual = snap.children_of(A11yNodeId::from_engine(panel));
-        assert_eq!(actual, expected, "父的 children 必须与节点树完全一致");
-        assert!(snap.node_for(child).is_some(), "新子节点必须出现");
+        let panel_id = snap.id_for_engine(panel).expect("panel 的稳定 id");
+        let child_id = snap.node_for(child).expect("新子节点必须出现").id;
+        assert_eq!(
+            snap.children_of(panel_id),
+            vec![child_id],
+            "父的 children 必须与节点树一致（稳定 id）"
+        );
+        // 同一笔里父的 children 引用的 id 必须与子节点自身的 id 相同（不是两套编码）。
+        assert_eq!(
+            snap.node_for(panel).expect("panel").children,
+            vec![child_id]
+        );
     }
 
     #[test]
@@ -1297,7 +1431,7 @@ mod p11_tests {
                 .paint(white())
                 .on_click(Action::custom("press"))
                 .bind_a11y(move |cx| A11yPatch {
-                    disabled: Some(cx.read(&signal)),
+                    disabled: Some(*cx.read(&signal)),
                     ..A11yPatch::default()
                 })
                 .id("press")
@@ -1391,7 +1525,8 @@ mod p11_tests {
             "`visible: false` 必须传播到 a11y 的 hidden"
         );
         assert!(
-            snap.visible_nodes().all(|node| node.engine != hidden),
+            snap.visible_nodes_in_batch()
+                .all(|node| node.engine != hidden),
             "hidden 节点不得出现在可见集合里"
         );
     }
@@ -1680,7 +1815,7 @@ mod p11_fix_tests {
                 .paint(white())
                 .on_click(Action::custom("press"))
                 .bind_a11y(move |cx| A11yPatch {
-                    disabled: Some(cx.read(&signal)),
+                    disabled: Some(*cx.read(&signal)),
                     ..A11yPatch::default()
                 })
                 .id("press")

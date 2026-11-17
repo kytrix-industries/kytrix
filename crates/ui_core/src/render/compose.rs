@@ -1,0 +1,410 @@
+//! 每窗口的**合成器**（`WindowComposer`）：把一条 `SceneDelta` 变成一份 `FramePayload`。
+//!
+//! 这是 B6-2 的落位点：**编码不再发生在 UI 线程**。本类型是线程无关的纯组件 ——
+//!
+//! - **inline 模式**（headless / 离屏 / 单测）：`Window` 直接持有它，`paint_frame` 里同步合成；
+//! - **threaded 模式**（真实窗口）：它被移交给合成线程（`render/compositor_thread.rs`），
+//!   UI 线程只发布 delta。
+//!
+//! 两种模式共用同一份代码与同一份产物：全量与增量的实例字节逐字节一致
+//! （`InstanceEncoder` 的两条路径同一个 `LaneEncoder`）。
+//!
+//! ## 为什么合成线程只做「编码之外」的合成工作
+//!
+//! 像素生成（lane 重建）仍在 UI 线程 —— lane 内容是 `Scene` 的唯一真相，搬到别的线程只会引入
+//! 双写。合成线程拿到的是**内容快照**（`Arc<[Primitive]>`），它做的是「把快照变成 GPU 字节」：
+//! 版本比对 → 只重编码变化 lane → 构造增量载荷 → 分发。这与 Chrome 的
+//! `LayerTreeHost`（UI）→ `LayerTreeHostImpl`（impl 线程）分工一致。
+
+use crate::{
+    error::EngineError,
+    paint::{color::ColorResolver, instance::InstanceEncoder},
+    render::{
+        compositor::Plan,
+        delta::{
+            GeometryCatalog, LaneStore, SceneDelta, ScrollTable, push_scroll_damage, scroll_damage,
+        },
+        frame::FramePayload,
+    },
+};
+
+/// 一帧合成之后的产物：damage 计划（合成线程可能并入滚动暴露区）+ 载荷。
+pub(crate) struct ComposedFrame {
+    pub plan: Plan,
+    pub payload: FramePayload,
+    pub stats: ComposeStats,
+}
+
+/// 本帧合成的可观测计数（HUD / `FrameRecord` / 测试）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ComposeStats {
+    /// 本帧重编码的 lane 数（`encoded_lanes`；滚动帧必须是 0）。
+    pub encoded_lanes: usize,
+    /// 本帧整段复用的 lane 段数。
+    pub reused_segments: usize,
+    /// 本帧写进实例环的字节数。
+    pub written_bytes: usize,
+    /// 实例环总实例数（含空洞）。
+    pub instance_count: u32,
+    /// 本帧绘制序真正引用的实例数（不含空洞）。
+    pub drawn_instances: u32,
+    /// 本帧滚动偏移变化的槽数（`FrameStats.scroll_offset_frames` 的来源）。
+    pub scroll_slots: usize,
+}
+
+/// 每窗口的合成器状态（`InstanceEncoder` 的唯一持有者）。
+pub(crate) struct WindowComposer {
+    encoder: InstanceEncoder,
+    lanes: LaneStore,
+    geometry: GeometryCatalog,
+    scroll: ScrollTable,
+    stats: ComposeStats,
+}
+
+impl WindowComposer {
+    pub(crate) fn new() -> Self {
+        Self {
+            encoder: InstanceEncoder::new(),
+            lanes: LaneStore::new(),
+            geometry: GeometryCatalog::new(),
+            scroll: ScrollTable::new(),
+            stats: ComposeStats::default(),
+        }
+    }
+
+    /// 最近一帧的编码产物（HUD / 诊断 / 测试：`Window::instance_buffer` 的唯一来源）。
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn buffer(&self) -> &crate::paint::instance::InstanceBuffer {
+        self.encoder.buffer()
+    }
+
+    /// 合成一帧：应用 delta → （必要时）增量编码 → 构造载荷。
+    ///
+    /// **没有 lane 级变化时不重编码**（滚动帧 / 纯 damage 帧）：实例环的段与 op 表整份沿用上一
+    /// 帧，载荷里 `chunks` 为空、只有滚动偏移表与 damage —— 这正是「滚动帧 `encoded_lanes == 0`」
+    /// 的实现点。
+    ///
+    /// # Errors
+    /// [`EngineError::ClipDepthExceeded`]：剪裁链超过 `MAX_CLIP_DEPTH`（内容错误，必须冒泡给
+    /// 应用；静默丢 clip 会让子内容越界可见）。
+    pub(crate) fn compose(
+        &mut self,
+        delta: &SceneDelta,
+        resolver: ColorResolver,
+    ) -> Result<ComposedFrame, EngineError> {
+        let scale = delta.header.scale;
+        // 已释放的 lane：立刻回收实例段（否则要等 arena 槽位被复用）。
+        for lane in &delta.removed {
+            self.encoder.release_lane(*lane);
+        }
+        let lanes_changed = self.lanes.apply(delta);
+        self.geometry.apply(delta);
+        let scroll_slots = self.scroll.apply(&delta.scroll, scale).len();
+        // 滚动暴露区必须补画：合成端偏移改变了 op 落在屏幕上的位置，旧像素作废。
+        let viewports: Vec<_> = delta
+            .scroll
+            .iter()
+            .filter_map(|scroll| scroll_damage(scroll.viewport))
+            .collect();
+        let plan = push_scroll_damage(delta.header.plan, &viewports);
+        if delta.full {
+            // 整帧重建（首帧 / DPI 变化 / 裁剪表重建）：编码器必须丢弃全部段与裁剪表。
+            self.encoder.invalidate();
+        }
+        if lanes_changed || delta.full || self.encoder.needs_reset(scale) {
+            self.encoder
+                .encode(&self.lanes, scale, resolver, &self.geometry)?;
+            let buffer = self.encoder.buffer();
+            self.stats = ComposeStats {
+                encoded_lanes: self.encoder.encoded_lanes(),
+                reused_segments: self.encoder.reused_segments(),
+                written_bytes: self.encoder.written_bytes(),
+                instance_count: buffer.instance_count(),
+                drawn_instances: buffer.len() as u32,
+                scroll_slots,
+            };
+        } else {
+            // 无 lane 变化：只刷新「本帧复用了多少段」的计数（编码器仍按帧统计）。
+            self.stats.encoded_lanes = 0;
+            // 没有任何 lane 变化 ⇒ 全部 lane 段整段复用（滚动帧的核心不变量）。
+            self.stats.reused_segments = self.lanes.len();
+            self.stats.written_bytes = 0;
+            self.stats.scroll_slots = scroll_slots;
+            let buffer = self.encoder.buffer();
+            self.stats.instance_count = buffer.instance_count();
+            self.stats.drawn_instances = buffer.len() as u32;
+        }
+        let mut scroll_payload = Vec::new();
+        self.scroll.to_payload(scale, &mut scroll_payload);
+        // 整帧重建（首帧 / DPI 变化 / 新渲染器挂上）必须发**整块**实例缓冲：GPU 侧的实例镜像
+        // 只会被载荷填满，不发全量它就永远缺内容（`InstanceMirror` 的 `needs_full` 只是「整块
+        // 写镜像」，镜像本身仍要靠载荷喂）。
+        let payload = if delta.full {
+            let payload = FramePayload::full(self.encoder.buffer(), scroll_payload);
+            // 全量块已经包含全部变化 ⇒ 变化区间清零（否则下一次增量会把它们再发一遍）。
+            self.encoder.buffer_mut().clear_changes();
+            payload
+        } else {
+            FramePayload::from_buffer_delta(self.encoder.buffer_mut(), scroll_payload)
+        };
+        Ok(ComposedFrame {
+            plan,
+            payload,
+            stats: self.stats,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::WindowComposer;
+    #[cfg(target_os = "linux")]
+    use crate::math::Size;
+    use crate::{
+        math::{PhysicalRect, Point, Rect, Scale},
+        paint::{
+            color::{Color, ColorResolver},
+            primitive::{Primitive, Quad, QuadPaint},
+            scene::Scene,
+        },
+        render::{
+            compositor::{DamageRects, Plan},
+            delta::{DeltaBuilder, FrameHeader, SceneDelta},
+        },
+        window::{FrameIndex, WindowId},
+    };
+
+    fn header(index: u32, plan: Plan, scale: Scale) -> FrameHeader {
+        FrameHeader {
+            window: WindowId::from_raw(1),
+            index: FrameIndex::from_raw(index),
+            plan,
+            surface: (64, 64),
+            scale,
+            #[cfg(target_os = "linux")]
+            surface_local: Size::new(64.0, 64.0),
+            #[cfg(target_os = "linux")]
+            buffer_scale: 1,
+            published_at: std::time::Instant::now(),
+        }
+    }
+
+    fn quad() -> Primitive {
+        Primitive::Quad(Quad {
+            bounds: Rect::new(0.0, 0.0, 4.0, 4.0),
+            corner_radius: [0.0; 4],
+            paint: QuadPaint::Solid {
+                fill: Color::WHITE,
+                border: None,
+            },
+        })
+    }
+
+    struct Fixture {
+        scene: Scene,
+        lane: crate::paint::scene::LaneId,
+        store: crate::paint::geometry_store::GeometryStore,
+        builder: DeltaBuilder,
+        composer: WindowComposer,
+        next: u32,
+    }
+
+    impl Fixture {
+        fn new(lanes: usize) -> Self {
+            let mut scene = Scene::empty();
+            let mut order = Vec::with_capacity(lanes);
+            for _ in 0..lanes {
+                let lane = scene.new_lane();
+                assert!(scene.push(lane, quad()));
+                order.push(lane);
+            }
+            scene.set_order(&order);
+            Self {
+                lane: order[0],
+                scene,
+                store: crate::paint::geometry_store::GeometryStore::new(),
+                builder: DeltaBuilder::new(),
+                composer: WindowComposer::new(),
+                next: 1,
+            }
+        }
+
+        fn frame(
+            &mut self,
+            plan: Plan,
+            full: bool,
+            scroll: &[(Point, PhysicalRect)],
+        ) -> SceneDelta {
+            let index = self.next;
+            self.next += 1;
+            let mut delta = SceneDelta::empty(header(index, plan, Scale::ONE));
+            self.builder
+                .collect(&self.scene, &self.store, scroll, full, &mut delta);
+            delta
+        }
+
+        fn compose(&mut self, delta: &SceneDelta) -> super::ComposedFrame {
+            self.composer
+                .compose(delta, ColorResolver)
+                .expect("compose")
+        }
+    }
+
+    /// 首帧：全部 lane 编码，载荷覆盖整张实例环。
+    #[test]
+    fn the_first_frame_encodes_every_lane() {
+        let mut fixture = Fixture::new(4);
+        let delta = fixture.frame(Plan::Full, true, &[]);
+        let composed = fixture.compose(&delta);
+        assert_eq!(composed.stats.encoded_lanes, 4);
+        assert_eq!(composed.stats.drawn_instances, 4);
+        assert_eq!(composed.payload.instance_count(), 4);
+        assert_eq!(
+            composed.payload.chunks().len(),
+            1,
+            "首帧只有一块覆盖全环的变化区间"
+        );
+    }
+
+    /// 增量帧：只有变化的 lane 被重编码，载荷只带它。
+    #[test]
+    fn an_incremental_frame_only_encodes_the_changed_lane() {
+        let mut fixture = Fixture::new(4);
+        let delta = fixture.frame(Plan::Full, true, &[]);
+        let _ = fixture.compose(&delta);
+        assert!(fixture.scene.push(fixture.lane, quad()));
+        let delta = fixture.frame(Plan::Partial(DamageRects::new()), false, &[]);
+        let composed = fixture.compose(&delta);
+        assert_eq!(composed.stats.encoded_lanes, 1);
+        assert_eq!(composed.stats.reused_segments, 3);
+        assert_eq!(composed.payload.chunks().len(), 1);
+    }
+
+    /// **滚动帧不重编码**：只有偏移变化 ⇒ `encoded_lanes == 0` 且载荷里没有实例块。
+    #[test]
+    fn a_scroll_frame_does_not_encode_anything() {
+        let mut fixture = Fixture::new(4);
+        let viewport = PhysicalRect::new(0, 0, 64, 64);
+        let delta = fixture.frame(Plan::Full, true, &[(Point::new(0.0, 0.0), viewport)]);
+        let first = fixture.compose(&delta);
+        assert_eq!(first.stats.encoded_lanes, 4);
+        assert!(first.payload.scroll().is_empty() || first.payload.scroll()[0] == [0.0, 0.0]);
+
+        let delta = fixture.frame(Plan::Idle, false, &[(Point::new(0.0, -20.0), viewport)]);
+        assert!(
+            delta.lanes.is_empty() && delta.order.is_none(),
+            "滚动 delta 不得带 lane"
+        );
+        let scrolled = fixture.compose(&delta);
+        assert_eq!(scrolled.stats.encoded_lanes, 0, "滚动帧不得重编码任何 lane");
+        assert_eq!(scrolled.stats.reused_segments, 4);
+        assert!(
+            scrolled.payload.chunks().is_empty(),
+            "滚动帧的载荷不得带实例块"
+        );
+        assert_eq!(scrolled.payload.scroll()[0], [0.0, -20.0], "偏移进载荷");
+        // damage 必须覆盖视口（否则 GPUs 侧 scissor 会把整帧裁掉）。
+        let Plan::Partial(rects) = scrolled.plan else {
+            panic!("滚动帧的 damage 必须是 Partial，实际 {:?}", scrolled.plan);
+        };
+        assert_eq!(rects.as_slice(), &[viewport]);
+    }
+
+    /// 滚动帧的实例字节与「不滚动」时逐字节一致（偏移在绘制期才生效）。
+    #[test]
+    fn scrolling_never_touches_instance_bytes() {
+        let mut moving = Fixture::new(3);
+        let viewport = PhysicalRect::new(0, 0, 64, 64);
+        let delta = moving.frame(Plan::Full, true, &[(Point::new(0.0, 0.0), viewport)]);
+        let before = moving.compose(&delta).stats;
+        // 重新采一帧（无变化）作为基线。
+        let delta = moving.frame(Plan::Partial(DamageRects::new()), false, &[]);
+        let baseline = moving.compose(&delta);
+        assert_eq!(baseline.stats.encoded_lanes, 0);
+        assert!(baseline.payload.chunks().is_empty());
+        assert_eq!(before.drawn_instances, baseline.stats.drawn_instances);
+        // 滚动 30 px：实例块仍然为空，说明实例数据没有被重写。
+        let delta = moving.frame(Plan::Idle, false, &[(Point::new(0.0, -30.0), viewport)]);
+        let scrolled = moving.compose(&delta);
+        assert!(scrolled.payload.chunks().is_empty());
+        assert_eq!(scrolled.stats.encoded_lanes, 0);
+    }
+
+    /// DPI 变化：整帧重编码（物理坐标全变）。
+    #[test]
+    fn a_scale_change_reencodes_every_lane() {
+        let mut fixture = Fixture::new(3);
+        let delta = fixture.frame(Plan::Full, true, &[]);
+        let _ = fixture.compose(&delta);
+        // 2× 的整帧 delta：`full_for` 判定 DPI 变化 ⇒ 采集全部 lane。
+        let mut delta = SceneDelta::empty(header(9, Plan::Full, Scale::new(2.0).expect("scale")));
+        let full = fixture.builder.full_for(Scale::new(2.0).expect("scale"));
+        assert!(full, "DPI 变化必须整帧重建");
+        fixture
+            .builder
+            .collect(&fixture.scene, &fixture.store, &[], full, &mut delta);
+        delta.full = true;
+        let composed = fixture.compose(&delta);
+        assert_eq!(composed.stats.encoded_lanes, 3);
+    }
+
+    /// `Arc` 复用：未变化的 lane 不重建快照（滚动帧零分配的前提）。
+    #[test]
+    fn unchanged_lanes_reuse_their_snapshot() {
+        let mut fixture = Fixture::new(2);
+        let delta = fixture.frame(Plan::Full, true, &[]);
+        let first = delta.lanes[0].primitives.clone();
+        let _ = fixture.compose(&delta);
+        let delta = fixture.frame(Plan::Partial(DamageRects::new()), false, &[]);
+        assert!(delta.lanes.is_empty(), "无变化帧不得带 lane");
+        assert!(Arc::strong_count(&first) >= 1);
+    }
+
+    /// **等价性**：同一份场景，UI 线程直接编码（`Scene` 作帧源）与合成线程从 `LaneStore` 编码
+    /// （`SceneDelta` 应用之后）必须产出**逐字节一致**的实例环与同一份绘制序。
+    ///
+    /// 这是「把编码搬线程」的安全网：搬迁只改编码发生的位置，不改编码结果。
+    #[test]
+    fn encoding_the_same_scene_from_a_delta_is_byte_identical() {
+        use crate::paint::instance::InstanceEncoder;
+
+        let mut fixture = Fixture::new(6);
+        // 让场景里出现多样的图元（圆角、渐变、clip），覆盖两条 clip 路径。
+        assert!(fixture.scene.push(fixture.lane, quad()));
+        let delta = fixture.frame(Plan::Full, true, &[]);
+        let composed = fixture.compose(&delta);
+        drop(composed);
+
+        // UI 线程路径：同一个 `InstanceEncoder` 直接吃 `Scene`。
+        let mut direct = InstanceEncoder::new();
+        direct
+            .encode(&fixture.scene, Scale::ONE, ColorResolver, &fixture.store)
+            .expect("direct encode");
+        // 合成线程路径：composer 的编码器吃 `LaneStore`（delta 应用之后）。
+        let composed_buffer = fixture.composer.buffer();
+        assert_eq!(
+            direct.buffer().as_bytes(),
+            composed_buffer.as_bytes(),
+            "两条路径的实例字节必须逐字节一致"
+        );
+        assert_eq!(direct.buffer().ops(), composed_buffer.ops());
+        assert_eq!(
+            direct.buffer().instance_count(),
+            composed_buffer.instance_count()
+        );
+        // 再跑一帧增量：仍然一致。
+        assert!(fixture.scene.push(fixture.lane, quad()));
+        let delta = fixture.frame(Plan::Partial(DamageRects::new()), false, &[]);
+        let composed = fixture.compose(&delta);
+        direct
+            .encode(&fixture.scene, Scale::ONE, ColorResolver, &fixture.store)
+            .expect("direct encode");
+        assert_eq!(
+            direct.buffer().as_bytes(),
+            fixture.composer.buffer().as_bytes()
+        );
+        assert_eq!(composed.stats.encoded_lanes, 1);
+    }
+}

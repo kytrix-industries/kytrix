@@ -10,7 +10,7 @@
 //! | dword | 字段                | 语义                                                     |
 //! |-------|---------------------|----------------------------------------------------------|
 //! | 0     | `frame.viewport`    | `(w_px, h_px, 2/w_px, 2/h_px)`                           |
-//! | 4     | `frame.params`      | `(scale, 0, 0, 0)`；只用于 geometry 的逻辑→物理换算      |
+//! | 4     | `frame.params`      | `(scale, scroll_x, scroll_y, 0)`；`.x` 是 DPI，`.yz` 是滚动偏移 |
 //! | 8     | `draw.basis`        | `(m11, m12, m21, m22)`                                   |
 //! | 12    | `draw.translation`  | `(tx, ty, 0, 0)`                                         |
 //! | 16    | `draw.color0`       | linear premultiplied RGBA                                |
@@ -96,6 +96,22 @@ impl RootUniform {
         self
     }
 
+    /// 写入本 op 的**滚动偏移**（物理像素；`frame.params.yz`）。
+    ///
+    /// B6-2 的合成端偏移：滚动帧不重编码任何实例，GPU 侧只把该槽位的偏移写进 root constant，
+    /// 由实例顶点 shader 在**最后一步**（`to_ndc` 之前）加到世界坐标上。因此实例字节里烘焙的
+    /// 坐标始终是「滚动容器内容空间」，与偏移无关。
+    ///
+    /// 为什么用 `frame.params.zw` 而不是 `draw.clip.zw`：`draw` 块在实例路径上整体不被读取
+    /// （`RootUniform::frame` 写恒等变换占位），而 `frame.params.x` 已被 DPI 占用，
+    /// `.yz` 是 frame 块里唯一未使用的两个 dword；几何绘制用 `.zw` 同样语义一致
+    /// （`geometry_root` 会把逻辑偏移直接并进 `draw.translation`）。
+    pub(crate) fn with_scroll(mut self, offset: [f32; 2]) -> Self {
+        self.words[5] = offset[0];
+        self.words[6] = offset[1];
+        self
+    }
+
     /// 平台 API 需要 `*const c_void` / `&[f32]` 时的零拷贝视图。
     pub(crate) fn words(&self) -> &[f32; ROOT_UNIFORM_DWORDS] {
         &self.words
@@ -130,6 +146,20 @@ mod tests {
         assert_eq!(uniform.words()[2], 0.0);
         assert_eq!(uniform.words()[3], 0.0);
         assert!(uniform.words().iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn the_scroll_offset_lands_in_frame_params_yz() {
+        let uniform = RootUniform::frame(64.0, 64.0, 2.0).with_scroll([0.0, -30.0]);
+        assert_eq!(uniform.words()[4], 2.0, "DPI 不受影响");
+        assert_eq!(uniform.words()[5], 0.0);
+        assert_eq!(uniform.words()[6], -30.0);
+        assert_eq!(uniform.words()[7], 0.0, "保留恒 0");
+        // 默认（无滚动）是 0，因此不开滚动的帧与旧行为逐字节一致。
+        assert_eq!(
+            &RootUniform::frame(64.0, 64.0, 2.0).words()[5..8],
+            &[0.0, 0.0, 0.0]
+        );
     }
 
     #[test]

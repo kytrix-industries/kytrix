@@ -36,6 +36,26 @@ pub enum Axis {
 ///
 /// 用 `taffy::Size<…>` 而不是引擎 `math::Size`：引擎 `Size` 按 P01 §6.3 冻结为纯 `f32`，无法表达
 /// `Option` / 三态可用空间；taffy 已是公开面的一部分（`Style.inner`，DEVIATIONS F-35）。
+///
+/// # 三态可用空间的语义（B8：与真实布局**同源**）
+///
+/// 文本类 measure 必须对三种输入给出**同一套 break/wrap 逻辑**的结果（`text::ShapedText::measure`
+/// 是引擎内的参考实现，`text::shape` 的 `measure_*` 测试钉住了"measure == rasterized"）：
+///
+/// | 输入 | 语义 | 文本实现的取值 |
+/// |---|---|---|
+/// | `MaxContent` | 不换行时的宽度 / 高度：**最长单行** | `max_size`（一行） |
+/// | `MinContent` | 允许任意断行时能压到的最小宽度 / 对应高度：**最长不可断片段**（CJK 逐字、拉丁按词） | `min_size`（多行） |
+/// | `Definite(w)` | 在 `w` 处的**真实断行结果**（与绘制同一次 `break_all_lines`）：宽度 ≤ `w` 的最长行、高度 = 实际行高之和 | 复用同一份 parley `Layout` 就地重排 |
+///
+/// 三态都必须应用 [`crate::text::TextStyle`] 的 `max_lines`（截断后的**可见高度**，不是全部行高）
+/// 与 `overflow: Ellipsis`（省略号不改变行高，故不改变 measure 高度）。不满足这三条的 measure
+/// 会让"测的"与"画的"分叉：taffy 按测量值排版，而 `layout_text` 按真实断行绘制。
+///
+/// # 与 `LayoutOverride` 的关系
+///
+/// 节点一旦有 [`LayoutOverride`]，measure **不参与**它的盒子（尺寸由应用给定）；文本仍会 shape
+/// 并在自己的内容宽内断行。measure 与 override 同时存在时不要用测量值推断布局。
 pub type MeasureFn =
     Box<dyn Fn(taffy::Size<Option<f32>>, taffy::Size<taffy::AvailableSpace>) -> Size>;
 
@@ -73,4 +93,10 @@ pub struct LayoutReport {
     pub cache_hits: usize,
     /// taffy cache 未命中次数。
     pub cache_misses: usize,
+    /// 本轮 post-pass **写过**子树包围盒的节点数（B9 的增量性证据）。
+    ///
+    /// 旧实现每轮布局无条件全树重算包围盒 ⇒ 该值恒等于节点总数；增量实现对"没变化的子树"
+    /// 直接跳过，单节点变化时它应与**该节点的祖先链长度**同阶（见 `layout` 基准与
+    /// `incremental_post_pass_touches_only_the_changed_path` 测试）。
+    pub bounds_updated: usize,
 }

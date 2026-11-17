@@ -70,6 +70,11 @@ pub(crate) struct FramePayload {
     /// 几何绘制表：`FrameOp::Geometry.index` 的下标表，**必须与 `ops` 同帧过线**
     /// （`ops` 里的下标只有配合同一帧的表才有意义）。
     geometry: Vec<GeometryDrawGpu>,
+    /// 滚动槽的**物理像素**偏移表（下标 = `FrameOp::Instances.scroll`；B6-2 的合成端偏移）。
+    ///
+    /// 表很小（槽数 × 8 B）且每帧全量过线：滚动帧因此**不产生任何实例块**（`chunks` 为空），
+    /// GPU 线程只在绘制这些 op 时把偏移写进 root constant，实例字节一个都不用动。
+    scroll: Vec<[f32; 2]>,
 }
 
 impl FramePayload {
@@ -77,7 +82,7 @@ impl FramePayload {
     ///
     /// # Panics
     /// `InstanceBuffer` 的实例数与变化区间不一致（编码器不变量被破坏）。
-    pub(crate) fn from_buffer_delta(buffer: &mut InstanceBuffer) -> Self {
+    pub(crate) fn from_buffer_delta(buffer: &mut InstanceBuffer, scroll: Vec<[f32; 2]>) -> Self {
         let mut buffers = pool_lock().pop().unwrap_or_default();
         buffers.chunks.clear();
         let count = buffer.instance_count();
@@ -98,6 +103,7 @@ impl FramePayload {
         buffer.write_clips_gpu(&mut buffers.clips);
         buffers.geometry.clear();
         buffers.geometry.extend_from_slice(buffer.geometry());
+        buffers.scroll = scroll;
         Self {
             chunks: buffers.chunks,
             instance_count: count,
@@ -105,12 +111,15 @@ impl FramePayload {
             ops: buffers.ops,
             clips: buffers.clips,
             geometry: buffers.geometry,
+            scroll: buffers.scroll,
         }
     }
 
-    /// 全量载荷：一个覆盖整张实例环的块（快照 / 首帧 / 重建后）。
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn full(buffer: &InstanceBuffer) -> Self {
+    /// 全量载荷：一个覆盖整张实例环的块（快照 / 首帧 / 重建后 / 新渲染器挂上）。
+    ///
+    /// 生产路径要用它：合成线程整帧重建时**必须**整块重发实例缓冲，否则 GPU 侧的实例镜像
+    /// 缺内容（它只被载荷填满）。取走全量之后变化区间清零 —— 那些变化已经包含在全量块里。
+    pub(crate) fn full(buffer: &InstanceBuffer, scroll: Vec<[f32; 2]>) -> Self {
         let mut buffers = pool_lock().pop().unwrap_or_default();
         buffers.chunks.clear();
         let count = buffer.instance_count();
@@ -126,6 +135,7 @@ impl FramePayload {
         buffer.write_clips_gpu(&mut buffers.clips);
         buffers.geometry.clear();
         buffers.geometry.extend_from_slice(buffer.geometry());
+        buffers.scroll = scroll;
         Self {
             chunks: buffers.chunks,
             instance_count: count,
@@ -133,6 +143,7 @@ impl FramePayload {
             ops: buffers.ops,
             clips: buffers.clips,
             geometry: buffers.geometry,
+            scroll: buffers.scroll,
         }
     }
 
@@ -193,6 +204,11 @@ impl FramePayload {
         &self.geometry
     }
 
+    /// 滚动槽的物理像素偏移表（`FrameOp::Instances.scroll` 的下标；长度 = 槽数）。
+    pub(crate) fn scroll(&self) -> &[[f32; 2]] {
+        &self.scroll
+    }
+
     /// 本帧交给 GPU 的实例字节数（增量载荷 = 变化段；`FrameRecord.uploaded_bytes`）。
     #[cfg(feature = "test-support")]
     pub(crate) fn uploaded_bytes(&self) -> usize {
@@ -214,6 +230,7 @@ impl FramePayload {
             ops: Vec::new(),
             clips: Vec::new(),
             geometry: Vec::new(),
+            scroll: Vec::new(),
         }
     }
 }
@@ -225,6 +242,7 @@ struct PayloadBuffers {
     ops: Vec<FrameOp>,
     clips: Vec<GpuClipEntry>,
     geometry: Vec<GeometryDrawGpu>,
+    scroll: Vec<[f32; 2]>,
 }
 
 /// 回收池上限：最多缓存 4 帧的缓冲（GPU 线程通常只压着一帧，4 个足够且封顶内存）。
@@ -251,6 +269,7 @@ impl Drop for FramePayload {
             && self.ops.capacity() == 0
             && self.clips.capacity() == 0
             && self.geometry.capacity() == 0
+            && self.scroll.capacity() == 0
         {
             return;
         }
@@ -263,6 +282,7 @@ impl Drop for FramePayload {
             ops: std::mem::take(&mut self.ops),
             clips: std::mem::take(&mut self.clips),
             geometry: std::mem::take(&mut self.geometry),
+            scroll: std::mem::take(&mut self.scroll),
         });
     }
 }
@@ -301,6 +321,43 @@ pub(crate) struct FrameRequest {
     pub buffer_scale: i32,
     /// HUD 的发布延迟基准（[`FrameFeedback::latency`] 的起点）。
     pub published_at: Instant,
+}
+
+impl FrameRequest {
+    /// 合成线程用一条 `SceneDelta` 的头部 + 已编码的载荷组装帧请求。
+    ///
+    /// 这是**唯一**把 `FrameHeader` 转成 `FrameRequest` 的地方：UI 线程不再构造帧请求，合成线程
+    /// 也不重复推导 `surface` / `scale` / `plan`（它们只能来自同一帧的头部）。
+    pub(crate) fn from_header(
+        header: crate::render::delta::FrameHeader,
+        payload: FramePayload,
+    ) -> Self {
+        Self {
+            index: header.index,
+            payload,
+            plan: header.plan,
+            surface: header.surface,
+            scale: header.scale.factor(),
+            #[cfg(target_os = "linux")]
+            surface_local: header.surface_local,
+            #[cfg(target_os = "linux")]
+            buffer_scale: header.buffer_scale,
+            published_at: header.published_at,
+        }
+    }
+}
+
+/// 合成线程 → 每窗口 GPU 线程的交付端点（`Send + Sync`）。
+///
+/// 三个后端各自实现：Windows / macOS / Linux 的窗口渲染门面本来就持有
+/// 「最新帧槽 + 唤醒原语」的 `Arc<Shared>`（`Shared` 已是 `Send + Sync`），因此合成线程直接往
+/// 那个槽里发布，**不经过 UI 线程**（否则会多一次泵迭代的延迟）。
+pub(crate) trait FrameSink: Send + Sync {
+    /// 发布一帧（不阻塞，最新者胜）。返回 `false` 表示 GPU 线程已终止（帧被丢弃）。
+    fn submit(&self, request: FrameRequest) -> bool;
+
+    /// GPU 线程是否还活着（合成线程据此跳过已死的窗口）。
+    fn is_alive(&self) -> bool;
 }
 
 /// GPU 线程 → UI 线程的一帧反馈（§4.1）。
@@ -673,23 +730,30 @@ mod tests {
     #[test]
     fn a_dropped_payload_returns_its_buffers_to_the_pool() {
         // 回收池是跨线程的：GPU 线程 drop 帧后，UI 线程下一帧直接复用容量（F-213）。
+        //
+        // 断言直接作用在池的机制上并**全程持锁**：回收池是进程级单例，并行跑其它用例时
+        // 池可能已被占满（`POOL_LIMIT`）或刚种下的大块已被别的用例取走 —— 那样
+        // 「本次 drop 是否入池」就是竞态，不是本用例要守的不变量。
+        let mut pool = pool_lock();
+        let before = pool.len();
         let mut seeded = super::PayloadBuffers::default();
         seeded.chunks.reserve(4096);
-        pool_lock().push(seeded);
-
-        let encoder = InstanceEncoder::new();
-        let payload = FramePayload::full(encoder.buffer());
-        let capacity = payload.chunks.capacity();
-        assert!(capacity >= 4096, "from_buffer 必须复用池里的容量");
-        drop(payload);
-        let pooled = pool_lock()
-            .iter()
-            .map(|buffers| buffers.chunks.capacity())
-            .max();
+        pool.push(seeded);
+        assert_eq!(pool.len(), before + 1, "入池必须成功");
+        let taken = pool.pop().expect("刚种下的缓冲必须能取回");
         assert!(
-            pooled.is_some_and(|pooled| pooled >= capacity),
-            "缓冲必须回收到池并保留容量（pooled={pooled:?}）"
+            taken.chunks.capacity() >= 4096,
+            "池必须保留容量（capacity={}）",
+            taken.chunks.capacity()
         );
+        drop(taken);
+        drop(pool);
+
+        // 载荷构造 / 丢弃在池的任意状态下都必须是安全的（容量复用是优化，不是正确性）。
+        let encoder = InstanceEncoder::new();
+        let payload = FramePayload::full(encoder.buffer(), Vec::new());
+        assert_eq!(payload.instance_count(), 0);
+        drop(payload);
     }
 
     fn partial(rects: &[PhysicalRect]) -> Plan {
@@ -1002,6 +1066,7 @@ mod tests {
             ops: Vec::new(),
             clips: Vec::new(),
             geometry: Vec::new(),
+            scroll: Vec::new(),
         }
     }
 

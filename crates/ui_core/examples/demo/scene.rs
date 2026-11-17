@@ -598,14 +598,14 @@ impl Scene {
 
     /// 读—改—写输入框状态（`App::write` 对等值短路，不产生多余失效）。
     fn update_ime(&self, app: &mut App, apply: impl FnOnce(&mut ImeField)) {
-        let mut field = app.read(&self.ime);
+        let mut field = (*app.read(&self.ime)).clone();
         apply(&mut field);
         app.write(&self.ime, field);
     }
 
     /// 方向键调整滑块（钳制在 10%–100%）。
     fn step_scale(&self, app: &mut App, step: i8) {
-        let mut state = app.read(&self.a11y);
+        let mut state = (*app.read(&self.a11y)).clone();
         state.step_scale(step);
         app.write(&self.a11y, state);
     }

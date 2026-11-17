@@ -381,4 +381,114 @@ mod tests {
             Err(EngineError::StaleNode { .. })
         ));
     }
+
+    /// B8：文本 measure 与布局提交**同源**（三态可用空间 + `max_lines` 截断）。
+    ///
+    /// 复刻 `app/text_pass` 的接线（`ShapedText::measure` 作为节点 measure），断言：
+    /// 1. `Definite(w)` 的测量高度 == taffy 写进 `layout.bounds` 的高度（测的和排的是同一次断行）；
+    /// 2. `max_lines` 在三态里都生效（可见高度 = 截断后的行高和，不是全部行高）；
+    /// 3. `MinContent <= Definite(w) <= MaxContent` 的宽度序（w 取两者之间）。
+    #[test]
+    fn text_measure_matches_the_committed_layout_for_all_three_available_spaces() {
+        use taffy::AvailableSpace;
+
+        use crate::text::{TextContent, TextOverflow, TextStyle};
+
+        let mut text = crate::text::context::TextContext::new();
+        let style = TextStyle::new(16.0).with_overflow(TextOverflow::Ellipsis, 2);
+        let content = TextContent::new(
+            smol_str::SmolStr::new_static("lorem ipsum dolor sit amet consectetur adipiscing elit"),
+            style,
+        );
+        let (shaped, _) = text.shape_cached(&content);
+
+        let min_content = shaped.measure(
+            taffy::Size {
+                width: None,
+                height: None,
+            },
+            taffy::Size {
+                width: AvailableSpace::MinContent,
+                height: AvailableSpace::MaxContent,
+            },
+        );
+        let max_content = shaped.measure(
+            taffy::Size {
+                width: None,
+                height: None,
+            },
+            taffy::Size {
+                width: AvailableSpace::MaxContent,
+                height: AvailableSpace::MaxContent,
+            },
+        );
+        assert!(
+            min_content.width <= max_content.width,
+            "MinContent 宽度必须 ≤ MaxContent：{min_content:?} vs {max_content:?}"
+        );
+        assert!(
+            min_content.height >= max_content.height,
+            "min-content 会换更多行（被 max_lines=2 截断后仍 ≥ 单行高度）：{min_content:?} vs {max_content:?}"
+        );
+
+        // 取两者之间、且必然触发换行的宽度。
+        let width = ((min_content.width + max_content.width) / 2.0).max(min_content.width);
+        let measured = shaped.measure(
+            taffy::Size {
+                width: None,
+                height: None,
+            },
+            taffy::Size {
+                width: AvailableSpace::Definite(width),
+                height: AvailableSpace::MaxContent,
+            },
+        );
+        assert!(
+            measured.width <= width + 0.001,
+            "Definite(w) 的测量宽不得超过可用宽：{measured:?}（w={width}）"
+        );
+
+        // 把同一份 measure 接进节点，跑真实布局（宽度固定、高度 auto）。
+        // 根设 `align_items: flex-start`，否则 flex 的 stretch 会把子节点高度拉满根高，
+        // 看不到"测量高度 → 提交高度"的链路。
+        let measure_shaped = Rc::clone(&shaped);
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        {
+            let mut root_style = fixed(400.0, 400.0);
+            root_style.inner.align_items = taffy::style::AlignItems::FLEX_START;
+            root_style.inner.flex_direction = taffy::style::FlexDirection::Column;
+            tree.set_style(root, root_style).expect("root 存活");
+        }
+        let mut node_style = fixed(width, 0.0);
+        node_style.inner.size.height = taffy::style::Dimension::auto();
+        let node = NodeBuilder::boxed()
+            .style(node_style)
+            .measure(Box::new(move |known, available| {
+                measure_shaped.measure(known, available)
+            }))
+            .build(&mut tree, root)
+            .expect("挂载成功");
+
+        let _ = tree
+            .compute_layout(taffy::geometry::Size {
+                width: Some(400.0),
+                height: Some(400.0),
+            })
+            .expect("布局成功");
+
+        let committed = bounds(&tree, node);
+        assert_eq!(
+            committed.size.width, width,
+            "固定宽度节点的提交宽度 = 样式宽（measure 只决定内容尺寸）"
+        );
+        assert_eq!(
+            committed.size.height, measured.height,
+            "提交高度必须等于 Definite(内容宽) 的测量高度：测的和排的是同一次断行 + 同一份 max_lines 截断"
+        );
+        assert!(
+            measured.height >= max_content.height,
+            "定宽断行后的可见高度不得小于单行高度（max_lines 截断只会截掉多余行）：{measured:?}"
+        );
+    }
 }

@@ -24,7 +24,7 @@ mod traverse;
 
 #[cfg(feature = "test-support")]
 use std::cell::RefCell;
-use std::{fmt, rc::Rc};
+use std::{fmt, rc::Rc, sync::Arc};
 
 use smallvec::SmallVec;
 use smol_str::SmolStr;
@@ -73,7 +73,7 @@ pub enum NodeKind {
     /// 普通容器/叶子：由引擎按 `Style`/`StylePatch` 生成图元。
     Box,
     /// 自绘节点：挂载时提交的画布内容（P02 的 `Canvas`；`Rc` 共享，paint 只加引用计数）。
-    Canvas(Rc<Canvas>),
+    Canvas(Arc<Canvas>),
     /// 静态几何节点：引用 P09 的 GPU 几何。
     Geometry(GeometryId),
     /// 文本叶子：载荷是 [`TextContent`]，布局由 `App::refresh_text` 注入的 measure 闭包完成。
@@ -88,6 +88,12 @@ impl NodeKind {
     #[must_use]
     pub(crate) fn is_leaf(&self) -> bool {
         matches!(self, Self::Canvas(_) | Self::Geometry(_) | Self::Text(_))
+    }
+
+    /// 静态几何节点（唯一会被 per-draw `Transform` 影响的种类；命中走逆变换）。
+    #[must_use]
+    pub(crate) fn is_geometry(&self) -> bool {
+        matches!(self, Self::Geometry(_))
     }
 
     /// 文本载荷（P06 的 paint 分派与 `App::refresh_text` 的唯一读入口）。
@@ -263,8 +269,16 @@ impl Node {
 
     /// 节点自己的句柄（消费者：P08 的 `Probe`、诊断日志）。
     #[must_use]
+    /// 节点句柄（含窗口归属；`arena` 铸出的原值）。
     pub fn id(&self) -> NodeId {
         self.id
+    }
+
+    /// 重贴句柄（消费者：`NodeTree::bind_window` —— 树绑定窗口时重贴根节点的键）。
+    ///
+    /// 只有根节点会在绑定窗口前存在，因此这是**一次性**的初始化操作，不是可变身份。
+    pub(crate) fn retag(&mut self, id: NodeId) {
+        self.id = id;
     }
 
     /// 父句柄；`None` = root。
@@ -370,6 +384,27 @@ pub(crate) struct PaintNodeState {
 pub struct NodeTree {
     arena: Arena<Node>,
     root: NodeId,
+    /// 该树绑定的窗口（`None` = 未绑定：测试 / headless 直接构造的树，句柄为通配作用域）。
+    ///
+    /// 绑定后，铸出的每个 `NodeId` 都带窗口 tag；把 A 窗的句柄传给 B 窗的 API 会在
+    /// `NodeTree::get` 处**确定性**返回 `StaleNode`（R03-7，不是"碰巧索引不同"）。
+    window: Option<crate::window::WindowId>,
+    /// 布局提交前的**设备像素吸附比例**（B7；`None` = 关闭）。
+    ///
+    /// 语义见 [`NodeTree::set_device_scale`]：只吸附提交给绘制的**边界**（`layout.bounds` 的
+    /// 四边），taffy 的内部布局（`local` / 内容宽 / min-max 约束）保持未圆整。
+    device_scale: Option<f32>,
+    /// 命中测试因**不可逆变换 / 非有限几何**而跳过的节点次数（C11/C13 的诊断面）。
+    ///
+    /// `hit_test` 只有 `Option<HitResult>` 一个返回通道，"跳过"无法从结果里区分于"没命中"；
+    /// 计数器让这类故障**可观测**（测试断言 + HUD/日志），而不是静默变成"点不动"。
+    hit_test_skips: std::cell::Cell<u64>,
+    /// 每节点上次布局的**未圆整**绝对原点（仅 `device_scale.is_some()` 时维护）。
+    ///
+    /// 吸附开启后，"父盒吸附后没变"不再蕴含"子树吸附后也没变"：父在同一个设备像素内移动
+    /// 0.4dp，自己吸附回原值、而孙子的边界可能跨过半像素。这个旁表让 post-pass 的早期退出
+    /// 判定同时看**未圆整**位移（8 B/节点；整数 DPI 下不分配，见 `set_device_scale`）。
+    raw_origins: Vec<Point>,
     /// taffy 布局缓存（**按需**：只有真正参与过布局的节点才有条目）。
     ///
     /// 按 `NodeId`（含代际）索引，卸载即删除；`taffy::Cache` 约 0.5 KB，所以不能像旁表那样
@@ -468,6 +503,40 @@ impl NodeTree {
     pub fn root(&self) -> NodeId {
         arena::root(self)
     }
+    /// 把树绑定到窗口（`App::create_window` 在 `Window::new` 之后立刻调用）。
+    ///
+    /// 绑定后铸出的句柄带窗口身份：跨窗口误用会在 `get` 处确定性返回 `StaleNode`（R03-7）。
+    pub(crate) fn bind_window(&mut self, window: crate::window::WindowId) {
+        arena::bind_window(self, window)
+    }
+    /// 该树绑定的窗口（`None` = 未绑定：测试直接构造的树）。
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn window(&self) -> Option<crate::window::WindowId> {
+        self.window
+    }
+    /// 树的窗口 tag（`0` = 未绑定；taffy 回调补全句柄身份用）。
+    #[must_use]
+    pub(crate) fn window_tag(&self) -> u32 {
+        arena::window_tag(self)
+    }
+    /// 设置**布局提交前的设备像素吸附**比例（B7）。
+    ///
+    /// 语义（只吸附"边界"，不吸附"内部尺寸"）：
+    /// - `layout.bounds` 的四条边界各自 `round(dp × scale) / scale`，宽高由吸附后的边界相减；
+    /// - taffy 的 `local`（父相对几何）、内容宽（文本断行依据）、min/max 约束**不**吸附 ——
+    ///   它们决定"盒子里装什么"，圆整它们会让排版内部与提交给绘制的盒子两套真相；
+    /// - 递归引用系用未圆整坐标，因此嵌套深度不会累积舍入误差；
+    /// - `None` = 关闭（未绑定窗口的树 / 测试构造的树；保持"taffy 不做圆整"的原始语义）。
+    ///
+    /// 关闭态存在的理由：`scale == 1` 时逻辑像素就是设备像素，引擎的既有契约
+    /// （P01 §7.5）明确"布局不做圆整"、亚像素位置由绘制期 AA 处理；像素吸附解决的是
+    /// **非整数 DPI** 下"1px 逻辑边框变成 1.25/1.5px 物理边"的边界错位（表格分割线、面板
+    /// 边框发虚）。窗口层只在 `scale != 1` 时开启它（见 `window::scale`）。
+    pub(crate) fn set_device_scale(&mut self, scale: Option<f32>) {
+        layout::set_device_scale(self, scale)
+    }
+
     /// 实现见子模块 `arena::get`（本文件只保留签名）。
     pub fn get(&self, node: NodeId) -> Result<&Node, EngineError> {
         arena::get(self, node)
@@ -527,6 +596,22 @@ impl NodeTree {
     #[must_use]
     pub(crate) fn is_effectively_visible(&self, node: NodeId) -> bool {
         traverse::is_effectively_visible(self, node)
+    }
+    /// 该节点及其祖先都未被 `interactive: Some(false)` 禁用（命中/焦点/Action 共用的继承规则）。
+    ///
+    /// 详见子模块 `content::is_effectively_interactive` 的文档（含与 CSS `pointer-events` 的差别）。
+    #[must_use]
+    pub(crate) fn is_effectively_interactive(&self, node: NodeId) -> bool {
+        content::is_effectively_interactive(self, node)
+    }
+    /// 记一次「命中因不可逆变换 / 非有限几何而跳过」（C11/C13 诊断）。
+    pub(crate) fn note_hit_test_skip(&self) {
+        content::note_hit_test_skip(self)
+    }
+    /// 累计的命中跳过次数（单调递增；诊断 / 测试断言用）。
+    #[must_use]
+    pub fn hit_test_skips(&self) -> u64 {
+        content::hit_test_skips(self)
     }
     fn is_ancestor(&self, ancestor: NodeId, node: NodeId) -> bool {
         traverse::is_ancestor(self, ancestor, node)
@@ -646,7 +731,9 @@ impl NodeTree {
     ) {
         layout::place_subtree(self, node, reference, epoch, force, parent_hidden)
     }
-    fn recompute_subtree_bounds(&mut self) {
+    /// 仅测试：全树重算子树包围盒（与 `place_subtree` 的增量维护做逐位一致性校验）。
+    #[cfg(test)]
+    pub(crate) fn recompute_subtree_bounds(&mut self) {
         layout::recompute_subtree_bounds(self)
     }
     pub(crate) fn subtree_bounds(&self, node: NodeId) -> Rect {
@@ -893,6 +980,11 @@ impl NodeTree {
     #[must_use]
     pub(crate) fn geometry_transform(&self, node: NodeId) -> Transform {
         content::geometry_transform(self, node)
+    }
+    /// 是否存在任何 per-draw 几何变换（O(1)；命中测试的快路径判定）。
+    #[must_use]
+    pub(crate) fn has_geometry_transforms(&self) -> bool {
+        content::has_geometry_transforms(self)
     }
     /// 设置几何节点的 per-draw 变换（顶点**不**重建：图表平移只改一个 uniform）。
     ///

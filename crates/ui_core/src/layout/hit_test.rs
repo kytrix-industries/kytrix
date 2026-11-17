@@ -1,13 +1,26 @@
-//! 命中测试：逆绘制序 + clip 链 + `hit_shape`。
+//! 命中测试：逆绘制序 + clip 链 + per-draw 逆变换 + `hit_shape`。
 //!
 //! 坐标契约：`bounds` 是窗口绝对逻辑像素；`HitResult::local_point` 是**目标节点 border box 局部坐标**
 //! （原点 = 节点左上角）。`clip_chain` 是沿途每个 `Clip::Bounds` **祖先**的 padding box（窗口绝对，祖先→子），
 //! **不含目标自己的 clip**。
 //!
+//! # 命中语义（与绘制、焦点、a11y 对齐）
+//!
+//! - **可见性**：`display:none` / `visible:false` 的节点及其子树不参与命中（与焦点遍历共用
+//!   `NodeTree::is_visible_locally`）。
+//! - **禁用（`interactive: Some(false)`）**：整棵子树不命中（**祖先禁用 ⇒ 子树不命中**），
+//!   与焦点遍历（`is_effectively_interactive`）和 a11y 的 `disabled` 属性同源。旧实现只让
+//!   被标记的节点自己"透明"，子节点仍可命中（R04-9 的"点击穿透"）。
+//! - **变换（C11）**：几何节点的 per-draw `Transform` 在命中时走**逆变换** —— 旋转/缩放后的
+//!   内容按视觉范围命中，`local_point` 回到未变换的内容坐标。不可逆变换（det≈0 / NaN / ∞）
+//!   跳过该节点并在 `NodeTree::hit_test_skips` 记账，**不 panic、不误判命中**。
+//! - **数值防御（C13）**：非有限的点/布局盒/裁剪矩形/clip 偏移一律视为"不命中"并跳过该子树；
+//!   NaN 永不返回 `true`。
+//!
 //! 设计见 `design/phase-04-layout.md` §12。
 
 use crate::{
-    math::{Point, Rect},
+    math::{Point, Rect, Transform},
     node::{id::NodeId, tree::NodeTree},
     paint::style::Clip,
 };
@@ -81,16 +94,42 @@ fn negate(offset: Point) -> Point {
     Point::new(-offset.x, -offset.y)
 }
 
+/// 几何节点的**可见范围**（窗口绝对，AABB）：`bounds.origin + transform(node-local box)`。
+///
+/// 与绘制侧 `paint::pass::geometry_damage` 用同一算法（四角变换取极值）；非单位变换时内容
+/// 可以落在节点布局盒之外，子树剪枝与命中都必须用这个范围（否则"看得见点不到"）。
+fn transformed_box(bounds: Rect, transform: Transform) -> Rect {
+    let local = Rect::new(0.0, 0.0, bounds.size.width, bounds.size.height);
+    let visual = transform.transform_rect(local);
+    Rect::from_origin_size(bounds.origin + visual.origin, visual.size)
+}
+
 /// 逆绘制序（`children` 的 DFS 先序 ⇒ 兄弟逆序 + 先子树后自身）+ 按布局盒与 clip 剪枝。
 ///
 /// **屏幕坐标**：`point` 是窗口逻辑像素；布局盒是**内容坐标**，因此进入滚动容器的子树时按它的 `offset`
 /// 把点换算到内容空间（`design/phase-10-interaction.md` §7.3）。根不是滚动容器 ⇒ 顶层偏移恒为零。
 pub(crate) fn hit_test(tree: &NodeTree, point: Point) -> Option<HitResult> {
+    // C13：非有限的指针坐标永不命中（NaN 参与任何比较都是 false，但显式短路让诊断确定）。
+    if !point.is_finite() {
+        tree.note_hit_test_skip();
+        return None;
+    }
     let root = tree.root();
-    if !tree.get(root).ok()?.layout().bounds.contains(point) {
+    let root_bounds = tree.get(root).ok()?.layout().bounds;
+    if !root_bounds.is_finite() || !root_bounds.contains(point) {
         return None; // 窗口外（根 100% 撑满 ⇒ 等价于「点在窗口外」）
     }
-    pick(tree, root, point, Point::ZERO, ClipChain::default())
+    // 绝大多数窗口没有任何 per-draw 变换：一次 O(1) 判定后，热路径不再为几何节点做额外检查。
+    let transforms = tree.has_geometry_transforms();
+    pick(
+        tree,
+        root,
+        point,
+        Point::ZERO,
+        ClipChain::default(),
+        false,
+        transforms,
+    )
 }
 
 fn pick(
@@ -99,6 +138,8 @@ fn pick(
     point: Point,
     offset: Point,
     mut chain: ClipChain,
+    inherited_disabled: bool,
+    transforms: bool,
 ) -> Option<HitResult> {
     let slot = tree.get(node).ok()?;
     // 本节点的**屏幕**布局盒（内容坐标减去祖先滚动偏移）。
@@ -114,11 +155,20 @@ fn pick(
         return None;
     }
 
+    // C12：`interactive: Some(false)` 的**整棵子树**不命中（祖先禁用 ⇒ 子树禁用），与焦点遍历
+    // 的 `is_effectively_interactive` 同一条规则；旧实现只让本节点透传，子节点仍可命中。
+    // 用已取到的 `slot` 判定（不再二次 `arena.get`）：命中测试是逐指针事件的热路径。
+    let disabled = inherited_disabled || slot.style_patch().interactive == Some(false);
+
     // 本节点的 clip **只作用于子树**（CSS：overflow 裁剪内容，不裁剪自身的 border/background）。
     // 点在 clip 外时仍可命中本节点，但不能下钻。
     let mut clipped = false;
     if slot.clip() == Clip::Bounds {
         let clip_rect = bounds.inset(slot.layout().border);
+        if !clip_rect.is_finite() {
+            tree.note_hit_test_skip();
+            return None;
+        }
         if clip_rect.contains(point) {
             chain.push(clip_rect);
         } else {
@@ -132,34 +182,86 @@ fn pick(
             + tree
                 .scroll_slot(node)
                 .map_or(Point::ZERO, |slot| slot.offset);
+        if !child_offset.is_finite() {
+            tree.note_hit_test_skip();
+            return None;
+        }
         // 子节点逆序：最后一个子节点绘制在最上层，因此先测。
         for child in slot.children().iter().rev() {
-            if tree.get(*child).is_err() {
+            let Ok(child_slot) = tree.get(*child) else {
                 continue;
-            }
+            };
             // 子树剪枝（P2-2）：用**子树包围盒**（自身 + 全部后代布局盒的并集）判断整棵
             // 子树是否可能被命中。只看节点自己的布局盒不行 —— 出流 / 溢出子节点可以落在
             // 父盒之外（B2），按父盒剪枝会漏命中；并集只会偏大，绝不偏小。
-            let subtree = tree.subtree_bounds(*child).translate(negate(child_offset));
+            //
+            // C13：非有限包络不需要单独判定 —— `Rect::contains` 对非有限矩形恒 `false`
+            // （`is_empty` 已含非有限判定），因此这里直接 `continue`，热路径不为诊断多付一次检查。
+            let mut subtree = tree.subtree_bounds(*child).translate(negate(child_offset));
+            // C11：几何节点的 per-draw 变换可能把内容缩放到布局盒之外（可见范围更大），
+            // 剪枝必须用**变换后的**可见范围，否则缩放后的图表"看得见点不到"。
+            if transforms && child_slot.kind().is_geometry() {
+                let transform = tree.geometry_transform(*child);
+                if transform != Transform::IDENTITY {
+                    let child_bounds = child_slot.layout().bounds.translate(negate(child_offset));
+                    if child_bounds.is_finite() {
+                        subtree = subtree.union(transformed_box(child_bounds, transform));
+                    }
+                }
+            }
             if !subtree.contains(point) {
                 continue;
             }
-            if let Some(hit) = pick(tree, *child, point, child_offset, chain) {
+            if let Some(hit) = pick(
+                tree,
+                *child,
+                point,
+                child_offset,
+                chain,
+                disabled,
+                transforms,
+            ) {
                 return Some(hit);
             }
         }
     }
 
     // 自身：先看布局盒（允许溢出后代，但自身不声称盒外命中），再看 `hit_shape`（局部坐标）。
-    if !bounds.contains(point) {
-        return None;
-    }
-    // `interactive: Some(false)` 的节点**不作为目标**（子节点已在上面的循环里独立判定）。
-    // 设计 §4.9 把它定义为「命中 / 焦点 / Action 开关」。
-    if slot.style_patch().interactive == Some(false) {
+    if disabled {
+        // 禁用的节点既不是命中目标，也不再把命中透给它的祖先（CSS `pointer-events:none`
+        // 的子树语义：事件穿过**整棵**子树，而不是落到父背景上）。
         return None;
     }
     let local_point = Point::new(point.x - bounds.origin.x, point.y - bounds.origin.y);
+    // C13：布局盒/滚动偏移出现 NaN/∞ 时"本节点不命中 + 诊断"，**不 panic、不误判**。
+    // 放在自身判定前（而不是入口）：被剪枝的子树根本走不到这里，热路径不为诊断付每次访问的成本；
+    // NaN 盒的 `contains` 本来就恒 false（`Rect::is_empty` 含非有限判定），因此正确性不依赖这条检查。
+    if !bounds.is_finite() {
+        tree.note_hit_test_skip();
+        return None;
+    }
+    // C11：几何节点的 per-draw 变换在命中时走逆变换（命中范围 = `transform(节点盒)` 的 AABB，
+    // `local_point` 回到未变换的内容坐标）。绝大多数窗口没有任何变换：`transforms` 是整次
+    // 命中测试前的 O(1) 判定，因此热路径只有一次可预测的分支；真正的逆变换逻辑在
+    // `#[inline(never)]` 的冷函数里，不会把 `pick` 的指令缓存撑大。
+    if transforms && slot.kind().is_geometry() {
+        let transform = tree.geometry_transform(node);
+        if transform != Transform::IDENTITY {
+            return hit_transformed(
+                tree,
+                node,
+                slot,
+                point,
+                bounds,
+                transform,
+                local_point,
+                ancestors,
+            );
+        }
+    }
+    if !bounds.contains(point) {
+        return None;
+    }
     if let Some(shape) = slot.hit_shape()
         && !shape(local_point)
     {
@@ -168,6 +270,46 @@ fn pick(
     Some(HitResult {
         node,
         local_point,
+        clip_chain: ancestors,
+    })
+}
+
+/// 带 per-draw 变换的几何节点命中（冷路径）。
+///
+/// - 命中范围 = `transform(节点盒)` 的 AABB（旋转/缩放的**视觉**范围，可以超出布局盒）；
+/// - `local_point` 回到**未变换**的内容坐标（与 `hit_shape`、应用拿到的局部坐标同一空间）；
+/// - 不可逆变换 ⇒ 跳过并记账（不 panic、不当作命中）。
+#[inline(never)]
+fn hit_transformed(
+    tree: &NodeTree,
+    node: NodeId,
+    slot: &crate::node::tree::Node,
+    point: Point,
+    bounds: Rect,
+    transform: Transform,
+    local_point: Point,
+    ancestors: ClipChain,
+) -> Option<HitResult> {
+    let Some(inverse) = transform.inverse() else {
+        tree.note_hit_test_skip();
+        return None;
+    };
+    let local = inverse.apply(local_point);
+    if !local.is_finite() || !transformed_box(bounds, transform).contains(point) {
+        return None;
+    }
+    let local_box = Rect::new(0.0, 0.0, bounds.size.width, bounds.size.height);
+    if !local_box.contains(local) {
+        return None;
+    }
+    if let Some(shape) = slot.hit_shape()
+        && !shape(local)
+    {
+        return None;
+    }
+    Some(HitResult {
+        node,
+        local_point: local,
         clip_chain: ancestors,
     })
 }
@@ -738,5 +880,241 @@ mod tests {
             Some(spacer),
             "父盒之外命中 spacer"
         );
+    }
+
+    // ── C11：per-draw 变换的逆变换命中 ─────────────────────────────────────
+
+    fn geometry_node(tree: &mut NodeTree, parent: NodeId, rect: Rect) -> NodeId {
+        NodeBuilder::geometry(crate::paint::geometry::GeometryId::for_test(0, 1))
+            .layout_override(rect)
+            .build(tree, parent)
+            .expect("几何节点挂载")
+    }
+
+    fn with_transform(tree: &mut NodeTree, node: NodeId, transform: crate::math::Transform) {
+        tree.set_geometry_transform(node, transform, Rect::default())
+            .expect("几何节点可设置变换");
+    }
+
+    #[test]
+    fn rotated_geometry_hits_through_inverse_transform() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let node = geometry_node(&mut tree, root, Rect::new(100.0, 50.0, 40.0, 20.0));
+        // 90°：局部 (x, y) → (−y, x)；局部盒 (0,0,40,20) 的 AABB = (−20, 0, 20, 40)。
+        with_transform(
+            &mut tree,
+            node,
+            crate::math::Transform::rotate(std::f32::consts::FRAC_PI_2),
+        );
+        layout(&mut tree);
+
+        // 屏幕 (90, 60) 在变换后的 AABB 内（80..120 × 50..90），逆变换后 = 局部 (10, 10)。
+        let hit = hit_test(&tree, Point::new(90.0, 60.0)).expect("旋转后可命中");
+        assert_eq!(hit.node, node);
+        assert!(
+            (hit.local_point.x - 10.0).abs() < 1e-3 && (hit.local_point.y - 10.0).abs() < 1e-3,
+            "local_point 必须回到**未变换**的内容坐标：{hit:?}"
+        );
+
+        // 未变换时能被命中的 (140, 60)（局部 (40,10) 恰在边界外/旋转后被移走）现在应为
+        // 变换后的形状之外 —— 逆变换把点映射到局部 (10, -40)，y 越界。
+        assert_eq!(
+            hit_node(&tree, 140.0, 60.0),
+            Some(root),
+            "旋转后的形状不再覆盖原布局盒的右侧"
+        );
+    }
+
+    #[test]
+    fn scaled_geometry_is_hittable_outside_its_layout_box() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let node = geometry_node(&mut tree, root, Rect::new(0.0, 0.0, 20.0, 10.0));
+        with_transform(&mut tree, node, crate::math::Transform::scale(3.0, 3.0));
+        layout(&mut tree);
+
+        // 布局盒 20×10，视觉盒 60×30：点 (50, 25) 在布局盒外、视觉盒内。
+        assert_eq!(
+            hit_node(&tree, 50.0, 25.0),
+            Some(node),
+            "缩放后的内容必须在视觉范围内可命中（子树剪枝用变换后的包络）"
+        );
+        // 局部坐标 = 屏幕 / 3。
+        let hit = hit_test(&tree, Point::new(50.0, 25.0)).expect("命中");
+        assert!((hit.local_point.x - 50.0 / 3.0).abs() < 1e-3);
+        // 视觉盒之外不命中。
+        assert_eq!(hit_node(&tree, 70.0, 25.0), Some(root));
+    }
+
+    #[test]
+    fn non_invertible_transform_skips_node_and_is_counted() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let node = geometry_node(&mut tree, root, Rect::new(0.0, 0.0, 40.0, 40.0));
+        with_transform(&mut tree, node, crate::math::Transform::scale(0.0, 1.0));
+        layout(&mut tree);
+
+        let before = tree.hit_test_skips();
+        assert_eq!(
+            hit_node(&tree, 20.0, 20.0),
+            Some(root),
+            "不可逆变换的节点不得被当作命中（跳过而不是 panic）"
+        );
+        assert!(
+            tree.hit_test_skips() > before,
+            "跳过必须记账（C11 的诊断面）"
+        );
+    }
+
+    // ── C12：interactive/disabled 在命中与焦点上同源 ───────────────────────
+
+    #[test]
+    fn disabled_ancestor_makes_its_whole_subtree_unhittable() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let container = add(&mut tree, root, fixed(100.0, 100.0));
+        // 子节点**声明动作**：如果没有继承禁用规则，它会是一个合法的命中目标与可聚焦节点。
+        let child = NodeBuilder::boxed()
+            .style(fixed(50.0, 50.0))
+            .on_click(crate::event::Action::custom("press"))
+            .build(&mut tree, container)
+            .expect("挂载成功");
+        // 对照：同样的子节点挂在未禁用的容器下 ⇒ 既可命中也可聚焦（证明下面的 false 来自继承）。
+        let active_container = add(&mut tree, root, fixed(100.0, 100.0));
+        let active_child = NodeBuilder::boxed()
+            .style(fixed(50.0, 50.0))
+            .on_click(crate::event::Action::custom("press"))
+            .build(&mut tree, active_container)
+            .expect("挂载成功");
+        tree.set_style_patch_for_test(
+            container,
+            StylePatch {
+                interactive: Some(false),
+                ..StylePatch::default()
+            },
+        );
+        layout(&mut tree);
+
+        assert_eq!(
+            hit_node(&tree, 10.0, 10.0),
+            Some(root),
+            "祖先禁用 ⇒ 子树不命中（旧实现会落到子节点上）"
+        );
+        assert!(
+            !crate::interaction::focus::focusable(&tree, child),
+            "焦点遍历必须与命中同源（禁用子树的节点不可聚焦）"
+        );
+        assert_eq!(
+            hit_node(&tree, 80.0, 80.0),
+            Some(root),
+            "禁用容器自己的盒也不命中"
+        );
+        assert_eq!(
+            hit_node(&tree, 110.0, 10.0),
+            Some(active_child),
+            "对照子树必须可命中（证明上面不是「没有被命中目标」的巧合）"
+        );
+        assert!(
+            crate::interaction::focus::focusable(&tree, active_child),
+            "对照子节点必须可聚焦（证明继承规则只影响禁用子树）"
+        );
+    }
+
+    #[test]
+    fn disabled_sibling_does_not_block_other_subtrees() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let disabled = add(&mut tree, root, fixed(100.0, 100.0));
+        let sibling = add(&mut tree, root, fixed(100.0, 100.0));
+        tree.set_style_patch_for_test(
+            disabled,
+            StylePatch {
+                interactive: Some(false),
+                ..StylePatch::default()
+            },
+        );
+        // 两个 100×100 兄弟在 flex 行里并排；各自命中自己的区域。
+        layout(&mut tree);
+
+        assert_eq!(hit_node(&tree, 10.0, 10.0), Some(root), "禁用盒不命中");
+        assert_eq!(hit_node(&tree, 150.0, 10.0), Some(sibling), "兄弟不受影响");
+    }
+
+    /// C12 的三处一致性：命中/焦点用的继承谓词与 a11y 的 `disabled` 判据在**同一节点**上一致。
+    ///
+    /// a11y 的 `disabled` 属性是每节点值（`a11y::mapping::is_disabled`），祖先禁用由 AT 的
+    /// 父节点语义继承；引擎侧命中/焦点的继承规则由 `is_effectively_interactive` 表达。
+    #[test]
+    fn hit_focus_and_a11y_agree_on_the_interactive_flag() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let plain = add(&mut tree, root, fixed(10.0, 10.0));
+        let flagged = add(&mut tree, root, fixed(10.0, 10.0));
+        tree.set_style_patch_for_test(
+            flagged,
+            StylePatch {
+                interactive: Some(false),
+                ..StylePatch::default()
+            },
+        );
+        layout(&mut tree);
+
+        let target = tree.get(flagged).expect("存在");
+        let a11y_disabled = crate::a11y::mapping::is_disabled(target, None, None);
+        assert!(a11y_disabled, "a11y 侧必须把它标成 disabled");
+        assert!(
+            !tree.is_effectively_interactive(flagged),
+            "命中/焦点侧必须同样禁用"
+        );
+        assert_eq!(hit_node(&tree, 15.0, 5.0), Some(root), "命中侧跳过它");
+
+        let plain_target = tree.get(plain).expect("存在");
+        assert!(
+            !crate::a11y::mapping::is_disabled(plain_target, None, None),
+            "未标记的节点在 a11y 侧不是 disabled"
+        );
+        assert!(tree.is_effectively_interactive(plain));
+    }
+
+    // ── C13：NaN / ∞ 防御 ────────────────────────────────────────────────
+
+    #[test]
+    fn non_finite_points_never_hit() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let _node = add(&mut tree, root, fixed(100.0, 100.0));
+        layout(&mut tree);
+
+        for point in [
+            Point::new(f32::NAN, 10.0),
+            Point::new(10.0, f32::NAN),
+            Point::new(f32::INFINITY, 10.0),
+            Point::new(10.0, f32::NEG_INFINITY),
+        ] {
+            let before = tree.hit_test_skips();
+            assert_eq!(hit_test(&tree, point), None, "{point:?} 不得命中");
+            assert!(tree.hit_test_skips() > before, "非有限点必须记账诊断");
+        }
+    }
+
+    #[test]
+    fn non_finite_layout_box_is_skipped_not_matched() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let node = add(&mut tree, root, fixed(100.0, 100.0));
+        layout(&mut tree);
+        // 造一个 NaN 布局盒（模拟 measure 产出坏值后残留的状态）。
+        tree.set_layout_for_test(
+            node,
+            crate::node::tree::LayoutBox {
+                bounds: Rect::new(f32::NAN, f32::NAN, 10.0, 10.0),
+                border: crate::math::Edges::ZERO,
+            },
+        );
+        // 根盒仍有效 ⇒ 命中落到根；坏盒子树被跳过且记账。
+        let before = tree.hit_test_skips();
+        assert_eq!(hit_node(&tree, 10.0, 10.0), Some(root));
+        assert!(tree.hit_test_skips() > before, "非有限布局盒必须记账");
     }
 }

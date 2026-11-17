@@ -1,4 +1,4 @@
-//! 诊断导出（`design/phase-13-resources-snapshot.md` §11）：`FrameDump` / `DependencyGraphDump` /
+//! 诊断导出：`FrameDump` / `DependencyGraphDump` /
 //! `A11yTreeDump` / `DamageOverlay`。
 //!
 //! 四条纪律：
@@ -171,7 +171,9 @@ pub fn frame_dump(app: &TestApp) -> FrameDump {
         .app()
         .window(app.window_id())
         .expect("TestApp's window must exist");
-    let buffer = window.instance_buffer();
+    let Some(buffer) = window.instance_buffer() else {
+        panic!("frame_dump requires an inline (headless) window");
+    };
     // 实例环有空洞（增量编码的段搬移会留下），诊断只导出**存活**实例（按实例环下标升序）。
     let instances: Vec<InstanceDump> = buffer
         .live_instances()
@@ -738,7 +740,7 @@ mod tests {
         let _ = NodeBuilder::boxed()
             .layout_override(crate::math::Rect::new(0.0, 0.0, 8.0, 8.0))
             .bind_style(move |cx| crate::paint::style::StylePatch {
-                opacity: Some(f32::from(cx.read(&signal))),
+                opacity: Some(f32::from(*cx.read(&signal))),
                 ..crate::paint::style::StylePatch::default()
             })
             .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
@@ -766,7 +768,7 @@ mod tests {
             let _ = NodeBuilder::boxed()
                 .layout_override(crate::math::Rect::new(0.0, 0.0, 8.0, 8.0))
                 .bind_style(move |cx| crate::paint::style::StylePatch {
-                    opacity: Some(f32::from(cx.read(&signal))),
+                    opacity: Some(f32::from(*cx.read(&signal))),
                     ..crate::paint::style::StylePatch::default()
                 })
                 .id("box")
@@ -847,6 +849,6 @@ mod tests {
         assert_static::<A11yTreeDump>();
         assert_static::<A11yNodeDump>();
         assert_static::<DamageOverlay>();
-        let _ = A11yNodeId::from_engine(crate::node::id::NodeId::for_test(1, 1));
+        let _ = A11yNodeId::from_stable(1);
     }
 }

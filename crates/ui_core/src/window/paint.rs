@@ -1,33 +1,42 @@
-//! 绘制：lane 重建 / damage / 实例编码 / 场景访问。
+//! 绘制：lane 重建 / damage / 增量协议采集 / 合成（inline）/ 场景访问。
+//!
+//! **编码不再发生在这里**：`paint_frame` 只产 `SceneDelta`（变化 lane 快照 + 绘制序 + 滚动位
+//! 移 + 几何描述）与 damage。编码与载荷构造在 `render::compose::WindowComposer`（inline 模式，
+//! 无 GPU 线程的窗口）或合成线程（真实窗口）里完成 —— 见 `render/compositor_thread.rs`。
 
 use super::Window;
+#[cfg(feature = "test-support")]
+use crate::paint::instance::InstanceBuffer;
 #[cfg(feature = "test-support")]
 use crate::test_support::record::PaintLog;
 use crate::{
     error::EngineError,
     math::Rect,
     paint::{
-        instance::InstanceBuffer,
         pass::{PaintPass, PaintReport},
         scene::Scene,
+    },
+    render::{
+        compose::ComposeStats,
+        delta::{FrameHeader, SceneDelta},
     },
 };
 
 // 消费者：`impl Window::paint_frame` 的薄委托（外部调用点见该方法文档）。
-/// lane 重建/复用 + damage + 实例编码（`design/phase-06-paint-runtime.md` §9.6）。
+/// lane 重建/复用 + damage + `SceneDelta` 采集（+ inline 模式的合成）。
 ///
 /// # Errors
-/// [`EngineError::ClipDepthExceeded`]：clip 嵌套超过上限（release 也失败，见 P14 审查）。
+/// [`EngineError::ClipDepthExceeded`]：clip 嵌套超过上限（inline 合成路径；release 也失败）。
 /// 返回 `Err` 时本帧未提交：调用方必须 `abort_frame`，damage/dirty 保留待重试。
 pub(crate) fn paint_frame(
     window: &mut Window,
     geometry: &crate::paint::geometry_store::GeometryStore,
 ) -> Result<PaintReport, EngineError> {
     // 借用式取出（保容量）：`tree` 与 `scene` 是不同字段，循环内可同时可变借用。
+    let mut removed: Vec<crate::paint::scene::LaneId> = Vec::new();
     for lane in window.tree.drain_removed_lanes() {
         window.scene.release_lane(lane);
-        // 编码器的实例段也同步回收：否则它的实例环要等 arena 槽位被新 lane 复用才释放。
-        window.encoder.release_lane(lane);
+        removed.push(lane);
     }
     let scale = window.scale;
     let frame = window.frame_rect();
@@ -48,7 +57,8 @@ pub(crate) fn paint_frame(
     }
     // P11：只有 `A11Y` 脏（`bind_a11y` 重算）的帧**没有任何像素要画**：早退让 lane 保持
     // `REUSABLE`、damage 保持空，帧末门禁把本帧退回 `Idle`（P11 审查 #6）。
-    if !has_damage && !window.needs_node_repaint() {
+    if !has_damage && !window.needs_node_repaint() && removed.is_empty() {
+        window.pending_delta = None;
         return Ok(PaintReport {
             rebuilt: 0,
             damage: crate::render::damage::DamageSummary::default(),
@@ -78,27 +88,74 @@ pub(crate) fn paint_frame(
         #[cfg(feature = "test-support")]
         log: PaintLog::default(),
     };
-    let mut report = pass.run()?;
-    let buffer = window
-        .encoder
-        .encode(&window.scene, scale, &window.resolver, geometry)?;
-    #[cfg(feature = "test-support")]
+    let report = pass.run()?;
+    // ── B6-2：采集 `SceneDelta`（UI 线程的产物到此为止）────────────────────────
+    let surface = window.physical_surface();
+    let mut delta = SceneDelta::empty(FrameHeader {
+        window: window.id(),
+        // 头部在 `submit_gpu` 里补齐（这里还不知道是否真的提交）。
+        index: crate::window::FrameIndex::default(),
+        plan: crate::render::compositor::Plan::Idle,
+        surface,
+        scale,
+        #[cfg(target_os = "linux")]
+        surface_local: window.size(),
+        #[cfg(target_os = "linux")]
+        buffer_scale: window.buffer_scale,
+        published_at: std::time::Instant::now(),
+    });
+    let full = window.delta_builder.full_for(scale);
     {
-        report.instances = buffer.len();
-        report.encoded_lanes = window.encoder.encoded_lanes();
-        report.reused_segments = window.encoder.reused_segments();
-        report.uploaded_bytes = window.encoder.written_bytes();
+        let Window {
+            scene,
+            delta_builder,
+            scroll_slots,
+            ..
+        } = window;
+        delta_builder.collect(scene, geometry, scroll_slots, full, &mut delta);
     }
-    #[cfg(not(feature = "test-support"))]
-    {
-        let _ = buffer;
-        let _ = &mut report;
+    for lane in removed {
+        window.delta_builder.note_removed(lane, &mut delta);
     }
+    // inline 模式（无 GPU 线程可分发的窗口）：就地合成，报告里带上编码统计（测试与 HUD 读）。
+    let mut report = report;
+    if let Some(composed) = compose_inline(window, &delta)? {
+        report = annotate_report(report, composed.stats);
+        window.pending_payload = Some(composed);
+    }
+    window.pending_delta = Some(delta);
     #[cfg(feature = "hud")]
     {
         window.frame_cpu = window.frame_started_at.map(|started| started.elapsed());
     }
     Ok(report)
+}
+
+/// 把合成统计写进 `PaintReport`（`test-support` 的帧记录读这四项；生产构建没有这些字段）。
+#[cfg(feature = "test-support")]
+fn annotate_report(mut report: PaintReport, stats: ComposeStats) -> PaintReport {
+    report.instances = stats.drawn_instances as usize;
+    report.encoded_lanes = stats.encoded_lanes;
+    report.reused_segments = stats.reused_segments;
+    report.uploaded_bytes = stats.written_bytes;
+    report
+}
+
+#[cfg(not(feature = "test-support"))]
+fn annotate_report(report: PaintReport, _stats: ComposeStats) -> PaintReport {
+    report
+}
+
+/// inline 合成（`composer` 在 UI 线程时）：返回 `None` = 本帧没有可发布的载荷（threaded 模式）。
+fn compose_inline(
+    window: &mut Window,
+    delta: &SceneDelta,
+) -> Result<Option<crate::render::compose::ComposedFrame>, EngineError> {
+    let resolver = window.resolver;
+    let Some(composer) = window.composer.as_mut() else {
+        return Ok(None);
+    };
+    composer.compose(delta, resolver).map(Some)
 }
 
 // 消费者：`impl Window::needs_node_repaint` 的薄委托（外部调用点见该方法文档）。
@@ -111,23 +168,13 @@ pub(crate) fn needs_node_repaint(window: &Window) -> bool {
 }
 
 // 消费者：`impl Window::instance_buffer` 的薄委托（外部调用点见该方法文档）。
-/// 最近一帧的编码结果（渲染层上传源；P08 的 `Renderer` 消费）。
-pub(crate) fn instance_buffer(window: &Window) -> &InstanceBuffer {
-    window.encoder.buffer()
-}
-
-// 消费者：`impl Window::instance_buffer_mut` 的薄委托（外部调用点见该方法文档）。
-/// 编码结果的可变视图：`FramePayload` 的增量载荷构建要取走并清空变化区间。
-pub(crate) fn instance_buffer_mut(window: &mut Window) -> &mut InstanceBuffer {
-    window.encoder.buffer_mut()
-}
-
-// 消费者：`impl Window::instance_bytes` 的薄委托（外部调用点见该方法文档）。
-/// 本帧编码出的实例字节（P07 的上传入口；应用层不得依赖其内容）。
-///
-/// 返回最近一帧 `InstanceEncoder` 的 `&[u8]`（`GpuPrimitive` 数组的字节视图，P02 §8.1 的 128 B 布局）。
-pub(crate) fn instance_bytes(window: &Window) -> &[u8] {
-    window.instance_buffer().as_bytes()
+/// 最近一帧的编码结果（**只有 inline 模式有**：真实窗口的编码器在合成线程里）。
+#[cfg(feature = "test-support")]
+pub(crate) fn instance_buffer(window: &Window) -> Option<&InstanceBuffer> {
+    window
+        .composer
+        .as_ref()
+        .map(crate::render::compose::WindowComposer::buffer)
 }
 
 // 消费者：`impl Window::scene` 的薄委托（外部调用点见该方法文档）。
@@ -140,7 +187,10 @@ pub(crate) fn scene(window: &Window) -> &Scene {
 /// 测试专用：最近一次编码出的几何绘制（校验 `App` 的几何表真的接进了编码器）。
 #[cfg(test)]
 pub(crate) fn encoded_geometry(window: &Window) -> &[crate::paint::instance::GeometryDrawGpu] {
-    window.encoder.buffer().geometry()
+    window
+        .composer
+        .as_ref()
+        .map_or(&[], |composer| composer.buffer().geometry())
 }
 
 // 消费者：`impl Window::request_damage` 的薄委托（外部调用点见该方法文档）。

@@ -71,6 +71,10 @@ pub(crate) fn new() -> NodeTree {
     NodeTree {
         arena,
         root,
+        window: None,
+        device_scale: None,
+        hit_test_skips: std::cell::Cell::new(0),
+        raw_origins: Vec::new(),
         layout_cache: ahash::HashMap::default(),
         text_slots: vec![None],
         debug_ids: vec![None],
@@ -102,10 +106,54 @@ pub(crate) fn new() -> NodeTree {
     }
 }
 
+// 消费者：`impl NodeTree::window_tag` 的薄委托（外部调用点见该方法文档）。
+/// 树的窗口 tag（`0` = 未绑定）。
+///
+/// 消费者：`layout::taffy_tree::to_engine` —— taffy 只携带 64 位 tree-local 编码，
+/// 回调里必须补上窗口 tag，否则返回的句柄是"通配"的，与 arena 里的键在 `HashMap`
+/// （`layout_cache` / `hoisted` / `geometry_transforms`）里**不相等** ⇒ 缓存失效会漏清。
+pub(crate) fn window_tag(tree: &NodeTree) -> u32 {
+    tree.arena.scope()
+}
+
 // 消费者：`impl NodeTree::root` 的薄委托（外部调用点见该方法文档）。
 /// 根句柄（永不失效）。
 pub(crate) fn root(tree: &NodeTree) -> NodeId {
     tree.root
+}
+
+// 消费者：`impl NodeTree::bind_window` 的薄委托（外部调用点见该方法文档）。
+/// 把树绑定到窗口：arena 的作用域 + 根句柄重贴 + 按根登记的脏集合重建。
+///
+/// 必须在建树之后、挂任何子节点之前调用（`Window::new` 之后立刻调用，见 `App::create_window`）。
+/// 绑定后新铸的每个 `NodeId` 都带窗口 tag，跨窗口误用在 `NodeTree::get` 处确定性失败。
+pub(crate) fn bind_window(tree: &mut NodeTree, window: crate::window::WindowId) {
+    debug_assert!(
+        tree.window.is_none(),
+        "窗口只能绑定一次（NodeTree::bind_window）"
+    );
+    debug_assert_eq!(
+        tree.arena.len(),
+        1,
+        "窗口必须在挂载任何子节点之前绑定（只有根节点存在）"
+    );
+    tree.arena.set_scope(window.to_bits());
+    let root = tree.root.with_window_tag(window.to_bits());
+    if let Some(node) = tree.arena.get_mut(tree.root) {
+        node.retag(root);
+    }
+    tree.root = root;
+    tree.window = Some(window);
+    // 构造期只有根进入了这四个集合（用旧键）；绑定后必须换成带窗口 tag 的键。
+    for set in [
+        &mut tree.dirty_layout,
+        &mut tree.dirty_paint,
+        &mut tree.dirty_a11y,
+        &mut tree.dirty_settle,
+    ] {
+        set.clear();
+        set.insert(root);
+    }
 }
 
 // 消费者：`impl NodeTree::get` 的薄委托（外部调用点见该方法文档）。
@@ -421,6 +469,8 @@ pub(crate) fn remove(
     tree.dirty_settle.shrink_stale();
     tree.moved_nodes.shrink_stale();
     tree.mark_structure(parent);
+    // B9：卸载后局部收紧祖先的子树包络（被删子树不再参与后续 `place_subtree` 的访问）。
+    super::layout::recompute_bounds_upwards(tree, parent);
     Ok(detached)
 }
 

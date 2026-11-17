@@ -11,6 +11,8 @@
 //! 设计见 `design/phase-08-d3d12.md` §5、`design/async-render-pipeline.md` §6。
 
 pub(crate) mod atlas;
+/// 合成线程的帧时钟源（DWM 合成器节拍 + 合成时序采样）：B6-2。
+pub(crate) mod clock;
 pub(crate) mod compositor;
 pub(crate) mod debug;
 pub(crate) mod device;

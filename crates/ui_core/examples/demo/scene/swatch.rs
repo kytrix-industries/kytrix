@@ -67,7 +67,7 @@ pub(crate) fn build(
                 ..A11yOverride::default()
             })
             .bind_style(move |cx| {
-                let selected = usize::from(cx.read(&active)) == index;
+                let selected = usize::from(*cx.read(&active)) == index;
                 StylePatch {
                     background: Some(if selected { highlight } else { base }),
                     cursor: Some(Cursor::Pointer),
@@ -75,7 +75,7 @@ pub(crate) fn build(
                 }
             })
             .bind_a11y(move |cx| A11yPatch {
-                checked: Some(usize::from(cx.read(&active)) == index),
+                checked: Some(usize::from(*cx.read(&active)) == index),
                 ..A11yPatch::default()
             })
             .build(card::tree(app, window), panel)
@@ -88,7 +88,7 @@ pub(crate) fn build(
         panel,
         Rect::new(18.0, 142.0, 520.0, 20.0),
         text_style(12.5, 400, TEXT_RGBA),
-        move |cx| selected_line(cx.read(&active)),
+        move |cx| selected_line(*cx.read(&active)),
     );
     swatches
 }

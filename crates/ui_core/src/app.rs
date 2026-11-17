@@ -48,7 +48,7 @@ use crate::{
         builder::NodeBuilder,
         dependency::{DependencyGraph, EvalStack, ReadCtx},
         id::NodeId,
-        signal::{Derived, Signal, SignalId, StateStore, Transient},
+        signal::{Derived, Signal, SignalId, SignalRef, SignalScope, StateStore, Transient},
     },
     paint::{
         color::Color,
@@ -204,6 +204,17 @@ pub struct App {
     /// 每窗口的 Debug HUD 运行状态（P17；feature 关闭时字段不存在）。
     #[cfg(feature = "hud")]
     debug_hud: ahash::HashMap<WindowId, DebugHudState>,
+    /// 每窗口的信号作用域（窗口销毁时自动释放；`App::window_signal` 的归属）。
+    ///
+    /// 作用域释放后，其信号的写变成 no-op 且依赖边被立即删除 —— 关闭窗口后的迟到写入
+    /// （异步任务 / 定时器回投）不会产生僵尸唤醒（R03-6 的可观测半边）。
+    window_scopes: ahash::HashMap<WindowId, SignalScope>,
+    /// 批处理嵌套深度（`App::batch`）。> 0 时写操作只累积，帧请求被推迟。
+    batch_depth: u32,
+    /// 批处理期间是否有被推迟的帧请求（`batch_depth` 归零时合并成一次）。
+    batch_wake: bool,
+    /// 累计的**帧请求**次数（进入平台唤醒队列的次数；诊断 / 基准的「N 次写 ⇒ 1 帧」证据）。
+    frame_requests: u64,
 }
 
 /// 一次点击的记录（双击判定的输入）。
@@ -428,6 +439,10 @@ impl App {
             a11y_diagnostics: Vec::new(),
             #[cfg(feature = "hud")]
             debug_hud: ahash::HashMap::default(),
+            window_scopes: ahash::HashMap::default(),
+            batch_depth: 0,
+            batch_wake: false,
+            frame_requests: 0,
         }
     }
 
@@ -577,6 +592,18 @@ impl App {
         signal_api::dependency_graph(self)
     }
 
+    /// 仅测试：依赖图当前的表项数（作用域释放「立即删边」的可测证据）。
+    #[cfg(test)]
+    pub(crate) fn dependency_edge_count_for_test(&self) -> usize {
+        signal_api::dependency_edge_count(self)
+    }
+
+    /// 仅测试：把下一个窗口句柄推到指定值（验证「句柄用尽」的行为）。
+    #[cfg(test)]
+    pub(crate) fn set_next_window_id_for_test(&mut self, next: u32) {
+        self.next_window_id = next;
+    }
+
     /// 本 App 绑定的 tokio 句柄（**借用**，不 clone）。
     ///
     /// 命名：不占用 `handle()` —— P09 会加 `App::handle() -> AppHandle`（那时是纯新增，零破坏）。
@@ -585,9 +612,47 @@ impl App {
         resources::runtime_handle(self)
     }
 
-    /// 建一个普通信号（id 稠密递增，条目永不删除）。
+    /// 建一个普通信号（id 稠密递增，条目永不删除；归属根作用域，永不释放）。
     pub fn signal<T: Clone + 'static>(&mut self, initial: T) -> Signal<T> {
         signal_api::signal(self, initial)
+    }
+
+    /// 新建一个信号作用域（窗口 / 面板 / 对话框的自有生命周期）。
+    ///
+    /// 典型用法：为一个可关闭的面板建作用域，面板内所有信号都注册进去；面板销毁时
+    /// [`App::release_scope`] 一次，之后任何迟到写入（异步结果、定时器回投）都是 no-op，
+    /// 不会唤醒已经不存在的内容。窗口作用域由引擎自动管理（见 [`App::window_signal`]）。
+    #[must_use]
+    pub fn signal_scope(&mut self) -> SignalScope {
+        signal_api::signal_scope(self)
+    }
+
+    /// 在指定作用域里注册信号。
+    pub fn signal_scoped<T: Clone + 'static>(
+        &mut self,
+        scope: SignalScope,
+        initial: T,
+    ) -> Signal<T> {
+        signal_api::signal_scoped(self, scope, initial)
+    }
+
+    /// 在**窗口作用域**里注册信号（`App::close_window` 时自动释放）。
+    ///
+    /// # Panics
+    /// `window` 不存在（窗口的信号作用域随窗口一起创建 / 销毁）。
+    pub fn window_signal<T: Clone + 'static>(&mut self, window: WindowId, initial: T) -> Signal<T> {
+        let scope = *self
+            .window_scopes
+            .get(&window)
+            .expect("window signal scope: window does not exist");
+        signal_api::signal_scoped(self, scope, initial)
+    }
+
+    /// 释放信号作用域：其信号的写从此是 no-op，依赖图里以它们为键的边被**立即**删除。
+    ///
+    /// 返回被释放的信号数（重复释放返回 0）。
+    pub fn release_scope(&mut self, scope: SignalScope) -> usize {
+        signal_api::release_scope(self, scope)
     }
 
     /// 建一个瞬态值（读不登记、写不失效）。
@@ -603,19 +668,73 @@ impl App {
         signal_api::derived(self, compute)
     }
 
-    /// 写一个信号。返回 `true` = 值变了（并已沿依赖图失效）；`false` = 值相等，**短路**。
+    /// 写一个信号。返回 `true` = 值变了（并已沿依赖图失效）；`false` = 值相等（短路）
+    /// **或**该信号的作用域已释放（no-op）。
     ///
     /// 返回值不表示「有节点被标脏」（只写派生时没有节点变脏）。
     ///
     /// **应用层契约**：`T` 必须是不可变值语义。若 `T` 内部可变（`Rc<RefCell<_>>`/`Cell`/`Mutex`）而
     /// `PartialEq` 只比较外层，则内部变化会被短路吞掉（不重绘）。见 S-35 / R9。
+    ///
+    /// # Panics
+    /// 该信号存在活跃 [`SignalRef`] 读守卫（见 `node::signal` 模块文档的借用规则）。
     pub fn write<T: Clone + PartialEq + 'static>(&mut self, signal: &Signal<T>, value: T) -> bool {
         signal_api::write(self, signal, value)
     }
 
+    /// 原地更新一个信号（**无等值短路**；适合大对象的局部修改）。
+    ///
+    /// 与 [`App::write`] 的差别：不 clone 旧值、不做 `PartialEq` 比较，闭包改完直接沿依赖图失效。
+    /// 返回 `false` 仅表示该信号的作用域已释放（no-op）。
+    ///
+    /// # Panics
+    /// 该信号存在活跃读守卫 / 类型不符。
+    pub fn update<T: 'static>(&mut self, signal: &Signal<T>, update: impl FnOnce(&mut T)) -> bool {
+        signal_api::update(self, signal, update)
+    }
+
     /// 写一个瞬态值：**不**失效、**不**请求唤醒（滚动偏移/悬浮态，§3.7）。
+    ///
+    /// # Panics
+    /// 该瞬态值存在活跃读守卫。
     pub fn write_transient<T: 'static>(&mut self, transient: &Transient<T>, value: T) {
         signal_api::write_transient(self, transient, value)
+    }
+
+    /// 批处理：闭包内的全部写操作**合并成一次**帧请求（一次平台唤醒）。
+    ///
+    /// 语义：
+    /// - 闭包内的写照常写值、照常沿依赖图标脏（下一帧的样式/布局/paint 会看到**最终**状态）；
+    /// - 帧请求（`wake_requested` / 平台唤醒）被推迟到最外层批处理结束，且只发一次 ——
+    ///   批内的中间状态不会被任何帧管线（styles / text / layout / paint）观察到，
+    ///   依赖图也不会在批内被重入求值；
+    /// - 嵌套批处理按最外层结算；闭包 panic 也会正确归零深度（不会把引擎卡在"永不唤醒"）。
+    ///
+    /// 典型用法：一次行情推送更新 20 个面板信号 → `app.batch(|app| { ... })` ⇒ 1 次唤醒。
+    pub fn batch<R>(&mut self, body: impl FnOnce(&mut App) -> R) -> R {
+        self.batch_depth += 1;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(self)));
+        self.batch_depth = self.batch_depth.saturating_sub(1);
+        if self.batch_depth == 0 && self.batch_wake {
+            self.batch_wake = false;
+            self.request_frame();
+        }
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// 当前是否在批处理内（诊断 / 测试）。
+    #[must_use]
+    pub fn batching(&self) -> bool {
+        self.batch_depth > 0
+    }
+
+    /// 累计的帧请求次数（进入平台唤醒队列的次数；批处理「N 次写 ⇒ 1 帧」的证据面）。
+    #[must_use]
+    pub fn frame_requests(&self) -> u64 {
+        self.frame_requests
     }
 
     /// 取走「需要一帧」的请求位（取走即清零）。
@@ -630,7 +749,14 @@ impl App {
     /// 即将阻塞在 `GetMessageW` / `poll`。只置位不唤醒会让这批状态一直等到下一条无关消息
     /// （画面与 a11y 更新都迟到）——P15 用 UIA 客户端实测 `SelectionItemPattern.Select()`
     /// 不生效时定位到这一点（`design/DEVIATIONS.md` F-152）。
+    ///
+    /// 批处理内（[`App::batch`]）只登记推迟位，由最外层批处理结束时合并成**一次**请求。
     fn request_frame(&mut self) {
+        if self.batch_depth > 0 {
+            self.batch_wake = true;
+            return;
+        }
+        self.frame_requests = self.frame_requests.saturating_add(1);
         frame::request_frame(self)
     }
 
@@ -685,12 +811,16 @@ impl App {
         })
     }
 
-    /// 非追踪读一个信号（handler 不是渲染 pass，不登记依赖）。
+    /// 非追踪读一个信号，返回**读守卫**（零拷贝；`Deref<Target = T>`）。
+    ///
+    /// handler 不是渲染 pass，不登记依赖。守卫的借用规则见 `node::signal` 模块文档：
+    /// 守卫不借用 `App`，但在它存活期间对**同一个**信号的写会 panic（显式借用冲突，
+    /// 不静默拷贝）。
     ///
     /// # Panics
     /// `signal` 的槽位不是普通信号（引擎不变量被破坏时才会发生）。
     #[must_use]
-    pub fn read<T: Clone + 'static>(&self, signal: &Signal<T>) -> T {
+    pub fn read<T: 'static>(&self, signal: &Signal<T>) -> SignalRef<T> {
         signal_api::read(self, signal)
     }
 
@@ -699,12 +829,12 @@ impl App {
         input::set_input_thresholds(self, thresholds)
     }
 
-    /// 非追踪读一个瞬态值（动画进度 / 滚动偏移的公开读取面）。
+    /// 非追踪读一个瞬态值，返回读守卫（动画进度 / 滚动偏移的公开读取面）。
     ///
     /// # Panics
     /// 槽位不是瞬态值（引擎不变量被破坏时才会发生）。
     #[must_use]
-    pub fn read_transient<T: Clone + 'static>(&self, transient: &Transient<T>) -> T {
+    pub fn read_transient<T: 'static>(&self, transient: &Transient<T>) -> SignalRef<T> {
         signal_api::read_transient(self, transient)
     }
 
@@ -1198,7 +1328,10 @@ impl App {
         overlay::dismiss_overlay(self, window)
     }
 
-    fn remove_node(&mut self, window: WindowId, node: NodeId) -> bool {
+    /// 卸载一棵子树（浮层关闭 / 虚拟列表回收 / 应用主动移除的公共出口）。
+    ///
+    /// 只接受**该窗口**的节点句柄：跨窗口句柄在 `NodeTree::get` 处确定性失败（返回 `false`）。
+    pub(crate) fn remove_node(&mut self, window: WindowId, node: NodeId) -> bool {
         window_set::remove_node(self, window, node)
     }
 

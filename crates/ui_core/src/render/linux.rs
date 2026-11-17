@@ -8,6 +8,8 @@
 //! - [`readback`]：离屏读回，只有 `test-support` 构建存在（快照 / golden）。
 
 pub(crate) mod atlas;
+/// 合成线程的帧时钟源（`wl_surface.frame` 回调 + 单调时钟推算）：B6-2。
+pub(crate) mod clock;
 pub(crate) mod compositor;
 pub(crate) mod device;
 /// 静态几何的 GPU 缓冲（按需创建；GeometryStore 的 Vulkan 侧缓存）。

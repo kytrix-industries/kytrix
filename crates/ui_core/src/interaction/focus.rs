@@ -8,23 +8,27 @@ use crate::{
     node::{id::NodeId, tree::NodeTree},
 };
 
-/// 该节点是否接受**动作**：声明了动作且未被 `interactive: false` 禁用。
+/// 该节点是否接受**动作**：声明了动作，且**自身与祖先**都未被 `interactive: false` 禁用。
 #[must_use]
 pub(crate) fn accepts_action(tree: &NodeTree, node: NodeId) -> bool {
     tree.interaction(node)
         .is_some_and(|slot| slot.action.is_some())
-        && tree.is_hittable(node)
+        && tree.is_effectively_interactive(node)
 }
 
 /// 该节点是否可聚焦：接受动作，或被显式标为 `interactive: Some(true)`。
 ///
-/// 先过可见性（**含祖先**）：`visible: false` / `display: none` 按 CSS 语义隐藏整棵子树，
-/// 旧实现只看 `interactive` 与 `tab_stop`，于是 Tab 会落到不可见控件上、Enter 还能触发
-/// 隐藏的 action（P2-3.3）。谓词与命中测试共用 `NodeTree::is_visible_locally`。
+/// 三道门与命中测试**同源**：
+/// 1. 可见性（**含祖先**）：`visible: false` / `display: none` 按 CSS 语义隐藏整棵子树
+///    （旧实现只看 `interactive` 与 `tab_stop`，于是 Tab 会落到不可见控件上、Enter 还能触发
+///    隐藏的 action，P2-3.3）；
+/// 2. 可交互性（**含祖先**）：任一祖先 `interactive: Some(false)` ⇒ 整棵子树不可聚焦
+///    （C12：与命中测试的 `disabled` 继承、a11y 的 `disabled` 同一判据）；
+/// 3. `tab_stop`：窗口控件可以点击但不进 Tab 序。
 #[must_use]
 pub(crate) fn focusable(tree: &NodeTree, node: NodeId) -> bool {
     if !tree.is_effectively_visible(node)
-        || !tree.is_hittable(node)
+        || !tree.is_effectively_interactive(node)
         || !tree.get(node).is_ok_and(|target| target.tab_stop())
     {
         return false;

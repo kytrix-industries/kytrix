@@ -332,7 +332,7 @@ fn window_size_is_root_available_space() {
 }
 
 #[test]
-fn dpi_scale_does_not_change_logical_boxes() {
+fn dpi_scale_only_shifts_logical_boxes_by_device_snapping() {
     use crate::{
         math::Rect,
         node::builder::NodeBuilder,
@@ -369,12 +369,20 @@ fn dpi_scale_does_not_change_logical_boxes() {
     window.set_scale(Scale::new(1.5).expect("合法比例"));
     let _ = window.compute_layout().expect("布局成功");
 
+    // B7：`scale != 1` 时提交给绘制的边界吸附到设备像素网格（`round(dp × scale) / scale`）。
+    // 布局输入（taffy 的父相对几何 / 内容宽）仍然与 scale 无关，差异**只**来自吸附。
+    let after = window.tree().get(child).expect("存在").layout().bounds;
     assert_eq!(
-        window.tree().get(child).expect("存在").layout().bounds,
-        before,
-        "逻辑布局盒与 scale 无关（物理化在 P06）"
+        after,
+        before.snap_to_device(1.5),
+        "提交盒 = 未吸附逻辑盒的设备像素吸附（与 `Rect::snap_to_device` 同一实现）"
     );
-    assert_eq!(before, Rect::new(0.0, 0.0, 10.5, 3.25));
+    assert_eq!(before, Rect::new(0.0, 0.0, 10.5, 3.25), "scale=1 不做吸附");
+    assert!(
+        (after.size.width - before.size.width).abs() <= 1.0 / 1.5 + f32::EPSILON
+            && (after.size.height - before.size.height).abs() <= 1.0 / 1.5 + f32::EPSILON,
+        "逻辑布局盒与 scale 无关：差异不超过一个设备像素（{after:?} vs {before:?}）"
+    );
 }
 
 #[test]

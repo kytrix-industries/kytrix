@@ -1,4 +1,4 @@
-//! `ActionRequest` → 引擎动作（`design/phase-11-a11y.md` §9）。
+//! `ActionRequest` → 引擎动作（辅助技术动作的唯一入口；效果一律走已有的失效闭环）。
 //!
 //! 执行点**只有主线程**：平台层的 `ActionHandler` 只把请求 `Dispatcher::push` 回主线程，本文件在
 //! drain 时被调用。所有效果都走 P03/P10 已存在的失效闭环（`set_focus` / `dispatch_action` /
@@ -31,7 +31,13 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
     if request.target_tree != accesskit::TreeId::ROOT {
         return;
     }
-    let Some(engine) = A11yNodeId::from_bits(request.target_node.0).to_engine() else {
+    // A1：`accesskit::NodeId` 是**稳定 id**（`a11y::identity` 分配），不再编码引擎句柄。
+    // 动作解码走窗口的分配器：未挂载 / 被清理的 id ⇒ 陈旧动作（忽略 + 诊断）。
+    let target_id = A11yNodeId::from_stable(request.target_node.0);
+    let Some(engine) = app
+        .window(window)
+        .and_then(|target| target.a11y_engine_of(target_id))
+    else {
         note_stale(app, request.action);
         return;
     };
@@ -70,7 +76,7 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
     }
     let action = match (request.action, data.as_ref()) {
         (Action::CustomAction, Some(ActionData::CustomAction(id))) => A11yAction::Custom(*id),
-        // 没有选区模型时 `ReplaceSelectedText` 与 `SetValue` 等价（design §9.1）。
+        // 引擎没有选区模型时 `ReplaceSelectedText` 与 `SetValue` 等价（整体替换）。
         (Action::ReplaceSelectedText, _) => A11yAction::SetValue,
         (action, _) => match action_from_accesskit(action) {
             Some(action) => action,
@@ -83,7 +89,29 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
             }
         },
     };
-    let payload = payload_of(data.as_ref(), action);
+
+    // R13-16：a11y 级 `disabled` 必须与动作能力同源 —— 宣告"不可用"后 AT 的激活不得执行
+    // 任何改变状态的路径（`Click` / `Focus` / `SetValue` / `Increment` / `Decrement` /
+    // `SetTextSelection` / `Expand` / `Collapse`）。滚动动作保留（只改视口）。
+    let disabled = app
+        .window(window)
+        .is_some_and(|target| crate::a11y::mapping::a11y_disabled(target.tree(), engine));
+    if disabled && is_state_changing(action) {
+        app.a11y_note(A11yDiagnostic::DisabledAction {
+            node: engine,
+            action,
+        });
+        return;
+    }
+
+    let payload = match action {
+        // R13-21：`Increment` / `Decrement` 没有 payload 时，AT 的"加一步"只能靠应用自己
+        // 猜当前值与步长。这里用节点自己的 `numeric_value ± numeric_value_step` 补齐。
+        A11yAction::Increment | A11yAction::Decrement => {
+            increment_payload(app, window, engine, action, data.as_ref())
+        }
+        _ => payload_of(data.as_ref(), action),
+    };
 
     // ① 应用 handler 优先（`Click` 例外：它必须落到 P10 的 `Action` 表，见 §9.3）。
     if action != A11yAction::Click
@@ -124,6 +152,58 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
     }
 }
 
+/// 该动作是否会改变被禁用控件的数据（R13-16 的剔除名单；滚动动作不在内）。
+const fn is_state_changing(action: A11yAction) -> bool {
+    matches!(
+        action,
+        A11yAction::Click
+            | A11yAction::Focus
+            | A11yAction::SetValue
+            | A11yAction::Increment
+            | A11yAction::Decrement
+            | A11yAction::SetTextSelection
+            | A11yAction::Expand
+            | A11yAction::Collapse
+    )
+}
+
+/// `Increment` / `Decrement` 的 payload：AT 明确给了数值就用它，否则用节点声明的
+/// `numeric_value ± numeric_value_step`（R13-21）。两者都没有 ⇒ 无 payload（应用自行判断）。
+fn increment_payload(
+    app: &App,
+    window: WindowId,
+    node: crate::node::id::NodeId,
+    action: A11yAction,
+    data: Option<&ActionData>,
+) -> A11yActionData<'static> {
+    if let Some(ActionData::NumericValue(value)) = data {
+        return A11yActionData::NumericValue(*value);
+    }
+    let Some(tree) = app.window(window).map(|target| target.tree()) else {
+        return A11yActionData::None;
+    };
+    let slot = tree.a11y_of(node);
+    let patch = slot.map(|slot| &slot.patch);
+    let over = slot.and_then(|slot| slot.over.as_ref());
+    let value = patch
+        .and_then(|patch| patch.numeric_value)
+        .or_else(|| over.and_then(|over| over.numeric_value));
+    let step = patch
+        .and_then(|patch| patch.numeric_value_step)
+        .or_else(|| over.and_then(|over| over.numeric_value_step));
+    match (value, step) {
+        (Some(value), Some(step)) => {
+            let delta = if action == A11yAction::Decrement {
+                -step
+            } else {
+                step
+            };
+            A11yActionData::NumericValue(value + delta)
+        }
+        _ => A11yActionData::None,
+    }
+}
+
 /// 把 `accesskit::ActionData` 翻译成引擎 payload。
 fn payload_of(data: Option<&ActionData>, action: A11yAction) -> A11yActionData<'_> {
     match (action, data) {
@@ -145,6 +225,9 @@ fn payload_of(data: Option<&ActionData>, action: A11yAction) -> A11yActionData<'
 }
 
 /// 调应用 handler（借用纪律：先摘出闭包 → 建 ctx → 调用 → 放回）。
+///
+/// 放回由 [`HandlerGuard`] 的 `Drop` 保证：应用 handler 里 panic（下单逻辑的 `unwrap`）被
+/// 上层捕获后，该动作的 handler **不会**永久消失（R13-20）。
 fn run_handler(
     app: &mut App,
     window: WindowId,
@@ -152,15 +235,36 @@ fn run_handler(
     action: A11yAction,
     data: A11yActionData<'_>,
 ) -> bool {
-    let Some(mut handler) = app.a11y_take_handler(action) else {
+    let Some(handler) = app.a11y_take_handler(action) else {
         return false;
     };
+    let mut guard = HandlerGuard {
+        app,
+        action,
+        handler: Some(handler),
+    };
     {
-        let mut ctx = A11yActionCtx::new(app, window, node, action, data);
-        handler(&mut ctx);
+        let mut ctx = A11yActionCtx::new(guard.app, window, node, action, data);
+        if let Some(handler) = guard.handler.as_mut() {
+            handler(&mut ctx);
+        }
     }
-    app.a11y_put_handler(action, handler);
     true
+}
+
+/// handler 的归还守卫（panic 时 `Drop` 也会把它放回表里）。
+struct HandlerGuard<'a> {
+    app: &'a mut App,
+    action: A11yAction,
+    handler: Option<Box<dyn FnMut(&mut A11yActionCtx<'_>)>>,
+}
+
+impl Drop for HandlerGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(handler) = self.handler.take() {
+            self.app.a11y_put_handler(self.action, handler);
+        }
+    }
 }
 
 /// `Click`：激活节点**声明的**动作（与指针点击 / 键盘 Enter 同一身份）。
@@ -327,16 +431,57 @@ mod tests {
     }
 
     fn request(
+        app: &mut App,
+        window: crate::window::WindowId,
         action: AkAction,
         target: crate::node::id::NodeId,
         data: Option<ActionData>,
     ) -> ActionRequest {
+        // A1：动作请求的 `NodeId` 是**稳定 id**（由 a11y 分配器发放），不再是引擎句柄。
+        // 先拿已发放的 id；还没交付过就先跑一笔 a11y pass 让分配器建表。
+        let stable = app
+            .window(window)
+            .and_then(|state| state.a11y_stable_id(target))
+            .or_else(|| {
+                let _ = app.a11y_take(window);
+                app.window(window)
+                    .and_then(|state| state.a11y_stable_id(target))
+            })
+            .expect("a11y 分配器必须给目标节点发过 id");
         ActionRequest {
             action,
             target_tree: TreeId::ROOT,
-            target_node: AkNodeId(crate::a11y::A11yNodeId::from_engine(target).get()),
+            target_node: AkNodeId(stable.get()),
             data,
         }
+    }
+
+    /// 造一条动作请求并立刻分发（测试主体只关心"AT 发了什么、引擎做了什么"）。
+    fn dispatch_request(
+        app: &mut App,
+        window: crate::window::WindowId,
+        action: AkAction,
+        target: crate::node::id::NodeId,
+        data: Option<ActionData>,
+    ) {
+        let request = request(app, window, action, target, data);
+        dispatch(app, window, request);
+    }
+
+    /// 断言"这次分发没有被判未处理 / 被禁用挡下"。
+    ///
+    /// 不能断言 `a11y_diagnostics()` 全空：为了让分配器发放 id，测试必须先跑一笔 a11y pass，
+    /// 它可能产生**与本次分发无关**的诊断（例如测试节点没给名字的 `MissingLabel`）。
+    fn assert_no_action_diagnostics(app: &App, message: &str) {
+        let offender = app.a11y_diagnostics().iter().find(|diagnostic| {
+            matches!(
+                diagnostic,
+                crate::a11y::A11yDiagnostic::UnhandledAction { .. }
+                    | crate::a11y::A11yDiagnostic::DisabledAction { .. }
+                    | crate::a11y::A11yDiagnostic::StaleAction { .. }
+            )
+        });
+        assert!(offender.is_none(), "{message}: {offender:?}");
     }
 
     /// review P2-5：UIA `RangeValuePattern.SetValue` 发的是 `NumericValue(f64)`，
@@ -360,21 +505,16 @@ mod tests {
             }
         });
 
-        dispatch(
+        dispatch_request(
             &mut app,
             window,
-            request(
-                AkAction::SetValue,
-                node,
-                Some(ActionData::NumericValue(42.5)),
-            ),
+            AkAction::SetValue,
+            node,
+            Some(ActionData::NumericValue(42.5)),
         );
 
         assert_eq!(seen.get(), 42.5, "handler 必须收到 UIA 传的数值");
-        assert!(
-            app.a11y_diagnostics().is_empty(),
-            "有 handler 时不得记未处理诊断"
-        );
+        assert_no_action_diagnostics(&app, "有 handler 时不得记未处理诊断");
     }
 
     /// review P2-5：`Increment` / `Decrement` 必须能映射到引擎动作（此前被静默忽略）。
@@ -390,7 +530,7 @@ mod tests {
         app.on_a11y_action(A11yAction::Increment, move |_ctx| {
             counter.set(counter.get() + 1);
         });
-        dispatch(&mut app, window, request(AkAction::Increment, node, None));
+        dispatch_request(&mut app, window, AkAction::Increment, node, None);
         assert_eq!(count.get(), 1, "Increment 必须落到 handler");
     }
 
@@ -409,10 +549,10 @@ mod tests {
             counter.set(counter.get() + 1);
         });
 
-        dispatch(&mut app, window, request(AkAction::Click, node, None));
+        dispatch_request(&mut app, window, AkAction::Click, node, None);
 
         assert_eq!(hits.get(), 1, "Click 必须落到 Action 表");
-        assert!(app.a11y_diagnostics().is_empty());
+        assert_no_action_diagnostics(&app, "Click 落地后不得记未处理诊断");
     }
 
     #[test]
@@ -424,10 +564,10 @@ mod tests {
             .build(app.window_mut(window).expect("window").tree_mut(), root)
             .expect("mount");
 
-        dispatch(&mut app, window, request(AkAction::Focus, node, None));
+        dispatch_request(&mut app, window, AkAction::Focus, node, None);
         assert_eq!(app.focused(window), Some(node));
 
-        dispatch(&mut app, window, request(AkAction::Blur, node, None));
+        dispatch_request(&mut app, window, AkAction::Blur, node, None);
         assert_eq!(app.focused(window), None);
     }
 
@@ -443,7 +583,7 @@ mod tests {
             .expect("mount");
         let _ = app.dispatcher().take_frame_wake();
 
-        dispatch(&mut app, window, request(AkAction::Focus, node, None));
+        dispatch_request(&mut app, window, AkAction::Focus, node, None);
 
         assert_eq!(app.focused(window), Some(node));
         assert!(
@@ -525,28 +665,20 @@ mod tests {
             .expect("mount");
 
         // 模态外：SetValue / Increment / Scroll* 全部拒绝。
-        dispatch(
+        dispatch_request(
             &mut app,
             window,
-            request(
-                AkAction::SetValue,
-                background,
-                Some(ActionData::Value("9".into())),
-            ),
+            AkAction::SetValue,
+            background,
+            Some(ActionData::Value("9".into())),
         );
-        dispatch(
+        dispatch_request(&mut app, window, AkAction::Increment, background, None);
+        dispatch_request(
             &mut app,
             window,
-            request(AkAction::Increment, background, None),
-        );
-        dispatch(
-            &mut app,
-            window,
-            request(
-                AkAction::ScrollDown,
-                container,
-                Some(ActionData::ScrollUnit(accesskit::ScrollUnit::Item)),
-            ),
+            AkAction::ScrollDown,
+            container,
+            Some(ActionData::ScrollUnit(accesskit::ScrollUnit::Item)),
         );
         assert_eq!(set_value_hits.get(), 0, "模态外的 SetValue 不得生效");
         assert_eq!(increment_hits.get(), 0, "模态外的 Increment 不得生效");
@@ -565,16 +697,14 @@ mod tests {
         );
 
         // 作用域内：同一批动作照常落地（证明拦截的是位置，不是动作类型）。
-        dispatch(
+        dispatch_request(
             &mut app,
             window,
-            request(
-                AkAction::SetValue,
-                inside,
-                Some(ActionData::Value("9".into())),
-            ),
+            AkAction::SetValue,
+            inside,
+            Some(ActionData::Value("9".into())),
         );
-        dispatch(&mut app, window, request(AkAction::Increment, inside, None));
+        dispatch_request(&mut app, window, AkAction::Increment, inside, None);
         assert_eq!(set_value_hits.get(), 1);
         assert_eq!(increment_hits.get(), 1);
     }
@@ -586,6 +716,14 @@ mod tests {
         let doomed = NodeBuilder::boxed()
             .build(app.window_mut(window).expect("window").tree_mut(), root)
             .expect("mount");
+        // 先交付一笔：分配器必须给 doomed 发过稳定 id（AT 侧那笔交付也发生过），
+        // 然后才卸载它 —— 这正是"AT 发来一个已回收节点的动作"的真实时序。
+        let _ = app.a11y_take(window).expect("首笔交付");
+        let stable = app
+            .window(window)
+            .expect("window")
+            .a11y_stable_id(doomed)
+            .expect("doomed 的稳定 id");
         app.window_mut(window)
             .expect("window")
             .tree_mut()
@@ -597,7 +735,16 @@ mod tests {
         app.on_action(Action::custom("press"), move |_ctx| {
             counter.set(counter.get() + 1);
         });
-        dispatch(&mut app, window, request(AkAction::Click, doomed, None));
+        dispatch(
+            &mut app,
+            window,
+            ActionRequest {
+                action: AkAction::Click,
+                target_tree: TreeId::ROOT,
+                target_node: AkNodeId(stable.get()),
+                data: None,
+            },
+        );
 
         assert_eq!(hits.get(), 0, "陈旧目标不得触发任何 handler");
         assert!(matches!(
@@ -625,20 +772,15 @@ mod tests {
             }
         });
 
-        dispatch(
+        dispatch_request(
             &mut app,
             window,
-            request(
-                AkAction::SetValue,
-                node,
-                Some(ActionData::Value("42".into())),
-            ),
+            AkAction::SetValue,
+            node,
+            Some(ActionData::Value("42".into())),
         );
         assert_eq!(seen.take(), String::from("42"));
-        assert!(
-            app.a11y_diagnostics().is_empty(),
-            "handler 落地后不再记 Unhandled"
-        );
+        assert_no_action_diagnostics(&app, "handler 落地后不再记 Unhandled");
         let _ = SmolStr::default();
     }
 
@@ -661,14 +803,12 @@ mod tests {
             }
         });
 
-        dispatch(
+        dispatch_request(
             &mut app,
             window,
-            request(
-                AkAction::ReplaceSelectedText,
-                node,
-                Some(ActionData::Value("的".into())),
-            ),
+            AkAction::ReplaceSelectedText,
+            node,
+            Some(ActionData::Value("的".into())),
         );
         assert_eq!(seen.take(), String::from("的"));
     }
@@ -692,23 +832,21 @@ mod tests {
             }
         });
 
-        dispatch(
+        dispatch_request(
             &mut app,
             window,
-            request(
-                AkAction::SetTextSelection,
-                node,
-                Some(ActionData::SetTextSelection(accesskit::TextSelection {
-                    anchor: accesskit::TextPosition {
-                        node: AkNodeId(crate::a11y::A11yNodeId::from_engine(node).get()),
-                        character_index: 2,
-                    },
-                    focus: accesskit::TextPosition {
-                        node: AkNodeId(crate::a11y::A11yNodeId::from_engine(node).get()),
-                        character_index: 5,
-                    },
-                })),
-            ),
+            AkAction::SetTextSelection,
+            node,
+            Some(ActionData::SetTextSelection(accesskit::TextSelection {
+                anchor: accesskit::TextPosition {
+                    node: AkNodeId(0),
+                    character_index: 2,
+                },
+                focus: accesskit::TextPosition {
+                    node: AkNodeId(0),
+                    character_index: 5,
+                },
+            })),
         );
         assert_eq!(seen.get(), (2, 5));
     }
@@ -736,14 +874,12 @@ mod tests {
         app.set_scroll_content(&handle, crate::math::Size::new(100.0, 400.0))
             .expect("content");
 
-        dispatch(
+        dispatch_request(
             &mut app,
             window,
-            request(
-                AkAction::ScrollDown,
-                container,
-                Some(ActionData::ScrollUnit(accesskit::ScrollUnit::Item)),
-            ),
+            AkAction::ScrollDown,
+            container,
+            Some(ActionData::ScrollUnit(accesskit::ScrollUnit::Item)),
         );
         let state = app.scroll_state(&handle).expect("state");
         assert!(state.offset.y > 0.0, "ScrollDown 必须下移偏移");
@@ -757,7 +893,7 @@ mod tests {
         let node = NodeBuilder::boxed()
             .build(app.window_mut(window).expect("window").tree_mut(), root)
             .expect("mount");
-        dispatch(&mut app, window, request(AkAction::ShowTooltip, node, None));
+        dispatch_request(&mut app, window, AkAction::ShowTooltip, node, None);
         assert!(matches!(
             app.a11y_diagnostics(),
             [crate::a11y::A11yDiagnostic::UnhandledAction { .. }]
@@ -768,5 +904,163 @@ mod tests {
             ScrollConfig::default(),
             Point::ZERO,
         );
+    }
+
+    /// C12 一致化：祖先 `interactive: false` 时，AT 对后代的激活同样被拒绝。
+    #[test]
+    fn disabled_ancestors_block_actions_on_descendants() {
+        let (_runtime, mut app, window) = setup();
+        let root = app.window(window).expect("window").tree().root();
+        let tree = app.window_mut(window).expect("window").tree_mut();
+        let panel = NodeBuilder::boxed().build(tree, root).expect("panel");
+        let child = NodeBuilder::boxed()
+            .on_click(Action::custom("buy"))
+            .build(tree, panel)
+            .expect("child");
+        tree.set_style_patch_for_test(
+            panel,
+            StylePatch {
+                interactive: Some(false),
+                ..StylePatch::default()
+            },
+        );
+        let hits = Rc::new(Cell::new(0));
+        let counter = Rc::clone(&hits);
+        app.on_action(Action::custom("buy"), move |_ctx| {
+            counter.set(counter.get() + 1);
+        });
+        dispatch_request(&mut app, window, AkAction::Click, child, None);
+        assert_eq!(hits.get(), 0, "禁用祖先的后代不得被 AT 激活");
+        assert!(
+            app.a11y_diagnostics().iter().any(|diagnostic| matches!(
+                diagnostic,
+                crate::a11y::A11yDiagnostic::DisabledAction { .. }
+            )),
+            "{:?}",
+            app.a11y_diagnostics()
+        );
+    }
+
+    /// A1：未知 / 已回收的稳定 id 必须判陈旧（忽略 + `StaleAction`），不得 panic。
+    #[test]
+    fn unknown_stable_ids_are_stale() {
+        let (_runtime, mut app, window) = setup();
+        dispatch(
+            &mut app,
+            window,
+            ActionRequest {
+                action: AkAction::Click,
+                target_tree: TreeId::ROOT,
+                target_node: AkNodeId(999_999),
+                data: None,
+            },
+        );
+        assert!(matches!(
+            app.a11y_diagnostics(),
+            [crate::a11y::A11yDiagnostic::StaleAction { .. }]
+        ));
+    }
+
+    /// R13-16（失败用例先行）：a11y 宣告 `disabled` 后，AT 的激活**不得**真的执行 `on_click`。
+    #[test]
+    fn disabled_nodes_reject_state_changing_actions() {
+        let (_runtime, mut app, window) = setup();
+        let root = app.window(window).expect("window").tree().root();
+        let node = NodeBuilder::boxed()
+            .on_click(Action::custom("buy"))
+            .build(app.window_mut(window).expect("window").tree_mut(), root)
+            .expect("mount");
+        let hits = Rc::new(Cell::new(0));
+        let counter = Rc::clone(&hits);
+        app.on_action(Action::custom("buy"), move |_ctx| {
+            counter.set(counter.get() + 1);
+        });
+        // `bind_a11y(disabled: Some(true))` 是最自然的写法 —— 但它必须同时挡住动作。
+        app.window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .set_a11y_patch(
+                node,
+                A11yPatch {
+                    disabled: Some(true),
+                    ..A11yPatch::default()
+                },
+            );
+        dispatch_request(&mut app, window, AkAction::Click, node, None);
+        assert_eq!(hits.get(), 0, "禁用节点不得被 AT 激活（可能下单）");
+        assert!(
+            app.a11y_diagnostics().iter().any(|diagnostic| matches!(
+                diagnostic,
+                crate::a11y::A11yDiagnostic::DisabledAction { .. }
+            )),
+            "{:?}",
+            app.a11y_diagnostics()
+        );
+    }
+
+    /// R13-21：`Increment` / `Decrement` 必须带"当前值 ± 步长"的 payload，
+    /// 否则应用只能猜（AT 说"加了一步"但值没动）。
+    #[test]
+    fn increment_payload_uses_the_numeric_value_and_step() {
+        let (_runtime, mut app, window) = setup();
+        let root = app.window(window).expect("window").tree().root();
+        let node = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(crate::a11y::A11yRole::Slider),
+                label: Some(SmolStr::new_static("价格")),
+                numeric_value: Some(100.0),
+                numeric_value_step: Some(5.0),
+                ..A11yOverride::default()
+            })
+            .build(app.window_mut(window).expect("window").tree_mut(), root)
+            .expect("mount");
+        let seen = Rc::new(Cell::new(f64::NAN));
+        let slot = Rc::clone(&seen);
+        app.on_a11y_action(A11yAction::Increment, move |ctx| {
+            if let A11yActionData::NumericValue(value) = ctx.data() {
+                slot.set(value);
+            }
+        });
+        let seen_down = Rc::new(Cell::new(f64::NAN));
+        let slot_down = Rc::clone(&seen_down);
+        app.on_a11y_action(A11yAction::Decrement, move |ctx| {
+            if let A11yActionData::NumericValue(value) = ctx.data() {
+                slot_down.set(value);
+            }
+        });
+        dispatch_request(&mut app, window, AkAction::Increment, node, None);
+        assert_eq!(seen.get(), 105.0, "Increment = 当前值 + 步长");
+        dispatch_request(&mut app, window, AkAction::Decrement, node, None);
+        assert_eq!(seen_down.get(), 95.0, "Decrement = 当前值 - 步长");
+    }
+
+    /// R13-20：应用 handler panic 后，handler 不得永久丢失（`Drop` 守卫放回）。
+    #[test]
+    fn a_panicking_handler_is_restored() {
+        let (_runtime, mut app, window) = setup();
+        let root = app.window(window).expect("window").tree().root();
+        let node = NodeBuilder::boxed()
+            .build(app.window_mut(window).expect("window").tree_mut(), root)
+            .expect("mount");
+        let calls = Rc::new(Cell::new(0));
+        let counter = Rc::clone(&calls);
+        app.on_a11y_action(A11yAction::SetValue, move |_ctx| {
+            counter.set(counter.get() + 1);
+            panic!("应用 handler 炸了");
+        });
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dispatch_request(&mut app, window, AkAction::SetValue, node, None);
+        }));
+        assert!(outcome.is_err(), "panic 必须冒泡给上层（引擎不吞）");
+        assert!(
+            app.a11y_has_handler(A11yAction::SetValue),
+            "panic 后 handler 必须被放回（否则后续同类动作永久失效）"
+        );
+        // 再触发一次：handler 仍然在（计数 +1 后再次 panic）。
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dispatch_request(&mut app, window, AkAction::SetValue, node, None);
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(calls.get(), 2, "第二次分发仍然命中 handler");
     }
 }

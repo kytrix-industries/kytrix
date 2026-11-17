@@ -1934,14 +1934,23 @@ fn draw_ops(
             continue;
         }
         match *op {
-            FrameOp::Instances { start, len, .. } => {
+            FrameOp::Instances {
+                start, len, scroll, ..
+            } => {
                 if len == 0 {
                     continue;
                 }
                 // 实例基址只经 push constant `draw.clip.y` 进 shader，硬件基址恒 0
                 // （Vulkan 的 firstInstance 会加到 gl_InstanceIndex 上，与 D3D12 相反；
                 //  统一走 uniform 才能三平台一致，contract §6）。
-                let uniform = root.with_instance_base(start);
+                // 合成端滚动偏移：只在本 op 的 root constant 里加，实例字节一个都不动
+                // （B6-2 / 架构决策 §4）。槽位越界按无偏移处理（保守：与不滚动等价）。
+                let scroll_offset = payload
+                    .scroll()
+                    .get(scroll as usize)
+                    .copied()
+                    .unwrap_or([0.0, 0.0]);
+                let uniform = root.with_instance_base(start).with_scroll(scroll_offset);
                 let push_bytes = bytemuck::cast_slice::<f32, u8>(uniform.words());
                 // SAFETY: push constant 的范围由本帧的 pipeline layout 声明（[0, 112)）。
                 unsafe {

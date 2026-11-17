@@ -38,7 +38,9 @@ void main() {
     // 压缩（滚动列表边缘的经典症状）。
     vec2 uv_t = (world_px - full_lo) / max(full_hi - full_lo, vec2(1e-6));
 
-    gl_Position = vec4(to_ndc(world_px), 0.0, 1.0);
+    // B6-2 合成端滚动偏移：只作用在最终的屏幕映射上，local_px / uv / clip 判定留在烘焙坐标空间
+    // （实例字节里与偏移无关），因此滚动帧不需要重编码任何实例。
+    gl_Position = vec4(to_ndc(world_px + root.frame.params.yz), 0.0, 1.0);
     v_local_px = world_px - center;
     v_uv = lerp(p.uv.xy, p.uv.zw, uv_t);
     v_instance = instance;

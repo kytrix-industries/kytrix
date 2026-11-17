@@ -188,7 +188,7 @@ fn bind_text_reevaluation_updates_content_and_marks_paint() {
         let w = app.window_mut(window).expect("窗口存在");
         let root = w.tree().root();
         NodeBuilder::text("", crate::text::TextStyle::new(16.0))
-            .bind_text(move |cx| cx.read(&signal))
+            .bind_text(move |cx| cx.read(&signal).clone())
             .build(w.tree_mut(), root)
             .expect("挂载成功")
     };
@@ -558,7 +558,7 @@ fn write_only_reaches_the_owning_window() {
     let window_a = app.create_window(WindowOptions::default());
     let window_b = app.create_window(WindowOptions::default());
     let node_a = node_with(&mut app, window_a, move |cx: &mut ReadCtx<'_>| StylePatch {
-        opacity: Some(cx.read(&signal) as f32),
+        opacity: Some(*cx.read(&signal) as f32),
         ..StylePatch::default()
     });
     let node_b = node_with(&mut app, window_b, |_cx| StylePatch::default());
@@ -589,7 +589,7 @@ fn write_marks_layout_when_patch_affects_layout() {
     let window = app.create_window(WindowOptions::default());
     let node = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
         affects_layout: true,
-        opacity: Some(cx.read(&signal) as f32),
+        opacity: Some(*cx.read(&signal) as f32),
         ..StylePatch::default()
     });
     app.refresh_styles(window).expect("窗口存在");
@@ -613,7 +613,7 @@ fn write_skips_stale_owner_without_panicking() {
     let signal: Signal<u32> = app.signal(0);
     let window = app.create_window(WindowOptions::default());
     let node = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-        opacity: Some(cx.read(&signal) as f32),
+        opacity: Some(*cx.read(&signal) as f32),
         ..StylePatch::default()
     });
     app.refresh_styles(window).expect("窗口存在");
@@ -641,7 +641,7 @@ fn refresh_styles_only_reevaluates_dirty_nodes() {
     let node = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| {
         a.set(a.get() + 1);
         StylePatch {
-            opacity: Some(cx.read(&signal) as f32),
+            opacity: Some(*cx.read(&signal) as f32),
             ..StylePatch::default()
         }
     });
@@ -676,7 +676,7 @@ fn refresh_styles_is_idempotent() {
     let signal: Signal<u32> = app.signal(0);
     let window = app.create_window(WindowOptions::default());
     let node = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-        opacity: Some(cx.read(&signal) as f32),
+        opacity: Some(*cx.read(&signal) as f32),
         ..StylePatch::default()
     });
 
@@ -713,7 +713,7 @@ fn refresh_styles_escalates_layout_when_patch_affects_layout() {
     let resized: Signal<bool> = app.signal(false);
     let window = app.create_window(WindowOptions::default());
     let node = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-        affects_layout: cx.read(&resized),
+        affects_layout: *cx.read(&resized),
         ..StylePatch::default()
     });
 
@@ -753,8 +753,8 @@ fn refresh_styles_updates_deps() {
     let b: Signal<u32> = app.signal(2);
     let window = app.create_window(WindowOptions::default());
     let node = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| {
-        let use_a = cx.read(&flag);
-        let value = if use_a { cx.read(&a) } else { cx.read(&b) };
+        let use_a = *cx.read(&flag);
+        let value = if use_a { *cx.read(&a) } else { *cx.read(&b) };
         StylePatch {
             opacity: Some(value as f32),
             ..StylePatch::default()
@@ -801,11 +801,11 @@ fn removing_a_node_detaches_its_dependencies() {
     // 两个独立读者：一个用裸 `tree.remove` 卸载（分层上不负责依赖图），一个走
     // `App::remove_node`（必须在删除的同时 detach）。断言后者不残留、前者残留。
     let bare = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-        opacity: Some(cx.read(&signal) as f32),
+        opacity: Some(*cx.read(&signal) as f32),
         ..StylePatch::default()
     });
     let managed = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-        opacity: Some(cx.read(&signal) as f32),
+        opacity: Some(*cx.read(&signal) as f32),
         ..StylePatch::default()
     });
     app.refresh_styles(window).expect("窗口存在");
@@ -835,7 +835,7 @@ fn close_window_detaches_dependencies() {
     let signal: Signal<u32> = app.signal(0);
     let window = app.create_window(WindowOptions::default());
     let _node = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-        opacity: Some(cx.read(&signal) as f32),
+        opacity: Some(*cx.read(&signal) as f32),
         ..StylePatch::default()
     });
     app.refresh_styles(window).expect("窗口存在");
@@ -857,7 +857,7 @@ fn refresh_styles_marks_a11y_on_interactive_change() {
     let enabled: Signal<bool> = app.signal(false);
     let window = app.create_window(WindowOptions::default());
     let node = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-        interactive: Some(cx.read(&enabled)),
+        interactive: Some(*cx.read(&enabled)),
         ..StylePatch::default()
     });
     app.refresh_styles(window).expect("窗口存在");
@@ -879,12 +879,12 @@ fn eval_guard_pops_on_panic_and_cache_survives() {
     let window = app.create_window(WindowOptions::default());
     // 第一个节点：本次求值会 panic（它的 `bind_style` 随后丢失 → 退化为静态节点）。
     let doomed = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-        opacity: Some(cx.read_derived(&bad).unwrap_or(0.0)),
+        opacity: Some(cx.read_derived(&bad).map(|v| *v).unwrap_or(0.0)),
         ..StylePatch::default()
     });
     // 第二个节点：求值面相同，但它没在 panic 里丢闭包 —— 用来证明后续读返回 `CyclicDerived` 而不是 panic。
     let survivor = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-        opacity: Some(cx.read_derived(&bad).unwrap_or(0.0)),
+        opacity: Some(cx.read_derived(&bad).map(|v| *v).unwrap_or(0.0)),
         ..StylePatch::default()
     });
 
@@ -930,11 +930,11 @@ fn write_isolates_sibling_nodes() {
     let signal_b: Signal<u32> = app.signal(0);
     let window = app.create_window(WindowOptions::default());
     let node_a = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-        opacity: Some(cx.read(&signal_a) as f32),
+        opacity: Some(*cx.read(&signal_a) as f32),
         ..StylePatch::default()
     });
     let node_b = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-        opacity: Some(cx.read(&signal_b) as f32),
+        opacity: Some(*cx.read(&signal_b) as f32),
         ..StylePatch::default()
     });
     app.refresh_styles(window).expect("窗口存在");
@@ -960,7 +960,7 @@ fn write_only_derived_does_not_wake() {
     // 只有派生失效、没有节点变脏 ⇒ 不该提交帧（I3「空闲不提交帧」）。
     let (_rt, mut app) = new_app();
     let signal: Signal<u32> = app.signal(1);
-    let derived: Derived<u32> = app.derived(move |cx| cx.read(&signal) * 2);
+    let derived: Derived<u32> = app.derived(move |cx| *cx.read(&signal) * 2);
     let window = app.create_window(WindowOptions::default());
 
     assert!(app.write(&signal, 2));
@@ -1274,7 +1274,7 @@ fn changed_text_marks_a11y() {
     let window = app.create_window(WindowOptions::default());
     let root = app.window(window).expect("窗口存在").tree().root();
     let node = NodeBuilder::text("A", crate::text::TextStyle::new(12.0))
-        .bind_text(move |cx| cx.read(&signal))
+        .bind_text(move |cx| cx.read(&signal).clone())
         .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
         .expect("挂载");
     app.refresh_styles(window).expect("窗口存在");
@@ -1305,7 +1305,7 @@ fn writing_a_signal_wakes_the_platform_loop() {
     let root = app.window(window).expect("窗口存在").tree().root();
     let _ = NodeBuilder::boxed()
         .bind_style(move |cx| StylePatch {
-            opacity: Some(cx.read(&signal) as f32),
+            opacity: Some(*cx.read(&signal) as f32),
             ..StylePatch::default()
         })
         .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
@@ -1330,11 +1330,11 @@ fn write_marks_across_windows() {
     let window_a = app.create_window(WindowOptions::default());
     let window_b = app.create_window(WindowOptions::default());
     let node_a = node_with(&mut app, window_a, move |cx: &mut ReadCtx<'_>| StylePatch {
-        opacity: Some(cx.read(&signal) as f32),
+        opacity: Some(*cx.read(&signal) as f32),
         ..StylePatch::default()
     });
     let node_b = node_with(&mut app, window_b, move |cx: &mut ReadCtx<'_>| StylePatch {
-        opacity: Some(cx.read(&signal) as f32),
+        opacity: Some(*cx.read(&signal) as f32),
         ..StylePatch::default()
     });
     app.refresh_styles(window_a).expect("窗口存在");
@@ -1384,7 +1384,7 @@ fn bind_style_panic_clears_ghost_deps() {
     let window = app.create_window(WindowOptions::default());
     let node = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| {
         counter.set(counter.get() + 1);
-        let value = cx.read(&signal);
+        let value = *cx.read(&signal);
         assert!(counter.get() <= 1, "第二次求值故意 panic");
         StylePatch {
             opacity: Some(value as f32),
@@ -1668,7 +1668,7 @@ fn bind_text_preserves_inline_boxes() {
         let w = app.window_mut(window).expect("window");
         let root = w.tree().root();
         NodeBuilder::text("", crate::text::TextStyle::new(16.0))
-            .bind_text(move |cx| cx.read(&signal))
+            .bind_text(move |cx| cx.read(&signal).clone())
             .inline_boxes([spec])
             .build(w.tree_mut(), root)
             .expect("build")
@@ -1707,7 +1707,7 @@ fn app_frame_runs_styles_then_paints() {
         let _ = NodeBuilder::boxed()
             .layout_override(crate::math::Rect::new(0.0, 0.0, 20.0, 10.0))
             .bind_style(move |cx| StylePatch {
-                background: Some(cx.read(&background)),
+                background: Some(*cx.read(&background)),
                 ..StylePatch::default()
             })
             .build(app.window_mut(window).expect("窗口").tree_mut(), root)

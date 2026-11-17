@@ -733,18 +733,39 @@ impl<'a> ActionCtx<'a> {
         self.source
     }
 
-    /// **非追踪**读（handler 不是渲染 pass，不登记依赖）。
-    pub fn read<T: Clone + 'static>(&self, signal: &crate::node::signal::Signal<T>) -> T {
+    /// **非追踪**读（handler 不是渲染 pass，不登记依赖），返回读守卫（零拷贝）。
+    ///
+    /// 守卫不借用 `ActionCtx`；在它存活期间对**同一个**信号的写会 panic（借用规则见
+    /// `node::signal` 模块文档）。需要长期持有旧值时用 `(*guard).clone()`。
+    pub fn read<T: 'static>(
+        &self,
+        signal: &crate::node::signal::Signal<T>,
+    ) -> crate::node::signal::SignalRef<T> {
         self.app.read(signal)
     }
 
     /// 写状态（`App::write` 的转调：等值短路 + `dependents` 反查 + 唤醒）。
+    ///
+    /// # Panics
+    /// 该信号存在活跃读守卫。
     pub fn write<T: Clone + PartialEq + 'static>(
         &mut self,
         signal: &crate::node::signal::Signal<T>,
         value: T,
     ) -> bool {
         self.app.write(signal, value)
+    }
+
+    /// 原地更新状态（`App::update` 的转调：无等值短路）。
+    ///
+    /// # Panics
+    /// 该信号存在活跃读守卫。
+    pub fn update<T: 'static>(
+        &mut self,
+        signal: &crate::node::signal::Signal<T>,
+        update: impl FnOnce(&mut T),
+    ) -> bool {
+        self.app.update(signal, update)
     }
 
     /// 其余交互能力（滚动 / 焦点 / 浮层 / 拖拽）走 `&mut App`。

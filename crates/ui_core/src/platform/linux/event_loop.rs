@@ -33,7 +33,7 @@ use crate::{
     platform::{
         dispatcher::Dispatcher,
         linux::{
-            a11y::{UnixA11y, window_bounds},
+            a11y::UnixA11y,
             clipboard::PendingSend,
             dpi,
             surface::{self, WaylandState},
@@ -347,7 +347,14 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                 };
                 window_a11y
                     .adapter
-                    .set_bounds(window_bounds(state.size(index), state.scale(index)));
+                    // AT-SPI 的 extent = inner.origin + 节点 bounds；Wayland 拿不到窗口的
+                    // 全局位置（`xdg_toplevel` 不暴露），按 GTK/GNOME 的同一约定退化为
+                    // 窗口客户区相对。尺寸是物理像素（含 scale），与 a11y 节点 bounds 同空间。
+                    .set_bounds(
+                        crate::math::Point::ZERO,
+                        state.size(index),
+                        state.scale(index),
+                    );
                 let id = window_a11y.id;
                 if app.a11y_pending(id) {
                     window_a11y

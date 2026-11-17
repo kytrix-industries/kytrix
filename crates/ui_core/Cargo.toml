@@ -56,6 +56,14 @@ name = "perf"
 path = "benches/perf.rs"
 harness = false
 
+# wave-6：状态写入 / 增量布局（B9）/ 命中测试（C11-C13）的热路径基准。
+# 独立 target（不碰 `perf.rs`：wave-5b 在改它）；同一份源码可在 wave-6 前后两个分支编译，
+# 用于"整改前 vs 整改后"的数值对比。
+[[bench]]
+name = "layout_postpass"
+path = "benches/layout_postpass.rs"
+harness = false
+
 [dev-dependencies]
 # P13：只测 CPU 侧 pass。workspace 已关掉 criterion 的默认 features（无 plotters/rayon，S-130）。
 criterion = { workspace = true }
@@ -72,6 +80,9 @@ bitflags = { workspace = true }
 bytes = { workspace = true }
 bytemuck = { workspace = true }
 color = { workspace = true }
+
+# P11：a11y `TextRun` 的 grapheme / 词边界（`character_lengths` / `word_starts`）。
+unicode-segmentation = { workspace = true }
 
 # P03 节点 / 状态 / 容器
 ahash = { workspace = true }

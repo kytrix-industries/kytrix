@@ -77,7 +77,7 @@ use crate::{
         DirtyRows, RenderStats,
         color::background_linear,
         compositor::{FramePlan, Plan},
-        frame::{FrameFeedback, FrameRequest, LatestFrame, MAX_FRAMES_IN_FLIGHT},
+        frame::{FrameFeedback, FrameRequest, FrameSink, LatestFrame, MAX_FRAMES_IN_FLIGHT},
         timer::{FrameTimings, GpuTimerSample},
         windows::{
             compositor::{FrameSubmitError, GpuRenderer, enter_gpu_thread},
@@ -179,6 +179,32 @@ impl Renderer {
     /// 后端运行期计数器（R08-3 / R08-7 / R08-13 的可观测面；HUD / 日志 / 测试共用）。
     pub(crate) fn diagnostics(&self) -> Diagnostics {
         crate::render::windows::diagnostics::snapshot()
+    }
+
+    /// 记录「UI 侧已经为这个目标尺寸发布过一帧」（B6-2 的合成线程路径）。
+    ///
+    /// 真实窗口的帧由合成线程直接投进最新帧槽，`publish` 不再经过 UI 线程 —— 但
+    /// [`Renderer::surface`] 是 `commit_frame` 判定「本帧是否需要 GPU 工作」的唯一依据，
+    /// 必须由 UI 侧在发布时同步。少这一次同步会让 `Plan::Idle` 的帧被反复发布（Windows 上每次
+    /// 白等一个 vsync 的帧延迟 token）。
+    pub(crate) fn note_published_surface(&mut self, surface: (u32, u32)) {
+        if let RenderTarget::Window(window) = &mut self.target {
+            window.surface = surface;
+        }
+    }
+
+    /// 合成线程的交付端点（B6-2）。
+    ///
+    /// 只有**窗口**目标有：它已经持有「最新帧槽 + 唤醒原语」的 `Arc<Shared>`（`Shared` 是
+    /// `Send + Sync`），合成线程直接往那个槽里发布，**不经过 UI 线程**（少一次泵迭代的延迟）。
+    /// 离屏目标是同步渲染，没有可跨线程的槽位 ⇒ `None`（走 inline 合成）。
+    pub(crate) fn frame_sink(&self) -> Option<Arc<dyn FrameSink>> {
+        match &self.target {
+            RenderTarget::Offscreen(_) => None,
+            RenderTarget::Window(window) => Some(Arc::new(WindowFrameSink {
+                shared: Arc::clone(&window.shared),
+            })),
+        }
     }
 
     /// 发布一帧（**不阻塞**）：窗口路径合并进最新帧槽并唤醒 GPU 线程；离屏路径同步渲染。
@@ -359,6 +385,25 @@ impl StickyError {
 }
 
 /// 窗口渲染器的主线程句柄（最新帧槽 + 图集槽 + 反馈槽 + GPU 线程句柄）。
+/// 合成线程持有的交付端点：只包一层 `Arc<Shared>`（最新帧槽 + 唤醒原语）。
+struct WindowFrameSink {
+    shared: Arc<Shared>,
+}
+
+impl FrameSink for WindowFrameSink {
+    fn submit(&self, request: FrameRequest) -> bool {
+        if !self.shared.alive() {
+            return false;
+        }
+        self.shared.publish_frame(request);
+        true
+    }
+
+    fn is_alive(&self) -> bool {
+        self.shared.alive()
+    }
+}
+
 struct WindowRenderer {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
@@ -652,6 +697,12 @@ impl Shared {
         unsafe {
             let _ = SetEvent(self.work);
         }
+    }
+
+    /// GPU 线程是否还能接收帧（关闭 / 终止之后为假）。
+    fn alive(&self) -> bool {
+        let state = self.lock();
+        !state.shutdown && !state.terminated
     }
 
     fn publish_frame(&self, request: FrameRequest) {

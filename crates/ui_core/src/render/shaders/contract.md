@@ -174,12 +174,34 @@ Metal `buffer(2)` / Vulkan push constants `[0, 112)`）。
 | offset | 字段               | 语义                                                                         |
 |--------|--------------------|------------------------------------------------------------------------------|
 | 0      | `frame.viewport`   | `(w_px, h_px, 2/w_px, 2/h_px)`                                               |
-| 16     | `frame.params`     | `(scale, 0, 0, 0)`；**只**用于 geometry 的逻辑→物理换算                      |
+| 16     | `frame.params`     | `(scale, scroll_x, scroll_y, 0)`；`.x` 只用于 geometry 的逻辑→物理换算，`.yz` 是**合成端滚动偏移**（物理像素；无滚动时恒 0） |
 | 32     | `draw.basis`       | `(m11, m12, m21, m22)`；`x' = m11·x + m21·y + tx`、`y' = m12·x + m22·y + ty` |
 | 48     | `draw.translation` | `(tx, ty, 0, 0)`                                                             |
 | 64     | `draw.color0`      | linear premultiplied（`Ui` 的填充色 / `Textured` 的调制色）                  |
 | 80     | `draw.clip_rect`   | 该 draw 的 clip 交集 AABB（物理浮点，`x,y,w,h`）                             |
 | 96     | `draw.clip`        | `.x = clip_index`（0 = 无裁剪）、`.y = instance_base`、`.zw` 保留恒 0        |
+
+**`frame.params.yz` = 合成端滚动偏移（B6-2）**
+
+滚动**不重编码任何实例**：实例里的 `bounds` / `clip_rect` / `corner_radius` 全部烘焙在「滚动
+容器内容空间」，滚动时 CPU 只更新 `FramePayload::scroll` 表（槽位 → 物理偏移），GPU 侧把它写进
+本 op 的 `frame.params.yz`，由实例顶点 shader 在**最后一步**（`to_ndc` 之前）加到世界坐标上：
+
+```hlsl
+o.position = float4(to_ndc(world_px + frame.params.yz), 0.0, 1.0);  // quad.hlsl
+o.position = float4(to_ndc(world_px + root.frame.params.yz, root.frame), 0.0, 1.0);  // quad.metal
+gl_Position = vec4(to_ndc(world_px + root.frame.params.yz), 0.0, 1.0);  // quad.vert.glsl
+```
+
+三条硬约束：
+
+1. **只加在屏幕映射上**：`local_px`、`uv`、`clip_rect` 与片元侧 `clip_mask` 的判定全部留在烘焙
+   坐标空间 —— 因此裁剪链（`ClipEntry` 是绝对坐标）与偏移天然一致，不需要平移裁剪表；
+2. **一条 op 只有一个偏移**：`FrameOp::Instances.scroll` 相同的相邻 lane 段才允许合并
+   （`append_segment_ops` 在槽位变化时切断合并），否则一个 draw call 会把两组偏移加到同一批顶点；
+3. **hardware scissor 不参与**：`damage` 的 scissor 是屏幕空间的脏矩形（不是 op 的 clip），
+   平移顶点后它仍然正确；滚动帧的 damage 取滚动容器的视口（`scroll_damage`）。
+
 
 **`draw.clip.y` = `instance_base`（实例基址的唯一通道）**
 

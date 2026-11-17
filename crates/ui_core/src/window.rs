@@ -22,6 +22,8 @@ use self::{
     surface::covering_surface,
 };
 #[cfg(feature = "test-support")]
+use crate::paint::instance::InstanceBuffer;
+#[cfg(feature = "test-support")]
 use crate::test_support::record::{FrameRecord, FrameStats};
 use crate::{
     error::EngineError,
@@ -32,11 +34,13 @@ use crate::{
     paint::{
         atlas::AtlasKind,
         color::{Color, ColorResolver},
-        instance::{InstanceBuffer, InstanceEncoder},
         pass::PaintReport,
         scene::Scene,
     },
-    render::{backend::Renderer, compositor::Plan, damage::DamageAccumulator, timer::FrameTimings},
+    render::{
+        backend::Renderer, compose::WindowComposer, compositor::Plan, damage::DamageAccumulator,
+        delta::SceneDelta, timer::FrameTimings,
+    },
 };
 
 /// 窗口句柄：单调递增、**永不复用**（陈旧 id 落回 `None`，因此不需要代际）。
@@ -332,8 +336,27 @@ pub struct Window {
     scale_epoch: u32,
     /// 帧调度（`Idle / Pending / Draining`；`FrameIndex` 只在提交时递增）。
     scheduler: FrameScheduler,
-    /// 实例编码器（容量跨帧保留；P07 消费 `InstanceBuffer`）。
-    encoder: InstanceEncoder,
+    /// 合成器（**inline 模式**持有编码器：headless / 离屏 / 单测）。
+    ///
+    /// 真实窗口的编码器在合成线程里（`render/compositor_thread.rs`），首帧之后这里恒为
+    /// `None`：两个位置各自持有**恰好一个** `InstanceEncoder`，不存在双写。
+    composer: Option<WindowComposer>,
+    /// 本帧待发布的 `SceneDelta`（`paint_frame` 产出；threaded 模式在 `submit_gpu` 补头部后发布）。
+    pending_delta: Option<SceneDelta>,
+    /// 本帧已合成的帧（inline 模式；`submit_gpu` 消费后发布给渲染器）。
+    pending_payload: Option<crate::render::compose::ComposedFrame>,
+    /// delta 采集器（lane 版本 / 绘制序 / 几何描述 / 滚动槽）。
+    delta_builder: crate::render::delta::DeltaBuilder,
+    /// 滚动槽表：槽位 → （逻辑偏移，物理视口）。
+    ///
+    /// **接线点**：paint pass 为滚动容器分配槽位后写入这里（`Pass` 侧一行），此后滚动只改偏移，
+    /// 不重建 lane（架构决策 B3B6 §4）。当前为空 ⇒ 所有 lane 的滚动槽恒 0，行为与旧实现一致。
+    scroll_slots: Vec<(crate::math::Point, PhysicalRect)>,
+    /// 合成线程注册 ticket：**必须声明在 `renderer` 之前**（字段按声明顺序析构）。
+    ///
+    /// 这样窗口关闭时先注销合成线程（最后一个窗口会 join 它），再析构 `renderer`（join GPU
+    /// 线程）—— 「合成线程先于所有 GPU 线程有序退出」的落点。
+    compositor_ticket: Option<crate::render::compositor_thread::CompositorTicket>,
     /// 本帧的 damage 累加器（`paint_frame` 重置，`commit_frame` 消费）。
     damage: DamageAccumulator,
     /// 颜色解析器（编码期 `resolve`；P14 主题的注入点）。
@@ -411,10 +434,15 @@ impl Window {
     pub(crate) fn new(id: WindowId, options: WindowOptions) -> Self {
         let scale = options.scale;
         let surface = covering_surface(options.size, scale);
+        let mut tree = NodeTree::new();
+        // B7：非整数 DPI 才开启布局提交前的设备像素吸附（见 `NodeTree::set_device_scale`）。
+        // 窗口 id 的绑定在 `App::create_window`（`NodeTree::bind_window`）—— 那里才确定
+        // 该树归属哪个窗口，而 `Window::new` 也可能被测试直接调用（不绑定 = 通配作用域）。
+        tree.set_device_scale((scale.factor() != 1.0).then_some(scale.factor()));
         Self {
             id,
             options,
-            tree: NodeTree::new(),
+            tree,
             scene: Scene::empty(),
             scale,
             surface,
@@ -423,7 +451,12 @@ impl Window {
             buffer_scale: 1,
             scale_epoch: 0,
             scheduler: FrameScheduler::new(),
-            encoder: InstanceEncoder::new(),
+            composer: Some(WindowComposer::new()),
+            pending_delta: None,
+            pending_payload: None,
+            delta_builder: crate::render::delta::DeltaBuilder::new(),
+            scroll_slots: Vec::new(),
+            compositor_ticket: None,
             damage: DamageAccumulator::new(scale),
             resolver: ColorResolver,
             renderer: None,
@@ -503,6 +536,32 @@ impl Window {
     pub(crate) fn a11y_note_scroll(&mut self, container: crate::node::id::NodeId) {
         a11y::a11y_note_scroll(self, container)
     }
+    /// 焦点是否变化且尚未交付（`App::a11y_pending` 的不节流旁路）。
+    #[must_use]
+    pub(crate) fn a11y_focus_pending(&self) -> bool {
+        a11y::a11y_focus_pending(self)
+    }
+    /// 稳定 a11y id → 引擎句柄（`ActionRequest` 解码）。
+    #[must_use]
+    pub(crate) fn a11y_engine_of(
+        &self,
+        id: crate::a11y::A11yNodeId,
+    ) -> Option<crate::node::id::NodeId> {
+        a11y::a11y_engine_of(self, id)
+    }
+    /// 引擎句柄 → 稳定 a11y id（只查不分配；动作测试用）。
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn a11y_stable_id(
+        &self,
+        node: crate::node::id::NodeId,
+    ) -> Option<crate::a11y::A11yNodeId> {
+        a11y::a11y_stable_id(self, node)
+    }
+    /// 强制下一笔 a11y 交付为全树（测试 oracle / 防御兜底）。
+    pub(crate) fn a11y_force_full(&mut self) {
+        a11y::a11y_force_full(self);
+    }
     pub(crate) fn a11y_note_bind_work(&mut self) {
         a11y::a11y_note_bind_work(self)
     }
@@ -566,18 +625,25 @@ impl Window {
     fn needs_node_repaint(&self) -> bool {
         paint::needs_node_repaint(self)
     }
+    /// **只给基准/测试**：摘掉 inline 合成器，模拟「编码在合成线程」时 UI 线程的耗时。
+    ///
+    /// 摘掉之后 `paint_frame` 只产 `SceneDelta`（不做编码、不构造载荷），因此同一 fixture 下
+    /// `frame_incremental_10k_ui_thread` 与 `frame_incremental_10k` 的差值就是「合成工作」的
+    /// 成本 —— 这是「编码搬离 UI 线程」的可度量证据。
+    #[cfg(feature = "test-support")]
+    pub fn detach_composer(&mut self) {
+        self.composer = None;
+        self.pending_payload = None;
+    }
+
+    /// 最近一帧的编码产物：**只有 inline 合成**（headless / 离屏 / 单测）的窗口有。
+    ///
+    /// 真实窗口的编码器在合成线程里（B6-2），编码产物不回到 UI 线程 —— 这条 API 因此返回
+    /// `None`（读它的只有诊断 / 读回 / 测试路径）。
+    #[cfg(feature = "test-support")]
     #[must_use]
-    pub(crate) fn instance_buffer(&self) -> &InstanceBuffer {
+    pub(crate) fn instance_buffer(&self) -> Option<&InstanceBuffer> {
         paint::instance_buffer(self)
-    }
-    /// 编码结果的可变视图（`FramePayload` 的增量载荷构建要取走变化区间）。
-    pub(crate) fn instance_buffer_mut(&mut self) -> &mut InstanceBuffer {
-        paint::instance_buffer_mut(self)
-    }
-    /// 实现见子模块 `paint::instance_bytes`（本文件只保留签名）。
-    #[must_use]
-    pub fn instance_bytes(&self) -> &[u8] {
-        paint::instance_bytes(self)
     }
     /// 实现见子模块 `paint::scene`（本文件只保留签名）。
     #[must_use]

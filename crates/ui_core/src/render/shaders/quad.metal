@@ -44,7 +44,8 @@ vertex QuadVsOut vs_main(uint vertex_id [[vertex_id]],
     float2 uv_t = (world_px - full_lo) / max(full_hi - full_lo, float2(1e-6));
 
     QuadVsOut o;
-    o.position = float4(to_ndc(world_px, root.frame), 0.0, 1.0);
+    // B6-2 合成端滚动偏移：只作用在最终的屏幕映射上，local_px / uv / clip 判定留在烘焙坐标空间。
+    o.position = float4(to_ndc(world_px + root.frame.params.yz, root.frame), 0.0, 1.0);
     o.local_px = world_px - center;
     o.uv = mix(p.uv.xy, p.uv.zw, uv_t);
     o.instance = instance;

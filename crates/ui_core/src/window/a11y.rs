@@ -7,7 +7,42 @@ use super::Window;
 
 /// 本轮是否有 a11y 工作（O(1)；平台泵每轮用它过滤 `update_if_active` 调用）。
 pub(crate) fn a11y_pending(window: &Window) -> bool {
-    window.a11y.pending(&window.tree)
+    window.a11y.pending(&window.tree, window.focus.focused())
+}
+
+// 消费者：`impl Window::a11y_focus_pending` 的薄委托。
+/// 焦点是否变化且尚未交付。`App::a11y_pending` 用它给焦点变化开一条**不节流**的旁路：
+/// 数据类更新仍按 `A11Y_THROTTLE`（100 ms）合并，但 Tab/点击造成的焦点变化在下一轮泵就
+/// 交付（0~16 ms），读屏的位置感不再断裂（R13-5）。
+pub(crate) fn a11y_focus_pending(window: &Window) -> bool {
+    window
+        .a11y
+        .focus_pending(&window.tree, window.focus.focused())
+}
+
+// 消费者：`impl Window::a11y_engine_of` 的薄委托（动作解码）。
+/// 稳定 a11y id → 当前引擎句柄（未知 / 已回收 ⇒ `None`，调用方记 `StaleAction`）。
+pub(crate) fn a11y_engine_of(
+    window: &Window,
+    id: crate::a11y::A11yNodeId,
+) -> Option<crate::node::id::NodeId> {
+    window.a11y.engine_of(id)
+}
+
+// 消费者：`impl Window::a11y_stable_id` 的薄委托（动作测试）。
+/// 引擎句柄 → 稳定 a11y id（只查不分配）。
+#[cfg(test)]
+pub(crate) fn a11y_stable_id(
+    window: &Window,
+    node: crate::node::id::NodeId,
+) -> Option<crate::a11y::A11yNodeId> {
+    window.a11y.stable_of(node)
+}
+
+// 消费者：`impl Window::a11y_force_full` 的薄委托。
+/// 强制下一笔交付为全树（测试 oracle 的"全量侧"；`build_update` 的兜底重试也用它）。
+pub(crate) fn a11y_force_full(window: &mut Window) {
+    window.a11y.force_full();
 }
 
 // 消费者：`impl Window::a11y_take` 的薄委托（外部调用点见该方法文档）。
@@ -24,13 +59,18 @@ pub(crate) fn a11y_take(
         focus,
         scale,
         options,
+        ime_cursor,
         ..
     } = window;
+    // IME 插入点提示（P16）是引擎里**唯一**的 caret 通道：a11y 用它填 `text_selection`，
+    // 读屏才能播报"光标在第 N 个字符"（A5）。
+    let caret = ime_cursor.map(|request| (request.node, request.byte_index));
     a11y.take(
         tree,
         focus.focused(),
         *scale,
         options.title.as_str(),
+        caret,
         diagnostics,
     )
 }

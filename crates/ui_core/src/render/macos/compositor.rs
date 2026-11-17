@@ -1253,7 +1253,9 @@ fn draw_ops(
             continue;
         }
         match *op {
-            FrameOp::Instances { start, len, .. } => {
+            FrameOp::Instances {
+                start, len, scroll, ..
+            } => {
                 if len == 0 {
                     continue;
                 }
@@ -1261,7 +1263,14 @@ fn draw_ops(
                 // 实例基址只经 root constant `draw.clip.y` 进 shader，硬件基址恒 0
                 // （Metal 的 instance_id 会包含 baseInstance，与 D3D12 相反；统一走 uniform
                 //  才能三平台一致，contract §6）。
-                let uniform = root.with_instance_base(start);
+                // 合成端滚动偏移：只在本 op 的 root constant 里加，实例字节一个都不动
+                // （B6-2 / 架构决策 §4）。槽位越界按无偏移处理（保守：与不滚动等价）。
+                let scroll_offset = payload
+                    .scroll()
+                    .get(scroll as usize)
+                    .copied()
+                    .unwrap_or([0.0, 0.0]);
+                let uniform = root.with_instance_base(start).with_scroll(scroll_offset);
                 // SAFETY: 4 顶点 unit quad + 实例区间 [0, len)；段起点由 shader 侧承担。
                 unsafe {
                     encoder.setRenderPipelineState(pipeline.quad());

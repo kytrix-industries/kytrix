@@ -1,5 +1,18 @@
-//! a11y 直连：`accesskit_macos::Adapter` + `NSView` 的 NSAccessibility 回调
-//! （`design/phase-12-macos-linux.md` §7.7）。
+//! a11y 直连：`accesskit_macos::Adapter` + `NSView` 的 NSAccessibility 回调。
+//!
+//! # 坐标系（NSAccessibility 的屏幕逻辑点）
+//!
+//! `accesskit_macos` 的 `to_ns_rect`（`util.rs`）把节点 bounds **除以**
+//! `window.backingScaleFactor()` 换成逻辑点，再经 `view.convertRect_toView` +
+//! `window.convertRectToScreen` 得到屏幕绝对矩形（逐条核对过 `accesskit_macos-0.27.2`
+//! 源码）。由此得到引擎侧的两条硬要求：
+//!
+//! 1. 节点 bounds 必须是 **`GuiView` 相对、物理像素、y 向下**（`GuiView` 是 flipped，
+//!    accesskit 按 `isFlipped` 分支处理的正是这一点）；
+//! 2. 不需要额外传窗口原点 —— macOS 的换算全在 adapter 内部，引擎给 view 相对坐标即可。
+//!
+//! 真机验证项（本仓 CI 断言不到）：VoiceOver 的 `AXFrame` 与窗口实际屏幕位置一致
+//! （外接 Retina 屏 + 非整数缩放拖动窗口后再读一次）。
 //!
 //! 三条纪律（probe 验证）：
 //! 1. `Adapter::new` 是 `unsafe` 且**必须在主线程**（内部 `MainThreadMarker::new().unwrap()`）；

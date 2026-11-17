@@ -684,13 +684,22 @@ pub(super) fn draw_ops(
         }
         visited = visited.saturating_add(1);
         match *op {
-            FrameOp::Instances { start, len, .. } => {
+            FrameOp::Instances {
+                start, len, scroll, ..
+            } => {
                 if len == 0 {
                     continue;
                 }
                 // 实例基址只经 root constant `draw.clip.y` 进 shader，硬件基址恒 0
                 // （D3D12 的 StartInstanceLocation **不**加到 SV_InstanceID 上，contract §6）。
-                let uniform = root.with_instance_base(start);
+                // 合成端滚动偏移：只在本 op 的 root constant 里加，实例字节一个都不动
+                // （B6-2 / 架构决策 §4）。槽位越界按无偏移处理（保守：与不滚动等价）。
+                let scroll_offset = payload
+                    .scroll()
+                    .get(scroll as usize)
+                    .copied()
+                    .unwrap_or([0.0, 0.0]);
+                let uniform = root.with_instance_base(start).with_scroll(scroll_offset);
                 // SAFETY: PSO / 根常量 / 拓扑 / scissor 都属于同一条已打开的 list。
                 unsafe {
                     if last_pipeline != Some(PsoTag::Quad) {

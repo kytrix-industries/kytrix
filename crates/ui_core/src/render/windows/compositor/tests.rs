@@ -66,7 +66,7 @@ fn dropping_a_renderer_releases_its_shared_device_resources() {
             .encode(
                 &scene,
                 Scale::ONE,
-                &resolver(),
+                resolver(),
                 &crate::paint::geometry_store::GeometryStore::new(),
             )
             .expect("encode");
@@ -140,7 +140,7 @@ fn two_renderers_render_concurrently_on_one_shared_gpu() {
                 .encode(
                     &text_free,
                     Scale::ONE,
-                    &resolver(),
+                    resolver(),
                     &crate::paint::geometry_store::GeometryStore::new(),
                 )
                 .expect("encode");
@@ -347,7 +347,7 @@ fn instance_bytes_are_128_per_primitive() {
         .encode(
             &scene,
             Scale::ONE,
-            &resolver(),
+            resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
         .expect("encode");
@@ -376,7 +376,7 @@ fn clear_half_encodes_once_to_srgb() {
         .encode(
             &scene,
             Scale::ONE,
-            &resolver(),
+            resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
         .expect("encode");
@@ -429,7 +429,7 @@ fn quad_pixels_are_srgb_encoded_and_clipped_by_bounds() {
         .encode(
             &scene,
             Scale::ONE,
-            &resolver(),
+            resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
         .expect("encode");
@@ -461,7 +461,7 @@ fn draw_calls_follow_full_and_partial_scissor_passes() {
         .encode(
             &scene,
             Scale::ONE,
-            &resolver(),
+            resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
         .expect("encode");
@@ -551,7 +551,7 @@ fn ops_outside_the_damage_are_skipped() {
         .encode(
             &scene,
             Scale::ONE,
-            &resolver(),
+            resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
         .expect("encode");
@@ -621,7 +621,7 @@ fn a_rendered_frame_produces_no_corruption_messages() {
         .encode(
             &scene,
             Scale::ONE,
-            &resolver(),
+            resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
         .expect("encode");
@@ -667,7 +667,7 @@ fn damage_isolates_pixels_across_two_real_frames() {
         .encode(
             &blue,
             Scale::ONE,
-            &resolver(),
+            resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
         .expect("encode");
@@ -686,7 +686,7 @@ fn damage_isolates_pixels_across_two_real_frames() {
         .encode(
             &red,
             Scale::ONE,
-            &resolver(),
+            resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
         .expect("encode");
@@ -745,7 +745,7 @@ fn geometry_ui_triangle_renders_white() {
         .encode(
             &scene,
             Scale::ONE,
-            &resolver(),
+            resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
         .expect("encode");
@@ -805,7 +805,7 @@ fn image_primitive_samples_the_image_atlas() {
         .encode(
             &scene,
             Scale::ONE,
-            &resolver(),
+            resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
         .expect("encode");
@@ -858,7 +858,7 @@ fn glyph_probe(page: u32) -> bool {
         .encode(
             &scene,
             Scale::ONE,
-            &resolver(),
+            resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
         .expect("encode");
@@ -901,7 +901,7 @@ fn odd_surface_readback_has_no_row_padding() {
         .encode(
             &scene,
             Scale::ONE,
-            &resolver(),
+            resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
         .expect("encode");
@@ -933,7 +933,7 @@ fn resize_then_submit_keeps_the_capacity_contract() {
         .encode(
             &scene,
             Scale::ONE,
-            &resolver(),
+            resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
         .expect("encode");
@@ -950,7 +950,7 @@ fn resize_then_submit_keeps_the_capacity_contract() {
         .encode(
             &scene,
             Scale::ONE,
-            &resolver(),
+            resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
         .expect("encode");
@@ -975,7 +975,7 @@ fn render_snapshot_returns_the_surface_pixels() {
         .encode(
             &scene,
             Scale::ONE,
-            &resolver(),
+            resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
         .expect("encode");
@@ -1012,7 +1012,7 @@ fn an_offscreen_target_keeps_persist_equal_to_the_surface() {
         .encode(
             &scene,
             Scale::ONE,
-            &resolver(),
+            resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
         .expect("encode");
@@ -1114,7 +1114,7 @@ fn a_background_refresh_never_touches_the_main_content_persist() {
         .encode(
             &red,
             Scale::ONE,
-            &resolver(),
+            resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
         .expect("encode");
@@ -1166,7 +1166,7 @@ fn the_offscreen_target_alternates_between_full_and_incremental_frames() {
         .encode(
             &scene,
             Scale::ONE,
-            &resolver(),
+            resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
         .expect("encode");
@@ -1229,12 +1229,13 @@ fn incremental_instance_upload_matches_a_full_upload() {
 
     let mut encoder = InstanceEncoder::new();
     encoder
-        .encode(&scene, Scale::ONE, &resolver(), &store)
+        .encode(&scene, Scale::ONE, resolver(), &store)
         .expect("初帧");
     let mut timings = FrameTimings::new();
     let mut frame = full_plan((64, 64));
     // 首帧也走增量载荷（与窗口路径一致；`full()` 不会取走变化区间）。
-    let first = crate::render::frame::FramePayload::from_buffer_delta(encoder.buffer_mut());
+    let first =
+        crate::render::frame::FramePayload::from_buffer_delta(encoder.buffer_mut(), Vec::new());
     let stats = incremental
         .submit_snapshot(FrameIndex::from_raw(1), &first, &mut frame, &mut timings)
         .expect("首帧");
@@ -1250,9 +1251,10 @@ fn incremental_instance_upload_matches_a_full_upload() {
         )
     ));
     encoder
-        .encode(&scene, Scale::ONE, &resolver(), &store)
+        .encode(&scene, Scale::ONE, resolver(), &store)
         .expect("增量帧");
-    let payload = crate::render::frame::FramePayload::from_buffer_delta(encoder.buffer_mut());
+    let payload =
+        crate::render::frame::FramePayload::from_buffer_delta(encoder.buffer_mut(), Vec::new());
     assert_eq!(payload.instance_count(), 2);
     assert_eq!(
         payload
@@ -1275,7 +1277,7 @@ fn incremental_instance_upload_matches_a_full_upload() {
     };
     let mut frame = full_plan((64, 64));
     let mut timings = FrameTimings::new();
-    let full = crate::render::frame::FramePayload::full(encoder.buffer());
+    let full = crate::render::frame::FramePayload::full(encoder.buffer(), Vec::new());
     reference
         .submit_snapshot(FrameIndex::from_raw(1), &full, &mut frame, &mut timings)
         .expect("全量参考帧");

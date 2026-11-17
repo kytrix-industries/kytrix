@@ -73,7 +73,6 @@ pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePas
         graph,
         windows,
         eval_stack,
-        wake_requested,
         ..
     } = app;
     // P11：本 pass 会求值全部 `bind_a11y`，旗标在这里消费。
@@ -211,12 +210,14 @@ pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePas
     }
     tree.recycle(nodes);
 
+    let layout_dirty = tree.has_layout_work();
+    let paint_dirty = tree.has_paint_work();
     Some(StylePassReport {
         evaluated,
         // O(1)：读反向集合长度，不再为被丢弃的诊断字段做两次全树扫描（R03-1 / R01-4）。
-        layout_dirty: tree.has_layout_work(),
-        paint_dirty: tree.has_paint_work(),
-        wake_requested: *wake_requested,
+        layout_dirty,
+        paint_dirty,
+        wake_requested: app.wake_requested,
         text_evaluated,
         text_changed,
     })
@@ -229,8 +230,6 @@ pub(crate) fn invalidate(app: &mut App, signal: SignalId) {
         store,
         graph,
         windows,
-        wake_requested,
-        dispatcher,
         ..
     } = app;
     let mut worklist: SmallVec<[SignalId; 8]> = smallvec![signal];
@@ -294,7 +293,7 @@ pub(crate) fn invalidate(app: &mut App, signal: SignalId) {
     }
 
     if marked > 0 {
-        *wake_requested = true;
-        dispatcher.wake();
+        // 批处理内只登记推迟位（最外层 `App::batch` 结束时合并成一次请求）。
+        app.request_frame();
     }
 }

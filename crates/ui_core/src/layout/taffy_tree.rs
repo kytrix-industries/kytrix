@@ -37,14 +37,23 @@ fn to_taffy_ref(node: &NodeId) -> TaffyNode {
 }
 
 /// taffy `NodeId` → 引擎 `NodeId`；非法编码回落根（`debug_assert`，release 安全）。
+///
+/// **必须补上树的窗口 tag**：taffy 只携带 64 位的 tree-local 编码（`(gen << 32) | index`），
+/// 直接 `NodeId::from_bits` 得到的是"未绑定"句柄（tag 0）。未绑定句柄在 `arena.get` 里是通配的
+/// （查得到），但作为 `HashMap` 的键与 arena 铸出的带 tag 句柄**不相等** —— `layout_cache` /
+/// `hoisted` / `geometry_transforms` 的失效会因此漏清（wave-6 的实测回归：文本 measure 缓存
+/// 清不掉，根 cache 命中 ⇒ 文本改动不重排）。
 fn to_engine(tree: &NodeTree, node: TaffyNode) -> NodeId {
-    NodeId::from_bits(u64::from(node)).unwrap_or_else(|| {
-        debug_assert!(
-            false,
-            "taffy handed back a NodeId that the engine never issued"
-        );
-        tree.root()
-    })
+    let tag = tree.window_tag();
+    NodeId::from_bits(u64::from(node))
+        .map(|engine| engine.with_window_tag(tag))
+        .unwrap_or_else(|| {
+            debug_assert!(
+                false,
+                "taffy handed back a NodeId that the engine never issued"
+            );
+            tree.root()
+        })
 }
 
 /// 一次布局运行：**不**做圆整（P01 §7.5 / I11；引擎永不调用 taffy 的圆整入口）。
@@ -1062,5 +1071,206 @@ mod tests {
             "N2：FlowRoot 走 block 排布"
         );
         assert_eq!(bounds(&tree, second).origin.y, 10.0);
+    }
+
+    // ── B9：布局后置遍历的增量性（不再全树重算子树包围盒）────────────────────
+
+    /// 快照全树的子树包围盒（与 `recompute_subtree_bounds` 的全量结果做逐位对比）。
+    fn snapshot_subtree_bounds(tree: &NodeTree) -> Vec<(NodeId, Rect)> {
+        tree.dfs_ids()
+            .into_iter()
+            .map(|node| (node, tree.subtree_bounds(node)))
+            .collect()
+    }
+
+    #[test]
+    fn incremental_post_pass_touches_only_the_changed_path() {
+        // 两级树：root → 100 行 × 100 列 = 10_001 个节点。
+        //
+        // 说明（为什么不是"root 直接挂 10k 叶子"）：taffy 每轮会把它**直接子节点**的布局写回
+        // （`set_unrounded_layout`），于是这些子节点在 `place_subtree` 里必然被访问一次 ——
+        // 这是布局算法本身的工作，不是 post-pass 的额外扫描。B9 要证明的是：**布局后置步骤**
+        // 不再全树重算包络（旧实现固定 = 节点总数），而是与"被布局算法访问过的节点数"同阶。
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let mut root_style = fixed(1000.0, 1000.0);
+        root_style.inner.flex_direction = taffy::style::FlexDirection::Column;
+        tree.set_style(root, root_style).expect("root 存活");
+        let mut rows = Vec::with_capacity(100);
+        let mut leaves = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let mut row_style = fixed(1000.0, 8.0);
+            row_style.inner.flex_direction = taffy::style::FlexDirection::Row;
+            let row = add(&mut tree, root, row_style);
+            rows.push(row);
+            for _ in 0..100 {
+                leaves.push(add(&mut tree, row, fixed(8.0, 8.0)));
+            }
+        }
+
+        let first = layout(&mut tree, 1000.0, 1000.0);
+        assert_eq!(
+            first.bounds_updated,
+            tree.len(),
+            "首轮布局每个节点都要写一次包围盒（{first:?}）"
+        );
+
+        // 改**最后一个**叶子：不推挤任何兄弟（位置全不变），只有它自己重排。
+        let last = *leaves.last().expect("非空");
+        tree.set_style(last, fixed(8.0, 9.0)).expect("节点存活");
+        let second = layout(&mut tree, 1000.0, 1000.0);
+
+        assert_eq!(second.moved, 1, "只有一个节点改变尺寸：{second:?}");
+        assert!(
+            second.bounds_updated <= 300,
+            "增量 post-pass 只应写「被布局算法访问过的节点」的包络（≈ root + 100 行 + 变化行的 100 叶 = 201），\
+             旧实现恒为全树 = {}；report={second:?}",
+            tree.len()
+        );
+    }
+
+    #[test]
+    fn incremental_subtree_bounds_match_a_full_recompute() {
+        // 覆盖：普通流、嵌套祖先链、出流盒（hoisted）、`LayoutOverride`。
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let mut root_style = fixed(200.0, 200.0);
+        root_style.inner.flex_direction = taffy::style::FlexDirection::Column;
+        tree.set_style(root, root_style).expect("root 存活");
+        let spacer = add(&mut tree, root, fixed(200.0, 20.0));
+
+        let mut container_style = fixed(100.0, 100.0);
+        container_style.inner.position = taffy::style::Position::Relative;
+        let container = add(&mut tree, root, container_style);
+        let static_mid = add(&mut tree, container, fixed(50.0, 50.0));
+        let mut abs = taffy::Style::<smol_str::SmolStr>::DEFAULT;
+        abs.position = taffy::style::Position::Absolute;
+        abs.inset = taffy::geometry::Rect {
+            left: taffy::style::LengthPercentageAuto::length(5.0),
+            right: taffy::style::LengthPercentageAuto::auto(),
+            top: taffy::style::LengthPercentageAuto::length(7.0),
+            bottom: taffy::style::LengthPercentageAuto::auto(),
+        };
+        abs.size = taffy::geometry::Size {
+            width: taffy::Dimension::length(20.0),
+            height: taffy::Dimension::length(20.0),
+        };
+        let out_of_flow = add(
+            &mut tree,
+            static_mid,
+            Style {
+                inner: abs,
+                clip: Clip::None,
+            },
+        );
+        let canvas = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 1.0, 1.0)))
+            .layout_override(Rect::new(10.0, 10.0, 30.0, 30.0))
+            .build(&mut tree, container)
+            .expect("挂载成功");
+
+        let verify = |tree: &mut NodeTree, label: &str| {
+            let incremental = snapshot_subtree_bounds(tree);
+            tree.recompute_subtree_bounds();
+            let exact = snapshot_subtree_bounds(tree);
+            assert_eq!(
+                incremental, exact,
+                "{label}：增量包络必须与全量重算逐位一致"
+            );
+        };
+
+        let _ = layout(&mut tree, 200.0, 200.0);
+        verify(&mut tree, "首轮");
+
+        // 1) 推挤容器（出流盒随包含块移动 → 树祖先的包络需要只增修正）。
+        tree.set_style(spacer, fixed(200.0, 60.0)).expect("存活");
+        let _ = layout(&mut tree, 200.0, 200.0);
+        verify(&mut tree, "祖先移动后");
+
+        // 2) 覆盖节点换位置（扩大容器子树包络）。
+        tree.set_layout_override(
+            canvas,
+            Some(LayoutOverride::new(Rect::new(150.0, 150.0, 40.0, 40.0))),
+        )
+        .expect("存活");
+        let _ = layout(&mut tree, 200.0, 200.0);
+        verify(&mut tree, "override 移动后");
+
+        // 3) 出流盒改 inset（自己的 local 变化）。
+        tree.set_absolute_inset(out_of_flow, crate::math::Point::new(40.0, 40.0));
+        let _ = layout(&mut tree, 200.0, 200.0);
+        verify(&mut tree, "出流盒移动后");
+
+        // 4) 卸载整棵子树（包络必须收紧，不能留幽灵范围）。
+        tree.remove(static_mid).expect("卸载成功");
+        let _ = layout(&mut tree, 200.0, 200.0);
+        verify(&mut tree, "卸载后");
+    }
+
+    #[test]
+    fn device_snapping_descends_when_only_the_subpixel_reference_moved() {
+        // B7 的正确性边角：父/中间盒吸附后**没变**，但未圆整的位移让**孙子**的边界跨过半像素。
+        // 若 post-pass 只用"吸附盒有没有变"做早期退出，孙子的提交盒会被漏更新（错位 1px）。
+        //
+        // 链：root → spacer + container → mid（margin 0.15）→ leaf（margin 0.3）。
+        // spacer 10.0 → 10.2 让整条链的未圆整 y 各 +0.2：container 10.0→10.2（吸附 10/10）、
+        // mid 10.15→10.35（吸附 10/10，**不变** ⇒ 会触发早期退出）、
+        // leaf 10.45→10.65（吸附 10→**11**，必须重贴）。
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let mut root_style = fixed(200.0, 200.0);
+        root_style.inner.flex_direction = taffy::style::FlexDirection::Column;
+        tree.set_style(root, root_style).expect("root 存活");
+        let spacer = add(&mut tree, root, fixed(200.0, 10.0));
+        let container = add(&mut tree, root, fixed(100.0, 100.0));
+        let mid = NodeBuilder::boxed()
+            .style({
+                let mut style = fixed(80.0, 80.0);
+                style.inner.margin = taffy::geometry::Rect {
+                    left: taffy::style::LengthPercentageAuto::length(0.0),
+                    right: taffy::style::LengthPercentageAuto::length(0.0),
+                    top: taffy::style::LengthPercentageAuto::length(0.15),
+                    bottom: taffy::style::LengthPercentageAuto::length(0.0),
+                };
+                style
+            })
+            .build(&mut tree, container)
+            .expect("挂载成功");
+        let leaf = NodeBuilder::boxed()
+            .style({
+                let mut style = fixed(50.0, 10.0);
+                style.inner.margin = taffy::geometry::Rect {
+                    left: taffy::style::LengthPercentageAuto::length(0.0),
+                    right: taffy::style::LengthPercentageAuto::length(0.0),
+                    top: taffy::style::LengthPercentageAuto::length(0.3),
+                    bottom: taffy::style::LengthPercentageAuto::length(0.0),
+                };
+                style
+            })
+            .build(&mut tree, mid)
+            .expect("挂载成功");
+        tree.set_device_scale(Some(1.0));
+        let _ = layout(&mut tree, 200.0, 200.0);
+        assert_eq!(bounds(&tree, container).origin.y, 10.0);
+        assert_eq!(bounds(&tree, mid).origin.y, 10.0, "10.15 吸附到 10");
+        assert_eq!(bounds(&tree, leaf).origin.y, 10.0, "10.45 吸附到 10");
+
+        tree.set_style(spacer, fixed(200.0, 10.2)).expect("存活");
+        let _ = layout(&mut tree, 200.0, 200.0);
+
+        assert_eq!(
+            bounds(&tree, container).origin.y,
+            10.0,
+            "container 的吸附盒没有变"
+        );
+        assert_eq!(
+            bounds(&tree, mid).origin.y,
+            10.0,
+            "mid 的吸附盒也没有变（这正是早期退出的陷阱）"
+        );
+        assert_eq!(
+            bounds(&tree, leaf).origin.y,
+            11.0,
+            "孙子的边界跨过半像素时必须重贴（否则提交盒错位 1px）"
+        );
     }
 }

@@ -288,13 +288,13 @@ pub(crate) fn install(app: &mut App, scene: &super::Scene) {
     for (index, action) in RADIO_ACTIONS.iter().enumerate() {
         let index = u8::try_from(index).expect("两个选项的下标必然适合 u8");
         app.on_action(Action::custom(action), move |ctx| {
-            let mut next = ctx.read(&state);
+            let mut next = (*ctx.read(&state)).clone();
             next.select_radio(index, RADIOS[usize::from(index)]);
             ctx.write(&state, next);
         });
     }
     app.on_action(Action::custom("a11y.slider.next"), move |ctx| {
-        let mut next = ctx.read(&state);
+        let mut next = (*ctx.read(&state)).clone();
         next.next_scale();
         ctx.write(&state, next);
     });
@@ -309,11 +309,11 @@ pub(crate) fn install(app: &mut App, scene: &super::Scene) {
         };
         if ctx.node() == input {
             // 文本输入框：AT 的 SetValue 是「替换整段文本」（引擎 v1 无选区模型）。
-            let mut field = ctx.read(&ime);
+            let mut field = (*ctx.read(&ime)).clone();
             field.set_text(text);
             ctx.write(&ime, field);
         } else if ctx.node() == slider {
-            let mut next = ctx.read(&value_state);
+            let mut next = (*ctx.read(&value_state)).clone();
             if next.set_scale_from_text(text) {
                 ctx.write(&value_state, next);
             }

@@ -1,6 +1,6 @@
 //! 帧记录（I12）：调度记录 [`FrameRecord`]、绘制快照 [`RenderedFrame`] 与 lane 复用日志。
 //!
-//! 设计见 `design/phase-06-paint-runtime.md` §10.3：`FrameRecord` 记录**调度事实**（本帧是否提交、
+//! `FrameRecord` 记录**调度事实**（本帧是否提交、
 //! damage、统计、lane 复用），`RenderedFrame` 记录**绘制事实**（quad/primitives/布局盒），两者只在
 //! 提交帧同时存在。
 
@@ -44,7 +44,7 @@ pub struct FrameRecord {
     /// 本帧产出的一笔 a11y 交付（`None` = 无 a11y 工作，或捕获未打开）。
     ///
     /// **放在这里而不是 `RenderedFrame`**：纯 `A11Y` 变化不产生 damage ⇒ 本帧 `Idle`，
-    /// 而 `RenderedFrame` 只存在于已提交帧（`design/phase-11-a11y.md` F-113）。
+    /// 而 `RenderedFrame` 只存在于已提交帧。
     pub a11y: Option<crate::a11y::A11yTreeSnapshot>,
 }
 
@@ -171,6 +171,15 @@ pub struct FrameStats {
     /// 本帧增量上传的实例字节数：渲染器路径 = 载荷实际字节数（变化段之和），
     /// headless = 编码器写入实例环的字节数（两者在「只改 1 条 lane」时相同）。
     pub uploaded_bytes: usize,
+    /// 合成线程等待下一拍的时长（B6-2；`None` = 本帧没有经过合成线程，或还没有反馈）。
+    ///
+    /// 与 `encoded_lanes` 一起把「编码搬到线程」变成可断言的事实：inline 合成时恒 `None`，
+    /// 真实窗口由 `CompositorHandle::counters()` 回填（落后 ≤1 帧）。
+    pub compositor_thread_wait: Option<std::time::Duration>,
+    /// 本帧的编码是否发生在**合成线程**（`true` = 编码已搬离 UI 线程）。
+    pub encode_on_compositor: bool,
+    /// 本帧滚动偏移变化的槽数（`0` = 不是滚动帧；>0 时 `encoded_lanes` 必须是 0）。
+    pub scroll_offset_frames: usize,
 }
 
 impl FrameRecord {
@@ -341,7 +350,7 @@ mod tests {
         let bound = NodeBuilder::boxed()
             .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
             .bind_style(move |cx| StylePatch {
-                opacity: Some(f32::from(cx.read(&source)) / 255.0),
+                opacity: Some(f32::from(*cx.read(&source)) / 255.0),
                 ..StylePatch::default()
             })
             .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
@@ -409,7 +418,7 @@ mod tests {
                 ..crate::paint::style::PaintSpec::default()
             })
             .bind_style(move |cx| StylePatch {
-                opacity: Some(f32::from(cx.read(&source)) / 255.0),
+                opacity: Some(f32::from(*cx.read(&source)) / 255.0),
                 ..StylePatch::default()
             })
             .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)

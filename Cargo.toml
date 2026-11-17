@@ -250,6 +250,10 @@ thiserror = "2.0.21"
 time = "0.3.55"
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-util = "0.7.20"
+# a11y `TextRun` 语义：`character_lengths` / `word_starts` 必须是 UAX #29 的 grapheme 与词边界
+# （CJK 3 字节/字、emoji 4 字节/代理对、ZWJ 家族 18 字节仍是一个可选单元）。已在 Cargo.lock 里
+# （parley 的传递依赖 1.13.3），这里提为直接依赖，不引入新 crate。
+unicode-segmentation = "1.13.3"
 url = "2.5.8"
 uuid = "1.29.2"
 wayland-client = "0.31.15"

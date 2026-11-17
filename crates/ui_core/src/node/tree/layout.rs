@@ -292,8 +292,26 @@ pub(crate) fn take_invalid_measure(tree: &mut NodeTree) -> Option<EngineError> {
     tree.invalid_measure.take()
 }
 
+// 消费者：`impl NodeTree::set_device_scale` 的薄委托（外部调用点见该方法文档）。
+/// 设置布局提交前的设备像素吸附比例（`None`/非法值 = 关闭）。
+///
+/// 变化会标根 `LAYOUT`（下一轮布局把**全部**边界按新比例重贴一次）。DPI 变化路径已经
+/// 整窗失效，这里只是保证独立调用也正确。
+pub(crate) fn set_device_scale(tree: &mut NodeTree, scale: Option<f32>) {
+    let scale = scale.filter(|scale| scale.is_finite() && *scale > 0.0);
+    if tree.device_scale == scale {
+        return;
+    }
+    tree.device_scale = scale;
+    // 吸附开关/比例变了：未圆整原点旁表与已提交的吸附盒都要重建（标根 LAYOUT 走全量）。
+    tree.raw_origins.clear();
+    let root = tree.root;
+    tree.invalidate_layout(root);
+}
+
 // 消费者：`impl NodeTree::absolutize` 的薄委托（外部调用点见该方法文档）。
-/// 绝对坐标 post-pass：把 `local`（父相对）换算成 `layout.bounds`（窗口绝对）。
+/// 绝对坐标 post-pass：把 `local`（父相对）换算成 `layout.bounds`（窗口绝对），
+/// 同时**就地**维护每节点的子树包围盒（不再全树重算，B9）。
 ///
 /// 遍历规则（正确性的核心，见 `design/phase-04-layout.md` §7）：
 /// - 从根开始，根的 `local` 相对 ICB 原点 ⇒ 绝对 = `local`；
@@ -304,7 +322,10 @@ pub(crate) fn take_invalid_measure(tree: &mut NodeTree) -> Option<EngineError> {
 pub(crate) fn absolutize(tree: &mut NodeTree) {
     let epoch = tree.layout_epoch;
     tree.place_subtree(tree.root, Point::ZERO, epoch, true, false);
-    tree.recompute_subtree_bounds();
+    // B9：出流盒由**包含块**放置，可能晚于它的树父被访问 ⇒ 树祖先的包络需要按"只增"修正
+    // （见 `expand_hoisted_ancestors` 的复杂度与正确性说明）。普通子树在 `place_subtree`
+    // 的后序里已经精确重算，这里只处理跨界的那批。
+    expand_hoisted_ancestors(tree);
 }
 
 // 消费者：`impl NodeTree::place_subtree` 的薄委托（外部调用点见该方法文档）。
@@ -332,11 +353,23 @@ pub(crate) fn place_subtree(
             .map_or(target.local, |over| over.rect)
     };
     let abs = Rect::from_origin_size(reference + local.origin, local.size);
+    // B7：**提交给绘制的边界**做设备像素对齐（只吸附边界，见 `Rect::snap_to_device`）。
+    //
+    // 递归引用系 `reference` 用的是**未圆整**的绝对坐标：吸附只发生在写 `layout.bounds` 的
+    // 这一处，所以 N 层嵌套不会把每层的舍入误差累加（每层边界都是"逻辑边界 × scale"的
+    // 一次舍入，而不是"父的已舍入值 + 子偏移"的链式舍入）。
+    let committed = match tree.device_scale {
+        Some(scale) => abs.snap_to_device(scale),
+        None => abs,
+    };
     let old = target.layout;
     let children = target.children.clone();
-    let changed = abs != old.bounds;
+    let changed = committed != old.bounds;
     let fresh = target.laid_out_epoch == epoch;
-    if !force && !fresh && !changed {
+    // 吸附开启时：父盒"吸附后没变"不蕴含子树没变（未圆整位移可能让后代跨过半像素边界），
+    // 因此早期退出判定还要看**未圆整原点**是否变化（该旁表只在 `device_scale.is_some()` 时维护）。
+    let raw_changed = tree.device_scale.is_some() && raw_origin(tree, node) != Some(abs.origin);
+    if !force && !fresh && !changed && !raw_changed {
         return;
     }
 
@@ -352,9 +385,9 @@ pub(crate) fn place_subtree(
         }
         if let Some(target) = tree.arena.get_mut(node) {
             // damage 的旧一侧在这里精确并入（`prev_layout` 字段因此可以删掉，省 32 B/节点）。
-            target.damage = target.damage.union(old.bounds).union(abs);
+            target.damage = target.damage.union(old.bounds).union(committed);
             target.layout = LayoutBox {
-                bounds: abs,
+                bounds: committed,
                 border: target.local_border,
             };
             // P06 F-60：lane 内的图元持有**绝对** bounds；布局移动后即使没有 `mark_paint`，
@@ -372,7 +405,7 @@ pub(crate) fn place_subtree(
     }
 
     let hoisted: SmallVec<[NodeId; 2]> = tree.hoisted.get(&node).cloned().unwrap_or_default();
-    for child in children {
+    for child in children.iter().copied() {
         // 出流节点（无 override）由它的**包含块**的 hoisted 列表驱动；但 override 节点按
         // **树父**的 border-box origin 放置（B1：taffy 会把 absolute 节点挂到最近的定位祖先，
         // 而引擎 `LayoutOverride` 的契约是「相对父 border box」），隐藏子树里的出流后代也必须
@@ -382,19 +415,130 @@ pub(crate) fn place_subtree(
         }
         tree.place_subtree(child, abs.origin, epoch, false, hidden);
     }
-    for child in hoisted {
+    for child in hoisted.iter().copied() {
         if tree.layout_override_of(child).is_some() {
             // override 节点已由树父按 border-box origin 放置（B1），不得再用包含块的 local 算一次。
             continue;
         }
         tree.place_subtree(child, abs.origin, epoch, false, false);
     }
+
+    // B9：本节点的子树包围盒在**同一次后序遍历**里精确重算（不再有第二遍全树扫描）。
+    //
+    // 子节点在下面这个循环之前已经处理完（DFS 后序），因此读到的 `subtree_bounds` 是本轮的；
+    // 未被访问的子节点缓存仍然有效（跳过条件是「没布局且绝对盒没变」⇒ 其子树包络不变）。
+    // 成本 = O(本节点直接子节点数)，与"命中测试要剪枝的那些子树"同阶，**不是** O(全树)。
+    let mut union = committed;
+    for child in children.iter().copied() {
+        union = union.union(subtree_bounds(tree, child));
+    }
+    for child in &hoisted {
+        union = union.union(subtree_bounds(tree, *child));
+    }
+    store_subtree_bounds(tree, node, union);
+    store_raw_origin(tree, node, abs.origin);
 }
 
-// 消费者：`impl NodeTree::recompute_subtree_bounds` 的薄委托（外部调用点见该方法文档）。
-/// 自底向上重算每节点的子树包围盒（绝对坐标并集）。
+/// 上次布局的未圆整绝对原点（`None` = 从未记录；吸附关闭时恒为 `None`）。
+fn raw_origin(tree: &NodeTree, node: NodeId) -> Option<Point> {
+    tree.raw_origins.get(node.index() as usize).copied()
+}
+
+/// 记录未圆整绝对原点（只在吸附开启时分配/写入，整数 DPI 下零成本）。
+fn store_raw_origin(tree: &mut NodeTree, node: NodeId, origin: Point) {
+    if tree.device_scale.is_none() {
+        return;
+    }
+    let index = node.index() as usize;
+    if tree.raw_origins.len() <= index {
+        tree.raw_origins.resize(index + 1, Point::ZERO);
+    }
+    tree.raw_origins[index] = origin;
+}
+
+/// 写一个节点的子树包围盒（按 arena 槽位扩容；`layout_stats.bounds_updated` 计数）。
+fn store_subtree_bounds(tree: &mut NodeTree, node: NodeId, bounds: Rect) {
+    let index = node.index() as usize;
+    if tree.subtree_bounds.len() <= index {
+        tree.subtree_bounds.resize_with(index + 1, Rect::default);
+    }
+    tree.subtree_bounds[index] = bounds;
+    tree.layout_stats.bounds_updated += 1;
+}
+
+/// 出流盒的**树祖先包络修正**（B9 的跨界情形）。
 ///
-/// 迭代式后序遍历（显式栈）：树的深度由应用决定，递归可能爆栈。
+/// 普通子节点在 `place_subtree` 的后序里先于父被处理，父的包络因此是精确的。出流盒是例外：
+/// 它由**包含块**（可能不是树父）放置，而包含块可能在它的树父**之后**才被访问 —— 于是那一段
+/// 树祖先的包络可能低估（漏掉刚移动的出流后代）。
+///
+/// 修正方式：对「本轮移动过的出流盒」沿**树父链**自底向上**精确重算**包络
+/// （`自身 ∪ 直接子节点的包络`）。子节点的包络此时已全部是本轮的（DFS 后序 + 本次修正的
+/// 自底向上），因此结果是精确值而不是"只增近似"。
+///
+/// - 复杂度：`O(Σ 被修正祖先的直接子节点数)`，与节点总数无关；普通（非出流）移动不走这条路径；
+/// - 触发条件是「出流盒本轮移动」，出流盒只在相对/绝对定位布局里出现，数量与界面结构同阶。
+fn expand_hoisted_ancestors(tree: &mut NodeTree) {
+    if tree.moved_nodes.is_empty() {
+        return;
+    }
+    // 先快照（不能同时持有集合借用与 `&mut tree`）；复用跨帧缓冲。
+    let mut moved = std::mem::take(&mut tree.dirty_scratch);
+    tree.moved_nodes.snapshot_into(&mut moved);
+    for &moved_node in &moved {
+        if !tree.is_out_of_flow(moved_node) {
+            continue;
+        }
+        let mut cursor = tree.arena.get(moved_node).and_then(|target| target.parent);
+        while let Some(current) = cursor {
+            let Some(target) = tree.arena.get(current) else {
+                break;
+            };
+            let mut union = target.layout.bounds;
+            let children = target.children.clone();
+            for child in children {
+                union = union.union(subtree_bounds(tree, child));
+            }
+            store_subtree_bounds(tree, current, union);
+            cursor = tree.arena.get(current).and_then(|target| target.parent);
+        }
+    }
+    tree.recycle(moved);
+}
+
+/// 结构变更（卸载子树）后的**局部收紧**：沿树父链精确重算包络。
+///
+/// `place_subtree` 只在被访问的节点上重算包络；卸载整棵子树时被删节点不再被访问，父的包络
+/// 会保留旧（偏大）值。偏大只影响剪枝效率、不影响正确性，但长期回收行会让包络越滚越大，
+/// 因此结构变更走这条精确路径：
+///
+/// - 成本 = `O(Σ 被删祖先的直接子节点数)`，与节点总数无关；不变则提前停止；
+/// - 只在**卸载**（冷路径）调用，布局热路径不付这笔钱。
+pub(crate) fn recompute_bounds_upwards(tree: &mut NodeTree, from: NodeId) {
+    let mut cursor = Some(from);
+    while let Some(current) = cursor {
+        let Some(target) = tree.arena.get(current) else {
+            return;
+        };
+        let mut union = target.layout.bounds;
+        let children = target.children.clone();
+        for child in children {
+            union = union.union(subtree_bounds(tree, child));
+        }
+        let cached = subtree_bounds(tree, current);
+        if union == cached {
+            return;
+        }
+        store_subtree_bounds(tree, current, union);
+        cursor = tree.arena.get(current).and_then(|target| target.parent);
+    }
+}
+
+// 消费者：`impl NodeTree::recompute_subtree_bounds` 的薄委托（外部调用点见该方法文档）。/// 全树重算子树包围盒（**诊断/测试逃生口**：正常布局路径由 `place_subtree` 增量维护）。
+///
+/// 生产路径不再调用它（R04-1：每轮全树 post-pass 是 O(N)）；保留为
+/// `#[cfg(test)]` 不可见的一致性校验入口（`subtree_bounds` 的增量维护必须与它逐位一致）。
+#[cfg(test)]
 pub(crate) fn recompute_subtree_bounds(tree: &mut NodeTree) {
     let root = tree.root;
     let mut stack: Vec<(NodeId, bool)> = vec![(root, false)];
@@ -538,6 +682,8 @@ pub(crate) struct LayoutStats {
     cache_misses: usize,
     laid_out: usize,
     moved: usize,
+    /// 本轮写过子树包围盒的节点数（B9 增量性证据；`store_subtree_bounds` 计数）。
+    bounds_updated: usize,
 }
 
 impl LayoutStats {
@@ -560,6 +706,7 @@ impl LayoutStats {
             moved: self.moved,
             cache_hits: self.cache_hits,
             cache_misses: self.cache_misses,
+            bounds_updated: self.bounds_updated,
         }
     }
 }

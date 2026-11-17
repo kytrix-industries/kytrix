@@ -7,7 +7,7 @@
 //! - 隐藏子树（自身/祖先 `display: none`）清空 lane、不产生像素、`clip_key` 置空（重新显示必重建）；
 //! - damage 按「节点级 + 图元级」双写（§6.6）。
 
-use std::rc::Rc;
+use std::{rc::Rc, sync::Arc};
 
 use smallvec::SmallVec;
 
@@ -210,7 +210,7 @@ impl ClipContext {
 enum Content {
     Box,
     Text(Option<Rc<ShapedLine>>),
-    Canvas(Rc<crate::paint::canvas::Canvas>),
+    Canvas(Arc<crate::paint::canvas::Canvas>),
     Geometry(crate::paint::geometry::GeometryId),
 }
 
@@ -384,7 +384,7 @@ fn rebuild_lane(
         let content = match target.kind() {
             NodeKind::Box => Content::Box,
             NodeKind::Text(_) => Content::Text(context.tree.text_line(node).cloned()),
-            NodeKind::Canvas(canvas) => Content::Canvas(Rc::clone(canvas)),
+            NodeKind::Canvas(canvas) => Content::Canvas(Arc::clone(canvas)),
             NodeKind::Geometry(id) => Content::Geometry(*id),
         };
         // 屏幕坐标 = 内容坐标 − 祖先滚动偏移（P10 §7.2）。
@@ -773,7 +773,7 @@ impl PrimitiveEmitter {
             }
             Content::Canvas(canvas) => {
                 let canvas_bounds = canvas.bounds();
-                self.push(context, Primitive::Canvas(Rc::clone(&canvas)));
+                self.push(context, Primitive::Canvas(Arc::clone(&canvas)));
                 context.damage.push(canvas_bounds, 1.0, self.clip);
             }
             Content::Text(line) => {

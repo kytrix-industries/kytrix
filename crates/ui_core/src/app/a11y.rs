@@ -10,8 +10,7 @@ use crate::window::{Window, WindowId};
 /// 注册 a11y 动作的处理器（同 `A11yAction` 后写覆盖）。
 ///
 /// 返回 `false` = 该动作**不能**注册：`A11yAction::Click` 必须落到 P10 的 `Action` 表
-/// （`App::on_action`），让指针点击 / 键盘 Enter / AT 激活共享同一身份
-/// （`design/phase-11-a11y.md` §9.3）。
+/// （`App::on_action`），让指针点击 / 键盘 Enter / AT 激活共享同一身份。
 /// 消费者：`App::on_a11y_action`。
 pub(crate) fn on_a11y_action(
     app: &mut App,
@@ -82,11 +81,19 @@ pub(crate) fn a11y_put_handler(
 
 /// 该窗口本轮是否有 a11y 工作（O(1)；平台泵每轮用它过滤 `update_if_active`）。
 /// 消费者：`App::a11y_pending`。
+///
+/// **焦点旁路**（R13-5）：焦点变化不受 `A11Y_THROTTLE` 约束 —— 读屏用户的"位置感"绑定在
+/// 焦点反馈的时效上；高频数据类更新（行情数字）仍按 100 ms 合并（省电目标不变）。
 #[must_use]
 pub(crate) fn a11y_pending(app: &App, window: WindowId) -> bool {
-    let dirty = app.windows.get(&window).is_some_and(Window::a11y_pending);
-    dirty
-        && app
+    let Some(target) = app.windows.get(&window) else {
+        return false;
+    };
+    if !target.a11y_pending() {
+        return false;
+    }
+    target.a11y_focus_pending()
+        || app
             .a11y_delivered
             .get(&window)
             .is_none_or(|last| app.clock.saturating_duration_since(*last) >= A11Y_THROTTLE)

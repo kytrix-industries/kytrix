@@ -24,6 +24,11 @@ pub(crate) fn set_scale(window: &mut Window, scale: Scale) {
     window.scale = scale;
     window.scale_epoch = window.scale_epoch.wrapping_add(1);
     window.full_damage_pending = true;
+    // B7：布局提交前的设备像素吸附只在**非整数 DPI** 下开启（见 `NodeTree::set_device_scale`）。
+    // scale == 1 时逻辑像素就是设备像素，保持引擎"布局不圆整"的既有契约。
+    window
+        .tree
+        .set_device_scale((scale.factor() != 1.0).then_some(scale.factor()));
     let root = window.tree.root();
     window.tree.invalidate_layout(root);
     // **所有文本必须重新 shape**：`font_size` 与 `ppem` 在 shape 时按当时的 `scale`

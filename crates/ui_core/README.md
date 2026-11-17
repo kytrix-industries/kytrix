@@ -86,15 +86,15 @@ cargo test -p ui_core --features test-support --test layout
 cargo test -p ui_core --features test-support --test snapshot -- --nocapture
 
 # 生成 / 更新 golden（写完立刻读回自检；不入库热力图见 tests/golden/README.md）
-$env:UPDATE_GOLDEN = '1'; cargo test -p ui_core --features test-support --test snapshot
-Remove-Item Env:UPDATE_GOLDEN
+$env:UI_CORE_BLESS = '1'; cargo test -p ui_core --features test-support --test snapshot
+Remove-Item Env:UI_CORE_BLESS
 
 # release 下的探针一致性（debug_assert 门控的用例不跑）
 cargo test -p ui_core --release --features test-support
 
 # 门禁
 cargo +nightly clippy -p ui_core --all-targets --all-features -- -D warnings
-cargo +nightly fmt -p ui_core -- --check
+rustup run nightly rustfmt --edition 2024 --check .\src\lib.rs
 cargo doc -p ui_core --no-deps
 ```
 
@@ -108,27 +108,26 @@ cargo run -p ui_core --example snapshot_demo --features test-support -- --snapsh
 cargo run --release -p ui_core --example snapshot_demo --features test-support -- --snapshot out\demo-showcase.png
 ```
 
-- `demo` 覆盖六类能力（`design/phase-15-demo-showcase.md`）：**焦点**（7 个可聚焦节点 / Tab 环 /
+- `demo` 覆盖六类能力：**焦点**（7 个可聚焦节点 / Tab 环 /
   焦点状态面板）、**CJK**（简/繁/日/韩 + 中英混排自动换行）、**输入法**（系统 IME 上屏 + 事件回显 +
-  `App::set_ime_cursor_area` 的精确 caret 定位，`design/phase-16-ime-caret.md`）、 **无障碍**（AccessKit 角色 / 名称 /
+  `App::set_ime_cursor_area` 的精确 caret 定位）、**无障碍**（AccessKit 角色 / 名称 /
   `checked` / `value` / `SetValue`）、**图片资源**（内嵌 PNG → 图集）、 **滚动列表**。`snapshot_demo` 会先
   `Scene::preview` 播种一套可截图的组合态（含内联组合串），且不安装 HUD。
-- **Debug HUD**（`design/phase-17-debug-hud.md`）：`ui_core` 的 `hud` feature 默认关闭；`demo`
+- **Debug HUD**（`hud` feature）：`ui_core` 的 `hud` feature 默认关闭；`demo`
   加 `--features hud` 后右上角显示 FPS / 帧时间 / CPU/GPU/Draw / Upload/Present / 分辨率/DPI/后端，
   F12 隐藏/显示。`snapshot_demo` 不安装 HUD。
-- 两个 example 共用 `examples/demo/scene*`（`design/phase-18-demo-example.md`）；`main.rs` 只负责
+- 两个 example 共用 `examples/demo/scene*`；`main.rs` 只负责
   启动，`snapshot.rs` 只负责离屏读回，场景代码与测试都在 `scene` 模块。
 - demo 的测试是 example 内 unit test，不是普通 integration test。`cargo test -p ui_core`
   会跑其中 23 项单元测试；13 项场景测试需要 `--features test-support`。聚焦命令：
   `cargo test -p ui_core --features "hud,test-support" --example demo`（无 HUD 为 35 项，
   带 HUD 为 36 项）。
 - **golden 详情**（字节语义 / 容差 / 平台策略 / 失败热力图）：[`tests/golden/README.md`](tests/golden/README.md)。
-- macOS 实机验证：`design/macos-verification.md`（环境、BUG 与修复决策、render 线程、全屏/AX、逐项结果、metal-real 基线）。
+- macOS / Linux 的真机验证记录随旧设计文档一起删除；结论以 CI 日志与 Git 历史为准（本 crate 不再维护该文档）。
 - 缺 shader 工具链时设 `ui_core_SKIP_SHADERS=1`（产物是占位符，**GPU 测试会失败**，只用于交叉 `cargo check`）。
-- Linux 实机验证：`design/linux-verification.md`（环境、11 项 BUG 与修复决策、逐项结果、lavapipe 基线）。
   构建依赖：`pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev glslang-tools fonts-noto-cjk`。
 - 交叉 target：`cargo check -p ui_core --target {aarch64-apple-darwin, x86_64-unknown-linux-gnu}`
-  （Linux 需要 `pkg-config` stub 提供 `fontconfig`，见 `design/DEVIATIONS.md` V-04）。
+  （Linux 需要 `pkg-config` stub 提供 `fontconfig`）。
 - CI：[`.github/workflows/gui-ci.yml`](../../.github/workflows/gui-ci.yml)（windows / ubuntu / macos 三个 job）。
 
 ## 文档与偏差入口
@@ -136,19 +135,16 @@ cargo run --release -p ui_core --example snapshot_demo --features test-support -
 | 文档                                 | 内容                                                              |
 |--------------------------------------|-------------------------------------------------------------------|
 | `design/custom-gui-engine-design.md` | 主设计（决策 D1–D25、全局不变量）                                 |
-| `../../design/phase-01…17-*.md`      | 每个实施阶段的详细设计（本 crate 的实现规格）                     |
-| `design/DEVIATIONS.md`               | **与上游文档不同的每个事实**（F/S/V 编号）；实现前先查这里        |
 | `../../AGENTS.md`                    | 仓库纪律（模块/测试/错误/依赖）                                   |
 | `src/render/shaders/contract.md`     | `GpuPrimitive` 字节布局 + uniform + 颜色/图集语义（**唯一权威**） |
 
-**偏差纪律**：任何与 `design/*` 不同的实现选择，必须先在 `design/DEVIATIONS.md` 追加条目
-（`F-xxx` 事实偏差 / `S-xxx` 实现纪律 / `V-xx` 待复核），再改代码；不写「以后再说」的兼容层。
+**偏差纪律**：与既有架构 / 注释不一致的实现选择必须写进 PR 描述并同步改注释，不留「以后再说」的兼容层。
 
 ## 依赖纪律
 
 - 所有依赖在 workspace 根 `Cargo.toml` 声明，本 crate 只 `workspace = true`。
 - **禁止**：`wgpu` / `naga` / `gpui-*` / `winit` / Vello 系 / `cosmic-text` 主链路；
-  `usvg` 不进本 crate（构建期 SVG 归 `base_ui`，`DEVIATIONS` F-11）。
+  `usvg` 不进本 crate（构建期 SVG 归 `base_ui`）。
 - `image`（资源解码）与 `criterion`（bench，关默认 features）是 P13 新增的两项；
   `taffy` 是本 crate 既有依赖，P14 起同时作为 **dev-dependency** 供 `tests/layout.rs` 构造样式。
 - 测试基建（`test_support`）只在 `--features test-support` 下编译，发布物零符号。

@@ -1,6 +1,6 @@
 //! 稳定元素探针（L1）：基于**持久节点树**直接查布局盒，不依赖绘制动作。
 //!
-//! 设计见 `design/phase-06-paint-runtime.md` §10.2；`Selector` 只用强类型变体，不用字符串 CSS 选择器。
+//! `Selector` 只用强类型变体，不用字符串 CSS 选择器。
 //! `Role(A11yRole)` 推迟 P14（F-63）。
 
 use crate::{

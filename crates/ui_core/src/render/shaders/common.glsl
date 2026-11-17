@@ -36,7 +36,7 @@
 
 struct FrameUniform {
     vec4 viewport;   // (w_px, h_px, 2 / w_px, 2 / h_px)
-    vec4 params;     // (scale, 0, 0, 0)
+    vec4 params;     // (scale, scroll_x, scroll_y, 0)：.x = DPI，.yz = 合成端滚动偏移（物理像素）
 };
 
 struct ClipEntry {

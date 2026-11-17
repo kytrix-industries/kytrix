@@ -12,7 +12,8 @@ use crate::{
     render::{
         backend::Renderer,
         compositor::{Plan, plan},
-        frame::{FramePayload, FrameRequest},
+        compositor_thread::CompositorTicket,
+        frame::FrameRequest,
     },
 };
 
@@ -159,7 +160,14 @@ pub(crate) fn commit_frame(
     ticket: FrameTicket,
     report: PaintReport,
 ) -> FrameOutcome {
-    let has_pixels = report.rebuilt > 0 || report.damage.full || report.damage.rects > 0;
+    // 滚动帧：只有偏移变化（没有任何 lane 重建、damage 也可能为空），但合成端偏移必须出帧才
+    // 能生效 —— 否则滚动会停在上一帧的偏移上。
+    let scroll_pending = window
+        .pending_delta
+        .as_ref()
+        .is_some_and(|delta| !delta.scroll.is_empty());
+    let has_pixels =
+        report.rebuilt > 0 || report.damage.full || report.damage.rects > 0 || scroll_pending;
     // 默认构建也算的读点：摘要计数必须与累加器的实际矩形数一致（P07 消费同一累加器）。
     debug_assert_eq!(
         report.damage.rects,
@@ -187,7 +195,7 @@ pub(crate) fn commit_frame(
     // `Plan::Idle` 会消费帧延迟 token 却不 present）。macOS / Linux 保持原规则。
     #[cfg(windows)]
     let plan = surface_change_plan(plan, renderer_surface, window.surface);
-    if !frame_reaches_gpu(plan, renderer_surface, window.surface) {
+    if !scroll_pending && !frame_reaches_gpu(plan, renderer_surface, window.surface) {
         // paint 已经消费了 lane 重建与 damage：即使不发布，也必须像已提交的帧一样结算节点
         // 状态（damage / REUSABLE），否则后续会 over-damage、a11y 多标（P2-1）。
         // 只是不推进 `FrameIndex`、不发布（V-122 ⑧ / F-183）。
@@ -270,8 +278,52 @@ pub(crate) fn submit_gpu(
     renderer.set_layer_scale(surface, window.scale.factor());
     // 窗口路径的 GPU 采样来自 `poll` 的反馈；本帧的同步采样表清空以免 HUD 显示过期数据。
     window.timings.reset(index);
-    // 增量载荷：只带自上次载荷以来变化的实例段（变化区间在这里被取走）。
-    let payload = FramePayload::from_buffer_delta(window.instance_buffer_mut());
+    // ── B6-2：真实窗口把 delta 交给合成线程（编码不在 UI 线程）────────────────
+    if let Some(sink) = renderer.frame_sink() {
+        if window.compositor_ticket.is_none() {
+            // 首个真实帧：注册交付端点，并让 UI 线程的编码器退休（合成线程持有唯一一份）。
+            window.compositor_ticket = Some(CompositorTicket::new(window.id()));
+            crate::render::compositor_thread::compositor().register(window.id(), sink);
+            window.composer = None;
+            window.pending_payload = None;
+        }
+        if let Some(mut delta) = window.pending_delta.take() {
+            fill_header(&mut delta, window, index, plan, surface);
+            crate::render::compositor_thread::compositor().publish(delta);
+        }
+        // 帧不再经过 `Renderer::publish`：目标尺寸记账必须由 UI 侧补齐（否则 `Plan::Idle` 的帧
+        // 会被反复判定为「有 GPU 工作」）。
+        renderer.note_published_surface(surface);
+        window.pending_payload = None;
+        #[cfg(feature = "test-support")]
+        {
+            // 合成线程的计数落后 ≤1 帧（与 `render_stats` 同一口径）：本帧读到的是上一帧的合成
+            // 结果。`encode_on_compositor` 因此是「最近一次编码发生在合成线程」的事实。
+            let counters = crate::render::compositor_thread::compositor().counters();
+            window.stats.compositor_thread_wait = Some(counters.wait);
+            window.stats.encode_on_compositor = counters.encoded_on_compositor();
+            window.stats.encoded_lanes = counters.encoded_lanes;
+            window.stats.reused_segments = counters.reused_segments;
+            window.stats.scroll_offset_frames =
+                usize::from(counters.encoded_lanes == 0 && counters.frames > 0);
+        }
+        return take_render_stats(window);
+    }
+    // ── inline：UI 线程持有合成器（headless / 离屏 / 单测）────────────────────
+    let Some(composed) = window.pending_payload.take() else {
+        return take_render_stats(window);
+    };
+    #[cfg(feature = "test-support")]
+    {
+        // inline 合成：编码在 UI 线程上，合成线程的两个计数器保持「未参与」。
+        window.stats.encoded_lanes = composed.stats.encoded_lanes;
+        window.stats.reused_segments = composed.stats.reused_segments;
+        window.stats.instances = composed.stats.drawn_instances as usize;
+        window.stats.scroll_offset_frames = composed.stats.scroll_slots;
+        window.stats.encode_on_compositor = false;
+        window.stats.compositor_thread_wait = None;
+    }
+    let payload = composed.payload;
     #[cfg(feature = "test-support")]
     {
         window.stats.uploaded_bytes = payload.uploaded_bytes();
@@ -279,7 +331,8 @@ pub(crate) fn submit_gpu(
     renderer.publish(FrameRequest {
         index,
         payload,
-        plan,
+        // 合成器可能把 damage 扩大（滚动暴露区），最终计划以它为准。
+        plan: composed.plan,
         surface,
         scale: window.scale.factor(),
         // Linux：逻辑尺寸与 `surface`（buffer 尺寸）同帧过线，GPU 线程在 present 前用它写
@@ -292,6 +345,37 @@ pub(crate) fn submit_gpu(
         buffer_scale: window.buffer_scale,
         published_at: Instant::now(),
     })
+}
+
+/// HUD 的最新一帧统计（`hud` 之外的构建没有这个字段：返回默认值）。
+#[cfg(feature = "hud")]
+fn take_render_stats(window: &mut Window) -> crate::render::RenderStats {
+    std::mem::take(&mut window.render_stats)
+}
+
+#[cfg(not(feature = "hud"))]
+fn take_render_stats(_window: &mut Window) -> crate::render::RenderStats {
+    crate::render::RenderStats::default()
+}
+
+/// 把本帧的头部补进 delta（`surface` / `scale` / `plan` 只能来自同一帧的提交点）。
+fn fill_header(
+    delta: &mut crate::render::delta::SceneDelta,
+    window: &Window,
+    index: FrameIndex,
+    plan: Plan,
+    surface: (u32, u32),
+) {
+    delta.header.index = index;
+    delta.header.plan = plan;
+    delta.header.surface = surface;
+    delta.header.scale = window.scale;
+    #[cfg(target_os = "linux")]
+    {
+        delta.header.surface_local = window.size();
+        delta.header.buffer_scale = window.buffer_scale;
+    }
+    delta.header.published_at = Instant::now();
 }
 
 // 消费者：`impl Window::abort_frame` 的薄委托（外部调用点见该方法文档）。
