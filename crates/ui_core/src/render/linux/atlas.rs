@@ -1177,13 +1177,13 @@ mod tests {
         };
         let buffer_handle = gpu.allocate(GpuObject::Buffer(buffer));
         let memory_handle = gpu.allocate(GpuObject::Memory(memory));
-        sync.retire(FrameIndex::from_raw(7), buffer_handle);
-        sync.retire(FrameIndex::from_raw(7), memory_handle);
+        sync.retire(7, buffer_handle);
+        sync.retire(7, memory_handle);
         assert_eq!(sync.pending_retired(), 2);
         assert_eq!(gpu.live_resources(), 2);
 
         // 该帧从未提交：完成前沿到不了 7，正常 drain 不释放。
-        assert_eq!(sync.drain_retire(FrameIndex::from_raw(6)), 0);
+        assert_eq!(sync.drain_retire(6), 0);
         assert_eq!(gpu.live_resources(), 2);
 
         // teardown：一次性释放（buffer 先于 memory，顺序由 retire 队列保持）。

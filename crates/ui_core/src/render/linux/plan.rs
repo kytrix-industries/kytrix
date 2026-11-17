@@ -552,12 +552,14 @@ mod tests {
 
     #[test]
     fn scoring_prefers_discrete_then_integrated_and_keeps_cpu_as_a_fallback() {
-        let discrete = score_device(&windowed_facts(vk::PhysicalDeviceType::DISCRETE_GPU), true);
+        let discrete = score_device(&windowed_facts(vk::PhysicalDeviceType::DISCRETE_GPU), true)
+            .expect("discrete");
         let integrated = score_device(
             &windowed_facts(vk::PhysicalDeviceType::INTEGRATED_GPU),
             true,
-        );
-        let cpu = score_device(&windowed_facts(vk::PhysicalDeviceType::CPU), true);
+        )
+        .expect("integrated");
+        let cpu = score_device(&windowed_facts(vk::PhysicalDeviceType::CPU), true).expect("cpu");
         assert!(
             discrete > integrated && integrated > cpu,
             "{discrete:?} {integrated:?} {cpu:?}"
