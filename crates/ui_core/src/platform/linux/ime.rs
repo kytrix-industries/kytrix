@@ -25,6 +25,12 @@ pub(crate) struct ImeState {
     dedupe: CommitDeduper,
     /// 当前是否处于组合态。
     composing: bool,
+    /// 自上次补 `End` 以来**曾经**有过非空组合串（R10-35 的判据）。
+    ///
+    /// 不能只看 `composing`：`commit_string` 与 `preedit_string("")` 可能在**同一批**里到达，
+    /// 而提交分支会先把 `composing` 清掉；只有这个latch 才能保证「组合在本批结束」仍补一条
+    /// [`ImeEvent::End`]，且**恰好一条**。
+    had_preedit: bool,
 }
 
 impl ImeState {
@@ -33,6 +39,15 @@ impl ImeState {
     }
 
     pub(crate) fn note_preedit(&mut self, text: Option<String>) {
+        // 组合态在**收到** preedit 时即生效（不等 `done`）：键盘通路据此静默，
+        // 而组合期按键可能先于 `done` 到达。
+        match text.as_deref() {
+            Some(text) if !text.is_empty() => {
+                self.composing = true;
+                self.had_preedit = true;
+            }
+            _ => self.composing = false,
+        }
         self.pending_preedit = Some(text);
         // 新的组合串开始 ⇒ 下一次提交是新的内容。
         self.dedupe.reset();
@@ -64,7 +79,9 @@ impl ImeState {
     /// [`ImeEvent::End`] 会让 App 侧的组合串残留在界面上。
     pub(crate) fn take_events(&mut self) -> Vec<ImeEvent> {
         let mut events = Vec::with_capacity(3);
-        let was_composing = self.composing;
+        // 「本批开始时组合串是否存在」：提交分支会先清 `composing`，所以必须提前取，
+        // 且要看 `had_preedit`（同批 `preedit_string("")` 会连 `composing` 一起清掉）。
+        let was_composing = self.composing || self.had_preedit;
         let committed = self.pending_commit.take();
         if let Some(commit) = committed.as_ref() {
             // 一次 `done` = 一批提交；批内的重复才吞掉（部分 compositor 会重复发）。
@@ -80,6 +97,7 @@ impl ImeState {
         match self.pending_preedit.take() {
             Some(Some(text)) if !text.is_empty() => {
                 self.composing = true;
+                self.had_preedit = true;
                 // `zwp_text_input_v3` 的 preedit 是整串替换，没有 AppKit 那种区间替换；
                 // 组合串内的插入点与子句信息由输入波次定义（`caret` / `clauses`），本平台
                 // 先按「插入点在末尾、无子句」交付。
@@ -91,15 +109,17 @@ impl ImeState {
                 });
             }
             Some(_) => {
-                // 本批显式清空组合串。
-                if self.composing {
-                    self.composing = false;
+                // 本批显式清空组合串：组合态结束，补一条 `End`（只补一次）。
+                self.composing = false;
+                if was_composing {
+                    self.had_preedit = false;
                     events.push(ImeEvent::End);
                 }
             }
             None => {
                 // 组合态被提交结束、且本批没有新的 preedit ⇒ 补一条 `End`（R10-35）。
                 if was_composing && committed.is_some() {
+                    self.had_preedit = false;
                     events.push(ImeEvent::End);
                 }
             }

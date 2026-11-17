@@ -336,7 +336,7 @@ fn upload_image(
         cursor,
         size,
         _file: file,
-        pool: pool,
+        pool,
         buffer,
         hotspot: (image.xhot as i32, image.yhot as i32),
         pixels: (image.width as i32, image.height as i32),
