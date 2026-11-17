@@ -79,7 +79,7 @@ impl QuitHandshake {
 }
 
 /// delegate 的 ivar。
-struct AppDelegateIvars {
+pub(crate) struct AppDelegateIvars {
     dispatcher: Arc<Dispatcher>,
     quit: Arc<QuitHandshake>,
 }

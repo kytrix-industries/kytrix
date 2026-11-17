@@ -401,9 +401,7 @@ mod tests {
     }
 
     /// 分片写的上限必须是管道原子写长度（≤ PIPE_BUF 才不会在阻塞 fd 上卡住）。
-    #[test]
-    fn each_write_stays_within_one_pipe_buffer() {
-        assert_eq!(PIPE_BUF, 4096);
-        assert!(PIPE_BUF <= 4096, "PIPE_BUF 是管道原子写的上界");
-    }
+    ///
+    /// 编译期断言：`PIPE_BUF` 一旦被改成大于原子写长度，这里直接构建失败。
+    const _: () = assert!(PIPE_BUF <= 4096, "PIPE_BUF 是管道原子写的上界");
 }

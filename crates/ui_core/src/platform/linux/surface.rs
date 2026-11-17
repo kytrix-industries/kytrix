@@ -521,7 +521,7 @@ impl WaylandState {
             pointer_focus: None,
             events: Vec::with_capacity(16),
             connection,
-            queue_handle: queue_handle.clone(),
+            queue_handle,
             compositor,
             wm_base,
             viewporter,

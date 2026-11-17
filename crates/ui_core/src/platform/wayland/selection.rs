@@ -191,6 +191,7 @@ impl OfferTable {
         preferred_mime(&entry.mimes)
     }
 
+    #[cfg(test)]
     /// 移除并返回该 offer 的 mime 列表（`selection` 处理完 / 拖放结束 / 离开时调用）。
     ///
     /// 返回 `Some` ⇒ 调用方分管这个 offer 的生命周期（处理完 `receive` 后 `destroy()`）。
