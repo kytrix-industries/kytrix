@@ -247,9 +247,7 @@ pub(crate) fn commit_frame(
         let stats = window.submit_gpu(&mut renderer, index, plan);
         window.renderer = Some(renderer);
         #[cfg(feature = "hud")]
-        {
-            window.render_stats = stats;
-        }
+        record_render_stats(window, stats);
         #[cfg(not(feature = "hud"))]
         {
             let _ = stats;
@@ -307,14 +305,17 @@ fn release_unpublished(window: &mut Window) {
 /// `plan` 由 [`Window::commit_frame`] 用同一份 damage 与 `frame` 算好；`Committed` 帧在这里
 /// **恰好发布一次**（`Plan::Idle` 且目标尺寸未变的帧已在 `commit_frame` 退回 `Idle`）。
 ///
-/// 返回最近一次**已完成**帧的统计（窗口路径落后 ≤1 帧，HUD 允许）；GPU 线程的错误在
-/// `poll_renderer` 里冒泡，提交路径没有同步错误。
+/// 返回值只有 inline 路径（headless / 离屏 / 单测）有：离屏渲染是同步的，`publish` 直接给出
+/// 本帧的真实绘制统计。threaded 路径（真实窗口）返回 `None`：后端计数随 `FrameFeedback`
+/// 回来（`poll_renderer` 落账），提交路径没有同步值 —— 用默认值顶替会让 HUD 的 Draw/Inst 恒 0。
+///
+/// GPU 线程的错误在 `poll_renderer` 里冒泡，提交路径没有同步错误。
 pub(crate) fn submit_gpu(
     window: &mut Window,
     renderer: &mut Renderer,
     index: FrameIndex,
     plan: Plan,
-) -> crate::render::RenderStats {
+) -> Option<crate::render::RenderStats> {
     let surface = window.physical_surface();
     // `plan` 的矩形已由 `commit_frame` 的 `plan(...)` 夹进本帧 frame；这里把「不变量被破坏」
     // 变成 debug 期显式失败（否则 D3D12 的 `Present1` / scissor 会以
@@ -365,12 +366,11 @@ pub(crate) fn submit_gpu(
             window.stats.scroll_offset_frames =
                 usize::from(counters.encoded_lanes == 0 && counters.frames > 0);
         }
-        return take_render_stats(window);
+        // 后端计数随完成反馈回来（`poll_renderer`），这里没有同步值。
+        return None;
     }
     // ── inline：UI 线程持有合成器（headless / 离屏 / 单测）────────────────────
-    let Some(composed) = window.pending_payload.take() else {
-        return take_render_stats(window);
-    };
+    let composed = window.pending_payload.take()?;
     #[cfg(feature = "test-support")]
     {
         // inline 合成：编码在 UI 线程上，合成线程的两个计数器保持「未参与」。
@@ -386,7 +386,7 @@ pub(crate) fn submit_gpu(
     {
         window.stats.uploaded_bytes = payload.uploaded_bytes();
     }
-    renderer.publish(FrameRequest {
+    Some(renderer.publish(FrameRequest {
         index,
         payload,
         // 合成器可能把 damage 扩大（滚动暴露区），最终计划以它为准。
@@ -402,18 +402,17 @@ pub(crate) fn submit_gpu(
         #[cfg(target_os = "linux")]
         buffer_scale: window.buffer_scale,
         published_at: Instant::now(),
-    })
+    }))
 }
 
-/// HUD 的最新一帧统计（`hud` 之外的构建没有这个字段：返回默认值）。
+// 消费者：`commit_frame`（已提交帧的绘制统计落账）。
+/// 记录本帧的绘制统计：只有 inline 路径有同步值；threaded 路径的统计来自完成反馈，
+/// **不得**在这里用默认值覆盖 —— 那正是 HUD 的 Draw/Inst 恒 0 的回归成因。
 #[cfg(feature = "hud")]
-fn take_render_stats(window: &mut Window) -> crate::render::RenderStats {
-    std::mem::take(&mut window.render_stats)
-}
-
-#[cfg(not(feature = "hud"))]
-fn take_render_stats(_window: &mut Window) -> crate::render::RenderStats {
-    crate::render::RenderStats::default()
+fn record_render_stats(window: &mut Window, stats: Option<crate::render::RenderStats>) {
+    if let Some(stats) = stats {
+        window.render_stats = stats;
+    }
 }
 
 /// 把本帧的头部补进 delta（`surface` / `scale` / `plan` 只能来自同一帧的提交点）。
@@ -708,5 +707,48 @@ mod tests {
             1,
             "整帧重发只发生一次，之后回到增量"
         );
+    }
+
+    /// **P-B 回归防线**：threaded 路径的提交（`submit_gpu` 返回 `None`）不得覆盖上一次完成帧的
+    /// 绘制统计。旧实现每帧把默认统计取走再存回 ⇒ HUD 的 Draw/Inst 恒 0。
+    #[cfg(feature = "hud")]
+    #[test]
+    fn a_threaded_commit_keeps_the_last_completed_draw_stats() {
+        use crate::render::RenderStats;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut app = App::new(runtime.handle().clone());
+        let window: WindowId = app.create_window(WindowOptions {
+            title: SmolStr::new_static("render-stats"),
+            size: Size::new(320.0, 240.0),
+            scale: Scale::ONE,
+            ..WindowOptions::default()
+        });
+        let view = app.window_mut(window).expect("window");
+        super::record_render_stats(
+            view,
+            Some(RenderStats {
+                draw_calls: 7,
+                instances: 9,
+            }),
+        );
+        // threaded 提交：没有同步统计 ⇒ 保持完成帧的值。
+        super::record_render_stats(view, None);
+        let metrics = view.debug_hud_metrics();
+        assert_eq!((metrics.draw_calls, metrics.instances), (7, 9));
+
+        // inline 提交：同步统计直接覆盖。
+        super::record_render_stats(
+            view,
+            Some(RenderStats {
+                draw_calls: 3,
+                instances: 4,
+            }),
+        );
+        let metrics = view.debug_hud_metrics();
+        assert_eq!((metrics.draw_calls, metrics.instances), (3, 4));
     }
 }

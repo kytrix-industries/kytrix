@@ -9,19 +9,30 @@
 //!    进入时会再取一次 `GWLP_USERDATA` 并构造 `&mut WndProcState` —— 两个活跃 `&mut` 是别名
 //!    UB。因此会重入的调用一律放在**短借用之间**：先算出命令/纯数据，释放借用，执行，再
 //!    短借用写回（IME 的 [`ime::ImeCommand`] 就是这个形状）。
-//! 2. **非客户区完全交系统**（R07-2）：`WM_NCCALCSIZE` / `WM_NCHITTEST` / `WM_NCLBUTTONDOWN`
-//!    都不改写。Aero Snap、Win11 Snap Layouts、拖动/缩放、双击最大化、右键系统菜单都是
-//!    `DefWindowProcW` 在 `WM_NCLBUTTONDOWN` 上进入的**模态循环内部**行为；自己接管
-//!    `HTCAPTION` 就等于放弃这些系统手势（Chrome / GPUI / Qt 的选择都是「要 Snap」）。
+//! 2. **非客户区：caption 交系统，resize 自持**（R07-2 / P-A）：
+//!    `WM_NCCALCSIZE` / `WM_NCHITTEST` 不改写（命中码、边框、缩放光标都由系统给）；
+//!    `WM_NCLBUTTONDOWN` 只拦 8 个 resize 命中码（[`resize::ResizeEdge::from_hit`]），
+//!    `HTCAPTION` / 系统按钮仍交 `DefWindowProcW`。
+//!    - 标题栏放行的原因：Aero Snap、Win11 Snap Layouts、拖动中的 DWM moving 状态、
+//!      双击最大化、右键系统菜单**只存在于** `DefWindowProcW` 在 `WM_NCLBUTTONDOWN` 上进入的
+//!      move 模态循环内部；move 不改变渲染目标与布局，模态循环期间不重绘没有可见代价。
+//!    - resize 自持的原因：size 模态循环会占住消息泵，拖动期间 `App::frame` 不运行 ⇒ 布局
+//!      不重排、内容不按新尺寸重绘、DComp 背景层停在上一个客户区（新区域透明）。产品前提
+//!      「不用定时器驱动刷新」+「resize 必须真实重排 + 重绘」要求拖动期间每一步都是真实帧，
+//!      所以这里只记账（起始外框 / 光标 / 边），`SetWindowPos` 与出帧都交给泵。
+//!
+//!    resize 会话期间 `WM_MOUSEMOVE` 只更新目标外框、**不翻译**成应用的 `PointerMove`
+//!    （与系统 size 模态循环一致）；Esc 取消并吞掉该按键，失去捕获 / `WM_CANCELMODE` /
+//!    会话中 DPI 变化都结束会话。
 
 use windows::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
-    Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT, ScreenToClient},
+    Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+    Graphics::Gdi::{BeginPaint, ClientToScreen, EndPaint, PAINTSTRUCT, ScreenToClient},
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
     UI::{
         Input::KeyboardAndMouse::{
-            GetKeyState, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_LBUTTON, VK_MBUTTON,
-            VK_RBUTTON, VK_SPACE, VK_XBUTTON1, VK_XBUTTON2,
+            GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+            VK_ESCAPE, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_SPACE, VK_XBUTTON1, VK_XBUTTON2,
         },
         WindowsAndMessaging::*,
     },
@@ -29,8 +40,9 @@ use windows::Win32::{
 
 use super::{
     WndProcState,
-    pump::{A11Y_TIMER_ID, cursor_handle, message_ticks},
+    pump::{A11Y_TIMER_ID, cursor_handle, message_ticks, plan_release_capture},
     recovery,
+    resize::{OuterRect, ResizeEdge, ResizeSession},
 };
 use crate::platform::{
     dispatcher::{WM_APP_COMPOSITION_WAKE, WM_APP_FRAME_WAKE},
@@ -55,12 +67,13 @@ pub(crate) extern "system" fn wndproc(
         if msg == WM_NCCALCSIZE {
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
-        // 非客户区命中：**系统命中码**（`HTCAPTION` / `HTTOP` / `HTTOPLEFT` / `HTCLOSE`…）。
+        // 非客户区命中：**系统命中码**（`HTCAPTION` / `HTLEFT` / `HTBOTTOMRIGHT` / `HTCLOSE`…）。
         //
-        // 引擎不改写它，也不接管 `WM_NCLBUTTONDOWN`（R07-2）：拖动 / 缩放 / 双击最大化 /
-        // 右键系统菜单 / Aero Snap / Snap Layouts 全部由 `DefWindowProcW` 的模态循环提供，
-        // 而模态循环**只在按下 `HT*` 时进入**。曾经在这里接管 `HTCAPTION` 的实现因此丢掉了
-        // 全部系统手势（多显示器用户最常用的窗口布局方式）。
+        // `WM_NCHITTEST` 不改写：命中码、边框几何、缩放光标形状都由系统算。`WM_NCLBUTTONDOWN`
+        // 按命中码分流（R07-2 / P-A）：caption 与系统按钮继续交 `DefWindowProcW`（move 模态
+        // 循环提供 Aero Snap / Snap Layouts / 双击最大化 / 右键系统菜单），8 个 resize 命中码
+        // 由引擎自持（见下面的 P-A 段）。曾经把 `HTCAPTION` 也一并接管的实现因此丢掉了全部
+        // 系统手势（多显示器用户最常用的窗口布局方式）。
         if msg == WM_NCHITTEST {
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
@@ -68,6 +81,108 @@ pub(crate) extern "system" fn wndproc(
         let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WndProcState;
         if state.is_null() {
             return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+
+        // ── P-A 自持窗口缩放 ────────────────────────────────────────────────────
+        //
+        // 8 个 resize 命中码**不进** `DefWindowProcW` 的 size 模态循环（原因见文件头纪律 2）：
+        // 这里只记账（起始外框 / 起始光标 / 边），鼠标位置交给泵。泵在 `collect_events` 之前
+        // 统一 `SetWindowPos` 一次，同步产生的 `WM_SIZE` 随后走现有事件链路
+        // （`set_size` 标 `LAYOUT` + `set_surface` 标全量 damage），本轮 ④ 出真实帧。
+        //
+        // `HTCAPTION` / 系统按钮不拦：Aero Snap / Snap Layouts / 双击最大化 / 右键系统菜单
+        // 只存在于系统的 move 模态循环里。
+        //
+        // 最小化 / 最大化窗口不能拖边框改尺寸（系统的 size 模态循环同样不允许）；`IsIconic` /
+        // `IsZoomed` 都是只读查询，不派发消息。`WM_NCLBUTTONDOWN` 的 `lParam` 就是按下时刻的
+        // 光标屏幕坐标（消息自带，比 `GetCursorPos` 更贴近事件时刻）。
+        if msg == WM_NCLBUTTONDOWN
+            && let Some(edge) = ResizeEdge::from_hit(wparam.0 as u32 & 0xFFFF)
+            && !IsIconic(hwnd).as_bool()
+            && !IsZoomed(hwnd).as_bool()
+        {
+            let session = ResizeSession::new(window_outer_rect(hwnd), screen_point(lparam.0), edge);
+            (*state).begin_resize(session);
+            // 与系统模态循环进入时同一条瞬时输入复位（它挂在 `WM_ENTERSIZEMOVE` 上，
+            // 自持会话收不到那条消息）：模态期间抬起的修饰键不能残留成「一直按下」。
+            (*state).reset_transient_input();
+            (*state).wake();
+            // 两阶段（纪律 1）：`SetCapture` 会同步派发 `WM_CAPTURECHANGED`。
+            // `state` 的临时借用已经结束，这里不再持有 `&mut WndProcState`。
+            // `hwnd` 是本进程窗口；捕获在松手 / Esc / 失去捕获时释放。
+            SetCapture(hwnd);
+            return LRESULT(0);
+        }
+        // 会话进行中：移动只更新目标外框，松手 / 取消结束会话。
+        if (*state).resize_active() {
+            match msg {
+                WM_MOUSEMOVE => {
+                    // **不翻译**成应用的 `PointerMove`（系统的 size 模态循环同样不投递输入），
+                    // 也**不**在这里 `SetWindowPos`：目标外框由泵统一应用（同一轮最多一次）。
+                    (*state).note_resize_cursor(client_to_screen(hwnd, lparam.0));
+                    (*state).wake();
+                    return LRESULT(0);
+                }
+                WM_LBUTTONUP => {
+                    // 松手：保留最后一次目标外框（最终尺寸必须落在一帧真实帧上），释放捕获。
+                    let release = plan_release_capture(hwnd, &mut *state);
+                    (*state).end_resize();
+                    (*state).wake();
+                    if release {
+                        // 计划阶段确认本窗口持有捕获。同线程调用会同步派发
+                        // `WM_CAPTURECHANGED`（那时会话已经结束、suppress 已置位）。
+                        let _ = ReleaseCapture();
+                    }
+                    return LRESULT(0);
+                }
+                WM_KEYDOWN if wparam.0 == VK_ESCAPE.0 as usize => {
+                    // Esc 取消：目标外框恢复成起始外框，并**吞掉**这条按键 —— 系统的缩放循环
+                    // 也把 Esc 当取消，不能冒泡去触发应用的 Esc（demo 里 Esc 是退出）。
+                    (*state).restore_resize();
+                    let release = plan_release_capture(hwnd, &mut *state);
+                    (*state).wake();
+                    if release {
+                        // 同 `WM_LBUTTONUP` 分支：计划阶段已置 suppress，这里执行释放。
+                        let _ = ReleaseCapture();
+                    }
+                    return LRESULT(0);
+                }
+                WM_CAPTURECHANGED => {
+                    // 捕获被系统 / 别的窗口抢走（Alt+Tab、系统弹窗）：取消会话，不恢复起始外框。
+                    (*state).cancel_resize();
+                    return LRESULT(0);
+                }
+                WM_CANCELMODE => {
+                    // 系统要求取消当前模态状态：取消会话并放掉捕获。
+                    (*state).cancel_resize();
+                    let release = plan_release_capture(hwnd, &mut *state);
+                    if release {
+                        // 同 `WM_LBUTTONUP` 分支：计划阶段已置 suppress，这里执行释放。
+                        let _ = ReleaseCapture();
+                    }
+                    return LRESULT(0);
+                }
+                _ => {}
+            }
+        }
+        if msg == WM_DPICHANGED && (*state).resize_active() {
+            // 会话的起始外框是**旧 DPI** 的物理坐标：跨屏改变 DPI 后继续按它算会漂。取消会话
+            // 并**释放指针捕获** —— 只清状态会让「混合 DPI 多显示器拖边框跨屏」之后鼠标被本
+            // 窗口永久捕获（直到用户再点别的窗口）。
+            //
+            // 两阶段（纪律 1）：短借用只记账（`cancel_resize` + `plan_release_capture` 置
+            // suppress），出借用后才 `ReleaseCapture`。它同步派发的 `WM_CAPTURECHANGED` 到达
+            // 时 `resize_active()` 已经是 false ⇒ 落到下面的普通分支并被 `suppress_capture_cancel`
+            // 消费（不产生 `PointerCancel`）。
+            //
+            // 之后**不 return**：照常走下面的 DPI 分支（系统建议矩形 + `set_scale` / `set_size` /
+            // `set_surface`，本轮 ④ 照常出帧）。
+            (*state).cancel_resize();
+            let release = plan_release_capture(hwnd, &mut *state);
+            if release {
+                // 计划阶段确认本窗口持有捕获；同 `WM_CANCELMODE` / `WM_LBUTTONUP` 分支。
+                let _ = ReleaseCapture();
+            }
         }
 
         if msg == WM_GETMINMAXINFO {
@@ -275,7 +390,14 @@ pub(crate) extern "system" fn wndproc(
             // GPU 线程在帧**完成**后通知「交换链里的内容尺寸变了」。这个通知**不请求新帧**：
             // 消息本身已经把 `GetMessageW` 唤醒，泵的 ②b′ 几何 pass 每轮都按
             // `presented_surface` / 客户区重算（同值几何是 no-op）。若在这里 `state.wake()`，
-            // 每次完成 present 都会额外产生一次 `App::frame`（HUD 下是真实的 paint + present）。
+            // 每次完成 present 都会额外产生一次 `App::frame`（多数是空帧，但仍要跑完两段门禁）。
+            //
+            // 例外是**自持缩放会话**（P-A）：拖动期的出帧背压要等「上一帧已上屏」，而本窗口
+            // 的 `presented_surface` 此刻正好更新完 —— 这一拍就是背压等待的那一次唤醒
+            // （不是定时器）。会话结束（松手 / Esc / 取消）后恢复「只唤醒、不请求帧」。
+            if (*state).resize_active() {
+                (*state).wake();
+            }
             return LRESULT(0);
         }
         if msg == WM_TIMER {
@@ -399,6 +521,45 @@ pub(crate) extern "system" fn wndproc(
         }
         DefWindowProcW(hwnd, msg, wparam, lparam)
     }
+}
+
+/// `WM_NCLBUTTONDOWN` 的 `lParam`：**屏幕坐标**（两个 16 位有符号值，物理像素）。
+fn screen_point(lparam: isize) -> (i32, i32) {
+    (loword_signed(lparam), hiword_signed(lparam))
+}
+
+/// 会话中 `WM_MOUSEMOVE` 的光标位置：`lParam` 是**客户区**坐标，换算成屏幕物理像素。
+///
+/// 用消息自带的位置而不是 `GetCursorPos`：前者是**该消息产生时**的光标位置（与系统模态循环
+/// 读数同源），后者在消息分发时可能已经又走了几像素，快速拖动时会滞后。`ClientToScreen`
+/// 只读写栈上的 `POINT`，不派发消息。
+fn client_to_screen(hwnd: HWND, lparam: isize) -> (i32, i32) {
+    let mut point = POINT {
+        x: loword_signed(lparam),
+        y: hiword_signed(lparam),
+    };
+    // SAFETY: `point` 是栈上值；只做坐标换算，不派发消息。
+    if unsafe { ClientToScreen(hwnd, &mut point) }.as_bool() {
+        (point.x, point.y)
+    } else {
+        cursor_pos()
+    }
+}
+
+/// 最近的系统光标位置（`ClientToScreen` 失败时的回退，正常路径不会用到）。
+fn cursor_pos() -> (i32, i32) {
+    let mut point = POINT::default();
+    // SAFETY: 无参数、只写栈上值。
+    let _ = unsafe { GetCursorPos(&mut point) };
+    (point.x, point.y)
+}
+
+/// 窗口**外框**矩形（屏幕物理像素；缩放会话的起始边界）。
+fn window_outer_rect(hwnd: HWND) -> OuterRect {
+    let mut rect = RECT::default();
+    // SAFETY: 窗口存活；`rect` 是栈上值。
+    let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
+    OuterRect::from_ltrb(rect.left, rect.top, rect.right, rect.bottom)
 }
 
 /// 消费者：`wndproc` 的事件翻译。

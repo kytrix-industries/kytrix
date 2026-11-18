@@ -61,8 +61,6 @@ pub(crate) fn frame(app: &mut App, window: WindowId) -> Option<Result<FrameOutco
     // 这里是 O(1) 的防御；钩子可能持有上一轮的事件引用做重放，所以裁剪放在帧入口）。
     app.events.trim();
     #[cfg(feature = "hud")]
-    let committed_at = app.clock;
-    #[cfg(feature = "hud")]
     app.prepare_debug_hud(window);
     // P2-3.3：偏移只在显式滚动时被夹紧，而可用范围 `content − viewport` 会随**内容尺寸**
     // 与**视口尺寸**变化 —— 两者都不一定触发重排（`set_scroll_content` 只写滚动槽），
@@ -232,12 +230,12 @@ pub(crate) fn frame(app: &mut App, window: WindowId) -> Option<Result<FrameOutco
         return None;
     };
     let outcome = target.commit_frame(ticket, paint);
+    // HUD 是纯观察者：提交成功后只清掉已经落进 paint 的待写文本（没有帧就保持上一次文本）。
     #[cfg(feature = "hud")]
-    if matches!(outcome, FrameOutcome::Committed(_)) {
-        if let Some(state) = app.debug_hud.get_mut(&window) {
-            debug_hud::finish_frame(state);
-        }
-        target.note_debug_hud_commit(committed_at);
+    if matches!(outcome, FrameOutcome::Committed(_))
+        && let Some(state) = app.debug_hud.get_mut(&window)
+    {
+        debug_hud::finish_frame(state);
     }
     // 图集行/整页没赶上本帧（窗口的共享槽还在消费上一笔）：这一帧会以旧图集呈现，因此
     // 立刻再要一帧（全量 damage），槽空后把内容补发——否则静态窗口会把缺字的画面一直

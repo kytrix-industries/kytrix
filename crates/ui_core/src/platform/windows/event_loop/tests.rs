@@ -1,6 +1,10 @@
 //! 事件循环的单元测试（拆分自 `event_loop.rs`，测试代码除路径外未改动）。
 //!
-//! 自绘标题栏拖动 / 边框缩放的状态机已随 R07-2 删除（非客户区交互完全交系统模态循环），
-//! 对应的 `caption_tests` / `resize_tests` 一并移除 —— 它们测的行为已经不存在。
+//! 非客户区交互的分工（R07-2 / P-A）：caption 拖动与系统按钮交给 `DefWindowProcW` 的 move
+//! 模态循环，8 个 resize 命中码由引擎自持（`resize.rs`）。因此这里保留
+//! `nonclient_hit_table_returns_system_hit_codes`（命中码必须仍由系统给），新增自持缩放的
+//! 状态机用例（`wndproc_tests` 里的 `resize_*`），以及泵侧几何应用的函数级用例
+//! （`pump_resize_tests`；泵里的调用点接线由真机拖动探针验收）。
 
+mod pump_resize_tests;
 mod wndproc_tests;

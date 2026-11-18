@@ -39,7 +39,7 @@ pub(crate) const IDLE_GRACE: Duration = Duration::from_millis(250);
 
 /// display link 需要跑的全部理由（`sync_pacing` 的唯一输入；纯函数便于单测）。
 ///
-/// - `continuous`：应用要连续帧（动画 / HUD）；
+/// - `continuous`：应用要连续帧（动画；Debug HUD 是纯观察者，不参与）；
 /// - `pending_frame`：有未取走的帧请求（GPU 线程还没拿走的）；
 /// - `in_flight`：还有在飞帧（它们要等 vsync 完成）；
 /// - `awaiting_presentation`：**还在等上屏证据**。这一条不能省：display link 是 tick 推断的

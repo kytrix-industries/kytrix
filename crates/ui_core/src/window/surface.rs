@@ -256,14 +256,20 @@ pub(crate) fn set_renderer(window: &mut Window, renderer: Renderer) {
     window.glyph_page_received = None;
     window.image_page_received = None;
     window.atlas_rects = std::array::from_fn(|_| crate::render::DirtyRects::default());
+    // 新渲染器还没呈现过任何一帧：拖动期背压的「已上屏序号」必须重新观测（否则会拿旧渲染器
+    // 的完成序号去比新发布的帧）。
+    #[cfg(windows)]
+    {
+        window.last_presented_frame = None;
+    }
 }
 
 // 消费者：`impl Window::poll_renderer` 的薄委托（外部调用点见该方法文档）。
 /// 轮询 renderer 的反馈 / 错误（三平台窗口路径；空闲时也要跑）。
 ///
 /// GPU 线程以错误退出后这里会持续返回同一个错误（粘性），平台泵在下一轮冒泡出去。
-/// 反馈本身由渲染器消费（统计 / GPU 采样），这里只把 HUD 需要的发布时间延迟记到窗口上：
-/// 反馈是最新者胜，窗口永远拿到最近一次完成帧的 `latency`。
+/// 反馈是最新者胜：每一条都是 GPU 线程**观察到完成**的帧，`Latency` / `Draw` / `Inst` 与
+/// 完成帧计数由 `record::note_completed_frame` 落到窗口上（threaded 路径的唯一来源）。
 pub(crate) fn poll_renderer(window: &mut Window) -> Result<(), EngineError> {
     let Some(renderer) = window.renderer.as_mut() else {
         return Ok(());
@@ -271,13 +277,31 @@ pub(crate) fn poll_renderer(window: &mut Window) -> Result<(), EngineError> {
     // 三平台窗口路径一致：`poll` 返回 `Result<Option<FrameFeedback>, EngineError>`，
     // 离屏路径恒为 `Ok(None)`。
     let feedback = renderer.poll()?;
+    // P-D：拖动期出帧背压要知道「最近一次完成帧」的序号（与 hud 无关，**不加** feature 门禁）。
+    // 反馈槽是最新者胜：同一轮里完成多帧时只看到最后一条，序号因此是单调不减的真实完成序号。
+    //
+    // **测试边界**：这行是本字段唯一的写点，但它只在真实窗口的 `poll` 路径上执行（`Renderer`
+    // 是具体类型，没有可注入的 fake）—— 单测覆盖不到，由真机拖动探针验收。若它没生效，
+    // `last_presented_frame()` 恒为 `None`，背压会退化成「永不跳过」（拖动仍能出帧，但 UI 会
+    // 按鼠标消息频率重排/重绘）；读侧逻辑见 `pump::ResizePacing` 的单测。
+    #[cfg(windows)]
+    if let Some(feedback) = feedback.as_ref() {
+        window.last_presented_frame = Some(feedback.index);
+    }
     #[cfg(feature = "hud")]
     if let Some(feedback) = feedback {
-        window.last_frame_latency = Some(feedback.latency);
+        super::record::note_completed_frame(window, &feedback);
     }
     #[cfg(not(feature = "hud"))]
     let _ = feedback;
     Ok(())
+}
+
+// 消费者：`impl Window::last_presented_frame` 的薄委托（外部调用点见该方法文档）。
+/// 最近一次**完成**帧的 `FrameIndex`（`None` = 还没有完成反馈）。
+#[cfg(windows)]
+pub(crate) fn last_presented_frame(window: &Window) -> Option<super::FrameIndex> {
+    window.last_presented_frame
 }
 
 // 消费者：`impl Window::sync_pacing` 的薄委托（外部调用点见该方法文档）。

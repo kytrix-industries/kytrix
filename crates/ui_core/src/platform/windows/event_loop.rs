@@ -9,22 +9,34 @@
 //! `WndProc` **不做**任何 `App` 调用：它只把 [`PlatformEvent`] 压进 `WndProcState`，泵在
 //! `DispatchMessageW` 返回后统一消费（Rust 借用规则 + 保持 `WndProc` 廉价）。
 //!
-//! ## 非客户区：完全交系统（R07-2）
+//! ## 非客户区：caption 交系统，resize 自持（R07-2 / P-A）
 //!
-//! 窗口用系统标题栏（`WS_OVERLAPPEDWINDOW`），`WM_NCCALCSIZE` / `WM_NCHITTEST` /
-//! `WM_NCLBUTTONDOWN` 全部交 `DefWindowProcW`。拖动、缩放、双击最大化、右键系统菜单、
-//! **Aero Snap / Win11 Snap Layouts** 都是系统 move/size 模态循环里的行为，只能由系统提供
-//! （Chrome / GPUI / Qt 的选择相同）。代价是拖动期间消息泵被模态循环挡住、画面不推进；
-//! 这是换 Snap 的**有意取舍**，不是遗漏。
+//! `WM_NCCALCSIZE` / `WM_NCHITTEST` 仍全部交 `DefWindowProcW`（命中码由系统给，边框与光标
+//! 形状因此正确）；`WM_NCLBUTTONDOWN` 则**按命中码分流**：
+//!
+//! - **标题栏 / 系统按钮**（`HTCAPTION` / `HTSYSMENU` / `HTMINBUTTON` / `HTMAXBUTTON` /
+//!   `HTCLOSE`）继续交 `DefWindowProcW`：Aero Snap / Win11 Snap Layouts / 双击最大化 /
+//!   右键系统菜单只存在于系统的 move 模态循环里，只能由系统提供（Chrome / GPUI / Qt 同样
+//!   放行）。move 不改变渲染目标与布局，模态循环期间不重绘没有可见代价。
+//! - **8 个 resize 命中码自持**（[`resize`] + [`WndProcState::begin_resize`]）：
+//!   size 模态循环会占住消息泵，拖动期间 `App::frame` 不运行 ⇒ 布局不重排、内容不按新尺寸
+//!   重绘、DComp 背景层也停在上一个客户区（新区域没有 visual ⇒ 露出桌面）。产品前提是
+//!   「不用定时器驱动刷新」+「resize 必须真实重排 + 重绘，不能拉伸旧帧」，所以缩放改由引擎
+//!   按消息驱动：`WndProc` 只记账，泵在 `collect_events` 之前 `SetWindowPos` 一次，随后走
+//!   现有 `set_size` / `set_surface` → 重排 → 按新 surface 重绘 → present。
+//!
+//! resize 的合并**不用定时器**：消息队列天然成批 + `pending_resize` 单值（最新赢）+
+//! 「上一帧未上屏就跳过该窗口出帧」的背压（`pump::ResizePacing`）。
 //!
 //! ## 帧节奏：合成器时钟（R07-10）
 //!
-//! 连续帧（动画 / HUD）由 [`pump::FramePacer`] 的合成器节拍线程驱动
-//! （`DCompositionWaitForCompositorClock`，与 Chrome Viz 同款），`WM_TIMER` 只保留给
-//! a11y 补发兜底；空闲时**没有**任何定时器或线程在跑。
+//! 连续帧（**动画**；HUD 自 P-C 起是纯观察者，不再产生帧）由 [`pump::FramePacer`] 的合成器
+//! 节拍线程驱动（`DCompositionWaitForCompositorClock`，与 Chrome Viz 同款），`WM_TIMER` 只
+//! 保留给 a11y 补发兜底；空闲时**没有**任何定时器或线程在跑。
 
 use std::sync::Arc;
 
+use resize::{OuterRect, ResizeSession};
 use windows::Win32::Foundation::HWND;
 
 use crate::{
@@ -45,6 +57,7 @@ use crate::{
 mod native_window;
 mod pump;
 mod recovery;
+mod resize;
 mod wndproc;
 
 pub(crate) use pump::run;
@@ -96,6 +109,17 @@ pub(crate) struct WndProcState {
     /// （恒为 `IDC_ARROW`）—— 只在光标变化时 `SetCursor` 的写法会被系统覆盖掉，自定义光标
     /// 永远不生效（P2-3）。所以这里记住当前值，在 `WM_SETCURSOR` 里重新应用。
     cursor: crate::paint::style::Cursor,
+    /// 自持缩放会话（P-A）：8 个 resize 命中码在 `WM_NCLBUTTONDOWN` 上开始，鼠标移动更新
+    /// 目标外框，松手 / Esc / 失去捕获 / `WM_CANCELMODE` / 会话中 DPI 变化结束。
+    ///
+    /// `WndProc` 只做记账（不在这里调 `SetWindowPos` / `SetCapture` 之外的重入 API）：
+    /// `SetWindowPos` 由泵在 `collect_events` 之前统一执行一次。
+    resize: Option<ResizeSession>,
+    /// 会话累积的目标外框（**单值、最新赢**）：`WM_MOUSEMOVE` 只写它，泵取走并应用一次。
+    ///
+    /// 它是「不用定时器合并鼠标」的两半之一：另一半是消息队列天然成批（一次排空里只留最新
+    /// 光标），单值则保证同一轮最多一次 `SetWindowPos`。
+    pending_resize: Option<OuterRect>,
 }
 
 impl WndProcState {
@@ -124,6 +148,8 @@ impl WndProcState {
             a11y: WindowsA11y::new(hwnd, dispatcher, window)?,
             suppress_capture_cancel: false,
             cursor: crate::paint::style::Cursor::Default,
+            resize: None,
+            pending_resize: None,
         })
     }
 
@@ -307,5 +333,51 @@ impl WndProcState {
     /// 记录引擎当前光标（`WM_SETCURSOR` 据此重新应用，P2-3）。
     pub(crate) fn set_cursor(&mut self, cursor: crate::paint::style::Cursor) {
         self.cursor = cursor;
+    }
+
+    /// 开始一次自持缩放会话（`WndProc` 的 `WM_NCLBUTTONDOWN` 分支；**纯记账**）。
+    ///
+    /// 替换任何已有会话并清空待应用的目标外框（同一窗口不应并存两个会话）。
+    pub(crate) fn begin_resize(&mut self, session: ResizeSession) {
+        self.resize = Some(session);
+        self.pending_resize = None;
+    }
+
+    /// 会话中的一次鼠标移动：按最新光标算目标外框，**最新赢**（不排队、不移动窗口）。
+    pub(crate) fn note_resize_cursor(&mut self, cursor: (i32, i32)) {
+        let Some(session) = self.resize else {
+            return;
+        };
+        // 最小外框与 `WM_GETMINMAXINFO` 同源（`note_dpi` 会同步重算）。
+        self.pending_resize = Some(session.target_outer(cursor, self.min_size));
+    }
+
+    /// 取走待应用的目标外框（泵在 `collect_events` 之前消费一次；取走即清零）。
+    pub(crate) fn take_pending_resize(&mut self) -> Option<OuterRect> {
+        self.pending_resize.take()
+    }
+
+    /// 缩放会话是否进行中（泵据此开启拖动期的出帧背压）。
+    pub(crate) fn resize_active(&self) -> bool {
+        self.resize.is_some()
+    }
+
+    /// 结束会话但**保留**最后一次目标外框：松手后的最终尺寸必须落在一帧真实帧上。
+    pub(crate) fn end_resize(&mut self) {
+        self.resize = None;
+    }
+
+    /// Esc 取消：目标外框恢复成会话起始外框，并结束会话。
+    pub(crate) fn restore_resize(&mut self) {
+        if let Some(session) = self.resize {
+            self.pending_resize = Some(session.start_outer());
+        }
+        self.resize = None;
+    }
+
+    /// 取消会话并丢弃待应用的目标外框（失去捕获 / `WM_CANCELMODE` / 会话中 DPI 变化）。
+    pub(crate) fn cancel_resize(&mut self) {
+        self.resize = None;
+        self.pending_resize = None;
     }
 }
