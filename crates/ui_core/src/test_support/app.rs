@@ -19,7 +19,7 @@ use super::{
 use crate::{
     app::{App, AppHandle},
     error::EngineError,
-    event::{InputEvent, InputOutcome},
+    event::{Event, InputEvent, InputOutcome},
     window::{FrameOutcome, WindowId, WindowOptions},
 };
 
@@ -347,6 +347,21 @@ impl TestApp {
             .dispatch_input(self.window, event.with_timestamp(stamp))
     }
 
+    /// 投递一个**平台事件**（`Event`：输入 / IME / DPI / 外观 / 焦点 / 尺寸…）。
+    ///
+    /// 走与平台泵**完全相同**的 `App::dispatch`（`crate::app::resources::dispatch`）：
+    /// ① `Event::Input` 立刻走一次交互分发；② 事件同时进有界观测队列（[`App::drain_events`]），
+    /// 应用侧因此真的能「读到」字符输入 / IME 提交（`TestApp::inject` 只做 ①，不排队）。
+    /// 时间戳同样换成可控时钟（双击 / 连击 / 拖拽判定以它为基准）。
+    pub fn dispatch_event(&mut self, event: Event) {
+        let stamp = self.app.clock();
+        let event = match event {
+            Event::Input(input) => Event::Input(input.with_timestamp(stamp)),
+            other => other,
+        };
+        self.app.dispatch(self.window, event);
+    }
+
     /// 推进测试时钟（双击窗口 / 动画 / 拖拽时间都读它；不改任何状态）。
     pub fn advance(&mut self, by: Duration) {
         self.app.advance_clock(by);
@@ -465,6 +480,55 @@ impl TestApp {
         size: (u32, u32),
     ) -> Result<crate::render::backend::Renderer, EngineError> {
         crate::render::backend::Renderer::new_offscreen(size)
+    }
+
+    /// 当前窗口的**物理读回尺寸**（headless 窗口 = `size × scale` 的 covering）。
+    fn readback_surface(&self) -> ((u32, u32), crate::math::Scale) {
+        let window = self
+            .app
+            .window(self.window)
+            .expect("TestApp's window must exist");
+        let scale = window.scale();
+        let size = window.size();
+        let surface =
+            crate::math::Rect::new(0.0, 0.0, size.width, size.height).to_physical_covering(scale);
+        (
+            (
+                surface.width().max(1) as u32,
+                surface.height().max(1) as u32,
+            ),
+            scale,
+        )
+    }
+
+    /// 当前窗口的像素读回（真实 GPU 离屏渲染；**不应用**合成端滚动偏移）。
+    ///
+    /// 与 [`Self::snapshot`] 同一条读回链路，但尺寸取自窗口本身（不是 `SnapshotCase`），
+    /// 供端到端冒烟测试断言「输入 → 绘制 → 呈现」的最后一跳。
+    ///
+    /// # Errors
+    /// 同 [`Self::snapshot`]。
+    pub fn read_pixels(&self) -> Result<SnapshotImage, SnapshotError> {
+        self.read_pixels_with_scroll(&[])
+    }
+
+    /// 当前窗口的像素读回，并**应用调用方给出的合成端滚动槽表**（见
+    /// [`super::pixels::render_offscreen`] 的「表从哪来」）。
+    ///
+    /// # Errors
+    /// 同 [`Self::snapshot`]。
+    pub fn read_pixels_with_scroll(
+        &self,
+        scroll: &[super::pixels::ScrollSlot],
+    ) -> Result<SnapshotImage, SnapshotError> {
+        let (size, scale) = self.readback_surface();
+        let window = self
+            .app
+            .window(self.window)
+            .ok_or_else(|| SnapshotError::Gpu {
+                detail: smol_str::SmolStr::new_static("readback: window was closed"),
+            })?;
+        super::pixels::render_offscreen(&self.app, window, size, scale, scroll).map_err(gpu_error)
     }
 
     /// 单窗口借用视图（多窗口驱动的入口）。

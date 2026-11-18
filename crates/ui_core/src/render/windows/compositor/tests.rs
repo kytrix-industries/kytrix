@@ -20,6 +20,7 @@ use crate::{
     render::{
         compositor::{FramePlan, Plan, plan},
         damage::DamageSummary,
+        frame::FramePayload,
         timer::FrameTimings,
     },
     window::FrameIndex,
@@ -441,6 +442,76 @@ fn quad_pixels_are_srgb_encoded_and_clipped_by_bounds() {
     let image = renderer.readback().expect("readback");
     assert_eq!(pixel(&image, 64, 24, 24), [255, 0, 0, 255]);
     assert_eq!(pixel(&image, 64, 4, 4), [0, 0, 0, 0]);
+}
+
+/// D-1 回归（P1，用户可见）：**合成端滚动偏移必须真的到 GPU**。
+///
+/// `RootUniform::with_scroll` 写的是 **frame 块**（dword 5/6），而 `draw_ops` 曾经每个 op 只上传
+/// draw 块（dword 8..28）—— 偏移于是永远停在 `bind_frame` 写入的 0 上：Windows 上滚动容器内容
+/// **根本不动**，而 CPU 侧的偏移表 / damage / `encoded_lanes == 0` 全都正确（既有单测因此全绿）。
+///
+/// 本用例走**真实 WARP 渲染**：一条 lane 的 quad 落在滚动槽 1（0 = 窗口根，恒不滚），载荷带
+/// `(0, -16)` 的物理偏移 ⇒ 读回像素必须整体上移 16 px、原位置留空。上传范围退回 draw 块会让
+/// 两条像素断言同时红（内容留在烘焙位置）。
+#[test]
+fn the_scroll_offset_reaches_the_gpu() {
+    let _guard = lock();
+    let Some(mut renderer) = warp_renderer((64, 64)) else {
+        return;
+    };
+    let mut scene = Scene::empty();
+    let lane = scene.new_lane();
+    assert!(scene.push(
+        lane,
+        quad(
+            Rect::new(16.0, 16.0, 16.0, 16.0),
+            Color::srgb(1.0, 0.0, 0.0, 1.0),
+        )
+    ));
+    scene.set_order(&[lane]);
+    // 真实滚动槽 1（`paint/pass.rs` 给滚动容器的 lane 分配的就是非 0 槽）；槽位变化让该 lane
+    // 必须重编码，因此 op 表里带的就是新槽位。
+    assert!(scene.set_lane_scroll(lane, 1), "lane 必须存在");
+    let mut encoder = InstanceEncoder::new();
+    let buffer = encoder
+        .encode(
+            &scene,
+            Scale::ONE,
+            resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        )
+        .expect("encode");
+    assert!(
+        buffer
+            .ops()
+            .iter()
+            .any(|op| matches!(op, FrameOp::Instances { scroll: 1, .. })),
+        "本用例的前提：quad 的 op 必须落在滚动槽 1（实际 {:?}）",
+        buffer.ops()
+    );
+    // 槽 0 = 窗口根（偏移恒 0），槽 1 = 滚动容器内容上移 16 物理像素。
+    let payload = FramePayload::full(buffer, vec![[0.0, 0.0], [0.0, -16.0]], Vec::new());
+    let mut frame = full_plan((64, 64));
+    let mut timings = FrameTimings::new();
+    let stats = renderer
+        .submit_snapshot(FrameIndex::from_raw(1), &payload, &mut frame, &mut timings)
+        .expect("submit");
+    assert_eq!(
+        (stats.draw_calls, stats.instances),
+        (1, 1),
+        "本用例的前提：一帧一个非空实例 op（实际 {stats:?}）"
+    );
+    let image = renderer.readback().expect("readback");
+    assert_eq!(
+        pixel(&image, 64, 24, 8),
+        [255, 0, 0, 255],
+        "偏移 (0,-16) 之后 quad 必须画在 y = 0..16；仍是烘焙位置说明 frame 块（words 5/6）没上传"
+    );
+    assert_eq!(
+        pixel(&image, 64, 24, 24),
+        [0, 0, 0, 0],
+        "烘焙位置的下半段（y = 16..32）必须留空：内容真的移动了，不是被画了两遍"
+    );
 }
 
 /// 白底 + 红 damage：两帧都是非空场景，damage 之外的蓝块必须原样保留（B5）。

@@ -102,10 +102,16 @@ impl RootUniform {
     /// 由实例顶点 shader 在**最后一步**（`to_ndc` 之前）加到世界坐标上。因此实例字节里烘焙的
     /// 坐标始终是「滚动容器内容空间」，与偏移无关。
     ///
-    /// 为什么用 `frame.params.zw` 而不是 `draw.clip.zw`：`draw` 块在实例路径上整体不被读取
+    /// 为什么用 `frame.params.yz` 而不是 `draw.clip.zw`：`draw` 块在实例路径上整体不被读取
     /// （`RootUniform::frame` 写恒等变换占位），而 `frame.params.x` 已被 DPI 占用，
     /// `.yz` 是 frame 块里唯一未使用的两个 dword；几何绘制用 `.zw` 同样语义一致
     /// （`geometry_root` 会把逻辑偏移直接并进 `draw.translation`）。
+    ///
+    /// **上传契约**：本字段落在 **frame 块**（dword 5/6），所以任何「每 op 变化」的后端都必须
+    /// 每 op 推**整份** 112 B，不能只推 draw 块（dword 8..28）。三端现在都是整份上传：
+    /// D3D12 `SetGraphicsRoot32BitConstants(0, 28, .., 0)` / Vulkan `cmd_push_constants([0,112))` /
+    /// Metal `setVertexBytes(112)`。Windows 曾经只推 draw 块，滚动偏移因此永远停在 0
+    /// （D-1：滚动容器内容不移动，而 CPU 侧偏移 / damage / `encoded_lanes` 全对）。
     pub(crate) fn with_scroll(mut self, offset: [f32; 2]) -> Self {
         self.words[5] = offset[0];
         self.words[6] = offset[1];

@@ -49,9 +49,6 @@ use crate::{
     window::FrameIndex,
 };
 
-/// `RootUniform` 里帧级常量的 dword 数（`frame @0`，32 B；R08-30）。
-const FRAME_DWORDS: usize = 8;
-
 /// 消费者：`GpuRenderer::prime_detached`（`compositor.rs` 的薄委托）。
 ///
 /// 把一条**还没挂到 visual 上**的交换链 prime 成背景色：clear 整块 back buffer + `Present1`
@@ -543,6 +540,9 @@ pub(super) fn bind_frame(
         list.SetDescriptorHeaps(&[Some(srv_heap.heap().clone())]);
         list.SetGraphicsRootSignature(pipeline.root_signature());
         list.SetPipelineState(pipeline.quad());
+        // pass 起点的**帧级默认值**（`scroll = 0`）。它**不是**本趟的最终值：`draw_ops` 在每次
+        // draw 之前整份重写这 112 B（`frame.params.yz` 是每 op 的滚动偏移，见 D-1）。保留这次
+        // 写入是为了让常量槽在任何 draw 之前就有确定内容（prime 帧只走这里，不画图元）。
         list.SetGraphicsRoot32BitConstants(
             0,
             ROOT_UNIFORM_DWORDS as u32,
@@ -731,11 +731,15 @@ pub(super) fn draw_ops(
                         list.SetPipelineState(pipeline.quad());
                         last_pipeline = Some(PsoTag::Quad);
                     }
+                    // **整份** 112 B（frame + draw）：`frame.params.yz` 是本 op 的合成端滚动偏移，
+                    // 每 op 都可能不同 ⇒ 只推 draw 块会让偏移永远停在 `bind_frame` 的 0 上
+                    // （D-1：Windows 滚动内容不移动）。与 Linux 的 push constants / macOS 的
+                    // `setVertexBytes` 完全同一条上传路径，三端因此没有可漂移的余地。
                     list.SetGraphicsRoot32BitConstants(
                         0,
-                        (ROOT_UNIFORM_DWORDS - FRAME_DWORDS) as u32,
-                        uniform.words()[FRAME_DWORDS..].as_ptr().cast(),
-                        FRAME_DWORDS as u32,
+                        ROOT_UNIFORM_DWORDS as u32,
+                        uniform.words().as_ptr().cast(),
+                        0,
                     );
                     if last_topology != Some(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP.0) {
                         list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
@@ -774,11 +778,14 @@ pub(super) fn draw_ops(
                         list.SetPipelineState(pipeline.geometry(entry.pipeline()));
                         last_pipeline = Some(PsoTag::Geometry(entry.pipeline()));
                     }
+                    // 同样整份上传：geometry 的偏移已经并进 `draw.translation`（`geometry_root`），
+                    // 但**帧块必须与实例路径走同一个入口**，否则「哪些 dword 会到 GPU」又变成
+                    // 每个后端各自的隐式知识（D-1 的成因）。
                     list.SetGraphicsRoot32BitConstants(
                         0,
-                        (ROOT_UNIFORM_DWORDS - FRAME_DWORDS) as u32,
-                        uniform.words()[FRAME_DWORDS..].as_ptr().cast(),
-                        FRAME_DWORDS as u32,
+                        ROOT_UNIFORM_DWORDS as u32,
+                        uniform.words().as_ptr().cast(),
+                        0,
                     );
                     if last_topology != Some(entry.topology().0) {
                         list.IASetPrimitiveTopology(entry.topology());

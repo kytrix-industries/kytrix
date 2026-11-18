@@ -1,11 +1,13 @@
 //! 最终合成负载验收 harness：命令行入口（只做参数解析与模式分发）。
 //!
-//! 三个模式（三平台同一份二进制）：
+//! 四个模式（三平台同一份二进制）：
 //!
 //! ```text
-//! cargo run --release -p ui_core --example acceptance -- cpu     # 无窗口 CPU 测量（生产特性）
-//! cargo run --release -p ui_core --example acceptance -- window  # 真实窗口帧率/抖动（+UI 线程 CPU）
-//! cargo run --release -p ui_core --example acceptance -- idle    # 真实窗口空闲 60 s 的进程 CPU
+//! cargo run --release -p ui_core --example acceptance -- cpu          # 无窗口 CPU 测量（生产特性）
+//! cargo run --release -p ui_core --example acceptance -- window       # 真实窗口帧率/抖动（+UI 线程 CPU）
+//! cargo run --release -p ui_core --example acceptance -- idle         # 真实窗口空闲 60 s 的进程 CPU
+//! cargo run --release -p ui_core --features test-support \
+//!     --example acceptance -- interaction                             # GUI 端到端冒烟（交互闭环）
 //! ```
 //!
 //! 口径边界（写进报告）：
@@ -13,9 +15,13 @@
 //!   （遍历 scene/tree），本 harness 检测到该特性时会打印警告，且只把 `FrameRecord` 计数当证据；
 //! - `cpu` 模式是 headless（`renderer = None`）：编码在 UI 线程内联完成，因此测的是
 //!   「样式 + 文本 + 布局 + 绘制 + 实例编码」的**完整 CPU 成本**，不受窗口前台化 / 组合器影响；
-//! - `window` / `idle` 模式必须真机真窗口：帧间隔由平台帧时钟给出（vsync 节拍）。
+//! - `window` / `idle` 模式必须真机真窗口：帧间隔由平台帧时钟给出（vsync 节拍）；
+//! - `interaction` 模式反过来：**必须** `--features test-support`，且 headless（真实输入分发 +
+//!   离屏 GPU 读回），无显示服务器也能跑 —— 交互正确性的断言在
+//!   `ui_core::test_support::gui_smoke`（同样的套件也由 `tests/gui_smoke.rs` 在 CI 里跑）。
 
 mod headless;
+mod interaction;
 mod report;
 mod scene;
 mod windowed;
@@ -74,13 +80,14 @@ impl Default for Config {
 
 /// 用法。
 const USAGE: &str = "\
-usage: acceptance [cpu|window|idle] [options]
+usage: acceptance [cpu|breakdown|window|idle|interaction] [options]
 
 modes:
   cpu                headless CPU 测量（默认）
   breakdown          1000 单元文本帧的 pass 归因（定位用，非判据）
   window             真实窗口：帧间隔 / 抖动 / UI 线程帧 CPU
   idle               真实窗口空闲 60 s 的进程 CPU
+  interaction        GUI 端到端冒烟（输入 → 布局 → 绘制 → 呈现 → a11y；需要 test-support）
 
 options:
   --frames N         增量帧测量帧数（默认 250）
@@ -171,6 +178,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         "breakdown" => headless::run_breakdown(&config),
         "window" | "fps" => windowed::run_window(&config),
         "idle" => windowed::run_idle(&config),
+        "interaction" | "smoke" => interaction::run(&config),
         other => Err(failure(format!("unknown mode: {other}\n\n{USAGE}"))),
     }
 }

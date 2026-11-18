@@ -14,6 +14,8 @@ pub mod a11y;
 pub mod acceptance;
 pub mod app;
 pub mod diagnostics;
+pub mod gui_smoke;
+pub mod pixels;
 pub mod probe;
 pub mod record;
 pub mod script;
