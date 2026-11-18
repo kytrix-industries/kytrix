@@ -47,6 +47,8 @@ pub(crate) fn paint_frame(
         window.full_damage_pending = true;
     }
     let has_damage = window.full_damage_pending || window.pending_damage.is_some();
+    // 纯滚动帧的快路径判据要用「本帧是否整帧重画」（下面会清掉这个位）。
+    let full_damage = window.full_damage_pending;
     if window.full_damage_pending {
         window.damage.push_full();
         window.full_damage_pending = false;
@@ -71,24 +73,68 @@ pub(crate) fn paint_frame(
             #[cfg(feature = "test-support")]
             uploaded_bytes: 0,
             #[cfg(feature = "test-support")]
+            scroll_slots: 0,
+            #[cfg(feature = "test-support")]
             log: crate::test_support::record::PaintLog::default(),
         });
     }
-    window.paint_order.clear();
-    let focused = window.focus.focused();
-    let mut pass = PaintPass {
-        tree: &mut window.tree,
-        geometry,
-        scene: &mut window.scene,
-        damage: &mut window.damage,
-        scale,
-        frame,
-        order: &mut window.paint_order,
-        focused,
-        #[cfg(feature = "test-support")]
-        log: PaintLog::default(),
+    // ── 纯滚动帧的快路径（AR4 P1-3 的性能验收）────────────────────────────────
+    //
+    // 有 damage（滚动视口）但**没有任何节点要重建**（没有 PAINT/LAYOUT 脏、没有移除的 lane、
+    // 不是整帧重画）时，paint 遍历唯一的产出是「把每条 lane 按原序推回绘制序」—— 10k 节点
+    // 约 240 µs 的白工，而滚动帧的架构目标是 ≤200 µs。
+    //
+    // 滚动槽位是**布局派生**的：树没变 ⇒ 槽位编号与视口都不变，只有偏移变了。于是直接按
+    // `scroll_slot_nodes` 把偏移刷进槽位表，与「遍历后 100% 复用」逐字节等价（`rebuilt == 0`、
+    // `order` 不变、没有节点级 damage）。槽位表与树不再一致时 `refresh_scroll_offsets` 返回
+    // `None`，落到完整遍历（那是唯一会重建槽位表的路径）。
+    let report = if !full_damage
+        && removed.is_empty()
+        && !window.needs_node_repaint()
+        && window.scroll_slots.len() > 1
+    {
+        refresh_scroll_offsets(window)
+    } else {
+        None
     };
-    let report = pass.run()?;
+    let report = match report {
+        Some(damage) => PaintReport {
+            rebuilt: 0,
+            damage,
+            #[cfg(feature = "test-support")]
+            instances: 0,
+            #[cfg(feature = "test-support")]
+            encoded_lanes: 0,
+            #[cfg(feature = "test-support")]
+            reused_segments: 0,
+            #[cfg(feature = "test-support")]
+            uploaded_bytes: 0,
+            #[cfg(feature = "test-support")]
+            scroll_slots: 0,
+            #[cfg(feature = "test-support")]
+            log: crate::test_support::record::PaintLog::default(),
+        },
+        None => {
+            window.paint_order.clear();
+            let focused = window.focus.focused();
+            let mut pass = PaintPass {
+                tree: &mut window.tree,
+                geometry,
+                scene: &mut window.scene,
+                damage: &mut window.damage,
+                scale,
+                frame,
+                order: &mut window.paint_order,
+                focused,
+                // pass 每帧重写槽位表：滚动容器在这里拿到稳定的合成端槽位（见 `scroll_slots`）。
+                scroll_slots: &mut window.scroll_slots,
+                scroll_slot_nodes: &mut window.scroll_slot_nodes,
+                #[cfg(feature = "test-support")]
+                log: PaintLog::default(),
+            };
+            pass.run()?
+        }
+    };
     // ── B6-2：采集 `SceneDelta`（UI 线程的产物到此为止）────────────────────────
     let surface = window.physical_surface();
     let mut delta = SceneDelta::empty(FrameHeader {
@@ -138,12 +184,32 @@ fn annotate_report(mut report: PaintReport, stats: ComposeStats) -> PaintReport 
     report.encoded_lanes = stats.encoded_lanes;
     report.reused_segments = stats.reused_segments;
     report.uploaded_bytes = stats.written_bytes;
+    report.scroll_slots = stats.scroll_slots;
     report
 }
 
 #[cfg(not(feature = "test-support"))]
 fn annotate_report(report: PaintReport, _stats: ComposeStats) -> PaintReport {
     report
+}
+
+/// 纯滚动帧的快路径：把每个滚动容器的当前偏移刷进槽位表，返回本帧 damage。
+///
+/// 返回 `None` = 槽位表与树不再一致（容器已卸载 / 不再是滚动容器）⇒ 调用方走完整遍历。
+/// **不重建任何 lane**：图元烘焙在「不含本槽位移」的内容空间里，滚动只改偏移。
+fn refresh_scroll_offsets(window: &mut Window) -> Option<crate::render::damage::DamageSummary> {
+    debug_assert_eq!(
+        window.scroll_slots.len(),
+        window.scroll_slot_nodes.len() + 1,
+        "槽位表与节点表必须平行（哨兵之外一一对应）"
+    );
+    for (index, node) in window.scroll_slot_nodes.iter().copied().enumerate() {
+        let offset = window.tree.scroll_slot(node)?.offset;
+        let slot = window.scroll_slots.get_mut(index + 1)?;
+        slot.0 = offset;
+    }
+    let frame = window.frame_rect();
+    Some(window.damage.finish(frame))
 }
 
 /// inline 合成（`composer` 在 UI 线程时）：返回 `None` = 本帧没有可发布的载荷（threaded 模式）。

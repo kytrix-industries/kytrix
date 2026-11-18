@@ -48,6 +48,15 @@ pub(crate) struct PaintPass<'a> {
     pub order: &'a mut Vec<LaneId>,
     /// 本帧的焦点节点（画 `Style.focus_ring`；`None` = 无焦点）。
     pub focused: Option<NodeId>,
+    /// 本帧的**滚动槽表**（槽位 → （逻辑滚动位移，物理视口））。
+    ///
+    /// 本 pass 每帧重写它：下标 0 恒是「不随滚动偏移」的哨兵（偏移 0、零面积视口），
+    /// 滚动容器按绘制序依次占 1..。槽位编号在树结构不变时**逐帧稳定**，因此滚动容器
+    /// 的 lane 不需要因为滚动而重建（`Lane::scroll` 参与复用判据）。
+    pub scroll_slots: &'a mut Vec<(Point, PhysicalRect)>,
+    /// 与 `scroll_slots` 平行的「槽位 → 容器节点」（下标 i ⇒ 槽位 i + 1）。消费者：纯滚动帧
+    /// 的快路径（`window/paint.rs`）据它把偏移刷进槽位表，不必重新遍历树。
+    pub scroll_slot_nodes: &'a mut Vec<NodeId>,
     /// lane 重建/复用记录（仅 `test-support`）。
     #[cfg(feature = "test-support")]
     pub log: PaintLog,
@@ -69,6 +78,9 @@ pub(crate) struct PaintReport {
     /// 本帧重编码写入实例环的字节数（增量上传量的编码器侧值）。
     #[cfg(feature = "test-support")]
     pub uploaded_bytes: usize,
+    /// 本帧滚动偏移变化的槽数（`FrameStats::scroll_offset_frames` 的 inline 来源）。
+    #[cfg(feature = "test-support")]
+    pub scroll_slots: usize,
     #[cfg(feature = "test-support")]
     pub log: PaintLog,
 }
@@ -84,10 +96,17 @@ impl PaintPass<'_> {
         let scene = &mut *self.scene;
         let damage = &mut *self.damage;
         let order = &mut *self.order;
+        let scroll_slots = &mut *self.scroll_slots;
+        let scroll_slot_nodes = &mut *self.scroll_slot_nodes;
         let scale = self.scale;
         let frame = self.frame;
         #[cfg(feature = "test-support")]
         let log = std::mem::take(&mut self.log);
+        // 槽位 0 是「不随滚动偏移」的哨兵：`FrameOp::Instances.scroll = 0` 的 op 永远拿到
+        // 零偏移，因此不需要在绘制期判断「这个 op 是否在滚动容器里」。
+        scroll_slots.clear();
+        scroll_slots.push((Point::ZERO, PhysicalRect::new(0, 0, 0, 0)));
+        scroll_slot_nodes.clear();
         let mut context = PaintContext {
             geometry: self.geometry,
             tree,
@@ -95,6 +114,8 @@ impl PaintPass<'_> {
             damage,
             scale,
             order,
+            scroll_slots,
+            scroll_slot_nodes,
             focused: self.focused,
             #[cfg(feature = "test-support")]
             log,
@@ -102,7 +123,16 @@ impl PaintPass<'_> {
         };
         let mut clip = ClipContext::default();
         let root = context.tree.root();
-        paint_node(&mut context, root, false, &mut clip, Point::ZERO)?;
+        paint_node(
+            &mut context,
+            root,
+            false,
+            &mut clip,
+            Point::ZERO,
+            Point::ZERO,
+            0,
+            0,
+        )?;
         context.scene.set_order(context.order);
         let damage = context.damage.finish(frame);
         Ok(PaintReport {
@@ -117,6 +147,8 @@ impl PaintPass<'_> {
             #[cfg(feature = "test-support")]
             uploaded_bytes: 0,
             #[cfg(feature = "test-support")]
+            scroll_slots: 0,
+            #[cfg(feature = "test-support")]
             log: context.log,
         })
     }
@@ -130,10 +162,19 @@ struct PaintContext<'a> {
     damage: &'a mut DamageAccumulator,
     scale: Scale,
     order: &'a mut Vec<LaneId>,
+    /// 滚动槽表（本帧写入；下标 0 = 哨兵）。
+    scroll_slots: &'a mut Vec<(Point, PhysicalRect)>,
+    /// 槽位 → 容器节点（与 `scroll_slots` 平行，下标 i ⇒ 槽位 i + 1）。
+    scroll_slot_nodes: &'a mut Vec<NodeId>,
     focused: Option<NodeId>,
     #[cfg(feature = "test-support")]
     log: PaintLog,
     rebuilt: usize,
+}
+
+/// 屏幕 = 内容 − `total`；图元烘焙 = 内容 − (`total` − `slot_offset`)。
+fn offset_between(total: Point, slot_offset: Point) -> Point {
+    Point::new(total.x - slot_offset.x, total.y - slot_offset.y)
 }
 
 /// 祖先 clip 链（外层在前）+ 物理 covering 交集。
@@ -226,12 +267,33 @@ fn content_needs_clip(content: &Content) -> bool {
     }
 }
 
+/// 绘制一棵子树。
+///
+/// 两个偏移（**滚动合成端偏移的核心约定**，见 `render/delta.rs` 的 [`ScrollTable`]）：
+/// - `total`：祖先滚动位移的**完整**累计值（屏幕 = 内容 − total）。damage / clip 上下文 /
+///   滚动视口都用它 —— 它们必须留在屏幕坐标里；
+/// - `slot_offset`：**最近一个滚动容器**（本子树所属滚动槽）自己的位移。图元烘焙时把它扣掉，
+///   于是「滚动这个容器」不改变烘焙字节 ⇒ 不重建 lane、不重编码（`frame.params.yz` 在绘制期
+///   把它加回去）。
+///
+/// `slot` 是本子树所属的滚动槽编号（0 = 不随滚动偏移；`Scene` 的 lane 记录它，编码器据此
+/// 生成 `FrameOp::Instances.scroll`）。
+///
+/// `boundary` 是该槽位的**视口 clip 深度**：`clip.rects[..boundary]` 是「滚动容器之外」的裁剪
+/// 链（含容器自己的 padding box）——它们**不**进 lane 的裁剪链（屏幕固定、随滚动在内容坐标里
+/// 移动，烘焙进去就等于每滚一像素都要重编码全部 lane），改由槽位的屏幕裁剪区在绘制期做
+/// 每 op scissor（`FramePayload::scroll_clip`）。
+///
+/// [`ScrollTable`]: crate::render::delta::ScrollTable
 fn paint_node(
     context: &mut PaintContext<'_>,
     node: NodeId,
     parent_hidden: bool,
     clip: &mut ClipContext,
-    offset: Point,
+    total: Point,
+    slot_offset: Point,
+    slot: u32,
+    boundary: usize,
 ) -> Result<(), EngineError> {
     // 一次取全本节点的只读状态（不可见 / 复用判据 / lane / 子节点数 / clip 盒 / 滚动偏移）。
     //
@@ -240,18 +302,34 @@ fn paint_node(
     // 隐藏子树，`visible: false` 仅跳过本节点自身的图元 —— 于是容器的背景消失、子控件仍然
     // 画出来，而那些子控件在命中测试里是不可见的（「看得见但点不动」的死像素，P2-3.2）。
     //
-    // 复用判据（§5.6 + P10 §7.6）：`REUSABLE` + clip 上下文一致 + **滚动偏移戳一致**（祖先滚动会
-    // 移动全部后代图元，因此偏移变化必须重建）。**不要求** lane 存在：从未产生图元的节点没有
-    // lane，但它的 `clip_key` 已写回，仍可整帧跳过（否则空节点每帧都要重建）。
+    // 复用判据（§5.6 + P10 §7.6）：`REUSABLE` + clip 上下文一致 + **烘焙偏移戳一致**（祖先滚动会
+    // 移动全部后代图元，因此偏移变化必须重建；滚动**本槽**不改变烘焙偏移 ⇒ 不重建）。
+    // **不要求** lane 存在：从未产生图元的节点没有 lane，但它的 `clip_key` 已写回，仍可整帧跳过。
     let current_key = clip.key();
-    let Some(state) = context.tree.paint_state(node, offset, current_key) else {
+    let Some(state) =
+        context
+            .tree
+            .paint_state(node, total, offset_between(total, slot_offset), current_key)
+    else {
         return Ok(());
     };
     if parent_hidden || state.hidden {
-        hide_subtree(context, node, clip, offset);
+        hide_subtree(context, node, clip, total);
         return Ok(());
     }
-    if state.reusable {
+    // 自绘节点（几何 / Canvas）必须留在屏幕坐标：`FrameOp::Geometry` 没有滚动槽、Canvas 图元
+    // 也不参与合成端平移（应用给的是绝对坐标）。它们照旧每次滚动都整条重建 —— 正确性优先。
+    let (node_slot, node_slot_offset) = if state.screen_baked {
+        (0, Point::ZERO)
+    } else {
+        (slot, slot_offset)
+    };
+    // 复用判据里的槽位一致：树结构变化会重新编号槽位（段的归属变了 ⇒ 必须重编码）。
+    let reusable = state.reusable
+        && state
+            .lane
+            .is_none_or(|lane| context.scene.lane_scroll(lane) == node_slot);
+    if reusable {
         if let Some(lane) = state.lane {
             context.order.push(lane);
             #[cfg(feature = "test-support")]
@@ -269,7 +347,15 @@ fn paint_node(
             }
         }
     } else {
-        rebuild_lane(context, node, clip, offset)?;
+        rebuild_lane(
+            context,
+            node,
+            clip,
+            total,
+            node_slot,
+            node_slot_offset,
+            boundary,
+        )?;
     }
 
     // B1：0×0 的 padding box **也要入栈**（depth+1、covering 交空）——子 lane 由此带空前缀、
@@ -281,14 +367,46 @@ fn paint_node(
         // 既不失败也不丢弃（P2-7）。
         clip.push(padding_box, context.scale);
     }
-    // 子节点的参照系：容器挂了滚动槽时，内容整体按 `offset` 上移（屏幕 = 内容 − 累计偏移）。
-    let child_offset = offset + state.scroll_offset;
+
+    // 本节点是滚动容器 ⇒ 给它的子树分配一个槽位，并把「本槽位移」从现在起从烘焙里扣掉。
+    // 槽位编号按绘制序稠密分配（树不变 ⇒ 逐帧稳定）。槽位的**屏幕裁剪区**是「容器 padding box
+    // 与全部祖先 clip 的交集」（= 刚 push 完之后的 covering），它同时是滚动 damage 与 GPU 侧
+    // 该槽全部 op 的 scissor —— 因此滚动容器的视口 clip 不再进 lane 的裁剪链。
+    let mut child_total = total;
+    let mut child_slot = node_slot;
+    let mut child_slot_offset = node_slot_offset;
+    let mut child_boundary = boundary;
+    if let Some(own) = state.scroll {
+        let viewport = clip.covering.unwrap_or_else(|| {
+            state.clip_bounds.map_or_else(
+                || PhysicalRect::new(0, 0, 0, 0),
+                |rect| rect.to_physical_covering(context.scale),
+            )
+        });
+        let index = u32::try_from(context.scroll_slots.len()).unwrap_or(u32::MAX);
+        context.scroll_slots.push((own, viewport));
+        context.scroll_slot_nodes.push(node);
+        child_total = Point::new(total.x + own.x, total.y + own.y);
+        child_slot = index;
+        child_slot_offset = own;
+        // 视口 clip 已经「花掉」：子树看到的 `clip.rects[..boundary]` 全部由屏幕裁剪区承担。
+        child_boundary = clip.rects.len();
+    }
     for index in 0..child_count {
         let child = match context.tree.get(node) {
             Ok(target) => target.children()[index],
             Err(_) => break,
         };
-        paint_node(context, child, false, clip, child_offset)?;
+        paint_node(
+            context,
+            child,
+            false,
+            clip,
+            child_total,
+            child_slot_offset,
+            child_slot,
+            child_boundary,
+        )?;
     }
     if clip_bounds.is_some() {
         clip.pop(context.scale);
@@ -298,7 +416,9 @@ fn paint_node(
 
 /// 隐藏子树：清空每条 lane（保留分配），并把旧像素并入 damage；`clip_key` 置空
 /// （再次显示时必然失配 ⇒ 重建，避免"复用空 lane"）。
-fn hide_subtree(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext, offset: Point) {
+///
+/// `total` 是完整的祖先滚动位移（damage 是屏幕坐标）；隐藏子树不产生 lane，因此不需要烘焙偏移。
+fn hide_subtree(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext, total: Point) {
     let (children, damage_rect, child_offset) = {
         let Ok(target) = context.tree.get(node) else {
             return;
@@ -314,8 +434,8 @@ fn hide_subtree(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
             damage_rect = damage_rect.union(desc.bounds);
         }
         // damage 与 bounds 都在**内容坐标**：先并集，再减祖先滚动偏移得到屏幕坐标（P10 §7.2）。
-        let damage_rect = damage_rect.translate(negate(offset));
-        let child_offset = offset
+        let damage_rect = damage_rect.translate(negate(total));
+        let child_offset = total
             + context
                 .tree
                 .scroll_slot(node)
@@ -349,11 +469,19 @@ fn hide_subtree(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
     }
 }
 
+/// 重建一条 lane（该节点本帧有变化 / 首次出现 / clip 或烘焙偏移失配）。
+///
+/// `total` = 完整祖先滚动位移（damage 用，屏幕坐标）；
+/// `slot` / `slot_offset` = 该 lane 的滚动槽位与**本槽自己的位移**（图元烘焙时扣掉它，
+/// 绘制期由 GPU 加回来；见 `paint_node` 的文档）。
 fn rebuild_lane(
     context: &mut PaintContext<'_>,
     node: NodeId,
     clip: &ClipContext,
-    offset: Point,
+    total: Point,
+    slot: u32,
+    slot_offset: Point,
+    boundary: usize,
 ) -> Result<(), EngineError> {
     #[cfg(feature = "test-support")]
     let created = context.tree.lane_of(node).is_none();
@@ -366,6 +494,11 @@ fn rebuild_lane(
         }
     };
     let _ = context.scene.clear_lane(lane);
+    // 槽位必须写进 lane：编码器据此生成 `FrameOp::Instances.scroll`，也是段复用的判据之一。
+    // `set_lane_scroll` 在槽位变化时让内容版本 +1，因此总线上不会漏掉这条 lane。
+    let _ = context.scene.set_lane_scroll(lane, slot);
+    // 烘焙偏移 = total − slot_offset（不含本槽自己的位移）。
+    let bake = offset_between(total, slot_offset);
 
     let (
         bounds,
@@ -387,8 +520,8 @@ fn rebuild_lane(
             NodeKind::Canvas(canvas) => Content::Canvas(Arc::clone(canvas)),
             NodeKind::Geometry(id) => Content::Geometry(*id),
         };
-        // 屏幕坐标 = 内容坐标 − 祖先滚动偏移（P10 §7.2）。
-        let bounds = target.layout().bounds.translate(negate(offset));
+        // 烘焙坐标 = 布局坐标 − 祖先滚动偏移（P10 §7.2；**不含本槽自己的位移**）。
+        let bounds = target.layout().bounds.translate(negate(bake));
         let patch = target.style_patch().clone();
         let spec = target.paint_spec().cloned();
         let node_damage = target.damage();
@@ -419,10 +552,25 @@ fn rebuild_lane(
 
     // 内容 clip 的层数由 `ClipContext::push` 折叠处理（达到上限时求交而不是失败），
     // 这里不需要再校验深度：8 层以上的嵌套裁剪容器会退化成一条求交后的矩形。
-    for clip_rect in &clip.rects {
+    //
+    // **坐标空间**：`ClipContext` 里的矩形是屏幕坐标（与 damage 同源），而 lane 的图元是烘焙
+    // 坐标（不含本槽位移）⇒ 压进 lane 的 clip 必须同样加上本槽位移（烘焙 = 屏幕 + slot_offset）。
+    // 两者同处烘焙空间，片元侧的 `clip_mask`（在烘焙坐标上判定）因此与图元天然一致。
+    //
+    // **槽位边界**：`clip.rects[..boundary]` 是滚动容器之外的裁剪链（含容器自己的视口）——
+    // 它在内容坐标里随滚动移动，烘焙进去就要求每滚一像素重编码全部 lane。它由槽位的屏幕
+    // 裁剪区在绘制期做每 op scissor（`FramePayload::scroll_clip`），这里必须跳过。
+    let inner_clips = if slot == 0 {
+        &clip.rects[..]
+    } else {
+        &clip.rects[boundary.min(clip.rects.len())..]
+    };
+    for clip_rect in inner_clips {
+        let mut baked = *clip_rect;
+        baked.rect = baked.rect.translate(slot_offset);
         let _ = context
             .scene
-            .push(lane, Primitive::Clip(ClipOp::Push(*clip_rect)));
+            .push(lane, Primitive::Clip(ClipOp::Push(baked)));
     }
 
     let mut emitter = PrimitiveEmitter {
@@ -436,14 +584,15 @@ fn rebuild_lane(
         content,
         emitted: 0,
         node_damage,
-        offset,
+        offset: total,
+        damage_shift: negate(slot_offset),
         ring,
         content_clip,
         geometry_transform,
     };
     emitter.emit(context);
 
-    for _ in clip.rects.iter().rev() {
+    for _ in inner_clips.iter().rev() {
         let _ = context.scene.push(lane, Primitive::Clip(ClipOp::Pop));
     }
 
@@ -453,7 +602,8 @@ fn rebuild_lane(
         .map_or(0, <[Primitive]>::len);
     context.tree.set_reusable(node);
     context.tree.set_clip_key(node, clip.key());
-    context.tree.set_lane_offset(node, offset);
+    // 烘焙偏移戳（**不含本槽位移**）：滚动本容器不改变它 ⇒ 下一帧仍可整条复用。
+    context.tree.set_lane_offset(node, bake);
     context.tree.clear_paint(node);
 
     // 「没有东西要画」的节点不留 lane（空 lane 只占绘制序/内存）：丢弃句柄并释放分配。
@@ -499,8 +649,13 @@ struct PrimitiveEmitter {
     emitted: usize,
     /// 本帧累积的节点级 damage（**内容坐标**；`touch`/`absolutize` 写入）。
     node_damage: Rect,
-    /// 该节点的祖先滚动偏移（把 `node_damage` 换算到屏幕坐标）。
+    /// 该节点的**完整**祖先滚动位移（把 `node_damage` 换算到屏幕坐标）。
     offset: Point,
+    /// 烘焙坐标 → 屏幕坐标的平移（= −本槽位移；`0` = 不在滚动容器里）。
+    ///
+    /// 图元的 `rect` 是烘焙坐标，而 damage 必须是屏幕坐标（scissor / 平台 present 都用屏幕），
+    /// 因此由 [`PrimitiveEmitter::push_damage`] 统一加上这个平移。
+    damage_shift: Point,
     /// 焦点环（仅焦点节点 + `Style.focus_ring` 时存在）。
     ring: Option<crate::paint::style::FocusRing>,
     /// 本节点几何内容的 per-draw 变换（R05-12；`Content::Geometry` 才有意义）。
@@ -576,6 +731,16 @@ impl PrimitiveEmitter {
         self.emitted += 1;
     }
 
+    /// 累积一块 damage（入参是**烘焙坐标**下的矩形：背景 / 边框 / 渐变的 `bounds` 等）。
+    ///
+    /// damage 必须留在屏幕坐标（平台 present 的脏矩形、合成线程的 scissor 都是屏幕空间），
+    /// 因此这里统一把烘焙坐标平移回屏幕：`screen = bake − 本槽位移`。
+    fn push_damage(&self, context: &mut PaintContext<'_>, bounds: Rect, aa_padding: f32) {
+        context
+            .damage
+            .push(bounds.translate(self.damage_shift), aa_padding, self.clip);
+    }
+
     fn emit(&mut self, context: &mut PaintContext<'_>) {
         let visible = self.patch.visible.unwrap_or(true);
         let opacity = match self.patch.opacity {
@@ -612,9 +777,7 @@ impl PrimitiveEmitter {
                     .max(crate::paint::instance::SHADOW_SIGMA_MIN);
                 let pad =
                     crate::paint::instance::SHADOW_PAD_SIGMAS * sigma * self.scale.factor() + 1.0;
-                context
-                    .damage
-                    .push(primitive.rect.translate(primitive.offset), pad, self.clip);
+                self.push_damage(context, primitive.rect.translate(primitive.offset), pad);
             }
         }
 
@@ -658,7 +821,7 @@ impl PrimitiveEmitter {
                         paint: QuadPaint::Gradient(gradient),
                     }),
                 );
-                context.damage.push(self.bounds, 1.0, self.clip);
+                self.push_damage(context, self.bounds, 1.0);
                 if let Some(border) = border {
                     self.push(
                         context,
@@ -684,7 +847,7 @@ impl PrimitiveEmitter {
                             paint: QuadPaint::Solid { fill, border },
                         }),
                     );
-                    context.damage.push(self.bounds, 1.0, self.clip);
+                    self.push_damage(context, self.bounds, 1.0);
                 }
             }
         }
@@ -715,7 +878,7 @@ impl PrimitiveEmitter {
                     },
                 }),
             );
-            context.damage.push(bounds, 1.0, self.clip);
+            self.push_damage(context, bounds, 1.0);
         }
 
         if self.emitted > 0 || !self.node_damage.is_empty() {
@@ -823,7 +986,7 @@ impl PrimitiveEmitter {
                     continue;
                 }
                 self.push(context, Primitive::GlyphRun(GlyphRun { color, glyphs }));
-                context.damage.push(glyph_bounds, 0.0, self.clip);
+                self.push_damage(context, glyph_bounds, 0.0);
             }
         }
     }
@@ -859,6 +1022,8 @@ mod tests {
         scene: Scene,
         damage: DamageAccumulator,
         order: Vec<LaneId>,
+        scroll_slots: Vec<(Point, PhysicalRect)>,
+        scroll_slot_nodes: Vec<crate::node::id::NodeId>,
     }
 
     impl Harness {
@@ -868,6 +1033,8 @@ mod tests {
                 scene: Scene::empty(),
                 damage: DamageAccumulator::new(scale()),
                 order: Vec::new(),
+                scroll_slots: Vec::new(),
+                scroll_slot_nodes: Vec::new(),
             }
         }
 
@@ -884,6 +1051,8 @@ mod tests {
                 frame: frame(),
                 order: &mut self.order,
                 focused: None,
+                scroll_slots: &mut self.scroll_slots,
+                scroll_slot_nodes: &mut self.scroll_slot_nodes,
                 #[cfg(feature = "test-support")]
                 log: crate::test_support::record::PaintLog::default(),
             };
@@ -934,6 +1103,110 @@ mod tests {
     fn lane_primitives(harness: &Harness, node: crate::node::id::NodeId) -> Vec<Primitive> {
         let lane = harness.tree.lane_of(node).expect("lane");
         harness.scene.lane_primitives(lane).expect("存在").to_vec()
+    }
+
+    /// **滚动合成端偏移的接线**（复审 AR4 P1-3）：滚动容器拿到稳定槽位，且**自己的**偏移不进
+    /// 图元烘焙坐标 ⇒ 滚动容器内的内容滚动时一条 lane 都不重建、图元字节一个都不动。
+    ///
+    /// 变异守卫：把 `paint_node` 里「子树的 `slot_offset` 换成容器自己的偏移」改错（例如沿用
+    /// 祖先的 `slot_offset`），本用例会看到 `rebuilt > 0` 且图元位置变了。
+    #[test]
+    fn scrolling_only_moves_the_slot_offset_not_the_lane_bytes() {
+        use crate::{
+            interaction::{ScrollAxis, ScrollSlot},
+            math::Size,
+        };
+
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let mut style = fixed_style(100.0, 100.0);
+        style.clip = Clip::Bounds;
+        let container = NodeBuilder::boxed()
+            .style(style)
+            .paint(with_white())
+            .build(&mut h.tree, root)
+            .expect("container");
+        let child = NodeBuilder::boxed()
+            .layout_override(Rect::new(0.0, 0.0, 100.0, 20.0))
+            .paint(with_white())
+            .build(&mut h.tree, container)
+            .expect("child");
+        layout_all(&mut h.tree);
+        // 与 `App::make_scroll` 写的是同一份状态（`Node.interaction.scroll`）。
+        h.tree
+            .ensure_interaction(container)
+            .expect("interaction")
+            .scroll = Some(ScrollSlot {
+            offset: Point::ZERO,
+            content: Size::new(100.0, 400.0),
+            axis: ScrollAxis::Vertical,
+            line_height: 48.0,
+        });
+        h.tree.note_scroll_container(container);
+
+        let first = h.paint();
+        assert!(first.rebuilt >= 2, "首帧两条 lane 都要建");
+        assert_eq!(h.scroll_slots.len(), 2, "槽位 0 是哨兵，滚动容器占 1");
+        assert_eq!(h.scroll_slots[1].0, Point::ZERO);
+        // 视口 = 容器的 padding box（屏幕坐标，物理化；夹具无 border）。
+        let container_box = h.tree.get(container).expect("container").layout().bounds;
+        assert_eq!(
+            h.scroll_slots[1].1,
+            PhysicalRect::new(
+                container_box.origin.x as i32,
+                container_box.origin.y as i32,
+                (container_box.origin.x + container_box.size.width) as i32,
+                (container_box.origin.y + container_box.size.height) as i32,
+            ),
+            "视口 = 容器的 padding box（物理像素）"
+        );
+        let before = lane_primitives(&h, child);
+        assert!(
+            !before
+                .iter()
+                .any(|primitive| matches!(primitive, Primitive::Clip(_))),
+            "滚动容器的视口 clip 不得烘焙进 lane：它在内容坐标里随滚动移动，烘焙进去就要求\
+             每滚一像素重编码全部 lane（改由槽位的屏幕裁剪区做每 op scissor）"
+        );
+        // 内容烘焙在**容器内容空间**：不含容器自己的滚动位移。
+        let quad_bounds = |primitives: &[Primitive]| {
+            primitives
+                .iter()
+                .find_map(|primitive| match primitive {
+                    Primitive::Quad(quad) => Some(quad.bounds),
+                    _ => None,
+                })
+                .expect("child 有背景 quad")
+        };
+        assert_eq!(
+            quad_bounds(&before),
+            h.tree.get(child).expect("child").layout().bounds,
+            "图元烘焙在容器内容空间（= 布局坐标，不含容器自己的滚动位移）"
+        );
+
+        // 滚 30 px：**不**标脏任何节点，只改滚动槽（生产路径由 `App::scroll_to` 写偏移 + 视口
+        // damage；paint pass 因为有待画 damage 而重跑）。
+        let lane = h.tree.lane_of(child).expect("child lane");
+        let version = h.scene.lane_state(lane).expect("lane").0;
+        h.tree.scroll_slot_mut(container).expect("slot").offset = Point::new(0.0, 30.0);
+        let second = h.paint();
+        assert_eq!(second.rebuilt, 0, "滚动不得重建任何 lane");
+        assert_eq!(h.scroll_slots[1].0, Point::new(0.0, 30.0), "位移进槽位表");
+        assert_eq!(
+            lane_primitives(&h, child),
+            before,
+            "滚动不得改图元字节（偏移在绘制期由 GPU 加上）"
+        );
+        assert_eq!(
+            h.scene.lane_state(lane).expect("lane").0,
+            version,
+            "图元没变 ⇒ 内容版本不得前进（否则合成端会重编码）"
+        );
+        assert_eq!(
+            h.scene.lane_scroll(lane),
+            1,
+            "lane 必须登记滚动槽 1（编码器据此生成 FrameOp::Instances.scroll）"
+        );
     }
 
     /// P2-2：几何 damage 必须用 `GeometryDesc.bounds`（真实可见范围），而不是节点布局盒。

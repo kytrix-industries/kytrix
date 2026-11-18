@@ -111,6 +111,27 @@ pub(crate) fn write<T: Clone + PartialEq + 'static>(
     }
 }
 
+/// 读旧值 → 由闭包产出新值 → 按 [`write`] 的语义写（等值短路 / 作用域已释放 ⇒ `false`）。
+///
+/// **守卫必须在 `write_owned` 之前析构**，否则这次写会撞上自己的读守卫（panic）：块作用域
+/// 保证闭包返回的那一刻守卫就 drop，随后才写。
+///
+/// # Panics
+/// 同 [`write`]（活跃读守卫 / 类型不符）。
+/// 消费者：`App::write_with`。
+pub(crate) fn write_with<T: Clone + PartialEq + 'static>(
+    app: &mut App,
+    signal: &Signal<T>,
+    body: impl FnOnce(&T) -> T,
+) -> bool {
+    let id = signal.id();
+    let value = {
+        let guard = app.store.read_owned::<T>(id);
+        body(&guard)
+    };
+    write(app, signal, value)
+}
+
 /// 原地更新一个信号（**无等值短路**：调用方声明这次修改必须生效）。
 ///
 /// 适合大对象（列表 / 图）的局部修改：不 clone 旧值、不做 `PartialEq` 比较，改完直接失效。
@@ -126,11 +147,29 @@ pub(crate) fn update<T: 'static>(
     let id = signal.id();
     match app.store.update_owned(id, update) {
         None => false, // 作用域已释放：no-op
-        Some(_) => {
+        Some(()) => {
             app.invalidate(id);
             true
         }
     }
+}
+
+/// 在闭包内就地更新一个信号并沿依赖图失效，返回闭包的返回值。
+///
+/// `None` = 作用域已释放（no-op，闭包**不会**被调用）；`Some(r)` = 已就地改完并已失效。
+///
+/// # Panics
+/// 同 [`update`]（活跃读守卫 / 类型不符）。
+/// 消费者：`App::update_with`。
+pub(crate) fn update_with<T: 'static, R>(
+    app: &mut App,
+    signal: &Signal<T>,
+    body: impl FnOnce(&mut T) -> R,
+) -> Option<R> {
+    let id = signal.id();
+    let result = app.store.update_owned(id, body)?;
+    app.invalidate(id);
+    Some(result)
 }
 
 /// 写一个瞬态值：**不**失效、**不**请求唤醒（滚动偏移/悬浮态，§3.7）。
@@ -150,6 +189,20 @@ pub(crate) fn write_transient<T: 'static>(app: &mut App, transient: &Transient<T
 #[must_use]
 pub(crate) fn read<T: 'static>(app: &App, signal: &Signal<T>) -> SignalRef<T> {
     app.store.read_owned(signal.id())
+}
+
+/// 在闭包内读一个信号：守卫在调用返回时析构（**不可逃逸**）。
+///
+/// # Panics
+/// 同 [`read`]（槽位不是普通信号）。
+/// 消费者：`App::read_with`。
+pub(crate) fn read_with<T: 'static, R>(
+    app: &App,
+    signal: &Signal<T>,
+    body: impl FnOnce(&T) -> R,
+) -> R {
+    let guard = app.store.read_owned::<T>(signal.id());
+    body(&guard)
 }
 
 /// 非追踪读一个瞬态值，返回读守卫（动画进度 / 滚动偏移的公开读取面）。
@@ -174,4 +227,301 @@ pub(crate) fn eval_stack_is_empty_for_test(app: &App) -> bool {
 #[cfg(test)]
 pub(crate) fn dependency_edge_count(app: &App) -> usize {
     app.graph.signal_count()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::Cell, panic::AssertUnwindSafe};
+
+    use crate::{
+        app::App,
+        node::{
+            builder::NodeBuilder,
+            dependency::ReadCtx,
+            dirty::DirtyFlags,
+            id::NodeId,
+            signal::{Signal, SignalScope},
+        },
+        paint::style::StylePatch,
+        window::{WindowId, WindowOptions},
+    };
+
+    /// 枚举状态机的状态（复审 §2.2 的 `match` 陷阱就出在这种类型上）。
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Mode {
+        Idle,
+        Busy,
+    }
+
+    fn new_app() -> (tokio::runtime::Runtime, App) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let app = App::new(rt.handle().clone());
+        (rt, app)
+    }
+
+    fn build_node<F>(app: &mut App, window: WindowId, bind: F) -> NodeId
+    where
+        F: Fn(&mut ReadCtx<'_>) -> StylePatch + 'static,
+    {
+        let w = app.window_mut(window).expect("窗口存在");
+        let root = w.tree().root();
+        NodeBuilder::boxed()
+            .bind_style(bind)
+            .build(w.tree_mut(), root)
+            .expect("挂载成功")
+    }
+
+    fn dirty(app: &App, window: WindowId, node: NodeId) -> DirtyFlags {
+        app.window(window)
+            .expect("窗口存在")
+            .tree()
+            .get(node)
+            .expect("节点存在")
+            .dirty()
+    }
+
+    fn clear_dirty(app: &mut App, window: WindowId) {
+        app.window_mut(window)
+            .expect("窗口存在")
+            .tree_mut()
+            .clear_all_dirty_for_test();
+    }
+
+    fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                payload
+                    .downcast_ref::<&'static str>()
+                    .map(|text| (*text).to_owned())
+            })
+            .unwrap_or_default()
+    }
+
+    // ── read_with：守卫不逃逸 ──────────────────────────────────────────────
+
+    #[test]
+    fn read_with_returns_the_closure_value_and_drops_the_guard_immediately() {
+        let (_rt, mut app) = new_app();
+        let signal: Signal<String> = app.signal(String::from("BTC"));
+
+        // 返回值与守卫的寿命无关：非 Copy 的返回值（String）也能从闭包里带出来。
+        let shout = app.read_with(&signal, |value| format!("{value}!"));
+        assert_eq!(shout, "BTC!", "组合子必须把闭包返回值原样透出");
+        assert_eq!(&*app.read(&signal), "BTC");
+
+        // 守卫没有泄漏到调用点：紧接着写同一个信号不 panic
+        // （手写 `let g = app.read(&signal); ... app.write(..)` 会 panic）。
+        assert!(
+            app.write(&signal, String::from("ETH")),
+            "read_with 返回后守卫必须已析构 ⇒ 写同一信号不得 panic"
+        );
+        assert!(app.update(&signal, |value| value.push('!')));
+        assert_eq!(&*app.read(&signal), "ETH!");
+    }
+
+    // ── update_with：返回值 + 失效 + 无等值短路 ────────────────────────────
+
+    #[test]
+    fn update_with_returns_the_closure_value_and_invalidates() {
+        let (_rt, mut app) = new_app();
+        let signal: Signal<Vec<u32>> = app.signal(vec![1, 2, 3]);
+        let window = app.create_window(WindowOptions::default());
+        let node = build_node(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
+            opacity: Some((*cx.read(&signal)).len() as f32),
+            ..StylePatch::default()
+        });
+        app.refresh_styles(window).expect("窗口存在");
+        assert_eq!(
+            app.dependency_edge_count_for_test(),
+            1,
+            "节点对该信号有一条依赖边"
+        );
+        clear_dirty(&mut app, window);
+        let _ = app.take_wake_request();
+
+        // Some(r)：闭包的返回值被透出；值就地改完；读者被标脏并请求唤醒。
+        let len = app.update_with(&signal, |values| {
+            values.push(4);
+            values.len()
+        });
+        assert_eq!(len, Some(4), "Some(r) = 闭包返回值，且修改已就地生效");
+        assert_eq!(*app.read(&signal), vec![1, 2, 3, 4]);
+        assert!(
+            dirty(&app, window, node).contains(DirtyFlags::PAINT),
+            "update_with 必须沿依赖图失效"
+        );
+        assert!(app.take_wake_request(), "有节点被标脏 ⇒ 必须请求唤醒");
+        assert_eq!(
+            app.dependency_edge_count_for_test(),
+            1,
+            "失效不得删除依赖边"
+        );
+
+        // 无等值短路：写回**相同的值**也返回 Some 并再次失效（与 `update` 同口径）。
+        clear_dirty(&mut app, window);
+        let _ = app.take_wake_request();
+        let same = app.update_with(&signal, |values| {
+            *values = vec![1, 2, 3, 4];
+            values.len()
+        });
+        assert_eq!(same, Some(4), "update_with 没有等值短路");
+        assert!(
+            dirty(&app, window, node).contains(DirtyFlags::PAINT),
+            "等值也必须失效（无等值短路是 update 的公开语义）"
+        );
+    }
+
+    // ── update_with：已释放作用域是 no-op ─────────────────────────────────
+
+    #[test]
+    fn update_with_is_a_noop_on_a_released_scope() {
+        let (_rt, mut app) = new_app();
+        let scope: SignalScope = app.signal_scope();
+        let signal: Signal<u32> = app.signal_scoped(scope, 7);
+        assert_eq!(app.release_scope(scope), 1, "作用域释放成功");
+
+        let called = Cell::new(false);
+        let result = app.update_with(&signal, |value| {
+            called.set(true);
+            *value += 1;
+        });
+        assert_eq!(
+            result, None,
+            "作用域已释放 ⇒ None（与 `update` 返回 false 同义）"
+        );
+        assert!(!called.get(), "no-op 不得调用闭包（一次借用都不做）");
+        assert_eq!(*app.read(&signal), 7, "值被冻结（写没有生效）");
+    }
+
+    // ── write_with：新值由旧值派生 + 等值短路 ─────────────────────────────
+
+    #[test]
+    fn write_with_produces_the_new_value_from_the_old_one() {
+        let (_rt, mut app) = new_app();
+        let signal: Signal<u32> = app.signal(10);
+        let window = app.create_window(WindowOptions::default());
+        let node = build_node(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
+            opacity: Some(*cx.read(&signal) as f32),
+            ..StylePatch::default()
+        });
+        app.refresh_styles(window).expect("窗口存在");
+        clear_dirty(&mut app, window);
+        let _ = app.take_wake_request();
+
+        // 不同 ⇒ true（并失效）。闭包拿到的是**旧值**；守卫必须在写之前析构，否则这里就 panic。
+        let seen = Cell::new(0u32);
+        assert!(
+            app.write_with(&signal, |old| {
+                seen.set(*old);
+                old + 5
+            }),
+            "值变化 ⇒ true"
+        );
+        assert_eq!(seen.get(), 10, "闭包必须拿到旧值");
+        assert_eq!(*app.read(&signal), 15);
+        assert!(
+            dirty(&app, window, node).contains(DirtyFlags::PAINT),
+            "值变化必须沿依赖图失效"
+        );
+
+        // 等值 ⇒ false（短路：不失效、不唤醒），且不 panic。
+        clear_dirty(&mut app, window);
+        let _ = app.take_wake_request();
+        assert!(
+            !app.write_with(&signal, |old| *old),
+            "等值 ⇒ false（与 `write` 的等值短路同义）"
+        );
+        assert!(
+            !dirty(&app, window, node).contains(DirtyFlags::PAINT),
+            "等值短路不得失效"
+        );
+        assert!(!app.take_wake_request(), "等值短路不得请求唤醒");
+        assert_eq!(*app.read(&signal), 15);
+    }
+
+    // ── match 陷阱：复审 §2.2 的两个写法 ──────────────────────────────────
+
+    #[test]
+    fn the_match_scrutinee_guard_panics_on_write_but_update_with_does_not() {
+        let (_rt, mut app) = new_app();
+        let signal: Signal<Mode> = app.signal(Mode::Idle);
+
+        // ① 复审实测的写法：`match` 的 scrutinee 临时量活到**整个 match** 结束，
+        //    分支里的写撞上仍然存活的读守卫 ⇒ 必 panic（编译期无法提醒）。
+        let payload = std::panic::catch_unwind(AssertUnwindSafe(|| match *app.read(&signal) {
+            Mode::Idle => app.write(&signal, Mode::Busy),
+            Mode::Busy => false,
+        }))
+        .expect_err("match 头的读守卫存活期间写同一信号必须 panic");
+        let message = panic_message(payload);
+        assert!(
+            message.contains("SignalRef read guard"),
+            "panic 必须点名读守卫（可诊断）：{message}"
+        );
+        assert_eq!(*app.read(&signal), Mode::Idle, "冲突的写不得生效");
+
+        // 对照：`if` 条件是 terminating scope ⇒ 同样的「读 + 写」不 panic。
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                if *app.read(&signal) == Mode::Idle {
+                    app.update(&signal, |mode| *mode = Mode::Busy);
+                }
+            }))
+            .is_ok(),
+            "if 条件的临时守卫在进入 body 之前析构"
+        );
+        assert_eq!(*app.read(&signal), Mode::Busy);
+
+        // ② 正确写法：把 match 搬进 `update_with` 的闭包 —— 闭包拿 `&mut Mode`，没有读守卫，
+        //    因此不 panic 且值真的更新。枚举状态机的最自然写法也能这么写。
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            app.update_with(&signal, |mode| match *mode {
+                Mode::Idle => *mode = Mode::Busy,
+                Mode::Busy => *mode = Mode::Idle,
+            })
+        }));
+        assert!(result.is_ok(), "update_with 消灭 match 陷阱");
+        assert_eq!(
+            result.expect("不 panic"),
+            Some(()),
+            "update_with 返回闭包的值"
+        );
+        assert_eq!(
+            *app.read(&signal),
+            Mode::Idle,
+            "闭包里的 match 已完成状态迁移"
+        );
+    }
+
+    /// 陷阱的根因是**外层读守卫**，不是写入口的 API：即使分支里改用 `update_with`，
+    /// 只要读守卫仍在 `match` 头里活着，就地写同样会 panic（组合子不能隔着外层守卫工作）。
+    /// 正确做法只有两条：把读搬进闭包，或在 `match` 之前把值取出来（`let mode = *cx.read(&s);`）。
+    #[test]
+    fn the_trap_lives_in_the_outer_guard_not_in_the_write_api() {
+        let (_rt, mut app) = new_app();
+        let signal: Signal<Mode> = app.signal(Mode::Idle);
+
+        let payload = std::panic::catch_unwind(AssertUnwindSafe(|| match *app.read(&signal) {
+            Mode::Idle => app.update_with(&signal, |mode| *mode = Mode::Busy),
+            Mode::Busy => None,
+        }))
+        .expect_err("外层 match 的读守卫仍存活 ⇒ update_with 同样 panic");
+        assert!(
+            panic_message(payload).contains("SignalRef read guard"),
+            "panic 必须点名读守卫"
+        );
+        assert_eq!(*app.read(&signal), Mode::Idle, "冲突的写不得生效");
+
+        // 先把值 Copy 出来（守卫在那条语句结束时析构）⇒ 之后的写安全。
+        let mode = *app.read(&signal);
+        match mode {
+            Mode::Idle => assert!(app.write(&signal, Mode::Busy)),
+            Mode::Busy => panic!("初始值必须是 Idle"),
+        }
+        assert_eq!(*app.read(&signal), Mode::Busy);
+    }
 }

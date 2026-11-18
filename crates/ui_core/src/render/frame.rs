@@ -38,7 +38,10 @@ pub(crate) struct InstanceChunk {
 
 impl InstanceChunk {
     /// 本块覆盖的实例区间。
-    fn range(&self) -> Range<u32> {
+    ///
+    /// 跨模块可见（`pub(crate)`）：`compose` 的全量协议用例要断言「重建后的载荷是一块覆盖
+    /// 整张实例环的整块」，块外的代码只能从这里读区间（字段是模块私有的）。
+    pub(crate) fn range(&self) -> Range<u32> {
         self.start..self.start + (self.bytes.len() / INSTANCE_BYTES) as u32
     }
 
@@ -75,6 +78,13 @@ pub(crate) struct FramePayload {
     /// 表很小（槽数 × 8 B）且每帧全量过线：滚动帧因此**不产生任何实例块**（`chunks` 为空），
     /// GPU 线程只在绘制这些 op 时把偏移写进 root constant，实例字节一个都不用动。
     scroll: Vec<[f32; 2]>,
+    /// 滚动槽的**屏幕裁剪区**（`[x0, y0, x1, y1]`，物理像素；下标同上）。
+    ///
+    /// 滚动容器自己的视口 clip 不能烘焙进实例的裁剪链：它随滚动偏移在**内容坐标**里移动
+    /// （见 `ScrollTable` 的坐标系约定），烘焙进去就等于「每滚一像素都要重编码全部 lane」。
+    /// 因此它在 CPU 侧被折成这个**屏幕空间**的矩形，三个后端在绘制该槽的 op 时把 scissor
+    /// 收窄到它（裁剪精度与烘焙 clip 相同：两者都是轴对齐矩形）。
+    scroll_clip: Vec<[i32; 4]>,
 }
 
 impl FramePayload {
@@ -82,7 +92,11 @@ impl FramePayload {
     ///
     /// # Panics
     /// `InstanceBuffer` 的实例数与变化区间不一致（编码器不变量被破坏）。
-    pub(crate) fn from_buffer_delta(buffer: &mut InstanceBuffer, scroll: Vec<[f32; 2]>) -> Self {
+    pub(crate) fn from_buffer_delta(
+        buffer: &mut InstanceBuffer,
+        scroll: Vec<[f32; 2]>,
+        scroll_clip: Vec<[i32; 4]>,
+    ) -> Self {
         let mut buffers = pool_lock().pop().unwrap_or_default();
         buffers.chunks.clear();
         let count = buffer.instance_count();
@@ -104,6 +118,7 @@ impl FramePayload {
         buffers.geometry.clear();
         buffers.geometry.extend_from_slice(buffer.geometry());
         buffers.scroll = scroll;
+        buffers.scroll_clip = scroll_clip;
         Self {
             chunks: buffers.chunks,
             instance_count: count,
@@ -112,6 +127,7 @@ impl FramePayload {
             clips: buffers.clips,
             geometry: buffers.geometry,
             scroll: buffers.scroll,
+            scroll_clip: buffers.scroll_clip,
         }
     }
 
@@ -119,7 +135,11 @@ impl FramePayload {
     ///
     /// 生产路径要用它：合成线程整帧重建时**必须**整块重发实例缓冲，否则 GPU 侧的实例镜像
     /// 缺内容（它只被载荷填满）。取走全量之后变化区间清零 —— 那些变化已经包含在全量块里。
-    pub(crate) fn full(buffer: &InstanceBuffer, scroll: Vec<[f32; 2]>) -> Self {
+    pub(crate) fn full(
+        buffer: &InstanceBuffer,
+        scroll: Vec<[f32; 2]>,
+        scroll_clip: Vec<[i32; 4]>,
+    ) -> Self {
         let mut buffers = pool_lock().pop().unwrap_or_default();
         buffers.chunks.clear();
         let count = buffer.instance_count();
@@ -136,6 +156,7 @@ impl FramePayload {
         buffers.geometry.clear();
         buffers.geometry.extend_from_slice(buffer.geometry());
         buffers.scroll = scroll;
+        buffers.scroll_clip = scroll_clip;
         Self {
             chunks: buffers.chunks,
             instance_count: count,
@@ -144,6 +165,7 @@ impl FramePayload {
             clips: buffers.clips,
             geometry: buffers.geometry,
             scroll: buffers.scroll,
+            scroll_clip: buffers.scroll_clip,
         }
     }
 
@@ -209,6 +231,13 @@ impl FramePayload {
         &self.scroll
     }
 
+    /// 滚动槽的屏幕裁剪区（`[x0, y0, x1, y1]` 物理像素，下标同上）。
+    ///
+    /// 消费者：三个后端的 `draw_ops`（该槽的 op 在绘制前把 scissor 收窄到它）；缺省/越界 ⇒ 不收窄。
+    pub(crate) fn scroll_clip(&self) -> &[[i32; 4]] {
+        &self.scroll_clip
+    }
+
     /// 本帧交给 GPU 的实例字节数（增量载荷 = 变化段；`FrameRecord.uploaded_bytes`）。
     #[cfg(feature = "test-support")]
     pub(crate) fn uploaded_bytes(&self) -> usize {
@@ -231,6 +260,7 @@ impl FramePayload {
             clips: Vec::new(),
             geometry: Vec::new(),
             scroll: Vec::new(),
+            scroll_clip: Vec::new(),
         }
     }
 }
@@ -243,6 +273,7 @@ struct PayloadBuffers {
     clips: Vec<GpuClipEntry>,
     geometry: Vec<GeometryDrawGpu>,
     scroll: Vec<[f32; 2]>,
+    scroll_clip: Vec<[i32; 4]>,
 }
 
 /// 回收池上限：最多缓存 4 帧的缓冲（GPU 线程通常只压着一帧，4 个足够且封顶内存）。
@@ -270,6 +301,7 @@ impl Drop for FramePayload {
             && self.clips.capacity() == 0
             && self.geometry.capacity() == 0
             && self.scroll.capacity() == 0
+            && self.scroll_clip.capacity() == 0
         {
             return;
         }
@@ -283,6 +315,7 @@ impl Drop for FramePayload {
             clips: std::mem::take(&mut self.clips),
             geometry: std::mem::take(&mut self.geometry),
             scroll: std::mem::take(&mut self.scroll),
+            scroll_clip: std::mem::take(&mut self.scroll_clip),
         });
     }
 }
@@ -358,6 +391,17 @@ pub(crate) trait FrameSink: Send + Sync {
 
     /// GPU 线程是否还活着（合成线程据此跳过已死的窗口）。
     fn is_alive(&self) -> bool;
+
+    /// 渲染器重建代际：GPU 侧每次重建实例镜像（设备恢复 / 新渲染器挂上）就 +1。
+    ///
+    /// UI 线程在每帧开始前读它；值变了 ⇒ 那一帧必须整帧发布（`SceneDelta::full`），因为
+    /// GPU 侧的 [`InstanceMirror`] 已经被清空 —— 增量载荷只会填它「变化」的段，其余段会画成
+    /// 退化实例（AR4 P1-1）。装配点见 [`ResyncGate`]。
+    ///
+    /// 默认 `0` = 该后端没有进程内重建路径（Linux / macOS 目前只有建窗口一次）。
+    fn reset_epoch(&self) -> u64 {
+        0
+    }
 }
 
 /// GPU 线程 → UI 线程的一帧反馈（§4.1）。
@@ -427,6 +471,40 @@ impl LatestFrame {
     /// 是否有未取走的帧。
     pub(crate) fn has_pending(&self) -> bool {
         self.pending.is_some()
+    }
+}
+
+/// 「消费端重置 ⇒ 生产端整帧重发」握手的 UI 侧存根（AR4 P1-1 / P2-2）。
+///
+/// GPU 线程每次重建实例镜像（设备恢复 / 新渲染器挂上）就把 [`FrameSink::reset_epoch`] +1；
+/// UI 线程每帧开始前 [`ResyncGate::observe`] 一次该代际，返回 `true` 的那一帧必须整帧发布
+/// （`DeltaBuilder::force_full` ⇒ `delta.full = true` ⇒ 载荷是覆盖整张实例环的整块）。
+///
+/// 没有这个握手，恢复后的第一帧只会发「变化 lane」，而镜像里其余段是 0 ⇒ 退化实例。
+/// 纯数据 + 纯逻辑：三个后端共用，不碰任何平台句柄。
+#[derive(Debug, Default)]
+pub(crate) struct ResyncGate {
+    /// 上次观察到的代际；`None` = 还没有观察过（UI 线程第一次读）。
+    seen: Option<u64>,
+}
+
+impl ResyncGate {
+    /// 观察一次渲染器重建代际；返回 `true` = 自上次观察以来重建过（本帧必须整帧发布）。
+    ///
+    /// 首次观察只记录代际并返回 `false`：**首帧本来就是整帧发布**（`DeltaBuilder::full_for`
+    /// 在合成侧还没有任何 lane 时返回真），这里再强制一次只会重复劳动。
+    pub(crate) fn observe(&mut self, epoch: u64) -> bool {
+        match self.seen {
+            None => {
+                self.seen = Some(epoch);
+                false
+            }
+            Some(seen) if seen == epoch => false,
+            Some(_) => {
+                self.seen = Some(epoch);
+                true
+            }
+        }
     }
 }
 
@@ -727,7 +805,7 @@ mod tests {
 
     use super::{
         FramePayload, FrameRequest, FrameSlot, InFlightRing, InstanceChunk, InstanceMirror,
-        LatestFrame, MAX_FRAMES_IN_FLIGHT, pool_lock,
+        LatestFrame, MAX_FRAMES_IN_FLIGHT, ResyncGate, pool_lock,
     };
     use crate::{
         math::PhysicalRect,
@@ -760,7 +838,7 @@ mod tests {
 
         // 载荷构造 / 丢弃在池的任意状态下都必须是安全的（容量复用是优化，不是正确性）。
         let encoder = InstanceEncoder::new();
-        let payload = FramePayload::full(encoder.buffer(), Vec::new());
+        let payload = FramePayload::full(encoder.buffer(), Vec::new(), Vec::new());
         assert_eq!(payload.instance_count(), 0);
         drop(payload);
     }
@@ -1076,6 +1154,7 @@ mod tests {
             clips: Vec::new(),
             geometry: Vec::new(),
             scroll: Vec::new(),
+            scroll_clip: Vec::new(),
         }
     }
 
@@ -1203,5 +1282,32 @@ mod tests {
         mirror.invalidate(0);
         assert!(mirror.prepare(0, &idle), "重构过的槽必须整块重写");
         mirror.finish(0);
+    }
+
+    /// AR4 P1-1 握手（`FrameSink::reset_epoch` 的 UI 侧存根）：只有**代际变化**的那一帧报告
+    /// 「必须整帧重发」，而且只报告一次。
+    ///
+    /// 首次观察必须返回 `false`：首帧本来就是整帧发布，重复强制只会让首帧多做一次全量编码。
+    /// 同一代际的后续帧必须返回 `false`：否则每一帧都会退化成全量发布（增量协议失效）。
+    #[test]
+    fn the_resync_gate_reports_a_rebuild_only_once() {
+        let mut gate = ResyncGate::default();
+        assert!(!gate.observe(0), "首次观察只记录代际（首帧本来就全量）");
+        assert!(!gate.observe(0), "代际没变不得要求整帧重发");
+
+        // 设备恢复：GPU 侧重建镜像 ⇒ 代际 +1 ⇒ 下一帧必须整帧重发。
+        assert!(gate.observe(1), "代际变化必须报告一次「本帧整帧发布」");
+        assert!(!gate.observe(1), "同一个新代际只报告一次（下一帧回到增量）");
+
+        // 连续两次重建（恢复后再次 TDR）：两个新代际各报告一次。
+        assert!(gate.observe(2));
+        assert!(!gate.observe(2));
+        // 代际回到一个旧值也必须报告（判据是「与上次观察不同」，不是「更大」）。
+        assert!(gate.observe(1));
+        assert!(!gate.observe(1));
+        // 代际为 0 的默认后端（Linux / macOS）：永远不强制（首帧之后全走增量）。
+        let mut stateless = ResyncGate::default();
+        assert!(!stateless.observe(0));
+        assert!(!stateless.observe(0));
     }
 }

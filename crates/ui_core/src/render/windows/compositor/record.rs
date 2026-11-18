@@ -29,7 +29,7 @@ use crate::{
     paint::{
         atlas::AtlasKind,
         geometry::GeometryPipeline,
-        instance::{FrameOp, GeometryDrawGpu, PhysicalBounds},
+        instance::{FrameOp, GeometryDrawGpu, PhysicalBounds, scroll_offset},
     },
     render::{
         RenderStats,
@@ -469,7 +469,9 @@ pub(super) fn record(
                     root,
                     content,
                 );
-                recorder.buckets.build(payload.ops(), &damage);
+                recorder
+                    .buckets
+                    .build(payload.ops(), &damage, payload.scroll());
                 for rect in damage.as_slice() {
                     let scissor = RECT {
                         left: rect.x0,
@@ -604,7 +606,11 @@ impl OpBuckets {
     /// 按本帧的（已夹紧）damage 重建分桶。`rects` 最多 `MAX_DRAW_PASSES` 个。
     ///
     /// 内层 `Vec` 跨帧保留容量（稳态零分配）：每帧只做「op × 矩形」整数相交。
-    fn build(&mut self, ops: &[FrameOp], damage: &DamageRects) {
+    ///
+    /// `scroll` = 本帧的滚动偏移表（`FramePayload::scroll`）：op 的 `bounds` 是**烘焙坐标**
+    /// （不含滚动偏移），求交前必须按本 op 的槽位平移到屏幕坐标，否则滚动帧会把本该绘制的
+    /// op 提前剔掉（横向滚动尤其明显）。
+    fn build(&mut self, ops: &[FrameOp], damage: &DamageRects, scroll: &[[f32; 2]]) {
         let rects = damage.as_slice();
         self.buckets.truncate(rects.len());
         self.buckets
@@ -620,7 +626,11 @@ impl OpBuckets {
             };
             slot.1.clear();
             for (index, op) in ops.iter().enumerate() {
-                if op.bounds().intersects(extent) {
+                if op
+                    .bounds()
+                    .translated(scroll_offset(scroll, *op))
+                    .intersects(extent)
+                {
                     slot.1.push(index as u32);
                 }
             }
@@ -676,8 +686,10 @@ pub(super) fn draw_ops(
             continue;
         };
         // 整帧路径没有分桶：仍然按 scissor 过滤（整帧 scissor = 内容，恒命中）。
+        // op 的 bounds 是烘焙坐标 ⇒ 先按本 op 的滚动槽平移到屏幕坐标。
         if !op
             .bounds()
+            .translated(scroll_offset(payload.scroll(), *op))
             .intersects([scissor.left, scissor.top, scissor.right, scissor.bottom])
         {
             continue;
@@ -700,6 +712,27 @@ pub(super) fn draw_ops(
                     .copied()
                     .unwrap_or([0.0, 0.0]);
                 let uniform = root.with_instance_base(start).with_scroll(scroll_offset);
+                // 滚动槽的屏幕裁剪区：容器视口 clip 不进实例裁剪链（见 `paint/pass.rs`），
+                // 这里把 scissor 收窄到它 —— 否则滚动内容会画到容器外。
+                let narrowed = crate::paint::instance::scrolled_scissor(
+                    payload.scroll_clip(),
+                    scroll,
+                    [scissor.left, scissor.top, scissor.right, scissor.bottom],
+                );
+                if let Some(rect) = narrowed {
+                    if rect[0] >= rect[2] || rect[1] >= rect[3] {
+                        // 完全被容器视口裁掉：本 op 一个像素都不该画。
+                        continue;
+                    }
+                    let narrow = RECT {
+                        left: rect[0],
+                        top: rect[1],
+                        right: rect[2],
+                        bottom: rect[3],
+                    };
+                    // SAFETY: 收窄后的矩形是帧 scissor 与该槽屏幕裁剪区的交集（都在目标内）。
+                    unsafe { list.RSSetScissorRects(&[narrow]) };
+                }
                 // SAFETY: PSO / 根常量 / 拓扑 / scissor 都属于同一条已打开的 list。
                 unsafe {
                     if last_pipeline != Some(PsoTag::Quad) {
@@ -720,6 +753,10 @@ pub(super) fn draw_ops(
                 // SAFETY: 4 顶点 TriangleStrip + 实例区间 [0, len) 已在编码期校验；
                 // 段起点由 shader 侧的 `draw.clip.y` 承担。
                 unsafe { list.DrawInstanced(4, len, 0, 0) };
+                if narrowed.is_some() {
+                    // SAFETY: 恢复本趟 damage 矩形的 scissor（同一份 `RECT`）。
+                    unsafe { list.RSSetScissorRects(&[scissor]) };
+                }
                 draw_calls = draw_calls.saturating_add(1);
             }
             FrameOp::Geometry {

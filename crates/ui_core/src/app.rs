@@ -682,6 +682,26 @@ impl App {
         signal_api::write(self, signal, value)
     }
 
+    /// 「先从旧值算出新值，再按 [`App::write`] 的语义写」：`true` = 值变了并已沿依赖图失效。
+    ///
+    /// 读旧值与写新值在同一次调用内完成：读守卫在算出新值的那条语句末尾就析构，**之后**才写，
+    /// 因此不会撞上自己的守卫（手写的 `let guard = read(); ...; write()` 会在这一步 panic）。
+    /// 返回值与 [`App::write`] 一致：`false` = 等值短路 **或**该信号的作用域已释放（no-op）。
+    ///
+    /// 适合「新值 = f(旧值)」的派生写。**组合子消灭了 `match` 陷阱**：
+    /// `cx.write_with(&s, |mode| match *mode { .. })` 不必先把值拷贝出来
+    /// （见 `node::signal` 的 [`SignalRef`] 文档〈三种自然写法与 `match` 陷阱〉）。
+    ///
+    /// # Panics
+    /// 该信号存在活跃 [`SignalRef`] 读守卫（见 `node::signal` 模块文档的借用规则）/ 类型不符。
+    pub fn write_with<T: Clone + PartialEq + 'static>(
+        &mut self,
+        signal: &Signal<T>,
+        body: impl FnOnce(&T) -> T,
+    ) -> bool {
+        signal_api::write_with(self, signal, body)
+    }
+
     /// 原地更新一个信号（**无等值短路**；适合大对象的局部修改）。
     ///
     /// 与 [`App::write`] 的差别：不 clone 旧值、不做 `PartialEq` 比较，闭包改完直接沿依赖图失效。
@@ -691,6 +711,27 @@ impl App {
     /// 该信号存在活跃读守卫 / 类型不符。
     pub fn update<T: 'static>(&mut self, signal: &Signal<T>, update: impl FnOnce(&mut T)) -> bool {
         signal_api::update(self, signal, update)
+    }
+
+    /// 在闭包内**就地**更新一个信号并沿依赖图失效，返回闭包的返回值（**无等值短路**）。
+    ///
+    /// 返回 `None` = 该信号的作用域已释放（no-op，闭包不会被调用，与 [`App::update`] 返回
+    /// `false` 同义）；`Some(r)` = 已就地改完并已沿依赖图失效。
+    ///
+    /// 与 [`App::update`] 的差别只有一个：闭包在**一次借用**内完成「看旧值 ⇒ 改值」，中间不会
+    /// 产生 [`SignalRef`] 读守卫。**组合子消灭了 `match` 陷阱** —— 枚举状态机的自然写法
+    /// `cx.update_with(&s, |mode| match *mode { .. })` 永远是安全的，而
+    /// `match *cx.read(&s) { A => cx.write(&s, ..), .. }` 必 panic（见 `node::signal` 的
+    /// [`SignalRef`] 文档〈三种自然写法与 `match` 陷阱〉）。
+    ///
+    /// # Panics
+    /// 该信号存在活跃 [`SignalRef`] 读守卫 / 类型不符（与 [`App::update`] 同口径）。
+    pub fn update_with<T: 'static, R>(
+        &mut self,
+        signal: &Signal<T>,
+        body: impl FnOnce(&mut T) -> R,
+    ) -> Option<R> {
+        signal_api::update_with(self, signal, body)
     }
 
     /// 写一个瞬态值：**不**失效、**不**请求唤醒（滚动偏移/悬浮态，§3.7）。
@@ -822,6 +863,22 @@ impl App {
     #[must_use]
     pub fn read<T: 'static>(&self, signal: &Signal<T>) -> SignalRef<T> {
         signal_api::read(self, signal)
+    }
+
+    /// 在闭包内读一个信号并返回闭包的返回值（零拷贝）；读守卫在**返回时**析构。
+    ///
+    /// 与 [`App::read`] 的差别只在守卫的寿命：这里的守卫活不过这次调用，闭包拿到的 `&T` 不能
+    /// 逃逸（返回值 `R` 与守卫的生命周期无关）。因此**结构上不可能**在闭包内写同一个信号，
+    /// 调用点之后也不会残留守卫（不会踩到「守卫活过读取语句 ⇒ 后续写 panic」）。
+    ///
+    /// 需要「读了就写」请用 [`App::update_with`] / [`App::write_with`]——
+    /// **组合子消灭了 `match` 陷阱**（见 `node::signal` 的 [`SignalRef`] 文档
+    /// 〈三种自然写法与 `match` 陷阱〉）。
+    ///
+    /// # Panics
+    /// `signal` 的槽位不是普通信号（引擎不变量被破坏时才会发生）。
+    pub fn read_with<T: 'static, R>(&self, signal: &Signal<T>, body: impl FnOnce(&T) -> R) -> R {
+        signal_api::read_with(self, signal, body)
     }
 
     /// 覆盖输入阈值（平台层用 `GetDoubleClickTime` / `SM_CXDRAG` 初始化；测试也可显式设置）。

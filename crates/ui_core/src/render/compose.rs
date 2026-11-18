@@ -136,16 +136,18 @@ impl WindowComposer {
         }
         let mut scroll_payload = Vec::new();
         self.scroll.to_payload(scale, &mut scroll_payload);
+        let mut scroll_clip = Vec::new();
+        self.scroll.viewports_to_payload(&mut scroll_clip);
         // 整帧重建（首帧 / DPI 变化 / 新渲染器挂上）必须发**整块**实例缓冲：GPU 侧的实例镜像
         // 只会被载荷填满，不发全量它就永远缺内容（`InstanceMirror` 的 `needs_full` 只是「整块
         // 写镜像」，镜像本身仍要靠载荷喂）。
         let payload = if delta.full {
-            let payload = FramePayload::full(self.encoder.buffer(), scroll_payload);
+            let payload = FramePayload::full(self.encoder.buffer(), scroll_payload, scroll_clip);
             // 全量块已经包含全部变化 ⇒ 变化区间清零（否则下一次增量会把它们再发一遍）。
             self.encoder.buffer_mut().clear_changes();
             payload
         } else {
-            FramePayload::from_buffer_delta(self.encoder.buffer_mut(), scroll_payload)
+            FramePayload::from_buffer_delta(self.encoder.buffer_mut(), scroll_payload, scroll_clip)
         };
         Ok(ComposedFrame {
             plan,
@@ -172,6 +174,7 @@ mod tests {
         render::{
             compositor::{DamageRects, Plan},
             delta::{DeltaBuilder, FrameHeader, SceneDelta},
+            frame::{InstanceMirror, MAX_FRAMES_IN_FLIGHT},
         },
         window::{FrameIndex, WindowId},
     };
@@ -245,6 +248,21 @@ mod tests {
             delta
         }
 
+        /// 走**生产路径**采一帧：`full` 由 builder 自己的信号推出（首帧 / DPI 变化 /
+        /// [`DeltaBuilder::force_full`]），而不是由调用方直接指定。
+        ///
+        /// 全量协议用例必须走这条路径：只有它能让「把消费端重置信号去掉 ⇒ 这一帧退化成增量」
+        /// 的变异真正反映到载荷上（[`Fixture::frame`] 的调用方直接给 `full`，测不出信号链）。
+        fn frame_with_signals(&mut self, plan: Plan) -> SceneDelta {
+            let index = self.next;
+            self.next += 1;
+            let mut delta = SceneDelta::empty(header(index, plan, Scale::ONE));
+            let full = self.builder.full_for(Scale::ONE);
+            self.builder
+                .collect(&mut self.scene, &self.store, &[], full, &mut delta);
+            delta
+        }
+
         fn compose(&mut self, delta: &SceneDelta) -> super::ComposedFrame {
             self.composer
                 .compose(delta, ColorResolver)
@@ -291,6 +309,11 @@ mod tests {
         let first = fixture.compose(&delta);
         assert_eq!(first.stats.encoded_lanes, 4);
         assert!(first.payload.scroll().is_empty() || first.payload.scroll()[0] == [0.0, 0.0]);
+        assert_eq!(
+            fixture.composer.encoder.fast_encodes(),
+            0,
+            "首帧走全量扫描，不计入增量快路径"
+        );
 
         let delta = fixture.frame(Plan::Idle, false, &[(Point::new(0.0, -20.0), viewport)]);
         assert!(
@@ -299,12 +322,24 @@ mod tests {
         );
         let scrolled = fixture.compose(&delta);
         assert_eq!(scrolled.stats.encoded_lanes, 0, "滚动帧不得重编码任何 lane");
+        // 门禁 `lanes_changed || delta.full || needs_reset` 为假 ⇒ 压根不进入 `encode()`。
+        // `encode()` 一旦被调用，即使走增量快路径也会让 `fast_encodes` +1 —— 所以这条断言
+        // 守的是门禁本身（复审 §7 的 M6/M11：把门禁改成 `if true` 时本用例必须失败）。
+        assert_eq!(
+            fixture.composer.encoder.fast_encodes(),
+            0,
+            "滚动帧不得进入编码器（门禁为假时 encode 根本不该被调用）"
+        );
         assert_eq!(scrolled.stats.reused_segments, 4);
         assert!(
             scrolled.payload.chunks().is_empty(),
             "滚动帧的载荷不得带实例块"
         );
-        assert_eq!(scrolled.payload.scroll()[0], [0.0, -20.0], "偏移进载荷");
+        assert_eq!(
+            scrolled.payload.scroll()[0],
+            [0.0, 20.0],
+            "偏移进载荷：绘制期平移量 = −位移（逻辑滚动 -20 ⇒ +20 物理像素）"
+        );
         // damage 必须覆盖视口（否则 GPUs 侧 scissor 会把整帧裁掉）。
         let Plan::Partial(rects) = scrolled.plan else {
             panic!("滚动帧的 damage 必须是 Partial，实际 {:?}", scrolled.plan);
@@ -509,5 +544,120 @@ mod tests {
             fixture.composer.buffer().as_bytes()
         );
         assert_eq!(composed.stats.encoded_lanes, 1);
+    }
+
+    /// **AR4 P1-1 验收（复审 §8.1 原话）**：消费端实例镜像重建之后的第一帧必须是整帧，并且把
+    /// 它写回重建后的镜像时，内容与重建前**逐字节一致**。
+    ///
+    /// 场景与生产同构：
+    /// - `InstanceMirror::new(MAX_FRAMES_IN_FLIGHT)` 是 Windows `recover()` 里镜像重建的等价物
+    ///   （`render/windows/compositor.rs`），重建后镜像里没有任何内容；
+    /// - `DeltaBuilder::force_full()` 是 UI 线程在每帧开始前观察到 `FrameSink::reset_epoch`
+    ///   变化（设备恢复 / 新渲染器挂上）时置位的信号，由 `full_for` 消费一次。
+    ///
+    /// 没有这条握手，恢复后的第一帧只发「变化 lane」，镜像里其余段是 0 ⇒ 退化实例。
+    /// 本用例同时带变异守卫：不置信号的那一帧必须是增量，且把增量载荷喂给空镜像之后内容与
+    /// 重建前**不一致** —— 去掉 full 信号，本用例必红。
+    #[test]
+    fn the_first_frame_after_a_rebuild_refills_the_mirror_byte_identically() {
+        const LANES: usize = 4;
+        let mut fixture = Fixture::new(LANES);
+        let mut mirror = InstanceMirror::new(MAX_FRAMES_IN_FLIGHT);
+
+        // 1. 首帧：`full_for` 天然为真（合成侧还没有任何 lane）⇒ 载荷是覆盖整张环的整块。
+        let first = fixture.frame_with_signals(Plan::Full);
+        assert!(first.full, "首帧必须整帧发布");
+        let composed = fixture.compose(&first);
+        assert!(
+            mirror.prepare(0, &composed.payload),
+            "从未写过的槽必须整块写"
+        );
+        mirror.finish(0);
+        assert_eq!(mirror.bytes().len(), LANES * 128, "镜像 = 整张实例环");
+
+        // 2. 改一条 lane 的增量帧：载荷只带那一段（逐帧增量协议真正生效）。
+        //    clear + push 保持实例数不变 ⇒ 编码器原地复用该 lane 的段（镜像布局不重排）。
+        assert!(fixture.scene.clear_lane(fixture.lane));
+        assert!(fixture.scene.push(fixture.lane, quad()));
+        let incremental = fixture.frame_with_signals(Plan::Partial(DamageRects::new()));
+        assert!(!incremental.full, "同一 DPI 的普通帧不得整帧发布");
+        assert_eq!(incremental.lanes.len(), 1, "只有那条脏 lane 进入 delta");
+        let composed = fixture.compose(&incremental);
+        assert_eq!(composed.payload.chunks().len(), 1, "增量帧只带变化的段");
+        assert!(
+            !mirror.prepare(0, &composed.payload),
+            "增量帧不得整块重写镜像"
+        );
+        mirror.finish(0);
+        // 「重建前的内容」：镜像此刻与场景逐字节一致。
+        let before = mirror.bytes().to_vec();
+
+        // 3. 消费端重置：GPU 侧镜像被重建（`recover()` 的等价物）+ UI 侧整帧信号。
+        let mut rebuilt = InstanceMirror::new(MAX_FRAMES_IN_FLIGHT);
+        assert!(rebuilt.bytes().is_empty(), "重建后的镜像没有任何内容");
+        fixture.builder.force_full();
+        assert!(fixture.builder.forced_full(), "信号必须先置位");
+
+        // 4. 重建后的第一帧：信号被 `full_for` 取走 ⇒ 整帧发布 ⇒ 整块载荷。
+        let resync = fixture.frame_with_signals(Plan::Full);
+        assert!(
+            !fixture.builder.forced_full(),
+            "信号必须被 `full_for` 取走（只强制一帧）"
+        );
+        assert!(resync.full, "重建后的第一帧必须整帧发布（delta.full）");
+        assert_eq!(resync.lanes.len(), LANES, "整帧必须带全部 lane 内容");
+        let composed = fixture.compose(&resync);
+        assert_eq!(composed.payload.chunks().len(), 1, "全量载荷只有一块");
+        let whole = 0..LANES as u32;
+        assert_eq!(
+            composed.payload.chunks()[0].range(),
+            whole,
+            "整块必须覆盖 [0, instance_count)"
+        );
+        assert_eq!(
+            (whole.end - whole.start) as usize * 128,
+            LANES * 128,
+            "整块的字节数 = 实例数 × 128（块区间 × 固定实例布局）"
+        );
+        assert!(
+            rebuilt.prepare(0, &composed.payload),
+            "重建后的槽必须整块写"
+        );
+        rebuilt.finish(0);
+        assert_eq!(
+            rebuilt.bytes(),
+            before.as_slice(),
+            "恢复后的镜像内容必须与重建前逐字节一致"
+        );
+
+        // 5. 变异守卫：同一场景里**不**置 `force_full`，那一帧只能是增量 —— 而且把这份增量
+        //    载荷喂给空镜像之后，内容与重建前不一致。这就是「把 full 信号去掉 ⇒ 本用例必红」
+        //    的落点：它把「增量载荷喂给空镜像 ⇒ 内容缺失」写死成事实。
+        assert!(fixture.scene.clear_lane(fixture.lane));
+        assert!(fixture.scene.push(fixture.lane, quad()));
+        let incremental = fixture.frame_with_signals(Plan::Partial(DamageRects::new()));
+        assert!(!incremental.full, "没有消费端重置信号 ⇒ 不得整帧发布");
+        let composed = fixture.compose(&incremental);
+        assert_eq!(
+            composed.payload.chunks().len(),
+            1,
+            "增量载荷只带 1 段（覆盖不了整张环）"
+        );
+        let covered = composed.payload.chunks()[0].range();
+        assert!(
+            covered.end - covered.start < LANES as u32,
+            "增量块不得覆盖整张实例环（实际 {covered:?}）"
+        );
+        let mut rebuilt_without_signal = InstanceMirror::new(MAX_FRAMES_IN_FLIGHT);
+        assert!(
+            rebuilt_without_signal.prepare(0, &composed.payload),
+            "空镜像总是整块写它自己的缓冲（与载荷是否全量无关）"
+        );
+        rebuilt_without_signal.finish(0);
+        assert_ne!(
+            rebuilt_without_signal.bytes(),
+            before.as_slice(),
+            "增量载荷喂给重建后的空镜像 ⇒ 内容与重建前不一致（所以 full 信号不可省）"
+        );
     }
 }

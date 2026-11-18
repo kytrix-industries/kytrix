@@ -564,10 +564,14 @@ fn bench_frame_full_10k(c: &mut Criterion) {
     });
 }
 
-/// 滚动 1 px：10k 行挂在一个滚动容器里，每帧只改 1 px 偏移。
+/// 滚动 1 px：10k **有图元**的行挂在一个滚动容器里，每帧只改 1 px 偏移。
 ///
-/// 这是 `scroll_1px_10k`（架构决策 §7 的「滚动不该重建任何 lane」）的基线：B5 完成前
-/// 每次滚动都会让全部行的 lane 因 `lane_offset` 变化而重建。
+/// 这是 `scroll_1px_10k`（架构决策 §7 的「滚动不该重建任何 lane」）的基准。两条历史坑：
+/// 1. 行必须**有图元**：空行不产生 lane，`encoded_lanes == 0` 就变得恒真（复审 §7 的
+///    「空变化集下编码与否取值相同」）；
+/// 2. `fixture` 必须**交回**调用方（`(fixture, outcome)`），否则在一个 10k 节点的 `App`
+///    里，它的析构会落进计时区 —— 旧版本因此报出 4.11 ms，而真实帧只有 ~0.1 ms
+///    （与 `frame_full_512` 的注释同一个坑）。
 fn bench_scroll_1px(c: &mut Criterion) {
     use ui_core::{
         interaction::{ScrollConfig, ScrollHandle},
@@ -608,6 +612,11 @@ fn bench_scroll_1px(c: &mut Criterion) {
                             VIEWPORT.width,
                             ROW_HEIGHT - 2.0,
                         ))
+                        // 每行一个实色 quad ⇒ 10k 条真实 lane（滚动帧必须一条都不重建）。
+                        .paint(PaintSpec {
+                            background: Color::from_rgba8([0x28, 0x2C, 0x34, 0xFF]),
+                            ..PaintSpec::default()
+                        })
                         .build(
                             app.window_mut(*window).expect("window").tree_mut(),
                             viewport,
@@ -627,16 +636,61 @@ fn bench_scroll_1px(c: &mut Criterion) {
             },
             |(mut fixture, scroll)| {
                 toggle += 1;
-                let y = if toggle.is_multiple_of(2) { 1.0 } else { 0.0 };
+                // 偏移在 **1 ↔ 2 px** 之间交替：与 setup 留下的 0 也不同 ⇒ 每个计时帧都是
+                // 真实滚动帧。旧版本用 0 ↔ 1，一半样本会落到「同值 ⇒ no-op ⇒ Idle 帧」上
+                // （与 `frame_incremental_*` 注释里记的坑完全相同）。
+                let y = if toggle.is_multiple_of(2) { 1.0 } else { 2.0 };
                 fixture
                     .app
                     .scroll_to(&scroll, ui_core::math::Point::new(0.0, y))
                     .expect("scroll 1px");
-                black_box(fixture.app.frame(fixture.window))
+                let outcome = black_box(fixture.app.frame(fixture.window));
+
+                #[cfg(feature = "test-support")]
+                assert_scroll_frame(&fixture, ROWS, "scroll_1px_10k");
+                // fixture 必须交回：否则 10k 节点的析构落在计时区内（见本函数文档）。
+                (fixture, outcome)
             },
             BatchSize::SmallInput,
         );
     });
+}
+
+/// 滚动帧的**计数**断言（仅 test-support）：确定性，不受机器负载影响。
+///
+/// 复审 AR4 P1-3 的验收口径：滚动 1 px **不得重建 / 重编码任何 lane**，偏移变化必须真的
+/// 进 `SceneDelta`（`scroll_offset_frames == 1`）。接线断开时三条断言全部为假。
+#[cfg(feature = "test-support")]
+fn assert_scroll_frame(fixture: &Fixture, lanes: usize, label: &str) {
+    let Some(stats) = fixture
+        .app
+        .window(fixture.window)
+        .and_then(ui_core::window::Window::frame_stats)
+        .copied()
+    else {
+        return;
+    };
+
+    assert_eq!(
+        stats.encoded_lanes, 0,
+        "{label}: 滚动帧不得重编码任何 lane（实际 {}）—— 槽位接线断了？",
+        stats.encoded_lanes
+    );
+    assert_eq!(
+        stats.reused_segments, lanes,
+        "{label}: 全部 {lanes} 条 lane 必须整段复用（实际 {}）",
+        stats.reused_segments
+    );
+    assert_eq!(
+        stats.uploaded_bytes, 0,
+        "{label}: 滚动帧不得上传任何实例字节（实际 {}）",
+        stats.uploaded_bytes
+    );
+    assert_eq!(
+        stats.scroll_offset_frames, 1,
+        "{label}: 偏移变化必须进 delta（实际 {} 个槽）—— 滚动会停在旧偏移上",
+        stats.scroll_offset_frames
+    );
 }
 
 /// 文本全量更新：320 个文本节点每帧全部变化（塑形 + 文本重排 + 绘制）。
@@ -664,7 +718,9 @@ fn bench_text_update_320(c: &mut Criterion) {
                 toggle += 1;
                 // `SmolStr` 是内联短串（≤22 字节）⇒ clone 是一次 memcpy，不产生堆分配。
                 fixture.app.write(&signal, values[toggle % 2].clone());
-                black_box(fixture.app.frame(fixture.window))
+                let outcome = black_box(fixture.app.frame(fixture.window));
+                // fixture 必须交回：否则 320 节点 + 文本缓存的析构落在计时区内。
+                (fixture, outcome)
             },
             BatchSize::SmallInput,
         );
@@ -784,7 +840,9 @@ fn bench_digit_fast_path_320(c: &mut Criterion) {
                 |(mut fixture, signal)| {
                     toggle += 1;
                     fixture.app.write(&signal, values[toggle % 2].clone());
-                    black_box(fixture.app.frame(fixture.window))
+                    let outcome = black_box(fixture.app.frame(fixture.window));
+                    // fixture 必须交回：否则 320 节点的析构落在计时区内。
+                    (fixture, outcome)
                 },
                 BatchSize::SmallInput,
             );

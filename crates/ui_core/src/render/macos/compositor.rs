@@ -1248,8 +1248,14 @@ fn draw_ops(
 ) -> Result<u32, EngineError> {
     let mut draw_calls = 0u32;
     // 局部刷新时跳过与 damage 不相交的 op（P1-2.1）：旧实现对每个 damage 矩形重放整份 op 列表。
+    // op 的 `bounds` 与实例字节同处**烘焙坐标空间**（不含滚动偏移），而 scissor 是屏幕坐标：
+    // 求交前先按本 op 的滚动槽平移，否则滚动帧会把本该绘制的 op 提前剔掉（横向滚动尤其明显）。
     for op in payload.ops() {
-        if !op.bounds().intersects(scissor) {
+        if !op
+            .bounds()
+            .translated(crate::paint::instance::scroll_offset(payload.scroll(), *op))
+            .intersects(scissor)
+        {
             continue;
         }
         match *op {
@@ -1271,6 +1277,20 @@ fn draw_ops(
                     .copied()
                     .unwrap_or([0.0, 0.0]);
                 let uniform = root.with_instance_base(start).with_scroll(scroll_offset);
+                // 滚动槽的屏幕裁剪区：容器视口 clip 不进实例裁剪链（见 `paint/pass.rs`），
+                // 这里把 scissor 收窄到它 —— 否则滚动内容会画到容器外。
+                let narrowed = crate::paint::instance::scrolled_scissor(
+                    payload.scroll_clip(),
+                    scroll,
+                    scissor,
+                );
+                if let Some(rect) = narrowed {
+                    if rect[0] >= rect[2] || rect[1] >= rect[3] {
+                        // 完全被容器视口裁掉：本 op 一个像素都不该画。
+                        continue;
+                    }
+                    encoder.setScissorRect(scissor_rect(rect));
+                }
                 // SAFETY: 4 顶点 unit quad + 实例区间 [0, len)；段起点由 shader 侧承担。
                 unsafe {
                     encoder.setRenderPipelineState(pipeline.quad());
@@ -1286,6 +1306,9 @@ fn draw_ops(
                         len as usize,
                         0usize,
                     );
+                }
+                if narrowed.is_some() {
+                    encoder.setScissorRect(scissor_rect(scissor));
                 }
                 draw_calls = draw_calls.saturating_add(1);
             }
@@ -1393,6 +1416,16 @@ fn blit_persist_rect(
         blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
             persist, 0, 0, origin, size, target, 0, 0, origin,
         );
+    }
+}
+
+/// `[x0, y0, x1, y1]`（物理像素）→ Metal scissor（调用方保证非空）。
+fn scissor_rect(rect: [i32; 4]) -> MTLScissorRect {
+    MTLScissorRect {
+        x: rect[0].max(0) as usize,
+        y: rect[1].max(0) as usize,
+        width: (rect[2] - rect[0]).max(0) as usize,
+        height: (rect[3] - rect[1]).max(0) as usize,
     }
 }
 

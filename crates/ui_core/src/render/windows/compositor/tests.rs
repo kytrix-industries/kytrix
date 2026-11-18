@@ -1234,8 +1234,11 @@ fn incremental_instance_upload_matches_a_full_upload() {
     let mut timings = FrameTimings::new();
     let mut frame = full_plan((64, 64));
     // 首帧也走增量载荷（与窗口路径一致；`full()` 不会取走变化区间）。
-    let first =
-        crate::render::frame::FramePayload::from_buffer_delta(encoder.buffer_mut(), Vec::new());
+    let first = crate::render::frame::FramePayload::from_buffer_delta(
+        encoder.buffer_mut(),
+        Vec::new(),
+        Vec::new(),
+    );
     let stats = incremental
         .submit_snapshot(FrameIndex::from_raw(1), &first, &mut frame, &mut timings)
         .expect("首帧");
@@ -1253,8 +1256,11 @@ fn incremental_instance_upload_matches_a_full_upload() {
     encoder
         .encode(&scene, Scale::ONE, resolver(), &store)
         .expect("增量帧");
-    let payload =
-        crate::render::frame::FramePayload::from_buffer_delta(encoder.buffer_mut(), Vec::new());
+    let payload = crate::render::frame::FramePayload::from_buffer_delta(
+        encoder.buffer_mut(),
+        Vec::new(),
+        Vec::new(),
+    );
     assert_eq!(payload.instance_count(), 2);
     assert_eq!(
         payload
@@ -1277,7 +1283,7 @@ fn incremental_instance_upload_matches_a_full_upload() {
     };
     let mut frame = full_plan((64, 64));
     let mut timings = FrameTimings::new();
-    let full = crate::render::frame::FramePayload::full(encoder.buffer(), Vec::new());
+    let full = crate::render::frame::FramePayload::full(encoder.buffer(), Vec::new(), Vec::new());
     reference
         .submit_snapshot(FrameIndex::from_raw(1), &full, &mut frame, &mut timings)
         .expect("全量参考帧");

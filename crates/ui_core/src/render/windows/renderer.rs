@@ -402,6 +402,11 @@ impl FrameSink for WindowFrameSink {
     fn is_alive(&self) -> bool {
         self.shared.alive()
     }
+
+    fn reset_epoch(&self) -> u64 {
+        // GPU 线程重建镜像时用 `AcqRel` 写；`Acquire` 读保证 UI 线程看到重建之后的全部效果。
+        self.shared.reset_epoch.load(Ordering::Acquire)
+    }
 }
 
 struct WindowRenderer {
@@ -442,6 +447,7 @@ impl WindowRenderer {
             // SAFETY: 只查询调用线程的 id；本构造发生在 UI 线程（GPU 线程随后才 spawn）。
             thread: unsafe { GetCurrentThreadId() },
             presented: AtomicU64::new(pack_size(surface)),
+            reset_epoch: AtomicU64::new(0),
             composition_pending: AtomicBool::new(false),
             atlas_pending: [AtomicBool::new(false), AtomicBool::new(false)],
         });
@@ -598,6 +604,11 @@ struct Shared {
     thread: u32,
     /// 最近一次**完成 present** 的内容尺寸（`width << 32 | height`；`Acquire`/`Release` 配对）。
     presented: AtomicU64,
+    /// 渲染器重建代际（设备恢复 / 新渲染器挂上 ⇒ +1）。
+    ///
+    /// GPU 线程在重建实例镜像之后 +1，UI 线程每帧通过 [`FrameSink::reset_epoch`] 读它；值变了
+    /// ⇒ UI 必须整帧重发实例缓冲（AR4 P1-1：镜像已被清空，增量载荷补不满它）。
+    reset_epoch: AtomicU64,
     /// 两次唤醒都失败时的兜底标记：UI 线程在泵的几何 pass 里消费它并重算一次几何。
     composition_pending: AtomicBool,
     /// 每 `AtlasKind` 的共享槽是否正在被 GPU 线程消费（`false` = UI 可以入队）。
@@ -767,6 +778,15 @@ impl Shared {
         }
     }
 
+    /// 渲染器重建（设备恢复 / 新渲染器挂上）：代际 +1。
+    ///
+    /// 调用点在 [`gpu_loop`] 的恢复成功分支：`recover()` 已经把 GPU 侧的 `InstanceMirror` 重建
+    /// 为空，UI 侧必须从下一帧开始整帧重发实例缓冲（[`FrameSink::reset_epoch`] 的握手）。
+    /// `AcqRel`：与 UI 线程的 `Acquire` 读配对，保证「代际可见」晚于「镜像已重建」。
+    fn note_renderer_rebuilt(&self) {
+        self.reset_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// 让 UI 线程多跑一轮泵（`poll_renderers` + ②b′ DComp 几何）。
     ///
     /// 只是通知，不改变 GPU 侧状态：`Shared::presented` 才是待处理状态本身，UI 线程每轮泵迭代
@@ -931,6 +951,9 @@ fn gpu_loop(renderer: GpuRenderer, shared: Arc<Shared>) {
                     Ok(recovered) => {
                         crate::render::windows::diagnostics::device_recovered();
                         renderer = Some(recovered);
+                        // 镜像已随设备重建 ⇒ UI 必须整帧重发：`InstanceMirror` 现在为空，而增量
+                        // 载荷只带「变化」的 lane，其余 lane 会画成退化实例（AR4 P1-1）。
+                        shared.note_renderer_rebuilt();
                         if shared.shutdown_requested() {
                             break;
                         }
@@ -1380,7 +1403,10 @@ mod tests {
 
     use smol_str::SmolStr;
 
-    use super::{AtlasSlots, PanicGuard, Shared, State, StickyError, pack_size, unpack_size};
+    use super::{
+        AtlasSlots, FrameSink, PanicGuard, Shared, State, StickyError, WindowFrameSink, pack_size,
+        unpack_size,
+    };
     use crate::{
         error::EngineError,
         paint::atlas::AtlasKind,
@@ -1503,9 +1529,28 @@ mod tests {
             hwnd: 0,
             thread: 0,
             presented: AtomicU64::new(pack_size((1, 1))),
+            reset_epoch: AtomicU64::new(0),
             composition_pending: AtomicBool::new(false),
             atlas_pending: [AtomicBool::new(false), AtomicBool::new(false)],
         })
+    }
+
+    /// AR4 P1-1（GPU 侧）：渲染器重建（设备恢复）必须让 UI 通过 `FrameSink::reset_epoch` 看到
+    /// 新代际；没有重建时保持 0（Linux / macOS 的默认实现同义：恒 0）。
+    ///
+    /// UI 侧据此整帧重发实例缓冲（`Window::resync` → `DeltaBuilder::force_full`）；这条链路的
+    /// 全量协议验收在 `render::compose` 的镜像字节一致性用例里。
+    #[test]
+    fn a_renderer_rebuild_bumps_the_reset_epoch_the_sink_exposes() {
+        let shared = test_shared();
+        let sink = WindowFrameSink {
+            shared: Arc::clone(&shared),
+        };
+        assert_eq!(sink.reset_epoch(), 0, "没有重建时不得要求整帧重发");
+        shared.note_renderer_rebuilt();
+        assert_eq!(sink.reset_epoch(), 1, "设备恢复必须让 UI 看到新代际");
+        shared.note_renderer_rebuilt();
+        assert_eq!(sink.reset_epoch(), 2, "连续两次重建必须各 +1");
     }
 
     /// `presented` 槽：尺寸变化才 post（动画帧不唤醒 UI），打包/拆包可逆。

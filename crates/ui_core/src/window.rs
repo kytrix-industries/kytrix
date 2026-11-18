@@ -347,11 +347,24 @@ pub struct Window {
     pending_payload: Option<crate::render::compose::ComposedFrame>,
     /// delta 采集器（lane 版本 / 绘制序 / 几何描述 / 滚动槽）。
     delta_builder: crate::render::delta::DeltaBuilder,
-    /// 滚动槽表：槽位 → （逻辑偏移，物理视口）。
+    /// 滚动槽表：槽位 → （逻辑滚动位移，物理视口）。
     ///
-    /// **接线点**：paint pass 为滚动容器分配槽位后写入这里（`Pass` 侧一行），此后滚动只改偏移，
-    /// 不重建 lane（架构决策 B3B6 §4）。当前为空 ⇒ 所有 lane 的滚动槽恒 0，行为与旧实现一致。
+    /// **由 paint pass 每帧重写**（`paint/pass.rs` 的 `PaintPass::scroll_slots`）：下标 0 恒是
+    /// 「不随滚动偏移」的哨兵，滚动容器按绘制序依次占 1..。lane 的图元烘焙在「不含本槽位移」
+    /// 的内容空间里，`DeltaBuilder` 只把偏移变化（O(槽数)）带上总线，合成端更新偏移表 ⇒
+    /// **滚动不重建任何 lane、不重编码任何实例**（架构决策 B3B6 §4 / wave-5）。
     scroll_slots: Vec<(crate::math::Point, PhysicalRect)>,
+    /// 与 `scroll_slots` 平行的「槽位 → 容器节点」（下标 i ⇒ 槽位 i + 1；槽位 0 是哨兵）。
+    ///
+    /// 消费者：纯滚动帧的快路径（`paint::paint_frame`）——树结构没变时槽位编号与视口都不变，
+    /// 只有偏移变了，于是直接按这张表把偏移刷进槽位表，不必遍历 10k 节点。
+    scroll_slot_nodes: Vec<crate::node::id::NodeId>,
+    /// 渲染器重建代际的观察门（消费端重置 ⇒ 生产端整帧重发，见 `render::frame::ResyncGate`）。
+    ///
+    /// 设备恢复（TDR / 驱动更新）之后 GPU 侧的实例镜像被重建为空：若继续只发增量 lane，
+    /// 未变化的段会画成退化实例（近似黑/花）。这个门在每帧开始前观察
+    /// [`crate::render::frame::FrameSink::reset_epoch`]，一旦变化就强制下一帧整帧发布。
+    resync: crate::render::frame::ResyncGate,
     /// 合成线程注册 ticket：**必须声明在 `renderer` 之前**（字段按声明顺序析构）。
     ///
     /// 这样窗口关闭时先注销合成线程（最后一个窗口会 join 它），再析构 `renderer`（join GPU
@@ -456,6 +469,8 @@ impl Window {
             pending_payload: None,
             delta_builder: crate::render::delta::DeltaBuilder::new(),
             scroll_slots: Vec::new(),
+            scroll_slot_nodes: Vec::new(),
+            resync: crate::render::frame::ResyncGate::default(),
             compositor_ticket: None,
             damage: DamageAccumulator::new(scale),
             resolver: ColorResolver,
@@ -653,6 +668,15 @@ impl Window {
     #[cfg(test)]
     pub(crate) fn encoded_geometry(&self) -> &[crate::paint::instance::GeometryDrawGpu] {
         paint::encoded_geometry(self)
+    }
+    /// 最近一帧采到的滚动槽表（槽位 → （逻辑滚动位移，物理视口））。
+    ///
+    /// 诊断 / 测试专用：它证明「滚动容器真的拿到了槽位、偏移真的进了槽位表而不是烘焙进图元」。
+    /// 下标 0 恒是哨兵（不随滚动偏移）。
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn scroll_slots(&self) -> &[(crate::math::Point, PhysicalRect)] {
+        &self.scroll_slots
     }
     pub(crate) fn request_damage(&mut self, rect: Rect) {
         paint::request_damage(self, rect)

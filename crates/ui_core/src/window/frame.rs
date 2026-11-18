@@ -123,6 +123,17 @@ pub(crate) fn begin_frame(window: &mut Window) -> Option<FrameTicket> {
         return None;
     }
     let ticket = window.scheduler.begin()?;
+    // **消费端重置 ⇒ 生产端整帧重发**（复审 AR4 P1-1）：GPU 侧的实例镜像在设备恢复后被重建为
+    // 空，增量载荷只会填满「变化 lane」的段 ⇒ 其余段画成退化实例。这里在每帧开始前观察一次
+    // 渲染器的重建代际（`FrameSink::reset_epoch`），变化了就强制本帧整帧发布。
+    if let Some(epoch) = window
+        .renderer
+        .as_ref()
+        .and_then(Renderer::frame_sink)
+        .map(|sink| sink.reset_epoch())
+    {
+        let _ = note_reset_epoch(window, epoch);
+    }
     // 帧簿记的扫描计数从本帧开始重新统计（`FrameRecord::scanned_nodes`，仅 test-support）。
     #[cfg(feature = "test-support")]
     window.tree.reset_scanned_nodes();
@@ -131,6 +142,23 @@ pub(crate) fn begin_frame(window: &mut Window) -> Option<FrameTicket> {
         window.frame_started_at = Some(std::time::Instant::now());
     }
     Some(ticket)
+}
+
+// 消费者：`begin_frame`（每帧一次）；测试用假代际直接驱动。
+/// 观察渲染器的重建代际：返回 `true` = 本帧必须整帧发布（已置好两个一次性开关）。
+///
+/// 两个开关：
+/// 1. `delta_builder.force_full()` ⇒ `paint_frame` 的 `full_for` 返回真 ⇒ 本帧发布**全部**
+///    lane 且 `SceneDelta::full = true` ⇒ 合成端 `FramePayload::full`（整块实例缓冲）；
+/// 2. `full_damage_pending` ⇒ 本帧的 damage 是 `Plan::Full`（设备恢复后持久目标也是空的，
+///    只重画「变化」区域会留下未初始化像素）。
+pub(crate) fn note_reset_epoch(window: &mut Window, epoch: u64) -> bool {
+    if !window.resync.observe(epoch) {
+        return false;
+    }
+    window.delta_builder.force_full();
+    window.full_damage_pending = true;
+    true
 }
 
 // 消费者：`impl Window::layout_if_dirty` 的薄委托（外部调用点见该方法文档）。
@@ -229,6 +257,16 @@ pub(crate) fn commit_frame(
     release_unpublished(window);
     #[cfg(feature = "test-support")]
     {
+        // **headless**（没有渲染器）的窗口不走 `submit_gpu`，`window.stats` 就一直是默认值 ——
+        // 于是 `Window::frame_stats()`（基准里「计数断言」的唯一公开面）会恒为零，断言变成假绿。
+        // 这里用本帧的 `PaintReport`（inline 合成的编码统计）补齐它。
+        if window.renderer.is_none() {
+            window.stats.encoded_lanes = report.encoded_lanes;
+            window.stats.reused_segments = report.reused_segments;
+            window.stats.uploaded_bytes = report.uploaded_bytes;
+            window.stats.instances = report.instances;
+            window.stats.scroll_offset_frames = report.scroll_slots;
+        }
         let stats = std::mem::take(&mut window.stats);
         let record = crate::test_support::record::capture(
             &window.scene,
@@ -529,7 +567,7 @@ pub(crate) fn surface_change_plan(
 mod tests {
     use smol_str::SmolStr;
 
-    use super::FrameOutcome;
+    use super::{FrameOutcome, note_reset_epoch};
     use crate::{
         app::App,
         math::{Rect, Scale, Size},
@@ -570,5 +608,99 @@ mod tests {
         let view = app.window(window).expect("window");
         assert!(view.pending_delta.is_none(), "帧末必须释放 SceneDelta");
         assert!(view.pending_payload.is_none(), "帧末必须释放载荷");
+    }
+
+    /// **回归防线（AR4 P1-1 / 变异守卫）**：消费端重建（`FrameSink::reset_epoch` 变化）之后，
+    /// 生产端的下一帧必须整帧发布 —— 全部 lane 重新进 delta（`encoded_lanes == 全部`）、
+    /// damage 是 `Plan::Full`。设备恢复后 GPU 侧的实例镜像已清空，只发增量会把未变化的 lane
+    /// 画成退化实例（复审 P1-1 的用户可见症状）。
+    #[test]
+    fn a_renderer_rebuild_forces_the_next_frame_full() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut app = App::new(runtime.handle().clone());
+        let window: WindowId = app.create_window(WindowOptions {
+            title: SmolStr::new_static("resync"),
+            size: Size::new(320.0, 240.0),
+            scale: Scale::ONE,
+            ..WindowOptions::default()
+        });
+        let root = app.window(window).expect("window").tree().root();
+        let mut nodes = Vec::new();
+        for index in 0..3 {
+            let node = NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, index as f32 * 24.0, 32.0, 20.0))
+                .paint(crate::paint::style::PaintSpec {
+                    background: crate::paint::color::Color::WHITE,
+                    ..crate::paint::style::PaintSpec::default()
+                })
+                .build(app.window_mut(window).expect("window").tree_mut(), root)
+                .expect("box");
+            nodes.push(node);
+        }
+        let _ = app.frame(window).expect("window").expect("full frame");
+        let view = app.window(window).expect("window");
+        assert_eq!(
+            view.record().expect("record").stats.encoded_lanes,
+            3,
+            "首帧必须全量编码"
+        );
+        // 增量帧：只改一个节点。
+        let _ = app
+            .window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .mark_paint(nodes[0]);
+        let _ = app
+            .frame(window)
+            .expect("window")
+            .expect("incremental frame");
+        let view = app.window(window).expect("window");
+        assert_eq!(
+            view.record().expect("record").stats.encoded_lanes,
+            1,
+            "前置条件：稳态帧是增量（只重编码 1 条 lane）"
+        );
+        // 模拟 GPU 线程重建渲染器：代际 0 → 1（第一次观察只记录）→ 2（变化 ⇒ 强制整帧）。
+        let view = app.window_mut(window).expect("window");
+        assert!(
+            !note_reset_epoch(view, 1),
+            "首次观察只记录代际（首帧本来就整帧发布）"
+        );
+        assert!(note_reset_epoch(view, 2), "代际变化必须强制整帧重发");
+        // 本帧会被 `full_damage_pending` 拉起来（不需要节点变脏）。
+        let outcome = app.frame(window).expect("window").expect("resync frame");
+        assert!(
+            matches!(outcome, FrameOutcome::Committed(_)),
+            "整帧重发必须真的提交"
+        );
+        let view = app.window(window).expect("window");
+        let record = view.record().expect("record");
+        assert!(
+            record.damage_full,
+            "重建后的第一帧必须是 Plan::Full（持久目标也是新的）"
+        );
+        assert_eq!(
+            record.stats.encoded_lanes, 3,
+            "重建后的第一帧必须重编码全部 lane（只发变化 lane ⇒ 镜像里其余段是 0）"
+        );
+        // 只强制一次：下一帧回到增量。
+        let _ = app
+            .window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .mark_paint(nodes[1]);
+        let _ = app
+            .frame(window)
+            .expect("window")
+            .expect("incremental frame");
+        let view = app.window(window).expect("window");
+        assert_eq!(
+            view.record().expect("record").stats.encoded_lanes,
+            1,
+            "整帧重发只发生一次，之后回到增量"
+        );
     }
 }

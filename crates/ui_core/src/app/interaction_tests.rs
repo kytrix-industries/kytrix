@@ -646,9 +646,110 @@ fn scroll_offset_is_clamped_in_the_same_frame_as_a_resize() {
     assert_eq!(offset(&app), 0.0, "resize 那一帧就必须夹紧");
 }
 
+/// **端到端**（生产路径，不是手工构造 `SceneDelta` 的合成场景）：滚动 1 px 的那一帧必须是
+/// 「不重建任何 lane + 不重编码 + damage = 视口」，且滚动容器**之外**的固定元素完全不动。
+///
+/// 复审 AR4 P1-3 的核心验收。接线前 `Window.scroll_slots` 恒空、`LaneSource::lane_scroll` 恒 0，
+/// 滚动走的是「重建全部 lane + 重编码 + 全量 damage」——`scroll_1px_10k` 因此是 4 ms 级
+/// （目标 ≤200 µs）。这条用例用真实 `App::frame` 路径把三件事一起钉住，undo 掉任一处接线都会失败。
 #[test]
-fn scroll_shifts_primitives_without_touching_layout() {
+fn a_one_pixel_scroll_frame_rebuilds_nothing_and_damages_only_the_viewport() {
     let (_rt, mut app, window, container, child) = scrollable_app();
+    // 固定元素：滚动容器**之外**的兄弟（滚动条 / 工具栏 / 表头都属这一类）。
+    let root = app.window(window).expect("window").tree().root();
+    let fixed = mount_override(&mut app, window, root, Rect::new(300.0, 0.0, 40.0, 40.0));
+    let _ = app
+        .window_mut(window)
+        .expect("window")
+        .tree_mut()
+        .mark_paint(container);
+    frame(&mut app, window);
+    let slots = app.window(window).expect("window").scroll_slots().to_vec();
+    assert_eq!(slots.len(), 2, "哨兵 + 一个滚动容器");
+    let viewport = slots[1].1;
+    let fixed_before = lane_quad_bounds(&app, window, fixed);
+    let child_before = lane_quad_bounds(&app, window, child);
+    assert!(!child_before.is_empty() && !fixed_before.is_empty());
+
+    let handle = app.scroll_handle(window, container).expect("scroll handle");
+    app.scroll_to(&handle, Point::new(0.0, 1.0))
+        .expect("scroll 1px");
+    frame(&mut app, window);
+
+    let record = app
+        .window(window)
+        .expect("window")
+        .record()
+        .expect("滚动帧必须提交并留下记录");
+    assert_eq!(
+        record.stats.encoded_lanes, 0,
+        "滚动帧不得重编码任何 lane（偏移在绘制期由 GPU 加上）"
+    );
+    assert!(
+        record.dirty_nodes.is_empty(),
+        "滚动帧不得重建任何 lane（实际重建 {})",
+        record.dirty_nodes.len()
+    );
+    assert!(
+        record.paint_log.lanes.is_empty(),
+        "纯滚动帧必须走快路径（不遍历树）：paint 日志应为空，实际 {} 条",
+        record.paint_log.lanes.len()
+    );
+    assert!(!record.damage_full, "滚动只脏视口，不该退化成整帧");
+    // damage = 视口本身；`paint_frame` 对滚动 damage 留了 1 物理像素的抗锯齿外扩。
+    let padded = crate::math::PhysicalRect::new(
+        viewport.x0 - 1,
+        viewport.y0 - 1,
+        viewport.x1 + 1,
+        viewport.y1 + 1,
+    );
+    assert_eq!(
+        record.damage,
+        vec![padded],
+        "damage 必须恰好是滚动容器的视口（物理像素 + 1 px AA 外扩）"
+    );
+    // 图元字节一个都没动：滚动容器的内容、容器外的固定元素都保持原样。
+    assert_eq!(
+        lane_quad_bounds(&app, window, child),
+        child_before,
+        "滚动不得改容器内容的图元（偏移在槽位表里）"
+    );
+    assert_eq!(
+        lane_quad_bounds(&app, window, fixed),
+        fixed_before,
+        "滚动容器之外的固定元素不受偏移影响"
+    );
+    assert_eq!(
+        app.window(window).expect("window").scroll_slots()[1].0,
+        Point::new(0.0, 1.0),
+        "偏移进槽位表"
+    );
+    // lane 必须**登记**了槽位 1：GPU 侧靠 FrameOp::Instances.scroll 才把偏移加上去；
+    // 槽位恒 0 时滚动不会生效，而所有计数仍是 0 —— 所以这条断言必须显式写。
+    let view = app.window(window).expect("window");
+    let lane = view.tree().lane_of(child).expect("child lane");
+    assert_eq!(
+        view.scene().lane_scroll(lane),
+        1,
+        "滚动容器内的 lane 必须登记槽位 1"
+    );
+}
+
+/// **滚动合成端偏移**（架构决策 B3B6 §4 / wave-5）：滚动既不改 `layout.bounds`，也**不改图元**。
+///
+/// 偏移移动到 `Window` 的滚动槽表里（槽位 → 偏移），合成线程只更新 `FramePayload::scroll`，
+/// 绘制期由 GPU 把偏移加到顶点上（`frame.params.yz`）。旧实现把偏移烘焙进图元，于是每滚 1 px
+/// 都要重建并重编码全部 lane（`scroll_1px_10k` 因此是 4 ms 级）。
+#[test]
+fn scrolling_moves_the_offset_into_the_slot_table_without_touching_lanes() {
+    let (_rt, mut app, window, container, child) = scrollable_app();
+    // `scrollable_app` 的最后一帧发生在 `make_scroll` **之前**：滚动槽位只有跑过一帧 paint 才有。
+    let _ = app
+        .window_mut(window)
+        .expect("window")
+        .tree_mut()
+        .mark_paint(container);
+    frame(&mut app, window);
     let layout_before = app
         .window(window)
         .expect("window")
@@ -659,6 +760,9 @@ fn scroll_shifts_primitives_without_touching_layout() {
         .bounds;
     let before = lane_quad_bounds(&app, window, child);
     assert!(!before.is_empty(), "子节点必须有背景图元");
+    let slots_before = app.window(window).expect("window").scroll_slots().to_vec();
+    assert_eq!(slots_before.len(), 2, "哨兵 + 一个滚动容器");
+    assert_eq!(slots_before[1].0, Point::ZERO, "初始偏移为 0");
 
     let handle = app.scroll_handle(window, container).expect("scroll handle");
     app.scroll_to(&handle, Point::new(0.0, 50.0))
@@ -666,11 +770,22 @@ fn scroll_shifts_primitives_without_touching_layout() {
     frame(&mut app, window);
 
     let after = lane_quad_bounds(&app, window, child);
-    assert_eq!(after.len(), before.len());
-    for (old, new) in before.iter().zip(after.iter()) {
-        assert_eq!(new.origin.y, old.origin.y - 50.0, "滚动 N 后图元 y 平移 −N");
-        assert_eq!(new.origin.x, old.origin.x);
-    }
+    assert_eq!(
+        after, before,
+        "滚动不得改图元字节（偏移在槽位表里，绘制期由 GPU 平移）"
+    );
+    let slots_after = app.window(window).expect("window").scroll_slots().to_vec();
+    assert_eq!(slots_after.len(), 2, "槽位编号逐帧稳定");
+    assert_eq!(
+        slots_after[1].0,
+        Point::new(0.0, 50.0),
+        "滚动位移进槽位表（正数 = 内容向负方向移动）"
+    );
+    assert!(
+        slots_after[1].1.x1 > slots_after[1].1.x0 && slots_after[1].1.y1 > slots_after[1].1.y0,
+        "视口必须是非空物理矩形（滚动 damage 的来源）：{:?}",
+        slots_after[1].1
+    );
     assert_eq!(
         app.window(window)
             .expect("window")

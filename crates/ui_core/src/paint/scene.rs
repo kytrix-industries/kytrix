@@ -28,6 +28,15 @@ pub(crate) const MAX_CLIP_DEPTH: u8 = 8;
 pub(crate) struct Lane {
     primitives: Vec<Primitive>,
     clip_depth: u8,
+    /// 该 lane 的图元烘焙在哪个滚动槽的**内容空间**（`0` = 不随滚动偏移）。
+    ///
+    /// 见 `render/delta.rs` 的坐标系约定：槽位 > 0 时图元的坐标**不含**该滚动容器自己的
+    /// 偏移，绘制期由 GPU 的 `frame.params.yz` 加上；`0` 表示图元已经烘焙成最终屏幕坐标。
+    /// 槽位变化必须让版本 +1（编码器的段复用判据里含槽位）。
+    ///
+    /// `u16` 而不是 `u32`：`Lane` 必须保持 32 B（`Canvas` = 48 B 的静态断言，见
+    /// `paint/canvas.rs`），`Vec` 占 24 B 之后只剩 8 B 给三个字段。
+    scroll: u16,
     /// 内容版本（**增量实例编码的复用判据**，`docs` B6 §2）：
     ///
     /// 任何会改变 lane 内容（图元序列）的操作都 `+1`：`push`（追加图元）与 `clear`
@@ -82,6 +91,22 @@ impl Lane {
     /// 当前 clip 嵌套深度。消费者：`Lane::push`（内部）与 `Canvas` 的 `pop_clip` 空栈判据。
     pub(crate) fn clip_depth(&self) -> u8 {
         self.clip_depth
+    }
+
+    /// 本 lane 的滚动槽（`0` = 不随滚动偏移；消费者：`LaneSource::lane_scroll`）。
+    pub(crate) fn scroll(&self) -> u32 {
+        u32::from(self.scroll)
+    }
+
+    /// 写滚动槽；**槽位变化必须让内容版本前进**（编码器的段复用判据含槽位，段归属变了要重编码）。
+    ///
+    /// 消费者：`paint/pass.rs` 的 `rebuild_lane`（每次重建都写一次）。
+    pub(crate) fn set_scroll(&mut self, slot: u32) {
+        let slot = u16::try_from(slot).unwrap_or(u16::MAX);
+        if self.scroll != slot {
+            self.scroll = slot;
+            self.version = self.version.wrapping_add(1);
+        }
     }
 
     /// 当前**未弹出**的 clip 里，四角半径非全 0（= 编码期会各占一层、计入 `MAX_CLIP_DEPTH`
@@ -298,6 +323,33 @@ impl Scene {
     #[must_use]
     pub fn lane_count(&self) -> usize {
         self.lanes.len()
+    }
+
+    /// 一条 lane 的滚动槽（`0` = 图元已烘焙成屏幕坐标；见 `render/delta.rs` 的坐标系约定）。
+    ///
+    /// 消费者：`LaneSource::lane_scroll`（inline 编码）与 `DeltaBuilder`（把槽位带上总线）。
+    #[must_use]
+    pub(crate) fn lane_scroll(&self, id: LaneId) -> u32 {
+        self.lanes.get(id).map_or(0, Lane::scroll)
+    }
+
+    /// 写一条 lane 的滚动槽（消费者：`paint/pass.rs` 的 `rebuild_lane`）。
+    ///
+    /// 返回 `false` = lane 句柄陈旧。槽位变化会让内容版本 +1（`Lane::set_scroll`），因此
+    /// 编码器与 `DeltaBuilder` 都会看到「这条 lane 变了」—— 段归属变化必须重编码。
+    #[must_use]
+    pub(crate) fn set_lane_scroll(&mut self, id: LaneId, slot: u32) -> bool {
+        match self.lanes.get_mut(id) {
+            Some(lane) => {
+                let before = lane.version();
+                lane.set_scroll(slot);
+                if lane.version() != before {
+                    self.dirty.push(id);
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     /// 本帧绘制序。

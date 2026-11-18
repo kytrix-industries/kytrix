@@ -543,38 +543,52 @@ pub(crate) fn set_lane_offset(tree: &mut NodeTree, node: NodeId, offset: Point) 
 // 消费者：`impl NodeTree::paint_state` 的薄委托（外部调用点见该方法文档）。
 /// 一次 arena 查找算出 paint 遍历需要的全部只读状态（见 [`super::PaintNodeState`]）。
 ///
-/// `offset` 是**祖先滚动偏移的累计值**；`clip_key` 是本帧当前的祖先 clip 上下文。
+/// `screen_offset` 是**祖先滚动偏移的累计值**（屏幕 = 内容 − offset；`clip_bounds` 用它）；
+/// `bake_offset` 是图元真正烘焙用的偏移（**不含本节点所属滚动槽自己的偏移**，滚动因此不
+/// 重建 lane）；`clip_key` 是本帧当前的祖先 clip 上下文。
 pub(crate) fn paint_state(
     tree: &NodeTree,
     node: NodeId,
-    offset: Point,
+    screen_offset: Point,
+    bake_offset: Point,
     clip_key: (u8, Option<PhysicalRect>),
 ) -> Option<super::PaintNodeState> {
     let target = tree.arena.get(node)?;
     let hidden = matches!(target.style.inner.display, taffy::style::Display::None)
         || target.style_patch().visible == Some(false);
+    // 自绘节点（几何 / Canvas）不支持合成端滚动偏移：它们的图元必须烘焙成屏幕坐标。
+    let screen_baked = matches!(
+        target.kind(),
+        super::NodeKind::Geometry(_) | super::NodeKind::Canvas(_)
+    );
+    let effective_bake = if screen_baked {
+        screen_offset
+    } else {
+        bake_offset
+    };
     let reusable = target.dirty.contains(DirtyFlags::REUSABLE)
         && tree.clip_key(node) == Some(clip_key)
-        && target.lane_offset == offset;
+        && target.lane_offset == effective_bake;
     let clip_bounds = (target.style.clip == crate::paint::style::Clip::Bounds).then(|| {
         target
             .layout
             .bounds
-            .translate(Point::new(-offset.x, -offset.y))
+            .translate(Point::new(-screen_offset.x, -screen_offset.y))
             .inset(target.layout.border)
     });
-    let scroll_offset = target
+    let scroll = target
         .interaction
         .as_deref()
         .and_then(|slot| slot.scroll)
-        .map_or(Point::ZERO, |slot| slot.offset);
+        .map(|slot| slot.offset);
     Some(super::PaintNodeState {
         hidden,
         reusable,
         lane: target.lane,
         children: target.children.len(),
         clip_bounds,
-        scroll_offset,
+        scroll,
+        screen_baked,
     })
 }
 

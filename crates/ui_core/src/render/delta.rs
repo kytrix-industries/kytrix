@@ -49,13 +49,19 @@ use crate::{
 pub(crate) struct LaneDelta {
     pub lane: LaneId,
     pub version: u32,
+    /// 图元烘焙在哪个滚动槽的内容空间（`0` = 已是屏幕坐标；见 [`ScrollTable`] 的坐标系约定）。
+    pub scroll: u32,
     pub primitives: Arc<[Primitive]>,
 }
 
 /// 一个滚动槽的偏移变化（逻辑像素；正数 = 内容向负方向移动，与 `NodeTree` 的 `scroll_offset` 同义）。
 ///
-/// `viewport` 是该滚动容器的可见区（**物理像素**）：滚动帧的 damage 直接取它 —— 合成端偏移下
-/// 「移动」不是 blit 而是按新偏移重画整个视口，因此视口内部全部像素都可能变，视口外部不变。
+/// `viewport` 是该滚动槽的**屏幕裁剪区**（物理像素）：容器 padding box 与本帧全部祖先 clip 的交集。
+/// 它有两个消费者：
+/// 1. 滚动帧的 damage —— 合成端偏移下「移动」不是 blit 而是按新偏移重画整条滚动内容的 op，
+///    因此视口内部全部像素都可能变，视口外部不变；
+/// 2. GPU 侧的**每 op scissor** —— 滚动容器自己的视口 clip 不进实例的裁剪链（它随滚动变化，
+///    烘焙进去就要求每帧重编码），改由这个矩形在绘制期裁剪（见 `FramePayload::scroll_clip`）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ScrollDelta {
     pub slot: u32,
@@ -122,11 +128,12 @@ impl SceneDelta {
 
 /// 把**被覆盖**的旧 delta 合并进新 delta（应用顺序 = 旧 → 新）。
 ///
-/// 合并规则与 `FramePayload::absorb` 同构：
-/// - lane：同 id 以**新**为准；旧 delta 里新 delta 没有的 lane 必须保留（否则那段变化永远丢）；
-/// - removed：并集减去「新 delta 里重新出现」的 lane；
+/// 合并规则（**每一条都是「后写胜出」**，与 `FramePayload::absorb` 同构）：
+/// - lane：同 id 以**新**为准；旧 delta 里新 delta 没有的 lane 必须保留（否则那段变化永远丢），
+///   但**被新 delta 释放的 lane 不得复活**（旧内容 + 新移除 = 复活出一个不在绘制序里的 lane）；
+/// - removed：并集减去「新 delta 里重新出现」的 lane；旧的移除不能被新的内容覆盖掉；
 /// - order：新 delta 有就用新的，否则保留旧的（顺序变化不能丢）；
-/// - scroll：同槽以新为准；
+/// - scroll：同槽以**新**为准（旧 delta 的同槽偏移必须丢弃 —— 否则连续覆盖时偏移冻结在最旧值）；
 /// - damage：`Plan::merge`（已有实现，含容量降级）；
 /// - `full`：任一为真即为真（整帧重建不能被覆盖成增量）。
 pub(crate) fn absorb(old: SceneDelta, new: &mut SceneDelta) {
@@ -145,11 +152,13 @@ pub(crate) fn absorb(old: SceneDelta, new: &mut SceneDelta) {
     if new.order.is_none() {
         new.order = order;
     }
-    // 旧 lane：新 delta 里同 id 的版本更新 ⇒ 直接用新的。
+    // 旧 lane：新 delta 里同 id 的版本更新 ⇒ 直接用新的；被新 delta 移除的 ⇒ 不保留。
     if !lanes.is_empty() {
         let mut kept: Vec<LaneDelta> = Vec::with_capacity(lanes.len());
         for old in lanes {
-            if !new.lanes.iter().any(|lane| lane.lane == old.lane) {
+            if !new.lanes.iter().any(|lane| lane.lane == old.lane)
+                && !new.removed.contains(&old.lane)
+            {
                 kept.push(old);
             }
         }
@@ -163,10 +172,17 @@ pub(crate) fn absorb(old: SceneDelta, new: &mut SceneDelta) {
             }
         }
     }
+    // 滚动：同槽**以新为准**。旧的同槽条目必须丢掉，否则它会被追加到新条目之后，把偏移
+    // 冻结在旧值上（旧实现正是如此：`new.scroll.retain(..) + extend(old)`）。
     if !scroll.is_empty() {
-        new.scroll
-            .retain(|fresh| !scroll.iter().any(|old| old.slot == fresh.slot));
-        new.scroll.extend(scroll);
+        let mut kept: Vec<ScrollDelta> = Vec::with_capacity(scroll.len());
+        for old in scroll {
+            if !new.scroll.iter().any(|fresh| fresh.slot == old.slot) {
+                kept.push(old);
+            }
+        }
+        new.scroll.reserve(kept.len());
+        new.scroll.extend(kept);
     }
     if !geometries.is_empty() {
         let mut kept: Vec<(GeometryId, Arc<crate::paint::geometry::GeometryDesc>)> =
@@ -192,10 +208,18 @@ pub(crate) struct DeltaBuilder {
     order: Arc<[LaneId]>,
     /// 上次发布出去的滚动偏移（按槽位）。
     scroll: Vec<Point>,
+    /// 上次发布出去的滚动槽屏幕裁剪区（按槽位；视口变化也必须过线，否则 GPU 侧 scissor 会陈旧）。
+    scroll_viewports: Vec<PhysicalRect>,
     /// 上次发布出去的几何描述（按 id）。
     geometries: ahash::HashMap<GeometryId, Arc<crate::paint::geometry::GeometryDesc>>,
     /// 上次发布时的 DPI（变化 ⇒ 物理坐标全变 ⇒ 整帧重建）。
     scale: Option<Scale>,
+    /// 下一帧必须整帧发布（**消费端重置**：渲染器重建后 GPU 侧的实例镜像已经清空）。
+    ///
+    /// 由 `Window` 在观察到 `FrameSink::reset_epoch` 变化（设备恢复 / 新渲染器挂上）时置位，
+    /// 由 [`DeltaBuilder::full_for`] 消费一次。没有这个握手，恢复后的第一帧只会发「变化 lane」，
+    /// 镜像里其余段是 0 ⇒ 退化实例。
+    force_full: bool,
     /// `Scene` 脏表的复用缓冲（跨帧保容量 ⇒ 增量帧的采集零分配）。
     dirty: Vec<LaneId>,
     /// 回退全量扫描的帧数（全量帧 / 脏表不完整）。**回归防线**：稳态增量帧必须保持 0 增长。
@@ -212,8 +236,10 @@ impl DeltaBuilder {
             versions: Vec::new(),
             order: Arc::from(Vec::new()),
             scroll: Vec::new(),
+            scroll_viewports: Vec::new(),
             geometries: ahash::HashMap::default(),
             scale: None,
+            force_full: false,
             dirty: Vec::new(),
             #[cfg(test)]
             full_scans: 0,
@@ -241,10 +267,27 @@ impl DeltaBuilder {
     /// 本帧是否必须整帧重建（DPI 变化：物理坐标、缩放后的圆角与 clip 全部变了）。
     ///
     /// 只在 `true` 时清缓存；第一帧也返回 `true`（合成侧还没有任何 lane）。
+    /// **消费端重置**（[`DeltaBuilder::force_full`]）也在这里被取走一次。
     pub(crate) fn full_for(&mut self, scale: Scale) -> bool {
-        let full = self.scale != Some(scale);
+        let forced = std::mem::take(&mut self.force_full);
+        let full = forced || self.scale != Some(scale);
         self.scale = Some(scale);
         full
+    }
+
+    /// 要求**下一帧整帧发布**（消费端（GPU 侧实例镜像）已经重建/清空）。
+    ///
+    /// 触发源是 [`crate::render::frame::FrameSink::reset_epoch`] 的变化（设备恢复等）：增量载荷只会
+    /// 填满「变化」的那些 lane 段，而镜像里其余段已经被重置成 0 —— 不整帧重发就会画成退化实例。
+    /// 这一帧同时必须带全量 damage（`Window` 会把 `full_damage_pending` 置位）。
+    pub(crate) fn force_full(&mut self) {
+        self.force_full = true;
+    }
+
+    /// 下一帧是否已被要求整帧发布（仅测试：验证信号被置位/消费一次）。
+    #[cfg(test)]
+    pub(crate) fn forced_full(&self) -> bool {
+        self.force_full
     }
 
     /// 采集本帧的 lane 变化 + 绘制序 + 几何描述。
@@ -265,10 +308,15 @@ impl DeltaBuilder {
         full: bool,
         delta: &mut SceneDelta,
     ) {
+        // 整帧重建的**唯一**置真点：`full` 同时意味着「本 delta 带全部 lane 内容」，因此消费端
+        // （`LaneStore` / 编码器 / `InstanceMirror`）可以放心重置。缺这一行 ⇒ `delta.full` 是死旗，
+        // 设备恢复后镜像永远缺内容（复审 AR4 P1-1 / P2-2）。
+        delta.full = full;
         if full {
             self.versions.clear();
             self.order = Arc::from(Vec::new());
             self.scroll.clear();
+            self.scroll_viewports.clear();
             self.geometries.clear();
         }
         // 脏表在任何分支之前取走：`full` 帧也要清空它，否则条目会留到下一帧。
@@ -308,16 +356,22 @@ impl DeltaBuilder {
         if self.scroll.len() < scroll.len() {
             self.scroll
                 .resize(scroll.len(), Point::new(f32::NAN, f32::NAN));
+            self.scroll_viewports.resize(
+                scroll.len(),
+                PhysicalRect::new(i32::MIN, i32::MIN, i32::MIN, i32::MIN),
+            );
         }
         for (slot, (offset, viewport)) in scroll.iter().enumerate() {
-            let previous = self.scroll[slot];
-            if full || previous != *offset {
+            // 偏移**或屏幕裁剪区**变化都要过线：后者决定 GPU 侧该槽全部 op 的 scissor，
+            // 漏发会让窗口 resize / 祖先 clip 变化之后滚动内容被裁在旧矩形里。
+            if full || self.scroll[slot] != *offset || self.scroll_viewports[slot] != *viewport {
                 delta.scroll.push(ScrollDelta {
                     slot: slot as u32,
                     offset: *offset,
                     viewport: *viewport,
                 });
                 self.scroll[slot] = *offset;
+                self.scroll_viewports[slot] = *viewport;
             }
         }
     }
@@ -351,6 +405,7 @@ impl DeltaBuilder {
         delta.lanes.push(LaneDelta {
             lane,
             version,
+            scroll: scene.lane_scroll(lane),
             primitives: Arc::from(primitives.to_vec()),
         });
         if slot >= self.versions.len() {
@@ -423,6 +478,8 @@ pub(crate) struct LaneStore {
 struct StoredLane {
     generation: u32,
     version: u32,
+    /// 该 lane 的图元烘焙在哪个滚动槽的内容空间（见 [`ScrollTable`]）。
+    scroll: u32,
     primitives: Arc<[Primitive]>,
 }
 
@@ -491,6 +548,7 @@ impl LaneStore {
             self.lanes[slot] = Some(StoredLane {
                 generation: lane.lane.generation(),
                 version: lane.version,
+                scroll: lane.scroll,
                 primitives: Arc::clone(&lane.primitives),
             });
             self.changed.push(lane.lane);
@@ -511,6 +569,14 @@ impl LaneSource for LaneStore {
         (stored.generation == id.generation()).then_some((stored.version, &stored.primitives))
     }
 
+    fn lane_scroll(&self, id: LaneId) -> u32 {
+        self.lanes
+            .get(id.slot() as usize)
+            .and_then(Option::as_ref)
+            .filter(|stored| stored.generation == id.generation())
+            .map_or(0, |stored| stored.scroll)
+    }
+
     fn order(&self) -> &[LaneId] {
         &self.order
     }
@@ -523,6 +589,10 @@ impl LaneSource for LaneStore {
 impl LaneSource for Scene {
     fn lane_state(&self, id: LaneId) -> Option<(u32, &[Primitive])> {
         Scene::lane_state(self, id)
+    }
+
+    fn lane_scroll(&self, id: LaneId) -> u32 {
+        Scene::lane_scroll(self, id)
     }
 
     fn order(&self) -> &[LaneId] {
@@ -560,14 +630,24 @@ impl GeometryLookup for GeometryCatalog {
     }
 }
 
-/// 滚动槽的偏移表（物理像素，按槽位索引；合成线程唯一消费点）。
+/// 滚动槽的偏移表（逻辑像素，按槽位索引；合成线程唯一消费点）。
 ///
-/// **坐标系约定**：`offset` 是逻辑像素的滚动位移，`physical = offset × scale`；GPU 侧把它加在
-/// 顶点/裁剪的世界坐标上（`RootUniform::with_scroll`），因此实例数据里烘焙的坐标始终是
-/// **滚动容器内容空间**（不随滚动变化）—— 滚动帧不重编码的前提。
+/// **坐标系约定**：`offset` 是滚动容器的**逻辑滚动位移**（`NodeInteraction::ScrollSlot::offset`
+/// 的同一个值：正数 = 内容向负方向移动）。图元烘焙在「容器内容空间」时**不含**这个位移，
+/// 因此绘制期要加的量是 `−offset × scale`（`physical_offset` 的返回值，物理像素）：
+///
+/// ```text
+/// 屏幕坐标 = 烘焙坐标 + physical_offset(slot)        （GPU：world_px + frame.params.yz）
+/// 烘焙坐标 = 布局坐标 − 祖先滚动位移                  （paint pass：不含本槽自己的位移）
+/// ```
+///
+/// 于是滚动本槽**不改变任何烘焙字节**（不重编码），而裁剪链与图元同处烘焙空间 ⇒ 两者
+/// 天然一致（视口未被平移，内容按位移滑动）。
 #[derive(Default)]
 pub(crate) struct ScrollTable {
     offsets: Vec<Point>,
+    /// 每个槽的**屏幕裁剪区**（物理像素；GPU 侧每 op scissor 的来源）。
+    viewports: Vec<PhysicalRect>,
     changed: Vec<u32>,
 }
 
@@ -575,6 +655,7 @@ impl ScrollTable {
     pub(crate) fn new() -> Self {
         Self {
             offsets: Vec::new(),
+            viewports: Vec::new(),
             changed: Vec::new(),
         }
     }
@@ -586,17 +667,25 @@ impl ScrollTable {
             let slot = delta.slot as usize;
             if self.offsets.len() <= slot {
                 self.offsets.resize(slot + 1, Point::new(0.0, 0.0));
+                self.viewports
+                    .resize(slot + 1, PhysicalRect::new(0, 0, 0, 0));
             }
             if self.offsets[slot] != delta.offset {
                 self.offsets[slot] = delta.offset;
                 self.changed.push(delta.slot);
             }
+            // 视口即使没变便宜地覆盖写（它在 payload 里每帧全量过线）。
+            self.viewports[slot] = delta.viewport;
             let _ = scale;
         }
         &self.changed
     }
 
-    /// 槽位的物理偏移（槽位不存在 ⇒ 0）。
+    /// 槽位的**绘制期平移量**（物理像素）= `−offset × scale`（槽位不存在 ⇒ 0）。
+    ///
+    /// 符号不能反：`scroll_to(0, +1)` 表示「内容上移 1 逻辑像素」，GPU 必须把顶点往**上**
+    /// 平移（`−scale` 物理像素）。旧实现直接返回 `+offset × scale`（复审 AR4 P1-3 的潜伏 bug：
+    /// 当时 `scroll_slots` 恒空、槽位从未被消费，因此从未暴露）。
     pub(crate) fn physical_offset(&self, slot: u32, scale: Scale) -> [f32; 2] {
         let offset = self
             .offsets
@@ -604,13 +693,25 @@ impl ScrollTable {
             .copied()
             .unwrap_or_else(|| Point::new(0.0, 0.0));
         let factor = scale.factor();
-        [offset.x * factor, offset.y * factor]
+        [-offset.x * factor, -offset.y * factor]
     }
 
     /// GPU 侧的偏移表（`FramePayload` 的载荷之一）。
     pub(crate) fn to_payload(&self, scale: Scale, out: &mut Vec<[f32; 2]>) {
         out.clear();
         out.extend((0..self.offsets.len() as u32).map(|slot| self.physical_offset(slot, scale)));
+    }
+
+    /// GPU 侧的**每槽屏幕裁剪区**（`[x0, y0, x1, y1]`，物理像素；槽位越界 ⇒ 空表项不追加）。
+    ///
+    /// 消费者：三个后端的 `draw_ops` —— 滚动槽的 op 在绘制前把 scissor 收窄到这个矩形。
+    pub(crate) fn viewports_to_payload(&self, out: &mut Vec<[i32; 4]>) {
+        out.clear();
+        out.extend(
+            self.viewports
+                .iter()
+                .map(|viewport| [viewport.x0, viewport.y0, viewport.x1, viewport.y1]),
+        );
     }
 }
 
@@ -699,6 +800,7 @@ mod tests {
         super::LaneDelta {
             lane,
             version,
+            scroll: 0,
             primitives: Arc::from(vec![quad()]),
         }
     }
@@ -895,6 +997,241 @@ mod tests {
         assert_eq!(newer.lanes[0].version, 4);
     }
 
+    // ── `absorb` 的**方向**契约（复审 AR4 P1-2：旧实现让旧值胜出）──────────────
+
+    fn scroll_delta(slot: u32, y: f32) -> ScrollDelta {
+        ScrollDelta {
+            slot,
+            offset: Point::new(0.0, y),
+            viewport: PhysicalRect::new(0, 0, 64, 64),
+        }
+    }
+
+    /// **回归防线（AR4 P1-2 / 变异 M9）**：被覆盖 delta 里的滚动偏移必须被新 delta 的同槽值
+    /// **覆盖**。旧实现用 `retain(新) + extend(旧)` ⇒ 合并应用得到 `−10`（最旧值），
+    /// 连续快速 publish 时偏移会冻结在最旧值。
+    #[test]
+    fn a_covered_scroll_offset_is_superseded_by_the_newer_one() {
+        let mut older = SceneDelta::empty(header(1, Plan::Idle));
+        older.scroll.push(scroll_delta(0, -10.0));
+        let mut newer = SceneDelta::empty(header(2, Plan::Idle));
+        newer.scroll.push(scroll_delta(0, -20.0));
+        absorb(older, &mut newer);
+        assert_eq!(newer.scroll.len(), 1, "同槽只能留一条");
+        assert_eq!(newer.scroll[0].offset.y, -20.0, "同槽以新为准");
+    }
+
+    /// **等价性**（复审 §8 验收口径）：被覆盖 delta 含 scroll 时，「合并后应用」与
+    /// 「逐帧顺序应用」必须得到同一张偏移表。
+    #[test]
+    fn absorbing_a_covered_scroll_delta_matches_sequential_application() {
+        let scale = Scale::ONE;
+        let viewport = PhysicalRect::new(0, 0, 64, 64);
+        // 顺序应用：−10 → −20 → −30（连续三帧快速发布，中间两帧被覆盖）。
+        let mut sequential = ScrollTable::new();
+        for y in [-10.0f32, -20.0, -30.0] {
+            let _ = sequential.apply(
+                &[ScrollDelta {
+                    slot: 0,
+                    offset: Point::new(0.0, y),
+                    viewport,
+                }],
+                scale,
+            );
+        }
+        // 合并应用：旧帧（−10）被（−20）覆盖，再被（−30）覆盖 —— 每一步都是 `absorb`。
+        let mut previous = SceneDelta::empty(header(3, Plan::Idle));
+        previous.scroll.push(scroll_delta(0, -10.0));
+        let mut middle = SceneDelta::empty(header(4, Plan::Idle));
+        middle.scroll.push(scroll_delta(0, -20.0));
+        absorb(previous, &mut middle);
+        let mut latest = SceneDelta::empty(header(5, Plan::Idle));
+        latest.scroll.push(scroll_delta(0, -30.0));
+        absorb(middle, &mut latest);
+
+        let mut table = ScrollTable::new();
+        let _ = table.apply(&latest.scroll, scale);
+        assert_eq!(
+            table.physical_offset(0, scale),
+            sequential.physical_offset(0, scale),
+            "合并路径的最终偏移必须是**最新值**（顺序应用 = −30 ⇒ 平移 +30）"
+        );
+        assert_eq!(table.physical_offset(0, scale), [0.0, 30.0]);
+    }
+
+    /// 旧 delta 的**不同槽**偏移必须保留（丢一帧不能丢另一个容器的滚动）。
+    #[test]
+    fn absorbing_keeps_covered_scroll_offsets_of_other_slots() {
+        let mut older = SceneDelta::empty(header(1, Plan::Idle));
+        older.scroll.push(scroll_delta(0, -10.0));
+        older.scroll.push(scroll_delta(3, -7.0));
+        let mut newer = SceneDelta::empty(header(2, Plan::Idle));
+        newer.scroll.push(scroll_delta(0, -20.0));
+        absorb(older, &mut newer);
+        let slots: Vec<u32> = newer.scroll.iter().map(|scroll| scroll.slot).collect();
+        assert_eq!(slots, vec![0, 3], "新槽在前、旧的不同槽在后");
+        assert_eq!(newer.scroll[0].offset.y, -20.0);
+        assert_eq!(newer.scroll[1].offset.y, -7.0);
+    }
+
+    /// **回归防线**：旧的「移除」不能被新 delta 的**旧内容**复活。
+    ///
+    /// 触发路径：帧 N 改了 lane X 的内容 → 帧 N+1 释放了 X（`note_removed`）。合并后如果
+    /// 保留旧内容，`LaneStore::apply` 会先 take 再 push ⇒ 复活出一个不在绘制序里的 lane。
+    #[test]
+    fn a_released_lane_is_not_resurrected_by_the_covered_delta() {
+        let mut scene = Scene::empty();
+        let released = scene.new_lane();
+        let mut older = SceneDelta::empty(header(1, Plan::Idle));
+        older.lanes.push(lane(released, 2));
+        let mut newer = SceneDelta::empty(header(2, Plan::Idle));
+        newer.removed.push(released);
+        absorb(older, &mut newer);
+        assert!(
+            newer.lanes.is_empty(),
+            "被新帧释放的 lane 不得把旧内容并回来：{:?}",
+            newer.lanes.len()
+        );
+        assert_eq!(newer.removed, vec![released]);
+    }
+
+    /// `order`：新 delta 有就用新的；没有则保留旧的（顺序变化不能随被覆盖帧丢掉）。
+    #[test]
+    fn order_follows_the_newer_delta_and_survives_without_one() {
+        let mut scene = Scene::empty();
+        let a = scene.new_lane();
+        let b = scene.new_lane();
+        // 新的有 order ⇒ 用新的。
+        let mut older = SceneDelta::empty(header(1, Plan::Idle));
+        older.order = Some(Arc::from(vec![a, b]));
+        let mut newer = SceneDelta::empty(header(2, Plan::Idle));
+        newer.order = Some(Arc::from(vec![b, a]));
+        absorb(older, &mut newer);
+        assert_eq!(
+            newer.order.as_deref(),
+            Some([b, a].as_slice()),
+            "新绘制序胜出"
+        );
+        // 新的没有 ⇒ 保留旧的。
+        let mut older = SceneDelta::empty(header(3, Plan::Idle));
+        older.order = Some(Arc::from(vec![a, b]));
+        let mut newer = SceneDelta::empty(header(4, Plan::Idle));
+        absorb(older, &mut newer);
+        assert_eq!(
+            newer.order.as_deref(),
+            Some([a, b].as_slice()),
+            "顺序变化不能被覆盖丢"
+        );
+    }
+
+    /// `full`：任一为真即为真（整帧重建不能被覆盖成增量，反之亦然）。
+    #[test]
+    fn full_is_sticky_in_both_directions() {
+        let older = {
+            let mut delta = SceneDelta::empty(header(1, Plan::Idle));
+            delta.full = true;
+            delta
+        };
+        let mut newer = SceneDelta::empty(header(2, Plan::Idle));
+        absorb(older, &mut newer);
+        assert!(newer.full, "旧帧要求整帧重建 ⇒ 合并结果仍是 Full");
+        let mut fresh = SceneDelta::empty(header(3, Plan::Idle));
+        fresh.full = true;
+        absorb(SceneDelta::empty(header(4, Plan::Idle)), &mut fresh);
+        assert!(fresh.full, "新帧自己就是 Full 时不能被旧帧降级");
+    }
+
+    /// 几何描述：同 id 以新为准，旧的不同 id 保留。
+    #[test]
+    fn geometries_follow_the_newer_delta() {
+        use crate::paint::geometry::{GeometryDesc, GeometryPipeline, IndexType, Topology};
+
+        let desc = |seed: u8| GeometryDesc {
+            vertex_bytes: bytes::Bytes::from(vec![seed; 12]),
+            index_bytes: bytes::Bytes::from_static(&[0u8; 6]),
+            vertex_stride: 12,
+            index_type: IndexType::U16,
+            topology: Topology::TriangleList,
+            bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
+            pipeline: GeometryPipeline::Ui,
+        };
+        let mut store = store();
+        let first = store.insert(desc(1)).expect("几何 1");
+        let second = store.insert(desc(2)).expect("几何 2");
+        let shared = store.insert(desc(3)).expect("几何 3");
+        // 同一个 id 的两个**不同** Arc（模拟「描述被重新注册」）：absorb 之后必须只剩新的那个。
+        let older_shared = store.desc_arc(shared).expect("描述");
+        let newer_shared = Arc::new((*older_shared).clone());
+        let mut older = SceneDelta::empty(header(1, Plan::Idle));
+        older
+            .geometries
+            .push((first, store.desc_arc(first).expect("描述")));
+        older.geometries.push((shared, older_shared));
+        let mut newer = SceneDelta::empty(header(2, Plan::Idle));
+        newer
+            .geometries
+            .push((second, store.desc_arc(second).expect("描述")));
+        newer.geometries.push((shared, Arc::clone(&newer_shared)));
+        absorb(older, &mut newer);
+        assert_eq!(
+            newer
+                .geometries
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![second, shared, first],
+            "新 delta 的描述在前，旧的未覆盖项追加在后"
+        );
+        assert!(
+            Arc::ptr_eq(&newer.geometries[1].1, &newer_shared),
+            "同 id 的描述以新为准（旧的被丢弃）"
+        );
+    }
+
+    /// **回归防线（消费端重置 ⇒ 生产端整帧重发）**：`force_full` 必须被下一帧消费一次，
+    /// 且那一帧的 delta 真的带 `full = true`（否则 `FramePayload::full` 生产不可达）。
+    #[test]
+    fn a_forced_full_frame_is_published_once_with_the_full_flag() {
+        let mut scene = Scene::empty();
+        let first = scene.new_lane();
+        let second = scene.new_lane();
+        assert!(scene.push(first, quad()));
+        assert!(scene.push(second, quad()));
+        scene.set_order(&[first, second]);
+        let mut builder = DeltaBuilder::new();
+        let geometry = store();
+        // 首帧本来就 full（合成侧还没有 lane）。
+        let mut delta = SceneDelta::empty(header(1, Plan::Full));
+        let full = builder.full_for(Scale::ONE);
+        builder.collect(&mut scene, &geometry, &[], full, &mut delta);
+        assert!(delta.full, "首帧必须 full");
+        assert_eq!(delta.lanes.len(), 2);
+
+        // 稳态增量帧：不是 full。
+        assert!(scene.push(first, quad()));
+        let mut delta = SceneDelta::empty(header(2, Plan::Idle));
+        let full = builder.full_for(Scale::ONE);
+        builder.collect(&mut scene, &geometry, &[], full, &mut delta);
+        assert!(!delta.full);
+        assert_eq!(delta.lanes.len(), 1, "只有变化的 lane");
+
+        // 消费端重置 ⇒ 强制整帧重发（一次）。
+        builder.force_full();
+        assert!(builder.forced_full());
+        let mut delta = SceneDelta::empty(header(3, Plan::Full));
+        let full = builder.full_for(Scale::ONE);
+        assert!(full, "force_full 必须让 full_for 返回 true");
+        builder.collect(&mut scene, &geometry, &[], full, &mut delta);
+        assert!(delta.full, "重置后的第一帧必须是 full");
+        assert_eq!(delta.lanes.len(), 2, "full 帧必须带全部 lane 内容");
+        // 只消费一次：下一帧回到增量。
+        let mut delta = SceneDelta::empty(header(4, Plan::Idle));
+        let full = builder.full_for(Scale::ONE);
+        builder.collect(&mut scene, &geometry, &[], full, &mut delta);
+        assert!(!delta.full);
+        assert!(delta.lanes.is_empty(), "无变化帧不带 lane");
+    }
+
     /// `LaneStore` 的应用是幂等的：重复应用同一 delta 不改变表。
     #[test]
     fn applying_the_same_delta_twice_is_idempotent() {
@@ -916,7 +1253,7 @@ mod tests {
         assert_eq!(store.len(), 1);
     }
 
-    /// 滚动表按 scale 换算成物理偏移，并原样进载荷。
+    /// 滚动表按 scale 换算成**绘制期平移量**（`−offset × scale`），并原样进载荷。
     #[test]
     fn the_scroll_table_converts_to_physical_offsets() {
         let mut table = ScrollTable::new();
@@ -927,12 +1264,88 @@ mod tests {
             viewport: PhysicalRect::new(0, 0, 100, 100),
         }];
         assert_eq!(table.apply(&deltas, scale), &[0]);
-        assert_eq!(table.physical_offset(0, scale), [0.0, -20.0]);
+        assert_eq!(
+            table.physical_offset(0, scale),
+            [0.0, 20.0],
+            "offset 是「内容位移」，绘制期要加的是它的相反数（−(−10)×2 = +20）"
+        );
         let mut out = Vec::new();
         table.to_payload(scale, &mut out);
-        assert_eq!(out, vec![[0.0, -20.0]]);
+        assert_eq!(out, vec![[0.0, 20.0]]);
         // 重复应用同样的偏移：不算「变化」（滚动帧的 damage 因此不重复补）。
         assert!(table.apply(&deltas, scale).is_empty());
+    }
+
+    /// 滚动槽的**屏幕裁剪区**必须随载荷过线（GPU 侧每 op scissor 的唯一来源）。
+    #[test]
+    fn the_scroll_table_carries_the_screen_clip_of_every_slot() {
+        let mut table = ScrollTable::new();
+        let viewport = PhysicalRect::new(10, 20, 110, 220);
+        let _ = table.apply(
+            &[ScrollDelta {
+                slot: 1,
+                offset: Point::new(0.0, 5.0),
+                viewport,
+            }],
+            Scale::ONE,
+        );
+        let mut out = Vec::new();
+        table.viewports_to_payload(&mut out);
+        assert_eq!(
+            out,
+            vec![[0, 0, 0, 0], [10, 20, 110, 220]],
+            "槽位 0 是哨兵（零面积），槽位 1 = 容器视口"
+        );
+    }
+
+    /// **视口变化本身也要过线**：窗口 resize / 祖先 clip 变化时偏移可能没变，但 GPU 侧
+    /// scissor 必须更新（否则滚动内容被裁在旧矩形里）。
+    #[test]
+    fn a_viewport_change_alone_is_published() {
+        let mut scene = Scene::empty();
+        let lane = scene.new_lane();
+        assert!(scene.push(lane, quad()));
+        scene.set_order(&[lane]);
+        let geometry = store();
+        let mut builder = DeltaBuilder::new();
+        let first_viewport = PhysicalRect::new(0, 0, 64, 64);
+        let mut delta = SceneDelta::empty(header(1, Plan::Full));
+        builder.collect(
+            &mut scene,
+            &geometry,
+            &[(Point::new(0.0, 0.0), first_viewport)],
+            true,
+            &mut delta,
+        );
+        let resized = PhysicalRect::new(0, 0, 64, 40);
+        let mut delta = SceneDelta::empty(header(2, Plan::Idle));
+        builder.collect(
+            &mut scene,
+            &geometry,
+            &[(Point::new(0.0, 0.0), resized)],
+            false,
+            &mut delta,
+        );
+        assert_eq!(delta.scroll.len(), 1, "只有视口变了，偏移没变");
+        assert_eq!(delta.scroll[0].viewport, resized);
+    }
+
+    /// **方向语义**（复审 AR4 P1-3 的潜伏 bug）：`scroll_to(0, +1)`（内容上移 1 逻辑像素）
+    /// ⇒ 绘制期平移量是 `−scale`，不是 `+scale`。
+    #[test]
+    fn scrolling_down_moves_baked_content_up() {
+        let mut table = ScrollTable::new();
+        let scale = Scale::new(1.5).expect("scale");
+        let _ = table.apply(
+            &[ScrollDelta {
+                slot: 1,
+                offset: Point::new(0.0, 1.0),
+                viewport: PhysicalRect::new(0, 0, 10, 10),
+            }],
+            scale,
+        );
+        assert_eq!(table.physical_offset(1, scale), [0.0, -1.5]);
+        assert_eq!(table.physical_offset(0, scale), [0.0, 0.0], "槽 0 = 不平移");
     }
 
     /// 滚动 damage = 视口；零面积视口不产生 damage。

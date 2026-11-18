@@ -506,6 +506,34 @@ mod tests {
         assert!(!inbox.has_pending());
     }
 
+    /// **端到端（真实合并路径）**：同一窗口连续 publish 两帧不同滚动偏移，被覆盖帧的偏移必须
+    /// 让位给最新值。复审 AR4 P1-2 的实测症状正是这里：合并后偏移冻结在**最旧**值。
+    #[test]
+    fn the_inbox_keeps_the_newest_scroll_offset() {
+        let inbox = CompositorInbox::new();
+        let window = WindowId::from_raw(1);
+        let scroll = |index: u32, y: f32| {
+            let mut delta = delta(index);
+            delta.scroll.push(crate::render::delta::ScrollDelta {
+                slot: 0,
+                offset: crate::math::Point::new(0.0, y),
+                viewport: PhysicalRect::new(0, 0, 8, 8),
+            });
+            delta
+        };
+        assert!(!inbox.publish(window, scroll(1, -10.0)));
+        assert!(inbox.publish(window, scroll(2, -20.0)), "覆盖已有帧");
+        assert!(inbox.publish(window, scroll(3, -30.0)), "再覆盖一帧");
+        let batch = inbox.take_blocking().expect("有待处理帧");
+        assert_eq!(batch.len(), 1);
+        let merged = &batch[0].1;
+        assert_eq!(merged.scroll.len(), 1, "同槽只留一条");
+        assert_eq!(
+            merged.scroll[0].offset.y, -30.0,
+            "同槽偏移必须是最新值（旧实现冻结在 −10）"
+        );
+    }
+
     /// 多个窗口各自合并（互不覆盖）。
     #[test]
     fn different_windows_have_independent_slots() {

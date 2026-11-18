@@ -218,6 +218,70 @@ impl<T> Transient<T> {
 /// - 不可 `Clone`：长期持有旧值必须显式 `(*guard).clone()`（一次可见的深拷贝）。
 ///
 /// 守卫的存活不阻止其它信号被写、不阻止布局/绘制推进 —— 它只冻结被读的那一格值。
+///
+/// 守卫是**临时量**，它的寿命由 Rust 的 terminating scope 规则决定：`match` 头与 `let` 绑定
+/// 都会把它留到写的那一刻（分别活到整个 `match` 结束 / 作用域结束），而 `if` 条件不会。
+/// 完整的对照与安全写法见下文〈三种自然写法与 `match` 陷阱〉；消灭陷阱的组合子是
+/// [`App::update_with`](crate::app::App::update_with)。
+///
+/// # 三种自然写法与 `match` 陷阱
+///
+/// 对同一个信号「先读后写」，三种看起来同样自然的写法里有两种会 panic —— 区别只在读守卫
+/// 这个临时量活到哪一行：
+///
+/// ```text
+/// // ✅ 安全：`if` 条件是 terminating scope —— 条件里的临时守卫在**进入 body 之前**析构。
+/// if *cx.read(&s) > 0 {
+///     cx.update(&s, |v| *v += 1);          // 此刻没有活跃守卫 ⇒ 不 panic
+/// }
+///
+/// // ❌ panic：`match` 的 scrutinee **不是** terminating scope，它的临时量活到整个 `match`
+/// //    结束（含所有分支）—— 分支里的写撞上仍然存活的读守卫。
+/// match *cx.read(&s) {
+///     Mode::Idle => cx.write(&s, Mode::Busy),   // panic: SignalRef read guard alive
+///     _ => {}
+/// }
+///
+/// // ❌ panic：`let` 绑定把守卫的寿命延长到作用域结束（模块文档的借用规则 1，文档化语义）。
+/// let guard = cx.read(&s);
+/// cx.write(&s, Mode::Busy);                 // panic
+/// ```
+///
+/// `match` 的两个**正确**写法（枚举状态机的自然写法都在里面）：
+///
+/// ```text
+/// // 1) 组合子：把整个 match 搬进 `update_with` 的闭包。闭包拿到 `&mut T`、拿不到 `&mut App`，
+/// //    在一次借用里完成「看旧值 ⇒ 决定新值」，因此连读守卫都不存在 —— 这是消灭 match 陷阱
+/// //    的写法。
+/// //    注意：把 `update_with` 塞进**外层** `match *cx.read(&s)` 的分支里仍然会 panic ——
+/// //    陷阱的根因是外层读守卫，不是写入口的 API。
+/// cx.update_with(&s, |mode| match *mode {
+///     Mode::Idle => *mode = Mode::Busy,
+///     _ => {}
+/// });
+///
+/// // 2) 在进入 `match` **之前**把需要的值取出来：`*cx.read(&s)` 是 Copy 出去（不是借用），
+/// //    守卫在那条语句结束时析构。
+/// let mode = *cx.read(&s);
+/// match mode {
+///     Mode::Idle => { cx.write(&s, Mode::Busy); }   // 没有活跃守卫 ⇒ 不 panic
+///     _ => {}
+/// }
+/// ```
+///
+/// ## 为什么编译器阻止不了
+///
+/// `SignalRef<T>` 只持有一个 `Rc<T>`，**不借用** `App` / `ReadCtx`：`cx.read(&s)` 返回之后
+/// `cx` 的借用就结束了。于是 borrowck 看到的是「一个指向堆上值的不可变借用（守卫）」加上
+/// 「一个 `&mut App` / `&mut ReadCtx`」两个**互不相干**的合法借用，两者之间没有任何生命周期
+/// 相连 —— 上面那段 `match` 在编译期无懈可击。
+///
+/// 真正的冲突是**运行期别名**：同一个信号槽的值被读守卫与就地写同时握住。引擎明确拒绝写时
+/// 复制（`Rc::make_mut`）—— 那等于让守卫静默拿到旧值快照，与模块文档「读是借用、不静默拷贝」
+/// 的取向相反。所以唯一可行的检测点是写入口：用 `Rc::strong_count` 判「除 `StateStore` 之外
+/// 还有谁持有这个值」，`> 0` 即 panic 并给出 `SignalId` 与守卫数量。该判据的前提是
+/// 「`StateStore` 是唯一持有者，只有读守卫会克隆那个 `Rc`」—— 将来任何内部缓存共享同一个
+/// `Rc`，都会被误判成活跃守卫（AR4 §2.1 的脆弱点）。
 pub struct SignalRef<T> {
     value: Rc<T>,
 }
@@ -399,11 +463,15 @@ impl SignalSlot {
         *existing = Rc::new(value);
     }
 
-    /// 原地更新普通信号（无等值短路：调用方声明了「这次修改一定要生效」）。
+    /// 原地更新普通信号（无等值短路：调用方声明了「这次修改一定要生效」），返回闭包的值。
     ///
     /// # Panics
     /// 同 [`SignalSlot::write_owned`]。
-    pub(crate) fn update_owned<T: 'static>(&mut self, id: SignalId, update: impl FnOnce(&mut T)) {
+    pub(crate) fn update_owned<T: 'static, R>(
+        &mut self,
+        id: SignalId,
+        update: impl FnOnce(&mut T) -> R,
+    ) -> R {
         let SignalValue::Owned(existing) = &mut self.value else {
             panic!(
                 "signal #{}: update() targets a transient/derived slot",
@@ -712,11 +780,14 @@ impl StateStore {
     }
 
     /// 原地更新普通信号（无等值短路；与 [`StateStore::write_owned`] 同样一次查找）。
-    pub(crate) fn update_owned<T: 'static>(
+    ///
+    /// 返回值：`None` = 作用域已释放（no-op，闭包不会被调用）；`Some(r)` = 闭包的返回值
+    /// （`App::update_with` 把它透给调用点，`App::update` 的闭包返回 `()`）。
+    pub(crate) fn update_owned<T: 'static, R>(
         &mut self,
         id: SignalId,
-        update: impl FnOnce(&mut T),
-    ) -> Option<bool> {
+        update: impl FnOnce(&mut T) -> R,
+    ) -> Option<R> {
         let StateStore {
             values,
             scopes,
@@ -733,8 +804,7 @@ impl StateStore {
         {
             return None;
         }
-        slot.update_owned(id, update);
-        Some(true)
+        Some(slot.update_owned(id, update))
     }
 
     pub(crate) fn set_transient<T: 'static>(&mut self, id: SignalId, value: T) {

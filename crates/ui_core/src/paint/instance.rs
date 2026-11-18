@@ -335,6 +335,50 @@ impl FrameOp {
             Self::Instances { bounds, .. } | Self::Geometry { bounds, .. } => bounds,
         }
     }
+
+    /// 本 op 的滚动槽（`0` = 不随滚动偏移；`Geometry` 没有槽，恒 0）。
+    ///
+    /// 消费者：三个后端的 op 级跳过 —— 它们要把 `bounds`（烘焙坐标）平移到屏幕坐标再与
+    /// damage / scissor 求交。
+    pub(crate) fn scroll(self) -> u32 {
+        match self {
+            Self::Instances { scroll, .. } => scroll,
+            Self::Geometry { .. } => 0,
+        }
+    }
+}
+
+/// op 的**绘制期平移量**（物理像素；槽位越界 / 无槽 ⇒ `[0, 0]`）。
+///
+/// 表就是 `FramePayload::scroll`（槽位 → 平移量，`ScrollTable::physical_offset` 的产物）。
+/// 三个后端的 op 级跳过都用它把 `FrameOp::bounds`（烘焙坐标）平移到屏幕坐标。
+pub(crate) fn scroll_offset(scroll: &[[f32; 2]], op: FrameOp) -> [f32; 2] {
+    scroll
+        .get(op.scroll() as usize)
+        .copied()
+        .unwrap_or([0.0, 0.0])
+}
+
+/// 把帧 scissor 与本 op 所属滚动槽的**屏幕裁剪区**求交（`None` = 不收窄）。
+///
+/// 滚动容器的视口 clip 不进实例的裁剪链（它随滚动在内容坐标里移动，见 `paint/pass.rs` 的
+/// `paint_node`）—— 它改由这个每 op scissor 承担，精度与烘焙 clip 相同（都是轴对齐矩形）。
+/// 槽位 0（不随滚动偏移）与越界槽位都返回 `None`。
+pub(crate) fn scrolled_scissor(
+    scroll_clip: &[[i32; 4]],
+    slot: u32,
+    scissor: [i32; 4],
+) -> Option<[i32; 4]> {
+    if slot == 0 {
+        return None;
+    }
+    let clip = scroll_clip.get(slot as usize)?;
+    Some([
+        scissor[0].max(clip[0]),
+        scissor[1].max(clip[1]),
+        scissor[2].min(clip[2]),
+        scissor[3].min(clip[3]),
+    ])
 }
 
 /// op 的可见范围（物理像素整数 AABB）。
@@ -364,6 +408,23 @@ impl PhysicalBounds {
     /// 漏画会让局部刷新留下旧像素，这是可见的错误；多画只是浪费。
     pub(crate) fn intersects(self, other: [i32; 4]) -> bool {
         self.x0 <= other[2] && other[0] <= self.x1 && self.y0 <= other[3] && other[1] <= self.y1
+    }
+
+    /// 平移到屏幕坐标：op 的 `bounds` 与实例字节同处**烘焙坐标空间**，而 damage / scissor 是
+    /// 屏幕坐标。局部刷新的 op 跳过判据必须先把 bounds 平移（`offset` = `FramePayload::scroll`
+    /// 里该槽的绘制期平移量，物理像素），否则滚动帧会把本该绘制的 op 提前剔掉 —— 横向滚动时
+    /// 尤其明显（内容烘焙在 x≈1000、视口在 0..800，相交判据直接失败）。
+    ///
+    /// 空区间（`EMPTY`）平移后仍是空区间：用饱和加减保住这个性质。
+    pub(crate) fn translated(self, offset: [f32; 2]) -> Self {
+        let dx = offset[0].round() as i32;
+        let dy = offset[1].round() as i32;
+        Self {
+            x0: self.x0.saturating_add(dx),
+            y0: self.y0.saturating_add(dy),
+            x1: self.x1.saturating_add(dx),
+            y1: self.y1.saturating_add(dy),
+        }
     }
 
     /// 并入另一个可见范围（`build_ops` 的 lane 段合并）。
@@ -2347,6 +2408,34 @@ mod tests {
 
     fn scale() -> Scale {
         Scale::new(2.0).expect("合法 scale")
+    }
+
+    /// 滚动槽的每 op scissor：槽位 0（不随滚动偏移）不收窄；真实槽位取与帧 scissor 的交集；
+    /// 完全被裁掉时给出空区间（调用方据此跳过整个 op）。
+    #[test]
+    fn the_scrolled_scissor_narrows_only_real_scroll_slots() {
+        // 表按下标索引：0 是哨兵（零面积），1 是真实滚动槽。
+        let clips = [[0, 0, 0, 0], [10, 20, 110, 220]];
+        assert_eq!(
+            super::scrolled_scissor(&clips, 0, [0, 0, 800, 600]),
+            None,
+            "槽位 0 是「不随滚动偏移」的哨兵，不得收窄"
+        );
+        assert_eq!(
+            super::scrolled_scissor(&clips, 1, [50, 0, 800, 600]),
+            Some([50, 20, 110, 220]),
+            "帧 scissor 与槽位屏幕裁剪区求交"
+        );
+        assert_eq!(
+            super::scrolled_scissor(&clips, 1, [0, 300, 800, 600]),
+            Some([10, 300, 110, 220]),
+            "完全不相交 ⇒ 空区间（调用方跳过整个 op）"
+        );
+        assert_eq!(
+            super::scrolled_scissor(&clips, 9, [0, 0, 800, 600]),
+            None,
+            "越界槽位按不收窄处理（保守：与不滚动等价）"
+        );
     }
 
     fn resolver() -> ColorResolver {

@@ -1917,6 +1917,20 @@ impl UploadSlot {
     }
 }
 
+/// `[x0, y0, x1, y1]`（物理像素）→ Vulkan scissor 矩形（调用方保证非空）。
+fn scissor_rect(rect: [i32; 4]) -> vk::Rect2D {
+    vk::Rect2D {
+        offset: vk::Offset2D {
+            x: rect[0].max(0),
+            y: rect[1].max(0),
+        },
+        extent: vk::Extent2D {
+            width: (rect[2] - rect[0]).max(0) as u32,
+            height: (rect[3] - rect[1]).max(0) as u32,
+        },
+    }
+}
+
 fn draw_ops(
     shared: &SharedGpu,
     command: vk::CommandBuffer,
@@ -1929,8 +1943,14 @@ fn draw_ops(
 ) -> Result<u32, EngineError> {
     let mut draw_calls = 0u32;
     // 局部刷新时跳过与 damage 不相交的 op（P1-2.1）：旧实现对每个 damage 矩形重放整份 op 列表。
+    // op 的 `bounds` 与实例字节同处**烘焙坐标空间**（不含滚动偏移），而 scissor 是屏幕坐标：
+    // 求交前先按本 op 的滚动槽平移，否则滚动帧会把本该绘制的 op 提前剔掉（横向滚动尤其明显）。
     for op in payload.ops() {
-        if !op.bounds().intersects(scissor) {
+        if !op
+            .bounds()
+            .translated(crate::paint::instance::scroll_offset(payload.scroll(), *op))
+            .intersects(scissor)
+        {
             continue;
         }
         match *op {
@@ -1951,6 +1971,25 @@ fn draw_ops(
                     .copied()
                     .unwrap_or([0.0, 0.0]);
                 let uniform = root.with_instance_base(start).with_scroll(scroll_offset);
+                // 滚动槽的屏幕裁剪区：容器视口 clip 不进实例裁剪链（见 `paint/pass.rs`），
+                // 这里把 scissor 收窄到它 —— 否则滚动内容会画到容器外。
+                let narrowed = crate::paint::instance::scrolled_scissor(
+                    payload.scroll_clip(),
+                    scroll,
+                    scissor,
+                );
+                if let Some(rect) = narrowed {
+                    if rect[0] >= rect[2] || rect[1] >= rect[3] {
+                        // 完全被容器视口裁掉：本 op 一个像素都不该画。
+                        continue;
+                    }
+                    // SAFETY: 收窄后的矩形是帧 scissor 与该槽屏幕裁剪区的交集（都在目标内）。
+                    unsafe {
+                        shared
+                            .raw()
+                            .cmd_set_scissor(command, 0, &[scissor_rect(rect)]);
+                    }
+                }
                 let push_bytes = bytemuck::cast_slice::<f32, u8>(uniform.words());
                 // SAFETY: push constant 的范围由本帧的 pipeline layout 声明（[0, 112)）。
                 unsafe {
@@ -1968,6 +2007,14 @@ fn draw_ops(
                     );
                     // 4 顶点 unit quad + 实例区间 [0, len)；段起点由 shader 侧的 draw.clip.y 承担。
                     shared.raw().cmd_draw(command, 4, len, 0, 0);
+                }
+                if narrowed.is_some() {
+                    // SAFETY: 恢复本趟 damage 矩形的 scissor（同一份 `[i32; 4]`）。
+                    unsafe {
+                        shared
+                            .raw()
+                            .cmd_set_scissor(command, 0, &[scissor_rect(scissor)]);
+                    }
                 }
                 draw_calls = draw_calls.saturating_add(1);
             }

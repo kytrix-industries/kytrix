@@ -373,8 +373,17 @@ pub(crate) struct PaintNodeState {
     pub children: usize,
     /// 该节点 `Clip::Bounds` 的 padding box（屏幕坐标；`None` = 不裁剪子树）。
     pub clip_bounds: Option<Rect>,
-    /// 该节点滚动槽的偏移（`Point::ZERO` = 非滚动容器）。
-    pub scroll_offset: Point,
+    /// 该节点滚动槽的偏移（`None` = 非滚动容器）。
+    ///
+    /// `Some(_)` 表示**这个节点是滚动容器**（哪怕当前偏移恰好是 0）：paint pass 据此给它分配
+    /// 一个合成端滚动槽位，内容按槽位偏移在绘制期平移，滚动因此不重建任何 lane。
+    pub scroll: Option<Point>,
+    /// 该节点的图元必须烘焙成**屏幕坐标**（自绘节点：几何 / Canvas）。
+    ///
+    /// `FrameOp::Geometry` 没有滚动槽字段、Canvas 图元也不参与合成端平移（应用给的是绝对
+    /// 坐标），因此这两类节点的 lane 不能登记滚动槽：它们留在屏幕坐标里，祖先/自身滚动时
+    /// 照旧重建（正确性优先，成本只落在自绘节点上）。
+    pub screen_baked: bool,
 }
 
 /// 唯一的一棵节点树（I5）。
@@ -1020,13 +1029,17 @@ impl NodeTree {
         content::clip_key(self, node)
     }
     /// 一次取全 paint 所需的只读状态（消费者：`paint::pass::paint_node`）。
+    ///
+    /// `screen_offset` = 完整祖先滚动位移（屏幕 = 内容 − 它）；`bake_offset` = 图元烘焙偏移
+    /// （不含本节点所属滚动槽自己的位移，见 `paint/pass.rs` 的 `paint_node`）。
     pub(crate) fn paint_state(
         &self,
         node: NodeId,
-        offset: Point,
+        screen_offset: Point,
+        bake_offset: Point,
         clip_key: (u8, Option<PhysicalRect>),
     ) -> Option<PaintNodeState> {
-        content::paint_state(self, node, offset, clip_key)
+        content::paint_state(self, node, screen_offset, bake_offset, clip_key)
     }
     pub(crate) fn set_clip_key(&mut self, node: NodeId, key: (u8, Option<PhysicalRect>)) {
         content::set_clip_key(self, node, key)
