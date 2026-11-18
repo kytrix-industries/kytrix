@@ -1110,7 +1110,8 @@ fn bench_hud_idle_frame(c: &mut Criterion) {
         .app
         .set_debug_hud(fixture.window, true)
         .expect("install debug hud");
-    // 安装帧：HUD 子树挂载 + 采样出第一份文本（时钟不动，之后的调用都在同一个采样窗口内）。
+    // 安装帧：HUD 子树挂载 + 画出面板（10 行缺省 `--` + 真实尺寸行；不采样、不补帧）。
+    // 时钟不动 ⇒ 之后的每次调用都落在同一个 500 ms 采样窗口内，且 HUD 不产生帧。
     let _ = fixture.app.frame(fixture.window);
     let reported = std::sync::Once::new();
     c.bench_function("hud_idle_frame", |b| {
