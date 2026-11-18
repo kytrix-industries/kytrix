@@ -84,10 +84,14 @@ pub(crate) fn note_completed_frame(window: &mut Window, feedback: &FrameFeedback
 }
 
 // 消费者：`impl Window::debug_hud_metrics` 的薄委托（外部调用点见该方法文档）。
-/// 最近提交帧 + 完成帧计数的 HUD 指标（P17）。
+/// 提交帧 + 完成帧计数的 HUD 指标（P17）。
 ///
-/// 一次读取混合两个时刻的数据，两者都是**真实观测值**而不是推算：
-/// - 逐帧成本 / 绘制计数 / 尺寸：最近一次通过帧门禁的提交帧；
+/// 一次读取混合几个时刻的数据，但每一项都是**真实观测值**而不是推算：
+/// - 逐帧成本（`cpu_time`）与 `primitives`：最近一次通过帧门禁的提交帧 / 当前场景；
+/// - `draw_calls` / `instances` / `latency`：最近一条 `FrameFeedback`（**已完成**帧；threaded
+///   路径的唯一来源，从没观测到完成帧时是默认值 0，由 HUD 显示成 `--`）；
+/// - `physical_width` / `physical_height` / `scale`：当前 `window.surface` 与比例（帧入口按帧
+///   刷新，尺寸行不滞后采样窗口）；
 /// - `completed_frames`：GPU 线程已经**完成**的帧数（单调累计，采样窗口用它做差）。
 #[cfg(feature = "hud")]
 pub(crate) fn debug_hud_metrics(window: &Window) -> crate::debug_hud::DebugHudMetrics {

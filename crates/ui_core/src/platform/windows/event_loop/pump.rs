@@ -2,7 +2,8 @@
 //!
 //! ## 帧节奏（R07-10）
 //!
-//! 连续帧（动画 / HUD）由 [`FramePacer`] 驱动：一条**只在需要时存在**的节拍线程阻塞在
+//! 连续帧（**动画**；HUD 自 P-C 起是纯观察者，不再参与 `needs_continuous_frames`）由
+//! [`FramePacer`] 驱动：一条**只在需要时存在**的节拍线程阻塞在
 //! `DCompositionWaitForCompositorClock`（Win10 1809+ / MSDN 最低 Win11 build 22000；
 //! Chrome Viz 的 `DCLayerTree::WaitForCompositorClock` 同款），每个合成器节拍唤醒一次泵。
 //!
@@ -546,6 +547,8 @@ pub(super) fn pump_loop(
         // 自持缩放（P-A）：把会话累积的目标外框 `SetWindowPos` 一次（同一轮的 ④ 就按新尺寸出
         // 真实帧）。它同步派发 `WM_SIZE`，紧随的 `collect_events` 用现有链路写 `set_size` /
         // `set_surface`；放在事件之前 ⇒ 拖动期间不存在「只更新了客户区、没重绘」的持久帧。
+        // **这条接线本身没有单测**（`apply_pending_resizes` 的函数级行为有单测；删掉这一行
+        // 单测仍全绿）—— 由真机拖动探针 `verify_pa_pc.ps1` 验收，见该函数文档。
         apply_pending_resizes(windows);
         collect_events(app, windows, dispatcher)?;
 
@@ -876,14 +879,19 @@ impl ResizePacing {
     }
 }
 
-/// 消费者：`pump_loop` 的 ②a′ 步骤（`collect_events` **之前**）。
+/// 消费者：`pump_loop` 的 ② 步骤（`collect_events` **之前**）。
 ///
 /// 应用自持缩放会话累积的目标外框：每轮每窗**最多一次**（`pending_resize` 最新赢）。
 ///
 /// `SetWindowPos` 会**同步**派发 `WM_SIZE`（重入 `WndProc`），所以必须在短借用之外执行，并且
 /// 放在 `collect_events` 之前：那条 `WM_SIZE` 产生的 `Resize` 事件会在同一轮被 `apply_event`
 /// 写进 `set_size`（标 `LAYOUT`）与 `set_surface`（标全量 damage），紧接着本轮 ④ 出一帧。
-fn apply_pending_resizes(windows: &mut [NativeWindow]) {
+///
+/// **测试边界**：函数级行为（取走一次 → `SetWindowPos` → 再次调用 no-op）有单测
+/// （`event_loop/tests/pump_resize_tests.rs`）；**泵里的调用点接线**（这一轮真的在事件之前
+/// 调用它）没有单测覆盖 —— 删掉下面 `pump_loop` 里的调用，既有单测仍会全绿。那条接线由真机
+/// 拖动探针 `verify_pa_pc.ps1` 验收（AR7 已把它登记为已知测试缺口）。
+pub(super) fn apply_pending_resizes(windows: &mut [NativeWindow]) {
     for native in windows.iter_mut() {
         // 短借用只做取走：在借用内调 `SetWindowPos` 会重入 `WndProc` 再取一次 `&mut`。
         let Some(rect) = native.state_mut().take_pending_resize() else {

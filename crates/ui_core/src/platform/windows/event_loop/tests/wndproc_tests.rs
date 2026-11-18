@@ -1236,3 +1236,58 @@ fn caption_and_system_button_hits_never_start_a_resize_session() {
         );
     }
 }
+
+/// AR7 P1 回归：`WM_DPICHANGED` 取消缩放会话时必须**释放指针捕获**。
+///
+/// 只清会话状态不释放捕获 ⇒ 混合 DPI 多显示器「拖边框跨屏」之后鼠标被本窗口永久捕获
+/// （`GetCapture()` 一直等于本窗口，直到用户再点别的窗口才恢复）。生产路径里系统会在
+/// `WM_DPICHANGED` 中给出建议矩形、由 `WndProc` 同步 `SetWindowPos`，这里投递同样的载荷。
+#[test]
+fn a_dpi_change_during_a_resize_releases_the_pointer_capture() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, _class) = hidden_window_sized("KytrixWndProcResizeDpi", dispatcher, 900, 700);
+    // SAFETY: `state` 由 `hidden_window_sized` 分配、生命周期到 `destroy_hidden_window`。
+    let raw = unsafe { &mut *state };
+    let (start, _cursor) = begin_bottom_right_session(hwnd, raw);
+    let _ = raw.take_events();
+
+    let suggested = RECT {
+        left: start.0,
+        top: start.1,
+        right: start.0 + 766,
+        bottom: start.1 + 608,
+    };
+    // SAFETY: 窗口存活；`lParam` 指向栈上的 `RECT`，只在本次消息处理期读取。
+    unsafe {
+        SendMessageW(
+            hwnd,
+            windows::Win32::UI::WindowsAndMessaging::WM_DPICHANGED,
+            Some(WPARAM(120)),
+            Some(LPARAM((&raw const suggested) as isize)),
+        );
+    }
+
+    assert!(
+        !raw.resize_active(),
+        "WM_DPICHANGED 必须结束缩放会话（起始外框是旧 DPI 的物理坐标）"
+    );
+    assert_eq!(
+        // SAFETY: 只读查询当前线程的捕获窗口（不派发消息）。
+        unsafe { GetCapture() },
+        HWND::default(),
+        "DPI 变化取消会话必须释放指针捕获（否则混合 DPI 跨屏后鼠标被永久捕获）"
+    );
+    assert!(
+        raw.take_pending_resize().is_none(),
+        "取消会话必须丢弃待应用的目标外框（旧 DPI 坐标不能应用到新 DPI 窗口上）"
+    );
+    let events = raw.take_events();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.event, PlatformEvent::PointerCancel)),
+        "同步派发的 WM_CAPTURECHANGED 必须被 suppress 消费，不得产生 PointerCancel：{events:?}"
+    );
+    destroy_hidden_window(hwnd, state);
+}

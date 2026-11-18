@@ -30,9 +30,9 @@
 //!
 //! ## 帧节奏：合成器时钟（R07-10）
 //!
-//! 连续帧（动画 / HUD）由 [`pump::FramePacer`] 的合成器节拍线程驱动
-//! （`DCompositionWaitForCompositorClock`，与 Chrome Viz 同款），`WM_TIMER` 只保留给
-//! a11y 补发兜底；空闲时**没有**任何定时器或线程在跑。
+//! 连续帧（**动画**；HUD 自 P-C 起是纯观察者，不再产生帧）由 [`pump::FramePacer`] 的合成器
+//! 节拍线程驱动（`DCompositionWaitForCompositorClock`，与 Chrome Viz 同款），`WM_TIMER` 只
+//! 保留给 a11y 补发兜底；空闲时**没有**任何定时器或线程在跑。
 
 use std::sync::Arc;
 

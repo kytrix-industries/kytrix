@@ -11,9 +11,12 @@
 //! 10 行缺省 `--` 加一行**尺寸行占位**。尺寸行（真实渲染目标）走**按帧刷新**：install 可能早于
 //! 平台写入真实 `surface` / `scale`（demo 在 `Application::run` 之前就装 HUD），此时读到的只是
 //! covering 猜测值，写进去比占位更糟；帧入口每帧比较期望值，安装帧（平台写完后的第一帧）就刷成
-//! 真实值，窗口 resize / DPI 变化后**下一个应用帧**即更新（不滞后 500 ms 采样窗口）。静止窗口
-//! 因此显示「10 行 `--` + 真实尺寸行」；真实指标要等应用出帧采样，帧率与后端计数还要等 GPU 完成
-//! 反馈。
+//! 真实值，窗口 resize / DPI 变化后**下一个应用帧**即更新（不滞后 500 ms 采样窗口）。
+//!
+//! 因此**首次采样之前**的静止窗口是「10 行 `--` + 真实尺寸行」；一旦有过应用帧采样，之后再静止
+//! 就**保留上一次文本**（HUD 不产生帧，也就没有新样本 —— 真机上 idle_after 可以看到 FPS /
+//! Prims 停在历史值）。真实指标只在应用出帧且距上一样本 ≥500 ms 时刷新；帧率与后端计数还要等
+//! GPU 完成反馈。
 //!
 //! **为什么不做「激活后补一帧提前首份样本」**（曾经的 bootstrap，已回退）：安装帧的下一帧距安装
 //! 帧只有几毫秒，而那一帧会**首次**把场景文字与新 HUD 文本一起写进字形图集 —— 上传槽还忙，新字形
@@ -130,9 +133,9 @@ pub(crate) struct DebugHudMetrics {
     pub instances: u32,
     /// 绘制序中的图元数。
     pub primitives: usize,
-    /// 最近一次采样时的物理宽度（`window.surface`；最多滞后一个采样间隔 + 一帧）。
+    /// 当前物理宽度（`window.surface`；帧入口**按帧刷新**，尺寸行不滞后采样窗口）。
     pub physical_width: u32,
-    /// 最近一次采样时的物理高度（同上）。
+    /// 当前物理高度（同上）。
     pub physical_height: u32,
     /// DPI 比例。
     pub scale: f32,
@@ -173,6 +176,25 @@ impl DebugHudState {
     /// HUD 根节点（关闭时移除整棵子树）。
     pub(crate) fn root(&self) -> NodeId {
         self.root
+    }
+
+    /// 结束当前采样窗口：窗口起点与完成帧基线归位，全部成本累计器清零。
+    ///
+    /// 两个调用点共用同一份复位逻辑：[`prepare_frame`] 正常采样之后，以及长时间静止后**丢弃**
+    /// 这个窗口时（那时不采样，只把起点移到本帧，让下一份样本覆盖干净的 500 ms 窗口）。
+    fn restart_sample_window(&mut self, now: Instant, completed_frames: u64) {
+        self.last_sample_at = now;
+        self.last_sample_completed = completed_frames;
+        self.cpu_sum = Duration::ZERO;
+        self.cpu_count = 0;
+        self.upload_sum = Duration::ZERO;
+        self.upload_count = 0;
+        self.gpu_sum = Duration::ZERO;
+        self.gpu_count = 0;
+        self.present_sum = Duration::ZERO;
+        self.present_count = 0;
+        self.latency_sum = Duration::ZERO;
+        self.latency_count = 0;
     }
 }
 
@@ -320,6 +342,13 @@ pub(crate) fn prepare_frame(state: &mut DebugHudState, window: &Window, now: Ins
     }
 
     let window_time = now.saturating_duration_since(state.last_sample_at);
+    if window_time >= SAMPLE_INTERVAL * 2 {
+        // 长时间静止后恢复出帧：分母里带着整段静止时长会给出「真实但误导」的帧率（真机实测首份
+        // 样本 FPS 4.0 / Frame 251.09 ms）。**丢弃这个窗口**：本帧不采样，下一个 500 ms 窗口从
+        // 这一帧开始重新计时/累计，恢复后的首份样本才是干净窗口的帧率。
+        state.restart_sample_window(now, metrics.completed_frames);
+        return;
+    }
     if window_time >= SAMPLE_INTERVAL {
         let completed = metrics
             .completed_frames
@@ -341,18 +370,7 @@ pub(crate) fn prepare_frame(state: &mut DebugHudState, window: &Window, now: Ins
             instances: observed_completion.then_some(state.last_instances),
         };
         state.pending_text = Some(format_lines(&snapshot));
-        state.last_sample_at = now;
-        state.last_sample_completed = metrics.completed_frames;
-        state.cpu_sum = Duration::ZERO;
-        state.cpu_count = 0;
-        state.upload_sum = Duration::ZERO;
-        state.upload_count = 0;
-        state.gpu_sum = Duration::ZERO;
-        state.gpu_count = 0;
-        state.present_sum = Duration::ZERO;
-        state.present_count = 0;
-        state.latency_sum = Duration::ZERO;
-        state.latency_count = 0;
+        state.restart_sample_window(now, metrics.completed_frames);
     }
 }
 
@@ -670,5 +688,40 @@ mod tests {
         let (fps, frame_ms) = rate(Duration::from_millis(500), 60);
         assert!((fps.expect("fps") - 120.0).abs() < 0.01);
         assert!((frame_ms.expect("frame ms") - 8.333_3).abs() < 0.01);
+    }
+
+    /// 长时间静止后恢复出帧：**静止时长不能算进帧率分母**（真机曾出现真实但误导的
+    /// `FPS 4.0 / Frame 251.09 ms`）。
+    ///
+    /// 跨过 `2 × SAMPLE_INTERVAL` 的窗口整窗丢弃（本帧不采样），下一份样本覆盖干净的 500 ms 窗口。
+    #[test]
+    fn a_sample_window_that_spans_a_long_idle_is_discarded() {
+        use std::time::{Duration as StdDuration, Instant as StdInstant};
+
+        use super::{SAMPLE_INTERVAL, install, prepare_frame};
+        use crate::window::{Window, WindowId, WindowOptions};
+
+        let t0 = StdInstant::now();
+        let mut window = Window::new(WindowId::from_raw(1), WindowOptions::default());
+        let mut state = install(&mut window, t0).expect("install");
+
+        // 静止 3 s 后恢复出帧：丢弃窗口，本帧不产出文本。
+        let after_idle = t0 + StdDuration::from_secs(3);
+        prepare_frame(&mut state, &window, after_idle);
+        assert!(
+            state.pending_text.is_none(),
+            "跨过长时间静止的窗口必须丢弃：本帧不采样"
+        );
+        assert_eq!(
+            state.last_sample_at, after_idle,
+            "丢弃窗口时起点移到本帧，下一个窗口从干净起点计时"
+        );
+
+        // 之后一个完整采样窗口：正常产出样本（本环境没有完成帧 ⇒ 帧率仍为 --）。
+        let sample_at = after_idle + SAMPLE_INTERVAL;
+        prepare_frame(&mut state, &window, sample_at);
+        let text = state.pending_text.as_ref().expect("干净窗口必须产出样本");
+        assert_eq!(text[0].as_str(), "FPS     --");
+        assert_eq!(state.last_sample_at, sample_at);
     }
 }

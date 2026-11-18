@@ -158,7 +158,8 @@ pub(crate) fn animations_running(app: &App, window: WindowId) -> bool {
     app.animations.iter().any(|slot| slot.window == window)
 }
 
-/// 全部窗口是否还有未完成的动画（平台泵用它决定 `SetTimer(1)` / `KillTimer`）。
+/// 全部窗口是否还有未完成的动画（[`needs_continuous_frames`] 的组成部分：只有动画需要按显示节拍
+/// 推进；连续帧由平台泵的合成器节拍线程 `FramePacer` 提供，`SetTimer` 只剩 a11y 补发兜底）。
 /// 消费者：`App::has_animations`。
 pub(crate) fn has_animations(app: &App) -> bool {
     !app.animations.is_empty()
@@ -256,4 +257,72 @@ pub(crate) fn sync_clock(app: &mut App) {
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn advance_clock(app: &mut App, by: Duration) {
     app.clock += by;
+}
+
+#[cfg(all(test, feature = "hud"))]
+mod tests {
+    use std::time::Duration;
+
+    use super::{has_animations, needs_continuous_frames};
+    use crate::{
+        app::App,
+        interaction::{AnimatedValue, AnimationSpec, Easing},
+        math::{Rect, Size},
+        node::builder::NodeBuilder,
+        window::WindowOptions,
+    };
+
+    /// **AR7 M4 变异防线**：把 Debug HUD 分支加回 [`needs_continuous_frames`] 时本用例必须变红。
+    ///
+    /// HUD 是纯观察者（P-C）：它可见**不**等于「平台需要按刷新率出帧」—— 只有动画需要。
+    #[test]
+    fn the_debug_hud_never_asks_for_continuous_frames() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut app = App::new(runtime.handle().clone());
+        let window = app.create_window(WindowOptions {
+            size: Size::new(320.0, 240.0),
+            ..WindowOptions::default()
+        });
+        let root = app.window(window).expect("window").tree().root();
+        let node = NodeBuilder::boxed()
+            .layout_override(Rect::new(0.0, 0.0, 32.0, 32.0))
+            .build(app.window_mut(window).expect("window").tree_mut(), root)
+            .expect("node");
+
+        assert!(!needs_continuous_frames(&app), "没有动画 ⇒ 不需要连续帧");
+
+        app.set_debug_hud(window, true).expect("HUD 安装");
+        assert!(
+            !needs_continuous_frames(&app),
+            "装 HUD 不是持续出帧的理由（纯观察者；变异「HUD 可见 ⇒ 连续帧」会在这里变红）"
+        );
+
+        let value = app.transient(0.0_f32);
+        app.animate(
+            window,
+            AnimatedValue::Scalar {
+                target: value,
+                to: 1.0,
+            },
+            &[node],
+            AnimationSpec {
+                duration: Duration::from_millis(50),
+                easing: Easing::Linear,
+            },
+        )
+        .expect("animate");
+        assert!(needs_continuous_frames(&app), "有动画 ⇒ 需要连续帧");
+
+        // 动画结束后 HUD 仍然可见 ⇒ 回到不需要连续帧（HUD 不是帧源）。
+        app.advance_clock(Duration::from_millis(60));
+        let _ = app.frame(window);
+        assert!(!has_animations(&app), "前置条件：动画已经结束");
+        assert!(
+            !needs_continuous_frames(&app),
+            "动画结束 + HUD 可见 ⇒ 仍然不需要连续帧"
+        );
+    }
 }

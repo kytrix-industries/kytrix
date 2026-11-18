@@ -11,7 +11,7 @@
 //!   delegate 把 `terminate:` 变成「通知引擎 → 引擎两阶段询问+关窗收尾 → 回复 AppKit」的握手。
 //! - **泵**由三条 common-modes 路径驱动：`CFRunLoopObserver`（**只注册 `BeforeWaiting`**，
 //!   每轮 run loop 一次）、wake `CFRunLoopSource`（跨线程唤醒）、连续帧 `CFRunLoopTimer`
-//!   （动画/HUD）。三者都只在主线程执行。
+//!   （只有动画；HUD 自 P-C 起是纯观察者、不再产生帧）。三者都只在主线程执行。
 //! - 退出：泵发现 `exit` 后撤掉 source/timer，投一个空 NSEvent，再 `NSApplication::stop(None)`
 //!   + `CFRunLoop::stop`/`wake_up`；`run()` 返回（F-165）。
 //!
@@ -294,7 +294,7 @@ fn pump_and_stop(state: &mut LoopState, tick: bool) {
         state.exit = true;
     }
     if state.exit {
-        // 先撤掉定时器/唤醒源：HUD 开着时 60Hz timer 仍在唤醒 run loop，
+        // 先撤掉定时器/唤醒源：连续帧定时器（动画 / a11y 补发）仍在唤醒 run loop 时，
         // `NSApp.stop` 会等不到 NSEvent 而永远不返回（实测关窗后进程不退出）。
         wake::uninstall();
         // `NSApplication::run` 睡在 `nextEventMatchingMask`；投一个 application-defined
@@ -396,7 +396,7 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
         task.run(app);
     }
 
-    // 连续帧定时器：有动画或 HUD 可见才挂（其余时间空闲零唤醒）。
+    // 连续帧定时器：只有动画在跑才挂（P-C 起 HUD 是纯观察者、不再是帧源；其余时间空闲零唤醒）。
     if let Some(native) = state.windows.first() {
         // a11y 到期补发也借用这个定时器（同 Windows）：到期交付后自动停表。
         native.set_animating(app.needs_continuous_frames() || app.a11y_retry_pending());

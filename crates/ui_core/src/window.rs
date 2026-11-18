@@ -189,14 +189,17 @@ pub enum WindowResizeEdge {
 ///
 /// # Windows 标题栏 / 非客户区交互
 ///
-/// **完全交系统**（R07-2）：引擎不接管 `WM_NCCALCSIZE` / `WM_NCHITTEST` /
-/// `WM_NCLBUTTONDOWN`。拖动标题栏、拖边框缩放、双击标题栏最大化/还原、右键标题栏与图标区的
-/// 系统菜单、`Alt+Space`、以及 **Aero Snap / Win11 Snap Layouts** 都由 `DefWindowProcW` 进入
-/// 的原生 move/size 模态循环提供（Chrome / GPUI / Qt 的选择相同 —— 这些手势只存在于系统循环
-/// 内部，应用自己 `SetWindowPos` 永远无法复现）。
+/// **caption / 系统按钮交系统，resize 自持**（P-A；取代 R07-2 的「非客户区全交系统」）：
+/// `WM_NCCALCSIZE` / `WM_NCHITTEST` 仍交 `DefWindowProcW`（系统命中码、标题栏与边框几何由它算），
+/// `HTCAPTION` / `HTSYSMENU` / 最小化 / 最大化 / 关闭按钮的 `WM_NCLBUTTONDOWN` 也交系统 ——
+/// 拖动标题栏、双击最大化/还原、右键系统菜单、`Alt+Space` 与 **Aero Snap / Win11 Snap Layouts**
+/// 都只存在于系统的 move 模态循环内部（Chrome / GPUI / Qt 同样不接管它们）。
 ///
-/// 代价（有意取舍）：模态循环期间本线程的消息泵被系统占用，窗口内容在拖动/缩放中**不重绘**
-/// （渲染线程仍在跑，旧内容保持 1:1 呈现）；拖动中推进的动画/HUD 会在松手后补上。
+/// **8 个 resize 命中码（`HTLEFT`…`HTBOTTOMRIGHT`）由引擎自持**：系统的 resize 模态循环会占住
+/// 本线程消息泵，窗口内容在拖动中无法按新尺寸重排/重绘。引擎改为 `WndProc` 只记账（起始外框 /
+/// 光标 / 边掩码），泵每一轮应用一次 `SetWindowPos`，随后走现有 `set_size` / `set_surface` →
+/// 重排 → 重绘 → present 链路 —— 拖动/缩放中每一步都是**真实帧**（不是拉伸旧帧），且不引入
+/// 定时器或额外帧。决策与取舍见 `.docs/ui_core-决策-resize自持与HUD观察者.md`。
 #[derive(Clone, Debug, PartialEq)]
 pub struct WindowOptions {
     /// 标题（`SmolStr`，AGENTS §2.2）。
@@ -210,8 +213,10 @@ pub struct WindowOptions {
     /// 平台差异：
     /// - Windows：persist clear 的**未覆盖像素**（linear，与 macOS/Linux 同一条路径），也是
     ///   独立 1×1 背景层的颜色（DirectComposition 的组合交换链**没有**可用的
-    ///   `SetBackgroundColor`，probe 实测返回 OK 但惰性）。窗口放大时露出的新区域就是这个
-    ///   背景层；旧内容保持 1:1，不会被拉伸（DEVIATIONS §36 F-205 / S-152）。
+    ///   `SetBackgroundColor`，probe 实测返回 OK 但惰性）。背景层的角色是**≤1 帧接缝**
+    ///   （几何已提交、真实帧还在飞）、首帧、DPI 切换与平台尚未出帧的路径：它是纯色填充，
+    ///   既不拉伸旧内容，**也不是**拖动/缩放期的画面来源 —— 拖动由引擎自持 resize 逐步真实
+    ///   重排 + 重绘（P-A，见上）。旧内容保持 1:1（DEVIATIONS §36 F-205 / S-152）。
     /// - macOS：既填旧 drawable **之外**的 `CAMetalLayer.backgroundColor`（sRGB `CGColor`），
     ///   也用于 persist clear 的**未覆盖像素**（linear，`render::color::background_linear`）。
     /// - Linux：只用于 persist clear 的**未覆盖像素**（linear，Vulkan sRGB attachment，

@@ -214,6 +214,39 @@ fn the_size_line_follows_the_window_on_the_next_application_frame() {
     assert_eq!(line(&test, 8).trim(), "Prims   --");
 }
 
+/// 长时间静止后恢复出帧：**静止时长不算进帧率分母**（真机曾出现真实但误导的
+/// `FPS 4.0 / Frame 251.09 ms`）。
+///
+/// 规则：跨过 `2 × 500 ms` 的采样窗口整窗丢弃 —— 恢复后的第一帧不采样、文本保持上一次；
+/// 之后一个干净的 500 ms 窗口才产出样本。
+#[test]
+fn a_frame_after_a_long_idle_does_not_pollute_the_sample_window() {
+    let mut test = TestApp::new();
+    let window = test.window_id();
+    assert_eq!(activate(&mut test), 1, "激活只画一帧面板");
+    assert_eq!(line(&test, 8).trim(), "Prims   --", "静止时还没有样本");
+
+    // 3 s 静止后的第一个应用帧：窗口被丢弃 ⇒ 不采样、文本保持占位。
+    test.advance(Duration::from_secs(3));
+    test.app_mut().request_repaint(window).expect("请求一帧");
+    assert!(test.drain().expect("恢复帧").rendered);
+    assert_eq!(
+        line(&test, 8).trim(),
+        "Prims   --",
+        "跨过 3 s 静止的窗口必须丢弃：这一帧不得产出样本"
+    );
+
+    // 干净的 500 ms 窗口之后：正常采样。
+    test.advance(Duration::from_millis(500));
+    test.app_mut().request_repaint(window).expect("请求一帧");
+    assert!(test.drain().expect("采样帧").rendered);
+    assert!(
+        prims_line(&test) > 0,
+        "干净窗口之后必须产出真实样本：{}",
+        line(&test, 8)
+    );
+}
+
 /// **FPS / Frame 的真实口径：完成帧数 / 采样窗口。**
 ///
 /// headless 窗口没有 GPU 完成反馈（`poll_renderer` 恒 `None`）⇒ 采样窗口内完成帧数为 0 ⇒

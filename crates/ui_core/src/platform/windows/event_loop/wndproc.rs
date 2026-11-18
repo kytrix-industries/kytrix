@@ -166,10 +166,23 @@ pub(crate) extern "system" fn wndproc(
             }
         }
         if msg == WM_DPICHANGED && (*state).resize_active() {
-            // 会话的起始外框是**旧 DPI** 的物理坐标：跨屏改变 DPI 后继续按它算会漂。
-            // 取消会话后照常走下面的 DPI 分支（系统建议矩形 + `set_scale` / `set_size` /
+            // 会话的起始外框是**旧 DPI** 的物理坐标：跨屏改变 DPI 后继续按它算会漂。取消会话
+            // 并**释放指针捕获** —— 只清状态会让「混合 DPI 多显示器拖边框跨屏」之后鼠标被本
+            // 窗口永久捕获（直到用户再点别的窗口）。
+            //
+            // 两阶段（纪律 1）：短借用只记账（`cancel_resize` + `plan_release_capture` 置
+            // suppress），出借用后才 `ReleaseCapture`。它同步派发的 `WM_CAPTURECHANGED` 到达
+            // 时 `resize_active()` 已经是 false ⇒ 落到下面的普通分支并被 `suppress_capture_cancel`
+            // 消费（不产生 `PointerCancel`）。
+            //
+            // 之后**不 return**：照常走下面的 DPI 分支（系统建议矩形 + `set_scale` / `set_size` /
             // `set_surface`，本轮 ④ 照常出帧）。
             (*state).cancel_resize();
+            let release = plan_release_capture(hwnd, &mut *state);
+            if release {
+                // 计划阶段确认本窗口持有捕获；同 `WM_CANCELMODE` / `WM_LBUTTONUP` 分支。
+                let _ = ReleaseCapture();
+            }
         }
 
         if msg == WM_GETMINMAXINFO {
@@ -377,7 +390,7 @@ pub(crate) extern "system" fn wndproc(
             // GPU 线程在帧**完成**后通知「交换链里的内容尺寸变了」。这个通知**不请求新帧**：
             // 消息本身已经把 `GetMessageW` 唤醒，泵的 ②b′ 几何 pass 每轮都按
             // `presented_surface` / 客户区重算（同值几何是 no-op）。若在这里 `state.wake()`，
-            // 每次完成 present 都会额外产生一次 `App::frame`（HUD 下是真实的 paint + present）。
+            // 每次完成 present 都会额外产生一次 `App::frame`（多数是空帧，但仍要跑完两段门禁）。
             //
             // 例外是**自持缩放会话**（P-A）：拖动期的出帧背压要等「上一帧已上屏」，而本窗口
             // 的 `presented_surface` 此刻正好更新完 —— 这一拍就是背压等待的那一次唤醒

@@ -1491,7 +1491,8 @@ impl App {
         animation::animations_running(self, window)
     }
 
-    /// 全部窗口是否还有未完成的动画（平台泵用它决定 `SetTimer(1)` / `KillTimer`）。
+    /// 全部窗口是否还有未完成的动画（`needs_continuous_frames` 的组成部分：连续帧由平台泵的
+    /// 合成器节拍线程 `FramePacer` 提供，`SetTimer` 只剩 a11y 补发兜底）。
     pub(crate) fn has_animations(&self) -> bool {
         animation::has_animations(self)
     }
