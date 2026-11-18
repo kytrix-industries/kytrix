@@ -664,6 +664,39 @@ mod tests {
         assert!(scrolled.lanes.is_empty() && scrolled.order.is_none());
     }
 
+    /// `DeltaBuilder` 的采集成本只随**变化**的 lane 增长：10k 条 lane 里只改 1 条时，delta 里
+    /// 只有 1 个快照（否则全量帧之外每帧都会重建 10k 份 `Arc<[Primitive]>`）。
+    #[test]
+    fn a_one_lane_change_does_not_snapshot_the_whole_scene() {
+        const LANES: usize = 10_000;
+        let mut scene = Scene::empty();
+        let mut order = Vec::with_capacity(LANES);
+        for _ in 0..LANES {
+            let lane = scene.new_lane();
+            assert!(scene.push(lane, quad()));
+            order.push(lane);
+        }
+        scene.set_order(&order);
+        let geometry = store();
+        let mut builder = DeltaBuilder::new();
+        let mut first = SceneDelta::empty(header(1, Plan::Full));
+        builder.collect(&scene, &geometry, &[], true, &mut first);
+        assert_eq!(first.lanes.len(), LANES, "全量帧带全部 lane 快照");
+
+        // 只改最后一条 lane：delta 里只有它，且绘制序不携带。
+        assert!(scene.push(order[LANES - 1], quad()));
+        let mut delta = SceneDelta::empty(header(2, Plan::Partial(DamageRects::new())));
+        builder.collect(&scene, &geometry, &[], false, &mut delta);
+        assert_eq!(delta.lanes.len(), 1, "只有变化的 lane 才重建快照");
+        assert_eq!(delta.lanes[0].lane, order[LANES - 1]);
+        assert_eq!(
+            Arc::strong_count(&delta.lanes[0].primitives),
+            1,
+            "快照只被 delta 持有（没有额外复制）"
+        );
+        assert!(delta.order.is_none(), "绘制序没变 ⇒ 不携带");
+    }
+
     /// 被覆盖的 delta 必须并进新 delta：lane 后写胜出、旧 lane 不丢、damage 取并集。
     #[test]
     fn absorbing_a_covered_delta_keeps_every_lane() {

@@ -13,6 +13,25 @@
 //! 每组在 setup 里建 `current_thread` runtime + `App`（**不计时**，`iter_batched` 的 setup 段）。
 //! 采样：50 samples / 1 s warmup / 3 s 测量——`frame_*` 单次 ~1 ms、setup ~2 ms，50 是
 //! 「统计稳定」与「总时长 < 5 min」的折中；数值**不进 CI 判定**（D19）。
+//!
+//! ## 增量帧基准的两条硬约束（别再把它们测成噪声）
+//!
+//! 1. **计时帧必须是真实增量帧**：setup 预置「计时帧写入值的前一个值」，routine 再写新值。
+//!    否则 `toggle % 2` 在「每样本新建 fixture」下有一半样本写入与初始值相同的值 ⇒ 帧门禁
+//!    直接返回 `Idle`，criterion 拿到的是 2 µs 的空帧与 400 µs 的真帧混合的分布（CI 宽达
+//!    一个数量级，197 µs / 553 µs 这类数字就是这么来的）。
+//! 2. **脏节点必须有背景**：没有图元的节点被标脏后重建出的是空 lane，编码器不会重编码任何
+//!    实例 —— 计时帧的 `encoded_lanes` 实际是 0（旧夹具的 `encoded_lanes=1` 来自另一个统计
+//!    探针帧，不是被计时的那一帧）。
+//!
+//! ## `frame_incremental_10k` 为什么只能跑小 sample size
+//!
+//! 10k 夹具的 setup（建树 + 首帧布局/样式/全量编码）约 440 ms/样本，而 criterion 的 Linear
+//! 采样按 `d = measurement_time / mean / (n(n+1)/2)` 取整：`n=100` 时 d=1 ⇒ 要跑 5050 次
+//! setup（约 37 min）。因此 10k 用 `--sample-size 10~30`，统计稳定性靠**多跑几轮**而不是
+//! 单轮样本数；1k 与 512 可以用 `--sample-size 100 --measurement-time 10`。
+//! 另外 `--features test-support` 会在**每一帧**做 `FrameRecord` 采集（遍历 scene/tree），
+//! 同一档位的数值会比默认特性高一个数量级——**两者不可直接比较**，只用于断言计数。
 
 use std::{hint::black_box, time::Duration};
 
@@ -118,7 +137,12 @@ fn mount_text_grid(fixture: &mut Fixture) -> Signal<SmolStr> {
     text
 }
 
-/// 一个被 64 个 `bind_style` 读的信号（依赖失效的扇出）。
+/// 一个被 `count` 个 `bind_style` 读的信号（依赖失效的扇出 + 增量帧的唯一脏节点）。
+///
+/// **必须有背景**：只有「改样式会改变图元」的节点才会让 lane 重建 + 实例重编码。没有背景的
+/// 盒子即使被标脏，重建出的 lane 也是空的 —— 编码器根本不会重编码任何实例，基准就测不到
+/// 「增量编码」这件事（旧夹具正是如此：`frame_incremental_*` 的计时帧里 `encoded_lanes`
+/// 实际是 0，`encoded_lanes=1` 只出现在额外的统计探针上）。
 fn mount_fanout(fixture: &mut Fixture, count: usize) -> Signal<u8> {
     let signal = fixture.app.signal(0u8);
     let Fixture { app, window } = fixture;
@@ -128,6 +152,10 @@ fn mount_fanout(fixture: &mut Fixture, count: usize) -> Signal<u8> {
         let value = signal;
         let _ = NodeBuilder::boxed()
             .layout_override(Rect::new(0.0, y, 100.0, 10.0))
+            .paint(PaintSpec {
+                background: Color::from_rgba8([0xFF, 0xFF, 0xFF, 0xFF]),
+                ..PaintSpec::default()
+            })
             .bind_style(move |cx| StylePatch {
                 opacity: Some(f32::from(*cx.read(&value)) / 255.0),
                 ..StylePatch::default()
@@ -136,6 +164,41 @@ fn mount_fanout(fixture: &mut Fixture, count: usize) -> Signal<u8> {
             .expect("fanout box");
     }
     signal
+}
+
+/// 基准侧的增量编码回归防线（**超标直接 panic**）。
+///
+/// 判据来自 `Window::frame_stats`（`test-support` 的记录面读点）。三个事实缺一不可：
+/// 1. `encoded_lanes == 1`：只有脏的那一条 lane 被重编码（不是全量）；
+/// 2. `reused_segments == lanes`：其余每条 lane 的实例段**整段复用**（一个实例字节都没重写）；
+/// 3. `uploaded_bytes == 128`：载荷只带那一条 lane 的 1 个实例（128 B 实例布局）。
+///
+/// 这比「时间变慢」更早、更确定地暴露回归：时间受机器负载影响 ±40%，但计数是确定的。
+#[cfg(feature = "test-support")]
+fn assert_incremental_frame(fixture: &Fixture, lanes: usize, label: &str) {
+    let Some(stats) = fixture
+        .app
+        .window(fixture.window)
+        .and_then(ui_core::window::Window::frame_stats)
+        .copied()
+    else {
+        return;
+    };
+    assert_eq!(
+        stats.encoded_lanes, 1,
+        "{label}: 增量帧只允许重编码 1 条 lane（实际 {}）—— 增量编码退化成全量？",
+        stats.encoded_lanes
+    );
+    assert_eq!(
+        stats.reused_segments, lanes,
+        "{label}: 其余 {lanes} 条 lane 必须整段复用（实际 {}）",
+        stats.reused_segments
+    );
+    assert_eq!(
+        stats.uploaded_bytes, 128,
+        "{label}: 增量帧只允许上传 1 个实例 = 128 B（实际 {}）",
+        stats.uploaded_bytes
+    );
 }
 
 fn palette() -> Vec<Color> {
@@ -322,7 +385,9 @@ fn bench_frame_incremental(c: &mut Criterion) {
         .build()
         .expect("bench runtime");
     let handle = runtime.handle().clone();
-    let mut toggle = 0usize;
+    // 递增而不是取模：(k+1)%2 与 setup 预置的值相同，会让**每两个样本**测到一次 Idle 帧。
+    // 1..=254：**始终可见**（opacity=0 会让那条 lane 变成空 lane，基准会跑到「无实例」的边上）。
+    let toggle = std::cell::Cell::new(1u8);
     c.bench_function("frame_incremental_512", |b| {
         b.iter_batched(
             || {
@@ -331,13 +396,17 @@ fn bench_frame_incremental(c: &mut Criterion) {
                 let _ = mount_boxes(&mut fixture, 512);
                 let signal = mount_fanout(&mut fixture, 1);
                 let _ = fixture.app.frame(fixture.window);
+                // setup 预置「本帧将要写入的值之前的那一个值」⇒ 计时帧 100% 是真实增量帧。
+                fixture.app.write(&signal, toggle.get());
                 (fixture, signal)
             },
             |(mut fixture, signal)| {
                 // 改一个节点：测 lane 复用 + damage 合并的增量帧。
-                toggle += 1;
-                fixture.app.write(&signal, (toggle % 2) as u8);
+                toggle.set(1 + toggle.get() % 254);
+                fixture.app.write(&signal, toggle.get());
                 let outcome = black_box(fixture.app.frame(fixture.window));
+                #[cfg(feature = "test-support")]
+                assert_incremental_frame(&fixture, 512, "frame_incremental_512");
                 // 见 `frame_full_512`：fixture 必须交回，否则 drop 落在计时区内。
                 (fixture, outcome)
             },
@@ -397,9 +466,13 @@ fn bench_tree_build_scale(c: &mut Criterion) {
 
 /// 增量帧规模：`count` 个静态 box（lane 可整桶复用）+ 1 个绑信号的节点（本帧唯一被标脏的）。
 ///
-/// `--features test-support` 下，setup 里额外跑一帧真增量并打印
-/// `encoded_lanes / reused_segments / uploaded_bytes`（「只重编码 1 条 lane、只上传它的实例段」
-/// 这两个事实的基准侧证据；setup 不计时）。
+/// 计时帧一定是**真实增量帧**：setup 把信号预置成「计时帧写入值的前一个值」，于是计时帧必然
+/// 重建 1 条 lane。旧夹具的 `toggle % 2` 在「每样本新建 fixture」下会让**一半样本落到 Idle
+/// 帧**（写入值与初始值相同 ⇒ 无脏位 ⇒ 帧门禁直接返回），criterion 的均值因此毫无意义
+/// （CI 宽达一个数量级；`frame_incremental_10k` 的 197 µs / 553 µs 都是这样量出来的）。
+///
+/// `--features test-support` 下 routine 里还会断言 `encoded_lanes=1 / reused_segments=count /
+/// uploaded_bytes=128`（见 [`assert_incremental_frame`]）：增量编码一旦退化成全量，基准直接 panic。
 fn bench_frame_incremental_scale(c: &mut Criterion) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -410,8 +483,8 @@ fn bench_frame_incremental_scale(c: &mut Criterion) {
         ("frame_incremental_1k", 1_000usize),
         ("frame_incremental_10k", 10_000usize),
     ] {
-        let mut toggle = 0usize;
-        // 统计只打印一次（setup 每个样本都会跑）；默认特性下没有 `test-support` 的记录可读。
+        // 1..=254：**始终可见**（opacity=0 会让那条 lane 变成空 lane，基准会跑到「无实例」的边上）。
+        let toggle = std::cell::Cell::new(1u8);
         #[cfg(feature = "test-support")]
         let stats_printed = std::sync::Once::new();
         c.bench_function(name, |b| {
@@ -421,42 +494,24 @@ fn bench_frame_incremental_scale(c: &mut Criterion) {
                     let _ = mount_boxes(&mut fixture, count);
                     let signal = mount_fanout(&mut fixture, 1);
                     let _ = fixture.app.frame(fixture.window);
+                    // 预置「前一个值」⇒ 计时帧一定改变样式、一定重建那条 lane。
+                    fixture.app.write(&signal, toggle.get());
+                    (fixture, signal)
+                },
+                |(mut fixture, signal)| {
+                    toggle.set(1 + toggle.get() % 254);
+                    fixture.app.write(&signal, toggle.get());
+                    let outcome = black_box(fixture.app.frame(fixture.window));
                     #[cfg(feature = "test-support")]
                     {
-                        // 统计探针：一个**带背景**的绑定节点 —— 改它的 opacity 真的会重编码
-                        // 1 条 lane（`mount_fanout` 的盒子没有 paint，改它不产生实例）。
-                        let probe = fixture.app.signal(0u8);
-                        {
-                            let Fixture { app, window } = &mut fixture;
-                            let root = app.window(*window).expect("window").tree().root();
-                            let value = probe;
-                            let _ = NodeBuilder::boxed()
-                                .layout_override(Rect::new(0.0, 0.0, 12.0, 12.0))
-                                .paint(PaintSpec {
-                                    background: Color::from_rgba8([0xFF, 0xFF, 0xFF, 0xFF]),
-                                    ..PaintSpec::default()
-                                })
-                                .bind_style(move |cx| StylePatch {
-                                    opacity: Some(f32::from(*cx.read(&value)) / 255.0),
-                                    ..StylePatch::default()
-                                })
-                                .build(
-                                    app.window_mut(*window).expect("window").tree_mut(),
-                                    root,
-                                )
-                                .expect("probe box");
-                        }
-                        // 先让探针节点编码一次（首帧全量），再推一帧真增量读统计。
-                        let _ = fixture.app.frame(fixture.window);
-                        fixture.app.write(&probe, 255);
-                        let _ = fixture.app.frame(fixture.window);
-                        let stats = fixture
+                        assert_incremental_frame(&fixture, count, name);
+                        if let Some(stats) = fixture
                             .app
                             .window(fixture.window)
                             .and_then(ui_core::window::Window::frame_stats)
-                            .copied();
-                        stats_printed.call_once(|| {
-                            if let Some(stats) = stats {
+                            .copied()
+                        {
+                            stats_printed.call_once(|| {
                                 eprintln!(
                                     "{name}: encoded_lanes={} reused_segments={} uploaded_bytes={} instances={}",
                                     stats.encoded_lanes,
@@ -464,19 +519,9 @@ fn bench_frame_incremental_scale(c: &mut Criterion) {
                                     stats.uploaded_bytes,
                                     stats.instances
                                 );
-                            }
-                        });
-                        // 复位探针（不参与计时帧）。
-                        fixture.app.write(&probe, 0);
-                        let _ = fixture.app.frame(fixture.window);
+                            });
+                        }
                     }
-                    (fixture, signal)
-                },
-                |(mut fixture, signal)| {
-                    // 改一个节点：测 lane 复用 + damage 合并的增量帧。
-                    toggle += 1;
-                    fixture.app.write(&signal, (toggle % 2) as u8);
-                    let outcome = black_box(fixture.app.frame(fixture.window));
                     // 见 `frame_full_512`：fixture 必须交回，否则 drop 落在计时区内。
                     (fixture, outcome)
                 },
@@ -769,7 +814,9 @@ fn bench_frame_incremental_10k_ui_thread(c: &mut Criterion) {
             .expect("bench runtime");
         let handle = runtime.handle().clone();
         let count = 10_000usize;
-        let mut toggle = 0usize;
+        // 递增而不是取模：见 `bench_frame_incremental_scale`（否则一半样本是 Idle 帧）。
+        // 1..=254：**始终可见**（opacity=0 会让那条 lane 变成空 lane，基准会跑到「无实例」的边上）。
+        let toggle = std::cell::Cell::new(1u8);
         c.bench_function("frame_incremental_10k_ui_thread", |b| {
             b.iter_batched(
                 || {
@@ -777,6 +824,8 @@ fn bench_frame_incremental_10k_ui_thread(c: &mut Criterion) {
                     let _ = mount_boxes(&mut fixture, count);
                     let signal = mount_fanout(&mut fixture, 1);
                     let _ = fixture.app.frame(fixture.window);
+                    // setup 预置「前一个值」⇒ 计时帧一定是真实增量帧。
+                    fixture.app.write(&signal, toggle.get());
                     // 关键：编码器不在 UI 线程（模拟真实窗口的合成线程路径）。
                     if let Some(window) = fixture.app.window_mut(fixture.window) {
                         window.detach_composer();
@@ -784,8 +833,8 @@ fn bench_frame_incremental_10k_ui_thread(c: &mut Criterion) {
                     (fixture, signal)
                 },
                 |(mut fixture, signal)| {
-                    toggle += 1;
-                    fixture.app.write(&signal, (toggle % 2) as u8);
+                    toggle.set(1 + toggle.get() % 254);
+                    fixture.app.write(&signal, toggle.get());
                     let outcome = black_box(fixture.app.frame(fixture.window));
                     (fixture, outcome)
                 },

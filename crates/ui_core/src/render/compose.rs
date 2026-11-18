@@ -362,6 +362,43 @@ mod tests {
         assert!(Arc::strong_count(&first) >= 1);
     }
 
+    /// **回归防线（合成线程 / `SceneDelta` 落地后不许退化）**：10k lane 的场景里只有 1 条 lane
+    /// 变脏的一帧，必须「只重编码 1 条 lane、其余每条 lane 整段复用、只上传 1 个实例」。
+    ///
+    /// 这条用例守护的是「增量编码被合成线程接线顺手改坏」的整类回归：一旦 `WindowComposer` 在
+    /// 应用 delta 之后把版本判据弄丢（例如把 `LaneStore` 的版本当成 `Scene` 的版本、或每次
+    /// 都走全量重建），`encoded_lanes` 会立刻变成 10k，而不是 1。
+    #[test]
+    fn one_dirty_lane_never_reencodes_the_whole_scene() {
+        const LANES: usize = 10_000;
+        let mut fixture = Fixture::new(LANES);
+        let delta = fixture.frame(Plan::Full, true, &[]);
+        let first = fixture.compose(&delta);
+        assert_eq!(first.stats.encoded_lanes, LANES, "首帧必须全量编码");
+
+        // 把那条 lane 改成一个实例（与 `frame_incremental_*` 的夹具一致：脏 lane 恰好 1 个实例）。
+        assert!(fixture.scene.clear_lane(fixture.lane));
+        assert!(fixture.scene.push(fixture.lane, quad()));
+        let delta = fixture.frame(Plan::Partial(DamageRects::new()), false, &[]);
+        assert_eq!(delta.lanes.len(), 1, "只有脏 lane 进入 delta");
+        let composed = fixture.compose(&delta);
+        assert_eq!(
+            composed.stats.encoded_lanes, 1,
+            "只有 1 条 lane 变脏 ⇒ 只允许重编码 1 条（不是全量）"
+        );
+        assert_eq!(
+            composed.stats.reused_segments,
+            LANES - 1,
+            "其余 {} 条 lane 的实例段必须整段复用",
+            LANES - 1
+        );
+        assert_eq!(
+            composed.stats.written_bytes, 128,
+            "只上传脏 lane 的 1 个实例（128 B 实例布局）"
+        );
+        assert_eq!(composed.payload.chunks().len(), 1, "载荷只带 1 个实例块");
+    }
+
     /// **等价性**：同一份场景，UI 线程直接编码（`Scene` 作帧源）与合成线程从 `LaneStore` 编码
     /// （`SceneDelta` 应用之后）必须产出**逐字节一致**的实例环与同一份绘制序。
     ///

@@ -178,6 +178,7 @@ pub(crate) fn commit_frame(
         // `paint_frame` 没有跑（或没产出任何 lane / 像素）：没有节点状态需要结算，
         // damage 与 dirty 保留给下一次重试。
         window.scheduler.abort(ticket);
+        release_unpublished(window);
         #[cfg(feature = "hud")]
         {
             window.frame_started_at = None;
@@ -201,6 +202,7 @@ pub(crate) fn commit_frame(
         // 只是不推进 `FrameIndex`、不发布（V-122 ⑧ / F-183）。
         window.tree.settle_frame();
         window.scheduler.abort(ticket);
+        release_unpublished(window);
         #[cfg(feature = "hud")]
         {
             window.frame_started_at = None;
@@ -224,6 +226,7 @@ pub(crate) fn commit_frame(
             let _ = stats;
         }
     }
+    release_unpublished(window);
     #[cfg(feature = "test-support")]
     {
         let stats = std::mem::take(&mut window.stats);
@@ -241,6 +244,22 @@ pub(crate) fn commit_frame(
         window.record = Some(record);
     }
     FrameOutcome::Committed(index)
+}
+
+// 消费者：`commit_frame`（三条出口：Idle×2 / Committed）。
+/// 丢弃本帧**没有被发布**的中间产物（`SceneDelta` / `ComposedFrame`）。
+///
+/// 它们唯一的消费者是 `submit_gpu`：threaded 模式取走 delta 交给合成线程，inline 模式取走载荷
+/// 交给渲染器。没有渲染器（headless / 离屏无 GPU）或本帧退回 `Idle` 时没人消费，**必须在本帧
+/// 结束时释放**：
+///
+/// 1. 留到下一帧没有任何意义（下一帧会重建，旧 delta 的帧序号已过期）；
+/// 2. 全量帧的 delta 是「每条 lane 一份 `Arc<[Primitive]>` 快照」，析构 10k 条 lane 需要数百 µs
+///    —— 把它留到下一帧，这笔开销就落进**下一帧的计时区**（`frame_incremental_10k` 的
+///    `paint → 下一帧` 组合尤其明显：全量帧之后的第一帧会被算上上一帧的析构）。
+fn release_unpublished(window: &mut Window) {
+    window.pending_delta = None;
+    window.pending_payload = None;
 }
 
 // 消费者：`impl Window::submit_gpu` 的薄委托（外部调用点见该方法文档）。
@@ -503,5 +522,53 @@ pub(crate) fn surface_change_plan(
         Plan::Full
     } else {
         plan
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use smol_str::SmolStr;
+
+    use super::FrameOutcome;
+    use crate::{
+        app::App,
+        math::{Rect, Scale, Size},
+        node::builder::NodeBuilder,
+        window::{WindowId, WindowOptions},
+    };
+
+    /// 回归防线：headless（没有渲染器）的已提交帧结束后，本帧的中间产物
+    /// （`SceneDelta` / `ComposedFrame`）必须已经释放，**不得留到下一帧**。
+    ///
+    /// 留到下一帧的代价不是常数：全量帧的 delta 是「每条 lane 一份 `Arc<[Primitive]>` 快照」，
+    /// 析构 10k 条会花几百 µs —— 这笔钱会砸进**下一帧**的计时区（`frame_incremental_10k` 的
+    /// 「全量帧 → 增量帧」组合正是如此）。见 `release_unpublished`。
+    #[test]
+    fn a_committed_headless_frame_does_not_retain_its_intermediates() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut app = App::new(runtime.handle().clone());
+        let window: WindowId = app.create_window(WindowOptions {
+            title: SmolStr::new_static("frame-release"),
+            size: Size::new(320.0, 240.0),
+            scale: Scale::ONE,
+            ..WindowOptions::default()
+        });
+        let root = app.window(window).expect("window").tree().root();
+        let _ = NodeBuilder::boxed()
+            .layout_override(Rect::new(0.0, 0.0, 32.0, 32.0))
+            .build(app.window_mut(window).expect("window").tree_mut(), root)
+            .expect("box");
+
+        let outcome = app.frame(window).expect("window").expect("frame");
+        assert!(
+            matches!(outcome, FrameOutcome::Committed(_)),
+            "headless 帧必须提交（没有渲染器时 `frame_reaches_gpu` 恒真）"
+        );
+        let view = app.window(window).expect("window");
+        assert!(view.pending_delta.is_none(), "帧末必须释放 SceneDelta");
+        assert!(view.pending_payload.is_none(), "帧末必须释放载荷");
     }
 }
