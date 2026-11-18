@@ -1,25 +1,34 @@
 //! `window` / `idle` 模式：真机真窗口。
 //!
-//! 帧间隔口径（写进报告，避免与 HUD 的 FPS 对不上）：在 `App::on_frame` 钩子里**自己提交**本帧
-//! 并记录**提交时刻**，相邻两次提交的时间差就是帧间隔（与 `DebugHudMetrics::frame_interval`
-//! 同源：都是「commit → commit」，不是「GPU 完成」，也不是「上屏」）。帧间节奏由平台帧时钟决定
-//! （Windows `DCompositionWaitForCompositorClock` / macOS display link / Linux frame callback），
-//! 因此这个间隔就是 vsync 节拍的实测值。
+//! # 帧间隔口径（写进报告，避免与 HUD 的 FPS 对不上）
 //!
-//! 为什么要自己提交而不是等泵提交：泵的 `frame_all` 只在 `tick && needs_continuous_frames`
-//! 时出帧，外面拿不到「本帧 CPU 起点」。钩子里的 `App::frame` 让我们能同时测到
-//! **UI 线程帧内 CPU**（样式 → 文本 → 布局 → 绘制 → 发布；真实窗口的实例编码在合成线程）。
-//! 泵随后那次 `frame` 因为没有脏位而退化为 `Idle`（不产生额外帧）。
+//! 测量点是 **UI 线程提交帧**（`FrameOutcome::Committed` 的时刻，commit → commit），不是
+//! 「GPU 完成」也不是「上屏」：
 //!
-//! 持续出帧靠一个 4×4 装饰节点的长动画（`needs_continuous_frames` 只认动画或 HUD）：
-//! 没有它，泵会阻塞在消息等待上，测到的间隔是输入驱动的，不是刷新率。
+//! - **驱动**：一个按目标刷新率（`--hz`，默认 60）节拍的数据泵线程（混合 sleep + 1 ms 自旋，
+//!   精度 ~0.1 ms）。每个节拍给 UI 线程投一次「增量帧更新」；UI 线程在钩子里应用更新并提交一帧。
+//!   这样测的是「数据以 60/120 Hz 到达时，引擎能否稳定每拍交一帧」——市场数据类界面的真实形态。
+//!   为什么不用「每次泵循环都写状态」：那会自己唤醒自己（写状态 ⇒ `request_frame` ⇒ 唤醒 ⇒
+//!   再写），实测变成 ~300 fps 的忙循环，测到的就不是刷新节拍了。
+//! - **present 级抖动不在本 harness 的测量面**：`FrameFeedback::presented_at`（macOS 的
+//!   `presentedTime` / Linux 的 `wl_callback`）是 crate 私有。平台节拍本身由帧时钟决定
+//!   （Windows `DCompositionWaitForCompositorClock` / macOS display link / Linux frame callback）；
+//!   Linux 的提交本来就被 `wl_callback` 门禁（`state.frame_ready`），因此 Linux 的 commit 间隔
+//!   **就是** present 间隔。HUD（`--features hud --hud`）给出引擎自报的 FPS/Frame/Latency，
+//!   作为同源旁证（报告里附截图）。
+//!
+//! # 为什么钩子里自己提交一帧
+//!
+//! 泵的 `frame_all` 只在「有唤醒 / 平台节拍」时出帧，外面拿不到「本帧 CPU 起点」。钩子里的
+//! `App::frame` 让我们能同时测到 **UI 线程帧内 CPU**（样式 → 文本 → 布局 → 绘制 → 发布；
+//! 真实窗口的实例编码在合成线程）。泵随后那次 `frame` 因为没有脏位而退化为 `Idle`。
 
 use std::{
     cell::Cell,
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -37,13 +46,10 @@ use crate::{
     scene::{self, Load},
 };
 
-/// 60 fps 的判定下限（60 Hz 显示器 vsync 锁定时中位间隔 16.67 ms ⇒ 59.9 fps；
-/// 允许 1 fps 的协议/测量开销，超过它才算掉帧）。
-const MIN_FPS: f64 = 59.0;
-/// 帧间隔抖动上限（毫秒）。
+/// 帧间隔抖动上限（毫秒；相对**目标间隔**的 RMS 偏差）。
 const MAX_JITTER_MS: f64 = 1.0;
-/// 掉帧判据：间隔 ≥ 中位数的 1.5 倍（跳过至少一个 vsync）。
-const DROPPED_FACTOR: f64 = 1.5;
+/// 掉拍判据：间隔 ≥ 目标间隔的 1.5 倍（漏了至少一拍）。
+const MISSED_FACTOR: f64 = 1.5;
 /// 进度打印间隔。
 const PROGRESS: Duration = Duration::from_secs(5);
 
@@ -54,6 +60,8 @@ struct WindowRun {
     started: Instant,
     measure_at: Instant,
     deadline: Instant,
+    /// 目标间隔（微秒；`--hz` 的倒数）。
+    target_us: f64,
     intervals: Samples,
     frame_cpu: Samples,
     update_cpu: Samples,
@@ -71,14 +79,15 @@ impl WindowRun {
         let duration = Duration::from_secs_f64(config.window_seconds.max(0.1));
         let measure_at = started + warmup;
         let deadline = measure_at + duration;
-        // 容量按「刷新率上限 360 Hz」估算，测量期不扩容。
-        let capacity = (duration.as_secs_f64() * 360.0).ceil() as usize + 8;
+        // 容量按「目标频率 × 1.5」估算（比目标快 50% 也不扩容）。
+        let capacity = (duration.as_secs_f64() * f64::from(config.hz) * 1.5).ceil() as usize + 8;
         Self {
             warmup,
             duration,
             started,
             measure_at,
             deadline,
+            target_us: 1e6 / f64::from(config.hz.max(1)),
             intervals: Samples::new("frame interval", capacity),
             frame_cpu: Samples::new("ui thread frame cpu", capacity),
             update_cpu: Samples::new("ui thread update cpu", capacity),
@@ -113,12 +122,12 @@ impl WindowRun {
     }
 
     /// 打印报告；返回 `true` = 帧率与抖动都达标。
-    fn report(&self) -> bool {
+    fn report(&self, hz: u32) -> bool {
         let elapsed = self.started.elapsed().as_secs_f64();
         println!();
-        println!("-- 帧率与抖动（真机真窗口，commit → commit） --");
+        println!("-- 帧率与抖动（真机真窗口，commit → commit，驱动 {hz} Hz） --");
         println!(
-            "运行 {:.1}s（预热 {:.1}s / 测量 {:.1}s）提交帧 {}；测量期帧数 {}",
+            "运行 {:.1}s（预热 {:.1}s / 测量 {:.1}s）提交帧 {}；测量期间隔样本 {}",
             elapsed,
             self.warmup.as_secs_f64(),
             self.duration.as_secs_f64(),
@@ -130,52 +139,69 @@ impl WindowRun {
             return false;
         };
         println!("{}", report.lines());
-        let dropped = report
+
+        // 相对**目标间隔**（而不是中位数）的抖动：漏拍会同时抬高它和掉拍计数。
+        let target = self.target_us;
+        let rms = (self
             .intervals
             .values()
             .iter()
-            .filter(|interval| **interval >= report.intervals.summary().map_or(f64::INFINITY, |s| s.p50_us) * DROPPED_FACTOR)
+            .map(|value| {
+                let delta = value - target;
+                delta * delta
+            })
+            .sum::<f64>()
+            / self.intervals.len() as f64)
+            .sqrt();
+        let missed = self
+            .intervals
+            .values()
+            .iter()
+            .filter(|interval| **interval >= target * MISSED_FACTOR)
             .count();
         let throughput = self.intervals.len() as f64 / self.duration.as_secs_f64();
         println!(
-            "测量期吞吐          {:.2} fps（帧数 / 测量时长）",
-            throughput
+            "目标间隔            {:.3} ms（{hz} Hz）",
+            target / 1e3
         );
         println!(
-            "掉帧（间隔 ≥{:.1}× 中位） {} / {}",
-            DROPPED_FACTOR, dropped,
+            "抖动（RMS vs 目标）  {:.3} ms",
+            rms / 1e3
+        );
+        println!(
+            "掉拍（间隔 ≥{MISSED_FACTOR:.1}× 目标） {missed} / {}",
             self.intervals.len()
         );
-        let refresh = report.fps;
-        println!("反推刷新率          {refresh:.2} Hz（1000 / 中位间隔）");
+        println!("测量期吞吐          {throughput:.2} fps（帧数 / 测量时长）");
         println!();
         println!("-- UI 线程 CPU（本帧 `App::frame`；编码在合成线程） --");
         println!("{}", self.frame_cpu.line());
         println!("{}", self.update_cpu.line());
-
-        let fps_ok = report.fps >= MIN_FPS;
-        let jitter_ok = report.jitter_us <= MAX_JITTER_MS * 1e3;
         println!();
         println!("-- 判定（真机窗口） --");
+        let jitter_ok = rms <= MAX_JITTER_MS * 1e3;
+        // 60 Hz 目标：≥60 fps（60 Hz vsync 锁定的 59.9 视为达标）；
+        // 120 Hz 目标：测的是「能否稳定每 8.33 ms 交一帧」，达标口径同为 fps ≥ 目标频率 - 1。
+        let fps_ok = throughput >= f64::from(hz) - 1.0;
         println!(
-            "≥60 fps               实测 {:.2} fps（门槛 ≥{MIN_FPS:.0}，60 Hz vsync 锁定即 59.9）⇒ {}",
-            report.fps,
+            "≥{hz} fps（吞吐）         实测 {throughput:.2} fps（门槛 ≥{:.0}）⇒ {}",
+            f64::from(hz) - 1.0,
             verdict(fps_ok)
         );
         println!(
             "帧间隔抖动 ≤1 ms      实测 RMS {:.3} ms ⇒ {}",
-            report.jitter_us / 1e3,
+            rms / 1e3,
             verdict(jitter_ok)
         );
-        if refresh < 90.0 {
+        if hz < 90 {
             println!(
-                "120 Hz                本机显示器为该间隔反推的 {refresh:.1} Hz，**无 120 Hz 屏幕，\
-                 120 Hz 无法在此机验证**；逻辑就绪证据见 `src/render/frame_clock.rs`\
-                 （`frame_interval(120)=8.33ms` / `normalize_refresh_hz` 24–360 Hz / \
-                 `FramePacing` 的 target 推导）与 `src/render/macos/clock.rs` 的 display link 对齐。"
+                "120 Hz 能力           目标频率 60 Hz 下测得抖动 {:.3} ms；\
+                 120 Hz 的**逻辑**由 `src/render/frame_clock.rs` 的帧时钟保证（\
+                 `frame_interval(120)=8.33ms` / `normalize_refresh_hz` 24–360 Hz / \
+                 `FramePacing` 目标推导 / display link 对齐），本机显示器只有 60 Hz，\
+                 120 Hz 的**上屏**无法验证（详见报告「120 Hz」一节）。",
+                rms / 1e3
             );
-        } else {
-            println!("120 Hz                已在该显示器上实测（中位间隔 {:.2} ms ⇒ {refresh:.1} Hz）", 1e3 / refresh);
         }
         fps_ok && jitter_ok
     }
@@ -199,14 +225,18 @@ pub fn run_window(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
     print_environment(&app, window);
     println!("{}", load.describe(&app));
     println!(
-        "测量计划：预热 {:.1}s，测量 {:.1}s，脚本 = 增量帧（5 行盘口 + 1 笔成交 + 滚动 + 折线平移）",
-        config.window_warmup_seconds, config.window_seconds
+        "测量计划：目标 {} Hz（间隔 {:.3} ms），预热 {:.1}s，测量 {:.1}s；\
+         数据泵每拍投一次「5 行盘口 + 1 笔成交 + 滚动 + 折线平移」",
+        config.hz,
+        1e3 / f64::from(config.hz.max(1)),
+        config.window_warmup_seconds,
+        config.window_seconds
     );
-    load.install_continuous_frames(&mut app)?;
-    #[cfg(feature = "hud")]
-    if config.hud {
+    #[cfg(feature = "hud")]    if config.hud {
         app.set_debug_hud(window, true)?;
-        println!("Debug HUD：已打开（右上角显示 FPS / Frame / CPU / Upload / Present / Latency / Draw）");
+        println!(
+            "Debug HUD：已打开（F12 切换；截图证据见报告）"
+        );
     }
     #[cfg(not(feature = "hud"))]
     if config.hud {
@@ -219,19 +249,63 @@ pub fn run_window(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
     let mut run = WindowRun::new(config);
     let passed = Rc::new(Cell::new(false));
     let result_slot = Rc::clone(&passed);
+
+    // 数据泵：按目标刷新率投递「本拍该更新」的信号（混合 sleep + 1 ms 自旋保证精度）。
+    let pending = Arc::new(AtomicU32::new(0));
+    let stop_pump = Arc::new(AtomicBool::new(false));
+    let handle = app.handle();
+    {
+        let pending = Arc::clone(&pending);
+        let stop_pump = Arc::clone(&stop_pump);
+        let hz = config.hz.max(1);
+        let period = Duration::from_secs_f64(1.0 / f64::from(hz));
+        std::thread::spawn(move || {
+            let mut next = Instant::now();
+            loop {
+                if stop_pump.load(Ordering::Acquire) {
+                    return;
+                }
+                next += period;
+                let now = Instant::now();
+                if next > now {
+                    let remaining = next - now;
+                    // 先睡到目标前 1 ms，再自旋（Sleep 在 Windows 上的默认精度是 15.6 ms）。
+                    if remaining > Duration::from_millis(1) {
+                        std::thread::sleep(remaining - Duration::from_millis(1));
+                    }
+                    while Instant::now() < next {
+                        std::hint::spin_loop();
+                    }
+                } else {
+                    // 落后了（上一拍被抢占）：立刻补一拍并重新对齐相位。
+                    next = now;
+                }
+                pending.fetch_add(1, Ordering::AcqRel);
+                handle.wake();
+            }
+        });
+    }
+
+    let hz = config.hz.max(1);
+    // 关闭时自唤醒一次：钩子跑在泵的 ④ 步（关闭检查在 ③），不补一拍唤醒的话泵会在
+    // `GetMessageW` 上永久阻塞（窗口已从 `App` 移除，但没有新的唤醒到达）。
+    let close_handle = app.handle();
     app.on_frame(move |app| {
         if run.finished {
             return;
         }
         let now = Instant::now();
-        let update_started = Instant::now();
-        load.incremental_step(app);
-        let update_time = update_started.elapsed();
-        let frame_started = Instant::now();
-        let outcome = app.frame(window);
-        let frame_time = frame_started.elapsed();
-        if matches!(outcome, Some(Ok(FrameOutcome::Committed(_)))) {
-            run.observe(now, update_time, frame_time);
+        // 只应用「一拍」：积压的节拍合并成一次更新（最新值胜），与真实行情的合并语义一致。
+        if pending.swap(0, Ordering::AcqRel) > 0 {
+            let update_started = Instant::now();
+            load.incremental_step(app);
+            let update_time = update_started.elapsed();
+            let frame_started = Instant::now();
+            let outcome = app.frame(window);
+            let frame_time = frame_started.elapsed();
+            if matches!(outcome, Some(Ok(FrameOutcome::Committed(_)))) {
+                run.observe(now, update_time, frame_time);
+            }
         }
         if run.last_progress.elapsed() >= PROGRESS {
             run.last_progress = Instant::now();
@@ -249,9 +323,11 @@ pub fn run_window(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
         }
         if now >= run.deadline {
             run.finished = true;
-            let ok = run.report();
+            let ok = run.report(hz);
             result_slot.set(ok);
+            stop_pump.store(true, Ordering::Release);
             let _ = app.close_window(window);
+            close_handle.wake();
         }
     });
 
@@ -273,7 +349,7 @@ pub fn run_idle(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
     });
     let load = Load::build(&mut app, window)?;
 
-    println!("== 最终合成负载验收 · idle 模式（窗口静止 60 s） ==");
+    println!("== 最终合成负载验收 · idle 模式（窗口静止） ==");
     print_environment(&app, window);
     println!("{}", load.describe(&app));
     println!("pid={}", std::process::id());
@@ -286,52 +362,49 @@ pub fn run_idle(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
     );
 
     let stop = Arc::new(AtomicBool::new(false));
-    let stop_flag = Arc::clone(&stop);
     let stop_hook = Arc::clone(&stop);
+    let handle = app.handle();
+    let close_handle = handle.clone();
     app.on_frame(move |app| {
         if stop_hook.load(Ordering::Acquire) {
             let _ = app.close_window(window);
+            // 钩子在泵的 ④ 步、关闭检查在 ③ 步：自己补一拍唤醒，否则泵在关闭后
+            // 还会阻塞在 `GetMessageW` 上。
+            close_handle.wake();
         }
     });
-    let handle = app.handle();
     let idle_seconds = config.idle_seconds;
     let idle_warmup = config.idle_warmup_seconds;
+    let passed = Arc::new(AtomicBool::new(false));
+    let passed_thread = Arc::clone(&passed);
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(idle_warmup));
         println!("idle: 采样窗口开始（{idle_seconds} s，进程静止）");
-        let measurement = sample_idle_cpu(Duration::from_secs(idle_seconds));
-        match measurement {
+        match sample_idle_cpu(Duration::from_secs(idle_seconds)) {
             Some(idle) => {
                 println!();
                 println!("-- 空闲 CPU（窗口静止 {}s） --", idle_seconds);
                 println!("{}", idle.line());
+                let ok = idle.percent_of_core() < 1.0;
+                passed_thread.store(ok, Ordering::Release);
                 println!(
-                    "判定：空闲 CPU <1%（占单核）⇒ {}",
-                    verdict(idle.percent_of_core() < 1.0)
-                );
-                println!(
-                    "备注：占整机口径 {:.4}%（分母 {} 逻辑核）；两口径都远小于 1%",
+                    "判定：空闲 CPU <1%（占单核）⇒ {}；占整机 {:.4}%（分母 {} 逻辑核）",
+                    verdict(ok),
                     idle.percent_of_machine(),
                     crate::report::cores()
                 );
-                if idle.percent_of_core() >= 1.0 {
-                    stop_flag.store(true, Ordering::Release);
-                    // 不达标时也要退出：报告已经打出。
-                }
-                stop_flag.store(true, Ordering::Release);
             }
             None => {
                 println!("空闲 CPU：本平台无法读取进程 CPU 时间（采样失败）⇒ FAIL");
-                stop_flag.store(true, Ordering::Release);
             }
         }
+        stop.store(true, Ordering::Release);
         handle.wake();
     });
 
     Application::new().run(app)?;
     println!("idle 模式结束（窗口已关闭）");
-    // 采样线程已经把结论打进日志；达标与否由日志里的判定行决定（这里不做二次推断）。
-    Ok(true)
+    Ok(passed.load(Ordering::Acquire))
 }
 
 /// 打印测量环境（OS / 核数 / 窗口尺寸 / DPI）。

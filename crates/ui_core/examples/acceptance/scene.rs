@@ -17,18 +17,16 @@
 //! 也让「增量帧 CPU」不被 taffy 的整树布局淹没。固定头部/侧栏不在任何滚动容器里，
 //! 它们的存在用来验证滚动帧不会波及不相关子树。
 
-use std::time::Duration;
-
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
     error::EngineError,
-    interaction::{AnimatedValue, AnimationSpec, Easing, ScrollConfig, ScrollHandle},
+    interaction::{ScrollConfig, ScrollHandle},
     math::{Point, Rect, Size, Transform},
     node::{
         builder::NodeBuilder,
         id::NodeId,
-        signal::{Signal, Transient},
+        signal::Signal,
         tree::NodeTree,
     },
     paint::{
@@ -148,8 +146,6 @@ struct Handles {
     chart: NodeId,
     book_viewport: NodeId,
     tape_viewport: NodeId,
-    pulse: Transient<f32>,
-    pulse_node: NodeId,
 }
 
 /// 场景句柄：驱动更新需要的全部句柄与状态。
@@ -164,10 +160,6 @@ pub struct Load {
     pub chart: NodeId,
     /// 成交列表滚动句柄。
     tape_scroll: ScrollHandle,
-    /// 持续帧的动画落点（`Transient` + 1 个装饰节点）。
-    pulse: Transient<f32>,
-    /// 动画装饰节点。
-    pulse_node: NodeId,
     /// 折线窗口平移量（逻辑像素）。
     chart_pan: f32,
     /// 已推进的脚本步数（成交序号 / 值生成共用）。
@@ -198,7 +190,6 @@ impl Load {
         for row in 0..TRADE_ROWS {
             trade_rows.push(app.signal(TradeRow(row as u32)));
         }
-        let pulse = app.transient(0.0f32);
         let chart_geometry = register_chart(app)?;
 
         let handles = {
@@ -206,7 +197,7 @@ impl Load {
                 .window_mut(window)
                 .ok_or(EngineError::UnknownWindow { window })?
                 .tree_mut();
-            build_tree(tree, root, &book_rows, &trade_rows, chart_geometry, pulse)
+            build_tree(tree, root, &book_rows, &trade_rows, chart_geometry)
         };
 
         let book_scroll = app.make_scroll(window, handles.book_viewport, ScrollConfig::default())?;
@@ -232,8 +223,6 @@ impl Load {
             trade_rows,
             chart: handles.chart,
             tape_scroll,
-            pulse: handles.pulse,
-            pulse_node: handles.pulse_node,
             chart_pan: 0.0,
             step: 0,
             trade_seq: TRADE_ROWS as u32,
@@ -259,30 +248,6 @@ impl Load {
             CHART_POINTS * 2,
             self.node_count(app)
         )
-    }
-
-    /// 让平台**持续出帧**（真实窗口模式的帧间隔才有 vsync 意义）。
-    ///
-    /// 引擎的 `needs_continuous_frames` 只认「有动画」或「HUD 可见」：没有它，泵会在
-    /// `GetMessageW` 上阻塞到下一次输入，测到的就不是刷新节拍。动画落在一个 4×4 装饰节点上
-    /// （每帧 1 个 style patch），代价远小于被测量的负载。
-    ///
-    /// # Errors
-    /// 窗口不存在（`UnknownWindow`）。
-    pub fn install_continuous_frames(&mut self, app: &mut App) -> Result<(), EngineError> {
-        app.animate(
-            self.window,
-            AnimatedValue::Scalar {
-                target: self.pulse,
-                to: 1.0,
-            },
-            &[self.pulse_node],
-            AnimationSpec {
-                duration: Duration::from_secs(36_000),
-                easing: Easing::Linear,
-            },
-        )?;
-        Ok(())
     }
 
     /// 增量帧：改 5 行盘口 + 追加 1 笔成交并滚动 1 行 + 折线窗口平移 0.5 px。
@@ -377,7 +342,6 @@ fn build_tree(
     book_rows: &[Signal<BookRow>],
     trade_rows: &[Signal<TradeRow>],
     chart_geometry: GeometryId,
-    pulse: Transient<f32>,
 ) -> Handles {
     let card = Color::from_rgba8(CARD_RGBA);
     let border = Color::from_rgba8(CARD_BORDER_RGBA);
@@ -583,31 +547,10 @@ fn build_tree(
         }
     }
 
-    // ── 持续帧的动画落点（4×4 装饰节点，代价可忽略） ─────────────────────
-    let pulse_node = NodeBuilder::boxed()
-        .layout_override(Rect::new(
-            WINDOW_WIDTH - 12.0,
-            WINDOW_HEIGHT - 12.0,
-            4.0,
-            4.0,
-        ))
-        .paint(PaintSpec {
-            background: accent,
-            ..PaintSpec::default()
-        })
-        .bind_style(move |cx| StylePatch {
-            opacity: Some(*cx.read_transient(&pulse)),
-            ..StylePatch::default()
-        })
-        .build(tree, root)
-        .expect("动画装饰节点");
-
     Handles {
         chart,
         book_viewport,
         tape_viewport,
-        pulse,
-        pulse_node,
     }
 }
 

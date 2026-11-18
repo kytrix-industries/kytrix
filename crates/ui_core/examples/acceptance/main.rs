@@ -38,6 +38,8 @@ pub struct Config {
     pub idle_frames: usize,
     /// 真实窗口模式的测量时长（秒，默认 20）。
     pub window_seconds: f64,
+    /// 真实窗口模式的数据泵目标频率（Hz，默认 60；`120` 用来验证 120 Hz 节拍能力）。
+    pub hz: u32,
     /// 真实窗口模式的预热时长（秒，默认 3）。
     pub window_warmup_seconds: f64,
     /// 空闲 CPU 的采样时长（秒，默认 60）。
@@ -60,6 +62,7 @@ impl Default for Config {
             scroll_frames: 30,
             idle_frames: 10,
             window_seconds: 20.0,
+            hz: 60,
             window_warmup_seconds: 3.0,
             idle_seconds: 60,
             idle_warmup_seconds: 3,
@@ -87,6 +90,7 @@ options:
   --scroll-frames N  只滚动成交列表的帧数（默认 30）
   --idle-frames N    空闲帧数（默认 10）
   --seconds F        窗口模式测量秒数（默认 20）
+  --hz N             窗口模式数据泵目标频率（默认 60；120 = 验证 120 Hz 节拍）
   --window-warmup F  窗口模式预热秒数（默认 3）
   --idle-seconds N   空闲 CPU 采样秒数（默认 60）
   --idle-warmup N    空闲 CPU 预热秒数（默认 3）
@@ -142,6 +146,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
                     "--scroll-frames" => config.scroll_frames = parsed as usize,
                     "--idle-frames" => config.idle_frames = parsed as usize,
                     "--seconds" => config.window_seconds = parsed,
+                    "--hz" => config.hz = parsed as u32,
                     "--window-warmup" => config.window_warmup_seconds = parsed,
                     "--idle-seconds" => config.idle_seconds = parsed as u64,
                     "--idle-warmup" => config.idle_warmup_seconds = parsed as u64,
