@@ -12,8 +12,8 @@
 //!   （`wndproc.rs` 文件头纪律 1）；
 //! - 泵在 `collect_events` **之前**统一 `SetWindowPos` 一次（`pump::apply_pending_resizes`），
 //!   同步产生的 `WM_SIZE` 走现有事件链路：`set_size` 标 `LAYOUT` + `set_surface` 标全量 damage；
-//! - 出帧合并只靠「消息队列天然成批 + `pending_resize` 最新赢 + 上一帧未上屏就跳过」
-//!   （`pump::ResizePacing`，**没有**任何定时器）。
+//! - 出帧合并只靠「消息队列天然成批 + `pending_resize` 最新赢 + 流水线深度 2 背压」
+//!   （`pump::ResizePacing`：允许 2 帧在飞，已发布落后已上屏 ≥2 帧才跳过；**没有**任何定时器）。
 //!
 //! `HTCAPTION` / 系统按钮**仍然交系统**：Aero Snap / Snap Layouts / 双击最大化 / 右键系统菜单
 //! 只存在于系统的 move 模态循环里（见 `wndproc.rs` 文件头纪律 2）。

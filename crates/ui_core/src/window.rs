@@ -403,6 +403,13 @@ pub struct Window {
     paint_order: Vec<crate::paint::scene::LaneId>,
     /// 尺寸/DPI 变化 ⇒ 必须整帧重绘（S-64）。
     full_damage_pending: bool,
+    /// 最近一次**完成**（GPU 线程反馈）帧的 `FrameIndex`；`None` = 还没观测到完成帧。
+    ///
+    /// 拖动期出帧背压（P-D，`platform::windows::event_loop::pump::ResizePacing`）用它算流水线
+    /// 深度：`已发布序号 − 已上屏序号`。只有 Windows 需要它（其它平台没有自持 resize 的背压），
+    /// 因此按 `cfg(windows)` 存在，避免另一端出现 dead code。
+    #[cfg(windows)]
+    last_presented_frame: Option<FrameIndex>,
     /// `App::frame` 在提交前写入的帧统计（仅 `test-support`）。
     #[cfg(feature = "test-support")]
     stats: FrameStats,
@@ -488,6 +495,8 @@ impl Window {
             timings: FrameTimings::new(),
             paint_order: Vec::new(),
             full_damage_pending: false,
+            #[cfg(windows)]
+            last_presented_frame: None,
             #[cfg(feature = "test-support")]
             stats: FrameStats::default(),
             #[cfg(feature = "test-support")]
@@ -655,6 +664,15 @@ impl Window {
     #[must_use]
     pub fn frame_index(&self) -> FrameIndex {
         frame::frame_index(self)
+    }
+    /// 最近一次**完成**帧的 `FrameIndex`（Windows 拖动期出帧背压用；`None` = 还没有完成反馈）。
+    ///
+    /// 三端反馈槽里都带 `FrameFeedback::index`，但只有 Windows 的自持 resize 背压消费它，
+    /// 见字段文档（`cfg(windows)`）。
+    #[cfg(windows)]
+    #[must_use]
+    pub(crate) fn last_presented_frame(&self) -> Option<FrameIndex> {
+        surface::last_presented_frame(self)
     }
     /// 实现见子模块 `frame::compute_layout`（本文件只保留签名）。
     pub fn compute_layout(&mut self) -> Result<LayoutReport, EngineError> {

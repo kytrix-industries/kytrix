@@ -42,7 +42,7 @@ use crate::{
         windows::{composition, dpi_awareness, frame_clock::FrameClock, window::NativeWindow},
     },
     render::backend::Renderer,
-    window::{FrameOutcome, Window, WindowId, WindowOptions},
+    window::{FrameIndex, FrameOutcome, Window, WindowId, WindowOptions},
 };
 
 /// 消费者：`wndproc` 的 `WM_TIMER` 分支与 `pump_loop` 的定时器管理。
@@ -505,7 +505,8 @@ pub(super) fn pump_loop(
     let mut pacer = FramePacer::new();
     // 合成几何的客户区缓存（R07-11）：稳态每轮每窗 0 次系统调用。
     let mut geometry = GeometryCache::new();
-    // 拖动期出帧背压（P-A）：自持缩放会话中「上一帧未上屏则跳过」，不用定时器合并鼠标。
+    // 拖动期出帧背压（P-D）：自持缩放会话中「允许 2 帧在飞，落后 ≥2 帧才跳过」，
+    // 不用定时器合并鼠标。
     let mut resize_pacing = ResizePacing::new();
     // a11y 补发兜底定时器的宿主窗口（定时器随窗口销毁失效，首窗换人时要重建，P2-4）。
     // 归属判定用 `WindowId` 而不是 HWND 裸值：首窗销毁后系统可能把同一个 HWND 复用给新窗，
@@ -676,7 +677,8 @@ pub(super) fn pump_loop(
         }
 
         // ④ 应用钩子（读事件 / 写状态），再提交本帧；两段门禁在 `App::frame` 里，闲时是 `Idle`。
-        // 自持缩放会话中的窗口按 `ResizePacing` 背压跳过（上一帧未上屏就不重排/重绘）。
+        // 自持缩放会话中的窗口按 `ResizePacing` 的流水线深度背压跳过（已有 2 帧在飞时
+        // 不重排/重绘；presented 推进一帧就恢复）。
         app.run_frame_hook();
         if dispatcher.take_frame_wake() {
             frame_all(app, windows, &mut resize_pacing)?;
@@ -762,40 +764,38 @@ pub(super) fn retarget_wake(windows: &[NativeWindow], dispatcher: &Arc<Dispatche
 /// 消费者：`pump_loop` 的 ④ 帧步骤。
 ///
 /// 逐窗口提交一帧；`Err` 立刻终止（device lost / swapchain 失败都不可重试）。
-/// 自持缩放会话中的窗口按 [`ResizePacing`] 的背压跳过（合并鼠标上报，见该类型文档）。
+/// 自持缩放会话中的窗口按 [`ResizePacing`] 的**流水线深度**背压跳过（合并鼠标上报，见该类型
+/// 文档）。
 pub(super) fn frame_all(
     app: &mut App,
     windows: &mut [NativeWindow],
     pacing: &mut ResizePacing,
 ) -> Result<(), EngineError> {
-    // 本帧放行的窗口；`Some(surface)` = 会话中（出帧后记进背压账目），`None` = 无常驻账目。
-    let mut ready: Vec<(WindowId, Option<(u32, u32)>)> = Vec::with_capacity(windows.len());
+    // 本帧放行的窗口；`true` = 缩放会话中（出帧后记已发布序号），`false` = 无背压账目。
+    let mut ready: Vec<(WindowId, bool)> = Vec::with_capacity(windows.len());
     for native in windows.iter_mut() {
         let id = native.id();
         if !native.state_mut().resize_active() {
-            ready.push((id, None));
+            ready.push((id, false));
             continue;
         }
-        // 只有会话中的窗口才查客户区：它就是本帧要发布的渲染目标（`WM_SIZE` 的 lParam 与
-        // `GetClientRect` 同源），而稳态非会话窗口仍然是每轮 0 次系统调用（R07-11）。
-        let surface = native.client_size();
-        let presented = app
-            .window(id)
-            .map(Window::presented_surface)
-            .unwrap_or_default();
-        if pacing.should_skip(id, true, presented) {
+        let Some(window) = app.window(id) else {
+            continue;
+        };
+        // `frame_index()` = 最近一次**已提交**的序号（会话第一帧用它给账目播种）；
+        // `last_presented_frame()` = 最近一次**完成**帧的序号（GPU 线程反馈，`None` = 还没有）。
+        // 两者都是 `FrameScheduler` 的单调序号，跨设备恢复仍然可比。
+        if pacing.should_skip(id, window.frame_index(), window.last_presented_frame()) {
             continue;
         }
-        ready.push((id, Some(surface)));
+        ready.push((id, true));
     }
-    for (id, surface) in ready {
+    for (id, paced) in ready {
         match app.frame(id) {
             None => {}
             Some(Ok(outcome)) => {
-                if matches!(outcome, FrameOutcome::Committed(_))
-                    && let Some(surface) = surface
-                {
-                    pacing.note_published(id, surface);
+                if paced && let FrameOutcome::Committed(index) = outcome {
+                    pacing.note_published(id, index);
                 }
             }
             Some(Err(error)) => return Err(error),
@@ -810,14 +810,25 @@ pub(super) fn frame_all(
     Ok(())
 }
 
-/// 拖动期出帧背压（P-A）：每窗口「最近一次已发布的 surface」。
+/// 拖动期出帧背压（P-D）：每窗口「最近一次已发布的 `FrameIndex`」+ 连续跳过计数。
 ///
 /// 自持缩放会话里鼠标可以上报到数百 Hz，而一次真实帧要重排 + 按新尺寸重绘。合并**不能**用
-/// 定时器（产品前提：不用定时器驱动刷新），所以改成背压：会话中的窗口只有在上一次发布的帧
-/// **已经上屏**（`presented == published`）时才出下一帧，否则跳过本帧、把 damage 留给下一轮。
+/// 定时器（产品前提：不用定时器驱动刷新），所以用**流水线深度**背压：允许同一窗口同时有
+/// [`MAX_IN_FLIGHT`]（2）帧在飞 —— 「已发布序号 − 已上屏序号 ≥ 2」时才跳过本帧、把 damage
+/// 留给下一轮。
+///
+/// 为什么不是深度 1（旧实现）：深度 1 要求上一帧上屏后才画下一帧，于是每帧都付「一帧呈现
+/// 延迟 + 一次重新绘制」，实测 release 拖动只有 32 fps @ 60 Hz（≈2 vsync/帧）。深度 2 让 GPU
+/// 线程**在呈现第 N 帧的同时录制第 N+1 帧**，把呈现延迟藏进流水线 ⇒ 出帧率回到刷新率。
 ///
 /// 唤醒来源是 present 完成后的 `WM_APP_COMPOSITION_WAKE`：缩放期间每帧尺寸都在变，
 /// `publish_presented` 的「尺寸变化才通知」因此每帧都会触发，正好当「上一帧上屏了」的信号。
+///
+/// **前向推进保险**：`presented` 可能长时间不前进（设备重置后反馈断流、帧被合成端吸收且不再
+/// 通知、GPU 线程异常）。只按深度判据会永久停帧（damage 一直留着但没人放行），因此同一窗口
+/// **连续跳过** [`MAX_CONSECUTIVE_SKIPS`]（8）次后强制放行一帧并清零计数：最坏情况只是多画
+/// 一帧，不会把窗口拖死。`presented` 未知（还没有完成反馈）时直接放行。
+///
 /// 会话结束（松手 / Esc / 取消）后不再跳过，最终尺寸一定落在一帧真实帧上。
 pub(crate) struct ResizePacing {
     entries: Vec<ResizePacingEntry>,
@@ -825,9 +836,17 @@ pub(crate) struct ResizePacing {
 
 struct ResizePacingEntry {
     window: WindowId,
-    /// 最近一次**已发布**（`App::frame` 提交成功）的 surface 尺寸。
-    published: (u32, u32),
+    /// 最近一次**已发布**（`App::frame` 提交成功）的 `FrameIndex`。
+    published: FrameIndex,
+    /// 连续跳过次数（前向推进保险；任何一次放行都清零）。
+    skips: u32,
 }
+
+/// 允许同时在飞的帧数（流水线深度）：2 = 呈现第 N 帧时录制第 N+1 帧。
+const MAX_IN_FLIGHT: u32 = 2;
+
+/// 连续跳过上限：只按深度判据会因反馈断流永久停帧，到上限后强制放行一帧。
+const MAX_CONSECUTIVE_SKIPS: u32 = 8;
 
 impl ResizePacing {
     fn new() -> Self {
@@ -836,33 +855,56 @@ impl ResizePacing {
         }
     }
 
-    /// 该窗口本帧是否跳过：会话中且「已发布的帧还没上屏」。
+    /// 该窗口本帧是否跳过。
     ///
-    /// 第一次看到某窗口的会话（还没有账目）时按 `presented` 初始化并**放行**本帧：会话开始时
-    /// 没有已知的在飞帧，缩放的第一个真实帧应当先出去。
-    fn should_skip(&mut self, window: WindowId, active: bool, presented: (u32, u32)) -> bool {
-        if !active {
-            return false;
-        }
-        match self.entries.iter_mut().find(|entry| entry.window == window) {
-            Some(entry) => entry.published != presented,
+    /// 规则（按顺序）：
+    /// 1. 会话第一帧（没有账目）：用 `current`（最近一次已提交的序号）播种并**放行**；
+    /// 2. `presented` 未知（还没有完成反馈）：放行（算不出深度）；
+    /// 3. `published − presented < MAX_IN_FLIGHT`：放行，并把连续跳过计数清零；
+    /// 4. 否则跳过；连续跳过达到 `MAX_CONSECUTIVE_SKIPS` 时强制放行一次并清零。
+    fn should_skip(
+        &mut self,
+        window: WindowId,
+        current: FrameIndex,
+        presented: Option<FrameIndex>,
+    ) -> bool {
+        let entry = match self.entries.iter_mut().find(|entry| entry.window == window) {
+            Some(entry) => entry,
             None => {
                 self.entries.push(ResizePacingEntry {
                     window,
-                    published: presented,
+                    published: current,
+                    skips: 0,
                 });
-                false
+                return false;
             }
+        };
+        let Some(presented) = presented else {
+            entry.skips = 0;
+            return false;
+        };
+        // `saturating_sub`：反馈乱序 / 陈旧时绝不 panic，最坏按「深度已满足」处理（放行）。
+        let in_flight = entry.published.get().saturating_sub(presented.get());
+        if in_flight < MAX_IN_FLIGHT {
+            entry.skips = 0;
+            return false;
         }
+        entry.skips = entry.skips.saturating_add(1);
+        if entry.skips >= MAX_CONSECUTIVE_SKIPS {
+            entry.skips = 0;
+            return false;
+        }
+        true
     }
 
-    /// 出帧成功后记账：本窗口最近一次发布的 surface。
-    fn note_published(&mut self, window: WindowId, surface: (u32, u32)) {
+    /// 出帧成功后记账：本窗口最近一次发布的 `FrameIndex`。
+    fn note_published(&mut self, window: WindowId, index: FrameIndex) {
         match self.entries.iter_mut().find(|entry| entry.window == window) {
-            Some(entry) => entry.published = surface,
+            Some(entry) => entry.published = index,
             None => self.entries.push(ResizePacingEntry {
                 window,
-                published: surface,
+                published: index,
+                skips: 0,
             }),
         }
     }
@@ -1062,65 +1104,136 @@ mod geometry_cache_tests {
 
 #[cfg(test)]
 mod resize_pacing_tests {
-    use super::ResizePacing;
-    use crate::window::WindowId;
+    use super::{MAX_CONSECUTIVE_SKIPS, ResizePacing};
+    use crate::window::{FrameIndex, WindowId};
 
     fn window(raw: u32) -> WindowId {
         WindowId::from_raw(raw)
     }
 
-    /// 会话中「上一帧已发布但还没上屏」必须跳过；presented 追平后立刻放行。
+    fn frame(raw: u32) -> FrameIndex {
+        FrameIndex::from_raw(raw)
+    }
+
+    /// **深度语义（P-D 的核心）**：允许 1 帧在飞（第二个可以发）；2 帧在飞时跳过；presented
+    /// 前进一帧后恢复。
     ///
-    /// 这就是拖动期的合并机制（替代定时器）：数百 Hz 鼠标上报只会在每个上屏周期里放行一帧。
+    /// 这是拖动期的合并机制（替代定时器）：数百 Hz 鼠标上报被压到「每帧上屏解锁一帧」；深度 2
+    /// 让呈现 N 的同时录制 N+1（深度 1 会退化成 ≈2 vsync/帧、release 实测 32 fps @ 60 Hz）。
     #[test]
-    fn a_published_but_unpresented_frame_skips_until_presented_catches_up() {
+    fn depth_two_allows_one_frame_in_flight_and_skips_the_second() {
         let mut pacing = ResizePacing::new();
         let id = window(1);
         assert!(
-            !pacing.should_skip(id, true, (800, 600)),
-            "会话的第一帧必须先出去（此时没有已知在飞帧）"
+            !pacing.should_skip(id, frame(10), None),
+            "会话第一帧必须先出去（账目用最近一次已提交序号播种）"
         );
-        pacing.note_published(id, (900, 700));
+        pacing.note_published(id, frame(11));
         assert!(
-            pacing.should_skip(id, true, (800, 600)),
-            "已发布 (900,700) 还没上屏：本帧必须跳过"
+            !pacing.should_skip(id, frame(11), Some(frame(10))),
+            "已发布 11、已上屏 10：只有 1 帧在飞 ⇒ 允许再发一帧（深度 2）"
+        );
+        pacing.note_published(id, frame(12));
+        assert!(
+            pacing.should_skip(id, frame(12), Some(frame(10))),
+            "已发布 12、已上屏 10：2 帧在飞 ⇒ 本帧必须跳过（damage 保留）"
         );
         assert!(
-            pacing.should_skip(id, true, (800, 600)),
-            "presented 不变就继续跳过（不进入帧 ⇒ damage 保留）"
+            !pacing.should_skip(id, frame(12), Some(frame(11))),
+            "presented 前进到 11 后只剩 1 帧在飞 ⇒ 必须放行"
         );
+        pacing.note_published(id, frame(13));
         assert!(
-            !pacing.should_skip(id, true, (900, 700)),
-            "presented 追上已发布尺寸后必须放行"
+            pacing.should_skip(id, frame(13), Some(frame(11))),
+            "已发布 13、已上屏 11：又是 2 帧在飞 ⇒ 继续跳过"
         );
     }
 
-    /// 非会话窗口永远不跳过，也不产生账目（稳态零成本）。
+    /// `presented` 未知（刚启动 / 反馈还没到）时放行：算不出深度，先画一帧，否则永远等不到
+    /// 第一帧完成。
     #[test]
-    fn an_inactive_session_never_skips_and_keeps_no_ledger() {
+    fn an_unknown_presented_frame_never_skips() {
         let mut pacing = ResizePacing::new();
         let id = window(1);
-        for presented in [(0, 0), (800, 600), (900, 700)] {
+        assert!(!pacing.should_skip(id, frame(3), None));
+        pacing.note_published(id, frame(4));
+        assert!(
+            !pacing.should_skip(id, frame(4), None),
+            "presented 未知时必须放行"
+        );
+    }
+
+    /// **前向推进保险**：presented 卡住不动（反馈断流 / 帧被吸收且不再通知）时，连续跳过达到
+    /// 上限后强制放行一帧并清零；之后重新计满一个上限，不会被永久放行（深度约束仍然有效）。
+    #[test]
+    fn a_stalled_presentation_forces_one_frame_after_the_skip_cap() {
+        let mut pacing = ResizePacing::new();
+        let id = window(1);
+        assert!(!pacing.should_skip(id, frame(1), Some(frame(1))));
+        pacing.note_published(id, frame(3));
+        let stalled = Some(frame(1));
+        for skipped in 1..MAX_CONSECUTIVE_SKIPS {
             assert!(
-                !pacing.should_skip(id, false, presented),
-                "没有缩放会话的窗口不受背压影响"
+                pacing.should_skip(id, frame(3), stalled),
+                "第 {skipped} 次仍应跳过（未到连续跳过的上限）"
             );
         }
-        assert_eq!(pacing.len(), 0, "非会话窗口不得留下账目");
+        assert!(
+            !pacing.should_skip(id, frame(3), stalled),
+            "连续跳过达到上限必须强制放行一帧（否则窗口永久停帧）"
+        );
+        assert!(
+            pacing.should_skip(id, frame(3), stalled),
+            "强制放行只解锁一帧：下一轮重新开始跳过计数"
+        );
+    }
+
+    /// **吸收帧导致的 presented 跳跃**：合成端吸收旧帧时 `presented` 会一次前进多格（没有中间
+    /// 帧的反馈）。深度判据只按最新值算，必须立刻收敛为「可以出帧」，不能把窗口判成永久在飞。
+    #[test]
+    fn a_presented_jump_forward_reopens_the_pipeline() {
+        let mut pacing = ResizePacing::new();
+        let id = window(1);
+        assert!(!pacing.should_skip(id, frame(10), Some(frame(10))));
+        pacing.note_published(id, frame(12));
+        assert!(
+            pacing.should_skip(id, frame(12), Some(frame(10))),
+            "2 帧在飞（11、12）⇒ 跳过"
+        );
+        // 帧 11 被合成端吸收：只在帧 12 完成时收到反馈，presented 直接跳到 12。
+        assert!(
+            !pacing.should_skip(id, frame(12), Some(frame(12))),
+            "presented 跳跃到最新已发布序号 ⇒ 在飞数归零 ⇒ 放行"
+        );
+    }
+
+    /// presented 超前 / 乱序（陈旧反馈被别的路径写回）不 panic 也不停帧：`saturating_sub`
+    /// 归零 ⇒ 放行。
+    #[test]
+    fn an_out_of_order_presented_frame_never_stalls_the_pipeline() {
+        let mut pacing = ResizePacing::new();
+        let id = window(1);
+        assert!(!pacing.should_skip(id, frame(10), Some(frame(10))));
+        pacing.note_published(id, frame(12));
+        assert!(
+            !pacing.should_skip(id, frame(12), Some(frame(99))),
+            "presented 超前（不可能但必须防御）⇒ 在飞数饱和为 0 ⇒ 放行"
+        );
     }
 
     /// 会话结束 / 窗口关闭后账目必须被清掉（否则残留项会挡住该窗口以后的帧）。
     #[test]
     fn the_ledger_drops_windows_whose_session_ended() {
         let mut pacing = ResizePacing::new();
-        pacing.note_published(window(1), (100, 100));
-        pacing.note_published(window(2), (200, 200));
+        assert!(!pacing.should_skip(window(1), frame(1), None));
+        pacing.note_published(window(1), frame(2));
+        assert!(!pacing.should_skip(window(2), frame(10), None));
         assert_eq!(pacing.len(), 2);
         pacing.retain_live(|id| id == window(2));
         assert_eq!(pacing.len(), 1, "会话结束 / 窗口关闭的账目必须清掉");
         assert!(
-            !pacing.should_skip(window(2), true, (200, 200)),
-            "保留的窗口在 presented 追平后正常出帧"
+            !pacing.should_skip(window(2), frame(10), Some(frame(10))),
+            "保留的窗口在深度满足时正常出帧"
         );
     }
 
@@ -1129,13 +1242,16 @@ mod resize_pacing_tests {
     fn windows_are_paced_independently() {
         let mut pacing = ResizePacing::new();
         let (one, two) = (window(1), window(2));
-        pacing.should_skip(one, true, (100, 100));
-        pacing.note_published(one, (300, 300));
-        pacing.should_skip(two, true, (200, 200));
-        assert!(pacing.should_skip(one, true, (100, 100)), "窗口 1 在飞");
+        assert!(!pacing.should_skip(one, frame(5), Some(frame(5))));
+        pacing.note_published(one, frame(7));
+        assert!(!pacing.should_skip(two, frame(20), None));
         assert!(
-            !pacing.should_skip(two, true, (200, 200)),
-            "窗口 2 自己的账目是同步的，不受窗口 1 影响"
+            pacing.should_skip(one, frame(7), Some(frame(5))),
+            "窗口 1 有 2 帧在飞 ⇒ 跳过"
+        );
+        assert!(
+            !pacing.should_skip(two, frame(20), Some(frame(20))),
+            "窗口 2 没有在飞帧，不受窗口 1 影响"
         );
     }
 }
