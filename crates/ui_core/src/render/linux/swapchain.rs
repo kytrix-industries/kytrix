@@ -1,5 +1,4 @@
 //! Wayland WSI：每窗口 `VkSurfaceKHR` + swapchain / acquire / present
-//! （`design/phase-12-macos-linux.md` §6.3 / §6.9、`design/async-render-pipeline.md` §7.2 / §7.4 / §7.6）。
 //!
 //! 实例是进程级的（[`VulkanInstance`]），swapchain / surface 是**每窗口**的：多窗口共享同一个
 //! `VkDevice` 与同一条 graphics queue，但各自的 surface 与图像链互不相干。

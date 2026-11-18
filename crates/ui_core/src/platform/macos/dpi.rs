@@ -1,4 +1,4 @@
-//! DPI：`backingScaleFactor` → 引擎 `Scale`（`design/phase-12-macos-linux.md` §7.4）。
+//! DPI：`backingScaleFactor` → 引擎 `Scale`。
 
 use crate::{error::EngineError, math::Scale};
 

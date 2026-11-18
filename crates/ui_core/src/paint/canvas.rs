@@ -2,7 +2,6 @@
 //!
 //! `Canvas` 内部持有一个 crate 私有的绘制桶（`scene::Lane`），公开的 `push_*` 方法把引擎图元写进去；
 //! 引擎在 P03/P07 把它包成 `Primitive::Canvas` 嵌进真实 lane。所有权与 API 契约见
-//! `design/phase-02-paint-foundation.md` §11。
 
 use crate::{
     math::Rect,
@@ -56,7 +55,7 @@ impl Canvas {
 
     /// 已塑形的文本。**应用层不应自行构造 [`GlyphRun`]**：其中的 `AtlasTile` 只能由图集分配器
     /// （`render/atlas.rs`，P05）产出，唯一合法调用者是 P06 的文本 painter；应用层要文本请用
-    /// `NodeBuilder::text()`（`design/phase-02-paint-foundation.md` §11.5）。
+    /// `NodeBuilder::text()`。
     ///
     /// debug 构建断言每个字形的 `tile.atlas == AtlasKind::Glyph`（放错图集 = 采样到图片页）。
     ///

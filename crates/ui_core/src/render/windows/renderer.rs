@@ -1,5 +1,4 @@
 //! 窗口渲染门面 + 每窗口一条 `kytrix-d3d12` GPU 线程
-//! （`design/async-render-pipeline.md` §4.5 / §6）。
 //!
 //! ```text
 //! UI 线程                                  kytrix-d3d12 线程（每窗口）
@@ -26,7 +25,7 @@
 //! - **I3**：节奏来自 `DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT` 的 waitable 句柄，
 //!   只在 GPU 线程等待，且每帧（含首帧）恰好等一次。
 //!
-//! GPU 对象分两层（见 `design/phase-08-d3d12.md` §3.1 与 `device.rs`）：device / direct queue /
+//! GPU 对象分两层（见 `device.rs`）：device / direct queue /
 //! 根签名 / PSO / 图集纹理是**进程级**共享的（`device::SharedGpu` 的 `OnceLock`，第一个窗口
 //! 创建时初始化）；每个窗口只持有自己的 `GpuRenderer`（swapchain / DirectComposition 对象 /
 //! persist / 提交流 / fence 与帧槽），并把它整体移交给自己的 `kytrix-d3d12` 线程。
@@ -1138,7 +1137,7 @@ fn run_gpu_loop(
             }
         }
         // 内容尺寸变化：buffer 内是纯 CPU 记账（内容 visual 恒 1:1；放大露出的区域由 1×1
-        // 背景层填充，UI 只改内容 clip / 背景 scale）；越过高水位 buffer 时在这里重建持久目标
+        // 背景层填充，UI 只改内容 clip / 背景 scale）；内容越过 buffer 桶时在这里重建持久目标
         // 并 `ResizeBuffers`（DEVIATIONS §36 F-199 / R08-1），重建失败（含内容 > 16384）以粘性
         // 错误退出，不静默裁剪。
         renderer.set_content_size(request.surface)?;

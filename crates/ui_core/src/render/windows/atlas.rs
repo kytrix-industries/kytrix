@@ -1,5 +1,5 @@
 //! 共享图集纹理（`SharedAtlas`）+ 每窗口上传器（`AtlasUploads`）
-//! （`design/phase-08-d3d12.md` §5.5；格式与 UV 约定见 P02 §10）。
+//! （格式与 UV 约定见 P02 §10）。
 //!
 //! 字形图集是 `R8_UNORM`（线性覆盖率），图片图集是 `B8G8R8A8_UNORM_SRGB`。两张纹理是**进程级
 //! 共享资源**，由 `device::SharedGpu` 持有；每窗口只有自己的**上传路径**：

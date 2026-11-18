@@ -1,5 +1,5 @@
-//! 剪贴板：`wl_data_device` / `wl_data_source` / `wl_data_offer`（`design/phase-12-macos-linux.md`
-//! §8.6 + R10-1 / R10-9 / R10-12 / R10-17 的整改）。
+//! 剪贴板：`wl_data_device` / `wl_data_source` / `wl_data_offer`。
+//! （R10-1 / R10-9 / R10-12 / R10-17 的整改）。
 //!
 //! Wayland 是**异步拉模型**：`receive` 之后数据由对端写 pipe；发布方向要把文本写进对端给的
 //! `wl_data_source.send` fd。协议顺序（`wl_data_offer` 的 spec）：收到

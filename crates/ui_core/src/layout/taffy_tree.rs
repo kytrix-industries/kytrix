@@ -1,7 +1,6 @@
 //! 为 `NodeTree` 实现 taffy 0.15.0 的低级 trait（+ 布局运行入口）。
 //!
 //! 事实基线：`E:\.cargo\registry\...\taffy-0.15.0\src\`（`tree/traits.rs`、`compute/{mod,leaf,oof}.rs`）。
-//! 设计见 `design/phase-04-layout.md` §5。
 //!
 //! **本文件的 impl 都是 trait impl**，不新增 inherent `impl NodeTree` 块
 //! （`clippy::multiple_inherent_impl = "forbid"` + AGENTS §1.3「严禁拆分多个 impl 到不同文件」）；

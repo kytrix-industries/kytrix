@@ -1,5 +1,4 @@
 //! 帧编排：上传 → 绘制（直绘 back buffer / 持久目标）→ 按需 copy → `Present1`
-//! （`design/phase-08-d3d12.md` §5.6 / §6、`design/async-render-pipeline.md` §6.3）。
 //!
 //! 结构要点（R08-1 / R08-8 / R08-11 之后）：
 //!
@@ -24,7 +23,7 @@
 //! 桌面、也不是被拉伸的旧内容（Chrome 语义）。背景层**没有**自己的持久目标：prime 直接 clear
 //! 它的 back buffer 并 present（[`record::prime_detached`]）。
 //!
-//! 所有权（`design/async-render-pipeline.md` §3.1）：本模块的 [`GpuRenderer`] 是**GPU 线程
+//! 所有权：本模块的 [`GpuRenderer`] 是**GPU 线程
 //! 独占**的每窗口对象，构造发生在窗口创建时（UI 线程），构造完成后整体移交给
 //! `kytrix-d3d12` 线程（[`super::renderer`]）。device / direct queue / 根签名 / PSO / 图集纹理
 //! 是进程级共享的（[`SharedGpu`]，见 `device.rs`）；离屏 / 快照路径不走线程。

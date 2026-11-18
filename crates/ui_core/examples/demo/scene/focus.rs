@@ -1,6 +1,6 @@
-//! ② 焦点状态面板：焦点名 / Tab 序 / 操作提示（`design/phase-15-demo-showcase.md` §2.1）。
+//! ② 焦点状态面板：焦点名 / Tab 序 / 操作提示。
 //!
-//! 引擎不派发「焦点变化」事件（`design/phase-10-interaction.md` §6）：应用在每轮帧钩子里读
+//! 引擎不派发「焦点变化」事件：应用在每轮帧钩子里读
 //! `App::focused`，把结果写成值语义的 [`FocusView`]，由 `bind_text` 更新文字。
 
 use smol_str::{SmolStr, format_smolstr};

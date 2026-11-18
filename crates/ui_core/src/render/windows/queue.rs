@@ -1,5 +1,4 @@
 //! 每窗口提交流：共享 `ID3D12CommandQueue` 上的 allocator / list / fence 记账 / retire 排空
-//! （`design/phase-08-d3d12.md` §5.2、`design/async-render-pipeline.md` §6.3 / §6.5）。
 //!
 //! 进程级只有**一条** direct queue（`device::SharedGpu`）。每个窗口保留自己的 in-flight 记账：
 //! 三个 allocator + 三个命令列表 + 自己的 fence（提交后 `Signal`）。D3D12 的 command queue 是

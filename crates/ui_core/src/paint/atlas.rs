@@ -1,10 +1,10 @@
 //! 图集引用数据（只读）：`AtlasKind` / `AtlasTile`。
 //!
 //! 这两个类型是 `Primitive::GlyphRun` / `Primitive::Image` 的字段类型，属 I2 的共享数据契约，
-//! 因此定义在 `paint` 而不是 `resources`（`design/DEVIATIONS.md` F-24）。图集**分配器**是 crate 私有的
+//! 因此定义在 `paint` 而不是 `resources`。图集**分配器**是 crate 私有的
 //! `render/atlas.rs`（P05 落地），公开面只有这里的数据。
 //!
-//! 坐标与代际约定见 `design/phase-02-paint-foundation.md` §10.1–§10.3、§10.6。
+//! 坐标与代际约定见下方常量与注释。
 
 /// 图集分两类（字形与图片分图集）。`#[repr(u8)]` 的值即 `GpuPrimitive.params1.y` 的 `texture_index`。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

@@ -1,4 +1,4 @@
-//! ⑤ 输入法：`ImeField` 单行模型 + 输入框（`design/phase-15-demo-showcase.md` §2.4）。
+//! ⑤ 输入法：`ImeField` 单行模型 + 输入框。
 //!
 //! 引擎负责把平台 `WM_IME_*` / `NSTextInputClient` / `zwp_text_input` 翻译成
 //! [`ImeEvent`](ui_core::event::ImeEvent) 并交给应用；**组合串的语义**（提交后追加、组合中忽略

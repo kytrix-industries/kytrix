@@ -10,7 +10,7 @@
 //! - `inline_flow`：`InlineBoxSpec → parley::InlineBox`、`(anchor, focus) → Rect`
 //!
 //! 公开路径因此是 `ui_core::text::{TextStyle, FontStack, InlineBoxSpec, ShapedLine, …}`
-//! （`design/phase-05-text.md` §4.1）。文本的**引擎**（字体库/图集/光栅）在 `App` 内部，
+//! 文本的**引擎**（字体库/图集/光栅）在 `App` 内部
 //! 应用层通过 `App::{refresh_text, set_font_stack, …}` 使用，见 §6.1。
 //!
 //! # 字形定位与 hinting（复审 P2-2 方案 A + 第三轮复审 P3 收尾）

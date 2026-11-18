@@ -1,4 +1,4 @@
-//! DPI 查询与「客户区 ↔ 窗口尺寸」换算（`design/phase-09-win32-demo.md` §6.4）。
+//! DPI 查询与「客户区 ↔ 窗口尺寸」换算。
 //!
 //! probe 实测（本机 120 dpi）：client 480×320 → window 496×359（96 dpi）/ 498×367（120 dpi）。
 //! 非 96 dpi 下**必须**用 `AdjustWindowRectExForDpi`，否则窗口客户区会被系统按 96 dpi 的边框算错。

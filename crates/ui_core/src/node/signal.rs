@@ -1,6 +1,6 @@
 //! 状态模型：`Signal`/`Derived`/`Transient` 句柄 + `StateStore`（类型擦除的值存储）。
 //!
-//! 设计见 `design/phase-03-node-state.md` §7。要点：
+//! 要点：
 //! - 句柄是 `Copy`（`PhantomData<fn() -> T>`，不要求 `T: Copy`），值只存在 `StateStore`；
 //! - `SignalId` = **稠密槽位下标 + 代际**（8 B），`DerivedId` 仍是永不删除的稠密下标；
 //!   作用域释放会**回收**槽位（值立即 drop、槽位进空闲栈、代际 +1），新信号优先复用空闲

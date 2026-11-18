@@ -1,4 +1,4 @@
-//! `CAMetalLayer` 的创建与**主线程独占**的属性写入口（`design/async-render-pipeline.md` §5.3）。
+//! `CAMetalLayer` 的创建与**主线程独占**的属性写入口。
 //!
 //! drawable 由 `CAMetalDisplayLink` 的 update 提供，图层不再取 drawable（§5.7 删除
 //! `nextDrawable` / `allowsNextDrawableTimeout`）。本模块只剩两件事：

@@ -1,5 +1,4 @@
 //! 窗口渲染门面 + 每窗口一条 `kytrix-vulkan` GPU 线程
-//! （`design/async-render-pipeline.md` §4.5 / §7）。
 //!
 //! ```text
 //! UI 线程（calloop：wl_display 默认队列）      kytrix-vulkan 线程（每窗口）

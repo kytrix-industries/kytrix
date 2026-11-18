@@ -1,4 +1,4 @@
-//! 形状：`parley` 的唯一调用点（`design/phase-05-text.md` §7）。
+//! 形状：`parley` 的唯一调用点。
 //!
 //! [`ShapedText`] 是一次 shape 的**不可变快照**，被 `Rc` 共享。三条关键契约：
 //!

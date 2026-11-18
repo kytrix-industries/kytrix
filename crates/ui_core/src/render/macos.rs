@@ -1,4 +1,4 @@
-//! macOS Metal 后端（`design/phase-12-macos-linux.md` §5）。
+//! macOS Metal 后端。
 //!
 //! 本文件只做模块声明与 crate 内出口（P01 §4.1 的模块根模板）：**不定义任何类型**
 //! （workspace lint `definition_in_module_root`）；`Renderer` 的实现在 [`compositor`]。

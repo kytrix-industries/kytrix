@@ -1,4 +1,4 @@
-//! 图集纹理：字形 `R8Unorm` + 图片 `BGRA8Unorm_sRGB`，脏矩形（AOI）上传（`design/phase-12-macos-linux.md` §5.5）。
+//! 图集纹理：字形 `R8Unorm` + 图片 `BGRA8Unorm_sRGB`，脏矩形（AOI）上传。
 //!
 //! 像素来源由上层持有（P05 §10.6 的定案：渲染层不保 CPU 副本）；本模块只做
 //! 「staging 写 → blit 到纹理」与「generation 变化时整页重传」。

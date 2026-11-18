@@ -84,7 +84,7 @@ pub(crate) fn set_clipboard_text(_app: &App, text: &str) -> Result<(), EngineErr
 ///
 /// # Errors
 /// `EngineError::Clipboard`：平台拒绝；Wayland 下「尚未收到过选区内容」也走这里
-/// （剪贴板是异步拉模型，`design/phase-12-macos-linux.md` F-130）。
+/// （剪贴板是异步拉模型）。
 /// 消费者：`App::clipboard_text`。
 pub(crate) fn clipboard_text(_app: &App) -> Result<smol_str::SmolStr, EngineError> {
     crate::platform::native::clipboard::get_text()

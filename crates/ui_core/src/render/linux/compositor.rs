@@ -1,5 +1,4 @@
 //! 帧编排：上传 → 逐 damage scissor 画进持久 offscreen → **差分 copy** 到 swapchain → present
-//! （`design/phase-12-macos-linux.md` §6.6 / §6.9、`design/async-render-pipeline.md` §7）。
 //!
 //! **两条硬约束**：
 //! 1. swapchain image 的内容在 present 之后对应用不可信 ⇒ 每张 image 相对 persist 还差哪些矩形

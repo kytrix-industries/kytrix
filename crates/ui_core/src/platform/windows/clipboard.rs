@@ -1,4 +1,4 @@
-//! 剪贴板（`CF_UNICODETEXT`；`design/phase-09-win32-demo.md` §4.5）。
+//! 剪贴板（`CF_UNICODETEXT`）。
 //!
 //! 写入顺序：`GlobalAlloc` + 填充 → `OpenClipboard`（带短退避重试）→ `EmptyClipboard`
 //! → `SetClipboardData` → `CloseClipboard`。三点与「直接照着 API 顺序写」的差别：

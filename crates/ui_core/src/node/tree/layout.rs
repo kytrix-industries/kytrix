@@ -330,7 +330,7 @@ pub(crate) fn set_device_scale(tree: &mut NodeTree, scale: Option<f32>) {
 /// 绝对坐标 post-pass：把 `local`（父相对）换算成 `layout.bounds`（窗口绝对），
 /// 同时**就地**维护每节点的子树包围盒（不再全树重算，B9）。
 ///
-/// 遍历规则（正确性的核心，见 `design/phase-04-layout.md` §7）：
+/// 遍历规则（正确性的核心）：
 /// - 从根开始，根的 `local` 相对 ICB 原点 ⇒ 绝对 = `local`；
 /// - 流内子节点：`abs = 父 abs.origin + child.local.origin`；
 /// - 出流子节点：**不在**父的 children 循环里处理（跳过），而由它**包含块**的 hoisted 列表驱动，

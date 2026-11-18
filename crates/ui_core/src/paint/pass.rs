@@ -1,6 +1,6 @@
 //! paint pass：把节点树 + 样式 + 文本 + 自绘图元变成 `Scene` 的 lane 与 damage。
 //!
-//! 契约见 `design/phase-06-paint-runtime.md` §5–§6：
+//! 契约：
 //! - **一节点一 lane**（`Node.lane`，粘性保留）；
 //! - lane 内桶序 = 祖先 clip 前缀 → Shadow → 背景/渐变 → 边框 → 内容 → 祖先 clip 后缀；
 //! - 复用判据 = `REUSABLE` + lane 存在 + **clip 上下文一致**（`clip_key`，审查 B1 的守卫）；

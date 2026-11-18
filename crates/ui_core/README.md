@@ -1,6 +1,6 @@
 # ui_core
 
-Kytrix 自研跨平台 GUI 引擎（``）。三平台原生图形后端（D3D12 / Metal / Vulkan）、
+Kytrix 自研跨平台 GUI 引擎（主设计：[`design/custom-gui-engine-design.md`](design/custom-gui-engine-design.md)）。三平台原生图形后端（D3D12 / Metal / Vulkan）、
 自建事件循环、细粒度依赖追踪 + 脏矩形、Parley 文本、AccessKit 无障碍。
 
 > 本 crate `publish = false`：它是产品的一部分，不是独立发布的库。
@@ -64,7 +64,7 @@ Windows 是 persist clear（**linear**）+ 独立的 **1×1 背景持久目标 /
 
 | 层    | 覆盖                                                           | 命令                                                                                                                                                                                                     |
 |-------|----------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| L0/L1 | 单测（`src/**` 内联）+ 纯 CPU 公共 API + demo 的 23 项单元测试 | `cargo test -p ui_core` ← 不跑 13 项场景测试（需要 `test-support`）                                                                                                                                      |
+| L0/L1 | 单测（`src/**` 内联）+ 纯 CPU 公共 API + demo 的 26 项单元测试 | `cargo test -p ui_core` ← 不跑 13 项场景测试（需要 `test-support`）                                                                                                                                      |
 | L2    | 帧记录 / 布局命中 / HUD 集成测试                               | `cargo test -p ui_core --features test-support --test frame_record`<br>`cargo test -p ui_core --features "hud,test-support" --test hud`<br>`cargo test -p ui_core --features test-support --test layout` |
 | L2    | demo example 的场景测试                                        | `cargo test -p ui_core --features "hud,test-support" --example demo`                                                                                                                                     |
 | L3    | 像素 golden（Windows WARP / Linux lavapipe / macOS Metal）     | `cargo test -p ui_core --features test-support --test snapshot`                                                                                                                                          |
@@ -119,9 +119,9 @@ cargo run --release -p ui_core --example snapshot_demo --features test-support -
 - 两个 example 共用 `examples/demo/scene*`；`main.rs` 只负责
   启动，`snapshot.rs` 只负责离屏读回，场景代码与测试都在 `scene` 模块。
 - demo 的测试是 example 内 unit test，不是普通 integration test。`cargo test -p ui_core`
-  会跑其中 23 项单元测试；13 项场景测试需要 `--features test-support`。聚焦命令：
-  `cargo test -p ui_core --features "hud,test-support" --example demo`（无 HUD 为 35 项，
-  带 HUD 为 36 项）。
+  会跑其中 **26** 项单元测试；**13** 项场景测试需要 `--features test-support`。聚焦命令：
+  `cargo test -p ui_core --features "hud,test-support" --example demo`（无 HUD 为 **39** 项，
+  带 HUD 为 **40** 项；数据为 HEAD `8d3a8c6` 实测）。
 - **golden 详情**（字节语义 / 容差 / 平台策略 / 失败热力图）：[`tests/golden/README.md`](tests/golden/README.md)。
 - macOS / Linux 的真机验证记录随旧设计文档一起删除；结论以 CI 日志与 Git 历史为准（本 crate 不再维护该文档）。
 - 缺 shader 工具链时设 `ui_core_SKIP_SHADERS=1`（产物是占位符，**GPU 测试会失败**，只用于交叉 `cargo check`）。

@@ -1,6 +1,5 @@
 //! `NodeId`（带窗口归属与代际的句柄）与 `Arena`（槽位 + 自由表 + 代际的对象池）。
 //!
-//! 设计见 `design/phase-03-node-state.md` §6。
 
 use std::{fmt, num::NonZeroU32};
 

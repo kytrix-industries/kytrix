@@ -1,7 +1,7 @@
 //! 浮层：层级（root 的末尾子节点）、外部点击命中、定位求值。
 //!
 //! 浮层节点由 `App::create_overlay` 创建（`append_child(root, …)`），因此绘制序在 DFS 先序末尾、命中优先级
-//! 由 `hit_test` 的逆序遍历天然给出（`design/phase-10-interaction.md` §9）。
+//! 由 `hit_test` 的逆序遍历天然给出。
 
 use crate::{
     interaction::{OverlayDismiss, OverlaySlot},

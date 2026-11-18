@@ -1,4 +1,4 @@
-//! 通用交互机制（`custom-gui-engine-design.md` §3.6 / §3.7 / §8.4；`design/phase-10-interaction.md`）。
+//! 通用交互机制（`custom-gui-engine-design.md` §3.6 / §3.7 / §8.4）。
 //!
 //! 本文件是**公共模块根**：契约类型定义在这里，实现放子模块（`focus` / `scroll` / `virtual_list` /
 //! `overlay` / `drag` / `animation`）。每个类型只有**一个** `impl` 块（`multiple_inherent_impl`）。
@@ -821,7 +821,7 @@ impl std::fmt::Debug for NodeInteraction {
 /// 浮层定位求值：把 [`OverlayPlacement`] 解成窗口绝对的左上角。
 ///
 /// `Anchor` 读锚点的**屏幕**布局盒（内容坐标减去祖先滚动偏移）：浮层挂在 root 上，必须与屏幕上看到的
-/// 锚点对齐（`design/phase-10-interaction.md` §9.2）。
+/// 锚点对齐。
 ///
 /// `size` 是浮层**自身**的测量尺寸：`Above` / `Left` 要把浮层的下/右边缘贴到锚点外侧，
 /// 必须减去自身尺寸（P2-6）。旧实现返回锚点的上/左边缘，浮层会盖住锚点。首帧尺寸未知时

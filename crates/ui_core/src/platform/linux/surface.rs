@@ -1,4 +1,4 @@
-//! Wayland surface / 协议状态机（`design/phase-12-macos-linux.md` §8.2 / §8.8）。
+//! Wayland surface / 协议状态机。
 //!
 //! 本文件是 **唯一的协议事件翻译点**：所有 `wl_*` / `xdg_*` / `wp_*` 事件在这里变成公共
 //! `Event`（与 Win32 的 `translate` 同层职责），泵在主循环里 drain 后交给 `App::dispatch`。

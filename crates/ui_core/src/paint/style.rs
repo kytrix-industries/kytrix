@@ -1,6 +1,5 @@
 //! 样式契约：静态结构 `Style` + 动态属性 `StylePatch` + `Cursor` + `Clip`。
 //!
-//! 设计见 `design/phase-03-node-state.md` §10 与 `design/phase-04-layout.md` §11；
 //! 上游 `custom-gui-engine-design.md` §4.9（D24 / I17）。
 //!
 //! 分层：`Style` 是**静态结构**（挂载时一次写入），`StylePatch` 是**动态属性**（`bind_style` 每次求值重算）。
@@ -25,7 +24,7 @@ use crate::{
 /// P06 才会追加其余引擎自有字段（圆角 / 阴影 / 字体族）——它们现在**没有读者**，按 AGENTS §2.1 不加。
 ///
 /// **`calc()` 不解析**：`Dimension::Calc` / `LengthPercentage::Calc` 在 v1 会按 0 处理
-/// （taffy 0.15 只把 calc 当不透明指针；连它自带的 `TaffyTree` 也返回 0）。见 `design/phase-04-layout.md` §14.3。
+/// （taffy 0.15 只把 calc 当不透明指针；连它自带的 `TaffyTree` 也返回 0）。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Style {
     /// 布局属性（taffy 0.15.0，`CustomIdent = SmolStr`）。
@@ -70,7 +69,7 @@ pub enum Clip {
     Bounds,
 }
 
-/// 静态绘制属性（`design/phase-06-paint-runtime.md` §6.1）。
+/// 静态绘制属性。
 ///
 /// 与 [`Style`] 分开存放（`Node.paint`）：绘制属性与布局属性是两条独立的失效通道（F-58）；
 /// 且绘制属性与布局属性是两条独立的失效通道。动态覆盖走 [`StylePatch`]（`background`/`border`/

@@ -1,5 +1,4 @@
-//! IME 状态（`NSTextInputClient` 的组合串 + 按键作用域的提交记账，
-//! `design/phase-12-macos-linux.md` §7.5）。
+//! IME 状态（`NSTextInputClient` 的组合串 + 按键作用域的提交记账）。
 //!
 //! `NSRange` 是 UTF-16 单位，因此组合串与选中范围都按 UTF-16 记录（提交时一次性转 `SmolStr`）。
 //! 提交去重与 `Text` 抑制的作用域记账在平台无关的

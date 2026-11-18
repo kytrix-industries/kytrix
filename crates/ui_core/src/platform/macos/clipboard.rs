@@ -1,4 +1,4 @@
-//! 剪贴板：`NSPasteboard` + `NSPasteboardTypeString`（`design/phase-12-macos-linux.md` §7.6）。
+//! 剪贴板：`NSPasteboard` + `NSPasteboardTypeString`。
 
 use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
 use objc2_foundation::NSString;

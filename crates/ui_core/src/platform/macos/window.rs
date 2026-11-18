@@ -1,4 +1,4 @@
-//! 原生窗口：`NSWindow` + 自绘标题栏 + 交通灯（`design/phase-12-macos-linux.md` §7.3）。
+//! 原生窗口：`NSWindow` + 自绘标题栏 + 交通灯。
 //!
 //! 状态同步（尺寸 / 缩放 / 焦点 / 可见性）走「每轮快照对比」而不是 delegate 或通知：泵每轮都要
 //! 读一次这些值（O(1)）。**例外是关闭**：`windowShouldClose:` 是 AppKit 在关窗前唯一的同步

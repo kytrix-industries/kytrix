@@ -1,5 +1,5 @@
 //! 进程级 `VkInstance` + `VK_KHR_wayland_surface` + 验证层 debug messenger
-//! （`design/phase-12-macos-linux.md` §6.1、R11-4）。
+//! （R11-4）。
 //!
 //! 实例是**进程级共享**的（P1-2.9）：多窗口只建一个 `VkInstance`，每个窗口用
 //! [`VulkanInstance::create_surface`] 建自己的 `VkSurfaceKHR`（surface 的存活期 = 窗口，

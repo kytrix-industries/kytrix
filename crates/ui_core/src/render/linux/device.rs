@@ -1,5 +1,4 @@
 //! 进程级共享 Vulkan 设备（[`SharedGpu`]）+ 每窗口帧同步原语（[`FrameSync`]）
-//! （`design/phase-12-macos-linux.md` §6.2、`design/async-render-pipeline.md` §7.2）。
 //!
 //! 多窗口的正确形状（与 Chrome / Qt RHI 一致）：进程一个 `VkInstance`、一个
 //! `VkPhysicalDevice`、一个 `VkDevice`、一条 graphics queue、一套 render pass / PSO、两张
@@ -154,7 +153,7 @@ impl GpuCaps {
 const HANDLE_KIND_OBJECT: u8 = 1;
 
 thread_local! {
-    /// 当前线程是否是 `kytrix-vulkan` GPU 线程（`design/async-render-pipeline.md` §10.1 的归属断言）。
+    /// 当前线程是否是 `kytrix-vulkan` GPU 线程。
     static ON_GPU_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 

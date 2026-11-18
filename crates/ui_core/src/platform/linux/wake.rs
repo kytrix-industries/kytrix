@@ -1,4 +1,4 @@
-//! 跨线程唤醒：`calloop::ping`（`design/phase-12-macos-linux.md` §8.1）。
+//! 跨线程唤醒：`calloop::ping`。
 //!
 //! `Ping` 是 `Clone + Send + Sync`；句柄存在 `OnceLock` 里，`Dispatcher::wake` 从这里打断
 //! `calloop::EventLoop::dispatch` 的阻塞等待（「先置位再 ping」由 `Dispatcher` 保证）。

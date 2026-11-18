@@ -1,7 +1,7 @@
 //! 逻辑像素几何与「逻辑 → 物理像素」的唯一换算点（I11）。
 //!
 //! 所有几何以逻辑像素 `f32` 存储，只在 paint / present 边界做一次缩放与舍入。换算分四种语义，
-//! 职责严格分离（见 `design/phase-01-foundation.md` §7）：
+//! 职责严格分离：
 //!
 //! - [`Rect::to_physical_f32`]：不取整的物理浮点矩形，用于 SDF 图元的 `GpuPrimitive.bounds` 与 `clip_rect`；
 //! - [`Rect::to_physical`]：逐边取整，用于图集图元（`GlyphRun` / `Image`）的四边形；

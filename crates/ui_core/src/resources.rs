@@ -5,7 +5,7 @@
 //! 图集的**字节语义**（线性预乘 → sRGB 编码的 BGRA8）来自 `render/shaders/contract.md` §8，
 //! `AtlasTile` / `AtlasKind` 的归属在 `paint::atlas`（DEVIATIONS F-24）。
 //!
-//! **三条硬规则**（`design/phase-13-resources-snapshot.md` §5）：
+//! **三条硬规则**：
 //!
 //! 1. tile 一旦交给应用就**恒有效**，直到引用计数归零（`unload` / `release_window`）——引擎不会
 //!    自动淘汰仍在引用的 tile（`Canvas` 是值语义快照，失效 tile 会让旧图元画出别人的图）；
@@ -342,7 +342,7 @@ pub struct ResourceStats {
 /// 图片资源缓存：字节 → 解码 → 图片图集 tile + 页缓冲。
 ///
 /// **不持有 GPU 对象**：页缓冲由 `App::upload_image_page` 交给窗口渲染器（与字形页同一路径）。
-/// 进程级一份（单 GPU 设备），由 `App` 持有（`design/phase-13-resources-snapshot.md` §8）。
+/// 进程级一份（单 GPU 设备），由 `App` 持有。
 pub struct ResourceCache {
     entries: Arena<Entry, ResourceId>,
     /// 内容去重索引：同一份字节只占一条 [`Entry`]，引用计数记在条目上。

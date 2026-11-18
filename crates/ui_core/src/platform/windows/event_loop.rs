@@ -1,5 +1,4 @@
 //! Windows 事件循环：`WndProc`、消息泵、唤醒合并、窗口生命周期
-//! （`design/phase-09-win32-demo.md` §5.2 / §5.4）。
 //!
 //! 两条实测约束（probe）：
 //! 1. `PeekMessageW` 会**取出并消费** `WM_QUIT`，泵必须在取出后显式判 `WM_QUIT` 再退出，

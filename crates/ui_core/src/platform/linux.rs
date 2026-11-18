@@ -1,4 +1,4 @@
-//! Linux 平台层（`design/phase-12-macos-linux.md` §8）。仅 Wayland（D25 / I16）。
+//! Linux 平台层。仅 Wayland（D25 / I16）。
 //!
 //! 模块根只做声明（lint `definition_in_module_root`）；`run` 是 `Application::run` 的平台入口。
 

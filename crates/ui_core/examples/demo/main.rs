@@ -1,5 +1,4 @@
-//! Kytrix GUI 的**真实窗口示例**（`design/phase-15-demo-showcase.md`、
-//! `design/phase-18-demo-example.md`）。
+//! Kytrix GUI 的**真实窗口示例**。
 //!
 //! ```text
 //! cargo run -p ui_core --example demo

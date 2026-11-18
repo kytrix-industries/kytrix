@@ -1,7 +1,6 @@
 //! 拖拽：阈值判定与位移（会话状态在 `Window.pointer.drag`）。
 //!
 //! 引擎**不**在拖拽里改布局：应用在自己的 handler 里写 `LayoutOverride` 或 `Signal`
-//! （`design/phase-10-interaction.md` §10）。
 
 use crate::math::Point;
 

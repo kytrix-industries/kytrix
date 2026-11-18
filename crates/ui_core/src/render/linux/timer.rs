@@ -1,4 +1,4 @@
-//! GPU 计时：`vkCmdWriteTimestamp` + query pool（`design/phase-12-macos-linux.md` §6.8）。
+//! GPU 计时：`vkCmdWriteTimestamp` + query pool。
 //!
 //! query pool 是**每窗口**的：时间戳写进该窗口自己的命令缓冲、由该窗口的帧槽 fence 观测；
 //! 进程级共享的只有 `VkDevice` 与队列的时间戳能力（`timestampPeriod` / `timestampValidBits`）。

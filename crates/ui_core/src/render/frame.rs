@@ -1,7 +1,7 @@
 //! 帧交付契约（共享，纯数据）：`FramePayload` / `FrameRequest` / `FrameFeedback` 与最新帧槽；
-//! 以及 in-flight 帧轮转（`design/phase-08-d3d12.md` §4.2）。
+//! 以及 in-flight 帧轮转。
 //!
-//! 本模块是**三平台共用**的纯数据 + 纯函数（`design/async-render-pipeline.md` §4.1 / §4.2）：
+//! 本模块是**三平台共用**的纯数据 + 纯函数：
 //! 不含线程、句柄或任何平台 API。UI 线程产帧、GPU 线程执行，跨线程只搬这里的值。
 //! 线程原语（Windows 的 work event、Linux 的 condvar、macOS 的 display link）各自留在平台模块内。
 //!
@@ -55,7 +55,7 @@ impl InstanceChunk {
     }
 }
 
-/// 一帧的 CPU→GPU 快照（`design/async-render-pipeline.md` §4.1）。
+/// 一帧的 CPU→GPU 快照。
 ///
 /// 实例数据是**增量**的：`chunks` 只含自上次载荷以来变化的实例段，**应用顺序 = 旧 → 新**
 /// （重叠区间后者覆盖）。GPU 线程侧的实例缓冲是持久的（`InstanceMirror`），未变化的段保留

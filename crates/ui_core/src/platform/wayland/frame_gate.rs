@@ -1,7 +1,7 @@
 //! Wayland 帧门禁：`wl_surface.frame` 回调的「已请求 / 已就绪」状态机（R10-7）。
 //!
 //! 门禁只负责一件事：上一帧的 `wl_callback.done` 回来之前不再向 GPU 线程发布下一帧，
-//! 把在飞帧压到 ≤ 1（`design/async-render-pipeline.md` §7.5 第 3 条）。
+//! 把在飞帧压到 ≤ 1。
 //!
 //! # 没有超时兜底（AR3 §3.7）
 //!

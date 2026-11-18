@@ -1,7 +1,7 @@
 //! 行内流：`InlineBoxSpec → parley::InlineBox` 与 `(anchor, focus)` 选区的几何映射（§12）。
 //!
 //! Markdown AST → `Vec<InlineFragment>` 的**数据管线不在本阶段**（P15 的消费者还不存在）；
-//! 本模块只把「盒的输入面」和「选区的输出面」钉死（`design/phase-05-text.md` §12.4）。
+//! 本模块只把「盒的输入面」和「选区的输出面」钉死。
 
 use parley::{
     Affinity, BoundingBox, InlineBox, InlineBoxKind, VerticalAlign,

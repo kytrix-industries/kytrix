@@ -385,7 +385,7 @@ pub(super) fn pump(
     dispatcher: Arc<Dispatcher>,
 ) -> Result<(), EngineError> {
     let result = pump_loop(&mut app, &mut windows, &dispatcher);
-    // 关闭顺序（`design/async-render-pipeline.md` §6.7）：先 drop `App`（`Window` →
+    // 关闭顺序：先 drop `App`（`Window` →
     // `Renderer::drop` 里的 GPU 线程 join 握手，期间窗口必须仍然存活），再销毁原生窗口。
     // 反过来会让 GPU 线程在 HWND 已销毁之后还去 `Present`。
     drop(app);

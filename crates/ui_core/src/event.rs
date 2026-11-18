@@ -1,4 +1,4 @@
-//! 平台事件、输入与动作契约（公开面；`design/phase-09-win32-demo.md` §4、`design/phase-10-interaction.md` §4/§5）。
+//! 平台事件、输入与动作契约（公开面）。
 //!
 //! 平台层（`crate::platform`，私有，I9）把 `WM_*` / `NSEvent` / `wl_*` 翻译成 [`InputEvent`] /
 //! [`ImeEvent`]，应用层通过 [`crate::app::App::drain_events`] 收到 [`Event`]；**交互分发**由引擎
@@ -786,7 +786,7 @@ pub enum InputEvent {
         /// 沿滚动链逐层消费 —— 内层容器只吃自己声明的轴，另一轴原样传给外层（浏览器的
         /// scroll chaining）。需要同时平移两轴的区域由**两层容器**表达（内层
         /// `Horizontal` + 外层 `Vertical`，每轴各由一个容器消费）；单容器同时吃两轴不在
-        /// 本引擎的契约内（R02-11 的取舍，见 `design/phase-10-interaction.md` §7）。
+        /// 本引擎的契约内（R02-11 的取舍）。
         delta: Point,
         /// 单位。
         unit: ScrollUnit,
@@ -1330,7 +1330,7 @@ pub enum Event {
     CloseRequested,
 }
 
-/// 引擎动作身份（`design/phase-10-interaction.md` §4.1）。
+/// 引擎动作身份。
 ///
 /// **身份而非载荷**：同一个 `Action` 可以同时被「点击」「快捷键」「a11y 动作」触达，三者的差异走
 /// [`ActionSource`]，不进 `Action` 本身（否则不可 `Hash`，也没法做 handler 表的键）。

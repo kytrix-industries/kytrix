@@ -1,6 +1,6 @@
 //! 依赖追踪：`Owner`/`DependencyGraph`/`ReadTracker`/`ReadCtx`/`EvalStack`/`EvalGuard`。
 //!
-//! 设计见 `design/phase-03-node-state.md` §8。要点：
+//! 要点：
 //! - 依赖图只用一个键空间：`SignalId → OwnerSet`（派生值也有自己的句柄槽 `SignalId`）；
 //! - 读取集合是**本帧替换**（不是累积），差分清理见 `replace_deps`；
 //! - 环检测在运行时求值栈上，入/出栈由 `EvalGuard` 的 `Drop` 保证 panic 安全。

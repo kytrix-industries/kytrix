@@ -1,5 +1,5 @@
-//! 固定 descriptor set + push constants + uber-quad / geometry 管线（`design/phase-12-macos-linux.md`
-//! §6.4）+ 进程级描述符池（P1-2.9）。
+//! 固定 descriptor set + push constants + uber-quad / geometry 管线
+//! + 进程级描述符池（P1-2.9）。
 //!
 //! 与 P07 的 `common.glsl` 逐字对应：`set 0` 的 `binding 0`（instances）/`1`（clips）/
 //! `4` + `5`（两张图集 sampler），push constants `[0, 112)`。

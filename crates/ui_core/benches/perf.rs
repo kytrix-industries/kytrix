@@ -2,8 +2,7 @@
 //!
 //! 覆盖主设计 §6.7 的六项：颜色转换 / 塑形 / 布局 / 实例构建 / damage 合并 / 依赖失效。
 //! 后两项没有独立的公开入口（`DamageAccumulator` 与 `FrameEncoder` 是 crate 私有，
-//! 不应为 bench 扩公开面），因此由 `frame_*` 组顺带测量——见
-//! `design/phase-13-resources-snapshot.md` §10.2。
+//! 不应为 bench 扩公开面），因此由 `frame_*` 组顺带测量。
 //!
 //! 规模档位（大整改的基线面）：`tree_build_{1k,10k}`、`frame_incremental_{1k,10k}`、
 //! `frame_full_10k`、`text_update_320`（40 行 × 8 列，每帧全部变化）。

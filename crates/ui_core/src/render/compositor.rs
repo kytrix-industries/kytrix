@@ -1,4 +1,4 @@
-//! damage → present/copy 计划（`design/phase-08-d3d12.md` §4.4 / §6.4）。
+//! damage → present/copy 计划。
 //!
 //! 纯函数、零分配：输入的物理矩形来自 [`crate::render::damage::DamageAccumulator`]，
 //! 输出是后端唯一认识的三种计划。**夹紧与去空在这里做**——`Present1` 对越界/空矩形
@@ -379,7 +379,7 @@ impl Plan {
         matches!(self, Self::Full)
     }
 
-    /// 两帧的 damage 合并（`design/async-render-pipeline.md` §4.2 / I5）。
+    /// 两帧的 damage 合并。
     ///
     /// UI 线程的「最新帧槽」覆盖旧请求时，旧请求的像素工作没有发生（GPU 线程只会画最新的那份
     /// 快照），所以它的 damage 必须由后继帧补画：**并集**而不是交集。

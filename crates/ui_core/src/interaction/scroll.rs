@@ -1,7 +1,6 @@
 //! 滚动：夹紧、视口、最近滚动祖先、滚轮目标（纯逻辑；状态在 `Node.interaction.scroll`）。
 //!
 //! 偏移是 `Transient` 语义（不登记依赖、不标脏位）；应用点是 `paint` 的累计偏移与 `hit_test` 的点换算
-//! （`design/phase-10-interaction.md` §7）。
 
 use crate::{
     interaction::{ScrollAxis, ScrollSlot},

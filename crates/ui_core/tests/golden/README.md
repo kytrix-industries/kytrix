@@ -32,7 +32,7 @@ golden 是 `SnapshotImage.rgba8` 的**原样**落盘：**预乘 sRGB 编码的 R
 | `clip`     | 嵌套 clip + 溢出子矩形（整数边界；**0 容差**，见下）                 | 240×160      | 1          | light       |
 | `clip_subpixel` | 分数坐标边界（容器物理边界 24.25 / 20.5 / 156.5 / 96.75）加四边溢出的子矩形（**0 容差**） | 240×160 | 1 | light |
 
-**没有文字 case**：字形像素依赖宿主字体文件与版本，跨机必然分叉（`../../design/DEVIATIONS.md` F-144 / V-96）。
+**没有文字 case**：字形像素依赖宿主字体文件与版本，跨机必然分叉。
 字形由 `rendered_text_produces_visible_glyph_pixels`（覆盖率 sanity）与 L2 的 `GlyphRun` 断言覆盖。
 
 ## 容差（D19：机制冻结，数值可校准）
@@ -131,7 +131,7 @@ bless 掉了」—— AR2b P1-N1 的越界列（lavapipe 旧基线 `x=148,y=18..
 | `warp` vs `lavapipe`  | 64–164             | 0.004% – 0.151%          | 3/13 case 超过 0.1%（`colors_1_dark` 0.151%、`shapes_1_light` 0.143%、`colors_1_light` 0.120%） |
 | `lavapipe` vs `metal-real` | 64–164        | 0.004% – 0.151%          | 与 warp-vs-lavapipe 同分布 |
 
-差异集中在 AA 边缘与阴影渐变（`../../design/DEVIATIONS.md` V-112 / S-138）。
+差异集中在 AA 边缘与阴影渐变。
 **每个平台只跟自己目录里的基线比**；跨平台比同一份 golden 会永久红。
 
 ## 失败时

@@ -30,7 +30,7 @@ pub(crate) fn take_wake_request(app: &mut App) -> bool {
 /// 回投任务（`AppHandle::send`、a11y `ActionRequest`）里写状态时循环已经过了帧门禁、
 /// 即将阻塞在 `GetMessageW` / `poll`。只置位不唤醒会让这批状态一直等到下一条无关消息
 /// （画面与 a11y 更新都迟到）——P15 用 UIA 客户端实测 `SelectionItemPattern.Select()`
-/// 不生效时定位到这一点（`design/DEVIATIONS.md` F-152）。
+/// 不生效时定位到这一点。
 /// 消费者：`App::request_frame`。
 pub(crate) fn request_frame(app: &mut App) {
     app.wake_requested = true;

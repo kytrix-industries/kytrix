@@ -1,5 +1,4 @@
 //! 事件循环：`calloop::EventLoop` + `WaylandSource` + `calloop::ping` 唤醒
-//! （`design/phase-12-macos-linux.md` §8.1）。
 //!
 //! 结构（多窗口，P1-2.8 Stage C-2b）：
 //! 1. 建 `WaylandState`（连接、协议工厂、首个窗口、IME / 剪贴板 / 光标）→ 首个 roundtrip 拿 configure；
@@ -167,7 +166,7 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                 dispatcher.wake();
             }
             // ①b GPU 线程反馈：设备丢失 / 呈现失败是粘性的，在这里冒泡出去
-            // （`design/async-render-pipeline.md` §7.7）。所有 Vulkan 工作都在 `kytrix-vulkan`
+            // 所有 Vulkan 工作都在 `kytrix-vulkan`
             // 线程上，UI 线程只读反馈（I1）。
             app.poll_renderers()?;
             // ② 逐窗口镜像平台真值：**只在值变化时**设置（`set_scale` 推进 scale epoch；二者置

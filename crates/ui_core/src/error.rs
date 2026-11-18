@@ -3,12 +3,12 @@
 //! 只有强类型变体，不出现字符串错误或通用错误包装（AGENTS §3）。`Display` 为英文诊断文本，
 //! 只用于日志 / CI / 开发者；面向用户的本地化文案由应用层按变体生成（i18n 留应用层）。
 //!
-//! 变体表在 `design/phase-01-foundation.md` §6.2.2 冻结为 17 项。已落地的变体见下方定义；
+//! 变体表冻结为 17 项。已落地的变体见下方定义；
 //! `LayoutInvalid` 无生产者、继续留空。`GeometryRegister` → P09，
 //! `AtlasExhausted` / `TextShape` → **P05**（DEVIATIONS F-55），`AppInit` → P08，
 //! `WindowCreate` → P12，`A11yInit` → P14，`ResourceDecode` → **P13**（payload 见 DEVIATIONS F-138）。
-//! 完整「名称 + payload + 实现 Phase」表见 `design/phase-01-foundation.md` §6.2.2；
-//! `StaleNode` / `CyclicDerived` 的实现 Phase 由 P04 改为 P03（`design/DEVIATIONS.md` S-30），
+//! 完整「名称 + payload + 实现 Phase」表见下方各变体定义；
+//! `StaleNode` / `CyclicDerived` 的实现 Phase 由 P04 改为 P03，
 //! `InvalidMeasure` 由 P05 改为 P04（DEVIATIONS F-51）。
 
 use std::path::PathBuf;
@@ -236,13 +236,13 @@ pub enum EngineError {
         /// 陈旧/未知的窗口句柄。
         window: WindowId,
     },
-    /// 平台 a11y adapter 初始化失败（必须在窗口**首次显示之前**构造，见 `design/phase-11-a11y.md` §8.1）。
+    /// 平台 a11y adapter 初始化失败（必须在窗口**首次显示之前**构造）。
     #[error("accessibility adapter initialization failed: {detail}")]
     A11yInit { detail: SmolStr },
 
     /// 图片资源解码 / 装箱失败（P13：`ResourceCache::insert`）。
     ///
-    /// payload 是**强类型分类**（`design/phase-13-resources-snapshot.md` §5.2 / DEVIATIONS F-138）：
+    /// payload 是**强类型分类**：
     /// 调用方按 `DecodeCause` 决定「占位图 / 报错 / 卸载重试」，不需要解析字符串。
     #[error("image resource decode failed: {cause}")]
     ResourceDecode {

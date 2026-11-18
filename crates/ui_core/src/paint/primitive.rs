@@ -1,7 +1,7 @@
 //! 8 类绘制指令（I2 的唯一表示）。
 //!
 //! 坐标全为**绝对窗口逻辑像素**，没有 per-primitive 变换（`GeometryDraw.transform` 是唯一例外）。
-//! 字段语义与「与附录 C 的差异」见 `design/phase-02-paint-foundation.md` §6。
+//! 字段语义与「与附录 C 的差异」。
 
 use std::sync::Arc;
 

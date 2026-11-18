@@ -1,6 +1,6 @@
 //! 持久节点树：`Node` / `NodeKind` / `LayoutBox` / `NodeTree`。
 //!
-//! 设计见 `design/phase-03-node-state.md` §11。要点：
+//! 要点：
 //! - 唯一的一棵树（I5）：节点树 + arena（`NodeId` 带代际）；**不维护全序平坦数组**
 //!   （Chrome / Qt / Flutter 都不维护：绘制、命中、a11y、Tab 序全部由 `children` 的 DFS 遍历直接
 //!   决定，结构插入/删除因此是 O(子树) 而不是 O(N) 拼接）；

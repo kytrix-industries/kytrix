@@ -1,6 +1,6 @@
 //! `ui_core` 的构建脚本：编译三套 shader + 构建期契约静态校验。
 //!
-//! 契约：`src/render/shaders/contract.md`；设计：`design/phase-07-shaders.md` §5/§6。
+//! 契约：`src/render/shaders/contract.md`。
 //!
 //! - 零依赖（std only）：不引 `regex`（手写扫描器）、不引 `sha2`（Cargo 的 fingerprint 就是缓存）。
 //! - 只编译本平台：Windows → `dxc`（DXIL）、macOS → `xcrun metal`（metallib）、Linux → `glslangValidator`（SPIR-V）。

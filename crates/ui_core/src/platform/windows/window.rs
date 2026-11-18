@@ -1,5 +1,4 @@
 //! 原生窗口：创建（初始隐藏）/ 显示 / 客户区尺寸 / 最小尺寸 / 销毁
-//! （`design/phase-09-win32-demo.md` §6）。
 //!
 //! P09 使用**系统标题栏**（`WS_OVERLAPPEDWINDOW`，`WM_NCCALCSIZE` 交 `DefWindowProcW`）；
 //! 自绘标题栏留 P12。
@@ -426,7 +425,7 @@ impl NativeWindow {
             let applied = ime::execute(hwnd, command);
             self.state_mut().note_ime_applied(applied);
         }
-        // 顺序（`design/DEVIATIONS.md` §36 F-204）：合成目标引用 HWND，必须**在 HWND 仍然存活时**把 visual 从
+        // 顺序：合成目标引用 HWND，必须**在 HWND 仍然存活时**把 visual 从
         // 窗口上摘下来并释放全部 DComp COM 对象（`SetRoot(NULL)` + `Commit`，再逐个 drop）。
         // 关闭顺序保证 GPU 线程已经退出（`pump` 先 drop `App`，`Renderer::drop` join 线程），
         // 因此这里能拿到互斥锁且不会再有人碰合成树。

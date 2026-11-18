@@ -1,6 +1,6 @@
 //! `App`：状态表 + 依赖图 + 窗口集合 + runtime 句柄。
 //!
-//! 设计见 `design/phase-03-node-state.md` §5.1 / §14。P03 是 headless 的：没有事件循环、没有
+//! P03 是 headless 的：没有事件循环、没有
 //! `Application`/`AppHandle`（推迟 P08/P09），`App` 只负责「状态 + 窗口 + 语义脏标记」。
 //!
 //! 写路径是 push 模型（§7.5）：一次 `write` 沿依赖图把 owner 标脏，**不**遍历整棵树；
@@ -331,7 +331,7 @@ fn overlay_style(origin: Point) -> crate::paint::style::Style {
 
 /// 应用层持有的跨线程句柄（`App::handle` 产出）。
 ///
-/// 三个方法就是全部的跨线程入口（`design/phase-09-win32-demo.md` §5.1）：
+/// 三个方法就是全部的跨线程入口：
 /// `wake` 请求一帧、`send` 回投一个主线程闭包、`spawn` 经 `App` 的 tokio 句柄提交任务。
 #[derive(Clone)]
 pub struct AppHandle {
@@ -506,7 +506,7 @@ impl App {
     ///
     /// # Errors
     /// `EngineError::Clipboard`：平台拒绝；Wayland 下「尚未收到过选区内容」也走这里
-    /// （剪贴板是异步拉模型，`design/phase-12-macos-linux.md` F-130）。
+    /// （剪贴板是异步拉模型）。
     pub fn clipboard_text(&self) -> Result<smol_str::SmolStr, EngineError> {
         resources::clipboard_text(self)
     }
@@ -833,7 +833,7 @@ impl App {
     /// 回投任务（`AppHandle::send`、a11y `ActionRequest`）里写状态时循环已经过了帧门禁、
     /// 即将阻塞在 `GetMessageW` / `poll`。只置位不唤醒会让这批状态一直等到下一条无关消息
     /// （画面与 a11y 更新都迟到）——P15 用 UIA 客户端实测 `SelectionItemPattern.Select()`
-    /// 不生效时定位到这一点（`design/DEVIATIONS.md` F-152）。
+    /// 不生效时定位到这一点。
     ///
     /// 批处理内（[`App::batch`]）只登记推迟位，由最外层批处理结束时合并成**一次**请求。
     fn request_frame(&mut self) {
@@ -872,7 +872,7 @@ impl App {
     /// 否则菜单项置灰 —— 「可点但点了没反应」比置灰更糟（用户会以为剪贴板/撤销坏了）。
     ///
     /// 为什么引擎不自己实现复制/粘贴/撤销：引擎没有内建文本控件，文本模型与选区归应用所有
-    /// （`design/phase-12-macos-linux.md` §7.2）；菜单动作只被翻译成与物理按键等价的
+    /// 菜单动作只被翻译成与物理按键等价的
     /// [`crate::event::InputEvent::Key`]，能执行它的只有应用注册的那条绑定。
     ///
     /// 与 `app::input::dispatch_action_with_hit` 的「引擎内置动作」名单保持同一份：那边新增
@@ -1693,7 +1693,6 @@ impl App {
     ///
     /// 返回 `false` = 该动作**不能**注册：`A11yAction::Click` 必须落到 P10 的 `Action` 表
     /// （`App::on_action`），让指针点击 / 键盘 Enter / AT 激活共享同一身份
-    /// （`design/phase-11-a11y.md` §9.3）。
     pub fn on_a11y_action(
         &mut self,
         action: crate::a11y::A11yAction,

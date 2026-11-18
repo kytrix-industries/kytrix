@@ -1,8 +1,8 @@
 //! 静态几何通道的数据契约（注册期描述 + 句柄 + 管线枚举）。
 //!
 //! `GeometryId` 是 `Copy` 句柄（要每帧塞进 `Primitive::Geometry`/`Path`），因此释放必须显式
-//! （`App::release_geometry`），不能依赖 `Drop`（`design/DEVIATIONS.md` F-30）。
-//! 顶点布局与 uniform 规格见 `design/phase-02-paint-foundation.md` §9。
+//! （`App::release_geometry`），不能依赖 `Drop`。
+//! 顶点布局与 uniform 规格见下方常量。
 
 use bytes::Bytes;
 

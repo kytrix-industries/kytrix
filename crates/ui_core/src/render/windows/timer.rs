@@ -1,4 +1,4 @@
-//! GPU timestamp（`design/phase-08-d3d12.md` §5.8）。
+//! GPU timestamp。
 //!
 //! 每 in-flight 槽 2 个 timestamp（帧起 / 帧末）+ 一块 READBACK buffer；fence 到达后读回
 //! 两个 `u64` 并换算成 ns。计时是**可选能力**：`new` 失败时返回 `None`，像素路径不受影响。

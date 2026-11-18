@@ -1,5 +1,4 @@
 //! ⑥ 图片与滚动：内嵌 PNG（1:1 / 2×）+ 20 行滚动列表
-//! （`design/phase-15-demo-showcase.md` §1）。
 //!
 //! 两个能力都是 P13 / P10 已有的公开面：`ResourceCache::insert`（PNG → 解码 → 线性预乘 → 图集 tile）
 //! 与 `App::{make_scroll, set_scroll_content}`（自带 clip 的滚动容器）。

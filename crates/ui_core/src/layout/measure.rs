@@ -6,7 +6,6 @@
 //! 「闭包捕获的状态变了」由 [`NodeTree::invalidate_measure`] 表达的**失效**（清 node..root 的缓存），
 //! 不是一个版本号字段（没有读者的字段按 AGENTS §2.1 不加）。
 //!
-//! 设计见 `design/phase-04-layout.md` §9。
 
 use std::cell::Cell;
 

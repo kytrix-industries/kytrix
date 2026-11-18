@@ -1,6 +1,6 @@
 //! 形状缓存：`ShapeKey` + `Rc<ShapedText>` 的 LRU（条目数 + 字节双上限）。
 //!
-//! 设计见 `design/phase-05-text.md` §11。键**不含** `atlas_generation`（F-53）：图集换代只影响
+//! 键**不含** `atlas_generation`：图集换代只影响
 //! 字形的 `AtlasTile`，不影响字形 id / advance / 基线 / 行数。
 //!
 //! 键也**不含水平亚像素相位**（P2-2）：相位是 `rasterize` 阶段由最终布局坐标派生的量化值

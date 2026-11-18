@@ -527,7 +527,8 @@ pub(crate) fn compute_layout(window: &mut Window) -> Result<LayoutReport, Engine
 ///   仍必须处理新目标尺寸，因此算有工作。
 ///
 /// Windows 的 `commit_frame` 在调用本函数之前先用 [`surface_change_plan`] 把「目标尺寸变了」
-/// 夹成 `Plan::Full`：组合交换链按高水位桶分配（2 s 静止后可能缩容），`set_content_size` 在
+/// 夹成 `Plan::Full`：组合交换链按 [`crate::platform::windows::composition::buffer_size`] 的桶分配
+/// （内容越过桶才 `ResizeBuffers`），`set_content_size` 在
 /// buffer 内不会重建任何资源，`Plan::Idle` 发布只会消费帧延迟 token 而不 present。
 ///
 /// 返回 `false` 的帧不会 publish：`commit_frame` 必须把它按 `Idle` 结算，否则 Linux 帧门禁
@@ -546,7 +547,7 @@ pub(crate) fn frame_reaches_gpu(
 // 消费者：`commit_frame`（Windows 目标尺寸变化的计划修正）。
 /// Windows：目标尺寸变化一律映射成 `Plan::Full`（任何输入计划）。
 ///
-/// 组合交换链按高水位 buffer 分配（2 s 静止后可能缩容），`set_content_size` 在 buffer 内只是
+/// 组合交换链按桶分配（内容越过桶才 `ResizeBuffers`），`set_content_size` 在 buffer 内只是
 /// CPU 记账；一个 `Plan::Idle` 的发布会让 GPU 线程消费一次帧延迟 waitable token 却不 present
 /// （DXGI 的 token 守恒被破坏，下一帧白等一个 vsync）。`Plan::Partial` 的 damage 是**按旧目标**算的：新暴露的
 /// 像素没有 damage，只画旧矩形会在新客户区留下未初始化内容，因此同样整帧重画。

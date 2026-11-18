@@ -1,5 +1,5 @@
 //! 帧编排：上传 → 逐 damage scissor 画进持久 offscreen → 把 persist 与 drawable 的差异 blit
-//! 过去 → present（`design/async-render-pipeline.md` §5.2 / §5.6）。
+//! 过去 → present。
 //!
 //! **本模块不取 drawable**：窗口路径的 drawable 由 `CAMetalDisplayLink` 的 update 提供，
 //! `CAMetalLayer::nextDrawable` 已删除（§5.7）。离屏/快照路径不给 drawable，只画进 persist。

@@ -5,7 +5,6 @@
 //!
 //! `event` 是 **Windows 专用**的 `WM_*` 解码层（`PlatformEvent` / `translate`）；macOS / Linux 的
 //! 平台层直接把原生事件翻成公共 `Event` 后调 `App::dispatch`
-//! （`design/phase-12-macos-linux.md` §3.2 / S-120）。
 //!
 //! 三份实现都必须提供：`run(app)`、`window::NativeWindow`、`dpi`、`ime`、`clipboard`、`a11y`。
 

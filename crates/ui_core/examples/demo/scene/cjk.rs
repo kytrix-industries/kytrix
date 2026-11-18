@@ -1,5 +1,4 @@
 //! ③ CJK 排版：四条脚本样例 + 一段中英混排自动换行
-//! （`design/phase-15-demo-showcase.md` §1、§4）。
 //!
 //! 引擎的字体栈（`FontStack::system_ui`）显式列出 CJK 家族，缺字形时继续往后找；本模块只给文本与
 //! 宽度，断行 / 光栅 / 图集全部由文本 pass 完成。集成测试断言**没有** `MissingGlyph`（豆腐块）。

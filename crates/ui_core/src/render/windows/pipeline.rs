@@ -1,5 +1,5 @@
 //! 根签名 / quad PSO / geometry PSO / 描述符堆 / 静态几何表
-//! （`design/phase-08-d3d12.md` §5.4；契约见 `render/shaders/contract.md`）。
+//! （契约见 `render/shaders/contract.md`）。
 //!
 //! 进程级共享的图元只有 [`Pipeline`]（根签名 + 4 个 PSO），由 `device::SharedGpu` 创建一次。
 //! 描述符全部在**一张** shader-visible 的 CBV/SRV/UAV 堆 [`SrvHeap`] 里（D3D12 规定每个

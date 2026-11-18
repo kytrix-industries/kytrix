@@ -3,7 +3,7 @@
 //! 语义与 Chrome / Zed 相同：**内容 visual 恒 1:1，不随窗口 resize 缩放**。客户区永远显示
 //! 「上一次呈现的内容 + 独立背景层」：拖动中旧内容保持左上角 1:1，露出的新区域由背景层
 //! （窗口背景色）填充；新内容由 GPU 线程按新尺寸重画后 1:1 覆盖。因此没有「上一帧被拉伸」
-//! 的中间态，也就没有静止时收回 1:1 的 snap / 回弹（`design/DEVIATIONS.md` §36 F-205 / S-152）。
+//! 的中间态，也就没有静止时收回 1:1 的 snap / 回弹。
 //!
 //! 视觉树（自下而上）：
 //! - `root`：`SetRoot` 的容器，没有内容；
@@ -13,11 +13,11 @@
 //!   `(0, 0, content_px)`。
 //!
 //! 四条实测约束（probe `dpi.log` / `resize.log` / `caps.log`）：
-//! 1. 组合交换链的 `ResizeBuffers` 只在**第一次 `Present` 之前**可用，之后必然 `0x887A0001`；
-//!    所以 buffer 是 **grow-only 高水位**（[`buffer_size`] 按内容 + 64 余量、256 对齐取桶；
-//!    GPU 侧 `grow` 再与当前 buffer 逐轴取大），只有内容越过它时才重建「持久目标 + 交换链」并
-//!    把 visual 切到新交换链（`GpuRenderer::grow`）；内容静止 `SHRINK_IDLE` 后 `maybe_shrink`
-//!    把高水位缩回当前内容桶（缩容先拷旧内容，F-207）。
+//! 1. 交换链与持久目标按 [`buffer_size`] 的**桶**创建（内容 + 64 余量、256 对齐）：内容在桶内
+//!    时只是 CPU 记账（内容 visual 恒 1:1，多出的像素由 `content_clip` 裁掉），内容越过桶才
+//!    `ResizeBuffers` 并重建持久目标（R08-1，前置条件见
+//!    `render::windows::compositor::persist::resize_target`）；`ResizeBuffers` 被驱动拒绝时回退
+//!    成整链替换（`replace_swapchain`：新建交换链 + prime + `SetContent` + `Commit`）。
 //! 2. visual 的单位是**物理像素**（与 DPI 无关）：内容 clip 写内容坐标 `(0, 0, content)`；
 //!    背景层 1×1 内容靠 `scale = client_px` 放大到客户区，两者都不再乘 1/dpi。
 //! 3. 内容 visual 没有 transform，所以 clip 就是客户区里的 `(0, 0, content)`：客户区变大时
@@ -28,8 +28,9 @@
 //!
 //! 线程：DComp 对象**不绑定创建线程**，但同一 visual 的并发 `Commit` 与属性写入批次归属未定义
 //! （文档要求应用自己同步），所以本结构用 `Arc<Mutex<Composition>>` 把**所有** DComp 调用串行化：
-//! UI 线程做 visual 几何 / 关闭，GPU 线程只在内容越过 buffer（`set_content`）、高水位缩容
-//! （`maybe_shrink`）或背景色变化（`set_background_content`）时各做一次 `SetContent` + `Commit`。
+//! UI 线程做 visual 几何 / 关闭，GPU 线程只在内容越过 buffer（`set_content_size` 的
+//! `resize_target` 回退路径）、内容尺寸变化（`set_content`）或背景色变化
+//! （`set_background_content`）时各做一次 `SetContent` + `Commit`。
 //!
 //! 两个错误面：[`Composition::new`] 的 COM 创建阶段失败是 [`EngineError::AppInit`]（窗口还建不
 //! 出来）；**运行时**调用（几何 / 提交 / 交换链切换，含首帧 `SetContent` + `Commit`）失败是
@@ -110,7 +111,7 @@ pub(crate) fn lock(composition: &Mutex<Composition>) -> MutexGuard<'_, Compositi
 }
 
 impl Composition {
-    /// 为一个**尚未显示**的窗口建立合成树（`design/DEVIATIONS.md` §36 F-202）。
+    /// 为一个**尚未显示**的窗口建立合成树。
     ///
     /// 本方法不设置裁剪边界 / 背景缩放（`CreateRectangleClip` 的初始边界没有语义保证）：
     /// 调用方必须在 `ShowWindow` 之前先挂上两条交换链（`set_content` / `set_background_content`，
@@ -332,12 +333,10 @@ fn visual_geometry(content: (u32, u32), client: (u32, u32)) -> VisualGeometry {
 /// 把桶限制在有限档位。**不再读虚拟屏幕** —— 旧的固定 buffer 在 6000×3840 的桌面上每个窗口
 /// 白占 ~352 MiB，且显示配置变大后内容必然越界、无法恢复。
 ///
-/// GPU 侧的 `grow` 会把这个桶与当前 buffer **逐轴取大**（历史高水位）：`content + 64` 只是
-/// 「当前内容需要的桶」，不是常驻 VRAM 的精确值。内容静止 `SHRINK_IDLE` 后
-/// `GpuRenderer::maybe_shrink` 把高水位缩回当前内容桶（新目标先 clear、再拷旧内容，然后才切
-/// visual；F-207），所以 VRAM 会回落而不是永久占用。grow 的逐轴取大还有一个正确性原因：视觉
-/// 切换那一帧的旧 clip 可能仍指向旧内容，新交换链必须至少覆盖旧 buffer，否则会露出未定义像素
-/// （P1-A）。
+/// 桶尺寸只由**当前内容**决定（`round_up_256(content + 64)`），不是历史高水位：内容缩小跨过
+/// 桶边界时 GPU 侧会 `ResizeBuffers` 到更小的桶，所以 VRAM 会回落而不是永久占用（R08-1；
+/// `render::windows::compositor::persist::set_content_size`）。桶内的小幅变化不碰任何 GPU 资源：
+/// 内容 visual 恒 1:1，多出的像素由 `content_clip` 裁掉。
 ///
 /// # Errors
 /// `EngineError::Swapchain`：内容的任一边 > [`MAX_BUFFER`]（DXGI 纹理上限），显式失败而不是

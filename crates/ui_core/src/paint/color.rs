@@ -10,7 +10,6 @@
 //! 代价是同一对颜色的中点比 Chrome 更亮，取舍记录见 `.docs/ui_core-审查报告.md` §5.6）。
 //!
 //! 算法与边界（自建 CSS Color 4 chroma 二分、NaN/clamp 规则）见
-//! `design/phase-02-paint-foundation.md` §5.4–§5.5。
 
 use color::{ColorSpaceTag, DynamicColor, Flags};
 

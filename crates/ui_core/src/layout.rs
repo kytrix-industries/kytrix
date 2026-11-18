@@ -4,7 +4,6 @@
 //! 公开路径因此是 `ui_core::layout::MeasureFn` / `layout::LayoutOverride` / `layout::LayoutReport` /
 //! `layout::hit_test::HitResult`（P01 §4.5 的路径表按「类型定义文件」解释）。
 //!
-//! 设计见 `design/phase-04-layout.md`。
 
 pub mod hit_test;
 pub(crate) mod measure;

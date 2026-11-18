@@ -2,7 +2,7 @@
 //!
 //! 结构：容器（滚动容器 + `Clip::Bounds` + `position: relative`）直接挂**绝对定位的行**，`content` 由
 //! `count × extent` 显式给出（taffy 没有「可滚动内容盒」）。挂载/回收的写入口是
-//! `App::set_virtual_items` / `App::scroll_to`（`design/phase-10-interaction.md` §8）。
+//! `App::set_virtual_items` / `App::scroll_to`。
 
 use std::ops::Range;
 

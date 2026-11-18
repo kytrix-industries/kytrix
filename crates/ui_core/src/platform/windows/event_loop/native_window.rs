@@ -244,7 +244,7 @@ pub(super) fn apply_event(
             let size = if native.is_minimized() {
                 native.logical_size()
             } else {
-                // 只记录尺寸并唤醒（`design/async-render-pipeline.md` §6.7）：内容重画发生在 GPU
+                // 只记录尺寸并唤醒：内容重画发生在 GPU
                 // 线程按下一帧的 `FrameRequest.surface` 做，UI 线程不等待。
                 //
                 // 逻辑尺寸用**该消息的 scale** 换算（R07-12）：`WM_SIZE` 与 `WM_DPICHANGED` 可能

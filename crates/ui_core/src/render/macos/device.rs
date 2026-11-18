@@ -1,4 +1,4 @@
-//! `MTLDevice` 的创建、D8 采集与资源句柄表（`design/phase-12-macos-linux.md` §5.1）。
+//! `MTLDevice` 的创建、D8 采集与资源句柄表。
 //!
 //! D8 硬基线：**`MTLCreateSystemDefaultDevice` 非空 + `argumentBuffersSupport == Tier2`**。
 //! v1 不建 argument buffer（F-119），但 Tier2 仍是产品基线（主设计 §2.2）与未来多页图集的门。
@@ -15,8 +15,7 @@ use smol_str::SmolStr;
 use crate::{error::EngineError, render::retire::GpuResourceHandle};
 
 thread_local! {
-    /// 当前线程是否是 `kytrix-metal` GPU 线程（`design/async-render-pipeline.md` §10.1 的
-    /// 线程归属断言）。
+    /// 当前线程是否是 `kytrix-metal` GPU 线程（线程归属断言）。
     static ON_GPU_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 

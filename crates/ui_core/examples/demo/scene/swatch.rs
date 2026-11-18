@@ -1,5 +1,4 @@
 //! ① 焦点与动作：3 个色块（互斥选择 = `RadioButton`）+ 选中说明
-//! （`design/phase-15-demo-showcase.md` §2.2）。
 
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{

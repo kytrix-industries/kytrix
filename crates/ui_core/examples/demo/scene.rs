@@ -1,5 +1,4 @@
 //! demo 的主场景：焦点 / CJK / 输入法 / 无障碍 / 图片与滚动
-//! （`design/phase-15-demo-showcase.md`、`design/phase-18-demo-example.md`）。
 //!
 //! 两个 example 目标共用同一份建树代码：`demo`（真实窗口）与 `snapshot_demo`（WARP 离屏）。
 //! 本模块是场景的**模块根**：常量、[`Scene`] 句柄与编排（建树 / 安装 / 帧钩子 / 截图种子状态）；

@@ -1,5 +1,5 @@
 //! 进程级共享 GPU（`SharedGpu`）+ `ID3D12Device` 的创建、D8 采集、DRED、调试层、恢复路径与
-//! 资源句柄表（`design/phase-08-d3d12.md` §5.1）。
+//! 资源句柄表。
 //!
 //! 多窗口的正确形状（与 Chrome / Qt RHI 一致）：进程一个 `ID3D12Device`、一条 direct queue、
 //! 一套根签名 / PSO、两份共享图集纹理；每个窗口只保留 swapchain / DirectComposition 对象 /

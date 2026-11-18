@@ -1,7 +1,6 @@
 //! 动画：进度采样、标量/点/颜色插值（槽与推进在 `App::{animate, tick_animations}`）。
 //!
 //! 被驱动的值落 `Transient`（不进依赖图）；重绘由**显式注册的节点集合**的 `mark_paint` 给出
-//! （`design/phase-10-interaction.md` §11）。
 
 use crate::{
     math::Point,

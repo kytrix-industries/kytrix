@@ -1,4 +1,4 @@
-//! metallib 加载 + PSO 缓存键 + PSO 构建（`design/phase-12-macos-linux.md` §5.4）。
+//! metallib 加载 + PSO 缓存键 + PSO 构建。
 //!
 //! 绑定模型与 P07 的 `contract.md` §7 逐字一致（**直绑，不做 argument buffer**，F-119）：
 //! `buffer(0)` instances / `buffer(1)` clips / `buffer(2)` root / `texture(0)` glyph / `texture(1)` image /

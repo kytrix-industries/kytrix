@@ -1,7 +1,6 @@
 //! 焦点：可聚焦谓词、Tab 序（DFS 先序过滤）、焦点作用域与焦点移动的纯逻辑。
 //!
 //! 状态（`focused`）在 [`crate::interaction::FocusScope`]；写入口是 `App::{set_focus, focus_next, focus_prev}`
-//! （`design/phase-10-interaction.md` §6）。
 
 use crate::{
     event::Action,

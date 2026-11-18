@@ -1,4 +1,4 @@
-//! offscreen → readback heap → CPU（`design/phase-08-d3d12.md` §5.7 / §7.7）。
+//! offscreen → readback heap → CPU。
 //!
 //! 只在 test / `test-support` 构建里存在（像素快照是 L3 的测试面；发布物不带读回路径）。
 //! 读回的字节是**资源格式** `B8G8R8A8_UNORM` 里已编码好的 sRGB 值（DEVIATIONS F-80）。
@@ -105,7 +105,7 @@ impl Readback {
                     SubresourceIndex: 0,
                 },
             };
-            // 显式给源盒：源资源可能比要读回的矩形大（窗口路径的持久目标按高水位桶分配，
+            // 显式给源盒：源资源可能比要读回的矩形大（窗口路径的持久目标按桶尺寸分配，
             // 内容只是左上角的子矩形），`pSrcBox = NULL` 会把整块源塞进更小的 footprint。
             let region = D3D12_BOX {
                 left: 0,

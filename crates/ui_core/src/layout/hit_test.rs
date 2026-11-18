@@ -17,7 +17,6 @@
 //! - **数值防御（C13）**：非有限的点/布局盒/裁剪矩形/clip 偏移一律视为"不命中"并跳过该子树；
 //!   NaN 永不返回 `true`。
 //!
-//! 设计见 `design/phase-04-layout.md` §12。
 
 use std::sync::Arc;
 
@@ -388,7 +387,7 @@ fn transformed_box(bounds: Rect, transform: Transform) -> Rect {
 /// 逆绘制序（`children` 的 DFS 先序 ⇒ 兄弟逆序 + 先子树后自身）+ 按布局盒与 clip 剪枝。
 ///
 /// **屏幕坐标**：`point` 是窗口逻辑像素；布局盒是**内容坐标**，因此进入滚动容器的子树时按它的 `offset`
-/// 把点换算到内容空间（`design/phase-10-interaction.md` §7.3）。根不是滚动容器 ⇒ 顶层偏移恒为零。
+/// 把点换算到内容空间。根不是滚动容器 ⇒ 顶层偏移恒为零。
 pub(crate) fn hit_test(tree: &NodeTree, point: Point) -> Option<HitResult> {
     // C13：非有限的指针坐标永不命中（NaN 参与任何比较都是 false，但显式短路让诊断确定）。
     if !point.is_finite() {

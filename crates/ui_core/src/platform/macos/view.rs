@@ -1,5 +1,5 @@
 //! `NSView` 子类：`CAMetalLayer` 宿主 + 输入收集 + `NSTextInputClient` + NSAccessibility +
-//! 主菜单的 responder 动作（`design/phase-12-macos-linux.md` §7.2 / §7.5 / §7.7）。
+//! 主菜单的 responder 动作。
 //!
 //! 纪律：
 //! - **平台回调不碰 `App`** —— 事件只 push 进 `ViewIvars.events`，泵在主线程 drain 后 dispatch

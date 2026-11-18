@@ -1,4 +1,4 @@
-//! 读回：persist（`*_SRGB` image）→ host-visible buffer → map（`design/phase-12-macos-linux.md` §6.7）。
+//! 读回：persist（`*_SRGB` image）→ host-visible buffer → map。
 //!
 //! 字节语义与 D3D12 / Metal 同契约：存储字节是 **sRGB 编码后的预乘值**，读回后只做 BGRA→RGBA 交换。
 //! 仅测试 / `test-support` 构建存在；缓冲是本窗口独占的（共享设备只提供 `VkDevice` / 内存类型）。

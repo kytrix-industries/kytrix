@@ -1,5 +1,4 @@
 //! **组合**交换链（`CreateSwapChainForComposition`）/ `ResizeBuffers` / `Present1` 分类
-//! （`design/phase-08-d3d12.md` §5.3 / §6.4、`design/DEVIATIONS.md` §36 F-199）。
 //!
 //! 窗口路径的交换链不是 HWND swapchain：它的内容经 `IDCompositionVisual::SetContent` 交给
 //! DirectComposition（`platform/windows/composition.rs`），窗口的客户区由 DComp 合成。
@@ -22,7 +21,7 @@
 //! `hresult::resize_fallback_worthwhile`）。
 //!
 //! 呈现节奏来自 `DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT` 的 waitable 对象
-//! （`design/async-render-pipeline.md` §6.2）：`SetMaximumFrameLatency(1)` + 每帧渲染前等一次
+//! `SetMaximumFrameLatency(1)` + 每帧渲染前等一次
 //! 该句柄。`SetBackgroundColor` 在组合交换链上是**惰性**的（probe：返回 OK 但不影响合成），
 //! 因此背景色只走持久目标的 clear（`render/color.rs`）与 1×1 背景层。
 //!

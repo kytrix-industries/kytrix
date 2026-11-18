@@ -1,5 +1,4 @@
 //! Kytrix GUI 的**离屏快照示例**，与 `demo` 共用 `scene` 模块
-//! （`design/phase-15-demo-showcase.md`、`design/phase-18-demo-example.md`）。
 //!
 //! ```text
 //! cargo run -p ui_core --example snapshot_demo --features test-support -- --snapshot out\demo-showcase.png

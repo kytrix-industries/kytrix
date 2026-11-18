@@ -1,5 +1,4 @@
 //! 窗口渲染门面 + `CAMetalDisplayLink` + 每窗口一条 `kytrix-metal` GPU 线程
-//! （`design/async-render-pipeline.md` §4.5 / §5）。
 //!
 //! ```text
 //! 主线程                                   kytrix-metal 线程（每窗口）

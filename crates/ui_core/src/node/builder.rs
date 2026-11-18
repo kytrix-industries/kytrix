@@ -1,6 +1,5 @@
 //! `NodeBuilder`：声明式建树的唯一入口。
 //!
-//! 设计见 `design/phase-03-node-state.md` §12 与 `design/phase-04-layout.md` §10。
 //! 一个 builder 实例 = 一次挂载（不是可复用的模板）；`build` 时把 6 个部件装成 `NodeSpec` 交给
 //! `NodeTree::insert_child`（`NodeSpec` 的字段私有 —— 见其 rustdoc）。
 
@@ -79,7 +78,7 @@ impl NodeBuilder {
 
     /// 静态 a11y 声明（角色 / 可访问名 / 值 / 动作 / 隐藏 / 禁用）。
     ///
-    /// 不写 `a11y` 的节点仍会进 a11y 树（角色由节点种类推导，见 `design/phase-11-a11y.md` §5.2）；
+    /// 不写 `a11y` 的节点仍会进 a11y 树（角色由节点种类推导）；
     /// 自绘节点（`canvas` / `geometry`）**必须**在这里给 `label`，否则会被标 `hidden` 并记诊断。
     #[must_use]
     pub fn a11y(mut self, a11y: crate::a11y::A11yOverride) -> Self {

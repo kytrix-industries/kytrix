@@ -1,7 +1,7 @@
 //! 绘制桶（`Lane`）、clip 深度上限、以及一帧的绘制场景（`Scene`/`LaneId`）。
 //!
-//! **`Scene` / `LaneId` / lane 分配与绘制序在 P03 落地**（`design/phase-02-paint-foundation.md` §7.2、§19；
-//! `design/phase-03-node-state.md` §13）。`Lane` 与 `MAX_CLIP_DEPTH` 保持 crate 私有：应用层通过
+//! **`Scene` / `LaneId` / lane 分配与绘制序在 P03 落地**
+//! `Lane` 与 `MAX_CLIP_DEPTH` 保持 crate 私有：应用层通过
 //! [`Canvas`] 与 [`Scene`] 的只读方法间接观测。
 //!
 //! [`Canvas`]: crate::paint::canvas::Canvas
@@ -23,7 +23,7 @@ pub(crate) const MAX_CLIP_DEPTH: u8 = 8;
 
 /// 一个绘制输出桶。内容按绘制序排列；`clip_depth` 是 C2/C3 的**增量校验状态**。
 ///
-/// 只在 crate 内可见：应用层通过 `Canvas` 构造与读取（`design/phase-02-paint-foundation.md` §11）。
+/// 只在 crate 内可见：应用层通过 `Canvas` 构造与读取。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Lane {
     primitives: Vec<Primitive>,

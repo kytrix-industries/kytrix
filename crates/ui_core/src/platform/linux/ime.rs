@@ -1,4 +1,4 @@
-//! IME 批次状态：`zwp_text_input_v3` 的双缓冲（`design/phase-12-macos-linux.md` §8.5 / F-128）。
+//! IME 批次状态：`zwp_text_input_v3` 的双缓冲。
 //!
 //! `preedit_string` / `commit_string` / `delete_surrounding_text` 可能在同一批里到达，
 //! **只在 `done` 时原子生效**（否则 UI 会看到半状态）。XML `done` 规定求值顺序：

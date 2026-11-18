@@ -1,4 +1,4 @@
-//! ④ 无障碍：单选组 + 缩放滑块（`design/phase-15-demo-showcase.md` §2.5、§0.1）。
+//! ④ 无障碍：单选组 + 缩放滑块。
 //!
 //! 语义选择：`RadioButton` 的选中态走 `A11yPatch.checked`（→ `set_toggled`），数值用
 //! `Slider.value`；`selected` 只适用于 `ListBoxOption` / `Tab` / `TreeItem` 这类按
@@ -31,7 +31,7 @@ use super::{
 /// 单选组选项（下标 = `A11yState.radio`）。
 const RADIOS: [&str; 2] = ["选项 A", "选项 B"];
 
-/// 单选的点击动作（两个选项各一条：动作身份里不带载荷，`design/phase-10-interaction.md` §4.1）。
+/// 单选的点击动作（两个选项各一条：动作身份里不带载荷）。
 const RADIO_ACTIONS: [&str; 2] = ["a11y.radio.a", "a11y.radio.b"];
 
 /// 滑块的分段数（每段 10%）。

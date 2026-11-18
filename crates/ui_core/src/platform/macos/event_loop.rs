@@ -1,5 +1,5 @@
 //! macOS 主事件循环（`NSApplication::run()` + `CFRunLoopObserver` / `CFRunLoopSource` 泵）
-//! （`design/phase-12-macos-linux.md` §7.1；macOS 验证修正见 `macos-verification.md` §2.8）。
+//! （macOS 验证修正见 `macos-verification.md` §2.8）。
 //!
 //! 结构：
 //! - **事件循环交给 AppKit**：`NSApplication::run()` 处理 NSEvent、原生全屏转场、live resize、

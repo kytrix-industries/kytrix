@@ -3,7 +3,7 @@
 //! 本文是 `render/shaders/contract.md` 的**权威来源**（I2/I8）：字段顺序、offset、`kind`/`params`
 //! 取值表的任何改动都必须同时改 Rust、三套 shader、`contract.md`，并触发像素快照回归。
 //!
-//! 范围（`design/phase-06-paint-runtime.md` §7、`ui_core-架构决策-B3B6.md` §2）：
+//! 范围（`ui_core-架构决策-B3B6.md` §2）：
 //! - 8 类 `Primitive` → `GpuPrimitive`（`GlyphRun` 是唯一的 1→N）；
 //! - `Path`/`Geometry` 0 实例 + `FrameOp::Geometry`；
 //! - clip 链去重（`ClipChainId`，**跨帧稳定索引**）+ **轴对齐矩形求交合并**（Skia `SkClipStack`

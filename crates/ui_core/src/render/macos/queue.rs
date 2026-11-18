@@ -1,4 +1,4 @@
-//! 命令队列 / 三槽上传背压 / 异步提交 / 完成通知 / retire（`design/async-render-pipeline.md` §5.2）。
+//! 命令队列 / 三槽上传背压 / 异步提交 / 完成通知 / retire。
 //!
 //! **没有在飞数组、没有 `status()` 轮询、没有 `waitUntilCompleted` 背压**：
 //! - 提交：登记 `addCompletedHandler`（signal 三槽 semaphore + 把命令缓冲交给调用方）后 `commit`，

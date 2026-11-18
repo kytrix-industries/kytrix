@@ -1,4 +1,4 @@
-//! 分段时间（`design/phase-08-d3d12.md` §4.5 / §5.8；主设计 §2.10 的数值语义）。
+//! 分段时间（数值语义）。
 //!
 //! P08 有生产者的段只有 `Upload` / `Gpu` / `Present`；`Build`/`Layout`/`Shape`/`Paint` 属
 //! P09 的 App 级计时，届时 additive 追加。

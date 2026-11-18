@@ -1,4 +1,4 @@
-//! GPU 计时：`MTLCommandBuffer::GPUStartTime` / `GPUEndTime`（`design/phase-12-macos-linux.md` §5.8）。
+//! GPU 计时：`MTLCommandBuffer::GPUStartTime` / `GPUEndTime`。
 //!
 //! 不用 `MTLCounterSampleBuffer`（`counterSets` 可能为空、要拆 pass、CI 无法验证）；command buffer 级
 //! 的 GPU 时间足以喂 `Section::Gpu`（F-131）。

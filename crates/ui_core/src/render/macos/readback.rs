@@ -1,5 +1,4 @@
 //! 读回：persist（Private）→ blit 到 Shared buffer → `getBytes` 语义的 CPU 读取
-//! （`design/phase-12-macos-linux.md` §5.7）。
 //!
 //! 字节语义与 D3D12 同契约：`BGRA8Unorm_sRGB` 的存储字节是 **sRGB 编码后的预乘值**，
 //! 读回后只做 BGRA→RGBA 交换（不再做色彩转换）。仅测试 / `test-support` 构建存在。

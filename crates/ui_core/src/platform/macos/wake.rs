@@ -1,5 +1,4 @@
 //! 跨线程唤醒（`CFRunLoopSource`）+ 连续帧定时器（`CFRunLoopTimer`）
-//! （`design/phase-12-macos-linux.md` §7.1）。
 //!
 //! `CFRunLoopSourceSignal` / `CFRunLoopWakeUp` / `CFRunLoopTimerInvalidate` 都是 CoreFoundation
 //! 文档保证线程安全的操作。source 的 `perform` 回调在主线程的 run loop 上执行泵，因此

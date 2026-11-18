@@ -1,5 +1,4 @@
-//! DPI：`wp_fractional_scale_v1`（120 分之几）与整数倍率回退（V-110 / V-122 ④，
-//! 见 `design/phase-12-macos-linux.md` §8.4）。
+//! DPI：`wp_fractional_scale_v1`（120 分之几）与整数倍率回退（V-110 / V-122 ④）。
 //!
 //! 两条路径的 buffer 尺寸都按 `round(logical × scale)` 计算；差别只在缩放由谁完成：fractional
 //! 用 `wp_viewport.set_destination`（`buffer_scale` 恒 1），整数回退用

@@ -1,6 +1,5 @@
 //! 图集分配器（P02 §10.4 的落地）：单页 + 1 纹素 padding + 脏矩形 + 代际。
 //!
-//! 设计见 `design/phase-05-text.md` §9（逐字规格）与 `design/phase-02-paint-foundation.md` §10。
 //! 只做**装箱 + 脏矩形 + 代际**：不持有 CPU 像素（P02 §10.6），上传由 P09 从字形缓存读。
 //!
 //! 两条 probe 实测修正（phase-05 §9.2）：
