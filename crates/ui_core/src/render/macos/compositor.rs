@@ -471,7 +471,7 @@ impl GpuRenderer {
         &mut self,
         buffer: &InstanceBuffer,
     ) -> Result<ReadbackImage, EngineError> {
-        let payload = FramePayload::full(buffer, Vec::new());
+        let payload = FramePayload::full(buffer, Vec::new(), Vec::new());
         let mut timings = FrameTimings::new();
         let mut frame = FramePlan::new(Plan::Full, true);
         self.submit_snapshot(FrameIndex::from_raw(1), &payload, &mut frame, &mut timings)?;
