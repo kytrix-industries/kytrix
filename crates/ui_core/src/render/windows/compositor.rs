@@ -549,9 +549,9 @@ impl GpuRenderer {
         kind: AtlasKind,
         page: u32,
         pixels: Vec<u8>,
-        rows: crate::render::atlas::DirtyRows,
+        rects: crate::render::atlas::DirtyRects,
     ) {
-        upload::queue_atlas_upload(self, kind, page, pixels, rows)
+        upload::queue_atlas_upload(self, kind, page, pixels, rects)
     }
 
     /// 该图集是否有一笔上传已入队、还没被命令列表消费（离屏目标的空闲判据）。

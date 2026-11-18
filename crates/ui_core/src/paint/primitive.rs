@@ -47,6 +47,10 @@ pub enum QuadPaint {
 }
 
 /// 内侧边框（沿 `bounds` 内缘展开）。
+///
+/// `width` 是**逻辑像素**的绘制宽度；编码期按设备像素吸附成**整数物理像素且至少 1 px**
+/// （`math::snap_stroke_width`，Skia hairline / WebRender 边框吸附）：1 dp 边框在 125% /
+/// 150% / 175% 下是 1 / 2 / 2 物理像素的硬边，不是 1.25/1.5/1.75 px 的 AA 带（R04-4）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Border {
     /// 边框宽度（逻辑像素）。

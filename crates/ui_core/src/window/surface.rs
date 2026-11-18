@@ -175,31 +175,31 @@ pub(crate) fn mark_atlas_page_stale(window: &mut Window, kind: AtlasKind) {
     }
 }
 
-// 消费者：`impl Window::atlas_rows` 的薄委托（外部调用点见该方法文档）。
-/// 本窗口待上传的图集脏行（忙窗口攒着，空闲时补发）。
-pub(crate) fn atlas_rows(window: &Window, kind: AtlasKind) -> &crate::render::DirtyRows {
-    &window.atlas_rows[kind.index() as usize]
+// 消费者：`impl Window::atlas_rects` 的薄委托（外部调用点见该方法文档）。
+/// 本窗口待上传的图集脏矩形（忙窗口攒着，空闲时补发）。
+pub(crate) fn atlas_rects(window: &Window, kind: AtlasKind) -> &crate::render::DirtyRects {
+    &window.atlas_rects[kind.index() as usize]
 }
 
-// 消费者：`impl Window::atlas_rows_mut` 的薄委托（外部调用点见该方法文档）。
-/// 本窗口待上传的图集脏行（可变：并入本帧新写的行）。
-pub(crate) fn atlas_rows_mut(
+// 消费者：`impl Window::atlas_rects_mut` 的薄委托（外部调用点见该方法文档）。
+/// 本窗口待上传的图集脏矩形（可变：并入本帧新写的矩形）。
+pub(crate) fn atlas_rects_mut(
     window: &mut Window,
     kind: AtlasKind,
-) -> &mut crate::render::DirtyRows {
-    &mut window.atlas_rows[kind.index() as usize]
+) -> &mut crate::render::DirtyRects {
+    &mut window.atlas_rects[kind.index() as usize]
 }
 
-// 消费者：`impl Window::clear_atlas_rows` 的薄委托（外部调用点见该方法文档）。
-/// 本窗口的待发行已入队（或已被整页上传覆盖）。
-pub(crate) fn clear_atlas_rows(window: &mut Window, kind: AtlasKind) {
-    window.atlas_rows[kind.index() as usize].clear();
+// 消费者：`impl Window::clear_atlas_rects` 的薄委托（外部调用点见该方法文档）。
+/// 本窗口的待发矩形已入队（或已被整页上传覆盖）。
+pub(crate) fn clear_atlas_rects(window: &mut Window, kind: AtlasKind) {
+    window.atlas_rects[kind.index() as usize].clear();
 }
 
-// 消费者：`impl Window::atlas_rows_pending` 的薄委托（外部调用点见该方法文档）。
-/// 本窗口还有没赶上帧的图集行：这一帧会以旧图集呈现，需要补一帧。
-pub(crate) fn atlas_rows_pending(window: &Window) -> bool {
-    window.atlas_rows.iter().any(|rows| !rows.is_empty())
+// 消费者：`impl Window::atlas_rects_pending` 的薄委托（外部调用点见该方法文档）。
+/// 本窗口还有没赶上帧的图集矩形：这一帧会以旧图集呈现，需要补一帧。
+pub(crate) fn atlas_rects_pending(window: &Window) -> bool {
+    window.atlas_rects.iter().any(|rects| !rects.is_empty())
 }
 
 // 消费者：`impl Window::note_atlas_deferral` 的薄委托（外部调用点见该方法文档）。
@@ -222,20 +222,20 @@ pub(crate) fn reset_atlas_deferrals(window: &mut Window) {
 // 消费者：`impl Window::queue_atlas_upload` 的薄委托（外部调用点见该方法文档）。
 /// 把一页图集像素交给渲染器；`false` = 没有渲染器或渲染器已关闭（**没有**入队）。
 ///
-/// `pixels` 是 `rows` 顺序**紧密打包**的行（每行 `page * texel` 字节；整页上传时就是整页），
-/// 因此增量上传只搬脏行（DEVIATIONS F-211）。消费者：`App::upload_atlas_pages`（逐窗口
-/// 分发；图集页是进程级共享数据，纹理是每窗口一份）。
+/// `pixels` 是 `rects` 顺序**逐矩形紧密打包**的字节（行内只有 `width × texel`；整页上传时就是
+/// 整页），因此增量上传只搬脏矩形（R06-3：AOI 上传，替代旧的整页宽行区间）。消费者：
+/// `App::upload_atlas_pages`（逐窗口分发；图集页是进程级共享数据，纹理是每窗口一份）。
 pub(crate) fn queue_atlas_upload(
     window: &mut Window,
     kind: AtlasKind,
     page: u32,
     pixels: &[u8],
-    rows: crate::render::DirtyRows,
+    rects: crate::render::DirtyRects,
 ) -> bool {
     window
         .renderer
         .as_mut()
-        .is_some_and(|renderer| renderer.queue_atlas_upload(kind, page, pixels, rows))
+        .is_some_and(|renderer| renderer.queue_atlas_upload(kind, page, pixels, rects))
 }
 
 // 消费者：`impl Window::atlas_idle` 的薄委托（外部调用点见该方法文档）。
@@ -255,7 +255,7 @@ pub(crate) fn set_renderer(window: &mut Window, renderer: Renderer) {
     window.renderer = Some(renderer);
     window.glyph_page_received = None;
     window.image_page_received = None;
-    window.atlas_rows = std::array::from_fn(|_| crate::render::DirtyRows::default());
+    window.atlas_rects = std::array::from_fn(|_| crate::render::DirtyRects::default());
 }
 
 // 消费者：`impl Window::poll_renderer` 的薄委托（外部调用点见该方法文档）。
@@ -309,7 +309,7 @@ pub(crate) fn enable_offscreen_renderer(window: &mut Window) -> Result<(), Engin
     window.renderer = Some(Renderer::new_offscreen(surface)?);
     window.glyph_page_received = None;
     window.image_page_received = None;
-    window.atlas_rows = std::array::from_fn(|_| crate::render::DirtyRows::default());
+    window.atlas_rects = std::array::from_fn(|_| crate::render::DirtyRects::default());
     Ok(())
 }
 

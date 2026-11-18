@@ -277,9 +277,11 @@ pub(crate) fn close_window(app: &mut App, id: WindowId) -> bool {
             }
         }
     }
-    // 窗口的信号作用域：释放后其信号的写是 no-op、依赖边被立即删除。
+    // 窗口的信号作用域：释放后其信号的值**立即回收**（槽位归还空闲栈、代际递增），旧句柄的写
+    // 是 no-op、读是确定性失败，依赖边被立即删除。
     // 这是「关窗之后的迟到写入（异步任务 / 定时器回投）不得产生僵尸唤醒」的可观测半边
-    // （R03-6 / wave-6）：节点退订处理了**读侧**，作用域释放处理了**写侧**。
+    // （R03-6 / wave-6）：节点退订处理了**读侧**，作用域释放处理了**写侧**；S6 起写侧同时
+    // 不再让槽位与其值常驻（长跑窗口 churn 的槽位峰值不增长）。
     if let Some(scope) = app.window_scopes.remove(&id) {
         super::signal_api::release_scope(app, scope);
     }

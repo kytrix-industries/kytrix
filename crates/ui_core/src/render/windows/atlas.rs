@@ -22,17 +22,14 @@
 //!
 //! staging 有两档：**每槽常驻**一小块（≤ 1 MiB，增量上传复用）与**一次性**大块（整页上传，
 //! 录制后按帧 retire）。常驻容量因此不随图集页尺寸放大（DEVIATIONS F-216）。页尺寸随上传
-//! **显式过线**（S-153），不由 `pixels.len()` 反推：增量载荷只有脏行，长度不足以恢复整页尺寸。
+//! **显式过线**（S-153），不由 `pixels.len()` 反推：增量载荷只有脏矩形，长度不足以恢复整页尺寸。
 //!
 //! **CPU 影子页**（R08-4）：每张图集的当前页在系统内存里留一份 1:1 拷贝（字形 4 MiB / 图片
 //! 16 MiB）。设备丢失后进程内恢复靠它把图集内容原样重传 —— 否则恢复出来的窗口只有占位纹理，
 //! 所有字形与图片都会消失。写入点就是 [`AtlasUploads::record_uploads`]（CPU 已经有一份字节，
 //! 增量行落位成本与 staging 拷贝同量级）。
 
-use std::{
-    ops::Range,
-    sync::{Mutex, MutexGuard, PoisonError},
-};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use windows::Win32::Graphics::{
     Direct3D12::*,
@@ -46,7 +43,7 @@ use crate::{
     error::EngineError,
     paint::atlas::AtlasKind,
     render::{
-        atlas::{DirtyRows, MAX_RESIDENT_STAGING_BYTES, texel_bytes},
+        atlas::{DirtyRects, MAX_RESIDENT_STAGING_BYTES, RectChunk, texel_bytes},
         frame::MAX_FRAMES_IN_FLIGHT,
         retire::GpuResourceHandle,
         windows::device::{SharedGpu, init_error_from},
@@ -56,15 +53,19 @@ use crate::{
 /// 初始化时的占位页（1×1）：让 SRV 在第一次上传之前也指向有效资源。
 const PLACEHOLDER_PAGE: u32 = 1;
 
-/// staging 的**初始**行数（需要更大时按本次上传的行数扩容）。
+/// 常驻 staging 的**初始容量**上界（行数口径：`STAGING_ROWS × 页行宽`，再夹到 1 MiB）。
 ///
 /// 一次 `record_uploads` 里的多条 `CopyTextureRegion` 都在同一提交、同一个 staging 上，
 /// **不能分块复用同一个缓冲**（后面的 CPU 写入会覆盖前面的内容，GPU 执行时读到的全是最后一块
-/// —— V-64 的根因）。因此一次上传的每一行都必须在 staging 里各有位置：容量按**本次上传的
-/// 总行数**保证，各段按累计行偏移落位。
+/// —— V-64 的根因）。因此一次上传的每个 AOI 矩形都必须在 staging 里各有位置：容量按**本次
+/// 上传的总字节数**保证，各矩形按 512 对齐的偏移落位。
 const STAGING_ROWS: u32 = 256;
 
+/// `D3D12_PLACED_SUBRESOURCE_FOOTPRINT.RowPitch` 的对齐（D3D12 要求 256）。
 const PITCH_ALIGNMENT: u32 = 256;
+
+/// `D3D12_PLACED_SUBRESOURCE_FOOTPRINT.Offset` 的对齐（D3D12 要求 512）。
+const PLACED_OFFSET_ALIGNMENT: u32 = 512;
 
 /// 一张共享图集页（纹理 + 当前页尺寸 + 行 pitch）。
 struct SharedPage {
@@ -144,12 +145,13 @@ impl SharedAtlas {
 
     /// 把一次上传的字节写进 CPU 影子（R08-4）。
     ///
-    /// `pixels` 是 `rows` 顺序**紧密打包**的行（与 staging 的写入布局同源）；页尺寸变化说明
-    /// App 换代，影子按新页整页重建（整页上传是换代之后的唯一合法载荷，见
+    /// `pixels` 是 `rects` 顺序**逐矩形紧密打包**的字节（与打包缓冲的布局同源）；页尺寸变化
+    /// 说明 App 换代，影子按新页整页重建（整页上传是换代之后的唯一合法载荷，见
     /// [`AtlasUploads::reconcile_pages`]）。
-    fn update_shadow(&self, kind: AtlasKind, page: u32, pixels: &[u8], rows: &DirtyRows) {
-        let row_bytes = page as usize * texel_bytes(kind) as usize;
-        if row_bytes == 0 || pixels.len() != rows.row_count(page) as usize * row_bytes {
+    fn update_shadow(&self, kind: AtlasKind, page: u32, pixels: &[u8], rects: &DirtyRects) {
+        let texel = texel_bytes(kind) as usize;
+        let row_bytes = page as usize * texel;
+        if row_bytes == 0 || pixels.len() != rects.byte_count(page, texel_bytes(kind)) {
             return;
         }
         let mut shadow = shadow_lock(&self.shadow[kind.index() as usize]);
@@ -162,24 +164,17 @@ impl SharedAtlas {
         let Some(shadow) = shadow.as_mut() else {
             return;
         };
-        let full = 0..page;
-        let spans: &[Range<u32>] = if rows.is_full() {
-            std::slice::from_ref(&full)
-        } else {
-            rows.spans()
-        };
-        let mut packed_row = 0usize;
-        for span in spans {
-            for row in span.clone() {
-                let source = packed_row * row_bytes;
-                let destination = row as usize * row_bytes;
-                if source + row_bytes <= pixels.len()
-                    && destination + row_bytes <= shadow.pixels.len()
+        for chunk in rects.chunks(page, texel_bytes(kind)) {
+            let width_bytes = chunk.width as usize * texel;
+            for row in 0..chunk.height as usize {
+                let source = chunk.offset + row * width_bytes;
+                let destination = (chunk.y as usize + row) * row_bytes + chunk.x as usize * texel;
+                if source + width_bytes <= pixels.len()
+                    && destination + width_bytes <= shadow.pixels.len()
                 {
-                    shadow.pixels[destination..destination + row_bytes]
-                        .copy_from_slice(&pixels[source..source + row_bytes]);
+                    shadow.pixels[destination..destination + width_bytes]
+                        .copy_from_slice(&pixels[source..source + width_bytes]);
                 }
-                packed_row += 1;
             }
         }
     }
@@ -216,11 +211,11 @@ fn shadow_lock(shadow: &Mutex<Option<ShadowPage>>) -> MutexGuard<'_, Option<Shad
 struct StagingSlot {
     buffer: ID3D12Resource,
     handle: GpuResourceHandle,
-    /// 该槽当前的 staging 行数容量。
+    /// 该槽当前的 staging **字节**容量。
     ///
-    /// 必须是按槽的数组语义：只记一个全局值会让「槽 0 已扩容到 N 行、槽 1 仍是 256 行」时
+    /// 必须是按槽的数组语义：只记一个全局值会让「槽 0 已扩容到 N 字节、槽 1 仍是初始容量」时
     /// 槽 1 的写入越界（V-64 的第二个根因）。
-    rows: u32,
+    capacity: u32,
     /// 持久映射的写入指针（DEVIATIONS F-210）：`Map` 一次，整个槽生命周期不再 `Unmap`。
     ptr: *mut u8,
 }
@@ -229,10 +224,10 @@ struct StagingSlot {
 unsafe impl Send for StagingSlot {}
 
 impl StagingSlot {
-    fn new_with_rows(shared: &SharedGpu, row_pitch: u32, rows: u32) -> Result<Self, EngineError> {
+    fn new_with_bytes(shared: &SharedGpu, bytes: u32) -> Result<Self, EngineError> {
         let buffer = create_buffer(
             shared.raw(),
-            u64::from(row_pitch) * u64::from(rows),
+            u64::from(bytes.max(1)),
             D3D12_HEAP_TYPE_UPLOAD,
         )?;
         let handle = shared.allocate(buffer.clone());
@@ -243,29 +238,27 @@ impl StagingSlot {
         Ok(Self {
             buffer,
             handle,
-            rows,
+            capacity: bytes,
             ptr: pointer.cast::<u8>(),
         })
     }
 }
 
-/// 一次 staging 写入的行区间：源页起点、staging 起点、行数。
+/// 一个 AOI 矩形在 staging 里的落点（D3D12 placed footprint 的约束：行 pitch 256 对齐、
+/// 偏移 512 对齐）。
 #[derive(Clone, Copy)]
-struct Chunk {
-    /// 目标纹理里的起始行（`pixels` 打包顺序之外的真实行号）。
-    source_row: u32,
-    /// staging 里的起始行。
-    staging_row: u32,
-    rows: u32,
-    /// 打包缓冲里的累计行号（源数据只有脏行）。
-    packed_row: u32,
+struct StagingRect {
+    chunk: RectChunk,
+    /// staging 里该矩形的行 pitch（字节，[`PITCH_ALIGNMENT`] 对齐）。
+    row_pitch: u32,
+    /// staging 里的起始字节偏移（[`PLACED_OFFSET_ALIGNMENT`] 对齐）。
+    offset: u32,
 }
 
 /// 一个图集（kind）的每窗口 staging：每 in-flight 槽一块缓冲，页换代时整组重建。
 struct AtlasStaging {
     kind: AtlasKind,
     page: u32,
-    row_pitch: u32,
     slots: Vec<StagingSlot>,
 }
 
@@ -278,18 +271,12 @@ impl AtlasStaging {
     ) -> Result<Self, EngineError> {
         let mut slots = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
-            slots.push(StagingSlot::new_with_rows(
+            slots.push(StagingSlot::new_with_bytes(
                 shared,
-                row_pitch,
-                resident_rows(row_pitch),
+                resident_bytes(row_pitch),
             )?);
         }
-        Ok(Self {
-            kind,
-            page,
-            row_pitch,
-            slots,
-        })
+        Ok(Self { kind, page, slots })
     }
 
     /// 把整组 staging 的句柄交给调用方 retire（R08-2）。
@@ -305,20 +292,20 @@ impl AtlasStaging {
         }
     }
 
-    /// 保证第 `slot` 个 staging 能容纳 `rows` 行（不够就重建；扩容后该槽复用）。
+    /// 保证第 `slot` 个 staging 至少能容纳 `bytes` 字节（不够就重建；扩容后该槽复用）。
     ///
     /// 只改**这一个槽**的容量记录：其它槽的缓冲没有变大，必须继续按自己的容量判断（V-64）。
-    fn ensure_rows(
+    fn ensure_bytes(
         &mut self,
         shared: &SharedGpu,
         slot: usize,
-        rows: u32,
+        bytes: u32,
         retired: &mut Vec<GpuResourceHandle>,
     ) -> Result<(), EngineError> {
-        if rows <= self.slots[slot].rows {
+        if bytes <= self.slots[slot].capacity {
             return Ok(());
         }
-        let staging = StagingSlot::new_with_rows(shared, self.row_pitch, rows)?;
+        let staging = StagingSlot::new_with_bytes(shared, bytes)?;
         let old = std::mem::replace(&mut self.slots[slot], staging);
         // 旧 staging 可能仍被在飞帧的命令列表读取（D3D12 命令列表不持有资源引用）：
         // 不能立即 drop，交给调用方按当前帧序号 retire。
@@ -326,7 +313,35 @@ impl AtlasStaging {
         Ok(())
     }
 
-    /// 在本帧命令列表里录制「staging 写入 + 逐区间 `CopyTextureRegion`」。
+    /// 本帧每个 AOI 矩形在 staging 里的落点：行 pitch 按**矩形宽**（不是页宽）对齐 256，
+    /// 偏移按 512 对齐；返回布局与总字节数。空集合返回 `(vec![], 0)`（零上传）。
+    fn layout(&self, rects: &DirtyRects) -> (Vec<StagingRect>, u32) {
+        let texel = texel_bytes(self.kind);
+        let mut layout = Vec::new();
+        let mut end = 0u32;
+        for chunk in rects.chunks(self.page, texel) {
+            debug_assert!(
+                chunk.x + chunk.width <= self.page && chunk.y + chunk.height <= self.page,
+                "atlas AOI chunk {chunk:?} is outside the {}-texel page",
+                self.page
+            );
+            let row_pitch = align_up(chunk.width * texel, PITCH_ALIGNMENT);
+            let offset = align_up(end, PLACED_OFFSET_ALIGNMENT);
+            end = offset + row_pitch * chunk.height;
+            layout.push(StagingRect {
+                chunk,
+                row_pitch,
+                offset,
+            });
+        }
+        (layout, end)
+    }
+
+    /// 在本帧命令列表里录制「staging 写入 + 逐矩形 `CopyTextureRegion`」。
+    ///
+    /// AOI（R06-3）：每个脏矩形单独一次拷贝，`PlacedFootprint.Width/Height` 与 `destination`
+    /// 的 `(DstX, DstY)` 都取矩形自己的 `(x, y, w, h)` —— 页宽只出现在页缓冲的行 pitch 里，
+    /// staging 的行 pitch 是**矩形宽**（单字形不再上传整页宽的行）。
     fn upload(
         &mut self,
         shared: &SharedGpu,
@@ -336,6 +351,11 @@ impl AtlasStaging {
         pending: &PendingUpload,
         retired: &mut Vec<GpuResourceHandle>,
     ) -> Result<(), EngineError> {
+        let (layout, total_bytes) = self.layout(&pending.rects);
+        if layout.is_empty() {
+            // 空集合 = 零上传：不分配 staging、不录 copy（调用方本就不该入队空集合）。
+            return Ok(());
+        }
         let resource = atlas.texture(self.kind);
         transition(
             list,
@@ -344,59 +364,19 @@ impl AtlasStaging {
             D3D12_RESOURCE_STATE_COPY_DEST,
         );
 
-        let full = 0..self.page;
-        let spans: &[Range<u32>] = if pending.rows.is_full() {
-            std::slice::from_ref(&full)
-        } else {
-            pending.rows.spans()
-        };
-        // 每一段必须在 staging 里**各有位置**：同一 staging 上先写后画的多次拷贝会在 GPU 执行时
-        // 读到最后一块的字节（V-64）。因此先按本帧所有段的**总行数**保证容量，再按累计行偏移
-        // 把各段顺序落位；`packed_row` 是打包缓冲里的累计行号（源数据只有脏行）。
-        //
-        // 行必须落在页内：`pack_rows` / `row_count` 已按页钳过长度，这里若还越页说明打包
-        // 缓冲与行描述不是同一份数据，按契约错误立刻失败（否则下面的 `ptr::add` 会读穿堆）。
-        let total_rows: u32 = spans
-            .iter()
-            .map(|span| {
-                assert!(
-                    span.start < span.end && span.end <= self.page,
-                    "atlas dirty span {span:?} is outside the {}-row page",
-                    self.page
-                );
-                span.end - span.start
-            })
-            .sum();
         // 小上传复用每槽常驻 staging；整页级的大上传用一次性缓冲（录制后 retire），
         // 常驻容量不随页尺寸放大（DEVIATIONS F-216）。
-        let total_bytes = u64::from(total_rows) * u64::from(self.row_pitch);
         let mut transient = None;
-        if total_bytes <= MAX_RESIDENT_STAGING_BYTES {
-            self.ensure_rows(shared, slot, total_rows, retired)?;
+        if u64::from(total_bytes) <= MAX_RESIDENT_STAGING_BYTES {
+            self.ensure_bytes(shared, slot, total_bytes, retired)?;
         } else {
-            let temp = StagingSlot::new_with_rows(shared, self.row_pitch, total_rows)?;
+            let temp = StagingSlot::new_with_bytes(shared, total_bytes)?;
             retired.push(temp.handle);
             transient = Some(temp);
         }
         let staging = transient.as_ref().unwrap_or(&self.slots[slot]);
-        let mut staging_row = 0;
-        let mut packed_row = 0;
-        for span in spans {
-            let rows = span.end - span.start;
-            self.upload_chunk(
-                list,
-                resource,
-                staging,
-                pending,
-                Chunk {
-                    source_row: span.start,
-                    staging_row,
-                    rows,
-                    packed_row,
-                },
-            );
-            staging_row += rows;
-            packed_row += rows;
+        for rect in &layout {
+            self.upload_rect(list, resource, staging, pending, *rect);
         }
 
         transition(
@@ -408,40 +388,43 @@ impl AtlasStaging {
         Ok(())
     }
 
-    /// 把一段行写进 staging 的指定起点，并录制一次拷贝。
-    fn upload_chunk(
+    /// 把一个 AOI 矩形写进 staging 的指定偏移，并录制一次 `CopyTextureRegion`。
+    fn upload_rect(
         &self,
         list: &ID3D12GraphicsCommandList,
         resource: &ID3D12Resource,
         staging: &StagingSlot,
         pending: &PendingUpload,
-        chunk: Chunk,
+        rect: StagingRect,
     ) {
-        let row_bytes = (self.page * texel_bytes(self.kind)) as usize;
-        // SAFETY: `staging` 的容量 ≥ 本帧总行数；指针是该槽的持久映射（DEVIATIONS F-210），
-        // `staging_row + rows` 不超过容量，源页由 `queue_upload` 的整页尺寸断言保证。
+        let texel = texel_bytes(self.kind) as usize;
+        let width_bytes = rect.chunk.width as usize * texel;
+        // SAFETY: `staging` 的容量 ≥ 本帧总字节数；指针是该槽的持久映射（DEVIATIONS F-210），
+        // `offset + (height-1) × row_pitch + width_bytes` 不超过容量；源缓冲长度由
+        // `queue_upload` 的 `byte_count` 断言保证，`chunk.offset` 是打包布局里的真实偏移。
         unsafe {
-            for row in 0..chunk.rows {
+            for row in 0..rect.chunk.height as usize {
                 let source = pending
                     .pixels
                     .as_ptr()
-                    .add((chunk.packed_row + row) as usize * row_bytes);
+                    .add(rect.chunk.offset + row * width_bytes);
                 let destination = staging
                     .ptr
-                    .add(((chunk.staging_row + row) * self.row_pitch) as usize);
-                std::ptr::copy_nonoverlapping(source, destination, row_bytes);
+                    .add(rect.offset as usize + row * rect.row_pitch as usize);
+                std::ptr::copy_nonoverlapping(source, destination, width_bytes);
             }
         }
 
         let placed = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-            // 每段各自的行偏移（同一 staging 上多段不能再共用 offset 0，否则 GPU 只读到末段）。
-            Offset: u64::from(chunk.staging_row) * u64::from(self.row_pitch),
+            // 每个矩形各自的行偏移（同一 staging 上多块不能再共用 offset 0，否则 GPU 只读到末块）。
+            Offset: u64::from(rect.offset),
             Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
                 Format: texture_format(self.kind),
-                Width: self.page,
-                Height: chunk.rows,
+                // AOI：footprint 就是矩形本身，不是整页宽。
+                Width: rect.chunk.width,
+                Height: rect.chunk.height,
                 Depth: 1,
-                RowPitch: self.row_pitch,
+                RowPitch: rect.row_pitch,
             },
         };
         let mut destination = D3D12_TEXTURE_COPY_LOCATION {
@@ -458,8 +441,11 @@ impl AtlasStaging {
                 PlacedFootprint: placed,
             },
         };
-        // SAFETY: 两个 location 与 `placed` 在调用期间有效，行区间已由 `DirtyRows` 保证在页内。
-        unsafe { list.CopyTextureRegion(&destination, 0, chunk.source_row, 0, &source, None) };
+        // SAFETY: 两个 location 与 `placed` 在调用期间有效；目标坐标 + footprint 尺寸由
+        // `layout` 的页内断言保证在纹理边界内。
+        unsafe {
+            list.CopyTextureRegion(&destination, rect.chunk.x, rect.chunk.y, 0, &source, None)
+        };
         // SAFETY: `pResource` 是 `ManuallyDrop`，结构体 drop 不释放 COM 引用（DEVIATIONS F-86）。
         unsafe {
             core::mem::ManuallyDrop::drop(&mut destination.pResource);
@@ -468,7 +454,7 @@ impl AtlasStaging {
     }
 }
 
-/// 待上传的一页内容（整页 `pixels` + 页尺寸 + 脏行区间）。
+/// 待上传的一页内容（打包 `pixels` + 页尺寸 + 脏矩形）。
 struct PendingUpload {
     page: u32,
     /// 入队时**共享图集**的页尺寸。
@@ -477,13 +463,13 @@ struct PendingUpload {
     /// （入队后别的窗口已经换代，`page == queued_page` 且与当前共享页不同：上传作废）。
     queued_page: u32,
     pixels: Vec<u8>,
-    rows: DirtyRows,
+    rects: DirtyRects,
 }
 
 impl PendingUpload {
     /// 是否覆盖整页（首次上传 / 页换代之后的唯一合法载荷，见 `AtlasUploads::reconcile_pages`）。
     fn covers_full_page(&self) -> bool {
-        self.rows.is_full() || self.rows.spans() == std::slice::from_ref(&(0..self.page))
+        self.rects.covers_page(self.page)
     }
 }
 
@@ -512,25 +498,23 @@ impl AtlasUploads {
         self.staging[kind.index() as usize].as_ref()
     }
 
-    /// 入队一页的脏行（`pixels` 是 `rows` 顺序**紧密打包**的行，DEVIATIONS F-211）。
+    /// 入队一页的脏矩形（`pixels` 是 `rects` 顺序**逐矩形紧密打包**的字节，R06-3）。
     ///
     /// `pixels` 按**所有权**移动进待上传槽，避免槽 → 纹理之间再复制一次。长度必须等于
-    /// `行数 × page × texel`（release 也硬断言：越界读会读穿堆）。
+    /// [`DirtyRects::byte_count`]（release 也硬断言：越界读会读穿堆）。
     pub(crate) fn queue_upload(
         &mut self,
         kind: AtlasKind,
         page: u32,
         queued_page: u32,
         pixels: Vec<u8>,
-        rows: DirtyRows,
+        rects: DirtyRects,
     ) {
-        let row_bytes = page as usize * texel_bytes(kind) as usize;
-        let expected = rows.row_count(page) as usize * row_bytes;
+        let expected = rects.byte_count(page, texel_bytes(kind));
         assert_eq!(
             pixels.len(),
             expected,
-            "atlas payload size mismatch for {kind:?}: expected {expected} bytes for {} rows of a {page}² page, got {}",
-            rows.row_count(page),
+            "atlas payload size mismatch for {kind:?}: expected {expected} bytes for the dirty rects of a {page}² page, got {}",
             pixels.len()
         );
         let slot = kind.index() as usize;
@@ -542,7 +526,7 @@ impl AtlasUploads {
             page,
             queued_page,
             pixels,
-            rows,
+            rects,
         });
     }
 
@@ -649,7 +633,7 @@ impl AtlasUploads {
                 continue;
             }
             // 影子页与 GPU 上传用同一份字节：设备丢失后按它重传整页（R08-4）。
-            atlas.update_shadow(kind, pending.page, &pending.pixels, &pending.rows);
+            atlas.update_shadow(kind, pending.page, &pending.pixels, &pending.rects);
             let Some(staging) = self.staging[index].as_mut() else {
                 return Err(EngineError::AppInit {
                     detail: smol_str::format_smolstr!(
@@ -757,9 +741,9 @@ pub(crate) fn copy_page(
     }
 }
 
-/// 每槽常驻 staging 的初始行数：受 1 MiB 上限与 [`STAGING_ROWS`] 双重约束。
-fn resident_rows(row_pitch: u32) -> u32 {
-    ((MAX_RESIDENT_STAGING_BYTES / u64::from(row_pitch)) as u32).clamp(1, STAGING_ROWS)
+/// 每槽常驻 staging 的初始容量（字节）：受 1 MiB 上限与 [`STAGING_ROWS`] 行双重约束。
+fn resident_bytes(row_pitch: u32) -> u32 {
+    (u64::from(row_pitch) * u64::from(STAGING_ROWS)).min(MAX_RESIDENT_STAGING_BYTES) as u32
 }
 
 fn create_texture(
@@ -844,11 +828,12 @@ mod tests {
         Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8_UNORM},
     };
 
-    use super::{AtlasUploads, STAGING_ROWS, SharedAtlas, align_up, resident_rows};
+    use super::{AtlasUploads, STAGING_ROWS, SharedAtlas, align_up, resident_bytes};
     use crate::{
+        math::PhysicalRect,
         paint::atlas::AtlasKind,
         render::{
-            atlas::{DirtyRows, MAX_ATLAS_PAGE, MAX_RESIDENT_STAGING_BYTES},
+            atlas::{DirtyRects, MAX_ATLAS_PAGE, MAX_RESIDENT_STAGING_BYTES},
             frame::MAX_FRAMES_IN_FLIGHT,
             windows::{device::SharedGpu, queue::CommandStream, readback::Readback},
         },
@@ -857,16 +842,25 @@ mod tests {
     /// 测试页：2048² 的纹理在 WARP 上代价过高（且会拖垮并行的 GPU 测试）。
     const TEST_PAGE: u32 = 64;
 
-    fn full_rows() -> DirtyRows {
-        let mut rows = DirtyRows::default();
-        rows.mark(0, u32::MAX);
-        rows
+    /// 整页哨兵（新窗口 / 页尺寸变化的载荷）。
+    fn full_rects() -> DirtyRects {
+        DirtyRects::full()
     }
 
-    fn rows(y0: u32, y1: u32) -> DirtyRows {
-        let mut rows = DirtyRows::default();
-        rows.mark(y0, y1);
-        rows
+    /// 整页宽的脏行矩形（等价于旧的 `mark(y0, y1)` 语义，用于验证行落位）。
+    fn rows(y0: u32, y1: u32) -> DirtyRects {
+        let mut rects = DirtyRects::default();
+        rects.mark(PhysicalRect::new(0, y0 as i32, i32::MAX, y1 as i32));
+        rects
+    }
+
+    /// 单个 AOI 矩形（x/y/w/h 全部保留，R06-3）。
+    fn rect(x0: u32, y0: u32, x1: u32, y1: u32) -> DirtyRects {
+        let mut rects = DirtyRects::default();
+        rects.mark(PhysicalRect::new(
+            x0 as i32, y0 as i32, x1 as i32, y1 as i32,
+        ));
+        rects
     }
 
     /// 一个独立的 WARP 共享 GPU + 独立共享图集（不碰进程级单例；图集状态可预测）。
@@ -896,7 +890,7 @@ mod tests {
             kind: AtlasKind,
             page: u32,
             pixels: Vec<u8>,
-            dirty: DirtyRows,
+            dirty: DirtyRects,
         ) -> Vec<crate::render::retire::GpuResourceHandle> {
             let queued_page = self.atlas.page(kind);
             self.uploads
@@ -959,19 +953,17 @@ mod tests {
     #[test]
     fn resident_staging_stays_within_the_cap() {
         for pitch in [256u32, 512, 1024, 2048, 4096, 8192] {
-            let rows = resident_rows(pitch);
+            let bytes = resident_bytes(pitch);
+            assert!(bytes > 0, "pitch {pitch}: 常驻容量不得为 0");
             assert!(
-                (1..=STAGING_ROWS).contains(&rows),
-                "pitch {pitch}: {rows} rows"
-            );
-            assert!(
-                u64::from(rows) * u64::from(pitch) <= MAX_RESIDENT_STAGING_BYTES,
-                "pitch {pitch}: {} bytes",
-                u64::from(rows) * u64::from(pitch)
+                u64::from(bytes) <= MAX_RESIDENT_STAGING_BYTES,
+                "pitch {pitch}: {bytes} bytes"
             );
         }
-        assert_eq!(resident_rows(8192), 128, "2048² 图片页的行宽");
-        assert_eq!(resident_rows(256), STAGING_ROWS);
+        // 2048² 图片页的行宽：256 行 × 8192 B = 2 MiB，夹到 1 MiB。
+        assert_eq!(resident_bytes(8192), MAX_RESIDENT_STAGING_BYTES as u32);
+        // 小页：256 行 × 256 B = 64 KiB。
+        assert_eq!(resident_bytes(256), STAGING_ROWS * 256);
     }
 
     /// 页对齐决策（不建 GPU 设备）：整页上传要求重建；过期增量直接丢弃。
@@ -1000,7 +992,7 @@ mod tests {
             TEST_PAGE,
             1,
             vec![0u8; (TEST_PAGE * TEST_PAGE) as usize],
-            full_rows(),
+            full_rects(),
         );
         assert_eq!(
             uploads.reconcile_pages([TEST_PAGE * 8, 1]),
@@ -1024,7 +1016,7 @@ mod tests {
             512,
             512,
             vec![0u8; 512 * 512],
-            full_rows(),
+            full_rects(),
         );
         assert!(
             uploads.reconcile_pages([1024, 1]).is_empty(),
@@ -1044,7 +1036,7 @@ mod tests {
             AtlasKind::Image,
             PAGE,
             vec![0u8; (PAGE * PAGE * 4) as usize],
-            full_rows(),
+            full_rects(),
         );
         assert!(
             !retired.is_empty(),
@@ -1055,17 +1047,19 @@ mod tests {
             .staging(AtlasKind::Image)
             .expect("image staging");
         assert_eq!(staging.page, PAGE);
-        let row_pitch = staging.row_pitch;
-        let resident = staging.slots[0].rows;
+        let resident = staging.slots[0].capacity;
         assert!(
-            u64::from(resident) * u64::from(row_pitch) <= MAX_RESIDENT_STAGING_BYTES,
-            "常驻槽被整页上传撑大：{resident} 行 × {row_pitch} B"
+            u64::from(resident) <= MAX_RESIDENT_STAGING_BYTES,
+            "常驻槽被整页上传撑大：{resident} B"
         );
-        assert!(resident < PAGE, "整页行数不得常驻（{resident}）");
+        assert!(
+            u64::from(resident) < u64::from(PAGE) * u64::from(PAGE) * 4,
+            "整页字节数不得常驻（{resident} B）"
+        );
     }
 
     #[test]
-    fn dirty_rows_upload_only_touches_those_rows() {
+    fn a_dirty_row_upload_only_touches_that_row() {
         let _guard = crate::render::windows::device::gpu_test_lock();
         let mut harness = Harness::new();
         // 第一次必须先整页上传（真实入口：新窗口 / 页尺寸变化都走整页），之后才是增量。
@@ -1073,7 +1067,7 @@ mod tests {
             AtlasKind::Glyph,
             TEST_PAGE,
             vec![0u8; (TEST_PAGE * TEST_PAGE) as usize],
-            full_rows(),
+            full_rects(),
         );
         // 增量：只有 1 行（= 页宽字节）的载荷。
         let page = vec![0xABu8; TEST_PAGE as usize];
@@ -1084,6 +1078,43 @@ mod tests {
         assert_eq!(image.rgba8[(5 * TEST_PAGE * 4 + 3) as usize], 0xFF);
         assert_eq!(image.rgba8[(4 * TEST_PAGE * 4) as usize], 0);
         assert_eq!(image.rgba8[(6 * TEST_PAGE * 4) as usize], 0);
+    }
+
+    /// R06-3 AOI 回归：8×11 字形只上传 88 B，且只有该矩形落进纹理。
+    ///
+    /// 旧「整页宽 × 行区间」语义在同一页上要传 11 × 64 = 704 B；AOI 是 88 B（8 倍）。
+    #[test]
+    fn an_eight_by_eleven_glyph_uploads_only_its_aoi_rect() {
+        let _guard = crate::render::windows::device::gpu_test_lock();
+        let mut harness = Harness::new();
+        harness.upload(
+            AtlasKind::Glyph,
+            TEST_PAGE,
+            vec![0u8; (TEST_PAGE * TEST_PAGE) as usize],
+            full_rects(),
+        );
+        // 8×11 字形落在 (20, 30)。
+        const X: u32 = 20;
+        const Y: u32 = 30;
+        const W: u32 = 8;
+        const H: u32 = 11;
+        let glyph = rect(X, Y, X + W, Y + H);
+        assert_eq!(glyph.byte_count(TEST_PAGE, 1), 88, "载荷必须只有 88 B");
+        assert_eq!(11 * TEST_PAGE as usize, 704, "旧语义要传 11 整行 × 页宽 64");
+        harness.upload(AtlasKind::Glyph, TEST_PAGE, vec![0xCDu8; 88], glyph);
+
+        let image = harness.readback(AtlasKind::Glyph, TEST_PAGE);
+        let texel = |x: u32, y: u32| image.rgba8[((y * TEST_PAGE + x) * 4) as usize];
+        assert_eq!(texel(X, Y), 0xCD, "AOI 左上角必须被写");
+        assert_eq!(
+            texel(X + W - 1, Y + H - 1),
+            0xCD,
+            "AOI 右下角必须被写（行内只有 width × texel 字节）"
+        );
+        assert_eq!(texel(X - 1, Y), 0, "AOI 左侧一列不得被写");
+        assert_eq!(texel(X + W, Y), 0, "AOI 右侧一列不得被写");
+        assert_eq!(texel(X, Y - 1), 0, "AOI 上一行不得被写");
+        assert_eq!(texel(X, Y + H), 0, "AOI 下一行不得被写");
     }
 
     #[test]
@@ -1115,14 +1146,14 @@ mod tests {
 
         // 槽 0：字形整页（512 行）。
         let glyph = vec![0x11u8; (BIG_PAGE * BIG_PAGE) as usize];
-        harness.upload(AtlasKind::Glyph, BIG_PAGE, glyph, full_rows());
+        harness.upload(AtlasKind::Glyph, BIG_PAGE, glyph, full_rects());
 
         // 槽 1：图片整页（512 行 × 4 B；行 pitch 2048）。
         let mut image = vec![0u8; (BIG_PAGE * BIG_PAGE * 4) as usize];
         for texel in image.as_chunks_mut::<4>().0 {
             *texel = [0x33, 0x44, 0x55, 0xFF];
         }
-        harness.upload(AtlasKind::Image, BIG_PAGE, image, full_rows());
+        harness.upload(AtlasKind::Image, BIG_PAGE, image, full_rects());
 
         // 两个独立的读回器：R8 与 BGRA8 的行 pitch 不同（`Readback` 按尺寸/格式缓存）。
         let glyph_image = harness.readback(AtlasKind::Glyph, BIG_PAGE);
@@ -1161,7 +1192,7 @@ mod tests {
             AtlasKind::Glyph,
             64,
             vec![0u8; (64 * 64) as usize],
-            full_rows(),
+            full_rects(),
         );
         let live = harness.shared.live_resources();
         assert_eq!(live, MAX_FRAMES_IN_FLIGHT, "页 64 只注册 3 个常驻 staging");
@@ -1171,7 +1202,7 @@ mod tests {
             AtlasKind::Glyph,
             128,
             vec![0u8; (128 * 128) as usize],
-            full_rows(),
+            full_rects(),
         );
         assert_eq!(
             retired.len(),
@@ -1205,7 +1236,7 @@ mod tests {
         // 整页上传：影子页 = 整页字节（紧密行）。
         let mut page = vec![0u8; row_bytes * TEST_PAGE as usize];
         page[5 * row_bytes + 3] = 0xAB;
-        harness.upload(AtlasKind::Glyph, TEST_PAGE, page.clone(), full_rows());
+        harness.upload(AtlasKind::Glyph, TEST_PAGE, page.clone(), full_rects());
         let snapshot = harness.atlas.shadow_snapshot();
         let (size, bytes) = snapshot[0]
             .as_ref()
@@ -1221,8 +1252,21 @@ mod tests {
         assert_eq!(bytes[5 * row_bytes + 3], 0x77, "脏行被覆盖");
         assert_eq!(bytes[4 * row_bytes], 0, "脏行之外保持不变");
 
+        // AOI 增量（R06-3）：4×2 的矩形只覆盖自己的列/行，影子页的其它字节保持原样。
+        let aoi = rect(3, 7, 7, 9);
+        assert_eq!(aoi.byte_count(TEST_PAGE, 1), 8);
+        harness.upload(AtlasKind::Glyph, TEST_PAGE, vec![0x99u8; 8], aoi);
+        let snapshot = harness.atlas.shadow_snapshot();
+        let bytes = &snapshot[0].as_ref().expect("glyph shadow").1;
+        assert_eq!(bytes[7 * row_bytes + 3], 0x99, "AOI 左上角");
+        assert_eq!(bytes[8 * row_bytes + 6], 0x99, "AOI 右下角");
+        assert_eq!(bytes[7 * row_bytes + 2], 0, "AOI 左侧一列保持原样");
+        assert_eq!(bytes[7 * row_bytes + 7], 0, "AOI 右侧一列保持原样");
+        assert_eq!(bytes[6 * row_bytes + 3], 0, "AOI 上一行保持原样");
+        assert_eq!(bytes[9 * row_bytes + 3], 0, "AOI 下一行保持原样");
+
         // 页换代：影子页按新页整页重建。
-        harness.upload(AtlasKind::Glyph, 128, vec![0x11u8; 128 * 128], full_rows());
+        harness.upload(AtlasKind::Glyph, 128, vec![0x11u8; 128 * 128], full_rects());
         let snapshot = harness.atlas.shadow_snapshot();
         let (size, bytes) = snapshot[0]
             .as_ref()
@@ -1232,10 +1276,10 @@ mod tests {
         assert!(bytes.iter().all(|byte| *byte == 0x11));
     }
 
-    /// 多脏段必须各自落位：每段写到 staging 自己的行偏移，`CopyTextureRegion` 的
-    /// `PlacedFootprint.Offset` 也必须跟着走（V-64；旧的「全部写 offset 0」会让两段都读到末段）。
+    /// 多脏矩形必须各自落位：每块写到 staging 自己的偏移，`CopyTextureRegion` 的
+    /// `PlacedFootprint.Offset` 也必须跟着走（V-64；旧的「全部写 offset 0」会让两块都读到末块）。
     #[test]
-    fn multi_span_upload_places_each_span_at_its_own_offset() {
+    fn multi_rect_upload_places_each_rect_at_its_own_offset() {
         let _guard = crate::render::windows::device::gpu_test_lock();
         let mut harness = Harness::new();
 
@@ -1244,24 +1288,24 @@ mod tests {
             AtlasKind::Glyph,
             BIG_PAGE,
             vec![0u8; (BIG_PAGE * BIG_PAGE) as usize],
-            full_rows(),
+            full_rects(),
         );
 
-        // 打包布局：段按行号顺序紧密排列（10 行 0x44 + 20 行 0x55）。
+        // 打包布局：矩形按行号顺序紧密排列（10 行 0x44 + 20 行 0x55，都是整页宽）。
         let mut page = vec![0x44u8; (10 * BIG_PAGE) as usize];
         page.extend(std::iter::repeat_n(0x55u8, (20 * BIG_PAGE) as usize));
-        let mut dirty = DirtyRows::default();
-        dirty.mark(10, 20);
-        dirty.mark(300, 320);
+        let mut dirty = DirtyRects::default();
+        dirty.mark(PhysicalRect::new(0, 10, i32::MAX, 20));
+        dirty.mark(PhysicalRect::new(0, 300, i32::MAX, 320));
         harness.upload(AtlasKind::Glyph, BIG_PAGE, page, dirty);
 
         let image = harness.readback(AtlasKind::Glyph, BIG_PAGE);
         let row = |row: u32| image.rgba8[(row * BIG_PAGE * 4) as usize];
-        assert_eq!(row(0), 0, "untouched row before the first span");
-        assert_eq!(row(15), 0x44, "first span content");
-        assert_eq!(row(100), 0, "gap between the spans stays untouched");
-        assert_eq!(row(299), 0, "row before the second span");
-        assert_eq!(row(305), 0x55, "second span content");
-        assert_eq!(row(511), 0, "untouched row after the last span");
+        assert_eq!(row(0), 0, "untouched row before the first rect");
+        assert_eq!(row(15), 0x44, "first rect content");
+        assert_eq!(row(100), 0, "gap between the rects stays untouched");
+        assert_eq!(row(299), 0, "row before the second rect");
+        assert_eq!(row(305), 0x55, "second rect content");
+        assert_eq!(row(511), 0, "untouched row after the last rect");
     }
 }

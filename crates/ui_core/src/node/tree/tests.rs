@@ -265,7 +265,10 @@ fn set_style_clears_caches_to_root() {
         "布局后兄弟必须有缓存条目"
     );
 
-    tree.set_style(child, Style::default()).expect("节点存活");
+    // R04-6：**等值**写入是 no-op（见 `node::tree::layout::tests::writing_an_equal_style_is_a_no_op`），
+    // 因此这里必须写一份**不同**的样式才谈得上"清缓存到根"。
+    tree.set_style(child, fixed_style(10.0, 10.0))
+        .expect("节点存活");
 
     for node in [root, parent, child] {
         let empty = tree.layout_cache(node).is_none_or(taffy::Cache::is_empty);

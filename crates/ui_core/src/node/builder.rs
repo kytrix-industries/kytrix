@@ -11,8 +11,8 @@ use smol_str::SmolStr;
 use crate::{
     error::EngineError,
     event::Action,
-    layout::{LayoutOverride, MeasureFn},
-    math::{Point, Rect},
+    layout::{LayoutOverride, MeasureFn, hit_test::HitShape},
+    math::Rect,
     node::{
         dependency::ReadCtx,
         id::NodeId,
@@ -35,7 +35,7 @@ pub struct NodeBuilder {
     style: Style,
     bind_style: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> StylePatch>>,
     measure: Option<MeasureFn>,
-    hit_shape: Option<Box<dyn Fn(Point) -> bool>>,
+    hit_shape: Option<HitShape>,
     layout_override: Option<LayoutOverride>,
     bind_text: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> SmolStr>>,
     paint: Option<PaintSpec>,
@@ -225,12 +225,16 @@ impl NodeBuilder {
         self
     }
 
-    /// 自定义命中形状：`point` 是节点 **border box 局部坐标**，返回 `false` = 该点穿透到下层。
+    /// 自定义命中形状（R04-8）：[`HitShape`] 是**数据**（矩形 / 圆角矩形 / 圆 / 椭圆 / 多边形
+    /// 路径），可缓存、可复用、可被 a11y 读取；`point` 是节点 **border box 局部坐标**。
     ///
-    /// 纯函数契约同 [`NodeBuilder::measure`]；默认（不设置）用布局盒矩形判定。
+    /// - 形状可以**超出布局盒**（自绘内容平移/缩放后「画得到、点得到」）：命中剪枝与
+    ///   `subtree_bounds` 会把形状 AABB 并进包络；
+    /// - 任意谓词用逃生舱 [`HitShape::custom`]（纯函数契约同 [`NodeBuilder::measure`]）；
+    /// - 默认（不设置）等价于布局盒矩形（旧行为）。
     #[must_use]
-    pub fn hit_shape(mut self, hit_shape: impl Fn(Point) -> bool + 'static) -> Self {
-        self.hit_shape = Some(Box::new(hit_shape));
+    pub fn hit_shape(mut self, hit_shape: HitShape) -> Self {
+        self.hit_shape = Some(hit_shape);
         self
     }
 
@@ -330,7 +334,7 @@ mod tests {
     use super::NodeBuilder;
     use crate::{
         error::EngineError,
-        layout::LayoutOverride,
+        layout::{LayoutOverride, hit_test::HitShape},
         math::{Point, Rect},
         node::{
             dirty::DirtyFlags,
@@ -490,7 +494,7 @@ mod tests {
                 counter.set(counter.get() + 1);
                 crate::math::Size::new(10.0, 10.0)
             }))
-            .hit_shape(|point: Point| point.x < 5.0)
+            .hit_shape(HitShape::custom(|point: Point| point.x < 5.0))
             .build(&mut tree, root)
             .expect("挂载成功");
 
@@ -500,8 +504,8 @@ mod tests {
             .expect("存在")
             .hit_shape()
             .expect("hit_shape 必须存进节点");
-        assert!(shape(Point::new(1.0, 1.0)));
-        assert!(!shape(Point::new(6.0, 1.0)));
+        assert!(shape.contains(Point::new(1.0, 1.0)));
+        assert!(!shape.contains(Point::new(6.0, 1.0)));
     }
 
     #[test]

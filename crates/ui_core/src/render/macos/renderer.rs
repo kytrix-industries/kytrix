@@ -6,12 +6,12 @@
 //! ────────────────────────────────────    ──────────────────────────────────────────
 //! CAMetalLayer（NSView 持有）              循环：等 condvar（有工作时才有上界）
 //! CAMetalDisplayLink ── 每 vsync ──┐        → 取完成通知（GPU 计时 / retire）
-//!   delegate: 存 update.drawable   │        → 取呈现通知（presentedTime → 真实呈现时刻）
+//!   delegate: 存 update.drawable   │        → 按 tick 序号判定「上一帧已上屏」
 //!             + targetPresentation │        → 取最新 drawable + 最新帧
-//!             唤醒 GPU 线程        │        → 3 槽 semaphore（非阻塞，失败即跳帧）
+//!             + tick 序号，唤醒    │        → 3 槽 semaphore（非阻塞，失败即跳帧）
 //! 写图层属性（drawableSize/scale） ┘        → 重建 persist → 录制
-//! sync_pacing(continuous)                  → addPresentedHandler（每 drawable 一次）+ presentDrawable:
-//!                                          → addCompletedHandler + commit（立即返回）
+//! sync_pacing(continuous)                  → presentDrawable:（无时刻参数）+ addCompletedHandler
+//!                                          → commit（立即返回）
 //! ```
 //!
 //! **呈现节奏由 `CAMetalDisplayLink` 独占**：GPU 线程只做 `presentDrawable:`（无时刻参数）。
@@ -22,10 +22,13 @@
 //! 三条硬约束：
 //! - **I1**：主线程只做「加锁拷贝 / 写图层属性 / `setPaused`」，没有 `nextDrawable`、
 //!   `waitUntilCompleted`、`status()` 轮询、semaphore 等待、persist 重建。
-//! - **I2**：`commit` 后立即返回；完成只通过 `addCompletedHandler`，呈现时刻只通过
-//!   `addPresentedHandler`（`presentedTime` 是唯一权威值）。
+//! - **I2**：`commit` 后立即返回；完成只通过 `addCompletedHandler`。**上屏时刻**不用
+//!   `addPresentedHandler`（display-link 驱动的 drawable 上不可靠：实测只回调数次、
+//!   `presentedTime` 恒为 0），而是用 display link 的 `targetPresentationTimestamp` 做 **tick
+//!   推断**（见 [`presentation_instant`] 与 [`FeedbackQueue::observe_tick`]）。
 //! - **I3**：节奏来自 `CAMetalDisplayLink`（主 run loop 的 **common modes**）；空闲 `isPaused = true`，
-//!   有帧请求 / 在飞帧 / 连续帧时恢复。
+//!   有帧请求 / 在飞帧 / **还在等上屏证据的帧**时恢复。
+
 //!
 //! 设备级对象（`MTLDevice` / 两个 metallib / 4 条 PSO / 采样器）全部来自进程单例
 //! [`GpuCore`]（R09-5）：本模块的每窗口状态只剩 drawable、persist、上传槽、display link 与
@@ -52,7 +55,7 @@ use objc2::{
 };
 use objc2_core_foundation::CFTimeInterval;
 use objc2_foundation::{NSObject, NSRunLoop, NSRunLoopCommonModes};
-use objc2_metal::{MTLCommandBuffer, MTLDrawable, MTLTexture};
+use objc2_metal::{MTLCommandBuffer, MTLTexture};
 use objc2_quartz_core::{
     CACurrentMediaTime, CAFrameRateRange, CAMetalDisplayLink, CAMetalDisplayLinkDelegate,
     CAMetalDisplayLinkUpdate, CAMetalDrawable, CAMetalLayer,
@@ -67,7 +70,7 @@ use crate::{
     error::EngineError,
     paint::{atlas::AtlasKind, color::Color},
     render::{
-        DirtyRows, RenderStats,
+        DirtyRects, RenderStats,
         color::background_linear,
         compositor::FramePlan,
         frame::{FrameFeedback, FrameRequest, FrameSink, LatestFrame, MAX_FRAMES_IN_FLIGHT},
@@ -254,20 +257,20 @@ impl Renderer {
     /// 门面收切片（`window.rs` 的公共入口只持有切片），窗口路径在 UI→GPU 边界复制一次进
     /// [`AtlasSlots`]；GPU 线程消费时按**所有权**移动给 `AtlasTextures`，不再复制第二遍整页
     /// （图片页 16 MiB）。离屏路径没有跨线程槽位，直接复制一份。
-    /// 把一页图集像素交给 GPU 线程（`pixels` 是 `rows` 顺序紧密打包的行）。
+    /// 把一页图集像素交给 GPU 线程（`pixels` 是 `rects` 顺序逐矩形紧密打包的字节）。
     pub(crate) fn queue_atlas_upload(
         &mut self,
         kind: AtlasKind,
         page: u32,
         pixels: &[u8],
-        rows: DirtyRows,
+        rects: DirtyRects,
     ) -> bool {
         match &mut self.target {
             RenderTarget::Offscreen(gpu) => {
-                gpu.queue_atlas_upload(kind, page, pixels.to_vec(), rows);
+                gpu.queue_atlas_upload(kind, page, pixels.to_vec(), rects);
                 true
             }
-            RenderTarget::Window(window) => window.queue_atlas_upload(kind, page, pixels, rows),
+            RenderTarget::Window(window) => window.queue_atlas_upload(kind, page, pixels, rects),
         }
     }
 
@@ -439,17 +442,16 @@ define_class!(
             update: &CAMetalDisplayLinkUpdate,
         ) {
             // `targetPresentationTimestamp` 是这次 vsync 被排定的**呈现时刻**（host time，与
-            // `CACurrentMediaTime()` / `MTLDrawable.presentedTime` 同一时基）。它是 display link
-            // 独占的信息：**不能**再交给 `presentDrawable:atTime:`（见 `render/macos/present.rs`），
-            // 只作为合成线程帧时钟的相位来源。
+            // `CACurrentMediaTime()` 同一时基）。它是 display link 独占的信息：**不能**再交给
+            // `presentDrawable:atTime:`（见 `render/macos/present.rs`），只作为上屏时刻的
+            // **tick 推断**来源与合成线程帧时钟的相位来源。
             let target = update.targetPresentationTimestamp();
             // B6-2：同一时刻也交给**合成线程**的帧时钟 —— 合成线程据此对齐出帧相位，并按回调节奏
             // 反推刷新率（`SignaledIntervalClock`）。这是 macOS 时钟源的唯一接线点。
-            //
-            // **只给合成线程用**：GPU 线程的 present 不带时刻（display link 独占呈现时刻，见
-            // `render/macos/present.rs`）。
             crate::render::macos::clock::note_display_link_target(target);
-            self.ivars().shared.publish_drawable(update.drawable());
+            // 同一个 tick 里把 drawable、它的目标呈现时刻与 tick 序号交给 GPU 线程：这是
+            // 「本帧被排定的上屏时刻」与「上一帧已上屏」判定的唯一来源。
+            self.ivars().shared.publish_drawable(update.drawable(), target);
         }
     }
 );
@@ -577,9 +579,9 @@ impl WindowRenderer {
         kind: AtlasKind,
         page: u32,
         pixels: &[u8],
-        rows: DirtyRows,
+        rects: DirtyRects,
     ) -> bool {
-        self.shared.queue_atlas(kind, page, pixels, rows)
+        self.shared.queue_atlas(kind, page, pixels, rects)
     }
 
     fn atlas_idle(&self, kind: AtlasKind) -> bool {
@@ -622,8 +624,8 @@ impl WindowRenderer {
     }
 
     fn sync_pacing(&mut self, continuous: bool) {
-        let (pending, in_flight) = self.shared.pacing_state();
-        let paused = pacing_paused(continuous, pending, in_flight);
+        let (pending, in_flight, awaiting_presentation) = self.shared.pacing_state();
+        let paused = pacing_paused(continuous, pending, in_flight, awaiting_presentation);
         if self.display_link.isPaused() != paused {
             self.display_link.setPaused(paused);
         }
@@ -636,13 +638,12 @@ impl WindowRenderer {
         let Some(feedback) = self.shared.take_feedback() else {
             return Ok(None);
         };
-        // 共享契约（B6-2）：`presented_at` 是**真实上屏**时刻，不可能早于 GPU 完成；
-        // 三端都读它，HUD 才能用同一字段区分「发布→完成」与「发布→上屏」。
+        // 共享契约（`render/frame.rs`）：`presented_at` 要么是**可信**的上屏时刻（macOS 是
+        // 「目标时刻 + 下一个 tick」的推断值，不早于 GPU 完成），要么如实为 `None`。绝不允许
+        // 用完成时刻顶替（那正是本轮修掉的假数据缺陷）。
         debug_assert!(
-            feedback
-                .presented_at
-                .is_none_or(|presented| presented >= feedback.completed_at),
-            "presented_at must not precede completed_at"
+            feedback.presentation_is_consistent(),
+            "presented_at must be a trustworthy on-screen instant or None"
         );
         self.stats = feedback.stats;
         debug_assert!(
@@ -659,9 +660,8 @@ impl WindowRenderer {
                     || feedback.completed_at >= published),
             "frame feedback completed before it was published"
         );
-        // `latency` 是本端独有的「发布 → **真实呈现**」（`presentedTime`；拿不到时退回完成
-        // 时刻）：它不要求 ≤ `completed_at - published_at`（后者只是 GPU 完成），但绝不能早于
-        // 发布时刻 —— 那说明时钟换算或配对出错。
+        // `latency` = 发布 → **GPU 完成**（三端同义）：它可能比 `presented_at - published_at`
+        // 小（上屏还要等 vsync），但绝不能早于发布时刻 —— 那说明完成时刻或配对出错。
         debug_assert!(
             self.last_published
                 .is_none_or(|(index, published)| index != feedback.index
@@ -728,12 +728,18 @@ struct SendCommandBuffer(Retained<ProtocolObject<dyn MTLCommandBuffer>>);
 // 交出引用后，只有 GPU 线程持有它。
 unsafe impl Send for SendCommandBuffer {}
 
-/// display link 交给 GPU 线程的一次呈现机会：本 vsync 的 drawable。
+/// display link 交给 GPU 线程的一次呈现机会：本 vsync 的 drawable + 它的目标呈现时刻 + tick 序号。
 ///
-/// 呈现时刻**不随 drawable 过线**：它由 display link 独占，GPU 线程只做无时刻的
-/// `presentDrawable:`（见 `render/macos/present.rs`）。
+/// **呈现时刻随 drawable 过线**（与 P0 之前的实现相反）：display link 独占呈现时刻，GPU 线程只做
+/// 无时刻的 `presentDrawable:`（见 `render/macos/present.rs`），但
+/// `targetPresentationTimestamp` 是「本帧被排定的上屏时刻」—— 提交时把它换算成 `Instant` 就是
+/// [`FrameFeedback::presented_at`] 的 tick 推断值。
 struct DrawableUpdate {
     drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
+    /// 本 vsync 的目标呈现时刻（host time，秒；`0.0` / 非有限值 = 系统没给，推断值如实留空）。
+    target: CFTimeInterval,
+    /// 本 tick 的单调序号（与 drawable 同一个 tick 盖章）：更新的 tick 到达 ⇒ 本帧已上屏。
+    sequence: u64,
 }
 
 // SAFETY: Metal 对象本身线程安全；放进最新 drawable 槽之后只有 GPU 线程持有引用。
@@ -773,13 +779,18 @@ struct State {
     drawable: Option<DrawableUpdate>,
     /// 已完成、等 GPU 线程 drain 的命令缓冲（完成回调入队，本队列只增不减）。
     completions: VecDeque<Completion>,
-    /// 已提交 drawable 的**真实呈现时刻**（`addPresentedHandler` 给的 `presentedTime` 换算成
-    /// `Instant`；只增不减，GPU 线程 drain）。
+    /// 已观察到的 display link tick 数（每次回调 +1，只增不减）。
     ///
-    /// 元素是 `(drawable 身份, 呈现时刻)`：呈现回调**每张 drawable 只登记一次**（AR3 §6.4），
-    /// 注册时不可能知道未来哪一帧会用这张 drawable，所以按 drawable 身份上报，帧序号的配对在
-    /// GPU 线程的反馈队列里按提交顺序完成。
-    presented: VecDeque<(usize, Instant)>,
+    /// 它是「上一帧已上屏」的唯一判据（见 [`FeedbackQueue::observe_tick`]）：更新的 tick 到达
+    /// 说明**上一个 vsync 的呈现截止时刻已经过去**，因此目标时刻更早的帧已经在屏幕上。
+    tick_sequence: u64,
+    /// GPU 线程还在等上屏证据的帧里**最早**的 tick 序号（`None` = 没有在等的帧）。
+    ///
+    /// 它同时是两件事的输入：`wait_for_work` 的唤醒条件（`tick_sequence > awaiting_tick` ⇒ 证据
+    /// 已到，见 [`State::presentation_evidence`]）与 `sync_pacing` 的第三个「必须继续跑」理由
+    /// （display link 一停就不会再有 tick，证据永远等不到 —— 旧实现靠 32 ms 超时轮询把这条
+    /// 掩盖成空转）。
+    awaiting_tick: Option<u64>,
     feedback: Option<FrameFeedback>,
     error: Option<EngineError>,
     shutdown: bool,
@@ -799,7 +810,8 @@ impl State {
             atlas: AtlasSlots::new(),
             drawable: None,
             completions: VecDeque::new(),
-            presented: VecDeque::new(),
+            tick_sequence: 0,
+            awaiting_tick: None,
             feedback: None,
             error: None,
             shutdown: false,
@@ -809,8 +821,8 @@ impl State {
         }
     }
 
-    /// GPU 线程的等待条件：有完成通知 / 有呈现通知 / 有帧且有 drawable / 有待应用背景色 /
-    /// 关闭且已无在飞帧。
+    /// GPU 线程的等待条件：有完成通知 / 有上屏证据（更新的 tick）/ 有帧且有 drawable / 有待应用
+    /// 背景色 / 关闭且已无在飞帧。
     ///
     /// 关闭开始后不再开新帧：只等完成通知（`in_flight` 归零或有通知可 drain）。否则残留的
     /// 「待画帧 + drawable」会让循环空转，也会让 [`Shared::wait_for_work`] 的 grace 永远不生效。
@@ -822,9 +834,18 @@ impl State {
             return in_flight == 0 || !self.completions.is_empty();
         }
         !self.completions.is_empty()
-            || !self.presented.is_empty()
+            || self.presentation_evidence()
             || self.background.is_some()
             || (self.frame.has_pending() && self.drawable.is_some())
+    }
+
+    /// 还在等上屏证据的帧是否已经拿到证据（一个更新的 tick 已到达）。
+    ///
+    /// **这是等待条件里唯一与时间有关的判据，而它由 tick 事件驱动**：旧实现让 GPU 线程每 32 ms
+    /// （`PRESENTED_WAIT`）超时醒来一次去「兜底发布」不存在的数据，等于空转。
+    fn presentation_evidence(&self) -> bool {
+        self.awaiting_tick
+            .is_some_and(|awaiting| self.tick_sequence > awaiting)
     }
 }
 
@@ -854,9 +875,9 @@ struct AtlasSlots {
 struct AtlasUpload {
     kind: AtlasKind,
     page: u32,
-    /// `rows` 顺序紧密打包的行（整页上传时就是整页）。
+    /// `rects` 顺序逐矩形紧密打包的字节（整页上传时就是整页）。
     pixels: Vec<u8>,
-    rows: DirtyRows,
+    rects: DirtyRects,
 }
 
 impl AtlasSlots {
@@ -869,7 +890,7 @@ impl AtlasSlots {
 
     /// 入队一次上传。**槽位由 UI 线程的 `atlas_idle` 保证空闲**（DEVIATIONS F-211）：
     /// 槽里已有未消费的上传时是契约破坏（会丢行），release 也硬失败。
-    fn queue(&mut self, kind: AtlasKind, page: u32, pixels: Vec<u8>, rows: DirtyRows) {
+    fn queue(&mut self, kind: AtlasKind, page: u32, pixels: Vec<u8>, rects: DirtyRects) {
         let slot = match kind {
             AtlasKind::Glyph => &mut self.glyph,
             AtlasKind::Image => &mut self.image,
@@ -882,7 +903,7 @@ impl AtlasSlots {
             kind,
             page,
             pixels,
-            rows,
+            rects,
         });
     }
 
@@ -893,31 +914,50 @@ impl AtlasSlots {
 
 /// display link 的暂停状态（§5.3 的状态机；纯函数便于单测）。
 ///
-/// 需要跑：`continuous || 有未取走的帧请求 || 有在飞帧` ⇒ 不暂停；否则暂停（空闲 0 唤醒）。
-fn pacing_paused(continuous: bool, pending_frame: bool, in_flight: usize) -> bool {
-    !(continuous || pending_frame || in_flight > 0)
+/// 需要跑：`continuous || 有未取走的帧请求 || 有在飞帧 || 还在等上屏证据` ⇒ 不暂停；否则暂停
+/// （空闲 0 唤醒）。
+///
+/// 第三个「在等上屏证据」的理由不能省：display link 是 tick 推断的唯一来源，暂停之后不会再有
+/// 回调，最后在飞的那一帧永远等不到证据（反馈不发布、`presented_at` 永远为空）。
+fn pacing_paused(
+    continuous: bool,
+    pending_frame: bool,
+    in_flight: usize,
+    awaiting_presentation: bool,
+) -> bool {
+    !(continuous || pending_frame || in_flight > 0 || awaiting_presentation)
 }
 
-/// 等 `presentedTime` 的上界：CoreAnimation 可能永远不回调（窗口被遮挡、drawable 被跳过），
-/// 反馈不能永远不发布。超过它就用完成时刻兜底。
-const PRESENTED_WAIT: Duration = Duration::from_millis(32);
+/// 「目标呈现时刻」与采样时刻的最大合理差距：display link 只提前 1–2 个 vsync 给出排定时刻，
+/// 超过它就是垃圾值 / 时钟异常，按「拿不到」处理（见 [`presentation_instant`]）。
+const MAX_TARGET_LEAD: Duration = Duration::from_millis(250);
 
-/// host time（秒，`mach_absolute_time` 时基）→ `Instant`。
+/// display link 给出的**目标上屏时刻**（host time，秒）→ `Instant`。
 ///
-/// `MTLDrawable.presentedTime` 与 `CACurrentMediaTime()` 是同一时基，与 `Instant`（单调时钟）
-/// 只差"采样此刻"这一个点：先算两者的差（`age`），再从 `observed` 往回推。非法值（0 / NaN /
-/// 未来时刻）返回 `None`，调用方退回完成时刻。
-fn host_time_to_instant(
-    presented: CFTimeInterval,
+/// `targetPresentationTimestamp` 与 `CACurrentMediaTime()` 是同一时基（`mach_absolute_time` 的
+/// 秒形式），与 `Instant` 只差「采样此刻」这一个点：先算两者的差，再从 `observed` 推出去。
+///
+/// 与「呈现回调」不同，目标时刻在**未来**（display link 提前一个 vsync 把本 vsync 的排定时刻交给
+/// 我们），因此两个方向都要支持：`target - now_host` 为正就往 `observed` 之后推。非法值
+/// （`0.0` / 非有限 / 差值超过 [`MAX_TARGET_LEAD`]）返回 `None`：调用方如实把 `presented_at` 留空，
+/// 而不是拿别的时刻顶替（假数据）。
+fn presentation_instant(
+    target: CFTimeInterval,
     observed: Instant,
     now_host: CFTimeInterval,
 ) -> Option<Instant> {
-    if !presented.is_finite() || presented <= 0.0 || !now_host.is_finite() {
+    if !target.is_finite() || target <= 0.0 || !now_host.is_finite() {
         return None;
     }
-    // 理论上 presented ≤ now_host；未来时刻按"刚刚"处理，避免 `from_secs_f64` 收到负数。
-    let age = (now_host - presented).max(0.0);
-    observed.checked_sub(Duration::from_secs_f64(age))
+    let lead = target - now_host;
+    if !lead.is_finite() || lead.abs() > MAX_TARGET_LEAD.as_secs_f64() {
+        return None;
+    }
+    if lead >= 0.0 {
+        observed.checked_add(Duration::from_secs_f64(lead))
+    } else {
+        observed.checked_sub(Duration::from_secs_f64(-lead))
+    }
 }
 
 /// 请求的目标尺寸与 drawable 的实际尺寸是否一致（容差 1 px）。
@@ -1024,7 +1064,7 @@ impl Shared {
         self.wake();
     }
 
-    fn queue_atlas(&self, kind: AtlasKind, page: u32, pixels: &[u8], rows: DirtyRows) -> bool {
+    fn queue_atlas(&self, kind: AtlasKind, page: u32, pixels: &[u8], rects: DirtyRects) -> bool {
         let index = kind.index() as usize;
         // 像素在**锁外**复制：整页可达 16 MiB，不能让 GPU 线程的取帧锁等这次 memcpy。
         let pixels = pixels.to_vec();
@@ -1036,7 +1076,7 @@ impl Shared {
             return false;
         }
         // 不唤醒：图集上传统一在「录制下一帧」之前落地（§4.2），单独唤醒只会空转。
-        state.atlas.queue(kind, page, pixels, rows);
+        state.atlas.queue(kind, page, pixels, rects);
         true
     }
 
@@ -1056,27 +1096,51 @@ impl Shared {
         self.lock().background.take()
     }
 
-    /// display link delegate（主线程）：把这一帧的 drawable 放进最新 drawable 槽并唤醒 GPU 线程。
+    /// display link delegate（主线程）：把这一帧的 drawable + 目标呈现时刻放进最新 drawable 槽，
+    /// 推进 tick 序号并唤醒 GPU 线程。
     ///
     /// **被覆盖的旧 drawable 必须在锁外释放**（P0 死锁，真机 `sample` 现场）：
     /// `-[CAMetalDrawable release]` 会在 CoreAnimation 内部等图层锁 —— 而呈现路径
-    /// （Metal 的 `CompletionQueueDispatch` → `presentWithOptions:` → 我们的完成/呈现回调）正持着
+    /// （Metal 的 `CompletionQueueDispatch` → `presentWithOptions:` → 我们的完成回调）正持着
     /// 那把锁去等 `Shared::state`。在临界区里 drop drawable 就是标准的锁序反转：主线程
     /// 持 `state` 等 CA 锁、Metal 回调线程持 CA 锁等 `state`，两边永久等待（实测进程冻结在
     /// `metal_display_link_needs_update → -[CAMetalDrawable release]`，4–5 分钟后必现）。
     ///
     /// 同理，任何 Metal 对象的 `Release` 都不能在 `Shared::state` 的临界区里发生。
-    fn publish_drawable(&self, drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>) {
+    fn publish_drawable(
+        &self,
+        drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
+        target: CFTimeInterval,
+    ) {
         let replaced = {
             let mut state = self.lock();
             if state.shutdown || state.terminated {
                 return;
             }
-            state.drawable.replace(DrawableUpdate { drawable })
+            // tick 序号只增不减：它是「更新的 tick 已到达」这一证据的比较基准。
+            state.tick_sequence += 1;
+            let sequence = state.tick_sequence;
+            state.drawable.replace(DrawableUpdate {
+                drawable,
+                target,
+                sequence,
+            })
         };
         // 锁已释放：这里才允许触发 `CAMetalDrawable` 的 Release（见上面的锁序说明）。
         drop(replaced);
         self.wake();
+    }
+
+    /// 已观察到的 display link tick 数（GPU 线程据此判定「本帧的目标 vsync 已经过去」）。
+    fn tick_sequence(&self) -> u64 {
+        self.lock().tick_sequence
+    }
+
+    /// 登记「还在等上屏证据的最早 tick」（`None` = 没有在等的帧）。
+    ///
+    /// 写进共享状态而不是只留在 GPU 线程：`wait_for_work` 与 `sync_pacing`（主线程）都要看它。
+    fn set_awaiting_tick(&self, awaiting: Option<u64>) {
+        self.lock().awaiting_tick = awaiting;
     }
 
     /// 完成回调（Metal 的任意线程）：入队 + 唤醒 GPU 线程（**不**碰 retire / 计时）。
@@ -1097,43 +1161,21 @@ impl Shared {
         self.wake();
     }
 
-    /// 呈现回调（CoreAnimation 的呈现线程）：记下这张 drawable 的**真实呈现时刻**并唤醒 GPU 线程。
-    ///
-    /// `presented_time` 是 `MTLDrawable.presentedTime`（host time，秒）；换算成 `Instant` 需要
-    /// 同一时刻的 host time 采样。**先采 host time、再采 `Instant`**：反序会把「两次采样之间的
-    /// 间隔」算进 `age`，让换算出的呈现时刻系统性偏早（甚至早于 `published_at`）。
-    fn push_presented(&self, drawable: usize, presented_time: CFTimeInterval) {
-        let now_host = CACurrentMediaTime();
-        let observed = Instant::now();
-        let Some(presented_at) = host_time_to_instant(presented_time, observed, now_host) else {
-            // `presentedTime == 0`：这一帧没有上屏（被 CA 跳过 / drawable 被丢弃）。不记呈现
-            // 时刻，反馈退回"完成时刻"兜底。
-            return;
-        };
-        let mut state = self.lock();
-        if state.terminated {
-            return;
-        }
-        state.presented.push_back((drawable, presented_at));
-        drop(state);
-        self.wake();
-    }
-
-    /// 取走全部呈现通知（GPU 线程 drain）。
-    fn take_presented(&self) -> Vec<(usize, Instant)> {
-        self.lock().presented.drain(..).collect()
-    }
-
-    /// 空闲：睡在 condvar 上直到「有完成 / 呈现通知 / 有帧且有 drawable / 关闭且无在飞帧」。
+    /// 空闲：睡在 condvar 上直到「有完成通知 / 有上屏证据（更新的 tick）/ 有帧且有 drawable /
+    /// 关闭且无在飞帧」。
     ///
     /// 关闭后有在飞帧但驱动永不回调完成时，等待必须有上界（否则 GPU 线程自己永不退出，
     /// detach 之后还会一直占着资源）：用 100 ms 超时轮询，从关闭请求起**累计**超过
     /// [`SHUTDOWN_GRACE`] 返回 [`WaitOutcome::TimedOut`]。
     ///
-    /// `awaiting_presentation` 为真时（已有 GPU 完成、还在等 `presentedTime` 的帧）等待也必须
-    /// 有上界：CoreAnimation 可能永远不回调（窗口被遮挡 / drawable 被跳过），反馈不能永远不发布。
-    /// 这条超时返回 [`WaitOutcome::Work`]，让调用方用完成时刻兜底发布后重新判定。
-    fn wait_for_work(&self, awaiting_presentation: bool) -> WaitOutcome {
+    /// **正常路径没有任何定时等待**：上屏证据由 display link 的 tick 事件唤醒
+    /// （[`State::presentation_evidence`]），不是超时轮询 —— 旧实现在这里每 32 ms 醒一次，
+    /// 只是为了把不存在的数据兜底发布出去。
+    ///
+    /// 代价（真机实测）：窗口被遮挡 / 最小化时 macOS 会停掉 display link 的 tick，最后一帧的
+    /// 反馈就会**停在等证据**上（HUD 不可见，恢复显示后第一个 tick 立刻发布）。旧实现那 32 ms
+    /// 超时会在这时用完成时刻「兜底发布」一个假的上屏时刻 —— 那正是本轮删掉的东西。
+    fn wait_for_work(&self) -> WaitOutcome {
         let mut state = self.lock();
         loop {
             if state.has_work(self.in_flight.get()) {
@@ -1151,14 +1193,6 @@ impl Shared {
                     .wait_timeout(state, timeout)
                     .unwrap_or_else(PoisonError::into_inner)
                     .0;
-            } else if awaiting_presentation {
-                // 等呈现通知的上界：睡 [`PRESENTED_WAIT`] 后返回，由调用方用完成时刻兜底发布
-                // （HUD 不允许停在旧值；CoreAnimation 可能永远不回调，例如 drawable 被跳过）。
-                let _ = self
-                    .work
-                    .wait_timeout(state, PRESENTED_WAIT)
-                    .unwrap_or_else(PoisonError::into_inner);
-                return WaitOutcome::Work;
             } else {
                 state = self
                     .work
@@ -1226,10 +1260,17 @@ impl Shared {
         self.in_flight.get()
     }
 
-    /// `sync_pacing` 的输入：是否有未取走的帧请求、是否有在飞帧。
-    fn pacing_state(&self) -> (bool, usize) {
+    /// `sync_pacing` 的输入：是否有未取走的帧请求、是否有在飞帧、是否还在等上屏证据。
+    ///
+    /// 第三个是「必须继续跑」的理由：display link 暂停后不再回调，最后一帧永远等不到上屏证据
+    /// （旧实现靠 32 ms 超时兜底把这条掩盖成空转）。
+    fn pacing_state(&self) -> (bool, usize, bool) {
         let state = self.lock();
-        (state.frame.has_pending(), self.in_flight.get())
+        (
+            state.frame.has_pending(),
+            self.in_flight.get(),
+            state.awaiting_tick.is_some(),
+        )
     }
 
     fn shutdown_requested(&self) -> bool {
@@ -1324,16 +1365,7 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, _keep_alive: SendLay
     let mut feedback = FeedbackQueue::new();
     // drawable 与请求尺寸不一致的退化状态（P1；粘性，见 [`SurfaceMismatch`]）。
     let mut surface = SurfaceMismatch::new();
-    // 呈现回调（**每张 drawable 只登记一次**，见 `compositor::PresentedHandlers`）：注册时不知道
-    // 未来哪一帧会用这张 drawable，所以只上报「drawable 身份 + presentedTime」；帧序号的配对由
-    // [`FeedbackQueue::presented`] 按提交顺序完成。整个 GPU 循环共用这一个回调。
-    let presented: Arc<dyn Fn(usize, CFTimeInterval) + Send + Sync> = {
-        let shared = Arc::clone(&shared);
-        Arc::new(move |drawable, presented_time| {
-            shared.push_presented(drawable, presented_time);
-        })
-    };
-    // 最近一次推进到的连续完成前沿：呈现通知晚到时也要按它发布反馈（见 `FeedbackQueue`）。
+    // 最近一次推进到的连续完成前沿：上屏证据晚到时也要按它发布反馈（见 [`FeedbackQueue`]）。
     let mut frontier: Option<FrameIndex> = None;
     // 已从共享槽取走、但还没编码进本帧 command buffer 的图集上传（按 `AtlasKind`）。
     let mut atlas_awaiting = [false; 2];
@@ -1342,7 +1374,7 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, _keep_alive: SendLay
         if let Some(linear) = shared.take_background() {
             renderer.set_background_color(linear);
         }
-        if shared.wait_for_work(feedback.awaiting_presentation()) == WaitOutcome::TimedOut {
+        if shared.wait_for_work() == WaitOutcome::TimedOut {
             // 驱动没有回调完成：线程自己不能永远等下去（detach 之后它会一直占着资源；进程退出前
             // 也没有人会来救它）。Metal 的命令缓冲自己持有资源引用，退出时释放 device/queue 不会
             // UAF。
@@ -1353,21 +1385,22 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, _keep_alive: SendLay
             );
             break;
         }
-        // 呈现通知先落地：它可能比完成通知晚到一帧（`presentedTime` 要等真正上屏）。
-        for (drawable, presented_at) in shared.take_presented() {
-            feedback.presented(drawable, presented_at);
-        }
+        // 上屏证据先落地：一个更新的 display link tick 到达 ⇒ 目标 tick 更早的帧已经上屏
+        // （该 vsync 的呈现截止时刻已经过去）。这是 `presented_at` 的唯一推导来源。
+        feedback.observe_tick(shared.tick_sequence());
         if let Err(error) = drain_completions(&mut renderer, &shared, &mut feedback, &mut frontier)
         {
             shared.publish_error(error);
             break;
         }
-        // 连续完成前缀推进过（或之前推进过）：按提交顺序发布已经拿到呈现时刻的帧；
-        // 等不到呈现时刻的帧由 [`PRESENTED_WAIT`] 兜底用完成时刻发布。
+        // 连续完成前缀推进过（或之前推进过）：按提交顺序发布「GPU 已完成 + 上屏证据已到」的帧。
         if let Some(frontier) = frontier {
-            let now = Instant::now();
-            feedback.pop_ready(frontier, now, |frame| shared.publish_feedback(frame));
+            feedback.pop_ready(frontier, |frame| shared.publish_feedback(frame));
         }
+        // 本轮之后还在等证据的帧决定两件事：`wait_for_work` 何时该醒（更新的 tick）与
+        // display link 何时能暂停（必须等证据到达，否则 tick 不再来 ⇒ 永远等不到）。
+        // 提交路径在本轮末尾还会再登记一次（新入队的帧）。
+        shared.set_awaiting_tick(feedback.awaiting_tick());
         if shared.shutdown_requested() {
             // 退出前 drain 在飞帧（I4）：完成通知到达、旧资源释放之后才销毁 device/queue。
             if shared.in_flight() == 0 {
@@ -1429,7 +1462,7 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, _keep_alive: SendLay
         for (index, upload) in shared.take_atlas().into_iter().enumerate() {
             if let Some(upload) = upload {
                 atlas_awaiting[index] = true;
-                renderer.queue_atlas_upload(upload.kind, upload.page, upload.pixels, upload.rows);
+                renderer.queue_atlas_upload(upload.kind, upload.page, upload.pixels, upload.rects);
             }
         }
         let resized = match renderer.prepare_target(target) {
@@ -1450,23 +1483,19 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, _keep_alive: SendLay
             continue;
         }
         let index = request.index;
-        // 反馈按 drawable 身份配对呈现通知（`FeedbackQueue::presented`）：同一张 drawable 的
-        // 多次呈现按提交顺序 FIFO，不会把后面帧的呈现时间记到前面帧上。
-        let drawable: &ProtocolObject<dyn MTLDrawable> = update.drawable.as_ref();
-        let drawable_id = drawable.drawableID();
+        // **tick 推断的上屏时刻**：本 vsync 的排定呈现时刻（host time）换算成 `Instant`。
+        // 这是 display link 独占的信息；GPU 线程仍然只做无时刻的 `presentDrawable:`。
+        let presented_at =
+            presentation_instant(update.target, Instant::now(), CACurrentMediaTime());
+        // 上屏证据按 tick 序号配对（`FeedbackQueue::observe_tick`）：更新 tick 到达 ⇒ 本帧已上屏。
+        let tick = update.sequence;
         let completed = {
             let shared = Arc::clone(&shared);
             // 完成通知带着本次提交的 u64 序号走：retire 的键不能等回调时再推导（R06-1）。
             let sequence = frame_slot.signal_value;
             move |buffer| shared.push_completion(index, sequence, SendCommandBuffer(buffer))
         };
-        match renderer.submit_frame(
-            &request,
-            &update.drawable,
-            &mut frame,
-            completed,
-            &presented,
-        ) {
+        match renderer.submit_frame(&request, &update.drawable, &mut frame, completed) {
             Ok((stats, samples)) => {
                 // 上传已经编码进本帧 command buffer：共享槽这才算空，UI 可以入队下一笔。
                 for (index, awaiting) in atlas_awaiting.iter_mut().enumerate() {
@@ -1480,7 +1509,18 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, _keep_alive: SendLay
                 }
                 // **不**在这里清退化状态：粘性状态只在尺寸重新一致时清除（`SurfaceMismatch`）。
                 // 在飞记账已经在 `Queue::submit` 里、`commit` **之前**完成（R09-17）。
-                feedback.push(index, drawable_id, stats, samples, request.published_at);
+                feedback.push(
+                    index,
+                    stats,
+                    samples,
+                    request.published_at,
+                    tick,
+                    presented_at,
+                );
+                // 新帧立刻登记「在等上屏证据」：`sync_pacing`（主线程）据此让 display link 继续跑。
+                // 必须紧跟 `push`：此刻 `in_flight ≥ 1`，主线程不会在这个窗口里暂停节奏源；
+                // 等到循环顶部再登记会给「完成回调已到、主线程刚好暂停 display link」留出竞态。
+                shared.set_awaiting_tick(feedback.awaiting_tick());
             }
             Err(error) => {
                 shared.publish_error(error);
@@ -1518,22 +1558,21 @@ fn drain_completions(
 /// **两个时刻必须分开**（AR3 §6.3 / P2-12）：
 /// - [`Self::completed_at`]：GPU 线程**观察到 GPU 工作完成**的时刻，与共享契约
 ///   （`render/frame.rs`）以及 Windows/Linux 两端同义；
-/// - [`Self::presented_at`]：`MTLDrawable.presentedTime` 换算出的**真实呈现时刻**，macOS 独有
-///   （`addPresentedHandler:` 才能拿到），HUD 的 `Latency` 用它。
-///
-/// 旧实现把发布出去的 `FrameFeedback::completed_at` 也写成呈现时刻，导致三端同名指标含义不同；
-/// 现在发布的是 `completed_at`（GPU 完成，契约不变）+ `latency`（发布 → **真实呈现**）。
+/// - [`Self::presented_at`]：本帧**被排定的上屏时刻**（提交时由 display link 的
+///   `targetPresentationTimestamp` 换算的 **tick 推断值**），不是逐帧真实呈现时间戳。
 struct SubmittedFrame {
     index: FrameIndex,
-    /// 本帧提交时用的 drawable 身份（`MTLDrawable.drawableID`）：呈现通知按它配对。
-    drawable: usize,
     stats: RenderStats,
     samples: Vec<GpuTimerSample>,
     published_at: Instant,
+    /// 本帧所用 drawable 的 tick 序号（`DrawableUpdate::sequence`）：更新的 tick 到达 ⇒ 本帧已上屏。
+    tick: u64,
     /// 完成通知到达的时刻（`None` = 仍在飞）。
     completed_at: Option<Instant>,
-    /// `MTLDrawable.presentedTime` 换算出的**真实呈现时刻**（`None` = 还没收到呈现通知）。
+    /// tick 推断的上屏时刻（`None` = 系统没给可用的目标时刻）；**不是**完成时刻的占位。
     presented_at: Option<Instant>,
+    /// 上屏证据（一个更新的 tick）已经到达：只有到这时才允许把 `presented_at` 发布出去。
+    presented: bool,
 }
 
 /// 按提交顺序发布反馈的队列（`render/frame.rs` 的跨平台契约）。
@@ -1553,27 +1592,29 @@ impl FeedbackQueue {
         }
     }
 
-    /// 提交成功：按提交顺序入队本帧的统计、drawable 身份与发布基准。
+    /// 提交成功：按提交顺序入队本帧的统计、tick 序号、tick 推断的上屏时刻与发布基准。
     fn push(
         &mut self,
         index: FrameIndex,
-        drawable: usize,
         stats: RenderStats,
         samples: Vec<GpuTimerSample>,
         published_at: Instant,
+        tick: u64,
+        presented_at: Option<Instant>,
     ) {
         self.submitted.push_back(SubmittedFrame {
             index,
-            drawable,
             stats,
             samples,
             published_at,
+            tick,
             completed_at: None,
-            presented_at: None,
+            presented_at,
+            presented: false,
         });
     }
 
-    /// 完成通知到达：记录 GPU 采样与完成时刻；**不**发布（可能还在等更早的帧或呈现时刻）。
+    /// 完成通知到达：记录 GPU 采样与完成时刻；**不**发布（可能还在等更早的帧或上屏证据）。
     fn complete(&mut self, index: FrameIndex, sample: Option<GpuTimerSample>) {
         let position = self.submitted.iter().position(|frame| frame.index == index);
         debug_assert!(
@@ -1590,55 +1631,44 @@ impl FeedbackQueue {
         frame.completed_at = Some(Instant::now());
     }
 
-    /// 呈现通知到达（`MTLDrawable.presentedTime`）：按 **drawable 身份**把呈现时刻配给最早的
-    /// 未配对帧。
+    /// 观察到第 `latest` 个 display link tick：tick 序号更早的帧**已经上屏**。
     ///
-    /// 呈现回调每张 drawable 只登记一次（`compositor::PresentedHandlers`），因此它不知道帧序号；
-    /// 同一张 drawable 的多次 `present` 是**按提交顺序**上屏的，所以「队列里第一张同身份、还没
-    /// 配上呈现时刻的帧」就是这次通知对应的帧。超过了（帧已发布 / 通知落在发布之后）直接丢弃，
-    /// 不能倒回去改已经发布的统计。
-    ///
-    /// 呈现时刻早于该帧发布时刻的通知也丢弃：那是时钟换算误差或陈旧的 `presentedTime`（唤醒 /
-    /// 换屏后的旧值），不能让它污染 HUD 的 `latency`。
-    fn presented(&mut self, drawable: usize, presented_at: Instant) {
-        // 先按身份找**最早**那个还没配对的帧（不能因为时间判据失败就配给更晚的帧）。
-        let Some(position) = self
-            .submitted
-            .iter()
-            .position(|frame| frame.drawable == drawable && frame.presented_at.is_none())
-        else {
-            return;
-        };
-        let frame = &mut self.submitted[position];
-        if presented_at < frame.published_at {
-            return;
+    /// 判据来自 display link 本身而不是墙钟：一个 tick 到达说明**上一个 vsync 的呈现截止时刻
+    /// 已经过去**，而该 vsync 的 drawable 正是那一帧的呈现目标。因此不需要（也不可能）拿到逐帧
+    /// 真实的 `presentedTime`，只需要「排定时刻 + 已经到达的下一个 tick」两件事。
+    fn observe_tick(&mut self, latest: u64) {
+        for frame in &mut self.submitted {
+            if !frame.presented && frame.tick < latest {
+                frame.presented = true;
+            }
         }
-        frame.presented_at = Some(presented_at);
     }
 
-    /// 是否还有"GPU 已完成、在等呈现通知"的帧：决定 [`Shared::wait_for_work`] 是否必须有上界。
-    fn awaiting_presentation(&self) -> bool {
+    /// 还在等上屏证据的帧里最早的 tick 序号（`None` = 队列为空 / 全部有证据）。
+    ///
+    /// 交给 `Shared::set_awaiting_tick`：它同时决定 `wait_for_work` 的唤醒条件与 display link
+    /// 能否暂停。
+    fn awaiting_tick(&self) -> Option<u64> {
         self.submitted
             .iter()
-            .any(|frame| frame.completed_at.is_some() && frame.presented_at.is_none())
+            .find(|frame| !frame.presented)
+            .map(|frame| frame.tick)
     }
 
-    /// `CompletionOrder` 的连续前缀推进到 `frontier`：按提交顺序弹出已完成帧并发布。
+    /// `CompletionOrder` 的连续前缀推进到 `frontier`：按提交顺序弹出「已完成 + 上屏证据已到」的
+    /// 帧并发布。
     ///
-    /// 一帧在两种情况下发布：
-    /// 1. 拿到了 `presentedTime`（真实呈现时刻，权威值）；
-    /// 2. 完成之后已经等了 [`PRESENTED_WAIT`]（CA 可能永远不回调 —— 遮挡、drawable 被跳过、
-    ///    或者这一帧被后来的 drawable 顶掉）⇒ 用完成时刻兜底，HUD 不会停在旧值。
+    /// 两个条件必须同时成立，缺一个都不发布：
+    /// 1. GPU 工作完成（完成回调到达，`completed_at` 有值）；
+    /// 2. 上屏证据（此后观察到一个更新的 display link tick，[`Self::observe_tick`]）。
     ///
-    /// 发布的 `FrameFeedback` 口径（AR3 §6.3 + B6-2 统一）：`completed_at` = **GPU 工作完成**、
-    /// `latency` = 发布 → GPU 完成（三端同义）；`presented_at` = 真实上屏时刻（macOS 独有来源，
-    /// 三端同名字段）。「发布 → 上屏」由 `FrameFeedback::presented_latency` 给出。
-    fn pop_ready(
-        &mut self,
-        frontier: FrameIndex,
-        now: Instant,
-        mut publish: impl FnMut(FrameFeedback),
-    ) {
+    /// 旧实现在等不到 `presentedTime` 时睡 32 ms（`PRESENTED_WAIT`）后用完成时刻兜底发布：
+    /// 那既是假数据（把 GPU 完成冒充上屏），又让 GPU 线程每 32 ms 空转一次。现在两个条件分别由
+    /// **完成回调**与 **display link tick** 驱动，没有任何定时轮询。
+    ///
+    /// 发布口径（AR3 §6.3 + B6-2 统一）：`completed_at` = GPU 工作完成、`latency` = 发布 → GPU
+    /// 完成（三端同义）；`presented_at` = tick 推断的上屏时刻（`None` = 系统没给目标时刻）。
+    fn pop_ready(&mut self, frontier: FrameIndex, mut publish: impl FnMut(FrameFeedback)) {
         while let Some(front) = self.submitted.front() {
             if front.index > frontier {
                 break;
@@ -1647,14 +1677,15 @@ impl FeedbackQueue {
                 debug_assert!(false, "completion frontier passed an incomplete frame");
                 break;
             };
-            let presented_at = match front.presented_at {
-                Some(presented_at) => presented_at,
-                None if now.saturating_duration_since(completed_at) >= PRESENTED_WAIT => {
-                    completed_at
-                }
-                // 还在等呈现通知：停在这里，保序（后面的帧也不能先发布）。
-                None => break,
-            };
+            // 上屏证据还没到：停在这里，保序（后面的帧也不能先发布）。
+            if !front.presented {
+                break;
+            }
+            // tick 推断值不得早于 GPU 完成：GPU 在排定时刻之后才画完时（错过本 vsync），像素最早
+            // 也只能在完成之后上屏 —— 这里取完成时刻作为下界，误差上界仍是 1 个 vsync。
+            let presented_at = front
+                .presented_at
+                .map(|presented| presented.max(completed_at));
             let frame = self.submitted.pop_front().expect("front exists");
             publish(FrameFeedback {
                 index: frame.index,
@@ -1662,11 +1693,10 @@ impl FeedbackQueue {
                 samples: frame.samples,
                 // 共享契约（B6-2 统一）：`latency` 三端同义 = 发布 → **GPU 完成**。
                 latency: completed_at.saturating_duration_since(frame.published_at),
-                // GPU 工作完成时刻（共享契约）；**不是**呈现时刻。
+                // GPU 工作完成时刻（共享契约）；**不是**上屏时刻。
                 completed_at,
-                // 真实上屏时刻（`presentedTime` 换算）；三端同名同义，拿不到就是 `None`。
-                // 拿不到呈现通知时这里是「完成时刻」兜底（见 `pop_ready` 的 PRESENTED_WAIT）。
-                presented_at: Some(presented_at),
+                // tick 推断的上屏时刻；系统没给目标时刻时如实为 `None`（绝不拿完成时刻顶替）。
+                presented_at,
             });
         }
     }
@@ -1682,22 +1712,27 @@ mod tests {
     use smol_str::SmolStr;
 
     use super::{
-        AtlasSlots, FeedbackQueue, InFlight, JOIN_TIMEOUT, MAX_SURFACE_MISMATCHES, PRESENTED_WAIT,
+        AtlasSlots, FeedbackQueue, InFlight, JOIN_TIMEOUT, MAX_SURFACE_MISMATCHES, MAX_TARGET_LEAD,
         PanicGuard, SHUTDOWN_GRACE, SendCommandBuffer, Shared, StickyError, SurfaceMismatch,
-        SurfaceVerdict, WaitOutcome, host_time_to_instant, join_with_deadline, pacing_paused,
+        SurfaceVerdict, WaitOutcome, join_with_deadline, pacing_paused, presentation_instant,
         surface_within_tolerance,
     };
     use crate::{
         error::EngineError,
         paint::atlas::AtlasKind,
-        render::{DirtyRows, RenderStats, compositor::Plan, frame::LatestFrame},
+        render::{DirtyRects, RenderStats, compositor::Plan, frame::LatestFrame},
         window::FrameIndex,
     };
 
-    fn stale_rows(y0: u32, y1: u32) -> DirtyRows {
-        let mut rows = DirtyRows::default();
-        rows.mark(y0, y1);
-        rows
+    fn dirty_rects(y0: u32, y1: u32) -> DirtyRects {
+        let mut rects = DirtyRects::default();
+        rects.mark(crate::math::PhysicalRect::new(
+            0,
+            y0 as i32,
+            i32::MAX,
+            y1 as i32,
+        ));
+        rects
     }
 
     fn index(value: u32) -> FrameIndex {
@@ -1723,14 +1758,14 @@ mod tests {
     }
 
     #[test]
-    fn a_first_atlas_upload_keeps_its_dirty_rows() {
+    fn a_first_atlas_upload_keeps_its_dirty_rects() {
         let mut slots = AtlasSlots::new();
-        slots.queue(AtlasKind::Glyph, 64, vec![1, 2, 3], stale_rows(4, 8));
+        slots.queue(AtlasKind::Glyph, 64, vec![1, 2, 3], dirty_rects(4, 8));
         let [glyph, image] = slots.take();
         let glyph = glyph.expect("glyph upload");
         assert_eq!(glyph.page, 64);
         assert_eq!(glyph.pixels, vec![1, 2, 3]);
-        assert_eq!(glyph.rows.spans(), stale_rows(4, 8).spans());
+        assert_eq!(glyph.rects, dirty_rects(4, 8));
         assert!(image.is_none());
         assert!(slots.take().iter().all(Option::is_none), "取走后槽位为空");
     }
@@ -1740,8 +1775,8 @@ mod tests {
     fn queueing_into_a_busy_atlas_slot_is_a_contract_violation() {
         // UI 线程用 `atlas_idle` 门控入队；覆盖未消费的上传会丢行，因此这里是硬失败。
         let mut slots = AtlasSlots::new();
-        slots.queue(AtlasKind::Glyph, 64, vec![1, 2, 3], stale_rows(4, 8));
-        slots.queue(AtlasKind::Glyph, 64, vec![9, 9, 9], stale_rows(16, 20));
+        slots.queue(AtlasKind::Glyph, 64, vec![1, 2, 3], dirty_rects(4, 8));
+        slots.queue(AtlasKind::Glyph, 64, vec![9, 9, 9], dirty_rects(16, 20));
     }
 
     #[test]
@@ -1765,55 +1800,87 @@ mod tests {
         );
     }
 
-    /// display link 的暂停判定：连续帧 / 有未取走的帧请求 / 有在飞帧时必须跑（否则没有 drawable）。
+    /// display link 的暂停判定：连续帧 / 有未取走的帧请求 / 有在飞帧 / **还在等上屏证据**时必须跑
+    /// （否则没有 drawable、也没有下一个 tick）。
     #[test]
     fn pacing_runs_while_continuous_or_busy() {
-        assert!(!pacing_paused(true, false, 0), "连续帧必须跑");
-        assert!(!pacing_paused(false, true, 0), "有未取走的帧请求必须跑");
-        assert!(!pacing_paused(false, false, 1), "有在飞帧必须跑");
-        assert!(pacing_paused(false, false, 0), "空闲：display link 暂停");
-    }
-
-    /// `presentedTime` 是 host time（秒）：换算成 `Instant` 之后必须能当作反馈的呈现时刻。
-    #[test]
-    fn host_time_is_converted_into_the_monotonic_clock() {
-        let observed = Instant::now();
-        let presented_host = 500.0;
-        let now_host = presented_host + 0.010;
-        let presented = host_time_to_instant(presented_host, observed, now_host).expect("instant");
-        assert!(presented <= observed, "呈现时刻不可能晚于观测时刻");
-        let age = observed.saturating_duration_since(presented);
+        assert!(!pacing_paused(true, false, 0, false), "连续帧必须跑");
         assert!(
-            (Duration::from_millis(9)..=Duration::from_millis(11)).contains(&age),
-            "10 ms 前呈现：换算误差 {age:?}"
+            !pacing_paused(false, true, 0, false),
+            "有未取走的帧请求必须跑"
         );
-        // 非法值（MLA 没给 / 被跳过 / NaN）：返回 None，调用方退回完成时刻。
-        assert!(host_time_to_instant(0.0, observed, now_host).is_none());
-        assert!(host_time_to_instant(f64::NAN, observed, now_host).is_none());
-        // 未来时刻（同一时基下不该出现）：按"刚刚"处理而不是溢出。
-        assert_eq!(
-            host_time_to_instant(now_host + 5.0, observed, now_host),
-            Some(observed)
+        assert!(!pacing_paused(false, false, 1, false), "有在飞帧必须跑");
+        assert!(
+            !pacing_paused(false, false, 0, true),
+            "等上屏证据时不能暂停：tick 是证据的唯一来源"
+        );
+        assert!(
+            pacing_paused(false, false, 0, false),
+            "空闲：display link 暂停"
         );
     }
 
-    /// AR3 §6.3 / P2-12：拿到 `presentedTime` 时，
-    /// - `latency`（HUD 的 `Latency`）用**真实呈现时刻**（旧实现让 HUD 少报 8~17 ms）；
-    /// - `completed_at` 保持**GPU 工作完成**时刻（共享契约，与 Windows/Linux 同义），不再被呈现
-    ///   时刻覆盖。
+    /// 目标呈现时刻是 host time（秒）且**在未来**（display link 提前一个 vsync 给出）：换算成
+    /// `Instant` 必须往后推；过去值往前推；垃圾值返回 `None`（调用方如实留空 `presented_at`）。
     #[test]
-    fn the_presented_time_drives_the_latency_but_not_completed_at() {
+    fn the_target_presentation_time_is_converted_into_the_monotonic_clock() {
+        let observed = Instant::now();
+        let now_host = 500.0;
+        let lead = presentation_instant(now_host + 0.008, observed, now_host).expect("instant");
+        assert_eq!(
+            lead.saturating_duration_since(observed),
+            Duration::from_millis(8),
+            "本 vsync 的目标时刻在未来：必须往后推 8 ms"
+        );
+        let late = presentation_instant(now_host - 0.010, observed, now_host).expect("instant");
+        assert_eq!(
+            observed.saturating_duration_since(late),
+            Duration::from_millis(10),
+            "已经过去的排定时刻：往前推 10 ms"
+        );
+        // 非法值（系统没给 / NaN / 时钟异常）：如实返回 None，不拿别的时刻顶替。
+        assert!(presentation_instant(0.0, observed, now_host).is_none());
+        assert!(presentation_instant(f64::NAN, observed, now_host).is_none());
+        assert!(presentation_instant(f64::INFINITY, observed, now_host).is_none());
+        assert!(
+            presentation_instant(
+                now_host + MAX_TARGET_LEAD.as_secs_f64() * 2.0,
+                observed,
+                now_host
+            )
+            .is_none(),
+            "超过一个合理提前量的目标时刻是垃圾值"
+        );
+    }
+
+    /// AR3 §6.3 / P2-12：tick 推断的上屏时刻只进 `presented_at`，
+    /// - `latency`（HUD 的 `Latency`）仍是**发布 → GPU 完成**（三端同义，与 Windows/Linux 一致）；
+    /// - `completed_at` 保持 GPU 工作完成时刻，不被上屏时刻覆盖。
+    #[test]
+    fn the_tick_inferred_presentation_fills_presented_at_but_not_latency() {
         let mut feedback = FeedbackQueue::new();
         let published_at = Instant::now() - Duration::from_millis(100);
-        feedback.push(index(1), 7, stats(1), Vec::new(), published_at);
+        // 目标呈现时刻（tick 推断）：发布之后、GPU 完成之后的某一刻。
+        let target = Instant::now() + Duration::from_millis(3);
+        feedback.push(
+            index(1),
+            stats(1),
+            Vec::new(),
+            published_at,
+            7,
+            Some(target),
+        );
         feedback.complete(index(1), None);
-        let presented_at = Instant::now();
-        feedback.presented(7, presented_at);
-        assert!(!feedback.awaiting_presentation(), "呈现时刻已到，不必再等");
+        assert_eq!(feedback.awaiting_tick(), Some(7), "在等更新的 tick");
+        // 还没有更新的 tick：不发布（上屏证据缺失）。
         let mut published = Vec::new();
-        feedback.pop_ready(index(1), Instant::now(), |frame| published.push(frame));
+        feedback.pop_ready(index(1), |frame| published.push(frame));
+        assert!(published.is_empty(), "没有上屏证据时不得发布");
+        feedback.observe_tick(8);
+        assert_eq!(feedback.awaiting_tick(), None, "证据已到");
+        feedback.pop_ready(index(1), |frame| published.push(frame));
         assert_eq!(published.len(), 1);
-        // 契约（三端一致）：`latency` = 发布 → **GPU 完成**；真实上屏由 `presented_at` 承载。
+        // 契约（三端一致）：`latency` = 发布 → **GPU 完成**；上屏由 `presented_at` 承载。
         assert_eq!(
             published[0].latency,
             published[0]
@@ -1823,105 +1890,118 @@ mod tests {
         );
         assert_eq!(
             published[0].presented_at,
-            Some(presented_at),
-            "presented_at 承载真实上屏时刻"
+            Some(target.max(published[0].completed_at)),
+            "presented_at 是 tick 推断的上屏时刻（不小于 GPU 完成）"
         );
         assert!(
-            published[0].completed_at <= presented_at,
-            "completed_at 是 GPU 完成时刻，必须早于呈现：{:?} vs {presented_at:?}",
-            published[0].completed_at
-        );
-        assert!(
-            published[0].completed_at >= published_at,
-            "completed_at 不可能早于该帧的发布时刻"
+            published[0].presentation_is_consistent(),
+            "共享契约：presented_at 不早于 completed_at"
         );
     }
 
-    /// 呈现通知不携带帧序号（每张 drawable 只登记一次回调），按 **drawable 身份 + 提交顺序**
-    /// 配对：同一张 drawable 的多次呈现按 FIFO 对应到最早那个还没配对的帧。
+    /// 上屏证据按 **tick 序号**判定：更新的 tick 只把**更早 tick** 的帧标记为已上屏，同一 tick 的
+    /// 帧还要等下一个 tick。这是「上一帧已上屏」判定的全部逻辑（不依赖任何真实 `presentedTime`）。
     #[test]
-    fn presented_notifications_pair_by_drawable_identity_in_submission_order() {
+    fn tick_evidence_marks_only_frames_from_older_ticks_as_presented() {
         let mut feedback = FeedbackQueue::new();
         let base = Instant::now() - Duration::from_millis(50);
-        // 三张 drawable 轮转：第 1、3 帧都用 10 号 drawable。
-        feedback.push(index(1), 10, stats(1), Vec::new(), base);
-        feedback.push(index(2), 11, stats(2), Vec::new(), base);
-        feedback.push(index(3), 10, stats(3), Vec::new(), base);
-        for value in 1..=3 {
-            feedback.complete(index(value), None);
-        }
-        let first = Instant::now();
-        let second = first + Duration::from_millis(8);
-        feedback.presented(10, first);
-        feedback.presented(10, second);
+        feedback.push(index(1), stats(1), Vec::new(), base, 10, Some(base));
+        feedback.push(index(2), stats(2), Vec::new(), base, 11, Some(base));
+        feedback.push(index(3), stats(3), Vec::new(), base, 11, Some(base));
+        feedback.observe_tick(10);
+        assert_eq!(feedback.awaiting_tick(), Some(10), "同一 tick 不算证据");
+        feedback.observe_tick(11);
         assert_eq!(
-            feedback.submitted[0].presented_at,
-            Some(first),
-            "同一个 drawable 的第一次呈现配给最早那帧"
+            feedback.awaiting_tick(),
+            Some(11),
+            "tick 10 的帧已上屏；tick 11 的帧还在等下一个 tick"
         );
-        assert_eq!(
-            feedback.submitted[1].presented_at, None,
-            "11 号 drawable 没收到通知，不能串到别的帧"
-        );
-        assert_eq!(
-            feedback.submitted[2].presented_at,
-            Some(second),
-            "第二次呈现配给同一 drawable 的下一帧"
-        );
+        assert!(feedback.submitted[0].presented);
+        assert!(!feedback.submitted[1].presented);
+        feedback.observe_tick(12);
+        assert_eq!(feedback.awaiting_tick(), None, "全部拿到上屏证据");
     }
 
-    /// 呈现时刻早于该帧发布时刻：不可能是这一帧（时钟换算误差 / 陈旧的 `presentedTime`），
-    /// 丢弃通知并退回完成时刻兜底，而不是把荒谬的 `latency` 塞进 HUD。
+    /// 系统没给可用的目标呈现时刻（`targetPresentationTimestamp` 为 0 / 异常）：tick 推断值如实为
+    /// `None`，**不**拿 GPU 完成时刻顶替；证据到达后照样发布，只是 `presented_at` 为空。
     #[test]
-    fn a_presented_time_before_the_frames_publication_is_ignored() {
+    fn an_unusable_target_time_publishes_a_none_presentation() {
         let mut feedback = FeedbackQueue::new();
         let published_at = Instant::now();
-        feedback.push(index(1), 3, stats(1), Vec::new(), published_at);
+        feedback.push(index(1), stats(1), Vec::new(), published_at, 4, None);
         feedback.complete(index(1), None);
-        feedback.presented(3, published_at - Duration::from_millis(10));
-        assert!(
-            feedback.awaiting_presentation(),
-            "早于发布时刻的呈现通知必须丢弃，反馈继续等（超时兜底）"
-        );
-    }
-
-    /// 呈现通知可能永远不来（窗口被遮挡 / drawable 被跳过）：等满 [`PRESENTED_WAIT`] 之后必须
-    /// 用完成时刻兜底发布，HUD 不能停在旧值；兜底时 `latency` 退回「发布 → GPU 完成」。
-    #[test]
-    fn a_frame_without_a_presented_time_is_published_after_the_wait() {
-        let mut feedback = FeedbackQueue::new();
-        let published_at = Instant::now();
-        feedback.push(index(1), 5, stats(1), Vec::new(), published_at);
-        feedback.complete(index(1), None);
-        assert!(feedback.awaiting_presentation(), "在等呈现通知");
+        feedback.observe_tick(5);
         let mut published = Vec::new();
-        // 还没等满：不能发布（保序，后面的帧也不能先出）。
-        feedback.pop_ready(index(1), Instant::now(), |frame| published.push(frame));
-        assert!(published.is_empty(), "等呈现通知期间不发布");
-        assert_eq!(feedback.submitted.len(), 1);
-        // 等满之后兜底发布：`completed_at` 与 `latency` 都用完成时刻。
-        feedback.pop_ready(index(1), Instant::now() + PRESENTED_WAIT * 2, |frame| {
-            published.push(frame)
-        });
+        feedback.pop_ready(index(1), |frame| published.push(frame));
         assert_eq!(published.len(), 1);
         assert_eq!(
-            published[0].latency,
-            published[0]
-                .completed_at
-                .saturating_duration_since(published_at),
-            "拿不到呈现时刻时 latency 退回 GPU 完成"
+            published[0].presented_at, None,
+            "拿不到可信上屏时刻就留空，不造假"
         );
-        assert!(feedback.submitted.is_empty());
+        assert!(published[0].presentation_is_consistent(), "None 是合法值");
     }
 
-    /// 呈现通知可能落在反馈已经发布之后（甚至极少数情况下早于提交记账）：两种情况都必须
-    /// 静默丢弃，不能 panic（CA 在另一个线程回调）。
+    /// GPU 在排定时刻之后才画完（错过本 vsync）：推断的上屏时刻取 GPU 完成时刻作为下界，
+    /// 否则会得出「像素比 GPU 工作更早上屏」的荒谬值（误差上界仍是 1 个 vsync）。
     #[test]
-    fn a_presented_notification_for_an_unknown_frame_is_ignored() {
+    fn an_early_target_is_clamped_to_the_gpu_completion() {
         let mut feedback = FeedbackQueue::new();
-        feedback.presented(99, Instant::now());
+        let published_at = Instant::now() - Duration::from_millis(20);
+        let early_target = published_at + Duration::from_millis(1);
+        feedback.push(
+            index(1),
+            stats(1),
+            Vec::new(),
+            published_at,
+            2,
+            Some(early_target),
+        );
+        feedback.complete(index(1), None);
+        feedback.observe_tick(3);
+        let mut published = Vec::new();
+        feedback.pop_ready(index(1), |frame| published.push(frame));
+        assert_eq!(published.len(), 1);
+        assert_eq!(
+            published[0].presented_at,
+            Some(published[0].completed_at),
+            "排定时刻早于 GPU 完成时按完成时刻取下界"
+        );
+        assert!(published[0].presentation_is_consistent());
+    }
+
+    /// 证据真的到达之前，反馈绝不发布（旧实现会在这里等 32 ms 然后用完成时刻兜底）：
+    /// 只有 `observe_tick` 给出的更新 tick 才能放行，顺序保持（后面的帧也不能先出）。
+    #[test]
+    fn no_frame_is_published_without_tick_evidence() {
+        let mut feedback = FeedbackQueue::new();
+        let published_at = Instant::now() - Duration::from_millis(80);
+        feedback.push(
+            index(1),
+            stats(1),
+            Vec::new(),
+            published_at,
+            5,
+            Some(published_at),
+        );
+        feedback.complete(index(1), None);
+        assert_eq!(feedback.awaiting_tick(), Some(5), "在等更新的 tick");
+        let mut published = Vec::new();
+        feedback.pop_ready(index(1), |frame| published.push(frame));
+        assert!(published.is_empty(), "等上屏证据期间不发布");
+        assert_eq!(feedback.submitted.len(), 1);
+        feedback.observe_tick(6);
+        feedback.pop_ready(index(1), |frame| published.push(frame));
+        assert_eq!(published.len(), 1);
+        assert!(feedback.submitted.is_empty(), "发布后队列清空");
+    }
+
+    /// 队列为空 / 陌生 tick 到达时必须是无操作（不能 panic，也不能发明帧）。
+    #[test]
+    fn tick_evidence_without_frames_is_a_no_op() {
+        let mut feedback = FeedbackQueue::new();
+        feedback.observe_tick(99);
         assert!(feedback.submitted.is_empty());
-        assert!(!feedback.awaiting_presentation());
+        assert_eq!(feedback.awaiting_tick(), None);
     }
 
     #[test]
@@ -2039,12 +2119,72 @@ mod tests {
         assert!(!shared.lock().has_work(0), "空闲：没有工作");
         shared.set_background([0.25, 0.5, 0.75, 1.0]);
         assert_eq!(
-            shared.wait_for_work(false),
+            shared.wait_for_work(),
             WaitOutcome::Work,
             "待应用背景色必须让 GPU 线程从等待中返回"
         );
         assert_eq!(shared.take_background(), Some([0.25, 0.5, 0.75, 1.0]));
         assert_eq!(shared.take_background(), None, "取一次清空");
+    }
+
+    /// **回归（32 ms 空转）**：等上屏证据的帧在旧实现里让 GPU 线程每 32 ms 超时醒来一次
+    /// （`PRESENTED_WAIT`；60 s 里约 1900 次无效唤醒）。现在等待只由**事件**驱动：既没有完成回调
+    /// 也没有新 tick 时，5 × 32 ms 内一次都不许醒；真正的证据（更新的 tick）到达时必须立刻醒来。
+    #[test]
+    fn awaiting_presentation_never_wakes_the_gpu_thread_on_a_timer() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        /// 旧实现的固定等待间隔 —— 用例用它做「不许在这个尺度上醒来」的度量。
+        const OLD_PRESENTED_WAIT: Duration = Duration::from_millis(32);
+
+        let shared = Arc::new(Shared::new(Arc::new(InFlight::new())));
+        // 模拟「GPU 线程提交了一帧、正在等它的上屏证据」：登记在等的 tick，还没有更新的 tick 到达。
+        shared.set_awaiting_tick(Some(0));
+        let woke = Arc::new(AtomicU32::new(0));
+        let worker = Arc::clone(&shared);
+        let counter = Arc::clone(&woke);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // 只等一次：没有工作就睡在 condvar 上（旧实现在这里 32 ms 就返回一次）。
+            let outcome = worker.wait_for_work();
+            counter.fetch_add(1, Ordering::Release);
+            let _ = sender.send(outcome);
+        });
+        std::thread::sleep(OLD_PRESENTED_WAIT * 5);
+        assert_eq!(
+            woke.load(Ordering::Acquire),
+            0,
+            "等上屏证据期间不允许固定间隔空转（旧实现每 32 ms 醒一次）"
+        );
+        // 证据到达（display link 的下一个 tick，只推进计数 + 唤醒，与 `publish_drawable` 同一路径）：
+        // 必须立刻醒来并返回工作。
+        shared.lock().tick_sequence += 1;
+        shared.wake();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(5)),
+            Ok(WaitOutcome::Work),
+            "更新的 tick 到达必须唤醒 GPU 线程"
+        );
+        assert_eq!(woke.load(Ordering::Acquire), 1, "只醒这一次");
+    }
+
+    #[test]
+    fn shutdown_wait_is_bounded_when_completions_never_arrive() {
+        let shared = Arc::new(Shared::new(Arc::new(InFlight::new())));
+        shared.in_flight.preset(1);
+        shared.request_shutdown();
+        let worker = Arc::clone(&shared);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(worker.wait_for_work());
+        });
+        let started = Instant::now();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(6)),
+            Ok(WaitOutcome::TimedOut),
+            "驱动永不回调完成时 GPU 线程自己的等待必须有界（detach 后它也要能退出）"
+        );
+        assert!(started.elapsed() >= SHUTDOWN_GRACE, "必须等满 grace 才放弃");
     }
 
     #[cfg(target_os = "macos")]
@@ -2067,28 +2207,32 @@ mod tests {
 
     /// 完成回调乱序时，反馈必须按**提交顺序**发布：第 2 帧先完成不能先发布，第 1 帧完成后
     /// 连续前缀推进，按 1 → 2 发布；每帧的 latency 用它自己的发布基准。
+    ///
+    /// 三帧共用同一个 tick（=同一次 display link 回调下提交的），因此一个更新的 tick 就能让三帧
+    /// 都拿到上屏证据 —— 发布顺序仍然只由提交顺序决定。
     #[test]
     fn out_of_order_completions_publish_in_submission_order() {
         let mut feedback = FeedbackQueue::new();
         let base = Instant::now();
         feedback.push(
             index(1),
-            10,
             stats(1),
             Vec::new(),
             base - Duration::from_millis(100),
+            21,
+            Some(base),
         );
-        feedback.push(index(2), 11, stats(2), Vec::new(), base);
-        feedback.push(index(3), 12, stats(3), Vec::new(), base);
+        feedback.push(index(2), stats(2), Vec::new(), base, 21, Some(base));
+        feedback.push(index(3), stats(3), Vec::new(), base, 21, Some(base));
         // 第 2、3 帧先完成：连续前缀（第 1 帧）未到，不能发布。
         feedback.complete(index(2), None);
         feedback.complete(index(3), None);
-        let mut published = Vec::new();
-        // 第 1 帧完成：`CompletionOrder` 的前沿一次推进到 3，按提交顺序发布 1、2、3。
+        // 第 1 帧完成：`CompletionOrder` 的前沿一次推进到 3。
         feedback.complete(index(1), None);
-        // 已经等满呈现通知的上界：三帧都用完成时刻兜底发布（发布顺序不受影响）。
-        let ready_at = Instant::now() + PRESENTED_WAIT * 2;
-        feedback.pop_ready(index(3), ready_at, |frame| published.push(frame));
+        // 更新的 tick 到达：三帧都拿到上屏证据，按提交顺序发布 1、2、3。
+        feedback.observe_tick(22);
+        let mut published = Vec::new();
+        feedback.pop_ready(index(3), |frame| published.push(frame));
 
         assert_eq!(
             published
@@ -2110,25 +2254,6 @@ mod tests {
             "第 2 帧不能被更旧帧的 latency 污染"
         );
         assert!(feedback.submitted.is_empty(), "发布后队列清空");
-    }
-
-    #[test]
-    fn shutdown_wait_is_bounded_when_completions_never_arrive() {
-        let shared = Arc::new(Shared::new(Arc::new(InFlight::new())));
-        shared.in_flight.preset(1);
-        shared.request_shutdown();
-        let worker = Arc::clone(&shared);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = sender.send(worker.wait_for_work(false));
-        });
-        let started = Instant::now();
-        assert_eq!(
-            receiver.recv_timeout(Duration::from_secs(6)),
-            Ok(WaitOutcome::TimedOut),
-            "驱动永不回调完成时 GPU 线程自己的等待必须有界（detach 后它也要能退出）"
-        );
-        assert!(started.elapsed() >= SHUTDOWN_GRACE, "必须等满 grace 才放弃");
     }
 
     /// 正常关闭：GPU 线程已经退出时 `join` 立即返回，主线程不白等 [`JOIN_TIMEOUT`]。

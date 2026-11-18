@@ -21,7 +21,7 @@
 //!
 //! staging 有两档：**每槽常驻**一小块（≤ 1 MiB，增量上传复用）与**一次性**大块（整页上传，
 //! 录制后按帧 retire）。常驻容量因此不随图集页尺寸放大（DEVIATIONS F-216）。页尺寸随上传
-//! **显式过线**（S-153），不由 `pixels.len()` 反推：增量载荷只有脏行，长度不足以恢复整页尺寸。
+//! **显式过线**（S-153），不由 `pixels.len()` 反推：增量载荷只有脏矩形，长度不足以恢复整页尺寸。
 
 use ash::vk;
 
@@ -29,7 +29,7 @@ use crate::{
     error::EngineError,
     paint::atlas::AtlasKind,
     render::{
-        atlas::{DirtyRows, MAX_RESIDENT_STAGING_BYTES, texel_bytes},
+        atlas::{DirtyRects, MAX_RESIDENT_STAGING_BYTES, RectChunk, texel_bytes},
         frame::MAX_FRAMES_IN_FLIGHT,
         linux::{
             device::{Device, GpuObject, SharedGpu, init_error},
@@ -313,7 +313,7 @@ impl Drop for SharedAtlas {
     }
 }
 
-/// 待上传的一页内容（整页 / 脏行 `pixels` + 页尺寸 + 入队时共享页）。
+/// 待上传的一页内容（打包 `pixels` + 页尺寸 + 脏矩形）。
 struct PendingUpload {
     page: u32,
     /// 入队时**共享图集**的页尺寸。
@@ -321,15 +321,15 @@ struct PendingUpload {
     /// 用来区分「新页」（App 换代后要重建共享纹理，`page != queued_page`）与「旧页」
     /// （入队后别的窗口已经换代，`page == queued_page` 且与当前共享页不同：上传作废）。
     queued_page: u32,
-    /// `rows` 顺序紧密打包的行（整页上传时就是整页）。
+    /// `rects` 顺序逐矩形紧密打包的字节（整页上传时就是整页）。
     pixels: Vec<u8>,
-    rows: DirtyRows,
+    rects: DirtyRects,
 }
 
 impl PendingUpload {
     /// 是否覆盖整页（首次上传 / 页换代之后的唯一合法载荷）。
     fn covers_full_page(&self) -> bool {
-        self.rows.is_full() || self.rows.spans() == std::slice::from_ref(&(0..self.page))
+        self.rects.covers_page(self.page)
     }
 }
 
@@ -352,25 +352,23 @@ impl AtlasUploads {
         self.pending[kind.index() as usize].is_some()
     }
 
-    /// 入队一页的脏行（`pixels` 是 `rows` 顺序**紧密打包**的行，DEVIATIONS F-211）。
+    /// 入队一页的脏矩形（`pixels` 是 `rects` 顺序**逐矩形紧密打包**的字节，R06-3）。
     ///
     /// `pixels` 按**所有权**移动进待上传槽，避免槽 → 纹理之间再复制一次（2048² 图片页是
-    /// 16 MiB）。长度必须等于 `行数 × page × texel`（release 也硬断言：越界读会读穿堆）。
+    /// 16 MiB）。长度必须等于 [`DirtyRects::byte_count`]（release 也硬断言：越界读会读穿堆）。
     pub(crate) fn queue_upload(
         &mut self,
         kind: AtlasKind,
         page: u32,
         queued_page: u32,
         pixels: Vec<u8>,
-        rows: DirtyRows,
+        rects: DirtyRects,
     ) {
-        let row_bytes = page as usize * texel_bytes(kind) as usize;
-        let expected = rows.row_count(page) as usize * row_bytes;
+        let expected = rects.byte_count(page, texel_bytes(kind));
         assert_eq!(
             pixels.len(),
             expected,
-            "atlas payload size mismatch for {kind:?}: expected {expected} bytes for {} rows of a {page}² page, got {}",
-            rows.row_count(page),
+            "atlas payload size mismatch for {kind:?}: expected {expected} bytes for the dirty rects of a {page}² page, got {}",
             pixels.len()
         );
         let slot = kind.index() as usize;
@@ -382,7 +380,7 @@ impl AtlasUploads {
             page,
             queued_page,
             pixels,
-            rows,
+            rects,
         });
     }
 
@@ -471,7 +469,11 @@ impl StagingSet {
         }
     }
 
-    /// 录制一页的上传：staging 写入 + 屏障 + 逐段 copy + 屏障。
+    /// 录制一页的上传：staging 写入 + 屏障 + 逐矩形 `cmd_copy_buffer_to_image` + 屏障。
+    ///
+    /// AOI（R06-3）：每个脏矩形单独一次 `vkCmdCopyBufferToImage`，`image_offset` 与
+    /// `image_extent` 都取矩形自己的 `(x, y, w, h)`（缺 `image_offset` 会从第 0 行覆写整页；
+    /// 用整页宽做 `image_extent` 就是旧的放大根因）。
     fn record(
         &mut self,
         shared: &SharedGpu,
@@ -483,30 +485,22 @@ impl StagingSet {
         retired: &mut Vec<GpuResourceHandle>,
     ) -> Result<(), EngineError> {
         let page = pending.page;
-        let full = 0..page;
-        let spans: &[std::ops::Range<u32>] = if pending.rows.is_full() {
-            std::slice::from_ref(&full)
-        } else {
-            pending.rows.spans()
-        };
-        let row_bytes = (page * texel_bytes(kind)) as usize;
-        // 行必须落在页内：`pack_rows` / `row_count` 已按页钳过长度，这里若还越页说明打包
-        // 缓冲与行描述不是同一份数据，按契约错误立刻失败（否则下面的 `ptr::copy` 会读到
-        // `pending.pixels` 之外）。
-        let total_rows: u32 = spans
-            .iter()
-            .map(|span| {
-                assert!(
-                    span.start < span.end && span.end <= page,
-                    "atlas dirty span {span:?} is outside the {page}-row page"
-                );
-                span.end - span.start
-            })
-            .sum();
-        if total_rows == 0 {
+        let texel = texel_bytes(kind);
+        // 打包布局（rect 顺序、行内只有 width × texel）：与该函数的 copy 顺序逐个对应。
+        let chunks: Vec<RectChunk> = pending.rects.chunks(page, texel).collect();
+        if chunks.is_empty() {
+            // 空集合 = 零上传：不分配 staging、不录 copy。
             return Ok(());
         }
-        let length = total_rows as usize * row_bytes;
+        // staging 布局：每块起点按 4 字节对齐（Vulkan 要求 bufferOffset 是纹素块大小的倍数，
+        // 4 对齐对 R8/BGRA8 都成立），块内行紧密排列（`bufferRowLength = 0`）。
+        let mut layout: Vec<(RectChunk, u64)> = Vec::with_capacity(chunks.len());
+        let mut length = 0usize;
+        for chunk in chunks {
+            let offset = length.next_multiple_of(4);
+            length = offset + (chunk.width * chunk.height) as usize * texel as usize;
+            layout.push((chunk, offset as u64));
+        }
         // 小上传复用每槽常驻 staging；整页级的大上传用一次性缓冲（本帧后 retire），
         // 常驻容量不随页尺寸放大（DEVIATIONS F-216）。
         let transient = length as u64 > MAX_RESIDENT_STAGING_BYTES;
@@ -523,10 +517,18 @@ impl StagingSet {
                 .expect("ensure must fill the slot");
             (ring.buffer, ring.ptr)
         };
-        // SAFETY: 映射在创建时常驻，`length` 不超过容量；`pending.pixels` 长度已由
-        // `queue_upload` 校验。
+        // 逐矩形把打包字节搬到 staging 的块起点（块间可能有 ≤3 字节的对齐填充）。
+        // SAFETY: 映射在创建时常驻，`offset + 块字节数 ≤ length ≤ 容量`；`pending.pixels`
+        // 的长度已由 `queue_upload` 的 `byte_count` 断言保证，`chunk.offset + 块字节数` 在界内。
         unsafe {
-            std::ptr::copy_nonoverlapping(pending.pixels.as_ptr(), staging_ptr, length);
+            for (chunk, offset) in &layout {
+                let bytes = (chunk.width * chunk.height) as usize * texel as usize;
+                std::ptr::copy_nonoverlapping(
+                    pending.pixels.as_ptr().add(chunk.offset),
+                    staging_ptr.add(*offset as usize),
+                    bytes,
+                );
+            }
         }
 
         let range = vk::ImageSubresourceRange::default()
@@ -541,7 +543,8 @@ impl StagingSet {
             .src_access_mask(vk::AccessFlags::SHADER_READ)
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
         // SAFETY: barrier 与 copy 的目标都是共享图集页（读锁在手，页不会变）；范围在图像
-        // 边界内；staging 是本次上传独占的缓冲（装全部段），行布局与页尺寸一致（紧密排列）。
+        // 边界内；staging 是本次上传独占的缓冲（装全部块），每块的 offset/extent 来自
+        // `DirtyRects::chunks` 的页内钳位。
         unsafe {
             shared.raw().cmd_pipeline_barrier(
                 command,
@@ -552,23 +555,22 @@ impl StagingSet {
                 &[],
                 &[to_dst],
             );
-            let mut staging_row = 0u32;
-            for span in spans {
-                let rows = span.end - span.start;
+            for (chunk, offset) in &layout {
                 shared.raw().cmd_copy_buffer_to_image(
                     command,
                     staging_buffer,
                     image,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     &[vk::BufferImageCopy::default()
-                        // 每段在 staging 里各有偏移（紧密排列的行）。
-                        .buffer_offset(u64::from(staging_row) * row_bytes as u64)
+                        // 每块在 staging 里各有偏移（块间 4 字节对齐）。
+                        .buffer_offset(*offset)
+                        // 0 = 行按 `image_extent.width` 紧密排列（块内只有 width × texel 字节）。
                         .buffer_row_length(0)
                         .buffer_image_height(0)
-                        // 局部上传：目标从 `span.start` 行开始（缺这个字段会从第 0 行覆写整页）。
+                        // AOI：目标从矩形自己的 (x, y) 开始。
                         .image_offset(vk::Offset3D {
-                            x: 0,
-                            y: span.start as i32,
+                            x: chunk.x as i32,
+                            y: chunk.y as i32,
                             z: 0,
                         })
                         .image_subresource(
@@ -577,12 +579,11 @@ impl StagingSet {
                                 .layer_count(1),
                         )
                         .image_extent(vk::Extent3D {
-                            width: page,
-                            height: rows,
+                            width: chunk.width,
+                            height: chunk.height,
                             depth: 1,
                         })],
                 );
-                staging_row += rows;
             }
             let to_sampled = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
@@ -780,7 +781,7 @@ mod tests {
     use crate::{
         paint::atlas::AtlasKind,
         render::{
-            atlas::DirtyRows,
+            atlas::DirtyRects,
             linux::{
                 device::{FrameSync, GpuObject, SharedGpu, gpu_test_lock},
                 memory::MemoryNeed,
@@ -791,16 +792,21 @@ mod tests {
     /// 小页（16²）够验证行落位；真实页 2048² 在单测里代价过高。
     const TEST_PAGE: u32 = 16;
 
-    fn full_rows() -> DirtyRows {
-        let mut rows = DirtyRows::default();
-        rows.mark(0, u32::MAX);
-        rows
+    /// 整页哨兵（新窗口 / 页尺寸变化的载荷）。
+    fn full_rects() -> DirtyRects {
+        DirtyRects::full()
     }
 
-    fn rows(y0: u32, y1: u32) -> DirtyRows {
-        let mut rows = DirtyRows::default();
-        rows.mark(y0, y1);
-        rows
+    /// 整页宽的脏行矩形（等价于旧的 `mark(y0, y1)` 语义）。
+    fn rows(y0: u32, y1: u32) -> DirtyRects {
+        let mut rects = DirtyRects::default();
+        rects.mark(crate::math::PhysicalRect::new(
+            0,
+            y0 as i32,
+            i32::MAX,
+            y1 as i32,
+        ));
+        rects
     }
 
     /// 一页 BGRA8 像素（行优先；初始全 0）。
@@ -882,9 +888,15 @@ mod tests {
         gpu.wait_queue_idle().expect("queue idle");
     }
 
-    /// 读回图集页某一行的前 4 字节（原始存储字节 = BGRA，不做通道交换）。
-    fn read_row(gpu: &SharedGpu, pool: vk::CommandPool, image: vk::Image, row: u32) -> [u8; 4] {
-        let bytes = u64::from(TEST_PAGE) * 4;
+    /// 读回图集页某个纹素的原始存储字节（BGRA，不做通道交换）。
+    fn read_texel(
+        gpu: &SharedGpu,
+        pool: vk::CommandPool,
+        image: vk::Image,
+        x: u32,
+        y: u32,
+    ) -> [u8; 4] {
+        let bytes = 4u64;
         // SAFETY: 句柄归本测试独占；提交并等待后读回，结束时销毁。
         unsafe {
             let buffer = gpu
@@ -944,8 +956,8 @@ mod tests {
                 &[vk::BufferImageCopy::default()
                     .buffer_offset(0)
                     .image_offset(vk::Offset3D {
-                        x: 0,
-                        y: row as i32,
+                        x: x as i32,
+                        y: y as i32,
                         z: 0,
                     })
                     .image_subresource(
@@ -954,7 +966,7 @@ mod tests {
                             .layer_count(1),
                     )
                     .image_extent(vk::Extent3D {
-                        width: TEST_PAGE,
+                        width: 1,
                         height: 1,
                         depth: 1,
                     })],
@@ -1005,7 +1017,7 @@ mod tests {
             64,
             1,
             vec![0u8; (64 * 64) as usize],
-            full_rows(),
+            full_rects(),
         );
         assert_eq!(
             uploads.reconcile_pages([1, 1]),
@@ -1020,7 +1032,7 @@ mod tests {
             64,
             64,
             vec![0u8; (64 * 64) as usize],
-            full_rows(),
+            full_rects(),
         );
         assert!(uploads.reconcile_pages([128, 1]).is_empty());
         assert!(!uploads.pending(AtlasKind::Glyph), "旧整页必须丢弃");
@@ -1055,7 +1067,7 @@ mod tests {
             TEST_PAGE,
             gpu.atlas_page(AtlasKind::Image),
             page(),
-            full_rows(),
+            full_rects(),
         );
         let rebuild = uploads.reconcile_pages([
             gpu.atlas().page(AtlasKind::Glyph),
@@ -1075,7 +1087,7 @@ mod tests {
         end(&gpu, commands[0]);
         submit_and_wait(&gpu, commands[0]);
         let image = gpu.atlas().image(AtlasKind::Image);
-        assert_eq!(read_row(&gpu, pool, image, 5), [0, 0, 0, 0]);
+        assert_eq!(read_texel(&gpu, pool, image, 0, 5), [0, 0, 0, 0]);
 
         // 第 2 帧：第 5 行 = 不透明深蓝（BGRA，打包的 1 行）。先只录制，不提交。
         let mut first_page = page();
@@ -1115,7 +1127,7 @@ mod tests {
         // 第 2 帧完成：它写进第 5 行的必须是**自己的**深蓝（旧实现会读到橙）。
         submit_and_wait(&gpu, commands[0]);
         assert_eq!(
-            read_row(&gpu, pool, image, 5),
+            read_texel(&gpu, pool, image, 0, 5),
             [0x11, 0x22, 0x33, 0xFF],
             "第 2 帧的 copy 必须读到自己 staging 的字节"
         );
@@ -1123,14 +1135,106 @@ mod tests {
         // 第 3 帧完成：后一帧覆盖前一帧。
         submit_and_wait(&gpu, commands[1]);
         assert_eq!(
-            read_row(&gpu, pool, image, 5),
+            read_texel(&gpu, pool, image, 0, 5),
             [0x44, 0x55, 0x66, 0xFF],
             "后一帧的像素覆盖前一帧"
         );
         assert_eq!(
-            read_row(&gpu, pool, image, 6),
+            read_texel(&gpu, pool, image, 0, 6),
             [0, 0, 0, 0],
             "未上传的行保持原样"
+        );
+
+        // SAFETY: 队列已空闲（每次提交都 wait idle），命令池没有在飞的缓冲。
+        unsafe { gpu.raw().destroy_command_pool(pool, None) };
+    }
+
+    /// R06-3 AOI：只写矩形自己的 `(x, y, w, h)` 区域，页内其它纹素保持原样。
+    ///
+    /// 旧的「整页宽 × 行区间」语义下，4×1 的矩形也要传 `1 行 × 16 纹素 × 4 B = 64 B`；
+    /// AOI 只传 16 B，且左右两侧的纹素不得被写。
+    #[test]
+    fn an_aoi_rect_upload_only_writes_its_own_texels() {
+        let _guard = gpu_test_lock();
+        let gpu = SharedGpu::new_headless_isolated().expect("headless shared gpu");
+        let mut uploads = AtlasUploads::new();
+        let pool = command_pool(&gpu);
+        let commands = allocate(&gpu, pool, 1);
+
+        // 第一个整页上传（新页必须整页，DEVIATIONS F-211），内容全零。
+        uploads.queue_upload(
+            AtlasKind::Image,
+            TEST_PAGE,
+            gpu.atlas_page(AtlasKind::Image),
+            page(),
+            full_rects(),
+        );
+        let rebuild = uploads.reconcile_pages([
+            gpu.atlas().page(AtlasKind::Glyph),
+            gpu.atlas().page(AtlasKind::Image),
+        ]);
+        gpu.rebuild_atlas_pages(&rebuild)
+            .expect("rebuild image page");
+        begin(&gpu, commands[0]);
+        uploads
+            .record_uploads(&gpu, &gpu.atlas(), 0, commands[0])
+            .expect("record full");
+        end(&gpu, commands[0]);
+        submit_and_wait(&gpu, commands[0]);
+
+        // AOI：x 4..8、y 5..6 的 4×1 矩形（BGRA8：4 × 4 = 16 B）。
+        let mut rects = DirtyRects::default();
+        rects.mark(crate::math::PhysicalRect::new(4, 5, 8, 6));
+        assert_eq!(rects.byte_count(TEST_PAGE, 4), 16, "AOI 载荷必须只有 16 B");
+        assert_eq!(TEST_PAGE as usize * 4, 64, "旧语义要传 1 整行 = 16 × 4 B");
+        let mut payload = Vec::with_capacity(16);
+        for _ in 0..4 {
+            payload.extend_from_slice(&[0x11, 0x22, 0x33, 0xFF]);
+        }
+        uploads.queue_upload(
+            AtlasKind::Image,
+            TEST_PAGE,
+            gpu.atlas_page(AtlasKind::Image),
+            payload,
+            rects,
+        );
+        begin(&gpu, commands[0]);
+        uploads
+            .record_uploads(&gpu, &gpu.atlas(), 0, commands[0])
+            .expect("record aoi");
+        end(&gpu, commands[0]);
+        submit_and_wait(&gpu, commands[0]);
+
+        let image = gpu.atlas().image(AtlasKind::Image);
+        assert_eq!(
+            read_texel(&gpu, pool, image, 3, 5),
+            [0, 0, 0, 0],
+            "AOI 左侧一列不得被写"
+        );
+        assert_eq!(
+            read_texel(&gpu, pool, image, 4, 5),
+            [0x11, 0x22, 0x33, 0xFF],
+            "AOI 首列"
+        );
+        assert_eq!(
+            read_texel(&gpu, pool, image, 7, 5),
+            [0x11, 0x22, 0x33, 0xFF],
+            "AOI 末列"
+        );
+        assert_eq!(
+            read_texel(&gpu, pool, image, 8, 5),
+            [0, 0, 0, 0],
+            "AOI 右侧一列不得被写"
+        );
+        assert_eq!(
+            read_texel(&gpu, pool, image, 4, 4),
+            [0, 0, 0, 0],
+            "AOI 上一行不得被写"
+        );
+        assert_eq!(
+            read_texel(&gpu, pool, image, 4, 6),
+            [0, 0, 0, 0],
+            "AOI 下一行不得被写"
         );
 
         // SAFETY: 队列已空闲（每次提交都 wait idle），命令池没有在飞的缓冲。

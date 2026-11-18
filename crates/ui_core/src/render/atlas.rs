@@ -1,13 +1,15 @@
-//! 图集分配器（P02 §10.4 的落地）：单页 + 1 纹素 padding + 脏行 + 代际。
+//! 图集分配器（P02 §10.4 的落地）：单页 + 1 纹素 padding + 脏矩形 + 代际。
 //!
 //! 设计见 `design/phase-05-text.md` §9（逐字规格）与 `design/phase-02-paint-foundation.md` §10。
-//! 只做**装箱 + 脏行 + 代际**：不持有 CPU 像素（P02 §10.6），上传由 P09 从字形缓存读。
+//! 只做**装箱 + 脏矩形 + 代际**：不持有 CPU 像素（P02 §10.6），上传由 P09 从字形缓存读。
 //!
 //! 两条 probe 实测修正（phase-05 §9.2）：
 //! 1. `etagere` 会把请求矩形**向上取整**（请求 8×11 得 8×16）⇒ `padded` 取 `Allocation::rectangle` 的实际值；
 //! 2. 陈旧 `AllocId` 的 `deallocate` 会 `assert!` panic ⇒ [`AtlasAllocator::deallocate`] 必须自己判重。
-
-use std::ops::Range;
+//!
+//! **脏矩形（AOI）上传**（R06-3）：脏集合是**页内矩形**而不是整页宽的行区间。单个 8×11 字形
+//! 只上传 88 B（旧「整页宽 × 行区间」语义要传 11 × page 字节：512² 页上是 5632 B，64 倍放大）。
+//! 合并策略见 [`DirtyRects`]（Skia `SkRegion` 的整数矩形并集思路）。
 
 use etagere::{AllocId, AtlasAllocator as EtagereAllocator, size2};
 
@@ -71,11 +73,36 @@ impl AtlasRebuilt {
     }
 }
 
-/// 把 `page` 里 `rows` 顺序的行**紧密打包**进 `out`（DEVIATIONS F-211）。
+/// 一个脏矩形在**页内**的落点 + 它在紧密打包缓冲里的字节偏移（AOI 上传契约，R06-3）。
 ///
-/// 增量上传的源数据只有脏行；后端按「累计行偏移」从打包缓冲取行。`rows.is_full()` 时等价于
+/// 三后端都只消费这个视图：同一份 [`DirtyRects`] 产出同一批 `(x, y, w, h)` 区域与同一批偏移，
+/// 各后端只按自己的图形 API 翻译（D3D12 `CopyTextureRegion` 的 destination box / Metal blit 的
+/// origin+size / Vulkan `vkCmdCopyBufferToImage` 的 image offset+extent）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RectChunk {
+    /// 页内左边界（纹素）。
+    pub x: u32,
+    /// 页内上边界（纹素）。
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    /// 该矩形在 [`pack_rects`] 输出里的起始字节偏移（按 `rects()` 顺序累计，紧密打包）。
+    pub offset: usize,
+}
+
+/// 把 `page` 里 `rects` 的每个矩形子块**按行紧密打包**进 `out`（R06-3，替代旧的行区间打包）。
+///
+/// 布局：按 [`DirtyRects::rects`] 顺序，对每个（钳到页内的）矩形逐行拷贝 `width × texel` 字节，
+/// 行间无 padding。因此 `out.len()` 恒等于 [`DirtyRects::byte_count`]，而后端可以用
+/// [`DirtyRects::chunks`] 给出的 `(x, y, w, h, offset)` 做逐矩形 AOI 拷贝。`is_full()` 时等价于
 /// 整页拷贝（新窗口 / 页尺寸变化 / 首次上传都走这条）。
-pub(crate) fn pack_rows(page: &[u8], extent: u32, texel: u32, rows: &DirtyRows, out: &mut Vec<u8>) {
+pub(crate) fn pack_rects(
+    page: &[u8],
+    extent: u32,
+    texel: u32,
+    rects: &DirtyRects,
+    out: &mut Vec<u8>,
+) {
     let expected = extent as usize * extent as usize * texel as usize;
     assert_eq!(
         page.len(),
@@ -83,17 +110,23 @@ pub(crate) fn pack_rows(page: &[u8], extent: u32, texel: u32, rows: &DirtyRows, 
         "atlas page buffer must be {extent}² × {texel} bytes"
     );
     out.clear();
-    let row_bytes = extent as usize * texel as usize;
-    if rows.is_full() {
+    if rects.is_full() {
         out.extend_from_slice(page);
         return;
     }
-    for span in rows.spans() {
-        let start = (span.start.min(extent) as usize) * row_bytes;
-        let end = (span.end.min(extent) as usize) * row_bytes;
-        if start < end {
-            out.extend_from_slice(&page[start..end]);
+    let row_bytes = extent as usize * texel as usize;
+    for chunk in rects.chunks(extent, texel) {
+        let width_bytes = chunk.width as usize * texel as usize;
+        let start = chunk.y as usize * row_bytes + chunk.x as usize * texel as usize;
+        for row in 0..chunk.height as usize {
+            let source = start + row * row_bytes;
+            out.extend_from_slice(&page[source..source + width_bytes]);
         }
+        debug_assert_eq!(
+            out.len(),
+            chunk.offset + width_bytes * chunk.height as usize,
+            "packed layout must match the chunk offsets the backends consume"
+        );
     }
 }
 
@@ -111,7 +144,7 @@ pub(crate) struct AtlasAllocator {
     tiles: Vec<Option<AllocId>>,
     free: Vec<usize>,
     generation: u32,
-    dirty: DirtyRows,
+    dirty: DirtyRects,
 }
 
 /// 一次分配的结果。`id` 是**唯一**可交给 [`AtlasAllocator::deallocate`] 的键。
@@ -138,7 +171,7 @@ impl AtlasAllocator {
             tiles: Vec::with_capacity(64),
             free: Vec::new(),
             generation: 1,
-            dirty: DirtyRows::default(),
+            dirty: DirtyRects::default(),
         }
     }
 
@@ -262,106 +295,197 @@ impl AtlasAllocator {
         true
     }
 
-    /// 记录「这些行被写脏了」（P02 §10.5）。
+    /// 记录「这块矩形被写脏了」（P02 §10.5，R06-3 起是**矩形**而不是整页宽的行区间）。
+    ///
+    /// 旧实现把 `rect` 的 x 区间丢掉、只留 `y0..y1`，于是单个 8×11 字形也要上传一整段页宽的行。
     pub(crate) fn mark_written(&mut self, rect: PhysicalRect) {
-        if rect.is_empty() {
-            return;
-        }
-        self.dirty
-            .mark(rect.y0.max(0) as u32, rect.y1.max(0) as u32);
+        self.dirty.mark(rect);
     }
 
-    /// 取走脏行（P09 的增量上传目标）。`App::layout_text` 把它合并进 `App::pending_dirty`。
-    pub(crate) fn take_dirty_rows(&mut self) -> DirtyRows {
+    /// 取走脏矩形（P09 的增量上传目标）。`App::layout_text` 把它合并进 `App::pending_dirty`。
+    pub(crate) fn take_dirty_rects(&mut self) -> DirtyRects {
         core::mem::take(&mut self.dirty)
     }
 }
-/// 被写脏的**行区间**集合（y 区间，x 覆盖整页），升序、已合并。
-#[derive(Clone, Debug, Default)]
-pub(crate) struct DirtyRows {
-    spans: Vec<Range<u32>>,
+/// 整页哨兵：覆盖任意页面的矩形（沿用旧 `mark(0, u32::MAX)` 的语义）。
+///
+/// 消费方仍靠 [`DirtyRects::is_full`] 走「整页缓冲直接上传、不打包」的快路径。
+const FULL_RECT: PhysicalRect = PhysicalRect {
+    x0: 0,
+    y0: 0,
+    x1: i32::MAX,
+    y1: i32::MAX,
+};
+
+/// 被写脏的**矩形**集合（Skia `SkRegion` 的整数矩形并集思路）：多个页内物理像素矩形，
+/// 按 `(y0, x0)` 升序、已合并。
+///
+/// 合并策略（纯函数式：无 I/O、无全局状态）：
+/// - 新矩形被已有矩形**包含** ⇒ 直接忽略（不增长集合）；
+/// - 新矩形与已有矩形**相交或相邻**（半开区间下边接触也算相邻）⇒ 迭代吸收成外接矩形直到不动点
+///   （吸收后的外接矩形可能又贴上下一个）；
+/// - 矩形数超过 [`DirtyRects::MAX_RECTS`]（沿用旧上限 8）⇒ 折叠为整页哨兵 [`FULL_RECT`]。
+///
+/// 复杂度：集合上限 8 ⇒ `mark` 的最坏 O(n²)（n ≤ 8）次矩形比较，摊销 O(1)；
+/// `chunks` / `byte_count` / `pack_rects` 都是 O(矩形数) + O(打包字节数)。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DirtyRects {
+    rects: Vec<PhysicalRect>,
 }
 
-impl DirtyRows {
-    /// 本次上传的行数（`full` = 整页 `page` 行；超出页的 span 被钳掉，DEVIATIONS F-211）。
-    pub(crate) fn row_count(&self, page: u32) -> u32 {
-        if self.is_full() {
-            return page;
+impl DirtyRects {
+    /// 段/矩形数上限：超过就折叠为整页（沿用旧 `DirtyRects` 的 8，避免碎片化上传）。
+    const MAX_RECTS: usize = 8;
+
+    /// 整页哨兵集合（等价于旧的 `mark(0, u32::MAX)`）。
+    pub(crate) fn full() -> Self {
+        Self {
+            rects: vec![FULL_RECT],
         }
-        self.spans
-            .iter()
-            .map(|span| span.end.min(page).saturating_sub(span.start.min(page)))
+    }
+
+    /// 标记 `rect` 脏；空矩形忽略；被已有矩形包含则忽略；相交/相邻合并；超上限折叠整页。
+    pub(crate) fn mark(&mut self, rect: PhysicalRect) {
+        if rect.is_empty() || self.is_full() {
+            return;
+        }
+        // 被已有矩形包含 ⇒ 本次上传不需要新的 AOI 区域（否则集合只会碎片化）。
+        if self.rects.iter().any(|existing| contains(*existing, rect)) {
+            return;
+        }
+        let mut merged = rect;
+        // 不动点：吸收所有相交/相邻的矩形。外接矩形变大后可能贴上下一个，因此必须重扫。
+        loop {
+            let mut absorbed = false;
+            let mut index = 0;
+            while index < self.rects.len() {
+                if touches(merged, self.rects[index]) {
+                    merged = merged.union(self.rects[index]);
+                    self.rects.swap_remove(index);
+                    absorbed = true;
+                } else {
+                    index += 1;
+                }
+            }
+            if !absorbed {
+                break;
+            }
+        }
+        self.rects.push(merged);
+        self.rects.sort_by_key(|rect| (rect.y0, rect.x0));
+        if self.rects.len() > Self::MAX_RECTS {
+            self.rects.clear();
+            self.rects.push(FULL_RECT);
+        }
+    }
+
+    /// 本次上传的矩形（升序；顺序 = 打包顺序 = 后端 AOI 顺序）。
+    pub(crate) fn rects(&self) -> &[PhysicalRect] {
+        &self.rects
+    }
+
+    /// 逐矩形产出**页内**落点 + 打包偏移；越页部分被钳掉，空块跳过。
+    ///
+    /// 这是三后端唯一的 AOI 契约来源：`(x, y, width, height)` 相同 ⇒ 三端上传同一批区域。
+    /// `offset` 与 [`pack_rects`] 的打包布局逐个对应（紧密、无 padding）。
+    pub(crate) fn chunks(&self, page: u32, texel: u32) -> impl Iterator<Item = RectChunk> + '_ {
+        let limit = page.min(i32::MAX as u32) as i32;
+        let mut offset = 0usize;
+        self.rects.iter().filter_map(move |rect| {
+            let x0 = rect.x0.clamp(0, limit) as u32;
+            let y0 = rect.y0.clamp(0, limit) as u32;
+            let x1 = rect.x1.clamp(0, limit) as u32;
+            let y1 = rect.y1.clamp(0, limit) as u32;
+            if x0 >= x1 || y0 >= y1 {
+                return None;
+            }
+            let chunk = RectChunk {
+                x: x0,
+                y: y0,
+                width: x1 - x0,
+                height: y1 - y0,
+                offset,
+            };
+            offset += (chunk.width * chunk.height) as usize * texel as usize;
+            Some(chunk)
+        })
+    }
+
+    /// 本次上传的字节数（逐矩形钳到页内；整页 = `page² × texel`）。
+    ///
+    /// 必须与 [`pack_rects`] 的输出长度**逐字节一致**：后端用它校验载荷、测试用它断言放大倍数。
+    pub(crate) fn byte_count(&self, page: u32, texel: u32) -> usize {
+        self.chunks(page, texel)
+            .map(|chunk| (chunk.width * chunk.height) as usize * texel as usize)
             .sum()
     }
 
-    /// 标记 `[y0, y1)` 脏；相邻/重叠都合并；非法区间忽略；段数 > 8 折叠为整页（0..u32::MAX）。
-    pub(crate) fn mark(&mut self, y0: u32, y1: u32) {
-        if y0 >= y1 || self.is_full() {
-            return;
-        }
-        let mut start = y0;
-        let mut end = y1;
-        let mut out: Vec<Range<u32>> = Vec::with_capacity(self.spans.len() + 1);
-        for span in self.spans.drain(..) {
-            if span.end < start || span.start > end {
-                out.push(span);
-            } else {
-                start = start.min(span.start);
-                end = end.max(span.end);
-            }
-        }
-        out.push(start..end);
-        out.sort_by_key(|span| span.start);
-        if out.len() > 8 {
-            self.spans.clear();
-            self.spans.push(0..u32::MAX);
-        } else {
-            self.spans = out;
-        }
-    }
-
-    pub(crate) fn spans(&self) -> &[Range<u32>] {
-        &self.spans
+    /// 是否恰好覆盖整页（页换代之后「整页上传」的判据；整页哨兵也算）。
+    pub(crate) fn covers_page(&self, page: u32) -> bool {
+        let page = page.min(i32::MAX as u32) as i32;
+        self.rects
+            .iter()
+            .any(|rect| rect.x0 <= 0 && rect.y0 <= 0 && rect.x1 >= page && rect.y1 >= page)
     }
 
     /// 是否退化为「整页」。
+    ///
+    /// 只有 [`FULL_RECT`] 的右/下边是 `i32::MAX`（`PhysicalRect` 不变量保证不会超过它），
+    /// 因此「覆盖哨兵」等价于「左上不窄于哨兵、右下正好到哨兵」。
     pub(crate) fn is_full(&self) -> bool {
-        self.spans
-            .iter()
-            .any(|span| span.start == 0 && span.end == u32::MAX)
+        self.rects.iter().any(|rect| {
+            rect.x0 <= FULL_RECT.x0
+                && rect.y0 <= FULL_RECT.y0
+                && rect.x1 == FULL_RECT.x1
+                && rect.y1 == FULL_RECT.y1
+        })
     }
 
-    /// 没有任何脏行。
+    /// 没有任何脏矩形。
     pub(crate) fn is_empty(&self) -> bool {
-        self.spans.is_empty()
+        self.rects.is_empty()
     }
 
     pub(crate) fn clear(&mut self) {
-        self.spans.clear();
+        self.rects.clear();
     }
 
-    /// 合并另一份脏行（P05 把每轮 `take_dirty_rows` 的结果并入 `App::pending_dirty`）。
-    pub(crate) fn merge(&mut self, other: &mut DirtyRows) {
-        for span in other.spans.drain(..) {
-            self.mark(span.start, span.end);
+    /// 合并另一份脏矩形（P05 把每轮 `take_dirty_rects` 的结果并入 `App::pending_dirty`）。
+    pub(crate) fn merge(&mut self, other: &mut Self) {
+        let other = core::mem::take(other);
+        for rect in other.rects {
+            self.mark(rect);
         }
     }
 
-    /// 只读合并：把 `other` 的区间并进来，但不清空 `other`。
+    /// 只读合并：把 `other` 的矩形并进来，但不清空 `other`。
     ///
-    /// 图集页是进程级共享数据、纹理是每窗口一份：同一批脏行要分发给每个窗口的待发队列
-    /// （忙窗口攒着、空闲时补发），因此不能像 [`DirtyRows::merge`] 那样消费源。
-    pub(crate) fn merge_from(&mut self, other: &DirtyRows) {
-        for span in &other.spans {
-            self.mark(span.start, span.end);
+    /// 图集页是进程级共享数据、纹理是每窗口一份：同一批脏矩形要分发给每个窗口的待发队列
+    /// （忙窗口攒着、空闲时补发），因此不能像 [`DirtyRects::merge`] 那样消费源。
+    pub(crate) fn merge_from(&mut self, other: &Self) {
+        for rect in &other.rects {
+            self.mark(*rect);
         }
     }
+}
+
+/// `outer` 是否包含 `inner`（半开区间；相等也算包含）。
+fn contains(outer: PhysicalRect, inner: PhysicalRect) -> bool {
+    outer.x0 <= inner.x0 && outer.y0 <= inner.y0 && outer.x1 >= inner.x1 && outer.y1 >= inner.y1
+}
+
+/// 两个矩形是否**相交或相邻**（半开区间：`a.x1 == b.x0` 的边接触也算相邻）。
+fn touches(a: PhysicalRect, b: PhysicalRect) -> bool {
+    a.x0 <= b.x1 && b.x0 <= a.x1 && a.y0 <= b.y1 && b.y0 <= a.y1
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ATLAS_PAGE_STEPS, AtlasAllocator, DirtyRows, MAX_ATLAS_PAGE, MIN_ATLAS_PAGE};
-    use crate::paint::atlas::AtlasKind;
+    use super::{
+        ATLAS_PAGE_STEPS, AtlasAllocator, DirtyRects, MAX_ATLAS_PAGE, MIN_ATLAS_PAGE, RectChunk,
+        pack_rects,
+    };
+    use crate::{math::PhysicalRect, paint::atlas::AtlasKind};
 
     fn allocator() -> AtlasAllocator {
         AtlasAllocator::with_page(AtlasKind::Glyph, (64, 64))
@@ -526,57 +650,247 @@ mod tests {
         );
     }
 
+    /// 相邻（边接触）与重叠都合并成外接矩形；包含则忽略；不相交保留。
     #[test]
-    fn dirty_rows_merge_adjacent_and_fold_to_full() {
-        let mut rows = DirtyRows::default();
-        rows.mark(10, 20);
-        rows.mark(20, 30);
-        rows.mark(0, 5);
-        assert_eq!(rows.spans(), &[0..5, 10..30]);
-        assert!(!rows.is_full());
+    fn dirty_rects_merge_adjacent_and_ignore_contained_rects() {
+        let mut rects = DirtyRects::default();
+        // 相邻（边接触）+ 重叠 + 不相交：前两块并成 (0,10)..(16,20)，第三块独立。
+        rects.mark(PhysicalRect::new(0, 10, 8, 20));
+        rects.mark(PhysicalRect::new(8, 10, 16, 20));
+        rects.mark(PhysicalRect::new(0, 10, 16, 20));
+        rects.mark(PhysicalRect::new(100, 200, 108, 211));
+        assert_eq!(rects.rects().len(), 2);
+        assert_eq!(rects.rects()[0], PhysicalRect::new(0, 10, 16, 20));
+        assert_eq!(rects.rects()[1], PhysicalRect::new(100, 200, 108, 211));
+        assert!(!rects.is_full());
 
-        for index in 0..12u32 {
-            rows.mark(index * 8, index * 8 + 1);
+        // 被已有矩形包含 ⇒ 直接忽略（集合不增长，也没多出上传区域）。
+        rects.mark(PhysicalRect::new(2, 12, 6, 18));
+        assert_eq!(rects.rects().len(), 2);
+        assert_eq!(rects.byte_count(512, 1), 16 * 10 + 8 * 11);
+
+        // 与之相交的更大矩形会吸收它（外接矩形）。
+        rects.mark(PhysicalRect::new(-4, 8, 4, 12));
+        assert_eq!(rects.rects().len(), 2);
+        assert_eq!(rects.rects()[0], PhysicalRect::new(-4, 8, 16, 20));
+    }
+
+    #[test]
+    fn dirty_rects_fold_to_full_when_the_limit_is_exceeded_and_clear_empties() {
+        let mut rects = DirtyRects::default();
+        for index in 0..DirtyRects::MAX_RECTS {
+            let y = index as i32 * 16;
+            rects.mark(PhysicalRect::new(0, y, 4, y + 4));
+            assert_eq!(rects.rects().len(), index + 1, "第 {index} 块必须保留");
         }
-        assert!(rows.is_full(), "more than 8 spans folds to the whole page");
-        rows.clear();
-        assert!(rows.spans().is_empty());
+        assert!(!rects.is_full());
+        rects.mark(PhysicalRect::new(0, 4096, 4, 4100));
+        assert!(rects.is_full(), "超过 8 块折叠为整页哨兵");
+
+        rects.clear();
+        assert!(rects.is_empty());
+        assert!(rects.rects().is_empty());
     }
 
     #[test]
-    fn dirty_rows_ignore_invalid_ranges() {
-        let mut rows = DirtyRows::default();
-        rows.mark(10, 10);
-        rows.mark(20, 5);
-        assert!(rows.spans().is_empty());
+    fn empty_rects_are_ignored_and_an_empty_set_uploads_nothing() {
+        let mut rects = DirtyRects::default();
+        rects.mark(PhysicalRect::new(10, 10, 10, 20));
+        rects.mark(PhysicalRect::new(10, 20, 20, 20));
+        assert!(rects.is_empty());
+        assert_eq!(rects.byte_count(512, 1), 0);
+        assert_eq!(rects.chunks(512, 1).count(), 0);
+
+        // 空集合的打包输出是空的：调用方据此跳过 staging 分配 / copy 录制。
+        let page = vec![0u8; 512 * 512];
+        let mut out = vec![7u8; 4];
+        pack_rects(&page, 512, 1, &rects, &mut out);
+        assert!(out.is_empty());
     }
 
-    /// 同一批脏行要分发给多个窗口的待发队列：`merge_from` 不能消费源。
+    /// 同一批脏矩形要分发给多个窗口的待发队列：`merge_from` 不能消费源。
     #[test]
-    fn merge_from_keeps_the_source_spans() {
-        let mut source = DirtyRows::default();
-        source.mark(4, 8);
-        let mut first = DirtyRows::default();
-        let mut second = DirtyRows::default();
+    fn merge_from_keeps_the_source_rects() {
+        let mut source = DirtyRects::default();
+        source.mark(PhysicalRect::new(0, 4, 8, 8));
+        let mut first = DirtyRects::default();
+        let mut second = DirtyRects::default();
         first.merge_from(&source);
         second.merge_from(&source);
 
-        assert_eq!(first.spans().len(), 1);
-        assert_eq!(first.spans()[0], 4..8);
-        assert_eq!(second.spans().len(), 1);
-        assert_eq!(second.spans()[0], 4..8);
-        assert_eq!(source.spans().len(), 1, "分发之后源必须仍然完整");
-        assert_eq!(source.spans()[0], 4..8);
+        assert_eq!(first.rects(), source.rects());
+        assert_eq!(second.rects(), source.rects());
+        assert_eq!(source.rects().len(), 1, "分发之后源必须仍然完整");
         assert!(!source.is_empty());
+
+        // `merge` 是消费源的另一半契约：并进自己之后源清空。
+        first.merge(&mut source);
+        assert!(source.is_empty(), "merge 必须消费源");
+        assert_eq!(first.rects().len(), 1);
     }
 
+    /// 根因回归（R06-3）：`mark_written` 必须保留矩形的 x 区间。
+    ///
+    /// 旧实现只取 `y0..y1`，于是 8×11 的字形被放大成「11 整行 × 页宽」。这里直接断言分配出的
+    /// 内容矩形（位置 + 尺寸）就是脏矩形。
     #[test]
-    fn mark_written_feeds_dirty_rows_and_take_drains_them() {
+    fn mark_written_keeps_the_full_rect_not_just_the_rows() {
         let mut atlas = allocator();
-        let _ = atlas.allocate((5, 7)).expect("fits");
-        let rows = atlas.take_dirty_rows();
-        assert_eq!(rows.spans().len(), 1);
-        assert!(atlas.take_dirty_rows().spans().is_empty(), "take drains");
+        let allocation = atlas.allocate((5, 7)).expect("fits");
+        let rects = atlas.take_dirty_rects();
+        assert_eq!(rects.rects(), &[allocation.content]);
+        assert_eq!(
+            rects.rects()[0].x0,
+            allocation.content.x0,
+            "x 起点必须保留（旧实现丢掉 x0/x1）"
+        );
+        assert_eq!(rects.rects()[0].width(), 5, "宽度必须是内容宽，不是页宽");
+        assert!(atlas.take_dirty_rects().is_empty(), "take drains");
+    }
+
+    /// 字节下降定量断言（R06-3 的核心证据）：512² 字形页里写一个 8×11 字形。
+    ///
+    /// 旧「整页宽 × 行区间」语义：11 行 × 页宽 512 = 5632 B；AOI：8×11 = 88 B（**64 倍**）。
+    #[test]
+    fn an_eight_by_eleven_glyph_uploads_88_bytes_instead_of_5632() {
+        const PAGE: u32 = 512;
+        let mut rects = DirtyRects::default();
+        rects.mark(PhysicalRect::new(100, 200, 108, 211));
+        assert_eq!(rects.byte_count(PAGE, 1), 88, "AOI 字节数");
+        let legacy = 11 * PAGE as usize;
+        assert_eq!(legacy, 5632, "旧语义的行区间字节数");
+        assert_eq!(legacy / rects.byte_count(PAGE, 1), 64, "放大倍数");
+        // 页档越大放大越夸张：1024² 是 128 倍，2048² 字形页上同一字形要 11 × 2048 = 22528 B
+        // ⇒ 256 倍。台账的「单字形放大 220×」正落在这一区间内。
+        assert_eq!(11 * 1024 / rects.byte_count(1024, 1), 128);
+        assert_eq!(11 * 2048 / rects.byte_count(2048, 1), 256);
+
+        // 打包输出长度 = 字节计数，且内容只来自该矩形（按行紧密排列）。
+        let mut page = vec![0u8; (PAGE * PAGE) as usize];
+        for y in 200..211usize {
+            for x in 100..108usize {
+                page[y * PAGE as usize + x] = 0xAB;
+            }
+        }
+        let mut out = Vec::new();
+        pack_rects(&page, PAGE, 1, &rects, &mut out);
+        assert_eq!(out.len(), 88);
+        assert!(out.iter().all(|byte| *byte == 0xAB));
+
+        // 三个后端用的 chunk 视图：一个 8×11 的 AOI 区域、偏移 0。
+        let chunks: Vec<RectChunk> = rects.chunks(PAGE, 1).collect();
+        assert_eq!(
+            chunks,
+            vec![RectChunk {
+                x: 100,
+                y: 200,
+                width: 8,
+                height: 11,
+                offset: 0,
+            }]
+        );
+    }
+
+    /// 图片页同法：16×16 的 BGRA8 图片（512² 页）。
+    ///
+    /// 旧语义：16 行 × 页宽 512 × 4 B = 32768 B；AOI：16×16×4 = 1024 B（**32 倍**）。
+    #[test]
+    fn a_sixteen_by_sixteen_image_uploads_1024_bytes_instead_of_32768() {
+        const PAGE: u32 = 512;
+        const TEXEL: u32 = 4;
+        let mut rects = DirtyRects::default();
+        rects.mark(PhysicalRect::new(64, 128, 80, 144));
+        let bytes = rects.byte_count(PAGE, TEXEL);
+        assert_eq!(bytes, 16 * 16 * 4);
+        let legacy = 16 * PAGE as usize * TEXEL as usize;
+        assert_eq!(legacy, 32768);
+        assert_eq!(legacy / bytes, 32, "放大倍数");
+
+        let mut page = vec![0u8; (PAGE * PAGE) as usize * TEXEL as usize];
+        for y in 128..144usize {
+            for x in 64..80usize {
+                let start = (y * PAGE as usize + x) * TEXEL as usize;
+                page[start..start + 4].copy_from_slice(&[0x11, 0x22, 0x33, 0xFF]);
+            }
+        }
+        let mut out = Vec::new();
+        pack_rects(&page, PAGE, TEXEL, &rects, &mut out);
+        assert_eq!(out.len(), bytes);
+        // 行内只拷 width × texel 字节：每行开头就是图片第一行第一个纹素。
+        assert_eq!(&out[..4], &[0x11, 0x22, 0x33, 0xFF]);
+        assert_eq!(&out[16 * 4 - 4..16 * 4], &[0x11, 0x22, 0x33, 0xFF]);
+    }
+
+    /// 多矩形打包布局与 `chunks` 的偏移逐个对应（后端按它做逐矩形 copy）。
+    #[test]
+    fn multi_rect_packing_matches_the_chunk_offsets() {
+        const PAGE: u32 = 64;
+        let mut rects = DirtyRects::default();
+        rects.mark(PhysicalRect::new(0, 10, 8, 12)); // 8×2 = 16 B
+        rects.mark(PhysicalRect::new(20, 10, 24, 13)); // 4×3 = 12 B
+        rects.mark(PhysicalRect::new(40, 40, 48, 41)); // 8×1 = 8 B
+        let mut out = Vec::new();
+        pack_rects(
+            &vec![0xFFu8; (PAGE * PAGE) as usize],
+            PAGE,
+            1,
+            &rects,
+            &mut out,
+        );
+        assert_eq!(out.len(), rects.byte_count(PAGE, 1));
+        assert_eq!(out.len(), 36);
+        let chunks: Vec<RectChunk> = rects.chunks(PAGE, 1).collect();
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.offset).collect::<Vec<_>>(),
+            vec![0, 16, 28]
+        );
+    }
+
+    /// 整页哨兵：`full()` 覆盖全页、`byte_count` 等于整页字节、打包输出就是整页。
+    #[test]
+    fn the_full_sentinel_uploads_exactly_one_page() {
+        let rects = DirtyRects::full();
+        assert!(rects.is_full());
+        assert!(rects.covers_page(512));
+        assert_eq!(rects.byte_count(512, 1), 512 * 512);
+        assert_eq!(rects.byte_count(512, 4), 512 * 512 * 4);
+        assert_eq!(
+            rects.chunks(512, 1).collect::<Vec<_>>(),
+            vec![RectChunk {
+                x: 0,
+                y: 0,
+                width: 512,
+                height: 512,
+                offset: 0,
+            }]
+        );
+        let page = vec![0x5Au8; 512 * 512];
+        let mut out = Vec::new();
+        pack_rects(&page, 512, 1, &rects, &mut out);
+        assert_eq!(out, page);
+    }
+
+    /// 越页矩形被钳到页内（脏矩形来自分配器，理论上总在页内；钳位是后端的最后防线）。
+    #[test]
+    fn chunks_clamp_rects_to_the_page() {
+        let mut rects = DirtyRects::default();
+        rects.mark(PhysicalRect::new(-4, -4, 6, 6));
+        assert_eq!(
+            rects.chunks(512, 1).collect::<Vec<_>>(),
+            vec![RectChunk {
+                x: 0,
+                y: 0,
+                width: 6,
+                height: 6,
+                offset: 0,
+            }]
+        );
+        assert_eq!(rects.byte_count(512, 1), 36);
+
+        let mut off_page = DirtyRects::default();
+        off_page.mark(PhysicalRect::new(600, 600, 700, 700));
+        assert_eq!(off_page.byte_count(512, 1), 0, "页外矩形不上传");
+        assert_eq!(off_page.chunks(512, 1).count(), 0);
     }
 
     #[test]

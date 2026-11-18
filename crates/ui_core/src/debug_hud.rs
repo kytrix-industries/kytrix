@@ -14,6 +14,7 @@ use smol_str::{SmolStr, format_smolstr};
 use crate::{
     a11y::A11yOverride,
     error::EngineError,
+    layout::hit_test::HitShape,
     math::{Rect, Size},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
@@ -91,8 +92,9 @@ pub(crate) struct DebugHudMetrics {
     pub present_time: Option<Duration>,
     /// UI 发布 → 本帧反馈给出的延迟（`FrameFeedback::latency`；窗口路径只有落后 ≤1 帧的值）。
     ///
-    /// 口径按后端：Windows / Linux 是「发布 → **GPU 完成**」；macOS 是「发布 → **真实呈现**」
-    /// （`MTLDrawable.presentedTime`，拿不到时退回 GPU 完成）。HUD 的 `Latency` 一行就显示它。
+    /// **三端同义**：都是「发布 → **GPU 工作完成**」（`FrameFeedback::completed_at`），不是上屏
+    /// 时刻。真实上屏时刻由 `FrameFeedback::presented_at` 单独承载（macOS 上是 display link 的
+    /// tick 推断值；Windows / Linux 没有可信来源 ⇒ 恒为 `None`），本 HUD 不显示它。
     pub latency: Option<Duration>,
     /// 实际发出的 draw call 数。
     pub draw_calls: u32,
@@ -169,7 +171,7 @@ pub(crate) fn install(window: &mut Window, now: Instant) -> Result<DebugHudState
     let panel = NodeBuilder::boxed()
         .style(panel_style())
         .paint(panel_paint())
-        .hit_shape(|_| false)
+        .hit_shape(HitShape::custom(|_| false))
         .a11y(hidden())
         .id("debug-hud")
         .build(tree, root)?;
@@ -180,7 +182,7 @@ pub(crate) fn install(window: &mut Window, now: Instant) -> Result<DebugHudState
     for index in 0..LINES {
         let built = NodeBuilder::text(initial[index].clone(), style.clone())
             .layout_override(line_rect(index))
-            .hit_shape(|_| false)
+            .hit_shape(HitShape::custom(|_| false))
             .a11y(hidden())
             .id(LINE_IDS[index])
             .build(tree, panel);

@@ -1,4 +1,4 @@
-//! 图集纹理：字形 `R8Unorm` + 图片 `BGRA8Unorm_sRGB`，脏行上传（`design/phase-12-macos-linux.md` §5.5）。
+//! 图集纹理：字形 `R8Unorm` + 图片 `BGRA8Unorm_sRGB`，脏矩形（AOI）上传（`design/phase-12-macos-linux.md` §5.5）。
 //!
 //! 像素来源由上层持有（P05 §10.6 的定案：渲染层不保 CPU 副本）；本模块只做
 //! 「staging 写 → blit 到纹理」与「generation 变化时整页重传」。
@@ -22,7 +22,7 @@ use crate::{
     error::EngineError,
     paint::atlas::AtlasKind,
     render::{
-        atlas::{AtlasRebuilt, DirtyRows, MAX_RESIDENT_STAGING_BYTES, texel_bytes},
+        atlas::{AtlasRebuilt, DirtyRects, MAX_RESIDENT_STAGING_BYTES, RectChunk, texel_bytes},
         frame::MAX_FRAMES_IN_FLIGHT,
         macos::{
             device::{Device, GpuObject, init_error},
@@ -34,6 +34,20 @@ use crate::{
 
 /// 初始化时的占位页（1×1）：让参数缓冲里的图集纹理在第一次上传之前也有效。
 const PLACEHOLDER_PAGE: u32 = 1;
+
+/// staging 的每块起点 / 行 pitch 的对齐：Metal 的 buffer→texture 拷要求行 pitch 是像素尺寸的
+/// 倍数，4 对齐对 `R8Unorm`（1 B）与 `BGRA8Unorm_sRGB`（4 B）都成立。
+const METAL_STAGING_ALIGNMENT: usize = 4;
+
+/// 一个 AOI 矩形在本帧 staging 里的落点。
+#[derive(Clone, Copy)]
+struct MetalRect {
+    chunk: RectChunk,
+    /// staging 里的起始字节偏移（[`METAL_STAGING_ALIGNMENT`] 对齐）。
+    offset: usize,
+    /// staging 里该矩形的行 pitch（字节，[`METAL_STAGING_ALIGNMENT`] 对齐）。
+    row_pitch: usize,
+}
 
 /// 一张图集页。
 struct AtlasTexture {
@@ -55,13 +69,13 @@ struct StagingBuffer {
     capacity: usize,
 }
 
-/// 待上传的行区间（一帧内多次 `queue_upload` 取并集）+ 该页的页尺寸。
+/// 待上传的脏矩形（一帧内多次 `queue_upload` 取并集）+ 该页的页尺寸。
 #[derive(Debug)]
 struct PendingUpload {
     page: u32,
-    /// `rows` 顺序紧密打包的行（整页上传时就是整页）。
+    /// `rects` 顺序逐矩形紧密打包的字节（整页上传时就是整页）。
     pixels: Vec<u8>,
-    rows: DirtyRows,
+    rects: DirtyRects,
 }
 
 /// 两张页（字形 / 图片）。
@@ -90,33 +104,31 @@ impl AtlasTextures {
         }
     }
 
-    /// 登记一次脏行上传（`pixels` 是 `rows` 顺序紧密打包的行，DEVIATIONS F-211）。
+    /// 登记一次脏矩形上传（`pixels` 是 `rects` 顺序逐矩形紧密打包的字节，R06-3）。
     ///
-    /// 长度必须等于 `行数 × page × texel`（release 也硬断言：越界读会读穿堆）。
+    /// 长度必须等于 [`DirtyRects::byte_count`]（release 也硬断言：越界读会读穿堆）。
     pub(crate) fn queue_upload(
         &mut self,
         kind: AtlasKind,
         page: u32,
         pixels: Vec<u8>,
-        rows: DirtyRows,
+        rects: DirtyRects,
     ) {
-        let row_bytes = page as usize * texel_bytes(kind) as usize;
-        let expected = rows.row_count(page) as usize * row_bytes;
+        let expected = rects.byte_count(page, texel_bytes(kind));
         assert_eq!(
             pixels.len(),
             expected,
-            "atlas payload size mismatch for {kind:?}: expected {expected} bytes for {} rows of a {page}² page, got {}",
-            rows.row_count(page),
+            "atlas payload size mismatch for {kind:?}: expected {expected} bytes for the dirty rects of a {page}² page, got {}",
             pixels.len()
         );
         let texture = match kind {
             AtlasKind::Glyph => &mut self.glyph,
             AtlasKind::Image => &mut self.image,
         };
-        texture.queue_upload(page, pixels, rows);
+        texture.queue_upload(page, pixels, rects);
     }
 
-    /// 本帧是否有待上传的行。
+    /// 本帧是否有待上传的矩形。
     pub(crate) fn has_pending(&self) -> bool {
         self.glyph.pending.is_some() || self.image.pending.is_some()
     }
@@ -162,7 +174,7 @@ impl AtlasTextures {
         Ok(rebuilt)
     }
 
-    /// 把待上传的行写进本帧的 staging 并编码 blit（必须在一帧的 command buffer 里调用）。
+    /// 把待上传的矩形写进本帧的 staging 并编码 blit（必须在一帧的 command buffer 里调用）。
     ///
     /// 小上传复用该帧槽的常驻缓冲（覆盖写安全：上一帧已完成）；超过 1 MiB 的整页上传临时
     /// 分配一块缓冲并以本帧的 `sequence`（`u64` 提交序号）进入 retire 队列（F-216），不会覆盖
@@ -204,8 +216,8 @@ impl AtlasTexture {
         })
     }
 
-    fn queue_upload(&mut self, page: u32, pixels: Vec<u8>, rows: DirtyRows) {
-        if rows.spans().is_empty() {
+    fn queue_upload(&mut self, page: u32, pixels: Vec<u8>, rects: DirtyRects) {
+        if rects.is_empty() {
             return;
         }
         assert!(
@@ -213,10 +225,17 @@ impl AtlasTexture {
             "atlas payload slot must be consumed before the next upload ({:?})",
             self.kind
         );
-        self.pending = Some(PendingUpload { page, pixels, rows });
+        self.pending = Some(PendingUpload {
+            page,
+            pixels,
+            rects,
+        });
     }
 
-    /// 把打包好的脏行写进**本帧槽的常驻 staging**、逐段编码 buffer→texture blit。
+    /// 把打包好的脏矩形写进**本帧槽的常驻 staging**、逐矩形编码 buffer→texture blit。
+    ///
+    /// AOI（R06-3）：每个脏矩形一次 `copyFromBuffer`，`MTLSize` 与 `MTLOrigin` 都取矩形自己的
+    /// `(w, h)` 与 `(x, y)`；staging 的行 pitch 是**矩形宽**（不是页宽）。
     fn record_upload(
         &mut self,
         device: &mut Device,
@@ -235,40 +254,34 @@ impl AtlasTexture {
             "page changes must be applied by AtlasTextures::prepare before recording"
         );
         // 重建过纹理的那一帧必须是整页上传（新纹理内容未定义）。
-        // 覆盖整页的脏行等价于整页上传（`mark(0, page)` 与 `mark(0, u32::MAX)` 都接受）。
-        let covers_page =
-            pending.rows.is_full() || pending.rows.spans() == std::slice::from_ref(&(0..self.page));
+        // 覆盖整页的脏矩形等价于整页上传（哨兵与整页矩形都接受）。
         assert!(
-            !force_full || covers_page,
+            !force_full || pending.rects.covers_page(self.page),
             "a rebuilt atlas page must be uploaded as a full page"
         );
-        let full = 0..self.page;
-        let spans: &[std::ops::Range<u32>] = if pending.rows.is_full() {
-            std::slice::from_ref(&full)
-        } else {
-            pending.rows.spans()
-        };
-        let row_bytes = (self.page * texel_bytes(kind)) as usize;
-        // 行必须落在页内：`pack_rows` / `row_count` 已按页钳过长度，这里若还越页说明打包
-        // 缓冲与行描述不是同一份数据，按契约错误立刻失败（否则下面的 `ptr::copy` 会读到
-        // `pending.pixels` 之外）。
-        let total_rows: u32 = spans
-            .iter()
-            .map(|span| {
-                assert!(
-                    span.start < span.end && span.end <= self.page,
-                    "atlas dirty span {span:?} is outside the {}-row page",
-                    self.page
-                );
-                span.end - span.start
-            })
-            .sum();
-        if total_rows == 0 {
+        let texel = texel_bytes(kind) as usize;
+        let chunks: Vec<RectChunk> = pending.rects.chunks(self.page, texel_bytes(kind)).collect();
+        if chunks.is_empty() {
+            // 空集合 = 零上传：不分配 staging、不编码 blit。
             return Ok(());
+        }
+        // staging 布局：每块起点与行 pitch 都按 [`METAL_STAGING_ALIGNMENT`] 对齐
+        // （Metal 的 buffer→texture 拷要求行 pitch 是像素尺寸的倍数），块内行紧密排列。
+        let mut layout = Vec::with_capacity(chunks.len());
+        let mut length = 0usize;
+        for chunk in chunks {
+            let row_pitch =
+                (chunk.width as usize * texel).next_multiple_of(METAL_STAGING_ALIGNMENT);
+            let offset = length.next_multiple_of(METAL_STAGING_ALIGNMENT);
+            length = offset + chunk.height as usize * row_pitch;
+            layout.push(MetalRect {
+                chunk,
+                offset,
+                row_pitch,
+            });
         }
         // 小上传复用每槽常驻 staging；整页级的大上传用一次性缓冲（本帧后 retire），
         // 常驻容量不随页尺寸放大（DEVIATIONS F-216）。
-        let length = total_rows as usize * row_bytes;
         let staging = if length as u64 <= MAX_RESIDENT_STAGING_BYTES {
             self.ensure_staging(device, queue, sequence, slot, length)?;
             self.staging[slot]
@@ -291,45 +304,49 @@ impl AtlasTexture {
             queue.retire(sequence, handle);
             buffer
         };
-        let mut staging_row = 0u32;
-        let mut packed_row = 0u32;
-        for span in spans {
-            let rows = span.end - span.start;
-            let source = packed_row as usize * row_bytes;
-            let destination = staging_row as usize * row_bytes;
-            // SAFETY: staging 恰为全部段的总字节数；源切片长度由整页断言 + 页内行断言保证。
+        for rect in &layout {
+            let width_bytes = rect.chunk.width as usize * texel;
+            // SAFETY: staging 容量 = 全部块的 `offset + height × row_pitch`；源切片长度由
+            // `queue_upload` 的 `byte_count` 断言保证，`chunk.offset` 是打包布局里的真实偏移。
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    pending.pixels.as_ptr().add(source),
-                    staging.contents().as_ptr().cast::<u8>().add(destination),
-                    rows as usize * row_bytes,
-                );
+                for row in 0..rect.chunk.height as usize {
+                    std::ptr::copy_nonoverlapping(
+                        pending
+                            .pixels
+                            .as_ptr()
+                            .add(rect.chunk.offset + row * width_bytes),
+                        staging
+                            .contents()
+                            .as_ptr()
+                            .cast::<u8>()
+                            .add(rect.offset + row * rect.row_pitch),
+                        width_bytes,
+                    );
+                }
             }
-            // SAFETY: blit 的源是本函数独占的 staging（容量覆盖本段），目标是本结构的纹理；
-            // 尺寸与 offset 在两者边界内。
+            // SAFETY: blit 的源是本函数独占的 staging（容量覆盖本块），目标是本结构的纹理；
+            // 尺寸与 origin 在两者边界内（`chunks` 已把矩形钳进页）。
             unsafe {
                 encoder.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
                     &staging,
-                    destination,
-                    row_bytes,
-                    rows as usize * row_bytes,
+                    rect.offset,
+                    rect.row_pitch,
+                    rect.chunk.height as usize * rect.row_pitch,
                     MTLSize {
-                        width: self.page as usize,
-                        height: rows as usize,
+                        width: rect.chunk.width as usize,
+                        height: rect.chunk.height as usize,
                         depth: 1,
                     },
                     &self.texture,
                     0,
                     0,
                     MTLOrigin {
-                        x: 0,
-                        y: span.start as usize,
+                        x: rect.chunk.x as usize,
+                        y: rect.chunk.y as usize,
                         z: 0,
                     },
                 );
             }
-            staging_row += rows;
-            packed_row += rows;
         }
         Ok(())
     }
@@ -431,7 +448,7 @@ mod tests {
     use crate::{
         paint::atlas::AtlasKind,
         render::{
-            atlas::DirtyRows,
+            atlas::DirtyRects,
             macos::{
                 device::Device,
                 queue::{InFlight, Queue},
@@ -466,10 +483,20 @@ mod tests {
         image.rgba8[start..start + 4].try_into().expect("4 bytes")
     }
 
-    fn rows(y0: u32, y1: u32) -> DirtyRows {
-        let mut rows = DirtyRows::default();
-        rows.mark(y0, y1);
-        rows
+    fn rows(y0: u32, y1: u32) -> DirtyRects {
+        let mut rects = DirtyRects::default();
+        rects.mark(crate::math::PhysicalRect::new(
+            0,
+            y0 as i32,
+            i32::MAX,
+            y1 as i32,
+        ));
+        rects
+    }
+
+    /// 整页哨兵（新窗口 / 页尺寸变化的载荷）。
+    fn full_rects() -> DirtyRects {
+        DirtyRects::full()
     }
 
     /// P1 回归：两帧在飞时各自持有自己的 staging。
@@ -485,7 +512,7 @@ mod tests {
         let mut atlas = AtlasTextures::new(&mut device).expect("atlas");
 
         // 第 1 帧：整页上传（新页必须整页，DEVIATIONS F-211），内容全零。
-        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, page(), rows(0, u32::MAX));
+        atlas.queue_upload(AtlasKind::Image, TEST_PAGE, page(), full_rects());
         let slot_full = queue.try_acquire().expect("upload slot full");
         let command_full = queue.begin().expect("command full");
         atlas

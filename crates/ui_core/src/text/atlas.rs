@@ -1,7 +1,7 @@
 //! 字形 `key → AtlasTile` 缓存（P05 §10）：保证每个字形只光栅化一次。
 //!
 //! 与 [`crate::render::atlas::AtlasAllocator`] 的分工：本模块**做缓存 + 驱动光栅**，分配器只做装箱 +
-//! 脏行 + 代际。图集 `clear()` 后必须同步 [`GlyphAtlas::clear`]（两级缓存同事务换代）。
+//! 脏矩形 + 代际。图集 `clear()` 后必须同步 [`GlyphAtlas::clear`]（两级缓存同事务换代）。
 //!
 //! # 容量策略：逐 tile LRU，不丢帧（R12-1，对齐 Skia `SkStrikeCache` / WebRender `GlyphCache`）
 //!
@@ -381,35 +381,39 @@ impl GlyphAtlas {
     /// 把所有 tile 的覆盖度写进整页缓冲区（`R8`、行主序、页宽 `page_width`）。
     ///
     /// 只在「整页要重传」的帧调用（新窗口 / 页尺寸变化 / 图集清空）；增量帧走
-    /// [`GlyphAtlas::write_rows`]，只碰脏行覆盖到的字形（DEVIATIONS F-211）。
+    /// [`GlyphAtlas::write_rows`]，只碰脏矩形覆盖到的字形（DEVIATIONS F-211 / R06-3）。
     pub(crate) fn write_page(&self, page: &mut [u8], page_width: u32) {
         for record in self.records.values() {
             write_record_rows(page, page_width, record, 0, record.height);
         }
     }
 
-    /// 只把 `rows` 覆盖到的字形行写进整页缓冲区（增量上传的 CPU 侧）。
+    /// 只把 `rects` 覆盖到的字形行写进整页缓冲区（增量上传的 CPU 侧）。
     ///
-    /// 与 [`GlyphAtlas::write_page`] 的区别：不重写整张页，代价随**脏行数**而不是字形总数
-    /// 增长（2000 个字形的窗口打一个字不再整页重写）。
+    /// 与 [`GlyphAtlas::write_page`] 的区别：不重写整张页，代价随**脏矩形数**而不是字形总数
+    /// 增长（2000 个字形的窗口打一个字不再整页重写）。每个字形记录按自身 x 区间落位，因此
+    /// 只需要判断「记录的 y 区间是否与脏矩形的 y 区间相交」：相交就重写该行的完整记录内容
+    /// （幂等，且不外扩脏矩形）。
     pub(crate) fn write_rows(
         &self,
         page: &mut [u8],
         page_width: u32,
-        rows: &crate::render::DirtyRows,
+        rects: &crate::render::DirtyRects,
     ) {
-        if rows.is_full() {
-            self.write_page(page, page_width);
-            return;
-        }
         for record in self.records.values() {
             let record_y0 = record.origin.1;
             let record_y1 = record_y0 + record.height;
-            for span in rows.spans() {
-                let start = span.start.max(record_y0).min(record_y1);
-                let end = span.end.max(record_y0).min(record_y1);
+            for rect in rects.rects() {
+                let start = rect.y0.max(record_y0 as i32).min(record_y1 as i32);
+                let end = rect.y1.max(record_y0 as i32).min(record_y1 as i32);
                 if start < end {
-                    write_record_rows(page, page_width, record, start - record_y0, end - record_y0);
+                    write_record_rows(
+                        page,
+                        page_width,
+                        record,
+                        (start - record_y0 as i32) as u32,
+                        (end - record_y0 as i32) as u32,
+                    );
                 }
             }
         }

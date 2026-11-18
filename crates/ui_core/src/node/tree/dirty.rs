@@ -68,12 +68,16 @@ pub(crate) fn mark_structure(tree: &mut NodeTree, node: NodeId) -> bool {
 // 消费者：`impl NodeTree::mark_subtree_paint` 的薄委托（外部调用点见该方法文档）。
 /// 整棵子树标 `PAINT | A11Y`（并清 `REUSABLE`）—— 重挂后绘制顺序与 a11y 父链都可能变化
 /// （消费者：`append_child`；`A11Y` 是 P11 追加，见 `design/phase-11-a11y.md` §6.4）。
-pub(crate) fn mark_subtree_paint(tree: &mut NodeTree, node: NodeId) {
+pub(crate) fn mark_subtree_paint(tree: &mut NodeTree, node: NodeId) -> usize {
     let mut ids: Vec<NodeId> = Vec::new();
     tree.for_each_subtree(node, |id| ids.push(id));
+    let mut touched = 0;
     for id in ids {
-        let _ = tree.touch(id, DirtyFlags::PAINT | DirtyFlags::A11Y);
+        if tree.touch(id, DirtyFlags::PAINT | DirtyFlags::A11Y) {
+            touched += 1;
+        }
     }
+    touched
 }
 
 // 消费者：`impl NodeTree::clear_bind` 的薄委托（外部调用点见该方法文档）。

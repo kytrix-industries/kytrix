@@ -19,14 +19,295 @@
 //!
 //! 设计见 `design/phase-04-layout.md` §12。
 
+use std::sync::Arc;
+
 use crate::{
-    math::{Point, Rect, Transform},
+    math::{Point, Rect, Size, Transform},
     node::{id::NodeId, tree::NodeTree},
     paint::style::Clip,
 };
 
 /// clip 栈深度上限：**复用** `paint::scene::MAX_CLIP_DEPTH`（`u8`，值 8），不新增第四份常量。
 const MAX_CLIP_DEPTH: usize = crate::paint::scene::MAX_CLIP_DEPTH as usize;
+
+/// 节点命中形状（节点 border box **局部坐标**，逻辑像素）。
+///
+/// R04-8：命中区域从"调用方自造闭包"升级为**可表达的数据**（CSS `clip-path` /
+/// `pointer-events` 与 Skia 的路径命中）：形状可枚举、可缓存/共享（`Arc`）、可被 a11y 复用。
+/// 绘制与命中共用同一份圆角规范化（`paint::instance::normalize_corner_radius`），不会出现
+/// "画得出、点不到"的第二套真相。
+///
+/// # 语义
+///
+/// - 坐标空间 = 目标节点 border box 局部坐标（原点 = 节点左上角，与 [`HitResult::local_point`]
+///   和 `GeometryDraw` 的局部空间相同）；
+/// - 判定口径是半开区间 `[min, max)`（与 [`Rect::contains`] 一致）；非有限点恒 `false`（C13）；
+/// - 形状**可以超出布局盒**：命中剪枝用 `布局盒 ∪ 形状 AABB`，且该包络已并入
+///   `subtree_bounds`（见 `node::tree::layout`）。这是"画布内容画在节点盒之外仍可命中"的
+///   表达力（旧 `Fn(Point) -> bool` 只能把命中**缩小**到布局盒以内）；
+/// - 未设置命中形状的节点等价于 `Rect(布局盒)`（旧行为不变）。
+///
+/// # 逃生舱
+///
+/// [`HitShape::Custom`] 保留任意谓词（动画/外部状态相关、无法静态表达的形状）。它是
+/// **过滤器**：谓词的 AABB 未知，因此自定义形状仍以布局盒为剪枝边界（不扩大命中范围）。
+#[derive(Clone)]
+pub enum HitShape {
+    /// 轴对齐矩形（局部坐标；可超出布局盒）。
+    Rect(Rect),
+    /// 圆角矩形（CSS `border-radius` 语义，四角半径 `[tl, tr, br, bl]`）。
+    RoundedRect { rect: Rect, corner_radius: [f32; 4] },
+    /// 圆（圆心 + 半径，局部坐标）。
+    Circle { center: Point, radius: f32 },
+    /// 椭圆（中心 + 半轴，局部坐标）。
+    Ellipse { center: Point, radius: Size },
+    /// 多边形路径（局部坐标顶点环，首尾隐式闭合；even-odd 填充规则，与 SVG `fill-rule`
+    /// 的 `fill-rule: evenodd` 一致）。
+    Path {
+        points: Arc<[Point]>,
+        /// 构造时算好的局部 AABB（命中剪枝每帧都要读，不在热路径上重算顶点）。
+        bounds: Rect,
+    },
+    /// 逃生舱：任意谓词（局部坐标）。命中范围仍以布局盒剪枝。
+    Custom(Arc<dyn Fn(Point) -> bool>),
+}
+
+impl HitShape {
+    /// 由任意谓词构造逃生舱形状。
+    pub fn custom(predicate: impl Fn(Point) -> bool + 'static) -> Self {
+        Self::Custom(Arc::new(predicate))
+    }
+
+    /// 由顶点环构造多边形路径；少于 3 个点 / 含非有限点 ⇒ 空路径（永不命中）。
+    #[must_use]
+    pub fn path(points: impl Into<Arc<[Point]>>) -> Self {
+        let points: Arc<[Point]> = points.into();
+        let bounds = if points.len() >= 3 && points.iter().all(|point| point.is_finite()) {
+            let mut min = Point::new(f32::INFINITY, f32::INFINITY);
+            let mut max = Point::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
+            for point in points.iter() {
+                min.x = min.x.min(point.x);
+                min.y = min.y.min(point.y);
+                max.x = max.x.max(point.x);
+                max.y = max.y.max(point.y);
+            }
+            Rect::new(min.x, min.y, max.x - min.x, max.y - min.y)
+        } else {
+            Rect::default()
+        };
+        Self::Path { points, bounds }
+    }
+
+    /// 形状的局部 AABB（`None` = 无法静态得知，仅 [`HitShape::Custom`]）。
+    ///
+    /// 消费者：命中剪枝（`bounds ∪ 形状 AABB`）、`subtree_bounds` 维护、a11y 几何。
+    #[must_use]
+    pub fn bounds(&self) -> Option<Rect> {
+        match self {
+            Self::Rect(rect) => Some(*rect),
+            Self::RoundedRect { rect, .. } => Some(*rect),
+            Self::Circle { center, radius } => {
+                let radius = *radius;
+                Some(Rect::new(
+                    center.x - radius,
+                    center.y - radius,
+                    radius * 2.0,
+                    radius * 2.0,
+                ))
+            }
+            Self::Ellipse { center, radius } => Some(Rect::new(
+                center.x - radius.width,
+                center.y - radius.height,
+                radius.width * 2.0,
+                radius.height * 2.0,
+            )),
+            Self::Path { bounds, .. } => Some(*bounds),
+            Self::Custom(_) => None,
+        }
+    }
+
+    /// 局部坐标点是否在形状内（命中、a11y 与 `interactive` 判定的**唯一**判据）。
+    ///
+    /// 非有限点 / 非有限形状 / 负半径 / 空路径恒 `false`（C13：NaN 永不命中）。
+    #[must_use]
+    pub fn contains(&self, point: Point) -> bool {
+        if !point.is_finite() {
+            return false;
+        }
+        match self {
+            Self::Rect(rect) => rect.contains(point),
+            Self::RoundedRect {
+                rect,
+                corner_radius,
+            } => rounded_rect_contains(*rect, *corner_radius, point),
+            Self::Circle { center, radius } => {
+                let radius = *radius;
+                if !radius.is_finite() || radius <= 0.0 || !center.is_finite() {
+                    return false;
+                }
+                let dx = point.x - center.x;
+                let dy = point.y - center.y;
+                dx * dx + dy * dy <= radius * radius
+            }
+            Self::Ellipse { center, radius } => {
+                let (rx, ry) = (radius.width, radius.height);
+                if !rx.is_finite() || !ry.is_finite() || rx <= 0.0 || ry <= 0.0 {
+                    return false;
+                }
+                let nx = (point.x - center.x) / rx;
+                let ny = (point.y - center.y) / ry;
+                nx * nx + ny * ny <= 1.0
+            }
+            Self::Path { points, bounds } => {
+                // even-odd 射线法：`(a.y > p.y) != (b.y > p.y)` 的半开边规则避免顶点重复计数。
+                if points.len() < 3 || bounds.is_empty() || !bounds.contains(point) {
+                    return false;
+                }
+                let mut inside = false;
+                for index in 0..points.len() {
+                    let a = points[index];
+                    let b = points[(index + 1) % points.len()];
+                    if (a.y > point.y) != (b.y > point.y) {
+                        let t = (point.y - a.y) / (b.y - a.y);
+                        if point.x < a.x + t * (b.x - a.x) {
+                            inside = !inside;
+                        }
+                    }
+                }
+                inside
+            }
+            Self::Custom(predicate) => predicate(point),
+        }
+    }
+}
+
+/// 圆角矩形包含判定：布局盒内，且落在四个角框里的点必须在角圆弧内。
+///
+/// 圆角半径复用绘制侧的 `normalize_corner_radius`（CSS 规则 + SDF 合法域 clamp），
+/// 因此命中与绘制对同一个 `corner_radius` 得到同一个轮廓（R05-8 的唯一规范化）。
+fn rounded_rect_contains(rect: Rect, corner_radius: [f32; 4], point: Point) -> bool {
+    if !rect.contains(point) {
+        return false;
+    }
+    let (width, height) = (rect.size.width, rect.size.height);
+    let radii = crate::paint::instance::normalize_corner_radius(corner_radius, width, height);
+    let local = Point::new(point.x - rect.origin.x, point.y - rect.origin.y);
+    // CSS 顺序 [tl, tr, br, bl]；角圆心在各自的内角点上。
+    let corners = [
+        (0.0, 0.0, radii[0]),
+        (width, 0.0, radii[1]),
+        (width, height, radii[2]),
+        (0.0, height, radii[3]),
+    ];
+    for (cx, cy, radius) in corners {
+        if radius <= 0.0 {
+            continue;
+        }
+        let in_corner_box = (if cx == 0.0 {
+            local.x < radius
+        } else {
+            local.x > width - radius
+        }) && (if cy == 0.0 {
+            local.y < radius
+        } else {
+            local.y > height - radius
+        });
+        if !in_corner_box {
+            continue;
+        }
+        let center_x = if cx == 0.0 { radius } else { width - radius };
+        let center_y = if cy == 0.0 { radius } else { height - radius };
+        let dx = local.x - center_x;
+        let dy = local.y - center_y;
+        if dx * dx + dy * dy > radius * radius {
+            return false;
+        }
+    }
+    true
+}
+
+impl std::fmt::Debug for HitShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rect(rect) => f.debug_tuple("Rect").field(rect).finish(),
+            Self::RoundedRect {
+                rect,
+                corner_radius,
+            } => f
+                .debug_struct("RoundedRect")
+                .field("rect", rect)
+                .field("corner_radius", corner_radius)
+                .finish(),
+            Self::Circle { center, radius } => f
+                .debug_struct("Circle")
+                .field("center", center)
+                .field("radius", radius)
+                .finish(),
+            Self::Ellipse { center, radius } => f
+                .debug_struct("Ellipse")
+                .field("center", center)
+                .field("radius", radius)
+                .finish(),
+            Self::Path { points, bounds } => f
+                .debug_struct("Path")
+                .field("points", &points.len())
+                .field("bounds", bounds)
+                .finish(),
+            Self::Custom(_) => f.write_str("Custom(<predicate>)"),
+        }
+    }
+}
+
+impl PartialEq for HitShape {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Rect(a), Self::Rect(b)) => a == b,
+            (
+                Self::RoundedRect {
+                    rect: ar,
+                    corner_radius: ac,
+                },
+                Self::RoundedRect {
+                    rect: br,
+                    corner_radius: bc,
+                },
+            ) => ar == br && ac == bc,
+            (
+                Self::Circle {
+                    center: ac,
+                    radius: ar,
+                },
+                Self::Circle {
+                    center: bc,
+                    radius: br,
+                },
+            ) => ac == bc && ar == br,
+            (
+                Self::Ellipse {
+                    center: ac,
+                    radius: ar,
+                },
+                Self::Ellipse {
+                    center: bc,
+                    radius: br,
+                },
+            ) => ac == bc && ar == br,
+            (
+                Self::Path {
+                    points: ap,
+                    bounds: ab,
+                },
+                Self::Path {
+                    points: bp,
+                    bounds: bb,
+                },
+            ) => ab == bb && ap == bp,
+            // 闭包无法结构比较：同一份 `Arc` 才算相等（可比较/可缓存是同一张形状的两个句柄）。
+            (Self::Custom(a), Self::Custom(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
 
 /// 命中路径上的 clip 矩形（定长、`Copy`、零分配；祖先 → 目标顺序）。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -155,10 +436,11 @@ fn pick(
         return None;
     }
 
-    // C12：`interactive: Some(false)` 的**整棵子树**不命中（祖先禁用 ⇒ 子树禁用），与焦点遍历
-    // 的 `is_effectively_interactive` 同一条规则；旧实现只让本节点透传，子节点仍可命中。
-    // 用已取到的 `slot` 判定（不再二次 `arena.get`）：命中测试是逐指针事件的热路径。
-    let disabled = inherited_disabled || slot.style_patch().interactive == Some(false);
+    // C12：`interactive: Some(false)` 的**整棵子树**不命中（祖先禁用 ⇒ 子树禁用）。本地判据是
+    // `NodeTree::is_hittable`（与 `a11y::mapping::a11y_disabled`、焦点遍历的
+    // `is_effectively_interactive` **同一个函数**，R04-9 的一致化）；祖先继承用沿途的
+    // `inherited_disabled` 传下去，避免每节点重新走一遍祖先链（命中是逐指针事件的热路径）。
+    let disabled = inherited_disabled || !tree.is_hittable(node);
 
     // 本节点的 clip **只作用于子树**（CSS：overflow 裁剪内容，不裁剪自身的 border/background）。
     // 点在 clip 外时仍可命中本节点，但不能下钻。
@@ -259,11 +541,21 @@ fn pick(
             );
         }
     }
-    if !bounds.contains(point) {
+    // 自身：命中区域 = 布局盒 ∪ 命中形状的局部 AABB（R04-8：形状可以**超出**布局盒，
+    // 如平移/缩放后的自绘内容；`Custom` 谓词无法静态得知范围 ⇒ 仍以布局盒剪枝）。
+    let shape = slot.hit_shape();
+    let region = match shape.and_then(HitShape::bounds) {
+        Some(shape_bounds) => bounds.union(Rect::from_origin_size(
+            bounds.origin + shape_bounds.origin,
+            shape_bounds.size,
+        )),
+        None => bounds,
+    };
+    if !region.contains(point) {
         return None;
     }
-    if let Some(shape) = slot.hit_shape()
-        && !shape(local_point)
+    if let Some(shape) = shape
+        && !shape.contains(local_point)
     {
         return None;
     }
@@ -295,15 +587,23 @@ fn hit_transformed(
         return None;
     };
     let local = inverse.apply(local_point);
-    if !local.is_finite() || !transformed_box(bounds, transform).contains(point) {
-        return None;
-    }
+    // R04-8：未变换的内容区域同样是「布局盒 ∪ 命中形状 AABB」，因此形状可以超出盒。
     let local_box = Rect::new(0.0, 0.0, bounds.size.width, bounds.size.height);
-    if !local_box.contains(local) {
+    let shape = slot.hit_shape();
+    let local_region = match shape.and_then(HitShape::bounds) {
+        Some(shape_bounds) => local_box.union(shape_bounds),
+        None => local_box,
+    };
+    let world_region =
+        Rect::from_origin_size(bounds.origin + local_region.origin, local_region.size);
+    if !local.is_finite() || !transformed_box(world_region, transform).contains(point) {
         return None;
     }
-    if let Some(shape) = slot.hit_shape()
-        && !shape(local)
+    if !local_region.contains(local) {
+        return None;
+    }
+    if let Some(shape) = shape
+        && !shape.contains(local)
     {
         return None;
     }
@@ -316,7 +616,7 @@ fn hit_transformed(
 #[cfg(test)]
 mod tests {
     use crate::{
-        layout::hit_test::{ClipChain, hit_test},
+        layout::hit_test::{ClipChain, HitShape, hit_test},
         math::{Point, Rect},
         node::{
             builder::NodeBuilder,
@@ -530,7 +830,7 @@ mod tests {
         // 自绘节点：只有左半边可命中（局部坐标 x < 20）
         let canvas = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 40.0, 20.0)))
             .style(fixed(40.0, 20.0))
-            .hit_shape(|local: Point| local.x < 20.0)
+            .hit_shape(HitShape::custom(|local: Point| local.x < 20.0))
             .build(&mut tree, root)
             .expect("挂载成功");
         layout(&mut tree);
@@ -560,10 +860,10 @@ mod tests {
                 };
                 style
             })
-            .hit_shape(|local: Point| {
+            .hit_shape(HitShape::custom(|local: Point| {
                 // 局部坐标原点必须是节点自己的左上角
                 local.x >= 0.0 && local.y >= 0.0 && local.x < 30.0 && local.y < 30.0
-            })
+            }))
             .build(&mut tree, parent)
             .expect("挂载成功");
         layout(&mut tree);
@@ -1116,5 +1416,205 @@ mod tests {
         let before = tree.hit_test_skips();
         assert_eq!(hit_node(&tree, 10.0, 10.0), Some(root));
         assert!(tree.hit_test_skips() > before, "非有限布局盒必须记账");
+    }
+
+    // ── R04-8：枚举式 HitShape ─────────────────────────────────────────────
+
+    /// 命中形状可以**大于布局盒**（自绘内容平移/缩放后的可见范围）：布局盒外、形状内的点
+    /// 必须命中；`subtree_bounds` 也要因此并入形状 AABB（否则父级剪枝会漏掉）。
+    #[test]
+    fn hit_shape_admits_points_outside_the_layout_box() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        // 容器盒 = 节点盒（20×20 @ (50,50)）；形状向外扩 20 px。
+        let container = add(&mut tree, root, {
+            let mut style = fixed(20.0, 20.0);
+            style.inner.margin = taffy::geometry::Rect {
+                left: taffy::style::LengthPercentageAuto::length(50.0),
+                right: taffy::style::LengthPercentageAuto::length(0.0),
+                top: taffy::style::LengthPercentageAuto::length(50.0),
+                bottom: taffy::style::LengthPercentageAuto::length(0.0),
+            };
+            style
+        });
+        let node = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 20.0, 20.0)))
+            .style(fixed(20.0, 20.0))
+            .hit_shape(HitShape::Rect(Rect::new(-20.0, -20.0, 60.0, 60.0)))
+            .build(&mut tree, container)
+            .expect("挂载成功");
+        layout(&mut tree);
+
+        assert_eq!(
+            tree.subtree_bounds(node),
+            Rect::new(30.0, 30.0, 60.0, 60.0),
+            "子树包围盒必须并入命中形状 AABB（命中剪枝的唯一依据）"
+        );
+        assert_eq!(
+            hit_node(&tree, 40.0, 40.0),
+            Some(node),
+            "布局盒外、形状内的点必须命中（旧实现只能缩小命中范围）"
+        );
+        assert_eq!(hit_node(&tree, 55.0, 55.0), Some(node), "布局盒内仍命中");
+        assert_eq!(
+            hit_node(&tree, 25.0, 25.0),
+            Some(root),
+            "形状外的点穿透到下层"
+        );
+    }
+
+    /// 圆角矩形：四角按 CSS 圆角轮廓判定（与绘制共用 `normalize_corner_radius`）。
+    #[test]
+    fn rounded_rect_hit_shape_follows_css_corners() {
+        let shape = HitShape::RoundedRect {
+            rect: Rect::new(0.0, 0.0, 100.0, 100.0),
+            corner_radius: [20.0; 4],
+        };
+
+        assert!(shape.contains(Point::new(50.0, 50.0)), "中心命中");
+        assert!(shape.contains(Point::new(10.0, 10.0)), "角框内但在圆弧内");
+        assert!(
+            !shape.contains(Point::new(2.0, 2.0)),
+            "角框内、圆弧外（旧矩形命中会误判）"
+        );
+        assert!(!shape.contains(Point::new(-1.0, 50.0)), "盒外不命中");
+        assert!(!shape.contains(Point::new(f32::NAN, 50.0)), "NaN 永不命中");
+
+        // 半径大于半边长时按 CSS 比例因子缩小（与绘制同一套规范化）。
+        let clamped = HitShape::RoundedRect {
+            rect: Rect::new(0.0, 0.0, 40.0, 10.0),
+            corner_radius: [40.0; 4],
+        };
+        assert!(clamped.contains(Point::new(20.0, 5.0)), "中心命中");
+        assert!(!clamped.contains(Point::new(-1.0, 5.0)));
+    }
+
+    /// 圆 / 椭圆 / 多边形路径的包含判定（半开区间 + 非有限防御）。
+    #[test]
+    fn circle_ellipse_and_path_hit_shapes() {
+        let circle = HitShape::Circle {
+            center: Point::new(50.0, 40.0),
+            radius: 30.0,
+        };
+        assert!(circle.contains(Point::new(50.0, 40.0)));
+        assert!(circle.contains(Point::new(50.0, 69.5)));
+        assert!(!circle.contains(Point::new(50.0, 70.5)));
+        assert!(!circle.contains(Point::new(f32::INFINITY, 40.0)));
+
+        let ellipse = HitShape::Ellipse {
+            center: Point::new(50.0, 50.0),
+            radius: crate::math::Size::new(40.0, 20.0),
+        };
+        assert!(ellipse.contains(Point::new(89.0, 50.0)));
+        assert!(!ellipse.contains(Point::new(91.0, 50.0)));
+        assert!(ellipse.contains(Point::new(50.0, 69.0)));
+        assert!(!ellipse.contains(Point::new(50.0, 71.0)));
+
+        // 凹多边形（L 形）：even-odd 填充规则，凹口必须不命中。
+        let path = HitShape::path(vec![
+            Point::new(0.0, 0.0),
+            Point::new(40.0, 0.0),
+            Point::new(40.0, 10.0),
+            Point::new(10.0, 10.0),
+            Point::new(10.0, 40.0),
+            Point::new(0.0, 40.0),
+        ]);
+        assert!(path.contains(Point::new(5.0, 5.0)));
+        assert!(path.contains(Point::new(5.0, 35.0)));
+        assert!(path.contains(Point::new(35.0, 5.0)));
+        assert!(!path.contains(Point::new(35.0, 35.0)), "凹口外");
+        assert!(!path.contains(Point::new(-1.0, 5.0)));
+        assert_eq!(
+            path.bounds(),
+            Some(Rect::new(0.0, 0.0, 40.0, 40.0)),
+            "路径 AABB 在构造时算好（命中剪枝不重算顶点）"
+        );
+        assert!(
+            !HitShape::path(Vec::new()).contains(Point::ZERO),
+            "空路径永不命中"
+        );
+        assert!(
+            !HitShape::path(vec![Point::new(0.0, 0.0), Point::new(1.0, 1.0)])
+                .contains(Point::new(0.5, 0.5)),
+            "少于 3 个点不是多边形"
+        );
+    }
+
+    /// `Custom` 是过滤式逃生舱：AABB 未知 ⇒ 仍以布局盒剪枝（不扩大命中范围）。
+    #[test]
+    fn custom_hit_shape_still_prunes_to_the_layout_box() {
+        let shape = HitShape::custom(|_| true);
+        assert_eq!(shape.bounds(), None, "自定义谓词没有静态 AABB");
+        assert!(shape.contains(Point::new(1000.0, 1000.0)));
+        assert_eq!(shape, shape.clone(), "同一份 Arc 的 Custom 可比较");
+        assert_ne!(
+            shape,
+            HitShape::custom(|_| true),
+            "不同闭包实例不相等（无法结构比较）"
+        );
+
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let node = NodeBuilder::boxed()
+            .style(fixed(10.0, 10.0))
+            .hit_shape(HitShape::custom(|_| true))
+            .build(&mut tree, root)
+            .expect("挂载成功");
+        layout(&mut tree);
+        assert_eq!(hit_node(&tree, 5.0, 5.0), Some(node));
+        assert_eq!(
+            hit_node(&tree, 50.0, 50.0),
+            Some(root),
+            "Custom 不扩大布局盒外的命中范围"
+        );
+    }
+
+    /// 命中、焦点（interactive）与 a11y 三处共用同一个「可交互」判据
+    /// （`NodeTree::is_hittable` / `is_effectively_interactive` / `a11y::mapping::a11y_disabled`）。
+    #[test]
+    fn interactive_criterion_is_shared_by_hit_focus_and_a11y() {
+        fn absolute_at(x: f32, y: f32, width: f32, height: f32) -> Style {
+            let mut style = absolute(width.max(height));
+            style.inner.size = taffy::geometry::Size {
+                width: taffy::style::Dimension::length(width),
+                height: taffy::style::Dimension::length(height),
+            };
+            style.inner.inset.left = taffy::style::LengthPercentageAuto::length(x);
+            style.inner.inset.top = taffy::style::LengthPercentageAuto::length(y);
+            style
+        }
+
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let disabled = add(&mut tree, root, absolute_at(0.0, 0.0, 100.0, 100.0));
+        tree.set_style_patch(
+            disabled,
+            StylePatch {
+                interactive: Some(false),
+                ..StylePatch::default()
+            },
+        );
+        let child = add(&mut tree, disabled, absolute_at(10.0, 10.0, 50.0, 50.0));
+        let enabled = add(&mut tree, root, absolute_at(120.0, 0.0, 30.0, 30.0));
+        layout(&mut tree);
+
+        assert!(!tree.is_hittable(disabled));
+        assert!(
+            !tree.is_effectively_interactive(child),
+            "祖先禁用 ⇒ 子树禁用"
+        );
+        assert_eq!(hit_node(&tree, 25.0, 25.0), Some(root), "禁用子树不命中");
+        assert!(
+            crate::a11y::mapping::a11y_disabled(&tree, child),
+            "a11y 与命中/焦点取同一判据"
+        );
+
+        assert!(tree.is_hittable(enabled));
+        assert!(tree.is_effectively_interactive(enabled));
+        assert!(!crate::a11y::mapping::a11y_disabled(&tree, enabled));
+        assert_eq!(
+            hit_node(&tree, 125.0, 5.0),
+            Some(enabled),
+            "未禁用节点正常命中"
+        );
     }
 }

@@ -52,13 +52,12 @@ fn dropping_a_renderer_releases_its_shared_device_resources() {
     {
         let mut renderer =
             GpuRenderer::with_shared(std::sync::Arc::clone(&shared), (16, 16)).expect("renderer");
-        let mut rows = crate::render::DirtyRows::default();
-        rows.mark(0, u32::MAX);
+        let rects = crate::render::DirtyRects::full();
         renderer.queue_atlas_upload(
             AtlasKind::Glyph,
             super::TEST_ATLAS_PAGE,
             vec![0u8; (super::TEST_ATLAS_PAGE * super::TEST_ATLAS_PAGE) as usize],
-            rows,
+            rects,
         );
         let scene = Scene::empty();
         let mut encoder = InstanceEncoder::new();
@@ -127,9 +126,8 @@ fn two_renderers_render_concurrently_on_one_shared_gpu() {
             for row in pixels.chunks_mut(page as usize) {
                 row.fill(0x40);
             }
-            let mut rows = crate::render::DirtyRows::default();
-            rows.mark(0, u32::MAX);
-            renderer.queue_atlas_upload(AtlasKind::Glyph, page, pixels, rows);
+            let rects = crate::render::DirtyRects::full();
+            renderer.queue_atlas_upload(AtlasKind::Glyph, page, pixels, rects);
 
             let text_free = one_lane_scene(quad(
                 Rect::new(2.0, 2.0, 2.0, 2.0),
@@ -608,9 +606,8 @@ fn a_rendered_frame_produces_no_corruption_messages() {
             pixels[(y * page + x) as usize] = 255;
         }
     }
-    let mut rows = crate::render::DirtyRows::default();
-    rows.mark(0, u32::MAX);
-    renderer.queue_atlas_upload(AtlasKind::Glyph, page, pixels, rows);
+    let rects = crate::render::DirtyRects::full();
+    renderer.queue_atlas_upload(AtlasKind::Glyph, page, pixels, rects);
 
     let scene = one_lane_scene(quad(
         Rect::new(0.0, 0.0, 32.0, 32.0),
@@ -783,9 +780,8 @@ fn image_primitive_samples_the_image_atlas() {
         texel[2] = 0x00;
         texel[3] = 0xFF;
     }
-    let mut rows = crate::render::atlas::DirtyRows::default();
-    rows.mark(0, page);
-    renderer.queue_atlas_upload(AtlasKind::Image, page, pixels, rows);
+    let rects = crate::render::atlas::DirtyRects::full();
+    renderer.queue_atlas_upload(AtlasKind::Image, page, pixels, rects);
 
     let tile = AtlasTile {
         atlas: AtlasKind::Image,
@@ -834,9 +830,8 @@ fn glyph_probe(page: u32) -> bool {
             pixels[(y * page + x) as usize] = 255;
         }
     }
-    let mut rows = crate::render::atlas::DirtyRows::default();
-    rows.mark(0, page);
-    renderer.queue_atlas_upload(AtlasKind::Glyph, page, pixels, rows);
+    let rects = crate::render::atlas::DirtyRects::full();
+    renderer.queue_atlas_upload(AtlasKind::Glyph, page, pixels, rects);
     let tile = AtlasTile {
         atlas: AtlasKind::Glyph,
         u0: 1.0 / page as f32,

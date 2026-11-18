@@ -387,23 +387,19 @@ impl TestApp {
         // 快照的渲染器是临时建的：页尺寸随整页上传一起给出（DEVIATIONS F-211）。
         let (glyph_page, glyph_pixels) = self.app.glyph_page_pixels();
         let mut renderer = Self::offscreen_renderer(size).map_err(gpu_error)?;
-        let mut rows = crate::render::DirtyRows::default();
-        rows.mark(0, u32::MAX);
         renderer.queue_atlas_upload(
             crate::paint::atlas::AtlasKind::Glyph,
             glyph_page.0,
             &glyph_pixels,
-            rows,
+            crate::render::DirtyRects::full(),
         );
         // 图片页：只有插过资源（页已分配）才上传。
         if let Some((image_page, image_pixels)) = self.app.resource_page_pixels() {
-            let mut rows = crate::render::DirtyRows::default();
-            rows.mark(0, u32::MAX);
             renderer.queue_atlas_upload(
                 crate::paint::atlas::AtlasKind::Image,
                 image_page.0,
                 image_pixels,
-                rows,
+                crate::render::DirtyRects::full(),
             );
         }
         let image = renderer

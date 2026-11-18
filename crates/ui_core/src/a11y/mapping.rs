@@ -8,6 +8,7 @@ use smol_str::SmolStr;
 use crate::{
     a11y::{A11yAction, A11yLabelSource, A11yOverride, A11yPatch, A11yRole},
     interaction::focus::focusable,
+    layout::hit_test::HitShape,
     math::{PhysicalRect, Scale},
     node::{
         id::NodeId,
@@ -150,7 +151,17 @@ pub(crate) fn bounds_of(tree: &NodeTree, node: NodeId, scale: Scale) -> Physical
     let content = tree
         .get(node)
         .map_or(crate::math::Rect::default(), |target| {
-            target.layout().bounds
+            let bounds = target.layout().bounds;
+            // R04-8：a11y 几何与命中测试**共用同一份命中形状数据**。形状可以超出布局盒
+            // （自绘内容平移/缩放的可见范围），AT 的高亮框/命中区域必须覆盖它，否则
+            // "点得到、读不到"（与 `hit_test` 的 `bounds ∪ shape.bounds()` 同源）。
+            match target.hit_shape().and_then(HitShape::bounds) {
+                Some(local) => bounds.union(crate::math::Rect::from_origin_size(
+                    bounds.origin + local.origin,
+                    local.size,
+                )),
+                None => bounds,
+            }
         });
     let screen = crate::interaction::scroll::to_screen(tree, node, content);
     screen.to_physical(scale)
@@ -483,7 +494,7 @@ pub(crate) fn is_disabled(
 #[cfg(test)]
 mod tests {
     use super::{
-        a11y_disabled, action_from_accesskit, action_to_accesskit, default_actions,
+        a11y_disabled, action_from_accesskit, action_to_accesskit, bounds_of, default_actions,
         effective_actions, is_disabled, is_hidden, role_by_kind, role_to_accesskit,
         sort_to_accesskit,
     };
@@ -491,6 +502,8 @@ mod tests {
         a11y::{
             A11yAction, A11yLabel, A11yLabelSource, A11yOverride, A11yPatch, A11yRole, A11ySort,
         },
+        layout::hit_test::HitShape,
+        math::{PhysicalRect, Scale},
         node::{builder::NodeBuilder, tree::NodeTree},
         paint::{
             canvas::Canvas,
@@ -923,5 +936,48 @@ mod tests {
             "普通文本仍是 Label"
         );
         let _ = TextContent::new("x", TextStyle::new(12.0));
+    }
+
+    /// R04-8：a11y 几何与命中测试**共用同一份 HitShape 数据** —— 形状超出布局盒时，
+    /// AT 的 bounds（屏幕高亮框 / 命中区域）必须覆盖形状而不是只覆盖布局盒。
+    #[test]
+    fn a11y_bounds_follow_the_hit_shape() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let node = NodeBuilder::boxed()
+            .layout_override(crate::math::Rect::new(10.0, 20.0, 40.0, 30.0))
+            .hit_shape(HitShape::Rect(crate::math::Rect::new(
+                -5.0, -5.0, 60.0, 50.0,
+            )))
+            .build(&mut tree, root)
+            .expect("mount");
+        tree.compute_layout(taffy::geometry::Size {
+            width: Some(200.0),
+            height: Some(200.0),
+        })
+        .expect("layout");
+        let scale = Scale::new(1.0).expect("scale");
+
+        assert_eq!(
+            bounds_of(&tree, node, scale),
+            PhysicalRect::new(5, 15, 65, 65),
+            "a11y bounds = 布局盒 (10,20,40,30) ∪ 形状局部 AABB (-5,-5,60,50)"
+        );
+
+        // 没有命中形状时行为不变（仅布局盒）。
+        let plain = NodeBuilder::boxed()
+            .layout_override(crate::math::Rect::new(10.0, 20.0, 40.0, 30.0))
+            .build(&mut tree, root)
+            .expect("mount");
+        tree.compute_layout(taffy::geometry::Size {
+            width: Some(200.0),
+            height: Some(200.0),
+        })
+        .expect("layout");
+        assert_eq!(
+            bounds_of(&tree, plain, scale),
+            PhysicalRect::new(10, 20, 50, 50),
+            "未设置 HitShape ⇒ 仍用布局盒（旧行为）"
+        );
     }
 }

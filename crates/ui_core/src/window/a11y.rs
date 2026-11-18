@@ -121,7 +121,7 @@ pub(crate) fn a11y_only_frame(window: &Window) -> bool {
         && window.pending_damage.is_none()
         && window.pending_delta.is_none()
         // 图集行没上去就不能跳过帧（否则新字形永远不出现；补帧由 `App::frame` 的尾部负责）。
-        && !window.atlas_rows_pending()
+        && !window.atlas_rects_pending()
 }
 
 // 消费者：`impl Window::a11y_only_frames` 的薄委托（外部调用点见该方法文档）。

@@ -60,7 +60,7 @@ use crate::{
     math::PhysicalRect,
     node::id::{Arena, ArenaKey},
     paint::atlas::{AtlasKind, AtlasTile},
-    render::{AtlasAllocator, DirtyRows},
+    render::{AtlasAllocator, DirtyRects},
     resources::{
         cache::{ContentKey, DedupeEntry, Entry, Page},
         image::DecodedImage,
@@ -844,11 +844,13 @@ impl ResourceCache {
             .map(|state| (state.page.dimensions(), state.page.bytes()))
     }
 
-    /// 取走自上次上传以来被写脏的**行**（首次调用返回整页）；没有图片页时是空集。
-    pub(crate) fn take_dirty_rows(&mut self) -> DirtyRows {
-        self.page.as_mut().map_or_else(DirtyRows::default, |state| {
-            state.allocator.take_dirty_rows()
-        })
+    /// 取走自上次上传以来被写脏的**矩形**（首次调用返回整页）；没有图片页时是空集。
+    pub(crate) fn take_dirty_rects(&mut self) -> DirtyRects {
+        self.page
+            .as_mut()
+            .map_or_else(DirtyRects::default, |state| {
+                state.allocator.take_dirty_rects()
+            })
     }
 
     /// 回收一条引用归零的资源：退还 tile、清零页内区域（含 padding）、删去重索引。
@@ -910,6 +912,7 @@ mod tests {
     };
     use crate::{
         error::EngineError,
+        math::PhysicalRect,
         paint::atlas::AtlasKind,
         resources::image::{MAX_SOURCE_BYTES, MAX_SOURCE_DIM, MAX_SOURCE_PIXELS},
         window::WindowId,
@@ -1160,48 +1163,64 @@ mod tests {
     }
 
     #[test]
-    fn unload_clears_the_page_region_and_marks_rows_dirty() {
+    fn unload_clears_the_page_region_and_marks_rects_dirty() {
         let mut cache = cache();
         let image = inserted(&mut cache, [200, 100, 50, 255]);
-        let _ = cache.take_dirty_rows(); // 首帧已上传整页
+        let region = image_region(&cache, image);
+        let _ = cache.take_dirty_rects(); // 首帧已上传整页
         let before: Vec<u8> = cache.page_pixels().expect("page").1.to_vec();
         assert!(before.iter().any(|byte| *byte != 0), "插入必须写进页");
 
         assert!(cache.unload(image.id));
         let after = cache.page_pixels().expect("page").1;
         assert!(after.iter().all(|byte| *byte == 0), "卸载后区域必须清零");
-        let rows = cache.take_dirty_rows();
-        assert!(!rows.spans().is_empty(), "清零区必须上报脏行");
+        let rects = cache.take_dirty_rects();
+        assert!(!rects.is_empty(), "清零区必须上报脏矩形");
+        // AOI 契约（R06-3）：清零的是**整块 padded 矩形**，x 区间同样要上报。
+        assert_eq!(rects.rects(), &[region]);
     }
 
     #[test]
-    fn first_dirty_rows_cover_the_whole_page() {
+    fn first_dirty_rects_cover_the_whole_page() {
         let mut cache = cache();
-        let rows = cache.take_dirty_rows();
-        assert_eq!(rows.spans().len(), 1);
+        let rects = cache.take_dirty_rects();
+        assert_eq!(rects.rects().len(), 1);
         assert_eq!(
-            rows.spans()[0],
-            0..16,
+            rects.rects()[0],
+            PhysicalRect::new(0, 0, 16, 16),
             "首次上传必须是整页（GPU 侧内容未定义）"
         );
-        assert!(cache.take_dirty_rows().spans().is_empty(), "take 会清空");
+        assert!(rects.covers_page(16));
+        assert_eq!(rects.byte_count(16, 4), 16 * 16 * 4);
+        assert!(cache.take_dirty_rects().is_empty(), "take 会清空");
     }
 
     #[test]
-    fn insert_marks_only_the_allocated_rows_dirty() {
+    fn insert_marks_only_the_allocated_rect_dirty() {
         let mut cache = cache();
-        let _ = cache.take_dirty_rows();
+        let _ = cache.take_dirty_rects();
         let image = inserted(&mut cache, [1, 2, 3, 255]);
 
-        let rows = cache.take_dirty_rows();
-        let spans = rows.spans();
-        assert_eq!(spans.len(), 1, "{spans:?}");
-        let padded = cache.entries.get(image.id).expect("entry").padded;
+        let rects = cache.take_dirty_rects();
+        assert_eq!(rects.rects().len(), 1, "{:?}", rects.rects());
+        // AOI 契约（R06-3）：脏矩形 = padded 块（含 1 纹素 padding）的**完整矩形** ——
+        // 旧实现只上报 y 区间，单个 4×4 图片也要上传整段页宽的行。
+        let region = image_region(&cache, image);
+        assert_eq!(rects.rects()[0], region);
         assert_eq!(
-            spans[0],
-            padded.y0 as u32..padded.y1 as u32,
-            "脏行必须覆盖 padded 块（含 1 纹素 padding）"
+            rects.byte_count(16, 4),
+            region.area() as usize * 4,
+            "只上传该矩形的字节，而不是 region.height() 行 × 页宽"
         );
+        assert!(
+            rects.byte_count(16, 4) <= region.area() as usize * 4,
+            "AOI 字节数不得超过 padded 块的面积 × texel"
+        );
+    }
+
+    /// 一条资源在图集页上的整块矩形（padded 块：内容 + 1 纹素 padding）。
+    fn image_region(cache: &ResourceCache, image: ResourceImage) -> PhysicalRect {
+        cache.entries.get(image.id).expect("entry").padded
     }
 
     #[test]

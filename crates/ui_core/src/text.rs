@@ -895,7 +895,7 @@ pub struct TextPassReport {
     pub reused: usize,
     /// 形状快照未变、整节点被跳过的次数（B4：空闲帧必须只走这条路）。
     pub skipped: usize,
-    /// 本次累积的脏行段数（P07 的增量上传输入）。
+    /// 本次累积的脏矩形数（P07 / R06-3 的 AOI 增量上传输入）。
     pub dirty_spans: usize,
     /// 走数字快速路径完成的塑形次数（R12 的 `DigitFastPath` 命中数）。
     pub fast_path_shaped: usize,

@@ -24,6 +24,16 @@
 //! 所以本后端只用 `MTLCommandBuffer::presentDrawable:`（等价 `present(_:)`，**没有时刻参数**）：
 //! 呈现节奏完全由 display link 决定 —— 它给 drawable，我们画完就尽快提交。
 //!
+//! # 上屏时刻从哪里来
+//!
+//! display link 的 `CAMetalDisplayLinkUpdate.targetPresentationTimestamp` 是「这张 drawable 被
+//! 排定的上屏时刻」。它不能传给 `presentDrawable:atTime:`（见上），但可以在提交时记下来做
+//! **tick 推断**：下一个 tick 到达 ⇒ 该 vsync 的呈现截止时刻已过 ⇒ 上一帧已上屏；推断出的上屏
+//! 时刻误差 ≤1 个 vsync。实现见 `render/macos/renderer.rs` 的 `presentation_instant` 与
+//! `FeedbackQueue::observe_tick`。`addPresentedHandler:` / `MTLDrawable.presentedTime` 在
+//! display-link 驱动的 drawable 上不可靠（真机实测只回调 3 次、`presentedTime` 恒为 0），本后端
+//! **不使用**它。
+//!
 //! # 线程纪律
 //!
 //! drawable 在**主线程**取得（display link delegate），编码 / 提交 / present 全在 `kytrix-metal`

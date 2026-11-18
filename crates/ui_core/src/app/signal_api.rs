@@ -21,7 +21,7 @@ pub(crate) fn dependency_graph(app: &App) -> &DependencyGraph {
 
 // ── 状态注册 ──────────────────────────────────────────────────────────────
 
-/// 建一个普通信号（id 稠密递增，条目永不删除；归属根作用域，永不释放）。
+/// 建一个普通信号（归属**根作用域**：永不释放，因此它的槽位永远不会被回收）。
 /// 消费者：`App::signal`。
 pub(crate) fn signal<T: Clone + 'static>(app: &mut App, initial: T) -> Signal<T> {
     let id = app.store.push_owned(initial);
@@ -30,8 +30,9 @@ pub(crate) fn signal<T: Clone + 'static>(app: &mut App, initial: T) -> Signal<T>
 
 /// 建一个**作用域内**的普通信号（窗口 / 面板 / 对话框的生命周期）。
 ///
-/// 作用域释放后写是 no-op（不标脏、不唤醒），见 [`SignalScope`]。
-/// 消费者：`App::signal_scoped`。
+/// 槽位优先复用空闲栈（作用域释放回收的下标 + 已推进的代际），因此**句柄不保证重建**：
+/// 释放后旧句柄的读 panic、写 no-op（见 [`SignalScope`]）。作用域已释放时 panic（引擎误用）。
+/// 消费者：`App::signal_scoped` / `App::window_signal`。
 pub(crate) fn signal_scoped<T: Clone + 'static>(
     app: &mut App,
     scope: SignalScope,
@@ -66,9 +67,10 @@ pub(crate) fn signal_scope(app: &mut App) -> SignalScope {
     app.store.new_scope()
 }
 
-/// 释放信号作用域：其信号的写从此是 no-op，依赖图里以它们为键的边**立即**删除。
+/// 释放信号作用域：其值**立即回收**（槽位归还空闲栈、代际 +1），依赖图里以它们为键的边
+/// **立即**删除，旧句柄从此读 panic / 写 no-op（见 [`SignalScope`]）。
 ///
-/// 返回被释放的信号数。重复释放返回 0（幂等）。
+/// 返回被释放的信号数。重复释放返回 0（幂等）；根作用域不会被释放（返回 0）。
 /// 消费者：`App::release_scope` / `App::close_window`。
 pub(crate) fn release_scope(app: &mut App, scope: SignalScope) -> usize {
     let Some(signals) = app.store.release_scope(scope) else {
@@ -77,6 +79,7 @@ pub(crate) fn release_scope(app: &mut App, scope: SignalScope) -> usize {
     let released = signals.len();
     for signal in signals {
         // 立即删边（不是"等下次写时惰性清理"）：释放的价值就是之后的写不再遍历任何 owner。
+        // 键是完整 `SignalId`（下标 + 代际），复用后的新信号代际不同 ⇒ 不会继承这些边。
         app.graph.remove_signal(signal);
     }
     released
@@ -85,7 +88,11 @@ pub(crate) fn release_scope(app: &mut App, scope: SignalScope) -> usize {
 // ── 写路径 ────────────────────────────────────────────────────────────────
 
 /// 写一个信号。返回 `true` = 值变了（并已沿依赖图失效）；`false` = 值相等（短路）
-/// **或**该信号的作用域已释放（no-op）。
+/// **或**该句柄已失效（作用域已释放 / 槽位已复用：no-op，不标脏、不唤醒）。
+///
+/// 返回 `false` 的第二种情况**不可**与等值短路区分 —— 这是有意的：作用域释放后的迟到写入
+/// （异步任务 / 定时器回投）必须无害（R03-6 的僵尸唤醒防护），而句柄失效本身是应用 bug。
+/// 同一句柄的**读**会确定性 panic（见 [`read`]）。
 ///
 /// 返回值不表示「有节点被标脏」（只写派生时没有节点变脏）。
 ///
@@ -102,7 +109,7 @@ pub(crate) fn write<T: Clone + PartialEq + 'static>(
 ) -> bool {
     let id = signal.id();
     match app.store.write_owned(id, value) {
-        None => false,        // 作用域已释放：no-op（不失效、不唤醒）
+        None => false,        // 句柄已失效：no-op（不失效、不唤醒、不写复用后的新值）
         Some(false) => false, // 等值短路
         Some(true) => {
             app.invalidate(id);
@@ -111,10 +118,13 @@ pub(crate) fn write<T: Clone + PartialEq + 'static>(
     }
 }
 
-/// 读旧值 → 由闭包产出新值 → 按 [`write`] 的语义写（等值短路 / 作用域已释放 ⇒ `false`）。
+/// 读旧值 → 由闭包产出新值 → 按 [`write`] 的语义写（等值短路 / 句柄已失效 ⇒ `false`）。
 ///
 /// **守卫必须在 `write_owned` 之前析构**，否则这次写会撞上自己的读守卫（panic）：块作用域
 /// 保证闭包返回的那一刻守卫就 drop，随后才写。
+///
+/// 句柄已失效时**不调用闭包**、直接返回 `false`：它是「先读旧值再写」组合子，读那一步不能把
+/// 迟到写入变成 UI 线程 panic（与 [`write`] 的 no-op 同口径）。
 ///
 /// # Panics
 /// 同 [`write`]（活跃读守卫 / 类型不符）。
@@ -125,6 +135,9 @@ pub(crate) fn write_with<T: Clone + PartialEq + 'static>(
     body: impl FnOnce(&T) -> T,
 ) -> bool {
     let id = signal.id();
+    if !app.store.is_live(id) {
+        return false;
+    }
     let value = {
         let guard = app.store.read_owned::<T>(id);
         body(&guard)
@@ -135,6 +148,7 @@ pub(crate) fn write_with<T: Clone + PartialEq + 'static>(
 /// 原地更新一个信号（**无等值短路**：调用方声明这次修改必须生效）。
 ///
 /// 适合大对象（列表 / 图）的局部修改：不 clone 旧值、不做 `PartialEq` 比较，改完直接失效。
+/// 返回 `false` 仅表示该句柄已失效（no-op，闭包不会被调用）。
 ///
 /// # Panics
 /// 同 [`write`]（活跃读守卫 / 类型不符）。
@@ -146,7 +160,7 @@ pub(crate) fn update<T: 'static>(
 ) -> bool {
     let id = signal.id();
     match app.store.update_owned(id, update) {
-        None => false, // 作用域已释放：no-op
+        None => false, // 句柄已失效：no-op
         Some(()) => {
             app.invalidate(id);
             true
@@ -156,7 +170,7 @@ pub(crate) fn update<T: 'static>(
 
 /// 在闭包内就地更新一个信号并沿依赖图失效，返回闭包的返回值。
 ///
-/// `None` = 作用域已释放（no-op，闭包**不会**被调用）；`Some(r)` = 已就地改完并已失效。
+/// `None` = 句柄已失效（no-op，闭包**不会**被调用）；`Some(r)` = 已就地改完并已失效。
 ///
 /// # Panics
 /// 同 [`update`]（活跃读守卫 / 类型不符）。
@@ -184,7 +198,10 @@ pub(crate) fn write_transient<T: 'static>(app: &mut App, transient: &Transient<T
 /// 非追踪读一个信号，返回**读守卫**（零拷贝）。
 ///
 /// # Panics
-/// `signal` 的槽位不是普通信号（引擎不变量被破坏时才会发生）。
+/// - 句柄已失效（作用域已释放 / 槽位已回收复用）：**确定性失败**，绝不返回复用后的新值
+///   （见 `node::signal` 模块文档〈作用域回收与句柄失效〉）；
+/// - `signal` 的槽位不是普通信号（引擎不变量被破坏时才会发生）。
+///
 /// 消费者：`App::read`。
 #[must_use]
 pub(crate) fn read<T: 'static>(app: &App, signal: &Signal<T>) -> SignalRef<T> {
@@ -194,7 +211,7 @@ pub(crate) fn read<T: 'static>(app: &App, signal: &Signal<T>) -> SignalRef<T> {
 /// 在闭包内读一个信号：守卫在调用返回时析构（**不可逃逸**）。
 ///
 /// # Panics
-/// 同 [`read`]（槽位不是普通信号）。
+/// 同 [`read`]（句柄已失效 / 槽位不是普通信号）。
 /// 消费者：`App::read_with`。
 pub(crate) fn read_with<T: 'static, R>(
     app: &App,
@@ -208,7 +225,7 @@ pub(crate) fn read_with<T: 'static, R>(
 /// 非追踪读一个瞬态值，返回读守卫（动画进度 / 滚动偏移的公开读取面）。
 ///
 /// # Panics
-/// 槽位不是瞬态值（引擎不变量被破坏时才会发生）。
+/// 句柄已失效，或槽位不是瞬态值（引擎不变量被破坏时才会发生）。
 /// 消费者：`App::read_transient`。
 #[must_use]
 pub(crate) fn read_transient<T: 'static>(app: &App, transient: &Transient<T>) -> SignalRef<T> {
@@ -394,7 +411,163 @@ mod tests {
             "作用域已释放 ⇒ None（与 `update` 返回 false 同义）"
         );
         assert!(!called.get(), "no-op 不得调用闭包（一次借用都不做）");
-        assert_eq!(*app.read(&signal), 7, "值被冻结（写没有生效）");
+        // 值已随作用域释放被回收：旧句柄的读是确定性失败（不再是"返回冻结值"）。
+        let payload = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = *app.read(&signal);
+        }))
+        .expect_err("失效句柄的读必须 panic");
+        assert!(panic_message(payload).contains("stale"));
+    }
+
+    // ── S6：窗口作用域的槽位回收（App 级）─────────────────────────────────
+
+    /// 1000 轮「建窗 → window_signal → 依赖边 → 关窗」：槽位峰值与依赖边都不增长。
+    #[test]
+    fn thousand_window_lifecycles_keep_the_slot_peak_flat_and_leave_no_edges() {
+        const CYCLES: usize = 1000;
+        const SIGNALS_PER_WINDOW: usize = 2;
+
+        let (_rt, mut app) = new_app();
+        let mut peak: Option<usize> = None;
+        for cycle in 0..CYCLES {
+            let window = app.create_window(WindowOptions::default());
+            let first: Signal<u32> = app.window_signal(window, 1);
+            let second: Signal<u32> = app.window_signal(window, 2);
+            assert!(app.write(&first, 3));
+            assert!(app.write(&second, 4));
+            let _node = build_node(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
+                opacity: Some(*cx.read(&first) as f32 + *cx.read(&second) as f32),
+                ..StylePatch::default()
+            });
+            app.refresh_styles(window).expect("窗口存在");
+            assert_eq!(
+                app.dependency_edge_count_for_test(),
+                SIGNALS_PER_WINDOW,
+                "第 {cycle} 轮节点必须对两个窗口信号各有一条依赖边"
+            );
+            assert!(app.close_window(window), "关窗成功");
+            assert_eq!(
+                app.dependency_edge_count_for_test(),
+                0,
+                "第 {cycle} 轮关窗后不得有残留依赖边"
+            );
+            let slots = app.store.slot_count_for_test();
+            match peak {
+                Some(expected) => assert_eq!(
+                    slots, expected,
+                    "第 {cycle} 轮后信号槽位峰值不得增长（回收失效会线性增长）"
+                ),
+                None => peak = Some(slots),
+            }
+        }
+        assert_eq!(
+            app.store.free_slot_count_for_test(),
+            SIGNALS_PER_WINDOW,
+            "两轮槽位必须全部回到空闲栈"
+        );
+        assert_eq!(
+            app.store.live_slot_count_for_test(),
+            0,
+            "没有存活信号占着槽位"
+        );
+    }
+
+    /// 关窗后槽位被复用：旧句柄的读确定性失败、写 no-op，绝不命中新窗口的值。
+    #[test]
+    fn window_signal_handle_is_stale_after_close_and_never_reads_the_reused_slot() {
+        let (_rt, mut app) = new_app();
+        let first = app.create_window(WindowOptions::default());
+        let stale: Signal<u32> = app.window_signal(first, 11);
+        assert!(app.close_window(first));
+
+        let second = app.create_window(WindowOptions::default());
+        let fresh: Signal<u32> = app.window_signal(second, 22);
+        assert_eq!(
+            fresh.id().index(),
+            stale.id().index(),
+            "关窗后槽位必须被复用"
+        );
+        assert_eq!(
+            fresh.id().generation(),
+            stale.id().generation() + 1,
+            "复用必须推进代际"
+        );
+
+        // 写 / 更新：no-op，绝不改到新占用者。
+        assert!(!app.write(&stale, 99));
+        assert!(!app.update(&stale, |value| *value = 99));
+        assert_eq!(*app.read(&fresh), 22, "旧句柄绝不能写到复用后的新值");
+
+        // 读：确定性失败。
+        let payload = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = *app.read(&stale);
+        }))
+        .expect_err("旧句柄读必须 panic");
+        assert!(panic_message(payload).contains("stale"));
+
+        // 新句柄照常工作。
+        assert!(app.write(&fresh, 23));
+        assert_eq!(*app.read(&fresh), 23);
+    }
+
+    /// `write_with` 是「先读后写」组合子：失效句柄不得在读一步 panic，而是 no-op（闭包不执行）。
+    #[test]
+    fn write_with_on_a_stale_handle_returns_false_without_calling_the_closure() {
+        let (_rt, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        let stale: Signal<u32> = app.window_signal(window, 1);
+        assert!(app.close_window(window));
+
+        let called = Cell::new(false);
+        assert!(
+            !app.write_with(&stale, |old| {
+                called.set(true);
+                old + 1
+            }),
+            "失效句柄的 write_with 必须是 no-op"
+        );
+        assert!(!called.get(), "no-op 不得调用闭包");
+    }
+
+    /// 旧句柄的写不得沿**复用槽位的新信号**的依赖边失效任何读者（槽位级边隔离）。
+    #[test]
+    fn stale_handle_write_cannot_invalidate_the_reused_slots_readers() {
+        let (_rt, mut app) = new_app();
+        let first = app.create_window(WindowOptions::default());
+        let stale: Signal<u32> = app.window_signal(first, 1);
+        assert!(app.close_window(first));
+
+        let second = app.create_window(WindowOptions::default());
+        let fresh: Signal<u32> = app.window_signal(second, 10);
+        assert_eq!(fresh.id().index(), stale.id().index(), "槽位已复用");
+        let node = build_node(&mut app, second, move |cx: &mut ReadCtx<'_>| StylePatch {
+            opacity: Some(*cx.read(&fresh) as f32),
+            ..StylePatch::default()
+        });
+        app.refresh_styles(second).expect("窗口存在");
+        assert_eq!(
+            app.dependency_edge_count_for_test(),
+            1,
+            "新信号有一条节点依赖边"
+        );
+        clear_dirty(&mut app, second);
+        let _ = app.take_wake_request();
+
+        assert!(!app.write(&stale, 99), "旧句柄的写是 no-op");
+        assert!(
+            !dirty(&app, second, node).contains(DirtyFlags::PAINT),
+            "旧句柄不得沿复用槽位的新依赖边失效任何读者"
+        );
+        assert!(!app.take_wake_request(), "不得请求帧（无僵尸唤醒）");
+        assert_eq!(
+            app.dependency_edge_count_for_test(),
+            1,
+            "新信号的依赖边不受旧句柄影响"
+        );
+        assert_eq!(*app.read(&fresh), 10, "新占用者的值未被改动");
+
+        assert!(app.write(&fresh, 11), "新句柄照常失效");
+        assert!(dirty(&app, second, node).contains(DirtyFlags::PAINT));
     }
 
     // ── write_with：新值由旧值派生 + 等值短路 ─────────────────────────────

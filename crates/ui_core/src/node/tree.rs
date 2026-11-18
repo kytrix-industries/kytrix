@@ -34,7 +34,10 @@ use crate::{
     error::EngineError,
     event::Action,
     interaction::{NodeInteraction, OverlaySlot, ScrollSlot, VirtualSlot},
-    layout::{Axis, LayoutOverride, LayoutReport, MeasureFn, hit_test::HitResult},
+    layout::{
+        Axis, LayoutOverride, LayoutReport, MeasureFn,
+        hit_test::{HitResult, HitShape},
+    },
     math::{Edges, PhysicalRect, Point, Rect, Size, Transform},
     node::{
         dependency::ReadCtx,
@@ -115,7 +118,7 @@ pub(crate) struct NodeSpec {
     style: Style,
     bind_style: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> StylePatch>>,
     measure: Option<MeasureFn>,
-    hit_shape: Option<Box<dyn Fn(Point) -> bool>>,
+    hit_shape: Option<HitShape>,
     layout_override: Option<LayoutOverride>,
     bind_text: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> SmolStr>>,
     paint: Option<Box<PaintSpec>>,
@@ -160,7 +163,7 @@ pub struct Node {
     /// 自定义叶子测量（P05 的文本入口；见 [`MeasureFn`] 的纯函数契约）。
     measure: Option<MeasureFn>,
     /// 自定义命中形状（局部坐标；`None` = 用 `layout.bounds` 判定）。
-    hit_shape: Option<Box<dyn Fn(Point) -> bool>>,
+    hit_shape: Option<Box<HitShape>>,
     /// 布局覆盖（root 逃生口）。
     layout_override: Option<LayoutOverride>,
     /// 是否进入 Tab 序（`false` = 仍可点击 / 可被 AT 激活，但 `focus_next/prev` 跳过它）。
@@ -215,7 +218,7 @@ impl fmt::Debug for Node {
             .field("style_patch", &self.style_patch())
             .field("bind_style", &self.bind_style.as_ref().map(|_| "<closure>"))
             .field("measure", &self.measure.as_ref().map(|_| "<closure>"))
-            .field("hit_shape", &self.hit_shape.as_ref().map(|_| "<closure>"))
+            .field("hit_shape", &self.hit_shape)
             .field("layout_override", &self.layout_override)
             .field("paint", &self.paint)
             .field("content_offset", &self.content_offset)
@@ -319,7 +322,7 @@ impl Node {
 
     /// 自定义命中形状（局部坐标；`None` = 用 `layout.bounds` 判定）。
     #[must_use]
-    pub fn hit_shape(&self) -> Option<&dyn Fn(Point) -> bool> {
+    pub fn hit_shape(&self) -> Option<&HitShape> {
         self.hit_shape.as_deref()
     }
 
@@ -788,7 +791,10 @@ impl NodeTree {
     pub(crate) fn mark_structure(&mut self, node: NodeId) -> bool {
         dirty::mark_structure(self, node)
     }
-    fn mark_subtree_paint(&mut self, node: NodeId) {
+    /// 整棵子树标 `PAINT | A11Y`（并清 `REUSABLE`）。
+    ///
+    /// 消费者：`App::request_node_repaint`（R01-16 的节点级重绘：子树重建 lane）。
+    pub(crate) fn mark_subtree_paint(&mut self, node: NodeId) -> usize {
         dirty::mark_subtree_paint(self, node)
     }
     pub(crate) fn clear_bind(&mut self, node: NodeId) -> bool {

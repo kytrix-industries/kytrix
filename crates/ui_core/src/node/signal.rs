@@ -2,7 +2,9 @@
 //!
 //! 设计见 `design/phase-03-node-state.md` §7。要点：
 //! - 句柄是 `Copy`（`PhantomData<fn() -> T>`，不要求 `T: Copy`），值只存在 `StateStore`；
-//! - `SignalId`/`DerivedId` 是**稠密索引**，条目永不删除 ⇒ 无代际、无自由表；
+//! - `SignalId` = **稠密槽位下标 + 代际**（8 B），`DerivedId` 仍是永不删除的稠密下标；
+//!   作用域释放会**回收**槽位（值立即 drop、槽位进空闲栈、代际 +1），新信号优先复用空闲
+//!   槽位 ⇒ 旧句柄的代际与槽位不匹配，**确定性失效**（见下文〈作用域回收与句柄失效〉）；
 //! - 派生值**惰性**求值、push 失效；环检测在运行时求值栈上（见 `node::dependency::EvalStack`）；
 //! - **没有版本号**：失效是 push 模型，等值短路由 `App::write` 的 `PartialEq` 完成（S-27 / S-35）。
 //!
@@ -35,36 +37,105 @@
 //!    深拷贝，而不是读路径的隐式成本。
 //! 4. **派生值**（`Derived`）的读守卫是**缓存快照**：重新求值只会替换缓存里的 `Rc`，
 //!    已发出的守卫继续指向旧值（快照语义），因此派生读**不会**阻塞写上游。
-//! 5. **作用域回收**（[`SignalScope`]）：作用域释放后，其信号的写是 **no-op**（返回 `false`、
-//!    不标脏、不请求帧）；读仍返回冻结值（值在内存里，但不再变化）。
+//! 5. **作用域回收**（[`SignalScope`]）：作用域释放后，其信号的值**立即回收**（槽位归还空闲
+//!    栈、代际递增）。此后旧句柄的**写是 no-op**（返回 `false`、不标脏、不请求帧 —— 迟到写入
+//!    不得产生僵尸唤醒），**读是确定性失败**（panic，消息给出槽位/代际/槽位状态：值已经不
+//!    在，引擎绝不能把复用后的新值交给旧句柄）。详见下文〈作用域回收与句柄失效〉。
+//!
+//! # 作用域回收与句柄失效
+//!
+//! `App::release_scope` / `App::close_window` 把作用域里的每个值**立即 drop**，槽位下标压回
+//! 空闲栈（LIFO、O(1)，不扫描槽位表），槽位代际 +1。之后 `App::signal` /
+//! `App::window_signal` / `App::signal_scoped` 优先弹空闲栈复用槽位，铸出的新句柄带**当前**
+//! 代际（旧句柄的代际因此必然落后）。
+//!
+//! 失效判据是一次 `u32` 比较：`SignalId::generation == 槽位代际`。写路径因此**不再需要**旧实现
+//! 的 `released_scopes` + 作用域表检查（每个槽位自带判据，热路径没有变慢）。旧句柄的两种行为：
+//!
+//! | 操作 | 旧句柄（代际不匹配） | 原因 |
+//! |---|---|---|
+//! | 读（`App::read` / `ReadCtx::read` / `App::read_with` / `ReadCtx::read_transient`） | **panic**（确定性失败），消息含 `stale` + 槽位下标/代际/槽位状态 | 值已被 drop，没有可返回的东西；宁可确定性失败也**不**返回复用后的新值 |
+//! | 写 / 更新（`App::write` / `App::update` / `App::update_with`） | **no-op**（`false` / `None`） | 关闭窗口后的迟到写入（异步回投、定时器）不得产生僵尸唤醒（R03-6），也不得把 UI 线程 panic 掉 |
+//! | `App::write_with` | **no-op**（`false`，闭包不会被调用） | 同上：它是「先读旧值再写」组合子，失效时读一步不能 panic |
+//!
+//! 这个"混合"不是随意的两个政策，而是**唯一的签名约束下的唯一解**：读没有返回值的第二形态
+//! （`SignalRef` 不是 `Result`），写有既定的 no-op 契约。两者的共同保证是**绝不触碰复用后的
+//! 槽位**——读 panic 在取值之前，写在同一处代际比较处直接返回。
+//!
+//! **依赖边是槽位级的**：依赖图的键是完整 `SignalId`（下标 + 代际）。释放时按旧 id 删除全部边；
+//! 复用后的新信号代际不同 ⇒ 键不同、不会继承旧边，旧句柄的写也不会遍历任何 owner。
+//!
+//! **代际用尽**（槽位已发放完 `u32::MAX` 代）⇒ 槽位**永久退休**：代际置 0（不是合法代际，
+//! 任何句柄都命中不了）、不进空闲栈。旧句柄因此不会 ABA 复活（与 `node::id::Arena` 同一规则）。
 
-use std::{any::Any, fmt, marker::PhantomData, ops::Deref, rc::Rc};
+use std::{any::Any, fmt, marker::PhantomData, num::NonZeroU32, ops::Deref, rc::Rc};
 
 use smallvec::SmallVec;
 
-use crate::node::dependency::ReadCtx;
+use crate::node::{dependency::ReadCtx, id::next_generation};
 
-/// 信号 / 瞬态值的稠密索引（`StateStore::values` 的下标）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct SignalId(u32);
+/// 信号 / 瞬态值的槽位句柄：**稠密槽位下标 + 代际**（`StateStore::values` 的下标）。
+///
+/// 8 B（`index` + `generation`；`Option<SignalId>` 同尺寸，`NonZeroU32` 提供 niche）。
+///
+/// # 代际（槽位回收的必要条件）
+///
+/// 槽位下标会被**复用**：作用域释放时值被回收、槽位进空闲栈，新信号优先复用。若句柄只有
+/// 下标，旧句柄就会静默读到复用后的新值（ABA，R03-8）。代际让失效变成**一次 `u32` 比较**：
+/// 句柄的 `generation` 必须等于槽位当前代际，否则该句柄已失效（见模块文档
+/// 〈作用域回收与句柄失效〉）。
+///
+/// `generation` 用 `NonZeroU32` 表示「0 永不是合法代际」：0 只属于**退休槽位**（代际用尽、
+/// 不再复用），任何句柄都命中不了 —— 类型即证明。
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SignalId {
+    index: u32,
+    generation: NonZeroU32,
+}
 
 impl SignalId {
-    /// 下标（诊断/依赖集合用）。
+    /// 槽位下标（诊断/依赖集合用）。
     #[must_use]
     pub const fn index(self) -> u32 {
-        self.0
+        self.index
     }
 
-    /// `u64` 投影（结构化日志，设计 §9.1）。
+    /// 代际，恒在 `1..=u32::MAX`（0 不是合法代际，见 [`SignalId`] 的类型不变量）。
+    #[must_use]
+    pub const fn generation(self) -> u32 {
+        self.generation.get()
+    }
+
+    /// `(generation as u64) << 32 | index as u64`（**槽位局部**编码，与 `NodeId::to_bits` 同布局）。
+    ///
+    /// 消费者：结构化日志/帧记录需要一个单值可打印的信号标识（设计 §9.1）；同一槽位的历次
+    /// 代际在数值上连续递增。
     #[must_use]
     pub const fn to_bits(self) -> u64 {
-        self.0 as u64
+        ((self.generation.get() as u64) << 32) | self.index as u64
     }
 
-    /// 仅测试：直接构造（不进入非 test 构建，因此没有 `dead_code`）。
+    /// crate 内构造（`StateStore::push_slot`）。代际不得为 0（0 = 退休槽位）。
+    fn from_parts(index: u32, generation: u32) -> Self {
+        let Some(generation) = NonZeroU32::new(generation) else {
+            panic!("signal generation 0 is reserved for retired slots (engine invariant)");
+        };
+        Self { index, generation }
+    }
+
+    /// 仅测试：直接构造（不进入非 test 构建，因此没有 `dead_code`）。代际恒为 1。
     #[cfg(test)]
     pub(crate) const fn for_test(index: u32) -> Self {
-        Self(index)
+        Self {
+            index,
+            generation: NonZeroU32::MIN,
+        }
+    }
+}
+
+impl fmt::Debug for SignalId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SignalId(#{}.{})", self.index, self.generation)
     }
 }
 
@@ -110,7 +181,7 @@ impl<T> Copy for Signal<T> {}
 
 impl<T> std::fmt::Debug for Signal<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Signal(#{})", self.id.index())
+        write!(f, "Signal(#{}.{})", self.id.index(), self.id.generation())
     }
 }
 
@@ -188,7 +259,12 @@ impl<T> Copy for Transient<T> {}
 
 impl<T> std::fmt::Debug for Transient<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Transient(#{})", self.id.index())
+        write!(
+            f,
+            "Transient(#{}.{})",
+            self.id.index(),
+            self.id.generation()
+        )
     }
 }
 
@@ -288,12 +364,14 @@ pub struct SignalRef<T> {
 
 impl<T: 'static> SignalRef<T> {
     /// 由类型擦除的 `Rc<dyn Any>` 下行构造（类型不符 = 引擎不变量破坏，panic 带 `SignalId`）。
-    pub(crate) fn from_any(value: Rc<dyn Any>, id: u64) -> Self {
+    pub(crate) fn from_any(value: Rc<dyn Any>, id: SignalId) -> Self {
         match value.downcast::<T>() {
             Ok(value) => Self { value },
             Err(_) => panic!(
-                "signal #{id}: store value type mismatch — engine invariant broken \
-                 (SignalId ↔ T is a constructive bijection)"
+                "signal #{}.{}: store value type mismatch — engine invariant broken \
+                 (SignalId ↔ T is a constructive bijection)",
+                id.index(),
+                id.generation()
             ),
         }
     }
@@ -332,14 +410,21 @@ impl<T: fmt::Display> fmt::Display for SignalRef<T> {
 /// let scope = app.signal_scope();              // 应用自建作用域（面板/对话框）
 /// let price = app.signal_scoped(scope, 0.0);   // 该作用域内的信号
 /// ...
-/// app.release_scope(scope);                    // 作用域释放：之后的写是 no-op
+/// app.release_scope(scope);                    // 作用域释放：值回收、旧句柄失效
 /// ```
 ///
 /// 释放语义（[`App::release_scope`](crate::app::App::release_scope)）：
-/// 1. 作用域内信号的**写**变成 no-op（`write` 返回 `false`，不标脏、不唤醒 —— 不会有僵尸唤醒）；
+/// 1. 作用域内每个信号的**值立即 drop**：槽位下标进空闲栈、槽位代际 +1 —— 内存不再被占着
+///    （这是长跑「建窗 → 关窗」churn 时槽位峰值不增长的前提）；
 /// 2. 依赖图里以这些信号为键的边被**立即删除**（不是"等下次写时惰性清理"），
 ///    因此释放后 `dependency_dump` 里查不到它们、`App::write` 也不再遍历任何 owner；
-/// 3. 值仍驻留（稠密 id 表不回收槽位），读返回冻结值；`App::signal` 注册的根作用域信号永不被释放。
+/// 3. **旧句柄失效**（见模块文档〈作用域回收与句柄失效〉）：读 **panic**（确定性失败，绝不
+///    返回复用后的新值），写/更新是 **no-op**（`false`/`None`，不标脏、不唤醒）；
+/// 4. 已释放的作用域**不能再 mint 新信号**（引擎误用 ⇒ panic）；根作用域（`App::signal` /
+///    `App::transient` / `App::derived` 的归属）**永不释放**（`release_scope` 对它返回 0）。
+///
+/// 槽位复用时旧句柄可能与新信号共享下标，因此**不要**在作用域释放后继续持有/使用句柄：引擎
+/// 能做的是让读确定性失败、写 no-op（见上文），而不是替应用记住"这个句柄已经死了"。
 ///
 /// 窗口作用域由引擎自动管理：`App::create_window` 建作用域，
 /// [`App::window_signal`](crate::app::App::window_signal) 往里注册信号，
@@ -376,20 +461,45 @@ pub(crate) enum SignalValue {
     Transient(Rc<dyn Any>),
 }
 
-/// 信号表的一格（**没有**版本号：S-27）。
+/// 信号表的一格（**没有**版本号：S-27；**有**代际：回收复用时判定旧句柄失效）。
 pub(crate) struct SignalSlot {
-    value: SignalValue,
-    /// 归属作用域（`SignalScope::ROOT.index` = 根作用域）。
-    scope: u32,
+    /// 当前占用该槽位的值；`None` = **空闲槽位**（值已随作用域释放被 drop，等待复用）。
+    value: Option<SignalValue>,
+    /// 槽位代际：存活/空闲槽位恒在 `1..=u32::MAX`；`0` = **退休槽位**（代际用尽，永不复用、
+    /// 永不命中任何句柄）。句柄的 [`SignalId::generation`] 必须与它逐位相等才命中。
+    generation: u32,
 }
 
 impl SignalSlot {
+    /// 句柄代际校验：不匹配 ⇒ 句柄已失效（作用域释放后槽位被回收，或已被新信号复用）。
+    ///
+    /// 读路径用它做**确定性失败**：绝不把复用后的新值交给旧句柄。返回自身，便于链式调用
+    /// （`values.get(..).expect(..).live(id).read_owned(id)`）。
+    ///
+    /// # Panics
+    /// 句柄的槽位下标命中，但代际与槽位不同（见模块文档〈作用域回收与句柄失效〉）。
+    #[inline]
+    pub(crate) fn live(&self, id: SignalId) -> &Self {
+        if self.generation != id.generation() {
+            stale_handle_panic(id, self);
+        }
+        self
+    }
+
+    /// 空闲槽位的"取值"兜底：走到这里说明代际校验已经放行了，但槽位是空的 ⇒ 引擎不变量破坏。
+    #[inline]
+    fn expect_value(&self) -> &SignalValue {
+        self.value
+            .as_ref()
+            .expect("live handle resolved to a free signal slot — engine invariant broken")
+    }
+
     /// `SignalValue::Owned` 的借用视图（不克隆、不产生守卫）。
     ///
     /// 消费者：`App::write` 的等值短路（借用比较）。
     #[inline]
     pub(crate) fn owned_ref<T: 'static>(&self) -> Option<&T> {
-        match &self.value {
+        match self.value.as_ref()? {
             SignalValue::Owned(value) => value.downcast_ref::<T>(),
             SignalValue::Derived(_) | SignalValue::Transient(_) => None,
         }
@@ -397,7 +507,7 @@ impl SignalSlot {
 
     /// `SignalValue::Transient` 的借用视图（不克隆、不产生守卫）。
     pub(crate) fn transient_ref<T: 'static>(&self) -> Option<&T> {
-        match &self.value {
+        match self.value.as_ref()? {
             SignalValue::Transient(value) => value.downcast_ref::<T>(),
             SignalValue::Owned(_) | SignalValue::Derived(_) => None,
         }
@@ -408,8 +518,8 @@ impl SignalSlot {
     /// # Panics
     /// 槽位不是普通信号，或其内部类型与 `T` 不一致（引擎不变量被破坏）。
     pub(crate) fn read_owned<T: 'static>(&self, id: SignalId) -> SignalRef<T> {
-        match &self.value {
-            SignalValue::Owned(value) => SignalRef::from_any(Rc::clone(value), id.to_bits()),
+        match self.expect_value() {
+            SignalValue::Owned(value) => SignalRef::from_any(Rc::clone(value), id),
             SignalValue::Derived(derived) => panic!(
                 "signal #{}: slot is the handle of derived {derived:?}, not a plain signal",
                 id.index()
@@ -425,11 +535,31 @@ impl SignalSlot {
     /// # Panics
     /// 槽位不是瞬态值，或其内部类型与 `T` 不一致。
     pub(crate) fn read_transient<T: 'static>(&self, id: SignalId) -> SignalRef<T> {
-        match &self.value {
-            SignalValue::Transient(value) => SignalRef::from_any(Rc::clone(value), id.to_bits()),
+        match self.expect_value() {
+            SignalValue::Transient(value) => SignalRef::from_any(Rc::clone(value), id),
             SignalValue::Owned(_) | SignalValue::Derived(_) => {
                 panic!("signal #{}: slot is not a transient value", id.index())
             }
+        }
+    }
+
+    /// 普通信号的可变值（`write` / `update` 的公共前戏）。
+    ///
+    /// # Panics
+    /// 槽位不是普通信号（瞬态/派生 = 误用；空闲槽位 = 引擎不变量破坏）。
+    #[inline]
+    fn owned_slot_mut(&mut self, id: SignalId, operation: &'static str) -> &mut Rc<dyn Any> {
+        match self.value.as_mut() {
+            Some(SignalValue::Owned(existing)) => existing,
+            Some(SignalValue::Derived(_) | SignalValue::Transient(_)) => panic!(
+                "signal #{}: {operation}() targets a transient/derived slot — use the matching \
+                 entry point",
+                id.index()
+            ),
+            None => panic!(
+                "signal #{}: {operation}() targets a free slot — engine invariant broken",
+                id.index()
+            ),
         }
     }
 
@@ -437,15 +567,10 @@ impl SignalSlot {
     ///
     /// # Panics
     /// - 存在活跃 [`SignalRef`]：`strong_count > 1`（读守卫持有同一个 `Rc`）；
-    /// - 槽位不是普通信号（`write_transient` 误用防护）。
+    /// - 槽位不是普通信号（`write_transient` 误用防护 / 空闲槽位）。
     #[inline]
     pub(crate) fn write_owned<T: 'static>(&mut self, id: SignalId, value: T) {
-        let SignalValue::Owned(existing) = &mut self.value else {
-            panic!(
-                "signal #{}: write() targets a transient/derived slot — use the matching entry point",
-                id.index()
-            );
-        };
+        let existing = self.owned_slot_mut(id, "write");
         let guards = Rc::strong_count(existing) - 1;
         if guards > 0 {
             panic!(
@@ -472,12 +597,7 @@ impl SignalSlot {
         id: SignalId,
         update: impl FnOnce(&mut T) -> R,
     ) -> R {
-        let SignalValue::Owned(existing) = &mut self.value else {
-            panic!(
-                "signal #{}: update() targets a transient/derived slot",
-                id.index()
-            );
-        };
+        let existing = self.owned_slot_mut(id, "update");
         let guards = Rc::strong_count(existing) - 1;
         if guards > 0 {
             panic!(
@@ -500,11 +620,17 @@ impl SignalSlot {
     /// # Panics
     /// 存在活跃 [`SignalRef`]，或槽位不是瞬态值。
     pub(crate) fn write_transient<T: 'static>(&mut self, id: SignalId, value: T) {
-        let SignalValue::Transient(existing) = &mut self.value else {
-            panic!(
-                "signal #{}: write_transient() targets a plain signal — use write()",
+        let existing = match self.value.as_mut() {
+            Some(SignalValue::Transient(existing)) => existing,
+            Some(SignalValue::Owned(_) | SignalValue::Derived(_)) => panic!(
+                "signal #{}: write_transient() targets a plain/derived slot — use the matching \
+                 entry point",
                 id.index()
-            );
+            ),
+            None => panic!(
+                "signal #{}: write_transient() targets a free slot — engine invariant broken",
+                id.index()
+            ),
         };
         let guards = Rc::strong_count(existing) - 1;
         if guards > 0 {
@@ -519,6 +645,28 @@ impl SignalSlot {
         }
         *existing = Rc::new(value);
     }
+}
+
+/// 旧句柄访问已回收槽位 ⇒ **确定性失败**（见模块文档〈作用域回收与句柄失效〉）。
+///
+/// 诊断要能定位「句柄来自已释放的作用域 / 槽位现在归谁」，而不是一个裸断言。
+#[cold]
+fn stale_handle_panic(id: SignalId, slot: &SignalSlot) -> ! {
+    let state = match (slot.generation, slot.value.is_some()) {
+        (0, _) => "permanently retired (its generation space is exhausted)",
+        (_, false) => "free (its value was recycled when the owning scope was released)",
+        (_, true) => "occupied by a newer signal (the slot was recycled and reused)",
+    };
+    panic!(
+        "signal #{}.{}: handle is stale — slot #{} is {state}, slot generation {}. \
+         A handle must not be used after its scope is released: the value was dropped, so reads \
+         fail deterministically instead of returning the new occupant's value (writes are no-ops: \
+         `App::write` returns false, `App::update_with` returns None).",
+        id.index(),
+        id.generation(),
+        id.index(),
+        slot.generation,
+    )
 }
 
 /// 派生槽：闭包 + 缓存 + 脏位 + 上次依赖。
@@ -606,12 +754,12 @@ impl DerivedStore {
     /// # Panics
     /// 尚未求值（调用方保证先检查 `is_dirty`），或类型不一致（不变量破坏）。
     pub(crate) fn read_value<T: 'static>(&self, id: DerivedId) -> SignalRef<T> {
-        let cache = self
-            .slot(id)
+        let slot = self.slot(id);
+        let cache = slot
             .cache
             .as_ref()
             .expect("derived value has not been evaluated");
-        SignalRef::from_any(Rc::clone(cache), id.to_bits())
+        SignalRef::from_any(Rc::clone(cache), slot.handle)
     }
 
     pub(crate) fn deps(&self, id: DerivedId) -> &[SignalId] {
@@ -647,21 +795,26 @@ impl DerivedStore {
 }
 
 /// 信号 / 派生 / 瞬态值的唯一存储 + 信号作用域表。
+///
+/// 槽位表**只增不减**：`values.len()` 就是槽位峰值（诊断/测试用它证明「窗口 churn 不增长」）。
+/// 释放作用域只把槽位下标还给 `free_slots`；真正回收内存的是被 drop 的值。
 pub(crate) struct StateStore {
     values: Vec<SignalSlot>,
+    /// 空闲槽位栈（LIFO、O(1) 复用；**不扫描**槽位表）。
+    ///
+    /// 不变量：下标不重复；不含退休槽位（代际用尽时槽位**不进**栈，见
+    /// [`StateStore::release_scope`]）；栈上的槽位 `value == None`。
+    free_slots: Vec<u32>,
     derived: DerivedStore,
     /// 作用域表；下标 0 = 根作用域（永不释放）。
     scopes: Vec<ScopeSlot>,
-    /// 已释放作用域数。0 = **从未释放过任何作用域** ⇒ 写路径可以完全跳过作用域检查
-    /// （常见情形：应用只开窗、不关窗）。窗口关闭后它变成 1 并保持 > 0，写路径恢复逐槽检查。
-    released_scopes: usize,
 }
 
 /// 一个作用域的运行时状态。
 struct ScopeSlot {
-    /// 是否已释放（释放后其信号的写是 no-op，依赖边被立即删除）。
+    /// 是否已释放（释放后不可再 mint 新信号；重复释放是幂等 no-op）。
     released: bool,
-    /// 该作用域铸造的全部信号 id（释放时逐条清依赖边）。
+    /// 该作用域铸造的、**仍然存活**的信号 id（释放时逐条回收槽位）。
     signals: Vec<SignalId>,
 }
 
@@ -669,12 +822,12 @@ impl StateStore {
     pub(crate) fn with_capacity(signals: usize, derived: usize) -> Self {
         Self {
             values: Vec::with_capacity(signals),
+            free_slots: Vec::new(),
             derived: DerivedStore::with_capacity(derived),
             scopes: vec![ScopeSlot {
                 released: false,
                 signals: Vec::new(),
             }],
-            released_scopes: 0,
         }
     }
 
@@ -684,6 +837,10 @@ impl StateStore {
     }
 
     /// 新建一个作用域（`App::signal_scope` / `App::create_window`）。
+    ///
+    /// **作用域表本身不回收**：每个建过的窗口留一格 `ScopeSlot`（`bool` + 空 `Vec` 头，32 B；
+    /// 值槽位与依赖边都已回收）。回收它需要给 `SignalScope` 也加代际 —— 否则释放后的旧作用域
+    /// 句柄会命中并释放**新窗口**的作用域（ABA）；那属于独立的句柄层改动，不在槽位回收范围内。
     pub(crate) fn new_scope(&mut self) -> SignalScope {
         let index = u32::try_from(self.scopes.len()).expect("信号作用域溢出 u32");
         self.scopes.push(ScopeSlot {
@@ -693,17 +850,47 @@ impl StateStore {
         SignalScope::from_index(index)
     }
 
-    /// 释放作用域并返回它的全部信号 id（调用方负责清依赖图里以它们为键的边）。
+    /// 释放作用域：**回收**它的全部值槽位（值立即 drop、槽位归还空闲栈、代际 +1），返回旧句柄
+    /// （调用方负责按旧 id 删除依赖图里的边）。
     ///
-    /// 重复释放返回空切片（幂等）。根作用域不可释放（`None`）。
+    /// 重复释放返回空 `Vec`（幂等）。根作用域不可释放（`None`）。
+    ///
+    /// 代际用尽（槽位已发放完 `u32::MAX` 代）的槽位**永久退休**：代际置 0（非法代际）、不进
+    /// 空闲栈 —— 旧句柄因此永远不会 ABA 复活（与 `node::id::Arena` 同一规则）。
     pub(crate) fn release_scope(&mut self, scope: SignalScope) -> Option<Vec<SignalId>> {
-        let slot = self.scopes.get_mut(scope.index() as usize)?;
-        if slot.released {
+        // 根作用域承载 `App::signal` / `transient` / `derived`：永不释放。旧实现只在文档里承诺
+        // 这一点、实现却会照常"释放"；槽位回收后那会清空整个应用的状态，必须做成硬约束。
+        if scope.index() == SignalScope::ROOT.index() {
+            return None;
+        }
+        let scope_slot = self.scopes.get_mut(scope.index() as usize)?;
+        if scope_slot.released {
             return Some(Vec::new());
         }
-        slot.released = true;
-        self.released_scopes += 1;
-        Some(std::mem::take(&mut slot.signals))
+        scope_slot.released = true;
+        let signals = std::mem::take(&mut scope_slot.signals);
+        for id in &signals {
+            let slot = self
+                .values
+                .get_mut(id.index() as usize)
+                .expect("released signal id out of range: engine invariant broken");
+            debug_assert_eq!(
+                slot.generation,
+                id.generation(),
+                "released id must be the live occupant of its slot"
+            );
+            // 值立即 drop（`Rc` 归零 ⇒ T 的内存还给分配器）。在外的读守卫持有自己的 `Rc`
+            // 快照，因此不受影响（见模块文档的借用规则）。
+            slot.value = None;
+            match next_generation(slot.generation) {
+                Some(next) => {
+                    slot.generation = next;
+                    self.free_slots.push(id.index());
+                }
+                None => slot.generation = 0,
+            }
+        }
+        Some(signals)
     }
 
     pub(crate) fn push_owned<T: 'static>(&mut self, value: T) -> SignalId {
@@ -711,6 +898,9 @@ impl StateStore {
     }
 
     /// 在指定作用域里注册普通信号。
+    ///
+    /// # Panics
+    /// 作用域已释放（引擎误用：释放后不可再 mint 新信号）。
     pub(crate) fn push_owned_scoped<T: 'static>(
         &mut self,
         scope: SignalScope,
@@ -736,40 +926,31 @@ impl StateStore {
     /// 覆盖普通信号的值（**不**比较、**不**失效：失效由 `App::write` 负责）。
     ///
     /// # Panics
-    /// 槽位不是普通信号，或该信号存在活跃读守卫（见 [`SignalSlot::write_owned`]）。
+    /// 槽位不是普通信号、句柄已失效，或该信号存在活跃读守卫（见 [`SignalSlot::write_owned`]）。
     #[cfg(test)]
     pub(crate) fn set_owned<T: 'static>(&mut self, id: SignalId, value: T) {
-        self.slot_mut(id).write_owned(id, value);
+        self.live_slot_mut(id).write_owned(id, value);
     }
 
-    /// **写路径的合并入口**（一次槽位查找）：作用域检查 → 等值短路 → 借用冲突检查 → 写。
+    /// **写路径的合并入口**（一次槽位查找）：句柄代际校验 → 等值短路 → 借用冲突检查 → 写。
     ///
-    /// 返回值：`None` = 作用域已释放（no-op，调用方不失效、不唤醒）；`Some(false)` = 等值短路；
+    /// 返回值：`None` = **句柄已失效**（作用域已释放 / 槽位已复用：no-op，调用方不失效、
+    /// 不唤醒 —— 迟到写入不得产生僵尸唤醒，也绝不写复用后的新值）；`Some(false)` = 等值短路；
     /// `Some(true)` = 已写入（调用方负责 `invalidate`）。
     ///
-    /// 为什么合并：`App::write` 是最高频热路径（行情推送每帧成百上千次），三次
-    /// `Vec` 索引 + 两次作用域表的 Option 链在基准里是可见成本。
+    /// 为什么合并：`App::write` 是最高频热路径（行情推送每帧成百上千次）；代际比较是一条
+    /// `u32` 比较（它取代了旧实现的 `released_scopes` + 作用域表 Option 链，热路径没有变慢）。
     #[inline]
     pub(crate) fn write_owned<T: PartialEq + 'static>(
         &mut self,
         id: SignalId,
         value: T,
     ) -> Option<bool> {
-        let StateStore {
-            values,
-            scopes,
-            released_scopes,
-            ..
-        } = self;
-        let slot = values
+        let slot = self
+            .values
             .get_mut(id.index() as usize)
             .expect("signal id out of range: engine invariant broken");
-        // 快路径：从未释放过作用域 ⇒ 不可能有"已释放作用域的信号"（省掉一次 Option 链）。
-        if *released_scopes > 0
-            && scopes
-                .get(slot.scope as usize)
-                .is_some_and(|scope| scope.released)
-        {
+        if slot.generation != id.generation() {
             return None;
         }
         if slot.owned_ref::<T>() == Some(&value) {
@@ -781,59 +962,65 @@ impl StateStore {
 
     /// 原地更新普通信号（无等值短路；与 [`StateStore::write_owned`] 同样一次查找）。
     ///
-    /// 返回值：`None` = 作用域已释放（no-op，闭包不会被调用）；`Some(r)` = 闭包的返回值
+    /// 返回值：`None` = 句柄已失效（no-op，闭包不会被调用）；`Some(r)` = 闭包的返回值
     /// （`App::update_with` 把它透给调用点，`App::update` 的闭包返回 `()`）。
     pub(crate) fn update_owned<T: 'static, R>(
         &mut self,
         id: SignalId,
         update: impl FnOnce(&mut T) -> R,
     ) -> Option<R> {
-        let StateStore {
-            values,
-            scopes,
-            released_scopes,
-            ..
-        } = self;
-        let slot = values
+        let slot = self
+            .values
             .get_mut(id.index() as usize)
             .expect("signal id out of range: engine invariant broken");
-        if *released_scopes > 0
-            && scopes
-                .get(slot.scope as usize)
-                .is_some_and(|scope| scope.released)
-        {
+        if slot.generation != id.generation() {
             return None;
         }
         Some(slot.update_owned(id, update))
     }
 
     pub(crate) fn set_transient<T: 'static>(&mut self, id: SignalId, value: T) {
-        self.slot_mut(id).write_transient(id, value);
+        self.live_slot_mut(id).write_transient(id, value);
     }
 
     /// 读普通信号（返回读守卫，不克隆值）。
+    ///
+    /// # Panics
+    /// 句柄已失效（**确定性失败**，见模块文档〈作用域回收与句柄失效〉），或槽位不是普通信号。
     pub(crate) fn read_owned<T: 'static>(&self, id: SignalId) -> SignalRef<T> {
-        self.slot(id).read_owned(id)
+        self.live_slot(id).read_owned(id)
     }
 
     /// 读瞬态值（返回读守卫，不克隆值）。
+    ///
+    /// # Panics
+    /// 句柄已失效，或槽位不是瞬态值。
     pub(crate) fn read_transient<T: 'static>(&self, id: SignalId) -> SignalRef<T> {
-        self.slot(id).read_transient(id)
+        self.live_slot(id).read_transient(id)
     }
 
-    /// 相等比较用的借用视图（不克隆）。`None` = 不是普通信号或类型不符。
+    /// 相等比较用的借用视图（不克隆）。`None` = 句柄已失效 / 不是普通信号 / 类型不符。
     ///
     /// 消费者：`App::write` 的等值短路（借用比较，不克隆）。
     #[cfg(test)]
     pub(crate) fn owned_ref<T: 'static>(&self, id: SignalId) -> Option<&T> {
-        self.values.get(id.index() as usize)?.owned_ref::<T>()
+        self.slot_if_live(id)?.owned_ref::<T>()
     }
 
-    /// 瞬态值的借用视图（不克隆）。`None` = 不是瞬态值或类型不符。
+    /// 瞬态值的借用视图（不克隆）。`None` = 句柄已失效 / 不是瞬态值 / 类型不符。
     ///
     /// 消费者：`App::animate` 取动画起点、`ActionCtx` 侧的诊断读。
     pub(crate) fn transient_ref<T: 'static>(&self, id: SignalId) -> Option<&T> {
-        self.values.get(id.index() as usize)?.transient_ref::<T>()
+        self.slot_if_live(id)?.transient_ref::<T>()
+    }
+
+    /// 句柄是否仍指向存活槽位。
+    ///
+    /// 消费者：`App::write_with` —— 它是「先读旧值再写」组合子，失效句柄必须走 no-op 而不是
+    /// 在读一步 panic（与 `App::write` 同口径）。
+    #[inline]
+    pub(crate) fn is_live(&self, id: SignalId) -> bool {
+        self.slot_if_live(id).is_some()
     }
 
     pub(crate) fn mark_derived_dirty(&mut self, id: DerivedId) -> bool {
@@ -844,27 +1031,113 @@ impl StateStore {
         self.derived.handle(id)
     }
 
-    fn slot(&self, id: SignalId) -> &SignalSlot {
+    /// 槽位表长度 = **槽位峰值**（数组只增不减：回收只把下标放进空闲栈）。
+    #[cfg(test)]
+    pub(crate) fn slot_count_for_test(&self) -> usize {
+        self.values.len()
+    }
+
+    /// 空闲栈长度（已回收、等待复用的槽位数）。
+    #[cfg(test)]
+    pub(crate) fn free_slot_count_for_test(&self) -> usize {
+        self.free_slots.len()
+    }
+
+    /// 存活（仍持有值）槽位数。
+    #[cfg(test)]
+    pub(crate) fn live_slot_count_for_test(&self) -> usize {
+        self.values
+            .iter()
+            .filter(|slot| slot.value.is_some())
+            .count()
+    }
+
+    /// 仅测试：把某个存活槽位的代际推到指定值，返回与新代际匹配的句柄（验证退休路径）。
+    ///
+    /// 同时改写作用域表里登记的 id —— 它必须与槽位保持一致，否则释放时会撞上 debug 断言。
+    #[cfg(test)]
+    pub(crate) fn force_generation_for_test(&mut self, old: SignalId, generation: u32) -> SignalId {
+        let slot = self
+            .values
+            .get_mut(old.index() as usize)
+            .expect("test handle must be alive");
+        slot.generation = generation;
+        let fresh = SignalId::from_parts(old.index(), generation);
+        for scope in &mut self.scopes {
+            for id in &mut scope.signals {
+                if *id == old {
+                    *id = fresh;
+                }
+            }
+        }
+        fresh
+    }
+
+    /// 句柄命中且代际一致时的只读槽位（失效 ⇒ `None`）。
+    fn slot_if_live(&self, id: SignalId) -> Option<&SignalSlot> {
+        let slot = self.values.get(id.index() as usize)?;
+        (slot.generation == id.generation()).then_some(slot)
+    }
+
+    /// 读路径的槽位查找：句柄失效 ⇒ 确定性 panic（见 [`SignalSlot::live`]）。
+    fn live_slot(&self, id: SignalId) -> &SignalSlot {
         self.values
             .get(id.index() as usize)
             .expect("signal id out of range: engine invariant broken")
+            .live(id)
     }
 
-    fn slot_mut(&mut self, id: SignalId) -> &mut SignalSlot {
-        self.values
+    /// 冷路径的槽位查找（`write_transient` / 测试写）：句柄失效 ⇒ 确定性 panic。
+    fn live_slot_mut(&mut self, id: SignalId) -> &mut SignalSlot {
+        let slot = self
+            .values
             .get_mut(id.index() as usize)
-            .expect("signal id out of range: engine invariant broken")
+            .expect("signal id out of range: engine invariant broken");
+        if slot.generation != id.generation() {
+            stale_handle_panic(id, slot);
+        }
+        slot
     }
 
+    /// 铸出新句柄并登记进作用域：优先复空闲栈里的槽位（代际已在释放时 +1），否则追加新槽位。
+    ///
+    /// # Panics
+    /// 作用域已释放，或槽位下标溢出 `u32`。
     fn push_slot(&mut self, value: SignalValue, scope: SignalScope) -> SignalId {
-        let id = SignalId(u32::try_from(self.values.len()).expect("信号槽位溢出 u32"));
-        self.values.push(SignalSlot {
-            value,
-            scope: scope.index(),
-        });
-        if let Some(slot) = self.scopes.get_mut(scope.index() as usize) {
-            slot.signals.push(id);
+        let scope_slot = self
+            .scopes
+            .get_mut(scope.index() as usize)
+            .unwrap_or_else(|| {
+                panic!(
+                    "signal scope #{} does not exist — engine invariant broken",
+                    scope.index()
+                )
+            });
+        if scope_slot.released {
+            panic!(
+                "signal scope #{}: released scopes cannot mint new signals — its values were \
+                 recycled by `release_scope`, so a new value here would leak forever",
+                scope.index()
+            );
         }
+        let (index, generation) = match self.free_slots.pop() {
+            Some(index) => {
+                let generation = self.values[index as usize].generation;
+                debug_assert!(generation > 0, "free list must never hold a retired slot");
+                (index, generation)
+            }
+            None => {
+                let index = u32::try_from(self.values.len()).expect("信号槽位溢出 u32");
+                self.values.push(SignalSlot {
+                    value: None,
+                    generation: 1,
+                });
+                (index, 1)
+            }
+        };
+        self.values[index as usize].value = Some(value);
+        let id = SignalId::from_parts(index, generation);
+        scope_slot.signals.push(id);
         id
     }
 }
@@ -874,14 +1147,20 @@ mod tests {
     use std::{
         cell::{Cell, RefCell},
         marker::PhantomData,
+        mem::size_of,
         rc::Rc,
     };
 
-    use super::{Derived, Signal, SignalId, SignalRef, StateStore, Transient};
+    use super::{Derived, Signal, SignalId, SignalRef, SignalScope, StateStore, Transient};
     use crate::{
         app::App,
         error::EngineError,
-        node::{builder::NodeBuilder, dependency::ReadCtx, dirty::DirtyFlags, id::NodeId},
+        node::{
+            builder::NodeBuilder,
+            dependency::{DependencyGraph, Owner, ReadCtx},
+            dirty::DirtyFlags,
+            id::NodeId,
+        },
         paint::style::StylePatch,
         window::{WindowId, WindowOptions},
     };
@@ -929,7 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn signal_id_is_dense_and_never_reused() {
+    fn signal_id_is_a_dense_slot_index_plus_generation() {
         let (_rt, mut app) = new_app();
         let a: Signal<u32> = app.signal(1);
         let b: Signal<u32> = app.signal(2);
@@ -938,10 +1217,30 @@ mod tests {
         assert_eq!(
             (a.id().index(), b.id().index(), c.id().index()),
             (0, 1, 2),
-            "SignalId 必须是稠密下标（无删除 ⇒ 无自由表 ⇒ 无代际）"
+            "SignalId 是稠密槽位下标（根作用域不回收 ⇒ 只增）"
+        );
+        assert_eq!(
+            (
+                a.id().generation(),
+                b.id().generation(),
+                c.id().generation()
+            ),
+            (1, 1, 1),
+            "新槽位的代际从 1 开始（0 只属于退休槽位）"
         );
         assert_ne!(a.id(), b.id());
-        assert_eq!((a.id().to_bits(), c.id().to_bits()), (0, 2));
+        assert_eq!(
+            a.id().to_bits(),
+            1u64 << 32,
+            "to_bits = (代际 << 32) | 下标"
+        );
+        assert_eq!(c.id().to_bits(), (1u64 << 32) | 2);
+        assert_eq!(size_of::<SignalId>(), 8, "槽位下标 + 代际");
+        assert_eq!(
+            size_of::<Option<SignalId>>(),
+            8,
+            "NonZeroU32 的 niche 让 Option 不额外膨胀"
+        );
     }
 
     #[test]
@@ -949,12 +1248,13 @@ mod tests {
         struct NotCopy;
 
         let signal = Signal::<NotCopy> {
-            id: SignalId(7),
+            id: SignalId::for_test(7),
             _marker: PhantomData,
         };
         let copy = signal;
         let _ = signal;
         assert_eq!(copy.id().index(), 7, "Copy 与 T: Copy 无关");
+        assert_eq!(copy.id().generation(), 1);
     }
 
     #[test]
@@ -1495,10 +1795,10 @@ mod tests {
         );
     }
 
-    // ── A2：SignalScope（窗口销毁后不得有僵尸唤醒）──────────────────────────
+    // ── A2：SignalScope（窗口销毁后不得有僵尸唤醒；S6 起值也立即回收）──────────
 
     #[test]
-    fn released_scope_write_is_a_noop_without_frame_request() {
+    fn released_scope_handle_write_is_a_noop_and_read_fails_deterministically() {
         let (_rt, mut app) = new_app();
         let window = app.create_window(WindowOptions::default());
         let signal: Signal<u32> = app.window_signal(window, 1);
@@ -1513,13 +1813,36 @@ mod tests {
         let _ = app.take_wake_request();
         let start = app.frame_requests();
 
+        // 写 / 更新：no-op（false / None、不标脏、不唤醒）—— 迟到写入不得僵尸唤醒（R03-6）。
         assert!(
             !app.write(&signal, 2),
-            "已释放作用域的写必须 short-circuit 为 false"
+            "已失效句柄的写必须 short-circuit 为 false"
+        );
+        assert!(
+            app.update_with(&signal, |value| *value += 1).is_none(),
+            "已失效句柄的 update_with 必须返回 None"
         );
         assert_eq!(app.frame_requests(), start, "不得请求帧（无僵尸唤醒）");
         assert!(!app.take_wake_request(), "不得置唤醒位");
-        assert_eq!(*app.read(&signal), 1, "值被冻结（写没有生效）");
+
+        // 读：确定性失败（值已被回收，绝不能返回复用后的新值）。
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = *app.read(&signal);
+        }))
+        .expect_err("读已失效句柄必须 panic");
+        let message = panic_payload_message(payload);
+        assert!(
+            message.contains("stale"),
+            "panic 必须可诊断（stale）：{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "#{}.{}",
+                signal.id().index(),
+                signal.id().generation()
+            )),
+            "panic 必须带槽位下标与代际：{message}"
+        );
     }
 
     #[test]
@@ -1549,6 +1872,235 @@ mod tests {
         );
     }
 
+    // ── S6：槽位回收 + 复用 + 句柄失效（`StateStore` 层）────────────────────
+    //
+    // 窗口路径（`create_window` / `window_signal` / `close_window`）对应的 store 调用就是
+    // `new_scope` / `push_owned_scoped` / `release_scope` + 逐 id `graph.remove_signal`，
+    // 因此这一层的断言直接覆盖「建窗 → 加信号 → 关窗」循环的存储行为。
+
+    /// 回收后复用同一槽位、代际递增；旧句柄不等于新句柄。
+    #[test]
+    fn releasing_a_scope_recycles_slots_and_bumps_generation() {
+        let mut store = StateStore::with_capacity(4, 0);
+        let scope = store.new_scope();
+        let old = store.push_owned_scoped(scope, 7u32);
+        assert_eq!((old.index(), old.generation()), (0, 1));
+        assert_eq!(store.live_slot_count_for_test(), 1);
+
+        assert_eq!(store.release_scope(scope).map(|ids| ids.len()), Some(1));
+        assert_eq!(store.slot_count_for_test(), 1, "槽位数组不收缩（下标复用）");
+        assert_eq!(store.free_slot_count_for_test(), 1, "槽位必须归还空闲栈");
+        assert_eq!(
+            store.live_slot_count_for_test(),
+            0,
+            "值必须被 drop（内存回收）"
+        );
+        assert!(!store.is_live(old), "释放后旧句柄立即失效");
+
+        let scope2 = store.new_scope();
+        let fresh = store.push_owned_scoped(scope2, 100u32);
+        assert_eq!(fresh.index(), old.index(), "新信号必须优先复用空闲槽位");
+        assert_eq!(
+            fresh.generation(),
+            old.generation() + 1,
+            "复用必须推进槽位代际"
+        );
+        assert_ne!(fresh, old);
+        assert_eq!(store.free_slot_count_for_test(), 0);
+        assert_eq!(store.live_slot_count_for_test(), 1);
+        assert!(store.is_live(fresh));
+        assert_eq!(*store.read_owned::<u32>(fresh), 100);
+    }
+
+    /// 读旧句柄 = 确定性失败（panic 带诊断），且永远读不到复用后的新值。
+    #[test]
+    fn stale_handle_read_is_a_deterministic_panic_with_diagnostic() {
+        let mut store = StateStore::with_capacity(2, 0);
+        let scope = store.new_scope();
+        let old = store.push_owned_scoped(scope, 1u32);
+        store.release_scope(scope);
+        let scope2 = store.new_scope();
+        let fresh = store.push_owned_scoped(scope2, 2u32);
+        assert_eq!(fresh.index(), old.index());
+
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = *store.read_owned::<u32>(old);
+        }))
+        .expect_err("旧句柄读必须 panic（绝不返回复用后的新值）");
+        let message = panic_payload_message(payload);
+        assert!(message.contains("stale"), "panic 必须可诊断：{message}");
+        assert!(
+            message.contains("newer signal") || message.contains("free"),
+            "panic 必须说明槽位现状（空闲 / 已被新信号占用）：{message}"
+        );
+        assert!(
+            message.contains("#0.1"),
+            "panic 必须带旧句柄下标+代际：{message}"
+        );
+        assert_eq!(*store.read_owned::<u32>(fresh), 2, "新占用者的值不受影响");
+    }
+
+    /// 写旧句柄 = no-op（`None`），绝不修改复用后的新值。
+    #[test]
+    fn stale_handle_write_is_a_noop_and_never_touches_the_reused_value() {
+        let mut store = StateStore::with_capacity(2, 0);
+        let scope = store.new_scope();
+        let old = store.push_owned_scoped(scope, 1u32);
+        store.release_scope(scope);
+        let scope2 = store.new_scope();
+        let fresh = store.push_owned_scoped(scope2, 2u32);
+        assert_eq!(fresh.index(), old.index());
+
+        assert_eq!(
+            store.write_owned(old, 99u32),
+            None,
+            "失效句柄的写必须是 no-op（None = 不失效传播）"
+        );
+        assert_eq!(
+            store.update_owned(old, |value| *value = 100),
+            None,
+            "失效句柄的 update 必须返回 None（闭包不执行）"
+        );
+        assert_eq!(
+            *store.read_owned::<u32>(fresh),
+            2,
+            "复用后的新值绝不能被子虚乌有的旧写改掉"
+        );
+        assert_eq!(store.write_owned(fresh, 3u32), Some(true), "新句柄照常可写");
+        assert_eq!(*store.read_owned::<u32>(fresh), 3);
+    }
+
+    /// 释放前已发出的读守卫是 `Rc` 快照：值被回收后它仍可读（快照语义，不悬垂）。
+    #[test]
+    fn read_guard_survives_the_release_as_a_value_snapshot() {
+        let mut store = StateStore::with_capacity(1, 0);
+        let scope = store.new_scope();
+        let id = store.push_owned_scoped(scope, String::from("frozen"));
+
+        let guard = store.read_owned::<String>(id);
+        store.release_scope(scope);
+        assert_eq!(&*guard, "frozen", "已发出的守卫持有旧值的 Rc 快照");
+        assert_eq!(store.live_slot_count_for_test(), 0, "存储侧的值已 drop");
+    }
+
+    /// 代际用尽 ⇒ 槽位永久退休：不进空闲栈、不被复用，旧句柄不会 ABA 复活。
+    #[test]
+    fn generation_exhaustion_retires_the_slot_instead_of_wrapping() {
+        let mut store = StateStore::with_capacity(1, 0);
+        let scope = store.new_scope();
+        let id = store.push_owned_scoped(scope, 1u32);
+        let almost = store.force_generation_for_test(id, u32::MAX);
+
+        assert_eq!(store.release_scope(scope).map(|ids| ids.len()), Some(1));
+        assert!(!store.is_live(almost));
+        assert_eq!(store.free_slot_count_for_test(), 0, "退休槽位不进空闲栈");
+
+        let scope2 = store.new_scope();
+        let fresh = store.push_owned_scoped(scope2, 2u32);
+        assert_ne!(fresh.index(), id.index(), "退休槽位不得被复用");
+        assert_eq!(store.slot_count_for_test(), 2, "新信号只能用新槽位");
+        assert!(!store.is_live(almost), "旧句柄不得复活");
+    }
+
+    /// 1000 轮「建窗 → 加信号 → 关窗」：槽位峰值**不增长**（去掉回收 ⇒ 线性增长 ⇒ 红）。
+    #[test]
+    fn thousand_window_cycles_recycle_slots_so_the_peak_does_not_grow() {
+        const CYCLES: usize = 1000;
+        const SIGNALS_PER_WINDOW: usize = 8;
+
+        let mut store = StateStore::with_capacity(4, 0);
+        let mut peak: Option<usize> = None;
+        for cycle in 0..CYCLES {
+            let scope = store.new_scope();
+            for value in 0..SIGNALS_PER_WINDOW {
+                let id = store.push_owned_scoped(scope, (value + cycle) as u32);
+                assert!(store.is_live(id), "新句柄必须存活");
+            }
+            assert_eq!(
+                store.release_scope(scope).map(|ids| ids.len()),
+                Some(SIGNALS_PER_WINDOW)
+            );
+            assert_eq!(store.live_slot_count_for_test(), 0, "关窗后不得有存活槽位");
+            let slots = store.slot_count_for_test();
+            match peak {
+                Some(expected) => assert_eq!(
+                    slots, expected,
+                    "第 {cycle} 轮后槽位峰值必须停在第 1 轮的 {expected} 个槽位（回收失效会线性增长）"
+                ),
+                None => peak = Some(slots),
+            }
+        }
+        assert_eq!(
+            store.free_slot_count_for_test(),
+            SIGNALS_PER_WINDOW,
+            "最后一轮的槽位必须全部回到空闲栈"
+        );
+    }
+
+    /// 槽位级依赖边：释放后按旧 id 归零；复用后的新信号不继承旧 owner。
+    #[test]
+    fn recycling_a_slot_clears_its_dependency_entries() {
+        let mut store = StateStore::with_capacity(2, 0);
+        let mut graph = DependencyGraph::new();
+        let scope = store.new_scope();
+        let old = store.push_owned_scoped(scope, 1u32);
+        let owner = Owner::Node {
+            window: WindowId::for_test(1),
+            node: NodeId::for_test(1, 1),
+        };
+        graph.replace_deps(owner, &[], &[old]);
+        assert_eq!(graph.signal_count(), 1, "先建立一条依赖边");
+
+        // 与 `App::release_scope` 完全同一条调用点：释放槽位 + 逐 id 删边。
+        let released = store.release_scope(scope).expect("作用域存在");
+        for signal in &released {
+            graph.remove_signal(*signal);
+        }
+        assert_eq!(graph.signal_count(), 0, "释放后槽位级依赖边必须归零");
+
+        let scope2 = store.new_scope();
+        let fresh = store.push_owned_scoped(scope2, 2u32);
+        assert_eq!(fresh.index(), old.index(), "槽位已复用");
+        assert!(
+            graph.dependents_mut(fresh).is_none(),
+            "新占用者不得继承旧信号的 owner"
+        );
+        assert!(graph.dependents_mut(old).is_none(), "旧键必须干净");
+    }
+
+    /// 已释放作用域不得再 mint 信号（否则新值永远没有释放入口 = 重新引入泄漏）。
+    #[test]
+    fn minting_into_a_released_scope_is_a_diagnostic_panic() {
+        let mut store = StateStore::with_capacity(1, 0);
+        let scope = store.new_scope();
+        store.push_owned_scoped(scope, 1u32);
+        store.release_scope(scope);
+
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.push_owned_scoped(scope, 2u32);
+        }))
+        .expect_err("已释放作用域不得再 mint 信号");
+        let message = panic_payload_message(payload);
+        assert!(
+            message.contains("released scopes cannot mint"),
+            "panic 必须可诊断：{message}"
+        );
+    }
+
+    /// 根作用域没有释放入口（否则会把 `App::signal` / transient / derived 全部回收）。
+    #[test]
+    fn root_scope_is_never_released() {
+        let mut store = StateStore::with_capacity(2, 0);
+        let root_signal = store.push_owned(1u32);
+        assert_eq!(
+            store.release_scope(SignalScope::ROOT),
+            None,
+            "根作用域不可释放"
+        );
+        assert!(store.is_live(root_signal), "根作用域信号必须仍然存活");
+        assert_eq!(*store.read_owned::<u32>(root_signal), 1);
+    }
+
     // ── A5：句柄用尽的行为 ────────────────────────────────────────────────
 
     #[test]
@@ -1576,8 +2128,13 @@ mod tests {
         let signal: Signal<u32> = app.signal_scoped(scope, 3);
         assert_eq!(app.release_scope(scope), 1);
         assert_eq!(app.release_scope(scope), 0, "重复释放返回 0");
-        assert!(!app.write(&signal, 4));
-        assert_eq!(*app.read(&signal), 3);
+        assert!(!app.write(&signal, 4), "失效句柄的写是 no-op");
+        // 值已回收：读是确定性失败（不再是"返回冻结值"）。
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = *app.read(&signal);
+        }))
+        .expect_err("失效句柄的读必须 panic");
+        assert!(panic_payload_message(payload).contains("stale"));
     }
 
     // ── A3：NodeId 窗口作用域 ─────────────────────────────────────────────

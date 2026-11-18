@@ -75,6 +75,10 @@ pub(crate) fn invalidate_measure(tree: &mut NodeTree, node: NodeId) -> Result<()
 /// **动态属性请用 `bind_style`**（`StylePatch` 通道）：每帧调本方法会清掉整条祖先链的缓存，
 /// 让增量布局退化为全量。
 ///
+/// **等值写入是 no-op**（R04-6）：样式是值语义，写同一份 `Style` 不产生任何失效。旧实现无比较
+/// 即 `invalidate_layout`，于是「每帧把同一份样式再 `set_style` 一次」会把祖先链的 taffy 缓存
+/// 每秒清掉 60 次，增量布局退化为全量 —— 而调用方从签名上看不出这是热路径。
+///
 /// # Errors
 /// `EngineError::StaleNode { node }`：句柄陈旧（从未存在 / 已卸载）。
 pub(crate) fn set_style(
@@ -85,6 +89,9 @@ pub(crate) fn set_style(
     let Some(target) = tree.arena.get_mut(node) else {
         return Err(EngineError::StaleNode { node });
     };
+    if *target.style == style {
+        return Ok(());
+    }
     *target.style = style;
     tree.invalidate_layout(node);
     Ok(())
@@ -92,6 +99,9 @@ pub(crate) fn set_style(
 
 // 消费者：`impl NodeTree::set_layout_override` 的薄委托（外部调用点见该方法文档）。
 /// 更新布局覆盖矩形（P10 的拖拽/分栏手柄）：写值 + 标 `LAYOUT|PAINT` + 清 `node..root` 缓存。
+///
+/// **等值写入是 no-op**（R04-6）：拖拽路径每帧都会用同一坐标再写一次，无比较会让整条
+/// 祖先链每帧失效（覆盖节点的子树本来就不参与 taffy 布局，代价全落在祖先缓存上）。
 ///
 /// # Errors
 /// `EngineError::StaleNode { node }`：句柄陈旧。
@@ -103,6 +113,9 @@ pub(crate) fn set_layout_override(
     let Some(target) = tree.arena.get_mut(node) else {
         return Err(EngineError::StaleNode { node });
     };
+    if target.layout_override == layout_override {
+        return Ok(());
+    }
     target.layout_override = layout_override;
     tree.invalidate_layout(node);
     Ok(())
@@ -225,6 +238,10 @@ pub(crate) fn set_local_layout(tree: &mut NodeTree, node: NodeId, layout: &taffy
         );
         target.laid_out_epoch = epoch;
         // `LAYOUT` 位的唯一消费点：被 taffy 布局过 ⇒ 不再需要重排。
+        //
+        // R04-10 的错误帧**不靠这里**保留脏位：`taffy_tree::run` 在发现 measure 违规时对出错
+        // 节点调 `invalidate_layout`（清 `node..root` 缓存 + 重新标 `LAYOUT`）后才返回 `Err`，
+        // 所以「本轮无错误」与「可以消费」是同一件事，清除点仍然唯一。
         target.dirty.remove(DirtyFlags::LAYOUT);
     }
     tree.dirty_layout.remove(node);
@@ -343,6 +360,14 @@ pub(crate) fn place_subtree(
     // 隐藏子树（自身或祖先 `display: none`）一律零化：taffy 的 hidden pass 已把 local 写成零，
     // 这里再兜住 `LayoutOverride`（覆盖节点不得留非零幽灵盒）。
     let hidden = parent_hidden || matches!(target.style.inner.display, taffy::style::Display::None);
+    // R04-12：**布局叶子**（`Canvas`/`Geometry`/带 `LayoutOverride` 的节点）不给子节点布局
+    // （`taffy_tree::dispatch_child_layout` 的这两个分支不递归；`NodeBuilder::build` 在 debug
+    // 构建里直接拒绝挂载）。release 下若真的挂上了子节点，必须给它们**已定义**的几何：零盒。
+    // 旧实现把子节点的 `local` 留在挂载值/上一轮布局值 ⇒ 全部堆在覆盖盒左上角（命中区域错
+    // 但"确定"，极难定位）；且 taffy 永不写回这些子节点的 `LAYOUT` ⇒ `layout_if_dirty`
+    // 每帧为真，帧循环永久空转（只烧 CPU、不崩）。
+    let layout_leaf = target.layout_override.is_some() || target.kind.is_leaf();
+    let children_hidden = hidden || layout_leaf;
     // `LayoutOverride` 直接覆盖 taffy 给的父相对盒（位置与尺寸都取应用给的值）；
     // 隐藏时归零（否则出流/隐藏的覆盖节点会在 P06 读到幽灵盒）。
     let local = if hidden {
@@ -363,9 +388,21 @@ pub(crate) fn place_subtree(
         None => abs,
     };
     let old = target.layout;
+    // R03-10 / R04-2 的剩余项（登记，不在本次改动范围）：这里仍 `clone()` 一次 `children`
+    // （每个被布局的节点一次短 Vec 分配），`place_subtree` 也仍是递归。改成索引访问 + 显式栈
+    // 需要同时照顾 `&mut tree` 与子迭代的借用、以及出流/hoisted 两套遍历次序，属独立重构；
+    // 本次只做语义修复（R04-12 的布局叶子零盒），不动遍历结构。
     let children = target.children.clone();
     let changed = committed != old.bounds;
     let fresh = target.laid_out_epoch == epoch;
+    if hidden {
+        if let Some(target) = tree.arena.get_mut(node) {
+            // 不参与布局的节点：`LAYOUT` 等不到 taffy 写回（隐藏 pass / 布局叶子的子节点都不在
+            // taffy 的遍历里）⇒ 必须在这里消费，否则帧门禁永远为真（R04-12 的空转面）。
+            target.dirty.remove(DirtyFlags::LAYOUT);
+        }
+        tree.dirty_layout.remove(node);
+    }
     // 吸附开启时：父盒"吸附后没变"不蕴含子树没变（未圆整位移可能让后代跨过半像素边界），
     // 因此早期退出判定还要看**未圆整原点**是否变化（该旁表只在 `device_scale.is_some()` 时维护）。
     let raw_changed = tree.device_scale.is_some() && raw_origin(tree, node) != Some(abs.origin);
@@ -415,17 +452,20 @@ pub(crate) fn place_subtree(
         // **树父**的 border-box origin 放置（B1：taffy 会把 absolute 节点挂到最近的定位祖先，
         // 而引擎 `LayoutOverride` 的契约是「相对父 border box」），隐藏子树里的出流后代也必须
         // 在这里零化（N1）。
-        if tree.is_out_of_flow(child) && tree.layout_override_of(child).is_none() && !hidden {
+        if tree.is_out_of_flow(child)
+            && tree.layout_override_of(child).is_none()
+            && !children_hidden
+        {
             continue;
         }
-        tree.place_subtree(child, abs.origin, epoch, false, hidden);
+        tree.place_subtree(child, abs.origin, epoch, false, children_hidden);
     }
     for child in hoisted.iter().copied() {
         if tree.layout_override_of(child).is_some() {
             // override 节点已由树父按 border-box origin 放置（B1），不得再用包含块的 local 算一次。
             continue;
         }
-        tree.place_subtree(child, abs.origin, epoch, false, false);
+        tree.place_subtree(child, abs.origin, epoch, false, layout_leaf);
     }
 
     // B9：本节点的子树包围盒在**同一次后序遍历**里精确重算（不再有第二遍全树扫描）。
@@ -433,7 +473,7 @@ pub(crate) fn place_subtree(
     // 子节点在下面这个循环之前已经处理完（DFS 后序），因此读到的 `subtree_bounds` 是本轮的；
     // 未被访问的子节点缓存仍然有效（跳过条件是「没布局且绝对盒没变」⇒ 其子树包络不变）。
     // 成本 = O(本节点直接子节点数)，与"命中测试要剪枝的那些子树"同阶，**不是** O(全树)。
-    let mut union = committed;
+    let mut union = hit_envelope(tree, node, committed);
     for child in children.iter().copied() {
         union = union.union(subtree_bounds(tree, child));
     }
@@ -533,11 +573,13 @@ fn expand_hoisted_ancestors(tree: &mut NodeTree) {
         let Some(target) = tree.arena.get(current) else {
             continue;
         };
-        let mut union = target.layout.bounds;
+        let base = target.layout.bounds;
         let children = target.children.clone();
+        let mut union = base;
         for child in children {
             union = union.union(subtree_bounds(tree, child));
         }
+        let union = hit_envelope(tree, current, union);
         store_subtree_bounds(tree, current, union);
     }
     tree.recycle(moved);
@@ -557,11 +599,13 @@ pub(crate) fn recompute_bounds_upwards(tree: &mut NodeTree, from: NodeId) {
         let Some(target) = tree.arena.get(current) else {
             return;
         };
-        let mut union = target.layout.bounds;
+        let base = target.layout.bounds;
         let children = target.children.clone();
+        let mut union = base;
         for child in children {
             union = union.union(subtree_bounds(tree, child));
         }
+        let union = hit_envelope(tree, current, union);
         let cached = subtree_bounds(tree, current);
         if union == cached {
             return;
@@ -569,6 +613,27 @@ pub(crate) fn recompute_bounds_upwards(tree: &mut NodeTree, from: NodeId) {
         store_subtree_bounds(tree, current, union);
         cursor = tree.arena.get(current).and_then(|target| target.parent);
     }
+}
+
+/// 节点的**命中包络**：布局盒 ∪ `HitShape` 的局部 AABB（绝对坐标）。
+///
+/// 命中形状可以超出布局盒（R04-8：自绘内容平移/缩放后仍可命中），而 `subtree_bounds` 是
+/// 命中测试唯一的子树剪枝依据 —— 不把形状 AABB 并进包络，形状落在盒外的节点会在父级
+/// 就被剪掉（"看得见、点得到却命不中"）。`Custom` 谓词的 AABB 无法静态得知，因此不扩大。
+fn hit_envelope(tree: &NodeTree, node: NodeId, bounds: Rect) -> Rect {
+    let Some(target) = tree.arena.get(node) else {
+        return bounds;
+    };
+    let Some(local) = target
+        .hit_shape()
+        .and_then(crate::layout::hit_test::HitShape::bounds)
+    else {
+        return bounds;
+    };
+    bounds.union(Rect::from_origin_size(
+        bounds.origin + local.origin,
+        local.size,
+    ))
 }
 
 // 消费者：`impl NodeTree::recompute_subtree_bounds` 的薄委托（外部调用点见该方法文档）。/// 全树重算子树包围盒（**诊断/测试逃生口**：正常布局路径由 `place_subtree` 增量维护）。
@@ -601,6 +666,7 @@ pub(crate) fn recompute_subtree_bounds(tree: &mut NodeTree) {
                 union = union.union(*bounds);
             }
         }
+        let union = hit_envelope(tree, node, union);
         let index = node.index() as usize;
         if tree.subtree_bounds.len() <= index {
             tree.subtree_bounds.resize_with(index + 1, Rect::default);
@@ -745,5 +811,155 @@ impl LayoutStats {
             cache_misses: self.cache_misses,
             bounds_updated: self.bounds_updated,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use taffy::style::Dimension;
+
+    use crate::{
+        layout::LayoutOverride,
+        math::Rect,
+        node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
+        paint::style::{Clip, Style},
+    };
+
+    fn fixed(width: f32, height: f32) -> Style {
+        let mut inner = taffy::Style::<smol_str::SmolStr>::DEFAULT;
+        inner.size = taffy::geometry::Size {
+            width: Dimension::length(width),
+            height: Dimension::length(height),
+        };
+        Style {
+            inner,
+            clip: Clip::None,
+        }
+    }
+
+    fn add(tree: &mut NodeTree, parent: NodeId, style: Style) -> NodeId {
+        NodeBuilder::boxed()
+            .style(style)
+            .build(tree, parent)
+            .expect("挂载成功")
+    }
+
+    fn layout(tree: &mut NodeTree) {
+        tree.compute_layout(taffy::geometry::Size {
+            width: Some(200.0),
+            height: Some(200.0),
+        })
+        .expect("布局成功");
+        assert!(!tree.has_layout_work(), "布局后脏集合必须清空");
+    }
+
+    fn bounds(tree: &NodeTree, node: NodeId) -> Rect {
+        tree.get(node).expect("存在").layout().bounds
+    }
+
+    /// R04-12：`LayoutOverride` 节点是**布局叶子**，它的子节点必须收敛到「不参与布局」的定义态。
+    ///
+    /// 旧实现：`place_subtree` 的子循环不判 override，子节点用**上一轮**布局写下的 `local`
+    /// 算绝对坐标 ⇒ 先正常布局、再给父加 `LayoutOverride` 之后，子节点冻结在旧位置上（错但
+    /// "确定"，比随机更难定位）。
+    #[test]
+    fn children_of_a_layout_override_node_are_zeroed() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let parent = add(&mut tree, root, fixed(100.0, 100.0));
+        let child = add(&mut tree, parent, fixed(20.0, 20.0));
+        layout(&mut tree);
+        assert!(
+            !bounds(&tree, child).is_empty(),
+            "前置：子节点先正常参与过布局"
+        );
+
+        tree.set_layout_override(
+            parent,
+            Some(LayoutOverride::new(Rect::new(0.0, 0.0, 50.0, 50.0))),
+        )
+        .expect("节点存活");
+        layout(&mut tree);
+
+        assert_eq!(bounds(&tree, parent), Rect::new(0.0, 0.0, 50.0, 50.0));
+        assert!(
+            bounds(&tree, child).is_empty(),
+            "布局叶子的子节点必须零盒（不得冻结在上一轮的 local）：{:?}",
+            bounds(&tree, child)
+        );
+    }
+
+    /// R04-12（第二面）：tiffy 永不写回布局叶子子节点的 `LAYOUT` ⇒ 必须在 `place_subtree` 消费，
+    /// 否则「脏位已消费、几何未成立」的另一半变成「帧门禁永远为真」的空转。
+    #[test]
+    fn a_descendant_of_a_layout_leaf_never_leaves_a_pending_layout_request() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let parent = add(&mut tree, root, fixed(100.0, 100.0));
+        let child = add(&mut tree, parent, fixed(20.0, 20.0));
+        layout(&mut tree);
+
+        tree.set_layout_override(
+            parent,
+            Some(LayoutOverride::new(Rect::new(0.0, 0.0, 50.0, 50.0))),
+        )
+        .expect("节点存活");
+        layout(&mut tree);
+
+        // release 下允许在布局叶子下挂子节点（debug 的 `NodeBuilder` 断言挡掉了）；这里模拟
+        // 那棵子树上又来了一个布局输入。
+        tree.set_style(child, fixed(30.0, 30.0)).expect("节点存活");
+        assert!(tree.has_layout_work(), "前置：确实有布局请求");
+        layout(&mut tree);
+        assert!(
+            !tree.has_layout_work(),
+            "布局叶子的子节点等不到 taffy 写回，LAYOUT 必须在这里消费（否则每帧空转）"
+        );
+    }
+
+    /// R04-6：`set_style` 是值语义入口，写**同一份**样式不产生任何失效。
+    ///
+    /// 旧实现无比较即 `invalidate_layout`（标 `LAYOUT|PAINT|A11Y` + 冒泡 + 清 `node..root`
+    /// 的 taffy 缓存）：每帧重复写同一份样式就会把整条祖先链的缓存清掉，增量布局退化为全量。
+    #[test]
+    fn writing_an_equal_style_is_a_no_op() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let style = fixed(40.0, 20.0);
+        let node = add(&mut tree, root, style.clone());
+        layout(&mut tree);
+
+        tree.set_style(node, style).expect("节点存活");
+
+        assert!(
+            !tree.has_layout_work(),
+            "等值写入不得请求布局（旧实现会清掉 node..root 的 taffy 缓存）"
+        );
+    }
+
+    /// R04-6：`set_layout_override` 同样按值比较（拖拽路径每帧都会用同一坐标再写一次）。
+    #[test]
+    fn writing_an_equal_layout_override_is_a_no_op() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let node = add(&mut tree, root, fixed(40.0, 20.0));
+        layout(&mut tree);
+
+        // `None` → `None`：等值（未设置覆盖）。
+        tree.set_layout_override(node, None).expect("节点存活");
+        assert!(!tree.has_layout_work(), "等值写入不得请求布局");
+
+        let over = LayoutOverride::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        tree.set_layout_override(node, Some(over))
+            .expect("节点存活");
+        assert!(tree.has_layout_work(), "真正的变更必须请求布局");
+        layout(&mut tree);
+
+        tree.set_layout_override(node, Some(over))
+            .expect("节点存活");
+        assert!(
+            !tree.has_layout_work(),
+            "同一份覆盖矩形再写一次不得请求布局"
+        );
     }
 }

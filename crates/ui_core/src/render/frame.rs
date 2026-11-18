@@ -418,18 +418,38 @@ pub(crate) struct FrameFeedback {
     /// GPU 线程**观察到该帧 GPU 工作完成**的时刻（fence / timeline / completed handler），
     /// 不是 `Present` 返回的时刻。
     pub completed_at: Instant,
-    /// 真实**上屏**时刻（`presentedTime` / 帧回调 / `GetFrameStatistics`）。
+    /// 本帧**上屏**时刻的最佳可信值；`None` = 该端如实不提供（**不是**「退回完成时刻」的占位）。
     ///
-    /// `None` = 该端拿不到呈现时间戳（Windows 默认；Linux 目前也未接）。**三端同名同义**：
-    /// 有值就一定是「像素真正显示的时刻」，不是 GPU 完成、也不是 `Present` 返回。
+    /// 来源按后端区分，各端都**不得**拿 [`Self::completed_at`] 顶替（那正是本轮修掉的假数据缺陷）：
+    /// - macOS：display link 的 `CAMetalDisplayLinkUpdate.targetPresentationTimestamp`（本帧被排定
+    ///   的上屏时刻）换算出的**tick 推断值**，误差上界 1 个 vsync；它只在「更新的 tick 已经到达」
+    ///   （证明该 vsync 的呈现截止时刻已过）之后才写入，且不早于 [`Self::completed_at`]。
+    ///   逐帧真实呈现时间戳（`MTLDrawable.presentedTime` / `addPresentedHandler:`）在
+    ///   display-link 驱动的 drawable 上不可靠（实测只回调数次、`presentedTime` 恒为 0），
+    ///   已不再作为来源。
+    /// - Windows / Linux：恒为 `None` —— 两端都没有接真实呈现时间戳（`GetFrameStatistics` /
+    ///   `wl_surface.frame` 回调未接），没有可信值就留空。
     pub presented_at: Option<Instant>,
     /// `completed_at - published_at`：UI 线程发布本帧到 **GPU 工作完成**的时长。
     ///
     /// **三端同义**（B6-2 统一）：起点是 [`FrameRequest::published_at`]（UI 提交时刻），终点是
-    /// `completed_at`。合成线程上线后这条链多了一段「合成线程等待下一拍 + 增量编码」——
+    /// [`Self::completed_at`]。合成线程上线后这条链多了一段「合成线程等待下一拍 + 增量编码」——
     /// 那正是 UI 发布到 GPU 完成之间的真实路径，因此数值变大是语义正确的结果，不是回归。
-    /// 想看「发布 → 真正上屏」请用 [`FrameFeedback::presented_latency`]。
+    /// HUD 的 `Latency` 一行显示的就是它；「发布 → 上屏」由 [`Self::presented_at`] 单独承载，
+    /// 其真实性判据见 [`Self::presentation_is_consistent`]。
     pub latency: Duration,
+}
+
+impl FrameFeedback {
+    /// [`Self::presented_at`] 契约的可执行版本（三端 `poll` 共用）：呈现时刻存在时不得早于本帧的
+    /// GPU 完成时刻 —— 像素不可能比 GPU 工作更早上屏。
+    ///
+    /// `None` 是合法值（该端如实不提供），不是「用完成时刻兜底」的同义词：本函数同时守住
+    /// 「有值 ⇒ 可信」与「不可信 ⇒ 必须为 `None`」两个方向。
+    pub(crate) fn presentation_is_consistent(&self) -> bool {
+        self.presented_at
+            .is_none_or(|presented| presented >= self.completed_at)
+    }
 }
 
 /// 最新帧槽：**最新者胜 + damage 合并**（§4.2 / I5）。
@@ -801,18 +821,53 @@ impl InFlightRing {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Instant};
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     use super::{
-        FramePayload, FrameRequest, FrameSlot, InFlightRing, InstanceChunk, InstanceMirror,
-        LatestFrame, MAX_FRAMES_IN_FLIGHT, ResyncGate, pool_lock,
+        FrameFeedback, FramePayload, FrameRequest, FrameSlot, InFlightRing, InstanceChunk,
+        InstanceMirror, LatestFrame, MAX_FRAMES_IN_FLIGHT, ResyncGate, pool_lock,
     };
     use crate::{
         math::PhysicalRect,
         paint::instance::InstanceEncoder,
-        render::compositor::{DamageRects, Plan},
+        render::{
+            compositor::{DamageRects, Plan},
+            stats::RenderStats,
+        },
         window::FrameIndex,
     };
+
+    /// 文档契约（`FrameFeedback::presented_at` / `presentation_is_consistent`）的可执行版本：
+    /// 呈现时刻要么如实缺失，要么**不早于**本帧的 GPU 完成时刻；把完成时刻冒充成上屏时刻（旧实现
+    /// 的 32 ms 兜底）会被判为不一致。
+    #[test]
+    fn a_feedback_never_claims_a_presented_time_before_the_gpu_completed() {
+        let completed_at = Instant::now();
+        let feedback = |presented_at: Option<Instant>| FrameFeedback {
+            index: FrameIndex::from_raw(1),
+            stats: RenderStats::default(),
+            samples: Vec::new(),
+            completed_at,
+            presented_at,
+            latency: Duration::from_millis(4),
+        };
+        assert!(
+            feedback(None).presentation_is_consistent(),
+            "该端不提供上屏时刻时 `None` 是合法值"
+        );
+        assert!(feedback(Some(completed_at)).presentation_is_consistent());
+        assert!(
+            feedback(Some(completed_at + Duration::from_millis(8))).presentation_is_consistent(),
+            "上屏必然晚于 GPU 完成：tick 推断值也遵守"
+        );
+        assert!(
+            !feedback(Some(completed_at - Duration::from_millis(1))).presentation_is_consistent(),
+            "早于 GPU 完成的上屏时刻不可信"
+        );
+    }
 
     #[test]
     fn a_dropped_payload_returns_its_buffers_to_the_pool() {

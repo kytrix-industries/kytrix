@@ -15,7 +15,9 @@ use crate::{
 };
 
 /// 取走「需要一帧」的请求位（取走即清零）。
-/// 消费者：`App::take_wake_request`。
+///
+/// 消费者：`App::take_wake_request`（**crate 内部**：R01-16 起不再公开，应用的入口是
+/// `App::request_repaint` / `App::request_node_repaint`）。
 pub(crate) fn take_wake_request(app: &mut App) -> bool {
     let requested = app.wake_requested;
     app.wake_requested = false;
@@ -245,7 +247,7 @@ pub(crate) fn frame(app: &mut App, window: WindowId) -> Option<Result<FrameOutco
     let deferred = app.windows.get(&window).is_some_and(|target| {
         use crate::paint::atlas::AtlasKind;
         target.has_renderer()
-            && (target.atlas_rows_pending()
+            && (target.atlas_rects_pending()
                 || !target.atlas_page_matches(AtlasKind::Glyph, glyph_extent)
                 || image_extent
                     .is_some_and(|extent| !target.atlas_page_matches(AtlasKind::Image, extent)))

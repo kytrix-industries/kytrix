@@ -384,11 +384,12 @@ pub struct Window {
     glyph_page_received: Option<u32>,
     /// 同上，图片图集页。
     image_page_received: Option<u32>,
-    /// 每个图集在本窗口上「已写脏、还没入队」的行。
+    /// 每个图集在本窗口上「已写脏、还没入队」的矩形。
     ///
-    /// 共享槽忙（GPU 线程还没录制上一笔上传）的窗口不参与全局等待：新行先攒在这里，
+    /// 共享槽忙（GPU 线程还没录制上一笔上传）的窗口不参与全局等待：新矩形先攒在这里，
     /// 等该窗口的槽空闲再补发。否则一个不再出帧的窗口会永久占住图集上传（DEVIATIONS F-211）。
-    atlas_rows: [crate::render::DirtyRows; 2],
+    /// R06-3 起是**矩形**（AOI）而不是整页宽的行区间。
+    atlas_rects: [crate::render::DirtyRects; 2],
     /// 本窗口「图集行没赶上帧」的补帧次数（上限见 [`MAX_ATLAS_FOLLOWUPS`]）。
     atlas_deferrals: u8,
     /// 本帧的分段计时（容量跨帧复用）。
@@ -477,7 +478,7 @@ impl Window {
             renderer: None,
             glyph_page_received: None,
             image_page_received: None,
-            atlas_rows: std::array::from_fn(|_| crate::render::DirtyRows::default()),
+            atlas_rects: std::array::from_fn(|_| crate::render::DirtyRects::default()),
             atlas_deferrals: 0,
             timings: FrameTimings::new(),
             paint_order: Vec::new(),
@@ -763,17 +764,17 @@ impl Window {
     pub(crate) fn mark_atlas_page_stale(&mut self, kind: AtlasKind) {
         surface::mark_atlas_page_stale(self, kind)
     }
-    pub(crate) fn atlas_rows(&self, kind: AtlasKind) -> &crate::render::DirtyRows {
-        surface::atlas_rows(self, kind)
+    pub(crate) fn atlas_rects(&self, kind: AtlasKind) -> &crate::render::DirtyRects {
+        surface::atlas_rects(self, kind)
     }
-    pub(crate) fn atlas_rows_mut(&mut self, kind: AtlasKind) -> &mut crate::render::DirtyRows {
-        surface::atlas_rows_mut(self, kind)
+    pub(crate) fn atlas_rects_mut(&mut self, kind: AtlasKind) -> &mut crate::render::DirtyRects {
+        surface::atlas_rects_mut(self, kind)
     }
-    pub(crate) fn clear_atlas_rows(&mut self, kind: AtlasKind) {
-        surface::clear_atlas_rows(self, kind)
+    pub(crate) fn clear_atlas_rects(&mut self, kind: AtlasKind) {
+        surface::clear_atlas_rects(self, kind)
     }
-    pub(crate) fn atlas_rows_pending(&self) -> bool {
-        surface::atlas_rows_pending(self)
+    pub(crate) fn atlas_rects_pending(&self) -> bool {
+        surface::atlas_rects_pending(self)
     }
     pub(crate) fn note_atlas_deferral(&mut self) -> bool {
         surface::note_atlas_deferral(self)
@@ -786,9 +787,9 @@ impl Window {
         kind: AtlasKind,
         page: u32,
         pixels: &[u8],
-        rows: crate::render::DirtyRows,
+        rects: crate::render::DirtyRects,
     ) -> bool {
-        surface::queue_atlas_upload(self, kind, page, pixels, rows)
+        surface::queue_atlas_upload(self, kind, page, pixels, rects)
     }
     pub(crate) fn atlas_idle(&self, kind: AtlasKind) -> bool {
         surface::atlas_idle(self, kind)

@@ -247,17 +247,25 @@ impl<'a> ReadCtx<'a> {
     /// 守卫也可以在 `ReadCtx` 销毁后继续存活（只冻结被读的那一格值）。
     ///
     /// # Panics
-    /// `SignalSlot` 的不变量断言（槽位类型与 `T` 不一致）。
+    /// - 句柄已失效（作用域已释放 / 槽位已回收复用）：**确定性失败**，绝不返回复用后的新值
+    ///   （见 `node::signal` 模块文档〈作用域回收与句柄失效〉）；
+    /// - `SignalSlot` 的不变量断言（槽位类型与 `T` 不一致）。
     pub fn read<T: 'static>(&mut self, signal: &Signal<T>) -> SignalRef<T> {
         let id = signal.id();
+        // 先校验代际再登记依赖：失效句柄必须在 **panic 之前**就被拦住，不能留下一条死边。
+        let slot = self
+            .values
+            .get(id.index() as usize)
+            .expect("signal id out of range: engine invariant broken")
+            .live(id);
         self.tracker.record(id);
-        self.slot(id).read_owned(id)
+        slot.read_owned(id)
     }
 
     /// 读瞬态值：**不登记**依赖。
     ///
     /// # Panics
-    /// `SignalSlot` 的不变量断言。
+    /// `SignalSlot` 的不变量断言 / 句柄已失效。
     pub fn read_transient<T: 'static>(&mut self, transient: &Transient<T>) -> SignalRef<T> {
         let id = transient.id();
         self.slot(id).read_transient(id)
@@ -266,12 +274,12 @@ impl<'a> ReadCtx<'a> {
     /// 读派生值：登记依赖 + 惰性求值 + 返回缓存快照守卫。
     ///
     /// # Errors
-    /// - `EngineError::CyclicDerived { derived }`：求值栈上再次遇到同一个 `DerivedId`（真环），
-    ///   或该派生的闭包上次 panic 未放回（`compute == None`）。两种情况都**不写缓存、不清 `dirty`**；
-    ///   因此该错误**不能**单独作为「存在环」的判据（N8）。
+    /// `EngineError::CyclicDerived { derived }`：求值栈上再次遇到同一个 `DerivedId`（真环）。
+    /// 错误路径**不写缓存、不清 `dirty`**。
     ///
     /// # Panics
-    /// 缓存/闭包的类型与 `T` 不符（不变量破坏）；派生闭包自身 panic 会原样向上传播。
+    /// 缓存/闭包的类型与 `T` 不符（不变量破坏）；派生闭包自身 panic 会原样向上传播 ——
+    /// 但闭包会在展开时放回（R03-12），下一次读会**重试**该闭包，不会把派生永久 brick。
     pub fn read_derived<T: 'static>(
         &mut self,
         derived: &Derived<T>,
@@ -296,9 +304,13 @@ impl<'a> ReadCtx<'a> {
         self.values
             .get(id.index() as usize)
             .expect("signal id out of range: engine invariant broken")
+            .live(id)
     }
 
-    /// 求值一个派生值（环检测 + `EvalGuard` + 失败不污染缓存）。
+    /// 求值一个派生值（环检测 + `EvalGuard` + 失败不污染缓存 + panic 安全放回闭包）。
+    ///
+    /// 闭包暂时 `take` 出去是借用约束决定的（求值期要把 `&mut DerivedStore` 交给 `ReadCtx`）；
+    /// 但 `Fn` 闭包会在**任何**退出路径上放回 —— 包括应用闭包 panic：见下面的 `catch_unwind`。
     fn eval_derived(&mut self, id: DerivedId) -> Result<(), EngineError> {
         if self.eval_stack.contains(id) {
             return Err(EngineError::CyclicDerived { derived: id });
@@ -306,13 +318,26 @@ impl<'a> ReadCtx<'a> {
         let mut guard = EvalGuard::enter(&mut *self.eval_stack, id);
 
         let Some(compute) = self.derived.take_compute(id) else {
-            // 闭包已被取走：要么该派生正在求值（环检测本应先拦住），要么上一次求值 panic 未放回。
-            // 两种情况都返回强类型错误而**不是** panic/断言：panic 之后引擎必须还能继续服务（N8）。
+            // 不变量破坏：闭包只在本函数求值期间被 `take`，而求值期不重入（上面的环检测先拦）。
+            // 保留 `CyclicDerived` 作为**最后防线**（panic 之外不再有合法路径走到这里），
+            // 但不作为"某派生已经坏了"的判据（R03-12 的伪装面已消除）。
+            debug_assert!(
+                false,
+                "derived compute closure is missing outside evaluation"
+            );
             return Err(EngineError::CyclicDerived { derived: id });
         };
 
         let mut nested = ReadTracker::new();
-        let value: Box<dyn Any> = {
+        // R03-12：应用闭包 panic 时，旧实现让 `put_compute` 永远执行不到 ⇒ 该派生**永久 brick**，
+        // 且下一次读被伪装成 `CyclicDerived`（"存在环"）。这里捕获 unwind、把闭包放回、再把
+        // payload 原样继续展开：panic 仍然是 panic（对外语义不变），但引擎状态自愈 —— 下一次
+        // 读会重试闭包，而不是把应用闭包的一次 bug 升级成该派生值的水久失效。
+        // 闭包已在 `EvalGuard` 的作用域内取走，`catch_unwind` 只包住调用本身。
+        //
+        // 适用面：`[profile.release] panic = "abort"`（workspace 根 `Cargo.toml`）时进程直接终止，
+        // 不存在"brick"；本保障针对 unwind 构建（debug / test / 任何改回 unwind 的 profile）。
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut nested_ctx = ReadCtx {
                 values: self.values,
                 derived: &mut *self.derived,
@@ -322,9 +347,13 @@ impl<'a> ReadCtx<'a> {
                 owner: Owner::Derived(id),
             };
             compute(&mut nested_ctx)
+        }));
+        self.derived.put_compute(id, compute);
+        let value: Box<dyn Any> = match outcome {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
         };
 
-        self.derived.put_compute(id, compute);
         self.derived.store_value(id, Rc::from(value));
 
         let old = self.derived.deps(id);

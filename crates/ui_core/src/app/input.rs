@@ -117,12 +117,27 @@ pub(crate) fn dispatch_action_with_hit(
     if target.tree().get(node).is_err() {
         return false;
     }
-    if let Some(mut handler) = app.handlers.remove(&action) {
+    if let Some(handler) = app.handlers.remove(&action) {
+        // R01-12：条目在调用期间被 `remove` 出来，必须**任何退出路径**都放回：
+        //
+        // 1. panic 安全：旧实现在 `handler(&mut ctx)` 之后才 `insert`，handler 自身 panic 时闭包
+        //    随 unwind 被 drop ⇒ 该动作的处理器永久丢失（下一次分发静默退化为默认行为）。
+        // 2. 重入覆盖：handler 体内 `on_action(同一个 action, 新闭包)` 注册的条目不得被旧闭包覆盖
+        //    —— 旧实现无条件 `insert`，把应用刚注册的新处理器踩掉。
+        //
+        // 做法与 a11y 那一侧（`a11y::action::HandlerGuard`，R13-20）同一套：返回守卫的 `Drop`
+        // 负责放回，`or_insert` 只在 vacant 时写，于是"内层新注册的胜出"。
+        let mut guard = HandlerGuard {
+            app,
+            action,
+            handler: Some(handler),
+        };
         {
-            let mut ctx = ActionCtx::new(app, window, node, hit, modifiers, source);
-            handler(&mut ctx);
+            let mut ctx = ActionCtx::new(guard.app, window, node, hit, modifiers, source);
+            if let Some(handler) = guard.handler.as_mut() {
+                handler(&mut ctx);
+            }
         }
-        app.handlers.insert(action, handler);
         return true;
     }
     match action {
@@ -1109,4 +1124,25 @@ pub(crate) fn take_capture_requests(app: &mut App) -> Vec<(WindowId, bool)> {
     std::mem::take(&mut app.capture_requests)
         .into_iter()
         .collect()
+}
+/// 动作 handler 的归还守卫：`Drop` 保证**panic 也放回**表里（R01-12）。
+///
+/// 与 `a11y::action::HandlerGuard`（R13-20）同构：`take` 出来是为了在调用期把 `&mut App`
+/// 借给 `ActionCtx`；放回用 `or_insert`，只在表里**没有**新条目时写 —— handler 体内对同一个
+/// action 的重新注册（`App::on_action`）因此不会被旧闭包踩掉。
+struct HandlerGuard<'a> {
+    app: &'a mut App,
+    action: Action,
+    handler: Option<Box<dyn FnMut(&mut ActionCtx<'_>)>>,
+}
+
+impl Drop for HandlerGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(handler) = self.handler.take() {
+            self.app
+                .handlers
+                .entry(self.action.clone())
+                .or_insert(handler);
+        }
+    }
 }

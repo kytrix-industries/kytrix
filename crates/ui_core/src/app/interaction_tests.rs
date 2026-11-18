@@ -1802,6 +1802,65 @@ fn animation_retarget_replaces_the_previous_slot() {
     assert!(!app.animations_running(window));
 }
 
+/// R01-13 回归：零时长动画是「立即到位」，必须与**同一目标**上的长动画互斥。
+///
+/// 旧实现只在 `duration == 0` 分支里写一次瞬态值就返回，**不清旧槽**：半途「立即置为 0」
+/// 之后，上一次注册的 100 ms 动画仍在 `animations` 里，下一帧 `tick_animations` 会把同一个
+/// `Transient` 继续推向旧目标值 —— 调用方看到的是「设了 0 ms 却被拉回」。
+#[test]
+fn zero_duration_animation_cancels_the_previous_slot_on_the_same_target() {
+    let (_rt, mut app, window) = setup();
+    let value = app.transient(0.0_f32);
+    app.animate(
+        window,
+        AnimatedValue::Scalar {
+            target: value,
+            to: 1.0,
+        },
+        &[],
+        AnimationSpec {
+            duration: std::time::Duration::from_millis(100),
+            easing: Easing::Linear,
+        },
+    )
+    .expect("slow animation");
+    app.advance_clock(std::time::Duration::from_millis(50));
+    frame(&mut app, window);
+    assert!(
+        (*app.read_transient(&value) - 0.5).abs() < 1e-3,
+        "先走到中点"
+    );
+
+    // 半途改主意：立即到位（0 ms）。
+    app.animate(
+        window,
+        AnimatedValue::Scalar {
+            target: value,
+            to: 0.25,
+        },
+        &[],
+        AnimationSpec {
+            duration: std::time::Duration::ZERO,
+            easing: Easing::Linear,
+        },
+    )
+    .expect("immediate");
+    assert_eq!(*app.read_transient(&value), 0.25, "零时长必须立即写值");
+    assert!(
+        !app.animations_running(window),
+        "零时长不得留下驱动源：旧槽必须一起取消"
+    );
+
+    // 再走一段连续帧：旧槽若还活着，会把值推向 1.0。
+    app.advance_clock(std::time::Duration::from_millis(200));
+    frame(&mut app, window);
+    assert_eq!(
+        *app.read_transient(&value),
+        0.25,
+        "旧动画不得在后续帧回写同一个瞬态值"
+    );
+}
+
 /// P2-5 回归：系统取消指针会话时，拖拽必须结束并派发 `Cancel`，不能卡在「按住」。
 ///
 /// Windows 的 `WM_CAPTURECHANGED`（Alt+Tab / 系统弹窗 / 别的窗口 `SetCapture`）之后

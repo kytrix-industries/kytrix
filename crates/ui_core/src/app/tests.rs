@@ -2,6 +2,7 @@ use std::{cell::Cell, panic::AssertUnwindSafe, rc::Rc};
 
 use super::App;
 use crate::{
+    event::{Action, ActionSource},
     node::{
         builder::NodeBuilder,
         dependency::ReadCtx,
@@ -872,19 +873,33 @@ fn refresh_styles_marks_a11y_on_interactive_change() {
     );
 }
 
+/// R03-12：派生闭包 panic 之后必须**放回**，下一次读重试闭包 —— 不能把一次应用 bug 升级成
+/// 该派生值的永久失效（旧行为：下一次读返回 `CyclicDerived`，伪装成"存在环"）。
+///
+/// 同时钉住 panic 安全的另一半：`EvalGuard::drop` 在展开时出栈、panic 节点自己的 `bind_style`
+/// 闭包丢失后退化为静态节点（这是 `refresh_styles` 的既有语义，不是本条的修复点）。
 #[test]
-fn eval_guard_pops_on_panic_and_cache_survives() {
+fn eval_guard_pops_on_panic_and_the_derived_closure_is_restored() {
     let (_rt, mut app) = new_app();
-    let bad: Derived<f32> = app.derived(|_cx| -> f32 { panic!("派生闭包炸了") });
+    // 第一次求值 panic、之后正常：闭包必须在 panic 展开时被放回。
+    let attempts = Rc::new(Cell::new(0u32));
+    let counter = Rc::clone(&attempts);
+    let flaky: Derived<f32> = app.derived(move |_cx| -> f32 {
+        counter.set(counter.get() + 1);
+        if counter.get() == 1 {
+            panic!("派生闭包第一次求值炸了")
+        }
+        7.0
+    });
     let window = app.create_window(WindowOptions::default());
     // 第一个节点：本次求值会 panic（它的 `bind_style` 随后丢失 → 退化为静态节点）。
     let doomed = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-        opacity: Some(cx.read_derived(&bad).map(|v| *v).unwrap_or(0.0)),
+        opacity: Some(cx.read_derived(&flaky).map(|v| *v).unwrap_or(0.0)),
         ..StylePatch::default()
     });
-    // 第二个节点：求值面相同，但它没在 panic 里丢闭包 —— 用来证明后续读返回 `CyclicDerived` 而不是 panic。
+    // 第二个节点：第一次 pass 里没轮到它，panic 之后才求值 —— 它是"闭包是否被放回"的探针。
     let survivor = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
-        opacity: Some(cx.read_derived(&bad).map(|v| *v).unwrap_or(0.0)),
+        opacity: Some(cx.read_derived(&flaky).map(|v| *v).unwrap_or(0.0)),
         ..StylePatch::default()
     });
 
@@ -902,16 +917,19 @@ fn eval_guard_pops_on_panic_and_cache_survives() {
         report.evaluated, 1,
         "panic 的那个节点闭包已丢（跳过），另一个节点仍被求值"
     );
-    assert!(
-        app.window(window)
-            .expect("窗口存在")
-            .tree()
-            .get(survivor)
-            .expect("存在")
-            .style_patch()
-            .opacity
-            .is_some(),
-        "read_derived 返回 CyclicDerived 后走了 unwrap_or，patch 仍被写入"
+    assert_eq!(attempts.get(), 2, "第二次求值必须真的重跑派生闭包");
+    let opacity = app
+        .window(window)
+        .expect("窗口存在")
+        .tree()
+        .get(survivor)
+        .expect("存在")
+        .style_patch()
+        .opacity;
+    assert_eq!(
+        opacity,
+        Some(7.0),
+        "闭包被放回 ⇒ 重试成功并写回真实值；旧实现返回 CyclicDerived 后这里会是 Some(0.0)"
     );
     assert!(
         app.window(window)
@@ -1755,4 +1773,72 @@ fn app_frame_is_idle_without_work() {
         1,
         "空闲帧不得递增序号"
     );
+}
+
+// ── R01-12：动作 handler 的重入与 panic 安全 ──────────────────────────────
+
+/// R01-12（重入面）：handler 体内为**同一个** action 注册新处理器时，新条目必须生效。
+///
+/// 旧实现无条件 `handlers.insert(action, 旧闭包)` 收尾，把应用刚注册的新处理器踩掉：下一次
+/// 分发仍然跑旧闭包（应用看到的是"重新订阅无效"）。
+#[test]
+fn a_handler_registered_from_inside_a_handler_survives() {
+    let (_rt, mut app) = new_app();
+    let window = app.create_window(WindowOptions::default());
+    let node = node_with(&mut app, window, |_cx| StylePatch::default());
+    let action = Action::custom("resubscribe");
+    let first_hits = Rc::new(Cell::new(0u32));
+    let second_hits = Rc::new(Cell::new(0u32));
+
+    let first = Rc::clone(&first_hits);
+    let second = Rc::clone(&second_hits);
+    let registered = action.clone();
+    app.on_action(action.clone(), move |ctx| {
+        first.set(first.get() + 1);
+        let second = Rc::clone(&second);
+        let registered = registered.clone();
+        ctx.app_mut().on_action(registered, move |_ctx| {
+            second.set(second.get() + 1);
+        });
+    });
+
+    assert!(app.dispatch_action(window, node, action.clone(), ActionSource::Programmatic));
+    assert_eq!(first_hits.get(), 1);
+    assert_eq!(second_hits.get(), 0, "第一次跑的是旧处理器");
+
+    assert!(app.dispatch_action(window, node, action, ActionSource::Programmatic));
+    assert_eq!(second_hits.get(), 1, "内层注册的新处理器必须接管");
+    assert_eq!(first_hits.get(), 1, "旧处理器不得再被调用");
+}
+
+/// R01-12（panic 面）：handler panic 之后条目必须还在表里。
+///
+/// 旧实现在 `handler(&mut ctx)` 之后才 `insert`：panic 展开时闭包随栈帧被 drop，该动作的
+/// 处理器永久丢失 —— 之后分发静默退化为默认行为（`Action::Custom` ⇒ `false`）。
+#[test]
+fn a_panicking_handler_is_not_lost() {
+    let (_rt, mut app) = new_app();
+    let window = app.create_window(WindowOptions::default());
+    let node = node_with(&mut app, window, |_cx| StylePatch::default());
+    let action = Action::custom("explode");
+    let hits = Rc::new(Cell::new(0u32));
+    let counter = Rc::clone(&hits);
+    app.on_action(action.clone(), move |_ctx| {
+        counter.set(counter.get() + 1);
+        panic!("动作处理器炸了");
+    });
+
+    let attempt = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        app.dispatch_action(window, node, action.clone(), ActionSource::Programmatic)
+    }));
+    assert!(attempt.is_err(), "handler panic 必须向上传播");
+
+    let again = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        app.dispatch_action(window, node, action.clone(), ActionSource::Programmatic)
+    }));
+    assert!(
+        again.is_err(),
+        "处理器必须仍在表里：旧实现在 unwind 里丢了闭包，分发会静默返回 false"
+    );
+    assert_eq!(hits.get(), 2, "处理器必须被再次调用");
 }

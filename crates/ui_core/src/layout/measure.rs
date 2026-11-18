@@ -42,14 +42,20 @@ pub(crate) fn compute_leaf(tree: &mut NodeTree, node: NodeId, inputs: LayoutInpu
                     // 无 measure 的空叶子：0×0（与 taffy `TaffyTree::compute_layout` 的默认闭包一致）
                     None => Size::ZERO,
                 };
-                if !size.width.is_finite() || size.width < 0.0 {
+                let width_ok = size.width.is_finite() && size.width >= 0.0;
+                let height_ok = size.height.is_finite() && size.height >= 0.0;
+                if !width_ok {
                     violation.set(Some((Axis::X, size.width)));
-                } else if !size.height.is_finite() || size.height < 0.0 {
+                } else if !height_ok {
                     violation.set(Some((Axis::Y, size.height)));
                 }
+                // R04-10：违规值**不得**交给 taffy。旧实现把 NaN/负数原样返回，taffy 会用它
+                // 算出整棵子树的 NaN 盒（`Rect::is_empty` 再把 NaN 当空 ⇒ 静默塌成 0×0），
+                // 而诊断仍只报"首条违规"。替换成 0 让这一轮至少是**确定**的几何；
+                // 错误帧的可恢复性由 `taffy_tree::run` + `set_local_layout` 保证（不消费 `LAYOUT`）。
                 TaffySize {
-                    width: size.width,
-                    height: size.height,
+                    width: if width_ok { size.width } else { 0.0 },
+                    height: if height_ok { size.height } else { 0.0 },
                 }
             },
         )
@@ -248,6 +254,63 @@ mod tests {
             seen.iter()
                 .any(|space| matches!(space, taffy::AvailableSpace::MaxContent)),
             "固有尺寸测量必须收到 MaxContent：{seen:?}"
+        );
+    }
+
+    /// R04-10（第一半）：违规值**不得**交给 taffy。
+    ///
+    /// 旧实现记录违规后仍把 NaN/负数原样返回，taffy 用它算整棵子树的盒（`Rect::is_empty`
+    /// 再把 NaN 当空 ⇒ 静默塌成 0×0，且兄弟/祖先的坐标也会被 NaN/∞ 污染）。
+    /// 现在违规轴按 0 提交，错误仍如实上报（`InvalidMeasure` 在 `taffy_tree::run` 里返回）。
+    ///
+    /// 用例取 `(NaN, ∞)`：实测 taffy 的 `compute_leaf_layout` 会在部分路径把 NaN 宽度 clamp
+    /// 成 0，只有 `∞` 高度原样穿过 —— 两个轴都必须归一化，不能依赖 taffy 的偶然 clamp。
+    #[test]
+    fn an_invalid_measure_is_replaced_with_zero_before_it_reaches_taffy() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let node = NodeBuilder::boxed()
+            .measure(Box::new(|_known, _available| {
+                Size::new(f32::NAN, f32::INFINITY)
+            }))
+            .build(&mut tree, root)
+            .expect("挂载成功");
+
+        let output = super::compute_leaf(
+            &mut tree,
+            node,
+            taffy::LayoutInput {
+                run_mode: taffy::RunMode::PerformLayout,
+                sizing_mode: taffy::SizingMode::ContentSize,
+                axis: taffy::RequestedAxis::Both,
+                known_dimensions: taffy::geometry::Size::NONE,
+                known_dimensions_are_definite: taffy::geometry::Size {
+                    width: false,
+                    height: false,
+                },
+                parent_size: taffy::geometry::Size::NONE,
+                available_space: taffy::geometry::Size {
+                    width: taffy::AvailableSpace::Definite(100.0),
+                    height: taffy::AvailableSpace::Definite(100.0),
+                },
+                vertical_margins_are_collapsible: taffy::geometry::Line::FALSE,
+            },
+        );
+
+        assert_eq!(
+            output.size,
+            taffy::geometry::Size {
+                width: 0.0,
+                height: 0.0
+            },
+            "两个轴的违规值都必须替换成 0，不得把 NaN/∞ 交给 taffy"
+        );
+        assert!(
+            matches!(
+                tree.take_invalid_measure(),
+                Some(EngineError::InvalidMeasure { axis: Axis::X, .. })
+            ),
+            "首条违规仍然要如实上报（X 先于 Y）"
         );
     }
 

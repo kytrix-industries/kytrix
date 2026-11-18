@@ -173,8 +173,8 @@ fn atlas_pages_are_broadcast_to_every_window() {
 /// 空闲窗口照常收到增量（DEVIATIONS F-211 的 BLOCKER 回归面）。
 #[cfg(windows)]
 #[test]
-fn a_busy_window_queues_its_rows_without_blocking_idle_windows() {
-    use crate::{paint::atlas::AtlasKind, render::DirtyRows};
+fn a_busy_window_queues_its_rects_without_blocking_idle_windows() {
+    use crate::{math::PhysicalRect, paint::atlas::AtlasKind, render::DirtyRects};
 
     let _guard = crate::render::windows::device::gpu_test_lock();
     let (_rt, mut app, first) = setup();
@@ -200,8 +200,7 @@ fn a_busy_window_queues_its_rows_without_blocking_idle_windows() {
             .mark_atlas_page_received(AtlasKind::Glyph, page);
     }
     // 让 second 的共享槽停在「已入队、未录制」：这就是忙窗口。
-    let mut full = DirtyRows::default();
-    full.mark(0, u32::MAX);
+    let full = DirtyRects::full();
     assert!(
         app.window_mut(second).expect("second").queue_atlas_upload(
             AtlasKind::Glyph,
@@ -218,25 +217,32 @@ fn a_busy_window_queues_its_rows_without_blocking_idle_windows() {
         "入队之后、录制之前必须是忙的"
     );
 
-    app.pending_dirty.mark(0, 4);
+    // 一帧的脏矩形：第 0..4 行、整页宽（等价于旧的行区间语义，但现在是矩形）。
+    let frame_dirty = PhysicalRect::new(0, 0, i32::MAX, 4);
+    app.pending_dirty.mark(frame_dirty);
     app.upload_atlas_pages();
 
     assert!(
         app.window(first)
             .expect("first")
-            .atlas_rows(AtlasKind::Glyph)
+            .atlas_rects(AtlasKind::Glyph)
             .is_empty(),
-        "空闲窗口的行必须已经发出"
+        "空闲窗口的矩形必须已经发出"
     );
-    let second_rows = app
+    let second_rects = app
         .window(second)
         .expect("second")
-        .atlas_rows(AtlasKind::Glyph);
-    assert_eq!(second_rows.spans().len(), 1);
+        .atlas_rects(AtlasKind::Glyph);
+    assert_eq!(second_rects.rects().len(), 1);
     assert_eq!(
-        second_rows.spans()[0],
-        0..4,
-        "忙窗口必须把这一帧的行攒在自己的队列里"
+        second_rects.rects()[0],
+        frame_dirty,
+        "忙窗口必须把这一帧的脏矩形攒在自己的队列里"
+    );
+    assert_eq!(
+        second_rects.byte_count(page, 1),
+        4 * page as usize,
+        "攒住的载荷只覆盖 4 行（页宽 × 4），不是整页"
     );
 }
 
@@ -262,7 +268,7 @@ fn a_page_change_rebuilds_the_glyph_page_buffer_from_zero() {
 #[cfg(windows)]
 #[test]
 fn a_deferred_atlas_frame_requests_a_follow_up() {
-    use crate::{paint::atlas::AtlasKind, render::DirtyRows};
+    use crate::{math::PhysicalRect, paint::atlas::AtlasKind, render::DirtyRects};
 
     let _guard = crate::render::windows::device::gpu_test_lock();
     let (_rt, mut app, window) = setup();
@@ -276,9 +282,8 @@ fn a_deferred_atlas_frame_requests_a_follow_up() {
     app.window_mut(window)
         .expect("window")
         .mark_atlas_page_received(AtlasKind::Glyph, page);
-    // 共享槽停在「已入队、未录制」：本帧的图集行只能攒着。
-    let mut full = DirtyRows::default();
-    full.mark(0, u32::MAX);
+    // 共享槽停在「已入队、未录制」：本帧的图集矩形只能攒着。
+    let full = DirtyRects::full();
     assert!(app.window_mut(window).expect("window").queue_atlas_upload(
         AtlasKind::Glyph,
         page,
@@ -286,23 +291,23 @@ fn a_deferred_atlas_frame_requests_a_follow_up() {
         full,
     ));
     app.window_mut(window).expect("window").request_repaint();
-    app.pending_dirty.mark(0, 4);
+    app.pending_dirty.mark(PhysicalRect::new(0, 0, i32::MAX, 4));
 
     let _ = app.frame(window).expect("frame").expect("ok");
     assert!(
-        app.window(window).expect("window").atlas_rows_pending(),
-        "忙窗口的图集行必须留在队列里"
+        app.window(window).expect("window").atlas_rects_pending(),
+        "忙窗口的图集矩形必须留在队列里"
     );
     assert!(
         app.dispatcher.take_frame_wake(),
         "补帧必须请求一次帧唤醒（否则静态窗口不会重试）"
     );
 
-    // 补帧：上一帧的 publish 已经消费了共享槽，这一帧必须把行入队并清掉。
+    // 补帧：上一帧的 publish 已经消费了共享槽，这一帧必须把矩形入队并清掉。
     let _ = app.frame(window).expect("follow-up").expect("ok");
     assert!(
-        !app.window(window).expect("window").atlas_rows_pending(),
-        "补帧之后图集行必须已经入队"
+        !app.window(window).expect("window").atlas_rects_pending(),
+        "补帧之后图集矩形必须已经入队"
     );
 }
 

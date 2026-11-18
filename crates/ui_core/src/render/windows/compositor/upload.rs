@@ -27,7 +27,7 @@ use crate::{
 /// 消费者：`GpuRenderer::queue_atlas_upload`（`compositor.rs` 的薄委托）。
 /// 图集上传入口：字形页与图片页共用（GPU 线程消费）。
 ///
-/// `pixels` 是 `rows` 顺序紧密打包的行（整页上传时就是整页），按**所有权**移动进待上传槽，
+/// `pixels` 是 `rects` 顺序逐矩形紧密打包的字节（整页上传时就是整页），按**所有权**移动进待上传槽，
 /// 避免槽 → 纹理之间再复制一次（DEVIATIONS F-211）。入队时同时记录**当前共享页**
 /// （`SharedGpu::atlas_page`），供录制前区分「App 换代的新页」与「已被别人换代的旧页」。
 pub(super) fn queue_atlas_upload(
@@ -35,7 +35,7 @@ pub(super) fn queue_atlas_upload(
     kind: AtlasKind,
     page: u32,
     pixels: Vec<u8>,
-    rows: crate::render::atlas::DirtyRows,
+    rects: crate::render::atlas::DirtyRects,
 ) {
     debug_assert!(
         renderer.swapchain.is_none() || on_gpu_thread(),
@@ -44,7 +44,7 @@ pub(super) fn queue_atlas_upload(
     let queued_page = renderer.shared.atlas_page(kind);
     renderer
         .atlas_uploads
-        .queue_upload(kind, page, queued_page, pixels, rows);
+        .queue_upload(kind, page, queued_page, pixels, rects);
 }
 
 /// 消费者：`UploadArena::new`（`compositor.rs` 的薄委托）。

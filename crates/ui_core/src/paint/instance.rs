@@ -179,7 +179,7 @@ pub(crate) const MAX_CLIP_ITEMS: f32 = 9.0;
 ///
 /// clip、quad、shadow 三条路径都走这里（R05-8）。旧实现有两套：quad 用 `min(half)` clamp、
 /// clip **完全不 clamp**；`r > min/2` 时等值线反转，裁剪区反而变大。
-fn normalize_corner_radius(radii: [f32; 4], width: f32, height: f32) -> [f32; 4] {
+pub(crate) fn normalize_corner_radius(radii: [f32; 4], width: f32, height: f32) -> [f32; 4] {
     // NaN 必须先挡掉：`f32::min` 会**忽略** NaN（返回另一个操作数），直接算会得到
     // 一个看似合法的 half_min，于是异常尺寸的图形不会被归零。
     if width.is_nan() || height.is_nan() || !width.is_finite() || !height.is_finite() {
@@ -2245,12 +2245,21 @@ impl LaneEncoder<'_> {
         let half_min = 0.5 * bounds[2].min(bounds[3]);
         let (color0, color1, border_width, gradient) = match &quad.paint {
             QuadPaint::Solid { fill, border } => {
-                let width = border.map_or(0.0, |border| border.width * factor);
+                // R04-4：边框宽度**吸附到整数物理像素且至少 1 px**（Skia hairline / WebRender
+                // 的边框吸附）。取整与布局提交值共用 `math::snap_physical`（见
+                // `math::snap_stroke_width`）：125% 下 1 px 边框是 1 物理像素的硬边，不再是
+                // 1.25 px 的 AA 带；宽度定了之后带以已吸附的 `quad.bounds` 外边界为锚点向内
+                // 展开，内边界随之为整数物理像素（位置不需要二次取整）。
+                let width = border.map_or(0.0, |border| {
+                    crate::math::snap_stroke_width(border.width, factor)
+                });
                 (
                     self.colors.resolve(&self.resolver, *fill),
                     border.map_or(LinearPremulRgba::TRANSPARENT, |border| {
                         self.colors.resolve(&self.resolver, border.color)
                     }),
+                    // 夹到 SDF 合法域（半尺寸）是**第二道**防线：极小盒子上「整数带宽」可能超过
+                    // 半尺寸，此时以正确性（等值线不反转）优先，允许退化回分数宽度。
                     width.clamp(0.0, half_min),
                     GRADIENT_NONE,
                 )
@@ -2478,6 +2487,25 @@ mod tests {
 
     fn encode(scene: &Scene) -> Encoded {
         try_encode(scene).expect("encode")
+    }
+
+    /// 指定 DPI 的编码（R04-4 的宽度吸附必须跨 scale 断言）。
+    fn encode_at(scene: &Scene, factor: f32) -> Encoded {
+        let mut encoder = InstanceEncoder::new();
+        let scale = Scale::new(factor).expect("合法 scale");
+        let buffer = encoder
+            .encode(
+                scene,
+                scale,
+                resolver(),
+                &crate::paint::geometry_store::GeometryStore::new(),
+            )
+            .expect("encode");
+        Encoded {
+            instances: buffer.instances.clone(),
+            clips: buffer.clips.clone(),
+            ops: buffer.ops.clone(),
+        }
     }
 
     fn try_encode(scene: &Scene) -> Result<Encoded, crate::error::EngineError> {
@@ -3352,6 +3380,79 @@ mod tests {
         assert_eq!(instance.params0[0], 4.0);
         assert_eq!(instance.color1, resolver().resolve(Color::BLACK).to_array());
         assert_eq!(instance.params0[3], 1.0);
+    }
+
+    /// R04-4：`params0.x`（边框带宽，物理像素）必须是**整数且 ≥1**，与节点的亚像素相位无关。
+    ///
+    /// 旧实现是 `border.width * factor`：125% 下 1 px 边框 = 1.25 px 的 AA 带（一行 80% 亮 +
+    /// 一行 25% 亮），且明暗随节点 y 坐标变化。新规则来自 `math::snap_stroke_width`
+    /// （Skia/WebRender 的边框设备像素吸附）：1 dp → 1/2/2 物理像素（125/150/175%）。
+    #[test]
+    fn border_width_snaps_to_integer_device_pixels() {
+        for (factor, expected) in [
+            (1.0, 1.0),
+            (1.25, 1.0),
+            (1.5, 2.0),
+            (1.75, 2.0),
+            (2.0, 2.0),
+            (3.0, 3.0),
+        ] {
+            for offset in [0.0f32, 0.1, 0.25, 0.4, 0.49, 0.5, 0.75, 0.9] {
+                let scene = scene_with(|scene, lane| {
+                    assert!(scene.push(
+                        lane,
+                        Primitive::Quad(Quad {
+                            bounds: rect(offset, offset, 20.0, 10.0).snap_to_device(factor),
+                            corner_radius: [0.0; 4],
+                            paint: QuadPaint::Solid {
+                                fill: Color::WHITE,
+                                border: Some(Border {
+                                    width: 1.0,
+                                    color: Color::BLACK,
+                                }),
+                            },
+                        }),
+                    ));
+                });
+                let buffer = encode_at(&scene, factor);
+                let instance = buffer.instances[0];
+                assert_eq!(
+                    instance.params0[0], expected,
+                    "1 dp 边框在 {factor}× / offset {offset} 下必须是 {expected} 物理像素"
+                );
+                assert_eq!(
+                    instance.params0[0].fract(),
+                    0.0,
+                    "边框带宽必须是整数物理像素"
+                );
+            }
+        }
+    }
+
+    /// hairline：亚像素宽度也至少 1 物理像素（细线不消失），但受 SDF 合法域（半尺寸）夹紧。
+    #[test]
+    fn hairline_border_never_disappears() {
+        let scene = scene_with(|scene, lane| {
+            assert!(scene.push(
+                lane,
+                Primitive::Quad(Quad {
+                    bounds: rect(10.0, 10.0, 20.0, 10.0),
+                    corner_radius: [0.0; 4],
+                    paint: QuadPaint::Solid {
+                        fill: Color::TRANSPARENT,
+                        border: Some(Border {
+                            width: 0.25,
+                            color: Color::BLACK,
+                        }),
+                    },
+                }),
+            ));
+        });
+        let buffer = encode_at(&scene, 1.25);
+        assert_eq!(
+            buffer.instances[0].params0[0], 1.0,
+            "0.25 dp 边框在 125% 下也必须画出 1 物理像素"
+        );
     }
 
     #[test]

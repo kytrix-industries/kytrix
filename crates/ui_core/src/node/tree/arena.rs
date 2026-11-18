@@ -221,7 +221,7 @@ pub(crate) fn insert_child(
         style_patch: None,
         bind_style,
         measure,
-        hit_shape,
+        hit_shape: hit_shape.map(Box::new),
         layout_override,
         tab_stop,
         paint,
@@ -559,7 +559,7 @@ impl NodeSpec {
         self
     }
 
-    pub(crate) fn with_hit_shape(mut self, hit_shape: Box<dyn Fn(Point) -> bool>) -> Self {
+    pub(crate) fn with_hit_shape(mut self, hit_shape: crate::layout::hit_test::HitShape) -> Self {
         self.hit_shape = Some(hit_shape);
         self
     }

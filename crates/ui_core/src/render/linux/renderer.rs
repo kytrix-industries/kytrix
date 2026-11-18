@@ -55,7 +55,7 @@ use crate::{
     error::EngineError,
     paint::{atlas::AtlasKind, color::Color},
     render::{
-        DirtyRows, RenderStats,
+        DirtyRects, RenderStats,
         color::background_linear,
         compositor::FramePlan,
         frame::{FrameFeedback, FrameRequest, FrameSink, LatestFrame, MAX_FRAMES_IN_FLIGHT},
@@ -194,20 +194,20 @@ impl Renderer {
     }
 
     /// 把一页图集像素交给 GPU 线程（每 `AtlasKind` 只留最新，§4.2）。
-    /// 把一页图集像素交给 GPU 线程（`pixels` 是 `rows` 顺序紧密打包的行）。
+    /// 把一页图集像素交给 GPU 线程（`pixels` 是 `rects` 顺序逐矩形紧密打包的字节）。
     pub(crate) fn queue_atlas_upload(
         &mut self,
         kind: AtlasKind,
         page: u32,
         pixels: &[u8],
-        rows: DirtyRows,
+        rects: DirtyRects,
     ) -> bool {
         match &mut self.target {
             RenderTarget::Offscreen(gpu) => {
-                gpu.queue_atlas_upload(kind, page, pixels.to_vec(), rows);
+                gpu.queue_atlas_upload(kind, page, pixels.to_vec(), rects);
                 true
             }
-            RenderTarget::Window(window) => window.queue_atlas_upload(kind, page, pixels, rows),
+            RenderTarget::Window(window) => window.queue_atlas_upload(kind, page, pixels, rects),
         }
     }
 
@@ -395,9 +395,9 @@ impl WindowRenderer {
         kind: AtlasKind,
         page: u32,
         pixels: &[u8],
-        rows: DirtyRows,
+        rects: DirtyRects,
     ) -> bool {
-        self.shared.queue_atlas(kind, page, pixels, rows)
+        self.shared.queue_atlas(kind, page, pixels, rects)
     }
 
     fn atlas_idle(&self, kind: AtlasKind) -> bool {
@@ -416,13 +416,11 @@ impl WindowRenderer {
         let Some(feedback) = self.shared.take_feedback() else {
             return Ok(None);
         };
-        // 共享契约（B6-2）：`presented_at` 是**真实上屏**时刻，不可能早于 GPU 完成；
-        // 三端都读它，HUD 才能用同一字段区分「发布→完成」与「发布→上屏」。
+        // 共享契约（`render/frame.rs`）：`presented_at` 要么是**可信**的上屏时刻（Linux 恒为
+        // `None` —— `wl_surface.frame` 回调未接），要么如实为 `None`；绝不允许用完成时刻顶替。
         debug_assert!(
-            feedback
-                .presented_at
-                .is_none_or(|presented| presented >= feedback.completed_at),
-            "presented_at must not precede completed_at"
+            feedback.presentation_is_consistent(),
+            "presented_at must be a trustworthy on-screen instant or None"
         );
         self.stats = feedback.stats;
         debug_assert!(
@@ -553,9 +551,9 @@ struct AtlasSlots {
 struct AtlasUpload {
     kind: AtlasKind,
     page: u32,
-    /// `rows` 顺序紧密打包的行（整页上传时就是整页）。
+    /// `rects` 顺序逐矩形紧密打包的字节（整页上传时就是整页）。
     pixels: Vec<u8>,
-    rows: DirtyRows,
+    rects: DirtyRects,
 }
 
 impl AtlasSlots {
@@ -568,7 +566,7 @@ impl AtlasSlots {
 
     /// 入队一次上传。**槽位由 UI 线程的 `atlas_idle` 保证空闲**（DEVIATIONS F-211）：
     /// 槽里已有未消费的上传时是契约破坏（会丢行），release 也硬失败。
-    fn queue(&mut self, kind: AtlasKind, page: u32, pixels: Vec<u8>, rows: DirtyRows) {
+    fn queue(&mut self, kind: AtlasKind, page: u32, pixels: Vec<u8>, rects: DirtyRects) {
         let slot = match kind {
             AtlasKind::Glyph => &mut self.glyph,
             AtlasKind::Image => &mut self.image,
@@ -581,7 +579,7 @@ impl AtlasSlots {
             kind,
             page,
             pixels,
-            rows,
+            rects,
         });
     }
 
@@ -618,7 +616,7 @@ impl Shared {
         self.wake();
     }
 
-    fn queue_atlas(&self, kind: AtlasKind, page: u32, pixels: &[u8], rows: DirtyRows) -> bool {
+    fn queue_atlas(&self, kind: AtlasKind, page: u32, pixels: &[u8], rects: DirtyRects) -> bool {
         let index = kind.index() as usize;
         // 像素在**锁外**复制：整页可达 16 MiB，不能让 GPU 线程的取帧锁等这次 memcpy。
         let pixels = pixels.to_vec();
@@ -630,7 +628,7 @@ impl Shared {
             return false;
         }
         // 不唤醒：图集上传统一在「录制下一帧」之前落地（§4.2），单独唤醒只会空转。
-        state.atlas.queue(kind, page, pixels, rows);
+        state.atlas.queue(kind, page, pixels, rects);
         true
     }
 
@@ -824,7 +822,7 @@ fn run_gpu_loop(
         for (index, upload) in shared.take_atlas().into_iter().enumerate() {
             if let Some(upload) = upload {
                 atlas_awaiting[index] = true;
-                renderer.queue_atlas_upload(upload.kind, upload.page, upload.pixels, upload.rows);
+                renderer.queue_atlas_upload(upload.kind, upload.page, upload.pixels, upload.rects);
             }
         }
         // §4.4：resize 不是独立命令，`FrameRequest.surface` 就是目标尺寸。
@@ -896,8 +894,8 @@ fn drain_completed(
             completed_at,
             // UI 发布 → GPU 完成（HUD 的 publish→present）。
             latency: completed_at.saturating_duration_since(frame.published_at),
-            // 该端没有可靠的呈现时间戳（Windows 的 GetFrameStatistics 未接；Linux 的帧回调未接）：
-            // 共享契约里 `presented_at` 是可空字段，HUD 会退回用 `latency`。
+            // 该端没有可信的呈现时间戳（`wl_surface.frame` 回调未接）：共享契约里 `presented_at`
+            // 是可空字段，**如实留空**——不拿 GPU 完成时刻顶替（那会让 HUD 的上屏延迟变成假数据）。
             presented_at: None,
         });
     }
@@ -942,25 +940,30 @@ mod tests {
     use crate::{
         error::EngineError,
         paint::atlas::AtlasKind,
-        render::{DirtyRows, RenderStats, compositor::Plan, frame::LatestFrame},
+        render::{DirtyRects, RenderStats, compositor::Plan, frame::LatestFrame},
         window::FrameIndex,
     };
 
-    fn stale_rows(y0: u32, y1: u32) -> DirtyRows {
-        let mut rows = DirtyRows::default();
-        rows.mark(y0, y1);
-        rows
+    fn dirty_rects(y0: u32, y1: u32) -> DirtyRects {
+        let mut rects = DirtyRects::default();
+        rects.mark(crate::math::PhysicalRect::new(
+            0,
+            y0 as i32,
+            i32::MAX,
+            y1 as i32,
+        ));
+        rects
     }
 
     #[test]
-    fn a_first_atlas_upload_keeps_its_dirty_rows() {
+    fn a_first_atlas_upload_keeps_its_dirty_rects() {
         let mut slots = AtlasSlots::new();
-        slots.queue(AtlasKind::Glyph, 64, vec![1, 2, 3], stale_rows(4, 8));
+        slots.queue(AtlasKind::Glyph, 64, vec![1, 2, 3], dirty_rects(4, 8));
         let [glyph, image] = slots.take();
         let glyph = glyph.expect("glyph upload");
         assert_eq!(glyph.page, 64);
         assert_eq!(glyph.pixels, vec![1, 2, 3]);
-        assert_eq!(glyph.rows.spans(), stale_rows(4, 8).spans());
+        assert_eq!(glyph.rects, dirty_rects(4, 8));
         assert!(image.is_none());
         assert!(slots.take().iter().all(Option::is_none), "取走后槽位为空");
     }
@@ -970,8 +973,8 @@ mod tests {
     fn queueing_into_a_busy_atlas_slot_is_a_contract_violation() {
         // UI 线程用 `atlas_idle` 门控入队；覆盖未消费的上传会丢行，因此这里是硬失败。
         let mut slots = AtlasSlots::new();
-        slots.queue(AtlasKind::Glyph, 64, vec![1, 2, 3], stale_rows(4, 8));
-        slots.queue(AtlasKind::Glyph, 64, vec![9, 9, 9], stale_rows(16, 20));
+        slots.queue(AtlasKind::Glyph, 64, vec![1, 2, 3], dirty_rects(4, 8));
+        slots.queue(AtlasKind::Glyph, 64, vec![9, 9, 9], dirty_rects(16, 20));
     }
 
     #[test]

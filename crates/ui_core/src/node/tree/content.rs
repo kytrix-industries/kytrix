@@ -842,13 +842,11 @@ pub(crate) fn is_hittable(tree: &NodeTree, node: NodeId) -> bool {
 pub(crate) fn is_effectively_interactive(tree: &NodeTree, node: NodeId) -> bool {
     let mut cursor = Some(node);
     while let Some(current) = cursor {
-        let Some(target) = tree.arena.get(current) else {
-            return false;
-        };
-        if target.style_patch().interactive == Some(false) {
+        // 唯一本地判据：`is_hittable`（命中 / 焦点 / a11y 三处共用，R04-9 的一致化）。
+        if !is_hittable(tree, current) {
             return false;
         }
-        cursor = target.parent;
+        cursor = tree.arena.get(current).and_then(|target| target.parent);
     }
     true
 }

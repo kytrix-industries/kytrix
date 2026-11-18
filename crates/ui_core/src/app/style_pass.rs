@@ -64,6 +64,19 @@ pub(crate) fn unbind_key(app: &mut App, key: KeyCode, modifiers: Modifiers) -> b
 /// 只遍历 `dirty_bind` 反向集合（R03-1 / R03-9）：旧实现每帧遍历全序 `order` 并对每个节点
 /// 查 `PAINT` 位 —— 既是 O(N)，又把"重算动态属性"和"重建 lane"压在同一个位上。
 ///
+/// # R03-15 的结论（复核记录，防再被误判为"未修"）
+///
+/// 台账把它记为「每 pass 整体替换 deps + 每节点 clone old_patch」，但按代码逐项核对：
+/// - `DependencyGraph::replace_deps` **本身就是差量**：只对「旧有新无」退订、「新有旧无」订阅，
+///   相同的边既不删也不重加（`node/dependency.rs` 的同名方法与 `replace_deps_*` 单测）；
+/// - `tree.set_deps` 换的是 `SmallVec<[SignalId; 8]>`（内联 8），常规读者数下**零堆分配**；
+/// - `style_patch().clone()` 克隆的是 `StylePatch`：字段全是 `Copy`（`Option<Color>`/`Option<Border>`/
+///   `Option<f32>`/`Option<bool>`/`Option<Cursor>`/`bool`），clone 就是一次 ~40 B 的 memcpy。
+///
+/// 唯一真实的剩余成本是 `ReadTracker::record` 的线性查重（典型 1–5 个读者）—— 已作为
+/// **R03-5 的显式取舍**登记（测量驱动，不在 1–5 读者规模上引入 HashSet/位图）。
+/// 因此本条**不再有一次"整表重建"级别的开销可消**；如未来出现 >8 读者的节点，先动的是 R03-5。
+///
 /// 返回 `None` = 窗口不存在（P03 的冻结错误表里没有「未知窗口」变体，`Option` 是唯一诚实的表达）。
 /// P11 追加：`bind_a11y` 与另两条动态通道同批求值（同一 `ReadCtx` / `ReadTracker` / 依赖边集）。
 /// **只有** `bind_a11y` 的节点不在这里求值（R13-6）：它们走 `refresh_a11y_bindings`，不标
@@ -235,6 +248,16 @@ pub(crate) fn invalidate(app: &mut App, signal: SignalId) {
         let Some(owners) = graph.dependents_mut(current) else {
             continue;
         };
+        // R01-5 的复核结论（代码注释即登记，防止再被当成"漏修"）：这里的两处开销都**不能删**：
+        //
+        // 1. `retain` 的逐 owner 存活检查是**惰性剔除**的唯一实现。死 owner（节点已卸载、arena
+        //    槽位已复用）只能在这里被发现 —— 引擎的卸载路径不逐信号摘边（`remove_node` 只解自己
+        //    那一层的边，`close_window` 是唯一的全量退订点）。删掉它，反查表会随节点回收无界增长，
+        //    且写一次信号就要为死 owner 付出一次 `windows.get`。若将来改为**卸载时立刻摘边**，
+        //    这里才能删；那是 R03-6 槽位回收的配套改动，不是本 pass 的局部优化。
+        // 2. `snapshot` 是 `SmallVec<[Owner; 8]>`：读者 ≤8 时**纯栈上**，无堆分配；超过 8 才
+        //    一次分配。它存在的原因是借用（`dependents_mut` 的可变借用不能在遍历中再次借用
+        //    `graph` 去做级联），不是"每次都要分配一份拷贝"。
         owners.retain(|owner| match owner {
             Owner::Node { window, node } => windows
                 .get(window)

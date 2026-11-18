@@ -10,6 +10,10 @@
 //!
 //! 逐边取整保证相邻图元共享边精确重合（无 1px 缝）：同一逻辑坐标只有一种表达式，
 //! 舍入输入逐位相同则输出相同。
+//!
+//! 第五条规则是**描边宽度**（[`snap_stroke_width`]）：线宽在物理像素域按同一取整吸附到
+//! 整数像素且至少 1 px（Skia hairline / WebRender 边框吸附），宽度与位置共用
+//! [`snap_physical`] 这一条取整表达式。
 
 use std::ops::{Add, Mul, Sub};
 
@@ -174,18 +178,10 @@ impl Rect {
         if !scale.is_finite() || scale <= 0.0 || !self.is_finite() {
             return self;
         }
-        let snap = |value: f32| {
-            let scaled = value * scale;
-            if scaled.is_finite() {
-                (scaled + 0.5).floor() / scale
-            } else {
-                value
-            }
-        };
-        let x0 = snap(self.origin.x);
-        let y0 = snap(self.origin.y);
-        let x1 = snap(self.origin.x + self.size.width);
-        let y1 = snap(self.origin.y + self.size.height);
+        let x0 = snap_scalar(self.origin.x, scale);
+        let y0 = snap_scalar(self.origin.y, scale);
+        let x1 = snap_scalar(self.origin.x + self.size.width, scale);
+        let y1 = snap_scalar(self.origin.y + self.size.height, scale);
         Self {
             origin: Point { x: x0, y: y0 },
             size: Size {
@@ -691,6 +687,60 @@ const EMPTY_PHYSICAL: PhysicalRect = PhysicalRect {
 
 fn saturate(value: f32) -> f32 {
     value.clamp(I32_MIN_F, I32_MAX_F)
+}
+
+/// 物理像素取整（**唯一表达式**）：`floor(v + 0.5)`，非有限原样返回。
+///
+/// 布局边界吸附（[`Rect::snap_to_device`]）与描边宽度吸附（[`snap_stroke_width`]）共用，
+/// 保证「只有一套吸附取整规则」（Skia `SkScalarRoundToScalar` 同式）。
+fn snap_physical(value: f32) -> f32 {
+    let shifted = value + 0.5;
+    if shifted.is_finite() {
+        shifted.floor()
+    } else {
+        value
+    }
+}
+
+/// 逻辑坐标 → 设备像素吸附（`floor(v·scale + 0.5) / scale`）。
+fn snap_scalar(value: f32, scale: f32) -> f32 {
+    let physical = value * scale;
+    if physical.is_finite() {
+        snap_physical(physical) / scale
+    } else {
+        value
+    }
+}
+
+/// 设备像素吸附的「至少 1 物理像素」描边宽度（返回**物理像素**）。
+///
+/// Skia 的 hairline（`SkPaint::kHairline_Width` 恒为 1 设备像素）/ WebRender 的边框设备像素
+/// 吸附 / Blink 的 `PixelSnappedSize` 是同一语义：1 逻辑像素的边框在 125% / 150% / 175% 下
+/// 落到 **1 / 2 / 2 物理像素**，而不是 1.25 / 1.5 / 1.75 px 的 AA 带。
+///
+/// 取整与 [`Rect::snap_to_device`] **逐位同源**（共用 [`snap_physical`]），没有第二套规则：
+/// - 宽度先在物理像素域按 `floor(v + 0.5)` 吸附成整数，再夹到**至少 1**（亚像素细线不消失，
+///   这是 hairline 的定义）；
+/// - 吸附后的带宽是整数物理像素；调用方以**布局提交值**（`layout.bounds` 已按
+///   `snap_to_device` 吸附过的边界）为锚点向内展开，因此边框的两条边都落在设备像素网格上，
+///   **位置不再二次取整**（位置就是布局提交值）；
+/// - 「居中于边界（外半 + 内半）」的落地：理想带是 `[edge − w·s, edge]`，先把它按理想中心线
+///   对称展开/收缩到整数带宽（外半 + 内半），再逐边按同一规则吸附；外半被盒边界挡回盒内
+///   （CSS 边框画在 border box 内侧），结果等价于「整数带宽从已吸附的外边界向内展开」，
+///   内边界同样落在整数物理像素上；
+/// - 非有限 / 非正 `scale` / 非正 `width` ⇒ `0.0`（无描边）：与 `snap_to_device` 的防御方向
+///   一致（只吸附确定能吸附的量，不制造半吊子吸附）。
+#[must_use]
+pub fn snap_stroke_width(width: f32, scale: f32) -> f32 {
+    if !width.is_finite() || width <= 0.0 || !scale.is_finite() || scale <= 0.0 {
+        return 0.0;
+    }
+    let physical = width * scale;
+    if !physical.is_finite() {
+        return 0.0;
+    }
+    // 至少 1 物理像素：宽度吸附到 0 的细线仍然可见（Skia hairline）。
+    snap_physical(physical).max(1.0)
 }
 
 fn round_physical(value: f32) -> i32 {
@@ -1346,5 +1396,97 @@ mod tests {
         let bounds = rotated.transform_rect(Rect::new(0.0, 0.0, 10.0, 10.0));
         assert!((bounds.size.width - 14.1421).abs() < 1e-3, "{bounds:?}");
         assert!((bounds.size.height - 14.1421).abs() < 1e-3, "{bounds:?}");
+    }
+
+    // ── R04-4：描边宽度吸附（≥1 物理像素，与边界吸附同一取整）────────────────
+
+    /// 1 逻辑像素边框在 125% / 150% / 175% 下落到 1 / 2 / 2 物理像素，而不是 1.25/1.5/1.75。
+    #[test]
+    fn stroke_width_snaps_to_integer_device_pixels() {
+        for (factor, expected) in [
+            (1.0, [1.0, 1.0, 2.0, 3.0, 2.0]),
+            (1.25, [1.0, 1.0, 3.0, 3.0, 3.0]),
+            (1.5, [2.0, 1.0, 3.0, 4.0, 4.0]),
+            (1.75, [2.0, 1.0, 4.0, 4.0, 4.0]),
+            (2.0, [2.0, 1.0, 4.0, 5.0, 5.0]),
+            (3.0, [3.0, 2.0, 6.0, 8.0, 7.0]),
+        ] {
+            for (width, want) in [1.0f32, 0.5, 2.0, 2.5, 2.4].iter().zip(expected.iter()) {
+                let got = snap_stroke_width(*width, factor);
+                assert_eq!(
+                    got, *want,
+                    "width {width} at scale {factor} must snap to {want} physical px"
+                );
+                assert_eq!(got.fract(), 0.0, "吸附结果必须是整数物理像素：{got}");
+            }
+        }
+    }
+
+    /// hairline：亚像素宽度也**不消失**（Skia `kHairline_Width` = 恒 1 设备像素）。
+    #[test]
+    fn stroke_width_is_at_least_one_physical_pixel() {
+        for factor in SCALES {
+            for width in [0.01f32, 0.1, 0.25, 0.4, 0.49] {
+                assert_eq!(
+                    snap_stroke_width(width, factor),
+                    1.0,
+                    "width {width} at scale {factor} 必须至少 1 物理像素"
+                );
+            }
+        }
+    }
+
+    /// 防御：非有限 / 非正输入不制造半吊子吸附（与 `snap_to_device` 同方向）。
+    #[test]
+    fn stroke_width_defends_against_invalid_input() {
+        assert_eq!(snap_stroke_width(0.0, 1.25), 0.0);
+        assert_eq!(snap_stroke_width(-1.0, 1.25), 0.0);
+        assert_eq!(snap_stroke_width(f32::NAN, 1.25), 0.0);
+        assert_eq!(snap_stroke_width(f32::INFINITY, 1.25), 0.0);
+        assert_eq!(snap_stroke_width(1.0, 0.0), 0.0);
+        assert_eq!(snap_stroke_width(1.0, -2.0), 0.0);
+        assert_eq!(snap_stroke_width(1.0, f32::NAN), 0.0);
+        assert_eq!(snap_stroke_width(1.0, f32::INFINITY), 0.0);
+        // 乘积极大但不溢出：饱和到 f32::MAX 域内的整数（不 panic、不返回 NaN）。
+        let huge = snap_stroke_width(1e30, 1.25);
+        assert!(huge.is_finite() && huge >= 1.0);
+    }
+
+    /// R04-4 的验收判据：**同一逻辑宽度在不同亚像素位置渲染出的物理行数相同**。
+    ///
+    /// 布局提交值已把外边界吸附到整数物理像素（`snap_to_device`）；边框宽度再用同一取整
+    /// 吸成整数 ⇒ 内外两条边都落在整数物理像素上，与节点的亚像素相位无关。
+    #[test]
+    fn stroke_width_is_phase_independent_at_fractional_scales() {
+        for factor in [1.25f32, 1.5, 1.75] {
+            let snapped = snap_stroke_width(1.0, factor);
+            for offset in [0.0f32, 0.1, 0.25, 0.4, 0.49, 0.5, 0.6, 0.75, 0.9] {
+                let committed = Rect::new(offset, offset, 20.0, 10.0).snap_to_device(factor);
+                let outer_px = committed.origin.x * factor;
+                let inner_px = outer_px - snapped;
+                assert_eq!(
+                    outer_px.fract(),
+                    0.0,
+                    "布局提交的外边界必须是整数物理像素：offset {offset} at {factor}"
+                );
+                assert_eq!(
+                    inner_px.fract(),
+                    0.0,
+                    "边框内边界必须是整数物理像素：offset {offset} at {factor}"
+                );
+            }
+        }
+    }
+
+    /// 整数 DPI 下吸附是恒等（宽度 1/2 dp 在 100% 与 200% 下不变），golden 不应移位。
+    #[test]
+    fn stroke_width_is_identity_at_integer_device_scales() {
+        for (factor, width) in [(1.0, 1.0), (1.0, 2.0), (2.0, 1.0), (2.0, 2.0)] {
+            assert_eq!(
+                snap_stroke_width(width, factor),
+                width * factor,
+                "整数 DPI 下宽度吸附必须是恒等"
+            );
+        }
     }
 }

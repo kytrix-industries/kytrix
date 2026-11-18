@@ -72,17 +72,16 @@ pub(crate) fn animate(
                 .transient_ref::<f32>(target.id())
                 .copied()
                 .unwrap_or(0.0);
-            if spec.duration.is_zero() {
-                app.store.set_transient(target.id(), to);
-                app.mark_nodes_paint(window, nodes);
-                app.request_frame();
-                return Ok(AnimationId::new(window, id));
-            }
-            AnimationTarget::Scalar {
+            let slot_target = AnimationTarget::Scalar {
                 transient: target,
                 from,
                 to,
+            };
+            if spec.duration.is_zero() {
+                settle_immediately(app, &slot_target, window, nodes);
+                return Ok(AnimationId::new(window, id));
             }
+            slot_target
         }
         AnimatedValue::Color { target, to } => {
             let from = app
@@ -90,17 +89,16 @@ pub(crate) fn animate(
                 .transient_ref::<Color>(target.id())
                 .copied()
                 .unwrap_or(Color::TRANSPARENT);
-            if spec.duration.is_zero() {
-                app.store.set_transient(target.id(), to);
-                app.mark_nodes_paint(window, nodes);
-                app.request_frame();
-                return Ok(AnimationId::new(window, id));
-            }
-            AnimationTarget::Color {
+            let slot_target = AnimationTarget::Color {
                 transient: target,
                 from,
                 to,
+            };
+            if spec.duration.is_zero() {
+                settle_immediately(app, &slot_target, window, nodes);
+                return Ok(AnimationId::new(window, id));
             }
+            slot_target
         }
     };
     // 同一目标重定向：旧槽必须让位（否则两条插值同时写同一个瞬态值 ⇒ 回弹/抖动）。
@@ -117,6 +115,31 @@ pub(crate) fn animate(
     });
     app.request_frame();
     Ok(AnimationId::new(window, id))
+}
+
+/// 零时长动画：**立即到位** + 取消同一目标上的旧槽（R01-13）。
+///
+/// 旧实现只在 `duration == 0` 分支里写一次瞬态值就 `return`，**不清旧槽**：上一次 `animate`
+/// 注册的长动画仍在 `app.animations` 里，同一帧的 `tick_animations` 会继续把同一个
+/// `Transient` 推向旧目标值（「设成 0 ms 还是被拉回 1.0」的回弹）。零时长的语义是
+/// 「不要动画」，所以与非零路径同一规则：同一目标只能有一条驱动源。
+fn settle_immediately(app: &mut App, target: &AnimationTarget, window: WindowId, nodes: &[NodeId]) {
+    app.animations
+        .retain(|slot| !slot.target.same_target(target));
+    match target {
+        AnimationTarget::Scalar { transient, to, .. } => {
+            app.store.set_transient(transient.id(), *to)
+        }
+        AnimationTarget::Color { transient, to, .. } => {
+            app.store.set_transient(transient.id(), *to)
+        }
+        // `AnimatedValue` 没有滚动变体：滚动动画只由 `App::scroll_to` 内部注册（不经本函数）。
+        AnimationTarget::Scroll { .. } => {
+            debug_assert!(false, "zero-duration scroll animation is not reachable");
+        }
+    }
+    app.mark_nodes_paint(window, nodes);
+    app.request_frame();
 }
 
 /// 取消动画（幂等）。
@@ -173,6 +196,13 @@ pub(crate) fn mark_nodes_paint(app: &mut App, window: WindowId, nodes: &[NodeId]
 
 /// 推进本窗口的动画（`App::frame` 在帧门禁**之前**调用）。
 /// 消费者：`App::tick_animations`。
+///
+/// # R01-7 的剩余项（登记，不在本次改动范围）
+///
+/// 每帧仍有一次 `mem::take` + `Vec::with_capacity`，以及每个被驱动节点一次
+/// `windows.get_mut`。两处都能消（复用 `App` 上的 scratch 缓冲、把窗口查找提到循环外），
+/// 但它们是**纯分配/借用顺序**优化：现有动画语义测试在两种实现下都绿，拿不出"先红后绿"的
+/// 行为断言；按本轮的门禁口径（每条修复必须带能失败的测试）不能算完成，留待与帧基准一起做。
 pub(crate) fn tick_animations(app: &mut App, window: WindowId) {
     if !app.animations_running(window) {
         return;

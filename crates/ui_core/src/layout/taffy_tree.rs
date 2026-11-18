@@ -74,13 +74,31 @@ pub(crate) fn run(
 
     // 低级入口：内部只写 `set_unrounded_layout`，不做任何圆整。
     compute_root_layout(tree, root, available_space);
+
+    // R04-10：错误帧既**不推进绝对坐标**，也不消费 `LAYOUT`（见 `set_local_layout` 的同款守卫）。
+    //
+    // 旧实现在 `absolutize()` 之后才 `take_invalid_measure()`，此时整轮已经跑完、`LAYOUT` 已被
+    // 清掉：应用修好 measure 闭包后没有任何失效源（`layout_if_dirty` 只看 `LAYOUT`），
+    // 该子树永远停在错误帧的盒子上。这里把「出错节点 → 根」的 taffy 缓存清掉并重新标 `LAYOUT`，
+    // 于是修复本身（闭包返回合法值）就足以让下一帧自愈，不需要外部 `mark_layout`。
+    // R04-10：错误帧既**不推进绝对坐标**，也不消费 `LAYOUT`。旧实现在 `absolutize()` 之后才
+    // `take_invalid_measure()`，此时整轮已跑完、`LAYOUT` 已被清掉：应用修好 measure 闭包后
+    // 没有任何失效源（`layout_if_dirty` 只看 `LAYOUT`），该子树永远停在错误帧的盒子上。
+    // 这里把「出错节点 → 根」的 taffy 缓存清掉并重新标 `LAYOUT`，于是修复本身（闭包返回合法值）
+    // 就足以让下一帧自愈，不需要外部 `mark_layout`。
+    if let Some(error) = tree.take_invalid_measure() {
+        let node = match &error {
+            EngineError::InvalidMeasure { node, .. } => *node,
+            // `NodeTree::invalid_measure` 的唯一写者是 `note_invalid_measure`（只装这一种错误）。
+            _ => tree.root(),
+        };
+        tree.invalidate_layout(node);
+        return Err(error);
+    }
     // 引擎 post-pass：父相对 → 窗口绝对（含出流/hoisted 子树）。
     tree.absolutize();
 
-    match tree.take_invalid_measure() {
-        Some(error) => Err(error),
-        None => Ok(tree.take_report()),
-    }
+    Ok(tree.take_report())
 }
 
 /// `LayoutPartialTree::compute_child_layout` + `LayoutBlockContainer::compute_block_child_layout`
@@ -1351,5 +1369,67 @@ mod tests {
             11.0,
             "孙子的边界跨过半像素时必须重贴（否则提交盒错位 1px）"
         );
+    }
+
+    /// R04-10 验收：measure 违规帧**不得**消费 `LAYOUT`，也不得把 NaN 交给 taffy。
+    ///
+    /// 第一轮 measure 返回 NaN（`InvalidMeasure`），第二轮返回 10 —— 期间不调用任何
+    /// `mark_layout` / `invalidate_measure`，节点必须自己回到 10×10。
+    /// 旧实现：错误帧已把 `LAYOUT` 清掉（`set_local_layout` 无条件 `remove`）、且 taffy 缓存里
+    /// 留着 NaN 布局 ⇒ 第二轮 cache 命中、第二/三次不再调 measure，节点永久停在坏盒子上。
+    #[test]
+    fn an_invalid_measure_is_recoverable_without_an_external_invalidation() {
+        use std::rc::Rc;
+
+        use crate::error::EngineError;
+
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let calls = Rc::new(Cell::new(0usize));
+        let counter = Rc::clone(&calls);
+        let node = NodeBuilder::boxed()
+            .measure(Box::new(move |_known, _available| {
+                let turn = counter.get();
+                counter.set(turn + 1);
+                if turn == 0 {
+                    Size::new(f32::NAN, 10.0)
+                } else {
+                    Size::new(10.0, 10.0)
+                }
+            }))
+            .build(&mut tree, root)
+            .expect("挂载成功");
+
+        let error = tree
+            .compute_layout(taffy::geometry::Size {
+                width: Some(100.0),
+                height: Some(100.0),
+            })
+            .expect_err("NaN measure 必须报错");
+        assert!(matches!(
+            error,
+            EngineError::InvalidMeasure {
+                node: reported,
+                axis: crate::layout::Axis::X,
+                ..
+            } if reported == node
+        ));
+        assert!(
+            tree.has_layout_work(),
+            "错误帧不得消费 LAYOUT：否则应用修好闭包后没有失效源能自愈"
+        );
+
+        let report = tree
+            .compute_layout(taffy::geometry::Size {
+                width: Some(100.0),
+                height: Some(100.0),
+            })
+            .expect("第二轮必须自愈");
+        let committed = bounds(&tree, node);
+        // flex 行会沿交叉轴拉伸子节点高度，因此只断言 measure 决定的主轴宽度。
+        assert_eq!(committed.size.width, 10.0, "第二轮必须重跑 measure");
+        assert!(report.laid_out > 0, "{report:?}");
+        assert!(calls.get() > 1, "measure 必须被重新调用：{}", calls.get());
+        assert!(!tree.has_layout_work(), "布局成功后脏集合必须清空");
     }
 }

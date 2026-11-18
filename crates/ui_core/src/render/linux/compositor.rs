@@ -673,7 +673,7 @@ impl GpuRenderer {
         kind: AtlasKind,
         page: u32,
         pixels: Vec<u8>,
-        rows: crate::render::atlas::DirtyRows,
+        rects: crate::render::atlas::DirtyRects,
     ) {
         debug_assert!(
             self.swapchain.is_none() || on_gpu_thread(),
@@ -681,7 +681,7 @@ impl GpuRenderer {
         );
         let queued_page = self.shared.atlas_page(kind);
         self.atlas_uploads
-            .queue_upload(kind, page, queued_page, pixels, rows);
+            .queue_upload(kind, page, queued_page, pixels, rects);
     }
 
     /// 该图集是否有一笔上传已入队、还没被命令缓冲消费（离屏目标的空闲判据）。
@@ -2229,7 +2229,7 @@ mod tests {
         math::{PhysicalRect, Size},
         paint::atlas::AtlasKind,
         render::{
-            DirtyRows,
+            DirtyRects,
             compositor::{CopyPlan, DamageRects, FramePlan, Plan},
             frame::FramePayload,
             linux::device::{SharedGpu, gpu_test_lock},
@@ -2423,9 +2423,8 @@ mod tests {
                 None,
             )
             .expect("renderer");
-            let mut rows = DirtyRows::default();
-            rows.mark(0, u32::MAX);
-            renderer.queue_atlas_upload(AtlasKind::Glyph, 64, vec![0u8; (64 * 64) as usize], rows);
+            let rects = DirtyRects::full();
+            renderer.queue_atlas_upload(AtlasKind::Glyph, 64, vec![0u8; (64 * 64) as usize], rects);
             let mut frame = FramePlan::new(Plan::Full, true);
             let mut timings = FrameTimings::new();
             renderer
@@ -2517,9 +2516,8 @@ mod tests {
                 let mut renderer = GpuRenderer::new_offscreen((8, 8)).expect("shared renderer");
                 // 两个线程同时往**同一张共享图集纹理**整页上传相同内容：页重建是进程级串行
                 // 事件（写锁 + 有界队列 idle），上传屏障序列在同一队列上不会交错。
-                let mut rows = crate::render::DirtyRows::default();
-                rows.mark(0, u32::MAX);
-                renderer.queue_atlas_upload(AtlasKind::Glyph, 64, vec![0x40u8; 64 * 64], rows);
+                let rects = crate::render::DirtyRects::full();
+                renderer.queue_atlas_upload(AtlasKind::Glyph, 64, vec![0x40u8; 64 * 64], rects);
                 let scene = red_quad_scene();
                 let mut encoder = InstanceEncoder::new();
                 let buffer = encoder

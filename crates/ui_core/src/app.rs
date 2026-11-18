@@ -15,6 +15,7 @@ mod focus;
 mod frame;
 mod geometry;
 mod input;
+mod invalidate;
 mod overlay;
 mod resources;
 mod scroll;
@@ -129,15 +130,15 @@ pub struct App {
     /// 页内所有 tile 重排。文本 lane 里存的是旧 `AtlasTile`（旧 UV），所以代际一变就必须
     /// 让**所有窗口**的文本节点重绘；否则画的是旧 UV（错字/花字）。
     atlas_generation_seen: u32,
-    /// 累积的图集脏行（P09 的增量上传输入；`layout_text` 合并、上传后清空）。
-    pending_dirty: crate::render::DirtyRows,
+    /// 累积的图集脏矩形（P09 的增量上传输入；`layout_text` 合并、上传后清空；R06-3 起是 AOI 矩形）。
+    pending_dirty: crate::render::DirtyRects,
     /// 字形页整页缓冲上次按哪个页尺寸重建（`None` = 还没建 / 刚清空）。
     ///
     /// 页尺寸变化时缓冲必须**清零重建**：旧页的行宽不同，残留字节会被当成新页内容上传。
     glyph_page_extent: Option<u32>,
     /// 字形页的整页 CPU 缓冲（跨上传复用，避免每次上传都分配）。
     glyph_page: Vec<u8>,
-    /// 增量上传的打包缓冲（脏行紧密排列；跨帧复用，避免每次上传都分配）。
+    /// 增量上传的打包缓冲（脏矩形逐个紧密排列；跨帧复用，避免每次上传都分配）。
     packed: Vec<u8>,
     /// 跨线程唤醒队列（`AppHandle` 的载荷；主线程之外唯一的引擎入口）。
     dispatcher: Arc<Dispatcher>,
@@ -413,7 +414,7 @@ impl App {
             text_layout_scratch: Vec::new(),
             scale_epochs: ahash::HashMap::default(),
             atlas_generation_seen: 0,
-            pending_dirty: crate::render::DirtyRows::default(),
+            pending_dirty: crate::render::DirtyRects::default(),
             glyph_page_extent: None,
             glyph_page: Vec::new(),
             packed: Vec::new(),
@@ -526,12 +527,12 @@ impl App {
         text_pass::upload_atlas_pages(self)
     }
 
-    /// 字形页分发：页级变化（尺寸 / 清空）走整页，其余按脏行增量。
+    /// 字形页分发：页级变化（尺寸 / 清空）走整页，其余按脏矩形（AOI）增量。
     fn upload_glyph_page(&mut self) {
         text_pass::upload_glyph_page(self)
     }
 
-    /// 图片页分发：懒分配（没插过图片就没有页）+ 按脏行增量（DEVIATIONS F-211）。
+    /// 图片页分发：懒分配（没插过图片就没有页）+ 按脏矩形（AOI）增量（DEVIATIONS F-211 / R06-3）。
     fn upload_image_page(&mut self) {
         text_pass::upload_image_page(self)
     }
@@ -612,7 +613,7 @@ impl App {
         resources::runtime_handle(self)
     }
 
-    /// 建一个普通信号（id 稠密递增，条目永不删除；归属根作用域，永不释放）。
+    /// 建一个普通信号（归属**根作用域**：永不释放，槽位因此永不被回收）。
     pub fn signal<T: Clone + 'static>(&mut self, initial: T) -> Signal<T> {
         signal_api::signal(self, initial)
     }
@@ -621,13 +622,17 @@ impl App {
     ///
     /// 典型用法：为一个可关闭的面板建作用域，面板内所有信号都注册进去；面板销毁时
     /// [`App::release_scope`] 一次，之后任何迟到写入（异步结果、定时器回投）都是 no-op，
-    /// 不会唤醒已经不存在的内容。窗口作用域由引擎自动管理（见 [`App::window_signal`]）。
+    /// 不会唤醒已经不存在的内容；旧句柄的**读**则确定性失败（值已被回收，不会读到复用后的
+    /// 新值），见 [`SignalScope`]。窗口作用域由引擎自动管理（见 [`App::window_signal`]）。
     #[must_use]
     pub fn signal_scope(&mut self) -> SignalScope {
         signal_api::signal_scope(self)
     }
 
-    /// 在指定作用域里注册信号。
+    /// 在指定作用域里注册信号（槽位优先复用该作用域释放时回收的空闲槽位）。
+    ///
+    /// # Panics
+    /// `scope` 已释放（引擎误用：释放后不可再 mint 信号）。
     pub fn signal_scoped<T: Clone + 'static>(
         &mut self,
         scope: SignalScope,
@@ -636,7 +641,7 @@ impl App {
         signal_api::signal_scoped(self, scope, initial)
     }
 
-    /// 在**窗口作用域**里注册信号（`App::close_window` 时自动释放）。
+    /// 在**窗口作用域**里注册信号（`App::close_window` 时自动释放：值立即回收、槽位归还空闲表）。
     ///
     /// # Panics
     /// `window` 不存在（窗口的信号作用域随窗口一起创建 / 销毁）。
@@ -648,9 +653,10 @@ impl App {
         signal_api::signal_scoped(self, scope, initial)
     }
 
-    /// 释放信号作用域：其信号的写从此是 no-op，依赖图里以它们为键的边被**立即**删除。
+    /// 释放信号作用域：其值**立即回收**（槽位归还空闲栈、代际 +1），依赖图里以它们为键的边被
+    /// **立即**删除；此后旧句柄的读 panic、写/更新是 no-op（见 [`SignalScope`]）。
     ///
-    /// 返回被释放的信号数（重复释放返回 0）。
+    /// 返回被释放的信号数（重复释放返回 0；根作用域不可释放）。
     pub fn release_scope(&mut self, scope: SignalScope) -> usize {
         signal_api::release_scope(self, scope)
     }
@@ -669,7 +675,7 @@ impl App {
     }
 
     /// 写一个信号。返回 `true` = 值变了（并已沿依赖图失效）；`false` = 值相等（短路）
-    /// **或**该信号的作用域已释放（no-op）。
+    /// **或**该句柄已失效（作用域已释放 / 槽位已复用：no-op，不标脏、不唤醒）。
     ///
     /// 返回值不表示「有节点被标脏」（只写派生时没有节点变脏）。
     ///
@@ -686,7 +692,8 @@ impl App {
     ///
     /// 读旧值与写新值在同一次调用内完成：读守卫在算出新值的那条语句末尾就析构，**之后**才写，
     /// 因此不会撞上自己的守卫（手写的 `let guard = read(); ...; write()` 会在这一步 panic）。
-    /// 返回值与 [`App::write`] 一致：`false` = 等值短路 **或**该信号的作用域已释放（no-op）。
+    /// 返回值与 [`App::write`] 一致：`false` = 等值短路 **或**该句柄已失效（no-op；闭包不会被
+    /// 调用，所以失效句柄不会在"读旧值"那一步 panic）。
     ///
     /// 适合「新值 = f(旧值)」的派生写。**组合子消灭了 `match` 陷阱**：
     /// `cx.write_with(&s, |mode| match *mode { .. })` 不必先把值拷贝出来
@@ -705,7 +712,7 @@ impl App {
     /// 原地更新一个信号（**无等值短路**；适合大对象的局部修改）。
     ///
     /// 与 [`App::write`] 的差别：不 clone 旧值、不做 `PartialEq` 比较，闭包改完直接沿依赖图失效。
-    /// 返回 `false` 仅表示该信号的作用域已释放（no-op）。
+    /// 返回 `false` 仅表示该句柄已失效（no-op，闭包不会被调用）。
     ///
     /// # Panics
     /// 该信号存在活跃读守卫 / 类型不符。
@@ -715,8 +722,8 @@ impl App {
 
     /// 在闭包内**就地**更新一个信号并沿依赖图失效，返回闭包的返回值（**无等值短路**）。
     ///
-    /// 返回 `None` = 该信号的作用域已释放（no-op，闭包不会被调用，与 [`App::update`] 返回
-    /// `false` 同义）；`Some(r)` = 已就地改完并已沿依赖图失效。
+    /// 返回 `None` = 该句柄已失效（no-op，闭包不会被调用，与 [`App::update`] 返回 `false`
+    /// 同义）；`Some(r)` = 已就地改完并已沿依赖图失效。
     ///
     /// 与 [`App::update`] 的差别只有一个：闭包在**一次借用**内完成「看旧值 ⇒ 改值」，中间不会
     /// 产生 [`SignalRef`] 读守卫。**组合子消灭了 `match` 陷阱** —— 枚举状态机的自然写法
@@ -779,8 +786,45 @@ impl App {
     }
 
     /// 取走「需要一帧」的请求位（取走即清零）。
-    pub fn take_wake_request(&mut self) -> bool {
+    ///
+    /// **crate 内部**：这是引擎与平台泵之间的唤醒协议（R01-16 把它从公开面降级 —— 应用可以
+    /// 消费掉引擎的帧请求位、让泵不再出帧）。应用侧唯一的重绘入口是
+    /// [`App::request_repaint`]（窗口级）与 [`App::request_node_repaint`]（节点级）。
+    pub(crate) fn take_wake_request(&mut self) -> bool {
         frame::take_wake_request(self)
+    }
+
+    /// 按**窗口**请求重绘：下一帧整窗 damage（`Plan::Full`）并唤醒平台事件循环。
+    ///
+    /// 面向「确实需要重画整个窗口」的场景（例如外部资源整体换绑）。只需要重画某个子树时用
+    /// [`App::request_node_repaint`] —— 它不会把 damage 放大到整窗。
+    ///
+    /// # Errors
+    /// [`EngineError::UnknownWindow`]：窗口已关闭 / 从未存在。
+    pub fn request_repaint(&mut self, window: WindowId) -> Result<(), EngineError> {
+        invalidate::request_repaint(self, window)
+    }
+
+    /// 按**节点**请求重绘（R01-16；Chrome `InvalidateRect` / GPUI `cx.notify()` 的节点版本）。
+    ///
+    /// - 只把 `node` 的**子树**标 `PAINT | A11Y`：这些节点的 lane 重建、a11y 重发；
+    /// - damage 只来自被重建的 lane（**不**置整窗 `full_damage_pending`）⇒ 局部刷新不会退化成
+    ///   整窗重绘；
+    /// - 祖先链只做有效性校验（存活 + 可见）：任一祖先不可见 ⇒ 返回 `Ok(false)` 且**不**请求帧；
+    /// - 只重放绘制输出（paint spec / 画布 / 几何 / 文本快照的**当前值**），不重算
+    ///   `bind_style` / 布局。`Transient` 的写者读完 `bind_style` 若没有走信号依赖图，就由它
+    ///   自己调用本入口（与 [`App::write_transient`] 的文档配套）；
+    /// - 幂等：重复调用只合并脏位/帧请求，不会重复出帧（下一次 `frame` 消费脏位）。
+    ///
+    /// # Errors
+    /// [`EngineError::UnknownWindow`]（窗口已关闭）/ [`EngineError::StaleNode`]（节点陈旧，
+    /// 例如已从树中卸载）。
+    pub fn request_node_repaint(
+        &mut self,
+        window: WindowId,
+        node: NodeId,
+    ) -> Result<bool, EngineError> {
+        invalidate::request_node_repaint(self, window, node)
     }
 
     /// 置「需要一帧」并**唤醒平台事件循环**（合并位由 `Dispatcher::wake` 保证幂等）。
@@ -859,7 +903,9 @@ impl App {
     /// 不静默拷贝）。
     ///
     /// # Panics
-    /// `signal` 的槽位不是普通信号（引擎不变量被破坏时才会发生）。
+    /// - 句柄已失效（作用域已释放 / 槽位已回收复用）：**确定性失败**，绝不返回复用后的新值
+    ///   （见 `node::signal` 模块文档〈作用域回收与句柄失效〉）；
+    /// - `signal` 的槽位不是普通信号（引擎不变量被破坏时才会发生）。
     #[must_use]
     pub fn read<T: 'static>(&self, signal: &Signal<T>) -> SignalRef<T> {
         signal_api::read(self, signal)
@@ -876,7 +922,7 @@ impl App {
     /// 〈三种自然写法与 `match` 陷阱〉）。
     ///
     /// # Panics
-    /// `signal` 的槽位不是普通信号（引擎不变量被破坏时才会发生）。
+    /// 同 [`App::read`]（句柄已失效 / 槽位不是普通信号）。
     pub fn read_with<T: 'static, R>(&self, signal: &Signal<T>, body: impl FnOnce(&T) -> R) -> R {
         signal_api::read_with(self, signal, body)
     }
@@ -889,7 +935,7 @@ impl App {
     /// 非追踪读一个瞬态值，返回读守卫（动画进度 / 滚动偏移的公开读取面）。
     ///
     /// # Panics
-    /// 槽位不是瞬态值（引擎不变量被破坏时才会发生）。
+    /// 句柄已失效，或槽位不是瞬态值（引擎不变量被破坏时才会发生）。
     #[must_use]
     pub fn read_transient<T: 'static>(&self, transient: &Transient<T>) -> SignalRef<T> {
         signal_api::read_transient(self, transient)
@@ -1888,3 +1934,7 @@ mod interaction_tests;
 /// P13：`ResourceCache` 接入 `App` 的边界用例（图片页上传 / 进程级缓存 / 零副作用）。
 #[cfg(test)]
 mod resources_tests;
+
+/// R01-16：按节点 / 按窗口请求重绘的失效范围（子树 + 祖先链校验、不放大到整窗）。
+#[cfg(test)]
+mod invalidate_tests;
