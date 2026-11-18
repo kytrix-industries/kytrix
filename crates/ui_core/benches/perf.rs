@@ -1078,17 +1078,20 @@ fn bench_idle_frame(c: &mut Criterion) {
     });
 }
 
-/// **R01-10 的基准：HUD 打开、画面静止时的「每帧」成本。**
+/// **P-C 的基准：HUD 打开、画面静止时的「每帧」成本。**
 ///
-/// 计时的是 `App::frame` 在「没有任何脏状态、也没到 500 ms 采样点」那一次调用的成本：
-/// - 旧实现（每帧无条件 `request_damage(HUD 面板)`）：帧门禁永远放行 ⇒ 每次调用都提交一帧，
-///   重放 HUD 面板区域的 damage（`Committed`）；
-/// - 新实现（只有 500 ms 采样产出新文本时才请求 damage）：门禁直接退回 `Idle`，零 damage、
-///   零提交。
+/// 计时的是 `App::frame` 在「HUD 可见、没有任何脏状态、采样窗口没到期」那一次调用的成本：
+/// HUD 是纯观察者（不请求 damage、不参与 `needs_continuous_frames`），因此门禁直接退回
+/// `Idle`，零 damage、零提交；这笔钱只剩帧入口 `prepare_frame` 的几次字段比较。
 ///
-/// 计数判据在 `tests/hud.rs::hud_costs_nothing_when_the_scene_is_idle`（静止帧必须不提交）；
-/// 本基准量化两者差距，并把每轮的实际结果打到 stderr（日志里直接可读 `before = Committed` /
-/// `after = Idle`）。
+/// 旧实现的对照：
+/// - R01-10 之前：每次调用都 `request_damage(HUD 面板)` ⇒ 按刷新率提交帧（`Committed`）；
+/// - R01-10：只在 500 ms 采样点请求 damage ⇒ 采样帧仍由 HUD 产生；
+/// - 现在：HUD 完全不产生帧（采样文本只在应用出帧时写入）。
+///
+/// 计数判据在 `tests/hud.rs::hud_is_a_passive_observer_and_never_produces_frames`（静止帧必须
+/// 不提交）；本基准量化每轮成本，并把每轮的实际结果打到 stderr（日志里直接可读
+/// `before = Committed` / `after = Idle`）。
 ///
 /// 需要 `--features hud`：`App::set_debug_hud` 只在 hud 特性下存在；没有该特性时是空基准。
 #[cfg(feature = "hud")]
@@ -1101,13 +1104,13 @@ fn bench_hud_idle_frame(c: &mut Criterion) {
         .expect("bench runtime");
     let handle = runtime.handle().clone();
     let mut fixture = new_app(&handle);
-    // 静态场景：HUD 之外没有任何节点/绑定，静止帧的唯一工作来源就是 HUD 自己。
+    // 静态场景：HUD 之外没有任何节点/绑定，静止帧的唯一潜在工作来源就是 HUD 自己。
     let _ = mount_boxes(&mut fixture, 1);
     fixture
         .app
         .set_debug_hud(fixture.window, true)
         .expect("install debug hud");
-    // 安装帧：HUD 子树挂载、首个 500 ms 窗口还没到（时钟不动）。
+    // 安装帧：HUD 子树挂载 + 采样出第一份文本（时钟不动，之后的调用都在同一个采样窗口内）。
     let _ = fixture.app.frame(fixture.window);
     let reported = std::sync::Once::new();
     c.bench_function("hud_idle_frame", |b| {
@@ -1121,9 +1124,9 @@ fn bench_hud_idle_frame(c: &mut Criterion) {
                 eprintln!(
                     "hud_idle_frame: 静止帧 {}",
                     if committed {
-                        "提交（HUD 每帧无条件 damage）"
+                        "提交（HUD 又变成了帧源）"
                     } else {
-                        "Idle（HUD 不产生 damage）"
+                        "Idle（HUD 不产生帧）"
                     }
                 );
             });

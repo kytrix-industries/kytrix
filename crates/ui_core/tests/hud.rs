@@ -27,6 +27,23 @@ fn node_text(test: &TestApp, selector: Selector) -> String {
     }
 }
 
+fn line(test: &TestApp, index: usize) -> String {
+    const LINE_IDS: [&str; 11] = [
+        "debug-hud.line-0",
+        "debug-hud.line-1",
+        "debug-hud.line-2",
+        "debug-hud.line-3",
+        "debug-hud.line-4",
+        "debug-hud.line-5",
+        "debug-hud.line-6",
+        "debug-hud.line-7",
+        "debug-hud.line-8",
+        "debug-hud.line-9",
+        "debug-hud.line-10",
+    ];
+    node_text(test, Selector::Id(LINE_IDS[index]))
+}
+
 #[test]
 fn hud_installs_as_a_top_right_non_interactive_overlay() {
     let mut test = TestApp::new();
@@ -74,77 +91,113 @@ fn hud_is_hidden_from_the_accessibility_tree() {
     assert!(record.hidden, "HUD 必须标记 hidden，而不是冒充可访问内容");
 }
 
-/// **R01-10 的契约：HUD 打开 ≠「永远有一帧」。**
+/// **P-C 契约：HUD 是纯观察者，不是帧源。**
 ///
-/// 旧实现 `prepare_frame` 末尾无条件 `request_damage(HUD 面板)`，而帧门禁读的正是
-/// `pending_damage` ⇒ 窗口只要开着 HUD 就按刷新率提交帧、整块重画 HUD（静止画面也如此）。
-/// 现在只在「有新文本要写」时请求 damage（采样点 = 500 ms；以及提交失败的重试帧），于是：
-/// - 静止画面：每次 `drain` 都是 `Idle`，`FrameIndex` 不推进；
-/// - 每个 500 ms 采样窗口：**恰好一帧**（不是每轮一帧）。
-///
-/// 判据全部是**计数**（`rendered` / `FrameIndex`），与机器负载无关。
+/// 旧实现（R01-10 之前）每帧无条件请求 HUD damage ⇒ 静止窗口按刷新率提交帧；R01-10 之后改成
+/// 「采样点请求一帧」，帧率仍是 2 Hz。现在 HUD **完全不产生帧**：不请求 damage、不参与
+/// `needs_continuous_frames`、没有任何定时器/周期唤醒 —— 安装帧之后，静止窗口无论推进多少时间
+/// 都必须零提交（`FrameIndex` 不变、`rendered == false`）。
 #[test]
-fn hud_costs_nothing_when_the_scene_is_idle() {
+fn hud_is_a_passive_observer_and_never_produces_frames() {
     let mut test = TestApp::new();
     install(&mut test);
     assert!(
         test.drain().expect("安装帧").rendered,
         "安装 HUD 必须提交一帧"
     );
-
     let settled = test.frame_record().frame_index;
-    for index in 0..5 {
+
+    // 2.4 s：跨过四个 500 ms 采样窗口。采样只在「应用自己出帧」时发生，没有帧就没有采样，
+    // 也就没有任何理由把窗口从 Idle 拉起来。
+    for index in 0..12 {
+        test.advance(Duration::from_millis(200));
         assert!(
             !test.drain().expect("静止帧").rendered,
-            "第 {index} 个静止帧不得提交：HUD 又在每帧无条件请求 damage 了"
+            "第 {index} 个静止帧不得提交：HUD 又变成了帧源（采样定时器 / 无条件 damage）"
         );
     }
     assert_eq!(
         test.frame_record().frame_index,
         settled,
-        "静止期间 FrameIndex 不得推进（每帧一帧的旧行为会让它 +5）"
+        "静止期间 FrameIndex 不得推进（每帧一帧或每 500 ms 一帧的旧行为都会让它 +N）"
     );
+}
 
-    // 一个采样窗口（500 ms）恰好一帧：文本刷新真的发生了，但只有这一帧。
-    test.advance(Duration::from_millis(600));
-    let sample = test.drain().expect("采样帧").clone();
-    assert!(sample.rendered, "到达 500 ms 采样点必须提交一帧刷新文本");
-    let sampled = test.frame_record().frame_index;
-    assert_eq!(
-        sampled.get(),
-        settled.get() + 1,
-        "采样点只允许推进一帧（旧行为是每轮一帧）"
+/// 安装帧就必须产出第一份**真实**文本：`last_sample_at` 在安装时预置了一个采样间隔。
+///
+/// 否则纯观察者模式下，静止 demo 永远没有第二帧，HUD 会一直停在 `--` 占位。
+#[test]
+fn the_installation_frame_already_samples_real_text() {
+    let mut test = TestApp::new();
+    install(&mut test);
+    let _ = test.drain().expect("安装帧");
+
+    let size = line(&test, 10);
+    assert_ne!(
+        size.trim(),
+        "0x0 @ 0.00x",
+        "安装帧必须写出真实渲染目标尺寸，而不是占位行：{size}"
     );
-
-    // HUD 的 damage 必须落在面板内（不是整窗）：面板 = (544,12,244,200) @ scale 1，含 1 px
-    // AA 外扩。整窗 damage 会让 HUD 打开时每次都重画整屏。
-    let panel = ui_core::math::PhysicalRect::new(543, 11, 789, 213);
-    assert!(!sample.damage.is_empty(), "采样帧必须有 damage 才会提交");
-    for rect in &sample.damage {
-        assert!(
-            rect.intersect(panel) == *rect,
-            "HUD damage 必须落在面板内：{rect:?}（整窗 damage = R01-10 回归）"
-        );
-    }
-
-    for index in 0..3 {
-        assert!(
-            !test.drain().expect("采样后的静止帧").rendered,
-            "采样之后第 {index} 帧必须回到 Idle"
-        );
-    }
-
-    // 第二个采样窗口：同样恰好一帧（帧率上限 = 2 Hz，不是刷新率）。
-    test.advance(Duration::from_millis(600));
     assert!(
-        test.drain().expect("第二个采样帧").rendered,
-        "第二个 500 ms 窗口必须再提交一帧"
+        !line(&test, 8).contains("--"),
+        "安装帧必须写出真实图元计数：{}",
+        line(&test, 8)
     );
+}
+
+/// **FPS / Frame 的真实口径：完成帧数 / 采样窗口。**
+///
+/// headless 窗口没有 GPU 完成反馈（`poll_renderer` 恒 `None`）⇒ 采样窗口内完成帧数为 0 ⇒
+/// 两行都必须显示 `--`。旧口径（两次提交帧入口的间隔）在这里会算出 2.0 FPS / 500 ms 的自指值。
+#[test]
+fn hud_reports_no_frame_rate_without_completed_frames() {
+    let mut test = TestApp::new();
+    let window = test.window_id();
+    install(&mut test);
+    let _ = test.drain().expect("安装帧");
+
+    // 一个采样窗口之后由应用主动驱动一帧（HUD 自己不会出帧）。
+    test.advance(Duration::from_millis(600));
+    test.app_mut().request_repaint(window).expect("请求一帧");
+    assert!(test.drain().expect("应用帧").rendered);
+
+    assert_eq!(line(&test, 0).trim(), "FPS     --");
+    assert_eq!(line(&test, 1).trim(), "Frame   --");
+}
+
+/// 应用自己出帧时 HUD 顺带刷新，但**不得**额外增帧。
+#[test]
+fn application_frames_refresh_the_hud_without_extra_frames() {
+    let mut test = TestApp::new();
+    let window = test.window_id();
+    install(&mut test);
+    let _ = test.drain().expect("安装帧");
+    let base = test.frame_record().frame_index.get();
+
+    for index in 0..10 {
+        test.advance(Duration::from_millis(60));
+        test.app_mut().request_repaint(window).expect("请求一帧");
+        assert!(
+            test.drain().expect("应用帧").rendered,
+            "第 {index} 个应用帧必须提交"
+        );
+    }
     assert_eq!(
         test.frame_record().frame_index.get(),
-        settled.get() + 2,
-        "两个采样窗口只允许两帧"
+        base + 10,
+        "HUD 不得额外增帧：10 个应用帧就是 10 次提交"
     );
+
+    // 采样窗口（500 ms）已经过去：文本随应用帧刷新成真实值（帧率仍是 --，没有完成帧）。
+    assert!(
+        !line(&test, 8).contains("--"),
+        "应用帧上必须刷新出真实图元计数：{}",
+        line(&test, 8)
+    );
+    assert_eq!(line(&test, 0).trim(), "FPS     --");
+
+    // 应用不再出帧 ⇒ 立刻回到 Idle（HUD 不补帧）。
+    assert!(!test.drain().expect("静止帧").rendered);
 }
 
 /// 关闭 HUD 必须**请求一帧**把旧像素擦掉，之后窗口重新回到 Idle。
@@ -166,29 +219,6 @@ fn disabling_the_hud_erases_its_pixels_once() {
     assert!(
         !test.drain().expect("空闲帧").rendered,
         "擦除之后窗口必须重新回到 Idle"
-    );
-}
-
-#[test]
-fn hud_samples_fps_after_the_500ms_window() {
-    let mut test = TestApp::new();
-    install(&mut test);
-    let _ = test.drain().expect("首帧");
-    test.advance(Duration::from_millis(600));
-    let _ = test.drain().expect("第二帧");
-    test.advance(Duration::from_millis(600));
-    let _ = test.drain().expect("第三帧");
-
-    assert!(
-        test.frame_record().stats.layout.is_none(),
-        "HUD 文本（LayoutOverride）变化不得触发窗口重排"
-    );
-    let fps = node_text(&test, Selector::Id("debug-hud.line-0"));
-    assert!(fps.starts_with("FPS"), "{fps}");
-    assert_ne!(
-        fps.trim(),
-        "FPS     --",
-        "至少两个提交帧后必须有样本：{fps}"
     );
 }
 

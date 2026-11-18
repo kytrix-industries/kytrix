@@ -1,37 +1,44 @@
 //! `WndProc` 消息分派与 `WndProcState` 的集成单测（真实隐藏窗口）。
 //!
-//! 非客户区（拖动 / 缩放 / 双击最大化 / 系统菜单 / Snap）现在**完全由系统提供**
-//! （R07-2），所以这里不再有自绘拖动/缩放状态机的用例；取而代之的是
-//! `nonclient_hit_table_returns_system_hit_codes` —— 它钉死「`WM_NCHITTEST` 必须返回
-//! **系统命中码**」这个不变量（一旦有人又把它改写/吞掉，系统的模态循环就拿不到
-//! `HTCAPTION`，Snap 与双击最大化会同时失效）。
+//! 非客户区分工（R07-2 / P-A）：
+//! - `WM_NCCALCSIZE` / `WM_NCHITTEST` 仍交系统，`nonclient_hit_table_returns_system_hit_codes`
+//!   钉死「命中码必须由系统给」这个不变量（改写了它，系统的 move 模态循环就拿不到
+//!   `HTCAPTION`，Aero Snap / 双击最大化会同时失效）；
+//! - 8 个 resize 命中码由引擎**自持**（`resize.rs`）：`WM_NCLBUTTONDOWN` 返回 0、不进模态循环，
+//!   后续 `WM_MOUSEMOVE` 只记账、`SetWindowPos` 由泵执行（用例见文件末尾的 `resize_*`）。
 
 use std::sync::Arc;
 
 use windows::Win32::{
-    Foundation::{HWND, LPARAM, POINT, RECT, WPARAM},
-    Graphics::Gdi::ClientToScreen,
+    Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+    Graphics::Gdi::{ClientToScreen, ScreenToClient},
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         HiDpi::GetSystemMetricsForDpi,
         Input::{
             Ime::{GCS_RESULTSTR, ImmAssociateContext, ImmGetContext, ImmReleaseContext},
-            KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture},
+            KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture, VK_ESCAPE},
         },
         WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, GWLP_USERDATA, GetWindowRect, HTBOTTOMRIGHT, HTCAPTION,
             HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON, HTMINBUTTON, HTSYSMENU, HTTOPLEFT,
             PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, RegisterClassW, SM_CXPADDEDBORDER,
             SM_CXSIZEFRAME, SPI_SETANIMATION, SPI_SETWORKAREA, SendMessageW, SetWindowLongPtrW,
-            WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_DISPLAYCHANGE, WM_IME_CHAR,
-            WM_IME_COMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_INPUTLANGCHANGE,
-            WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCHITTEST, WM_POWERBROADCAST, WM_SETTINGCHANGE,
-            WM_SIZE, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+            WINDOW_EX_STYLE, WM_APP, WM_CANCELMODE, WM_CAPTURECHANGED, WM_DISPLAYCHANGE,
+            WM_IME_CHAR, WM_IME_COMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
+            WM_INPUTLANGCHANGE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+            WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER,
+            WNDCLASSW, WS_OVERLAPPEDWINDOW,
         },
     },
 };
 
-use super::super::{WndProcState, pump::A11Y_TIMER_ID, wndproc};
+use super::super::{
+    WndProcState,
+    pump::A11Y_TIMER_ID,
+    resize::{OuterRect, ResizeEdge},
+    wndproc,
+};
 use crate::{
     event::ImeEvent,
     platform::{
@@ -51,6 +58,20 @@ fn wide(text: &str) -> Vec<u16> {
 
 /// 建一个**隐藏**窗口并挂上生产 `WndProc` + `WndProcState`（`GWLP_USERDATA` 指向它）。
 fn hidden_window(tag: &str, dispatcher: Arc<Dispatcher>) -> (HWND, *mut WndProcState, Vec<u16>) {
+    hidden_window_sized(tag, dispatcher, 320, 240)
+}
+
+/// 与 [`hidden_window`] 相同，但窗口外框尺寸可指定。
+///
+/// 自持缩放的用例需要窗口**大于系统最小跟踪尺寸**：`WM_GETMINMAXINFO` 的 `ptMinTrackSize`
+/// 随 DPI 放大（150% 下最小外框约 496×314），窗口更小时每次目标外框都会被最小尺寸钳住，
+/// 就测不到「拖动边跟光标位移」。
+fn hidden_window_sized(
+    tag: &str,
+    dispatcher: Arc<Dispatcher>,
+    width: i32,
+    height: i32,
+) -> (HWND, *mut WndProcState, Vec<u16>) {
     let class_name = wide(tag);
     // SAFETY: 进程级模块句柄；类名是 NUL 结尾的宽字符串，`RegisterClassW` 同步拷贝。
     let instance = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
@@ -72,8 +93,8 @@ fn hidden_window(tag: &str, dispatcher: Arc<Dispatcher>) -> (HWND, *mut WndProcS
             WS_OVERLAPPEDWINDOW,
             0,
             0,
-            320,
-            240,
+            width,
+            height,
             None,
             None,
             Some(instance.into()),
@@ -633,7 +654,7 @@ fn nonclient_hit_table_returns_system_hit_codes() {
             y: middle_y
         }),
         HTLEFT,
-        "左边框必须是 HTLEFT：缩放同样由系统模态循环提供"
+        "左边框必须是 HTLEFT：缩放由引擎自持，但命中码仍由系统给"
     );
     assert_eq!(
         hit(POINT {
@@ -649,7 +670,7 @@ fn nonclient_hit_table_returns_system_hit_codes() {
             y: window.bottom - 1
         }),
         HTBOTTOMRIGHT,
-        "窗口右下角必须是 HTBOTTOMRIGHT（系统的缩放模态循环只认 HT*）"
+        "窗口右下角必须是 HTBOTTOMRIGHT（自持缩放靠这个命中码分流）"
     );
     // 系统菜单图标：标题栏最左侧（边框之后）。允许命中 `HTSYSMENU`（双击关闭 / 单击出菜单
     // 都是系统行为）。
@@ -914,4 +935,304 @@ fn unhandled_messages_fall_through_to_the_default_procedure() {
     let raw = unsafe { &mut *state };
     assert!(raw.take_events().is_empty());
     destroy_hidden_window(hwnd, state);
+}
+
+// ── P-A：自持窗口缩放（8 个 resize 命中码不进系统模态循环）──────────────────────────
+
+/// 窗口外框（屏幕物理像素；四元组避免依赖 `RECT` 的相等语义）。
+fn outer(hwnd: HWND) -> (i32, i32, i32, i32) {
+    let mut rect = RECT::default();
+    // SAFETY: 窗口存活；`rect` 是栈上值。
+    unsafe { GetWindowRect(hwnd, &mut rect) }.expect("GetWindowRect");
+    (rect.left, rect.top, rect.right, rect.bottom)
+}
+
+/// 由四元组构造 `OuterRect`（期望值书写用）。
+fn expected(left: i32, top: i32, right: i32, bottom: i32) -> OuterRect {
+    OuterRect::from_ltrb(left, top, right, bottom)
+}
+
+/// 投递一次 `WM_NCLBUTTONDOWN`（`lParam` 是屏幕坐标）。
+fn send_nonclient_down(hwnd: HWND, hit: u32, cursor: POINT) -> LRESULT {
+    let encoded = ((((cursor.y as u32) << 16) | (cursor.x as u32 & 0xFFFF)) as i32) as isize;
+    // SAFETY: 窗口存活；`SendMessageW` 同步进入生产 `wndproc`。
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_NCLBUTTONDOWN,
+            Some(WPARAM(hit as usize)),
+            Some(LPARAM(encoded)),
+        )
+    }
+}
+
+/// 投递一次 `WM_MOUSEMOVE`（把屏幕坐标换算成客户区坐标，与系统发消息的方式一致）。
+fn send_mouse_move_to_screen(hwnd: HWND, screen: POINT) -> LRESULT {
+    let mut client = screen;
+    // SAFETY: 只做坐标换算，不派发消息。
+    let _ = unsafe { ScreenToClient(hwnd, &mut client) };
+    let encoded = ((((client.y as u32) << 16) | (client.x as u32 & 0xFFFF)) as i32) as isize;
+    // SAFETY: 窗口存活；`SendMessageW` 同步进入生产 `wndproc`。
+    unsafe { SendMessageW(hwnd, WM_MOUSEMOVE, None, Some(LPARAM(encoded))) }
+}
+
+/// 投递一次无载荷消息（`WM_LBUTTONUP` / `WM_CAPTURECHANGED` / `WM_CANCELMODE`）。
+fn send_bare(hwnd: HWND, msg: u32) -> LRESULT {
+    // SAFETY: 窗口存活；`SendMessageW` 同步进入生产 `wndproc`。
+    unsafe { SendMessageW(hwnd, msg, None, None) }
+}
+
+/// 在窗口右下角中部开始一次缩放会话（`HTBOTTOMRIGHT`），返回起始外框与光标。
+fn begin_bottom_right_session(hwnd: HWND, raw: &mut WndProcState) -> ((i32, i32, i32, i32), POINT) {
+    let start = outer(hwnd);
+    let cursor = POINT {
+        x: start.2 - 1,
+        y: start.3 - 1,
+    };
+    let result = send_nonclient_down(hwnd, HTBOTTOMRIGHT, cursor);
+    assert_eq!(
+        result.0, 0,
+        "resize 命中码必须吞掉 WM_NCLBUTTONDOWN（返回 0 = 不进系统模态循环）"
+    );
+    assert!(raw.resize_active(), "按下 resize 命中码必须开始会话");
+    (start, cursor)
+}
+
+/// `WM_NCLBUTTONDOWN` 命中 resize 码：返回 0（不进模态循环）、开始会话、抓鼠标，
+/// 并且 **WndProc 只记账**（窗口矩形一点没动 —— `SetWindowPos` 属于泵）。
+#[test]
+fn a_resize_hit_starts_a_self_owned_session_without_moving_the_window() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, _class) =
+        hidden_window_sized("KytrixWndProcResizeStart", dispatcher, 900, 700);
+    // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
+    let raw = unsafe { &mut *state };
+    let (start, _cursor) = begin_bottom_right_session(hwnd, raw);
+    assert_eq!(
+        // SAFETY: 只读查询当前线程的捕获窗口（不派发消息）。
+        unsafe { GetCapture() },
+        hwnd,
+        "会话必须持有指针捕获（否则鼠标移出窗口就收不到 WM_MOUSEMOVE）"
+    );
+    assert_eq!(
+        outer(hwnd),
+        start,
+        "WndProc 只记账：窗口矩形在泵应用之前不得变化"
+    );
+    raw.cancel_resize();
+    // SAFETY: 本线程持有捕获；释放会同步派发 WM_CAPTURECHANGED（会话已结束 ⇒ 走普通分支）。
+    let _ = unsafe { ReleaseCapture() };
+    destroy_hidden_window(hwnd, state);
+}
+
+/// 会话中的 `WM_MOUSEMOVE`：只更新目标外框（最新赢、一次消费），窗口矩形不变，
+/// 且**不向应用翻译** `PointerMove`（系统的 size 模态循环同样不投递输入）。
+#[test]
+fn a_resize_move_only_records_the_target_outer_rect() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, _class) =
+        hidden_window_sized("KytrixWndProcResizeMove", dispatcher, 900, 700);
+    // SAFETY: 同上。
+    let raw = unsafe { &mut *state };
+    let (start, cursor) = begin_bottom_right_session(hwnd, raw);
+    assert!(
+        raw.take_pending_resize().is_none(),
+        "会话开始（还没有鼠标移动）不得有待应用的目标外框"
+    );
+
+    let moved = POINT {
+        x: cursor.x + 40,
+        y: cursor.y + 30,
+    };
+    let _ = send_mouse_move_to_screen(hwnd, moved);
+    assert_eq!(
+        outer(hwnd),
+        start,
+        "WM_MOUSEMOVE 不得直接移动窗口（SetWindowPos 在泵里）"
+    );
+    assert_eq!(
+        raw.take_pending_resize(),
+        Some(expected(start.0, start.1, start.2 + 40, start.3 + 30)),
+        "右下角拖动：left/top 固定，right/bottom 跟光标位移"
+    );
+    assert!(
+        raw.take_pending_resize().is_none(),
+        "目标外框是单值：泵取走一次后必须清空（同一轮最多一次 SetWindowPos）"
+    );
+
+    // 第二次移动覆盖第一次（最新赢），不是排队。
+    let again = POINT {
+        x: cursor.x + 10,
+        y: cursor.y + 5,
+    };
+    let _ = send_mouse_move_to_screen(hwnd, again);
+    assert_eq!(
+        raw.take_pending_resize(),
+        Some(expected(start.0, start.1, start.2 + 10, start.3 + 5)),
+        "连续移动只保留最新目标外框"
+    );
+    assert!(
+        raw.take_events().is_empty(),
+        "会话中的鼠标移动不得产生应用的 PointerMove 事件"
+    );
+    raw.cancel_resize();
+    // SAFETY: 本线程持有捕获，释放会同步派发 WM_CAPTURECHANGED。
+    let _ = unsafe { ReleaseCapture() };
+    destroy_hidden_window(hwnd, state);
+}
+
+/// 松手：会话结束、捕获释放，但**保留**最后一次目标外框 —— 最终尺寸必须落在一帧真实帧上。
+#[test]
+fn a_resize_button_up_ends_the_session_and_keeps_the_last_target() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, _class) = hidden_window_sized("KytrixWndProcResizeUp", dispatcher, 900, 700);
+    // SAFETY: 同上。
+    let raw = unsafe { &mut *state };
+    let (start, cursor) = begin_bottom_right_session(hwnd, raw);
+    let moved = POINT {
+        x: cursor.x + 24,
+        y: cursor.y + 16,
+    };
+    let _ = send_mouse_move_to_screen(hwnd, moved);
+    let result = send_bare(hwnd, WM_LBUTTONUP);
+    assert_eq!(result.0, 0, "松手消息被会话消费");
+    assert!(!raw.resize_active(), "松手必须结束会话");
+    assert_eq!(
+        // SAFETY: 只读查询当前线程的捕获窗口。
+        unsafe { GetCapture() },
+        HWND::default(),
+        "松手必须释放指针捕获"
+    );
+    assert_eq!(
+        raw.take_pending_resize(),
+        Some(expected(start.0, start.1, start.2 + 24, start.3 + 16)),
+        "最后一次目标外框必须留给泵应用（松手后的最终尺寸）"
+    );
+    destroy_hidden_window(hwnd, state);
+}
+
+/// Esc 取消：目标外框恢复成起始外框、会话结束、捕获释放，并且这条 Esc **不冒泡**给应用
+/// （系统缩放循环也把 Esc 当取消，不能触发应用的 Esc 退出）。
+#[test]
+fn escape_cancels_the_resize_and_restores_the_start_outer_rect() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, _class) =
+        hidden_window_sized("KytrixWndProcResizeEscape", dispatcher, 900, 700);
+    // SAFETY: 同上。
+    let raw = unsafe { &mut *state };
+    let (start, cursor) = begin_bottom_right_session(hwnd, raw);
+    let _ = send_mouse_move_to_screen(
+        hwnd,
+        POINT {
+            x: cursor.x + 40,
+            y: cursor.y + 30,
+        },
+    );
+    assert!(
+        raw.take_pending_resize().is_some(),
+        "移动先产生一个待应用外框"
+    );
+
+    // SAFETY: 窗口存活；`SendMessageW` 同步进入生产 `wndproc`。
+    let result = unsafe {
+        SendMessageW(
+            hwnd,
+            WM_KEYDOWN,
+            Some(WPARAM(VK_ESCAPE.0 as usize)),
+            Some(LPARAM(0)),
+        )
+    };
+    assert_eq!(result.0, 0, "Esc 被会话消费");
+    assert!(!raw.resize_active(), "Esc 必须结束会话");
+    assert_eq!(
+        // SAFETY: 只读查询当前线程的捕获窗口。
+        unsafe { GetCapture() },
+        HWND::default(),
+        "Esc 取消必须释放指针捕获"
+    );
+    assert_eq!(
+        raw.take_pending_resize(),
+        Some(expected(start.0, start.1, start.2, start.3)),
+        "Esc 必须把目标外框恢复成起始外框"
+    );
+    assert!(
+        raw.take_events().is_empty(),
+        "Esc 是缩放的取消键，不得翻译成应用的按键事件"
+    );
+    destroy_hidden_window(hwnd, state);
+}
+
+/// 捕获被系统 / 别的窗口抢走：会话取消，且**不**恢复起始矩形（用户没要求取消尺寸）。
+#[test]
+fn capture_loss_cancels_the_resize_session() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, _class) =
+        hidden_window_sized("KytrixWndProcResizeCaptureLoss", dispatcher, 900, 700);
+    // SAFETY: 同上。
+    let raw = unsafe { &mut *state };
+    let (start, cursor) = begin_bottom_right_session(hwnd, raw);
+    let _ = send_mouse_move_to_screen(
+        hwnd,
+        POINT {
+            x: cursor.x + 40,
+            y: cursor.y + 30,
+        },
+    );
+    // 生产语义：捕获已经被别人拿走，系统随后送来 WM_CAPTURECHANGED（这里直接投递）。
+    let _ = send_bare(hwnd, WM_CAPTURECHANGED);
+    assert!(!raw.resize_active(), "失去捕获必须取消会话");
+    assert!(
+        raw.take_pending_resize().is_none(),
+        "取消会话必须丢弃待应用外框（不恢复起始矩形）"
+    );
+    assert_eq!(outer(hwnd), start, "取消不得移动窗口");
+    // SAFETY: 本线程仍持有捕获（测试直接投递了消息、没真释放），释放以清理状态。
+    let _ = unsafe { ReleaseCapture() };
+    destroy_hidden_window(hwnd, state);
+}
+
+/// 系统要求取消模态状态（`WM_CANCELMODE`，Alt+Tab / 系统弹窗）：会话取消、捕获释放。
+#[test]
+fn cancel_mode_cancels_the_resize_session_and_releases_capture() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, _class) =
+        hidden_window_sized("KytrixWndProcResizeCancelMode", dispatcher, 900, 700);
+    // SAFETY: 同上。
+    let raw = unsafe { &mut *state };
+    let (start, _cursor) = begin_bottom_right_session(hwnd, raw);
+    let _ = send_bare(hwnd, WM_CANCELMODE);
+    assert!(!raw.resize_active(), "WM_CANCELMODE 必须取消会话");
+    assert_eq!(
+        // SAFETY: 只读查询当前线程的捕获窗口。
+        unsafe { GetCapture() },
+        HWND::default(),
+        "WM_CANCELMODE 必须放掉指针捕获"
+    );
+    assert_eq!(outer(hwnd), start);
+    destroy_hidden_window(hwnd, state);
+}
+
+/// 只有 8 个 HT 缩放码自持：caption / 系统按钮必须继续交系统（Snap / 系统菜单）。
+#[test]
+fn caption_and_system_button_hits_never_start_a_resize_session() {
+    for hit in [
+        HTCAPTION,
+        HTSYSMENU,
+        HTCLOSE,
+        HTMINBUTTON,
+        HTMAXBUTTON,
+        HTCLIENT,
+    ] {
+        assert_eq!(
+            ResizeEdge::from_hit(hit),
+            None,
+            "命中码 {hit} 必须继续交 DefWindowProcW（Aero Snap / 双击最大化 / 系统菜单）"
+        );
+    }
 }

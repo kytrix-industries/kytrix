@@ -262,8 +262,8 @@ pub(crate) fn set_renderer(window: &mut Window, renderer: Renderer) {
 /// 轮询 renderer 的反馈 / 错误（三平台窗口路径；空闲时也要跑）。
 ///
 /// GPU 线程以错误退出后这里会持续返回同一个错误（粘性），平台泵在下一轮冒泡出去。
-/// 反馈本身由渲染器消费（统计 / GPU 采样），这里只把 HUD 需要的发布时间延迟记到窗口上：
-/// 反馈是最新者胜，窗口永远拿到最近一次完成帧的 `latency`。
+/// 反馈是最新者胜：每一条都是 GPU 线程**观察到完成**的帧，`Latency` / `Draw` / `Inst` 与
+/// 完成帧计数由 `record::note_completed_frame` 落到窗口上（threaded 路径的唯一来源）。
 pub(crate) fn poll_renderer(window: &mut Window) -> Result<(), EngineError> {
     let Some(renderer) = window.renderer.as_mut() else {
         return Ok(());
@@ -273,7 +273,7 @@ pub(crate) fn poll_renderer(window: &mut Window) -> Result<(), EngineError> {
     let feedback = renderer.poll()?;
     #[cfg(feature = "hud")]
     if let Some(feedback) = feedback {
-        window.last_frame_latency = Some(feedback.latency);
+        super::record::note_completed_frame(window, &feedback);
     }
     #[cfg(not(feature = "hud"))]
     let _ = feedback;

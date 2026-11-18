@@ -296,22 +296,68 @@ fn scenario_button_click_and_pointer_cancel() -> ScenarioReport {
     // 绘制 oracle：增量路径必须与全量重绘逐图元一致（点击帧走过增量编码）。
     app.assert_oracle();
 
+    // ── P-B：Draw/Inst 必须是后端录制出的真实计数，而不是默认值 ──────────────────
+    //
+    // 前面的步骤都是 headless 窗口（没有挂渲染器）：`commit_frame` 不会 publish，`render_stats`
+    // 就没有来源。这里把真实离屏渲染器挂到窗口上，让本帧走 inline 提交（同步返回统计），断言
+    // HUD 指标拿到的是后端录制的 draw_calls / instances。
+    //
+    // threaded 路径（真实窗口）的同一指标经 `FrameFeedback` 回来，由
+    // `window/record.rs::note_completed_frame` 的单测覆盖 —— 离屏套件不建平台窗口，测不到那条链。
+    #[cfg(feature = "hud")]
+    let render_stats_evidence: Option<String> = {
+        app.app_mut()
+            .window_mut(window)
+            .expect("窗口")
+            .enable_offscreen_renderer()
+            .expect("离屏渲染器（本套件本来就要求真实 GPU）");
+        let mut observed = (0u32, 0u32);
+        for _ in 0..3 {
+            app.app_mut().request_repaint(window).expect("请求一帧");
+            frame(&mut app);
+            let metrics = app.app().window(window).expect("窗口").debug_hud_metrics();
+            observed = (metrics.draw_calls, metrics.instances);
+            if observed.0 > 0 && observed.1 > 0 {
+                break;
+            }
+        }
+        assert!(
+            observed.0 > 0,
+            "离屏提交必须真的发出 draw call（HUD 的 Draw 读到 {}）—— 0 说明统计没有从后端回来",
+            observed.0
+        );
+        assert!(
+            observed.1 > 0,
+            "实例缓冲必须非空（HUD 的 Inst 读到 {}）",
+            observed.1
+        );
+        Some(format!(
+            "P-B：离屏 inline 提交的绘制统计 draw_calls={} instances={}（后端录制计数，非默认值）",
+            observed.0, observed.1
+        ))
+    };
+    #[cfg(not(feature = "hud"))]
+    let render_stats_evidence: Option<String> = None;
+
+    let mut evidence = vec![
+        format!(
+            "idle={BUTTON_IDLE:?} → clicked={BUTTON_ON:?}（读回像素），区域最大通道差 {clicked_span}"
+        ),
+        format!(
+            "action={:?} click_count={} target=#{}；取消后点击计数仍为 1，capture={:?}",
+            released.action,
+            released.click_count,
+            released
+                .target
+                .map_or_else(|| String::from("-"), |node| node.index().to_string()),
+            app.app().pointer_captured(window).map(|node| node.index()),
+        ),
+    ];
+    evidence.extend(render_stats_evidence);
+
     ScenarioReport {
         name: "① 按钮点击 + PointerCancel",
-        evidence: vec![
-            format!(
-                "idle={BUTTON_IDLE:?} → clicked={BUTTON_ON:?}（读回像素），区域最大通道差 {clicked_span}"
-            ),
-            format!(
-                "action={:?} click_count={} target=#{}；取消后点击计数仍为 1，capture={:?}",
-                released.action,
-                released.click_count,
-                released
-                    .target
-                    .map_or_else(|| String::from("-"), |node| node.index().to_string()),
-                app.app().pointer_captured(window).map(|node| node.index()),
-            ),
-        ],
+        evidence,
     }
 }
 

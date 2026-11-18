@@ -423,21 +423,21 @@ pub struct Window {
     /// Linux：compositor 侧的窗口状态镜像（最大化 / 全屏 / 装饰模式 / 可用能力）。
     #[cfg(target_os = "linux")]
     state: WindowState,
-    /// 最近一帧的实际 GPU 绘制统计（P17 HUD）。
+    /// 最近一帧**完成**帧的实际 GPU 绘制统计（P17 HUD）。
+    ///
+    /// threaded 路径（真实窗口）由 [`crate::window::record`] 的完成反馈写入；inline 路径
+    /// （headless / 离屏）由提交时同步返回的统计写入。两种来源都是后端**录制命令时**的真实计数。
     #[cfg(feature = "hud")]
     render_stats: crate::render::RenderStats,
     /// 最近一次反馈帧的「发布 → GPU 完成」时长（HUD 的 Latency 行；窗口路径落后 ≤1 帧）。
     #[cfg(feature = "hud")]
     last_frame_latency: Option<std::time::Duration>,
+    /// 已完成的帧数（HUD 的 FPS / Frame 唯一来源：完成反馈到达次数）。
+    #[cfg(feature = "hud")]
+    completed_frames: u64,
     /// 最近一帧的 CPU 时间（`begin_frame` → `paint_frame` 结束）。
     #[cfg(feature = "hud")]
     frame_cpu: Option<std::time::Duration>,
-    /// 最近两次提交帧入口的间隔（首帧为 `None`）。
-    #[cfg(feature = "hud")]
-    frame_interval: Option<std::time::Duration>,
-    /// 上一次提交帧的入口时间戳（App 时钟；用于 HUD 帧间隔）。
-    #[cfg(feature = "hud")]
-    last_commit_at: Option<std::time::Instant>,
     /// 当前帧开始时间（仅 CPU 计时用；中止/空闲时清空）。
     #[cfg(feature = "hud")]
     frame_started_at: Option<std::time::Instant>,
@@ -501,11 +501,9 @@ impl Window {
             #[cfg(feature = "hud")]
             last_frame_latency: None,
             #[cfg(feature = "hud")]
+            completed_frames: 0,
+            #[cfg(feature = "hud")]
             frame_cpu: None,
-            #[cfg(feature = "hud")]
-            frame_interval: None,
-            #[cfg(feature = "hud")]
-            last_commit_at: None,
             #[cfg(feature = "hud")]
             frame_started_at: None,
         }
@@ -638,7 +636,7 @@ impl Window {
         renderer: &mut Renderer,
         index: FrameIndex,
         plan: Plan,
-    ) -> crate::render::RenderStats {
+    ) -> Option<crate::render::RenderStats> {
         frame::submit_gpu(self, renderer, index, plan)
     }
     pub(crate) fn abort_frame(&mut self, ticket: FrameTicket) {
@@ -935,10 +933,6 @@ impl Window {
     #[cfg(feature = "hud")]
     pub(crate) fn reset_debug_hud_timing(&mut self) {
         record::reset_debug_hud_timing(self)
-    }
-    #[cfg(feature = "hud")]
-    pub(crate) fn note_debug_hud_commit(&mut self, now: std::time::Instant) {
-        record::note_debug_hud_commit(self, now)
     }
     #[cfg(feature = "hud")]
     pub(crate) fn debug_hud_metrics(&self) -> crate::debug_hud::DebugHudMetrics {

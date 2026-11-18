@@ -41,7 +41,7 @@ use crate::{
         windows::{composition, dpi_awareness, frame_clock::FrameClock, window::NativeWindow},
     },
     render::backend::Renderer,
-    window::{Window, WindowId, WindowOptions},
+    window::{FrameOutcome, Window, WindowId, WindowOptions},
 };
 
 /// 消费者：`wndproc` 的 `WM_TIMER` 分支与 `pump_loop` 的定时器管理。
@@ -504,6 +504,8 @@ pub(super) fn pump_loop(
     let mut pacer = FramePacer::new();
     // 合成几何的客户区缓存（R07-11）：稳态每轮每窗 0 次系统调用。
     let mut geometry = GeometryCache::new();
+    // 拖动期出帧背压（P-A）：自持缩放会话中「上一帧未上屏则跳过」，不用定时器合并鼠标。
+    let mut resize_pacing = ResizePacing::new();
     // a11y 补发兜底定时器的宿主窗口（定时器随窗口销毁失效，首窗换人时要重建，P2-4）。
     // 归属判定用 `WindowId` 而不是 HWND 裸值：首窗销毁后系统可能把同一个 HWND 复用给新窗，
     // 裸值比较会「看起来仍匹配」而不重建定时器（复审 P2-8）。
@@ -541,6 +543,10 @@ pub(super) fn pump_loop(
         if sync_native_windows(app, windows, dispatcher)? {
             retarget_wake(windows, dispatcher);
         }
+        // 自持缩放（P-A）：把会话累积的目标外框 `SetWindowPos` 一次（同一轮的 ④ 就按新尺寸出
+        // 真实帧）。它同步派发 `WM_SIZE`，紧随的 `collect_events` 用现有链路写 `set_size` /
+        // `set_surface`；放在事件之前 ⇒ 拖动期间不存在「只更新了客户区、没重绘」的持久帧。
+        apply_pending_resizes(windows);
         collect_events(app, windows, dispatcher)?;
 
         // ②a′ 显示 / 电源恢复（R07-14）：显示器拓扑 / 工作区 / 睡眠唤醒之后重新查询显示器
@@ -553,11 +559,13 @@ pub(super) fn pump_loop(
         app.poll_renderers()?;
 
         // ②b′ DirectComposition 几何：内容尺寸 = 最近一次**完成 present** 的尺寸，客户区 = 当前
-        // 客户区。内容 visual 恒 1:1：拖动中旧内容保持左上角，露出的新区域由背景层填充；静止时
-        // 内容 = 客户区，背景层被完全盖住。GPU 线程在每帧完成后 post
-        // `WM_APP_COMPOSITION_WAKE`（只唤醒、不请求帧），所以「最后一帧」的几何也会在下一次泵
-        // 迭代里落地。这里是几何**唯一**的周期应用点：`WM_SIZE` / DPI 只记录尺寸，不逐条
-        // `Commit`（P1-2a）。
+        // 客户区。内容 visual 恒 1:1、**从不拉伸**：自持缩放（P-A）的每一步都由本轮 ④ 出一帧
+        // 真实帧，所以背景层只覆盖「客户区已变、新尺寸的帧还没上屏」的 ≤1 个 vsync 接缝（以及
+        // DPI 同步改尺寸 / 首帧 / 设备恢复这些没有帧在飞的瞬间），不是拖动期的画面来源。
+        // GPU 线程在每帧完成后 post `WM_APP_COMPOSITION_WAKE`（平时只唤醒、不请求帧；缩放
+        // 会话中额外请求一次出帧尝试，见 `ResizePacing`），所以「最后一帧」的几何也会在
+        // 下一次泵迭代里落地。这里是几何**唯一**的周期应用点：`WM_SIZE` / DPI 只记录尺寸，
+        // 不逐条 `Commit`（P1-2a）。
         //
         // R07-11：客户区与最小化状态**不再每轮每窗查询**（旧实现 2 次系统调用/窗/轮）。缓存键
         // = `(逻辑尺寸, 比例)` —— `WM_SIZE` / `WM_DPICHANGED` 已在本轮 ①/② 阶段写进
@@ -665,9 +673,10 @@ pub(super) fn pump_loop(
         }
 
         // ④ 应用钩子（读事件 / 写状态），再提交本帧；两段门禁在 `App::frame` 里，闲时是 `Idle`。
+        // 自持缩放会话中的窗口按 `ResizePacing` 背压跳过（上一帧未上屏就不重排/重绘）。
         app.run_frame_hook();
         if dispatcher.take_frame_wake() {
-            frame_all(app)?;
+            frame_all(app, windows, &mut resize_pacing)?;
         }
 
         // ④′ a11y：纯 `A11Y` 变化不会提交帧（`FrameOutcome::Idle`），所以**每轮**都要给 adapter
@@ -748,16 +757,154 @@ pub(super) fn retarget_wake(windows: &[NativeWindow], dispatcher: &Arc<Dispatche
 }
 
 /// 消费者：`pump_loop` 的 ④ 帧步骤。
+///
 /// 逐窗口提交一帧；`Err` 立刻终止（device lost / swapchain 失败都不可重试）。
-pub(super) fn frame_all(app: &mut App) -> Result<(), EngineError> {
-    let ids: Vec<WindowId> = app.windows().map(|(id, _)| id).collect();
-    for id in ids {
+/// 自持缩放会话中的窗口按 [`ResizePacing`] 的背压跳过（合并鼠标上报，见该类型文档）。
+pub(super) fn frame_all(
+    app: &mut App,
+    windows: &mut [NativeWindow],
+    pacing: &mut ResizePacing,
+) -> Result<(), EngineError> {
+    // 本帧放行的窗口；`Some(surface)` = 会话中（出帧后记进背压账目），`None` = 无常驻账目。
+    let mut ready: Vec<(WindowId, Option<(u32, u32)>)> = Vec::with_capacity(windows.len());
+    for native in windows.iter_mut() {
+        let id = native.id();
+        if !native.state_mut().resize_active() {
+            ready.push((id, None));
+            continue;
+        }
+        // 只有会话中的窗口才查客户区：它就是本帧要发布的渲染目标（`WM_SIZE` 的 lParam 与
+        // `GetClientRect` 同源），而稳态非会话窗口仍然是每轮 0 次系统调用（R07-11）。
+        let surface = native.client_size();
+        let presented = app
+            .window(id)
+            .map(Window::presented_surface)
+            .unwrap_or_default();
+        if pacing.should_skip(id, true, presented) {
+            continue;
+        }
+        ready.push((id, Some(surface)));
+    }
+    for (id, surface) in ready {
         match app.frame(id) {
-            None | Some(Ok(_)) => {}
+            None => {}
+            Some(Ok(outcome)) => {
+                if matches!(outcome, FrameOutcome::Committed(_))
+                    && let Some(surface) = surface
+                {
+                    pacing.note_published(id, surface);
+                }
+            }
             Some(Err(error)) => return Err(error),
         }
     }
+    // 会话结束 / 窗口关闭：账目跟着清掉，否则残留项会挡住该窗口以后的帧。
+    pacing.retain_live(|id| {
+        windows
+            .iter_mut()
+            .any(|native| native.id() == id && native.state_mut().resize_active())
+    });
     Ok(())
+}
+
+/// 拖动期出帧背压（P-A）：每窗口「最近一次已发布的 surface」。
+///
+/// 自持缩放会话里鼠标可以上报到数百 Hz，而一次真实帧要重排 + 按新尺寸重绘。合并**不能**用
+/// 定时器（产品前提：不用定时器驱动刷新），所以改成背压：会话中的窗口只有在上一次发布的帧
+/// **已经上屏**（`presented == published`）时才出下一帧，否则跳过本帧、把 damage 留给下一轮。
+///
+/// 唤醒来源是 present 完成后的 `WM_APP_COMPOSITION_WAKE`：缩放期间每帧尺寸都在变，
+/// `publish_presented` 的「尺寸变化才通知」因此每帧都会触发，正好当「上一帧上屏了」的信号。
+/// 会话结束（松手 / Esc / 取消）后不再跳过，最终尺寸一定落在一帧真实帧上。
+pub(crate) struct ResizePacing {
+    entries: Vec<ResizePacingEntry>,
+}
+
+struct ResizePacingEntry {
+    window: WindowId,
+    /// 最近一次**已发布**（`App::frame` 提交成功）的 surface 尺寸。
+    published: (u32, u32),
+}
+
+impl ResizePacing {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// 该窗口本帧是否跳过：会话中且「已发布的帧还没上屏」。
+    ///
+    /// 第一次看到某窗口的会话（还没有账目）时按 `presented` 初始化并**放行**本帧：会话开始时
+    /// 没有已知的在飞帧，缩放的第一个真实帧应当先出去。
+    fn should_skip(&mut self, window: WindowId, active: bool, presented: (u32, u32)) -> bool {
+        if !active {
+            return false;
+        }
+        match self.entries.iter_mut().find(|entry| entry.window == window) {
+            Some(entry) => entry.published != presented,
+            None => {
+                self.entries.push(ResizePacingEntry {
+                    window,
+                    published: presented,
+                });
+                false
+            }
+        }
+    }
+
+    /// 出帧成功后记账：本窗口最近一次发布的 surface。
+    fn note_published(&mut self, window: WindowId, surface: (u32, u32)) {
+        match self.entries.iter_mut().find(|entry| entry.window == window) {
+            Some(entry) => entry.published = surface,
+            None => self.entries.push(ResizePacingEntry {
+                window,
+                published: surface,
+            }),
+        }
+    }
+
+    /// 丢掉「会话已结束 / 窗口已关闭」的账目。
+    fn retain_live(&mut self, mut live: impl FnMut(WindowId) -> bool) {
+        self.entries.retain(|entry| live(entry.window));
+    }
+
+    /// 账目条数（测试判据：会话结束后必须归零，不能随窗口 churn 无界增长）。
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// 消费者：`pump_loop` 的 ②a′ 步骤（`collect_events` **之前**）。
+///
+/// 应用自持缩放会话累积的目标外框：每轮每窗**最多一次**（`pending_resize` 最新赢）。
+///
+/// `SetWindowPos` 会**同步**派发 `WM_SIZE`（重入 `WndProc`），所以必须在短借用之外执行，并且
+/// 放在 `collect_events` 之前：那条 `WM_SIZE` 产生的 `Resize` 事件会在同一轮被 `apply_event`
+/// 写进 `set_size`（标 `LAYOUT`）与 `set_surface`（标全量 damage），紧接着本轮 ④ 出一帧。
+fn apply_pending_resizes(windows: &mut [NativeWindow]) {
+    for native in windows.iter_mut() {
+        // 短借用只做取走：在借用内调 `SetWindowPos` 会重入 `WndProc` 再取一次 `&mut`。
+        let Some(rect) = native.state_mut().take_pending_resize() else {
+            continue;
+        };
+        let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
+        let (x, y, width, height) = rect.as_window_rect();
+        // SAFETY: `hwnd` 是本进程窗口；只改位置/尺寸，不激活、不改 Z 序。同步派发的
+        // `WM_SIZE` / `WM_WINDOWPOSCHANGED` 由生产 `WndProc` 处理（它只记账，不调用 `App`）。
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                x,
+                y,
+                width,
+                height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -902,5 +1049,85 @@ mod geometry_cache_tests {
         cache.retain_live(|id| id == window(2));
         assert_eq!(cache.len(), 1, "关闭的窗口必须丢掉缓存项");
         assert_eq!(cache.queries(), 3);
+    }
+}
+
+#[cfg(test)]
+mod resize_pacing_tests {
+    use super::ResizePacing;
+    use crate::window::WindowId;
+
+    fn window(raw: u32) -> WindowId {
+        WindowId::from_raw(raw)
+    }
+
+    /// 会话中「上一帧已发布但还没上屏」必须跳过；presented 追平后立刻放行。
+    ///
+    /// 这就是拖动期的合并机制（替代定时器）：数百 Hz 鼠标上报只会在每个上屏周期里放行一帧。
+    #[test]
+    fn a_published_but_unpresented_frame_skips_until_presented_catches_up() {
+        let mut pacing = ResizePacing::new();
+        let id = window(1);
+        assert!(
+            !pacing.should_skip(id, true, (800, 600)),
+            "会话的第一帧必须先出去（此时没有已知在飞帧）"
+        );
+        pacing.note_published(id, (900, 700));
+        assert!(
+            pacing.should_skip(id, true, (800, 600)),
+            "已发布 (900,700) 还没上屏：本帧必须跳过"
+        );
+        assert!(
+            pacing.should_skip(id, true, (800, 600)),
+            "presented 不变就继续跳过（不进入帧 ⇒ damage 保留）"
+        );
+        assert!(
+            !pacing.should_skip(id, true, (900, 700)),
+            "presented 追上已发布尺寸后必须放行"
+        );
+    }
+
+    /// 非会话窗口永远不跳过，也不产生账目（稳态零成本）。
+    #[test]
+    fn an_inactive_session_never_skips_and_keeps_no_ledger() {
+        let mut pacing = ResizePacing::new();
+        let id = window(1);
+        for presented in [(0, 0), (800, 600), (900, 700)] {
+            assert!(
+                !pacing.should_skip(id, false, presented),
+                "没有缩放会话的窗口不受背压影响"
+            );
+        }
+        assert_eq!(pacing.len(), 0, "非会话窗口不得留下账目");
+    }
+
+    /// 会话结束 / 窗口关闭后账目必须被清掉（否则残留项会挡住该窗口以后的帧）。
+    #[test]
+    fn the_ledger_drops_windows_whose_session_ended() {
+        let mut pacing = ResizePacing::new();
+        pacing.note_published(window(1), (100, 100));
+        pacing.note_published(window(2), (200, 200));
+        assert_eq!(pacing.len(), 2);
+        pacing.retain_live(|id| id == window(2));
+        assert_eq!(pacing.len(), 1, "会话结束 / 窗口关闭的账目必须清掉");
+        assert!(
+            !pacing.should_skip(window(2), true, (200, 200)),
+            "保留的窗口在 presented 追平后正常出帧"
+        );
+    }
+
+    /// 多窗口互不影响：一个窗口在飞不会让另一个窗口跳过。
+    #[test]
+    fn windows_are_paced_independently() {
+        let mut pacing = ResizePacing::new();
+        let (one, two) = (window(1), window(2));
+        pacing.should_skip(one, true, (100, 100));
+        pacing.note_published(one, (300, 300));
+        pacing.should_skip(two, true, (200, 200));
+        assert!(pacing.should_skip(one, true, (100, 100)), "窗口 1 在飞");
+        assert!(
+            !pacing.should_skip(two, true, (200, 200)),
+            "窗口 2 自己的账目是同步的，不受窗口 1 影响"
+        );
     }
 }

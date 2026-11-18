@@ -164,22 +164,14 @@ pub(crate) fn has_animations(app: &App) -> bool {
     !app.animations.is_empty()
 }
 
-/// 平台是否需要持续出帧：动画，或任一窗口的 Debug HUD 可见。
+/// 平台是否需要持续出帧：只有**动画**需要按显示节拍推进。
+///
+/// Debug HUD **不**是帧源（P-C）：它只在应用自己出帧时观察并刷新文本，静止窗口不产生帧，
+/// 因此这里不能因为它可见就把平台拉进按刷新率出帧的模式（那正是「HUD 打开 ⇒ 60 Hz 空转、
+/// 却只提交 2 Hz」的来源）。
 /// 消费者：`App::needs_continuous_frames`。
 pub(crate) fn needs_continuous_frames(app: &App) -> bool {
-    #[cfg(feature = "hud")]
-    {
-        app.has_animations()
-            || app.debug_hud.iter().any(|(window, state)| {
-                app.windows
-                    .get(window)
-                    .is_some_and(|target| target.tree().get(state.root()).is_ok())
-            })
-    }
-    #[cfg(not(feature = "hud"))]
-    {
-        app.has_animations()
-    }
+    app.has_animations()
 }
 
 /// 消费者：`App::mark_nodes_paint`。

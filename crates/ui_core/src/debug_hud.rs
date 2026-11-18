@@ -3,12 +3,20 @@
 //! 本模块只在 `hud` feature 下编译。公开入口只有 `App::set_debug_hud` /
 //! `App::debug_hud_enabled`；节点、采样累计器与格式化都是 crate 私有。
 //!
-//! 文本更新分两段：`prepare_frame` 在帧门禁前采样并**只在新文本需要落盘时**请求 HUD damage；
-//! `apply_frame` 在 `refresh_styles` 之后、`refresh_text` 之前写文本并 `mark_paint`。
-//! 这样不会经过信号依赖图，也不会被样式 pass 的 `clear_paint` 吞掉。
+//! **纯观察者（P-C）**：HUD 不请求 damage、不参与 `needs_continuous_frames`、没有任何定时器或
+//! 周期唤醒。文本只在**应用自己出帧**时刷新（`prepare_frame` 在帧入口采样、`apply_frame` 在
+//! `refresh_styles` 之后写文本）；静止窗口不产生帧，HUD 保持上一次文本。
 //!
-//! **每帧成本**（R01-10）：HUD 可见不等于「永远有一帧」。没有新文本时 `prepare_frame` 只做几次
-//! 字段比较（无分配、无格式化），窗口保持 `Idle`；采样点（500 ms）才提交一帧。
+//! 文本更新分两段：`prepare_frame` 采样并暂存 `pending_text`；`apply_frame` 在 `refresh_styles`
+//! 之后、`refresh_text` 之前写文本并 `mark_paint`。这样不经过信号依赖图，也不会被样式 pass 的
+//! `clear_paint` 吞掉。`pending_text` **只在提交成功后清**（`finish_frame`）：失败帧下一帧重试。
+//!
+//! **FPS / Frame 的口径**（P-C）：以 GPU 线程的完成反馈（`FrameFeedback`）为准 ——
+//! `FPS = 采样窗口内真实完成的帧数 / 窗口秒数`、`Frame = 窗口毫秒 / 帧数`；窗口内一帧都没完成
+//! （静止窗口）⇒ 显示 `--`。**不再**用「两次提交帧入口的间隔」冒充帧率：HUD 自己造帧时那条口径
+//! 会退化成 2.0 FPS / 500 ms 的自指值。`CPU / GPU / Upload / Present` 是采样窗口内**真实提交帧**
+//! 的平均成本；`Latency` 是发布 → GPU 完成；尺寸行是最近一次采样时的渲染目标（最多滞后一个
+//! 采样间隔 + 一帧）。
 
 use std::time::{Duration, Instant};
 
@@ -18,7 +26,7 @@ use crate::{
     a11y::A11yOverride,
     error::EngineError,
     layout::hit_test::HitShape,
-    math::{Rect, Size},
+    math::Rect,
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
         color::Color,
@@ -48,7 +56,7 @@ pub(crate) const LINES: usize = 11;
 /// 指标汇总间隔。
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 
-/// 初始占位行（首 500 ms 显示；不伪造 0 值）。
+/// 初始占位行（安装帧之前显示；安装帧就会采样出第一份真实文本）。
 const INITIAL_LINES: [&str; LINES] = [
     "FPS     --",
     "Frame   --",
@@ -78,13 +86,13 @@ const LINE_IDS: [&str; LINES] = [
     "debug-hud.line-10",
 ];
 
-/// 窗口最后提交帧的可观察指标（`Window::debug_hud_metrics` 的载荷）。
+/// 窗口最近提交帧 + 完成帧计数的可观察指标（`Window::debug_hud_metrics` 的载荷）。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct DebugHudMetrics {
     /// 最近提交的帧序号。
     pub frame_index: FrameIndex,
-    /// 与上一提交帧的间隔（首帧为 `None`）。
-    pub frame_interval: Option<Duration>,
+    /// GPU 线程**已完成**的帧数（单调累计；采样窗口用它做差得到帧率分母）。
+    pub completed_frames: u64,
     /// 从 `begin_frame` 到 `paint_frame` 结束的 CPU 时间。
     pub cpu_time: Option<Duration>,
     /// 后端的 Upload CPU 时间。
@@ -105,9 +113,9 @@ pub(crate) struct DebugHudMetrics {
     pub instances: u32,
     /// 绘制序中的图元数。
     pub primitives: usize,
-    /// 物理宽度。
+    /// 最近一次采样时的物理宽度（`window.surface`；最多滞后一个采样间隔 + 一帧）。
     pub physical_width: u32,
-    /// 物理高度。
+    /// 最近一次采样时的物理高度（同上）。
     pub physical_height: u32,
     /// DPI 比例。
     pub scale: f32,
@@ -117,10 +125,11 @@ pub(crate) struct DebugHudMetrics {
 pub(crate) struct DebugHudState {
     root: NodeId,
     lines: [NodeId; LINES],
+    /// 当前采样窗口的起点。
     last_sample_at: Instant,
+    /// 采样窗口起点时已完成的帧数（完成计数的基线）。
+    last_sample_completed: u64,
     last_seen_frame: FrameIndex,
-    interval_sum: Duration,
-    interval_count: u32,
     cpu_sum: Duration,
     cpu_count: u32,
     upload_sum: Duration,
@@ -201,10 +210,11 @@ pub(crate) fn install(window: &mut Window, now: Instant) -> Result<DebugHudState
     Ok(DebugHudState {
         root: panel,
         lines,
-        last_sample_at: now,
+        // 预置一个采样间隔：安装帧（`set_debug_hud` 请求的那一帧）就会产出第一份真实文本，
+        // 而不是让静止窗口永远停在 `--` 占位（HUD 自己不再造帧，没有第二次机会）。
+        last_sample_at: now.checked_sub(SAMPLE_INTERVAL).unwrap_or(now),
+        last_sample_completed: 0,
         last_seen_frame: frame_index,
-        interval_sum: Duration::ZERO,
-        interval_count: 0,
         cpu_sum: Duration::ZERO,
         cpu_count: 0,
         upload_sum: Duration::ZERO,
@@ -222,23 +232,18 @@ pub(crate) fn install(window: &mut Window, now: Instant) -> Result<DebugHudState
     })
 }
 
-/// 帧门禁前：消费上一提交帧的指标、每 500 ms 生成新文本，并请求 HUD damage。
+/// 帧入口的采样：消费最近提交帧的指标，每 500 ms 生成一份新文本（**不请求 damage**）。
 ///
-/// **damage 只在有新文本要写时请求**（R01-10）：帧门禁读的是 `Window::pending_damage`，旧实现
-/// 无条件请求就等于「HUD 打开 ⇒ 永远有一帧待办」——静止画面也按刷新率提交帧、整块重画 HUD
-/// （实测每帧 ~0.6 µs/单窗，外加一次只为 HUD 区域的 present 与常开合成器节拍线程）。
-/// 文本本来只在采样点变化，所以请求条件收紧为「`pending_text` 非空」：
-/// - 采样帧：本函数刚生成新文本 ⇒ 请求 damage 顶开帧门禁，`apply_frame` 随后写文本；
-/// - 失败重试帧：`pending_text` 要等提交成功才清（见 [`finish_frame`]）⇒ 仍然请求，语义不丢；
-/// - 静止帧：不请求 ⇒ 门禁直接 `Idle`，HUD 的每帧成本只剩几次字段比较（无分配、无格式化）。
-pub(crate) fn prepare_frame(state: &mut DebugHudState, window: &mut Window, now: Instant) {
+/// **HUD 不产生帧**（P-C）：本函数不写任何脏位、不请求 damage，只是应用这一帧的观察者。没有
+/// 应用帧时它不会被调用，静止窗口就保持上一次文本 —— 这既是「HUD 不能把自己变成帧源」的
+/// 要求，也是帧率必须是真实完成帧的原因。
+///
+/// 逐帧成本与绘制计数只在 `frame_index` 前进（真的有新提交帧）时累加；`FPS` / `Frame` 用
+/// 「采样窗口内**完成**的帧数 / 窗口时长」，一帧都没完成时是 `--`（见 [`rate`]）。
+pub(crate) fn prepare_frame(state: &mut DebugHudState, window: &Window, now: Instant) {
     let metrics = window.debug_hud_metrics();
     if metrics.frame_index != state.last_seen_frame {
         state.last_seen_frame = metrics.frame_index;
-        if let Some(interval) = metrics.frame_interval.filter(|value| !value.is_zero()) {
-            state.interval_sum += interval;
-            state.interval_count = state.interval_count.saturating_add(1);
-        }
         if let Some(cpu) = metrics.cpu_time {
             state.cpu_sum += cpu;
             state.cpu_count = state.cpu_count.saturating_add(1);
@@ -264,10 +269,15 @@ pub(crate) fn prepare_frame(state: &mut DebugHudState, window: &mut Window, now:
         state.last_instances = metrics.instances;
     }
 
-    if now.saturating_duration_since(state.last_sample_at) >= SAMPLE_INTERVAL {
+    let window_time = now.saturating_duration_since(state.last_sample_at);
+    if window_time >= SAMPLE_INTERVAL {
+        let completed = metrics
+            .completed_frames
+            .saturating_sub(state.last_sample_completed);
+        let (fps, frame_ms) = rate(window_time, completed);
         let snapshot = Snapshot {
-            fps: average_rate(state.interval_sum, state.interval_count),
-            frame_ms: average_ms(state.interval_sum, state.interval_count),
+            fps,
+            frame_ms,
             cpu_ms: average_ms(state.cpu_sum, state.cpu_count),
             gpu_ms: average_ms(state.gpu_sum, state.gpu_count),
             upload_ms: average_ms(state.upload_sum, state.upload_count),
@@ -282,8 +292,7 @@ pub(crate) fn prepare_frame(state: &mut DebugHudState, window: &mut Window, now:
         };
         state.pending_text = Some(format_lines(&snapshot));
         state.last_sample_at = now;
-        state.interval_sum = Duration::ZERO;
-        state.interval_count = 0;
+        state.last_sample_completed = metrics.completed_frames;
         state.cpu_sum = Duration::ZERO;
         state.cpu_count = 0;
         state.upload_sum = Duration::ZERO;
@@ -294,12 +303,6 @@ pub(crate) fn prepare_frame(state: &mut DebugHudState, window: &mut Window, now:
         state.present_count = 0;
         state.latency_sum = Duration::ZERO;
         state.latency_count = 0;
-    }
-
-    // R01-10：只有「有文本要写」才顶开帧门禁（判据与 `apply_frame` 的早退条件完全一致）。
-    // 采样帧与失败重试帧都满足；静止帧不满足 ⇒ 窗口回到 `Idle`，不再按刷新率重画 HUD。
-    if state.pending_text.is_some() {
-        window.request_damage(hud_rect(window.size()));
     }
 }
 
@@ -326,13 +329,6 @@ pub(crate) fn apply_frame(state: &mut DebugHudState, window: &mut Window) {
 /// 一帧提交成功：本次 pending 文本已经落进 paint，清空避免下一帧重复重建。
 pub(crate) fn finish_frame(state: &mut DebugHudState) {
     state.pending_text = None;
-}
-
-/// HUD 面板在窗口中的逻辑矩形（right/top 锚点；窄窗口夹到左边）。
-#[must_use]
-pub(crate) fn hud_rect(size: Size) -> Rect {
-    let x = (size.width - WIDTH - MARGIN).max(0.0);
-    Rect::new(x, MARGIN, WIDTH, HEIGHT)
 }
 
 fn panel_style() -> Style {
@@ -435,8 +431,18 @@ fn count_text(value: impl std::fmt::Display) -> SmolStr {
     format_smolstr!("{value}")
 }
 
-fn average_rate(sum: Duration, count: u32) -> Option<f32> {
-    (count > 0 && !sum.is_zero()).then(|| (f64::from(count) / sum.as_secs_f64()) as f32)
+/// 采样窗口的上屏帧率：`(FPS, 平均帧时长毫秒)`。
+///
+/// 帧数是窗口内通过 `FrameFeedback` **真实完成**的帧数（不是提交帧数，更不是 HUD 自己的采样
+/// 次数）；一帧都没完成（静止窗口 / 没有渲染器）返回 `(None, None)` ⇒ 文本显示 `--`。
+fn rate(window: Duration, completed: u64) -> (Option<f32>, Option<f32>) {
+    if completed == 0 || window.is_zero() {
+        return (None, None);
+    }
+    let seconds = window.as_secs_f64();
+    let fps = (completed as f64 / seconds) as f32;
+    let frame_ms = (seconds * 1000.0 / completed as f64) as f32;
+    (Some(fps), Some(frame_ms))
 }
 
 fn average_ms(sum: Duration, count: u32) -> Option<f32> {
@@ -467,24 +473,27 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        LINES, Snapshot, average_ms, average_rate, backend_name, format_lines, hud_rect,
-        initial_lines,
+        HEIGHT, LINES, MARGIN, Snapshot, WIDTH, average_ms, backend_name, format_lines,
+        initial_lines, panel_style, rate,
     };
-    use crate::math::Size;
 
+    /// 面板是 root 的绝对定位子节点、right/top 双向锚定 12 px、固定 244×200：窗口变大时它跟着
+    /// 右上角走（布局每次 resize 都会重解析 inset），不需要 HUD 自己算 damage 矩形。
     #[test]
-    fn hud_is_anchored_to_the_top_right() {
-        let rect = hud_rect(Size::new(960.0, 740.0));
-        assert_eq!(rect.origin.x, 960.0 - 244.0 - 12.0);
-        assert_eq!(rect.origin.y, 12.0);
-        assert_eq!(rect.size.width, 244.0);
-        assert_eq!(rect.size.height, 200.0);
-    }
+    fn the_panel_style_anchors_it_to_the_top_right() {
+        use taffy::style::{Dimension, LengthPercentageAuto, Position};
 
-    #[test]
-    fn hud_rect_clamps_to_the_left_edge_on_narrow_windows() {
-        let rect = hud_rect(Size::new(100.0, 80.0));
-        assert_eq!(rect.origin.x, 0.0);
+        let style = panel_style();
+        assert_eq!(style.inner.position, Position::Absolute);
+        assert_eq!(style.inner.inset.left, LengthPercentageAuto::auto());
+        assert_eq!(
+            style.inner.inset.right,
+            LengthPercentageAuto::length(MARGIN)
+        );
+        assert_eq!(style.inner.inset.top, LengthPercentageAuto::length(MARGIN));
+        assert_eq!(style.inner.inset.bottom, LengthPercentageAuto::auto());
+        assert_eq!(style.inner.size.width, Dimension::length(WIDTH));
+        assert_eq!(style.inner.size.height, Dimension::length(HEIGHT));
     }
 
     #[test]
@@ -541,11 +550,29 @@ mod tests {
 
     #[test]
     fn average_helpers_do_not_divide_by_zero() {
-        assert_eq!(average_rate(Duration::ZERO, 0), None);
         assert_eq!(average_ms(Duration::ZERO, 0), None);
-        let rate = average_rate(Duration::from_millis(500), 30).expect("rate");
-        assert!((rate - 60.0).abs() < 0.01);
         let ms = average_ms(Duration::from_millis(500), 30).expect("ms");
         assert!((ms - 16.666_7).abs() < 0.01);
+    }
+
+    /// P-C 的核心口径：帧率 = 窗口内**真实完成**的帧数 / 窗口时长；零帧必须是 `None`。
+    #[test]
+    fn the_frame_rate_is_completed_frames_over_the_sample_window() {
+        assert_eq!(
+            rate(Duration::from_millis(500), 0),
+            (None, None),
+            "窗口内没有完成帧 ⇒ --（静止窗口 / 无渲染器）"
+        );
+        assert_eq!(rate(Duration::ZERO, 30), (None, None), "零长窗口不能除零");
+        let (fps, frame_ms) = rate(Duration::from_millis(500), 30);
+        let fps = fps.expect("fps");
+        let frame_ms = frame_ms.expect("frame ms");
+        assert!((fps - 60.0).abs() < 0.01, "{fps}");
+        assert!((frame_ms - 16.666_7).abs() < 0.01, "{frame_ms}");
+
+        // 120 Hz：500 ms 内完成 60 帧。
+        let (fps, frame_ms) = rate(Duration::from_millis(500), 60);
+        assert!((fps.expect("fps") - 120.0).abs() < 0.01);
+        assert!((frame_ms.expect("frame ms") - 8.333_3).abs() < 0.01);
     }
 }

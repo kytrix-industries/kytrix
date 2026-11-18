@@ -1496,7 +1496,8 @@ impl App {
         animation::has_animations(self)
     }
 
-    /// 平台是否需要持续出帧：动画，或任一窗口的 Debug HUD 可见。
+    /// 平台是否需要持续出帧：只有动画需要按显示节拍推进（Debug HUD 不参与，见
+    /// `animation::needs_continuous_frames`）。
     pub(crate) fn needs_continuous_frames(&self) -> bool {
         animation::needs_continuous_frames(self)
     }
@@ -1645,8 +1646,8 @@ impl App {
     /// 显示或隐藏内置 Debug HUD（P17；需要 `hud` feature）。
     ///
     /// HUD 是窗口 root 末尾的普通子树：右上角浮动、不参与文档流、命中穿透、a11y 隐藏。
-    /// 可见时平台泵会持续出帧，数字每 500 ms 汇总一次。应用应在建完静态场景后开启 HUD；
-    /// 之后再追加的 root 子节点可能盖在它上面。
+    /// 它是**纯观察者**：不产生帧，只在应用自己出帧时按 500 ms 采样窗口刷新数字；静止窗口保持
+    /// 上一次文本。应用应在建完静态场景后开启 HUD；之后再追加的 root 子节点可能盖在它上面。
     ///
     /// # Errors
     /// `EngineError::UnknownWindow`：窗口不存在。建树失败时返回底层 `StaleNode` 等错误，
