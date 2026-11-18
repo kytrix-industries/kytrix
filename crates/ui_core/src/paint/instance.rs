@@ -47,6 +47,18 @@ pub(crate) trait LaneSource {
     fn lane_scroll(&self, _id: crate::paint::scene::LaneId) -> u32 {
         0
     }
+
+    /// 本帧**已确认变化**的 lane 集合（编码器增量快路径的输入）。
+    ///
+    /// `None` = 帧源不知道本帧的变化集（`Scene`：UI 侧的脏表已经被 `DeltaBuilder` 消费），
+    /// 编码器必须全量扫描绘制序。
+    ///
+    /// **契约**：返回 `Some` 的帧源必须保证「除这些 lane 的内容之外，绘制序、lane 集合、
+    /// 段表布局自上次编码以来都没有变」。`LaneStore::apply` 用内部 `fast` 标志守这条
+    /// （绘制序变化 / lane 移除 / 代际复用 / 全量重置都会让它返回 `None`）。
+    fn changed_lanes(&self) -> Option<&[crate::paint::scene::LaneId]> {
+        None
+    }
 }
 
 /// 编码期的几何描述查表（`GeometryStore` 在 UI 线程；合成线程用自己的 `GeometryCatalog`）。
@@ -1034,6 +1046,14 @@ pub(crate) struct InstanceEncoder {
     written_bytes: usize,
     /// 本帧整段复用的 lane 段数（`FrameRecord.reused_segments`）。
     reused_segments: usize,
+    /// 上一次编码是「全量扫描」并且成功了 —— 段表与 op 表因此覆盖整个绘制序。
+    ///
+    /// 只有它为 `true` 时才能走增量快路径（见 [`InstanceEncoder::encode_changed`]）：快路径
+    /// 假定「除变化 lane 之外，段表与 op 表与上一帧一致」。
+    primed: bool,
+    /// 走增量快路径的帧数（仅测试：守住「快路径没被悄悄关掉」这条性能不变量）。
+    #[cfg(test)]
+    fast_encodes: u32,
 }
 
 impl InstanceEncoder {
@@ -1051,6 +1071,9 @@ impl InstanceEncoder {
             encoded_lanes: 0,
             reused_segments: 0,
             written_bytes: 0,
+            primed: false,
+            #[cfg(test)]
+            fast_encodes: 0,
         }
     }
 
@@ -1084,8 +1107,194 @@ impl InstanceEncoder {
             self.buffer.reset();
             self.chains.clear();
             self.scale = Some(scale);
+            self.primed = false;
         }
         let order = source.order();
+        // 快路径的门禁：**上一次**是全量扫描（段表 / op 表覆盖整个绘制序）、本帧没有整表重建、
+        // 且帧源能给出可信变化集。三者缺一就退回全量扫描（行为与旧实现逐字节一致）。
+        if !reset
+            && self.primed
+            && let Some(changed) = source.changed_lanes()
+        {
+            #[cfg(test)]
+            {
+                self.fast_encodes += 1;
+            }
+            self.encode_changed(source, changed, order, scale, resolver, geometry)?;
+        } else {
+            self.encode_scanned(source, order, scale, resolver, geometry)?;
+            self.primed = true;
+        }
+        // 自检只在 debug 构建里跑：循环本身（遍历全部 op / clip / instance）不是
+        // `debug_assert!` 的宏体，release 下也会白跑 —— 10k 图元 ≈ 40 µs/帧。
+        #[cfg(debug_assertions)]
+        self.self_check(order);
+        Ok(&self.buffer)
+    }
+
+    /// 全量扫描编码：遍历整条绘制序（首帧 / 整表重建 / 帧源不提供变化集时的唯一路径）。
+    fn encode_scanned<S: LaneSource>(
+        &mut self,
+        source: &S,
+        order: &[crate::paint::scene::LaneId],
+        scale: Scale,
+        resolver: ColorResolver,
+        geometry: &dyn GeometryLookup,
+    ) -> Result<(), EngineError> {
+        let Self {
+            buffer,
+            state,
+            saved,
+            chains,
+            colors,
+            scratch,
+            scratch_parts,
+            encoded_lanes,
+            reused_segments,
+            written_bytes,
+            ..
+        } = self;
+        // 绘制序在**同一次 lane 遍历**里生成（消掉 10k lane 的第二次 O(n) 扫描）：
+        // op / 几何表先借出，循环结束时再放回（compaction 之后才需要重建）。
+        let mut ops = std::mem::take(&mut buffer.ops);
+        ops.clear();
+        let mut geometry_ops = std::mem::take(&mut buffer.geometry);
+        geometry_ops.clear();
+        let mut group = OpGroup::new();
+        for lane_id in order {
+            let slot = lane_id.slot() as usize;
+            // arena 槽位被**新** lane 复用（代际不同）：旧段属于已释放的 lane，回收。
+            let stale = buffer.segments.get(slot).is_some_and(|entry| {
+                entry
+                    .as_ref()
+                    .is_some_and(|segment| segment.generation != lane_id.generation())
+            });
+            if stale && let Some(old) = buffer.segments[slot].take() {
+                buffer.release(old.range());
+            }
+            let Some((version, primitives)) = source.lane_state(*lane_id) else {
+                continue;
+            };
+            // 滚动槽：段复用时**段本身**的滚动槽必须与本次一致，否则要重编码（段落归属变了）。
+            let scroll_slot = source.lane_scroll(*lane_id);
+            // 复用判据：段存在 + 版本一致 + 滚动槽一致 ⇒ 整段不重编码（连实例字节都不碰）。
+            let reusable = buffer
+                .segments
+                .get(slot)
+                .and_then(Option::as_ref)
+                .is_some_and(|segment| segment.version == version && segment.scroll == scroll_slot);
+            if reusable {
+                *reused_segments += 1;
+            } else {
+                scratch.clear();
+                scratch_parts.clear();
+                {
+                    let mut lane = LaneEncoder {
+                        instances: scratch,
+                        parts: scratch_parts,
+                        clips: &mut buffer.clips,
+                        chains,
+                        state,
+                        saved,
+                        scale,
+                        resolver,
+                        colors,
+                        geometry,
+                        run_start: 0,
+                    };
+                    lane.encode_lane(primitives)?;
+                }
+                let len = scratch.len() as u32;
+                let previous = buffer.segments.get_mut(slot).and_then(Option::take);
+                // 段框（`Box`）跨帧复用：整帧重编码时 10k 条 lane 每帧 new/drop 一次 Box 是
+                // 六位数的分配开销（`frame_full_10k` 实测 ~15%）。只有首次为某条 lane 建段
+                // 才真正分配；`parts` 也用 `swap` 复用（SmallVec 的内联容量直接换手）。
+                let (mut segment, range) = match previous {
+                    // 实例数不变 ⇒ 原地重写：段地址不动，op 分组的连续性也不受影响。
+                    Some(old) if old.len() == len => {
+                        let range = old.range();
+                        buffer.write_instances(range.clone(), scratch);
+                        (old, range)
+                    }
+                    // 实例数变了：旧段归还（空洞留给下次分配 / compaction），新段重新分配。
+                    Some(old) => {
+                        buffer.release(old.range());
+                        let range = buffer.allocate(len);
+                        buffer.write_instances(range.clone(), scratch);
+                        (old, range)
+                    }
+                    None => {
+                        let range = buffer.allocate(len);
+                        buffer.write_instances(range.clone(), scratch);
+                        (
+                            Box::new(LaneSegment {
+                                generation: lane_id.generation(),
+                                version,
+                                scroll: scroll_slot,
+                                start: 0,
+                                end: 0,
+                                parts: SmallVec::new(),
+                            }),
+                            range,
+                        )
+                    }
+                };
+                segment.generation = lane_id.generation();
+                segment.version = version;
+                segment.scroll = scroll_slot;
+                segment.start = range.start;
+                segment.end = range.start + len;
+                segment.parts.clear();
+                std::mem::swap(&mut segment.parts, scratch_parts);
+                if buffer.segments.len() <= slot {
+                    buffer.segments.resize_with(slot + 1, || None);
+                }
+                buffer.segments[slot] = Some(segment);
+                *encoded_lanes += 1;
+                *written_bytes += len as usize * 128;
+            }
+            // 本 lane 的 op 追加进绘制序（复用与新编码走同一条路径）。
+            if let Some(segment) = buffer.segments.get(slot).and_then(Option::as_deref)
+                && segment.generation == lane_id.generation()
+            {
+                append_segment_ops(&mut ops, &mut geometry_ops, &mut group, segment);
+            }
+        }
+        flush_group(&mut ops, &mut group);
+        buffer.ops = ops;
+        buffer.geometry = geometry_ops;
+        // compaction 只在**没有任何 lane 被重编码**的帧执行：它要重排整张实例环
+        // （一次 1.28 MB 级搬运），绝不抢增量帧的预算。压实会改段起点 ⇒ 重建 op 表。
+        if *encoded_lanes == 0 && *reused_segments > 0 && buffer.needs_compaction() {
+            compact(buffer, order);
+            build_ops(buffer, order);
+        }
+        Ok(())
+    }
+
+    /// 增量快路径：只处理 `changed` 里的 lane；**段布局没变时沿用上一帧的 op 表**。
+    ///
+    /// 与全量扫描的差别只有三处：
+    /// 1. 迭代集合是帧源给出的变化集（稳态通常 1 条），不是整条绘制序（10k）；
+    /// 2. 不在同一次遍历里重建 op / 几何表 —— 所有重编码 lane 的**段区间**与几何绘制都没变时，
+    ///    上一帧的 op 表仍然有效（实例字节变了不影响 op 的段区间）；
+    /// 3. `reused_segments` 由「绘制序长度 − 重编码条数」导出：快路径的前提是绘制序里全是
+    ///    活 lane（`LaneStore::apply` 在释放 lane 时同步从绘制序摘除，并让变化集失效）。
+    ///
+    /// 任何一种「段布局可能变了」的情况（段长度变化 / 新 lane / 段回收 / 几何绘制出现）都会
+    /// 触发一次 [`build_ops`]（O(lanes) 的 op 表重建），行为与全量扫描完全一致。
+    fn encode_changed<S: LaneSource>(
+        &mut self,
+        source: &S,
+        changed: &[crate::paint::scene::LaneId],
+        order: &[crate::paint::scene::LaneId],
+        scale: Scale,
+        resolver: ColorResolver,
+        geometry: &dyn GeometryLookup,
+    ) -> Result<(), EngineError> {
+        // 上一帧的 op 表能否沿用：段区间、绘制项（实例包围盒烘焙在 op 里）或滚动槽任一变化
+        // 都会让旧 op 失效。
+        let mut ops_stale = false;
         {
             let Self {
                 buffer,
@@ -1096,20 +1305,11 @@ impl InstanceEncoder {
                 scratch,
                 scratch_parts,
                 encoded_lanes,
-                reused_segments,
                 written_bytes,
                 ..
             } = self;
-            // 绘制序在**同一次 lane 遍历**里生成（消掉 10k lane 的第二次 O(n) 扫描）：
-            // op / 几何表先借出，循环结束时再放回（compaction 之后才需要重建）。
-            let mut ops = std::mem::take(&mut buffer.ops);
-            ops.clear();
-            let mut geometry_ops = std::mem::take(&mut buffer.geometry);
-            geometry_ops.clear();
-            let mut group = OpGroup::new();
-            for lane_id in order {
+            for lane_id in changed {
                 let slot = lane_id.slot() as usize;
-                // arena 槽位被**新** lane 复用（代际不同）：旧段属于已释放的 lane，回收。
                 let stale = buffer.segments.get(slot).is_some_and(|entry| {
                     entry
                         .as_ref()
@@ -1117,13 +1317,12 @@ impl InstanceEncoder {
                 });
                 if stale && let Some(old) = buffer.segments[slot].take() {
                     buffer.release(old.range());
+                    ops_stale = true;
                 }
                 let Some((version, primitives)) = source.lane_state(*lane_id) else {
                     continue;
                 };
-                // 滚动槽：段复用时**段本身**的滚动槽必须与本次一致，否则要重编码（段落归属变了）。
                 let scroll_slot = source.lane_scroll(*lane_id);
-                // 复用判据：段存在 + 版本一致 + 滚动槽一致 ⇒ 整段不重编码（连实例字节都不碰）。
                 let reusable = buffer
                     .segments
                     .get(slot)
@@ -1132,97 +1331,103 @@ impl InstanceEncoder {
                         segment.version == version && segment.scroll == scroll_slot
                     });
                 if reusable {
-                    *reused_segments += 1;
-                } else {
-                    scratch.clear();
-                    scratch_parts.clear();
-                    {
-                        let mut lane = LaneEncoder {
-                            instances: scratch,
-                            parts: scratch_parts,
-                            clips: &mut buffer.clips,
-                            chains,
-                            state,
-                            saved,
-                            scale,
-                            resolver,
-                            colors,
-                            geometry,
-                            run_start: 0,
-                        };
-                        lane.encode_lane(primitives)?;
-                    }
-                    let len = scratch.len() as u32;
-                    let previous = buffer.segments.get_mut(slot).and_then(Option::take);
-                    // 段框（`Box`）跨帧复用：整帧重编码时 10k 条 lane 每帧 new/drop 一次 Box 是
-                    // 六位数的分配开销（`frame_full_10k` 实测 ~15%）。只有首次为某条 lane 建段
-                    // 才真正分配；`parts` 也用 `swap` 复用（SmallVec 的内联容量直接换手）。
-                    let (mut segment, range) = match previous {
-                        // 实例数不变 ⇒ 原地重写：段地址不动，op 分组的连续性也不受影响。
-                        Some(old) if old.len() == len => {
-                            let range = old.range();
-                            buffer.write_instances(range.clone(), scratch);
-                            (old, range)
-                        }
-                        // 实例数变了：旧段归还（空洞留给下次分配 / compaction），新段重新分配。
-                        Some(old) => {
-                            buffer.release(old.range());
-                            let range = buffer.allocate(len);
-                            buffer.write_instances(range.clone(), scratch);
-                            (old, range)
-                        }
-                        None => {
-                            let range = buffer.allocate(len);
-                            buffer.write_instances(range.clone(), scratch);
-                            (
-                                Box::new(LaneSegment {
-                                    generation: lane_id.generation(),
-                                    version,
-                                    scroll: scroll_slot,
-                                    start: 0,
-                                    end: 0,
-                                    parts: SmallVec::new(),
-                                }),
-                                range,
-                            )
-                        }
-                    };
-                    segment.generation = lane_id.generation();
-                    segment.version = version;
-                    segment.scroll = scroll_slot;
-                    segment.start = range.start;
-                    segment.end = range.start + len;
-                    segment.parts.clear();
-                    std::mem::swap(&mut segment.parts, scratch_parts);
-                    if buffer.segments.len() <= slot {
-                        buffer.segments.resize_with(slot + 1, || None);
-                    }
-                    buffer.segments[slot] = Some(segment);
-                    *encoded_lanes += 1;
-                    *written_bytes += len as usize * 128;
+                    continue;
                 }
-                // 本 lane 的 op 追加进绘制序（复用与新编码走同一条路径）。
-                if let Some(segment) = buffer.segments.get(slot).and_then(Option::as_deref)
-                    && segment.generation == lane_id.generation()
+                let previous_range = buffer
+                    .segments
+                    .get(slot)
+                    .and_then(Option::as_ref)
+                    .map(|segment| segment.range());
+                let previous_scroll = buffer
+                    .segments
+                    .get(slot)
+                    .and_then(Option::as_ref)
+                    .map(|segment| segment.scroll);
+                scratch.clear();
+                scratch_parts.clear();
                 {
-                    append_segment_ops(&mut ops, &mut geometry_ops, &mut group, segment);
+                    let mut lane = LaneEncoder {
+                        instances: scratch,
+                        parts: scratch_parts,
+                        clips: &mut buffer.clips,
+                        chains,
+                        state,
+                        saved,
+                        scale,
+                        resolver,
+                        colors,
+                        geometry,
+                        run_start: 0,
+                    };
+                    lane.encode_lane(primitives)?;
                 }
-            }
-            flush_group(&mut ops, &mut group);
-            buffer.ops = ops;
-            buffer.geometry = geometry_ops;
-            // compaction 只在**没有任何 lane 被重编码**的帧执行：它要重排整张实例环
-            // （一次 1.28 MB 级搬运），绝不抢增量帧的预算。压实会改段起点 ⇒ 重建 op 表。
-            if *encoded_lanes == 0 && *reused_segments > 0 && buffer.needs_compaction() {
-                compact(buffer, order);
-                build_ops(buffer, order);
+                // 绘制项必须逐项相同（实例包围盒烘焙在 op 里、几何表项按 op 顺序编号）：
+                // 有一项不同就重建 op 表。实例字节变了不影响绘制项，因此原地重写仍可复用 op。
+                let parts_unchanged = buffer
+                    .segments
+                    .get(slot)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|segment| parts_equal(&segment.parts, scratch_parts));
+                ops_stale |= !parts_unchanged;
+                // 滚动槽烘焙在 op 里（绘制期按它取偏移），槽位变了同样要重建。
+                ops_stale |= previous_scroll != Some(scroll_slot);
+                let len = scratch.len() as u32;
+                let previous = buffer.segments.get_mut(slot).and_then(Option::take);
+                let (mut segment, range) = match previous {
+                    Some(old) if old.len() == len => {
+                        let range = old.range();
+                        buffer.write_instances(range.clone(), scratch);
+                        (old, range)
+                    }
+                    Some(old) => {
+                        buffer.release(old.range());
+                        let range = buffer.allocate(len);
+                        buffer.write_instances(range.clone(), scratch);
+                        (old, range)
+                    }
+                    None => {
+                        let range = buffer.allocate(len);
+                        buffer.write_instances(range.clone(), scratch);
+                        (
+                            Box::new(LaneSegment {
+                                generation: lane_id.generation(),
+                                version,
+                                scroll: scroll_slot,
+                                start: 0,
+                                end: 0,
+                                parts: SmallVec::new(),
+                            }),
+                            range,
+                        )
+                    }
+                };
+                segment.generation = lane_id.generation();
+                segment.version = version;
+                segment.scroll = scroll_slot;
+                segment.start = range.start;
+                segment.end = range.start + len;
+                segment.parts.clear();
+                std::mem::swap(&mut segment.parts, scratch_parts);
+                if buffer.segments.len() <= slot {
+                    buffer.segments.resize_with(slot + 1, || None);
+                }
+                buffer.segments[slot] = Some(segment);
+                *encoded_lanes += 1;
+                *written_bytes += len as usize * 128;
+                ops_stale |= previous_range.as_ref() != Some(&range);
             }
         }
-        // 自检只在 debug 构建里跑：循环本身（遍历全部 op / clip / instance）不是
-        // `debug_assert!` 的宏体，release 下也会白跑 —— 10k 图元 ≈ 40 µs/帧。
-        #[cfg(debug_assertions)]
-        self.self_check(order);
-        Ok(&self.buffer)
+        if ops_stale {
+            build_ops(&mut self.buffer, order);
+        }
+        // compaction：与全量扫描同一门禁（只在**没有任何 lane 被重编码**的帧执行；它要重排整张
+        // 实例环，压实会改段起点 ⇒ 重建 op 表）。
+        if self.encoded_lanes == 0 && !order.is_empty() && self.buffer.needs_compaction() {
+            compact(&mut self.buffer, order);
+            build_ops(&mut self.buffer, order);
+        }
+        self.reused_segments = order.len().saturating_sub(self.encoded_lanes);
+        Ok(())
     }
 
     /// 引擎侧释放一条 lane（节点不再持有它）：立刻回收实例段（否则要等 arena 槽位被复用）。
@@ -1238,6 +1443,12 @@ impl InstanceEncoder {
         if matches && let Some(segment) = self.buffer.segments[slot].take() {
             self.buffer.release(segment.range());
         }
+    }
+
+    /// 走增量快路径的帧数（仅测试；见 [`InstanceEncoder::encode_changed`]）。
+    #[cfg(test)]
+    pub(crate) fn fast_encodes(&self) -> u32 {
+        self.fast_encodes
     }
 
     /// 本帧重编码的 lane 数（`FrameRecord.encoded_lanes` / `ComposeStats.encoded_lanes`）。
@@ -1275,6 +1486,7 @@ impl InstanceEncoder {
         self.encoded_lanes = 0;
         self.reused_segments = 0;
         self.written_bytes = 0;
+        self.primed = false;
     }
 
     /// 本帧的编码结果（消费者：`Window::instance_bytes`，P07 上传）。
@@ -1559,6 +1771,31 @@ fn build_ops(buffer: &mut InstanceBuffer, order: &[crate::paint::scene::LaneId])
     flush_group(&mut ops, &mut group);
     buffer.ops = ops;
     buffer.geometry = geometry;
+}
+
+/// 两段绘制项是否逐项相同（决定编码器能否沿用上一帧的 op 表）。
+///
+/// op 里烘焙了**实例包围盒**（damage 的 op 级跳过用它）与几何表下标，因此绘制项只要有一项
+/// 不同（长度 / 包围盒 / 几何绘制）就必须重建 op 表。几何绘制一律视为「不同」：几何表项按
+/// op 顺序编号，宁可重建也不冒险复用旧下标。
+fn parts_equal(previous: &[LanePart], current: &[LanePart]) -> bool {
+    previous.len() == current.len()
+        && previous
+            .iter()
+            .zip(current)
+            .all(|(old, new)| match (old, new) {
+                (
+                    LanePart::Instances {
+                        len: old_len,
+                        bounds: old_bounds,
+                    },
+                    LanePart::Instances {
+                        len: new_len,
+                        bounds: new_bounds,
+                    },
+                ) => old_len == new_len && old_bounds == new_bounds,
+                _ => false,
+            })
 }
 
 fn flush_group(ops: &mut Vec<FrameOp>, group: &mut OpGroup) {

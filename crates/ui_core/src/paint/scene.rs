@@ -173,6 +173,16 @@ pub struct Scene {
     lanes: Arena<Lane, LaneId>,
     /// 本帧的 lane 绘制序（P06 的 paint 阶段用 `set_order` 写入）。
     order: Vec<LaneId>,
+    /// 自上次 [`Scene::take_dirty_lanes`] 以来内容变过的 lane（**不查重**：一条 lane 的多次
+    /// `push` 会各记一条，消费端用版本判据去重 —— 代价只是一次槽位比较）。
+    ///
+    /// 由 `Scene` 的写入点自己记录，而不是让 paint pass 在调用点逐个上报：lane 内容的唯一真相
+    /// 在这个类型里，这样任何新增写入路径都不可能"忘记录"（漏记 = 漏画，视觉 bug；多记只是
+    /// 一次白跑的比较）。UI 侧的增量采集（`DeltaBuilder`）因此不必每帧扫 10k 条 lane。
+    dirty: Vec<LaneId>,
+    /// `false` = 本帧的脏表**不完整**（`clear_frame` 这类全表复位没有逐条登记），消费端必须
+    /// 回退全量扫描。
+    dirty_complete: bool,
 }
 
 impl Scene {
@@ -181,6 +191,8 @@ impl Scene {
         Self {
             lanes: Arena::<Lane, LaneId>::new(),
             order: Vec::new(),
+            dirty: Vec::new(),
+            dirty_complete: true,
         }
     }
 
@@ -202,6 +214,7 @@ impl Scene {
         match self.lanes.get_mut(lane) {
             Some(target) => {
                 target.push(primitive);
+                self.dirty.push(lane);
                 true
             }
             None => false,
@@ -213,6 +226,9 @@ impl Scene {
         for lane in self.lanes.values_mut() {
             lane.clear();
         }
+        // 全表复位：逐条登记的成本与这里已有的 O(lanes) 遍历无关，但也没有收益 —— 直接把脏表
+        // 标记为不可信，让消费端回退一次全量扫描（可观测：`DeltaBuilder::full_scans`）。
+        self.dirty_complete = false;
     }
 
     /// engine-internal, 应用层不得调用 —— 清空**一条** lane 的内容并复位 `clip_depth`（保留容量）。
@@ -223,10 +239,25 @@ impl Scene {
         match self.lanes.get_mut(id) {
             Some(lane) => {
                 lane.clear();
+                self.dirty.push(id);
                 true
             }
             None => false,
         }
+    }
+
+    /// 取走本帧的脏 lane 表（消费者：`DeltaBuilder` 的增量采集）。
+    ///
+    /// 返回 `false` = 脏表**不完整**（`clear_frame` 等全表复位之后），调用方必须回退全量扫描。
+    /// `into` 由调用方持有并跨帧复用（`DeltaBuilder` 保留容量 ⇒ 稳态零分配）；返回后它内容
+    /// 就是本帧的脏表（**可能有重复**，版本判据会去重）。
+    pub(crate) fn take_dirty_lanes(&mut self, into: &mut Vec<LaneId>) -> bool {
+        std::mem::swap(into, &mut self.dirty);
+        // 换回来的缓冲区清空保留容量：下一帧的写入点直接往里推。
+        self.dirty.clear();
+        let complete = self.dirty_complete;
+        self.dirty_complete = true;
+        complete
     }
 
     /// engine-internal, 应用层不得调用 —— 写入本帧绘制序。

@@ -196,6 +196,14 @@ pub(crate) struct DeltaBuilder {
     geometries: ahash::HashMap<GeometryId, Arc<crate::paint::geometry::GeometryDesc>>,
     /// 上次发布时的 DPI（变化 ⇒ 物理坐标全变 ⇒ 整帧重建）。
     scale: Option<Scale>,
+    /// `Scene` 脏表的复用缓冲（跨帧保容量 ⇒ 增量帧的采集零分配）。
+    dirty: Vec<LaneId>,
+    /// 回退全量扫描的帧数（全量帧 / 脏表不完整）。**回归防线**：稳态增量帧必须保持 0 增长。
+    #[cfg(test)]
+    full_scans: u32,
+    /// 本帧真正查过版本的 lane 数（`full_scans` 的姊妹指标：脏 1 条 ⇒ 只查 1 条）。
+    #[cfg(test)]
+    visited_lanes: usize,
 }
 
 impl DeltaBuilder {
@@ -206,7 +214,28 @@ impl DeltaBuilder {
             scroll: Vec::new(),
             geometries: ahash::HashMap::default(),
             scale: None,
+            dirty: Vec::new(),
+            #[cfg(test)]
+            full_scans: 0,
+            #[cfg(test)]
+            visited_lanes: 0,
         }
+    }
+
+    /// 回退全量扫描的累计帧数（见 [`DeltaBuilder::collect`]）。
+    ///
+    /// 只有三种情况会增长：全量帧（首帧 / DPI 变化）、`Scene` 脏表不完整（`clear_frame`）、
+    /// 以及显式要求整帧发布的帧。稳态增量帧必须**不再增长** —— 超过预期就说明 UI 侧的
+    /// 「只发布变化」退化成了「每帧扫 10k 条 lane」。
+    #[cfg(test)]
+    pub(crate) fn full_scans(&self) -> u32 {
+        self.full_scans
+    }
+
+    /// 上一次 `collect` 查过版本的 lane 数（脏 1 条时必须是 1，而不是 lane 总数）。
+    #[cfg(test)]
+    pub(crate) fn visited_lanes(&self) -> usize {
+        self.visited_lanes
     }
 
     /// 本帧是否必须整帧重建（DPI 变化：物理坐标、缩放后的圆角与 clip 全部变了）。
@@ -220,11 +249,17 @@ impl DeltaBuilder {
 
     /// 采集本帧的 lane 变化 + 绘制序 + 几何描述。
     ///
+    /// **成本模型**：稳态增量帧只遍历 [`Scene::take_dirty_lanes`] 的脏表（paint pass 这一帧真正
+    /// 重建/清空过的 lane，通常是 1 条），而不是绘制序里的全部 lane（10k）。
+    ///
+    /// **回退**：`full`（全量帧必须发布全部 lane 内容）或 `Scene` 的脏表不完整（`clear_frame`
+    /// 这类全表复位）时扫全部 lane，并记一次 [`DeltaBuilder::full_scans`]。
+    ///
     /// `scroll` 是**本帧全量**的滚动表（槽位 → 逻辑偏移），只有变化的槽进入 delta；
     /// `viewports` 是槽位 → 物理可见区（滚动 damage 用）。
     pub(crate) fn collect(
         &mut self,
-        scene: &Scene,
+        scene: &mut Scene,
         store: &GeometryStore,
         scroll: &[(Point, PhysicalRect)],
         full: bool,
@@ -236,7 +271,11 @@ impl DeltaBuilder {
             self.scroll.clear();
             self.geometries.clear();
         }
-        // 绘制序：`set_order` 在顺序不变时不会重写，因此指针/长度相等即可跳过。
+        // 脏表在任何分支之前取走：`full` 帧也要清空它，否则条目会留到下一帧。
+        let mut dirty = std::mem::take(&mut self.dirty);
+        let complete = scene.take_dirty_lanes(&mut dirty);
+        // 绘制序：`set_order` 在顺序不变时不会重写，因此逐项判等是唯一判据（O(lanes) 比较，
+        // 但不构造/不拷贝；顺序真的变化时才分配一次）。
         let order = scene.order();
         if full || !same_order(&self.order, order) {
             delta.order = Some(Arc::from(order));
@@ -245,30 +284,26 @@ impl DeltaBuilder {
         if self.versions.len() < scene.lane_count() {
             self.versions.resize(scene.lane_count(), (0, 0));
         }
-        for lane in order.iter().copied() {
-            let slot = lane.slot() as usize;
-            let Some((version, primitives)) = scene.lane_state(lane) else {
-                continue;
-            };
-            if slot < self.versions.len()
-                && self.versions[slot] == (lane.generation(), version)
-                && !full
-            {
-                continue;
-            }
-            // 内容变了：重建快照（`Arc<[Primitive]>` 只在**变化**的 lane 上分配一次；
-            // 未变化的 lane 根本不进 delta，因此稳态零分配、零拷贝）。
-            self.collect_geometries(primitives, store, delta);
-            delta.lanes.push(LaneDelta {
-                lane,
-                version,
-                primitives: Arc::from(primitives.to_vec()),
-            });
-            if slot >= self.versions.len() {
-                self.versions.resize(slot + 1, (0, 0));
-            }
-            self.versions[slot] = (lane.generation(), version);
+        #[cfg(test)]
+        {
+            self.visited_lanes = 0;
         }
+        if full || !complete {
+            // 回退全量扫描：全量帧必须发布每条 lane 的完整内容；脏表不可信时必须自己找变化。
+            #[cfg(test)]
+            {
+                self.full_scans += 1;
+            }
+            for lane in order.iter().copied() {
+                self.collect_lane(scene, store, delta, lane, full);
+            }
+        } else if !dirty.is_empty() {
+            for lane in dirty.iter().copied() {
+                self.collect_lane(scene, store, delta, lane, false);
+            }
+        }
+        // 脏表缓冲交给 builder 继续持有（下一帧复用同一块容量）。
+        self.dirty = dirty;
         // 滚动：只有变化的槽进入 delta（滚动帧因此不触碰任何 lane）。
         if self.scroll.len() < scroll.len() {
             self.scroll
@@ -285,6 +320,43 @@ impl DeltaBuilder {
                 self.scroll[slot] = *offset;
             }
         }
+    }
+
+    /// 单条 lane 的采集（脏表与全量扫描共用同一个判据）。
+    fn collect_lane(
+        &mut self,
+        scene: &Scene,
+        store: &GeometryStore,
+        delta: &mut SceneDelta,
+        lane: LaneId,
+        full: bool,
+    ) {
+        let slot = lane.slot() as usize;
+        #[cfg(test)]
+        {
+            self.visited_lanes += 1;
+        }
+        let Some((version, primitives)) = scene.lane_state(lane) else {
+            return;
+        };
+        if !full
+            && slot < self.versions.len()
+            && self.versions[slot] == (lane.generation(), version)
+        {
+            return;
+        }
+        // 内容变了：重建快照（`Arc<[Primitive]>` 只在**变化**的 lane 上分配一次；
+        // 未变化的 lane 根本不进 delta，因此稳态零分配、零拷贝）。
+        self.collect_geometries(primitives, store, delta);
+        delta.lanes.push(LaneDelta {
+            lane,
+            version,
+            primitives: Arc::from(primitives.to_vec()),
+        });
+        if slot >= self.versions.len() {
+            self.versions.resize(slot + 1, (0, 0));
+        }
+        self.versions[slot] = (lane.generation(), version);
     }
 
     /// 一条 lane 引用的几何描述（只有变化 lane 会重新收集；未变化的 lane 的描述仍在缓存里）。
@@ -338,6 +410,14 @@ fn same_order(previous: &[LaneId], current: &[LaneId]) -> bool {
 pub(crate) struct LaneStore {
     lanes: Vec<Option<StoredLane>>,
     order: Vec<LaneId>,
+    /// 上次 [`LaneStore::apply`] 里内容**真的变了**的 lane（编码器快路径的输入）。
+    changed: Vec<LaneId>,
+    /// 上次 `apply` 期间**除 lane 内容之外**的一切都没变（绘制序 / lane 集合 / 全量重置）。
+    ///
+    /// 只有 `true` 时 `changed` 才是可信的「本帧全部变化」：编码器据此跳过 10k 条 lane 的
+    /// 扫描并沿用上一帧的 op 表。绘制序或 lane 集合一变就置 `false`（那些变化会让 op 表失效，
+    /// 必须回退全量扫描）。
+    fast: bool,
 }
 
 struct StoredLane {
@@ -351,6 +431,8 @@ impl LaneStore {
         Self {
             lanes: Vec::new(),
             order: Vec::new(),
+            changed: Vec::new(),
+            fast: false,
         }
     }
 
@@ -359,6 +441,8 @@ impl LaneStore {
     /// 返回 `true` = lane 表真的变了（调用方据此判断是否需要重编码）。版本相同的重复 delta
     /// （覆盖帧合并/重发）不会改变表，因此是幂等的。
     pub(crate) fn apply(&mut self, delta: &SceneDelta) -> bool {
+        self.changed.clear();
+        self.fast = !delta.full;
         let mut changed = delta.full;
         if delta.full {
             self.lanes.clear();
@@ -370,16 +454,20 @@ impl LaneStore {
             self.order.clear();
             self.order.extend_from_slice(order);
             changed = true;
+            // 绘制序变了：op 表（每条 op 的段区间与顺序）必须重建。
+            self.fast = false;
         }
         for removed in &delta.removed {
             let slot = removed.slot() as usize;
-            if self
-                .lanes
-                .get_mut(slot)
-                .and_then(Option::take)
-                .is_some_and(|lane| lane.generation == removed.generation())
+            if let Some(stored) = self.lanes.get_mut(slot).and_then(Option::take)
+                && stored.generation == removed.generation()
             {
                 changed = true;
+                // 段会被编码器回收 ⇒ 段布局变化 ⇒ op 表必须重建。
+                self.fast = false;
+                // 同时把已释放的 lane 从绘制序里摘掉：编码器的快路径依赖「绘制序里全是活 lane」
+                // 这一不变量（否则它算出的复用数会偏）。下一帧 UI 侧会带来新绘制序。
+                self.order.retain(|lane| *lane != *removed);
             }
         }
         for lane in &delta.lanes {
@@ -393,11 +481,19 @@ impl LaneStore {
             if stale {
                 continue;
             }
+            // arena 槽位被新 lane 复用（代际变化）⇒ 旧段作废 ⇒ 段布局会变。
+            if self.lanes[slot]
+                .as_ref()
+                .is_some_and(|stored| stored.generation != lane.lane.generation())
+            {
+                self.fast = false;
+            }
             self.lanes[slot] = Some(StoredLane {
                 generation: lane.lane.generation(),
                 version: lane.version,
                 primitives: Arc::clone(&lane.primitives),
             });
+            self.changed.push(lane.lane);
             changed = true;
         }
         changed
@@ -417,6 +513,10 @@ impl LaneSource for LaneStore {
 
     fn order(&self) -> &[LaneId] {
         &self.order
+    }
+
+    fn changed_lanes(&self) -> Option<&[LaneId]> {
+        self.fast.then_some(self.changed.as_slice())
     }
 }
 
@@ -619,13 +719,13 @@ mod tests {
         let geometry = store();
         let mut builder = DeltaBuilder::new();
         let mut delta = SceneDelta::empty(header(1, Plan::Full));
-        builder.collect(&scene, &geometry, &[], true, &mut delta);
+        builder.collect(&mut scene, &geometry, &[], true, &mut delta);
         assert_eq!(delta.lanes.len(), 2, "全量帧必须带全部 lane");
 
         // 只改一条 lane：delta 里只有它。
         assert!(scene.push(second, quad()));
         let mut delta = SceneDelta::empty(header(2, Plan::Partial(DamageRects::new())));
-        builder.collect(&scene, &geometry, &[], false, &mut delta);
+        builder.collect(&mut scene, &geometry, &[], false, &mut delta);
         assert_eq!(delta.lanes.len(), 1);
         assert_eq!(delta.lanes[0].lane, second);
         assert!(delta.order.is_none(), "绘制序没变 ⇒ 不携带");
@@ -643,7 +743,7 @@ mod tests {
         let viewport = PhysicalRect::new(0, 0, 64, 64);
         let mut first = SceneDelta::empty(header(1, Plan::Full));
         builder.collect(
-            &scene,
+            &mut scene,
             &geometry,
             &[(Point::new(0.0, 0.0), viewport)],
             true,
@@ -651,7 +751,7 @@ mod tests {
         );
         let mut scrolled = SceneDelta::empty(header(2, Plan::Idle));
         builder.collect(
-            &scene,
+            &mut scene,
             &geometry,
             &[(Point::new(0.0, -12.0), viewport)],
             false,
@@ -662,6 +762,57 @@ mod tests {
         assert_eq!(scrolled.scroll.len(), 1);
         assert_eq!(scrolled.scroll[0].offset.y, -12.0);
         assert!(scrolled.lanes.is_empty() && scrolled.order.is_none());
+    }
+
+    /// **回归防线（UI 线程不扫全表）**：增量帧的采集只遍历 `Scene` 的脏表（paint pass 这一帧
+    /// 真正改过的 lane），而不是绘制序里的全部 10k 条；回退全量扫描必须可观测且只在
+    /// 「必须发布全部 lane / 脏表不可信」时发生。
+    #[test]
+    fn a_one_lane_change_visits_only_the_dirty_lane() {
+        const LANES: usize = 10_000;
+        let mut scene = Scene::empty();
+        let mut order = Vec::with_capacity(LANES);
+        for _ in 0..LANES {
+            let lane = scene.new_lane();
+            assert!(scene.push(lane, quad()));
+            order.push(lane);
+        }
+        scene.set_order(&order);
+        let geometry = store();
+        let mut builder = DeltaBuilder::new();
+        let mut first = SceneDelta::empty(header(1, Plan::Full));
+        builder.collect(&mut scene, &geometry, &[], true, &mut first);
+        assert_eq!(
+            builder.full_scans(),
+            1,
+            "首帧必须回退全量扫描（合成侧还没有任何 lane）"
+        );
+        assert_eq!(builder.visited_lanes(), LANES);
+
+        // 只改一条 lane：本帧只该看它一条。
+        assert!(scene.push(order[LANES / 2], quad()));
+        let mut delta = SceneDelta::empty(header(2, Plan::Partial(DamageRects::new())));
+        builder.collect(&mut scene, &geometry, &[], false, &mut delta);
+        assert_eq!(delta.lanes.len(), 1);
+        assert_eq!(
+            builder.visited_lanes(),
+            1,
+            "脏 1 条 lane ⇒ 只查 1 条（不得扫全部 {LANES} 条）"
+        );
+        assert_eq!(builder.full_scans(), 1, "稳态增量帧不得回退全量扫描");
+        assert!(delta.order.is_none(), "绘制序没变 ⇒ 不携带");
+
+        // `clear_frame` 之后脏表不可信 ⇒ 回退一次全量扫描（并记数）。
+        scene.clear_frame();
+        let mut after_reset = SceneDelta::empty(header(3, Plan::Partial(DamageRects::new())));
+        builder.collect(&mut scene, &geometry, &[], false, &mut after_reset);
+        assert_eq!(builder.full_scans(), 2, "脏表不完整必须回退全量扫描");
+        assert_eq!(builder.visited_lanes(), LANES);
+        assert_eq!(
+            after_reset.lanes.len(),
+            LANES,
+            "全表复位后每条 lane 的版本都变了，必须全部重新发布"
+        );
     }
 
     /// `DeltaBuilder` 的采集成本只随**变化**的 lane 增长：10k 条 lane 里只改 1 条时，delta 里
@@ -680,13 +831,13 @@ mod tests {
         let geometry = store();
         let mut builder = DeltaBuilder::new();
         let mut first = SceneDelta::empty(header(1, Plan::Full));
-        builder.collect(&scene, &geometry, &[], true, &mut first);
+        builder.collect(&mut scene, &geometry, &[], true, &mut first);
         assert_eq!(first.lanes.len(), LANES, "全量帧带全部 lane 快照");
 
         // 只改最后一条 lane：delta 里只有它，且绘制序不携带。
         assert!(scene.push(order[LANES - 1], quad()));
         let mut delta = SceneDelta::empty(header(2, Plan::Partial(DamageRects::new())));
-        builder.collect(&scene, &geometry, &[], false, &mut delta);
+        builder.collect(&mut scene, &geometry, &[], false, &mut delta);
         assert_eq!(delta.lanes.len(), 1, "只有变化的 lane 才重建快照");
         assert_eq!(delta.lanes[0].lane, order[LANES - 1]);
         assert_eq!(
@@ -754,7 +905,7 @@ mod tests {
         let geometry = store();
         let mut builder = DeltaBuilder::new();
         let mut delta = SceneDelta::empty(header(1, Plan::Full));
-        builder.collect(&scene, &geometry, &[], true, &mut delta);
+        builder.collect(&mut scene, &geometry, &[], true, &mut delta);
         let mut applied = SceneDelta::empty(header(2, Plan::Idle));
         applied.lanes = delta.lanes.clone();
         applied.order = delta.order.clone();
@@ -844,13 +995,13 @@ mod tests {
         scene.set_order(&[lane]);
         let mut builder = DeltaBuilder::new();
         let mut delta = SceneDelta::empty(header(1, Plan::Full));
-        builder.collect(&scene, &geometry, &[], true, &mut delta);
+        builder.collect(&mut scene, &geometry, &[], true, &mut delta);
         assert_eq!(delta.geometries.len(), 1);
         assert_eq!(delta.geometries[0].0, id);
         // 同一 lane 再变一次（内容相同但版本 +1）：描述已经在缓存里，不重复携带。
         assert!(scene.push(lane, quad()));
         let mut again = SceneDelta::empty(header(2, Plan::Full));
-        builder.collect(&scene, &geometry, &[], false, &mut again);
+        builder.collect(&mut scene, &geometry, &[], false, &mut again);
         assert!(again.geometries.is_empty(), "描述已缓存 ⇒ 不重复过线");
         let mut catalog = GeometryCatalog::new();
         catalog.apply(&delta);

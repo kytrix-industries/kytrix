@@ -1206,10 +1206,89 @@ mod tests {
         verify(&mut tree, "卸载后");
     }
 
+    /// wave-9 性能回归的确定性钉板：**大量出流兄弟**时，祖先包络修正必须去重（每个受波及祖先
+    /// 只重算一次），不能是 `O(移动出流盒数 × 祖先数 × 直接子节点数)`。
+    ///
+    /// 计数用 `LayoutReport::bounds_updated`（`store_subtree_bounds` 的调用次数）：
+    /// 200 个绝对定位子节点 ⇒ 首轮 = 根 + 200 个孩子 = 201 次放置写入 + **1** 次根包络修正；
+    /// 未去重的实现会在每个移动子节点上重写根一次（+200），> 300 就会失败。
+    #[test]
+    fn many_out_of_flow_siblings_recompute_each_ancestor_once() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let mut children = Vec::new();
+        for index in 0..200 {
+            let child = add(&mut tree, root, fixed(10.0, 10.0));
+            tree.set_absolute_inset(
+                child,
+                crate::math::Point::new((index % 20) as f32 * 10.0, (index / 20) as f32 * 10.0),
+            );
+            children.push(child);
+        }
+        let report = layout(&mut tree, 400.0, 400.0);
+        assert!(
+            report.bounds_updated <= 300,
+            "首轮包络写入必须 ≈ 节点数（根 1 + 200），实际 {} —— 祖先修正没有去重",
+            report.bounds_updated
+        );
+        // 第二次布局：结构没变 ⇒ 没有移动出流盒 ⇒ 只重贴根（以及被 taffy 写回的孩子）。
+        let second = layout(&mut tree, 400.0, 400.0);
+        assert!(
+            second.bounds_updated <= 300,
+            "稳定态包络写入必须 O(被布局节点数)，实际 {}",
+            second.bounds_updated
+        );
+        // 正确性：增量包络与全量重算逐位一致（去重/自底向上顺序不能改变结果）。
+        let incremental = children
+            .iter()
+            .map(|child| tree.subtree_bounds(*child))
+            .collect::<Vec<_>>();
+        tree.recompute_subtree_bounds();
+        let exact = children
+            .iter()
+            .map(|child| tree.subtree_bounds(*child))
+            .collect::<Vec<_>>();
+        assert_eq!(incremental, exact, "增量包络必须与全量重算一致");
+    }
+
+    /// `LayoutOverride` 节点由树父就地放置（B1），包络天然精确 ⇒ **不得**进入跨界的祖先修正。
+    ///
+    /// 未修版本把 512 个 override 兄弟当"出流跨界"处理：每个都重扫根的 512 个孩子
+    /// （实测 `layout_512` 1.5 ms，修复后 ≈ 180 µs）。计数断言把它变成确定性测试。
+    #[test]
+    fn layout_overrides_never_enter_the_ancestor_fixup() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let mut children = Vec::new();
+        for index in 0..512 {
+            let x = (index % 8) as f32 * 96.0;
+            let y = (index / 8) as f32 * 32.0;
+            let child = NodeBuilder::boxed()
+                .layout_override(Rect::new(x, y, 90.0, 28.0))
+                .build(&mut tree, root)
+                .expect("挂载成功");
+            children.push(child);
+        }
+        let report = layout(&mut tree, 800.0, 600.0);
+        assert_eq!(
+            report.bounds_updated, 513,
+            "根 + 512 个 override 各写一次包络；override 不得触发祖先修正"
+        );
+        // 包络正确性：根 = 根自身 (800×600) ∪ 全部 override 盒（最后一格 y = 63 × 32 + 28）。
+        assert_eq!(bounds(&tree, children[0]), Rect::new(0.0, 0.0, 90.0, 28.0));
+        assert_eq!(
+            bounds(&tree, children[511]),
+            Rect::new(7.0 * 96.0, 63.0 * 32.0, 90.0, 28.0)
+        );
+        assert_eq!(
+            tree.subtree_bounds(root),
+            Rect::new(0.0, 0.0, 800.0, 2016.0 + 28.0)
+        );
+    }
+
     #[test]
     fn device_snapping_descends_when_only_the_subpixel_reference_moved() {
         // B7 的正确性边角：父/中间盒吸附后**没变**，但未圆整的位移让**孙子**的边界跨过半像素。
-        // 若 post-pass 只用"吸附盒有没有变"做早期退出，孙子的提交盒会被漏更新（错位 1px）。
         //
         // 链：root → spacer + container → mid（margin 0.15）→ leaf（margin 0.3）。
         // spacer 10.0 → 10.2 让整条链的未圆整 y 各 +0.2：container 10.0→10.2（吸附 10/10）、

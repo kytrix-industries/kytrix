@@ -241,7 +241,7 @@ mod tests {
             self.next += 1;
             let mut delta = SceneDelta::empty(header(index, plan, Scale::ONE));
             self.builder
-                .collect(&self.scene, &self.store, scroll, full, &mut delta);
+                .collect(&mut self.scene, &self.store, scroll, full, &mut delta);
             delta
         }
 
@@ -344,7 +344,7 @@ mod tests {
         assert!(full, "DPI 变化必须整帧重建");
         fixture
             .builder
-            .collect(&fixture.scene, &fixture.store, &[], full, &mut delta);
+            .collect(&mut fixture.scene, &fixture.store, &[], full, &mut delta);
         delta.full = true;
         let composed = fixture.compose(&delta);
         assert_eq!(composed.stats.encoded_lanes, 3);
@@ -360,6 +360,72 @@ mod tests {
         let delta = fixture.frame(Plan::Partial(DamageRects::new()), false, &[]);
         assert!(delta.lanes.is_empty(), "无变化帧不得带 lane");
         assert!(Arc::strong_count(&first) >= 1);
+    }
+
+    /// **回归防线（op 包围盒不能沿用旧的）**：实例数不变、但绘制项变了（位置移动）时，
+    /// 编码器必须重建 op 表 —— op 的实例包围盒会参与 damage 的 op 级跳过，沿用旧值会漏画。
+    #[test]
+    fn moving_a_lane_with_the_same_instance_count_rebuilds_the_op_bounds() {
+        let mut fixture = Fixture::new(2);
+        let delta = fixture.frame(Plan::Full, true, &[]);
+        let _ = fixture.compose(&delta);
+        assert!(fixture.scene.clear_lane(fixture.lane));
+        assert!(fixture.scene.push(
+            fixture.lane,
+            Primitive::Quad(Quad {
+                bounds: Rect::new(400.0, 0.0, 4.0, 4.0),
+                corner_radius: [0.0; 4],
+                paint: QuadPaint::Solid {
+                    fill: Color::WHITE,
+                    border: None,
+                },
+            })
+        ));
+        let delta = fixture.frame(Plan::Partial(DamageRects::new()), false, &[]);
+        let composed = fixture.compose(&delta);
+        assert_eq!(
+            composed.stats.encoded_lanes, 1,
+            "实例数不变也要重编码实例字节"
+        );
+        let rightmost = composed
+            .payload
+            .ops()
+            .iter()
+            .filter_map(|op| match op {
+                crate::paint::instance::FrameOp::Instances { bounds, .. } => Some(bounds.x1),
+                crate::paint::instance::FrameOp::Geometry { .. } => None,
+            })
+            .max()
+            .expect("至少有实例 op");
+        assert!(
+            rightmost >= 390,
+            "op 包围盒必须包含移动后的位置（实际 x1={rightmost}）"
+        );
+    }
+
+    /// **性能回归防线**：第二帧起必须走编码器的增量快路径（只处理变化 lane、沿用 op 表）。
+    /// 快路径被悄悄关掉，就是每帧 10k 条 lane 的全量扫描 —— 那正是要守的回退。
+    #[test]
+    fn incremental_frames_take_the_encoder_fast_path() {
+        let mut fixture = Fixture::new(4);
+        let delta = fixture.frame(Plan::Full, true, &[]);
+        let _ = fixture.compose(&delta);
+        assert_eq!(
+            fixture.composer.encoder.fast_encodes(),
+            0,
+            "首帧必须走全量扫描（合成侧还没有任何段）"
+        );
+
+        assert!(fixture.scene.push(fixture.lane, quad()));
+        let delta = fixture.frame(Plan::Partial(DamageRects::new()), false, &[]);
+        let composed = fixture.compose(&delta);
+        assert_eq!(
+            fixture.composer.encoder.fast_encodes(),
+            1,
+            "增量帧必须走快路径（帧源给出了可信变化集）"
+        );
+        assert_eq!(composed.stats.encoded_lanes, 1);
+        assert_eq!(composed.stats.reused_segments, 3);
     }
 
     /// **回归防线（合成线程 / `SceneDelta` 落地后不许退化）**：10k lane 的场景里只有 1 条 lane

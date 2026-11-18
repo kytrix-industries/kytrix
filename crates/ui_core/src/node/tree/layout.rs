@@ -404,7 +404,12 @@ pub(crate) fn place_subtree(
         }
     }
 
-    let hoisted: SmallVec<[NodeId; 2]> = tree.hoisted.get(&node).cloned().unwrap_or_default();
+    // 出流子节点由**包含块**的 hoisted 列表驱动（B2）；没有任何出流盒时省掉每节点的表查找。
+    let hoisted: SmallVec<[NodeId; 2]> = if tree.hoisted.is_empty() {
+        SmallVec::new()
+    } else {
+        tree.hoisted.get(&node).cloned().unwrap_or_default()
+    };
     for child in children.iter().copied() {
         // 出流节点（无 override）由它的**包含块**的 hoisted 列表驱动；但 override 节点按
         // **树父**的 border-box origin 放置（B1：taffy 会把 absolute 节点挂到最近的定位祖先，
@@ -472,12 +477,16 @@ fn store_subtree_bounds(tree: &mut NodeTree, node: NodeId, bounds: Rect) {
 /// 它由**包含块**（可能不是树父）放置，而包含块可能在它的树父**之后**才被访问 —— 于是那一段
 /// 树祖先的包络可能低估（漏掉刚移动的出流后代）。
 ///
-/// 修正方式：对「本轮移动过的出流盒」沿**树父链**自底向上**精确重算**包络
-/// （`自身 ∪ 直接子节点的包络`）。子节点的包络此时已全部是本轮的（DFS 后序 + 本次修正的
+/// 修正方式：对「本轮移动过的出流盒」沿**树父链**收集祖先，去重后**按深度自底向上精确重算一次**
+/// 包络（`自身 ∪ 直接子节点的包络`）。子节点的包络此时已全部是本轮的（DFS 后序 + 本次修正的
 /// 自底向上），因此结果是精确值而不是"只增近似"。
 ///
-/// - 复杂度：`O(Σ 被修正祖先的直接子节点数)`，与节点总数无关；普通（非出流）移动不走这条路径；
-/// - 触发条件是「出流盒本轮移动」，出流盒只在相对/绝对定位布局里出现，数量与界面结构同阶。
+/// **复杂度（关键，wave-9 性能回归的修复点）**：
+/// - 祖先集合去重 ⇒ 每个被波及的祖先只重算一次，成本 `O(Σ 被修正祖先的直接子节点数)`；
+/// - 收集阶段 `O(移动出流盒数 × 祖先深度)`，与子树规模无关；
+/// - **`LayoutOverride` 节点不参与**：它们由树父在本轮 DFS 里就地放置（B1 的"相对父 border box"
+///   契约），父的包络必然在它们之后计算，天然精确。把它们当作"跨界出流"处理会让
+///   「500 个 override 兄弟」退化成 `O(兄弟数 × 兄弟数)` 的二次开销（实测 1.1 ms → 0）。
 fn expand_hoisted_ancestors(tree: &mut NodeTree) {
     if tree.moved_nodes.is_empty() {
         return;
@@ -485,23 +494,51 @@ fn expand_hoisted_ancestors(tree: &mut NodeTree) {
     // 先快照（不能同时持有集合借用与 `&mut tree`）；复用跨帧缓冲。
     let mut moved = std::mem::take(&mut tree.dirty_scratch);
     tree.moved_nodes.snapshot_into(&mut moved);
+
+    // 1) 收集受影响的树祖先：去重 + **真深度**（根 = 0），随后深者先算。
+    //
+    // 深度必须是「到根的层数」而不是「到移动节点走了几步」：不同移动节点的链会把同一个
+    // 祖先登记成不同的相对深度，用它排序会让深祖先排在浅祖先之后（wave-9 首版实现的缺陷）。
+    let mut ancestors: Vec<(u32, NodeId)> = Vec::new();
+    let mut seen: ahash::HashSet<NodeId> = ahash::HashSet::default();
     for &moved_node in &moved {
-        if !tree.is_out_of_flow(moved_node) {
+        // override 节点由树父就地放置 ⇒ 包络已精确，不需要跨界修正。
+        if !tree.is_out_of_flow(moved_node) || tree.layout_override_of(moved_node).is_some() {
             continue;
+        }
+        // 移动节点到根的层数（一次 O(depth) 行走），祖先的真深度由它沿链递减得到。
+        let mut depth = 0;
+        let mut cursor = Some(moved_node);
+        while let Some(current) = cursor {
+            cursor = tree.arena.get(current).and_then(|target| target.parent);
+            if cursor.is_some() {
+                depth += 1;
+            }
         }
         let mut cursor = tree.arena.get(moved_node).and_then(|target| target.parent);
         while let Some(current) = cursor {
-            let Some(target) = tree.arena.get(current) else {
+            depth -= 1;
+            if !seen.insert(current) {
+                // 第一次插入时已经把它**上面**的所有祖先一并登记过，可以停。
                 break;
-            };
-            let mut union = target.layout.bounds;
-            let children = target.children.clone();
-            for child in children {
-                union = union.union(subtree_bounds(tree, child));
             }
-            store_subtree_bounds(tree, current, union);
+            ancestors.push((depth, current));
             cursor = tree.arena.get(current).and_then(|target| target.parent);
         }
+    }
+
+    // 2) 自底向上精确重算（父读到的子包络是本轮的）。
+    ancestors.sort_unstable_by_key(|(depth, _)| std::cmp::Reverse(*depth));
+    for &(_, current) in &ancestors {
+        let Some(target) = tree.arena.get(current) else {
+            continue;
+        };
+        let mut union = target.layout.bounds;
+        let children = target.children.clone();
+        for child in children {
+            union = union.union(subtree_bounds(tree, child));
+        }
+        store_subtree_bounds(tree, current, union);
     }
     tree.recycle(moved);
 }
