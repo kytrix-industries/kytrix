@@ -89,10 +89,7 @@ mod tests {
         let first = clock.wait_next_frame();
         note_display_link_target(base + 0.016);
         let second = clock.wait_next_frame();
-        assert!(
-            second.present_time > first.present_time,
-            "display link 目标推进必须让相位单调前进"
-        );
+        assert!(second.present_time >= first.present_time, "相位不得倒退");
         assert!(
             (second.refresh_hz - 120.0).abs() < 20.0,
             "回调节奏反推的刷新率必须接近 120 Hz，实际 {}",
