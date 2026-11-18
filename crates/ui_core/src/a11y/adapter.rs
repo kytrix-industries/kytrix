@@ -57,8 +57,18 @@ pub(crate) struct A11yBridge {
     seen_bounds_epoch: u32,
     /// 内容整体平移的子树（滚动容器）：子孙 bounds 全变。
     subtrees: SmallVec<[NodeId; 2]>,
-    /// 有 `bind_a11y` 节点被写信号（没有像素要画，但 `refresh_styles` 必须跑一次）。
-    bind_work: bool,
+    /// 待重算 `bind_a11y` 的节点（只有 a11y 绑定的节点被写信号时入队）。
+    ///
+    /// **不进 `dirty_bind`、不跑 paint 管线**（R13-6）：这些节点没有视觉绑定，重算
+    /// `A11yPatch` 不产生像素。帧入口只跑一遍 [`A11yBridge::take_bindings`] 的求值，然后
+    /// 按 a11y-only 帧结算（不重建 lane、不编码、不产生 damage），TreeUpdate 由平台泵在
+    /// 同一轮投递。
+    bindings: Vec<NodeId>,
+    /// `bindings` 的成员集合（去重）：同一批写可能重复命中同一节点。
+    binding_set: ahash::HashSet<NodeId>,
+    /// 本窗口累计的 a11y-only 帧数（仅 `test-support`：`FrameStats` 的断言面）。
+    #[cfg(feature = "test-support")]
+    a11y_only_frames: usize,
     /// 稳定身份分配器（跨帧不变；逻辑行重建后不变）。
     ids: A11yIds,
     /// 上次交付的焦点（已解析到存在的节点）。
@@ -88,7 +98,10 @@ impl A11yBridge {
             bounds_epoch: 0,
             seen_bounds_epoch: 0,
             subtrees: SmallVec::new(),
-            bind_work: false,
+            bindings: Vec::new(),
+            binding_set: ahash::HashSet::default(),
+            #[cfg(feature = "test-support")]
+            a11y_only_frames: 0,
             ids: A11yIds::new(),
             last_focus: None,
             delivered: ahash::HashSet::default(),
@@ -123,19 +136,48 @@ impl A11yBridge {
         self.bounds_epoch = self.bounds_epoch.wrapping_add(1);
     }
 
-    /// 只有 `bind_a11y` 的节点被写信号：记下来让下一帧仍跑 `refresh_styles`（不产生像素）。
-    pub(crate) fn note_bind_work(&mut self) {
-        self.bind_work = true;
+    /// 只有 `bind_a11y` 的节点被写信号：登记一次待重算（去重）。
+    ///
+    /// 返回 `true` = 本次新入队。调用方（`App::invalidate`）据此判断"本批至少脏了一个 owner"。
+    /// **不标 `BIND`/`PAINT`**：这条通道不产生像素，帧入口只重算 patch（R13-6）。
+    pub(crate) fn note_binding_work(&mut self, node: NodeId) -> bool {
+        if self.binding_set.insert(node) {
+            self.bindings.push(node);
+            true
+        } else {
+            false
+        }
     }
 
-    /// 是否有待求值的 a11y 绑定（`refresh_styles` 开头清掉）。
-    pub(crate) fn bind_work(&self) -> bool {
-        self.bind_work
+    /// 是否有待重算的 a11y 绑定（`needs_frame` 的门禁：a11y-only 写仍要出一帧来投递）。
+    pub(crate) fn binding_work(&self) -> bool {
+        !self.bindings.is_empty()
     }
 
-    /// 清掉「a11y 绑定待求值」旗标（`refresh_styles` 的入口处）。
-    pub(crate) fn clear_bind_work(&mut self) {
-        self.bind_work = false;
+    /// 取走本批待重算节点（帧的 a11y 绑定 pass 消费；调用方用
+    /// [`A11yBridge::recycle_bindings`] 归还缓冲）。
+    pub(crate) fn take_bindings(&mut self) -> Vec<NodeId> {
+        self.binding_set.clear();
+        std::mem::take(&mut self.bindings)
+    }
+
+    /// 归还 [`A11yBridge::take_bindings`] 借走的缓冲（容量保留，避免每帧分配）。
+    pub(crate) fn recycle_bindings(&mut self, mut buffer: Vec<NodeId>) {
+        buffer.clear();
+        self.bindings = buffer;
+    }
+
+    /// 记一笔 a11y-only 帧（本窗口累计），返回累计值。
+    #[cfg(feature = "test-support")]
+    pub(crate) fn note_a11y_only_frame(&mut self) -> usize {
+        self.a11y_only_frames += 1;
+        self.a11y_only_frames
+    }
+
+    /// 本窗口累计的 a11y-only 帧数。
+    #[cfg(feature = "test-support")]
+    pub(crate) fn a11y_only_frames(&self) -> usize {
+        self.a11y_only_frames
     }
 
     /// 某个子树的内容整体平移（滚动）：下一笔重发整棵子树。

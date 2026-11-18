@@ -30,6 +30,7 @@ use windows::Win32::{
 use super::{
     WndProcState,
     pump::{A11Y_TIMER_ID, cursor_handle, message_ticks},
+    recovery,
 };
 use crate::platform::{
     dispatcher::{WM_APP_COMPOSITION_WAKE, WM_APP_FRAME_WAKE},
@@ -98,6 +99,32 @@ pub(crate) extern "system" fn wndproc(
             let _ = EndPaint(hwnd, &paint);
             (*state).wake();
             return LRESULT(0);
+        }
+        // ── R07-14：显示 / 电源恢复 ────────────────────────────────────────────
+        //
+        // 显示器拓扑变化（`WM_DISPLAYCHANGE`）、工作区变化（`WM_SETTINGCHANGE` +
+        // `SPI_SETWORKAREA`）与睡眠唤醒（`WM_POWERBROADCAST` 的两个 resume 通知）都会让
+        // **引擎持有的显示派生状态**失效：每窗口 DPI、客户区、交换链关联的显示器。
+        //
+        // 这里只登记 + 唤醒（判定是纯函数 [`recovery::recovery_plan`]）：重新查询显示器、
+        // 重建交换链、全量重绘都在泵的 ②a′ 与 GPU 线程执行 —— 放在 `WndProc` 里会违反
+        // 文件头纪律 1（`SetWindowPos` / 合成调用都会重入本函数）。
+        //
+        // 三条消息都**不**翻译成 `PlatformEvent`：恢复是平台层内部动作，不是应用可见的输入。
+        if recovery::recovery_plan(msg, wparam.0).is_some() {
+            (*state).note_display_recovery();
+            (*state).wake();
+            match msg {
+                // 电源广播的约定：返回 `TRUE` = 已处理（`MSDN power broadcast`）。恢复动作
+                // 已经在上面登记，系统不会重发这条消息，所以这里必须应答。
+                WM_POWERBROADCAST => return LRESULT(1),
+                // 显示变化不交给默认过程：本窗口的全部像素由 DirectComposition 提供
+                // （`WS_EX_NOREDIRECTIONBITMAP`），`DefWindowProcW` 没有可刷新的重定向表面。
+                WM_DISPLAYCHANGE => return LRESULT(0),
+                // 工作区变化继续走下面的外观色 / 滚轮行数路径（同一条消息也可能带着
+                // `ImmersiveColorSet` 的 `lParam`）。
+                _ => {}
+            }
         }
         // 应用主动禁用了本窗口的 IME（自绘搜索框的英文直输等）：输入上下文已经从窗口上摘下，
         // 所有 `WM_IME_*` 一律吞掉 —— 不派发 `ImeEvent`、不写 caret 表单，也不交给

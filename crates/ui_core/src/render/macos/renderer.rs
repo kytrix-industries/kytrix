@@ -8,12 +8,16 @@
 //! CAMetalDisplayLink ── 每 vsync ──┐        → 取完成通知（GPU 计时 / retire）
 //!   delegate: 存 update.drawable   │        → 取呈现通知（presentedTime → 真实呈现时刻）
 //!             + targetPresentation │        → 取最新 drawable + 最新帧
-//!             唤醒 GPU 线程        │        → 目标时刻已过期 ⇒ 跳过本 vsync（R09-6）
-//! 写图层属性（drawableSize/scale） ┘        → 3 槽 semaphore（非阻塞，失败即跳帧）
-//! sync_pacing(continuous)                  → 重建 persist → 录制
-//!                                          → addPresentedHandler（每 drawable 一次）+ presentDrawable:atTime:
+//!             唤醒 GPU 线程        │        → 3 槽 semaphore（非阻塞，失败即跳帧）
+//! 写图层属性（drawableSize/scale） ┘        → 重建 persist → 录制
+//! sync_pacing(continuous)                  → addPresentedHandler（每 drawable 一次）+ presentDrawable:
 //!                                          → addCompletedHandler + commit（立即返回）
 //! ```
+//!
+//! **呈现节奏由 `CAMetalDisplayLink` 独占**：GPU 线程只做 `presentDrawable:`（无时刻参数）。
+//! `presentDrawable:atTime:` 在 display link 提供的 drawable 上会让 `CAMetalDrawable` 抛
+//! `CAMetalDrawableInvalidOperation`，而异常是在驱动调度命令缓冲时才抛的（穿 FFI ⇒ SIGSEGV），
+//! 见 [`crate::render::macos::present`] 的模块文档与 [`GpuRenderer::submit_frame`]。
 //!
 //! 三条硬约束：
 //! - **I1**：主线程只做「加锁拷贝 / 写图层属性 / `setPaused`」，没有 `nextDrawable`、
@@ -71,7 +75,6 @@ use crate::{
             compositor::GpuRenderer,
             core::GpuCore,
             device::{Device, enter_gpu_thread},
-            present::{PresentPacing, PresentPlan},
             queue::InFlight,
             swapchain,
         },
@@ -435,15 +438,18 @@ define_class!(
             _link: &CAMetalDisplayLink,
             update: &CAMetalDisplayLinkUpdate,
         ) {
-            // R09-6：`targetPresentationTimestamp` 是这次 vsync 要求提交的**呈现时刻**
-            // （host time，与 `CACurrentMediaTime()` / `MTLDrawable.presentedTime` 同一时基）。
-            // 提交时必须把它交给 `presentDrawable:atTime:`，否则 CA 自行决定呈现时刻，
-            // commit 晚于层的调度点就被推到下一个 vsync（整整多一帧）。
+            // `targetPresentationTimestamp` 是这次 vsync 被排定的**呈现时刻**（host time，与
+            // `CACurrentMediaTime()` / `MTLDrawable.presentedTime` 同一时基）。它是 display link
+            // 独占的信息：**不能**再交给 `presentDrawable:atTime:`（见 `render/macos/present.rs`），
+            // 只作为合成线程帧时钟的相位来源。
             let target = update.targetPresentationTimestamp();
             // B6-2：同一时刻也交给**合成线程**的帧时钟 —— 合成线程据此对齐出帧相位，并按回调节奏
             // 反推刷新率（`SignaledIntervalClock`）。这是 macOS 时钟源的唯一接线点。
+            //
+            // **只给合成线程用**：GPU 线程的 present 不带时刻（display link 独占呈现时刻，见
+            // `render/macos/present.rs`）。
             crate::render::macos::clock::note_display_link_target(target);
-            self.ivars().shared.publish_drawable(update.drawable(), target);
+            self.ivars().shared.publish_drawable(update.drawable());
         }
     }
 );
@@ -722,17 +728,15 @@ struct SendCommandBuffer(Retained<ProtocolObject<dyn MTLCommandBuffer>>);
 // 交出引用后，只有 GPU 线程持有它。
 unsafe impl Send for SendCommandBuffer {}
 
-/// display link 交给 GPU 线程的一次呈现机会：drawable + 这次 vsync 要求的呈现时刻。
+/// display link 交给 GPU 线程的一次呈现机会：本 vsync 的 drawable。
 ///
-/// 目标时刻来自 `CAMetalDisplayLinkUpdate.targetPresentationTimestamp`（host time，R09-6）。
+/// 呈现时刻**不随 drawable 过线**：它由 display link 独占，GPU 线程只做无时刻的
+/// `presentDrawable:`（见 `render/macos/present.rs`）。
 struct DrawableUpdate {
     drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
-    /// host time（`CACurrentMediaTime()` 时基）。`0.0` = 系统没给（不该发生，按"不可用"处理）。
-    target_presentation: CFTimeInterval,
 }
 
 // SAFETY: Metal 对象本身线程安全；放进最新 drawable 槽之后只有 GPU 线程持有引用。
-// `CFTimeInterval` 是 `f64`，天然可跨线程。
 unsafe impl Send for DrawableUpdate {}
 
 /// 图层的跨线程**保活**句柄（GPU 线程只持有引用，不解引用、不读写任何属性）。
@@ -765,8 +769,7 @@ struct State {
     /// （同一把锁里维护）。
     published_surface: Option<(u32, u32)>,
     atlas: AtlasSlots,
-    /// 最新 drawable 与它被要求呈现的**目标时刻**（display link 每 vsync 覆盖旧的；GPU 线程
-    /// 取走即清空）。目标时刻是 host time（`CACurrentMediaTime()` 时基，R09-6）。
+    /// 最新 drawable（display link 每 vsync 覆盖旧的；GPU 线程取走即清空）。
     drawable: Option<DrawableUpdate>,
     /// 已完成、等 GPU 线程 drain 的命令缓冲（完成回调入队，本队列只增不减）。
     completions: VecDeque<Completion>,
@@ -835,7 +838,10 @@ enum WaitOutcome {
 }
 
 struct Completion {
+    /// 帧序号：只用于反馈 / 诊断（R06-1：它会在 2 年多后饱和）。
     index: FrameIndex,
+    /// 这次提交的 `u64` 提交序号（`Queue::retire` 的键，R06-1）。
+    sequence: u64,
     buffer: SendCommandBuffer,
 }
 
@@ -1050,27 +1056,31 @@ impl Shared {
         self.lock().background.take()
     }
 
-    /// display link delegate（主线程）：把这一帧的 drawable 与它的目标呈现时刻放进最新
-    /// drawable 槽并唤醒 GPU 线程。
-    fn publish_drawable(
-        &self,
-        drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
-        target_presentation: CFTimeInterval,
-    ) {
-        let mut state = self.lock();
-        if state.shutdown || state.terminated {
-            return;
-        }
-        state.drawable = Some(DrawableUpdate {
-            drawable,
-            target_presentation,
-        });
-        drop(state);
+    /// display link delegate（主线程）：把这一帧的 drawable 放进最新 drawable 槽并唤醒 GPU 线程。
+    ///
+    /// **被覆盖的旧 drawable 必须在锁外释放**（P0 死锁，真机 `sample` 现场）：
+    /// `-[CAMetalDrawable release]` 会在 CoreAnimation 内部等图层锁 —— 而呈现路径
+    /// （Metal 的 `CompletionQueueDispatch` → `presentWithOptions:` → 我们的完成/呈现回调）正持着
+    /// 那把锁去等 `Shared::state`。在临界区里 drop drawable 就是标准的锁序反转：主线程
+    /// 持 `state` 等 CA 锁、Metal 回调线程持 CA 锁等 `state`，两边永久等待（实测进程冻结在
+    /// `metal_display_link_needs_update → -[CAMetalDrawable release]`，4–5 分钟后必现）。
+    ///
+    /// 同理，任何 Metal 对象的 `Release` 都不能在 `Shared::state` 的临界区里发生。
+    fn publish_drawable(&self, drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>) {
+        let replaced = {
+            let mut state = self.lock();
+            if state.shutdown || state.terminated {
+                return;
+            }
+            state.drawable.replace(DrawableUpdate { drawable })
+        };
+        // 锁已释放：这里才允许触发 `CAMetalDrawable` 的 Release（见上面的锁序说明）。
+        drop(replaced);
         self.wake();
     }
 
     /// 完成回调（Metal 的任意线程）：入队 + 唤醒 GPU 线程（**不**碰 retire / 计时）。
-    fn push_completion(&self, index: FrameIndex, buffer: SendCommandBuffer) {
+    fn push_completion(&self, index: FrameIndex, sequence: u64, buffer: SendCommandBuffer) {
         let mut state = self.lock();
         // 只丢弃「消费者已经退出」之后的完成通知：`terminated` 之后没有线程会 drain，继续入队
         // 只会泄漏命令缓冲。**不能**在 `shutdown` 时就丢弃 —— 关闭握手正是靠这些通知把在飞帧
@@ -1078,7 +1088,11 @@ impl Shared {
         if state.terminated {
             return;
         }
-        state.completions.push_back(Completion { index, buffer });
+        state.completions.push_back(Completion {
+            index,
+            sequence,
+            buffer,
+        });
         drop(state);
         self.wake();
     }
@@ -1310,8 +1324,6 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, _keep_alive: SendLay
     let mut feedback = FeedbackQueue::new();
     // drawable 与请求尺寸不一致的退化状态（P1；粘性，见 [`SurfaceMismatch`]）。
     let mut surface = SurfaceMismatch::new();
-    // display link 的目标呈现时刻判定（R09-6；纯状态机，见 `render::macos::present`）。
-    let mut pacing = PresentPacing::new();
     // 呈现回调（**每张 drawable 只登记一次**，见 `compositor::PresentedHandlers`）：注册时不知道
     // 未来哪一帧会用这张 drawable，所以只上报「drawable 身份 + presentedTime」；帧序号的配对由
     // [`FeedbackQueue::presented`] 按提交顺序完成。整个 GPU 循环共用这一个回调。
@@ -1373,19 +1385,14 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, _keep_alive: SendLay
         // ① drawable 的实际像素尺寸就是本帧的渲染尺寸（§5.4）。
         let texture = update.drawable.texture();
         let target = (texture.width() as u32, texture.height() as u32);
-        // ② 呈现时刻判定（R09-6）：display link 要求本帧在 `target_presentation` 这一帧上屏。
-        //    已经不够提交（CPU 落后）时**最多跳过一个 vsync** 重新对齐（`MAX_CONSECUTIVE_SKIPS`），
-        //    下一个 vsync 无论如何都提交 —— 旧实现「连跳 2 次再立即呈现」的稳态是每 3 个 vsync
-        //    只提交 1 帧（120 Hz → 40 fps，AR3 §6.2）。
-        //    录制之后还有一次夹紧（`submit_frame` 里用新的 `CACurrentMediaTime()` 判定）：
-        //    录制耗时把目标吃掉时退回「尽快呈现」，不把过期时刻交给 CA。
-        let present_at = match pacing.plan(CACurrentMediaTime(), update.target_presentation) {
-            PresentPlan::Skip => continue,
-            PresentPlan::AtTime(time) => Some(time),
-            PresentPlan::Now => None,
-        };
+        // ② 本 vsync 就是 display link 给出的那次呈现机会：不判定时刻、不跳帧 —— 它给 drawable
+        //    我们就画完尽快呈现（`presentDrawable:`，**不带时刻**，见 `render/macos/present.rs`）。
+        //    旧实现在这里按 `targetPresentationTimestamp` 决定「钉时刻 / 跳过本 vsync」，并把时刻
+        //    交给 `presentDrawable:atTime:` —— 那正是 P0 崩溃（`CAMetalDrawableInvalidOperation`）
+        //    的唯一来源：display link 独占呈现时刻，显式时刻会让 `CAMetalDrawable` 在驱动调度命令
+        //    缓冲时抛 ObjC 异常，穿 FFI ⇒ SIGSEGV。
         // ③ resize 校验（P1）必须在**占槽与取帧之前**：drawable 可能还是上一轮 layout 的产物，
-        //    用它消费最新帧会把最后一帧按旧尺寸画完并 present；此后 pacing 暂停、没有新帧
+        //    用它消费最新帧会把最后一帧按旧尺寸画完并 present；此后没有新帧、没有 vsync
         //    ⇒ 窗口永久停在旧尺寸画面。不一致就丢弃这个 drawable、跳过本 vsync，帧留在最新
         //    帧槽里（`pending=true` 让 display link 保持运行），下一个 vsync 再取新尺寸的 drawable。
         //    连续超过 `MAX_SURFACE_MISMATCHES` 次后进入**粘性**退化：之后每个 vsync 都按 drawable
@@ -1406,9 +1413,9 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, _keep_alive: SendLay
         let degrade = verdict == SurfaceVerdict::Degraded;
         // ④ 三缓冲背压：**非阻塞**；失败就丢掉这个 drawable（帧请求留在槽里，下一个 vsync 再试）。
         //    必须在尺寸校验之后占槽：占槽后放弃会让 semaphore 与 ring 槽位不同源。
-        if !renderer.try_acquire_upload_slot() {
+        let Some(frame_slot) = renderer.try_acquire_upload_slot() else {
             continue;
-        }
+        };
         let Some(request) = shared.take_frame_for_drawable(target, degrade) else {
             // 尺寸在两次加锁之间又变了（新帧发布）：归还槽位，帧留在槽里。
             renderer.release_upload_slot();
@@ -1449,12 +1456,13 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, _keep_alive: SendLay
         let drawable_id = drawable.drawableID();
         let completed = {
             let shared = Arc::clone(&shared);
-            move |buffer| shared.push_completion(index, SendCommandBuffer(buffer))
+            // 完成通知带着本次提交的 u64 序号走：retire 的键不能等回调时再推导（R06-1）。
+            let sequence = frame_slot.signal_value;
+            move |buffer| shared.push_completion(index, sequence, SendCommandBuffer(buffer))
         };
         match renderer.submit_frame(
             &request,
             &update.drawable,
-            present_at,
             &mut frame,
             completed,
             &presented,
@@ -1495,7 +1503,8 @@ fn drain_completions(
 ) -> Result<(), EngineError> {
     for completion in shared.take_completions() {
         let index = completion.index;
-        let (sample, advanced) = renderer.on_frame_completed(index, &completion.buffer.0)?;
+        let (sample, advanced) =
+            renderer.on_frame_completed(index, completion.sequence, &completion.buffer.0)?;
         feedback.complete(index, sample);
         if advanced.is_some() {
             *frontier = advanced;
@@ -1756,8 +1765,7 @@ mod tests {
         );
     }
 
-    /// R09-6 的呈现时刻判定（`PresentPacing` / `clamp_present_time`）是一层纯状态机，
-    /// 单测在 `render/macos/present.rs`（判定点在录制前后各一次，见该模块文件头）。
+    /// display link 的暂停判定：连续帧 / 有未取走的帧请求 / 有在飞帧时必须跑（否则没有 drawable）。
     #[test]
     fn pacing_runs_while_continuous_or_busy() {
         assert!(!pacing_paused(true, false, 0), "连续帧必须跑");
@@ -2174,7 +2182,7 @@ mod tests {
         let buffer = || SendCommandBuffer(queue.commandBuffer().expect("command buffer"));
         shared.request_shutdown();
         shared.in_flight.preset(2);
-        shared.push_completion(index(1), buffer());
+        shared.push_completion(index(1), 1, buffer());
         let completions = shared.take_completions();
         assert_eq!(
             completions.len(),
@@ -2184,7 +2192,7 @@ mod tests {
         assert_eq!(shared.in_flight(), 1, "drain 必须按完成数减少在飞帧");
 
         shared.mark_terminated();
-        shared.push_completion(index(2), buffer());
+        shared.push_completion(index(2), 2, buffer());
         assert!(
             shared.take_completions().is_empty(),
             "terminated 之后不再入队（消费者已退出，继续入队只会泄漏命令缓冲）"

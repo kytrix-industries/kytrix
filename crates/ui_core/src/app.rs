@@ -1626,15 +1626,21 @@ impl App {
         debug::raise_debug_hud(self, window)
     }
 
-    /// P03 的「样式求值 pass」：对指定窗口中**带 `PAINT` 且有 `bind_style`** 的节点求值。
+    /// P03 的「样式求值 pass」：对指定窗口中**带 `BIND`** 的动态节点求值。
     ///
     /// 它做四件事：求值闭包、差分替换依赖、写回 patch、按需升级 `LAYOUT` / 标 `A11Y`。
     /// **不产生任何 Scene 图元**（那是 P06 的 paint 阶段；两者共用本实现的前半段）。
     ///
     /// 返回 `None` = 窗口不存在（P03 的冻结错误表里没有「未知窗口」变体，`Option` 是唯一诚实的表达）。
     /// P11 追加：`bind_a11y` 与另两条动态通道同批求值（同一 `ReadCtx` / `ReadTracker` / 依赖边集）。
+    /// R13-6：**只有** `bind_a11y` 的节点不进 `dirty_bind`，由紧随其后的
+    /// [`App::refresh_a11y_bindings`] 求值 —— 本方法的语义仍是"全部动态属性都已重算"。
     pub fn refresh_styles(&mut self, window: WindowId) -> Option<StylePassReport> {
-        style_pass::refresh_styles(self, window)
+        let report = style_pass::refresh_styles(self, window);
+        if report.is_some() {
+            self.refresh_a11y_bindings(window);
+        }
+        report
     }
 
     /// 注册 a11y 动作的处理器（同 `A11yAction` 后写覆盖）。
@@ -1708,6 +1714,11 @@ impl App {
     /// 闭包不执行 ⇒ 零开销），或由 `test-support` 的捕获路径调用。
     pub(crate) fn a11y_take(&mut self, window: WindowId) -> Option<crate::a11y::A11yTreeSnapshot> {
         a11y::a11y_take(self, window)
+    }
+
+    /// 只重算 `bind_a11y` 的 pass（R13-6）：不标 `BIND`/`PAINT`、不产生任何像素工作。
+    pub(crate) fn refresh_a11y_bindings(&mut self, window: WindowId) {
+        a11y::refresh_a11y_bindings(self, window)
     }
 
     /// 打开/关闭某个窗口的 a11y 快照捕获（`TestApp` 专用）。

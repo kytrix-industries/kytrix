@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use super::recovery;
 use crate::{
     app::App,
     error::EngineError,
@@ -73,6 +74,52 @@ pub(super) fn sync_native_windows(
         changed = true;
     }
     Ok(changed)
+}
+
+/// 消费者：`pump_loop` 的 ②a′ 步骤（R07-14）。
+///
+/// 执行窗口侧登记的显示 / 电源恢复：按 [`recovery::RECOVERY_ACTIONS`] 的顺序
+/// 「重新查询显示器 → 请求 GPU 重建交换链 → 请求一帧全量重绘」。
+///
+/// 判定（消息 → 动作序列）在 `WndProc` 里由纯函数 [`recovery::recovery_plan`] 完成，本函数
+/// 只执行副作用：
+/// - 重建请求是**进程级**的（`render::windows::display` 的代际），每条 GPU 线程各消费一次，
+///   重建后 `FrameSink::reset_epoch` +1 ⇒ UI 整帧重发并清掉本窗口的遮挡退避；
+/// - 最后 `dispatcher.wake()` 让本轮的 ④ 帧门禁放行 —— 恢复必须**立刻**出一帧，否则「重建后
+///   的空目标」会一直挂到下一笔输入。
+///
+/// 返回 `true` = 至少一个窗口执行了恢复（诊断 / 测试用）。
+pub(super) fn apply_display_recovery(
+    app: &mut App,
+    windows: &mut [NativeWindow],
+    dispatcher: &Arc<Dispatcher>,
+) -> bool {
+    let mut requested = false;
+    let mut rebuild_targets = false;
+    for native in windows.iter_mut() {
+        if !native.state_mut().take_display_recovery() {
+            continue;
+        }
+        requested = true;
+        for action in recovery::RECOVERY_ACTIONS {
+            match action {
+                recovery::RecoveryAction::RequeryDisplays => native.requery_display(app),
+                recovery::RecoveryAction::RebuildTargets => rebuild_targets = true,
+                recovery::RecoveryAction::RequestFullRepaint => {
+                    if let Some(window) = app.window_mut(native.id()) {
+                        window.request_repaint();
+                    }
+                }
+            }
+        }
+    }
+    if rebuild_targets {
+        crate::render::windows::display::note_display_change();
+    }
+    if requested {
+        dispatcher.wake();
+    }
+    requested
 }
 
 /// 消费者：`pump_loop` 的 ② 步骤。
@@ -248,4 +295,82 @@ pub(super) fn apply_event(
     };
     app.dispatch(id, app_event);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::apply_display_recovery;
+    use crate::{
+        app::App,
+        platform::{dispatcher::Dispatcher, windows::window::NativeWindow},
+        render::windows::display,
+        window::{FrameOutcome, WindowOptions},
+    };
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+
+    /// R07-14：泵的 ②a′ 恢复步骤必须（a）推进显示代际让 GPU 重建交换链、（b）请求一帧，且
+    /// 这一帧是**全量重绘**（headless 窗口直接结算成 `Committed`；`Idle` 说明全量 damage
+    /// 没被置位），（c）重新查询显示器把平台真值写回 `Window`。
+    #[test]
+    fn a_display_recovery_requeries_the_display_and_requests_a_full_frame() {
+        let runtime = runtime();
+        let mut app = App::new(runtime.handle().clone());
+        let options = WindowOptions::default();
+        let id = app.create_window(options.clone());
+        let dispatcher = Dispatcher::new();
+        let mut native =
+            NativeWindow::create(id, &options, Arc::clone(&dispatcher)).expect("NativeWindow");
+        let _ = dispatcher.take_frame_wake();
+
+        native.state_mut().note_display_recovery();
+        let before_epoch = display::epoch();
+        let mut windows = vec![native];
+        assert!(
+            apply_display_recovery(&mut app, &mut windows, &dispatcher),
+            "有恢复请求时必须执行动作"
+        );
+
+        assert!(
+            display::epoch() > before_epoch,
+            "恢复必须请求 GPU 重建交换链（推进显示代际）"
+        );
+        assert!(dispatcher.take_frame_wake(), "恢复必须请求一帧");
+
+        let outcome = app.frame(id).expect("window").expect("frame");
+        assert!(
+            matches!(outcome, FrameOutcome::Committed(_)),
+            "恢复后的第一帧必须是全量重绘，实际 {outcome:?}"
+        );
+        let window = app.window(id).expect("window");
+        assert_eq!(window.scale(), windows[0].scale(), "必须重新查询显示器 DPI");
+        assert_eq!(
+            window.size(),
+            windows[0].logical_size(),
+            "必须重新查询客户区尺寸"
+        );
+    }
+
+    /// 没有恢复请求时步骤必须是 no-op（否则每个泵轮次都会重建一次交换链）。
+    #[test]
+    fn a_pump_round_without_a_display_recovery_does_nothing() {
+        let runtime = runtime();
+        let mut app = App::new(runtime.handle().clone());
+        let options = WindowOptions::default();
+        let id = app.create_window(options.clone());
+        let dispatcher = Dispatcher::new();
+        let native = NativeWindow::create(id, &options, Arc::clone(&dispatcher)).expect("window");
+        let _ = dispatcher.take_frame_wake();
+
+        let mut windows = vec![native];
+        assert!(!apply_display_recovery(&mut app, &mut windows, &dispatcher));
+        assert!(!dispatcher.take_frame_wake(), "没有请求时不得唤醒一帧");
+    }
 }

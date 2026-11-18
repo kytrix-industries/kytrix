@@ -21,10 +21,12 @@ use windows::Win32::{
         WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, GWLP_USERDATA, GetWindowRect, HTBOTTOMRIGHT, HTCAPTION,
             HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON, HTMINBUTTON, HTSYSMENU, HTTOPLEFT,
-            RegisterClassW, SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SendMessageW, SetWindowLongPtrW,
-            WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_IME_CHAR, WM_IME_COMPOSITION,
-            WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_INPUTLANGCHANGE, WM_LBUTTONDOWN,
-            WM_MOUSEMOVE, WM_NCHITTEST, WM_SIZE, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+            PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, RegisterClassW, SM_CXPADDEDBORDER,
+            SM_CXSIZEFRAME, SPI_SETANIMATION, SPI_SETWORKAREA, SendMessageW, SetWindowLongPtrW,
+            WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_DISPLAYCHANGE, WM_IME_CHAR,
+            WM_IME_COMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_INPUTLANGCHANGE,
+            WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCHITTEST, WM_POWERBROADCAST, WM_SETTINGCHANGE,
+            WM_SIZE, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
         },
     },
 };
@@ -310,6 +312,82 @@ fn only_the_a11y_timer_wakes_a_frame() {
         SendMessageW(hwnd, WM_TIMER, Some(WPARAM(A11Y_TIMER_ID + 1)), None);
     }
     assert!(!dispatcher.take_frame_wake(), "非 a11y 定时器不得唤醒帧");
+    destroy_hidden_window(hwnd, state);
+}
+
+/// R07-14 回归：显示 / 电源消息必须登记一次恢复并唤醒泵，且**不**翻译成平台事件
+/// （恢复是平台层内部动作，应用层不该看到假输入）；准备挂起与无关设置项不触发恢复。
+#[test]
+fn display_and_power_messages_mark_one_pending_display_recovery() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, _class) =
+        hidden_window("KytrixWndProcDisplayRecovery", Arc::clone(&dispatcher));
+    let _ = dispatcher.take_frame_wake();
+    // SAFETY: `state` 由 `hidden_window` 分配；窗口存活到 `destroy_hidden_window`。
+    let raw = unsafe { &mut *state };
+    let _ = raw.take_events();
+
+    // 显示器拓扑变化：登记恢复 + 唤醒帧；不交给默认过程（回 0）。
+    // SAFETY: 窗口由本测试创建且仍存活；`SendMessageW` 同步进入生产 `wndproc`。
+    let result = unsafe { SendMessageW(hwnd, WM_DISPLAYCHANGE, None, None) };
+    assert_eq!(result.0, 0, "WM_DISPLAYCHANGE 必须返回 0");
+    assert!(raw.take_display_recovery(), "拓扑变化必须登记恢复");
+    assert!(dispatcher.take_frame_wake(), "拓扑变化必须唤醒一帧");
+
+    // 睡眠唤醒：电源广播的约定是返回 `TRUE`。
+    // SAFETY: 同上。
+    let result = unsafe {
+        SendMessageW(
+            hwnd,
+            WM_POWERBROADCAST,
+            Some(WPARAM(PBT_APMRESUMEAUTOMATIC as usize)),
+            None,
+        )
+    };
+    assert_eq!(result.0, 1, "恢复广播必须应答 TRUE");
+    assert!(raw.take_display_recovery(), "睡眠唤醒必须登记恢复");
+    assert!(dispatcher.take_frame_wake(), "睡眠唤醒必须唤醒一帧");
+
+    // 准备挂起不是恢复：不登记。
+    // SAFETY: 同上。
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_POWERBROADCAST,
+            Some(WPARAM(PBT_APMSUSPEND as usize)),
+            None,
+        );
+    }
+    assert!(!raw.take_display_recovery(), "PBT_APMSUSPEND 不得登记恢复");
+
+    // 工作区变化（任务栏 / 停靠栏）：登记恢复。
+    // SAFETY: 同上。
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_SETTINGCHANGE,
+            Some(WPARAM(SPI_SETWORKAREA.0 as usize)),
+            None,
+        );
+    }
+    assert!(raw.take_display_recovery(), "工作区变化必须登记恢复");
+
+    // 无关设置项（动画开关）：不登记 —— 主题变化不值得重建交换链。
+    // SAFETY: 同上。
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_SETTINGCHANGE,
+            Some(WPARAM(SPI_SETANIMATION.0 as usize)),
+            None,
+        );
+    }
+    assert!(!raw.take_display_recovery(), "无关设置项不得登记恢复");
+    assert!(
+        raw.take_events().is_empty(),
+        "恢复消息不得产生平台事件（应用层看不到显示恢复）"
+    );
     destroy_hidden_window(hwnd, state);
 }
 

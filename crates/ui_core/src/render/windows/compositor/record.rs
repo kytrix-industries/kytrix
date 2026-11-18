@@ -117,18 +117,11 @@ pub(super) fn prime_detached(
             buckets: &mut buckets,
             prime: true,
         };
-        recorder.record(
-            slot,
-            FrameIndex::default(),
-            &payload,
-            &mut frame,
-            &mut timings,
-            Instant::now(),
-        )?
+        recorder.record(slot, &payload, &mut frame, &mut timings, Instant::now())?
     };
     renderer
         .stream
-        .submit(FrameIndex::default(), slot)
+        .submit(slot)
         .map_err(|error| renderer.classify(error))?;
     match swapchain.present1(recorded.present.as_ref(), 0) {
         PresentOutcome::Presented | PresentOutcome::Clipped | PresentOutcome::Occluded => {}
@@ -227,17 +220,17 @@ pub(super) fn submit_recorded(
                 buckets: &mut renderer.op_buckets,
                 prime: false,
             };
-            recorder.record(slot, index, payload, frame, timings, frame_started)
+            recorder.record(slot, payload, frame, timings, frame_started)
         }
         .map_err(|error| renderer.classify(error))?;
 
         renderer
             .stream
-            .submit(index, slot)
+            .submit(slot)
             .map_err(|error| renderer.classify(error))?;
-        renderer.last_index = index;
+        renderer.last_sequence = slot.signal_value;
         for handle in staging_retired {
-            renderer.stream.retire(index, handle);
+            renderer.stream.retire(slot.signal_value, handle);
         }
         return Ok((recorded, slot));
     }
@@ -248,7 +241,6 @@ pub(super) fn submit_recorded(
 pub(super) fn record(
     recorder: &mut FrameRecorder<'_>,
     slot: FrameSlot,
-    index: FrameIndex,
     payload: &FramePayload,
     frame: &mut FramePlan,
     timings: &mut FrameTimings,
@@ -263,7 +255,7 @@ pub(super) fn record(
             recorder.mirror,
             recorder.shared,
             recorder.stream,
-            index,
+            slot.signal_value,
             slot.index,
             payload,
         )?;
@@ -519,10 +511,10 @@ pub(super) fn record(
     if !recorder.prime {
         recorder.geometry.retain_recent(&mut geometry_retired);
         for handle in atlas_retired {
-            recorder.stream.retire(index, handle);
+            recorder.stream.retire(slot.signal_value, handle);
         }
         for handle in geometry_retired {
-            recorder.stream.retire(index, handle);
+            recorder.stream.retire(slot.signal_value, handle);
         }
     }
 

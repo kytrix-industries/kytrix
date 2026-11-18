@@ -370,6 +370,48 @@ impl NativeWindow {
         );
     }
 
+    /// 重新查询显示器信息并写回 `App` 窗口（R07-14）。
+    ///
+    /// 消费者：`native_window::apply_display_recovery`（显示器拓扑变化 / 工作区变化 / 睡眠
+    /// 唤醒）。引擎持有的显示派生状态只有两项：**本窗口所在显示器的 DPI**
+    /// （`GetDpiForWindow`）与**客户区几何**（`GetClientRect`）—— 两者是布局与渲染目标的输入，
+    /// 睡眠唤醒或拔插显示器之后它们可能已经被系统改掉，而 `WM_DPICHANGED` / `WM_SIZE` 不保证
+    /// 补发（同尺寸换屏、窗口被系统搬走、唤醒后系统只发一条 `WM_DISPLAYCHANGE`）。
+    ///
+    /// 写回顺序与 `WM_DPICHANGED` 的路径一致（`native_window::apply_event`）：先 `set_scale`
+    /// （布局 + 全量 damage + 文本重新 shape），再 `set_size` / `set_surface`（渲染目标）。
+    /// 最小化时客户区是 0×0，只更新比例，目标保持上一次真实值（由恢复后的 `WM_SIZE` 覆盖）。
+    pub(crate) fn requery_display(&mut self, app: &mut App) {
+        let dpi = dpi::window_dpi(self.hwnd);
+        // 非法 DPI（0 / 非有限）：保留旧值，等下一次 `WM_DPICHANGED` 纠正。
+        let Some(scale) = dpi::scale_from_dpi(dpi) else {
+            return;
+        };
+        if scale != self.scale {
+            // 同步 `WndProcState` 的 DPI（`WM_GETMINMAXINFO` / 同批事件换算读它），并清掉旧
+            // DPI 下的 IME caret hint（恢复后重发）。
+            self.note_scale(scale, dpi);
+        }
+        let Some(window) = app.window_mut(self.id) else {
+            return;
+        };
+        // 比例以**平台真值 vs `Window` 现值**比较：拓扑变化不一定改 DPI，而 `set_scale`
+        // 会整树重排 + 全部文本重新 shape，不该白付这份代价（同值不写）。
+        if window.scale() != scale {
+            window.set_scale(scale);
+        }
+        if self.is_minimized() {
+            return;
+        }
+        let client = self.client_size();
+        self.note_client_resize(scale, client);
+        window.set_size(Size::new(
+            scale.to_logical(client.0 as f32),
+            scale.to_logical(client.1 as f32),
+        ));
+        window.set_surface(client);
+    }
+
     /// 销毁窗口（幂等；`Drop` 也会调）。
     pub(crate) fn destroy(&mut self) {
         if self.hwnd.is_invalid() {
@@ -465,7 +507,7 @@ mod tests {
     use super::NativeWindow;
     use crate::{
         app::App,
-        math::{Rect, Scale},
+        math::{Rect, Scale, Size},
         platform::dispatcher::Dispatcher,
         window::WindowOptions,
     };
@@ -549,6 +591,38 @@ mod tests {
         assert!(
             native.state_mut().ime_enabled(),
             "destroy 必须先恢复 IME 关联状态，否则 HIMC 泄漏"
+        );
+    }
+
+    /// R07-14：恢复路径必须把**当前**显示器信息（DPI + 客户区）写回 `App` 窗口 —— 这是
+    /// 「重新查询显示器」这一步的全部意义：睡眠唤醒 / 拓扑变化之后 `Window` 里的旧值不可信。
+    #[test]
+    fn requery_display_writes_the_live_scale_and_client_size_back() {
+        let runtime = runtime();
+        let mut app = App::new(runtime.handle().clone());
+        let options = WindowOptions::default();
+        let id = app.create_window(options.clone());
+        let mut native =
+            NativeWindow::create(id, &options, Dispatcher::new()).expect("NativeWindow::create");
+
+        // 故意把 App 侧写成与平台不一致的值：恢复必须把它纠回平台真值。
+        {
+            let window = app.window_mut(id).expect("window");
+            window.set_scale(Scale::new(3.0).expect("scale"));
+            window.set_size(Size::new(1.0, 1.0));
+        }
+        native.requery_display(&mut app);
+
+        let window = app.window(id).expect("window");
+        assert_eq!(
+            window.scale(),
+            native.scale(),
+            "恢复必须重新查询显示器 DPI 并写回比例"
+        );
+        assert_eq!(
+            window.size(),
+            native.logical_size(),
+            "恢复必须重新查询客户区并写回逻辑尺寸"
         );
     }
 }

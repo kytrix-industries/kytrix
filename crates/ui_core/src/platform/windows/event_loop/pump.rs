@@ -27,19 +27,18 @@ use windows::Win32::{
     Foundation::HWND,
     System::SystemInformation::GetTickCount64,
     UI::{
-        HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
         Input::KeyboardAndMouse::{GetCapture, GetDoubleClickTime, ReleaseCapture, SetCapture},
         WindowsAndMessaging::*,
     },
 };
 
-use super::native_window::{collect_events, sync_native_windows};
+use super::native_window::{apply_display_recovery, collect_events, sync_native_windows};
 use crate::{
     app::App,
     error::EngineError,
     platform::{
         dispatcher::Dispatcher,
-        windows::{composition, frame_clock::FrameClock, window::NativeWindow},
+        windows::{composition, dpi_awareness, frame_clock::FrameClock, window::NativeWindow},
     },
     render::backend::Renderer,
     window::{Window, WindowId, WindowOptions},
@@ -171,14 +170,6 @@ pub(super) fn cursor_handle(cursor: crate::paint::style::Cursor) -> HCURSOR {
     };
     // SAFETY: `LoadCursorW` 取共享的系统光标句柄（不拥有、不释放）；`id` 是本函数的静态常量。
     unsafe { LoadCursorW(None, id) }.unwrap_or_default()
-}
-
-/// 消费者：`run`。
-/// 启动时声明 DPI 感知：per-monitor v2（`WM_DPICHANGED` 才带每屏 DPI）。
-pub(super) fn install_dpi_awareness() {
-    // 失败通常意味着清单/宿主已经设过 awareness（返回 `ERROR_ACCESS_DENIED`）：沿用现有设置。
-    // SAFETY: 无参数指针的进程级设置；必须在创建任何窗口之前调用。
-    let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 }
 
 /// 消费者：`pump_loop` 的 ②c 与 `plan_release_capture`。
@@ -341,7 +332,9 @@ fn pace(stop: Arc<AtomicBool>, hwnd: isize, dispatcher: Arc<Dispatcher>) {
 /// 消费者：`platform::windows` 的 `pub(crate) use event_loop::run`。
 /// 引擎自有事件循环：建窗口 → 挂渲染器 → 显示 → 泵 → 关闭。
 pub(crate) fn run(mut app: App) -> Result<(), EngineError> {
-    install_dpi_awareness();
+    // R07-1：进程清单（`ui_core.manifest.xml`）声明 PerMonitorV2，启动再**校验实际值** ——
+    // 清单可能被宿主忽略；不是 per-monitor v2 就带诊断失败，绝不静默按 96 dpi 排版。
+    dpi_awareness::install()?;
     install_input_thresholds(&mut app);
     let dispatcher = app.dispatcher();
     // 线程消息兜底的目标：首窗关闭后 `PostMessageW` 会失败，`wake()` 必须还能叫醒 `GetMessageW`。
@@ -448,6 +441,12 @@ pub(super) fn pump_loop(
             retarget_wake(windows, dispatcher);
         }
         collect_events(app, windows, dispatcher)?;
+
+        // ②a′ 显示 / 电源恢复（R07-14）：显示器拓扑 / 工作区 / 睡眠唤醒之后重新查询显示器
+        // 信息，请求 GPU 重建交换链（⇒ 下一帧 `reset_epoch` 整帧重发 + 清遮挡退避），并保证
+        // 本轮的 ④ 帧门禁放行一帧全量重绘。放在平台事件之后：同批到达的 `WM_SIZE` /
+        // `WM_DPICHANGED` 已经把尺寸与比例写进 `App`，这里查到的值覆盖它们。
+        apply_display_recovery(app, windows, dispatcher);
 
         // ②b GPU 线程反馈：设备丢失 / 呈现失败是粘性的，在这里冒泡出去（三平台统一）。
         app.poll_renderers()?;

@@ -1,39 +1,20 @@
 //! 延迟销毁队列（`design/phase-08-d3d12.md` §4.3 / §8；主设计 §2.7 的共享状态机，I4）。
 //!
-//! 平台无关：只记账「哪些句柄活到哪一帧」。真正的 `drop` 由后端通过 `free` 回调完成
+//! 平台无关：只记账「哪些句柄活到哪一次提交完成」。真正的 `drop` 由后端通过 `free` 回调完成
 //! （单态泛型，不做 trait object 分派）。
 //!
-//! **键是 `u64` 不是 `FrameIndex`**（R06-1 / R11-1）：`FrameIndex` 是 UI 侧的 `u32` 提交序号，
-//! 60 fps 约 2.27 年、120 fps 约 1.13 年就会饱和；饱和后同一帧号代表所有后续帧，队列会退化为
-//! 「立刻释放」。Vulkan 的后端已经有一条自己的 `u64` 提交序号（timeline 的 signal 值，见
-//! `render::frame::InFlightRing`），retire 必须按它记账，而不是按 UI 帧号。Windows / macOS 仍按
-//! `FrameIndex`（D3D12 的 fence 值同样来自提交序号，两者当前一致），因此键用
-//! [`RetireKey`] 泛化：两种键都直接比较大小，不需要调用方转换或新增状态。
+//! **键是 `u64` 提交序号，三端一致**（R06-1 / R11-1）：
+//! - Linux：timeline 的 signal 值（`FrameSlot::signal_value`）；
+//! - Windows：`ID3D12Fence`（本窗口提交流的 fence）的 signal 值；
+//! - macOS：`InFlightRing` 的 `FrameSlot::signal_value`（提交计数，Metal 没有 fence）。
+//!
+//! 三者都是「由提交驱动、每提交一次递增」的 `u64`，队列直接比较它们即可。
+//!
+//! **为什么不用 `FrameIndex`**：它是 UI 侧的 `u32` 提交序号，60 fps 约 2.27 年、120 fps 约 1.13 年
+//! 就会饱和；饱和后同一个帧号代表所有后续帧，`on_completed(MAX)` 会把仍在飞的句柄一起放掉 ——
+//! 「按帧延迟释放」退化成「立刻释放」（use-after-free）。`FrameIndex` 现在只作为反馈 / 诊断标签。
 
 use std::collections::VecDeque;
-
-use crate::window::FrameIndex;
-
-/// retire 队列的键：`u64` 提交序号或 UI 侧的 [`FrameIndex`]。
-///
-/// 存在的唯一理由：Linux 的完成判据是 timeline 的 `u64` signal 值（提交序号），Windows / macOS
-/// 用 `FrameIndex`。两者都是「单调递增的完成点」，队列只需要能比较大小。
-pub(crate) trait RetireKey: Copy + Ord {
-    /// 原始键值（诊断 / 测试）。
-    fn key(self) -> u64;
-}
-
-impl RetireKey for u64 {
-    fn key(self) -> u64 {
-        self
-    }
-}
-
-impl RetireKey for FrameIndex {
-    fn key(self) -> u64 {
-        u64::from(self.get())
-    }
-}
 
 /// 后端定义的资源句柄。
 ///
@@ -80,9 +61,8 @@ impl RetireQueue {
         }
     }
 
-    /// 在 `at` 仍在使用 → 该提交完成前不得释放。
-    pub(crate) fn retire(&mut self, at: impl RetireKey, handle: GpuResourceHandle) {
-        let at = at.key();
+    /// 在 `at`（提交序号）仍在使用 → 该提交完成前不得释放。
+    pub(crate) fn retire(&mut self, at: u64, handle: GpuResourceHandle) {
         if let Some((last, _)) = self.frames.back()
             && *last == at
         {
@@ -99,10 +79,10 @@ impl RetireQueue {
     /// 返回本次释放的句柄数。
     pub(crate) fn on_completed(
         &mut self,
-        completed: impl RetireKey,
+        completed: u64,
         free: &mut impl FnMut(GpuResourceHandle),
     ) -> usize {
-        self.completed = completed.key();
+        self.completed = completed;
         let mut released = 0;
         while let Some((frame, _)) = self.frames.front() {
             if *frame > self.completed {
@@ -151,10 +131,6 @@ mod tests {
     use super::{GpuResourceHandle, RetireQueue};
     use crate::window::FrameIndex;
 
-    fn index(value: u32) -> FrameIndex {
-        FrameIndex::from_raw(value)
-    }
-
     fn handle(index: u32) -> GpuResourceHandle {
         GpuResourceHandle::new(1, index % 4, index)
     }
@@ -168,66 +144,65 @@ mod tests {
     }
 
     #[test]
-    fn nothing_is_released_before_its_frame_completes() {
+    fn nothing_is_released_before_its_submission_completes() {
         let mut queue = RetireQueue::new();
-        queue.retire(index(3), handle(1));
+        queue.retire(3, handle(1));
         let mut freed = Vec::new();
-        assert_eq!(queue.on_completed(index(2), &mut |h| freed.push(h)), 0);
+        assert_eq!(queue.on_completed(2, &mut |h| freed.push(h)), 0);
         assert!(freed.is_empty());
         assert_eq!(queue.pending(), 1);
     }
 
     #[test]
-    fn releases_at_and_before_the_completed_frame() {
+    fn releases_at_and_before_the_completed_sequence() {
         let mut queue = RetireQueue::new();
-        queue.retire(index(1), handle(1));
-        queue.retire(index(2), handle(2));
-        queue.retire(index(3), handle(3));
+        queue.retire(1, handle(1));
+        queue.retire(2, handle(2));
+        queue.retire(3, handle(3));
 
         let mut freed = Vec::new();
-        assert_eq!(queue.on_completed(index(2), &mut |h| freed.push(h)), 2);
+        assert_eq!(queue.on_completed(2, &mut |h| freed.push(h)), 2);
         assert_eq!(freed, vec![handle(1), handle(2)]);
         assert_eq!(queue.pending(), 1);
     }
 
     #[test]
-    fn handles_at_the_same_frame_are_batched_in_order() {
+    fn handles_at_the_same_commit_point_are_batched_in_order() {
         let mut queue = RetireQueue::new();
-        queue.retire(index(5), handle(7));
-        queue.retire(index(5), handle(8));
+        queue.retire(5, handle(7));
+        queue.retire(5, handle(8));
         assert_eq!(queue.pending(), 2);
 
         let mut freed = Vec::new();
-        queue.on_completed(index(5), &mut |h| freed.push(h));
+        queue.on_completed(5, &mut |h| freed.push(h));
         assert_eq!(freed, vec![handle(7), handle(8)]);
         assert_eq!(queue.pending(), 0);
-        assert_eq!(queue.completed(), 5, "完成点记的是原始键值");
+        assert_eq!(queue.completed(), 5, "完成点记的是提交序号本身");
     }
 
     #[test]
-    fn skipped_frame_indices_do_not_block_retirement() {
+    fn skipped_sequences_do_not_block_retirement() {
         // 提交序号 1、3、5（2、4 被跳过：没有 GPU 工作，也就不会出现在完成通知里）。
         let mut queue = RetireQueue::new();
-        for frame in [1, 3, 5] {
-            queue.retire(index(frame), handle(frame));
+        for sequence in [1, 3, 5] {
+            queue.retire(sequence, handle(sequence as u32));
         }
 
         // 完成通知只报「真正提交过」的最大序号 4（§4.3：completed 直接跨过被跳过的序号）。
         let mut freed = Vec::new();
-        assert_eq!(queue.on_completed(index(4), &mut |h| freed.push(h)), 2);
+        assert_eq!(queue.on_completed(4, &mut |h| freed.push(h)), 2);
         assert_eq!(freed, vec![handle(1), handle(3)]);
         assert_eq!(queue.pending(), 1, "5 的句柄不得提前释放");
 
-        assert_eq!(queue.on_completed(index(5), &mut |h| freed.push(h)), 1);
+        assert_eq!(queue.on_completed(5, &mut |h| freed.push(h)), 1);
         assert_eq!(freed, vec![handle(1), handle(3), handle(5)]);
         assert_eq!(queue.pending(), 0);
     }
 
-    /// R06-1 / R11-1：Linux 用 `u64` 提交序号（timeline 的 signal 值）记账，**与 `FrameIndex`
-    /// 无关**。这里提交序号取 `u64::MAX` 附近：`FrameIndex` 在这个量级早已饱和（全帧同号），
-    /// 而队列仍必须按序号逐次释放（饱和会让「按帧延迟释放」退化成「立刻释放」）。
+    /// `u64` 序列在 `u64::MAX` 附近仍然逐次推进（`u64` 的饱和在此后端寿命内不可达，但不能依赖
+    /// 「序号很小」这个假设做边界处理）。
     #[test]
-    fn u64_sequences_retire_independently_of_frame_indices() {
+    fn sequences_near_u64_max_retire_in_submission_order() {
         let mut queue = RetireQueue::new();
         let base = u64::MAX - 3;
         for offset in 0..3u64 {
@@ -249,27 +224,43 @@ mod tests {
         assert_eq!(queue.pending(), 0);
     }
 
-    /// 两种键共用同一套 FIFO / 批量规则：混合提交（先 `FrameIndex` 后 `u64`）也按值排序，
-    /// 后端切换记账来源不会破坏「先入先出」。
+    /// R06-1：**帧序号饱和后 retire 不退化**。
+    ///
+    /// 三帧的 `FrameIndex` 已经饱和（60 fps 约 2.27 年后每帧都是同一个 `u32::MAX`），而后端的
+    /// 提交序号仍是三个不同的 `u64`（这里取在 `u32` 范围之外）。队列按提交序号记账，因此三个
+    /// 提交点各自独立释放；若键还是 `FrameIndex`，三帧会塌成同一个键，一次 `on_completed` 就把
+    /// 仍在 GPU 上读着的句柄全放掉。
     #[test]
-    fn both_key_kinds_share_the_same_ordering_rules() {
+    fn saturated_frame_indices_do_not_degrade_retirement() {
         let mut queue = RetireQueue::new();
-        queue.retire(index(2), handle(1));
-        queue.retire(3u64, handle(2));
-        queue.retire(index(4), handle(3));
-        assert_eq!(queue.pending(), 3);
+        // 饱和后的帧号：三帧完全相同。它现在只是反馈 / 诊断标签，队列不接收它。
+        let saturated = FrameIndex::from_raw(u32::MAX);
+        assert_eq!(saturated.get(), u32::MAX);
+        // 真实提交序号：后端自己的 u64 计数器（fence / timeline / ring 的 signal 值）。
+        let base = u64::from(u32::MAX) + 1;
+        for offset in 0..3u64 {
+            queue.retire(base + offset, handle(offset as u32));
+        }
 
         let mut freed = Vec::new();
-        assert_eq!(queue.on_completed(3u64, &mut |h| freed.push(h)), 2);
-        assert_eq!(freed, vec![handle(1), handle(2)]);
-        assert_eq!(queue.pending(), 1);
+        assert_eq!(
+            queue.on_completed(base, &mut |h| freed.push(h)),
+            1,
+            "饱和帧号不能把三个提交点压成一个"
+        );
+        assert_eq!(freed, vec![handle(0)]);
+        assert_eq!(queue.pending(), 2, "后两个提交的句柄仍在飞");
+        assert_eq!(queue.on_completed(base + 1, &mut |h| freed.push(h)), 1);
+        assert_eq!(queue.on_completed(base + 2, &mut |h| freed.push(h)), 1);
+        assert_eq!(freed, vec![handle(0), handle(1), handle(2)]);
+        assert_eq!(queue.pending(), 0);
     }
 
     #[test]
     fn empty_queue_is_stable() {
         let mut queue = RetireQueue::new();
         assert_eq!(queue.pending(), 0);
-        assert_eq!(queue.on_completed(index(1), &mut |_| unreachable!()), 0);
+        assert_eq!(queue.on_completed(1, &mut |_| unreachable!()), 0);
         assert_eq!(queue.pending(), 0);
     }
 }

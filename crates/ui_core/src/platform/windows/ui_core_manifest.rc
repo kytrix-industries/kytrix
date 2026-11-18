@@ -1,0 +1,8 @@
+// ui_core 的进程清单资源（R07-1）。
+//
+// ID 必须是 1（`CREATEPROCESS_MANIFEST_RESOURCE_ID`）：其它 ID 的资源不会被系统当作进程清单，
+// 而构建仍然会成功 —— `build.rs` 因此对 `1 RT_MANIFEST` 这条锚点做静态校验。
+//
+// 清单内容见 `ui_core.manifest.xml`（同一目录；构建脚本把该目录传给 rc.exe 的 /I）。
+#define RT_MANIFEST 24
+1 RT_MANIFEST "ui_core.manifest.xml"

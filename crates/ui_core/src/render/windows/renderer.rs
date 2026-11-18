@@ -83,6 +83,7 @@ use crate::{
             compositor::{FrameSubmitError, GpuRenderer, enter_gpu_thread},
             device::init_error_from,
             diagnostics::Diagnostics,
+            display,
             queue::WaitOutcome,
         },
     },
@@ -604,10 +605,10 @@ struct Shared {
     thread: u32,
     /// 最近一次**完成 present** 的内容尺寸（`width << 32 | height`；`Acquire`/`Release` 配对）。
     presented: AtomicU64,
-    /// 渲染器重建代际（设备恢复 / 新渲染器挂上 ⇒ +1）。
+    /// 渲染器重建代际（设备恢复 / 显示恢复 / 新渲染器挂上 ⇒ +1）。
     ///
-    /// GPU 线程在重建实例镜像之后 +1，UI 线程每帧通过 [`FrameSink::reset_epoch`] 读它；值变了
-    /// ⇒ UI 必须整帧重发实例缓冲（AR4 P1-1：镜像已被清空，增量载荷补不满它）。
+    /// GPU 线程在重建之后 +1，UI 线程每帧通过 [`FrameSink::reset_epoch`] 读它；值变了
+    /// ⇒ UI 必须整帧重发实例缓冲（AR4 P1-1：镜像可能已被清空，增量载荷补不满它）。
     reset_epoch: AtomicU64,
     /// 两次唤醒都失败时的兜底标记：UI 线程在泵的几何 pass 里消费它并重算一次几何。
     composition_pending: AtomicBool,
@@ -778,11 +779,15 @@ impl Shared {
         }
     }
 
-    /// 渲染器重建（设备恢复 / 新渲染器挂上）：代际 +1。
+    /// 渲染器重建（设备恢复 / 显示拓扑恢复 / 新渲染器挂上）：代际 +1。
     ///
-    /// 调用点在 [`gpu_loop`] 的恢复成功分支：`recover()` 已经把 GPU 侧的 `InstanceMirror` 重建
-    /// 为空，UI 侧必须从下一帧开始整帧重发实例缓冲（[`FrameSink::reset_epoch`] 的握手）。
-    /// `AcqRel`：与 UI 线程的 `Acquire` 读配对，保证「代际可见」晚于「镜像已重建」。
+    /// 调用点在 [`gpu_loop`] 的两处重建分支：
+    /// - 设备恢复：`recover()` 已经把 GPU 侧的 `InstanceMirror` 重建为空，UI 侧必须从下一帧
+    ///   开始整帧重发实例缓冲（[`FrameSink::reset_epoch`] 的握手）；
+    /// - 显示 / 电源恢复（R07-14）：`rebuild_target` 重建了交换链与持久目标，同样让 UI 整帧
+    ///   重发，恢复后的第一帧因此不依赖任何帧前状态。
+    ///
+    /// `AcqRel`：与 UI 线程的 `Acquire` 读配对，保证「代际可见」晚于「镜像/目标已重建」。
     fn note_renderer_rebuilt(&self) {
         self.reset_epoch.fetch_add(1, Ordering::AcqRel);
     }
@@ -971,6 +976,82 @@ fn gpu_loop(renderer: GpuRenderer, shared: Arc<Shared>) {
     guard.disarm();
 }
 
+/// GPU 线程本地的显示 / 电源恢复状态（R07-14）。
+///
+/// 代际是进程级的单调信号，失败重试与它绑定：**换代际就重新计数**，避免「几次互不相关的
+/// 拓扑变化各失败一次」被累加成一次粘性错误。
+struct DisplayRecovery {
+    /// 已成功消费的代际。
+    seen: u64,
+    /// 正在重建的代际（`None` = 没有进行中的恢复）。
+    pending: Option<u64>,
+    /// `pending` 代际的连续失败次数。
+    attempts: u32,
+}
+
+impl DisplayRecovery {
+    fn new() -> Self {
+        Self {
+            seen: display::epoch(),
+            pending: None,
+            attempts: 0,
+        }
+    }
+}
+
+/// 显示 / 电源恢复（R07-14）：消费平台层推进的代际，重建本窗口的目标并让 UI 整帧重发。
+///
+/// 返回 `true` = 已清掉遮挡退避：调用方把**恢复后的第一帧**放行（唤醒后必须出帧，不能被
+/// 「不可见 / 被遮挡」的跳过逻辑永久挡住）。
+///
+/// 代际只在重建成功后推进：`rebuild_target` 返回 `false`（设备健康但还有在飞工作）时保持
+/// 未消费，下一轮重试，恢复不会丢。
+///
+/// 设备健康但目标**暂时**建不起来（唤醒 / 显示模式切换进行中）不退出应用：退避后重试，最多
+/// [`DISPLAY_REBUILD_ATTEMPTS`] 次；只有 `GetDeviceRemovedReason()` 判定真的丢了设备才立刻
+/// 冒泡（⇒ GPU 循环走既有的 `GpuCell::recover`），或重试耗尽后按粘性错误上报。
+fn recover_display_change(
+    renderer: &mut GpuRenderer,
+    shared: &Shared,
+    state: &mut DisplayRecovery,
+) -> Result<bool, EngineError> {
+    let epoch = display::epoch();
+    if epoch == state.seen {
+        return Ok(false);
+    }
+    // 新一轮恢复（代际变了）：重试计数从零开始。
+    if state.pending != Some(epoch) {
+        state.pending = Some(epoch);
+        state.attempts = 0;
+    }
+    match renderer.rebuild_target() {
+        Ok(true) => {}
+        // 设备健康但本窗口还有在飞工作：下一轮再试（不消耗代际）。
+        Ok(false) => return Ok(false),
+        Err(error) => {
+            // R08-3 的判据：只有真正的设备移除才升级成粘性错误（走既有的设备恢复）。
+            if let Some(lost) = renderer.check_device_lost() {
+                return Err(lost);
+            }
+            state.attempts += 1;
+            if state.attempts > DISPLAY_REBUILD_ATTEMPTS {
+                return Err(error);
+            }
+            // 退避：显示模式切换在唤醒后还要几百毫秒才稳定，立刻重试只会连续失败。
+            std::thread::sleep(DISPLAY_REBUILD_BACKOFF);
+            return Ok(false);
+        }
+    }
+    state.seen = epoch;
+    state.pending = None;
+    state.attempts = 0;
+    // 目标刚被重建（persist / back buffer 都是空的）⇒ UI 从下一帧开始整帧重发：
+    // `FrameSink::reset_epoch` +1 走既有的 `ResyncGate` 握手，恢复后的第一帧自包含。
+    shared.note_renderer_rebuilt();
+    crate::render::windows::diagnostics::display_recovered();
+    Ok(true)
+}
+
 fn run_gpu_loop(
     renderer: &mut GpuRenderer,
     shared: &Shared,
@@ -979,11 +1060,21 @@ fn run_gpu_loop(
     // 已从共享槽取走、但还没被本帧命令列表消费的图集上传（按 `AtlasKind`）。共享槽标志
     // 要等这里清，UI 才不会在 `Retry` / Idle 帧覆盖掉未录制的上传（DEVIATIONS F-211）。
     let mut atlas_awaiting = [false; 2];
+    // 显示 / 电源恢复（R07-14）：平台层推进的进程级代际，本线程消费一次；失败重试与退避
+    // 都绑定在代际上（换代际重新计数）。
+    let mut display_recovery = DisplayRecovery::new();
+    // 清退避（一次性）：恢复后的第一帧不因「不可见 / 被遮挡」退避，见 `recover_display_change`。
+    let mut force_present = false;
     loop {
         // 完成通知的唯一处理点：按提交顺序发布反馈 + 推进 retire（§4.1 / §6.5）。
         drain_completed(renderer, shared, submitted);
         if shared.shutdown_requested() {
             return Ok(());
+        }
+        // 显示 / 电源恢复：拓扑 / 工作区 / 唤醒之后重建交换链（⇒ reset_epoch 让 UI 整帧重发）
+        // 并清一次遮挡退避。
+        if recover_display_change(renderer, shared, &mut display_recovery)? {
+            force_present = true;
         }
         // 空闲时也要应用待定背景色：改色不要求提交一帧（UI 只写共享槽 + 唤醒）。背景色同时
         // 落在 1×1 背景层上（`refresh_background`），所以不画内容也能立刻看到新底色。
@@ -994,7 +1085,11 @@ fn run_gpu_loop(
         // 遮挡 / 最小化（R08-7）：不取帧、不提交、不 present。帧**留在**最新帧槽里，damage 继续
         // 合并 —— 恢复可见时一帧就能补上全部变化。这里只睡在 `[work, completion]` 上（定时唤醒
         // 一次以重查可见性 / 关闭），不消耗 waitable token。
-        if renderer.window_occluded() {
+        //
+        // R07-14：显示 / 电源恢复之后的**第一帧**例外（`force_present`）—— 锁屏 / RDP 断连 /
+        // 睡眠回来时 `IsIconic` / `DWMWA_CLOAKED` 可能仍是陈旧值，若照常退避，「唤醒后出帧」
+        // 就要等用户再碰一下窗口，恢复等于没做。
+        if renderer.window_occluded() && !force_present {
             crate::render::windows::diagnostics::occluded_skipped();
             wait_for_work_or_completion(shared, Some(OCCLUDED_POLL_INTERVAL))?;
             continue;
@@ -1005,6 +1100,10 @@ fn run_gpu_loop(
             wait_for_work_or_completion(shared, None)?;
             continue;
         }
+        // 恢复后的第一帧要在**进入这次呈现尝试时**就清掉退避：遮挡时 `Present1` 会报告
+        // `DXGI_STATUS_OCCLUDED`（是时序现象，不是错误），此时若无条件重试会变成
+        // 「每秒一次 waitable 超时」的空转 —— 只放行一次，之后回到正常退避。
+        force_present = false;
         // I3：先等呈现节奏，再取「此刻最新」的帧 —— 等待期间 UI 的发布覆盖旧请求并合并 damage，
         // 渲染的是最新快照而不是最多等了一个 vsync 的旧快照（§4.2 的「帧是状态不是队列」）。
         if !wait_for_waitable(renderer, shared, submitted)? {
@@ -1292,6 +1391,13 @@ const PRESENT_TIMEOUT_MS: u32 = 1_000;
 const PRESENT_STALL_BACKOFF: Duration = Duration::from_millis(16);
 /// 遮挡期间重查可见性的间隔（R08-7）。
 const OCCLUDED_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// 显示 / 电源恢复时目标重建的失败重试上限（R07-14）。
+///
+/// 唤醒后显示模式可能还要几百毫秒才稳定，一次重建失败不代表设备不可用；超过上限才把错误
+/// 升级成粘性、交给 UI（真正丢了设备的情况在此之前就被 `GetDeviceRemovedReason` 判出来了）。
+const DISPLAY_REBUILD_ATTEMPTS: u32 = 5;
+/// 上面那个重试之间的退避。
+const DISPLAY_REBUILD_BACKOFF: Duration = Duration::from_millis(200);
 /// `Present1` 报告 out of date 之后最多重试几次（R08-7）。
 const RESIZE_ATTEMPTS: u32 = 2;
 /// `Present1(InvalidCall)` 之后允许**整帧重录**几次（AR3 P2-4）。
@@ -1404,13 +1510,18 @@ mod tests {
     use smol_str::SmolStr;
 
     use super::{
-        AtlasSlots, FrameSink, PanicGuard, Shared, State, StickyError, WindowFrameSink, pack_size,
-        unpack_size,
+        AtlasSlots, DisplayRecovery, FrameSink, PanicGuard, Shared, State, StickyError,
+        WindowFrameSink, pack_size, recover_display_change, unpack_size,
     };
     use crate::{
         error::EngineError,
         paint::atlas::AtlasKind,
-        render::{DirtyRows, compositor::Plan, frame::LatestFrame},
+        render::{
+            DirtyRows,
+            compositor::Plan,
+            frame::LatestFrame,
+            windows::{compositor::GpuRenderer, display},
+        },
     };
 
     fn stale_rows(y0: u32, y1: u32) -> DirtyRows {
@@ -1551,6 +1662,28 @@ mod tests {
         assert_eq!(sink.reset_epoch(), 1, "设备恢复必须让 UI 看到新代际");
         shared.note_renderer_rebuilt();
         assert_eq!(sink.reset_epoch(), 2, "连续两次重建必须各 +1");
+    }
+
+    /// R07-14：平台层的显示 / 电源恢复（拓扑变化、工作区变化、睡眠唤醒）必须让 GPU 线程
+    /// **重建目标**（⇒ `reset_epoch` +1，UI 整帧重发）并**清一次遮挡退避**（返回值 = 放行恢复
+    /// 后的第一帧）。离屏渲染器没有交换链，重建是 no-op，但「消费代际 → 推进 reset_epoch」
+    /// 这条握手与窗口路径完全相同；交换链真被替换的那半只能在真机上验证（WARP 建不了组合链）。
+    #[test]
+    fn a_display_change_rebuilds_the_target_and_clears_the_backoff() {
+        let mut renderer = GpuRenderer::new_warp_offscreen((32, 32)).expect("warp renderer");
+        let shared = test_shared();
+        let sink = WindowFrameSink {
+            shared: Arc::clone(&shared),
+        };
+        let mut recovery = DisplayRecovery::new();
+
+        display::note_display_change();
+        assert!(
+            recover_display_change(&mut renderer, &shared, &mut recovery)
+                .expect("display recovery"),
+            "恢复后的第一帧必须放行（清遮挡退避）"
+        );
+        assert_eq!(sink.reset_epoch(), 1, "目标重建后 UI 必须整帧重发");
     }
 
     /// `presented` 槽：尺寸变化才 post（动画帧不唤醒 UI），打包/拆包可逆。

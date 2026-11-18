@@ -102,14 +102,15 @@ impl FrameScheduler {
 /// `wake` = `App::take_wake_request()` 的结果（`App::frame` 传入；`Window::frame` 传 `false`）。
 /// `!REUSABLE` 表示 lane 内容与树/样式不一致；`LAYOUT | PAINT` 覆盖「新建/未标 REUSABLE」的节点。
 pub(crate) fn needs_frame(window: &Window, wake: bool) -> bool {
-    // `a11y_bind_pending`：只有 `bind_a11y` 的节点被写信号时**没有**像素要画，但
-    // `refresh_styles` 仍必须跑一次（否则补丁永远不更新）。帧末的门禁会把它退回 `Idle`。
+    // `a11y_binding_work`：只有 `bind_a11y` 的节点被写信号时**没有**像素要画，但 a11y 绑定
+    // 仍必须重算一次（否则补丁永远不更新）—— 帧入口只跑 `refresh_a11y_bindings` 并按 a11y-only
+    // 帧结算（R13-6：不重建 lane / 不编码 / 不产生 damage；TreeUpdate 由平台泵同轮投递）。
     //
     // 全部判据都是 O(1)：读的是 `NodeTree` 的反向脏集合是否为空（R03-1 / S1）。旧实现用
     // `any_node(|n| LAYOUT|PAINT || !REUSABLE)` 做全树扫描，10k 节点每帧白付 ~50 µs。
     wake || window.full_damage_pending
         || window.pending_damage.is_some()
-        || window.a11y.bind_work()
+        || window.a11y_binding_work()
         || window.tree.has_bind_work()
         || window.tree.has_layout_work()
         || window.tree.has_paint_work()
@@ -567,7 +568,10 @@ pub(crate) fn surface_change_plan(
 mod tests {
     use smol_str::SmolStr;
 
-    use super::{FrameOutcome, note_reset_epoch};
+    use super::FrameOutcome;
+    // `note_reset_epoch` 的消费者被 `test-support` 门禁住，这里跟着收窄。
+    #[cfg(feature = "test-support")]
+    use super::note_reset_epoch;
     use crate::{
         app::App,
         math::{Rect, Scale, Size},
@@ -614,6 +618,7 @@ mod tests {
     /// 生产端的下一帧必须整帧发布 —— 全部 lane 重新进 delta（`encoded_lanes == 全部`）、
     /// damage 是 `Plan::Full`。设备恢复后 GPU 侧的实例镜像已清空，只发增量会把未变化的 lane
     /// 画成退化实例（复审 P1-1 的用户可见症状）。
+    #[cfg(feature = "test-support")]
     #[test]
     fn a_renderer_rebuild_forces_the_next_frame_full() {
         let runtime = tokio::runtime::Builder::new_current_thread()

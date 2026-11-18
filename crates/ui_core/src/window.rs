@@ -577,11 +577,38 @@ impl Window {
     pub(crate) fn a11y_force_full(&mut self) {
         a11y::a11y_force_full(self);
     }
-    pub(crate) fn a11y_note_bind_work(&mut self) {
-        a11y::a11y_note_bind_work(self)
+    /// 只有 `bind_a11y` 的节点被写信号：登记待重算（不标 `BIND`/`PAINT`，不产生像素）。
+    pub(crate) fn a11y_note_binding(&mut self, node: crate::node::id::NodeId) -> bool {
+        a11y::a11y_note_binding(self, node)
     }
-    pub(crate) fn a11y_clear_bind_work(&mut self) {
-        a11y::a11y_clear_bind_work(self)
+    /// 是否有待重算的 a11y 绑定（帧门禁：a11y-only 写仍要出一帧来投递 TreeUpdate）。
+    #[must_use]
+    pub(crate) fn a11y_binding_work(&self) -> bool {
+        a11y::a11y_binding_work(self)
+    }
+    /// 取走本批待重算的 a11y 绑定节点（`App::refresh_a11y_bindings` 的唯一消费者）。
+    pub(crate) fn a11y_take_bindings(&mut self) -> Vec<crate::node::id::NodeId> {
+        a11y::a11y_take_bindings(self)
+    }
+    /// 归还 [`Window::a11y_take_bindings`] 借走的缓冲。
+    pub(crate) fn a11y_recycle_bindings(&mut self, buffer: Vec<crate::node::id::NodeId>) {
+        a11y::a11y_recycle_bindings(self, buffer)
+    }
+    /// 本帧是否只剩 a11y 工作（R13-6 的 a11y-only 快速路径判据）。
+    #[must_use]
+    pub(crate) fn a11y_only_frame(&self) -> bool {
+        a11y::a11y_only_frame(self)
+    }
+    /// 记一笔 a11y-only 帧（指标面；仅 `test-support` 有帧记录）。
+    #[cfg(feature = "test-support")]
+    pub(crate) fn record_a11y_only_frame(&mut self) {
+        a11y::record_a11y_only_frame(self)
+    }
+    /// 本窗口累计的 a11y-only 帧数（R13-6 指标）。
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub(crate) fn a11y_only_frames(&self) -> usize {
+        a11y::a11y_only_frames(self)
     }
     #[cfg(feature = "test-support")]
     pub(crate) fn set_a11y_capture(&mut self, on: bool) {

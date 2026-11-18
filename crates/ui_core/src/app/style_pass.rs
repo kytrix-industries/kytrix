@@ -66,6 +66,8 @@ pub(crate) fn unbind_key(app: &mut App, key: KeyCode, modifiers: Modifiers) -> b
 ///
 /// 返回 `None` = 窗口不存在（P03 的冻结错误表里没有「未知窗口」变体，`Option` 是唯一诚实的表达）。
 /// P11 追加：`bind_a11y` 与另两条动态通道同批求值（同一 `ReadCtx` / `ReadTracker` / 依赖边集）。
+/// **只有** `bind_a11y` 的节点不在这里求值（R13-6）：它们走 `refresh_a11y_bindings`，不标
+/// `BIND`/`PAINT`（帧可以整段跳过像素管线）。
 /// 消费者：`App::refresh_styles`。
 pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePassReport> {
     let App {
@@ -75,10 +77,6 @@ pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePas
         eval_stack,
         ..
     } = app;
-    // P11：本 pass 会求值全部 `bind_a11y`，旗标在这里消费。
-    if let Some(target) = windows.get_mut(&window) {
-        target.a11y_clear_bind_work();
-    }
     let window_state = windows.get_mut(&window)?;
     let tree = window_state.tree_mut();
     debug_assert!(eval_stack.is_empty(), "上一帧的派生求值栈泄漏");
@@ -90,11 +88,9 @@ pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePas
     let nodes = tree.take_dirty_bind();
     for node in nodes.iter().copied() {
         // 集合的成员资格是权威判据；防御性再确认一次位（`take` 之后位可能已被消费）。
-        let needs_eval = tree.get(node).is_ok_and(|n| {
-            n.dirty().contains(DirtyFlags::BIND)
-                // 只有 `bind_a11y` 的节点没有 PAINT（写信号只标 A11Y），但补丁仍要重算。
-                || (n.dirty().contains(DirtyFlags::A11Y) && tree.has_a11y_bind(node))
-        });
+        let needs_eval = tree
+            .get(node)
+            .is_ok_and(|n| n.dirty().contains(DirtyFlags::BIND));
         if !needs_eval {
             tree.clear_bind(node);
             continue;
@@ -258,8 +254,10 @@ pub(crate) fn invalidate(app: &mut App, signal: SignalId) {
                     let Some(target) = windows.get_mut(&window) else {
                         continue;
                     };
-                    // P11：只有 `bind_a11y` 的节点（没有视觉绑定）被写信号时，**不得**产像素：
-                    // 标 `A11Y` 并让下一帧仍跑 `refresh_styles`（帧末门禁会退回 `Idle`）。
+                    // P11 / R13-6：只有 `bind_a11y` 的节点（没有视觉绑定）被写信号时，**不得**
+                    // 进帧的像素通道：登记到 a11y 桥的待重算队列（不标 `BIND`/`PAINT`）。
+                    // 下一帧的 `refresh_a11y_bindings` 只重算 patch；帧本身按 a11y-only 结算
+                    // （不重建 lane / 不编码 / 不产生 damage）。
                     let a11y_only =
                         target.tree().has_a11y_bind(node) && !target.tree().has_visual_bind(node);
                     let affects_layout = target
@@ -269,9 +267,9 @@ pub(crate) fn invalidate(app: &mut App, signal: SignalId) {
                     // `BIND` 是"重算动态属性"的唯一通道（R03-9）；`PAINT`/`LAYOUT`/`A11Y`
                     // 是它可能引发的下游失效，三者按语义各自独立登记。
                     let alive = if a11y_only {
-                        target.a11y_note_bind_work();
-                        target.tree_mut().mark_a11y(node);
-                        target.tree_mut().mark_bind(node)
+                        let queued = target.a11y_note_binding(node);
+                        let marked = target.tree_mut().mark_a11y(node);
+                        queued || marked
                     } else if affects_layout {
                         target.tree_mut().mark_bind(node);
                         target.tree_mut().mark_layout(node)

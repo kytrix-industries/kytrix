@@ -34,7 +34,7 @@ use std::{
 };
 
 use ui_core::{
-    app::{App, Application},
+    app::{App, AppHandle, Application},
     math::Scale,
     paint::color::Color,
     window::{FrameOutcome, WindowId, WindowOptions},
@@ -160,14 +160,8 @@ impl WindowRun {
             .filter(|interval| **interval >= target * MISSED_FACTOR)
             .count();
         let throughput = self.intervals.len() as f64 / self.duration.as_secs_f64();
-        println!(
-            "目标间隔            {:.3} ms（{hz} Hz）",
-            target / 1e3
-        );
-        println!(
-            "抖动（RMS vs 目标）  {:.3} ms",
-            rms / 1e3
-        );
+        println!("目标间隔            {:.3} ms（{hz} Hz）", target / 1e3);
+        println!("抖动（RMS vs 目标）  {:.3} ms", rms / 1e3);
         println!(
             "掉拍（间隔 ≥{MISSED_FACTOR:.1}× 目标） {missed} / {}",
             self.intervals.len()
@@ -232,11 +226,10 @@ pub fn run_window(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
         config.window_warmup_seconds,
         config.window_seconds
     );
-    #[cfg(feature = "hud")]    if config.hud {
+    #[cfg(feature = "hud")]
+    if config.hud {
         app.set_debug_hud(window, true)?;
-        println!(
-            "Debug HUD：已打开（F12 切换；截图证据见报告）"
-        );
+        println!("Debug HUD：已打开（F12 切换；截图证据见报告）");
     }
     #[cfg(not(feature = "hud"))]
     if config.hud {
@@ -253,44 +246,25 @@ pub fn run_window(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
     // 数据泵：按目标刷新率投递「本拍该更新」的信号（混合 sleep + 1 ms 自旋保证精度）。
     let pending = Arc::new(AtomicU32::new(0));
     let stop_pump = Arc::new(AtomicBool::new(false));
-    let handle = app.handle();
-    {
-        let pending = Arc::clone(&pending);
-        let stop_pump = Arc::clone(&stop_pump);
-        let hz = config.hz.max(1);
-        let period = Duration::from_secs_f64(1.0 / f64::from(hz));
-        std::thread::spawn(move || {
-            let mut next = Instant::now();
-            loop {
-                if stop_pump.load(Ordering::Acquire) {
-                    return;
-                }
-                next += period;
-                let now = Instant::now();
-                if next > now {
-                    let remaining = next - now;
-                    // 先睡到目标前 1 ms，再自旋（Sleep 在 Windows 上的默认精度是 15.6 ms）。
-                    if remaining > Duration::from_millis(1) {
-                        std::thread::sleep(remaining - Duration::from_millis(1));
-                    }
-                    while Instant::now() < next {
-                        std::hint::spin_loop();
-                    }
-                } else {
-                    // 落后了（上一拍被抢占）：立刻补一拍并重新对齐相位。
-                    next = now;
-                }
-                pending.fetch_add(1, Ordering::AcqRel);
-                handle.wake();
-            }
-        });
-    }
-
     let hz = config.hz.max(1);
     // 关闭时自唤醒一次：钩子跑在泵的 ④ 步（关闭检查在 ③），不补一拍唤醒的话泵会在
     // `GetMessageW` 上永久阻塞（窗口已从 `App` 移除，但没有新的唤醒到达）。
     let close_handle = app.handle();
+    // 数据泵**必须在 `Application::run` 装好平台唤醒目标之后**才启动：macOS 的 run loop
+    // source 是在 `run()` 里安装的，提前从其它线程 `wake()` 会踩到未初始化的唤醒目标
+    // （实测 SIGSEGV）。因此线程在第一次帧钩子里懒启动。
+    let pump_handle = app.handle();
+    let mut pump_started = false;
     app.on_frame(move |app| {
+        if !pump_started {
+            pump_started = true;
+            spawn_data_pump(
+                pump_handle.clone(),
+                Arc::clone(&pending),
+                Arc::clone(&stop_pump),
+                hz,
+            );
+        }
         if run.finished {
             return;
         }
@@ -333,6 +307,44 @@ pub fn run_window(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
 
     Application::new().run(app)?;
     Ok(passed.get())
+}
+
+/// 数据泵线程：按 `hz` 的节拍置位「本拍该更新」并唤醒 UI 线程。
+///
+/// 混合 sleep + 1 ms 自旋：`Sleep` 在 Windows 上的默认精度是 15.6 ms，纯 sleep 会产生
+/// 十几毫秒的相位误差；自旋只覆盖最后 1 ms（占空比 ~6%，且在独立线程上，不进 UI 帧计时）。
+///
+/// # Panics
+/// 线程创建失败（进程已无法继续验收）。
+fn spawn_data_pump(handle: AppHandle, pending: Arc<AtomicU32>, stop: Arc<AtomicBool>, hz: u32) {
+    let period = Duration::from_secs_f64(1.0 / f64::from(hz));
+    std::thread::Builder::new()
+        .name("acceptance-data-pump".to_owned())
+        .spawn(move || {
+            let mut next = Instant::now();
+            loop {
+                if stop.load(Ordering::Acquire) {
+                    return;
+                }
+                next += period;
+                let now = Instant::now();
+                if next > now {
+                    let remaining = next - now;
+                    if remaining > Duration::from_millis(1) {
+                        std::thread::sleep(remaining - Duration::from_millis(1));
+                    }
+                    while Instant::now() < next {
+                        std::hint::spin_loop();
+                    }
+                } else {
+                    // 落后了（上一拍被抢占）：立刻补一拍并重新对齐相位。
+                    next = now;
+                }
+                pending.fetch_add(1, Ordering::AcqRel);
+                handle.wake();
+            }
+        })
+        .expect("data pump thread");
 }
 
 /// 跑 `idle` 模式：窗口静止（无动画、无脏位）时测进程 CPU；返回 `true` = <1%。

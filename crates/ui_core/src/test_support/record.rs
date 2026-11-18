@@ -39,6 +39,11 @@ pub struct FrameRecord {
     /// `scanned_nodes <= 1 + 祖先链长度`（R03-1 / S1 的验收）。旧实现每帧有 6–12 次全树
     /// 遍历，该值会是节点总数的数倍。
     pub scanned_nodes: usize,
+    /// 本帧是否发生了任何重绘（重建 lane / damage / 编码 / 提交）。a11y-only 帧恒为 `false`。
+    pub repainted: bool,
+    /// 本帧是不是 **a11y-only 帧**（R13-6）：只重算 `bind_a11y` 并让泵投递 TreeUpdate，
+    /// 没有任何像素工作（`rendered == false`、`damage` 空、`encoded_lanes == 0`）。
+    pub a11y_only: bool,
     /// lane 级重建/复用记录。
     pub paint_log: PaintLog,
     /// 本帧产出的一笔 a11y 交付（`None` = 无 a11y 工作，或捕获未打开）。
@@ -180,6 +185,9 @@ pub struct FrameStats {
     pub encode_on_compositor: bool,
     /// 本帧滚动偏移变化的槽数（`0` = 不是滚动帧；>0 时 `encoded_lanes` 必须是 0）。
     pub scroll_offset_frames: usize,
+    /// 本窗口累计的 a11y-only 帧数（R13-6）：a11y-only 写不再跑像素管线，这个计数是
+    /// 「快速路径真的在跑」的确定性断言面（不随机器负载变化）。
+    pub a11y_only_frames: usize,
 }
 
 impl FrameRecord {
@@ -195,6 +203,8 @@ impl FrameRecord {
             damage_full: false,
             dirty_nodes: Vec::new(),
             scanned_nodes: 0,
+            repainted: false,
+            a11y_only: false,
             paint_log: PaintLog::default(),
             a11y: None,
         }
@@ -262,6 +272,9 @@ pub(crate) fn capture(
         damage_full: report.damage.full,
         dirty_nodes,
         scanned_nodes,
+        // 提交帧必然产生了像素（重建 lane / damage / 编码 / 滚动偏移之一）⇒ 发生过重绘。
+        repainted: true,
+        a11y_only: false,
         paint_log: report.log,
         a11y: None,
     }

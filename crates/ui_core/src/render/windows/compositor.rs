@@ -156,8 +156,9 @@ pub(crate) struct GpuRenderer {
     buffer_syncs: BufferSyncs,
     /// 局部帧的 op 分桶缓存（R08-13；跨帧复用 `Vec` 容量）。
     op_buckets: OpBuckets,
-    /// 最后一次**真正提交**的帧序号（重建资源入 retire 队列时的 tag，§4.3）。
-    last_index: FrameIndex,
+    /// 最后一次**真正提交**的提交序号（fence 的 signal 值；重建资源入 retire 队列时的 tag，
+    /// §4.3）。**不是** `FrameIndex`（R06-1）：帧序号会饱和，后端的 u64 序号不会。
+    last_sequence: u64,
     /// 窗口 DPI（`frame.params.x`）。平台层在 DPI 变化时写入；只影响 geometry 通道的
     /// 逻辑→物理换算，实例通道的 bounds 已是物理像素。
     scale: f32,
@@ -305,7 +306,7 @@ impl GpuRenderer {
             target: TargetState::Fresh,
             buffer_syncs: BufferSyncs::new(),
             op_buckets: OpBuckets::new(),
-            last_index: FrameIndex::default(),
+            last_sequence: 0,
             scale: 1.0,
             #[cfg(any(test, feature = "test-support"))]
             readback: Readback::new(),
@@ -405,6 +406,15 @@ impl GpuRenderer {
     /// 消费者：GPU 循环在 `Present1` 报告交换链 out of date 时重试（R08-7）。
     pub(crate) fn resize_target(&mut self) -> Result<(), EngineError> {
         persist::resize_target(self, self.surface)
+    }
+
+    /// 实现在 `persist::rebuild_target`（薄委托）：显示 / 电源恢复之后的**整链重建**（R07-14）。
+    ///
+    /// 与 [`GpuRenderer::resize_target`] 的差别是「即使尺寸没变也重建」：睡眠唤醒 / 换屏之后
+    /// 交换链的显示器关联与持久目标内容都不可信，只 `ResizeBuffers`（同尺寸时是 no-op）
+    /// 修不好。返回 `Ok(false)` = 设备健康但还有在飞工作，调用方下一轮重试。
+    pub(crate) fn rebuild_target(&mut self) -> Result<bool, EngineError> {
+        persist::rebuild_target(self)
     }
 
     /// 实现在 `persist::resize_offscreen`（薄委托）。
@@ -603,7 +613,7 @@ impl GpuRenderer {
             .geometry
             .ensure(&self.shared, id, &desc, &mut retired)?;
         for handle in retired {
-            self.stream.retire(self.last_index, handle);
+            self.stream.retire(self.last_sequence, handle);
         }
         Ok(())
     }
@@ -736,13 +746,12 @@ impl FrameRecorder<'_> {
     fn record(
         &mut self,
         slot: FrameSlot,
-        index: FrameIndex,
         payload: &FramePayload,
         frame: &mut FramePlan,
         timings: &mut FrameTimings,
         frame_started: std::time::Instant,
     ) -> Result<RecordedFrame, EngineError> {
-        record::record(self, slot, index, payload, frame, timings, frame_started)
+        record::record(self, slot, payload, frame, timings, frame_started)
     }
 }
 
@@ -821,11 +830,11 @@ impl UploadArena {
         mirror: &mut InstanceMirror,
         shared: &SharedGpu,
         stream: &mut CommandStream,
-        index: FrameIndex,
+        sequence: u64,
         slot: usize,
         payload: &FramePayload,
     ) -> Result<(u32, u32), EngineError> {
-        upload::write_uploads(self, mirror, shared, stream, index, slot, payload)
+        upload::write_uploads(self, mirror, shared, stream, sequence, slot, payload)
     }
 }
 

@@ -24,6 +24,8 @@ pub(crate) struct Diagnostics {
     pub occluded_skips: u64,
     /// 设备丢失后**进程内**恢复成功的次数（R08-4）。
     pub device_recoveries: u64,
+    /// 显示 / 电源恢复（拓扑变化 / 工作区变化 / 睡眠唤醒）重建目标的次数（R07-14）。
+    pub display_recoveries: u64,
     /// 图集换代时因为等不到某个窗口的水位而推迟销毁旧纹理的次数（R08-6 的慢路径）。
     pub atlas_deferred_rebuilds: u64,
     /// `ResizeBuffers` 失败后回退到整链替换的次数（R08-1 的回退开关）。
@@ -44,6 +46,7 @@ static PRESENT_FAILED: AtomicU64 = AtomicU64::new(0);
 static PRESENT_RETRIES: AtomicU64 = AtomicU64::new(0);
 static OCCLUDED_SKIPS: AtomicU64 = AtomicU64::new(0);
 static DEVICE_RECOVERIES: AtomicU64 = AtomicU64::new(0);
+static DISPLAY_RECOVERIES: AtomicU64 = AtomicU64::new(0);
 static ATLAS_DEFERRED_REBUILDS: AtomicU64 = AtomicU64::new(0);
 static RESIZE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static OP_VISITS: AtomicU64 = AtomicU64::new(0);
@@ -79,6 +82,11 @@ pub(crate) fn device_recovered() {
     DEVICE_RECOVERIES.fetch_add(1, Ordering::Relaxed);
 }
 
+/// 记一次显示 / 电源恢复导致的目标重建（R07-14）。
+pub(crate) fn display_recovered() {
+    DISPLAY_RECOVERIES.fetch_add(1, Ordering::Relaxed);
+}
+
 /// 记一次图集换代的慢路径（旧纹理进延迟销毁表）。
 pub(crate) fn atlas_deferred_rebuild() {
     ATLAS_DEFERRED_REBUILDS.fetch_add(1, Ordering::Relaxed);
@@ -105,6 +113,7 @@ pub(crate) fn snapshot() -> Diagnostics {
         present_retries: PRESENT_RETRIES.load(Ordering::Relaxed),
         occluded_skips: OCCLUDED_SKIPS.load(Ordering::Relaxed),
         device_recoveries: DEVICE_RECOVERIES.load(Ordering::Relaxed),
+        display_recoveries: DISPLAY_RECOVERIES.load(Ordering::Relaxed),
         atlas_deferred_rebuilds: ATLAS_DEFERRED_REBUILDS.load(Ordering::Relaxed),
         resize_fallbacks: RESIZE_FALLBACKS.load(Ordering::Relaxed),
         op_visits: OP_VISITS.load(Ordering::Relaxed),
@@ -119,13 +128,14 @@ pub(crate) fn snapshot() -> Diagnostics {
 impl Diagnostics {
     pub(crate) fn describe(&self) -> smol_str::SmolStr {
         smol_str::format_smolstr!(
-            "wait_timeouts={} present_waitable_timeouts={} present_failed={} present_retries={} occluded_skips={} device_recoveries={} atlas_deferred={} resize_fallbacks={} op_visits={}/{} debug(w/e/c)={}/{}/{}",
+            "wait_timeouts={} present_waitable_timeouts={} present_failed={} present_retries={} occluded_skips={} device_recoveries={} display_recoveries={} atlas_deferred={} resize_fallbacks={} op_visits={}/{} debug(w/e/c)={}/{}/{}",
             self.frame_wait_timeouts,
             self.present_waitable_timeouts,
             self.present_failed,
             self.present_retries,
             self.occluded_skips,
             self.device_recoveries,
+            self.display_recoveries,
             self.atlas_deferred_rebuilds,
             self.resize_fallbacks,
             self.op_visits,
@@ -151,16 +161,22 @@ mod tests {
         super::frame_wait_timeout();
         super::occluded_skipped();
         super::present_retried();
+        super::display_recovered();
         let second = snapshot();
         assert!(second.frame_wait_timeouts > first.frame_wait_timeouts);
         assert!(second.occluded_skips > first.occluded_skips);
         assert!(second.present_retries > first.present_retries);
+        assert!(
+            second.display_recoveries > first.display_recoveries,
+            "显示恢复必须进诊断快照"
+        );
 
         let text = second.describe();
         for needle in [
             "wait_timeouts=",
             "op_visits=",
             "occluded_skips=",
+            "display_recoveries=",
             "debug(w/e/c)=",
         ] {
             assert!(text.contains(needle), "missing {needle} in {text}");

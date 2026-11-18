@@ -26,7 +26,7 @@ use crate::{
     paint::{
         color::Color,
         geometry::{GeometryDesc, GeometryId, GeometryPipeline, IndexType, Topology},
-        style::{Clip, PaintSpec, Style},
+        style::{Clip, Style},
     },
     text::{TextStyle, TextWrap},
     window::WindowId,
@@ -71,6 +71,13 @@ impl Scale {
     pub const CELL_WIDTH: f32 = 64.0;
 }
 
+/// 成交序号的起点。
+///
+/// 夹具的成交信号初值是行号（0…N-1），追加时写成 [`TRADE_SEQ_START`] + step：**两者必须错开**，
+/// 否则前 N 步写回的是同值，`App::write` 直接 no-op（这条断言曾经把增量帧的期望值
+/// 从 29 打成 25 —— 少掉的正是那 4 条成交 lane）。
+const TRADE_SEQ_START: u32 = 1_000_000;
+
 /// 一面盘口单元格的数据（列 0 是价格分，其余是计数）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BookRow(pub [u32; Scale::COLUMNS]);
@@ -99,7 +106,10 @@ impl Load {
     /// # Errors
     /// 建树 / 几何注册 / 滚动容器创建失败。
     pub fn build(app: &mut App, window: WindowId, scale: Scale) -> Result<Self, EngineError> {
-        assert!(scale.book_rows >= Scale::TEXT_ROWS, "缩比档至少要有 125 行盘口");
+        assert!(
+            scale.book_rows >= Scale::TEXT_ROWS,
+            "缩比档至少要有 125 行盘口"
+        );
         let root = app
             .window(window)
             .ok_or(EngineError::UnknownWindow { window })?
@@ -108,9 +118,8 @@ impl Load {
 
         let mut book_rows = Vec::with_capacity(scale.book_rows);
         for row in 0..scale.book_rows {
-            book_rows.push(app.signal(BookRow(std::array::from_fn(|column| {
-                value(row, column, 0)
-            }))));
+            book_rows
+                .push(app.signal(BookRow(std::array::from_fn(|column| value(row, column, 0)))));
         }
         let mut trade_rows = Vec::with_capacity(scale.trade_rows);
         for row in 0..scale.trade_rows {
@@ -135,22 +144,19 @@ impl Load {
             for (row, signal) in book_rows.iter().enumerate() {
                 for column in 0..Scale::COLUMNS {
                     let source = *signal;
-                    let _ = NodeBuilder::text(
-                        text(value(row, column, 0), column),
-                        cell_style(),
-                    )
-                    .layout_override(Rect::new(
-                        column as f32 * Scale::CELL_WIDTH,
-                        row as f32 * Scale::ROW_HEIGHT,
-                        Scale::CELL_WIDTH - 2.0,
-                        Scale::ROW_HEIGHT - 1.0,
-                    ))
-                    .bind_text(move |cx| {
-                        let row = cx.read(&source);
-                        text(row.0[column], column)
-                    })
-                    .build(tree, book_viewport)
-                    .expect("盘口单元格");
+                    let _ = NodeBuilder::text(text(value(row, column, 0), column), cell_style())
+                        .layout_override(Rect::new(
+                            column as f32 * Scale::CELL_WIDTH,
+                            row as f32 * Scale::ROW_HEIGHT,
+                            Scale::CELL_WIDTH - 2.0,
+                            Scale::ROW_HEIGHT - 1.0,
+                        ))
+                        .bind_text(move |cx| {
+                            let row = cx.read(&source);
+                            text(row.0[column], column)
+                        })
+                        .build(tree, book_viewport)
+                        .expect("盘口单元格");
                 }
             }
             let tape_viewport = NodeBuilder::boxed()
@@ -261,9 +267,11 @@ impl Load {
         let _ = app.write(&self.book_rows[row], BookRow(values));
     }
 
+    /// 追加一笔成交：**必须**写成与初始值不同的序号，否则 `App::write` 是 no-op、这一帧
+    /// 会少 4 条脏 lane（夹具自己踩过一次：初始值 = 行号，前 60 步写回的正好是同值）。
     fn append_trade(&mut self, app: &mut App) {
         let row = (self.step as usize) % self.trade_rows.len();
-        let _ = app.write(&self.trade_rows[row], self.step);
+        let _ = app.write(&self.trade_rows[row], TRADE_SEQ_START + self.step);
     }
 
     fn scroll_tape(&mut self, app: &mut App) {
@@ -275,22 +283,25 @@ impl Load {
 
     fn pan_chart(&mut self, app: &mut App) {
         let pan = (self.step % 16) as f32 * 0.5;
-        let _ = app.set_geometry_transform(self.window, self.chart, Transform::translate(-pan, 0.0));
+        let _ =
+            app.set_geometry_transform(self.window, self.chart, Transform::translate(-pan, 0.0));
     }
 }
 
 /// 盘口单元格的值（列 0 价格分、列 7 涨跌带符号、其余计数）。
+///
+/// **每步必然变化**：取值 = 列内基准 + `step`（同余类里 +1），因此相邻两步的文本一定不同。
+/// 不能用「整值哈希 + 取模」——那会让极少数单元格在两步之间撞回同值（`App::write` 变 no-op），
+/// 1000 单元帧的 `encoded_lanes` 断言就会偶发 999。
 #[must_use]
 pub fn value(row: usize, column: usize, step: u32) -> u32 {
     let seed = (row as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ (column as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
-        ^ (step as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
-    let mixed = seed ^ (seed >> 31) ^ (seed >> 17);
-    let value = mixed as u32;
+        ^ (column as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    let base = ((seed ^ (seed >> 31) ^ (seed >> 17)) as u32).wrapping_add(step);
     match column {
-        0 => 9_000_00 + value % 2_000_00,
-        7 => 8_00 + value % 1_600,
-        _ => 1 + value % 999_999,
+        0 => 900_000 + base % 200_000,
+        7 => 800 + base % 1_600,
+        _ => 1 + base % 999_999,
     }
 }
 

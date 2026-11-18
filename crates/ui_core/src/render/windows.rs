@@ -17,6 +17,8 @@ pub(crate) mod compositor;
 pub(crate) mod debug;
 pub(crate) mod device;
 pub(crate) mod diagnostics;
+/// 显示 / 电源状态变化的恢复信号（R07-14）：平台层置位，GPU 线程消费（重建目标 + 整帧重发）。
+pub(crate) mod display;
 pub(crate) mod hresult;
 pub(crate) mod pipeline;
 pub(crate) mod queue;

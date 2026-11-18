@@ -5,6 +5,9 @@
 //! - 零依赖（std only）：不引 `regex`（手写扫描器）、不引 `sha2`（Cargo 的 fingerprint 就是缓存）。
 //! - 只编译本平台：Windows → `dxc`（DXIL）、macOS → `xcrun metal`（metallib）、Linux → `glslangValidator`（SPIR-V）。
 //! - `ui_core_SKIP_SHADERS=1` 或 host ≠ target 时只写**占位产物**（P09 的 `include_bytes!` 仍可解析）。
+//! - Windows 目标额外把**本仓自带**的进程清单（`RT_MANIFEST`，DPI awareness = PerMonitorV2，
+//!   R07-1）编进 `.res` 并链接到每个链接本 crate 的可执行文件 —— 不再依赖 `gpui-pre` 之类
+//!   依赖的资源合并副作用；清单内容与 `1 RT_MANIFEST` 锚点在构建期静态校验。
 
 use std::{
     env, fs,
@@ -156,6 +159,22 @@ const METAL_LIBS: [(&str, &str); 2] = [
     ("geometry.metal", "geometry.metallib"),
 ];
 
+/// R07-1：本仓自带的进程清单（`RT_MANIFEST`）与其 rc 包装。
+///
+/// 清单只声明「期望的 awareness」，实际值由 OS / 宿主决定，所以运行期还会再校验一次
+/// （`src/platform/windows/dpi_awareness.rs`）。这里要守的是：清单必须**本仓拥有** ——
+/// 依赖（`gpui-pre` 的默认特性 `windows-manifest`）带进来的清单只是副作用，依赖一换就没了。
+const MANIFEST_RC: &str = "src/platform/windows/ui_core_manifest.rc";
+const MANIFEST_XML: &str = "src/platform/windows/ui_core.manifest.xml";
+
+/// 清单里缺失即构建失败的锚点：老/新 Windows 读不同的元素（1607 及更早读 `dpiAware`，
+/// 1703+ 读 `dpiAwareness`），少一条就会在对应版本上静默退回 96 dpi。
+const MANIFEST_XML_ANCHORS: [&str; 2] = [">true/pm</dpiAware>", ">PerMonitorV2</dpiAwareness>"];
+
+/// rc 侧锚点：清单必须是 `RT_MANIFEST` 的 **ID 1**（`CREATEPROCESS_MANIFEST_RESOURCE_ID`）。
+/// ID 不对时资源不会生效，但构建仍然成功 —— 所以必须静态校验。
+const MANIFEST_RC_ANCHOR: &str = "1 RT_MANIFEST";
+
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let shader_dir = manifest.join("src/render/shaders");
@@ -163,6 +182,7 @@ fn main() {
 
     emit_rerun(&manifest, &shader_dir);
     validate(&manifest, &shader_dir);
+    embed_manifest(&manifest);
     build(&shader_dir, &out_dir);
 }
 
@@ -195,6 +215,89 @@ fn emit_rerun(manifest: &Path, shader_dir: &Path) {
     }
     println!("cargo:rerun-if-env-changed=ui_core_SKIP_SHADERS");
     println!("cargo:rerun-if-env-changed=KYTRIX_DXC");
+}
+
+// ---------------------------------------------------------------------------
+// 进程清单（R07-1；只对 Windows 目标）
+// ---------------------------------------------------------------------------
+
+/// 把本仓自带的进程清单编成 `.res` 并让**最终 exe** 链接它（R07-1）。
+///
+/// 传播链：`cargo:rustc-link-search` + `cargo:rustc-link-lib` 写进 ui_core 的 rlib 元数据，
+/// 依赖本 crate 的每个可执行文件在链接时都会带上这条 `-l`（`gpui-pre` 的 `gpui.lib` 正是这样
+/// 把它的清单带进 exe 的 —— 本函数把同一机制变成**本仓声明**）。
+fn embed_manifest(project: &Path) {
+    if env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() != "windows" {
+        return;
+    }
+
+    let rc_file = project.join(MANIFEST_RC);
+    let xml_file = project.join(MANIFEST_XML);
+    println!("cargo:rerun-if-changed={}", rc_file.display());
+    println!("cargo:rerun-if-changed={}", xml_file.display());
+
+    let xml = read(&xml_file);
+    for anchor in MANIFEST_XML_ANCHORS {
+        if !xml.contains(anchor) {
+            panic!(
+                "\nui_core: 进程清单漂移（R07-1）\n  文件:   {MANIFEST_XML}\n  缺失:   {anchor}\n  \
+                 修复:   DPI awareness 必须是 PerMonitorV2，且老/新 Windows 两条声明都要有；\
+                 否则窗口跨屏时收不到每屏 DPI\n"
+            );
+        }
+    }
+    if !read(&rc_file).contains(MANIFEST_RC_ANCHOR) {
+        panic!(
+            "\nui_core: 进程清单漂移（R07-1）\n  文件:   {MANIFEST_RC}\n  缺失:   {MANIFEST_RC_ANCHOR}\n  \
+             修复:   进程清单必须写成 `1 RT_MANIFEST`（ID ≠ 1 的资源不会被系统当作进程清单）\n"
+        );
+    }
+
+    // `rc.exe` 只覆盖 MSVC 目标（`windows-gnu` 走 windres，本仓构建矩阵没有这一格）。
+    // 宁可构建失败，也不要静默产出一个没有清单的 exe。
+    if env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default() != "msvc" {
+        panic!(
+            "ui_core: R07-1 的进程清单只支持 MSVC 目标（需要 rc.exe）。\n  \
+             当前 CARGO_CFG_TARGET_ENV 不是 msvc；请改用 *-pc-windows-msvc 目标。"
+        );
+    }
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    let artifact = out_dir.join("ui_core_manifest.lib");
+    let rc_tool = find_rc().unwrap_or_else(|| {
+        panic!(
+            "ui_core: 找不到 rc.exe（把进程清单编进 exe，R07-1）。\n  \
+             已尝试：%WindowsSdkDir%\\bin\\10.0.*\\<arch>\\rc.exe、\
+             %ProgramFiles(x86)%\\Windows Kits\\10\\bin\\10.0.*\\<arch>\\rc.exe、PATH\n  \
+             安装 Windows SDK 10.0.26100+，或设置 KYTRIX_RC=<rc.exe 的绝对路径>。"
+        )
+    });
+    let output = Command::new(&rc_tool)
+        .args(["/nologo", "/fo"])
+        .arg(&artifact)
+        .arg("/I")
+        .arg(project.join("src/platform/windows"))
+        .arg(&rc_file)
+        .current_dir(project)
+        .output();
+    report(output, "rc.exe（进程清单）");
+
+    // 产物是 `.res` 格式（**不是** COFF 库，只是沿用 `.lib` 扩展名给 link.exe 当输入）：
+    // 32 字节空头，首两个 dword 恒为 `0` / `0x20`。
+    let bytes = fs::read(&artifact)
+        .unwrap_or_else(|err| panic!("无法读取进程清单产物 {}：{err}", artifact.display()));
+    if !bytes.starts_with(b"\0\0\0\0\x20\0\0\0") {
+        panic!(
+            "ui_core: rc.exe 没有产出 .res 资源（magic 不符）：{}",
+            artifact.display()
+        );
+    }
+
+    // 注意：同一条 `-l` 若被两个清单资源满足，`link.exe` 会以
+    // `CVT1100: duplicate resource. type:MANIFEST, name:1` 硬失败 —— 这正是「不要把清单
+    // 重复塞进同一个 exe」的机器证明（见 `.review` 报告里的 gpui-pre 冲突结论）。
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=dylib=ui_core_manifest");
 }
 
 // ---------------------------------------------------------------------------
@@ -827,8 +930,47 @@ fn find_dxc() -> Option<PathBuf> {
         panic!("ui_core: KYTRIX_DXC 指向的文件不存在：{}", path.display());
     }
 
+    find_windows_sdk_tool("dxc.exe").or_else(|| {
+        let on_path = PathBuf::from("dxc.exe");
+        Command::new(&on_path)
+            .arg("--version")
+            .output()
+            .is_ok()
+            .then_some(on_path)
+    })
+}
+
+/// Windows SDK 的 `rc.exe`（资源编译器；编进程清单用，R07-1）。
+///
+/// `KYTRIX_RC` 可覆盖（与 `KYTRIX_DXC` 同规矩）：构建机把 SDK 装在非标准位置时用。
+fn find_rc() -> Option<PathBuf> {
+    if let Some(raw) = env::var_os("KYTRIX_RC") {
+        let path = PathBuf::from(raw);
+        if path.is_file() {
+            return Some(path);
+        }
+        panic!("ui_core: KYTRIX_RC 指向的文件不存在：{}", path.display());
+    }
+
+    find_windows_sdk_tool("rc.exe").or_else(|| {
+        let on_path = PathBuf::from("rc.exe");
+        Command::new(&on_path)
+            .arg("/?")
+            .output()
+            .is_ok()
+            .then_some(on_path)
+    })
+}
+
+/// Windows SDK 里的宿主工具（`<root>/bin/<version>/<arch>/<tool>`，取版本号最大的一个）。
+///
+/// 按**宿主**架构选：`dxc.exe` / `rc.exe` 都在构建机上运行，产物与目标架构无关，
+/// build script 的 `cfg!(target_arch)` 就是宿主架构。
+fn find_windows_sdk_tool(tool: &str) -> Option<PathBuf> {
     let arch = if cfg!(target_arch = "aarch64") {
         "arm64"
+    } else if cfg!(target_arch = "x86") {
+        "x86"
     } else {
         "x64"
     };
@@ -842,21 +984,13 @@ fn find_dxc() -> Option<PathBuf> {
     if let Some(dir) = env::var_os("ProgramFiles") {
         roots.push(PathBuf::from(dir).join("Windows Kits").join("10"));
     }
-    for root in roots {
-        if let Some(found) = newest_dxc(&root, arch) {
-            return Some(found);
-        }
-    }
-
-    let on_path = PathBuf::from("dxc.exe");
-    if Command::new(&on_path).arg("--version").output().is_ok() {
-        return Some(on_path);
-    }
-    None
+    roots
+        .into_iter()
+        .find_map(|root| newest_sdk_tool(&root, arch, tool))
 }
 
-/// 在 `<root>/bin/<version>/<arch>/dxc.exe` 中取版本号最大的一个。
-fn newest_dxc(root: &Path, arch: &str) -> Option<PathBuf> {
+/// 在 `<root>/bin/<version>/<arch>/<tool>` 中取版本号最大的一个。
+fn newest_sdk_tool(root: &Path, arch: &str, tool: &str) -> Option<PathBuf> {
     let entries = fs::read_dir(root.join("bin")).ok()?;
     let mut versions: Vec<(Vec<u32>, PathBuf)> = entries
         .filter_map(|entry| {
@@ -872,7 +1006,7 @@ fn newest_dxc(root: &Path, arch: &str) -> Option<PathBuf> {
     versions.sort_by(|left, right| right.0.cmp(&left.0));
     versions
         .into_iter()
-        .map(|(_, dir)| dir.join(arch).join("dxc.exe"))
+        .map(|(_, dir)| dir.join(arch).join(tool))
         .find(|candidate| candidate.is_file())
 }
 

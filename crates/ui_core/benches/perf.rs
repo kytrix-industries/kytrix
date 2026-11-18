@@ -33,11 +33,15 @@
 //! 另外 `--features test-support` 会在**每一帧**做 `FrameRecord` 采集（遍历 scene/tree），
 //! 同一档位的数值会比默认特性高一个数量级——**两者不可直接比较**，只用于断言计数。
 
-use std::{hint::black_box, time::Duration};
+use std::{
+    hint::black_box,
+    time::{Duration, Instant},
+};
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
+    a11y::A11yPatch,
     app::App,
     math::{Rect, Scale, Size},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
@@ -414,6 +418,152 @@ fn bench_frame_incremental(c: &mut Criterion) {
             BatchSize::LargeInput,
         );
     });
+}
+
+/// **R13-6 的基准：a11y-only 更新（只改一个节点的 label）**。
+///
+/// 夹具 = 10k 个静态实色 box（全部有 lane，可整桶复用）+ 1 个**只**绑 `bind_a11y` 的 box。
+/// 计时帧只写 label 信号：`bind_a11y` 重算 **1 次**，0 条 lane 重建、0 条 lane 重编码、
+/// 0 damage、`FrameIndex` 不变（帧按 a11y-only 结算）。
+///
+/// 与同规模的绘制帧的对照在 [`assert_a11y_only_is_much_cheaper_than_a_paint_frame`]：
+/// 该断言在同一台机器、同一份夹具上各测 7 轮取最小值，比值必须 ≥ 3×（实测约 40–80×）。
+///
+/// `--features test-support` 下还断言本帧的计数：`encoded_lanes == 0`、`painted_lanes == 0`、
+/// `a11y_only_frames` 增长 —— 快速路径一旦被绕过（退回整帧管线），计数断言先红，不依赖计时。
+fn bench_a11y_only_update(c: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("bench runtime");
+    let handle = runtime.handle().clone();
+    assert_a11y_only_is_much_cheaper_than_a_paint_frame(&handle);
+    #[cfg(feature = "test-support")]
+    let printed = std::sync::Once::new();
+    c.bench_function("a11y_only_update_10k", |b| {
+        b.iter_batched(
+            || {
+                let mut fixture = new_app(&handle);
+                let _ = mount_boxes(&mut fixture, 10_000);
+                let label = mount_a11y_label(&mut fixture);
+                let _ = fixture.app.frame(fixture.window);
+                // 预置「前一个值」⇒ 计时帧一定改变 label（与 `frame_incremental_*` 同一个坑）。
+                fixture.app.write(&label, SmolStr::new_static("a11y label 1"));
+                (fixture, label)
+            },
+            |(mut fixture, label)| {
+                fixture.app.write(&label, SmolStr::new_static("a11y label 2"));
+                let outcome = black_box(fixture.app.frame(fixture.window));
+                #[cfg(feature = "test-support")]
+                if let Some(stats) = fixture
+                    .app
+                    .window(fixture.window)
+                    .and_then(ui_core::window::Window::frame_stats)
+                    .copied()
+                {
+                    assert_eq!(
+                        stats.encoded_lanes, 0,
+                        "a11y-only 帧不得重编码任何 lane（实际 {}）",
+                        stats.encoded_lanes
+                    );
+                    assert_eq!(
+                        stats.painted_lanes, 0,
+                        "a11y-only 帧不得重建任何 lane（实际 {}）",
+                        stats.painted_lanes
+                    );
+                    assert!(
+                        stats.a11y_only_frames >= 1,
+                        "a11y_only_frames 必须增长 —— a11y-only 快速路径没跑？"
+                    );
+                    printed.call_once(|| {
+                        eprintln!(
+                            "a11y_only_update_10k: encoded_lanes={} painted_lanes={} a11y_only_frames={}",
+                            stats.encoded_lanes, stats.painted_lanes, stats.a11y_only_frames
+                        );
+                    });
+                }
+                // fixture 必须交回：否则 10k 节点的析构落在计时区内（见 `frame_full_512`）。
+                (fixture, outcome)
+            },
+            BatchSize::LargeInput,
+        );
+    });
+}
+
+/// a11y 绑定的夹具：`count` 个静态实色 box 之外，再挂 1 个**只**绑 `bind_a11y` 的 box。
+fn mount_a11y_label(fixture: &mut Fixture) -> Signal<SmolStr> {
+    let label = fixture.app.signal(SmolStr::new_static("a11y label 0"));
+    let Fixture { app, window } = fixture;
+    let root = app.window(*window).expect("window").tree().root();
+    let source = label;
+    let _ = NodeBuilder::boxed()
+        .layout_override(Rect::new(0.0, 0.0, 160.0, 24.0))
+        // 有图元：a11y-only 帧必须**一条**都别重建（空 lane 会让断言恒真）。
+        .paint(PaintSpec {
+            background: Color::from_rgba8([0x00, 0x91, 0xFF, 0xFF]),
+            ..PaintSpec::default()
+        })
+        .bind_a11y(move |cx| A11yPatch {
+            label: Some(cx.read(&source).clone()),
+            ..A11yPatch::default()
+        })
+        .build(app.window_mut(*window).expect("window").tree_mut(), root)
+        .expect("a11y label");
+    label
+}
+
+/// R13-6 的量化断言：**只改一个节点的 label 的帧**必须远低于同规模的绘制帧。
+///
+/// 同一份 10k 夹具、同一台机器，交替各跑 7 轮并取最小值（最小值比中位数更抗后台负载）：
+/// - a11y-only：写 label（只驱动 `bind_a11y`），帧只重算 patch，不碰 paint/编码；
+/// - 绘制帧：写 `bind_style` 信号（opacity），帧重建 1 条 lane 并重编码 1 个实例。
+///
+/// 比值断言取 ≥ 3×：实测约 40–80×，放宽到"只在真的退化成整帧管线时才失败"。
+fn assert_a11y_only_is_much_cheaper_than_a_paint_frame(handle: &tokio::runtime::Handle) {
+    let mut fixture = new_app(handle);
+    let _ = mount_boxes(&mut fixture, 10_000);
+    let label = mount_a11y_label(&mut fixture);
+    let painted = mount_fanout(&mut fixture, 1);
+    let _ = fixture.app.frame(fixture.window);
+    // 预置「前一个值」⇒ 每个计时帧都真的改变。
+    fixture
+        .app
+        .write(&label, SmolStr::new_static("a11y label 1"));
+    fixture.app.write(&painted, 1u8);
+    let mut a11y_min = Duration::MAX;
+    let mut paint_min = Duration::MAX;
+    for round in 0..7usize {
+        let value = if round.is_multiple_of(2) {
+            SmolStr::new_static("a11y label 2")
+        } else {
+            SmolStr::new_static("a11y label 1")
+        };
+        let start = Instant::now();
+        fixture.app.write(&label, value);
+        let outcome = fixture.app.frame(fixture.window);
+        a11y_min = a11y_min.min(start.elapsed());
+        black_box(outcome);
+
+        let start = Instant::now();
+        // 2..=8/255：始终可见（opacity=0 会让 lane 变空，测的是「无实例」的边）。
+        fixture.app.write(&painted, 2 + round as u8);
+        let outcome = fixture.app.frame(fixture.window);
+        paint_min = paint_min.min(start.elapsed());
+        black_box(outcome);
+    }
+    let ratio = paint_min.as_secs_f64() / a11y_min.as_secs_f64();
+    eprintln!(
+        "a11y_only_update: a11y-only {:.2} µs vs paint {:.2} µs ({ratio:.1}×)",
+        a11y_min.as_secs_f64() * 1e6,
+        paint_min.as_secs_f64() * 1e6
+    );
+    assert!(
+        a11y_min * 3 < paint_min,
+        "a11y-only 帧（{:.2} µs）必须远低于同规模绘制帧（{:.2} µs，{ratio:.1}×）：\
+         a11y-only 写又跑回像素管线了？",
+        a11y_min.as_secs_f64() * 1e6,
+        paint_min.as_secs_f64() * 1e6
+    );
 }
 
 fn bench_signal_write(c: &mut Criterion) {
@@ -943,6 +1093,7 @@ criterion_group! {
         bench_layout,
         bench_frame_full,
         bench_frame_incremental,
+        bench_a11y_only_update,
         bench_signal_write,
         bench_tree_build_scale,
         bench_frame_incremental_scale,

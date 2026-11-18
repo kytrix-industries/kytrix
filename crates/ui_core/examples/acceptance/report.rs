@@ -174,19 +174,16 @@ impl IntervalReport {
     /// 多行报告。
     #[must_use]
     pub fn lines(&self) -> String {
-        let summary = self
-            .intervals
-            .summary()
-            .unwrap_or(Summary {
-                count: 0,
-                min_us: 0.0,
-                p50_us: 0.0,
-                p95_us: 0.0,
-                p99_us: 0.0,
-                max_us: 0.0,
-                mean_us: 0.0,
-                stddev_us: 0.0,
-            });
+        let summary = self.intervals.summary().unwrap_or(Summary {
+            count: 0,
+            min_us: 0.0,
+            p50_us: 0.0,
+            p95_us: 0.0,
+            p99_us: 0.0,
+            max_us: 0.0,
+            mean_us: 0.0,
+            stddev_us: 0.0,
+        });
         format!(
             "frame interval      n={} p50={:.3}ms p95={:.3}ms p99={:.3}ms max={:.3}ms min={:.3}ms\n\
              frame rate          {:.2} fps (median interval)\n\
@@ -273,8 +270,10 @@ pub fn sample_idle_cpu(duration: Duration) -> Option<IdleCpu> {
 #[cfg(windows)]
 #[must_use]
 pub fn process_cpu_seconds() -> Option<f64> {
-    use windows::Win32::Foundation::FILETIME;
-    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    use windows::Win32::{
+        Foundation::FILETIME,
+        System::Threading::{GetCurrentProcess, GetProcessTimes},
+    };
 
     let mut creation = FILETIME::default();
     let mut exit = FILETIME::default();

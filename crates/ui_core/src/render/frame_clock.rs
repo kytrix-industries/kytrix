@@ -8,9 +8,14 @@
 //! | macOS  | `CAMetalDisplayLinkUpdate.targetPresentationTimestamp`（host time）      | display link 给的目标时刻 |
 //! | Linux  | `wl_surface.frame` 回调（+ 单调时钟推算）                                | 回调时刻 + 1 个刷新周期 |
 //!
-//! 三种来源都归一到同一个 [`FrameTick`]（`Instant` 时基 + 刷新率），因此**「何时提交、何时跳过、
-//! 提交时钉不钉目标时刻」这套判定只有 [`FramePacing`] 一份实现**：macOS wave-4 的
-//! `PresentPacing`、Windows 的合成器节拍、Linux 的 frame callback 补偿都收敛到它。
+//! 三种来源都归一到同一个 [`FrameTick`]（`Instant` 时基 + 刷新率），因此**「何时出帧、何时跳过、
+//! 提交时钉不钉目标时刻」这套判定只有 [`FramePacing`] 一份实现**：Windows 的合成器节拍、Linux 的
+//! frame callback 补偿、macOS 的合成线程帧时钟都收敛到它。
+//!
+//! **macOS 的 GPU 线程不再走这里**：窗口路径的 drawable 由 `CAMetalDisplayLink` 提供，呈现时刻由
+//! display link 独占（`presentDrawable:` 不接受时刻，显式时刻会让 `CAMetalDrawable` 抛
+//! `CAMetalDrawableInvalidOperation`，见 `render/macos/present.rs`），因此 GPU 线程不做「钉时刻 /
+//! 跳帧」判定，只按 display link 给的 drawable 出帧。
 //!
 //! 无窗口 / 离屏 / 单测环境用 [`ManualClock`]（确定性：完全由测试推进虚拟时间，不读真实时钟）。
 //!
@@ -37,7 +42,6 @@ pub(crate) const FALLBACK_REFRESH_HZ: f32 = 60.0;
 /// 距离目标呈现时刻不足这个量就认为**来不及提交**。
 ///
 /// 一个 vsync 是 16.7 ms（60 Hz）/ 8.3 ms（120 Hz）；留 2 ms 给「提交 → 合成器收到」的调度。
-/// 与 macOS wave-4 的 `PresentPacing::PRESENT_MARGIN_SECS` 同值同义（收敛到本模块）。
 pub(crate) const PRESENT_MARGIN: Duration = Duration::from_millis(2);
 
 /// 连续跳过本 vsync 的上限：**1**。
@@ -50,7 +54,7 @@ pub(crate) const MAX_CONSECUTIVE_SKIPS: u32 = 1;
 /// 目标呈现时刻与「现在」之间允许的最大提前量。
 ///
 /// 合成器正常只给下一两个 vsync（≤ 34 ms）。异常大的「目标时刻」必须按「系统没给可用时刻」
-/// 处理：`presentDrawable:atTime:` 这类 API 拿到远期时刻会让这张 drawable **永远不上屏**。
+/// 处理：按它对齐相位会让合成线程去追一个很远的时刻（那几拍全部无效），而不是出帧。
 const MAX_PRESENT_LEAD: Duration = Duration::from_millis(100);
 
 /// 刷新率规范化（三平台共用；异常值一律 clamp 到可渲染区间）。
@@ -79,7 +83,7 @@ pub(crate) struct FrameTick {
     pub completed: bool,
 }
 
-/// 一次呈现决定（原 macOS `PresentPlan`，收敛到共享层）。
+/// 一次呈现决定（`FramePacing::plan` 的结论）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum PresentDecision {
     /// 钉到目标呈现时刻提交。
@@ -90,10 +94,13 @@ pub(crate) enum PresentDecision {
     Skip,
 }
 
-/// 「何时出帧 / 何时跳过」的共享状态机（三平台唯一实现）。
+/// 「何时出帧 / 何时跳过」的共享状态机（唯一实现）。
 ///
-/// 输入是一次 [`FrameTick`]，输出 [`PresentDecision`]。macOS 的 `present.rs`、Windows 的合成器
-/// 节拍与 Linux 的 frame callback 补偿都走这里 —— 三端的跳帧语义因此不可能再分叉。
+/// 输入是一次 [`FrameTick`]，输出 [`PresentDecision`]。Windows 的合成器节拍、Linux 的 frame
+/// callback 补偿与 macOS 的**合成线程**帧时钟都走这里 —— 跳帧语义因此不可能分叉。
+///
+/// macOS 的 GPU 线程是唯一例外：它按 `CAMetalDisplayLink` 给的 drawable 出帧，呈现时刻由
+/// display link 独占，不做这里的判定（见 `render/macos/present.rs`）。
 pub(crate) struct FramePacing {
     /// 已经连续跳过本 vsync 的次数（`0..=MAX_CONSECUTIVE_SKIPS`）。
     consecutive_skips: u32,
@@ -125,15 +132,6 @@ impl FramePacing {
             self.consecutive_skips += 1;
             PresentDecision::Skip
         }
-    }
-
-    /// **提交之前**的二次夹紧：用录制结束后的新时刻重新判定目标是否还够提交。
-    ///
-    /// `None` = 目标被录制耗时吃掉了（resize 重建、首帧编译 PSO、整页图集上传都可能花掉整个
-    /// 余量）：调用方必须退回「立即呈现」，而不是把一个**已经过期**的时刻交给合成器。
-    #[cfg(any(target_os = "macos", test))]
-    pub(crate) fn clamp_before_present(target: Instant, now: Instant) -> Option<Instant> {
-        usable_target(now, target).filter(|target| now + PRESENT_MARGIN <= *target)
     }
 }
 
@@ -684,25 +682,7 @@ mod tests {
                 completed: true,
             }),
             PresentDecision::Now,
-            "提前量荒谬的目标时刻按不可用处理（远期 atTime 会让 drawable 永不上屏）"
-        );
-    }
-
-    #[test]
-    fn clamping_before_present_uses_the_same_margin() {
-        let now = Instant::now();
-        let target = now + Duration::from_millis(10);
-        assert_eq!(
-            FramePacing::clamp_before_present(target, now + Duration::from_millis(5)),
-            Some(target)
-        );
-        assert_eq!(
-            FramePacing::clamp_before_present(target, target - PRESENT_MARGIN / 2),
-            None
-        );
-        assert_eq!(
-            FramePacing::clamp_before_present(target, target + Duration::from_millis(1)),
-            None
+            "提前量荒谬的目标时刻按不可用处理（不去追一个一秒后的时刻）"
         );
     }
 

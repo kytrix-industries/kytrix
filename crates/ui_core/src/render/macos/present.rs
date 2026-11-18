@@ -1,210 +1,86 @@
-//! 呈现节奏（R09-6 / AR3 §6.2）：`CAMetalDisplayLink` 的目标时刻 → 本 vsync 的呈现决定。
+//! 呈现（drawable 上屏）的唯一入口 + 接口/线程纪律的回归防线。
 //!
-//! **本文件只做时基换算**：判定逻辑是共享层的 `render::frame_clock::FramePacing`（三平台唯一
-//! 一份实现）。macOS 独有的东西只有两样：
+//! # 为什么窗口路径**不能**用 `presentDrawable:atTime:`
 //!
-//! 1. 输入是 `CFTimeInterval`（host time 秒，与 `CACurrentMediaTime()` 同一时基），而共享层用
-//!    `Instant` —— 因此这里维护一个进程级锚点做纯换算；
-//! 2. `presentDrawable:atTime:` 需要一个 `CFTimeInterval`，所以判定结果要换回 host time。
+//! 窗口路径的 drawable 由 `CAMetalDisplayLink` 给出，而 display link **独占呈现时刻**：它给的
+//! `CAMetalDisplayLinkUpdate.targetPresentationTimestamp` 就是这一帧被排定的上屏时刻。因此
+//! `CAMetalDrawable` 拒绝任何显式时刻，运行时直接抛 ObjC 异常：
 //!
-//! 旧实现（AR3 复审 P1）的两个缺陷已由共享实现修掉：连续跳过上界是 **1**，且 `Now` 分支**不**
-//! 清零计数（否则稳态是 `Skip, Skip, Now` = 每 3 个 vsync 只提交 1 帧，120 Hz → 40 fps）。
+//! ```text
+//! CAMetalDrawableInvalidOperation: -presentAtTime should not be called when using CAMetalDisplayLink.
+//! ```
+//!
+//! 抛出点在 **Metal 自己的队列**上（`com.Metal.CompletionQueueDispatch` →
+//! `-[_MTLCommandBuffer presentDrawable:options:]_block_invoke` → `-[CAMetalDrawable
+//! presentWithOptions:]`），时间点是命令缓冲被驱动调度（`didScheduleWithStartTime:`）时 ——
+//! 也就是说 `presentDrawable:atTime:` 返回之后才炸，**没有任何 Rust 帧能拦住它**。展开穿透
+//! FFI 的边界后进程直接 SIGSEGV（真机 `EXC_BAD_ACCESS` + `SIGSEGV`，见 P0 报告）。
+//!
+//! Apple 的 `CAMetalDisplayLinkDelegate.metalDisplayLink(_:needsUpdate:)` 文档也只承诺一个
+//! 「调用 drawable 的 **`present()`** 的截止时刻」（"a deadline to call its drawable's `present()`
+//! method"），从不提 `present(at:)`；`MTLCommandBuffer.present(_:atTime:)` 的文档说明它就是
+//! 「命令队列调度命令缓冲之后调用 drawable 的 `present(at:)`」—— 正是被 display link 禁掉的那条路。
+//!
+//! 所以本后端只用 `MTLCommandBuffer::presentDrawable:`（等价 `present(_:)`，**没有时刻参数**）：
+//! 呈现节奏完全由 display link 决定 —— 它给 drawable，我们画完就尽快提交。
+//!
+//! # 线程纪律
+//!
+//! drawable 在**主线程**取得（display link delegate），编码 / 提交 / present 全在 `kytrix-metal`
+//! 线程。`presentDrawable:` 只是把「这一帧要上屏」登记进命令缓冲，真正的
+//! `presentWithOptions:` 由驱动在自己的队列上执行，所以这次的跨线程本身是合法的；
+//! 但**同一张 drawable 的取得与 present 必须落在同一个 GPU 线程的同一帧里** —— 把别的帧/
+//! 别的线程的 drawable 交给本帧的命令缓冲，一样会在驱动里炸掉，因此这里有一道断言守卫。
 
-use std::{sync::OnceLock, time::Instant};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandBuffer, MTLDrawable};
 
-use objc2_core_foundation::CFTimeInterval;
+use crate::render::macos::device::on_gpu_thread;
 
-use crate::render::frame_clock::{FALLBACK_REFRESH_HZ, FramePacing, FrameTick, TimeAnchor};
-
-/// 本 vsync 的呈现决定（[`PresentPacing::plan`] 的结论）。
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum PresentPlan {
-    /// `presentDrawable:atTime:`：钉到 display link 要求的那一帧。
-    AtTime(CFTimeInterval),
-    /// `presentDrawable:`：目标时刻不可用，或连续迟到到不值得再等。
-    Now,
-    /// 跳过本 vsync：目标时刻已经不够提交（提交注定被推到下一帧）。
-    Skip,
-}
-
-/// host time 锚点（进程级一次）：`CFTimeInterval` ⇄ `Instant` 的纯换算。
-fn host_anchor() -> Option<&'static TimeAnchor> {
-    static ANCHOR: OnceLock<Option<TimeAnchor>> = OnceLock::new();
-    ANCHOR
-        .get_or_init(|| TimeAnchor::new(Instant::now(), host_now()))
-        .as_ref()
-}
-
-/// 当前 host time（`CACurrentMediaTime` 同一时基；失败时用 0 让锚点退化为「从进程启动算起」）。
-fn host_now() -> f64 {
-    objc2_quartz_core::CACurrentMediaTime()
-}
-
-/// 呈现时刻判定（薄壳：状态在共享层的 [`FramePacing`] 里）。
-pub(crate) struct PresentPacing {
-    inner: FramePacing,
-}
-
-impl PresentPacing {
-    pub(crate) const fn new() -> Self {
-        Self {
-            inner: FramePacing::new(),
-        }
-    }
-
-    /// **录制之前**的判定：本 vsync 提交不提交、提交时钉不钉目标时刻。
-    pub(crate) fn plan(&mut self, now: CFTimeInterval, target: CFTimeInterval) -> PresentPlan {
-        // 时基换算失败（锚点缺失 / 异常值）：退回「尽快呈现」，绝不把非法时刻交给 CA。
-        let Some(tick) = self.tick(now, target) else {
-            return PresentPlan::Now;
-        };
-        match self.inner.plan(tick) {
-            // 钉时刻时把**原始的** host time 还给调用方（避免 Instant 往返的量化误差）。
-            crate::render::frame_clock::PresentDecision::AtTime(_) => PresentPlan::AtTime(target),
-            crate::render::frame_clock::PresentDecision::Now => PresentPlan::Now,
-            crate::render::frame_clock::PresentDecision::Skip => PresentPlan::Skip,
-        }
-    }
-
-    fn tick(&self, now: CFTimeInterval, target: CFTimeInterval) -> Option<FrameTick> {
-        let anchor = host_anchor()?;
-        Some(FrameTick {
-            now: anchor.to_instant(now)?,
-            present_time: anchor.to_instant(target)?,
-            refresh_hz: FALLBACK_REFRESH_HZ,
-            completed: true,
-        })
-    }
-}
-
-/// **提交之前**的二次夹紧：用录制结束后的新时刻重新判定目标是否还够提交。
+/// present 之前的线程归属断言。
 ///
-/// `None` = 目标被录制耗时吃掉了（resize 重建 persist、首帧同步编译 PSO、整页图集上传都可能
-/// 花掉整个余量），调用方必须退回 `presentDrawable:`（尽快呈现），而不是把一个**已经过期**的
-/// 时刻交给 CA —— 后者会被推到下一个 vsync，正是 R09-6 想消除的「迟到一帧 + 抖动」。
-pub(crate) fn clamp_present_time(
-    target: CFTimeInterval,
-    now: CFTimeInterval,
-) -> Option<CFTimeInterval> {
-    let anchor = host_anchor()?;
-    let target_instant = anchor.to_instant(target)?;
-    let now_instant = anchor.to_instant(now)?;
-    FramePacing::clamp_before_present(target_instant, now_instant).map(|_| target)
+/// 这里刻意用 release 也生效的 `assert!`（而同模块的其它线程归属断言都是 `debug_assert!`）：
+/// present 是**唯一不可恢复**的调用点 —— 走错线程的后果是驱动里抛 ObjC 异常、穿 FFI 后整个进程
+/// SIGSEGV，没有任何机会发布错误或降级。代价只是每帧一次 thread-local 读。
+fn assert_present_thread() {
+    assert!(
+        on_gpu_thread(),
+        "Metal window frames may only be presented on the kytrix-metal thread"
+    );
+}
+
+/// **唯一**的 present 入口：`MTLCommandBuffer::presentDrawable:`（无时刻参数，见模块文档）。
+pub(crate) fn present(
+    command: &ProtocolObject<dyn MTLCommandBuffer>,
+    drawable: &ProtocolObject<dyn MTLDrawable>,
+) {
+    assert_present_thread();
+    command.presentDrawable(drawable);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PresentPacing, PresentPlan, clamp_present_time};
-    use crate::render::frame_clock::{MAX_CONSECUTIVE_SKIPS, PRESENT_MARGIN};
+    use super::{assert_present_thread, on_gpu_thread};
+    use crate::render::macos::device::enter_gpu_thread;
 
-    /// 120 Hz 的 vsync 周期（秒）。
-    const VSYNC_120: f64 = 1.0 / 120.0;
-
-    /// 还来得及提交：钉到目标呈现时刻。
+    /// 「drawable 取得 → 编码 → 提交 → present 全在同一条 GPU 线程」：任何别的线程（UI 线程、
+    /// Metal 的完成/呈现回调线程）调用 present 入口都必须立刻炸在断言上。
     #[test]
-    fn a_fresh_target_presentation_timestamp_is_pinned() {
-        let mut pacing = PresentPacing::new();
-        let target = 1_000.010;
-        assert_eq!(pacing.plan(1_000.0, target), PresentPlan::AtTime(target));
+    #[should_panic(expected = "kytrix-metal thread")]
+    fn presenting_off_the_gpu_thread_is_a_contract_violation() {
+        assert!(!on_gpu_thread(), "测试线程不是 GPU 线程");
+        assert_present_thread();
     }
 
-    /// 连续迟到：**最多**跳 1 个 vsync，之后保持「尽快呈现」，直到重新赶上目标时刻
-    /// （不允许 1/3 刷新率，也不在 `Now` 分支清零计数）。
+    /// GPU 线程上同一个入口不触发断言（`enter_gpu_thread` 是 GPU 循环入口打的标记）。
     #[test]
-    fn a_late_target_skips_once_then_presents_immediately() {
-        let mut pacing = PresentPacing::new();
-        let target = 1_000.0;
-        let late = target - PRESENT_MARGIN.as_secs_f64() / 2.0;
-        assert_eq!(pacing.plan(late, target), PresentPlan::Skip, "落后：跳一次");
-        for _ in 0..5 {
-            assert_eq!(
-                pacing.plan(late, target),
-                PresentPlan::Now,
-                "跳过之后必须保持提交（不能每隔几个 vsync 再跳一次）"
-            );
-        }
-        // 追上之后回到钉时刻（计数随之清零）。
-        assert_eq!(
-            pacing.plan(1_000.0, target + 0.010),
-            PresentPlan::AtTime(target + 0.010)
-        );
-    }
-
-    /// 系统不给目标时刻（headless / 0 / NaN / 负 / 巨型提前量）：回到「尽快呈现」。
-    #[test]
-    fn a_missing_or_absurd_target_timestamp_presents_immediately() {
-        for target in [0.0, f64::NAN, f64::INFINITY, -1.0, f64::MAX] {
-            let mut pacing = PresentPacing::new();
-            assert_eq!(pacing.plan(123.0, target), PresentPlan::Now, "{target:?}");
-        }
-    }
-
-    /// 慢帧 / 唤醒抖动序列（120 Hz，GPU 线程每次都在 vsync 之后 7 ms 才被唤醒）绝不能退化成
-    /// 「每 3 个 vsync 只提交 1 帧」。
-    #[test]
-    fn a_slow_120hz_frame_series_never_drops_to_one_third_rate() {
-        const WAKE_DELAY: f64 = 0.007;
-        const VSYNCS: u32 = 30;
-        let mut pacing = PresentPacing::new();
-        let mut submitted = 0u32;
-        let mut consecutive_skips = 0u32;
-        let mut max_consecutive_skips = 0u32;
-        for vsync in 0..VSYNCS {
-            let now = f64::from(vsync) * VSYNC_120 + WAKE_DELAY;
-            // display link 要求本帧在**下一个** vsync 上屏。
-            let target = f64::from(vsync + 1) * VSYNC_120;
-            match pacing.plan(now, target) {
-                PresentPlan::Skip => {
-                    consecutive_skips += 1;
-                    max_consecutive_skips = max_consecutive_skips.max(consecutive_skips);
-                }
-                PresentPlan::AtTime(_) | PresentPlan::Now => {
-                    consecutive_skips = 0;
-                    submitted += 1;
-                }
-            }
-        }
-        assert!(
-            max_consecutive_skips <= MAX_CONSECUTIVE_SKIPS,
-            "最多连续跳过 {max_consecutive_skips} 次：1/3 刷新率回归"
-        );
-        assert!(
-            submitted >= VSYNCS - 2,
-            "慢帧下只提交了 {submitted}/{VSYNCS} 帧（旧实现的 1/3 刷新率 = 10 帧）"
-        );
-    }
-
-    /// 录制耗时把目标吃掉：提交前必须改成「立即呈现」，不能把过期时刻交给 CA。
-    #[test]
-    fn a_target_that_expires_during_recording_presents_immediately() {
-        let target = 1_000.010;
-        // 录制 5 ms：还剩 3 ms 余量，仍可钉时刻。
-        assert_eq!(
-            clamp_present_time(target, target - 0.005),
-            Some(target),
-            "录制后仍来得及提交"
-        );
-        // 只剩一半余量：已经不够提交（用「明显不足」而不是卡在浮点边界上）。
-        assert_eq!(
-            clamp_present_time(target, target - PRESENT_MARGIN.as_secs_f64() / 2.0),
-            None
-        );
-        // 已经过期：立即呈现。
-        assert_eq!(clamp_present_time(target, target + 0.001), None);
-        // 异常目标时刻：同样退回立即呈现。
-        assert_eq!(clamp_present_time(f64::MAX, 1_000.0), None);
-        assert_eq!(clamp_present_time(0.0, 1_000.0), None);
-    }
-
-    /// 一次迟到不会粘住状态：紧随其后的正常 vsync 仍走钉时刻路径。
-    #[test]
-    fn one_late_vsync_does_not_stick() {
-        let mut pacing = PresentPacing::new();
-        assert_eq!(pacing.plan(1_000.0, 1_000.001), PresentPlan::Skip);
-        assert_eq!(
-            pacing.plan(1_000.002, 1_000.010),
-            PresentPlan::AtTime(1_000.010),
-            "重新对齐后必须恢复钉时刻"
-        );
+    fn presenting_on_the_gpu_thread_is_allowed() {
+        std::thread::spawn(|| {
+            enter_gpu_thread();
+            assert_present_thread();
+            assert!(on_gpu_thread());
+        })
+        .join()
+        .expect("gpu thread");
     }
 }

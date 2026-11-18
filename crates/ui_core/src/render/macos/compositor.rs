@@ -40,7 +40,7 @@ use objc2_metal::{
     MTLResourceOptions, MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture, MTLTextureDescriptor,
     MTLTextureUsage, MTLViewport,
 };
-use objc2_quartz_core::{CACurrentMediaTime, CAMetalDrawable};
+use objc2_quartz_core::CAMetalDrawable;
 
 #[cfg(any(test, feature = "test-support"))]
 use crate::paint::instance::InstanceBuffer;
@@ -52,7 +52,7 @@ use crate::{
     render::{
         compositor::{DamageRects, FramePlan, MAX_DRAW_PASSES, Plan},
         damage::MAX_DAMAGE_RECTS,
-        frame::{FramePayload, InstanceMirror, MAX_FRAMES_IN_FLIGHT},
+        frame::{FramePayload, FrameSlot, InstanceMirror, MAX_FRAMES_IN_FLIGHT},
         macos::{
             atlas::AtlasTextures,
             core::{GpuCore, PersistLease},
@@ -88,7 +88,7 @@ pub(crate) struct GpuRenderer {
     ///
     /// permit 必须与**具体槽**绑定：`try_acquire` 取的是某一槽的许可，`begin` 必须用
     /// 同一个槽，否则上传会写进别的在飞帧正在读的缓冲。
-    pending_slot: Option<crate::render::frame::FrameSlot>,
+    pending_slot: Option<FrameSlot>,
     /// 四条 PSO（懒解析：进程内首次需要时由 `GpuCore` 编译一次，之后是缓存命中）。
     ///
     /// 懒在这里而不是构造时：窗口路径的构造在主线程，PSO 首次编译（数十毫秒）必须落在
@@ -116,8 +116,9 @@ pub(crate) struct GpuRenderer {
     geometry: GeometryRegistry,
     /// 下一次 present 是否必须全量（新建 / 重建之后为 `true`）。
     fresh: bool,
-    /// 最后一次**提交**的帧序号：重建产生的旧句柄以它作为 retire 的 tag（§4.3）。
-    last_index: FrameIndex,
+    /// 最后一次**提交**的 `u64` 提交序号（`FrameSlot::signal_value`）：重建产生的旧句柄以它作为
+    /// retire 的 tag（§4.3）。**不是** `FrameIndex`（R06-1）：`u32` 帧号会饱和。
+    last_sequence: u64,
     /// 本渲染器是否是**窗口**目标（§10.1 的线程归属断言只对窗口路径成立：离屏 / 快照由门面
     /// 在 UI 线程同步调用）。
     window_target: bool,
@@ -196,7 +197,7 @@ impl GpuRenderer {
             geometry: GeometryRegistry::new(),
             pending_slot: None,
             fresh: true,
-            last_index: FrameIndex::default(),
+            last_sequence: 0,
             window_target,
             #[cfg(any(test, feature = "test-support"))]
             readback: Readback::new(),
@@ -245,10 +246,13 @@ impl GpuRenderer {
         self.fresh
     }
 
-    /// 非阻塞取一个上传槽（三缓冲背压，I1）：`false` = 三帧在飞，本帧跳帧。
-    pub(crate) fn try_acquire_upload_slot(&mut self) -> bool {
+    /// 非阻塞取一个上传槽（三缓冲背压，I1）：`None` = 三帧在飞，本帧跳帧。
+    ///
+    /// 返回本帧的 [`FrameSlot`] —— 它带着 `u64` 提交序号，调用方用它登记 retire（R06-1）并把
+    /// 同一个序号放进完成通知。
+    pub(crate) fn try_acquire_upload_slot(&mut self) -> Option<FrameSlot> {
         self.pending_slot = self.queue.try_acquire();
-        self.pending_slot.is_some()
+        self.pending_slot
     }
 
     /// 归还一个已经取到、但本帧没有提交的槽位（防御路径）。
@@ -281,7 +285,7 @@ impl GpuRenderer {
         //   看到未初始化像素（比停帧更糟）。
         self.persist_lease.resize(size)?;
         let old = self.persist.recreate(&mut self.device, size)?;
-        self.queue.retire(self.last_index, old);
+        self.queue.retire(self.last_sequence, old);
         self.surface = size;
         self.fresh = true;
         // 新尺寸的 drawable 是图层池里新建的纹理，旧表项持有的是旧尺寸纹理：同步状态整体作废
@@ -308,17 +312,14 @@ impl GpuRenderer {
     /// 窗口路径：把一帧画进 persist 后，把这张 drawable 落后于 persist 的部分 blit 过去，登记
     /// 完成通知与呈现通知并 `commit`（I2）。
     ///
-    /// 调用方（GPU 循环）已经：取到 drawable、按 target presentation timestamp 判定本 vsync 要
-    /// 提交、非阻塞拿到三槽上传槽、按 drawable 实际尺寸调过 [`GpuRenderer::prepare_target`]，
-    /// 并构造好 `frame`。
+    /// 调用方（GPU 循环）已经：取到 drawable、非阻塞拿到三槽上传槽、按 drawable 实际尺寸调过
+    /// [`GpuRenderer::prepare_target`]，并构造好 `frame`。
     ///
-    /// `present_at` 是 `CAMetalDisplayLinkUpdate.targetPresentationTimestamp`（host time）：
-    /// `Some` ⇒ `presentDrawable:atTime:`（把呈现钉到 display link 要求的那一帧），`None` ⇒
-    /// 目标时刻不可用 / 已经来不及提交时的立即呈现（`presentDrawable:`）。
-    ///
-    /// **录制之后还有一次夹紧**（AR3 §6.2）：判定发生在录制之前，而录制可能吃掉整个余量
-    /// （resize 重建 persist、首帧同步编译 PSO、整页图集上传）；`present_at` 在这里再用
-    /// `CACurrentMediaTime()` 过一遍 [`present::clamp_present_time`]，过期就退回「尽快呈现」。
+    /// **present 只用 [`present::present`]（`presentDrawable:`，无时刻参数）**：这张 drawable 来自
+    /// `CAMetalDisplayLink`，而 `CAMetalDrawable` 对显式呈现时刻直接抛
+    /// `CAMetalDrawableInvalidOperation`（`-presentAtTime should not be called when using
+    /// CAMetalDisplayLink.`），而异常是在驱动调度命令缓冲时才抛的 —— 没有任何 Rust 帧能拦住它，
+    /// 进程会 SIGSEGV。呈现节奏由 display link 独占，见 [`present`] 的模块文档（P0 根因）。
     ///
     /// `presented` 在 drawable 真正上屏时由 CoreAnimation 在**它自己的线程**调用，参数是
     /// **这张 drawable 的身份**与 `MTLDrawable.presentedTime`（唯一权威的呈现时刻，R09-6）。
@@ -328,7 +329,6 @@ impl GpuRenderer {
         &mut self,
         request: &crate::render::frame::FrameRequest,
         drawable: &ProtocolObject<dyn CAMetalDrawable>,
-        present_at: Option<CFTimeInterval>,
         frame: &mut FramePlan,
         completed: impl Fn(Retained<ProtocolObject<dyn MTLCommandBuffer>>) + Send + 'static,
         presented: &Arc<dyn Fn(usize, CFTimeInterval) + Send + Sync>,
@@ -353,9 +353,6 @@ impl GpuRenderer {
             &mut timings,
         )?;
         let mtl_drawable: &ProtocolObject<dyn MTLDrawable> = drawable.as_ref();
-        // **提交前的二次夹紧**（AR3 §6.2）：录制耗时可能已经吃掉判定时的余量。
-        let present_at =
-            present_at.and_then(|target| present::clamp_present_time(target, CACurrentMediaTime()));
         // **先登记呈现回调、再登记呈现**（R09-6）：`presentedTime` 是唯一权威的呈现时刻，
         // 完成回调（GPU 执行完）比它早一个 vsync 左右，不能代替。
         //
@@ -379,18 +376,17 @@ impl GpuRenderer {
         }
         // **在 commit 前登记呈现**（Apple 推荐的 Metal 生命周期）：drawable 在 GPU 完成时立即
         // 归还给 `CAMetalLayer`，而不是等某个同步等待之后。
-        match present_at {
-            // 钉到 display link 给出的呈现时刻（R09-6 的核心）：CA 不必再猜本帧属于哪个 vsync。
-            Some(time) => command.presentDrawable_atTime(mtl_drawable, time),
-            // 没有可用的目标时刻（headless / 目标已被录制吃掉）：回到默认的"尽快呈现"。
-            None => command.presentDrawable(mtl_drawable),
-        }
+        //
+        // 唯一的呈现入口、且**不带时刻**（P0 根因）：这张 drawable 由 `CAMetalDisplayLink` 提供，
+        // 时刻由它独占；`presentDrawable:atTime:` 会让 `CAMetalDrawable` 在驱动调度命令缓冲时
+        // 抛 `CAMetalDrawableInvalidOperation`，异常穿 FFI ⇒ SIGSEGV。见 [`present`] 模块文档。
+        present::present(&command, mtl_drawable);
         let present_started = Instant::now();
         self.queue
             .submit(request.index, slot, &command, completed)?;
         self.fresh = false;
         frame.presented();
-        self.last_index = request.index;
+        self.last_sequence = slot.signal_value;
         timings.push(GpuTimerSample {
             section: Section::Present,
             cpu_ns: elapsed_ns(present_started),
@@ -425,7 +421,7 @@ impl GpuRenderer {
         let present_started = Instant::now();
         self.fresh = false;
         frame.presented();
-        self.last_index = index;
+        self.last_sequence = slot.signal_value;
         timings.push(GpuTimerSample {
             section: Section::Present,
             cpu_ns: elapsed_ns(present_started),
@@ -436,11 +432,13 @@ impl GpuRenderer {
 
     /// 完成通知到达（`kytrix-metal` 线程 drain）：失败分类 / GPU 时间 / retire（I4）。
     ///
+    /// `sequence` 是这次提交的 `u64` 提交序号（retire 的键，R06-1）；`index` 只用于反馈 / 诊断。
     /// 第二个返回值是新的**连续完成前沿**（`CompletionOrder`）：调用方只在它推进时按提交
     /// 顺序发布反馈（完成回调可能乱序，见 `renderer::FeedbackQueue`）。
     pub(crate) fn on_frame_completed(
         &mut self,
         index: FrameIndex,
+        sequence: u64,
         buffer: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<(Option<GpuTimerSample>, Option<FrameIndex>), EngineError> {
         debug_assert!(
@@ -450,7 +448,9 @@ impl GpuRenderer {
         if buffer.status() == MTLCommandBufferStatus::Error {
             return Err(self.queue.failure(index, buffer, &mut self.device));
         }
-        Ok(self.queue.on_completed(index, buffer, &mut self.device))
+        Ok(self
+            .queue
+            .on_completed(index, sequence, buffer, &mut self.device))
     }
 
     /// 读回持久 offscreen（快照；`submit_snapshot` 已保证本帧完成）。
@@ -510,7 +510,7 @@ impl GpuRenderer {
         timings: &mut FrameTimings,
     ) -> Result<
         (
-            crate::render::frame::FrameSlot,
+            FrameSlot,
             Retained<ProtocolObject<dyn MTLCommandBuffer>>,
             crate::render::RenderStats,
         ),
@@ -550,7 +550,7 @@ impl GpuRenderer {
             &mut self.device,
             &mut self.queue,
             &mut self.mirror,
-            index,
+            slot.signal_value,
             slot.index,
             payload,
         )?;
@@ -567,11 +567,11 @@ impl GpuRenderer {
         // 推进几何 registry 的帧号：`ensure` 记录 last_used，帧末 `retain_recent` 驱逐
         // 长期未绘制的几何（D-1：否则应用释放句柄后 GPU 缓冲永不回收）。
         self.geometry.begin_frame();
-        // 页尺寸变化在编码 blit 之前落地：新纹理建好、旧纹理句柄按本帧序号 retire
+        // 页尺寸变化在编码 blit 之前落地：新纹理建好、旧纹理句柄按本帧提交序号 retire
         // （DEVIATIONS F-208）。纹理绑定是每帧 `setFragmentTexture` 现场写的，无需重写。
         let _rebuilt = self
             .atlas
-            .prepare(&mut self.device, &mut self.queue, index)?;
+            .prepare(&mut self.device, &mut self.queue, slot.signal_value)?;
         if self.atlas.has_pending() {
             let blit = command
                 .blitCommandEncoder()
@@ -581,7 +581,7 @@ impl GpuRenderer {
             self.atlas.record_uploads(
                 &mut self.device,
                 &mut self.queue,
-                index,
+                slot.signal_value,
                 slot.index,
                 &blit,
             )?;
@@ -665,15 +665,16 @@ impl GpuRenderer {
             }
             encoder.endEncoding();
         }
-        // 几何换代的旧缓冲按**当前帧序号**入 retire 队列（等该帧完成后释放，I4）；同时驱逐
+        // 几何换代的旧缓冲按**本帧提交序号**入 retire 队列（等该次提交完成后释放，I4）；同时驱逐
         // 长期未绘制的几何（它们的设备对象进同一个 retire 列表）。
         //
-        // 用 `index` 而不是 `last_index`：后者是**上一次已提交**的帧，按它释放会比「当前帧
-        // 完成」更早 —— 现在恰好安全（被驱逐的几何 180 帧未用、换代旧缓冲也不被本帧引用），
-        // 但这是隐式假设而不是本代码的保证；Windows/Linux 两后端都用当前帧号（复审 P2-3）。
+        // 用本帧的 `slot.signal_value` 而不是 `last_sequence`：后者是**上一次已提交**的提交，按它
+        // 释放会比「当前帧完成」更早 —— 现在恰好安全（被驱逐的几何 180 帧未用、换代旧缓冲也不被
+        // 本帧引用），但这是隐式假设而不是本代码的保证；Windows/Linux 两后端都用当前提交点
+        // （复审 P2-3）。
         self.geometry.retain_recent(&mut geometry_retired);
         for handle in geometry_retired {
-            self.queue.retire(index, handle);
+            self.queue.retire(slot.signal_value, handle);
         }
         if let Some(drawable) = drawable {
             let target = drawable.texture();
@@ -1113,7 +1114,8 @@ impl UploadArena {
 
     /// 写入本帧的实例/裁剪字节；容量不够时扩容（旧缓冲交 retire 队列）。
     ///
-    /// 实例走**增量写**：`InstanceMirror` 持有完整实例字节，本帧只把变化区间（或整块，当该槽
+    /// `sequence` 是本帧的 `u64` 提交序号（retire 的键，R06-1）。实例走**增量写**：
+    /// `InstanceMirror` 持有完整实例字节，本帧只把变化区间（或整块，当该槽
     /// 需要整块重写时）拷进当前槽的 `MTLBuffer`；未变化的段保留该槽上次的内容。裁剪表仍然
     /// 全量写（小表，且表项索引必须与实例里内嵌的 `clip_index` 同帧一致）。
     fn write(
@@ -1121,7 +1123,7 @@ impl UploadArena {
         device: &mut Device,
         queue: &mut Queue,
         mirror: &mut InstanceMirror,
-        index: FrameIndex,
+        sequence: u64,
         slot: usize,
         payload: &FramePayload,
     ) -> Result<(u32, u32), EngineError> {
@@ -1136,7 +1138,7 @@ impl UploadArena {
             self.slots[slot].instances = buffer;
             self.slots[slot].instance_handle = handle;
             self.slots[slot].instance_capacity = capacity;
-            queue.retire(index, old);
+            queue.retire(sequence, old);
             // 新缓冲内容未定义：这个槽的增量欠账全部作废，下一次必须整块重写。
             mirror.invalidate(slot);
         }
@@ -1148,7 +1150,7 @@ impl UploadArena {
             self.slots[slot].clips = buffer;
             self.slots[slot].clip_handle = handle;
             self.slots[slot].clip_capacity = capacity;
-            queue.retire(index, old);
+            queue.retire(sequence, old);
         }
         let buffer = &self.slots[slot].instances;
         let full = mirror.prepare(slot, payload);

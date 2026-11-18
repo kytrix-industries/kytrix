@@ -45,6 +45,7 @@ use crate::{
 
 mod native_window;
 mod pump;
+mod recovery;
 mod wndproc;
 
 pub(crate) use pump::run;
@@ -76,6 +77,12 @@ pub(crate) struct WndProcState {
     /// 由泵在派发 `Dpi` 事件时对齐。
     scale: Scale,
     close_requested: bool,
+    /// 待泵消费的显示 / 电源恢复请求（R07-14；同一批里的多条消息合并成一次）。
+    ///
+    /// `WndProc` 只置位并唤醒（判定见 [`recovery::recovery_plan`]），真正的副作用（重新查询
+    /// 显示器、重建交换链、全量重绘）在泵的 ②a′ 执行 —— `WndProc` 不做任何会重入的调用
+    /// （文件头纪律 1）。
+    display_recovery: bool,
     /// 是否已注册 `TrackMouseEvent(TME_LEAVE)`（每进入一次客户区注册一次）。
     mouse_tracking: bool,
     /// a11y（P11：首显前构造的 `accesskit_windows::Adapter` + `WM_GETOBJECT` 接线）。
@@ -111,6 +118,7 @@ impl WndProcState {
             min_size: dpi::min_track_size(dpi),
             scale,
             close_requested: false,
+            display_recovery: false,
             mouse_tracking: false,
             // **必须在窗口显示之前构造**：`Adapter::new` 内部 `init_uia()`，
             // 且不得在处理 `WM_GETOBJECT` 时构造（adapter.rs:411-441）。
@@ -228,6 +236,17 @@ impl WndProcState {
 
     pub(crate) fn take_close_request(&mut self) -> bool {
         std::mem::take(&mut self.close_requested)
+    }
+
+    /// 登记一次显示 / 电源恢复（R07-14）：显示器拓扑、工作区或睡眠唤醒之后由 `WndProc`
+    /// 置位，泵的 ②a′ 消费（动作序列见 [`recovery::RECOVERY_ACTIONS`]）。
+    pub(crate) fn note_display_recovery(&mut self) {
+        self.display_recovery = true;
+    }
+
+    /// 取走显示 / 电源恢复请求（同一批里的多次触发只执行一次）。
+    pub(crate) fn take_display_recovery(&mut self) -> bool {
+        std::mem::take(&mut self.display_recovery)
     }
 
     /// 本窗口的 IME **已应用**状态（泵每轮与 `App` 的目标状态比较）。

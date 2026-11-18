@@ -22,7 +22,6 @@ use crate::{
             queue::CommandStream,
         },
     },
-    window::FrameIndex,
 };
 
 /// 消费者：`GpuRenderer::queue_atlas_upload`（`compositor.rs` 的薄委托）。
@@ -83,7 +82,7 @@ pub(super) fn write_uploads(
     mirror: &mut InstanceMirror,
     shared: &SharedGpu,
     stream: &mut CommandStream,
-    index: FrameIndex,
+    sequence: u64,
     slot: usize,
     payload: &FramePayload,
 ) -> Result<(u32, u32), EngineError> {
@@ -101,7 +100,7 @@ pub(super) fn write_uploads(
         arena.slots[slot].instance_handle = handle;
         arena.slots[slot].instance_capacity = capacity;
         arena.slots[slot].instance_ptr = pointer;
-        stream.retire(index, old);
+        stream.retire(sequence, old);
         // 新缓冲内容未定义：这个槽的增量欠账全部作废，下一次必须整块重写。
         mirror.invalidate(slot);
     }
@@ -116,7 +115,7 @@ pub(super) fn write_uploads(
         arena.slots[slot].clip_handle = handle;
         arena.slots[slot].clip_capacity = capacity;
         arena.slots[slot].clip_ptr = pointer;
-        stream.retire(index, old);
+        stream.retire(sequence, old);
     }
 
     let full = mirror.prepare(slot, payload);

@@ -94,6 +94,24 @@ pub(crate) fn frame(app: &mut App, window: WindowId) -> Option<Result<FrameOutco
     // 又必须在 refresh_text 之前，让新文本在同一帧完成 shape。
     #[cfg(feature = "hud")]
     app.apply_debug_hud(window);
+    // R13-6：`bind_a11y` 的重算与像素管线解耦。`refresh_styles` 已把只绑 a11y 的节点的补丁
+    // 重算完（它们不标 `BIND`/`PAINT`）；若本帧因此没有任何像素工作，就整段跳过文本/布局/
+    // paint/编码（见下面的 a11y-only 出口）。
+    if app
+        .windows
+        .get(&window)
+        .is_some_and(Window::a11y_only_frame)
+    {
+        // a11y-only 帧：仍然"出帧"（平台泵在本轮之后照常投递 TreeUpdate、节流只管投递），
+        // 但**不跑** paint 管线：不重建 lane、不编码、不产生 damage、`FrameIndex` 不变。
+        app.abort_frame(window, ticket);
+        #[cfg(feature = "test-support")]
+        if let Some(target) = app.windows.get_mut(&window) {
+            // 覆盖 `abort_frame` 记下的普通空闲帧：本帧的指标面是 a11y-only。
+            target.record_a11y_only_frame();
+        }
+        return Some(Ok(FrameOutcome::Idle));
+    }
     let text = match app.refresh_text(window) {
         Some(Ok(report)) => report,
         Some(Err(error)) => {
@@ -194,6 +212,8 @@ pub(crate) fn frame(app: &mut App, window: WindowId) -> Option<Result<FrameOutco
             compositor_thread_wait: None,
             encode_on_compositor: false,
             scroll_offset_frames: 0,
+            // R13-6 的累计指标：本帧是像素帧，数字保持不变（a11y-only 帧才会 +1）。
+            a11y_only_frames: target.a11y_only_frames(),
         };
         let Some(target) = app.windows.get_mut(&window) else {
             app.abort_frame(window, ticket);

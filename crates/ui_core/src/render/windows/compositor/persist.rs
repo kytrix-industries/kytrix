@@ -91,13 +91,13 @@ pub(super) fn resize_target(
         .stream
         .reset_in_flight_lists()
         .map_err(|error| renderer.classify(error))?;
-    // 2. 新持久目标（旧句柄按最后一帧序号 retire；命令列表刚被重置，引用已释放）。
+    // 2. 新持久目标（旧句柄按最后一次提交序号 retire；命令列表刚被重置，引用已释放）。
     let rtv = rtv_handle(renderer.shared.raw(), &renderer.rtv_heap, 0);
     let old = renderer
         .persist
         .recreate(&renderer.shared, buffer, rtv)
         .map_err(|error| renderer.classify(error))?;
-    renderer.stream.retire(renderer.last_index, old);
+    renderer.stream.retire(renderer.last_sequence, old);
     // 3. `ResizeBuffers`（回退开关见下）。
     let resized = {
         let device = renderer.shared.raw();
@@ -130,6 +130,56 @@ pub(super) fn resize_target(
     renderer.target.on_target_created();
     renderer.buffer_syncs.invalidate();
     Ok(())
+}
+
+/// 消费者：`GpuRenderer::rebuild_target`（`compositor.rs` 的薄委托）。
+/// 显示 / 电源恢复的**整链重建**（R07-14）。
+///
+/// 为什么不是 `ResizeBuffers`：唤醒 / 换屏之后尺寸常常一点没变（同分辨率换屏、睡眠回来），
+/// 但交换链的显示器关联、驱动侧的呈现状态与持久目标的内容都不可信。这里复用
+/// [`replace_swapchain`] 那条已经存在的整链替换路径（新建 → prime → `SetContent` + `Commit`
+/// → 丢弃旧链），因此恢复路径**没有**第二套「重建交换链」的实现。
+///
+/// 返回 `Ok(false)`：设备健康但本窗口还有在飞工作（`wait_idle` 没等到），这一轮先不重建 ——
+/// 调用方保留代际，下一轮重试（同 `resize_target` 的处理）。
+pub(super) fn rebuild_target(renderer: &mut GpuRenderer) -> Result<bool, EngineError> {
+    // 离屏 / 快照目标没有交换链、也不 present：没有需要重建的东西（任何线程都可以判）。
+    if renderer.swapchain.is_none() {
+        return Ok(true);
+    }
+    debug_assert!(
+        on_gpu_thread(),
+        "the composition target may only be rebuilt on the kytrix-d3d12 thread"
+    );
+    // `ResizeBuffers` / 整链替换的前置条件（R08-1）：本窗口工作完成 + 丢掉命令列表对
+    // back buffer 的间接引用（`replace_swapchain` 的 prime 会重新取 back buffer）。
+    if !renderer
+        .stream
+        .wait_idle()
+        .map_err(|error| renderer.classify(error))?
+        .is_signaled()
+    {
+        return Ok(false);
+    }
+    renderer
+        .stream
+        .reset_in_flight_lists()
+        .map_err(|error| renderer.classify(error))?;
+    let buffer = buffer_size(renderer.surface)?;
+    // 持久目标与 back buffer 一样从零开始（旧内容不可信 ⇒ `TargetState::Fresh`）。
+    let rtv = rtv_handle(renderer.shared.raw(), &renderer.rtv_heap, 0);
+    let old = renderer
+        .persist
+        .recreate(&renderer.shared, buffer, rtv)
+        .map_err(|error| renderer.classify(error))?;
+    renderer.stream.retire(renderer.last_sequence, old);
+    // 设备真的被移除时 `classify` 会把错误升级成 `DeviceLost`（⇒ GPU 线程走既有的
+    // `GpuCell::recover`，R08-4）；设备健康时保留原始交换链错误（与 `resize_target` 同语义）。
+    replace_swapchain(renderer, buffer).map_err(|error| renderer.classify(error))?;
+    renderer.buffer = buffer;
+    renderer.target.on_target_created();
+    renderer.buffer_syncs.invalidate();
+    Ok(true)
 }
 
 /// `ResizeBuffers` 失败时的**回退开关**（R08-1）：整条交换链替换 + prime + `SetContent`。
@@ -187,7 +237,7 @@ pub(super) fn resize_offscreen(
         .persist
         .recreate(&renderer.shared, size, rtv)
         .map_err(|error| renderer.classify(error))?;
-    renderer.stream.retire(renderer.last_index, old);
+    renderer.stream.retire(renderer.last_sequence, old);
     renderer.buffer = size;
     renderer.surface = size;
     renderer.target.on_target_created();

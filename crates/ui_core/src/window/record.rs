@@ -24,6 +24,23 @@ pub(crate) fn record_idle(window: &mut Window) {
     ));
 }
 
+// 消费者：`impl Window::record_a11y_only_frame` 的薄委托（外部调用点见该方法文档）。
+/// a11y-only 帧（R13-6）的记录：没有像素工作、`FrameIndex` 不变，只带 a11y 指标。
+///
+/// 与 [`record_idle`] 的区别只有两处：`a11y_only` 旗标与窗口级累计计数
+/// （`FrameStats::a11y_only_frames`），后者是"快速路径真的在跑"的断言面。
+#[cfg(feature = "test-support")]
+pub(crate) fn a11y_only_record(window: &mut Window) -> FrameRecord {
+    let frames = window.a11y.note_a11y_only_frame();
+    let stats = FrameStats {
+        a11y_only_frames: frames,
+        ..std::mem::take(&mut window.stats)
+    };
+    let mut record = FrameRecord::idle(FrameIndex(window.scheduler.committed()), stats);
+    record.a11y_only = true;
+    record
+}
+
 // 消费者：`impl Window::attach_a11y` 的薄委托（外部调用点见该方法文档）。
 /// 把一笔 a11y 交付挂到**最近一帧**的记录上（`TestApp::drain` 在帧之后调用，与平台泵同序）。
 #[cfg(feature = "test-support")]

@@ -53,7 +53,6 @@ use crate::{
         retire::{GpuResourceHandle, RetireQueue},
         windows::device::{SharedGpu, init_error, init_error_from},
     },
-    window::FrameIndex,
 };
 
 /// fence 等待的硬上限（P1-2.13）。INFINITE 会在设备被移除时永久挂住 UI 线程；
@@ -117,11 +116,11 @@ pub(crate) struct CommandStream {
     fence: ID3D12Fence,
     event: HANDLE,
     ring: InFlightRing,
-    /// 已提交但**尚未确认完成**的帧（FIFO：帧序号 + 它的 signal 值）。
-    submitted: VecDeque<(FrameIndex, u64)>,
+    /// 已提交但**尚未确认完成**的提交序号（FIFO：`Signal` 的 fence 值）。
+    submitted: VecDeque<u64>,
     retire: RetireQueue,
-    /// retire 队列里出现过的最大帧序号（teardown 的兜底释放用）。
-    last_retire_index: Option<FrameIndex>,
+    /// retire 队列里出现过的最大提交序号（teardown 的兜底释放用）。
+    last_retire_sequence: Option<u64>,
     /// 向共享设备登记的提交水位（图集页换代的最小等待集，R08-6）。
     watermark: Arc<StreamWatermark>,
 }
@@ -179,7 +178,7 @@ impl CommandStream {
             ring: InFlightRing::new(),
             submitted: VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT),
             retire: RetireQueue::new(),
-            last_retire_index: None,
+            last_retire_sequence: None,
             watermark,
         })
     }
@@ -219,7 +218,7 @@ impl CommandStream {
     }
 
     /// 关闭 → 执行 → `Signal`，**立即返回**（I2：完成通知只走 fence）。
-    pub(crate) fn submit(&mut self, index: FrameIndex, slot: FrameSlot) -> Result<(), EngineError> {
+    pub(crate) fn submit(&mut self, slot: FrameSlot) -> Result<(), EngineError> {
         let list = &self.lists[slot.index];
         // SAFETY: 列表由本结构独占，提交前已录制完成。
         unsafe { list.Close() }.map_err(|error| init_error_from("CommandList::Close", error))?;
@@ -236,7 +235,7 @@ impl CommandStream {
         unsafe { self.shared.queue().Signal(&self.fence, slot.signal_value) }
             .map_err(|error| init_error_from("CommandQueue::Signal", error))?;
         self.ring.advance(slot);
-        self.submitted.push_back((index, slot.signal_value));
+        self.submitted.push_back(slot.signal_value);
         // 水位与本结构共享：页换代只需要等它，不必等整条队列（R08-6）。
         self.watermark.publish(slot.signal_value);
         Ok(())
@@ -352,16 +351,22 @@ impl CommandStream {
         }
     }
 
-    /// 延迟销毁：本帧用过的资源至少要活到 `index` 的 fence 完成。
-    pub(crate) fn retire(&mut self, index: FrameIndex, handle: GpuResourceHandle) {
-        self.last_retire_index = Some(self.last_retire_index.map_or(index, |last| last.max(index)));
-        self.retire.retire(index, handle);
+    /// 延迟销毁：本提交用过的资源至少要活到 `sequence`（fence 的 signal 值）完成。
+    ///
+    /// 键是 fence 的 `u64` 提交序号，**不是** `FrameIndex`（R06-1）：`u32` 帧号饱和后同一个帧号
+    /// 代表所有后续帧，按它记账会在 `GetCompletedValue()` 越过饱和点时提前释放仍在飞的资源。
+    pub(crate) fn retire(&mut self, sequence: u64, handle: GpuResourceHandle) {
+        self.last_retire_sequence = Some(
+            self.last_retire_sequence
+                .map_or(sequence, |last| last.max(sequence)),
+        );
+        self.retire.retire(sequence, handle);
     }
 
     /// teardown：GPU 已空闲（调用方先 `wait_idle`），把 retire 队列里**所有**残留句柄交回
     /// `SharedGpu` —— 包括录制失败、从未提交的帧（正常路径不会观察到它们的完成）。
     pub(crate) fn drain_retire(&mut self) {
-        let Some(last) = self.last_retire_index else {
+        let Some(last) = self.last_retire_sequence else {
             return;
         };
         let shared = Arc::clone(&self.shared);
@@ -371,24 +376,24 @@ impl CommandStream {
         self.submitted.clear();
     }
 
-    /// **非阻塞**推进 retire：fence 已到达的帧（含被跳过的序号，§4.3）及更早的句柄交回
+    /// **非阻塞**推进 retire：fence 已到达的提交（含被跳过的序号，§4.3）及更早的句柄交回
     /// `SharedGpu` 真正释放。返回释放数。
     ///
     /// 只读 `GetCompletedValue`，不等 GPU（I2 / I4）。
     pub(crate) fn release_completed(&mut self) -> usize {
         let completed = self.completed_value();
         let mut highest = None;
-        while let Some((_, value)) = self.submitted.front() {
+        while let Some(value) = self.submitted.front() {
             if *value > completed {
                 break;
             }
-            let (index, _) = self.submitted.pop_front().expect("front checked above");
-            highest = Some(index);
+            let value = self.submitted.pop_front().expect("front checked above");
+            highest = Some(value);
         }
         match highest {
-            Some(index) => {
+            Some(sequence) => {
                 let shared = Arc::clone(&self.shared);
-                self.retire.on_completed(index, &mut |handle| {
+                self.retire.on_completed(sequence, &mut |handle| {
                     let _ = shared.release(handle);
                 })
             }
@@ -472,11 +477,7 @@ impl CommandStream {
 #[cfg(all(test, windows))]
 mod tests {
     use super::{CommandStream, WaitOutcome};
-    use crate::{render::windows::device::SharedGpu, window::FrameIndex};
-
-    fn index(value: u32) -> FrameIndex {
-        FrameIndex::from_raw(value)
-    }
+    use crate::render::{retire::GpuResourceHandle, windows::device::SharedGpu};
 
     #[test]
     fn submits_and_advances_the_fence_for_many_frames() {
@@ -496,7 +497,7 @@ mod tests {
                 WaitOutcome::Signaled
             );
             stream.reset_slot(slot).expect("reset slot");
-            stream.submit(index(value), slot).expect("submit");
+            stream.submit(slot).expect("submit");
             // 提交本身不等 GPU（I2）：完成状态由调用方按 fence 观察。
             assert_eq!(
                 stream.wait_slot_fence(slot.signal_value).expect("signaled"),
@@ -522,7 +523,7 @@ mod tests {
                 WaitOutcome::Signaled
             );
             stream.reset_slot(slot).expect("reset");
-            stream.submit(index(value), slot).expect("submit");
+            stream.submit(slot).expect("submit");
             assert_eq!(
                 shared.watermark_values(),
                 vec![u64::from(value)],
@@ -535,5 +536,49 @@ mod tests {
             shared.watermark_values().is_empty(),
             "提交流销毁后水位条目必须注销（不留悬空 Weak）"
         );
+    }
+
+    /// R06-1：retire 的键是 fence 的 `u64` 提交序号，不是 `u32` 帧序号。
+    ///
+    /// 两件事一起守：(1) 常规路径按 fence 值释放；(2) 超出 `u32` 范围的提交点（帧序号饱和之后
+    /// 的常态）不会被「更早的帧已完成」提前放掉 —— 只有 teardown 的 `drain_retire` 兜底释放。
+    ///
+    /// 句柄只用于记账（`u32::MAX` 槽位不存在，`release` 是无害的 no-op），断言的是队列行为。
+    #[test]
+    fn retire_keys_are_fence_sequences_beyond_the_frame_index_range() {
+        let _guard = crate::render::windows::device::gpu_test_lock();
+        let shared = SharedGpu::new_warp().expect("WARP shared gpu");
+        let mut stream = CommandStream::new(&shared).expect("command stream");
+        let slot = stream.acquire_slot();
+        assert_eq!(
+            stream.wait_slot_fence(slot.wait_value).expect("slot fence"),
+            WaitOutcome::Signaled
+        );
+        stream.reset_slot(slot).expect("reset slot");
+        stream.submit(slot).expect("submit");
+        assert_eq!(stream.wait_idle().expect("idle"), WaitOutcome::Signaled);
+        let handle = GpuResourceHandle::new(1, 0, u32::MAX);
+
+        // 本提交点：fence 已到 ⇒ 按提交序号释放。
+        stream.retire(slot.signal_value, handle);
+        assert_eq!(
+            stream.release_completed(),
+            1,
+            "fence 已到的提交点按 u64 序号释放"
+        );
+        assert_eq!(stream.pending_retire(), 0);
+
+        // 远超 `u32` 范围的提交点：fence 没到 ⇒ 不得释放（键若还是 `u32` 帧号，饱和后两者同号）。
+        let future = u64::from(u32::MAX) + 7;
+        stream.retire(future, handle);
+        assert_eq!(stream.release_completed(), 0, "fence 没到那个提交点");
+        assert_eq!(
+            stream.pending_retire(),
+            1,
+            "键是 u64 提交序号，不会被已完成的更早提交放掉"
+        );
+        // teardown：调用方已 idle，残留句柄兜底释放。
+        stream.drain_retire();
+        assert_eq!(stream.pending_retire(), 0);
     }
 }

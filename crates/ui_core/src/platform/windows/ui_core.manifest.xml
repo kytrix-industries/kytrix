@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  ui_core 的进程清单（R07-1）：DPI awareness 由本仓声明，而不是依赖的资源合并副作用。
+
+  `build.rs` 把它编成 `RT_MANIFEST`（ID 1）并链接进每个链接本 crate 的可执行文件；
+  运行期还会用 `GetThreadDpiAwarenessContext` 校验实际值（`dpi_awareness.rs`），
+  因为清单只是声明 —— 宿主进程可能已经有自己的清单或已经设过 awareness。
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10：引擎的合成器节拍（DCompositionWaitForCompositorClock）要求 1809+。 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
+    </application>
+  </compatibility>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <!-- Windows 10 1607 及更早版本读 `dpiAware`；1703+ 读 `dpiAwareness`。两条都要有。 -->
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <!-- 引擎要求 PerMonitorV2：`WM_DPICHANGED` 带每屏建议矩形、非客户区按新 DPI 重绘。 -->
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>

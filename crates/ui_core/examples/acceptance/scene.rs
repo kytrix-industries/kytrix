@@ -23,12 +23,7 @@ use ui_core::{
     error::EngineError,
     interaction::{ScrollConfig, ScrollHandle},
     math::{Point, Rect, Size, Transform},
-    node::{
-        builder::NodeBuilder,
-        id::NodeId,
-        signal::Signal,
-        tree::NodeTree,
-    },
+    node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{
         color::Color,
         geometry::{GeometryDesc, GeometryId, GeometryPipeline, IndexType, Topology},
@@ -200,7 +195,8 @@ impl Load {
             build_tree(tree, root, &book_rows, &trade_rows, chart_geometry)
         };
 
-        let book_scroll = app.make_scroll(window, handles.book_viewport, ScrollConfig::default())?;
+        let book_scroll =
+            app.make_scroll(window, handles.book_viewport, ScrollConfig::default())?;
         app.set_scroll_content(
             &book_scroll,
             Size::new(
@@ -208,7 +204,8 @@ impl Load {
                 BOOK_ROWS as f32 * BOOK_ROW_HEIGHT,
             ),
         )?;
-        let tape_scroll = app.make_scroll(window, handles.tape_viewport, ScrollConfig::default())?;
+        let tape_scroll =
+            app.make_scroll(window, handles.tape_viewport, ScrollConfig::default())?;
         app.set_scroll_content(
             &tape_scroll,
             Size::new(
@@ -596,18 +593,19 @@ fn label(tree: &mut NodeTree, parent: NodeId, rect: Rect, content: &str, style: 
 
 /// 盘口单元格的值：列 0 是价格（分），列 6 是占比（千分比），列 7 是涨跌（分，带符号），
 /// 其余是无量纲计数。
+///
+/// **每步必然变化**：取值 = 列内基准 + `step`，相邻两步的文本一定不同（否则
+/// `App::write` 会退化成 no-op，那一帧少一条脏 lane，报告里的 `encoded_lanes` 就对不齐）。
 #[must_use]
 pub fn book_value(row: usize, column: usize, step: u32) -> u32 {
     let seed = (row as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ (column as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
-        ^ (step as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
-    let mixed = seed ^ (seed >> 31) ^ (seed >> 17);
-    let value = mixed as u32;
+        ^ (column as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    let base = ((seed ^ (seed >> 31) ^ (seed >> 17)) as u32).wrapping_add(step);
     match column {
-        0 => 9_000_00 + value % 2_000_00,
-        6 => 1 + value % 100_00,
-        7 => 8_00 + value % 1_600,
-        _ => 1 + value % 999_999,
+        0 => 900_000 + base % 200_000,
+        6 => 1 + base % 10_000,
+        7 => 800 + base % 1_600,
+        _ => 1 + base % 999_999,
     }
 }
 
@@ -628,7 +626,7 @@ pub fn book_text(value: u32, column: usize) -> SmolStr {
 /// 成交单元格的文本。
 #[must_use]
 pub fn trade_text(seq: u32, column: usize) -> SmolStr {
-    let price = 9_000_00 + seq.wrapping_mul(7_919) % 2_000_00;
+    let price = 900_000 + seq.wrapping_mul(7_919) % 200_000;
     let size = 1 + seq.wrapping_mul(1_009) % 99_999;
     match column {
         0 => format_smolstr!("{:06}", seq % 1_000_000),

@@ -852,7 +852,6 @@ mod tests {
             frame::MAX_FRAMES_IN_FLIGHT,
             windows::{device::SharedGpu, queue::CommandStream, readback::Readback},
         },
-        window::FrameIndex,
     };
 
     /// 测试页：2048² 的纹理在 WARP 上代价过高（且会拖垮并行的 GPU 测试）。
@@ -1186,8 +1185,9 @@ mod tests {
         );
 
         // 交给提交流之后仍在 retire 队列里（fence 未到，不能释放）。
+        // 键是 fence 的 u64 提交序号（R06-1）。
         for handle in retired {
-            harness.stream.retire(FrameIndex::from_raw(1), handle);
+            harness.stream.retire(1, handle);
         }
         assert!(
             harness.stream.pending_retire() >= MAX_FRAMES_IN_FLIGHT,

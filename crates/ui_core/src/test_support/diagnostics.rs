@@ -826,6 +826,8 @@ mod tests {
             damage_full: false,
             scanned_nodes: 0,
             dirty_nodes: Vec::new(),
+            repainted: true,
+            a11y_only: false,
             paint_log: crate::test_support::record::PaintLog::default(),
             a11y: None,
         };

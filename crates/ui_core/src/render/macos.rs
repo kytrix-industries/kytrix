@@ -13,7 +13,8 @@ pub(crate) mod device;
 /// 静态几何的 GPU 缓冲（按需创建；`GeometryStore` 的 Metal 侧缓存）。
 pub(crate) mod geometry;
 pub(crate) mod pipeline;
-/// 呈现节奏状态机（display link 目标时刻 → 本 vsync 的呈现决定）：R09-6 / AR3 §6.2。
+/// drawable 上屏的**唯一**入口 + 「present 必须在 GPU 线程、且不带显式呈现时刻」的断言
+/// （`CAMetalDisplayLink` 独占呈现时刻）：P0 回归防线。
 pub(crate) mod present;
 pub(crate) mod queue;
 #[cfg(any(test, feature = "test-support"))]

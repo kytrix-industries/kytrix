@@ -652,6 +652,7 @@ fn scroll_offset_is_clamped_in_the_same_frame_as_a_resize() {
 /// 复审 AR4 P1-3 的核心验收。接线前 `Window.scroll_slots` 恒空、`LaneSource::lane_scroll` 恒 0，
 /// 滚动走的是「重建全部 lane + 重编码 + 全量 damage」——`scroll_1px_10k` 因此是 4 ms 级
 /// （目标 ≤200 µs）。这条用例用真实 `App::frame` 路径把三件事一起钉住，undo 掉任一处接线都会失败。
+#[cfg(feature = "test-support")]
 #[test]
 fn a_one_pixel_scroll_frame_rebuilds_nothing_and_damages_only_the_viewport() {
     let (_rt, mut app, window, container, child) = scrollable_app();

@@ -169,7 +169,8 @@ impl Scenario {
 }
 
 /// 跑 `cpu` 模式；返回 `true` = 两项 CPU 指标都达标。
-pub fn run(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {    let runtime = tokio::runtime::Builder::new_current_thread()
+pub fn run(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     let mut app = App::new(runtime.handle().clone());
@@ -192,7 +193,10 @@ pub fn run(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {    let
          计时不可与生产特性比较，只看确定性计数。"
     );
     println!("{}", load.describe(&app));
-    println!("建树 + 首次挂载      {:.1} ms", build_time.as_secs_f64() * 1e3);
+    println!(
+        "建树 + 首次挂载      {:.1} ms",
+        build_time.as_secs_f64() * 1e3
+    );
 
     // 首帧：全量（文本塑形 / 布局 / 全 lane 编码），不计入统计。
     let first_started = Instant::now();
@@ -278,12 +282,7 @@ pub fn run(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {    let
     // 报告
     println!();
     println!("-- 分场景（毫秒；判定用「写 + 帧」合计的 p99） --");
-    for scenario in [
-        &incremental,
-        &text_update,
-        &pan_only,
-        &scroll_only,
-    ] {
+    for scenario in [&incremental, &text_update, &pan_only, &scroll_only] {
         println!("{}", scenario.frame.line());
         println!("{}", scenario.update.line());
         println!("{}", scenario.total.line());
@@ -451,11 +450,11 @@ pub fn run_breakdown(config: &Config) -> Result<bool, Box<dyn std::error::Error>
         let _ = frame_once(&mut app, window)?;
         let paint_time = started.elapsed();
         if config.raw {
-            println!("raw,breakdown_styles,{:.3}", styles_time.as_secs_f64() * 1e6);
             println!(
-                "raw,breakdown_shape,{:.3}",
-                shape_time.as_secs_f64() * 1e6
+                "raw,breakdown_styles,{:.3}",
+                styles_time.as_secs_f64() * 1e6
             );
+            println!("raw,breakdown_shape,{:.3}", shape_time.as_secs_f64() * 1e6);
             println!(
                 "raw,breakdown_layout,{:.3}",
                 layout_time.as_secs_f64() * 1e6
