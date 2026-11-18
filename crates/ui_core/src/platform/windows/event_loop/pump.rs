@@ -393,6 +393,105 @@ pub(super) fn pump(
     result
 }
 
+/// 合成几何缓存键：客户区只在 `WM_SIZE` / `WM_DPICHANGED` 之后变化，而这两个消息已经在本轮
+/// 泵的 ①/② 阶段把**逻辑尺寸**与**比例**写进 `NativeWindow`（R07-11）。
+#[derive(Clone, Copy, PartialEq)]
+struct GeometryKey {
+    logical: crate::math::Size,
+    scale: crate::math::Scale,
+}
+
+/// 一次客户区探测的结果（`Minimized` = `GetClientRect` 是 0×0，不能当几何）。
+enum ClientProbe {
+    Minimized,
+    Measured((u32, u32)),
+}
+
+/// 合成几何的客户区缓存（R07-11）。
+///
+/// 泵的 ②b′ 每轮每窗都要「当前客户区」来对齐 DirectComposition 的内容 visual，而客户区只能由
+/// `GetClientRect` 得到。旧实现**每轮每窗**都调一次 `IsIconic` + `GetClientRect`（2 次系统
+/// 调用），但那两个值只在窗口尺寸 / DPI 变化时才变 —— 而尺寸与比例本轮已经落在
+/// [`NativeWindow::logical_size`] / [`NativeWindow::scale`] 里。因此把 `(逻辑尺寸, 比例)` 当缓存
+/// 键：键不变 ⇒ 一次元组比较，**0 次系统调用**；键变化（真正的 `WM_SIZE` / DPI）才查询。
+///
+/// 最小化时**不写缓存**：`GetClientRect` 在最小化时是 0×0（会被钳成 1×1），不能当几何；也
+/// 不缓存「最小化」这个事实 —— 恢复窗口可能不改尺寸（键仍相同），缓存住就会永远跳过它。
+struct GeometryCache {
+    entries: Vec<GeometryEntry>,
+    /// 累计客户区查询次数（**稳态必须不增长**；只在单测里读，生产构建没有读者）。
+    #[cfg(test)]
+    queries: u64,
+}
+
+struct GeometryEntry {
+    window: WindowId,
+    key: GeometryKey,
+    client: (u32, u32),
+}
+
+impl GeometryCache {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            #[cfg(test)]
+            queries: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// 取本窗口的客户区：键相同直接命中缓存（`probe` **不会**被调用），否则查询。
+    ///
+    /// 返回 `None` = 本次探测到最小化（不写缓存，下一轮重试）。
+    fn client(
+        &mut self,
+        window: WindowId,
+        key: GeometryKey,
+        probe: impl FnOnce() -> ClientProbe,
+    ) -> Option<(u32, u32)> {
+        if let Some(index) = self.entries.iter().position(|entry| entry.window == window)
+            && self.entries[index].key == key
+        {
+            return Some(self.entries[index].client);
+        }
+        match probe() {
+            ClientProbe::Minimized => None,
+            ClientProbe::Measured(client) => {
+                #[cfg(test)]
+                {
+                    self.queries += 1;
+                }
+                match self.entries.iter_mut().find(|entry| entry.window == window) {
+                    Some(entry) => {
+                        entry.key = key;
+                        entry.client = client;
+                    }
+                    None => self.entries.push(GeometryEntry {
+                        window,
+                        key,
+                        client,
+                    }),
+                }
+                Some(client)
+            }
+        }
+    }
+
+    /// 丢弃已关闭窗口的缓存项（窗口 churn 不积累条目）。
+    fn retain_live(&mut self, live: impl Fn(WindowId) -> bool) {
+        self.entries.retain(|entry| live(entry.window));
+    }
+
+    /// 累计客户区查询次数（单测的计数判据：稳态必须不增长）。
+    #[cfg(test)]
+    const fn queries(&self) -> u64 {
+        self.queries
+    }
+}
+
 /// 消费者：`pump`。
 /// 消息泵主体（每轮：消息 → 平台事件 → GPU 反馈 → 关闭 → 应用钩子 + 提交帧 → 阻塞等待）。
 pub(super) fn pump_loop(
@@ -403,6 +502,8 @@ pub(super) fn pump_loop(
     let mut message = MSG::default();
     // 合成器节拍线程：只在需要连续帧时存在（空闲时零线程、零定时器）。
     let mut pacer = FramePacer::new();
+    // 合成几何的客户区缓存（R07-11）：稳态每轮每窗 0 次系统调用。
+    let mut geometry = GeometryCache::new();
     // a11y 补发兜底定时器的宿主窗口（定时器随窗口销毁失效，首窗换人时要重建，P2-4）。
     // 归属判定用 `WindowId` 而不是 HWND 裸值：首窗销毁后系统可能把同一个 HWND 复用给新窗，
     // 裸值比较会「看起来仍匹配」而不重建定时器（复审 P2-8）。
@@ -457,22 +558,34 @@ pub(super) fn pump_loop(
         // `WM_APP_COMPOSITION_WAKE`（只唤醒、不请求帧），所以「最后一帧」的几何也会在下一次泵
         // 迭代里落地。这里是几何**唯一**的周期应用点：`WM_SIZE` / DPI 只记录尺寸，不逐条
         // `Commit`（P1-2a）。
+        //
+        // R07-11：客户区与最小化状态**不再每轮每窗查询**（旧实现 2 次系统调用/窗/轮）。缓存键
+        // = `(逻辑尺寸, 比例)` —— `WM_SIZE` / `WM_DPICHANGED` 已在本轮 ①/② 阶段写进
+        // `NativeWindow`，所以键变化精确覆盖「客户区可能变了」的时机；稳态每轮每窗 0 次系统调用。
         for native in windows.iter_mut() {
+            let id = native.id();
+            let key = GeometryKey {
+                logical: native.logical_size(),
+                scale: native.scale(),
+            };
             // 最小化时 `GetClientRect` 是 0×0（会钳成 1×1）：不要拿它当几何。
-            if native.is_minimized() {
+            let Some(client) = geometry.client(id, key, || {
+                if native.is_minimized() {
+                    ClientProbe::Minimized
+                } else {
+                    ClientProbe::Measured(native.client_size())
+                }
+            }) else {
                 continue;
-            }
-            let client = native.client_size();
+            };
             let presented = app
-                .window(native.id())
+                .window(id)
                 .map(Window::presented_surface)
                 .unwrap_or(client);
             // `presented` 是待处理状态本身：每次泵迭代都读它，消息丢了也只是晚一轮（同值 no-op）。
             // `pending` 是 GPU 线程两次唤醒都失败时的兜底标记；正常情况下靠与本窗口上次成功应用
             // 的 `(presented, client)` 比较，避免输入风暴下每轮都进一次互斥锁。
-            let pending = app
-                .window(native.id())
-                .is_some_and(Window::take_composition_pending);
+            let pending = app.window(id).is_some_and(Window::take_composition_pending);
             if !pending && native.composition_geometry() == Some((presented, client)) {
                 continue;
             }
@@ -480,6 +593,10 @@ pub(super) fn pump_loop(
             let mut target = composition::lock(&target);
             target.set_geometry(presented, client)?;
             native.note_composition_geometry((presented, client));
+        }
+        // 已关闭窗口的缓存项跟着丢掉（否则窗口 churn 会让条目无界增长）。
+        if geometry.len() > windows.len() {
+            geometry.retain_live(|id| windows.iter().any(|native| native.id() == id));
         }
 
         // ②c 交互反馈：光标 / 指针捕获（P10 §5.4 / §11.3）。
@@ -641,4 +758,149 @@ pub(super) fn frame_all(app: &mut App) -> Result<(), EngineError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod geometry_cache_tests {
+    use super::{ClientProbe, GeometryCache, GeometryKey};
+    use crate::{
+        math::{Scale, Size},
+        window::WindowId,
+    };
+
+    fn window(raw: u32) -> WindowId {
+        WindowId::from_raw(raw)
+    }
+
+    fn key(width: f32) -> GeometryKey {
+        GeometryKey {
+            logical: Size::new(width, 600.0),
+            scale: Scale::ONE,
+        }
+    }
+
+    fn measured(client: (u32, u32)) -> impl Fn() -> ClientProbe {
+        move || ClientProbe::Measured(client)
+    }
+
+    /// **R07-11 的计数判据**：稳态（逻辑尺寸 / 比例没变）每轮**0 次**客户区查询。
+    ///
+    /// 旧实现每轮每窗 2 次系统调用（`IsIconic` + `GetClientRect`）；现在稳态只剩一次元组比较。
+    #[test]
+    fn a_steady_pump_iteration_queries_the_client_size_zero_times() {
+        let mut cache = GeometryCache::new();
+        let id = window(1);
+        let mut probes = 0u32;
+        assert_eq!(
+            cache.client(id, key(800.0), || {
+                probes += 1;
+                ClientProbe::Measured((800, 600))
+            }),
+            Some((800, 600))
+        );
+        for _ in 0..1_000 {
+            let client = cache.client(id, key(800.0), || {
+                probes += 1;
+                ClientProbe::Measured((800, 600))
+            });
+            assert_eq!(client, Some((800, 600)), "缓存命中必须给出上次的客户区");
+        }
+        assert_eq!(probes, 1, "稳态 1000 轮只允许 1 次查询（实际 {probes} 次）");
+        assert_eq!(cache.queries(), 1, "查询计数必须停在 1");
+    }
+
+    /// 真正的尺寸 / DPI 变化必须重新查询（否则几何会停在旧客户区上）。
+    #[test]
+    fn a_resize_or_dpi_change_queries_the_client_size_again() {
+        let mut cache = GeometryCache::new();
+        let id = window(1);
+        let probes = std::cell::Cell::new(0u32);
+        let probe = |client: (u32, u32)| {
+            probes.set(probes.get() + 1);
+            ClientProbe::Measured(client)
+        };
+        assert_eq!(
+            cache.client(id, key(800.0), || probe((800, 600))),
+            Some((800, 600))
+        );
+        assert_eq!(
+            cache.client(id, key(900.0), || probe((900, 700))),
+            Some((900, 700))
+        );
+        // 比例变化（DPI）同样是一个新键。
+        let mut dpi = key(900.0);
+        dpi.scale = Scale::new(1.25).expect("scale");
+        assert_eq!(
+            cache.client(id, dpi, || probe((1125, 875))),
+            Some((1125, 875))
+        );
+        assert_eq!(
+            probes.get(),
+            3,
+            "最后一次查询必须跟上新键（实际 {} 次）",
+            probes.get()
+        );
+        assert_eq!(cache.queries(), 3);
+        // 回到已知键：仍然重新查询（缓存只保留最近一次的客户区）。
+        assert_eq!(
+            cache.client(id, key(800.0), || probe((800, 600))),
+            Some((800, 600))
+        );
+        assert_eq!(probes.get(), 4);
+    }
+
+    /// 最小化时 `GetClientRect` 是 0×0：**不得**写缓存，也不得缓存「最小化」这个事实
+    /// （恢复窗口可能不改尺寸 ⇒ 键不变，缓存住就永远跳过几何）。
+    #[test]
+    fn a_minimized_window_is_never_cached() {
+        let mut cache = GeometryCache::new();
+        let id = window(1);
+        assert_eq!(
+            cache.client(id, key(800.0), || ClientProbe::Measured((800, 600))),
+            Some((800, 600))
+        );
+        let mut probes = 0u32;
+        for _ in 0..3 {
+            assert_eq!(
+                cache.client(id, key(900.0), || {
+                    probes += 1;
+                    ClientProbe::Minimized
+                }),
+                None,
+                "最小化时必须跳过几何应用"
+            );
+        }
+        assert_eq!(probes, 3, "最小化状态不能被缓存（每轮重试）");
+        // 恢复：同一新键下探测到客户区 ⇒ 写入缓存（下一轮起 0 系统调用）。
+        assert_eq!(
+            cache.client(id, key(900.0), measured((900, 700))),
+            Some((900, 700))
+        );
+        let mut restored_probes = 0u32;
+        assert_eq!(
+            cache.client(id, key(900.0), || {
+                restored_probes += 1;
+                ClientProbe::Measured((900, 700))
+            }),
+            Some((900, 700))
+        );
+        assert_eq!(restored_probes, 0, "恢复后的稳态必须走缓存");
+    }
+
+    /// 多个窗口各自独立缓存；窗口关闭后条目被丢弃（窗口 churn 不积累内存）。
+    #[test]
+    fn closed_windows_do_not_keep_cache_entries() {
+        let mut cache = GeometryCache::new();
+        for raw in 1..=3u32 {
+            let id = window(raw);
+            assert_eq!(
+                cache.client(id, key(800.0), measured((800, 600))),
+                Some((800, 600))
+            );
+        }
+        assert_eq!(cache.len(), 3);
+        cache.retain_live(|id| id == window(2));
+        assert_eq!(cache.len(), 1, "关闭的窗口必须丢掉缓存项");
+        assert_eq!(cache.queries(), 3);
+    }
 }

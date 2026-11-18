@@ -195,6 +195,99 @@ fn node_repaint_rebuilds_only_subtree_lanes_and_stays_within_the_node() {
     );
 }
 
+/// AR5 P2-1 回归：内容**收缩**时 damage 必须覆盖旧可见范围（旧 ∪ 新）。
+///
+/// 构造（AR5 的生产路径）：60×20 的文本节点、`Clip::None`、`TextWrap::NoWrap`，14 个 'W'
+/// 的字形显著溢出节点盒（实测宽约 200 px）；改成 'i' 后新图元只覆盖节点盒内，旧实现
+/// damage = 节点盒 +1 px ⇒ 旧字形溢出部分无人重画（残影）。
+#[cfg(feature = "test-support")]
+#[test]
+fn shrinking_text_damage_covers_the_old_glyphs_outside_the_node_box() {
+    let (_rt, mut app, window) = setup();
+    let root = app.window(window).expect("window").tree().root();
+    let node = {
+        let w = app.window_mut(window).expect("window");
+        NodeBuilder::text(
+            "WWWWWWWWWWWWWW",
+            crate::text::TextStyle::new(16.0).with_wrap(crate::text::TextWrap::NoWrap),
+        )
+        .style(positioned(Rect::new(20.0, 20.0, 60.0, 20.0)))
+        .build(w.tree_mut(), root)
+        .expect("文本挂载成功")
+    };
+    frame(&mut app, window);
+    let old_bounds = {
+        let tree = app.window(window).expect("window").tree();
+        let target = tree.get(node).expect("node");
+        let origin = target.layout().bounds.origin;
+        let content = tree.content_offset(node);
+        let line = tree.text_line(node).expect("首帧必须已经 shape");
+        let mut bounds = Rect::default();
+        for run in line.glyph_runs() {
+            for glyph in &run.glyphs {
+                bounds = bounds.union(Rect::from_origin_size(
+                    crate::math::Point::new(
+                        origin.x + content.x + glyph.position.x,
+                        origin.y + content.y + glyph.position.y,
+                    ),
+                    glyph.size,
+                ));
+            }
+        }
+        bounds
+    };
+    let node_bounds = app
+        .window(window)
+        .expect("window")
+        .tree()
+        .get(node)
+        .expect("node")
+        .layout()
+        .bounds;
+    assert!(
+        old_bounds.origin.x + old_bounds.size.width > node_bounds.origin.x + 100.0,
+        "前置条件：14 个 W 必须显著溢出 60 px 节点盒（旧字形 {old_bounds:?}）"
+    );
+
+    // 内容收缩（布局盒不变）：新字形只剩一个 'i'。`set_text_content` 本身只进 shape 队列，
+    // 不请求帧；生产里改文本通常伴随 `request_node_repaint`（AR5 的复现路径同此）。
+    app.window_mut(window)
+        .expect("window")
+        .tree_mut()
+        .set_text_content(
+            node,
+            crate::text::TextContent::new(
+                "i",
+                crate::text::TextStyle::new(16.0).with_wrap(crate::text::TextWrap::NoWrap),
+            ),
+        );
+    assert!(
+        app.request_node_repaint(window, node).expect("repaint"),
+        "内容变更必须请求一帧"
+    );
+    frame(&mut app, window);
+
+    let record = app
+        .window(window)
+        .expect("window")
+        .record()
+        .expect("commit 帧必须有记录");
+    assert!(!record.damage_full, "内容收缩不得退化成整窗 damage");
+    let last_pixel_x = (old_bounds.origin.x + old_bounds.size.width - 1.0).floor() as i32;
+    let sample_y = (old_bounds.origin.y + old_bounds.size.height / 2.0).floor() as i32;
+    assert!(
+        record.damage.iter().any(|rect| {
+            rect.x0 <= last_pixel_x
+                && last_pixel_x < rect.x1
+                && rect.y0 <= sample_y
+                && sample_y < rect.y1
+        }),
+        "damage 必须覆盖旧字形的溢出部分（旧字形右端 x≈{last_pixel_x}, y={sample_y}）；\
+         旧实现只覆盖节点盒 ⇒ 残影。damage={:?}",
+        record.damage
+    );
+}
+
 #[test]
 fn node_repaint_under_a_hidden_ancestor_is_a_noop() {
     let (_rt, mut app, window) = setup();

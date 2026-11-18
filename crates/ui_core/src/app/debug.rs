@@ -12,8 +12,8 @@ use crate::{error::EngineError, window::WindowId};
 /// 显示或隐藏内置 Debug HUD（P17；需要 `hud` feature）。
 ///
 /// HUD 是窗口 root 末尾的普通子树：右上角浮动、不参与文档流、命中穿透、a11y 隐藏。
-/// 可见时平台泵会持续出帧，数字每 500 ms 汇总一次。应用应在建完静态场景后开启 HUD；
-/// 之后再追加的 root 子节点可能盖在它上面。
+/// 可见时**只有采样点（500 ms）才请求帧**（R01-10）：静止画面保持 `Idle`，不会按刷新率重画。
+/// 应用应在建完静态场景后开启 HUD；之后再追加的 root 子节点可能盖在它上面。
 ///
 /// # Errors
 /// `EngineError::UnknownWindow`：窗口不存在。建树失败时返回底层 `StaleNode` 等错误，

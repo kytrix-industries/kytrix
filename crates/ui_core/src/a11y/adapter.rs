@@ -83,6 +83,13 @@ pub(crate) struct A11yBridge {
     queued: ahash::HashSet<NodeId>,
     /// 下一笔必须先重发的父节点（它们的 `children` 因分批暂时不完整）。
     refresh: SmallVec<[NodeId; 8]>,
+    /// 累计因**每笔预算**被推迟到下一笔的 `refresh` 条目数（P2-6 的可观测指标）。
+    ///
+    /// 只在测试 / 测试基建构建里存在：它在生产里没有读者（"未交付剩余量"由
+    /// [`A11yBridge::refresh_backlog`] 与 `pending()` 表达），但单测需要一个累计计数来区分
+    /// 「本来就没活」与「活被推迟了」。
+    #[cfg(test)]
+    refresh_deferred: u64,
     /// 本次全树运行是否还没发过 `TreeInfo`。
     tree_info_pending: bool,
     /// 测试捕获开关（生产构建里整个字段不存在：捕获只有 `test-support` 的 `TestApp` 会用）。
@@ -109,6 +116,8 @@ impl A11yBridge {
             queue_cursor: 0,
             queued: ahash::HashSet::default(),
             refresh: SmallVec::new(),
+            #[cfg(test)]
+            refresh_deferred: 0,
             tree_info_pending: false,
             #[cfg(feature = "test-support")]
             capture: false,
@@ -129,6 +138,22 @@ impl A11yBridge {
     /// 焦点是否变化且尚未交付（`App::a11y_pending` 的**不节流旁路**）。
     pub(crate) fn focus_pending(&self, tree: &NodeTree, focus: Option<NodeId>) -> bool {
         self.focus_changed(tree, focus)
+    }
+
+    /// 当前因每笔预算而**未交付**的重发父节点数（P2-6 的"未交付剩余量"指标）。
+    ///
+    /// 非 0 ⇒ 还有父节点的 `children` 未补齐：`pending()` 恒为真、平台泵的下一轮会继续发。
+    /// 生产构建里这个值没有独立读者（待办本身由 `pending()` 消费）；单测用它断言"超出预算的
+    /// 一定要留在下一笔，而不是被丢掉"。
+    #[cfg(test)]
+    pub(crate) fn refresh_backlog(&self) -> usize {
+        self.refresh.len()
+    }
+
+    /// 累计因每笔预算被推迟到下一笔的重发条目数（P2-6 的计数指标，单调递增）。
+    #[cfg(test)]
+    pub(crate) fn deferred_refresh(&self) -> u64 {
+        self.refresh_deferred
     }
 
     /// DPI 比例变化（bounds 全变 ⇒ 下一笔全树）。
@@ -272,10 +297,27 @@ impl A11yBridge {
                     batch.push(node);
                 }
             };
+        // P2-6：`refresh`（"children 暂时不完整"的待重发父节点）也受**同一笔预算**约束。
+        // 旧实现把整个 `refresh` 无条件塞进本批 ⇒ 单笔 `TreeUpdate` 可以远超
+        // `A11Y_BATCH_BUDGET`（极端分批下 `refresh` 会积累上千个父节点，AT 侧一笔收到几千个
+        // 节点的更新）。超预算的留在 `refresh` 里，`pending()` 因它非空恒为真 ⇒ 下一笔继续发
+        // （分批契约不变：仍然"父先于子 + 每笔预算内"，只是本笔不再无界）。
+        let mut deferred: SmallVec<[NodeId; 8]> = SmallVec::new();
         for node in std::mem::take(&mut self.refresh) {
+            if batch.len() >= A11Y_BATCH_BUDGET {
+                // 已卸载的节点直接丢：重发一个不存在的节点没有意义，且会让积压永不清空。
+                if tree.get(node).is_ok() {
+                    deferred.push(node);
+                }
+                continue;
+            }
             if tree.get(node).is_ok() {
                 push(node, &mut batch, &mut batch_set);
             }
+        }
+        #[cfg(test)]
+        {
+            self.refresh_deferred = self.refresh_deferred.saturating_add(deferred.len() as u64);
         }
         let mut ancestors: SmallVec<[NodeId; 16]> = SmallVec::new();
         while batch.len() < A11Y_BATCH_BUDGET && self.queue_cursor < self.queue.len() {
@@ -322,7 +364,10 @@ impl A11yBridge {
         for node in &batch {
             self.delivered.insert(*node);
         }
-        self.refresh = re_refresh;
+        // 下一笔的重发集 = 本笔因预算推迟的（P2-6）+ 本笔 `children` 被裁剪的。推迟项排在前面，
+        // 保证积压在有限笔数内一定会被清空（不会因为持续新增的 re_refresh 而饿死）。
+        self.refresh = deferred;
+        self.refresh.extend(re_refresh);
 
         // ③ 收尾：队列与重发都空了 ⇒ 本次全树/增量运行结束，做一次旁表清理。
         if self.queue_cursor >= self.queue.len() && self.refresh.is_empty() {
@@ -1264,5 +1309,59 @@ mod tests {
         assert_eq!(selection.focus.character_index, 1);
         assert_eq!(selection.focus.node, AkNodeId(record.id.get()));
         assert_eq!(converted.character_lengths(), &[3, 3, 1, 1]);
+    }
+    /// **P2-6**：`refresh`（"children 暂时不完整"的待重发父节点）也必须受**每笔预算**约束。
+    ///
+    /// 旧实现把 `bridge.refresh` 整个塞进本批 ⇒ 单笔 `TreeUpdate` 的节点数可以远超
+    /// `A11Y_BATCH_BUDGET`（AT 侧一笔收到几千个节点 = UI 线程被钉住、AccessKit 更新超时）。
+    /// 现在超预算的留在 `refresh` 里（下一笔继续），并计入 `deferred_refresh`。
+    #[test]
+    fn the_refresh_set_is_capped_by_the_batch_budget() {
+        const EXTRA: usize = 17;
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let mut nodes = Vec::with_capacity(A11Y_BATCH_BUDGET + EXTRA);
+        for _ in 0..(A11Y_BATCH_BUDGET + EXTRA) {
+            nodes.push(NodeBuilder::boxed().build(&mut tree, root).expect("node"));
+        }
+        let mut bridge = A11yBridge::new();
+        // 先把首笔全树**发完**（首笔也受预算约束 ⇒ 要分几笔），这样 `refresh` / `queue` 从空开始。
+        let mut full_frames = 0usize;
+        while take(&mut bridge, &mut tree, None).is_some() {
+            full_frames += 1;
+            assert!(full_frames < 16, "首笔全树的分批没有收敛");
+        }
+        assert_eq!(bridge.refresh_backlog(), 0, "首笔发完后不得有积压");
+        // 手动制造积压：等价于「上一笔把这一批父节点的 children 裁掉了」。
+        bridge.refresh.extend(nodes.iter().copied());
+
+        let batch = take(&mut bridge, &mut tree, None).expect("增量笔");
+        assert!(
+            batch.nodes.len() <= A11Y_BATCH_BUDGET,
+            "单笔节点数超预算：{} > {A11Y_BATCH_BUDGET}",
+            batch.nodes.len()
+        );
+        assert_eq!(
+            bridge.refresh_backlog(),
+            EXTRA,
+            "超出预算的 {} 条必须留在下一笔（实际 {}）",
+            EXTRA,
+            bridge.refresh_backlog()
+        );
+        assert_eq!(
+            bridge.deferred_refresh(),
+            EXTRA as u64,
+            "推迟条数必须被计数"
+        );
+        assert!(
+            bridge.pending(&tree, None),
+            "还有积压时 pending 必须为真，否则泵不会再发下一笔"
+        );
+
+        // 下一笔把积压发完（不是丢弃）：剩余 17 条全部交付、积压清零。
+        let rest = take(&mut bridge, &mut tree, None).expect("尾笔");
+        assert_eq!(rest.nodes.len(), EXTRA, "积压必须被交付，不能丢");
+        assert_eq!(bridge.refresh_backlog(), 0);
+        assert!(!bridge.pending(&tree, None), "清空之后不得再有工作");
     }
 }

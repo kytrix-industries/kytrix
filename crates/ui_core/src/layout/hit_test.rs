@@ -1461,6 +1461,88 @@ mod tests {
         );
     }
 
+    /// AR5 P1-1：`hit_envelope` 的形状 AABB 必须叠加**节点自身**的布局盒原点。
+    ///
+    /// 生产路径复现（不需要测试逃生口）：父 20×20 @ margin(50,50)，
+    /// `HitShape(-20,-20,60,60)`（绝对 `(30,30)-(90,90)`）；子绝对定位 `inset(-30,-30)`
+    /// 被 taffy hoist 到根 ⇒ `expand_hoisted_ancestors` 拿到的并集原点是 `(-30,-30)`。
+    /// 旧实现把形状按并集原点再平移一次，包络变成 `(-50,-50,120,120)`（右/下只到 (70,70)），
+    /// `hit_test(80,80)` 在父级剪枝处跳过整棵子树、返回 root。
+    #[test]
+    fn hit_shape_envelope_uses_the_node_origin_not_the_subtree_union_origin() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let mut parent_style = fixed(20.0, 20.0);
+        parent_style.inner.margin = taffy::geometry::Rect {
+            left: taffy::style::LengthPercentageAuto::length(50.0),
+            right: taffy::style::LengthPercentageAuto::length(0.0),
+            top: taffy::style::LengthPercentageAuto::length(50.0),
+            bottom: taffy::style::LengthPercentageAuto::length(0.0),
+        };
+        let parent = NodeBuilder::boxed()
+            .style(parent_style)
+            .hit_shape(HitShape::Rect(Rect::new(-20.0, -20.0, 60.0, 60.0)))
+            .build(&mut tree, root)
+            .expect("父节点挂载成功");
+        // 父非 positioned ⇒ 绝对定位子的包含块是根；负 inset 把父的并集原点拉到 (-30,-30)。
+        let mut child_style = fixed(10.0, 10.0);
+        child_style.inner.position = taffy::style::Position::Absolute;
+        child_style.inner.inset = taffy::geometry::Rect {
+            left: taffy::style::LengthPercentageAuto::length(-30.0),
+            right: taffy::style::LengthPercentageAuto::auto(),
+            top: taffy::style::LengthPercentageAuto::length(-30.0),
+            bottom: taffy::style::LengthPercentageAuto::auto(),
+        };
+        let child = NodeBuilder::boxed()
+            .style(child_style)
+            .build(&mut tree, parent)
+            .expect("子节点挂载成功");
+        layout(&mut tree);
+
+        let expected = Rect::new(-30.0, -30.0, 120.0, 120.0);
+        assert_eq!(
+            tree.subtree_bounds(parent),
+            expected,
+            "包络 = 节点盒 ∪ 子盒 ∪ 形状绝对 AABB；旧实现按并集原点平移形状 ⇒ (-50,-50,120,120)"
+        );
+        // 增量维护（`place_subtree` + `expand_hoisted_ancestors`）必须与全量重算逐位一致。
+        let incremental = tree.subtree_bounds(parent);
+        tree.recompute_subtree_bounds();
+        assert_eq!(
+            tree.subtree_bounds(parent),
+            incremental,
+            "增量包络必须与全量重算逐位一致"
+        );
+        // 布局盒外、形状内的点必须命中父节点；旧实现被父级剪枝跳过 ⇒ root。
+        assert_eq!(
+            hit_node(&tree, 80.0, 80.0),
+            Some(parent),
+            "形状右下必须可命中"
+        );
+        assert_eq!(
+            hit_node(&tree, 40.0, 40.0),
+            Some(parent),
+            "形状左上必须可命中"
+        );
+
+        // 卸载出流子节点走 `recompute_bounds_upwards`：包络必须收紧回「节点盒 ∪ 形状」，
+        // 并继续与全量重算一致（4 个维护点里的第 3 条）。
+        tree.remove(child).expect("卸载成功");
+        assert_eq!(
+            tree.subtree_bounds(parent),
+            Rect::new(30.0, 30.0, 60.0, 60.0),
+            "结构变更后的局部收紧也必须用节点自身原点"
+        );
+        let after_remove = tree.subtree_bounds(parent);
+        tree.recompute_subtree_bounds();
+        assert_eq!(tree.subtree_bounds(parent), after_remove);
+        assert_eq!(
+            hit_node(&tree, 80.0, 80.0),
+            Some(parent),
+            "形状右下必须仍可命中"
+        );
+    }
+
     /// 圆角矩形：四角按 CSS 圆角轮廓判定（与绘制共用 `normalize_corner_radius`）。
     #[test]
     fn rounded_rect_hit_shape_follows_css_corners() {

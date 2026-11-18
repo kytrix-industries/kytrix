@@ -1028,6 +1028,9 @@ impl NodeTree {
     pub(crate) fn set_lane(&mut self, node: NodeId, lane: LaneId) {
         content::set_lane(self, node, lane)
     }
+    pub(crate) fn lane_offset(&self, node: NodeId) -> Point {
+        content::lane_offset(self, node)
+    }
     pub(crate) fn set_lane_offset(&mut self, node: NodeId, offset: Point) {
         content::set_lane_offset(self, node, offset)
     }

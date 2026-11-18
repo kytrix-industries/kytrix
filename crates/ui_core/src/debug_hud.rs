@@ -3,9 +3,12 @@
 //! 本模块只在 `hud` feature 下编译。公开入口只有 `App::set_debug_hud` /
 //! `App::debug_hud_enabled`；节点、采样累计器与格式化都是 crate 私有。
 //!
-//! 文本更新分两段：`prepare_frame` 在帧门禁前采样并请求 HUD damage；
+//! 文本更新分两段：`prepare_frame` 在帧门禁前采样并**只在新文本需要落盘时**请求 HUD damage；
 //! `apply_frame` 在 `refresh_styles` 之后、`refresh_text` 之前写文本并 `mark_paint`。
 //! 这样不会经过信号依赖图，也不会被样式 pass 的 `clear_paint` 吞掉。
+//!
+//! **每帧成本**（R01-10）：HUD 可见不等于「永远有一帧」。没有新文本时 `prepare_frame` 只做几次
+//! 字段比较（无分配、无格式化），窗口保持 `Idle`；采样点（500 ms）才提交一帧。
 
 use std::time::{Duration, Instant};
 
@@ -220,6 +223,14 @@ pub(crate) fn install(window: &mut Window, now: Instant) -> Result<DebugHudState
 }
 
 /// 帧门禁前：消费上一提交帧的指标、每 500 ms 生成新文本，并请求 HUD damage。
+///
+/// **damage 只在有新文本要写时请求**（R01-10）：帧门禁读的是 `Window::pending_damage`，旧实现
+/// 无条件请求就等于「HUD 打开 ⇒ 永远有一帧待办」——静止画面也按刷新率提交帧、整块重画 HUD
+/// （实测每帧 ~0.6 µs/单窗，外加一次只为 HUD 区域的 present 与常开合成器节拍线程）。
+/// 文本本来只在采样点变化，所以请求条件收紧为「`pending_text` 非空」：
+/// - 采样帧：本函数刚生成新文本 ⇒ 请求 damage 顶开帧门禁，`apply_frame` 随后写文本；
+/// - 失败重试帧：`pending_text` 要等提交成功才清（见 [`finish_frame`]）⇒ 仍然请求，语义不丢；
+/// - 静止帧：不请求 ⇒ 门禁直接 `Idle`，HUD 的每帧成本只剩几次字段比较（无分配、无格式化）。
 pub(crate) fn prepare_frame(state: &mut DebugHudState, window: &mut Window, now: Instant) {
     let metrics = window.debug_hud_metrics();
     if metrics.frame_index != state.last_seen_frame {
@@ -285,7 +296,11 @@ pub(crate) fn prepare_frame(state: &mut DebugHudState, window: &mut Window, now:
         state.latency_count = 0;
     }
 
-    window.request_damage(hud_rect(window.size()));
+    // R01-10：只有「有文本要写」才顶开帧门禁（判据与 `apply_frame` 的早退条件完全一致）。
+    // 采样帧与失败重试帧都满足；静止帧不满足 ⇒ 窗口回到 `Idle`，不再按刷新率重画 HUD。
+    if state.pending_text.is_some() {
+        window.request_damage(hud_rect(window.size()));
+    }
 }
 
 /// `refresh_styles` 之后、`refresh_text` 之前：写文本并标 PAINT。

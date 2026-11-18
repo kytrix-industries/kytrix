@@ -630,10 +630,13 @@ fn hit_envelope(tree: &NodeTree, node: NodeId, bounds: Rect) -> Rect {
     else {
         return bounds;
     };
-    bounds.union(Rect::from_origin_size(
-        bounds.origin + local.origin,
-        local.size,
-    ))
+    // 原点必须取**节点自身**的布局盒原点，不能沿用入参 `bounds.origin`：除了
+    // `place_subtree` 传的是节点自己的盒之外，其余三个维护点（`expand_hoisted_ancestors` /
+    // `recompute_bounds_upwards` / `recompute_subtree_bounds`）传的都是「节点盒 ∪ 子包络」
+    // 的并集，其原点可能被左上方的出流/负偏移子节点拉走。用并集原点会按同样的偏移量再平移
+    // 一次形状 AABB ⇒ 包络右/下缺一块 ⇒ 父级剪枝把形状的一部分剪掉（AR5 P1-1：看得见点不到）。
+    let origin = target.layout.bounds.origin;
+    bounds.union(Rect::from_origin_size(origin + local.origin, local.size))
 }
 
 // 消费者：`impl NodeTree::recompute_subtree_bounds` 的薄委托（外部调用点见该方法文档）。/// 全树重算子树包围盒（**诊断/测试逃生口**：正常布局路径由 `place_subtree` 增量维护）。

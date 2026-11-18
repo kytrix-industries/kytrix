@@ -418,12 +418,19 @@ pub(crate) struct FrameFeedback {
     /// GPU 线程**观察到该帧 GPU 工作完成**的时刻（fence / timeline / completed handler），
     /// 不是 `Present` 返回的时刻。
     pub completed_at: Instant,
-    /// 本帧**上屏**时刻的最佳可信值；`None` = 该端如实不提供（**不是**「退回完成时刻」的占位）。
+    /// 本帧**上屏时刻的下界**（不是近似值，更不是逐帧真实呈现时间戳）；`None` = 该端如实不提供
+    /// （**不是**「退回完成时刻」的占位）。
+    ///
+    /// **语义（R5a / AR5 P2-2）**：偏差方向恒为**偏早**，最多 **1 个 vsync**。显示器上屏发生在
+    /// 排定 vsync 之后的呈现截止点；GPU 晚于排定时刻完成（错过本 vsync）时真实上屏还要再晚
+    /// 一个 vsync。因此调用方只能断言「真实上屏时刻 ≥ `presented_at`」，不能把它当等号使用
+    /// （HUD 的延迟统计应把它读作下界；需要更准的值只能接平台真实呈现时间戳）。
     ///
     /// 来源按后端区分，各端都**不得**拿 [`Self::completed_at`] 顶替（那正是本轮修掉的假数据缺陷）：
     /// - macOS：display link 的 `CAMetalDisplayLinkUpdate.targetPresentationTimestamp`（本帧被排定
     ///   的上屏时刻）换算出的**tick 推断值**，误差上界 1 个 vsync；它只在「更新的 tick 已经到达」
-    ///   （证明该 vsync 的呈现截止时刻已过）之后才写入，且不早于 [`Self::completed_at`]。
+    ///   （证明该 vsync 的呈现截止时刻已过）之后才写入，且不早于 [`Self::completed_at`]
+    ///   （`render::present_evidence::clamp_presented_at` 取下界）。
     ///   逐帧真实呈现时间戳（`MTLDrawable.presentedTime` / `addPresentedHandler:`）在
     ///   display-link 驱动的 drawable 上不可靠（实测只回调数次、`presentedTime` 恒为 0），
     ///   已不再作为来源。
@@ -444,8 +451,11 @@ impl FrameFeedback {
     /// [`Self::presented_at`] 契约的可执行版本（三端 `poll` 共用）：呈现时刻存在时不得早于本帧的
     /// GPU 完成时刻 —— 像素不可能比 GPU 工作更早上屏。
     ///
+    /// 它只守住「下界」的必要条件（真实上屏时刻 ≥ `presented_at`），**不**证明 `presented_at`
+    /// 是精确上屏时刻：允许的偏差方向是偏早，最多 1 个 vsync（见字段文档）。
+    ///
     /// `None` 是合法值（该端如实不提供），不是「用完成时刻兜底」的同义词：本函数同时守住
-    /// 「有值 ⇒ 可信」与「不可信 ⇒ 必须为 `None`」两个方向。
+    /// 「有值 ⇒ 不早于完成」与「不可信 ⇒ 必须为 `None`」两个方向。
     pub(crate) fn presentation_is_consistent(&self) -> bool {
         self.presented_at
             .is_none_or(|presented| presented >= self.completed_at)

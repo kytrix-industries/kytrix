@@ -72,10 +72,9 @@ impl CompositorClock {
     }
 }
 
-// SAFETY: `CompositorClock` 唯一的非 `Send` 字段是平台时钟里的 `HWND`（一个进程范围的句柄值，
-// 只用于 DXGI 兜底时定位显示器）。句柄值本身可以自由复制到另一个线程；本类型在合成线程里
-// **构造并独占使用**，`Send` 只为满足 `Box<dyn FrameClock>` 的移交约束。
-unsafe impl Send for CompositorClock {}
+// P2-5：`CompositorClock` 的 `Send` 是**自动推导**的 —— 平台时钟（`platform/windows/frame_clock.rs`
+// 的 `FrameClock`）把 `HWND` 存成 `isize`，所以这里没有裸指针字段。旧实现在这里写
+// `unsafe impl Send for CompositorClock {}` 来掩盖 `HWND` 的 `!Send`；不再需要。
 
 /// 合成线程的时钟（平台入口：三平台签名一致，差异只在本模块内部）。
 pub(crate) fn compositor_clock() -> Box<dyn FrameClock> {
@@ -110,6 +109,23 @@ impl FrameClock for CompositorClock {
 mod tests {
     use super::{CompositorClock, WAIT_SLICE};
     use crate::render::frame_clock::{FrameClock, PRESENT_MARGIN, frame_interval};
+
+    /// **P2-5**：合成线程时钟必须**自动** `Send`（`FrameClock: Send` 的移交约束），
+    /// 且不再有 `unsafe impl Send`。旧实现靠 unsafe 掩盖 `HWND` 字段的 `!Send`。
+    #[test]
+    fn the_compositor_clock_is_send_without_an_unsafe_impl() {
+        fn assert_send<T: Send>() {}
+        assert_send::<CompositorClock>();
+        // 合成线程的真实用法：线程内构造、线程内独占使用（返回值也是 `Send`）。
+        let handle = std::thread::spawn(|| {
+            let clock = CompositorClock::new();
+            clock.signal_handle()();
+            let mut clock = clock;
+            clock.wait_next_frame().completed
+        });
+        let completed = handle.join().expect("compositor clock thread");
+        assert!(!completed, "取消之后必须显式标记为被打断");
+    }
 
     /// 真实合成器时钟的冒烟测试：本机有 DWM ⇒ 采样给出合法刷新率与目标时刻；
     /// 没有 DWM（远程会话 / 无显示）⇒ 兜底 60 Hz，但**不允许** panic 或给出过去时刻。

@@ -656,6 +656,10 @@ impl App {
     /// 释放信号作用域：其值**立即回收**（槽位归还空闲栈、代际 +1），依赖图里以它们为键的边被
     /// **立即**删除；此后旧句柄的读 panic、写/更新是 no-op（见 [`SignalScope`]）。
     ///
+    /// **派生侧**：根作用域派生的闭包若捕获了本作用域的句柄，释放后既不会再被失效（缓存永久
+    /// 陈旧），又会在下次重算时读死句柄 panic。引擎无法检测不透明闭包，因此这是应用层硬契约
+    /// （禁止跨作用域捕获，见 [`App::derived`] 与 [`Derived`]）。
+    ///
     /// 返回被释放的信号数（重复释放返回 0；根作用域不可释放）。
     pub fn release_scope(&mut self, scope: SignalScope) -> usize {
         signal_api::release_scope(self, scope)
@@ -667,6 +671,11 @@ impl App {
     }
 
     /// 注册一个派生值（**不**立即求值；环在运行期检测）。
+    ///
+    /// **禁止跨作用域捕获（AR5 P2-4 / R5c）**：派生归属**根作用域**，闭包不得捕获
+    /// `App::signal_scoped` / `App::window_signal` 这类会随窗口/面板释放的信号句柄。作用域释放后
+    /// 该派生的依赖边已被删除（不再被失效 ⇒ 缓存永久陈旧），而一旦因其它依赖重算，读死句柄会
+    /// 确定性 panic。引擎无法在释放时检查不透明闭包，因此这是应用层硬契约（详见 [`Derived`]）。
     pub fn derived<T: Clone + 'static>(
         &mut self,
         compute: impl Fn(&mut ReadCtx<'_>) -> T + 'static,

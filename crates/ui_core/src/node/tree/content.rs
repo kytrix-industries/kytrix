@@ -532,6 +532,13 @@ pub(crate) fn set_lane(tree: &mut NodeTree, node: NodeId, lane: LaneId) {
     }
 }
 
+/// 上次烘焙 lane 图元时扣掉的偏移（烘焙坐标 + 它 = 布局坐标；消费者：paint 的旧内容 damage）。
+pub(crate) fn lane_offset(tree: &NodeTree, node: NodeId) -> Point {
+    tree.arena
+        .get(node)
+        .map_or(Point::ZERO, |target| target.lane_offset)
+}
+
 // 消费者：`impl NodeTree::set_lane_offset` 的薄委托（外部调用点见该方法文档）。
 /// 写 lane 的偏移戳（paint 重建 lane 时调用）。
 pub(crate) fn set_lane_offset(tree: &mut NodeTree, node: NodeId, offset: Point) {

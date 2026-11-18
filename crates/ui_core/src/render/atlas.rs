@@ -824,18 +824,20 @@ mod tests {
     #[test]
     fn multi_rect_packing_matches_the_chunk_offsets() {
         const PAGE: u32 = 64;
+        let first = PhysicalRect::new(0, 10, 8, 12); // 8×2 = 16 B
+        let second = PhysicalRect::new(20, 10, 24, 13); // 4×3 = 12 B
+        let third = PhysicalRect::new(40, 40, 48, 41); // 8×1 = 8 B
         let mut rects = DirtyRects::default();
-        rects.mark(PhysicalRect::new(0, 10, 8, 12)); // 8×2 = 16 B
-        rects.mark(PhysicalRect::new(20, 10, 24, 13)); // 4×3 = 12 B
-        rects.mark(PhysicalRect::new(40, 40, 48, 41)); // 8×1 = 8 B
+        rects.mark(first);
+        rects.mark(second);
+        rects.mark(third);
+        // 非均匀页内容（AR5 假绿 2）：每个纹素一个可区分的字节。旧测试的页全是 0xFF，
+        // 于是「长度对、偏移对、内容全错」（打包行起点丢掉 chunk.x）也能变绿。
+        let page: Vec<u8> = (0..(PAGE * PAGE))
+            .map(|index| (index % 251) as u8)
+            .collect();
         let mut out = Vec::new();
-        pack_rects(
-            &vec![0xFFu8; (PAGE * PAGE) as usize],
-            PAGE,
-            1,
-            &rects,
-            &mut out,
-        );
+        pack_rects(&page, PAGE, 1, &rects, &mut out);
         assert_eq!(out.len(), rects.byte_count(PAGE, 1));
         assert_eq!(out.len(), 36);
         let chunks: Vec<RectChunk> = rects.chunks(PAGE, 1).collect();
@@ -843,6 +845,27 @@ mod tests {
             chunks.iter().map(|chunk| chunk.offset).collect::<Vec<_>>(),
             vec![0, 16, 28]
         );
+
+        // 期望值由源页 + **显式矩形坐标**独立算出（不经过 `chunks`/`byte_count`，避免同源自证），
+        // 然后逐字节比较：行 stride、行内宽度、x 起点任何一处写错都会在这里失败。
+        let expected_block = |rect: PhysicalRect| -> Vec<u8> {
+            let mut block = Vec::with_capacity(rect.width() as usize * rect.height() as usize);
+            for y in rect.y0..rect.y1 {
+                for x in rect.x0..rect.x1 {
+                    block.push(page[y as usize * PAGE as usize + x as usize]);
+                }
+            }
+            block
+        };
+        let blocks = [first, second, third].map(expected_block);
+        assert_eq!(blocks.concat(), out, "打包内容必须逐字节等于源页对应区域");
+        for (chunk, block) in chunks.iter().zip(&blocks) {
+            assert_eq!(
+                &out[chunk.offset..chunk.offset + block.len()],
+                block.as_slice(),
+                "chunk {chunk:?} 的偏移必须指向它自己的打包块（x 起点写错会在这里现形）"
+            );
+        }
     }
 
     /// 整页哨兵：`full()` 覆盖全页、`byte_count` 等于整页字节、打包输出就是整页。
@@ -890,6 +913,64 @@ mod tests {
         off_page.mark(PhysicalRect::new(600, 600, 700, 700));
         assert_eq!(off_page.byte_count(512, 1), 0, "页外矩形不上传");
         assert_eq!(off_page.chunks(512, 1).count(), 0);
+
+        // 跨右/下边界（AR5 假绿 1）：钳位必须同时作用于 x1/y1，而不只是负坐标。
+        // 页 512²：500..700 两个方向都钳到 500..512（12×12）。
+        let mut crossing = DirtyRects::default();
+        crossing.mark(PhysicalRect::new(500, 500, 700, 700));
+        assert_eq!(
+            crossing.chunks(512, 1).collect::<Vec<_>>(),
+            vec![RectChunk {
+                x: 500,
+                y: 500,
+                width: 12,
+                height: 12,
+                offset: 0,
+            }],
+            "跨右/下边界的矩形必须被钳到页内"
+        );
+        assert_eq!(crossing.byte_count(512, 1), 144);
+        // 打包必须逐字节来自页内的钳位区域；漏掉上界钳制会让这里的切片越界 panic。
+        let mut page = vec![0u8; 512 * 512];
+        for y in 500..512usize {
+            for x in 500..512usize {
+                page[y * 512 + x] = 0xA5;
+            }
+        }
+        let mut out = Vec::new();
+        pack_rects(&page, 512, 1, &crossing, &mut out);
+        assert_eq!(out.len(), 144, "跨页矩形的上传字节 = 钳位后的面积");
+        assert!(out.iter().all(|byte| *byte == 0xA5));
+
+        // 只跨右边界（y 完全在页内）：单独锁住 x1 的上界钳制（M10 变异的目标）。
+        let mut right_edge = DirtyRects::default();
+        right_edge.mark(PhysicalRect::new(500, 10, 700, 14));
+        assert_eq!(
+            right_edge.chunks(512, 1).collect::<Vec<_>>(),
+            vec![RectChunk {
+                x: 500,
+                y: 10,
+                width: 12,
+                height: 4,
+                offset: 0,
+            }]
+        );
+        assert_eq!(right_edge.byte_count(512, 1), 48);
+
+        // 只跨下边界（x 完全在页内）：单独锁住 y1 的上界钳制。
+        let mut bottom_edge = DirtyRects::default();
+        bottom_edge.mark(PhysicalRect::new(10, 500, 14, 700));
+        assert_eq!(
+            bottom_edge.chunks(512, 1).collect::<Vec<_>>(),
+            vec![RectChunk {
+                x: 10,
+                y: 500,
+                width: 4,
+                height: 12,
+                offset: 0,
+            }]
+        );
+        assert_eq!(bottom_edge.byte_count(512, 1), 48);
     }
 
     #[test]

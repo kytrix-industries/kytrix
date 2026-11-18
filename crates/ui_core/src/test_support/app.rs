@@ -2,6 +2,11 @@
 //!
 //! `TestApp::new()` 的 renderer 恒为 `None`：`Scene` 照常生成、记录照常抓取、present 是 no-op。
 //! `drain()` 是**唯一**帧推进原语：一次最多一帧，不做「等到没事干」的隐式阻塞（设计 §6.2）。
+//!
+//! **按平台泵的顺序推进**：`drain` = 帧 → a11y 交付 → 跨线程回投任务（R13-12）。三者同序是
+//! 有意的：生产里「任务写状态 ⇒ 下一轮才出帧」的时序 bug 只有在测试泵也走 `Dispatcher` 的
+//! push → drain → run 三层时才会现形（旧实现 `TestApp` 根本没有任务泵，a11y 用例全走
+//! `dispatch_request` 直调，把这一层整个跳过了）。
 
 use std::time::Duration;
 
@@ -12,7 +17,7 @@ use super::{
     snapshot::{SnapshotCase, SnapshotError, SnapshotImage},
 };
 use crate::{
-    app::App,
+    app::{App, AppHandle},
     error::EngineError,
     event::{InputEvent, InputOutcome},
     window::{FrameOutcome, WindowId, WindowOptions},
@@ -37,6 +42,8 @@ pub struct TestApp {
     a11y_shadow: ShadowTree,
     /// 上一笔 `TreeUpdate` 的契约校验错误（`Some` ⇒ 本帧的更新违反 AccessKit 契约）。
     a11y_contract_error: Option<String>,
+    /// 已执行的回投任务数（R13-12 的断言面：push → drain → run 三层真的走通）。
+    tasks_run: usize,
 }
 
 impl Default for TestApp {
@@ -73,6 +80,7 @@ impl TestApp {
             last_a11y_update: None,
             a11y_shadow: ShadowTree::new(),
             a11y_contract_error: None,
+            tasks_run: 0,
         }
     }
 
@@ -95,6 +103,8 @@ impl TestApp {
     }
 
     /// 推进**一帧**（空闲帧也返回记录：`rendered == false`）。
+    ///
+    /// 一次 `drain` = 生产泵的一轮：帧 → a11y 交付 → 跨线程回投任务（R13-12）。
     ///
     /// 捕获打开时，本帧的 a11y 交付**立即**挂到记录上（不看 `A11Y_THROTTLE`）：
     /// 这是断言面最直接的语义（「本帧有没有 a11y 工作」）。
@@ -142,10 +152,36 @@ impl TestApp {
             self.last_a11y_update = Some(update);
             self.app.attach_a11y(self.window, snapshot);
         }
+        // ⑤ 跨线程回投的任务（R13-12）：与平台泵**同序**（帧 → a11y → 任务）。任务里写下的
+        // 状态因此在本轮帧之后才可见 —— 依赖 dispatcher 时序的 bug（"任务写状态但当轮不出帧"
+        // 或"任务在帧之前跑"）在这条路径上会直接现形。
+        self.pump_tasks();
         if let Some(frame) = self.frame_record().frame.clone() {
             self.last_rendered = Some(frame);
         }
         Ok(self.frame_record())
+    }
+
+    /// 执行本轮回投的任务（消费者：`step`；与平台泵的 ⑤ 一一对应）。
+    fn pump_tasks(&mut self) {
+        let dispatcher = self.app.dispatcher();
+        for task in dispatcher.drain_tasks() {
+            self.tasks_run += 1;
+            task.run(&mut self.app);
+        }
+    }
+
+    /// 跨线程句柄（`App::handle` 的转发）：测试可以用 `send` 真走
+    /// `Dispatcher::push → drain_tasks → UserTask::run` 三层（R13-12）。
+    #[must_use]
+    pub fn handle(&self) -> AppHandle {
+        self.app.handle()
+    }
+
+    /// 累计执行过的回投任务数（R13-12 的断言面）。
+    #[must_use]
+    pub fn tasks_run(&self) -> usize {
+        self.tasks_run
     }
 
     /// 最近一次 `drain` 的调度记录。
@@ -1856,5 +1892,152 @@ mod p11_fix_tests {
                 .disabled,
             "补丁照常生效"
         );
+    }
+}
+
+/// R13-12：`UserTask` 回投链的端到端用例（`AppHandle::send` → `Dispatcher::push` →
+/// `drain_tasks` → `UserTask::run`）。
+///
+/// 这条链路在旧实现里**零覆盖**：`TestApp` 没有任务泵，a11y 用例全部 `dispatch_request` 直调，
+/// 于是「任务被丢掉 / 在帧之前执行 / 重复执行 / 空闲轮不执行」四种 bug 都不可能被测出来。
+#[cfg(test)]
+mod dispatcher_tests {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    use super::TestApp;
+    use crate::{
+        math::Rect,
+        node::builder::NodeBuilder,
+        paint::{
+            color::Color,
+            style::{PaintSpec, StylePatch},
+        },
+    };
+
+    /// 跨线程 `send` 的任务必须在下一次 `drain` 里执行，且只执行一次。
+    #[test]
+    fn a_task_posted_from_another_thread_runs_on_the_next_drain() {
+        let mut app = TestApp::new();
+        let handle = app.handle();
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        std::thread::spawn(move || {
+            handle.send(move |_app| flag.store(true, Ordering::SeqCst));
+        })
+        .join()
+        .expect("posting thread");
+
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "回投任务不能在下一次 drain 之前执行"
+        );
+        let _ = app.drain().expect("frame");
+        assert!(ran.load(Ordering::SeqCst), "drain 必须执行本轮回投的任务");
+        assert_eq!(app.tasks_run(), 1, "任务只允许执行一次");
+        let _ = app.drain().expect("next frame");
+        assert_eq!(app.tasks_run(), 1, "同一条任务不得重复执行");
+    }
+
+    /// 任务在帧**之后**执行：它写下的状态必须等到下一轮才出帧。
+    ///
+    /// 这是生产泵 ④/⑤ 的时序（帧 → a11y → 任务）。若测试泵把任务放在帧之前（或丢了任务泵），
+    /// 这条用例立刻变红 —— 正是「依赖 dispatcher 时序的 bug」的回归面。
+    #[test]
+    fn a_task_runs_after_the_frame_and_its_write_lands_on_the_next_frame() {
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let color = app.app_mut().signal(Color::from_rgba8([255, 0, 0, 255]));
+        {
+            let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+            let root = tree.root();
+            NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, 0.0, 20.0, 20.0))
+                .paint(PaintSpec {
+                    background: Color::from_rgba8([0, 0, 0, 255]),
+                    ..PaintSpec::default()
+                })
+                .bind_style(move |cx| StylePatch {
+                    background: Some(*cx.read(&color)),
+                    ..StylePatch::default()
+                })
+                .build(tree, root)
+                .expect("bound box");
+        }
+        let first = app.drain().expect("首帧").clone();
+        assert!(first.rendered, "首帧必须提交");
+        let settled = app.frame_record().frame_index;
+
+        // 任务写状态：发生在**本轮帧之后** ⇒ 本轮不得因此出帧。
+        let handle = app.handle();
+        handle.send(move |app| {
+            app.write(&color, Color::from_rgba8([0, 255, 0, 255]));
+        });
+        let same_round = app.drain().expect("任务轮").clone();
+        assert_eq!(
+            app.frame_record().frame_index,
+            settled,
+            "任务在帧之后执行：本轮的 FrameIndex 不得因这次写入推进"
+        );
+        assert!(
+            !same_round.rendered,
+            "任务写下的状态只能下一轮出帧（本轮帧已经跑完）"
+        );
+        assert_eq!(app.tasks_run(), 1);
+
+        let next = app.drain().expect("下一轮").clone();
+        assert!(
+            next.rendered,
+            "任务写下的状态必须在下一轮出帧（丢了任务泵 / 没有唤醒都会停在这里）"
+        );
+        assert_eq!(
+            app.frame_record().frame_index.get(),
+            settled.get() + 1,
+            "任务写入只允许产生一帧"
+        );
+    }
+
+    /// 空闲轮也要执行任务（生产泵的 ⑤ 与帧门禁无关：没有帧可出时任务照样回投）。
+    #[test]
+    fn tasks_run_even_when_the_frame_is_idle() {
+        let mut app = TestApp::new();
+        let _ = app.drain().expect("首帧");
+        let handle = app.handle();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&ran);
+        handle.send(move |_app| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let record = app.drain().expect("空闲帧").clone();
+        assert!(!record.rendered, "任务本身不产生像素 ⇒ 帧门禁必须 Idle");
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "空闲帧也必须执行回投任务（生产泵的 ⑤ 与帧门禁无关）"
+        );
+    }
+
+    /// 一次 drain 执行队列里的**全部**任务，且按 push 顺序（FIFO）。
+    #[test]
+    fn tasks_run_in_fifo_order_and_only_once() {
+        let mut app = TestApp::new();
+        let handle = app.handle();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        for index in 0..3usize {
+            let log = Arc::clone(&order);
+            handle.send(move |_app| log.lock().expect("task log").push(index));
+        }
+        let _ = app.drain().expect("frame");
+        assert_eq!(
+            *order.lock().expect("task log"),
+            vec![0, 1, 2],
+            "回投任务必须按 push 顺序执行"
+        );
+        assert_eq!(app.tasks_run(), 3);
+        let _ = app.drain().expect("next frame");
+        assert_eq!(app.tasks_run(), 3, "队列取空后不得重复执行");
     }
 }

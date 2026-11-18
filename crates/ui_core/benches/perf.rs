@@ -1078,6 +1078,164 @@ fn bench_idle_frame(c: &mut Criterion) {
     });
 }
 
+/// **R01-10 的基准：HUD 打开、画面静止时的「每帧」成本。**
+///
+/// 计时的是 `App::frame` 在「没有任何脏状态、也没到 500 ms 采样点」那一次调用的成本：
+/// - 旧实现（每帧无条件 `request_damage(HUD 面板)`）：帧门禁永远放行 ⇒ 每次调用都提交一帧，
+///   重放 HUD 面板区域的 damage（`Committed`）；
+/// - 新实现（只有 500 ms 采样产出新文本时才请求 damage）：门禁直接退回 `Idle`，零 damage、
+///   零提交。
+///
+/// 计数判据在 `tests/hud.rs::hud_costs_nothing_when_the_scene_is_idle`（静止帧必须不提交）；
+/// 本基准量化两者差距，并把每轮的实际结果打到 stderr（日志里直接可读 `before = Committed` /
+/// `after = Idle`）。
+///
+/// 需要 `--features hud`：`App::set_debug_hud` 只在 hud 特性下存在；没有该特性时是空基准。
+#[cfg(feature = "hud")]
+fn bench_hud_idle_frame(c: &mut Criterion) {
+    use ui_core::window::FrameOutcome;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("bench runtime");
+    let handle = runtime.handle().clone();
+    let mut fixture = new_app(&handle);
+    // 静态场景：HUD 之外没有任何节点/绑定，静止帧的唯一工作来源就是 HUD 自己。
+    let _ = mount_boxes(&mut fixture, 1);
+    fixture
+        .app
+        .set_debug_hud(fixture.window, true)
+        .expect("install debug hud");
+    // 安装帧：HUD 子树挂载、首个 500 ms 窗口还没到（时钟不动）。
+    let _ = fixture.app.frame(fixture.window);
+    let reported = std::sync::Once::new();
+    c.bench_function("hud_idle_frame", |b| {
+        b.iter(|| {
+            let outcome = black_box(fixture.app.frame(fixture.window));
+            reported.call_once(|| {
+                let committed = matches!(
+                    outcome.as_ref().and_then(|result| result.as_ref().ok()),
+                    Some(FrameOutcome::Committed(_))
+                );
+                eprintln!(
+                    "hud_idle_frame: 静止帧 {}",
+                    if committed {
+                        "提交（HUD 每帧无条件 damage）"
+                    } else {
+                        "Idle（HUD 不产生 damage）"
+                    }
+                );
+            });
+            outcome
+        });
+    });
+}
+
+/// 没有 `hud` 特性时的空实现（`criterion_group!` 的 targets 必须始终存在）。
+#[cfg(not(feature = "hud"))]
+fn bench_hud_idle_frame(_c: &mut Criterion) {}
+
+/// **R07-11 的基准：泵每轮每窗的 DirectComposition 几何阶段。**
+///
+/// 泵的 ②b′ 每轮对**每个窗口**做一次「当前客户区 + 是否最小化」判定：
+/// - 旧实现：每轮每窗 2 次系统调用（`IsIconic` + `GetClientRect`，实测 0.5–1 µs 量级）；
+/// - 新实现：以 `(逻辑尺寸, 比例)` 做缓存键，只有键变化（`WM_SIZE` / DPI）才查询 ⇒ 稳态
+///   每轮每窗 0 次系统调用（就是一次元组比较）。
+///
+/// 本基准在同一台机器上、用**同一对 Win32 API**（句柄 = 桌面窗口）量出两者的每轮成本；
+/// 64 窗口一档对应「同时开 64 个窗口时泵的一轮」。计数判据（稳态 0 次查询）在
+/// `platform/windows/event_loop/pump.rs` 的单测里。
+#[cfg(windows)]
+fn bench_pump_composition_geometry(c: &mut Criterion) {
+    use windows::{
+        Win32::{
+            Foundation::{HWND, RECT},
+            System::LibraryLoader::GetModuleHandleW,
+            UI::WindowsAndMessaging::{
+                CreateWindowExW, DestroyWindow, GetClientRect, IsIconic, WINDOW_EX_STYLE, WS_POPUP,
+            },
+        },
+        core::w,
+    };
+
+    let Ok(instance) = (unsafe { GetModuleHandleW(None) }) else {
+        return;
+    };
+    // **真实的隐藏窗口**（不是桌面窗口句柄）：桌面窗口有用户态快路径，量出来会偏快、不能代表
+    // 泵里「每窗一个 HWND」的 `IsIconic` / `GetClientRect`。创建失败（无交互会话）就跳过。
+    // SAFETY: 内置 `STATIC` 类，不需要自定义 WndProc；参数都是值或空。
+    let hwnd: HWND = match unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("STATIC"),
+            w!("kytrix bench target"),
+            WS_POPUP,
+            0,
+            0,
+            800,
+            600,
+            None,
+            None,
+            Some(instance.into()),
+            None,
+        )
+    } {
+        Ok(hwnd) => hwnd,
+        Err(_) => return,
+    };
+    let mut group = c.benchmark_group("pump_composition_geometry");
+    for windows_count in [1usize, 64] {
+        group.bench_function(format!("syscalls_{windows_count}_windows"), |b| {
+            b.iter(|| {
+                let mut last = (false, 0i32, 0i32);
+                for _ in 0..windows_count {
+                    // SAFETY: 窗口由本函数创建、尚未销毁；两个调用都只读窗口状态。
+                    let minimized = unsafe { IsIconic(hwnd) }.as_bool();
+                    let mut rect = RECT::default();
+                    // SAFETY: `rect` 是栈上值，句柄同上。
+                    let _ = unsafe { GetClientRect(hwnd, &mut rect) };
+                    last = (minimized, rect.right, rect.bottom);
+                }
+                black_box(last)
+            });
+        });
+        // 新路径的等价判定：缓存键 = (逻辑尺寸, 比例)；键不变 ⇒ 一次比较，零系统调用。
+        group.bench_function(format!("cached_{windows_count}_windows"), |b| {
+            let key = (VIEWPORT, Scale::ONE);
+            let cached = key;
+            b.iter(|| {
+                let mut hits = 0usize;
+                for _ in 0..windows_count {
+                    let probe = black_box(key);
+                    if probe == cached {
+                        hits += 1;
+                    }
+                }
+                black_box(hits)
+            });
+        });
+    }
+    group.finish();
+    // SAFETY: 本函数创建、无人再引用；销毁是最后一步。
+    unsafe {
+        let _ = DestroyWindow(hwnd);
+    }
+}
+
+/// 没有 Windows 目标时的空实现（同上：group targets 必须存在）。
+#[cfg(not(windows))]
+fn bench_pump_composition_geometry(_c: &mut Criterion) {}
+
+criterion_group! {
+    name = rw11_benches;
+    config = Criterion::default()
+        .sample_size(20)
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(2));
+    targets = bench_hud_idle_frame, bench_pump_composition_geometry
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default()
@@ -1104,4 +1262,4 @@ criterion_group! {
         bench_frame_incremental_10k_ui_thread,
         bench_idle_frame
 }
-criterion_main!(benches);
+criterion_main!(benches, rw11_benches);

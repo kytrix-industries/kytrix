@@ -419,13 +419,19 @@ fn paint_node(
 ///
 /// `total` 是完整的祖先滚动位移（damage 是屏幕坐标）；隐藏子树不产生 lane，因此不需要烘焙偏移。
 fn hide_subtree(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext, total: Point) {
+    // AR5 P2-1：隐藏同样是"内容消失"——旧 lane 里的文本/Canvas 可见范围可能溢出节点盒，
+    // 必须先记下再清 lane，否则 `Clip::None` 的长文本隐藏后旧字形留在屏幕上。
+    let previous_content = painted_content(context.tree, context.scene, node);
     let (children, damage_rect, child_offset) = {
         let Ok(target) = context.tree.get(node) else {
             return;
         };
         let children: SmallVec<[NodeId; 4]> = target.children().iter().copied().collect();
         // damage 与 bounds 都在**内容坐标**：先并集，再减祖先滚动偏移得到屏幕坐标（P10 §7.2）。
-        let mut damage_rect = target.damage().union(target.layout().bounds);
+        let mut damage_rect = target
+            .damage()
+            .union(target.layout().bounds)
+            .union(previous_content.content);
         // 几何的可见范围可能超出节点布局盒：隐藏时也必须把 `desc.bounds` 并入
         // damage，否则溢出部分留下旧像素（「damage 帧不清屏」会长期残留；复审 A3）。
         if let NodeKind::Geometry(id) = *target.kind()
@@ -464,6 +470,11 @@ fn hide_subtree(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
     context.tree.set_reusable(node);
     context.tree.clear_paint(node);
     context.damage.push(damage_rect, 1.0, clip.covering);
+    if !previous_content.screen.is_empty() {
+        context
+            .damage
+            .push(previous_content.screen, 1.0, clip.covering);
+    }
     for child in children {
         hide_subtree(context, child, clip, child_offset);
     }
@@ -493,6 +504,9 @@ fn rebuild_lane(
             lane
         }
     };
+    // AR5 P2-1：旧可见内容范围必须在清空 lane **之前**记下 —— 内容收缩（长文本变短 /
+    // Canvas 变小）后新图元只覆盖收缩后的区域，旧像素需要这份旧 AABB 才会被重画。
+    let previous_content = painted_content(context.tree, context.scene, node);
     let _ = context.scene.clear_lane(lane);
     // 槽位必须写进 lane：编码器据此生成 `FrameOp::Instances.scroll`，也是段复用的判据之一。
     // `set_lane_scroll` 在槽位变化时让内容版本 +1，因此总线上不会漏掉这条 lane。
@@ -524,7 +538,7 @@ fn rebuild_lane(
         let bounds = target.layout().bounds.translate(negate(bake));
         let patch = target.style_patch().clone();
         let spec = target.paint_spec().cloned();
-        let node_damage = target.damage();
+        let node_damage = target.damage().union(previous_content.content);
         let content_offset = context.tree.content_offset(node);
         let content_clip =
             (target.clip() == Clip::Bounds).then(|| bounds.inset(target.layout().border));
@@ -591,6 +605,13 @@ fn rebuild_lane(
         geometry_transform,
     };
     emitter.emit(context);
+
+    // Canvas 的旧可见范围是屏幕坐标（`screen_baked`，不参与合成端平移），直接进 damage。
+    if !previous_content.screen.is_empty() {
+        context
+            .damage
+            .push(previous_content.screen, 1.0, clip.covering);
+    }
 
     for _ in inner_clips.iter().rev() {
         let _ = context.scene.push(lane, Primitive::Clip(ClipOp::Pop));
@@ -723,6 +744,51 @@ fn geometry_damage(
         .map(|point| point.y)
         .fold(f32::NEG_INFINITY, f32::max);
     Rect::new(min_x, min_y, max_x - min_x, max_y - min_y).translate(negate(offset))
+}
+
+/// 上一帧 lane 里**内容图元**的可见范围（lane 重建 / 隐藏**之前**记下；AR5 P2-1）。
+///
+/// 文本（`Clip::None` 的长行可以溢出节点盒）与 Canvas 的可见范围都可能大于节点布局盒。
+/// 内容**收缩**时如果只按「新图元 + 节点盒」记 damage，旧像素没有任何矩形覆盖 ⇒ 残影
+/// （AR5 复现：14 个 'W' 改成 'i'，damage 只到 x=60，旧字形 x∈[61,200] 留在屏幕上）。
+/// lane 里恰好保存着上一帧的图元列表，重建前取一份 AABB 即可，不需要额外的常驻状态。
+///
+/// 两者坐标空间不同（与 `emit_content` 的 damage 写入保持一致）：
+/// - 字形是**烘焙坐标**（lane 图元本来就是按 bake 存的）⇒ 加 `lane_offset` 还原成内容坐标，
+///   由 `PrimitiveEmitter` 与 `node_damage` 一起统一减祖先滚动偏移转屏幕；
+/// - Canvas 是**屏幕坐标**（`screen_baked` 节点，不参与合成端平移）⇒ 直接进 damage。
+#[derive(Default)]
+struct PaintedContent {
+    /// 内容坐标（走 `node_damage` 的记账路径）。
+    content: Rect,
+    /// 屏幕坐标（直接 push 的 damage）。
+    screen: Rect,
+}
+
+fn painted_content(tree: &NodeTree, scene: &Scene, node: NodeId) -> PaintedContent {
+    let Some(lane) = tree.lane_of(node) else {
+        return PaintedContent::default();
+    };
+    let Some(primitives) = scene.lane_primitives(lane) else {
+        return PaintedContent::default();
+    };
+    let mut content = Rect::default();
+    let mut screen = Rect::default();
+    for primitive in primitives {
+        match primitive {
+            Primitive::GlyphRun(run) => {
+                for glyph in &run.glyphs {
+                    content = content.union(Rect::from_origin_size(glyph.position, glyph.size));
+                }
+            }
+            Primitive::Canvas(canvas) => screen = screen.union(canvas.bounds()),
+            _ => {}
+        }
+    }
+    PaintedContent {
+        content: content.translate(tree.lane_offset(node)),
+        screen,
+    }
 }
 
 impl PrimitiveEmitter {

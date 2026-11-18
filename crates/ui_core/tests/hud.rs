@@ -74,13 +74,86 @@ fn hud_is_hidden_from_the_accessibility_tree() {
     assert!(record.hidden, "HUD 必须标记 hidden，而不是冒充可访问内容");
 }
 
+/// **R01-10 的契约：HUD 打开 ≠「永远有一帧」。**
+///
+/// 旧实现 `prepare_frame` 末尾无条件 `request_damage(HUD 面板)`，而帧门禁读的正是
+/// `pending_damage` ⇒ 窗口只要开着 HUD 就按刷新率提交帧、整块重画 HUD（静止画面也如此）。
+/// 现在只在「有新文本要写」时请求 damage（采样点 = 500 ms；以及提交失败的重试帧），于是：
+/// - 静止画面：每次 `drain` 都是 `Idle`，`FrameIndex` 不推进；
+/// - 每个 500 ms 采样窗口：**恰好一帧**（不是每轮一帧）。
+///
+/// 判据全部是**计数**（`rendered` / `FrameIndex`），与机器负载无关。
 #[test]
-fn hud_keeps_committing_frames_while_the_scene_is_idle() {
+fn hud_costs_nothing_when_the_scene_is_idle() {
+    let mut test = TestApp::new();
+    install(&mut test);
+    assert!(
+        test.drain().expect("安装帧").rendered,
+        "安装 HUD 必须提交一帧"
+    );
+
+    let settled = test.frame_record().frame_index;
+    for index in 0..5 {
+        assert!(
+            !test.drain().expect("静止帧").rendered,
+            "第 {index} 个静止帧不得提交：HUD 又在每帧无条件请求 damage 了"
+        );
+    }
+    assert_eq!(
+        test.frame_record().frame_index,
+        settled,
+        "静止期间 FrameIndex 不得推进（每帧一帧的旧行为会让它 +5）"
+    );
+
+    // 一个采样窗口（500 ms）恰好一帧：文本刷新真的发生了，但只有这一帧。
+    test.advance(Duration::from_millis(600));
+    let sample = test.drain().expect("采样帧").clone();
+    assert!(sample.rendered, "到达 500 ms 采样点必须提交一帧刷新文本");
+    let sampled = test.frame_record().frame_index;
+    assert_eq!(
+        sampled.get(),
+        settled.get() + 1,
+        "采样点只允许推进一帧（旧行为是每轮一帧）"
+    );
+
+    // HUD 的 damage 必须落在面板内（不是整窗）：面板 = (544,12,244,200) @ scale 1，含 1 px
+    // AA 外扩。整窗 damage 会让 HUD 打开时每次都重画整屏。
+    let panel = ui_core::math::PhysicalRect::new(543, 11, 789, 213);
+    assert!(!sample.damage.is_empty(), "采样帧必须有 damage 才会提交");
+    for rect in &sample.damage {
+        assert!(
+            rect.intersect(panel) == *rect,
+            "HUD damage 必须落在面板内：{rect:?}（整窗 damage = R01-10 回归）"
+        );
+    }
+
+    for index in 0..3 {
+        assert!(
+            !test.drain().expect("采样后的静止帧").rendered,
+            "采样之后第 {index} 帧必须回到 Idle"
+        );
+    }
+
+    // 第二个采样窗口：同样恰好一帧（帧率上限 = 2 Hz，不是刷新率）。
+    test.advance(Duration::from_millis(600));
+    assert!(
+        test.drain().expect("第二个采样帧").rendered,
+        "第二个 500 ms 窗口必须再提交一帧"
+    );
+    assert_eq!(
+        test.frame_record().frame_index.get(),
+        settled.get() + 2,
+        "两个采样窗口只允许两帧"
+    );
+}
+
+/// 关闭 HUD 必须**请求一帧**把旧像素擦掉，之后窗口重新回到 Idle。
+#[test]
+fn disabling_the_hud_erases_its_pixels_once() {
     let mut test = TestApp::new();
     let window = test.window_id();
     install(&mut test);
     assert!(test.drain().expect("第一帧").rendered);
-    assert!(test.drain().expect("HUD 持续帧").rendered);
 
     test.app_mut()
         .set_debug_hud(window, false)

@@ -51,6 +51,9 @@ pub(crate) fn transient<T: Clone + 'static>(app: &mut App, initial: T) -> Transi
 
 /// 注册一个派生值（**不**立即求值；环在运行期检测）。
 /// 消费者：`App::derived`。
+///
+/// 派生归属**根作用域**：闭包捕获作用域信号会在释放后留下"永久陈旧 + 下次重算 panic"的组合
+/// （见 `Derived` / `SignalScope` 的文档，R5c）。这里不（也无法）检查不透明闭包。
 pub(crate) fn derived<T: Clone + 'static>(
     app: &mut App,
     compute: impl Fn(&mut ReadCtx<'_>) -> T + 'static,
@@ -72,6 +75,9 @@ pub(crate) fn signal_scope(app: &mut App) -> SignalScope {
 ///
 /// 返回被释放的信号数。重复释放返回 0（幂等）；根作用域不会被释放（返回 0）。
 /// 消费者：`App::release_scope` / `App::close_window`。
+///
+/// 只清值槽位与依赖边：**根作用域里捕获了这些句柄的派生不会被失效**（旧边已删），下次因其它
+/// 依赖重算会读死句柄 panic —— 跨作用域捕获是应用层硬禁令（R5c，见 `Derived` 文档）。
 pub(crate) fn release_scope(app: &mut App, scope: SignalScope) -> usize {
     let Some(signals) = app.store.release_scope(scope) else {
         return 0;

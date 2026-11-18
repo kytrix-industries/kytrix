@@ -83,9 +83,16 @@ pub(crate) enum RefreshSource {
 ///
 /// 一个窗口一个实例，由拥有该窗口的线程独占（泵 / 合成线程）；`hwnd` 只用于 DXGI 兜底时定位
 /// 显示器，DWM 采样始终是桌面级的。
+///
+/// **`hwnd` 存 `isize` 而不是 `HWND`**（P2-5）：`HWND` 是裸指针，存它会让整个类型 `!Send`，
+/// 而合成线程的 `Box<dyn FrameClock>` 要求 `Send` —— 旧实现为此在
+/// `render/windows/clock.rs` 里写了一个 `unsafe impl Send for CompositorClock`。句柄值本身只是
+/// 进程内不透明整数，可以自由跨线程复制；本类型在合成线程里**构造并独占使用**，所有 Win32
+/// 调用都发生在该线程（`dxgi_refresh_hz`），不跨线程调 API。因此把字段降为整数即自动 `Send`，
+/// 不需要任何 unsafe。
 pub(crate) struct FrameClock {
-    /// DXGI 兜底探测用（窗口所在显示器）；`HWND::default()` = 桌面级（主显示器）。
-    hwnd: HWND,
+    /// DXGI 兜底探测用（窗口所在显示器）；`0` = 桌面级（主显示器）。
+    hwnd: isize,
     /// 最近一次采样 / 兜底值，恒在 [`MIN_REFRESH_HZ`]..=[`MAX_REFRESH_HZ`] 内。
     refresh_hz: f32,
     /// `refresh_hz` 的来源（[`RefreshSource`]）。
@@ -108,7 +115,8 @@ impl FrameClock {
     /// 建好就采一次：120/144 Hz 显示器不能等第一次 [`Self::sample`] 才发现。
     pub(crate) fn new(hwnd: HWND) -> Self {
         let mut clock = Self {
-            hwnd,
+            // 只保存句柄值（`0` = 桌面级）；`HWND` 是裸指针，存它会毁掉 `Send`（见类型文档）。
+            hwnd: hwnd.0 as isize,
             refresh_hz: FALLBACK_REFRESH_HZ,
             source: RefreshSource::Fallback,
         };
@@ -162,7 +170,10 @@ impl FrameClock {
         // DWM 缺席时才问 DXGI：它要建工厂 / 枚举适配器与输出，比 DWM 查询贵得多，而且只给得出
         // 当前桌面模式的刷新率（没有相位）。
         let dxgi = if dwm.is_none() {
-            dxgi_refresh_hz(self.hwnd)
+            // SAFETY: 句柄值由 `new` 保存，来自本进程的窗口（可能已销毁 / `0` = 桌面级）。
+            // `dxgi_refresh_hz` 只用它定位显示器 —— `GetWindowRect` 对失效句柄返回错误，此时按
+            // 桌面原点退回；不解引用任何指针。本调用发生在时钟被构造的那个线程上。
+            dxgi_refresh_hz(HWND(self.hwnd as *mut core::ffi::c_void))
         } else {
             None
         };
@@ -508,5 +519,22 @@ mod tests {
             elapsed <= Duration::from_millis(500),
             "ticked={ticked} elapsed={elapsed:?}"
         );
+    }
+
+    /// **P2-5**：`FrameClock` 必须是 `Send`，且这个 `Send` 是**自动推导**出来的（字段里没有裸
+    /// 指针）—— 旧实现存 `HWND`（裸指针）导致 `!Send`，只能靠 `render/windows/clock.rs` 的
+    /// `unsafe impl Send for CompositorClock` 兜住。
+    #[test]
+    fn the_frame_clock_is_send_without_any_unsafe_impl() {
+        fn assert_send<T: Send>() {}
+        assert_send::<FrameClock>();
+        // 送进另一条线程并真的用一次（不是只做类型检查）。
+        let mut clock = FrameClock::new(HWND::default());
+        let handle = std::thread::spawn(move || {
+            let sample = clock.sample();
+            (sample.refresh_hz, clock.refresh_hz())
+        });
+        let (sampled, cached) = handle.join().expect("clock thread");
+        assert_eq!(sampled, cached, "跨线程采样与缓存必须一致");
     }
 }

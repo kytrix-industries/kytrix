@@ -368,6 +368,8 @@ impl ScriptReport {
 pub struct FrameScript {
     app: TestApp,
     capture: A11yCapture,
+    /// `run` 结束处是否跑 a11y 增量 vs 全量 oracle（会额外推进两帧）。
+    oracle: bool,
     queued: Vec<ScriptFrame>,
     report: ScriptReport,
 }
@@ -379,6 +381,7 @@ impl FrameScript {
         Self {
             app,
             capture: A11yCapture::Off,
+            oracle: false,
             queued: Vec::new(),
             report: ScriptReport {
                 samples: Vec::new(),
@@ -393,6 +396,17 @@ impl FrameScript {
             self.app.enable_a11y_capture();
         }
         self.capture = capture;
+        self
+    }
+
+    /// 每次 [`Self::run`] 结束处跑 [`TestApp::assert_a11y_oracle`]（增量 vs 全量）。
+    ///
+    /// oracle 是「忘记 `mark_a11y`」的唯一防线，但它在比较前需要**强制全量交付**，因此会额外
+    /// 推进两帧；所以是显式 opt-in，而不是每个脚本都自动跑。要求捕获已打开
+    /// （[`A11yCapture::Pump`]），否则 [`TestApp::assert_a11y_oracle`] 自己会 panic。
+    #[must_use]
+    pub fn with_a11y_oracle(mut self) -> Self {
+        self.oracle = true;
         self
     }
 
@@ -424,12 +438,28 @@ impl FrameScript {
     ///
     /// 结果用 [`Self::report`] 取：`run` 不返回报告的借用，避免「执行完就锁住 `app`」的坑。
     ///
+    /// **结束处是 a11y 的真实执行点**（R2）：捕获打开时，每轮 `run` 结束都校验整份报告里
+    /// 每一笔 `TreeUpdate` 的 AccessKit 契约（[`ScriptReport::assert_a11y_contract_all`]）与
+    /// `TestApp` 最近一笔的契约错误；用 [`Self::with_a11y_oracle`] 打开时再跑增量 vs 全量
+    /// oracle —— 后者是「忘记 `mark_a11y`」的唯一防线（只注册不执行的基建等于没有基建）。
+    ///
     /// # Errors
-    /// 任一帧失败（`EngineError`）：失败帧之前的结果留在报告里，之后的帧不再执行。
+    /// 任一帧失败（`EngineError`）：失败帧之前的结果留在报告里，之后的帧不再执行
+    /// （结束后断言不跑：脚本已中止）。
+    ///
+    /// # Panics
+    /// 捕获打开时：某帧的 `TreeUpdate` 违反 AccessKit 契约；打开 oracle 时：增量与全量不一致。
     pub fn run(&mut self) -> Result<(), EngineError> {
         for frame in std::mem::take(&mut self.queued) {
             let sample = self.execute(frame)?;
             self.report.samples.push(sample);
+        }
+        if self.capture == A11yCapture::Pump {
+            self.report.assert_a11y_contract_all();
+            self.app.assert_a11y_contract();
+        }
+        if self.oracle {
+            self.app.assert_a11y_oracle();
         }
         Ok(())
     }
@@ -647,7 +677,9 @@ mod tests {
             )
             .expect("挂载");
 
-        let mut script = FrameScript::new(app).with_a11y_capture(A11yCapture::Pump);
+        let mut script = FrameScript::new(app)
+            .with_a11y_capture(A11yCapture::Pump)
+            .with_a11y_oracle();
         script.push(ScriptFrame::new("首帧"));
         script.push(
             ScriptFrame::new("只移焦点（必须立即交付）").mutate(move |app| {
@@ -691,6 +723,50 @@ mod tests {
             report.a11y_snapshot(3)
         );
         report.assert_a11y_contract_all();
+    }
+
+    /// **R2 变异验证**：故意漏掉 `mark_a11y` 的变更必须让 oracle 变红。
+    ///
+    /// 这是 a11y oracle 的自测：没有它，oracle 本身坏掉（或没有被接到真实执行点）也没人知道。
+    /// [`FrameScript::with_a11y_oracle`] 在 `run` 结束处比较「增量累积」与「强制全量」——
+    /// 漏标 `A11Y` 的节点只会让全量侧出现新语义 ⇒ `assert_a11y_oracle` panic。
+    ///
+    /// 变异验证：删掉 `run` 里的 `assert_a11y_oracle` 调用 ⇒ 这里不再 panic，`should_panic` 失败。
+    #[test]
+    #[should_panic(expected = "inconsistent a11y tree")]
+    fn a11y_oracle_is_red_when_a_node_forgets_mark_a11y() {
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let root = app.app().window(window).expect("窗口").tree().root();
+        let node = NodeBuilder::boxed()
+            .layout_override(Rect::new(10.0, 10.0, 40.0, 16.0))
+            .a11y(A11yOverride {
+                label: Some(smol_str::SmolStr::new_static("旧标签")),
+                ..A11yOverride::default()
+            })
+            .build(
+                app.app_mut().window_mut(window).expect("窗口").tree_mut(),
+                root,
+            )
+            .expect("挂载");
+        let mut script = FrameScript::new(app)
+            .with_a11y_capture(A11yCapture::Pump)
+            .with_a11y_oracle();
+        script.push(ScriptFrame::new("首帧（全树）"));
+        script.push(
+            ScriptFrame::new("改语义但故意漏 mark_a11y").mutate(move |app| {
+                let tree = app.window_mut(window).expect("窗口").tree_mut();
+                tree.set_a11y_patch(
+                    node,
+                    crate::a11y::A11yPatch {
+                        label: Some(smol_str::SmolStr::new_static("新标签")),
+                        ..crate::a11y::A11yPatch::default()
+                    },
+                );
+                // 关键：**不**调用 `tree.mark_a11y(node)`（模拟应用漏标）。
+            }),
+        );
+        script.run().expect("帧执行本身不报错，oracle 才该失败");
     }
 
     #[test]
@@ -833,6 +909,8 @@ mod tests {
             )
             .expect("text");
         let _ = app.drain().expect("首帧");
+        // R2：`TestApp::assert_a11y_contract` 的真实调用点（此前全仓 0 调用）。
+        app.assert_a11y_contract();
 
         let snapshot = crate::test_support::a11y::tree_update_snapshot(
             app.a11y_update().expect("首帧必须有 TreeUpdate"),
