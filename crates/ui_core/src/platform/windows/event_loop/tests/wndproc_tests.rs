@@ -10,7 +10,14 @@
 //! 停在 `WM_ENTERSIZEMOVE` + `WM_SIZE` 这一层：系统模态循环本身无法在单测里进入
 //! （`SendMessage(WM_NCLBUTTONDOWN)` 会阻塞到用户松手），那条接线由真机拖动探针验收。
 
-use std::sync::Arc;
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use windows::Win32::{
     Foundation::{HWND, LPARAM, POINT, RECT, WPARAM},
@@ -25,13 +32,13 @@ use windows::Win32::{
         WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, GWLP_USERDATA, GetWindowRect, HTBOTTOMRIGHT, HTCAPTION,
             HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON, HTMINBUTTON, HTSYSMENU, HTTOPLEFT, MINMAXINFO,
-            PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, RegisterClassW, SM_CXPADDEDBORDER,
-            SM_CXSIZEFRAME, SPI_SETANIMATION, SPI_SETWORKAREA, SendMessageW, SetWindowLongPtrW,
-            WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_DISPLAYCHANGE, WM_DPICHANGED,
-            WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_IME_CHAR, WM_IME_COMPOSITION,
-            WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_INPUTLANGCHANGE, WM_LBUTTONDOWN,
-            WM_MOUSEMOVE, WM_MOVE, WM_NCHITTEST, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_SIZE,
-            WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+            MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PM_REMOVE, PeekMessageW, RegisterClassW,
+            SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SPI_SETANIMATION, SPI_SETWORKAREA, SendMessageW,
+            SetWindowLongPtrW, WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_DISPLAYCHANGE,
+            WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_IME_CHAR,
+            WM_IME_COMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_INPUTLANGCHANGE,
+            WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOVE, WM_NCHITTEST, WM_POWERBROADCAST,
+            WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
         },
     },
 };
@@ -42,7 +49,7 @@ use crate::{
     event::ImeEvent,
     math::{Rect, Scale, Size},
     platform::{
-        dispatcher::{Dispatcher, WM_APP_COMPOSITION_WAKE},
+        dispatcher::{Dispatcher, UserTask, WM_APP_COMPOSITION_WAKE, WM_APP_FRAME_WAKE},
         event::PlatformEvent,
         windows::{
             dark_mode, dpi,
@@ -1400,4 +1407,377 @@ fn a_size_after_the_modal_loop_is_only_recorded_for_the_pump() {
             .any(|event| matches!(event.event, PlatformEvent::Resize { .. })),
         "事件仍必须入队交给泵（否则模态循环外的 resize 永远不重排）：{events_before:?}"
     );
+}
+
+// ── B1：系统 move 模态循环里的出帧（`WM_APP_FRAME_WAKE` → `ModalTick`）──────────────────
+//
+// 拖动标题栏走系统 move 模态循环：它不产生 `WM_SIZE`，而唯一的帧请求入口
+// `WM_APP_FRAME_WAKE` 曾经被直接吞掉 ⇒ tokio 回投任务 / `on_frame` 钩子 / `App::frame` 全部
+// 停摆（报告 §1 VALID）。下面的用例钉住三件事：
+// (a) 模态循环内一条 `WM_APP_FRAME_WAKE` 执行任务 + 钩子 + 提交一帧；
+// (b) 模态循环外同序列**不得**直接出帧（守住泵的 ④ 路径，不回归成双帧）；
+// (c) 模态 tick 里任务关掉全部窗口：不 panic、不重入、不泄漏唤醒位。
+
+/// B1 用例夹具：真实 `App` + 隐藏 `NativeWindow`（挂上生产 `WndProc` 与模态 tick 驱动）。
+///
+/// `native` 必须活到用例结束（`WndProcState` 的所有者）；`hook_runs` 是 `App::on_frame` 的
+/// 调用计数（模态 tick 与泵的 ④ 都会让它 +1）。`runtime` 由调用方持有（`App` 的 tokio 句柄）。
+struct ModalFixture {
+    app: Rc<RefCell<App>>,
+    dispatcher: Arc<Dispatcher>,
+    native: NativeWindow,
+    hwnd: HWND,
+    id: WindowId,
+    hook_runs: Rc<Cell<u32>>,
+}
+
+fn modal_tick_fixture(runtime: &tokio::runtime::Runtime) -> ModalFixture {
+    let mut app = App::new(runtime.handle().clone());
+    let options = WindowOptions::default();
+    let id = app.create_window(options.clone());
+    let app = Rc::new(RefCell::new(app));
+    let dispatcher = Dispatcher::new();
+    let native = NativeWindow::create(id, &options, Arc::clone(&dispatcher), Some(&app))
+        .expect("NativeWindow::create");
+    let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
+    let hook_runs = Rc::new(Cell::new(0u32));
+    let counter = Rc::clone(&hook_runs);
+    app.borrow_mut().on_frame(move |_app| {
+        counter.set(counter.get() + 1);
+    });
+    // 建窗 / a11y 构造不应留下待处理帧：清一次让断言只测被发送的消息。
+    let _ = dispatcher.take_frame_wake();
+    ModalFixture {
+        app,
+        dispatcher,
+        native,
+        hwnd,
+        id,
+        hook_runs,
+    }
+}
+
+/// B1 (a)：`WM_ENTERSIZEMOVE` 之后，一条 `WM_APP_FRAME_WAKE` 必须在 `WndProc` 内直接
+/// 执行回投任务、`on_frame` 钩子并提交一帧（泵的 ④ 在系统模态循环里不运行）。
+///
+/// 变异守卫：删掉 `WM_APP_FRAME_WAKE` 分支里的 `in_modal_loop()` / `modal_tick_step()`
+/// 判定 ⇒ 任务与钩子都不执行、`FrameIndex` 不前进，本条变红；删掉 `modal_tick` 里的
+/// `drain_tasks` ⇒ 任务断言红；删掉 `run_frame_hook` ⇒ 钩子计数断言红。
+#[test]
+fn a_modal_loop_wake_runs_tasks_and_frames_inside_the_wndproc() {
+    let runtime = runtime();
+    let ModalFixture {
+        app,
+        dispatcher,
+        native: _native,
+        hwnd,
+        id,
+        hook_runs,
+    } = modal_tick_fixture(&runtime);
+    let task_ran = Arc::new(AtomicBool::new(false));
+    let task_flag = Arc::clone(&task_ran);
+    // 回投任务：写状态并请求重绘（行情 / HUD 更新的典型形态）。
+    dispatcher.push(UserTask::new(move |app| {
+        app.window_mut(id).expect("窗口存在").request_repaint();
+        task_flag.store(true, Ordering::Release);
+    }));
+    let before = app.borrow().window(id).expect("窗口存在").frame_index();
+
+    // 系统 move 模态循环开始（被拖窗口 = 本窗口）。
+    // SAFETY: 窗口由 `native` 持有且仍存活；`SendMessageW` 同步进入生产 `wndproc`。
+    unsafe {
+        SendMessageW(hwnd, WM_ENTERSIZEMOVE, None, None);
+    }
+    assert!(
+        dispatcher.in_modal_loop(),
+        "WM_ENTERSIZEMOVE 必须进入全局模态计数（唤醒目标可能是另一个窗口）"
+    );
+
+    // SAFETY: 同 `a_size_move_resize_drives_a_real_frame`；消息同步进入生产 `wndproc`。
+    unsafe {
+        SendMessageW(hwnd, WM_APP_FRAME_WAKE, None, None);
+    }
+
+    assert!(
+        task_ran.load(Ordering::Acquire),
+        "模态循环里的回投任务必须被执行（否则任务堆到松手后集中爆发）"
+    );
+    assert_eq!(
+        hook_runs.get(),
+        1,
+        "on_frame 钩子必须在模态循环里每拍执行一次"
+    );
+    let after = app.borrow().window(id).expect("窗口存在").frame_index();
+    assert!(
+        after > before,
+        "模态 tick 必须提交一帧（frame_index {before:?} → {after:?}；泵的 ④ 这段时间不运行）"
+    );
+    assert!(
+        !dispatcher.take_frame_wake(),
+        "唤醒位必须被这一拍消费（不能留在泵的一轮里造成双帧）"
+    );
+    assert!(
+        dispatcher.drain_tasks().is_empty(),
+        "任务队列必须已排空（否则下一条消息会重复执行）"
+    );
+
+    // 退出模态循环：计数归零，唤醒回到泵路径。
+    // SAFETY: 窗口仍存活。
+    unsafe {
+        SendMessageW(hwnd, WM_EXITSIZEMOVE, None, None);
+    }
+    assert!(
+        !dispatcher.in_modal_loop(),
+        "WM_EXITSIZEMOVE 必须退出全局模态计数"
+    );
+}
+
+/// B1 (b)：模态循环**外**同一序列不得直接出帧 —— `WM_APP_FRAME_WAKE` 仍只把唤醒位留给泵的
+/// ④（否则每次唤醒都被 `WndProc` 抢跑，泵一侧再出一帧，形成系统性双帧）。
+#[test]
+fn a_frame_wake_outside_the_modal_loop_stays_for_the_pump() {
+    let runtime = runtime();
+    let ModalFixture {
+        app,
+        dispatcher,
+        native: _native,
+        hwnd,
+        id,
+        hook_runs,
+    } = modal_tick_fixture(&runtime);
+    let task_ran = Arc::new(AtomicBool::new(false));
+    let task_flag = Arc::clone(&task_ran);
+    dispatcher.push(UserTask::new(move |app| {
+        app.window_mut(id).expect("窗口存在").request_repaint();
+        task_flag.store(true, Ordering::Release);
+    }));
+    let before = app.borrow().window(id).expect("窗口存在").frame_index();
+    assert!(!dispatcher.in_modal_loop(), "前置：不在模态循环里");
+
+    // SAFETY: 窗口由 `native` 持有且仍存活；消息同步进入生产 `wndproc`。
+    unsafe {
+        SendMessageW(hwnd, WM_APP_FRAME_WAKE, None, None);
+    }
+
+    assert_eq!(hook_runs.get(), 0, "模态循环外不得跑钩子（归泵的 ④）");
+    assert!(
+        !task_ran.load(Ordering::Acquire),
+        "模态循环外不得执行回投任务"
+    );
+    assert_eq!(
+        app.borrow().window(id).expect("窗口存在").frame_index(),
+        before,
+        "模态循环外 WM_APP_FRAME_WAKE 不得直接出帧"
+    );
+    assert!(
+        dispatcher.take_frame_wake(),
+        "唤醒位必须留给泵的 ④（这里抢走就等于丢帧）"
+    );
+    let _ = dispatcher.drain_tasks();
+}
+
+/// B1 (c) 边界：模态 tick 里任务关闭**全部**窗口 —— 不 panic、帧内不重入（`try_borrow_mut`
+/// 失败即放弃本拍）、唤醒位不泄漏（否则泵退出前还会空转一轮）。
+#[test]
+fn a_modal_tick_that_closes_every_window_neither_panics_nor_leaks_the_wake() {
+    let runtime = runtime();
+    let ModalFixture {
+        app,
+        dispatcher,
+        mut native,
+        hwnd,
+        id,
+        hook_runs,
+    } = modal_tick_fixture(&runtime);
+    let ids: Vec<WindowId> = app.borrow().windows().map(|(window, _)| window).collect();
+    assert_eq!(ids, vec![id], "前置：App 里只有一个窗口");
+    dispatcher.push(UserTask::new(move |app| {
+        for window in ids {
+            assert!(app.close_window(window), "任务必须关闭窗口");
+        }
+    }));
+
+    // SAFETY: 窗口由 `native` 持有且仍存活；消息同步进入生产 `wndproc`。
+    unsafe {
+        SendMessageW(hwnd, WM_ENTERSIZEMOVE, None, None);
+        SendMessageW(hwnd, WM_APP_FRAME_WAKE, None, None);
+    }
+
+    assert!(
+        app.borrow().windows().next().is_none(),
+        "任务必须把 App 里的窗口全部关掉"
+    );
+    assert_eq!(hook_runs.get(), 1, "钩子仍按拍执行（关窗之后才出帧）");
+    assert!(
+        !dispatcher.take_frame_wake(),
+        "关掉全部窗口之后唤醒位不得泄漏（否则泵退出路径多一轮空转）"
+    );
+    assert!(dispatcher.drain_tasks().is_empty());
+    assert!(
+        native.state_mut().take_pending_error().is_none(),
+        "关窗不是帧管线错误，不得登记粘性错误"
+    );
+
+    // SAFETY: 隐藏窗口仍由 `NativeWindow` 持有，直到用例结束。
+    unsafe {
+        SendMessageW(hwnd, WM_EXITSIZEMOVE, None, None);
+    }
+    assert!(!dispatcher.in_modal_loop());
+}
+
+/// B1 (d) 空唤醒守卫：模态循环里一条**没有唤醒位**的 `WM_APP_FRAME_WAKE` 不得出帧 ——
+/// 「唤醒位 + 一条消息」是同一电平信号，若先跑任务 / 钩子再检查唤醒位，重复/迟到的消息会把
+/// 模态循环变成忙循环（持续跑钩子 + 空帧）。`take_frame_wake` 必须是本函数的第一件事。
+#[test]
+fn a_spurious_modal_wake_without_a_pending_request_does_not_tick() {
+    let runtime = runtime();
+    let ModalFixture {
+        app: _app,
+        dispatcher,
+        native: _native,
+        hwnd,
+        hook_runs,
+        ..
+    } = modal_tick_fixture(&runtime);
+    // 前置：夹具已清掉建窗 / a11y 构造留下的唤醒位。
+    assert!(!dispatcher.take_frame_wake(), "前置：没有待消费的帧唤醒");
+
+    // SAFETY: 窗口由 `native` 持有且仍存活；消息同步进入生产 `wndproc`。
+    unsafe {
+        SendMessageW(hwnd, WM_ENTERSIZEMOVE, None, None);
+        SendMessageW(hwnd, WM_APP_FRAME_WAKE, None, None);
+    }
+    assert_eq!(hook_runs.get(), 0, "没有唤醒位时不得跑任务 / 钩子");
+
+    // 守卫不能把模态 tick 关死：之后的真实唤醒仍必须驱动一拍（并消费唤醒位）。
+    dispatcher.wake();
+    // SAFETY: 窗口仍存活。
+    unsafe {
+        SendMessageW(hwnd, WM_APP_FRAME_WAKE, None, None);
+    }
+    assert_eq!(hook_runs.get(), 1, "真实唤醒必须执行一拍钩子");
+    assert!(
+        !dispatcher.take_frame_wake(),
+        "真实唤醒的唤醒位必须被这一拍消费"
+    );
+
+    // SAFETY: 窗口仍存活。
+    unsafe {
+        SendMessageW(hwnd, WM_EXITSIZEMOVE, None, None);
+    }
+    assert!(!dispatcher.in_modal_loop());
+}
+
+/// B1 (e) 异常路径对称性：窗口在系统模态循环里被销毁（`WM_EXITSIZEMOVE` 永远不会到达本
+/// 窗口过程）时，`WndProcState::drop` 必须把本窗口记过的模态层数退回全局计数。
+///
+/// 泄漏的后果不是「少出帧」而是「多出帧」：模态循环外每条 `WM_APP_FRAME_WAKE` 都会在
+/// `WndProc` 里抢跑泵的 ④（钩子重复执行、绕过泵的 a11y / 几何同步）。
+#[test]
+fn a_window_destroyed_inside_the_modal_loop_returns_its_global_entry() {
+    let runtime = runtime();
+    let ModalFixture {
+        app: _app,
+        dispatcher,
+        native,
+        hwnd,
+        ..
+    } = modal_tick_fixture(&runtime);
+    // SAFETY: 窗口由 `native` 持有且仍存活。
+    unsafe {
+        SendMessageW(hwnd, WM_ENTERSIZEMOVE, None, None);
+    }
+    assert!(dispatcher.in_modal_loop(), "前置：全局计数已进入一层");
+
+    // 模拟「窗口在 move / size 循环里被销毁」：销毁路径没有配对的 `WM_EXITSIZEMOVE`。
+    drop(native);
+    assert!(
+        !dispatcher.in_modal_loop(),
+        "销毁窗口必须退回尚未退出的模态层数（否则唤醒会在模态循环外抢跑泵的 ④）"
+    );
+}
+
+/// 取走本窗口消息队列里的下一条 `WM_APP_FRAME_WAKE`（其它消息丢弃）。
+fn take_posted_frame_wake(hwnd: HWND) -> bool {
+    let mut message = MSG::default();
+    loop {
+        // SAFETY: `message` 是栈上输出；只取本窗口的消息（测试线程就是窗口线程）。
+        let has_message =
+            unsafe { PeekMessageW(&mut message, Some(hwnd), 0, 0, PM_REMOVE) }.as_bool();
+        if !has_message {
+            return false;
+        }
+        if message.message == WM_APP_FRAME_WAKE {
+            return true;
+        }
+    }
+}
+
+/// B1 (f) 模态循环入口的唤醒位重投：钉住真机帧冻结的竞态。
+///
+/// 复现（真机实测偶发、拖动 3 s 一帧不出）：
+/// ① 数据泵 `wake()` 置位并 post 一条 `WM_APP_FRAME_WAKE`；
+/// ② 泵的 ① drain 把它派发进 `WndProc`（模态循环外 ⇒ 只返回、**不**消费位，消费归泵的 ④）；
+/// ③ 同一批消息里紧随的鼠标按下让 `DefWindowProc` 在泵的 ④ 之前进入模态循环。
+/// 此时唤醒位仍置位、队列里却没有唤醒消息：生产者看到「已置位」不再 post ⇒ 循环内零 tick。
+/// `begin_size_move` 必须在进入循环时消费并重投一条唤醒消息。
+#[test]
+fn entering_the_modal_loop_reposts_a_wake_that_was_dispatched_but_not_consumed() {
+    let runtime = runtime();
+    let ModalFixture {
+        app: _app,
+        dispatcher,
+        native: _native,
+        hwnd,
+        hook_runs,
+        ..
+    } = modal_tick_fixture(&runtime);
+    // `wake()` 要在生产投递路径上真的 post 到这个窗口：attach 之后走 `PostMessageW`。
+    dispatcher.attach(hwnd.0 as isize);
+    // ① 数据泵唤醒：置位 + post 一条消息。
+    dispatcher.wake();
+    // ② 泵的 ① drain 取走并派发这条消息（模态循环外分支：只返回、不消费位）。
+    assert!(
+        take_posted_frame_wake(hwnd),
+        "前置：wake() 必须真的 post 一条 WM_APP_FRAME_WAKE"
+    );
+    // SAFETY: 窗口仍存活；消息同步进入生产 `wndproc`（模态循环外分支）。
+    unsafe {
+        SendMessageW(hwnd, WM_APP_FRAME_WAKE, None, None);
+    }
+    // 现在唤醒位仍置位、队列里没有消息 —— 再 wake() 必须被 coalesce（不再 post 新消息），
+    // 这就是真机上「泵 ④ 没来得及消费就进入模态循环」的竞态状态。
+    dispatcher.wake();
+    assert!(
+        !take_posted_frame_wake(hwnd),
+        "前置：竞态状态必须是「位置位、队列里没有唤醒消息」"
+    );
+    assert_eq!(hook_runs.get(), 0, "前置：模态循环外派发不得出帧");
+
+    // ③ 进入系统模态循环：必须消费并重投一条唤醒消息。
+    // SAFETY: 窗口仍存活；消息同步进入生产 `wndproc`。
+    unsafe {
+        SendMessageW(hwnd, WM_ENTERSIZEMOVE, None, None);
+    }
+    assert!(
+        take_posted_frame_wake(hwnd),
+        "进入模态循环时必须重投一条唤醒消息（否则拖动全程零帧，松手后才爆发）"
+    );
+
+    // 重投的那条消息派发后必须**真的**跑一拍（钩子 / 帧），而不是空转。
+    // SAFETY: 窗口仍存活；同步派发走同一条 `WndProc` 路径。
+    unsafe {
+        SendMessageW(hwnd, WM_APP_FRAME_WAKE, None, None);
+    }
+    assert_eq!(hook_runs.get(), 1, "重投的唤醒必须在模态循环里跑一拍钩子");
+    assert!(
+        !dispatcher.take_frame_wake(),
+        "这一拍必须消费唤醒位（否则下一次生产者仍然 coalesce）"
+    );
+
+    // SAFETY: 窗口仍存活。
+    unsafe {
+        SendMessageW(hwnd, WM_EXITSIZEMOVE, None, None);
+    }
+    assert!(!dispatcher.in_modal_loop());
 }

@@ -20,6 +20,13 @@
 //!    函数，`WM_ENTERSIZEMOVE` 之后每一条 `WM_SIZE` 都由
 //!    [`super::resize::ResizeFrameDriver`] 直接驱动一帧真实帧（与 Qt 在 `WM_SIZE` 里同步
 //!    布局 / 重绘、Chrome 在每个 size 步 `SetScaleAndSize` 之后合成同构）。
+//!
+//!    **move 模态循环（拖动标题栏，B1）没有 `WM_SIZE`**：它唯一的出帧入口是
+//!    `WM_APP_FRAME_WAKE`（tokio 回投 / 行情写入 / 帧节拍都只 `Dispatcher::wake`）。泵的 ④ 同样
+//!    停摆，所以本函数在**全局** `Dispatcher::in_modal_loop()` 为真时把这条消息变成一步
+//!    [`super::resize::ModalTick`]（drain 任务 → `run_frame_hook` → 全部窗口 `App::frame`）。
+//!    不看本窗口的 `size_move`：唤醒目标是 attach 首窗，被拖窗口不一定是它。模态循环外这条
+//!    消息**保持原语义**（只返回，由泵的 ④ 统一出帧）。
 
 use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
@@ -303,8 +310,8 @@ pub(crate) extern "system" fn wndproc(
         // 窗口焦点态同步（与 `TranslateState` 的 `PlatformEvent::Focus` 是两条独立的线：
         // 前者给 AT 看「窗口有没有焦点」，后者给引擎做键盘分发）。
         if msg == WM_EXITSIZEMOVE {
-            // 系统 size 模态循环结束：之后回到泵的常规出帧路径（最后一条 `WM_SIZE` 已驱动
-            // 过一帧真实帧）。
+            // 系统 size / move 模态循环结束：之后回到泵的常规出帧路径（最后一条 `WM_SIZE` 已
+            // 驱动过一帧真实帧；B1 的全局模态计数随 `end_size_move` 一起退出一层）。
             (*state).end_size_move();
         }
         if matches!(msg, WM_SETFOCUS | WM_EXITMENULOOP | WM_EXITSIZEMOVE) {
@@ -322,7 +329,10 @@ pub(crate) extern "system" fn wndproc(
             // （否则失焦前半个代理会和失焦后的字符拼成乱码，残留抑制码元会吞掉真实输入）。
             (*state).reset_transient_input();
             if msg == WM_ENTERSIZEMOVE {
-                // 系统 size 模态循环开始：由 `WM_SIZE` 直接驱动真实帧（泵的 ④ 这段不运行）。
+                // 系统 size / move 模态循环开始（泵的 ④ 这段不运行）：size 循环由 `WM_SIZE`
+                // 直接驱动真实帧（`ResizeFrameDriver`），move 循环（B1）由 `WM_APP_FRAME_WAKE`
+                // 驱动的全局模态 tick 出帧 —— 全局计数在 `begin_size_move` 里，因为唤醒目标
+                // 可能是别的窗口。
                 (*state).begin_size_move();
             }
             let events = (*state).a11y_mut().focus_changed(false);
@@ -332,7 +342,30 @@ pub(crate) extern "system" fn wndproc(
         }
 
         if msg == WM_APP_FRAME_WAKE {
-            // `Dispatcher::wake` 已置位，这里只需要返回。
+            // `Dispatcher::wake` 已置位。模态循环**外**只需要返回 —— 泵的 ④ 会取走唤醒位并
+            // 出帧（这里不得抢跑，否则每次唤醒会被绘制两次）。
+            //
+            // 注意这条路径与模态循环入口的竞态：本消息在循环外被派发时唤醒位**没有**被消费；
+            // 如果同一批消息里紧跟系统 move 循环的起点（鼠标按下），泵的 ④ 还来不及消费就被
+            // 模态循环占住 —— 那一位会「已置位但队列里没有消息」，循环里再也不会有 tick。
+            // 因此 `begin_size_move`（`WM_ENTERSIZEMOVE`）会消费并重投一条唤醒消息。
+            //
+            // 系统 move / size 模态循环里泵的 ④ 停摆（`DispatchMessageW` 被系统循环占住）：
+            // 这时本函数直接跑一步模态 tick（B1）。判定用**全局**计数 `in_modal_loop()` 而不是
+            // 本窗口的 `size_move` —— `wake` 的目标是 attach 首窗，被拖窗口不一定是它。
+            //
+            // 两阶段（文件头纪律 1）：短借用只取 `ModalTick`（克隆 `Weak<App>` / `Arc<Dispatcher>`），
+            // `App::frame` / 任务 / 钩子全部在借用**之外**执行；错误重新取状态写回
+            // `pending_error`，与 `WM_SIZE` 的模态帧路径同款（帧管线失败绝不能静默）。
+            if (*state).dispatcher().in_modal_loop()
+                && let Some(step) = (*state).modal_tick_step()
+                && let Some(error) = step.run()
+            {
+                let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WndProcState;
+                if !state.is_null() {
+                    (*state).note_pending_error(error);
+                }
+            }
             return LRESULT(0);
         }
         if msg == WM_APP_COMPOSITION_WAKE {

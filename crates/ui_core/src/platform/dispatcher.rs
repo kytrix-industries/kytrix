@@ -67,6 +67,17 @@ pub(crate) struct Dispatcher {
     /// 主线程 id（Windows：`PostThreadMessageW` 的兜底目标；其它平台没有线程消息，字段不存）。
     #[cfg(windows)]
     thread: AtomicU32,
+    /// 系统模态循环（Windows：`WM_ENTERSIZEMOVE` 的 move / size 循环）的**全局**深度计数（B1）。
+    ///
+    /// 为什么必须在 `Dispatcher` 而不是每个 `WndProcState`：`Dispatcher::wake` 的目标是
+    /// **attach 的首窗**（`pump::retarget_wake`），而被拖动 / 缩放的窗口不一定是首窗。只看
+    /// 「本窗口是否在模态循环」会让拖动非首窗时的 `WM_APP_FRAME_WAKE` 依旧被吞掉。
+    ///
+    /// 计数而非布尔：系统模态循环可以嵌套（例如 `Alt+Space` 菜单循环里再启动 move 循环），
+    /// `WM_EXITSIZEMOVE` 只退出一层。只有 Windows 端有「系统模态循环」这个概念（macOS /
+    /// Linux 的模态由应用层 / compositor 表达），其它平台不编译该字段与方法。
+    #[cfg(windows)]
+    modal_loops: AtomicU32,
 }
 
 impl Dispatcher {
@@ -82,6 +93,8 @@ impl Dispatcher {
             hwnd: AtomicIsize::new(0),
             #[cfg(windows)]
             thread: AtomicU32::new(0),
+            #[cfg(windows)]
+            modal_loops: AtomicU32::new(0),
         })
     }
 
@@ -124,6 +137,45 @@ impl Dispatcher {
     /// 取走「有一帧要画」的信号（主线程，取走即清零）。
     pub(crate) fn take_frame_wake(&self) -> bool {
         self.frame_pending.swap(false, Ordering::AcqRel)
+    }
+
+    /// 进入一层系统模态循环（Windows `WM_ENTERSIZEMOVE`；B1）。
+    ///
+    /// 只由主线程的 `WndProc` 调用：模态循环期间的 `WM_APP_FRAME_WAKE` 必须自己驱动帧
+    /// （泵的 ④ 被 `DispatchMessageW` 里的系统循环占住），判定见 [`Self::in_modal_loop`]。
+    #[cfg(windows)]
+    pub(crate) fn enter_modal_loop(&self) {
+        self.modal_loops.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// 退出一层系统模态循环（Windows `WM_EXITSIZEMOVE`）。
+    ///
+    /// 计数**绝不下溢**成 `u32::MAX`（否则「模态外」的所有唤醒都会被误判成模态 tick）；多余
+    /// 的 exit 饱和在 0。窗口在模态循环里被销毁时收不到配对的 `WM_EXITSIZEMOVE`，漏退的计数
+    /// 由窗口状态的 `Drop` 补齐（见 `WndProcState::modal_entries`）。
+    ///
+    /// 手写 CAS 循环而不是 `fetch_update`：后者在夜间工具链已被重命名为 `try_update` 并标记
+    /// deprecated，而项目测试仍用 stable（还没有新名字）—— 两个工具链都必须零 warning 编译。
+    #[cfg(windows)]
+    pub(crate) fn exit_modal_loop(&self) {
+        let mut loops = self.modal_loops.load(Ordering::Acquire);
+        while loops > 0 {
+            match self.modal_loops.compare_exchange_weak(
+                loops,
+                loops - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => loops = current,
+            }
+        }
+    }
+
+    /// 当前线程是否处于系统模态循环内（**全局**标记，见 `modal_loops` 字段文档）。
+    #[cfg(windows)]
+    pub(crate) fn in_modal_loop(&self) -> bool {
+        self.modal_loops.load(Ordering::Acquire) > 0
     }
 
     /// 仅测试（macOS）：当前是否有一个尚未取走的帧唤醒（验证跨线程发布路径真的叫醒了
@@ -359,6 +411,32 @@ mod tests {
         // SAFETY: 窗口由本测试创建、尚未销毁。
         let _ = unsafe { DestroyWindow(hwnd) };
         dispatcher.detach();
+    }
+
+    /// B1：系统模态循环的**全局**深度计数 —— 支持嵌套、退出绝不下溢，且不触碰唤醒位。
+    ///
+    /// 为什么必须全局：`wake` 的目标是 attach 的首窗，而被拖动 / 缩放的窗口不一定是它；
+    /// 判定若读窗口自己的 `size_move`，拖动非首窗时模态 tick 永远不触发（报告 §1）。
+    #[cfg(windows)]
+    #[test]
+    fn the_modal_loop_depth_is_counted_and_never_underflows() {
+        let dispatcher = super::Dispatcher::new();
+        assert!(!dispatcher.in_modal_loop(), "初始不在模态循环");
+        dispatcher.enter_modal_loop();
+        assert!(dispatcher.in_modal_loop());
+        dispatcher.enter_modal_loop();
+        dispatcher.exit_modal_loop();
+        assert!(
+            dispatcher.in_modal_loop(),
+            "嵌套：只退出一层时仍在模态循环里"
+        );
+        dispatcher.exit_modal_loop();
+        assert!(!dispatcher.in_modal_loop(), "两层都退出后回到常规路径");
+        // 未配对的 exit（窗口在模态循环里被销毁、收不到 WM_EXITSIZEMOVE）不得下溢成 u32::MAX。
+        dispatcher.exit_modal_loop();
+        dispatcher.exit_modal_loop();
+        assert!(!dispatcher.in_modal_loop(), "多余的 exit 必须饱和在 0");
+        assert!(!dispatcher.take_frame_wake(), "模态记账不得触碰唤醒位");
     }
 
     #[test]

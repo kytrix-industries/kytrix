@@ -57,7 +57,7 @@ mod resize;
 mod wndproc;
 
 pub(crate) use pump::run;
-pub(crate) use resize::{ResizeFrameDriver, ResizeStep};
+pub(crate) use resize::{ModalTick, ResizeFrameDriver, ResizeStep};
 pub(crate) use wndproc::wndproc;
 
 #[cfg(test)]
@@ -120,8 +120,20 @@ pub(crate) struct WndProcState {
     /// 系统 size / move 模态循环是否进行中（`WM_ENTERSIZEMOVE` → `WM_EXITSIZEMOVE`）。
     ///
     /// 会话期间泵的 ④ 不运行：重排 + 重绘由模态循环分派的 `WM_SIZE` 直接驱动
-    /// （[`ResizeFrameDriver`]），与 Qt / Chrome 同构。
+    /// （[`ResizeFrameDriver`]），拖动标题栏（没有 `WM_SIZE`）则由 `WM_APP_FRAME_WAKE` 驱动的
+    /// 模态 tick（[`ModalTick`]，B1）保证行情 / HUD / 动画继续出帧。
+    /// 全局模态判定在 `Dispatcher::in_modal_loop`（唤醒目标可能是另一个窗口）。
     size_move: bool,
+    /// 本窗口**进入过、尚未退出**的系统模态循环层数（B1）。
+    ///
+    /// 与全局 `Dispatcher::modal_loops` 严格配对：[`Self::begin_size_move`] +1、
+    /// [`Self::end_size_move`] -1。窗口在模态循环里被销毁时收不到 `WM_EXITSIZEMOVE`，
+    /// [`Self::drop`] 把余数退回去 —— 计数绝不能泄漏成「永远在模态循环里」，否则模态循环外的
+    /// 每条 `WM_APP_FRAME_WAKE` 都会抢跑泵的 ④（重复跑钩子 / 绕过泵的 a11y、几何同步）。
+    ///
+    /// 层数而不是布尔：系统模态循环可以嵌套（例如菜单循环里再启动 move 循环），
+    /// `WM_EXITSIZEMOVE` 只退出一层。
+    modal_entries: u32,
     /// 是否正在按系统建议矩形应用 `WM_DPICHANGED`：其内部 `SetWindowPos` 产生的 `WM_MOVE`
     /// 属于 DPI 路径的副产物，不派发 `Event::Moved`（`Event::Moved` 的公共契约：DPI 变化
     /// 只产生 `DpiChanged`）。用户拖动 / 程序 `SetWindowPos` 的移动不受影响（置位只覆盖那一次
@@ -177,6 +189,7 @@ impl WndProcState {
             cursor: crate::paint::style::Cursor::Default,
             drag_regions: Vec::new(),
             size_move: false,
+            modal_entries: 0,
             suppress_move: false,
             pending_error: None,
             #[cfg(test)]
@@ -192,6 +205,12 @@ impl WndProcState {
 
     fn wake(&self) {
         self.dispatcher.wake();
+    }
+
+    /// 唤醒队列 / 全局模态循环标记的来源（B1：`WM_APP_FRAME_WAKE` 的 tick 判定与
+    /// `WM_ENTERSIZEMOVE` / `WM_EXITSIZEMOVE` 的深度记账）。
+    pub(crate) fn dispatcher(&self) -> &Arc<Dispatcher> {
+        &self.dispatcher
     }
 
     /// 当前消息时刻的窗口比例（事件换算与 `WM_GETMINMAXINFO` 都用它）。
@@ -389,13 +408,40 @@ impl WndProcState {
     }
 
     /// `WM_ENTERSIZEMOVE`：系统 size / move 模态循环开始（期间泵的 ④ 不运行）。
+    ///
+    /// 全局计数（`Dispatcher::modal_loops`）与 `size_move` 一起记账：判定必须全局，因为
+    /// `Dispatcher::wake` 的目标是 attach 的首窗，被拖动 / 缩放的窗口不一定是它（B1）。
     pub(crate) fn begin_size_move(&mut self) {
         self.size_move = true;
+        self.modal_entries = self.modal_entries.saturating_add(1);
+        self.dispatcher.enter_modal_loop();
+        // B1：把可能「已派发、未消费」的唤醒位重新投递一条消息。
+        //
+        // 模态循环**外**的 `WM_APP_FRAME_WAKE` 只返回（唤醒位由泵的 ④ 消费），而系统 move
+        // 循环是在泵的 `DispatchMessageW` 里启动的。于是存在这个竞态：
+        // ① 数据泵置位并 post 一条唤醒消息；
+        // ② 泵的 ① drain 把它派发进 `WndProc`（模态循环外 ⇒ 只返回，位仍置位）；
+        // ③ 同一批消息里紧随的鼠标按下让 `DefWindowProc` 在泵的 ④ 取走唤醒位**之前**进入
+        //    模态循环。
+        // 此时位已置位、队列里却没有唤醒消息：生产者看到「已置位」不再 post，模态循环里
+        // 永远没有 tick —— 真机实测就是「拖动 3 s 一帧不出、松手后集中爆发」。
+        //
+        // 进入循环时若仍有置位，**消费并重投**一条消息：循环里至少有一拍 tick；旧消息
+        // 之后若被派发，位已清，只是一条 no-op。
+        if self.dispatcher.take_frame_wake() {
+            self.dispatcher.wake();
+        }
     }
 
     /// `WM_EXITSIZEMOVE`：模态循环结束；之后回到泵的常规出帧路径。
+    ///
+    /// 只退出**本窗口记过**的那一层（未配对的 `WM_EXITSIZEMOVE` 不得把别的窗口的计数退掉）。
     pub(crate) fn end_size_move(&mut self) {
         self.size_move = false;
+        if self.modal_entries > 0 {
+            self.modal_entries -= 1;
+            self.dispatcher.exit_modal_loop();
+        }
     }
 
     /// 会话中的一条 `WM_SIZE`：取出「要驱动的一步」（**短借用**，纪律 1）。
@@ -410,6 +456,22 @@ impl WndProcState {
         Some(ResizeStep::new(Rc::clone(driver), self.scale, client))
     }
 
+    /// 系统模态循环里的一条 `WM_APP_FRAME_WAKE`：取出「要驱动的一步」（**短借用**，纪律 1）。
+    ///
+    /// 与 [`Self::resize_step`] 同款两阶段：这里只克隆 `Weak<App>` / `Arc<Dispatcher>`，
+    /// [`ModalTick::run`] 在借用之外跑任务 / 钩子 / 全部窗口的帧。
+    ///
+    /// **不检查本窗口的 `size_move`**：唤醒消息的目标是 attach 的首窗，被拖动 / 缩放的窗口
+    /// 不一定是它 —— 模态判定用 `Dispatcher::in_modal_loop`（全局计数，见 `WndProc` 的分支）。
+    /// `None` = 没有 `App`（平台单测里只验证 `WndProc` 记账、不真正建渲染器的窗口）。
+    pub(crate) fn modal_tick_step(&self) -> Option<ModalTick> {
+        let driver = self.driver.as_ref()?;
+        Some(ModalTick::new(
+            Rc::clone(driver),
+            Arc::clone(&self.dispatcher),
+        ))
+    }
+
     /// 登记模态循环里产生的粘性错误（泵的下一轮 ② 冒泡）。
     pub(crate) fn note_pending_error(&mut self, error: EngineError) {
         self.pending_error.get_or_insert(error);
@@ -418,5 +480,19 @@ impl WndProcState {
     /// 取走模态循环里登记的粘性错误（泵的 ② 步骤每轮检查一次）。
     pub(crate) fn take_pending_error(&mut self) -> Option<EngineError> {
         self.pending_error.take()
+    }
+}
+
+/// 窗口在系统模态循环进行中被销毁：把本窗口尚未退出的模态层数退给全局计数（B1）。
+///
+/// 异常路径的对称性：正常路径由 `WM_EXITSIZEMOVE` → [`WndProcState::end_size_move`] 退出；
+/// 但窗口若在 move / size 循环里被销毁（例如用户 / 系统在拖动中强制关窗），
+/// `WM_EXITSIZEMOVE` 不会再送到这个 `WndProc`。若不在这里退，`Dispatcher::modal_loops`
+/// 会永久 > 0，之后模态循环外的每条 `WM_APP_FRAME_WAKE` 都会在 `WndProc` 里抢跑泵的 ④。
+impl Drop for WndProcState {
+    fn drop(&mut self) {
+        for _ in 0..self.modal_entries {
+            self.dispatcher.exit_modal_loop();
+        }
     }
 }
