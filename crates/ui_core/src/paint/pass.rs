@@ -1139,6 +1139,7 @@ fn paint_geometry_node(
         }
         let mut emitter = PrimitiveEmitter {
             lane,
+            node,
             bounds,
             content_offset,
             patch: patch.clone(),
