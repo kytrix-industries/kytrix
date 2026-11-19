@@ -436,16 +436,30 @@ impl ShapedText {
         } else {
             0.0
         };
-        let (mut shaped, diagnostics) = match &self.kind {
+        let (mut shaped, diagnostics, line_offset) = match &self.kind {
             ShapedKind::Simple(simple) => {
                 let shaped =
                     simple.rasterize(self.text.clone(), &self.style, color, ctx, simple_offset)?;
-                (shaped, Vec::new())
+                (shaped, Vec::new(), simple_offset)
             }
             ShapedKind::Parley(snapshot) => {
                 let mut snapshot = snapshot.borrow_mut();
                 let width =
                     snapshot.break_and_align(Some(content_width.max(0.0)), align_of(alignment));
+                let line_count = snapshot.layout.lines().len();
+                // 行对齐平移已经烘进 `glyph.x`（见 parley `LineMetrics::offset`）：省略号裁剪
+                // 要把落点还原到未对齐坐标系，取最后一个**可见行**（`max_lines` 截断后的末行）
+                // 的对齐偏移。数字快路径的对齐偏移由 `simple_offset` 给出。
+                let visible_last = max_visible_lines(&self.style, line_count);
+                let line_offset = if visible_last == 0 {
+                    0.0
+                } else {
+                    snapshot
+                        .layout
+                        .lines()
+                        .nth(visible_last - 1)
+                        .map_or(0.0, |line| line.metrics().offset)
+                };
                 let (shaped, diagnostics) = rasterize_parley(
                     &snapshot.layout,
                     width,
@@ -454,7 +468,7 @@ impl ShapedText {
                     ctx,
                     &self.inline_diagnostics,
                 )?;
-                (shaped, diagnostics)
+                (shaped, diagnostics, line_offset)
             }
         };
         apply_overflow(
@@ -464,7 +478,7 @@ impl ShapedText {
             color,
             ctx,
             ellipsis,
-            simple_offset,
+            line_offset,
         )?;
         Ok((shaped, diagnostics, ctx.glyph_atlas.take_stats()))
     }
@@ -887,14 +901,12 @@ fn apply_overflow(
     color: Color,
     ctx: &mut RasterCtx<'_>,
     ellipsis: Option<&EllipsisGlyphs>,
-    layout_offset: f32,
+    line_offset: f32,
 ) -> Result<(), EngineError> {
     if shaped.lines.is_empty() {
         return Ok(());
     }
-    let max_lines = style.max_lines().map_or(shaped.lines.len(), |max| {
-        (max as usize).max(1).min(shaped.lines.len())
-    });
+    let max_lines = max_visible_lines(style, shaped.lines.len());
     let truncated = max_lines < shaped.lines.len();
     if truncated {
         shaped.lines.truncate(max_lines);
@@ -915,7 +927,7 @@ fn apply_overflow(
             color,
             style,
             ctx,
-            layout_offset,
+            line_offset,
         )?;
     }
     // 重新汇总尺寸（截断后行数与宽度都变了）。
@@ -928,7 +940,25 @@ fn apply_overflow(
     Ok(())
 }
 
-/// 在最后一可见行上「保留前缀 + 省略号」。
+/// `max_lines` 作用后的可见行数（截断与「取末行对齐偏移」共用同一口径）。
+fn max_visible_lines(style: &TextStyle, line_count: usize) -> usize {
+    style
+        .max_lines()
+        .map_or(line_count, |max| (usize::from(max)).max(1).min(line_count))
+}
+
+/// 在最后一可见行上「保留前缀 + 省略号」（单趟前缀算法，D-3）。
+///
+/// 语义与 Blink `NGLineTruncator` / Qt `QFontMetrics::elidedText` 一致：保留的是**原行字形
+/// 序列的前缀**（逐位不动），其后恰好是省略号字形；`prefix_advance + ellipsis.advance` 不超过
+/// 内容宽（`content_width > 0` 时）。`max_lines` 截断时即使末行宽度未溢出也走本函数 —— 末行
+/// 内容保留，只在行尾追加省略号；只有「连一个字都放不下」（`prefix_end == 0`）才退化为行首
+/// 只有省略号。多 run（混合脚本）跨 run 连续处理：保留位置之后的 run 字形全部清空。
+///
+/// `line_offset` 是该行对齐已经烘进 `PositionedGlyph::position` 的平移量（parley 的
+/// `LineMetrics::offset`；数字快路径的 `simple_alignment_offset`）。裁剪判定与省略号落点都在
+/// **未对齐**坐标系里进行（`position.x - line_offset`），保证右对齐/居中行不会被行对齐平移
+/// 误判为溢出。
 fn clip_with_ellipsis(
     shaped: &mut ShapedLine,
     ellipsis: &EllipsisGlyphs,
@@ -936,105 +966,106 @@ fn clip_with_ellipsis(
     color: Color,
     style: &TextStyle,
     ctx: &mut RasterCtx<'_>,
-    layout_offset: f32,
+    line_offset: f32,
 ) -> Result<(), EngineError> {
     let Some(last) = shaped.lines.last_mut() else {
         return Ok(());
     };
     let ppem = (style.size * ctx.scale).clamp(1.0, 512.0);
     let variation = GlyphVariation::of(&ellipsis.variation_coords, ellipsis.synthesis, ppem);
-    // 允许放下省略号后剩余的可写宽度。
-    let limit = if content_width > 0.0 {
-        (content_width - ellipsis.advance).max(0.0)
-    } else {
-        f32::INFINITY
-    };
-    let ellipsis_height = last.line_height;
     let baseline = last.baseline;
-    // 收集保留下来的字形（按行内顺序），并在前缀末尾放置省略号。
-    let mut append_x: Option<f32> = None;
+
+    // 1) 按 item/run 顺序展平「未对齐字形起点」。字形终点 = 下一字形的起点（跨 run 连续）；
+    //    行内最后一个字形的终点 = 行推进 `advance`（含悬挂空白 ⇒ 省略号落在尾随空白之后，
+    //    与 CSS 一致）。只记录起点，不复制字形。
+    let glyph_count = last
+        .items
+        .iter()
+        .map(|item| match item {
+            ShapedTextItem::GlyphRun(run) => run.glyphs.len(),
+            ShapedTextItem::InlineBox(_) => 0,
+        })
+        .sum();
+    let mut starts: Vec<f32> = Vec::with_capacity(glyph_count);
+    for item in &last.items {
+        if let ShapedTextItem::GlyphRun(run) = item {
+            starts.extend(
+                run.glyphs
+                    .iter()
+                    .map(|glyph| glyph.position.x - line_offset),
+            );
+        }
+    }
+
+    // 2) 保留前缀：字形终点 + 省略号 advance 放得进内容宽。`prefix_end` = 最后一个保留字形的
+    //    终点（未对齐坐标系）；一个字都放不下时保持 0。判定按**该行对齐平移之后**的落点算
+    //    （`+ line_offset`）：右对齐/居中的截断行，省略号也必须留在内容盒内。
+    let mut prefix_len = 0usize;
+    let mut prefix_end = 0.0f32;
+    for (index, _) in starts.iter().enumerate() {
+        let end = starts.get(index + 1).copied().unwrap_or(last.advance);
+        if content_width > 0.0 && end + line_offset + ellipsis.advance > content_width + 1e-3 {
+            break;
+        }
+        prefix_len = index + 1;
+        prefix_end = end;
+    }
+
+    // 3) 清空保留位置之后的**全部** run 字形：多 run 不得残留（旧实现只清第一个溢出 run）。
+    //    保留 `items` 顺序与各自的 `text_range`（paint 只消费 glyphs）。
+    let mut remaining = prefix_len;
     for item in &mut last.items {
         let ShapedTextItem::GlyphRun(run) = item else {
             continue;
         };
-        let mut kept: Vec<PositionedGlyph> = Vec::with_capacity(run.glyphs.len());
-        let mut drop_from: Option<f32> = None;
-        for glyph in &run.glyphs {
-            // 用「该字形未对齐的逻辑落点」判断：`layout_offset` 是行对齐的平移量，
-            // 省略号裁剪必须按未平移的前缀宽度进行（否则右对齐行会被误判为溢出）。
-            let glyph_x = glyph.position.x - layout_offset;
-            if glyph_x > limit {
-                drop_from = Some(glyph_x);
-                break;
-            }
-            kept.push(*glyph);
-        }
-        if let Some(mut append) = drop_from {
-            // 被丢弃字形的起点 ≈ 最后一个保留字形的**终点**；若省略号仍放不下，继续往前退。
-            while let Some(previous) = kept.last() {
-                if append + ellipsis.advance <= content_width + 1e-3 {
-                    break;
-                }
-                append = previous.position.x - layout_offset;
-                kept.pop();
-            }
-            append_x = Some(append);
-        }
-        if let Some(x) = append_x {
-            run.glyphs = kept;
-            let mut ellipsis_x = x;
-            for (glyph_id, advance) in &ellipsis.glyphs {
-                if let Some((positioned, _color)) = emit_glyph(
-                    ctx,
-                    &ellipsis.font,
-                    *glyph_id,
-                    ppem,
-                    &variation,
-                    ellipsis_x + layout_offset,
-                    baseline,
-                )? {
-                    run.glyphs.push(positioned);
-                }
-                ellipsis_x += advance;
-            }
-            // `line.advance` 是文本推进宽度，不含行对齐偏移（`shaped.width` 的语义）。
-            last.advance = ellipsis_x;
-            break;
-        }
+        let keep = remaining.min(run.glyphs.len());
+        run.glyphs.truncate(keep);
+        remaining -= keep;
     }
-    // 省略号放不下任何前缀（或整行放得下但行数被截断）：行首只放省略号。
-    if append_x.is_none() {
-        let mut rasterized = Vec::with_capacity(ellipsis.glyphs.len());
-        let mut x = 0.0f32;
-        for (glyph_id, advance) in &ellipsis.glyphs {
-            if let Some((positioned, _color)) = emit_glyph(
-                ctx,
-                &ellipsis.font,
-                *glyph_id,
-                ppem,
-                &variation,
-                x + layout_offset,
-                baseline,
-            )? {
-                rasterized.push(positioned);
-            }
-            x += advance;
+
+    // 4) 在 `prefix_end` 处光栅省略号（沿用缓存的 glyph id/advance），追到最后一个保留 run。
+    let mut rasterized = Vec::with_capacity(ellipsis.glyphs.len());
+    let mut x = prefix_end;
+    for (glyph_id, advance) in &ellipsis.glyphs {
+        if let Some((positioned, _color)) = emit_glyph(
+            ctx,
+            &ellipsis.font,
+            *glyph_id,
+            ppem,
+            &variation,
+            x + line_offset,
+            baseline,
+        )? {
+            rasterized.push(positioned);
         }
-        let run = ShapedGlyphRun {
-            color,
-            text_range: 0..0,
-            glyphs: rasterized,
-        };
-        match last.items.first_mut() {
-            Some(ShapedTextItem::GlyphRun(existing)) => {
-                let text_range = existing.text_range.clone();
-                *existing = ShapedGlyphRun { text_range, ..run };
-            }
-            _ => last.items.insert(0, ShapedTextItem::GlyphRun(run)),
-        }
-        last.advance = x;
-        let _ = ellipsis_height;
+        x += advance;
     }
+    if prefix_len == 0 {
+        // 一个字都放不下（或空行）：行首只有省略号。沿用旧兜底结构：复用首个 GlyphRun 的
+        // `text_range`，没有 GlyphRun 时在最前面插入一条（`text_range = 0..0`）。
+        if !matches!(last.items.first(), Some(ShapedTextItem::GlyphRun(_))) {
+            last.items.insert(
+                0,
+                ShapedTextItem::GlyphRun(ShapedGlyphRun {
+                    color,
+                    text_range: 0..0,
+                    glyphs: Vec::new(),
+                }),
+            );
+        }
+        if let Some(ShapedTextItem::GlyphRun(run)) = last.items.first_mut() {
+            run.glyphs.extend(rasterized);
+        }
+    } else if let Some(ShapedTextItem::GlyphRun(run)) = last
+        .items
+        .iter_mut()
+        .rev()
+        .find(|item| matches!(item, ShapedTextItem::GlyphRun(run) if !run.glyphs.is_empty()))
+    {
+        run.glyphs.extend(rasterized);
+    }
+    // `line.advance` 是文本推进宽度（不含行对齐偏移，`shaped.width` 的语义）。
+    last.advance = prefix_end + ellipsis.advance;
     Ok(())
 }
 
@@ -1236,6 +1267,75 @@ mod tests {
                 (512, 512),
             ),
         )
+    }
+
+    /// 一行内所有已装箱字形（按绘制序；逐行版的 [`all_glyphs`]）。
+    fn line_glyphs(
+        line: &crate::text::ShapedTextLine,
+    ) -> Vec<crate::paint::primitive::PositionedGlyph> {
+        line.items
+            .iter()
+            .filter_map(|item| match item {
+                ShapedTextItem::GlyphRun(run) => Some(run.glyphs.iter().copied()),
+                ShapedTextItem::InlineBox(_) => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// D-3 结构断言：省略号裁剪的结果必须是「原行字形序列的前缀 + 恰好的省略号字形」。
+    ///
+    /// - `rendered`：裁剪后的末行；`reference`：同一文本/宽度/`max_lines` 下 `Clip` 的参考行
+    ///   （未裁剪）；`ellipsis`：省略号字形。参考行必须是 **Start 对齐**（无行对齐平移）。
+    ///
+    /// 断言：① 去掉末尾省略号后与参考序列**逐位一致**（多 run 残留 / 改了落点都会失败）；
+    /// ② 行推进 == 前缀终点 + 省略号推进；③ `content_width > 0` 时推进不超过内容宽。
+    /// 返回保留前缀的字形数。
+    fn assert_ellipsis_prefix(
+        rendered: &crate::text::ShapedTextLine,
+        reference: &crate::text::ShapedTextLine,
+        ellipsis: &super::EllipsisGlyphs,
+        content_width: f32,
+    ) -> usize {
+        let glyphs = line_glyphs(rendered);
+        let reference_glyphs = line_glyphs(reference);
+        assert!(
+            glyphs.len() >= ellipsis.glyphs.len(),
+            "渲染序列必须包含省略号字形：{} vs {}",
+            glyphs.len(),
+            ellipsis.glyphs.len()
+        );
+        let prefix_len = glyphs.len() - ellipsis.glyphs.len();
+        assert!(
+            prefix_len <= reference_glyphs.len(),
+            "保留前缀不得多于参考行：{prefix_len} vs {}",
+            reference_glyphs.len()
+        );
+        assert_eq!(
+            glyphs[..prefix_len],
+            reference_glyphs[..prefix_len],
+            "保留的必须是原行字形序列的**前缀**（逐位相同）：省略号之后残留任何字形都会失败"
+        );
+        let prefix_end = if prefix_len == reference_glyphs.len() {
+            reference.advance
+        } else {
+            reference_glyphs[prefix_len].position.x
+        };
+        assert!(
+            (rendered.advance - (prefix_end + ellipsis.advance)).abs() < 1e-2,
+            "行推进必须 == 前缀终点 + 省略号推进：{} vs {} + {}",
+            rendered.advance,
+            prefix_end,
+            ellipsis.advance
+        );
+        if content_width > 0.0 {
+            assert!(
+                rendered.advance <= content_width + 1e-2,
+                "前缀 + 省略号必须放得进内容宽：{} vs {content_width}",
+                rendered.advance
+            );
+        }
+        prefix_len
     }
 
     #[test]
@@ -2656,6 +2756,264 @@ mod tests {
             "钳制后必须严格矮于全文：{} vs {}",
             multiline_size.height,
             full_line.height
+        );
+    }
+
+    /// D-3 / 审计最低要求：`max_lines` 截断时**短末行**不得被整行替换成「…」——必须保留
+    /// 「原行字形前缀 + 省略号」，且前缀落点与 `Clip` 参考逐位一致、省略号紧跟前缀终点。
+    ///
+    /// 旧实现此测试必红：短末行宽度未溢出 ⇒ 走「行首只有省略号」兜底，末行内容全部丢失。
+    #[test]
+    fn ellipsis_max_lines_keeps_short_last_line_prefix() {
+        const TEXT: &str = "first\nshort\nthird";
+        // 宽度充足：三行都远小于它 ⇒ 唯一触发截断的是 `max_lines`（末行宽度「未溢出」）。
+        const CONTENT_WIDTH: f32 = 240.0;
+        let mut harness = Harness::new();
+        let ellipsis_shaped = harness.shape(
+            TEXT,
+            TextStyle::new(16.0).with_overflow(crate::text::TextOverflow::Ellipsis, 2),
+        );
+        let clip_shaped = harness.shape(
+            TEXT,
+            TextStyle::new(16.0).with_overflow(crate::text::TextOverflow::Clip, 2),
+        );
+        let (_, max_width) = min_max_widths(&ellipsis_shaped);
+        assert!(
+            max_width < CONTENT_WIDTH,
+            "precondition: 宽度必须充足（末行未溢出），实得 {max_width} vs {CONTENT_WIDTH}"
+        );
+        let ellipsis = super::measure_ellipsis(
+            &mut harness.font_cx,
+            &mut harness.layout_cx,
+            &harness.family,
+            ellipsis_shaped.style(),
+        )
+        .expect("the host font must provide an ellipsis glyph");
+
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (clip_line, _, _) = rasterize_line(
+            &clip_shaped,
+            CONTENT_WIDTH,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let (line, _, _) = rasterize_line_with_ellipsis(
+            &ellipsis_shaped,
+            CONTENT_WIDTH,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+            Some(&ellipsis),
+        );
+
+        assert_eq!(clip_line.lines.len(), 2, "Clip + max_lines = 2");
+        assert_eq!(line.lines.len(), 2, "Ellipsis + max_lines = 2");
+        let clip_last = clip_line.lines.last().expect("clip last line");
+        let last = line.lines.last().expect("ellipsis last line");
+        let prefix_len = assert_ellipsis_prefix(last, clip_last, &ellipsis, CONTENT_WIDTH);
+
+        // 关键断言：短末行**全部**字形都要保留（旧实现 prefix_len == 0）。
+        let clip_glyphs = line_glyphs(clip_last);
+        assert_eq!(
+            prefix_len,
+            clip_glyphs.len(),
+            "宽度充足的末行必须保留全部原行字形（旧实现只剩省略号）：{:?}",
+            line_glyphs(last)
+        );
+        let last_glyphs = line_glyphs(last);
+        assert_eq!(
+            last_glyphs.len(),
+            clip_glyphs.len() + ellipsis.glyphs.len(),
+            "末行 = 原行字形 + 省略号字形：{:?}",
+            last_glyphs
+        );
+
+        // 省略号必须紧跟前缀终点：用同一条 `emit_glyph` 路径独立复算落点，逐位比较。
+        let expected_ellipsis = {
+            let generation = atlas.generation();
+            let mut ctx = super::RasterCtx {
+                raster: &mut raster,
+                glyph_atlas: &mut glyphs,
+                atlas: &mut atlas,
+                generation,
+                scale: 1.0,
+            };
+            let ppem = (16.0f32 * 1.0).clamp(1.0, 512.0);
+            let variation =
+                super::GlyphVariation::of(&ellipsis.variation_coords, ellipsis.synthesis, ppem);
+            let mut positioned = Vec::with_capacity(ellipsis.glyphs.len());
+            let mut x = clip_last.advance;
+            for (glyph_id, advance) in &ellipsis.glyphs {
+                if let Some((glyph, _)) = super::emit_glyph(
+                    &mut ctx,
+                    &ellipsis.font,
+                    *glyph_id,
+                    ppem,
+                    &variation,
+                    x,
+                    clip_last.baseline,
+                )
+                .expect("ellipsis must not fail")
+                {
+                    positioned.push(glyph);
+                }
+                x += advance;
+            }
+            positioned
+        };
+        assert_eq!(
+            &last_glyphs[prefix_len..],
+            expected_ellipsis.as_slice(),
+            "省略号必须紧跟前缀终点（位置逐位一致）"
+        );
+    }
+
+    /// D-3：多 run（混合脚本）被截断时，省略号之后不得残留任何 run 的字形。
+    ///
+    /// 旧实现只清「第一个溢出 run」并 `break`，后续 CJK run 的字形原样残留。宿主必须有 CJK
+    /// fallback 字体才会产生多 run；没有则 skip（同 `explicit_family_changes_advances_...` 的约定）。
+    #[test]
+    fn ellipsis_clears_trailing_runs() {
+        const TEXT: &str = "abcdef中文中文";
+        let mut harness = Harness::new();
+        let style = |overflow| {
+            TextStyle::new(16.0)
+                .with_wrap(TextWrap::NoWrap)
+                .with_overflow(overflow, 1)
+        };
+        let ellipsis_shaped = harness.shape(TEXT, style(crate::text::TextOverflow::Ellipsis));
+        let clip_shaped = harness.shape(TEXT, style(crate::text::TextOverflow::Clip));
+        // 窄宽 = 纯拉丁前缀宽 - 2px：截断必然发生在第一个 run（拉丁）里，旧实现会留下 CJK run。
+        let latin_width = harness
+            .shape("abcdef", TextStyle::new(16.0).with_wrap(TextWrap::NoWrap))
+            .max_content_size()
+            .width;
+        let width = latin_width - 2.0;
+        let ellipsis = super::measure_ellipsis(
+            &mut harness.font_cx,
+            &mut harness.layout_cx,
+            &harness.family,
+            ellipsis_shaped.style(),
+        )
+        .expect("the host font must provide an ellipsis glyph");
+
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (clip_line, _, _) = rasterize_line(
+            &clip_shaped,
+            width,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let (line, _, _) = rasterize_line_with_ellipsis(
+            &ellipsis_shaped,
+            width,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+            Some(&ellipsis),
+        );
+        assert_eq!(line.lines.len(), 1, "NoWrap 恒为一行");
+
+        let clip_last = clip_line.lines.first().expect("clip line");
+        let runs = clip_last
+            .items
+            .iter()
+            .filter(|item| matches!(item, ShapedTextItem::GlyphRun(run) if !run.glyphs.is_empty()))
+            .count();
+        if runs < 2 {
+            eprintln!("skip: host has no mixed-script fallback font (single run)");
+            return;
+        }
+        let last = line.lines.first().expect("ellipsis line");
+        let reference_glyphs = line_glyphs(clip_last);
+        let prefix_len = assert_ellipsis_prefix(last, clip_last, &ellipsis, width);
+        assert!(prefix_len > 0, "窄宽仍应放得下至少一个字");
+        assert!(
+            prefix_len < reference_glyphs.len(),
+            "必须真的截断：{prefix_len} vs {}",
+            reference_glyphs.len()
+        );
+        // 视觉不变量：省略号是行尾最后一个元素 —— 任何字形起点都不得出现在行推进之后
+        //（旧实现的残留 CJK run 在 x ≈ 拉丁前缀宽处，必然超过旧的行推进）。
+        for glyph in line_glyphs(last) {
+            assert!(
+                glyph.position.x <= last.advance + 0.5,
+                "省略号之后不得残留字形：x = {} > advance {}",
+                glyph.position.x,
+                last.advance
+            );
+        }
+    }
+
+    /// D-3：宽度扫描（32 档）——任何「内容宽 ≥ 省略号宽」的宽度下：
+    /// ① 保留序列是原行字形前缀（逐位一致）；② `prefix_advance + ellipsis.advance ≤ content_width`；
+    /// ③ 前缀长度随宽度单调不减。
+    #[test]
+    fn ellipsis_prefix_advance_fits_content_width() {
+        const TEXT: &str = "0123456789abcdefghijklmnopqrstuvwxyz";
+        let mut harness = Harness::new();
+        let style = |overflow| {
+            TextStyle::new(16.0)
+                .with_wrap(TextWrap::NoWrap)
+                .with_overflow(overflow, 0)
+        };
+        let ellipsis_shaped = harness.shape(TEXT, style(crate::text::TextOverflow::Ellipsis));
+        let clip_shaped = harness.shape(TEXT, style(crate::text::TextOverflow::Clip));
+        let ellipsis = super::measure_ellipsis(
+            &mut harness.font_cx,
+            &mut harness.layout_cx,
+            &harness.family,
+            ellipsis_shaped.style(),
+        )
+        .expect("the host font must provide an ellipsis glyph");
+        let full_width = ellipsis_shaped.max_content_size().width;
+        let min_width = ellipsis.advance + 1.0;
+        assert!(
+            full_width > min_width + 2.0,
+            "precondition: 文本必须明显宽于省略号（{full_width} vs {min_width}）"
+        );
+
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let steps = 32usize;
+        let mut previous_prefix = 0usize;
+        for step in 0..steps {
+            let ratio = step as f32 / (steps - 1) as f32;
+            let width = min_width + (full_width - min_width - 1.0) * ratio;
+            let (clip_line, _, _) = rasterize_line(
+                &clip_shaped,
+                width,
+                1.0,
+                &mut raster,
+                &mut glyphs,
+                &mut atlas,
+            );
+            let (line, _, _) = rasterize_line_with_ellipsis(
+                &ellipsis_shaped,
+                width,
+                1.0,
+                &mut raster,
+                &mut glyphs,
+                &mut atlas,
+                Some(&ellipsis),
+            );
+            let reference = clip_line.lines.first().expect("clip line");
+            let last = line.lines.first().expect("ellipsis line");
+            let prefix_len = assert_ellipsis_prefix(last, reference, &ellipsis, width);
+            assert!(
+                prefix_len >= previous_prefix,
+                "宽度 {width}: 前缀长度必须随宽度单调不减（{prefix_len} < {previous_prefix}）"
+            );
+            previous_prefix = prefix_len;
+        }
+        assert!(
+            previous_prefix > 0,
+            "至少最宽的一档必须保留前缀（否则扫描没覆盖到有效区间）"
         );
     }
 
