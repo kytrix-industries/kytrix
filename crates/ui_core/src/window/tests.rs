@@ -59,6 +59,12 @@ fn window_options_default_values() {
     assert_eq!(options.title, "");
     assert_eq!(options.size.width, 800.0);
     assert_eq!(options.size.height, 600.0);
+    assert_eq!(
+        options.position, None,
+        "默认位置由平台决定（Windows 屏幕中央附近 / macOS 级联 / Wayland compositor）"
+    );
+    assert_eq!(options.min_size, None, "默认无最小尺寸约束");
+    assert_eq!(options.max_size, None, "默认无最大尺寸约束");
     assert_eq!(options.scale, Scale::ONE);
     assert_eq!(
         options.background,

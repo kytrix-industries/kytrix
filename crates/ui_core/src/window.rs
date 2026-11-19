@@ -1,7 +1,8 @@
 //! 窗口：句柄、建窗参数、节点树 + 绘制场景的持有者。
 //!
-//! P03 是 headless 的：只保存参数，不驱动平台
-//! （平台窗口句柄、DPI 事件、标题栏属 P12）。
+//! 窗口参数（[`WindowOptions`]）在 headless 测试里只保存；真机上由平台层在创建原生窗口
+//! 时消费（初始位置 / 最小最大尺寸），运行时变化经 `Event::Resized` / `Event::Moved`
+//! 回流到应用。
 
 mod a11y;
 mod focus;
@@ -35,7 +36,7 @@ use crate::{
     error::EngineError,
     interaction::{FocusScope, PointerState},
     layout::LayoutReport,
-    math::{PhysicalRect, Rect, Scale, Size},
+    math::{PhysicalRect, Point, Rect, Scale, Size},
     node::{id::NodeId, tree::NodeTree},
     paint::{
         atlas::AtlasKind,
@@ -187,11 +188,25 @@ pub enum WindowResizeEdge {
     BottomRight,
 }
 
-/// 建窗参数。P03 只保存，不驱动平台（P12 才消费）。
+/// 建窗参数（平台层在创建原生窗口时消费）。
 ///
 /// 三个平台创建的窗口默认都是**可关闭 / 最小化 / 最大化 / 可缩放**的：Windows 用
 /// `WS_OVERLAPPEDWINDOW` 的系统标题栏，macOS 保留三个原生交通灯，Linux/Wayland 请求
 /// 客户端装饰并由应用自绘标题栏（`WindowControl` 提供按钮/拖动所需的平台请求）。
+///
+/// # 坐标语义（三端统一）
+///
+/// [`Self::position`] / [`Self::size`] / [`Self::min_size`] / [`Self::max_size`] 全部是
+/// **逻辑像素**（与 [`Self::scale`] 同域，DPI 换算由平台层完成）：
+///
+/// - 原点 = **虚拟桌面内容区左上角**，x 向右、y 向下；
+/// - Windows：`(虚拟屏幕左上角为原点的物理坐标) / (窗口所在显示器的 scale)`；混合 DPI
+///   跨屏恢复时按窗口最终落点显示器的 scale 解释（误差 ≤1 逻辑像素）；
+/// - macOS：AppKit 屏幕坐标的原点在主屏**左下角**、y 向上，平台层换算成上面的一致语义
+///   （应用无需感知 AppKit 的翻转）；
+/// - Linux/Wayland：`xdg_toplevel` **没有定位请求**，[`Self::position`] 被忽略（窗口位置
+///   完全由 compositor 决定，`Event::Moved` 在该端永不产生）；`min_size`/`max_size` 走
+///   `xdg_toplevel.set_min_size/set_max_size` 的 compositor 提示语义（不保证被强制执行）。
 ///
 /// # Windows 标题栏 / 非客户区交互
 ///
@@ -203,13 +218,37 @@ pub enum WindowResizeEdge {
 /// 系统 size 模态循环会占住本线程消息泵，但**重排 + 重绘不会停**：模态循环把 `WM_SIZE`
 /// 同步分派到 `WndProc`，平台层在每条 `WM_SIZE` 上直接更新客户区、对齐 DirectComposition
 /// 几何并跑一帧完整帧（`platform::windows::event_loop::ResizeFrameDriver`）—— 拖动/缩放中
-/// 每一步都是**真实帧**（不是拉伸旧帧），且不引入定时器或额外帧。
+/// 每一步都是**真实帧**（不是拉伸旧帧），且不引入定时器或额外帧。系统 move 模态循环
+/// （拖动标题栏）**不产生 `WM_SIZE`**，由 `WM_APP_FRAME_WAKE` 驱动的模态 tick 出帧
+/// （`platform::windows::event_loop::ModalTick`），两者共用同一套「任务 → 钩子 → 全窗口帧」
+/// 纪律。
 #[derive(Clone, Debug, PartialEq)]
 pub struct WindowOptions {
     /// 标题（`SmolStr`，AGENTS §2.2）。
     pub title: SmolStr,
     /// 初始逻辑尺寸。
     pub size: Size,
+    /// 初始客户区左上角位置（逻辑像素，坐标语义见 [`WindowOptions`] 的「坐标语义」一节）。
+    ///
+    /// `None` = 由平台决定（Windows 建在屏幕中央附近、macOS 由 AppKit 级联摆放、
+    /// Wayland 由 compositor 决定）。
+    ///
+    /// 平台层会把位置 **clamp 到最近显示器的工作区**（至少保留标题栏/一条边可见，避免
+    /// 显示器拔掉后窗口恢复到不可达位置）。placement 的**持久化归属应用层**：应用从
+    /// [`crate::event::Event::Moved`] / [`crate::event::Event::Resized`] 记录，下次启动填回
+    /// 这里；引擎不落盘（AGENTS §1.2）。
+    pub position: Option<Point>,
+    /// 客户区最小逻辑尺寸（`None` = 平台默认/不额外约束）。
+    ///
+    /// - Windows：`WM_GETMINMAXINFO` 的 `ptMinTrackSize`（系统再补上边框/标题栏）；
+    /// - macOS：`NSWindow.contentMinSize`；
+    /// - Linux：`xdg_toplevel.set_min_size` —— compositor 提示，不保证被执行。
+    ///
+    /// 同时设置 `min_size`/`max_size` 且 `min > max` 时引擎先 clamp 成 `min = max`
+    /// （与 Qt 的 `setMinimumSize/setMaximumSize` 互相钳制同义），平台层按钳制后的值应用。
+    pub min_size: Option<Size>,
+    /// 客户区最大逻辑尺寸（`None` = 平台默认/不额外约束）；平台对应关系同 [`Self::min_size`]。
+    pub max_size: Option<Size>,
     /// 初始 DPI 比例（由平台在 P12 传入；headless 默认 `Scale::ONE`）。
     pub scale: Scale,
     /// 窗口背景色：内容未覆盖区域的底色（持久目标 clear；Windows 另有独立背景层）。
@@ -243,6 +282,9 @@ impl Default for WindowOptions {
         Self {
             title: SmolStr::new_static(""),
             size: Size::new(800.0, 600.0),
+            position: None,
+            min_size: None,
+            max_size: None,
             scale: Scale::ONE,
             background: Color::BLACK,
         }
