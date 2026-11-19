@@ -118,6 +118,9 @@ kytrix_proto = { git = "https://github.com/kytrix-industries/kytrix_proto", rev 
 llama_sys = { path = "crates/llama_sys" }
 log = "0.4.35"
 longbridge-proto = "5.3.0"
+# P13 图片色彩管理（D-8）：image 0.25.10 的**非可选**依赖（`Cargo.lock` 已在 0.8.1），
+# 这里只是把它提到直接依赖；不引入新的编译单元。
+moxcms = "0.8.1"
 nucleo = "0.5.0"
 objc2 = { version = "0.6.5", features = ["std"] }
 objc2-app-kit = { version = "0.3.2", features = [
@@ -254,6 +257,9 @@ tokio-util = "0.7.20"
 # （CJK 3 字节/字、emoji 4 字节/代理对、ZWJ 家族 18 字节仍是一个可选单元）。已在 Cargo.lock 里
 # （parley 的传递依赖 1.13.3），这里提为直接依赖，不引入新 crate。
 unicode-segmentation = "1.13.3"
+# 数字快速路径的断行机会判定（D-2）：UAX #14 真实现。已在 Cargo.lock 里（cosmic-text 的传递
+# 依赖 0.1.5），这里提为直接依赖，不引入新编译单元。
+unicode-linebreak = "0.1.5"
 url = "2.5.8"
 uuid = "1.29.2"
 wayland-client = "0.31.15"

@@ -14,7 +14,7 @@ use etagere::{AllocId, AtlasAllocator as EtagereAllocator, size2};
 
 use crate::{
     math::PhysicalRect,
-    paint::atlas::{AtlasKind, AtlasTile},
+    paint::atlas::{AtlasKind, AtlasTile, MAX_IMAGE_PAGES},
 };
 
 /// 图集页的**上限**（纹素，边长）：2048²。字形页 R8 = 4 MiB、图片页 BGRA8 = 16 MiB
@@ -136,6 +136,10 @@ pub(crate) struct AtlasAllocator {
     max_page: u32,
     kind: AtlasKind,
     page: (u32, u32),
+    /// 该分配器对应的图集页索引（D-9 多页图集）：写进 [`AtlasTile::page`]。
+    ///
+    /// 单页图集（字形、以及多页改造前的图片）恒为 0；图片图集多页化后由页管理器设置。
+    page_index: u16,
     allocator: EtagereAllocator,
     /// 槽位表：`deallocate` 的幂等守卫（`etagere` 对陈旧 `AllocId` 会 `assert!` panic）。
     ///
@@ -166,12 +170,18 @@ impl AtlasAllocator {
             max_page: MAX_ATLAS_PAGE,
             kind,
             page,
+            page_index: 0,
             allocator: EtagereAllocator::new(size2(page.0 as i32, page.1 as i32)),
             tiles: Vec::with_capacity(64),
             free: Vec::new(),
             generation: 1,
             dirty: DirtyRects::default(),
         }
+    }
+
+    /// 设置该分配器对应的图集页索引（D-9 多页图片图集用；字形图集恒 0）。
+    pub(crate) fn set_page_index(&mut self, page_index: u16) {
+        self.page_index = page_index;
     }
 
     /// 仅测试：把页档上限钉在 `page`（调小阶梯，用来在少量 tile 内触发 LRU 淘汰/软失败）。
@@ -223,6 +233,7 @@ impl AtlasAllocator {
         let page_h = self.page.1 as f32;
         let tile = AtlasTile {
             atlas: self.kind(),
+            page: self.page_index,
             u0: origin_x as f32 / page_w,
             v0: origin_y as f32 / page_h,
             u1: (origin_x + width as i32) as f32 / page_w,
@@ -272,6 +283,36 @@ impl AtlasAllocator {
         self.allocator.deallocate(id);
     }
 
+    /// 该 `AllocId` 当前是否还活着（[`ImageAtlasPager`] 用它做幂等的活 tile 计数）。
+    pub(crate) fn is_live(&self, id: AllocId) -> bool {
+        self.tiles
+            .iter()
+            .any(|slot| matches!(slot, Some(existing) if *existing == id))
+    }
+
+    /// 仅探测：`content`（+padding）当前能否在本页分配。**不改动** tiles / 脏矩形 / 代际。
+    ///
+    /// 实现是「分配后立刻归还」：`etagere` 没有只读的 fit 查询；归还后 free list 与本页原状态
+    /// 等价（同一块矩形回到空闲表），不会泄漏或改变语义。仅供 [`ImageAtlasPager::would_open_new_page`]
+    /// 在**解码前预算准入**里判断是否可能新开一页（RD-2）；不在热路径。
+    pub(crate) fn has_room_for(&mut self, content: (u32, u32)) -> bool {
+        let (width, height) = content;
+        let Some(padded) = width.checked_add(2).zip(height.checked_add(2)) else {
+            return false;
+        };
+        if padded.0 > self.page.0 || padded.1 > self.page.1 {
+            return false;
+        }
+        let Some(allocation) = self
+            .allocator
+            .allocate(size2(padded.0 as i32, padded.1 as i32))
+        else {
+            return false;
+        };
+        self.allocator.deallocate(allocation.id);
+        true
+    }
+
     /// 清空并 `generation += 1`（DPI 变化 / 字体换代 / 容量逃逸）。
     pub(crate) fn clear(&mut self) {
         self.allocator = EtagereAllocator::new(size2(self.page.0 as i32, self.page.1 as i32));
@@ -306,6 +347,230 @@ impl AtlasAllocator {
         core::mem::take(&mut self.dirty)
     }
 }
+
+/// 图片图集的多页分配器（D-9）：`MAX_IMAGE_PAGES` 页、按需懒开、空闲页 LRU 回收。
+///
+/// 语义（用户裁决「多页图集 + LRU」，取代审计 D-9 的单页容量文档方案）：
+/// - 每页一个 `MAX_ATLAS_PAGE²` 的 [`AtlasAllocator`]；`AtlasTile.page` 是页号
+///   （`0..MAX_IMAGE_PAGES`），三端用 `GpuPrimitive.params1.y` 作 texture array 的层号。
+/// - 分配先试现有页；页满且页数未达上限 ⇒ 开新页（新页整页标记脏：三端首次必须整层上传）；
+///   页数达上限时，若存在**没有活 tile** 的页 ⇒ 按 LRU 复用最久未用的空页（`clear` 换代后
+///   原地重新分配，页号稳定）；否则 `None`（上层报 `Capacity{PageFull}`）。
+/// - `deallocate` 只释放单块；页变空后进入空闲表，等下一次分配回收。
+/// - **活 tile 永不淘汰**（tile 恒有效契约）：LRU 只作用于已空的页。
+pub(crate) struct ImageAtlasPager {
+    /// 页槽：下标 == 页号。页槽只增不减（页号稳定；回收 = `clear` 原地复用）。
+    pages: Vec<PagerPage>,
+    /// 空闲页号（按 `last_used` 升序选最久未用的回收）。
+    idle: Vec<u16>,
+    /// 每页的边长（纹素）。生产恒 `MAX_ATLAS_PAGE`；测试用小页验证容量/回收。
+    page_size: u32,
+    /// 单调 LRU 时钟（每次分配 +1）。
+    clock: u64,
+}
+
+struct PagerPage {
+    allocator: AtlasAllocator,
+    /// 活 tile 数（0 = 页空，可回收）。
+    live: usize,
+    /// 最近一次分配的时钟值（LRU 回收顺序）。
+    last_used: u64,
+}
+
+impl ImageAtlasPager {
+    pub(crate) fn new() -> Self {
+        Self::with_page_size(MAX_ATLAS_PAGE)
+    }
+
+    fn with_page_size(page_size: u32) -> Self {
+        debug_assert!(page_size > 0, "atlas page must be non-empty");
+        Self {
+            pages: Vec::with_capacity(usize::from(MAX_IMAGE_PAGES)),
+            idle: Vec::new(),
+            page_size,
+            clock: 0,
+        }
+    }
+
+    /// 仅测试：用小页（几十个 tile 即填满）验证页面增长 / 容量上限 / LRU 回收，避免真的塞满
+    /// 4 × 2048² 页。
+    #[cfg(test)]
+    pub(crate) fn with_page_for_test(page_size: u32) -> Self {
+        Self::with_page_size(page_size)
+    }
+
+    /// 已打开的页数（含空闲页；页缓冲/GPU 纹理按这个数常驻）。
+    pub(crate) fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// 单页边长（纹素；所有页相同）。
+    pub(crate) fn page_size(&self) -> u32 {
+        self.page_size
+    }
+
+    /// 仅测试：预开第 0 页并整页标脏（等价于旧单页实现的「构造时建页」语义，让既有页容量/
+    /// 脏矩形测试保持原有口径）。
+    #[cfg(test)]
+    pub(crate) fn preopen_page_for_test(&mut self) {
+        debug_assert!(self.pages.is_empty(), "只用于构造期预开页");
+        let mut allocator =
+            AtlasAllocator::with_page(AtlasKind::Image, (self.page_size, self.page_size));
+        allocator.set_page_index(0);
+        allocator.mark_written(full_page(self.page_size));
+        self.pages.push(PagerPage {
+            allocator,
+            live: 0,
+            last_used: 1,
+        });
+        // 预开页没有活 tile ⇒ 进入空闲表：首次分配走「清空换代 + 原地复用」路径，
+        // 与生产「空页按 LRU 回收」是同一条代码路径（测试因此覆盖真实回收逻辑）。
+        self.idle.push(0);
+        self.clock = 1;
+    }
+
+    /// 分配 `content` 是否**必然新开一页**（页数 +1；命中现有页空闲空间或 LRU 复用空页都不算）。
+    ///
+    /// RD-2：资源层在**解码前预算准入**时用它判断是否要额外预留一页 CPU 缓冲（16 MiB）——
+    /// 旧实现只在 `page_count()==0` 时预留一页，已开页后再新开页可让 `used_bytes` 超出预算
+    /// 最多 3 页（48 MiB）。estimate 只需保守（按源尺寸 clamp 到 `MAX_TILE_DIM`），
+    /// 多预留只会让预算更严格、不会漏。
+    pub(crate) fn would_open_new_page(&mut self, content: (u32, u32)) -> bool {
+        let (width, height) = content;
+        if width == 0 || height == 0 {
+            return false;
+        }
+        let Some(padded) = width.checked_add(2).zip(height.checked_add(2)) else {
+            return false;
+        };
+        if padded.0 > self.page_size || padded.1 > self.page_size {
+            return false;
+        }
+        // 非空页有空闲空间 ⇒ 不开新页。
+        for index in 0..self.pages.len() {
+            if self.pages[index].live == 0 {
+                continue;
+            }
+            if self.pages[index].allocator.has_room_for(content) {
+                return false;
+            }
+        }
+        // 有空闲页 ⇒ 原地回收复用，页数不变。
+        if !self.idle.is_empty() {
+            return false;
+        }
+        self.pages.len() < usize::from(MAX_IMAGE_PAGES)
+    }
+
+    /// 分配一块内容区（1 纹素 padding 由 [`AtlasAllocator`] 加）。返回的 `tile.page` 已设置。
+    pub(crate) fn allocate(&mut self, content: (u32, u32)) -> Option<Allocation> {
+        let (width, height) = content;
+        if width == 0 || height == 0 {
+            return None;
+        }
+        // 页级上限先判：内容区 + padding 超过页长时开新页也放不下（避免为无效分配白开一页）。
+        let padded = (width.checked_add(2)?, height.checked_add(2)?);
+        if padded.0 > self.page_size || padded.1 > self.page_size {
+            return None;
+        }
+        // 1) 先复用**非空页**的空闲空间（空页留到回收路径做换代，避免装箱碎片累积）。
+        for index in 0..self.pages.len() {
+            if self.pages[index].live == 0 {
+                continue;
+            }
+            if let Some(allocation) = self.allocate_on(index, content) {
+                return Some(allocation);
+            }
+        }
+        // 2) 页满：优先回收最久未用的空页（换代后原地复用；先于开新页，避免白占一页内存）。
+        if let Some(idle_index) = self
+            .idle
+            .iter()
+            .copied()
+            .min_by_key(|page| self.pages[usize::from(*page)].last_used)
+        {
+            let index = usize::from(idle_index);
+            let slot = &mut self.pages[index];
+            // 回收 = 原地换代：`clear` 重置装箱表/脏矩形并 generation+1；旧 tile 已全部释放
+            // （页空才可回收），因此不会破坏 tile 恒有效契约。
+            slot.allocator.clear();
+            slot.allocator.set_page_index(idle_index);
+            slot.live = 0;
+            self.idle.retain(|page| *page != idle_index);
+            return self.allocate_on(index, content);
+        }
+        // 3) 开新页（未达上限）；新页整页标记脏：三端首次必须整层上传。
+        if self.pages.len() < usize::from(MAX_IMAGE_PAGES) {
+            let index = self.pages.len();
+            let mut allocator =
+                AtlasAllocator::with_page(AtlasKind::Image, (self.page_size, self.page_size));
+            allocator.set_page_index(u16::try_from(index).ok()?);
+            allocator.mark_written(FULL_RECT);
+            self.pages.push(PagerPage {
+                allocator,
+                live: 0,
+                last_used: 0,
+            });
+            return self.allocate_on(index, content);
+        }
+        None
+    }
+
+    /// 在指定页上分配并记账（`tile.page` 与 LRU 时钟）。
+    fn allocate_on(&mut self, index: usize, content: (u32, u32)) -> Option<Allocation> {
+        let mut allocation = self.pages[index].allocator.allocate(content)?;
+        allocation.tile.page = u16::try_from(index).ok()?;
+        self.pages[index].live += 1;
+        self.clock = self.clock.wrapping_add(1);
+        self.pages[index].last_used = self.clock;
+        Some(allocation)
+    }
+
+    /// 释放一块（幂等：陈旧 `AllocId` 不改变活 tile 计数）。页变空后进入空闲表。
+    pub(crate) fn deallocate(&mut self, page: u16, id: AllocId) {
+        let Some(slot) = self.pages.get_mut(usize::from(page)) else {
+            return;
+        };
+        let was_live = slot.allocator.is_live(id);
+        slot.allocator.deallocate(id);
+        if !was_live {
+            return;
+        }
+        slot.live -= 1;
+        if slot.live == 0 && !self.idle.contains(&page) {
+            self.idle.push(page);
+        }
+    }
+
+    /// 记录某页的写脏矩形（资源层把解码后的像素写进 CPU 页缓冲后调用）。
+    pub(crate) fn mark_written(&mut self, page: u16, rect: PhysicalRect) {
+        if let Some(slot) = self.pages.get_mut(usize::from(page)) {
+            slot.allocator.mark_written(rect);
+        }
+    }
+
+    /// 取走某页的待上传矩形（`None` = 页号无效）。首次（新页）返回整页哨兵。
+    pub(crate) fn take_dirty_rects(&mut self, page: u16) -> Option<DirtyRects> {
+        self.pages
+            .get_mut(usize::from(page))
+            .map(|slot| slot.allocator.take_dirty_rects())
+    }
+
+    /// 某页的分配代际（诊断/测试：页回收复用后必须换代）。
+    #[must_use]
+    pub(crate) fn generation(&self, page: u16) -> Option<u32> {
+        self.pages
+            .get(usize::from(page))
+            .map(|slot| slot.allocator.generation())
+    }
+}
+
+impl Default for ImageAtlasPager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// 整页哨兵：覆盖任意页面的矩形（沿用旧 `mark(0, u32::MAX)` 的语义）。
 ///
 /// 消费方仍靠 [`DirtyRects::is_full`] 走「整页缓冲直接上传、不打包」的快路径。
@@ -315,6 +580,12 @@ const FULL_RECT: PhysicalRect = PhysicalRect {
     x1: i32::MAX,
     y1: i32::MAX,
 };
+
+/// 一整页的矩形（测试预开页的「整页脏」口径）。
+#[cfg(test)]
+fn full_page(page: u32) -> PhysicalRect {
+    PhysicalRect::new(0, 0, page as i32, page as i32)
+}
 
 /// 被写脏的**矩形**集合（Skia `SkRegion` 的整数矩形并集思路）：多个页内物理像素矩形，
 /// 按 `(y0, x0)` 升序、已合并。
@@ -333,7 +604,10 @@ pub(crate) struct DirtyRects {
 }
 
 impl DirtyRects {
-    /// 段/矩形数上限：超过就折叠为整页（沿用旧 `DirtyRects` 的 8，避免碎片化上传）。
+    /// 段/矩形数上限：超过就折叠为并集外接矩形（沿用旧 `DirtyRects` 的 8，避免碎片化上传）。
+    ///
+    /// 折叠目标**不是**整页哨兵（X4）：整页上传是 16 MiB 级拷贝/尖峰，只在显式整页
+    /// （首帧 / 页尺寸变化 / 渲染器重建）时使用。
     const MAX_RECTS: usize = 8;
 
     /// 整页哨兵集合（等价于旧的 `mark(0, u32::MAX)`）。
@@ -343,7 +617,7 @@ impl DirtyRects {
         }
     }
 
-    /// 标记 `rect` 脏；空矩形忽略；被已有矩形包含则忽略；相交/相邻合并；超上限折叠整页。
+    /// 标记 `rect` 脏；空矩形忽略；被已有矩形包含则忽略；相交/相邻合并；超上限折叠为 bbox。
     pub(crate) fn mark(&mut self, rect: PhysicalRect) {
         if rect.is_empty() || self.is_full() {
             return;
@@ -373,8 +647,15 @@ impl DirtyRects {
         self.rects.push(merged);
         self.rects.sort_by_key(|rect| (rect.y0, rect.x0));
         if self.rects.len() > Self::MAX_RECTS {
+            // X4：折叠为**并集外接矩形**（bounding box）而不是整页哨兵。旧行为让「一帧 ≥9 块
+            // 图片」必然整页上传（2048² BGRA8 = 16 MiB UI 线程拷贝 + 上传尖峰）；bbox 面积恒
+            // ≤ 页面，三端 AOI 契约不变（仍按矩形盒拷贝）。
+            let mut union = self.rects[0];
+            for rect in &self.rects[1..] {
+                union = union.union(*rect);
+            }
             self.rects.clear();
-            self.rects.push(FULL_RECT);
+            self.rects.push(union);
         }
     }
 
@@ -481,10 +762,13 @@ fn touches(a: PhysicalRect, b: PhysicalRect) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ATLAS_PAGE_STEPS, AtlasAllocator, DirtyRects, MAX_ATLAS_PAGE, MIN_ATLAS_PAGE, RectChunk,
-        pack_rects,
+        ATLAS_PAGE_STEPS, AtlasAllocator, DirtyRects, ImageAtlasPager, MAX_ATLAS_PAGE,
+        MIN_ATLAS_PAGE, RectChunk, pack_rects,
     };
-    use crate::{math::PhysicalRect, paint::atlas::AtlasKind};
+    use crate::{
+        math::PhysicalRect,
+        paint::atlas::{AtlasKind, MAX_IMAGE_PAGES},
+    };
 
     fn allocator() -> AtlasAllocator {
         AtlasAllocator::with_page(AtlasKind::Glyph, (64, 64))
@@ -675,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn dirty_rects_fold_to_full_when_the_limit_is_exceeded_and_clear_empties() {
+    fn dirty_rects_fold_to_a_bounding_box_when_the_limit_is_exceeded_and_clear_empties() {
         let mut rects = DirtyRects::default();
         for index in 0..DirtyRects::MAX_RECTS {
             let y = index as i32 * 16;
@@ -684,11 +968,51 @@ mod tests {
         }
         assert!(!rects.is_full());
         rects.mark(PhysicalRect::new(0, 4096, 4, 4100));
-        assert!(rects.is_full(), "超过 8 块折叠为整页哨兵");
+        // X4：超过上限折叠为**并集外接矩形**，不是整页哨兵（整页 = 16 MiB 级上传尖峰）。
+        assert!(!rects.is_full(), "折叠后不得退化为整页哨兵");
+        assert_eq!(rects.rects(), &[PhysicalRect::new(0, 0, 4, 4100)]);
+        // 页高 512：yte_count 按页裁剪（y1 4096→512），= 4 × 512 × 1 B。
+        assert_eq!(rects.byte_count(512, 1), 4 * 512);
 
         rects.clear();
         assert!(rects.is_empty());
         assert!(rects.rects().is_empty());
+    }
+
+    /// X4：一帧 9+ 块分散的图片矩形不得折叠成整页上传（旧行为 16 MiB 拷贝/尖峰）；
+    /// bbox 面积恒 ≤ 页面，上传字节数必然小于整页。
+    #[test]
+    fn nine_scattered_image_rects_fold_to_a_bounding_box_not_the_whole_page() {
+        const PAGE: u32 = 2048;
+        const TEXEL: u32 = 4;
+        let mut rects = DirtyRects::default();
+        // 9 块 32² 图片（+2 padding 的 34² 块）沿对角线/网格分散。
+        let mut expected: Option<PhysicalRect> = None;
+        for index in 0..9i32 {
+            let x = (index % 3) * 600;
+            let y = (index / 3) * 600;
+            let rect = PhysicalRect::new(x, y, x + 34, y + 34);
+            rects.mark(rect);
+            expected = Some(match expected {
+                Some(union) => union.union(rect),
+                None => rect,
+            });
+            if index < 8 {
+                assert!(!rects.is_full(), "未超上限前不得整页");
+            }
+        }
+        assert!(
+            !rects.is_full(),
+            "超过 8 块后必须折叠为 bbox，而不是整页哨兵"
+        );
+        assert_eq!(rects.rects(), &[expected.expect("有矩形")]);
+        let bytes = rects.byte_count(PAGE, TEXEL) as u64;
+        let page_bytes = u64::from(PAGE) * u64::from(PAGE) * u64::from(TEXEL);
+        assert!(
+            bytes < page_bytes,
+            "bbox 上传字节 {bytes} 必须小于整页 {page_bytes}（旧实现折叠整页）"
+        );
+        assert_eq!(rects.chunks(PAGE, TEXEL).count(), 1, "bbox 是单个矩形块");
     }
 
     #[test]
@@ -980,5 +1304,165 @@ mod tests {
         let allocation = atlas.allocate((8, 8)).expect("fits");
         atlas.deallocate(allocation.id);
         assert!(atlas.allocate((8, 8)).is_some(), "释放后容量必须回来");
+    }
+
+    /// D-9：多页图片图集——单页放满后必须开第 2 页，`tile.page` 指向正确页。
+    #[test]
+    fn image_pager_opens_a_second_page_when_the_first_is_full() {
+        // 64² 页 + 18×18 内容（20×20 分配）⇒ 每页 9 块左右，几轮就满。
+        let mut pager = ImageAtlasPager::with_page_for_test(64);
+        let mut page_0 = 0usize;
+        let mut allocations = Vec::new();
+        for _ in 0..32 {
+            let Some(allocation) = pager.allocate((18, 18)) else {
+                break;
+            };
+            if allocation.tile.page == 0 {
+                page_0 += 1;
+            }
+            allocations.push(allocation);
+        }
+        assert!(page_0 > 0, "第一页必须被使用");
+        assert!(
+            allocations
+                .iter()
+                .any(|allocation| allocation.tile.page == 1),
+            "单页放满后必须开第 2 页（tile.page 才有 1）"
+        );
+        assert!(pager.page_count() >= 2, "必须开过第 2 页");
+    }
+
+    /// D-9：页数达到 `MAX_IMAGE_PAGES` 且全部页满 ⇒ `None`（上层报 Capacity{PageFull}）。
+    #[test]
+    fn image_pager_reports_capacity_only_after_all_pages_are_full() {
+        let mut pager = ImageAtlasPager::with_page_for_test(64);
+        let mut allocations = Vec::new();
+        while let Some(allocation) = pager.allocate((18, 18)) {
+            allocations.push(allocation);
+        }
+        assert_eq!(
+            pager.page_count(),
+            usize::from(MAX_IMAGE_PAGES),
+            "必须先把所有页填满才报容量失败"
+        );
+        let mut seen = [false; MAX_IMAGE_PAGES as usize];
+        for allocation in &allocations {
+            seen[usize::from(allocation.tile.page)] = true;
+        }
+        assert!(seen.iter().all(|used| *used), "每个页号都必须被用到");
+    }
+
+    /// D-9/RD-3：**只**回收已空的页，活 tile 永不淘汰；回收按 LRU（最久未用的空页先复用）。
+    ///
+    /// 必须钉死顺序（旧测试只断言 `recycled == 1 || 2`，把 `min_by_key` 改成 `max_by_key`
+    /// 也能通过）：62² 内容 + 1 纹素 padding = 64² 整页（每页恰好一块），页 1 先变空
+    /// （更久未用）⇒ 下一次分配必须落在页 1；页 2 其次。
+    #[test]
+    fn image_pager_recycles_the_least_recently_used_empty_page() {
+        let mut pager = ImageAtlasPager::with_page_for_test(64);
+        let mut per_page: ahash::HashMap<u16, Vec<etagere::AllocId>> = ahash::HashMap::default();
+        while let Some(allocation) = pager.allocate((62, 62)) {
+            per_page
+                .entry(allocation.tile.page)
+                .or_default()
+                .push(allocation.id);
+        }
+        assert_eq!(pager.page_count(), usize::from(MAX_IMAGE_PAGES));
+        // 页 1 先清空、页 2 后清空 ⇒ 页 1 是更久未用的空页。
+        for id in per_page.remove(&1).expect("page 1 has tiles") {
+            pager.deallocate(1, id);
+        }
+        for id in per_page.remove(&2).expect("page 2 has tiles") {
+            pager.deallocate(2, id);
+        }
+        let first = pager.allocate((62, 62)).expect("存在空页时必须能分配");
+        assert_eq!(
+            first.tile.page, 1,
+            "必须精确回收**最久未用**的空页（页 1），而不是任意空页"
+        );
+        let second = pager.allocate((62, 62)).expect("第二个空页");
+        assert_eq!(second.tile.page, 2, "其次回收较近变空的页 2");
+        assert_eq!(
+            pager.page_count(),
+            usize::from(MAX_IMAGE_PAGES),
+            "回收空页不得增加页数"
+        );
+        // 使用中保护：页 0/3 仍有活 tile、且此时没有空页 ⇒ 分配必须失败（4 页全满），
+        // 绝不为了腾空间回收活 tile。
+        assert!(
+            pager.allocate((62, 62)).is_none(),
+            "活 tile 的页（0/3）绝不能被回收，且不得开第 5 页"
+        );
+    }
+
+    /// D-9：新页第一次取脏矩形必须是整页哨兵（三端首次必须整层上传）。
+    #[test]
+    fn image_pager_new_page_is_fully_dirty() {
+        let mut pager = ImageAtlasPager::with_page_for_test(64);
+        let _ = pager.allocate((18, 18)).expect("fits");
+        let dirty = pager.take_dirty_rects(0).expect("page 0 exists");
+        assert!(dirty.is_full(), "新页首次上传必须是整页");
+        assert!(pager.take_dirty_rects(1).is_none(), "第 2 页还没开");
+        // 页 1 打开后同样整页脏。
+        loop {
+            if pager.allocate((18, 18)).is_none() {
+                break;
+            }
+            if pager.page_count() == 2 {
+                break;
+            }
+        }
+        assert!(pager.page_count() >= 2, "必须开过第 2 页");
+        assert!(
+            pager.take_dirty_rects(1).expect("page 1 exists").is_full(),
+            "新开的第 2 页首次上传必须是整页"
+        );
+    }
+
+    /// D-9：页回收复用后必须换代（旧 tile 的 generation 不得与新一代混淆），且页号保持稳定。
+    #[test]
+    fn image_pager_recycled_page_bumps_its_generation() {
+        let mut pager = ImageAtlasPager::with_page_for_test(64);
+        let mut per_page: ahash::HashMap<u16, Vec<etagere::AllocId>> = ahash::HashMap::default();
+        while let Some(allocation) = pager.allocate((18, 18)) {
+            per_page
+                .entry(allocation.tile.page)
+                .or_default()
+                .push(allocation.id);
+        }
+        let generation_before = pager.generation(0).expect("page 0");
+        for id in per_page.remove(&0).expect("page 0 has tiles") {
+            pager.deallocate(0, id);
+        }
+        let mut recycled = None;
+        for _ in 0..64 {
+            let Some(allocation) = pager.allocate((18, 18)) else {
+                break;
+            };
+            if allocation.tile.page == 0 {
+                recycled = Some(allocation);
+                break;
+            }
+        }
+        let recycled = recycled.expect("page 0 must be recycled (it is the only empty page)");
+        assert_eq!(recycled.tile.page, 0, "回收复用必须保持页号稳定");
+        assert_ne!(
+            pager.generation(0).expect("page 0"),
+            generation_before,
+            "回收复用必须换代（旧 tile 不得与新 tile 共用 generation）"
+        );
+    }
+
+    /// D-9：陈旧 `AllocId` 的重复释放不得把活 tile 计成 0（幂等）。
+    #[test]
+    fn image_pager_deallocate_is_idempotent() {
+        let mut pager = ImageAtlasPager::with_page_for_test(64);
+        let allocation = pager.allocate((18, 18)).expect("fits");
+        pager.deallocate(0, allocation.id);
+        pager.deallocate(0, allocation.id);
+        pager.deallocate(99, allocation.id);
+        // 页已空：下一次分配应能复用页 0（若幂等失败，活计数为负/丢页会表现成开新页或错误）。
+        let next = pager.allocate((18, 18)).expect("fits");
+        assert_eq!(next.tile.page, 0);
     }
 }

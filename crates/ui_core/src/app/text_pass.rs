@@ -49,7 +49,7 @@ pub(crate) fn upload_glyph_page(app: &mut App) {
         app.pending_dirty.clear();
         app.glyph_page_extent = None;
         for window in app.windows.values_mut() {
-            window.clear_atlas_rects(AtlasKind::Glyph);
+            window.clear_atlas_rects(AtlasKind::Glyph, 0);
             window.mark_atlas_page_stale(AtlasKind::Glyph);
         }
     }
@@ -80,7 +80,7 @@ pub(crate) fn upload_glyph_page(app: &mut App) {
     let any_queued = app
         .windows
         .values()
-        .any(|window| window.has_renderer() && !window.atlas_rects(AtlasKind::Glyph).is_empty());
+        .any(|window| window.has_renderer() && !window.atlas_rects(AtlasKind::Glyph, 0).is_empty());
     if !has_rects && !any_missing && !any_queued {
         return;
     }
@@ -98,6 +98,7 @@ pub(crate) fn upload_glyph_page(app: &mut App) {
         if !window.has_renderer() {
             continue;
         }
+        // 字形图集是 1 层 texture array：层号恒 0。
         if !window.atlas_page_matches(AtlasKind::Glyph, extent) {
             // 整页是唯一正确的来源：页尺寸变了 / 图集清空过 / 新渲染器。
             if !window.atlas_idle(AtlasKind::Glyph) {
@@ -105,31 +106,38 @@ pub(crate) fn upload_glyph_page(app: &mut App) {
             }
             let uploaded = window.queue_atlas_upload(
                 AtlasKind::Glyph,
+                0,
                 extent,
                 &app.glyph_page,
                 full_rects.clone(),
             );
             if uploaded {
                 window.mark_atlas_page_received(AtlasKind::Glyph, extent);
-                window.clear_atlas_rects(AtlasKind::Glyph);
+                window.clear_atlas_rects(AtlasKind::Glyph, 0);
             }
             continue;
         }
         if has_rects {
-            window.atlas_rects_mut(AtlasKind::Glyph).merge_from(&dirty);
+            window
+                .atlas_rects_mut(AtlasKind::Glyph, 0)
+                .merge_from(&dirty);
         }
-        if window.atlas_rects(AtlasKind::Glyph).is_empty() || !window.atlas_idle(AtlasKind::Glyph) {
+        if window.atlas_rects(AtlasKind::Glyph, 0).is_empty()
+            || !window.atlas_idle(AtlasKind::Glyph)
+        {
             continue;
         }
-        // 整页脏（矩形数超上限折叠）：直接用整页缓冲，省掉「打包再复制」的一整页拷贝。
-        if window.atlas_rects(AtlasKind::Glyph).is_full() {
+        // 显式整页脏（首帧 / 页尺寸变化 / 渲染器重建）：直接用整页缓冲，省掉「打包再复制」。
+        // 注：X4 起「矩形数超上限」折叠为 bbox（不再退化整页），本分支只服务真正的整页。
+        if window.atlas_rects(AtlasKind::Glyph, 0).is_full() {
             if window.queue_atlas_upload(
                 AtlasKind::Glyph,
+                0,
                 extent,
                 &app.glyph_page,
                 full_rects.clone(),
             ) {
-                window.clear_atlas_rects(AtlasKind::Glyph);
+                window.clear_atlas_rects(AtlasKind::Glyph, 0);
             }
             continue;
         }
@@ -138,84 +146,186 @@ pub(crate) fn upload_glyph_page(app: &mut App) {
             &app.glyph_page,
             extent,
             1,
-            window.atlas_rects(AtlasKind::Glyph),
+            window.atlas_rects(AtlasKind::Glyph, 0),
             &mut packed,
         );
-        let rects = window.atlas_rects(AtlasKind::Glyph).clone();
-        if window.queue_atlas_upload(AtlasKind::Glyph, extent, &packed, rects) {
-            window.clear_atlas_rects(AtlasKind::Glyph);
+        let rects = window.atlas_rects(AtlasKind::Glyph, 0).clone();
+        if window.queue_atlas_upload(AtlasKind::Glyph, 0, extent, &packed, rects) {
+            window.clear_atlas_rects(AtlasKind::Glyph, 0);
         }
         app.packed = packed;
     }
 }
 
-/// 图片页分发：懒分配（没插过图片就没有页）+ 按脏矩形（AOI）增量（DEVIATIONS F-211 / R06-3）。
+/// 图片页分发：懒分配（没插过图片就没有页）+ 逐层整页 / 按脏矩形（AOI）增量
+/// （DEVIATIONS F-211 / R06-3 / D-9-c 多页 texture array）。
+///
+/// 图片图集是 `MAX_IMAGE_PAGES` 层的 texture array，layer = 图集页索引。每个窗口的每一层
+/// 独立记账：
+/// 1. **整数组建立**（新窗口 / 换渲染器 / extent 变化）或某层第一次出现 ⇒ 该层整页上传
+///    （资源层新页首帧整页脏，见 `ImageAtlasPager::allocate`）；
+/// 2. 其余帧逐层增量：先并入本窗口该层的待传矩形，槽空闲时按 AOI 打包上传；
+/// 3. 共享槽忙的窗口不等待，矩形留在自己的队列里（一个不出帧的窗口不拖住其它窗口）。
+///
 /// 消费者：`App::upload_image_page`。
 pub(crate) fn upload_image_page(app: &mut App) {
-    use crate::paint::atlas::AtlasKind;
+    use crate::paint::atlas::{AtlasKind, MAX_IMAGE_PAGES};
 
-    // 先取脏矩形再借页（`take_dirty_rects` 需要 `&mut`）：没有页时脏矩形必然是空的。
-    let dirty = app.resources.take_dirty_rects();
-    let Some((page, pixels)) = app.resources.page_pixels() else {
+    let page_count = app.resources.page_count();
+    if page_count == 0 {
         return;
-    };
-    debug_assert_eq!(page.0, page.1, "image atlas page must stay square");
-    let extent = page.0;
-    let has_rects = !dirty.is_empty();
+    }
+    let extent = app.resources.page_extent();
+    debug_assert!(extent > 0, "image atlas page must be non-empty");
+    debug_assert!(
+        page_count <= usize::from(MAX_IMAGE_PAGES),
+        "image atlas pages must respect MAX_IMAGE_PAGES"
+    );
+    let layers = page_count as u16;
+
+    // 先逐页取走脏矩形（进程级共享，统一消费一次再逐窗口分发：与字形页同一条纪律，
+    // 否则第一个窗口消费后其余窗口永远收不到内容）。
+    let dirty: Vec<crate::render::DirtyRects> = (0..layers)
+        .map(|layer| app.resources.take_dirty_rects_at(layer).unwrap_or_default())
+        .collect();
+    let has_rects = dirty.iter().any(|rects| !rects.is_empty());
     let any_missing = app.windows.values().any(|window| {
-        window.has_renderer() && !window.atlas_page_matches(AtlasKind::Image, extent)
+        window.has_renderer()
+            && (!window.atlas_page_matches(AtlasKind::Image, extent)
+                || (0..layers).any(|layer| !window.image_layer_received(layer)))
     });
-    let any_queued = app
-        .windows
-        .values()
-        .any(|window| window.has_renderer() && !window.atlas_rects(AtlasKind::Image).is_empty());
+    let any_queued = app.windows.values().any(|window| {
+        window.has_renderer()
+            && (0..usize::from(MAX_IMAGE_PAGES)).any(|layer| {
+                !window
+                    .atlas_rects(AtlasKind::Image, layer as u16)
+                    .is_empty()
+            })
+    });
     if !has_rects && !any_missing && !any_queued {
         return;
     }
     let full_rects = crate::render::DirtyRects::full();
 
-    for window in app.windows.values_mut() {
+    let App {
+        resources,
+        windows,
+        packed,
+        ..
+    } = app;
+    for window in windows.values_mut() {
         if !window.has_renderer() {
             continue;
         }
-        if !window.atlas_page_matches(AtlasKind::Image, extent) {
+        let array_missing = !window.atlas_page_matches(AtlasKind::Image, extent);
+        let missing_layers =
+            array_missing || (0..layers).any(|layer| !window.image_layer_received(layer));
+        if missing_layers {
+            // 已经在同步的层仍要收下本帧写入：整层上传只补「缺的层」，不能因此丢掉其它层的
+            // 增量（否则忙窗口错过一帧写入后永远缺那一块像素）。缺的层随后整页上传覆盖。
+            if has_rects {
+                for layer in 0..layers {
+                    window
+                        .atlas_rects_mut(AtlasKind::Image, layer)
+                        .merge_from(&dirty[usize::from(layer)]);
+                }
+            }
+            // 整数组建立 / 新层补齐：逐层整页上传（只上传已分配过页的层；尚未分配的层
+            // 在它第一次出现的那一帧走同一条路径）。
             if !window.atlas_idle(AtlasKind::Image) {
                 continue;
             }
-            let uploaded =
-                window.queue_atlas_upload(AtlasKind::Image, extent, pixels, full_rects.clone());
+            let mut uploaded_layers = Vec::with_capacity(page_count);
+            let mut uploaded = true;
+            for layer in 0..layers {
+                if !array_missing && window.image_layer_received(layer) {
+                    continue;
+                }
+                let Some((dims, pixels)) = resources.page_pixels_at(layer) else {
+                    uploaded = false;
+                    break;
+                };
+                debug_assert_eq!(
+                    (dims.0, dims.1),
+                    (extent, extent),
+                    "image atlas page must be square and uniform"
+                );
+                if !window.queue_atlas_upload(
+                    AtlasKind::Image,
+                    layer,
+                    extent,
+                    pixels,
+                    full_rects.clone(),
+                ) {
+                    uploaded = false;
+                    break;
+                }
+                uploaded_layers.push(layer);
+            }
             if uploaded {
+                for layer in uploaded_layers {
+                    window.mark_image_layer_received(layer);
+                    window.clear_atlas_rects(AtlasKind::Image, layer);
+                }
                 window.mark_atlas_page_received(AtlasKind::Image, extent);
-                window.clear_atlas_rects(AtlasKind::Image);
+                if array_missing {
+                    window.clear_all_atlas_rects(AtlasKind::Image);
+                }
             }
             continue;
         }
-        if has_rects {
-            window.atlas_rects_mut(AtlasKind::Image).merge_from(&dirty);
-        }
-        if window.atlas_rects(AtlasKind::Image).is_empty() || !window.atlas_idle(AtlasKind::Image) {
-            continue;
-        }
-        // 整页脏（矩形数超上限折叠）：直接用整页缓冲，省掉「打包再复制」的一整页拷贝。
-        if window.atlas_rects(AtlasKind::Image).is_full() {
-            if window.queue_atlas_upload(AtlasKind::Image, extent, pixels, full_rects.clone()) {
-                window.clear_atlas_rects(AtlasKind::Image);
+        // 增量：逐层并入本帧脏矩形，槽空闲时按 AOI 上传（整页脏直接整页）。
+        let idle = window.atlas_idle(AtlasKind::Image);
+        if !idle {
+            if has_rects {
+                for layer in 0..layers {
+                    window
+                        .atlas_rects_mut(AtlasKind::Image, layer)
+                        .merge_from(&dirty[usize::from(layer)]);
+                }
             }
             continue;
         }
-        let mut packed = std::mem::take(&mut app.packed);
-        crate::render::atlas::pack_rects(
-            pixels,
-            extent,
-            4,
-            window.atlas_rects(AtlasKind::Image),
-            &mut packed,
-        );
-        let rects = window.atlas_rects(AtlasKind::Image).clone();
-        if window.queue_atlas_upload(AtlasKind::Image, extent, &packed, rects) {
-            window.clear_atlas_rects(AtlasKind::Image);
+        for layer in 0..layers {
+            if has_rects {
+                window
+                    .atlas_rects_mut(AtlasKind::Image, layer)
+                    .merge_from(&dirty[usize::from(layer)]);
+            }
+            if window.atlas_rects(AtlasKind::Image, layer).is_empty() {
+                continue;
+            }
+            let Some((dims, pixels)) = resources.page_pixels_at(layer) else {
+                window.clear_atlas_rects(AtlasKind::Image, layer);
+                continue;
+            };
+            debug_assert_eq!((dims.0, dims.1), (extent, extent));
+            if window.atlas_rects(AtlasKind::Image, layer).is_full() {
+                if window.queue_atlas_upload(
+                    AtlasKind::Image,
+                    layer,
+                    extent,
+                    pixels,
+                    full_rects.clone(),
+                ) {
+                    window.clear_atlas_rects(AtlasKind::Image, layer);
+                }
+                continue;
+            }
+            let mut buf = std::mem::take(packed);
+            crate::render::atlas::pack_rects(
+                pixels,
+                extent,
+                4,
+                window.atlas_rects(AtlasKind::Image, layer),
+                &mut buf,
+            );
+            let rects = window.atlas_rects(AtlasKind::Image, layer).clone();
+            if window.queue_atlas_upload(AtlasKind::Image, layer, extent, &buf, rects) {
+                window.clear_atlas_rects(AtlasKind::Image, layer);
+            }
+            *packed = buf;
         }
-        app.packed = packed;
     }
 }
 
@@ -229,11 +339,16 @@ pub(crate) fn glyph_page_pixels(app: &App) -> ((u32, u32), Vec<u8>) {
     (page, pixels)
 }
 
-/// 图片页的当前内容（BGRA8 预乘 sRGB；`TestApp::snapshot` 的上传源）；没插过图片时 `None`。
-/// 消费者：`App::resource_page_pixels`。
+/// 全部已打开图片页的当前内容（BGRA8 预乘 sRGB；`TestApp::snapshot` / 像素读回的上传源）。
+///
+/// D-9-c 起图片图集是 `MAX_IMAGE_PAGES` 层 texture array：快照必须逐层上传，否则多页场景的
+/// 第 2 页会采样到未定义层。返回顺序 = 层号升序；未分配页已由 `page_count` 排除。
+/// 消费者：`App::resource_page_pixels_all`。
 #[cfg(feature = "test-support")]
-pub(crate) fn resource_page_pixels(app: &App) -> Option<((u32, u32), &[u8])> {
-    app.resources.page_pixels()
+pub(crate) fn resource_page_pixels_all(app: &App) -> Vec<((u32, u32), &[u8])> {
+    (0..app.resources.page_count() as u16)
+        .filter_map(|page| app.resources.page_pixels_at(page))
+        .collect()
 }
 
 // ── P05：文本 pass / 字体栈 / 诊断 ────────────────────────────────────────
@@ -339,10 +454,11 @@ pub(crate) fn refresh_text(
         );
     }
     // 数字快速路径的命中率（R12 的核心性能指标）：分子 = 走快速路径的塑形数，
-    // 分母 = 进入快速路径判定的塑形数。
+    // 分母 = 进入快速路径判定的塑形数（含静态条件不满足的候选，D-2 后是真实命中率）。
     let fast = text.take_fast_path_stats();
     report.fast_path_shaped = fast.hits;
     report.fast_path_queries = fast.queries;
+    report.fast_path_ineligible = fast.ineligible();
     // 光栅/图集统计**不在这里**：光栅发生在同帧的 `layout_text`（第二阶段），而本报告在
     // 第一阶段产出。`GlyphAtlas::take_stats` 只能取一次，第二阶段才是唯一正确的消费点
     // （此前这里取到的永远是 0，复审已确认）。见 `TextLayoutReport` 的同名字段。
@@ -619,17 +735,17 @@ pub(crate) fn reload_system_fonts(app: &mut App) -> u32 {
     version
 }
 
-/// 所有窗口的文本节点标 `LAYOUT | PAINT` 并清 `node..root` 缓存。
-/// 图集代际变化时让**所有窗口**的文本节点重绘（P1-2.6）。
+/// 图集代际变化时的**唯一重光栅入口**（D-5）。
 ///
-/// 图集换代（DPI 变化 / 字形扩容逃逸）会让页内所有 tile 重排，而每个文本 lane 里存的是
-/// 生成时的 `AtlasTile`（旧 UV）。`set_text_line` 不标 `PAINT`，paint 的 lane 复用只看
-/// `REUSABLE`/`clip_key`，于是旧 UV 被继续使用 —— 表现为错字/花字，且要等一次无关的
-/// `PAINT` 才可能恢复。
+/// 字形图集是**进程级**共享的：任一窗口的 DPI 变化 / 字形容量逃逸都会让 `atlas.generation`
+/// 递增、页内所有 tile 重排。每个窗口文本节点的 `ShapedLine` 里烘焙的是生成时的
+/// `AtlasTile`（旧 UV），仅标 `PAINT` 只会把旧 UV 重新编码一遍（审计 D-5 的无效兜底）。
 ///
-/// 只标 `PAINT` 不标 `LAYOUT`：换代不改变字形宽度与断行，重排是纯损失。
+/// 因此这里走 [`NodeTree::invalidate_text_lines`]：清 `ShapedLine` + 置 `laid_*` 失配 +
+/// `mark_text_layout_dirty` + `mark_paint` ⇒ 下一帧 `layout_text` 用当前代际重光栅、
+/// paint 重建 lane。换代是冷路径，重排成本可接受（Chrome/Skia 的 glyph draw 数据同样整体作废）。
 ///
-/// 对照 Skia：glyph atlas / strike cache 换代时会让所有引用旧 strike 的绘制数据失效。
+/// 对照 Skia：glyph atlas / strike cache 换代时所有引用旧 strike 的绘制数据失效。
 /// 消费者：`App::repaint_text_if_atlas_changed`。
 pub(crate) fn repaint_text_if_atlas_changed(app: &mut App) {
     let generation = app.atlas.generation();
@@ -638,7 +754,7 @@ pub(crate) fn repaint_text_if_atlas_changed(app: &mut App) {
     }
     app.atlas_generation_seen = generation;
     for window in app.windows.values_mut() {
-        window.tree_mut().mark_all_text_paint();
+        window.tree_mut().invalidate_text_lines();
     }
 }
 
@@ -668,12 +784,14 @@ pub(crate) fn invalidate_all_text(app: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use super::MAX_LAYOUT_TEXT_PASSES;
     use crate::{
         app::App,
         error::EngineError,
         node::{builder::NodeBuilder, id::NodeId},
-        paint::atlas::AtlasKind,
+        paint::{atlas::AtlasKind, primitive::Primitive},
         render::AtlasAllocator,
         text::{TextDiagnostic, TextStyle, atlas::ATLAS_FULL_ESCALATION_FRAMES},
         window::{WindowId, WindowOptions},
@@ -886,5 +1004,126 @@ mod tests {
             "重试后必须把少画的字形全部补上（重排轮数上限 {MAX_LAYOUT_TEXT_PASSES}）"
         );
         assert_eq!(line.atlas_generation, app.atlas.generation());
+    }
+
+    /// D-5：图集换代必须走**唯一重光栅入口**（`repaint_text_if_atlas_changed` →
+    /// `NodeTree::invalidate_text_lines`）：清掉旧 `ShapedLine` 并把节点重新入队，而不是只标
+    /// `PAINT`（审计判定旧兜底会重编旧 UV）；下一轮 `layout_text` 用**当前代际**重光栅。
+    #[test]
+    fn atlas_generation_change_invalidates_lines_through_the_unique_entry() {
+        let (_rt, mut app, window, node) = text_app("1,234.56", Some(200.0));
+        let _ = frame_text(&mut app, window);
+        let old_generation = app
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .text_line(node)
+            .expect("行快照")
+            .atlas_generation;
+        assert_eq!(old_generation, app.atlas.generation());
+
+        // 等价于容量逃逸 / 新页扩容：`grow` 递增图集代际。
+        assert!(app.atlas.grow(), "512² → 1024² 必须成功");
+        app.repaint_text_if_atlas_changed();
+        {
+            let tree = app.window(window).expect("窗口存在").tree();
+            assert!(
+                tree.text_line(node).is_none(),
+                "换代必须清掉旧 ShapedLine（否则 paint 会重编旧 UV）"
+            );
+            assert_eq!(tree.text_layout_dirty_len(), 1, "节点必须进入重排队列");
+        }
+
+        let report = app
+            .layout_text(window)
+            .expect("窗口存在")
+            .expect("重排不报错");
+        assert!(report.laid >= 1, "必须真正重光栅（report: {report:?}）");
+        let line = app
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .text_line(node)
+            .expect("行快照")
+            .clone();
+        assert_eq!(
+            line.atlas_generation,
+            app.atlas.generation(),
+            "重光栅必须使用当前图集代际"
+        );
+        assert_ne!(line.atlas_generation, old_generation, "换代后必须换新代际");
+    }
+    /// D-5：绘制前硬校验的端到端闭环。伪造一行「`atlas_generation` 是旧代际、但槽里记录的
+    /// `laid_generation` 是当前代际」的快照（模拟绕过唯一入口/未来遗漏的路径）：本帧 paint
+    /// **不得编码旧 UV**（scene 无 GlyphRun），提交后该节点被逐行失效，下一帧用当前代际重光栅。
+    #[test]
+    fn stale_text_line_is_skipped_by_paint_and_healed_next_frame() {
+        let (_rt, mut app, window, node) = text_app("1,234.56", Some(200.0));
+
+        // 同步「已见代际」：否则首次 pp.frame 的换代入口会先清掉我们伪造的旧行。
+        app.repaint_text_if_atlas_changed();
+        let _ = frame_text(&mut app, window);
+        let width = app
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .text_content_width(node);
+        let current = app.atlas.generation();
+        let stale = {
+            let existing = app
+                .window(window)
+                .expect("窗口存在")
+                .tree()
+                .text_line(node)
+                .expect("行快照")
+                .clone();
+            let mut line = (*existing).clone();
+            line.atlas_generation = current.wrapping_add(1);
+            Rc::new(line)
+        };
+        assert!(
+            app.window_mut(window)
+                .expect("窗口存在")
+                .tree_mut()
+                .set_text_line(node, stale, width, current)
+        );
+
+        let requests = app.frame_requests();
+        let _ = app.frame(window).expect("帧").expect("首帧不报错");
+        {
+            let target = app.window(window).expect("窗口存在");
+            let encoded = target
+                .tree()
+                .lane_of(node)
+                .and_then(|lane| target.scene().lane_primitives(lane))
+                .is_some_and(|primitives| {
+                    primitives
+                        .iter()
+                        .any(|primitive| matches!(primitive, Primitive::GlyphRun(_)))
+                });
+            assert!(!encoded, "旧代际行本帧不得编码 GlyphRun（旧 UV）");
+        }
+        assert!(
+            app.frame_requests() > requests,
+            "硬校验必须请求下一帧补齐（stale_text 处理）"
+        );
+
+        let _ = app.frame(window).expect("帧").expect("补齐帧不报错");
+        let line = app
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .text_line(node)
+            .expect("行快照")
+            .clone();
+        assert_eq!(
+            line.atlas_generation,
+            app.atlas.generation(),
+            "下一帧必须用当前图集代际重光栅"
+        );
+        assert!(
+            line.glyph_runs().any(|run| !run.glyphs.is_empty()),
+            "重光栅后必须真的有字形（不是永久跳过）"
+        );
     }
 }

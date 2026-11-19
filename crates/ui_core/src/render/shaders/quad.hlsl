@@ -60,10 +60,13 @@ float4 ps_main(VsOut input) : SV_Target {
 
     float4 color;
     if (kind == KYTRIX_KIND_GLYPH) {
-        float coverage = glyph_atlas.Sample(atlas_sampler, input.uv).r;
+        // 字形图集恒 1 层（contract §8）：layer 硬编码 0。
+        float coverage = glyph_atlas.Sample(atlas_sampler, float3(input.uv, 0.0)).r;
         color = p.color0 * coverage;
     } else if (kind == KYTRIX_KIND_IMAGE) {
-        color = image_atlas.Sample(atlas_sampler, input.uv) * p.color0;
+        // 图片图集是 texture array：`params1.y` 是图集页（= 层号）索引（整数编码进 f32）。
+        color = image_atlas.Sample(atlas_sampler, float3(input.uv, (float)(uint)p.params1.y))
+                * p.color0;
     } else if (kind == KYTRIX_KIND_SHADOW) {
         // 可分离 2D 高斯（σ = blur / 2）：矩形部分是精确解，角部按圆角半径混合。
         color = p.color0 * analytic_shadow(input.local_px, half_size, p.corner_radius,

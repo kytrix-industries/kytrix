@@ -52,13 +52,18 @@ pub fn render_offscreen(
     let (glyph_page, glyph_pixels) = app.glyph_page_pixels();
     renderer.queue_atlas_upload(
         AtlasKind::Glyph,
+        0,
         glyph_page.0,
         glyph_pixels,
         DirtyRects::full(),
     );
-    if let Some((image_page, image_pixels)) = app.resource_page_pixels() {
+    // 图片图集：多页 texture array（D-9-c）⇒ 逐层整页上传；没有图片页时什么都不传。
+    for (layer, (image_page, image_pixels)) in
+        app.resource_page_pixels_all().into_iter().enumerate()
+    {
         renderer.queue_atlas_upload(
             AtlasKind::Image,
+            layer as u16,
             image_page.0,
             image_pixels.to_vec(),
             DirtyRects::full(),

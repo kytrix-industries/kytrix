@@ -8,9 +8,6 @@
 #define KYTRIX_KIND_IMAGE 2u
 #define KYTRIX_KIND_SHADOW 3u
 
-#define KYTRIX_TEXTURE_GLYPH 0u
-#define KYTRIX_TEXTURE_IMAGE 1u
-
 #define KYTRIX_GRADIENT_NONE 0u
 #define KYTRIX_GRADIENT_HORIZONTAL 1u
 #define KYTRIX_GRADIENT_VERTICAL 2u
@@ -67,8 +64,10 @@ struct GpuPrimitive {
 layout(std430, set = 0, binding = 0) readonly buffer Instances { GpuPrimitive instances[]; };
 layout(std430, set = 0, binding = 1) readonly buffer Clips { ClipEntry clips[]; };
 layout(push_constant) uniform RootPush { FrameUniform frame; GeometryDrawUniform draw; } root;
-layout(set = 0, binding = 4) uniform sampler2D glyph_atlas;
-layout(set = 0, binding = 5) uniform sampler2D image_atlas;
+// 图集是 texture array（D-9）：字形恒 1 层、图片 MAX_IMAGE_PAGES 层；采样层号由
+// `params1.y`（图集页索引）给出，字形恒 0。见 contract.md §7/§8。
+layout(set = 0, binding = 4) uniform sampler2DArray glyph_atlas;
+layout(set = 0, binding = 5) uniform sampler2DArray image_atlas;
 
 // GLSL 没有 lerp / saturate：提供同名包装，保证函数体与 HLSL 逐行一致。
 float saturate(float x) { return clamp(x, 0.0, 1.0); }

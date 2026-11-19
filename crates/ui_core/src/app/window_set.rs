@@ -268,6 +268,9 @@ pub(crate) fn close_window(app: &mut App, id: WindowId) -> bool {
     let Some(window) = app.windows.remove(&id) else {
         return false;
     };
+    // 窗口没了，它名下（`insert_owned`）的图片引用也必须归还：tile 恒有效契约的对偶面。
+    // 放在窗口移除**之后**，重复 close（窗口已不存在）会提前 return false，不会误释放。
+    app.resources.release_window(id);
     // 关窗是冷路径：一次 DFS 收集句柄（不再有全序数组可借）。
     let nodes = window.tree().dfs_ids();
     for node in nodes {

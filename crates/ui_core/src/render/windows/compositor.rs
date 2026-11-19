@@ -607,11 +607,12 @@ impl GpuRenderer {
     pub(crate) fn queue_atlas_upload(
         &mut self,
         kind: AtlasKind,
-        page: u32,
+        layer: u16,
+        extent: u32,
         pixels: Vec<u8>,
         rects: crate::render::atlas::DirtyRects,
     ) {
-        upload::queue_atlas_upload(self, kind, page, pixels, rects)
+        upload::queue_atlas_upload(self, kind, layer, extent, pixels, rects)
     }
 
     /// 该图集是否有一笔上传已入队、还没被命令列表消费（离屏目标的空闲判据）。

@@ -57,7 +57,7 @@ use crate::{
     },
     platform::dispatcher::{Dispatcher, UserTask},
     render::{AtlasAllocator, MIN_ATLAS_PAGE},
-    resources::ResourceCache,
+    resources::{DecodeState, PendingResource, ResourceCache},
     text::{
         FontStack, FontStackStatus, TextDiagnostic, TextLayoutReport, TextPassReport,
         atlas::GlyphAtlas, context::TextContext, raster::GlyphRasterizer,
@@ -114,6 +114,10 @@ pub struct App {
     atlas: AtlasAllocator,
     /// 图片资源缓存（解码 + 图片图集页；与字形页分图集，且**不随 DPI 换代**，P13 §8.1）。
     resources: ResourceCache,
+    /// 异步解码已交付、等待应用取走的结果（D-6）。`App::poll_resources` 每轮填充；
+    /// 应用在 `on_frame` 钩子里用 [App::take_resource_results] 消费（把 Ready tile 换到节点 /
+    /// Failed 画占位）。缓冲只由 UI 线程读写，取走时 `mem::take` 换空（容量归还）。
+    pending_resource_results: Vec<(PendingResource, DecodeState)>,
     /// 静态几何的注册表（进程级；设备无关的 CPU 字节，各后端自缓存 GPU 缓冲）。
     geometry: crate::paint::geometry_store::GeometryStore,
     /// 字形 `key → tile` 缓存（与图集同事务换代）。
@@ -398,6 +402,10 @@ impl App {
     /// 也不做 `Handle::current()`（在 runtime 之外会 panic，且会让引擎依赖「调用线程恰好在 runtime 内」）。
     #[must_use]
     pub fn new(runtime: tokio::runtime::Handle) -> Self {
+        // D-6：`ResourceCache` 需要同一个 `Dispatcher` 在解码完成时唤醒泵（空闲时泵阻塞在
+        // `GetMessageW`/`poll`，没有唤醒就永远不会有人调 `poll()`）。字段顺序要求它先于
+        // `resources` 构造，因此提到结构体字面量之前。
+        let dispatcher = Dispatcher::new();
         Self {
             store: StateStore::with_capacity(64, 16),
             graph: DependencyGraph::new(),
@@ -412,7 +420,8 @@ impl App {
                 crate::paint::atlas::AtlasKind::Glyph,
                 (MIN_ATLAS_PAGE, MIN_ATLAS_PAGE),
             ),
-            resources: ResourceCache::new(runtime),
+            resources: ResourceCache::new(runtime, Arc::clone(&dispatcher)),
+            pending_resource_results: Vec::new(),
             geometry: crate::paint::geometry_store::GeometryStore::new(),
             glyph_atlas: GlyphAtlas::new(),
             text_dirty_scratch: Vec::new(),
@@ -423,7 +432,7 @@ impl App {
             glyph_page_extent: None,
             glyph_page: Vec::new(),
             packed: Vec::new(),
-            dispatcher: Dispatcher::new(),
+            dispatcher,
             events: event_queue::EventQueue::new(),
             held_keys: ahash::HashMap::default(),
             frame_hook: None,
@@ -462,8 +471,29 @@ impl App {
     }
 
     /// 调用一次帧钩子（crate 私有；临时 take 以避免 `&mut self` 与闭包参数重叠）。
+    ///
+    /// D-6 起钩子之前先轮询一次异步解码结果（`App::poll_resources`）：平台泵每轮都会调用本函数，
+    /// 因此解码完成（工作线程已 `Dispatcher::wake`）后，结果会在这一轮交付并请求一帧。
     pub(crate) fn run_frame_hook(&mut self) {
         resources::run_frame_hook(self)
+    }
+
+    /// 轮询图片异步解码结果并请求一帧（D-6）。
+    ///
+    /// 交付项进入 [`App::take_resource_results`] 的缓冲；有交付才 `request_frame`（空闲
+    /// 无 pending 时不产生帧，I3 不变式保持）。平台泵的 `run_frame_hook` 每轮调用一次；
+    /// `App::frame` 入口也兜底调用（headless / 自驱帧宿主）。
+    pub(crate) fn poll_resources(&mut self) {
+        resources::poll_resources(self)
+    }
+
+    /// 取走已交付的异步解码结果（D-6 的公开消费面）。
+    ///
+    /// 应用在 `on_frame` 钩子里取走并把 `Ready(ResourceImage)` 应用到节点（例如
+    /// `Window::set_canvas`）或对 `Failed(DecodeCause)` 画占位/记录；每项只交付一次。
+    /// 任务仍在途时返回空列表（稍后的轮次再交付）。
+    pub fn take_resource_results(&mut self) -> Vec<(PendingResource, DecodeState)> {
+        resources::take_resource_results(self)
     }
 
     /// 跨线程句柄（`AppHandle`）。
@@ -538,7 +568,8 @@ impl App {
         text_pass::upload_glyph_page(self)
     }
 
-    /// 图片页分发：懒分配（没插过图片就没有页）+ 按脏矩形（AOI）增量（DEVIATIONS F-211 / R06-3）。
+    /// 图片图集分发：懒分配（没插过图片就没有页）+ 逐层整页 / 按脏矩形（AOI）增量
+    /// （DEVIATIONS F-211 / R06-3；D-9-c 起图片图集是 4 层 texture array，layer = 页号）。
     fn upload_image_page(&mut self) {
         text_pass::upload_image_page(self)
     }
@@ -549,10 +580,11 @@ impl App {
         text_pass::glyph_page_pixels(self)
     }
 
-    /// 图片页的当前内容（BGRA8 预乘 sRGB；`TestApp::snapshot` 的上传源）；没插过图片时 `None`。
+    /// 全部已打开图片页的当前内容（BGRA8 预乘 sRGB；`TestApp::snapshot` 的逐层上传源）。
+    /// 没有图片页时是空集；顺序 = 层号升序。
     #[cfg(feature = "test-support")]
-    pub(crate) fn resource_page_pixels(&self) -> Option<((u32, u32), &[u8])> {
-        text_pass::resource_page_pixels(self)
+    pub(crate) fn resource_page_pixels_all(&self) -> Vec<((u32, u32), &[u8])> {
+        text_pass::resource_page_pixels_all(self)
     }
 
     /// 图片资源缓存（只读）。应用层在**建树时**用 [`App::resources_mut`] 换 `AtlasTile`。

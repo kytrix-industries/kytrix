@@ -58,10 +58,13 @@ impl Readback {
             size,
             DXGI_FORMAT_B8G8R8A8_UNORM,
             D3D12_RESOURCE_STATE_RENDER_TARGET,
+            0,
         )
     }
 
     /// 指定源资源的出入状态（图集等非 RT 资源用）。
+    ///
+    /// `layer` 是 texture array 的子资源层号（mip 0；非数组纹理传 0）。
     pub(crate) fn capture_from(
         &mut self,
         shared: &SharedGpu,
@@ -70,6 +73,7 @@ impl Readback {
         size: (u32, u32),
         format: DXGI_FORMAT,
         resident: D3D12_RESOURCE_STATES,
+        layer: u16,
     ) -> Result<ReadbackImage, EngineError> {
         if self.buffer.is_none() || self.size != size {
             self.recreate(shared, size, format)?;
@@ -102,7 +106,8 @@ impl Readback {
                 pResource: core::mem::ManuallyDrop::new(Some(source.clone())),
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    SubresourceIndex: 0,
+                    // texture array 的 mip0 子资源下标 = 层号（MipLevels = 1）。
+                    SubresourceIndex: u32::from(layer),
                 },
             };
             // 显式给源盒：源资源可能比要读回的矩形大（窗口路径的持久目标按桶尺寸分配，

@@ -886,12 +886,14 @@ impl GpuRenderer {
     /// 图集上传入口（P09 的字形页与 P15 的图片页共用）。
     ///
     /// `pixels` 按**所有权**移动进来（[`AtlasUploads`] 的待上传槽直接持有它），避免槽 → 纹理
-    /// 之间再复制一次整页（2048² 的图片页是 16 MiB）。入队时同时记录**当前共享页**
+    /// 之间再复制一次整页（2048² 的图片页是 16 MiB）。`layer` 是图集 texture array 的层号
+    /// （字形恒 0、图片 = 图集页索引），`extent` 是该层的页边长；入队时同时记录**当前共享页**
     /// （`SharedGpu::atlas_page`），供录制前区分「App 换代的新页」与「已被别人换代的旧页」。
     pub(crate) fn queue_atlas_upload(
         &mut self,
         kind: AtlasKind,
-        page: u32,
+        layer: u16,
+        extent: u32,
         pixels: Vec<u8>,
         rects: crate::render::atlas::DirtyRects,
     ) {
@@ -901,7 +903,7 @@ impl GpuRenderer {
         );
         let queued_page = self.shared.atlas_page(kind);
         self.atlas_uploads
-            .queue_upload(kind, page, queued_page, pixels, rects);
+            .queue_upload(kind, layer, extent, queued_page, pixels, rects);
     }
 
     /// 该图集是否有一笔上传已入队、还没被命令缓冲消费（离屏目标的空闲判据）。
@@ -3174,7 +3176,13 @@ mod tests {
             )
             .expect("renderer");
             let rects = DirtyRects::full();
-            renderer.queue_atlas_upload(AtlasKind::Glyph, 64, vec![0u8; (64 * 64) as usize], rects);
+            renderer.queue_atlas_upload(
+                AtlasKind::Glyph,
+                0,
+                64,
+                vec![0u8; (64 * 64) as usize],
+                rects,
+            );
             let mut frame = FramePlan::new(Plan::Full, true);
             let mut timings = FrameTimings::new();
             renderer
@@ -3267,7 +3275,7 @@ mod tests {
                 // 两个线程同时往**同一张共享图集纹理**整页上传相同内容：页重建是进程级串行
                 // 事件（写锁 + 有界队列 idle），上传屏障序列在同一队列上不会交错。
                 let rects = crate::render::DirtyRects::full();
-                renderer.queue_atlas_upload(AtlasKind::Glyph, 64, vec![0x40u8; 64 * 64], rects);
+                renderer.queue_atlas_upload(AtlasKind::Glyph, 0, 64, vec![0x40u8; 64 * 64], rects);
                 let scene = red_quad_scene();
                 let mut encoder = InstanceEncoder::new();
                 let buffer = encoder

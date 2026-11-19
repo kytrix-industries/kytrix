@@ -90,6 +90,9 @@ pub(crate) fn frame(
     }
     // R02-5：把未消费的事件在交给 `on_frame` 钩子之后再兜底有界化一次（正常推入就已经有界，
     // 这里是 O(1) 的防御；钩子可能持有上一轮的事件引用做重放，所以裁剪放在帧入口）。
+    // D-6：帧入口兜底轮询一次异步解码结果（`run_frame_hook` 的正常路径已在泵里轮询；
+    // headless / 自驱帧宿主没有泵钩子，若这一帧前恰好有解码完成，这里交付并置出帧请求）。
+    app.poll_resources();
     app.events.trim();
     #[cfg(feature = "hud")]
     app.prepare_debug_hud(window);
@@ -214,6 +217,8 @@ pub(crate) fn frame(
     }
     // 图集页上传（P13：逐窗口分发，两张页分开、顺序固定以便帧记录复现）。
     app.upload_atlas_pages();
+    // D-5：图集代际在本帧 paint 之前取一次（`paint_frame` 的绘制前硬校验用）。
+    let atlas_generation = app.atlas.generation();
     // 借用拆分：`windows` 与 `geometry` 是不同字段，可同时借出（几何表只读）。
     // 先取结果、结束后再处理错误 —— 解构 `self` 期间不能再调 `self.abort_frame`。
     let painted = {
@@ -222,9 +227,9 @@ pub(crate) fn frame(
         } = app;
         windows
             .get_mut(&window)
-            .map(|target| target.paint_frame(geometry))
+            .map(|target| target.paint_frame(geometry, Some(atlas_generation)))
     };
-    let paint = match painted {
+    let mut paint = match painted {
         Some(Ok(report)) => report,
         Some(Err(error)) => {
             app.abort_frame(window, ticket);
@@ -282,6 +287,8 @@ pub(crate) fn frame(
         app.abort_frame(window, ticket);
         return None;
     };
+    // D-5：绘制前硬校验跳过的旧代际文本行先取出来（commit_frame 会消费 paint）。
+    let stale_text = core::mem::take(&mut paint.stale_text);
     let outcome = target.commit_frame(ticket, paint);
     // HUD 是纯观察者：提交成功后只清掉已经落进 paint 的待写文本（没有帧就保持上一次文本）。
     #[cfg(feature = "hud")]
@@ -290,18 +297,37 @@ pub(crate) fn frame(
     {
         debug_hud::finish_frame(state);
     }
+    // D-5：图集换代硬校验的补齐入口。被跳过的行本帧**没有编码旧 UV**；提交后逐节点重新入队，
+    // 下一帧的 layout_text 用当前代际重光栅（laid_generation 失配 ⇒ 不命中复用）。
+    if !stale_text.is_empty() {
+        if let Some(target) = app.windows.get_mut(&window) {
+            let tree = target.tree_mut();
+            for node in stale_text {
+                // 清 line + 置 laid_* 失配 + mark_paint：只 mark 脏位不够——若槽里的
+                // laid_generation 恰好等于当前代际，layout_text 的复用判据仍会命中旧行。
+                tree.invalidate_text_line(node);
+            }
+        }
+        app.request_frame();
+    }
     // 图集行/整页没赶上本帧（窗口的共享槽还在消费上一笔）：这一帧会以旧图集呈现，因此
     // 立刻再要一帧（全量 damage），槽空后把内容补发——否则静态窗口会把缺字的画面一直
     // 留着。槽长期不空（GPU 卡住 / 窗口不再出帧）时最多补 `MAX_ATLAS_FOLLOWUPS` 帧，不空转。
     let glyph_extent = app.atlas.page().0;
-    let image_extent = app.resources.page_pixels().map(|(page, _)| page.0);
+    // 图片图集是多页 texture array（D-9-c）：除 extent 之外，每层是否已整层初始化也必须对齐，
+    // 否则新页 / 新窗口会采样到未定义层（表现为整块花图而不是「旧图集」）。
+    let image_pages = app.resources.page_count();
+    let image_extent = (image_pages > 0).then(|| app.resources.page_extent());
+    let image_layers = image_pages as u16;
     let deferred = app.windows.get(&window).is_some_and(|target| {
         use crate::paint::atlas::AtlasKind;
         target.has_renderer()
             && (target.atlas_rects_pending()
                 || !target.atlas_page_matches(AtlasKind::Glyph, glyph_extent)
-                || image_extent
-                    .is_some_and(|extent| !target.atlas_page_matches(AtlasKind::Image, extent)))
+                || image_extent.is_some_and(|extent| {
+                    !target.atlas_page_matches(AtlasKind::Image, extent)
+                        || (0..image_layers).any(|layer| !target.image_layer_received(layer))
+                }))
     });
     if deferred {
         let retry = app

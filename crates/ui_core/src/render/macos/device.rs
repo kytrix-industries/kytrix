@@ -1,7 +1,8 @@
 //! `MTLDevice` 的创建、D8 采集与资源句柄表。
 //!
 //! D8 硬基线：**`MTLCreateSystemDefaultDevice` 非空 + `argumentBuffersSupport == Tier2`**。
-//! v1 不建 argument buffer（F-119），但 Tier2 仍是产品基线（主设计 §2.2）与未来多页图集的门。
+//! v1 不建 argument buffer（F-119），但 Tier2 仍是产品基线（主设计 §2.2）与多页图集
+//! （texture array，D-9-c）的门。
 
 use std::path::PathBuf;
 
