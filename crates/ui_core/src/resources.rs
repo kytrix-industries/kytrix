@@ -25,7 +25,8 @@
 //!
 //! 源图峰值约束在 `resources::image`：像素数上限 `MAX_SOURCE_PIXELS`（16 M px，取代单纯的
 //! 单边 8192）+ 显式 `image::Limits`（`max_alloc` 256 MiB；命中 → [`DecodeCause::OutOfMemory`]）。
-//! 准入用 [`image::estimate_peak`]（像素数 × 8 B + 16 MiB 余量，≤ `MAX_DECODE_ALLOC`）：
+//! 准入用 [`image::estimate_peak`]（像素数 × 12 B + 16 MiB 余量，≤ `MAX_DECODE_ALLOC`；12 B/px
+//! 含 ICC 转换 dst，D-8）：
 //! `图片页 + 存活的源字节 + 在途解码预留 + 本次估算 + 本次源字节 > 预算` ⇒ 立即
 //! [`DecodeCause::Capacity`]（[`CapacityCause::ByteBudget`]），**不投递**、不占解码线程。
 //! 在途预留从准入一直保持到 [`ResourceCache::poll`] 交付（成功/失败都归还）——完成但未交付的
@@ -42,6 +43,14 @@
 //!   [`DecodeCause::Capacity`]（[`CapacityCause::ByteBudget`]）。超预算时**不会**静默淘汰仍在
 //!   引用的 tile；空闲条目在 `unload` / `release_window` 里即时回收。`ResourceCache::stats` 是
 //!   唯一的可观测面。
+//!
+//! # 色彩管理（D-8）
+//!
+//! 带 ICC profile 的资产在解码线程转换到 sRGB（实现与降级策略见 [`image`] 模块文档：sRGB profile
+//! 与无 profile 逐字节一致、不可用 profile 按 sRGB 降级、只做 8-bit ICC、不做 gAMA/cHRM）。
+//! [`ResourceStats::color_converted`] / [`ResourceStats::color_fallback`] 按**解码次数**累计
+//! （内容去重命中不重新解码、也不重复计数），是 HUD / 产品告警面；转换不改变缓存 key
+//! （仍是源字节），同一内容的转换结果自然只算一次。
 //!
 //! # 应用层接线（现状）
 //!
@@ -70,7 +79,7 @@ use crate::{
     render::{AtlasAllocator, DirtyRects},
     resources::{
         cache::{ContentKey, DedupeEntry, Entry, Page},
-        image::DecodedImage,
+        image::{DecodedImage, SourceColor},
     },
     window::WindowId,
 };
@@ -80,11 +89,12 @@ mod image;
 
 /// 默认字节预算：图片页（16 MiB）+ 去重表保留的源字节 + 在途解码预留。
 ///
-/// 源字节是去重的代价（memcmp 需要原始缓冲）；图标 / logo 的压缩字节通常只有几十 KiB，
-/// 256 MiB 的预算让「5000 行 × 不同图标」这种工作集也不会误报 [`DecodeCause::Capacity`]。
-/// 单张合法最大图（16 M px、编码后 ≤ 64 MiB 字节）的准入估算 = 144 MiB 估算 + 64 MiB 源字节，
-/// 加上 16 MiB 图片页仍 ≤ 256 MiB —— 预算不会拒绝单张合法图，只拒绝**并发**的大图。
-const DEFAULT_BYTE_BUDGET: u64 = 256 * 1024 * 1024;
+/// 源字节是去重的代价（memcmp 需要原始缓冲）；图标 / logo 的压缩字节通常只有几十 KiB。
+/// 单张合法最大图（16 M px、编码后 ≤ 64 MiB 字节）的准入估算 = 12 B/px × 16 M px = 208 MiB
+/// （D-8 起含 ICC 转换 dst）+ 64 MiB 源字节 + 16 MiB 图片页 = 288 MiB，再留 32 MiB 余量 ⇒
+/// 320 MiB：预算不会拒绝单张合法图，只拒绝**并发**的大图；「5000 行 × 不同图标」这类工作集也
+/// 远达不到预算。ICC 转换不会让预算口径失真（转换 dst 只在解码峰值内、不常驻）。
+const DEFAULT_BYTE_BUDGET: u64 = 320 * 1024 * 1024;
 
 /// 同时进行的图片解码数上限（`insert_async` 的 blocking 并发）。
 ///
@@ -353,6 +363,11 @@ pub struct ResourceStats {
     pub page_occupancy: f32,
     /// 累计 [`DecodeCause::Capacity`] 失败次数（页满 / 预算不足的告警面）。
     pub capacity_errors: u64,
+    /// 累计「ICC → sRGB」转换的解码次数（D-8；内容去重命中不重复计）。
+    pub color_converted: u64,
+    /// 累计「带 ICC 但无法使用、按 sRGB 降级」的解码次数（D-8；损坏 / 不支持 / 超大 / 读取失败；
+    /// 内容去重命中不重复计）。产品可据此告警「资产色彩配置有问题」。
+    pub color_fallback: u64,
 }
 
 /// 图片资源缓存：字节 → 解码 → 图片图集 tile + 页缓冲。
@@ -389,6 +404,10 @@ pub struct ResourceCache {
     byte_budget: u64,
     /// 累计 `Capacity` 失败次数。
     capacity_errors: u64,
+    /// 累计「ICC → sRGB」转换解码次数（D-8 诊断面）。
+    color_converted: u64,
+    /// 累计「ICC 无法使用 → sRGB 降级」解码次数（D-8 诊断面）。
+    color_fallback: u64,
     /// 仅测试：已真正开始解码的 blocking 任务数（证明准入拒绝**没有投递**）。
     #[cfg(test)]
     decode_starts: Arc<std::sync::atomic::AtomicUsize>,
@@ -444,6 +463,8 @@ impl ResourceCache {
             epoch: 0,
             byte_budget: DEFAULT_BYTE_BUDGET,
             capacity_errors: 0,
+            color_converted: 0,
+            color_fallback: 0,
             #[cfg(test)]
             decode_starts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
@@ -753,9 +774,20 @@ impl ResourceCache {
         source: Bytes,
         decoded: DecodedImage,
     ) -> Result<ResourceImage, DecodeCause> {
+        let color = decoded.color;
         let key = ContentKey::new(&source);
         self.ensure_page();
         let image = self.place(decoded, key)?;
+        // D-8 诊断面：ICC 处理结果按**解码次数**累计（去重命中不重新解码、也不重复计数）。
+        match color {
+            SourceColor::Srgb => {}
+            SourceColor::Converted => {
+                self.color_converted = self.color_converted.saturating_add(1);
+            }
+            SourceColor::AssumedSrgb => {
+                self.color_fallback = self.color_fallback.saturating_add(1);
+            }
+        }
         self.source_bytes = self.source_bytes.saturating_add(source.len() as u64);
         if let Some(replaced) = self.dedupe.insert(
             key,
@@ -916,6 +948,8 @@ impl ResourceCache {
                 self.used_pixels as f32 / page_pixels as f32
             },
             capacity_errors: self.capacity_errors,
+            color_converted: self.color_converted,
+            color_fallback: self.color_fallback,
         }
     }
 
@@ -1557,6 +1591,8 @@ mod tests {
                 used_bytes: 16 * 16 * 4,
                 page_occupancy: 0.0,
                 capacity_errors: 0,
+                color_converted: 0,
+                color_fallback: 0,
             }
         );
 
@@ -1574,6 +1610,62 @@ mod tests {
         assert_eq!(stats.used_pixels, 0);
         assert_eq!(stats.used_bytes, 16 * 16 * 4, "图片页本身不释放");
         assert_eq!(stats.page_occupancy, 0.0);
+    }
+
+    /// 页内某条资源内容区的第一个像素（由 tile 的归一化 UV 反推页内偏移）。
+    fn content_pixel(cache: &ResourceCache, image: ResourceImage) -> [u8; 4] {
+        let ((page_width, page_height), pixels) = cache.page_pixels().expect("page");
+        let origin_x = (image.tile.u0 * page_width as f32).round() as usize;
+        let origin_y = (image.tile.v0 * page_height as f32).round() as usize;
+        let offset = (origin_y * page_width as usize + origin_x) * 4;
+        pixels[offset..offset + 4].try_into().expect("4 bytes")
+    }
+
+    /// D-8：坏 ICC ⇒ 解码成功（不让插入失败）、像素 == 无 profile 路径、
+    /// `stats.color_fallback` 计数。
+    #[test]
+    fn decode_invalid_icc_falls_back_to_srgb_and_counts() {
+        use super::image::test_png;
+
+        let mut cache = ResourceCache::with_page_for_test((64, 64));
+        let pixels = [12u8, 34, 56, 128];
+        let plain = test_png(1, 1, &pixels, None, None);
+        let broken = test_png(1, 1, &pixels, Some(b"broken icc"), None);
+        assert_eq!(cache.stats().color_fallback, 0);
+
+        let plain_image = cache.insert(&plain).expect("无 profile 的资产");
+        let broken_image = cache.insert(&broken).expect("坏 ICC 不得使插入失败");
+        let stats = cache.stats();
+        assert_eq!(stats.color_fallback, 1, "坏 ICC 必须计入降级计数");
+        assert_eq!(stats.color_converted, 0);
+        assert_eq!(stats.entries, 2);
+        assert_eq!(
+            content_pixel(&cache, broken_image),
+            content_pixel(&cache, plain_image),
+            "降级路径的像素必须等于无 profile 路径"
+        );
+    }
+
+    /// D-8 诊断面：ICC 转换按**解码次数**累计（去重命中不重新解码、不重复计数）。
+    #[test]
+    fn icc_conversion_is_counted_once_per_decode() {
+        use super::image::test_png;
+
+        let mut cache = ResourceCache::with_page_for_test((64, 64));
+        let p3 = moxcms::ColorProfile::new_display_p3()
+            .encode()
+            .expect("encode display p3");
+        // sRGB 红的 P3 编码（解码后应变为 sRGB 红）。
+        let tagged = test_png(1, 1, &[234, 51, 35, 255], Some(&p3), None);
+        cache.insert(&tagged).expect("第一次插入解码并转换");
+        cache.insert(&tagged).expect("同字节再去重命中，不重新解码");
+        let stats = cache.stats();
+        assert_eq!(
+            stats.color_converted, 1,
+            "去重命中不重新解码，也就不得重复计数"
+        );
+        assert_eq!(stats.color_fallback, 0);
+        assert_eq!(stats.entries, 1);
     }
 
     /// D-11：预算准入在**投递之前**拒绝，不占解码线程、不留预留。

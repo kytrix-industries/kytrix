@@ -118,6 +118,9 @@ kytrix_proto = { git = "https://github.com/kytrix-industries/kytrix_proto", rev 
 llama_sys = { path = "crates/llama_sys" }
 log = "0.4.35"
 longbridge-proto = "5.3.0"
+# P13 图片色彩管理（D-8）：image 0.25.10 的**非可选**依赖（`Cargo.lock` 已在 0.8.1），
+# 这里只是把它提到直接依赖；不引入新的编译单元。
+moxcms = "0.8.1"
 nucleo = "0.5.0"
 objc2 = { version = "0.6.5", features = ["std"] }
 objc2-app-kit = { version = "0.3.2", features = [

@@ -1,21 +1,36 @@
-//! 图片解码：字节 → **线性空间预乘 → sRGB 重编码**的 `BGRA8`（P13 §6）。
+//! 图片解码：字节 → **色彩管理 → 线性空间预乘 → sRGB 重编码**的 `BGRA8`（P13 §6，D-8）。
 //!
 //! 图集字节语义由 `render/shaders/contract.md` §8 冻结（纹素是 linear-premultiplied 后 sRGB 编码），
-//! 本模块就是它的 CPU 侧实现。四条约束：
+//! 本模块就是它的 CPU 侧实现。五条约束：
 //!
 //! 1. 只接受 PNG / JPEG / WebP（`image::guess_format` 与 feature 无关，所以必须**策略性**拒绝其它格式）；
-//! 2. 色彩管理不在本模块（ICC 由后续任务接入）：资产必须**已经是 sRGB 编码**；
-//! 3. EXIF orientation 在缩放 / 转 RGBA / 预乘**之前**应用到像素（`ImageDecoder::orientation` +
+//! 2. 色彩管理（D-8）：带 ICC profile 的资产在解码期用 `moxcms` 转换到 sRGB（引擎 RT 是 sRGB 编码，
+//!    合成假设 sRGB；`paint/color.rs` 的 DisplayP3 只用于主题纯色，图片管线没有宽色域通道）。
+//!    只做 **8-bit ICC → sRGB**；**不做 gAMA / cHRM**（`image` 0.25.10 没有 cHRM 访问器，gAMA 只有
+//!    `PngDecoder::gamma_value()` 这个 inherent 方法，`into_decoder()` 拿不到；见阶段 1 审计 D-8 决策 3）；
+//! 3. EXIF orientation 在缩放 / 转 RGBA / ICC / 预乘**之前**应用到像素（`ImageDecoder::orientation` +
 //!    `DynamicImage::apply_orientation`）；cache key 仍是源字节，方向不进键；
-//! 4. 大图在解码后按 `MAX_TILE_DIM` 等比缩小（编码域 `Triangle`，与浏览器一致），不做线性空间重采样。
+//! 4. 大图在解码后按 `MAX_TILE_DIM` 等比缩小（编码域 `Triangle`，与浏览器一致），不做线性空间重采样；
+//! 5. 像素顺序固定为：元数据 → 解码 → orientation → 缩放 → `to_rgba8` → ICC → 预乘。
 //!
 //! 解码流程（[`decode`]）固定为：`format_of` → `into_decoder()` → `dimensions` +
-//! [`check_source_size`] → 元数据（orientation；ICC **也在这个位置**读取，见下面的注释）→
-//! `Limits::reserve(decoder.total_bytes())` + `set_limits` → `DynamicImage::from_decoder` →
-//! `apply_orientation` → 缩放 → `to_rgba8` → 预乘。`reserve` 是复刻 `ImageReader::decode` 的
-//! 「整图分配」预检：走 `into_decoder` 而漏掉它，[`MAX_DECODE_ALLOC`] 就只剩解码器中间缓冲有意义。
+//! [`check_source_size`] → 元数据（orientation + ICC，**必须先于** `from_decoder`：解码器一旦被消耗，
+//! 就再没有 `icc_profile()` 的机会）→ `Limits::reserve(decoder.total_bytes())` + `set_limits` →
+//! `DynamicImage::from_decoder` → `apply_orientation` → 缩放 → `to_rgba8` → **ICC 转换到 sRGB** → 预乘。
+//! `reserve` 是复刻 `ImageReader::decode` 的「整图分配」预检：走 `into_decoder` 而漏掉它，
+//! [`MAX_DECODE_ALLOC`] 就只剩解码器中间缓冲有意义。
 //!
-//! 分配失败：本模块自己的预乘缓冲走 `try_reserve_exact` ⇒ [`DecodeCause::OutOfMemory`]；
+//! ICC 策略（[`convert_icc_to_srgb`]）：
+//!
+//! - **无 ICC** ⇒ 现状路径，逐字节不变（性能护栏：不分配、不拷贝）；
+//! - **可解析且是 sRGB**（primaries + white point + TRC 数值近似，[`is_srgb_profile`]）⇒ **短路**，
+//!   逐字节不变。不能依赖「sRGB→sRGB transform 恒等」：8-bit 定点管线有量化抖动；
+//! - **可解析的非 sRGB profile** ⇒ `create_transform_8bit(Rgba → sRGB)` 在 `to_rgba8()` 的 RGBA8 上
+//!   转换一次（src/dst 分离，dst 走 `try_reserve_exact`）；转换失败也按 sRGB 降级（**不**让整图失败）；
+//! - **解析失败 / 不支持（Gray/CMYK/DeviceLink…）/ 超过 [`ICC_PROFILE_LIMIT`] / 读取失败** ⇒ 按 sRGB
+//!   继续（像素 = 无 profile 路径），由 [`SourceColor::AssumedSrgb`] 计数（诊断面）。
+//!
+//! 分配失败：本模块自己的预乘 / ICC dst 缓冲走 `try_reserve_exact` ⇒ [`DecodeCause::OutOfMemory`]；
 //! `image` 内部缓冲仍是 `vec!`（分配失败 = abort），预算准入（[`estimate_peak`] + `ResourceCache`
 //! 的 byte budget）把单张峰值压在 [`MAX_DECODE_ALLOC`] 内，残余 abort 风险只留给绕过预算的调用方。
 //!
@@ -29,6 +44,7 @@ use image::{
     DynamicImage, ImageDecoder, ImageError, ImageFormat, ImageReader, error::LimitErrorKind,
     imageops::FilterType,
 };
+use moxcms::{ColorProfile, DataColorSpace, Layout, TransformOptions, Xyzd};
 use smol_str::{SmolStr, format_smolstr};
 
 use crate::resources::DecodeCause;
@@ -59,12 +75,45 @@ pub(crate) const MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 /// 命中时映射成 [`DecodeCause::OutOfMemory`]。
 pub(crate) const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
 
-/// 解码峰值估算的每像素字节数：RGBA16 是 `image` 0.25 能产出的最宽输出类型（8 B/px）。
-const DECODE_PEAK_BYTES_PER_PIXEL: u64 = 8;
+/// 解码峰值估算的每像素字节数：RGBA16 中间图（8 B/px，`image` 0.25 能产出的最宽输出类型）
+/// + `to_rgba8()` 的 RGBA8（4 B/px）+ ICC 转换的 dst RGBA8（4 B/px，与 `rgba` 同时存活）。
+///
+/// 12 B/px 是「转换路径」的上界；无 ICC 的资产实际峰值更低，但准入对每张图按统一上界估算
+/// （预算宁可保守，不做按 profile 的二次探测——那要在 UI 线程解析 ICC，D-11 明确不这样做）。
+const DECODE_PEAK_BYTES_PER_PIXEL: u64 = 12;
 
 /// 解码峰值估算的固定余量：缩放中间图 + `to_rgba8()` + 预乘输出（各在 `MAX_TILE_DIM²`
 /// 档位内 ≤ 16 MiB，合取一个 16 MiB 的保守余量）。
 const DECODE_PEAK_MARGIN: u64 = 16 * 1024 * 1024;
+
+/// 接受的 ICC profile 字节上限。sRGB / Display P3 / AdobeRGB 的 profile 都是几 KiB；
+/// 4 MiB 远高于图片资产的合理需求，只用来拦「塞满 ancillary chunk 的 profile 炸弹」——
+/// 超过上限按「无法使用」降级到 sRGB 并计数（不使解码失败）。
+pub(crate) const ICC_PROFILE_LIMIT: usize = 4 * 1024 * 1024;
+
+/// 像素的色彩来源分类（D-8；诊断面，`DecodedImage` 内部字段，不公开）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SourceColor {
+    /// 无 ICC，或 ICC 判定为 sRGB：像素**未做任何转换**（与无 profile 资产逐字节一致）。
+    Srgb,
+    /// 可解析的非 sRGB profile：像素已由 ICC 转换到 sRGB。
+    Converted,
+    /// 带 ICC 但无法使用（解析失败 / 不支持 / 超大 / 读取失败）：按 sRGB 使用，
+    /// 像素 == 无 profile 路径（[`ResourceStats::color_fallback`] 计数）。
+    ///
+    /// [`ResourceStats::color_fallback`]: crate::resources::ResourceStats::color_fallback
+    AssumedSrgb,
+}
+
+/// ICC 元数据的读取结果（读取发生在解码像素之前，见模块文档）。
+enum SourceIcc {
+    /// 解码器没有 ICC profile。
+    Absent,
+    /// 读到了 profile 字节；能否使用由 [`convert_icc_to_srgb`] 判定。
+    Present(Vec<u8>),
+    /// 解码器读取 ICC 元数据失败：按「带 profile 但无法解析」降级（不使整图失败）。
+    Unreadable,
+}
 
 /// 解码结果：**预乘 sRGB 编码**的 BGRA8（行主序，行宽 `width * 4`）。
 pub(crate) struct DecodedImage {
@@ -74,21 +123,24 @@ pub(crate) struct DecodedImage {
     pub height: u32,
     /// `width * height * 4` 字节，BGR(A) 顺序。
     pub bgra: Vec<u8>,
+    /// 像素的色彩来源（ICC 转换 / sRGB / 降级），`ResourceStats` 的诊断计数来源。
+    pub color: SourceColor,
 }
 
-/// 字节 → BGRA8 预乘 sRGB。
+/// 字节 → BGRA8 预乘 sRGB（含 ICC → sRGB 色彩管理，D-8）。
 ///
 /// 两段式（R12-15）：先由解码器只读文件头拿尺寸（**不分配整图**），像素 / 单边超限在这里就报
 /// [`DecodeCause::TooLarge`]；再 `reserve(total_bytes)` + `set_limits` 后解码，`max_alloc` 命中
-/// 映射成 [`DecodeCause::OutOfMemory`]。EXIF orientation 在解码后、缩放前应用到像素。
+/// 映射成 [`DecodeCause::OutOfMemory`]。EXIF orientation 在解码后、缩放前应用到像素；ICC 转换在
+/// 缩放 / `to_rgba8` 之后、预乘之前（见模块文档的固定顺序）。
 ///
 /// # Errors
 /// [`DecodeCause`]：格式不支持 / 字节损坏 / 源图过大 / 解码器内存不足
-/// （四类里除 `Capacity` 外都可能出现）。
+/// （四类里除 `Capacity` 外都可能出现）。ICC 无法使用时**不**报错，按 sRGB 降级并计数。
 pub(crate) fn decode(bytes: &[u8]) -> Result<DecodedImage, DecodeCause> {
     let format = format_of(bytes)?;
     let tag = format_tag(format);
-    // `into_decoder` 让「元数据读取」发生在解码像素之前（orientation 必须先于 `from_decoder`：
+    // `into_decoder` 让「元数据读取」发生在解码像素之前（orientation / ICC 必须先于 `from_decoder`：
     // 解码器一旦交给 `DynamicImage::from_decoder` 就被消耗，之后再没有 `icc_profile()` 的机会）。
     let mut decoder = ImageReader::with_format(Cursor::new(bytes), format)
         .into_decoder()
@@ -96,11 +148,16 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<DecodedImage, DecodeCause> {
     let (width, height) = decoder.dimensions();
     check_pixel_dimensions(tag, width, height)?;
     check_source_size(width, height)?;
-    // ICC 后续任务在这一行之后、`from_decoder` 之前读取 `decoder.icc_profile()`；顺序固定为
-    // 「元数据 → reserve/set_limits → 解码 → apply_orientation → resize → to_rgba8 → 预乘」。
+    // 元数据（D-8）：orientation 与 ICC 都在这里读，位置固定为「reserve/from_decoder 之前」。
+    // ICC 读取失败按「带 profile 但无法解析」处理：降级到 sRGB，不让整图解码失败。
     let orientation = decoder
         .orientation()
         .map_err(|error| classify(tag, error))?;
+    let icc = match decoder.icc_profile() {
+        Ok(Some(profile)) => SourceIcc::Present(profile),
+        Ok(None) => SourceIcc::Absent,
+        Err(_) => SourceIcc::Unreadable,
+    };
     // 复刻 `ImageReader::decode` 的两步（`io/image_reader_type.rs`）：整图分配先记进
     // `max_alloc`，再把剩余预算交给解码器；漏掉任一步都会让 `MAX_DECODE_ALLOC` 失去意义。
     let mut limits = decode_limits();
@@ -120,11 +177,119 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<DecodedImage, DecodeCause> {
     let rgba = image.to_rgba8();
     let (width, height) = (rgba.width(), rgba.height());
     debug_assert_eq!(rgba.as_raw().len(), width as usize * height as usize * 4);
+    let (rgba, color) = convert_icc_to_srgb(icc, rgba.into_raw())?;
     Ok(DecodedImage {
         width,
         height,
-        bgra: premultiply(rgba.as_raw())?,
+        bgra: premultiply(&rgba)?,
+        color,
     })
+}
+
+/// straight-alpha 的 RGBA8（`to_rgba8` 输出）→ sRGB（必要时经 ICC 转换）。
+///
+/// 返回 `(RGBA8, 色彩来源)`：
+/// - `Srgb` / `AssumedSrgb` ⇒ 返回**传入的同一个 `Vec`**（零拷贝：无 ICC / sRGB ICC / 降级路径都
+///   不增加一次全图拷贝）；
+/// - `Converted` ⇒ 新分配同尺寸 dst 再转换（`try_reserve_exact`，失败 [`DecodeCause::OutOfMemory`]）。
+fn convert_icc_to_srgb(
+    icc: SourceIcc,
+    rgba: Vec<u8>,
+) -> Result<(Vec<u8>, SourceColor), DecodeCause> {
+    let bytes = match icc {
+        SourceIcc::Absent => return Ok((rgba, SourceColor::Srgb)),
+        SourceIcc::Unreadable => return Ok((rgba, SourceColor::AssumedSrgb)),
+        SourceIcc::Present(bytes) => bytes,
+    };
+    if bytes.len() > ICC_PROFILE_LIMIT {
+        return Ok((rgba, SourceColor::AssumedSrgb));
+    }
+    let Ok(source) = ColorProfile::new_from_slice(&bytes) else {
+        return Ok((rgba, SourceColor::AssumedSrgb));
+    };
+    // sRGB profile 必须短路：sRGB→sRGB 的 8-bit 定点 transform 不保证逐字节恒等，转换会破坏
+    // 「sRGB 资产与无 profile 资产逐字节一致」的性能 / 黄金护栏。
+    if is_srgb_profile(&source) {
+        return Ok((rgba, SourceColor::Srgb));
+    }
+    let srgb = ColorProfile::new_srgb();
+    let Ok(transform) = source.create_transform_8bit(
+        Layout::Rgba,
+        &srgb,
+        Layout::Rgba,
+        TransformOptions::default(),
+    ) else {
+        // Gray / CMYK / DeviceLink 等以 RGBA 为源不支持的 profile：降级 sRGB（像素保持原样）。
+        return Ok((rgba, SourceColor::AssumedSrgb));
+    };
+    let mut converted = allocate_zeroed(rgba.len())?;
+    if transform.transform(&rgba, &mut converted).is_err() {
+        return Ok((rgba, SourceColor::AssumedSrgb));
+    }
+    Ok((converted, SourceColor::Converted))
+}
+
+/// 判定解析后的 profile 是否**就是 sRGB**（primaries + white point + TRC 数值近似）。
+///
+/// 同时覆盖 ICC v2 的 `curveType` 采样表与 v4 的 `parametricCurveType`：比较的是 TRC 在采样点上的
+/// 数值，而不是内部表示。判定通过后直接跳过转换，因此「sRGB profile 资产逐字节不变」不依赖
+/// 转换管线的恒等性。
+fn is_srgb_profile(profile: &ColorProfile) -> bool {
+    // 只有 matrix-shaper RGB profile 才有可比较的 primaries / TRC；LUT 型（mAB/mft2）与
+    // 非 RGB（Gray / CMYK）一律视为「不是 sRGB」，走转换或降级。
+    if profile.color_space != DataColorSpace::Rgb || profile.pcs != DataColorSpace::Xyz {
+        return false;
+    }
+    let srgb = ColorProfile::new_srgb();
+    let colorants_match = [
+        (&profile.red_colorant, &srgb.red_colorant),
+        (&profile.green_colorant, &srgb.green_colorant),
+        (&profile.blue_colorant, &srgb.blue_colorant),
+        (&profile.white_point, &srgb.white_point),
+    ]
+    .into_iter()
+    .all(|(candidate, reference)| xyz_close(candidate, reference));
+    colorants_match && trc_matches_srgb(profile, &srgb)
+}
+
+/// 色度坐标近似相等（容差覆盖 ICC `s15Fixed16` 的量化误差；Display P3 / AdobeRGB 与 sRGB 的
+/// 差异在 0.02 以上，1e-3 足以区分）。
+fn xyz_close(candidate: &Xyzd, reference: &Xyzd) -> bool {
+    const TOLERANCE: f64 = 1e-3;
+    (candidate.x - reference.x).abs() < TOLERANCE
+        && (candidate.y - reference.y).abs() < TOLERANCE
+        && (candidate.z - reference.z).abs() < TOLERANCE
+}
+
+/// sRGB TRC 的采样点（覆盖线性段与幂函数段）。
+const SRGB_TRC_SAMPLES: [f32; 8] = [0.0, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0];
+
+/// 三条 TRC 是否与 sRGB 曲线在 [`SRGB_TRC_SAMPLES`] 上数值近似（容差 1e-3 ≈ 0.25/255，
+/// 远小于 sRGB 与 gamma 2.2 在低段的差异）。
+fn trc_matches_srgb(profile: &ColorProfile, srgb: &ColorProfile) -> bool {
+    const TOLERANCE: f32 = 1e-3;
+    let channels = [
+        (&profile.red_trc, &srgb.red_trc),
+        (&profile.green_trc, &srgb.green_trc),
+        (&profile.blue_trc, &srgb.blue_trc),
+    ];
+    channels
+        .into_iter()
+        .all(|(candidate, reference)| match (candidate, reference) {
+            (Some(candidate), Some(reference)) => {
+                let (Ok(candidate), Ok(reference)) = (
+                    candidate.make_linear_evaluator(),
+                    reference.make_linear_evaluator(),
+                ) else {
+                    return false;
+                };
+                SRGB_TRC_SAMPLES.into_iter().all(|sample| {
+                    (candidate.evaluate_value(sample) - reference.evaluate_value(sample)).abs()
+                        < TOLERANCE
+                })
+            }
+            _ => false,
+        })
 }
 
 /// 只读文件头拿尺寸（**不解码像素**）：`insert` / `insert_async` 的预算准入用。
@@ -144,9 +309,10 @@ pub(crate) fn probe_dimensions(bytes: &[u8]) -> Result<(u32, u32), DecodeCause> 
 
 /// 解码峰值估算（**准入**用，不分配）：文件头尺寸 → 上界字节数。
 ///
-/// `pixels × 8 B`（RGBA16 解码缓冲，`image` 0.25 的最坏输出类型）+ [`DECODE_PEAK_MARGIN`]；
-/// [`MAX_SOURCE_PIXELS`] 之内的图估算上界 = 16 M px × 8 B + 16 MiB = 144 MiB ≤
-/// [`MAX_DECODE_ALLOC`]，因此「能合法解码的图」不会因估算本身被默认预算误拒。
+/// `pixels × 12 B`（RGBA16 解码缓冲 8 B + `to_rgba8` 的 RGBA8 4 B + ICC 转换 dst 4 B，
+/// 见 [`DECODE_PEAK_BYTES_PER_PIXEL`]）+ [`DECODE_PEAK_MARGIN`]；[`MAX_SOURCE_PIXELS`] 之内的图
+/// 估算上界 = 16 M px × 12 B + 16 MiB = 208 MiB ≤ [`MAX_DECODE_ALLOC`]，因此「能合法解码的图」
+/// 不会因估算本身被默认预算误拒。
 pub(crate) fn estimate_peak(width: u32, height: u32) -> u64 {
     u64::from(width) * u64::from(height) * DECODE_PEAK_BYTES_PER_PIXEL + DECODE_PEAK_MARGIN
 }
@@ -358,27 +524,74 @@ fn srgb_encode(linear: f32) -> u8 {
     (encoded * 255.0 + 0.5) as u8
 }
 
+/// 仅测试：RGBA8 → PNG，可选写入 ICC profile（iCCP）与 EXIF orientation（eXIf）。
+///
+/// 用 `PngEncoder` 的 `ImageEncoder::set_icc_profile` / `set_exif_metadata` 构造资产，
+/// 不依赖手写 iCCP chunk + zlib 压缩。放在模块级是为了让 `resources::tests` 复用同一份
+/// 资产构造（ICC 统计口径测试），避免两处重复。
+#[cfg(test)]
+pub(crate) fn test_png(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    icc: Option<&[u8]>,
+    orientation: Option<u16>,
+) -> Vec<u8> {
+    use image::{ExtendedColorType, ImageEncoder};
+
+    let mut out = Cursor::new(Vec::new());
+    let mut encoder = image::codecs::png::PngEncoder::new(&mut out);
+    if let Some(icc) = icc {
+        encoder
+            .set_icc_profile(icc.to_vec())
+            .expect("PngEncoder 支持 iCCP");
+    }
+    if let Some(orientation) = orientation {
+        encoder
+            .set_exif_metadata(test_exif_orientation(orientation))
+            .expect("PngEncoder 支持 eXIf");
+    }
+    encoder
+        .write_image(pixels, width, height, ExtendedColorType::Rgba8)
+        .expect("encode png");
+    out.into_inner()
+}
+
+/// 仅测试：手工 EXIF：TIFF little-endian，IFD0 里一条 `Orientation` 记录
+/// （tag 0x0112 / SHORT / count 1）。
+#[cfg(test)]
+fn test_exif_orientation(orientation: u16) -> Vec<u8> {
+    let mut exif = Vec::with_capacity(26);
+    exif.extend_from_slice(b"II*\0");
+    exif.extend_from_slice(&8u32.to_le_bytes()); // IFD0 偏移
+    exif.extend_from_slice(&1u16.to_le_bytes()); // 条目数
+    exif.extend_from_slice(&0x0112u16.to_le_bytes()); // Orientation
+    exif.extend_from_slice(&3u16.to_le_bytes()); // SHORT
+    exif.extend_from_slice(&1u32.to_le_bytes()); // count
+    exif.extend_from_slice(&orientation.to_le_bytes()); // value（后 2 字节是 padding）
+    exif.extend_from_slice(&0u16.to_le_bytes());
+    exif.extend_from_slice(&0u32.to_le_bytes()); // 下一个 IFD
+    exif
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
 
     use image::error::LimitErrorKind;
+    use moxcms::{ColorProfile, Layout, TransformOptions};
 
     use super::{
-        DECODE_PEAK_MARGIN, MAX_DECODE_ALLOC, MAX_SOURCE_BYTES, MAX_SOURCE_DIM, MAX_SOURCE_PIXELS,
-        MAX_TILE_DIM, allocate_zeroed, check_source_bytes, check_source_size, classify, decode,
-        decode_limits, estimate_peak, fit_within, premultiply_channel, srgb_decode, srgb_encode,
-        transfer_lut,
+        DECODE_PEAK_MARGIN, ICC_PROFILE_LIMIT, MAX_DECODE_ALLOC, MAX_SOURCE_BYTES, MAX_SOURCE_DIM,
+        MAX_SOURCE_PIXELS, MAX_TILE_DIM, SourceColor, SourceIcc, allocate_zeroed,
+        check_source_bytes, check_source_size, classify, convert_icc_to_srgb, decode,
+        decode_limits, estimate_peak, fit_within, is_srgb_profile, premultiply_channel,
+        srgb_decode, srgb_encode, test_png, transfer_lut,
     };
     use crate::resources::DecodeCause;
 
     fn png_rgba8(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
-        let image = image::RgbaImage::from_raw(width, height, pixels.to_vec()).expect("raw");
-        let mut out = Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgba8(image)
-            .write_to(&mut out, image::ImageFormat::Png)
-            .expect("encode png");
-        out.into_inner()
+        test_png(width, height, pixels, None, None)
     }
 
     fn solid(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
@@ -389,34 +602,45 @@ mod tests {
         png_rgba8(width, height, &pixels)
     }
 
-    /// 手工 EXIF：TIFF little-endian，IFD0 里一条 `Orientation` 记录（tag 0x0112 / SHORT / count 1）。
-    fn exif_orientation(orientation: u16) -> Vec<u8> {
-        let mut exif = Vec::with_capacity(26);
-        exif.extend_from_slice(b"II*\0");
-        exif.extend_from_slice(&8u32.to_le_bytes()); // IFD0 偏移
-        exif.extend_from_slice(&1u16.to_le_bytes()); // 条目数
-        exif.extend_from_slice(&0x0112u16.to_le_bytes()); // Orientation
-        exif.extend_from_slice(&3u16.to_le_bytes()); // SHORT
-        exif.extend_from_slice(&1u32.to_le_bytes()); // count
-        exif.extend_from_slice(&orientation.to_le_bytes()); // value（后 2 字节是 padding）
-        exif.extend_from_slice(&0u16.to_le_bytes());
-        exif.extend_from_slice(&0u32.to_le_bytes()); // 下一个 IFD
-        exif
+    /// 带 iCCP chunk 的 RGBA8 PNG。
+    fn png_with_icc(width: u32, height: u32, pixels: &[u8], icc: &[u8]) -> Vec<u8> {
+        test_png(width, height, pixels, Some(icc), None)
     }
 
     /// 带 eXIf chunk 的 RGBA8 PNG（PNG 的 eXIf 是原始 TIFF，不压缩）。
     fn png_with_exif(width: u32, height: u32, pixels: &[u8], orientation: u16) -> Vec<u8> {
-        use image::{ExtendedColorType, ImageEncoder};
+        test_png(width, height, pixels, None, Some(orientation))
+    }
 
-        let mut out = Cursor::new(Vec::new());
-        let mut encoder = image::codecs::png::PngEncoder::new(&mut out);
-        encoder
-            .set_exif_metadata(exif_orientation(orientation))
-            .expect("PngEncoder 支持 eXIf");
-        encoder
-            .write_image(pixels, width, height, ExtendedColorType::Rgba8)
-            .expect("encode png with exif");
-        out.into_inner()
+    /// Display P3 的 ICC 字节（`moxcms` 的默认 profile 编码；与真实 P3 资产同一路径解析）。
+    fn display_p3_icc() -> Vec<u8> {
+        ColorProfile::new_display_p3()
+            .encode()
+            .expect("encode display p3 profile")
+    }
+
+    /// sRGB 的 ICC 字节。
+    fn srgb_icc() -> Vec<u8> {
+        ColorProfile::new_srgb()
+            .encode()
+            .expect("encode srgb profile")
+    }
+
+    /// 用 moxcms 直接做一次 RGBA8 转换（不经过解码管线）：测试期望值的独立来源。
+    fn transform_rgba(icc: &[u8], pixel: [u8; 4]) -> [u8; 4] {
+        let source = ColorProfile::new_from_slice(icc).expect("valid profile");
+        let srgb = ColorProfile::new_srgb();
+        let transform = source
+            .create_transform_8bit(
+                Layout::Rgba,
+                &srgb,
+                Layout::Rgba,
+                TransformOptions::default(),
+            )
+            .expect("create transform");
+        let mut out = [0u8; 4];
+        transform.transform(&pixel, &mut out).expect("transform");
+        out
     }
 
     fn cause(bytes: &[u8]) -> DecodeCause {
@@ -575,6 +799,152 @@ mod tests {
         );
     }
 
+    /// D-8：Display P3 资产在解码期转换到 sRGB（引擎 RT / 合成假设 sRGB）。
+    #[test]
+    fn decode_converts_display_p3_to_srgb() {
+        let icc = display_p3_icc();
+        // 「sRGB 红」在 Display P3 编码下的 8-bit 值（P3 色域更大，同一颜色值更低）。
+        let p3_red = [234u8, 51, 35, 255];
+        let image = decode(&png_with_icc(1, 1, &p3_red, &icc)).expect("P3 png");
+
+        assert_eq!(image.color, SourceColor::Converted, "P3 必须走转换路径");
+        assert_eq!((image.width, image.height), (1, 1));
+        // 期望值来自 moxcms 的直接转换（独立于解码管线的同源实现）：转换后回到 sRGB 红。
+        let expected = transform_rgba(&icc, p3_red);
+        assert_eq!(
+            image.bgra.as_slice(),
+            &[expected[2], expected[1], expected[0], expected[3]],
+            "解码管线的 ICC 结果必须与 moxcms 直接转换逐字节一致（BGRA 顺序）"
+        );
+        assert!(
+            image.bgra[0] <= 2 && image.bgra[1] <= 2 && image.bgra[2] >= 250,
+            "P3 编码下的 sRGB 红应转回 sRGB 红，实际 {:?}",
+            &image.bgra[..4]
+        );
+
+        // 同一份源像素、无 ICC：保持原值（证明转换发生在解码管线，而不是解码器内置行为）。
+        let untagged = decode(&png_rgba8(1, 1, &p3_red)).expect("untagged png");
+        assert_eq!(untagged.color, SourceColor::Srgb);
+        assert_ne!(
+            image.bgra, untagged.bgra,
+            "带 P3 profile 与无 profile 的像素必须不同"
+        );
+    }
+
+    /// D-8 性能 / 黄金护栏：sRGB profile 资产必须与无 profile 资产**逐字节**一致。
+    ///
+    /// 判定为 sRGB 后**短路**，不依赖「sRGB→sRGB transform 恒等」（8-bit 定点管线有量化抖动）。
+    #[test]
+    fn decode_srgb_icc_is_byte_exact() {
+        let icc = srgb_icc();
+        let profile = ColorProfile::new_from_slice(&icc).expect("sRGB profile 可解析");
+        assert!(
+            is_srgb_profile(&profile),
+            "moxcms 编码的 sRGB profile 必须被识别为 sRGB"
+        );
+        let p3 = ColorProfile::new_from_slice(&display_p3_icc()).expect("P3 profile 可解析");
+        assert!(
+            !is_srgb_profile(&p3),
+            "Display P3 不是 sRGB（primaries 不同）"
+        );
+
+        // 覆盖不透明 / 半透明 / 低段与高段：预乘 LUT 也要逐字节一致。
+        let pixels = [
+            255u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 128, 64, 32, 128, 10, 20, 30, 0, 1,
+            2, 3, 255,
+        ];
+        let plain = decode(&png_rgba8(6, 1, &pixels)).expect("plain png");
+        let tagged = decode(&png_with_icc(6, 1, &pixels, &icc)).expect("sRGB icc png");
+        assert_eq!(tagged.color, SourceColor::Srgb);
+        assert_eq!(
+            tagged.bgra, plain.bgra,
+            "sRGB profile 必须短路：像素与无 profile 路径逐字节相同"
+        );
+    }
+
+    /// D-8：无 ICC 的资产走现状路径（分类 `Srgb`、逐字节不变、不增加拷贝）。
+    #[test]
+    fn decode_icc_without_profile_keeps_bytes_exact() {
+        let pixels = [10u8, 20, 30, 128, 200, 100, 50, 255];
+        let plain = decode(&png_rgba8(2, 1, &pixels)).expect("plain png");
+        assert_eq!(plain.color, SourceColor::Srgb);
+        // 与 D-7 的 orientation=1 资产逐字节一致（无 ICC 路径不得因 D-8 改动）。
+        let tagged = decode(&png_with_exif(2, 1, &pixels, 1)).expect("orientation 1");
+        assert_eq!(plain.bgra, tagged.bgra);
+    }
+
+    /// D-8：损坏 / 超大 / 不支持（Gray）的 ICC 不得让解码失败，像素按 sRGB 处理并分类计数。
+    #[test]
+    fn decode_invalid_icc_falls_back_to_srgb() {
+        let pixels = [12u8, 34, 56, 128, 78, 90, 12, 255];
+        let plain = decode(&png_rgba8(2, 1, &pixels)).expect("plain png");
+        let gray_icc = ColorProfile::new_gray_with_gamma(2.2)
+            .encode()
+            .expect("encode gray profile");
+        let cases: [(&str, Vec<u8>); 3] = [
+            ("垃圾字节", b"not an icc profile".to_vec()),
+            ("超过 ICC_PROFILE_LIMIT", vec![0u8; ICC_PROFILE_LIMIT + 1]),
+            ("Gray profile（RGBA 布局不支持）", gray_icc),
+        ];
+        for (label, icc) in cases {
+            let tagged = decode(&png_with_icc(2, 1, &pixels, &icc))
+                .unwrap_or_else(|error| panic!("{label}: 坏 ICC 不得使解码失败：{error:?}"));
+            assert_eq!(tagged.color, SourceColor::AssumedSrgb, "{label}");
+            assert_eq!(
+                tagged.bgra, plain.bgra,
+                "{label}: 降级路径的像素必须等于无 profile 路径"
+            );
+        }
+    }
+
+    /// D-8 固定顺序：orientation → 缩放 → `to_rgba8` → ICC → 预乘。
+    #[test]
+    fn decode_applies_orientation_before_icc_and_premultiplies_after() {
+        let icc = display_p3_icc();
+        // 2×1：左 = P3 编码下的 sRGB 红（不透明），右 = 黑。
+        let pixels = [234u8, 51, 35, 255, 0, 0, 0, 255];
+        let rotated =
+            decode(&test_png(2, 1, &pixels, Some(&icc), Some(6))).expect("rotated P3 png");
+        assert_eq!((rotated.width, rotated.height), (1, 2), "EXIF 6 先转置尺寸");
+
+        let expected = transform_rgba(&icc, [234, 51, 35, 255]);
+        assert_eq!(
+            &rotated.bgra[..4],
+            &[expected[2], expected[1], expected[0], expected[3]],
+            "上像素：orientation 之后再做 ICC"
+        );
+        assert_eq!(&rotated.bgra[4..], &[0, 0, 0, 255], "黑色转换后仍是黑");
+        assert_eq!(rotated.color, SourceColor::Converted);
+    }
+
+    /// D-8 性能护栏：无 ICC / sRGB ICC / 降级路径的转换必须**零拷贝**（返回同一个 `Vec`）。
+    #[test]
+    fn icc_conversion_is_zero_copy_when_no_work_is_needed() {
+        let cases: [(&str, SourceIcc, SourceColor); 4] = [
+            ("absent", SourceIcc::Absent, SourceColor::Srgb),
+            ("srgb", SourceIcc::Present(srgb_icc()), SourceColor::Srgb),
+            (
+                "fallback",
+                SourceIcc::Present(b"not an icc profile".to_vec()),
+                SourceColor::AssumedSrgb,
+            ),
+            (
+                "oversize",
+                SourceIcc::Present(vec![0u8; ICC_PROFILE_LIMIT + 1]),
+                SourceColor::AssumedSrgb,
+            ),
+        ];
+        for (label, icc, expected) in cases {
+            let rgba = vec![7u8; 64];
+            let pointer = rgba.as_ptr();
+            let (converted, color) =
+                convert_icc_to_srgb(icc, rgba).expect("ICC 降级不产生解码失败");
+            assert_eq!(converted.as_ptr(), pointer, "{label}: 不需要转换时不得拷贝");
+            assert_eq!(converted, vec![7u8; 64], "{label}: 像素必须原样返回");
+            assert_eq!(color, expected, "{label}");
+        }
+    }
+
     #[test]
     fn fit_within_preserves_aspect_and_never_upscales() {
         assert_eq!(fit_within(10, 10), (10, 10));
@@ -678,14 +1048,15 @@ mod tests {
         );
     }
 
-    /// D-11：峰值估算必须覆盖「合法最大图」且不越过解码器的 `max_alloc` 上限。
+    /// D-11 / D-8：峰值估算必须覆盖「合法最大图」（含 ICC 转换 dst 的 12 B/px）且不越过
+    /// 解码器的 `max_alloc` 上限。
     #[test]
     fn decode_peak_estimate_is_bounded_by_max_decode_alloc() {
-        assert_eq!(estimate_peak(1, 1), 8 + DECODE_PEAK_MARGIN);
+        assert_eq!(estimate_peak(1, 1), 12 + DECODE_PEAK_MARGIN);
         assert_eq!(
             estimate_peak(200, 100),
-            200 * 100 * 8 + DECODE_PEAK_MARGIN,
-            "估算按文件头像素数线性增长"
+            200 * 100 * 12 + DECODE_PEAK_MARGIN,
+            "估算按文件头像素数线性增长（RGBA16 + RGBA8 + ICC dst = 12 B/px）"
         );
         assert!(
             estimate_peak(4096, 4096) <= MAX_DECODE_ALLOC,
