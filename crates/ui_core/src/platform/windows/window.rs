@@ -31,7 +31,7 @@ use crate::{
         dispatcher::Dispatcher,
         windows::{
             composition::{self, Composition},
-            dpi,
+            dark_mode, dpi,
             event_loop::{ResizeFrameDriver, WndProcState, wndproc},
             ime,
         },
@@ -124,6 +124,11 @@ impl NativeWindow {
             )
         }
         .map_err(|error| window_error("CreateWindowExW", error))?;
+
+        // B2：标题栏明暗跟随系统主题 —— 必须在**首次显示之前**设置，否则深色主题下第一帧
+        // 会闪一条亮色标题栏。DWM 属性在隐藏窗口上设置是标准做法；失败时窗口仍可用
+        //（`set_titlebar` 内部只记诊断，标题栏退回系统默认亮色）。
+        dark_mode::set_titlebar(hwnd, dark_mode::current().unwrap_or(false));
 
         // 合成目标在窗口显示之前建立：`WS_EX_NOREDIRECTIONBITMAP` 的客户区只有 DComp 内容。
         let composition = match Composition::new(hwnd) {

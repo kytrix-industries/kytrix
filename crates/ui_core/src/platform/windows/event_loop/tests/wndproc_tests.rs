@@ -44,7 +44,7 @@ use crate::{
         dispatcher::{Dispatcher, WM_APP_COMPOSITION_WAKE},
         event::PlatformEvent,
         windows::{
-            dpi,
+            dark_mode, dpi,
             ime::{self, ImeApplied, ImeCommand},
             window::NativeWindow,
         },
@@ -414,6 +414,88 @@ fn display_and_power_messages_mark_one_pending_display_recovery() {
         "恢复消息不得产生平台事件（应用层看不到显示恢复）"
     );
     destroy_hidden_window(hwnd, state);
+}
+
+/// B2 回归：系统主题变化（`WM_SETTINGCHANGE` + `ImmersiveColorSet`）必须把标题栏切到注册表
+/// 里的最新主题值 —— `WndProcState` 的 test-only 观察点 + DWM 真值回读双重断言。
+///
+/// 前置：先把 DWM 属性设成与系统主题**相反**的值，因此「调用被删掉 / 没真正执行」时回读
+/// 停在反值上，本条在任何系统主题的宿主下都会变红。
+/// 变异守卫：删掉 `WM_SETTINGCHANGE` 分支里的 `dark_mode::set_titlebar` 调用（或把它的结果
+/// 替换成常量）⇒ 观察点恒 `None`、回读停在反值，本条变红；应用侧仍必须收到
+/// `AppearanceChanged`（两条线不能互相替代）。
+#[test]
+fn a_theme_change_applies_the_dark_titlebar() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, class_name) = hidden_window("KytrixWndProcDarkTitlebar", dispatcher);
+    // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
+    let raw = unsafe { &mut *state };
+    let expected = dark_mode::current()
+        .expect("本机 HKCU\\…\\Personalize\\AppsUseLightTheme 必须可读（Win11 宿主）");
+    assert_eq!(
+        raw.last_dark_titlebar, None,
+        "未收到主题变化前不得有标题栏观察值"
+    );
+    // 前置：DWM 属性停在反值，主题变化的同步必须把它翻回 `expected`。
+    assert!(
+        dark_mode::set_titlebar(hwnd, !expected),
+        "前置：把标题栏设成与系统主题相反的值"
+    );
+    assert_eq!(read_titlebar(hwnd), !expected, "前置：DWM 回读为反值");
+
+    let changed = wide("ImmersiveColorSet");
+    // SAFETY: 窗口由本测试创建且仍存活；`lParam` 是本函数栈上的 NUL 结尾宽字符串，只在本次
+    // 消息处理期使用；`SendMessageW` 同步进入生产 `wndproc`。
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_SETTINGCHANGE,
+            None,
+            Some(LPARAM(changed.as_ptr() as isize)),
+        );
+    }
+
+    assert_eq!(
+        raw.last_dark_titlebar,
+        Some(expected),
+        "系统主题变化必须把 DWM 标题栏切到注册表里的主题值"
+    );
+    assert_eq!(
+        read_titlebar(hwnd),
+        expected,
+        "DWM 真值必须跟随系统主题（不能只记观察点）"
+    );
+    let appearance = raw
+        .take_events()
+        .into_iter()
+        .find_map(|event| match event.event {
+            PlatformEvent::Appearance(dark) => Some(dark),
+            _ => None,
+        });
+    assert_eq!(
+        appearance,
+        Some(expected),
+        "应用仍必须收到 AppearanceChanged（平台同步不能替代事件）"
+    );
+    destroy_hidden_window(hwnd, state);
+    let _ = class_name;
+}
+
+/// 从 DWM 回读标题栏明暗（B2 用例的「真值」断言用）。
+fn read_titlebar(hwnd: HWND) -> bool {
+    let mut value = windows::core::BOOL::default();
+    // SAFETY: `hwnd` 由调用方保证存活；输出是指向栈上 `BOOL` 的可写指针，长度 = 4 字节。
+    unsafe {
+        windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWA_USE_IMMERSIVE_DARK_MODE,
+            (&raw mut value).cast(),
+            std::mem::size_of::<windows::core::BOOL>() as u32,
+        )
+    }
+    .expect("DwmGetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE)");
+    value.as_bool()
 }
 
 /// R07-13 回归：同一批内的 `WM_MOUSEMOVE` 合并成一条（保留最后一条的位置）。

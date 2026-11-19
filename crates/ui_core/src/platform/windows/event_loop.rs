@@ -113,6 +113,11 @@ pub(crate) struct WndProcState {
     ///
     /// `WndProc` 没有错误通道，但绝不能把失败吞掉 —— 帧管线失败在用户看来就是「画面冻结」。
     pending_error: Option<EngineError>,
+    /// 测试观察点：最近一次 `WM_SETTINGCHANGE("ImmersiveColorSet")` **实际成功**应用到标题栏的
+    /// 明暗（`None` = 尚未收到主题变化或 DWM 调用失败）。生产构建没有该字段；与
+    /// `pump::GeometryCache::queries` 同款 test-only 记账。
+    #[cfg(test)]
+    last_dark_titlebar: Option<bool>,
     /// 系统 size 模态循环里的成帧驱动（连接泵持有的 `App` 与本窗口的合成目标）。
     ///
     /// `None` = 没有 `App`（平台单测里只验证 `WndProc` 记账、不真正建渲染器的窗口）。
@@ -148,6 +153,8 @@ impl WndProcState {
             cursor: crate::paint::style::Cursor::Default,
             size_move: false,
             pending_error: None,
+            #[cfg(test)]
+            last_dark_titlebar: None,
             driver,
         })
     }

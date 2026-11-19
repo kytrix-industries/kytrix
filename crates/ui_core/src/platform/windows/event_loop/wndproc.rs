@@ -22,7 +22,6 @@
 use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
     Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT, ScreenToClient},
-    System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
     UI::{
         Input::KeyboardAndMouse::{
             GetKeyState, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_LBUTTON, VK_MBUTTON,
@@ -40,7 +39,7 @@ use super::{
 use crate::platform::{
     dispatcher::{WM_APP_COMPOSITION_WAKE, WM_APP_FRAME_WAKE},
     event::{PlatformEvent, StampedEvent, hiword_signed, loword_signed, translate},
-    windows::{dpi, ime},
+    windows::{dark_mode, dpi, ime},
 };
 
 /// 消费者：`NativeWindow::create`（`window.rs` 注册窗口过程）。
@@ -381,10 +380,25 @@ pub(crate) extern "system" fn wndproc(
         let stamped = if msg == WM_SETTINGCHANGE {
             // 系统滚轮行数（`SPI_GETWHEELSCROLLLINES`）可能变了（R02-10）。
             (*state).refresh_wheel_lines();
-            appearance_change(lparam_value).map(|event| StampedEvent {
-                event,
-                ticks_ms: ticks,
-                scale: (*state).scale(),
+            // B2：沉浸式颜色集变化 ⇒ 重新读注册表主题并同步标题栏明暗。`DwmSetWindowAttribute`
+            // 只改 DWM 属性、**不派发窗口消息**，因此可以在 `&mut WndProcState` 的短借用内执行
+            //（文件头纪律 1 只约束会同步重入本函数的调用）。
+            appearance_dark(lparam_value).map(|dark| {
+                let applied = dark_mode::set_titlebar(hwnd, dark);
+                #[cfg(test)]
+                {
+                    // 测试观察点（生产构建没有该字段）：记录 DWM 调用**真的发生且成功**的明暗；
+                    // 删掉上面的调用时恒为 `None`，单测据此变红。
+                    (*state).last_dark_titlebar = applied.then_some(dark);
+                }
+                // 生产构建没有观察者：失败已在 `set_titlebar` 内部 `debug_assert`，窗口继续可用。
+                #[cfg(not(test))]
+                let _ = applied;
+                StampedEvent {
+                    event: PlatformEvent::Appearance(dark),
+                    ticks_ms: ticks,
+                    scale: (*state).scale(),
+                }
             })
         } else {
             let context = (*state).context(ticks);
@@ -470,8 +484,8 @@ pub(super) fn is_any_ime_message(msg: u32) -> bool {
 }
 
 /// 消费者：`wndproc` 的 `WM_SETTINGCHANGE` 分支。
-/// `WM_SETTINGCHANGE` 且是「沉浸式颜色集」变化 → 读注册表拿深浅色。
-pub(super) fn appearance_change(lparam: isize) -> Option<PlatformEvent> {
+/// `WM_SETTINGCHANGE` 且是「沉浸式颜色集」变化 → 读注册表返回最新深色标志。
+pub(super) fn appearance_dark(lparam: isize) -> Option<bool> {
     if lparam == 0 {
         return None;
     }
@@ -491,40 +505,10 @@ pub(super) fn appearance_change(lparam: isize) -> Option<PlatformEvent> {
     if changed != "ImmersiveColorSet" {
         return None;
     }
-    dark_mode().map(PlatformEvent::Appearance)
-}
-
-/// 消费者：`appearance_change`。
-/// 读 `HKCU\...\Themes\Personalize\AppsUseLightTheme`（1 = 浅色）。
-pub(super) fn dark_mode() -> Option<bool> {
-    let subkey = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
-    let value = wide("AppsUseLightTheme");
-    let mut data = 0u32;
-    let mut size = std::mem::size_of::<u32>() as u32;
-    // SAFETY: 输出缓冲是栈上的 `u32`，`size` 同步给出字节数；键路径是 NUL 结尾的宽字符串。
-    let status = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            windows::core::PCWSTR(subkey.as_ptr()),
-            windows::core::PCWSTR(value.as_ptr()),
-            RRF_RT_REG_DWORD,
-            None,
-            Some((&mut data as *mut u32).cast()),
-            Some(&mut size),
-        )
-    };
-    if status != windows::Win32::Foundation::ERROR_SUCCESS {
-        return None;
-    }
-    Some(data == 0)
+    dark_mode::current()
 }
 
 /// 消费者：`wndproc` 的滚轮坐标翻译。
 pub(super) fn encode_point(x: i32, y: i32) -> isize {
     ((((y as u32) << 16) | (x as u32 & 0xFFFF)) as i32) as isize
-}
-
-/// 消费者：`dark_mode` 的注册表键名。
-pub(super) fn wide(text: &str) -> Vec<u16> {
-    text.encode_utf16().chain(std::iter::once(0)).collect()
 }
