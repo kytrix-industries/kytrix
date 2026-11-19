@@ -262,10 +262,21 @@ impl NativeWindow {
 
     /// 把渲染器的 `CAMetalLayer` 挂到 view 上（`wantsLayer` 已在 `create` 里打开）。
     ///
-    /// 只在这里把 layer 交给 AppKit；`contentsScale` / `drawableSize` 的唯一写者是**主线程**的
-    /// `Renderer::set_layer_scale`（§5.3），GPU 线程只读 drawable 的实际尺寸。
+    /// 只在这里把 layer 交给 AppKit；`contentsScale` / `drawableSize` / 几何的唯一写者是**主线程**
+    /// 的 `Renderer::set_layer_scale`（§5.3 / C6），GPU 线程只读 drawable 的实际尺寸。
+    ///
+    /// 挂上之后立刻用 **view bounds 的精确点**再写一次 layer 几何（C6）：`new_layer` 建层时用的是
+    /// `backing / scale`（半像素对齐时可能差 `0.5/scale` pt），这里拿得到 view 的真值。
+    /// layer-hosting 的几何责任在 App 侧（Apple `NSView.wantsLayer`），图层在 `setLayer:` 之前
+    /// frame 是 zero；真机定案表明 AppKit 也会同步同样的值 ⇒ 本次写入是幂等防御（见
+    /// `swapchain::set_layer_geometry` 的文档）。
     pub(crate) fn attach_layer(&self, layer: Retained<CAMetalLayer>) {
         self.view.setLayer(Some(&layer));
+        let bounds = self.view.bounds();
+        crate::render::macos::swapchain::set_layer_geometry(
+            &layer,
+            (bounds.size.width, bounds.size.height),
+        );
     }
 
     pub(crate) fn show(&self) {

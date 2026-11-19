@@ -247,6 +247,19 @@ pub(crate) fn atlas_idle(window: &Window, kind: AtlasKind) -> bool {
         .is_none_or(|renderer| renderer.atlas_idle(kind))
 }
 
+// 消费者：`Window::request_composition_rebuild` 的薄委托（Windows 泵的几何 pass 调用）。
+/// 请求 GPU 线程检查 / 重建 DirectComposition 设备与 visual tree（C2）。
+///
+/// 只置位 + 唤醒：真正的重建在 GPU 线程（需要 D3D12 设备 / 交换链）。`WndProc` 只推进
+/// `WM_PAINT` 健康检查代际，泵的几何 pass 消费代际并调 `CheckDeviceState`；这里把
+/// 「Invalid ⇒ 请重建」转给 `Renderer`。
+#[cfg(target_os = "windows")]
+pub(crate) fn request_composition_rebuild(window: &Window) {
+    if let Some(renderer) = window.renderer.as_ref() {
+        renderer.request_composition_rebuild();
+    }
+}
+
 // 消费者：`impl Window::set_renderer` 的薄委托（外部调用点见该方法文档）。
 /// 挂上 GPU 渲染器（平台层在窗口创建之后调用；`Renderer` 已带 HWND swapchain）。
 ///
@@ -256,6 +269,28 @@ pub(crate) fn set_renderer(window: &mut Window, renderer: Renderer) {
     window.glyph_page_received = None;
     window.image_page_received = None;
     window.atlas_rects = std::array::from_fn(|_| crate::render::DirtyRects::default());
+}
+
+// 消费者：`impl Window::take_renderer` 的薄委托（调用点：macOS 设备恢复驱动）。
+/// 摘走渲染器（**不 drop**：调用方决定何时/在哪 drop）。
+///
+/// 设备恢复要按「先 take/drop 旧 renderer（有界）→ 建新 renderer」的顺序落地：旧
+/// `WindowRenderer::drop` 会 invalidate display link 并**有界等待**旧 GPU 线程退出
+/// （主线程上限 250 ms），而新 renderer 要复用旧图层 ⇒ 必须先让旧线程停止 present。
+#[cfg(target_os = "macos")]
+pub(crate) fn take_renderer(window: &mut Window) -> Option<Renderer> {
+    window.renderer.take()
+}
+
+// 消费者：`impl Window::has_compositor_ticket` 的薄委托（调用点：macOS 设备恢复驱动）。
+/// 该窗口是否已把交付端点注册到合成线程（`CompositorTicket` 的生命周期）。
+///
+/// 设备恢复只在**已注册**时覆盖 sink：未注册时新 renderer 的 `submit_gpu` 会按首个真实帧
+/// 的正常路径注册 —— 在恢复驱动里无条件 `register` 会造出一个没有 ticket 的注册项
+/// （关窗时无人 `unregister` ⇒ 合成线程永不退出）。
+#[cfg(target_os = "macos")]
+pub(crate) fn has_compositor_ticket(window: &Window) -> bool {
+    window.compositor_ticket.is_some()
 }
 
 // 消费者：`impl Window::poll_renderer` 的薄委托（外部调用点见该方法文档）。

@@ -59,7 +59,7 @@ use crate::{
         compositor::FramePlan,
         frame::{FrameFeedback, FrameRequest, FrameSink, LatestFrame, MAX_FRAMES_IN_FLIGHT},
         linux::{
-            compositor::{GpuRenderer, Submitted},
+            compositor::{GpuRenderer, MAX_RETRY_BACKOFF, Submitted},
             device::enter_gpu_thread,
         },
         timer::{FrameTimings, GpuTimerSample},
@@ -862,8 +862,24 @@ fn run_gpu_loop(
                 });
                 pending = None;
             }
-            // 保留待画帧：下一次 acquire 会阻塞到超时 / 下一张图，不会自旋。
-            Submitted::Retry => {}
+            // 保留待画帧：可恢复的 WSI 故障（C8）按 `after` 有界退避后重试；`None` 表示立即
+            // 重试（acquire 已自带 100 ms 节拍）。`sleep` 前后都检查 shutdown ⇒ 关窗 `join()`
+            // 的尾延迟 ≤ `MAX_RETRY_BACKOFF`（50 ms，小于 acquire 的 100 ms 上界）。
+            Submitted::Retry { after } => {
+                if let Some(after) = after {
+                    debug_assert!(
+                        after <= MAX_RETRY_BACKOFF,
+                        "swapchain retry backoff must stay bounded (got {after:?})"
+                    );
+                    if shared.shutdown_requested() {
+                        return Ok(());
+                    }
+                    thread::sleep(after.min(MAX_RETRY_BACKOFF));
+                    if shared.shutdown_requested() {
+                        return Ok(());
+                    }
+                }
+            }
         }
     }
 }

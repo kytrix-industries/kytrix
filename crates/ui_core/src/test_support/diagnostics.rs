@@ -526,6 +526,20 @@ fn logical_of(rect: &PhysicalRect, scale: Scale) -> Rect {
     )
 }
 
+/// macOS 设备恢复验收计数：进程成功安装过几个 `GpuCore`（首次创建 = 1，每次设备重建 +1）。
+///
+/// 消费者：`examples/acceptance` 的 `window` 模式 —— 在
+/// `KYTRIX_METAL_INJECT_DEVICE_LOST=1` 下注入一次 `DeviceLost` 之后必须恰好为 `2`
+/// （= 一次整设备重建；0 次说明恢复分支没跑，≥3 说明恢复风暴/重复删建设备）。
+///
+/// 只在 macOS + `test-support` 构建存在：这是测试基建的观测口，不是生产 API
+/// （恢复本身不依赖它；生产构建没有本函数也没有计数器消费者）。
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn metal_gpu_core_generation() -> u64 {
+    crate::render::macos::core::GpuCore::generation()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

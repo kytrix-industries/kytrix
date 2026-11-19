@@ -12,9 +12,13 @@
 //!   不需要锁。
 //! - **根签名 / PSO** 创建后只读。
 //! - **图集纹理由 `RwLock` 保护**：窗口的 GPU 线程在**读锁**内录制并提交一帧（页在录制期间不会
-//!   变），页重建走**写锁**。写锁期间不可能出现新的提交（录制与提交都在读锁内），因此页换代
-//!   只需要等各窗口登记的**提交水位**（[`super::queue::StreamWatermark`]），不需要整条队列
-//!   idle（R08-6）。
+//!   变），页重建走**写锁**。写锁期间不可能出现新的提交（录制与提交都在读锁内）。
+//! - **图集描述符组双代（C3）**：D3D12 禁止改写「提交执行中的命令列表可能引用」的描述符。共享
+//!   SRV 堆的图集固定段因此有 2 代；页换代先把新 SRV 写进**没有在飞引用**的那一代，再翻转
+//!   `atlas_generation`。旧代是否空闲由各窗口登记的**代际弃用水位**
+//!   （[`super::queue::StreamWatermark::generation_idle`]）非阻塞判定：未空闲 ⇒ 本帧不换代
+//!   （[`AtlasRebuildOutcome::Deferred`]，调用方退避重试），绝不改写仍被引用的描述符。旧纹理
+//!   按代挂在 [`AtlasSwitch::retired_textures`] 里，只有该代被重新启用时才释放（旧代回收）。
 //! - **设备恢复**（R08-4）：进程级实例不再是 `OnceLock`，而是可替换的注册表（[`GpuCell`]）；
 //!   设备真的被移除后，[`SharedGpu::recover`] 重建 device / queue / PSO / SRV 堆，并按
 //!   [`super::atlas::SharedAtlas::shadow_snapshot`] 的 CPU 影子把图集内容原样重传。
@@ -29,7 +33,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, Weak,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU8, AtomicU32, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -37,7 +41,7 @@ use std::{
 use smol_str::SmolStr;
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
         Graphics::{
             Direct3D::{
                 D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_12_0,
@@ -66,7 +70,7 @@ use crate::{
     render::{
         atlas::{AtlasRebuilt, texel_bytes},
         retire::GpuResourceHandle,
-        windows::pipeline::{DescriptorArena, MAX_WINDOWS, Pipeline, SrvHeap},
+        windows::pipeline::{ATLAS_GENERATIONS, DescriptorArena, MAX_WINDOWS, Pipeline, SrvHeap},
     },
 };
 
@@ -453,17 +457,45 @@ pub(crate) struct SharedGpu {
     atlas: RwLock<SharedAtlas>,
     /// 当前共享图集页尺寸的无锁快照（`[glyph, image]`；上传入队时打「入队页」标记用）。
     atlas_pages: [AtomicU32; 2],
-    /// 各窗口提交流登记的**提交水位**（R08-6）：页换代的最小等待集。
+    /// 各窗口提交流登记的**提交水位**（R08-6 / C3）：页换代的代际判据来源。
     watermarks: Mutex<Vec<Weak<StreamWatermark>>>,
-    /// 页换代慢路径的延迟销毁表（等不到某个窗口的水位时，旧纹理先留在这里）。
-    deferred_atlas: Mutex<Vec<ID3D12Resource>>,
+    /// 新帧应绑定的图集描述符代（C3）：录制时按图集读锁读取；页换代在写锁内翻转。
+    atlas_generation: AtomicU8,
+    /// 图集双代切换状态（图集写锁内访问）：每一代上仍被引用的旧纹理。
+    atlas_switch: Mutex<AtlasSwitch>,
+}
+
+/// 图集双代描述符组的切换记账（C3）。
+///
+/// `retired_textures[g]` 是「仍可能被绑定代 g 的在飞命令列表引用」的旧纹理：在切到代 g 之前
+/// 已确认代 g 无在飞引用（代际水位完成），这时才能释放它们。
+struct AtlasSwitch {
+    retired_textures: [Vec<ID3D12Resource>; ATLAS_GENERATIONS as usize],
+}
+
+impl AtlasSwitch {
+    fn new() -> Self {
+        Self {
+            retired_textures: [Vec::new(), Vec::new()],
+        }
+    }
+}
+
+/// 图集页换代的结果（C3）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AtlasRebuildOutcome {
+    /// 页已重建；目标代描述符已写好并切换为当前代。
+    Applied,
+    /// 目标代仍有在飞命令列表引用（非阻塞拒绝）：**没有写任何描述符、没有换纹理**，调用方应
+    /// 短暂退避后重试（页换代是稀有事件，退避不影响稳态帧率）。
+    Deferred,
 }
 
 // SAFETY: D3D12 的 device / queue / fence / descriptor heap 都是 free-threaded 的 COM 对象，
 // 允许跨线程调用；本结构把**可变**状态全部收进了同步原语：
 // - `device`（资源句柄表 + 丢失状态）在 `Mutex` 里；
-// - 图集纹理与共享图集 SRV 堆由 `atlas` 的 `RwLock` 保护：描述符只会在写锁内、且等到全部
-//   窗口的提交水位之后被重写，读锁持有者在录制 / 提交期间不会看到页变化；
+// - 图集纹理由 `atlas` 的 `RwLock` 保护；图集 SRV 只会在写锁内写进**没有在飞引用**的那一代
+//   （C3 双代，判据是各窗口的代际弃用水位），读锁持有者在录制 / 提交期间不会看到页变化；
 // - `pipeline`（根签名 / PSO）创建后只读；`watermarks` 是 `Weak` 列表。
 unsafe impl Send for SharedGpu {}
 unsafe impl Sync for SharedGpu {}
@@ -556,16 +588,12 @@ impl SharedGpu {
             AtomicU32::new(atlas.page(AtlasKind::Image)),
         ];
         let srv_heap = SrvHeap::new(device.raw())?;
-        srv_heap.write_atlas(
-            device.raw(),
-            AtlasKind::Glyph,
-            atlas.texture(AtlasKind::Glyph),
-        );
-        srv_heap.write_atlas(
-            device.raw(),
-            AtlasKind::Image,
-            atlas.texture(AtlasKind::Image),
-        );
+        // C3：两代描述符组都指向当前占位纹理（真正换代时只写未在用的那一代）。
+        for generation in 0..ATLAS_GENERATIONS {
+            for kind in [AtlasKind::Glyph, AtlasKind::Image] {
+                srv_heap.write_atlas(device.raw(), generation, kind, atlas.texture(kind));
+            }
+        }
         // 能力快照是进程级共享事实：启动时记录一行（诊断 / A-B 对照；P3-1 的 review 建议）。
         eprintln!("kytrix: d3d12 {}", device.caps().describe());
         let raw = device.raw().clone();
@@ -579,7 +607,8 @@ impl SharedGpu {
             atlas: RwLock::new(atlas),
             atlas_pages,
             watermarks: Mutex::new(Vec::new()),
-            deferred_atlas: Mutex::new(Vec::new()),
+            atlas_generation: AtomicU8::new(0),
+            atlas_switch: Mutex::new(AtlasSwitch::new()),
         })
     }
 
@@ -639,6 +668,38 @@ impl SharedGpu {
         self.atlas_pages[kind.index() as usize].load(Ordering::Acquire)
     }
 
+    /// 新帧应绑定的图集描述符代（C3）。录制方在持有图集读锁时读取并把它写进根参数 2 的基址。
+    pub(crate) fn atlas_generation(&self) -> u8 {
+        self.atlas_generation.load(Ordering::Acquire)
+    }
+
+    /// 目标代是否已经没有在飞引用（C3；非阻塞，只读各窗口 fence 的完成值）。
+    ///
+    /// 判据：每个窗口在「弃用该代」时登记了当时的提交水位（`StreamWatermark::retire_generation`），
+    /// 该代的所有在飞命令列表都属于 ≤ 该水位的提交 —— 全部完成（`GetCompletedValue` 追上）后，
+    /// 改写该代描述符才是 D3D12 规范允许的。
+    fn generation_idle(&self, generation: u8) -> bool {
+        self.watermarks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter_map(Weak::upgrade)
+            .all(|watermark| watermark.generation_idle(generation))
+    }
+
+    /// 把各窗口**当前**的提交水位登记到 `generation` 上（该代即将被弃用；C3）。
+    ///
+    /// 调用方持有图集写锁 ⇒ 不可能有新提交；此刻登记的 `value` 就是该窗口最后使用该代的序号。
+    fn capture_generation_watermark(&self, generation: u8) {
+        let watermarks = self
+            .watermarks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for watermark in watermarks.iter().filter_map(Weak::upgrade) {
+            watermark.retire_generation(generation, watermark.value());
+        }
+    }
+
     /// 登记一个提交流的水位（`CommandStream::new`；条目只持 `Weak`）。
     pub(crate) fn register_watermark(&self, fence: ID3D12Fence) -> Arc<StreamWatermark> {
         let watermark = Arc::new(StreamWatermark::new(fence));
@@ -674,76 +735,6 @@ impl SharedGpu {
             .collect()
     }
 
-    /// 等全部窗口的提交水位到达（R08-6：页换代的最小等待集）。
-    ///
-    /// 返回 `false` 表示「设备健康但**有**窗口的水位在 [`FENCE_TIMEOUT_MS`] 内没来」——
-    /// 这不是错误（R08-3），只是慢路径：页换代照做，旧纹理先进延迟销毁表，下一次成功同步再释放。
-    fn wait_watermarks(&self) -> Result<bool, EngineError> {
-        let pending: Vec<(ID3D12Fence, u64)> = self
-            .watermarks
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .filter_map(Weak::upgrade)
-            .map(|watermark| (watermark.fence(), watermark.value()))
-            .filter(|(_, value)| *value > 0)
-            .collect();
-        if pending.is_empty() {
-            return Ok(true);
-        }
-        let deadline = Instant::now() + Duration::from_millis(u64::from(FENCE_TIMEOUT_MS));
-        let mut synced = true;
-        for (fence, value) in pending {
-            // SAFETY: fence 句柄由对应窗口的提交流持有（它是 `Weak` 的强引用方，页换代期间
-            // 提交流一定还活着：调用方是窗口自己的 GPU 线程或它的锁持有者）。
-            if unsafe { fence.GetCompletedValue() } >= value {
-                continue;
-            }
-            // SAFETY: 无名称 auto-reset 事件，仅本次等待使用；句柄在返回前关闭。
-            let event: HANDLE = unsafe { CreateEventW(None, false, false, None) }
-                .map_err(|error| init_error_from("CreateEventW(atlas watermark)", error))?;
-            // SAFETY: fence / 事件句柄在本次调用期间有效。
-            let armed = unsafe { fence.SetEventOnCompletion(value, event) };
-            if let Err(error) = armed {
-                // SAFETY: 事件句柄由本函数独占，失败路径也必须关闭一次。
-                unsafe {
-                    let _ = CloseHandle(event);
-                }
-                return Err(init_error_from(
-                    "SetEventOnCompletion(atlas watermark)",
-                    error,
-                ));
-            }
-            let remaining = deadline
-                .saturating_duration_since(Instant::now())
-                .as_millis()
-                .max(1) as u32;
-            // SAFETY: 事件句柄在本次调用期间有效。
-            let wait = unsafe { WaitForSingleObject(event, remaining) };
-            // SAFETY: 事件句柄由本函数独占，关闭一次。
-            unsafe {
-                let _ = CloseHandle(event);
-            }
-            if wait == WAIT_OBJECT_0 && unsafe { fence.GetCompletedValue() } >= value {
-                continue;
-            }
-            // 设备真的没了 ⇒ 走设备丢失路径；否则是本轮慢路径（合成器/GPU 停摆）。
-            // SAFETY: 设备句柄由本结构持有，调用期间有效；查询无副作用。
-            if let Err(error) = unsafe { self.raw.GetDeviceRemovedReason() }
-                && is_device_removal(error.code())
-                && let Some(sticky) = self.note_failure()
-            {
-                return Err(sticky);
-            }
-            synced = false;
-            super::diagnostics::frame_wait_timeout();
-            if wait == WAIT_TIMEOUT || Instant::now() >= deadline {
-                break;
-            }
-        }
-        Ok(synced)
-    }
-
     /// 登记资源（`&mut Device` 的短临界区）。
     pub(crate) fn allocate(&self, resource: ID3D12Resource) -> GpuResourceHandle {
         self.device_lock().allocate(resource)
@@ -771,12 +762,16 @@ impl SharedGpu {
         self.device_lock().live_resources()
     }
 
-    /// 把一个或多个图集页重建到指定页尺寸。
+    /// 把一个或多个图集页重建到指定页尺寸（C3：双代描述符组）。
     ///
-    /// 写锁内重新检查（排队期间别的窗口可能已经建好同一页），然后**等各窗口的提交水位**：
-    /// 页重建是唯一的「全局事件」，但它需要的不是整条队列 idle，而是「没有在飞命令列表还引用
-    /// 旧纹理」（R08-6）。所有窗口的录制 + 提交都在图集**读锁**内完成，写锁期间不可能出现新
-    /// 提交，因此快照时的水位就覆盖了全部在飞引用。
+    /// 契约：
+    /// 1. 写锁内重新检查（排队期间别的窗口可能已经建好同一页）；
+    /// 2. 只把新 SRV 写进**没有在飞引用**的那一代 —— 目标代是否空闲由各窗口登记的代际弃用
+    ///    水位**非阻塞**判定；不空闲返回 [`AtlasRebuildOutcome::Deferred`]，此时**什么都没改**
+    ///    （不换纹理、不写描述符、不翻转代际），调用方短暂退避后重试；
+    /// 3. 换代顺序：释放目标代上更早的旧纹理（目标代已无引用）→ 创建新纹理、当前代旧纹理
+    ///    挂进当前代的回收表 → 写目标代描述符 → 登记当前代的弃用水位 → 翻转
+    ///    `atlas_generation`。全部发生在图集写锁内（录制方持读锁，不会看到中间态）。
     ///
     /// 页重建是**进程级事件**：只有第一个看到「App 换代的新页」的窗口会真正重建（窗口侧的
     /// `AtlasUploads::reconcile_pages` 已经把「别的窗口换代之后留下的旧页上传」丢弃），其余
@@ -784,7 +779,7 @@ impl SharedGpu {
     pub(crate) fn rebuild_atlas_pages(
         &self,
         requests: &[(AtlasKind, u32)],
-    ) -> Result<(), EngineError> {
+    ) -> Result<AtlasRebuildOutcome, EngineError> {
         let mut atlas = self.atlas.write().unwrap_or_else(PoisonError::into_inner);
         let pending: Vec<(AtlasKind, u32)> = requests
             .iter()
@@ -792,33 +787,29 @@ impl SharedGpu {
             .filter(|(kind, page)| atlas.page(*kind) != *page)
             .collect();
         if pending.is_empty() {
-            return Ok(());
+            return Ok(AtlasRebuildOutcome::Applied);
         }
-        let synced = self.wait_watermarks()?;
-        if synced {
-            // 上一次慢路径留下的旧纹理此时一定没有引用（所有水位都到了）。
-            self.deferred_atlas
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clear();
-        } else {
+        let active = self.atlas_generation.load(Ordering::Acquire);
+        let target = (active + 1) % ATLAS_GENERATIONS;
+        // 1) 非阻塞安全判据（C3 的核心）：目标代上一次被弃用时登记的提交水位必须全部完成。
+        //    未完成 ⇒ 仍可能有在飞命令列表引用目标代的描述符，D3D12 禁止此时改写它们。
+        if !self.generation_idle(target) {
             super::diagnostics::atlas_deferred_rebuild();
+            return Ok(AtlasRebuildOutcome::Deferred);
         }
+        let mut switch = self
+            .atlas_switch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // 2) 目标代没有任何在飞引用：它上面更早换下来的旧纹理此时一定也没人引用，可以释放。
+        switch.retired_textures[target as usize].clear();
+        // 3) 创建新纹理；被换下来的当前代纹理仍可能被在飞帧采样 ⇒ 按当前代挂进回收表。
         let mut rebuilt = AtlasRebuilt::default();
         for (kind, page) in pending {
             let old = atlas.recreate(self.raw(), kind, page)?;
-            if synced {
-                drop(old);
-            } else {
-                // 慢路径：仍可能有在飞帧引用旧纹理（只是等不到水位）。留在表里，下一次成功
-                // 同步时释放 —— 绝不在这里读已销毁的 UPLOAD/纹理。
-                self.deferred_atlas
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(old);
-            }
+            switch.retired_textures[active as usize].push(old);
             self.srv_heap
-                .write_atlas(self.raw(), kind, atlas.texture(kind));
+                .write_atlas(self.raw(), target, kind, atlas.texture(kind));
             self.atlas_pages[kind.index() as usize].store(page, Ordering::Release);
             rebuilt.mark(kind);
         }
@@ -826,12 +817,12 @@ impl SharedGpu {
             rebuilt.glyph || rebuilt.image,
             "a non-empty rebuild must recreate at least one atlas page"
         );
-        Ok(())
+        // 4) 登记当前代在各窗口上的弃用水位（此后新提交都属于 target 代）。
+        self.capture_generation_watermark(active);
+        // 5) 翻转代际（写锁内：录制方持读锁 + 读代际，看到的一定是已写好的目标代描述符）。
+        self.atlas_generation.store(target, Ordering::Release);
+        Ok(AtlasRebuildOutcome::Applied)
     }
-
-    /// 设备恢复后按 CPU 影子页重传图集（R08-4）。
-    ///
-    /// 影子页是录制期从同一份上传字节落下来的（`SharedAtlas::update_shadow`），因此恢复后的
     /// 图集内容与被移除设备上的一致。
     fn restore_atlas(&self, snapshot: &[Option<(u32, Vec<u8>)>; 2]) -> Result<(), EngineError> {
         let mut atlas = self.atlas.write().unwrap_or_else(PoisonError::into_inner);
@@ -848,12 +839,21 @@ impl SharedGpu {
                 continue;
             }
             atlas.recreate(self.raw(), kind, *page)?;
-            self.srv_heap
-                .write_atlas(self.raw(), kind, atlas.texture(kind));
+            // 新设备上没有任何在飞帧：两代描述符组都指向恢复后的纹理（代际重置为 0）。
+            for generation in 0..ATLAS_GENERATIONS {
+                self.srv_heap
+                    .write_atlas(self.raw(), generation, kind, atlas.texture(kind));
+            }
             self.atlas_pages[index].store(*page, Ordering::Release);
             let texture = atlas.texture(kind).clone();
             self.upload_atlas_page_now(&texture, kind, *page, pixels)?;
         }
+        // 设备恢复后没有任何在飞引用：清空旧代回收表并重置代际。
+        self.atlas_switch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retired_textures = [Vec::new(), Vec::new()];
+        self.atlas_generation.store(0, Ordering::Release);
         Ok(())
     }
 
@@ -1338,7 +1338,7 @@ mod tests {
         core::Interface,
     };
 
-    use super::{Device, SharedGpu};
+    use super::{AtlasRebuildOutcome, Device, SharedGpu};
     use crate::{error::EngineError, paint::atlas::AtlasKind};
 
     fn debug_texture(device: &Device) -> Result<ID3D12Resource, EngineError> {
@@ -1407,23 +1407,156 @@ mod tests {
         );
     }
 
-    /// 共享图集的页换代：写锁 + 各窗口水位之后替换纹理，页尺寸与描述符一起前进。
+    /// C3：共享图集页换代用**双代描述符组**：每次换代只写未在用的一代并翻转代际。
     #[test]
-    fn rebuilding_a_shared_atlas_page_swaps_the_texture() {
+    fn rebuilding_a_shared_atlas_page_swaps_the_descriptor_generation() {
         let _guard = super::gpu_test_lock();
         let shared = SharedGpu::new_warp().expect("WARP shared gpu");
         assert_eq!(shared.atlas().page(AtlasKind::Glyph), 1, "占位页是 1×1");
-        shared
-            .rebuild_atlas_pages(&[(AtlasKind::Glyph, 64)])
-            .expect("rebuild");
+        assert_eq!(shared.atlas_generation(), 0);
+        assert_eq!(
+            shared
+                .rebuild_atlas_pages(&[(AtlasKind::Glyph, 64)])
+                .expect("rebuild"),
+            AtlasRebuildOutcome::Applied
+        );
         assert_eq!(shared.atlas().page(AtlasKind::Glyph), 64);
         assert_eq!(shared.atlas().row_pitch(AtlasKind::Glyph), 256);
+        assert_eq!(
+            shared.atlas_generation(),
+            1,
+            "换代只写目标代并把它翻成当前代"
+        );
 
-        // 同一页重复请求是 no-op（其余窗口在写锁释放后不必再重建）。
-        shared
-            .rebuild_atlas_pages(&[(AtlasKind::Glyph, 64)])
-            .expect("no-op rebuild");
+        // 同一页重复请求是 no-op：不换代（其余窗口在写锁释放后不必再重建）。
+        assert_eq!(
+            shared
+                .rebuild_atlas_pages(&[(AtlasKind::Glyph, 64)])
+                .expect("no-op rebuild"),
+            AtlasRebuildOutcome::Applied
+        );
+        assert_eq!(shared.atlas_generation(), 1);
         assert_eq!(shared.atlas().page(AtlasKind::Glyph), 64);
+
+        // 第二次真正换代回到代 0（没有窗口登记水位 ⇒ 代 1 已空闲、可立即复用）。
+        assert_eq!(
+            shared
+                .rebuild_atlas_pages(&[(AtlasKind::Glyph, 128)])
+                .expect("rebuild"),
+            AtlasRebuildOutcome::Applied
+        );
+        assert_eq!(shared.atlas_generation(), 0);
+        assert_eq!(shared.atlas().page(AtlasKind::Glyph), 128);
+    }
+
+    /// C3 的核心不变量：目标代仍有在飞引用时**绝不**改写它的描述符 —— 非阻塞返回
+    /// `Deferred`（纹理 / 页尺寸 / 代际全部保持原状），引用完成后同一请求即可应用。
+    #[test]
+    fn a_generation_with_in_flight_frames_defers_the_page_rebuild() {
+        let _guard = super::gpu_test_lock();
+        let shared = SharedGpu::new_warp().expect("WARP shared gpu");
+        // 造一个未完成的 fence 并登记为窗口水位；把「代 1」标记为它使用过（弃用水位 = 1）。
+        let fence: ID3D12Fence =
+            unsafe { shared.raw().CreateFence(0, D3D12_FENCE_FLAG_NONE) }.expect("fence");
+        let watermark = shared.register_watermark(fence.clone());
+        watermark.retire_generation(1, 1);
+        assert!(!watermark.generation_idle(1), "fence 未完成 ⇒ 代 1 仍在飞");
+
+        assert_eq!(
+            shared
+                .rebuild_atlas_pages(&[(AtlasKind::Glyph, 64)])
+                .expect("deferred rebuild"),
+            AtlasRebuildOutcome::Deferred
+        );
+        assert_eq!(shared.atlas_generation(), 0, "Deferred 不得翻转代际");
+        assert_eq!(
+            shared.atlas().page(AtlasKind::Glyph),
+            1,
+            "Deferred 不得换纹理（什么都没改）"
+        );
+
+        // CPU 侧 signal 让 fence 完成：同一请求接下来必须成功。
+        unsafe { fence.Signal(1) }.expect("signal fence");
+        assert!(watermark.generation_idle(1));
+        assert_eq!(
+            shared
+                .rebuild_atlas_pages(&[(AtlasKind::Glyph, 64)])
+                .expect("rebuild"),
+            AtlasRebuildOutcome::Applied
+        );
+        assert_eq!(shared.atlas_generation(), 1);
+        assert_eq!(shared.atlas().page(AtlasKind::Glyph), 64);
+        shared.unregister_watermark(&watermark);
+    }
+
+    /// C3 的**捕获侧**（review-c RC-3）：换代时弃用水位必须登记到**离开**的那一代
+    /// （`capture_generation_watermark(active)`），下一次回到该代时用它判空闲。
+    ///
+    /// 变异 `capture_generation_watermark(active)` → `(target)`（把水位记到即将启用的代上）
+    /// 会让第二次换代误判「代 0 空闲」并改写仍被在飞帧引用的描述符。本测试用「未完成的
+    /// fence + 真实登记流」确定性构造该状态：
+    /// 1. 流水位 = 7（最后提交序号），fence 完成值 0 ⇒ 代 0 的引用仍在飞；
+    /// 2. 第一次换代（0→1）必须把**代 0**的弃用水位捕获为 7；
+    /// 3. 第二次换代（目标回到代 0）必须 `Deferred`（不写描述符/不翻代）；
+    /// 4. signal 后同一请求 `Applied`。
+    #[test]
+    fn the_retired_watermark_is_captured_for_the_departing_generation() {
+        let _guard = super::gpu_test_lock();
+        let shared = SharedGpu::new_warp().expect("WARP shared gpu");
+        let fence: ID3D12Fence =
+            unsafe { shared.raw().CreateFence(0, D3D12_FENCE_FLAG_NONE) }.expect("fence");
+        let watermark = shared.register_watermark(fence.clone());
+        // 模拟：该流最后一次使用「代 0」的提交序号是 7，且 fence 尚未完成（仍在飞）。
+        watermark.publish_for_test(7);
+        assert_eq!(watermark.value(), 7);
+
+        assert_eq!(
+            shared
+                .rebuild_atlas_pages(&[(AtlasKind::Glyph, 64)])
+                .expect("first rebuild"),
+            AtlasRebuildOutcome::Applied
+        );
+        assert_eq!(shared.atlas_generation(), 1, "第一次换代 0 → 1");
+        // 捕获侧不变量：被弃用的是代 0，弃用水位必须记在**代 0** 上（fence 未完成 ⇒ 非空闲）。
+        assert!(
+            !watermark.generation_idle(0),
+            "capture 必须把弃用水位登记到离开的代（代 0），而不是目标代（代 1）"
+        );
+        assert!(
+            watermark.generation_idle(1),
+            "代 1 从未被该流使用，必须视为空闲"
+        );
+
+        // 第二次换代目标回到代 0：其弃用水位（7）尚未完成 ⇒ 只能 Deferred。
+        assert_eq!(
+            shared
+                .rebuild_atlas_pages(&[(AtlasKind::Glyph, 128)])
+                .expect("second rebuild"),
+            AtlasRebuildOutcome::Deferred
+        );
+        assert_eq!(
+            shared.atlas_generation(),
+            1,
+            "Deferred 不得切换回仍有在飞引用的代"
+        );
+        assert_eq!(
+            shared.atlas().page(AtlasKind::Glyph),
+            64,
+            "Deferred 不得换纹理"
+        );
+
+        // fence 完成：同一请求必须成功回到代 0。
+        unsafe { fence.Signal(7) }.expect("signal fence");
+        assert!(watermark.generation_idle(0), "fence 完成后代 0 才空闲");
+        assert_eq!(
+            shared
+                .rebuild_atlas_pages(&[(AtlasKind::Glyph, 128)])
+                .expect("third rebuild"),
+            AtlasRebuildOutcome::Applied
+        );
+        assert_eq!(shared.atlas_generation(), 0, "第二次真正换代回到代 0");
+        assert_eq!(shared.atlas().page(AtlasKind::Glyph), 128);
+        shared.unregister_watermark(&watermark);
     }
 
     /// 设备真正被移除时：`note_failure` 升级为 `DeviceLost`（粘性）并落 DRED 日志。

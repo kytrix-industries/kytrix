@@ -247,7 +247,10 @@ fn device_name(device: &ProtocolObject<dyn MTLDevice>) -> SmolStr {
 }
 
 /// 设备丢失诊断：写一行到 `%TEMP%`（写失败只降级为路径本身）。
-fn write_diagnostics(reason: &str, frame: u64) -> PathBuf {
+///
+/// 消费者：本模块的 `note_failure`（命令缓冲错误）与 `core::device_lost`（恢复超限）——
+/// 两者都产出 `EngineError::DeviceLost`，而该错误的公开契约要求 `log_path` 指向已落盘的诊断。
+pub(crate) fn write_diagnostics(reason: &str, frame: u64) -> PathBuf {
     let path = std::env::temp_dir().join(smol_str::format_smolstr!(
         "kytrix-metal-{}-{frame}.txt",
         std::process::id()
@@ -310,5 +313,104 @@ impl ResourceTable {
         );
         self.free.push(index as u32);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use objc2::rc::Retained;
+    use objc2_foundation::{NSError, NSString};
+    use objc2_metal::MTLCommandBufferError;
+
+    use super::Device;
+    use crate::error::EngineError;
+
+    /// 用一个 `MTLCommandBufferError` 域的 `NSError` 跑一遍分类（每个码用新 `Device`：
+    /// `note_failure` 一旦置位就是粘性的，不能复用同一个句柄表）。
+    fn classify(domain: &str, code: isize) -> Option<EngineError> {
+        let mut device = Device::new().expect("metal device");
+        let domain = NSString::from_str(domain);
+        // SAFETY: `errorWithDomain:code:userInfo:` 的 `userInfo` 允许为 nil（objc2 的
+        // `Option<&NSDictionary>` 把它编码成 nil）；domain 是本函数持有的 `NSString`。
+        let error: Retained<NSError> =
+            unsafe { NSError::errorWithDomain_code_userInfo(&domain, code, None) };
+        device.note_failure(Some(&error), 7)
+    }
+
+    /// **C4 分类契约**（audit §4.4-1）：只有 `MTLCommandBufferError` 域的
+    /// `AccessRevoked(4)` / `DeviceRemoved(11)` 升级为粘性 `DeviceLost`；其余错误码（包括
+    /// 历史实现误当成 `AccessRevoked` 的 `StackOverflow(12)`）与其它错误域都保持非
+    /// `DeviceLost` —— 它们不是设备级事实，不能触发整 renderer 重建。
+    #[test]
+    fn only_access_revoked_and_device_removed_classify_as_device_lost() {
+        for code in [
+            MTLCommandBufferError::AccessRevoked.0 as isize,
+            MTLCommandBufferError::DeviceRemoved.0 as isize,
+        ] {
+            match classify("MTLCommandBufferError", code) {
+                Some(EngineError::DeviceLost { reason, log_path }) => {
+                    assert!(
+                        reason.contains("MTLCommandBufferError"),
+                        "分类理由必须可诊断：{reason}"
+                    );
+                    assert!(
+                        log_path.exists(),
+                        "DeviceLost 必须落盘诊断文件：{log_path:?}"
+                    );
+                }
+                other => panic!("code {code} 必须升级为 DeviceLost：{other:?}"),
+            }
+        }
+        for code in [
+            MTLCommandBufferError::StackOverflow.0 as isize,
+            MTLCommandBufferError::Internal.0 as isize,
+            99,
+        ] {
+            assert!(
+                classify("MTLCommandBufferError", code).is_none(),
+                "code {code} 不是设备丢失：必须保持非 DeviceLost（由调用方归 Swapchain）"
+            );
+        }
+        assert!(
+            classify(
+                "NSErrorDomainUnrelated",
+                MTLCommandBufferError::DeviceRemoved.0 as isize
+            )
+            .is_none(),
+            "其它错误域的同码值含义不同，不能当设备丢失"
+        );
+        // 命令缓冲没有 `error` 对象（例如 `status == Completed`）：不是设备丢失。
+        let mut device = Device::new().expect("metal device");
+        assert!(device.note_failure(None, 1).is_none());
+    }
+
+    /// 设备丢失是粘性的：第一次 `DeviceLost` 之后，即使后续错误码不是设备级，也不能被
+    /// 降级成可重试错误（GPU 工作已不可信）。
+    #[test]
+    fn device_loss_is_sticky_for_the_whole_device() {
+        use std::path::PathBuf;
+
+        let mut device = Device::new().expect("metal device");
+        let domain = NSString::from_str("MTLCommandBufferError");
+        // SAFETY: 同 `classify`：domain 是本地 `NSString`，userInfo 为 nil。
+        let removed = unsafe {
+            NSError::errorWithDomain_code_userInfo(
+                &domain,
+                MTLCommandBufferError::DeviceRemoved.0 as isize,
+                None,
+            )
+        };
+        assert!(matches!(
+            device.note_failure(Some(&removed), 1),
+            Some(EngineError::DeviceLost { .. })
+        ));
+        match device.note_failure(None, 2) {
+            Some(EngineError::DeviceLost { reason, log_path }) => {
+                assert!(reason.contains("MTLCommandBufferError"), "{reason}");
+                assert_ne!(log_path, PathBuf::new());
+            }
+            other => panic!("粘性 DeviceLost 必须被再次报告：{other:?}"),
+        }
+        assert!(device.lost_error().is_some());
     }
 }

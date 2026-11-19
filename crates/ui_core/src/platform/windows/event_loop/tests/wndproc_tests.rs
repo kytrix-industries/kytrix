@@ -30,8 +30,8 @@ use windows::Win32::{
             WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_DISPLAYCHANGE, WM_ENTERSIZEMOVE,
             WM_EXITSIZEMOVE, WM_IME_CHAR, WM_IME_COMPOSITION, WM_IME_SETCONTEXT,
             WM_IME_STARTCOMPOSITION, WM_INPUTLANGCHANGE, WM_LBUTTONDOWN, WM_MOUSEMOVE,
-            WM_NCHITTEST, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSW,
-            WS_OVERLAPPEDWINDOW,
+            WM_NCHITTEST, WM_PAINT, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER,
+            WNDCLASSW, WS_OVERLAPPEDWINDOW,
         },
     },
 };
@@ -175,6 +175,35 @@ fn release_capture_without_ownership_leaves_no_suppress() {
     );
     assert!(!state.suppress_capture_cancel);
     destroy_hidden_window(hwnd, state as *mut WndProcState);
+    // 占位：保证 `class_name` 活到窗口销毁之后。
+    let _ = class_name;
+}
+
+/// C2：`WM_PAINT` 必须推进进程级 DirectComposition 健康检查代际。
+///
+/// MS《Best practices for DirectComposition》：合成设备失效时系统会投递 `WM_PAINT`，应用必须
+/// 在每次 `WM_PAINT` 检查 `CheckDeviceState`。`WndProc` 里只做无锁记账（DComp 调用会同步重入
+/// 消息泵，违反文件头纪律 1），检查在泵的几何 pass、重建在 GPU 线程 —— 本用例钉住「记账」这
+/// 一段的接线：没有它，DWM 重启后引擎永远不会检查设备状态（变异：删掉 `note_device_check`
+/// 调用 ⇒ 本用例红）。
+#[test]
+fn wm_paint_advances_the_composition_check_epoch() {
+    use crate::platform::windows::composition;
+
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, class_name) = hidden_window("KytrixCompositionCheckEpoch", dispatcher);
+    let before = composition::device_check_epoch();
+    // SAFETY: `hwnd` 由本用例独占；`SendMessageW(WM_PAINT)` 同步进入生产 `WndProc`。
+    unsafe {
+        SendMessageW(hwnd, WM_PAINT, Some(WPARAM(0)), Some(LPARAM(0)));
+    }
+    let after = composition::device_check_epoch();
+    assert!(
+        after > before,
+        "WM_PAINT 必须推进 DComp 健康检查代际（before={before} after={after}）"
+    );
+    destroy_hidden_window(hwnd, state);
     // 占位：保证 `class_name` 活到窗口销毁之后。
     let _ = class_name;
 }

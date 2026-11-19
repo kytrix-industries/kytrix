@@ -44,12 +44,24 @@
 //! 两个错误面：[`Composition::new`] 的 COM 创建阶段失败是 [`EngineError::AppInit`]（窗口还建不
 //! 出来）；**运行时**调用（几何 / 提交 / 交换链切换，含首帧 `SetContent` + `Commit`）失败是
 //! [`EngineError::Composition`]，并带失败操作名。
+//!
+//! ## 合成设备健康检查与重建（C2）
+//!
+//! MS《Best practices for DirectComposition》要求每个 `WM_PAINT` 调
+//! `IDCompositionDevice::CheckDeviceState`，设备失效时新建设备并重建全部内容。本模块的分工：
+//! `WndProc` 只推进无锁代际（[`note_device_check`]），泵的几何 pass 消费代际并检查
+//! （[`Composition::check_device_state`]，复用几何 pass 已有的合成锁），设备失效时请求 GPU 线程
+//! 重建（[`Composition::rebuild`] + 重新挂内容/背景/几何 + 一次 `Commit`）。检查/重建都不在
+//! `WndProc` 里做：DComp 调用可能同步重入消息泵，而重建需要 D3D12 设备与交换链（GPU 线程独占）。
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{
+    Mutex, MutexGuard,
+    atomic::{AtomicU64, Ordering},
+};
 
 use windows::{
     Win32::{
-        Foundation::HWND,
+        Foundation::{HWND, RECT},
         Graphics::{
             DirectComposition::{
                 DCOMPOSITION_BITMAP_INTERPOLATION_MODE_LINEAR, DCompositionCreateDevice2,
@@ -58,11 +70,43 @@ use windows::{
             },
             Dxgi::IDXGISwapChain1,
         },
+        UI::WindowsAndMessaging::{GetClientRect, IsWindow},
     },
-    core::IUnknown,
+    core::{BOOL, IUnknown},
 };
 
 use crate::error::EngineError;
+
+/// `WM_PAINT` 健康检查代际（C2）。
+///
+/// MS《Best practices for DirectComposition》：合成设备失效时 DirectComposition 会向窗口投递
+/// `WM_PAINT`，应用应在每次 `WM_PAINT` 里调 `IDCompositionDevice::CheckDeviceState`。`WndProc`
+/// 不能直接查（要拿 DComp 锁、而 DComp 调用可能同步重入消息泵 —— 违反 `wndproc` 纪律），所以这里
+/// 只推进一个**无锁**代际；泵的几何 pass 消费它（那时本来就持合成锁）并把「需要重建」的请求交给
+/// GPU 线程（真正的重建需要 D3D12 设备与交换链，只能在 GPU 线程做）。
+static DEVICE_CHECK_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// `WndProc` 的 `WM_PAINT` 分支调用：只推进代际，不加锁、不做任何 COM 调用。
+pub(crate) fn note_device_check() {
+    DEVICE_CHECK_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
+/// 当前健康检查代际（泵的几何 pass 每轮比较一次；进程级单调）。
+pub(crate) fn device_check_epoch() -> u64 {
+    DEVICE_CHECK_EPOCH.load(Ordering::Acquire)
+}
+
+/// `IDCompositionDevice::CheckDeviceState` 的三分类（C2）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CompositionState {
+    /// 设备有效且窗口仍然存在。
+    #[default]
+    Valid,
+    /// 设备失效（DWM 重启 / DComp 内部失效 / 窗口状态被系统改坏）：可以重建恢复。
+    Invalid,
+    /// 窗口已销毁或合成树已 `shutdown`：恢复没有意义（GPU 线程/窗口正在退出）。
+    WindowClosed,
+}
 
 /// buffer 的硬上限（物理像素；DXGI 纹理上限）。内容超过它显式失败，不静默裁剪。
 const MAX_BUFFER: u32 = 16384;
@@ -188,6 +232,53 @@ impl Composition {
     /// HWND 的 `isize` 形式（GPU 线程 `PostMessageW` 的目标）。
     pub(crate) fn hwnd_raw(&self) -> isize {
         self.hwnd.0 as isize
+    }
+
+    /// 当前 DComp 合成设备的健康状态（C2；GPU 线程 / 泵的几何 pass 调用，调用方持锁）。
+    ///
+    /// `IDCompositionDevice::CheckDeviceState` 返回 `S_OK` + `BOOL`；窗口关闭等失败返回 HRESULT
+    /// 错误（文档未公开具体错误码，且 SDK 头文件不导出该常量）。因此分类不猜错误码：**窗口是否
+    /// 还活着**用 `IsWindow` 判定 —— 窗口已销毁就是 [`CompositionState::WindowClosed`]（退出路径，
+    /// 不恢复）；窗口还在但设备报错/无效就是可重建的 [`CompositionState::Invalid`]。
+    pub(crate) fn check_device_state(&self) -> CompositionState {
+        let Some(device) = &self.device else {
+            return CompositionState::WindowClosed;
+        };
+        // SAFETY: device 由本结构持有到 `shutdown`；查询无副作用。
+        let result = unsafe { device.CheckDeviceState() };
+        classify_device_state(result, self.window_alive())
+    }
+
+    /// 窗口句柄是否仍然指向一个存活窗口。
+    fn window_alive(&self) -> bool {
+        // SAFETY: `IsWindow` 只读查询；失效句柄返回 `FALSE`，不会解引用窗口对象。
+        self.hwnd != HWND::default() && unsafe { IsWindow(Some(self.hwnd)).as_bool() }
+    }
+
+    /// 当前客户区（物理像素；最小 1×1）。重建 visual tree 后用客户区恢复背景缩放几何。
+    pub(crate) fn client_size(&self) -> (u32, u32) {
+        let mut rect = RECT::default();
+        // SAFETY: 只读查询；`RECT` 是栈上输出参数，句柄失效时返回错误。
+        if self.hwnd == HWND::default() || unsafe { GetClientRect(self.hwnd, &mut rect) }.is_err() {
+            return (1, 1);
+        }
+        (
+            (rect.right - rect.left).max(1) as u32,
+            (rect.bottom - rect.top).max(1) as u32,
+        )
+    }
+
+    /// 重建整个 DirectComposition 设备 / visual tree（C2）。
+    ///
+    /// 保留 HWND 与调用方随后重新挂上的内容：`shutdown()` 先 `SetRoot(NULL)` + `Commit` 并按
+    /// 依赖顺序释放旧对象（`CreateTargetForHwnd` 要求窗口上没有旧 target），再走一次
+    /// [`Composition::new`] 的创建顺序。调用方必须重新 `set_content` / `set_background_content` /
+    /// `set_geometry` 并 `commit`（GPU 线程的 `GpuRenderer::rebuild_composition` 负责）。
+    pub(crate) fn rebuild(&mut self) -> Result<(), EngineError> {
+        let hwnd = self.hwnd;
+        self.shutdown();
+        *self = Self::new(hwnd)?;
+        Ok(())
     }
 
     /// 把内容交换链挂到**内容 visual** 上（恒 1:1，不缩放）。
@@ -389,10 +480,191 @@ fn runtime_error(stage: &'static str, error: windows::core::Error) -> EngineErro
     }
 }
 
+/// `CheckDeviceState` 结果的三分类（纯函数，C2）。
+///
+/// 顺序很重要：**窗口已关闭优先**（此时设备失效与「窗口销毁中」无法区分，且恢复没有意义，
+/// GPU 线程/Epoch 消费方必须把它当退出前状态而不是反复重建）；窗口还在时 `Ok(FALSE)` 或错误
+/// 都是可重建的 [`CompositionState::Invalid`]。
+fn classify_device_state(
+    result: windows::core::Result<BOOL>,
+    window_alive: bool,
+) -> CompositionState {
+    if !window_alive {
+        return CompositionState::WindowClosed;
+    }
+    match result {
+        Ok(valid) if valid.as_bool() => CompositionState::Valid,
+        Ok(_) | Err(_) => CompositionState::Invalid,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{VisualGeometry, buffer_size, visual_geometry};
+    use windows::{
+        Win32::{
+            Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+            System::LibraryLoader::GetModuleHandleW,
+            UI::WindowsAndMessaging::{
+                CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, WINDOW_EX_STYLE,
+                WNDCLASSW, WS_OVERLAPPEDWINDOW,
+            },
+        },
+        core::{BOOL, PCWSTR},
+    };
+
+    use super::{
+        Composition, CompositionState, VisualGeometry, buffer_size, classify_device_state,
+        visual_geometry,
+    };
     use crate::error::EngineError;
+
+    /// `CheckDeviceState` 的三分类（C2 的纯逻辑核心）：
+    /// - 窗口已关闭时任何结果都归 `WindowClosed`（退出路径，不触发重建）；
+    /// - 窗口存活时 `Ok(TRUE)` = `Valid`；`Ok(FALSE)` 与任意 HRESULT 错误 = 可重建的 `Invalid`。
+    #[test]
+    fn device_state_is_classified_without_guessing_the_undocumented_error_code() {
+        assert_eq!(
+            classify_device_state(Ok(BOOL(1)), true),
+            CompositionState::Valid
+        );
+        assert_eq!(
+            classify_device_state(Ok(BOOL(0)), true),
+            CompositionState::Invalid,
+            "设备自报无效 ⇒ 可重建"
+        );
+        assert_eq!(
+            classify_device_state(
+                Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+                    0x8899_0000u32 as i32
+                ))),
+                true
+            ),
+            CompositionState::Invalid,
+            "窗口仍存活但检查报错 ⇒ 可重建（不猜具体 DComp 错误码）"
+        );
+        assert_eq!(
+            classify_device_state(Ok(BOOL(1)), false),
+            CompositionState::WindowClosed,
+            "窗口已销毁：恢复没有意义"
+        );
+        assert_eq!(
+            classify_device_state(Ok(BOOL(0)), false),
+            CompositionState::WindowClosed
+        );
+        assert_eq!(
+            classify_device_state(
+                Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+                    0x8899_0000u32 as i32
+                ))),
+                false
+            ),
+            CompositionState::WindowClosed
+        );
+    }
+
+    /// `WNDCLASSW::lpfnWndProc` 需要 `extern "system"` 函数指针；`DefWindowProcW` 是
+    /// `unsafe fn`（windows crate 的约定），因此包一层。
+    unsafe extern "system" fn default_window_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        // SAFETY: 由系统在消息分发时调用，参数就是收到的消息。
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// 建一个隐藏窗口（默认窗口过程；本测试只验证 DComp 设备/visual tree 的生命周期）。
+    fn hidden_window(tag: &str) -> (HWND, Vec<u16>) {
+        let class_name = wide(tag);
+        // SAFETY: 进程级模块句柄；类名是 NUL 结尾宽字符串，`RegisterClassW` 同步拷贝。
+        let instance = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(default_window_proc),
+            hInstance: instance.into(),
+            lpszClassName: PCWSTR(class_name.as_ptr()),
+            ..Default::default()
+        };
+        // SAFETY: 同上；每个测试用唯一类名，只注册一次。
+        let atom = unsafe { RegisterClassW(&class) };
+        assert_ne!(atom, 0, "RegisterClassW");
+        // SAFETY: 类已注册；`WS_OVERLAPPEDWINDOW` 不含 `WS_VISIBLE` ⇒ 窗口保持隐藏。
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(class_name.as_ptr()),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                320,
+                240,
+                None,
+                None,
+                Some(instance.into()),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+        (hwnd, class_name)
+    }
+
+    /// C2：真实 DComp 设备 / visual tree 的健康检查与重建（隐藏窗口，不需要交换链）。
+    ///
+    /// 这是 WM_PAINT 检查路径最终会调到的同一套 API：`new` 之后设备有效；`rebuild` 之后仍然
+    /// 有效（旧 target 已完整释放，`CreateTargetForHwnd` 不会撞 already-composed）；`shutdown`
+    /// 幂等并把状态归为 `WindowClosed`（GPU 线程退出路径不得再触发重建）。
+    #[test]
+    fn the_composition_tree_can_be_rebuilt_for_a_live_window() {
+        let (hwnd, _class) = hidden_window("kytrix-composition-rebuild-test");
+        let mut composition = Composition::new(hwnd).expect("DCompositionCreateDevice2");
+        assert_eq!(
+            composition.check_device_state(),
+            CompositionState::Valid,
+            "新建设备必须报告有效"
+        );
+        assert!(composition.client_size().0 >= 1 && composition.client_size().1 >= 1);
+
+        composition.rebuild().expect("rebuild visual tree");
+        assert_eq!(
+            composition.check_device_state(),
+            CompositionState::Valid,
+            "重建后的设备必须报告有效"
+        );
+
+        composition.shutdown();
+        assert_eq!(
+            composition.check_device_state(),
+            CompositionState::WindowClosed,
+            "shutdown 之后不再有可恢复的合成树"
+        );
+        // 幂等：重复 shutdown 不 panic（窗口销毁路径已经显式调过一次）。
+        composition.shutdown();
+
+        // SAFETY: 窗口由本测试创建、尚未交给其它所有者。
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn a_closed_window_is_reported_as_window_closed() {
+        let (hwnd, _class) = hidden_window("kytrix-composition-closed-test");
+        let composition = Composition::new(hwnd).expect("DCompositionCreateDevice2");
+        // SAFETY: 窗口由本测试创建；销毁后句柄失效，`IsWindow` 返回 FALSE。
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+        assert_eq!(
+            composition.check_device_state(),
+            CompositionState::WindowClosed,
+            "窗口销毁后检查必须归为退出路径"
+        );
+    }
 
     #[test]
     fn matching_sizes_are_a_pixel_exact_one_to_one() {

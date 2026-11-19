@@ -917,6 +917,13 @@ impl Window {
     }
 
     // ── surface：实现见 `surface` 子模块的自由函数 ──
+    /// 实现见子模块 `surface::request_composition_rebuild`（C2；Windows 泵的几何 pass 调用）。
+    ///
+    /// 其它平台没有 DirectComposition，不存在该入口（`cfg` 保证只有 Windows 编译它）。
+    #[cfg(target_os = "windows")]
+    pub(crate) fn request_composition_rebuild(&mut self) {
+        surface::request_composition_rebuild(self)
+    }
     /// 实现见子模块 `surface::options`（本文件只保留签名）。
     #[must_use]
     pub fn options(&self) -> &WindowOptions {
@@ -999,6 +1006,16 @@ impl Window {
     }
     pub(crate) fn set_renderer(&mut self, renderer: Renderer) {
         surface::set_renderer(self, renderer)
+    }
+    /// 实现见子模块 `surface::take_renderer`（macOS 设备恢复：先摘旧 renderer 再重建）。
+    #[cfg(target_os = "macos")]
+    pub(crate) fn take_renderer(&mut self) -> Option<Renderer> {
+        surface::take_renderer(self)
+    }
+    /// 实现见子模块 `surface::has_compositor_ticket`（设备恢复据此决定是否覆盖合成线程 sink）。
+    #[cfg(target_os = "macos")]
+    pub(crate) fn has_compositor_ticket(&self) -> bool {
+        surface::has_compositor_ticket(self)
     }
     pub(crate) fn poll_renderer(&mut self) -> Result<(), EngineError> {
         surface::poll_renderer(self)

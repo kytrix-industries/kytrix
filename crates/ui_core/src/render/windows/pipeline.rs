@@ -61,12 +61,16 @@ const SLOT_SRVS: u32 = 2;
 const SLOT_COUNT: u32 = MAX_FRAMES_IN_FLIGHT as u32;
 /// 每窗口占用的描述符数（in-flight 槽 × 每槽 SRV）。
 const WINDOW_SRVS: u32 = SLOT_SRVS * SLOT_COUNT;
-/// 固定段：`[glyph, image]` 图集 SRV。
+/// 每代图集描述符组：`[glyph, image]`。
 const ATLAS_SRVS: u32 = 2;
-/// 堆容量：固定段 + 341 个窗口（每描述符 32 B ⇒ 约 64 KiB，相对显存可忽略）。
+/// 图集描述符组的代数（C3 双代：换代只写**未在用**的一代，旧一代在飞命令列表的引用保持有效）。
+pub(crate) const ATLAS_GENERATIONS: u8 = 2;
+/// 固定段描述符数（所有代）：`ATLAS_SRVS × ATLAS_GENERATIONS`。
+const ATLAS_DESCRIPTORS: u32 = ATLAS_SRVS * ATLAS_GENERATIONS as u32;
+/// 堆容量：固定段 + 340 个窗口（每描述符 32 B ⇒ 约 64 KiB，相对显存可忽略）。
 const SRV_HEAP_CAPACITY: u32 = 2048;
 /// 最多同时存在的窗口数（由堆容量决定；超出时创建渲染器返回 `AppInit`）。
-pub(crate) const MAX_WINDOWS: u32 = (SRV_HEAP_CAPACITY - ATLAS_SRVS) / WINDOW_SRVS;
+pub(crate) const MAX_WINDOWS: u32 = (SRV_HEAP_CAPACITY - ATLAS_DESCRIPTORS) / WINDOW_SRVS;
 
 /// P07 产物（`build.rs` 写入 `OUT_DIR/shaders`；跳过模式是占位符）。
 const QUAD_VS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/quad.vs.dxil"));
@@ -208,10 +212,16 @@ impl Pipeline {
 
 /// 进程级共享的 shader-visible CBV/SRV/UAV 堆。
 ///
-/// 布局（描述符索引）：`[0, ATLAS_SRVS)` 是图集固定段（glyph @0、image @1）；之后是每窗口段
-/// （`[instances, clips]` × in-flight 槽）。窗口段由 [`DescriptorArena`] 分配，窗口只写自己的
-/// 区间。D3D12 每个 command list 每种堆只能绑一张（`SetDescriptorHeaps` 文档），所以实例 / 裁剪
-/// 与图集必须共用这一张堆 —— 根签名的两张描述符表指向同一张堆的两个区间。
+/// 布局（描述符索引）：`[0, ATLAS_DESCRIPTORS)` 是图集的**双代**固定段（代 g 的 glyph @
+/// `g × ATLAS_SRVS`、image @ `g × ATLAS_SRVS + 1`）；之后是每窗口段（`[instances, clips]` ×
+/// in-flight 槽）。窗口段由 [`DescriptorArena`] 分配，窗口只写自己的区间。D3D12 每个 command
+/// list 每种堆只能绑一张（`SetDescriptorHeaps` 文档），所以实例 / 裁剪与图集必须共用这一张堆 ——
+/// 根签名的两张描述符表指向同一张堆的两个区间。
+///
+/// **双代的目的（C3）**：D3D12《Descriptor Heaps Overview》规定描述符在「提交执行中的命令列表
+/// 可能引用它」期间不得被 CPU 改写。图集页换代只改代数里**没有在飞引用**的那一代（代际水位见
+/// `SharedGpu::rebuild_atlas_pages`）；新帧按当前代绑定图集表（根参数 2 的基址），旧帧继续绑定
+/// 旧代，两者互不覆盖。
 pub(crate) struct SrvHeap {
     heap: ID3D12DescriptorHeap,
     descriptor_size: u32,
@@ -243,9 +253,13 @@ impl SrvHeap {
         &self.heap
     }
 
-    /// 图集表基址（root parameter 2；glyph @0、image @1）。
-    pub(crate) fn atlas_table(&self) -> D3D12_GPU_DESCRIPTOR_HANDLE {
-        self.gpu_handle(0)
+    /// 某代图集表基址（root parameter 2；glyph @该代基址、image @该代基址+1）。
+    pub(crate) fn atlas_table(&self, generation: u8) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+        debug_assert!(
+            generation < ATLAS_GENERATIONS,
+            "atlas generation out of range"
+        );
+        self.gpu_handle(u32::from(generation) * ATLAS_SRVS)
     }
 
     /// 某窗口某槽的 `[instances, clips]` 表基址（root parameter 1）。
@@ -279,17 +293,26 @@ impl SrvHeap {
         }
     }
 
-    /// 写一个图集的 SRV（另一个图集的描述符保持不变）。
+    /// 写**指定代**里一个图集的 SRV（另一代与另一图集的描述符保持不变）。
+    ///
+    /// 调用方负责代际前置条件：只允许写「没有在飞命令列表引用」的那一代（C3；由
+    /// `SharedGpu::rebuild_atlas_pages` 的代际水位判据保证）。
     pub(crate) fn write_atlas(
         &self,
         device: &ID3D12Device,
+        generation: u8,
         kind: AtlasKind,
         texture: &ID3D12Resource,
     ) {
+        debug_assert!(
+            generation < ATLAS_GENERATIONS,
+            "atlas generation out of range"
+        );
         let srv = texture_srv(kind);
+        let index = u32::from(generation) * ATLAS_SRVS + kind.index();
         // SAFETY: 设备 / 堆句柄由调用方持有，调用期间有效；描述符索引在固定段内。
         unsafe {
-            device.CreateShaderResourceView(texture, Some(&srv), self.cpu_handle(kind.index()));
+            device.CreateShaderResourceView(texture, Some(&srv), self.cpu_handle(index));
         }
     }
 
@@ -327,25 +350,25 @@ impl DescriptorArena {
     /// 分配一个窗口段，返回段内第一个描述符的**绝对索引**。
     pub(crate) fn allocate(&mut self) -> Option<u32> {
         if let Some(index) = self.free.pop() {
-            return Some(ATLAS_SRVS + index * WINDOW_SRVS);
+            return Some(ATLAS_DESCRIPTORS + index * WINDOW_SRVS);
         }
         if self.next < MAX_WINDOWS {
             let index = self.next;
             self.next += 1;
-            return Some(ATLAS_SRVS + index * WINDOW_SRVS);
+            return Some(ATLAS_DESCRIPTORS + index * WINDOW_SRVS);
         }
         None
     }
 
     /// 归还一个窗口段（`base` 是 [`SrvHeap::slot_table`] 用的段起始索引）。
     pub(crate) fn free(&mut self, base: u32) {
-        debug_assert!(base >= ATLAS_SRVS);
+        debug_assert!(base >= ATLAS_DESCRIPTORS);
         debug_assert_eq!(
-            (base - ATLAS_SRVS) % WINDOW_SRVS,
+            (base - ATLAS_DESCRIPTORS) % WINDOW_SRVS,
             0,
             "window descriptor base must be aligned"
         );
-        self.free.push((base - ATLAS_SRVS) / WINDOW_SRVS);
+        self.free.push((base - ATLAS_DESCRIPTORS) / WINDOW_SRVS);
     }
 }
 fn buffer_srv(num_elements: u32, stride: u32) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -822,7 +845,10 @@ fn upload_buffer(
 mod tests {
     use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 
-    use super::{ATLAS_SRVS, DescriptorArena, Pipeline, SrvHeap, WINDOW_SRVS};
+    use super::{
+        ATLAS_DESCRIPTORS, ATLAS_GENERATIONS, ATLAS_SRVS, DescriptorArena, Pipeline, SrvHeap,
+        WINDOW_SRVS,
+    };
     use crate::{
         paint::geometry::{GeometryId, GeometryPipeline, IndexType, Topology},
         render::windows::device::Device,
@@ -839,7 +865,6 @@ mod tests {
         let _ = pipeline.geometry(GeometryPipeline::Ui);
     }
 
-    /// 一张共享堆里的两段：图集固定段在索引 0/1，窗口段从 `ATLAS_SRVS` 开始。
     /// 驱逐决策的边界（不建真实设备：只验「多少帧未用才算过期」这一纯逻辑）。
     #[test]
     fn geometry_is_evicted_only_after_the_grace_window() {
@@ -855,6 +880,8 @@ mod tests {
         assert!(!geometry_is_stale(0, u64::MAX));
     }
 
+    /// C3：图集固定段有 `ATLAS_GENERATIONS` 代，每代 `ATLAS_SRVS` 个（glyph/image）；
+    /// 两代基址必须落在不同描述符上（互换时不覆盖），窗口段从固定段之后开始。
     #[test]
     fn the_srv_heap_reserves_the_atlas_segment_before_window_segments() {
         let _guard = crate::render::windows::device::gpu_test_lock();
@@ -863,11 +890,26 @@ mod tests {
         let mut arena = DescriptorArena::new();
         let first = arena.allocate().expect("first window segment");
         let second = arena.allocate().expect("second window segment");
-        assert_eq!(first, ATLAS_SRVS);
-        assert_eq!(second, ATLAS_SRVS + WINDOW_SRVS);
-        assert_ne!(heap.atlas_table().ptr, 0);
-        assert_ne!(heap.slot_table(first, 0).ptr, heap.atlas_table().ptr);
+        assert_eq!(first, ATLAS_DESCRIPTORS, "窗口段从图集双代固定段之后开始");
+        assert_eq!(second, ATLAS_DESCRIPTORS + WINDOW_SRVS);
+        // SAFETY: 只读查询描述符增量；设备 / 堆由本测试持有。
+        let descriptor_size = unsafe {
+            device.raw().GetDescriptorHandleIncrementSize(
+                windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            )
+        };
+        let generation0 = heap.atlas_table(0);
+        let generation1 = heap.atlas_table(1);
+        assert_ne!(generation0.ptr, 0);
+        assert_eq!(
+            generation1.ptr - generation0.ptr,
+            u64::from(descriptor_size) * u64::from(ATLAS_SRVS),
+            "两代图集描述符组必须相隔 ATLAS_SRVS 个描述符（换代不覆盖在飞代）"
+        );
+        // 每代内 glyph @+0、image @+1 由 shader 的 t0/t1 绑定约定保证（根签名 range 是 2）。
+        assert_ne!(heap.slot_table(first, 0).ptr, generation0.ptr);
         assert_ne!(heap.slot_table(first, 1).ptr, heap.slot_table(first, 0).ptr);
+        assert_eq!(ATLAS_GENERATIONS, 2, "C3 的判据建立在恰好两代之上");
 
         // 归还的段会被复用（窗口关闭后新窗口拿回同一段）。
         arena.free(first);

@@ -31,9 +31,38 @@
 //!   一次 hover）直接命中运行态，不必付「display link 恢复 → 下一个 vsync 才回调」的一帧延迟。
 
 //!
-//! 设备级对象（`MTLDevice` / 两个 metallib / 4 条 PSO / 采样器）全部来自进程单例
+//! 设备级对象（`MTLDevice` / 两个 metallib / 4 条 PSO / 采样器）全部来自进程注册表
 //! [`GpuCore`]（R09-5）：本模块的每窗口状态只剩 drawable、persist、上传槽、display link 与
 //! GPU 线程。
+//!
+//! # 设备恢复（C4）：整 renderer 重建
+//!
+//! `DeviceLost` 的恢复粒度是**整 renderer 重建**（对齐 Chrome：Metal 后端在 GPU 进程中，设备
+//! 丢失 = GPU 侧进程级状态重建，粗粒度重建比 in-place 修复可控）：
+//!
+//! 1. 平台泵发现窗口的粘性 `DeviceLost` 后先 take/drop 旧 `Renderer`（[`WindowRenderer::drop`]：
+//!    invalidate display link + 有界 join GPU 线程，主线程上限 [`JOIN_TIMEOUT`] = 250 ms）；
+//! 2. [`GpuCore::recover`] 把进程注册表换成新实例（5 s 内最多 3 次；其它窗口已重建则复用）；
+//! 3. [`Renderer::new_with_layer`] 用**旧 `CAMetalLayer`**（只 `setDevice(new)` + 窗口级属性
+//!    重写 + 几何/drawableSize 重放，见 `swapchain::reuse_layer`）新建 persist / 图集页 /
+//!    上传槽 / GPU 线程 / display link；
+//! 4. 平台泵把新 renderer 挂回窗口，并 `compositor().register(id, new_sink)` 覆盖旧 sink
+//!    （否则合成线程继续把 delta 投给已死的 `Arc<Shared>` ⇒ 黑屏），再
+//!    `Window::force_full_republish()` + `request_repaint()` 整帧重发。
+//!
+//! 代价（登记为残余风险，不触发性能门禁）：恢复发生在 UI 泵内，**主线程阻塞上限 250 ms**
+//! （旧 GPU 线程 join）＋新 GPU 线程首帧 PSO 编译数十毫秒；**可见空窗约 1–3 帧**（旧帧保留到
+//! 新 renderer 出第一帧）。恢复期间交易终端看不到新行情，需要产品侧提示时由应用层决定。
+//!
+//! 恢复失败/超限把错误交回泵：泵写入 `state.error` 走**既有退出路径**（应用退出语义不变）。
+//!
+//! # 测试注入（`test-support`）
+//!
+//! 真实 `MTLCommandBufferError.DeviceRemoved` 无法在测试里制造，因此 `test-support` 构建下
+//! 环境变量 `KYTRIX_METAL_INJECT_DEVICE_LOST=1` 会让 `kytrix-metal` 线程在**第一个有待画帧的
+//! tick** 发布一次 `DeviceLost`（进程内只注入一次，见 [`take_injected_device_lost`]）。
+//! `acceptance window` 用它验收「进程不退出 + GpuCore 重建一次 + 帧计数恢复」；生产构建
+//! （无 `test-support`）不编译该分支，环境变量也无效果（cfg + 环境变量双门）。
 //!
 //! 关闭握手（§4.5 / F-169）：`Drop` 里停 display link → signal shutdown → **有界等待** GPU 线程
 //! 退出（[`JOIN_TIMEOUT`]，超时 detach，见 [`join_with_deadline`]）；GPU 线程在退出前自行 drain
@@ -41,6 +70,7 @@
 
 use std::{
     collections::VecDeque,
+    ops::ControlFlow,
     path::PathBuf,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, PoisonError,
@@ -52,7 +82,8 @@ use std::{
 
 use objc2::{
     AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
-    rc::Retained, runtime::ProtocolObject,
+    rc::{Retained, autoreleasepool},
+    runtime::ProtocolObject,
 };
 use objc2_core_foundation::CFTimeInterval;
 use objc2_foundation::{NSObject, NSRunLoop, NSRunLoopCommonModes};
@@ -140,13 +171,15 @@ impl Renderer {
         })
     }
 
-    /// 真实窗口：主线程建图层（GPU 侧对象随后整体移交），建 `CAMetalDisplayLink` 并挂到
-    /// 主 run loop 的 common modes。
+    /// 真实窗口（首建）：主线程建图层（GPU 侧对象随后整体移交），建 `CAMetalDisplayLink` 并挂
+    /// 到主 run loop 的 common modes。
+    ///
+    /// 恢复路径不走这里（那会丢掉旧图层的几何历史）——见 [`Self::new_with_layer`]。
     ///
     /// `background` 同时写进图层的 `backgroundColor`（sRGB，旧 drawable 之外）与 persist 的
     /// clear color（linear，新 drawable 内部）。
     ///
-    /// **主线程只做窗口级工作**（R09-5）：设备 / metallib / PSO 全部来自进程单例
+    /// **主线程只做窗口级工作**（R09-5）：设备 / metallib / PSO 全部来自进程注册表
     /// [`GpuCore`]（首次调用后才需要加载，之后是纯读），本函数新建的只有图层、persist、
     /// 三槽上传缓冲与 1×1 占位图集页 —— 都是 `newTexture` / `newBuffer` 级的小分配。
     /// PSO 的首次编译（数十毫秒）落在 `kytrix-metal` 线程的首帧录制里，不阻塞开窗。
@@ -160,25 +193,90 @@ impl Renderer {
         background: Color,
         dispatcher: Arc<Dispatcher>,
     ) -> Result<Self, EngineError> {
+        let core = GpuCore::shared()?;
+        let device = Device::new()?;
+        let layer = swapchain::new_layer(&device, size, scale, background)?;
+        Self::with_layer(
+            core,
+            device,
+            layer,
+            size,
+            max_frame_rate,
+            background,
+            dispatcher,
+        )
+    }
+
+    /// 设备恢复：用**旧 `CAMetalLayer`** 重建一个完整窗口渲染器（C4）。
+    ///
+    /// 与 [`Self::new_for_layer`] 的唯一区别是图层复用：旧图层已经承载过 drawable 与几何
+    /// （C6 的 layer-hosting 责任），只把 `device` 换成恢复后的当前实例并重写窗口级属性
+    /// （见 `swapchain::reuse_layer` 的取舍说明）。persist / 图集页 / 上传槽 / display link /
+    /// GPU 线程全部是新的 —— 旧对象属于旧设备，不能跨设备复用。
+    ///
+    /// 调用者（macOS 泵的恢复驱动）必须**先** take/drop 旧 `Renderer`：旧 display link 必须已经
+    /// invalidate、旧 GPU 线程必须已经有界退出，否则这里改图层 `device` 会与旧线程的 present
+    /// 竞争。
+    ///
+    /// # Errors
+    /// 设备创建、图层重配失败（`AppInit`），或新 GPU 线程无法启动。
+    pub(crate) fn new_with_layer(
+        layer: Retained<CAMetalLayer>,
+        size: (u32, u32),
+        scale: f64,
+        max_frame_rate: f32,
+        background: Color,
+        dispatcher: Arc<Dispatcher>,
+    ) -> Result<Self, EngineError> {
+        let core = GpuCore::shared()?;
+        let device = Device::new()?;
+        swapchain::reuse_layer(&layer, &device, size, scale, background)?;
+        Self::with_layer(
+            core,
+            device,
+            layer,
+            size,
+            max_frame_rate,
+            background,
+            dispatcher,
+        )
+    }
+
+    /// 窗口渲染器的公共构造：GPU 侧对象（persist / 上传槽 / 图集页）+ display link + GPU 线程。
+    ///
+    /// `layer` 必须已经绑定 `device`（两个入口分别是 `new_layer` / `reuse_layer`）。
+    fn with_layer(
+        core: Arc<GpuCore>,
+        device: Device,
+        layer: Retained<CAMetalLayer>,
+        size: (u32, u32),
+        max_frame_rate: f32,
+        background: Color,
+        dispatcher: Arc<Dispatcher>,
+    ) -> Result<Self, EngineError> {
         let mtm = MainThreadMarker::new().ok_or(EngineError::AppInit {
             detail: SmolStr::new_static("CAMetalDisplayLink requires the main thread"),
         })?;
-        let core = Arc::clone(GpuCore::shared()?);
-        let device = Device::new()?;
-        let layer = swapchain::new_layer(&device, size, scale, background)?;
         // 在飞计数必须在 `Queue` 构造之前建好：提交路径（GPU 线程）与 `sync_pacing`
         // （主线程）读写同一份（R09-17）。
         let in_flight = Arc::new(InFlight::new());
         let shared = Arc::new(Shared::new(Arc::clone(&in_flight)));
-        let gpu =
-            GpuRenderer::new_window(device, core, in_flight, size, background_linear(background))?;
+        let gpu = GpuRenderer::new_window(
+            device,
+            Arc::clone(&core),
+            in_flight,
+            size,
+            background_linear(background),
+        )?;
         Ok(Self {
             target: RenderTarget::Window(WindowRenderer::new(
                 mtm,
                 gpu,
+                core,
                 layer,
                 size,
                 max_frame_rate,
+                background,
                 shared,
                 dispatcher,
             )?),
@@ -191,6 +289,26 @@ impl Renderer {
         match &self.target {
             RenderTarget::Offscreen(_) => None,
             RenderTarget::Window(window) => Some(window.layer.clone()),
+        }
+    }
+
+    /// 本窗口正在使用的设备实例（设备恢复驱动用它做 `GpuCore::recover(&stale)` 的判据）。
+    ///
+    /// 离屏目标没有 `DeviceLost` 恢复路径（同步渲染由调用方重建），返回 `None`。
+    pub(crate) fn gpu_core(&self) -> Option<Arc<GpuCore>> {
+        match &self.target {
+            RenderTarget::Offscreen(_) => None,
+            RenderTarget::Window(window) => Some(Arc::clone(&window.core)),
+        }
+    }
+
+    /// 本窗口当前的背景色（主线程侧真值：`set_background_color` 会更新它）。
+    ///
+    /// 设备恢复必须把运行期改过的背景色带到新 renderer（否则会闪回建窗时的颜色）。
+    pub(crate) fn background_color(&self) -> Option<Color> {
+        match &self.target {
+            RenderTarget::Offscreen(_) => None,
+            RenderTarget::Window(window) => Some(window.background),
         }
     }
 
@@ -539,6 +657,12 @@ struct WindowRenderer {
     dispatcher: Arc<Dispatcher>,
     thread: Option<JoinHandle<()>>,
     layer: Retained<CAMetalLayer>,
+    /// 本窗口的 GPU 侧对象（与 GPU 线程里那份 `GpuRenderer` 是同一个设备实例的两份引用）。
+    ///
+    /// 主线程保留一份是为设备恢复：`GpuCore::recover(&stale)` 需要判断「这个窗口用的是不是
+    /// 注册表里的当前实例」。旧 renderer 被 drop 之后旧 `Arc<GpuCore>` 仍活到本字段释放，
+    /// 因此旧设备的对象不会在回收前被提前销毁。
+    core: Arc<GpuCore>,
     display_link: Retained<CAMetalDisplayLink>,
     /// `delegate` 是 **weak** 属性（objc2 与 Apple 文档都如此）：必须由门面持有强引用，
     /// 否则回调会打在已释放的对象上（§5.1）。
@@ -548,6 +672,8 @@ struct WindowRenderer {
     /// 最近一次写进图层的物理尺寸 / DPI（避免每帧重复写 CA 属性，§5.3）。
     layer_size: (u32, u32),
     layer_scale: f64,
+    /// 当前窗口背景色（主线程真值；设备恢复时带给新 renderer）。
+    background: Color,
     /// 当前写进 display link 的偏好帧率（换屏时比较用）。
     frame_rate: f32,
     /// display link 的暂停状态机（R06-8 的空闲滞回；与 `display_link.isPaused()` 同步）。
@@ -563,9 +689,11 @@ impl WindowRenderer {
     fn new(
         mtm: MainThreadMarker,
         gpu: GpuRenderer,
+        core: Arc<GpuCore>,
         layer: Retained<CAMetalLayer>,
         size: (u32, u32),
         max_frame_rate: f32,
+        background: Color,
         shared: Arc<Shared>,
         dispatcher: Arc<Dispatcher>,
     ) -> Result<Self, EngineError> {
@@ -605,11 +733,13 @@ impl WindowRenderer {
             dispatcher,
             thread: Some(thread),
             layer,
+            core,
             display_link,
             _delegate: delegate,
             surface: size,
             layer_size: size,
             layer_scale: 0.0,
+            background,
             frame_rate: target,
             // 与下面 `display_link.setPaused(true)` 同一个初始状态（R06-8 的状态机也从暂停开始）。
             pacing: PacingGate::new(),
@@ -680,7 +810,11 @@ impl WindowRenderer {
     ///
     /// 顺序不能反：图层属性只能在主线程写，而 GPU 线程一被唤醒就要读共享槽；两者都来自同一个
     /// `Color`，所以条带颜色永远一致。
-    fn set_background_color(&self, color: Color) {
+    ///
+    /// 主线程侧同时记一份 `background`：设备恢复要把它带到新 renderer（见
+    /// [`Renderer::background_color`]），否则运行期改过的背景色会在恢复后闪回建窗时的值。
+    fn set_background_color(&mut self, color: Color) {
+        self.background = color;
         swapchain::set_layer_background(&self.layer, color);
         self.shared.set_background(background_linear(color));
     }
@@ -1411,8 +1545,74 @@ impl Drop for PanicGuard {
     }
 }
 
-/// GPU 线程主循环（§5.2）。
+/// 一帧的 autorelease pool 边界（C5）。
 ///
+/// `kytrix-metal` 是 `std::thread` 自建线程，没有 run loop 的隐式 pool。Metal 每次
+/// `commandBuffer` / encoder / drawable 包装都会向**当前线程最内层** pool autorelease：
+/// 没有 pool 时这些对象只能一直悬着（Apple《Threading Programming Guide》：自建线程必须先建
+/// 自己的 pool）。`objc2::rc::autoreleasepool` 内部走 `objc_autoreleasePoolPush/Pop`，闭包
+/// 返回后立即 drain —— 不需要 `NSAutoreleasePool` feature，也不新增依赖。
+///
+/// 闭包只包**一个 tick 的帧体**：阻塞等待（`wait_for_work`）与待定背景色在 pool 外，pool
+/// 不跨 vsync 持有。`ControlFlow::Break` 与普通返回值一样穿出闭包，drain 先于 `gpu_loop`
+/// 的退出收尾（`mark_terminated` / `PanicGuard::disarm`）。
+fn with_frame_pool<T>(f: impl FnOnce() -> T) -> T {
+    autoreleasepool(|_pool| f())
+}
+
+/// `test-support` 的故障注入额度：**进程内只生效一次**。
+///
+/// 恢复后新建的 GPU 线程不能再次注入 —— 否则「注入 → 恢复 → 新线程再注入」会烧穿
+/// [`GpuCore`] 的恢复限次（5 s / 3 次）并让验收进程以超限错误退出，掩盖真正的恢复缺陷。
+#[cfg(any(test, feature = "test-support"))]
+struct InjectionGate {
+    consumed: AtomicBool,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl InjectionGate {
+    const fn new() -> Self {
+        Self {
+            consumed: AtomicBool::new(false),
+        }
+    }
+
+    /// `true` = 本次调用是被注入的那一次（`armed == false` 时恒不注入，也不消耗额度）。
+    fn take(&self, armed: bool) -> bool {
+        if !armed {
+            return false;
+        }
+        !self.consumed.swap(true, Ordering::AcqRel)
+    }
+}
+
+/// 是否要在本次 tick 注入一次 `DeviceLost`（`test-support`；生产构建不编译）。
+///
+/// 门是 **cfg + 环境变量**双重的：没有 `test-support` 时本函数不存在，环境变量完全无效；
+/// 有特性时也要求 `KYTRIX_METAL_INJECT_DEVICE_LOST=1`（显式开启，不会误伤开发者机器）。
+#[cfg(any(test, feature = "test-support"))]
+fn take_injected_device_lost() -> Option<EngineError> {
+    static GATE: InjectionGate = InjectionGate::new();
+    // 环境变量在进程启动前设置；缓存一次，避免每帧 tick 都做一次环境查找。
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let armed = *ARMED
+        .get_or_init(|| std::env::var("KYTRIX_METAL_INJECT_DEVICE_LOST").is_ok_and(|v| v == "1"));
+    if !GATE.take(armed) {
+        return None;
+    }
+    let reason =
+        SmolStr::new_static("injected MTLCommandBufferError.DeviceRemoved (test-support hook)");
+    let log_path = crate::render::macos::device::write_diagnostics(&reason, 0);
+    eprintln!(
+        "kytrix: test-support injected a DeviceLost on the kytrix-metal thread \
+         (KYTRIX_METAL_INJECT_DEVICE_LOST=1)"
+    );
+    Some(EngineError::DeviceLost { reason, log_path })
+}
+
+/// GPU 线程主循环（§5.2 / C5）。
+///
+/// 每轮在 pool 外做阻塞等待与待定背景色，池内把一个 tick 的全部 Metal 工作交给 [`frame_tick`]。
 /// `_keep_alive` 是**保活引用**：detach 之后线程可能还在提交最后一帧，而 `presentDrawable` 的目标
 /// 正是这个图层。主线程在 `Drop` 里已经释放了自己的引用，这份引用保证图层活到线程退出（图层属性
 /// 仍然只有主线程写，这里不读不写，§5.3）。
@@ -1445,153 +1645,191 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, _keep_alive: SendLay
             );
             break;
         }
-        // 上屏证据先落地：一个更新的 display link tick 到达 ⇒ 目标 tick 更早的帧已经上屏
-        // （该 vsync 的呈现截止时刻已经过去）。这是 `presented_at` 的唯一推导来源。
-        feedback.observe_tick(shared.tick_sequence());
-        if let Err(error) = drain_completions(&mut renderer, &shared, &mut feedback, &mut frontier)
-        {
-            shared.publish_error(error);
+        // 帧体整体包进每 tick drain 的 pool（C5）：闭包返回（含 `ControlFlow::Break`
+        // 退出）之后 pool 已经 drain，因此上面的阻塞等待期间没有任何帧的 pool 还活着。
+        let flow = with_frame_pool(|| {
+            frame_tick(
+                &mut renderer,
+                &shared,
+                &mut feedback,
+                &mut frontier,
+                &mut surface,
+                &mut atlas_awaiting,
+            )
+        });
+        if flow.is_break() {
             break;
-        }
-        // 连续完成前缀推进过（或之前推进过）：按提交顺序发布「GPU 已完成 + 上屏证据已到」的帧。
-        if let Some(frontier) = frontier {
-            feedback.pop_ready(frontier, |frame| shared.publish_feedback(frame));
-        }
-        // 本轮之后还在等证据的帧决定两件事：`wait_for_work` 何时该醒（更新的 tick）与
-        // display link 何时能暂停（必须等证据到达，否则 tick 不再来 ⇒ 永远等不到）。
-        // 提交路径在本轮末尾还会再登记一次（新入队的帧）。
-        shared.set_awaiting_tick(feedback.awaiting_tick());
-        if shared.shutdown_requested() {
-            // 退出前 drain 在飞帧（I4）：完成通知到达、旧资源释放之后才销毁 device/queue。
-            if shared.in_flight() == 0 {
-                break;
-            }
-            continue;
-        }
-        // 没有脏区就不画，drawable 留给下一个 vsync。
-        if !shared.has_pending_frame() {
-            continue;
-        }
-        let Some(update) = shared.take_drawable() else {
-            continue;
-        };
-        // ① drawable 的实际像素尺寸就是本帧的渲染尺寸（§5.4）。
-        let texture = update.drawable.texture();
-        let target = (texture.width() as u32, texture.height() as u32);
-        // ② 本 vsync 就是 display link 给出的那次呈现机会：不判定时刻、不跳帧 —— 它给 drawable
-        //    我们就画完尽快呈现（`presentDrawable:`，**不带时刻**，见 `render/macos/present.rs`）。
-        //    旧实现在这里按 `targetPresentationTimestamp` 决定「钉时刻 / 跳过本 vsync」，并把时刻
-        //    交给 `presentDrawable:atTime:` —— 那正是 P0 崩溃（`CAMetalDrawableInvalidOperation`）
-        //    的唯一来源：display link 独占呈现时刻，显式时刻会让 `CAMetalDrawable` 在驱动调度命令
-        //    缓冲时抛 ObjC 异常，穿 FFI ⇒ SIGSEGV。
-        // ③ resize 校验（P1）必须在**占槽与取帧之前**：drawable 可能还是上一轮 layout 的产物，
-        //    用它消费最新帧会把最后一帧按旧尺寸画完并 present；此后没有新帧、没有 vsync
-        //    ⇒ 窗口永久停在旧尺寸画面。不一致就丢弃这个 drawable、跳过本 vsync，帧留在最新
-        //    帧槽里（`pending=true` 让 display link 保持运行），下一个 vsync 再取新尺寸的 drawable。
-        //    连续超过 `MAX_SURFACE_MISMATCHES` 次后进入**粘性**退化：之后每个 vsync 都按 drawable
-        //    尺寸全量画，直到尺寸重新在容差内（诊断只在进入退化时打印一次）。
-        let requested = shared.published_surface();
-        let was_degraded = surface.degraded;
-        let verdict = surface.observe(requested, target);
-        if !was_degraded && surface.degraded {
-            let requested = requested.unwrap_or(target);
-            eprintln!(
-                "kytrix: metal drawable {}x{} never matched the requested {}x{} within {} vsyncs; rendering at the drawable size (full frame) from now on",
-                target.0, target.1, requested.0, requested.1, MAX_SURFACE_MISMATCHES
-            );
-        }
-        if verdict == SurfaceVerdict::Skip {
-            continue;
-        }
-        let degrade = verdict == SurfaceVerdict::Degraded;
-        // ④ 三缓冲背压：**非阻塞**；失败就丢掉这个 drawable（帧请求留在槽里，下一个 vsync 再试）。
-        //    必须在尺寸校验之后占槽：占槽后放弃会让 semaphore 与 ring 槽位不同源。
-        let Some(frame_slot) = renderer.try_acquire_upload_slot() else {
-            continue;
-        };
-        let Some(request) = shared.take_frame_for_drawable(target, degrade) else {
-            // 尺寸在两次加锁之间又变了（新帧发布）：归还槽位，帧留在槽里。
-            renderer.release_upload_slot();
-            continue;
-        };
-        // 等 drawable / 配额期间到达的背景色：与帧一起落地（仍是录制前，不引入新的 GPU 调用点）。
-        if let Some(linear) = shared.take_background() {
-            renderer.set_background_color(linear);
-        }
-        // 图集像素在本帧录制前落地（上传先于绘制，§4.2；像素按所有权移交给 GPU）。
-        for (index, upload) in shared.take_atlas().into_iter().enumerate() {
-            if let Some(upload) = upload {
-                atlas_awaiting[index] = true;
-                renderer.queue_atlas_upload(upload.kind, upload.page, upload.pixels, upload.rects);
-            }
-        }
-        let resized = match renderer.prepare_target(target) {
-            Ok(resized) => resized,
-            // 额度不足 / 纹理创建失败：**粘性错误 + 停止出帧**（不是"按旧目标继续渲染"）。
-            // 旧注释与 `W4-metal-修复报告.md` 声称"保留旧目标继续渲染"，与实现相反；这里按实现
-            // 写成唯一口径（AR3 §6.5 / P2-13）：新 drawable 里 persist 覆盖不到的区域没有 clear
-            // 路径，继续 present 会露出未初始化像素；预算打满也是配置/尺寸异常，必须让调用方看见。
-            Err(error) => {
-                shared.publish_error(error);
-                break;
-            }
-        };
-        let mut frame = FramePlan::new(request.plan, resized || renderer.is_fresh() || degrade);
-        if frame.is_idle() {
-            // 没有像素要画（Idle 且目标未重建）⇒ 不产生 GPU 工作；该序号不会出现在完成通知里（§4.3）。
-            renderer.release_upload_slot();
-            continue;
-        }
-        let index = request.index;
-        // **tick 推断的上屏时刻**：本 vsync 的排定呈现时刻（host time）换算成 `Instant`。
-        // 这是 display link 独占的信息；GPU 线程仍然只做无时刻的 `presentDrawable:`。
-        let presented_at =
-            presentation_instant(update.target, Instant::now(), CACurrentMediaTime());
-        // 上屏证据按 tick 序号配对（`FeedbackQueue::observe_tick`）：更新 tick 到达 ⇒ 本帧已上屏。
-        let tick = update.sequence;
-        let completed = {
-            let shared = Arc::clone(&shared);
-            // 完成通知带着本次提交的 u64 序号走：retire 的键不能等回调时再推导（R06-1）。
-            let sequence = frame_slot.signal_value;
-            move |buffer| shared.push_completion(index, sequence, SendCommandBuffer(buffer))
-        };
-        match renderer.submit_frame(&request, &update.drawable, &mut frame, completed) {
-            Ok((stats, samples)) => {
-                // 上传已经编码进本帧 command buffer：共享槽这才算空，UI 可以入队下一笔。
-                for (index, awaiting) in atlas_awaiting.iter_mut().enumerate() {
-                    if std::mem::take(awaiting) {
-                        shared.atlas_uploaded(if index == 0 {
-                            AtlasKind::Glyph
-                        } else {
-                            AtlasKind::Image
-                        });
-                    }
-                }
-                // **不**在这里清退化状态：粘性状态只在尺寸重新一致时清除（`SurfaceMismatch`）。
-                // 在飞记账已经在 `Queue::submit` 里、`commit` **之前**完成（R09-17）。
-                feedback.push(
-                    index,
-                    stats,
-                    samples,
-                    request.published_at,
-                    tick,
-                    presented_at,
-                );
-                // 新帧立刻登记「在等上屏证据」：`sync_pacing`（主线程）据此让 display link 继续跑。
-                // 必须紧跟 `push`：此刻 `in_flight ≥ 1`，主线程不会在这个窗口里暂停节奏源；
-                // 等到循环顶部再登记会给「完成回调已到、主线程刚好暂停 display link」留出竞态。
-                shared.set_awaiting_tick(feedback.awaiting_tick());
-            }
-            Err(error) => {
-                shared.publish_error(error);
-                break;
-            }
         }
     }
     shared.mark_terminated();
     guard.disarm();
 }
 
+/// 一个 tick 的全部 GPU 线程工作（C5 从 `gpu_loop` 机械拆出，行为不变）。
+///
+/// 返回 `ControlFlow::Break(())` = GPU 线程必须退出（原 `break`），`ControlFlow::Continue(())`
+/// = 等下一个 vsync（原 `continue` 与循环末尾）。本函数**只能**由 [`with_frame_pool`] 的闭包
+/// 调用：闭包结束即 drain，任何退出路径都不会把 pool 带出 tick。
+fn frame_tick(
+    renderer: &mut GpuRenderer,
+    shared: &Arc<Shared>,
+    feedback: &mut FeedbackQueue,
+    frontier: &mut Option<FrameIndex>,
+    surface: &mut SurfaceMismatch,
+    atlas_awaiting: &mut [bool; 2],
+) -> ControlFlow<()> {
+    // `test-support` 故障注入（见模块文档「测试注入」）：模拟「第一个有待画帧的 tick 上
+    // 命令缓冲失败」。必须在任何 GPU 工作之前发布，恢复路径才看到与真实 DeviceLost 相同的
+    // 状态（GPU 线程以粘性错误退出、不再提交）。
+    #[cfg(any(test, feature = "test-support"))]
+    if shared.has_pending_frame()
+        && let Some(error) = take_injected_device_lost()
+    {
+        shared.publish_error(error);
+        return ControlFlow::Break(());
+    }
+    // 上屏证据先落地：一个更新的 display link tick 到达 ⇒ 目标 tick 更早的帧已经上屏
+    // （该 vsync 的呈现截止时刻已经过去）。这是 `presented_at` 的唯一推导来源。
+    feedback.observe_tick(shared.tick_sequence());
+    if let Err(error) = drain_completions(renderer, shared, feedback, frontier) {
+        shared.publish_error(error);
+        return ControlFlow::Break(());
+    }
+    // 连续完成前缀推进过（或之前推进过）：按提交顺序发布「GPU 已完成 + 上屏证据已到」的帧。
+    if let Some(frontier) = *frontier {
+        feedback.pop_ready(frontier, |frame| shared.publish_feedback(frame));
+    }
+    // 本轮之后还在等证据的帧决定两件事：`wait_for_work` 何时该醒（更新的 tick）与
+    // display link 何时能暂停（必须等证据到达，否则 tick 不再来 ⇒ 永远等不到）。
+    // 提交路径在本轮末尾还会再登记一次（新入队的帧）。
+    shared.set_awaiting_tick(feedback.awaiting_tick());
+    if shared.shutdown_requested() {
+        // 退出前 drain 在飞帧（I4）：完成通知到达、旧资源释放之后才销毁 device/queue。
+        if shared.in_flight() == 0 {
+            return ControlFlow::Break(());
+        }
+        return ControlFlow::Continue(());
+    }
+    // 没有脏区就不画，drawable 留给下一个 vsync。
+    if !shared.has_pending_frame() {
+        return ControlFlow::Continue(());
+    }
+    let Some(update) = shared.take_drawable() else {
+        return ControlFlow::Continue(());
+    };
+    // ① drawable 的实际像素尺寸就是本帧的渲染尺寸（§5.4）。
+    let texture = update.drawable.texture();
+    let target = (texture.width() as u32, texture.height() as u32);
+    // ② 本 vsync 就是 display link 给出的那次呈现机会：不判定时刻、不跳帧 —— 它给 drawable
+    //    我们就画完尽快呈现（`presentDrawable:`，**不带时刻**，见 `render/macos/present.rs`）。
+    //    旧实现在这里按 `targetPresentationTimestamp` 决定「钉时刻 / 跳过本 vsync」，并把时刻
+    //    交给 `presentDrawable:atTime:` —— 那正是 P0 崩溃（`CAMetalDrawableInvalidOperation`）
+    //    的唯一来源：display link 独占呈现时刻，显式时刻会让 `CAMetalDrawable` 在驱动调度命令
+    //    缓冲时抛 ObjC 异常，穿 FFI ⇒ SIGSEGV。
+    // ③ resize 校验（P1）必须在**占槽与取帧之前**：drawable 可能还是上一轮 layout 的产物，
+    //    用它消费最新帧会把最后一帧按旧尺寸画完并 present；此后没有新帧、没有 vsync
+    //    ⇒ 窗口永久停在旧尺寸画面。不一致就丢弃这个 drawable、跳过本 vsync，帧留在最新
+    //    帧槽里（`pending=true` 让 display link 保持运行），下一个 vsync 再取新尺寸的 drawable。
+    //    连续超过 `MAX_SURFACE_MISMATCHES` 次后进入**粘性**退化：之后每个 vsync 都按 drawable
+    //    尺寸全量画，直到尺寸重新在容差内（诊断只在进入退化时打印一次）。
+    let requested = shared.published_surface();
+    let was_degraded = surface.degraded;
+    let verdict = surface.observe(requested, target);
+    if !was_degraded && surface.degraded {
+        let requested = requested.unwrap_or(target);
+        eprintln!(
+            "kytrix: metal drawable {}x{} never matched the requested {}x{} within {} vsyncs; rendering at the drawable size (full frame) from now on",
+            target.0, target.1, requested.0, requested.1, MAX_SURFACE_MISMATCHES
+        );
+    }
+    if verdict == SurfaceVerdict::Skip {
+        return ControlFlow::Continue(());
+    }
+    let degrade = verdict == SurfaceVerdict::Degraded;
+    // ④ 三缓冲背压：**非阻塞**；失败就丢掉这个 drawable（帧请求留在槽里，下一个 vsync 再试）。
+    //    必须在尺寸校验之后占槽：占槽后放弃会让 semaphore 与 ring 槽位不同源。
+    let Some(frame_slot) = renderer.try_acquire_upload_slot() else {
+        return ControlFlow::Continue(());
+    };
+    let Some(request) = shared.take_frame_for_drawable(target, degrade) else {
+        // 尺寸在两次加锁之间又变了（新帧发布）：归还槽位，帧留在槽里。
+        renderer.release_upload_slot();
+        return ControlFlow::Continue(());
+    };
+    // 等 drawable / 配额期间到达的背景色：与帧一起落地（仍是录制前，不引入新的 GPU 调用点）。
+    if let Some(linear) = shared.take_background() {
+        renderer.set_background_color(linear);
+    }
+    // 图集像素在本帧录制前落地（上传先于绘制，§4.2；像素按所有权移交给 GPU）。
+    for (index, upload) in shared.take_atlas().into_iter().enumerate() {
+        if let Some(upload) = upload {
+            atlas_awaiting[index] = true;
+            renderer.queue_atlas_upload(upload.kind, upload.page, upload.pixels, upload.rects);
+        }
+    }
+    let resized = match renderer.prepare_target(target) {
+        Ok(resized) => resized,
+        // 额度不足 / 纹理创建失败：**粘性错误 + 停止出帧**（不是"按旧目标继续渲染"）。
+        // 旧注释与 `W4-metal-修复报告.md` 声称"保留旧目标继续渲染"，与实现相反；这里按实现
+        // 写成唯一口径（AR3 §6.5 / P2-13）：新 drawable 里 persist 覆盖不到的区域没有 clear
+        // 路径，继续 present 会露出未初始化像素；预算打满也是配置/尺寸异常，必须让调用方看见。
+        Err(error) => {
+            shared.publish_error(error);
+            return ControlFlow::Break(());
+        }
+    };
+    let mut frame = FramePlan::new(request.plan, resized || renderer.is_fresh() || degrade);
+    if frame.is_idle() {
+        // 没有像素要画（Idle 且目标未重建）⇒ 不产生 GPU 工作；该序号不会出现在完成通知里（§4.3）。
+        renderer.release_upload_slot();
+        return ControlFlow::Continue(());
+    }
+    let index = request.index;
+    // **tick 推断的上屏时刻**：本 vsync 的排定呈现时刻（host time）换算成 `Instant`。
+    // 这是 display link 独占的信息；GPU 线程仍然只做无时刻的 `presentDrawable:`。
+    let presented_at = presentation_instant(update.target, Instant::now(), CACurrentMediaTime());
+    // 上屏证据按 tick 序号配对（`FeedbackQueue::observe_tick`）：更新 tick 到达 ⇒ 本帧已上屏。
+    let tick = update.sequence;
+    let completed = {
+        let shared = Arc::clone(shared);
+        // 完成通知带着本次提交的 u64 序号走：retire 的键不能等回调时再推导（R06-1）。
+        let sequence = frame_slot.signal_value;
+        move |buffer| shared.push_completion(index, sequence, SendCommandBuffer(buffer))
+    };
+    match renderer.submit_frame(&request, &update.drawable, &mut frame, completed) {
+        Ok((stats, samples)) => {
+            // 上传已经编码进本帧 command buffer：共享槽这才算空，UI 可以入队下一笔。
+            for (index, awaiting) in atlas_awaiting.iter_mut().enumerate() {
+                if std::mem::take(awaiting) {
+                    shared.atlas_uploaded(if index == 0 {
+                        AtlasKind::Glyph
+                    } else {
+                        AtlasKind::Image
+                    });
+                }
+            }
+            // **不**在这里清退化状态：粘性状态只在尺寸重新一致时清除（`SurfaceMismatch`）。
+            // 在飞记账已经在 `Queue::submit` 里、`commit` **之前**完成（R09-17）。
+            feedback.push(
+                index,
+                stats,
+                samples,
+                request.published_at,
+                tick,
+                presented_at,
+            );
+            // 新帧立刻登记「在等上屏证据」：`sync_pacing`（主线程）据此让 display link 继续跑。
+            // 必须紧跟 `push`：此刻 `in_flight ≥ 1`，主线程不会在这个窗口里暂停节奏源；
+            // 等到循环顶部再登记会给「完成回调已到、主线程刚好暂停 display link」留出竞态。
+            shared.set_awaiting_tick(feedback.awaiting_tick());
+        }
+        Err(error) => {
+            shared.publish_error(error);
+            return ControlFlow::Break(());
+        }
+    }
+    ControlFlow::Continue(())
+}
 /// 处理完成通知：读 GPU 时间、推进 retire（**只**在 GPU 线程）。
 ///
 /// 新的连续完成前沿写进 `frontier`（调用方在 drain 之后统一按提交顺序发布反馈）。
@@ -1625,9 +1863,10 @@ mod tests {
     use smol_str::SmolStr;
 
     use super::{
-        AtlasSlots, InFlight, JOIN_TIMEOUT, MAX_SURFACE_MISMATCHES, PanicGuard, SHUTDOWN_GRACE,
-        SendCommandBuffer, Shared, StickyError, SurfaceMismatch, SurfaceVerdict, WaitOutcome,
-        join_with_deadline, reconcile_pacing, surface_within_tolerance,
+        AtlasSlots, InFlight, InjectionGate, JOIN_TIMEOUT, MAX_SURFACE_MISMATCHES, PanicGuard,
+        SHUTDOWN_GRACE, SendCommandBuffer, Shared, StickyError, SurfaceMismatch, SurfaceVerdict,
+        WaitOutcome, join_with_deadline, reconcile_pacing, surface_within_tolerance,
+        with_frame_pool,
     };
     use crate::{
         error::EngineError,
@@ -2246,5 +2485,81 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    /// C5：帧体 pool 必须在 tick 结束时 drain。
+    ///
+    /// 观察点只有 `Weak`：`[NSObject autorelease]` 等价于 `@autoreleasepool` 块里创建的普通
+    /// ObjC 临时对象 —— 只有真的 drain（引用计数归零、dealloc）弱引用才 load 不到。若把
+    /// [`with_frame_pool`] 退化成直接调用闭包，对象会在「autoreleased with no pool」下泄漏，
+    /// 弱引用仍然可用 ⇒ 本用例变红。
+    #[test]
+    fn the_frame_pool_drains_autoreleased_objects_at_the_end_of_every_tick() {
+        use objc2::{
+            msg_send,
+            rc::{Retained, Weak},
+            runtime::NSObject,
+        };
+
+        let object = NSObject::new();
+        let weak = Weak::from_retained(&object);
+        assert!(weak.load().is_some(), "precondition: the object is alive");
+        with_frame_pool(move || {
+            let raw = Retained::into_raw(object);
+            // SAFETY: `with_frame_pool` 打开的是本线程最内层 pool；把 +1 引用交给它，等价于
+            // ObjC `@autoreleasepool` 块里创建的临时对象。
+            let _: *mut NSObject = unsafe { msg_send![raw, autorelease] };
+        });
+        assert!(
+            weak.load().is_none(),
+            "pool 必须在 tick 结束时 drain（否则每帧的 Metal 临时对象全部泄漏）"
+        );
+    }
+
+    /// C4：`test-support` 的 `DeviceLost` 注入额度**每个进程只生效一次**。
+    ///
+    /// 恢复会新建 GPU 线程；如果新线程也能注入，就会「注入 → 恢复 → 再注入」烧穿 5 s/3 次的
+    /// 恢复限次，把「恢复失败」伪装成「超限」（验收会误判）。未武装（环境变量缺失）时不得注入，
+    /// 也不消耗额度。
+    #[test]
+    fn the_device_lost_injection_fires_at_most_once_per_process() {
+        let gate = InjectionGate::new();
+        assert!(!gate.take(false), "未武装时不得注入");
+        assert!(gate.take(true), "第一次武装必须注入");
+        assert!(
+            !gate.take(true),
+            "同一进程只能注入一次（否则恢复限次会被烧穿）"
+        );
+    }
+
+    /// C5：`ControlFlow::Break`（GPU 线程退出）不得把 pool 带出 tick。
+    ///
+    /// `frame_tick` 的返回值在 `gpu_loop` 里只经由 [`with_frame_pool`] 拿到（唯一调用点）；
+    /// 本用例用同一个包装短路一个 `Break` tick，断言闭包返回时 pool 已经 drain ⇒
+    /// `mark_terminated` / `PanicGuard::disarm` 一定跑在 pool 之外。
+    #[test]
+    fn a_break_tick_returns_only_after_the_frame_pool_has_drained() {
+        use std::ops::ControlFlow;
+
+        use objc2::{
+            msg_send,
+            rc::{Retained, Weak},
+            runtime::NSObject,
+        };
+
+        let object = NSObject::new();
+        let weak = Weak::from_retained(&object);
+        let flow: ControlFlow<()> = with_frame_pool(move || {
+            let raw = Retained::into_raw(object);
+            // SAFETY: 同 `the_frame_pool_drains_autoreleased_objects_at_the_end_of_every_tick`：
+            // 当前位于 `with_frame_pool` 打开的最内层 pool 内。
+            let _: *mut NSObject = unsafe { msg_send![raw, autorelease] };
+            ControlFlow::Break(())
+        });
+        assert!(flow.is_break(), "Break must survive the pool boundary");
+        assert!(
+            weak.load().is_none(),
+            "pool 必须在返回 Break 之前 drain，否则线程退出收尾会跑在 pool 里"
+        );
     }
 }

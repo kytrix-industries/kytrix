@@ -40,7 +40,11 @@ use crate::{
     error::EngineError,
     platform::{
         dispatcher::Dispatcher,
-        windows::{composition, dpi_awareness, window::NativeWindow},
+        windows::{
+            composition::{self, CompositionState},
+            dpi_awareness,
+            window::NativeWindow,
+        },
     },
     render::backend::Renderer,
     window::{Window, WindowId, WindowOptions},
@@ -584,6 +588,30 @@ impl GeometryCache {
 /// 消费者：`pump`。
 /// 消息泵主体（每轮：消息 → 平台事件 → GPU 反馈 → 关闭 → 应用钩子 + 提交帧 → 阻塞等待）。
 ///
+/// 一次「DirectComposition 健康检查代际」的消费计划（C2；review-c RC-1 抽出的可测 seam）。
+///
+/// 返回需要请求重建 visual tree 的窗口 id：
+/// - 代际相等 ⇒ 本拍没有新的 `WM_PAINT`，**不检查也不消费**（`seen` 不变、返回空）；
+/// - 否则**恰好消费一次**：`seen` 推进到 `epoch`，对每个 id 调 `check`，保留判 Invalid 的窗口。
+///
+/// `pump_loop` 只用它做「无锁代际比较 → 逐窗 `CheckDeviceState` → 重建清单」；真正的请求
+/// （`Window::request_composition_rebuild`）留在调用点。抽出来的理由：泵本身是无限消息循环、
+/// 无法单测（review-c RC-1 证明删除泵内消费段时旧测试全绿）；本函数让单测直接驱动
+/// 「WM_PAINT 推进代际 → 检查 → 清单」这条链，另有一条源码级接线断言钉住 pump 的调用与请求。
+fn composition_health_plan(
+    seen: &mut u64,
+    epoch: u64,
+    ids: impl Iterator<Item = WindowId>,
+    mut check: impl FnMut(WindowId) -> CompositionState,
+) -> Vec<WindowId> {
+    if epoch == *seen {
+        return Vec::new();
+    }
+    *seen = epoch;
+    ids.filter(|id| check(*id) == CompositionState::Invalid)
+        .collect()
+}
+
 /// **`App` 以 `Rc<RefCell<_>>` 传入**：`DispatchMessageW` 里可能运行系统的 size / move 模态
 /// 循环，它同步分派的 `WM_SIZE` 要由 `WndProc` 直接驱动一帧真实帧（`ResizeFrameDriver`）。
 /// 因此泵只在**每一步**内短借用 `App`，消息排空期间不持有借用 —— 模态循环里的
@@ -603,6 +631,8 @@ pub(super) fn pump_loop(
     // 归属判定用 `WindowId` 而不是 HWND 裸值：首窗销毁后系统可能把同一个 HWND 复用给新窗，
     // 裸值比较会「看起来仍匹配」而不重建定时器（复审 P2-8）。
     let mut a11y_timer: Option<WindowId> = None;
+    // C2：已消费的 DirectComposition 健康检查代际（`WM_PAINT` 在 `WndProc` 推进）。
+    let mut composition_epoch_seen = composition::device_check_epoch();
     loop {
         // ①′ 新消息批开始：推进 IME 提交抑制队列的批次号（AR3 §1.5 / P2-2）。
         //
@@ -666,6 +696,31 @@ pub(super) fn pump_loop(
         // 客户区对齐；背景层覆盖「客户区已变、新尺寸的帧还没上屏」的 ≤1 个 vsync 接缝（以及
         // DPI 同步改尺寸 / 首帧 / 设备恢复这些没有帧在飞的瞬间）。
         //
+        // C2：`WM_PAINT` 健康检查代际（MS DirectComposition best practice）。`WndProc` 只推进
+        // 无锁代际；在这里消费 —— 本 pass 下一步本来就要拿合成锁做几何，检查复用同一个临界区。
+        // 设备失效时只登记「重建 visual tree」请求：重建需要 D3D12 设备与交换链，只能在 GPU 线程做。
+        // review-c RC-1：消费逻辑抽成 `composition_health_plan`（可单测），这里只做「取状态 + 发请求」。
+        let plan = composition_health_plan(
+            &mut composition_epoch_seen,
+            composition::device_check_epoch(),
+            windows.iter().map(NativeWindow::id),
+            |id| match windows.iter().find(|native| native.id() == id) {
+                Some(native) => {
+                    let target = native.composition();
+                    composition::lock(&target).check_device_state()
+                }
+                // 窗口在同一次迭代里消失：没有可恢复的合成树（与 shutdown 同语义）。
+                None => CompositionState::WindowClosed,
+            },
+        );
+        if !plan.is_empty() {
+            let mut app = app_cell.borrow_mut();
+            for id in plan {
+                if let Some(window) = app.window_mut(id) {
+                    window.request_composition_rebuild();
+                }
+            }
+        }
         // R07-11：客户区与最小化状态**不再每轮每窗查询**（旧实现 2 次系统调用/窗/轮）。缓存键
         // = `(逻辑尺寸, 比例)` —— `WM_SIZE` / `WM_DPICHANGED` 已在本轮 ①/② 阶段写进
         // `NativeWindow`，所以键变化精确覆盖「客户区可能变了」的时机；稳态每轮每窗 0 次系统调用。
@@ -1121,6 +1176,91 @@ mod pacer_tests {
             pace_interval_from(Some(0.5)),
             Duration::from_millis(MAX_PACE_WAIT_MS),
             "异常低的刷新率必须被上限保护（不能睡死）"
+        );
+    }
+}
+
+#[cfg(test)]
+mod composition_health_tests {
+    use std::cell::Cell;
+
+    use super::composition_health_plan;
+    use crate::{platform::windows::composition::CompositionState, window::WindowId};
+
+    fn window(raw: u32) -> WindowId {
+        WindowId::from_raw(raw)
+    }
+
+    /// review-c RC-1：代际相等时**不检查、不消费**；`WM_PAINT` 推进代际后**恰好消费一次**并
+    /// 返回 Invalid 窗口清单。删除泵内消费链后旧测试全绿（缺口证据），本测试钉住消费语义。
+    #[test]
+    fn the_composition_health_plan_consumes_a_new_epoch_exactly_once() {
+        let id = window(7);
+        let checks = Cell::new(0u32);
+
+        // 代际相同：本拍没有新的 WM_PAINT ⇒ 0 次 CheckDeviceState、seen 不动。
+        let mut seen = 3;
+        let plan = composition_health_plan(&mut seen, 3, std::iter::once(id), |_| {
+            checks.set(checks.get() + 1);
+            CompositionState::Invalid
+        });
+        assert!(plan.is_empty(), "代际相同不得产生重建清单");
+        assert_eq!(checks.get(), 0, "代际相同不得逐窗检查");
+        assert_eq!(seen, 3, "代际相同不得消费");
+
+        // WM_PAINT 推进代际：逐窗检查一次、返回 Invalid 清单、记住新代际。
+        let plan = composition_health_plan(&mut seen, 4, std::iter::once(id), |_| {
+            checks.set(checks.get() + 1);
+            CompositionState::Invalid
+        });
+        assert_eq!(plan, vec![id], "Invalid 窗口必须进重建清单");
+        assert_eq!(checks.get(), 1, "代际变化必须逐窗检查一次");
+        assert_eq!(seen, 4, "消费后必须记住新代际");
+
+        // 代际不再变化：重复调用是 no-op（不会重复请求重建）。
+        let plan = composition_health_plan(&mut seen, 4, std::iter::once(id), |_| {
+            checks.set(checks.get() + 1);
+            CompositionState::Invalid
+        });
+        assert!(plan.is_empty());
+        assert_eq!(checks.get(), 1, "同一代际只能消费一次");
+    }
+
+    /// 只有 `Invalid` 的窗口进清单：`Valid`（健康）与 `WindowClosed`（销毁中/已 shutdown）
+    /// 都不请求重建 —— 对已关闭窗口重建 visual tree 没有意义。
+    #[test]
+    fn only_invalid_windows_reach_the_rebuild_plan() {
+        let mut seen = 0;
+        let state_of = |id: WindowId| match id.to_bits() {
+            1 => CompositionState::Invalid,
+            2 => CompositionState::Valid,
+            _ => CompositionState::WindowClosed,
+        };
+        let plan = composition_health_plan(&mut seen, 1, (1..=3).map(window), state_of);
+        assert_eq!(
+            plan,
+            vec![window(1)],
+            "只有 Invalid 窗口需要重建 visual tree"
+        );
+        assert_eq!(seen, 1);
+    }
+
+    /// 接线防回归（review-c RC-1）：`pump_loop` 必须真的调用上面这条链，并对清单里的每个 id
+    /// 调 `Window::request_composition_rebuild`。用 `concat!` 拼接 needle，避免本测试源码自身
+    /// 命中（测试文本里不会出现完整 needle）—— 删除泵内消费段/请求后本断言变红。
+    #[test]
+    fn the_pump_loop_wires_the_health_plan_into_rebuild_requests() {
+        let source = include_str!("pump.rs");
+        let plan_call = concat!("composition_health", "_plan(");
+        let request = concat!("request_composition", "_rebuild()");
+        assert!(
+            source.matches(plan_call).count() >= 2,
+            "pump.rs 必须同时包含 composition_health_plan 的定义与 pump_loop 内调用（删掉 \
+             WM_PAINT 消费链即红）"
+        );
+        assert!(
+            source.contains(request),
+            "pump.rs 必须把 Invalid 清单落到 request_composition_rebuild（删掉请求即红）"
         );
     }
 }
