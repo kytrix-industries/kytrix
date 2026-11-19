@@ -762,9 +762,8 @@ fn verify_glyph_sequence(
         // 连字/替换把字符数压缩了：不满足「一字符一字形」。
         return None;
     }
-    let mut position = 0usize;
     let mut x = 0.0f32;
-    for character in text.chars() {
+    for (position, character) in text.chars().enumerate() {
         let fast_char = font.chars[alphabet_index(character)?]?;
         if (glyph_x[position] - x).abs() > ADVANCE_TOLERANCE {
             return None;
@@ -773,7 +772,6 @@ fn verify_glyph_sequence(
             return None;
         }
         x += fast_char.advance;
-        position += 1;
     }
     Some(())
 }
