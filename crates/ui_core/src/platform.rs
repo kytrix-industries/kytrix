@@ -36,6 +36,15 @@ pub(crate) mod menu;
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod macos_placement;
 
+/// macOS 关闭语义的**平台无关状态机**（B5）：`performClose:` / `windowShouldClose:` 的用户
+/// 手势（可否决）与 `windowWillClose:` 的外部关闭（不可否决、终态）必须严格区分，泵每轮
+/// 据桥状态决定「投递事件 + 裁决 + 关窗」「只做关闭记账」还是「保留窗口」。
+///
+/// 与 [`macos_placement`] 同一模式：`platform::macos` 整模块 macOS-only，而这里不依赖
+/// AppKit 类型，状态迁移必须在开发机（Windows）单测。
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod macos_close;
+
 /// Wayland 协议层的纯逻辑（`wl_data_source` 生命周期、IME 焦点路由、光标形状/主题、
 /// `xdg_toplevel` 状态机）。
 ///

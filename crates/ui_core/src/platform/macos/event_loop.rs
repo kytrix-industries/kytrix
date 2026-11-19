@@ -23,6 +23,7 @@ use std::{ffi::c_void, sync::Arc, time::Duration};
 use objc2::{MainThreadMarker, rc::Retained};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSEvent, NSEventModifierFlags, NSEventType,
+    NSWindow,
 };
 use objc2_core_foundation::{
     CFRunLoop, CFRunLoopActivity, CFRunLoopObserver, CFRunLoopObserverContext, CFRunLoopTimer,
@@ -40,6 +41,7 @@ use crate::{
             menu, wake,
             window::NativeWindow,
         },
+        macos_close::CloseAction,
     },
     render::backend::Renderer,
     window::{WindowId, WindowOptions},
@@ -126,6 +128,12 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
     let ns_app = NSApplication::sharedApplication(mtm);
     ns_app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     ns_app.finishLaunching();
+    // B5：禁用 AppKit 的自动窗口 tabbing（类级开关，10.12+）。必须在**创建任何窗口之前**
+    // 设置：打开后 AppKit 会按 tabbingIdentifier / 用户偏好把新窗口并进 tab 组，并往
+    // Window 菜单追加「Merge All Windows」等项。引擎的关闭语义以 `windowWillClose:` 为
+    // 唯一权威来源、以窗口为关闭单位；合 tab 会把「关一个 tab」与「关窗口」的语义分叉，
+    // 且非前台 tab 的 `isVisible()` 为 false（旧实现的可见性反推会误判成关闭，B5 已删）。
+    NSWindow::setAllowsAutomaticWindowTabbing(false, mtm);
     // R09-1：主菜单必须**在任何输入之前**就位。AppKit 的键等价分发是
     // `sendEvent:` → `[mainMenu performKeyEquivalent:]` → 失败才给 key window；主菜单为 nil 时
     // Cmd+Q / Cmd+W / Cmd+C 全部没有承载对象，只能退化成普通 keyDown 并被丢弃。
@@ -448,26 +456,40 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
         state.quitting = false;
     }
 
-    // 关闭：请求关闭的窗口真正关闭；一个不剩就退出。
-    let mut closed = false;
+    // 关闭（B5）：两个来源，语义严格区分（状态机见 `platform::macos_close`）。
+    //
+    // - **用户手势**（红点 / Cmd+W / 菜单 Close / `performClose:`）：先 dispatch
+    //   `Event::CloseRequested`（通知，三端同序），再问 `App::request_close`（`on_close`
+    //   裁决，可否决）。批准后才关原生窗口；否决则窗口原样保留。
+    // - **外部关闭**（`windowWillClose:`）：AppKit 已经关闭了窗口，不可否决 —— 不再投递
+    //   事件、不再询问；只做 App 侧关闭记账（`App::close_window`）并移除原生窗口。
+    //
+    // 事件先于处理器由 `CloseBridge::decide` 的闭包顺序保证：闭包里先 dispatch 再返回
+    // `request_close` 的结果，且只在手势路径执行、只执行一次。
+    let mut removed = false;
     for native in state.windows.iter_mut() {
-        let Some(source) = native.take_close_request() else {
-            continue;
-        };
-        // 只有**手势**路径需要在这里补发事件（`sync_state` 不产生它）；观察路径
-        // （窗口已不可见）已经在 `sync_state` 里 dispatch 过，再发就是双投递（复审 F3）。
-        if source == crate::platform::macos::window::CloseRequestSource::Gesture {
-            app.dispatch(native.id(), crate::event::Event::CloseRequested);
+        let id = native.id();
+        let action = native.decide_close(|| {
+            app.dispatch(id, crate::event::Event::CloseRequested);
+            app.request_close(id)
+        });
+        match action {
+            CloseAction::Keep => {}
+            CloseAction::Close => {
+                native.close();
+                removed = true;
+            }
+            CloseAction::RemoveNative => {
+                // 外部关闭：窗口已经被 AppKit 关掉，没有可裁决的对象。`App` 里可能还留着
+                // 这扇窗口（应用没有参与关闭），直接做引擎侧记账；下一轮
+                // `sync_native_windows` 也不会再为它建原生窗口。
+                app.close_window(id);
+                native.mark_externally_closed();
+                removed = true;
+            }
         }
-        // 先问应用：`App::on_close` 返回 `false` 就拦下这次关闭（P2-8）。
-        // 观察路径下窗口已经不可见、拦不住（AppKit 已关），这里只决定是否从 App 侧移除。
-        if !app.request_close(native.id()) {
-            continue;
-        }
-        native.close();
-        closed = true;
     }
-    if closed {
+    if removed {
         state.windows.retain(|native| !native.is_destroyed());
     }
     if state.windows.is_empty() || app.windows().next().is_none() {

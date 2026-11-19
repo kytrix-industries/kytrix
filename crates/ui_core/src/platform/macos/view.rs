@@ -17,6 +17,8 @@
 use std::{
     cell::{Cell, RefCell},
     ptr::NonNull,
+    rc::Rc,
+    sync::Arc,
     time::Instant,
 };
 
@@ -44,17 +46,24 @@ use crate::{
     math::{Point, Rect},
     paint::style::Cursor,
     platform::{
+        dispatcher::Dispatcher,
         ime::{CommitVerdict, KeyScopeToken, key_visible, replacement_range},
         macos::{a11y::MacA11y, ime::ImeState, menu},
+        macos_close::CloseBridge,
         menu::{EditAvailability, MenuCommand},
     },
 };
 
 /// `GuiView` 的实例变量（主线程独占）。
-#[derive(Debug)]
 pub(crate) struct ViewIvars {
     /// 待泵消费的平台事件（**不**在这里调 `App`）。
     events: RefCell<Vec<Event>>,
+    /// 关闭桥（B5）：`performClose:` 置位、泵消费；与 `WindowDelegate` 的
+    /// `windowShouldClose:` / `windowWillClose:` 共享同一份状态（同一窗口只有一个真值）。
+    close: Rc<CloseBridge>,
+    /// 唤醒泵：`performClose:` 只置位关闭桥，裁决与真正的 `NSWindow.close()` 在泵里做；
+    /// 不唤醒的话请求要等到下一个 run loop 事件才会被处理（关闭会「延迟一拍」）。
+    dispatcher: Arc<Dispatcher>,
     /// IME 组合状态 + 按键作用域的提交记账（R09-3）。
     ime: RefCell<ImeState>,
     /// a11y adapter（首显前构造；`None` = 尚未安装 / 已卸载）。
@@ -422,6 +431,24 @@ define_class!(
         // 引擎是自绘控件，必须自己实现这些方法才参与这条通路（否则 Cmd+C 会「无响应」）。
         // 动作**不直接改状态**：它被翻译成与物理按键等价的 `Key` 事件，走 `App::dispatch`
         // 的绑定派发（菜单、快捷键、a11y 动作因此语义一致）。
+
+        /// 标准关闭动作（B5）：红点重定向、`Cmd+W` 与菜单 Close 的 responder 路径都到这里。
+        ///
+        /// **不调用 `super`**：一旦走 `NSWindow.performClose:`，AppKit 会先问 delegate
+        /// `windowShouldClose:`，返回 `false` 就播放系统提示音（Apple 文档明确），且关闭变成
+        /// AppKit 的同步决定。这里只把请求交给关闭桥并唤醒泵，由泵统一走
+        /// 「`Event::CloseRequested` → `App::on_close` 裁决 → `NSWindow.close()`」——与 Windows
+        /// 同序、保留异步否决、无提示音。
+        ///
+        /// 红点的 target/action 在 `NativeWindow::create` 里被重定向到本 view（标准关闭按钮
+        /// 默认发 `performClose:` 给窗口，会让 AppKit 走那条会响提示音的同步路径）。
+        #[unsafe(method(performClose:))]
+        fn perform_close(&self, _sender: Option<&AnyObject>) {
+            if self.ivars().close.request() {
+                self.ivars().dispatcher.wake();
+            }
+        }
+
         #[unsafe(method(undo:))]
         fn undo(&self, _sender: Option<&AnyObject>) {
             self.run_menu_command(MenuCommand::Undo);
@@ -698,9 +725,18 @@ impl Drop for KeyScope<'_> {
 
 impl GuiView {
     /// 建 view（`frame` 先给 1×1，`NativeWindow` 随后 `setFrame`）。
-    pub(crate) fn new(mtm: MainThreadMarker) -> Retained<Self> {
+    ///
+    /// `dispatcher` 与 `close` 由 `NativeWindow` 持有并共享：关闭请求只置位关闭桥 + 唤醒泵，
+    /// 真正的裁决/关闭在泵里做（平台回调不碰 `App` 的纪律，B5）。
+    pub(crate) fn new(
+        mtm: MainThreadMarker,
+        dispatcher: Arc<Dispatcher>,
+        close: Rc<CloseBridge>,
+    ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(ViewIvars {
             events: RefCell::new(Vec::with_capacity(16)),
+            close,
+            dispatcher,
             ime: RefCell::new(ImeState::new()),
             a11y: RefCell::new(None),
             modifiers: Cell::new(0),
