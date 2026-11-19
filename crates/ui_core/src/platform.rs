@@ -54,6 +54,15 @@ pub(crate) mod macos_close;
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod macos_owner;
 
+/// macOS 自绘标题栏**拖动区**的命中判定纯逻辑（X2）：区域是逻辑窗口坐标（客户区左上原点、
+/// y 向下），`GuiView` 是 flipped，因此只需半开区间矩形包含判定；命中后真机侧把拖动交给
+/// WindowServer（`performWindowDragWithEvent:`）而不投递 `PointerDown`。
+///
+/// 与 [`macos_owner`] 同一模式：`platform::macos` 整模块 macOS-only，命中判定必须在开发机
+/// （Windows）单测（区域内/外、边界点、空/负尺寸区域、多区域顺序、y 向下）。
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod macos_drag;
+
 /// Wayland 协议层的纯逻辑（`wl_data_source` 生命周期、IME 焦点路由、光标形状/主题、
 /// `xdg_toplevel` 状态机）。
 ///

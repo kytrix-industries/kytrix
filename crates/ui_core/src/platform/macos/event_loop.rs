@@ -494,6 +494,10 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
         //（`sync_ime_enabled` 会清掉 `ime_area` 缓存）。
         native.sync_ime_enabled(app);
         native.sync_ime_cursor_area(app);
+        // X2：自绘标题栏拖动区（泵每轮对账；`NativeWindow` 内部只在值变化时写 view）。
+        if let Some(window) = app.window(native.id()) {
+            native.sync_drag_regions(window.drag_regions());
+        }
     }
     for task in state.dispatcher.drain_tasks() {
         task.run(app);

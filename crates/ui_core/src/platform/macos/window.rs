@@ -771,6 +771,16 @@ impl NativeWindow {
         self.view.set_cursor(cursor);
     }
 
+    /// 同步自绘标题栏拖动区到 `GuiView`（X2；泵每轮对账，值变化才写 view）。
+    ///
+    /// 区域是逻辑窗口坐标（客户区左上原点、y 向下），与指针事件同一坐标系；`mouseDown:`
+    /// 命中区域时把拖动交给 WindowServer（`performWindowDragWithEvent:`），不进入引擎指针
+    /// 分发。应用在布局/尺寸变化后重新 `App::set_drag_regions`，泵下一轮对账（Chrome
+    /// `SetDraggableRegions` 同模型）。
+    pub(crate) fn sync_drag_regions(&self, regions: &[Rect]) {
+        self.view.set_drag_regions(regions);
+    }
+
     /// 关闭窗口（幂等；引擎主动关闭路径）。
     ///
     /// 先断 delegate 再 `NSWindow.close`：`close` 不会询问 `windowShouldClose:`，断掉 delegate

@@ -50,6 +50,7 @@ use crate::{
         ime::{CommitVerdict, KeyScopeToken, key_visible, replacement_range},
         macos::{a11y::MacA11y, ime::ImeState, menu},
         macos_close::CloseBridge,
+        macos_drag::drag_region_at,
         menu::{EditAvailability, MenuCommand},
     },
 };
@@ -90,6 +91,11 @@ pub(crate) struct ViewIvars {
     /// 侧有接收者」，而平台回调里拿不到 `App`（见文件头的纪律）。唯一生产者是
     /// `App::edit_menu_availability`。
     edit: Cell<EditAvailability>,
+    /// 自绘标题栏拖动区（X2；逻辑窗口坐标、客户区左上原点、y 向下 —— view 是 flipped，
+    /// 与 [`GuiView::logical_point`] 同一坐标系）。唯一写者是泵
+    /// （`NativeWindow::sync_drag_regions`，每轮对账、值变化才写）；`mouseDown:` 只读：
+    /// 命中即把拖动交给 WindowServer 且**不**投递 `PointerDown`（拖动区是窗口 chrome）。
+    drag_regions: RefCell<Vec<Rect>>,
 }
 
 define_class!(
@@ -289,6 +295,11 @@ define_class!(
 
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
+            // X2：自绘标题栏拖动区命中 ⇒ 同步交给 WindowServer 拖动，且**不**投递
+            // `PointerDown`（不开始引擎指针会话 —— 拖动期间没有后续 mouseUp 保证）。
+            if self.begin_window_drag(event) {
+                return;
+            }
             self.push_pointer(event, PointerPhase::Down(PointerButton::Primary));
         }
 
@@ -745,6 +756,7 @@ impl GuiView {
             cursor: Cell::new(Cursor::Default),
             pointer_inside: Cell::new(false),
             edit: Cell::new(EditAvailability::NONE),
+            drag_regions: RefCell::new(Vec::new()),
         });
         // SAFETY: `initWithFrame:` 是 NSView 的指定初始化器；`this` 由 `alloc` 产生且未初始化。
         let this: Retained<Self> = unsafe {
@@ -895,6 +907,38 @@ impl GuiView {
         if self.ivars().pointer_inside.get() {
             self.apply_cursor();
         }
+    }
+
+    /// 保存自绘标题栏拖动区（X2；唯一调用点是泵里的 `NativeWindow::sync_drag_regions`）。
+    ///
+    /// 值不变时零写入（拖动区只在布局变化后由应用更新，泵每轮对账但绝大多数轮次相同）。
+    pub(crate) fn set_drag_regions(&self, regions: &[Rect]) {
+        let mut slot = self.ivars().drag_regions.borrow_mut();
+        if slot.as_slice() == regions {
+            return;
+        }
+        slot.clear();
+        slot.extend_from_slice(regions);
+    }
+
+    /// `mouseDown:` 的拖动区分支（X2）：命中任一区域 ⇒ `performWindowDragWithEvent:`。
+    ///
+    /// 返回 `true` = 本次按下已被拖动区消费（调用方不得再投递 `PointerDown`）。拖动由
+    /// WindowServer 同步接管（Apple 文档：可参与 Space 切换等系统行为；调用立即返回，可能
+    /// 不再收到 mouseUp）—— 因此绝不能给应用发一个没有后续 `PointerUp` 的按下会话。
+    fn begin_window_drag(&self, event: &NSEvent) -> bool {
+        let position = self.logical_point(event.locationInWindow());
+        // 借用在判定后立即结束，避免 `performWindowDragWithEvent:` 期间 AppKit 回调进来
+        // （例如拖动触发窗口状态变化）时 `RefCell` 仍被借用。
+        let hit = drag_region_at(&self.ivars().drag_regions.borrow(), position).is_some();
+        if !hit {
+            return false;
+        }
+        let Some(window) = self.window() else {
+            return false;
+        };
+        window.performWindowDragWithEvent(event);
+        true
     }
 
     /// 把光标形状交给 AppKit（`NSCursor::set`：cursor rect / `cursorUpdate:` 之外唯一有效的
