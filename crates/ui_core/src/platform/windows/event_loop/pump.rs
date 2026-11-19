@@ -440,6 +440,12 @@ pub(crate) fn run(mut app: App) -> Result<(), EngineError> {
                 }
             }
         }
+        // X2：`Application::run` 之前声明的拖动区必须在**首次显示之前**生效（否则第一帧里点击
+        // 自绘标题栏条带不会开始拖动）。运行时变化仍由泵的 ④′ 每轮对账。
+        {
+            let app = app.borrow();
+            native.sync_drag_regions(&app);
+        }
         // 首帧已经由 `new_for_hwnd` prime 并 present（内容层与背景层都已 attach；客户区在第一次
         // present 之前完全透明），这里把几何对齐成「内容 = 客户区」（内容 1:1、背景层铺满），
         // 再显示窗口。
@@ -837,6 +843,9 @@ pub(super) fn pump_loop(
             let mut app = app_cell.borrow_mut();
             for native in windows.iter_mut() {
                 native.update_a11y(&mut app);
+                // X2：自绘标题栏拖动区对账（`WndProc` 的 `WM_NCHITTEST` 只读 `WndProcState`；
+                // 区域变化由应用在布局/尺寸变化后调 `App::set_drag_regions`，同值 no-op）。
+                native.sync_drag_regions(&app);
                 // IME 启用状态先于 caret hint：刚禁用时不必再写表单，刚启用时要重发 hint
                 //（`sync_ime_enabled` 会清掉 `ime_area` 缓存）。
                 native.sync_ime_enabled(&app);

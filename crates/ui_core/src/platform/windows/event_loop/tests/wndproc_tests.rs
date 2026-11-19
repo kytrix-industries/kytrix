@@ -40,7 +40,7 @@ use super::super::{WndProcState, pump::A11Y_TIMER_ID, wndproc};
 use crate::{
     app::App,
     event::ImeEvent,
-    math::Size,
+    math::{Rect, Scale, Size},
     platform::{
         dispatcher::{Dispatcher, WM_APP_COMPOSITION_WAKE},
         event::PlatformEvent,
@@ -153,6 +153,24 @@ fn encoded_client(width: u16, height: u16) -> isize {
 /// `WM_MOVE` / `WM_NCHITTEST` 的 `lParam`：低 16 位 = x、高 16 位 = y（两段有符号）。
 fn encoded_point(x: i32, y: i32) -> isize {
     ((((y as u32) << 16) | (x as u32 & 0xFFFF)) as i32) as isize
+}
+
+/// 用一个**逻辑客户区坐标**向窗口发 `WM_NCHITTEST`（lParam 是屏幕物理坐标），返回命中码。
+fn hit_test(hwnd: HWND, scale: Scale, client_origin: POINT, x: f32, y: f32) -> u32 {
+    let point = POINT {
+        x: client_origin.x + (x * scale.factor()).round() as i32,
+        y: client_origin.y + (y * scale.factor()).round() as i32,
+    };
+    // SAFETY: 窗口由调用方保证存活；`WM_NCHITTEST` 的 lParam 是两个 16 位屏幕坐标。
+    let result = unsafe {
+        SendMessageW(
+            hwnd,
+            WM_NCHITTEST,
+            None,
+            Some(LPARAM(encoded_point(point.x, point.y))),
+        )
+    };
+    result.0 as u32
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -858,6 +876,101 @@ fn wm_move_is_translated_and_dpi_repositioning_moves_are_filtered() {
     );
     destroy_hidden_window(hwnd, state);
     let _ = class_name;
+}
+
+/// X2：`WM_NCHITTEST` 命中应用声明的**自绘标题栏拖动区**时返回 `HTCAPTION`（系统 move
+/// 模态循环的入场券：双击最大化/还原、Aero Snap、Snap Layouts 全部照常）；区域之外仍是系统的
+/// `HTCLIENT`；清空区域后恢复系统命中码。
+///
+/// 变异守卫：删掉 `WM_NCHITTEST` 分支里的拖动区判定 ⇒ 第一条断言变红（返回 `HTCLIENT`）。
+#[test]
+fn drag_regions_hit_test_as_caption_and_clear_back_to_the_system() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, class_name) = hidden_window("KytrixWndProcDragRegion", dispatcher);
+    // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
+    let raw = unsafe { &mut *state };
+    let scale = raw.scale();
+    let mut client_origin = POINT::default();
+    // SAFETY: 窗口由本测试创建且仍存活；只做坐标换算。
+    assert!(
+        unsafe { ClientToScreen(hwnd, &mut client_origin) }.as_bool(),
+        "ClientToScreen"
+    );
+    raw.set_drag_regions(&[Rect::new(0.0, 0.0, 200.0, 24.0)]);
+
+    assert_eq!(
+        hit_test(hwnd, scale, client_origin, 10.0, 10.0),
+        HTCAPTION,
+        "拖动区内必须返回 HTCAPTION（系统 move 模态循环只认它）"
+    );
+    assert_eq!(
+        hit_test(hwnd, scale, client_origin, 10.0, 100.0),
+        HTCLIENT,
+        "拖动区外仍是客户区（非客户区语义不变）"
+    );
+    assert_eq!(
+        hit_test(hwnd, scale, client_origin, 150.0, 30.0),
+        HTCLIENT,
+        "拖动区下沿之外仍是客户区"
+    );
+
+    raw.set_drag_regions(&[]);
+    assert_eq!(
+        hit_test(hwnd, scale, client_origin, 10.0, 10.0),
+        HTCLIENT,
+        "清空拖动区后必须恢复系统命中码"
+    );
+    destroy_hidden_window(hwnd, state);
+    let _ = class_name;
+}
+
+/// X2：泵的每轮对账把 `App::window(id).drag_regions()` 同步进 `WndProcState` —— 运行时设置 /
+/// 更新 / 清空立即反映到命中测试（应用在布局变化后重新声明区域的路径）。
+#[test]
+fn the_pump_sync_copies_drag_regions_into_the_wndproc_state() {
+    let runtime = runtime();
+    let mut app = App::new(runtime.handle().clone());
+    let options = WindowOptions::default();
+    let id = app.create_window(options.clone());
+    let mut native =
+        NativeWindow::create(id, &options, Dispatcher::new(), None).expect("NativeWindow::create");
+    let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
+    let scale = native.scale();
+    let mut client_origin = POINT::default();
+    // SAFETY: 窗口由 `native` 持有且仍存活；只做坐标换算。
+    assert!(
+        unsafe { ClientToScreen(hwnd, &mut client_origin) }.as_bool(),
+        "ClientToScreen"
+    );
+
+    // 首次声明：区域同步到 WndProcState 并生效。
+    let first = [Rect::new(0.0, 0.0, 320.0, 32.0)];
+    app.set_drag_regions(id, &first);
+    native.sync_drag_regions(&app);
+    assert_eq!(native.state_mut().drag_regions(), &first);
+    assert_eq!(
+        hit_test(hwnd, scale, client_origin, 10.0, 10.0),
+        HTCAPTION,
+        "同步后的区域必须命中 HTCAPTION"
+    );
+
+    // 运行时更新：新区域覆盖旧区域（旧区域的剩余部分回到系统命中码）。
+    let second = [Rect::new(0.0, 0.0, 120.0, 16.0)];
+    app.set_drag_regions(id, &second);
+    native.sync_drag_regions(&app);
+    assert_eq!(native.state_mut().drag_regions(), &second);
+    assert_eq!(
+        hit_test(hwnd, scale, client_origin, 200.0, 10.0),
+        HTCLIENT,
+        "更新后旧区域之外的命中必须回到系统命中码"
+    );
+
+    // 清空：同步为空表，区域不再生效。
+    app.set_drag_regions(id, &[]);
+    native.sync_drag_regions(&app);
+    assert!(native.state_mut().drag_regions().is_empty());
+    assert_eq!(hit_test(hwnd, scale, client_origin, 10.0, 10.0), HTCLIENT);
 }
 
 /// R07-2 回归：`WM_NCHITTEST` 必须返回**系统命中码**。

@@ -1,7 +1,8 @@
 //! 原生窗口：创建（初始隐藏）/ 显示 / 客户区尺寸 / 最小尺寸 / 销毁
 //!
-//! P09 使用**系统标题栏**（`WS_OVERLAPPEDWINDOW`，`WM_NCCALCSIZE` 交 `DefWindowProcW`）；
-//! 自绘标题栏留 P12。
+//! 使用**系统标题栏**（`WS_OVERLAPPEDWINDOW`，`WM_NCCALCSIZE` 交 `DefWindowProcW`）；应用
+//! 自绘标题栏时可以声明**拖动区**（X2 `Window::set_drag_regions`）：`WM_NCHITTEST` 命中区域
+//! 返回 `HTCAPTION`，走系统 move 模态循环（拖动区之外的非客户区仍全部交系统）。
 //!
 //! 客户区**没有**系统的重定向表面（`WS_EX_NOREDIRECTIONBITMAP`）：窗口的全部像素由
 //! [`Composition`] 合成的组合交换链提供。内容 visual 恒 1:1（resize 不缩放旧内容）；窗口放大
@@ -482,6 +483,20 @@ impl NativeWindow {
             self.state_mut().note_ime_applied(applied);
         }
         self.ime_area = None;
+    }
+
+    /// 把 `App` 里最新的自绘标题栏拖动区对账到 `WndProcState`（X2；泵每轮调用）。
+    ///
+    /// **设计**：`WndProc` 不调用应用层（平台层纪律，也避免消息处理期间借用 `App`），区域由
+    /// 泵每轮从 `App::window(id).drag_regions()` 拷进 per-window 状态；`Window::set_drag_regions`
+    /// 同值 no-op，这里再比一次避免每轮分配（同值时不碰 `Vec`）。
+    /// 区域是 `Window::set_drag_regions` 的**逻辑客户区坐标**，`WM_NCHITTEST` 在命中时返回
+    /// `HTCAPTION`（走系统 move 模态循环）。
+    pub(crate) fn sync_drag_regions(&mut self, app: &App) {
+        let Some(window) = app.window(self.id) else {
+            return;
+        };
+        self.state_mut().set_drag_regions(window.drag_regions());
     }
 
     /// 窗口是否已被销毁（`close_requested_windows` 的 retain 判据）。

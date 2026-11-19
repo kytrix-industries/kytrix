@@ -9,10 +9,12 @@
 //!    进入时会再取一次 `GWLP_USERDATA` 并构造 `&mut WndProcState` —— 两个活跃 `&mut` 是别名
 //!    UB。因此会重入的调用一律放在**短借用之间**：先算出命令/纯数据，释放借用，执行，再
 //!    短借用写回（IME 的 [`ime::ImeCommand`] 就是这个形状）。
-//! 2. **非客户区全部交系统**（R07-2）：`WM_NCCALCSIZE` / `WM_NCHITTEST` /
-//!    `WM_NCLBUTTONDOWN` 都不改写。命中码、边框几何、缩放光标，以及 caption 的 move 模态
-//!    循环与 8 个命中码的 size 模态循环都由系统提供（Aero Snap、Win11 Snap Layouts、
-//!    双击边框、`Alt+Space` → 大小、拖动中跨屏 DPI 全部免费；Chrome / Qt / GPUI 同款）。
+//! 2. **非客户区全部交系统**（R07-2）：`WM_NCCALCSIZE` / `WM_NCLBUTTONDOWN` 不改写，
+//!    `WM_NCHITTEST` 也只在**自绘标题栏拖动区**（X2，`drag_regions` 命中）时返回
+//!    `HTCAPTION`，其余仍交 `DefWindowProcW`。命中码、边框几何、缩放光标，以及 caption 的
+//!    move 模态循环与 8 个命中码的 size 模态循环都由系统提供（Aero Snap、Win11 Snap
+//!    Layouts、双击边框、`Alt+Space` → 大小、拖动中跨屏 DPI 全部免费；Chrome / Qt / GPUI
+//!    同款）。拖动区返回 `HTCAPTION` 走的就是同一条系统 move 模态循环。
 //!
 //!    size 模态循环期间泵的 ④ 不运行，但重排 + 重绘没有停：系统把 `WM_SIZE` 同步分派到本
 //!    函数，`WM_ENTERSIZEMOVE` 之后每一条 `WM_SIZE` 都由
@@ -36,10 +38,13 @@ use super::{
     pump::{A11Y_TIMER_ID, cursor_handle, message_ticks},
     recovery,
 };
-use crate::platform::{
-    dispatcher::{WM_APP_COMPOSITION_WAKE, WM_APP_FRAME_WAKE},
-    event::{PlatformEvent, StampedEvent, hiword_signed, loword_signed, translate},
-    windows::{dark_mode, dpi, ime},
+use crate::{
+    math::Point,
+    platform::{
+        dispatcher::{WM_APP_COMPOSITION_WAKE, WM_APP_FRAME_WAKE},
+        event::{PlatformEvent, StampedEvent, hiword_signed, loword_signed, translate},
+        windows::{dark_mode, dpi, ime},
+    },
 };
 
 /// 消费者：`NativeWindow::create`（`window.rs` 注册窗口过程）。
@@ -59,20 +64,48 @@ pub(crate) extern "system" fn wndproc(
         if msg == WM_NCCALCSIZE {
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
-        // 非客户区命中：**系统命中码**（`HTCAPTION` / `HTLEFT` / `HTBOTTOMRIGHT` / `HTCLOSE`…）。
-        //
-        // `WM_NCHITTEST` 不改写：命中码、边框几何、缩放光标形状都由系统算。`WM_NCLBUTTONDOWN`
-        // 也不改写（R07-2）：caption 的 move 模态循环（Aero Snap / Snap Layouts / 双击最大化 /
-        // 右键系统菜单）与 8 个命中码的 size 模态循环都只存在于 `DefWindowProcW` 内部。
-        // 曾经把 `HTCAPTION` 接管的实现因此丢掉了全部系统手势（多显示器用户最常用的窗口布局
-        // 方式）；曾经自持 8 个 resize 命中码的实现则要自己重实现整套平台语义（见 `resize.rs`
-        // 的模块文档：现在改为「系统拥有交互，`WM_SIZE` 驱动真实帧」）。
-        if msg == WM_NCHITTEST {
-            return DefWindowProcW(hwnd, msg, wparam, lparam);
-        }
 
         let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WndProcState;
         if state.is_null() {
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+
+        // 非客户区命中：**系统命中码**（`HTCAPTION` / `HTLEFT` / `HTBOTTOMRIGHT` / `HTCLOSE`…）。
+        //
+        // 命中码、边框几何、缩放光标形状都由系统算。`WM_NCLBUTTONDOWN` 也不改写（R07-2）：
+        // caption 的 move 模态循环（Aero Snap / Snap Layouts / 双击最大化 / 右键系统菜单）与
+        // 8 个命中码的 size 模态循环都只存在于 `DefWindowProcW` 内部。曾经把 `HTCAPTION`
+        // 接管的实现因此丢掉了全部系统手势（多显示器用户最常用的窗口布局方式）；曾经自持
+        // 8 个 resize 命中码的实现则要自己重实现整套平台语义（见 `resize.rs` 的模块文档：
+        // 现在改为「系统拥有交互，`WM_SIZE` 驱动真实帧」）。
+        //
+        // **X2 的唯一例外**：自绘标题栏拖动区（应用通过 `Window::set_drag_regions` 声明，泵
+        // 每轮同步到 [`WndProcState::drag_regions`]）命中时返回 `HTCAPTION` —— 与系统标题栏走
+        // 同一条 move 模态循环（双击最大化/还原、Aero Snap、Snap Layouts、`Alt+Space` 全部
+        // 成立）；区域之外仍交 `DefWindowProcW`，上面的系统语义不变。区域是**逻辑客户区
+        // 坐标**：屏幕物理坐标（`WM_NCHITTEST` 的 lParam）→ `ScreenToClient` → 除以本消息
+        // 时刻的 scale。
+        if msg == WM_NCHITTEST {
+            let mut point = POINT {
+                x: loword_signed(lparam.0),
+                y: hiword_signed(lparam.0),
+            };
+            // `ScreenToClient` 只做坐标换算、不派发消息（不违反纪律 1）；`hwnd` 存活由外层
+            // `unsafe` 块的 SAFETY 注释覆盖。
+            if ScreenToClient(hwnd, &mut point).as_bool() {
+                let scale = (*state).scale();
+                let logical = Point::new(
+                    scale.to_logical(point.x as f32),
+                    scale.to_logical(point.y as f32),
+                );
+                if (*state)
+                    .drag_regions()
+                    .iter()
+                    .any(|region| region.contains(logical))
+                {
+                    return LRESULT(HTCAPTION as isize);
+                }
+            }
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
 

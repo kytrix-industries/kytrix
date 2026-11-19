@@ -75,6 +75,9 @@ pub(super) fn sync_native_windows(
             let mut target = composition::lock(&target);
             target.set_geometry(client, client)?;
         }
+        // X2：运行时新建的窗口同样必须在**显示之前**拿到当前拖动区（`App::set_drag_regions`
+        // 可能先于原生窗口创建调用；之后的变化由泵的 ④′ 每轮对账）。
+        native.sync_drag_regions(app);
         native.note_composition_geometry((client, client));
         native.show();
         windows.push(native);

@@ -11,10 +11,11 @@
 //!
 //! ## 非客户区：全部交系统（R07-2）
 //!
-//! `WM_NCCALCSIZE` / `WM_NCHITTEST` / `WM_NCLBUTTONDOWN` **全部**交 `DefWindowProcW`：命中码、
-//! 边框几何、缩放光标，以及 caption 的 move 模态循环与 8 个命中码的 size 模态循环都由系统
-//! 提供（Chrome / Qt / GPUI 同款）。Aero Snap / Win11 Snap Layouts / 双击边框 /
-//! `Alt+Space` → 大小 / 拖动中跨屏 DPI 因此全部免费。
+//! `WM_NCCALCSIZE` / `WM_NCLBUTTONDOWN` **全部**交 `DefWindowProcW`；`WM_NCHITTEST` 只在应用
+//! 声明的**自绘标题栏拖动区**（X2）命中时返回 `HTCAPTION`，其余点仍交默认过程。命中码、边框
+//! 几何、缩放光标，以及 caption 的 move 模态循环与 8 个命中码的 size 模态循环都由系统提供
+//! （Chrome / Qt / GPUI 同款）。Aero Snap / Win11 Snap Layouts / 双击边框 / `Alt+Space` →
+//! 大小 / 拖动中跨屏 DPI 因此全部免费。
 //!
 //! size 模态循环期间泵的 ④ 不运行，但**重排 + 重绘并没有停**：模态循环会同步
 //! `DispatchMessage` 到本窗口的 `WndProc`，每一条 `WM_SIZE` 都由
@@ -35,7 +36,7 @@ use windows::Win32::Foundation::HWND;
 
 use crate::{
     error::EngineError,
-    math::{PhysicalRect, Scale},
+    math::{PhysicalRect, Rect, Scale},
     platform::{
         dispatcher::Dispatcher,
         event::{MessageContext, PlatformEvent, StampedEvent, TranslateState},
@@ -110,6 +111,12 @@ pub(crate) struct WndProcState {
     /// （恒为 `IDC_ARROW`）—— 只在光标变化时 `SetCursor` 的写法会被系统覆盖掉，自定义光标
     /// 永远不生效（P2-3）。所以这里记住当前值，在 `WM_SETCURSOR` 里重新应用。
     cursor: crate::paint::style::Cursor,
+    /// 自绘标题栏拖动区（**逻辑窗口坐标**，客户区左上原点；X2 公共契约）。
+    ///
+    /// 泵每轮从 `App::window(id).drag_regions()` 对账到本字段
+    ///（`NativeWindow::sync_drag_regions`），`WndProc` 的 `WM_NCHITTEST` 只读 —— 窗口过程里
+    /// 不调用应用层（平台层纪律），也避免在消息处理期间借用 `App` 造成重入。
+    drag_regions: Vec<Rect>,
     /// 系统 size / move 模态循环是否进行中（`WM_ENTERSIZEMOVE` → `WM_EXITSIZEMOVE`）。
     ///
     /// 会话期间泵的 ④ 不运行：重排 + 重绘由模态循环分派的 `WM_SIZE` 直接驱动
@@ -168,6 +175,7 @@ impl WndProcState {
             a11y: WindowsA11y::new(hwnd, dispatcher, window)?,
             suppress_capture_cancel: false,
             cursor: crate::paint::style::Cursor::Default,
+            drag_regions: Vec::new(),
             size_move: false,
             suppress_move: false,
             pending_error: None,
@@ -364,6 +372,20 @@ impl WndProcState {
     /// 记录引擎当前光标（`WM_SETCURSOR` 据此重新应用，P2-3）。
     pub(crate) fn set_cursor(&mut self, cursor: crate::paint::style::Cursor) {
         self.cursor = cursor;
+    }
+
+    /// 当前自绘标题栏拖动区（X2；`WndProc` 的 `WM_NCHITTEST` 读点）。
+    pub(crate) fn drag_regions(&self) -> &[Rect] {
+        &self.drag_regions
+    }
+
+    /// 用 `App` 的最新拖动区对账（同值 no-op；泵每轮调用，`WndProc` 的读点唯一来源）。
+    pub(crate) fn set_drag_regions(&mut self, regions: &[Rect]) {
+        if self.drag_regions == regions {
+            return;
+        }
+        self.drag_regions.clear();
+        self.drag_regions.extend_from_slice(regions);
     }
 
     /// `WM_ENTERSIZEMOVE`：系统 size / move 模态循环开始（期间泵的 ④ 不运行）。
