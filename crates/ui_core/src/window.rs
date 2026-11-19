@@ -217,9 +217,11 @@ pub enum WindowResizeEdge {
 /// # Windows 标题栏 / 非客户区交互
 ///
 /// **非客户区全部交系统**（R07-2）：`WM_NCCALCSIZE` / `WM_NCHITTEST` / `WM_NCLBUTTONDOWN`
-/// 都不改写 —— 拖动标题栏、双击最大化/还原、右键系统菜单、`Alt+Space`、**Aero Snap /
+/// 默认都不改写 —— 拖动标题栏、双击最大化/还原、右键系统菜单、`Alt+Space`、**Aero Snap /
 /// Win11 Snap Layouts** 与边框拖拽都由系统的 move / size 模态循环提供（Chrome / GPUI / Qt
-/// 同样不接管它们）。
+/// 同样不接管它们）。唯一的例外是应用显式声明的自绘标题栏拖动区（X2
+/// [`Window::set_drag_regions`]）：命中区域的 `WM_NCHITTEST` 返回 `HTCAPTION`，让自绘标题栏
+/// 复用系统标题栏的同一套拖动语义；未声明时非客户区行为完全不变。
 ///
 /// 系统 size 模态循环会占住本线程消息泵，但**重排 + 重绘不会停**：模态循环把 `WM_SIZE`
 /// 同步分派到 `WndProc`，平台层在每条 `WM_SIZE` 上直接更新客户区、对齐 DirectComposition
@@ -236,8 +238,9 @@ pub struct WindowOptions {
     pub size: Size,
     /// 初始客户区左上角位置（逻辑像素，坐标语义见 [`WindowOptions`] 的「坐标语义」一节）。
     ///
-    /// `None` = 由平台决定（Windows 建在屏幕中央附近、macOS 由 AppKit 级联摆放、
-    /// Wayland 由 compositor 决定）。
+    /// `None` = 由平台决定（Windows 保留历史默认 `(100,100)`；macOS 由平台按 26 point 级联摆放；
+    /// Wayland 由 compositor 决定）。应用若需要稳定的多窗口摆放，应显式传 `position` 并自己
+    /// 持久化（placement 归应用层）。
     ///
     /// 平台层会把位置 **clamp 到最近显示器的工作区**（至少保留标题栏/一条边可见，避免
     /// 显示器拔掉后窗口恢复到不可达位置）。placement 的**持久化归属应用层**：应用从

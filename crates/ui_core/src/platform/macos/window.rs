@@ -141,10 +141,10 @@ fn screen_areas(mtm: MainThreadMarker) -> Vec<placement::ScreenArea> {
     let screens = NSScreen::screens(mtm);
     let mut areas = Vec::with_capacity(screens.count());
     for screen in screens.to_vec() {
-        areas.push(placement::ScreenArea {
-            frame: ns_area(screen.frame()),
-            visible: ns_area(screen.visibleFrame()),
-        });
+        areas.push(placement::ScreenArea::new(
+            ns_area(screen.frame()),
+            ns_area(screen.visibleFrame()),
+        ));
     }
     areas
 }
