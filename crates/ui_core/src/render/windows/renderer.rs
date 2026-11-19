@@ -1033,6 +1033,26 @@ impl FrameStatisticsClock {
     }
 }
 
+/// GPU 线程错误边界的权威判据：设备是否真的已移除（C1）。
+///
+/// 只在**非** `DeviceLost` 错误上调用（`DeviceLost` 本身就是粘性结论）：`GetDeviceRemovedReason`
+/// 是唯一权威来源，设备健康时恒 `false`。
+fn device_lost_for_boundary(renderer: Option<&GpuRenderer>) -> bool {
+    renderer.is_some_and(|current| current.check_device_lost().is_some())
+}
+
+/// GPU 线程致命错误边界：宣布致命之前是否需要走设备恢复（C1）。
+///
+/// - `DeviceLost` 是粘性结论，必须恢复；
+/// - 其它错误（`Swapchain` / `Composition` / ...）只有在权威判据同时确认设备已移除时才恢复 ——
+///   典型来源是 `ResizeBuffers` 在 TDR / 驱动复位竞态下返回设备级 HRESULT 却被包成交换链错误。
+///
+/// 这与逐调用点的 `classify` 是两层防线：`classify` 让错误**分类正确**，本判据保证**不会漏掉**
+/// 尚未接线的 DXGI 调用点（新增调用点忘记 classify 时仍然恢复而不是静默退出线程）。
+fn recovery_required(error: &EngineError, device_lost: bool) -> bool {
+    matches!(error, EngineError::DeviceLost { .. }) || device_lost
+}
+
 /// GPU 线程主循环（§6.3）。
 ///
 /// 外层只做一件事（R08-4）：`run_gpu_loop` 以 `DeviceLost` 退出时先尝试**进程内恢复**
@@ -1057,7 +1077,11 @@ fn gpu_loop(renderer: GpuRenderer, shared: Arc<Shared>) {
         match result {
             Ok(()) => break,
             Err(error) => {
-                if !matches!(error, EngineError::DeviceLost { .. }) {
+                // C1 的边界复判：任何 GPU 线程致命错误在宣布致命之前，用权威判据
+                // （`GetDeviceRemovedReason`）复查一次设备是否真的还在。逐调用点 `classify`
+                // 之外还会有遗漏（尤其 `ResizeBuffers` 这类把设备级 HRESULT 包成
+                // `Swapchain` 的出口），这里兜底：设备已死就必须走恢复，而不是退出线程。
+                if !recovery_required(&error, device_lost_for_boundary(renderer.as_ref())) {
                     shared.publish_error(error);
                     break;
                 }
@@ -1646,7 +1670,7 @@ mod tests {
 
     use super::{
         AtlasSlots, DisplayRecovery, FrameSink, PanicGuard, Shared, State, StickyError,
-        WindowFrameSink, pack_size, recover_display_change, unpack_size,
+        WindowFrameSink, recovery_required, pack_size, recover_display_change, unpack_size,
     };
     use crate::{
         error::EngineError,
@@ -1802,6 +1826,42 @@ mod tests {
         assert_eq!(sink.reset_epoch(), 1, "设备恢复必须让 UI 看到新代际");
         shared.note_renderer_rebuilt();
         assert_eq!(sink.reset_epoch(), 2, "连续两次重建必须各 +1");
+    }
+
+    /// C1：GPU 线程错误边界必须先复判设备状态，再决定「恢复」还是「致命」。
+    ///
+    /// 真实故障（TDR 恰落在 `ResizeBuffers` 上）无法在 WARP 里自动触发，因此这里对**判据**做
+    /// 穷举：`DeviceLost` 恒恢复；非 `DeviceLost` 但权威判据确认移除 ⇒ 恢复（`ResizeBuffers`
+    /// 把设备级 HRESULT 包成 `Swapchain` 的路径）；健康设备上的非 `DeviceLost` 错误保持致命。
+    #[test]
+    fn the_fatal_boundary_rejudges_a_removed_device_before_publishing() {
+        let removed = EngineError::DeviceLost {
+            reason: SmolStr::new_static("DXGI_ERROR_DEVICE_REMOVED"),
+            log_path: std::path::PathBuf::from("logs/dred.txt"),
+        };
+        assert!(
+            recovery_required(&removed, false),
+            "DeviceLost 本身已足够触发恢复"
+        );
+        assert!(recovery_required(&removed, true));
+
+        let swapchain = EngineError::Swapchain {
+            detail: SmolStr::new_static("ResizeBuffers(800x600): 0x887A0005"),
+        };
+        assert!(
+            !recovery_required(&swapchain, false),
+            "设备健康时交换链错误必须保持致命（不无限恢复）"
+        );
+        assert!(
+            recovery_required(&swapchain, true),
+            "ResizeBuffers 在设备移除竞态下被包成 Swapchain 时仍必须恢复"
+        );
+
+        let composition = EngineError::Composition {
+            detail: SmolStr::new_static("Device::Commit: 0x8007000E"),
+        };
+        assert!(!recovery_required(&composition, false));
+        assert!(recovery_required(&composition, true));
     }
 
     /// R07-14：平台层的显示 / 电源恢复（拓扑变化、工作区变化、睡眠唤醒）必须让 GPU 线程
