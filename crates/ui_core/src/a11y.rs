@@ -325,7 +325,8 @@ pub struct A11yOverride {
     pub key: Option<u64>,
     /// 表头排序状态（`aria-sort`）。
     pub sort: Option<A11ySort>,
-    /// 文本选区 / caret（UTF-8 字节偏移；只对文本节点有意义）。
+    /// 文本选区 / caret（UTF-8 字节偏移；**只对 `TextRun` 节点有效** —— AccessKit 的
+    /// `TextPosition.node` 必须是 `Role::TextRun`）。
     pub selection: Option<A11yTextSelection>,
     /// 自定义动作（id + 名字）：`A11yAction::Custom(id)` 的能力登记。
     pub custom_actions: Vec<A11yCustomAction>,
@@ -407,6 +408,10 @@ pub struct A11yPatch {
     /// 表头排序状态（`aria-sort`）。
     pub sort: Option<A11ySort>,
     /// 文本选区 / caret（UTF-8 字节偏移）。
+    ///
+    /// **只能打在 `TextRun` 节点上**（E4a 契约）：AccessKit 的 `TextPosition.node` 必须是
+    /// `Role::TextRun`，打在输入框/普通文本节点上会被 consumer 静默丢弃。输入框的选区由它的子
+    /// TextRun 承载。
     pub selection: Option<A11yTextSelection>,
     /// 自定义动作（id + 名字）。
     pub custom_actions: Option<Vec<A11yCustomAction>>,
@@ -532,6 +537,17 @@ pub struct A11yNode {
     pub character_lengths: Vec<u8>,
     /// 每个词的起始字符下标（`accesskit::Node::word_starts`；升序，`u8` 上限见 AccessKit）。
     pub word_starts: Vec<u8>,
+    /// 逐 grapheme 的 caret 位置（**物理像素、节点 bounds 原点起算的 inline 轴坐标**；
+    /// `accesskit::Node::character_positions`，E4b）。
+    ///
+    /// 只在能正确表达时非空：`TextRun` + 已 shape 且与当前文本一致 + **单行 LTR**。空 = AT
+    /// 回退（无 caret 高亮），引擎绝不发近似/错行的值。
+    pub character_positions: Vec<f32>,
+    /// 逐 grapheme 的 advance 宽度（物理像素；`accesskit::Node::character_widths`，E4b）。
+    ///
+    /// 与 [`Self::character_positions`] 等长；`text_direction` 由 `to_accesskit` 在非空时写
+    /// `LeftToRight`。
+    pub character_widths: Vec<f32>,
     /// 文本选区 / caret（**grapheme 下标**，已由字节偏移换算；`None` = 不表态）。
     pub text_selection: Option<A11yTextSelection>,
     /// 只读（`set_read_only`）。
@@ -773,6 +789,17 @@ pub enum A11yDiagnostic {
         /// 被拒绝的动作。
         action: A11yAction,
     },
+    /// 动作的 payload 无法按引擎口径解释（已忽略，E4a）。
+    ///
+    /// 典型：`SetTextSelection` 的 `TextPosition.node` 既不是存活的 `TextRun`、目标也不能回退
+    /// 成 TextRun（AT 拿的是旧快照 / 多 run 定位失败）。此时**不能**把含糊的字符索引交给应用
+    /// （CJK/emoji 下会错位改写文本），只能拒绝并留诊断。
+    InvalidActionData {
+        /// 节点。
+        node: NodeId,
+        /// 动作。
+        action: A11yAction,
+    },
 }
 
 /// a11y 动作的 payload（强类型；替代 `accesskit::ActionData` 的公开面）。
@@ -782,11 +809,15 @@ pub enum A11yActionData<'a> {
     None,
     /// 文本值（`SetValue` / `ReplaceSelectedText`）。
     Value(&'a str),
-    /// 文本选区（**字符**索引；转为字节/字形归应用）。
+    /// 文本选区（**UTF-8 字节偏移**，与 `A11yTextSelection` / IME caret / `String` 同一口径；
+    /// E4a 由引擎在唯一入口把 AT 的 grapheme 下标换算成字节并夹紧）。
+    ///
+    /// 目标语义：Windows 的 `SetTextSelection` 打在 `TextRun` 上、macOS/AT-SPI 打在输入框上；
+    /// 引擎把 `ctx.node()` 归一为**输入框节点**（三端一致），应用无需关心平台差异。
     Selection {
-        /// 起点。
+        /// 起点（UTF-8 字节偏移，落在 char boundary）。
         anchor: usize,
-        /// 活动端。
+        /// 活动端（UTF-8 字节偏移，落在 char boundary）。
         focus: usize,
     },
     /// 滚动偏移。

@@ -637,7 +637,11 @@ fn depth_of(tree: &NodeTree, node: NodeId) -> u32 {
     depth
 }
 
-/// 用窗口的 IME 插入点提示补 `text_selection`（只在没有显式选区、且节点是可编辑文本时）。
+/// 用窗口的 IME 插入点提示补 `text_selection`（只在没有显式选区、且节点是 `TextRun` 时）。
+///
+/// E4a 契约：`text_selection` **只**挂 `TextRun`（`accesskit_consumer` 要求
+/// `TextPosition.node` 是 `Role::TextRun`，否则整段选区被静默丢弃）；输入框的 caret 提示由它的
+/// 子 TextRun 承载。
 fn apply_caret(record: &mut A11yNode, caret: Option<(NodeId, usize)>) {
     let Some((node, byte_index)) = caret else {
         return;
@@ -645,10 +649,7 @@ fn apply_caret(record: &mut A11yNode, caret: Option<(NodeId, usize)>) {
     if record.engine != node
         || record.text_selection.is_some()
         || record.character_lengths.is_empty()
-        || !matches!(
-            record.role,
-            A11yRole::TextRun | A11yRole::TextInput | A11yRole::MultilineTextInput
-        )
+        || record.role != A11yRole::TextRun
     {
         return;
     }
@@ -843,6 +844,17 @@ pub(crate) fn to_accesskit(record: &crate::a11y::A11yNode) -> accesskit::Node {
     }
     if !record.word_starts.is_empty() {
         node.set_word_starts(record.word_starts.clone());
+    }
+    // 字符度量（E4b）：`character_positions` / `character_widths` 长度必须等于
+    // `character_lengths`（AccessKit 硬约束），且只在单行 LTR 时由 a11y::tree 生成；这里再
+    // 防御一次长度（不一致时**省略**，绝不让 consumer 读到错位的 caret 表）。
+    if !record.character_positions.is_empty()
+        && record.character_positions.len() == record.character_lengths.len()
+        && record.character_widths.len() == record.character_lengths.len()
+    {
+        node.set_character_positions(record.character_positions.clone());
+        node.set_character_widths(record.character_widths.clone());
+        node.set_text_direction(accesskit::TextDirection::LeftToRight);
     }
     if let Some(selection) = record.text_selection {
         node.set_text_selection(accesskit::TextSelection {

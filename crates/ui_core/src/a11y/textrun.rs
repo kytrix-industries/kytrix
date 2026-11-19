@@ -17,7 +17,12 @@
 
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::a11y::A11yTextSelection;
+use crate::{
+    a11y::A11yTextSelection,
+    math::Scale,
+    node::{id::NodeId, tree::NodeTree},
+    text::TextDirection,
+};
 
 /// 文本的 `(character_lengths, word_starts)`；病态 grapheme 超过 `u8` 表示能力时返回 `None`。
 pub(crate) fn text_metrics(text: &str) -> Option<(Vec<u8>, Vec<u8>)> {
@@ -33,6 +38,11 @@ pub(crate) fn text_metrics(text: &str) -> Option<(Vec<u8>, Vec<u8>)> {
             break;
         };
         starts.push(index);
+    }
+    // AccessKit 契约：词起点之后的每个字符都必须归入某个词（前导非词字符 / 纯标点文本也要有
+    // 0 起点），否则读屏的"按词移动"会漏掉开头这段（`unicode_word_indices` 不产生 0 起点）。
+    if !text.is_empty() && starts.first().copied() != Some(0) {
+        starts.insert(0, 0);
     }
     Some((lengths, starts))
 }
@@ -51,6 +61,19 @@ pub(crate) fn grapheme_index(lengths: &[u8], byte: usize) -> usize {
     lengths.len()
 }
 
+/// grapheme 下标 → 该 grapheme 起点的**字节偏移**（[`grapheme_index`] 的逆；E4a）。
+///
+/// AT 侧（`accesskit::TextPosition.character_index`）是 `character_lengths` 的下标；引擎与
+/// 应用层的文本 API 是 UTF-8 字节偏移。下标越界时夹紧到 `Σ lengths`（= 文本末尾的 caret），
+/// 因此返回值恒落在 char boundary 上（`lengths` 本身来自 grapheme 划分）。
+pub(crate) fn byte_index(lengths: &[u8], grapheme: usize) -> usize {
+    lengths
+        .iter()
+        .take(grapheme)
+        .map(|len| usize::from(*len))
+        .sum()
+}
+
 /// 字节偏移的选区 → grapheme 下标的选区。
 pub(crate) fn selection(lengths: &[u8], selection: A11yTextSelection) -> A11yTextSelection {
     A11yTextSelection {
@@ -59,9 +82,82 @@ pub(crate) fn selection(lengths: &[u8], selection: A11yTextSelection) -> A11yTex
     }
 }
 
+/// TextRun 的逐 grapheme 字符度量（AccessKit `character_positions` / `character_widths`）。
+///
+/// 返回 `(positions, widths)`：位置是**节点 bounds 原点起算的物理像素 x**（AccessKit consumer
+/// 用 `point.x - bounds.x0` 对比 `character_positions`，见 `accesskit_consumer::text` 的
+/// `character_index_at_point`），宽度是同一 grapheme 的 advance。数组长度 == `lengths.len()`。
+///
+/// **只在能正确表达时返回**（否则 `None` ⇒ AT 回退到无 caret 高亮，绝不发错值）：
+/// - `TextRun` 已被 shape 且与当前文本一致：直接复用 `NodeTree::text_caret_rect` 的**全部**
+///   输入校验（`text == shaped.text`、`same_shaping_inputs`、行内盒一致、laid 宽度 == 期望宽度、
+///   byte 在 char boundary）—— 与 `apply` 用的是同一份真值，不会读到半新半旧的 shape；
+/// - **显式 LTR**：`Auto` 需要逐段方向判定、RTL 的 inline 轴方向相反，而 consumer 只处理单一
+///   `text_direction`（D6-A）；
+/// - **单行**：所有 grapheme 起点 + 末尾 caret 必须落在同一 y（软换行/硬换行都会让 y 变化；
+///   AccessKit 的位置模型忽略 y，多行发出去会命中错行）。
+pub(crate) fn character_metrics(
+    tree: &NodeTree,
+    node: NodeId,
+    lengths: &[u8],
+    scale: Scale,
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    if lengths.is_empty() {
+        return None;
+    }
+    let content = tree.text_content(node)?;
+    if content.style.direction != TextDirection::Ltr {
+        return None;
+    }
+    let slot = tree.text_slot(node)?;
+    // 完整输入校验（失败 = 文本/样式/宽度与上次 shape 不一致，等文本 pass 之后再来）。
+    tree.text_caret_rect(node, 0).ok()?;
+    let shaped = slot.shaped();
+    let width = f32::from_bits(slot.laid_width_bits());
+    let alignment = content.style.alignment;
+    let scale_factor = scale.factor();
+    let content_x = tree.content_offset(node).x;
+
+    let mut positions = Vec::with_capacity(lengths.len());
+    let mut byte = 0usize;
+    let mut line_y: Option<f32> = None;
+    for len in lengths {
+        let rect = shaped.caret_rect(width, alignment, byte);
+        let y = rect.min().y;
+        match line_y {
+            None => line_y = Some(y),
+            Some(expected) if expected != y => return None,
+            Some(_) => {}
+        }
+        positions.push((content_x + rect.min().x) * scale_factor);
+        byte += usize::from(*len);
+    }
+    // 末尾 caret 参与单行判定，并提供最后一个 grapheme 的 advance。
+    let end = shaped.caret_rect(width, alignment, byte);
+    if Some(end.min().y) != line_y {
+        return None;
+    }
+    positions.push((content_x + end.min().x) * scale_factor);
+    let mut widths = Vec::with_capacity(lengths.len());
+    for pair in positions.windows(2) {
+        widths.push(pair[1] - pair[0]);
+    }
+    positions.pop();
+    if positions
+        .iter()
+        .chain(widths.iter())
+        .any(|value| !value.is_finite())
+        || widths.iter().any(|width| *width < 0.0)
+    {
+        return None;
+    }
+    debug_assert_eq!(positions.len(), lengths.len());
+    Some((positions, widths))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{grapheme_index, selection, text_metrics};
+    use super::{byte_index, grapheme_index, selection, text_metrics};
     use crate::a11y::A11yTextSelection;
 
     fn lengths(text: &str) -> Vec<u8> {
@@ -175,5 +271,50 @@ mod tests {
     #[test]
     fn empty_text_has_no_metrics() {
         assert_eq!(text_metrics(""), Some((Vec::new(), Vec::new())));
+    }
+
+    /// E4b：非空文本的 `word_starts` 必须以 0 开始（AccessKit 契约：词起点之后的每个字符都
+    /// 必须归入某个词；`unicode_word_indices` 对前导非词字符 / 纯标点文本不产生 0 起点）。
+    #[test]
+    fn word_starts_start_at_zero_for_non_empty_runs() {
+        for text in ["  abc", "!!!", "价🌍ab", "a b", "  "] {
+            let (_, starts) = text_metrics(text).expect("metrics");
+            assert_eq!(
+                starts.first().copied(),
+                Some(0),
+                "{text:?} 的 word_starts 必须以 0 开始：{starts:?}"
+            );
+            assert!(
+                starts.windows(2).all(|pair| pair[0] < pair[1]),
+                "{text:?} 的 word_starts 必须严格升序：{starts:?}"
+            );
+        }
+        assert_eq!(
+            text_metrics("").expect("metrics").1,
+            Vec::<u8>::new(),
+            "空文本没有词起点"
+        );
+    }
+
+    /// E4a：AT 的 grapheme 下标 → 应用层的 UTF-8 字节偏移（`grapheme_index` 的逆）。
+    #[test]
+    fn byte_index_is_the_inverse_of_grapheme_index() {
+        let g = lengths("价🌍ab");
+        assert_eq!(g, vec![3, 4, 1, 1]);
+        // 每个 grapheme 的起点字节。
+        assert_eq!(
+            (0..=4).map(|index| byte_index(&g, index)).collect::<Vec<_>>(),
+            vec![0, 3, 7, 8, 9],
+            "grapheme 下标 → 字节偏移（含末尾 caret）"
+        );
+        // 往返：字节起点 → grapheme 下标 → 同一字节。
+        for grapheme in 0..=g.len() {
+            let byte = byte_index(&g, grapheme);
+            assert_eq!(grapheme_index(&g, byte), grapheme);
+        }
+        // 越界夹紧到文本末尾（不 panic、不越过 Σ lengths）。
+        assert_eq!(byte_index(&g, 99), 9);
+        assert_eq!(byte_index(&[], 0), 0);
+        assert_eq!(byte_index(&[], 5), 0);
     }
 }

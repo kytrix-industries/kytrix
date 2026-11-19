@@ -14,14 +14,19 @@ use accesskit::{Action, ActionData, ActionRequest};
 
 use crate::{
     a11y::{
-        A11yAction, A11yActionCtx, A11yActionData, A11yDiagnostic, A11yNodeId,
-        mapping::action_from_accesskit,
+        A11yAction, A11yActionCtx, A11yActionData, A11yDiagnostic, A11yNodeId, A11yRole,
+        mapping::{action_from_accesskit, effective_role_of},
+        textrun,
     },
     app::App,
     event::ActionSource,
     interaction::focus::{action_target, focusable, in_scope},
     math::Point,
-    window::WindowId,
+    node::{
+        id::NodeId,
+        tree::{Node, NodeKind, NodeTree},
+    },
+    window::{Window, WindowId},
 };
 
 /// 分发一条 a11y 动作（主线程）。
@@ -135,11 +140,25 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
         return;
     }
 
+    // E4a：`SetTextSelection` 的 AT 侧 payload 是 grapheme 下标、`TextPosition.node` 是 TextRun；
+    // 应用边界统一为 **UTF-8 字节偏移**，目标归一为**输入框**（Windows 把动作打在 TextRun 上，
+    // macOS/AT-SPI 打在输入框上）。换算失败（位置节点失效/不是 TextRun 且目标也回退不了）⇒
+    // 拒绝并留 `InvalidActionData` 诊断，绝不把含糊口径交给应用。
+    let mut handler_node = engine;
     let payload = match action {
         // R13-21：`Increment` / `Decrement` 没有 payload 时，AT 的"加一步"只能靠应用自己
         // 猜当前值与步长。这里用节点自己的 `numeric_value ± numeric_value_step` 补齐。
         A11yAction::Increment | A11yAction::Decrement => {
             increment_payload(app, window, engine, action, data.as_ref())
+        }
+        A11yAction::SetTextSelection => {
+            let Some((target, payload)) = selection_payload(app, window, engine, data.as_ref())
+            else {
+                app.a11y_note(A11yDiagnostic::InvalidActionData { node: engine, action });
+                return;
+            };
+            handler_node = target;
+            payload
         }
         _ => payload_of(data.as_ref(), action),
     };
@@ -147,7 +166,7 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
     // ① 应用 handler 优先（`Click` 例外：它必须落到 P10 的 `Action` 表，见 §9.3）。
     if action != A11yAction::Click
         && app.a11y_has_handler(action)
-        && run_handler(app, window, engine, action, payload)
+        && run_handler(app, window, handler_node, action, payload)
     {
         return;
     }
@@ -253,6 +272,100 @@ fn payload_of(data: Option<&ActionData>, action: A11yAction) -> A11yActionData<'
         }
         _ => A11yActionData::None,
     }
+}
+
+/// E4a：AT 的文本选区 → 应用层 payload（**UTF-8 字节偏移**）+ 归一后的 handler 目标。
+///
+/// `accesskit::TextPosition.character_index` 是 `character_lengths`（grapheme 划分）的下标；
+/// 应用侧（`A11yTextSelection` / IME caret / `String`）统一用字节偏移，所以两端都在这里换算并
+/// 夹紧（越界 = 文本末尾的 caret）。位置节点的稳定 id 经窗口分配器解回引擎句柄；任一端解析
+/// 失败时回退到目标自身（仅当目标本身是 TextRun），否则返回 `None` 由调用方拒绝。
+fn selection_payload(
+    app: &App,
+    window: WindowId,
+    target: NodeId,
+    data: Option<&ActionData>,
+) -> Option<(NodeId, A11yActionData<'static>)> {
+    let Some(ActionData::SetTextSelection(selection)) = data else {
+        return None;
+    };
+    let window_state = app.window(window)?;
+    let tree = window_state.tree();
+    let anchor = selection_byte_index(
+        tree,
+        window_state,
+        selection.anchor.node.0,
+        selection.anchor.character_index,
+        target,
+    )?;
+    let focus = selection_byte_index(
+        tree,
+        window_state,
+        selection.focus.node.0,
+        selection.focus.character_index,
+        target,
+    )?;
+    Some((
+        normalized_selection_target(tree, target),
+        A11yActionData::Selection { anchor, focus },
+    ))
+}
+
+/// 选区一端的 AT 位置（稳定 id + grapheme 下标）→ UTF-8 字节偏移。
+fn selection_byte_index(
+    tree: &NodeTree,
+    window: &Window,
+    stable: u64,
+    character_index: usize,
+    fallback: NodeId,
+) -> Option<usize> {
+    let run = window
+        .a11y_engine_of(A11yNodeId::from_stable(stable))
+        .filter(|engine| is_text_run(tree, *engine))
+        .or_else(|| is_text_run(tree, fallback).then_some(fallback))?;
+    let content = tree.text_content(run)?;
+    let (lengths, _) = textrun::text_metrics(&content.text)?;
+    Some(textrun::byte_index(&lengths, character_index))
+}
+
+/// 选区动作的 handler 目标归一：Windows 把 `SetTextSelection` 打在 `TextRun` 上，macOS/AT-SPI
+/// 打在输入框上 —— 应用统一收到**输入框节点**。TextRun 沿父链最多 2 层找输入框（引擎的
+/// 输入框结构是「声明 TextInput 角色的盒子 + 子文本运行」，2 层足够容纳包装层）。
+fn normalized_selection_target(tree: &NodeTree, target: NodeId) -> NodeId {
+    if is_text_input(tree, target) {
+        return target;
+    }
+    if !is_text_run(tree, target) {
+        return target;
+    }
+    let mut cursor = tree.get(target).ok().and_then(Node::parent);
+    let mut hops = 0;
+    while let Some(parent) = cursor {
+        if is_text_input(tree, parent) {
+            return parent;
+        }
+        hops += 1;
+        if hops >= 2 {
+            break;
+        }
+        cursor = tree.get(parent).ok().and_then(Node::parent);
+    }
+    target
+}
+
+/// 该节点是否是文本输入框（按合并后的角色判断，与 a11y 快照同源）。
+fn is_text_input(tree: &NodeTree, node: NodeId) -> bool {
+    matches!(
+        effective_role_of(tree, node),
+        A11yRole::TextInput | A11yRole::MultilineTextInput
+    )
+}
+
+/// 该节点是否是 `TextRun`（`TextPosition.node` 的合法宿主）。
+fn is_text_run(tree: &NodeTree, node: NodeId) -> bool {
+    tree.get(node)
+        .is_ok_and(|target| matches!(target.kind(), NodeKind::Text(_)))
+        && effective_role_of(tree, node) == A11yRole::TextRun
 }
 
 /// 调应用 handler（借用纪律：先摘出闭包 → 建 ctx → 调用 → 放回）。
@@ -854,29 +967,47 @@ mod tests {
         assert_eq!(seen.take(), String::from("的"));
     }
 
-    #[test]
-    fn set_text_selection_carries_character_offsets() {
-        let (_runtime, mut app, window) = setup();
+    /// 造一个「输入框 + 子文本 `"价🌍ab"`」的夹具，返回 `(input, text_run)` 与已分配的稳定 id。
+    fn text_input_fixture(
+        app: &mut App,
+        window: crate::window::WindowId,
+    ) -> (crate::node::id::NodeId, crate::node::id::NodeId, crate::a11y::A11yNodeId) {
         let root = app.window(window).expect("window").tree().root();
-        let node = NodeBuilder::boxed()
+        let input = NodeBuilder::boxed()
             .a11y(A11yOverride {
                 role: Some(crate::a11y::A11yRole::TextInput),
-                // E3：能力集是分发判据。没有 TextRun 子节点时输入框不默认宣告
-                // `SetTextSelection`（AccessKit 的 `supports_text_ranges` 同款判据），
-                // 所以这里由应用显式声明。
-                actions: Some(vec![
-                    crate::a11y::A11yAction::SetValue,
-                    crate::a11y::A11yAction::SetTextSelection,
-                ]),
+                label: Some(SmolStr::new_static("搜索")),
                 ..A11yOverride::default()
             })
             .build(app.window_mut(window).expect("window").tree_mut(), root)
-            .expect("mount");
-        let seen = Rc::new(Cell::new((usize::MAX, usize::MAX)));
+            .expect("input");
+        let text = NodeBuilder::text("价🌍ab", crate::text::TextStyle::new(12.0))
+            .build(app.window_mut(window).expect("window").tree_mut(), input)
+            .expect("text run");
+        let _ = app.a11y_take(window).expect("首笔 a11y 交付（分配稳定 id）");
+        let stable = app
+            .window(window)
+            .expect("window")
+            .a11y_stable_id(text)
+            .expect("text run 的稳定 id");
+        (input, text, stable)
+    }
+
+    /// E4a：AT 的 grapheme 下标在引擎边界换算成**应用层的 UTF-8 字节偏移**；macOS/AT-SPI 的
+    /// 目标是输入框，`ctx.node()` 必须仍是输入框。
+    #[test]
+    fn set_text_selection_uses_byte_offsets() {
+        let (_runtime, mut app, window) = setup();
+        let (input, _text, run) = text_input_fixture(&mut app, window);
+        let seen = Rc::new(Cell::new((
+            usize::MAX,
+            usize::MAX,
+            None::<crate::node::id::NodeId>,
+        )));
         let sink = Rc::clone(&seen);
         app.on_a11y_action(A11yAction::SetTextSelection, move |ctx| {
             if let A11yActionData::Selection { anchor, focus } = ctx.data() {
-                sink.set((anchor, focus));
+                sink.set((anchor, focus, Some(ctx.node())));
             }
         });
 
@@ -884,19 +1015,107 @@ mod tests {
             &mut app,
             window,
             AkAction::SetTextSelection,
-            node,
+            input,
             Some(ActionData::SetTextSelection(accesskit::TextSelection {
                 anchor: accesskit::TextPosition {
-                    node: AkNodeId(0),
-                    character_index: 2,
+                    node: AkNodeId(run.get()),
+                    character_index: 1,
                 },
                 focus: accesskit::TextPosition {
-                    node: AkNodeId(0),
-                    character_index: 5,
+                    node: AkNodeId(run.get()),
+                    character_index: 3,
                 },
             })),
         );
-        assert_eq!(seen.get(), (2, 5));
+        assert_eq!(
+            seen.get(),
+            (3, 8, Some(input)),
+            "grapheme 1..3 → 字节 3..8（CJK 3 + emoji 4），目标归一为输入框"
+        );
+        assert_no_action_diagnostics(&app, "合法选区不得记未处理诊断");
+    }
+
+    /// E4a：Windows 把 `SetTextSelection` 打在 **TextRun** 上 —— 应用仍应收到输入框节点
+    /// （三端 target 统一）。
+    #[test]
+    fn set_text_selection_normalizes_the_target_to_the_input() {
+        let (_runtime, mut app, window) = setup();
+        let (input, text, run) = text_input_fixture(&mut app, window);
+        let seen = Rc::new(Cell::new(None::<crate::node::id::NodeId>));
+        let sink = Rc::clone(&seen);
+        app.on_a11y_action(A11yAction::SetTextSelection, move |ctx| {
+            if matches!(ctx.data(), A11yActionData::Selection { .. }) {
+                sink.set(Some(ctx.node()));
+            }
+        });
+
+        dispatch_request(
+            &mut app,
+            window,
+            AkAction::SetTextSelection,
+            text,
+            Some(ActionData::SetTextSelection(accesskit::TextSelection {
+                anchor: accesskit::TextPosition {
+                    node: AkNodeId(run.get()),
+                    character_index: 0,
+                },
+                focus: accesskit::TextPosition {
+                    node: AkNodeId(run.get()),
+                    character_index: 2,
+                },
+            })),
+        );
+        assert_eq!(
+            seen.get(),
+            Some(input),
+            "AT 打 TextRun 时 handler 仍收到输入框（归一化）"
+        );
+    }
+
+    /// E4a：选区位置节点失效且目标无法回退成 TextRun ⇒ **拒绝**，绝不把含糊的字符索引
+    /// 交给应用（CJK/emoji 下会错位改写文本）。
+    #[test]
+    fn an_unresolvable_text_selection_is_rejected() {
+        let (_runtime, mut app, window) = setup();
+        let (input, _text, _run) = text_input_fixture(&mut app, window);
+        let hits = Rc::new(Cell::new(0_u32));
+        let counter = Rc::clone(&hits);
+        app.on_a11y_action(A11yAction::SetTextSelection, move |_ctx| {
+            counter.set(counter.get() + 1);
+        });
+
+        dispatch_request(
+            &mut app,
+            window,
+            AkAction::SetTextSelection,
+            input,
+            Some(ActionData::SetTextSelection(accesskit::TextSelection {
+                anchor: accesskit::TextPosition {
+                    node: AkNodeId(0),
+                    character_index: 1,
+                },
+                focus: accesskit::TextPosition {
+                    node: AkNodeId(0),
+                    character_index: 3,
+                },
+            })),
+        );
+        assert_eq!(
+            hits.get(),
+            0,
+            "无法解析的选区 payload 不得落到 handler（口径不可信）"
+        );
+        assert!(
+            app.a11y_diagnostics().iter().any(|diagnostic| matches!(
+                diagnostic,
+                crate::a11y::A11yDiagnostic::InvalidActionData {
+                    action: A11yAction::SetTextSelection,
+                    ..
+                }
+            )),
+            "拒绝必须留 InvalidActionData 诊断：{:?}",
+            app.a11y_diagnostics()
+        );
     }
 
     #[test]
@@ -1229,7 +1448,16 @@ mod tests {
                     ..A11yPatch::default()
                 },
             );
+        // E4a：`SetTextSelection` 的 `TextPosition.node` 必须是 TextRun；给输入框建一个子文本。
+        let text = NodeBuilder::text("搜索框", crate::text::TextStyle::new(12.0))
+            .build(app.window_mut(window).expect("window").tree_mut(), node)
+            .expect("text run");
         let _ = app.a11y_take(window).expect("首笔 a11y 交付（分配稳定 id）");
+        let run = app
+            .window(window)
+            .expect("window")
+            .a11y_stable_id(text)
+            .expect("text run 的稳定 id");
 
         let custom_hits = Rc::new(Cell::new(0_u32));
         let seen_custom = Rc::clone(&custom_hits);
@@ -1238,9 +1466,12 @@ mod tests {
         });
         let selection_hits = Rc::new(Cell::new(0_u32));
         let seen_selection = Rc::clone(&selection_hits);
+        let selection_target = Rc::new(Cell::new(None::<crate::node::id::NodeId>));
+        let seen_target = Rc::clone(&selection_target);
         app.on_a11y_action(A11yAction::SetTextSelection, move |ctx| {
             if matches!(ctx.data(), A11yActionData::Selection { .. }) {
                 seen_selection.set(seen_selection.get() + 1);
+                seen_target.set(Some(ctx.node()));
             }
         });
 
@@ -1258,17 +1489,22 @@ mod tests {
             node,
             Some(ActionData::SetTextSelection(accesskit::TextSelection {
                 anchor: accesskit::TextPosition {
-                    node: AkNodeId(0),
+                    node: AkNodeId(run.get()),
                     character_index: 1,
                 },
                 focus: accesskit::TextPosition {
-                    node: AkNodeId(0),
+                    node: AkNodeId(run.get()),
                     character_index: 3,
                 },
             })),
         );
         assert_eq!(custom_hits.get(), 1, "read_only 不影响自定义动作");
         assert_eq!(selection_hits.get(), 1, "read_only 不影响选区（只读文本仍可选中朗读）");
+        assert_eq!(
+            selection_target.get(),
+            Some(node),
+            "选区动作的 handler 目标归一为输入框"
+        );
 
         // Blur 在能力门禁之前处理：只读节点必须能被 AT 移走焦点。
         dispatch_request(&mut app, window, AkAction::Focus, node, None);

@@ -184,12 +184,14 @@ pub(crate) fn default_actions(role: A11yRole) -> Vec<A11yAction> {
         // `RangeValuePattern.SetValue` 带 `NumericValue` payload），步进走
         // Increment/Decrement（P2-8 / review P2-5）。
         R::Slider => vec![A::SetValue, A::Increment, A::Decrement, A::Focus],
-        // 文本输入只声明 `SetValue`。**不**声明 `SetTextSelection`：AccessKit 的
-        // `TextPosition.character_index` 是 grapheme 索引（`character_lengths` 的下标），
-        // 而引擎当前的选区 API 收 UTF-8 字节偏移，且没有建 `TextRun` 节点/字符度量
-        // ⇒ 声明这个动作会让读屏器按 grapheme 下标操作、CJK/emoji 下错位（review P2-9）。
-        // 等引擎补了 TextRun + grapheme→byte 转换再声明（宁可少声明，不给死/错动作）。
+        // 文本输入声明 `SetValue`（整体替换）。`SetTextSelection` 挂在 **TextRun** 上（E4a）：
+        // AccessKit 的 `TextPosition.node` 必须是 `Role::TextRun`，且 `character_index` 是
+        // `character_lengths` 的 grapheme 下标；引擎在分发时换算成应用层的 UTF-8 字节偏移。
+        // 输入框自身仍可由 `action_allowed` 的固定例外接收 `SetTextSelection`（macOS/AT-SPI
+        // 把动作打在输入框上，Windows 打在 TextRun 上 —— 入口统一归一为输入框交给应用）。
         R::TextInput | R::MultilineTextInput => vec![A::SetValue],
+        // 文本运行：选区是它唯一的原生动作（选择不改变数据，`read_only` 不剔除）。
+        R::TextRun => vec![A::SetTextSelection],
         R::ScrollView => vec![
             A::ScrollUp,
             A::ScrollDown,
@@ -426,7 +428,7 @@ pub(crate) fn action_allowed(tree: &NodeTree, node: NodeId, action: A11yAction) 
             effective_actions_of(tree, container).contains(&action)
         }
         A11yAction::SetTextSelection => {
-            let role = role_of(tree, node);
+            let role = effective_role_of(tree, node);
             matches!(role, A11yRole::TextRun)
                 || (is_text_input_role(role) && subtree_has_text_run(tree, node))
         }
@@ -455,8 +457,8 @@ fn effective_actions_of(tree: &NodeTree, node: NodeId) -> Vec<A11yAction> {
     )
 }
 
-/// 节点的合并角色（`action_allowed` 的判据用；只读，不分配）。
-fn role_of(tree: &NodeTree, node: NodeId) -> A11yRole {
+/// 节点的合并角色（`action_allowed` / 文本选区归一 / 动作分发共用；只读，不分配）。
+pub(crate) fn effective_role_of(tree: &NodeTree, node: NodeId) -> A11yRole {
     let Ok(target) = tree.get(node) else {
         return A11yRole::GenericContainer;
     };
@@ -481,7 +483,7 @@ fn is_text_input_role(role: A11yRole) -> bool {
 fn subtree_has_text_run(tree: &NodeTree, node: NodeId) -> bool {
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {
-        if role_of(tree, current) == A11yRole::TextRun {
+        if effective_role_of(tree, current) == A11yRole::TextRun {
             return true;
         }
         if let Ok(target) = tree.get(current) {
