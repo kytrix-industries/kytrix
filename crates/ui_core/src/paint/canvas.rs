@@ -214,6 +214,7 @@ mod tests {
             bounds: bounds(),
             tile: AtlasTile {
                 atlas: AtlasKind::Image,
+                page: 0,
                 u0: 0.0,
                 v0: 0.0,
                 u1: 1.0,
@@ -240,6 +241,7 @@ mod tests {
             glyphs: vec![PositionedGlyph {
                 tile: AtlasTile {
                     atlas: AtlasKind::Glyph,
+                    page: 0,
                     u0: 0.0,
                     v0: 0.0,
                     u1: 0.5,

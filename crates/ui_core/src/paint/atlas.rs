@@ -6,7 +6,20 @@
 //!
 //! 坐标与代际约定见下方常量与注释。
 
-/// 图集分两类（字形与图片分图集）。`#[repr(u8)]` 的值即 `GpuPrimitive.params1.y` 的 `texture_index`。
+/// 图片图集的最大页数（D-9：多页图集）。
+///
+/// 单页 2048² 只能容纳约 3628 个 32×32 tile；行情列表「每个交易对一个图标」会很快打满。
+/// 图片图集因此按页增长（每页 `MAX_ATLAS_PAGE²`），页数上限为 4（约 14.5k 个 32² tile）。
+/// 语义：
+/// - 页按需懒分配（没有图片就没有页；页缓冲/GPU 纹理都随页出现）；
+/// - 页满且页数未达上限 ⇒ 开新页；达到上限且全部页满 ⇒ `DecodeCause::Capacity { PageFull }`；
+/// - 已空的页按 LRU 回收（**只**回收没有活 tile 的页；tile 恒有效契约不因淘汰破坏）。
+///
+/// 该常量是跨端契约：三端图片图集纹理是 `MAX_IMAGE_PAGES` 层的 texture array，
+/// `shader` 用 `params1.y`（图集页索引）作为层号采样。
+pub const MAX_IMAGE_PAGES: u16 = 4;
+
+/// 图集分两类（字形与图片分图集）。`#[repr(u8)]` 的值即 `GpuPrimitive.params1.z` 的 `kind`。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum AtlasKind {
@@ -17,17 +30,24 @@ pub enum AtlasKind {
 }
 
 impl AtlasKind {
-    /// 该图集页在三平台纹理数组 / bindless 表里的索引（= `GpuPrimitive.params1.y`）。
+    /// 该图集在 `GpuPrimitive.params1.z` 里的 `kind` 取值。
     #[must_use]
     pub const fn index(self) -> u32 {
         self as u32
     }
 }
 
-/// 图集里的一块矩形 + 代际。只读数据：应用层（P15）持有它来画图标，引擎（P07）把它编码进 `uv`。
+/// 图集里的一块矩形 + 代际。只读数据：应用层（P15）持有它来画图标，引擎（P07）把它编码进
+/// `uv` 与 `params1.y`（图集页索引）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AtlasTile {
     pub atlas: AtlasKind,
+    /// 图集页索引（页内 UV 的归一化基准是**这一页**的尺寸）。
+    ///
+    /// - `Glyph` 图集当前单页，恒 0；
+    /// - `Image` 图集 0..`MAX_IMAGE_PAGES`，由 `resources` 的多页分配器给出；编码进
+    ///   `GpuPrimitive.params1.y`，shader 用它作 texture array 的层号。
+    pub page: u16,
     /// 归一化 UV 的左边界（**内容区**，不含 padding）。
     pub u0: f32,
     /// 归一化 UV 的上边界。
@@ -47,6 +67,12 @@ impl AtlasTile {
         [self.u0, self.v0, self.u1, self.v1]
     }
 
+    /// `GpuPrimitive.params1.y` 的图集页索引（整数编码进 f32，见 contract §1）。
+    #[must_use]
+    pub const fn page_f32(self) -> f32 {
+        self.page as f32
+    }
+
     /// `self.generation != atlas_generation`：P06 的缓存校验与「图集重排 → PAINT」的判据。
     #[must_use]
     pub const fn is_stale(self, atlas_generation: u32) -> bool {
@@ -58,11 +84,20 @@ impl AtlasTile {
 mod tests {
     use std::mem::size_of;
 
-    use super::{AtlasKind, AtlasTile};
+    use super::{AtlasKind, AtlasTile, MAX_IMAGE_PAGES};
 
-    fn tile(atlas: AtlasKind, u0: f32, v0: f32, u1: f32, v1: f32, generation: u32) -> AtlasTile {
+    fn tile(
+        atlas: AtlasKind,
+        page: u16,
+        u0: f32,
+        v0: f32,
+        u1: f32,
+        v1: f32,
+        generation: u32,
+    ) -> AtlasTile {
         AtlasTile {
             atlas,
+            page,
             u0,
             v0,
             u1,
@@ -79,7 +114,7 @@ mod tests {
 
     #[test]
     fn tile_uv_order() {
-        let t = tile(AtlasKind::Glyph, 0.25, 0.5, 0.75, 1.0, 3);
+        let t = tile(AtlasKind::Glyph, 0, 0.25, 0.5, 0.75, 1.0, 3);
         assert_eq!(t.uv(), [0.25, 0.5, 0.75, 1.0]);
         assert!(t.u0 < t.u1);
         assert!(t.v0 < t.v1);
@@ -87,14 +122,25 @@ mod tests {
 
     #[test]
     fn tile_staleness() {
-        let t = tile(AtlasKind::Image, 0.0, 0.0, 0.5, 0.5, 7);
+        let t = tile(AtlasKind::Image, 0, 0.0, 0.0, 0.5, 0.5, 7);
         assert!(!t.is_stale(7));
         assert!(t.is_stale(8));
     }
 
+    /// D-9：页索引编码进 `params1.y`（整数编码进 f32，contract §1 的 `[0, 2^24)` 约束）。
+    #[test]
+    fn tile_page_encodes_as_a_small_integer_float() {
+        for page in 0..MAX_IMAGE_PAGES {
+            let t = tile(AtlasKind::Image, page, 0.0, 0.0, 1.0, 1.0, 1);
+            assert_eq!(t.page_f32(), f32::from(page));
+            assert_eq!(t.page_f32() as u32, u32::from(page));
+        }
+        assert_eq!(MAX_IMAGE_PAGES, 4, "契约上限：4 页 = 约 14.5k 个 32² tile");
+    }
+
     #[test]
     fn size_budget() {
-        // AtlasKind(1) + 4×f32 + u32，对齐 4 → 24 B。
+        // AtlasKind(1) + page(u16, 2) 后接对齐 4 的 4×f32 + u32：仍为 24 B。
         assert_eq!(size_of::<AtlasKind>(), 1);
         assert_eq!(size_of::<AtlasTile>(), 24);
     }

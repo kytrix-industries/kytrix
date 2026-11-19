@@ -856,6 +856,7 @@ fn image_primitive_samples_the_image_atlas() {
 
     let tile = AtlasTile {
         atlas: AtlasKind::Image,
+        page: 0,
         u0: 0.25,
         v0: 0.25,
         u1: 0.5,
@@ -905,6 +906,7 @@ fn glyph_probe(page: u32) -> bool {
     renderer.queue_atlas_upload(AtlasKind::Glyph, page, pixels, rects);
     let tile = AtlasTile {
         atlas: AtlasKind::Glyph,
+        page: 0,
         u0: 1.0 / page as f32,
         v0: 1.0 / page as f32,
         u1: 11.0 / page as f32,

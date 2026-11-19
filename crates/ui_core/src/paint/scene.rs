@@ -414,6 +414,7 @@ mod tests {
             bounds: Rect::new(0.0, 0.0, 4.0, 4.0),
             tile: AtlasTile {
                 atlas: AtlasKind::Image,
+                page: 0,
                 u0: 0.0,
                 v0: 0.0,
                 u1: 1.0,

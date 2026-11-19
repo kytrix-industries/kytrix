@@ -187,6 +187,7 @@ mod tests {
     fn tile(atlas: AtlasKind) -> AtlasTile {
         AtlasTile {
             atlas,
+            page: 0,
             u0: 0.0,
             v0: 0.0,
             u1: 0.5,

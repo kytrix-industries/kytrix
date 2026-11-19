@@ -3484,6 +3484,7 @@ mod tests {
     fn atlas_bounds_are_integer() {
         let tile = AtlasTile {
             atlas: AtlasKind::Glyph,
+            page: 0,
             u0: 0.0,
             v0: 0.0,
             u1: 1.0,
@@ -3513,6 +3514,7 @@ mod tests {
     fn glyph_run_is_one_to_n() {
         let tile = |u0: f32| AtlasTile {
             atlas: AtlasKind::Glyph,
+            page: 0,
             u0,
             v0: 0.0,
             u1: u0 + 0.1,
@@ -3878,6 +3880,7 @@ mod tests {
     fn image_maps_to_atlas_quad() {
         let tile = AtlasTile {
             atlas: AtlasKind::Image,
+            page: 0,
             u0: 0.1,
             v0: 0.2,
             u1: 0.3,

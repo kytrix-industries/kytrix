@@ -136,6 +136,10 @@ pub(crate) struct AtlasAllocator {
     max_page: u32,
     kind: AtlasKind,
     page: (u32, u32),
+    /// 该分配器对应的图集页索引（D-9 多页图集）：写进 [`AtlasTile::page`]。
+    ///
+    /// 单页图集（字形、以及多页改造前的图片）恒为 0；图片图集多页化后由页管理器设置。
+    page_index: u16,
     allocator: EtagereAllocator,
     /// 槽位表：`deallocate` 的幂等守卫（`etagere` 对陈旧 `AllocId` 会 `assert!` panic）。
     ///
@@ -166,6 +170,7 @@ impl AtlasAllocator {
             max_page: MAX_ATLAS_PAGE,
             kind,
             page,
+            page_index: 0,
             allocator: EtagereAllocator::new(size2(page.0 as i32, page.1 as i32)),
             tiles: Vec::with_capacity(64),
             free: Vec::new(),
@@ -223,6 +228,7 @@ impl AtlasAllocator {
         let page_h = self.page.1 as f32;
         let tile = AtlasTile {
             atlas: self.kind(),
+            page: self.page_index,
             u0: origin_x as f32 / page_w,
             v0: origin_y as f32 / page_h,
             u1: (origin_x + width as i32) as f32 / page_w,
