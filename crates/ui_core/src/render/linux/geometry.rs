@@ -606,7 +606,6 @@ mod tests {
 
         // 同版本再 prepare：零上传（tracker 幂等）。
         let snapshot = store.snapshot_arc(id).expect("快照");
-        let snapshot_vertex_len = snapshot.vertex_len();
         let draw = GeometryDrawGpu {
             id,
             chunk: 0,
