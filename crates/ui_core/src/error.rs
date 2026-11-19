@@ -3,13 +3,12 @@
 //! 只有强类型变体，不出现字符串错误或通用错误包装（AGENTS §3）。`Display` 为英文诊断文本，
 //! 只用于日志 / CI / 开发者；面向用户的本地化文案由应用层按变体生成（i18n 留应用层）。
 //!
-//! 变体表冻结为 17 项。已落地的变体见下方定义；
-//! `LayoutInvalid` 无生产者、继续留空。`GeometryRegister` → P09，
-//! `AtlasExhausted` / `TextShape` → **P05**（DEVIATIONS F-55），`AppInit` → P08，
-//! `WindowCreate` → P12，`A11yInit` → P14，`ResourceDecode` → **P13**（payload 见 DEVIATIONS F-138）。
-//! 完整「名称 + payload + 实现 Phase」表见下方各变体定义；
-//! `StaleNode` / `CyclicDerived` 的实现 Phase 由 P04 改为 P03，
-//! `InvalidMeasure` 由 P05 改为 P04（DEVIATIONS F-51）。
+//! **变体表随阶段演进增删，不保持向后兼容**（AGENTS §1.1；应用代码按变体匹配，不按数量）。
+//! 当前 21 个变体的 payload 与语义以各变体定义为准；其中与静态几何增量更新（X5）相关的 4 个
+//! 是 [`EngineError::UnknownGeometry`] / [`EngineError::GeometryRangeOutOfBounds`] /
+//! [`EngineError::GeometryRangeUnaligned`] / [`EngineError::GeometryRangeBytes`]，
+//! [`EngineError::GeometryRegister`] 由三端 GPU 后端（快照缺失 / 非法数据）生产。
+//! `LayoutInvalid` 暂无生产者（保留给布局契约的显式失败路径）。
 
 use std::path::PathBuf;
 

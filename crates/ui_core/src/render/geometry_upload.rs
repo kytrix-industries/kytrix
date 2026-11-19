@@ -266,13 +266,72 @@ fn same_page(a: &Bytes, b: &Bytes) -> bool {
     a.len() == b.len() && (a.is_empty() || a.as_ptr() == b.as_ptr())
 }
 
+/// staging 缓冲每段的起始偏移（512 B 对齐；与 [`staging_layout`] 的容量同一口径）。
+///
+/// macOS / Linux 的几何上传每帧建一块一次性 staging 缓冲：把本帧计划里的所有页按
+/// 「顶点页在前、索引页在后、计划顺序」排成一段字节流，再逐页 blit / copy 到本帧的页偏移。
+/// 分配大小与页偏移**必须**用同一套 512 B 对齐规则 —— 旧实现按 `Σ len` 分配、按
+/// `Σ align512(len)` 推进，末页真实长度会把写入落点推过缓冲末尾（RX-1）。
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StagingLayout {
+    /// 缓冲总字节数 = `Σ align512(len)`（0 页时为 0）。
+    pub total_bytes: usize,
+    /// 第 i 页在 staging 里的起始偏移（= 前 i 页 `align512(len)` 之和）。
+    pub offsets: Vec<usize>,
+}
+
+/// staging 用 512 B 对齐的原因：与 Windows UPLOAD staging arena 的 bump 口径一致，
+/// 并保守覆盖各后端 `CopyBufferRegion` / blit buffer copy 的对齐要求。
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
+pub(crate) const STAGING_ALIGN: usize = 512;
+
+/// 计算一帧几何上传的 staging 布局：**容量与每页偏移使用同一条 512 B 对齐规则**。
+///
+/// 调用方拿 [`StagingLayout::total_bytes`] 分配缓冲，再用 [`StagingLayout::offsets`] 里的
+/// 偏移写入/拷贝**真实长度**（`page.len()`，不是对齐后的长度）⇒ 每页满足
+/// `offset + len <= total_bytes`（[`StagingLayout::fits`] 即该断言）。
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
+pub(crate) fn staging_layout(page_lens: impl IntoIterator<Item = usize>) -> StagingLayout {
+    let mut total_bytes = 0usize;
+    let mut offsets = Vec::new();
+    for len in page_lens {
+        offsets.push(total_bytes);
+        total_bytes += aligned_page_len(len);
+    }
+    StagingLayout {
+        total_bytes,
+        offsets,
+    }
+}
+
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
+impl StagingLayout {
+    /// 第 `page` 页的真实字节长度是否能完整放进 staging 缓冲（防越界的唯一判据）。
+    #[must_use]
+    pub(crate) fn fits(&self, page: usize, len: usize) -> bool {
+        self.offsets
+            .get(page)
+            .is_some_and(|offset| offset + len <= self.total_bytes)
+    }
+}
+
+/// 一页在 staging 里占的字节数（512 B 向上取整）。
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
+fn aligned_page_len(len: usize) -> usize {
+    len.div_ceil(STAGING_ALIGN) * STAGING_ALIGN
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use bytes::Bytes;
 
-    use super::{GEOMETRY_BUFFER_GROWTH_ALIGN, GeometryUploadTracker, growth_capacity, same_page};
+    use super::{
+        GEOMETRY_BUFFER_GROWTH_ALIGN, GeometryUploadTracker, STAGING_ALIGN, growth_capacity,
+        same_page, staging_layout,
+    };
     use crate::{
         math::{Rect, Transform},
         paint::{
@@ -483,5 +542,49 @@ mod tests {
             GEOMETRY_BUFFER_GROWTH_ALIGN,
             "容量足够时不扩容"
         );
+    }
+
+    /// RX-1 的最小反例：vertex 页 36 B + index 页 6 B。
+    ///
+    /// 旧实现按 `Σ len = 42` 分配、按 `Σ align512(len)` 推进 ⇒ index 页写 offset 512，
+    /// `512 + 6 > 42` 越界（Metal `contents()` 写越界 / Vulkan `vkCmdCopyBuffer` 源区间越界）。
+    /// 新布局必须让**容量与偏移同一口径**：每页 `offset + len <= total_bytes`。
+    #[test]
+    fn staging_layout_fits_unaligned_pages_across_plan_boundaries() {
+        let layout = staging_layout([36, 6]);
+        assert_eq!(layout.total_bytes, 1024);
+        assert_eq!(layout.offsets, vec![0, 512]);
+        assert!(layout.fits(0, 36));
+        assert!(layout.fits(1, 6));
+        // 反例的两种旧写法都必须被“放不下”拒绝（防回归到按 Σ len 分配）。
+        assert!(layout.total_bytes >= 512 + 6, "index 页必须整段落在缓冲内");
+        assert!(!layout.fits(1, 513), "越过缓冲末尾的写入必须被判为放不下");
+    }
+
+    /// 单页非对齐：36 B 页仍占一整段 512 B，偏移 0 + 真实长度 36 ≤ total。
+    #[test]
+    fn staging_layout_single_unaligned_page() {
+        let layout = staging_layout([36]);
+        assert_eq!(layout.total_bytes, STAGING_ALIGN);
+        assert_eq!(layout.offsets, vec![0]);
+        assert!(layout.fits(0, 36));
+    }
+
+    /// 多页混合（4096 + 768 + 744）：偏移按 512 对齐推进，真实长度写入不越界。
+    #[test]
+    fn staging_layout_mixed_pages_respect_offset_and_length() {
+        let layout = staging_layout([4096, 768, 744]);
+        assert_eq!(layout.offsets, vec![0, 4096, 5120]);
+        assert_eq!(layout.total_bytes, 4096 + 1024 + 1024);
+        for (page, len) in [4096, 768, 744].into_iter().enumerate() {
+            assert!(layout.fits(page, len), "第 {page} 页越界");
+            assert_eq!(
+                layout.offsets[page] % STAGING_ALIGN,
+                0,
+                "每页偏移必须 512 B 对齐"
+            );
+        }
+        assert!(staging_layout(Vec::<usize>::new()).offsets.is_empty());
+        assert_eq!(staging_layout(Vec::<usize>::new()).total_bytes, 0);
     }
 }

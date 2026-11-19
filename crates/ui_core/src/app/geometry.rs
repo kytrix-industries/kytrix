@@ -1,10 +1,14 @@
-//! 应用层的几何入口：`App::set_geometry_transform`（R05-12 / AR2 P1-D4）。
+//! 应用层的几何入口。
 //!
-//! 几何节点（`NodeBuilder::geometry`）的顶点在**装载期**一次写入 `GeometryStore`，之后不可变；
-//! 平移/缩放一块图表只需要改一个 per-draw 变换（`GeometryDraw.transform` → 顶点着色器的
-//! `draw.basis` / `draw.translation`），**不重建顶点缓冲**。这正是 R05-12 的核心诉求，但在
-//! wave-1 里写入口只存在于 `#[cfg(test)]`（`node/tree/content.rs`），生产不可达 ⇒ 整条
-//! 「变换 → uniform → damage」链路是死代码（AR2 P1-D4）。本模块补上公开入口。
+//! - **变换**（`App::set_geometry_transform`，R05-12 / AR2 P1-D4）：几何节点的 per-draw
+//!   变换（`GeometryDraw.transform` → 顶点着色器的 `draw.basis` / `draw.translation`），
+//!   **不重建顶点缓冲**；
+//! - **数据更新**（`App::update_geometry_vertices/indices`，X5）：按 range 就地更新几何快照，
+//!   只重建块版本变化的块 lane / 只上传变化的 4 KiB 页。
+//!
+//! 数据更新会把**所有窗口**里绑定该几何的几何节点标 PAINT（`GeometryStore` 是进程级，一个
+//! `GeometryId` 可被多个窗口的节点引用），并自动请求一帧；空 range / 没有任何块受影响时
+//! 不标脏、不请求帧。
 //!
 //! # damage 必须两侧都算
 //!
@@ -52,7 +56,9 @@ pub(crate) fn update_vertices(
     bytes: &[u8],
 ) -> Result<GeometryUpdate, EngineError> {
     let update = app.geometry.update_vertices(id, range, bytes)?;
-    mark_bound_nodes(app, id, update.damaged);
+    if mark_bound_nodes(app, id, update.damaged) {
+        app.request_frame();
+    }
     Ok(update)
 }
 
@@ -64,18 +70,25 @@ pub(crate) fn update_indices(
     bytes: &[u8],
 ) -> Result<GeometryUpdate, EngineError> {
     let update = app.geometry.update_indices(id, range, bytes)?;
-    mark_bound_nodes(app, id, update.damaged);
+    if mark_bound_nodes(app, id, update.damaged) {
+        app.request_frame();
+    }
     Ok(update)
 }
 
-/// 把绑定到 `geometry` 的节点标 PAINT（`damaged` 为空 = 没有块受影响 ⇒ 不需要重绘）。
-fn mark_bound_nodes(app: &mut App, geometry: GeometryId, damaged: Rect) {
+/// 把所有窗口里绑定到 `geometry` 的几何节点标 PAINT，返回「是否有节点被标脏」。
+///
+/// `damaged` 为空 = 没有块受影响（空 range / 只改了未被块引用的顶点）⇒ 不标脏、不请求帧。
+/// 返回 `true` 时调用方负责 `request_frame`（与 `App::request_repaint` / signal 写入同语义）。
+fn mark_bound_nodes(app: &mut App, geometry: GeometryId, damaged: Rect) -> bool {
     if damaged.is_empty() {
-        return;
+        return false;
     }
+    let mut marked = false;
     for window in app.windows.values_mut() {
-        window.tree_mut().mark_geometry_updated(geometry);
+        marked |= window.tree_mut().mark_geometry_updated(geometry) > 0;
     }
+    marked
 }
 
 /// 几何 damage 的额外外扩（逻辑像素）。
@@ -636,5 +649,62 @@ mod tests {
             .update_geometry_indices(id, 0..0, &[])
             .expect("空区间合法");
         assert!(update.damaged.is_empty());
+    }
+
+    /// RX-7/RX-8：一个 `GeometryId` 被多个窗口的几何节点引用时，数据更新必须标脏**所有**
+    /// 窗口并自动请求一帧；空 range 不标脏、不请求帧。
+    #[test]
+    fn geometry_update_marks_bound_nodes_in_every_window_and_requests_a_frame() {
+        let mut app = TestApp::new();
+        let first = app.window_id();
+        let second = app
+            .app_mut()
+            .create_window(crate::window::WindowOptions::default());
+        let id = register(&mut app);
+        for window in [first, second] {
+            let root = app.app().window(window).expect("窗口存在").tree().root();
+            let _ = NodeBuilder::geometry(id)
+                .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
+                .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
+                .expect("挂载几何节点");
+        }
+        // 首帧：两个窗口各自建立块 lane。
+        for window in [first, second] {
+            let outcome = app.app_mut().frame(window).expect("窗口存在").expect("帧");
+            assert!(
+                matches!(outcome, crate::window::FrameOutcome::Committed(_)),
+                "首帧必须提交，实际 {outcome:?}"
+            );
+        }
+
+        let requests = app.app().frame_requests();
+        let update = app
+            .app_mut()
+            .update_geometry_vertices(id, 0..12, &vertex(5.0, 5.0))
+            .expect("顶点更新");
+        assert!(
+            !update.damaged.is_empty(),
+            "被块引用的顶点更新必须有 damage"
+        );
+        assert!(
+            app.app().frame_requests() > requests,
+            "几何数据更新必须自动请求一帧（与 signal 写入同语义）"
+        );
+        // 两个窗口都绑定同一几何 ⇒ 都必须被标脏：各自的下一帧必须真的提交（未标脏会是 Idle）。
+        for window in [first, second] {
+            match app.app_mut().frame(window).expect("窗口存在").expect("帧") {
+                crate::window::FrameOutcome::Committed(_) => {}
+                other => panic!("绑定几何的窗口 {window:?} 未被标脏：{other:?}"),
+            }
+        }
+
+        // 空 range：合法 no-op ⇒ 不标脏、不请求帧。
+        let requests = app.app().frame_requests();
+        let update = app
+            .app_mut()
+            .update_geometry_vertices(id, 0..0, &[])
+            .expect("空区间合法");
+        assert!(update.damaged.is_empty());
+        assert_eq!(app.app().frame_requests(), requests, "空 range 不请求帧");
     }
 }

@@ -3088,6 +3088,62 @@ mod tests {
         );
     }
 
+    /// RX-3（review-x 覆盖探针）：块 lane 的 damage 必须同时覆盖**旧块位置**与**新块位置**。
+    ///
+    /// 探针：删除 `paint_geometry_node` 里「旧块 bounds 并入 damage」后全量测试仍绿
+    /// （只测了 store 层 `GeometryUpdate.damaged`）。本测试把整个三角形从 (10,10) 移到
+    /// (100,60)：旧位置不在新块 AABB 内，而数据更新又**不并节点盒 damage** ⇒ 只有旧∪新
+    /// 并集才能覆盖旧位置；只算新位置会静默留下残影。
+    #[test]
+    fn geometry_data_update_damage_covers_old_and_new_block_bounds() {
+        use crate::paint::geometry::{GeometryDesc, GeometryPipeline, IndexType, Topology};
+
+        fn triangle(x: f32, y: f32) -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(36);
+            for (dx, dy) in [(0.0f32, 0.0f32), (1.0, 0.0), (0.0, 1.0)] {
+                bytes.extend_from_slice(&(x + dx).to_ne_bytes());
+                bytes.extend_from_slice(&(y + dy).to_ne_bytes());
+                bytes.extend_from_slice(&(-1.0f32).to_ne_bytes());
+            }
+            bytes
+        }
+
+        let mut h = Harness::new();
+        let id = h
+            .geometry
+            .insert(GeometryDesc {
+                vertex_bytes: bytes::Bytes::from(triangle(10.0, 10.0)),
+                index_bytes: bytes::Bytes::from_static(&[0, 0, 1, 0, 2, 0]),
+                vertex_stride: 12,
+                index_type: IndexType::U16,
+                topology: Topology::TriangleList,
+                bounds: Rect::new(0.0, 0.0, 400.0, 400.0),
+                pipeline: GeometryPipeline::Ui,
+            })
+            .expect("注册单三角形几何");
+        let node = mount_geometry(&mut h, id, Clip::None);
+        h.paint();
+        assert_eq!(h.tree.lane_count(node), 1, "单块几何只有一条块 lane");
+
+        // 整体移动（旧 AABB 约 (10,10)-(11,11)，新 AABB 约 (100,60)-(101,61)）。
+        h.geometry
+            .update_vertices(id, 0..36, &triangle(100.0, 60.0))
+            .expect("整体移动");
+        assert_eq!(h.tree.mark_geometry_updated(id), 1);
+        let report = h.paint_incremental(&[node]);
+        assert!(!report.damage.full, "块移动是局部 damage，不得退化为整帧");
+        assert_eq!(report.rebuilt, 1, "唯一块 lane 重建");
+
+        let rects = h.damage.rects();
+        let hits = |x: i32, y: i32| {
+            rects
+                .iter()
+                .any(|rect| rect.x0 <= x && x < rect.x1 && rect.y0 <= y && y < rect.y1)
+        };
+        assert!(hits(10, 10), "旧位置必须重画（否则留残影）：{rects:?}");
+        assert!(hits(100, 60), "新位置必须重画：{rects:?}");
+    }
+
     /// X5：块满后追加 ⇒ 新建块 lane，增量路径用轻量 DFS 兜底重建绘制序；旧块 lane 不动。
     #[test]
     fn appending_across_the_chunk_boundary_creates_a_new_lane_and_rebuilds_order() {

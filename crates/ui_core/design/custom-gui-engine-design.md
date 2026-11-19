@@ -1179,8 +1179,8 @@ X5 的几何增量更新（§5.3 / §5.5）**不改变**本节字节布局与 `c
 
 ### 5.3 Paint lane 与绘制序
 
-- 每个节点持有 0–N 条 lane（`Node.lanes: SmallVec<[LaneId; 2]>`）；普通节点 / 文本节点仍是 1 条，
-  `Canvas` 可多条。
+- 每个节点持有 0–N 条 lane（`Node.lanes: SmallVec<[LaneId; 2]>`）；普通节点 / 文本节点 /
+  `Canvas` 仍是 1 条，**目前只有几何节点按块使用多条 lane**（X5）。
 - **几何节点按块一条 lane**（X5）：`Geometry` 的索引缓冲按 `GEOMETRY_CHUNK_INDICES = 12288`
   （4096 个三角形，`TriangleList`）切块；第 0 条块 lane 同时承载 Shadow / 背景 / 边框 / 焦点环
   与节点盒 damage，其余块 lane 只有「祖先 clip 前缀 + 内容 clip + 本块几何图元」。
@@ -1239,7 +1239,7 @@ pub struct GeometryDesc {
 | `update_geometry_vertices(id, range, bytes)` | 就地替换被触碰的 **4 KiB 页**（页级 COW），重扫受影响块 AABB，revision+1，自动标脏绑定节点 | 只上传变化页 |
 | `update_geometry_indices(id, range, bytes)`  | 同上（索引页） | 只上传变化页 |
 | `resize` / `dpi change`        | 重布局 + uniform + 重建渲染目标，**不重建 VBO** | 消除 17.5 ms/次 |
-| `drop(GeometryId)`             | retire 队列延迟释放 | I4 |
+| `release(GeometryId)`          | 显式释放（`App::geometry_mut().release`）；GPU 缓冲走 retire 队列延迟释放，没有 `Drop` 实现 | I4 |
 
 - **range 契约**：`range.start <= len`；`range.end > len` 视为尾随追加；空 range = no-op
   （不 bump revision、不 damage、不标脏）；越界 / 未对齐 / 字节长度不符 / 未知句柄返回强类型
@@ -1260,7 +1260,13 @@ pub struct GeometryDesc {
   并集，**只覆盖更新范围**；`set_transform` 只改 uniform、不重建 lane，damage = 变换前后包围盒
   并集（外扩 AA 半径）。
 - **已知限制**（本阶段明确不做）：无缩容 API（K 线滑动窗口「删头」需要后续 truncate）；
-  `TriangleStrip` 单块退化；非 `NodeBuilder::geometry` 节点的几何引用不自动标脏。
+  `TriangleStrip` 单块退化；非 `NodeBuilder::geometry` 节点的几何引用不自动标脏；
+  已 `release` 的快照在 UI 侧 delta builder / 合成端 catalog 中要到下一次整帧（`delta.full`）
+  才驱逐（CPU 侧无对等 LRU；长跑反复注册/释放大几何会短期保留内存）。
+- **每帧 draw call 代价**：每个几何块一条 lane ⇒ 每帧几何 op 数 = `ceil(index_count / 12288)`。
+  20 万点折线（1,199,994 索引）≈ **98 个几何 op**（X5 前是 1 个）；块大小是「增量粒度 ↔ op 数」
+  的折中（12288 索引 ⇒ K 线追加只重扫尾块 ≈ 0.4 MB 顶点 = 1/98 全量）。若图表几何成为 draw
+  call 瓶颈，后续优化方向是「相邻同变换块合并成一次 `DrawIndexed`」（仍保留块级失效 / 页级上传）。
 - **契约**：§5.2 的 `GpuPrimitive` 字节布局与 `contract.md` **不变**；几何绘制复用既有 PSO /
   根签名，几何顶点布局由 `GeometryDesc.vertex_stride` 描述。
 

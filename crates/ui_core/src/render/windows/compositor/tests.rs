@@ -831,6 +831,91 @@ fn geometry_ui_triangle_renders_white() {
     );
 }
 
+/// RX-13：增量页上传的**真实 GPU 内容**（旧测试只验账本字节数）。
+///
+/// 帧 1 上传原始三角形 → 帧 2 前把三角形整体右移 20 px（一次 range 更新，只换 1 页）
+/// → 帧 2 必须画在新位置。若增量 copy 的偏移 / 长度错了，WARP 会继续画旧位置（像素断言变红）。
+#[test]
+fn geometry_incremental_page_upload_updates_pixels() {
+    let _guard = lock();
+    let Some(mut renderer) = warp_renderer((64, 64)) else {
+        return;
+    };
+
+    fn triangle(points: [[f32; 2]; 3]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(36);
+        for point in points {
+            bytes.extend_from_slice(&point[0].to_ne_bytes());
+            bytes.extend_from_slice(&point[1].to_ne_bytes());
+            bytes.extend_from_slice(&(-1.0f32).to_ne_bytes());
+        }
+        bytes
+    }
+
+    let mut store = crate::paint::geometry_store::GeometryStore::new();
+    let id = store
+        .insert(crate::paint::geometry::GeometryDesc {
+            vertex_bytes: bytes::Bytes::from(triangle([[0.0, 0.0], [32.0, 0.0], [0.0, 32.0]])),
+            index_bytes: bytes::Bytes::from_static(&[0, 0, 1, 0, 2, 0]),
+            vertex_stride: GeometryPipeline::Ui.vertex_stride(),
+            index_type: IndexType::U16,
+            topology: Topology::TriangleList,
+            bounds: Rect::new(0.0, 0.0, 64.0, 32.0),
+            pipeline: GeometryPipeline::Ui,
+        })
+        .expect("注册几何");
+    let scene = || {
+        one_lane_scene(Primitive::Geometry(GeometryDraw {
+            id,
+            transform: Transform::IDENTITY,
+            color: Color::WHITE,
+        }))
+    };
+    let mut timings = FrameTimings::new();
+
+    // 帧 1：整份上传（首见 ⇒ full plan）。每帧新建 encoder：模拟「数据更新把节点标脏后
+    // 重新编码」的完整路径（复用 encoder 会走段复用、不重建几何表）。
+    let mut encoder = InstanceEncoder::new();
+    let buffer = encoder
+        .encode(&scene(), Scale::ONE, resolver(), &store)
+        .expect("encode 1");
+    let mut frame = full_plan((64, 64));
+    renderer
+        .submit_buffer(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
+        .expect("submit 1");
+    let image = renderer.readback().expect("readback 1");
+    assert_eq!(pixel(&image, 64, 8, 8), [255, 255, 255, 255], "帧 1 旧位置");
+    assert_eq!(pixel(&image, 64, 28, 8), [0, 0, 0, 0], "帧 1 新位置为空");
+
+    // 帧 2 前：整体右移 20 px（vertices 0..36 一次 range 更新 ⇒ 只换 1 个 4 KiB 页）。
+    store
+        .update_vertices(
+            id,
+            0..36,
+            &triangle([[20.0, 0.0], [52.0, 0.0], [20.0, 32.0]]),
+        )
+        .expect("移动三角形");
+    let mut encoder = InstanceEncoder::new();
+    let buffer = encoder
+        .encode(&scene(), Scale::ONE, resolver(), &store)
+        .expect("encode 2");
+    let mut frame = full_plan((64, 64));
+    renderer
+        .submit_buffer(FrameIndex::from_raw(2), buffer, &mut frame, &mut timings)
+        .expect("submit 2");
+    let image = renderer.readback().expect("readback 2");
+    assert_eq!(
+        pixel(&image, 64, 8, 8),
+        [0, 0, 0, 0],
+        "旧位置必须变空（增量页上传把新顶点写进了 DEFAULT 缓冲）"
+    );
+    assert_eq!(
+        pixel(&image, 64, 28, 8),
+        [255, 255, 255, 255],
+        "新位置必须被画出来"
+    );
+}
+
 /// image（`GeometryPipeline::Textured` 的 quad 路径）：UV 采样命中上传的像素（B1/B5）。
 #[test]
 fn image_primitive_samples_the_image_atlas() {

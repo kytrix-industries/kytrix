@@ -27,7 +27,7 @@ use crate::{
         instance::GeometryDrawGpu,
     },
     render::{
-        geometry_upload::{GeometryUploadPlan, GeometryUploadTracker},
+        geometry_upload::{GeometryUploadTracker, staging_layout},
         linux::{
             device::{GpuBuffer, SharedGpu, init_error},
             memory::MemoryNeed,
@@ -190,7 +190,6 @@ impl GeometryRegistry {
                 ),
             });
         }
-        let total: usize = plans.iter().map(GeometryUploadPlan::uploaded_bytes).sum();
         for plan in &plans {
             debug_assert!(plan.snapshot.vertex_stride() > 0);
             debug_assert!(
@@ -200,7 +199,16 @@ impl GeometryRegistry {
                 !plan.index.full || plan.index.pages.len() == plan.snapshot.index_pages().len()
             );
         }
-        let staging = staging_buffer(shared, total.max(4) as u64)?;
+        // 容量与每页偏移必须同一口径（RX-1）：`staging_layout` 用 `Σ align512(len)` 分配，
+        // 偏移也按 512 B 推进，页的**真实长度**写入不会越过缓冲末尾。
+        let layout = staging_layout(plans.iter().flat_map(|plan| {
+            plan.vertex
+                .pages
+                .iter()
+                .chain(plan.index.pages.iter())
+                .map(|page| page.bytes.len())
+        }));
+        let staging = staging_buffer(shared, layout.total_bytes.max(4) as u64)?;
         let Some(staging_pointer) = staging.pointer else {
             let _ = shared.release(staging.handle);
             return Err(init_error(
@@ -210,7 +218,7 @@ impl GeometryRegistry {
         };
         let staging_handle = staging.handle;
         let staging_buffer = staging.buffer;
-        let mut staging_offset = 0usize;
+        let mut staged_page = 0usize;
         let mut uploaded = 0usize;
         for plan in &plans {
             let entry_slot = plan.id.index() as usize;
@@ -257,8 +265,10 @@ impl GeometryRegistry {
             let mut vertex_copies: Vec<vk::BufferCopy> = Vec::new();
             let mut index_copies: Vec<vk::BufferCopy> = Vec::new();
             for page in &plan.vertex.pages {
-                let src_offset = staging_offset;
-                stage_page(&staging_pointer, &mut staging_offset, &page.bytes);
+                let src_offset = layout.offsets[staged_page];
+                debug_assert!(layout.fits(staged_page, page.bytes.len()));
+                stage_page(&staging_pointer, src_offset, &page.bytes);
+                staged_page += 1;
                 vertex_copies.push(
                     vk::BufferCopy::default()
                         .src_offset(src_offset as u64)
@@ -270,8 +280,10 @@ impl GeometryRegistry {
                 uploaded += page.bytes.len();
             }
             for page in &plan.index.pages {
-                let src_offset = staging_offset;
-                stage_page(&staging_pointer, &mut staging_offset, &page.bytes);
+                let src_offset = layout.offsets[staged_page];
+                debug_assert!(layout.fits(staged_page, page.bytes.len()));
+                stage_page(&staging_pointer, src_offset, &page.bytes);
+                staged_page += 1;
                 index_copies.push(
                     vk::BufferCopy::default()
                         .src_offset(src_offset as u64)
@@ -332,18 +344,15 @@ fn staging_buffer(shared: &SharedGpu, bytes: u64) -> Result<GpuBuffer, EngineErr
     )
 }
 
-/// 把一页写进 staging（512 B 对齐，与另两端同一口径）。
-fn stage_page(pointer: &*mut u8, offset: &mut usize, bytes: &[u8]) {
-    // SAFETY: staging 容量按计划总字节（含对齐余量）分配，写入区间在本页范围内。
+/// 把一页写进 staging 的 `offset`（来自 [`staging_layout`]，容量与偏移同一 512 B 口径）。
+///
+/// 调用方已在 `debug_assert!(layout.fits(..))` 处证明 `offset + len` 落在 staging 内；
+/// 写入用**真实长度**（不是对齐后的长度）。
+fn stage_page(pointer: &*mut u8, offset: usize, bytes: &[u8]) {
+    // SAFETY: staging 容量按 `Σ align512(len)` 分配、偏移按同一对齐推进，区间在缓冲内。
     unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer.add(*offset), bytes.len());
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer.add(offset), bytes.len());
     }
-    *offset += mappable_len(bytes) as usize;
-}
-
-/// 一页在 staging 里占用的字节数（512 B 对齐）。
-fn mappable_len(bytes: &[u8]) -> u32 {
-    (bytes.len() as u32).next_multiple_of(512)
 }
 
 /// 记录一次 buffer → buffer copy，并在 copy 前后做 `TRANSFER_WRITE` / `SHADER_READ` 的
@@ -416,6 +425,7 @@ mod tests {
     use ash::vk;
 
     use super::{EVICT_AFTER_FRAMES, GeometryRegistry, geometry_is_stale};
+    use crate::render::linux::device::SharedGpu;
 
     /// 驱逐判据的边界：恰好到门槛保留、越过门槛驱逐、帧号回绕给出正确差值。
     #[test]
@@ -455,5 +465,169 @@ mod tests {
         assert_eq!(uploaded, 0);
         assert!(retired.is_empty());
         assert_eq!(shared.memory_stats(), before, "无几何的帧不得分配 GPU 内存");
+    }
+
+    fn command_pool(gpu: &SharedGpu) -> vk::CommandPool {
+        // SAFETY: 池归测试独占；结束时销毁。
+        unsafe {
+            gpu.raw()
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default()
+                        .queue_family_index(gpu.queue_family())
+                        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                    None,
+                )
+                .expect("command pool")
+        }
+    }
+
+    fn allocate(gpu: &SharedGpu, pool: vk::CommandPool) -> vk::CommandBuffer {
+        // SAFETY: 池由调用方持有；只分配一条一次性命令缓冲。
+        unsafe {
+            gpu.raw()
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )
+                .expect("command buffer")[0]
+        }
+    }
+
+    fn begin(gpu: &SharedGpu, command: vk::CommandBuffer) {
+        // SAFETY: 命令缓冲由本测试独占；提交前只录制一次。
+        unsafe {
+            gpu.raw()
+                .reset_command_buffer(command, vk::CommandBufferResetFlags::empty())
+                .expect("reset command buffer");
+            gpu.raw()
+                .begin_command_buffer(
+                    command,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .expect("begin command buffer");
+        }
+    }
+
+    fn submit_and_wait(gpu: &SharedGpu, command: vk::CommandBuffer) {
+        // SAFETY: 命令缓冲已录制完毕；同步等待只发生在测试里。
+        unsafe { gpu.raw().end_command_buffer(command) }.expect("end command buffer");
+        let commands = [command];
+        gpu.with_queue(|queue| unsafe {
+            gpu.raw()
+                .queue_submit(
+                    queue,
+                    &[vk::SubmitInfo::default().command_buffers(&commands)],
+                    vk::Fence::null(),
+                )
+                .expect("queue submit");
+        });
+        gpu.wait_queue_idle().expect("queue idle");
+    }
+
+    /// RX-1/RX-13 的真实设备回归：最小反例（顶点页 36 B + 索引页 6 B，均非 512 倍数）
+    /// 走一次完整 `prepare`（staging + `vkCmdCopyBuffer`），提交并等待后**读回**几何缓冲：
+    ///
+    /// - staging 越界（旧实现按 `Σ len` 分配、按 512 对齐推进）在 lavapipe/validation 下会
+    ///   报 VUID 或读回内容错位；
+    /// - 读回同时验证「增量的那一页」真的被 copy 到页偏移（不只是账本数字）。
+    #[test]
+    fn staging_upload_copies_real_page_lengths_on_a_real_device() {
+        use crate::{
+            math::{Rect, Transform},
+            paint::{
+                geometry::{
+                    GEOMETRY_PAGE_BYTES, GeometryDesc, GeometryPipeline, IndexType, Topology,
+                },
+                geometry_store::GeometryStore,
+                instance::GeometryDrawGpu,
+            },
+        };
+        let shared = SharedGpu::new_headless_isolated().expect("headless shared gpu");
+        let pool = command_pool(&shared);
+        let mut store = GeometryStore::new();
+        // 最小反例：3 顶点（12 B/顶点 = 36 B）+ 3 个 U16 索引（6 B）。
+        let mut vertices = Vec::with_capacity(36);
+        for value in [0x11u8, 0x22, 0x33] {
+            vertices.extend_from_slice(&[value; 12]);
+        }
+        let indices = [0u8, 0, 1, 0, 2, 0];
+        let id = store
+            .insert(GeometryDesc {
+                vertex_bytes: bytes::Bytes::from(vertices),
+                index_bytes: bytes::Bytes::from(indices.to_vec()),
+                vertex_stride: 12,
+                index_type: IndexType::U16,
+                topology: Topology::TriangleList,
+                bounds: Rect::new(0.0, 0.0, 32.0, 32.0),
+                pipeline: GeometryPipeline::Ui,
+            })
+            .expect("注册几何");
+        // 增量更新中间那个顶点（offset 12..24）——只替换一页。
+        store
+            .update_vertices(id, 12..24, &[0xAB; 12])
+            .expect("range 更新");
+        let snapshot = store.snapshot_arc(id).expect("快照");
+        let snapshot_vertex_len = snapshot.vertex_len();
+        let draw = GeometryDrawGpu {
+            id,
+            chunk: 0,
+            transform: Transform::IDENTITY,
+            color: [1.0; 4],
+            snapshot,
+        };
+        let mut registry = GeometryRegistry::new();
+        registry.begin_frame();
+        let mut retired = Vec::new();
+        let command = allocate(&shared, pool);
+        begin(&shared, command);
+        let uploaded = registry
+            .prepare(&shared, command, &[draw], &mut retired)
+            .expect("prepare");
+        submit_and_wait(&shared, command);
+        assert_eq!(uploaded, 36 + 6, "首帧整份上传（真实长度，不含对齐填充）");
+        let entry = registry.get(id).expect("几何条目");
+        let vertex_pointer = entry.vertex.pointer.expect("几何缓冲必须可读回");
+        // SAFETY: 队列已 idle，映射区间覆盖整个子分配块；读取 36 B。
+        let vertex_bytes = unsafe { std::slice::from_raw_parts(vertex_pointer, 36) };
+        assert_eq!(&vertex_bytes[0..12], &[0x11; 12]);
+        assert_eq!(&vertex_bytes[12..24], &[0xAB; 12], "增量页必须落到页内偏移");
+        assert_eq!(&vertex_bytes[24..36], &[0x33; 12]);
+        let index_pointer = entry.index.pointer.expect("索引缓冲必须可读回");
+        // SAFETY: 同上，读取 6 B。
+        let index_bytes = unsafe { std::slice::from_raw_parts(index_pointer, 6) };
+        assert_eq!(index_bytes, &[0u8, 0, 1, 0, 2, 0]);
+        assert!(
+            snapshot_vertex_len as usize <= GEOMETRY_PAGE_BYTES,
+            "最小反例应落在单页内（本测试的目标是页内偏移而不是跨页）"
+        );
+
+        // 同版本再 prepare：零上传（tracker 幂等）。
+        let snapshot = store.snapshot_arc(id).expect("快照");
+        let snapshot_vertex_len = snapshot.vertex_len();
+        let draw = GeometryDrawGpu {
+            id,
+            chunk: 0,
+            transform: Transform::IDENTITY,
+            color: [1.0; 4],
+            snapshot,
+        };
+        registry.begin_frame();
+        let command = allocate(&shared, pool);
+        begin(&shared, command);
+        let uploaded = registry
+            .prepare(&shared, command, &[draw], &mut retired)
+            .expect("prepare same revision");
+        submit_and_wait(&shared, command);
+        assert_eq!(uploaded, 0, "同版本帧不得重复上传");
+
+        for handle in retired {
+            let _ = shared.release(handle);
+        }
+        registry.release(&shared);
+        // SAFETY: 池只被本测试使用，命令缓冲已执行完毕。
+        unsafe { shared.raw().destroy_command_pool(pool, None) };
     }
 }

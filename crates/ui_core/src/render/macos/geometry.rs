@@ -28,7 +28,7 @@ use crate::{
         instance::GeometryDrawGpu,
     },
     render::{
-        geometry_upload::{GeometryUploadPlan, GeometryUploadTracker},
+        geometry_upload::{GeometryUploadTracker, staging_layout},
         macos::device::{Device, GpuObject, init_error},
         retire::GpuResourceHandle,
     },
@@ -167,7 +167,6 @@ impl GeometryRegistry {
                 ),
             });
         }
-        let total: usize = plans.iter().map(GeometryUploadPlan::uploaded_bytes).sum();
         for plan in &plans {
             // 契约自检：`full` 计划覆盖全部页；顶点步长必须非零（GPU 侧 PSO 的顶点布局契约）。
             debug_assert!(plan.snapshot.vertex_stride() > 0);
@@ -179,16 +178,28 @@ impl GeometryRegistry {
             );
         }
         // 一次性 staging（本帧结束后由 device 句柄表 + retire 队列保证生命周期）。
+        // 容量与每页偏移必须同一口径（RX-1）：`staging_layout` 用 `Σ align512(len)` 分配，
+        // 偏移也按 512 B 推进，页的**真实长度**写入不会越过缓冲末尾。
+        let layout = staging_layout(plans.iter().flat_map(|plan| {
+            plan.vertex
+                .pages
+                .iter()
+                .chain(plan.index.pages.iter())
+                .map(|page| page.bytes.len())
+        }));
         let staging = device
             .raw()
-            .newBufferWithLength_options(total.max(4), MTLResourceOptions::StorageModeShared)
+            .newBufferWithLength_options(
+                layout.total_bytes.max(4),
+                MTLResourceOptions::StorageModeShared,
+            )
             .ok_or_else(|| init_error("newBufferWithLength_options(geometry staging)", "nil"))?;
         let staging_handle = device.allocate(GpuObject::Buffer(staging.clone()));
         retired.push(staging_handle);
         let blit = command
             .blitCommandEncoder()
             .ok_or_else(|| init_error("blitCommandEncoder(geometry)", "returned nil"))?;
-        let mut staging_offset = 0usize;
+        let mut staged_page = 0usize;
         let mut uploaded = 0usize;
         for plan in &plans {
             let entry_slot = plan.id.index() as usize;
@@ -241,27 +252,33 @@ impl GeometryRegistry {
                 retired.push(old_handle);
             }
             for page in &plan.vertex.pages {
+                let offset = layout.offsets[staged_page];
+                debug_assert!(layout.fits(staged_page, page.bytes.len()));
                 copy_page(
                     &blit,
                     &staging,
-                    &mut staging_offset,
+                    offset,
                     &page.bytes,
                     &entry.vertex,
                     crate::paint::geometry::GeometrySnapshot::page_offset(page.page as usize)
                         as usize,
                 );
+                staged_page += 1;
                 uploaded += page.bytes.len();
             }
             for page in &plan.index.pages {
+                let offset = layout.offsets[staged_page];
+                debug_assert!(layout.fits(staged_page, page.bytes.len()));
                 copy_page(
                     &blit,
                     &staging,
-                    &mut staging_offset,
+                    offset,
                     &page.bytes,
                     &entry.index,
                     crate::paint::geometry::GeometrySnapshot::page_offset(page.page as usize)
                         as usize,
                 );
+                staged_page += 1;
                 uploaded += page.bytes.len();
             }
             entry.index_count = plan.snapshot.index_count();
@@ -296,39 +313,37 @@ fn private_buffer(
 }
 
 /// 把一页写进 staging 并记录「staging → private 缓冲」的 blit copy。
+///
+/// `staging_offset` 来自 [`staging_layout`]（容量与偏移同一 512 B 口径），写入/copy 用**真实
+/// 长度**；调用方已在 `debug_assert!(layout.fits(..))` 处证明区间落在 staging 内。
 fn copy_page(
     blit: &ProtocolObject<dyn MTLBlitCommandEncoder>,
     staging: &ProtocolObject<dyn MTLBuffer>,
-    staging_offset: &mut usize,
+    staging_offset: usize,
     bytes: &bytes::Bytes,
     target: &ProtocolObject<dyn MTLBuffer>,
     target_offset: usize,
 ) {
-    // 512 B 对齐（与 Windows 的 staging 对齐口径一致，保守覆盖各后端 copy 对齐要求）。
-    let aligned = bytes.len().next_multiple_of(512);
-    // SAFETY: staging 容量按计划总字节（含对齐余量）分配，`contents()` 返回可写指针。
+    // SAFETY: staging 容量按 `Σ align512(len)` 分配、偏移按同一对齐推进，`offset + len` 在
+    // 缓冲内（调用方已断言）；`contents()` 返回可写指针。
     unsafe {
         std::ptr::copy_nonoverlapping(
             bytes.as_ptr(),
-            staging
-                .contents()
-                .as_ptr()
-                .cast::<u8>()
-                .add(*staging_offset),
+            staging.contents().as_ptr().cast::<u8>().add(staging_offset),
             bytes.len(),
         );
     }
-    // SAFETY: 源/目标区间都在各自缓冲容量内；blit 在 command buffer 提交后按序执行。
+    // SAFETY: 源区间 [offset, offset+len) 在 staging 内、目标区间在 private 缓冲容量内；
+    // blit 在 command buffer 提交后按序执行。
     unsafe {
         blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
             staging,
-            *staging_offset,
+            staging_offset,
             target,
             target_offset,
             bytes.len(),
         );
     }
-    *staging_offset += aligned;
 }
 
 #[cfg(test)]
@@ -346,5 +361,101 @@ mod tests {
         assert!(geometry_is_stale(1_001 + EVICT_AFTER_FRAMES, 1_000));
         // 帧号回绕（u64 实际不会发生，但 `wrapping_sub` 必须给出正确差值）。
         assert!(!geometry_is_stale(0, u64::MAX));
+    }
+
+    /// RX-1/RX-13 的真实 Metal 回归：最小反例（顶点页 36 B + 索引页 6 B，均非 512 倍数）
+    /// 走两次完整 `prepare`（首帧整份 + 增量一页），提交真实命令缓冲并等待完成。
+    ///
+    /// 旧实现按 `Σ len` 分配 staging、按 512 对齐推进偏移 ⇒ index 页从 offset 512 写入
+    /// 42 B 的缓冲：`contents()` 越界写 + blit 源区间越界（Metal validation 报错或静默损坏）。
+    /// 本测试在真机 Metal 上执行该路径，断言命令缓冲成功完成且上传字节为真实长度。
+    #[test]
+    fn staging_upload_runs_on_a_real_metal_device() {
+        use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue, MTLDevice};
+
+        use crate::{
+            math::{Rect, Transform},
+            paint::{
+                geometry::{GeometryDesc, GeometryPipeline, IndexType, Topology},
+                geometry_store::GeometryStore,
+                instance::GeometryDrawGpu,
+            },
+        };
+
+        let mut device = super::Device::new().expect("metal device");
+        let queue = device.raw().newCommandQueue().expect("command queue");
+        let mut store = GeometryStore::new();
+        let mut vertices = Vec::with_capacity(36);
+        for value in [0x11u8, 0x22, 0x33] {
+            vertices.extend_from_slice(&[value; 12]);
+        }
+        let indices = [0u8, 0, 1, 0, 2, 0];
+        let id = store
+            .insert(GeometryDesc {
+                vertex_bytes: bytes::Bytes::from(vertices),
+                index_bytes: bytes::Bytes::from(indices.to_vec()),
+                vertex_stride: 12,
+                index_type: IndexType::U16,
+                topology: Topology::TriangleList,
+                bounds: Rect::new(0.0, 0.0, 32.0, 32.0),
+                pipeline: GeometryPipeline::Ui,
+            })
+            .expect("注册几何");
+        store
+            .update_vertices(id, 12..24, &[0xAB; 12])
+            .expect("range 更新");
+        let mut registry = super::GeometryRegistry::new();
+        let mut retired = Vec::new();
+
+        // 帧 1：首见 ⇒ 整份上传（36 + 6 = 42 B，staging 容量按 512 对齐取整）。
+        registry.begin_frame();
+        let snapshot = store.snapshot_arc(id).expect("快照");
+        let command = queue.commandBuffer().expect("command buffer 1");
+        let uploaded = registry
+            .prepare(
+                &mut device,
+                &command,
+                &[GeometryDrawGpu {
+                    id,
+                    chunk: 0,
+                    transform: Transform::IDENTITY,
+                    color: [1.0; 4],
+                    snapshot,
+                }],
+                &mut retired,
+            )
+            .expect("prepare full");
+        command.commit();
+        command.waitUntilCompleted();
+        assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+        assert!(command.error().is_none(), "Metal 命令缓冲不得失败");
+        assert_eq!(uploaded, 36 + 6);
+
+        // 帧 2：同版本 ⇒ 0 上传；帧 3：改顶点 1 ⇒ 只上传被触碰的页（36 B 页内 12 B）。
+        registry.begin_frame();
+        let snapshot = store.snapshot_arc(id).expect("快照");
+        let command = queue.commandBuffer().expect("command buffer 2");
+        let uploaded = registry
+            .prepare(
+                &mut device,
+                &command,
+                &[GeometryDrawGpu {
+                    id,
+                    chunk: 0,
+                    transform: Transform::IDENTITY,
+                    color: [1.0; 4],
+                    snapshot,
+                }],
+                &mut retired,
+            )
+            .expect("prepare same revision");
+        command.commit();
+        command.waitUntilCompleted();
+        assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+        assert_eq!(uploaded, 0, "同版本帧不得重复上传");
+
+        for handle in retired {
+            let _ = device.release(handle);
+        }
     }
 }

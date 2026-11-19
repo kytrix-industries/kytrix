@@ -2427,10 +2427,6 @@ fn draw_ops(
                     chunk.index_first + chunk.index_count <= entry.index_count(),
                     "geometry chunk range must stay inside the uploaded index buffer"
                 );
-                debug_assert!(
-                    chunk.index_first + chunk.index_count <= entry.index_count(),
-                    "geometry chunk range must stay inside the uploaded index buffer"
-                );
                 let push_bytes = bytemuck::cast_slice::<f32, u8>(uniform.words());
                 // SAFETY: 顶点/索引缓冲由 `GeometryRegistry` 持有到本帧结束；
                 // push constant 范围由 pipeline layout 声明。

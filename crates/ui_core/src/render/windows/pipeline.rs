@@ -1051,6 +1051,7 @@ fn transition_buffer(
 
 #[cfg(test)]
 mod tests {
+
     use super::{
         ATLAS_DESCRIPTORS, ATLAS_GENERATIONS, ATLAS_SRVS, DescriptorArena, Pipeline, SrvHeap,
         WINDOW_SRVS,
@@ -1260,6 +1261,18 @@ mod tests {
         assert!(
             third > 0 && third <= crate::paint::geometry::GEOMETRY_PAGE_BYTES,
             "只上传被触碰的页：{third} B"
+        );
+
+        // RX-16：registry 级驱逐必须真的把顶点/索引句柄交回 retire 队列。
+        let retired_before = retired.len();
+        for _ in 0..=super::EVICT_AFTER_FRAMES {
+            registry.begin_frame();
+        }
+        registry.retain_recent(&mut retired);
+        assert!(registry.get(id).is_none(), "长期未绘制的几何条目必须被驱逐");
+        assert!(
+            retired.len() > retired_before,
+            "驱逐必须交还顶点/索引缓冲句柄（此前只测了谓词）"
         );
 
         // teardown：staging 句柄与 buffer 句柄都归还，retire 队列不泄漏。

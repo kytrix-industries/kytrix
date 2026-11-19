@@ -632,9 +632,11 @@ impl App {
     /// `range.start` 不得越过当前末尾（不允许中间留空洞）。合法空区间是 no-op。
     ///
     /// 成功返回 [`crate::paint::geometry::GeometryUpdate`]：新版本号 + 受影响块的
-    /// 旧∪新 AABB（逻辑像素）。引擎自动把绑定该几何的节点标脏，paint 只重建块版本变化的
-    /// 块 lane（K 线追加只重建尾块）。只有一个窗口里的节点被自动标脏；若同一几何还被
-    /// `Canvas` 图元引用（非几何节点），应用需要自行请求该节点重绘。
+    /// 旧∪新 AABB（**逻辑像素**，与 `GeometryDesc.bounds` 同一坐标空间；per-draw 变换在
+    /// paint 阶段才应用）。引擎会把**所有窗口**里绑定该几何的几何节点标 PAINT 并自动请求
+    /// 一帧（与 signal 写入一致）；paint 只重建块版本变化的块 lane（K 线追加只重建尾块）。
+    /// 空 range / 没有块受影响时不标脏、不请求帧。若同一几何还被 `Canvas` 图元引用
+    /// （非几何节点），应用需要自行请求该节点重绘。
     ///
     /// # Errors
     /// - [`EngineError::UnknownGeometry`]：句柄陈旧 / 已释放；

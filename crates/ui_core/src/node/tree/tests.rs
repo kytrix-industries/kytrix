@@ -626,6 +626,41 @@ fn remove_reports_released_lanes() {
     assert_eq!(tree.drain_removed_lanes().count(), 0, "取走即清空");
 }
 
+/// RX-4（review-x 覆盖探针）：多块几何节点卸载时**每一条** lane 都要交回。
+///
+/// 探针：把 `arena.rs` 的回收改成「只取第一条 lane」后全量测试仍绿（既有删除测试只有单
+/// lane 普通节点）。多块几何节点（每块一条 lane）卸载 / 关窗时漏回收会永久泄漏 `Scene`
+/// lane 槽与编码器实例段（7×24 场景）。
+#[test]
+fn remove_reports_every_lane_of_a_multi_lane_node() {
+    use crate::paint::scene::LaneId;
+
+    let mut tree = NodeTree::new();
+    let root = tree.root();
+    let parent = boxed(&mut tree, root);
+    let node = boxed(&mut tree, parent);
+    let lanes: Vec<LaneId> = (0..3).map(|chunk| LaneId::for_test(chunk, 1)).collect();
+    tree.set_lane(node, lanes[0]);
+    tree.push_lane(node, lanes[1]);
+    tree.push_lane(node, lanes[2]);
+    let parent_lane = LaneId::for_test(9, 1);
+    tree.set_lane(parent, parent_lane);
+
+    tree.remove(parent).expect("卸载多块几何节点");
+
+    let removed: Vec<LaneId> = tree.drain_removed_lanes().collect();
+    assert_eq!(
+        removed.len(),
+        4,
+        "父 1 条 + 子节点 3 条块 lane 必须全部回收"
+    );
+    for lane in &lanes {
+        assert!(removed.contains(lane), "块 lane {lane:?} 泄漏");
+    }
+    assert!(removed.contains(&parent_lane));
+    assert_eq!(tree.drain_removed_lanes().count(), 0, "取走即清空");
+}
+
 #[test]
 fn debug_id_roundtrip_and_slot_reuse() {
     let mut tree = NodeTree::new();
