@@ -1,11 +1,19 @@
 //! 图片解码：字节 → **线性空间预乘 → sRGB 重编码**的 `BGRA8`（P13 §6）。
 //!
 //! 图集字节语义由 `render/shaders/contract.md` §8 冻结（纹素是 linear-premultiplied 后 sRGB 编码），
-//! 本模块就是它的 CPU 侧实现。三个约束：
+//! 本模块就是它的 CPU 侧实现。四条约束：
 //!
 //! 1. 只接受 PNG / JPEG / WebP（`image::guess_format` 与 feature 无关，所以必须**策略性**拒绝其它格式）；
-//! 2. 不做色彩管理：`image 0.25` 把 ICC 当元数据透传，资产必须**已经是 sRGB 编码**；
-//! 3. 大图在解码后按 `MAX_TILE_DIM` 等比缩小（编码域 `Triangle`，与浏览器一致），不做线性空间重采样。
+//! 2. 色彩管理不在本模块（ICC 由后续任务接入）：资产必须**已经是 sRGB 编码**；
+//! 3. EXIF orientation 在缩放 / 转 RGBA / 预乘**之前**应用到像素（`ImageDecoder::orientation` +
+//!    `DynamicImage::apply_orientation`）；cache key 仍是源字节，方向不进键；
+//! 4. 大图在解码后按 `MAX_TILE_DIM` 等比缩小（编码域 `Triangle`，与浏览器一致），不做线性空间重采样。
+//!
+//! 解码流程（[`decode`]）固定为：`format_of` → `into_decoder()` → `dimensions` +
+//! [`check_source_size`] → 元数据（orientation；ICC **也在这个位置**读取，见下面的注释）→
+//! `Limits::reserve(decoder.total_bytes())` + `set_limits` → `DynamicImage::from_decoder` →
+//! `apply_orientation` → 缩放 → `to_rgba8` → 预乘。`reserve` 是复刻 `ImageReader::decode` 的
+//! 「整图分配」预检：走 `into_decoder` 而漏掉它，[`MAX_DECODE_ALLOC`] 就只剩解码器中间缓冲有意义。
 //!
 //! 预乘在**线性**空间完成：`srgb_decode(rgb) * alpha` 再 `srgb_encode` 存 8 bit。直接在编码域乘 alpha
 //! 在中灰半透明处会偏暗最多 60/255（probe 实测），因此用 64 KiB 的 `(color, alpha) → stored` 查找表，
@@ -14,7 +22,8 @@
 use std::{io::Cursor, sync::OnceLock};
 
 use image::{
-    DynamicImage, ImageError, ImageFormat, ImageReader, error::LimitErrorKind, imageops::FilterType,
+    DynamicImage, ImageDecoder, ImageError, ImageFormat, ImageReader, error::LimitErrorKind,
+    imageops::FilterType,
 };
 use smol_str::{SmolStr, format_smolstr};
 
@@ -48,9 +57,9 @@ pub(crate) const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
 
 /// 解码结果：**预乘 sRGB 编码**的 BGRA8（行主序，行宽 `width * 4`）。
 pub(crate) struct DecodedImage {
-    /// 解码（必要时缩放）后的像素宽。
+    /// 解码（必要时缩放、应用 EXIF orientation）后的像素宽。
     pub width: u32,
-    /// 解码（必要时缩放）后的像素高。
+    /// 解码（必要时缩放、应用 EXIF orientation）后的像素高。
     pub height: u32,
     /// `width * height * 4` 字节，BGR(A) 顺序。
     pub bgra: Box<[u8]>,
@@ -58,9 +67,9 @@ pub(crate) struct DecodedImage {
 
 /// 字节 → BGRA8 预乘 sRGB。
 ///
-/// 两段式（R12-15）：先只读文件头拿尺寸（**不分配整图**），像素 / 单边超限在这里就报
-/// [`DecodeCause::TooLarge`]；再带显式 [`decode_limits`] 解码，`max_alloc` 命中映射成
-/// [`DecodeCause::OutOfMemory`]。
+/// 两段式（R12-15）：先由解码器只读文件头拿尺寸（**不分配整图**），像素 / 单边超限在这里就报
+/// [`DecodeCause::TooLarge`]；再 `reserve(total_bytes)` + `set_limits` 后解码，`max_alloc` 命中
+/// 映射成 [`DecodeCause::OutOfMemory`]。EXIF orientation 在解码后、缩放前应用到像素。
 ///
 /// # Errors
 /// [`DecodeCause`]：格式不支持 / 字节损坏 / 源图过大 / 解码器内存不足
@@ -68,21 +77,31 @@ pub(crate) struct DecodedImage {
 pub(crate) fn decode(bytes: &[u8]) -> Result<DecodedImage, DecodeCause> {
     let format = format_of(bytes)?;
     let tag = format_tag(format);
-    let (width, height) = ImageReader::with_format(Cursor::new(bytes), format)
-        .into_dimensions()
+    // `into_decoder` 让「元数据读取」发生在解码像素之前（orientation 必须先于 `from_decoder`：
+    // 解码器一旦交给 `DynamicImage::from_decoder` 就被消耗，之后再没有 `icc_profile()` 的机会）。
+    let mut decoder = ImageReader::with_format(Cursor::new(bytes), format)
+        .into_decoder()
         .map_err(|error| classify(tag, error))?;
-    if width == 0 || height == 0 {
-        return Err(DecodeCause::Corrupt {
-            format: SmolStr::new_static(tag),
-            detail: SmolStr::new_static("image has a zero dimension"),
-        });
-    }
+    let (width, height) = decoder.dimensions();
+    check_pixel_dimensions(tag, width, height)?;
     check_source_size(width, height)?;
-    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
-    reader.limits(decode_limits());
-    // `ImageReader::decode` 会先把 `decoder.total_bytes()` 记进 `max_alloc` 再读像素，
-    // 因此「整图分配」本身也受 [`MAX_DECODE_ALLOC`] 约束（不只是解码器的中间缓冲）。
-    let mut image: DynamicImage = reader.decode().map_err(|error| classify(tag, error))?;
+    // ICC 后续任务在这一行之后、`from_decoder` 之前读取 `decoder.icc_profile()`；顺序固定为
+    // 「元数据 → reserve/set_limits → 解码 → apply_orientation → resize → to_rgba8 → 预乘」。
+    let orientation = decoder
+        .orientation()
+        .map_err(|error| classify(tag, error))?;
+    // 复刻 `ImageReader::decode` 的两步（`io/image_reader_type.rs`）：整图分配先记进
+    // `max_alloc`，再把剩余预算交给解码器；漏掉任一步都会让 `MAX_DECODE_ALLOC` 失去意义。
+    let mut limits = decode_limits();
+    limits
+        .reserve(decoder.total_bytes())
+        .map_err(|error| classify(tag, error))?;
+    decoder
+        .set_limits(limits)
+        .map_err(|error| classify(tag, error))?;
+    let mut image: DynamicImage =
+        DynamicImage::from_decoder(decoder).map_err(|error| classify(tag, error))?;
+    image.apply_orientation(orientation);
     if image.width() > MAX_TILE_DIM || image.height() > MAX_TILE_DIM {
         let (target_width, target_height) = fit_within(image.width(), image.height());
         image = image.resize_exact(target_width, target_height, FilterType::Triangle);
@@ -120,6 +139,21 @@ fn check_source_size(width: u32, height: u32) -> Result<(), DecodeCause> {
             pixels,
             limit: MAX_SOURCE_PIXELS,
             dim_limit: MAX_SOURCE_DIM,
+        });
+    }
+    Ok(())
+}
+
+/// 零尺寸不是可解码的图片（解码器能以 `Ok` 返回 0×0）：分类成 `Corrupt`。
+fn check_pixel_dimensions(
+    format: &'static str,
+    width: u32,
+    height: u32,
+) -> Result<(), DecodeCause> {
+    if width == 0 || height == 0 {
+        return Err(DecodeCause::Corrupt {
+            format: SmolStr::new_static(format),
+            detail: SmolStr::new_static("image has a zero dimension"),
         });
     }
     Ok(())
@@ -304,6 +338,36 @@ mod tests {
         png_rgba8(width, height, &pixels)
     }
 
+    /// 手工 EXIF：TIFF little-endian，IFD0 里一条 `Orientation` 记录（tag 0x0112 / SHORT / count 1）。
+    fn exif_orientation(orientation: u16) -> Vec<u8> {
+        let mut exif = Vec::with_capacity(26);
+        exif.extend_from_slice(b"II*\0");
+        exif.extend_from_slice(&8u32.to_le_bytes()); // IFD0 偏移
+        exif.extend_from_slice(&1u16.to_le_bytes()); // 条目数
+        exif.extend_from_slice(&0x0112u16.to_le_bytes()); // Orientation
+        exif.extend_from_slice(&3u16.to_le_bytes()); // SHORT
+        exif.extend_from_slice(&1u32.to_le_bytes()); // count
+        exif.extend_from_slice(&orientation.to_le_bytes()); // value（后 2 字节是 padding）
+        exif.extend_from_slice(&0u16.to_le_bytes());
+        exif.extend_from_slice(&0u32.to_le_bytes()); // 下一个 IFD
+        exif
+    }
+
+    /// 带 eXIf chunk 的 RGBA8 PNG（PNG 的 eXIf 是原始 TIFF，不压缩）。
+    fn png_with_exif(width: u32, height: u32, pixels: &[u8], orientation: u16) -> Vec<u8> {
+        use image::{ExtendedColorType, ImageEncoder};
+
+        let mut out = Cursor::new(Vec::new());
+        let mut encoder = image::codecs::png::PngEncoder::new(&mut out);
+        encoder
+            .set_exif_metadata(exif_orientation(orientation))
+            .expect("PngEncoder 支持 eXIf");
+        encoder
+            .write_image(pixels, width, height, ExtendedColorType::Rgba8)
+            .expect("encode png with exif");
+        out.into_inner()
+    }
+
     fn cause(bytes: &[u8]) -> DecodeCause {
         match decode(bytes) {
             Err(cause) => cause,
@@ -411,6 +475,53 @@ mod tests {
         let strip = solid(4000, 1, [1, 2, 3, 255]);
         let image = decode(&strip).expect("strip png");
         assert_eq!((image.width, image.height), (MAX_TILE_DIM, 1));
+    }
+
+    /// D-8：EXIF orientation 必须在缩放 / 预乘之前应用（输出宽高与像素顺序都变）。
+    #[test]
+    fn decode_applies_exif_orientation_before_scaling() {
+        // 2×1：左红右蓝（RGBA）。BGRA 后红 = [0,0,255,255]、蓝 = [255,0,0,255]。
+        let red_blue = [255u8, 0, 0, 255, 0, 0, 255, 255];
+
+        // EXIF 6 = 顺时针 90°：2×1 → 1×2，上红下蓝。
+        let rotated = decode(&png_with_exif(2, 1, &red_blue, 6)).expect("rotate90 png");
+        assert_eq!(
+            (rotated.width, rotated.height),
+            (1, 2),
+            "EXIF 6 必须交换宽高"
+        );
+        assert_eq!(
+            &rotated.bgra[..],
+            &[0, 0, 255, 255, 255, 0, 0, 255],
+            "EXIF 6 的像素顺序：上红下蓝"
+        );
+
+        // EXIF 2 = 水平翻转：尺寸不变，列序反转。
+        let flipped = decode(&png_with_exif(2, 1, &red_blue, 2)).expect("fliph png");
+        assert_eq!((flipped.width, flipped.height), (2, 1), "EXIF 2 不改尺寸");
+        assert_eq!(
+            &flipped.bgra[..],
+            &[255, 0, 0, 255, 0, 0, 255, 255],
+            "EXIF 2 的像素顺序：左蓝右红"
+        );
+    }
+
+    /// D-8 回归面：无 eXIf 与 orientation=1 必须**逐字节**保持原有解码结果。
+    #[test]
+    fn decode_without_orientation_transforms_is_byte_exact() {
+        let baseline = decode(&solid(2, 1, [10, 20, 30, 255])).expect("plain png");
+
+        let pixels = [10u8, 20, 30, 255, 10, 20, 30, 255];
+        let tagged = decode(&png_with_exif(2, 1, &pixels, 1)).expect("orientation 1");
+        assert_eq!(
+            (tagged.width, tagged.height),
+            (baseline.width, baseline.height),
+            "orientation 1 不得改变尺寸"
+        );
+        assert_eq!(
+            tagged.bgra, baseline.bgra,
+            "orientation 1 必须与无 eXIf 的像素逐字节一致"
+        );
     }
 
     #[test]
