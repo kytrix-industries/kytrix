@@ -222,10 +222,15 @@ pub(crate) fn qpc_instant(
     }
     let ticks = presented_qpc.checked_sub(anchor_qpc)?;
     let seconds = ticks as f64 / frequency as f64;
-    if !seconds.is_finite() || seconds.abs() > MAX_QPC_LEAD_SECS * 10.0 {
-        // 只拦住荒谬的绝对值（QPC 回绕 / 时钟域错位）；「离 now 太远」在下面统一判。
+    if !seconds.is_finite() {
         return None;
     }
+    // **不要**限制 `ticks`/`seconds` 的绝对值：锚点（`OnceLock`）只在进程内取一次，之后 QPC
+    // 持续前进，`presented_qpc − anchor_qpc` 随进程 uptime 单调增长。曾经在这里加过
+    // 「|seconds| ≤ 10s」的上限，导致进程运行约 10 秒后 `presented_at` **永久变 None**
+    // （RA-1：20s acceptance 有值率 38.64%，与「首帧+10s 终断」模型吻合）。线性映射本身与
+    // 锚点距离无关，合法性判据是下面两条：结果不晚于采样时刻、且离采样时刻不超过一个刷新
+    // 量级（1s）。
     let instant = if seconds >= 0.0 {
         anchor.checked_add(Duration::from_secs_f64(seconds))?
     } else {
@@ -1116,6 +1121,47 @@ mod tests {
             FREQUENCY,
         );
         assert!(future.is_none(), "映射到采样时刻之后的呈现时刻不可信");
+    }
+
+    /// **RA-1 回归防线**：`OnceLock` 锚点只在进程内取一次，进程运行任意久之后仍必须能映射。
+    ///
+    /// 回归：曾经在 `qpc_instant` 里加「`|presented_qpc − anchor_qpc| ≤ 10 s`」的绝对上限，
+    /// 进程跑约 10 秒后该判据恒真 ⇒ Windows `presented_at` 永久 `None`（20 s acceptance
+    /// 有值率只有 38.64%）。线性映射与锚点距离无关，合法性只看「不晚于 now 且离 now ≤1 s」。
+    #[test]
+    fn an_anchor_sixty_seconds_old_still_maps_onto_the_monotonic_clock() {
+        const FREQUENCY: i64 = 10_000_000;
+        let now = Instant::now();
+        // 锚点在 60 s 前；本帧的 vblank 在 5 ms 前 ⇒ 结果必须映射成功且与锚点相距 60 s。
+        let anchor = now - Duration::from_secs(60);
+        let anchor_qpc = 1_000_000_000;
+        let instant = qpc_instant(
+            anchor_qpc + FREQUENCY * 60 - FREQUENCY / 200,
+            anchor_qpc,
+            anchor,
+            now,
+            FREQUENCY,
+        )
+        .expect("锚点早 60 s 仍必须能映射（RA-1 回归）");
+        assert_eq!(
+            instant.saturating_duration_since(anchor),
+            Duration::from_secs(59) + Duration::from_millis(995)
+        );
+        assert!(instant <= now);
+        // 换成 10 分钟后同样成立（绝对距离不参与判据）。
+        let anchor = now - Duration::from_secs(600);
+        let instant = qpc_instant(
+            anchor_qpc + FREQUENCY * 600 - FREQUENCY / 500,
+            anchor_qpc,
+            anchor,
+            now,
+            FREQUENCY,
+        )
+        .expect("锚点早 10 min 仍必须能映射");
+        assert_eq!(
+            instant.saturating_duration_since(anchor),
+            Duration::from_secs(599) + Duration::from_millis(998)
+        );
     }
 
     /// 刷新周期只能从相邻采样实测（`DXGI_FRAME_STATISTICS` 没有 `SyncRefreshPeriod` 字段）。

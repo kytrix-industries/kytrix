@@ -200,6 +200,11 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                 if let Some(hz) = state.refresh_hz(index) {
                     window.set_frame_refresh_hz(hz);
                 }
+                // RA-5：不可见窗口不参与帧循环（`frame_windows` 过滤掉它），推迟标记必须清掉；
+                // 否则 `next_deferred_deadline()` 一直返回已过期时刻 ⇒ calloop timeout=0 空转。
+                if !state.is_visible(index) {
+                    window.clear_frame_budget_deferred();
+                }
                 // ③ R10-4 / R10-15：compositor 侧的窗口状态（装饰模式、最大化/全屏、可用能力）
                 // 镜像给应用 —— 自绘标题栏据此决定是否画、按钮是否可用。
                 window.set_state(state.window_state(index));
@@ -411,9 +416,12 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                 None => timeout,
             };
             // A5：被帧预算门禁推迟的帧到期后必须自己醒来（不依赖下一次无关事件；与 Windows
-            // 的 FramePacer / macOS 连续帧定时器同义）。
+            // 的 FramePacer / macOS 连续帧定时器同义）。RA-5：不可见窗口的推迟标记已在上面
+            // 清掉；这里再夹一个 1 ms 下限，避免已过期 deadline 让 calloop timeout=0 空转。
             let timeout = match app.next_deferred_deadline() {
-                Some(deadline) => timeout.min(deadline.saturating_duration_since(Instant::now())),
+                Some(deadline) => timeout
+                    .min(deadline.saturating_duration_since(Instant::now()))
+                    .max(Duration::from_millis(1)),
                 None => timeout,
             };
             // 应用自己关窗（Esc / 标题栏关闭按钮）后不能停在下面 1h 的空闲等待里。

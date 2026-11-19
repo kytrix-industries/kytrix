@@ -107,6 +107,16 @@ impl FrameBudget {
         self.deferred
     }
 
+    /// 清除「推迟未补」标记（窗口不可见 / 最小化时调用）。
+    ///
+    /// **RA-5**：推迟帧的一次性唤醒依赖「有窗口 `deferred == true`」；若窗口随即不可见，平台
+    /// 帧循环会跳过它 ⇒ 标记永不清除，mac 连续帧定时器常驻、Linux calloop timeout=0 空转。
+    /// 不可见窗口不再需要补帧（可见性恢复路径会置全量 damage + 请求一帧），因此这里只清标记、
+    /// 不伪造放行（脏位保留）；累计推迟计数不清（诊断量）。
+    pub(crate) fn clear_deferred(&mut self) {
+        self.deferred = false;
+    }
+
     /// 被推迟的帧最早何时可以开始（Linux calloop timeout 的到期时刻）。
     #[cfg(target_os = "linux")]
     pub(crate) fn deadline(&self) -> Option<Instant> {
@@ -258,5 +268,29 @@ mod tests {
             "同值写入不得重置相位"
         );
         assert_eq!(budget.deferrals(), 0, "相位重置不清累计计数");
+    }
+
+    /// **RA-5 回归防线**：窗口不可见时清除「推迟未补」标记——只停一次性唤醒，不伪造放行。
+    ///
+    /// 回归：不可见窗口的平台帧循环会跳过它，`deferred` 永不清除 ⇒ mac 连续帧定时器常驻 /
+    /// Linux calloop timeout=0 空转。
+    #[test]
+    fn clearing_the_deferred_flag_stops_the_one_shot_wakeup_without_forging_a_frame() {
+        let mut budget = budget(60.0);
+        let t0 = Instant::now();
+        budget.note_start(t0);
+        assert!(!budget.admits(t0 + Duration::from_millis(1), false));
+        assert!(budget.note_deferred());
+        assert!(budget.is_deferred());
+        budget.clear_deferred();
+        assert!(
+            !budget.is_deferred(),
+            "不可见窗口的推迟标记必须清掉（RA-5）"
+        );
+        assert!(
+            !budget.admits(t0 + Duration::from_millis(2), false),
+            "清除标记不等于放行（脏位保留、相位不变）"
+        );
+        assert_eq!(budget.deferrals(), 1, "累计计数保留（诊断量）");
     }
 }

@@ -804,6 +804,19 @@ pub(super) fn pump_loop(
         // 上等下一次无关消息 —— 立即让节拍线程在下一个合成器节拍唤醒泵。节拍线程的生命周期
         // 从「仅连续帧」扩展为「连续帧 **或** 有被推迟的帧」；两者都没有时线程不存在
         // （空闲零唤醒不变式，I3）。
+        //
+        // RA-5：最小化窗口的推迟标记清掉（不再需要补帧；恢复时可见性路径置全量 damage + 请求
+        // 一帧），避免节拍线程为永远不出帧的窗口常驻。
+        {
+            let mut app = app_cell.borrow_mut();
+            for native in windows.iter() {
+                if native.is_minimized()
+                    && let Some(window) = app.window_mut(native.id())
+                {
+                    window.clear_frame_budget_deferred();
+                }
+            }
+        }
         let (continuous, deferred) = {
             let app = app_cell.borrow();
             (app.needs_continuous_frames(), app.has_deferred_frames())

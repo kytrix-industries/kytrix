@@ -378,6 +378,11 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
         if let Some(window) = app.window_mut(native.id()) {
             // A5：窗口可能被拖到另一块屏（刷新率不同）⇒ 每轮泵更新预算提示（同值幂等）。
             window.set_frame_refresh_hz(native.maximum_frames_per_second());
+            // RA-5：不可见窗口不产帧（下面 `sync_pacing` 会停 display link），推迟标记必须清掉，
+            // 否则 `has_deferred_frames()` 让连续帧定时器常驻（空闲零唤醒不变式被破坏）。
+            if !visible {
+                window.clear_frame_budget_deferred();
+            }
             window.sync_pacing(continuous && visible);
         }
     }

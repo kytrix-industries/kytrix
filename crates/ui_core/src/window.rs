@@ -767,6 +767,10 @@ impl Window {
     pub(crate) fn frame_budget_deferred(&self) -> bool {
         self.frame_budget.is_deferred()
     }
+    /// 清除「推迟未补」标记（不可见 / 最小化窗口：平台帧循环会跳过它，否则一次性唤醒常驻）。
+    pub(crate) fn clear_frame_budget_deferred(&mut self) {
+        self.frame_budget.clear_deferred();
+    }
     /// 被推迟的帧最早何时可以开始（Linux calloop timeout 的到期时刻）。
     #[cfg(target_os = "linux")]
     #[must_use]

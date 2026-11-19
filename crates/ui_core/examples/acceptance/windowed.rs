@@ -186,6 +186,15 @@ impl WindowRun {
     fn report(&self, hz: u32, refresh_hz: Option<f32>, deferrals: u64) -> bool {
         let elapsed = self.started.elapsed().as_secs_f64();
         println!();
+        // RA-3：刷新率提示在**平台注入之后**（`Application::run` 已启动、泵已跑过）打印，
+        // 与测量/推迟计数同点，日志自洽（旧实现在 `run` 之前打印 ⇒ 恒显示「禁用」）。
+        match refresh_hz {
+            Some(hz) => println!("帧预算门禁：刷新率提示 {hz:.1} Hz（写入快于刷新时合并到下一拍）"),
+            None => println!(
+                "帧预算门禁：平台未提供刷新率提示（headless / macOS 屏幕不可得）⇒ 门禁禁用，\
+                 吞吐仅受平台 present 门禁约束"
+            ),
+        }
         println!("-- 帧率与抖动（真机真窗口，commit → commit，驱动 {hz} Hz） --");
         println!(
             "运行 {:.1}s（预热 {:.1}s / 测量 {:.1}s）提交帧 {}；测量期间隔样本 {}",
@@ -313,10 +322,10 @@ impl WindowRun {
         if hz < 90 {
             println!(
                 "120 Hz 能力           目标频率 60 Hz 下测得抖动 {:.3} ms；\
-                 120 Hz 的**逻辑**由 `src/render/frame_clock.rs` 的帧时钟保证（\
-                 `frame_interval(120)=8.33ms` / `normalize_refresh_hz` 24–360 Hz / \
-                 `FramePacing` 目标推导 / display link 对齐），本机显示器只有 60 Hz，\
-                 120 Hz 的**上屏**无法验证（详见报告「120 Hz」一节）。",
+                 120 Hz 的**逻辑**由「帧预算门禁（每 refresh 周期最多一帧，10% 相位容差）+ \
+                 每窗口 GPU present 门禁」保证（A2 已删除进程级帧时钟，present 节奏由 Windows \
+                 DXGI waitable / macOS CAMetalDisplayLink / Linux wl_surface.frame 决定），\
+                 本机显示器只有 60 Hz，120 Hz 的**上屏**无法验证（详见报告「120 Hz」一节）。",
                 rms / 1e3
             );
         }
@@ -361,13 +370,8 @@ pub fn run_window(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
 
     // 首帧：全量（让窗口先有内容）。
     let _ = app.frame(window);
-    // A5：平台上报的刷新率提示（窗口所在 output）。`None` = 平台没给 ⇒ 预算门禁禁用。
-    let refresh_hz = app.frame_refresh_hz(window);
-    match refresh_hz {
-        Some(hz) => println!("帧预算门禁：刷新率提示 {hz:.1} Hz（写入快于刷新时合并到下一拍）"),
-        None => println!("帧预算门禁：平台未提供刷新率提示 ⇒ 禁用（吞吐仅受 present 门禁约束）"),
-    }
-
+    // 注意：此刻还没有原生窗口（`Application::run` 尚未启动），平台刷新率提示不可用；
+    // 预算门禁的提示在 `report()`（计数/判定同点）打印，避免「先禁用、后启用」的误导日志（RA-3）。
     let mut run = WindowRun::new(config);
     let passed = Rc::new(Cell::new(false));
     let result_slot = Rc::clone(&passed);
@@ -429,7 +433,7 @@ pub fn run_window(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
         if now >= run.deadline {
             run.finished = true;
             let deferrals = app.frame_budget_deferrals(window);
-            let refresh_hz = app.frame_refresh_hz(window).or(refresh_hz);
+            let refresh_hz = app.frame_refresh_hz(window);
             let ok = run.report(hz, refresh_hz, deferrals);
             result_slot.set(ok);
             stop_pump.store(true, Ordering::Release);

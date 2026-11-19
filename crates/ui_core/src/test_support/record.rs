@@ -81,7 +81,7 @@ pub struct FrameRecord {
     ///
     /// `None` = 该端/该帧没有可信的呈现时刻（Windows 拿不到帧统计 / Linux compositor 无
     /// `wp_presentation` / 该帧被合成器丢弃），或反馈还没到达。**不是**「用 GPU 完成时刻
-    /// 顶替」的占位：`stats.compositor_thread_wait` 与本字段一起把呈现链的可观测性补齐。
+    /// 顶替」的占位：`stats.compositor_inbox_latency`（A2 改名）与本字段一起把「入队→编码→完成→上屏」的可观测性补齐。
     pub presented_latency: Option<std::time::Duration>,
 }
 

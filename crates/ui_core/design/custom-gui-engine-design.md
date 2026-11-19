@@ -800,8 +800,10 @@ present → GPU 完成反馈（completed_at / presented_at / latency）──►
   出帧，绝不用错误周期卡帧）。
 - **presented_at 契约**：`Option<Instant>`，语义是真实上屏时刻的**下界**（偏差方向恒为偏早、最多
   1 vsync）；不可得如实 `None`，绝不用完成时刻顶替。Windows 用 `IDXGISwapChain::GetFrameStatistics`
-  （DComp 下只到 composition，天然满足下界契约），Linux 用 `wp_presentation_feedback`，macOS 用
-  display link tick 推断。验收指标 `publish→presented` 的 p50/p99 由 `acceptance window` 打印。
+  （DComp 下只到 composition，天然满足下界契约），macOS 用 display link tick 推断；
+  **Linux 用 `wp_presentation_feedback` 是计划项（A4 明确降级：数据面已实现并有单测，平台接线
+  未启用，生产路径如实 `presented_at=None`）**，接线由 Wave2 B 组在 Linux 真机完成后再改为现状。
+  验收指标 `publish→presented` 的 p50/p99 由 `acceptance window` 打印。
 
 
 ### 3.6 事件 → Action → 状态 → 失效 的闭环
