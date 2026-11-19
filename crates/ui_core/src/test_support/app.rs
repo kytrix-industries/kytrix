@@ -1911,6 +1911,80 @@ mod p11_fix_tests {
         );
     }
 
+    /// E2 端到端：分批首树尚未跑完时滚动一次，**已交付**的行必须在后续笔重发新 bounds。
+    ///
+    /// 修前行为：滚动把整棵子树标脏（`a11y_note_scroll` → `invalidate_subtree`），但已交付行
+    /// 仍占着 `queued` 去重名额 ⇒ 后续笔只有尚未交付的行，读屏的高亮框/命中区域停在旧位置。
+    ///
+    /// 变异守卫：删掉交付后的 `queued.remove` ⇒ `node_for(rows[0])` 变 None 或 bounds 不变。
+    #[test]
+    fn a11y_scroll_during_a_batched_first_tree_is_not_lost() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let mut inner = taffy::Style::<SmolStr>::DEFAULT;
+        inner.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::length(200.0),
+            height: taffy::style::Dimension::length(100.0),
+        };
+        inner.position = taffy::style::Position::Relative;
+        let container = mount(&mut app, move |tree, root| {
+            NodeBuilder::boxed()
+                .style(Style {
+                    inner,
+                    clip: Clip::Bounds,
+                })
+                .id("viewport")
+                .build(tree, root)
+                .expect("container")
+        });
+        // 3000 行 ⇒ 首笔 2048 节点后队列还剩 953 个未交付节点（分批运行**未结束**）。
+        let rows: Vec<NodeId> = {
+            let tree = app
+                .app_mut()
+                .window_mut(window)
+                .expect("window")
+                .tree_mut();
+            (0..3000)
+                .map(|index| {
+                    NodeBuilder::boxed()
+                        .layout_override(Rect::new(0.0, index as f32, 50.0, 10.0))
+                        .id(smol_str::format_smolstr!("row-{index}"))
+                        .build(tree, container)
+                        .expect("row")
+                })
+                .collect()
+        };
+        let handle = app
+            .app_mut()
+            .make_scroll(window, container, ScrollConfig::default())
+            .expect("scroll");
+        app.app_mut()
+            .set_scroll_content(&handle, Size::new(200.0, 4000.0))
+            .expect("content");
+
+        let _ = app.drain().expect("首帧");
+        let first = app.a11y().expect("首笔 a11y").clone();
+        assert!(first.full, "首笔必须是全树");
+        let before = first.node_for(rows[0]).expect("行 0 必须已交付").bounds;
+
+        // 分批运行中滚动：整棵子树 bounds 变化。
+        app.app_mut()
+            .scroll_to(&handle, crate::math::Point::new(0.0, 120.0))
+            .expect("scroll to");
+        let _ = app.drain().expect("滚动帧");
+        let snapshot = app.a11y().expect("滚动后必须有 a11y 交付");
+        let after = snapshot
+            .node_for(rows[0])
+            .expect("已交付行必须在滚动后重发")
+            .bounds;
+        assert_ne!(
+            before, after,
+            "滚动后已交付行的 bounds 必须更新（修前它永久停在旧位置）"
+        );
+        app.assert_a11y_contract();
+    }
+
     /// 审查 #6：写 `bind_a11y` 的信号**不得**产生任何像素（Idle、无 damage、无 PAINT）。
     #[test]
     fn a11y_bind_a11y_write_is_idle_without_damage() {

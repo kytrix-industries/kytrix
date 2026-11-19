@@ -137,7 +137,11 @@ pub(crate) struct A11yBridge {
     queue: Vec<NodeId>,
     /// `queue` 的读游标。
     queue_cursor: usize,
-    /// `queue` 的成员集合（去重；增量补充候选时用）。
+    /// **本队列里尚未交付**的候选集合（去重）。
+    ///
+    /// 语义是「当前待交付」，不是"本轮出现过"（E2）：节点一旦在本笔 `nodes` 里交付就移出，
+    /// 之后被 `mark_a11y` / 滚动子树失效重新标脏时必须能再次入队 —— 否则脏位已被
+    /// `collect_incremental` 清掉、节点又被去重挡在队列外，新值/新 bounds 永久丢失。
     queued: ahash::HashSet<NodeId>,
     /// 下一笔必须先重发的父节点（它们的 `children` 因分批暂时不完整）。
     refresh: SmallVec<[NodeId; 8]>,
@@ -472,6 +476,10 @@ impl A11yBridge {
         }
         for node in &batch {
             self.delivered.insert(*node);
+            // E2：去重只约束**未交付**候选。本笔已交付的节点必须移出 `queued`，否则它在本轮
+            // 结束前被改脏（patch / 滚动子树失效）时无法重新入队 —— `collect_incremental`
+            // 已清掉脏位，而 `queued` 会挡住重发 ⇒ 更新永久丢失，直到下一次无关落点再标记。
+            self.queued.remove(node);
         }
         // 下一笔的重发集 = 本笔因预算推迟的（P2-6）+ 本笔 `children` 被裁剪的。推迟项排在前面，
         // 保证积压在有限笔数内一定会被清空（不会因为持续新增的 re_refresh 而饿死）。
@@ -504,6 +512,7 @@ impl A11yBridge {
                     self.refresh.push(*ancestor);
                 }
                 self.delivered.insert(*ancestor);
+                self.queued.remove(ancestor);
                 focus_ancestors.push(record);
             }
         }
@@ -557,6 +566,7 @@ impl A11yBridge {
             apply_caret(record, caret);
         }
         self.delivered.insert(focus_id);
+        self.queued.remove(&focus_id);
         self.last_focus = Some(focus_id);
         let root_id = self
             .ids
@@ -583,6 +593,9 @@ impl A11yBridge {
     }
 
     /// 收集增量候选（脏位 + 滚动子树）追加到队列；清位在收集后立即做。
+    ///
+    /// `queued` 只挡**尚未交付**的重复候选（E2）：已交付节点在交付时已移出集合，因此这里对
+    /// 它再次 `insert` 会成功、追加到队尾并在后续笔重发（同一轮里一个节点可以交付多次）。
     fn collect_incremental(&mut self, tree: &mut NodeTree) {
         let mut dirty = tree.take_a11y();
         let mut fresh: SmallVec<[NodeId; 32]> = SmallVec::new();
@@ -1050,6 +1063,147 @@ mod tests {
         assert!(forced.full);
         assert!(to_tree_update(&forced).tree.is_some());
         assert!(!bridge.consumer_epoch_pending(), "两次重置一次交付即消费完");
+    }
+
+    /// E2：分批运行中给**已交付**节点标脏 ⇒ 它必须重新入队并在后续笔重发。
+    ///
+    /// 修前行为：`queued` 在整轮运行结束前都不清，已交付节点仍占着去重名额；而
+    /// `collect_incremental` 已把脏位清掉 ⇒ 新值永久丢失（滚动后的 bounds 同理会停在旧值）。
+    ///
+    /// 变异守卫：删掉 `take` 里交付后的 `self.queued.remove(node)` ⇒ 本用例红。
+    #[test]
+    fn an_update_to_an_already_delivered_node_during_a_batched_run_is_redelivered() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let mut rows = Vec::with_capacity(3000);
+        for _ in 0..3000 {
+            rows.push(NodeBuilder::boxed().build(&mut tree, root).expect("row"));
+        }
+        let mut bridge = A11yBridge::new();
+        let first = take(&mut bridge, &mut tree, None).expect("首笔");
+        assert!(first.full);
+        assert_eq!(first.nodes.len(), A11Y_BATCH_BUDGET);
+        assert!(first.node_for(rows[100]).is_some(), "首笔必须包含行 100");
+        assert!(
+            first.node_for(rows[2999]).is_none(),
+            "首笔预算 2048 ⇒ 行 2999 尚未交付"
+        );
+
+        // 运行中（队列还有 953 个未交付节点）改一个**已交付**行。
+        tree.set_a11y_patch(
+            rows[100],
+            A11yPatch {
+                label: Some(SmolStr::new_static("changed")),
+                ..A11yPatch::default()
+            },
+        );
+        tree.mark_a11y(rows[100]);
+
+        let second = take(&mut bridge, &mut tree, None).expect("第二笔");
+        assert!(!second.full, "运行中不得退化成全树");
+        assert_eq!(
+            second
+                .node_for(rows[100])
+                .expect("已交付行被改脏后必须重发（否则更新永久丢失）")
+                .label_text(),
+            Some("changed")
+        );
+        assert!(
+            second.node_for(rows[2047]).is_some(),
+            "队列照常推进：重发已交付行不得挤掉尚未交付的新节点"
+        );
+    }
+
+    /// E2：滚动（`invalidate_subtree`）失效的子树里，**已交付**的节点也必须重发。
+    ///
+    /// 真实触发：AT 接入后的分批首树 / DPI 变化期间用户滚动一次，整棵子树 bounds 全变；
+    /// 修前只有尚未交付的节点会进下一批，已交付行的 AT 高亮框/命中区域停在旧位置。
+    #[test]
+    fn a_subtree_invalidation_reaches_already_delivered_nodes() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let container = NodeBuilder::boxed().build(&mut tree, root).expect("container");
+        let mut rows = Vec::with_capacity(3000);
+        for _ in 0..3000 {
+            rows.push(
+                NodeBuilder::boxed()
+                    .build(&mut tree, container)
+                    .expect("row"),
+            );
+        }
+        let mut bridge = A11yBridge::new();
+        let first = take(&mut bridge, &mut tree, None).expect("首笔");
+        assert!(first.full);
+        assert!(first.node_for(rows[0]).is_some(), "行 0 已交付");
+        assert!(first.node_for(rows[2999]).is_none(), "行 2999 尚未交付");
+
+        // 内容整体平移（滚动容器）：整棵子树失效。
+        bridge.invalidate_subtree(container);
+
+        let second = take(&mut bridge, &mut tree, None).expect("第二笔");
+        assert!(
+            second.node_for(rows[0]).is_some(),
+            "已交付行必须在滚动后重发（否则 AT 的 bounds 永久过期）"
+        );
+        assert!(
+            second.node_for(container).is_some(),
+            "容器自身也必须重发（children 的几何来自这里）"
+        );
+    }
+
+    /// E2 压力：长批次运行期间持续给已交付节点写入，跑完后所有新值都必须生效，且批数收敛。
+    #[test]
+    fn marks_during_a_long_batched_run_are_not_starved() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let mut rows = Vec::with_capacity(5000);
+        for _ in 0..5000 {
+            rows.push(NodeBuilder::boxed().build(&mut tree, root).expect("row"));
+        }
+        let mut bridge = A11yBridge::new();
+        let first = take(&mut bridge, &mut tree, None).expect("首笔");
+        assert!(first.full);
+
+        // 运行期间改 100 个已交付行（首笔覆盖 rows[0..2046]）。
+        let mut seen: ahash::HashMap<NodeId, Option<SmolStr>> = ahash::HashMap::default();
+        for (index, row) in rows.iter().enumerate().take(100) {
+            let label = smol_str::format_smolstr!("改{index}");
+            tree.set_a11y_patch(
+                *row,
+                A11yPatch {
+                    label: Some(label.clone()),
+                    ..A11yPatch::default()
+                },
+            );
+            tree.mark_a11y(*row);
+            seen.insert(*row, Some(label));
+        }
+
+        let mut batches = 1usize;
+        while let Some(snapshot) = take(&mut bridge, &mut tree, None) {
+            batches += 1;
+            assert!(batches < 32, "批次必须收敛（实际 {batches}，疑似队列膨胀死循环）");
+            for record in &snapshot.nodes {
+                if let Some(expected) = seen.get_mut(&record.engine)
+                    && record.label_text() == expected.as_deref()
+                {
+                    *expected = None;
+                }
+            }
+        }
+        let missing: Vec<NodeId> = seen
+            .iter()
+            .filter_map(|(row, expected)| expected.as_ref().map(|_| *row))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "运行期间写入的 100 个新值必须全部送达，缺失节点：{missing:?}（共 {batches} 笔）"
+        );
+        assert!(
+            batches <= 2 * 5000_usize.div_ceil(A11Y_BATCH_BUDGET) + 8,
+            "批数必须收敛在上界内（防队列膨胀活锁），实际 {batches} 笔"
+        );
+        assert!(!bridge.pending(&tree, None), "收敛后不得残留待办");
     }
 
     /// A3（失败用例先行）：焦点节点不在本笔 `nodes` 里时，`TreeUpdate.nodes` 仍必须包含它。
