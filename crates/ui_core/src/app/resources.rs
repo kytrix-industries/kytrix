@@ -58,8 +58,20 @@ pub(crate) fn drain_events(app: &mut App) -> Vec<(WindowId, Event)> {
 /// `Event::Input` 除了进观测缓冲，还会**立刻**走一次交互分发（P10 §5.3）；观测缓冲只用于
 /// `drain_events`（应用读事件），不承担分发。缓冲是**有界**环形队列：超限丢最旧并计数
 /// （R02-5），因此应用忘记 drain 也不会无界增长。
+///
+/// **X1 引擎层模态**：目标窗口是某个打开中的模态窗口的 owner 时，`Event::Input` /
+/// `Event::Ime` 在入口处被丢弃（观测队列也不投递）—— 与 Windows 原生 `EnableWindow(owner,
+/// FALSE)` 的效果一致：被模态挡住的窗口**完全看不到**输入，而不是「看到但引擎不响应」。
+/// 系统通知类事件（`Resized`/`Moved`/`DpiChanged`/`AppearanceChanged`/`FocusChanged`/
+/// `CloseRequested`）不受影响。macOS/Linux 没有原生模态协议，靠这条引擎层路径实现用户裁决
+/// 的模态语义；Windows 同时有原生禁用，形成双保险。
 /// 消费者：`App::dispatch`。
 pub(crate) fn dispatch(app: &mut App, window: WindowId, event: Event) {
+    if matches!(event, Event::Input(_) | Event::Ime(_))
+        && super::window_set::is_input_blocked_by_modal(app, window)
+    {
+        return;
+    }
     match &event {
         Event::Input(input) => {
             app.sync_clock();

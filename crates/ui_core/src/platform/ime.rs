@@ -410,7 +410,8 @@ mod tests {
     }
 
     #[test]
-    fn clause_ranges_clamps_to_the_composition_length() {        // 越界边界夹到组合串长度；末项缺失也不越界。
+    fn clause_ranges_clamps_to_the_composition_length() {
+        // 越界边界夹到组合串长度；末项缺失也不越界。
         assert_eq!(
             clause_ranges(&[0, 2, 99], 3)
                 .into_iter()
