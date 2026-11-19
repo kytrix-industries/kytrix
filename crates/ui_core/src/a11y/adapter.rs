@@ -15,6 +15,17 @@
 //!   下一轮泵就会被交付（不节流，见 `App::a11y_pending` 的焦点旁路）；
 //! - 焦点节点若不在本批 `nodes` 里，[`build_update`] 会把它**并入同一笔**（去重），
 //!   包括"节点刚挂载、还没被任何一笔交付过"的边界。
+//!
+//! 消费端生命周期（E1）：`accesskit_*` 的激活/停用会让消费端**丢弃整棵树**。AccessKit 的契约是
+//! 「`request_initial_tree` 返回 `None` 后的第一笔必须是全树（`tree: Some`）」，否则
+//! `accesskit_consumer` 在 `Tree::new` 里 panic，或适配器永远停在 `Pending`（AT 看到空树）。
+//! 引擎用 [`A11yConsumerEpoch`] 表达"消费端已重置"：平台回调 `bump()`，[`A11yBridge::take`]
+//! 发现代际变化就把这一笔升成全树，[`A11yBridge::pending`] 因此也立即为真（不等脏位）。
+
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use accesskit::{NodeId as AkNodeId, Rect as AkRect, TreeId, TreeInfo, TreeUpdate};
 use smallvec::SmallVec;
@@ -53,6 +64,56 @@ use crate::{
 /// 硬约束（节点的父必须已在树里或同批，`children` 里的 id 必须可达）。
 pub(crate) const A11Y_BATCH_BUDGET: usize = 2048;
 
+/// 消费端树生命周期代际：**每次消费端重置整棵树时递增**（E1）。
+///
+/// 三个平台 adapter 的激活/停用回调（`ActivationHandler::request_initial_tree` /
+/// `DeactivationHandler::deactivate_accessibility`）在 AccessKit 的线程上执行，不能碰 `App`，
+/// 所以只对这份 `Arc<AtomicU64>` 做一次 `fetch_add` + 唤醒主线程；引擎在
+/// [`A11yBridge::pending`] / [`A11yBridge::take`] 里读它。
+///
+/// **为什么用代际而不是布尔旗标**：AT 可能连续重置两次（停用后立刻重新启用）；布尔旗标会在
+/// "第一次重置 → 全树交付 → 第二次重置"的到达顺序上产生竞态（清旗标与置旗标谁先谁后不可控）。
+/// 代际在 `bump` 与交付之间只要求"不相等 ⇒ 全树"：任意次数的重置最多多付一笔全树，绝不会
+/// 漏掉"重置后第一笔必须是全树"的硬约束。
+///
+/// 内存序用 `SeqCst`：平台回调与主线程之间除了这个计数器没有其它同步点（adapter 内部的
+/// 状态互斥锁保护的是 adapter 状态，不是引擎代际），代际变化必须与 `pending`/`take` 的顺序
+/// 严格一致 —— 这里不是热路径（只在 AT 接入/重连时写一次），不值得为弱内存序冒险。
+#[derive(Clone, Debug)]
+pub(crate) struct A11yConsumerEpoch(Arc<AtomicU64>);
+
+impl A11yConsumerEpoch {
+    /// 新代际（从 0 开始；`A11yBridge::new` 的初始 `seen` 也是 0）。
+    ///
+    /// **不对平台层开放构造**（RE-01）：平台 adapter 必须持有窗口 `A11yBridge` 里的**那一份**
+    /// 句柄（`App::window_a11y_epoch`），否则激活回调 `bump()` 的是另一份计数器，引擎的
+    /// `seen_consumer_epoch` 永远看不到变化 —— E1 在生产上退化成「重激活后等下一次输入才有
+    /// 树」。构造函数私有 + 无 `Default` 让「另起一份」在编译期不可写。
+    fn new() -> Self {
+        Self(Arc::new(AtomicU64::new(0)))
+    }
+
+    /// 标记消费端已重置：下一笔交付必须是全树。
+    pub(crate) fn bump(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// 当前代际。
+    pub(crate) fn current(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// 两份句柄是否指向**同一个**计数器（RE-01 的共享句柄断言用；仅测试有读者）。
+    ///
+    /// 平台 adapter 与窗口 `A11yBridge` 必须共享同一份：`same_handle == false` 时回调的
+    /// `bump()` 永远不会被引擎看到（E1 在生产上失效）。
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn same_handle(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 /// 一个窗口的 a11y 状态机（`Window.a11y`）。
 pub(crate) struct A11yBridge {
     /// 下一笔必须是全树（首次交付 / scale 变化 / 捕获开启）。
@@ -61,6 +122,10 @@ pub(crate) struct A11yBridge {
     bounds_epoch: u32,
     /// 上一笔交付时的代际。
     seen_bounds_epoch: u32,
+    /// 消费端树生命周期代际（平台 adapter 的激活/停用回调 `bump`）。
+    consumer_epoch: A11yConsumerEpoch,
+    /// 上一笔**全树**交付时看到的消费端代际；不等 ⇒ 消费端已重置、下一笔必须 full。
+    seen_consumer_epoch: u64,
     /// 内容整体平移的子树（滚动容器）：子孙 bounds 全变。
     subtrees: SmallVec<[NodeId; 2]>,
     /// 待重算 `bind_a11y` 的节点（只有 a11y 绑定的节点被写信号时入队）。
@@ -87,7 +152,11 @@ pub(crate) struct A11yBridge {
     queue: Vec<NodeId>,
     /// `queue` 的读游标。
     queue_cursor: usize,
-    /// `queue` 的成员集合（去重；增量补充候选时用）。
+    /// **本队列里尚未交付**的候选集合（去重）。
+    ///
+    /// 语义是「当前待交付」，不是"本轮出现过"（E2）：节点一旦在本笔 `nodes` 里交付就移出，
+    /// 之后被 `mark_a11y` / 滚动子树失效重新标脏时必须能再次入队 —— 否则脏位已被
+    /// `collect_incremental` 清掉、节点又被去重挡在队列外，新值/新 bounds 永久丢失。
     queued: ahash::HashSet<NodeId>,
     /// 下一笔必须先重发的父节点（它们的 `children` 因分批暂时不完整）。
     refresh: SmallVec<[NodeId; 8]>,
@@ -112,6 +181,8 @@ impl A11yBridge {
             full_pending: true,
             bounds_epoch: 0,
             seen_bounds_epoch: 0,
+            consumer_epoch: A11yConsumerEpoch::new(),
+            seen_consumer_epoch: 0,
             subtrees: SmallVec::new(),
             bindings: Vec::new(),
             binding_set: ahash::HashSet::default(),
@@ -137,6 +208,7 @@ impl A11yBridge {
     pub(crate) fn pending(&self, tree: &NodeTree, focus: Option<NodeId>) -> bool {
         self.full_pending
             || self.bounds_epoch != self.seen_bounds_epoch
+            || self.consumer_epoch_pending()
             || !self.subtrees.is_empty()
             || tree.a11y_dirty() > 0
             || self.queue_cursor < self.queue.len()
@@ -144,9 +216,42 @@ impl A11yBridge {
             || self.focus_changed(tree, focus)
     }
 
+    /// 消费端是否重置过而本次全树尚未交付（`App::a11y_pending` 的**不节流旁路**）。
+    ///
+    /// 重置后的第一笔必须立刻发：AccessKit 适配器此时停在 `Pending`，在收到全树之前 AT 看到的是
+    /// **空树**；按 100 ms 节流等下一拍没有任何意义（也没有脏位可以触发补发）。
+    pub(crate) fn consumer_epoch_pending(&self) -> bool {
+        self.consumer_epoch.current() != self.seen_consumer_epoch
+    }
+
+    /// 消费端代际句柄（`Window::a11y_consumer_epoch` 把它交给平台 adapter 的激活/停用回调）。
+    pub(crate) fn consumer_epoch(&self) -> A11yConsumerEpoch {
+        self.consumer_epoch.clone()
+    }
+
     /// 焦点是否变化且尚未交付（`App::a11y_pending` 的**不节流旁路**）。
     pub(crate) fn focus_pending(&self, tree: &NodeTree, focus: Option<NodeId>) -> bool {
         self.focus_changed(tree, focus)
+    }
+
+    /// 是否还有**已开始交付的**运行未走完的批次（`queue` 候选 / 待重发父节点；E5）。
+    ///
+    /// **不含** `full_pending` / DPI 代际（见 [`A11yBridge::rebuild_pending`]）：那是「还没开始
+    /// 交付」的重建待发，用来让 `App::a11y_pending` 在**被叫醒后**立刻交付；若把它算进
+    /// backlog，无辅助技术客户端时 `full_pending` 恒真（adapter Inactive ⇒ `a11y_take` 永不
+    /// 执行）、平台泵的 `wake_for_a11y_backlog` 会每轮自唤醒 = 单核 100% 忙等，I3「空闲零
+    /// 唤醒」失效（RE-05）。平台自唤醒只认**交付后仍真**的本函数。
+    pub(crate) fn backlog(&self) -> bool {
+        self.queue_cursor < self.queue.len() || !self.refresh.is_empty()
+    }
+
+    /// 是否有一轮**尚未开始交付**的全量重建（首树 / DPI 代际变化；E5）。
+    ///
+    /// 只用于 `App::a11y_pending` 的「被叫醒后立刻交付」不节流旁路（否则 DPI 首笔要等
+    /// 100 ms 节流）；**不参与**平台泵自唤醒判定（`wake_for_a11y_backlog` 只看
+    /// [`A11yBridge::backlog`]，RE-05 的忙等根因就是把二者混在一起）。
+    pub(crate) fn rebuild_pending(&self) -> bool {
+        self.full_pending || self.bounds_epoch != self.seen_bounds_epoch
     }
 
     /// 当前因每笔预算而**未交付**的重发父节点数（P2-6 的"未交付剩余量"指标）。
@@ -267,11 +372,16 @@ impl A11yBridge {
         self.ids.begin_delivery();
         // 表格结构可能已经变化：索引只在**一笔**内复用（同一笔的 arena 不会变）。
         self.tables.clear();
-        let full_run = self.full_pending || self.bounds_epoch != self.seen_bounds_epoch;
+        // 消费端代际只读一次：本次交付要么消费掉这次重置（升成全树），要么留给下一笔。
+        let consumer_epoch = self.consumer_epoch.current();
+        let full_run = self.full_pending
+            || self.bounds_epoch != self.seen_bounds_epoch
+            || consumer_epoch != self.seen_consumer_epoch;
         if full_run {
             // 全树：消费端会整体重置树，`delivered` 从零开始。
             self.full_pending = false;
             self.seen_bounds_epoch = self.bounds_epoch;
+            self.seen_consumer_epoch = consumer_epoch;
             self.tree_info_pending = true;
             self.delivered.clear();
             self.queue.clear();
@@ -401,6 +511,10 @@ impl A11yBridge {
         }
         for node in &batch {
             self.delivered.insert(*node);
+            // E2：去重只约束**未交付**候选。本笔已交付的节点必须移出 `queued`，否则它在本轮
+            // 结束前被改脏（patch / 滚动子树失效）时无法重新入队 —— `collect_incremental`
+            // 已清掉脏位，而 `queued` 会挡住重发 ⇒ 更新永久丢失，直到下一次无关落点再标记。
+            self.queued.remove(node);
         }
         // 下一笔的重发集 = 本笔因预算推迟的（P2-6）+ 本笔 `children` 被裁剪的。推迟项排在前面，
         // 保证积压在有限笔数内一定会被清空（不会因为持续新增的 re_refresh 而饿死）。
@@ -433,6 +547,7 @@ impl A11yBridge {
                     self.refresh.push(*ancestor);
                 }
                 self.delivered.insert(*ancestor);
+                self.queued.remove(ancestor);
                 focus_ancestors.push(record);
             }
         }
@@ -486,6 +601,7 @@ impl A11yBridge {
             apply_caret(record, caret);
         }
         self.delivered.insert(focus_id);
+        self.queued.remove(&focus_id);
         self.last_focus = Some(focus_id);
         let root_id = self
             .ids
@@ -512,6 +628,9 @@ impl A11yBridge {
     }
 
     /// 收集增量候选（脏位 + 滚动子树）追加到队列；清位在收集后立即做。
+    ///
+    /// `queued` 只挡**尚未交付**的重复候选（E2）：已交付节点在交付时已移出集合，因此这里对
+    /// 它再次 `insert` 会成功、追加到队尾并在后续笔重发（同一轮里一个节点可以交付多次）。
     fn collect_incremental(&mut self, tree: &mut NodeTree) {
         let mut dirty = tree.take_a11y();
         let mut fresh: SmallVec<[NodeId; 32]> = SmallVec::new();
@@ -553,7 +672,11 @@ fn depth_of(tree: &NodeTree, node: NodeId) -> u32 {
     depth
 }
 
-/// 用窗口的 IME 插入点提示补 `text_selection`（只在没有显式选区、且节点是可编辑文本时）。
+/// 用窗口的 IME 插入点提示补 `text_selection`（只在没有显式选区、且节点是 `TextRun` 时）。
+///
+/// E4a 契约：`text_selection` **只**挂 `TextRun`（`accesskit_consumer` 要求
+/// `TextPosition.node` 是 `Role::TextRun`，否则整段选区被静默丢弃）；输入框的 caret 提示由它的
+/// 子 TextRun 承载。
 fn apply_caret(record: &mut A11yNode, caret: Option<(NodeId, usize)>) {
     let Some((node, byte_index)) = caret else {
         return;
@@ -561,10 +684,7 @@ fn apply_caret(record: &mut A11yNode, caret: Option<(NodeId, usize)>) {
     if record.engine != node
         || record.text_selection.is_some()
         || record.character_lengths.is_empty()
-        || !matches!(
-            record.role,
-            A11yRole::TextRun | A11yRole::TextInput | A11yRole::MultilineTextInput
-        )
+        || record.role != A11yRole::TextRun
     {
         return;
     }
@@ -760,6 +880,17 @@ pub(crate) fn to_accesskit(record: &crate::a11y::A11yNode) -> accesskit::Node {
     if !record.word_starts.is_empty() {
         node.set_word_starts(record.word_starts.clone());
     }
+    // 字符度量（E4b）：`character_positions` / `character_widths` 长度必须等于
+    // `character_lengths`（AccessKit 硬约束），且只在单行 LTR 时由 a11y::tree 生成；这里再
+    // 防御一次长度（不一致时**省略**，绝不让 consumer 读到错位的 caret 表）。
+    if !record.character_positions.is_empty()
+        && record.character_positions.len() == record.character_lengths.len()
+        && record.character_widths.len() == record.character_lengths.len()
+    {
+        node.set_character_positions(record.character_positions.clone());
+        node.set_character_widths(record.character_widths.clone());
+        node.set_text_direction(accesskit::TextDirection::LeftToRight);
+    }
     if let Some(selection) = record.text_selection {
         node.set_text_selection(accesskit::TextSelection {
             anchor: accesskit::TextPosition {
@@ -907,6 +1038,230 @@ mod tests {
             full.node_for(button).expect("button").id,
             patch.node_for(button).expect("button").id
         );
+    }
+
+    /// E1：消费端重置（AT 重新激活 / adapter 停用）后，第一笔**必须是全树**，且不依赖脏位。
+    ///
+    /// 失败场景（修前）：平台激活回调拿到 `None` 后 AccessKit 停在 `Pending`；下一笔由脏位
+    /// 驱动，是增量（`tree: None`）⇒ `accesskit_consumer::Tree::new` 直接 panic；若没有脏位，
+    /// 引擎永远不交付 ⇒ AT 看到永久空树。
+    ///
+    /// 变异守卫：让 `take` 不检查 `consumer_epoch`（或 `pending` 不检查）⇒ 本用例变红。
+    #[test]
+    fn a_consumer_epoch_reset_forces_the_next_delivery_to_be_full() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let button = NodeBuilder::boxed().build(&mut tree, root).expect("button");
+        let mut bridge = A11yBridge::new();
+
+        let first = take(&mut bridge, &mut tree, None).expect("首笔");
+        assert!(first.full, "首次激活必须是全树");
+        assert!(
+            to_tree_update(&first).tree.is_some(),
+            "全树笔必须带 TreeInfo"
+        );
+
+        // 正常的增量路径先跑一笔：模拟"消费端已经有一棵树"。
+        tree.mark_a11y(button);
+        let incremental = take(&mut bridge, &mut tree, None).expect("增量");
+        assert!(!incremental.full);
+        assert!(to_tree_update(&incremental).tree.is_none());
+        assert!(!bridge.pending(&tree, None), "交付后必须无工作");
+
+        // 消费端重置：没有任何脏位，也必须立即有工作。
+        let epoch = bridge.consumer_epoch();
+        epoch.bump();
+        assert!(
+            bridge.consumer_epoch_pending(),
+            "重置后必须标记「待全树」（不依赖脏位）"
+        );
+        assert!(
+            bridge.pending(&tree, None),
+            "重置后 pending 必须为真，否则平台泵不会交付"
+        );
+
+        let forced = take(&mut bridge, &mut tree, None).expect("重置后的第一笔");
+        assert!(forced.full, "重置后的第一笔必须是全树");
+        assert!(
+            to_tree_update(&forced).tree.is_some(),
+            "AccessKit 要求重置后的首笔携带 TreeInfo（否则 consumer panic/空树）"
+        );
+        assert_eq!(forced.nodes.len(), tree.len(), "全树笔必须覆盖整棵树");
+        assert!(
+            !bridge.consumer_epoch_pending(),
+            "全树交付后重置标记必须消费掉"
+        );
+        assert!(!bridge.pending(&tree, None), "消费后不得残留待办");
+        assert!(
+            take(&mut bridge, &mut tree, None).is_none(),
+            "全树交付后无变化时不得再产出"
+        );
+    }
+
+    /// E1：连续两次重置（停用后立刻重新启用）只应付一次全树，不得重复/遗漏。
+    #[test]
+    fn two_consumer_epoch_resets_collapse_into_one_full_delivery() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let button = NodeBuilder::boxed().build(&mut tree, root).expect("button");
+        let mut bridge = A11yBridge::new();
+        let _ = take(&mut bridge, &mut tree, None).expect("首笔");
+        tree.mark_a11y(button);
+        let _ = take(&mut bridge, &mut tree, None).expect("增量");
+
+        let epoch = bridge.consumer_epoch();
+        epoch.bump();
+        epoch.bump();
+        let forced = take(&mut bridge, &mut tree, None).expect("重置后的第一笔");
+        assert!(forced.full);
+        assert!(to_tree_update(&forced).tree.is_some());
+        assert!(!bridge.consumer_epoch_pending(), "两次重置一次交付即消费完");
+    }
+
+    /// E2：分批运行中给**已交付**节点标脏 ⇒ 它必须重新入队并在后续笔重发。
+    ///
+    /// 修前行为：`queued` 在整轮运行结束前都不清，已交付节点仍占着去重名额；而
+    /// `collect_incremental` 已把脏位清掉 ⇒ 新值永久丢失（滚动后的 bounds 同理会停在旧值）。
+    ///
+    /// 变异守卫：删掉 `take` 里交付后的 `self.queued.remove(node)` ⇒ 本用例红。
+    #[test]
+    fn an_update_to_an_already_delivered_node_during_a_batched_run_is_redelivered() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let mut rows = Vec::with_capacity(3000);
+        for _ in 0..3000 {
+            rows.push(NodeBuilder::boxed().build(&mut tree, root).expect("row"));
+        }
+        let mut bridge = A11yBridge::new();
+        let first = take(&mut bridge, &mut tree, None).expect("首笔");
+        assert!(first.full);
+        assert_eq!(first.nodes.len(), A11Y_BATCH_BUDGET);
+        assert!(first.node_for(rows[100]).is_some(), "首笔必须包含行 100");
+        assert!(
+            first.node_for(rows[2999]).is_none(),
+            "首笔预算 2048 ⇒ 行 2999 尚未交付"
+        );
+
+        // 运行中（队列还有 953 个未交付节点）改一个**已交付**行。
+        tree.set_a11y_patch(
+            rows[100],
+            A11yPatch {
+                label: Some(SmolStr::new_static("changed")),
+                ..A11yPatch::default()
+            },
+        );
+        tree.mark_a11y(rows[100]);
+
+        let second = take(&mut bridge, &mut tree, None).expect("第二笔");
+        assert!(!second.full, "运行中不得退化成全树");
+        assert_eq!(
+            second
+                .node_for(rows[100])
+                .expect("已交付行被改脏后必须重发（否则更新永久丢失）")
+                .label_text(),
+            Some("changed")
+        );
+        assert!(
+            second.node_for(rows[2047]).is_some(),
+            "队列照常推进：重发已交付行不得挤掉尚未交付的新节点"
+        );
+    }
+
+    /// E2：滚动（`invalidate_subtree`）失效的子树里，**已交付**的节点也必须重发。
+    ///
+    /// 真实触发：AT 接入后的分批首树 / DPI 变化期间用户滚动一次，整棵子树 bounds 全变；
+    /// 修前只有尚未交付的节点会进下一批，已交付行的 AT 高亮框/命中区域停在旧位置。
+    #[test]
+    fn a_subtree_invalidation_reaches_already_delivered_nodes() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let container = NodeBuilder::boxed()
+            .build(&mut tree, root)
+            .expect("container");
+        let mut rows = Vec::with_capacity(3000);
+        for _ in 0..3000 {
+            rows.push(
+                NodeBuilder::boxed()
+                    .build(&mut tree, container)
+                    .expect("row"),
+            );
+        }
+        let mut bridge = A11yBridge::new();
+        let first = take(&mut bridge, &mut tree, None).expect("首笔");
+        assert!(first.full);
+        assert!(first.node_for(rows[0]).is_some(), "行 0 已交付");
+        assert!(first.node_for(rows[2999]).is_none(), "行 2999 尚未交付");
+
+        // 内容整体平移（滚动容器）：整棵子树失效。
+        bridge.invalidate_subtree(container);
+
+        let second = take(&mut bridge, &mut tree, None).expect("第二笔");
+        assert!(
+            second.node_for(rows[0]).is_some(),
+            "已交付行必须在滚动后重发（否则 AT 的 bounds 永久过期）"
+        );
+        assert!(
+            second.node_for(container).is_some(),
+            "容器自身也必须重发（children 的几何来自这里）"
+        );
+    }
+
+    /// E2 压力：长批次运行期间持续给已交付节点写入，跑完后所有新值都必须生效，且批数收敛。
+    #[test]
+    fn marks_during_a_long_batched_run_are_not_starved() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let mut rows = Vec::with_capacity(5000);
+        for _ in 0..5000 {
+            rows.push(NodeBuilder::boxed().build(&mut tree, root).expect("row"));
+        }
+        let mut bridge = A11yBridge::new();
+        let first = take(&mut bridge, &mut tree, None).expect("首笔");
+        assert!(first.full);
+
+        // 运行期间改 100 个已交付行（首笔覆盖 rows[0..2046]）。
+        let mut seen: ahash::HashMap<NodeId, Option<SmolStr>> = ahash::HashMap::default();
+        for (index, row) in rows.iter().enumerate().take(100) {
+            let label = smol_str::format_smolstr!("改{index}");
+            tree.set_a11y_patch(
+                *row,
+                A11yPatch {
+                    label: Some(label.clone()),
+                    ..A11yPatch::default()
+                },
+            );
+            tree.mark_a11y(*row);
+            seen.insert(*row, Some(label));
+        }
+
+        let mut batches = 1usize;
+        while let Some(snapshot) = take(&mut bridge, &mut tree, None) {
+            batches += 1;
+            assert!(
+                batches < 32,
+                "批次必须收敛（实际 {batches}，疑似队列膨胀死循环）"
+            );
+            for record in &snapshot.nodes {
+                if let Some(expected) = seen.get_mut(&record.engine)
+                    && record.label_text() == expected.as_deref()
+                {
+                    *expected = None;
+                }
+            }
+        }
+        let missing: Vec<NodeId> = seen
+            .iter()
+            .filter_map(|(row, expected)| expected.as_ref().map(|_| *row))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "运行期间写入的 100 个新值必须全部送达，缺失节点：{missing:?}（共 {batches} 笔）"
+        );
+        assert!(
+            batches <= 2 * 5000_usize.div_ceil(A11Y_BATCH_BUDGET) + 8,
+            "批数必须收敛在上界内（防队列膨胀活锁），实际 {batches} 笔"
+        );
+        assert!(!bridge.pending(&tree, None), "收敛后不得残留待办");
     }
 
     /// A3（失败用例先行）：焦点节点不在本笔 `nodes` 里时，`TreeUpdate.nodes` 仍必须包含它。

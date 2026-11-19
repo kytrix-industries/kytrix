@@ -68,10 +68,11 @@ use crate::{
 /// a11y 诊断的环形容量（与 `text_diagnostics` 同口径：超出丢最旧）。
 const A11Y_DIAGNOSTIC_CAPACITY: usize = 64;
 
-/// a11y 交付的最小间隔（按窗口；P2-6）。
+/// a11y 交付的最小间隔（按窗口；P2-6 / E5）。
 ///
-/// 100 ms 对应 10 Hz：屏幕阅读器自身也消化不了更快的变化，而实时行情会让 A11Y`r
-/// 脏位每帧为真 —— 不限流时每帧都要全树扫描并构造 TreeUpdate。
+/// 100 ms 对应 10 Hz：屏幕阅读器自身也消化不了更快的变化，而实时行情会让 A11Y 脏位每帧为真。
+/// **只约束「已接入后」的高频数据增量**（E5）：首树 / DPI 全量重建的分批（[`A11yBridge::backlog`]）
+/// 与焦点变化、消费端重置一样走不节流旁路 —— 否则 40k 节点的 20 批首树会被拖成 ≈2 s。
 const A11Y_THROTTLE: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// 一次样式求值 pass 的结果（P06 的 `FrameRecord` 会复用这些字段）。
@@ -172,6 +173,10 @@ pub struct App {
     /// TreeUpdate 构造。按窗口限流到 A11Y_THROTTLE 一次，屏幕阅读器本身也消化不了
     /// 更快的变化。Assertive live region 同样受此限制（≤100ms 延迟，可接受）。
     a11y_delivered: ahash::HashMap<WindowId, Instant>,
+    /// **本轮泵**是否真的交付过一笔 a11y（`a11y_take` 产出过快照才置位；平台泵的
+    /// `wake_for_a11y_backlog` 消费并清零）。无 AT 客户端 / 无测试捕获时恒 false ⇒ 泵绝不
+    /// 因 a11y backlog 自唤醒（RE-05 / I3 空闲零唤醒）。
+    a11y_delivered_round: bool,
     /// 最近一次点击（双击判定）。
     last_click: Option<ClickRecord>,
     /// 动画槽（P10；`tick_animations` 推进，结束时删槽）。
@@ -428,6 +433,7 @@ impl App {
             thresholds: InputThresholds::platform_default(),
             clock: Instant::now(),
             a11y_delivered: ahash::HashMap::default(),
+            a11y_delivered_round: false,
             last_click: None,
             animations: Vec::new(),
             next_animation: 1,
@@ -1788,6 +1794,18 @@ impl App {
         a11y::a11y_pending(self, window)
     }
 
+    /// 建窗路径的 a11y 消费端代际句柄（三端唯一入口；RE-01）。
+    ///
+    /// 与窗口 `A11yBridge` 的 `consumer_epoch` 是**同一份** `Arc`：平台 adapter 的激活/停用
+    /// 回调 bump 它，引擎才能观察到「消费端已重置」并把下一笔升成全树。`None` = 窗口不存在。
+    #[must_use]
+    pub(crate) fn window_a11y_epoch(
+        &self,
+        window: WindowId,
+    ) -> Option<crate::a11y::adapter::A11yConsumerEpoch> {
+        a11y::window_a11y_epoch(self, window)
+    }
+
     /// 是否有窗口「a11y 脏但正被限流」——平台泵据此安排**到期补发**唤醒。
     ///
     /// 没有这条，被限流挡下的最后一次变化永远不会交付：脏位留着，但没有任何机制在
@@ -1796,6 +1814,20 @@ impl App {
         a11y::a11y_retry_pending(self)
     }
 
+    /// 是否还有未交付的 a11y 批次（分批首树/DPI 全量重建未走完；不节流旁路，E5）。
+    #[must_use]
+    pub(crate) fn a11y_backlog_pending(&self) -> bool {
+        a11y::a11y_backlog_pending(self)
+    }
+
+    /// 本轮泵交付过 a11y 且仍有未走完的批次时唤醒平台泵
+    /// （三端唯一入口；E5/RE-04/RE-05）。
+    pub(crate) fn wake_for_a11y_backlog(
+        &mut self,
+        dispatcher: &crate::platform::dispatcher::Dispatcher,
+    ) {
+        a11y::wake_for_a11y_backlog(self, dispatcher)
+    }
     /// 产出一笔 a11y 交付（消费 `A11Y` 反向集合与 `full_pending`）。
     ///
     /// **必须在 `accesskit_windows::Adapter::update_if_active` 的闭包里调用**（adapter 不活跃时

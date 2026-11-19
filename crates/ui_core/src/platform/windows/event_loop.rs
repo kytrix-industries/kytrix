@@ -125,6 +125,7 @@ impl WndProcState {
         hwnd: HWND,
         window: WindowId,
         driver: Option<Rc<ResizeFrameDriver>>,
+        a11y_consumer_epoch: crate::a11y::adapter::A11yConsumerEpoch,
     ) -> Result<Self, EngineError> {
         let dpi = dpi::window_dpi(hwnd);
         let scale = dpi::scale_from_dpi(dpi).ok_or(EngineError::InvalidDpiScale {
@@ -143,7 +144,7 @@ impl WndProcState {
             mouse_tracking: false,
             // **必须在窗口显示之前构造**：`Adapter::new` 内部 `init_uia()`，
             // 且不得在处理 `WM_GETOBJECT` 时构造（adapter.rs:411-441）。
-            a11y: WindowsA11y::new(hwnd, dispatcher, window)?,
+            a11y: WindowsA11y::new(hwnd, dispatcher, window, a11y_consumer_epoch)?,
             suppress_capture_cancel: false,
             cursor: crate::paint::style::Cursor::Default,
             size_move: false,

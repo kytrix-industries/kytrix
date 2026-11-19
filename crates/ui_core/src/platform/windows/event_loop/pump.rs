@@ -426,7 +426,13 @@ pub(crate) fn run(mut app: App) -> Result<(), EngineError> {
     let app = Rc::new(RefCell::new(app));
     let mut windows: Vec<NativeWindow> = Vec::with_capacity(requests.len());
     for (id, options) in requests {
-        let mut native = NativeWindow::create(id, &options, dispatcher.clone(), Some(&app))?;
+        // RE-01：adapter 必须持有窗口 `A11yBridge` 的**那一份**消费端代际（唯一入口
+        // `App::window_a11y_epoch`）；AT 重激活时平台回调 bump 它 ⇒ 引擎下一笔全树。
+        let Some(a11y_epoch) = app.borrow().window_a11y_epoch(id) else {
+            continue;
+        };
+        let mut native =
+            NativeWindow::create(id, &options, dispatcher.clone(), Some(&app), a11y_epoch)?;
         let client = native.client_size();
         let renderer = Renderer::new_for_hwnd(native.composition(), client, options.background)?;
         // A5：帧预算的刷新率提示（窗口所在 output；查询失败 ⇒ 门禁保持禁用）。
@@ -898,6 +904,12 @@ pub(super) fn pump_loop(
                 native.sync_ime_cursor_area(&app);
             }
         }
+        // E5 / RE-04 / RE-05：**本轮确实交付过** a11y 且仍有未走完的批次 ⇒ 立刻唤醒下一轮泵
+        // （无 AT 客户端时 adapter Inactive、无交付 ⇒ 绝不 wake，I3 空闲零唤醒）。判定 + wake
+        // 收敛在 `App::wake_for_a11y_backlog`（App 层测试 + 真机 idle 覆盖）。
+        app_cell
+            .borrow_mut()
+            .wake_for_a11y_backlog(dispatcher.as_ref());
 
         // ⑤ 跨线程回投的任务。
         for task in dispatcher.drain_tasks() {
