@@ -23,6 +23,10 @@
 //!   判据在 [`crate::platform::wayland::text_input`]）。
 //! - **seat 能力撤销要 `release()`**（R10-8）：直接丢代理会让服务端继续往已释放的 id 发事件，
 //!   那是协议错误（断连）。
+//! - **组合期不投递裸键**（B4）：Linux 没有同步的「按键被 IME 消费」信号（`zwp_text_input_v3`
+//!   的结果是异步批次），以**已有 preedit** 为判据不投递裸 `Key`（Ctrl/Alt/Meta 命令组合
+//!   豁免）。判据在 [`crate::platform::wayland::input::key_visible_while_composing`]（Windows
+//!   可单测），首键启动组合的残余风险见 `translate_key` 文档。
 //!
 //! 缩放（V-110 / V-122 ④）：
 //! - **fractional**：`wp_viewporter` 与 `wp_fractional_scale_manager_v1` **同时**存在时才启用
@@ -1409,6 +1413,23 @@ impl WaylandState {
     /// 协议只保证单调、原点未定义，无法与 `Instant` 对齐（P3-4：旧注释写成「事件时刻」，
     /// 与调用点 `Instant::now()` 相反）。
     /// `repeat` 由调用方明确给出（R02-2）：真实按下为 `false`，客户端合成的重复为 `true`。
+    ///
+    /// # 组合期不投递裸键（B4）
+    ///
+    /// macOS 在 `keyDown:` 里能**同步**拿到 `inputContext.handleEvent` 的权威消费标记，Win32
+    /// 在组合期把按键换成 `VK_PROCESSKEY`；Wayland 两者都没有 —— `zwp_text_input_v3` 的结果是
+    /// **异步批次**（`done` 之后才生效），按键到达时客户端无法知道这一键是否会被输入法消费。
+    /// 因此判据只能取**已有 preedit**（`WindowSurface::ime` 的 `composing()`），可见性判定在
+    /// [`crate::platform::wayland::input::key_visible_while_composing`]（Windows 可单测）：
+    /// 组合中的裸 `Key` 不投递（否则组合里的字母/数字会命中应用的裸键绑定）；带
+    /// Ctrl/Alt/Meta 的命令组合始终投递（`Ctrl+W` 不能被吞），Shift 不算命令修饰键。
+    ///
+    /// **残余风险（与 audit §4 一致）**：首键启动组合时 preedit 尚不存在 ⇒ 该键仍会以裸
+    /// `Key` 投递一次。协议不提供同步的消费信号，客户端无法消除这个竞态；文本/IME 通路
+    /// （`Text` 走 `should_emit_text` + `TextInputRoute::takes_text()`，B9）不受影响。
+    ///
+    /// `composing` **必须**在 push `Key` 之前取：旧实现取在 push 之后，于是组合期的裸键
+    /// 无论 preedit 状态如何都先被投递（本项修复的核心偏差）。
     fn translate_key(&mut self, key: u32, state: KeyState, repeat: bool, timestamp: Instant) {
         let Some(xkb_state) = self.xkb_state.as_mut() else {
             return;
@@ -1419,17 +1440,21 @@ impl WaylandState {
         let keycode = xkb::Keycode::new(key);
         // seat 事件没有 surface 归属：派发给**焦点窗口**（active）。
         let window = self.windows[self.active].id;
-        self.events.push((
-            window,
-            Event::Input(InputEvent::Key {
-                // R02-1：物理键身份取自 **evdev 码**（布局无关），不是 keysym（布局相关）。
-                code: key_code(key.saturating_sub(8)),
-                state,
-                repeat,
-                modifiers: self.modifiers,
-                timestamp,
-            }),
-        ));
+        // B4：先取组合态，再按可见性决定是否投递裸 `Key`（首键启动组合的残余风险见函数文档）。
+        let composing = self.windows[self.active].ime.composing();
+        if input::key_visible_while_composing(self.modifiers, composing) {
+            self.events.push((
+                window,
+                Event::Input(InputEvent::Key {
+                    // R02-1：物理键身份取自 **evdev 码**（布局无关），不是 keysym（布局相关）。
+                    code: key_code(key.saturating_sub(8)),
+                    state,
+                    repeat,
+                    modifiers: self.modifiers,
+                    timestamp,
+                }),
+            ));
+        }
         // R10-2：文本是否**只**走 IME 由 `TextInputRoute` 决定 —— `enable` 之后 1.5 s 内没有
         // 任何 IM 事件就降级回键盘通路（否则没有输入法守护进程的 compositor 上字符输入全灭）。
         // 组合态（preedit 非空）里物理按键不产生正文：组合串由 `ImeEvent::Preedit` 表达。
@@ -1438,7 +1463,6 @@ impl WaylandState {
         // （服务端从不重发 `key` 事件），字符文本也只能由客户端按每次重复生成；旧实现写成
         // `!repeat` ⇒ 在默认的 XKB 回退通路里按住可打印键只输入一个字符。判据统一走
         // `should_emit_text`（含单测），`repeat` 只影响绑定/动作派发。
-        let composing = self.windows[self.active].ime.composing();
         let ime_takes_text = self.text_input_route.takes_text();
         // R10-5：Ctrl / Alt / Super 组合不产生字符（`key_get_utf8` 不看这些修饰键，
         // `Ctrl+C` 会拿到 "c"）。Shift 与 AltGr（Mod5，`Modifiers` 无对应位）不受影响。
