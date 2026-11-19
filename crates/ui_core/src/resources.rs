@@ -102,7 +102,7 @@ use crate::{
     render::{DirtyRects, ImageAtlasPager},
     resources::{
         cache::{ContentKey, DedupeEntry, Entry, Page, VariantEntry},
-        image::{DecodedImage, SourceColor},
+        image::{DecodedImage, MAX_TILE_DIM, SourceColor},
     },
     window::WindowId,
 };
@@ -450,6 +450,52 @@ pub struct ResourceCache {
     /// 仅测试：已真正开始解码的 blocking 任务数（证明准入拒绝**没有投递**）。
     #[cfg(test)]
     decode_starts: Arc<std::sync::atomic::AtomicUsize>,
+    /// 仅测试：下一次 blocking 解码注入 panic（RD-1：验证 panic 完成路径仍交付+唤醒）。
+    #[cfg(test)]
+    panic_decode_next: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// RD-1：解码 worker 的交付 guard。
+///
+/// `image::decode` 对恶意/畸形资产 panic（unwind 构建）时，`oneshot::Sender` 会随闭包展开被
+/// drop —— 旧实现此时既不 `send` 也不 `wake()`：纯空闲 UI 不会再 `poll`，预留解码预算与源字节
+/// 滞留，后续 `insert_async` 可能被 ByteBudget 永久拒绝。guard 在 `Drop` 里补齐「投递失败结果 +
+/// 唤醒泵」，保证「完成/失败必须在有限轮次交付」的契约；正常路径先 `deliver` 结果，`Drop`
+/// 只负责 `wake`（幂等电平位）。
+struct DecodeGuard {
+    sender: Option<oneshot::Sender<Result<DecodedImage, DecodeCause>>>,
+    dispatcher: Arc<Dispatcher>,
+}
+
+impl DecodeGuard {
+    fn new(
+        sender: oneshot::Sender<Result<DecodedImage, DecodeCause>>,
+        dispatcher: Arc<Dispatcher>,
+    ) -> Self {
+        Self {
+            sender: Some(sender),
+            dispatcher,
+        }
+    }
+
+    fn deliver(&mut self, result: Result<DecodedImage, DecodeCause>) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(result);
+        }
+    }
+}
+
+impl Drop for DecodeGuard {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(Err(DecodeCause::Corrupt {
+                format: SmolStr::new_static("decode"),
+                detail: SmolStr::new_static("decode worker panicked before delivering a result"),
+            }));
+        }
+        // D-6/RD-1：无论正常、失败还是 panic 完成，都必须唤醒泵。
+        self.dispatcher.wake();
+    }
 }
 
 /// 一个在途的异步解码任务。
@@ -505,6 +551,8 @@ impl ResourceCache {
             color_fallback: 0,
             #[cfg(test)]
             decode_starts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            panic_decode_next: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -523,7 +571,9 @@ impl ResourceCache {
         cache.byte_budget = byte_budget;
         cache.pager = ImageAtlasPager::with_page_for_test(page.0);
         cache.pager.preopen_page_for_test();
-        cache.page_buffers.push(Some(Page::new(page.0, page.1)));
+        cache.page_buffers.push(Some(
+            Page::new(page.0, page.1).expect("测试页缓冲分配（小页）不应失败"),
+        ));
         cache
             .page_generations
             .push(cache.pager.generation(0).unwrap_or(1));
@@ -744,23 +794,40 @@ impl ResourceCache {
         let dispatcher = Arc::clone(&self.dispatcher);
         #[cfg(test)]
         let decode_starts = Arc::clone(&self.decode_starts);
+        #[cfg(test)]
+        let panic_decode_next = Arc::clone(&self.panic_decode_next);
         runtime.spawn(async move {
             // 并发许可在 async 任务里等（**不**占 blocking 线程）；拿到才真正投解码。
-            // 信号量只被本 cache 的解码任务共享，永不 close；拿不到只可能是防御性路径：
-            // 返回会 drop `sender`，`poll` 的 `TryRecvError::Closed` 会把预留归还。
-            let Ok(permit) = semaphore.acquire_owned().await else {
-                return;
+            // 信号量只被本 cache 的解码任务共享，永不 close；拿不到是防御性路径，但同样必须
+            // 交付失败并唤醒泵（RD-1：否则结果/预留永久滞留）。
+            let permit = match semaphore.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let _ = sender.send(Err(DecodeCause::Corrupt {
+                        format: SmolStr::new_static("decode"),
+                        detail: SmolStr::new_static(
+                            "decode concurrency semaphore closed unexpectedly",
+                        ),
+                    }));
+                    dispatcher.wake();
+                    return;
+                }
             };
             blocking_runtime.spawn_blocking(move || {
                 // 许可活到解码结束（`_permit` 是绑定而不是 `_`，drop 在闭包末尾）。
                 let _permit = permit;
+                // RD-1：guard 必须在任何可能 panic 的代码之前构造，保证 unwind 路径也投递
+                // Failed 并唤醒泵。
+                let mut guard = DecodeGuard::new(sender, dispatcher);
                 #[cfg(test)]
-                decode_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let _ = sender.send(image::decode(&source, decode_target));
-                // D-6：解码完成唤醒平台泵 —— 空闲时泵阻塞在 GetMessageW/poll，不唤醒就永远不会
-                // 有下一次 `poll()`，结果、源字节与已解码 BGRA 会一直挂着。
-                // `wake` 幂等合并（Dispatcher 的电平位），批量解码不会打满消息队列。
-                dispatcher.wake();
+                {
+                    if panic_decode_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        panic!("injected decode worker panic (RD-1 test seam)");
+                    }
+                    decode_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                let result = image::decode(&source, decode_target);
+                guard.deliver(result);
             });
         });
         self.push_pending(PendingJob {
@@ -989,18 +1056,23 @@ impl ResourceCache {
         height: u32,
         source_len: usize,
     ) -> Result<u64, DecodeCause> {
-        // 预算口径必须包含图片页：页是懒分配的，准入时若还没有页，按**一页**的缓冲预留
-        // （与旧 `ensure_page` 的语义一致：单张合法图不会被自己的页成本误拒）；多页时已开的
-        // 页都计入 `used_bytes()`。
+        // RD-2：预算口径必须包含**本次解码可能新开的一页** CPU 缓冲。旧实现只在
+        // `page_count()==0` 时预留一页：已开页后 `place` 仍可能再开新页（每页 16 MiB），
+        // 最多超出预算 3 页（48 MiB）。这里用保守的最终尺寸估算（源尺寸 clamp 到
+        // `MAX_TILE_DIM`；等比 fit 只会更小）判断是否会新开页，并把页字节一起记进预留
+        // （交付时归还）——这样 `used_bytes()`（含预留）在任何时刻都 ≤ byte_budget。
         let (page_width, page_height) = self.page_dimensions();
         let page_bytes = u64::from(page_width) * u64::from(page_height) * 4;
-        let pending_page_bytes = if self.pager.page_count() == 0 {
+        let estimated_content = (width.min(MAX_TILE_DIM), height.min(MAX_TILE_DIM));
+        let pending_page_bytes = if self.pager.would_open_new_page(estimated_content) {
             page_bytes
         } else {
             0
         };
-        let reservation = image::estimate_peak(width, height).saturating_add(source_len as u64);
-        let used = self.used_bytes().saturating_add(pending_page_bytes);
+        let reservation = image::estimate_peak(width, height)
+            .saturating_add(source_len as u64)
+            .saturating_add(pending_page_bytes);
+        let used = self.used_bytes();
         if used.saturating_add(reservation) <= self.byte_budget {
             self.reserved_decode_bytes = self.reserved_decode_bytes.saturating_add(reservation);
             return Ok(reservation);
@@ -1060,8 +1132,18 @@ impl ResourceCache {
                 self.page_buffers.resize_with(page_index + 1, || None);
                 self.page_generations.resize(page_index + 1, 0);
             }
-            self.page_buffers[page_index] = Some(Page::new(page_width, page_height));
-            self.page_generations[page_index] = generation;
+            // RD-2：页缓冲分配失败映射 `OutOfMemory` 且**回滚**已拿到的图集分配，
+            // 不改变既有条目/代际。
+            match Page::new(page_width, page_height) {
+                Ok(buffer) => {
+                    self.page_buffers[page_index] = Some(buffer);
+                    self.page_generations[page_index] = generation;
+                }
+                Err(cause) => {
+                    self.pager.deallocate(page, allocation.id);
+                    return Err(cause);
+                }
+            }
         }
         let buffer = self.page_buffers[page_index]
             .as_mut()
@@ -1087,6 +1169,15 @@ impl ResourceCache {
         self.used_pixels = self
             .used_pixels
             .saturating_add(u64::from(width) * u64::from(height));
+        // RD-2 预算不变量：页缓冲在 `place` 里才真正计入 `used_bytes()`；准入阶段已按
+        // `would_open_new_page` 把这一页的字节算进预留，因此此刻（本任务预留已归还）的
+        // `used_bytes()`（含其它在途预留）必须仍 ≤ 预算。
+        debug_assert!(
+            self.used_bytes() <= self.byte_budget,
+            "RD-2 预算不变量被破坏：used={} budget={}",
+            self.used_bytes(),
+            self.byte_budget
+        );
         Ok(self
             .entries
             .get(id)
@@ -1606,35 +1697,60 @@ mod tests {
         assert_eq!(rects.chunks(2048, 4).count(), 1, "折叠结果是单个 bbox 矩形");
     }
 
-    /// D-9：活 tile 永不淘汰；只有**已空**的页按 LRU 回收复用（页号保持稳定）。
+    /// D-9/RD-3：活 tile 永不淘汰；只有**已空**的页按 LRU 回收复用（页号保持稳定），
+    /// 且必须精确按「最久未用」顺序（8² 页 + 6² 内容 = 每页恰好一块，顺序可观测）。
     #[test]
     fn empty_pages_are_recycled_lru() {
         let mut cache = ResourceCache::with_page_for_test((8, 8));
         let (images, _source, _error) = fill_until_capacity(&mut cache);
         assert_eq!(cache.stats().pages, usize::from(MAX_IMAGE_PAGES));
-        // 选一个非 0 页的 tile 释放，让它的页成为唯一空闲页。
-        let victim = images
+        let page1 = images
             .iter()
             .find(|image| image.tile.page == 1)
             .copied()
             .expect("page 1 must be used");
-        assert!(cache.unload(victim.id));
-        let new_image = cache
+        let page2 = images
+            .iter()
+            .find(|image| image.tile.page == 2)
+            .copied()
+            .expect("page 2 must be used");
+        // 先释放页 1（更久未用），再释放页 2（更新）⇒ LRU 必须先用页 1、再用页 2。
+        assert!(cache.unload(page1.id));
+        assert!(cache.unload(page2.id));
+        let recycled_first = cache
             .insert(&png(6, 6, [9, 9, 9, 255]))
             .expect("已空页必须被回收复用");
         assert_eq!(
-            new_image.tile.page, victim.tile.page,
-            "已空页必须被回收复用（页号稳定）"
+            recycled_first.tile.page, 1,
+            "必须精确回收最久未用的空页（页 1），而不是任意空页"
         );
+        assert_ne!(
+            recycled_first.tile.generation, page1.tile.generation,
+            "回收复用必须换代"
+        );
+        let recycled_second = cache
+            .insert(&png(6, 6, [10, 10, 10, 255]))
+            .expect("第二个空页");
+        assert_eq!(recycled_second.tile.page, 2, "其次回收较近变空的页 2");
         assert_eq!(
             cache.stats().pages,
             usize::from(MAX_IMAGE_PAGES),
             "回收复用不得增加页数"
         );
-        assert_ne!(
-            new_image.tile.generation, victim.tile.generation,
-            "回收复用必须换代"
+        // 使用中保护：页 0/3 仍有活 tile；4 页均已无空闲（每页一块）⇒ 再插入必须失败，
+        // 且失败不得回收仍被引用的页。
+        let error = decode_cause(insert_error(&mut cache, &png(6, 6, [11, 11, 11, 255])));
+        assert!(
+            matches!(
+                &error,
+                DecodeCause::Capacity {
+                    cause: CapacityCause::PageFull,
+                    ..
+                }
+            ),
+            "页全满时必须 PageFull：{error:?}"
         );
+        assert_eq!(cache.len(), 4, "活 tile 不得被淘汰");
     }
 
     /// D-9：每页有独立的 CPU 页缓冲与脏矩形（多页上传的数据面）。
@@ -1966,6 +2082,54 @@ mod tests {
         let second = cache.insert(&second_bytes).expect("unload 之后预算有空间");
         assert_ne!(second.id, first.id);
         assert_eq!(cache.stats().capacity_errors, 1, "成功插入不再累计失败");
+    }
+
+    /// RD-2：**新开页**也必须走解码前预算准入（旧实现只在页数=0 时预留一页，已开页后再开
+    /// 新页可让 `used_bytes` 超出预算最多 3 页 = 48 MiB）。这里用 16² 页 + 14² 内容（每页恰好
+    /// 一块）构造：第 2 页允许、第 3 页在**解码前**被 ByteBudget 拒绝，且不变量 `used ≤ budget` 恒成立。
+    #[test]
+    fn new_page_allocation_is_admitted_by_the_byte_budget() {
+        let page_bytes = 16u64 * 16 * 4;
+        let first_bytes = png(14, 14, [10, 20, 30, 255]);
+        let second_bytes = png(14, 14, [40, 50, 60, 255]);
+        let third_bytes = png(14, 14, [70, 80, 90, 255]);
+        let source = |bytes: &[u8]| bytes.len() as u64;
+        // 预算 = 2 页 + 一次峰值估算 + 一份源字节 + 半页余量：第 2 张允许，第 3 张拒绝。
+        let budget = page_bytes * 2
+            + super::image::estimate_peak(14, 14)
+            + source(&first_bytes)
+            + page_bytes / 2;
+        let mut cache = ResourceCache::for_test((16, 16), budget, None);
+        assert_eq!(cache.stats().pages, 1, "测试构造预开第 0 页");
+
+        let first = cache.insert(&first_bytes).expect("第一张（复用预开页）");
+        assert_eq!(first.tile.page, 0);
+        assert!(cache.stats().used_bytes <= budget);
+
+        let second = cache.insert(&second_bytes).expect("第二张必须被准入到新页");
+        assert_eq!(second.tile.page, 1, "第二张必须落在新开的第 2 页");
+        assert_eq!(cache.stats().pages, 2);
+        assert!(
+            cache.stats().used_bytes <= budget,
+            "开新页后 used_bytes 仍必须 ≤ 预算：{} > {budget}",
+            cache.stats().used_bytes
+        );
+
+        let error = decode_cause(insert_error(&mut cache, &third_bytes));
+        assert!(
+            matches!(
+                &error,
+                DecodeCause::Capacity {
+                    cause: CapacityCause::ByteBudget { .. },
+                    ..
+                }
+            ),
+            "第 3 页必须由字节预算在解码前拒绝：{error:?}"
+        );
+        assert_eq!(cache.stats().pages, 2, "被拒的插入不得开页");
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.reserved_decode_bytes, 0, "准入失败不得留下预留");
+        assert!(cache.stats().used_bytes <= budget);
     }
 
     #[test]
@@ -2350,6 +2514,37 @@ mod tests {
         assert_eq!(delivered[0].0, pending);
         assert_eq!(delivered[0].1, state);
         assert!(cache.poll().is_empty(), "交付后不得重复");
+    }
+
+    /// RD-1：worker panic（unwind 构建）也必须投递 `Failed(Corrupt)` 并唤醒泵、归还预留——
+    /// 旧实现只在 `sender.send` 之后 `wake`，panic 时两者都不发生，纯空闲 UI 会永久滞留。
+    #[test]
+    fn decode_worker_panic_delivers_failure_and_wakes() {
+        let runtime = runtime();
+        let mut cache = ResourceCache::for_test(
+            (16, 16),
+            DEFAULT_BYTE_BUDGET,
+            Some(runtime.handle().clone()),
+        );
+        let _ = cache.take_dirty_rects();
+        let _ = cache.dispatcher.take_frame_wake();
+        cache
+            .panic_decode_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let pending = cache.insert_async(Bytes::from(png(4, 4, [7, 8, 9, 255])));
+        assert_eq!(cache.state(pending), DecodeState::Pending);
+
+        let state = poll_until(&mut cache, pending);
+        assert!(
+            matches!(state, DecodeState::Failed(DecodeCause::Corrupt { .. })),
+            "worker panic 必须交付 Failed(Corrupt)：{state:?}"
+        );
+        assert_eq!(cache.reserved_decode_bytes, 0, "panic 完成必须归还预留");
+        assert!(
+            cache.dispatcher.take_frame_wake(),
+            "panic 完成必须唤醒平台泵（否则结果/预留滞留）"
+        );
+        assert!(cache.poll().is_empty(), "失败结果只交付一次");
     }
 
     /// D-11：在途解码预留从准入保持到 poll 交付；交付后归还，下一张才能插入。

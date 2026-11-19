@@ -20,7 +20,7 @@ use bytes::Bytes;
 
 use crate::{
     math::PhysicalRect,
-    resources::{ResourceId, ResourceImage},
+    resources::{DecodeCause, ResourceId, ResourceImage},
 };
 
 /// 图片内容的哈希键：`(len, 64 bit 哈希)`。
@@ -90,14 +90,25 @@ pub(crate) struct Page {
 
 impl Page {
     /// 新建一页（全 0：padding 与未使用区必须是透明的 0，P02 §10.3）。
-    pub(crate) fn new(width: u32, height: u32) -> Self {
+    ///
+    /// RD-2：16 MiB 级缓冲属于**引擎自有**分配，必须走 `try_reserve_exact` 并把失败映射为
+    /// [`DecodeCause::OutOfMemory`]（release `panic=abort` 下 `vec!` 分配失败会直接杀进程）。
+    /// 调用方（`ResourceCache::place`）在失败时负责回滚已经拿到的图集分配。
+    pub(crate) fn new(width: u32, height: u32) -> Result<Self, DecodeCause> {
         assert!(width > 0 && height > 0, "atlas page must be non-empty");
         let len = width as usize * height as usize * 4;
-        Self {
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes
+            .try_reserve_exact(len)
+            .map_err(|_| DecodeCause::OutOfMemory {
+                limit_bytes: u64::try_from(len).unwrap_or(u64::MAX),
+            })?;
+        bytes.resize(len, 0);
+        Ok(Self {
             width,
             height,
-            bytes: vec![0u8; len].into_boxed_slice(),
-        }
+            bytes: bytes.into_boxed_slice(),
+        })
     }
 
     pub(crate) fn dimensions(&self) -> (u32, u32) {
@@ -161,10 +172,23 @@ impl Page {
 #[cfg(test)]
 mod tests {
     use super::{ContentKey, Page};
-    use crate::math::PhysicalRect;
+    use crate::{math::PhysicalRect, resources::DecodeCause};
 
     fn page(width: u32, height: u32) -> Page {
-        Page::new(width, height)
+        Page::new(width, height).expect("测试页缓冲分配（小页，不应失败）")
+    }
+
+    /// RD-2：页缓冲分配失败必须映射为 `DecodeCause::OutOfMemory`，而不是 panic/abort。
+    #[test]
+    fn page_allocation_failure_maps_to_out_of_memory() {
+        // 4.0e18 字节的请求必然 `try_reserve_exact` 失败（不会真分配）。
+        let error = Page::new(1_000_000_000, 1_000_000_000)
+            .err()
+            .expect("荒谬大的页必须分配失败");
+        assert!(
+            matches!(error, DecodeCause::OutOfMemory { .. }),
+            "{error:?}"
+        );
     }
 
     #[test]
