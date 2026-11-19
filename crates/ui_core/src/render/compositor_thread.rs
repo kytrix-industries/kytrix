@@ -22,6 +22,17 @@
 //!
 //! 没有 delta 时线程阻塞在邮箱的条件变量上（**不**等帧时钟），因此空闲 CPU 为 0；只有真的收到
 //! delta 才进入「等下一拍」。这是与「按 vsync 空转」的关键差别（后者空闲时也有 60 次/秒唤醒）。
+//!
+//! ## 不静默死亡（活性）
+//!
+//! 主循环的退出条件只有两个：邮箱关闭（有序关闭）或**时钟显式取消**。一个刷新周期内没等到
+//! 合成器节拍（显示关闭 / DWM 停摆 / 会话被调度走）只是流失一次 vsync 对齐，`FramePacing` 会
+//! 把这一 tick 判成「立即呈现」—— 把它当成关闭会让合成线程永久退出，屏幕停在最后一帧而输入
+//! 仍在工作（用户可见的「画面冻结」）。
+//!
+//! 线程仍可能因为其它原因（panic / 平台资源）静默结束：`CompositorHandle::supervise`（每帧由
+//! `App::frame` 调用一次）会检测并**重启**它，同时通知调用方让所有窗口整帧重发；重启失败则
+//! 以 [`EngineError::FramePipeline`] 显式失败，绝不退化成空转。
 
 use std::{
     sync::{
@@ -32,13 +43,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+use smol_str::SmolStr;
+
 use crate::{
     error::EngineError,
     render::{
         compose::{ComposeStats, WindowComposer},
         delta::{SceneDelta, absorb},
         frame::{FrameRequest, FrameSink},
-        frame_clock::{FramePacing, PresentDecision},
+        frame_clock::{FrameClock, FramePacing, PresentDecision},
     },
     window::WindowId,
 };
@@ -103,10 +116,13 @@ impl CompositorInbox {
     }
 
     /// 发布一帧（同一窗口已有未取走的帧时合并：旧 → 新）。
-    pub(crate) fn publish(&self, window: WindowId, delta: SceneDelta) -> bool {
+    ///
+    /// `None` = 邮箱已关闭（帧被丢弃，调用方必须把它当**帧管线已死**显式失败，不能静默）；
+    /// `Some(covered)` = 已接收，`covered` 表示覆盖了同窗口一帧未取走的旧 delta。
+    pub(crate) fn publish(&self, window: WindowId, delta: SceneDelta) -> Option<bool> {
         let mut state = self.lock();
         if state.closed {
-            return false;
+            return None;
         }
         let covered = match state.pending.iter_mut().find(|(id, _)| *id == window) {
             Some((_, pending)) => {
@@ -122,7 +138,7 @@ impl CompositorInbox {
         };
         drop(state);
         self.condvar.notify_all();
-        covered
+        Some(covered)
     }
 
     /// 阻塞到有帧可取或关闭（`None` = 关闭）：**空闲时线程停在这里，不唤醒、不空转**。
@@ -163,6 +179,12 @@ impl CompositorInbox {
     /// 重新打开（窗口全部关闭之后又新建窗口：线程重启时复用同一个邮箱）。
     pub(crate) fn reopen(&self) {
         self.lock().closed = false;
+    }
+
+    /// 丢弃未消费的 delta（线程**意外**退出后重启：新线程没有 lane 历史，旧 delta 只会
+    /// 拼出坏帧；调用方随后会要求整帧重发）。
+    fn clear(&self) {
+        self.lock().pending.clear();
     }
 }
 
@@ -269,11 +291,21 @@ impl CompositorHandle {
     }
 
     /// 发布一条 delta（UI 线程；不阻塞）。
-    pub(crate) fn publish(&self, delta: SceneDelta) {
+    ///
+    /// `Err` = 邮箱已关闭（合成线程已死且重启失败）：帧被丢弃。错误同时登记到合成侧错误槽，
+    /// 由 `App::frame` 的下一帧入口粘性冒泡 —— 帧管线绝不允许静默停摆。
+    pub(crate) fn publish(&self, delta: SceneDelta) -> Result<(), EngineError> {
         // 窗口身份是 delta 头部的一部分（不另传参数：两个来源迟早会漂移）。
         let window = delta.header.window;
         // 覆盖（合并）计数由邮箱自己维护；这里不需要额外动作。
-        let _ = self.shared.inbox.publish(window, delta);
+        if self.shared.inbox.publish(window, delta).is_some() {
+            return Ok(());
+        }
+        let detail = SmolStr::new_static("compositor inbox closed while a window is registered");
+        self.shared.set_error(EngineError::FramePipeline {
+            detail: detail.clone(),
+        });
+        Err(EngineError::FramePipeline { detail })
     }
 
     /// 合成侧的内容错误（`App::frame` 每帧取一次）。
@@ -295,6 +327,48 @@ impl CompositorHandle {
     #[cfg(test)]
     pub(crate) fn is_running(&self) -> bool {
         self.shared.running.load(Ordering::Acquire)
+    }
+
+    /// 监督合成线程：线程**意外**退出（不是 shutdown）时重启它。
+    ///
+    /// 帧管线是单点：合成线程一旦静默退出，UI 照常发布、GPU 线程空等、屏幕停在最后一帧，
+    /// 用户看到的就是「画面冻结而输入仍工作」。这里把「静默死亡」变成可恢复事件：
+    ///
+    /// - 返回 `Ok(true)` = 刚刚重启，调用方**必须**让所有窗口整帧重发（新线程没有 lane 历史，
+    ///   增量载荷会画成退化实例）；
+    /// - 返回 `Ok(false)` = 线程正常（或从未启动 / 已有序关闭）；
+    /// - 返回 `Err` = 线程已死且重启失败（极端资源耗尽）：只能显式失败。
+    pub(crate) fn supervise(self: &Arc<Self>) -> Result<bool, EngineError> {
+        if !self.shared.running.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let finished = self
+            .shared
+            .join
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished);
+        if !finished {
+            return Ok(false);
+        }
+        // 死线程没有机会清这些：未消费的 delta 与过期的取消句柄全部作废，重建线程。
+        self.shared.inbox.clear();
+        self.shared.running.store(false, Ordering::Release);
+        *self
+            .shared
+            .cancel
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        self.ensure_running();
+        if !self.shared.running.load(Ordering::Acquire) {
+            return Err(EngineError::FramePipeline {
+                detail: SmolStr::new_static(
+                    "compositor thread exited unexpectedly and could not be restarted",
+                ),
+            });
+        }
+        Ok(true)
     }
 
     fn ensure_running(self: &Arc<Self>) {
@@ -358,11 +432,20 @@ pub(crate) fn compositor() -> &'static Arc<CompositorHandle> {
     HANDLE.get_or_init(|| Arc::new(CompositorHandle::new()))
 }
 
-/// 合成线程主循环。
+/// 合成线程入口：构造时钟并把取消句柄登记给关闭路径，然后进入主循环。
 fn run(shared: Arc<CompositorShared>) {
     let mut clock = crate::render::frame_clock::compositor_clock();
     // 关闭路径的时钟打断句柄必须在线程等待之前注册。
     *shared.cancel.lock().unwrap_or_else(PoisonError::into_inner) = Some(clock.signal_handle());
+    serve(&shared, clock.as_mut());
+}
+
+/// 合成线程主循环（时钟可注入：单测用脚本化时钟钉死「错过一拍 ≠ 关闭」）。
+///
+/// 退出条件只有两个：邮箱关闭（有序关闭 / 最后一个窗口注销），或时钟报告**取消**
+/// （`FrameTick::cancelled`，只来自 `signal_handle`）。一个刷新周期内没有节拍**不是**退出
+/// 条件 —— 那只是流失了一次 vsync 对齐，`FramePacing` 会把这一 tick 判成「立即呈现」。
+fn serve(shared: &Arc<CompositorShared>, clock: &mut dyn FrameClock) {
     let mut pacing = FramePacing::new();
     let mut composers: ahash::HashMap<WindowId, WindowComposer> = ahash::HashMap::default();
     let mut pending: Option<Vec<(WindowId, SceneDelta)>> = None;
@@ -378,7 +461,7 @@ fn run(shared: Arc<CompositorShared>) {
         let wait_started = Instant::now();
         let tick = clock.wait_next_frame();
         let wait = wait_started.elapsed();
-        if !tick.completed {
+        if tick.cancelled {
             break;
         }
         match pacing.plan(tick) {
@@ -454,13 +537,16 @@ impl Drop for CompositorTicket {
 mod tests {
     use std::{
         sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex, PoisonError,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
-        time::Duration,
+        time::{Duration, Instant},
     };
 
-    use super::{CompositorHandle, CompositorInbox, FrameRequest, FrameSink, compositor};
+    use super::{
+        CompositorHandle, CompositorInbox, CompositorShared, FrameRequest, FrameSink, compositor,
+        serve,
+    };
     #[cfg(target_os = "linux")]
     use crate::math::Size;
     use crate::{
@@ -468,6 +554,7 @@ mod tests {
         render::{
             compositor::{DamageRects, Plan},
             delta::{FrameHeader, SceneDelta},
+            frame_clock::{FrameClock, FrameTick},
         },
         window::{FrameIndex, WindowId},
     };
@@ -496,8 +583,8 @@ mod tests {
     fn the_inbox_keeps_one_frame_per_window() {
         let inbox = CompositorInbox::new();
         let window = WindowId::from_raw(1);
-        assert!(!inbox.publish(window, delta(1)));
-        assert!(inbox.publish(window, delta(2)), "覆盖已有帧");
+        assert_eq!(inbox.publish(window, delta(1)), Some(false));
+        assert_eq!(inbox.publish(window, delta(2)), Some(true), "覆盖已有帧");
         assert_eq!(inbox.absorbed(), 1);
         let batch = inbox.take_blocking().expect("有待处理帧");
         assert_eq!(batch.len(), 1, "同一窗口只占一个槽");
@@ -521,9 +608,17 @@ mod tests {
             });
             delta
         };
-        assert!(!inbox.publish(window, scroll(1, -10.0)));
-        assert!(inbox.publish(window, scroll(2, -20.0)), "覆盖已有帧");
-        assert!(inbox.publish(window, scroll(3, -30.0)), "再覆盖一帧");
+        assert_eq!(inbox.publish(window, scroll(1, -10.0)), Some(false));
+        assert_eq!(
+            inbox.publish(window, scroll(2, -20.0)),
+            Some(true),
+            "覆盖已有帧"
+        );
+        assert_eq!(
+            inbox.publish(window, scroll(3, -30.0)),
+            Some(true),
+            "再覆盖一帧"
+        );
         let batch = inbox.take_blocking().expect("有待处理帧");
         assert_eq!(batch.len(), 1);
         let merged = &batch[0].1;
@@ -538,8 +633,8 @@ mod tests {
     #[test]
     fn different_windows_have_independent_slots() {
         let inbox = CompositorInbox::new();
-        assert!(!inbox.publish(WindowId::from_raw(1), delta(1)));
-        assert!(!inbox.publish(WindowId::from_raw(2), delta(1)));
+        assert_eq!(inbox.publish(WindowId::from_raw(1), delta(1)), Some(false));
+        assert_eq!(inbox.publish(WindowId::from_raw(2), delta(1)), Some(false));
         let batch = inbox.take_blocking().expect("两帧");
         assert_eq!(batch.len(), 2);
     }
@@ -579,6 +674,186 @@ mod tests {
         assert!(std::ptr::eq(first, second));
     }
 
+    /// **本 bug 的回归防线（合成线程侧）**：一次「错过一拍」的 tick 不得让主循环退出。
+    ///
+    /// 脚本化时钟返回 `cancelled == false` 的 tick（目标时刻在过去 ⇒ `FramePacing` 判「立即
+    /// 呈现」）。旧实现把「一个刷新周期内没等到节拍」也塞进 `completed == false`，主循环据此
+    /// 直接 `break` ⇒ 本测试里的 delta 永远不会被合成，sink 一次都收不到（画面永久冻结）。
+    #[test]
+    fn a_missed_beat_does_not_stop_the_compositor_loop() {
+        struct MissedBeats;
+
+        impl FrameClock for MissedBeats {
+            fn wait_next_frame(&mut self) -> FrameTick {
+                let now = Instant::now();
+                FrameTick {
+                    now,
+                    // 错过一拍之后的典型状态：没有可对准的目标时刻。
+                    present_time: now - Duration::from_millis(1),
+                    refresh_hz: 60.0,
+                    cancelled: false,
+                }
+            }
+
+            fn signal_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
+                Arc::new(|| {})
+            }
+        }
+
+        let shared = Arc::new(CompositorShared {
+            inbox: CompositorInbox::new(),
+            sinks: Mutex::new(ahash::HashMap::default()),
+            cancel: Mutex::new(None),
+            join: Mutex::new(None),
+            counters: Mutex::new(super::CompositorCounters::default()),
+            error: Mutex::new(None),
+            running: AtomicBool::new(true),
+        });
+        let sink = Arc::new(RecordingSink::default());
+        let window = WindowId::from_raw(9);
+        shared.lock_sinks().insert(window, sink.clone());
+        let mut pending = SceneDelta::empty(header(1));
+        pending.header.window = window;
+        pending.full = true;
+        assert_eq!(shared.inbox.publish(window, pending), Some(false));
+
+        let runner = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let mut clock = MissedBeats;
+                serve(&shared, &mut clock);
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while sink.submitted.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let delivered = sink.submitted.load(Ordering::Acquire);
+        // 有序退出：关闭邮箱让 `take_blocking` 返回 `None`。
+        shared.inbox.close();
+        runner.join().expect("compositor loop");
+        assert!(
+            delivered >= 1,
+            "错过一拍必须继续合成并交付；若在这里为 0，说明主循环把「没等到节拍」当成了关闭"
+        );
+    }
+
+    /// 取消（关闭路径）必须**先于**合成退出：取消的 tick 不得再合成 / 交付。
+    #[test]
+    fn a_cancelled_tick_stops_the_loop_before_delivering() {
+        struct CancelledClock;
+
+        impl FrameClock for CancelledClock {
+            fn wait_next_frame(&mut self) -> FrameTick {
+                let now = Instant::now();
+                FrameTick {
+                    now,
+                    present_time: now + Duration::from_millis(8),
+                    refresh_hz: 60.0,
+                    cancelled: true,
+                }
+            }
+
+            fn signal_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
+                Arc::new(|| {})
+            }
+        }
+
+        let shared = Arc::new(CompositorShared {
+            inbox: CompositorInbox::new(),
+            sinks: Mutex::new(ahash::HashMap::default()),
+            cancel: Mutex::new(None),
+            join: Mutex::new(None),
+            counters: Mutex::new(super::CompositorCounters::default()),
+            error: Mutex::new(None),
+            running: AtomicBool::new(true),
+        });
+        let sink = Arc::new(RecordingSink::default());
+        let window = WindowId::from_raw(10);
+        shared.lock_sinks().insert(window, sink.clone());
+        let mut pending = SceneDelta::empty(header(1));
+        pending.header.window = window;
+        pending.full = true;
+        assert_eq!(shared.inbox.publish(window, pending), Some(false));
+
+        serve(&shared, &mut CancelledClock);
+        assert_eq!(
+            sink.submitted.load(Ordering::Acquire),
+            0,
+            "取消之后不得再交付帧（关闭路径优先）"
+        );
+    }
+
+    /// **本 bug 的回归防线（句柄侧）**：合成线程**静默死亡**（不是 shutdown：`running` 仍为真、
+    /// 没人关过邮箱）必须被 `supervise` 重启，并通知调用方整帧重发。
+    #[test]
+    fn a_dead_compositor_thread_is_restarted_by_supervise() {
+        let handle = Arc::new(CompositorHandle::new());
+        let sink = Arc::new(RecordingSink::default());
+        let window = WindowId::from_raw(11);
+        handle.register(window, sink.clone());
+        assert!(handle.is_running(), "注册之后线程必须在跑");
+
+        // 制造「running 为真、邮箱开着、线程已结束」的静默死亡现场：先有序关闭（join 真线程），
+        // 再把一个**已结束但未 join** 的句柄塞回 join 槽。
+        handle.shutdown();
+        let finished = std::thread::spawn(|| {});
+        while !finished.is_finished() {
+            std::thread::yield_now();
+        }
+        *handle
+            .shared
+            .join
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(finished);
+        handle.shared.running.store(true, Ordering::Release);
+
+        assert!(
+            handle.supervise().expect("supervise"),
+            "线程静默死亡 ⇒ 必须重启并返回「刚重启」"
+        );
+        assert!(handle.is_running(), "重启之后线程必须在跑");
+
+        // 新线程能继续交付（整帧重发由 `App::frame` 负责，这里只验证活性）。
+        let mut delta = SceneDelta::empty(header(2));
+        delta.header.window = window;
+        delta.full = true;
+        handle.publish(delta).expect("publish after restart");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while sink.submitted.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let delivered = sink.submitted.load(Ordering::Acquire);
+        handle.unregister(window);
+        assert!(delivered >= 1, "重启后的线程必须继续交付帧");
+    }
+
+    /// 健康 / 未启动 / 已关闭的合成器上 `supervise` 必须是 no-op（不重启、不报错）。
+    #[test]
+    fn supervise_is_a_no_op_for_a_healthy_or_stopped_compositor() {
+        let handle = Arc::new(CompositorHandle::new());
+        assert!(!handle.supervise().expect("未启动"), "未启动 ⇒ 不重启");
+        let window = WindowId::from_raw(12);
+        handle.register(window, Arc::new(CountingSink::default()));
+        assert!(!handle.supervise().expect("健康"), "健康线程 ⇒ 不重启");
+        handle.shutdown();
+        assert!(!handle.supervise().expect("已关闭"), "有序关闭 ⇒ 不重启");
+    }
+
+    /// 邮箱关闭之后 `publish` 必须**显式失败**（而不是静默丢弃），并登记粘性错误。
+    #[test]
+    fn publishing_into_a_closed_inbox_is_an_error() {
+        let handle = Arc::new(CompositorHandle::new());
+        handle.shared.inbox.close();
+        let mut delta = SceneDelta::empty(header(1));
+        delta.full = true;
+        assert!(handle.publish(delta).is_err(), "关闭的邮箱不得静默接受");
+        assert!(
+            handle.take_error().is_some(),
+            "错误必须登记到合成侧错误槽（下一帧 `App::frame` 冒泡）"
+        );
+    }
+
     #[derive(Default)]
     struct CountingSink {
         submitted: AtomicUsize,
@@ -607,7 +882,7 @@ mod tests {
         let mut delta = SceneDelta::empty(header(1));
         delta.header.window = WindowId::from_raw(3);
         delta.full = true;
-        handle.publish(delta);
+        handle.publish(delta).expect("publish");
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while sink.submitted.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(2));
@@ -658,7 +933,7 @@ mod tests {
         let mut first = SceneDelta::empty(header(1));
         first.header.window = WindowId::from_raw(5);
         first.full = true;
-        handle.publish(first);
+        handle.publish(first).expect("publish");
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while sink.submitted.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(2));
@@ -671,7 +946,7 @@ mod tests {
             offset: crate::math::Point::new(0.0, -8.0),
             viewport: PhysicalRect::new(0, 0, 8, 8),
         });
-        handle.publish(scrolled);
+        handle.publish(scrolled).expect("publish");
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while sink.submitted.load(Ordering::Acquire) < 2 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(2));

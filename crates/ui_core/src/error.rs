@@ -151,6 +151,13 @@ pub enum EngineError {
     #[error("DirectComposition call failed: {detail}")]
     Composition { detail: SmolStr },
 
+    /// 帧管线失去活性（合成线程意外退出且无法重启 / 邮箱在有窗口注册时已关闭）。
+    ///
+    /// **不可重试**：帧管线是单点 —— 一旦死在用户看来就是「画面冻结、输入仍在工作」。这类
+    /// 失败必须显式冒泡，绝不能静默退化成「UI 继续发布、下游无人消费」。`detail` 带失败阶段。
+    #[error("frame pipeline stopped: {detail}")]
+    FramePipeline { detail: SmolStr },
+
     /// 平台报告的 DPI 缩放因子非法（非有限值或 `<= 0`）。唯一生产者是平台层 DPI 事件处理。
     #[error("invalid DPI scale factor {factor}: must be finite and greater than zero")]
     InvalidDpiScale { factor: f32 },

@@ -79,8 +79,12 @@ pub(crate) struct FrameTick {
     pub present_time: Instant,
     /// 显示器刷新率（Hz，已 [`normalize_refresh_hz`]）。
     pub refresh_hz: f32,
-    /// `false` = 等待被 [`FrameClock::signal_handle`] 打断（关闭路径），不是自然到点。
-    pub completed: bool,
+    /// `true` **只**表示等待被 [`FrameClock::signal_handle`] 打断（关闭路径）。
+    ///
+    /// 不是「自然到点」的反面：一个刷新周期内没有合成器节拍（显示关闭 / DWM 停摆 / 会话被
+    /// 调度走）只是**错过一拍**，必须继续出帧（`FramePacing` 会判 `Now`）。把「没等到节拍」
+    /// 也塞进这个字段，合成线程就会把一次调度抖动当成关闭、永久退出（用户可见的「画面冻结」）。
+    pub cancelled: bool,
 }
 
 /// 一次呈现决定（`FramePacing::plan` 的结论）。
@@ -452,16 +456,16 @@ impl IntervalClock {
         };
         // 在目标时刻之前留出提交余量：太晚醒来本帧就要被跳过。
         let deadline = target.checked_sub(PRESENT_MARGIN).unwrap_or(target);
-        let completed = match deadline.checked_duration_since(Instant::now()) {
-            Some(wait) => self.wait.wait(wait),
-            None => true,
+        let cancelled = match deadline.checked_duration_since(Instant::now()) {
+            Some(wait) => !self.wait.wait(wait),
+            None => false,
         };
         self.anchor = target + self.interval;
         FrameTick {
             now: Instant::now(),
             present_time: target,
             refresh_hz: self.refresh_hz,
-            completed,
+            cancelled,
         }
     }
 
@@ -550,7 +554,7 @@ impl FrameClock for ManualClock {
             now: self.now,
             present_time,
             refresh_hz: self.refresh_hz,
-            completed: !self.cancelled,
+            cancelled: self.cancelled,
         }
     }
 
@@ -600,7 +604,7 @@ mod tests {
                 now,
                 present_time: target,
                 refresh_hz: 60.0,
-                completed: true,
+                cancelled: false,
             }),
             PresentDecision::AtTime(target)
         );
@@ -615,7 +619,7 @@ mod tests {
             now,
             present_time: now + PRESENT_MARGIN / 2,
             refresh_hz: 120.0,
-            completed: true,
+            cancelled: false,
         };
         assert_eq!(pacing.plan(late), PresentDecision::Skip);
         for _ in 0..5 {
@@ -630,7 +634,7 @@ mod tests {
             now,
             present_time: now + VSYNC_60,
             refresh_hz: 120.0,
-            completed: true,
+            cancelled: false,
         };
         assert_eq!(
             pacing.plan(caught_up),
@@ -649,7 +653,7 @@ mod tests {
                 now,
                 present_time: now - Duration::from_millis(5),
                 refresh_hz: 60.0,
-                completed: true,
+                cancelled: false,
             }),
             PresentDecision::Now
         );
@@ -660,7 +664,7 @@ mod tests {
                 now,
                 present_time: now,
                 refresh_hz: 60.0,
-                completed: true,
+                cancelled: false,
             }),
             PresentDecision::Skip
         );
@@ -669,7 +673,7 @@ mod tests {
                 now,
                 present_time: now,
                 refresh_hz: 60.0,
-                completed: true,
+                cancelled: false,
             }),
             PresentDecision::Now
         );
@@ -679,7 +683,7 @@ mod tests {
                 now,
                 present_time: now + Duration::from_secs(1),
                 refresh_hz: 60.0,
-                completed: true,
+                cancelled: false,
             }),
             PresentDecision::Now,
             "提前量荒谬的目标时刻按不可用处理（不去追一个一秒后的时刻）"
@@ -693,7 +697,7 @@ mod tests {
         assert_eq!(clock.wait_count(), 0);
         let first = clock.wait_next_frame();
         assert_eq!(clock.wait_count(), 1);
-        assert!(first.completed);
+        assert!(!first.cancelled);
         assert_eq!(first.refresh_hz, 60.0);
         let second = clock.wait_next_frame();
         assert_eq!(
@@ -731,7 +735,7 @@ mod tests {
         clock.signal_handle()();
         let started = Instant::now();
         let tick = clock.wait_next_frame();
-        assert!(!tick.completed);
+        assert!(tick.cancelled);
         assert!(
             started.elapsed() < Duration::from_millis(100),
             "取消之后不得等到目标时刻"
@@ -878,12 +882,12 @@ mod tests {
         );
     }
 
-    /// `ManualClock` 的取消：等待立刻返回且标记为「未完成」。
+    /// `ManualClock` 的取消：等待立刻返回且标记为「已取消」。
     #[test]
     fn a_cancelled_manual_clock_reports_an_incomplete_wait() {
         let mut clock = ManualClock::new(60.0);
-        assert!(clock.wait_next_frame().completed);
+        assert!(!clock.wait_next_frame().cancelled);
         clock.cancel();
-        assert!(!clock.wait_next_frame().completed);
+        assert!(clock.wait_next_frame().cancelled);
     }
 }

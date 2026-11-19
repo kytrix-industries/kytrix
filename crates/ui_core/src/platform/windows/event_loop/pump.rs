@@ -16,6 +16,8 @@
 //! 唯一的消息泵 —— 把它放进泵里就等于暂停输入。Chrome 同样是「合成线程等时钟、UI 线程消费」。
 
 use std::{
+    cell::RefCell,
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -42,7 +44,7 @@ use crate::{
         windows::{composition, dpi_awareness, frame_clock::FrameClock, window::NativeWindow},
     },
     render::backend::Renderer,
-    window::{FrameIndex, FrameOutcome, Window, WindowId, WindowOptions},
+    window::{Window, WindowId, WindowOptions},
 };
 
 /// 消费者：`wndproc` 的 `WM_TIMER` 分支与 `pump_loop` 的定时器管理。
@@ -346,17 +348,23 @@ pub(crate) fn run(mut app: App) -> Result<(), EngineError> {
         .windows()
         .map(|(id, window)| (id, window.options().clone()))
         .collect();
+    // `App` 交给 `Rc<RefCell<_>>`：系统的 size / move 模态循环里，`WndProc` 要直接驱动一帧
+    // 真实帧（见 `pump_loop` 的 ① 与 `ResizeFrameDriver`）。驱动的引用是 `Weak`，关闭顺序不受影响。
+    let app = Rc::new(RefCell::new(app));
     let mut windows: Vec<NativeWindow> = Vec::with_capacity(requests.len());
     for (id, options) in requests {
-        let mut native = NativeWindow::create(id, &options, dispatcher.clone())?;
+        let mut native = NativeWindow::create(id, &options, dispatcher.clone(), Some(&app))?;
         let client = native.client_size();
         let renderer = Renderer::new_for_hwnd(native.composition(), client, options.background)?;
-        if let Some(window) = app.window_mut(id) {
-            window.set_renderer(renderer);
-            window.set_scale(native.scale());
-            window.set_size(native.logical_size());
-            // 渲染目标就是真实客户区：逻辑尺寸取整后的 covering 值可能比它大 1 px。
-            window.set_surface(client);
+        {
+            let mut app = app.borrow_mut();
+            if let Some(window) = app.window_mut(id) {
+                window.set_renderer(renderer);
+                window.set_scale(native.scale());
+                window.set_size(native.logical_size());
+                // 渲染目标就是真实客户区：逻辑尺寸取整后的 covering 值可能比它大 1 px。
+                window.set_surface(client);
+            }
         }
         // 首帧已经由 `new_for_hwnd` prime 并 present（内容层与背景层都已 attach；客户区在第一次
         // present 之前完全透明），这里把几何对齐成「内容 = 客户区」（内容 1:1、背景层铺满），
@@ -381,14 +389,14 @@ pub(crate) fn run(mut app: App) -> Result<(), EngineError> {
 
 /// 消费者：`run`。
 pub(super) fn pump(
-    mut app: App,
+    app: Rc<RefCell<App>>,
     mut windows: Vec<NativeWindow>,
     dispatcher: Arc<Dispatcher>,
 ) -> Result<(), EngineError> {
-    let result = pump_loop(&mut app, &mut windows, &dispatcher);
-    // 关闭顺序：先 drop `App`（`Window` →
-    // `Renderer::drop` 里的 GPU 线程 join 握手，期间窗口必须仍然存活），再销毁原生窗口。
-    // 反过来会让 GPU 线程在 HWND 已销毁之后还去 `Present`。
+    let result = pump_loop(&app, &mut windows, &dispatcher);
+    // 关闭顺序：先 drop `App`（`Window` → `Renderer::drop` 里的 GPU 线程 join 握手，期间窗口
+    // 必须仍然存活），再销毁原生窗口。驱动持有的是 `Weak<RefCell<App>>`，不会延长 `App` 的
+    // 生命周期，所以 `drop(app)` 就是「最后一个强引用」。
     drop(app);
     drop(windows);
     result
@@ -495,8 +503,14 @@ impl GeometryCache {
 
 /// 消费者：`pump`。
 /// 消息泵主体（每轮：消息 → 平台事件 → GPU 反馈 → 关闭 → 应用钩子 + 提交帧 → 阻塞等待）。
+///
+/// **`App` 以 `Rc<RefCell<_>>` 传入**：`DispatchMessageW` 里可能运行系统的 size / move 模态
+/// 循环，它同步分派的 `WM_SIZE` 要由 `WndProc` 直接驱动一帧真实帧（`ResizeFrameDriver`）。
+/// 因此泵只在**每一步**内短借用 `App`，消息排空期间不持有借用 —— 模态循环里的
+/// `try_borrow_mut` 于是总能成功；真遇到帧内重入则跳过那一步（下一条消息会重试），绝不构造
+/// 第二个 `&mut App`。
 pub(super) fn pump_loop(
-    app: &mut App,
+    app_cell: &Rc<RefCell<App>>,
     windows: &mut Vec<NativeWindow>,
     dispatcher: &Arc<Dispatcher>,
 ) -> Result<(), EngineError> {
@@ -505,9 +519,6 @@ pub(super) fn pump_loop(
     let mut pacer = FramePacer::new();
     // 合成几何的客户区缓存（R07-11）：稳态每轮每窗 0 次系统调用。
     let mut geometry = GeometryCache::new();
-    // 拖动期出帧背压（P-D）：自持缩放会话中「允许 2 帧在飞，落后 ≥2 帧才跳过」，
-    // 不用定时器合并鼠标。
-    let mut resize_pacing = ResizePacing::new();
     // a11y 补发兜底定时器的宿主窗口（定时器随窗口销毁失效，首窗换人时要重建，P2-4）。
     // 归属判定用 `WindowId` 而不是 HWND 裸值：首窗销毁后系统可能把同一个 HWND 复用给新窗，
     // 裸值比较会「看起来仍匹配」而不重建定时器（复审 P2-8）。
@@ -523,6 +534,9 @@ pub(super) fn pump_loop(
             native.state_mut().end_message_batch();
         }
         // ① 先 drain：`WM_QUIT` 必须显式识别（`PeekMessageW` 会把它取出来）。
+        //
+        // **这里不持有 `App` 借用**：系统的 size / move 模态循环在 `DispatchMessageW` 里运行，
+        // 它同步分派的 `WM_SIZE` 要借 `App` 出一帧真实帧（`ResizeFrameDriver`）。
         loop {
             // SAFETY: `message` 是栈上值；过滤范围 0..0 = 本线程全部消息。
             let has_message = unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) };
@@ -540,40 +554,42 @@ pub(super) fn pump_loop(
         }
 
         // ② 平台事件 → App。
-        app.sync_clock();
-        // ②a 运行时窗口生命周期（P1-2.8）：`App` 里新增/移除的窗口要同步到原生窗口。
-        if sync_native_windows(app, windows, dispatcher)? {
-            retarget_wake(windows, dispatcher);
+        {
+            let mut app = app_cell.borrow_mut();
+            app.sync_clock();
+            // ②a 运行时窗口生命周期（P1-2.8）：`App` 里新增/移除的窗口要同步到原生窗口。
+            if sync_native_windows(&mut app, app_cell, windows, dispatcher)? {
+                retarget_wake(windows, dispatcher);
+            }
+            // ②b 平台事件 → `App`（几何 / DPI 先落地，再投递事件；时间戳取消息自带的 `MSG.time`）。
+            collect_events(&mut app, windows, dispatcher)?;
         }
-        // 自持缩放（P-A）：把会话累积的目标外框 `SetWindowPos` 一次（同一轮的 ④ 就按新尺寸出
-        // 真实帧）。它同步派发 `WM_SIZE`，紧随的 `collect_events` 用现有链路写 `set_size` /
-        // `set_surface`；放在事件之前 ⇒ 拖动期间不存在「只更新了客户区、没重绘」的持久帧。
-        // **这条接线本身没有单测**（`apply_pending_resizes` 的函数级行为有单测；删掉这一行
-        // 单测仍全绿）—— 由真机拖动探针 `verify_pa_pc.ps1` 验收，见该函数文档。
-        apply_pending_resizes(windows);
-        collect_events(app, windows, dispatcher)?;
-
         // ②a′ 显示 / 电源恢复（R07-14）：显示器拓扑 / 工作区 / 睡眠唤醒之后重新查询显示器
         // 信息，请求 GPU 重建交换链（⇒ 下一帧 `reset_epoch` 整帧重发 + 清遮挡退避），并保证
         // 本轮的 ④ 帧门禁放行一帧全量重绘。放在平台事件之后：同批到达的 `WM_SIZE` /
         // `WM_DPICHANGED` 已经把尺寸与比例写进 `App`，这里查到的值覆盖它们。
-        apply_display_recovery(app, windows, dispatcher);
-
-        // ②b GPU 线程反馈：设备丢失 / 呈现失败是粘性的，在这里冒泡出去（三平台统一）。
-        app.poll_renderers()?;
-
+        {
+            let mut app = app_cell.borrow_mut();
+            apply_display_recovery(&mut app, windows, dispatcher);
+            // ②b GPU 线程反馈：设备丢失 / 呈现失败是粘性的，在这里冒泡出去（三平台统一）。
+            app.poll_renderers()?;
+        }
+        // ②b″ 模态循环里由 `ResizeFrameDriver` 登记的错误：帧管线失败不可重试，必须冒泡。
+        for native in windows.iter_mut() {
+            if let Some(error) = native.state_mut().take_pending_error() {
+                return Err(error);
+            }
+        }
         // ②b′ DirectComposition 几何：内容尺寸 = 最近一次**完成 present** 的尺寸，客户区 = 当前
-        // 客户区。内容 visual 恒 1:1、**从不拉伸**：自持缩放（P-A）的每一步都由本轮 ④ 出一帧
-        // 真实帧，所以背景层只覆盖「客户区已变、新尺寸的帧还没上屏」的 ≤1 个 vsync 接缝（以及
-        // DPI 同步改尺寸 / 首帧 / 设备恢复这些没有帧在飞的瞬间），不是拖动期的画面来源。
-        // GPU 线程在每帧完成后 post `WM_APP_COMPOSITION_WAKE`（平时只唤醒、不请求帧；缩放
-        // 会话中额外请求一次出帧尝试，见 `ResizePacing`），所以「最后一帧」的几何也会在
-        // 下一次泵迭代里落地。这里是几何**唯一**的周期应用点：`WM_SIZE` / DPI 只记录尺寸，
-        // 不逐条 `Commit`（P1-2a）。
+        // 客户区。内容 visual 恒 1:1、**从不拉伸**：系统 size 模态循环里的每一步都由
+        // `ResizeFrameDriver` 出真实帧（`WM_SIZE` 分支），本 pass 只把「已上屏的尺寸」与当前
+        // 客户区对齐；背景层覆盖「客户区已变、新尺寸的帧还没上屏」的 ≤1 个 vsync 接缝（以及
+        // DPI 同步改尺寸 / 首帧 / 设备恢复这些没有帧在飞的瞬间）。
         //
         // R07-11：客户区与最小化状态**不再每轮每窗查询**（旧实现 2 次系统调用/窗/轮）。缓存键
         // = `(逻辑尺寸, 比例)` —— `WM_SIZE` / `WM_DPICHANGED` 已在本轮 ①/② 阶段写进
         // `NativeWindow`，所以键变化精确覆盖「客户区可能变了」的时机；稳态每轮每窗 0 次系统调用。
+        let app_shared = app_cell.borrow();
         for native in windows.iter_mut() {
             let id = native.id();
             let key = GeometryKey {
@@ -590,14 +606,16 @@ pub(super) fn pump_loop(
             }) else {
                 continue;
             };
-            let presented = app
+            let presented = app_shared
                 .window(id)
                 .map(Window::presented_surface)
                 .unwrap_or(client);
             // `presented` 是待处理状态本身：每次泵迭代都读它，消息丢了也只是晚一轮（同值 no-op）。
             // `pending` 是 GPU 线程两次唤醒都失败时的兜底标记；正常情况下靠与本窗口上次成功应用
             // 的 `(presented, client)` 比较，避免输入风暴下每轮都进一次互斥锁。
-            let pending = app.window(id).is_some_and(Window::take_composition_pending);
+            let pending = app_shared
+                .window(id)
+                .is_some_and(Window::take_composition_pending);
             if !pending && native.composition_geometry() == Some((presented, client)) {
                 continue;
             }
@@ -606,6 +624,7 @@ pub(super) fn pump_loop(
             target.set_geometry(presented, client)?;
             native.note_composition_geometry((presented, client));
         }
+        drop(app_shared);
         // 已关闭窗口的缓存项跟着丢掉（否则窗口 churn 会让条目无界增长）。
         if geometry.len() > windows.len() {
             geometry.retain_live(|id| windows.iter().any(|native| native.id() == id));
@@ -623,36 +642,43 @@ pub(super) fn pump_loop(
         // 所以这里只在短借用里做记账（`set_cursor` / `plan_release_capture`），把动作收进
         // `Vec`，离开借用作用域后由 [`apply_interaction_actions`] 统一执行。
         let mut actions: Vec<InteractionAction> = Vec::with_capacity(4);
-        if let Some((target, cursor)) = app.take_cursor_change()
-            && let Some(native) = windows.iter_mut().find(|native| native.id() == target)
         {
-            native.state_mut().set_cursor(cursor);
-            actions.push(InteractionAction::SetCursor(cursor_handle(cursor)));
-        }
-        for (target, capture) in app.take_capture_requests() {
-            let Some(native) = windows.iter_mut().find(|native| native.id() == target) else {
-                continue;
-            };
-            let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
-            if capture {
-                actions.push(InteractionAction::SetCapture(hwnd));
-            } else if plan_release_capture(hwnd, native.state_mut()) {
-                // 只有确实持有捕获时才置 suppress 并计划释放（见 `plan_release_capture`）。
-                actions.push(InteractionAction::ReleaseCapture(hwnd));
+            let mut app = app_cell.borrow_mut();
+            if let Some((target, cursor)) = app.take_cursor_change()
+                && let Some(native) = windows.iter_mut().find(|native| native.id() == target)
+            {
+                native.state_mut().set_cursor(cursor);
+                actions.push(InteractionAction::SetCursor(cursor_handle(cursor)));
+            }
+            for (target, capture) in app.take_capture_requests() {
+                let Some(native) = windows.iter_mut().find(|native| native.id() == target) else {
+                    continue;
+                };
+                let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
+                if capture {
+                    actions.push(InteractionAction::SetCapture(hwnd));
+                } else if plan_release_capture(hwnd, native.state_mut()) {
+                    // 只有确实持有捕获时才置 suppress 并计划释放（见 `plan_release_capture`）。
+                    actions.push(InteractionAction::ReleaseCapture(hwnd));
+                }
             }
         }
         apply_interaction_actions(actions);
 
         // ②d 帧节奏：合成器节拍线程（只在需要连续帧时存在）+ a11y 补发兜底定时器。
+        let (continuous, a11y_pending) = {
+            let app = app_cell.borrow();
+            (app.needs_continuous_frames(), app.a11y_retry_pending())
+        };
         if let Some(native) = windows.first_mut() {
             let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
-            pacer.sync(app.needs_continuous_frames(), hwnd, dispatcher);
+            pacer.sync(continuous, hwnd, dispatcher);
             // 定时器随宿主窗口销毁而失效：宿主已不是当前首窗 ⇒ 清掉记录，下面在新首窗重建
             //（否则首窗关闭后其余窗口的 a11y 补发永远不再触发，P2-4）。
             if a11y_timer.is_some_and(|owner| owner != native.id()) {
                 a11y_timer = None;
             }
-            match (app.a11y_retry_pending(), a11y_timer) {
+            match (a11y_pending, a11y_timer) {
                 (true, None) => {
                     // SAFETY: `hwnd` 是本进程窗口；`KillTimer` 在同一线程（见下面分支）。
                     let id = unsafe { SetTimer(Some(hwnd), A11Y_TIMER_ID, A11Y_RETRY_MS, None) };
@@ -672,31 +698,40 @@ pub(super) fn pump_loop(
         }
 
         // ③ 关闭：关掉 App 里的窗口与原生窗口；一个不剩就退出。
-        if close_requested_windows(app, windows, dispatcher)? {
-            return Ok(());
+        {
+            let mut app = app_cell.borrow_mut();
+            if close_requested_windows(&mut app, windows, dispatcher)? {
+                return Ok(());
+            }
         }
 
         // ④ 应用钩子（读事件 / 写状态），再提交本帧；两段门禁在 `App::frame` 里，闲时是 `Idle`。
-        // 自持缩放会话中的窗口按 `ResizePacing` 的流水线深度背压跳过（已有 2 帧在飞时
-        // 不重排/重绘；presented 推进一帧就恢复）。
-        app.run_frame_hook();
+        {
+            let mut app = app_cell.borrow_mut();
+            app.run_frame_hook();
+        }
         if dispatcher.take_frame_wake() {
-            frame_all(app, windows, &mut resize_pacing)?;
+            let mut app = app_cell.borrow_mut();
+            frame_all(&mut app, windows)?;
         }
 
         // ④′ a11y：纯 `A11Y` 变化不会提交帧（`FrameOutcome::Idle`），所以**每轮**都要给 adapter
         // 一次机会；`App::a11y_pending` 是 O(1) 过滤，adapter 不活跃时闭包根本不执行（懒激活）。
-        for native in windows.iter_mut() {
-            native.update_a11y(app);
-            // IME 启用状态先于 caret hint：刚禁用时不必再写表单，刚启用时要重发 hint
-            //（`sync_ime_enabled` 会清掉 `ime_area` 缓存）。
-            native.sync_ime_enabled(app);
-            native.sync_ime_cursor_area(app);
+        {
+            let mut app = app_cell.borrow_mut();
+            for native in windows.iter_mut() {
+                native.update_a11y(&mut app);
+                // IME 启用状态先于 caret hint：刚禁用时不必再写表单，刚启用时要重发 hint
+                //（`sync_ime_enabled` 会清掉 `ime_area` 缓存）。
+                native.sync_ime_enabled(&app);
+                native.sync_ime_cursor_area(&app);
+            }
         }
 
         // ⑤ 跨线程回投的任务。
         for task in dispatcher.drain_tasks() {
-            task.run(app);
+            let mut app = app_cell.borrow_mut();
+            task.run(&mut app);
         }
 
         // ⑥ 阻塞等待（I3）：没有消息时停在这里。连续帧的唤醒由节拍线程 `PostMessageW` 送来。
@@ -764,197 +799,15 @@ pub(super) fn retarget_wake(windows: &[NativeWindow], dispatcher: &Arc<Dispatche
 /// 消费者：`pump_loop` 的 ④ 帧步骤。
 ///
 /// 逐窗口提交一帧；`Err` 立刻终止（device lost / swapchain 失败都不可重试）。
-/// 自持缩放会话中的窗口按 [`ResizePacing`] 的**流水线深度**背压跳过（合并鼠标上报，见该类型
-/// 文档）。
-pub(super) fn frame_all(
-    app: &mut App,
-    windows: &mut [NativeWindow],
-    pacing: &mut ResizePacing,
-) -> Result<(), EngineError> {
-    // 本帧放行的窗口；`true` = 缩放会话中（出帧后记已发布序号），`false` = 无背压账目。
-    let mut ready: Vec<(WindowId, bool)> = Vec::with_capacity(windows.len());
-    for native in windows.iter_mut() {
-        let id = native.id();
-        if !native.state_mut().resize_active() {
-            ready.push((id, false));
-            continue;
-        }
-        let Some(window) = app.window(id) else {
-            continue;
-        };
-        // `frame_index()` = 最近一次**已提交**的序号（会话第一帧用它给账目播种）；
-        // `last_presented_frame()` = 最近一次**完成**帧的序号（GPU 线程反馈，`None` = 还没有）。
-        // 两者都是 `FrameScheduler` 的单调序号，跨设备恢复仍然可比。
-        if pacing.should_skip(id, window.frame_index(), window.last_presented_frame()) {
-            continue;
-        }
-        ready.push((id, true));
-    }
-    for (id, paced) in ready {
-        match app.frame(id) {
+pub(super) fn frame_all(app: &mut App, windows: &[NativeWindow]) -> Result<(), EngineError> {
+    for native in windows {
+        match app.frame(native.id()) {
             None => {}
-            Some(Ok(outcome)) => {
-                if paced && let FrameOutcome::Committed(index) = outcome {
-                    pacing.note_published(id, index);
-                }
-            }
+            Some(Ok(_)) => {}
             Some(Err(error)) => return Err(error),
         }
     }
-    // 会话结束 / 窗口关闭：账目跟着清掉，否则残留项会挡住该窗口以后的帧。
-    pacing.retain_live(|id| {
-        windows
-            .iter_mut()
-            .any(|native| native.id() == id && native.state_mut().resize_active())
-    });
     Ok(())
-}
-
-/// 拖动期出帧背压（P-D）：每窗口「最近一次已发布的 `FrameIndex`」+ 连续跳过计数。
-///
-/// 自持缩放会话里鼠标可以上报到数百 Hz，而一次真实帧要重排 + 按新尺寸重绘。合并**不能**用
-/// 定时器（产品前提：不用定时器驱动刷新），所以用**流水线深度**背压：允许同一窗口同时有
-/// [`MAX_IN_FLIGHT`]（2）帧在飞 —— 「已发布序号 − 已上屏序号 ≥ 2」时才跳过本帧、把 damage
-/// 留给下一轮。
-///
-/// 为什么不是深度 1（旧实现）：深度 1 要求上一帧上屏后才画下一帧，于是每帧都付「一帧呈现
-/// 延迟 + 一次重新绘制」，实测 release 拖动只有 32 fps @ 60 Hz（≈2 vsync/帧）。深度 2 让 GPU
-/// 线程**在呈现第 N 帧的同时录制第 N+1 帧**，把呈现延迟藏进流水线 ⇒ 出帧率回到刷新率。
-///
-/// 唤醒来源是 present 完成后的 `WM_APP_COMPOSITION_WAKE`：缩放期间每帧尺寸都在变，
-/// `publish_presented` 的「尺寸变化才通知」因此每帧都会触发，正好当「上一帧上屏了」的信号。
-///
-/// **前向推进保险**：`presented` 可能长时间不前进（设备重置后反馈断流、帧被合成端吸收且不再
-/// 通知、GPU 线程异常）。只按深度判据会永久停帧（damage 一直留着但没人放行），因此同一窗口
-/// **连续跳过** [`MAX_CONSECUTIVE_SKIPS`]（8）次后强制放行一帧并清零计数：最坏情况只是多画
-/// 一帧，不会把窗口拖死。`presented` 未知（还没有完成反馈）时直接放行。
-///
-/// 会话结束（松手 / Esc / 取消）后不再跳过，最终尺寸一定落在一帧真实帧上。
-pub(crate) struct ResizePacing {
-    entries: Vec<ResizePacingEntry>,
-}
-
-struct ResizePacingEntry {
-    window: WindowId,
-    /// 最近一次**已发布**（`App::frame` 提交成功）的 `FrameIndex`。
-    published: FrameIndex,
-    /// 连续跳过次数（前向推进保险；任何一次放行都清零）。
-    skips: u32,
-}
-
-/// 允许同时在飞的帧数（流水线深度）：2 = 呈现第 N 帧时录制第 N+1 帧。
-const MAX_IN_FLIGHT: u32 = 2;
-
-/// 连续跳过上限：只按深度判据会因反馈断流永久停帧，到上限后强制放行一帧。
-const MAX_CONSECUTIVE_SKIPS: u32 = 8;
-
-impl ResizePacing {
-    fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-
-    /// 该窗口本帧是否跳过。
-    ///
-    /// 规则（按顺序）：
-    /// 1. 会话第一帧（没有账目）：用 `current`（最近一次已提交的序号）播种并**放行**；
-    /// 2. `presented` 未知（还没有完成反馈）：放行（算不出深度）；
-    /// 3. `published − presented < MAX_IN_FLIGHT`：放行，并把连续跳过计数清零；
-    /// 4. 否则跳过；连续跳过达到 `MAX_CONSECUTIVE_SKIPS` 时强制放行一次并清零。
-    fn should_skip(
-        &mut self,
-        window: WindowId,
-        current: FrameIndex,
-        presented: Option<FrameIndex>,
-    ) -> bool {
-        let entry = match self.entries.iter_mut().find(|entry| entry.window == window) {
-            Some(entry) => entry,
-            None => {
-                self.entries.push(ResizePacingEntry {
-                    window,
-                    published: current,
-                    skips: 0,
-                });
-                return false;
-            }
-        };
-        let Some(presented) = presented else {
-            entry.skips = 0;
-            return false;
-        };
-        // `saturating_sub`：反馈乱序 / 陈旧时绝不 panic，最坏按「深度已满足」处理（放行）。
-        let in_flight = entry.published.get().saturating_sub(presented.get());
-        if in_flight < MAX_IN_FLIGHT {
-            entry.skips = 0;
-            return false;
-        }
-        entry.skips = entry.skips.saturating_add(1);
-        if entry.skips >= MAX_CONSECUTIVE_SKIPS {
-            entry.skips = 0;
-            return false;
-        }
-        true
-    }
-
-    /// 出帧成功后记账：本窗口最近一次发布的 `FrameIndex`。
-    fn note_published(&mut self, window: WindowId, index: FrameIndex) {
-        match self.entries.iter_mut().find(|entry| entry.window == window) {
-            Some(entry) => entry.published = index,
-            None => self.entries.push(ResizePacingEntry {
-                window,
-                published: index,
-                skips: 0,
-            }),
-        }
-    }
-
-    /// 丢掉「会话已结束 / 窗口已关闭」的账目。
-    fn retain_live(&mut self, mut live: impl FnMut(WindowId) -> bool) {
-        self.entries.retain(|entry| live(entry.window));
-    }
-
-    /// 账目条数（测试判据：会话结束后必须归零，不能随窗口 churn 无界增长）。
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-}
-
-/// 消费者：`pump_loop` 的 ② 步骤（`collect_events` **之前**）。
-///
-/// 应用自持缩放会话累积的目标外框：每轮每窗**最多一次**（`pending_resize` 最新赢）。
-///
-/// `SetWindowPos` 会**同步**派发 `WM_SIZE`（重入 `WndProc`），所以必须在短借用之外执行，并且
-/// 放在 `collect_events` 之前：那条 `WM_SIZE` 产生的 `Resize` 事件会在同一轮被 `apply_event`
-/// 写进 `set_size`（标 `LAYOUT`）与 `set_surface`（标全量 damage），紧接着本轮 ④ 出一帧。
-///
-/// **测试边界**：函数级行为（取走一次 → `SetWindowPos` → 再次调用 no-op）有单测
-/// （`event_loop/tests/pump_resize_tests.rs`）；**泵里的调用点接线**（这一轮真的在事件之前
-/// 调用它）没有单测覆盖 —— 删掉下面 `pump_loop` 里的调用，既有单测仍会全绿。那条接线由真机
-/// 拖动探针 `verify_pa_pc.ps1` 验收（AR7 已把它登记为已知测试缺口）。
-pub(super) fn apply_pending_resizes(windows: &mut [NativeWindow]) {
-    for native in windows.iter_mut() {
-        // 短借用只做取走：在借用内调 `SetWindowPos` 会重入 `WndProc` 再取一次 `&mut`。
-        let Some(rect) = native.state_mut().take_pending_resize() else {
-            continue;
-        };
-        let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
-        let (x, y, width, height) = rect.as_window_rect();
-        // SAFETY: `hwnd` 是本进程窗口；只改位置/尺寸，不激活、不改 Z 序。同步派发的
-        // `WM_SIZE` / `WM_WINDOWPOSCHANGED` 由生产 `WndProc` 处理（它只记账，不调用 `App`）。
-        unsafe {
-            let _ = SetWindowPos(
-                hwnd,
-                None,
-                x,
-                y,
-                width,
-                height,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1099,159 +952,5 @@ mod geometry_cache_tests {
         cache.retain_live(|id| id == window(2));
         assert_eq!(cache.len(), 1, "关闭的窗口必须丢掉缓存项");
         assert_eq!(cache.queries(), 3);
-    }
-}
-
-#[cfg(test)]
-mod resize_pacing_tests {
-    use super::{MAX_CONSECUTIVE_SKIPS, ResizePacing};
-    use crate::window::{FrameIndex, WindowId};
-
-    fn window(raw: u32) -> WindowId {
-        WindowId::from_raw(raw)
-    }
-
-    fn frame(raw: u32) -> FrameIndex {
-        FrameIndex::from_raw(raw)
-    }
-
-    /// **深度语义（P-D 的核心）**：允许 1 帧在飞（第二个可以发）；2 帧在飞时跳过；presented
-    /// 前进一帧后恢复。
-    ///
-    /// 这是拖动期的合并机制（替代定时器）：数百 Hz 鼠标上报被压到「每帧上屏解锁一帧」；深度 2
-    /// 让呈现 N 的同时录制 N+1（深度 1 会退化成 ≈2 vsync/帧、release 实测 32 fps @ 60 Hz）。
-    #[test]
-    fn depth_two_allows_one_frame_in_flight_and_skips_the_second() {
-        let mut pacing = ResizePacing::new();
-        let id = window(1);
-        assert!(
-            !pacing.should_skip(id, frame(10), None),
-            "会话第一帧必须先出去（账目用最近一次已提交序号播种）"
-        );
-        pacing.note_published(id, frame(11));
-        assert!(
-            !pacing.should_skip(id, frame(11), Some(frame(10))),
-            "已发布 11、已上屏 10：只有 1 帧在飞 ⇒ 允许再发一帧（深度 2）"
-        );
-        pacing.note_published(id, frame(12));
-        assert!(
-            pacing.should_skip(id, frame(12), Some(frame(10))),
-            "已发布 12、已上屏 10：2 帧在飞 ⇒ 本帧必须跳过（damage 保留）"
-        );
-        assert!(
-            !pacing.should_skip(id, frame(12), Some(frame(11))),
-            "presented 前进到 11 后只剩 1 帧在飞 ⇒ 必须放行"
-        );
-        pacing.note_published(id, frame(13));
-        assert!(
-            pacing.should_skip(id, frame(13), Some(frame(11))),
-            "已发布 13、已上屏 11：又是 2 帧在飞 ⇒ 继续跳过"
-        );
-    }
-
-    /// `presented` 未知（刚启动 / 反馈还没到）时放行：算不出深度，先画一帧，否则永远等不到
-    /// 第一帧完成。
-    #[test]
-    fn an_unknown_presented_frame_never_skips() {
-        let mut pacing = ResizePacing::new();
-        let id = window(1);
-        assert!(!pacing.should_skip(id, frame(3), None));
-        pacing.note_published(id, frame(4));
-        assert!(
-            !pacing.should_skip(id, frame(4), None),
-            "presented 未知时必须放行"
-        );
-    }
-
-    /// **前向推进保险**：presented 卡住不动（反馈断流 / 帧被吸收且不再通知）时，连续跳过达到
-    /// 上限后强制放行一帧并清零；之后重新计满一个上限，不会被永久放行（深度约束仍然有效）。
-    #[test]
-    fn a_stalled_presentation_forces_one_frame_after_the_skip_cap() {
-        let mut pacing = ResizePacing::new();
-        let id = window(1);
-        assert!(!pacing.should_skip(id, frame(1), Some(frame(1))));
-        pacing.note_published(id, frame(3));
-        let stalled = Some(frame(1));
-        for skipped in 1..MAX_CONSECUTIVE_SKIPS {
-            assert!(
-                pacing.should_skip(id, frame(3), stalled),
-                "第 {skipped} 次仍应跳过（未到连续跳过的上限）"
-            );
-        }
-        assert!(
-            !pacing.should_skip(id, frame(3), stalled),
-            "连续跳过达到上限必须强制放行一帧（否则窗口永久停帧）"
-        );
-        assert!(
-            pacing.should_skip(id, frame(3), stalled),
-            "强制放行只解锁一帧：下一轮重新开始跳过计数"
-        );
-    }
-
-    /// **吸收帧导致的 presented 跳跃**：合成端吸收旧帧时 `presented` 会一次前进多格（没有中间
-    /// 帧的反馈）。深度判据只按最新值算，必须立刻收敛为「可以出帧」，不能把窗口判成永久在飞。
-    #[test]
-    fn a_presented_jump_forward_reopens_the_pipeline() {
-        let mut pacing = ResizePacing::new();
-        let id = window(1);
-        assert!(!pacing.should_skip(id, frame(10), Some(frame(10))));
-        pacing.note_published(id, frame(12));
-        assert!(
-            pacing.should_skip(id, frame(12), Some(frame(10))),
-            "2 帧在飞（11、12）⇒ 跳过"
-        );
-        // 帧 11 被合成端吸收：只在帧 12 完成时收到反馈，presented 直接跳到 12。
-        assert!(
-            !pacing.should_skip(id, frame(12), Some(frame(12))),
-            "presented 跳跃到最新已发布序号 ⇒ 在飞数归零 ⇒ 放行"
-        );
-    }
-
-    /// presented 超前 / 乱序（陈旧反馈被别的路径写回）不 panic 也不停帧：`saturating_sub`
-    /// 归零 ⇒ 放行。
-    #[test]
-    fn an_out_of_order_presented_frame_never_stalls_the_pipeline() {
-        let mut pacing = ResizePacing::new();
-        let id = window(1);
-        assert!(!pacing.should_skip(id, frame(10), Some(frame(10))));
-        pacing.note_published(id, frame(12));
-        assert!(
-            !pacing.should_skip(id, frame(12), Some(frame(99))),
-            "presented 超前（不可能但必须防御）⇒ 在飞数饱和为 0 ⇒ 放行"
-        );
-    }
-
-    /// 会话结束 / 窗口关闭后账目必须被清掉（否则残留项会挡住该窗口以后的帧）。
-    #[test]
-    fn the_ledger_drops_windows_whose_session_ended() {
-        let mut pacing = ResizePacing::new();
-        assert!(!pacing.should_skip(window(1), frame(1), None));
-        pacing.note_published(window(1), frame(2));
-        assert!(!pacing.should_skip(window(2), frame(10), None));
-        assert_eq!(pacing.len(), 2);
-        pacing.retain_live(|id| id == window(2));
-        assert_eq!(pacing.len(), 1, "会话结束 / 窗口关闭的账目必须清掉");
-        assert!(
-            !pacing.should_skip(window(2), frame(10), Some(frame(10))),
-            "保留的窗口在深度满足时正常出帧"
-        );
-    }
-
-    /// 多窗口互不影响：一个窗口在飞不会让另一个窗口跳过。
-    #[test]
-    fn windows_are_paced_independently() {
-        let mut pacing = ResizePacing::new();
-        let (one, two) = (window(1), window(2));
-        assert!(!pacing.should_skip(one, frame(5), Some(frame(5))));
-        pacing.note_published(one, frame(7));
-        assert!(!pacing.should_skip(two, frame(20), None));
-        assert!(
-            pacing.should_skip(one, frame(7), Some(frame(5))),
-            "窗口 1 有 2 帧在飞 ⇒ 跳过"
-        );
-        assert!(
-            !pacing.should_skip(two, frame(20), Some(frame(20))),
-            "窗口 2 没有在飞帧，不受窗口 1 影响"
-        );
     }
 }

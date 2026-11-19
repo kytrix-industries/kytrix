@@ -1,358 +1,136 @@
-//! 自持窗口缩放（P-A）：命中码 → 会话 → 目标外框的纯数据与纯函数。
+//! 系统 size 模态循环里的**真实帧**驱动（与 Chrome / Qt 同构）。
 //!
-//! 为什么 8 个 resize 命中码**不再**交 `DefWindowProcW`：系统的 size 模态循环会**占住 UI 线程
-//! 的消息泵**，拖动期间 `App::frame` 不运行 —— 布局不重排、内容不按新尺寸重绘、DirectComposition
-//! 背景层也停在上一个客户区（新区域没有 visual ⇒ 露出桌面）。而产品前提是「不用定时器驱动刷新」
-//! 且「resize 必须真实重排 + 重绘，不能拉伸旧帧」，两条合起来只允许一种实现：**缩放由引擎自己
-//! 按消息驱动**，泵每轮跑一次真实帧。
+//! 拖动边框时系统进入自己的 size 模态循环：它把 `WM_SIZE` / `WM_PAINT` **同步 `DispatchMessage`**
+//! 到本窗口的 `WndProc`，但不会回到引擎的泵 —— 泵的 ④（`App::frame`）在这整段时间不运行。
+//! 产品前提是「不用定时器驱动刷新」+「resize 必须真实重排 + 重绘，不能拉伸旧帧」，所以重排 /
+//! 重绘必须由**模态循环分派的消息**直接驱动，而不是由引擎的顶层消息循环驱动。
 //!
-//! 分工：
-//! - `WndProc` 只**记账**（[`super::WndProcState::begin_resize`] /
-//!   [`super::WndProcState::note_resize_cursor`]），不做任何会重入 `WndProc` 的调用
-//!   （`wndproc.rs` 文件头纪律 1）；
-//! - 泵在 `collect_events` **之前**统一 `SetWindowPos` 一次（`pump::apply_pending_resizes`），
-//!   同步产生的 `WM_SIZE` 走现有事件链路：`set_size` 标 `LAYOUT` + `set_surface` 标全量 damage；
-//! - 出帧合并只靠「消息队列天然成批 + `pending_resize` 最新赢 + 流水线深度 2 背压」
-//!   （`pump::ResizePacing`：允许 2 帧在飞，已发布落后已上屏 ≥2 帧才跳过；**没有**任何定时器）。
+//! 交互本身仍归系统（`WM_NCLBUTTONDOWN` 的 8 个命中码照常 `DefWindowProcW`）：Aero Snap /
+//! Win11 Snap Layouts / 双击边框 / `Alt+Space` → 大小 / 拖动中切换显示器全部免费，且与
+//! Chrome / Qt 的实际做法一致（Qt 的 `QWindow::startSystemResize` 在 Windows 上就是
+//! `PostMessage(WM_SYSCOMMAND, SC_SIZE…)`，把交互交还系统）。
 //!
-//! `HTCAPTION` / 系统按钮**仍然交系统**：Aero Snap / Snap Layouts / 双击最大化 / 右键系统菜单
-//! 只存在于系统的 move 模态循环里（见 `wndproc.rs` 文件头纪律 2）。
+//! 本模块只做「一条 `WM_SIZE` → 一步帧」的适配，顺序与泵的 ②b′/④ 相同：
 //!
-//! ## 与系统 size 模态循环的已知差异（有意，不补）
+//! 1. 客户区物理尺寸 + 当前比例 → 逻辑尺寸 / surface（布局输入先落地）；
+//! 2. DirectComposition 几何：内容 = 最近一次**完成 present** 的尺寸（恒 1:1、从不拉伸），
+//!    客户区 = 当前；新暴露区域由背景层填充，最多一个 vsync 的接缝；
+//! 3. `App::frame`：重排 → 按新 surface 重绘 → 提交 → 发布给合成线程。
 //!
-//! 会话只吞 `WM_MOUSEMOVE` / `WM_LBUTTONUP` / `WM_KEYDOWN(VK_ESCAPE)` / 失去捕获 / `WM_CANCELMODE`，
-//! 其余消息照常走生产路径。因此与系统循环相比有三处差异：
-//! - 缩放期间应用仍会收到键盘事件（系统循环吞掉全部输入）：补一层输入闸门需要额外的会话状态，
-//!   而「拖边框的同时打字」不是真实路径；
-//! - Esc 取消会话后，它的 `WM_KEYUP` 仍会作为应用的按键事件投递（系统循环会一起吞掉）；
-//! - 边框双击后的第二次 `WM_LBUTTONUP` 会作为一次**孤立** `PointerUp` 投递（没有配对的
-//!   `PointerDown`）：交互层对孤立抬键是 no-op。
+//! **重入安全**：泵在 `DispatchMessageW` 期间不持有 `App` 借用（见 `pump_loop` 的 ① 与 ② 分段），
+//! 所以模态循环里的这一步能拿到独占借用；万一恰好有别的借用（帧内重入），`try_borrow_mut`
+//! 失败就放弃本步（下一条 `WM_SIZE` 会重试），绝不构造第二个 `&mut App`。
+//!
+//! 失败不在这里 `return`（`WndProc` 没有错误通道）：登记进 [`super::WndProcState`] 的
+//! `pending_error`，由泵的下一轮 ② 冒泡（帧管线错误不可重试，绝不能静默）。
+//!
+//! **范围**：只做「像素 / 布局 / 渲染目标」。a11y 树交付与 IME caret 表单仍由泵的 ④′ 负责
+//! （它们需要 adapter / IMM32 上下文，且拖拽期间没有键盘输入）：一次拖动结束后的下一轮泵会
+//! 把最终几何同步给 AT / IME，拖拽过程中的中间尺寸不必逐条通知。
 
-use windows::Win32::UI::WindowsAndMessaging::{
-    HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
+use std::{
+    cell::RefCell,
+    rc::{Rc, Weak},
+    sync::{Arc, Mutex},
 };
 
-/// 缩放会话拖动的边 / 角。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ResizeEdge {
-    Left,
-    Right,
-    Top,
-    Bottom,
-    TopLeft,
-    TopRight,
-    BottomLeft,
-    BottomRight,
-}
+use crate::{
+    app::App,
+    error::EngineError,
+    math::{Scale, Size},
+    platform::windows::composition::{self, Composition},
+    window::{Window, WindowId},
+};
 
-impl ResizeEdge {
-    /// 命中码 → 边 / 角；非缩放命中码（`HTCAPTION` / 系统按钮 / 客户区…）返回 `None`。
-    pub(crate) fn from_hit(hit: u32) -> Option<Self> {
-        match hit {
-            HTLEFT => Some(Self::Left),
-            HTRIGHT => Some(Self::Right),
-            HTTOP => Some(Self::Top),
-            HTBOTTOM => Some(Self::Bottom),
-            HTTOPLEFT => Some(Self::TopLeft),
-            HTTOPRIGHT => Some(Self::TopRight),
-            HTBOTTOMLEFT => Some(Self::BottomLeft),
-            HTBOTTOMRIGHT => Some(Self::BottomRight),
-            _ => None,
-        }
-    }
-
-    /// 该边 / 角会拖动外框的左边。
-    const fn moves_left(self) -> bool {
-        matches!(self, Self::Left | Self::TopLeft | Self::BottomLeft)
-    }
-
-    /// 该边 / 角会拖动外框的右边。
-    const fn moves_right(self) -> bool {
-        matches!(self, Self::Right | Self::TopRight | Self::BottomRight)
-    }
-
-    /// 该边 / 角会拖动外框的上边。
-    const fn moves_top(self) -> bool {
-        matches!(self, Self::Top | Self::TopLeft | Self::TopRight)
-    }
-
-    /// 该边 / 角会拖动外框的下边。
-    const fn moves_bottom(self) -> bool {
-        matches!(self, Self::Bottom | Self::BottomLeft | Self::BottomRight)
-    }
-}
-
-/// 窗口**外框**矩形（屏幕物理像素，含系统标题栏与边框）。
+/// 一条待执行的 `WM_SIZE` 帧步骤：在 `&mut WndProcState` 的短借用里取走，**出借用后**执行。
 ///
-/// 缩放会话里的边界都是外框边界：`WM_NCLBUTTONDOWN` 的命中发生在非客户区，
-/// `SetWindowPos` 的 `(cx, cy)` 也是外框尺寸；客户区由系统按边框算，不在本模块出现。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct OuterRect {
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
+/// 两阶段是文件头纪律 1：`App::frame` 的调用面很大（用户布局 / 样式闭包、渲染发布），
+/// 把「驱动一帧」放进 `&mut WndProcState` 的借用里等于赌它永远不会重入 `WndProc`；
+/// 拆成「短借用取 [`ResizeStep`] → 借用外 `run` → 短借用写回错误」就不再依赖这个假设。
+pub(crate) struct ResizeStep {
+    driver: Rc<ResizeFrameDriver>,
+    scale: Scale,
+    client: (u32, u32),
 }
 
-impl OuterRect {
-    /// 由四条边构造（右 / 下为**排他**边界，与 Win32 `RECT` 同义）。
-    pub(crate) const fn from_ltrb(left: i32, top: i32, right: i32, bottom: i32) -> Self {
+impl ResizeStep {
+    pub(crate) fn new(driver: Rc<ResizeFrameDriver>, scale: Scale, client: (u32, u32)) -> Self {
         Self {
-            left,
-            top,
-            right,
-            bottom,
+            driver,
+            scale,
+            client,
         }
     }
 
-    /// `SetWindowPos` 的 `(x, y, cx, cy)`。
-    ///
-    /// 尺寸用 `saturating_sub`：极端光标 + 极端最小尺寸（测试里的 `u32::MAX`）可以让外框
-    /// 跨满整个 `i32` 值域，普通减法会溢出；真实窗口的坐标远小于该范围。
-    pub(crate) const fn as_window_rect(self) -> (i32, i32, i32, i32) {
-        (
-            self.left,
-            self.top,
-            self.right.saturating_sub(self.left),
-            self.bottom.saturating_sub(self.top),
-        )
+    /// 执行一步（不持有 `WndProcState` 借用）；返回需要冒泡的粘性错误。
+    pub(crate) fn run(self) -> Option<EngineError> {
+        self.driver.frame(self.scale, self.client)
     }
 }
 
-/// 一次自持缩放会话：起始外框 + 起始光标 + 拖动的边 / 角。
-///
-/// 起始光标与起始外框都取**按下那一刻**的值（屏幕物理像素），目标外框只按光标位移计算 ⇒
-/// 抓取点相对边框的偏移保持不变（与系统模态循环的手感一致）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ResizeSession {
-    start_outer: OuterRect,
-    start_cursor: (i32, i32),
-    edge: ResizeEdge,
+/// 每窗口一个：把系统派发的一条 `WM_SIZE` 变成「更新客户区 + 一帧真实帧」。
+pub(crate) struct ResizeFrameDriver {
+    /// 泵持有的 `App`（弱引用：驱动随窗口存活，但**不得**延长 `App` 的生命周期 ——
+    /// 关闭顺序要求 `App`（及其 `Renderer` 的 GPU 线程 join）先于原生窗口销毁）。
+    app: Weak<RefCell<App>>,
+    window: WindowId,
+    /// 与 `NativeWindow` 共享的合成目标（`Arc<Mutex<Composition>>`，与 GPU 线程串行化）。
+    composition: Arc<Mutex<Composition>>,
 }
 
-impl ResizeSession {
-    pub(crate) const fn new(
-        start_outer: OuterRect,
-        start_cursor: (i32, i32),
-        edge: ResizeEdge,
+impl ResizeFrameDriver {
+    pub(crate) fn new(
+        app: Weak<RefCell<App>>,
+        window: WindowId,
+        composition: Arc<Mutex<Composition>>,
     ) -> Self {
         Self {
-            start_outer,
-            start_cursor,
-            edge,
+            app,
+            window,
+            composition,
         }
     }
 
-    /// 会话起始外框（Esc 取消时恢复它）。
-    pub(crate) const fn start_outer(self) -> OuterRect {
-        self.start_outer
-    }
-
-    /// 按最新光标算目标外框：起始的**对边固定**、拖动边跟着光标位移走。
-    ///
-    /// `min_outer` 是最小外框（`WndProcState::min_size`，`WM_GETMINMAXINFO` 用的同一份换算）：
-    /// 拖动边最多压到「对边 − 最小尺寸」，因此反向拖动 / 越过对边都不会产生 0 或负尺寸，也不会
-    /// 左右 / 上下翻转。位移用 `saturating_add` 吸收异常大的坐标，不溢出。
-    pub(crate) fn target_outer(self, cursor: (i32, i32), min_outer: (u32, u32)) -> OuterRect {
-        let dx = cursor.0.saturating_sub(self.start_cursor.0);
-        let dy = cursor.1.saturating_sub(self.start_cursor.1);
-        let mut rect = self.start_outer;
-        if self.edge.moves_left() {
-            rect.left = self.start_outer.left.saturating_add(dx);
+    /// 一条 `WM_SIZE` 的副作用（见模块文档的顺序）；返回需要冒泡的粘性错误。
+    pub(crate) fn frame(&self, scale: Scale, client: (u32, u32)) -> Option<EngineError> {
+        let app = self.app.upgrade()?;
+        // 借用冲突（帧内重入）⇒ 放弃本步：事件仍在队列里，下一条 `WM_SIZE` 会重试。
+        let mut app = app.try_borrow_mut().ok()?;
+        // 先收 GPU 反馈：`presented_surface` 是几何的输入，落后一帧也只是晚一步对齐。
+        if let Err(error) = app.poll_renderers() {
+            return Some(error);
         }
-        if self.edge.moves_right() {
-            rect.right = self.start_outer.right.saturating_add(dx);
+        // 0×0（`WM_SIZE` 的 SIZE_MINIMIZED 语义）不是渲染目标：模态循环里不该出现，但
+        // 防御性跳过，避免把 surface 写成 0（`GetClientRect` 的最小化 0×0 在泵侧有同样的保护）。
+        if client.0 == 0 || client.1 == 0 {
+            return None;
         }
-        if self.edge.moves_top() {
-            rect.top = self.start_outer.top.saturating_add(dy);
+        let window = app.window_mut(self.window)?;
+        // `set_scale` 没有同值短路（会整树失效 + 全部文本重新 shape）：只在 DPI 真的变了时写，
+        // 与 `requery_display` 的口径一致。拖动中它几乎总是相同值。
+        if window.scale() != scale {
+            window.set_scale(scale);
         }
-        if self.edge.moves_bottom() {
-            rect.bottom = self.start_outer.bottom.saturating_add(dy);
+        window.set_size(Size::new(
+            scale.to_logical(client.0 as f32),
+            scale.to_logical(client.1 as f32),
+        ));
+        // surface = 真实客户区（逻辑尺寸取整后的 covering 值可能比它大 1 px）。
+        window.set_surface(client);
+        let presented = app
+            .window(self.window)
+            .map(Window::presented_surface)
+            .unwrap_or(client);
+        // 短借用之间做 DComp 调用（`Commit` 不派发消息，但保持与泵一致的纪律）。
+        {
+            let mut target = composition::lock(&self.composition);
+            if let Err(error) = target.set_geometry(presented, client) {
+                return Some(error);
+            }
         }
-        let min_width = i32::try_from(min_outer.0).unwrap_or(i32::MAX).max(1);
-        let min_height = i32::try_from(min_outer.1).unwrap_or(i32::MAX).max(1);
-        if self.edge.moves_left() {
-            rect.left = rect.left.min(rect.right.saturating_sub(min_width));
+        match app.frame(self.window) {
+            Some(Ok(_)) | None => None,
+            Some(Err(error)) => Some(error),
         }
-        if self.edge.moves_right() {
-            rect.right = rect.right.max(rect.left.saturating_add(min_width));
-        }
-        if self.edge.moves_top() {
-            rect.top = rect.top.min(rect.bottom.saturating_sub(min_height));
-        }
-        if self.edge.moves_bottom() {
-            rect.bottom = rect.bottom.max(rect.top.saturating_add(min_height));
-        }
-        // 未参与拖动的轴保持起始尺寸；起始外框本身退化时也保证正尺寸（`SetWindowPos` 的
-        // 0 宽 / 0 高窗口不可用）。
-        if rect.right <= rect.left {
-            rect.right = rect.left.saturating_add(1);
-        }
-        if rect.bottom <= rect.top {
-            rect.bottom = rect.top.saturating_add(1);
-        }
-        rect
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON,
-        HTMINBUTTON, HTNOWHERE, HTRIGHT, HTSYSMENU, HTTOP, HTTOPLEFT, HTTOPRIGHT,
-    };
-
-    use super::{OuterRect, ResizeEdge, ResizeSession};
-
-    /// 320×240 客户区在 96 dpi 下的最小外框（`dpi::min_track_size` 的量级；只用于几何断言）。
-    const MIN: (u32, u32) = (336, 239);
-
-    fn session(start: OuterRect, cursor: (i32, i32), edge: ResizeEdge) -> ResizeSession {
-        ResizeSession::new(start, cursor, edge)
-    }
-
-    fn start() -> OuterRect {
-        OuterRect::from_ltrb(100, 100, 500, 400)
-    }
-
-    /// 只有 8 个 HT 缩放码是缩放命中；标题栏 / 系统按钮 / 客户区必须返回 `None`
-    /// （它们要继续交给系统的 move 模态循环：Aero Snap / Snap Layouts / 双击最大化）。
-    #[test]
-    fn only_the_eight_resize_hit_codes_start_a_resize() {
-        let cases = [
-            (HTLEFT, ResizeEdge::Left),
-            (HTRIGHT, ResizeEdge::Right),
-            (HTTOP, ResizeEdge::Top),
-            (HTBOTTOM, ResizeEdge::Bottom),
-            (HTTOPLEFT, ResizeEdge::TopLeft),
-            (HTTOPRIGHT, ResizeEdge::TopRight),
-            (HTBOTTOMLEFT, ResizeEdge::BottomLeft),
-            (HTBOTTOMRIGHT, ResizeEdge::BottomRight),
-        ];
-        for (hit, edge) in cases {
-            assert_eq!(
-                ResizeEdge::from_hit(hit),
-                Some(edge),
-                "命中码 {hit} 必须是 {edge:?}"
-            );
-        }
-        for hit in [
-            HTCAPTION,
-            HTSYSMENU,
-            HTCLOSE,
-            HTMINBUTTON,
-            HTMAXBUTTON,
-            HTCLIENT,
-            HTNOWHERE,
-        ] {
-            assert_eq!(
-                ResizeEdge::from_hit(hit),
-                None,
-                "命中码 {hit} 不是缩放码：必须继续交系统，否则 Snap / 双击最大化会失效"
-            );
-        }
-    }
-
-    /// 单边拖动：只有该边跟着光标走，其余三边保持起始值。
-    #[test]
-    fn a_single_edge_follows_the_cursor_and_keeps_the_opposite_edge() {
-        let s = start();
-        assert_eq!(
-            session(s, (160, 220), ResizeEdge::Left).target_outer((140, 220), MIN),
-            OuterRect::from_ltrb(80, 100, 500, 400),
-            "左边：left 跟 -20，其余不变"
-        );
-        assert_eq!(
-            session(s, (160, 220), ResizeEdge::Right).target_outer((190, 220), MIN),
-            OuterRect::from_ltrb(100, 100, 530, 400),
-            "右边：right 跟 +30"
-        );
-        assert_eq!(
-            session(s, (160, 220), ResizeEdge::Top).target_outer((160, 200), MIN),
-            OuterRect::from_ltrb(100, 80, 500, 400),
-            "上边：top 跟 -20"
-        );
-        assert_eq!(
-            session(s, (160, 220), ResizeEdge::Bottom).target_outer((160, 250), MIN),
-            OuterRect::from_ltrb(100, 100, 500, 430),
-            "下边：bottom 跟 +30"
-        );
-    }
-
-    /// 角拖动：两条边同时跟光标走。
-    #[test]
-    fn a_corner_moves_both_axes() {
-        let s = start();
-        assert_eq!(
-            session(s, (160, 220), ResizeEdge::TopLeft).target_outer((140, 210), MIN),
-            OuterRect::from_ltrb(80, 90, 500, 400)
-        );
-        assert_eq!(
-            session(s, (160, 220), ResizeEdge::TopRight).target_outer((190, 210), MIN),
-            OuterRect::from_ltrb(100, 90, 530, 400)
-        );
-        assert_eq!(
-            session(s, (160, 220), ResizeEdge::BottomLeft).target_outer((140, 250), MIN),
-            OuterRect::from_ltrb(80, 100, 500, 430)
-        );
-        assert_eq!(
-            session(s, (160, 220), ResizeEdge::BottomRight).target_outer((190, 250), MIN),
-            OuterRect::from_ltrb(100, 100, 530, 430)
-        );
-    }
-
-    /// 反向拖动（越过对边）停在最小外框：不产生 0 / 负尺寸，也不翻转。
-    #[test]
-    fn dragging_past_the_opposite_edge_stops_at_the_minimum() {
-        let s = start();
-        // 右边拖到起点左侧很远：宽度 = 最小外框宽，右边界贴着左边界。
-        let rect = session(s, (160, 220), ResizeEdge::Right).target_outer((0, 220), MIN);
-        assert_eq!(rect.as_window_rect(), (100, 100, MIN.0 as i32, 400 - 100));
-        // 左边拖到起点右侧很远：left = right − 最小宽。
-        let rect = session(s, (160, 220), ResizeEdge::Left).target_outer((9_000, 220), MIN);
-        assert_eq!(
-            rect.as_window_rect(),
-            (500 - MIN.0 as i32, 100, MIN.0 as i32, 300)
-        );
-        // 上边拖到下边以下：高度 = 最小高。
-        let rect = session(s, (160, 220), ResizeEdge::Top).target_outer((160, 9_000), MIN);
-        assert_eq!(
-            rect.as_window_rect(),
-            (100, 400 - MIN.1 as i32, 400, MIN.1 as i32)
-        );
-        // 下边拖到上边以上：bottom = top + 最小高。
-        let rect = session(s, (160, 220), ResizeEdge::Bottom).target_outer((160, 0), MIN);
-        assert_eq!(rect.as_window_rect(), (100, 100, 400, MIN.1 as i32));
-        // 角：两个轴各自钳住。
-        let rect = session(s, (160, 220), ResizeEdge::BottomRight).target_outer((0, 0), MIN);
-        assert_eq!(
-            rect.as_window_rect(),
-            (100, 100, MIN.0 as i32, MIN.1 as i32),
-            "右下角反向拖到左上：两轴都停在最小尺寸"
-        );
-    }
-
-    /// 退化输入：最小外框为 0 时仍至少 1 px；极端坐标不溢出。
-    #[test]
-    fn degenerate_minimum_and_extreme_cursors_keep_a_positive_size() {
-        let s = start();
-        let rect = session(s, (0, 0), ResizeEdge::Right).target_outer((-9_000, 0), (0, 0));
-        let (_, _, width, height) = rect.as_window_rect();
-        assert_eq!(width, 1, "最小外框为 0 时宽度至少 1 px");
-        assert_eq!(height, 300, "未拖动的轴保持起始尺寸");
-        let rect = session(s, (0, 0), ResizeEdge::BottomLeft)
-            .target_outer((i32::MIN, i32::MAX), (u32::MAX, u32::MAX));
-        let (_, _, width, height) = rect.as_window_rect();
-        assert!(
-            width > 0 && height > 0,
-            "极端坐标下尺寸仍为正：{width}x{height}"
-        );
-    }
-
-    /// 目标外框来回转换 `SetWindowPos` 参数不丢信息（泵直接用 `as_window_rect`）。
-    #[test]
-    fn outer_rect_round_trips_to_set_window_pos_arguments() {
-        let rect = OuterRect::from_ltrb(-40, 12, 960, 720);
-        assert_eq!(rect.as_window_rect(), (-40, 12, 1000, 708));
     }
 }

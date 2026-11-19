@@ -51,8 +51,29 @@ pub(crate) fn frame(app: &mut App, window: WindowId) -> Option<Result<FrameOutco
     if !app.windows.contains_key(&window) {
         return None;
     }
-    // B6-2：合成线程的**内容错误**（clip 链超限等）在这里冒泡。编码已不在 UI 线程，错误只能
-    // 经合成线程的错误槽回到 UI；本帧不再推进（错误是粘性的，调用方处理之后下一帧重试）。
+    // B6-2：合成线程的**活性**与**内容错误**都在这里冒泡。
+    //
+    // 活性（supervision）：帧管线是单点 —— 合成线程一旦意外退出，UI 照常发布、GPU 线程空等、
+    // 屏幕停在最后一帧，用户看到的就是「画面冻结而输入仍工作」。这里每帧入口监督一次：
+    // 线程已死就重启，并让**所有**窗口整帧重发（新线程没有 lane 历史，增量载荷会画成退化
+    // 实例）；重启失败 / 邮箱关闭则显式失败，绝不静默退化成空转。
+    match crate::render::compositor_thread::compositor().supervise() {
+        Ok(false) => {}
+        Ok(true) => {
+            let windows: Vec<WindowId> = app.windows.keys().copied().collect();
+            for target in windows {
+                if let Some(target) = app.windows.get_mut(&target) {
+                    target.force_full_republish();
+                }
+            }
+        }
+        Err(error) => {
+            app.record_idle(window);
+            return Some(Err(error));
+        }
+    }
+    // 合成线程的内容错误（clip 链超限等）：编码已不在 UI 线程，错误只能经合成线程的错误槽
+    // 回到 UI；本帧不再推进（错误是粘性的，调用方处理之后下一帧重试）。
     if let Some(error) = crate::render::compositor_thread::compositor().take_error() {
         app.record_idle(window);
         return Some(Err(error));

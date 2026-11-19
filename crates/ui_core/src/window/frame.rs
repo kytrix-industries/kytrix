@@ -162,6 +162,18 @@ pub(crate) fn note_reset_epoch(window: &mut Window, epoch: u64) -> bool {
     true
 }
 
+// 消费者：`impl Window::force_full_republish` 的薄委托（调用点：`App::frame`）。
+/// 消费端被重建（合成线程意外退出后重启）：下一次出帧必须**整帧**发布。
+///
+/// 与 [`note_reset_epoch`] 同一条 AR4 P1-1 纪律，但触发源不同：GPU 侧的代际由渲染器自己推进
+/// （设备恢复），而合成线程重启是**进程内新线程、没有 lane 历史** —— 它拿到的增量载荷只会
+/// 填「变化」的段，其余段会画成退化实例。新线程没有机会改渲染器代际，所以由这里显式置位。
+pub(crate) fn force_full_republish(window: &mut Window) {
+    window.delta_builder.force_full();
+    window.full_damage_pending = true;
+    window.request_repaint();
+}
+
 // 消费者：`impl Window::layout_if_dirty` 的薄委托（外部调用点见该方法文档）。
 /// 仅当有 `LAYOUT` 时才重排（纯颜色变化不跑布局）。
 pub(crate) fn layout_if_dirty(window: &mut Window) -> Result<Option<LayoutReport>, EngineError> {
@@ -309,7 +321,9 @@ fn release_unpublished(window: &mut Window) {
 /// 本帧的真实绘制统计。threaded 路径（真实窗口）返回 `None`：后端计数随 `FrameFeedback`
 /// 回来（`poll_renderer` 落账），提交路径没有同步值 —— 用默认值顶替会让 HUD 的 Draw/Inst 恒 0。
 ///
-/// GPU 线程的错误在 `poll_renderer` 里冒泡，提交路径没有同步错误。
+/// GPU 线程的错误在 `poll_renderer` 里冒泡；提交路径唯一的同步失败是「合成线程邮箱已关闭」
+/// （帧管线已死）—— 那种情况下本帧 delta 丢弃，错误登记到合成侧错误槽，由下一帧
+/// `App::frame` 的入口粘性冒泡（见 [`crate::render::compositor_thread::CompositorHandle::publish`]）。
 pub(crate) fn submit_gpu(
     window: &mut Window,
     renderer: &mut Renderer,
@@ -348,7 +362,15 @@ pub(crate) fn submit_gpu(
         }
         if let Some(mut delta) = window.pending_delta.take() {
             fill_header(&mut delta, window, index, plan, surface);
-            crate::render::compositor_thread::compositor().publish(delta);
+            // 邮箱已关闭 = 帧管线已死（合成线程意外退出且重启失败）：本帧 delta 丢弃。错误
+            // 已由 `CompositorHandle::publish` 登记到合成侧错误槽，下一帧 `App::frame` 的入口
+            // 会粘性冒泡；这里请求一帧，确保 UI 真的走到那次检查（**绝不静默冻结**）。
+            if crate::render::compositor_thread::compositor()
+                .publish(delta)
+                .is_err()
+            {
+                window.request_repaint();
+            }
         }
         // 帧不再经过 `Renderer::publish`：目标尺寸记账必须由 UI 侧补齐（否则 `Plan::Idle` 的帧
         // 会被反复判定为「有 GPU 工作」）。

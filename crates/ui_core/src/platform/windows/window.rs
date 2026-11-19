@@ -7,7 +7,11 @@
 //! [`Composition`] 合成的组合交换链提供。内容 visual 恒 1:1（resize 不缩放旧内容）；窗口放大
 //! 露出的新区域由下方独立的背景层填充。
 
-use std::sync::{Arc, Mutex};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
 
 use windows::Win32::{
     Foundation::{HWND, RECT},
@@ -25,7 +29,7 @@ use crate::{
         windows::{
             composition::{self, Composition},
             dpi,
-            event_loop::{WndProcState, wndproc},
+            event_loop::{ResizeFrameDriver, WndProcState, wndproc},
             ime,
         },
     },
@@ -72,6 +76,7 @@ impl NativeWindow {
         id: WindowId,
         options: &WindowOptions,
         dispatcher: Arc<Dispatcher>,
+        app: Option<&Rc<RefCell<App>>>,
     ) -> Result<Self, EngineError> {
         // SAFETY: 取本进程模块句柄（`None` = 当前可执行文件）；只读，不转移所有权。
         let instance = unsafe { GetModuleHandleW(None) }
@@ -108,11 +113,31 @@ impl NativeWindow {
         }
         .map_err(|error| window_error("CreateWindowExW", error))?;
 
-        let state = match WndProcState::new(dispatcher, hwnd, id) {
+        // 合成目标在窗口显示之前建立：`WS_EX_NOREDIRECTIONBITMAP` 的客户区只有 DComp 内容。
+        let composition = match Composition::new(hwnd) {
+            Ok(composition) => Arc::new(Mutex::new(composition)),
+            Err(error) => {
+                // SAFETY: 窗口刚由本函数创建，尚未交给任何其它所有者。
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                }
+                return Err(error);
+            }
+        };
+        // 系统 size 模态循环里的成帧驱动：有 `App` 才挂（平台单测可以只验证 `WndProc` 记账）。
+        let driver = app.map(|app| {
+            Rc::new(ResizeFrameDriver::new(
+                Rc::downgrade(app),
+                id,
+                Arc::clone(&composition),
+            ))
+        });
+        let state = match WndProcState::new(dispatcher, hwnd, id, driver) {
             Ok(state) => Box::into_raw(Box::new(state)),
             Err(error) => {
                 // a11y adapter 构造失败（`A11yInit`）：窗口还没显示，直接销毁，避免泄漏 HWND。
-                // SAFETY: 窗口刚由本函数创建，尚未交给任何其它所有者。
+                // SAFETY: 窗口刚由本函数创建，尚未交给任何其它所有者（`composition` 随本函数
+                // 返回一起释放；DComp 目标引用 HWND，必须先销毁窗口）。
                 unsafe {
                     let _ = DestroyWindow(hwnd);
                 }
@@ -121,20 +146,6 @@ impl NativeWindow {
         };
         // SAFETY: `hwnd` 刚创建且本函数独占；`state` 的所有权转移给 `NativeWindow`（Drop 回收）。
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize) };
-
-        // 合成目标在窗口显示之前建立：`WS_EX_NOREDIRECTIONBITMAP` 的客户区只有 DComp 内容。
-        let composition = match Composition::new(hwnd) {
-            Ok(composition) => Arc::new(Mutex::new(composition)),
-            Err(error) => {
-                // SAFETY: 窗口与 `state` 都还没有其它所有者（窗口未显示，`state` 刚由
-                // `Box::into_raw` 产生）；销毁窗口之后才能回收 `WndProc` 状态。
-                unsafe {
-                    let _ = DestroyWindow(hwnd);
-                    drop(Box::from_raw(state));
-                }
-                return Err(error);
-            }
-        };
 
         let mut window = Self {
             id,
@@ -531,8 +542,8 @@ mod tests {
         let mut app = App::new(runtime.handle().clone());
         let options = WindowOptions::default();
         let id = app.create_window(options.clone());
-        let mut native =
-            NativeWindow::create(id, &options, Dispatcher::new()).expect("NativeWindow::create");
+        let mut native = NativeWindow::create(id, &options, Dispatcher::new(), None)
+            .expect("NativeWindow::create");
 
         // SAFETY: 窗口由本用例持有且存活；上下文句柄成对释放。
         let baseline = unsafe { ImmGetContext(native.hwnd) };
@@ -601,8 +612,8 @@ mod tests {
         let mut app = App::new(runtime.handle().clone());
         let options = WindowOptions::default();
         let id = app.create_window(options.clone());
-        let mut native =
-            NativeWindow::create(id, &options, Dispatcher::new()).expect("NativeWindow::create");
+        let mut native = NativeWindow::create(id, &options, Dispatcher::new(), None)
+            .expect("NativeWindow::create");
 
         // 故意把 App 侧写成与平台不一致的值：恢复必须把它纠回平台真值。
         {

@@ -1,7 +1,7 @@
 //! `NativeWindow` 生命周期同步：运行时建窗 / 销毁、客户区尺寸 / DPI / surface 写入、
 //! 平台事件 → `App` 事件。自由函数由 `pump` 的每轮步骤调用（零行为变更的结构拆分）。
 
-use std::sync::Arc;
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use super::recovery;
 use crate::{
@@ -24,12 +24,14 @@ use crate::{
 ///
 /// 两件事：
 /// - **创建**：`App` 里存在但还没有原生窗口的 id ⇒ 建 `NativeWindow` + `Renderer`，并把
-///   尺寸 / DPI / surface 写回 `Window`（与启动路径同一套写入顺序）。
+///   尺寸 / DPI / surface 写回 `Window`（与启动路径同一套写入顺序）。新窗口带回
+///   `app_cell` 的弱引用（系统 size 模态循环里的成帧驱动）。
 /// - **销毁**：原生窗口对应的 `App` 窗口已经不存在 ⇒ `destroy()` + 从列表移除。
 ///   （用户点 X 的路径在 `close_requested_windows` 里，已经先 `app.close_window` 再 `destroy`，
 ///   这里只兜「应用自己关掉」的那一半。）
 pub(super) fn sync_native_windows(
     app: &mut App,
+    app_cell: &Rc<RefCell<App>>,
     windows: &mut Vec<NativeWindow>,
     dispatcher: &Arc<Dispatcher>,
 ) -> Result<bool, EngineError> {
@@ -52,7 +54,7 @@ pub(super) fn sync_native_windows(
         .map(|(id, window)| (id, window.options().clone()))
         .collect();
     for (id, options) in pending {
-        let mut native = NativeWindow::create(id, &options, dispatcher.clone())?;
+        let mut native = NativeWindow::create(id, &options, dispatcher.clone(), Some(app_cell))?;
         let client = native.client_size();
         let renderer = Renderer::new_for_hwnd(native.composition(), client, options.background)?;
         if let Some(window) = app.window_mut(id) {
@@ -326,8 +328,8 @@ mod tests {
         let options = WindowOptions::default();
         let id = app.create_window(options.clone());
         let dispatcher = Dispatcher::new();
-        let mut native =
-            NativeWindow::create(id, &options, Arc::clone(&dispatcher)).expect("NativeWindow");
+        let mut native = NativeWindow::create(id, &options, Arc::clone(&dispatcher), None)
+            .expect("NativeWindow");
         let _ = dispatcher.take_frame_wake();
 
         native.state_mut().note_display_recovery();
@@ -366,7 +368,8 @@ mod tests {
         let options = WindowOptions::default();
         let id = app.create_window(options.clone());
         let dispatcher = Dispatcher::new();
-        let native = NativeWindow::create(id, &options, Arc::clone(&dispatcher)).expect("window");
+        let native =
+            NativeWindow::create(id, &options, Arc::clone(&dispatcher), None).expect("window");
         let _ = dispatcher.take_frame_wake();
 
         let mut windows = vec![native];

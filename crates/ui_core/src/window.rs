@@ -189,17 +189,15 @@ pub enum WindowResizeEdge {
 ///
 /// # Windows 标题栏 / 非客户区交互
 ///
-/// **caption / 系统按钮交系统，resize 自持**（P-A；取代 R07-2 的「非客户区全交系统」）：
-/// `WM_NCCALCSIZE` / `WM_NCHITTEST` 仍交 `DefWindowProcW`（系统命中码、标题栏与边框几何由它算），
-/// `HTCAPTION` / `HTSYSMENU` / 最小化 / 最大化 / 关闭按钮的 `WM_NCLBUTTONDOWN` 也交系统 ——
-/// 拖动标题栏、双击最大化/还原、右键系统菜单、`Alt+Space` 与 **Aero Snap / Win11 Snap Layouts**
-/// 都只存在于系统的 move 模态循环内部（Chrome / GPUI / Qt 同样不接管它们）。
+/// **非客户区全部交系统**（R07-2）：`WM_NCCALCSIZE` / `WM_NCHITTEST` / `WM_NCLBUTTONDOWN`
+/// 都不改写 —— 拖动标题栏、双击最大化/还原、右键系统菜单、`Alt+Space`、**Aero Snap /
+/// Win11 Snap Layouts** 与边框拖拽都由系统的 move / size 模态循环提供（Chrome / GPUI / Qt
+/// 同样不接管它们）。
 ///
-/// **8 个 resize 命中码（`HTLEFT`…`HTBOTTOMRIGHT`）由引擎自持**：系统的 resize 模态循环会占住
-/// 本线程消息泵，窗口内容在拖动中无法按新尺寸重排/重绘。引擎改为 `WndProc` 只记账（起始外框 /
-/// 光标 / 边掩码），泵每一轮应用一次 `SetWindowPos`，随后走现有 `set_size` / `set_surface` →
-/// 重排 → 重绘 → present 链路 —— 拖动/缩放中每一步都是**真实帧**（不是拉伸旧帧），且不引入
-/// 定时器或额外帧。决策与取舍见 `.docs/ui_core-决策-resize自持与HUD观察者.md`。
+/// 系统 size 模态循环会占住本线程消息泵，但**重排 + 重绘不会停**：模态循环把 `WM_SIZE`
+/// 同步分派到 `WndProc`，平台层在每条 `WM_SIZE` 上直接更新客户区、对齐 DirectComposition
+/// 几何并跑一帧完整帧（`platform::windows::event_loop::ResizeFrameDriver`）—— 拖动/缩放中
+/// 每一步都是**真实帧**（不是拉伸旧帧），且不引入定时器或额外帧。
 #[derive(Clone, Debug, PartialEq)]
 pub struct WindowOptions {
     /// 标题（`SmolStr`，AGENTS §2.2）。
@@ -215,8 +213,9 @@ pub struct WindowOptions {
     ///   独立 1×1 背景层的颜色（DirectComposition 的组合交换链**没有**可用的
     ///   `SetBackgroundColor`，probe 实测返回 OK 但惰性）。背景层的角色是**≤1 帧接缝**
     ///   （几何已提交、真实帧还在飞）、首帧、DPI 切换与平台尚未出帧的路径：它是纯色填充，
-    ///   既不拉伸旧内容，**也不是**拖动/缩放期的画面来源 —— 拖动由引擎自持 resize 逐步真实
-    ///   重排 + 重绘（P-A，见上）。旧内容保持 1:1（DEVIATIONS §36 F-205 / S-152）。
+    ///   既不拉伸旧内容，**也不是**拖动/缩放期的画面来源 —— 拖动期间每条 `WM_SIZE` 都由
+    ///   `ResizeFrameDriver` 驱动一帧真实帧（见上）。旧内容保持 1:1（DEVIATIONS §36 F-205 /
+    ///   S-152）。
     /// - macOS：既填旧 drawable **之外**的 `CAMetalLayer.backgroundColor`（sRGB `CGColor`），
     ///   也用于 persist clear 的**未覆盖像素**（linear，`render::color::background_linear`）。
     /// - Linux：只用于 persist clear 的**未覆盖像素**（linear，Vulkan sRGB attachment，
@@ -403,13 +402,6 @@ pub struct Window {
     paint_order: Vec<crate::paint::scene::LaneId>,
     /// 尺寸/DPI 变化 ⇒ 必须整帧重绘（S-64）。
     full_damage_pending: bool,
-    /// 最近一次**完成**（GPU 线程反馈）帧的 `FrameIndex`；`None` = 还没观测到完成帧。
-    ///
-    /// 拖动期出帧背压（P-D，`platform::windows::event_loop::pump::ResizePacing`）用它算流水线
-    /// 深度：`已发布序号 − 已上屏序号`。只有 Windows 需要它（其它平台没有自持 resize 的背压），
-    /// 因此按 `cfg(windows)` 存在，避免另一端出现 dead code。
-    #[cfg(windows)]
-    last_presented_frame: Option<FrameIndex>,
     /// `App::frame` 在提交前写入的帧统计（仅 `test-support`）。
     #[cfg(feature = "test-support")]
     stats: FrameStats,
@@ -495,8 +487,6 @@ impl Window {
             timings: FrameTimings::new(),
             paint_order: Vec::new(),
             full_damage_pending: false,
-            #[cfg(windows)]
-            last_presented_frame: None,
             #[cfg(feature = "test-support")]
             stats: FrameStats::default(),
             #[cfg(feature = "test-support")]
@@ -635,6 +625,10 @@ impl Window {
     pub(crate) fn begin_frame(&mut self) -> Option<FrameTicket> {
         frame::begin_frame(self)
     }
+    /// 实现见子模块 `frame::force_full_republish`（合成线程重启之后整帧重发）。
+    pub(crate) fn force_full_republish(&mut self) {
+        frame::force_full_republish(self);
+    }
     pub(crate) fn layout_if_dirty(&mut self) -> Result<Option<LayoutReport>, EngineError> {
         frame::layout_if_dirty(self)
     }
@@ -664,15 +658,6 @@ impl Window {
     #[must_use]
     pub fn frame_index(&self) -> FrameIndex {
         frame::frame_index(self)
-    }
-    /// 最近一次**完成**帧的 `FrameIndex`（Windows 拖动期出帧背压用；`None` = 还没有完成反馈）。
-    ///
-    /// 三端反馈槽里都带 `FrameFeedback::index`，但只有 Windows 的自持 resize 背压消费它，
-    /// 见字段文档（`cfg(windows)`）。
-    #[cfg(windows)]
-    #[must_use]
-    pub(crate) fn last_presented_frame(&self) -> Option<FrameIndex> {
-        surface::last_presented_frame(self)
     }
     /// 实现见子模块 `frame::compute_layout`（本文件只保留签名）。
     pub fn compute_layout(&mut self) -> Result<LayoutReport, EngineError> {
