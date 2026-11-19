@@ -711,7 +711,13 @@ pub enum A11yDrawKind {
 }
 
 /// a11y 诊断（结构化字段；对齐 `text::TextDiagnostic::FontStackMiss` 的形态）。
+///
+/// `#[non_exhaustive]`：诊断是**观测/日志面**，会随实现补充变体（E3/E4 一次新增了
+/// `ReadOnlyAction` / `UnadvertisedAction` / `InvalidActionData` 三个）；外部只应
+/// `matches!` / `match ... { .. }` 处理自己关心的变体，不依赖穷举 —— 与 `A11yLive` 同风格。
+/// （`EngineError` 刻意保持穷举：调用方要按错误类型决定处理策略，诊断不参与控制流。）
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum A11yDiagnostic {
     /// `Canvas` / `Geometry` 缺替代文本（节点被标 `hidden`，**不**静默丢弃）。
     MissingAltText {
