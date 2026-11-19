@@ -218,6 +218,12 @@ impl WndProcState {
         self.scale
     }
 
+    /// 平台 IME 是否处于组合中（B6/D6：禁用 / 失焦路径据此决定是否补恰好一条
+    /// `ImeEvent::End`；组合态由 `ImeState` 记账）。
+    pub(crate) fn ime_composing(&self) -> bool {
+        self.translate.ime().is_composing()
+    }
+
     /// `WM_DPICHANGED` 的同步记账（R07-12）：新比例 + 新的最小/最大跟踪尺寸。
     ///
     /// 必须在**投递 `Dpi` 事件之前**、在 `SetWindowPos(建议矩形)` 之前调用：`SetWindowPos`

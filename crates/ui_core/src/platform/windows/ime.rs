@@ -128,6 +128,13 @@ pub(crate) struct ImeState {
     pending_ticks: u32,
     /// 当前消息批次序号。
     batch: u64,
+    /// 平台 IME 是否处于**组合中**（`WM_IME_STARTCOMPOSITION` 置位，组合结束 / 失焦 / 禁用清零）。
+    ///
+    /// 这是「失焦时补**恰好一条** [`ImeEvent::End`]」的裁决依据（B6/D6 三端统一语义）：
+    /// Win32 **不保证**失焦时一定先派发 `WM_IME_ENDCOMPOSITION`，所以 WndProc 在
+    /// `WM_KILLFOCUS` 里按这个状态补一条；补完清零后，系统迟到的
+    /// `WM_IME_ENDCOMPOSITION` 不再重复投递（同样由这里判定）。
+    composing: bool,
 }
 
 /// 提交抑制队列跨过的**批次**上限：入队批次 + 紧随其后的一轮。
@@ -152,6 +159,7 @@ impl Default for ImeState {
             pending_batch: None,
             pending_ticks: 0,
             batch: 0,
+            composing: false,
         }
     }
 }
@@ -173,6 +181,7 @@ impl ImeState {
                 // 没到达的也不会再来）。清掉队列，避免把新组合之后的真实键入当成残留吞掉
                 // （AR1b P3-2：旧注释承诺了这一点，代码只在失焦/禁用/销毁时清）。
                 self.clear_pending();
+                self.composing = true;
                 // 组合开始时重放 caret 位置（上下文可能在禁用/启用之间换过，表单不保证还在）。
                 // 这里的 `ImmSet*Window` 会重入 `WndProc`，所以只产命令、不在这里调用。
                 ImeOutcome {
@@ -194,6 +203,9 @@ impl ImeState {
                     self.queue_commit(text, ticks_ms);
                 }
                 let read = if flags & GCS_COMPSTR.0 != 0 {
+                    // 第三方 IME 可能不发 `WM_IME_STARTCOMPOSITION` 就直接送组合串：只要本报文
+                    // 带组合串就记成「组合中」，失焦 / 禁用路径才补得出 `ImeEvent::End`。
+                    self.composing = true;
                     read_composition(hwnd, flags)
                 } else {
                     None
@@ -203,12 +215,36 @@ impl ImeState {
                     command: None,
                 }
             }
-            WM_IME_ENDCOMPOSITION => ImeOutcome {
-                events: smallvec![ImeEvent::End],
-                command: None,
-            },
+            WM_IME_ENDCOMPOSITION => {
+                // 恰好一条 `End`：只有确实处于组合中才投递。失焦 / 禁用路径可能已经合成过一条
+                //（组合态已清零），系统随后迟到的这条 `WM_IME_ENDCOMPOSITION` 不得重复投递。
+                let composing = std::mem::take(&mut self.composing);
+                ImeOutcome {
+                    events: if composing {
+                        smallvec![ImeEvent::End]
+                    } else {
+                        SmallVec::new()
+                    },
+                    command: None,
+                }
+            }
             _ => ImeOutcome::default(),
         }
+    }
+
+    /// 平台 IME 是否处于组合中（失焦 / 禁用的清场路径据此决定是否补 `ImeEvent::End`）。
+    pub(crate) fn is_composing(&self) -> bool {
+        self.composing
+    }
+
+    /// 结束平台组合状态（失焦 / 窗口销毁 / IME 状态切换）：返回**至多一条** `ImeEvent::End`。
+    ///
+    /// 组合中调用恰好返回一条 `End` 并把状态清零：之后系统迟到的 `WM_IME_ENDCOMPOSITION`
+    /// 走 [`Self::handle`] 时组合态已是 false，不会重复投递。不在组合中则返回 `None`。
+    /// 同时清空待抑制码元队列（失焦后的 `WM_CHAR` 不会再来，残留会吞掉之后的真实键入）。
+    pub(crate) fn finish_composition(&mut self) -> Option<ImeEvent> {
+        self.clear_pending();
+        std::mem::take(&mut self.composing).then_some(ImeEvent::End)
     }
 
     /// `WM_CHAR` 是否应被 IME 提交吞掉（提交后 Windows 会再发同样的字符）。
@@ -302,9 +338,11 @@ impl ImeState {
                 None => ImeCommand::AssociateDefault,
             })
         } else {
-            // 禁用：摘下上下文，并清掉未消费的抑制队列（否则重新启用后第一次真实输入会被
-            // 上一次提交的余数吞掉）。
+            // 禁用：摘下上下文，并清掉未消费的抑制队列与平台组合态（否则重新启用后第一次
+            // 真实输入会被上一次提交的余数吞掉；残留的「组合中」还会让失焦路径补一条过期的
+            // `ImeEvent::End`）。`End` 本身由泵侧 `sync_ime_enabled` 按禁用前的组合快照补发。
             self.clear_pending();
+            self.composing = false;
             Some(ImeCommand::Associate(None))
         }
     }
@@ -329,6 +367,9 @@ impl ImeState {
     pub(crate) fn plan_release_before_destroy(&mut self) -> Option<ImeCommand> {
         self.enabled = true;
         self.clear_pending();
+        // 窗口销毁 = 平台组合一起消失：清组合态，避免残留状态影响（进程内可能还有别的窗口）。
+        // 应用侧已经收到关闭请求 / 收到窗口销毁，不需要再补 `End`。
+        self.composing = false;
         self.saved_context
             .take()
             .map(|context| ImeCommand::Associate(Some(context)))
@@ -702,7 +743,7 @@ mod tests {
             },
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, WINDOW_EX_STYLE,
-                WM_IME_STARTCOMPOSITION, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+                WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WNDCLASSW, WS_OVERLAPPEDWINDOW,
             },
         },
     };
@@ -1267,5 +1308,72 @@ mod tests {
         takes(ImeCommand::Associate(None));
         takes(ImeCommand::AssociateDefault);
         takes(ImeCommand::SetCaret(PhysicalRect::new(0, 0, 1, 1)));
+    }
+
+    // ── B6/D6：失焦 / 禁用时的组合清场（恰好一条 End）─────────────────────────────
+
+    /// 组合中失焦：清场返回**恰好一条** `ImeEvent::End`；系统随后迟到的
+    /// `WM_IME_ENDCOMPOSITION` 不得重复投递（组合态已清零），再次清场也不得再补。
+    #[test]
+    fn a_focus_loss_during_composition_emits_exactly_one_end() {
+        let (hwnd, _class) = hidden_window("KytrixImeFocusLoss");
+        let mut state = ImeState::default();
+        let start = state.handle(hwnd, WM_IME_STARTCOMPOSITION, 0, 0);
+        assert!(matches!(start.events.as_slice(), [ImeEvent::Start]));
+        assert!(state.is_composing(), "START 后平台必须记为组合中");
+
+        assert_eq!(state.finish_composition(), Some(ImeEvent::End));
+        assert!(!state.is_composing(), "补发 End 后组合态必须清零");
+        assert_eq!(state.finish_composition(), None, "重复清场不得再补 End");
+
+        let late = state.handle(hwnd, WM_IME_ENDCOMPOSITION, 0, 0);
+        assert!(
+            late.events.is_empty(),
+            "系统迟到的 WM_IME_ENDCOMPOSITION 不得重复投递 End"
+        );
+    }
+
+    /// 不在组合中失焦：不得凭空补 `End`。
+    #[test]
+    fn a_focus_loss_outside_composition_emits_no_end() {
+        let mut state = ImeState::default();
+        assert!(!state.is_composing());
+        assert_eq!(state.finish_composition(), None);
+    }
+
+    /// 孤立 `WM_IME_ENDCOMPOSITION`（没有对应 START）不投递 `End`：协议上 END 只配 START，
+    /// 且失焦 / 禁用清场后迟到的 END 必须被吞掉 —— 否则「恰好一条」不成立。
+    #[test]
+    fn an_end_composition_without_a_live_composition_emits_nothing() {
+        let (hwnd, _class) = hidden_window("KytrixImeStrayEnd");
+        let mut state = ImeState::default();
+        let outcome = state.handle(hwnd, WM_IME_ENDCOMPOSITION, 0, 0);
+        assert!(outcome.events.is_empty());
+    }
+
+    /// 禁用 IME 时平台组合态一起清掉（`End` 由泵侧 `sync_ime_enabled` 按禁用前快照补发）；
+    /// 清掉之后失焦路径不得再补一条过期的 `End`。
+    #[test]
+    fn disabling_the_ime_clears_the_composition_state() {
+        let (hwnd, _class) = hidden_window("KytrixImeDisable");
+        let mut state = ImeState::default();
+        assert_eq!(
+            state
+                .handle(hwnd, WM_IME_STARTCOMPOSITION, 0, 0)
+                .events
+                .len(),
+            1
+        );
+        assert!(state.is_composing());
+
+        let command = state.plan_enabled(false);
+
+        assert!(command.is_some());
+        assert!(!state.is_composing(), "禁用必须清平台组合态");
+        assert_eq!(
+            state.finish_composition(),
+            None,
+            "禁用清场后的失焦不得补过期 End"
+        );
     }
 }

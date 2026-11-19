@@ -36,9 +36,9 @@ use windows::Win32::{
             SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SPI_SETANIMATION, SPI_SETWORKAREA, SendMessageW,
             SetWindowLongPtrW, WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_DISPLAYCHANGE,
             WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_IME_CHAR,
-            WM_IME_COMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_INPUTLANGCHANGE,
-            WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOVE, WM_NCHITTEST, WM_POWERBROADCAST,
-            WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+            WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
+            WM_INPUTLANGCHANGE, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOVE, WM_NCHITTEST,
+            WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
         },
     },
 };
@@ -1780,4 +1780,84 @@ fn entering_the_modal_loop_reposts_a_wake_that_was_dispatched_but_not_consumed()
         SendMessageW(hwnd, WM_EXITSIZEMOVE, None, None);
     }
     assert!(!dispatcher.in_modal_loop());
+}
+
+// ── B6/D6：Windows IME 失焦对齐（组合中失焦恰好一条 `ImeEvent::End`）──────────────────
+
+/// 组合中 `WM_KILLFOCUS`：必须补**恰好一条** `ImeEvent::End`（Win32 不保证失焦会先派发
+/// `WM_IME_ENDCOMPOSITION`），系统随后迟到的 `WM_IME_ENDCOMPOSITION` 不得重复投递；
+/// `Focus(false)` 事件仍在，且 `End` 先于 `Focus(false)`（先结束组合、再通知失焦）。
+#[test]
+fn losing_keyboard_focus_during_composition_emits_exactly_one_ime_end() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, _class) = hidden_window("KytrixWndProcImeFocusLoss", dispatcher);
+    // SAFETY: `state` 由 `hidden_window` 分配、生命周期到测试结束。
+    let raw = unsafe { &mut *state };
+    // SAFETY: 窗口由本测试创建且仍存活；`SendMessageW` 同步进入生产 `wndproc`。
+    unsafe {
+        SendMessageW(hwnd, WM_IME_STARTCOMPOSITION, None, None);
+    }
+    assert!(
+        raw.take_events()
+            .iter()
+            .any(|event| matches!(event.event, PlatformEvent::Ime(ImeEvent::Start))),
+        "前置：启用态组合开始必须派发 Start"
+    );
+
+    // SAFETY: 同上。第二次 KILLFOCUS 用于验证组合态清零后不会重复补 End。
+    unsafe {
+        SendMessageW(hwnd, WM_KILLFOCUS, None, None);
+        SendMessageW(hwnd, WM_KILLFOCUS, None, None);
+        SendMessageW(hwnd, WM_IME_ENDCOMPOSITION, None, None);
+    }
+    let events = raw.take_events();
+    let ends: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| matches!(event.event, PlatformEvent::Ime(ImeEvent::End)))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        ends.len(),
+        1,
+        "组合中失焦必须补恰好一条 ImeEvent::End（实际 {:?}）",
+        events.iter().map(|event| &event.event).collect::<Vec<_>>()
+    );
+    let focus_lost = events
+        .iter()
+        .position(|event| matches!(event.event, PlatformEvent::Focus(false)))
+        .expect("失焦必须派发 Focus(false)");
+    assert!(
+        ends[0] < focus_lost,
+        "End 必须先于 Focus(false)（先结束组合、再通知失焦）"
+    );
+}
+
+/// 不在组合中失焦：不得凭空补 `ImeEvent::End`；后续孤立 `WM_IME_ENDCOMPOSITION` 也不得投递。
+#[test]
+fn losing_keyboard_focus_outside_composition_emits_no_ime_end() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, _class) = hidden_window("KytrixWndProcImeNoComposition", dispatcher);
+    // SAFETY: `state` 由 `hidden_window` 分配、生命周期到测试结束。
+    let raw = unsafe { &mut *state };
+    // SAFETY: 窗口由本测试创建且仍存活；`SendMessageW` 同步进入生产 `wndproc`。
+    unsafe {
+        SendMessageW(hwnd, WM_KILLFOCUS, None, None);
+        SendMessageW(hwnd, WM_IME_ENDCOMPOSITION, None, None);
+    }
+    let events = raw.take_events();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.event, PlatformEvent::Ime(ImeEvent::End))),
+        "没有组合时失焦不得补 End"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.event, PlatformEvent::Focus(false))),
+        "失焦事件本身仍必须派发"
+    );
 }

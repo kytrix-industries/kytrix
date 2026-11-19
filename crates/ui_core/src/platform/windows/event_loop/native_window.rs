@@ -343,7 +343,17 @@ pub(super) fn apply_event(
             dispatcher.wake();
             Event::DpiChanged { dpi, scale }
         }
-        PlatformEvent::Focus(focused) => Event::FocusChanged { focused },
+        PlatformEvent::Focus(focused) => {
+            if !focused {
+                // Windows IME 失焦对齐（B6/D6 三端统一）：窗口失去键盘焦点 = 本窗口的文本焦点
+                // 也结束，引擎统一清应用侧 caret hint（平台 IME 表单在下一轮 ④′ 由
+                // `sync_ime_cursor_area` 按清空后的 hint 清掉）。`WndProc` 不碰 `App`，所以这里
+                // 是唯一清点；应用若在 `FocusChanged` 处理器里重新聚焦文本节点，可以直接再
+                // `set_ime_cursor_area`（清点在派发事件**之前**，不会被覆盖顺序坑）。
+                app.clear_ime_cursor_area(id);
+            }
+            Event::FocusChanged { focused }
+        }
         PlatformEvent::Appearance(dark) => Event::AppearanceChanged { dark },
         PlatformEvent::Close => Event::CloseRequested,
     };
@@ -355,11 +365,19 @@ pub(super) fn apply_event(
 mod tests {
     use std::sync::Arc;
 
-    use super::{apply_display_recovery, resolve_owner};
+    use super::{apply_display_recovery, apply_event, resolve_owner};
     use crate::{
         app::App,
-        platform::{dispatcher::Dispatcher, windows::window::NativeWindow},
+        event::Event,
+        math::Scale,
+        node::builder::NodeBuilder,
+        platform::{
+            dispatcher::Dispatcher,
+            event::{PlatformEvent, StampedEvent},
+            windows::window::NativeWindow,
+        },
         render::windows::display,
+        text::TextStyle,
         window::{FrameOutcome, WindowOptions},
     };
 
@@ -469,6 +487,68 @@ mod tests {
             resolve_owner(&options, &[]),
             None,
             "没有 owner 时直接返回 None"
+        );
+    }
+
+    /// B6/D6（Windows 对齐）：窗口失去键盘焦点（`PlatformEvent::Focus(false)`）时，泵侧必须清
+    /// 应用侧 IME caret hint（`WndProc` 不碰 `App`，清点只能在泵路径）；`FocusChanged { false }`
+    /// 事件本身照常入队派发。
+    #[test]
+    fn losing_window_focus_clears_the_app_ime_caret_hint() {
+        let runtime = runtime();
+        let mut app = App::new(runtime.handle().clone());
+        let options = WindowOptions::default();
+        let id = app.create_window(options.clone());
+        // 文本节点 + 真实 shape 后才有 IME caret hint（与 `window.rs` 的 IME 用例同款前置）。
+        let node = {
+            let window = app.window_mut(id).expect("窗口存在");
+            let root = window.tree().root();
+            NodeBuilder::text("abc", TextStyle::new(16.0))
+                .build(window.tree_mut(), root)
+                .expect("文本节点")
+        };
+        let _ = app.refresh_text(id).expect("窗口存在").expect("文本 pass");
+        let _ = app
+            .window_mut(id)
+            .expect("窗口存在")
+            .compute_layout()
+            .expect("布局");
+        let _ = app.layout_text(id).expect("窗口存在").expect("文本重排");
+        app.set_ime_cursor_area(id, node, 1).expect("caret hint");
+        assert!(
+            app.ime_cursor_area(id).expect("窗口存在").is_some(),
+            "前置：文本 shape 后必须有 caret hint"
+        );
+
+        let dispatcher = Dispatcher::new();
+        let mut native = NativeWindow::create(id, &options, None, Arc::clone(&dispatcher), None)
+            .expect("window");
+        let _ = dispatcher.take_frame_wake();
+        apply_event(
+            &mut app,
+            &mut native,
+            &dispatcher,
+            id,
+            StampedEvent {
+                event: PlatformEvent::Focus(false),
+                ticks_ms: 0,
+                scale: Scale::ONE,
+            },
+            std::time::Instant::now(),
+            0,
+        )
+        .expect("apply_event");
+
+        assert_eq!(
+            app.ime_cursor_area(id).expect("窗口存在"),
+            None,
+            "窗口失焦必须清应用侧 IME caret hint"
+        );
+        assert!(
+            app.drain_events().iter().any(|(window, event)| {
+                *window == id && matches!(event, Event::FocusChanged { focused: false })
+            }),
+            "失焦事件本身仍必须派发"
         );
     }
 }

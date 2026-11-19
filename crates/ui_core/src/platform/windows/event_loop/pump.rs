@@ -855,8 +855,9 @@ pub(super) fn pump_loop(
                 // 区域变化由应用在布局/尺寸变化后调 `App::set_drag_regions`，同值 no-op）。
                 native.sync_drag_regions(&app);
                 // IME 启用状态先于 caret hint：刚禁用时不必再写表单，刚启用时要重发 hint
-                //（`sync_ime_enabled` 会清掉 `ime_area` 缓存）。
-                native.sync_ime_enabled(&app);
+                //（`sync_ime_enabled` 会清掉 `ime_area` 缓存；禁用瞬间还在组合中时它会补一条
+                // `ImeEvent::End` 并清应用侧 caret hint，因此要 `&mut App`）。
+                native.sync_ime_enabled(&mut app);
                 native.sync_ime_cursor_area(&app);
             }
         }

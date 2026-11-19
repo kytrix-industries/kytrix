@@ -321,6 +321,26 @@ pub(crate) extern "system" fn wndproc(
             }
         }
         if matches!(msg, WM_KILLFOCUS | WM_ENTERMENULOOP | WM_ENTERSIZEMOVE) {
+            // IME 失焦对齐（B6/D6 三端统一语义）：窗口真的失去键盘焦点时，组合中补**恰好
+            // 一条** `ImeEvent::End`。Win32 **不保证**失焦一定先派发
+            // `WM_IME_ENDCOMPOSITION`（TSF / 第三方 IME 可以先丢焦点、稍后才结束上下文），
+            // 不补的话应用会永久停在 inline preedit。组合态由 `ImeState` 记账：这里补过一条后
+            // 状态清零，系统随后迟到的 `WM_IME_ENDCOMPOSITION` 不再重复投递。
+            //
+            // 应用侧 caret hint 由泵路径清（`native_window::apply_event` 的 `Focus(false)` 分支，
+            // `WndProc` 不碰 `App`）。
+            if msg == WM_KILLFOCUS {
+                let ticks = message_ticks();
+                if let Some(end) = (*state).translate.ime_mut().finish_composition() {
+                    let scale = (*state).scale();
+                    (*state).push_stamped_event(StampedEvent {
+                        event: PlatformEvent::Ime(end),
+                        ticks_ms: ticks,
+                        scale,
+                    });
+                    (*state).wake();
+                }
+            }
             // 丢失键盘焦点时必须**复位瞬时输入状态**（P2-6）：
             //
             // 修饰键是按消息顺序维护的（按下置位、抬起清位）。失焦期间抬起消息不再到达本窗口，

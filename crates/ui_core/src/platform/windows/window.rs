@@ -27,6 +27,7 @@ use windows::Win32::{
 use crate::{
     app::App,
     error::EngineError,
+    event::{Event, ImeEvent},
     math::{PhysicalRect, Rect, Scale, Size},
     platform::{
         dispatcher::Dispatcher,
@@ -509,13 +510,20 @@ impl NativeWindow {
     /// 系统新建的默认上下文，之前写的组合/候选窗表单不保证还在，下一轮
     /// [`Self::sync_ime_cursor_area`] 必须重发。
     ///
+    /// **禁用时的清场语义**（B6/D6 三端统一）：先清应用侧 caret hint；若禁用瞬间平台仍在
+    /// 组合中，再补**恰好一条** [`ImeEvent::End`]（与失焦路径一致，应用不会停在 preedit）。
+    /// 组合态由 `ImeState` 记账，系统之后迟到的 `WM_IME_ENDCOMPOSITION` 会被禁用分支吞掉，
+    /// 不会重复投递。
+    ///
     /// 两阶段执行的原因同 [`Self::sync_ime_cursor_area`]：`ImmAssociateContext*` 会同步派发
     /// `WM_IME_SETCONTEXT`。
-    pub(crate) fn sync_ime_enabled(&mut self, app: &App) {
+    pub(crate) fn sync_ime_enabled(&mut self, app: &mut App) {
         let enabled = app.ime_enabled(self.id);
         if self.state_mut().ime_enabled() == enabled {
             return;
         }
+        // 禁用前的组合快照：`plan_ime_enabled(false)` 会清平台组合态，End 要在那之前判定。
+        let was_composing = !enabled && self.state_mut().ime_composing();
         let hwnd = self.hwnd;
         let command = self.state_mut().plan_ime_enabled(enabled);
         if let Some(command) = command {
@@ -523,6 +531,12 @@ impl NativeWindow {
             self.state_mut().note_ime_applied(applied);
         }
         self.ime_area = None;
+        if !enabled {
+            app.clear_ime_cursor_area(self.id);
+            if was_composing {
+                app.dispatch(self.id, Event::Ime(ImeEvent::End));
+            }
+        }
     }
 
     /// 把 `App` 里最新的自绘标题栏拖动区对账到 `WndProcState`（X2；泵每轮调用）。
@@ -754,16 +768,19 @@ mod tests {
             KeyboardAndMouse::IsWindowEnabled,
         },
         WindowsAndMessaging::{
-            GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetWindow, GetWindowLongPtrW, IsWindow, WS_CHILD,
-            WS_EX_TOPMOST,
+            GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetWindow, GetWindowLongPtrW, IsWindow, SendMessageW,
+            WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WS_CHILD, WS_EX_TOPMOST,
         },
     };
 
     use super::{NativeWindow, refresh_hz_from_display_frequency};
     use crate::{
         app::App,
+        event::{Event, ImeEvent},
         math::{Rect, Scale, Size},
+        node::builder::NodeBuilder,
         platform::dispatcher::Dispatcher,
+        text::TextStyle,
         window::{WindowId, WindowOptions},
     };
     fn runtime() -> tokio::runtime::Runtime {
@@ -800,7 +817,7 @@ mod tests {
 
         // 目标状态与已应用状态相同：`sync_ime_enabled` 直接返回，不清 caret 缓存。
         native.ime_area = Some((Rect::new(0.0, 0.0, 1.0, 18.0), Scale::ONE));
-        native.sync_ime_enabled(&app);
+        native.sync_ime_enabled(&mut app);
         assert!(
             native.ime_area.is_some(),
             "目标状态未变化时不得清 caret 缓存"
@@ -809,7 +826,7 @@ mod tests {
         // 禁用：`App` 目标状态变化 ⇒ 摘除上下文，并清 caret 缓存（恢复的上下文不保证保留
         // 之前写的组合/候选窗表单，下一轮必须重发）。
         app.set_ime_enabled(id, false);
-        native.sync_ime_enabled(&app);
+        native.sync_ime_enabled(&mut app);
         assert!(
             !native.state_mut().ime_enabled(),
             "禁用态必须应用到平台状态"
@@ -823,7 +840,7 @@ mod tests {
 
         // 重新启用：还回保存的上下文（没有保存值则 `IACE_DEFAULT` 让系统关联默认上下文）。
         app.set_ime_enabled(id, true);
-        native.sync_ime_enabled(&app);
+        native.sync_ime_enabled(&mut app);
         assert!(native.state_mut().ime_enabled(), "启用态必须应用到平台状态");
         // SAFETY: 同上。
         let restored = unsafe { ImmGetContext(native.hwnd) };
@@ -839,7 +856,7 @@ mod tests {
         // 销毁前恢复：`destroy` 必须先执行 `plan_ime_release` 的命令（它会把已应用状态置回
         // 启用）；若这一步被删掉，状态会停在禁用态。
         app.set_ime_enabled(id, false);
-        native.sync_ime_enabled(&app);
+        native.sync_ime_enabled(&mut app);
         assert!(!native.state_mut().ime_enabled(), "前置：窗口处于禁用态");
         native.destroy();
         assert!(
@@ -1107,5 +1124,79 @@ mod tests {
         // 引擎侧销毁路径对已经失效的句柄必须安全失败：`Composition::shutdown` 忽略错误、
         // `DestroyWindow` 返回错误被忽略，不 panic。
         owned.destroy();
+    }
+
+    /// B6/D6（Windows 对齐）：禁用 IME 瞬间平台仍在组合中 ⇒ 泵侧同步清场：应用侧 caret hint
+    /// 清零 + 补**恰好一条** `ImeEvent::End`；系统迟到的 `WM_IME_ENDCOMPOSITION` 被禁用分支
+    /// 吞掉，不会重复投递。
+    #[test]
+    fn disabling_the_ime_during_composition_emits_one_end_and_clears_the_caret_hint() {
+        let runtime = runtime();
+        let mut app = App::new(runtime.handle().clone());
+        let options = WindowOptions::default();
+        let id = app.create_window(options.clone());
+        // 文本节点 + 真实 shape，才有 IME caret hint（`App::set_ime_cursor_area` 要求 TextShape）。
+        let node = {
+            let window = app.window_mut(id).expect("窗口存在");
+            let root = window.tree().root();
+            NodeBuilder::text("abc", TextStyle::new(16.0))
+                .build(window.tree_mut(), root)
+                .expect("文本节点")
+        };
+        let _ = app.refresh_text(id).expect("窗口存在").expect("文本 pass");
+        let _ = app
+            .window_mut(id)
+            .expect("窗口存在")
+            .compute_layout()
+            .expect("布局");
+        let _ = app.layout_text(id).expect("窗口存在").expect("文本重排");
+        app.set_ime_cursor_area(id, node, 1).expect("caret hint");
+        assert!(
+            app.ime_cursor_area(id).expect("窗口存在").is_some(),
+            "前置：文本 shape 后必须有 caret hint"
+        );
+
+        let mut native = NativeWindow::create(id, &options, None, Dispatcher::new(), None)
+            .expect("NativeWindow::create");
+        let hwnd = native.hwnd;
+        // SAFETY: 窗口由本用例持有且仍存活；`SendMessageW` 同步进入生产 `wndproc`。
+        unsafe {
+            SendMessageW(hwnd, WM_IME_STARTCOMPOSITION, None, None);
+        }
+
+        app.set_ime_enabled(id, false);
+        native.sync_ime_enabled(&mut app);
+
+        assert_eq!(
+            app.ime_cursor_area(id).expect("窗口存在"),
+            None,
+            "禁用 IME 必须清应用侧 caret hint"
+        );
+        let events: Vec<Event> = app
+            .drain_events()
+            .into_iter()
+            .filter(|(window, _)| *window == id)
+            .map(|(_, event)| event)
+            .collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::Ime(ImeEvent::End)))
+                .count(),
+            1,
+            "禁用组合中的 IME 必须补恰好一条 ImeEvent::End（实际 {events:?}）"
+        );
+
+        // 禁用态下系统迟到的 ENDCOMPOSITION 被 WndProc 吞掉：不得再补 End。
+        // SAFETY: 窗口仍存活。
+        unsafe {
+            SendMessageW(hwnd, WM_IME_ENDCOMPOSITION, None, None);
+        }
+        assert!(
+            !app.drain_events()
+                .iter()
+                .any(|(window, event)| *window == id && matches!(event, Event::Ime(ImeEvent::End))),
+            "系统迟到的 WM_IME_ENDCOMPOSITION 不得重复投递 End"
+        );
     }
 }
