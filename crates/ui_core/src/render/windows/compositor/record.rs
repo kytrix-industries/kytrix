@@ -9,7 +9,7 @@
 //! damage 在**本模块入口**夹紧到当前内容矩形（R08-10 的后端二次防御），夹紧后的同一份集合
 //! 同时用于 scissor / copy / `Present1` —— 三个消费点不再各自从 `FramePlan` 重取。
 
-use std::{sync::Arc, time::Instant};
+use std::{sync::Arc, time::{Duration, Instant}};
 
 use windows::Win32::{
     Foundation::RECT,
@@ -39,7 +39,7 @@ use crate::{
         timer::{FrameTimings, GpuTimerSample, Section},
         uniform::{ROOT_UNIFORM_DWORDS, RootUniform},
         windows::{
-            device::SharedGpu,
+            device::{AtlasRebuildOutcome, SharedGpu},
             diagnostics,
             hresult::PresentOutcome,
             pipeline::{GeometryRegistry, Pipeline, SrvHeap},
@@ -48,6 +48,16 @@ use crate::{
     },
     window::FrameIndex,
 };
+
+/// 图集页换代遇到「目标描述符代仍被在飞引用」时的重试间隔（C3）。
+///
+/// 页换代是稀有事件（首建上传 / 字体或 DPI 换代）；一次退避只等一轮 GPU 完成观测，正常情况
+/// 1–3 次重试即可拿到空闲代。
+const ATLAS_REBUILD_DEFER_RETRY: Duration = Duration::from_millis(1);
+
+/// 图集页换代退避的上限（C3）。超时说明已提交工作长时间没有完成 —— 设备健康但无法推进，
+/// 按显式错误上报（不静默丢 damage、不无限自旋）。
+const ATLAS_REBUILD_DEFER_LIMIT: Duration = Duration::from_secs(1);
 
 /// 消费者：`GpuRenderer::prime_detached`（`compositor.rs` 的薄委托）。
 ///
@@ -148,6 +158,11 @@ pub(super) fn prime_detached(
 /// 共享图集的页对齐在录制之前完成：**图集读锁**在整个录制 + 提交区间内持有（共享页在帧内
 /// 不会变；别的窗口的页重建是写锁，会等本帧提交完）。发现待上传页与共享页不一致时先释放
 /// 读锁、在写锁里重建（[`SharedGpu::rebuild_atlas_pages`]），然后重试。
+///
+/// C3：页换代可能返回 [`AtlasRebuildOutcome::Deferred`]（目标描述符代仍有在飞引用）。此时**本帧
+/// 尚未提交任何东西**，短暂退避后重试即可（帧请求仍由调用方持有，damage 不丢）；退避有上限
+/// （[`ATLAS_REBUILD_DEFER_LIMIT`]），超时说明 GPU 长时间没有完成已提交工作，按设备健康但无法
+/// 推进的显式错误上报。
 pub(super) fn submit_recorded(
     renderer: &mut GpuRenderer,
     slot: FrameSlot,
@@ -167,7 +182,11 @@ pub(super) fn submit_recorded(
     );
     let frame_started = Instant::now();
     let shared = Arc::clone(&renderer.shared);
+    let mut defer_deadline: Option<Instant> = None;
     loop {
+        if let Some(error) = shared.lost_error() {
+            return Err(error);
+        }
         // 图集读锁：持有到本帧提交完成（页重建是写锁，会等这里释放）。
         let atlas = shared.atlas();
         // 待上传页 ≠ 共享页 ⇒ 先落地页换代：全页上传触发重建，过期增量直接丢弃。
@@ -176,9 +195,24 @@ pub(super) fn submit_recorded(
             .reconcile_pages([atlas.page(AtlasKind::Glyph), atlas.page(AtlasKind::Image)]);
         if !rebuild.is_empty() {
             drop(atlas);
-            shared
+            match shared
                 .rebuild_atlas_pages(&rebuild)
-                .map_err(|error| renderer.classify(error))?;
+                .map_err(|error| renderer.classify(error))?
+            {
+                AtlasRebuildOutcome::Applied => {}
+                AtlasRebuildOutcome::Deferred => {
+                    let deadline = *defer_deadline
+                        .get_or_insert_with(|| Instant::now() + ATLAS_REBUILD_DEFER_LIMIT);
+                    if Instant::now() >= deadline {
+                        return Err(EngineError::Swapchain {
+                            detail: smol_str::SmolStr::new_static(
+                                "atlas page rebuild kept waiting for a free descriptor generation",
+                            ),
+                        });
+                    }
+                    std::thread::sleep(ATLAS_REBUILD_DEFER_RETRY);
+                }
+            }
             continue;
         }
         // staging 对齐到共享页（第一次上传 / 页换代之后整组重建本窗口的 staging）。
@@ -351,6 +385,7 @@ pub(super) fn record(
                     recorder.pipeline,
                     srv_heap,
                     recorder.descriptors.base(),
+                    recorder.shared.atlas_generation(),
                     rtv,
                     slot.index,
                     root,
@@ -404,6 +439,7 @@ pub(super) fn record(
                     recorder.pipeline,
                     srv_heap,
                     recorder.descriptors.base(),
+                    recorder.shared.atlas_generation(),
                     recorder.persist.rtv,
                     slot.index,
                     root,
@@ -453,6 +489,7 @@ pub(super) fn record(
                     recorder.pipeline,
                     srv_heap,
                     recorder.descriptors.base(),
+                    recorder.shared.atlas_generation(),
                     recorder.persist.rtv,
                     slot.index,
                     root,
@@ -530,6 +567,7 @@ pub(super) fn bind_frame(
     pipeline: &Pipeline,
     srv_heap: &SrvHeap,
     descriptor_base: u32,
+    atlas_generation: u8,
     rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
     slot: usize,
     root: RootUniform,
@@ -550,7 +588,8 @@ pub(super) fn bind_frame(
             0,
         );
         list.SetGraphicsRootDescriptorTable(1, srv_heap.slot_table(descriptor_base, slot));
-        list.SetGraphicsRootDescriptorTable(2, srv_heap.atlas_table());
+        // C3：绑定**本帧的图集描述符代**（代际在录制期间由图集读锁固定；页换代只写另一代）。
+        list.SetGraphicsRootDescriptorTable(2, srv_heap.atlas_table(atlas_generation));
         list.OMSetRenderTargets(1, Some(&rtv), false, None);
         // 视口 = **内容**尺寸（不是 buffer）：Ndc 坐标由 root uniform 的内容尺寸给出，
         // 两者必须是同一个矩形，否则内容会被拉伸到整块 buffer 上。
