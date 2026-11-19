@@ -42,6 +42,7 @@ use crate::{
             window::NativeWindow,
         },
         macos_close::CloseAction,
+        macos_owner::{OwnerResolution, resolve_owner, window_level},
     },
     render::backend::Renderer,
     window::{WindowId, WindowOptions},
@@ -153,15 +154,12 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
         .map(|(id, window)| (id, window.options().clone()))
         .collect();
     let mut windows: Vec<NativeWindow> = Vec::with_capacity(requests.len());
-    for (id, options) in requests {
-        windows.push(open_window(
-            mtm,
-            &mut app,
-            id,
-            &options,
-            &dispatcher,
-            windows.len(),
-        )?);
+    // X1：两阶段建窗（先全部创建、再接线 owner/层级、最后显示 + 建渲染器）。`App` 的窗口
+    // 表是 `HashMap`，创建顺序不可控，而 owner 必须先有原生窗口，见 `attach_owners`。
+    create_native_windows(mtm, &requests, &dispatcher, &mut windows)?;
+    attach_owners(&requests, &mut windows, 0);
+    for (native, (_, options)) in windows.iter_mut().zip(requests.iter()) {
+        show_window(&mut app, native, options, &dispatcher)?;
     }
     // `activate` 必须在窗口已经存在之后（macOS 14+ 的无参版本不会自己找窗口，
     // 在首窗之前调用可能「没真正到前台」）。
@@ -256,22 +254,86 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
     }
 }
 
-/// 建一个原生窗口 + 渲染器，并把平台真值写回 `App` 的窗口。
+/// 建一批原生窗口（**不显示**；`cascade_index` 按批内顺序级联摆放）。
+///
+/// 与 [`show_window`] 拆开是为了 X1 的 owner 接线：`App` 的窗口表是 `HashMap`，一批窗口的
+/// 创建顺序不可控，而 owner 必须先有原生窗口。因此建窗分三步：
+/// 1. [`create_native_windows`] 全部创建（隐藏）；
+/// 2. [`attach_owners`] 把 owner/层级接上（owner 可以在这批里、也可以是更早的批次）；
+/// 3. [`show_window`] 逐个显示 + 建渲染器。
+fn create_native_windows(
+    mtm: MainThreadMarker,
+    requests: &[(WindowId, WindowOptions)],
+    dispatcher: &Arc<Dispatcher>,
+    windows: &mut Vec<NativeWindow>,
+) -> Result<(), EngineError> {
+    let start = windows.len();
+    windows.reserve(requests.len());
+    for (offset, (id, options)) in requests.iter().enumerate() {
+        windows.push(NativeWindow::create(
+            mtm,
+            *id,
+            options,
+            dispatcher,
+            start + offset,
+        )?);
+    }
+    Ok(())
+}
+
+/// X1：把 owner 关系与窗口层级接到刚创建的一批原生窗口上（`start` = 本批起始下标）。
+///
+/// - **owner**：`addChildWindow:ordered:`（transient parent 语义；见
+///   `NativeWindow::apply_owner` 与 `window.rs` 模块文档）。找不到 owner 原生窗口
+///   （创建顺序之外的竞态 / 非法 id）⇒ 降级为无 owner 并写诊断，不 panic。
+/// - **层级**：模态（owner 已解析）> 置顶 > 普通；纯逻辑在
+///   `platform::macos_owner::window_level`（Windows 可单测）。
+fn attach_owners(
+    requests: &[(WindowId, WindowOptions)],
+    windows: &mut [NativeWindow],
+    start: usize,
+) {
+    for (offset, (id, options)) in requests.iter().enumerate() {
+        let index = start + offset;
+        let resolution = resolve_owner(*id, options.owner, |owner| {
+            windows.iter().any(|native| native.id() == owner)
+        });
+        let owner = match resolution {
+            OwnerResolution::Attach(owner) => windows
+                .iter()
+                .find(|native| native.id() == owner)
+                .map(NativeWindow::window_handle),
+            OwnerResolution::None => None,
+            OwnerResolution::Missing => {
+                // 引擎层（`app/window_set.rs`）保证 options.owner 合法；走到这里说明平台侧
+                // 没找到对应原生窗口。窗口仍然可用，只是失去 transient parent 语义。
+                eprintln!(
+                    "kytrix: 窗口 {id:?} 的 owner {:?} 没有原生窗口；降级为无 owner",
+                    options.owner
+                );
+                None
+            }
+        };
+        // 模态窗口只能在 owner 已解析时抬层级（没有 owner 的模态由引擎层降级为普通窗口）。
+        let level = window_level(options.always_on_top, options.modal && owner.is_some());
+        windows[index].apply_owner(owner, level);
+    }
+}
+
+/// 显示一个已建好的原生窗口 + 创建渲染器，并把平台真值写回 `App` 的窗口。
 ///
 /// **顺序**（R09-5 的平台侧一半）：先 `show()` 再同步编译 GPU 对象。渲染器构造里有
 /// `MTLDevice` / 两个 metallib / 4 条 PSO 的同步编译（数十毫秒），放在 `show()` 之前会表现为
 /// 「点了新窗口，整个应用卡一下才出现窗口」；放在之后则是「窗口立刻出现（AppKit 用背景色
 /// 铺底），内容稍后到位」。真正的根治（进程级共享 device/library/PSO）在 `render/macos`
 /// 的 `GpuCore` 重构里。
-fn open_window(
-    mtm: MainThreadMarker,
+fn show_window(
     app: &mut App,
-    id: WindowId,
+    native: &mut NativeWindow,
     options: &WindowOptions,
     dispatcher: &Arc<Dispatcher>,
-    cascade_index: usize,
-) -> Result<NativeWindow, EngineError> {
-    let native = NativeWindow::create(mtm, id, options, dispatcher, cascade_index)?;
+) -> Result<(), EngineError> {
+    let id = native.id();
     // 先显示：用户立刻看到窗口（背景色由 `NSColor` 铺底）。
     native.show();
     let scale = native.scale();
@@ -300,7 +362,7 @@ fn open_window(
         // A5：帧预算的刷新率提示 = 窗口所在屏的 `maximumFramesPerSecond`（ProMotion 120 也覆盖）。
         window.set_frame_refresh_hz(native.maximum_frames_per_second());
     }
-    Ok(native)
+    Ok(())
 }
 
 /// 泵一次；`tick` = 本次由连续帧定时器触发（而不是 source/observer）。
@@ -533,6 +595,8 @@ fn request_quit(state: &mut LoopState, app: &mut App) {
 /// 与 Win32 的同名函数同构：
 /// - **创建**：`App` 里存在但还没有原生窗口的 id ⇒ 建 `NativeWindow` + `Renderer`，挂
 ///   `CAMetalLayer`，并把尺寸 / DPI / surface 写回 `Window`（与启动路径同一套写入顺序）。
+///   与启动路径共用 X1 的两阶段建窗（[`create_native_windows`] → [`attach_owners`] →
+///   [`show_window`]）：owner 可能同批创建（顺序不可控）或已存在。
 /// - **销毁**：原生窗口对应的 `App` 窗口已经不存在 ⇒ 从列表移除（`NativeWindow::drop`
 ///   负责关窗；`App` 丢弃 `Window` 时已经 drop 了它的 `Renderer`，GPU 线程 join 早于关窗）。
 fn sync_native_windows(
@@ -554,15 +618,11 @@ fn sync_native_windows(
     let mtm = MainThreadMarker::new().ok_or(EngineError::AppInit {
         detail: smol_str::SmolStr::new_static("window creation requires the main thread"),
     })?;
-    for (id, options) in pending {
-        windows.push(open_window(
-            mtm,
-            app,
-            id,
-            &options,
-            dispatcher,
-            windows.len(),
-        )?);
+    let start = windows.len();
+    create_native_windows(mtm, &pending, dispatcher, windows)?;
+    attach_owners(&pending, windows, start);
+    for (native, (_, options)) in windows[start..].iter_mut().zip(pending.iter()) {
+        show_window(app, native, options, dispatcher)?;
     }
     Ok(())
 }

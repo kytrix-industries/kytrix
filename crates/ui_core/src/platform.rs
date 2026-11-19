@@ -45,6 +45,15 @@ pub(crate) mod macos_placement;
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod macos_close;
 
+/// macOS 窗口层级的**平台无关纯逻辑**（X1 原生部分）：`always_on_top` / `modal` →
+/// AppKit `NSWindowLevel` 的选择（模态 > 置顶 > 普通），以及 `WindowOptions.owner` →
+/// `addChildWindow:ordered:` 关系的解析（含「平台侧找不到 owner 原生窗口」的降级判据）。
+///
+/// 与 [`macos_close`] 同一模式：`platform::macos` 整模块 macOS-only，这里不依赖 AppKit
+/// 类型，映射与优先级必须在开发机（Windows）单测。
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod macos_owner;
+
 /// Wayland 协议层的纯逻辑（`wl_data_source` 生命周期、IME 焦点路由、光标形状/主题、
 /// `xdg_toplevel` 状态机）。
 ///

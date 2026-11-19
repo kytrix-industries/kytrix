@@ -36,6 +36,23 @@
 //! 摆放（B3）：`WindowOptions.position` / `min_size` / `max_size` 在 [`NativeWindow::create`]
 //! 消费；坐标换算 / 工作区 clamp 的纯逻辑在 `platform::macos_placement`（Windows 可单测）。
 //! 位置变化经 `windowDidMove:` 唤醒 + `sync_state` 快照比较，产出 `Event::Moved`。
+//!
+//! # 窗口层级 / owner（X1 原生部分）
+//!
+//! - **owner**：建窗后对 owner 窗口调 `addChildWindow:ordered:`（`NSWindowAbove`），保存
+//!   owner 的强引用以便关闭时 `removeChildWindow:`。这是 AppKit 的 **transient parent**
+//!   语义：child 恒在 parent 之上、随 parent 一起进出 z 序，parent 关闭/orderOut 时 AppKit
+//!   会把 child 一并 orderOut（不销毁）。**引擎层**（`app/window_set.rs`）已负责 owner 关闭
+//!   时级联关闭 owned 窗口，两者不冲突：引擎先把 App 侧窗口关掉，平台层再各自关原生窗口；
+//!   AppKit 的自动 orderOut 至多让窗口提前离开屏幕（同一轮泵内就被移除）。
+//! - **always_on_top**：`NSFloatingWindowLevel`。
+//! - **modal**：引擎层在输入分发入口拦截 owner 的输入；原生只做「模态层级
+//!   （`NSModalPanelWindowLevel`）+ 作为 owner 的 child window」。**不用**
+//!   `runModalForWindow:` —— 那会开嵌套 run loop，与本引擎在 `NSApplication.run` 的 run
+//!   loop 上跑的泵重入（同一批 AppKit 事件会被处理两次）。层级选择（模态 > 置顶）的纯逻辑
+//!   在 `platform::macos_owner`，Windows 可单测。
+//! - 请求了 owner 但平台侧找不到对应原生窗口（创建批次顺序/非法 id）⇒ 降级为无 owner 并
+//!   写诊断，不 panic（见 `event_loop::attach_owners`）。
 
 use std::{cell::Cell, rc::Rc, sync::Arc};
 
@@ -45,9 +62,10 @@ use objc2::{
     runtime::{AnyObject, ProtocolObject},
 };
 use objc2_app_kit::{
-    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSScreen, NSWindow,
-    NSWindowButton, NSWindowCollectionBehavior, NSWindowDelegate, NSWindowOcclusionState,
-    NSWindowStyleMask, NSWindowTabbingMode, NSWindowTitleVisibility,
+    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSFloatingWindowLevel,
+    NSModalPanelWindowLevel, NSScreen, NSWindow, NSWindowButton, NSWindowCollectionBehavior,
+    NSWindowDelegate, NSWindowOcclusionState, NSWindowOrderingMode, NSWindowStyleMask,
+    NSWindowTabbingMode, NSWindowTitleVisibility,
 };
 use objc2_foundation::{
     NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -64,6 +82,7 @@ use crate::{
         dispatcher::Dispatcher,
         macos::{a11y::MacA11y, dpi, menu, view::GuiView, wake},
         macos_close::{CloseAction, CloseBridge},
+        macos_owner::WindowLevel,
         macos_placement as placement,
         menu::MenuCommand,
     },
@@ -236,6 +255,11 @@ pub(crate) struct NativeWindow {
     delegate: Retained<WindowDelegate>,
     /// 关闭桥（B5）：view / delegate 写入、泵消费（与 `GuiView` / `WindowDelegate` 共享）。
     close: Rc<CloseBridge>,
+    /// owner 窗口的原生引用（X1；`addChildWindow:ordered:` 的 parent）。
+    ///
+    /// 保持强引用：关闭本窗口时要 `removeChildWindow:`，即使 parent 的 `NativeWindow` 已先
+    /// 被移除，NSWindow 对象也必须仍然存活（`Retained` 保证这一点）。
+    owner: Option<Retained<NSWindow>>,
     scale: Scale,
     logical_size: Size,
     /// 最近一次同步的快照（用于检测变化）。
@@ -393,6 +417,9 @@ impl NativeWindow {
             view,
             delegate,
             close,
+            // X1：owner 关系由泵在建窗批次**全部创建之后**接线（`apply_owner`）：
+            // `App` 的窗口表是 HashMap，owner 可能排在 owned 之后。
+            owner: None,
             scale: options.scale,
             logical_size: options.size,
             seen_scale: 1.0,
@@ -452,6 +479,47 @@ impl NativeWindow {
 
     pub(crate) fn id(&self) -> WindowId {
         self.id
+    }
+
+    /// 原生窗口句柄（X1）：泵把 owner 的 `NSWindow` 交给 owned 窗口挂接 child 关系用。
+    pub(crate) fn window_handle(&self) -> Retained<NSWindow> {
+        self.window.clone()
+    }
+
+    /// 建窗后的 X1 接线：设置窗口层级 + 挂接 owner（`addChildWindow:ordered:`）。
+    ///
+    /// 分两阶段调用（先创建全部原生窗口、再接线）的原因见 `event_loop::attach_owners`：
+    /// `App` 的窗口表是 `HashMap`，创建批次的顺序不可控而 owner 必须先有原生窗口。
+    ///
+    /// - **层级**：选择逻辑在 `platform::macos_owner`（模态压过置顶）。`Normal` 不调用
+    ///   `setLevel:` —— 保持 AppKit 默认层级（`NSNormalWindowLevel` == 0）。
+    /// - **owner**：`addChildWindow:ordered:` 是 transient parent 语义（child 恒在 parent
+    ///   之上、随 parent 进出 z 序，parent 关闭时被 orderOut）；引擎层的 owner 关闭级联与
+    ///   它不冲突（见模块文档）。
+    pub(crate) fn apply_owner(&mut self, owner: Option<Retained<NSWindow>>, level: WindowLevel) {
+        match level {
+            WindowLevel::Normal => {}
+            WindowLevel::Floating => self.window.setLevel(NSFloatingWindowLevel),
+            WindowLevel::ModalPanel => self.window.setLevel(NSModalPanelWindowLevel),
+        }
+        if let Some(owner) = owner {
+            // SAFETY: 两个 NSWindow 都是本进程主线程上创建、由 `NativeWindow` 持有的对象；
+            // `addChildWindow:ordered:` 是 AppKit 的窗口关系 API（ordered 只决定 z 序，不转移
+            // 所有权）。调用方已过滤自指（`platform::macos_owner::resolve_owner`）。
+            unsafe { owner.addChildWindow_ordered(&self.window, NSWindowOrderingMode::Above) };
+            self.owner = Some(owner);
+        }
+    }
+
+    /// 解除 owner 关系（幂等；引擎主动关闭与外部关闭两条收尾路径共用）。
+    ///
+    /// AppKit 不保证 `NSWindow.close` 会把本窗口从 parent 的 `childWindows` 里摘掉（文档只
+    /// 承诺 parent 关闭时 child 一并 orderOut），因此显式 `removeChildWindow:`。parent 即使
+    /// 已先被关闭，其 `NSWindow` 对象仍由这里的强引用保活，调用安全。
+    fn detach_owner(&mut self) {
+        if let Some(owner) = self.owner.take() {
+            owner.removeChildWindow(&self.window);
+        }
     }
 
     pub(crate) fn scale(&self) -> Scale {
@@ -719,6 +787,8 @@ impl NativeWindow {
         // `view.window().unwrap()` 会 panic（穿过 ObjC 帧 = abort），且 `accessibilityChildren`
         // 会 `borrow_mut` 正在 `drop_in_place` 的 ivars（UB）。
         self.view.uninstall_a11y();
+        // X1：先解除 owner 关系（parent 可能仍存活），再关窗。
+        self.detach_owner();
         // delegate 是 weak：先断掉，避免关闭期间的 AppKit 回调打进来（我们仍持强引用）。
         self.window.setDelegate(None);
         self.window.close();
@@ -745,6 +815,8 @@ impl NativeWindow {
             return;
         }
         self.view.uninstall_a11y();
+        // X1：外部关闭同样要摘掉 owner 关系，避免 parent 的 `childWindows` 留着已关闭对象。
+        self.detach_owner();
         self.window.setDelegate(None);
         self.destroyed = true;
     }
