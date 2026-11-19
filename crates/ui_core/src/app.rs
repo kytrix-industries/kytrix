@@ -173,6 +173,10 @@ pub struct App {
     /// TreeUpdate 构造。按窗口限流到 A11Y_THROTTLE 一次，屏幕阅读器本身也消化不了
     /// 更快的变化。Assertive live region 同样受此限制（≤100ms 延迟，可接受）。
     a11y_delivered: ahash::HashMap<WindowId, Instant>,
+    /// **本轮泵**是否真的交付过一笔 a11y（`a11y_take` 产出过快照才置位；平台泵的
+    /// `wake_for_a11y_backlog` 消费并清零）。无 AT 客户端 / 无测试捕获时恒 false ⇒ 泵绝不
+    /// 因 a11y backlog 自唤醒（RE-05 / I3 空闲零唤醒）。
+    a11y_delivered_round: bool,
     /// 最近一次点击（双击判定）。
     last_click: Option<ClickRecord>,
     /// 动画槽（P10；`tick_animations` 推进，结束时删槽）。
@@ -429,6 +433,7 @@ impl App {
             thresholds: InputThresholds::platform_default(),
             clock: Instant::now(),
             a11y_delivered: ahash::HashMap::default(),
+            a11y_delivered_round: false,
             last_click: None,
             animations: Vec::new(),
             next_animation: 1,
@@ -1815,9 +1820,10 @@ impl App {
         a11y::a11y_backlog_pending(self)
     }
 
-    /// a11y 交付后若仍有未交付批次则唤醒平台泵（三端唯一入口；E5 / RE-04）。
+    /// 本轮泵交付过 a11y 且仍有未走完的批次时唤醒平台泵
+    /// （三端唯一入口；E5/RE-04/RE-05）。
     pub(crate) fn wake_for_a11y_backlog(
-        &self,
+        &mut self,
         dispatcher: &crate::platform::dispatcher::Dispatcher,
     ) {
         a11y::wake_for_a11y_backlog(self, dispatcher)

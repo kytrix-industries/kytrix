@@ -104,6 +104,9 @@ pub(crate) fn a11y_pending(app: &App, window: WindowId) -> bool {
     }
     target.a11y_focus_pending()
         || target.a11y_consumer_epoch_pending()
+        // 未开始交付的全量重建（首树/DPI）：被叫醒就立刻发第一笔。
+        || target.a11y_rebuild_pending()
+        // 已开始的批次未走完：被叫醒就继续推进（平台自唤醒另见 `wake_for_a11y_backlog`）。
         || target.a11y_backlog_pending()
         || app
             .a11y_delivered
@@ -124,14 +127,21 @@ pub(crate) fn a11y_backlog_pending(app: &App) -> bool {
     app.windows.values().any(Window::a11y_backlog_pending)
 }
 
-/// a11y 交付后若仍有未交付批次则唤醒平台泵（三端唯一入口；E5 / RE-04）。
+/// 本轮泵**交付过** a11y 且仍有未走完的批次时，唤醒平台泵
+/// （三端唯一入口；E5/RE-04/RE-05）。
 ///
-/// 平台泵每轮只交付一笔；真实事件循环无法在单测里执行，所以把**判定 + wake** 收敛到这一个
-/// 函数，用 App 层测试钉住「有 backlog ⇒ 恰好一次 wake；收敛后 ⇒ 不 wake」，三端各留一行
-/// 调用。变异：删掉这里的 `dispatcher.wake()` ⇒ App 层测试红；删掉三端调用行则属真机/验收
-/// 项（见实现报告 §8.3）。
-pub(crate) fn wake_for_a11y_backlog(app: &App, dispatcher: &Dispatcher) {
-    if app.a11y_backlog_pending() {
+/// 判据必须同时满足：
+/// 1. **本轮确实交付过** a11y（`a11y_delivered_round`：`a11y_take` 产出过快照才置位）。
+///    adapter Inactive（无 AT 客户端 / 无测试捕获）时 `update_if_active` 不执行闭包 ⇒ 标志
+///    恒 false；
+/// 2. 交付后仍有**已开始**的剩余批次（[`A11yBridge::backlog`]，不含 `full_pending`）。
+///
+/// 只有第 2 条的实现会让无 AT 的默认场景每轮自唤醒 = 单核 100% 忙等（RE-05，I3 失效）。
+/// 标志在每次调用时消费并清零，语义是「本轮」；三端泵各留一行调用，真实事件循环不在单测
+/// 执行（App 层测试 + 真机 `acceptance idle` 覆盖，见实现报告 §6.2/§8.3）。
+pub(crate) fn wake_for_a11y_backlog(app: &mut App, dispatcher: &Dispatcher) {
+    let delivered = std::mem::take(&mut app.a11y_delivered_round);
+    if delivered && app.a11y_backlog_pending() {
         dispatcher.wake();
     }
 }
@@ -182,6 +192,9 @@ pub(crate) fn a11y_take(app: &mut App, window: WindowId) -> Option<crate::a11y::
     }
     if snapshot.is_some() {
         app.a11y_delivered.insert(window, app.clock);
+        // RE-05：标记「本轮泵确实交付过 a11y」，平台泵的 `wake_for_a11y_backlog` 消费它；
+        // 无 AT 客户端时（adapter Inactive，本函数不执行）绝不会因此自唤醒。
+        app.a11y_delivered_round = true;
     }
     snapshot
 }

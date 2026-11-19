@@ -234,19 +234,24 @@ impl A11yBridge {
         self.focus_changed(tree, focus)
     }
 
-    /// 是否还有**未交付的批次工作**（`App::a11y_pending` 的不节流旁路；E5）。
+    /// 是否还有**已开始交付的**运行未走完的批次（`queue` 候选 / 待重发父节点；E5）。
     ///
-    /// 两类来源：
-    /// - 全量重建**待发**（`full_pending` / DPI 代际变化）：首树、`set_scale`、捕获开启；
-    /// - 全量/增量已发了一部分、`queue` 里还有待发候选或待重发父节点。
-    ///
-    /// 这种「多笔连续投递」状态必须**连续推进**（每轮泵至少一笔），不能被 `A11Y_THROTTLE`
-    /// （100 ms/笔）拖成 20 × 100 ms ≈ 2 s；单点高频增量不受影响（这里为假 ⇒ 仍按 100 ms 合并）。
+    /// **不含** `full_pending` / DPI 代际（见 [`A11yBridge::rebuild_pending`]）：那是「还没开始
+    /// 交付」的重建待发，用来让 `App::a11y_pending` 在**被叫醒后**立刻交付；若把它算进
+    /// backlog，无辅助技术客户端时 `full_pending` 恒真（adapter Inactive ⇒ `a11y_take` 永不
+    /// 执行）、平台泵的 `wake_for_a11y_backlog` 会每轮自唤醒 = 单核 100% 忙等，I3「空闲零
+    /// 唤醒」失效（RE-05）。平台自唤醒只认**交付后仍真**的本函数。
     pub(crate) fn backlog(&self) -> bool {
-        self.full_pending
-            || self.bounds_epoch != self.seen_bounds_epoch
-            || self.queue_cursor < self.queue.len()
-            || !self.refresh.is_empty()
+        self.queue_cursor < self.queue.len() || !self.refresh.is_empty()
+    }
+
+    /// 是否有一轮**尚未开始交付**的全量重建（首树 / DPI 代际变化；E5）。
+    ///
+    /// 只用于 `App::a11y_pending` 的「被叫醒后立刻交付」不节流旁路（否则 DPI 首笔要等
+    /// 100 ms 节流）；**不参与**平台泵自唤醒判定（`wake_for_a11y_backlog` 只看
+    /// [`A11yBridge::backlog`]，RE-05 的忙等根因就是把二者混在一起）。
+    pub(crate) fn rebuild_pending(&self) -> bool {
+        self.full_pending || self.bounds_epoch != self.seen_bounds_epoch
     }
 
     /// 当前因每笔预算而**未交付**的重发父节点数（P2-6 的"未交付剩余量"指标）。

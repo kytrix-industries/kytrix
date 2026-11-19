@@ -34,10 +34,16 @@ pub(crate) fn a11y_consumer_epoch_pending(window: &Window) -> bool {
 }
 
 // 消费者：`impl Window::a11y_backlog_pending` 的薄委托。
-/// 是否还有未交付的 a11y 批次（首树/DPI 全量重建的分批未走完；`App::a11y_pending` 的
-/// 不节流旁路，E5）。
+/// 是否还有**已开始交付的** a11y 批次未走完（首树/DPI 重建的剩余部分；E5）。
 pub(crate) fn a11y_backlog_pending(window: &Window) -> bool {
     window.a11y.backlog()
+}
+
+// 消费者：`impl Window::a11y_rebuild_pending` 的薄委托。
+/// 是否有一轮**尚未开始交付**的全量重建（首树 / DPI 代际变化；`App::a11y_pending` 的
+/// 不节流旁路，E5）。不参与平台泵自唤醒（RE-05）。
+pub(crate) fn a11y_rebuild_pending(window: &Window) -> bool {
+    window.a11y.rebuild_pending()
 }
 
 // 消费者：`impl Window::a11y_engine_of` 的薄委托（动作解码）。

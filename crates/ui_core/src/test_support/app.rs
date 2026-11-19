@@ -2532,37 +2532,87 @@ mod p11_fix_tests {
         );
     }
 
-    /// E5 / RE-04：三端接线共享的唯一函数 `App::wake_for_a11y_backlog` —— 有未交付批次时
-    /// 必须在测试 dispatcher 上观察到真实 wake；收敛后不得再 wake（避免泵空转）。
+    /// E5 / RE-04 / RE-05：三端接线共享的 `App::wake_for_a11y_backlog` —— **只有本轮真的
+    /// 交付过** a11y 且仍有未走完的批次时才 wake；每笔非最终批次恰好一次；收敛后不再 wake。
     ///
-    /// 变异：删掉 `wake_for_a11y_backlog` 里的 `dispatcher.wake()` ⇒ 第一个断言红。
-    /// 三端泵各只保留一行调用（真实事件循环不在单测覆盖，见报告 §8.3）。
+    /// 变异：删掉 `dispatcher.wake()`、或把判据改回「无条件 backlog」（不看本轮交付标志）⇒
+    /// 本用例 / 无消费者用例红。
     #[test]
-    fn the_backlog_wake_helper_wakes_the_pump_until_converged() {
+    fn the_backlog_wake_helper_wakes_only_after_a_real_delivery() {
         let mut app = TestApp::new();
         app.enable_a11y_capture();
         let window = app.window_id();
         let _rows = rows_fixture(&mut app, 5000);
         let dispatcher = app.app().dispatcher();
-        let _ = app.drain_pump().expect("首帧");
-        app.assert_a11y_contract();
 
-        let _ = dispatcher.take_frame_wake();
-        app.app().wake_for_a11y_backlog(dispatcher.as_ref());
-        assert!(
-            dispatcher.take_frame_wake(),
-            "有未交付批次时，交付后必须唤醒平台泵（RE-04 接线核心）"
-        );
-
-        while app.app().a11y_pending(window) {
-            let _ = app.drain_pump().expect("后续批次（不推进时钟）");
-            app.assert_a11y_contract();
+        let mut batches = 0usize;
+        let mut wakes = 0usize;
+        loop {
+            let delivered_round = app.app().a11y_pending(window);
+            if delivered_round {
+                let _ = app.drain_pump().expect("泵轮（本批交付）");
+                app.assert_a11y_contract();
+                batches += 1;
+                assert!(batches < 16, "分批必须收敛（实际 {batches} 批）");
+            }
+            let _ = dispatcher.take_frame_wake();
+            app.app_mut().wake_for_a11y_backlog(dispatcher.as_ref());
+            let woke = dispatcher.take_frame_wake();
+            if !delivered_round {
+                assert!(!woke, "本轮没有交付 ⇒ 绝不能唤醒泵（RE-05：I3 空闲零唤醒）");
+                break;
+            }
+            if app.app().a11y_backlog_pending() {
+                assert!(
+                    woke,
+                    "交付后仍有未走完批次 ⇒ 必须唤醒下一轮（第 {batches} 批）"
+                );
+                wakes += 1;
+            } else {
+                assert!(!woke, "最后一笔交付后不得再唤醒泵（已收敛）");
+            }
         }
-        let _ = dispatcher.take_frame_wake();
-        app.app().wake_for_a11y_backlog(dispatcher.as_ref());
-        assert!(
-            !dispatcher.take_frame_wake(),
-            "收敛后不得再唤醒泵（否则空闲零唤醒退化）"
+        assert!(batches >= 3, "5000 节点必须分多批");
+        assert_eq!(
+            wakes,
+            batches - 1,
+            "除最后一笔外每笔交付后必须唤醒一次（实际 {wakes} 次 / {batches} 批）"
+        );
+    }
+
+    /// **RE-05（P0 回归）**：无 AT 客户端 / 无测试捕获时 adapter 永远 Inactive，`a11y_take`
+    /// 不执行；泵轮即使 a11y 仍有「未开始的重建待发」，也**绝不能**自唤醒 —— 否则每轮
+    /// `wake()` 让泵停不下来（单核 100% 忙等，I3「空闲零唤醒」失效）。
+    ///
+    /// 变异：把 `wake_for_a11y_backlog` 判据改回无条件 backlog（不看本轮交付标志）⇒ 本用例红。
+    #[test]
+    fn a11y_backlog_never_wakes_the_pump_without_a_consumer() {
+        // 不调用 `enable_a11y_capture()`：模拟绝大多数用户的默认状态（无读屏器/自动化客户端）。
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let _rows = rows_fixture(&mut app, 5000);
+        let dispatcher = app.app().dispatcher();
+        let mut wakes = 0usize;
+        for round in 0..10 {
+            let _ = app.drain_pump().expect("泵轮（无消费者）");
+            // 丢弃其它来源的帧唤醒，只观察 a11y 自唤醒逻辑。
+            let _ = dispatcher.take_frame_wake();
+            app.app_mut().wake_for_a11y_backlog(dispatcher.as_ref());
+            if dispatcher.take_frame_wake() {
+                wakes += 1;
+            }
+            assert!(
+                !app.app().a11y_backlog_pending(),
+                "无消费者时不存在「已开始的交付批次」（round {round}）"
+            );
+            assert!(
+                app.app().a11y_pending(window),
+                "待发全量重建仍应报告工作（被叫醒后立刻交付；但不参与自唤醒）"
+            );
+        }
+        assert_eq!(
+            wakes, 0,
+            "无 AT/无捕获时 a11y 绝不能唤醒泵（RE-05：否则单核 100% 忙等）"
         );
     }
 }
