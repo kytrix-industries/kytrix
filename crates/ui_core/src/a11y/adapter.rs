@@ -1036,7 +1036,10 @@ mod tests {
 
         let first = take(&mut bridge, &mut tree, None).expect("首笔");
         assert!(first.full, "首次激活必须是全树");
-        assert!(to_tree_update(&first).tree.is_some(), "全树笔必须带 TreeInfo");
+        assert!(
+            to_tree_update(&first).tree.is_some(),
+            "全树笔必须带 TreeInfo"
+        );
 
         // 正常的增量路径先跑一笔：模拟"消费端已经有一棵树"。
         tree.mark_a11y(button);
@@ -1064,7 +1067,10 @@ mod tests {
             "AccessKit 要求重置后的首笔携带 TreeInfo（否则 consumer panic/空树）"
         );
         assert_eq!(forced.nodes.len(), tree.len(), "全树笔必须覆盖整棵树");
-        assert!(!bridge.consumer_epoch_pending(), "全树交付后重置标记必须消费掉");
+        assert!(
+            !bridge.consumer_epoch_pending(),
+            "全树交付后重置标记必须消费掉"
+        );
         assert!(!bridge.pending(&tree, None), "消费后不得残留待办");
         assert!(
             take(&mut bridge, &mut tree, None).is_none(),
@@ -1149,7 +1155,9 @@ mod tests {
     fn a_subtree_invalidation_reaches_already_delivered_nodes() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        let container = NodeBuilder::boxed().build(&mut tree, root).expect("container");
+        let container = NodeBuilder::boxed()
+            .build(&mut tree, root)
+            .expect("container");
         let mut rows = Vec::with_capacity(3000);
         for _ in 0..3000 {
             rows.push(
@@ -1209,7 +1217,10 @@ mod tests {
         let mut batches = 1usize;
         while let Some(snapshot) = take(&mut bridge, &mut tree, None) {
             batches += 1;
-            assert!(batches < 32, "批次必须收敛（实际 {batches}，疑似队列膨胀死循环）");
+            assert!(
+                batches < 32,
+                "批次必须收敛（实际 {batches}，疑似队列膨胀死循环）"
+            );
             for record in &snapshot.nodes {
                 if let Some(expected) = seen.get_mut(&record.engine)
                     && record.label_text() == expected.as_deref()

@@ -535,10 +535,10 @@ fn sync_windows(
             adapter: UnixA11y::new(
                 dispatcher.clone(),
                 id,
-                app.window(id).map_or_else(
-                    crate::a11y::adapter::A11yConsumerEpoch::new,
-                    |window| window.a11y_consumer_epoch(),
-                ),
+                app.window(id)
+                    .map_or_else(crate::a11y::adapter::A11yConsumerEpoch::new, |window| {
+                        window.a11y_consumer_epoch()
+                    }),
             )?,
         });
     }

@@ -56,17 +56,13 @@ pub(super) fn sync_native_windows(
     for (id, options) in pending {
         // 窗口的 a11y adapter 与引擎的 `A11yBridge` 共享同一份消费端代际：AT 重新激活时
         // 平台回调 `bump()` 它，引擎把下一笔升成全树（E1）。
-        let a11y_epoch = app.window(id).map_or_else(
-            crate::a11y::adapter::A11yConsumerEpoch::new,
-            |window| window.a11y_consumer_epoch(),
-        );
-        let mut native = NativeWindow::create(
-            id,
-            &options,
-            dispatcher.clone(),
-            Some(app_cell),
-            a11y_epoch,
-        )?;
+        let a11y_epoch = app
+            .window(id)
+            .map_or_else(crate::a11y::adapter::A11yConsumerEpoch::new, |window| {
+                window.a11y_consumer_epoch()
+            });
+        let mut native =
+            NativeWindow::create(id, &options, dispatcher.clone(), Some(app_cell), a11y_epoch)?;
         let client = native.client_size();
         let renderer = Renderer::new_for_hwnd(native.composition(), client, options.background)?;
         // A5：帧预算的刷新率提示（窗口所在 output；查询失败 ⇒ 门禁保持禁用）。
@@ -350,8 +346,14 @@ mod tests {
         let options = WindowOptions::default();
         let id = app.create_window(options.clone());
         let dispatcher = Dispatcher::new();
-        let mut native = NativeWindow::create(id, &options, Arc::clone(&dispatcher), None, crate::a11y::adapter::A11yConsumerEpoch::new())
-            .expect("NativeWindow");
+        let mut native = NativeWindow::create(
+            id,
+            &options,
+            Arc::clone(&dispatcher),
+            None,
+            crate::a11y::adapter::A11yConsumerEpoch::new(),
+        )
+        .expect("NativeWindow");
         let _ = dispatcher.take_frame_wake();
 
         native.state_mut().note_display_recovery();
@@ -390,8 +392,14 @@ mod tests {
         let options = WindowOptions::default();
         let id = app.create_window(options.clone());
         let dispatcher = Dispatcher::new();
-        let native =
-            NativeWindow::create(id, &options, Arc::clone(&dispatcher), None, crate::a11y::adapter::A11yConsumerEpoch::new()).expect("window");
+        let native = NativeWindow::create(
+            id,
+            &options,
+            Arc::clone(&dispatcher),
+            None,
+            crate::a11y::adapter::A11yConsumerEpoch::new(),
+        )
+        .expect("window");
         let _ = dispatcher.take_frame_wake();
 
         let mut windows = vec![native];
@@ -399,5 +407,3 @@ mod tests {
         assert!(!dispatcher.take_frame_wake(), "没有请求时不得唤醒一帧");
     }
 }
-
-

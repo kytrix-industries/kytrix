@@ -473,10 +473,7 @@ pub(crate) fn effective_role_of(tree: &NodeTree, node: NodeId) -> A11yRole {
 }
 
 fn is_text_input_role(role: A11yRole) -> bool {
-    matches!(
-        role,
-        A11yRole::TextInput | A11yRole::MultilineTextInput
-    )
+    matches!(role, A11yRole::TextInput | A11yRole::MultilineTextInput)
 }
 
 /// 子树里是否存在 `TextRun`（输入框的字符语义由子文本运行承担）。
@@ -515,7 +512,6 @@ fn scroll_container(tree: &NodeTree, node: NodeId) -> Option<NodeId> {
     }
     crate::interaction::scroll::scroll_ancestor(tree, node).map(|(container, _)| container)
 }
-
 
 /// 节点的 a11y "禁用"状态（`node_a11y` 与动作分发**共用同一判据**）。
 ///
@@ -837,7 +833,15 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let plain = NodeBuilder::boxed().build(&mut tree, root).expect("mount");
-        let actions = effective_actions(&tree, plain, A11yRole::ListBoxOption, None, None, false, false);
+        let actions = effective_actions(
+            &tree,
+            plain,
+            A11yRole::ListBoxOption,
+            None,
+            None,
+            false,
+            false,
+        );
         assert!(
             !actions.contains(&A11yAction::Click),
             "无 on_click 的列表项不得暴露 Click：{actions:?}"
@@ -848,8 +852,15 @@ mod tests {
             .on_click(crate::event::Action::custom("pick"))
             .build(&mut tree, root)
             .expect("mount");
-        let actions =
-            effective_actions(&tree, clickable, A11yRole::ListBoxOption, None, None, false, false);
+        let actions = effective_actions(
+            &tree,
+            clickable,
+            A11yRole::ListBoxOption,
+            None,
+            None,
+            false,
+            false,
+        );
         assert!(
             actions.contains(&A11yAction::Click),
             "有 on_click 的列表项必须暴露 Click：{actions:?}"
@@ -1163,7 +1174,8 @@ mod tests {
 
         let over = tree.a11y_of(node).and_then(|slot| slot.over.as_ref());
         let patch = tree.a11y_of(node).map(|slot| &slot.patch);
-        let writable = effective_actions(&tree, node, A11yRole::TextInput, over, patch, false, false);
+        let writable =
+            effective_actions(&tree, node, A11yRole::TextInput, over, patch, false, false);
         for action in [
             A11yAction::SetValue,
             A11yAction::Increment,
@@ -1174,7 +1186,8 @@ mod tests {
             assert!(writable.contains(&action), "可写节点必须保留 {action:?}");
         }
 
-        let read_only = effective_actions(&tree, node, A11yRole::TextInput, over, patch, false, true);
+        let read_only =
+            effective_actions(&tree, node, A11yRole::TextInput, over, patch, false, true);
         for action in [
             A11yAction::SetValue,
             A11yAction::Increment,
@@ -1188,7 +1201,8 @@ mod tests {
         assert!(read_only.contains(&A11yAction::SetTextSelection));
         assert!(read_only.contains(&A11yAction::Click));
 
-        let disabled = effective_actions(&tree, node, A11yRole::TextInput, over, patch, true, false);
+        let disabled =
+            effective_actions(&tree, node, A11yRole::TextInput, over, patch, true, false);
         assert!(
             !disabled.contains(&A11yAction::SetTextSelection)
                 && !disabled.contains(&A11yAction::Click),

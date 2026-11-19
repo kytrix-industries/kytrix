@@ -77,7 +77,10 @@ impl MacA11y {
         // SAFETY: `pointer` 指向本窗口持有的 `GuiView`（`NativeWindow` 的生命周期覆盖 adapter），
         // 且已确认在主线程 —— 这正是 `Adapter::new` 文档要求的两条前提。
         let adapter = unsafe { Adapter::new(pointer, false, actions) };
-        Ok(Self { adapter, activation })
+        Ok(Self {
+            adapter,
+            activation,
+        })
     }
 
     /// 交付一笔增量更新（闭包只在 adapter 活跃时执行 ⇒ 懒激活零开销）。

@@ -178,9 +178,7 @@ pub(crate) fn node_a11y_with_cache(
     // `TextPosition.node` 必须指向 `Role::TextRun`，输入框的字符语义由它的子文本运行承担；
     // 输入框自身只承载 `value`（+ 可选选区属性，但 `text_selection` 只挂 TextRun）。
     let text_metrics = match role {
-        A11yRole::Label | A11yRole::TextRun => {
-            value.as_deref().and_then(textrun::text_metrics)
-        }
+        A11yRole::Label | A11yRole::TextRun => value.as_deref().and_then(textrun::text_metrics),
         _ => None,
     };
     let (character_lengths, word_starts) = text_metrics.unwrap_or_default();
@@ -1378,9 +1376,7 @@ mod tests {
             "字节 3（emoji 之后）= grapheme 1"
         );
         assert!(
-            run_snapshot
-                .actions
-                .contains(&A11yAction::SetTextSelection),
+            run_snapshot.actions.contains(&A11yAction::SetTextSelection),
             "TextRun 默认宣告 SetTextSelection"
         );
     }

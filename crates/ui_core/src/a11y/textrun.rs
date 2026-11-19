@@ -303,7 +303,9 @@ mod tests {
         assert_eq!(g, vec![3, 4, 1, 1]);
         // 每个 grapheme 的起点字节。
         assert_eq!(
-            (0..=4).map(|index| byte_index(&g, index)).collect::<Vec<_>>(),
+            (0..=4)
+                .map(|index| byte_index(&g, index))
+                .collect::<Vec<_>>(),
             vec![0, 3, 7, 8, 9],
             "grapheme 下标 → 字节偏移（含末尾 caret）"
         );

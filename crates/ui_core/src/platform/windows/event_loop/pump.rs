@@ -423,17 +423,14 @@ pub(crate) fn run(mut app: App) -> Result<(), EngineError> {
     let mut windows: Vec<NativeWindow> = Vec::with_capacity(requests.len());
     for (id, options) in requests {
         // a11y adapter 与引擎 `A11yBridge` 共享消费端代际（AT 重激活 ⇒ 下一笔全树，E1）。
-        let a11y_epoch = app.borrow().window(id).map_or_else(
-            crate::a11y::adapter::A11yConsumerEpoch::new,
-            |window| window.a11y_consumer_epoch(),
-        );
-        let mut native = NativeWindow::create(
-            id,
-            &options,
-            dispatcher.clone(),
-            Some(&app),
-            a11y_epoch,
-        )?;
+        let a11y_epoch = app
+            .borrow()
+            .window(id)
+            .map_or_else(crate::a11y::adapter::A11yConsumerEpoch::new, |window| {
+                window.a11y_consumer_epoch()
+            });
+        let mut native =
+            NativeWindow::create(id, &options, dispatcher.clone(), Some(&app), a11y_epoch)?;
         let client = native.client_size();
         let renderer = Renderer::new_for_hwnd(native.composition(), client, options.background)?;
         // A5：帧预算的刷新率提示（窗口所在 output；查询失败 ⇒ 门禁保持禁用）。

@@ -154,7 +154,10 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
         A11yAction::SetTextSelection => {
             let Some((target, payload)) = selection_payload(app, window, engine, data.as_ref())
             else {
-                app.a11y_note(A11yDiagnostic::InvalidActionData { node: engine, action });
+                app.a11y_note(A11yDiagnostic::InvalidActionData {
+                    node: engine,
+                    action,
+                });
                 return;
             };
             handler_node = target;
@@ -971,7 +974,11 @@ mod tests {
     fn text_input_fixture(
         app: &mut App,
         window: crate::window::WindowId,
-    ) -> (crate::node::id::NodeId, crate::node::id::NodeId, crate::a11y::A11yNodeId) {
+    ) -> (
+        crate::node::id::NodeId,
+        crate::node::id::NodeId,
+        crate::a11y::A11yNodeId,
+    ) {
         let root = app.window(window).expect("window").tree().root();
         let input = NodeBuilder::boxed()
             .a11y(A11yOverride {
@@ -984,7 +991,9 @@ mod tests {
         let text = NodeBuilder::text("价🌍ab", crate::text::TextStyle::new(12.0))
             .build(app.window_mut(window).expect("window").tree_mut(), input)
             .expect("text run");
-        let _ = app.a11y_take(window).expect("首笔 a11y 交付（分配稳定 id）");
+        let _ = app
+            .a11y_take(window)
+            .expect("首笔 a11y 交付（分配稳定 id）");
         let stable = app
             .window(window)
             .expect("window")
@@ -1452,7 +1461,9 @@ mod tests {
         let text = NodeBuilder::text("搜索框", crate::text::TextStyle::new(12.0))
             .build(app.window_mut(window).expect("window").tree_mut(), node)
             .expect("text run");
-        let _ = app.a11y_take(window).expect("首笔 a11y 交付（分配稳定 id）");
+        let _ = app
+            .a11y_take(window)
+            .expect("首笔 a11y 交付（分配稳定 id）");
         let run = app
             .window(window)
             .expect("window")
@@ -1499,7 +1510,11 @@ mod tests {
             })),
         );
         assert_eq!(custom_hits.get(), 1, "read_only 不影响自定义动作");
-        assert_eq!(selection_hits.get(), 1, "read_only 不影响选区（只读文本仍可选中朗读）");
+        assert_eq!(
+            selection_hits.get(),
+            1,
+            "read_only 不影响选区（只读文本仍可选中朗读）"
+        );
         assert_eq!(
             selection_target.get(),
             Some(node),
@@ -1538,7 +1553,10 @@ mod tests {
                 label: Some(SmolStr::new_static("行")),
                 ..A11yOverride::default()
             })
-            .build(app.window_mut(window).expect("window").tree_mut(), container)
+            .build(
+                app.window_mut(window).expect("window").tree_mut(),
+                container,
+            )
             .expect("row");
         let handle = app
             .make_scroll(window, container, ScrollConfig::default())
@@ -1583,7 +1601,11 @@ mod tests {
             plain,
             Some(ActionData::Value("注入".into())),
         );
-        assert_eq!(hits.get(), 0, "未声明 SetValue 的节点不得把动作交给 handler");
+        assert_eq!(
+            hits.get(),
+            0,
+            "未声明 SetValue 的节点不得把动作交给 handler"
+        );
         assert!(
             app.a11y_diagnostics().iter().any(|diagnostic| matches!(
                 diagnostic,

@@ -255,10 +255,11 @@ fn open_window(
     options: &WindowOptions,
     dispatcher: &Arc<Dispatcher>,
 ) -> Result<NativeWindow, EngineError> {
-    let a11y_epoch = app.window(id).map_or_else(
-        crate::a11y::adapter::A11yConsumerEpoch::new,
-        |window| window.a11y_consumer_epoch(),
-    );
+    let a11y_epoch = app
+        .window(id)
+        .map_or_else(crate::a11y::adapter::A11yConsumerEpoch::new, |window| {
+            window.a11y_consumer_epoch()
+        });
     let native = NativeWindow::create(mtm, id, options, dispatcher, a11y_epoch)?;
     // 先显示：用户立刻看到窗口（背景色由 `NSColor` 铺底）。
     native.show();

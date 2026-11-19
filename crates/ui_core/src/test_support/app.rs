@@ -1942,11 +1942,7 @@ mod p11_fix_tests {
         });
         // 3000 行 ⇒ 首笔 2048 节点后队列还剩 953 个未交付节点（分批运行**未结束**）。
         let rows: Vec<NodeId> = {
-            let tree = app
-                .app_mut()
-                .window_mut(window)
-                .expect("window")
-                .tree_mut();
+            let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
             (0..3000)
                 .map(|index| {
                     NodeBuilder::boxed()
@@ -2118,12 +2114,7 @@ mod p11_fix_tests {
     /// 造一个「输入框 + 单行子文本」的夹具，返回 TextRun 的引擎句柄。
     fn text_run_fixture(app: &mut TestApp, text: &'static str, style: TextStyle) -> NodeId {
         let window = app.window_id();
-        let root = app
-            .app()
-            .window(window)
-            .expect("window")
-            .tree()
-            .root();
+        let root = app.app().window(window).expect("window").tree().root();
         // 输入框必须有真实布局（可容纳子文本节点）：用显式尺寸的 Style，不能用
         // `layout_override`（那是叶子节点的绝对定位覆盖，禁止带子节点）。
         let mut inner = taffy::Style::<SmolStr>::DEFAULT;
@@ -2240,12 +2231,7 @@ mod p11_fix_tests {
                 .text_caret_rect(run, caret_byte)
                 .expect("caret");
             let bounds = app.probe().bounds(run).expect("bounds");
-            let scale = app
-                .app()
-                .window(window)
-                .expect("window")
-                .scale()
-                .factor();
+            let scale = app.app().window(window).expect("window").scale().factor();
             let expected = (caret.min().x - bounds.origin.x) * scale;
             let actual = record.character_positions[position_index];
             assert!(
@@ -2325,11 +2311,7 @@ mod p11_fix_tests {
     /// 造 `count` 个固定几何的行（`layout_override` ⇒ 边界可预测，根的直接子节点）。
     fn rows_fixture(app: &mut TestApp, count: usize) -> Vec<NodeId> {
         let window = app.window_id();
-        let tree = app
-            .app_mut()
-            .window_mut(window)
-            .expect("window")
-            .tree_mut();
+        let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
         let root = tree.root();
         (0..count)
             .map(|index| {
@@ -2386,10 +2368,7 @@ mod p11_fix_tests {
             "单点增量仍在 A11Y_THROTTLE 窗口内（省电目标不变）"
         );
         app.advance(std::time::Duration::from_millis(100));
-        assert!(
-            app.app().a11y_pending(window),
-            "节流窗口到期后增量恢复交付"
-        );
+        assert!(app.app().a11y_pending(window), "节流窗口到期后增量恢复交付");
         let _ = app.drain_pump().expect("到期补发");
         app.assert_a11y_contract();
     }

@@ -186,9 +186,7 @@ mod tests {
 
     use super::{WindowsA11y, WindowsActivation};
     use crate::{
-        a11y::adapter::A11yConsumerEpoch,
-        platform::dispatcher::Dispatcher,
-        window::WindowId,
+        a11y::adapter::A11yConsumerEpoch, platform::dispatcher::Dispatcher, window::WindowId,
     };
 
     unsafe extern "system" fn wndproc(
@@ -256,7 +254,12 @@ mod tests {
             !unsafe { IsWindowVisible(hwnd) }.as_bool(),
             "本用例必须在首显之前构造 adapter"
         );
-        let a11y = WindowsA11y::new(hwnd, Dispatcher::new(), WindowId::for_test(1), A11yConsumerEpoch::new());
+        let a11y = WindowsA11y::new(
+            hwnd,
+            Dispatcher::new(),
+            WindowId::for_test(1),
+            A11yConsumerEpoch::new(),
+        );
         assert!(a11y.is_ok(), "隐藏窗口上必须能构造 adapter（首显前）");
         let mut a11y = a11y.expect("adapter");
         a11y.focus_changed(true);
@@ -271,8 +274,13 @@ mod tests {
     fn update_if_active_is_lazy_without_assistive_tech() {
         let _runtime = runtime();
         let (hwnd, _class) = hidden_window("KytrixP11A11yLazy");
-        let mut a11y =
-            WindowsA11y::new(hwnd, Dispatcher::new(), WindowId::for_test(2), A11yConsumerEpoch::new()).expect("adapter");
+        let mut a11y = WindowsA11y::new(
+            hwnd,
+            Dispatcher::new(),
+            WindowId::for_test(2),
+            A11yConsumerEpoch::new(),
+        )
+        .expect("adapter");
         // 无辅助技术连接时 adapter 恒 Inactive ⇒ 闭包**一次都不执行**（懒激活零开销）。
         // 注：本断言在「有 AT 正在运行的机器」上不成立，CI 无桌面环境恒成立（V-75 的已知边界）。
         let mut called = false;
@@ -291,8 +299,13 @@ mod tests {
     fn wm_getobject_with_an_unrelated_objid_falls_through() {
         let _runtime = runtime();
         let (hwnd, _class) = hidden_window("KytrixP11A11yObjid");
-        let mut a11y =
-            WindowsA11y::new(hwnd, Dispatcher::new(), WindowId::for_test(3), A11yConsumerEpoch::new()).expect("adapter");
+        let mut a11y = WindowsA11y::new(
+            hwnd,
+            Dispatcher::new(),
+            WindowId::for_test(3),
+            A11yConsumerEpoch::new(),
+        )
+        .expect("adapter");
         // OBJID_WINDOW / 其它负数 objid 不归 AccessKit 管 ⇒ 交回 DefWindowProcW。
         let result = a11y.wm_getobject(
             windows::Win32::Foundation::WPARAM(0),

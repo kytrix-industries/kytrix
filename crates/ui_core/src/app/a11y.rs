@@ -464,10 +464,7 @@ mod tests {
         );
 
         // 消费端重置：不推进时钟也必须立即交付，且下一笔是全树。
-        let epoch = app
-            .window(window)
-            .expect("window")
-            .a11y_consumer_epoch();
+        let epoch = app.window(window).expect("window").a11y_consumer_epoch();
         epoch.bump();
         assert!(
             app.a11y_pending(window),

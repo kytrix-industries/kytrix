@@ -23,9 +23,7 @@ pub(crate) fn a11y_focus_pending(window: &Window) -> bool {
 /// 消费端树生命周期代际句柄（E1）：交给平台 adapter 的激活/停用回调 `bump()`。
 ///
 /// 回调在 AccessKit 的线程上执行，只能原子递增 + 唤醒主线程；引擎据此把下一笔升成全树。
-pub(crate) fn a11y_consumer_epoch(
-    window: &Window,
-) -> crate::a11y::adapter::A11yConsumerEpoch {
+pub(crate) fn a11y_consumer_epoch(window: &Window) -> crate::a11y::adapter::A11yConsumerEpoch {
     window.a11y.consumer_epoch()
 }
 
