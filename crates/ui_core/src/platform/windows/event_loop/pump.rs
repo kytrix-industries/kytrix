@@ -40,7 +40,7 @@ use crate::{
     error::EngineError,
     platform::{
         dispatcher::Dispatcher,
-        windows::{composition, dpi_awareness, window::NativeWindow},
+        windows::{composition::{self, CompositionState}, dpi_awareness, window::NativeWindow},
     },
     render::backend::Renderer,
     window::{Window, WindowId, WindowOptions},
@@ -597,6 +597,8 @@ pub(super) fn pump_loop(
     // 归属判定用 `WindowId` 而不是 HWND 裸值：首窗销毁后系统可能把同一个 HWND 复用给新窗，
     // 裸值比较会「看起来仍匹配」而不重建定时器（复审 P2-8）。
     let mut a11y_timer: Option<WindowId> = None;
+    // C2：已消费的 DirectComposition 健康检查代际（`WM_PAINT` 在 `WndProc` 推进）。
+    let mut composition_epoch_seen = composition::device_check_epoch();
     loop {
         // ①′ 新消息批开始：推进 IME 提交抑制队列的批次号（AR3 §1.5 / P2-2）。
         //
@@ -660,6 +662,28 @@ pub(super) fn pump_loop(
         // 客户区对齐；背景层覆盖「客户区已变、新尺寸的帧还没上屏」的 ≤1 个 vsync 接缝（以及
         // DPI 同步改尺寸 / 首帧 / 设备恢复这些没有帧在飞的瞬间）。
         //
+        // C2：`WM_PAINT` 健康检查代际（MS DirectComposition best practice）。`WndProc` 只推进
+        // 无锁代际；在这里消费 —— 本 pass 下一步本来就要拿合成锁做几何，检查复用同一个临界区。
+        // 设备失效时只登记「重建 visual tree」请求：重建需要 D3D12 设备与交换链，只能在 GPU 线程做。
+        if composition::device_check_epoch() != composition_epoch_seen {
+            composition_epoch_seen = composition::device_check_epoch();
+            let mut stale = Vec::new();
+            for native in windows.iter() {
+                let target = native.composition();
+                let target = composition::lock(&target);
+                if target.check_device_state() == CompositionState::Invalid {
+                    stale.push(native.id());
+                }
+            }
+            if !stale.is_empty() {
+                let mut app = app_cell.borrow_mut();
+                for id in stale {
+                    if let Some(window) = app.window_mut(id) {
+                        window.request_composition_rebuild();
+                    }
+                }
+            }
+        }
         // R07-11：客户区与最小化状态**不再每轮每窗查询**（旧实现 2 次系统调用/窗/轮）。缓存键
         // = `(逻辑尺寸, 比例)` —— `WM_SIZE` / `WM_DPICHANGED` 已在本轮 ①/② 阶段写进
         // `NativeWindow`，所以键变化精确覆盖「客户区可能变了」的时机；稳态每轮每窗 0 次系统调用。

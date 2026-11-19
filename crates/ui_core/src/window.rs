@@ -897,6 +897,13 @@ impl Window {
     }
 
     // ── surface：实现见 `surface` 子模块的自由函数 ──
+    /// 实现见子模块 `surface::request_composition_rebuild`（C2；Windows 泵的几何 pass 调用）。
+    ///
+    /// 其它平台没有 DirectComposition，不存在该入口（`cfg` 保证只有 Windows 编译它）。
+    #[cfg(target_os = "windows")]
+    pub(crate) fn request_composition_rebuild(&mut self) {
+        surface::request_composition_rebuild(self)
+    }
     /// 实现见子模块 `surface::options`（本文件只保留签名）。
     #[must_use]
     pub fn options(&self) -> &WindowOptions {

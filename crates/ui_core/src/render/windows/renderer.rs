@@ -72,7 +72,7 @@ use crate::{
     paint::{atlas::AtlasKind, color::Color},
     platform::{
         dispatcher::WM_APP_COMPOSITION_WAKE,
-        windows::composition::{self, Composition},
+        windows::composition::{self, Composition, CompositionState},
     },
     render::{
         DirtyRects, RenderStats,
@@ -179,6 +179,18 @@ impl Renderer {
         match &self.target {
             RenderTarget::Offscreen(_) => false,
             RenderTarget::Window(window) => window.take_composition_pending(),
+        }
+    }
+
+    /// 请求 GPU 线程检查 / 重建 DirectComposition 设备与 visual tree（C2；泵的几何 pass 调用）。
+    ///
+    /// 泵已经在本轮消费了 `WM_PAINT` 健康检查代际并调过 `CheckDeviceState`：Invalid 时才请求，
+    /// 真正重建在 GPU 线程（`GpuRenderer::rebuild_composition`）。返回 `false` = 没有窗口目标或
+    /// GPU 线程已经不在（关闭路径），调用方不需要任何处理。
+    pub(crate) fn request_composition_rebuild(&self) -> bool {
+        match &self.target {
+            RenderTarget::Offscreen(_) => false,
+            RenderTarget::Window(window) => window.shared.request_composition_rebuild(),
         }
     }
 
@@ -455,6 +467,7 @@ impl WindowRenderer {
             presented: AtomicU64::new(pack_size(surface)),
             reset_epoch: AtomicU64::new(0),
             composition_pending: AtomicBool::new(false),
+            composition_rebuild: AtomicBool::new(false),
             atlas_pending: [AtomicBool::new(false), AtomicBool::new(false)],
         });
         let worker = Arc::clone(&shared);
@@ -615,6 +628,11 @@ struct Shared {
     reset_epoch: AtomicU64,
     /// 两次唤醒都失败时的兜底标记：UI 线程在泵的几何 pass 里消费它并重算一次几何。
     composition_pending: AtomicBool,
+    /// 「DirectComposition 设备可能失效，请 GPU 线程检查/重建」请求（C2）。
+    ///
+    /// 泵的几何 pass 消费 `WM_PAINT` 健康检查代际并调 `CheckDeviceState`；Invalid 时置位本标记 +
+    /// `SetEvent(work)` 唤醒 GPU 线程，由 GPU 线程重建 visual tree（需要 D3D12 设备/交换链）。
+    composition_rebuild: AtomicBool,
     /// 每 `AtlasKind` 的共享槽是否正在被 GPU 线程消费（`false` = UI 可以入队）。
     atlas_pending: [AtomicBool; 2],
 }
@@ -770,6 +788,24 @@ impl Shared {
     /// 取走待应用的背景色（取一次清空）。
     fn take_background(&self) -> Option<[f32; 4]> {
         self.lock().background.take()
+    }
+
+    /// 请求 GPU 线程检查 / 重建 DirectComposition 设备与 visual tree（C2；UI 线程）。
+    ///
+    /// 只置位 + `SetEvent(work)`：检查与重建在 GPU 线程（需要 D3D12 设备/交换链，且 DComp 调用
+    /// 不能从 `WndProc`/泵的借用里做）。GPU 线程不可用时返回 `false`。
+    fn request_composition_rebuild(&self) -> bool {
+        if !self.alive() {
+            return false;
+        }
+        self.composition_rebuild.store(true, Ordering::Release);
+        self.wake();
+        true
+    }
+
+    /// 取走「重建 DComp」请求（GPU 线程循环顶部消费）。
+    fn take_composition_rebuild_request(&self) -> bool {
+        self.composition_rebuild.swap(false, Ordering::AcqRel)
     }
 
     /// 发布「最近一次完成 present 的内容尺寸」；尺寸变化时唤醒 UI 线程重算合成几何。
@@ -1041,16 +1077,87 @@ fn device_lost_for_boundary(renderer: Option<&GpuRenderer>) -> bool {
     renderer.is_some_and(|current| current.check_device_lost().is_some())
 }
 
-/// GPU 线程致命错误边界：宣布致命之前是否需要走设备恢复（C1）。
+/// GPU 线程致命错误的处置分类（C1 边界复判 + C2 的 DComp 可恢复分支）。
 ///
-/// - `DeviceLost` 是粘性结论，必须恢复；
-/// - 其它错误（`Swapchain` / `Composition` / ...）只有在权威判据同时确认设备已移除时才恢复 ——
-///   典型来源是 `ResizeBuffers` 在 TDR / 驱动复位竞态下返回设备级 HRESULT 却被包成交换链错误。
+/// - `DeviceLost` 是粘性结论，必须整 renderer 恢复；
+/// - 其它错误（`Swapchain` / `Composition` / ...）只有权威判据确认设备已移除时才走设备恢复 ——
+///   典型来源是 `ResizeBuffers` 在 TDR / 驱动复位竞态下返回设备级 HRESULT 却被包成交换链错误；
+/// - D3D12 设备健康、但 `CheckDeviceState` 判 DComp 失效时，只重建合成设备/visual tree（C2）：
+///   `Composition` 错误既可能来自 DWM 重启，也可能只是一次瞬态调用失败，只有权威状态无效才重建。
 ///
-/// 这与逐调用点的 `classify` 是两层防线：`classify` 让错误**分类正确**，本判据保证**不会漏掉**
-/// 尚未接线的 DXGI 调用点（新增调用点忘记 classify 时仍然恢复而不是静默退出线程）。
-fn recovery_required(error: &EngineError, device_lost: bool) -> bool {
-    matches!(error, EngineError::DeviceLost { .. }) || device_lost
+/// 逐调用点的 `classify` 让错误**分类正确**；本判据保证**不会漏掉**尚未接线的调用点（新增 DXGI
+/// 调用点忘记 classify 时仍然恢复而不是静默退出线程）。
+fn fatal_disposition(
+    error: &EngineError,
+    device_lost: bool,
+    composition_invalid: bool,
+) -> FatalDisposition {
+    if matches!(error, EngineError::DeviceLost { .. }) || device_lost {
+        FatalDisposition::DeviceLost
+    } else if composition_invalid {
+        FatalDisposition::CompositionInvalid
+    } else {
+        FatalDisposition::Fatal
+    }
+}
+
+/// GPU 线程致命错误的处置（C1/C2）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FatalDisposition {
+    /// 真正致命：交给 UI（粘性错误）。
+    Fatal,
+    /// 设备已移除：恢复整个 renderer（D3D12 设备 + DComp visual tree）。
+    DeviceLost,
+    /// D3D12 设备健康但 DirectComposition 失效：只重建 DComp 设备 / visual tree。
+    CompositionInvalid,
+}
+
+/// DirectComposition 设备 / visual tree 重建的限次预算（C2）。
+///
+/// 与 `SharedGpu::recover`（D3D12 设备恢复）同一量级：窗口内最多
+/// [`MAX_COMPOSITION_REBUILDS`] 次。DWM 反复重启 / DComp 持续失效时，无限重建就是「每帧重建
+/// visual tree」的活锁；超限后按粘性 `Composition` 错误上报，由应用决定是否重建窗口。
+const COMPOSITION_RECOVERY_WINDOW: Duration = Duration::from_secs(5);
+const MAX_COMPOSITION_REBUILDS: usize = 3;
+
+/// DComp 重建预算（GPU 线程独占；纯逻辑，可用 `allow_rebuild` 单测）。
+struct CompositionRecovery {
+    /// 最近窗口内的重建时刻（FIFO）。
+    rebuilds: VecDeque<Instant>,
+}
+
+impl CompositionRecovery {
+    fn new() -> Self {
+        Self {
+            rebuilds: VecDeque::with_capacity(MAX_COMPOSITION_REBUILDS),
+        }
+    }
+
+    /// 登记一次重建尝试；窗口内超限返回 `false`（调用方按粘性错误上报）。
+    fn allow_rebuild(&mut self) -> bool {
+        let now = Instant::now();
+        while self
+            .rebuilds
+            .front()
+            .is_some_and(|at| now.duration_since(*at) >= COMPOSITION_RECOVERY_WINDOW)
+        {
+            self.rebuilds.pop_front();
+        }
+        if self.rebuilds.len() >= MAX_COMPOSITION_REBUILDS {
+            return false;
+        }
+        self.rebuilds.push_back(now);
+        true
+    }
+}
+
+/// 重建预算耗尽时的粘性错误（C2；文案带次数与窗口，便于诊断归因）。
+fn composition_rebuild_exhausted() -> EngineError {
+    EngineError::Composition {
+        detail: format_smolstr!(
+            "DirectComposition device stayed invalid after {MAX_COMPOSITION_REBUILDS} rebuilds within {COMPOSITION_RECOVERY_WINDOW:?}"
+        ),
+    }
 }
 
 /// GPU 线程主循环（§6.3）。
@@ -1066,6 +1173,7 @@ fn gpu_loop(renderer: GpuRenderer, shared: Arc<Shared>) {
     // 引用，再销毁 swapchain / 设备），`join` 返回时 teardown 一定已经完成（§6.7）。
     let mut renderer = Some(renderer);
     let mut submitted = VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT);
+    let mut composition_recovery = CompositionRecovery::new();
     loop {
         let result = run_gpu_loop(
             renderer
@@ -1073,6 +1181,7 @@ fn gpu_loop(renderer: GpuRenderer, shared: Arc<Shared>) {
                 .expect("renderer is present until teardown"),
             &shared,
             &mut submitted,
+            &mut composition_recovery,
         );
         match result {
             Ok(()) => break,
@@ -1081,27 +1190,65 @@ fn gpu_loop(renderer: GpuRenderer, shared: Arc<Shared>) {
                 // （`GetDeviceRemovedReason`）复查一次设备是否真的还在。逐调用点 `classify`
                 // 之外还会有遗漏（尤其 `ResizeBuffers` 这类把设备级 HRESULT 包成
                 // `Swapchain` 的出口），这里兜底：设备已死就必须走恢复，而不是退出线程。
-                if !recovery_required(&error, device_lost_for_boundary(renderer.as_ref())) {
-                    shared.publish_error(error);
-                    break;
-                }
-                // 设备真的被移除了：先尝试一次进程内恢复（限次在 `SharedGpu::recover` 里）。
-                submitted.clear();
-                let current = renderer.take().expect("renderer is present until teardown");
-                match current.recover() {
-                    Ok(recovered) => {
-                        crate::render::windows::diagnostics::device_recovered();
-                        renderer = Some(recovered);
-                        // 镜像已随设备重建 ⇒ UI 必须整帧重发：`InstanceMirror` 现在为空，而增量
-                        // 载荷只带「变化」的 lane，其余 lane 会画成退化实例（AR4 P1-1）。
-                        shared.note_renderer_rebuilt();
-                        if shared.shutdown_requested() {
-                            break;
+                let device_lost = match &error {
+                    EngineError::DeviceLost { .. } => true,
+                    _ => device_lost_for_boundary(renderer.as_ref()),
+                };
+                // C2：D3D12 健康时再看 DComp —— `Composition` 错误只有权威状态判 Invalid 才重建。
+                let composition_invalid = !device_lost
+                    && renderer
+                        .as_ref()
+                        .is_some_and(|current| {
+                            current.composition_state() == CompositionState::Invalid
+                        });
+                match fatal_disposition(&error, device_lost, composition_invalid) {
+                    FatalDisposition::Fatal => {
+                        shared.publish_error(error);
+                        break;
+                    }
+                    FatalDisposition::DeviceLost => {
+                        // 设备真的被移除了：先尝试一次进程内恢复（限次在 `SharedGpu::recover` 里）。
+                        submitted.clear();
+                        let current =
+                            renderer.take().expect("renderer is present until teardown");
+                        match current.recover() {
+                            Ok(recovered) => {
+                                crate::render::windows::diagnostics::device_recovered();
+                                renderer = Some(recovered);
+                                // 镜像已随设备重建 ⇒ UI 必须整帧重发：`InstanceMirror` 现在为空，
+                                // 而增量载荷只带「变化」的 lane，其余 lane 会画成退化实例
+                                // （AR4 P1-1）。
+                                shared.note_renderer_rebuilt();
+                                if shared.shutdown_requested() {
+                                    break;
+                                }
+                            }
+                            Err(fatal) => {
+                                shared.publish_error(fatal);
+                                break;
+                            }
                         }
                     }
-                    Err(fatal) => {
-                        shared.publish_error(fatal);
-                        break;
+                    FatalDisposition::CompositionInvalid => {
+                        if !composition_recovery.allow_rebuild() {
+                            shared.publish_error(composition_rebuild_exhausted());
+                            break;
+                        }
+                        let current =
+                            renderer.as_mut().expect("renderer is present until teardown");
+                        match current.rebuild_composition() {
+                            Ok(()) => {
+                                crate::render::windows::diagnostics::composition_recovered();
+                                // visual tree 换了：旧 visual 上的内容已随旧设备释放 ⇒ UI 整帧重发。
+                                shared.note_renderer_rebuilt();
+                                // **不**清 `submitted`：D3D12 设备 / 提交 / fence 都还在，
+                                // 完成反馈与 retire 必须继续推进（否则 retire 队列会泄漏到卸载）。
+                            }
+                            Err(fatal) => {
+                                shared.publish_error(fatal);
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -1192,6 +1339,7 @@ fn run_gpu_loop(
     renderer: &mut GpuRenderer,
     shared: &Shared,
     submitted: &mut VecDeque<SubmittedFrame>,
+    composition_recovery: &mut CompositionRecovery,
 ) -> Result<(), EngineError> {
     // 已从共享槽取走、但还没被本帧命令列表消费的图集上传（按 `AtlasKind`）。共享槽标志
     // 要等这里清，UI 才不会在 `Retry` / Idle 帧覆盖掉未录制的上传（DEVIATIONS F-211）。
@@ -1208,6 +1356,24 @@ fn run_gpu_loop(
         drain_completed(renderer, shared, submitted, &mut statistics);
         if shared.shutdown_requested() {
             return Ok(());
+        }
+        // C2：泵的几何 pass 消费了 `WM_PAINT` 健康检查代际、发现 DComp 设备失效 ⇒ 请求 GPU 线程
+        // 重建 visual tree（D3D12 设备 / 交换链 / persist 全部保留，空窗 ≤1–2 帧）。这里再读一次
+        // 权威状态：请求可能已过期（DWM 恢复），只有仍然 Invalid 才真的重建。
+        if shared.take_composition_rebuild_request() {
+            match renderer.composition_state() {
+                CompositionState::Valid | CompositionState::WindowClosed => {}
+                CompositionState::Invalid => {
+                    if !composition_recovery.allow_rebuild() {
+                        return Err(composition_rebuild_exhausted());
+                    }
+                    renderer.rebuild_composition()?;
+                    crate::render::windows::diagnostics::composition_recovered();
+                    shared.note_renderer_rebuilt();
+                    // 重建后 DWM 需要一次 present 才显示内容：本帧不吃遮挡退避。
+                    force_present = true;
+                }
+            }
         }
         // 显示 / 电源恢复：拓扑 / 工作区 / 唤醒之后重建交换链（⇒ reset_epoch 让 UI 整帧重发）
         // 并清一次遮挡退避。
@@ -1669,8 +1835,9 @@ mod tests {
     use smol_str::SmolStr;
 
     use super::{
-        AtlasSlots, DisplayRecovery, FrameSink, PanicGuard, Shared, State, StickyError,
-        WindowFrameSink, recovery_required, pack_size, recover_display_change, unpack_size,
+        AtlasSlots, CompositionRecovery, DisplayRecovery, FatalDisposition, FrameSink, PanicGuard,
+        Shared, State, StickyError, WindowFrameSink, fatal_disposition, pack_size,
+        recover_display_change, unpack_size,
     };
     use crate::{
         error::EngineError,
@@ -1806,6 +1973,7 @@ mod tests {
             presented: AtomicU64::new(pack_size((1, 1))),
             reset_epoch: AtomicU64::new(0),
             composition_pending: AtomicBool::new(false),
+            composition_rebuild: AtomicBool::new(false),
             atlas_pending: [AtomicBool::new(false), AtomicBool::new(false)],
         })
     }
@@ -1839,29 +2007,72 @@ mod tests {
             reason: SmolStr::new_static("DXGI_ERROR_DEVICE_REMOVED"),
             log_path: std::path::PathBuf::from("logs/dred.txt"),
         };
-        assert!(
-            recovery_required(&removed, false),
+        assert_eq!(
+            fatal_disposition(&removed, false, false),
+            FatalDisposition::DeviceLost,
             "DeviceLost 本身已足够触发恢复"
         );
-        assert!(recovery_required(&removed, true));
+        assert_eq!(
+            fatal_disposition(&removed, true, true),
+            FatalDisposition::DeviceLost
+        );
 
         let swapchain = EngineError::Swapchain {
             detail: SmolStr::new_static("ResizeBuffers(800x600): 0x887A0005"),
         };
-        assert!(
-            !recovery_required(&swapchain, false),
+        assert_eq!(
+            fatal_disposition(&swapchain, false, false),
+            FatalDisposition::Fatal,
             "设备健康时交换链错误必须保持致命（不无限恢复）"
         );
-        assert!(
-            recovery_required(&swapchain, true),
+        assert_eq!(
+            fatal_disposition(&swapchain, true, false),
+            FatalDisposition::DeviceLost,
             "ResizeBuffers 在设备移除竞态下被包成 Swapchain 时仍必须恢复"
         );
 
+        // C2：D3D12 健康但 DComp 失效 ⇒ 可恢复（只重建 visual tree），不是致命。
         let composition = EngineError::Composition {
             detail: SmolStr::new_static("Device::Commit: 0x8007000E"),
         };
-        assert!(!recovery_required(&composition, false));
-        assert!(recovery_required(&composition, true));
+        assert_eq!(
+            fatal_disposition(&composition, false, true),
+            FatalDisposition::CompositionInvalid
+        );
+        assert_eq!(
+            fatal_disposition(&composition, false, false),
+            FatalDisposition::Fatal
+        );
+        // 设备已丢失的优先级高于 DComp 失效：必须整 renderer 恢复，而不是只重建 visual tree。
+        assert_eq!(
+            fatal_disposition(&composition, true, true),
+            FatalDisposition::DeviceLost
+        );
+    }
+
+    /// C2：DComp 重建预算 —— 窗口内最多 3 次，超限后由成功重建前的冷却时间复位。
+    ///
+    /// 直接跑 3 次 `allow_rebuild` 后再跑第 4 次（窗口内）必须拒绝；把窗口“拨快”到冷却之后
+    /// 再允许（这里通过时间无法注入，因此用 `COMPOSITION_RECOVERY_WINDOW` 的语义断言：持续
+    /// 重建在窗口内也不会无限通过 —— 三次后拒绝，说明预算生效）。
+    #[test]
+    fn composition_rebuilds_are_bounded_within_the_recovery_window() {
+        let mut recovery = CompositionRecovery::new();
+        assert!(recovery.allow_rebuild(), "第 1 次重建允许");
+        assert!(recovery.allow_rebuild(), "第 2 次重建允许");
+        assert!(recovery.allow_rebuild(), "第 3 次重建允许");
+        assert!(
+            !recovery.allow_rebuild(),
+            "同一窗口内第 4 次重建必须被拒绝（否则 DWM 反复失效会变成每帧重建活锁）"
+        );
+        // 诊断文案必须能归因到「限次」，而不是伪装成普通 Composition 错误。
+        let error = super::composition_rebuild_exhausted();
+        match error {
+            EngineError::Composition { detail } => {
+                assert!(detail.contains("3 rebuilds"), "{detail}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     /// R07-14：平台层的显示 / 电源恢复（拓扑变化、工作区变化、睡眠唤醒）必须让 GPU 线程

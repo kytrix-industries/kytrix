@@ -247,6 +247,19 @@ pub(crate) fn atlas_idle(window: &Window, kind: AtlasKind) -> bool {
         .is_none_or(|renderer| renderer.atlas_idle(kind))
 }
 
+// 消费者：`Window::request_composition_rebuild` 的薄委托（Windows 泵的几何 pass 调用）。
+/// 请求 GPU 线程检查 / 重建 DirectComposition 设备与 visual tree（C2）。
+///
+/// 只置位 + 唤醒：真正的重建在 GPU 线程（需要 D3D12 设备 / 交换链）。`WndProc` 只推进
+/// `WM_PAINT` 健康检查代际，泵的几何 pass 消费代际并调 `CheckDeviceState`；这里把
+/// 「Invalid ⇒ 请重建」转给 `Renderer`。
+#[cfg(target_os = "windows")]
+pub(crate) fn request_composition_rebuild(window: &Window) {
+    if let Some(renderer) = window.renderer.as_ref() {
+        renderer.request_composition_rebuild();
+    }
+}
+
 // 消费者：`impl Window::set_renderer` 的薄委托（外部调用点见该方法文档）。
 /// 挂上 GPU 渲染器（平台层在窗口创建之后调用；`Renderer` 已带 HWND swapchain）。
 ///
