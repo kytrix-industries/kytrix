@@ -85,8 +85,8 @@ use crate::{
     app::App,
     error::{EngineError, WaylandErrorKind},
     event::{
-        Event, ImeEvent, InputEvent, KeyCode, KeyState, Modifiers, PointerButton, ScrollPhase,
-        ScrollUnit, should_emit_text,
+        Event, ImeEvent, InputEvent, KeyCode, KeyState, Modifiers, ScrollPhase, ScrollUnit,
+        should_emit_text,
     },
     math::{Point, Rect, Scale, Size},
     paint::style::Cursor,
@@ -94,6 +94,7 @@ use crate::{
         linux::{clipboard::Clipboard, cursor::CursorManager, dpi, ime::ImeState, window},
         wayland::{
             frame_gate::{CallbackToken, FrameGate},
+            input,
             text_input::{self, ImeStateSnapshot, TextInputRoute},
             toplevel::{
                 self, DecorationMode, ToplevelStates, Visibility, WindowGeometry, WmCapabilities,
@@ -1518,17 +1519,6 @@ impl WaylandState {
         }
     }
 
-    fn pointer_button(button: u32) -> Option<PointerButton> {
-        match button {
-            0x110 => Some(PointerButton::Primary),
-            0x111 => Some(PointerButton::Middle),
-            0x112 => Some(PointerButton::Secondary),
-            0x113 => Some(PointerButton::X1),
-            0x114 => Some(PointerButton::X2),
-            _ => None,
-        }
-    }
-
     /// 把已排队的协议事件分发进 handler（`initial_roundtrip` 与首帧之前调用）。
     fn dispatch_pending(
         &mut self,
@@ -2104,7 +2094,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 state: button_state,
                 ..
             } => {
-                if let Some(button) = Self::pointer_button(button) {
+                if let Some(button) = input::pointer_button(button) {
                     let timestamp = Instant::now();
                     let event = match button_state {
                         wayland_client::WEnum::Value(wl_pointer::ButtonState::Pressed) => {

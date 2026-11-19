@@ -19,6 +19,7 @@
 
 pub(crate) mod cursor;
 pub(crate) mod frame_gate;
+pub(crate) mod input;
 pub(crate) mod selection;
 pub(crate) mod text_input;
 pub(crate) mod toplevel;
