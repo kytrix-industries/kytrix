@@ -1174,11 +1174,29 @@ app.write( & disabled, true);   // → 一个节点失效 → 一个 lane → �
 见 §2.3 与**附录 B**。128 B / 16 B 对齐；`contract.md` 为唯一权威；Rust 侧 `size_of` / `offset_of` 静态断言，构建期比对三套
 shader 的结构体文本。
 
+X5 的几何增量更新（§5.3 / §5.5）**不改变**本节字节布局与 `contract.md`：几何通道复用既有 PSO / 根签名，几何顶点布局
+只由 `GeometryDesc.vertex_stride` 描述。
+
 ### 5.3 Paint lane 与绘制序
 
-- 每个节点持有 1–4 个 `LaneId`，lane 内容 = `Vec<Primitive>` + 该 lane 的 `DamageRect`。
-- `order: Vec<NodeId>` 稳定排序；子节点增删只做局部重排，标 `ORDER` 的节点及其子树 lane 强制重建。
-- clip 栈按 `Clip` 压 / 弹，生成 `clip_chain`；uber-quad 片元用 `clip_mask` 求值，一个 clip 区域内一次 draw。
+- 每个节点持有 0–N 条 lane（`Node.lanes: SmallVec<[LaneId; 2]>`）；普通节点 / 文本节点仍是 1 条，
+  `Canvas` 可多条。
+- **几何节点按块一条 lane**（X5）：`Geometry` 的索引缓冲按 `GEOMETRY_CHUNK_INDICES = 12288`
+  （4096 个三角形，`TriangleList`）切块；第 0 条块 lane 同时承载 Shadow / 背景 / 边框 / 焦点环
+  与节点盒 damage，其余块 lane 只有「祖先 clip 前缀 + 内容 clip + 本块几何图元」。
+  `TriangleStrip` 无法在索引缓冲里独立 draw，固定退化为单块（1 条 lane，已文档化）。
+- **块间绘制序 = 块序 = 索引缓冲顺序**：块 lane 按块号排在 `order` 里，clip 栈语义与单 lane
+  时代完全一致（每块 lane 展开同一份祖先 clip 前缀/后缀 + 内容 clip）；golden 10/10 证明像素路径
+  不变。
+- `order: Vec<NodeId>` 稳定排序；块 lane 顺序在节点内部固定。**纯数据更新不改变 lane 集合 ⇒
+  不重排绘制序**（`delta.order == None` 快路径）；只有块数变化（追加跨块）或节点增删才标
+  `order_changed`，走轻量 DFS 兜底重建。
+- 节点数据更新只把绑定节点标 `PAINT`（不清 `REUSABLE`、不并节点盒 damage）；paint 逐块比较
+  烘焙块版本 `(revision, AABB)`，只重建变化的块 lane；块 0 的装饰/焦点环随节点重建。
+- damage：`!REUSABLE` 块 lane 的 damage = 该块「旧 AABB ∪ 新 AABB」经 per-draw 变换后的物理
+  并集；块 0 额外并入节点盒 damage（祖先闭包 / 内容收缩）。
+- clip 栈按 `Clip` 压 / 弹，生成 `clip_chain`；uber-quad 片元用 `clip_mask` 求值，一个 clip 区域内
+  一次 draw。
 
 ### 5.4 uber-quad 管线（三套 shader 的语义契约）
 
@@ -1198,11 +1216,14 @@ shader 的结构体文本。
 
 ### 5.5 `Geometry` 静态几何通道（最大收益项）
 
+**装载期注册 + 运行期页级增量更新**（X5）。注册输入 `GeometryDesc` 与跨线程只读快照
+`GeometrySnapshot` 分离：数据更新只产生新快照，不重新注册、不重建 GPU 缓冲。
+
 ```rust
 pub struct GeometryId(u64);
 pub struct GeometryDesc {
     pub vertex_stride: u32,
-    pub vertex_bytes: Bytes,      // 装载期一次写入，之后不可变
+    pub vertex_bytes: Bytes,      // 注册期一次写入（此后由 range 更新维护）
     pub index_bytes: Bytes,
     pub index_type: IndexType,
     pub topology: Topology,
@@ -1211,19 +1232,37 @@ pub struct GeometryDesc {
 }
 ```
 
-| 操作                        | 行为                                            | 成本               |
-|-----------------------------|-------------------------------------------------|--------------------|
-| `register_geometry(desc)`   | 创建 VBO/IBO 并常驻，返回 `GeometryId`          | 装载期一次         |
-| `set_transform(id, matrix)` | 只更新 uniform（64–128 B）                      | 每帧 ~0 B 顶点上传 |
-| `resize` / `dpi change`     | 重布局 + uniform + 重建渲染目标，**不重建 VBO** | 消除 17.5 ms/次    |
-| `drop(GeometryId)`          | retire 队列延迟释放                             | I4                 |
+| 操作 | 行为 | 成本 |
+| ------------------------------ | ------------------------------------------------------------ | ------------------ |
+| `register_geometry(desc)`      | 创建快照（页表 + 块元数据）；GPU 缓冲首帧按需创建 | 装载期一次 |
+| `set_transform(id, matrix)`    | 只更新 uniform（64–128 B） | 每帧 ~0 B 顶点上传 |
+| `update_geometry_vertices(id, range, bytes)` | 就地替换被触碰的 **4 KiB 页**（页级 COW），重扫受影响块 AABB，revision+1，自动标脏绑定节点 | 只上传变化页 |
+| `update_geometry_indices(id, range, bytes)`  | 同上（索引页） | 只上传变化页 |
+| `resize` / `dpi change`        | 重布局 + uniform + 重建渲染目标，**不重建 VBO** | 消除 17.5 ms/次 |
+| `drop(GeometryId)`             | retire 队列延迟释放 | I4 |
 
-**收益依据**：现状 154,404 顶点 × 48 B 展开 + 多次 clone → `2^18` 档 26 MiB × 8 段 ≈ 194 MB `PAGE_NOCACHE`；静态 VBO
-后每帧上传 ≈ 0 B，容量固定，不出现 `2^n` 跨档翻倍。这是**唯一**能结构性移除 86% 框架成本的改动，也是 D1「专属 GPU
-绘制能力」最具体的兑现。
-
-**与 damage 的交互**：`Geometry` 节点的 damage = 变换前后包围盒并集（外扩 AA 半径）；uniform 变化不重建 lane，只标 `GEOMETRY`
-；地图 / K 线的静态网格与动态标注分层，动态部分仍走普通 lane。
+- **range 契约**：`range.start <= len`；`range.end > len` 视为尾随追加；空 range = no-op
+  （不 bump revision、不 damage、不标脏）；越界 / 未对齐 / 字节长度不符 / 未知句柄返回强类型
+  `EngineError`（`GeometryRangeOutOfBounds` / `GeometryRangeUnaligned` / `GeometryRangeBytes` /
+  `UnknownGeometry`）。返回 `GeometryUpdate { revision, damaged }`。
+- **物理分页**：`GEOMETRY_PAGE_BYTES = 4096`；顶点/索引各是 `Box<[Bytes]>` 只读页序列，未变页与
+  上一版本共享同一分配 ⇒ 页指针就是脏区唯一真相（CPU 计数与三端 GPU 上传使用同一 diff 算法）。
+- **逻辑分块**：`GEOMETRY_CHUNK_INDICES = 12288`（4096 三角形）是**引擎内部策略**，应用不可见；
+  块 AABB 由引擎扫描块引用的顶点位置计算（零宽/零高抬到 ≥1 px）。追加一根 K 线只重建/上传尾块；
+  热力图改一格只重建/上传受影响块的一页。
+- **三端上传语义**（同一「队列序即同步」模型）：Windows `DEFAULT` 堆 + 每 in-flight 槽持久
+  staging + `CopyBufferRegion`；macOS `.private` 缓冲 + 每帧 shared staging + blit copy；Linux
+  `vkCmdCopyBuffer` + `TRANSFER_WRITE → SHADER_READ` barrier（必须在本帧 render pass 之前）。
+  缓冲增长按 `GEOMETRY_BUFFER_GROWTH_ALIGN = 64 KiB` 对齐扩容并整份重传（摊薄扩容频率）。
+- **计数面**：`FrameStats.geometry_encoded_chunks` / `geometry_uploaded_bytes`；GPU 侧
+  `RenderStats.geometry_uploaded_bytes` 为真实 staging 字节。
+- **damage 交互**：数据更新的 damage = 受影响块「旧 AABB ∪ 新 AABB」经 per-draw 变换后的物理
+  并集，**只覆盖更新范围**；`set_transform` 只改 uniform、不重建 lane，damage = 变换前后包围盒
+  并集（外扩 AA 半径）。
+- **已知限制**（本阶段明确不做）：无缩容 API（K 线滑动窗口「删头」需要后续 truncate）；
+  `TriangleStrip` 单块退化；非 `NodeBuilder::geometry` 节点的几何引用不自动标脏。
+- **契约**：§5.2 的 `GpuPrimitive` 字节布局与 `contract.md` **不变**；几何绘制复用既有 PSO /
+  根签名，几何顶点布局由 `GeometryDesc.vertex_stride` 描述。
 
 ### 5.6 图集、批次与 draw call
 
