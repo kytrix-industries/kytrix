@@ -20,6 +20,7 @@
 pub(crate) mod close;
 pub(crate) mod cursor;
 pub(crate) mod frame_gate;
+pub(crate) mod ime;
 pub(crate) mod input;
 pub(crate) mod scroll;
 pub(crate) mod selection;

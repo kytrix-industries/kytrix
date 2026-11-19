@@ -91,9 +91,10 @@ use crate::{
     math::{Point, Rect, Scale, Size},
     paint::style::Cursor,
     platform::{
-        linux::{clipboard::Clipboard, cursor::CursorManager, dpi, ime::ImeState, window},
+        linux::{clipboard::Clipboard, cursor::CursorManager, dpi, window},
         wayland::{
             frame_gate::{CallbackToken, FrameGate},
+            ime::ImeState,
             input,
             scroll::{ScrollAccum, ScrollAxis},
             text_input::{self, ImeStateSnapshot, TextInputRoute},
@@ -206,6 +207,12 @@ struct WindowSurface {
     toplevel: xdg_toplevel::XdgToplevel,
     /// 应用声明的 IME caret 区域（surface 逻辑坐标；`None` = 无 hint）。
     ime_cursor_area: Option<Rect>,
+    /// 本窗口当前是否有**可编辑文本目标**（`App::ime_cursor_area` 有值；B9）。
+    ///
+    /// 泵每轮 [`WaylandState::sync_ime_policy`] 写入；`false` ⇒ `zwp_text_input_v3.disable()`
+    /// （同一 surface 内焦点从输入框移到图表/列表时也必须关，XML `enable` 的协议要求）。
+    /// 同时作为 [`TextInputRoute`] 的每窗口策略输入（`text_target`）。
+    text_target: bool,
     /// **上次已提交**的 text-input 状态快照（`set_cursor_rectangle` + `set_content_type`）。
     ///
     /// `done` 里回写的判据：只有当前状态与它不同才允许再 `commit()`（AR3 §3.3）；`None` ⇒
@@ -589,6 +596,7 @@ impl WaylandState {
             xdg_surface,
             toplevel,
             ime_cursor_area: None,
+            text_target: false,
             ime_applied: None,
             ime_content: crate::window::ImeContentType::Text,
             ime: ImeState::new(),
@@ -616,6 +624,8 @@ impl WaylandState {
             frame_callback: None,
         });
         // window geometry 与首个 commit 一起生效（`set_window_geometry` 是双缓冲状态）。
+        // IME 路由的每窗口策略表与 `windows` 同生命周期（下标一一对应）。
+        self.text_input_route.add_window();
         self.apply_window_geometry(self.windows.len() - 1);
         // **唯一**触发初始 configure 的 commit：必须排在所有协议对象创建之后（R10-4）。
         self.windows[self.windows.len() - 1].surface.commit();
@@ -636,10 +646,13 @@ impl WaylandState {
         // 关窗时必须清空客户端合成的按键重复：之后不再有 `key` 事件（含 release），
         // `active` 又会重映射到别的窗口 ⇒ 按住键的重复会写进**另一个窗口**（复审 F5）。
         self.held_keys.clear();
-        // R10-6：只有被移除的窗口**就是** IME 焦点时才停用 —— 旧实现在这里无条件
-        // `set_ime_focus(false)`，于是关掉任意一个监控窗都会把焦点窗口的 IME 掐掉。
-        if self.text_input_route.is_focus(index as u32) {
-            self.apply_ime_target(None);
+        // R10-6：只有被移除的窗口**就是** IME 目标（已 enable 或持有键盘焦点候选）时才停用 ——
+        // 旧实现在这里无条件停用，于是关掉任意一个监控窗都会把焦点窗口的 IME 掐掉。
+        // 关窗路径不补 `ImeEvent::End`（窗口即将销毁，事件没有接收者）。
+        if self.text_input_route.is_focus(index as u32)
+            || self.text_input_route.is_keyboard_focus(index as u32)
+        {
+            self.ime_disable(false);
         }
         self.windows.remove(index);
         // text-input 路由存的是下标：移除之后整体前移，按位置修正（与 active 同一套规则）。
@@ -1105,37 +1118,96 @@ impl WaylandState {
         }
     }
 
-    /// 把 text-input 焦点切到 `target`（`None` = 停用），按**差分**下发 `enable`/`disable`。
+    /// 键盘 / text-input 焦点进入某窗口：更新路由候选，然后按策略收敛协议状态。
     ///
-    /// 协议要求（R10-6 / R10-13）：
+    /// **不无条件 enable**（B9）：是否真的把 IME 交给该窗口由每窗口策略
+    /// （`app_enabled && text_target`）决定，见 [`Self::sync_ime_policy`]。
+    fn ime_focus_in(&mut self, index: usize) {
+        self.text_input_route.focus_in(index as u32);
+        self.sync_ime_target(true);
+    }
+
+    /// 键盘 / text-input 焦点离开某窗口：清掉候选（只清「正是这个窗口」的）并收敛状态。
+    ///
+    /// 失焦路径与「应用禁用 / 文本目标消失」共用同一个收敛点：停用时重置组合、并在真的丢弃
+    /// 组合串时补一条 [`ImeEvent::End`]（`emit_end`）。
+    fn ime_focus_out(&mut self, index: usize) {
+        self.text_input_route.focus_out(index as u32);
+        self.sync_ime_target(true);
+    }
+
+    /// 无条件停用（窗口关闭 / 键盘能力撤销）并收敛协议状态。
+    ///
+    /// `emit_end` = 是否给应用补 [`ImeEvent::End`]：关窗路径传 `false`（窗口即将销毁，事件
+    /// 没有接收者），键盘能力撤销传 `true`（窗口还在，组合必须显式结束）。
+    fn ime_disable(&mut self, emit_end: bool) {
+        let previous = self.text_input_route.focus();
+        let change = self.text_input_route.disable();
+        self.apply_ime_change(previous, change, emit_end);
+    }
+
+    /// 收敛一次：按路由当前决定 enable/disable，并下发协议动作与整份状态。
+    fn sync_ime_target(&mut self, emit_end: bool) {
+        if self.text_input.is_none() {
+            // 没有 `zwp_text_input_manager_v3`：协议对象不存在，键盘通路永远接管文本。路由不
+            // 推进，否则 [`TextInputRoute::takes_text`] 会误判「IME 已接管」而吞掉字符。
+            return;
+        }
+        let previous = self.text_input_route.focus();
+        let change = self.text_input_route.reconcile(Instant::now());
+        self.apply_ime_change(previous, change, emit_end);
+    }
+
+    /// 执行一次焦点收敛的协议动作。
+    ///
+    /// 协议要求（R10-6 / R10-13 / B9）：
     /// - 换焦点前必须先 `disable` 旧的（XML `enable`：*must disable the current text input before
     ///   enabling the new one*）；
-    /// - `done` 之前的 `set_cursor_rectangle` / `set_content_type` 都是双缓冲状态，必须
-    ///   `commit()` 才生效；
-    /// - `leave` 之后 compositor 会忽略本对象的所有请求，直到下一次 `enter` —— 所以焦点不匹配
-    ///   时**不**下发状态（由 [`TextInputRoute::focus`] 判定）。
-    fn apply_ime_target(&mut self, target: Option<usize>) {
+    /// - `disable` 之后 compositor 侧状态全部失效 ⇒ 下次 `enable` 必须整份重发
+    ///   `set_content_type` / `set_cursor_rectangle`（快照清空）；
+    /// - 组合被停用：重置批次与组合态，并且**只在真的丢弃了组合串时**补一条
+    ///   [`ImeEvent::End`]（`emit_end` 控制；收敛点唯一 ⇒ 至多一条）；
+    /// - `enable` / `disable` 本身也要 `commit()` 才生效。
+    fn apply_ime_change(
+        &mut self,
+        previous: Option<u32>,
+        change: text_input::FocusChange,
+        emit_end: bool,
+    ) {
         let Some(text_input) = self.text_input.clone() else {
             return;
-        };
-        let change = match target {
-            Some(index) => self.text_input_route.enter(index as u32, Instant::now()),
-            None => self.text_input_route.disable(),
         };
         if !change.disable && !change.enable {
             return;
         }
         if change.disable {
+            if let Some(index) = previous {
+                let ended = self.windows.get_mut(index as usize).is_some_and(|window| {
+                    let ended = window.ime.reset_ending();
+                    // disable 之后 compositor 侧状态失效 ⇒ 下次 enable 必须整份重发。
+                    window.ime_applied = None;
+                    ended
+                });
+                if ended
+                    && emit_end
+                    && let Some(window) = self.windows.get(index as usize)
+                {
+                    let id = window.id;
+                    self.events.push((id, Event::Ime(ImeEvent::End)));
+                    // 组合串消失 ⇒ 应用界面必须重绘（preedit 要被清掉）。
+                    self.redraw = true;
+                }
+            }
             text_input.disable();
         }
         if change.enable
-            && let Some(index) = target
+            && let Some(index) = self.text_input_route.focus()
         {
             text_input.enable();
             // XML `set_content_type` / `set_cursor_rectangle`：状态「保持到下一次 commit 的
             // enable/disable 为止」⇒ 新 enable 之后必须重发（快照清空）。
-            self.windows[index].ime_applied = None;
-            self.push_ime_state(index, &text_input);
+            self.windows[index as usize].ime_applied = None;
+            self.push_ime_state(index as usize, &text_input);
         }
         // `enable` / `disable` 本身也要 `commit()` 才生效（与上面的状态合成同一批）。
         text_input.commit();
@@ -1186,58 +1258,81 @@ impl WaylandState {
         true
     }
 
-    /// 保存 IME caret 区域；焦点正是这个窗口时下发（`commit` 是 v3 的生效点）。
+    /// 记录一个窗口的 caret 区域 / `content_type`，返回是否真的变化。
     ///
-    /// 有批在飞时**只记账、不提交**：协议要求 pending state 在收到匹配 serial 的 `done` 之后
-    /// 再发（AR3 §3.3），由 `done` 处理器统一回写；这同时把「一次焦点切换」的协议往返压到一轮。
-    ///
-    /// 依赖 compositor 遵守「每个 `commit()` 回一条 `done`」（协议硬要求）。违约的 compositor
-    /// 会让 caret 更新停在上一批 —— 同一条违约也意味着 `commit_string` 永远不生效（IME 文本
-    /// 根本用不了），因此这不是本状态机新引入的失效面。
-    fn set_ime_cursor_area(
+    /// 只记账、不下发：下发统一在 [`Self::sync_ime_policy`] 的收敛之后（focus 与批量状态必须
+    /// 在同一批 `commit()` 里，且 `disable` 的本轮不再发无意义的 caret）。
+    fn note_ime_state(
         &mut self,
         index: usize,
         area: Option<Rect>,
         content: crate::window::ImeContentType,
-    ) {
-        let content_changed = self.windows[index].ime_content != content;
-        self.windows[index].ime_content = content;
-        let area_changed = self.windows[index].ime_cursor_area != area;
-        self.windows[index].ime_cursor_area = area;
-        if !area_changed && !content_changed {
+    ) -> bool {
+        let window = &mut self.windows[index];
+        let changed = window.ime_content != content || window.ime_cursor_area != area;
+        window.ime_content = content;
+        window.ime_cursor_area = area;
+        changed
+    }
+
+    /// 把 `App` 的 IME 目标状态同步到 Wayland 侧并收敛协议状态（每轮泵调用一次）。
+    ///
+    /// **必须在 `event_loop.dispatch`（协议事件）之前**：本轮的应用事件与布局都已处理完，
+    /// 之后才派发键盘 / text-input 的 enter/leave —— 它们用到的就是**本轮最新**策略，不会出现
+    /// 「按旧策略先 enable、同一轮再 disable」的抖动（B9）。
+    ///
+    /// 逐窗口写入两个策略信号：
+    /// - `app_enabled` = [`App::ime_enabled`]（`App::set_ime_enabled`，默认启用）；
+    /// - `text_target` = [`App::ime_cursor_area`] 有值（应用声明的 caret hint = 焦点在可编辑
+    ///   文本上）。`Err` 表示文本尚未 shape / 刚变化，**保留上一次有效值**而不是当成「没有
+    ///   文本目标」——否则打字期间每次重排都会 disable/enable 抖动。
+    ///
+    /// 收敛（[`TextInputRoute::reconcile`]）之后再把本轮的 caret / content 变化下发给当前焦点；
+    /// 有批在飞时只记账，由匹配 serial 的 `done` 统一回写（AR3 §3.3）。
+    pub(crate) fn sync_ime_policy(&mut self, app: &App) {
+        if self.text_input.is_none() {
             return;
         }
-        // 只有当前 text-input 焦点才发请求：`leave` 之后 compositor 会忽略一切请求。
-        if self.text_input_route.focus() != Some(index as u32) {
-            return;
+        let mut changed: Vec<usize> = Vec::with_capacity(self.windows.len());
+        for index in 0..self.windows.len() {
+            let id = self.windows[index].id;
+            let content = app
+                .window(id)
+                .map_or(crate::window::ImeContentType::Text, |window| {
+                    window.ime_content_type()
+                });
+            let area = match app.ime_cursor_area(id) {
+                Ok(area) => area,
+                // 文本尚未 shape / 文本刚变化：保留上一次有效区域（与旧路径同口径）。
+                Err(_) => self.windows[index].ime_cursor_area,
+            };
+            if self.note_ime_state(index, area, content) {
+                changed.push(index);
+            }
+            // 文本目标 = 应用声明的有效 caret hint（同一 surface 内焦点移到非编辑控件时清空）。
+            self.windows[index].text_target = area.is_some();
+            self.text_input_route.set_policy(
+                index as u32,
+                app.ime_enabled(id),
+                self.windows[index].text_target,
+            );
         }
+        // 先收敛焦点：应用禁用 / 文本目标消失在这里变成 disable；enable 时整份状态随 enable 下发。
+        self.sync_ime_target(true);
+        // 已在焦点上的窗口：本轮 caret / content 变化单独下发一次；有批在飞则等 `done`。
         if self.text_input_route.commit_in_flight() {
+            return;
+        }
+        let Some(focus) = self.text_input_route.focus() else {
+            return;
+        };
+        if !changed.contains(&(focus as usize)) {
             return;
         }
         let Some(text_input) = self.text_input.clone() else {
             return;
         };
-        self.flush_ime_state(index, &text_input);
-    }
-
-    /// 从 `App` 同步指定窗口的 IME caret 区域与 `content_type`（每轮泵逐窗口调用）。
-    ///
-    /// 独立于帧门禁：候选窗定位与密码框语义不能等下一帧。
-    pub(crate) fn sync_ime_cursor_area(&mut self, app: &App, window: crate::window::WindowId) {
-        let Some(index) = self.window_index(window) else {
-            return;
-        };
-        let content = app
-            .window(window)
-            .map_or(crate::window::ImeContentType::Text, |window| {
-                window.ime_content_type()
-            });
-        let area = match app.ime_cursor_area(window) {
-            Ok(area) => area,
-            // 文本尚未 shape / 文本刚变化：保留上一次有效区域（但 `content_type` 仍要更新）。
-            Err(_) => self.windows[index].ime_cursor_area,
-        };
-        self.set_ime_cursor_area(index, area, content);
+        self.flush_ime_state(focus as usize, &text_input);
     }
 
     /// 无输入法守护进程时的降级判定（R10-2）；返回 `true` ⇒ 文本通路已切回键盘。
@@ -1947,8 +2042,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                 state
                     .events
                     .push((window, Event::FocusChanged { focused: true }));
-                // R10-6：IME 焦点跟随键盘焦点（zwp_text_input_v3.enter 到达后会被去重成 no-op）。
-                state.apply_ime_target(Some(index));
+                // R10-6：IME 焦点跟随键盘焦点（策略判定见 `sync_ime_policy`，B9：非编辑焦点
+                // 不再无条件 enable）。
+                state.ime_focus_in(index);
             }
             wl_keyboard::Event::Leave { surface, .. } => {
                 // 失焦后不再有 `wl_keyboard.key`（含 release）到达：必须**主动清空**按住键，
@@ -1967,10 +2063,8 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                 state
                     .events
                     .push((window, Event::FocusChanged { focused: false }));
-                // R10-6：只有失焦的正是当前 IME 焦点时才停用（差分下发在 apply_ime_target）。
-                if state.text_input_route.is_focus(index as u32) {
-                    state.apply_ime_target(None);
-                }
+                // R10-6 / B9：失焦收敛到同一个 disable 点（组合被丢弃时补 `End`）。
+                state.ime_focus_out(index);
             }
             _ => {}
         }
@@ -2261,17 +2355,17 @@ impl Dispatch<ZwpTextInputV3, ()> for WaylandState {
                 let Some(index) = state.window_index_for_surface(&surface) else {
                     return;
                 };
-                state.apply_ime_target(Some(index));
+                // 只更新候选：是否 enable 由策略（应用开关 × caret hint）决定，B9。
+                state.ime_focus_in(index);
             }
             zwp_text_input_v3::Event::Leave { surface } => {
                 let Some(index) = state.window_index_for_surface(&surface) else {
                     return;
                 };
-                // XML：`The client should reset any preedit string previously set`。
+                // 先收敛（正是 IME 目标时 disable，组合被丢弃则补 `End`），再按 XML 兜底：
+                // `The client should reset any preedit string previously set`。
+                state.ime_focus_out(index);
                 state.windows[index].ime.reset();
-                if state.text_input_route.is_focus(index as u32) {
-                    state.apply_ime_target(None);
-                }
             }
             zwp_text_input_v3::Event::PreeditString {
                 text,
@@ -2420,7 +2514,7 @@ pub(crate) fn create_devices(state: &mut WaylandState) -> Result<(), EngineError
         state.held_keys.clear();
         if let Some(keyboard) = state.keyboard.take() {
             // IME 焦点也随键盘一起失效（没有键盘就没有文本焦点）。
-            state.apply_ime_target(None);
+            state.ime_disable(true);
             if keyboard.version() >= 3 {
                 keyboard.release();
             }

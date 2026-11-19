@@ -5,7 +5,7 @@
 //! 2. 所有可失败的 setup：calloop 事件循环 / 唤醒句柄 / `WaylandSource`；
 //! 3. 每轮泵开头把 `App` 的窗口集合同步到原生窗口：新增窗口建 `wl_surface` / toplevel 与
 //!    渲染器，`App` 已关闭的窗口销毁协议对象（[`sync_windows`]）；
-//! 4. 循环：drain 事件 → 逐窗口镜像 / 关闭 / 帧 → 钩子 → 任务 → a11y → 阻塞等待。
+//! 4. 循环：drain 事件 → 逐窗口镜像 / 关闭 / 帧 → 钩子 → 任务 → IME 策略 → a11y → 阻塞等待。
 //!
 //! R10 整改的四处接线：
 //!
@@ -17,6 +17,14 @@
 //!   压进 `dispatch` 的 timeout（否则要等下一个无关事件才降级）。
 //! - **强类型错误**（R10-16）：运行期 `dispatch` 失败按 `calloop::Error::IoError` 分类
 //!   （`EPIPE` ⇒ 合成器消失、`EPROTO` ⇒ 协议错误）。
+//!
+//! P1 补充接线：
+//!
+//! - **关闭请求事件**（B11）：`xdg_toplevel.close` 先经
+//!   [`crate::platform::wayland::close::handle_close_requests`] 投递 `Event::CloseRequested`，
+//!   再跑 `on_close` 裁决（与 Windows / macOS 同序）；
+//! - **IME 策略**（B9）：每轮在 `event_loop.dispatch` **之前** `sync_ime_policy`：焦点离开可编辑
+//!   文本或应用 `set_ime_enabled(false)` 时，同一轮内下发 `zwp_text_input_v3.disable()`。
 
 use std::{
     sync::Arc,
@@ -351,11 +359,12 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             for task in dispatcher.drain_tasks() {
                 task.run(&mut app);
             }
-            // ⑤ IME caret hint（逐窗口）：每轮泵调用，独立于帧门禁。
-            for index in 0..state.window_count() {
-                let id = state.window_id(index);
-                state.sync_ime_cursor_area(&app, id);
-            }
+            // ⑤ IME：把应用目标状态（`App::ime_enabled` × `App::ime_cursor_area`）写成每窗口
+            // 策略，收敛 text-input 的 enable/disable，再下发本轮 caret / content_type。
+            // **必须在下面 `event_loop.dispatch` 派发协议事件之前**（本轮应用事件与布局都已
+            // 处理完）：键盘 / text-input 的 enter/leave 用的是**本轮最新**策略，不会出现
+            // 「按旧策略先 enable、同一轮再 disable」的抖动（B9）。
+            state.sync_ime_policy(&app);
 
             // ⑥ 剪贴板发布（需要最新输入 serial）+ a11y 增量。
             let serial = state.serial();
