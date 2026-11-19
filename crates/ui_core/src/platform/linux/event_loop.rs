@@ -382,6 +382,9 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                         .update(|| crate::a11y::adapter::build_update(&mut app, id));
                 }
             }
+            // E5 / RE-04：本笔交付后仍有未交付批次 ⇒ 立刻唤醒下一轮泵（否则被 AT-SPI/重发
+            // 定时器拖到 16~100 ms/笔，分批首树又回到秒级）；判定 + wake 的唯一入口。
+            app.wake_for_a11y_backlog(dispatcher.as_ref());
 
             // ⑦ 连续帧（动画 / P17 HUD）：定时器语义由 `dispatch` 的 timeout 提供，
             // 醒来后主动请求一帧（否则 tick 只更新状态、不出帧）。

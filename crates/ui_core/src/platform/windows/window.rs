@@ -732,6 +732,8 @@ mod tests {
             &options,
             Dispatcher::new(),
             None,
+            // RE-01：平台层不允许自造消费端代际；测试从真实 `A11yBridge` 取。
+            crate::a11y::adapter::A11yBridge::new().consumer_epoch(),
         )
         .expect("NativeWindow::create");
         match native.refresh_hz() {

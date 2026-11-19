@@ -2480,6 +2480,91 @@ mod p11_fix_tests {
         }
         assert!(batches >= 3, "5000 节点的 DPI 全树必须分多批重发");
     }
+
+    /// E5 / RE-04：三端泵接线所读的 **App 级信号** —— 每笔非最终批次交付后
+    /// `a11y_backlog_pending()` 必须为真（平台泵据此 `dispatcher.wake()` 下一轮），收敛后为假；
+    /// 单点高频增量不得触发（否则泵会被无谓连续唤醒）。
+    ///
+    /// 边界：三端泵本身（`event_loop`/`pump` 里三行 wake 接线）需要真实事件循环，单测不执行；
+    /// 本用例钉住接线读的**唯一信号**，平台接线后的连续交付由真机/验收记录（报告 §8.3）。
+    #[test]
+    fn a11y_backlog_signals_a_pump_wake_after_every_non_final_batch() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let rows = rows_fixture(&mut app, 5000);
+        let _ = app.drain_pump().expect("首帧");
+        app.assert_a11y_contract();
+        assert!(
+            app.app().a11y_backlog_pending(),
+            "首笔之后仍有分批 ⇒ 平台必须收到 wake 信号"
+        );
+        let mut batches = 1usize;
+        let mut wakes = 1usize;
+        while app.app().a11y_pending(window) {
+            let _ = app.drain_pump().expect("后续批次（不推进时钟）");
+            app.assert_a11y_contract();
+            batches += 1;
+            if app.app().a11y_backlog_pending() {
+                wakes += 1;
+            }
+            assert!(batches < 16, "分批必须收敛（实际 {batches} 笔）");
+        }
+        assert!(batches >= 3, "5000 节点必须分多批");
+        assert_eq!(
+            wakes,
+            batches - 1,
+            "除最后一笔外每笔交付后都必须请求 wake（实际 {wakes} 次 / {batches} 批）"
+        );
+        assert!(
+            !app.app().a11y_backlog_pending(),
+            "收敛后不得残留 wake 信号（否则泵会空转）"
+        );
+        // 单点增量不满足 backlog ⇒ 平台不需要额外唤醒（仍走 100ms 合并）。
+        app.app_mut()
+            .window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .mark_a11y(rows[0]);
+        assert!(
+            !app.app().a11y_backlog_pending(),
+            "单点数据增量不得让泵连续唤醒"
+        );
+    }
+
+    /// E5 / RE-04：三端接线共享的唯一函数 `App::wake_for_a11y_backlog` —— 有未交付批次时
+    /// 必须在测试 dispatcher 上观察到真实 wake；收敛后不得再 wake（避免泵空转）。
+    ///
+    /// 变异：删掉 `wake_for_a11y_backlog` 里的 `dispatcher.wake()` ⇒ 第一个断言红。
+    /// 三端泵各只保留一行调用（真实事件循环不在单测覆盖，见报告 §8.3）。
+    #[test]
+    fn the_backlog_wake_helper_wakes_the_pump_until_converged() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let _rows = rows_fixture(&mut app, 5000);
+        let dispatcher = app.app().dispatcher();
+        let _ = app.drain_pump().expect("首帧");
+        app.assert_a11y_contract();
+
+        let _ = dispatcher.take_frame_wake();
+        app.app().wake_for_a11y_backlog(dispatcher.as_ref());
+        assert!(
+            dispatcher.take_frame_wake(),
+            "有未交付批次时，交付后必须唤醒平台泵（RE-04 接线核心）"
+        );
+
+        while app.app().a11y_pending(window) {
+            let _ = app.drain_pump().expect("后续批次（不推进时钟）");
+            app.assert_a11y_contract();
+        }
+        let _ = dispatcher.take_frame_wake();
+        app.app().wake_for_a11y_backlog(dispatcher.as_ref());
+        assert!(
+            !dispatcher.take_frame_wake(),
+            "收敛后不得再唤醒泵（否则空闲零唤醒退化）"
+        );
+    }
 }
 
 /// R13-12：`UserTask` 回投链的端到端用例（`AppHandle::send` → `Dispatcher::push` →

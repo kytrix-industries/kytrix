@@ -416,6 +416,9 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
         native.update_a11y(app);
         native.sync_ime_cursor_area(app);
     }
+    // E5 / RE-04：本笔交付后仍有未交付批次 ⇒ 立刻唤醒下一轮泵（否则被 retry 定时器拖到
+    // 16~100 ms/笔，分批首树又回到秒级）；判定 + wake 的唯一入口。
+    app.wake_for_a11y_backlog(state.dispatcher.as_ref());
     for task in state.dispatcher.drain_tasks() {
         task.run(app);
     }

@@ -7,6 +7,7 @@ use smallvec::SmallVec;
 use super::{A11Y_DIAGNOSTIC_CAPACITY, A11Y_THROTTLE, App};
 use crate::{
     node::dependency::{Owner, ReadCtx, ReadTracker},
+    platform::dispatcher::Dispatcher,
     window::{Window, WindowId},
 };
 
@@ -108,6 +109,31 @@ pub(crate) fn a11y_pending(app: &App, window: WindowId) -> bool {
             .a11y_delivered
             .get(&window)
             .is_none_or(|last| app.clock.saturating_duration_since(*last) >= A11Y_THROTTLE)
+}
+
+/// 是否有**任一窗口**还有未交付的 a11y 批次（平台泵交付后据此自唤醒；E5 / RE-04）。
+///
+/// 平台泵每轮只交付**一笔**（三端 `update_a11y` 各调一次）。分批首树 / DPI 全量重建期间，
+/// 交付完这一笔后若本函数为真，平台层必须立刻 `Dispatcher::wake()` 下一轮 —— 否则 Windows
+/// 只能等 `A11Y_RETRY_MS = 100 ms` 的兜底定时器，40k 首树又回到 ≈19×100ms≈1.9s；
+/// Linux/macOS 也会退化为既有 retry 定时器的 ≈16ms/轮。`App::a11y_pending` 的 backlog 旁路
+/// 只保证「被叫醒后立刻交付」，**叫醒本身**是平台层这三行接线的职责。
+/// 消费者：三端泵的 a11y 交付步骤。
+#[must_use]
+pub(crate) fn a11y_backlog_pending(app: &App) -> bool {
+    app.windows.values().any(Window::a11y_backlog_pending)
+}
+
+/// a11y 交付后若仍有未交付批次则唤醒平台泵（三端唯一入口；E5 / RE-04）。
+///
+/// 平台泵每轮只交付一笔；真实事件循环无法在单测里执行，所以把**判定 + wake** 收敛到这一个
+/// 函数，用 App 层测试钉住「有 backlog ⇒ 恰好一次 wake；收敛后 ⇒ 不 wake」，三端各留一行
+/// 调用。变异：删掉这里的 `dispatcher.wake()` ⇒ App 层测试红；删掉三端调用行则属真机/验收
+/// 项（见实现报告 §8.3）。
+pub(crate) fn wake_for_a11y_backlog(app: &App, dispatcher: &Dispatcher) {
+    if app.a11y_backlog_pending() {
+        dispatcher.wake();
+    }
 }
 
 /// 是否有窗口「a11y 脏但正被限流」——平台泵据此安排**到期补发**唤醒。

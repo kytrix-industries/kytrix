@@ -1809,6 +1809,19 @@ impl App {
         a11y::a11y_retry_pending(self)
     }
 
+    /// 是否还有未交付的 a11y 批次（分批首树/DPI 全量重建未走完；不节流旁路，E5）。
+    #[must_use]
+    pub(crate) fn a11y_backlog_pending(&self) -> bool {
+        a11y::a11y_backlog_pending(self)
+    }
+
+    /// a11y 交付后若仍有未交付批次则唤醒平台泵（三端唯一入口；E5 / RE-04）。
+    pub(crate) fn wake_for_a11y_backlog(
+        &self,
+        dispatcher: &crate::platform::dispatcher::Dispatcher,
+    ) {
+        a11y::wake_for_a11y_backlog(self, dispatcher)
+    }
     /// 产出一笔 a11y 交付（消费 `A11Y` 反向集合与 `full_pending`）。
     ///
     /// **必须在 `accesskit_windows::Adapter::update_if_active` 的闭包里调用**（adapter 不活跃时

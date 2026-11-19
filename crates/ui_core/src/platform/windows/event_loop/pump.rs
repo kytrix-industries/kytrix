@@ -849,6 +849,10 @@ pub(super) fn pump_loop(
                 native.sync_ime_cursor_area(&app);
             }
         }
+        // E5 / RE-04：本笔交付后仍有未交付批次 ⇒ 立刻唤醒下一轮泵。没有这一行时，分批首树
+        // 每笔只能靠 `A11Y_TIMER_ID`（100 ms）兜底定时器推进，40k 节点首树又回到 ≈1.9 s。
+        // 判定 + wake 收敛在 `App::wake_for_a11y_backlog`（可被 App 层测试覆盖）。
+        app_cell.borrow().wake_for_a11y_backlog(dispatcher.as_ref());
 
         // ⑤ 跨线程回投的任务。
         for task in dispatcher.drain_tasks() {
