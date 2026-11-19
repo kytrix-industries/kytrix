@@ -34,15 +34,37 @@
 //!
 //! # 内容去重 / 归属 / 预算（R12-16）
 //!
-//! - **去重**：`ContentKey = (len, ahash(bytes))` 索引 + 原始字节 memcmp（防碰撞）。同一份字节
-//!   插入 N 次只占 1 块 tile，引用计数 N；命中时**不重新解码**（也不占解码预算）。
-//! - **归属**：[`ResourceCache::insert_owned`] 把引用登记到 [`WindowId`] 名下，
-//!   [`ResourceCache::release_window`] 在该窗口关闭时（`app::window_set::close_window`）把引用
-//!   一次性还回去（按 LRU epoch 顺序）。
+//! - **去重（D-10 两级）**：`ContentKey = (len, ahash(bytes))` 索引 + 原始字节 memcmp（防碰撞）；
+//!   每个内容下挂多个**变体**（`(target, ResourceId)`）。同一 `(bytes, target)` 插入 N 次只占
+//!   1 块 tile，引用计数 N，命中时**不重新解码**（也不占解码预算）；同一字节的不同变体并存、
+//!   各自引用计数，源字节只保留一份（全部变体回收后才释放）。
+//! - **归属**：[`ResourceCache::insert_owned`] / [`ResourceCache::insert_owned_at_size`] 把引用
+//!   登记到 [`WindowId`] 名下，[`ResourceCache::release_window`] 在该窗口关闭时
+//!   （`app::window_set::close_window`）把引用一次性还回去（按 LRU epoch 顺序）。
 //! - **预算**：字节预算（图片页 CPU 缓冲 + 去重表保留的源字节 + 在途解码预留）超限 ⇒
 //!   [`DecodeCause::Capacity`]（[`CapacityCause::ByteBudget`]）。超预算时**不会**静默淘汰仍在
 //!   引用的 tile；空闲条目在 `unload` / `release_window` 里即时回收。`ResourceCache::stats` 是
 //!   唯一的可观测面。
+//!
+//! # 按目标尺寸解码（D-10）
+//!
+//! `insert_at_size` / `insert_owned_at_size` / `insert_async_at_size` / `insert_for_display` 让应用
+//! 按**绘制尺度**取一个变体：`target = ceil(物理目标)` → clamp 到源尺寸（**不放大**）与
+//! [`image::MAX_TILE_DIM`]（单块图集上限）→ 解码**全图**后等比 fit 并用 `CatmullRom`（bicubic，
+//! 接近 Skia / Qt 的高质量缩放档，比 Lanczos3 少振铃）缩到最终尺寸。默认 `insert*` 仍是
+//! 「原始尺寸变体」（必要时按 `MAX_TILE_DIM` 缩小，行为与 D-10 之前完全一致）。
+//!
+//! - **缓存**：两级（内容 → 变体）。同一内容的不同 target 并存、各自 refcount、`len()` 分别计，
+//!   `unload` 一个变体不影响另一个；所有变体归零才删去重条目、释放源字节。`used_pixels` 按
+//!   变体最终尺寸累计，页容量 / 预算语义沿用 D-11。
+//! - **不省解码峰值**：`image` 0.25.10 没有 decoder 级 scaled decode（`zune-jpeg` 的
+//!   `set_max_width` 只是上限校验），准入与并发仍按**源**尺寸估算——target 变小只省图集 tile 与
+//!   采样质量，不省解码峰值。
+//! - **不做 mipmap**（设计结论）：共享单页图集里给单片 tile 建 mip 链会把相邻 tile 的颜色卷进来；
+//!   Chromium 对 `<img>` 也不用 mipmap，而是 `ImageDecodeCache` 按绘制尺度 at-raster 解码——
+//!   本 API 就是这一层；放大继续用 GPU 线性采样。
+//! - **DPI 2× 资产选择是应用层职责**（同一图片在 2× 设备上用 2× 字节）；引擎不解析 CSS
+//!   `image-set`，只保证 `insert_at_size` 的物理目标像素。
 //!
 //! # 色彩管理（D-8）
 //!
@@ -73,12 +95,12 @@ use tokio::sync::{
 
 use crate::{
     error::EngineError,
-    math::PhysicalRect,
+    math::{PhysicalRect, Size},
     node::id::{Arena, ArenaKey},
     paint::atlas::{AtlasKind, AtlasTile},
     render::{AtlasAllocator, DirtyRects},
     resources::{
-        cache::{ContentKey, DedupeEntry, Entry, Page},
+        cache::{ContentKey, DedupeEntry, Entry, Page, VariantEntry},
         image::{DecodedImage, SourceColor},
     },
     window::WindowId,
@@ -86,6 +108,13 @@ use crate::{
 
 mod cache;
 mod image;
+
+/// 「原始尺寸」变体的变体键（D-10）。
+///
+/// 与真实目标尺寸（[`image::resolve_target`] 保证 `>= 1`）不冲突：`insert` / `insert_owned` /
+/// `insert_async` 的语义仍是「源尺寸变体」（必要时按 `MAX_TILE_DIM` 等比缩小，与 D-10 之前
+/// 完全一致），`insert_at_size` 系列才用请求的目标尺寸作键。
+const ORIGINAL_TARGET: (u32, u32) = (0, 0);
 
 /// 默认字节预算：图片页（16 MiB）+ 去重表保留的源字节 + 在途解码预留。
 ///
@@ -376,7 +405,8 @@ pub struct ResourceStats {
 /// 进程级一份（单 GPU 设备），由 `App` 持有。
 pub struct ResourceCache {
     entries: Arena<Entry, ResourceId>,
-    /// 内容去重索引：同一份字节只占一条 [`Entry`]，引用计数记在条目上。
+    /// 内容去重索引（D-10 两级）：内容 → 原始字节 + 全部存活变体；每个变体一条 [`Entry`]，
+    /// 引用计数记在条目上。全部变体回收后整条删除（源字节随之释放）。
     dedupe: ahash::HashMap<ContentKey, DedupeEntry>,
     /// 窗口归属：`insert_owned` 登记，`release_window` 一次性回收。
     owners: ahash::HashMap<WindowId, Vec<ResourceId>>,
@@ -429,6 +459,8 @@ struct PendingJob {
     source: Bytes,
     /// 处于 `Pending` 时占用的预算（`estimate_peak + 源字节`）；交付时归还。
     reservation: u64,
+    /// 该任务的目标变体键（D-10；`(0,0)` = 原始尺寸变体）；交付时据此做 `(bytes, target)` 去重。
+    target: (u32, u32),
 }
 
 impl ResourceCache {
@@ -515,28 +547,94 @@ impl ResourceCache {
         }
     }
 
-    /// 解码 `bytes` 并装箱，返回句柄、tile 与像素尺寸。
+    /// 解码 `bytes` 并装箱，返回句柄、tile 与像素尺寸（「原始尺寸」变体）。
     ///
     /// 同一内容第二次插入是**去重命中**：不重新解码，返回同一个 [`ResourceImage`]，引用计数 +1。
+    /// 需要按绘制尺度取变体时用 [`ResourceCache::insert_at_size`] / [`ResourceCache::insert_for_display`]。
     ///
     /// # Errors
     /// [`EngineError::ResourceDecode`]：`UnsupportedFormat` / `Corrupt` / `SourceTooLarge` /
     /// `TooLarge` / `OutOfMemory` / `Capacity`。
     pub fn insert(&mut self, bytes: &[u8]) -> Result<ResourceImage, EngineError> {
-        self.insert_inner(bytes)
+        self.insert_inner(bytes, None)
             .map_err(|cause| EngineError::ResourceDecode { cause })
     }
 
-    fn insert_inner(&mut self, bytes: &[u8]) -> Result<ResourceImage, DecodeCause> {
+    /// 按**物理像素**目标尺寸解码并装箱（D-10），返回该变体的句柄 / tile / 最终尺寸。
+    ///
+    /// 语义：
+    /// - `target` 先 `ceil`（物理像素不能有小数）、防御非有限 / `<= 0`（按 1 像素），再
+    ///   `clamp` 到源尺寸与 [`image::MAX_TILE_DIM`] ⇒ **不放大**（Retina 2× 必须由应用提供 2×
+    ///   字节）、不会超过单块图集上限；
+    /// - 解码**全图**后等比 fit 到 target（`CatmullRom` bicubic），所以 `200×100` + `target 40×40`
+    ///   ⇒ `40×20`（不是拉伸成 40×40）；`40×20` + `target 200×200` ⇒ 仍是 `40×20`；
+    /// - 变体参与缓存 key：同一份字节的不同 target **并存**、各自引用计数，源字节只保留一份；
+    ///   相同 `(bytes, target)`（clamp 后）命中去重、不重新解码；
+    /// - **不省解码峰值**：`image` 0.25.10 没有 decoder 级 scaled decode，准入仍按**源**尺寸估算
+    ///   （见模块文档「按目标尺寸解码」），target 只省图集 tile 与采样质量。
+    ///
+    /// # Errors
+    /// 同 [`ResourceCache::insert`]。
+    pub fn insert_at_size(
+        &mut self,
+        bytes: &[u8],
+        target: Size,
+    ) -> Result<ResourceImage, EngineError> {
+        self.insert_inner(bytes, Some(target))
+            .map_err(|cause| EngineError::ResourceDecode { cause })
+    }
+
+    /// 按**逻辑尺寸 × 设备缩放**取物理像素目标并解码（D-10 的应用便捷入口）。
+    ///
+    /// `target = ceil(logical * scale)` 物理像素（例如 100×50 逻辑 @2× ⇒ 200×100），其余语义与
+    /// [`ResourceCache::insert_at_size`] 相同（不放大 ⇒ 应用负责为 2× 设备提供 2× 资产；
+    /// 引擎不解析 CSS `image-set`）。`scale` 为 `<= 0` / 非有限时按 `1.0` 防御。
+    ///
+    /// # Errors
+    /// 同 [`ResourceCache::insert`]。
+    pub fn insert_for_display(
+        &mut self,
+        bytes: &[u8],
+        logical: Size,
+        scale: f32,
+    ) -> Result<ResourceImage, EngineError> {
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        self.insert_at_size(
+            bytes,
+            Size::new(logical.width * scale, logical.height * scale),
+        )
+    }
+
+    fn insert_inner(
+        &mut self,
+        bytes: &[u8],
+        target: Option<Size>,
+    ) -> Result<ResourceImage, DecodeCause> {
         image::check_source_bytes(bytes.len())?;
-        if let Some(image) = self.dedupe_hit(bytes) {
+        // 原始尺寸变体的键与源尺寸无关，去重可以发生在读文件头之前。
+        if target.is_none()
+            && let Some(image) = self.dedupe_hit(bytes, ORIGINAL_TARGET)
+        {
+            return Ok(image);
+        }
+        // 目标尺寸变体的键要 clamp 到源尺寸（不放大 ⇒ 不同请求可能归一成同一变体），
+        // 所以必须先读文件头（O(header)）再做去重匹配。
+        let (source_width, source_height) = image::probe_dimensions(bytes)?;
+        let variant = match target {
+            None => ORIGINAL_TARGET,
+            Some(target) => image::resolve_target(target, (source_width, source_height)),
+        };
+        if let Some(image) = self.dedupe_hit(bytes, variant) {
             return Ok(image);
         }
         // D-11：同步路径同样先读头 + 按峰值准入再解码（解码期间没有别的插入能改 `&mut self`，
         // 所以这里的预留只用于复用准入逻辑，解码结束立即归还）。
-        let (width, height) = image::probe_dimensions(bytes)?;
-        let reservation = self.admit_decode(width, height, bytes.len())?;
-        let decoded = match image::decode(bytes) {
+        let reservation = self.admit_decode(source_width, source_height, bytes.len())?;
+        let decoded = match image::decode(bytes, target.map(|_| variant)) {
             Ok(decoded) => decoded,
             Err(cause) => {
                 self.release_reservation(reservation);
@@ -544,7 +642,7 @@ impl ResourceCache {
             }
         };
         self.release_reservation(reservation);
-        self.insert_decoded(Bytes::copy_from_slice(bytes), decoded)
+        self.insert_decoded(Bytes::copy_from_slice(bytes), decoded, variant)
     }
 
     /// 与 [`ResourceCache::insert`] 相同，额外把这次引用登记到 `owner` 名下。
@@ -563,6 +661,21 @@ impl ResourceCache {
         Ok(image)
     }
 
+    /// 与 [`ResourceCache::insert_owned`] 相同，但按目标物理尺寸取变体（D-10）。
+    ///
+    /// # Errors
+    /// 同 [`ResourceCache::insert_at_size`]。
+    pub fn insert_owned_at_size(
+        &mut self,
+        owner: WindowId,
+        bytes: &[u8],
+        target: Size,
+    ) -> Result<ResourceImage, EngineError> {
+        let image = self.insert_at_size(bytes, target)?;
+        self.owners.entry(owner).or_default().push(image.id);
+        Ok(image)
+    }
+
     /// 把解码投到 tokio 阻塞池，**立即**返回句柄（UI 线程只做轻量校验 + 头解析 + 预算准入）。
     ///
     /// D-11：超出预算的图在**投递之前**就返回 `Failed(Capacity)`（不占解码线程、不占并发许可）；
@@ -570,51 +683,51 @@ impl ResourceCache {
     /// 结果通过 [`ResourceCache::poll`] 交付；[`ResourceCache::state`] 可随时查询。
     /// 缓存在测试 / 无 runtime 模式下（`new_unmanaged`）退化为同步解码并立即 `Ready`。
     pub fn insert_async(&mut self, bytes: Bytes) -> PendingResource {
+        self.insert_async_inner(bytes, None)
+    }
+
+    /// 与 [`ResourceCache::insert_async`] 相同，但交付按目标物理尺寸的变体（D-10）。
+    ///
+    /// 语义（不放大 / 等比 fit / 变体 key）与 [`ResourceCache::insert_at_size`] 一致；准入与并发
+    /// 仍按**源**尺寸的 D-11 口径（decoder 没有 scaled decode，target 不降低解码峰值）。
+    /// 去重命中会立即 `Ready`（不投递解码），否则通过 [`ResourceCache::poll`] 交付。
+    pub fn insert_async_at_size(&mut self, bytes: Bytes, target: Size) -> PendingResource {
+        self.insert_async_inner(bytes, Some(target))
+    }
+
+    fn insert_async_inner(&mut self, bytes: Bytes, target: Option<Size>) -> PendingResource {
         if let Err(cause) = image::check_source_bytes(bytes.len()) {
-            return self.push_pending(PendingJob {
-                result: None,
-                state: DecodeState::Failed(cause),
-                source: Bytes::new(),
-                reservation: 0,
-            });
+            return self.push_failed(cause);
         }
-        if let Some(image) = self.dedupe_hit(&bytes) {
-            // 去重命中：不需要解码，立刻可用（也不占解码预算）。
-            return self.push_pending(PendingJob {
-                result: None,
-                state: DecodeState::Ready(image),
-                source: Bytes::new(),
-                reservation: 0,
-            });
+        // 原始尺寸变体的去重键不需要读文件头。
+        if target.is_none()
+            && let Some(image) = self.dedupe_hit(&bytes, ORIGINAL_TARGET)
+        {
+            return self.push_ready(image);
         }
         // 头解析 + 预算准入都必须发生在投递之前：不合格的图不占线程、不占并发许可。
-        let (width, height) = match image::probe_dimensions(&bytes) {
+        let (source_width, source_height) = match image::probe_dimensions(&bytes) {
             Ok(dimensions) => dimensions,
-            Err(cause) => {
-                return self.push_pending(PendingJob {
-                    result: None,
-                    state: DecodeState::Failed(cause),
-                    source: Bytes::new(),
-                    reservation: 0,
-                });
-            }
+            Err(cause) => return self.push_failed(cause),
         };
-        let reservation = match self.admit_decode(width, height, bytes.len()) {
+        let variant = match target {
+            None => ORIGINAL_TARGET,
+            Some(target) => image::resolve_target(target, (source_width, source_height)),
+        };
+        if let Some(image) = self.dedupe_hit(&bytes, variant) {
+            // 去重命中：不需要解码，立刻可用（也不占解码预算）。
+            return self.push_ready(image);
+        }
+        let reservation = match self.admit_decode(source_width, source_height, bytes.len()) {
             Ok(reservation) => reservation,
-            Err(cause) => {
-                return self.push_pending(PendingJob {
-                    result: None,
-                    state: DecodeState::Failed(cause),
-                    source: Bytes::new(),
-                    reservation: 0,
-                });
-            }
+            Err(cause) => return self.push_failed(cause),
         };
+        let decode_target = target.map(|_| variant);
         let Some(runtime) = self.runtime.clone() else {
             // 无 runtime：退化为同步解码；准入预留立即归还（该路径没有并发解码）。
             self.release_reservation(reservation);
-            let state = match image::decode(&bytes) {
-                Ok(decoded) => self.finish_decoded(bytes, decoded),
+            let state = match image::decode(&bytes, decode_target) {
+                Ok(decoded) => self.finish_decoded(bytes, decoded, variant),
                 Err(cause) => DecodeState::Failed(cause),
             };
             return self.push_pending(PendingJob {
@@ -622,6 +735,7 @@ impl ResourceCache {
                 state,
                 source: Bytes::new(),
                 reservation: 0,
+                target: variant,
             });
         };
         let (sender, receiver) = oneshot::channel();
@@ -642,7 +756,7 @@ impl ResourceCache {
                 let _permit = permit;
                 #[cfg(test)]
                 decode_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let _ = sender.send(image::decode(&source));
+                let _ = sender.send(image::decode(&source, decode_target));
             });
         });
         self.push_pending(PendingJob {
@@ -650,6 +764,7 @@ impl ResourceCache {
             state: DecodeState::Pending,
             source: bytes,
             reservation,
+            target: variant,
         })
     }
 
@@ -688,7 +803,7 @@ impl ResourceCache {
             };
             self.release_reservation(job.reservation);
             let state = match completion {
-                Ok(decoded) => self.finish_decoded(job.source, decoded),
+                Ok(decoded) => self.finish_decoded(job.source, decoded, job.target),
                 Err(cause) => DecodeState::Failed(cause),
             };
             out.push((id, state));
@@ -711,6 +826,28 @@ impl ResourceCache {
         let id = self.pending.insert_with(|_| job);
         self.pending_ids.push(id);
         id
+    }
+
+    /// 立即失败的异步槽位（轻量校验 / 头解析 / 准入拒绝）：不投递解码、不占预算。
+    fn push_failed(&mut self, cause: DecodeCause) -> PendingResource {
+        self.push_pending(PendingJob {
+            result: None,
+            state: DecodeState::Failed(cause),
+            source: Bytes::new(),
+            reservation: 0,
+            target: ORIGINAL_TARGET,
+        })
+    }
+
+    /// 立即就绪的异步槽位（去重命中）：不需要解码，也不占预算。
+    fn push_ready(&mut self, image: ResourceImage) -> PendingResource {
+        self.push_pending(PendingJob {
+            result: None,
+            state: DecodeState::Ready(image),
+            source: Bytes::new(),
+            reservation: 0,
+            target: ORIGINAL_TARGET,
+        })
     }
 
     /// 取走一个已完成的后台结果；未完成 / 没有后台任务时 `None`。
@@ -737,29 +874,40 @@ impl ResourceCache {
     }
 
     /// 解码结果 → 装箱；失败是 `Failed`（不 panic、不吞掉分类）。
-    fn finish_decoded(&mut self, source: Bytes, decoded: DecodedImage) -> DecodeState {
-        if let Some(image) = self.dedupe_hit(&source) {
+    fn finish_decoded(
+        &mut self,
+        source: Bytes,
+        decoded: DecodedImage,
+        target: (u32, u32),
+    ) -> DecodeState {
+        // 两个在途任务可能是同一 `(bytes, target)`：先交付的那个成功装箱，后到的在这里合并。
+        if let Some(image) = self.dedupe_hit(&source, target) {
             return DecodeState::Ready(image);
         }
-        match self.insert_decoded(source, decoded) {
+        match self.insert_decoded(source, decoded, target) {
             Ok(image) => DecodeState::Ready(image),
             Err(cause) => DecodeState::Failed(cause),
         }
     }
 
-    /// 去重命中：同一份字节已经有一个 tile ⇒ 引用计数 +1，返回既有结果（**不重新解码**）。
-    fn dedupe_hit(&mut self, bytes: &[u8]) -> Option<ResourceImage> {
+    /// 去重命中：同一份字节 + 同一目标尺寸已经有一个 tile ⇒ 引用计数 +1，返回既有结果
+    /// （**不重新解码**）。
+    fn dedupe_hit(&mut self, bytes: &[u8], target: (u32, u32)) -> Option<ResourceImage> {
         let key = ContentKey::new(bytes);
         let existing = self.dedupe.get(&key)?;
         // 64 bit 哈希碰撞：必须 memcmp 原始字节才能认定「同一内容」。
         if existing.bytes.as_ref() != bytes {
             return None;
         }
-        let id = existing.id;
+        let id = existing
+            .variants
+            .iter()
+            .find(|variant| variant.target == target)?
+            .id;
         let epoch = self.next_epoch();
         let Some(entry) = self.entries.get_mut(id) else {
-            // 索引里残留了已回收的映射（防御性清理）。
-            self.dedupe.remove(&key);
+            // 索引里残留了已回收的变体（防御性清理，避免永久占用源字节）。
+            self.remove_variant(key, target, id);
             return None;
         };
         entry.refcount = entry.refcount.saturating_add(1);
@@ -773,11 +921,12 @@ impl ResourceCache {
         &mut self,
         source: Bytes,
         decoded: DecodedImage,
+        target: (u32, u32),
     ) -> Result<ResourceImage, DecodeCause> {
         let color = decoded.color;
         let key = ContentKey::new(&source);
         self.ensure_page();
-        let image = self.place(decoded, key)?;
+        let image = self.place(decoded, key, target)?;
         // D-8 诊断面：ICC 处理结果按**解码次数**累计（去重命中不重新解码、也不重复计数）。
         match color {
             SourceColor::Srgb => {}
@@ -788,12 +937,32 @@ impl ResourceCache {
                 self.color_fallback = self.color_fallback.saturating_add(1);
             }
         }
+        // 两级索引（D-10）：同内容（memcmp 相等）追加变体；64 bit 哈希碰撞（极少）按旧逻辑
+        // 覆盖旧内容并立即释放旧源字节（旧 tile 仍有效，回收时不会再命中去重表）。
+        let same_content = self
+            .dedupe
+            .get(&key)
+            .is_some_and(|existing| existing.bytes.as_ref() == source.as_ref());
+        if same_content {
+            self.dedupe
+                .get_mut(&key)
+                .expect("checked above")
+                .variants
+                .push(VariantEntry {
+                    target,
+                    id: image.id,
+                });
+            return Ok(image);
+        }
         self.source_bytes = self.source_bytes.saturating_add(source.len() as u64);
         if let Some(replaced) = self.dedupe.insert(
             key,
             DedupeEntry {
-                id: image.id,
                 bytes: source,
+                variants: vec![VariantEntry {
+                    target,
+                    id: image.id,
+                }],
             },
         ) {
             // 哈希碰撞导致同一个 key 覆盖了另一条内容：旧源字节不再保留。
@@ -849,6 +1018,7 @@ impl ResourceCache {
         &mut self,
         decoded: DecodedImage,
         key: ContentKey,
+        target: (u32, u32),
     ) -> Result<ResourceImage, DecodeCause> {
         let (width, height) = (decoded.width, decoded.height);
         let epoch = self.next_epoch();
@@ -888,6 +1058,7 @@ impl ResourceCache {
             refcount: 1,
             last_used: epoch,
             key,
+            target,
         });
         self.used_pixels = self
             .used_pixels
@@ -953,7 +1124,8 @@ impl ResourceCache {
         }
     }
 
-    /// 存活资源数（引用计数 > 0 的条目数；图片被多次去重命中时仍是 1）。
+    /// 存活变体数（引用计数 > 0 的条目数；同一变体被多次去重命中仍是 1，同一内容的不同 target
+    /// 变体分别计，D-10）。
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -981,21 +1153,13 @@ impl ResourceCache {
             })
     }
 
-    /// 回收一条引用归零的资源：退还 tile、清零页内区域（含 padding）、删去重索引。
+    /// 回收一条引用归零的资源：退还 tile、清零页内区域（含 padding）、从去重表删除该变体
+    /// （最后一个变体删除时才释放源字节，D-10）。
     fn reclaim(&mut self, id: ResourceId) {
         let Some(entry) = self.entries.remove(id) else {
             return;
         };
-        let owned_key = self
-            .dedupe
-            .get(&entry.key)
-            .is_some_and(|dedupe| dedupe.id == id)
-            .then_some(entry.key);
-        if let Some(key) = owned_key
-            && let Some(dedupe) = self.dedupe.remove(&key)
-        {
-            self.source_bytes = self.source_bytes.saturating_sub(dedupe.bytes.len() as u64);
-        }
+        self.remove_variant(entry.key, entry.target, id);
         self.used_pixels = self
             .used_pixels
             .saturating_sub(u64::from(entry.image.width) * u64::from(entry.image.height));
@@ -1003,6 +1167,21 @@ impl ResourceCache {
             state.allocator.deallocate(entry.alloc);
             state.page.clear_rect(entry.padded);
             state.allocator.mark_written(entry.padded);
+        }
+    }
+
+    /// 从去重表的 `key` 内容里删掉 `(target, id)` 这一个变体；变体全部归零才删条目、释放源字节
+    /// （D-10 两级缓存：同一内容的所有变体共享一份源字节）。
+    fn remove_variant(&mut self, key: ContentKey, target: (u32, u32), id: ResourceId) {
+        let Some(dedupe) = self.dedupe.get_mut(&key) else {
+            return;
+        };
+        dedupe
+            .variants
+            .retain(|variant| variant.id != id || variant.target != target);
+        let empty = dedupe.variants.is_empty();
+        if empty && let Some(removed) = self.dedupe.remove(&key) {
+            self.source_bytes = self.source_bytes.saturating_sub(removed.bytes.len() as u64);
         }
     }
 
@@ -1040,7 +1219,7 @@ mod tests {
     };
     use crate::{
         error::EngineError,
-        math::PhysicalRect,
+        math::{PhysicalRect, Size},
         paint::atlas::AtlasKind,
         resources::image::{MAX_SOURCE_BYTES, MAX_SOURCE_DIM, MAX_SOURCE_PIXELS},
         window::WindowId,
@@ -1055,12 +1234,36 @@ mod tests {
         let pixels: Vec<u8> = std::iter::repeat_n(rgba, (width * height) as usize)
             .flatten()
             .collect();
-        let image = image::RgbaImage::from_raw(width, height, pixels).expect("raw");
+        rgba_png(width, height, &pixels, format)
+    }
+
+    /// 指定 RGBA8 像素的编码字节（保持 `format` 与 `encoded` 一致）。
+    fn rgba_png(width: u32, height: u32, pixels: &[u8], format: image::ImageFormat) -> Vec<u8> {
+        let image = image::RgbaImage::from_raw(width, height, pixels.to_vec()).expect("raw");
         let mut out = std::io::Cursor::new(Vec::new());
         image::DynamicImage::ImageRgba8(image)
             .write_to(&mut out, format)
             .expect("encode");
         out.into_inner()
+    }
+
+    /// 四象限纯色图（左上红、右上绿、左下蓝、右下白）：用于断言缩放后的方向与等比 fit。
+    fn quadrant_png(width: u32, height: u32) -> Vec<u8> {
+        let half_width = width / 2;
+        let half_height = height / 2;
+        let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
+        for y in 0..height {
+            for x in 0..width {
+                let color = match (x < half_width, y < half_height) {
+                    (true, true) => [255u8, 0, 0, 255],
+                    (false, true) => [0, 255, 0, 255],
+                    (true, false) => [0, 0, 255, 255],
+                    (false, false) => [255, 255, 255, 255],
+                };
+                pixels.extend_from_slice(&color);
+            }
+        }
+        rgba_png(width, height, &pixels, image::ImageFormat::Png)
     }
 
     fn cache() -> ResourceCache {
@@ -1614,11 +1817,31 @@ mod tests {
 
     /// 页内某条资源内容区的第一个像素（由 tile 的归一化 UV 反推页内偏移）。
     fn content_pixel(cache: &ResourceCache, image: ResourceImage) -> [u8; 4] {
+        content_pixel_at(cache, image, 0, 0)
+    }
+
+    /// 页内某条资源内容区 `(x, y)` 处的 BGRA 像素（D-10 的方向 / 缩放断言用）。
+    fn content_pixel_at(cache: &ResourceCache, image: ResourceImage, x: u32, y: u32) -> [u8; 4] {
+        assert!(x < image.width && y < image.height, "越界采样 {x},{y}");
         let ((page_width, page_height), pixels) = cache.page_pixels().expect("page");
         let origin_x = (image.tile.u0 * page_width as f32).round() as usize;
         let origin_y = (image.tile.v0 * page_height as f32).round() as usize;
-        let offset = (origin_y * page_width as usize + origin_x) * 4;
+        let offset = ((origin_y + y as usize) * page_width as usize + origin_x + x as usize) * 4;
         pixels[offset..offset + 4].try_into().expect("4 bytes")
+    }
+
+    /// 页内某条资源内容区的全部 BGRA 字节（逐变体比较像素用）。
+    fn tile_pixels(cache: &ResourceCache, image: ResourceImage) -> Vec<u8> {
+        let ((page_width, page_height), pixels) = cache.page_pixels().expect("page");
+        let origin_x = (image.tile.u0 * page_width as f32).round() as usize;
+        let origin_y = (image.tile.v0 * page_height as f32).round() as usize;
+        let row_bytes = image.width as usize * 4;
+        let mut out = Vec::with_capacity(row_bytes * image.height as usize);
+        for y in 0..image.height as usize {
+            let start = ((origin_y + y) * page_width as usize + origin_x) * 4;
+            out.extend_from_slice(&pixels[start..start + row_bytes]);
+        }
+        out
     }
 
     /// D-8：坏 ICC ⇒ 解码成功（不让插入失败）、像素 == 无 profile 路径、
@@ -1666,6 +1889,239 @@ mod tests {
         );
         assert_eq!(stats.color_fallback, 0);
         assert_eq!(stats.entries, 1);
+    }
+
+    /// D-10：按目标尺寸解码——等比 fit、不拉伸（200×100 + target 40×40 ⇒ 40×20），
+    /// 缩小的像素方向与原图一致（四象限着色）。
+    #[test]
+    fn insert_at_size_downscales_and_keeps_aspect() {
+        let mut cache = ResourceCache::with_page_for_test((128, 128));
+        let bytes = quadrant_png(200, 100);
+        let image = cache
+            .insert_at_size(&bytes, Size::new(40.0, 40.0))
+            .expect("按目标尺寸插入 200x100 -> 40x40");
+
+        assert_eq!(
+            (image.width, image.height),
+            (40, 20),
+            "必须等比 fit 到 40×20，而不是拉伸成 40×40"
+        );
+        assert_eq!(
+            cache.stats().used_pixels,
+            40 * 20,
+            "used_pixels 按目标尺寸累计"
+        );
+        assert_eq!(image.tile.atlas, AtlasKind::Image);
+
+        // 四象限中心：缩放后方向不得翻转/交换（CatmullRom 只在象限边界过渡）。
+        let red = content_pixel_at(&cache, image, 10, 5);
+        let green = content_pixel_at(&cache, image, 30, 5);
+        let blue = content_pixel_at(&cache, image, 10, 15);
+        let white = content_pixel_at(&cache, image, 30, 15);
+        assert!(
+            red[2] > 200 && red[0] < 40 && red[1] < 40,
+            "左上必须是红（BGRA）：{red:?}"
+        );
+        assert!(
+            green[1] > 200 && green[0] < 40 && green[2] < 40,
+            "右上必须是绿（BGRA）：{green:?}"
+        );
+        assert!(
+            blue[0] > 200 && blue[1] < 40 && blue[2] < 40,
+            "左下必须是蓝（BGRA）：{blue:?}"
+        );
+        assert!(
+            white.iter().all(|channel| *channel > 200),
+            "右下必须是白：{white:?}"
+        );
+    }
+
+    /// D-10：目标大于源尺寸时**不放大**（Retina 2× 的 1× 资产必须由应用提供 2× 字节）。
+    #[test]
+    fn insert_at_size_never_upscales() {
+        let mut cache = ResourceCache::with_page_for_test((128, 128));
+        let bytes = png(40, 20, [90, 120, 150, 255]);
+        let image = cache
+            .insert_at_size(&bytes, Size::new(200.0, 200.0))
+            .expect("目标大于源");
+
+        assert_eq!(
+            (image.width, image.height),
+            (40, 20),
+            "不得把 40×20 放大成 200×200（应用负责提供 2× 资产）"
+        );
+        // 不放大 ⇒ 像素与「原始尺寸变体」逐字节一致。
+        let original = cache.insert(&bytes).expect("原始尺寸变体");
+        assert_eq!((original.width, original.height), (40, 20));
+        assert_eq!(
+            tile_pixels(&cache, image),
+            tile_pixels(&cache, original),
+            "不放大时像素必须与原始尺寸路径一致"
+        );
+        assert_eq!(cache.len(), 2, "按目标尺寸与原始尺寸是两个变体");
+    }
+
+    /// D-10 两级缓存：同一内容的不同 target 变体并存、各自引用计数；源字节只保留一份。
+    #[test]
+    fn variants_of_the_same_content_coexist_and_refcount_independently() {
+        let mut cache = ResourceCache::with_page_for_test((128, 128));
+        let bytes = png(200, 100, [30, 60, 90, 255]);
+        let large = cache
+            .insert_at_size(&bytes, Size::new(80.0, 80.0))
+            .expect("大缩略图");
+        let small = cache
+            .insert_at_size(&bytes, Size::new(20.0, 20.0))
+            .expect("小缩略图");
+
+        assert_ne!(large.id, small.id, "不同 target 是不同的变体");
+        assert_eq!((large.width, large.height), (80, 40));
+        assert_eq!((small.width, small.height), (20, 10));
+        assert_eq!(cache.len(), 2, "两个变体各占一条 Entry");
+        assert_eq!(cache.stats().entries, 2);
+        assert_eq!(cache.stats().used_pixels, 80 * 40 + 20 * 10);
+        // 源字节只保留一份（两级缓存：内容一份 + 变体 N 条）。
+        assert_eq!(cache.source_bytes, bytes.len() as u64, "源字节只存一份");
+        assert_eq!(
+            cache.stats().used_bytes,
+            128 * 128 * 4 + bytes.len() as u64,
+            "预算 = 图片页 + 一份源字节"
+        );
+        assert_eq!(cache.dedupe.len(), 1, "一条内容");
+        assert_eq!(
+            cache
+                .dedupe
+                .values()
+                .next()
+                .expect("dedupe entry")
+                .variants
+                .len(),
+            2,
+            "该内容下两个变体"
+        );
+
+        // unload 一个大变体：小变体不受影响，源字节仍被小变体持有。
+        assert!(cache.unload(large.id));
+        assert_eq!(cache.len(), 1, "另一个变体仍存活");
+        assert_eq!(cache.stats().used_pixels, 20 * 10);
+        assert_eq!(cache.source_bytes, bytes.len() as u64, "还有变体存活");
+        let small_again = cache
+            .insert_at_size(&bytes, Size::new(20.0, 20.0))
+            .expect("小变体仍存活，命中去重");
+        assert_eq!(small_again, small, "同 (bytes, target) 去重命中");
+        assert_eq!(cache.len(), 1);
+        assert_eq!(
+            content_pixel(&cache, small_again),
+            content_pixel(&cache, small),
+            "去重命中后 tile 内容仍是原来的变体"
+        );
+        // 引用计数 2：再 unload 一次才回收。
+        assert!(cache.unload(small_again.id));
+        assert_eq!(cache.len(), 1);
+        assert!(cache.unload(small.id));
+        assert_eq!(cache.len(), 0, "最后一个变体回收");
+        assert!(cache.dedupe.is_empty(), "全部变体归零才删去重条目");
+        assert_eq!(cache.source_bytes, 0, "全部变体归零才释放源字节");
+        assert_eq!(cache.stats().used_bytes, 128 * 128 * 4, "只剩图片页常驻");
+    }
+
+    /// D-10：回收最后一个变体时同步释放源字节与 tile（预算口径回到页常驻）。
+    #[test]
+    fn unload_releases_the_only_variant_and_source_bytes() {
+        let mut cache = ResourceCache::with_page_for_test((64, 64));
+        let bytes = png(200, 100, [10, 20, 30, 255]);
+        let image = cache
+            .insert_at_size(&bytes, Size::new(40.0, 40.0))
+            .expect("按目标尺寸插入");
+        assert_eq!(cache.source_bytes, bytes.len() as u64);
+        let page_bytes = 64 * 64 * 4;
+        assert!(cache.stats().used_bytes > page_bytes, "源字节在预算里");
+
+        assert!(cache.unload(image.id));
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.stats().entries, 0);
+        assert_eq!(cache.stats().used_pixels, 0);
+        assert_eq!(cache.stats().used_bytes, page_bytes, "回到页常驻");
+        assert_eq!(cache.source_bytes, 0);
+        assert!(cache.dedupe.is_empty());
+        // 陈旧句柄幂等（与原始尺寸变体同一语义）。
+        assert!(!cache.unload(image.id));
+    }
+
+    /// D-10：`insert_for_display` 把逻辑尺寸 × 设备缩放取整为物理像素，且不放大。
+    #[test]
+    fn insert_for_display_rounds_to_physical_pixels_and_does_not_upscale() {
+        let mut cache = ResourceCache::with_page_for_test((256, 256));
+        let wide = png(200, 100, [1, 2, 3, 255]);
+        // 100×50 逻辑 @1.5× ⇒ 150×75 物理像素（等比 fit 后正好 150×75）。
+        let hd = cache
+            .insert_for_display(&wide, Size::new(100.0, 50.0), 1.5)
+            .expect("1.5x");
+        assert_eq!((hd.width, hd.height), (150, 75));
+
+        // 非整数逻辑尺寸必须向上取整到物理像素：30.2 × 30.2 @2× ⇒ ceil(60.4) = 61。
+        let square = png(100, 100, [7, 8, 9, 255]);
+        let rounded = cache
+            .insert_for_display(&square, Size::new(30.2, 30.2), 2.0)
+            .expect("ceil 物理像素");
+        assert_eq!((rounded.width, rounded.height), (61, 61));
+
+        // 2× 设备 + 1× 资产：不放大（应用层负责 2× 资产选择）。
+        let small = png(40, 20, [4, 5, 6, 255]);
+        let at_2x = cache
+            .insert_for_display(&small, Size::new(40.0, 20.0), 2.0)
+            .expect("2x");
+        assert_eq!((at_2x.width, at_2x.height), (40, 20));
+
+        // scale <= 0 / 非有限按 1.0 防御（不是 0 尺寸 tile、不 panic）。
+        for scale in [0.0f32, -2.0, f32::NAN, f32::INFINITY] {
+            let defensive = cache
+                .insert_for_display(&small, Size::new(40.0, 20.0), scale)
+                .expect("防御 scale");
+            assert_eq!(
+                (defensive.width, defensive.height),
+                (40, 20),
+                "scale {scale} 必须按 1.0 处理"
+            );
+        }
+    }
+
+    /// D-10：异步路径同样交付请求的变体（D-11 的准入 / 并发 / 预留语义不变）。
+    #[test]
+    fn async_insert_at_size_delivers_the_requested_variant() {
+        let runtime = runtime();
+        let mut cache = ResourceCache::for_test(
+            (128, 128),
+            DEFAULT_BYTE_BUDGET,
+            Some(runtime.handle().clone()),
+        );
+        let bytes = png(200, 100, [12, 34, 56, 255]);
+        let pending = cache.insert_async_at_size(Bytes::from(bytes), Size::new(40.0, 40.0));
+        assert_eq!(
+            cache.state(pending),
+            DecodeState::Pending,
+            "UI 线程不做解码"
+        );
+
+        let state = poll_until(&mut cache, pending);
+        let DecodeState::Ready(image) = state else {
+            panic!("expected Ready, got {state:?}");
+        };
+        assert_eq!((image.width, image.height), (40, 20), "异步路径也等比 fit");
+        assert_eq!(cache.stats().used_pixels, 40 * 20);
+        assert_eq!(cache.len(), 1);
+
+        // 同一 bytes + 同一 target 的异步插入命中去重、立即 Ready。
+        let again = cache.insert_async_at_size(
+            Bytes::from(png(200, 100, [12, 34, 56, 255])),
+            Size::new(40.0, 40.0),
+        );
+        assert_eq!(
+            cache.state(again),
+            DecodeState::Ready(image),
+            "异步去重命中立即 Ready、不重新解码"
+        );
+        assert_eq!(cache.poll().len(), 1);
+        assert_eq!(cache.len(), 1);
     }
 
     /// D-11：预算准入在**投递之前**拒绝，不占解码线程、不留预留。
@@ -1849,7 +2305,7 @@ mod tests {
             let bytes = encoded(200, 100, [90, 120, 150, 255], format);
             let probed = super::image::probe_dimensions(&bytes).expect("probe header");
             assert_eq!(probed, (200, 100), "{format:?} 的头尺寸");
-            let decoded = super::image::decode(&bytes).expect("decode");
+            let decoded = super::image::decode(&bytes, None).expect("decode");
             assert_eq!(
                 (decoded.width, decoded.height),
                 probed,

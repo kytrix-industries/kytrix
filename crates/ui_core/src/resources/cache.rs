@@ -1,12 +1,17 @@
-//! 图片页的 CPU 缓冲与缓存索引（P13 §7）。
+//! 图片页的 CPU 缓冲与缓存索引（P13 §7，D-10 两级变体缓存）。
 //!
 //! 页缓冲是图片图集的**唯一**上传源：`Page` 恒为整页（`width * height * 4` 字节，BGRA8），
 //! tile 内容在 `ResourceCache::place` 时直接写进页（不为每条资源保存一份像素副本），
 //! 引用计数归零（`unload` / `release_window`）时把该块连同 1 纹素 padding 一起清零。
 //!
-//! 两张索引表（R12-16）：
-//! - [`Entry`]：存活资源（tile + 引用计数 + LRU epoch）；
-//! - [`ContentKey`] / [`DedupeEntry`]：内容的哈希索引 + 原始字节，命中去重时**不重新解码**。
+//! 两级索引（D-10；D-10 之前是「内容 → 单 entry」）：
+//! - [`ContentKey`] / [`DedupeEntry`]：内容的哈希索引 + 原始字节 + 该内容的**全部存活变体**；
+//!   命中去重时按 `(bytes, target)` 匹配变体、**不重新解码**，源字节只保留一份；
+//! - [`Entry`]：存活资源（变体），一条 = 一个 tile + 一个变体键 + 引用计数 + LRU epoch。
+//!
+//! 同一内容的「原始尺寸」与「目标尺寸」变体、以及不同目标尺寸的变体可以同时存在
+//! （例如列表缩略图与大图预览共用同一份压缩字节）；全部变体的引用计数归零后，
+//! [`DedupeEntry`] 才被删除、源字节随之释放。
 
 use std::hash::Hasher;
 
@@ -40,15 +45,25 @@ impl ContentKey {
     }
 }
 
-/// 去重表的一条：内容 → 资源 + 原始字节（memcmp 用）。
+/// 去重表的一条：内容 → 该内容的全部存活变体 + 原始字节（memcmp 用）。
 pub(crate) struct DedupeEntry {
-    /// 该内容当前的资源句柄（回收时置空整条）。
-    pub id: ResourceId,
-    /// 原始输入字节（`Bytes`：`insert_async` 路径零拷贝共享）。
+    /// 原始输入字节（`Bytes`：`insert_async` 路径零拷贝共享）。**同一内容只保留一份**，
+    /// 全部变体回收后才删除本条目并释放它。
     pub bytes: Bytes,
+    /// 该内容的存活变体（同一字节不同目标尺寸并存；元素数 ≥ 1）。
+    pub variants: Vec<VariantEntry>,
 }
 
-/// 一条存活资源。
+/// 去重表里的一个内容变体：变体键（目标尺寸）→ 资源句柄。
+pub(crate) struct VariantEntry {
+    /// 变体键：请求的物理目标尺寸（`ceil` 后 clamp 到源尺寸与图片页单块上限 `MAX_TILE_DIM`）。
+    /// `(0, 0)` 保留给「原始尺寸」变体（`resources::ORIGINAL_TARGET`）。
+    pub target: (u32, u32),
+    /// 该变体的资源句柄。
+    pub id: ResourceId,
+}
+
+/// 一条存活资源（一个变体）。
 pub(crate) struct Entry {
     /// 交给应用的结果（句柄 + tile + 像素尺寸）。
     pub image: ResourceImage,
@@ -56,12 +71,14 @@ pub(crate) struct Entry {
     pub alloc: etagere::AllocId,
     /// 分配到的整块（含 padding；卸载时清零它）。
     pub padded: PhysicalRect,
-    /// 引用计数：同一内容每被引用一次 +1，归零才回收 tile。
+    /// 引用计数：同一变体每被引用一次 +1，归零才回收 tile。
     pub refcount: u32,
     /// 最近一次被引用的 LRU epoch（`ResourceCache::release_window` 的回收顺序）。
     pub last_used: u64,
-    /// 内容键（回收时用它删去重表项）。
+    /// 内容键（回收时用它从去重表删去本变体）。
     pub key: ContentKey,
+    /// 变体键（与 [`VariantEntry::target`] 一致；回收时按 `(key, target, id)` 精确删变体）。
+    pub target: (u32, u32),
 }
 
 /// 图片页的 CPU 缓冲（BGRA8 预乘 sRGB，行主序，行宽 `width * 4`）。

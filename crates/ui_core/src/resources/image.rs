@@ -1,7 +1,7 @@
-//! 图片解码：字节 → **色彩管理 → 线性空间预乘 → sRGB 重编码**的 `BGRA8`（P13 §6，D-8）。
+//! 图片解码：字节 → **色彩管理 → 线性空间预乘 → sRGB 重编码**的 `BGRA8`（P13 §6，D-8/D-10）。
 //!
 //! 图集字节语义由 `render/shaders/contract.md` §8 冻结（纹素是 linear-premultiplied 后 sRGB 编码），
-//! 本模块就是它的 CPU 侧实现。五条约束：
+//! 本模块就是它的 CPU 侧实现。六条约束：
 //!
 //! 1. 只接受 PNG / JPEG / WebP（`image::guess_format` 与 feature 无关，所以必须**策略性**拒绝其它格式）；
 //! 2. 色彩管理（D-8）：带 ICC profile 的资产在解码期用 `moxcms` 转换到 sRGB（引擎 RT 是 sRGB 编码，
@@ -10,15 +10,25 @@
 //!    `PngDecoder::gamma_value()` 这个 inherent 方法，`into_decoder()` 拿不到；见阶段 1 审计 D-8 决策 3）；
 //! 3. EXIF orientation 在缩放 / 转 RGBA / ICC / 预乘**之前**应用到像素（`ImageDecoder::orientation` +
 //!    `DynamicImage::apply_orientation`）；cache key 仍是源字节，方向不进键；
-//! 4. 大图在解码后按 `MAX_TILE_DIM` 等比缩小（编码域 `Triangle`，与浏览器一致），不做线性空间重采样；
-//! 5. 像素顺序固定为：元数据 → 解码 → orientation → 缩放 → `to_rgba8` → ICC → 预乘。
+//! 4. 缩放（D-10）：默认 `decode(bytes, None)` 是「原始尺寸」路径，只在超过 [`MAX_TILE_DIM`] 时
+//!    等比缩小（编码域 `Triangle`，与浏览器一致，行为与 D-10 之前完全一致）；`decode(bytes,
+//!    Some(target))` 是「按目标尺寸」路径，等比 fit 到 target（**不放大**）后按 `CatmullRom`
+//!    重采样（bicubic；与 Skia / Qt 的高质量缩放同一档，比 Lanczos3 少振铃，适合带文字/线稿的
+//!    UI 资产）。两条路径都**不做 mipmap**：共享单页图集里给单片 tile 建 mip 链会把相邻 tile
+//!    的颜色卷进来；Chromium 对 `<img>` 也不用 mipmap，而是按绘制尺度 at-raster 解码——本 API
+//!    就是这一层；放大继续用 GPU 线性采样。DPI 2× 资产选择是**应用层职责**（同一图片在 2× 设备
+//!    上用 2× 字节），引擎不解析 CSS `image-set`；
+//! 5. 像素顺序固定为：元数据 → 解码 → orientation → 缩放 → `to_rgba8` → ICC → 预乘；
+//! 6. **不缩放解码器**：`image` 0.25.10 没有 decoder 级 scaled decode（zune-jpeg 的
+//!    `set_max_width` 只是上限校验，不是降采样），target 只决定解码后的缩放尺寸——省的是图集
+//!    tile 与采样质量，**不省解码峰值**（准入仍按源尺寸估算，见 [`estimate_peak`]）。
 //!
 //! 解码流程（[`decode`]）固定为：`format_of` → `into_decoder()` → `dimensions` +
 //! [`check_source_size`] → 元数据（orientation + ICC，**必须先于** `from_decoder`：解码器一旦被消耗，
 //! 就再没有 `icc_profile()` 的机会）→ `Limits::reserve(decoder.total_bytes())` + `set_limits` →
-//! `DynamicImage::from_decoder` → `apply_orientation` → 缩放 → `to_rgba8` → **ICC 转换到 sRGB** → 预乘。
-//! `reserve` 是复刻 `ImageReader::decode` 的「整图分配」预检：走 `into_decoder` 而漏掉它，
-//! [`MAX_DECODE_ALLOC`] 就只剩解码器中间缓冲有意义。
+//! `DynamicImage::from_decoder` → `apply_orientation` → 缩放（按 target / `MAX_TILE_DIM`）→
+//! `to_rgba8` → **ICC 转换到 sRGB** → 预乘。`reserve` 是复刻 `ImageReader::decode` 的
+//! 「整图分配」预检：走 `into_decoder` 而漏掉它，[`MAX_DECODE_ALLOC`] 就只剩解码器中间缓冲有意义。
 //!
 //! ICC 策略（[`convert_icc_to_srgb`]）：
 //!
@@ -47,7 +57,7 @@ use image::{
 use moxcms::{ColorProfile, DataColorSpace, Layout, TransformOptions, Xyzd};
 use smol_str::{SmolStr, format_smolstr};
 
-use crate::resources::DecodeCause;
+use crate::{math::Size, resources::DecodeCause};
 
 /// 图片页能容纳的单块上限（2048 − 2 纹素 padding，P02 §10.3）。
 pub(crate) const MAX_TILE_DIM: u32 = 2046;
@@ -127,17 +137,25 @@ pub(crate) struct DecodedImage {
     pub color: SourceColor,
 }
 
-/// 字节 → BGRA8 预乘 sRGB（含 ICC → sRGB 色彩管理，D-8）。
+/// 字节 → BGRA8 预乘 sRGB（含 ICC → sRGB 色彩管理，D-8；含按目标尺寸缩放，D-10）。
 ///
 /// 两段式（R12-15）：先由解码器只读文件头拿尺寸（**不分配整图**），像素 / 单边超限在这里就报
 /// [`DecodeCause::TooLarge`]；再 `reserve(total_bytes)` + `set_limits` 后解码，`max_alloc` 命中
 /// 映射成 [`DecodeCause::OutOfMemory`]。EXIF orientation 在解码后、缩放前应用到像素；ICC 转换在
 /// 缩放 / `to_rgba8` 之后、预乘之前（见模块文档的固定顺序）。
 ///
+/// `target`：`None` = 原始尺寸路径（只在超过 [`MAX_TILE_DIM`] 时用 `Triangle` 等比缩小，行为与
+/// D-10 之前一致）；`Some((width, height))` = 按目标尺寸路径（调用方先用 [`resolve_target`] 把
+/// 请求 clamp 到源尺寸 / [`MAX_TILE_DIM`]，这里再等比 fit 并按 `CatmullRom` 缩小；目标 ≥ 源尺寸
+/// 时**不放大**）。
+///
 /// # Errors
 /// [`DecodeCause`]：格式不支持 / 字节损坏 / 源图过大 / 解码器内存不足
 /// （四类里除 `Capacity` 外都可能出现）。ICC 无法使用时**不**报错，按 sRGB 降级并计数。
-pub(crate) fn decode(bytes: &[u8]) -> Result<DecodedImage, DecodeCause> {
+pub(crate) fn decode(
+    bytes: &[u8],
+    target: Option<(u32, u32)>,
+) -> Result<DecodedImage, DecodeCause> {
     let format = format_of(bytes)?;
     let tag = format_tag(format);
     // `into_decoder` 让「元数据读取」发生在解码像素之前（orientation / ICC 必须先于 `from_decoder`：
@@ -170,10 +188,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<DecodedImage, DecodeCause> {
     let mut image: DynamicImage =
         DynamicImage::from_decoder(decoder).map_err(|error| classify(tag, error))?;
     image.apply_orientation(orientation);
-    if image.width() > MAX_TILE_DIM || image.height() > MAX_TILE_DIM {
-        let (target_width, target_height) = fit_within(image.width(), image.height());
-        image = image.resize_exact(target_width, target_height, FilterType::Triangle);
-    }
+    image = resize_decoded(image, target);
     let rgba = image.to_rgba8();
     let (width, height) = (rgba.width(), rgba.height());
     debug_assert_eq!(rgba.as_raw().len(), width as usize * height as usize * 4);
@@ -184,6 +199,41 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<DecodedImage, DecodeCause> {
         bgra: premultiply(&rgba)?,
         color,
     })
+}
+
+/// 把应用物理目标尺寸解析成**变体键**（`insert_at_size` 系列的去重键，D-10）。
+///
+/// 步骤：`ceil` → 防御（`<= 0` / 非有限 ⇒ 1 像素）→ 不放大（clamp 到源尺寸）→ clamp 到
+/// [`MAX_TILE_DIM`]（单个图集块上限）。`(0, 0)` 由调用方保留给「原始尺寸」变体，因此这里的结果
+/// 恒 `>= 1`。把请求收敛到源尺寸后，不同的大目标（如 200×200 与 500×500 之于 40×20 源图）会归一
+/// 成同一个变体键、命中去重；等比 fit 的结果不受这个逐轴 clamp 影响。
+pub(crate) fn resolve_target(target: Size, source: (u32, u32)) -> (u32, u32) {
+    fn pixel(value: f32) -> u32 {
+        if !value.is_finite() || value <= 0.0 {
+            1
+        } else {
+            (value.ceil() as u32).max(1)
+        }
+    }
+    let width = pixel(target.width).min(source.0).min(MAX_TILE_DIM);
+    let height = pixel(target.height).min(source.1).min(MAX_TILE_DIM);
+    (width, height)
+}
+
+/// 解码后的缩放（D-10）：原始路径按 [`MAX_TILE_DIM`]（`Triangle`），目标路径按 target（`CatmullRom`）。
+///
+/// 两条路径都是等比 fit + 不放大；尺寸不变时**不分配**新图（小资产/目标大于源时零缩放拷贝）。
+fn resize_decoded(image: DynamicImage, target: Option<(u32, u32)>) -> DynamicImage {
+    let (width, height) = (image.width(), image.height());
+    let (limit, filter) = match target {
+        Some(target) => (target, FilterType::CatmullRom),
+        None => ((MAX_TILE_DIM, MAX_TILE_DIM), FilterType::Triangle),
+    };
+    let (final_width, final_height) = fit_into((width, height), limit);
+    if (final_width, final_height) == (width, height) {
+        return image;
+    }
+    image.resize_exact(final_width, final_height, filter)
 }
 
 /// straight-alpha 的 RGBA8（`to_rgba8` 输出）→ sRGB（必要时经 ICC 转换）。
@@ -434,13 +484,14 @@ fn classify(format: &'static str, error: ImageError) -> DecodeCause {
     }
 }
 
-/// 等比缩到 `MAX_TILE_DIM` 以内（不放大；两边都至少 1）。
-fn fit_within(width: u32, height: u32) -> (u32, u32) {
-    let limit = MAX_TILE_DIM as f32;
-    let scale = (limit / width as f32).min(limit / height as f32).min(1.0);
-    let target_width = ((width as f32 * scale).floor() as u32).clamp(1, MAX_TILE_DIM);
-    let target_height = ((height as f32 * scale).floor() as u32).clamp(1, MAX_TILE_DIM);
-    (target_width, target_height)
+/// 等比缩到 `limit` 以内（不放大；两边都至少 1）。
+fn fit_into(source: (u32, u32), limit: (u32, u32)) -> (u32, u32) {
+    let scale = (limit.0 as f32 / source.0 as f32)
+        .min(limit.1 as f32 / source.1 as f32)
+        .min(1.0);
+    let width = ((source.0 as f32 * scale).floor() as u32).clamp(1, limit.0.max(1));
+    let height = ((source.1 as f32 * scale).floor() as u32).clamp(1, limit.1.max(1));
+    (width, height)
 }
 
 /// RGBA8 → 预乘 sRGB 编码的 BGRA8。
@@ -584,11 +635,16 @@ mod tests {
     use super::{
         DECODE_PEAK_MARGIN, ICC_PROFILE_LIMIT, MAX_DECODE_ALLOC, MAX_SOURCE_BYTES, MAX_SOURCE_DIM,
         MAX_SOURCE_PIXELS, MAX_TILE_DIM, SourceColor, SourceIcc, allocate_zeroed,
-        check_source_bytes, check_source_size, classify, convert_icc_to_srgb, decode,
-        decode_limits, estimate_peak, fit_within, is_srgb_profile, premultiply_channel,
-        srgb_decode, srgb_encode, test_png, transfer_lut,
+        check_source_bytes, check_source_size, classify, convert_icc_to_srgb, decode_limits,
+        estimate_peak, fit_into, is_srgb_profile, premultiply_channel, resolve_target, srgb_decode,
+        srgb_encode, test_png, transfer_lut,
     };
-    use crate::resources::DecodeCause;
+    use crate::{math::Size, resources::DecodeCause};
+
+    /// 原始尺寸解码（大多数测试用；`decode` 的生产签名带 D-10 的 target 参数）。
+    fn decode(bytes: &[u8]) -> Result<super::DecodedImage, DecodeCause> {
+        super::decode(bytes, None)
+    }
 
     fn png_rgba8(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
         test_png(width, height, pixels, None, None)
@@ -946,10 +1002,59 @@ mod tests {
     }
 
     #[test]
-    fn fit_within_preserves_aspect_and_never_upscales() {
-        assert_eq!(fit_within(10, 10), (10, 10));
-        assert_eq!(fit_within(4092, 2046), (MAX_TILE_DIM, 1023));
-        assert_eq!(fit_within(1, 100_000), (1, MAX_TILE_DIM));
+    fn fit_into_preserves_aspect_and_never_upscales() {
+        let tile = (MAX_TILE_DIM, MAX_TILE_DIM);
+        assert_eq!(fit_into((10, 10), tile), (10, 10));
+        assert_eq!(fit_into((4092, 2046), tile), (MAX_TILE_DIM, 1023));
+        assert_eq!(fit_into((1, 100_000), tile), (1, MAX_TILE_DIM));
+        // D-10：任意 target 都等比 fit，且目标大于源时不放大。
+        assert_eq!(fit_into((200, 100), (40, 40)), (40, 20));
+        assert_eq!(fit_into((200, 100), (300, 40)), (80, 40));
+        assert_eq!(fit_into((40, 20), (200, 200)), (40, 20));
+        assert_eq!(fit_into((600, 300), (40, 40)), (40, 20));
+    }
+
+    /// D-10：目标尺寸解析 `ceil` / 防御 / 不放大 / 页面单块上限。
+    #[test]
+    fn resolve_target_rounds_up_and_clamps_to_source_and_tile() {
+        // ceil：物理像素不能有小数。
+        assert_eq!(resolve_target(Size::new(40.2, 20.1), (200, 100)), (41, 21));
+        assert_eq!(resolve_target(Size::new(40.0, 20.0), (200, 100)), (40, 20));
+        // 不放大：目标大于源尺寸时收敛到源尺寸（不同大目标归一到同一变体键）。
+        assert_eq!(resolve_target(Size::new(200.0, 200.0), (40, 20)), (40, 20));
+        assert_eq!(resolve_target(Size::new(500.0, 500.0), (40, 20)), (40, 20));
+        // 页面单块上限：超过 MAX_TILE_DIM 的目标收敛到上限。
+        assert_eq!(
+            resolve_target(Size::new(4000.0, 4000.0), (5000, 5000)),
+            (MAX_TILE_DIM, MAX_TILE_DIM)
+        );
+        // 防御：0 / 负数 / 非有限 ⇒ 至少 1 像素（不 panic、不产生 0 尺寸 tile）。
+        assert_eq!(resolve_target(Size::new(0.0, -3.0), (200, 100)), (1, 1));
+        assert_eq!(
+            resolve_target(Size::new(f32::NAN, f32::INFINITY), (200, 100)),
+            (1, 1)
+        );
+    }
+
+    /// D-10：按目标尺寸解码走等比 fit（不拉伸、不放大），`CatmullRom` 的尺寸契约。
+    #[test]
+    fn decode_at_size_keeps_aspect_and_never_upscales() {
+        let bytes = solid(200, 100, [10, 20, 30, 255]);
+        let sized = super::decode(&bytes, Some((40, 40))).expect("sized decode");
+        assert_eq!((sized.width, sized.height), (40, 20), "等比 fit，不是拉伸");
+
+        let small = solid(40, 20, [1, 2, 3, 255]);
+        let not_upscaled = super::decode(&small, Some((200, 200))).expect("no upscale");
+        assert_eq!(
+            (not_upscaled.width, not_upscaled.height),
+            (40, 20),
+            "目标大于源尺寸时不得放大"
+        );
+        assert_eq!(
+            not_upscaled.bgra,
+            decode(&small).expect("原尺寸").bgra,
+            "不放大时像素与原尺寸路径逐字节一致"
+        );
     }
 
     #[test]
