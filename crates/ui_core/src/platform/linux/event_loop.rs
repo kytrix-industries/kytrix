@@ -30,6 +30,10 @@
 //!   serial，等使用该状态渲染的帧发布（`App::frame` 返回 `Committed`）后才
 //!   `ack_configure`。不可见 / 没渲染器 / `Idle` 的窗口没有帧可配对，在本轮 force ack
 //!   （否则静止窗口的 configure 永远不确认）。
+//! - **自绘标题栏拖动区**（X2）：泵在把平台事件交给 `App` **之前**逐条判定
+//!   （[`crate::platform::wayland::drag`]）：主键按下命中 `Window::drag_regions()` ⇒
+//!   `WaylandState::begin_move` 发 `xdg_toplevel.move(seat, serial)`，该次 `PointerDown`
+//!   不派发（拖动区是窗口 chrome，不是内容）；区域之外完全不变。
 
 use std::{
     sync::Arc,
@@ -51,7 +55,7 @@ use crate::{
             surface::{self, WaylandState},
             wake,
         },
-        wayland::close,
+        wayland::{close, drag},
     },
     render::backend::Renderer,
     window::{FrameOutcome, WindowControl, WindowId},
@@ -172,6 +176,30 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             // 每个事件**自带**窗口 id（P1-2.8 Stage C-2）：多窗口下同一批里可能混着不同窗口的
             // 事件，不能再用「当前窗口」统一派发。
             for (target, event) in events {
+                // X2：自绘标题栏拖动区内的**主键按下**转成 `xdg_toplevel.move(seat, serial)`，
+                // 交给 compositor 驱动移动，**不投递** `PointerDown` —— 拖动区是窗口 chrome，
+                // 不是内容：应用收不到这次按下 ⇒ 不开始指针会话、不产生 click / drag 动作；
+                // 之后同一按键的 motion / up 由 compositor 的隐式抓取接管。
+                //
+                // 判定放在泵里（而不是 `wl_pointer.button` 的协议回调里）：那里只有
+                // `WaylandState`、拿不到 `App` 的拖动区；泵在派发前读 `Window::drag_regions()`
+                // 的当前值（应用在上一轮响应里设置），与 Windows 平台层「每轮对账」同一时机。
+                //
+                // serial：`WaylandState::begin_move` 用最近一次指针按键的 serial（协议要求隐式
+                // 抓取请求带输入事件的 serial）；同一批里多个按键的极端情况取最后一条，仍是
+                // 本 seat 的有效输入 serial。
+                //
+                // 降级：compositor 不实现交互移动时 `move` 是无副作用的 no-op（协议没有
+                // 「不支持」错误）；应用仍可用 `WindowControl::BeginMove` 的显式路径。
+                if let Some(position) = drag::drag_press_position(&event)
+                    && app
+                        .window(target)
+                        .is_some_and(|window| drag::hit(window.drag_regions(), position))
+                    && let Some(index) = state.window_index(target)
+                {
+                    state.begin_move(index);
+                    continue;
+                }
                 app.dispatch(target, event);
             }
             if had_events {

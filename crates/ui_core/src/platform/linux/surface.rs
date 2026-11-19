@@ -1126,6 +1126,16 @@ impl WaylandState {
     }
 
     /// 开始交互式移动；使用触发拖动的指针按键 serial。
+    ///
+    /// 两个调用点，共用同一份 serial 来源（最近一次 `wl_pointer.button` 的按下 serial）：
+    ///
+    /// - `WindowControl::BeginMove`：应用**显式**请求（demo 的标题栏拖动处理器等），在
+    ///   `App::take_window_control` 消费的同一轮执行；
+    /// - **X2 拖动区**：应用通过 `Window::set_drag_regions` 声明自绘标题栏的可拖动区域，泵在
+    ///   派发事件前判定主键按下命中 ⇒ 走本方法（该次 `PointerDown` 不投递）。
+    ///
+    /// 协议语义：`xdg_toplevel.move` 只是「请 compositor 开始交互移动」的请求，之后的光标抓取、
+    /// 窗口摆放全由 compositor 驱动；compositor 可以忽略（无副作用，不是协议错误）。
     pub(crate) fn begin_move(&self, index: usize) {
         self.windows[index]
             .toplevel
