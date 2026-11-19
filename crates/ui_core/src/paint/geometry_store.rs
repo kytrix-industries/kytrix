@@ -644,10 +644,11 @@ pub(crate) fn missing_snapshot() -> Arc<GeometrySnapshot> {
     }))
 }
 
-/// 仅测试：把一个注册描述变成合法快照（GPU 后端单测与合成器测试用）。
+/// 仅测试：把一个注册描述变成合法快照（Windows WARP 单测 / 合成器测试用）。
 ///
-/// 生产代码没有这条路径：快照只由本 store 的记录产出。
-#[cfg(test)]
+/// 生产代码没有这条路径：快照只由本 store 的记录产出。macOS / Linux 的后端测试直接走
+/// `GeometryStore`，不需要这条旁路（`cfg(all(test, windows))` 避免其它平台的 dead_code）。
+#[cfg(all(test, windows))]
 pub(crate) fn snapshot_for_test(desc: GeometryDesc) -> Arc<GeometrySnapshot> {
     let mut store = GeometryStore::new();
     let id = store

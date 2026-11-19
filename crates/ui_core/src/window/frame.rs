@@ -792,6 +792,7 @@ mod tests {
             Some(RenderStats {
                 draw_calls: 7,
                 instances: 9,
+                geometry_uploaded_bytes: 0,
             }),
         );
         // threaded 提交：没有同步统计 ⇒ 保持完成帧的值。
@@ -805,6 +806,7 @@ mod tests {
             Some(RenderStats {
                 draw_calls: 3,
                 instances: 4,
+                geometry_uploaded_bytes: 0,
             }),
         );
         let metrics = view.debug_hud_metrics();

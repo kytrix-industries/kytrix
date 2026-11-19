@@ -42,7 +42,7 @@ use crate::{
         timer::{FrameTimings, GpuTimerSample, Section},
         uniform::{ROOT_UNIFORM_DWORDS, RootUniform},
         windows::{
-            device::{AtlasRebuildOutcome, SharedGpu},
+            device::AtlasRebuildOutcome,
             diagnostics,
             hresult::PresentOutcome,
             pipeline::{GeometryRegistry, Pipeline, SrvHeap},
@@ -115,6 +115,7 @@ pub(super) fn prime_detached(
             atlas_uploads: &mut renderer.atlas_uploads,
             persist: &renderer.persist,
             upload: &mut renderer.upload,
+            geometry_upload: &mut renderer.geometry_upload,
             mirror: &mut renderer.mirror,
             geometry: &mut renderer.geometry,
             timer: None,
@@ -242,6 +243,7 @@ pub(super) fn submit_recorded(
                 atlas_uploads: &mut renderer.atlas_uploads,
                 persist: &renderer.persist,
                 upload: &mut renderer.upload,
+                geometry_upload: &mut renderer.geometry_upload,
                 mirror: &mut renderer.mirror,
                 geometry: &mut renderer.geometry,
                 timer: renderer.timer.as_ref(),
@@ -348,6 +350,7 @@ pub(super) fn record(
     if !recorder.prime {
         recorder.geometry.begin_frame();
     }
+    let mut geometry_uploaded_bytes = 0usize;
     let present;
     {
         let list = recorder.stream.list(slot);
@@ -364,6 +367,19 @@ pub(super) fn record(
                 slot.index,
             )?
         };
+        // X5：几何 DEFAULT 缓冲的页级增量上传（staging + `CopyBufferRegion`）。必须在任何
+        // copy / draw 之前、在**同一条命令列表**里：队列按序执行 ⇒ 上一帧的顶点/索引读取一定
+        // 先于本帧的 copy 完成（DEFAULT 堆因此不需要额外同步）。
+        if !recorder.prime {
+            geometry_uploaded_bytes = recorder.geometry.prepare(
+                recorder.shared,
+                list,
+                recorder.geometry_upload,
+                payload.geometry(),
+                slot.index,
+                &mut geometry_retired,
+            )?;
+        }
         match draw {
             FrameDraw::Direct => {
                 // 整帧直绘当前 back buffer：**零拷贝**（R08-8）。
@@ -402,8 +418,6 @@ pub(super) fn record(
                     payload.ops(),
                     None,
                     recorder.geometry,
-                    recorder.shared,
-                    &mut geometry_retired,
                     payload,
                     root,
                     scissor_whole,
@@ -456,8 +470,6 @@ pub(super) fn record(
                     payload.ops(),
                     None,
                     recorder.geometry,
-                    recorder.shared,
-                    &mut geometry_retired,
                     payload,
                     root,
                     scissor_whole,
@@ -517,8 +529,6 @@ pub(super) fn record(
                             payload.ops(),
                             Some(&*recorder.buckets),
                             recorder.geometry,
-                            recorder.shared,
-                            &mut geometry_retired,
                             payload,
                             root,
                             scissor,
@@ -559,6 +569,7 @@ pub(super) fn record(
         stats: RenderStats {
             draw_calls,
             instances: payload.drawn_instances(),
+            geometry_uploaded_bytes,
         },
         present,
     })
@@ -697,8 +708,6 @@ pub(super) fn draw_ops(
     ops: &[FrameOp],
     buckets: Option<&OpBuckets>,
     geometry: &mut GeometryRegistry,
-    shared: &SharedGpu,
-    retired: &mut Vec<GpuResourceHandle>,
     payload: &FramePayload,
     root: RootUniform,
     scissor: RECT,
@@ -810,8 +819,17 @@ pub(super) fn draw_ops(
                         ),
                     }
                 })?;
-                // 首次见到该 id（或版本变化）时现场建/更新缓冲；`snapshot` 随帧过线。
-                let entry = geometry.ensure(shared, draw.id, &draw.snapshot, retired)?;
+                // 缓冲由帧开始前的 `prepare` 建好/更新（X5）；这里只查表 + 记使用帧号。
+                geometry.touch(draw.id);
+                let entry = geometry
+                    .get(draw.id)
+                    .ok_or_else(|| EngineError::GeometryRegister {
+                        detail: smol_str::format_smolstr!(
+                            "geometry {}:{} was not prepared before drawing",
+                            draw.id.index(),
+                            draw.id.generation()
+                        ),
+                    })?;
                 let chunk = draw.snapshot.chunk(draw.chunk).ok_or_else(|| {
                     EngineError::GeometryRegister {
                         detail: smol_str::format_smolstr!(

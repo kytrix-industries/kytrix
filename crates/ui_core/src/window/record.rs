@@ -191,6 +191,7 @@ mod tests {
             stats: RenderStats {
                 draw_calls,
                 instances,
+                geometry_uploaded_bytes: 0,
             },
             samples: Vec::new(),
             completed_at: Instant::now(),

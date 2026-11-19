@@ -10,6 +10,8 @@ pub(crate) struct RenderStats {
     pub draw_calls: u32,
     /// 本帧实例缓冲的条目数（不按 damage 重复）。
     pub instances: u32,
+    /// 本帧**几何页级增量上传**的 staging 字节数（X5；只统计真正 copy 的页/整缓冲重建）。
+    pub geometry_uploaded_bytes: usize,
 }
 
 #[cfg(test)]
@@ -21,5 +23,6 @@ mod tests {
         let stats = RenderStats::default();
         assert_eq!(stats.draw_calls, 0);
         assert_eq!(stats.instances, 0);
+        assert_eq!(stats.geometry_uploaded_bytes, 0);
     }
 }

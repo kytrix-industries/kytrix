@@ -685,6 +685,7 @@ mod tests {
         RenderStats {
             draw_calls,
             instances: draw_calls * 10,
+            geometry_uploaded_bytes: 0,
         }
     }
 

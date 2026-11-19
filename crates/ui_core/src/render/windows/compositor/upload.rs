@@ -17,6 +17,7 @@ use crate::{
     paint::{atlas::AtlasKind, instance::GpuClipEntry},
     render::{
         frame::{FramePayload, InstanceMirror, MAX_FRAMES_IN_FLIGHT},
+        retire::GpuResourceHandle,
         windows::{
             device::{SharedGpu, init_error_from},
             queue::CommandStream,
@@ -71,6 +72,111 @@ pub(super) fn create_arena(shared: &SharedGpu) -> Result<UploadArena, EngineErro
         });
     }
     Ok(UploadArena { slots })
+}
+
+/// 几何页级上传的 staging arena（X5）：每 in-flight 槽一块持久映射的 UPLOAD 缓冲，帧内
+/// bump 分配、帧初重置。
+///
+/// 槽的复用安全性由既有帧同步保证：`submit_recorded` 在录制前已经等过该槽的 fence，
+/// 因此本帧覆写缓冲区时，该槽上一帧的命令已完成。
+pub(crate) struct GeometryUploadArena {
+    slots: Vec<GeometryUploadSlot>,
+}
+
+pub(crate) struct GeometryUploadSlot {
+    resource: ID3D12Resource,
+    handle: GpuResourceHandle,
+    /// 容量（字节；按 64 KiB 对齐增长）。
+    capacity: u32,
+    /// 本帧已用字节（512 B 对齐的 bump 指针）。
+    used: u32,
+    pointer: *mut u8,
+}
+
+/// staging 缓冲增长率：首块 64 KiB，之后翻倍（与几何缓冲同一对齐粒度，避免小更新反复分配）。
+const GEOMETRY_STAGING_INITIAL: u32 = 64 * 1024;
+
+impl GeometryUploadArena {
+    /// 每 in-flight 槽一块 staging 缓冲（消费者：`GpuRenderer::new`）。
+    pub(crate) fn new(shared: &SharedGpu) -> Result<Self, EngineError> {
+        let mut slots = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+        for _ in 0..MAX_FRAMES_IN_FLIGHT {
+            let resource = create_upload(shared.raw(), u64::from(GEOMETRY_STAGING_INITIAL))?;
+            let handle = shared.allocate(resource.clone());
+            let pointer = map_upload(&resource)?;
+            slots.push(GeometryUploadSlot {
+                resource,
+                handle,
+                capacity: GEOMETRY_STAGING_INITIAL,
+                used: 0,
+                pointer,
+            });
+        }
+        Ok(Self { slots })
+    }
+
+    /// teardown：把 staging 缓冲的句柄交回共享设备。
+    pub(crate) fn release(&self, shared: &SharedGpu) {
+        for slot in &self.slots {
+            let _ = shared.release(slot.handle);
+        }
+    }
+
+    /// 帧初重置 bump 指针（调用方保证该槽上一帧已完成）。
+    pub(crate) fn begin(&mut self, slot: usize) {
+        if let Some(target) = self.slots.get_mut(slot) {
+            target.used = 0;
+        }
+    }
+
+    /// 把 `bytes` 拷进 staging 缓冲，返回 `(staging 资源, 偏移)`（供 `CopyBufferRegion`）。
+    ///
+    /// 每段按 512 B 对齐（`D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT` 下限；buffer copy 的
+    /// 对齐要求远低于此，取它是为了保守覆盖驱动的实现差异）。
+    pub(crate) fn stage(
+        &mut self,
+        shared: &SharedGpu,
+        slot: usize,
+        bytes: &[u8],
+        retired: &mut Vec<GpuResourceHandle>,
+    ) -> Result<(&ID3D12Resource, u32), EngineError> {
+        let target = self
+            .slots
+            .get_mut(slot)
+            .ok_or_else(|| EngineError::AppInit {
+                detail: smol_str::SmolStr::new_static("geometry staging slot out of range"),
+            })?;
+        let aligned = (bytes.len() as u32).next_multiple_of(512);
+        let needed = target
+            .used
+            .checked_add(aligned)
+            .ok_or_else(|| EngineError::AppInit {
+                detail: smol_str::SmolStr::new_static("geometry staging size overflow"),
+            })?;
+        if needed > target.capacity {
+            let capacity = needed.max(GEOMETRY_STAGING_INITIAL).next_power_of_two();
+            let resource = create_upload(shared.raw(), u64::from(capacity))?;
+            let handle = shared.allocate(resource.clone());
+            let pointer = map_upload(&resource)?;
+            let old = target.handle;
+            target.resource = resource;
+            target.handle = handle;
+            target.pointer = pointer;
+            target.capacity = capacity;
+            retired.push(old);
+        }
+        let offset = target.used;
+        // SAFETY: bump 区间在容量内（上面已扩容）；`bytes` 非空时源指针有效。
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                target.pointer.add(offset as usize),
+                bytes.len(),
+            );
+        }
+        target.used += aligned;
+        Ok((&target.resource, offset))
+    }
 }
 
 /// 消费者：`UploadArena::write`（`compositor.rs` 的薄委托）。

@@ -25,6 +25,7 @@ use crate::{
             GeometryCatalog, LaneStore, SceneDelta, ScrollTable, push_scroll_damage, scroll_damage,
         },
         frame::FramePayload,
+        geometry_upload::{GeometryUploadPlan, GeometryUploadTracker},
     },
 };
 
@@ -61,6 +62,9 @@ pub(crate) struct WindowComposer {
     encoder: InstanceEncoder,
     lanes: LaneStore,
     geometry: GeometryCatalog,
+    /// 几何快照的页级上传计划器（X5）：只用于 **CPU 侧计数**（headless 绝对可靠；真实窗口的
+    /// GPU 线程各持一份自己的 tracker 做实际上传）。
+    geometry_uploads: GeometryUploadTracker,
     scroll: ScrollTable,
     stats: ComposeStats,
 }
@@ -71,6 +75,7 @@ impl WindowComposer {
             encoder: InstanceEncoder::new(),
             lanes: LaneStore::new(),
             geometry: GeometryCatalog::new(),
+            geometry_uploads: GeometryUploadTracker::new(),
             scroll: ScrollTable::new(),
             stats: ComposeStats::default(),
         }
@@ -157,6 +162,17 @@ impl WindowComposer {
         } else {
             FramePayload::from_buffer_delta(self.encoder.buffer_mut(), scroll_payload, scroll_clip)
         };
+        // X5：几何页级上传计划（与 GPU 后端同一 diff 算法）。整帧重建（首帧 / 设备恢复 /
+        // 新渲染器挂上）意味着 GPU 侧缓冲是空的 ⇒ tracker 清空后本帧整份重传。
+        if delta.full {
+            self.geometry_uploads.clear();
+        }
+        self.stats.geometry_uploaded_bytes = self
+            .geometry_uploads
+            .plan(payload.geometry())
+            .iter()
+            .map(GeometryUploadPlan::uploaded_bytes)
+            .sum();
         Ok(ComposedFrame {
             plan,
             payload,
