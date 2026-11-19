@@ -146,7 +146,14 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
         .collect();
     let mut windows: Vec<NativeWindow> = Vec::with_capacity(requests.len());
     for (id, options) in requests {
-        windows.push(open_window(mtm, &mut app, id, &options, &dispatcher)?);
+        windows.push(open_window(
+            mtm,
+            &mut app,
+            id,
+            &options,
+            &dispatcher,
+            windows.len(),
+        )?);
     }
     // `activate` 必须在窗口已经存在之后（macOS 14+ 的无参版本不会自己找窗口，
     // 在首窗之前调用可能「没真正到前台」）。
@@ -254,8 +261,9 @@ fn open_window(
     id: WindowId,
     options: &WindowOptions,
     dispatcher: &Arc<Dispatcher>,
+    cascade_index: usize,
 ) -> Result<NativeWindow, EngineError> {
-    let native = NativeWindow::create(mtm, id, options, dispatcher)?;
+    let native = NativeWindow::create(mtm, id, options, dispatcher, cascade_index)?;
     // 先显示：用户立刻看到窗口（背景色由 `NSColor` 铺底）。
     native.show();
     let scale = native.scale();
@@ -525,7 +533,14 @@ fn sync_native_windows(
         detail: smol_str::SmolStr::new_static("window creation requires the main thread"),
     })?;
     for (id, options) in pending {
-        windows.push(open_window(mtm, app, id, &options, dispatcher)?);
+        windows.push(open_window(
+            mtm,
+            app,
+            id,
+            &options,
+            dispatcher,
+            windows.len(),
+        )?);
     }
     Ok(())
 }

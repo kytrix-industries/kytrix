@@ -27,6 +27,15 @@ pub(crate) mod ime;
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod menu;
 
+/// macOS 窗口摆放的**平台无关纯逻辑**（B3）：引擎逻辑坐标 ⇄ AppKit 全局屏幕坐标、
+/// `NSScreen.visibleFrame` 工作区 clamp、内容 min/max 钳制、`position = None` 时的级联
+/// 默认位置。
+///
+/// 与 [`menu`] 同一模式，只在 macOS 构建与测试构建里编译：`platform::macos` 整个模块是
+/// macOS-only（objc2 依赖也是），而这里全是纯数据 / 纯函数，必须在开发机（Windows）单测。
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod macos_placement;
+
 /// Wayland 协议层的纯逻辑（`wl_data_source` 生命周期、IME 焦点路由、光标形状/主题、
 /// `xdg_toplevel` 状态机）。
 ///

@@ -1,9 +1,18 @@
 //! 原生窗口：`NSWindow` + 自绘标题栏 + 交通灯。
 //!
-//! 状态同步（尺寸 / 缩放 / 焦点 / 可见性）走「每轮快照对比」而不是 delegate 或通知：泵每轮都要
-//! 读一次这些值（O(1)）。**例外是关闭**：`windowShouldClose:` 是 AppKit 在关窗前唯一的同步
-//! 钩子，没有它就无法拦截用户点红点 / Cmd-W（窗口已被 AppKit 关掉，泵事后才观察到，veto 也就
-//! 失去意义）。见 [`WindowDelegate`]。
+//! 状态同步（尺寸 / 缩放 / 焦点 / 可见性 / 位置）走「每轮快照对比」而不是 delegate 或通知：
+//! 泵每轮都要读一次这些值（O(1)）。delegate 回调（`windowDidMove:` 等）只**置位 + 唤醒**，
+//! 平台真值仍由 `sync_state` 快照读取，避免两个真值来源。**例外是关闭**：`windowShouldClose:`
+//! 是 AppKit 在关窗前唯一的同步钩子，没有它就无法拦截用户点红点 / Cmd-W（窗口已被 AppKit
+//! 关掉，泵事后才观察到，veto 也就失去意义）。见 [`WindowDelegate`]。
+//!
+//! 可见性（R09-9）三个来源：最小化（`isMiniaturized`）、应用隐藏（`NSApp.hide`，Cmd+H）、
+//! **被完全遮挡/在别的 Space**（`occlusionState` 不含 `Visible`）。三者任一为真，帧就不再产出、
+//! display link 暂停（见 `event_loop::pump`）——交易终端最小化几小时是常态，120 Hz 唤醒是纯浪费。
+//!
+//! 摆放（B3）：`WindowOptions.position` / `min_size` / `max_size` 在 [`NativeWindow::create`]
+//! 消费；坐标换算 / 工作区 clamp 的纯逻辑在 `platform::macos_placement`（Windows 可单测）。
+//! 位置变化经 `windowDidMove:` 唤醒 + `sync_state` 快照比较，产出 `Event::Moved`。
 //!
 //! 可见性（R09-9）三个来源：最小化（`isMiniaturized`）、应用隐藏（`NSApp.hide`，Cmd+H）、
 //! **被完全遮挡/在别的 Space**（`occlusionState` 不含 `Visible`）。三者任一为真，帧就不再产出、
@@ -16,7 +25,7 @@ use objc2::{
     runtime::ProtocolObject,
 };
 use objc2_app_kit::{
-    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSWindow,
+    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSScreen, NSWindow,
     NSWindowCollectionBehavior, NSWindowDelegate, NSWindowOcclusionState, NSWindowStyleMask,
     NSWindowTitleVisibility,
 };
@@ -34,6 +43,7 @@ use crate::{
     platform::{
         dispatcher::Dispatcher,
         macos::{a11y::MacA11y, dpi, view::GuiView, wake},
+        macos_placement as placement,
     },
     window::{WindowId, WindowOptions},
 };
@@ -43,8 +53,12 @@ use crate::{
 /// 回调里**不碰 `App`**（与 `GuiView` 同一纪律）：置位 / 唤醒，由泵在主线程决定
 /// `App::request_close` 的裁决。`windowShouldClose:` 恒返回 `false` —— 真正的关闭由泵在
 /// 应用同意之后调 `NSWindow::close`（`close` 不再询问 delegate，因此不会递归）。
+///
+/// `moved`（B3）同理：`windowDidMove:` 只置位 + `dispatcher.wake()`，位置由泵的
+/// `sync_state` 从 `NSView` 快照算出（回调里拿不到 `&mut App`，也不该在回调里换算）。
 struct WindowIvars {
     requested: Cell<bool>,
+    moved: Cell<bool>,
     dispatcher: Arc<Dispatcher>,
 }
 
@@ -84,6 +98,16 @@ define_class!(
         fn window_did_deminiaturize(&self, _notification: &NSNotification) {
             self.ivars().dispatcher.wake();
         }
+
+        /// B3：窗口位置变化（拖动标题栏 / 系统摆放 / 跨屏 / `setFrame`）。
+        ///
+        /// 只置位 + 唤醒：位置换算与 `Event::Moved` 投递由泵做（回调不碰 `App`）。
+        /// 唤醒保证「拖动期间至少每个 run loop 一轮」收到位置事件。
+        #[unsafe(method(windowDidMove:))]
+        fn window_did_move(&self, _notification: &NSNotification) {
+            self.ivars().moved.set(true);
+            self.ivars().dispatcher.wake();
+        }
     }
 );
 
@@ -91,6 +115,7 @@ impl WindowDelegate {
     fn new(mtm: MainThreadMarker, dispatcher: Arc<Dispatcher>) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(WindowIvars {
             requested: Cell::new(false),
+            moved: Cell::new(false),
             dispatcher,
         });
         // SAFETY: `init` 是 NSObject 的指定初始化器；`this` 由 `alloc` 产生且未初始化。
@@ -101,10 +126,60 @@ impl WindowDelegate {
     fn take_request(&self) -> bool {
         self.ivars().requested.replace(false)
     }
+
+    /// 取走「AppKit 报告窗口移动」标记（B3；位置真值仍由 `sync_state` 快照读取）。
+    fn take_moved(&self) -> bool {
+        self.ivars().moved.replace(false)
+    }
 }
 
 /// 最小客户区（逻辑像素；与 Win32 / Wayland 同源）。
 pub(crate) const MIN_SIZE_LOGICAL: (f32, f32) = (320.0, 200.0);
+
+/// 全部屏幕的 frame / visibleFrame 快照（B3；`NSScreen` 是主线程对象，建窗与泵都在主线程）。
+fn screen_areas(mtm: MainThreadMarker) -> Vec<placement::ScreenArea> {
+    let screens = NSScreen::screens(mtm);
+    let mut areas = Vec::with_capacity(screens.count());
+    for screen in screens.to_vec() {
+        areas.push(placement::ScreenArea {
+            frame: ns_area(screen.frame()),
+            visible: ns_area(screen.visibleFrame()),
+        });
+    }
+    areas
+}
+
+/// `NSRect` → 平台无关的 [`placement::Area`]（AppKit 全局坐标、point）。
+fn ns_area(rect: NSRect) -> placement::Area {
+    placement::Area::new(
+        rect.origin.x,
+        rect.origin.y,
+        rect.size.width,
+        rect.size.height,
+    )
+}
+
+/// `position = None` 时的平台默认摆放（B3）：主屏工作区左上角按 26 point 阶梯级联。
+///
+/// AppKit 没有「自动摆放」的默认行为（`initWithContentRect:` 严格按给定矩形创建），
+/// 因此平台层自己做级联（等价 `NSWindow.cascadeTopLeftFromPoint:` 的步长，Qt / winit
+/// 的默认摆放同款）—— 多窗口不再完全重叠，兑现 `WindowOptions::position = None` 文档。
+fn cascade_content_origin(
+    mtm: MainThreadMarker,
+    screens: &[placement::ScreenArea],
+    size: Size,
+    index: usize,
+) -> (f64, f64) {
+    let Some(desktop) = placement::Desktop::from_screens(screens) else {
+        // 无屏幕（headless / 无显示器）：沿用历史默认位置，保证窗口仍可创建。
+        return (80.0, 80.0);
+    };
+    let main_visible = NSScreen::mainScreen(mtm)
+        .map(|screen| ns_area(screen.visibleFrame()))
+        .unwrap_or(screens[0].visible);
+    let position = placement::cascade_position(desktop, main_visible, index);
+    placement::content_origin_for_position(position, size, screens)
+}
 
 /// 关窗请求的来源。
 ///
@@ -145,27 +220,45 @@ pub(crate) struct NativeWindow {
     ime_enabled: bool,
     /// `sync_state` 观察到的「窗口刚失去键盘焦点」边沿（泵在同步后消费它做 IME 清场）。
     focus_lost: bool,
+    /// 最近一次观察到的内容区左上角（**AppKit 全局坐标**，point）：`Event::Moved` 的去重基准。
+    ///
+    /// 用 AppKit 坐标比较而不是引擎坐标：屏幕布局变化会改变两者之间的平移/翻转，用引擎
+    /// 坐标比较会在「没动过的窗口」上误报 `Event::Moved`。
+    seen_content: placement::Area,
 }
 
 impl NativeWindow {
     /// 建**隐藏**窗口（不 `makeKeyAndOrderFront`）并装好 view + a11y adapter。
+    ///
+    /// `cascade_index` 是「本窗口是本次运行创建的第几个」：`WindowOptions.position = None`
+    /// 时用于平台默认的级联摆放（B3，见 `macos_placement::cascade_position`）。
     pub(crate) fn create(
         mtm: MainThreadMarker,
         id: WindowId,
         options: &WindowOptions,
         dispatcher: &Arc<Dispatcher>,
+        cascade_index: usize,
     ) -> Result<Self, EngineError> {
         let style = NSWindowStyleMask::Titled
             | NSWindowStyleMask::Closable
             | NSWindowStyleMask::Miniaturizable
             | NSWindowStyleMask::Resizable
             | NSWindowStyleMask::FullSizeContentView;
+        let size = Size::new(options.size.width.max(1.0), options.size.height.max(1.0));
+        // B3：`position` 是「虚拟桌面内容区左上角、y 向下」的逻辑点；平台层换算成 AppKit
+        // 的内容区矩形（左下原点、y 向上）并 clamp 进目标屏幕的 visibleFrame。`None` 走
+        // 平台默认摆放（主屏工作区左上角 26 point 阶梯级联）。
+        //
+        // 非有限的 `position`（NaN/∞）按 `None` 处理：NSRect 里塞 NaN 会让 AppKit 行为未定义。
+        let screens = screen_areas(mtm);
+        let (content_x, content_y) = match options.position.filter(|position| position.is_finite())
+        {
+            Some(position) => placement::content_origin_for_position(position, size, &screens),
+            None => cascade_content_origin(mtm, &screens, size, cascade_index),
+        };
         let rect = NSRect::new(
-            NSPoint::new(80.0, 80.0),
-            NSSize::new(
-                f64::from(options.size.width.max(1.0)),
-                f64::from(options.size.height.max(1.0)),
-            ),
+            NSPoint::new(content_x, content_y),
+            NSSize::new(f64::from(size.width), f64::from(size.height)),
         );
         // SAFETY: `alloc` + 指定初始化器是 NSWindow 的合法构造路径；`rect` 是栈上值。
         let window = unsafe {
@@ -196,10 +289,23 @@ impl NativeWindow {
         );
         window.setBackgroundColor(Some(&background));
         window.setAcceptsMouseMovedEvents(true);
+        // B3：客户区 min/max（逻辑点）。`min > max` 的钳制在平台无关纯逻辑里做；
+        // `max = None` 时不调用 `setContentMaxSize:`（保持 AppKit 的默认无限上限）。
+        let (min_size, max_size) = placement::content_size_bounds(
+            options.min_size,
+            options.max_size,
+            Size::new(MIN_SIZE_LOGICAL.0, MIN_SIZE_LOGICAL.1),
+        );
         window.setContentMinSize(NSSize::new(
-            f64::from(MIN_SIZE_LOGICAL.0),
-            f64::from(MIN_SIZE_LOGICAL.1),
+            f64::from(min_size.width),
+            f64::from(min_size.height),
         ));
+        if let Some(max_size) = max_size {
+            window.setContentMaxSize(NSSize::new(
+                f64::from(max_size.width),
+                f64::from(max_size.height),
+            ));
+        }
         // 显式声明该窗口是原生全屏的 primary 窗口；默认 collectionBehavior=0 时
         // AppKit 的 fullscreen 转场会停在过渡快照上（实测：窗口/view/layer 都已
         // 1680×1050，但屏幕仍显示旧的 960×740 快照）。
@@ -247,12 +353,13 @@ impl NativeWindow {
             // 因此不会产生任何平台调用。
             ime_enabled: true,
             focus_lost: false,
+            seen_content: placement::Area::new(0.0, 0.0, 0.0, 0.0),
         };
         native.sync_initial(mtm)?;
         Ok(native)
     }
 
-    /// 初次同步：读 `backingScaleFactor` / 内容尺寸，写回字段（**不**产生事件）。
+    /// 初次同步：读 `backingScaleFactor` / 内容尺寸 / 初始内容区位置，写回字段（**不**产生事件）。
     fn sync_initial(&mut self, _mtm: MainThreadMarker) -> Result<(), EngineError> {
         let factor = self.window.backingScaleFactor();
         let scale = dpi::scale_from(factor)?;
@@ -261,7 +368,20 @@ impl NativeWindow {
         let size = self.view.frame().size;
         self.seen_size = (size.width, size.height);
         self.logical_size = Size::new(size.width as f32, size.height as f32);
+        // B3：把实际生效的位置记成 `Event::Moved` 的去重基准 —— 创建时的请求位置可能被
+        // AppKit 的 frame 约束微调过（或者被我们的 visibleFrame clamp 过），这里以真值
+        // 为准，避免启动后的第一轮同步补发一条「假移动」。
+        self.seen_content = self.content_rect_in_screen();
         Ok(())
+    }
+
+    /// view 的内容区在 AppKit 全局坐标下的矩形（point）。
+    ///
+    /// 用「view 的矩形」而不是 `window.frame()`：窗口是 `FullSizeContentView`，内容区铺满
+    /// 整个 frame；`NSWindow.convertRectToScreen:` 把内容坐标系里的矩形换算成屏幕坐标，
+    /// 与创建时喂给 `initWithContentRect:` 的矩形是同一个语义，读写才能互逆。
+    fn content_rect_in_screen(&self) -> placement::Area {
+        ns_area(self.window.convertRectToScreen(self.view.frame()))
     }
 
     /// 把渲染器的 `CAMetalLayer` 挂到 view 上（`wantsLayer` 已在 `create` 里打开）。
@@ -370,6 +490,22 @@ impl NativeWindow {
                 window.set_surface(backing);
             }
             events.push(Event::Resized { size: logical });
+        }
+        // B3：位置变化（拖动标题栏 / 系统摆放 / 跨屏 / 程序化 `setFrame`）。
+        //
+        // `windowDidMove:` 只负责尽早唤醒泵（回调不碰 App）；这里的快照比较才是权威判据：
+        // 用 AppKit 坐标的内容区左上角做去重，拖动期间每轮泵最多产出一条 `Event::Moved`
+        // （不要求每像素，但 ≥ 每个 run loop 一轮）。容差 0.5 point 与尺寸同步一致。
+        let content = self.content_rect_in_screen();
+        let appkit_moved = self.delegate.take_moved();
+        if appkit_moved
+            || (content.x - self.seen_content.x).abs() > 0.5
+            || (content.max_y() - self.seen_content.max_y()).abs() > 0.5
+        {
+            self.seen_content = content;
+            let screens = screen_areas(self.mtm);
+            let position = placement::position_from_content_rect(content, &screens);
+            events.push(Event::Moved { position });
         }
         let key = self.window.isKeyWindow();
         if key != self.was_key {
