@@ -22,6 +22,7 @@ use crate::{
     error::EngineError,
     math::{Point, Rect, Scale, Transform},
     paint::{
+        atlas::MAX_IMAGE_PAGES,
         color::{ColorResolver, LinearPremulRgba},
         primitive::{ClipOp, GradientKind, Primitive, QuadPaint},
         scene::MAX_CLIP_DEPTH,
@@ -2319,6 +2320,15 @@ impl LaneEncoder<'_> {
     }
 
     fn emit_image(&mut self, image: &crate::paint::primitive::Image) {
+        // RD-8：`page` 是 texture array 的层号，越界采样在三端都是未定义行为（Vulkan 可能
+        // 设备丢失）。契约破坏在 debug 直接断言；release 版本 clamp 到最后一层（安全但内容错，
+        // 绝不把越界层号写进 GPU 实例）。
+        debug_assert!(
+            image.tile.page < MAX_IMAGE_PAGES,
+            "image tile page {} out of range (MAX_IMAGE_PAGES={MAX_IMAGE_PAGES})",
+            image.tile.page
+        );
+        let page = image.tile.page.min(MAX_IMAGE_PAGES - 1);
         let physical = image.bounds.to_physical(self.scale);
         let color0 = self.colors.resolve(&self.resolver, image.modulation);
         let bounds = physical_to_bounds(physical);
@@ -2330,7 +2340,7 @@ impl LaneEncoder<'_> {
             params0: [0.0; 4],
             params1: [
                 self.clip_index(),
-                image.tile.page_f32(),
+                f32::from(page),
                 KIND_IMAGE,
                 self.clip_depth(),
             ],
@@ -2345,6 +2355,11 @@ impl LaneEncoder<'_> {
         color0: LinearPremulRgba,
         glyph: &crate::paint::primitive::PositionedGlyph,
     ) {
+        // RD-8：glyph 图集只有 1 层（layer 恒 0），越界 tile 是契约破坏。
+        debug_assert_eq!(
+            glyph.tile.page, 0,
+            "glyph atlas tile must live in texture array layer 0"
+        );
         let physical = Rect::from_origin_size(glyph.position, glyph.size).to_physical(self.scale);
         let bounds = physical_to_bounds(physical);
         let instance = GpuPrimitive {
@@ -3903,6 +3918,33 @@ mod tests {
         assert_eq!(instance.params1[2], super::KIND_IMAGE);
         assert_eq!(instance.uv, [0.1, 0.2, 0.3, 0.4]);
         assert_eq!(instance.params1[3], 0.0, "无裁剪 ⇒ clip_depth 0");
+    }
+
+    /// RD-8：编码期对越界图片层号硬校验（debug 断言）；release 走 clamp，绝不把越界层号
+    /// 写进 GPU 实例（texture array 越界采样是三端未定义行为）。
+    #[test]
+    #[should_panic(expected = "image tile page")]
+    fn image_page_out_of_range_is_rejected_at_encode_time() {
+        let tile = AtlasTile {
+            atlas: AtlasKind::Image,
+            page: crate::paint::atlas::MAX_IMAGE_PAGES,
+            u0: 0.0,
+            v0: 0.0,
+            u1: 1.0,
+            v1: 1.0,
+            generation: 0,
+        };
+        let scene = scene_with(|scene, lane| {
+            assert!(scene.push(
+                lane,
+                Primitive::Image(crate::paint::primitive::Image {
+                    bounds: rect(0.0, 0.0, 4.0, 4.0),
+                    tile,
+                    modulation: Color::WHITE,
+                }),
+            ));
+        });
+        let _ = encode(&scene);
     }
 
     /// D-9-c：图片的 `params1.y` 逐页编码（页 1 写 1.0，不是旧的 `TEXTURE_IMAGE = 1` 巧合值）。

@@ -57,26 +57,32 @@ impl Canvas {
     /// （`render/atlas.rs`，P05）产出，唯一合法调用者是 P06 的文本 painter；应用层要文本请用
     /// `NodeBuilder::text()`。
     ///
-    /// debug 构建断言每个字形的 `tile.atlas == AtlasKind::Glyph`（放错图集 = 采样到图片页）。
+    /// debug 构建断言每个字形来自 glyph 图集且层号为 0（RD-8：gl­yph 图集只有 1 层）。
     ///
-    /// # Panics: none
+    /// # Panics: debug 构建下 run 含非法 tile（放错图集 / 层号非 0）时断言失败
     pub fn push_text(&mut self, run: GlyphRun) {
         debug_assert!(
             run.glyphs
                 .iter()
-                .all(|glyph| glyph.tile.atlas == AtlasKind::Glyph),
-            "glyph run contains a tile from a non-glyph atlas"
+                .all(|glyph| glyph.tile.atlas == AtlasKind::Glyph && glyph.tile.page == 0),
+            "glyph run contains a tile from a non-glyph atlas or non-zero layer"
         );
         self.lane.push(Primitive::GlyphRun(run));
     }
 
-    /// debug 构建断言 `image.tile.atlas == AtlasKind::Image`。
+    /// debug 构建断言 `image.tile.atlas == AtlasKind::Image` 且层号 < `MAX_IMAGE_PAGES`。
     ///
-    /// # Panics: none
+    /// # Panics: debug 构建下 tile 非法（放错图集 / 越界层号）时断言失败
     pub fn push_image(&mut self, image: Image) {
         debug_assert!(
             image.tile.atlas == AtlasKind::Image,
             "image tile must come from the image atlas"
+        );
+        debug_assert!(
+            image.tile.page < crate::paint::atlas::MAX_IMAGE_PAGES,
+            "image tile page {} out of range (MAX_IMAGE_PAGES={})",
+            image.tile.page,
+            crate::paint::atlas::MAX_IMAGE_PAGES
         );
         self.lane.push(Primitive::Image(image));
     }
@@ -383,5 +389,26 @@ mod tests {
         canvas.push_quad(quad());
         let clone = canvas.clone();
         assert_eq!(clone, canvas);
+    }
+
+    /// RD-8：图片 tile 的层号是 texture array 索引，越界层号在编码/采样时是未定义行为，
+    /// 应用层写入口必须在 debug 构建直接拒绝。
+    #[test]
+    #[should_panic(expected = "image tile page")]
+    fn push_image_rejects_out_of_range_atlas_page() {
+        let mut canvas = Canvas::new(bounds());
+        let mut out_of_range = image();
+        out_of_range.tile.page = crate::paint::atlas::MAX_IMAGE_PAGES;
+        canvas.push_image(out_of_range);
+    }
+
+    /// RD-8：glyph 图集只有 1 层（layer 恒 0），非 0 层号的 run 是契约破坏。
+    #[test]
+    #[should_panic(expected = "glyph run contains a tile")]
+    fn push_text_rejects_non_zero_glyph_atlas_page() {
+        let mut canvas = Canvas::new(bounds());
+        let mut run = glyph_run();
+        run.glyphs[0].tile.page = 1;
+        canvas.push_text(run);
     }
 }
