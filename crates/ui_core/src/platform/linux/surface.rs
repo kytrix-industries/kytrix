@@ -112,6 +112,16 @@ struct OutputEntry {
     name: u32,
     /// 最近一次 `wl_output.scale`（协议保证非零正数；本地再 clamp 到 ≥1）。
     scale: i32,
+    /// 最近一次 `wl_output.mode.refresh`（**mHz**；0 = compositor 未给）。
+    ///
+    /// 帧预算门禁（A5）用它得到「每 refresh 最多一帧」的周期。Wayland 的 mode 事件按
+    /// output 上报，混合刷新率双屏下每窗口仍能拿到自己那块屏的周期。
+    refresh_mhz: i32,
+}
+
+/// `wl_output.mode.refresh`（**mHz**）→ 刷新率提示（Hz）。0 / 非正值 = 未知。
+fn refresh_hz_from_millihz(refresh_mhz: i32) -> Option<f32> {
+    (refresh_mhz > 0).then(|| refresh_mhz as f32 / 1000.0)
 }
 
 /// 整数回退的 scale 选择（纯函数，便于单测；V-110）。
@@ -752,6 +762,7 @@ impl WaylandState {
             output,
             name,
             scale: 1,
+            refresh_mhz: 0,
         });
     }
 
@@ -809,6 +820,30 @@ impl WaylandState {
             self.windows[index].integer_scale,
             self.windows[index].entered_once,
         )
+    }
+
+    /// 窗口所在 output 的刷新率提示（A5 / A3：帧预算「每 refresh 最多一帧」的周期来源）。
+    ///
+    /// 优先取窗口**已 enter** 的 output 的最大值（多屏跨不同刷新率时取较大者，避免把窗口卡在
+    /// 较慢那块屏的周期上）；尚未收到 `enter` 时退到全部已绑定 output 的最大值（与整数 scale 的
+    /// 首帧兜底同一策略）。全部未知 ⇒ `None`（`FrameBudget` 保持禁用，退回唤醒即出帧）。
+    pub(crate) fn refresh_hz(&self, index: usize) -> Option<f32> {
+        let entered = self
+            .outputs
+            .iter()
+            .filter(|entry| {
+                self.windows[index]
+                    .surface_outputs
+                    .contains(&entry.output.id())
+            })
+            .filter_map(|entry| refresh_hz_from_millihz(entry.refresh_mhz))
+            .reduce(f32::max);
+        entered.or_else(|| {
+            self.outputs
+                .iter()
+                .filter_map(|entry| refresh_hz_from_millihz(entry.refresh_mhz))
+                .reduce(f32::max)
+        })
     }
 
     /// 当前生效的 scale：fractional 模式下用 `preferred_scale`（未收到时回落到整数 scale），
@@ -1629,13 +1664,22 @@ impl Dispatch<wl_output::WlOutput, u32> for WaylandState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // 只关心整数 scale（`name` 是 bind 时写入的 registry global name，与 entry 一一对应）；
-        // geometry / mode / name / description 都不影响渲染。
-        if let wl_output::Event::Scale { factor } = event {
-            if let Some(entry) = state.outputs.iter_mut().find(|entry| entry.name == *name) {
-                entry.scale = factor.max(1);
+        // 只关心整数 scale 与 mode 的刷新率（`name` 是 bind 时写入的 registry global name，与
+        // entry 一一对应）；geometry / name / description 都不影响渲染。
+        match event {
+            wl_output::Event::Scale { factor } => {
+                if let Some(entry) = state.outputs.iter_mut().find(|entry| entry.name == *name) {
+                    entry.scale = factor.max(1);
+                }
+                state.recompute_all_scales();
             }
-            state.recompute_all_scales();
+            wl_output::Event::Mode { refresh, .. } => {
+                // A5：帧预算的刷新率提示（mHz）。compositor 不发 mode（0）时保持「未知」。
+                if let Some(entry) = state.outputs.iter_mut().find(|entry| entry.name == *name) {
+                    entry.refresh_mhz = refresh;
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -2645,7 +2689,7 @@ fn key_code(evdev: u32) -> KeyCode {
 mod tests {
     use super::{
         CONTINUOUS_AXIS_UNITS_PER_LINE, KeyRepeat, ScrollAccum, choose_integer_scale, key_code,
-        scroll_event,
+        refresh_hz_from_millihz, scroll_event,
     };
     use crate::{
         event::{KeyCode, Modifiers, ScrollPhase, ScrollUnit},
@@ -2792,6 +2836,17 @@ mod tests {
         assert_eq!(choose_integer_scale(None, None, Some(0), 1, false), 1);
         assert_eq!(choose_integer_scale(None, None, None, 0, true), 1);
         assert_eq!(choose_integer_scale(None, None, None, -3, true), 1);
+    }
+
+    /// A5：`wl_output.mode.refresh`（mHz）→ 刷新率提示；0 / 非正值 = compositor 未给，必须
+    /// 按未知处理（`FrameBudget` 据此禁用门禁，绝不能把 0 当周期把帧卡死）。
+    #[test]
+    fn a_wl_output_mode_refresh_becomes_a_frame_budget_hint() {
+        assert_eq!(refresh_hz_from_millihz(60_000), Some(60.0));
+        assert_eq!(refresh_hz_from_millihz(120_000), Some(120.0));
+        assert_eq!(refresh_hz_from_millihz(143_981), Some(143.981));
+        assert_eq!(refresh_hz_from_millihz(0), None, "0 = compositor 未给 mode");
+        assert_eq!(refresh_hz_from_millihz(-60_000), None);
     }
 
     /// R02-1：物理键身份取自 **evdev 码**（布局无关），不是 keysym（布局相关）。

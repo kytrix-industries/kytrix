@@ -829,6 +829,7 @@ mod tests {
             dirty_nodes: Vec::new(),
             repainted: true,
             a11y_only: false,
+            skipped_by_budget: 0,
             paint_log: crate::test_support::record::PaintLog::default(),
             a11y: None,
             presented_latency: None,

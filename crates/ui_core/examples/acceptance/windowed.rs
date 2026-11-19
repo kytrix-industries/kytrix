@@ -179,8 +179,11 @@ impl WindowRun {
         }
     }
 
-    /// 打印报告；返回 `true` = 帧率与抖动都达标。
-    fn report(&self, hz: u32) -> bool {
+    /// 打印报告；返回 `true` = 帧率、抖动与帧预算门禁都达标。
+    ///
+    /// `refresh_hz` = 平台上报的窗口所在 output 刷新率提示（A5；`None` = 平台没给，门禁禁用）；
+    /// `deferrals` = 累计被预算门禁推迟的请求数（证明「合并到下一拍」真的发生过）。
+    fn report(&self, hz: u32, refresh_hz: Option<f32>, deferrals: u64) -> bool {
         let elapsed = self.started.elapsed().as_secs_f64();
         println!();
         println!("-- 帧率与抖动（真机真窗口，commit → commit，驱动 {hz} Hz） --");
@@ -276,6 +279,33 @@ impl WindowRun {
             rms / 1e3,
             verdict(jitter_ok)
         );
+        // A5：帧预算门禁。写入快于刷新时（`--hz` > 刷新率），吞吐必须被钳到刷新率附近，
+        // 且必须观测到推迟（否则说明门禁没生效，UI 帧率 = 写入率）。
+        let budget_ok = match refresh_hz {
+            Some(refresh) if f64::from(hz) > f64::from(refresh) + 1.0 => {
+                let capped = throughput <= f64::from(refresh) + 1.0;
+                println!(
+                    "写入 {hz} Hz > 刷新 {refresh:.1} Hz ⇒ 吞吐钳到 ≤{:.1} fps；实测 {throughput:.2} fps，\
+                     累计推迟 {deferrals} 次 ⇒ {}",
+                    f64::from(refresh) + 1.0,
+                    verdict(capped && deferrals > 0)
+                );
+                capped && deferrals > 0
+            }
+            Some(refresh) => {
+                println!(
+                    "写入 {hz} Hz ≤ 刷新 {refresh:.1} Hz（每 refresh 最多一帧的自然满足）；\
+                     累计推迟 {deferrals} 次"
+                );
+                true
+            }
+            None => {
+                println!(
+                    "刷新率提示不可得（平台未提供）⇒ 帧预算门禁禁用，吞吐仅受平台 present 门禁约束"
+                );
+                true
+            }
+        };
         if hz < 90 {
             println!(
                 "120 Hz 能力           目标频率 60 Hz 下测得抖动 {:.3} ms；\
@@ -286,7 +316,7 @@ impl WindowRun {
                 rms / 1e3
             );
         }
-        fps_ok && jitter_ok
+        fps_ok && jitter_ok && budget_ok
     }
 }
 
@@ -327,6 +357,12 @@ pub fn run_window(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
 
     // 首帧：全量（让窗口先有内容）。
     let _ = app.frame(window);
+    // A5：平台上报的刷新率提示（窗口所在 output）。`None` = 平台没给 ⇒ 预算门禁禁用。
+    let refresh_hz = app.frame_refresh_hz(window);
+    match refresh_hz {
+        Some(hz) => println!("帧预算门禁：刷新率提示 {hz:.1} Hz（写入快于刷新时合并到下一拍）"),
+        None => println!("帧预算门禁：平台未提供刷新率提示 ⇒ 禁用（吞吐仅受 present 门禁约束）"),
+    }
 
     let mut run = WindowRun::new(config);
     let passed = Rc::new(Cell::new(false));
@@ -388,7 +424,9 @@ pub fn run_window(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
         }
         if now >= run.deadline {
             run.finished = true;
-            let ok = run.report(hz);
+            let deferrals = app.frame_budget_deferrals(window);
+            let refresh_hz = app.frame_refresh_hz(window).or(refresh_hz);
+            let ok = run.report(hz, refresh_hz, deferrals);
             result_slot.set(ok);
             stop_pump.store(true, Ordering::Release);
             let _ = app.close_window(window);

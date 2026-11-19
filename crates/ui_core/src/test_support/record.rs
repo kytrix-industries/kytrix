@@ -64,6 +64,11 @@ pub struct FrameRecord {
     /// 本帧是不是 **a11y-only 帧**（R13-6）：只重算 `bind_a11y` 并让泵投递 TreeUpdate，
     /// 没有任何像素工作（`rendered == false`、`damage` 空、`encoded_lanes == 0`）。
     pub a11y_only: bool,
+    /// 本窗口**累计**被帧预算门禁推迟的帧请求数（A5；单调递增）。
+    ///
+    /// 与 `rendered == false` 一起区分「门禁推迟」（脏位保留、下一拍补上）与真正的掉帧：
+    /// 同一 refresh 周期内的多次写入只产生一次提交，其余请求计入本字段。
+    pub skipped_by_budget: u64,
     /// lane 级重建/复用记录。
     pub paint_log: PaintLog,
     /// 本帧产出的一笔 a11y 交付（`None` = 无 a11y 工作，或捕获未打开）。
@@ -239,6 +244,7 @@ impl FrameRecord {
             scanned_nodes: 0,
             repainted: false,
             a11y_only: false,
+            skipped_by_budget: 0,
             paint_log: PaintLog::default(),
             a11y: None,
             presented_latency: None,
@@ -326,6 +332,7 @@ pub(crate) fn capture(
         // 提交帧必然产生了像素（重建 lane / damage / 编码 / 滚动偏移之一）⇒ 发生过重绘。
         repainted: true,
         a11y_only: false,
+        skipped_by_budget: 0,
         paint_log: report.log,
         a11y: None,
         // 呈现时刻在 GPU 完成反馈到达时回填（`Window::poll_renderer`）；录制时还不知道。

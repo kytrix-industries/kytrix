@@ -194,6 +194,12 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                 window.set_buffer_scale(state.buffer_scale(index));
                 // 每轮写入真实的 Wayland buffer 尺寸（`round(逻辑 × scale)`）；同值 no-op。
                 window.set_surface(dpi::physical_size(size_now, scale_now));
+                // A5：帧预算的刷新率提示 = 窗口已 enter 的 output 的当前模式（`wl_output.mode`，
+                // mHz）；compositor 没发 mode 时为 `None` ⇒ 预算门禁保持禁用（退回唤醒即出帧，
+                // Linux 的逐窗口 `wl_callback` 门禁仍然承担 present 节奏）。
+                if let Some(hz) = state.refresh_hz(index) {
+                    window.set_frame_refresh_hz(hz);
+                }
                 // ③ R10-4 / R10-15：compositor 侧的窗口状态（装饰模式、最大化/全屏、可用能力）
                 // 镜像给应用 —— 自绘标题栏据此决定是否画、按钮是否可用。
                 window.set_state(state.window_state(index));
@@ -322,6 +328,16 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                     match app.frame(id) {
                         None | Some(Ok(FrameOutcome::Idle)) => {
                             state.note_frame_not_committed(index);
+                            // A5：本帧被帧预算门禁推迟（不是空闲：脏位保留）⇒ 记进
+                            // `deferred_frames`，到期后**不依赖新唤醒**补一帧（下面的 timeout 会
+                            // 压到 `next_deferred_deadline`）。
+                            if app
+                                .window(id)
+                                .is_some_and(crate::window::Window::frame_budget_deferred)
+                                && !deferred_frames.contains(&id)
+                            {
+                                deferred_frames.push(id);
+                            }
                         }
                         Some(Ok(FrameOutcome::Committed(_))) => {}
                         Some(Err(error)) => return Err(error),
@@ -392,6 +408,12 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             // 一个字符都打不出来）。
             let timeout = match state.next_ime_degrade_in(Instant::now()) {
                 Some(due) => timeout.min(due),
+                None => timeout,
+            };
+            // A5：被帧预算门禁推迟的帧到期后必须自己醒来（不依赖下一次无关事件；与 Windows
+            // 的 FramePacer / macOS 连续帧定时器同义）。
+            let timeout = match app.next_deferred_deadline() {
+                Some(deadline) => timeout.min(deadline.saturating_duration_since(Instant::now())),
                 None => timeout,
             };
             // 应用自己关窗（Esc / 标题栏关闭按钮）后不能停在下面 1h 的空闲等待里。

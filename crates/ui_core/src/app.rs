@@ -1503,6 +1503,20 @@ impl App {
         animation::needs_continuous_frames(self)
     }
 
+    /// 是否有窗口的帧请求正被预算门禁推迟（A5）：平台据此挂一次性唤醒。
+    pub(crate) fn has_deferred_frames(&self) -> bool {
+        self.windows()
+            .any(|(_, window)| window.frame_budget_deferred())
+    }
+
+    /// 所有被推迟帧里最早的放行时刻（A5）：Linux calloop timeout 的到期时刻。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn next_deferred_deadline(&self) -> Option<Instant> {
+        self.windows()
+            .filter_map(|(_, window)| window.frame_budget_deadline())
+            .min()
+    }
+
     fn mark_nodes_paint(&mut self, window: WindowId, nodes: &[NodeId]) {
         animation::mark_nodes_paint(self, window, nodes)
     }
@@ -1817,12 +1831,42 @@ impl App {
     /// 完整帧：`refresh_styles` → `refresh_text` → `compute_layout`（仅 LAYOUT 脏）→ `layout_text`
     /// → paint → commit。
     ///
+    /// 入口有「每 refresh 周期最多一帧」的预算门禁（A5）：同一刷新周期内的重复请求返回
+    /// `Ok(FrameOutcome::Idle)`（脏位保留，平台一次性唤醒到期后补帧，最多晚 1 个 vsync）。
+    /// 需要**立即**出帧的路径（resize / 拖动 / 系统模态循环 / 动画 tick）使用
+    /// `App::frame_forced`（force 通道，绕过预算）。
+    ///
     /// 返回 `None` = 窗口不存在（**不**消费 wake 请求）；`Ok(FrameOutcome::Idle)` = 空闲零帧（I3，
     /// 不提交、`FrameIndex` 不变）；`Err` = 本帧已中止（damage/dirty 保留，下一帧重试）。
     ///
     /// 产品路径：含 `bind_style`/`bind_text` 的窗口只能走这里；`Window::frame` 是它的无 App 通道版本。
     pub fn frame(&mut self, window: WindowId) -> Option<Result<FrameOutcome, EngineError>> {
-        frame::frame(self, window)
+        frame::frame(self, window, false)
+    }
+
+    /// 窗口所在 output 的刷新率提示（A5 诊断面；`None` = 平台没给 / headless）。
+    #[must_use]
+    pub fn frame_refresh_hz(&self, window: WindowId) -> Option<f32> {
+        self.window(window).and_then(Window::frame_refresh_hz)
+    }
+
+    /// 该窗口累计被帧预算门禁推迟的请求数（A5 验收诊断；单调递增）。
+    #[must_use]
+    pub fn frame_budget_deferrals(&self, window: WindowId) -> u64 {
+        self.window(window)
+            .map_or(0, Window::frame_budget_deferrals)
+    }
+
+    /// 完整帧（force 通道）：绕过入口的帧预算门禁，立即出帧。
+    ///
+    /// 消费者（`crate` 内）：Windows `ResizeFrameDriver`（系统 size / move 模态循环里每条
+    /// `WM_SIZE` 必须立刻重排重绘）、macOS 连续帧定时器（display link 节拍的 tick 已经代表
+    /// 「这一拍该出帧」）。普通唤醒路径不得使用：否则 `--hz 240` 的写入会绕过预算。
+    pub(crate) fn frame_forced(
+        &mut self,
+        window: WindowId,
+    ) -> Option<Result<FrameOutcome, EngineError>> {
+        frame::frame(self, window, true)
     }
 
     /// 中止本帧（不结算、不递增 `FrameIndex`）。

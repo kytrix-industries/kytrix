@@ -20,10 +20,27 @@ pub(crate) fn record(window: &Window) -> Option<&FrameRecord> {
 /// 记录一次空闲帧（不提交、序号不变）。
 #[cfg(feature = "test-support")]
 pub(crate) fn record_idle(window: &mut Window) {
-    window.record = Some(FrameRecord::idle(
+    let mut record = FrameRecord::idle(
         FrameIndex(window.scheduler.committed()),
         std::mem::take(&mut window.stats),
-    ));
+    );
+    record.skipped_by_budget = window.frame_budget_deferrals();
+    window.record = Some(record);
+}
+
+// 消费者：`impl Window::record_budget_deferred` 的薄委托（外部调用点见该方法文档）。
+/// 记录一次「被帧预算门禁推迟」的请求（A5）：空闲帧 + 累计推迟计数。
+///
+/// 与 [`record_idle`] 的区别只有 `skipped_by_budget` 的可断言性：它证明「帧没有丢，只是被
+/// 合并到下一拍」，而不是掉帧（`FrameIndex` 不变、脏位保留）。
+#[cfg(feature = "test-support")]
+pub(crate) fn record_budget_deferred(window: &mut Window) {
+    let mut record = FrameRecord::idle(
+        FrameIndex(window.scheduler.committed()),
+        std::mem::take(&mut window.stats),
+    );
+    record.skipped_by_budget = window.frame_budget_deferrals();
+    window.record = Some(record);
 }
 
 // 消费者：`impl Window::record_a11y_only_frame` 的薄委托（外部调用点见该方法文档）。

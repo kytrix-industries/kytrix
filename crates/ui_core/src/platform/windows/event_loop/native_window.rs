@@ -57,6 +57,8 @@ pub(super) fn sync_native_windows(
         let mut native = NativeWindow::create(id, &options, dispatcher.clone(), Some(app_cell))?;
         let client = native.client_size();
         let renderer = Renderer::new_for_hwnd(native.composition(), client, options.background)?;
+        // A5：帧预算的刷新率提示（窗口所在 output；查询失败 ⇒ 门禁保持禁用）。
+        let refresh_hz = native.refresh_hz();
         if let Some(window) = app.window_mut(id) {
             // `set_renderer` 先清空图集页记账（新渲染器 = 一套空纹理 ⇒ 两张页都要整页重传），
             // `set_surface` 会把 `full_damage_pending` 置位（新交换链/持久目标必须整帧）。
@@ -64,6 +66,9 @@ pub(super) fn sync_native_windows(
             window.set_scale(native.scale());
             window.set_size(native.logical_size());
             window.set_surface(client);
+            if let Some(hz) = refresh_hz {
+                window.set_frame_refresh_hz(hz);
+            }
         }
         {
             let target = native.composition();
@@ -269,8 +274,13 @@ pub(super) fn apply_event(
             // 建议矩形（R07-12），这里只做记账与渲染目标更新（P1-2a：内容重画由 GPU 线程按
             // 新 surface 做，UI 线程不等待）。
             native.note_scale(scale, dpi);
+            // A5：窗口可能刚被系统搬到另一块显示器，刷新率提示跟着重查。
+            let refresh_hz = native.refresh_hz();
             if let Some(window) = app.window_mut(id) {
                 window.set_scale(scale);
+                if let Some(hz) = refresh_hz {
+                    window.set_frame_refresh_hz(hz);
+                }
                 // 最小化时 `GetClientRect` 是 0×0（`client_size()` 会钳成 1×1）：跳过 `set_surface`，
                 // 目标保持上一次平台写入的真实客户区；恢复窗口的 `WM_SIZE` 会用新客户区覆盖它。
                 //

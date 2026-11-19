@@ -2,6 +2,8 @@
 //!
 //! `app.rs` 的 `impl App` 只保留同名薄委托，方法体在这里（零行为变更的纯拆分）。
 
+use std::time::Instant;
+
 use super::App;
 #[cfg(feature = "hud")]
 use crate::debug_hud;
@@ -13,7 +15,6 @@ use crate::{
     error::EngineError,
     window::{FrameOutcome, FrameTicket, Window, WindowId},
 };
-
 /// 取走「需要一帧」的请求位（取走即清零）。
 ///
 /// 消费者：`App::take_wake_request`（**crate 内部**：R01-16 起不再公开，应用的入口是
@@ -42,12 +43,21 @@ pub(crate) fn request_frame(app: &mut App) {
 /// 完整帧：`refresh_styles` → `refresh_text` → `compute_layout`（仅 LAYOUT 脏）→ `layout_text`
 /// → paint → commit。
 ///
+/// `forced`：本帧走 **force 通道**（resize / 拖动 / 系统模态循环 / 动画 tick 等必须立即出帧
+/// 的路径），绕过 [`App::frame`] 入口的「每 refresh 周期最多一帧」预算门禁（A5）。普通唤醒
+/// （输入 / 行情写入 / 任务回投）传 `false`：快于刷新的请求合并到下一拍，最多晚 1 个 vsync。
+///
 /// 返回 `None` = 窗口不存在（**不**消费 wake 请求）；`Ok(FrameOutcome::Idle)` = 空闲零帧（I3，
-/// 不提交、`FrameIndex` 不变）；`Err` = 本帧已中止（damage/dirty 保留，下一帧重试）。
+/// 不提交、`FrameIndex` 不变）或本帧被预算门禁推迟（状态保留，平台一次性唤醒会补一帧）；
+/// `Err` = 本帧已中止（damage/dirty 保留，下一帧重试）。
 ///
 /// 产品路径：含 `bind_style`/`bind_text` 的窗口只能走这里；`Window::frame` 是它的无 App 通道版本。
-/// 消费者：`App::frame`。
-pub(crate) fn frame(app: &mut App, window: WindowId) -> Option<Result<FrameOutcome, EngineError>> {
+/// 消费者：`App::frame`（预算门禁）/ `App::frame_forced`（force 通道）。
+pub(crate) fn frame(
+    app: &mut App,
+    window: WindowId,
+    forced: bool,
+) -> Option<Result<FrameOutcome, EngineError>> {
     if !app.windows.contains_key(&window) {
         return None;
     }
@@ -103,6 +113,28 @@ pub(crate) fn frame(app: &mut App, window: WindowId) -> Option<Result<FrameOutco
     if !needs_frame {
         app.record_idle(window);
         return Some(Ok(FrameOutcome::Idle));
+    }
+    // A5：每 refresh 周期最多一帧的预算门禁（force 通道绕过）。位置在 `needs_frame` 之后：
+    // 只有**真的有事情要做**的帧才配一次预算名额 —— 空闲帧（I3）在这里之前已经返回，
+    // 不会被记成「推迟」而让平台误挂一次性唤醒（空闲时零唤醒不变式）。
+    //
+    // 被推迟时脏位 / damage 保持原样，**不**结算、不递增 `FrameIndex`：平台的一次性
+    // 唤醒（Windows `FramePacer` / macOS 连续帧定时器 / Linux calloop timeout）到期后会再走一次
+    // `App::frame`，那一帧补上本次状态（最多晚 1 个 vsync，用户裁决允许）。
+    let now = Instant::now();
+    let admits = app
+        .windows
+        .get(&window)
+        .is_none_or(|candidate| candidate.frame_budget_admits(now, forced));
+    if !admits {
+        if let Some(target) = app.windows.get_mut(&window) {
+            target.note_frame_budget_deferred();
+        }
+        record_budget_deferred(app, window);
+        return Some(Ok(FrameOutcome::Idle));
+    }
+    if let Some(target) = app.windows.get_mut(&window) {
+        target.note_frame_start(now);
     }
     let Some(ticket) = app.windows.get_mut(&window).and_then(Window::begin_frame) else {
         return Some(Ok(FrameOutcome::Idle));
@@ -305,4 +337,154 @@ pub(crate) fn record_idle(app: &mut App, window: WindowId) {
     }
     #[cfg(not(feature = "test-support"))]
     let _ = (app, window);
+}
+
+/// 记录一次「被预算门禁推迟」的帧请求（仅 `test-support`；其余构建是空操作）。
+///
+/// 与空闲帧分开记录：`FrameRecord::skipped_by_budget` 让测试能区分「门禁推迟」与「掉帧」，
+/// 这是 A5 的可断言面（P1A-5d）。
+pub(crate) fn record_budget_deferred(app: &mut App, window: WindowId) {
+    #[cfg(feature = "test-support")]
+    if let Some(target) = app.windows.get_mut(&window) {
+        target.record_budget_deferred();
+    }
+    #[cfg(not(feature = "test-support"))]
+    let _ = (app, window);
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod tests {
+    use std::time::Duration;
+
+    use crate::{
+        app::App,
+        math::{Rect, Scale, Size},
+        node::builder::NodeBuilder,
+        paint::style::{PaintSpec, StylePatch},
+        window::{FrameOutcome, WindowOptions},
+    };
+
+    /// 建一个 headless App + 一个可重复失效的绑定节点（每次 `write` 都产生一帧真正的像素工作）。
+    fn app_with_bound_node() -> (
+        App,
+        crate::window::WindowId,
+        crate::node::signal::Signal<u8>,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let mut app = App::new(runtime.handle().clone());
+        let window = app.create_window(WindowOptions {
+            title: smol_str::SmolStr::new_static("frame budget"),
+            size: Size::new(400.0, 300.0),
+            scale: Scale::ONE,
+            ..WindowOptions::default()
+        });
+        let root = app.window(window).expect("窗口存在").tree().root();
+        let value = app.signal(0u8);
+        let source = value;
+        let _node = NodeBuilder::boxed()
+            .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
+            .paint(PaintSpec {
+                background: crate::paint::color::Color::WHITE,
+                ..PaintSpec::default()
+            })
+            .bind_style(move |cx| StylePatch {
+                opacity: Some(f32::from(*cx.read(&source)) / 255.0),
+                ..StylePatch::default()
+            })
+            .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
+            .expect("绑定节点");
+        (app, window, value)
+    }
+
+    fn committed(outcome: Option<Result<FrameOutcome, crate::error::EngineError>>) -> bool {
+        matches!(outcome, Some(Ok(FrameOutcome::Committed(_))))
+    }
+
+    /// **P1A-5a 的核心断言**：同一 refresh 周期内的第二次请求被预算门禁合并成 `Idle`（脏位保留、
+    /// `FrameIndex` 不变、没有掉帧），到期后同一份状态补出一帧；force 通道绕过门禁。
+    ///
+    /// 变异守卫：删掉 `app/frame.rs` 里的预算门禁（`frame_budget_admits` 分支）后，第二次调用会
+    /// 直接 `Committed`，本测试必须变红。
+    #[test]
+    fn a_second_request_inside_one_refresh_period_is_deferred_then_resumed() {
+        let (mut app, window, value) = app_with_bound_node();
+        // 注入确定的 200 ms 周期：真实刷新率受机器负载影响，首帧偶发超过一个周期会让本测试
+        // 变成测调度抖动（该机制本身用 24–480 Hz 的提示驱动，见 `window::frame_budget` 的
+        // 单测）。
+        app.window_mut(window)
+            .expect("窗口存在")
+            .set_frame_budget_test_interval(Duration::from_millis(200));
+
+        // 首帧：有真实像素工作 ⇒ 提交。
+        assert!(app.write(&value, 255));
+        assert!(committed(app.frame(window)), "首帧必须提交");
+        let first_index = app.window(window).expect("窗口存在").frame_index();
+        assert_eq!(app.frame_budget_deferrals(window), 0);
+
+        // 同一 refresh 周期内的第二次请求：推迟成 Idle。
+        assert!(app.write(&value, 128));
+        let deferred = app.frame(window);
+        assert!(
+            matches!(deferred, Some(Ok(FrameOutcome::Idle))),
+            "同一 refresh 周期内的第二次请求必须被推迟"
+        );
+        assert_eq!(
+            app.window(window).expect("窗口存在").frame_index(),
+            first_index,
+            "推迟不递增 FrameIndex（不是提交帧）"
+        );
+        assert_eq!(app.frame_budget_deferrals(window), 1, "推迟计数必须可观测");
+        let record = app
+            .window(window)
+            .expect("窗口存在")
+            .record()
+            .expect("推迟也必须有帧记录")
+            .clone();
+        assert_eq!(record.skipped_by_budget, 1);
+        assert!(!record.rendered, "推迟记录不是提交帧");
+
+        // force 通道（resize / 拖动 / 动画 tick）：绕过预算，立即提交同一份状态。
+        let forced = app.frame_forced(window);
+        assert!(committed(forced), "force 通道必须绕过帧预算门禁");
+        assert!(
+            app.window(window).expect("窗口存在").frame_index() > first_index,
+            "force 帧必须真正提交"
+        );
+        // force 帧推进了相位：紧接着的普通请求又被合并。
+        assert!(app.write(&value, 64));
+        assert!(matches!(app.frame(window), Some(Ok(FrameOutcome::Idle))));
+
+        // 等到下一拍：同一份脏状态无需新写入即可补出一帧（P1A-5a 的「状态写入合并到下一 tick」）。
+        std::thread::sleep(Duration::from_millis(220));
+        assert!(
+            committed(app.frame(window)),
+            "下一拍必须把被推迟的状态补上（不是丢帧）"
+        );
+
+        // 空闲帧不参与预算：没有工作时不记推迟（I3「空闲零帧」不变式）。
+        let before = app.frame_budget_deferrals(window);
+        assert!(matches!(app.frame(window), Some(Ok(FrameOutcome::Idle))));
+        assert_eq!(
+            app.frame_budget_deferrals(window),
+            before,
+            "空闲帧不是预算推迟，不得虚增计数"
+        );
+    }
+
+    /// **P1A-5b**：没有刷新率提示（headless / compositor 未提供）时门禁禁用，行为与 HEAD 一致。
+    #[test]
+    fn an_unknown_refresh_rate_leaves_the_frame_path_ungated() {
+        let (mut app, window, value) = app_with_bound_node();
+        assert_eq!(app.frame_refresh_hz(window), None);
+        assert!(app.write(&value, 255));
+        assert!(committed(app.frame(window)));
+        assert!(app.write(&value, 128));
+        assert!(
+            committed(app.frame(window)),
+            "刷新率未知时不得卡帧（退回唤醒即出帧）"
+        );
+        assert_eq!(app.frame_budget_deferrals(window), 0);
+    }
 }

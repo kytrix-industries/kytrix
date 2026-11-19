@@ -368,6 +368,8 @@ pub(crate) fn run(mut app: App) -> Result<(), EngineError> {
         let mut native = NativeWindow::create(id, &options, dispatcher.clone(), Some(&app))?;
         let client = native.client_size();
         let renderer = Renderer::new_for_hwnd(native.composition(), client, options.background)?;
+        // A5：帧预算的刷新率提示（窗口所在 output；查询失败 ⇒ 门禁保持禁用）。
+        let refresh_hz = native.refresh_hz();
         {
             let mut app = app.borrow_mut();
             if let Some(window) = app.window_mut(id) {
@@ -376,6 +378,9 @@ pub(crate) fn run(mut app: App) -> Result<(), EngineError> {
                 window.set_size(native.logical_size());
                 // 渲染目标就是真实客户区：逻辑尺寸取整后的 covering 值可能比它大 1 px。
                 window.set_surface(client);
+                if let Some(hz) = refresh_hz {
+                    window.set_frame_refresh_hz(hz);
+                }
             }
         }
         // 首帧已经由 `new_for_hwnd` prime 并 present（内容层与背景层都已 attach；客户区在第一次
@@ -677,14 +682,18 @@ pub(super) fn pump_loop(
         }
         apply_interaction_actions(actions);
 
-        // ②d 帧节奏：合成器节拍线程（只在需要连续帧时存在）+ a11y 补发兜底定时器。
-        let (continuous, a11y_pending) = {
+        // ②d 帧节奏：合成器节拍线程（连续帧 **或** 有被预算推迟的帧时存在）+ a11y 补发兜底定时器。
+        let (continuous, deferred, a11y_pending) = {
             let app = app_cell.borrow();
-            (app.needs_continuous_frames(), app.a11y_retry_pending())
+            (
+                app.needs_continuous_frames(),
+                app.has_deferred_frames(),
+                app.a11y_retry_pending(),
+            )
         };
         if let Some(native) = windows.first_mut() {
             let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
-            pacer.sync(continuous, hwnd, dispatcher);
+            pacer.sync(continuous || deferred, hwnd, dispatcher);
             // 定时器随宿主窗口销毁而失效：宿主已不是当前首窗 ⇒ 清掉记录，下面在新首窗重建
             //（否则首窗关闭后其余窗口的 a11y 补发永远不再触发，P2-4）。
             if a11y_timer.is_some_and(|owner| owner != native.id()) {
@@ -725,6 +734,22 @@ pub(super) fn pump_loop(
         if dispatcher.take_frame_wake() {
             let mut app = app_cell.borrow_mut();
             frame_all(&mut app, windows)?;
+        }
+
+        // ④a 帧预算推迟的一次性唤醒（A5）：帧被预算门禁推迟时，泵不能阻塞在 `GetMessageW`
+        // 上等下一次无关消息 —— 立即让节拍线程在下一个合成器节拍唤醒泵。节拍线程的生命周期
+        // 从「仅连续帧」扩展为「连续帧 **或** 有被推迟的帧」；两者都没有时线程不存在
+        // （空闲零唤醒不变式，I3）。
+        let (continuous, deferred) = {
+            let app = app_cell.borrow();
+            (app.needs_continuous_frames(), app.has_deferred_frames())
+        };
+        match windows.first_mut() {
+            Some(native) => {
+                let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
+                pacer.sync(continuous || deferred, hwnd, dispatcher);
+            }
+            None => pacer.sync(false, HWND::default(), dispatcher),
         }
 
         // ④′ a11y：纯 `A11Y` 变化不会提交帧（`FrameOutcome::Idle`），所以**每轮**都要给 adapter

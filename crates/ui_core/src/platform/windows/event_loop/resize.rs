@@ -128,7 +128,9 @@ impl ResizeFrameDriver {
                 return Some(error);
             }
         }
-        match app.frame(self.window) {
+        // A5：系统 size / move 模态循环里的每一步必须**立即**出帧（force 通道，绕过
+        // 「每 refresh 最多一帧」的预算门禁）：拖动边框时用户期望内容跟手，而不是被合并到下一拍。
+        match app.frame_forced(self.window) {
             Some(Ok(_)) | None => None,
             Some(Err(error)) => Some(error),
         }

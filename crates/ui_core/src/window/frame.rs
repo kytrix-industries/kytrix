@@ -318,7 +318,7 @@ pub(crate) fn commit_frame(
             window.stats.scroll_offset_frames = report.scroll_slots;
         }
         let stats = std::mem::take(&mut window.stats);
-        let record = crate::test_support::record::capture(
+        let mut record = crate::test_support::record::capture(
             &window.scene,
             &window.tree,
             &window.resolver,
@@ -329,6 +329,8 @@ pub(crate) fn commit_frame(
             stats,
             window.tree.scanned_nodes(),
         );
+        // A5：累计被预算推迟的帧请求数（区分「门禁推迟」与「掉帧」的可断言面）。
+        record.skipped_by_budget = window.frame_budget_deferrals();
         window.record = Some(record);
     }
     FrameOutcome::Committed(index)

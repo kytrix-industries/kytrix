@@ -15,7 +15,10 @@ use std::{
 
 use windows::Win32::{
     Foundation::{HWND, RECT},
-    Graphics::Gdi::HBRUSH,
+    Graphics::Gdi::{
+        DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW, GetMonitorInfoW, HBRUSH,
+        MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromWindow,
+    },
     System::LibraryLoader::GetModuleHandleW,
     UI::WindowsAndMessaging::*,
 };
@@ -43,6 +46,15 @@ const CLASS_NAME: &str = "KytrixGuiWindow";
 fn load_arrow_cursor() -> HCURSOR {
     // SAFETY: 共享的系统光标句柄（进程不拥有）；`IDC_ARROW` 是静态常量。
     unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default()
+}
+
+/// `DEVMODEW.dmDisplayFrequency` → 帧预算的刷新率提示（纯函数，可单测）。
+///
+/// MS 文档：`dmDisplayFrequency` 为 **0** = 硬件默认、**1** = 显示器的默认/由驱动决定的速率 ——
+/// 两者都不是可用的周期值，按「未知」返回 `None`。其余值原样透传，由
+/// [`crate::window`] 的 `FrameBudget` 再做 24–480 Hz 的合法性校验（超范围同样禁用门禁）。
+fn refresh_hz_from_display_frequency(frequency: u32) -> Option<f32> {
+    (frequency > 1).then_some(frequency as f32)
 }
 
 /// 一个原生窗口（`Application::run` 持有；`Drop` 时销毁）。
@@ -176,6 +188,51 @@ impl NativeWindow {
     /// 创建者传入的窗口 id。
     pub(crate) fn id(&self) -> WindowId {
         self.id
+    }
+
+    /// 窗口**当前所在 output** 的刷新率（Hz；A5 的帧预算提示，A3 per-output 收尾）。
+    ///
+    /// 查询链：`MonitorFromWindow(MONITOR_DEFAULTTONEAREST)` → `GetMonitorInfoW` 取设备名 →
+    /// `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)` 的 `dmDisplayFrequency`。这是窗口所在显示器
+    /// 的**当前模式**，不是桌面级主屏 —— MS 文档明确 DXGI swapchain 只用主屏 cadence
+    /// （`render/windows/swapchain.rs` 的 waitable 因此是主屏相位），而 UI 侧的预算门禁用
+    /// **本窗口**所在 output 的周期才符合「每 refresh 最多一帧」。
+    ///
+    /// 任一系统调用失败 ⇒ `None`（平台如实不提供；`Window` 侧据此禁用门禁，退回唤醒即出帧）。
+    /// 只在窗口创建 / 显示恢复 / DPI 变化时调用：稳态泵不做系统调用（R07-11 纪律）。
+    pub(crate) fn refresh_hz(&self) -> Option<f32> {
+        // SAFETY: `self.hwnd` 是仍然存活的本进程窗口（`NativeWindow` 独占）；`MONITORINFOEXW`
+        // 的 `cbSize` 按结构体大小填写（`GetMonitorInfoW` 的必需输入）；设备名由系统写入
+        // `szDevice`（NUL 结尾），只读传给 `EnumDisplaySettingsW`。
+        let monitor = unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST) };
+        let mut info = MONITORINFOEXW {
+            monitorInfo: MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        if !unsafe { GetMonitorInfoW(monitor, &mut info.monitorInfo) }.as_bool() {
+            return None;
+        }
+        let mut devmode = DEVMODEW {
+            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+            ..Default::default()
+        };
+        // SAFETY: `info.szDevice` 由 `GetMonitorInfoW` 写成 NUL 结尾的设备名；`devmode` 已填
+        // `dmSize`（`EnumDisplaySettingsW` 的必需输入），只写本函数栈上的结构体。
+        if !unsafe {
+            EnumDisplaySettingsW(
+                windows::core::PCWSTR(info.szDevice.as_ptr()),
+                ENUM_CURRENT_SETTINGS,
+                &mut devmode,
+            )
+        }
+        .as_bool()
+        {
+            return None;
+        }
+        refresh_hz_from_display_frequency(devmode.dmDisplayFrequency)
     }
 
     /// 当前 DPI 比例。
@@ -405,6 +462,10 @@ impl NativeWindow {
         let Some(window) = app.window_mut(self.id) else {
             return;
         };
+        // A5：显示 / 电源恢复后刷新率提示也要重查（换屏 / 改刷新率 / 唤醒后模式重置）。
+        if let Some(hz) = self.refresh_hz() {
+            window.set_frame_refresh_hz(hz);
+        }
         // 比例以**平台真值 vs `Window` 现值**比较：拓扑变化不一定改 DPI，而 `set_scale`
         // 会整树重排 + 全部文本重新 shape，不该白付这份代价（同值不写）。
         if window.scale() != scale {
@@ -514,14 +575,13 @@ fn wide(text: &str) -> Vec<u16> {
 mod tests {
     use windows::Win32::UI::Input::Ime::{ImmGetContext, ImmReleaseContext};
 
-    use super::NativeWindow;
+    use super::{NativeWindow, refresh_hz_from_display_frequency};
     use crate::{
         app::App,
         math::{Rect, Scale, Size},
         platform::dispatcher::Dispatcher,
         window::WindowOptions,
     };
-
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -634,5 +694,53 @@ mod tests {
             native.logical_size(),
             "恢复必须重新查询客户区并写回逻辑尺寸"
         );
+    }
+
+    /// A5：刷新率提示的解析 —— `dmDisplayFrequency` 的 0 / 1 是「硬件默认 / 驱动决定」，
+    /// 不是可用周期，必须按未知处理（否则会把 1 Hz 当成刷新率把帧卡死）。
+    #[test]
+    fn a_display_mode_frequency_becomes_a_refresh_hint() {
+        assert_eq!(refresh_hz_from_display_frequency(60), Some(60.0));
+        assert_eq!(refresh_hz_from_display_frequency(144), Some(144.0));
+        assert_eq!(
+            refresh_hz_from_display_frequency(0),
+            None,
+            "0 = 硬件默认，不可用"
+        );
+        assert_eq!(
+            refresh_hz_from_display_frequency(1),
+            None,
+            "1 = 驱动决定，不可用"
+        );
+    }
+
+    /// A5：真实窗口的刷新率查询必须在 Windows 本机给出**合理值**（24–480 Hz）。
+    ///
+    /// 环境（远程桌面 / 无显示器会话）可能查不到 ⇒ `None` 也是合法结果；有值时必须是真实
+    /// 刷新率量级，不能是 0 / 1 / 垃圾值。变异：把 `refresh_hz_from_display_frequency` 改成恒
+    /// `Some(frequency as f32)` 后，本测试在 `dmDisplayFrequency = 0` 的会话上会失败。
+    #[test]
+    fn a_real_window_reports_a_plausible_refresh_rate() {
+        let options = WindowOptions::default();
+        let native = NativeWindow::create(
+            crate::window::WindowId::for_test(1),
+            &options,
+            Dispatcher::new(),
+            None,
+        )
+        .expect("NativeWindow::create");
+        match native.refresh_hz() {
+            None => {}
+            Some(hz) => {
+                assert!(
+                    (24.0..=480.0).contains(&hz),
+                    "刷新率提示必须是真实量级：{hz}"
+                );
+                assert!(
+                    hz.fract() == 0.0,
+                    "EnumDisplaySettings 的频率是整数 Hz：{hz}"
+                );
+            }
+        }
     }
 }

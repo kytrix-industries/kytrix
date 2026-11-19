@@ -281,6 +281,8 @@ fn open_window(
         window.set_size(native.logical_size());
         // `set_size` 不再重算平台真值；这里写入 AppKit 的真实 backing。
         window.set_surface(size);
+        // A5：帧预算的刷新率提示 = 窗口所在屏的 `maximumFramesPerSecond`（ProMotion 120 也覆盖）。
+        window.set_frame_refresh_hz(native.maximum_frames_per_second());
     }
     Ok(native)
 }
@@ -357,18 +359,25 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
     app.run_frame_hook();
     // 连续帧的节奏由定时器（observer 每轮一次）提供；`tick` 为真时直接出帧，不再写回
     // `Dispatcher::wake`。source/observer 路径只响应显式 wake（输入、任务、应用请求）。
+    //
+    // A5：`tick` 是 display link 节拍的 tick（定时器只在需要连续帧 / 有预算推迟帧 / a11y 补发
+    // 时挂着），因此 tick 驱动的连续帧走 **force 通道**（这一拍本来就该出帧，不能又被预算合并
+    // 一拍）；预算推迟的帧走普通通道（tick 到期时预算门禁已经放行）。
+    let continuous = app.needs_continuous_frames();
+    let deferred = app.has_deferred_frames();
     let wake = state.dispatcher.take_frame_wake();
-    if wake || changed || (tick && app.needs_continuous_frames()) {
-        frame_all(app, &state.windows)?;
+    if wake || changed || (tick && (continuous || deferred)) {
+        frame_all(app, &state.windows, tick && continuous)?;
     }
 
     // display link 的节奏（§5.3 + R09-9）：连续帧 / 有帧要画 / 有在飞帧时恢复，否则暂停
     // （空闲 0 唤醒）。**不可见**（最小化 / 应用隐藏 / 被完全遮挡）时无条件停帧 —— 那三种
     // 状态下窗口一个像素都不显示，却会产生帧请求把 display link 永久钉在 120 Hz。
-    let continuous = app.needs_continuous_frames();
     for native in state.windows.iter() {
         let visible = native.is_visible();
         if let Some(window) = app.window_mut(native.id()) {
+            // A5：窗口可能被拖到另一块屏（刷新率不同）⇒ 每轮泵更新预算提示（同值幂等）。
+            window.set_frame_refresh_hz(native.maximum_frames_per_second());
             window.sync_pacing(continuous && visible);
         }
     }
@@ -398,9 +407,12 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
     }
 
     // 连续帧定时器：只有动画在跑才挂（P-C 起 HUD 是纯观察者、不再是帧源；其余时间空闲零唤醒）。
+    // A5：被预算门禁推迟的帧也要一个一次性唤醒（定时器到下一拍时泵会走 `tick` 分支出帧）。
     if let Some(native) = state.windows.first() {
         // a11y 到期补发也借用这个定时器（同 Windows）：到期交付后自动停表。
-        native.set_animating(app.needs_continuous_frames() || app.a11y_retry_pending());
+        native.set_animating(
+            app.needs_continuous_frames() || app.has_deferred_frames() || app.a11y_retry_pending(),
+        );
     }
 
     // R09-16：退出握手。Dock 退出 / osascript / Cmd+Q 都汇到 `applicationShouldTerminate:`，
@@ -508,12 +520,20 @@ fn sync_native_windows(
 /// **不可见窗口不产帧**（R09-9）：不 publish ⇒ 渲染器的 `pending_frame` 保持为假 ⇒
 /// `pacing_paused()` 才有机会为真，display link 才会真正停下来。恢复可见时
 /// `NativeWindow::sync_state` 置全量 damage 并请求一帧。
-fn frame_all(app: &mut App, windows: &[NativeWindow]) -> Result<(), EngineError> {
+///
+/// `force` = 本帧由 display link 节拍 tick 驱动（force 通道，绕过 A5 的帧预算门禁）；
+/// 普通唤醒路径传 `false`。
+fn frame_all(app: &mut App, windows: &[NativeWindow], force: bool) -> Result<(), EngineError> {
     for native in windows {
         if !native.is_visible() {
             continue;
         }
-        match app.frame(native.id()) {
+        let outcome = if force {
+            app.frame_forced(native.id())
+        } else {
+            app.frame(native.id())
+        };
+        match outcome {
             None | Some(Ok(_)) => {}
             Some(Err(error)) => return Err(error),
         }

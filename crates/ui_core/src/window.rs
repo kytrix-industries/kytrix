@@ -6,6 +6,7 @@
 mod a11y;
 mod focus;
 mod frame;
+mod frame_budget;
 mod paint;
 mod record;
 mod scale;
@@ -392,6 +393,8 @@ pub struct Window {
     buffer_scale: i32,
     /// DPI 代际：`set_scale` 递增；`App::refresh_text` 用它判定「图集要换代」（P05）。
     scale_epoch: u32,
+    /// 每 refresh 周期最多一帧的预算门禁（A5；实现见 `frame_budget` 子模块）。
+    frame_budget: frame_budget::FrameBudget,
     /// 帧调度（`Idle / Pending / Draining`；`FrameIndex` 只在提交时递增）。
     scheduler: FrameScheduler,
     /// 合成器（**inline 模式**持有编码器：headless / 离屏 / 单测）。
@@ -527,6 +530,7 @@ impl Window {
             #[cfg(target_os = "linux")]
             buffer_scale: 1,
             scale_epoch: 0,
+            frame_budget: frame_budget::FrameBudget::default(),
             scheduler: FrameScheduler::new(),
             composer: Some(WindowComposer::new()),
             pending_delta: None,
@@ -729,6 +733,54 @@ impl Window {
     // ── frame：实现见 `frame` 子模块的自由函数 ──
     pub(crate) fn needs_frame(&self, wake: bool) -> bool {
         frame::needs_frame(self, wake)
+    }
+    // ── frame_budget：实现见 `frame_budget` 子模块的自由函数 ──
+
+    /// 平台层注入「窗口所在 output」的刷新率提示（A5；`None` / 非法值 ⇒ 门禁禁用）。
+    ///
+    /// 消费者：三端事件循环（Windows 逐窗口显示器查询 / macOS `NSScreen` 的
+    /// `maximumFramesPerSecond` / Linux `wl_output.mode`）。只在提示变化时调用即可
+    /// （同值写入是幂等的）。
+    pub(crate) fn set_frame_refresh_hz(&mut self, hz: f32) {
+        self.frame_budget.set_refresh_hz(hz);
+    }
+    /// 当前生效的刷新率提示（诊断 / 验收；未知 = `None`）。
+    #[must_use]
+    pub(crate) fn frame_refresh_hz(&self) -> Option<f32> {
+        self.frame_budget.refresh_hz()
+    }
+    /// 本帧是否放行（`forced` = force 通道，绕过预算）。
+    pub(crate) fn frame_budget_admits(&self, now: std::time::Instant, forced: bool) -> bool {
+        self.frame_budget.admits(now, forced)
+    }
+    /// 放行一帧：推进下一拍（`App::frame` 在通过门禁后调用）。
+    pub(crate) fn note_frame_start(&mut self, now: std::time::Instant) {
+        self.frame_budget.note_start(now);
+    }
+    /// 记一次预算推迟；返回 `true` = 新的推迟（平台尚未挂一次性唤醒）。
+    pub(crate) fn note_frame_budget_deferred(&mut self) -> bool {
+        self.frame_budget.note_deferred()
+    }
+    /// 是否有「已推迟、还没放行」的帧请求。
+    #[must_use]
+    pub(crate) fn frame_budget_deferred(&self) -> bool {
+        self.frame_budget.is_deferred()
+    }
+    /// 被推迟的帧最早何时可以开始（Linux calloop timeout 的到期时刻）。
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub(crate) fn frame_budget_deadline(&self) -> Option<std::time::Instant> {
+        self.frame_budget.deadline()
+    }
+    /// 累计被预算推迟的帧请求数（只增不减的诊断量）。
+    #[must_use]
+    pub(crate) fn frame_budget_deferrals(&self) -> u64 {
+        self.frame_budget.deferrals()
+    }
+    /// 仅测试：注入确定的预算周期（可注入 200 ms 这类长周期让测试不依赖真实刷新率抖动）。
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn set_frame_budget_test_interval(&mut self, interval: std::time::Duration) {
+        self.frame_budget.set_test_interval(Some(interval));
     }
     pub(crate) fn begin_frame(&mut self) -> Option<FrameTicket> {
         frame::begin_frame(self)
@@ -1040,6 +1092,10 @@ impl Window {
     #[cfg(feature = "test-support")]
     pub(crate) fn record_idle(&mut self) {
         record::record_idle(self)
+    }
+    #[cfg(feature = "test-support")]
+    pub(crate) fn record_budget_deferred(&mut self) {
+        record::record_budget_deferred(self)
     }
     #[cfg(feature = "test-support")]
     pub(crate) fn attach_a11y(&mut self, snapshot: crate::a11y::A11yTreeSnapshot) {
