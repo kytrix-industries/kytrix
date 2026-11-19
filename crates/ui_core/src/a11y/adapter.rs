@@ -79,13 +79,18 @@ pub(crate) const A11Y_BATCH_BUDGET: usize = 2048;
 /// 内存序用 `SeqCst`：平台回调与主线程之间除了这个计数器没有其它同步点（adapter 内部的
 /// 状态互斥锁保护的是 adapter 状态，不是引擎代际），代际变化必须与 `pending`/`take` 的顺序
 /// 严格一致 —— 这里不是热路径（只在 AT 接入/重连时写一次），不值得为弱内存序冒险。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct A11yConsumerEpoch(Arc<AtomicU64>);
 
 impl A11yConsumerEpoch {
     /// 新代际（从 0 开始；`A11yBridge::new` 的初始 `seen` 也是 0）。
-    pub(crate) fn new() -> Self {
-        Self::default()
+    ///
+    /// **不对平台层开放构造**（RE-01）：平台 adapter 必须持有窗口 `A11yBridge` 里的**那一份**
+    /// 句柄（`App::window_a11y_epoch`），否则激活回调 `bump()` 的是另一份计数器，引擎的
+    /// `seen_consumer_epoch` 永远看不到变化 —— E1 在生产上退化成「重激活后等下一次输入才有
+    /// 树」。构造函数私有 + 无 `Default` 让「另起一份」在编译期不可写。
+    fn new() -> Self {
+        Self(Arc::new(AtomicU64::new(0)))
     }
 
     /// 标记消费端已重置：下一笔交付必须是全树。
@@ -96,6 +101,16 @@ impl A11yConsumerEpoch {
     /// 当前代际。
     pub(crate) fn current(&self) -> u64 {
         self.0.load(Ordering::SeqCst)
+    }
+
+    /// 两份句柄是否指向**同一个**计数器（RE-01 的共享句柄断言用；仅测试有读者）。
+    ///
+    /// 平台 adapter 与窗口 `A11yBridge` 必须共享同一份：`same_handle == false` 时回调的
+    /// `bump()` 永远不会被引擎看到（E1 在生产上失效）。
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn same_handle(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 

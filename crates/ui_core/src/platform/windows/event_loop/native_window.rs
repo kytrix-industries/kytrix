@@ -54,13 +54,11 @@ pub(super) fn sync_native_windows(
         .map(|(id, window)| (id, window.options().clone()))
         .collect();
     for (id, options) in pending {
-        // 窗口的 a11y adapter 与引擎的 `A11yBridge` 共享同一份消费端代际：AT 重新激活时
-        // 平台回调 `bump()` 它，引擎把下一笔升成全树（E1）。
-        let a11y_epoch = app
-            .window(id)
-            .map_or_else(crate::a11y::adapter::A11yConsumerEpoch::new, |window| {
-                window.a11y_consumer_epoch()
-            });
+        // RE-01：adapter 必须持有窗口 `A11yBridge` 的**那一份**消费端代际（唯一入口
+        // `App::window_a11y_epoch`）：AT 重新激活时平台回调 `bump()` 它，引擎把下一笔升成全树。
+        let Some(a11y_epoch) = app.window_a11y_epoch(id) else {
+            continue;
+        };
         let mut native =
             NativeWindow::create(id, &options, dispatcher.clone(), Some(app_cell), a11y_epoch)?;
         let client = native.client_size();
@@ -351,7 +349,7 @@ mod tests {
             &options,
             Arc::clone(&dispatcher),
             None,
-            crate::a11y::adapter::A11yConsumerEpoch::new(),
+            app.window_a11y_epoch(id).expect("window exists"),
         )
         .expect("NativeWindow");
         let _ = dispatcher.take_frame_wake();
@@ -397,7 +395,7 @@ mod tests {
             &options,
             Arc::clone(&dispatcher),
             None,
-            crate::a11y::adapter::A11yConsumerEpoch::new(),
+            app.window_a11y_epoch(id).expect("window exists"),
         )
         .expect("window");
         let _ = dispatcher.take_frame_wake();

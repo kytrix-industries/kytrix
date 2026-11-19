@@ -177,24 +177,38 @@ mod tests {
 
     use super::{UnixActivation, UnixDeactivation, window_bounds};
     use crate::{
-        a11y::adapter::A11yConsumerEpoch,
+        app::App,
         math::{Point, Scale, Size},
         platform::dispatcher::Dispatcher,
+        window::WindowOptions,
     };
 
     fn scale(factor: f32) -> Scale {
         Scale::new(factor).expect("scale")
     }
 
-    /// E1：AT 重新激活（`IsEnabled` 关→开 / Orca 重启）必须 bump 消费端代际 ——
-    /// 引擎据此把下一笔升成全树，而不是把增量当初始树（consumer panic / 永久空树）。
+    /// RE-01（E1 接线防线）：AT 重新激活（`IsEnabled` 关→开 / Orca 重启）必须
+    /// ① `bump()` 窗口 bridge 的消费端代际、② `wake()` 主线程。
+    ///
+    /// 变异守卫：删掉 `self.dispatcher.wake()` ⇒ wake 断言红；让 adapter 持另一份 epoch
+    /// （平台层已无法构造，只能显式传断开的句柄）⇒ 引擎 pending/full 断言红。
     #[test]
-    fn activation_bumps_the_consumer_epoch() {
-        let epoch = A11yConsumerEpoch::new();
+    fn activation_wakes_the_main_thread_and_forces_the_next_full_tree() {
+        use std::sync::Arc;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut app = App::new(runtime.handle().clone());
+        let window = app.create_window(WindowOptions::default());
+        let epoch = app.window_a11y_epoch(window).expect("窗口存在");
         let before = epoch.current();
+        let dispatcher = Dispatcher::new();
+        let _ = dispatcher.take_frame_wake();
         let mut activation = UnixActivation {
             epoch: epoch.clone(),
-            dispatcher: Dispatcher::new(),
+            dispatcher: Arc::clone(&dispatcher),
         };
         assert!(
             activation.request_initial_tree().is_none(),
@@ -205,12 +219,31 @@ mod tests {
             before + 1,
             "激活回调必须标记消费端已重置（否则下一笔仍是增量）"
         );
+        assert!(
+            dispatcher.take_frame_wake(),
+            "激活必须 wake 主线程（空闲重激活否则要等下一次输入才有树）"
+        );
+        assert!(
+            app.window(window)
+                .expect("window")
+                .a11y_consumer_epoch_pending(),
+            "窗口 bridge 必须观察到同一个 epoch 变化（共享同一份句柄）"
+        );
+        assert!(
+            app.a11y_pending(window),
+            "激活后 App 门禁必须立即放行（不节流旁路）"
+        );
+        let snapshot = app.a11y_take(window).expect("重激活后的第一笔必须产出");
+        assert!(
+            snapshot.full,
+            "重激活后的第一笔必须是全树（否则 consumer panic / 永久空树）"
+        );
     }
 
     /// E1：停用回调同样 bump（消费端已丢弃整棵树；防御未来复用路径）。
     #[test]
     fn deactivation_bumps_the_consumer_epoch() {
-        let epoch = A11yConsumerEpoch::new();
+        let epoch = crate::a11y::adapter::A11yBridge::new().consumer_epoch();
         let before = epoch.current();
         let mut deactivation = UnixDeactivation {
             epoch: epoch.clone(),

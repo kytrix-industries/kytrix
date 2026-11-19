@@ -422,13 +422,11 @@ pub(crate) fn run(mut app: App) -> Result<(), EngineError> {
     let app = Rc::new(RefCell::new(app));
     let mut windows: Vec<NativeWindow> = Vec::with_capacity(requests.len());
     for (id, options) in requests {
-        // a11y adapter 与引擎 `A11yBridge` 共享消费端代际（AT 重激活 ⇒ 下一笔全树，E1）。
-        let a11y_epoch = app
-            .borrow()
-            .window(id)
-            .map_or_else(crate::a11y::adapter::A11yConsumerEpoch::new, |window| {
-                window.a11y_consumer_epoch()
-            });
+        // RE-01：adapter 必须持有窗口 `A11yBridge` 的**那一份**消费端代际（唯一入口
+        // `App::window_a11y_epoch`）；AT 重激活时平台回调 bump 它 ⇒ 引擎下一笔全树。
+        let Some(a11y_epoch) = app.borrow().window_a11y_epoch(id) else {
+            continue;
+        };
         let mut native =
             NativeWindow::create(id, &options, dispatcher.clone(), Some(&app), a11y_epoch)?;
         let client = native.client_size();

@@ -255,11 +255,15 @@ fn open_window(
     options: &WindowOptions,
     dispatcher: &Arc<Dispatcher>,
 ) -> Result<NativeWindow, EngineError> {
+    // RE-01：adapter 必须持有窗口 `A11yBridge` 的**那一份**消费端代际（唯一入口
+    // `App::window_a11y_epoch`）；不存在的窗口不能建原生窗口。
     let a11y_epoch = app
-        .window(id)
-        .map_or_else(crate::a11y::adapter::A11yConsumerEpoch::new, |window| {
-            window.a11y_consumer_epoch()
-        });
+        .window_a11y_epoch(id)
+        .ok_or_else(|| EngineError::AppInit {
+            detail: smol_str::SmolStr::new_static(
+                "window disappeared while creating native window",
+            ),
+        })?;
     let native = NativeWindow::create(mtm, id, options, dispatcher, a11y_epoch)?;
     // 先显示：用户立刻看到窗口（背景色由 `NSColor` 铺底）。
     native.show();

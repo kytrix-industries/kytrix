@@ -169,3 +169,64 @@ impl ActionHandler for MacActions {
         }));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use accesskit::ActivationHandler;
+
+    use super::MacActivation;
+    use crate::{app::App, platform::dispatcher::Dispatcher, window::WindowOptions};
+
+    /// RE-01（E1 接线防线，macOS）：AX 重新激活必须 ① bump 窗口 bridge 的消费端代际、
+    /// ② wake 主线程，引擎据此把下一笔升成全树。
+    ///
+    /// 变异守卫：删掉 `self.dispatcher.wake()` ⇒ wake 断言红；adapter 持另一份 epoch
+    /// （平台层已无法构造）⇒ 引擎 pending/full 断言红。
+    #[test]
+    fn activation_wakes_the_main_thread_and_forces_the_next_full_tree() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut app = App::new(runtime.handle().clone());
+        let window = app.create_window(WindowOptions::default());
+        let epoch = app.window_a11y_epoch(window).expect("窗口存在");
+        let before = epoch.current();
+        let dispatcher = Dispatcher::new();
+        let _ = dispatcher.take_frame_wake();
+        let mut activation = MacActivation {
+            epoch: epoch.clone(),
+            dispatcher: Arc::clone(&dispatcher),
+        };
+        assert!(
+            activation.request_initial_tree().is_none(),
+            "引擎异步交付首树：激活回调只标记，不同步构造 TreeUpdate"
+        );
+        assert_eq!(
+            epoch.current(),
+            before + 1,
+            "激活回调必须标记消费端已重置（否则下一笔仍是增量）"
+        );
+        assert!(
+            dispatcher.has_pending_wake(),
+            "激活必须 wake 主线程（空闲重激活否则要等下一次输入才有树）"
+        );
+        assert!(
+            app.window(window)
+                .expect("window")
+                .a11y_consumer_epoch_pending(),
+            "窗口 bridge 必须观察到同一个 epoch 变化（共享同一份句柄）"
+        );
+        assert!(
+            app.a11y_pending(window),
+            "激活后 App 门禁必须立即放行（不节流旁路）"
+        );
+        let snapshot = app.a11y_take(window).expect("重激活后的第一笔必须产出");
+        assert!(
+            snapshot.full,
+            "重激活后的第一笔必须是全树（否则 consumer panic / 永久空树）"
+        );
+    }
+}

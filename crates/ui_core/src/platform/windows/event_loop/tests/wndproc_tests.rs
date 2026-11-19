@@ -106,7 +106,8 @@ fn hidden_window_sized(
         hwnd,
         WindowId::for_test(1),
         None,
-        crate::a11y::adapter::A11yConsumerEpoch::new(),
+        // RE-01：平台层不允许自造消费端代际；测试从真实 `A11yBridge` 取。
+        crate::a11y::adapter::A11yBridge::new().consumer_epoch(),
     ) {
         Ok(state) => Box::into_raw(Box::new(state)),
         Err(error) => {
@@ -962,12 +963,8 @@ fn a_size_move_resize_drives_a_real_frame() {
     let id = app.create_window(options.clone());
     let app = std::rc::Rc::new(std::cell::RefCell::new(app));
     let dispatcher = Dispatcher::new();
-    let a11y_epoch = app
-        .borrow()
-        .window(id)
-        .map_or_else(crate::a11y::adapter::A11yConsumerEpoch::new, |window| {
-            window.a11y_consumer_epoch()
-        });
+    // RE-01：建窗路径唯一入口（窗口 bridge 的那一份代际）。
+    let a11y_epoch = app.borrow().window_a11y_epoch(id).expect("window exists");
     let native = NativeWindow::create(
         id,
         &options,
@@ -1011,12 +1008,8 @@ fn a_size_after_the_modal_loop_is_only_recorded_for_the_pump() {
     let id = app.create_window(options.clone());
     let app = std::rc::Rc::new(std::cell::RefCell::new(app));
     let dispatcher = Dispatcher::new();
-    let a11y_epoch = app
-        .borrow()
-        .window(id)
-        .map_or_else(crate::a11y::adapter::A11yConsumerEpoch::new, |window| {
-            window.a11y_consumer_epoch()
-        });
+    // RE-01：建窗路径唯一入口（窗口 bridge 的那一份代际）。
+    let a11y_epoch = app.borrow().window_a11y_epoch(id).expect("window exists");
     let mut native = NativeWindow::create(
         id,
         &options,

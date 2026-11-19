@@ -530,16 +530,14 @@ fn sync_windows(
         if a11ys.iter().any(|entry| entry.id == id) {
             continue;
         }
+        // RE-01：adapter 必须持有窗口 `A11yBridge` 的**那一份**消费端代际（唯一入口
+        // `App::window_a11y_epoch`）；窗口刚被关闭时本轮跳过，下一轮 remove_window 清理协议对象。
+        let Some(epoch) = app.window_a11y_epoch(id) else {
+            continue;
+        };
         a11ys.push(WindowA11y {
             id,
-            adapter: UnixA11y::new(
-                dispatcher.clone(),
-                id,
-                app.window(id)
-                    .map_or_else(crate::a11y::adapter::A11yConsumerEpoch::new, |window| {
-                        window.a11y_consumer_epoch()
-                    }),
-            )?,
+            adapter: UnixA11y::new(dispatcher.clone(), id, epoch)?,
         });
     }
     // 渲染器只能在首个 configure 之后建：configure 之前 `xdg_surface` 没有配置的尺寸，WSI

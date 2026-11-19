@@ -1789,6 +1789,18 @@ impl App {
         a11y::a11y_pending(self, window)
     }
 
+    /// 建窗路径的 a11y 消费端代际句柄（三端唯一入口；RE-01）。
+    ///
+    /// 与窗口 `A11yBridge` 的 `consumer_epoch` 是**同一份** `Arc`：平台 adapter 的激活/停用
+    /// 回调 bump 它，引擎才能观察到「消费端已重置」并把下一笔升成全树。`None` = 窗口不存在。
+    #[must_use]
+    pub(crate) fn window_a11y_epoch(
+        &self,
+        window: WindowId,
+    ) -> Option<crate::a11y::adapter::A11yConsumerEpoch> {
+        a11y::window_a11y_epoch(self, window)
+    }
+
     /// 是否有窗口「a11y 脏但正被限流」——平台泵据此安排**到期补发**唤醒。
     ///
     /// 没有这条，被限流挡下的最后一次变化永远不会交付：脏位留着，但没有任何机制在

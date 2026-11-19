@@ -125,6 +125,21 @@ pub(crate) fn a11y_retry_pending(app: &App) -> bool {
     })
 }
 
+/// 建窗路径的 a11y 消费端代际句柄（三端唯一入口；RE-01）。
+/// 消费者：`App::window_a11y_epoch`。
+///
+/// **必须返回窗口 `A11yBridge` 里的那一份句柄**（同一 `Arc`）：平台 adapter 的激活/停用回调
+/// `bump()` 它之后，引擎 `A11yBridge` 的 `seen_consumer_epoch` 才能观察到变化并强制下一笔全树。
+/// 另起一份 `A11yConsumerEpoch` 是断开的（bump 永远到不了引擎），因此该类型不向平台层开放
+/// 构造入口 —— 三个平台只能经由本函数取句柄。
+#[must_use]
+pub(crate) fn window_a11y_epoch(
+    app: &App,
+    window: WindowId,
+) -> Option<crate::a11y::adapter::A11yConsumerEpoch> {
+    app.windows.get(&window).map(Window::a11y_consumer_epoch)
+}
+
 /// 产出一笔 a11y 交付（消费 `A11Y` 反向集合与 `full_pending`）。
 ///
 /// **必须在 `accesskit_windows::Adapter::update_if_active` 的闭包里调用**（adapter 不活跃时
@@ -472,5 +487,36 @@ mod tests {
         );
         let snapshot = app.a11y_take(window).expect("重置后的第一笔必须产出");
         assert!(snapshot.full, "重置后的第一笔必须是全树");
+    }
+
+    /// RE-01：建窗路径取到的代际必须是窗口 `A11yBridge` 的**同一份** `Arc` —— 否则平台回调
+    /// bump 的是另一份计数器，引擎永远看不到重置（E1 在生产上失效但测试全绿）。
+    ///
+    /// 变异守卫：把 `window_a11y_epoch` 改成 `A11yConsumerEpoch::new()`（不可编译）或返回
+    /// 断开句柄 ⇒ 本用例红；三端平台层只允许经由本 helper 取句柄。
+    #[test]
+    fn window_a11y_epoch_is_the_bridge_handle_of_that_window() {
+        let (_runtime, mut app, window, _label_signal, _label) = fixture();
+        let other = app.create_window(WindowOptions::default());
+        let first = app.window_a11y_epoch(window).expect("窗口存在");
+        let again = app.window_a11y_epoch(window).expect("窗口存在");
+        assert!(
+            first.same_handle(&again),
+            "同一窗口多次取句柄必须是同一份 Arc"
+        );
+        let bridge = app.window(window).expect("window").a11y_consumer_epoch();
+        assert!(
+            first.same_handle(&bridge),
+            "必须与窗口 A11yBridge 的 consumer_epoch 同一份（平台回调 bump 才能被引擎看到）"
+        );
+        let other_epoch = app.window_a11y_epoch(other).expect("第二个窗口存在");
+        assert!(
+            !first.same_handle(&other_epoch),
+            "不同窗口必须有独立的消费端代际"
+        );
+        assert!(
+            app.window_a11y_epoch(WindowId::for_test(999)).is_none(),
+            "不存在的窗口返回 None（平台建窗路径据此跳过）"
+        );
     }
 }

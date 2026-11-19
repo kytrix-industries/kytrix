@@ -603,14 +603,10 @@ mod tests {
         let mut app = App::new(runtime.handle().clone());
         let options = WindowOptions::default();
         let id = app.create_window(options.clone());
-        let mut native = NativeWindow::create(
-            id,
-            &options,
-            Dispatcher::new(),
-            None,
-            crate::a11y::adapter::A11yConsumerEpoch::new(),
-        )
-        .expect("NativeWindow::create");
+        // RE-01：建窗路径唯一入口（窗口 bridge 的那一份代际）。
+        let a11y_epoch = app.window_a11y_epoch(id).expect("window exists");
+        let mut native = NativeWindow::create(id, &options, Dispatcher::new(), None, a11y_epoch)
+            .expect("NativeWindow::create");
 
         // SAFETY: 窗口由本用例持有且存活；上下文句柄成对释放。
         let baseline = unsafe { ImmGetContext(native.hwnd) };
@@ -679,14 +675,10 @@ mod tests {
         let mut app = App::new(runtime.handle().clone());
         let options = WindowOptions::default();
         let id = app.create_window(options.clone());
-        let mut native = NativeWindow::create(
-            id,
-            &options,
-            Dispatcher::new(),
-            None,
-            crate::a11y::adapter::A11yConsumerEpoch::new(),
-        )
-        .expect("NativeWindow::create");
+        // RE-01：建窗路径唯一入口（窗口 bridge 的那一份代际）。
+        let a11y_epoch = app.window_a11y_epoch(id).expect("window exists");
+        let mut native = NativeWindow::create(id, &options, Dispatcher::new(), None, a11y_epoch)
+            .expect("NativeWindow::create");
 
         // 故意把 App 侧写成与平台不一致的值：恢复必须把它纠回平台真值。
         {

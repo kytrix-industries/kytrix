@@ -129,6 +129,12 @@ impl WindowsA11y {
     pub(crate) fn update(&mut self, factory: impl FnOnce() -> TreeUpdate) -> Option<QueuedEvents> {
         self.adapter.update_if_active(factory)
     }
+
+    /// 仅测试：adapter 持有的消费端代际句柄（RE-01 的「与窗口 bridge 共享同一 `Arc`」防线）。
+    #[cfg(test)]
+    pub(crate) fn consumer_epoch(&self) -> &A11yConsumerEpoch {
+        &self.activation.epoch
+    }
 }
 
 impl std::fmt::Debug for WindowsA11y {
@@ -186,7 +192,10 @@ mod tests {
 
     use super::{WindowsA11y, WindowsActivation};
     use crate::{
-        a11y::adapter::A11yConsumerEpoch, platform::dispatcher::Dispatcher, window::WindowId,
+        a11y::adapter::A11yConsumerEpoch,
+        app::App,
+        platform::dispatcher::Dispatcher,
+        window::{WindowId, WindowOptions},
     };
 
     unsafe extern "system" fn wndproc(
@@ -245,6 +254,11 @@ mod tests {
             .expect("runtime")
     }
 
+    /// RE-01：平台层不允许自造消费端代际；测试也从真实 `A11yBridge` 取（与生产同一来源）。
+    fn test_epoch() -> A11yConsumerEpoch {
+        crate::a11y::adapter::A11yBridge::new().consumer_epoch()
+    }
+
     #[test]
     fn adapter_constructs_before_the_window_is_shown() {
         let _runtime = runtime();
@@ -254,12 +268,7 @@ mod tests {
             !unsafe { IsWindowVisible(hwnd) }.as_bool(),
             "本用例必须在首显之前构造 adapter"
         );
-        let a11y = WindowsA11y::new(
-            hwnd,
-            Dispatcher::new(),
-            WindowId::for_test(1),
-            A11yConsumerEpoch::new(),
-        );
+        let a11y = WindowsA11y::new(hwnd, Dispatcher::new(), WindowId::for_test(1), test_epoch());
         assert!(a11y.is_ok(), "隐藏窗口上必须能构造 adapter（首显前）");
         let mut a11y = a11y.expect("adapter");
         a11y.focus_changed(true);
@@ -274,13 +283,9 @@ mod tests {
     fn update_if_active_is_lazy_without_assistive_tech() {
         let _runtime = runtime();
         let (hwnd, _class) = hidden_window("KytrixP11A11yLazy");
-        let mut a11y = WindowsA11y::new(
-            hwnd,
-            Dispatcher::new(),
-            WindowId::for_test(2),
-            A11yConsumerEpoch::new(),
-        )
-        .expect("adapter");
+        let mut a11y =
+            WindowsA11y::new(hwnd, Dispatcher::new(), WindowId::for_test(2), test_epoch())
+                .expect("adapter");
         // 无辅助技术连接时 adapter 恒 Inactive ⇒ 闭包**一次都不执行**（懒激活零开销）。
         // 注：本断言在「有 AT 正在运行的机器」上不成立，CI 无桌面环境恒成立（V-75 的已知边界）。
         let mut called = false;
@@ -299,13 +304,9 @@ mod tests {
     fn wm_getobject_with_an_unrelated_objid_falls_through() {
         let _runtime = runtime();
         let (hwnd, _class) = hidden_window("KytrixP11A11yObjid");
-        let mut a11y = WindowsA11y::new(
-            hwnd,
-            Dispatcher::new(),
-            WindowId::for_test(3),
-            A11yConsumerEpoch::new(),
-        )
-        .expect("adapter");
+        let mut a11y =
+            WindowsA11y::new(hwnd, Dispatcher::new(), WindowId::for_test(3), test_epoch())
+                .expect("adapter");
         // OBJID_WINDOW / 其它负数 objid 不归 AccessKit 管 ⇒ 交回 DefWindowProcW。
         let result = a11y.wm_getobject(
             windows::Win32::Foundation::WPARAM(0),
@@ -318,17 +319,26 @@ mod tests {
         }
     }
 
-    /// E1：UIA 激活（provider 重建 / `WM_GETOBJECT` 首次握手）必须 bump 消费端代际 ——
-    /// 引擎据此把下一笔升成全树，而不是把增量当初始树（consumer panic / 永久空树）。
+    /// RE-01（E1 接线防线）：UIA 激活（provider 重建 / `WM_GETOBJECT` 首次握手）必须
+    /// ① `bump()` 窗口 bridge 的消费端代际、② `wake()` 主线程 —— 引擎据此把下一笔升成全树，
+    /// 空闲重激活也不需要等下一次输入。
+    ///
+    /// 变异守卫：删掉 `dispatcher.wake()` ⇒ wake 断言红；让 adapter 持有另一份 epoch
+    /// （平台层已无法构造，只能显式传断开的句柄）⇒ 引擎 pending/full 断言红。
     #[test]
-    fn activation_bumps_the_consumer_epoch() {
+    fn activation_wakes_the_main_thread_and_forces_the_next_full_tree() {
         use accesskit::ActivationHandler;
 
-        let epoch = A11yConsumerEpoch::new();
+        let runtime = runtime();
+        let mut app = App::new(runtime.handle().clone());
+        let window = app.create_window(WindowOptions::default());
+        let epoch = app.window_a11y_epoch(window).expect("窗口存在");
         let before = epoch.current();
+        let dispatcher = Dispatcher::new();
+        let _ = dispatcher.take_frame_wake();
         let mut activation = WindowsActivation {
             epoch: epoch.clone(),
-            dispatcher: Dispatcher::new(),
+            dispatcher: std::sync::Arc::clone(&dispatcher),
         };
         assert!(
             activation.request_initial_tree().is_none(),
@@ -339,6 +349,48 @@ mod tests {
             before + 1,
             "激活回调必须标记消费端已重置（否则下一笔仍是增量）"
         );
+        assert!(
+            dispatcher.take_frame_wake(),
+            "激活必须 wake 主线程（空闲重激活否则要等下一次输入才有树）"
+        );
+        assert!(
+            app.window(window)
+                .expect("window")
+                .a11y_consumer_epoch_pending(),
+            "窗口 bridge 必须观察到同一个 epoch 变化（共享同一份句柄）"
+        );
+        assert!(
+            app.a11y_pending(window),
+            "激活后 App 门禁必须立即放行（不节流旁路）"
+        );
+        let snapshot = app.a11y_take(window).expect("重激活后的第一笔必须产出");
+        assert!(
+            snapshot.full,
+            "重激活后的第一笔必须是全树（否则 consumer panic / 永久空树）"
+        );
+    }
+
+    /// RE-01（E1 接线防线）：平台 adapter 与窗口 `A11yBridge` 必须共享**同一份**代际句柄。
+    ///
+    /// 变异守卫：建窗路径改用另一份 `A11yConsumerEpoch`（现已在平台层不可构造；若显式传
+    /// 断开的句柄）⇒ `Arc::ptr_eq` 断言红。
+    #[test]
+    fn the_adapter_shares_the_window_consumer_epoch() {
+        let runtime = runtime();
+        let mut app = App::new(runtime.handle().clone());
+        let window = app.create_window(WindowOptions::default());
+        let epoch = app.window_a11y_epoch(window).expect("窗口存在");
+        let (hwnd, _class) = hidden_window("KytrixP11A11ySharedEpoch");
+        let a11y =
+            WindowsA11y::new(hwnd, Dispatcher::new(), window, epoch.clone()).expect("adapter");
+        assert!(
+            a11y.consumer_epoch().same_handle(&epoch),
+            "adapter 必须持有窗口 bridge 的同一份 epoch（否则回调 bump 到不了引擎）"
+        );
+        // SAFETY: 窗口由本用例创建；销毁后不再访问。
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
     }
 
     fn empty_update() -> accesskit::TreeUpdate {
