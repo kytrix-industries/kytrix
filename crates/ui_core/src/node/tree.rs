@@ -1145,14 +1145,16 @@ impl NodeTree {
     pub fn text_caret_rect(&self, node: NodeId, byte_index: usize) -> Result<Rect, EngineError> {
         content::text_caret_rect(self, node, byte_index)
     }
+    /// 让单个文本节点的 ShapedLine 失效并进入重排队列（D-5 绘制前硬校验用）。
+    pub(crate) fn invalidate_text_line(&mut self, node: NodeId) {
+        content::invalidate_text_line(self, node)
+    }
+
     pub(crate) fn invalidate_text_layout(&mut self, node: NodeId) -> bool {
         content::invalidate_text_layout(self, node)
     }
     pub(crate) fn mark_all_text_dirty(&mut self) {
         content::mark_all_text_dirty(self)
-    }
-    pub(crate) fn mark_all_text_paint(&mut self) -> usize {
-        content::mark_all_text_paint(self)
     }
     pub(crate) fn take_bind_text(
         &mut self,

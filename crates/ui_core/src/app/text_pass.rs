@@ -620,17 +620,17 @@ pub(crate) fn reload_system_fonts(app: &mut App) -> u32 {
     version
 }
 
-/// 所有窗口的文本节点标 `LAYOUT | PAINT` 并清 `node..root` 缓存。
-/// 图集代际变化时让**所有窗口**的文本节点重绘（P1-2.6）。
+/// 图集代际变化时的**唯一重光栅入口**（D-5）。
 ///
-/// 图集换代（DPI 变化 / 字形扩容逃逸）会让页内所有 tile 重排，而每个文本 lane 里存的是
-/// 生成时的 `AtlasTile`（旧 UV）。`set_text_line` 不标 `PAINT`，paint 的 lane 复用只看
-/// `REUSABLE`/`clip_key`，于是旧 UV 被继续使用 —— 表现为错字/花字，且要等一次无关的
-/// `PAINT` 才可能恢复。
+/// 字形图集是**进程级**共享的：任一窗口的 DPI 变化 / 字形容量逃逸都会让 `atlas.generation`
+/// 递增、页内所有 tile 重排。每个窗口文本节点的 `ShapedLine` 里烘焙的是生成时的
+/// `AtlasTile`（旧 UV），仅标 `PAINT` 只会把旧 UV 重新编码一遍（审计 D-5 的无效兜底）。
 ///
-/// 只标 `PAINT` 不标 `LAYOUT`：换代不改变字形宽度与断行，重排是纯损失。
+/// 因此这里走 [`NodeTree::invalidate_text_lines`]：清 `ShapedLine` + 置 `laid_*` 失配 +
+/// `mark_text_layout_dirty` + `mark_paint` ⇒ 下一帧 `layout_text` 用当前代际重光栅、
+/// paint 重建 lane。换代是冷路径，重排成本可接受（Chrome/Skia 的 glyph draw 数据同样整体作废）。
 ///
-/// 对照 Skia：glyph atlas / strike cache 换代时会让所有引用旧 strike 的绘制数据失效。
+/// 对照 Skia：glyph atlas / strike cache 换代时所有引用旧 strike 的绘制数据失效。
 /// 消费者：`App::repaint_text_if_atlas_changed`。
 pub(crate) fn repaint_text_if_atlas_changed(app: &mut App) {
     let generation = app.atlas.generation();
@@ -639,7 +639,7 @@ pub(crate) fn repaint_text_if_atlas_changed(app: &mut App) {
     }
     app.atlas_generation_seen = generation;
     for window in app.windows.values_mut() {
-        window.tree_mut().mark_all_text_paint();
+        window.tree_mut().invalidate_text_lines();
     }
 }
 
@@ -669,12 +669,14 @@ pub(crate) fn invalidate_all_text(app: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use super::MAX_LAYOUT_TEXT_PASSES;
     use crate::{
         app::App,
         error::EngineError,
         node::{builder::NodeBuilder, id::NodeId},
-        paint::atlas::AtlasKind,
+        paint::{atlas::AtlasKind, primitive::Primitive},
         render::AtlasAllocator,
         text::{TextDiagnostic, TextStyle, atlas::ATLAS_FULL_ESCALATION_FRAMES},
         window::{WindowId, WindowOptions},
@@ -887,5 +889,126 @@ mod tests {
             "重试后必须把少画的字形全部补上（重排轮数上限 {MAX_LAYOUT_TEXT_PASSES}）"
         );
         assert_eq!(line.atlas_generation, app.atlas.generation());
+    }
+
+    /// D-5：图集换代必须走**唯一重光栅入口**（`repaint_text_if_atlas_changed` →
+    /// `NodeTree::invalidate_text_lines`）：清掉旧 `ShapedLine` 并把节点重新入队，而不是只标
+    /// `PAINT`（审计判定旧兜底会重编旧 UV）；下一轮 `layout_text` 用**当前代际**重光栅。
+    #[test]
+    fn atlas_generation_change_invalidates_lines_through_the_unique_entry() {
+        let (_rt, mut app, window, node) = text_app("1,234.56", Some(200.0));
+        let _ = frame_text(&mut app, window);
+        let old_generation = app
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .text_line(node)
+            .expect("行快照")
+            .atlas_generation;
+        assert_eq!(old_generation, app.atlas.generation());
+
+        // 等价于容量逃逸 / 新页扩容：`grow` 递增图集代际。
+        assert!(app.atlas.grow(), "512² → 1024² 必须成功");
+        app.repaint_text_if_atlas_changed();
+        {
+            let tree = app.window(window).expect("窗口存在").tree();
+            assert!(
+                tree.text_line(node).is_none(),
+                "换代必须清掉旧 ShapedLine（否则 paint 会重编旧 UV）"
+            );
+            assert_eq!(tree.text_layout_dirty_len(), 1, "节点必须进入重排队列");
+        }
+
+        let report = app
+            .layout_text(window)
+            .expect("窗口存在")
+            .expect("重排不报错");
+        assert!(report.laid >= 1, "必须真正重光栅（report: {report:?}）");
+        let line = app
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .text_line(node)
+            .expect("行快照")
+            .clone();
+        assert_eq!(
+            line.atlas_generation,
+            app.atlas.generation(),
+            "重光栅必须使用当前图集代际"
+        );
+        assert_ne!(line.atlas_generation, old_generation, "换代后必须换新代际");
+    }
+    /// D-5：绘制前硬校验的端到端闭环。伪造一行「`atlas_generation` 是旧代际、但槽里记录的
+    /// `laid_generation` 是当前代际」的快照（模拟绕过唯一入口/未来遗漏的路径）：本帧 paint
+    /// **不得编码旧 UV**（scene 无 GlyphRun），提交后该节点被逐行失效，下一帧用当前代际重光栅。
+    #[test]
+    fn stale_text_line_is_skipped_by_paint_and_healed_next_frame() {
+        let (_rt, mut app, window, node) = text_app("1,234.56", Some(200.0));
+
+        // 同步「已见代际」：否则首次 pp.frame 的换代入口会先清掉我们伪造的旧行。
+        app.repaint_text_if_atlas_changed();
+        let _ = frame_text(&mut app, window);
+        let width = app
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .text_content_width(node);
+        let current = app.atlas.generation();
+        let stale = {
+            let existing = app
+                .window(window)
+                .expect("窗口存在")
+                .tree()
+                .text_line(node)
+                .expect("行快照")
+                .clone();
+            let mut line = (*existing).clone();
+            line.atlas_generation = current.wrapping_add(1);
+            Rc::new(line)
+        };
+        assert!(
+            app.window_mut(window)
+                .expect("窗口存在")
+                .tree_mut()
+                .set_text_line(node, stale, width, current)
+        );
+
+        let requests = app.frame_requests();
+        let _ = app.frame(window).expect("帧").expect("首帧不报错");
+        {
+            let target = app.window(window).expect("窗口存在");
+            let encoded = target
+                .tree()
+                .lane_of(node)
+                .and_then(|lane| target.scene().lane_primitives(lane))
+                .is_some_and(|primitives| {
+                    primitives
+                        .iter()
+                        .any(|primitive| matches!(primitive, Primitive::GlyphRun(_)))
+                });
+            assert!(!encoded, "旧代际行本帧不得编码 GlyphRun（旧 UV）");
+        }
+        assert!(
+            app.frame_requests() > requests,
+            "硬校验必须请求下一帧补齐（stale_text 处理）"
+        );
+
+        let _ = app.frame(window).expect("帧").expect("补齐帧不报错");
+        let line = app
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .text_line(node)
+            .expect("行快照")
+            .clone();
+        assert_eq!(
+            line.atlas_generation,
+            app.atlas.generation(),
+            "下一帧必须用当前图集代际重光栅"
+        );
+        assert!(
+            line.glyph_runs().any(|run| !run.glyphs.is_empty()),
+            "重光栅后必须真的有字形（不是永久跳过）"
+        );
     }
 }

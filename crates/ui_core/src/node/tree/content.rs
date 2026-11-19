@@ -366,6 +366,23 @@ fn expected_layout_width(tree: &NodeTree, shaped: &ShapedText, node: NodeId) -> 
     }
 }
 
+// 消费者：`impl NodeTree::invalidate_text_line` 的薄委托（外部调用点见该方法文档）。
+/// 让**单个**文本节点的 ShapedLine 失效并进入重排队列（D-5）。
+///
+/// 与整树的 [invalidate_text_lines] 同语义（清 line + laid_* 失配 + mark_paint），但只动
+/// 一个节点：绘制前硬校验的 stale 集合通常只有 0~几个节点，没必要整窗重排。
+pub(crate) fn invalidate_text_line(tree: &mut NodeTree, node: NodeId) {
+    let index = node.index() as usize;
+    let Some(slot) = tree.text_slots.get_mut(index).and_then(Option::as_mut) else {
+        return;
+    };
+    slot.line = None;
+    slot.laid_width_bits = 0;
+    slot.laid_generation = 0;
+    tree.mark_text_layout_dirty(node);
+    tree.mark_paint(node);
+}
+
 // 消费者：`impl NodeTree::invalidate_text_layout` 的薄委托（外部调用点见该方法文档）。
 /// 文本节点的布局失效（= `invalidate_measure` + 补 `PAINT`，F-56）。
 pub(crate) fn invalidate_text_layout(tree: &mut NodeTree, node: NodeId) -> bool {
@@ -395,36 +412,6 @@ pub(crate) fn mark_all_text_dirty(tree: &mut NodeTree) {
         tree.mark_text_dirty(node);
         tree.mark_text_layout_dirty(node);
     }
-}
-
-// 消费者：`impl NodeTree::mark_all_text_paint` 的薄委托（外部调用点见该方法文档）。
-/// 把所有文本节点标 `PAINT`（**不动** `LAYOUT`），P1-2.6。
-///
-/// 用途：字形图集是**进程级**共享的，任一窗口的 DPI 变化或容量逃逸都会让
-/// `AtlasAllocator::generation` 递增、页内所有 tile 重排。此时每个窗口文本节点的
-/// `ShapedLine` 里存的是旧 `AtlasTile`（旧 UV），而 paint 的 lane 复用只认
-/// `REUSABLE`/`clip_key` —— 不标 `PAINT` 就会继续画旧 UV，表现为错字/花字。
-///
-/// 只标 `PAINT` 不标 `LAYOUT`：图集换代不改变字形宽度/行数，不需要重排（重排是纯损失）。
-/// 返回被标记的节点数（诊断 / 测试）。
-pub(crate) fn mark_all_text_paint(tree: &mut NodeTree) -> usize {
-    let mut nodes: Vec<NodeId> = Vec::new();
-    tree.for_each_dfs(|node| {
-        if tree
-            .arena
-            .get(node)
-            .is_some_and(|target| target.kind.text().is_some())
-        {
-            nodes.push(node);
-        }
-    });
-    let mut marked = 0;
-    for node in nodes {
-        if tree.mark_paint(node) {
-            marked += 1;
-        }
-    }
-    marked
 }
 
 // 消费者：`impl NodeTree::take_bind_text` 的薄委托（外部调用点见该方法文档）。

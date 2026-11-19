@@ -853,8 +853,9 @@ impl Window {
     pub(crate) fn paint_frame(
         &mut self,
         geometry: &crate::paint::geometry_store::GeometryStore,
+        atlas_generation: Option<u32>,
     ) -> Result<PaintReport, EngineError> {
-        paint::paint_frame(self, geometry)
+        paint::paint_frame(self, geometry, atlas_generation)
     }
     fn needs_node_repaint(&self) -> bool {
         paint::needs_node_repaint(self)
