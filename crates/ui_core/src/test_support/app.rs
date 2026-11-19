@@ -2308,6 +2308,69 @@ mod p11_fix_tests {
         );
     }
 
+    /// RE-02：TextRun 的 `A11yPatch::value` 覆盖与真实 shape 文本不一致时，`character_lengths`
+    /// 描述的是 value 串、而位置只能描述真实文本 —— 两者不一致 ⇒ **省略**位置/宽度（AT 回退），
+    /// 绝不再发出「重复位置 + 零宽尾部」的错位 caret 表。
+    #[test]
+    fn a_value_override_that_disagrees_with_the_shaped_text_omits_character_metrics() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let run = text_run_fixture(
+            &mut app,
+            "ab",
+            TextStyle {
+                direction: TextDirection::Ltr,
+                ..TextStyle::new(20.0)
+            },
+        );
+        let window = app.window_id();
+        app.app_mut()
+            .window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .set_a11y_patch(
+                run,
+                A11yPatch {
+                    value: Some(SmolStr::new_static("ABCDEFGH")),
+                    ..A11yPatch::default()
+                },
+            );
+        let _ = app.drain().expect("frame");
+        app.assert_a11y_contract();
+
+        let snapshot = app.a11y().expect("a11y delivery");
+        let record = snapshot.node_for(run).expect("text run record");
+        assert_eq!(
+            record.value.as_deref(),
+            Some("ABCDEFGH"),
+            "value 覆盖本身仍然生效"
+        );
+        assert_eq!(
+            record.character_lengths.len(),
+            8,
+            "character_lengths 仍描述 value 串（AccessKit 的 Σ == value.len() 约束成立）"
+        );
+        assert!(
+            record.character_positions.is_empty() && record.character_widths.is_empty(),
+            "value 与真实文本不一致 ⇒ 必须省略位置/宽度（否则 caret 表错位）：{:?} / {:?}",
+            record.character_positions,
+            record.character_widths
+        );
+        let update = app.a11y_update().expect("TreeUpdate").clone();
+        let ak = update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == accesskit::NodeId(record.id.get()))
+            .map(|(_, node)| node)
+            .expect("accesskit node");
+        assert!(
+            ak.character_positions().is_none()
+                && ak.character_widths().is_none()
+                && ak.text_direction().is_none(),
+            "RE-02：口径不一致时不得写 character_positions/widths/text_direction"
+        );
+    }
+
     /// 造 `count` 个固定几何的行（`layout_override` ⇒ 边界可预测，根的直接子节点）。
     fn rows_fixture(app: &mut TestApp, count: usize) -> Vec<NodeId> {
         let window = app.window_id();

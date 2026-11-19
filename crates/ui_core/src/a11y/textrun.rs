@@ -89,6 +89,10 @@ pub(crate) fn selection(lengths: &[u8], selection: A11yTextSelection) -> A11yTex
 /// `character_index_at_point`），宽度是同一 grapheme 的 advance。数组长度 == `lengths.len()`。
 ///
 /// **只在能正确表达时返回**（否则 `None` ⇒ AT 回退到无 caret 高亮，绝不发错值）：
+/// - **文本口径一致**：`Σ character_lengths == content.text.len()`。`character_lengths` 来自
+///   节点 a11y `value`（可被 `A11yPatch::value` 覆盖），位置来自**已 shape 的真实文本**；
+///   两者不一致（TextRun 上覆盖了 value）时描述的是两串不同文本，输出位置就是错位的 caret
+///   表（RE-02：重复位置 + 零宽尾部），因此省略；
 /// - `TextRun` 已被 shape 且与当前文本一致：直接复用 `NodeTree::text_caret_rect` 的**全部**
 ///   输入校验（`text == shaped.text`、`same_shaping_inputs`、行内盒一致、laid 宽度 == 期望宽度、
 ///   byte 在 char boundary）—— 与 `apply` 用的是同一份真值，不会读到半新半旧的 shape；
@@ -106,6 +110,14 @@ pub(crate) fn character_metrics(
         return None;
     }
     let content = tree.text_content(node)?;
+    // RE-02：`character_lengths` 来自节点的 a11y `value`（`A11yPatch::value` 可覆盖），而位置是用
+    // **已 shape 的真实文本** `content.text` 算的。TextRun 上覆盖出不同的 value 时，两者描述的是
+    // 两串不同文本 —— 此时发出位置就是「错位的 caret 表」（实测会得到重复位置 + 零宽尾部）。
+    // 只在 Σlengths == 真实文本字节数时输出，否则省略（AT 回退）。
+    let described_bytes: usize = lengths.iter().map(|len| usize::from(*len)).sum();
+    if described_bytes != content.text.len() {
+        return None;
+    }
     if content.style.direction != TextDirection::Ltr {
         return None;
     }
