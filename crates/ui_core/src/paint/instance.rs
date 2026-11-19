@@ -49,6 +49,17 @@ pub(crate) trait LaneSource {
         0
     }
 
+    /// 该 lane 的几何块绘制范围（None = 非几何块 lane / 整块几何绘制；X5）。
+    ///
+    /// 编码器据此把这条 lane 编码成「只画第 chunk 块」的几何 op（几何节点的块 lane），
+    /// 因此一次数据更新只重编码受影响的那一条 lane。
+    fn lane_geometry_chunk(
+        &self,
+        _id: crate::paint::scene::LaneId,
+    ) -> Option<(crate::paint::geometry::GeometryId, u32)> {
+        None
+    }
+
     /// 本帧**已确认变化**的 lane 集合（编码器增量快路径的输入）。
     ///
     /// `None` = 帧源不知道本帧的变化集（`Scene`：UI 侧的脏表已经被 `DeltaBuilder` 消费），
@@ -1108,6 +1119,8 @@ pub(crate) struct InstanceEncoder {
     scratch_parts: SmallVec<[LanePart; 2]>,
     /// 本帧重编码的 lane 数（`FrameRecord.encoded_lanes`）。
     encoded_lanes: usize,
+    /// 本帧重编码的几何块 op 数（`FrameRecord.geometry_encoded_chunks`；增量几何的断言面）。
+    encoded_geometry_chunks: usize,
     /// 本帧重编码写进实例环的字节数（`FrameRecord.uploaded_bytes` 的编码器侧值）。
     ///
     /// 生产路径也保留：合成线程的 `ComposeStats`（HUD / 帧记录）在 release 构建里读它。
@@ -1137,6 +1150,7 @@ impl InstanceEncoder {
             scratch: Vec::with_capacity(64),
             scratch_parts: SmallVec::new(),
             encoded_lanes: 0,
+            encoded_geometry_chunks: 0,
             reused_segments: 0,
             written_bytes: 0,
             primed: false,
@@ -1167,6 +1181,7 @@ impl InstanceEncoder {
         geometry: &dyn GeometryLookup,
     ) -> Result<&InstanceBuffer, EngineError> {
         self.encoded_lanes = 0;
+        self.encoded_geometry_chunks = 0;
         self.reused_segments = 0;
         self.written_bytes = 0;
         self.colors.clear();
@@ -1218,6 +1233,7 @@ impl InstanceEncoder {
             scratch,
             scratch_parts,
             encoded_lanes,
+            encoded_geometry_chunks,
             reused_segments,
             written_bytes,
             ..
@@ -1245,6 +1261,7 @@ impl InstanceEncoder {
             };
             // 滚动槽：段复用时**段本身**的滚动槽必须与本次一致，否则要重编码（段落归属变了）。
             let scroll_slot = source.lane_scroll(*lane_id);
+            let geometry_chunk = source.lane_geometry_chunk(*lane_id);
             // 复用判据：段存在 + 版本一致 + 滚动槽一致 ⇒ 整段不重编码（连实例字节都不碰）。
             let reusable = buffer
                 .segments
@@ -1268,9 +1285,12 @@ impl InstanceEncoder {
                         resolver,
                         colors,
                         geometry,
+                        chunk_scope: geometry_chunk,
+                        emitted_geometry_chunks: 0,
                         run_start: 0,
                     };
-                    lane.encode_lane(primitives)?;
+                    lane.encode_lane(primitives, geometry_chunk)?;
+                    *encoded_geometry_chunks += lane.emitted_geometry_chunks;
                 }
                 let len = scratch.len() as u32;
                 let previous = buffer.segments.get_mut(slot).and_then(Option::take);
@@ -1373,6 +1393,7 @@ impl InstanceEncoder {
                 scratch,
                 scratch_parts,
                 encoded_lanes,
+                encoded_geometry_chunks,
                 written_bytes,
                 ..
             } = self;
@@ -1391,6 +1412,7 @@ impl InstanceEncoder {
                     continue;
                 };
                 let scroll_slot = source.lane_scroll(*lane_id);
+                let geometry_chunk = source.lane_geometry_chunk(*lane_id);
                 let reusable = buffer
                     .segments
                     .get(slot)
@@ -1425,9 +1447,12 @@ impl InstanceEncoder {
                         resolver,
                         colors,
                         geometry,
+                        chunk_scope: geometry_chunk,
+                        emitted_geometry_chunks: 0,
                         run_start: 0,
                     };
-                    lane.encode_lane(primitives)?;
+                    lane.encode_lane(primitives, geometry_chunk)?;
+                    *encoded_geometry_chunks += lane.emitted_geometry_chunks;
                 }
                 // 绘制项必须逐项相同（实例包围盒烘焙在 op 里、几何表项按 op 顺序编号）：
                 // 有一项不同就重建 op 表。实例字节变了不影响绘制项，因此原地重写仍可复用 op。
@@ -1524,6 +1549,11 @@ impl InstanceEncoder {
         self.encoded_lanes
     }
 
+    /// 本帧重编码的几何块 op 数（增量几何的断言面：追加 K 线只应重编码尾块）。
+    pub(crate) fn encoded_geometry_chunks(&self) -> usize {
+        self.encoded_geometry_chunks
+    }
+
     /// 本帧增量上传的实例字节数（编码器侧值；渲染器路径会用载荷的实际字节数覆盖它）。
     pub(crate) fn written_bytes(&self) -> usize {
         self.written_bytes
@@ -1552,6 +1582,7 @@ impl InstanceEncoder {
         self.saved.clear();
         self.scale = None;
         self.encoded_lanes = 0;
+        self.encoded_geometry_chunks = 0;
         self.reused_segments = 0;
         self.written_bytes = 0;
         self.primed = false;
@@ -1947,12 +1978,21 @@ struct LaneEncoder<'a> {
     colors: &'a mut crate::paint::color::ResolveCache,
     /// 几何描述查表（UI 线程是 `GeometryStore`，合成线程是 `GeometryCatalog`）。
     geometry: &'a dyn GeometryLookup,
+    /// 本 lane 的几何块绘制范围（`None` = 非几何块 lane / 整块几何绘制；X5）。
+    chunk_scope: Option<(crate::paint::geometry::GeometryId, u32)>,
+    /// 本 lane 编码出的几何块 op 数（编码完成后由调用方累进 `InstanceEncoder`）。
+    emitted_geometry_chunks: usize,
     run_start: usize,
 }
 
 impl LaneEncoder<'_> {
     /// 编码一条 lane 的全部图元（clip 状态从「无裁剪」开始，结束时必须回到 0 层）。
-    fn encode_lane(&mut self, primitives: &[Primitive]) -> Result<(), EngineError> {
+    fn encode_lane(
+        &mut self,
+        primitives: &[Primitive],
+        chunk_scope: Option<(crate::paint::geometry::GeometryId, u32)>,
+    ) -> Result<(), EngineError> {
+        self.chunk_scope = chunk_scope;
         *self.state = ClipState::unbounded();
         self.saved.clear();
         for primitive in primitives {
@@ -2204,23 +2244,40 @@ impl LaneEncoder<'_> {
         let clip_aabb = self.clip_aabb();
         let clip_index = self.clip_index() as u32;
         let clip_rect = clip_aabb.map(f32::to_bits);
-        let mut push_part = |chunk: u32, bounds: Rect, snapshot: std::sync::Arc<_>| {
-            let visible = visible_aabb(transformed_aabb(transform, bounds), self.scale, clip_aabb);
-            self.parts.push(LanePart::Geometry(Box::new(LaneGeometry {
-                draw: GeometryDrawGpu {
-                    id,
-                    chunk,
-                    transform,
-                    color,
-                    snapshot,
-                },
-                clip_index,
-                clip_rect,
-                bounds: bounds_of_aabb(visible),
-            })));
-        };
-        match &registered {
-            Some(snapshot) => {
+        // 块 lane（几何节点的一条块 lane）只发它自己那一块；整块几何绘制（Canvas/Path）展开全部块。
+        let scope = self.chunk_scope.filter(|(scoped, _)| *scoped == id);
+        let mut emitted = 0usize;
+        let mut push_part =
+            |emitted: &mut usize, chunk: u32, bounds: Rect, snapshot: std::sync::Arc<_>| {
+                let visible =
+                    visible_aabb(transformed_aabb(transform, bounds), self.scale, clip_aabb);
+                self.parts.push(LanePart::Geometry(Box::new(LaneGeometry {
+                    draw: GeometryDrawGpu {
+                        id,
+                        chunk,
+                        transform,
+                        color,
+                        snapshot,
+                    },
+                    clip_index,
+                    clip_rect,
+                    bounds: bounds_of_aabb(visible),
+                })));
+                *emitted += 1;
+            };
+        match (&registered, scope) {
+            // 块 lane：只编码本块（块 AABB 为空时退回整块几何 bounds，保持旧可见范围）。
+            (Some(snapshot), Some((_, chunk))) => {
+                if let Some(meta) = snapshot.chunk(chunk) {
+                    let local = match (op_bounds, meta.bounds.is_empty()) {
+                        (Some(bounds), _) => bounds,
+                        (None, false) => meta.bounds,
+                        (None, true) => snapshot.bounds(),
+                    };
+                    push_part(&mut emitted, chunk, local, std::sync::Arc::clone(snapshot));
+                }
+            }
+            (Some(snapshot), None) => {
                 // 快照的块表是绘制序的权威来源；空块表只可能来自未注册兜底（不会走到这里）。
                 for (chunk, meta) in snapshot.chunks().iter().enumerate() {
                     let local = match (op_bounds, meta.bounds.is_empty()) {
@@ -2228,11 +2285,17 @@ impl LaneEncoder<'_> {
                         (None, false) => meta.bounds,
                         (None, true) => snapshot.bounds(),
                     };
-                    push_part(chunk as u32, local, std::sync::Arc::clone(snapshot));
+                    push_part(
+                        &mut emitted,
+                        chunk as u32,
+                        local,
+                        std::sync::Arc::clone(snapshot),
+                    );
                 }
             }
             // 未注册：拿不到真实范围，保守地用 clip 上界（GPU 侧会报 GeometryRegister）。
-            None => push_part(
+            (None, _) => push_part(
+                &mut emitted,
                 0,
                 op_bounds.unwrap_or_else(|| {
                     Rect::new(
@@ -2245,6 +2308,7 @@ impl LaneEncoder<'_> {
                 crate::paint::geometry_store::missing_snapshot(),
             ),
         }
+        self.emitted_geometry_chunks += emitted;
     }
 
     // ── 实例发射 ───────────────────────────────────────────────────────────

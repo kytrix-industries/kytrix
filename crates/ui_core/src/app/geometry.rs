@@ -25,8 +25,58 @@ use crate::{
     error::EngineError,
     math::{Rect, Transform},
     node::{id::NodeId, tree::NodeKind},
+    paint::geometry::{GeometryId, GeometryUpdate},
     window::WindowId,
 };
+
+/// `GeometryStore::update_*` 的引擎侧包装（X5）：数据更新 + 绑定几何节点自动标脏。
+///
+/// # 为什么不是纯数据更新
+///
+/// 几何数据变了以后，绘制输出（`Primitive::Geometry` / 块 lane 的块 AABB）必须跟着重算，
+/// 否则 GPU 读到的还是旧快照。`GeometryStore` 是进程级、不知道哪些节点引用它，因此这里用
+/// 节点树的反向绑定表把「数据更新」翻译成「绑定节点标 PAINT」：paint 走几何分块路径，
+/// 只重建**块版本变化**的块 lane（追加 K 线只重建尾块）。
+///
+/// 节点级 `REUSABLE` 不清、节点盒 damage 不并（见 `NodeTree::mark_geometry_updated`）：
+/// 块 lane 的 damage 由块 bounds 的旧∪新精确给出。
+///
+/// # Errors
+/// 同 [`crate::paint::geometry_store::GeometryStore::update_vertices`] /
+/// [`crate::paint::geometry_store::GeometryStore::update_indices`]（陈旧句柄 / 越界 / 非对齐 /
+/// 字节数不一致的强类型错误）。
+pub(crate) fn update_vertices(
+    app: &mut App,
+    id: GeometryId,
+    range: std::ops::Range<u32>,
+    bytes: &[u8],
+) -> Result<GeometryUpdate, EngineError> {
+    let update = app.geometry.update_vertices(id, range, bytes)?;
+    mark_bound_nodes(app, id, update.damaged);
+    Ok(update)
+}
+
+/// [`update_vertices`] 的索引版本（语义对称）。
+pub(crate) fn update_indices(
+    app: &mut App,
+    id: GeometryId,
+    range: std::ops::Range<u32>,
+    bytes: &[u8],
+) -> Result<GeometryUpdate, EngineError> {
+    let update = app.geometry.update_indices(id, range, bytes)?;
+    mark_bound_nodes(app, id, update.damaged);
+    Ok(update)
+}
+
+/// 把绑定到 `geometry` 的节点标 PAINT（`damaged` 为空 = 没有块受影响 ⇒ 不需要重绘）。
+fn mark_bound_nodes(app: &mut App, geometry: GeometryId, damaged: Rect) {
+    if damaged.is_empty() {
+        return;
+    }
+    for window in app.windows.values_mut() {
+        window.tree_mut().mark_geometry_updated(geometry);
+    }
+}
 
 /// 几何 damage 的额外外扩（逻辑像素）。
 ///
@@ -319,5 +369,272 @@ mod tests {
             Err(EngineError::UnknownWindow { window }) => assert_eq!(window, missing),
             other => panic!("不存在的窗口必须报 UnknownWindow，实际 {other:?}"),
         }
+    }
+    // ── X5：Geometry range 更新（数据层 + 节点标脏 + damage / 顺序快路径）─────────
+
+    use crate::math::PhysicalRect;
+
+    /// `triangles` 个互不共享顶点的三角形（真实位置；每 4096 个三角形一块）。
+    fn long_desc(triangles: u32) -> GeometryDesc {
+        let mut vertex_bytes = Vec::with_capacity(triangles as usize * 36);
+        let mut index_bytes = Vec::with_capacity(triangles as usize * 6);
+        for triangle in 0..triangles {
+            let base = (triangle * 3) as u16;
+            let x = (triangle % 64) as f32;
+            let y = (triangle / 64) as f32;
+            for (dx, dy) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)] {
+                vertex_bytes.extend_from_slice(&(x + dx).to_ne_bytes());
+                vertex_bytes.extend_from_slice(&(y + dy).to_ne_bytes());
+                vertex_bytes.extend_from_slice(&(-1.0f32).to_ne_bytes());
+            }
+            for index in [base, base + 1, base + 2] {
+                index_bytes.extend_from_slice(&index.to_ne_bytes());
+            }
+        }
+        GeometryDesc {
+            vertex_bytes: bytes::Bytes::from(vertex_bytes),
+            index_bytes: bytes::Bytes::from(index_bytes),
+            vertex_stride: 12,
+            index_type: IndexType::U16,
+            topology: Topology::TriangleList,
+            bounds: Rect::new(0.0, 0.0, 64.0, 100.0),
+            pipeline: GeometryPipeline::Ui,
+        }
+    }
+
+    fn register_long(app: &mut TestApp, triangles: u32) -> GeometryId {
+        app.app_mut()
+            .geometry_mut()
+            .insert(long_desc(triangles))
+            .expect("注册几何")
+    }
+
+    /// 每个块的 lane 内容版本（按块序）。
+    fn chunk_lane_versions(app: &TestApp, node: crate::node::id::NodeId) -> Vec<u32> {
+        let window = app.window_id();
+        let window_state = app.app().window(window).expect("窗口存在");
+        let tree = window_state.tree();
+        (0..tree.lane_count(node))
+            .map(|chunk| {
+                let lane = tree.lane_at(node, chunk).expect("块 lane");
+                window_state.scene().lane_state(lane).expect("lane").0
+            })
+            .collect()
+    }
+
+    fn vertex(x: f32, y: f32) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(12);
+        bytes.extend_from_slice(&x.to_ne_bytes());
+        bytes.extend_from_slice(&y.to_ne_bytes());
+        bytes.extend_from_slice(&(-1.0f32).to_ne_bytes());
+        bytes
+    }
+
+    /// 在几何末尾追加一个三角形（顶点 range + 索引 range，与 K 线追加同路径）。
+    fn append_triangle(app: &mut TestApp, id: GeometryId, x: f32, y: f32) {
+        let snapshot = app.app().geometry().snapshot_arc(id).expect("已注册");
+        let vertex_at = snapshot.vertex_len();
+        let mut vertices = Vec::with_capacity(36);
+        for (dx, dy) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)] {
+            vertices.extend_from_slice(&vertex(x + dx, y + dy));
+        }
+        app.app_mut()
+            .update_geometry_vertices(id, vertex_at..vertex_at + 36, &vertices)
+            .expect("追加顶点");
+        let index_at = snapshot.index_len();
+        let base = (snapshot.vertex_len() / 12) as u16;
+        let mut bytes = Vec::with_capacity(6);
+        for index in [base, base + 1, base + 2] {
+            bytes.extend_from_slice(&index.to_ne_bytes());
+        }
+        app.app_mut()
+            .update_geometry_indices(id, index_at..index_at + 6, &bytes)
+            .expect("追加索引");
+    }
+
+    fn damage_hits(damage: &[PhysicalRect], x: f32, y: f32) -> bool {
+        let point = PhysicalRect::new(
+            x.floor() as i32,
+            y.floor() as i32,
+            x.floor() as i32 + 2,
+            y.floor() as i32 + 2,
+        );
+        damage.iter().any(|rect| !rect.intersect(point).is_empty())
+    }
+
+    /// 顶点 range 更新（热力图改色 / 改一格位置）：只重建受影响块的 lane、只产生该块旧∪新的
+    /// damage，并且**不重排绘制序**（`delta.order == None` 快路径）。
+    #[test]
+    fn range_update_rebuilds_only_the_affected_chunk_lane() {
+        let mut app = TestApp::new();
+        let id = register_long(&mut app, 4096 + 10);
+        let node = mount(&mut app, id);
+        let before = chunk_lane_versions(&app, node);
+        assert_eq!(before.len(), 2, "两块几何 = 两条块 lane");
+
+        // 移动块 0 里的一个顶点（热力图改一格的位置/颜色都走同一个 range 更新入口）。
+        let update = app
+            .app_mut()
+            .update_geometry_vertices(id, 0..12, &vertex(100.0, 100.0))
+            .expect("顶点 range 更新");
+        assert!(!update.damaged.is_empty(), "受影响块必须给出 damage 范围");
+        let (stats, order_some, damage, damage_full) = {
+            let record = app.drain().expect("更新帧");
+            (
+                record.stats,
+                record.delta.order_some,
+                record.damage.clone(),
+                record.damage_full,
+            )
+        };
+
+        let after = chunk_lane_versions(&app, node);
+        assert!(
+            after[0] > before[0],
+            "块 0 的 lane 必须重建：before={before:?} after={after:?}"
+        );
+        assert_eq!(after[1], before[1], "块 1 的 lane 不得被触碰");
+        assert_eq!(stats.encoded_lanes, 1, "只重编码一条块 lane");
+        assert_eq!(stats.geometry_encoded_chunks, 1, "只重编码一块几何");
+        assert!(!order_some, "块版本更新不得重排绘制序");
+        assert!(!damage_full, "damage 不得退化为整帧");
+        assert!(
+            damage_hits(&damage, 100.0, 100.0),
+            "新位置必须重画：{damage:?}"
+        );
+        assert!(
+            update.damaged.origin.x <= 0.0
+                && update.damaged.origin.y <= 0.0
+                && update.damaged.max().x >= 100.0,
+            "API 返回的 damage 必须是受影响块旧∪新：{:?}",
+            update.damaged
+        );
+    }
+
+    /// 追加一个三角形到未满的尾块：只重建尾块 lane、damage 只覆盖尾块新范围。
+    #[test]
+    fn appending_to_the_tail_chunk_rebuilds_only_the_tail_chunk_lane() {
+        let mut app = TestApp::new();
+        let id = register_long(&mut app, 4096 + 2);
+        let node = mount(&mut app, id);
+        let before = chunk_lane_versions(&app, node);
+
+        append_triangle(&mut app, id, 100.0, 100.0);
+        let (stats, order_some, damage) = {
+            let record = app.drain().expect("追加帧");
+            (record.stats, record.delta.order_some, record.damage.clone())
+        };
+
+        let after = chunk_lane_versions(&app, node);
+        assert_eq!(after[0], before[0], "前面块 lane 不得重建（追加只动尾块）");
+        assert!(
+            after[1] > before[1],
+            "尾块 lane 必须重建：before={before:?} after={after:?}"
+        );
+        assert_eq!(stats.encoded_lanes, 1);
+        assert_eq!(stats.geometry_encoded_chunks, 1);
+        assert_eq!(stats.uploaded_bytes, 0, "几何追加不上传实例字节");
+        assert!(!order_some, "尾块增长不改变绘制序成员");
+        assert!(
+            damage_hits(&damage, 100.0, 100.0),
+            "新三角形必须进 damage：{damage:?}"
+        );
+    }
+
+    /// 块满后追加：新建块 lane，绘制序成员变化 ⇒ 本帧 `delta.order` 必须携带新序。
+    #[test]
+    fn appending_across_the_chunk_boundary_updates_the_draw_order_once() {
+        let mut app = TestApp::new();
+        let id = register_long(&mut app, 4096);
+        let node = mount(&mut app, id);
+        assert_eq!(chunk_lane_versions(&app, node).len(), 1);
+        let before = chunk_lane_versions(&app, node);
+
+        append_triangle(&mut app, id, 100.0, 100.0);
+        let (stats, order_some) = {
+            let record = app.drain().expect("跨块追加帧");
+            (record.stats, record.delta.order_some)
+        };
+        let after = chunk_lane_versions(&app, node);
+        assert_eq!(after.len(), 2, "满块后追加必须新建块 lane");
+        assert_eq!(after[0], before[0], "旧块 lane 不动");
+        assert_eq!(stats.encoded_lanes, 1);
+        assert_eq!(stats.geometry_encoded_chunks, 1);
+        assert!(order_some, "新 lane ⇒ 绘制序成员变化，delta 必须带新序");
+
+        // 下一帧没有新变化 ⇒ 空闲（顺序已经发布，不重复重建）。
+        let idle = app.drain().expect("后续帧");
+        assert!(!idle.rendered, "顺序已发布后的无变化帧必须空闲");
+        assert_eq!(idle.stats.encoded_lanes, 0);
+    }
+
+    /// 只追加未被索引引用的顶点：没有块受影响 ⇒ 无 damage、不标脏、帧保持空闲。
+    #[test]
+    fn appending_unreferenced_vertices_is_invisible_and_keeps_the_frame_idle() {
+        let mut app = TestApp::new();
+        let id = register_long(&mut app, 4096 + 2);
+        let _node = mount(&mut app, id);
+        let _ = app.drain().expect("首帧");
+
+        let vertex_at = app
+            .app()
+            .geometry()
+            .snapshot_arc(id)
+            .expect("已注册")
+            .vertex_len();
+        let update = app
+            .app_mut()
+            .update_geometry_vertices(id, vertex_at..vertex_at + 12, &vertex(1.0, 1.0))
+            .expect("追加孤立顶点");
+        assert!(update.damaged.is_empty(), "没有块引用新顶点 ⇒ damaged 为空");
+        let record = app.drain().expect("空闲帧");
+        assert!(!record.rendered, "无可见变化 ⇒ 帧必须退化 Idle");
+        assert_eq!(record.stats.encoded_lanes, 0);
+        assert_eq!(record.stats.geometry_encoded_chunks, 0);
+    }
+
+    /// 陈旧句柄与参数错误是**分开的**强类型错误（应用可按类型决定重注册 / 修参数）。
+    #[test]
+    fn range_update_errors_are_typed_and_distinct() {
+        let mut app = TestApp::new();
+        let id = register_long(&mut app, 4);
+        let stale = GeometryId::for_test(999, 1);
+        match app
+            .app_mut()
+            .update_geometry_vertices(stale, 0..12, &vertex(0.0, 0.0))
+        {
+            Err(EngineError::UnknownGeometry { geometry }) => assert_eq!(geometry, stale),
+            other => panic!("陈旧句柄必须报 UnknownGeometry，实际 {other:?}"),
+        }
+        let vertex_len = app
+            .app()
+            .geometry()
+            .snapshot_arc(id)
+            .expect("已注册")
+            .vertex_len();
+        match app.app_mut().update_geometry_vertices(
+            id,
+            vertex_len + 12..vertex_len + 24,
+            &vertex(0.0, 0.0),
+        ) {
+            Err(EngineError::GeometryRangeOutOfBounds { buffer, .. }) => {
+                assert_eq!(buffer, crate::paint::geometry::GeometryBuffer::Vertex);
+            }
+            other => panic!("越过末尾的空洞必须报 GeometryRangeOutOfBounds，实际 {other:?}"),
+        }
+        match app.app_mut().update_geometry_vertices(id, 0..6, &[0u8; 6]) {
+            Err(EngineError::GeometryRangeUnaligned { align, .. }) => assert_eq!(align, 12),
+            other => panic!("未按 stride 对齐必须报 GeometryRangeUnaligned，实际 {other:?}"),
+        }
+        match app.app_mut().update_geometry_vertices(id, 0..12, &[0u8; 6]) {
+            Err(EngineError::GeometryRangeBytes { bytes, .. }) => assert_eq!(bytes, 6),
+            other => panic!("字节数不一致必须报 GeometryRangeBytes，实际 {other:?}"),
+        }
+        // 合法空区间是 no-op：版本与画面都不动。
+        let update = app
+            .app_mut()
+            .update_geometry_indices(id, 0..0, &[])
+            .expect("空区间合法");
+        assert!(update.damaged.is_empty());
     }
 }

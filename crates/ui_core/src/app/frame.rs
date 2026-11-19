@@ -265,6 +265,8 @@ pub(crate) fn frame(
             // 编码器侧的增量字节数；渲染器路径会用载荷的实际字节数覆盖它
             // （`Window::submit_gpu`；headless 保持编码器侧值）。
             uploaded_bytes: paint.uploaded_bytes,
+            geometry_encoded_chunks: paint.geometry_encoded_chunks,
+            geometry_uploaded_bytes: paint.geometry_uploaded_bytes,
             // B6-2 的三个合成观测字段：`submit_gpu` 在发布时按合成路径回填
             // （inline ⇒ encode_on_compositor = false；threaded ⇒ 读合成线程计数）。
             compositor_inbox_latency: None,

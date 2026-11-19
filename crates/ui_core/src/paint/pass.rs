@@ -18,7 +18,7 @@ use crate::{
     math::{PhysicalRect, Point, Rect, Scale},
     node::{
         id::NodeId,
-        tree::{NodeKind, NodeTree},
+        tree::{BakedGeometryChunk, NodeKind, NodeTree, PaintNodeState},
     },
     paint::{
         color::Color,
@@ -110,6 +110,12 @@ pub(crate) struct PaintReport {
     /// 本帧重编码写入实例环的字节数（增量上传量的编码器侧值）。
     #[cfg(feature = "test-support")]
     pub uploaded_bytes: usize,
+    /// 本帧重编码的几何块 op 数（X5：K 线追加应恒为 1）。
+    #[cfg(feature = "test-support")]
+    pub geometry_encoded_chunks: usize,
+    /// 本帧 GPU 侧实际上传的几何字节数（X5；渲染器路径回填，headless 恒 0）。
+    #[cfg(feature = "test-support")]
+    pub geometry_uploaded_bytes: usize,
     /// 本帧滚动偏移变化的槽数（`FrameStats::scroll_offset_frames` 的 inline 来源）。
     #[cfg(feature = "test-support")]
     pub scroll_slots: usize,
@@ -181,6 +187,8 @@ impl PaintPass<'_> {
             rebuilt: 0,
             visited: 0,
             order_changed: false,
+            baked_scratch: SmallVec::new(),
+            rebuild_scratch: SmallVec::new(),
         };
         let mut clip = ClipContext::default();
         let root = context.tree.root();
@@ -224,6 +232,10 @@ impl PaintPass<'_> {
             #[cfg(feature = "test-support")]
             uploaded_bytes: 0,
             #[cfg(feature = "test-support")]
+            geometry_encoded_chunks: 0,
+            #[cfg(feature = "test-support")]
+            geometry_uploaded_bytes: 0,
+            #[cfg(feature = "test-support")]
             scroll_slots: 0,
             #[cfg(feature = "test-support")]
             log: context.log,
@@ -259,6 +271,10 @@ struct PaintContext<'a> {
     visited: usize,
     /// 增量路径：本帧是否新建 / 释放过 lane（绘制序成员变化 ⇒ 需要兜底重建）。
     order_changed: bool,
+    /// 几何块 lane 重建工作区：旧的烘焙块状态（跨节点/帧复用容量；X5）。
+    baked_scratch: SmallVec<[crate::node::tree::BakedGeometryChunk; 2]>,
+    /// 几何块 lane 重建工作区：本帧要重建哪些块（与块数等长）。
+    rebuild_scratch: SmallVec<[bool; 8]>,
 }
 
 /// 屏幕 = 内容 − `total`；图元烘焙 = 内容 − (`total` − `slot_offset`)。
@@ -341,7 +357,6 @@ enum Content {
     Box,
     Text(Option<Rc<ShapedLine>>),
     Canvas(Arc<crate::paint::canvas::Canvas>),
-    Geometry(crate::paint::geometry::GeometryId),
 }
 
 /// 该内容是否会产生图元（决定要不要为它压一层内容 clip）。
@@ -352,7 +367,7 @@ fn content_needs_clip(content: &Content) -> bool {
     match content {
         Content::Box => false,
         Content::Text(line) => line.is_some(),
-        Content::Canvas(_) | Content::Geometry(_) => true,
+        Content::Canvas(_) => true,
     }
 }
 
@@ -430,7 +445,11 @@ fn paint_node(
         && state
             .lane
             .is_none_or(|lane| context.scene.lane_scroll(lane) == node_slot);
-    if reusable {
+    if let Some(geometry) = state.geometry {
+        // 几何节点：按块 lane 重建（X5）。数据 range 更新只把受影响块的版本推进，因此这里
+        // 只重建版本变化的块 lane —— 追加 K 线只重建尾块，热力图改色只重建受影响块。
+        paint_geometry_node(context, node, &state, geometry, clip, total)?;
+    } else if reusable {
         // 增量路径不 push 绘制序：顺序没变（结构未变、lane 成员未变），`Scene::order` 整体保留。
         if context.mode.is_full()
             && let Some(lane) = state.lane
@@ -579,8 +598,9 @@ fn rebuild_order_only(tree: &NodeTree, order: &mut Vec<LaneId>) {
             // 隐藏子树：`hide_subtree` 已把它的 lane 清空，全量路径同样不会把它计入绘制序。
             continue;
         }
-        if let Some(lane) = target.lane() {
-            order.push(lane);
+        // 几何节点按块序 push 全部块 lane（X5：块间序 = 块序 = 索引顺序）；普通节点 0/1 条。
+        for lane in target.lanes() {
+            order.push(*lane);
         }
         for child in target.children().iter().rev() {
             stack.push((*child, false));
@@ -622,7 +642,11 @@ fn hide_subtree(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
                 .map_or(Point::ZERO, |slot| slot.offset);
         (children, damage_rect, child_offset)
     };
-    if let Some(lane) = context.tree.lane_of(node) {
+    // 几何节点可能有多条块 lane（X5）：隐藏时全部清空（保留分配，再次显示时重建）。
+    for index in 0..context.tree.lane_count(node) {
+        let Some(lane) = context.tree.lane_at(node, index) else {
+            continue;
+        };
         let had_primitives = context
             .scene
             .lane_primitives(lane)
@@ -715,7 +739,9 @@ fn rebuild_lane(
             NodeKind::Box => Content::Box,
             NodeKind::Text(_) => Content::Text(context.tree.text_line(node).cloned()),
             NodeKind::Canvas(canvas) => Content::Canvas(Arc::clone(canvas)),
-            NodeKind::Geometry(id) => Content::Geometry(*id),
+            // 几何节点在 paint_node 就分流到 paint_geometry_node（块 lane 路径），
+            // 不会走到单 lane 的重建里；这里只是满足 match 的穷尽性。
+            NodeKind::Geometry(_) => Content::Box,
         };
         // 烘焙坐标 = 布局坐标 − 祖先滚动偏移（P10 §7.2；**不含本槽自己的位移**）。
         let bounds = target.layout().bounds.translate(negate(bake));
@@ -728,12 +754,9 @@ fn rebuild_lane(
         let ring = (context.focused == Some(node))
             .then(|| context.tree.focus_ring(node))
             .flatten();
-        // R05-12：几何节点的 per-draw 变换（旁表，未设置 = 单位矩阵）。只在几何节点上查表，
-        // 避免每帧每节点一次 HashMap 查找（热路径）。
-        let geometry_transform = match &content {
-            Content::Geometry(_) => context.tree.geometry_transform(node),
-            _ => crate::math::Transform::IDENTITY,
-        };
+        // 普通内容（Box/Text/Canvas）没有 per-draw 变换；几何节点的变换由
+        // paint_geometry_node 单独读取（X5）。
+        let geometry_transform = crate::math::Transform::IDENTITY;
         (
             bounds,
             content_offset,
@@ -849,7 +872,454 @@ fn rebuild_lane(
     Ok(())
 }
 
-/// 逐图元生成 + damage 累积（§6.2 的生成表）。
+/// 几何节点一次 paint 需要的绘制状态（与 `rebuild_lane` 的读取块同源；X5）。
+struct GeometryNodeState {
+    /// 节点盒的**烘焙坐标**（几何节点 = 屏幕坐标）。
+    bounds: Rect,
+    content_offset: Point,
+    patch: StylePatch,
+    spec: Option<PaintSpec>,
+    node_damage: Rect,
+    ring: Option<crate::paint::style::FocusRing>,
+    content_clip: Option<Rect>,
+    geometry_transform: crate::math::Transform,
+    /// 图元烘焙偏移（几何节点 = 祖先滚动累计值，因为它是 screen-baked 节点）。
+    bake: Point,
+}
+
+/// 读一个几何节点的全部绘制状态（一次 arena 查找 + 少量旁表查；消费者：
+/// [`paint_geometry_node`]）。
+fn geometry_node_state(
+    context: &PaintContext<'_>,
+    node: NodeId,
+    total: Point,
+    node_slot_offset: Point,
+) -> Option<GeometryNodeState> {
+    let Ok(target) = context.tree.get(node) else {
+        return None;
+    };
+    let bake = offset_between(total, node_slot_offset);
+    let bounds = target.layout().bounds.translate(negate(bake));
+    let patch = target.style_patch().clone();
+    let spec = target.paint_spec().cloned();
+    let node_damage = target.damage();
+    let content_offset = context.tree.content_offset(node);
+    let content_clip =
+        (target.clip() == Clip::Bounds).then(|| bounds.inset(target.layout().border));
+    let ring = (context.focused == Some(node))
+        .then(|| context.tree.focus_ring(node))
+        .flatten();
+    let geometry_transform = context.tree.geometry_transform(node);
+    Some(GeometryNodeState {
+        bounds,
+        content_offset,
+        patch,
+        spec,
+        node_damage,
+        ring,
+        content_clip,
+        geometry_transform,
+        bake,
+    })
+}
+
+/// 某块在**逻辑空间**的 AABB（快照块表；空块退回整块几何 bounds）。`None` = 未注册句柄。
+fn geometry_chunk_local_bounds(
+    snapshot: Option<&std::sync::Arc<crate::paint::geometry::GeometrySnapshot>>,
+    chunk: usize,
+) -> Option<Rect> {
+    let snapshot = snapshot?;
+    Some(
+        snapshot
+            .chunk(chunk as u32)
+            .map(|meta| meta.bounds)
+            .filter(|bounds| !bounds.is_empty())
+            .unwrap_or_else(|| snapshot.bounds()),
+    )
+}
+
+/// 几何节点不可见 / 零尺寸：释放全部块 lane、清空块状态，并把旧块范围并入 damage。
+fn clear_geometry_lanes(
+    context: &mut PaintContext<'_>,
+    node: NodeId,
+    old_lanes: usize,
+    total: Point,
+    clip: &ClipContext,
+    node_damage: &Rect,
+    geometry_transform: crate::math::Transform,
+    bake: Point,
+) {
+    for chunk in 0..old_lanes {
+        let Some(previous) = context.baked_scratch.get(chunk).copied() else {
+            continue;
+        };
+        let damage = geometry_chunk_damage(geometry_transform, previous.bounds, total);
+        if !damage.is_empty() {
+            context.damage.push(damage, 1.0, clip.covering);
+        }
+    }
+    let mut order_changed = false;
+    for chunk in 0..old_lanes {
+        let Some(lane) = context.tree.lane_at(node, chunk) else {
+            continue;
+        };
+        let had_primitives = context
+            .scene
+            .lane_primitives(lane)
+            .is_some_and(|primitives| !primitives.is_empty());
+        if !context.mode.is_full() && had_primitives {
+            order_changed = true;
+        }
+        context.scene.release_lane(lane);
+        #[cfg(feature = "test-support")]
+        context.log.lanes.push(LanePaintEntry {
+            lane,
+            node,
+            outcome: LaneOutcome::Cleared,
+            primitives: 0,
+        });
+    }
+    context.tree.clear_lane(node);
+    context.tree.resize_baked_geometry_chunks(node, 0);
+    if !node_damage.is_empty() {
+        context
+            .damage
+            .push(node_damage.translate(negate(total)), 1.0, clip.covering);
+        context.rebuilt += 1;
+    }
+    context.tree.set_reusable(node);
+    context.tree.set_clip_key(node, clip.key());
+    context.tree.set_lane_offset(node, bake);
+    context.tree.clear_paint(node);
+    if order_changed {
+        context.order_changed = true;
+    }
+}
+
+/// 几何节点的 paint（X5）：按**块 lane** 规划绘制输出，只重建数据版本变化的块。
+///
+/// # 契约（与单 lane 完全一致）
+///
+/// - **块内/块间绘制序**：块 lane 在绘制序里连续（`lanes[0..n]`，按块序），块内图元序 =
+///   祖先 clip 前缀 → 块 0 lane 的装饰（Shadow/背景/边框/焦点环）→ 内容 clip → 几何 →
+///   content clip 后缀 → 祖先 clip 后缀；块 `i>0` 的 lane 只有「祖先 clip 前缀 + 内容 clip +
+///   第 i 块几何 + 后缀」。与旧单 lane 的差异只是「内容」被切到多条 lane，绘制顺序不变。
+/// - **clip 语义**：每条块 lane 都带完整的祖先 clip 前缀/后缀 + 内容 clip 括号（`emit_content`
+///   的同一实现），因此裁剪结果与单 lane 逐像素一致。
+/// - **复用**：`REUSABLE` + clip 上下文 + 烘焙偏移一致的前提下，只有**块版本**（几何数据里
+///   该块的 revision）变化的块 lane 被重建。data-only 更新（`mark_geometry_updated`）不清
+///   `REUSABLE`，于是追加 K 线只重建尾块、热力图改色只重建受影响块；纯滚动帧仍然
+///   `encoded_lanes == 0`、`delta.order == None`。
+/// - **damage**：每条被重建的块 lane 把「旧块 bounds ∪ 新块 bounds」（经 per-draw 变换）
+///   并入 damage；块数增加/减少同样按旧 bounds 记 damage。
+///
+/// # Panics
+/// debug 构建断言几何节点是 screen-baked（`paint_node` 恒传 slot 0 / offset 0）。
+fn paint_geometry_node(
+    context: &mut PaintContext<'_>,
+    node: NodeId,
+    state: &PaintNodeState,
+    geometry_id: crate::paint::geometry::GeometryId,
+    clip: &ClipContext,
+    total: Point,
+) -> Result<(), EngineError> {
+    let snapshot = context.geometry.snapshot_arc(geometry_id);
+    // 块数：未注册句柄保守按 1 块（GPU 侧报 `GeometryRegister`，与旧行为一致）。
+    let desired = snapshot
+        .as_ref()
+        .map_or(1, |snapshot| snapshot.chunks().len().max(1));
+    // 一次 arena 查找取全本节点的绘制状态（与 `rebuild_lane` 同一份读取块）。
+    let Some(node_state) = geometry_node_state(context, node, total, Point::ZERO) else {
+        return Ok(());
+    };
+    let GeometryNodeState {
+        bounds,
+        content_offset,
+        patch,
+        spec,
+        node_damage,
+        ring,
+        content_clip,
+        geometry_transform,
+        bake,
+    } = node_state;
+    let opacity = match patch.opacity {
+        Some(value) if value.is_nan() => 0.0,
+        Some(value) => value.clamp(0.0, 1.0),
+        None => 1.0,
+    };
+    let visible = patch.visible.unwrap_or(true);
+    let old_lanes = context.tree.lane_count(node);
+    // 旧块烘焙状态（决定「哪些块需要重建」与旧 bounds damage），拷进复用工作区。
+    context.baked_scratch.clear();
+    if let Some(baked) = context.tree.baked_geometry_chunks(node) {
+        context.baked_scratch.extend(baked.iter().copied());
+    }
+    // 节点级 gate：不可见 / 零尺寸布局盒 ⇒ 不画任何块（旧实现 `PrimitiveEmitter::emit` 的
+    // 早退语义），清空全部块 lane 并把旧块范围并入 damage。
+    if !visible || bounds.is_empty() {
+        clear_geometry_lanes(
+            context,
+            node,
+            old_lanes,
+            total,
+            clip,
+            &node_damage,
+            geometry_transform,
+            bake,
+        );
+        return Ok(());
+    }
+    // 规划：块数变化 / 节点级重建（`REUSABLE` 失配）⇒ 全部块重建；否则只重建版本变化的块。
+    context.rebuild_scratch.clear();
+    for chunk in 0..desired {
+        let lane_missing = context.tree.lane_at(node, chunk).is_none();
+        let revision = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.chunk(chunk as u32))
+            .map_or(0, |meta| meta.revision);
+        let baked_matches = context
+            .baked_scratch
+            .get(chunk)
+            .is_some_and(|baked| baked.revision == revision);
+        context
+            .rebuild_scratch
+            .push(!state.reusable || lane_missing || !baked_matches);
+    }
+    // 先对齐块状态的条目数（复用块保留原值；新块由上面的规划判为重建）。
+    context.tree.resize_baked_geometry_chunks(node, desired);
+    let mut created_any = false;
+    // 内层 clip（屏幕 → 烘焙坐标；几何节点恒 slot 0：见 `paint_node` 的 screen_baked 分支）。
+    let inner_clips = &clip.rects[..];
+    for chunk in 0..desired {
+        let lane = match context.tree.lane_at(node, chunk) {
+            Some(lane) => lane,
+            None => {
+                let lane = context.scene.new_lane();
+                context.tree.push_lane(node, lane);
+                created_any = true;
+                lane
+            }
+        };
+        if !context.rebuild_scratch[chunk] {
+            if context.mode.is_full() {
+                context.order.push(lane);
+            }
+            #[cfg(feature = "test-support")]
+            {
+                let primitives = context
+                    .scene
+                    .lane_primitives(lane)
+                    .map_or(0, <[Primitive]>::len);
+                context.log.lanes.push(LanePaintEntry {
+                    lane,
+                    node,
+                    outcome: LaneOutcome::Reused,
+                    primitives,
+                });
+            }
+            continue;
+        }
+        // 旧块 bounds 必须在清空 lane 之前记下（内容收缩 / 块删除时旧像素要重画）。
+        let previous = context.baked_scratch.get(chunk).copied();
+        let had_primitives = context
+            .scene
+            .lane_primitives(lane)
+            .is_some_and(|primitives| !primitives.is_empty());
+        let _ = context.scene.clear_lane(lane);
+        let _ = context.scene.set_lane_scroll(lane, 0);
+        context
+            .scene
+            .set_lane_geometry_chunk(lane, Some((geometry_id, chunk as u32)));
+        context.tree.set_lane_offset(node, bake);
+        for clip_rect in inner_clips {
+            let _ = context
+                .scene
+                .push(lane, Primitive::Clip(ClipOp::Push(*clip_rect)));
+        }
+        let mut emitter = PrimitiveEmitter {
+            lane,
+            bounds,
+            content_offset,
+            patch: patch.clone(),
+            spec: spec.clone(),
+            scale: context.scale,
+            clip: clip.covering,
+            content: Content::Box,
+            emitted: 0,
+            node_damage: if chunk == 0 {
+                node_damage
+            } else {
+                Rect::default()
+            },
+            offset: total,
+            damage_shift: negate(Point::ZERO),
+            ring: if chunk == 0 { ring } else { None },
+            geometry_transform,
+            content_clip,
+        };
+        if chunk == 0 {
+            emitter.emit_decorations(context, opacity);
+        }
+        emitter.emit_geometry_chunk(context, geometry_id, chunk as u32, opacity);
+        if chunk == 0 {
+            emitter.emit_focus_ring(context, opacity);
+            emitter.emit_node_damage(context);
+        }
+        for _ in inner_clips.iter().rev() {
+            let _ = context.scene.push(lane, Primitive::Clip(ClipOp::Pop));
+        }
+        // 全量路径的绘制序在同一次遍历里生成（增量路径不 push：顺序不变；新建 lane 由
+        // 遍历结束后的轻量 DFS 兜底重建）。
+        if context.mode.is_full() {
+            context.order.push(lane);
+        }
+        // damage = 旧块 bounds ∪ 新块 bounds（都经 per-draw 变换；旧一侧来自烘焙状态）。
+        let mut damage = match (
+            &snapshot,
+            geometry_chunk_local_bounds(snapshot.as_ref(), chunk),
+        ) {
+            // 未注册句柄：旧实现退回节点布局盒（拿不到真实范围）。
+            (None, _) => bounds,
+            (Some(_), Some(new_bounds)) => {
+                geometry_chunk_damage(geometry_transform, new_bounds, total)
+            }
+            (Some(_), None) => Rect::default(),
+        };
+        if let Some(previous) = previous {
+            damage = damage.union(geometry_chunk_damage(
+                geometry_transform,
+                previous.bounds,
+                total,
+            ));
+        }
+        if !damage.is_empty() {
+            context.damage.push(damage, 1.0, clip.covering);
+        }
+        let revision = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.chunk(chunk as u32))
+            .map_or(0, |meta| meta.revision);
+        let baked_bounds =
+            geometry_chunk_local_bounds(snapshot.as_ref(), chunk).unwrap_or_default();
+        context.tree.set_baked_geometry_chunk(
+            node,
+            chunk,
+            BakedGeometryChunk {
+                revision,
+                bounds: baked_bounds,
+            },
+        );
+        context.rebuilt += 1;
+        #[cfg(feature = "test-support")]
+        {
+            let primitives = context
+                .scene
+                .lane_primitives(lane)
+                .map_or(0, <[Primitive]>::len);
+            context.log.lanes.push(LanePaintEntry {
+                lane,
+                node,
+                outcome: if had_primitives {
+                    LaneOutcome::Rebuilt
+                } else {
+                    LaneOutcome::Allocated
+                },
+                primitives,
+            });
+        }
+    }
+    // 块数减少（当前 API 只能增长，保留这条路径给「重置/截断」的后续语义）：释放多余 lane。
+    for chunk in desired..old_lanes {
+        let Some(lane) = context.tree.lane_at(node, chunk) else {
+            continue;
+        };
+        let had_primitives = context
+            .scene
+            .lane_primitives(lane)
+            .is_some_and(|primitives| !primitives.is_empty());
+        if let Some(previous) = context.baked_scratch.get(chunk) {
+            let damage = geometry_chunk_damage(geometry_transform, previous.bounds, total);
+            if !damage.is_empty() {
+                context.damage.push(damage, 1.0, clip.covering);
+            }
+        }
+        context.scene.release_lane(lane);
+        context.rebuilt += 1;
+        if !context.mode.is_full() && had_primitives {
+            context.order_changed = true;
+        }
+    }
+    // 截断 `Node.lanes` / 块状态到 `desired`。
+    context.tree.truncate_lanes(node, desired);
+    context.tree.resize_baked_geometry_chunks(node, desired);
+    context.tree.set_reusable(node);
+    context.tree.set_clip_key(node, clip.key());
+    context.tree.set_lane_offset(node, bake);
+    context.tree.clear_paint(node);
+    if !context.mode.is_full() && created_any {
+        context.order_changed = true;
+    }
+    Ok(())
+}
+
+/// 几何块 lane 的 damage 范围：`transform(块 AABB)` 换算到屏幕坐标（减祖先滚动累计值）。
+///
+/// 块 bounds 是**逻辑像素**（几何局部空间，与 `GeometryDesc.bounds` 同空间），因此要先过
+/// per-draw 变换再减滚动累计值 —— 与旧单 lane 的 `geometry_damage` 同一算法；顶点位移时
+/// 调用方把「旧块 bounds」也过一次同样的变换，两者并集就是「旧位置 ∪ 新位置」。
+fn geometry_chunk_damage(
+    transform: crate::math::Transform,
+    chunk_bounds: Rect,
+    total: Point,
+) -> Rect {
+    if chunk_bounds.is_empty() {
+        return Rect::default();
+    }
+    let aabb = transformed_chunk_aabb(transform, chunk_bounds);
+    Rect::new(
+        aabb[0] - total.x,
+        aabb[1] - total.y,
+        (aabb[2] - aabb[0]).max(0.0),
+        (aabb[3] - aabb[1]).max(0.0),
+    )
+}
+
+/// 逻辑矩形经仿射变换后的 AABB（`[x0, y0, x1, y1]`；非有限输入 = 空区间）。
+fn transformed_chunk_aabb(transform: crate::math::Transform, bounds: Rect) -> [f32; 4] {
+    let far = Point::new(
+        bounds.origin.x + bounds.size.width,
+        bounds.origin.y + bounds.size.height,
+    );
+    let corners = [
+        transform.apply(bounds.origin),
+        transform.apply(Point::new(far.x, bounds.origin.y)),
+        transform.apply(Point::new(bounds.origin.x, far.y)),
+        transform.apply(far),
+    ];
+    if !corners
+        .iter()
+        .all(|point| point.x.is_finite() && point.y.is_finite())
+    {
+        return [1.0, 1.0, -1.0, -1.0];
+    }
+    let mut aabb = [
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    ];
+    for point in corners {
+        aabb = [
+            aabb[0].min(point.x),
+            aabb[1].min(point.y),
+            aabb[2].max(point.x),
+            aabb[3].max(point.y),
+        ];
+    }
+    aabb
+}
+
 struct PrimitiveEmitter {
     /// 发出本节点图元的节点 id（D-5：图集代际不匹配时记入 `stale_text` 重新入队）。
     node: NodeId,
@@ -889,58 +1359,6 @@ fn negate(offset: Point) -> Point {
     Point::new(-offset.x, -offset.y)
 }
 
-/// 几何内容的 damage 范围：`transform(GeometryDesc.bounds)`（真实可见范围，逻辑窗口坐标），
-/// 句柄陈旧/未注册时退回节点布局盒。
-///
-/// R05-12：旧实现忽略 per-draw `transform` —— 平移后 damage 用的是**未变换**的 bounds，
-/// 溢出部分在局部刷新时不会被重画（残影）。
-fn geometry_damage(
-    geometry: &crate::paint::geometry_store::GeometryStore,
-    id: crate::paint::geometry::GeometryId,
-    node_bounds: Rect,
-    offset: Point,
-    transform: crate::math::Transform,
-) -> Rect {
-    let Some(snapshot) = geometry.snapshot_arc(id) else {
-        return node_bounds;
-    };
-    let bounds = snapshot.bounds();
-    // 轴对齐仿射变换后的 AABB（与编码器 `transformed_aabb` 同一算法；四角取极值）。
-    let far = Point::new(
-        bounds.origin.x + bounds.size.width,
-        bounds.origin.y + bounds.size.height,
-    );
-    let corners = [
-        transform.apply(bounds.origin),
-        transform.apply(Point::new(far.x, bounds.origin.y)),
-        transform.apply(Point::new(bounds.origin.x, far.y)),
-        transform.apply(far),
-    ];
-    if !corners
-        .iter()
-        .all(|point| point.x.is_finite() && point.y.is_finite())
-    {
-        return node_bounds;
-    }
-    let min_x = corners
-        .iter()
-        .map(|point| point.x)
-        .fold(f32::INFINITY, f32::min);
-    let min_y = corners
-        .iter()
-        .map(|point| point.y)
-        .fold(f32::INFINITY, f32::min);
-    let max_x = corners
-        .iter()
-        .map(|point| point.x)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let max_y = corners
-        .iter()
-        .map(|point| point.y)
-        .fold(f32::NEG_INFINITY, f32::max);
-    Rect::new(min_x, min_y, max_x - min_x, max_y - min_y).translate(negate(offset))
-}
-
 /// 上一帧 lane 里**内容图元**的可见范围（lane 重建 / 隐藏**之前**记下；AR5 P2-1）。
 ///
 /// 文本（`Clip::None` 的长行可以溢出节点盒）与 Canvas 的可见范围都可能大于节点布局盒。
@@ -961,23 +1379,27 @@ struct PaintedContent {
 }
 
 fn painted_content(tree: &NodeTree, scene: &Scene, node: NodeId) -> PaintedContent {
-    let Some(lane) = tree.lane_of(node) else {
-        return PaintedContent::default();
-    };
-    let Some(primitives) = scene.lane_primitives(lane) else {
-        return PaintedContent::default();
-    };
     let mut content = Rect::default();
     let mut screen = Rect::default();
-    for primitive in primitives {
-        match primitive {
-            Primitive::GlyphRun(run) => {
-                for glyph in &run.glyphs {
-                    content = content.union(Rect::from_origin_size(glyph.position, glyph.size));
+    // 几何节点可能有多条块 lane（X5）；文本/Canvas 节点恒 ≤1 条。几何图元不进这里
+    // （几何的旧可见范围由 `geometry_chunks` 旁路按块精确给出）。
+    for index in 0..tree.lane_count(node) {
+        let Some(lane) = tree.lane_at(node, index) else {
+            continue;
+        };
+        let Some(primitives) = scene.lane_primitives(lane) else {
+            continue;
+        };
+        for primitive in primitives {
+            match primitive {
+                Primitive::GlyphRun(run) => {
+                    for glyph in &run.glyphs {
+                        content = content.union(Rect::from_origin_size(glyph.position, glyph.size));
+                    }
                 }
+                Primitive::Canvas(canvas) => screen = screen.union(canvas.bounds()),
+                _ => {}
             }
-            Primitive::Canvas(canvas) => screen = screen.union(canvas.bounds()),
-            _ => {}
         }
     }
     PaintedContent {
@@ -1010,13 +1432,20 @@ impl PrimitiveEmitter {
             None => 1.0,
         };
         if !visible || self.bounds.is_empty() {
-            if !self.node_damage.is_empty() {
-                let damage = self.node_damage.translate(negate(self.offset));
-                context.damage.push(damage, 1.0, self.clip);
-            }
+            self.emit_node_damage(context);
             return;
         }
+        self.emit_decorations(context, opacity);
+        self.emit_content(context, opacity);
+        self.emit_focus_ring(context, opacity);
+        self.emit_node_damage(context);
+    }
 
+    /// 装饰层（Shadow → 背景/渐变 → 边框）：不参与内容 clip，也不含焦点环/内容。
+    ///
+    /// 拆成独立方法的唯一原因：几何节点的块 0 lane 要在「装饰之后、焦点环之前」插入几何
+    /// 内容（X5 的多 lane 分块），而 `emit` 的单 lane 顺序必须逐图元保持原样。
+    fn emit_decorations(&mut self, context: &mut PaintContext<'_>, opacity: f32) {
         let spec = self.spec.clone().unwrap_or_default();
         let radii = spec.corner_radius;
         if let Some(shadow) = spec.shadow {
@@ -1112,10 +1541,11 @@ impl PrimitiveEmitter {
                 }
             }
         }
+    }
 
-        self.emit_content(context, opacity);
-
-        // 焦点环：在**节点自己的 lane 内**画（受祖先 clip 约束），环在 border box 外侧。
+    /// 焦点环：在**节点自己的 lane 内**画（受祖先 clip 约束），环在 border box 外侧。
+    fn emit_focus_ring(&mut self, context: &mut PaintContext<'_>, opacity: f32) {
+        let radii = self.spec.clone().unwrap_or_default().corner_radius;
         if let Some(ring) = self.ring
             && ring.width > 0.0
             && !ring.color.with_opacity(opacity).is_transparent()
@@ -1141,10 +1571,52 @@ impl PrimitiveEmitter {
             );
             self.push_damage(context, bounds, 1.0);
         }
+    }
 
+    /// 节点级 damage（`touch`/布局写入）转屏幕坐标后并入；装饰/内容/几何都没有产出时也要记
+    /// （内容收缩 / 节点不可见时的旧像素）。
+    fn emit_node_damage(&mut self, context: &mut PaintContext<'_>) {
         if self.emitted > 0 || !self.node_damage.is_empty() {
             let damage = self.node_damage.translate(negate(self.offset));
             context.damage.push(damage, 1.0, self.clip);
+        }
+    }
+
+    /// 几何块的内容：内容 clip 括号 + 一条 Primitive::Geometry（X5 的块 lane 内容）。
+    ///
+    /// chunk 是块号（编码器据此只发该块的 draw range）；paint_geometry_node 已把旧/新块
+    /// bounds 的 damage 记好，这里只负责「画什么」。
+    fn emit_geometry_chunk(
+        &mut self,
+        context: &mut PaintContext<'_>,
+        id: crate::paint::geometry::GeometryId,
+        chunk: u32,
+        opacity: f32,
+    ) {
+        let _ = chunk;
+        let content_clip = self.content_clip.map(|rect| ClipRect {
+            rect,
+            corner_radius: [0.0; 4],
+        });
+        if let Some(clip_rect) = content_clip {
+            let _ = context
+                .scene
+                .push(self.lane, Primitive::Clip(ClipOp::Push(clip_rect)));
+        }
+        self.push(
+            context,
+            Primitive::Geometry(GeometryDraw {
+                id,
+                transform: self.geometry_transform,
+                color: self
+                    .patch
+                    .foreground
+                    .unwrap_or(Color::WHITE)
+                    .with_opacity(opacity),
+            }),
+        );
+        if content_clip.is_some() {
+            let _ = context.scene.push(self.lane, Primitive::Clip(ClipOp::Pop));
         }
     }
 
@@ -1170,31 +1642,7 @@ impl PrimitiveEmitter {
         }
         match std::mem::replace(&mut self.content, Content::Box) {
             Content::Box => {}
-            Content::Geometry(id) => {
-                self.push(
-                    context,
-                    Primitive::Geometry(GeometryDraw {
-                        id,
-                        transform: self.geometry_transform,
-                        color: self
-                            .patch
-                            .foreground
-                            .unwrap_or(Color::WHITE)
-                            .with_opacity(opacity),
-                    }),
-                );
-                // 几何的可见范围是它**自己的** AABB（`desc.bounds`，逻辑窗口坐标），
-                // 可能超出节点布局盒。旧实现按节点盒推 damage，于是几何溢出部分在局部
-                // 刷新时不会被重画（残影，复审 P2-2）。节点盒仍是命中测试的范围。
-                let geometry_bounds = geometry_damage(
-                    context.geometry,
-                    id,
-                    self.bounds,
-                    self.offset,
-                    self.geometry_transform,
-                );
-                context.damage.push(geometry_bounds, 1.0, self.clip);
-            }
+
             Content::Canvas(canvas) => {
                 let canvas_bounds = canvas.bounds();
                 self.push(context, Primitive::Canvas(Arc::clone(&canvas)));
@@ -1299,6 +1747,8 @@ mod tests {
         scroll_slot_nodes: Vec<crate::node::id::NodeId>,
         /// D-5：绘制前图集代际校验的注入点（None = 不校验）。
         atlas_generation: Option<u32>,
+        /// 几何注册表（几何节点的块 lane 测试用；X5）。
+        geometry: crate::paint::geometry_store::GeometryStore,
     }
 
     impl Harness {
@@ -1311,16 +1761,17 @@ mod tests {
                 scroll_slots: Vec::new(),
                 scroll_slot_nodes: Vec::new(),
                 atlas_generation: None,
+                geometry: crate::paint::geometry_store::GeometryStore::new(),
             }
         }
 
         fn try_paint(&mut self) -> Result<super::PaintReport, crate::error::EngineError> {
             self.damage.reset(scale());
             self.order.clear();
-            let geometry_store = crate::paint::geometry_store::GeometryStore::new();
+            let geometry = &self.geometry;
             let mut pass = PaintPass {
                 tree: &mut self.tree,
-                geometry: &geometry_store,
+                geometry,
                 scene: &mut self.scene,
                 damage: &mut self.damage,
                 scale: scale(),
@@ -1348,10 +1799,10 @@ mod tests {
         ) -> Result<super::PaintReport, crate::error::EngineError> {
             self.damage.reset(scale());
             self.tree.mark_paint_closure(dirty);
-            let geometry_store = crate::paint::geometry_store::GeometryStore::new();
+            let geometry = &self.geometry;
             let mut pass = PaintPass {
                 tree: &mut self.tree,
-                geometry: &geometry_store,
+                geometry,
                 scene: &mut self.scene,
                 damage: &mut self.damage,
                 scale: scale(),
@@ -1525,63 +1976,42 @@ mod tests {
         );
     }
 
-    /// P2-2：几何 damage 必须用 `GeometryDesc.bounds`（真实可见范围），而不是节点布局盒。
+    /// X5：块 lane 的 damage = `transform(块 AABB)` 减祖先滚动累计值（逻辑 → 屏幕坐标）。
     #[test]
-    fn geometry_damage_uses_the_registered_bounds() {
-        use crate::paint::geometry::{GeometryDesc, GeometryPipeline, IndexType, Topology};
-        let stride = GeometryPipeline::Ui.vertex_stride() as usize;
-        let desc = GeometryDesc {
-            vertex_bytes: bytes::Bytes::from(vec![0u8; stride * 3]),
-            index_bytes: bytes::Bytes::from(vec![0u8, 0, 1, 0, 2, 0]),
-            vertex_stride: stride as u32,
-            index_type: IndexType::U16,
-            topology: Topology::TriangleList,
-            // 几何真实范围 200×200，节点布局盒只有 10×10（溢出）。
-            bounds: Rect::new(0.0, 0.0, 200.0, 200.0),
-            pipeline: GeometryPipeline::Ui,
-        };
-        let mut store = crate::paint::geometry_store::GeometryStore::new();
-        let id = store.insert(desc).expect("valid geometry");
-        let node_bounds = Rect::new(0.0, 0.0, 10.0, 10.0);
+    fn geometry_chunk_damage_uses_the_chunk_aabb_and_transform() {
+        let chunk = Rect::new(0.0, 0.0, 200.0, 200.0);
+        let damage =
+            super::geometry_chunk_damage(crate::math::Transform::IDENTITY, chunk, Point::ZERO);
+        assert_eq!(damage, chunk, "无变换 / 无滚动时块 AABB 原样");
 
-        let damage = super::geometry_damage(
-            &store,
-            id,
-            node_bounds,
-            Point::ZERO,
+        let scrolled = super::geometry_chunk_damage(
             crate::math::Transform::IDENTITY,
-        );
-        assert_eq!(damage, Rect::new(0.0, 0.0, 200.0, 200.0), "用 desc.bounds");
-
-        // 祖先滚动偏移要换算到屏幕坐标。
-        let scrolled = super::geometry_damage(
-            &store,
-            id,
-            node_bounds,
+            chunk,
             Point::new(0.0, 50.0),
-            crate::math::Transform::IDENTITY,
         );
-        assert_eq!(scrolled, Rect::new(0.0, -50.0, 200.0, 200.0));
+        assert_eq!(
+            scrolled,
+            Rect::new(0.0, -50.0, 200.0, 200.0),
+            "祖先滚动累计值要换算到屏幕坐标"
+        );
 
         // R05-12：per-draw transform 必须进入 damage 范围（否则平移后残影）。
-        let moved = super::geometry_damage(
-            &store,
-            id,
-            node_bounds,
-            Point::ZERO,
+        let moved = super::geometry_chunk_damage(
             crate::math::Transform::translate(30.0, 40.0),
+            chunk,
+            Point::ZERO,
         );
         assert_eq!(moved, Rect::new(30.0, 40.0, 200.0, 200.0));
 
-        // 陈旧句柄退回节点盒（不会因为查不到就丢掉 damage）。
-        let stale = super::geometry_damage(
-            &store,
-            crate::paint::geometry::GeometryId::for_test(99, 1),
-            node_bounds,
-            Point::ZERO,
-            crate::math::Transform::IDENTITY,
+        // 空块不产生 damage。
+        assert!(
+            super::geometry_chunk_damage(
+                crate::math::Transform::IDENTITY,
+                Rect::default(),
+                Point::ZERO
+            )
+            .is_empty()
         );
-        assert_eq!(stale, node_bounds);
     }
 
     #[test]
@@ -2506,5 +2936,238 @@ mod tests {
             "lane 集合（按节点归一化）必须一致"
         );
         assert_eq!(incremental, full, "增量与全量产物必须逐字段一致");
+    }
+    // ── X5：几何节点多 lane 分块 ─────────────────────────────────────────────
+
+    /// `triangles` 个互不共享顶点的三角形（真实位置；每 4096 个三角形一块）。
+    fn long_geometry(triangles: u32) -> crate::paint::geometry::GeometryDesc {
+        use crate::paint::geometry::{GeometryDesc, GeometryPipeline, IndexType, Topology};
+        let mut vertex_bytes = Vec::with_capacity(triangles as usize * 36);
+        let mut index_bytes = Vec::with_capacity(triangles as usize * 6);
+        for triangle in 0..triangles {
+            let base = (triangle * 3) as u16;
+            let x = (triangle % 64) as f32;
+            let y = (triangle / 64) as f32;
+            for (dx, dy) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)] {
+                vertex_bytes.extend_from_slice(&(x + dx).to_ne_bytes());
+                vertex_bytes.extend_from_slice(&(y + dy).to_ne_bytes());
+                vertex_bytes.extend_from_slice(&(-1.0f32).to_ne_bytes());
+            }
+            for index in [base, base + 1, base + 2] {
+                index_bytes.extend_from_slice(&index.to_ne_bytes());
+            }
+        }
+        GeometryDesc {
+            vertex_bytes: bytes::Bytes::from(vertex_bytes),
+            index_bytes: bytes::Bytes::from(index_bytes),
+            vertex_stride: 12,
+            index_type: IndexType::U16,
+            topology: Topology::TriangleList,
+            bounds: Rect::new(0.0, 0.0, 64.0, 100.0),
+            pipeline: GeometryPipeline::Ui,
+        }
+    }
+
+    /// 挂一个几何节点并把布局盒写成固定值（paint 只读 `layout`）。
+    fn mount_geometry(h: &mut Harness, id: GeometryId, clip: Clip) -> NodeId {
+        let root = h.tree.root();
+        let mut style = fixed_style(100.0, 100.0);
+        style.clip = clip;
+        let node = NodeBuilder::geometry(id)
+            .style(style)
+            .build(&mut h.tree, root)
+            .expect("挂载几何节点");
+        layout_all(&mut h.tree);
+        node
+    }
+
+    /// 在几何末尾追加一个三角形（顶点 range + 索引 range 两次更新，与 K 线追加同路径）。
+    fn append_triangle(h: &mut Harness, id: GeometryId, x: f32, y: f32) {
+        let snapshot = h.geometry.snapshot_arc(id).expect("已注册");
+        let vertex_at = snapshot.vertex_len();
+        let mut vertices = Vec::with_capacity(36);
+        for (dx, dy) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)] {
+            vertices.extend_from_slice(&(x + dx).to_ne_bytes());
+            vertices.extend_from_slice(&(y + dy).to_ne_bytes());
+            vertices.extend_from_slice(&(-1.0f32).to_ne_bytes());
+        }
+        h.geometry
+            .update_vertices(id, vertex_at..vertex_at + 36, &vertices)
+            .expect("追加顶点");
+        let index_at = snapshot.index_len();
+        let base = (snapshot.vertex_len() / 12) as u16;
+        let indices = [base, base + 1, base + 2];
+        let mut bytes = Vec::with_capacity(6);
+        for index in indices {
+            bytes.extend_from_slice(&index.to_ne_bytes());
+        }
+        h.geometry
+            .update_indices(id, index_at..index_at + 6, &bytes)
+            .expect("追加索引");
+    }
+
+    /// X5：几何节点每块一条 lane，块间绘制序 = 块序，且每条块 lane 的 clip 语义完整
+    /// （内容 clip 前缀/后缀与单 lane 用同一个 `emit_geometry_chunk` 实现）。
+    #[test]
+    fn geometry_node_gets_one_clipped_lane_per_chunk_in_order() {
+        let mut h = Harness::new();
+        let id = h
+            .geometry
+            .insert(long_geometry(4096 + 10))
+            .expect("注册两块几何");
+        let node = mount_geometry(&mut h, id, Clip::Bounds);
+        h.paint();
+
+        assert_eq!(h.tree.lane_count(node), 2, "两块 = 两条块 lane");
+        let first = h.tree.lane_at(node, 0).expect("块 0 lane");
+        let second = h.tree.lane_at(node, 1).expect("块 1 lane");
+        assert_eq!(h.scene.lane_geometry_chunk(first), Some((id, 0)));
+        assert_eq!(h.scene.lane_geometry_chunk(second), Some((id, 1)));
+        assert_eq!(
+            h.order,
+            vec![first, second],
+            "块间绘制序 = 块序，两条 lane 相邻"
+        );
+
+        for lane in [first, second] {
+            let primitives = h.scene.lane_primitives(lane).expect("lane 活着");
+            assert!(
+                matches!(primitives.first(), Some(Primitive::Clip(ClipOp::Push(_)))),
+                "块 lane 必须以内容 clip 前缀开始"
+            );
+            assert!(
+                matches!(primitives.last(), Some(Primitive::Clip(ClipOp::Pop))),
+                "块 lane 必须以内容 clip 后缀结束"
+            );
+            assert_eq!(
+                primitives
+                    .iter()
+                    .filter(|primitive| matches!(primitive, Primitive::Geometry(_)))
+                    .count(),
+                1,
+                "每条块 lane 恰好一条几何绘制"
+            );
+        }
+    }
+
+    /// X5：几何数据只改尾块 ⇒ 增量帧只重建尾块 lane，前面的块一条都不动、绘制序不变。
+    #[test]
+    fn geometry_data_update_rebuilds_only_the_tail_chunk_lane() {
+        let mut h = Harness::new();
+        let id = h
+            .geometry
+            .insert(long_geometry(4096 + 2))
+            .expect("注册两块几何");
+        let node = mount_geometry(&mut h, id, Clip::None);
+        h.paint();
+        let first = h.tree.lane_at(node, 0).expect("块 0 lane");
+        let second = h.tree.lane_at(node, 1).expect("块 1 lane");
+        let first_version = h.scene.lane_state(first).expect("lane").0;
+        let second_version = h.scene.lane_state(second).expect("lane").0;
+
+        append_triangle(&mut h, id, 100.0, 100.0);
+        assert_eq!(h.tree.mark_geometry_updated(id), 1, "绑定节点被标脏");
+        let report = h.paint_incremental(&[node]);
+
+        assert_eq!(report.rebuilt, 1, "只重建尾块 lane");
+        assert_eq!(
+            h.scene.lane_state(first).expect("lane").0,
+            first_version,
+            "第一块 lane 内容版本不动（编码器整段复用）"
+        );
+        assert_ne!(
+            h.scene.lane_state(second).expect("lane").0,
+            second_version,
+            "尾块 lane 必须重建"
+        );
+        assert_eq!(h.order, vec![first, second], "增量帧不重排绘制序");
+        assert!(
+            report.damage.rects > 0 && !report.damage.full,
+            "尾块新范围产生局部 damage（不是整帧）"
+        );
+    }
+
+    /// X5：块满后追加 ⇒ 新建块 lane，增量路径用轻量 DFS 兜底重建绘制序；旧块 lane 不动。
+    #[test]
+    fn appending_across_the_chunk_boundary_creates_a_new_lane_and_rebuilds_order() {
+        let mut h = Harness::new();
+        let id = h
+            .geometry
+            .insert(long_geometry(4096))
+            .expect("注册单块几何");
+        let node = mount_geometry(&mut h, id, Clip::None);
+        h.paint();
+        assert_eq!(h.tree.lane_count(node), 1);
+        let first = h.tree.lane_at(node, 0).expect("块 0 lane");
+        let first_version = h.scene.lane_state(first).expect("lane").0;
+
+        append_triangle(&mut h, id, 100.0, 100.0);
+        h.tree.mark_geometry_updated(id);
+        let report = h.paint_incremental(&[node]);
+
+        assert_eq!(report.rebuilt, 1);
+        assert_eq!(h.tree.lane_count(node), 2, "满块后追加必须新建块 lane");
+        let second = h.tree.lane_at(node, 1).expect("新块 lane");
+        assert_eq!(h.scene.lane_geometry_chunk(second), Some((id, 1)));
+        assert_eq!(h.order, vec![first, second], "绘制序兜底重建后包含新 lane");
+        assert_eq!(
+            h.scene.lane_state(first).expect("lane").0,
+            first_version,
+            "旧块 lane 不动"
+        );
+    }
+
+    /// X5：没有数据变化的帧不重建任何块 lane（纯 damage / 滚动帧的 `encoded_lanes == 0` 前提）。
+    #[test]
+    fn unchanged_geometry_reuses_every_block_lane() {
+        let mut h = Harness::new();
+        let id = h
+            .geometry
+            .insert(long_geometry(4096 + 10))
+            .expect("注册两块几何");
+        let node = mount_geometry(&mut h, id, Clip::None);
+        h.paint();
+        let versions: Vec<u32> = (0..2)
+            .map(|chunk| {
+                let lane = h.tree.lane_at(node, chunk).expect("lane");
+                h.scene.lane_state(lane).expect("lane").0
+            })
+            .collect();
+
+        let report = h.paint_incremental(&[]);
+        assert_eq!(report.rebuilt, 0, "没有变化 ⇒ 零重建");
+        for (chunk, version) in versions.iter().enumerate() {
+            let lane = h.tree.lane_at(node, chunk).expect("lane");
+            assert_eq!(h.scene.lane_state(lane).expect("lane").0, *version);
+        }
+    }
+
+    /// X5：per-draw 变换变化 ⇒ 全部块 lane 重建（变换烘在每条块 lane 的图元里）。
+    #[test]
+    fn geometry_transform_change_rebuilds_every_block_lane() {
+        let mut h = Harness::new();
+        let id = h
+            .geometry
+            .insert(long_geometry(4096 + 10))
+            .expect("注册两块几何");
+        let node = mount_geometry(&mut h, id, Clip::None);
+        h.paint();
+        let transform = crate::math::Transform::translate(7.0, 9.0);
+        h.tree
+            .set_geometry_transform(node, transform, Rect::default())
+            .expect("几何节点");
+        let report = h.paint_incremental(&[node]);
+        assert_eq!(report.rebuilt, 2, "变换烘在块 lane 里 ⇒ 两块都要重建");
+        for chunk in 0..2 {
+            let lane = h.tree.lane_at(node, chunk).expect("lane");
+            let primitives = h.scene.lane_primitives(lane).expect("lane");
+            let Some(Primitive::Geometry(draw)) = primitives
+                .iter()
+                .find(|primitive| matches!(primitive, Primitive::Geometry(_)))
+            else {
+                panic!("块 {chunk} 必须有几何绘制");
+            };
+            assert_eq!(draw.transform, transform, "变换必须进每条块 lane");
+        }
     }
 }

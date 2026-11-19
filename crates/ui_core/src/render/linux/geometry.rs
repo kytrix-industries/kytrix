@@ -157,9 +157,13 @@ impl GeometryRegistry {
         if self.entries.len() <= slot {
             self.entries.resize_with(slot + 1, || None);
         }
+        // 只允许**向前**更新：复用段（未变块 lane）的几何表项仍携带旧版本快照，若这里
+        // 按「版本不等」重建就会在新旧表项之间来回抖动（同一帧内多次重建）。旧版本画
+        // 旧块区间 = 新索引缓冲的合法前缀（块在索引缓冲里连续、只增不减），因此保留
+        // 已上传的更新版本、忽略旧快照是正确且稳定的。
         let stale = match &self.entries[slot] {
             Some(entry) => {
-                entry.generation != id.generation() || entry.revision != snapshot.revision()
+                entry.generation != id.generation() || snapshot.revision() > entry.revision
             }
             None => true,
         };

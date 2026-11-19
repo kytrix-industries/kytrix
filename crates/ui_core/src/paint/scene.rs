@@ -208,6 +208,12 @@ pub struct Scene {
     /// `false` = 本帧的脏表**不完整**（`clear_frame` 这类全表复位没有逐条登记），消费端必须
     /// 回退全量扫描。
     dirty_complete: bool,
+    /// 几何节点**块 lane** 的绘制范围（X5）：`lane → (geometry, chunk)`。
+    ///
+    /// 只有几何节点的块 lane 有条目（数量 = 块数，通常几条到几十条），因此用按需
+    /// `HashMap` 而不是按 arena 槽位预分配（10k lane × 12 B 的白付）。编码器据此把该 lane
+    /// 编码成「只画第 chunk 块」的几何 op，而不是整块几何的全部块。
+    geometry_chunks: ahash::HashMap<LaneId, (crate::paint::geometry::GeometryId, u32)>,
 }
 
 impl Scene {
@@ -218,6 +224,7 @@ impl Scene {
             order: Vec::new(),
             dirty: Vec::new(),
             dirty_complete: true,
+            geometry_chunks: ahash::HashMap::default(),
         }
     }
 
@@ -229,6 +236,34 @@ impl Scene {
     /// engine-internal, 应用层不得调用 —— 释放 lane（代际 +1，旧句柄立即失效）；陈旧句柄 → 无操作。
     pub fn release_lane(&mut self, id: LaneId) {
         let _ = self.lanes.remove(id);
+        self.geometry_chunks.remove(&id);
+    }
+
+    /// engine-internal —— 登记几何块 lane 的绘制范围（`None` = 该 lane 画整块几何 / 非几何）。
+    ///
+    /// 消费者：`paint/pass.rs` 的块 lane 重建；读取者：编码器（`LaneSource::lane_geometry_chunk`）。
+    pub(crate) fn set_lane_geometry_chunk(
+        &mut self,
+        lane: LaneId,
+        chunk: Option<(crate::paint::geometry::GeometryId, u32)>,
+    ) {
+        match chunk {
+            Some(chunk) => {
+                self.geometry_chunks.insert(lane, chunk);
+            }
+            None => {
+                self.geometry_chunks.remove(&lane);
+            }
+        }
+    }
+
+    /// 一条 lane 的几何块绘制范围（`None` = 整块几何 / 非几何 lane）。
+    #[must_use]
+    pub(crate) fn lane_geometry_chunk(
+        &self,
+        lane: LaneId,
+    ) -> Option<(crate::paint::geometry::GeometryId, u32)> {
+        self.geometry_chunks.get(&lane).copied()
     }
 
     /// engine-internal, 应用层不得调用 —— 向 lane 追加一条图元（**唯一**写入点）。
@@ -248,6 +283,7 @@ impl Scene {
 
     /// engine-internal, 应用层不得调用 —— 清空**所有** lane 的内容但保留分配与容量（每帧 paint 的起点）。
     pub fn clear_frame(&mut self) {
+        self.geometry_chunks.clear();
         for lane in self.lanes.values_mut() {
             lane.clear();
         }

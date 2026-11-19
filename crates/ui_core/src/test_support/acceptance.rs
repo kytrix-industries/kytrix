@@ -256,10 +256,15 @@ impl Load {
         self.pan_chart(app);
     }
 
-    /// 每增量帧该重编码的 lane 数：3 行 × 8 列 + 4 个成交格 + 1 条几何 lane。
+    /// 每增量帧该重编码的 lane 数：3 行 × 8 列 + 4 个成交格 + 折线节点的**块 lane 数**。
+    ///
+    /// X5：几何节点按块持有 lane（每 `GEOMETRY_CHUNK_INDICES` 个索引一块），`pan_chart`
+    /// 改变 per-draw 变换 ⇒ 变换烘在每条块 lane 里，全部块 lane 都要重建。
     #[must_use]
-    pub const fn incremental_lanes() -> usize {
-        Scale::INCREMENTAL_ROWS * Scale::COLUMNS + Scale::TRADE_COLUMNS + 1
+    pub fn incremental_lanes() -> usize {
+        Scale::INCREMENTAL_ROWS * Scale::COLUMNS
+            + Scale::TRADE_COLUMNS
+            + chart_chunk_lanes(Scale::MINI.chart_points)
     }
 
     fn write_book_row(&mut self, app: &mut App, row: usize) {
@@ -286,6 +291,15 @@ impl Load {
         let _ =
             app.set_geometry_transform(self.window, self.chart, Transform::translate(-pan, 0.0));
     }
+}
+
+/// 折线几何的块 lane 数（X5 的分块策略与 `GeometryStore` 同一常量）。
+///
+/// 折线索引数 = `(points − 1) × 6`（每个线段 2 个三角形），`TriangleList` 每块
+/// `GEOMETRY_CHUNK_INDICES` 个索引。
+fn chart_chunk_lanes(points: usize) -> usize {
+    let indices = points.saturating_sub(1) * 6;
+    indices.div_ceil(crate::paint::geometry::GEOMETRY_CHUNK_INDICES as usize)
 }
 
 /// 盘口单元格的值（列 0 价格分、列 7 涨跌带符号、其余计数）。
@@ -408,7 +422,7 @@ fn register_chart(app: &mut App, points: usize) -> Result<GeometryId, EngineErro
 
 #[cfg(test)]
 mod tests {
-    use super::{Load, Scale};
+    use super::{Load, Scale, chart_chunk_lanes};
     use crate::{
         app::App,
         math::{Scale as DpiScale, Size},
@@ -458,7 +472,9 @@ mod tests {
         let total_lanes = first_frame(&mut app, window);
         assert_eq!(
             Load::incremental_lanes(),
-            Scale::INCREMENTAL_ROWS * Scale::COLUMNS + Scale::TRADE_COLUMNS + 1,
+            Scale::INCREMENTAL_ROWS * Scale::COLUMNS
+                + Scale::TRADE_COLUMNS
+                + chart_chunk_lanes(Scale::MINI.chart_points),
             "脏 lane 数的口径必须写在夹具里（避免断言与实现同时漂移）"
         );
 
@@ -528,24 +544,40 @@ mod tests {
         );
     }
 
-    /// 折线平移：1 条几何 lane、0 实例字节（顶点在几何通道，变换走 uniform）。
+    /// 折线平移：几何节点按块持有 lane（X5）—— 只有 uniform 变换变化，因此**全部块 lane**
+    /// 都要重建（变换烘在每条块 lane 的图元里），但**一条实例字节都不上传**（顶点在几何通道）。
+    /// GPU 侧的几何数据页没有变化，故 `geometry_uploaded_bytes` 为 0。
     #[test]
     fn a_geometry_transform_frame_uploaded_no_instance_bytes() {
         let (_runtime, mut app, mut load) = fixture();
         let window = load.window;
         let _total_lanes = first_frame(&mut app, window);
+        let chunk_lanes = app
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .lane_count(load.chart);
 
         load.pan(&mut app);
         let stats = commit(&mut app, window);
         assert_eq!(
-            stats.encoded_lanes, 1,
-            "折线平移只允许重编码那 1 条几何 lane（实际 {}）",
+            stats.encoded_lanes, chunk_lanes,
+            "折线平移只允许重编码这个几何节点的块 lane（{chunk_lanes} 条，实际 {}）",
             stats.encoded_lanes
+        );
+        assert_eq!(
+            stats.geometry_encoded_chunks, chunk_lanes,
+            "每条块 lane 恰好一条几何 op（实际 {}）",
+            stats.geometry_encoded_chunks
         );
         assert_eq!(
             stats.uploaded_bytes, 0,
             "几何顶点不重建 ⇒ 不得上传实例字节（实际 {} B）",
             stats.uploaded_bytes
+        );
+        assert_eq!(
+            stats.geometry_uploaded_bytes, 0,
+            "只改 uniform 不触碰几何数据页 ⇒ GPU 几何上传 0 字节"
         );
     }
 

@@ -5,7 +5,7 @@ use std::{rc::Rc, sync::Arc};
 use smallvec::SmallVec;
 use smol_str::SmolStr;
 
-use super::{NodeKind, NodeTree};
+use super::{BakedGeometryChunk, NodeKind, NodeTree};
 #[cfg(test)]
 use crate::paint::style::Style;
 use crate::{
@@ -13,7 +13,7 @@ use crate::{
     interaction::{NodeInteraction, OverlaySlot, ScrollSlot, VirtualSlot},
     math::{PhysicalRect, Point, Rect, Size, Transform},
     node::{dependency::ReadCtx, dirty::DirtyFlags, id::NodeId, signal::SignalId},
-    paint::{scene::LaneId, style::StylePatch},
+    paint::{geometry::GeometryId, scene::LaneId, style::StylePatch},
     text::{ShapedLine, TextContent, shape::ShapedText},
 };
 
@@ -530,16 +530,127 @@ pub(crate) fn content_offset(tree: &NodeTree, node: NodeId) -> Point {
 // 消费者：`impl NodeTree::lane_of` 的薄委托（外部调用点见该方法文档）。
 // ── P06：lane / clip 上下文 / 帧结算 ──────────────────────────────────────
 
-/// 节点的绘制桶句柄（`P06` 每节点最多一条；消费者：`paint/pass.rs`）。
+/// 节点的**第一条**绘制桶句柄（消费者：paint 的单 lane 路径 / 测试）。
 pub(crate) fn lane_of(tree: &NodeTree, node: NodeId) -> Option<LaneId> {
-    tree.arena.get(node).and_then(|target| target.lane)
+    tree.arena
+        .get(node)
+        .and_then(|target| target.lanes.first().copied())
+}
+
+/// lane 条数（几何节点 = 块数；消费者：paint 绘制序兜底 / 隐藏 / 卸载）。
+pub(crate) fn lane_count(tree: &NodeTree, node: NodeId) -> usize {
+    tree.arena.get(node).map_or(0, |target| target.lanes.len())
+}
+
+/// 第 `index` 条 lane（按块序；消费者：paint 绘制序兜底 / 隐藏 / 卸载）。
+pub(crate) fn lane_at(tree: &NodeTree, node: NodeId, index: usize) -> Option<LaneId> {
+    tree.arena
+        .get(node)
+        .and_then(|target| target.lanes.get(index).copied())
 }
 
 // 消费者：`impl NodeTree::set_lane` 的薄委托（外部调用点见该方法文档）。
-/// 记录节点的绘制桶（一节点一 lane；消费者：`paint/pass.rs`）。
+/// 把 lane 集合改成**单条**（普通节点的唯一写法；几何节点用 `push_lane`）。
 pub(crate) fn set_lane(tree: &mut NodeTree, node: NodeId, lane: LaneId) {
     if let Some(target) = tree.arena.get_mut(node) {
-        target.lane = Some(lane);
+        target.lanes.clear();
+        target.lanes.push(lane);
+    }
+}
+
+// 消费者：`impl NodeTree::push_lane` 的薄委托（外部调用点见该方法文档）。
+/// 追加一条 lane（几何节点的块 lane；调用方保证按块序追加）。
+pub(crate) fn push_lane(tree: &mut NodeTree, node: NodeId, lane: LaneId) {
+    if let Some(target) = tree.arena.get_mut(node) {
+        target.lanes.push(lane);
+    }
+}
+
+/// 截断 lane 集合到 `len`（多余 lane 由调用方先 `Scene::release_lane`；几何节点块数变化用）。
+pub(crate) fn truncate_lanes(tree: &mut NodeTree, node: NodeId, len: usize) {
+    if let Some(target) = tree.arena.get_mut(node) {
+        target.lanes.truncate(len);
+    }
+}
+
+/// 该几何节点的块 lane 烘焙状态（与 `lanes` 一一对应；`None` = 还没画过）。
+pub(crate) fn baked_geometry_chunks(
+    tree: &NodeTree,
+    node: NodeId,
+) -> Option<&SmallVec<[BakedGeometryChunk; 2]>> {
+    tree.geometry_chunks.get(&node)
+}
+
+/// 重置块 lane 烘焙状态的长度（首帧 / 块数变化；`0` = 删除条目）。
+pub(crate) fn resize_baked_geometry_chunks(tree: &mut NodeTree, node: NodeId, len: usize) {
+    if len == 0 {
+        tree.geometry_chunks.remove(&node);
+        return;
+    }
+    let entry = tree
+        .geometry_chunks
+        .entry(node)
+        .or_insert_with(|| SmallVec::with_capacity(len));
+    entry.resize(
+        len,
+        BakedGeometryChunk {
+            revision: 0,
+            bounds: Rect::default(),
+        },
+    );
+}
+
+/// 写一条块 lane 的烘焙状态（`chunk` 必须 < 已重置的长度）。
+pub(crate) fn set_baked_geometry_chunk(
+    tree: &mut NodeTree,
+    node: NodeId,
+    chunk: usize,
+    baked: BakedGeometryChunk,
+) {
+    if let Some(entry) = tree.geometry_chunks.get_mut(&node)
+        && let Some(slot) = entry.get_mut(chunk)
+    {
+        *slot = baked;
+    }
+}
+
+// 消费者：`impl NodeTree::mark_geometry_updated` 的薄委托（外部调用点见该方法文档）。
+/// 把绑定到 `geometry` 的几何节点标 `PAINT`（**不清 `REUSABLE`、不并节点盒 damage**）。
+pub(crate) fn mark_geometry_updated(tree: &mut NodeTree, geometry: GeometryId) -> usize {
+    let Some(nodes) = tree.geometry_bindings.get(&geometry) else {
+        return 0;
+    };
+    // 绑定表通常是 1 个节点（几何 id 每图表一个）；克隆 SmallVec 避免「读绑定表 + 改脏集合」
+    // 的借用冲突（`insert` 只碰 `dirty_paint`/`dirty_settle` 两个不同字段，但函数级 `&mut self`
+    // 会整树借用）。
+    let nodes: SmallVec<[NodeId; 2]> = nodes.iter().copied().collect();
+    let mut touched = 0;
+    for node in nodes {
+        if tree.arena.get(node).is_none() {
+            continue;
+        }
+        tree.dirty_paint.insert(node);
+        tree.dirty_settle.insert(node);
+        touched += 1;
+    }
+    touched
+}
+
+/// 注册「几何 id → 几何节点」绑定（消费者：`arena::insert_child`）。
+pub(crate) fn bind_geometry_node(tree: &mut NodeTree, geometry: GeometryId, node: NodeId) {
+    let entry = tree.geometry_bindings.entry(geometry).or_default();
+    if !entry.contains(&node) {
+        entry.push(node);
+    }
+}
+
+/// 移除一个节点的全部反向绑定（消费者：`arena::remove`）。
+pub(crate) fn unbind_geometry_node(tree: &mut NodeTree, geometry: GeometryId, node: NodeId) {
+    if let Some(nodes) = tree.geometry_bindings.get_mut(&geometry) {
+        nodes.retain(|existing| *existing != node);
+        if nodes.is_empty() {
+            tree.geometry_bindings.remove(&geometry);
+        }
     }
 }
 
@@ -599,10 +710,15 @@ pub(crate) fn paint_state(
         .as_deref()
         .and_then(|slot| slot.scroll)
         .map(|slot| slot.offset);
+    let geometry = match target.kind() {
+        NodeKind::Geometry(id) => Some(*id),
+        _ => None,
+    };
     Some(super::PaintNodeState {
         hidden,
         reusable,
-        lane: target.lane,
+        lane: target.lanes.first().copied(),
+        geometry,
         children: target.children.len(),
         clip_bounds,
         scroll,
@@ -668,7 +784,7 @@ pub(crate) fn force_repaint_all(tree: &mut NodeTree) {
 /// 丢弃节点的 lane 句柄（不放回 `Scene`；重建路径在"无图元"时先 `Scene::release_lane` 再调它）。
 pub(crate) fn clear_lane(tree: &mut NodeTree, node: NodeId) {
     if let Some(target) = tree.arena.get_mut(node) {
-        target.lane = None;
+        target.lanes.clear();
     }
 }
 

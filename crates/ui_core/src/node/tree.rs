@@ -191,8 +191,12 @@ pub struct Node {
     laid_out_epoch: u32,
     /// 本帧累积的逻辑 damage AABB（§9.4）。
     damage: Rect,
-    /// 该节点的绘制桶（一节点一 lane；`None` = 尚无绘制输出）。
-    lane: Option<LaneId>,
+    /// 该节点的绘制桶（`None` = 尚无绘制输出；**非几何节点恒 ≤1 条**）。
+    ///
+    /// 几何节点按块持有**多条** lane（X5，`paint/pass.rs` 的块 lane）：块 lane 在绘制序里
+    /// 连续、块间序 = 块序，索引缓冲里的块区间也连续 ⇒ 块内/块间绘制序与单 lane 完全一致。
+    /// 追加 K 线只重建尾块 lane，热力图改色只重建受影响块的 lane。
+    lanes: SmallVec<[LaneId; 2]>,
     /// 上次求值实际读过的信号（差分清理用；`replace_deps` 的 `old`）。只有挂 `bind_*` 的节点非空。
     deps: Option<Box<SmallVec<[SignalId; 8]>>>,
     dirty: DirtyFlags,
@@ -230,7 +234,7 @@ impl fmt::Debug for Node {
             .field("local_border", &self.local_border)
             .field("laid_out_epoch", &self.laid_out_epoch)
             .field("damage", &self.damage)
-            .field("lane", &self.lane)
+            .field("lanes", &self.lanes)
             .field("deps", &self.deps())
             .field("dirty", &self.dirty)
             .field("interaction", &self.interaction)
@@ -308,10 +312,18 @@ impl Node {
         self.layout
     }
 
-    /// 该节点的绘制桶（P06 的 paint 分配；`Probe` 读取）。
+    /// 该节点的**第一条**绘制桶（P06 的 paint 分配；`Probe` 读取）。
+    ///
+    /// 几何节点可能有多条块 lane；完整集合走 [`Node::lanes`]。
     #[must_use]
     pub fn lane(&self) -> Option<LaneId> {
-        self.lane
+        self.lanes.first().copied()
+    }
+
+    /// 该节点的全部绘制桶（非几何节点恒 ≤1 条；几何节点 = 块 lane，按块序）。
+    #[must_use]
+    pub fn lanes(&self) -> &[LaneId] {
+        &self.lanes
     }
 
     /// 子树裁剪策略（P04 的命中测试与 P06 的 `Clip` 图元都读它）。
@@ -370,8 +382,11 @@ pub(crate) struct PaintNodeState {
     pub hidden: bool,
     /// lane 可整桶复用（`REUSABLE` + clip 上下文一致 + 滚动偏移戳一致）。
     pub reusable: bool,
-    /// 节点的绘制桶（`None` = 尚无绘制输出）。
+    /// 节点的**第一条**绘制桶（`None` = 尚无绘制输出）。
     pub lane: Option<LaneId>,
+
+    /// 几何内容（`None` = 非几何节点）：paint 走分块路径而不是普通单 lane 路径。
+    pub geometry: Option<GeometryId>,
     /// 直接子节点数（循环里按下标取，不拷 `children`）。
     pub children: usize,
     /// 该节点 `Clip::Bounds` 的 padding box（屏幕坐标；`None` = 不裁剪子树）。
@@ -387,6 +402,18 @@ pub(crate) struct PaintNodeState {
     /// 坐标），因此这两类节点的 lane 不能登记滚动槽：它们留在屏幕坐标里，祖先/自身滚动时
     /// 照旧重建（正确性优先，成本只落在自绘节点上）。
     pub screen_baked: bool,
+}
+
+/// 几何节点一条**块 lane** 上次烘焙时的块状态（X5）。
+///
+/// - `revision`：几何数据里该块的块版本。paint 拿它与快照的块版本比较：相等 ⇒ 该块 lane
+///   可以整条复用（追加 K 线只动尾块时，前面的块一条都不重建）；不等 ⇒ 只重建这一条。
+/// - `bounds`：该块的逻辑 AABB。重建时把**旧 bounds ∪ 新 bounds** 并入 damage（顶点位移时
+///   旧位置也要重画）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BakedGeometryChunk {
+    pub revision: u64,
+    pub bounds: Rect,
 }
 
 /// paint 脏子树剪枝（A1）的可观测计数（验收 / 诊断面）。
@@ -502,6 +529,14 @@ pub struct NodeTree {
     /// 几何节点的 per-draw 变换旁表（R05-12：`Primitive::Geometry.transform` 的来源）。
     /// 只在 `set_geometry_transform` 写入时分配条目，单位矩阵 = 无条目。
     geometry_transforms: ahash::HashMap<NodeId, Transform>,
+    /// 几何节点的**块 lane 已烘焙状态**（X5；与 `Node.lanes` 一一对应）。
+    ///
+    /// 只在几何节点上有条目；paint 用它判断「哪些块的版本变了、只需要重建哪几条 lane」。
+    geometry_chunks: ahash::HashMap<NodeId, SmallVec<[BakedGeometryChunk; 2]>>,
+    /// 几何 id → 绑定它的几何节点（**反向索引**，X5）。
+    ///
+    /// 几何数据 range 更新后据此 O(绑定数) 把节点标 `PAINT`（不扫描全树）；节点卸载时同步移除。
+    geometry_bindings: ahash::HashMap<GeometryId, SmallVec<[NodeId; 1]>>,
     /// paint 脏子树剪枝的**祖先闭包**戳记（按 arena 槽位；`paint_epoch` 的当前代次在闭包内）。
     ///
     /// 每帧从 `dirty_paint` 快照向 root 走标记（`mark_paint_closure`），增量遍历只下行到
@@ -1218,8 +1253,60 @@ impl NodeTree {
     pub(crate) fn lane_of(&self, node: NodeId) -> Option<LaneId> {
         content::lane_of(self, node)
     }
+    /// lane 条数（几何节点 = 块数；消费者：paint 的分块路径 / 绘制序兜底重建）。
+    pub(crate) fn lane_count(&self, node: NodeId) -> usize {
+        content::lane_count(self, node)
+    }
+    /// 第 `index` 条 lane（越界 = `None`；消费者：paint 的绘制序兜底 / 隐藏子树 / 卸载回收）。
+    pub(crate) fn lane_at(&self, node: NodeId, index: usize) -> Option<LaneId> {
+        content::lane_at(self, node, index)
+    }
+    /// 把 lane 集合改成**单条**（普通节点的唯一写法）。
     pub(crate) fn set_lane(&mut self, node: NodeId, lane: LaneId) {
         content::set_lane(self, node, lane)
+    }
+    /// 追加一条 lane（几何节点的块 lane；按块序）。
+    pub(crate) fn push_lane(&mut self, node: NodeId, lane: LaneId) {
+        content::push_lane(self, node, lane)
+    }
+    /// 该几何节点的块 lane 烘焙状态（`None` = 不是几何节点 / 还没画过）。
+    pub(crate) fn baked_geometry_chunks(
+        &self,
+        node: NodeId,
+    ) -> Option<&SmallVec<[BakedGeometryChunk; 2]>> {
+        content::baked_geometry_chunks(self, node)
+    }
+    /// 重置块 lane 烘焙状态的长度（新建 / 收缩时调用）。
+    pub(crate) fn resize_baked_geometry_chunks(&mut self, node: NodeId, len: usize) {
+        content::resize_baked_geometry_chunks(self, node, len)
+    }
+    /// 写一条块 lane 的烘焙状态。
+    pub(crate) fn set_baked_geometry_chunk(
+        &mut self,
+        node: NodeId,
+        chunk: usize,
+        baked: BakedGeometryChunk,
+    ) {
+        content::set_baked_geometry_chunk(self, node, chunk, baked)
+    }
+
+    /// 截断 lane 集合到 `len`（几何节点的块数变化；多余 lane 必须由调用方先 release）。
+    pub(crate) fn truncate_lanes(&mut self, node: NodeId, len: usize) {
+        content::truncate_lanes(self, node, len)
+    }
+    /// 把绑定到 `geometry` 的几何节点标 `PAINT`（几何数据 range 更新后由 `App` 调用）。
+    ///
+    /// 与 `mark_paint` 的差别：**不清 `REUSABLE`、不并节点盒 damage** —— 几何数据的变化范围
+    /// 由块 bounds 精确给出（`paint` 在块 lane 重建时按旧∪新 bounds 记 damage），节点盒与
+    /// 其它绘制输出都没变，保守清 `REUSABLE` 会把整节点（含全部块 lane）都拖去重建。
+    ///
+    /// 返回标脏的节点数（`0` = 该几何没有绑定几何节点）。
+    pub(crate) fn mark_geometry_updated(&mut self, geometry: GeometryId) -> usize {
+        content::mark_geometry_updated(self, geometry)
+    }
+    /// 注册「几何 id → 几何节点」绑定（消费者：`arena::insert_child`）。
+    pub(crate) fn bind_geometry_node(&mut self, geometry: GeometryId, node: NodeId) {
+        content::bind_geometry_node(self, geometry, node)
     }
     pub(crate) fn lane_offset(&self, node: NodeId) -> Point {
         content::lane_offset(self, node)

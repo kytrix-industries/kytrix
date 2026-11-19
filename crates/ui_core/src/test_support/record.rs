@@ -214,6 +214,10 @@ pub struct FrameStats {
     /// 本帧增量上传的实例字节数：渲染器路径 = 载荷实际字节数（变化段之和），
     /// headless = 编码器写入实例环的字节数（两者在「只改 1 条 lane」时相同）。
     pub uploaded_bytes: usize,
+    /// 本帧重编码的几何块 op 数（X5：追加 K 线应恒为 1）。
+    pub geometry_encoded_chunks: usize,
+    /// 本帧 GPU 侧实际上传的几何字节数（X5；headless 场景恒 0）。
+    pub geometry_uploaded_bytes: usize,
     /// 合成线程**入队 → 开始编码**的时长（A2 之后不再有 vsync 等待；`None` = 本帧没有经过
     /// 合成线程，或还没有反馈）。
     ///

@@ -54,7 +54,7 @@ pub(crate) fn new() -> NodeTree {
         local_border: Edges::ZERO,
         laid_out_epoch: 0,
         damage: Rect::default(),
-        lane: None,
+        lanes: SmallVec::new(),
         deps: None,
         dirty: DirtyFlags::LAYOUT | DirtyFlags::PAINT | DirtyFlags::A11Y,
         interaction: None,
@@ -99,6 +99,8 @@ pub(crate) fn new() -> NodeTree {
         invalid_measure: None,
         geometry_damage_escalation: false,
         geometry_transforms: ahash::HashMap::default(),
+        geometry_chunks: ahash::HashMap::default(),
+        geometry_bindings: ahash::HashMap::default(),
         paint_marks: vec![0],
         paint_epoch: 0,
         scroll_slot_of: vec![0],
@@ -246,7 +248,7 @@ pub(crate) fn insert_child(
         local_border: Edges::ZERO,
         laid_out_epoch: 0,
         damage: Rect::default(),
-        lane: None,
+        lanes: SmallVec::new(),
         deps: None,
         dirty: DirtyFlags::LAYOUT | DirtyFlags::PAINT | DirtyFlags::A11Y,
         interaction,
@@ -313,6 +315,14 @@ pub(crate) fn insert_child(
     }
     if let Some(node) = tree.arena.get_mut(parent) {
         node.children.push(id);
+    }
+    // 几何节点登记反向绑定：几何数据 range 更新后 O(绑定数) 标脏（X5）。
+    let geometry = match tree.arena.get(id).map(Node::kind) {
+        Some(NodeKind::Geometry(geometry)) => Some(*geometry),
+        _ => None,
+    };
+    if let Some(geometry) = geometry {
+        tree.bind_geometry_node(geometry, id);
     }
     tree.mark_structure(parent);
     Ok(id)
@@ -412,8 +422,9 @@ pub(crate) fn remove(
             subtree_damage = subtree_damage
                 .union(target.damage)
                 .union(target.layout.bounds);
-            if let Some(lane) = target.lane {
-                tree.removed_lanes.push(lane);
+            // 块 lane 全部回收：几何节点每条块 lane 都要 release（只回收第一条会泄漏）。
+            if !target.lanes.is_empty() {
+                tree.removed_lanes.extend(target.lanes.iter().copied());
             }
         }
     }
@@ -452,6 +463,12 @@ pub(crate) fn remove(
         tree.moved_nodes.remove(*id);
         tree.hoisted.remove(id);
         tree.geometry_transforms.remove(id);
+        tree.geometry_chunks.remove(id);
+        if let Some(target) = tree.arena.get(*id)
+            && let NodeKind::Geometry(geometry) = *target.kind()
+        {
+            super::content::unbind_geometry_node(tree, geometry, *id);
+        }
         let had_bind = tree
             .arena
             .get(*id)

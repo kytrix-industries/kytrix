@@ -51,6 +51,8 @@ pub(crate) struct LaneDelta {
     pub version: u32,
     /// 图元烘焙在哪个滚动槽的内容空间（`0` = 已是屏幕坐标；见 [`ScrollTable`] 的坐标系约定）。
     pub scroll: u32,
+    /// 几何块 lane 的绘制范围（`None` = 非几何块 lane / 整块几何绘制；X5）。
+    pub geometry_chunk: Option<(GeometryId, u32)>,
     pub primitives: Arc<[Primitive]>,
 }
 
@@ -414,6 +416,7 @@ impl DeltaBuilder {
             lane,
             version,
             scroll: scene.lane_scroll(lane),
+            geometry_chunk: scene.lane_geometry_chunk(lane),
             primitives: Arc::from(primitives.to_vec()),
         });
         if slot >= self.versions.len() {
@@ -488,6 +491,8 @@ struct StoredLane {
     version: u32,
     /// 该 lane 的图元烘焙在哪个滚动槽的内容空间（见 [`ScrollTable`]）。
     scroll: u32,
+    /// 几何块 lane 的绘制范围（X5；`None` = 非几何块 lane）。
+    geometry_chunk: Option<(GeometryId, u32)>,
     primitives: Arc<[Primitive]>,
 }
 
@@ -557,6 +562,7 @@ impl LaneStore {
                 generation: lane.lane.generation(),
                 version: lane.version,
                 scroll: lane.scroll,
+                geometry_chunk: lane.geometry_chunk,
                 primitives: Arc::clone(&lane.primitives),
             });
             self.changed.push(lane.lane);
@@ -585,6 +591,14 @@ impl LaneSource for LaneStore {
             .map_or(0, |stored| stored.scroll)
     }
 
+    fn lane_geometry_chunk(&self, id: LaneId) -> Option<(GeometryId, u32)> {
+        self.lanes
+            .get(id.slot() as usize)
+            .and_then(Option::as_ref)
+            .filter(|stored| stored.generation == id.generation())
+            .and_then(|stored| stored.geometry_chunk)
+    }
+
     fn order(&self) -> &[LaneId] {
         &self.order
     }
@@ -601,6 +615,10 @@ impl LaneSource for Scene {
 
     fn lane_scroll(&self, id: LaneId) -> u32 {
         Scene::lane_scroll(self, id)
+    }
+
+    fn lane_geometry_chunk(&self, id: LaneId) -> Option<(GeometryId, u32)> {
+        Scene::lane_geometry_chunk(self, id)
     }
 
     fn order(&self) -> &[LaneId] {
@@ -812,6 +830,7 @@ mod tests {
             lane,
             version,
             scroll: 0,
+            geometry_chunk: None,
             primitives: Arc::from(vec![quad()]),
         }
     }

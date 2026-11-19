@@ -44,6 +44,10 @@ pub(crate) struct ComposeStats {
     pub reused_segments: usize,
     /// 本帧写进实例环的字节数。
     pub written_bytes: usize,
+    /// 本帧重编码的几何块 op 数（X5：增量几何的断言面）。
+    pub geometry_encoded_chunks: usize,
+    /// 本帧 GPU 侧实际上传的几何字节数（X5；渲染器路径回填，headless 恒 0）。
+    pub geometry_uploaded_bytes: usize,
     /// 实例环总实例数（含空洞）。
     pub instance_count: u32,
     /// 本帧绘制序真正引用的实例数（不含空洞）。
@@ -119,6 +123,8 @@ impl WindowComposer {
                 encoded_lanes: self.encoder.encoded_lanes(),
                 reused_segments: self.encoder.reused_segments(),
                 written_bytes: self.encoder.written_bytes(),
+                geometry_encoded_chunks: self.encoder.encoded_geometry_chunks(),
+                geometry_uploaded_bytes: 0,
                 instance_count: buffer.instance_count(),
                 drawn_instances: buffer.len() as u32,
                 scroll_slots,
@@ -129,6 +135,8 @@ impl WindowComposer {
             // 没有任何 lane 变化 ⇒ 全部 lane 段整段复用（滚动帧的核心不变量）。
             self.stats.reused_segments = self.lanes.len();
             self.stats.written_bytes = 0;
+            self.stats.geometry_encoded_chunks = 0;
+            self.stats.geometry_uploaded_bytes = 0;
             self.stats.scroll_slots = scroll_slots;
             let buffer = self.encoder.buffer();
             self.stats.instance_count = buffer.instance_count();

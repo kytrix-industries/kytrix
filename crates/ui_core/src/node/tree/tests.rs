@@ -185,8 +185,8 @@ fn node_and_handle_sizes() {
         size_of::<Option<Box<crate::a11y::tree::NodeA11y>>>()
     );
     assert!(
-        node_size <= 320,
-        "Node 尺寸超预算: {node_size} B（上限 320 B：冷字段必须装箱，见 R03-3）"
+        node_size <= 336,
+        "Node 尺寸超预算: {node_size} B（上限 336 B：冷字段必须装箱，见 R03-3；X5 起多 lane 集合占 24 B）"
     );
     assert_eq!(
         size_of::<crate::text::TextContent>(),
@@ -664,8 +664,10 @@ fn node_size_after_p06() {
     println!("size_of::<Node>() = {size}");
     // wave-2 瘦身后预算 320 B；wave-6 的 NodeId 带窗口身份（8→12 B）后仍必须守住
     // （`Node.id` 与 `Node.parent` 各 +4 B；`Option<NodeId>` 靠 NonZeroU32 的 niche 保持 12 B）。
+    // X5 起 `Node.lane: Option<LaneId>` 改为 `SmallVec<[LaneId; 2]>`（几何节点每块一条块 lane），
+    // 集合本身 24 B，预算 +16 B（328 B 实测；仍是「冷字段必须装箱」的同一约束）。
     assert!(
-        size <= 320,
+        size <= 336,
         "Node 超预算：{size} B（备选瘦身：删掉未被读取的 `Node.id` 字段）"
     );
 }
