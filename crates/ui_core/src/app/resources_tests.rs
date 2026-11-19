@@ -22,15 +22,28 @@ fn setup() -> (tokio::runtime::Runtime, App, WindowId) {
 
 /// 4×4 的不透明 PNG（解码后逐字节可预测：BGRA = 源 RGB 交换）。
 fn png() -> Vec<u8> {
-    let pixels: Vec<u8> = std::iter::repeat_n([10u8, 20, 30, 255], 16)
-        .flatten()
-        .collect();
+    png_rgba([10, 20, 30, 255])
+}
+
+/// 指定颜色的 4×4 不透明 PNG。
+fn png_rgba(rgba: [u8; 4]) -> Vec<u8> {
+    let pixels: Vec<u8> = std::iter::repeat_n(rgba, 16).flatten().collect();
     let image = image::RgbaImage::from_raw(4, 4, pixels).expect("raw");
     let mut out = std::io::Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(image)
         .write_to(&mut out, image::ImageFormat::Png)
         .expect("encode png");
     out.into_inner()
+}
+
+/// 图集页内某个 tile 内容区左上角的 BGRA 字节。
+fn tile_pixel(app: &App, image: crate::resources::ResourceImage) -> [u8; 4] {
+    let (page, pixels) = app.resources().page_pixels().expect("image page");
+    let page_width = page.0 as usize;
+    let origin_x = (image.tile.u0 * page.0 as f32).round() as usize;
+    let origin_y = (image.tile.v0 * page.0 as f32).round() as usize;
+    let offset = origin_y * page_width * 4 + origin_x * 4;
+    pixels[offset..offset + 4].try_into().expect("4 字节像素")
 }
 
 #[test]
@@ -353,4 +366,96 @@ fn image_atlas_page_is_lazy_until_the_first_insert() {
         "图片页固定最大档（P1-2.7：页尺寸与插入顺序无关）"
     );
     assert_eq!(pixels.len(), 2048 * 2048 * 4, "整页 = page² × BGRA8");
+}
+
+/// D-7：关窗必须归还该窗口 `insert_owned` 的引用；去重共享的内容不得被误回收。
+#[test]
+fn closing_a_window_releases_its_owned_resources() {
+    let (_rt, mut app, left) = setup();
+    let right = app.create_window(WindowOptions {
+        title: "right".into(),
+        size: Size::new(64.0, 64.0),
+        scale: crate::math::Scale::ONE,
+        ..WindowOptions::default()
+    });
+    let bytes = png();
+    let left_image = app
+        .resources_mut()
+        .insert_owned(left, &bytes)
+        .expect("left insert");
+    let right_image = app
+        .resources_mut()
+        .insert_owned(right, &bytes)
+        .expect("right insert");
+    assert_eq!(left_image, right_image, "同一内容两个窗口共享同一 tile");
+    assert_eq!(app.resources().len(), 1, "去重后只有一条条目");
+    assert_eq!(app.resources().stats().used_pixels, 16, "4×4 内容区");
+
+    assert!(app.close_window(left), "左窗口存在");
+    assert_eq!(app.resources().len(), 1, "右窗口仍持有引用，不得回收");
+    // 右窗口的 tile 仍有效：去重命中说明条目与内容索引都还在。
+    let still_alive = app
+        .resources_mut()
+        .insert(&bytes)
+        .expect("共享内容必须仍可去重命中");
+    assert_eq!(still_alive, right_image, "右窗口的 tile 不得失效");
+    assert_eq!(
+        tile_pixel(&app, right_image),
+        [30, 20, 10, 255],
+        "右窗口 tile 的页内像素必须仍是原内容"
+    );
+    assert!(app.resources_mut().unload(still_alive.id), "还掉临时引用");
+
+    assert!(app.close_window(right), "右窗口存在");
+    assert_eq!(app.resources().len(), 0, "两个窗口关完后条目必须归零");
+    let stats = app.resources().stats();
+    assert_eq!(stats.used_pixels, 0);
+    assert_eq!(
+        stats.used_bytes,
+        2048 * 2048 * 4,
+        "回收后只剩常驻图片页字节（源字节也归还）"
+    );
+}
+
+/// D-7：重复 close 幂等，且不得释放其它窗口的引用（窗口不存在时提前返回）。
+#[test]
+fn closing_a_window_is_idempotent_with_resources() {
+    let (_rt, mut app, left) = setup();
+    let right = app.create_window(WindowOptions {
+        title: "right".into(),
+        size: Size::new(64.0, 64.0),
+        scale: crate::math::Scale::ONE,
+        ..WindowOptions::default()
+    });
+    let left_bytes = png_rgba([1, 2, 3, 255]);
+    let right_bytes = png_rgba([4, 5, 6, 255]);
+    let _left_image = app
+        .resources_mut()
+        .insert_owned(left, &left_bytes)
+        .expect("left insert");
+    let right_image = app
+        .resources_mut()
+        .insert_owned(right, &right_bytes)
+        .expect("right insert");
+    assert_eq!(app.resources().len(), 2, "两种内容两条条目");
+
+    assert!(app.close_window(left));
+    assert_eq!(app.resources().len(), 1, "只释放左窗口的引用");
+    assert!(!app.close_window(left), "已关闭窗口的重复 close 返回 false");
+    assert_eq!(
+        app.resources().len(),
+        1,
+        "重复 close 不得释放其它窗口的引用"
+    );
+    // 右窗口的资源仍可用（内容索引与 tile 都还在）。
+    let still_alive = app
+        .resources_mut()
+        .insert(&right_bytes)
+        .expect("right content still alive");
+    assert_eq!(still_alive, right_image);
+    assert_eq!(tile_pixel(&app, right_image), [6, 5, 4, 255]);
+    assert!(app.resources_mut().unload(still_alive.id));
+
+    assert!(app.close_window(right));
+    assert_eq!(app.resources().len(), 0);
 }

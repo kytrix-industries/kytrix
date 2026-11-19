@@ -29,25 +29,20 @@
 //! - **去重**：`ContentKey = (len, ahash(bytes))` 索引 + 原始字节 memcmp（防碰撞）。同一份字节
 //!   插入 N 次只占 1 块 tile，引用计数 N；命中时**不重新解码**。
 //! - **归属**：[`ResourceCache::insert_owned`] 把引用登记到 [`WindowId`] 名下，
-//!   [`ResourceCache::release_window`] 在关窗时把该窗口的引用一次性还回去（按 LRU epoch 顺序）。
+//!   [`ResourceCache::release_window`] 在该窗口关闭时（`app::window_set::close_window`）把引用
+//!   一次性还回去（按 LRU epoch 顺序）。
 //! - **预算**：字节预算（图片页 CPU 缓冲 + 去重表保留的源字节）超限 ⇒ [`DecodeCause::Capacity`]
 //!   （[`CapacityCause::ByteBudget`]）。超预算时**不会**静默淘汰仍在引用的 tile；空闲条目在
 //!   `unload` / `release_window` 里即时回收。[`ResourceCache::stats`] 是唯一的可观测面。
 //!
-//! # 应用层接线（`app.rs` 不在本模块改动范围内，留待集成）
+//! # 应用层接线（现状）
 //!
-//! 1. `App::new` 的字段初始化里 `resources: ResourceCache::new()`（本轮见 `src/app.rs:392`）改成
-//!    `resources: ResourceCache::new(runtime.clone())`：`runtime` 字段在它之前被 move 进结构体，
-//!    所以要么把该字段改成 `runtime: runtime.clone()`，要么把 `resources:` 挪到 `runtime:` 之前。
-//! 2. 每帧调一次 `App::resources_mut().poll()`（接线点：`App::run_frame_hook` /
-//!    平台泵 `app.run_frame_hook()` 之前）：`Ready` 项换掉节点上的 `AtlasTile`，`Failed` 项按
-//!    强类型分类画占位图 / 记日志。
-//! 3. `crate::app::window_set::close_window`（本轮见 `src/app/window_set.rs:124`，`App::close_window`
-//!    的委托目标）在清旁表之后追加 `app.resources.release_window(id);`，否则关掉的窗口的 tile
-//!    一直占着页。
-//! 4. 插入带归属的图片用 `resources.insert_owned(window, bytes)`（关窗时才会被回收）。
-//!
-//! （行号在并行整改期间会漂移，按符号定位。）
+//! - `App` 持有进程级 [`ResourceCache`]（`App::new` 里 `ResourceCache::new(runtime)`）；带归属的
+//!   插入用 [`ResourceCache::insert_owned`]。
+//! - 关窗已接线：`app::window_set::close_window` 在窗口移除后调用
+//!   [`ResourceCache::release_window`]（D-7）。
+//! - 异步交付仍由宿主驱动：[`ResourceCache::poll`] 需要每帧调一次（帧钩子 / 平台泵）。本分支
+//!   尚未把 `poll` 接进 `App` 帧循环，`insert_async` 的结果在接线前只能由调用方自己 poll。
 
 use std::{fmt, num::NonZeroU32};
 
@@ -793,8 +788,8 @@ impl ResourceCache {
     /// 关窗回收：把 `owner` 名下的引用全部还回去，并删掉归属记录。
     ///
     /// 回收顺序按 `last_used`（LRU）：最久没被引用的先还。**不影响**其它窗口对同一内容的引用。
-    ///
-    /// 消费者：`App::close_window`（`app.rs` 不在本模块改动范围内 —— 需要在那边调一次）。
+    /// 窗口不存在时不会走到这里（`app::window_set::close_window` 的重复调用提前返回），
+    /// 因此重复关窗是幂等的。
     pub fn release_window(&mut self, owner: WindowId) {
         let Some(mut ids) = self.owners.remove(&owner) else {
             return;
