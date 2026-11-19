@@ -1,6 +1,6 @@
 //! 节点内容与旁表读写：文本 / a11y 载荷 / 绑定闭包 / 交互槽 / lane / clip。
 
-use std::rc::Rc;
+use std::{rc::Rc, sync::Arc};
 
 use smallvec::SmallVec;
 use smol_str::SmolStr;
@@ -23,6 +23,30 @@ use crate::{
 /// 文本载荷（`None` = 不是文本节点）。消费者：`App::refresh_styles` / `App::refresh_text`。
 pub(crate) fn text_content(tree: &NodeTree, node: NodeId) -> Option<&TextContent> {
     tree.arena.get(node).and_then(|target| target.kind.text())
+}
+
+// 消费者：`impl NodeTree::set_canvas` 的薄委托（外部调用点见该方法文档）。
+/// 替换 `Canvas` 节点的画布内容（D-6：异步图片交付的落地入口）。
+///
+/// 只接受 `NodeKind::Canvas` 节点；替换后标该节点**子树** `PAINT`（lane 重建 ⇒ damage 来自
+/// 重建后的图元，不会退化成整窗重绘）。不改变布局：Canvas 节点尺寸仍由布局决定。
+/// `AtlasTile` 的生命周期由调用方持有的 `ResourceImage` 决定 —— 引擎不会在替换时保留/延长
+/// 旧 tile，也不会自动 `unload` 旧资源。
+/// 返回 `false` = 节点不存在 / 不是 Canvas（**不**改动任何状态）。
+pub(crate) fn set_canvas(
+    tree: &mut NodeTree,
+    node: NodeId,
+    canvas: crate::paint::canvas::Canvas,
+) -> bool {
+    let Some(target) = tree.arena.get_mut(node) else {
+        return false;
+    };
+    let NodeKind::Canvas(existing) = &mut target.kind else {
+        return false;
+    };
+    *existing = Arc::new(canvas);
+    tree.mark_subtree_paint(node);
+    true
 }
 
 // 消费者：`impl NodeTree::set_text_content` 的薄委托（外部调用点见该方法文档）。

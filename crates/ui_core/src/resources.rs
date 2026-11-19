@@ -98,6 +98,7 @@ use crate::{
     math::Size,
     node::id::{Arena, ArenaKey},
     paint::atlas::{AtlasKind, AtlasTile},
+    platform::dispatcher::Dispatcher,
     render::{DirtyRects, ImageAtlasPager},
     resources::{
         cache::{ContentKey, DedupeEntry, Entry, Page, VariantEntry},
@@ -426,6 +427,8 @@ pub struct ResourceCache {
     page_generations: Vec<u32>,
     /// 解码任务投递用的 tokio 句柄；`None` = 无 runtime（`insert_async` 退化为同步解码）。
     runtime: Option<tokio::runtime::Handle>,
+    /// 平台事件循环唤醒器：**解码完成时唤醒泵**（D-6）。没有它，空闲时泵阻塞在`GetMessageW`/`poll`，`poll()` 永远不会被调用一次，`insert_async` 的结果与源字节/已解码 BGRA 永不释放。
+    dispatcher: Arc<Dispatcher>,
     /// 解码并发信号量：在途 blocking 解码各持有一个许可（上限 [`MAX_CONCURRENT_DECODES`]）。
     decode_semaphore: Arc<Semaphore>,
     /// 在途解码占用的预算（`estimate_peak + 源字节`），[`ResourceCache::poll`] 交付时归还。
@@ -466,8 +469,8 @@ struct PendingJob {
 impl ResourceCache {
     /// 新建：异步解码用 `handle` 投递（`runtime` 由 `App` 持有，引擎内不建 runtime、
     /// 也不做 `Handle::current()`——在 runtime 之外会 panic）。
-    pub(crate) fn new(handle: tokio::runtime::Handle) -> Self {
-        Self::with_runtime(Some(handle))
+    pub(crate) fn new(handle: tokio::runtime::Handle, dispatcher: Arc<Dispatcher>) -> Self {
+        Self::with_runtime(Some(handle), dispatcher)
     }
 
     /// 无 tokio runtime：`insert_async` **退化为同步解码**并立即给出 `DecodeState::Ready`。
@@ -476,10 +479,10 @@ impl ResourceCache {
     /// 永远持有 runtime），不带 runtime 的宿主直接用同步的 [`ResourceCache::insert`]。
     #[cfg(test)]
     pub(crate) fn new_unmanaged() -> Self {
-        Self::with_runtime(None)
+        Self::with_runtime(None, Dispatcher::new())
     }
 
-    fn with_runtime(runtime: Option<tokio::runtime::Handle>) -> Self {
+    fn with_runtime(runtime: Option<tokio::runtime::Handle>, dispatcher: Arc<Dispatcher>) -> Self {
         Self {
             entries: Arena::new(),
             dedupe: ahash::HashMap::default(),
@@ -490,6 +493,7 @@ impl ResourceCache {
             page_buffers: Vec::new(),
             page_generations: Vec::new(),
             runtime,
+            dispatcher,
             decode_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
             reserved_decode_bytes: 0,
             source_bytes: 0,
@@ -515,7 +519,7 @@ impl ResourceCache {
         runtime: Option<tokio::runtime::Handle>,
     ) -> Self {
         debug_assert_eq!(page.0, page.1, "图片页必须为正方形");
-        let mut cache = Self::with_runtime(runtime);
+        let mut cache = Self::with_runtime(runtime, Dispatcher::new());
         cache.byte_budget = byte_budget;
         cache.pager = ImageAtlasPager::with_page_for_test(page.0);
         cache.pager.preopen_page_for_test();
@@ -737,6 +741,7 @@ impl ResourceCache {
         let source = bytes.clone();
         let semaphore = Arc::clone(&self.decode_semaphore);
         let blocking_runtime = runtime.clone();
+        let dispatcher = Arc::clone(&self.dispatcher);
         #[cfg(test)]
         let decode_starts = Arc::clone(&self.decode_starts);
         runtime.spawn(async move {
@@ -752,6 +757,10 @@ impl ResourceCache {
                 #[cfg(test)]
                 decode_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let _ = sender.send(image::decode(&source, decode_target));
+                // D-6：解码完成唤醒平台泵 —— 空闲时泵阻塞在 GetMessageW/poll，不唤醒就永远不会
+                // 有下一次 `poll()`，结果、源字节与已解码 BGRA 会一直挂着。
+                // `wake` 幂等合并（Dispatcher 的电平位），批量解码不会打满消息队列。
+                dispatcher.wake();
             });
         });
         self.push_pending(PendingJob {

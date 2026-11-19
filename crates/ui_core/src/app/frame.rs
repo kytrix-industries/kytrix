@@ -90,6 +90,9 @@ pub(crate) fn frame(
     }
     // R02-5：把未消费的事件在交给 `on_frame` 钩子之后再兜底有界化一次（正常推入就已经有界，
     // 这里是 O(1) 的防御；钩子可能持有上一轮的事件引用做重放，所以裁剪放在帧入口）。
+    // D-6：帧入口兜底轮询一次异步解码结果（`run_frame_hook` 的正常路径已在泵里轮询；
+    // headless / 自驱帧宿主没有泵钩子，若这一帧前恰好有解码完成，这里交付并置出帧请求）。
+    app.poll_resources();
     app.events.trim();
     #[cfg(feature = "hud")]
     app.prepare_debug_hud(window);

@@ -1074,6 +1074,15 @@ impl NodeTree {
     pub(crate) fn text_content(&self, node: NodeId) -> Option<&TextContent> {
         content::text_content(self, node)
     }
+    /// 替换 Canvas 节点的画布内容（D-6 异步图片交付入口；语义见 `content::set_canvas`）。
+    pub(crate) fn set_canvas(
+        &mut self,
+        node: NodeId,
+        canvas: crate::paint::canvas::Canvas,
+    ) -> bool {
+        content::set_canvas(self, node, canvas)
+    }
+
     pub(crate) fn set_text_content(&mut self, node: NodeId, content: TextContent) -> bool {
         content::set_text_content(self, node, content)
     }

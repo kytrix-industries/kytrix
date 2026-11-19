@@ -643,6 +643,33 @@ impl Window {
         &mut self.tree
     }
 
+    /// 替换 **Canvas 节点**的画布内容（D-6：异步图片解码交付的落地入口）。
+    ///
+    /// # 语义
+    /// - 只接受 `NodeKind::Canvas` 节点：节点不存在 ⇒ [`EngineError::StaleNode`]；节点存在但
+    ///   不是 Canvas ⇒ `Ok(false)`（不改变任何状态，调用方按契约错误处理）。
+    /// - 替换后标该节点**子树** `PAINT`：下一帧重建 lane，damage 来自新图元；**不**置整窗
+    ///   damage，也**不**重算布局 —— Canvas 节点的尺寸仍由布局 / `LayoutOverride` 决定，
+    ///   应用换画布前应保证尺寸与内容匹配（否则溢出/留白由应用负责）。
+    /// - `AtlasTile` 的生命周期由调用方持有的 [`crate::resources::ResourceImage`] 决定：
+    ///   引擎不会因替换而保留/延长旧 tile，也不会自动 `unload` 旧资源；应用负责对不再引用的
+    ///   资源调用 `ResourceCache::unload`（或关窗时 `release_window`）。
+    /// - 本方法不请求帧（Window 无平台唤醒能力）：在 `on_frame` 钩子里调用时本帧稍后就会重建
+    ///   lane；其它时机随后调用 `App::request_node_repaint(window, node)` 或等下一次帧。
+    ///
+    /// # Errors
+    /// [`EngineError::StaleNode`]：节点已卸载（陈旧句柄）。
+    pub fn set_canvas(
+        &mut self,
+        node: NodeId,
+        canvas: crate::paint::canvas::Canvas,
+    ) -> Result<bool, EngineError> {
+        if self.tree.get(node).is_err() {
+            return Err(EngineError::StaleNode { node });
+        }
+        Ok(self.tree.set_canvas(node, canvas))
+    }
+
     /// 指针状态（crate 私有：`App::dispatch_input` 与平台泵是唯一读者）。
     pub(crate) fn pointer(&self) -> &PointerState {
         &self.pointer

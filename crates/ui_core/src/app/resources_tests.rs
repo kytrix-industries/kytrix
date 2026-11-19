@@ -1,8 +1,15 @@
 use super::App;
 use crate::{
     math::{Rect, Size},
-    node::builder::NodeBuilder,
-    paint::style::PaintSpec,
+    node::{builder::NodeBuilder, dirty::DirtyFlags},
+    paint::{
+        atlas::{AtlasKind, AtlasTile},
+        canvas::Canvas,
+        color::Color,
+        primitive::{Image, Primitive},
+        style::PaintSpec,
+    },
+    resources::{DecodeState, ResourceImage},
     window::{WindowId, WindowOptions},
 };
 
@@ -458,4 +465,249 @@ fn closing_a_window_is_idempotent_with_resources() {
 
     assert!(app.close_window(right));
     assert_eq!(app.resources().len(), 0);
+}
+
+/// D-6 测试用 runtime：`insert_async` 现在先 spawn 一个 async 任务等并发许可再投 blocking 解码，
+/// `current_thread` runtime 需要被 `block_on` 驱动；这里用单 worker 的 multi_thread 让任务在
+/// 后台 worker 上跑，测试线程可以同步轮询 `run_frame_hook`。
+fn decode_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("multi-thread runtime")
+}
+
+/// 轮询直到 `predicate` 为真（上限 `attempts` × `sleep`）。
+fn wait_until(attempts: usize, mut predicate: impl FnMut() -> bool) -> bool {
+    for _ in 0..attempts {
+        if predicate() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    false
+}
+
+/// D-6：`insert_async` 的结果必须由帧钩子（`run_frame_hook` → `poll`）交付，且只交付一次。
+#[test]
+fn async_decode_is_delivered_by_the_frame_hook() {
+    let rt = decode_runtime();
+    let mut app = App::new(rt.handle().clone());
+    let _window = app.create_window(WindowOptions::default());
+    let pending = app
+        .resources_mut()
+        .insert_async(bytes::Bytes::from(png_rgba([10, 20, 30, 255])));
+
+    let requests = app.frame_requests();
+    let mut delivered = Vec::new();
+    assert!(
+        wait_until(400, || {
+            app.run_frame_hook();
+            delivered = app.take_resource_results();
+            !delivered.is_empty()
+        }),
+        "异步解码结果必须在 ≈2s 内由帧钩子交付"
+    );
+    assert!(
+        app.frame_requests() > requests,
+        "交付必须有新帧请求（否则应用看不到结果）"
+    );
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].0, pending, "必须带原 PendingResource 句柄");
+    assert!(
+        matches!(&delivered[0].1, DecodeState::Ready(image) if (image.width, image.height) == (4, 4)),
+        "必须交付 Ready(ResourceImage)：{:?}",
+        delivered[0].1
+    );
+    assert_eq!(app.resources().len(), 1, "交付后条目已装箱");
+    assert!(app.take_resource_results().is_empty(), "每项只交付一次");
+    // 再跑一轮钩子也不得重复交付 / 开新帧。
+    let requests = app.frame_requests();
+    app.run_frame_hook();
+    assert!(app.take_resource_results().is_empty());
+    assert_eq!(app.frame_requests(), requests, "没有新交付就不会每轮请求帧");
+}
+
+/// D-6：解码完成必须唤醒平台泵（否则空闲时泵阻塞在 GetMessageW/poll，`poll` 永不发生）。
+#[test]
+fn async_decode_wakes_the_pump() {
+    let rt = decode_runtime();
+    let mut app = App::new(rt.handle().clone());
+    let _window = app.create_window(WindowOptions::default());
+    // 清掉构造期可能留下的唤醒位。
+    let _ = app.dispatcher().take_frame_wake();
+    let _pending = app
+        .resources_mut()
+        .insert_async(bytes::Bytes::from(png_rgba([1, 2, 3, 255])));
+
+    assert!(
+        wait_until(400, || app.dispatcher().take_frame_wake()),
+        "解码完成必须唤醒泵（Dispatcher 电平位）"
+    );
+    // 收尾：把结果交付掉，避免 pending 残留影响其它断言。
+    let mut delivered = Vec::new();
+    assert!(wait_until(200, || {
+        app.run_frame_hook();
+        delivered = app.take_resource_results();
+        !delivered.is_empty()
+    }));
+    assert_eq!(delivered.len(), 1);
+}
+
+/// D-6：`Window::set_canvas` 替换 Canvas 节点内容 ⇒ 标子树 PAINT、下一帧新图元上屏。
+#[test]
+fn set_canvas_replaces_canvas_content_and_marks_subtree_paint() {
+    let (_rt, mut app, window) = setup();
+    let root = app.window(window).expect("窗口存在").tree().root();
+    let node = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 32.0, 32.0)))
+        .layout_override(Rect::new(0.0, 0.0, 32.0, 32.0))
+        .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
+        .expect("canvas 节点");
+    let _ = app.frame(window).expect("帧").expect("首帧不报错");
+
+    let tile = AtlasTile {
+        atlas: AtlasKind::Image,
+        page: 0,
+        u0: 0.0,
+        v0: 0.0,
+        u1: 0.25,
+        v1: 0.25,
+        generation: 1,
+    };
+    let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 32.0, 32.0));
+    canvas.push_image(Image {
+        bounds: Rect::new(0.0, 0.0, 32.0, 32.0),
+        tile,
+        modulation: Color::WHITE,
+    });
+    let replaced = app
+        .window_mut(window)
+        .expect("窗口存在")
+        .set_canvas(node, canvas)
+        .expect("节点存活");
+    assert!(replaced, "Canvas 节点必须接受替换");
+    let dirty = app
+        .window(window)
+        .expect("窗口存在")
+        .tree()
+        .get(node)
+        .expect("节点")
+        .dirty();
+    assert!(
+        dirty.contains(DirtyFlags::PAINT),
+        "替换画布必须标 PAINT（重建 lane）：{dirty:?}"
+    );
+
+    let _ = app.frame(window).expect("帧").expect("次帧不报错");
+    let target = app.window(window).expect("窗口存在");
+    let lane = target.tree().lane_of(node).expect("lane");
+    let primitives = target
+        .scene()
+        .lane_primitives(lane)
+        .expect("lane primitives");
+    assert!(
+        primitives.iter().any(|primitive| matches!(
+            primitive,
+            Primitive::Canvas(canvas)
+                if canvas
+                    .primitives()
+                    .iter()
+                    .any(|inner| matches!(inner, Primitive::Image(image) if image.tile == tile)),
+        )),
+        "新画布的 Image 图元必须上屏：{primitives:?}"
+    );
+}
+
+/// D-6：`Window::set_canvas` 的类型/生命周期契约。
+#[test]
+fn set_canvas_rejects_non_canvas_nodes_and_stale_handles() {
+    let (_rt, mut app, window) = setup();
+    let root = app.window(window).expect("窗口存在").tree().root();
+    let text = NodeBuilder::text("not a canvas", crate::text::TextStyle::new(16.0))
+        .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
+        .expect("text 节点");
+    assert!(
+        !app.window_mut(window)
+            .expect("窗口存在")
+            .set_canvas(text, Canvas::new(Rect::new(0.0, 0.0, 8.0, 8.0)))
+            .expect("节点存活"),
+        "非 Canvas 节点必须返回 Ok(false) 且不改状态"
+    );
+
+    let canvas = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 16.0, 16.0)))
+        .layout_override(Rect::new(0.0, 0.0, 16.0, 16.0))
+        .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
+        .expect("canvas 节点");
+    app.window_mut(window)
+        .expect("窗口存在")
+        .tree_mut()
+        .remove(canvas)
+        .expect("移除成功");
+    let error = app
+        .window_mut(window)
+        .expect("窗口存在")
+        .set_canvas(canvas, Canvas::new(Rect::new(0.0, 0.0, 8.0, 8.0)))
+        .expect_err("陈旧节点必须报错");
+    assert!(
+        matches!(error, crate::error::EngineError::StaleNode { .. }),
+        "{error:?}"
+    );
+}
+
+/// D-6 完整闭环：异步入库的图片 → 帧钩子交付 Ready → `set_canvas` 把新 tile 应用到已有节点
+/// → 下一帧上屏（素材/节点生命周期由调用方持有 `ResourceImage` 的引用决定）。
+#[test]
+fn async_ready_tile_can_be_applied_to_an_existing_node() {
+    let rt = decode_runtime();
+    let mut app = App::new(rt.handle().clone());
+    let window = app.create_window(WindowOptions::default());
+    let root = app.window(window).expect("窗口存在").tree().root();
+    let node = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 32.0, 32.0)))
+        .layout_override(Rect::new(0.0, 0.0, 32.0, 32.0))
+        .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
+        .expect("canvas 节点");
+    let _ = app.frame(window).expect("帧").expect("首帧不报错");
+
+    let _pending = app
+        .resources_mut()
+        .insert_async(bytes::Bytes::from(png_rgba([40, 50, 60, 255])));
+    let mut image: Option<ResourceImage> = None;
+    assert!(wait_until(400, || {
+        app.run_frame_hook();
+        for (_pending, state) in app.take_resource_results() {
+            if let DecodeState::Ready(ready) = state {
+                image = Some(ready);
+            }
+        }
+        image.is_some()
+    }));
+    let image = image.expect("必须交付 Ready");
+    assert_eq!((image.width, image.height), (4, 4));
+
+    let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 32.0, 32.0));
+    canvas.push_image(Image {
+        bounds: Rect::new(0.0, 0.0, 4.0, 4.0),
+        tile: image.tile,
+        modulation: Color::WHITE,
+    });
+    assert!(
+        app.window_mut(window)
+            .expect("窗口存在")
+            .set_canvas(node, canvas)
+            .expect("节点存活")
+    );
+    let _ = app.frame(window).expect("帧").expect("次帧不报错");
+    let target = app.window(window).expect("窗口存在");
+    let lane = target.tree().lane_of(node).expect("lane");
+    let primitives = target.scene().lane_primitives(lane).expect("prims");
+    assert!(
+        primitives.iter().any(|primitive| match primitive {
+            Primitive::Canvas(canvas) => canvas.primitives().iter().any(
+                |inner| matches!(inner, Primitive::Image(primed) if primed.tile == image.tile)
+            ),
+            _ => false,
+        }),
+        "Ready tile 必须被 set_canvas 应用到节点并上屏：{primitives:?}"
+    );
 }
