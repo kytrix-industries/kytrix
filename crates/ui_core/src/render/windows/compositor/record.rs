@@ -9,7 +9,10 @@
 //! damage 在**本模块入口**夹紧到当前内容矩形（R08-10 的后端二次防御），夹紧后的同一份集合
 //! 同时用于 scissor / copy / `Present1` —— 三个消费点不再各自从 `FramePlan` 重取。
 
-use std::{sync::Arc, time::{Duration, Instant}};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use windows::Win32::{
     Foundation::RECT,

@@ -1196,11 +1196,9 @@ fn gpu_loop(renderer: GpuRenderer, shared: Arc<Shared>) {
                 };
                 // C2：D3D12 健康时再看 DComp —— `Composition` 错误只有权威状态判 Invalid 才重建。
                 let composition_invalid = !device_lost
-                    && renderer
-                        .as_ref()
-                        .is_some_and(|current| {
-                            current.composition_state() == CompositionState::Invalid
-                        });
+                    && renderer.as_ref().is_some_and(|current| {
+                        current.composition_state() == CompositionState::Invalid
+                    });
                 match fatal_disposition(&error, device_lost, composition_invalid) {
                     FatalDisposition::Fatal => {
                         shared.publish_error(error);
@@ -1209,8 +1207,7 @@ fn gpu_loop(renderer: GpuRenderer, shared: Arc<Shared>) {
                     FatalDisposition::DeviceLost => {
                         // 设备真的被移除了：先尝试一次进程内恢复（限次在 `SharedGpu::recover` 里）。
                         submitted.clear();
-                        let current =
-                            renderer.take().expect("renderer is present until teardown");
+                        let current = renderer.take().expect("renderer is present until teardown");
                         match current.recover() {
                             Ok(recovered) => {
                                 crate::render::windows::diagnostics::device_recovered();
@@ -1234,8 +1231,9 @@ fn gpu_loop(renderer: GpuRenderer, shared: Arc<Shared>) {
                             shared.publish_error(composition_rebuild_exhausted());
                             break;
                         }
-                        let current =
-                            renderer.as_mut().expect("renderer is present until teardown");
+                        let current = renderer
+                            .as_mut()
+                            .expect("renderer is present until teardown");
                         match current.rebuild_composition() {
                             Ok(()) => {
                                 crate::render::windows::diagnostics::composition_recovered();

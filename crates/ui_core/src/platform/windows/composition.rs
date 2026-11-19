@@ -60,7 +60,6 @@ use std::sync::{
 };
 
 use windows::{
-    core::BOOL,
     Win32::{
         Foundation::{HWND, RECT},
         Graphics::{
@@ -73,7 +72,7 @@ use windows::{
         },
         UI::WindowsAndMessaging::{GetClientRect, IsWindow},
     },
-    core::IUnknown,
+    core::{BOOL, IUnknown},
 };
 
 use crate::error::EngineError;
@@ -486,7 +485,10 @@ fn runtime_error(stage: &'static str, error: windows::core::Error) -> EngineErro
 /// 顺序很重要：**窗口已关闭优先**（此时设备失效与「窗口销毁中」无法区分，且恢复没有意义，
 /// GPU 线程/Epoch 消费方必须把它当退出前状态而不是反复重建）；窗口还在时 `Ok(FALSE)` 或错误
 /// 都是可重建的 [`CompositionState::Invalid`]。
-fn classify_device_state(result: windows::core::Result<BOOL>, window_alive: bool) -> CompositionState {
+fn classify_device_state(
+    result: windows::core::Result<BOOL>,
+    window_alive: bool,
+) -> CompositionState {
     if !window_alive {
         return CompositionState::WindowClosed;
     }
@@ -498,8 +500,6 @@ fn classify_device_state(result: windows::core::Result<BOOL>, window_alive: bool
 
 #[cfg(test)]
 mod tests {
-    use super::{Composition, CompositionState, VisualGeometry, buffer_size, classify_device_state, visual_geometry};
-    use crate::error::EngineError;
     use windows::{
         Win32::{
             Foundation::{HWND, LPARAM, LRESULT, WPARAM},
@@ -511,6 +511,12 @@ mod tests {
         },
         core::{BOOL, PCWSTR},
     };
+
+    use super::{
+        Composition, CompositionState, VisualGeometry, buffer_size, classify_device_state,
+        visual_geometry,
+    };
+    use crate::error::EngineError;
 
     /// `CheckDeviceState` 的三分类（C2 的纯逻辑核心）：
     /// - 窗口已关闭时任何结果都归 `WindowClosed`（退出路径，不触发重建）；
@@ -527,9 +533,12 @@ mod tests {
             "设备自报无效 ⇒ 可重建"
         );
         assert_eq!(
-            classify_device_state(Err(windows::core::Error::from_hresult(
-                windows::core::HRESULT(0x8899_0000u32 as i32)
-            )), true),
+            classify_device_state(
+                Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+                    0x8899_0000u32 as i32
+                ))),
+                true
+            ),
             CompositionState::Invalid,
             "窗口仍存活但检查报错 ⇒ 可重建（不猜具体 DComp 错误码）"
         );
@@ -543,9 +552,12 @@ mod tests {
             CompositionState::WindowClosed
         );
         assert_eq!(
-            classify_device_state(Err(windows::core::Error::from_hresult(
-                windows::core::HRESULT(0x8899_0000u32 as i32)
-            )), false),
+            classify_device_state(
+                Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+                    0x8899_0000u32 as i32
+                ))),
+                false
+            ),
             CompositionState::WindowClosed
         );
     }

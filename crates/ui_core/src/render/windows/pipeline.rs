@@ -894,11 +894,9 @@ mod tests {
         assert_eq!(second, ATLAS_DESCRIPTORS + WINDOW_SRVS);
         // SAFETY: 只读查询描述符增量；设备 / 堆由本测试持有。
         let descriptor_size = unsafe {
-            device
-                .raw()
-                .GetDescriptorHandleIncrementSize(
-                    windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                )
+            device.raw().GetDescriptorHandleIncrementSize(
+                windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            )
         };
         let generation0 = heap.atlas_table(0);
         let generation1 = heap.atlas_table(1);

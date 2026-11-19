@@ -70,9 +70,7 @@ use crate::{
     render::{
         atlas::{AtlasRebuilt, texel_bytes},
         retire::GpuResourceHandle,
-        windows::pipeline::{
-            ATLAS_GENERATIONS, DescriptorArena, MAX_WINDOWS, Pipeline, SrvHeap,
-        },
+        windows::pipeline::{ATLAS_GENERATIONS, DescriptorArena, MAX_WINDOWS, Pipeline, SrvHeap},
     },
 };
 
@@ -736,7 +734,6 @@ impl SharedGpu {
             .map(|watermark| watermark.value())
             .collect()
     }
-
 
     /// 登记资源（`&mut Device` 的短临界区）。
     pub(crate) fn allocate(&self, resource: ID3D12Resource) -> GpuResourceHandle {

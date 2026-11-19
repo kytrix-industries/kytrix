@@ -40,7 +40,11 @@ use crate::{
     error::EngineError,
     platform::{
         dispatcher::Dispatcher,
-        windows::{composition::{self, CompositionState}, dpi_awareness, window::NativeWindow},
+        windows::{
+            composition::{self, CompositionState},
+            dpi_awareness,
+            window::NativeWindow,
+        },
     },
     render::backend::Renderer,
     window::{Window, WindowId, WindowOptions},

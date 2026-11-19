@@ -130,7 +130,6 @@ impl StreamWatermark {
     pub(crate) fn value(&self) -> u64 {
         self.value.load(Ordering::Acquire)
     }
-
 }
 
 /// 一个窗口在共享队列上的提交流：allocator/list + 自己的 fence + 提交记账 + retire。
