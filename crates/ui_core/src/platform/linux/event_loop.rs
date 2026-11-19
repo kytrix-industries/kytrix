@@ -532,7 +532,14 @@ fn sync_windows(
         }
         a11ys.push(WindowA11y {
             id,
-            adapter: UnixA11y::new(dispatcher.clone(), id)?,
+            adapter: UnixA11y::new(
+                dispatcher.clone(),
+                id,
+                app.window(id).map_or_else(
+                    crate::a11y::adapter::A11yConsumerEpoch::new,
+                    |window| window.a11y_consumer_epoch(),
+                ),
+            )?,
         });
     }
     // 渲染器只能在首个 configure 之后建：configure 之前 `xdg_surface` 没有配置的尺寸，WSI

@@ -31,6 +31,7 @@ use windows::Win32::{
 };
 
 use crate::{
+    a11y::adapter::A11yConsumerEpoch,
     error::EngineError,
     platform::dispatcher::{Dispatcher, UserTask},
     window::WindowId,
@@ -47,12 +48,17 @@ pub(crate) struct WindowsA11y {
 impl WindowsA11y {
     /// 在窗口**显示之前**构造（`NativeWindow::create` 里、`ShowWindow` 之前）。
     ///
+    /// `epoch` 是窗口的消费端代际句柄：UIA 重新激活（provider 重建）时激活回调 `bump()` 它，
+    /// 引擎据此把下一笔升成全树（E1）。当前 Windows 没有暴露 deactivate 路径，激活路径统一后
+    /// 即使未来出现重激活也安全。
+    ///
     /// # Errors
     /// `EngineError::A11yInit`：句柄无效（adapter 只能在有效窗口上构造）。
     pub(crate) fn new(
         hwnd: HWND,
         dispatcher: Arc<Dispatcher>,
         window: WindowId,
+        epoch: A11yConsumerEpoch,
     ) -> Result<Self, EngineError> {
         // SAFETY: 只查窗口有效性，不改任何状态。
         if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
@@ -60,11 +66,15 @@ impl WindowsA11y {
                 detail: smol_str::SmolStr::new_static("IsWindow(hwnd) == false"),
             });
         }
+        let activation = WindowsActivation {
+            epoch,
+            dispatcher: Arc::clone(&dispatcher),
+        };
         let action_handler = WindowsActionHandler { dispatcher, window };
         Ok(Self {
             // `is_window_focused = false`：窗口尚未显示；随后由 `WM_SETFOCUS` 纠正。
             adapter: Adapter::new(hwnd, false, action_handler),
-            activation: WindowsActivation,
+            activation,
             in_getobject: Cell::new(false),
         })
     }
@@ -133,10 +143,18 @@ impl std::fmt::Debug for WindowsA11y {
 ///
 /// 这里恒返回 `None`——`WndProc` 不碰 `App`（P09 §5.2 的纪律），要同步返回全树就得在平台层缓存
 /// 一整棵 `TreeUpdate`（第二份真值）。占位一帧是 AccessKit 明确支持的用法（`lib.rs:3351-3358`）。
-struct WindowsActivation;
+///
+/// E1：激活时 `bump()` 消费端代际并唤醒主线程，保证"占位根之后的第一笔"是全树。
+/// Windows 当前没有 deactivation 路径；统一后即使未来出现 provider 重建也安全。
+struct WindowsActivation {
+    epoch: A11yConsumerEpoch,
+    dispatcher: Arc<Dispatcher>,
+}
 
 impl ActivationHandler for WindowsActivation {
     fn request_initial_tree(&mut self) -> Option<TreeUpdate> {
+        self.epoch.bump();
+        self.dispatcher.wake();
         None
     }
 }
@@ -166,8 +184,12 @@ mod tests {
         },
     };
 
-    use super::WindowsA11y;
-    use crate::{platform::dispatcher::Dispatcher, window::WindowId};
+    use super::{WindowsA11y, WindowsActivation};
+    use crate::{
+        a11y::adapter::A11yConsumerEpoch,
+        platform::dispatcher::Dispatcher,
+        window::WindowId,
+    };
 
     unsafe extern "system" fn wndproc(
         hwnd: windows::Win32::Foundation::HWND,
@@ -234,7 +256,7 @@ mod tests {
             !unsafe { IsWindowVisible(hwnd) }.as_bool(),
             "本用例必须在首显之前构造 adapter"
         );
-        let a11y = WindowsA11y::new(hwnd, Dispatcher::new(), WindowId::for_test(1));
+        let a11y = WindowsA11y::new(hwnd, Dispatcher::new(), WindowId::for_test(1), A11yConsumerEpoch::new());
         assert!(a11y.is_ok(), "隐藏窗口上必须能构造 adapter（首显前）");
         let mut a11y = a11y.expect("adapter");
         a11y.focus_changed(true);
@@ -250,7 +272,7 @@ mod tests {
         let _runtime = runtime();
         let (hwnd, _class) = hidden_window("KytrixP11A11yLazy");
         let mut a11y =
-            WindowsA11y::new(hwnd, Dispatcher::new(), WindowId::for_test(2)).expect("adapter");
+            WindowsA11y::new(hwnd, Dispatcher::new(), WindowId::for_test(2), A11yConsumerEpoch::new()).expect("adapter");
         // 无辅助技术连接时 adapter 恒 Inactive ⇒ 闭包**一次都不执行**（懒激活零开销）。
         // 注：本断言在「有 AT 正在运行的机器」上不成立，CI 无桌面环境恒成立（V-75 的已知边界）。
         let mut called = false;
@@ -270,7 +292,7 @@ mod tests {
         let _runtime = runtime();
         let (hwnd, _class) = hidden_window("KytrixP11A11yObjid");
         let mut a11y =
-            WindowsA11y::new(hwnd, Dispatcher::new(), WindowId::for_test(3)).expect("adapter");
+            WindowsA11y::new(hwnd, Dispatcher::new(), WindowId::for_test(3), A11yConsumerEpoch::new()).expect("adapter");
         // OBJID_WINDOW / 其它负数 objid 不归 AccessKit 管 ⇒ 交回 DefWindowProcW。
         let result = a11y.wm_getobject(
             windows::Win32::Foundation::WPARAM(0),
@@ -281,6 +303,29 @@ mod tests {
         unsafe {
             let _ = DestroyWindow(hwnd);
         }
+    }
+
+    /// E1：UIA 激活（provider 重建 / `WM_GETOBJECT` 首次握手）必须 bump 消费端代际 ——
+    /// 引擎据此把下一笔升成全树，而不是把增量当初始树（consumer panic / 永久空树）。
+    #[test]
+    fn activation_bumps_the_consumer_epoch() {
+        use accesskit::ActivationHandler;
+
+        let epoch = A11yConsumerEpoch::new();
+        let before = epoch.current();
+        let mut activation = WindowsActivation {
+            epoch: epoch.clone(),
+            dispatcher: Dispatcher::new(),
+        };
+        assert!(
+            activation.request_initial_tree().is_none(),
+            "引擎异步交付首树：激活回调只标记，不同步构造 TreeUpdate"
+        );
+        assert_eq!(
+            epoch.current(),
+            before + 1,
+            "激活回调必须标记消费端已重置（否则下一笔仍是增量）"
+        );
     }
 
     fn empty_update() -> accesskit::TreeUpdate {

@@ -145,11 +145,15 @@ pub(crate) struct NativeWindow {
 
 impl NativeWindow {
     /// 建**隐藏**窗口（不 `makeKeyAndOrderFront`）并装好 view + a11y adapter。
+    ///
+    /// `a11y_consumer_epoch` 是窗口的消费端代际句柄（与引擎 `A11yBridge` 共享）：AX 重新激活
+    /// 时激活回调 `bump()` 它，引擎把下一笔升成全树（E1）。
     pub(crate) fn create(
         mtm: MainThreadMarker,
         id: WindowId,
         options: &WindowOptions,
         dispatcher: &Arc<Dispatcher>,
+        a11y_consumer_epoch: crate::a11y::adapter::A11yConsumerEpoch,
     ) -> Result<Self, EngineError> {
         let style = NSWindowStyleMask::Titled
             | NSWindowStyleMask::Closable
@@ -214,7 +218,7 @@ impl NativeWindow {
 
         // 原生交通灯全部保留：关闭 / 最小化 / 缩放。标题栏透明且标题隐藏，内容铺满窗口，
         // 因此窗口控件浮在内容上方（应用用顶部安全区避让）。
-        let a11y = MacA11y::new(&view, dispatcher.clone(), id)?;
+        let a11y = MacA11y::new(&view, dispatcher.clone(), id, a11y_consumer_epoch)?;
         view.install_a11y(a11y);
 
         // 关闭拦截：AppKit 的关窗手势（红点 / Cmd-W / performClose:）走 delegate，

@@ -1971,6 +1971,73 @@ mod p11_fix_tests {
             "补丁照常生效"
         );
     }
+
+    /// E1 端到端：AT 重新激活（消费端重置）后，**不推进时钟**也必须立即交付全树。
+    ///
+    /// 修前行为：平台激活回调拿到 `None` 后 AccessKit 停在 `Pending`；`drain_pump` 走生产闸门
+    /// `App::a11y_pending`，重置后既没有脏位、也不节流旁路 ⇒ 永远不交付（AT 永久空树）；
+    /// 若有脏位则交付增量（`tree: None`）⇒ `accesskit_consumer::Tree::new` panic。
+    ///
+    /// 变异守卫：删掉 `App::a11y_pending` 的 epoch 旁路（泵不交付）或 `take` 的全树升级
+    /// （`tree: None`）⇒ 本用例红。
+    #[test]
+    fn a_consumer_epoch_reset_delivers_a_full_tree_without_advancing_the_clock() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let button = mount(&mut app, |tree, root| {
+            NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, 0.0, 60.0, 24.0))
+                .paint(white())
+                .on_click(Action::custom("press"))
+                .id("press")
+                .build(tree, root)
+                .expect("button")
+        });
+        // 首笔全树（生产闸门：首笔不受节流影响）。
+        let _ = app.drain_pump().expect("首帧");
+        assert!(
+            app.a11y_update().expect("首笔").tree.is_some(),
+            "首笔必须全树"
+        );
+        app.assert_a11y_contract();
+
+        // 标脏一笔增量：时钟不动 ⇒ 仍在 `A11Y_THROTTLE` 窗口内，普通脏位不得交付
+        // （先证明节流仍然有效，否则"不推进时钟"这个前提没有意义）。
+        app.app_mut()
+            .window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .mark_a11y(button);
+        assert!(
+            !app.app().a11y_pending(window),
+            "限流窗口内的普通脏位不得立即交付"
+        );
+
+        // 消费端重置（平台 adapter 的激活/停用回调）：必须立即、全量交付。
+        let epoch = app
+            .app()
+            .window(window)
+            .expect("window")
+            .a11y_consumer_epoch();
+        epoch.bump();
+        let _ = app.drain_pump().expect("重置后的泵轮");
+        let update = app
+            .a11y_update()
+            .expect("消费端重置后必须交付（不推进时钟、不依赖脏位）")
+            .clone();
+        assert!(
+            update.tree.is_some(),
+            "重置后的第一笔必须携带 TreeInfo（否则 consumer panic / AT 空树）"
+        );
+        app.assert_a11y_contract();
+        // 额外用一份**空**影子树应用该笔：模拟 AT 重新接入时消费端从零开始。
+        let mut fresh = crate::test_support::a11y::ShadowTree::new();
+        fresh
+            .apply(&update)
+            .expect("AT 重新接入时全树笔必须能初始化一棵空树");
+        assert!(fresh.len() >= 2, "全树笔必须覆盖根 + 按钮");
+    }
 }
 
 /// R13-12：`UserTask` 回投链的端到端用例（`AppHandle::send` → `Dispatcher::push` →

@@ -20,6 +20,21 @@ pub(crate) fn a11y_focus_pending(window: &Window) -> bool {
         .focus_pending(&window.tree, window.focus.focused())
 }
 
+/// 消费端树生命周期代际句柄（E1）：交给平台 adapter 的激活/停用回调 `bump()`。
+///
+/// 回调在 AccessKit 的线程上执行，只能原子递增 + 唤醒主线程；引擎据此把下一笔升成全树。
+pub(crate) fn a11y_consumer_epoch(
+    window: &Window,
+) -> crate::a11y::adapter::A11yConsumerEpoch {
+    window.a11y.consumer_epoch()
+}
+
+// 消费者：`impl Window::a11y_consumer_epoch_pending` 的薄委托。
+/// 消费端是否重置过而全树尚未交付（`App::a11y_pending` 的不节流旁路，E1）。
+pub(crate) fn a11y_consumer_epoch_pending(window: &Window) -> bool {
+    window.a11y.consumer_epoch_pending()
+}
+
 // 消费者：`impl Window::a11y_engine_of` 的薄委托（动作解码）。
 /// 稳定 a11y id → 当前引擎句柄（未知 / 已回收 ⇒ `None`，调用方记 `StaleAction`）。
 pub(crate) fn a11y_engine_of(

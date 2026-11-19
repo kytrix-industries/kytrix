@@ -87,8 +87,10 @@ pub(crate) fn a11y_put_handler(
 /// 该窗口本轮是否有 a11y 工作（O(1)；平台泵每轮用它过滤 `update_if_active`）。
 /// 消费者：`App::a11y_pending`。
 ///
-/// **焦点旁路**（R13-5）：焦点变化不受 `A11Y_THROTTLE` 约束 —— 读屏用户的"位置感"绑定在
-/// 焦点反馈的时效上；高频数据类更新（行情数字）仍按 100 ms 合并（省电目标不变）。
+/// 两条不节流旁路（`A11Y_THROTTLE` 只约束**已接入后**的高频数据更新）：
+/// - **焦点变化**（R13-5）：读屏用户的"位置感"绑定在焦点反馈的时效上；
+/// - **消费端重置**（E1）：AT 重新激活 / adapter 停用后 AccessKit 停在 `Pending`，在收到全树
+///   之前 AT 看到的是空树；此时也没有脏位可供到期补发，必须立刻交付。
 #[must_use]
 pub(crate) fn a11y_pending(app: &App, window: WindowId) -> bool {
     let Some(target) = app.windows.get(&window) else {
@@ -98,6 +100,7 @@ pub(crate) fn a11y_pending(app: &App, window: WindowId) -> bool {
         return false;
     }
     target.a11y_focus_pending()
+        || target.a11y_consumer_epoch_pending()
         || app
             .a11y_delivered
             .get(&window)
@@ -435,5 +438,39 @@ mod tests {
             "同一帧里 bind_a11y 必须已重算"
         );
         let _ = styled;
+    }
+
+    /// E1：消费端重置（AT 重新激活 / adapter 停用）必须**立即**交付全树，不受 `A11Y_THROTTLE`。
+    ///
+    /// 变异守卫：删掉 `a11y_pending` 的 `a11y_consumer_epoch_pending()` 旁路 ⇒ 第一个
+    /// `assert!(app.a11y_pending(...))` 变红（时钟未推进，节流窗口内普通脏位不会交付）。
+    #[test]
+    fn a_consumer_epoch_reset_bypasses_the_a11y_throttle() {
+        let (_runtime, mut app, window, _label_signal, label) = fixture();
+        let _ = app.frame(window).expect("window").expect("first frame");
+        assert!(app.a11y_take(window).is_some(), "首笔 a11y 交付必为全树");
+
+        // 首笔刚交付：时钟未推进，普通脏位落在 100 ms 节流窗口内。
+        app.window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .mark_a11y(label);
+        assert!(
+            !app.a11y_pending(window),
+            "限流窗口内的普通脏位不得立即交付（否则旁路测试没有意义）"
+        );
+
+        // 消费端重置：不推进时钟也必须立即交付，且下一笔是全树。
+        let epoch = app
+            .window(window)
+            .expect("window")
+            .a11y_consumer_epoch();
+        epoch.bump();
+        assert!(
+            app.a11y_pending(window),
+            "消费端重置必须走不节流旁路（AT 此时看到空树，等 100 ms 没有意义）"
+        );
+        let snapshot = app.a11y_take(window).expect("重置后的第一笔必须产出");
+        assert!(snapshot.full, "重置后的第一笔必须是全树");
     }
 }

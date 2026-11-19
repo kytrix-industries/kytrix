@@ -672,6 +672,16 @@ impl Window {
     pub(crate) fn a11y_focus_pending(&self) -> bool {
         a11y::a11y_focus_pending(self)
     }
+    /// 消费端树生命周期代际句柄（E1）：平台 adapter 的激活/停用回调用它标记"下一笔必须全树"。
+    #[must_use]
+    pub(crate) fn a11y_consumer_epoch(&self) -> crate::a11y::adapter::A11yConsumerEpoch {
+        a11y::a11y_consumer_epoch(self)
+    }
+    /// 消费端是否重置过而全树尚未交付（`App::a11y_pending` 的不节流旁路，E1）。
+    #[must_use]
+    pub(crate) fn a11y_consumer_epoch_pending(&self) -> bool {
+        a11y::a11y_consumer_epoch_pending(self)
+    }
     /// 稳定 a11y id → 引擎句柄（`ActionRequest` 解码）。
     #[must_use]
     pub(crate) fn a11y_engine_of(
