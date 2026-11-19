@@ -51,6 +51,8 @@ pub(crate) struct LaneDelta {
     pub version: u32,
     /// 图元烘焙在哪个滚动槽的内容空间（`0` = 已是屏幕坐标；见 [`ScrollTable`] 的坐标系约定）。
     pub scroll: u32,
+    /// 几何块 lane 的绘制范围（`None` = 非几何块 lane / 整块几何绘制；X5）。
+    pub geometry_chunk: Option<(GeometryId, u32)>,
     pub primitives: Arc<[Primitive]>,
 }
 
@@ -106,7 +108,7 @@ pub(crate) struct SceneDelta {
     /// 滚动偏移变化（O(槽数)，不触碰任何图元）。
     pub scroll: Vec<ScrollDelta>,
     /// 本帧引用的几何描述（`Arc` 克隆；合成线程按 id 缓存）。
-    pub geometries: Vec<(GeometryId, Arc<crate::paint::geometry::GeometryDesc>)>,
+    pub geometries: Vec<(GeometryId, Arc<crate::paint::geometry::GeometrySnapshot>)>,
     /// 是否整帧重建（首帧 / DPI 变化 / 裁剪表重建）：合成线程会重置 lane 表与编码器。
     pub full: bool,
 }
@@ -193,7 +195,7 @@ pub(crate) fn absorb(old: SceneDelta, new: &mut SceneDelta) {
         new.scroll.extend(kept);
     }
     if !geometries.is_empty() {
-        let mut kept: Vec<(GeometryId, Arc<crate::paint::geometry::GeometryDesc>)> =
+        let mut kept: Vec<(GeometryId, Arc<crate::paint::geometry::GeometrySnapshot>)> =
             Vec::with_capacity(geometries.len());
         for entry in geometries {
             if !new.geometries.iter().any(|(fresh, _)| *fresh == entry.0) {
@@ -219,7 +221,7 @@ pub(crate) struct DeltaBuilder {
     /// 上次发布出去的滚动槽屏幕裁剪区（按槽位；视口变化也必须过线，否则 GPU 侧 scissor 会陈旧）。
     scroll_viewports: Vec<PhysicalRect>,
     /// 上次发布出去的几何描述（按 id）。
-    geometries: ahash::HashMap<GeometryId, Arc<crate::paint::geometry::GeometryDesc>>,
+    geometries: ahash::HashMap<GeometryId, Arc<crate::paint::geometry::GeometrySnapshot>>,
     /// 上次发布时的 DPI（变化 ⇒ 物理坐标全变 ⇒ 整帧重建）。
     scale: Option<Scale>,
     /// 下一帧必须整帧发布（**消费端重置**：渲染器重建后 GPU 侧的实例镜像已经清空）。
@@ -414,6 +416,7 @@ impl DeltaBuilder {
             lane,
             version,
             scroll: scene.lane_scroll(lane),
+            geometry_chunk: scene.lane_geometry_chunk(lane),
             primitives: Arc::from(primitives.to_vec()),
         });
         if slot >= self.versions.len() {
@@ -435,18 +438,18 @@ impl DeltaBuilder {
                 Primitive::Path(path) => path.geometry,
                 _ => continue,
             };
-            let Some(desc) = store.desc_arc(id) else {
+            let Some(snapshot) = store.snapshot_arc(id) else {
                 continue;
             };
             let known = self
                 .geometries
                 .get(&id)
-                .is_some_and(|cached| Arc::ptr_eq(cached, &desc));
+                .is_some_and(|cached| Arc::ptr_eq(cached, &snapshot));
             if known {
                 continue;
             }
-            self.geometries.insert(id, Arc::clone(&desc));
-            delta.geometries.push((id, desc));
+            self.geometries.insert(id, Arc::clone(&snapshot));
+            delta.geometries.push((id, snapshot));
         }
     }
 
@@ -488,6 +491,8 @@ struct StoredLane {
     version: u32,
     /// 该 lane 的图元烘焙在哪个滚动槽的内容空间（见 [`ScrollTable`]）。
     scroll: u32,
+    /// 几何块 lane 的绘制范围（X5；`None` = 非几何块 lane）。
+    geometry_chunk: Option<(GeometryId, u32)>,
     primitives: Arc<[Primitive]>,
 }
 
@@ -557,6 +562,7 @@ impl LaneStore {
                 generation: lane.lane.generation(),
                 version: lane.version,
                 scroll: lane.scroll,
+                geometry_chunk: lane.geometry_chunk,
                 primitives: Arc::clone(&lane.primitives),
             });
             self.changed.push(lane.lane);
@@ -585,6 +591,14 @@ impl LaneSource for LaneStore {
             .map_or(0, |stored| stored.scroll)
     }
 
+    fn lane_geometry_chunk(&self, id: LaneId) -> Option<(GeometryId, u32)> {
+        self.lanes
+            .get(id.slot() as usize)
+            .and_then(Option::as_ref)
+            .filter(|stored| stored.generation == id.generation())
+            .and_then(|stored| stored.geometry_chunk)
+    }
+
     fn order(&self) -> &[LaneId] {
         &self.order
     }
@@ -603,6 +617,10 @@ impl LaneSource for Scene {
         Scene::lane_scroll(self, id)
     }
 
+    fn lane_geometry_chunk(&self, id: LaneId) -> Option<(GeometryId, u32)> {
+        Scene::lane_geometry_chunk(self, id)
+    }
+
     fn order(&self) -> &[LaneId] {
         Scene::order(self)
     }
@@ -611,7 +629,7 @@ impl LaneSource for Scene {
 /// 合成侧的几何描述缓存（`GeometryStore` 在 UI 线程，合成线程不能直接读它）。
 #[derive(Default)]
 pub(crate) struct GeometryCatalog {
-    entries: ahash::HashMap<GeometryId, Arc<crate::paint::geometry::GeometryDesc>>,
+    entries: ahash::HashMap<GeometryId, Arc<crate::paint::geometry::GeometrySnapshot>>,
 }
 
 impl GeometryCatalog {
@@ -633,7 +651,10 @@ impl GeometryCatalog {
 }
 
 impl GeometryLookup for GeometryCatalog {
-    fn desc_arc(&self, id: GeometryId) -> Option<Arc<crate::paint::geometry::GeometryDesc>> {
+    fn snapshot_arc(
+        &self,
+        id: GeometryId,
+    ) -> Option<Arc<crate::paint::geometry::GeometrySnapshot>> {
         self.entries.get(&id).map(Arc::clone)
     }
 }
@@ -809,6 +830,7 @@ mod tests {
             lane,
             version,
             scroll: 0,
+            geometry_chunk: None,
             primitives: Arc::from(vec![quad()]),
         }
     }
@@ -1195,17 +1217,24 @@ mod tests {
         let second = store.insert(desc(2)).expect("几何 2");
         let shared = store.insert(desc(3)).expect("几何 3");
         // 同一个 id 的两个**不同** Arc（模拟「描述被重新注册」）：absorb 之后必须只剩新的那个。
-        let older_shared = store.desc_arc(shared).expect("描述");
-        let newer_shared = Arc::new((*older_shared).clone());
+        let older_shared = store.snapshot_arc(shared).expect("描述");
+        store
+            .update_vertices(shared, 0..12, &[9u8; 12])
+            .expect("几何 3 的数据更新");
+        let newer_shared = store.snapshot_arc(shared).expect("新描述");
+        assert!(
+            !Arc::ptr_eq(&older_shared, &newer_shared),
+            "更新必须产出新的快照 Arc"
+        );
         let mut older = SceneDelta::empty(header(1, Plan::Idle));
         older
             .geometries
-            .push((first, store.desc_arc(first).expect("描述")));
+            .push((first, store.snapshot_arc(first).expect("描述")));
         older.geometries.push((shared, older_shared));
         let mut newer = SceneDelta::empty(header(2, Plan::Idle));
         newer
             .geometries
-            .push((second, store.desc_arc(second).expect("描述")));
+            .push((second, store.snapshot_arc(second).expect("描述")));
         newer.geometries.push((shared, Arc::clone(&newer_shared)));
         absorb(older, &mut newer);
         assert_eq!(
@@ -1453,6 +1482,6 @@ mod tests {
         assert!(again.geometries.is_empty(), "描述已缓存 ⇒ 不重复过线");
         let mut catalog = GeometryCatalog::new();
         catalog.apply(&delta);
-        assert!(catalog.desc_arc(id).is_some());
+        assert!(catalog.snapshot_arc(id).is_some());
     }
 }

@@ -25,6 +25,7 @@ use crate::{
             GeometryCatalog, LaneStore, SceneDelta, ScrollTable, push_scroll_damage, scroll_damage,
         },
         frame::FramePayload,
+        geometry_upload::{GeometryUploadPlan, GeometryUploadTracker},
     },
 };
 
@@ -44,6 +45,10 @@ pub(crate) struct ComposeStats {
     pub reused_segments: usize,
     /// 本帧写进实例环的字节数。
     pub written_bytes: usize,
+    /// 本帧重编码的几何块 op 数（X5：增量几何的断言面）。
+    pub geometry_encoded_chunks: usize,
+    /// 本帧 GPU 侧实际上传的几何字节数（X5；渲染器路径回填，headless 恒 0）。
+    pub geometry_uploaded_bytes: usize,
     /// 实例环总实例数（含空洞）。
     pub instance_count: u32,
     /// 本帧绘制序真正引用的实例数（不含空洞）。
@@ -57,6 +62,9 @@ pub(crate) struct WindowComposer {
     encoder: InstanceEncoder,
     lanes: LaneStore,
     geometry: GeometryCatalog,
+    /// 几何快照的页级上传计划器（X5）：只用于 **CPU 侧计数**（headless 绝对可靠；真实窗口的
+    /// GPU 线程各持一份自己的 tracker 做实际上传）。
+    geometry_uploads: GeometryUploadTracker,
     scroll: ScrollTable,
     stats: ComposeStats,
 }
@@ -67,6 +75,7 @@ impl WindowComposer {
             encoder: InstanceEncoder::new(),
             lanes: LaneStore::new(),
             geometry: GeometryCatalog::new(),
+            geometry_uploads: GeometryUploadTracker::new(),
             scroll: ScrollTable::new(),
             stats: ComposeStats::default(),
         }
@@ -119,6 +128,8 @@ impl WindowComposer {
                 encoded_lanes: self.encoder.encoded_lanes(),
                 reused_segments: self.encoder.reused_segments(),
                 written_bytes: self.encoder.written_bytes(),
+                geometry_encoded_chunks: self.encoder.encoded_geometry_chunks(),
+                geometry_uploaded_bytes: 0,
                 instance_count: buffer.instance_count(),
                 drawn_instances: buffer.len() as u32,
                 scroll_slots,
@@ -129,6 +140,8 @@ impl WindowComposer {
             // 没有任何 lane 变化 ⇒ 全部 lane 段整段复用（滚动帧的核心不变量）。
             self.stats.reused_segments = self.lanes.len();
             self.stats.written_bytes = 0;
+            self.stats.geometry_encoded_chunks = 0;
+            self.stats.geometry_uploaded_bytes = 0;
             self.stats.scroll_slots = scroll_slots;
             let buffer = self.encoder.buffer();
             self.stats.instance_count = buffer.instance_count();
@@ -149,6 +162,17 @@ impl WindowComposer {
         } else {
             FramePayload::from_buffer_delta(self.encoder.buffer_mut(), scroll_payload, scroll_clip)
         };
+        // X5：几何页级上传计划（与 GPU 后端同一 diff 算法）。整帧重建（首帧 / 设备恢复 /
+        // 新渲染器挂上）意味着 GPU 侧缓冲是空的 ⇒ tracker 清空后本帧整份重传。
+        if delta.full {
+            self.geometry_uploads.clear();
+        }
+        self.stats.geometry_uploaded_bytes = self
+            .geometry_uploads
+            .plan(payload.geometry())
+            .iter()
+            .map(GeometryUploadPlan::uploaded_bytes)
+            .sum();
         Ok(ComposedFrame {
             plan,
             payload,

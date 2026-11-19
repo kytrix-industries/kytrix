@@ -1061,11 +1061,13 @@ impl GpuRenderer {
         for handle in retired {
             self.sync.retire(slot.signal_value, handle);
         }
-        let draw_calls = recorded.map_err(|error| self.classify(error))?;
+        let (draw_calls, geometry_uploaded_bytes) =
+            recorded.map_err(|error| self.classify(error))?;
         Ok((
             RenderStats {
                 draw_calls,
                 instances: payload.drawn_instances(),
+                geometry_uploaded_bytes,
             },
             slot.signal_value,
         ))
@@ -1081,7 +1083,7 @@ impl GpuRenderer {
         image_index: Option<u32>,
         clip_offset: u64,
         retired: &mut Vec<GpuResourceHandle>,
-    ) -> Result<u32, EngineError> {
+    ) -> Result<(u32, usize), EngineError> {
         let full = frame.is_full();
         loop {
             // 图集读锁：持有到本帧提交完成（页重建是写锁，会等这里释放）。
@@ -1134,6 +1136,11 @@ impl GpuRenderer {
                 .atlas_uploads
                 .record_uploads(shared, &atlas, slot.index, command)?;
             retired.extend(atlas_retired);
+            // X5：几何缓冲的页级增量上传（staging + `vkCmdCopyBuffer`）。必须在 begin render
+            // pass 之前：copy / buffer barrier 不能出现在 render pass 内。
+            let geometry_uploaded_bytes =
+                self.geometry
+                    .prepare(shared, command, payload.geometry(), retired)?;
             let (draw_calls, geometry_retired) =
                 self.draw(shared, command, slot.index, payload, frame, full)?;
             retired.extend(geometry_retired);
@@ -1155,7 +1162,7 @@ impl GpuRenderer {
             self.last_sequence = slot.signal_value;
             // 读锁在这里释放（present 不需要它）。
             drop(atlas);
-            return Ok(draw_calls);
+            return Ok((draw_calls, geometry_uploaded_bytes));
         }
     }
 
@@ -1624,7 +1631,6 @@ impl GpuRenderer {
                     command,
                     pipeline,
                     &mut self.geometry,
-                    &mut geometry_retired,
                     payload,
                     root,
                     [0, 0, extent.width as i32, extent.height as i32],
@@ -1657,7 +1663,6 @@ impl GpuRenderer {
                             command,
                             pipeline,
                             &mut self.geometry,
-                            &mut geometry_retired,
                             payload,
                             root,
                             [rect.x0, rect.y0, rect.x1, rect.y1],
@@ -2304,7 +2309,6 @@ fn draw_ops(
     command: vk::CommandBuffer,
     pipeline: &Pipeline,
     geometry: &mut GeometryRegistry,
-    retired: &mut Vec<GpuResourceHandle>,
     payload: &FramePayload,
     root: RootUniform,
     scissor: [i32; 4],
@@ -2397,8 +2401,32 @@ fn draw_ops(
                         detail: smol_str::format_smolstr!("geometry op index {index} out of range"),
                     }
                 })?;
-                let entry = geometry.ensure(shared, draw.id, &draw.desc, retired)?;
+                // 缓冲由帧开始前的 `prepare` 建好/更新（X5）；这里只查表 + 记使用帧号。
+                geometry.touch(draw.id);
+                let entry = geometry
+                    .get(draw.id)
+                    .ok_or_else(|| EngineError::GeometryRegister {
+                        detail: smol_str::format_smolstr!(
+                            "geometry {}:{} was not prepared before drawing",
+                            draw.id.index(),
+                            draw.id.generation()
+                        ),
+                    })?;
+                let chunk = draw.snapshot.chunk(draw.chunk).ok_or_else(|| {
+                    EngineError::GeometryRegister {
+                        detail: smol_str::format_smolstr!(
+                            "geometry {}:{} has no chunk {}",
+                            draw.id.index(),
+                            draw.id.generation(),
+                            draw.chunk
+                        ),
+                    }
+                })?;
                 let uniform = geometry_root(root, draw, clip_index, clip_rect);
+                debug_assert!(
+                    chunk.index_first + chunk.index_count <= entry.index_count(),
+                    "geometry chunk range must stay inside the uploaded index buffer"
+                );
                 let push_bytes = bytemuck::cast_slice::<f32, u8>(uniform.words());
                 // SAFETY: 顶点/索引缓冲由 `GeometryRegistry` 持有到本帧结束；
                 // push constant 范围由 pipeline layout 声明。
@@ -2424,9 +2452,15 @@ fn draw_ops(
                         0,
                         entry.index_type(),
                     );
-                    shared
-                        .raw()
-                        .cmd_draw_indexed(command, entry.index_count(), 1, 0, 0, 0);
+                    // 分块绘制：`first_index` 是块内第一个索引（不是字节偏移）。
+                    shared.raw().cmd_draw_indexed(
+                        command,
+                        chunk.index_count,
+                        1,
+                        chunk.index_first,
+                        0,
+                        0,
+                    );
                 }
                 draw_calls = draw_calls.saturating_add(1);
             }

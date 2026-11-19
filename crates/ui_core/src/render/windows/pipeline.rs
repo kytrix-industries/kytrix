@@ -37,9 +37,9 @@ use windows::{
         },
         Direct3D12::*,
         Dxgi::Common::{
-            DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R16_UINT,
-            DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G32_FLOAT,
-            DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+            DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8_UNORM,
+            DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT,
+            DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
         },
     },
     core::PCSTR,
@@ -604,15 +604,26 @@ unsafe fn create_pipeline_state(
     state
 }
 
-/// 一条已注册静态几何的 GPU 视图（顶点/索引缓冲各持一个句柄）。
+/// 一条已注册静态几何的 GPU 视图。
+///
+/// X5：顶点/索引缓冲在 **DEFAULT 堆**（设备本地），数据更新走 staging + `CopyBufferRegion`
+/// 的**页级增量上传**（只传 `GeometrySnapshot` 里变化的 4 KiB 页）；缓冲增长时新建缓冲并
+/// 整份重传（容量按 `GEOMETRY_BUFFER_GROWTH_ALIGN` 对齐，摊薄扩容频率）。
 pub(crate) struct GeometryEntry {
-    vertex: D3D12_VERTEX_BUFFER_VIEW,
-    index: D3D12_INDEX_BUFFER_VIEW,
+    vertex: ID3D12Resource,
+    vertex_view: D3D12_VERTEX_BUFFER_VIEW,
+    index: ID3D12Resource,
+    index_view: D3D12_INDEX_BUFFER_VIEW,
     index_count: u32,
     topology: D3D_PRIMITIVE_TOPOLOGY,
     pipeline: GeometryPipeline,
     /// 该条目对应的代际（槽位复用后必须重建缓冲，否则会画成新几何）。
     generation: u32,
+    /// 已上传的几何快照版本。
+    revision: u64,
+    /// 两个缓冲当前的 D3D12 资源状态（DEFAULT 堆必须显式 barrier 才能 copy / 顶点读取）。
+    vertex_state: D3D12_RESOURCE_STATES,
+    index_state: D3D12_RESOURCE_STATES,
     /// 最后一次被绘制的帧号（GeometryRegistry 的单调帧号）。
     ///
     /// 用于驱逐：应用释放几何句柄后本窗口的 GPU 缓冲仍会驻留，必须按「最近使用」回收，
@@ -624,11 +635,11 @@ pub(crate) struct GeometryEntry {
 
 impl GeometryEntry {
     pub(crate) fn vertex(&self) -> D3D12_VERTEX_BUFFER_VIEW {
-        self.vertex
+        self.vertex_view
     }
 
     pub(crate) fn index(&self) -> D3D12_INDEX_BUFFER_VIEW {
-        self.index
+        self.index_view
     }
 
     pub(crate) fn index_count(&self) -> u32 {
@@ -649,9 +660,17 @@ impl GeometryEntry {
     }
 }
 
-/// `GeometryId → GPU 缓冲`（按需创建；代际不匹配即重建）。
+/// 连续多少帧未被绘制就回收该几何的 GPU 缓冲（180 帧 ≈ 60 Hz 下 3 秒）。
+const EVICT_AFTER_FRAMES: u64 = 180;
+
+/// 该几何是否已连续 `EVICT_AFTER_FRAMES` 帧以上未被绘制（`wrapping_sub` 容忍回绕）。
+fn geometry_is_stale(frame: u64, last_used_frame: u64) -> bool {
+    frame.wrapping_sub(last_used_frame) > EVICT_AFTER_FRAMES
+}
+
+/// `GeometryId → GPU 缓冲`（按需创建；版本变化按页增量上传；长期未绘制即驱逐）。
 ///
-/// 缓冲由 GPU 线程在**首次见到某个 `GeometryId`** 时创建：编码器把注册描述附在
+/// 缓冲由 GPU 线程在**帧开始前的 prepare 阶段**按本帧几何表创建/更新：编码器把几何快照附在
 /// `GeometryDrawGpu` 上随帧过线，因此这里不需要额外的跨线程注册通道。
 /// 槽位复用（`generation` 变化）会**丢弃并重建**该槽的缓冲，避免旧图元画成新几何。
 ///
@@ -659,25 +678,17 @@ impl GeometryEntry {
 /// 跨窗口共享（共享它们会引入「哪个窗口的 fence 先到达」的所有权问题，见 D-1）。
 pub(crate) struct GeometryRegistry {
     entries: Vec<Option<GeometryEntry>>,
+    /// 页级上传计划器（每窗口一份；渲染器重建时 `invalidate`）。
+    uploads: crate::render::geometry_upload::GeometryUploadTracker,
     /// 单调帧号：每个内容帧录制前自增，`last_used_frame` 与驱逐都基于它。
     frame: u64,
 }
 
-/// 连续多少帧未被绘制就回收该几何的 GPU 缓冲。
-///
-/// 180 帧 ≈ 60 Hz 下的 3 秒：足够覆盖「隔帧 / 低频动画」的几何，同时让被应用释放的静态
-/// 几何在几秒内归还显存（Chrome 的 discardable GPU cache 用同类按使用时间的策略）。
-const EVICT_AFTER_FRAMES: u64 = 180;
-
-/// 该几何是否已连续 EVICT_AFTER_FRAMES 帧以上未被绘制（wrapping_sub 容忍回绕）。
-fn geometry_is_stale(frame: u64, last_used_frame: u64) -> bool {
-    frame.wrapping_sub(last_used_frame) > EVICT_AFTER_FRAMES
-}
-
 impl GeometryRegistry {
-    pub(crate) const fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             entries: Vec::new(),
+            uploads: crate::render::geometry_upload::GeometryUploadTracker::new(),
             frame: 0,
         }
     }
@@ -709,96 +720,242 @@ impl GeometryRegistry {
         }
     }
 
-    /// 取该句柄的 GPU 缓冲；没有或代际不匹配时按 `desc` 现场创建。
+    /// 取已就绪条目（消费者：录制期的 draw 循环；条目由 [`GeometryRegistry::prepare`] 建好）。
+    pub(crate) fn get(&self, id: GeometryId) -> Option<&GeometryEntry> {
+        self.entries
+            .get(id.index() as usize)
+            .and_then(Option::as_ref)
+            .filter(|entry| entry.generation == id.generation())
+    }
+
+    /// 标记条目本帧被绘制（`retain_recent` 的驱逐判据）。
+    pub(crate) fn touch(&mut self, id: GeometryId) {
+        let frame = self.frame;
+        if let Some(entry) = self
+            .entries
+            .get_mut(id.index() as usize)
+            .and_then(Option::as_mut)
+            .filter(|entry| entry.generation == id.generation())
+        {
+            entry.last_used_frame = frame;
+        }
+    }
+
+    /// X5：帧开始前把本帧几何表的**新版本页**增量上传到 DEFAULT 缓冲
+    /// （staging + `CopyBufferRegion`）。
     ///
-    /// `retired` 收集被替换掉的旧句柄（调用方在录制块结束后交给 retire 队列，I4）。
-    pub(crate) fn ensure(
+    /// 返回本帧实际 staging 上传的字节数（HUD / 测试断言面）。
+    pub(crate) fn prepare(
         &mut self,
         shared: &super::device::SharedGpu,
-        id: GeometryId,
-        desc: &crate::paint::geometry::GeometryDesc,
+        list: &ID3D12GraphicsCommandList,
+        staging: &mut super::compositor::GeometryUploadArena,
+        geometry_table: &[crate::paint::instance::GeometryDrawGpu],
+        slot: usize,
         retired: &mut Vec<GpuResourceHandle>,
-    ) -> Result<&GeometryEntry, EngineError> {
-        let slot = id.index() as usize;
-        if self.entries.len() <= slot {
-            self.entries.resize_with(slot + 1, || None);
+    ) -> Result<usize, EngineError> {
+        staging.begin(slot);
+        let plans = self.uploads.plan(geometry_table);
+        let mut uploaded = 0usize;
+        for plan in &plans {
+            uploaded += self.apply_plan(shared, list, staging, slot, plan, retired)?;
         }
-        let stale = match &self.entries[slot] {
-            Some(entry) => entry.generation != id.generation(),
-            None => true,
-        };
-        if stale {
-            if let Some(old) = self.entries[slot].take() {
-                retired.extend(old.storage());
-            }
-            let entry = upload_geometry(shared, id, desc)?;
-            self.entries[slot] = Some(entry);
-        }
-        // 记录使用帧号：`retain_recent` 据此驱逐长期未绘制的几何（D-1）。
-        if let Some(entry) = &mut self.entries[slot] {
-            entry.last_used_frame = self.frame;
-        }
-        self.entries[slot]
-            .as_ref()
-            .ok_or_else(|| EngineError::GeometryRegister {
+        Ok(uploaded)
+    }
+
+    /// 应用一个几何的上传计划：必要时重建缓冲，把变化页写进 staging 并记录 copy + barrier。
+    fn apply_plan(
+        &mut self,
+        shared: &super::device::SharedGpu,
+        list: &ID3D12GraphicsCommandList,
+        staging: &mut super::compositor::GeometryUploadArena,
+        slot: usize,
+        plan: &crate::render::geometry_upload::GeometryUploadPlan,
+        retired: &mut Vec<GpuResourceHandle>,
+    ) -> Result<usize, EngineError> {
+        let snapshot = &plan.snapshot;
+        // 契约自检：`full` 计划必须覆盖全部页（否则 GPU 会留下上一代的旧页数据）。
+        debug_assert!(
+            !plan.vertex.full || plan.vertex.pages.len() == snapshot.vertex_pages().len(),
+            "full vertex plan must upload every page"
+        );
+        debug_assert!(
+            !plan.index.full || plan.index.pages.len() == snapshot.index_pages().len(),
+            "full index plan must upload every page"
+        );
+        if snapshot.index_count() == 0 || snapshot.vertex_pages().is_empty() {
+            return Err(EngineError::GeometryRegister {
                 detail: smol_str::format_smolstr!(
-                    "geometry {}:{} failed to produce GPU buffers",
-                    id.index(),
-                    id.generation()
+                    "geometry {}:{} has no CPU data (stale handle or released before upload)",
+                    plan.id.index(),
+                    plan.id.generation()
                 ),
-            })
+            });
+        }
+        let entry_slot = plan.id.index() as usize;
+        if self.entries.len() <= entry_slot {
+            self.entries.resize_with(entry_slot + 1, || None);
+        }
+        // 槽位复用：旧代际的条目与缓冲一起废弃。
+        if self.entries[entry_slot]
+            .as_ref()
+            .is_some_and(|entry| entry.generation != plan.id.generation())
+            && let Some(old) = self.entries[entry_slot].take()
+        {
+            retired.extend(old.storage());
+        }
+        let first_sight = self.entries[entry_slot].is_none();
+        if first_sight {
+            let vertex = create_geometry_buffer(shared, plan.vertex.capacity)?;
+            let index = create_geometry_buffer(shared, plan.index.capacity)?;
+            let vertex_handle = shared.allocate(vertex.clone());
+            let index_handle = shared.allocate(index.clone());
+            self.entries[entry_slot] = Some(GeometryEntry {
+                vertex_view: vertex_view(&vertex, 0, snapshot.vertex_stride()),
+                index_view: index_view(&index, 0, index_format(snapshot.index_type())),
+                vertex,
+                index,
+                index_count: 0,
+                topology: D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+                pipeline: GeometryPipeline::Ui,
+                generation: plan.id.generation(),
+                revision: 0,
+                vertex_state: D3D12_RESOURCE_STATE_COPY_DEST,
+                index_state: D3D12_RESOURCE_STATE_COPY_DEST,
+                last_used_frame: self.frame,
+                storage: [vertex_handle, index_handle],
+            });
+        }
+        let entry = self.entries[entry_slot]
+            .as_mut()
+            .expect("刚刚建好的几何条目");
+        // 单缓冲扩容：新建并整份重传（另一个缓冲保持按页上传）。
+        if plan.vertex.realloc && !first_sight {
+            let vertex = create_geometry_buffer(shared, plan.vertex.capacity)?;
+            let handle = shared.allocate(vertex.clone());
+            let old = core::mem::replace(&mut entry.vertex, vertex);
+            let old_handle = core::mem::replace(&mut entry.storage[0], handle);
+            entry.vertex_state = D3D12_RESOURCE_STATE_COPY_DEST;
+            let _ = old;
+            retired.push(old_handle);
+        }
+        if plan.index.realloc && !first_sight {
+            let index = create_geometry_buffer(shared, plan.index.capacity)?;
+            let handle = shared.allocate(index.clone());
+            let old = core::mem::replace(&mut entry.index, index);
+            let old_handle = core::mem::replace(&mut entry.storage[1], handle);
+            entry.index_state = D3D12_RESOURCE_STATE_COPY_DEST;
+            let _ = old;
+            retired.push(old_handle);
+        }
+        let mut uploaded = 0usize;
+        if !plan.vertex.pages.is_empty() {
+            if entry.vertex_state != D3D12_RESOURCE_STATE_COPY_DEST {
+                transition_buffer(
+                    list,
+                    &entry.vertex,
+                    entry.vertex_state,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                );
+                entry.vertex_state = D3D12_RESOURCE_STATE_COPY_DEST;
+            }
+            for page in &plan.vertex.pages {
+                let offset =
+                    crate::paint::geometry::GeometrySnapshot::page_offset(page.page as usize);
+                let (staging_resource, staging_offset) =
+                    staging.stage(shared, slot, &page.bytes, retired)?;
+                // SAFETY: 目标区间在缓冲容量内（页来自快照的页对齐切分）；staging 区间由
+                // bump 分配保证不重叠且在本帧内有效。
+                unsafe {
+                    list.CopyBufferRegion(
+                        &entry.vertex,
+                        u64::from(offset),
+                        staging_resource,
+                        u64::from(staging_offset),
+                        u64::from(page.bytes.len() as u32),
+                    );
+                }
+                uploaded += page.bytes.len();
+            }
+        }
+        if !plan.index.pages.is_empty() {
+            if entry.index_state != D3D12_RESOURCE_STATE_COPY_DEST {
+                transition_buffer(
+                    list,
+                    &entry.index,
+                    entry.index_state,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                );
+                entry.index_state = D3D12_RESOURCE_STATE_COPY_DEST;
+            }
+            for page in &plan.index.pages {
+                let offset =
+                    crate::paint::geometry::GeometrySnapshot::page_offset(page.page as usize);
+                let (staging_resource, staging_offset) =
+                    staging.stage(shared, slot, &page.bytes, retired)?;
+                // SAFETY: 同顶点路径。
+                unsafe {
+                    list.CopyBufferRegion(
+                        &entry.index,
+                        u64::from(offset),
+                        staging_resource,
+                        u64::from(staging_offset),
+                        u64::from(page.bytes.len() as u32),
+                    );
+                }
+                uploaded += page.bytes.len();
+            }
+        }
+        // copy 之后过渡回顶点/索引读取状态（下一帧的 copy 再切回 COPY_DEST）。
+        if entry.vertex_state != D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER {
+            transition_buffer(
+                list,
+                &entry.vertex,
+                entry.vertex_state,
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+            );
+            entry.vertex_state = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+        }
+        if entry.index_state != D3D12_RESOURCE_STATE_INDEX_BUFFER {
+            transition_buffer(
+                list,
+                &entry.index,
+                entry.index_state,
+                D3D12_RESOURCE_STATE_INDEX_BUFFER,
+            );
+            entry.index_state = D3D12_RESOURCE_STATE_INDEX_BUFFER;
+        }
+        entry.vertex_view = vertex_view(
+            &entry.vertex,
+            snapshot.vertex_len(),
+            snapshot.vertex_stride(),
+        );
+        entry.index_view = index_view(
+            &entry.index,
+            snapshot.index_len(),
+            index_format(snapshot.index_type()),
+        );
+        entry.index_count = snapshot.index_count();
+        entry.topology = match snapshot.topology() {
+            Topology::TriangleList => D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+            Topology::TriangleStrip => D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+        };
+        entry.pipeline = snapshot.pipeline();
+        entry.revision = snapshot.revision();
+        entry.generation = plan.id.generation();
+        entry.last_used_frame = self.frame;
+        Ok(uploaded)
     }
 }
 
-/// 按注册描述创建顶点/索引缓冲（`UPLOAD` 堆；几何是静态数据，装载期一次写入）。
-fn upload_geometry(
+/// 建一块 DEFAULT 堆（设备本地）缓冲；初始状态 COMMON（copy 前再显式过渡）。
+fn create_geometry_buffer(
     shared: &super::device::SharedGpu,
-    id: GeometryId,
-    desc: &crate::paint::geometry::GeometryDesc,
-) -> Result<GeometryEntry, EngineError> {
-    let vertex = upload_buffer(shared, &desc.vertex_bytes)?;
-    let index = upload_buffer(shared, &desc.index_bytes)?;
-    // SAFETY: 缓冲由 `GeometryRegistry` 持有，提交前不会释放；地址只在录制期使用。
-    let vertex_location = unsafe { vertex.GetGPUVirtualAddress() };
-    // SAFETY: 同上。
-    let index_location = unsafe { index.GetGPUVirtualAddress() };
-    let vertex_handle = shared.allocate(vertex);
-    let index_handle = shared.allocate(index);
-    let index_format = match desc.index_type {
-        IndexType::U16 => DXGI_FORMAT_R16_UINT,
-        IndexType::U32 => DXGI_FORMAT_R32_UINT,
-    };
-    Ok(GeometryEntry {
-        vertex: D3D12_VERTEX_BUFFER_VIEW {
-            BufferLocation: vertex_location,
-            SizeInBytes: desc.vertex_bytes.len() as u32,
-            StrideInBytes: desc.pipeline.vertex_stride(),
-        },
-        index: D3D12_INDEX_BUFFER_VIEW {
-            BufferLocation: index_location,
-            SizeInBytes: desc.index_bytes.len() as u32,
-            Format: index_format,
-        },
-        index_count: (desc.index_bytes.len() as u32) / desc.index_type.size(),
-        topology: match desc.topology {
-            Topology::TriangleList => D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
-            Topology::TriangleStrip => D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
-        },
-        pipeline: desc.pipeline,
-        generation: id.generation(),
-        // 由 `ensure` 在返回前立刻写成当前帧号；这里只是构造初值。
-        last_used_frame: 0,
-        storage: [vertex_handle, index_handle],
-    })
-}
-
-fn upload_buffer(
-    shared: &super::device::SharedGpu,
-    bytes: &[u8],
+    capacity: u32,
 ) -> Result<ID3D12Resource, EngineError> {
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: bytes.len().max(4) as u64,
+        Width: u64::from(capacity.max(4)),
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,
@@ -808,10 +965,11 @@ fn upload_buffer(
             Quality: 0,
         },
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_NONE,
         ..D3D12_RESOURCE_DESC::default()
     };
     let heap = D3D12_HEAP_PROPERTIES {
-        Type: D3D12_HEAP_TYPE_UPLOAD,
+        Type: D3D12_HEAP_TYPE_DEFAULT,
         CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
         MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
         CreationNodeMask: 1,
@@ -824,36 +982,82 @@ fn upload_buffer(
             &heap,
             D3D12_HEAP_FLAG_NONE,
             &desc,
-            D3D12_RESOURCE_STATE_GENERIC_READ,
+            D3D12_RESOURCE_STATE_COMMON,
             None,
             &mut out,
         )
     }
-    .map_err(|error| init_error_from("CreateCommittedResource(upload)", error))?;
-    let resource = out.ok_or_else(|| EngineError::AppInit {
-        detail: smol_str::SmolStr::new_static("d3d12 CreateCommittedResource returned no resource"),
-    })?;
-    let mut pointer: *mut core::ffi::c_void = std::ptr::null_mut();
-    // SAFETY: 映射区间由 `Map` 独占，直到同一函数的 `Unmap`；容量由该缓冲的创建尺寸保证。
-    unsafe { resource.Map(0, None, Some(&mut pointer)) }
-        .map_err(|error| init_error_from("Map(upload)", error))?;
-    // SAFETY: `pointer` 容量 ≥ `bytes.len()`（缓冲按该长度创建），映射期间无并发访问。
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer.cast::<u8>(), bytes.len()) };
-    // SAFETY: `Unmap` 与同一函数的 `Map` 成对，映射期间无并发访问。
-    unsafe { resource.Unmap(0, None) };
-    Ok(resource)
+    .map_err(|error| init_error_from("CreateCommittedResource(geometry)", error))?;
+    out.ok_or_else(|| EngineError::AppInit {
+        detail: smol_str::SmolStr::new_static("d3d12 geometry buffer missing"),
+    })
+}
+
+fn vertex_view(resource: &ID3D12Resource, len: u32, stride: u32) -> D3D12_VERTEX_BUFFER_VIEW {
+    // SAFETY: 资源由 `GeometryRegistry` 持有，视图只在录制期使用。
+    let location = unsafe { resource.GetGPUVirtualAddress() };
+    D3D12_VERTEX_BUFFER_VIEW {
+        BufferLocation: location,
+        SizeInBytes: len,
+        StrideInBytes: stride,
+    }
+}
+
+fn index_view(resource: &ID3D12Resource, len: u32, format: DXGI_FORMAT) -> D3D12_INDEX_BUFFER_VIEW {
+    // SAFETY: 同 `vertex_view`。
+    let location = unsafe { resource.GetGPUVirtualAddress() };
+    D3D12_INDEX_BUFFER_VIEW {
+        BufferLocation: location,
+        SizeInBytes: len,
+        Format: format,
+    }
+}
+
+/// 索引格式 → DXGI 格式。
+fn index_format(kind: IndexType) -> DXGI_FORMAT {
+    match kind {
+        IndexType::U16 => DXGI_FORMAT_R16_UINT,
+        IndexType::U32 => DXGI_FORMAT_R32_UINT,
+    }
+}
+
+/// 一次 DEFAULT 缓冲的资源状态过渡（副本 → 顶点/索引读取）。
+fn transition_buffer(
+    list: &ID3D12GraphicsCommandList,
+    resource: &ID3D12Resource,
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+) {
+    let mut barrier = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            Transition: core::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                pResource: core::mem::ManuallyDrop::new(Some(resource.clone())),
+                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                StateBefore: before,
+                StateAfter: after,
+            }),
+        },
+    };
+    // SAFETY: `barrier` 在本次调用期间独占；`from_ref` 不转移所有权。
+    unsafe { list.ResourceBarrier(core::slice::from_ref(&barrier)) };
+    // SAFETY: union 载荷是 `ManuallyDrop`，drop 不会释放 COM 引用；记录已提交，显式释放。
+    unsafe {
+        let transition: &mut D3D12_RESOURCE_TRANSITION_BARRIER = &mut barrier.Anonymous.Transition;
+        core::mem::ManuallyDrop::drop(&mut transition.pResource);
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 
     use super::{
         ATLAS_DESCRIPTORS, ATLAS_GENERATIONS, ATLAS_SRVS, DescriptorArena, Pipeline, SrvHeap,
         WINDOW_SRVS,
     };
     use crate::{
-        paint::geometry::{GeometryId, GeometryPipeline, IndexType, Topology},
+        paint::geometry::{GeometryPipeline, IndexType, Topology},
         render::windows::device::Device,
     };
 
@@ -932,52 +1136,153 @@ mod tests {
         assert_eq!(allocated, super::MAX_WINDOWS);
     }
 
+    /// X5：DEFAULT 缓冲 + staging 页级增量上传的账本：首帧整份、同版本零上传、range 更新只上传
+    /// 变化页、长度增长时按对齐粒度扩容并整份重传。
     #[test]
-    fn geometry_registry_injects_a_ui_triangle() {
+    fn geometry_registry_uploads_pages_incrementally() {
         let _guard = crate::render::windows::device::gpu_test_lock();
+        super::super::debug::enable_debug_layer();
         let shared = super::super::device::SharedGpu::new_warp().expect("WARP shared gpu");
+        let mut stream = super::super::queue::CommandStream::new(&shared).expect("command stream");
+        let mut staging =
+            super::super::compositor::GeometryUploadArena::new(&shared).expect("staging arena");
         let mut registry = super::GeometryRegistry::new();
-        // Ui 顶点 = position(f32×2) + 解析 AA 的覆盖率距离(f32)，12 B/顶点（R05-6）。
-        let vertices = [0.0f32, 0.0, -1.0, 32.0, 0.0, -1.0, 0.0, 32.0, -1.0]
+        let mut store = crate::paint::geometry_store::GeometryStore::new();
+        // Ui 顶点 = position(f32×2) + 覆盖率(f32)，12 B/顶点；一个三角形。
+        let mut vertices = Vec::new();
+        for point in [[0.0f32, 0.0f32], [32.0, 0.0], [0.0, 32.0]] {
+            vertices.extend_from_slice(&point[0].to_ne_bytes());
+            vertices.extend_from_slice(&point[1].to_ne_bytes());
+            vertices.extend_from_slice(&(-1.0f32).to_ne_bytes());
+        }
+        let indices: Vec<u8> = [0u16, 1, 2]
             .iter()
-            .flat_map(|value| value.to_ne_bytes())
-            .collect::<Vec<u8>>();
-        let indices = [0u16, 1, 2]
-            .iter()
-            .flat_map(|value| value.to_ne_bytes())
-            .collect::<Vec<u8>>();
-        let desc = crate::paint::geometry::GeometryDesc {
-            vertex_bytes: bytes::Bytes::copy_from_slice(&vertices),
-            index_bytes: bytes::Bytes::copy_from_slice(&indices),
-            vertex_stride: GeometryPipeline::Ui.vertex_stride(),
-            index_type: IndexType::U16,
-            topology: Topology::TriangleList,
-            bounds: crate::math::Rect::new(0.0, 0.0, 32.0, 32.0),
-            pipeline: GeometryPipeline::Ui,
-        };
-        let id = GeometryId::for_test(0, 1);
+            .flat_map(|index| index.to_ne_bytes())
+            .collect();
+        let id = store
+            .insert(crate::paint::geometry::GeometryDesc {
+                vertex_bytes: bytes::Bytes::from(vertices),
+                index_bytes: bytes::Bytes::from(indices),
+                vertex_stride: GeometryPipeline::Ui.vertex_stride(),
+                index_type: IndexType::U16,
+                topology: Topology::TriangleList,
+                bounds: crate::math::Rect::new(0.0, 0.0, 32.0, 32.0),
+                pipeline: GeometryPipeline::Ui,
+            })
+            .expect("注册几何");
         let mut retired = Vec::new();
-        let entry = registry
-            .ensure(&shared, id, &desc, &mut retired)
-            .expect("ensure");
+        let draw = |snapshot: std::sync::Arc<crate::paint::geometry::GeometrySnapshot>| {
+            crate::paint::instance::GeometryDrawGpu {
+                id,
+                chunk: 0,
+                transform: crate::math::Transform::IDENTITY,
+                color: [1.0; 4],
+                snapshot,
+            }
+        };
+        let snapshot = store.snapshot_arc(id).expect("快照");
+        let full_pages_bytes = snapshot.vertex_len() as usize + snapshot.index_len() as usize;
+
+        // 帧 1：首见 ⇒ 整份上传。
+        let first = {
+            let slot = stream.acquire_slot();
+            assert!(stream.wait_slot_fence(slot.wait_value).is_ok());
+            stream.reset_slot(slot).expect("reset");
+            registry.begin_frame();
+            let list = stream.list(slot);
+            let uploaded = registry
+                .prepare(
+                    &shared,
+                    list,
+                    &mut staging,
+                    &[draw(std::sync::Arc::clone(&snapshot))],
+                    slot.index,
+                    &mut retired,
+                )
+                .expect("prepare");
+            stream.submit(slot).expect("submit");
+            let _ = stream.wait_slot_fence(slot.signal_value);
+            uploaded
+        };
+        assert_eq!(first, full_pages_bytes, "首帧整份上传");
+        let entry = registry.get(id).expect("条目已就绪");
         assert_eq!(entry.index_count(), 3);
         assert_eq!(entry.vertex().StrideInBytes, 12);
-        assert_eq!(entry.topology(), D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         assert_eq!(entry.storage().len(), 2);
-        assert!(retired.is_empty(), "首次创建不产生退役句柄");
 
-        // 同一 id + 同一代际：命中缓存，不重建、不产生退役句柄。
-        let again = registry
-            .ensure(&shared, id, &desc, &mut retired)
-            .expect("cached");
-        assert_eq!(again.index_count(), 3);
-        assert!(retired.is_empty());
+        // 帧 2：同一版本 ⇒ 零上传（CPU 与 GPU 的页指针完全相同）。
+        let second = {
+            let slot = stream.acquire_slot();
+            assert!(stream.wait_slot_fence(slot.wait_value).is_ok());
+            stream.reset_slot(slot).expect("reset");
+            registry.begin_frame();
+            let list = stream.list(slot);
+            let uploaded = registry
+                .prepare(
+                    &shared,
+                    list,
+                    &mut staging,
+                    &[draw(std::sync::Arc::clone(&snapshot))],
+                    slot.index,
+                    &mut retired,
+                )
+                .expect("prepare");
+            stream.submit(slot).expect("submit");
+            let _ = stream.wait_slot_fence(slot.signal_value);
+            uploaded
+        };
+        assert_eq!(second, 0, "同版本帧不得重复上传");
 
-        // 槽位复用（代际 +1）：必须重建，并把旧句柄交还 retire。
-        let reused = GeometryId::for_test(0, 2);
-        let _ = registry
-            .ensure(&shared, reused, &desc, &mut retired)
-            .expect("rebuilt");
-        assert_eq!(retired.len(), 2, "换代必须退役旧顶点/索引缓冲");
+        // 帧 3：改一个顶点 ⇒ 只上传被触碰的页。
+        store
+            .update_vertices(id, 0..12, &[7u8; 12])
+            .expect("range 更新");
+        let updated = store.snapshot_arc(id).expect("新快照");
+        let third = {
+            let slot = stream.acquire_slot();
+            assert!(stream.wait_slot_fence(slot.wait_value).is_ok());
+            stream.reset_slot(slot).expect("reset");
+            registry.begin_frame();
+            let list = stream.list(slot);
+            let uploaded = registry
+                .prepare(
+                    &shared,
+                    list,
+                    &mut staging,
+                    &[draw(updated)],
+                    slot.index,
+                    &mut retired,
+                )
+                .expect("prepare");
+            stream.submit(slot).expect("submit");
+            let _ = stream.wait_slot_fence(slot.signal_value);
+            uploaded
+        };
+        assert!(
+            third > 0 && third <= crate::paint::geometry::GEOMETRY_PAGE_BYTES,
+            "只上传被触碰的页：{third} B"
+        );
+
+        // RX-16：registry 级驱逐必须真的把顶点/索引句柄交回 retire 队列。
+        let retired_before = retired.len();
+        for _ in 0..=super::EVICT_AFTER_FRAMES {
+            registry.begin_frame();
+        }
+        registry.retain_recent(&mut retired);
+        assert!(registry.get(id).is_none(), "长期未绘制的几何条目必须被驱逐");
+        assert!(
+            retired.len() > retired_before,
+            "驱逐必须交还顶点/索引缓冲句柄（此前只测了谓词）"
+        );
+
+        // teardown：staging 句柄与 buffer 句柄都归还，retire 队列不泄漏。
+        let _ = stream.wait_idle();
+        let _ = stream.release_completed();
+        registry.release(&shared);
+        staging.release(&shared);
+        for handle in retired {
+            let _ = shared.release(handle);
+        }
+        drop(stream);
     }
 }

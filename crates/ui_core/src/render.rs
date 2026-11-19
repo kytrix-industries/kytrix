@@ -21,6 +21,8 @@ pub(crate) mod damage;
 /// `SceneDelta` 协议（UI → 合成线程）：B6-2。
 pub(crate) mod delta;
 pub(crate) mod frame;
+/// 静态几何快照的**页级上传计划**（X5）：三端 GPU 后端与合成端计数共用的唯一 diff 算法。
+pub(crate) mod geometry_upload;
 /// 上屏证据与呈现节奏的**平台无关**逻辑（R3 / A4）：`presented_at` 的三个平台来源
 /// （macOS display-link tick 推断 / Windows `GetFrameStatistics` / Linux `wp_presentation`）、
 /// 下界钳制与反馈发布顺序。三平台无条件编译（各端专用项 `cfg` 门控）；**所有平台的

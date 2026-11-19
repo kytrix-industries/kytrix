@@ -87,6 +87,10 @@ pub(crate) fn paint_frame(
             #[cfg(feature = "test-support")]
             uploaded_bytes: 0,
             #[cfg(feature = "test-support")]
+            geometry_encoded_chunks: 0,
+            #[cfg(feature = "test-support")]
+            geometry_uploaded_bytes: 0,
+            #[cfg(feature = "test-support")]
             scroll_slots: 0,
             #[cfg(feature = "test-support")]
             log: crate::test_support::record::PaintLog::default(),
@@ -133,6 +137,10 @@ pub(crate) fn paint_frame(
                 reused_segments: 0,
                 #[cfg(feature = "test-support")]
                 uploaded_bytes: 0,
+                #[cfg(feature = "test-support")]
+                geometry_encoded_chunks: 0,
+                #[cfg(feature = "test-support")]
+                geometry_uploaded_bytes: 0,
                 #[cfg(feature = "test-support")]
                 scroll_slots: 0,
                 #[cfg(feature = "test-support")]
@@ -279,6 +287,8 @@ fn annotate_report(mut report: PaintReport, stats: ComposeStats) -> PaintReport 
     report.encoded_lanes = stats.encoded_lanes;
     report.reused_segments = stats.reused_segments;
     report.uploaded_bytes = stats.written_bytes;
+    report.geometry_encoded_chunks = stats.geometry_encoded_chunks;
+    report.geometry_uploaded_bytes = stats.geometry_uploaded_bytes;
     report.scroll_slots = stats.scroll_slots;
     report
 }

@@ -255,17 +255,17 @@ fn instance_segments_use_the_uniform_base_not_the_hardware_base() {
     );
 }
 
-/// 测试用的最小几何描述（`draw_ops` 只读 `id`/`transform`/`color`，描述由 registry 提供）。
-fn test_desc() -> crate::paint::geometry::GeometryDesc {
-    crate::paint::geometry::GeometryDesc {
-        vertex_bytes: bytes::Bytes::new(),
-        index_bytes: bytes::Bytes::new(),
+/// 测试用的最小几何快照（`draw_ops` 只读 `id`/`transform`/`color`，数据由 registry 提供）。
+fn test_snapshot() -> std::sync::Arc<crate::paint::geometry::GeometrySnapshot> {
+    crate::paint::geometry_store::snapshot_for_test(crate::paint::geometry::GeometryDesc {
+        vertex_bytes: bytes::Bytes::from_static(&[0u8; 36]),
+        index_bytes: bytes::Bytes::from_static(&[0, 0, 1, 0, 2, 0]),
         vertex_stride: 12,
         index_type: IndexType::U16,
         topology: Topology::TriangleList,
         bounds: Rect::new(0.0, 0.0, 1.0, 1.0),
         pipeline: GeometryPipeline::Ui,
-    }
+    })
 }
 
 /// 逐 dword 对照 `common.hlsl` 的 `GeometryDrawUniform`（B1）。
@@ -275,9 +275,10 @@ fn geometry_root_matches_common_hlsl_layout() {
     let clip_rect = [4.0f32, 5.0, 100.0, 120.0].map(f32::to_bits);
     let draw = GeometryDrawGpu {
         id: GeometryId::for_test(0, 1),
+        chunk: 0,
         transform: Transform::translate(11.0, 13.0),
         color: resolver().resolve(Color::WHITE).to_array(),
-        desc: std::sync::Arc::new(test_desc()),
+        snapshot: test_snapshot(),
     };
     let uniform = geometry_root(frame, draw, 3, clip_rect);
     let words = uniform.words();
@@ -307,11 +308,12 @@ fn geometry_root_consumes_transform_and_color() {
     let frame = root_uniform(64.0, 32.0, 2.0);
     let draw = GeometryDrawGpu {
         id: GeometryId::for_test(0, 1),
+        chunk: 0,
         transform: Transform::scale(3.0, 4.0),
         color: resolver()
             .resolve(Color::srgb(1.0, 0.0, 0.0, 1.0))
             .to_array(),
-        desc: std::sync::Arc::new(test_desc()),
+        snapshot: test_snapshot(),
     };
     let uniform = geometry_root(frame, draw, 0, [0; 4]);
     let words = uniform.words();
@@ -329,9 +331,10 @@ fn geometry_root_without_clip_uses_the_viewport() {
     let frame = root_uniform(64.0, 32.0, 1.0);
     let draw = GeometryDrawGpu {
         id: GeometryId::for_test(0, 1),
+        chunk: 0,
         transform: Transform::IDENTITY,
         color: resolver().resolve(Color::WHITE).to_array(),
-        desc: std::sync::Arc::new(test_desc()),
+        snapshot: test_snapshot(),
     };
     let uniform = geometry_root(frame, draw, 0, [0; 4]);
     let words = uniform.words();
@@ -571,22 +574,23 @@ fn ops_outside_the_damage_are_skipped() {
     let Some(mut renderer) = warp_renderer((64, 64)) else {
         return;
     };
-    let id = GeometryId::for_test(0, 0);
     #[rustfmt::skip]
-    let vertices: [f32; 6] = [0.0, 0.0, 8.0, 0.0, 0.0, 8.0];
+    let vertices: [f32; 9] = [0.0, 0.0, -1.0, 8.0, 0.0, -1.0, 0.0, 8.0, -1.0];
     let indices: [u16; 3] = [0, 1, 2];
     let vertex_bytes: Vec<u8> = vertices.iter().flat_map(|v| v.to_ne_bytes()).collect();
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_ne_bytes()).collect();
-    renderer
-        .register_geometry(
-            id,
-            &vertex_bytes,
-            &index_bytes,
-            GeometryPipeline::Ui,
-            Topology::TriangleList,
-            IndexType::U16,
-        )
-        .expect("register");
+    let mut store = crate::paint::geometry_store::GeometryStore::new();
+    let id = store
+        .insert(crate::paint::geometry::GeometryDesc {
+            vertex_bytes: bytes::Bytes::from(vertex_bytes),
+            index_bytes: bytes::Bytes::from(index_bytes),
+            vertex_stride: GeometryPipeline::Ui.vertex_stride(),
+            index_type: IndexType::U16,
+            topology: Topology::TriangleList,
+            bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
+            pipeline: GeometryPipeline::Ui,
+        })
+        .expect("注册几何");
 
     let mut scene = Scene::empty();
     let lane = scene.new_lane();
@@ -618,12 +622,7 @@ fn ops_outside_the_damage_are_skipped() {
     scene.set_order(&[lane]);
     let mut encoder = InstanceEncoder::new();
     let buffer = encoder
-        .encode(
-            &scene,
-            Scale::ONE,
-            resolver(),
-            &crate::paint::geometry_store::GeometryStore::new(),
-        )
+        .encode(&scene, Scale::ONE, resolver(), &store)
         .expect("encode");
     let mut timings = FrameTimings::new();
 
@@ -786,23 +785,24 @@ fn geometry_ui_triangle_renders_white() {
     let Some(mut renderer) = warp_renderer((64, 64)) else {
         return;
     };
-    let id = GeometryId::for_test(0, 0);
     // `Ui` 顶点 = position(f32×2) + 解析 AA 的覆盖率距离(f32)；-1 = 形状内部（R05-6）。
     #[rustfmt::skip]
     let vertices: [f32; 9] = [0.0, 0.0, -1.0, 32.0, 0.0, -1.0, 0.0, 32.0, -1.0];
     let indices: [u16; 3] = [0, 1, 2];
     let vertex_bytes: Vec<u8> = vertices.iter().flat_map(|v| v.to_ne_bytes()).collect();
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_ne_bytes()).collect();
-    renderer
-        .register_geometry(
-            id,
-            &vertex_bytes,
-            &index_bytes,
-            GeometryPipeline::Ui,
-            Topology::TriangleList,
-            IndexType::U16,
-        )
-        .expect("register");
+    let mut store = crate::paint::geometry_store::GeometryStore::new();
+    let id = store
+        .insert(crate::paint::geometry::GeometryDesc {
+            vertex_bytes: bytes::Bytes::from(vertex_bytes),
+            index_bytes: bytes::Bytes::from(index_bytes),
+            vertex_stride: GeometryPipeline::Ui.vertex_stride(),
+            index_type: IndexType::U16,
+            topology: Topology::TriangleList,
+            bounds: Rect::new(0.0, 0.0, 32.0, 32.0),
+            pipeline: GeometryPipeline::Ui,
+        })
+        .expect("注册几何");
 
     let scene = one_lane_scene(Primitive::Geometry(GeometryDraw {
         id,
@@ -811,12 +811,7 @@ fn geometry_ui_triangle_renders_white() {
     }));
     let mut encoder = InstanceEncoder::new();
     let buffer = encoder
-        .encode(
-            &scene,
-            Scale::ONE,
-            resolver(),
-            &crate::paint::geometry_store::GeometryStore::new(),
-        )
+        .encode(&scene, Scale::ONE, resolver(), &store)
         .expect("encode");
     let mut frame = full_plan((64, 64));
     let mut timings = FrameTimings::new();
@@ -833,6 +828,91 @@ fn geometry_ui_triangle_renders_white() {
         pixel(&image, 64, 48, 48),
         [0, 0, 0, 0],
         "outside the triangle"
+    );
+}
+
+/// RX-13：增量页上传的**真实 GPU 内容**（旧测试只验账本字节数）。
+///
+/// 帧 1 上传原始三角形 → 帧 2 前把三角形整体右移 20 px（一次 range 更新，只换 1 页）
+/// → 帧 2 必须画在新位置。若增量 copy 的偏移 / 长度错了，WARP 会继续画旧位置（像素断言变红）。
+#[test]
+fn geometry_incremental_page_upload_updates_pixels() {
+    let _guard = lock();
+    let Some(mut renderer) = warp_renderer((64, 64)) else {
+        return;
+    };
+
+    fn triangle(points: [[f32; 2]; 3]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(36);
+        for point in points {
+            bytes.extend_from_slice(&point[0].to_ne_bytes());
+            bytes.extend_from_slice(&point[1].to_ne_bytes());
+            bytes.extend_from_slice(&(-1.0f32).to_ne_bytes());
+        }
+        bytes
+    }
+
+    let mut store = crate::paint::geometry_store::GeometryStore::new();
+    let id = store
+        .insert(crate::paint::geometry::GeometryDesc {
+            vertex_bytes: bytes::Bytes::from(triangle([[0.0, 0.0], [32.0, 0.0], [0.0, 32.0]])),
+            index_bytes: bytes::Bytes::from_static(&[0, 0, 1, 0, 2, 0]),
+            vertex_stride: GeometryPipeline::Ui.vertex_stride(),
+            index_type: IndexType::U16,
+            topology: Topology::TriangleList,
+            bounds: Rect::new(0.0, 0.0, 64.0, 32.0),
+            pipeline: GeometryPipeline::Ui,
+        })
+        .expect("注册几何");
+    let scene = || {
+        one_lane_scene(Primitive::Geometry(GeometryDraw {
+            id,
+            transform: Transform::IDENTITY,
+            color: Color::WHITE,
+        }))
+    };
+    let mut timings = FrameTimings::new();
+
+    // 帧 1：整份上传（首见 ⇒ full plan）。每帧新建 encoder：模拟「数据更新把节点标脏后
+    // 重新编码」的完整路径（复用 encoder 会走段复用、不重建几何表）。
+    let mut encoder = InstanceEncoder::new();
+    let buffer = encoder
+        .encode(&scene(), Scale::ONE, resolver(), &store)
+        .expect("encode 1");
+    let mut frame = full_plan((64, 64));
+    renderer
+        .submit_buffer(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
+        .expect("submit 1");
+    let image = renderer.readback().expect("readback 1");
+    assert_eq!(pixel(&image, 64, 8, 8), [255, 255, 255, 255], "帧 1 旧位置");
+    assert_eq!(pixel(&image, 64, 28, 8), [0, 0, 0, 0], "帧 1 新位置为空");
+
+    // 帧 2 前：整体右移 20 px（vertices 0..36 一次 range 更新 ⇒ 只换 1 个 4 KiB 页）。
+    store
+        .update_vertices(
+            id,
+            0..36,
+            &triangle([[20.0, 0.0], [52.0, 0.0], [20.0, 32.0]]),
+        )
+        .expect("移动三角形");
+    let mut encoder = InstanceEncoder::new();
+    let buffer = encoder
+        .encode(&scene(), Scale::ONE, resolver(), &store)
+        .expect("encode 2");
+    let mut frame = full_plan((64, 64));
+    renderer
+        .submit_buffer(FrameIndex::from_raw(2), buffer, &mut frame, &mut timings)
+        .expect("submit 2");
+    let image = renderer.readback().expect("readback 2");
+    assert_eq!(
+        pixel(&image, 64, 8, 8),
+        [0, 0, 0, 0],
+        "旧位置必须变空（增量页上传把新顶点写进了 DEFAULT 缓冲）"
+    );
+    assert_eq!(
+        pixel(&image, 64, 28, 8),
+        [255, 255, 255, 255],
+        "新位置必须被画出来"
     );
 }
 

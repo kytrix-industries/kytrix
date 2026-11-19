@@ -24,13 +24,23 @@ use crate::{
     math::{Point, Rect, Size, Transform},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::{
+        atlas::AtlasKind,
         color::Color,
-        geometry::{GeometryDesc, GeometryId, GeometryPipeline, IndexType, Topology},
+        geometry::{
+            GeometryDesc, GeometryId, GeometryPipeline, GeometryUpdate, IndexType, Topology,
+        },
         style::{Clip, Style},
     },
     text::{TextStyle, TextWrap},
     window::WindowId,
 };
+
+/// 折线几何的每顶点字节数（`GeometryPipeline::Ui` 的 position + 覆盖率，12 B）。
+const CHART_VERTEX_BYTES: usize = 12;
+/// 折线半厚度（逻辑像素）。
+const CHART_HALF_THICKNESS: f32 = 0.5;
+/// 热力图顶点步长（`GeometryPipeline::Textured`：position + UV，16 B）。
+const HEATMAP_VERTEX_BYTES: usize = 16;
 
 /// 缩比负载的规模（每行 8 列盘口 / 4 列成交是固定契约）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +52,9 @@ pub struct Scale {
     /// 折线点数。
     pub chart_points: usize,
 }
+
+/// 热力图网格边长（32 × 32 = 1024 格；每格 2 个三角形 ⇒ 6144 索引 = 1 个几何块）。
+const HEATMAP_EDGE: usize = 32;
 
 impl Scale {
     /// 门禁用缩比档（全尺寸的 1/17 左右，跑完 < 1 s）。
@@ -92,6 +105,12 @@ pub struct Load {
     trade_rows: Vec<Signal<u32>>,
     /// 折线几何节点。
     pub chart: NodeId,
+    /// 折线几何句柄（`chart_append` 场景的 range 更新目标）。
+    pub chart_geometry: GeometryId,
+    /// 热力图几何节点（`heatmap_color_update` 场景）。
+    pub heatmap: NodeId,
+    /// 热力图几何句柄。
+    pub heatmap_geometry: GeometryId,
     /// 成交列表滚动句柄。
     tape_scroll: ScrollHandle,
     /// 盘口滚动句柄（本夹具不滚动它；留着证明滚动不波及别的容器）。
@@ -126,8 +145,9 @@ impl Load {
             trade_rows.push(app.signal(row as u32));
         }
         let geometry = register_chart(app, scale.chart_points)?;
+        let heatmap_geometry = register_heatmap(app)?;
 
-        let (book_viewport, tape_viewport, chart) = {
+        let (book_viewport, tape_viewport, chart, heatmap) = {
             let tree = app
                 .window_mut(window)
                 .ok_or(EngineError::UnknownWindow { window })?
@@ -192,7 +212,11 @@ impl Load {
                 .layout_override(Rect::new(0.0, 0.0, 320.0, 200.0))
                 .build(tree, root)
                 .expect("折线节点");
-            (book_viewport, tape_viewport, chart)
+            let heatmap = NodeBuilder::geometry(heatmap_geometry)
+                .layout_override(Rect::new(328.0, 0.0, 256.0, 256.0))
+                .build(tree, root)
+                .expect("热力图节点");
+            (book_viewport, tape_viewport, chart, heatmap)
         };
 
         let book_scroll = app.make_scroll(window, book_viewport, ScrollConfig::default())?;
@@ -217,6 +241,9 @@ impl Load {
             book_rows,
             trade_rows,
             chart,
+            chart_geometry: geometry,
+            heatmap,
+            heatmap_geometry,
             tape_scroll,
             book_scroll,
             step: 0,
@@ -256,10 +283,83 @@ impl Load {
         self.pan_chart(app);
     }
 
-    /// 每增量帧该重编码的 lane 数：3 行 × 8 列 + 4 个成交格 + 1 条几何 lane。
+    /// `chart_append` 场景：在 20 万点折线的**末尾追加一根 K 线**（2 顶点 + 1 个三角形）。
+    ///
+    /// 与真实 K 线一致：顶点 range 与索引 range 两次更新（同一帧内），尾块从 9402 索引涨到
+    /// 9408；预期只有尾块 lane 重建、只上传尾块所在的顶点页/索引页。
+    ///
+    /// # Errors
+    /// 几何 range 更新失败（越界 / 陈旧句柄等强类型错误）。
+    pub fn append_candle(&mut self, app: &mut App) -> Result<GeometryUpdate, EngineError> {
+        self.step += 1;
+        let snapshot = app.geometry().snapshot_arc(self.chart_geometry).ok_or(
+            EngineError::UnknownGeometry {
+                geometry: self.chart_geometry,
+            },
+        )?;
+        let vertex_at = snapshot.vertex_len();
+        let base = (vertex_at as usize / CHART_VERTEX_BYTES) as u32;
+        let points = self.step as usize * 2 - 1;
+        let x = (points % 320) as f32;
+        let y = (points % 200) as f32;
+        let mut vertices = Vec::with_capacity(2 * 12);
+        for offset in [-CHART_HALF_THICKNESS, CHART_HALF_THICKNESS] {
+            vertices.extend_from_slice(&x.to_ne_bytes());
+            vertices.extend_from_slice(&(y + offset).to_ne_bytes());
+            vertices.extend_from_slice(&(-CHART_HALF_THICKNESS).to_ne_bytes());
+        }
+        let update = app.update_geometry_vertices(
+            self.chart_geometry,
+            vertex_at..vertex_at + 24,
+            &vertices,
+        )?;
+        let index_at = snapshot.index_len();
+        let mut indices = Vec::with_capacity(24);
+        let previous = base.saturating_sub(2);
+        for index in [previous, previous + 1, base, base, previous + 1, base + 1] {
+            indices.extend_from_slice(&index.to_ne_bytes());
+        }
+        app.update_geometry_indices(self.chart_geometry, index_at..index_at + 24, &indices)?;
+        Ok(update)
+    }
+
+    /// `heatmap_color_update` 场景：热力图改一格 —— 只改该格 4 个顶点的 UV（64 B）。
+    ///
+    /// 颜色在图集纹理里，UV 决定采样哪一格 ⇒ 顶点属性 range 更新即可换色（与真实的
+    /// 「纹理 + 逐格 UV 映射」热力图同一路径）。预期只有该格所在块 lane 重建、
+    /// 只上传 1 个顶点页（≤ 4 KiB），索引与其它块一个字节都不动。
+    ///
+    /// # Errors
+    /// 几何 range 更新失败。
+    pub fn heatmap_color_update(&mut self, app: &mut App) -> Result<GeometryUpdate, EngineError> {
+        self.step += 1;
+        let cell = (self.step as usize * 17) % (HEATMAP_EDGE * HEATMAP_EDGE);
+        let offset = (cell * 4 * HEATMAP_VERTEX_BYTES) as u32;
+        // 该格的新 UV：随 step 平移采样区域（模拟「改一格颜色」）。
+        let shift = (self.step % 8) as f32 * 0.125;
+        let mut vertices = Vec::with_capacity(4 * HEATMAP_VERTEX_BYTES);
+        for (dx, dy) in [(0.0f32, 0.0f32), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+            vertices.extend_from_slice(&dx.to_ne_bytes());
+            vertices.extend_from_slice(&dy.to_ne_bytes());
+            vertices.extend_from_slice(&(dx * 0.25 + shift).to_ne_bytes());
+            vertices.extend_from_slice(&(dy * 0.25 + shift).to_ne_bytes());
+        }
+        app.update_geometry_vertices(
+            self.heatmap_geometry,
+            offset..offset + vertices.len() as u32,
+            &vertices,
+        )
+    }
+
+    /// 每增量帧该重编码的 lane 数：3 行 × 8 列 + 4 个成交格 + 折线节点的**块 lane 数**。
+    ///
+    /// X5：几何节点按块持有 lane（每 `GEOMETRY_CHUNK_INDICES` 个索引一块），`pan_chart`
+    /// 改变 per-draw 变换 ⇒ 变换烘在每条块 lane 里，全部块 lane 都要重建。
     #[must_use]
-    pub const fn incremental_lanes() -> usize {
-        Scale::INCREMENTAL_ROWS * Scale::COLUMNS + Scale::TRADE_COLUMNS + 1
+    pub fn incremental_lanes() -> usize {
+        Scale::INCREMENTAL_ROWS * Scale::COLUMNS
+            + Scale::TRADE_COLUMNS
+            + chart_chunk_lanes(Scale::MINI.chart_points)
     }
 
     fn write_book_row(&mut self, app: &mut App, row: usize) {
@@ -286,6 +386,15 @@ impl Load {
         let _ =
             app.set_geometry_transform(self.window, self.chart, Transform::translate(-pan, 0.0));
     }
+}
+
+/// 折线几何的块 lane 数（X5 的分块策略与 `GeometryStore` 同一常量）。
+///
+/// 折线索引数 = `(points − 1) × 6`（每个线段 2 个三角形），`TriangleList` 每块
+/// `GEOMETRY_CHUNK_INDICES` 个索引。
+fn chart_chunk_lanes(points: usize) -> usize {
+    let indices = points.saturating_sub(1) * 6;
+    indices.div_ceil(crate::paint::geometry::GEOMETRY_CHUNK_INDICES as usize)
 }
 
 /// 盘口单元格的值（列 0 价格分、列 7 涨跌带符号、其余计数）。
@@ -373,18 +482,15 @@ fn viewport_style(left: f32, top: f32, width: f32, height: f32) -> Style {
 /// # Errors
 /// 几何注册校验失败（`GeometryRegister`）。
 fn register_chart(app: &mut App, points: usize) -> Result<GeometryId, EngineError> {
-    const VERTEX_BYTES: usize = 12;
-    const HALF_THICKNESS: f32 = 0.5;
-
-    let mut vertices = Vec::with_capacity(points * 2 * VERTEX_BYTES);
+    let mut vertices = Vec::with_capacity(points * 2 * CHART_VERTEX_BYTES);
     let mut indices = Vec::with_capacity(points.saturating_sub(1) * 6 * 4);
     for point in 0..points {
         let x = (point % 320) as f32;
         let y = (point % 200) as f32;
-        for offset in [-HALF_THICKNESS, HALF_THICKNESS] {
+        for offset in [-CHART_HALF_THICKNESS, CHART_HALF_THICKNESS] {
             vertices.extend_from_slice(&x.to_le_bytes());
             vertices.extend_from_slice(&(y + offset).to_le_bytes());
-            vertices.extend_from_slice(&(-HALF_THICKNESS).to_le_bytes());
+            vertices.extend_from_slice(&(-CHART_HALF_THICKNESS).to_le_bytes());
         }
         if point > 0 {
             let base = ((point - 1) * 2) as u32;
@@ -398,7 +504,7 @@ fn register_chart(app: &mut App, points: usize) -> Result<GeometryId, EngineErro
     app.geometry_mut().insert(GeometryDesc {
         vertex_bytes: bytes::Bytes::from(vertices),
         index_bytes: bytes::Bytes::from(indices),
-        vertex_stride: VERTEX_BYTES as u32,
+        vertex_stride: CHART_VERTEX_BYTES as u32,
         index_type: IndexType::U32,
         topology: Topology::TriangleList,
         bounds: Rect::new(0.0, 0.0, 320.0, 200.0),
@@ -406,9 +512,52 @@ fn register_chart(app: &mut App, points: usize) -> Result<GeometryId, EngineErro
     })
 }
 
+/// 注册热力图几何：32 × 32 格，每格 2 个三角形（UV 决定采样图集里的哪一格）。
+///
+/// 6144 个索引 < `GEOMETRY_CHUNK_INDICES`（12288）⇒ 整个热力图是**一个几何块**；
+/// 「改一格」= 改该格 4 个顶点的 UV（64 B）⇒ 只重建/上传 1 条块 lane、1 个顶点页。
+///
+/// # Errors
+/// 几何注册校验失败（`GeometryRegister`）。
+fn register_heatmap(app: &mut App) -> Result<GeometryId, EngineError> {
+    const EDGE: usize = 32;
+    let cells = EDGE * EDGE;
+    let mut vertices = Vec::with_capacity(cells * 4 * HEATMAP_VERTEX_BYTES);
+    let mut indices = Vec::with_capacity(cells * 6 * 2);
+    for row in 0..EDGE {
+        for column in 0..EDGE {
+            let cell = row * EDGE + column;
+            let base = (cell * 4) as u16;
+            let x = (column * 8) as f32;
+            let y = (row * 8) as f32;
+            for (dx, dy) in [(0.0f32, 0.0f32), (8.0, 0.0), (8.0, 8.0), (0.0, 8.0)] {
+                vertices.extend_from_slice(&(x + dx).to_le_bytes());
+                vertices.extend_from_slice(&(y + dy).to_le_bytes());
+                vertices.extend_from_slice(&(dx / 8.0).to_le_bytes());
+                vertices.extend_from_slice(&(dy / 8.0).to_le_bytes());
+            }
+            for index in [base, base + 1, base + 2, base, base + 2, base + 3] {
+                indices.extend_from_slice(&index.to_le_bytes());
+            }
+        }
+    }
+
+    app.geometry_mut().insert(GeometryDesc {
+        vertex_bytes: bytes::Bytes::from(vertices),
+        index_bytes: bytes::Bytes::from(indices),
+        vertex_stride: HEATMAP_VERTEX_BYTES as u32,
+        index_type: IndexType::U16,
+        topology: Topology::TriangleList,
+        bounds: Rect::new(328.0, 0.0, 256.0, 256.0),
+        pipeline: GeometryPipeline::Textured {
+            atlas: AtlasKind::Image,
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Load, Scale};
+    use super::{Load, Scale, chart_chunk_lanes};
     use crate::{
         app::App,
         math::{Scale as DpiScale, Size},
@@ -458,7 +607,9 @@ mod tests {
         let total_lanes = first_frame(&mut app, window);
         assert_eq!(
             Load::incremental_lanes(),
-            Scale::INCREMENTAL_ROWS * Scale::COLUMNS + Scale::TRADE_COLUMNS + 1,
+            Scale::INCREMENTAL_ROWS * Scale::COLUMNS
+                + Scale::TRADE_COLUMNS
+                + chart_chunk_lanes(Scale::MINI.chart_points),
             "脏 lane 数的口径必须写在夹具里（避免断言与实现同时漂移）"
         );
 
@@ -528,25 +679,172 @@ mod tests {
         );
     }
 
-    /// 折线平移：1 条几何 lane、0 实例字节（顶点在几何通道，变换走 uniform）。
+    /// 折线平移：几何节点按块持有 lane（X5）—— 只有 uniform 变换变化，因此**全部块 lane**
+    /// 都要重建（变换烘在每条块 lane 的图元里），但**一条实例字节都不上传**（顶点在几何通道）。
+    /// GPU 侧的几何数据页没有变化，故 `geometry_uploaded_bytes` 为 0。
     #[test]
     fn a_geometry_transform_frame_uploaded_no_instance_bytes() {
         let (_runtime, mut app, mut load) = fixture();
         let window = load.window;
         let _total_lanes = first_frame(&mut app, window);
+        let chunk_lanes = app
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .lane_count(load.chart);
 
         load.pan(&mut app);
         let stats = commit(&mut app, window);
         assert_eq!(
-            stats.encoded_lanes, 1,
-            "折线平移只允许重编码那 1 条几何 lane（实际 {}）",
+            stats.encoded_lanes, chunk_lanes,
+            "折线平移只允许重编码这个几何节点的块 lane（{chunk_lanes} 条，实际 {}）",
             stats.encoded_lanes
+        );
+        assert_eq!(
+            stats.geometry_encoded_chunks, chunk_lanes,
+            "每条块 lane 恰好一条几何 op（实际 {}）",
+            stats.geometry_encoded_chunks
         );
         assert_eq!(
             stats.uploaded_bytes, 0,
             "几何顶点不重建 ⇒ 不得上传实例字节（实际 {} B）",
             stats.uploaded_bytes
         );
+        assert_eq!(
+            stats.geometry_uploaded_bytes, 0,
+            "只改 uniform 不触碰几何数据页 ⇒ GPU 几何上传 0 字节"
+        );
+    }
+
+    /// X5 `chart_append` 验收场景：20 万点折线末尾追加一根 K 线（2 顶点 + 6 索引，仍在尾块内）。
+    ///
+    /// 断言的是 §3.1 P1-4 的核心结果：**只有尾块 lane 重建、只有尾块所在的顶点页/索引页上传**，
+    /// 其它 9 条块 lane、热力图、盘口/成交文本一律不触碰，实例缓冲 0 字节。
+    #[test]
+    fn appending_one_candle_rebuilds_and_uploads_only_the_tail_chunk() {
+        let (_runtime, mut app, mut load) = fixture();
+        let window = load.window;
+        let _total = first_frame(&mut app, window);
+        let chunk_lanes = chart_chunk_lanes(Scale::MINI.chart_points);
+        assert!(
+            chunk_lanes > 1,
+            "折线必须跨多个几何块（否则测不到「只重建尾块」）"
+        );
+        let (tail_before, head_before, heatmap_before, heatmap_lanes) = {
+            let state = app.window(window).expect("窗口存在");
+            let tree = state.tree();
+            assert_eq!(tree.lane_count(load.chart), chunk_lanes, "折线块 lane 数");
+            let version = |node, chunk| {
+                let lane = tree.lane_at(node, chunk).expect("块 lane");
+                state.scene().lane_state(lane).expect("lane 状态").0
+            };
+            (
+                version(load.chart, chunk_lanes - 1),
+                version(load.chart, 0),
+                version(load.heatmap, 0),
+                tree.lane_count(load.heatmap),
+            )
+        };
+        assert_eq!(heatmap_lanes, 1, "6144 索引的热力图是单个几何块");
+
+        load.append_candle(&mut app).expect("追加一根 K 线");
+        let stats = commit(&mut app, window);
+        println!(
+            "chart_append: encoded_lanes={} chunks={} instance_bytes={} geometry_bytes={}",
+            stats.encoded_lanes,
+            stats.geometry_encoded_chunks,
+            stats.uploaded_bytes,
+            stats.geometry_uploaded_bytes
+        );
+        assert_eq!(
+            stats.encoded_lanes, 1,
+            "只有尾块 lane 重建（实际 {}）",
+            stats.encoded_lanes
+        );
+        assert_eq!(
+            stats.geometry_encoded_chunks, 1,
+            "只重编码尾块（实际 {}）",
+            stats.geometry_encoded_chunks
+        );
+        assert_eq!(
+            stats.uploaded_bytes, 0,
+            "几何数据更新不动实例缓冲（实际 {} B）",
+            stats.uploaded_bytes
+        );
+        assert!(
+            stats.geometry_uploaded_bytes > 0
+                && stats.geometry_uploaded_bytes <= 2 * crate::paint::geometry::GEOMETRY_PAGE_BYTES,
+            "只上传尾块所在的顶点页 + 索引页（实际 {} B）",
+            stats.geometry_uploaded_bytes
+        );
+        {
+            let state = app.window(window).expect("窗口存在");
+            let tree = state.tree();
+            let version = |node, chunk| {
+                let lane = tree.lane_at(node, chunk).expect("块 lane");
+                state.scene().lane_state(lane).expect("lane 状态").0
+            };
+            assert!(
+                version(load.chart, chunk_lanes - 1) > tail_before,
+                "尾块 lane 必须重建"
+            );
+            assert_eq!(
+                version(load.chart, 0),
+                head_before,
+                "非尾块 lane 不得被触碰"
+            );
+            assert_eq!(version(load.heatmap, 0), heatmap_before, "热力图不得被触碰");
+        }
+    }
+
+    /// X5 `heatmap_color_update` 验收场景：热力图改一格（该格 4 个顶点的 UV，64 B）。
+    ///
+    /// 断言：只重建 1 条块 lane、只上传 1 个顶点页（≤ 4 KiB）、索引 0 字节、实例 0 字节。
+    #[test]
+    fn heatmap_single_cell_update_rebuilds_and_uploads_one_page() {
+        let (_runtime, mut app, mut load) = fixture();
+        let window = load.window;
+        let _total = first_frame(&mut app, window);
+        let (heatmap_before, chart_before) = {
+            let state = app.window(window).expect("窗口存在");
+            let tree = state.tree();
+            let version = |node, chunk| {
+                let lane = tree.lane_at(node, chunk).expect("块 lane");
+                state.scene().lane_state(lane).expect("lane 状态").0
+            };
+            (version(load.heatmap, 0), version(load.chart, 0))
+        };
+        load.heatmap_color_update(&mut app).expect("改一格");
+        let stats = commit(&mut app, window);
+        println!(
+            "heatmap_color_update: encoded_lanes={} chunks={} instance_bytes={} geometry_bytes={}",
+            stats.encoded_lanes,
+            stats.geometry_encoded_chunks,
+            stats.uploaded_bytes,
+            stats.geometry_uploaded_bytes
+        );
+        assert_eq!(stats.encoded_lanes, 1, "只有热力图唯一的块 lane 重建");
+        assert_eq!(stats.geometry_encoded_chunks, 1);
+        assert_eq!(stats.uploaded_bytes, 0, "不触碰实例缓冲");
+        assert!(
+            stats.geometry_uploaded_bytes > 0
+                && stats.geometry_uploaded_bytes <= crate::paint::geometry::GEOMETRY_PAGE_BYTES,
+            "只上传被改的那 1 个顶点页（实际 {} B）",
+            stats.geometry_uploaded_bytes
+        );
+        {
+            let state = app.window(window).expect("窗口存在");
+            let tree = state.tree();
+            let version = |node, chunk| {
+                let lane = tree.lane_at(node, chunk).expect("块 lane");
+                state.scene().lane_state(lane).expect("lane 状态").0
+            };
+            assert!(
+                version(load.heatmap, 0) > heatmap_before,
+                "热力图 lane 重建"
+            );
+            assert_eq!(version(load.chart, 0), chart_before, "折线不得被触碰");
+        }
     }
 
     /// 空闲帧：不写任何状态 ⇒ 帧门禁直接退化为 `Idle`（零工作、不推进提交游标）。

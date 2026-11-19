@@ -541,6 +541,7 @@ impl GpuRenderer {
 
         let full = frame.is_full();
         let mut draw_calls = 0u32;
+        let mut geometry_uploaded_bytes = 0usize;
         // 几何换代（槽位复用）产生的旧缓冲：录制块结束后交给 retire 队列。
         let mut geometry_retired: Vec<GpuResourceHandle> = Vec::new();
         // 推进几何 registry 的帧号：`ensure` 记录 last_used，帧末 `retain_recent` 驱逐
@@ -565,6 +566,16 @@ impl GpuRenderer {
                 &blit,
             )?;
             blit.endEncoding();
+        }
+        // X5：几何 private 缓冲的页级增量上传（一次性 shared staging + blit copy）。与图集
+        // blit 分开编码：几何只在版本变化时有工作，绝大多数帧连 encoder 都不建。
+        if !payload.geometry().is_empty() {
+            geometry_uploaded_bytes = self.geometry.prepare(
+                &mut self.device,
+                &command,
+                payload.geometry(),
+                &mut geometry_retired,
+            )?;
         }
         {
             let pass = MTLRenderPassDescriptor::new();
@@ -611,8 +622,6 @@ impl GpuRenderer {
                         root,
                         pipeline,
                         &mut self.geometry,
-                        &mut self.device,
-                        &mut geometry_retired,
                     )?;
                 }
                 false => match frame.plan() {
@@ -635,8 +644,6 @@ impl GpuRenderer {
                                 root,
                                 pipeline,
                                 &mut self.geometry,
-                                &mut self.device,
-                                &mut geometry_retired,
                             )?);
                         }
                     }
@@ -700,6 +707,7 @@ impl GpuRenderer {
             crate::render::RenderStats {
                 draw_calls,
                 instances: payload.drawn_instances(),
+                geometry_uploaded_bytes,
             },
         ))
     }
@@ -1185,8 +1193,6 @@ fn draw_ops(
     root: RootUniform,
     pipeline: &PipelineSet,
     geometry: &mut GeometryRegistry,
-    device: &mut Device,
-    retired: &mut Vec<GpuResourceHandle>,
 ) -> Result<u32, EngineError> {
     let mut draw_calls = 0u32;
     // 局部刷新时跳过与 damage 不相交的 op（P1-2.1）：旧实现对每个 damage 矩形重放整份 op 列表。
@@ -1265,8 +1271,34 @@ fn draw_ops(
                         detail: smol_str::format_smolstr!("geometry op index {index} out of range"),
                     }
                 })?;
-                let entry = geometry.ensure(device, draw.id, &draw.desc, retired)?;
+                // 缓冲由帧开始前的 `prepare` 建好/更新（X5）；这里只查表 + 记使用帧号。
+                geometry.touch(draw.id);
+                let entry = geometry
+                    .get(draw.id)
+                    .ok_or_else(|| EngineError::GeometryRegister {
+                        detail: smol_str::format_smolstr!(
+                            "geometry {}:{} was not prepared before drawing",
+                            draw.id.index(),
+                            draw.id.generation()
+                        ),
+                    })?;
+                let chunk = draw.snapshot.chunk(draw.chunk).ok_or_else(|| {
+                    EngineError::GeometryRegister {
+                        detail: smol_str::format_smolstr!(
+                            "geometry {}:{} has no chunk {}",
+                            draw.id.index(),
+                            draw.id.generation(),
+                            draw.chunk
+                        ),
+                    }
+                })?;
                 let uniform = geometry_root(root, draw, clip_index, clip_rect);
+                debug_assert!(
+                    chunk.index_first + chunk.index_count <= entry.index_count(),
+                    "geometry chunk range must stay inside the uploaded index buffer"
+                );
+                // 分块绘制：索引缓冲偏移 = 块内第一个索引 × 索引字节数；顶点缓冲是整块几何的。
+                let index_offset = chunk.index_first as usize * entry.index_type().size() as usize;
                 // SAFETY: 顶点/索引缓冲由 `GeometryRegistry` 持有到本帧结束；
                 // root uniform 由 `setVertexBytes` 在录制时复制。
                 unsafe {
@@ -1291,12 +1323,11 @@ fn draw_ops(
                     encoder
                         .drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset(
                             metal_topology(entry.topology()),
-                            entry.index_count() as usize,
+                            chunk.index_count as usize,
                             metal_index_type(entry.index_type()),
                             entry.index(),
-                            0,
-                        );
-                    // 恢复实例的 **vertex buffer 0**：几何 VBO 覆盖了同一个槽，而后续
+                            index_offset,
+                        ); // 恢复实例的 **vertex buffer 0**：几何 VBO 覆盖了同一个槽，而后续
                     // `FrameOp::Instances` 不会重绑它（旧实现只在 `bind()` 绑一次，导致
                     // 「几何之后的所有实例绘制」都从几何顶点缓冲读 `GpuPrimitive`）。
                     encoder.setVertexBuffer_offset_atIndex(Some(instances), 0, 0);

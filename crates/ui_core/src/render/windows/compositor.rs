@@ -82,6 +82,9 @@ mod record;
 mod timings;
 mod upload;
 
+/// 几何页级上传的 staging arena（X5；record 与 pipeline 的 GeometryRegistry::prepare 共用）。
+pub(crate) use self::upload::GeometryUploadArena;
+
 #[cfg(test)]
 mod tests;
 
@@ -125,6 +128,8 @@ pub(crate) struct GpuRenderer {
     atlas_uploads: AtlasUploads,
     persist: Persist,
     upload: UploadArena,
+    /// 几何页级上传的 staging arena（X5；每 in-flight 槽一块 UPLOAD 缓冲）。
+    geometry_upload: GeometryUploadArena,
     /// 实例缓冲的持久镜像（增量写：只写变化区间，见 `render/frame.rs` 的 `InstanceMirror`）。
     mirror: InstanceMirror,
     geometry: GeometryRegistry,
@@ -331,6 +336,7 @@ impl GpuRenderer {
         let size = (size.0.max(1), size.1.max(1));
         let persist = Persist::new(&shared, size, rtv)?;
         let upload = UploadArena::new(&shared)?;
+        let geometry_upload = GeometryUploadArena::new(&shared)?;
         let mirror = InstanceMirror::new(MAX_FRAMES_IN_FLIGHT);
         let timer = GpuTimer::new(&shared, &stream)?;
 
@@ -341,6 +347,7 @@ impl GpuRenderer {
             atlas_uploads: AtlasUploads::new(),
             persist,
             upload,
+            geometry_upload,
             mirror,
             geometry: GeometryRegistry::new(),
             timer,
@@ -648,37 +655,6 @@ impl GpuRenderer {
         self.readback()
     }
 
-    /// 测试用的静态几何注册入口：直接放进 registry（生产路径是编码器随帧带描述、
-    /// `draw_ops` 按需建缓冲）。
-    #[cfg(test)]
-    pub(crate) fn register_geometry(
-        &mut self,
-        id: crate::paint::geometry::GeometryId,
-        vertices: &[u8],
-        indices: &[u8],
-        pipeline: crate::paint::geometry::GeometryPipeline,
-        topology: crate::paint::geometry::Topology,
-        index_type: crate::paint::geometry::IndexType,
-    ) -> Result<(), EngineError> {
-        let desc = crate::paint::geometry::GeometryDesc {
-            vertex_bytes: bytes::Bytes::copy_from_slice(vertices),
-            index_bytes: bytes::Bytes::copy_from_slice(indices),
-            vertex_stride: pipeline.vertex_stride(),
-            index_type,
-            topology,
-            bounds: crate::math::Rect::new(0.0, 0.0, 1.0, 1.0),
-            pipeline,
-        };
-        let mut retired = Vec::new();
-        let _ = self
-            .geometry
-            .ensure(&self.shared, id, &desc, &mut retired)?;
-        for handle in retired {
-            self.stream.retire(self.last_sequence, handle);
-        }
-        Ok(())
-    }
-
     /// 把底层错误归类为设备丢失（粘性）或原样返回。
     fn classify(&mut self, error: EngineError) -> EngineError {
         self.shared.note_failure().unwrap_or(error)
@@ -752,6 +728,7 @@ impl Drop for GpuRenderer {
         let _ = self.stream.release_completed();
         self.stream.drain_retire();
         self.upload.release(&self.shared);
+        self.geometry_upload.release(&self.shared);
         self.geometry.release(&self.shared);
         self.atlas_uploads.release(&self.shared);
         let _ = self.shared.release(self.persist.handle);
@@ -781,6 +758,8 @@ struct FrameRecorder<'a> {
     atlas_uploads: &'a mut AtlasUploads,
     persist: &'a Persist,
     upload: &'a mut UploadArena,
+    /// 几何页级上传的 staging arena（X5）。
+    geometry_upload: &'a mut GeometryUploadArena,
     /// GPU 线程侧的持久实例镜像（本帧只写变化区间）。
     mirror: &'a mut InstanceMirror,
     geometry: &'a mut GeometryRegistry,

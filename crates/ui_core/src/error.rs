@@ -3,13 +3,12 @@
 //! 只有强类型变体，不出现字符串错误或通用错误包装（AGENTS §3）。`Display` 为英文诊断文本，
 //! 只用于日志 / CI / 开发者；面向用户的本地化文案由应用层按变体生成（i18n 留应用层）。
 //!
-//! 变体表冻结为 17 项。已落地的变体见下方定义；
-//! `LayoutInvalid` 无生产者、继续留空。`GeometryRegister` → P09，
-//! `AtlasExhausted` / `TextShape` → **P05**（DEVIATIONS F-55），`AppInit` → P08，
-//! `WindowCreate` → P12，`A11yInit` → P14，`ResourceDecode` → **P13**（payload 见 DEVIATIONS F-138）。
-//! 完整「名称 + payload + 实现 Phase」表见下方各变体定义；
-//! `StaleNode` / `CyclicDerived` 的实现 Phase 由 P04 改为 P03，
-//! `InvalidMeasure` 由 P05 改为 P04（DEVIATIONS F-51）。
+//! **变体表随阶段演进增删，不保持向后兼容**（AGENTS §1.1；应用代码按变体匹配，不按数量）。
+//! 当前 21 个变体的 payload 与语义以各变体定义为准；其中与静态几何增量更新（X5）相关的 4 个
+//! 是 [`EngineError::UnknownGeometry`] / [`EngineError::GeometryRangeOutOfBounds`] /
+//! [`EngineError::GeometryRangeUnaligned`] / [`EngineError::GeometryRangeBytes`]，
+//! [`EngineError::GeometryRegister`] 由三端 GPU 后端（快照缺失 / 非法数据）生产。
+//! `LayoutInvalid` 暂无生产者（保留给布局契约的显式失败路径）。
 
 use std::path::PathBuf;
 
@@ -213,6 +212,59 @@ pub enum EngineError {
     /// `FrameOp::Geometry` 的 `GeometryId` 没有对应的 GPU 缓冲（`GeometryStore` 属 P09）。
     #[error("geometry registration failed: {detail}")]
     GeometryRegister { detail: SmolStr },
+
+    /// 几何 range 更新的目标句柄不存在：陈旧 / 已 release / 从未注册。
+    ///
+    /// 与「越界 / 非对齐」分开：陈旧句柄是**生命周期**错误（应用应停止更新或重注册），
+    /// 越界是**参数**错误（应用应修正 range），两者的处理策略不同。
+    #[error("unknown geometry handle: {geometry:?}")]
+    UnknownGeometry {
+        /// 陈旧 / 未注册的几何句柄。
+        geometry: crate::paint::geometry::GeometryId,
+    },
+
+    /// 几何 range 更新越界：`range.start` 超过缓冲当前长度，或区间反向。
+    ///
+    /// 允许在缓冲区**末尾追加**（`range.end > len` 合法），因此这里只判 `start`。
+    #[error(
+        "geometry {geometry:?} {buffer:?} update range {range:?} is out of bounds \
+         (current length {len} bytes)"
+    )]
+    GeometryRangeOutOfBounds {
+        geometry: crate::paint::geometry::GeometryId,
+        /// 作用于哪个缓冲（顶点 / 索引）。
+        buffer: crate::paint::geometry::GeometryBuffer,
+        /// 应用给的字节区间。
+        range: std::ops::Range<u32>,
+        /// 缓冲当前字节长度。
+        len: u32,
+    },
+
+    /// 几何 range 更新未按元素对齐（顶点按 `vertex_stride`，索引按 `index_type.size()`）。
+    #[error(
+        "geometry {geometry:?} {buffer:?} update range {range:?} is not aligned to {align} bytes"
+    )]
+    GeometryRangeUnaligned {
+        geometry: crate::paint::geometry::GeometryId,
+        /// 作用于哪个缓冲（顶点 / 索引）。
+        buffer: crate::paint::geometry::GeometryBuffer,
+        /// 应用给的字节区间。
+        range: std::ops::Range<u32>,
+        /// 要求的对齐字节数。
+        align: u32,
+    },
+
+    /// 几何 range 更新的载荷字节数与区间长度不一致（`bytes.len() != range.len()`）。
+    #[error("geometry {geometry:?} {buffer:?} update carries {bytes} bytes for range {range:?}")]
+    GeometryRangeBytes {
+        geometry: crate::paint::geometry::GeometryId,
+        /// 作用于哪个缓冲（顶点 / 索引）。
+        buffer: crate::paint::geometry::GeometryBuffer,
+        /// 应用给的字节区间。
+        range: std::ops::Range<u32>,
+        /// 实际提供的字节数。
+        bytes: usize,
+    },
 
     /// 引擎 / 平台初始化失败（`Application::run` 的前置条件；P08 的渲染器初始化也走这里）。
     #[error("engine initialization failed: {detail}")]
