@@ -298,6 +298,11 @@ pub(crate) fn effective_role(
 /// `Decrement` / `SetTextSelection` / `Expand` / `Collapse`）：a11y 级 `disabled` 与动作能力
 /// 必须同源，否则 AT 读到 `IsEnabled == false` 却仍能通过"激活"触发下单（R13-16）。
 /// 滚动动作保留 —— 只改视口、不改被禁用控件的数据，且阅读长列表本身不该被禁用阻断。
+///
+/// `read_only` 是**独立状态**（不折叠进 `disabled`，E3）：只剔除值变更类能力
+/// （[`is_value_mutation`]：`SetValue` / `Increment` / `Decrement`），保留 `Focus` / `Click` /
+/// `Scroll*` / `SetTextSelection` —— 只读文本仍要能被 AT 选中/朗读（Qt
+/// `QAccessible::State::readOnly` 与 UIA `ValuePattern.IsReadOnly` 都独立于 enabled）。
 pub(crate) fn effective_actions(
     tree: &NodeTree,
     node: NodeId,
@@ -305,6 +310,7 @@ pub(crate) fn effective_actions(
     over: Option<&A11yOverride>,
     patch: Option<&A11yPatch>,
     disabled: bool,
+    read_only: bool,
 ) -> Vec<A11yAction> {
     let mut actions = patch
         .and_then(|patch| patch.actions.clone())
@@ -358,8 +364,156 @@ pub(crate) fn effective_actions(
             )
         });
     }
+    if read_only {
+        actions.retain(|action| !is_value_mutation(*action));
+    }
     actions
 }
+
+/// 该动作是否会**改变节点的数据**（`read_only` 的剔除名单）。
+///
+/// 只含 `SetValue` / `Increment` / `Decrement`：`SetTextSelection` 不算（只读文本仍可被选择/
+/// 朗读，Qt 的只读行编辑也允许移动选区），`Expand` / `Collapse` / `Click` 只改 UI 状态，
+/// 滚动动作只改视口。`ReplaceSelectedText` 在 `a11y::action` 已归一为 `SetValue`。
+pub(crate) const fn is_value_mutation(action: A11yAction) -> bool {
+    matches!(
+        action,
+        A11yAction::SetValue | A11yAction::Increment | A11yAction::Decrement
+    )
+}
+
+/// 节点的 a11y「只读」状态（`node_a11y` 与动作分发**共用同一判据**，E3）。
+///
+/// 合并方向与 `node_a11y` 一致：动态 `patch.read_only` > 静态 `override.read_only` > false
+/// （`Some(false)` 必须能覆盖静态 `true`，与 `is_disabled` 的 patch-first 约定相同）。
+pub(crate) fn a11y_read_only(tree: &NodeTree, node: NodeId) -> bool {
+    let Some(slot) = tree.a11y_of(node) else {
+        return false;
+    };
+    slot.patch
+        .read_only
+        .or_else(|| slot.over.as_ref().map(|over| over.read_only))
+        .unwrap_or(false)
+}
+
+/// 该动作是否被节点的**能力集**允许（能力集与动作分发同源，E3 的信任边界）。
+///
+/// 规则：`effective_actions` 里有该动作 ⇒ 允许；否则只有三个**固定例外**：
+/// 1. 滚动动作（`ScrollUp/Down/Left/Right` / `ScrollIntoView` / `SetScrollOffset`）——
+///    对列表行/单元格这类子节点发出时，收敛到可解析的滚动容器再判能力（与
+///    `a11y::action` 的 `scroll_container` 同一语义）；否则 AT 对行发 `ScrollIntoView`
+///    会被误拒；
+/// 2. `SetTextSelection` —— 目标是 `TextRun`，或输入框且子树里有 `TextRun`（AccessKit
+///    consumer 的 `supports_text_ranges` 同款判据）；
+/// 3. `Custom(id)` —— 已登记进 `custom_actions` 注册表的 id（注册表本身就是能力声明，
+///    `to_accesskit` 也会因此宣告 `CustomAction` 类别）。
+///
+/// `Blur` 没有对应的 `A11yAction`（`a11y::action` 在门禁之前处理），不在此列。
+pub(crate) fn action_allowed(tree: &NodeTree, node: NodeId, action: A11yAction) -> bool {
+    if effective_actions_of(tree, node).contains(&action) {
+        return true;
+    }
+    match action {
+        A11yAction::ScrollUp
+        | A11yAction::ScrollDown
+        | A11yAction::ScrollLeft
+        | A11yAction::ScrollRight
+        | A11yAction::ScrollIntoView
+        | A11yAction::SetScrollOffset => {
+            let Some(container) = scroll_container(tree, node) else {
+                return false;
+            };
+            effective_actions_of(tree, container).contains(&action)
+        }
+        A11yAction::SetTextSelection => {
+            let role = role_of(tree, node);
+            matches!(role, A11yRole::TextRun)
+                || (is_text_input_role(role) && subtree_has_text_run(tree, node))
+        }
+        A11yAction::Custom(id) => custom_action_registered(tree, node, id),
+        _ => false,
+    }
+}
+
+/// 节点当前的完整能力集（`action_allowed` 的判据；结构变化时 O(角色默认表)）。
+fn effective_actions_of(tree: &NodeTree, node: NodeId) -> Vec<A11yAction> {
+    let Ok(target) = tree.get(node) else {
+        return Vec::new();
+    };
+    let slot = tree.a11y_of(node);
+    let over = slot.and_then(|slot| slot.over.as_ref());
+    let patch = slot.map(|slot| &slot.patch);
+    let role = effective_role(tree, node, target, over, patch);
+    effective_actions(
+        tree,
+        node,
+        role,
+        over,
+        patch,
+        a11y_disabled(tree, node),
+        a11y_read_only(tree, node),
+    )
+}
+
+/// 节点的合并角色（`action_allowed` 的判据用；只读，不分配）。
+fn role_of(tree: &NodeTree, node: NodeId) -> A11yRole {
+    let Ok(target) = tree.get(node) else {
+        return A11yRole::GenericContainer;
+    };
+    let slot = tree.a11y_of(node);
+    effective_role(
+        tree,
+        node,
+        target,
+        slot.and_then(|slot| slot.over.as_ref()),
+        slot.map(|slot| &slot.patch),
+    )
+}
+
+fn is_text_input_role(role: A11yRole) -> bool {
+    matches!(
+        role,
+        A11yRole::TextInput | A11yRole::MultilineTextInput
+    )
+}
+
+/// 子树里是否存在 `TextRun`（输入框的字符语义由子文本运行承担）。
+fn subtree_has_text_run(tree: &NodeTree, node: NodeId) -> bool {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if role_of(tree, current) == A11yRole::TextRun {
+            return true;
+        }
+        if let Ok(target) = tree.get(current) {
+            stack.extend(target.children().iter().copied());
+        }
+    }
+    false
+}
+
+/// 登记过的自定义动作（`patch.custom_actions` > `override.custom_actions`，与 `node_a11y` 同序）。
+fn custom_action_registered(tree: &NodeTree, node: NodeId, id: i32) -> bool {
+    let Some(slot) = tree.a11y_of(node) else {
+        return false;
+    };
+    let registered = match &slot.patch.custom_actions {
+        Some(actions) => actions,
+        None => slot
+            .over
+            .as_ref()
+            .map_or(&[][..], |over| over.custom_actions.as_slice()),
+    };
+    registered.iter().any(|custom| custom.id == id)
+}
+
+/// 滚动动作的目标收敛（自身有滚动槽就用自身，否则最近的滚动祖先）。
+fn scroll_container(tree: &NodeTree, node: NodeId) -> Option<NodeId> {
+    if tree.scroll_slot(node).is_some() {
+        return Some(node);
+    }
+    crate::interaction::scroll::scroll_ancestor(tree, node).map(|(container, _)| container)
+}
+
 
 /// 节点的 a11y "禁用"状态（`node_a11y` 与动作分发**共用同一判据**）。
 ///
@@ -494,9 +648,9 @@ pub(crate) fn is_disabled(
 #[cfg(test)]
 mod tests {
     use super::{
-        a11y_disabled, action_from_accesskit, action_to_accesskit, bounds_of, default_actions,
-        effective_actions, is_disabled, is_hidden, role_by_kind, role_to_accesskit,
-        sort_to_accesskit,
+        a11y_disabled, a11y_read_only, action_allowed, action_from_accesskit, action_to_accesskit,
+        bounds_of, default_actions, effective_actions, is_disabled, is_hidden, is_value_mutation,
+        role_by_kind, role_to_accesskit, sort_to_accesskit,
     };
     use crate::{
         a11y::{
@@ -681,7 +835,7 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let plain = NodeBuilder::boxed().build(&mut tree, root).expect("mount");
-        let actions = effective_actions(&tree, plain, A11yRole::ListBoxOption, None, None, false);
+        let actions = effective_actions(&tree, plain, A11yRole::ListBoxOption, None, None, false, false);
         assert!(
             !actions.contains(&A11yAction::Click),
             "无 on_click 的列表项不得暴露 Click：{actions:?}"
@@ -693,7 +847,7 @@ mod tests {
             .build(&mut tree, root)
             .expect("mount");
         let actions =
-            effective_actions(&tree, clickable, A11yRole::ListBoxOption, None, None, false);
+            effective_actions(&tree, clickable, A11yRole::ListBoxOption, None, None, false, false);
         assert!(
             actions.contains(&A11yAction::Click),
             "有 on_click 的列表项必须暴露 Click：{actions:?}"
@@ -821,7 +975,7 @@ mod tests {
             .expect("mount");
 
         // 启用态：Click + Focus 都在。
-        let enabled = effective_actions(&tree, button, A11yRole::Button, None, None, false);
+        let enabled = effective_actions(&tree, button, A11yRole::Button, None, None, false, false);
         assert!(enabled.contains(&A11yAction::Click));
         assert!(enabled.contains(&A11yAction::Focus));
 
@@ -845,6 +999,7 @@ mod tests {
             slot.over.as_ref(),
             Some(&slot.patch),
             a11y_disabled(&tree, button),
+            false,
         );
         assert!(
             !disabled.contains(&A11yAction::Click),
@@ -856,7 +1011,7 @@ mod tests {
         );
 
         // 滚动动作保留（只改视口，不改被禁用控件的数据）。
-        let view = effective_actions(&tree, button, A11yRole::ScrollView, None, None, true);
+        let view = effective_actions(&tree, button, A11yRole::ScrollView, None, None, true, false);
         assert!(view.contains(&A11yAction::ScrollDown), "{view:?}");
     }
 
@@ -898,6 +1053,7 @@ mod tests {
             None,
             None,
             a11y_disabled(&tree, child),
+            false,
         );
         assert!(
             !actions.contains(&A11yAction::Click) && !actions.contains(&A11yAction::Focus),
@@ -979,5 +1135,167 @@ mod tests {
             PhysicalRect::new(10, 20, 50, 50),
             "未设置 HitShape ⇒ 仍用布局盒（旧行为）"
         );
+    }
+
+    /// E3：`read_only` 只剔除值变更能力（`SetValue`/`Increment`/`Decrement`），保留
+    /// `Focus`/`Click`/`SetTextSelection`；`disabled` 的剔除面更大（证明两者不是同一状态）。
+    #[test]
+    fn read_only_removes_only_value_mutations() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let node = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::TextInput),
+                label: Some(smol_str::SmolStr::new_static("搜索")),
+                actions: Some(vec![
+                    A11yAction::SetValue,
+                    A11yAction::Increment,
+                    A11yAction::Decrement,
+                    A11yAction::SetTextSelection,
+                    A11yAction::Click,
+                ]),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("input");
+
+        let over = tree.a11y_of(node).and_then(|slot| slot.over.as_ref());
+        let patch = tree.a11y_of(node).map(|slot| &slot.patch);
+        let writable = effective_actions(&tree, node, A11yRole::TextInput, over, patch, false, false);
+        for action in [
+            A11yAction::SetValue,
+            A11yAction::Increment,
+            A11yAction::Decrement,
+            A11yAction::SetTextSelection,
+            A11yAction::Click,
+        ] {
+            assert!(writable.contains(&action), "可写节点必须保留 {action:?}");
+        }
+
+        let read_only = effective_actions(&tree, node, A11yRole::TextInput, over, patch, false, true);
+        for action in [
+            A11yAction::SetValue,
+            A11yAction::Increment,
+            A11yAction::Decrement,
+        ] {
+            assert!(
+                !read_only.contains(&action),
+                "只读节点不得宣告值变更动作 {action:?}"
+            );
+        }
+        assert!(read_only.contains(&A11yAction::SetTextSelection));
+        assert!(read_only.contains(&A11yAction::Click));
+
+        let disabled = effective_actions(&tree, node, A11yRole::TextInput, over, patch, true, false);
+        assert!(
+            !disabled.contains(&A11yAction::SetTextSelection)
+                && !disabled.contains(&A11yAction::Click),
+            "disabled 必须比 read_only 剔除更多（两者语义不同）"
+        );
+    }
+
+    /// E3：`read_only` 的合并方向与 `node_a11y` 一致（patch 优先，`Some(false)` 能解静态只读）。
+    #[test]
+    fn a11y_read_only_follows_the_patch_first_merge() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let node = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                read_only: true,
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("mount");
+        assert!(a11y_read_only(&tree, node), "静态 read_only 必须生效");
+        tree.set_a11y_patch(
+            node,
+            A11yPatch {
+                read_only: Some(false),
+                ..A11yPatch::default()
+            },
+        );
+        assert!(
+            !a11y_read_only(&tree, node),
+            "动态补丁 Some(false) 必须能解掉静态只读（patch-first）"
+        );
+    }
+
+    /// E3：`is_value_mutation` 的名单固定（`SetTextSelection` 不属于值变更）。
+    #[test]
+    fn is_value_mutation_covers_exactly_the_data_actions() {
+        assert!(is_value_mutation(A11yAction::SetValue));
+        assert!(is_value_mutation(A11yAction::Increment));
+        assert!(is_value_mutation(A11yAction::Decrement));
+        for action in [
+            A11yAction::Click,
+            A11yAction::Focus,
+            A11yAction::SetTextSelection,
+            A11yAction::ScrollUp,
+            A11yAction::ScrollDown,
+            A11yAction::ScrollLeft,
+            A11yAction::ScrollRight,
+            A11yAction::ScrollIntoView,
+            A11yAction::SetScrollOffset,
+            A11yAction::Expand,
+            A11yAction::Collapse,
+            A11yAction::ShowContextMenu,
+            A11yAction::Custom(1),
+        ] {
+            assert!(
+                !is_value_mutation(action),
+                "{action:?} 不属于值变更（read_only 必须保留它）"
+            );
+        }
+    }
+
+    /// E3：`action_allowed` 的固定例外 —— `SetTextSelection`（TextRun / 含 TextRun 的输入框）
+    /// 与已登记的 `Custom(id)`；其余未宣告动作一律拒绝。
+    #[test]
+    fn action_allowed_honours_the_fixed_exceptions() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let input = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::TextInput),
+                label: Some(smol_str::SmolStr::new_static("搜索")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("input");
+        assert!(
+            !action_allowed(&tree, input, A11yAction::SetTextSelection),
+            "没有 TextRun 子节点的输入框不默认宣告 SetTextSelection"
+        );
+        // 输入框内的文本自动推导为 TextRun（`role_by_kind`）⇒ 选区能力成立。
+        let run = NodeBuilder::text("42150", TextStyle::new(12.0))
+            .build(&mut tree, input)
+            .expect("text run");
+        assert!(
+            action_allowed(&tree, input, A11yAction::SetTextSelection),
+            "含 TextRun 的输入框必须允许 SetTextSelection（consumer 同款判据）"
+        );
+        assert!(
+            action_allowed(&tree, run, A11yAction::SetTextSelection),
+            "TextRun 自身必须允许 SetTextSelection"
+        );
+        assert!(
+            !action_allowed(&tree, input, A11yAction::Increment),
+            "未声明/角色默认表不含的动作必须被拒"
+        );
+
+        // Custom：注册表本身就是能力声明。
+        let custom = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                label: Some(smol_str::SmolStr::new_static("自选")),
+                custom_actions: vec![crate::a11y::A11yCustomAction {
+                    id: 3,
+                    label: smol_str::SmolStr::new_static("加入自选"),
+                }],
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("custom");
+        assert!(action_allowed(&tree, custom, A11yAction::Custom(3)));
+        assert!(!action_allowed(&tree, custom, A11yAction::Custom(4)));
     }
 }

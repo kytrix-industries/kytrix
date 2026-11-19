@@ -753,6 +753,26 @@ pub enum A11yDiagnostic {
         /// 被拒绝的动作。
         action: A11yAction,
     },
+    /// 对**只读**节点发来的值变更动作（`SetValue` / `Increment` / `Decrement`；已忽略，E3）。
+    ///
+    /// `read_only` 是独立于 `disabled` 的状态：只读输入框对 AT 仍宣告可聚焦/可选中，但不宣告
+    /// 也不执行值变更。应用要区分"禁用"（播报 unavailable）与"只读"（播报 read-only）时靠它。
+    ReadOnlyAction {
+        /// 节点。
+        node: NodeId,
+        /// 被拒绝的动作。
+        action: A11yAction,
+    },
+    /// 动作**不在节点的能力集**里（未在 `A11yOverride/A11yPatch::actions` 声明、角色默认表
+    /// 也没有；已忽略，E3）。
+    ///
+    /// 能力集是 AT 动作的唯一信任边界：能力集里没有的动作，应用 handler 也收不到。
+    UnadvertisedAction {
+        /// 节点。
+        node: NodeId,
+        /// 被拒绝的动作。
+        action: A11yAction,
+    },
 }
 
 /// a11y 动作的 payload（强类型；替代 `accesskit::ActionData` 的公开面）。

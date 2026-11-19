@@ -18,8 +18,8 @@ use crate::{
         A11yScroll,
         identity::{A11yIds, A11yKey},
         mapping::{
-            a11y_disabled, bounds_of, effective_actions, effective_description, effective_label,
-            effective_role, effective_value, is_hidden,
+            a11y_disabled, a11y_read_only, bounds_of, effective_actions, effective_description,
+            effective_label, effective_role, effective_value, is_hidden,
         },
         textrun,
     },
@@ -116,7 +116,9 @@ pub(crate) fn node_a11y_with_cache(
     let checked = patch.and_then(|patch| patch.checked);
     let hidden = is_hidden(target, role, label.as_ref(), over, patch);
     let disabled = a11y_disabled(tree, node);
-    let actions = effective_actions(tree, node, role, over, patch, disabled);
+    // `read_only` 必须在能力计算之前求（E3：能力集 = 分发判据，read_only 剔除值变更类动作）。
+    let read_only = a11y_read_only(tree, node);
+    let actions = effective_actions(tree, node, role, over, patch, disabled, read_only);
 
     // 诊断：自绘缺替代文本（§5.4）、交互节点无名（§5.2）。
     if role == A11yRole::Image
@@ -200,11 +202,7 @@ pub(crate) fn node_a11y_with_cache(
             .get(node)
             .is_ok_and(|state| state.style().clip != Clip::None);
 
-    // 表单 / 状态属性（R13-14）。
-    let read_only = patch
-        .and_then(|patch| patch.read_only)
-        .or_else(|| over.map(|over| over.read_only))
-        .unwrap_or(false);
+    // 表单 / 状态属性（R13-14）。`read_only` 已在能力计算之前求（E3）。
     let modal = patch
         .and_then(|patch| patch.modal)
         .or_else(|| over.map(|over| over.modal))
