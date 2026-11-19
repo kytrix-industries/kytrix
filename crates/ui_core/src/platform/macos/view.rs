@@ -26,8 +26,9 @@ use objc2::{
     runtime::{AnyObject, ProtocolObject},
 };
 use objc2_app_kit::{
-    NSCursor, NSEvent, NSEventModifierFlags, NSEventPhase, NSTextInputClient, NSTrackingArea,
-    NSTrackingAreaOptions, NSUserInterfaceValidations, NSValidatedUserInterfaceItem, NSView,
+    NSCursor, NSEvent, NSEventModifierFlags, NSEventPhase, NSTextInputClient, NSTextInputContext,
+    NSTrackingArea, NSTrackingAreaOptions, NSUserInterfaceValidations,
+    NSValidatedUserInterfaceItem, NSView,
 };
 use objc2_foundation::{
     NSArray, NSAttributedString, NSAttributedStringKey, NSPoint, NSProcessInfo, NSRange, NSRect,
@@ -62,10 +63,17 @@ pub(crate) struct ViewIvars {
     modifiers: Cell<u8>,
     /// IME caret 区域（窗口逻辑坐标；`None` = 无 hint）。
     ime_cursor: Cell<Option<Rect>>,
-    /// 引擎请求的光标形状（`cursorUpdate:` / `mouseEntered:` 重新 apply 它，R09-11）。
+    /// 箭头 `cursorUpdate:` / `mouseEntered:` 重新 apply 它，R09-11）。
     cursor: Cell<Cursor>,
     /// 指针是否在 view 内（决定 `set_cursor` 能否立刻 `NSCursor::set`）。
     pointer_inside: Cell<bool>,
+    /// 应用是否允许该窗口使用 IME（B6；默认启用）。`false` ⇒ [`GuiView::input_context`]
+    /// 返回 `nil`，按下时 `keyDown:`/`keyUp:` 里的 `inputContext()` 也是 `None`，按键因此
+    /// 走普通 `characters` 通路（`InputEvent::Text`），不再被路由给输入法。
+    ///
+    /// 唯一写者是泵里的 `NativeWindow::sync_ime_enabled`（目标状态来自
+    /// `App::ime_enabled`）；平台回调只读，不在回调里改它。
+    ime_enabled: Cell<bool>,
     /// Edit 菜单项的可用性快照（泵每轮由 `sync_ime_cursor_area` 写入）：`validateUserInterfaceItem:`
     /// 与菜单动作（`run_menu_command`）据此决定启用/上抛（R09-1 收尾 / AR3 P2-11）。
     ///
@@ -101,6 +109,33 @@ define_class!(
         #[unsafe(method(wantsUpdateLayer))]
         fn wants_update_layer(&self) -> bool {
             true
+        }
+
+        /// `NSView.inputContext` 的覆盖（B6）：禁用 IME 时返回 `nil`。
+        ///
+        /// AppKit 在把按键路由给输入法之前会向第一响应者要输入上下文；返回 `nil` ⇒ 按键
+        /// 不经过输入法，`keyDown:` 里的 `characters` 直接产出 `InputEvent::Text`。这是
+        /// WebKit `-[WKView inputContext]`「非 editable 返回 nil」的同一成熟做法
+        /// （NSTextInputContext 没有公开的「摘除/恢复」API，覆盖 `inputContext` 是唯一
+        /// 不依赖私有行为的开关）。
+        ///
+        /// 启用时必须调用 **super** 的默认实现取回 AppKit 维护的上下文：`NSView::inputContext`
+        /// 是同一 selector 的 Rust 绑定，直接调用会自递归。
+        ///
+        /// `method_id`（而不是 `method`）是 `define_class!` 对**返回对象**的方法要求：
+        /// 返回值走 `RetainedReturnValue`（`Option<Retained<_>>` 是合法返回），普通
+        /// `method` 只接受 `Encode` 的值类型。
+        #[unsafe(method_id(inputContext))]
+        fn input_context(&self) -> Option<Retained<NSTextInputContext>> {
+            // 注意：`method_id` 的返回值必须走**尾部表达式**（宏把函数体包成
+            // `RetainedReturnValue` 转换），因此这里用 if/else 而不是提前 `return`。
+            if self.ivars().ime_enabled.get() {
+                // SAFETY: `inputContext` 是 NSView 的既有方法；`super(self)` 直接把消息发给
+                // 父类实现（不会重新进入本覆盖），返回值按 `Option<Retained<_>>` 持有。
+                unsafe { msg_send![super(self), inputContext] }
+            } else {
+                None
+            }
         }
 
         #[unsafe(method(keyDown:))]
@@ -670,6 +705,7 @@ impl GuiView {
             a11y: RefCell::new(None),
             modifiers: Cell::new(0),
             ime_cursor: Cell::new(None),
+            ime_enabled: Cell::new(true),
             cursor: Cell::new(Cursor::Default),
             pointer_inside: Cell::new(false),
             edit: Cell::new(EditAvailability::NONE),
@@ -753,6 +789,49 @@ impl GuiView {
             a11y.focus_changed(focused);
         }
         *self.ivars().a11y.borrow_mut() = adapter;
+    }
+
+    /// 应用 IME 目标状态（B6；唯一调用点是泵里的 `NativeWindow::sync_ime_enabled`）。
+    ///
+    /// 禁用：先丢弃进行中的组合、清平台侧 IME 状态（返回值语义见
+    /// [`Self::reset_ime_composition`]），**再**翻标志位 —— 顺序不能反：一旦
+    /// `inputContext` 开始返回 `nil`，就拿不到上下文去 `discardMarkedText`，输入法那边的
+    /// 转换会话会悬空。启用只翻标志：下一次按键自然取回 super 的上下文。
+    ///
+    /// 返回 `true` = 有组合被丢弃且需要调用方补一条 `ImeEvent::End`（与焦点移走路径共用
+    /// 同一收尾判据）。
+    pub(crate) fn apply_ime_enabled(&self, enabled: bool) -> bool {
+        if enabled {
+            self.ivars().ime_enabled.set(true);
+            return false;
+        }
+        let needs_end = self.reset_ime_composition();
+        self.ivars().ime_enabled.set(false);
+        needs_end
+    }
+
+    /// 丢弃进行中的 IME 组合并清掉平台侧 IME 缓存（B6/B9 的统一清场路径：禁用 IME /
+    /// 窗口失焦）。
+    ///
+    /// 两步：① 让 AppKit 丢弃它那边的转换会话（`NSTextInputContext.discardMarkedText`，
+    /// 公开 API，WebKit/Qt 同款）；② 清引擎侧的 `ImeState` 与 caret 缓存。返回 `true` =
+    /// 需要调用方补一条 `ImeEvent::End` —— `discardMarkedText` 若同步回调了
+    /// `unmarkText:`（该回调已经 push 过 `End`），这里就不再补，**End 恰好一条**。
+    ///
+    /// caret 缓存是 AppKit 摆候选窗的依据（`firstRectForCharacterRange:`）；失焦/禁用不是
+    /// 「caret 移到别处」，清场后必须回到空矩形，否则下一次组合会拿旧插入点摆候选窗。
+    pub(crate) fn reset_ime_composition(&self) -> bool {
+        self.ivars().ime_cursor.set(None);
+        if !self.ivars().ime.borrow().has_marked() {
+            return false;
+        }
+        if let Some(context) = self.inputContext() {
+            context.discardMarkedText();
+        }
+        let mut ime = self.ivars().ime.borrow_mut();
+        let still_composing = ime.has_marked();
+        ime.clear_marked();
+        still_composing
     }
 
     /// 取走本轮的平台事件（泵唯一读点）。

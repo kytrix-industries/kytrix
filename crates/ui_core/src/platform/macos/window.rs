@@ -28,7 +28,7 @@ use objc2_quartz_core::CAMetalLayer;
 use crate::{
     app::App,
     error::EngineError,
-    event::Event,
+    event::{Event, ImeEvent},
     math::{Rect, Scale, Size},
     paint::style::Cursor,
     platform::{
@@ -141,6 +141,10 @@ pub(crate) struct NativeWindow {
     destroyed: bool,
     /// 最近一次下发的 IME caret 区域（逻辑坐标）。
     ime_area: Option<Rect>,
+    /// 已应用到 `GuiView` 的 IME 启用状态（B6；目标状态来自 `App::ime_enabled`）。
+    ime_enabled: bool,
+    /// `sync_state` 观察到的「窗口刚失去键盘焦点」边沿（泵在同步后消费它做 IME 清场）。
+    focus_lost: bool,
 }
 
 impl NativeWindow {
@@ -239,6 +243,10 @@ impl NativeWindow {
             close_requested: false,
             destroyed: false,
             ime_area: None,
+            // 与 `App::ime_enabled` 的默认值一致（默认启用）；首次 `sync_ime_enabled`
+            // 因此不会产生任何平台调用。
+            ime_enabled: true,
+            focus_lost: false,
         };
         native.sync_initial(mtm)?;
         Ok(native)
@@ -368,6 +376,12 @@ impl NativeWindow {
             self.was_key = key;
             self.view.focus_changed(key);
             events.push(Event::FocusChanged { focused: key });
+            if !key {
+                // B9(mac)：失焦边沿留给泵做 IME 清场 —— 这里只置位（`sync_state` 可能
+                // 在嵌套/无关回调里被调用，清场要碰 `&mut App` 的公共入口，放到同一轮泵
+                // 的状态同步之后执行，见 [`Self::handle_focus_lost`]）。
+                self.focus_lost = true;
+            }
         }
         // 关闭判定只看「窗口真的不在了」：最小化（`isMiniaturized`）与 `NSApp.hide()`
         // 都会让 `isVisible` 变 false，但窗口并没有被关闭。
@@ -449,6 +463,53 @@ impl NativeWindow {
         }
         self.ime_area = area;
         self.view.set_ime_cursor_area(area);
+    }
+
+    /// 同步 IME 启用状态到 `GuiView.inputContext`（每轮泵调用；目标状态来自
+    /// `App::ime_enabled`，B6）。
+    ///
+    /// 与 Windows 的 `NativeWindow::sync_ime_enabled` 同构：每轮对账「目标状态 vs 已应用
+    /// 状态」，只在变化时执行平台动作。禁用 ⇒ AppKit 丢弃转换会话 + 清引擎组合态（有组合
+    /// 时补 `ImeEvent::End`，经 `App::dispatch` 立刻交付）+ 清 App 侧 caret hint；启用 ⇒
+    /// 下一次按键自然取回 super 的上下文，并清 `ime_area` 缓存让 hint 重发（恢复的上下文
+    /// 不保证还留着旧的候选窗/组合窗表单）。
+    ///
+    /// 清 caret hint 走 `App::clear_ime_cursor_area`（公共入口，会 `dispatcher.wake()`）。
+    /// 启停是**边沿事件**（不是每帧动作），因此这里多出的一轮空泵可忽略；不在
+    /// `sync_state` 里做是为了不破坏「`sync_state` 不唤醒泵」的纪律（R09-15②）。
+    pub(crate) fn sync_ime_enabled(&mut self, app: &mut App) {
+        let enabled = app.ime_enabled(self.id);
+        if enabled == self.ime_enabled {
+            return;
+        }
+        self.ime_enabled = enabled;
+        if !enabled {
+            app.clear_ime_cursor_area(self.id);
+        }
+        self.ime_area = None;
+        if self.view.apply_ime_enabled(enabled) {
+            app.dispatch(self.id, Event::Ime(ImeEvent::End));
+        }
+    }
+
+    /// 取走「窗口刚失去键盘焦点」边沿（`sync_state` 置位；泵唯一读点）。
+    pub(crate) fn take_focus_lost(&mut self) -> bool {
+        std::mem::take(&mut self.focus_lost)
+    }
+
+    /// 窗口失焦的 IME 清场（B9 mac 部分；泵每轮在 `sync_state` 之后调用）。
+    ///
+    /// 用户裁决的统一清场路径：**清 caret hint → 重置组合状态 → 补 `End`**。AppKit 在窗口
+    /// resign key 时通常自己会取消转换会话（走 `unmarkText:`，那条回调已经交付过 `End`），
+    /// 这里兜底「没有取消」的输入法；两种情况都做到 `End` 恰好一条。
+    ///
+    /// 不引入嵌套 runloop：全部在泵里同步完成（view 回调纪律不变 —— 回调只置位/唤醒）。
+    pub(crate) fn handle_focus_lost(&mut self, app: &mut App) {
+        app.clear_ime_cursor_area(self.id);
+        self.ime_area = None;
+        if self.view.reset_ime_composition() {
+            app.dispatch(self.id, Event::Ime(ImeEvent::End));
+        }
     }
 
     /// 引擎请求的光标形状（R09-11；`WindowId` 的定向投递在泵里完成）。

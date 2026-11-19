@@ -354,6 +354,13 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
             changed = true;
         }
         changed |= native.sync_state(app)?;
+        // B9(mac)：窗口刚失去键盘焦点 ⇒ IME 统一清场（清 caret hint / 丢弃组合 / 补 End）。
+        // 放在 `sync_state` 之后：`FocusChanged { focused: false }` 已经按事件顺序投递，
+        // 清场产生的 `ImeEvent::End` 排在其后；清场要 `&mut App`，因此由泵执行而不是在
+        // view / delegate 回调里（回调纪律：只置位 + 唤醒）。
+        if native.take_focus_lost() {
+            native.handle_focus_lost(app);
+        }
     }
 
     app.run_frame_hook();
@@ -405,6 +412,9 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
 
     for native in state.windows.iter_mut() {
         native.update_a11y(app);
+        // IME 启用状态先于 caret hint：刚禁用时不必再写表单，刚启用时要重发 hint
+        //（`sync_ime_enabled` 会清掉 `ime_area` 缓存）。
+        native.sync_ime_enabled(app);
         native.sync_ime_cursor_area(app);
     }
     for task in state.dispatcher.drain_tasks() {
