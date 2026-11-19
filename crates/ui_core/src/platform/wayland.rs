@@ -15,10 +15,29 @@
 //! 函数与纯状态机，由 [`mod@self`] 的单测覆盖（开发机跑得到）。协议对象（`wl_data_source`、
 //! `zwp_text_input_v3`、`wl_pointer`…）只出现在 `platform/linux/**` 的薄驱动层。
 //!
+//! P1 追加的纯逻辑同理：
+//!
+//! - **X2 拖动区**（[`drag`]）：自绘标题栏的主键按下命中拖动区 ⇒ 平台层发 `xdg_toplevel.move`
+//!   交给 compositor 驱动移动、不投递 `PointerDown`（判定在 Windows 开发机上可单测）；
+//! - **X1 窗口层级**（[`owner`]）：`WindowOptions::owner` → `xdg_toplevel.set_parent` 的
+//!   transient 提示解析（Wayland 没有 owner / 模态 / 置顶的跨合成器协议，降级语义在模块里
+//!   写清：模态由 `App` 层输入拦截承担、置顶无操作）。
+//! - **A4 呈现证据**（[`presentation`]）：`wp_presentation` 的纯判据 —— 呈现时钟域白名单
+//!   （`CLOCK_REALTIME` / `CLOCK_MONOTONIC`）与 presented 证据的单调判据；协议对象、GPU 线程
+//!   的 feedback 请求与时钟换算在 `platform/linux/presentation.rs`。
+//!
 //! 编译条件与 `platform/ime` 同款：Linux 构建 + 测试构建（`cfg(test)` 让 Windows 也能测）。
 
+pub(crate) mod close;
+pub(crate) mod configure;
 pub(crate) mod cursor;
+pub(crate) mod drag;
 pub(crate) mod frame_gate;
+pub(crate) mod ime;
+pub(crate) mod input;
+pub(crate) mod owner;
+pub(crate) mod presentation;
+pub(crate) mod scroll;
 pub(crate) mod selection;
 pub(crate) mod text_input;
 pub(crate) mod toplevel;

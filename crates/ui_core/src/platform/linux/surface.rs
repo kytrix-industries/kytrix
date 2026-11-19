@@ -23,6 +23,16 @@
 //!   判据在 [`crate::platform::wayland::text_input`]）。
 //! - **seat 能力撤销要 `release()`**（R10-8）：直接丢代理会让服务端继续往已释放的 id 发事件，
 //!   那是协议错误（断连）。
+//! - **组合期不投递裸键**（B4）：Linux 没有同步的「按键被 IME 消费」信号（`zwp_text_input_v3`
+//!   的结果是异步批次），以**已有 preedit** 为判据不投递裸 `Key`（Ctrl/Alt/Meta 命令组合
+//!   豁免）。判据在 [`crate::platform::wayland::input::key_visible_while_composing`]（Windows
+//!   可单测），首键启动组合的残余风险见 `translate_key` 文档。
+//! - **呈现证据**（A4）：registry 里绑定 `wp_presentation`（可选扩展，缺失只记豁免）；GPU
+//!   线程在每次 present 之前对 `wl_surface` 请求一次 `wp_presentation.feedback`（帧序号写进
+//!   反馈 user data，见 `render/linux/renderer.rs` 的调用点）。终态事件（presented /
+//!   discarded）在 UI 线程按 user data 找回 `(WindowId, FrameIndex)`，换算成 `Instant` 后写进
+//!   邮箱，泵按 `FrameIndex` 回填窗口呈现历史。协议对象与时钟换算在
+//!   `platform/linux/presentation.rs`，本文件只做「事件翻译 + 泵接线」。
 //!
 //! 缩放（V-110 / V-122 ④）：
 //! - **fractional**：`wp_viewporter` 与 `wp_fractional_scale_manager_v1` **同时**存在时才启用
@@ -66,6 +76,7 @@ use wayland_protocols::{
         fractional_scale::v1::client::{
             wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1, wp_fractional_scale_v1,
         },
+        presentation_time::client::{wp_presentation, wp_presentation_feedback},
         text_input::zv3::client::{
             zwp_text_input_manager_v3::ZwpTextInputManagerV3,
             zwp_text_input_v3::{self, ZwpTextInputV3},
@@ -85,21 +96,35 @@ use crate::{
     app::App,
     error::{EngineError, WaylandErrorKind},
     event::{
-        Event, ImeEvent, InputEvent, KeyCode, KeyState, Modifiers, PointerButton, ScrollPhase,
-        ScrollUnit, should_emit_text,
+        Event, ImeEvent, InputEvent, KeyCode, KeyState, Modifiers, ScrollPhase, ScrollUnit,
+        should_emit_text,
     },
     math::{Point, Rect, Scale, Size},
     paint::style::Cursor,
     platform::{
-        linux::{clipboard::Clipboard, cursor::CursorManager, dpi, ime::ImeState, window},
+        linux::{
+            clipboard::Clipboard,
+            cursor::CursorManager,
+            dpi,
+            presentation::{FeedbackData, Presentation, PresentationHandle},
+            window,
+        },
         wayland::{
+            configure::{AckAction, ConfigureLatch},
             frame_gate::{CallbackToken, FrameGate},
+            ime::ImeState,
+            input, owner,
+            presentation::PresentedOrder,
+            scroll::{ScrollAccum, ScrollAxis},
             text_input::{self, ImeStateSnapshot, TextInputRoute},
             toplevel::{
-                self, DecorationMode, ToplevelStates, Visibility, WindowGeometry, WmCapabilities,
+                self, DecorationMode, SizeConstraintState, ToplevelStates, Visibility,
+                WindowGeometry, WmCapabilities,
             },
         },
     },
+    // A4：`wp_presentation_feedback` 终态事件 → 邮箱 → 泵回填窗口呈现历史。
+    render::present_evidence::{PresentationInbox, PresentationOutcome},
 };
 
 /// 客户端自报的 app id（compositor 用来匹配桌面文件）。
@@ -186,61 +211,6 @@ struct HeldKey {
     next: std::time::Instant,
 }
 
-/// 一次 `wl_pointer.frame` 内累积的滚轮增量。
-///
-/// Wayland 的 `axis` 是连续值（surface-local 单位，触控板即像素、滚轮一格通常 10–15），
-/// `axis_value120`（v8+）才是 1/120 行的高精度离散步长 —— 后者与 Windows 的
-/// `WHEEL_DELTA = 120` 同量纲，可以直接除以 120 得到行数。旧实现把 `axis` 除以 120，
-/// 于是滚轮慢约一个数量级（P1-2.11）。
-#[derive(Clone, Copy, Debug, Default)]
-struct ScrollAccum {
-    /// `axis_value120` 累积（1/120 行）。
-    discrete_x: i32,
-    discrete_y: i32,
-    /// 连续 `axis` 累积（surface-local 单位）。
-    continuous_x: f32,
-    continuous_y: f32,
-}
-
-impl ScrollAccum {
-    fn is_empty(self) -> bool {
-        self.discrete_x == 0
-            && self.discrete_y == 0
-            && self.continuous_x == 0.0
-            && self.continuous_y == 0.0
-    }
-
-    /// 换算成「行」。
-    ///
-    /// 离散部分走 `value120 / 120`（精确）；连续部分按 `CONTINUOUS_AXIS_UNITS_PER_LINE`
-    /// 折算 —— Wayland v5 起滚轮一格被规定为 10 个单位，取 10 让连续通路在滚轮上得到 1 行/格，
-    /// 触控板则按手指位移成比例平滑滚动。
-    fn lines(self) -> (f32, f32) {
-        (
-            self.discrete_x as f32 / 120.0 + self.continuous_x / CONTINUOUS_AXIS_UNITS_PER_LINE,
-            self.discrete_y as f32 / 120.0 + self.continuous_y / CONTINUOUS_AXIS_UNITS_PER_LINE,
-        )
-    }
-
-    /// 连续部分按**像素**（触控板 / `axis_source = finger` 的 1:1 跟随，R02-10）。
-    ///
-    /// 手指输入的 `axis` 值本来就是「手指移动量 × 加速度」，不做行换算才能与系统惯性对齐；
-    /// 方便起见把同时到达的离散分量按一格 = 10 个单位折算进来（正常不会同时出现）。
-    fn continuous_pixels(self) -> (f32, f32) {
-        (
-            self.continuous_x + self.discrete_x as f32 / 120.0 * CONTINUOUS_AXIS_UNITS_PER_LINE,
-            self.continuous_y + self.discrete_y as f32 / 120.0 * CONTINUOUS_AXIS_UNITS_PER_LINE,
-        )
-    }
-
-    fn clear(&mut self) {
-        *self = Self::default();
-    }
-}
-
-/// 连续 `axis` 的单位→行换算（见 [`ScrollAccum::lines`]）。
-const CONTINUOUS_AXIS_UNITS_PER_LINE: f32 = 10.0;
-
 /// 一个原生窗口的 Wayland 侧状态（surface / toplevel / 几何 / 帧节流）。
 ///
 /// **进程级 vs 每窗口**（P1-2.8 的分层）：`WaylandState` 持有连接、seat、键盘/指针、
@@ -254,11 +224,23 @@ struct WindowSurface {
     /// 稳定 id（与 `App` 的 `WindowId` 对应）。
     id: crate::window::WindowId,
     surface: wl_surface::WlSurface,
-    /// `xdg_surface`（首个 configure 的 ack 在 handler 里；析构顺序见 `Drop`）。
+    /// `xdg_surface`（`configure` 的 ack 时机由 [`Self::configure`] 裁决；析构顺序见 `Drop`）。
     xdg_surface: xdg_surface::XdgSurface,
     toplevel: xdg_toplevel::XdgToplevel,
+    /// xdg-shell configure 的 ack 时序锁存（B10）。
+    ///
+    /// 初始 configure 立即 ack（否则不能 attach buffer 映射）；后续**改变 buffer 状态**
+    /// （尺寸 / 窗口 states）的 configure 等「使用该状态渲染的帧已发布」之后才 ack。
+    /// 窗口销毁时锁存随协议对象一起 drop：surface 已销毁，未 ack 的 serial 不能再 ack。
+    configure: ConfigureLatch,
     /// 应用声明的 IME caret 区域（surface 逻辑坐标；`None` = 无 hint）。
     ime_cursor_area: Option<Rect>,
+    /// 本窗口当前是否有**可编辑文本目标**（`App::ime_cursor_area` 有值；B9）。
+    ///
+    /// 泵每轮 [`WaylandState::sync_ime_policy`] 写入；`false` ⇒ `zwp_text_input_v3.disable()`
+    /// （同一 surface 内焦点从输入框移到图表/列表时也必须关，XML `enable` 的协议要求）。
+    /// 同时作为 [`TextInputRoute`] 的每窗口策略输入（`text_target`）。
+    text_target: bool,
     /// **上次已提交**的 text-input 状态快照（`set_cursor_rectangle` + `set_content_type`）。
     ///
     /// `done` 里回写的判据：只有当前状态与它不同才允许再 `commit()`（AR3 §3.3）；`None` ⇒
@@ -314,8 +296,9 @@ struct WindowSurface {
     states: ToplevelStates,
     /// compositor 声明的窗口管理能力（xdg-shell v5；未收到 ⇒ 假定全部支持，R10-15）。
     wm_caps: WmCapabilities,
-    /// compositor 建议的尺寸上限（`configure_bounds`，xdg-shell v4；`None` = 未收到）。
-    bounds: Option<Size>,
+    /// 尺寸约束状态（B3）：应用 `min_size`/`max_size` + compositor `configure_bounds` →
+    /// `xdg_toplevel.set_min_size/set_max_size`。同值不重复下发。
+    size_constraints: SizeConstraintState,
     /// 最近一次下发的 window geometry（同值不重复发，R10-10）。
     geometry: Option<WindowGeometry>,
     /// 指针进入本窗口时应使用的光标（应用通过 `take_cursor_change` 设置，R10-3）。
@@ -329,6 +312,14 @@ struct WindowSurface {
     /// 因此靠 id 区分「当前请求的 callback」与「被放弃、迟到的旧 callback」，令牌只对匹配的
     /// 回调生效。
     frame_callback: Option<(ObjectId, CallbackToken)>,
+    /// A4：presented 证据的单调判据（每窗口一份）。
+    ///
+    /// 反馈对象由 GPU 线程在 present 前创建（帧序号写进 user data）；终态事件按提交顺序送达，
+    /// 因此 presented 帧序号必须严格递增 —— 陈旧/乱序证据只能丢弃（见
+    /// [`crate::platform::wayland::presentation::PresentedOrder`]）。
+    presented_order: PresentedOrder,
+    /// A4：呈现反馈邮箱（终态事件 → 泵按 `FrameIndex` 回填窗口的呈现历史）。
+    presentation_inbox: PresentationInbox,
 }
 
 impl Drop for WindowSurface {
@@ -383,6 +374,11 @@ pub(crate) struct WaylandState {
     /// 光标下发状态（cursor-shape-v1 优先，主题回退，R10-3）。
     cursor: CursorManager,
     clipboard: Clipboard,
+    /// A4：`wp_presentation` 绑定与呈现时钟（可选扩展；缺失时 `presented_at` 记豁免）。
+    ///
+    /// 只保存工厂代理（用来创建 feedback 对象），关闭连接时不需要显式 destroy；按上面
+    /// 「协议对象声明在 `connection` 之前」的析构纪律放在这里。
+    presentation: Presentation,
     connection: Connection,
     queue_handle: QueueHandle<Self>,
     /// `wl_compositor`：每个新窗口都从它 `create_surface`（多窗口的生命周期入口）。
@@ -458,13 +454,13 @@ pub(crate) struct WaylandState {
 impl WaylandState {
     /// 连上 compositor、绑定必需 global、建首个 surface/toplevel、装 IME / 剪贴板（§8.1 的 1–4）。
     ///
-    /// `size` / `title` 是应用建窗参数：compositor 的 configure 给出 `0×0` 时，客户端用请求的
+    /// `options` 是首个窗口的建窗参数（尺寸 / 标题 / min-max；`position` 在 Wayland 上按协议
+    /// 忽略，见 [`Self::add_window`]）：compositor 的 configure 给出 `0×0` 时，客户端用请求的
     /// 尺寸作为初值（否则会退到固定的 800×600）。后续窗口（运行期新增 / 启动时就存在的）都走
     /// [`Self::add_window`]，本函数只在最后为**首个**窗口调用它一次。
     pub(crate) fn new(
-        size: Size,
-        title: &str,
         id: crate::window::WindowId,
+        options: &crate::window::WindowOptions,
     ) -> Result<(Self, wayland_client::EventQueue<Self>), EngineError> {
         // R10-16：断连 / 协议错误 / 缺 global 分成三种强类型失败（不再折叠成 AppInit 字符串）。
         let connection = Connection::connect_to_env().map_err(|error| EngineError::Wayland {
@@ -543,6 +539,7 @@ impl WaylandState {
             text_input_route: TextInputRoute::default(),
             outputs: Vec::with_capacity(2),
             clipboard,
+            presentation: Presentation::new(),
             xkb_context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
             xkb_state: None,
             xkb_keymap: None,
@@ -563,7 +560,9 @@ impl WaylandState {
         // `wl_output.scale`，整数回退的首帧因此能按「全部已绑定 output 的最大 scale」兜底
         // （`wl_surface.enter` 要等 surface 映射之后才到，V-110）。
         state.bind_existing_outputs(&globals);
-        state.add_window(id, size, title)?;
+        // A4：可选扩展 `wp_presentation`（缺失 ⇒ presented_at 恒 None + 豁免计数，不伪造）。
+        state.bind_existing_presentation(&globals);
+        state.add_window(id, options)?;
         Ok((state, queue))
     }
 
@@ -573,7 +572,7 @@ impl WaylandState {
     ///
     /// ```text
     /// create_surface → get_xdg_surface → get_toplevel
-    ///   → set_app_id / set_title / set_min_size
+    ///   → set_app_id / set_title / set_min_size + set_max_size
     ///   → get_toplevel_decoration + set_mode   ← xdg-decoration v1：必须早于首次 commit
     ///   → get_fractional_scale + get_viewport  ← 尽早创建，避免错过初始 preferred_scale
     ///   → surface.commit()                     ← 唯一触发初始 configure 的 commit
@@ -584,11 +583,27 @@ impl WaylandState {
     ///
     /// 首个 configure 由 compositor 异步发回，事件循环在收到 `configured` 之前不会为它建
     /// swapchain / 出帧。
+    ///
+    /// # `WindowOptions` 的消费（B3 / X1）
+    ///
+    /// - `size` / `title`：初始尺寸与标题（`size` 在协议层取整，见下）；
+    /// - `min_size` / `max_size`：收敛进 [`SizeConstraintState`]，在首个 commit 之前下发
+    ///   `set_min_size/set_max_size`（`None` 的 min 用平台默认 [`window::MIN_SIZE_LOGICAL`]）；
+    /// - `owner`：解析到已存在的窗口 ⇒ `xdg_toplevel.set_parent` 的 *transient for* **提示**
+    ///   （[`owner`] 模块；compositor 可忽略，不保证 z 序 / 生命周期联动）；owner 尚未创建 /
+    ///   已关闭 ⇒ 降级不设并 `eprintln!` 诊断；
+    /// - `modal` / `always_on_top`：Wayland **没有**对应原生协议 —— 模态由 `App` 层输入拦截
+    ///   承担（本端只有上面的 parent 提示），置顶明确降级为无操作；见下方调用点的注释。
+    /// - `position`：**有意忽略** —— 这是 Wayland 的协议事实而不是遗漏：`xdg_toplevel` 没有
+    ///   任何定位请求（只有
+    ///   set_parent/set_title/set_app_id/show_window_menu/move/resize/set_max_size/set_min_size/
+    ///   set_maximized/unset_maximized/set_fullscreen/unset_fullscreen/set_minimized），窗口位置
+    ///   完全由 compositor 决定，也没有可靠的位置回读（`Event::Moved` 在 Linux 上永不产生）。
+    ///   公共文档 `WindowOptions::position` 已写明该降级语义。
     pub(crate) fn add_window(
         &mut self,
         id: crate::window::WindowId,
-        size: Size,
-        title: &str,
+        options: &crate::window::WindowOptions,
     ) -> Result<(), EngineError> {
         let surface = self.compositor.create_surface(&self.queue_handle, ());
         let xdg_surface = self
@@ -596,20 +611,67 @@ impl WaylandState {
             .get_xdg_surface(&surface, &self.queue_handle, ());
         let toplevel = xdg_surface.get_toplevel(&self.queue_handle, ());
         toplevel.set_app_id(APP_ID.to_owned());
-        toplevel.set_title(title.to_owned());
+        toplevel.set_title(options.title.to_string());
+        // X1：owner → `xdg_toplevel.set_parent` —— **transient for 提示**，不是客户区父子关系。
+        //
+        // 协议（xdg-shell.xml `set_parent`）：子 surface "should be stacked above the parent
+        // surface and all other ancestor surfaces"、父窗口被 raise 时子窗口跟着 raise。compositor
+        // **可以忽略**，协议也无法表达「随 owner 最小化 / 销毁」⇒ 本端的 owner 是降级提示
+        // （公共 `WindowOptions::owner` 文档已写明；判定与原因见 `wayland::owner` 模块文档）。
+        //
+        // 解析发生在把新窗口 push 进 `self.windows` **之前**（`window_index` 只能看到已存在的
+        // 窗口）：owner 尚未创建 / 已关闭 / 陈旧 id ⇒ `Missing` ⇒ 不设 parent 并写诊断（不
+        // panic；`WindowId` 永不复用，陈旧 id 不会误绑新窗口）。一批窗口同时创建时，
+        // `event_loop::sync_windows` 按 `WindowId` 升序（= App 的创建顺序）建原生窗口，保证
+        // owner 先于 owned 窗口落地（`run()` 的首个窗口同样取最小 id）。
+        //
+        // 生命周期：引擎层 owner 关闭时会先**级联关闭** owned 窗口（App 层职责），因此本端
+        // 不需要在 owner 销毁时对 child 清 parent；若该前提失效（child 未关），协议也没有
+        // 「父销毁」错误 —— 按协议只有 mapped 的父 surface 才能有 child，父 unmapped / 销毁后
+        // 这段 transient 关系随父对象消失，不会把子窗口一起销毁。
+        //
+        // 残余风险（协议原文）："Only mapped surfaces can have child surfaces. Setting a parent
+        // which is not mapped is equivalent to setting a null parent." 运行期对话框的 owner 通常
+        // 已映射（前提成立）；启动时同一批创建的 owner 在本请求时可能尚未映射，严格按字面执行
+        // 的 compositor 可以把提示当作 null parent（多数实现不强制，真机验收记录）。本仓不为
+        // 这条提示加延迟重发机制：owner 在 Wayland 上本来就只有降级提示（公共文档），额外状态
+        // 换不来契约级保证。
+        match owner::resolve_owner(options.owner, |owner| self.window_index(owner)) {
+            owner::OwnerResolution::Unparented => {}
+            owner::OwnerResolution::Existing(index) => {
+                toplevel.set_parent(Some(&self.windows[index].toplevel));
+            }
+            owner::OwnerResolution::Missing(owner) => eprintln!(
+                "kytrix: window owner {owner:?} does not exist yet or is already closed; \
+                 xdg_toplevel.set_parent skipped (the owned window has no transient hint)"
+            ),
+        }
+        // X1：`modal` / `always_on_top` 在 Wayland 上**没有额外原生请求**（明确降级，不是遗漏）：
+        //
+        // - `modal`：xdg-shell 没有模态协议，`xdg_toplevel` 的请求表里**没有** `set_modal`
+        //   （不要臆造）。模态语义完全由 `App` 层输入拦截承担（与 macOS 同一套）；本端只提供
+        //   上面 owner 的 `set_parent` 提示，让 compositor 把对话框叠在 owner 之上。
+        //   `modal && owner == None` 的「降级为普通窗口 + 诊断」由 App 层负责（公共契约的落地
+        //   点），这里不重复诊断。
+        // - `always_on_top`：xdg-shell 没有置顶请求；KDE plasma-shell / wlr-layer-shell 都不是
+        //   xdg-shell 标准能力，本端**不使用任何非标准协议** ⇒ 明确降级为**无操作**（应用不得
+        //   假设置顶成立，公共 `WindowOptions::always_on_top` 文档已写明）。`options.always_on_top`
+        //   因此**有意不消费**。
         // Wayland 的 configure / window geometry 是整数，小数的逻辑尺寸在协议层没有表示：
         // 这里先四舍五入取整，整数回退下 buffer = `round(L × N)` 因而严格是 buffer_scale 的
         // 整数倍（否则 `wl_surface.attach` 报 `invalid_size`，V-110）。
-        let size = Size::new(size.width.round().max(1.0), size.height.round().max(1.0));
+        let size = Size::new(
+            options.size.width.round().max(1.0),
+            options.size.height.round().max(1.0),
+        );
         // 首帧尺寸：**xdg-shell 没有 `set_default_size` 请求**（协议原文的 xdg_toplevel 请求只有
         // set_parent/set_title/set_app_id/show_window_menu/move/resize/set_max_size/set_min_size/
         // set_maximized/unset_maximized/set_fullscreen/unset_fullscreen/set_minimized，
         // 见 `wayland-protocols-0.32.13/protocols/stable/xdg-shell/xdg-shell.xml:622-1247`）。
         // 初始尺寸因此只有两条合法途径：compositor 在首个 `configure` 里给尺寸，或它给 0×0 表示
         // 「客户端自选」—— 后者由下面的 `Configure` 分支保留本结构里的 `size`（我们不覆盖它）。
-        // 最小尺寸是 window geometry 的逻辑像素（含 CSD 阴影边距），与 scale 无关：只需在首个
-        // commit 前设置一次。
-        window::apply_min_size(&toplevel);
+        // 尺寸约束（min/max）是 window geometry 的逻辑像素（含 CSD 阴影边距），与 scale 无关：
+        // 在首个 commit 前由 `SizeConstraintState` 下发（见 `apply_size_limits`）。
 
         // 装饰：请求 CLIENT_SIDE（没有该扩展时 compositor 自行决定）。**必须在首次 commit
         // 之前**创建，`configure` 事件里的 `mode` 才是权威的最终模式（R10-4）。
@@ -636,12 +698,17 @@ impl WaylandState {
             _ => None,
         };
         let uses_viewport = viewport.is_some();
+        // B3：`min_size = None` 用平台默认（与 Win32 / macOS 同源）；max 走应用上限，
+        // 之后由 `configure_bounds` 逐维收紧。
+        let minimum = options.min_size.unwrap_or(window::MIN_SIZE_LOGICAL);
         self.windows.push(WindowSurface {
             id,
             surface,
             xdg_surface,
             toplevel,
+            configure: ConfigureLatch::new(),
             ime_cursor_area: None,
+            text_target: false,
             ime_applied: None,
             ime_content: crate::window::ImeContentType::Text,
             ime: ImeState::new(),
@@ -661,15 +728,22 @@ impl WaylandState {
             configured: false,
             states: ToplevelStates::default(),
             wm_caps: WmCapabilities::ASSUMED,
-            bounds: None,
+            size_constraints: SizeConstraintState::new(minimum, options.max_size),
             geometry: None,
             cursor: Cursor::Default,
             close_requested: false,
             frame_gate: FrameGate::new(),
             frame_callback: None,
+            presented_order: PresentedOrder::new(),
+            presentation_inbox: PresentationInbox::new(),
         });
         // window geometry 与首个 commit 一起生效（`set_window_geometry` 是双缓冲状态）。
-        self.apply_window_geometry(self.windows.len() - 1);
+        // IME 路由的每窗口策略表与 `windows` 同生命周期（下标一一对应）。
+        self.text_input_route.add_window();
+        let index = self.windows.len() - 1;
+        // B3：min/max 与 window geometry 一样是双缓冲 toplevel 状态，必须在首个 commit 之前下发。
+        self.apply_size_limits(index);
+        self.apply_window_geometry(index);
         // **唯一**触发初始 configure 的 commit：必须排在所有协议对象创建之后（R10-4）。
         self.windows[self.windows.len() - 1].surface.commit();
         Ok(())
@@ -689,11 +763,17 @@ impl WaylandState {
         // 关窗时必须清空客户端合成的按键重复：之后不再有 `key` 事件（含 release），
         // `active` 又会重映射到别的窗口 ⇒ 按住键的重复会写进**另一个窗口**（复审 F5）。
         self.held_keys.clear();
-        // R10-6：只有被移除的窗口**就是** IME 焦点时才停用 —— 旧实现在这里无条件
-        // `set_ime_focus(false)`，于是关掉任意一个监控窗都会把焦点窗口的 IME 掐掉。
-        if self.text_input_route.is_focus(index as u32) {
-            self.apply_ime_target(None);
+        // R10-6：只有被移除的窗口**就是** IME 目标（已 enable 或持有键盘焦点候选）时才停用 ——
+        // 旧实现在这里无条件停用，于是关掉任意一个监控窗都会把焦点窗口的 IME 掐掉。
+        // 关窗路径不补 `ImeEvent::End`（窗口即将销毁，事件没有接收者）。
+        if self.text_input_route.is_focus(index as u32)
+            || self.text_input_route.is_keyboard_focus(index as u32)
+        {
+            self.ime_disable(false);
         }
+        // B10：configure 锁存随 `WindowSurface` 一起 drop —— 未 ack 的 serial 不再补发：
+        // surface 对象已经销毁，ack 一个不存在的对象是 `invalid_serial` 协议错误（关闭窗口
+        // 是唯一允许「丢弃 pending configure」的路径）。
         self.windows.remove(index);
         // text-input 路由存的是下标：移除之后整体前移，按位置修正（与 active 同一套规则）。
         self.text_input_route.reindex_removed(index as u32);
@@ -740,6 +820,27 @@ impl WaylandState {
                 self.bind_output(globals.registry(), global.name, global.version);
             }
         }
+    }
+
+    /// 绑定启动时已宣告的 `wp_presentation`（A4；可选扩展，缺了不报错）。
+    ///
+    /// 与 `wl_output` 一样走 `WlRegistry::bind`（`GlobalList` 已消费掉首轮 `global` 事件，
+    /// 运行期新宣告的实例由 `Dispatch<WlRegistry>` 的 `Global` 分支动态绑定）。
+    fn bind_existing_presentation(&mut self, globals: &GlobalList) {
+        let Some(global) = globals
+            .contents()
+            .clone_list()
+            .into_iter()
+            .find(|global| global.interface == "wp_presentation")
+        else {
+            return;
+        };
+        self.presentation.bind(
+            globals.registry(),
+            &self.queue_handle,
+            global.name,
+            global.version,
+        );
     }
 
     /// 动态绑定一个 `wl_output`（已绑定过的同名 global 幂等跳过）。
@@ -922,6 +1023,14 @@ impl WaylandState {
             .position(|window| window.toplevel.id() == id)
     }
 
+    /// `xdg_surface` → 窗口下标（`configure` 的 ack 必须落回**这个** surface 的锁存器，B10）。
+    fn window_index_for_xdg_surface(&self, xdg_surface: &xdg_surface::XdgSurface) -> Option<usize> {
+        let id = xdg_surface.id();
+        self.windows
+            .iter()
+            .position(|window| window.xdg_surface.id() == id)
+    }
+
     /// `wl_callback` → 窗口下标（按挂起的 `frame_callback` 对象 id 匹配）。
     fn window_index_for_callback(&self, callback: &wl_callback::WlCallback) -> Option<usize> {
         let id = callback.id();
@@ -1021,6 +1130,31 @@ impl WaylandState {
         );
     }
 
+    /// B3：把窗口当前的尺寸约束（应用 min/max + compositor `configure_bounds`）下发给
+    /// `xdg_toplevel`。
+    ///
+    /// - 同值不重复发：[`SizeConstraintState::take_pending`] 返回 `None` 表示与上次下发的
+    ///   协议参数完全一致；
+    /// - `max == None` 时发 `set_max_size(0, 0)`：协议里 0 表示「该维无上限」，正是「撤销应用
+    ///   上限 / 清除 compositor bounds」的表示；
+    /// - 调用点两个：`add_window`（首个 commit 之前）与 `configure_bounds` 变化（下一次 commit
+    ///   之前生效）。min/max 是双缓冲 toplevel 状态，本方法只排队请求，不 commit。
+    fn apply_size_limits(&mut self, index: usize) {
+        let Some(limits) = self.windows[index]
+            .size_constraints
+            .take_pending(window::SHADOW_MARGIN)
+        else {
+            return;
+        };
+        self.windows[index]
+            .toplevel
+            .set_min_size(limits.min.0, limits.min.1);
+        let (max_width, max_height) = limits.max.unwrap_or((0, 0));
+        self.windows[index]
+            .toplevel
+            .set_max_size(max_width, max_height);
+    }
+
     /// 把 `wp_viewport` 的所有权交给窗口渲染器（`Some` = fractional 模式）。
     ///
     /// 只有 `wp_viewporter` 与 `wp_fractional_scale_manager_v1` **同时**存在时才创建 viewport
@@ -1097,6 +1231,16 @@ impl WaylandState {
     }
 
     /// 开始交互式移动；使用触发拖动的指针按键 serial。
+    ///
+    /// 两个调用点，共用同一份 serial 来源（最近一次 `wl_pointer.button` 的按下 serial）：
+    ///
+    /// - `WindowControl::BeginMove`：应用**显式**请求（demo 的标题栏拖动处理器等），在
+    ///   `App::take_window_control` 消费的同一轮执行；
+    /// - **X2 拖动区**：应用通过 `Window::set_drag_regions` 声明自绘标题栏的可拖动区域，泵在
+    ///   派发事件前判定主键按下命中 ⇒ 走本方法（该次 `PointerDown` 不投递）。
+    ///
+    /// 协议语义：`xdg_toplevel.move` 只是「请 compositor 开始交互移动」的请求，之后的光标抓取、
+    /// 窗口摆放全由 compositor 驱动；compositor 可以忽略（无副作用，不是协议错误）。
     pub(crate) fn begin_move(&self, index: usize) {
         self.windows[index]
             .toplevel
@@ -1146,6 +1290,115 @@ impl WaylandState {
         self.windows[index].frame_gate.note_not_committed();
     }
 
+    /// A4：取出一个可移到 GPU 线程的呈现反馈请求句柄（建渲染器时调用一次）。
+    ///
+    /// 返回 `None` = compositor 没有 `wp_presentation`（记豁免；该窗口 `presented_at` 恒
+    /// `None`，绝不伪造）。句柄里的 `wl_surface` 是渲染器持有的同一份代理的副本：GPU 线程
+    /// 在每次 present 前直接请求 feedback，事件仍由本线程的默认队列派发。
+    pub(crate) fn presentation_handle(&mut self, index: usize) -> Option<PresentationHandle> {
+        let window = self.windows[index].id;
+        let surface = self.windows[index].surface.clone();
+        self.presentation
+            .handle(window, &self.queue_handle, surface)
+    }
+
+    /// A4：把呈现邮箱里的终态按 `FrameIndex` 回填到 `App` 的窗口呈现历史。
+    ///
+    /// 在每轮 `app.poll_renderers()` **之后**调用（完成反馈先落账，`presented` 事件后到）。
+    /// 只回填「历史里已有、且还没有 `presented_at`」的帧：presented 事件可能早于 GPU 完成
+    /// 反馈的**观测点**到达（合成器在 vblank 之后立即发事件，而 GPU 线程每 4 ms 才观测一次
+    /// timeline），此时条目还没追加，条目留在有界邮箱里下一轮再取 —— 不会丢证据，也不会把
+    /// 迟到事件记到别的帧上。
+    pub(crate) fn backfill_presentation(&self, app: &mut App) {
+        for native in &self.windows {
+            let Some(window) = app.window_mut(native.id) else {
+                continue;
+            };
+            // 历史最多 8 条（`FRAME_PRESENTATION_HISTORY`），用位置迭代避免每轮分配；
+            // `note_frame_presented` 只改 `presented_at`、不增删条目 ⇒ 位置在循环内稳定。
+            let mut position = 0;
+            loop {
+                let Some(presentation) = window.recent_frame_presentations().nth(position) else {
+                    break;
+                };
+                position += 1;
+                if presentation.presented_at.is_some() {
+                    continue;
+                }
+                let Some(outcome) = native.presentation_inbox.take(presentation.index) else {
+                    // 事件还没到 / 已被邮箱容量上限丢弃：本轮保持 None（不伪造）。
+                    continue;
+                };
+                let presented_at = match outcome {
+                    PresentationOutcome::Presented(instant) => Some(instant),
+                    PresentationOutcome::Discarded => None,
+                };
+                window.note_frame_presented(presentation.index, presented_at);
+            }
+        }
+    }
+
+    /// A4：`wp_presentation_feedback` 终态事件 → 呈现邮箱。
+    ///
+    /// - `presented`：`(tv_sec_hi, tv_sec_lo, tv_nsec)` 按 compositor 宣告的呈现时钟换算成
+    ///   `Instant`；不可信（时钟域不支持 / nsec 越界 / 偏差超限）⇒ 记豁免、**不写邮箱**
+    ///   （该帧 `presented_at` 如实保持 `None`，绝不用别的时刻顶替）；非递增的帧序号说明
+    ///   反馈绑到了更晚的提交，同样丢弃；
+    /// - `discarded`：内容是终态「没有上屏」⇒ 写 `Discarded`，回填后该帧同样是 `None`。
+    fn note_presentation_terminal(
+        &mut self,
+        data: &FeedbackData,
+        presented: Option<(u32, u32, u32)>,
+    ) {
+        // 窗口已关闭：surface 销毁时 compositor 会给所有未决反馈补 `discarded`，这是正常路径
+        // （窗口的呈现历史已随窗口销毁，没有可回填的目标）⇒ 静默忽略，不计豁免。
+        let Some(index) = self.window_index(data.window()) else {
+            return;
+        };
+        let outcome = match presented {
+            Some((tv_sec_hi, tv_sec_lo, tv_nsec)) => {
+                // 协议按提交顺序送呈现事件；不递增只可能来自反馈绑到了更晚的提交（陈旧），
+                // 宁可丢弃该条证据（本帧如实 None），也不能记到错帧。
+                if !self.windows[index].presented_order.accept(data.frame()) {
+                    self.presentation.note_unmatched_feedback();
+                    return;
+                }
+                let Some(instant) = self
+                    .presentation
+                    .presented_instant(tv_sec_hi, tv_sec_lo, tv_nsec)
+                else {
+                    // 豁免已在换算处计数；本帧没有可信的呈现时刻。
+                    return;
+                };
+                PresentationOutcome::Presented(instant)
+            }
+            None => PresentationOutcome::Discarded,
+        };
+        self.windows[index]
+            .presentation_inbox
+            .note(data.frame(), outcome);
+    }
+
+    /// B10：把该窗口待确认的 configure ack 掉（若有），返回是否真的发送了 `ack_configure`。
+    ///
+    /// 两个调用契约：
+    ///
+    /// - **帧已发布**（`App::frame` 返回 `FrameOutcome::Committed`）之后调用：此时使用该
+    ///   configure 状态渲染的帧已经交给 GPU 线程（present 时 `wl_surface.commit`），compositor
+    ///   不会再把旧内容按新几何显示 —— 这是 `ConfigureLatch` 的正常 ack 路径；
+    /// - **force 路径**（窗口不可见 / 还没建渲染器 / 本帧 `Idle` 没有 publish）调用：没有帧
+    ///   可配对，立即 ack。否则静止窗口的 configure 永远不确认，compositor 可能不完成映射 /
+    ///   状态切换（比稍早 ack 更糟）。
+    ///
+    /// 一次调用最多 ack 一个 serial；同一 serial 不会被 ack 两次（`pending` 取走即清）。
+    pub(crate) fn ack_pending_configure(&mut self, index: usize) -> bool {
+        let Some(serial) = self.windows[index].configure.on_frame_published() else {
+            return false;
+        };
+        self.windows[index].xdg_surface.ack_configure(serial);
+        true
+    }
+
     /// 可见性变化后的门禁同步（R10-7）：不可见 ⇒ 门禁直接回 Idle，不留挂起记录。
     ///
     /// 协议允许服务端在 surface 不可见时不回 `wl_frame_callback`；而**没有**任何基于时间的
@@ -1158,37 +1411,96 @@ impl WaylandState {
         }
     }
 
-    /// 把 text-input 焦点切到 `target`（`None` = 停用），按**差分**下发 `enable`/`disable`。
+    /// 键盘 / text-input 焦点进入某窗口：更新路由候选，然后按策略收敛协议状态。
     ///
-    /// 协议要求（R10-6 / R10-13）：
+    /// **不无条件 enable**（B9）：是否真的把 IME 交给该窗口由每窗口策略
+    /// （`app_enabled && text_target`）决定，见 [`Self::sync_ime_policy`]。
+    fn ime_focus_in(&mut self, index: usize) {
+        self.text_input_route.focus_in(index as u32);
+        self.sync_ime_target(true);
+    }
+
+    /// 键盘 / text-input 焦点离开某窗口：清掉候选（只清「正是这个窗口」的）并收敛状态。
+    ///
+    /// 失焦路径与「应用禁用 / 文本目标消失」共用同一个收敛点：停用时重置组合、并在真的丢弃
+    /// 组合串时补一条 [`ImeEvent::End`]（`emit_end`）。
+    fn ime_focus_out(&mut self, index: usize) {
+        self.text_input_route.focus_out(index as u32);
+        self.sync_ime_target(true);
+    }
+
+    /// 无条件停用（窗口关闭 / 键盘能力撤销）并收敛协议状态。
+    ///
+    /// `emit_end` = 是否给应用补 [`ImeEvent::End`]：关窗路径传 `false`（窗口即将销毁，事件
+    /// 没有接收者），键盘能力撤销传 `true`（窗口还在，组合必须显式结束）。
+    fn ime_disable(&mut self, emit_end: bool) {
+        let previous = self.text_input_route.focus();
+        let change = self.text_input_route.disable();
+        self.apply_ime_change(previous, change, emit_end);
+    }
+
+    /// 收敛一次：按路由当前决定 enable/disable，并下发协议动作与整份状态。
+    fn sync_ime_target(&mut self, emit_end: bool) {
+        if self.text_input.is_none() {
+            // 没有 `zwp_text_input_manager_v3`：协议对象不存在，键盘通路永远接管文本。路由不
+            // 推进，否则 [`TextInputRoute::takes_text`] 会误判「IME 已接管」而吞掉字符。
+            return;
+        }
+        let previous = self.text_input_route.focus();
+        let change = self.text_input_route.reconcile(Instant::now());
+        self.apply_ime_change(previous, change, emit_end);
+    }
+
+    /// 执行一次焦点收敛的协议动作。
+    ///
+    /// 协议要求（R10-6 / R10-13 / B9）：
     /// - 换焦点前必须先 `disable` 旧的（XML `enable`：*must disable the current text input before
     ///   enabling the new one*）；
-    /// - `done` 之前的 `set_cursor_rectangle` / `set_content_type` 都是双缓冲状态，必须
-    ///   `commit()` 才生效；
-    /// - `leave` 之后 compositor 会忽略本对象的所有请求，直到下一次 `enter` —— 所以焦点不匹配
-    ///   时**不**下发状态（由 [`TextInputRoute::focus`] 判定）。
-    fn apply_ime_target(&mut self, target: Option<usize>) {
+    /// - `disable` 之后 compositor 侧状态全部失效 ⇒ 下次 `enable` 必须整份重发
+    ///   `set_content_type` / `set_cursor_rectangle`（快照清空）；
+    /// - 组合被停用：重置批次与组合态，并且**只在真的丢弃了组合串时**补一条
+    ///   [`ImeEvent::End`]（`emit_end` 控制；收敛点唯一 ⇒ 至多一条）；
+    /// - `enable` / `disable` 本身也要 `commit()` 才生效。
+    fn apply_ime_change(
+        &mut self,
+        previous: Option<u32>,
+        change: text_input::FocusChange,
+        emit_end: bool,
+    ) {
         let Some(text_input) = self.text_input.clone() else {
             return;
-        };
-        let change = match target {
-            Some(index) => self.text_input_route.enter(index as u32, Instant::now()),
-            None => self.text_input_route.disable(),
         };
         if !change.disable && !change.enable {
             return;
         }
         if change.disable {
+            if let Some(index) = previous {
+                let ended = self.windows.get_mut(index as usize).is_some_and(|window| {
+                    let ended = window.ime.reset_ending();
+                    // disable 之后 compositor 侧状态失效 ⇒ 下次 enable 必须整份重发。
+                    window.ime_applied = None;
+                    ended
+                });
+                if ended
+                    && emit_end
+                    && let Some(window) = self.windows.get(index as usize)
+                {
+                    let id = window.id;
+                    self.events.push((id, Event::Ime(ImeEvent::End)));
+                    // 组合串消失 ⇒ 应用界面必须重绘（preedit 要被清掉）。
+                    self.redraw = true;
+                }
+            }
             text_input.disable();
         }
         if change.enable
-            && let Some(index) = target
+            && let Some(index) = self.text_input_route.focus()
         {
             text_input.enable();
             // XML `set_content_type` / `set_cursor_rectangle`：状态「保持到下一次 commit 的
             // enable/disable 为止」⇒ 新 enable 之后必须重发（快照清空）。
-            self.windows[index].ime_applied = None;
-            self.push_ime_state(index, &text_input);
+            self.windows[index as usize].ime_applied = None;
+            self.push_ime_state(index as usize, &text_input);
         }
         // `enable` / `disable` 本身也要 `commit()` 才生效（与上面的状态合成同一批）。
         text_input.commit();
@@ -1239,58 +1551,81 @@ impl WaylandState {
         true
     }
 
-    /// 保存 IME caret 区域；焦点正是这个窗口时下发（`commit` 是 v3 的生效点）。
+    /// 记录一个窗口的 caret 区域 / `content_type`，返回是否真的变化。
     ///
-    /// 有批在飞时**只记账、不提交**：协议要求 pending state 在收到匹配 serial 的 `done` 之后
-    /// 再发（AR3 §3.3），由 `done` 处理器统一回写；这同时把「一次焦点切换」的协议往返压到一轮。
-    ///
-    /// 依赖 compositor 遵守「每个 `commit()` 回一条 `done`」（协议硬要求）。违约的 compositor
-    /// 会让 caret 更新停在上一批 —— 同一条违约也意味着 `commit_string` 永远不生效（IME 文本
-    /// 根本用不了），因此这不是本状态机新引入的失效面。
-    fn set_ime_cursor_area(
+    /// 只记账、不下发：下发统一在 [`Self::sync_ime_policy`] 的收敛之后（focus 与批量状态必须
+    /// 在同一批 `commit()` 里，且 `disable` 的本轮不再发无意义的 caret）。
+    fn note_ime_state(
         &mut self,
         index: usize,
         area: Option<Rect>,
         content: crate::window::ImeContentType,
-    ) {
-        let content_changed = self.windows[index].ime_content != content;
-        self.windows[index].ime_content = content;
-        let area_changed = self.windows[index].ime_cursor_area != area;
-        self.windows[index].ime_cursor_area = area;
-        if !area_changed && !content_changed {
+    ) -> bool {
+        let window = &mut self.windows[index];
+        let changed = window.ime_content != content || window.ime_cursor_area != area;
+        window.ime_content = content;
+        window.ime_cursor_area = area;
+        changed
+    }
+
+    /// 把 `App` 的 IME 目标状态同步到 Wayland 侧并收敛协议状态（每轮泵调用一次）。
+    ///
+    /// **必须在 `event_loop.dispatch`（协议事件）之前**：本轮的应用事件与布局都已处理完，
+    /// 之后才派发键盘 / text-input 的 enter/leave —— 它们用到的就是**本轮最新**策略，不会出现
+    /// 「按旧策略先 enable、同一轮再 disable」的抖动（B9）。
+    ///
+    /// 逐窗口写入两个策略信号：
+    /// - `app_enabled` = [`App::ime_enabled`]（`App::set_ime_enabled`，默认启用）；
+    /// - `text_target` = [`App::ime_cursor_area`] 有值（应用声明的 caret hint = 焦点在可编辑
+    ///   文本上）。`Err` 表示文本尚未 shape / 刚变化，**保留上一次有效值**而不是当成「没有
+    ///   文本目标」——否则打字期间每次重排都会 disable/enable 抖动。
+    ///
+    /// 收敛（[`TextInputRoute::reconcile`]）之后再把本轮的 caret / content 变化下发给当前焦点；
+    /// 有批在飞时只记账，由匹配 serial 的 `done` 统一回写（AR3 §3.3）。
+    pub(crate) fn sync_ime_policy(&mut self, app: &App) {
+        if self.text_input.is_none() {
             return;
         }
-        // 只有当前 text-input 焦点才发请求：`leave` 之后 compositor 会忽略一切请求。
-        if self.text_input_route.focus() != Some(index as u32) {
-            return;
+        let mut changed: Vec<usize> = Vec::with_capacity(self.windows.len());
+        for index in 0..self.windows.len() {
+            let id = self.windows[index].id;
+            let content = app
+                .window(id)
+                .map_or(crate::window::ImeContentType::Text, |window| {
+                    window.ime_content_type()
+                });
+            let area = match app.ime_cursor_area(id) {
+                Ok(area) => area,
+                // 文本尚未 shape / 文本刚变化：保留上一次有效区域（与旧路径同口径）。
+                Err(_) => self.windows[index].ime_cursor_area,
+            };
+            if self.note_ime_state(index, area, content) {
+                changed.push(index);
+            }
+            // 文本目标 = 应用声明的有效 caret hint（同一 surface 内焦点移到非编辑控件时清空）。
+            self.windows[index].text_target = area.is_some();
+            self.text_input_route.set_policy(
+                index as u32,
+                app.ime_enabled(id),
+                self.windows[index].text_target,
+            );
         }
+        // 先收敛焦点：应用禁用 / 文本目标消失在这里变成 disable；enable 时整份状态随 enable 下发。
+        self.sync_ime_target(true);
+        // 已在焦点上的窗口：本轮 caret / content 变化单独下发一次；有批在飞则等 `done`。
         if self.text_input_route.commit_in_flight() {
+            return;
+        }
+        let Some(focus) = self.text_input_route.focus() else {
+            return;
+        };
+        if !changed.contains(&(focus as usize)) {
             return;
         }
         let Some(text_input) = self.text_input.clone() else {
             return;
         };
-        self.flush_ime_state(index, &text_input);
-    }
-
-    /// 从 `App` 同步指定窗口的 IME caret 区域与 `content_type`（每轮泵逐窗口调用）。
-    ///
-    /// 独立于帧门禁：候选窗定位与密码框语义不能等下一帧。
-    pub(crate) fn sync_ime_cursor_area(&mut self, app: &App, window: crate::window::WindowId) {
-        let Some(index) = self.window_index(window) else {
-            return;
-        };
-        let content = app
-            .window(window)
-            .map_or(crate::window::ImeContentType::Text, |window| {
-                window.ime_content_type()
-            });
-        let area = match app.ime_cursor_area(window) {
-            Ok(area) => area,
-            // 文本尚未 shape / 文本刚变化：保留上一次有效区域（但 `content_type` 仍要更新）。
-            Err(_) => self.windows[index].ime_cursor_area,
-        };
-        self.set_ime_cursor_area(index, area, content);
+        self.flush_ime_state(focus as usize, &text_input);
     }
 
     /// 无输入法守护进程时的降级判定（R10-2）；返回 `true` ⇒ 文本通路已切回键盘。
@@ -1367,6 +1702,23 @@ impl WaylandState {
     /// 协议只保证单调、原点未定义，无法与 `Instant` 对齐（P3-4：旧注释写成「事件时刻」，
     /// 与调用点 `Instant::now()` 相反）。
     /// `repeat` 由调用方明确给出（R02-2）：真实按下为 `false`，客户端合成的重复为 `true`。
+    ///
+    /// # 组合期不投递裸键（B4）
+    ///
+    /// macOS 在 `keyDown:` 里能**同步**拿到 `inputContext.handleEvent` 的权威消费标记，Win32
+    /// 在组合期把按键换成 `VK_PROCESSKEY`；Wayland 两者都没有 —— `zwp_text_input_v3` 的结果是
+    /// **异步批次**（`done` 之后才生效），按键到达时客户端无法知道这一键是否会被输入法消费。
+    /// 因此判据只能取**已有 preedit**（`WindowSurface::ime` 的 `composing()`），可见性判定在
+    /// [`crate::platform::wayland::input::key_visible_while_composing`]（Windows 可单测）：
+    /// 组合中的裸 `Key` 不投递（否则组合里的字母/数字会命中应用的裸键绑定）；带
+    /// Ctrl/Alt/Meta 的命令组合始终投递（`Ctrl+W` 不能被吞），Shift 不算命令修饰键。
+    ///
+    /// **残余风险（与 audit §4 一致）**：首键启动组合时 preedit 尚不存在 ⇒ 该键仍会以裸
+    /// `Key` 投递一次。协议不提供同步的消费信号，客户端无法消除这个竞态；文本/IME 通路
+    /// （`Text` 走 `should_emit_text` + `TextInputRoute::takes_text()`，B9）不受影响。
+    ///
+    /// `composing` **必须**在 push `Key` 之前取：旧实现取在 push 之后，于是组合期的裸键
+    /// 无论 preedit 状态如何都先被投递（本项修复的核心偏差）。
     fn translate_key(&mut self, key: u32, state: KeyState, repeat: bool, timestamp: Instant) {
         let Some(xkb_state) = self.xkb_state.as_mut() else {
             return;
@@ -1377,17 +1729,22 @@ impl WaylandState {
         let keycode = xkb::Keycode::new(key);
         // seat 事件没有 surface 归属：派发给**焦点窗口**（active）。
         let window = self.windows[self.active].id;
-        self.events.push((
-            window,
-            Event::Input(InputEvent::Key {
-                // R02-1：物理键身份取自 **evdev 码**（布局无关），不是 keysym（布局相关）。
-                code: key_code(key.saturating_sub(8)),
-                state,
-                repeat,
-                modifiers: self.modifiers,
-                timestamp,
-            }),
-        ));
+        // B4：先取组合态，再按可见性决定是否投递裸 `Key`（首键启动组合的残余风险见函数文档）。
+        // RB-02：抬起始终投递（`App::held_keys` 只由 Up 清除；组合期吞 up 会让 held 永久残留）。
+        let composing = self.windows[self.active].ime.composing();
+        if input::key_delivered(state, self.modifiers, composing) {
+            self.events.push((
+                window,
+                Event::Input(InputEvent::Key {
+                    // R02-1：物理键身份取自 **evdev 码**（布局无关），不是 keysym（布局相关）。
+                    code: key_code(key.saturating_sub(8)),
+                    state,
+                    repeat,
+                    modifiers: self.modifiers,
+                    timestamp,
+                }),
+            ));
+        }
         // R10-2：文本是否**只**走 IME 由 `TextInputRoute` 决定 —— `enable` 之后 1.5 s 内没有
         // 任何 IM 事件就降级回键盘通路（否则没有输入法守护进程的 compositor 上字符输入全灭）。
         // 组合态（preedit 非空）里物理按键不产生正文：组合串由 `ImeEvent::Preedit` 表达。
@@ -1396,7 +1753,6 @@ impl WaylandState {
         // （服务端从不重发 `key` 事件），字符文本也只能由客户端按每次重复生成；旧实现写成
         // `!repeat` ⇒ 在默认的 XKB 回退通路里按住可打印键只输入一个字符。判据统一走
         // `should_emit_text`（含单测），`repeat` 只影响绑定/动作派发。
-        let composing = self.windows[self.active].ime.composing();
         let ime_takes_text = self.text_input_route.takes_text();
         // R10-5：Ctrl / Alt / Super 组合不产生字符（`key_get_utf8` 不看这些修饰键，
         // `Ctrl+C` 会拿到 "c"）。Shift 与 AltGr（Mod5，`Modifiers` 无对应位）不受影响。
@@ -1518,17 +1874,6 @@ impl WaylandState {
         }
     }
 
-    fn pointer_button(button: u32) -> Option<PointerButton> {
-        match button {
-            0x110 => Some(PointerButton::Primary),
-            0x111 => Some(PointerButton::Middle),
-            0x112 => Some(PointerButton::Secondary),
-            0x113 => Some(PointerButton::X1),
-            0x114 => Some(PointerButton::X2),
-            _ => None,
-        }
-    }
-
     /// 把已排队的协议事件分发进 handler（`initial_roundtrip` 与首帧之前调用）。
     fn dispatch_pending(
         &mut self,
@@ -1599,7 +1944,7 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandState {
         event: wl_registry::Event,
         _: &GlobalListContents,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        queue: &QueueHandle<Self>,
     ) {
         match event {
             // `wl_output` 是热插拔的多实例 global：新出现的实例动态绑定（热插拔显示器）。
@@ -1611,8 +1956,17 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandState {
                 if interface == "wl_output" {
                     state.bind_output(registry, name, version);
                 }
+                // A4：`wp_presentation` 通常与其它 global 一起在首轮宣告（启动时由
+                // `bind_existing_presentation` 绑定）；这里覆盖「启动之后才宣告」的情形。
+                // `bind` 幂等（已绑定 / 已存在时忽略）。
+                if interface == "wp_presentation" {
+                    state.presentation.bind(registry, queue, name, version);
+                }
             }
-            wl_registry::Event::GlobalRemove { name } => state.unbind_output(name),
+            wl_registry::Event::GlobalRemove { name } => {
+                state.unbind_output(name);
+                state.presentation.unbind(name);
+            }
             _ => {}
         }
     }
@@ -1654,6 +2008,50 @@ dispatch_unit!(
     WpCursorShapeManagerV1,
     WpCursorShapeDeviceV1,
 );
+
+impl Dispatch<wp_presentation::WpPresentation, ()> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _: &wp_presentation::WpPresentation,
+        event: wp_presentation::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // 呈现时钟域只在 bind 之后发一次（连接生命周期内不变）；记下来供 feedback 时间戳换算。
+        if let wp_presentation::Event::ClockId { clk_id } = event {
+            state.presentation.note_clock_id(clk_id);
+        }
+    }
+}
+
+impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, FeedbackData> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _: &wp_presentation_feedback::WpPresentationFeedback,
+        event: wp_presentation_feedback::Event,
+        data: &FeedbackData,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            // `presented` / `discarded` 都是 destructor 事件：一条反馈恰好一个终态，处理完
+            // 对象由 wayland-client 自动销毁（不需要也不存在 `destroy` 请求）。
+            wp_presentation_feedback::Event::Presented {
+                tv_sec_hi,
+                tv_sec_lo,
+                tv_nsec,
+                ..
+            } => state.note_presentation_terminal(data, Some((tv_sec_hi, tv_sec_lo, tv_nsec))),
+            wp_presentation_feedback::Event::Discarded => {
+                state.note_presentation_terminal(data, None);
+            }
+            // `sync_output` 只指出同步到哪块 output；`refresh` / `seq` / `flags` 是辅助预测，
+            // 本帧证据只用呈现时间戳。都不影响 `presented_at`。
+            _ => {}
+        }
+    }
+}
 
 impl Dispatch<wl_output::WlOutput, u32> for WaylandState {
     fn event(
@@ -1803,7 +2201,7 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for WaylandState {
 
 impl Dispatch<xdg_surface::XdgSurface, ()> for WaylandState {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         xdg_surface: &xdg_surface::XdgSurface,
         event: xdg_surface::Event,
         _: &(),
@@ -1811,7 +2209,18 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for WaylandState {
         _: &QueueHandle<Self>,
     ) {
         if let xdg_surface::Event::Configure { serial } = event {
-            xdg_surface.ack_configure(serial);
+            // 归属**按对象解析**：ack 必须落回这个 surface 自己的锁存器（多窗口下不能靠
+            // `active`，同 `wl_callback` 的纪律）。
+            let Some(index) = state.window_index_for_xdg_surface(xdg_surface) else {
+                return;
+            };
+            // B10：初始 configure 立即 ack（协议：不 ack 不能 attach buffer 映射）；尺寸/状态
+            // 变化的 configure 只记账，等使用该状态渲染的帧发布后由泵 `ack_pending_configure`
+            // 发送（Qt `applyConfigureWhenPossible` 式）。
+            match state.windows[index].configure.on_surface_configure(serial) {
+                AckAction::AckNow => xdg_surface.ack_configure(serial),
+                AckAction::Defer => {}
+            }
         }
     }
 }
@@ -1836,6 +2245,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandState {
                 states,
             } => {
                 let previous = state.windows[index].size;
+                let previous_states = state.windows[index].states;
                 // 0 = 「客户端自己选」；否则用 compositor 给的建议尺寸。
                 if width > 0 && height > 0 {
                     state.windows[index].size = Size::new(width as f32, height as f32);
@@ -1845,7 +2255,13 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandState {
                 let was_configured = state.windows[index].configured;
                 state.windows[index].configured = true;
                 let size = state.windows[index].size;
+                let states_now = state.windows[index].states;
                 let window = state.windows[index].id;
+                // B10：只有**改变 buffer 状态**（尺寸 / 窗口 states）的 configure 才需要等新帧
+                // 再 ack；wm_capabilities / configure_bounds 不经过这里（它们没有重画需求）。
+                state.windows[index]
+                    .configure
+                    .on_toplevel_configure(size != previous || states_now != previous_states);
                 // R10-10：window geometry 随尺寸变化更新（与下一次 commit 一同生效）。
                 state.apply_window_geometry(index);
                 // R10-18：`xdg_toplevel.configure` 在任何状态变化时都会来（焦点、平铺、resize），
@@ -1870,20 +2286,13 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandState {
                 }
             }
             xdg_toplevel::Event::ConfigureBounds { width, height } => {
-                // R10-15：建议的尺寸上限（扣掉面板等区域）。落成 `set_max_size`，
-                // 避免最大化时向 compositor 请求超出可用工作区的尺寸。
-                if width > 0 && height > 0 {
-                    let bounds = Size::new(width as f32, height as f32);
-                    if state.windows[index].bounds != Some(bounds) {
-                        state.windows[index].bounds = Some(bounds);
-                        state.windows[index].toplevel.set_max_size(
-                            bounds.width.round() as i32,
-                            bounds.height.round() as i32,
-                        );
-                    }
-                } else {
-                    state.windows[index].bounds = None;
-                }
+                // R10-15 / B3：compositor 建议的**尺寸上限**（扣掉面板等区域；0×0 = 无建议上限）。
+                // 它与应用 `max_size` 逐维取最小后才是 `set_max_size` 的参数 —— 旧实现直接拿
+                // bounds 覆盖应用上限，应用显式设置的 max 会被静默放大（审计 §3）。
+                state.windows[index].size_constraints.set_bounds(
+                    (width > 0 && height > 0).then(|| Size::new(width as f32, height as f32)),
+                );
+                state.apply_size_limits(index);
             }
             xdg_toplevel::Event::Close => {
                 state.windows[index].close_requested = true;
@@ -2011,8 +2420,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                 state
                     .events
                     .push((window, Event::FocusChanged { focused: true }));
-                // R10-6：IME 焦点跟随键盘焦点（zwp_text_input_v3.enter 到达后会被去重成 no-op）。
-                state.apply_ime_target(Some(index));
+                // R10-6：IME 焦点跟随键盘焦点（策略判定见 `sync_ime_policy`，B9：非编辑焦点
+                // 不再无条件 enable）。
+                state.ime_focus_in(index);
             }
             wl_keyboard::Event::Leave { surface, .. } => {
                 // 失焦后不再有 `wl_keyboard.key`（含 release）到达：必须**主动清空**按住键，
@@ -2031,10 +2441,8 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                 state
                     .events
                     .push((window, Event::FocusChanged { focused: false }));
-                // R10-6：只有失焦的正是当前 IME 焦点时才停用（差分下发在 apply_ime_target）。
-                if state.text_input_route.is_focus(index as u32) {
-                    state.apply_ime_target(None);
-                }
+                // R10-6 / B9：失焦收敛到同一个 disable 点（组合被丢弃时补 `End`）。
+                state.ime_focus_out(index);
             }
             _ => {}
         }
@@ -2104,7 +2512,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 state: button_state,
                 ..
             } => {
-                if let Some(button) = Self::pointer_button(button) {
+                if let Some(button) = input::pointer_button(button) {
                     let timestamp = Instant::now();
                     let event = match button_state {
                         wayland_client::WEnum::Value(wl_pointer::ButtonState::Pressed) => {
@@ -2138,22 +2546,31 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
             }
             wl_pointer::Event::Axis { axis, value, .. } => {
                 // 连续值（触控板即像素；v5 起滚轮一格 = 10 个单位）。**不能**除 120 ——
-                // 那是 `axis_value120` 的量纲（P1-2.11）。
-                match axis {
-                    wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll) => {
-                        state.scroll.continuous_x += value as f32;
-                    }
-                    _ => state.scroll.continuous_y += value as f32,
-                }
+                // 那是 `axis_value120` 的量纲（P1-2.11）。单位换算在纯逻辑层
+                // （`scroll::ScrollAccum`）：滚轮连续值按 10 单位/行，手指按 1:1 像素。
+                let axis = if matches!(
+                    axis,
+                    wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll)
+                ) {
+                    ScrollAxis::Horizontal
+                } else {
+                    ScrollAxis::Vertical
+                };
+                state.scroll.note_continuous(axis, value as f32);
             }
             wl_pointer::Event::AxisValue120 { axis, value120 } => {
                 // v8+ 的高精度离散步长：1/120 行，与 Win32 的 `WHEEL_DELTA = 120` 同量纲。
-                match axis {
-                    wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll) => {
-                        state.scroll.discrete_x = state.scroll.discrete_x.saturating_add(value120);
-                    }
-                    _ => state.scroll.discrete_y = state.scroll.discrete_y.saturating_add(value120),
-                }
+                // 它与同帧的连续 `axis` 是**同一次物理滚动**的两种表示，累积器按轴二选一
+                // （B8：相加会让一格滚轮变成两行）。
+                let axis = if matches!(
+                    axis,
+                    wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll)
+                ) {
+                    ScrollAxis::Horizontal
+                } else {
+                    ScrollAxis::Vertical
+                };
+                state.scroll.note_discrete(axis, value120);
             }
             wl_pointer::Event::AxisStop { .. } => {
                 // 一次连续手势结束：补一条 `phase = End` 的空增量事件，引擎据此结束惯性/动画
@@ -2174,14 +2591,15 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
             }
             wl_pointer::Event::Frame => {
                 // 一次 frame = 一批同属一个逻辑输入的指针事件 ⇒ 只产出一个 Scroll。
-                // 未实现 `axis_value120` 的服务端（v8 以下）只会来连续 `axis`，两条通路在此合并。
+                // v8+ 服务端对滚轮会同时发连续 `axis` 与离散 `axis_value120`；两者是同一格
+                // 滚动的两种表示，`ScrollAccum` 按轴二选一（B8：相加会一格 = 两行）。
                 if !state.scroll.is_empty() {
                     // 手指（触控板）：连续值就是像素增量，1:1 跟随；滚轮：换算成行。
                     let (delta_x, delta_y) = if state.scroll_finger {
-                        let (x, y) = state.scroll.continuous_pixels();
+                        let (x, y) = state.scroll.finger_pixels();
                         (-x, -y)
                     } else {
-                        let (x, y) = state.scroll.lines();
+                        let (x, y) = state.scroll.wheel_lines();
                         (-x, -y)
                     };
                     state.scroll.clear();
@@ -2315,17 +2733,17 @@ impl Dispatch<ZwpTextInputV3, ()> for WaylandState {
                 let Some(index) = state.window_index_for_surface(&surface) else {
                     return;
                 };
-                state.apply_ime_target(Some(index));
+                // 只更新候选：是否 enable 由策略（应用开关 × caret hint）决定，B9。
+                state.ime_focus_in(index);
             }
             zwp_text_input_v3::Event::Leave { surface } => {
                 let Some(index) = state.window_index_for_surface(&surface) else {
                     return;
                 };
-                // XML：`The client should reset any preedit string previously set`。
+                // 先收敛（正是 IME 目标时 disable，组合被丢弃则补 `End`），再按 XML 兜底：
+                // `The client should reset any preedit string previously set`。
+                state.ime_focus_out(index);
                 state.windows[index].ime.reset();
-                if state.text_input_route.is_focus(index as u32) {
-                    state.apply_ime_target(None);
-                }
             }
             zwp_text_input_v3::Event::PreeditString {
                 text,
@@ -2474,7 +2892,7 @@ pub(crate) fn create_devices(state: &mut WaylandState) -> Result<(), EngineError
         state.held_keys.clear();
         if let Some(keyboard) = state.keyboard.take() {
             // IME 焦点也随键盘一起失效（没有键盘就没有文本焦点）。
-            state.apply_ime_target(None);
+            state.ime_disable(true);
             if keyboard.version() >= 3 {
                 keyboard.release();
             }
@@ -2687,67 +3105,11 @@ fn key_code(evdev: u32) -> KeyCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CONTINUOUS_AXIS_UNITS_PER_LINE, KeyRepeat, ScrollAccum, choose_integer_scale, key_code,
-        refresh_hz_from_millihz, scroll_event,
-    };
+    use super::{KeyRepeat, choose_integer_scale, key_code, refresh_hz_from_millihz, scroll_event};
     use crate::{
         event::{KeyCode, Modifiers, ScrollPhase, ScrollUnit},
         math::Point,
     };
-
-    /// P1-2.11：`axis_value120` 是 1/120 行，一格（120）= 整整一行。
-    ///
-    /// 旧实现把连续的 `axis`（一格 10–15 个单位）除以 120，于是滚轮慢约一个数量级。
-    #[test]
-    fn discrete_scroll_is_one_line_per_120_units() {
-        let one_notch = ScrollAccum {
-            discrete_y: 120,
-            ..ScrollAccum::default()
-        };
-        assert_eq!(one_notch.lines().1, 1.0, "一格 = 120/120 = 1 行");
-
-        let two_notches = ScrollAccum {
-            discrete_y: 240,
-            ..ScrollAccum::default()
-        };
-        assert_eq!(two_notches.lines().1, 2.0, "两格 = 2 行");
-    }
-
-    /// 连续 `axis`（滚轮一格 = 10 个单位）也必须得到 1 行，而不是 10/120 ≈ 0.083 行。
-    #[test]
-    fn continuous_scroll_uses_the_documented_unit() {
-        let one_notch = ScrollAccum {
-            continuous_y: CONTINUOUS_AXIS_UNITS_PER_LINE,
-            ..ScrollAccum::default()
-        };
-        assert_eq!(
-            one_notch.lines().1,
-            1.0,
-            "一格连续值 = 1 行（旧实现是 0.083）"
-        );
-    }
-
-    /// 两条通路在同一 frame 内叠加（服务端可能同时发 `axis` 与 `axis_value120`）。
-    #[test]
-    fn both_axis_paths_accumulate() {
-        let mixed = ScrollAccum {
-            discrete_x: 60,
-            continuous_x: CONTINUOUS_AXIS_UNITS_PER_LINE,
-            ..ScrollAccum::default()
-        };
-        assert_eq!(mixed.lines().0, 1.5, "0.5 行离散 + 1 行连续");
-    }
-
-    #[test]
-    fn an_empty_accumulator_reports_empty() {
-        let mut scroll = ScrollAccum::default();
-        assert!(scroll.is_empty());
-        scroll.continuous_y = -3.0;
-        assert!(!scroll.is_empty());
-        scroll.clear();
-        assert!(scroll.is_empty(), "clear 之后必须回到空态");
-    }
 
     /// `repeat_info` 的 `rate == 0` = 服务端要求关闭重复。
     #[test]
@@ -2938,16 +3300,5 @@ mod tests {
         assert_eq!(key_code(172), KeyCode::BrowserHome);
         assert_eq!(key_code(158), KeyCode::BrowserBack);
         assert_eq!(key_code(159), KeyCode::BrowserForward);
-    }
-
-    /// `ScrollAccum` 的像素通路（触控板 1:1 跟随）与行通路互相独立。
-    #[test]
-    fn continuous_pixels_are_not_converted_to_lines() {
-        let touchpad = ScrollAccum {
-            continuous_y: -24.0,
-            ..ScrollAccum::default()
-        };
-        assert_eq!(touchpad.continuous_pixels().1, -24.0);
-        assert_eq!(touchpad.lines().1, -2.4);
     }
 }

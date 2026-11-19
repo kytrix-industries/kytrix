@@ -28,6 +28,11 @@
 //!
 //! WSI 线程模型（§7.5）：`vkCreateWaylandSurfaceKHR` 创建的 WSI 私有 `wl_event_queue` 完全由
 //! Mesa 内部 dispatch；应用只 dispatch 自己的默认队列（calloop 的 `WaylandSource`）。
+//!
+//! A4 呈现证据：GPU 线程在**每次 present 之前**用 `PresentationHandle` 创建
+//! `wp_presentation_feedback`（帧序号写进 user data，见 `run_gpu_loop` 的调用点注释）；终态
+//! 事件由 UI 线程的默认队列派发，经平台层换算后回填窗口呈现历史。见
+//! `platform/linux/presentation.rs` 的模块文档（为什么必须在 GPU 线程、为什么不能放 UI 线程）。
 
 use std::{
     collections::VecDeque,
@@ -56,6 +61,7 @@ use crate::{
         atlas::{AtlasKind, MAX_IMAGE_PAGES},
         color::Color,
     },
+    platform::linux::presentation::PresentationHandle,
     render::{
         DirtyRects, RenderStats,
         color::background_linear,
@@ -106,6 +112,9 @@ impl Renderer {
     /// `wp_viewport`（`None` = 整数回退，见 V-110）：GPU 线程在 present 前用它写逻辑尺寸，
     /// destination 与 buffer 必须同一次生效（D1 / D2）。`surface` 是同一个 `wl_surface` 的代理
     /// 副本，GPU 线程在 present 前用它写整数回退的 `set_buffer_scale`。
+    /// `presentation` 是 A4 的呈现反馈请求句柄（`None` = compositor 没有 `wp_presentation`）：
+    /// GPU 线程在**每次 present 之前**用它创建 `wp_presentation_feedback`，帧序号直接写进
+    /// user data（时序论证见 `platform/linux/presentation.rs` 的模块文档）。
     ///
     /// # Errors
     /// 设备 / swapchain 创建失败，或 GPU 线程无法启动（`AppInit`）。
@@ -116,6 +125,7 @@ impl Renderer {
         background: Color,
         viewport: Option<WpViewport>,
         surface: wl_surface::WlSurface,
+        presentation: Option<PresentationHandle>,
     ) -> Result<Self, EngineError> {
         let gpu = GpuRenderer::new_for_surface(
             display,
@@ -126,7 +136,7 @@ impl Renderer {
             surface,
         )?;
         Ok(Self {
-            target: RenderTarget::Window(WindowRenderer::new(gpu, size)?),
+            target: RenderTarget::Window(WindowRenderer::new(gpu, size, presentation)?),
             error: None,
         })
     }
@@ -365,7 +375,11 @@ struct WindowRenderer {
 }
 
 impl WindowRenderer {
-    fn new(gpu: GpuRenderer, size: (u32, u32)) -> Result<Self, EngineError> {
+    fn new(
+        gpu: GpuRenderer,
+        size: (u32, u32),
+        presentation: Option<PresentationHandle>,
+    ) -> Result<Self, EngineError> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::new()),
             work: Condvar::new(),
@@ -374,7 +388,7 @@ impl WindowRenderer {
         let worker = Arc::clone(&shared);
         let thread = thread::Builder::new()
             .name("kytrix-vulkan".to_owned())
-            .spawn(move || gpu_loop(gpu, worker))
+            .spawn(move || gpu_loop(gpu, worker, presentation))
             .map_err(|error| EngineError::AppInit {
                 detail: format_smolstr!("spawn kytrix-vulkan thread: {error}"),
             })?;
@@ -424,8 +438,10 @@ impl WindowRenderer {
             return Ok(None);
         };
         // 共享契约（`render/frame.rs`）：`presented_at` 要么是**可信**的上屏时刻（A4 数据面：
-        // `wp_presentation_feedback.presented` 的呈现时钟；生产接线尚未启用 ⇒ 当前恒为 `None`），
-        // 要么如实为 `None`；绝不允许用完成时刻顶替。
+        // `wp_presentation_feedback.presented` 的呈现时钟），要么如实为 `None`；绝不允许用
+        // 完成时刻顶替。Linux 的呈现事件在 **UI 线程**异步到达，由平台层
+        // （`platform/linux/presentation.rs`）回填到窗口呈现历史，不经过本反馈槽
+        // （`drain_completed` 恒发布 `None`，见那里的注释）。
         debug_assert!(
             feedback.presentation_is_consistent(),
             "presented_at must be a trustworthy on-screen instant or None"
@@ -799,7 +815,7 @@ struct SubmittedFrame {
 }
 
 /// GPU 线程主循环（§7.3）。
-fn gpu_loop(renderer: GpuRenderer, shared: Arc<Shared>) {
+fn gpu_loop(renderer: GpuRenderer, shared: Arc<Shared>, presentation: Option<PresentationHandle>) {
     enter_gpu_thread();
     // panic 出路：展开时把错误交给 UI（`poll` 不会静默停摆）。
     let guard = PanicGuard::new(Arc::clone(&shared));
@@ -813,6 +829,7 @@ fn gpu_loop(renderer: GpuRenderer, shared: Arc<Shared>) {
             .expect("renderer is present until teardown"),
         &shared,
         &mut submitted,
+        presentation.as_ref(),
     ) {
         shared.publish_error(error);
     }
@@ -825,10 +842,15 @@ fn run_gpu_loop(
     renderer: &mut GpuRenderer,
     shared: &Shared,
     submitted: &mut VecDeque<SubmittedFrame>,
+    presentation: Option<&PresentationHandle>,
 ) -> Result<(), EngineError> {
     // 已从最新帧槽取出、但还没产生 GPU 工作的帧。`NOT_READY` / `OUT_OF_DATE` 时**保留**它：
     // 丢掉会把它的 damage 一起丢掉（persist 里那块像素永远不会被补画，I5）。
     let mut pending: Option<FrameRequest> = None;
+    // A4：已经请求过呈现反馈的帧序号。`Retry`（acquire 超时 / OUT_OF_DATE）会保留待画帧并
+    // 重试同一序号 —— 反馈对象只在**第一次**尝试前请求一次，重试不得重复创建（否则一次
+    // commit 会出多条反馈；邮箱按帧去重能兜住，但没必要多占服务端对象）。
+    let mut feedback_requested: Option<FrameIndex> = None;
     // 已从共享槽取走、但还没录进命令列表的图集上传（按 `AtlasKind`）。`Retry` 帧不清共享槽
     // 标志，否则 UI 的下一笔会覆盖这一笔（DEVIATIONS F-211）。
     let mut atlas_awaiting = [false; 2];
@@ -884,6 +906,20 @@ fn run_gpu_loop(
         if frame.is_idle() {
             pending = None;
             continue;
+        }
+        // A4：呈现反馈必须在 present（= `wl_surface.attach/commit`）**之前**请求 ——
+        // `wp_presentation.feedback` 绑定的是该 surface 的**下一次** commit，而本线程是唯一
+        // 的提交者（Vulkan WSI）。请求先入 libwayland 的发送缓冲，`submit_frame` 随后的
+        // attach/commit 排在它后面（同一 `wl_display` 的发送缓冲由 libwayland 互斥锁保序），
+        // 帧序号随 user data 过线，终态事件到达时直接知道是哪一帧。
+        //
+        // 只按帧序号请求一次：`Retry`（acquire 超时 / OUT_OF_DATE）会保留待画帧并重试同一
+        // 序号，重试不得重复创建对象（一次 commit 会出多条反馈）。
+        if let Some(handle) = presentation
+            && feedback_requested != Some(request.index)
+        {
+            handle.request_feedback(request.index);
+            feedback_requested = Some(request.index);
         }
         match renderer.submit_frame(request, &mut frame)? {
             Submitted::Presented {
@@ -959,10 +995,11 @@ fn drain_completed(
             // UI 发布 → GPU 完成（HUD 的 publish→present）。
             latency: completed_at.saturating_duration_since(frame.published_at),
             // A4：Linux 的 presented_at 来源是 `wp_presentation_feedback.presented`（呈现时钟
-            // 时间戳）。纯逻辑（`presented_event_instant` / `PresentationInbox`）已在
-            // `render::present_evidence` 落地并有本机单测，但平台层（`wp_presentation` 全局绑定、
-            // 每次 present 前 feedback 请求、事件派发）尚未接线 —— 生产路径如实留空 `None`，
-            // **不拿 GPU 完成时刻顶替**（那会让 HUD / e2e 的上屏延迟变成假数据）。
+            // 时间戳）。事件在 **UI 线程**派发、比本完成反馈更晚到达，由平台层
+            // （`platform/linux/presentation.rs` 绑定与换算 → `surface.rs` 的 Dispatch →
+            // 邮箱 → 泵回填 `Window::note_frame_presented`）异步写入窗口呈现历史。GPU 线程的
+            // 完成反馈槽**恒为 `None`**：不拿 GPU 完成时刻顶替（那会让 HUD / e2e 的上屏延迟
+            // 变成假数据）。
             presented_at: None,
         });
     }

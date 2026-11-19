@@ -5,7 +5,7 @@ use super::{
     frame::frame_reaches_gpu, surface::covering_surface,
 };
 use crate::{
-    math::{PhysicalRect, Scale, Size},
+    math::{PhysicalRect, Rect, Scale, Size},
     node::dirty::DirtyFlags,
     paint::color::Color,
     render::compositor::{DamageRects, Plan},
@@ -59,12 +59,43 @@ fn window_options_default_values() {
     assert_eq!(options.title, "");
     assert_eq!(options.size.width, 800.0);
     assert_eq!(options.size.height, 600.0);
+    assert_eq!(
+        options.position, None,
+        "默认位置由平台决定（Windows 屏幕中央附近 / macOS 级联 / Wayland compositor）"
+    );
+    assert_eq!(options.min_size, None, "默认无最小尺寸约束");
+    assert_eq!(options.max_size, None, "默认无最大尺寸约束");
+    assert_eq!(options.owner, None, "默认没有 owner（独立顶层窗口）");
+    assert!(!options.modal, "默认不是模态窗口");
+    assert!(!options.always_on_top, "默认不置顶");
     assert_eq!(options.scale, Scale::ONE);
     assert_eq!(
         options.background,
         Color::BLACK,
         "默认背景必须是不透明黑（Color::default() 是透明）"
     );
+}
+
+#[test]
+fn drag_regions_are_stored_and_cleared_by_an_empty_slice() {
+    let mut window = window();
+    assert!(window.drag_regions().is_empty(), "默认没有拖动区");
+
+    let strip = Rect::new(0.0, 0.0, 800.0, 38.0);
+    let handle = Rect::new(0.0, 38.0, 800.0, 8.0);
+    window.set_drag_regions(&[strip, handle]);
+    assert_eq!(
+        window.drag_regions(),
+        &[strip, handle],
+        "区域按逻辑窗口坐标原样保存（含顺序）"
+    );
+
+    // 同值重复设置不改变任何东西（调用方可每帧无条件刷新）。
+    window.set_drag_regions(&[strip, handle]);
+    assert_eq!(window.drag_regions(), &[strip, handle]);
+
+    window.set_drag_regions(&[]);
+    assert!(window.drag_regions().is_empty(), "空切片 = 清空拖动区");
 }
 
 #[test]

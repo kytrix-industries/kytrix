@@ -9,20 +9,28 @@
 //!    进入时会再取一次 `GWLP_USERDATA` 并构造 `&mut WndProcState` —— 两个活跃 `&mut` 是别名
 //!    UB。因此会重入的调用一律放在**短借用之间**：先算出命令/纯数据，释放借用，执行，再
 //!    短借用写回（IME 的 [`ime::ImeCommand`] 就是这个形状）。
-//! 2. **非客户区全部交系统**（R07-2）：`WM_NCCALCSIZE` / `WM_NCHITTEST` /
-//!    `WM_NCLBUTTONDOWN` 都不改写。命中码、边框几何、缩放光标，以及 caption 的 move 模态
-//!    循环与 8 个命中码的 size 模态循环都由系统提供（Aero Snap、Win11 Snap Layouts、
-//!    双击边框、`Alt+Space` → 大小、拖动中跨屏 DPI 全部免费；Chrome / Qt / GPUI 同款）。
+//! 2. **非客户区全部交系统**（R07-2）：`WM_NCCALCSIZE` / `WM_NCLBUTTONDOWN` 不改写，
+//!    `WM_NCHITTEST` 也只在**自绘标题栏拖动区**（X2，`drag_regions` 命中）时返回
+//!    `HTCAPTION`，其余仍交 `DefWindowProcW`。命中码、边框几何、缩放光标，以及 caption 的
+//!    move 模态循环与 8 个命中码的 size 模态循环都由系统提供（Aero Snap、Win11 Snap
+//!    Layouts、双击边框、`Alt+Space` → 大小、拖动中跨屏 DPI 全部免费；Chrome / Qt / GPUI
+//!    同款）。拖动区返回 `HTCAPTION` 走的就是同一条系统 move 模态循环。
 //!
 //!    size 模态循环期间泵的 ④ 不运行，但重排 + 重绘没有停：系统把 `WM_SIZE` 同步分派到本
 //!    函数，`WM_ENTERSIZEMOVE` 之后每一条 `WM_SIZE` 都由
 //!    [`super::resize::ResizeFrameDriver`] 直接驱动一帧真实帧（与 Qt 在 `WM_SIZE` 里同步
 //!    布局 / 重绘、Chrome 在每个 size 步 `SetScaleAndSize` 之后合成同构）。
+//!
+//!    **move 模态循环（拖动标题栏，B1）没有 `WM_SIZE`**：它唯一的出帧入口是
+//!    `WM_APP_FRAME_WAKE`（tokio 回投 / 行情写入 / 帧节拍都只 `Dispatcher::wake`）。泵的 ④ 同样
+//!    停摆，所以本函数在**全局** `Dispatcher::in_modal_loop()` 为真时把这条消息变成一步
+//!    [`super::resize::ModalTick`]（drain 任务 → `run_frame_hook` → 全部窗口 `App::frame`）。
+//!    不看本窗口的 `size_move`：唤醒目标是 attach 首窗，被拖窗口不一定是它。模态循环外这条
+//!    消息**保持原语义**（只返回，由泵的 ④ 统一出帧）。
 
 use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
     Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT, ScreenToClient},
-    System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
     UI::{
         Input::KeyboardAndMouse::{
             GetKeyState, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_LBUTTON, VK_MBUTTON,
@@ -37,10 +45,13 @@ use super::{
     pump::{A11Y_TIMER_ID, cursor_handle, message_ticks},
     recovery,
 };
-use crate::platform::{
-    dispatcher::{WM_APP_COMPOSITION_WAKE, WM_APP_FRAME_WAKE},
-    event::{PlatformEvent, StampedEvent, hiword_signed, loword_signed, translate},
-    windows::{composition, dpi, ime},
+use crate::{
+    math::Point,
+    platform::{
+        dispatcher::{WM_APP_COMPOSITION_WAKE, WM_APP_FRAME_WAKE},
+        event::{PlatformEvent, StampedEvent, hiword_signed, loword_signed, translate},
+        windows::{composition, dark_mode, dpi, ime},
+    },
 };
 
 /// 消费者：`NativeWindow::create`（`window.rs` 注册窗口过程）。
@@ -60,29 +71,67 @@ pub(crate) extern "system" fn wndproc(
         if msg == WM_NCCALCSIZE {
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
-        // 非客户区命中：**系统命中码**（`HTCAPTION` / `HTLEFT` / `HTBOTTOMRIGHT` / `HTCLOSE`…）。
-        //
-        // `WM_NCHITTEST` 不改写：命中码、边框几何、缩放光标形状都由系统算。`WM_NCLBUTTONDOWN`
-        // 也不改写（R07-2）：caption 的 move 模态循环（Aero Snap / Snap Layouts / 双击最大化 /
-        // 右键系统菜单）与 8 个命中码的 size 模态循环都只存在于 `DefWindowProcW` 内部。
-        // 曾经把 `HTCAPTION` 接管的实现因此丢掉了全部系统手势（多显示器用户最常用的窗口布局
-        // 方式）；曾经自持 8 个 resize 命中码的实现则要自己重实现整套平台语义（见 `resize.rs`
-        // 的模块文档：现在改为「系统拥有交互，`WM_SIZE` 驱动真实帧」）。
-        if msg == WM_NCHITTEST {
-            return DefWindowProcW(hwnd, msg, wparam, lparam);
-        }
 
         let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WndProcState;
         if state.is_null() {
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
 
+        // 非客户区命中：**系统命中码**（`HTCAPTION` / `HTLEFT` / `HTBOTTOMRIGHT` / `HTCLOSE`…）。
+        //
+        // 命中码、边框几何、缩放光标形状都由系统算。`WM_NCLBUTTONDOWN` 也不改写（R07-2）：
+        // caption 的 move 模态循环（Aero Snap / Snap Layouts / 双击最大化 / 右键系统菜单）与
+        // 8 个命中码的 size 模态循环都只存在于 `DefWindowProcW` 内部。曾经把 `HTCAPTION`
+        // 接管的实现因此丢掉了全部系统手势（多显示器用户最常用的窗口布局方式）；曾经自持
+        // 8 个 resize 命中码的实现则要自己重实现整套平台语义（见 `resize.rs` 的模块文档：
+        // 现在改为「系统拥有交互，`WM_SIZE` 驱动真实帧」）。
+        //
+        // **X2 的唯一例外**：自绘标题栏拖动区（应用通过 `Window::set_drag_regions` 声明，泵
+        // 每轮同步到 [`WndProcState::drag_regions`]）命中时返回 `HTCAPTION` —— 与系统标题栏走
+        // 同一条 move 模态循环（双击最大化/还原、Aero Snap、Snap Layouts、`Alt+Space` 全部
+        // 成立）；区域之外仍交 `DefWindowProcW`，上面的系统语义不变。区域是**逻辑客户区
+        // 坐标**：屏幕物理坐标（`WM_NCHITTEST` 的 lParam）→ `ScreenToClient` → 除以本消息
+        // 时刻的 scale。
+        if msg == WM_NCHITTEST {
+            let mut point = POINT {
+                x: loword_signed(lparam.0),
+                y: hiword_signed(lparam.0),
+            };
+            // `ScreenToClient` 只做坐标换算、不派发消息（不违反纪律 1）；`hwnd` 存活由外层
+            // `unsafe` 块的 SAFETY 注释覆盖。
+            if ScreenToClient(hwnd, &mut point).as_bool() {
+                let scale = (*state).scale();
+                let logical = Point::new(
+                    scale.to_logical(point.x as f32),
+                    scale.to_logical(point.y as f32),
+                );
+                if (*state)
+                    .drag_regions()
+                    .iter()
+                    .any(|region| region.contains(logical))
+                {
+                    return LRESULT(HTCAPTION as isize);
+                }
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+
         if msg == WM_GETMINMAXINFO {
             let info = &mut *(lparam.0 as *mut MINMAXINFO);
+            // B3：应用配置的最小客户区（`WindowOptions::min_size`，缺省 = 引擎 320×200）
+            // 换算成**窗口外框**的 `ptMinTrackSize`；物理像素随 DPI 同步（`WndProcState::note_dpi`）。
             info.ptMinTrackSize = POINT {
-                x: (*state).min_size.0 as i32,
-                y: (*state).min_size.1 as i32,
+                x: (*state).min_track_size.0 as i32,
+                y: (*state).min_track_size.1 as i32,
             };
+            // 只有应用显式配置了 `max_size` 才覆盖：否则保留系统按屏幕算出的默认最大跟踪尺寸
+            //（窗口可被拖出屏幕的最大值由系统决定，引擎不越权限制）。
+            if let Some((width, height)) = (*state).max_track_size {
+                info.ptMaxTrackSize = POINT {
+                    x: width as i32,
+                    y: height as i32,
+                };
+            }
             return LRESULT(0);
         }
         // 客户区的光标由引擎决定（P2-3）：每次鼠标移动系统都会问一次，不接管就会被
@@ -187,8 +236,13 @@ pub(crate) extern "system" fn wndproc(
                 (rect.left, rect.top, rect.right, rect.bottom)
             });
             if let Some((left, top, right, bottom)) = suggested {
+                // B3：这次重新落位属于 DPI 路径（不是用户移动）：期间系统同步派发的
+                // `WM_MOVE` 不派发 `Event::Moved`（公共契约：DPI 变化只产生 `DpiChanged`）。
+                // 置位只覆盖 `SetWindowPos` 同步调用期间，之后的用户/程序移动照常派发。
+                (*state).suppress_move = true;
                 // SAFETY: `hwnd` 存活；系统建议矩形只改位置与尺寸，不激活窗口、不改 Z 序。
-                // 可能重入 `WndProc`（`WM_WINDOWPOSCHANGED` / `WM_SIZE`）：此处不持有 `&mut`。
+                // 可能重入 `WndProc`（`WM_WINDOWPOSCHANGED` / `WM_SIZE` / `WM_MOVE`）：此处
+                // 不持有 `&mut`。
                 let _ = SetWindowPos(
                     hwnd,
                     None,
@@ -198,6 +252,7 @@ pub(crate) extern "system" fn wndproc(
                     bottom - top,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
+                (*state).suppress_move = false;
             }
             (*state).wake();
             return LRESULT(0);
@@ -260,8 +315,8 @@ pub(crate) extern "system" fn wndproc(
         // 窗口焦点态同步（与 `TranslateState` 的 `PlatformEvent::Focus` 是两条独立的线：
         // 前者给 AT 看「窗口有没有焦点」，后者给引擎做键盘分发）。
         if msg == WM_EXITSIZEMOVE {
-            // 系统 size 模态循环结束：之后回到泵的常规出帧路径（最后一条 `WM_SIZE` 已驱动
-            // 过一帧真实帧）。
+            // 系统 size / move 模态循环结束：之后回到泵的常规出帧路径（最后一条 `WM_SIZE` 已
+            // 驱动过一帧真实帧；B1 的全局模态计数随 `end_size_move` 一起退出一层）。
             (*state).end_size_move();
         }
         if matches!(msg, WM_SETFOCUS | WM_EXITMENULOOP | WM_EXITSIZEMOVE) {
@@ -271,6 +326,26 @@ pub(crate) extern "system" fn wndproc(
             }
         }
         if matches!(msg, WM_KILLFOCUS | WM_ENTERMENULOOP | WM_ENTERSIZEMOVE) {
+            // IME 失焦对齐（B6/D6 三端统一语义）：窗口真的失去键盘焦点时，组合中补**恰好
+            // 一条** `ImeEvent::End`。Win32 **不保证**失焦一定先派发
+            // `WM_IME_ENDCOMPOSITION`（TSF / 第三方 IME 可以先丢焦点、稍后才结束上下文），
+            // 不补的话应用会永久停在 inline preedit。组合态由 `ImeState` 记账：这里补过一条后
+            // 状态清零，系统随后迟到的 `WM_IME_ENDCOMPOSITION` 不再重复投递。
+            //
+            // 应用侧 caret hint 由泵路径清（`native_window::apply_event` 的 `Focus(false)` 分支，
+            // `WndProc` 不碰 `App`）。
+            if msg == WM_KILLFOCUS {
+                let ticks = message_ticks();
+                if let Some(end) = (*state).translate.ime_mut().finish_composition() {
+                    let scale = (*state).scale();
+                    (*state).push_stamped_event(StampedEvent {
+                        event: PlatformEvent::Ime(end),
+                        ticks_ms: ticks,
+                        scale,
+                    });
+                    (*state).wake();
+                }
+            }
             // 丢失键盘焦点时必须**复位瞬时输入状态**（P2-6）：
             //
             // 修饰键是按消息顺序维护的（按下置位、抬起清位）。失焦期间抬起消息不再到达本窗口，
@@ -279,7 +354,10 @@ pub(crate) extern "system" fn wndproc(
             // （否则失焦前半个代理会和失焦后的字符拼成乱码，残留抑制码元会吞掉真实输入）。
             (*state).reset_transient_input();
             if msg == WM_ENTERSIZEMOVE {
-                // 系统 size 模态循环开始：由 `WM_SIZE` 直接驱动真实帧（泵的 ④ 这段不运行）。
+                // 系统 size / move 模态循环开始（泵的 ④ 这段不运行）：size 循环由 `WM_SIZE`
+                // 直接驱动真实帧（`ResizeFrameDriver`），move 循环（B1）由 `WM_APP_FRAME_WAKE`
+                // 驱动的全局模态 tick 出帧 —— 全局计数在 `begin_size_move` 里，因为唤醒目标
+                // 可能是别的窗口。
                 (*state).begin_size_move();
             }
             let events = (*state).a11y_mut().focus_changed(false);
@@ -289,7 +367,30 @@ pub(crate) extern "system" fn wndproc(
         }
 
         if msg == WM_APP_FRAME_WAKE {
-            // `Dispatcher::wake` 已置位，这里只需要返回。
+            // `Dispatcher::wake` 已置位。模态循环**外**只需要返回 —— 泵的 ④ 会取走唤醒位并
+            // 出帧（这里不得抢跑，否则每次唤醒会被绘制两次）。
+            //
+            // 注意这条路径与模态循环入口的竞态：本消息在循环外被派发时唤醒位**没有**被消费；
+            // 如果同一批消息里紧跟系统 move 循环的起点（鼠标按下），泵的 ④ 还来不及消费就被
+            // 模态循环占住 —— 那一位会「已置位但队列里没有消息」，循环里再也不会有 tick。
+            // 因此 `begin_size_move`（`WM_ENTERSIZEMOVE`）会消费并重投一条唤醒消息。
+            //
+            // 系统 move / size 模态循环里泵的 ④ 停摆（`DispatchMessageW` 被系统循环占住）：
+            // 这时本函数直接跑一步模态 tick（B1）。判定用**全局**计数 `in_modal_loop()` 而不是
+            // 本窗口的 `size_move` —— `wake` 的目标是 attach 首窗，被拖窗口不一定是它。
+            //
+            // 两阶段（文件头纪律 1）：短借用只取 `ModalTick`（克隆 `Weak<App>` / `Arc<Dispatcher>`），
+            // `App::frame` / 任务 / 钩子全部在借用**之外**执行；错误重新取状态写回
+            // `pending_error`，与 `WM_SIZE` 的模态帧路径同款（帧管线失败绝不能静默）。
+            if (*state).dispatcher().in_modal_loop()
+                && let Some(step) = (*state).modal_tick_step()
+                && let Some(error) = step.run()
+            {
+                let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WndProcState;
+                if !state.is_null() {
+                    (*state).note_pending_error(error);
+                }
+            }
             return LRESULT(0);
         }
         if msg == WM_APP_COMPOSITION_WAKE {
@@ -386,10 +487,25 @@ pub(crate) extern "system" fn wndproc(
         let stamped = if msg == WM_SETTINGCHANGE {
             // 系统滚轮行数（`SPI_GETWHEELSCROLLLINES`）可能变了（R02-10）。
             (*state).refresh_wheel_lines();
-            appearance_change(lparam_value).map(|event| StampedEvent {
-                event,
-                ticks_ms: ticks,
-                scale: (*state).scale(),
+            // B2：沉浸式颜色集变化 ⇒ 重新读注册表主题并同步标题栏明暗。`DwmSetWindowAttribute`
+            // 只改 DWM 属性、**不派发窗口消息**，因此可以在 `&mut WndProcState` 的短借用内执行
+            //（文件头纪律 1 只约束会同步重入本函数的调用）。
+            appearance_dark(lparam_value).map(|dark| {
+                let applied = dark_mode::set_titlebar(hwnd, dark);
+                #[cfg(test)]
+                {
+                    // 测试观察点（生产构建没有该字段）：记录 DWM 调用**真的发生且成功**的明暗；
+                    // 删掉上面的调用时恒为 `None`，单测据此变红。
+                    (*state).last_dark_titlebar = applied.then_some(dark);
+                }
+                // 生产构建没有观察者：失败已在 `set_titlebar` 内部 `debug_assert`，窗口继续可用。
+                #[cfg(not(test))]
+                let _ = applied;
+                StampedEvent {
+                    event: PlatformEvent::Appearance(dark),
+                    ticks_ms: ticks,
+                    scale: (*state).scale(),
+                }
             })
         } else {
             let context = (*state).context(ticks);
@@ -403,6 +519,12 @@ pub(crate) extern "system" fn wndproc(
         };
 
         if let Some(stamped) = stamped {
+            // B3：`WM_DPICHANGED` 建议矩形的重新落位是 DPI 路径的一部分 —— 期间系统同步派发的
+            // `WM_MOVE` 不产生 `Event::Moved`（公共契约：该路径只产生 `DpiChanged`；见
+            // `WndProcState::suppress_move`）。`WM_MOVE` 的默认过程返回 0，直接交默认过程。
+            if (*state).suppress_move && matches!(stamped.event, PlatformEvent::Moved { .. }) {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
             match &stamped.event {
                 PlatformEvent::PointerLeave => (*state).mouse_tracking = false,
                 // `WM_MOUSELEAVE` 不带坐标：记下最近位置供 `PointerLeave` 的离开点使用。
@@ -475,8 +597,8 @@ pub(super) fn is_any_ime_message(msg: u32) -> bool {
 }
 
 /// 消费者：`wndproc` 的 `WM_SETTINGCHANGE` 分支。
-/// `WM_SETTINGCHANGE` 且是「沉浸式颜色集」变化 → 读注册表拿深浅色。
-pub(super) fn appearance_change(lparam: isize) -> Option<PlatformEvent> {
+/// `WM_SETTINGCHANGE` 且是「沉浸式颜色集」变化 → 读注册表返回最新深色标志。
+pub(super) fn appearance_dark(lparam: isize) -> Option<bool> {
     if lparam == 0 {
         return None;
     }
@@ -496,40 +618,10 @@ pub(super) fn appearance_change(lparam: isize) -> Option<PlatformEvent> {
     if changed != "ImmersiveColorSet" {
         return None;
     }
-    dark_mode().map(PlatformEvent::Appearance)
-}
-
-/// 消费者：`appearance_change`。
-/// 读 `HKCU\...\Themes\Personalize\AppsUseLightTheme`（1 = 浅色）。
-pub(super) fn dark_mode() -> Option<bool> {
-    let subkey = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
-    let value = wide("AppsUseLightTheme");
-    let mut data = 0u32;
-    let mut size = std::mem::size_of::<u32>() as u32;
-    // SAFETY: 输出缓冲是栈上的 `u32`，`size` 同步给出字节数；键路径是 NUL 结尾的宽字符串。
-    let status = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            windows::core::PCWSTR(subkey.as_ptr()),
-            windows::core::PCWSTR(value.as_ptr()),
-            RRF_RT_REG_DWORD,
-            None,
-            Some((&mut data as *mut u32).cast()),
-            Some(&mut size),
-        )
-    };
-    if status != windows::Win32::Foundation::ERROR_SUCCESS {
-        return None;
-    }
-    Some(data == 0)
+    dark_mode::current()
 }
 
 /// 消费者：`wndproc` 的滚轮坐标翻译。
 pub(super) fn encode_point(x: i32, y: i32) -> isize {
     ((((y as u32) << 16) | (x as u32 & 0xFFFF)) as i32) as isize
-}
-
-/// 消费者：`dark_mode` 的注册表键名。
-pub(super) fn wide(text: &str) -> Vec<u16> {
-    text.encode_utf16().chain(std::iter::once(0)).collect()
 }

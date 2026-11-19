@@ -1,7 +1,8 @@
 //! 窗口：句柄、建窗参数、节点树 + 绘制场景的持有者。
 //!
-//! P03 是 headless 的：只保存参数，不驱动平台
-//! （平台窗口句柄、DPI 事件、标题栏属 P12）。
+//! 窗口参数（[`WindowOptions`]）在 headless 测试里只保存；真机上由平台层在创建原生窗口
+//! 时消费（初始位置 / 最小最大尺寸），运行时变化经 `Event::Resized` / `Event::Moved`
+//! 回流到应用。
 
 mod a11y;
 mod focus;
@@ -29,13 +30,15 @@ use self::{
 };
 #[cfg(feature = "test-support")]
 use crate::paint::instance::InstanceBuffer;
+#[cfg(any(target_os = "linux", test))]
+use crate::render::present_evidence::clamp_presented_at;
 #[cfg(feature = "test-support")]
 use crate::test_support::record::{FrameRecord, FrameStats};
 use crate::{
     error::EngineError,
     interaction::{FocusScope, PointerState},
     layout::LayoutReport,
-    math::{PhysicalRect, Rect, Scale, Size},
+    math::{PhysicalRect, Point, Rect, Scale, Size},
     node::{id::NodeId, tree::NodeTree},
     paint::{
         atlas::{AtlasKind, MAX_IMAGE_PAGES},
@@ -187,29 +190,119 @@ pub enum WindowResizeEdge {
     BottomRight,
 }
 
-/// 建窗参数。P03 只保存，不驱动平台（P12 才消费）。
+/// 建窗参数（平台层在创建原生窗口时消费）。
 ///
 /// 三个平台创建的窗口默认都是**可关闭 / 最小化 / 最大化 / 可缩放**的：Windows 用
 /// `WS_OVERLAPPEDWINDOW` 的系统标题栏，macOS 保留三个原生交通灯，Linux/Wayland 请求
 /// 客户端装饰并由应用自绘标题栏（`WindowControl` 提供按钮/拖动所需的平台请求）。
 ///
+/// # 坐标语义（三端统一）
+///
+/// [`Self::position`] / [`Self::size`] / [`Self::min_size`] / [`Self::max_size`] 全部是
+/// **逻辑像素**（与 [`Self::scale`] 同域，DPI 换算由平台层完成）：
+///
+/// - 原点 = **虚拟桌面内容区左上角**，x 向右、y 向下；
+/// - Windows：`(虚拟屏幕左上角为原点的物理坐标) / (窗口所在显示器的 scale)`；混合 DPI
+///   跨屏恢复时按窗口最终落点显示器的 scale 解释（误差 ≤1 逻辑像素）；
+/// - macOS：AppKit 屏幕坐标的原点在主屏**左下角**、y 向上，平台层换算成上面的一致语义
+///   （应用无需感知 AppKit 的翻转）；
+/// - Linux/Wayland：`xdg_toplevel` **没有定位请求**，[`Self::position`] 被忽略（窗口位置
+///   完全由 compositor 决定，`Event::Moved` 在该端永不产生）；`min_size`/`max_size` 走
+///   `xdg_toplevel.set_min_size/set_max_size` 的 compositor 提示语义（不保证被强制执行）。
+///
+/// # 窗口层级（X1）
+///
+/// [`Self::owner`] / [`Self::modal`] / [`Self::always_on_top`] 表达窗口之间的层级关系
+/// （owned 窗口、owner 的模态窗口、置顶窗口）。三端能力不同（Wayland 没有 owner/模态/
+/// 置顶的跨合成器协议），每个字段的文档写明**原生路径与降级语义** —— 引擎不得静默忽略。
+///
 /// # Windows 标题栏 / 非客户区交互
 ///
 /// **非客户区全部交系统**（R07-2）：`WM_NCCALCSIZE` / `WM_NCHITTEST` / `WM_NCLBUTTONDOWN`
-/// 都不改写 —— 拖动标题栏、双击最大化/还原、右键系统菜单、`Alt+Space`、**Aero Snap /
+/// 默认都不改写 —— 拖动标题栏、双击最大化/还原、右键系统菜单、`Alt+Space`、**Aero Snap /
 /// Win11 Snap Layouts** 与边框拖拽都由系统的 move / size 模态循环提供（Chrome / GPUI / Qt
-/// 同样不接管它们）。
+/// 同样不接管它们）。唯一的例外是应用显式声明的自绘标题栏拖动区（X2
+/// [`Window::set_drag_regions`]）：命中区域的 `WM_NCHITTEST` 返回 `HTCAPTION`，让自绘标题栏
+/// 复用系统标题栏的同一套拖动语义；未声明时非客户区行为完全不变。
 ///
 /// 系统 size 模态循环会占住本线程消息泵，但**重排 + 重绘不会停**：模态循环把 `WM_SIZE`
 /// 同步分派到 `WndProc`，平台层在每条 `WM_SIZE` 上直接更新客户区、对齐 DirectComposition
 /// 几何并跑一帧完整帧（`platform::windows::event_loop::ResizeFrameDriver`）—— 拖动/缩放中
-/// 每一步都是**真实帧**（不是拉伸旧帧），且不引入定时器或额外帧。
+/// 每一步都是**真实帧**（不是拉伸旧帧），且不引入定时器或额外帧。系统 move 模态循环
+/// （拖动标题栏）**不产生 `WM_SIZE`**，由 `WM_APP_FRAME_WAKE` 驱动的模态 tick 出帧
+/// （`platform::windows::event_loop::ModalTick`），两者共用同一套「任务 → 钩子 → 全窗口帧」
+/// 纪律。
 #[derive(Clone, Debug, PartialEq)]
 pub struct WindowOptions {
     /// 标题（`SmolStr`，AGENTS §2.2）。
     pub title: SmolStr,
     /// 初始逻辑尺寸。
     pub size: Size,
+    /// 初始客户区左上角位置（逻辑像素，坐标语义见 [`WindowOptions`] 的「坐标语义」一节）。
+    ///
+    /// `None` = 由平台决定（Windows 保留历史默认 `(100,100)`；macOS 由平台按 26 point 级联摆放；
+    /// Wayland 由 compositor 决定）。应用若需要稳定的多窗口摆放，应显式传 `position` 并自己
+    /// 持久化（placement 归应用层）。
+    ///
+    /// 平台层会把位置 **clamp 到最近显示器的工作区**（至少保留标题栏/一条边可见，避免
+    /// 显示器拔掉后窗口恢复到不可达位置）。placement 的**持久化归属应用层**：应用从
+    /// [`crate::event::Event::Moved`] / [`crate::event::Event::Resized`] 记录，下次启动填回
+    /// 这里；引擎不落盘（AGENTS §1.2）。
+    pub position: Option<Point>,
+    /// 客户区最小逻辑尺寸（`None` = 平台默认/不额外约束）。
+    ///
+    /// - Windows：`WM_GETMINMAXINFO` 的 `ptMinTrackSize`（系统再补上边框/标题栏）；
+    /// - macOS：`NSWindow.contentMinSize`；
+    /// - Linux：`xdg_toplevel.set_min_size` —— compositor 提示，不保证被执行。
+    ///
+    /// 同时设置 `min_size`/`max_size` 且 `min > max` 时引擎先 clamp 成 `min = max`
+    /// （与 Qt 的 `setMinimumSize/setMaximumSize` 互相钳制同义），平台层按钳制后的值应用。
+    pub min_size: Option<Size>,
+    /// 客户区最大逻辑尺寸（`None` = 平台默认/不额外约束）；平台对应关系同 [`Self::min_size`]。
+    pub max_size: Option<Size>,
+    /// 父/属主窗口（owner，X1）。`None` = 无属主的顶层独立窗口（默认）。
+    ///
+    /// owner 不是「客户区父子关系」：owned 窗口仍是顶层窗口，只是**永远位于 owner 之上**
+    /// （系统 z 序）、owner 最小化时一并隐藏/最小化、owner 销毁时 owned 窗口一并销毁。
+    /// 模态（[`Self::modal`]）要求 owner 存在。
+    ///
+    /// 三端语义（用户裁决 X1：无原生能力的端**必须写清降级**，不得静默忽略）：
+    /// - **Windows**：`CreateWindowExW` 的 `hWndParent`（owner 语义；不设 `WS_CHILD`）。
+    /// - **macOS**：`addChildWindow:ordered:`（child window / transient parent 语义）。
+    /// - **Linux/Wayland**：`xdg_toplevel.set_parent` 只是「transient for」提示（compositor
+    ///   可忽略、且无法表达「随 owner 最小化/销毁」），**降级**：仅提交 set_parent 提示，
+    ///   不保证 z 序或生命周期联动；文档与 `Event` 不假设 owner 语义成立。
+    ///
+    /// 生命周期：owner 必须已存在（同一 `App` 内先创建的窗口）。创建时 owner 不存在/已关闭
+    /// ⇒ 按 `None` 处理并写诊断（不 panic；与「窗口句柄永不复用」一致，陈旧 id 不会误绑新窗口）。
+    pub owner: Option<WindowId>,
+    /// 是否为 owner 的**模态**窗口（X1）。
+    ///
+    /// 模态窗口打开期间，**直接 owner**（`owner` 字段指向的窗口）**不接收输入**，直到模态窗口
+    /// 关闭。拦截面与 Windows 原生 `EnableWindow(owner, FALSE)` 一致：只作用于 owner 本身，
+    /// **不**连带 owner 拥有的其它 owned 窗口（它们不是 `WS_CHILD`）。模态必须是 owned 窗口
+    /// （[`Self::owner`] 为 `Some`）；`modal == true` 而 `owner == None`
+    /// ⇒ 降级为普通窗口并写诊断（不 panic）。
+    ///
+    /// 平台语义（用户裁决 X1）：
+    /// - **Windows**：原生路径 —— 打开时 `EnableWindow(owner, FALSE)` 禁用 owner（系统级输入
+    ///   拦截 + 灰显），关闭/销毁时恢复；同时引擎层按同一规则过滤（UI 线程兜底，防止
+    ///   DComp/自定义消息绕过）。
+    /// - **macOS**：引擎层模态（`App` 分发层按 owner 关系过滤输入）+ 模态窗口层级
+    ///   （`NSModalPanelWindowLevel` 可选项，不依赖 `runModalForWindow:` 同步嵌套循环 ——
+    ///   那会与引擎自己的事件泵重入）。
+    /// - **Linux/Wayland**：协议没有模态；引擎层模态（同 macOS），并 `set_parent` 提示
+    ///   compositor 置于 owner 之上。
+    ///
+    /// 模态窗口被关闭/否决关闭时语义：否决 = 保持模态；真正关闭 = 恢复 owner 输入。
+    pub modal: bool,
+    /// 是否置顶（always-on-top，X1）。
+    ///
+    /// - **Windows**：`WS_EX_TOPMOST`（`SetWindowPos(HWND_TOPMOST)`）；
+    /// - **macOS**：`NSFloatingWindowLevel` 窗口层级；
+    /// - **Linux/Wayland**：**没有跨合成器协议**（KDE plasma-shell / wlr-layer-shell 都不是
+    ///   xdg-shell 标准能力）⇒ 降级为无操作并在文档写明（应用不得假设置顶成立）。
+    pub always_on_top: bool,
     /// 初始 DPI 比例（由平台在 P12 传入；headless 默认 `Scale::ONE`）。
     pub scale: Scale,
     /// 窗口背景色：内容未覆盖区域的底色（持久目标 clear；Windows 另有独立背景层）。
@@ -243,6 +336,12 @@ impl Default for WindowOptions {
         Self {
             title: SmolStr::new_static(""),
             size: Size::new(800.0, 600.0),
+            position: None,
+            min_size: None,
+            max_size: None,
+            owner: None,
+            modal: false,
+            always_on_top: false,
             scale: Scale::ONE,
             background: Color::BLACK,
         }
@@ -487,6 +586,14 @@ pub struct Window {
     a11y: crate::a11y::adapter::A11yBridge,
     /// IME caret hint（P16：应用声明的文本节点 + UTF-8 字节偏移）。
     ime_cursor: Option<ImeCursorRequest>,
+    /// 自绘标题栏的可拖动区域（X2；逻辑窗口坐标，客户区左上角原点）。
+    ///
+    /// 空 = 没有拖动区（默认）。平台层每轮从 `App` 同步到原生窗口：
+    /// Windows 命中区域的 `WM_NCHITTEST` 返回 `HTCAPTION`（系统 move 模态循环，与系统
+    /// 标题栏同路径：双击最大化 / Aero Snap / 右键系统菜单都成立）；macOS 命中区域的
+    /// 主键按下走 `performWindowDragWithEvent:`（不进引擎指针分发）；Linux/Wayland CSD
+    /// 命中区域的主键按下请求 `xdg_toplevel.move(seat, serial)`（compositor 驱动移动）。
+    titlebar_drag_regions: Vec<Rect>,
     /// Linux：当前焦点文本域的语义类型（`zwp_text_input_v3.set_content_type` 的数据源）。
     ///
     /// 密码 / API key 输入框必须切到 [`ImeContentType::Password`]：text-input-v3 的默认值
@@ -569,6 +676,7 @@ impl Window {
             pending_damage: None,
             a11y: crate::a11y::adapter::A11yBridge::new(),
             ime_cursor: None,
+            titlebar_drag_regions: Vec::new(),
             #[cfg(target_os = "linux")]
             ime_content: ImeContentType::default(),
             #[cfg(target_os = "linux")]
@@ -621,12 +729,13 @@ impl Window {
 
     /// Linux：`wp_presentation` 的呈现事件到达，回填对应帧的 `presented_at`。
     ///
-    /// 已被历史窗口挤掉的帧直接忽略（不会伪造；验收侧有各自的「已结算」口径）。
+    /// 事件由平台泵在 **dispatch 之后**按 `FrameIndex` 从呈现邮箱里取走并调用本方法；反馈本身
+    /// 是异步的（presented 可能晚于 GPU 完成反馈若干轮），因此历史里还没有该帧时调用方先不
+    /// 取，等下一轮。已被历史窗口挤掉的帧直接忽略（不会伪造；验收侧有各自的「已结算」口径）。
     ///
-    /// **仅测试构建**：A4 的 Linux 平台接线（`wp_presentation` 全局绑定 / present 前 feedback
-    /// 请求 / Dispatch 回填）是明确登记的降级项（见 `.review/p1-a-impl.md`），生产路径如实
-    /// `presented_at = None`；接线启用时把本方法改回 `cfg(any(target_os = "linux", test))`。
-    #[cfg(test)]
+    /// `presented_at` 仍按**下界**收口：真实上屏只可能发生在 GPU 完成之后，事件时间戳与
+    /// `completed_at` 两个下界取较大者（[`clamp_presented_at`]），偏差方向恒为偏早。
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn note_frame_presented(
         &mut self,
         index: FrameIndex,
@@ -637,7 +746,7 @@ impl Window {
             .iter_mut()
             .find(|entry| entry.index == index)
         {
-            entry.presented_at = presented_at;
+            entry.presented_at = clamp_presented_at(presented_at, entry.completed_at);
         }
     }
 
@@ -1132,6 +1241,44 @@ impl Window {
     }
     pub(crate) fn ime_cursor_area(&self) -> Result<Option<Rect>, EngineError> {
         focus::ime_cursor_area(self)
+    }
+
+    // ── X2：自绘标题栏拖动区（Chrome / Electron `-webkit-app-region: drag` 模型） ──
+
+    /// 设置自绘标题栏的**可拖动区域**（X2；三端原生路径见下方列表）。
+    ///
+    /// 区域是**逻辑窗口坐标**（客户区左上角为原点，x 右 y 下），可以有多个（顶部条带 + 侧栏
+    /// 把手）；传空切片清空。引擎不自动跟随布局：应用在布局/尺寸变化后重新调用（Chrome
+    /// `SetDraggableRegions` 同模型）。命中区域**不再投递**指针事件给应用 —— 拖动区是窗口
+    /// chrome，不是内容。
+    ///
+    /// 平台语义（用户裁决 X1/X2「不得静默忽略」）：
+    ///
+    /// - **Windows**：命中区域的 `WM_NCHITTEST` 返回 `HTCAPTION` ⇒ 走系统 move 模态循环，
+    ///   与系统标题栏完全同路径（双击最大化/还原、Aero Snap、`Alt+Space` 系统菜单都成立；
+    ///   拖动期间的出帧由 B1 的模态 tick 保证）。
+    /// - **macOS**：`GuiView mouseDown:` 命中区域 ⇒ `performWindowDragWithEvent:`（AppKit
+    ///   同步拖动），不进入引擎指针分发。用于恢复 `FullSizeContentView` 下被 view 挖掉的
+    ///   顶部拖动条（AppKit 的 drag map 只让 `mouseDownCanMoveWindow == YES` 且有内容的视图
+    ///   可拖）。
+    /// - **Linux/Wayland**：CSD 窗口命中区域的主键按下 ⇒ `xdg_toplevel.move(seat, serial)`
+    ///   交给 compositor 驱动（协议没有客户端侧拖动）；不投递 `PointerDown`。没有
+    ///   `xdg_toplevel` / compositor 不实现 move 时降级为无操作（应用仍可用
+    ///   `WindowControl::BeginMove` 的显式路径）。
+    ///
+    /// 消费者：`App::set_drag_regions`（平台泵每轮对账到原生窗口）。
+    pub fn set_drag_regions(&mut self, regions: &[Rect]) {
+        if self.titlebar_drag_regions == regions {
+            return;
+        }
+        self.titlebar_drag_regions.clear();
+        self.titlebar_drag_regions.extend_from_slice(regions);
+    }
+
+    /// 当前拖动区（平台层读点；X2）。
+    #[must_use]
+    pub(crate) fn drag_regions(&self) -> &[Rect] {
+        &self.titlebar_drag_regions
     }
 
     // ── Linux：文本输入的语义类型（`zwp_text_input_v3.set_content_type`）──

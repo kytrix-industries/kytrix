@@ -34,7 +34,9 @@ use windows::Win32::{
     },
 };
 
-use super::native_window::{apply_display_recovery, collect_events, sync_native_windows};
+use super::native_window::{
+    apply_display_recovery, collect_events, resolve_owner, sync_native_windows,
+};
 use crate::{
     app::App,
     error::EngineError,
@@ -417,22 +419,34 @@ pub(crate) fn run(mut app: App) -> Result<(), EngineError> {
     // SAFETY: 无参数，返回调用线程的 id（只用于 `PostThreadMessageW`）。
     dispatcher.bind_thread(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() });
 
-    let requests: Vec<(WindowId, WindowOptions)> = app
+    let mut requests: Vec<(WindowId, WindowOptions)> = app
         .windows()
         .map(|(id, window)| (id, window.options().clone()))
         .collect();
+    // X1：owner 必须比 owned **先创建**。`App` 的窗口表是哈希表（迭代顺序任意），平台层按
+    // `WindowId`（单调递增 = 创建顺序）排序后再建窗，owner 解析才稳定命中。
+    requests.sort_by_key(|(id, _)| id.to_bits());
     // `App` 交给 `Rc<RefCell<_>>`：系统的 size / move 模态循环里，`WndProc` 要直接驱动一帧
     // 真实帧（见 `pump_loop` 的 ① 与 `ResizeFrameDriver`）。驱动的引用是 `Weak`，关闭顺序不受影响。
     let app = Rc::new(RefCell::new(app));
     let mut windows: Vec<NativeWindow> = Vec::with_capacity(requests.len());
     for (id, options) in requests {
+        // X1：owner 只在**已创建**的原生窗口里解析（`App::create_window` 保证 owner 先创建；
+        // 找不到时降级为无 owner 并写诊断）。
+        let owner = resolve_owner(&options, &windows);
         // RE-01：adapter 必须持有窗口 `A11yBridge` 的**那一份**消费端代际（唯一入口
         // `App::window_a11y_epoch`）；AT 重激活时平台回调 bump 它 ⇒ 引擎下一笔全树。
         let Some(a11y_epoch) = app.borrow().window_a11y_epoch(id) else {
             continue;
         };
-        let mut native =
-            NativeWindow::create(id, &options, dispatcher.clone(), Some(&app), a11y_epoch)?;
+        let mut native = NativeWindow::create(
+            id,
+            &options,
+            owner,
+            dispatcher.clone(),
+            Some(&app),
+            a11y_epoch,
+        )?;
         let client = native.client_size();
         let renderer = Renderer::new_for_hwnd(native.composition(), client, options.background)?;
         // A5：帧预算的刷新率提示（窗口所在 output；查询失败 ⇒ 门禁保持禁用）。
@@ -449,6 +463,12 @@ pub(crate) fn run(mut app: App) -> Result<(), EngineError> {
                     window.set_frame_refresh_hz(hz);
                 }
             }
+        }
+        // X2：`Application::run` 之前声明的拖动区必须在**首次显示之前**生效（否则第一帧里点击
+        // 自绘标题栏条带不会开始拖动）。运行时变化仍由泵的 ④′ 每轮对账。
+        {
+            let app = app.borrow();
+            native.sync_drag_regions(&app);
         }
         // 首帧已经由 `new_for_hwnd` prime 并 present（内容层与背景层都已 attach；客户区在第一次
         // present 之前完全透明），这里把几何对齐成「内容 = 客户区」（内容 1:1、背景层铺满），
@@ -898,9 +918,13 @@ pub(super) fn pump_loop(
             let mut app = app_cell.borrow_mut();
             for native in windows.iter_mut() {
                 native.update_a11y(&mut app);
+                // X2：自绘标题栏拖动区对账（`WndProc` 的 `WM_NCHITTEST` 只读 `WndProcState`；
+                // 区域变化由应用在布局/尺寸变化后调 `App::set_drag_regions`，同值 no-op）。
+                native.sync_drag_regions(&app);
                 // IME 启用状态先于 caret hint：刚禁用时不必再写表单，刚启用时要重发 hint
-                //（`sync_ime_enabled` 会清掉 `ime_area` 缓存）。
-                native.sync_ime_enabled(&app);
+                //（`sync_ime_enabled` 会清掉 `ime_area` 缓存；禁用瞬间还在组合中时它会补一条
+                // `ImeEvent::End` 并清应用侧 caret hint，因此要 `&mut App`）。
+                native.sync_ime_enabled(&mut app);
                 native.sync_ime_cursor_area(&app);
             }
         }

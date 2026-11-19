@@ -3,6 +3,8 @@
 
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
+use windows::Win32::Foundation::HWND;
+
 use super::recovery;
 use crate::{
     app::App,
@@ -16,6 +18,29 @@ use crate::{
     render::backend::Renderer,
     window::{WindowId, WindowOptions},
 };
+
+/// 消费者：`pump::run`（启动建窗）与 [`sync_native_windows`]（运行时建窗）。
+///
+/// 解析 `WindowOptions::owner` → 原生 owner 的 HWND（X1）。
+///
+/// 只在**已创建的原生窗口集合**里查：owner 必须比 owned 先创建（同一 `App` 内先创建的窗口，
+/// 由 App 层保证顺序）。找不到（owner 已关闭 / 尚未创建）⇒ 返回 `None` 降级为普通顶层窗口，
+/// 并写诊断 —— 与公共契约「按 None 处理并写诊断（不 panic）」一致。
+///
+/// 「窗口句柄永不复用」由 `WindowId` 单调分配保证：这里只按 `WindowId` 匹配，因此陈旧 id
+/// 不会误绑到后来复用同一 HWND 的新窗口。
+pub(super) fn resolve_owner(options: &WindowOptions, windows: &[NativeWindow]) -> Option<HWND> {
+    let owner_id = options.owner?;
+    match windows.iter().find(|native| native.id() == owner_id) {
+        Some(owner) => Some(owner.hwnd()),
+        None => {
+            eprintln!(
+                "kytrix: 窗口 owner={owner_id:?} 不存在（已关闭或晚于 owned 创建），按无 owner 降级"
+            );
+            None
+        }
+    }
+}
 
 /// 消费者：`pump_loop` 的 ②a 步骤。
 /// 把 `App` 的窗口集合同步到原生窗口（运行时创建 / 应用主动关闭，P1-2.8）。
@@ -48,19 +73,30 @@ pub(super) fn sync_native_windows(
     // `NativeWindow::drop` 负责 `DestroyWindow`（GPU 线程的 join 在 `Renderer::drop` 里，
     // `App::close_window` 已经丢掉了那个 `Window`，因此顺序天然正确）。
     let existing: Vec<WindowId> = windows.iter().map(NativeWindow::id).collect();
-    let pending: Vec<(WindowId, WindowOptions)> = app
+    let mut pending: Vec<(WindowId, WindowOptions)> = app
         .windows()
         .filter(|(id, _)| !existing.contains(id))
         .map(|(id, window)| (id, window.options().clone()))
         .collect();
+    // X1：owner 必须比 owned 先创建。`App` 的窗口表是哈希表（迭代顺序任意），平台层按
+    // `WindowId`（单调递增 = 创建顺序）排序后再建窗，owner 解析才稳定命中。
+    pending.sort_by_key(|(id, _)| id.to_bits());
     for (id, options) in pending {
+        // X1：owner 在**已创建**的原生窗口里解析（App 层保证 owner 先于 owned 创建）。
+        let owner = resolve_owner(&options, windows);
         // RE-01：adapter 必须持有窗口 `A11yBridge` 的**那一份**消费端代际（唯一入口
-        // `App::window_a11y_epoch`）：AT 重新激活时平台回调 `bump()` 它，引擎把下一笔升成全树。
+        // `App::window_a11y_epoch`）；AT 重新激活时平台回调 `bump()` 它，引擎把下一笔升成全树。
         let Some(a11y_epoch) = app.window_a11y_epoch(id) else {
             continue;
         };
-        let mut native =
-            NativeWindow::create(id, &options, dispatcher.clone(), Some(app_cell), a11y_epoch)?;
+        let mut native = NativeWindow::create(
+            id,
+            &options,
+            owner,
+            dispatcher.clone(),
+            Some(app_cell),
+            a11y_epoch,
+        )?;
         let client = native.client_size();
         let renderer = Renderer::new_for_hwnd(native.composition(), client, options.background)?;
         // A5：帧预算的刷新率提示（窗口所在 output；查询失败 ⇒ 门禁保持禁用）。
@@ -81,6 +117,9 @@ pub(super) fn sync_native_windows(
             let mut target = composition::lock(&target);
             target.set_geometry(client, client)?;
         }
+        // X2：运行时新建的窗口同样必须在**显示之前**拿到当前拖动区（`App::set_drag_regions`
+        // 可能先于原生窗口创建调用；之后的变化由泵的 ④′ 每轮对账）。
+        native.sync_drag_regions(app);
         native.note_composition_geometry((client, client));
         native.show();
         windows.push(native);
@@ -275,6 +314,14 @@ pub(super) fn apply_event(
             dispatcher.wake();
             Event::Resized { size }
         }
+        PlatformEvent::Moved { x, y } => {
+            // B3：`WM_MOVE` 给的是**屏幕物理坐标**；按该消息的 scale 换算成公共 API 的逻辑
+            // 坐标语义（虚拟桌面内容区左上角为原点，`Event::Moved` 的契约）。窗口移动本身
+            // 不需要重画（DComp 内容随窗口移动），因此不在这里 `wake` 请求新帧。
+            Event::Moved {
+                position: to_logical(x, y),
+            }
+        }
         PlatformEvent::Dpi { dpi } => {
             // DPI 的**几何已经落地**：`WndProc` 在 `WM_DPICHANGED` 里同步 `SetWindowPos` 了系统
             // 建议矩形（R07-12），这里只做记账与渲染目标更新（P1-2a：内容重画由 GPU 线程按
@@ -307,7 +354,17 @@ pub(super) fn apply_event(
             dispatcher.wake();
             Event::DpiChanged { dpi, scale }
         }
-        PlatformEvent::Focus(focused) => Event::FocusChanged { focused },
+        PlatformEvent::Focus(focused) => {
+            if !focused {
+                // Windows IME 失焦对齐（B6/D6 三端统一）：窗口失去键盘焦点 = 本窗口的文本焦点
+                // 也结束，引擎统一清应用侧 caret hint（平台 IME 表单在下一轮 ④′ 由
+                // `sync_ime_cursor_area` 按清空后的 hint 清掉）。`WndProc` 不碰 `App`，所以这里
+                // 是唯一清点；应用若在 `FocusChanged` 处理器里重新聚焦文本节点，可以直接再
+                // `set_ime_cursor_area`（清点在派发事件**之前**，不会被覆盖顺序坑）。
+                app.clear_ime_cursor_area(id);
+            }
+            Event::FocusChanged { focused }
+        }
         PlatformEvent::Appearance(dark) => Event::AppearanceChanged { dark },
         PlatformEvent::Close => Event::CloseRequested,
     };
@@ -319,11 +376,19 @@ pub(super) fn apply_event(
 mod tests {
     use std::sync::Arc;
 
-    use super::apply_display_recovery;
+    use super::{apply_display_recovery, apply_event, resolve_owner};
     use crate::{
         app::App,
-        platform::{dispatcher::Dispatcher, windows::window::NativeWindow},
+        event::Event,
+        math::Scale,
+        node::builder::NodeBuilder,
+        platform::{
+            dispatcher::Dispatcher,
+            event::{PlatformEvent, StampedEvent},
+            windows::window::NativeWindow,
+        },
         render::windows::display,
+        text::TextStyle,
         window::{FrameOutcome, WindowOptions},
     };
 
@@ -347,6 +412,7 @@ mod tests {
         let mut native = NativeWindow::create(
             id,
             &options,
+            None,
             Arc::clone(&dispatcher),
             None,
             app.window_a11y_epoch(id).expect("window exists"),
@@ -393,6 +459,7 @@ mod tests {
         let native = NativeWindow::create(
             id,
             &options,
+            None,
             Arc::clone(&dispatcher),
             None,
             app.window_a11y_epoch(id).expect("window exists"),
@@ -403,5 +470,118 @@ mod tests {
         let mut windows = vec![native];
         assert!(!apply_display_recovery(&mut app, &mut windows, &dispatcher));
         assert!(!dispatcher.take_frame_wake(), "没有请求时不得唤醒一帧");
+    }
+
+    /// X1：`WindowOptions::owner` 按 `WindowId` 解析到**已创建**原生窗口的 HWND；
+    /// 查不到（owner 已关闭 / 晚于 owned 创建）⇒ 降级为无 owner（函数内写诊断，不 panic）。
+    ///
+    /// 变异守卫：删掉建窗路径对 [`resolve_owner`] 的使用、或让它恒返回 `None`
+    /// ⇒ `window.rs` 的 `an_owned_window_reports_its_owner...` 与真机 X1 证据红。
+    #[test]
+    fn owner_resolution_maps_window_ids_to_live_native_windows() {
+        let options = WindowOptions::default();
+        let owner = NativeWindow::create(
+            crate::window::WindowId::for_test(1),
+            &options,
+            None,
+            Dispatcher::new(),
+            None,
+            crate::platform::windows::window::test_a11y_epoch(),
+        )
+        .expect("owner window");
+        let windows = vec![owner];
+
+        let mut options = WindowOptions {
+            owner: Some(crate::window::WindowId::for_test(1)),
+            ..WindowOptions::default()
+        };
+        assert_eq!(
+            resolve_owner(&options, &windows),
+            Some(windows[0].hwnd()),
+            "owner id 必须解析到已创建原生窗口的 HWND"
+        );
+
+        options.owner = Some(crate::window::WindowId::for_test(99));
+        assert_eq!(
+            resolve_owner(&options, &windows),
+            None,
+            "不存在的 owner 必须降级为无 owner（不 panic）"
+        );
+
+        options.owner = None;
+        assert_eq!(
+            resolve_owner(&options, &[]),
+            None,
+            "没有 owner 时直接返回 None"
+        );
+    }
+
+    /// B6/D6（Windows 对齐）：窗口失去键盘焦点（`PlatformEvent::Focus(false)`）时，泵侧必须清
+    /// 应用侧 IME caret hint（`WndProc` 不碰 `App`，清点只能在泵路径）；`FocusChanged { false }`
+    /// 事件本身照常入队派发。
+    #[test]
+    fn losing_window_focus_clears_the_app_ime_caret_hint() {
+        let runtime = runtime();
+        let mut app = App::new(runtime.handle().clone());
+        let options = WindowOptions::default();
+        let id = app.create_window(options.clone());
+        // 文本节点 + 真实 shape 后才有 IME caret hint（与 `window.rs` 的 IME 用例同款前置）。
+        let node = {
+            let window = app.window_mut(id).expect("窗口存在");
+            let root = window.tree().root();
+            NodeBuilder::text("abc", TextStyle::new(16.0))
+                .build(window.tree_mut(), root)
+                .expect("文本节点")
+        };
+        let _ = app.refresh_text(id).expect("窗口存在").expect("文本 pass");
+        let _ = app
+            .window_mut(id)
+            .expect("窗口存在")
+            .compute_layout()
+            .expect("布局");
+        let _ = app.layout_text(id).expect("窗口存在").expect("文本重排");
+        app.set_ime_cursor_area(id, node, 1).expect("caret hint");
+        assert!(
+            app.ime_cursor_area(id).expect("窗口存在").is_some(),
+            "前置：文本 shape 后必须有 caret hint"
+        );
+
+        let dispatcher = Dispatcher::new();
+        let mut native = NativeWindow::create(
+            id,
+            &options,
+            None,
+            Arc::clone(&dispatcher),
+            None,
+            crate::platform::windows::window::test_a11y_epoch(),
+        )
+        .expect("window");
+        let _ = dispatcher.take_frame_wake();
+        apply_event(
+            &mut app,
+            &mut native,
+            &dispatcher,
+            id,
+            StampedEvent {
+                event: PlatformEvent::Focus(false),
+                ticks_ms: 0,
+                scale: Scale::ONE,
+            },
+            std::time::Instant::now(),
+            0,
+        )
+        .expect("apply_event");
+
+        assert_eq!(
+            app.ime_cursor_area(id).expect("窗口存在"),
+            None,
+            "窗口失焦必须清应用侧 IME caret hint"
+        );
+        assert!(
+            app.drain_events().iter().any(|(window, event)| {
+                *window == id && matches!(event, Event::FocusChanged { focused: false })
+            }),
+            "失焦事件本身仍必须派发"
+        );
     }
 }

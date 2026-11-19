@@ -75,6 +75,15 @@ pub(crate) enum PlatformEvent {
         /// 让应用同步自己的 scale 与渲染目标。
         dpi: u32,
     },
+    /// 窗口客户区左上角发生移动（`WM_MOVE`）。
+    ///
+    /// 坐标是**屏幕物理像素**（客户区左上角，虚拟桌面坐标）；应用层事件
+    /// [`crate::event::Event::Moved`] 按 `StampedEvent::scale` 换算成逻辑坐标。
+    /// `WM_DPICHANGED` 建议矩形引起的系统移动由 `WndProc` 在入队前过滤，不会投递给泵。
+    Moved {
+        x: i32,
+        y: i32,
+    },
     Focus(bool),
     Appearance(bool),
     PointerLeave,
@@ -276,6 +285,9 @@ pub(crate) fn translate(
             let height = (lparam as u32 >> 16) & 0xFFFF;
             (width > 0 && height > 0).then_some(PlatformEvent::Resize { width, height })
         }
+        // B3：`WM_MOVE` 的 `lParam` = 客户区左上角的**屏幕物理坐标**（LOWORD/HIWORD 有符号）。
+        // `WM_DPICHANGED` 建议矩形引起的移动在 `WndProc` 里被过滤，泵看不到。
+        WM_MOVE => Some(PlatformEvent::Moved { x, y }),
         WM_DPICHANGED => {
             let dpi = (wparam as u32) & 0xFFFF;
             (dpi != 0).then_some(PlatformEvent::Dpi { dpi })
@@ -731,6 +743,20 @@ mod tests {
                 y: -300,
                 kind: PointerKind::Move
             })
+        );
+    }
+
+    /// B3：`WM_MOVE` 的 `lParam` 是客户区左上角的**屏幕物理**坐标（两个 16 位有符号数；
+    /// 负坐标是多屏虚拟桌面左上方向的合法位置）。
+    #[test]
+    fn window_moves_decode_signed_screen_coordinates() {
+        assert_eq!(
+            translate_raw(WM_MOVE, 0, lparam(320, 180)),
+            Some(PlatformEvent::Moved { x: 320, y: 180 })
+        );
+        assert_eq!(
+            translate_raw(WM_MOVE, 0, lparam(-1920, -200)),
+            Some(PlatformEvent::Moved { x: -1920, y: -200 })
         );
     }
 

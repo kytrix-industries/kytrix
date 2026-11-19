@@ -74,16 +74,56 @@ pub(crate) fn remove_node(app: &mut App, window: WindowId, node: NodeId) -> bool
 
 // ── 窗口 ──────────────────────────────────────────────────────────────────
 
+/// 本窗口的输入是否被某个**打开中的模态窗口**拦截（X1 引擎层模态）。
+///
+/// 判据：存在一个窗口 `m`，`m.options().modal == true` 且 `m.options().owner == Some(window)`。
+/// 即「本窗口是模态窗口的 owner」⇒ 模态期间 owner 不接收输入，直到模态窗口关闭。
+///
+/// 只拦截**直接 owner**（不递归 owner 链、不牵连 owner 的其它 owned 窗口）：与 Windows
+/// `EnableWindow(owner, FALSE)` 的作用面一致 —— 被禁用的是 owner 本身；owned 窗口在系统
+/// 语义里不是 owner 的子窗口（不是 `WS_CHILD`），不会自动禁用。
+///
+/// 消费者：`app::resources::dispatch`（三端统一兜底；Windows 另有原生 `EnableWindow` 路径）。
+pub(crate) fn is_input_blocked_by_modal(app: &App, window: WindowId) -> bool {
+    app.windows
+        .values()
+        .any(|candidate| candidate.options().modal && candidate.options().owner == Some(window))
+}
+
 /// 建一个窗口（headless：只建树与空场景）。`WindowId` 从 **1** 起单调 +1、永不复用
 /// （0 保留为非法句柄，见 `WindowId::from_raw`）。
 ///
 /// 同时铸造该窗口的**信号作用域**（`App::window_signal` 的归属；关窗时自动释放）。
 ///
+/// # X1：owner / modal 的合法性
+///
+/// - `owner` 必须**已存在**（同一 `App` 内先创建）。不存在/已关闭 ⇒ 按 `None` 处理并写诊断：
+///   陈旧句柄不得静默绑到新窗口（`WindowId` 永不复用，这里只是防御调用方传错）。
+/// - `modal` 必须有 owner；没有 owner 的模态请求降级为普通窗口并写诊断（不存在「无主模态」
+///   的合理语义，也不该 panic —— 建窗是应用常规路径）。
+///
+/// 级联生命周期：owner 被关闭时 owned 窗口一并关闭（见 [`close_window`]），与 Windows 原生
+/// owner 语义一致（不询问 owned 窗口的关闭处理器）。
+///
 /// # Panics
 /// 窗口句柄空间用尽（已建过 `u32::MAX` 个窗口）：`WindowId` 是 u32 的**单调不复用**句柄，
 /// 没有回绕语义 —— 回绕会与早已关闭的窗口 id 冲突。这是「句柄用尽」的显式行为（A5）。
 /// 消费者：`App::create_window`。
-pub(crate) fn create_window(app: &mut App, options: WindowOptions) -> WindowId {
+pub(crate) fn create_window(app: &mut App, mut options: WindowOptions) -> WindowId {
+    if let Some(owner) = options.owner
+        && !app.windows.contains_key(&owner)
+    {
+        eprintln!(
+            "kytrix: window owner {owner:?} does not exist; creating an independent top-level window"
+        );
+        options.owner = None;
+    }
+    if options.modal && options.owner.is_none() {
+        eprintln!(
+            "kytrix: a modal window needs an existing owner; creating a non-modal top-level window"
+        );
+        options.modal = false;
+    }
     let id = WindowId::from_raw(app.next_window_id);
     app.next_window_id = app
         .next_window_id
@@ -114,6 +154,22 @@ pub(crate) fn window(app: &App, id: WindowId) -> Option<&Window> {
 /// 消费者：`App::window_mut`。
 pub(crate) fn window_mut(app: &mut App, id: WindowId) -> Option<&mut Window> {
     app.windows.get_mut(&id)
+}
+
+/// 设置窗口的自绘标题栏拖动区（X2；坐标与平台语义见 `Window::set_drag_regions`）。
+///
+/// 值变化才唤醒平台泵：泵每轮把最新区域对账到原生窗口（Windows 的 `WM_NCHITTEST` 表 /
+/// macOS 的 `GuiView` 区域 / Linux 的 CSD move 判定）。窗口不存在时是 no-op。
+/// 消费者：`App::set_drag_regions`。
+pub(crate) fn set_drag_regions(app: &mut App, id: WindowId, regions: &[crate::math::Rect]) {
+    let Some(target) = app.windows.get_mut(&id) else {
+        return;
+    };
+    if target.drag_regions() == regions {
+        return;
+    }
+    target.set_drag_regions(regions);
+    app.dispatcher.wake();
 }
 
 /// 注册窗口的「关闭前」处理器：返回 `false` 拦下关闭（P2-8）。
@@ -230,10 +286,26 @@ pub(crate) fn request_close_all(app: &mut App, ids: &[WindowId]) -> bool {
 
 /// 关窗：精确退订该窗口全部节点的依赖，然后丢弃。返回 `false` = 窗口不存在。
 ///
+/// **X1：owner 级联** —— 关闭 owner 时先级联关闭它的 owned 窗口（递归，含 modal 窗口），
+/// 与 Windows 原生 owner 语义一致：系统销毁 owner 会一并销毁 owned 窗口、且**不询问**
+/// 它们的关闭处理器。因此级联是**无条件**的（应用主动 `close_window(owner)` 的语义就是
+/// 「连同附属窗口一起关闭」；如果应用想逐窗征求否决，应自己先逐窗 `request_close`）。
+///
 /// 同时清理所有按窗口的旁表（关闭处理器 / a11y 限流戳 / scale epoch / 动画槽），
 /// 否则 create/close 循环下这些表会无界增长。
 /// 消费者：`App::close_window`。
 pub(crate) fn close_window(app: &mut App, id: WindowId) -> bool {
+    // 先级联 owned 窗口（递归由被调用的 `close_window` 完成）；先收集再递归，避免在
+    // `app.windows` 的借用期内调用 `&mut App`。
+    let owned: Vec<WindowId> = app
+        .windows
+        .iter()
+        .filter(|(_, window)| window.options().owner == Some(id))
+        .map(|(window, _)| *window)
+        .collect();
+    for child in owned {
+        close_window(app, child);
+    }
     // 按窗口的旁表必须一并清掉，否则 create/close 循环下无界增长 —— 尤其是
     // `close_handlers`：它持有应用闭包（可能捕获大量状态）。`WindowId` 单调不复用，
     // 所以不会串用，但泄漏是真实的（复审发现：早期提交声称清了，实际没清）。

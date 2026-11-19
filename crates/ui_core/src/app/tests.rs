@@ -1524,6 +1524,30 @@ fn ime_cursor_area_requires_text_shape_and_can_be_cleared() {
     );
 }
 
+/// RB-03（用户裁决「焦点移走/窗口失焦统一清 caret hint」）：窗口失焦必须清 IME hint。
+///
+/// 变异检查：删掉 `on_window_focus_lost` 里的 `clear_ime_cursor_request` 调用 ⇒ 本测试红。
+#[test]
+fn losing_window_focus_clears_the_ime_cursor_hint() {
+    let (_rt, mut app, window, node) = text_app("abc", None);
+    let _ = refresh(&mut app, window);
+    let _ = layout(&mut app, window);
+    let _ = text_layout(&mut app, window);
+    assert!(app.set_ime_cursor_area(window, node, 1).is_ok());
+    assert!(
+        app.ime_cursor_area(window).expect("窗口存在").is_some(),
+        "前置：失焦前应有 caret hint"
+    );
+
+    app.dispatch(window, crate::event::Event::FocusChanged { focused: false });
+
+    assert_eq!(
+        app.ime_cursor_area(window).expect("窗口存在"),
+        None,
+        "窗口失焦后 caret hint 必须清空（三端统一清场）"
+    );
+}
+
 #[test]
 fn ime_cursor_area_resolves_after_the_first_frame() {
     let (_rt, mut app, window, node) = text_app("abc", None);
@@ -1847,4 +1871,111 @@ fn a_panicking_handler_is_not_lost() {
         "处理器必须仍在表里：旧实现在 unwind 里丢了闭包，分发会静默返回 false"
     );
     assert_eq!(hits.get(), 2, "处理器必须被再次调用");
+}
+
+// ── X1：owner / modal / 置顶的引擎层语义 ─────────────────────────────────
+
+#[test]
+fn a_modal_window_blocks_its_owners_input_until_it_closes() {
+    let (_rt, mut app) = new_app();
+    let owner = app.create_window(WindowOptions::default());
+    let modal = app.create_window(WindowOptions {
+        owner: Some(owner),
+        modal: true,
+        ..WindowOptions::default()
+    });
+    assert_eq!(
+        app.window(modal).expect("modal 存在").options().owner,
+        Some(owner),
+        "合法 owner 必须保留"
+    );
+
+    // 模态窗口自己的输入正常分发。
+    app.dispatch(
+        modal,
+        crate::event::Event::Input(crate::event::InputEvent::key_down(
+            crate::event::KeyCode::KeyA,
+            crate::event::Modifiers::empty(),
+        )),
+    );
+    assert_eq!(app.drain_events().len(), 1, "模态窗口本身不受限");
+
+    // owner 的输入被模态拦截：观测队列也不投递（与原生 EnableWindow 语义一致）。
+    app.dispatch(
+        owner,
+        crate::event::Event::Input(crate::event::InputEvent::key_down(
+            crate::event::KeyCode::KeyB,
+            crate::event::Modifiers::empty(),
+        )),
+    );
+    assert!(
+        app.drain_events().is_empty(),
+        "owner 在模态期间不得收到输入事件"
+    );
+
+    // 系统通知类事件不受模态影响。
+    app.dispatch(owner, crate::event::Event::CloseRequested);
+    assert_eq!(app.drain_events().len(), 1, "非输入事件必须仍然投递");
+
+    // 模态窗口关闭后 owner 输入恢复。
+    app.close_window(modal);
+    app.dispatch(
+        owner,
+        crate::event::Event::Input(crate::event::InputEvent::key_down(
+            crate::event::KeyCode::KeyC,
+            crate::event::Modifiers::empty(),
+        )),
+    );
+    assert_eq!(app.drain_events().len(), 1, "模态关闭后 owner 恢复输入");
+}
+
+#[test]
+fn a_modal_option_without_an_owner_is_demoted_to_a_normal_window() {
+    let (_rt, mut app) = new_app();
+    let id = app.create_window(WindowOptions {
+        modal: true,
+        ..WindowOptions::default()
+    });
+    let options = app.window(id).expect("窗口存在").options();
+    assert!(!options.modal, "无主模态降级为普通窗口");
+    assert_eq!(options.owner, None);
+}
+
+#[test]
+fn a_nonexistent_owner_is_ignored_instead_of_binding_a_stale_handle() {
+    let (_rt, mut app) = new_app();
+    let id = app.create_window(WindowOptions {
+        owner: Some(WindowId::for_test(999)),
+        ..WindowOptions::default()
+    });
+    assert_eq!(
+        app.window(id).expect("窗口存在").options().owner,
+        None,
+        "不存在/已关闭的 owner 不得绑定（WindowId 永不复用，陈旧句柄只能是调用方错误）"
+    );
+}
+
+#[test]
+fn closing_the_owner_cascades_to_owned_and_modal_windows() {
+    let (_rt, mut app) = new_app();
+    let owner = app.create_window(WindowOptions::default());
+    let panel = app.create_window(WindowOptions {
+        owner: Some(owner),
+        ..WindowOptions::default()
+    });
+    let modal = app.create_window(WindowOptions {
+        owner: Some(owner),
+        modal: true,
+        ..WindowOptions::default()
+    });
+    let grandchild = app.create_window(WindowOptions {
+        owner: Some(panel),
+        ..WindowOptions::default()
+    });
+
+    assert!(app.close_window(owner), "owner 必须关闭成功");
+    assert!(app.window(owner).is_none());
+    assert!(app.window(panel).is_none(), "owned 面板级联关闭");
+    assert!(app.window(modal).is_none(), "模态窗口级联关闭");
+    assert!(app.window(grandchild).is_none(), "级联必须递归");
 }

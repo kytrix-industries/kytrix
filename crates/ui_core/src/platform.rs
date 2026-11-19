@@ -27,6 +27,42 @@ pub(crate) mod ime;
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod menu;
 
+/// macOS 窗口摆放的**平台无关纯逻辑**（B3）：引擎逻辑坐标 ⇄ AppKit 全局屏幕坐标、
+/// `NSScreen.visibleFrame` 工作区 clamp、内容 min/max 钳制、`position = None` 时的级联
+/// 默认位置。
+///
+/// 与 [`menu`] 同一模式，只在 macOS 构建与测试构建里编译：`platform::macos` 整个模块是
+/// macOS-only（objc2 依赖也是），而这里全是纯数据 / 纯函数，必须在开发机（Windows）单测。
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod macos_placement;
+
+/// macOS 关闭语义的**平台无关状态机**（B5）：`performClose:` / `windowShouldClose:` 的用户
+/// 手势（可否决）与 `windowWillClose:` 的外部关闭（不可否决、终态）必须严格区分，泵每轮
+/// 据桥状态决定「投递事件 + 裁决 + 关窗」「只做关闭记账」还是「保留窗口」。
+///
+/// 与 [`macos_placement`] 同一模式：`platform::macos` 整模块 macOS-only，而这里不依赖
+/// AppKit 类型，状态迁移必须在开发机（Windows）单测。
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod macos_close;
+
+/// macOS 窗口层级的**平台无关纯逻辑**（X1 原生部分）：`always_on_top` / `modal` →
+/// AppKit `NSWindowLevel` 的选择（模态 > 置顶 > 普通），以及 `WindowOptions.owner` →
+/// `addChildWindow:ordered:` 关系的解析（含「平台侧找不到 owner 原生窗口」的降级判据）。
+///
+/// 与 [`macos_close`] 同一模式：`platform::macos` 整模块 macOS-only，这里不依赖 AppKit
+/// 类型，映射与优先级必须在开发机（Windows）单测。
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod macos_owner;
+
+/// macOS 自绘标题栏**拖动区**的命中判定纯逻辑（X2）：区域是逻辑窗口坐标（客户区左上原点、
+/// y 向下），`GuiView` 是 flipped，因此只需半开区间矩形包含判定；命中后真机侧把拖动交给
+/// WindowServer（`performWindowDragWithEvent:`）而不投递 `PointerDown`。
+///
+/// 与 [`macos_owner`] 同一模式：`platform::macos` 整模块 macOS-only，命中判定必须在开发机
+/// （Windows）单测（区域内/外、边界点、空/负尺寸区域、多区域顺序、y 向下）。
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod macos_drag;
+
 /// Wayland 协议层的纯逻辑（`wl_data_source` 生命周期、IME 焦点路由、光标形状/主题、
 /// `xdg_toplevel` 状态机）。
 ///

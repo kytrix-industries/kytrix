@@ -5,7 +5,7 @@
 //! 2. 所有可失败的 setup：calloop 事件循环 / 唤醒句柄 / `WaylandSource`；
 //! 3. 每轮泵开头把 `App` 的窗口集合同步到原生窗口：新增窗口建 `wl_surface` / toplevel 与
 //!    渲染器，`App` 已关闭的窗口销毁协议对象（[`sync_windows`]）；
-//! 4. 循环：drain 事件 → 逐窗口镜像 / 关闭 / 帧 → 钩子 → 任务 → a11y → 阻塞等待。
+//! 4. 循环：drain 事件 → 逐窗口镜像 / 关闭 / 帧 → 钩子 → 任务 → IME 策略 → a11y → 阻塞等待。
 //!
 //! R10 整改的四处接线：
 //!
@@ -17,6 +17,26 @@
 //!   压进 `dispatch` 的 timeout（否则要等下一个无关事件才降级）。
 //! - **强类型错误**（R10-16）：运行期 `dispatch` 失败按 `calloop::Error::IoError` 分类
 //!   （`EPIPE` ⇒ 合成器消失、`EPROTO` ⇒ 协议错误）。
+//!
+//! P1 补充接线：
+//!
+//! - **关闭请求事件**（B11）：`xdg_toplevel.close` 先经
+//!   [`crate::platform::wayland::close::handle_close_requests`] 投递 `Event::CloseRequested`，
+//!   再跑 `on_close` 裁决（与 Windows / macOS 同序）；
+//! - **IME 策略**（B9）：每轮在 `event_loop.dispatch` **之前** `sync_ime_policy`：焦点离开可编辑
+//!   文本或应用 `set_ime_enabled(false)` 时，同一轮内下发 `zwp_text_input_v3.disable()`。
+//! - **configure ack 时序**（B10）：初始 configure 在 `xdg_surface` 事件里立即 ack；改变
+//!   尺寸/状态的 configure 由 [`crate::platform::wayland::configure::ConfigureLatch`] 记住
+//!   serial，等使用该状态渲染的帧发布（`App::frame` 返回 `Committed`）后才
+//!   `ack_configure`。不可见 / 没渲染器 / `Idle` 的窗口没有帧可配对，在本轮 force ack
+//!   （否则静止窗口的 configure 永远不确认）。
+//! - **自绘标题栏拖动区**（X2）：泵在把平台事件交给 `App` **之前**逐条判定
+//!   （[`crate::platform::wayland::drag`]）：主键按下命中 `Window::drag_regions()` ⇒
+//!   `WaylandState::begin_move` 发 `xdg_toplevel.move(seat, serial)`，该次 `PointerDown`
+//!   不派发（拖动区是窗口 chrome，不是内容）；区域之外完全不变。
+//! - **呈现证据**（A4）：GPU 线程在 present 前请求 `wp_presentation.feedback`（帧序号写进
+//!   反馈 user data），终态事件由本泵在 `dispatch` 里派发；每轮 `poll_renderers` 之后把
+//!   presented/discarded 按 `FrameIndex` 回填窗口呈现历史。
 
 use std::{
     sync::Arc,
@@ -38,6 +58,7 @@ use crate::{
             surface::{self, WaylandState},
             wake,
         },
+        wayland::{close, drag},
     },
     render::backend::Renderer,
     window::{FrameOutcome, WindowControl, WindowId},
@@ -80,14 +101,19 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
 
     // `WaylandState::new` 要先建**一个**原生窗口（连接、协议工厂与首个 surface 的初始化在同
     // 一条路径上）；其余窗口（含启动时就存在的）由下面的 `sync_windows` 统一建。
-    let (first_id, first_size, first_title) = app
+    //
+    // 取**最小 id**（= 最早创建）而不是 `App` 哈希表迭代到的任意一条：X1 的 owner 语义要求
+    // owner 先于 owned 窗口建原生对象（`xdg_toplevel.set_parent` 只能引用已存在的 toplevel）。
+    // `WindowId` 单调递增（永不复用）⇒ 最早创建的窗口必是本批其它窗口可能的 owner；`sync_windows`
+    // 对剩余窗口按同一顺序排序（见那里的注释）。
+    let (first_id, first_options) = app
         .windows()
-        .next()
-        .map(|(id, window)| (id, window.size(), window.options().title.clone()))
+        .min_by_key(|(id, _)| id.to_bits())
+        .map(|(id, window)| (id, window.options().clone()))
         .ok_or(EngineError::AppInit {
             detail: smol_str::SmolStr::new_static("Application::run without a window"),
         })?;
-    let (mut state, mut queue) = WaylandState::new(first_size, first_title.as_str(), first_id)?;
+    let (mut state, mut queue) = WaylandState::new(first_id, &first_options)?;
     surface::initial_roundtrip(&mut queue, &mut state)?;
     surface::create_devices(&mut state)?;
     // **`app` 必须作为局部变量声明在 `state` 之后**：Rust 的局部变量按声明逆序析构，而函数
@@ -158,6 +184,30 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             // 每个事件**自带**窗口 id（P1-2.8 Stage C-2）：多窗口下同一批里可能混着不同窗口的
             // 事件，不能再用「当前窗口」统一派发。
             for (target, event) in events {
+                // X2：自绘标题栏拖动区内的**主键按下**转成 `xdg_toplevel.move(seat, serial)`，
+                // 交给 compositor 驱动移动，**不投递** `PointerDown` —— 拖动区是窗口 chrome，
+                // 不是内容：应用收不到这次按下 ⇒ 不开始指针会话、不产生 click / drag 动作；
+                // 之后同一按键的 motion / up 由 compositor 的隐式抓取接管。
+                //
+                // 判定放在泵里（而不是 `wl_pointer.button` 的协议回调里）：那里只有
+                // `WaylandState`、拿不到 `App` 的拖动区；泵在派发前读 `Window::drag_regions()`
+                // 的当前值（应用在上一轮响应里设置），与 Windows 平台层「每轮对账」同一时机。
+                //
+                // serial：`WaylandState::begin_move` 用最近一次指针按键的 serial（协议要求隐式
+                // 抓取请求带输入事件的 serial）；同一批里多个按键的极端情况取最后一条，仍是
+                // 本 seat 的有效输入 serial。
+                //
+                // 降级：compositor 不实现交互移动时 `move` 是无副作用的 no-op（协议没有
+                // 「不支持」错误）；应用仍可用 `WindowControl::BeginMove` 的显式路径。
+                if let Some(position) = drag::drag_press_position(&event)
+                    && app
+                        .window(target)
+                        .is_some_and(|window| drag::hit(window.drag_regions(), position))
+                    && let Some(index) = state.window_index(target)
+                {
+                    state.begin_move(index);
+                    continue;
+                }
                 app.dispatch(target, event);
             }
             if had_events {
@@ -169,6 +219,10 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             // 所有 Vulkan 工作都在 `kytrix-vulkan`
             // 线程上，UI 线程只读反馈（I1）。
             app.poll_renderers()?;
+            // ①c A4：`wp_presentation` 的 presented/discarded 在上一轮末尾的 `dispatch` 里进了
+            // 各窗口的呈现邮箱；这里按 `FrameIndex` 回填窗口呈现历史（完成反馈已在 ①b 落账，
+            // 事件晚于它到达；还没出现在历史里的条目留在邮箱里下一轮再取）。
+            state.backfill_presentation(&mut app);
             // ② 逐窗口镜像平台真值：**只在值变化时**设置（`set_scale` 推进 scale epoch；二者置
             // full-damage、重排根 LAYOUT，每轮无条件调用会让 UI 永久失效）。没有渲染器的窗口还没
             // 有镜像记账（首个 configure 之后才建），由 `sync_windows` 负责初次写入。
@@ -239,19 +293,17 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                 let _ = register_pending_send(&loop_handle, pending);
             }
 
-            // ③ 关闭请求（`xdg_toplevel.close`）：先关 `App` 窗口（drop 渲染器 → GPU 线程
-            // join），再销毁原生窗口（drop 协议对象），顺序与窗口销毁的依赖方向一致。
+            // ③ 关闭请求（`xdg_toplevel.close`）：先投递 `Event::CloseRequested`（通知），再由
+            // `App::request_close` 裁决（与 Windows / macOS 同一顺序，B11）；只有批准关闭的窗口
+            // 才销毁原生对象 —— 先关 `App` 窗口（drop 渲染器 → GPU 线程 join），再 drop 协议
+            // 对象，顺序与窗口销毁的依赖方向一致。
             let mut closing: Vec<WindowId> = Vec::new();
             for index in 0..state.window_count() {
                 if state.take_close_request(index) {
                     closing.push(state.window_id(index));
                 }
             }
-            for id in closing {
-                // 先问应用：on_close 返回 false 就拦下这次关闭（P2-8）。
-                if !app.request_close(id) {
-                    continue;
-                }
+            for id in close::handle_close_requests(&mut app, &closing) {
                 state.remove_window(id);
                 a11ys.retain(|entry| entry.id != id);
                 mirrors.retain(|entry| entry.id != id);
@@ -333,30 +385,53 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                     match app.frame(id) {
                         None | Some(Ok(FrameOutcome::Idle)) => {
                             state.note_frame_not_committed(index);
+                            // B10：本帧没有 publish（Idle / 窗口已不在），没有「使用新状态的帧」
+                            // 可以配对 ⇒ force ack。**例外**：被帧预算门禁推迟的帧（A5）状态仍
+                            // 保留、下一拍就会真的出帧（`deferred_frames` 保证），此时不能提前
+                            // ack —— 否则 maximize 恰好撞上预算合并时又会回到「先 ack 后画」。
+                            let budget_deferred = app
+                                .window(id)
+                                .is_some_and(crate::window::Window::frame_budget_deferred);
+                            if !budget_deferred {
+                                state.ack_pending_configure(index);
+                            }
                             // A5：本帧被帧预算门禁推迟（不是空闲：脏位保留）⇒ 记进
                             // `deferred_frames`，到期后**不依赖新唤醒**补一帧（下面的 timeout 会
                             // 压到 `next_deferred_deadline`）。
-                            if app
-                                .window(id)
-                                .is_some_and(crate::window::Window::frame_budget_deferred)
-                                && !deferred_frames.contains(&id)
-                            {
+                            if budget_deferred && !deferred_frames.contains(&id) {
                                 deferred_frames.push(id);
                             }
                         }
-                        Some(Ok(FrameOutcome::Committed(_))) => {}
+                        Some(Ok(FrameOutcome::Committed(_))) => {
+                            // B10：使用 configure 状态渲染的帧已发布给 GPU 线程（present 时
+                            // `wl_surface.commit`）⇒ 现在才 ack 该 configure（Qt 式 latch）。
+                            state.ack_pending_configure(index);
+                        }
                         Some(Err(error)) => return Err(error),
                     }
+                }
+            }
+            // B10：不参与帧循环的窗口（不可见 / 还没建渲染器）永远等不到「使用新状态的帧已
+            // 发布」——在这里 force ack，否则静止窗口的 configure 会一直悬挂（compositor 可能
+            // 不完成映射 / 状态切换）。可见且已挂渲染器的窗口在帧提交或 Idle 分支 ack，不能在
+            // 这里提前发（那会回到「先 ack 后画」的旧时序）。
+            for index in 0..state.window_count() {
+                let id = state.window_id(index);
+                let renders = state.is_visible(index)
+                    && app.window(id).is_some_and(|window| window.has_renderer());
+                if !renders {
+                    state.ack_pending_configure(index);
                 }
             }
             for task in dispatcher.drain_tasks() {
                 task.run(&mut app);
             }
-            // ⑤ IME caret hint（逐窗口）：每轮泵调用，独立于帧门禁。
-            for index in 0..state.window_count() {
-                let id = state.window_id(index);
-                state.sync_ime_cursor_area(&app, id);
-            }
+            // ⑤ IME：把应用目标状态（`App::ime_enabled` × `App::ime_cursor_area`）写成每窗口
+            // 策略，收敛 text-input 的 enable/disable，再下发本轮 caret / content_type。
+            // **必须在下面 `event_loop.dispatch` 派发协议事件之前**（本轮应用事件与布局都已
+            // 处理完）：键盘 / text-input 的 enter/leave 用的是**本轮最新**策略，不会出现
+            // 「按旧策略先 enable、同一轮再 disable」的抖动（B9）。
+            state.sync_ime_policy(&app);
 
             // ⑥ 剪贴板发布（需要最新输入 serial）+ a11y 增量。
             let serial = state.serial();
@@ -519,13 +594,17 @@ fn sync_windows(
         a11ys.retain(|entry| entry.id != id);
         mirrors.retain(|entry| entry.id != id);
     }
-    let missing: Vec<(WindowId, Size, smol_str::SmolStr)> = app
+    let mut missing: Vec<(WindowId, crate::window::WindowOptions)> = app
         .windows()
         .filter(|(id, _)| state.window_index(*id).is_none())
-        .map(|(id, window)| (id, window.size(), window.options().title.clone()))
+        .map(|(id, window)| (id, window.options().clone()))
         .collect();
-    for (id, size, title) in missing {
-        state.add_window(id, size, title.as_str())?;
+    // X1：按**创建顺序**建原生窗口（`WindowId` 单调递增 ⇒ 升序 = 创建顺序）。owner 必须先于
+    // owned 窗口存在，否则 `set_parent` 只能降级（诊断 + 不设）；`App` 的窗口表是 `HashMap`，
+    // 迭代顺序不确定，这里显式排序钉住（启动路径与运行期新增共用本函数）。
+    missing.sort_by_key(|(id, _)| id.to_bits());
+    for (id, options) in missing {
+        state.add_window(id, &options)?;
     }
     // a11y adapter 与协议对象同生命周期：`App` 里每个窗口在 `WaylandState` 里有且仅有一个。
     for index in 0..state.window_count() {
@@ -565,6 +644,9 @@ fn sync_windows(
         // viewport 的所有权交给渲染器：destination 必须与 buffer 同一次 present 生效（D1 / D2）。
         let viewport = state.take_viewport(index);
         let surface = state.surface_clone(index);
+        // A4：呈现反馈请求句柄交给 GPU 线程（在 present 前创建 `wp_presentation.feedback`）。
+        // 协议不可用时是 `None`（平台层已记豁免），该窗口 `presented_at` 如实恒为 `None`。
+        let presentation = state.presentation_handle(index);
         let Some(background) = app.window(id).map(|window| window.options().background) else {
             continue;
         };
@@ -575,6 +657,7 @@ fn sync_windows(
             background,
             viewport,
             surface,
+            presentation,
         )?;
         let Some(window) = app.window_mut(id) else {
             continue;

@@ -56,6 +56,28 @@
 //! [`ImeStateSnapshot`] 与上次已提交快照做差来决定，本模块只提供两个计数：
 //! `commits`（已发出的 `commit()` 次数 = 下一个 `done` 的期望 serial）与 `acked`
 //! （最后一次匹配上的 serial）；`commits != acked` ⇒ 有批在飞，新的状态更新应等 `done`。
+//!
+//! # B9：焦点是否「可编辑」决定 enable / disable
+//!
+//! `zwp_text_input_v3` 只有「焦点 surface」一个概念，**没有**「当前焦点是不是输入框」的协议
+//! 请求。XML `enable`：*"This request must be issued every time the focused text input changes
+//! to a new one, including within the current surface. Use zwp_text_input_v3.disable when there
+//! is no longer any input focus on the current surface."* —— 焦点从输入框移到**同一个 surface
+//! 内**的图表/列表（或应用 `set_ime_enabled(false)`）时也必须 `disable()`，否则 compositor
+//! 侧永远认为该 surface 有文本焦点：候选窗不消失、按键被输入法路由走却没有任何文本目标。
+//!
+//! 本状态机因此把「协议真实状态」和「候选目标」分开：
+//!
+//! ```text
+//! 每窗口策略 = (应用开关 app_enabled, 文本目标 text_target)   ← 泵每轮 dispatch 协议事件前同步
+//! 候选目标   = 键盘焦点窗口（wl_keyboard.enter / text_input.enter）
+//! desired    = 候选目标.filter(策略允许 enable)              ← 唯一的收敛判据点
+//! 协议动作    = desired 与已 enable 的 focus 不同 ⇒ disable / enable（disable 优先）
+//! ```
+//!
+//! 收敛只在 [`TextInputRoute::reconcile`] 里发生一次 ⇒ 不重复 `commit()`、不重复补
+//! `ImeEvent::End`；策略不允许时的 `focus()` 恒 `None`，[`Self::takes_text`] 因此为 `false`，
+//! 按键走普通键盘通路（`InputEvent::Text`）。
 
 use std::time::{Duration, Instant};
 
@@ -78,11 +100,62 @@ pub(crate) struct FocusChange {
     pub enable: bool,
 }
 
+/// 一个窗口的 IME 策略（B9）：应用开关 × 文本目标。
+///
+/// 两个信号都由泵每轮从 `App` 同步（`sync_ime_policy`，在 dispatch 协议事件**之前**）：
+///
+/// - `app_enabled` = `App::ime_enabled`（`App::set_ime_enabled`，默认 `true`）；
+/// - `text_target` = `App::ime_cursor_area` 是否 `Ok(Some(_))` —— 应用声明的 caret hint，
+///   即「焦点落在可编辑文本上」。应用在焦点离开文本节点时必须清 hint
+///   （`App::clear_ime_cursor_area`），D6(a) 的裁决口径。
+///
+/// 只有两者同时为真才允许 `enable`；`text_target == false`（焦点在图表/列表/无焦点）或应用
+/// 禁用时协议状态必须是 `disable` —— 这是「同一 surface 内焦点从文本移到非文本也必须
+/// disable」的唯一判据点。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowImePolicy {
+    /// 应用开关（`App::ime_enabled`）。
+    app_enabled: bool,
+    /// 应用声明的文本目标（`App::ime_cursor_area` 有值）。
+    text_target: bool,
+}
+
+impl Default for WindowImePolicy {
+    fn default() -> Self {
+        // `app_enabled` 默认与 `App::ime_enabled` 一致（启用）；`text_target` 默认 `false` ——
+        // 应用声明 caret hint 之前没有可编辑焦点，不得凭「窗口存在」就 enable。
+        Self {
+            app_enabled: true,
+            text_target: false,
+        }
+    }
+}
+
+impl WindowImePolicy {
+    /// 是否允许 text-input 在该窗口上 enable。
+    const fn allows_text_input(self) -> bool {
+        self.app_enabled && self.text_target
+    }
+}
+
 /// `zwp_text_input_v3` 的客户端侧状态机（纯逻辑，可在开发机上单测）。
+///
+/// 协议对象的真实状态是 `focus`（已 enable 的窗口），候选目标是 `keyboard_focus`；二者之间
+/// 的差由 [`Self::reconcile`] 收敛，是否允许 enable 由每窗口策略（[`WindowImePolicy`]）决定。
 #[derive(Debug, Default)]
 pub(crate) struct TextInputRoute {
-    /// 当前 text-input 焦点（窗口下标；`None` = 没有 enable 任何 surface）。
+    /// 当前已 `enable` 的窗口下标（协议真实状态；`None` = text-input 对象处于 disable）。
     focus: Option<u32>,
+    /// 键盘焦点窗口下标（候选目标；策略不允许时存在但不 enable）。
+    ///
+    /// `wl_keyboard.enter` / `zwp_text_input_v3.enter` 更新（两个信号是同一焦点变化的两个来源，
+    /// 收敛到同一个候选）。
+    keyboard_focus: Option<u32>,
+    /// 每窗口 IME 策略（下标与 `WaylandState::windows` 一一对应）。
+    ///
+    /// [`Self::add_window`] / [`Self::reindex_removed`] 维护增删与下标前移；策略值由泵每轮从
+    /// `App` 覆盖写入（[`Self::set_policy`]）。
+    policies: Vec<WindowImePolicy>,
     /// 已发出的 `commit()` 次数（`done.serial` 的期望值）。
     commits: u32,
     /// 最后一次**匹配上的** `done.serial`（= 最近一次被 compositor 确认的 `commit()`）。
@@ -100,41 +173,97 @@ pub(crate) struct TextInputRoute {
     /// 本进程**第一次** `enable()` 的时刻（降级计时的唯一起点）。
     ///
     /// 只设一次、从不因焦点切换复位：否则「每换一次焦点重新给 1.5 s 窗口期」会让无输入法的
-    /// compositor 上每次换焦点都有 1.5 s 文本真空（AR3 §3.2）。
+    /// compositor 上每次换焦点都有 1.5 s 文本真空（AR3 §3.2）。策略不允许的焦点不会 enable，
+    /// 因此也不会提前开始计时。
     first_enable_at: Option<Instant>,
 }
 
 impl TextInputRoute {
-    /// `zwp_text_input_v3.enter`（或 `wl_keyboard.enter` 的 IME 侧）：把焦点设到 `window`。
+    /// 新增一个窗口（下标 = 当前窗口数）；默认策略「应用启用、无文本目标」。
+    pub(crate) fn add_window(&mut self) {
+        self.policies.push(WindowImePolicy::default());
+    }
+
+    /// 写入一个窗口的策略（`sync_ime_policy` 每轮调用；**不**在这里收敛协议状态）。
+    pub(crate) fn set_policy(&mut self, window: u32, app_enabled: bool, text_target: bool) {
+        let Some(policy) = self.policies.get_mut(window as usize) else {
+            debug_assert!(
+                false,
+                "窗口策略表与 WaylandState::windows 不同步（缺下标 {window}）"
+            );
+            return;
+        };
+        *policy = WindowImePolicy {
+            app_enabled,
+            text_target,
+        };
+    }
+
+    /// 键盘焦点进入 `window`（`wl_keyboard.enter` / `zwp_text_input_v3.enter`）。
     ///
-    /// **不重置降级状态与计时**（per-seat 判据，见模块文档）：换 surface 只换协议对象的焦点，
-    /// 背后的输入法引擎没变。
-    pub(crate) fn enter(&mut self, window: u32, now: Instant) -> FocusChange {
-        if self.focus == Some(window) {
+    /// **不**立即 enable：是否真的接管文本要等 [`Self::reconcile`] 按策略判定（焦点在非编辑
+    /// 控件上时保持 disable，B9）。
+    pub(crate) fn focus_in(&mut self, window: u32) {
+        self.keyboard_focus = Some(window);
+    }
+
+    /// 键盘焦点离开 `window`（`wl_keyboard.leave` / `zwp_text_input_v3.leave`）。
+    ///
+    /// 只清「正是这个窗口」的候选：迟到的 leave 不得清掉新焦点的候选。
+    pub(crate) fn focus_out(&mut self, window: u32) {
+        if self.keyboard_focus == Some(window) {
+            self.keyboard_focus = None;
+        }
+    }
+
+    /// 按「键盘焦点 × 每窗口策略」收敛协议状态，返回需要下发的 enable/disable。
+    ///
+    /// **唯一的收敛点**（B9）：`desired = 键盘焦点窗口.filter(策略允许)`，与已 enable 的
+    /// `focus` 不同才产生一次变化。因此：
+    ///
+    /// - 焦点在非编辑元素上（`text_target == false`）⇒ `desired == None` ⇒ `disable`；
+    /// - 应用 `ImmAssociate` 等价物 `set_ime_enabled(false)` ⇒ 同上 disable，且
+    ///   [`Self::takes_text`] 恒 `false`（按键走普通键盘通路）；
+    /// - 重新允许且仍聚焦文本 ⇒ enable（调用方整份重发 `set_content_type` /
+    ///   `set_cursor_rectangle`）；
+    /// - 策略/焦点没变 ⇒ 空变化：不重复 `commit()`，也不会重复补 `ImeEvent::End`。
+    pub(crate) fn reconcile(&mut self, now: Instant) -> FocusChange {
+        let desired = self.desired_focus();
+        if desired == self.focus {
             return FocusChange::default();
         }
         let change = FocusChange {
             disable: self.focus.is_some(),
-            enable: true,
+            enable: desired.is_some(),
         };
-        self.focus = Some(window);
-        // 计时起点只在这里**第一次**落定；之后的焦点切换不改它。
-        self.first_enable_at.get_or_insert(now);
+        self.focus = desired;
+        if change.enable {
+            // 降级计时起点：本 seat **第一次真正 enable** 的时刻（只设一次，跨焦点切换保持）。
+            self.first_enable_at.get_or_insert(now);
+        }
         change
     }
 
-    /// 关闭窗口 / 退出：无条件停用（`remove_window` 不能再误伤焦点窗口，见 `is_focus`）。
+    /// 策略允许的启用目标（= 键盘焦点窗口，若其策略允许 text-input）。
+    fn desired_focus(&self) -> Option<u32> {
+        let window = self.keyboard_focus?;
+        let policy = self.policies.get(window as usize)?;
+        policy.allows_text_input().then_some(window)
+    }
+
+    /// 关闭窗口 / 退出：无条件停用（清掉候选与协议焦点）。
     ///
     /// 降级状态**不清**：本 seat 有没有输入法不因「当前没有文本焦点」而改变（下一次 enable
     /// 若重新计时，就又把 1.5 s 真空还给了没有输入法的 compositor）。
     pub(crate) fn disable(&mut self) -> FocusChange {
-        if self.focus.is_none() {
-            return FocusChange::default();
-        }
-        self.focus = None;
-        FocusChange {
-            disable: true,
-            enable: false,
+        self.keyboard_focus = None;
+        if self.focus.take().is_some() {
+            FocusChange {
+                disable: true,
+                enable: false,
+            }
+        } else {
+            FocusChange::default()
         }
     }
 
@@ -150,18 +279,23 @@ impl TextInputRoute {
         self.focus == Some(window)
     }
 
-    /// 一个窗口被移除后修正焦点下标（`windows` 是 `Vec`，移除位置之后的下标整体 -1）。
+    /// 该窗口是否持有键盘焦点（候选目标，可能因策略不允许而尚未 enable）。
+    #[must_use]
+    pub(crate) fn is_keyboard_focus(&self, window: u32) -> bool {
+        self.keyboard_focus == Some(window)
+    }
+
+    /// 一个窗口被移除后修正下标（`windows` 是 `Vec`，移除位置之后的下标整体 -1）。
     ///
-    /// 被移除的正是焦点时置 `None`（调用方在此之前已经 `disable` 过协议对象）。
+    /// 被移除的正是焦点 / 键盘焦点时置 `None`（调用方在此之前已经 `disable` 过协议对象）；
+    /// 每窗口策略表同步移除。其它窗口的下标按同一套规则前移。
     pub(crate) fn reindex_removed(&mut self, removed: u32) {
-        let Some(focus) = self.focus else {
-            return;
-        };
-        if focus == removed {
-            self.focus = None;
-        } else if focus > removed {
-            self.focus = Some(focus - 1);
+        let removed = removed as usize;
+        if removed < self.policies.len() {
+            self.policies.remove(removed);
         }
+        self.focus = shifted(self.focus, removed);
+        self.keyboard_focus = shifted(self.keyboard_focus, removed);
     }
 
     /// 记录一次 `commit()` 请求（`done.serial` 的期望值 = 已发出的 commit 次数）。
@@ -228,6 +362,15 @@ impl TextInputRoute {
         }
         let first_enable_at = self.first_enable_at?;
         Some(NO_IM_FALLBACK.saturating_sub(now.duration_since(first_enable_at)))
+    }
+}
+
+/// 窗口下标重映射：移除 `removed` 之后，等于它的置 `None`、大于它的减一。
+fn shifted(index: Option<u32>, removed: usize) -> Option<u32> {
+    match index {
+        Some(index) if index as usize == removed => None,
+        Some(index) if index as usize > removed => Some(index - 1),
+        other => other,
     }
 }
 
@@ -367,9 +510,24 @@ mod tests {
     };
     use crate::{event::Modifiers, math::Rect, window::ImeContentType};
 
-    fn route_with_focus(now: Instant) -> TextInputRoute {
+    /// 建一个「窗口数足够、指定窗口都是文本目标（应用启用）」的路由，供 R10 系列用例使用。
+    fn route_with_text_targets(windows: &[u32]) -> TextInputRoute {
         let mut route = TextInputRoute::default();
-        let change = route.enter(7, now);
+        let count = windows.iter().max().map_or(0, |max| max + 1);
+        for _ in 0..count {
+            route.add_window();
+        }
+        for &window in windows {
+            route.set_policy(window, true, true);
+        }
+        route
+    }
+
+    /// 一个已 enable 的路由（窗口 0 是文本目标、应用启用、已 commit 一次）。
+    fn route_with_focus(now: Instant) -> TextInputRoute {
+        let mut route = route_with_text_targets(&[0]);
+        route.focus_in(0);
+        let change = route.reconcile(now);
         assert!(change.enable && !change.disable);
         route.note_commit();
         route
@@ -379,17 +537,19 @@ mod tests {
     #[test]
     fn focus_changes_disable_the_previous_surface_first() {
         let now = Instant::now();
-        let mut route = TextInputRoute::default();
+        let mut route = route_with_text_targets(&[1, 2]);
+        route.focus_in(1);
         assert_eq!(
-            route.enter(1, now),
+            route.reconcile(now),
             super::FocusChange {
                 disable: false,
                 enable: true
             }
         );
         assert_eq!(route.focus(), Some(1));
+        route.focus_in(2);
         assert_eq!(
-            route.enter(2, now),
+            route.reconcile(now),
             super::FocusChange {
                 disable: true,
                 enable: true
@@ -401,9 +561,11 @@ mod tests {
     #[test]
     fn entering_the_same_surface_twice_is_a_no_op() {
         let now = Instant::now();
-        let mut route = TextInputRoute::default();
-        route.enter(3, now);
-        assert_eq!(route.enter(3, now), super::FocusChange::default());
+        let mut route = route_with_text_targets(&[3]);
+        route.focus_in(3);
+        assert!(route.reconcile(now).enable);
+        route.focus_in(3);
+        assert_eq!(route.reconcile(now), super::FocusChange::default());
     }
 
     /// R10-6 的核心回归：`is_focus` 是「该不该为这个窗口停用 IME」的唯一判据 —— 关闭/失焦
@@ -411,9 +573,10 @@ mod tests {
     #[test]
     fn only_the_focused_window_is_reported_as_the_ime_target() {
         let now = Instant::now();
-        let mut route = TextInputRoute::default();
+        let mut route = route_with_text_targets(&[5]);
+        route.focus_in(5);
         assert_eq!(
-            route.enter(5, now),
+            route.reconcile(now),
             super::FocusChange {
                 disable: false,
                 enable: true
@@ -437,9 +600,10 @@ mod tests {
     #[test]
     fn disable_is_idempotent_and_reports_whether_it_changed_anything() {
         let now = Instant::now();
-        let mut route = TextInputRoute::default();
+        let mut route = route_with_text_targets(&[1]);
         assert_eq!(route.disable(), super::FocusChange::default());
-        route.enter(1, now);
+        route.focus_in(1);
+        assert!(route.reconcile(now).enable);
         assert_eq!(
             route.disable(),
             super::FocusChange {
@@ -450,20 +614,24 @@ mod tests {
         assert_eq!(route.disable(), super::FocusChange::default());
     }
 
-    /// R10-6：窗口被移除后焦点下标必须跟着前移（否则 IME 会投给另一个窗口）。
+    /// R10-6：窗口被移除后焦点下标必须跟着前移（否则 IME 会投给另一个窗口）；
+    /// 每窗口策略表同步前移。
     #[test]
     fn removing_a_window_reindexes_the_ime_target() {
         let now = Instant::now();
-        let mut route = TextInputRoute::default();
-        route.enter(3, now);
-        // 移除下标 1（在焦点之前）⇒ 焦点 3 → 2。
+        let mut route = route_with_text_targets(&[0, 1, 2, 3]);
+        route.focus_in(3);
+        assert!(route.reconcile(now).enable);
+        // 移除下标 1（在焦点之前）⇒ 焦点 3 → 2，策略表同步前移。
         route.reindex_removed(1);
         assert_eq!(route.focus(), Some(2));
         // 移除焦点窗口 ⇒ 没有焦点（调用方负责在此之前 disable 协议对象）。
         route.reindex_removed(2);
         assert_eq!(route.focus(), None);
         // 移除之后的窗口不影响焦点。
-        route.enter(1, now);
+        route.set_policy(1, true, true);
+        route.focus_in(1);
+        assert!(route.reconcile(now).enable);
         route.reindex_removed(5);
         assert_eq!(route.focus(), Some(1));
     }
@@ -546,16 +714,23 @@ mod tests {
 
     /// AR3 §3.2 P1：换焦点**不得**重置降级计时。
     ///
-    /// 计时的起点是「本进程第一次 enable」，之后 `enter`/`leave`/`disable` 都不动它：否则没有
-    /// 输入法的 compositor 上每换一次焦点都要重新等 1.5 s，而输入法根本不可能出现。
+    /// 计时的起点是「本进程第一次 enable」，之后 `focus_in`/`focus_out`/`disable` 都不动它：否则
+    /// 没有输入法的 compositor 上每换一次焦点都要重新等 1.5 s，而输入法根本不可能出现。
     #[test]
     fn switching_focus_does_not_restart_the_fallback_timer() {
         let now = Instant::now();
-        let mut route = route_with_focus(now);
-        // 在窗口 7 上启用后立刻换到窗口 8（例如 Tab 到下一个输入框）。
+        let mut route = route_with_text_targets(&[7, 8]);
+        route.focus_in(7);
+        assert!(route.reconcile(now).enable);
         route.note_commit();
+        // 在窗口 7 上启用后立刻换到窗口 8（例如 Tab 到下一个输入框）。
         let switched_at = now + Duration::from_millis(100);
-        route.enter(8, switched_at);
+        route.focus_in(8);
+        let change = route.reconcile(switched_at);
+        assert!(
+            change.disable && change.enable,
+            "换 surface = 先 disable 再 enable"
+        );
         assert_eq!(
             route.next_degrade_in(switched_at),
             Some(NO_IM_FALLBACK - Duration::from_millis(100)),
@@ -572,13 +747,15 @@ mod tests {
     #[test]
     fn switching_focus_does_not_undo_a_degraded_seat() {
         let now = Instant::now();
-        let mut route = route_with_focus(now);
+        let mut route = route_with_text_targets(&[7, 8]);
+        route.focus_in(7);
+        assert!(route.reconcile(now).enable);
         assert!(route.should_degrade(now + NO_IM_FALLBACK));
         assert!(!route.takes_text());
 
         let later = now + NO_IM_FALLBACK * 2;
-        route.note_commit();
-        route.enter(8, later);
+        route.focus_in(8);
+        assert!(route.reconcile(later).enable);
         assert!(
             !route.takes_text(),
             "换焦点后键盘文本必须继续产生（旧实现会在这里再开一个 1.5 s 的真空）"
@@ -595,12 +772,15 @@ mod tests {
     #[test]
     fn disabling_the_focus_does_not_forget_the_seat_verdict() {
         let now = Instant::now();
-        let mut route = route_with_focus(now);
+        let mut route = route_with_text_targets(&[0, 2]);
+        route.focus_in(0);
+        assert!(route.reconcile(now).enable);
         assert!(route.should_degrade(now + NO_IM_FALLBACK));
         route.disable();
         assert!(!route.takes_text(), "没有焦点时键盘通路本来就该产生文本");
 
-        route.enter(2, now + NO_IM_FALLBACK * 3);
+        route.focus_in(2);
+        assert!(route.reconcile(now + NO_IM_FALLBACK * 3).enable);
         assert!(
             !route.takes_text(),
             "重新聚焦不得再开一个 1.5 s 的 IME 窗口期"
@@ -613,13 +793,198 @@ mod tests {
     #[test]
     fn an_im_event_is_remembered_for_the_whole_seat() {
         let now = Instant::now();
-        let mut route = route_with_focus(now);
+        let mut route = route_with_text_targets(&[0, 3]);
+        route.focus_in(0);
+        assert!(route.reconcile(now).enable);
         route.note_im_event();
         route.disable();
-        route.enter(3, now + Duration::from_secs(10));
+        route.focus_in(3);
+        assert!(route.reconcile(now + Duration::from_secs(10)).enable);
         assert!(route.takes_text());
         assert!(!route.should_degrade(now + Duration::from_secs(60)));
         assert_eq!(route.next_degrade_in(now + Duration::from_secs(60)), None);
+    }
+
+    // ── B9：文本目标 / 应用开关决定 enable / disable ──────────────────────────
+
+    /// B9：键盘焦点落在**非编辑控件**上（同 surface 内的图表/列表）⇒ 不 enable、也不 disable。
+    #[test]
+    fn a_non_text_focus_neither_enables_nor_disables() {
+        let now = Instant::now();
+        let mut route = TextInputRoute::default();
+        route.add_window();
+        route.set_policy(0, true, false); // 应用启用，但焦点不是文本目标
+        route.focus_in(0);
+        assert_eq!(
+            route.reconcile(now),
+            super::FocusChange::default(),
+            "没有文本目标 ⇒ 协议对象保持 disable（不得凭空 enable）"
+        );
+        assert_eq!(route.focus(), None);
+        assert!(!route.takes_text(), "非编辑焦点上字符走键盘通路");
+    }
+
+    /// B9：应用 `set_ime_enabled(false)` ⇒ 已 enable 的 surface 必须 disable，
+    /// 且 `takes_text() == false`（字母/数字作为普通 `InputEvent::Text` 到达应用）。
+    #[test]
+    fn an_app_disabled_text_target_is_disabled_and_yields_text_to_the_keyboard() {
+        let now = Instant::now();
+        let mut route = route_with_focus(now);
+        assert!(route.takes_text(), "前置：IME 已接管文本");
+
+        route.set_policy(0, false, true);
+        assert_eq!(
+            route.reconcile(now),
+            super::FocusChange {
+                disable: true,
+                enable: false
+            },
+            "应用禁用 ⇒ 协议 disable（旧实现只写 App 状态、从不产生 disable）"
+        );
+        assert_eq!(route.focus(), None);
+        assert!(!route.takes_text(), "禁用后键盘通路必须产生字符");
+    }
+
+    /// B9：重新启用 + 文本焦点仍在 ⇒ 重新 enable（调用方据此整份重发 set_* 状态）。
+    #[test]
+    fn re_enabling_a_text_target_enables_the_surface_again() {
+        let now = Instant::now();
+        let mut route = route_with_focus(now);
+        route.set_policy(0, false, true);
+        assert!(route.reconcile(now).disable);
+        route.note_commit();
+
+        route.set_policy(0, true, true);
+        assert_eq!(
+            route.reconcile(now),
+            super::FocusChange {
+                disable: false,
+                enable: true
+            },
+            "策略恢复 + 仍聚焦文本 ⇒ 重新 enable"
+        );
+        assert_eq!(route.focus(), Some(0));
+        assert!(route.takes_text());
+    }
+
+    /// B9：应用处于禁用态时，在同窗口内换焦点不得 enable 任何 surface。
+    #[test]
+    fn a_focus_change_while_app_disabled_never_enables() {
+        let now = Instant::now();
+        let mut route = route_with_text_targets(&[0, 1]);
+        route.set_policy(0, false, true);
+        route.set_policy(1, false, true);
+
+        route.focus_in(0);
+        assert_eq!(route.reconcile(now), super::FocusChange::default());
+        route.focus_in(1);
+        assert_eq!(
+            route.reconcile(now),
+            super::FocusChange::default(),
+            "禁用态换焦点不得 enable（旧实现在每个 enter 上无条件 enable）"
+        );
+        route.focus_out(1);
+        assert_eq!(route.reconcile(now), super::FocusChange::default());
+        assert!(!route.takes_text());
+    }
+
+    /// B9 的「disable 是唯一收敛点」：文本目标消失只产生**一次** disable。
+    ///
+    /// 平台层在 disable 收敛时补一条 `ImeEvent::End`；收敛点唯一 ⇒ `End` 至多一条，
+    /// 重复的策略同步（每轮泵都会跑）不会重复补。
+    #[test]
+    fn a_lost_text_target_emits_disable_exactly_once() {
+        let now = Instant::now();
+        let mut route = route_with_focus(now);
+        route.set_policy(0, true, false); // 同一 surface 内焦点移到非编辑元素
+        assert_eq!(
+            route.reconcile(now),
+            super::FocusChange {
+                disable: true,
+                enable: false
+            }
+        );
+        assert_eq!(
+            route.reconcile(now),
+            super::FocusChange::default(),
+            "已经 disable ⇒ 后续轮次不得重复 disable（⇒ End 不得重复）"
+        );
+    }
+
+    /// B9：同一 surface 内「文本目标 → 非文本 → 文本」恰好产生 disable → enable 各一次。
+    #[test]
+    fn text_to_non_text_to_text_yields_one_disable_and_one_enable() {
+        let now = Instant::now();
+        let mut route = route_with_focus(now);
+
+        route.set_policy(0, true, false);
+        let lost = route.reconcile(now);
+        route.note_commit();
+        route.set_policy(0, true, true);
+        let regained = route.reconcile(now);
+        route.note_commit();
+
+        assert_eq!(
+            lost,
+            super::FocusChange {
+                disable: true,
+                enable: false
+            }
+        );
+        assert_eq!(
+            regained,
+            super::FocusChange {
+                disable: false,
+                enable: true
+            }
+        );
+        assert_eq!(route.focus(), Some(0));
+        assert!(route.takes_text());
+        // 两次变化各一次 commit ⇒ 下一次期望的 done serial 是 3（首次 enable 1 + disable 2
+        // + enable 3）。serial 状态机不因策略变化而错位。
+        assert!(route.settle(3));
+        assert!(!route.commit_in_flight());
+    }
+
+    /// B9：`commit_in_flight` 期间策略变化只攒状态，不改变 commit/serial 记账 ——
+    /// 平台层据此把 caret 更新推迟到匹配 serial 的 `done`（AR3 §3.3）。
+    #[test]
+    fn policy_changes_while_a_commit_is_in_flight_do_not_disturb_the_serial_state() {
+        let now = Instant::now();
+        let mut route = route_with_focus(now);
+        assert!(route.commit_in_flight(), "前置：首次 enable 的 commit 在飞");
+
+        route.set_policy(0, false, true);
+        let change = route.reconcile(now);
+        assert!(change.disable);
+        assert!(
+            route.commit_in_flight(),
+            "策略变化本身不 commit（提交由平台层在收敛点统一发）"
+        );
+        route.note_commit(); // 平台层为 disable 合成的 commit
+
+        assert!(!route.settle(1), "在飞的旧 batch（serial 1）不得放行新状态");
+        assert!(route.settle(2), "匹配 serial 2 之后才允许回写");
+        assert!(!route.commit_in_flight());
+        assert!(!route.reconcile(now).disable, "已经 disable，不重复变化");
+    }
+
+    /// B9：迟到的 `focus_out`（非当前候选）不得清掉新焦点的候选。
+    #[test]
+    fn a_stale_focus_out_does_not_clear_the_new_focus() {
+        let now = Instant::now();
+        let mut route = route_with_text_targets(&[0, 1]);
+        route.focus_in(1);
+        assert!(route.reconcile(now).enable);
+        assert!(route.is_keyboard_focus(1), "候选目标 = 键盘焦点窗口");
+        route.focus_out(0);
+        assert_eq!(route.reconcile(now), super::FocusChange::default());
+        assert_eq!(route.focus(), Some(1));
+        assert!(route.is_keyboard_focus(1), "迟到的 leave 不得清掉新候选");
+        route.focus_out(1);
+        assert!(route.reconcile(now).disable);
+        assert_eq!(route.focus(), None);
+        assert!(!route.is_keyboard_focus(1), "失焦后不再持有候选");
     }
 
     /// AR3 §3.3：`ImeStateSnapshot` 是「要不要在 `done` 里回写」的唯一判据 ——

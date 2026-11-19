@@ -1,18 +1,43 @@
-//! 窗口：最小尺寸、CSD 装饰度量，以及 **`wl_region`（输入区 / 不透明区）的已知取舍**（R10-11）。
+//! 窗口：平台默认最小客户区、CSD 装饰度量，以及 **`wl_region`（输入区 / 不透明区）的已知
+//! 取舍**（R10-11）。
 //!
 //! Wayland 没有「窗口对象」：状态在 `WaylandState`（surface/toplevel）里，本模块只放
-//! 与协议无关的窗口常量与最小尺寸设置，避免它散落到事件翻译层。
+//! 与协议无关的窗口常量，避免它散落到事件翻译层。
 //!
-//! 最小尺寸是 **window geometry 的逻辑像素**，与 `scale` 无关：xdg-shell 的
-//! `xdg_toplevel.set_min_size` 参数是 window geometry 坐标，不是 buffer 像素。本仓用
+//! **尺寸约束**（B3）：应用 [`crate::window::WindowOptions::min_size`] / `max_size` 在
+//! `WaylandState::add_window` 里与 compositor 的 `configure_bounds` 一起收敛到
+//! `crate::platform::wayland::toplevel::SizeConstraintState`，由它产出
+//! `xdg_toplevel.set_min_size/set_max_size` 的参数。`min_size = None` 时用本模块的
+//! [`MIN_SIZE_LOGICAL`]（与 Win32 / macOS 同源的平台默认 320×200）。
+//!
+//! 尺寸与坐标都是 **window geometry 的逻辑像素**，与 `scale` 无关：xdg-shell 的
+//! `set_min_size` / `set_max_size` 参数是 window geometry 坐标，不是 buffer 像素。本仓用
 //! `wp_viewport.set_destination(ceil(logical))` 让 surface 尺寸等于逻辑尺寸（S-144），所以
-//! 320×200 直接就是逻辑值；因此它只需在建窗时（`wl_surface` 首个 commit 之前）设置一次
-//! （V-122 ⑦）。
+//! 320×200 直接就是逻辑值；约束在 `wl_surface` 首个 commit 之前下发（`configure_bounds` 变化
+//! 时再增量下发，见 `SizeConstraintState` 的同值 no-op）。
+//!
+//! **位置**：xdg-shell **没有**定位请求（`xdg_toplevel` 的请求表只有
+//! set_parent/set_title/set_app_id/show_window_menu/move/resize/set_max_size/set_min_size/
+//! set_maximized/unset_maximized/set_fullscreen/unset_fullscreen/set_minimized），窗口位置完全
+//! 由 compositor 决定；`WindowOptions::position` 在 Linux 上被**有意忽略**，`Event::Moved`
+//! 在该端也永不产生（公共文档已写明）。这是协议事实，不是遗漏。
+//!
+//! **窗口层级**（X1）：`WindowOptions::owner` / `modal` / `always_on_top` 在 Wayland 上的原生
+//! 能力极弱，三个字段都是**明确降级**（用户裁决：不得静默忽略）：
+//!
+//! - `owner` ⇒ `xdg_toplevel.set_parent` 的 *transient for* 提示（compositor 可忽略；协议无法
+//!   表达「随 owner 最小化 / 销毁」⇒ z 序与生命周期都不保证）。解析在
+//!   [`crate::platform::linux::surface::WaylandState::add_window`] 里、新窗口进入窗口表之前完成：
+//!   owner 尚未创建 / 已关闭 ⇒ 降级不设并写诊断（见 [`crate::platform::wayland::owner`]）。
+//! - `modal` ⇒ 协议没有模态（`xdg_toplevel` **没有** `set_modal` 请求），语义完全由 `App` 层
+//!   输入拦截承担（与 macOS 同一套）；本端只有 owner 的 parent 提示。
+//! - `always_on_top` ⇒ xdg-shell 没有置顶请求，wlr-layer-shell / plasma-shell 都不是 xdg-shell
+//!   标准能力 ⇒ **无操作**（应用不得假设成立）。
 //!
 //! **阴影边距**（R10-10）：引擎目前不画投影，[`SHADOW_MARGIN`] 是 0，于是 window geometry
 //! 就是整个 surface，`set_min_size(320, 200)` 正好约束客户区。将来加投影时只需把边距改成非 0：
-//! `xdg_surface.set_window_geometry` 会据此收缩（阴影落在几何之外），`set_min_size` 会据此
-//! 把边距补回去（否则窗口能被缩到内容不可用）。两处都走
+//! `xdg_surface.set_window_geometry` 会据此收缩（阴影落在几何之外），`set_min_size` /
+//! `set_max_size` 会据此把边距补回去（否则窗口能被缩到内容不可用）。两处都走
 //! [`crate::platform::wayland::toplevel`] 的纯函数，语义不会分叉。
 //!
 //! 没有 viewporter 时走整数回退（buffer = `round(逻辑 × N)`、`wl_surface.set_buffer_scale(N)`，
@@ -81,12 +106,10 @@
 //!   `set_opaque_region`；点击窗口最上/最下行、四角仍然命中窗口（说明「整个 surface 都是
 //!   内容」这一前提没被破坏）。
 
-use wayland_protocols::xdg::shell::client::xdg_toplevel::XdgToplevel;
-
-use crate::platform::wayland::toplevel;
+use crate::math::Size;
 
 /// 最小客户区（逻辑像素；与 Win32 / macOS 同源）。
-pub(crate) const MIN_SIZE_LOGICAL: (f32, f32) = (320.0, 200.0);
+pub(crate) const MIN_SIZE_LOGICAL: Size = Size::new(320.0, 200.0);
 
 /// CSD 阴影 / 边框在 window geometry **之外**占的逻辑像素（每边）。
 ///
@@ -102,12 +125,3 @@ const _: () = assert!(
     SHADOW_MARGIN.to_bits() == 0,
     "SHADOW_MARGIN 改成非 0 时必须同时实现 wl_surface.set_input_region（见本模块文档「wl_region 的已知取舍」）"
 );
-
-/// 把最小尺寸交给 `xdg_toplevel`：window geometry 的逻辑像素（含阴影边距）。
-///
-/// 每个窗口只在建窗时（`WaylandState::add_window` 的首个 commit 之前）调用一次：DPI 变化后
-/// 重发会把最小客户区按 `scale` 放大（V-122 ⑦）。
-pub(crate) fn apply_min_size(toplevel: &XdgToplevel) {
-    let (width, height) = toplevel::min_size_with_shadow(MIN_SIZE_LOGICAL, SHADOW_MARGIN);
-    toplevel.set_min_size(width, height);
-}

@@ -241,6 +241,7 @@ pub fn run(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
         size: scene::WINDOW_SIZE,
         scale: Scale::ONE,
         background: Color::from_rgba8([0x0B, 0x0E, 0x13, 0xFF]),
+        ..WindowOptions::default()
     });
 
     let build_started = Instant::now();
@@ -483,6 +484,7 @@ pub fn run_breakdown(config: &Config) -> Result<bool, Box<dyn std::error::Error>
         size: scene::WINDOW_SIZE,
         scale: Scale::ONE,
         background: Color::from_rgba8([0x0B, 0x0E, 0x13, 0xFF]),
+        ..WindowOptions::default()
     });
     let mut load = Load::build(&mut app, window)?;
     println!("== 最终合成负载验收 · breakdown 模式（pass 归因，非判据） ==");

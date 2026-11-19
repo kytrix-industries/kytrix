@@ -33,7 +33,7 @@ use crate::{
     math::Point,
     node::id::NodeId,
     paint::style::Cursor,
-    window::WindowId,
+    window::{Window, WindowId},
 };
 
 /// 覆盖输入阈值（平台层用系统真值初始化；测试也可显式设置）。
@@ -857,8 +857,19 @@ pub(crate) fn click_count(
 pub(crate) fn on_window_focus_lost(app: &mut App, window: WindowId) {
     // 失焦期间抬起消息不再到达本窗口：该窗口的按住集合必须清空，否则 `key_down` 会永久为真
     //（与 `TranslateState::reset_transient` 对修饰键的处理同源）。其它窗口的集合不受影响
-    //（集合是每窗口的，R02-16）。
+    // （集合是每窗口的，R02-16）。
     app.held_keys.remove(&window);
+    // B6/B9 用户裁决「焦点移走/窗口失焦统一清 caret hint」：失焦后旧 hint 不再有意义，
+    // 保留它会让重新获焦时平台按旧位置重开候选窗（三端同语义；平台层另有即时清场，
+    // 这里是 App 层兜底，`clear_ime_cursor_request` 同值 no-op）。清掉后唤醒平台泵让
+    // `sync_ime_cursor_area` 把空 hint 应用下去。
+    if app
+        .windows
+        .get_mut(&window)
+        .is_some_and(Window::clear_ime_cursor_request)
+    {
+        app.dispatcher.wake();
+    }
     app.cancel_pointer_session(window);
 }
 

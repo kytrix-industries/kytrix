@@ -51,6 +51,11 @@ pub(crate) fn install(mtm: MainThreadMarker, ns_app: &NSApplication) {
     ns_app.setMainMenu(Some(&main));
     // 注册 Window 菜单：AppKit 会往里追加窗口列表与「Bring All to Front」，
     // 并把它当成系统语义上的 Window 菜单（全屏项的标题切换也依赖这个身份）。
+    //
+    // B5：`event_loop::run` 在建窗之前调了 `NSWindow.setAllowsAutomaticWindowTabbing(false)`，
+    // 因此 AppKit **不会**再往这里追加「Merge All Windows」/「Show All Tabs」等 tab 相关项
+    // （自动 tabbing 关闭后这些系统项没有意义）。窗口列表与 Bring All to Front 照常保留。
+    // 本模块不自己增删这些系统项 —— 它们由 AppKit 按上述开关维护。
     ns_app.setWindowsMenu(window_menu.as_deref());
 }
 

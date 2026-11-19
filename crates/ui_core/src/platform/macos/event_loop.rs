@@ -27,6 +27,7 @@ use std::{
 use objc2::{MainThreadMarker, rc::Retained};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSEvent, NSEventModifierFlags, NSEventType,
+    NSWindow,
 };
 use objc2_core_foundation::{
     CFRunLoop, CFRunLoopActivity, CFRunLoopObserver, CFRunLoopObserverContext, CFRunLoopTimer,
@@ -44,6 +45,8 @@ use crate::{
             menu, wake,
             window::NativeWindow,
         },
+        macos_close::CloseAction,
+        macos_owner::{OwnerResolution, resolve_owner, window_level},
     },
     render::{backend::Renderer, macos::core::GpuCore},
     window::{Window, WindowId, WindowOptions},
@@ -130,6 +133,12 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
     let ns_app = NSApplication::sharedApplication(mtm);
     ns_app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     ns_app.finishLaunching();
+    // B5：禁用 AppKit 的自动窗口 tabbing（类级开关，10.12+）。必须在**创建任何窗口之前**
+    // 设置：打开后 AppKit 会按 tabbingIdentifier / 用户偏好把新窗口并进 tab 组，并往
+    // Window 菜单追加「Merge All Windows」等项。引擎的关闭语义以 `windowWillClose:` 为
+    // 唯一权威来源、以窗口为关闭单位；合 tab 会把「关一个 tab」与「关窗口」的语义分叉，
+    // 且非前台 tab 的 `isVisible()` 为 false（旧实现的可见性反推会误判成关闭，B5 已删）。
+    NSWindow::setAllowsAutomaticWindowTabbing(false, mtm);
     // R09-1：主菜单必须**在任何输入之前**就位。AppKit 的键等价分发是
     // `sendEvent:` → `[mainMenu performKeyEquivalent:]` → 失败才给 key window；主菜单为 nil 时
     // Cmd+Q / Cmd+W / Cmd+C 全部没有承载对象，只能退化成普通 keyDown 并被丢弃。
@@ -149,8 +158,12 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
         .map(|(id, window)| (id, window.options().clone()))
         .collect();
     let mut windows: Vec<NativeWindow> = Vec::with_capacity(requests.len());
-    for (id, options) in requests {
-        windows.push(open_window(mtm, &mut app, id, &options, &dispatcher)?);
+    // X1：两阶段建窗（先全部创建、再接线 owner/层级、最后显示 + 建渲染器）。`App` 的窗口
+    // 表是 `HashMap`，创建顺序不可控，而 owner 必须先有原生窗口，见 `attach_owners`。
+    create_native_windows(mtm, &app, &requests, &dispatcher, &mut windows)?;
+    attach_owners(&requests, &mut windows, 0);
+    for (native, (_, options)) in windows.iter_mut().zip(requests.iter()) {
+        show_window(&mut app, native, options, &dispatcher)?;
     }
     // `activate` 必须在窗口已经存在之后（macOS 14+ 的无参版本不会自己找窗口，
     // 在首窗之前调用可能「没真正到前台」）。
@@ -245,30 +258,97 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
     }
 }
 
-/// 建一个原生窗口 + 渲染器，并把平台真值写回 `App` 的窗口。
+/// 建一批原生窗口（**不显示**；`cascade_index` 按批内顺序级联摆放）。
+///
+/// 与 [`show_window`] 拆开是为了 X1 的 owner 接线：`App` 的窗口表是 `HashMap`，一批窗口的
+/// 创建顺序不可控，而 owner 必须先有原生窗口。因此建窗分三步：
+/// 1. [`create_native_windows`] 全部创建（隐藏）；
+/// 2. [`attach_owners`] 把 owner/层级接上（owner 可以在这批里、也可以是更早的批次）；
+/// 3. [`show_window`] 逐个显示 + 建渲染器。
+fn create_native_windows(
+    mtm: MainThreadMarker,
+    app: &App,
+    requests: &[(WindowId, WindowOptions)],
+    dispatcher: &Arc<Dispatcher>,
+    windows: &mut Vec<NativeWindow>,
+) -> Result<(), EngineError> {
+    let start = windows.len();
+    windows.reserve(requests.len());
+    for (offset, (id, options)) in requests.iter().enumerate() {
+        // RE-01：adapter 必须持有窗口 `A11yBridge` 的**那一份**消费端代际（唯一入口
+        // `App::window_a11y_epoch`）；不存在的窗口不能建原生窗口。
+        let a11y_epoch = app
+            .window_a11y_epoch(*id)
+            .ok_or_else(|| EngineError::AppInit {
+                detail: smol_str::SmolStr::new_static(
+                    "window disappeared while creating native window",
+                ),
+            })?;
+        windows.push(NativeWindow::create(
+            mtm,
+            *id,
+            options,
+            dispatcher,
+            start + offset,
+            a11y_epoch,
+        )?);
+    }
+    Ok(())
+}
+
+/// X1：把 owner 关系与窗口层级接到刚创建的一批原生窗口上（`start` = 本批起始下标）。
+///
+/// - **owner**：`addChildWindow:ordered:`（transient parent 语义；见
+///   `NativeWindow::apply_owner` 与 `window.rs` 模块文档）。找不到 owner 原生窗口
+///   （创建顺序之外的竞态 / 非法 id）⇒ 降级为无 owner 并写诊断，不 panic。
+/// - **层级**：模态（owner 已解析）> 置顶 > 普通；纯逻辑在
+///   `platform::macos_owner::window_level`（Windows 可单测）。
+fn attach_owners(
+    requests: &[(WindowId, WindowOptions)],
+    windows: &mut [NativeWindow],
+    start: usize,
+) {
+    for (offset, (id, options)) in requests.iter().enumerate() {
+        let index = start + offset;
+        let resolution = resolve_owner(*id, options.owner, |owner| {
+            windows.iter().any(|native| native.id() == owner)
+        });
+        let owner = match resolution {
+            OwnerResolution::Attach(owner) => windows
+                .iter()
+                .find(|native| native.id() == owner)
+                .map(NativeWindow::window_handle),
+            OwnerResolution::None => None,
+            OwnerResolution::Missing => {
+                // 引擎层（`app/window_set.rs`）保证 options.owner 合法；走到这里说明平台侧
+                // 没找到对应原生窗口。窗口仍然可用，只是失去 transient parent 语义。
+                eprintln!(
+                    "kytrix: 窗口 {id:?} 的 owner {:?} 没有原生窗口；降级为无 owner",
+                    options.owner
+                );
+                None
+            }
+        };
+        // 模态窗口只能在 owner 已解析时抬层级（没有 owner 的模态由引擎层降级为普通窗口）。
+        let level = window_level(options.always_on_top, options.modal && owner.is_some());
+        windows[index].apply_owner(owner, level);
+    }
+}
+
+/// 显示一个已建好的原生窗口 + 创建渲染器，并把平台真值写回 `App` 的窗口。
 ///
 /// **顺序**（R09-5 的平台侧一半）：先 `show()` 再同步编译 GPU 对象。渲染器构造里有
 /// `MTLDevice` / 两个 metallib / 4 条 PSO 的同步编译（数十毫秒），放在 `show()` 之前会表现为
 /// 「点了新窗口，整个应用卡一下才出现窗口」；放在之后则是「窗口立刻出现（AppKit 用背景色
 /// 铺底），内容稍后到位」。真正的根治（进程级共享 device/library/PSO）在 `render/macos`
 /// 的 `GpuCore` 重构里。
-fn open_window(
-    mtm: MainThreadMarker,
+fn show_window(
     app: &mut App,
-    id: WindowId,
+    native: &mut NativeWindow,
     options: &WindowOptions,
     dispatcher: &Arc<Dispatcher>,
-) -> Result<NativeWindow, EngineError> {
-    // RE-01：adapter 必须持有窗口 `A11yBridge` 的**那一份**消费端代际（唯一入口
-    // `App::window_a11y_epoch`）；不存在的窗口不能建原生窗口。
-    let a11y_epoch = app
-        .window_a11y_epoch(id)
-        .ok_or_else(|| EngineError::AppInit {
-            detail: smol_str::SmolStr::new_static(
-                "window disappeared while creating native window",
-            ),
-        })?;
-    let native = NativeWindow::create(mtm, id, options, dispatcher, a11y_epoch)?;
+) -> Result<(), EngineError> {
+    let id = native.id();
     // 先显示：用户立刻看到窗口（背景色由 `NSColor` 铺底）。
     native.show();
     let scale = native.scale();
@@ -297,7 +377,7 @@ fn open_window(
         // A5：帧预算的刷新率提示 = 窗口所在屏的 `maximumFramesPerSecond`（ProMotion 120 也覆盖）。
         window.set_frame_refresh_hz(native.maximum_frames_per_second());
     }
-    Ok(native)
+    Ok(())
 }
 
 /// 泵一次；`tick` = 本次由连续帧定时器触发（而不是 source/observer）。
@@ -370,6 +450,13 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
             changed = true;
         }
         changed |= native.sync_state(app)?;
+        // B9(mac)：窗口刚失去键盘焦点 ⇒ IME 统一清场（清 caret hint / 丢弃组合 / 补 End）。
+        // 放在 `sync_state` 之后：`FocusChanged { focused: false }` 已经按事件顺序投递，
+        // 清场产生的 `ImeEvent::End` 排在其后；清场要 `&mut App`，因此由泵执行而不是在
+        // view / delegate 回调里（回调纪律：只置位 + 唤醒）。
+        if native.take_focus_lost() {
+            native.handle_focus_lost(app);
+        }
     }
 
     app.run_frame_hook();
@@ -421,7 +508,14 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
 
     for native in state.windows.iter_mut() {
         native.update_a11y(app);
+        // IME 启用状态先于 caret hint：刚禁用时不必再写表单，刚启用时要重发 hint
+        //（`sync_ime_enabled` 会清掉 `ime_area` 缓存）。
+        native.sync_ime_enabled(app);
         native.sync_ime_cursor_area(app);
+        // X2：自绘标题栏拖动区（泵每轮对账；`NativeWindow` 内部只在值变化时写 view）。
+        if let Some(window) = app.window(native.id()) {
+            native.sync_drag_regions(window.drag_regions());
+        }
     }
     // E5 / RE-04 / RE-05：**本轮确实交付过** a11y 且仍有未走完的批次 ⇒ 立刻唤醒下一轮泵
     // （无 AT 客户端时无交付 ⇒ 绝不 wake，I3 空闲零唤醒）；判定 + wake 的唯一入口。
@@ -449,26 +543,40 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
         state.quitting = false;
     }
 
-    // 关闭：请求关闭的窗口真正关闭；一个不剩就退出。
-    let mut closed = false;
+    // 关闭（B5）：两个来源，语义严格区分（状态机见 `platform::macos_close`）。
+    //
+    // - **用户手势**（红点 / Cmd+W / 菜单 Close / `performClose:`）：先 dispatch
+    //   `Event::CloseRequested`（通知，三端同序），再问 `App::request_close`（`on_close`
+    //   裁决，可否决）。批准后才关原生窗口；否决则窗口原样保留。
+    // - **外部关闭**（`windowWillClose:`）：AppKit 已经关闭了窗口，不可否决 —— 不再投递
+    //   事件、不再询问；只做 App 侧关闭记账（`App::close_window`）并移除原生窗口。
+    //
+    // 事件先于处理器由 `CloseBridge::decide` 的闭包顺序保证：闭包里先 dispatch 再返回
+    // `request_close` 的结果，且只在手势路径执行、只执行一次。
+    let mut removed = false;
     for native in state.windows.iter_mut() {
-        let Some(source) = native.take_close_request() else {
-            continue;
-        };
-        // 只有**手势**路径需要在这里补发事件（`sync_state` 不产生它）；观察路径
-        // （窗口已不可见）已经在 `sync_state` 里 dispatch 过，再发就是双投递（复审 F3）。
-        if source == crate::platform::macos::window::CloseRequestSource::Gesture {
-            app.dispatch(native.id(), crate::event::Event::CloseRequested);
+        let id = native.id();
+        let action = native.decide_close(|| {
+            app.dispatch(id, crate::event::Event::CloseRequested);
+            app.request_close(id)
+        });
+        match action {
+            CloseAction::Keep => {}
+            CloseAction::Close => {
+                native.close();
+                removed = true;
+            }
+            CloseAction::RemoveNative => {
+                // 外部关闭：窗口已经被 AppKit 关掉，没有可裁决的对象。`App` 里可能还留着
+                // 这扇窗口（应用没有参与关闭），直接做引擎侧记账；下一轮
+                // `sync_native_windows` 也不会再为它建原生窗口。
+                app.close_window(id);
+                native.mark_externally_closed();
+                removed = true;
+            }
         }
-        // 先问应用：`App::on_close` 返回 `false` 就拦下这次关闭（P2-8）。
-        // 观察路径下窗口已经不可见、拦不住（AppKit 已关），这里只决定是否从 App 侧移除。
-        if !app.request_close(native.id()) {
-            continue;
-        }
-        native.close();
-        closed = true;
     }
-    if closed {
+    if removed {
         state.windows.retain(|native| !native.is_destroyed());
     }
     if state.windows.is_empty() || app.windows().next().is_none() {
@@ -512,6 +620,8 @@ fn request_quit(state: &mut LoopState, app: &mut App) {
 /// 与 Win32 的同名函数同构：
 /// - **创建**：`App` 里存在但还没有原生窗口的 id ⇒ 建 `NativeWindow` + `Renderer`，挂
 ///   `CAMetalLayer`，并把尺寸 / DPI / surface 写回 `Window`（与启动路径同一套写入顺序）。
+///   与启动路径共用 X1 的两阶段建窗（[`create_native_windows`] → [`attach_owners`] →
+///   [`show_window`]）：owner 可能同批创建（顺序不可控）或已存在。
 /// - **销毁**：原生窗口对应的 `App` 窗口已经不存在 ⇒ 从列表移除（`NativeWindow::drop`
 ///   负责关窗；`App` 丢弃 `Window` 时已经 drop 了它的 `Renderer`，GPU 线程 join 早于关窗）。
 fn sync_native_windows(
@@ -533,8 +643,11 @@ fn sync_native_windows(
     let mtm = MainThreadMarker::new().ok_or(EngineError::AppInit {
         detail: smol_str::SmolStr::new_static("window creation requires the main thread"),
     })?;
-    for (id, options) in pending {
-        windows.push(open_window(mtm, app, id, &options, dispatcher)?);
+    let start = windows.len();
+    create_native_windows(mtm, app, &pending, dispatcher, windows)?;
+    attach_owners(&pending, windows, start);
+    for (native, (_, options)) in windows[start..].iter_mut().zip(pending.iter()) {
+        show_window(app, native, options, dispatcher)?;
     }
     Ok(())
 }

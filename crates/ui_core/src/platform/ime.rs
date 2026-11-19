@@ -241,6 +241,31 @@ pub(crate) fn preedit_carets(
     (Some(start as u32), clauses)
 }
 
+/// IME 组合期 `InputEvent::Key` 的可见性判定（三端统一，B4）。
+///
+/// 语义（与 Win32 的 `VK_PROCESSKEY` 过滤一致，macOS / Wayland 对齐）：
+///
+/// - **组合期**（mac `hasMarkedText` / Linux 已有非空 preedit）不投递裸 `InputEvent::Key`：
+///   组合中的字母/数字/空格会被输入法翻译成候选，应用若同时收到裸键就会命中快捷键
+///   （下单误触级别）；被 IME 消费的按键（mac `handleEvent == true`）同样不投递；
+/// - **带 Ctrl/Alt/Meta 的命令组合始终投递**：Win32 在这些键上通常不产生 `VK_PROCESSKEY`
+///   （`Ctrl+W` / `Cmd+C` 必须可用）；AppKit 的菜单键等价在 `keyDown:` 之前处理，不受影响；
+///   Shift 不算命令修饰键（`Shift+字母` 是正常的上屏输入）。
+///
+/// 提交键的 key-up **始终投递**（不受本函数约束）：抬起不产生正文，应用只用它清
+/// `held_keys`；组合期连 up 一起吞会让「按下 → 组合开始 → 抬起」把按住状态永久残留
+/// （RB-02）。Win32 同样只把按下替换成 `VK_PROCESSKEY`，抬起以真实 `VK_*` 到达。
+///
+/// `ImeEvent::Commit/Preedit` 通路不受本函数影响（组合结果必须交付）。
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+pub(crate) const fn key_visible(
+    ime_consumed: bool,
+    composing: bool,
+    command_modifiers: bool,
+) -> bool {
+    command_modifiers || (!ime_consumed && !composing)
+}
+
 /// 一次**原生输入事件**的作用域令牌（macOS 的每个 `keyDown:` 一个）。
 ///
 /// 用令牌而不是裸 `bool` 的原因：`insertText:` 可能由非按键路径触发（鼠标点候选窗、听写、
@@ -332,8 +357,8 @@ impl ImeCommitScope {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClauseRanges, NS_NOT_FOUND, clause_ranges, highlight_runs, preedit_carets, preedit_clauses,
-        replacement_range,
+        ClauseRanges, NS_NOT_FOUND, clause_ranges, highlight_runs, key_visible, preedit_carets,
+        preedit_clauses, replacement_range,
     };
 
     /// `ATTR_INPUT`（Win32 值 0）：仍在输入、不需要高亮的那一段。
@@ -594,6 +619,35 @@ mod tests {
         assert_eq!(preedit_carets("ni", 99, 99).0, Some(2));
         assert_eq!(preedit_carets("ni", i32::MAX, i32::MAX).0, Some(2));
         assert_eq!(preedit_carets("", 0, 0), (Some(0), ClauseRanges::new()));
+    }
+
+    /// B4 真值表（1/4）：组合期 + 无命令修饰键 ⇒ 不投递裸 `Key`（拼音中按 B/S/数字）。
+    #[test]
+    fn composing_without_command_modifiers_hides_the_bare_key() {
+        assert!(!key_visible(false, true, false));
+        assert!(!key_visible(true, true, false));
+    }
+
+    /// B4 真值表（2/4）：组合期 + Ctrl/Alt/Meta ⇒ **仍然投递**（`Cmd+C` / `Ctrl+W` 不能被吞）。
+    /// Shift 不算命令修饰键（调用方传入的 `command_modifiers` 不含 Shift），组合中 Shift+数字
+    /// 仍按输入法语义处理。
+    #[test]
+    fn composing_with_a_command_modifier_still_delivers() {
+        assert!(key_visible(true, true, true));
+        assert!(key_visible(false, true, true));
+    }
+
+    /// B4 真值表（3/4）：按键被 IME 消费（mac `handleEvent == true`）⇒ 不投递，即使没有组合串。
+    #[test]
+    fn an_ime_consumed_key_is_hidden_even_without_marked_text() {
+        assert!(!key_visible(true, false, false));
+        assert!(key_visible(true, false, true));
+    }
+
+    /// B4 真值表（4/4）：普通键入（无组合、未消费）⇒ 投递。
+    #[test]
+    fn an_ordinary_key_is_visible() {
+        assert!(key_visible(false, false, false));
     }
 }
 

@@ -344,6 +344,7 @@ pub fn run_window(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
         size: scene::WINDOW_SIZE,
         scale: Scale::ONE,
         background: Color::from_rgba8([0x0B, 0x0E, 0x13, 0xFF]),
+        ..WindowOptions::default()
     });
     let mut load = Load::build(&mut app, window)?;
 
@@ -504,6 +505,7 @@ pub fn run_idle(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
         size: scene::WINDOW_SIZE,
         scale: Scale::ONE,
         background: Color::from_rgba8([0x0B, 0x0E, 0x13, 0xFF]),
+        ..WindowOptions::default()
     });
     let load = Load::build(&mut app, window)?;
 

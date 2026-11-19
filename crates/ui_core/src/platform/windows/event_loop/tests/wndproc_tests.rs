@@ -10,7 +10,14 @@
 //! 停在 `WM_ENTERSIZEMOVE` + `WM_SIZE` 这一层：系统模态循环本身无法在单测里进入
 //! （`SendMessage(WM_NCLBUTTONDOWN)` 会阻塞到用户松手），那条接线由真机拖动探针验收。
 
-use std::sync::Arc;
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use windows::Win32::{
     Foundation::{HWND, LPARAM, POINT, RECT, WPARAM},
@@ -24,14 +31,15 @@ use windows::Win32::{
         },
         WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, GWLP_USERDATA, GetWindowRect, HTBOTTOMRIGHT, HTCAPTION,
-            HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON, HTMINBUTTON, HTSYSMENU, HTTOPLEFT,
-            PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, RegisterClassW, SM_CXPADDEDBORDER,
-            SM_CXSIZEFRAME, SPI_SETANIMATION, SPI_SETWORKAREA, SendMessageW, SetWindowLongPtrW,
-            WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_DISPLAYCHANGE, WM_ENTERSIZEMOVE,
-            WM_EXITSIZEMOVE, WM_IME_CHAR, WM_IME_COMPOSITION, WM_IME_SETCONTEXT,
-            WM_IME_STARTCOMPOSITION, WM_INPUTLANGCHANGE, WM_LBUTTONDOWN, WM_MOUSEMOVE,
-            WM_NCHITTEST, WM_PAINT, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER,
-            WNDCLASSW, WS_OVERLAPPEDWINDOW,
+            HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON, HTMINBUTTON, HTSYSMENU, HTTOPLEFT, MINMAXINFO,
+            MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PM_REMOVE, PeekMessageW, RegisterClassW,
+            SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SPI_SETANIMATION, SPI_SETWORKAREA, SendMessageW,
+            SetWindowLongPtrW, WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_DISPLAYCHANGE,
+            WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_IME_CHAR,
+            WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
+            WM_INPUTLANGCHANGE, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOVE, WM_NCHITTEST,
+            WM_PAINT, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSW,
+            WS_OVERLAPPEDWINDOW,
         },
     },
 };
@@ -40,12 +48,14 @@ use super::super::{WndProcState, pump::A11Y_TIMER_ID, wndproc};
 use crate::{
     app::App,
     event::ImeEvent,
+    math::{Rect, Scale, Size},
     platform::{
-        dispatcher::{Dispatcher, WM_APP_COMPOSITION_WAKE},
+        dispatcher::{Dispatcher, UserTask, WM_APP_COMPOSITION_WAKE, WM_APP_FRAME_WAKE},
         event::PlatformEvent,
         windows::{
-            dpi,
+            dark_mode, dpi,
             ime::{self, ImeApplied, ImeCommand},
+            placement,
             window::NativeWindow,
         },
     },
@@ -68,6 +78,24 @@ fn hidden_window(tag: &str, dispatcher: Arc<Dispatcher>) -> (HWND, *mut WndProcS
 fn hidden_window_sized(
     tag: &str,
     dispatcher: Arc<Dispatcher>,
+    width: i32,
+    height: i32,
+) -> (HWND, *mut WndProcState, Vec<u16>) {
+    hidden_window_with_limits(
+        tag,
+        dispatcher,
+        placement::ClientLimits::default(),
+        width,
+        height,
+    )
+}
+
+/// 与 [`hidden_window`] 相同，但 `WndProcState` 的客户区尺寸约束可指定（B3 的
+/// `WM_GETMINMAXINFO` 用例：约束来源必须是建窗时解析出的 `WindowOptions`）。
+fn hidden_window_with_limits(
+    tag: &str,
+    dispatcher: Arc<Dispatcher>,
+    limits: placement::ClientLimits,
     width: i32,
     height: i32,
 ) -> (HWND, *mut WndProcState, Vec<u16>) {
@@ -105,6 +133,7 @@ fn hidden_window_sized(
         dispatcher,
         hwnd,
         WindowId::for_test(1),
+        limits,
         None,
         // RE-01：平台层不允许自造消费端代际；测试从真实 `A11yBridge` 取。
         crate::a11y::adapter::A11yBridge::new().consumer_epoch(),
@@ -135,6 +164,29 @@ fn destroy_hidden_window(hwnd: HWND, state: *mut WndProcState) {
 /// `WM_SIZE` 的 `lParam`：低 16 位 = 客户区物理宽，高 16 位 = 客户区物理高。
 fn encoded_client(width: u16, height: u16) -> isize {
     (((height as u32) << 16) | width as u32) as isize
+}
+
+/// `WM_MOVE` / `WM_NCHITTEST` 的 `lParam`：低 16 位 = x、高 16 位 = y（两段有符号）。
+fn encoded_point(x: i32, y: i32) -> isize {
+    ((((y as u32) << 16) | (x as u32 & 0xFFFF)) as i32) as isize
+}
+
+/// 用一个**逻辑客户区坐标**向窗口发 `WM_NCHITTEST`（lParam 是屏幕物理坐标），返回命中码。
+fn hit_test(hwnd: HWND, scale: Scale, client_origin: POINT, x: f32, y: f32) -> u32 {
+    let point = POINT {
+        x: client_origin.x + (x * scale.factor()).round() as i32,
+        y: client_origin.y + (y * scale.factor()).round() as i32,
+    };
+    // SAFETY: 窗口由调用方保证存活；`WM_NCHITTEST` 的 lParam 是两个 16 位屏幕坐标。
+    let result = unsafe {
+        SendMessageW(
+            hwnd,
+            WM_NCHITTEST,
+            None,
+            Some(LPARAM(encoded_point(point.x, point.y))),
+        )
+    };
+    result.0 as u32
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -452,6 +504,88 @@ fn display_and_power_messages_mark_one_pending_display_recovery() {
     destroy_hidden_window(hwnd, state);
 }
 
+/// B2 回归：系统主题变化（`WM_SETTINGCHANGE` + `ImmersiveColorSet`）必须把标题栏切到注册表
+/// 里的最新主题值 —— `WndProcState` 的 test-only 观察点 + DWM 真值回读双重断言。
+///
+/// 前置：先把 DWM 属性设成与系统主题**相反**的值，因此「调用被删掉 / 没真正执行」时回读
+/// 停在反值上，本条在任何系统主题的宿主下都会变红。
+/// 变异守卫：删掉 `WM_SETTINGCHANGE` 分支里的 `dark_mode::set_titlebar` 调用（或把它的结果
+/// 替换成常量）⇒ 观察点恒 `None`、回读停在反值，本条变红；应用侧仍必须收到
+/// `AppearanceChanged`（两条线不能互相替代）。
+#[test]
+fn a_theme_change_applies_the_dark_titlebar() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, class_name) = hidden_window("KytrixWndProcDarkTitlebar", dispatcher);
+    // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
+    let raw = unsafe { &mut *state };
+    let expected = dark_mode::current()
+        .expect("本机 HKCU\\…\\Personalize\\AppsUseLightTheme 必须可读（Win11 宿主）");
+    assert_eq!(
+        raw.last_dark_titlebar, None,
+        "未收到主题变化前不得有标题栏观察值"
+    );
+    // 前置：DWM 属性停在反值，主题变化的同步必须把它翻回 `expected`。
+    assert!(
+        dark_mode::set_titlebar(hwnd, !expected),
+        "前置：把标题栏设成与系统主题相反的值"
+    );
+    assert_eq!(read_titlebar(hwnd), !expected, "前置：DWM 回读为反值");
+
+    let changed = wide("ImmersiveColorSet");
+    // SAFETY: 窗口由本测试创建且仍存活；`lParam` 是本函数栈上的 NUL 结尾宽字符串，只在本次
+    // 消息处理期使用；`SendMessageW` 同步进入生产 `wndproc`。
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_SETTINGCHANGE,
+            None,
+            Some(LPARAM(changed.as_ptr() as isize)),
+        );
+    }
+
+    assert_eq!(
+        raw.last_dark_titlebar,
+        Some(expected),
+        "系统主题变化必须把 DWM 标题栏切到注册表里的主题值"
+    );
+    assert_eq!(
+        read_titlebar(hwnd),
+        expected,
+        "DWM 真值必须跟随系统主题（不能只记观察点）"
+    );
+    let appearance = raw
+        .take_events()
+        .into_iter()
+        .find_map(|event| match event.event {
+            PlatformEvent::Appearance(dark) => Some(dark),
+            _ => None,
+        });
+    assert_eq!(
+        appearance,
+        Some(expected),
+        "应用仍必须收到 AppearanceChanged（平台同步不能替代事件）"
+    );
+    destroy_hidden_window(hwnd, state);
+    let _ = class_name;
+}
+
+/// 从 DWM 回读标题栏明暗（B2 用例的「真值」断言用）。
+fn read_titlebar(hwnd: HWND) -> bool {
+    let mut value = windows::core::BOOL::default();
+    // SAFETY: `hwnd` 由调用方保证存活；输出是指向栈上 `BOOL` 的可写指针，长度 = 4 字节。
+    unsafe {
+        windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWA_USE_IMMERSIVE_DARK_MODE,
+            (&raw mut value).cast(),
+            std::mem::size_of::<windows::core::BOOL>() as u32,
+        )
+    }
+    .expect("DwmGetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE)");
+    value.as_bool()
+}
+
 /// R07-13 回归：同一批内的 `WM_MOUSEMOVE` 合并成一条（保留最后一条的位置）。
 ///
 /// 系统以最高 1000 Hz 投递鼠标移动；旧实现每条都入队 + 唤醒 + 应用级派发（每条都做命中
@@ -603,9 +737,9 @@ fn a_dpi_change_applies_immediately_and_stamps_later_events() {
     }
     // 建议矩形（800×600）比 192 dpi 下的最小跟踪尺寸大，系统不会钳制 ⇒ 位置与尺寸逐字落地。
     assert!(
-        raw.min_size.0 <= 800 && raw.min_size.1 <= 600,
-        "前置：建议矩形必须大于最小跟踪尺寸（否则会被系统钳制），min_size={:?}",
-        raw.min_size
+        raw.min_track_size.0 <= 800 && raw.min_track_size.1 <= 600,
+        "前置：建议矩形必须大于最小跟踪尺寸（否则会被系统钳制），min_track_size={:?}",
+        raw.min_track_size
     );
     assert_eq!(
         (
@@ -631,6 +765,264 @@ fn a_dpi_change_applies_immediately_and_stamps_later_events() {
         "同批后续输入必须用新 scale（R07-12）"
     );
     destroy_hidden_window(hwnd, state);
+}
+
+/// B3：`WM_GETMINMAXINFO` 的 `ptMinTrackSize` / `ptMaxTrackSize` 必须来自建窗时解析的
+/// `WindowOptions::min_size` / `max_size`（客户区逻辑尺寸 → **窗口外框**物理像素，含 DPI
+/// 换算）；`min > max` 时按 `max` 钳制（公共契约 min = max）；未配置 `max_size` 时必须保留
+/// 系统默认值（`DefWindowProcW` 预填的屏幕上限），不能被引擎写成 0。
+///
+/// 变异守卫：删掉 `ptMinTrackSize` 赋值 / 删掉 `max_track_size` 的覆盖判断 ⇒ 对应断言变红。
+#[test]
+fn wm_getminmaxinfo_applies_the_configured_client_limits() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let options = WindowOptions {
+        min_size: Some(Size::new(500.0, 300.0)),
+        max_size: Some(Size::new(1200.0, 900.0)),
+        ..WindowOptions::default()
+    };
+    let limits = placement::ClientLimits::from_options(&options);
+    let (hwnd, state, class_name) =
+        hidden_window_with_limits("KytrixWndProcMinMax", dispatcher, limits, 640, 480);
+    let dpi = dpi::window_dpi(hwnd);
+    let mut info = MINMAXINFO::default();
+
+    // SAFETY: 窗口由本测试创建且仍存活；`WM_GETMINMAXINFO` 处理期只写 `lParam` 指向的栈上结构。
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_GETMINMAXINFO,
+            None,
+            Some(LPARAM((&raw mut info) as isize)),
+        );
+    }
+
+    let min = dpi::track_size(Size::new(500.0, 300.0), dpi);
+    let max = dpi::track_size(Size::new(1200.0, 900.0), dpi);
+    assert_eq!(
+        (info.ptMinTrackSize.x, info.ptMinTrackSize.y),
+        (min.0 as i32, min.1 as i32),
+        "ptMinTrackSize 必须是配置值的窗口外框尺寸（含 DPI 换算，dpi={dpi}）"
+    );
+    assert_eq!(
+        (info.ptMaxTrackSize.x, info.ptMaxTrackSize.y),
+        (max.0 as i32, max.1 as i32),
+        "ptMaxTrackSize 必须是配置值的窗口外框尺寸（含 DPI 换算，dpi={dpi}）"
+    );
+    destroy_hidden_window(hwnd, state);
+    let _ = class_name;
+
+    // `min > max` ⇒ 按 max 钳制：两个跟踪尺寸相等。`ptMaxTrackSize` 的系统默认值必须仍被
+    // 覆盖成钳制后的值（否则用户可以拖到 max 以外）。
+    let dispatcher = Dispatcher::new();
+    let options = WindowOptions {
+        min_size: Some(Size::new(900.0, 700.0)),
+        max_size: Some(Size::new(600.0, 500.0)),
+        ..WindowOptions::default()
+    };
+    let limits = placement::ClientLimits::from_options(&options);
+    let (hwnd, state, class_name) =
+        hidden_window_with_limits("KytrixWndProcMinMaxClamped", dispatcher, limits, 640, 480);
+    // SAFETY: 同上的所有权约定。
+    let _raw = unsafe { &mut *state };
+    let dpi = dpi::window_dpi(hwnd);
+    let mut info = MINMAXINFO::default();
+    // SAFETY: 同上。
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_GETMINMAXINFO,
+            None,
+            Some(LPARAM((&raw mut info) as isize)),
+        );
+    }
+    let clamped = dpi::track_size(Size::new(600.0, 500.0), dpi);
+    assert_eq!(
+        (info.ptMinTrackSize.x, info.ptMinTrackSize.y),
+        (clamped.0 as i32, clamped.1 as i32),
+        "min > max 时最小跟踪尺寸按 max 钳制"
+    );
+    assert_eq!(
+        (info.ptMaxTrackSize.x, info.ptMaxTrackSize.y),
+        (clamped.0 as i32, clamped.1 as i32),
+        "钳制后 min == max"
+    );
+    destroy_hidden_window(hwnd, state);
+    let _ = class_name;
+}
+
+/// B3：`WM_MOVE` 必须翻译成 `PlatformEvent::Moved`（**屏幕物理坐标**）；`WM_DPICHANGED`
+/// 建议矩形重排期间系统同步派发的 `WM_MOVE` 被过滤（公共契约：DPI 路径只产生 `DpiChanged`），
+/// 且过滤只覆盖那一次重排 —— 之后的普通移动照常派发。
+///
+/// 变异守卫：删掉 `translate` 的 `WM_MOVE` 分支 ⇒ 第一条断言变红；删掉 `suppress_move`
+/// 判定 ⇒ DPI 重排期间多出一条 `Moved`，第二条断言变红。
+#[test]
+fn wm_move_is_translated_and_dpi_repositioning_moves_are_filtered() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, class_name) = hidden_window("KytrixWndProcMove", dispatcher);
+    // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
+    let raw = unsafe { &mut *state };
+    let _ = raw.take_events();
+
+    // 普通移动（负屏幕坐标也是合法的多屏位置）：一条 `Moved`，坐标不换算。
+    // SAFETY: 窗口由本测试创建且仍存活；`SendMessageW` 同步进入生产 `wndproc`。
+    unsafe {
+        SendMessageW(hwnd, WM_MOVE, None, Some(LPARAM(encoded_point(-1920, 120))));
+    }
+    let events = raw.take_events();
+    assert_eq!(events.len(), 1, "一条移动事件，实际 {events:?}");
+    assert_eq!(events[0].event, PlatformEvent::Moved { x: -1920, y: 120 });
+    assert_eq!(events[0].scale, raw.scale(), "Moved 必须带消息时刻的 scale");
+
+    // DPI 建议矩形重排：期间同步派发的 `WM_MOVE` 被过滤，DPI 事件仍在。
+    let suggested = RECT {
+        left: 40,
+        top: 50,
+        right: 840,
+        bottom: 650,
+    };
+    // SAFETY: 窗口存活；`WM_DPICHANGED` 的 lParam 在消息处理期有效。
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_DPICHANGED,
+            Some(WPARAM(192)),
+            Some(LPARAM((&raw const suggested) as isize)),
+        );
+    }
+    assert!(!raw.suppress_move, "过滤标记必须在消息处理结束时复位");
+    let events = raw.take_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.event, PlatformEvent::Dpi { dpi: 192 })),
+        "DPI 事件仍必须派发，实际 {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.event, PlatformEvent::Moved { .. })),
+        "DPI 重排期间产生的 WM_MOVE 不得派发 Event::Moved（公共契约），实际 {events:?}"
+    );
+
+    // 过滤不是永久的：之后的普通移动照常派发。
+    // SAFETY: 同上。
+    unsafe {
+        SendMessageW(hwnd, WM_MOVE, None, Some(LPARAM(encoded_point(100, 200))));
+    }
+    assert!(
+        raw.take_events()
+            .iter()
+            .any(|event| matches!(event.event, PlatformEvent::Moved { x: 100, y: 200 })),
+        "DPI 重排结束后 WM_MOVE 必须恢复派发"
+    );
+    destroy_hidden_window(hwnd, state);
+    let _ = class_name;
+}
+
+/// X2：`WM_NCHITTEST` 命中应用声明的**自绘标题栏拖动区**时返回 `HTCAPTION`（系统 move
+/// 模态循环的入场券：双击最大化/还原、Aero Snap、Snap Layouts 全部照常）；区域之外仍是系统的
+/// `HTCLIENT`；清空区域后恢复系统命中码。
+///
+/// 变异守卫：删掉 `WM_NCHITTEST` 分支里的拖动区判定 ⇒ 第一条断言变红（返回 `HTCLIENT`）。
+#[test]
+fn drag_regions_hit_test_as_caption_and_clear_back_to_the_system() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, class_name) = hidden_window("KytrixWndProcDragRegion", dispatcher);
+    // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
+    let raw = unsafe { &mut *state };
+    let scale = raw.scale();
+    let mut client_origin = POINT::default();
+    // SAFETY: 窗口由本测试创建且仍存活；只做坐标换算。
+    assert!(
+        unsafe { ClientToScreen(hwnd, &mut client_origin) }.as_bool(),
+        "ClientToScreen"
+    );
+    raw.set_drag_regions(&[Rect::new(0.0, 0.0, 200.0, 24.0)]);
+
+    assert_eq!(
+        hit_test(hwnd, scale, client_origin, 10.0, 10.0),
+        HTCAPTION,
+        "拖动区内必须返回 HTCAPTION（系统 move 模态循环只认它）"
+    );
+    assert_eq!(
+        hit_test(hwnd, scale, client_origin, 10.0, 100.0),
+        HTCLIENT,
+        "拖动区外仍是客户区（非客户区语义不变）"
+    );
+    assert_eq!(
+        hit_test(hwnd, scale, client_origin, 150.0, 30.0),
+        HTCLIENT,
+        "拖动区下沿之外仍是客户区"
+    );
+
+    raw.set_drag_regions(&[]);
+    assert_eq!(
+        hit_test(hwnd, scale, client_origin, 10.0, 10.0),
+        HTCLIENT,
+        "清空拖动区后必须恢复系统命中码"
+    );
+    destroy_hidden_window(hwnd, state);
+    let _ = class_name;
+}
+
+/// X2：泵的每轮对账把 `App::window(id).drag_regions()` 同步进 `WndProcState` —— 运行时设置 /
+/// 更新 / 清空立即反映到命中测试（应用在布局变化后重新声明区域的路径）。
+#[test]
+fn the_pump_sync_copies_drag_regions_into_the_wndproc_state() {
+    let runtime = runtime();
+    let mut app = App::new(runtime.handle().clone());
+    let options = WindowOptions::default();
+    let id = app.create_window(options.clone());
+    let mut native = NativeWindow::create(
+        id,
+        &options,
+        None,
+        Dispatcher::new(),
+        None,
+        crate::platform::windows::window::test_a11y_epoch(),
+    )
+    .expect("NativeWindow::create");
+    let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
+    let scale = native.scale();
+    let mut client_origin = POINT::default();
+    // SAFETY: 窗口由 `native` 持有且仍存活；只做坐标换算。
+    assert!(
+        unsafe { ClientToScreen(hwnd, &mut client_origin) }.as_bool(),
+        "ClientToScreen"
+    );
+
+    // 首次声明：区域同步到 WndProcState 并生效。
+    let first = [Rect::new(0.0, 0.0, 320.0, 32.0)];
+    app.set_drag_regions(id, &first);
+    native.sync_drag_regions(&app);
+    assert_eq!(native.state_mut().drag_regions(), &first);
+    assert_eq!(
+        hit_test(hwnd, scale, client_origin, 10.0, 10.0),
+        HTCAPTION,
+        "同步后的区域必须命中 HTCAPTION"
+    );
+
+    // 运行时更新：新区域覆盖旧区域（旧区域的剩余部分回到系统命中码）。
+    let second = [Rect::new(0.0, 0.0, 120.0, 16.0)];
+    app.set_drag_regions(id, &second);
+    native.sync_drag_regions(&app);
+    assert_eq!(native.state_mut().drag_regions(), &second);
+    assert_eq!(
+        hit_test(hwnd, scale, client_origin, 200.0, 10.0),
+        HTCLIENT,
+        "更新后旧区域之外的命中必须回到系统命中码"
+    );
+
+    // 清空：同步为空表，区域不再生效。
+    app.set_drag_regions(id, &[]);
+    native.sync_drag_regions(&app);
+    assert!(native.state_mut().drag_regions().is_empty());
+    assert_eq!(hit_test(hwnd, scale, client_origin, 10.0, 10.0), HTCLIENT);
 }
 
 /// R07-2 回归：`WM_NCHITTEST` 必须返回**系统命中码**。
@@ -997,6 +1389,7 @@ fn a_size_move_resize_drives_a_real_frame() {
     let native = NativeWindow::create(
         id,
         &options,
+        None,
         Arc::clone(&dispatcher),
         Some(&app),
         a11y_epoch,
@@ -1042,6 +1435,7 @@ fn a_size_after_the_modal_loop_is_only_recorded_for_the_pump() {
     let mut native = NativeWindow::create(
         id,
         &options,
+        None,
         Arc::clone(&dispatcher),
         Some(&app),
         a11y_epoch,
@@ -1075,5 +1469,465 @@ fn a_size_after_the_modal_loop_is_only_recorded_for_the_pump() {
             .iter()
             .any(|event| matches!(event.event, PlatformEvent::Resize { .. })),
         "事件仍必须入队交给泵（否则模态循环外的 resize 永远不重排）：{events_before:?}"
+    );
+}
+
+// ── B1：系统 move 模态循环里的出帧（`WM_APP_FRAME_WAKE` → `ModalTick`）──────────────────
+//
+// 拖动标题栏走系统 move 模态循环：它不产生 `WM_SIZE`，而唯一的帧请求入口
+// `WM_APP_FRAME_WAKE` 曾经被直接吞掉 ⇒ tokio 回投任务 / `on_frame` 钩子 / `App::frame` 全部
+// 停摆（报告 §1 VALID）。下面的用例钉住三件事：
+// (a) 模态循环内一条 `WM_APP_FRAME_WAKE` 执行任务 + 钩子 + 提交一帧；
+// (b) 模态循环外同序列**不得**直接出帧（守住泵的 ④ 路径，不回归成双帧）；
+// (c) 模态 tick 里任务关掉全部窗口：不 panic、不重入、不泄漏唤醒位。
+
+/// B1 用例夹具：真实 `App` + 隐藏 `NativeWindow`（挂上生产 `WndProc` 与模态 tick 驱动）。
+///
+/// `native` 必须活到用例结束（`WndProcState` 的所有者）；`hook_runs` 是 `App::on_frame` 的
+/// 调用计数（模态 tick 与泵的 ④ 都会让它 +1）。`runtime` 由调用方持有（`App` 的 tokio 句柄）。
+struct ModalFixture {
+    app: Rc<RefCell<App>>,
+    dispatcher: Arc<Dispatcher>,
+    native: NativeWindow,
+    hwnd: HWND,
+    id: WindowId,
+    hook_runs: Rc<Cell<u32>>,
+}
+
+fn modal_tick_fixture(runtime: &tokio::runtime::Runtime) -> ModalFixture {
+    let mut app = App::new(runtime.handle().clone());
+    let options = WindowOptions::default();
+    let id = app.create_window(options.clone());
+    let app = Rc::new(RefCell::new(app));
+    let dispatcher = Dispatcher::new();
+    let native = NativeWindow::create(
+        id,
+        &options,
+        None,
+        Arc::clone(&dispatcher),
+        Some(&app),
+        crate::platform::windows::window::test_a11y_epoch(),
+    )
+    .expect("NativeWindow::create");
+    let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
+    let hook_runs = Rc::new(Cell::new(0u32));
+    let counter = Rc::clone(&hook_runs);
+    app.borrow_mut().on_frame(move |_app| {
+        counter.set(counter.get() + 1);
+    });
+    // 建窗 / a11y 构造不应留下待处理帧：清一次让断言只测被发送的消息。
+    let _ = dispatcher.take_frame_wake();
+    ModalFixture {
+        app,
+        dispatcher,
+        native,
+        hwnd,
+        id,
+        hook_runs,
+    }
+}
+
+/// B1 (a)：`WM_ENTERSIZEMOVE` 之后，一条 `WM_APP_FRAME_WAKE` 必须在 `WndProc` 内直接
+/// 执行回投任务、`on_frame` 钩子并提交一帧（泵的 ④ 在系统模态循环里不运行）。
+///
+/// 变异守卫：删掉 `WM_APP_FRAME_WAKE` 分支里的 `in_modal_loop()` / `modal_tick_step()`
+/// 判定 ⇒ 任务与钩子都不执行、`FrameIndex` 不前进，本条变红；删掉 `modal_tick` 里的
+/// `drain_tasks` ⇒ 任务断言红；删掉 `run_frame_hook` ⇒ 钩子计数断言红。
+#[test]
+fn a_modal_loop_wake_runs_tasks_and_frames_inside_the_wndproc() {
+    let runtime = runtime();
+    let ModalFixture {
+        app,
+        dispatcher,
+        native: _native,
+        hwnd,
+        id,
+        hook_runs,
+    } = modal_tick_fixture(&runtime);
+    let task_ran = Arc::new(AtomicBool::new(false));
+    let task_flag = Arc::clone(&task_ran);
+    // 回投任务：写状态并请求重绘（行情 / HUD 更新的典型形态）。
+    dispatcher.push(UserTask::new(move |app| {
+        app.window_mut(id).expect("窗口存在").request_repaint();
+        task_flag.store(true, Ordering::Release);
+    }));
+    let before = app.borrow().window(id).expect("窗口存在").frame_index();
+
+    // 系统 move 模态循环开始（被拖窗口 = 本窗口）。
+    // SAFETY: 窗口由 `native` 持有且仍存活；`SendMessageW` 同步进入生产 `wndproc`。
+    unsafe {
+        SendMessageW(hwnd, WM_ENTERSIZEMOVE, None, None);
+    }
+    assert!(
+        dispatcher.in_modal_loop(),
+        "WM_ENTERSIZEMOVE 必须进入全局模态计数（唤醒目标可能是另一个窗口）"
+    );
+
+    // SAFETY: 同 `a_size_move_resize_drives_a_real_frame`；消息同步进入生产 `wndproc`。
+    unsafe {
+        SendMessageW(hwnd, WM_APP_FRAME_WAKE, None, None);
+    }
+
+    assert!(
+        task_ran.load(Ordering::Acquire),
+        "模态循环里的回投任务必须被执行（否则任务堆到松手后集中爆发）"
+    );
+    assert_eq!(
+        hook_runs.get(),
+        1,
+        "on_frame 钩子必须在模态循环里每拍执行一次"
+    );
+    let after = app.borrow().window(id).expect("窗口存在").frame_index();
+    assert!(
+        after > before,
+        "模态 tick 必须提交一帧（frame_index {before:?} → {after:?}；泵的 ④ 这段时间不运行）"
+    );
+    assert!(
+        !dispatcher.take_frame_wake(),
+        "唤醒位必须被这一拍消费（不能留在泵的一轮里造成双帧）"
+    );
+    assert!(
+        dispatcher.drain_tasks().is_empty(),
+        "任务队列必须已排空（否则下一条消息会重复执行）"
+    );
+
+    // 退出模态循环：计数归零，唤醒回到泵路径。
+    // SAFETY: 窗口仍存活。
+    unsafe {
+        SendMessageW(hwnd, WM_EXITSIZEMOVE, None, None);
+    }
+    assert!(
+        !dispatcher.in_modal_loop(),
+        "WM_EXITSIZEMOVE 必须退出全局模态计数"
+    );
+}
+
+/// B1 (b)：模态循环**外**同一序列不得直接出帧 —— `WM_APP_FRAME_WAKE` 仍只把唤醒位留给泵的
+/// ④（否则每次唤醒都被 `WndProc` 抢跑，泵一侧再出一帧，形成系统性双帧）。
+#[test]
+fn a_frame_wake_outside_the_modal_loop_stays_for_the_pump() {
+    let runtime = runtime();
+    let ModalFixture {
+        app,
+        dispatcher,
+        native: _native,
+        hwnd,
+        id,
+        hook_runs,
+    } = modal_tick_fixture(&runtime);
+    let task_ran = Arc::new(AtomicBool::new(false));
+    let task_flag = Arc::clone(&task_ran);
+    dispatcher.push(UserTask::new(move |app| {
+        app.window_mut(id).expect("窗口存在").request_repaint();
+        task_flag.store(true, Ordering::Release);
+    }));
+    let before = app.borrow().window(id).expect("窗口存在").frame_index();
+    assert!(!dispatcher.in_modal_loop(), "前置：不在模态循环里");
+
+    // SAFETY: 窗口由 `native` 持有且仍存活；消息同步进入生产 `wndproc`。
+    unsafe {
+        SendMessageW(hwnd, WM_APP_FRAME_WAKE, None, None);
+    }
+
+    assert_eq!(hook_runs.get(), 0, "模态循环外不得跑钩子（归泵的 ④）");
+    assert!(
+        !task_ran.load(Ordering::Acquire),
+        "模态循环外不得执行回投任务"
+    );
+    assert_eq!(
+        app.borrow().window(id).expect("窗口存在").frame_index(),
+        before,
+        "模态循环外 WM_APP_FRAME_WAKE 不得直接出帧"
+    );
+    assert!(
+        dispatcher.take_frame_wake(),
+        "唤醒位必须留给泵的 ④（这里抢走就等于丢帧）"
+    );
+    let _ = dispatcher.drain_tasks();
+}
+
+/// B1 (c) 边界：模态 tick 里任务关闭**全部**窗口 —— 不 panic、帧内不重入（`try_borrow_mut`
+/// 失败即放弃本拍）、唤醒位不泄漏（否则泵退出前还会空转一轮）。
+#[test]
+fn a_modal_tick_that_closes_every_window_neither_panics_nor_leaks_the_wake() {
+    let runtime = runtime();
+    let ModalFixture {
+        app,
+        dispatcher,
+        mut native,
+        hwnd,
+        id,
+        hook_runs,
+    } = modal_tick_fixture(&runtime);
+    let ids: Vec<WindowId> = app.borrow().windows().map(|(window, _)| window).collect();
+    assert_eq!(ids, vec![id], "前置：App 里只有一个窗口");
+    dispatcher.push(UserTask::new(move |app| {
+        for window in ids {
+            assert!(app.close_window(window), "任务必须关闭窗口");
+        }
+    }));
+
+    // SAFETY: 窗口由 `native` 持有且仍存活；消息同步进入生产 `wndproc`。
+    unsafe {
+        SendMessageW(hwnd, WM_ENTERSIZEMOVE, None, None);
+        SendMessageW(hwnd, WM_APP_FRAME_WAKE, None, None);
+    }
+
+    assert!(
+        app.borrow().windows().next().is_none(),
+        "任务必须把 App 里的窗口全部关掉"
+    );
+    assert_eq!(hook_runs.get(), 1, "钩子仍按拍执行（关窗之后才出帧）");
+    assert!(
+        !dispatcher.take_frame_wake(),
+        "关掉全部窗口之后唤醒位不得泄漏（否则泵退出路径多一轮空转）"
+    );
+    assert!(dispatcher.drain_tasks().is_empty());
+    assert!(
+        native.state_mut().take_pending_error().is_none(),
+        "关窗不是帧管线错误，不得登记粘性错误"
+    );
+
+    // SAFETY: 隐藏窗口仍由 `NativeWindow` 持有，直到用例结束。
+    unsafe {
+        SendMessageW(hwnd, WM_EXITSIZEMOVE, None, None);
+    }
+    assert!(!dispatcher.in_modal_loop());
+}
+
+/// B1 (d) 空唤醒守卫：模态循环里一条**没有唤醒位**的 `WM_APP_FRAME_WAKE` 不得出帧 ——
+/// 「唤醒位 + 一条消息」是同一电平信号，若先跑任务 / 钩子再检查唤醒位，重复/迟到的消息会把
+/// 模态循环变成忙循环（持续跑钩子 + 空帧）。`take_frame_wake` 必须是本函数的第一件事。
+#[test]
+fn a_spurious_modal_wake_without_a_pending_request_does_not_tick() {
+    let runtime = runtime();
+    let ModalFixture {
+        app: _app,
+        dispatcher,
+        native: _native,
+        hwnd,
+        hook_runs,
+        ..
+    } = modal_tick_fixture(&runtime);
+    // 前置：夹具已清掉建窗 / a11y 构造留下的唤醒位。
+    assert!(!dispatcher.take_frame_wake(), "前置：没有待消费的帧唤醒");
+
+    // SAFETY: 窗口由 `native` 持有且仍存活；消息同步进入生产 `wndproc`。
+    unsafe {
+        SendMessageW(hwnd, WM_ENTERSIZEMOVE, None, None);
+        SendMessageW(hwnd, WM_APP_FRAME_WAKE, None, None);
+    }
+    assert_eq!(hook_runs.get(), 0, "没有唤醒位时不得跑任务 / 钩子");
+
+    // 守卫不能把模态 tick 关死：之后的真实唤醒仍必须驱动一拍（并消费唤醒位）。
+    dispatcher.wake();
+    // SAFETY: 窗口仍存活。
+    unsafe {
+        SendMessageW(hwnd, WM_APP_FRAME_WAKE, None, None);
+    }
+    assert_eq!(hook_runs.get(), 1, "真实唤醒必须执行一拍钩子");
+    assert!(
+        !dispatcher.take_frame_wake(),
+        "真实唤醒的唤醒位必须被这一拍消费"
+    );
+
+    // SAFETY: 窗口仍存活。
+    unsafe {
+        SendMessageW(hwnd, WM_EXITSIZEMOVE, None, None);
+    }
+    assert!(!dispatcher.in_modal_loop());
+}
+
+/// B1 (e) 异常路径对称性：窗口在系统模态循环里被销毁（`WM_EXITSIZEMOVE` 永远不会到达本
+/// 窗口过程）时，`WndProcState::drop` 必须把本窗口记过的模态层数退回全局计数。
+///
+/// 泄漏的后果不是「少出帧」而是「多出帧」：模态循环外每条 `WM_APP_FRAME_WAKE` 都会在
+/// `WndProc` 里抢跑泵的 ④（钩子重复执行、绕过泵的 a11y / 几何同步）。
+#[test]
+fn a_window_destroyed_inside_the_modal_loop_returns_its_global_entry() {
+    let runtime = runtime();
+    let ModalFixture {
+        app: _app,
+        dispatcher,
+        native,
+        hwnd,
+        ..
+    } = modal_tick_fixture(&runtime);
+    // SAFETY: 窗口由 `native` 持有且仍存活。
+    unsafe {
+        SendMessageW(hwnd, WM_ENTERSIZEMOVE, None, None);
+    }
+    assert!(dispatcher.in_modal_loop(), "前置：全局计数已进入一层");
+
+    // 模拟「窗口在 move / size 循环里被销毁」：销毁路径没有配对的 `WM_EXITSIZEMOVE`。
+    drop(native);
+    assert!(
+        !dispatcher.in_modal_loop(),
+        "销毁窗口必须退回尚未退出的模态层数（否则唤醒会在模态循环外抢跑泵的 ④）"
+    );
+}
+
+/// 取走本窗口消息队列里的下一条 `WM_APP_FRAME_WAKE`（其它消息丢弃）。
+fn take_posted_frame_wake(hwnd: HWND) -> bool {
+    let mut message = MSG::default();
+    loop {
+        // SAFETY: `message` 是栈上输出；只取本窗口的消息（测试线程就是窗口线程）。
+        let has_message =
+            unsafe { PeekMessageW(&mut message, Some(hwnd), 0, 0, PM_REMOVE) }.as_bool();
+        if !has_message {
+            return false;
+        }
+        if message.message == WM_APP_FRAME_WAKE {
+            return true;
+        }
+    }
+}
+
+/// B1 (f) 模态循环入口的唤醒位重投：钉住真机帧冻结的竞态。
+///
+/// 复现（真机实测偶发、拖动 3 s 一帧不出）：
+/// ① 数据泵 `wake()` 置位并 post 一条 `WM_APP_FRAME_WAKE`；
+/// ② 泵的 ① drain 把它派发进 `WndProc`（模态循环外 ⇒ 只返回、**不**消费位，消费归泵的 ④）；
+/// ③ 同一批消息里紧随的鼠标按下让 `DefWindowProc` 在泵的 ④ 之前进入模态循环。
+/// 此时唤醒位仍置位、队列里却没有唤醒消息：生产者看到「已置位」不再 post ⇒ 循环内零 tick。
+/// `begin_size_move` 必须在进入循环时消费并重投一条唤醒消息。
+#[test]
+fn entering_the_modal_loop_reposts_a_wake_that_was_dispatched_but_not_consumed() {
+    let runtime = runtime();
+    let ModalFixture {
+        app: _app,
+        dispatcher,
+        native: _native,
+        hwnd,
+        hook_runs,
+        ..
+    } = modal_tick_fixture(&runtime);
+    // `wake()` 要在生产投递路径上真的 post 到这个窗口：attach 之后走 `PostMessageW`。
+    dispatcher.attach(hwnd.0 as isize);
+    // ① 数据泵唤醒：置位 + post 一条消息。
+    dispatcher.wake();
+    // ② 泵的 ① drain 取走并派发这条消息（模态循环外分支：只返回、不消费位）。
+    assert!(
+        take_posted_frame_wake(hwnd),
+        "前置：wake() 必须真的 post 一条 WM_APP_FRAME_WAKE"
+    );
+    // SAFETY: 窗口仍存活；消息同步进入生产 `wndproc`（模态循环外分支）。
+    unsafe {
+        SendMessageW(hwnd, WM_APP_FRAME_WAKE, None, None);
+    }
+    // 现在唤醒位仍置位、队列里没有消息 —— 再 wake() 必须被 coalesce（不再 post 新消息），
+    // 这就是真机上「泵 ④ 没来得及消费就进入模态循环」的竞态状态。
+    dispatcher.wake();
+    assert!(
+        !take_posted_frame_wake(hwnd),
+        "前置：竞态状态必须是「位置位、队列里没有唤醒消息」"
+    );
+    assert_eq!(hook_runs.get(), 0, "前置：模态循环外派发不得出帧");
+
+    // ③ 进入系统模态循环：必须消费并重投一条唤醒消息。
+    // SAFETY: 窗口仍存活；消息同步进入生产 `wndproc`。
+    unsafe {
+        SendMessageW(hwnd, WM_ENTERSIZEMOVE, None, None);
+    }
+    assert!(
+        take_posted_frame_wake(hwnd),
+        "进入模态循环时必须重投一条唤醒消息（否则拖动全程零帧，松手后才爆发）"
+    );
+
+    // 重投的那条消息派发后必须**真的**跑一拍（钩子 / 帧），而不是空转。
+    // SAFETY: 窗口仍存活；同步派发走同一条 `WndProc` 路径。
+    unsafe {
+        SendMessageW(hwnd, WM_APP_FRAME_WAKE, None, None);
+    }
+    assert_eq!(hook_runs.get(), 1, "重投的唤醒必须在模态循环里跑一拍钩子");
+    assert!(
+        !dispatcher.take_frame_wake(),
+        "这一拍必须消费唤醒位（否则下一次生产者仍然 coalesce）"
+    );
+
+    // SAFETY: 窗口仍存活。
+    unsafe {
+        SendMessageW(hwnd, WM_EXITSIZEMOVE, None, None);
+    }
+    assert!(!dispatcher.in_modal_loop());
+}
+
+// ── B6/D6：Windows IME 失焦对齐（组合中失焦恰好一条 `ImeEvent::End`）──────────────────
+
+/// 组合中 `WM_KILLFOCUS`：必须补**恰好一条** `ImeEvent::End`（Win32 不保证失焦会先派发
+/// `WM_IME_ENDCOMPOSITION`），系统随后迟到的 `WM_IME_ENDCOMPOSITION` 不得重复投递；
+/// `Focus(false)` 事件仍在，且 `End` 先于 `Focus(false)`（先结束组合、再通知失焦）。
+#[test]
+fn losing_keyboard_focus_during_composition_emits_exactly_one_ime_end() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, _class) = hidden_window("KytrixWndProcImeFocusLoss", dispatcher);
+    // SAFETY: `state` 由 `hidden_window` 分配、生命周期到测试结束。
+    let raw = unsafe { &mut *state };
+    // SAFETY: 窗口由本测试创建且仍存活；`SendMessageW` 同步进入生产 `wndproc`。
+    unsafe {
+        SendMessageW(hwnd, WM_IME_STARTCOMPOSITION, None, None);
+    }
+    assert!(
+        raw.take_events()
+            .iter()
+            .any(|event| matches!(event.event, PlatformEvent::Ime(ImeEvent::Start))),
+        "前置：启用态组合开始必须派发 Start"
+    );
+
+    // SAFETY: 同上。第二次 KILLFOCUS 用于验证组合态清零后不会重复补 End。
+    unsafe {
+        SendMessageW(hwnd, WM_KILLFOCUS, None, None);
+        SendMessageW(hwnd, WM_KILLFOCUS, None, None);
+        SendMessageW(hwnd, WM_IME_ENDCOMPOSITION, None, None);
+    }
+    let events = raw.take_events();
+    let ends: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| matches!(event.event, PlatformEvent::Ime(ImeEvent::End)))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        ends.len(),
+        1,
+        "组合中失焦必须补恰好一条 ImeEvent::End（实际 {:?}）",
+        events.iter().map(|event| &event.event).collect::<Vec<_>>()
+    );
+    let focus_lost = events
+        .iter()
+        .position(|event| matches!(event.event, PlatformEvent::Focus(false)))
+        .expect("失焦必须派发 Focus(false)");
+    assert!(
+        ends[0] < focus_lost,
+        "End 必须先于 Focus(false)（先结束组合、再通知失焦）"
+    );
+}
+
+/// 不在组合中失焦：不得凭空补 `ImeEvent::End`；后续孤立 `WM_IME_ENDCOMPOSITION` 也不得投递。
+#[test]
+fn losing_keyboard_focus_outside_composition_emits_no_ime_end() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, _class) = hidden_window("KytrixWndProcImeNoComposition", dispatcher);
+    // SAFETY: `state` 由 `hidden_window` 分配、生命周期到测试结束。
+    let raw = unsafe { &mut *state };
+    // SAFETY: 窗口由本测试创建且仍存活；`SendMessageW` 同步进入生产 `wndproc`。
+    unsafe {
+        SendMessageW(hwnd, WM_KILLFOCUS, None, None);
+        SendMessageW(hwnd, WM_IME_ENDCOMPOSITION, None, None);
+    }
+    let events = raw.take_events();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.event, PlatformEvent::Ime(ImeEvent::End))),
+        "没有组合时失焦不得补 End"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.event, PlatformEvent::Focus(false))),
+        "失焦事件本身仍必须派发"
     );
 }

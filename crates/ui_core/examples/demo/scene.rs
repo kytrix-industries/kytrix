@@ -308,6 +308,7 @@ impl Scene {
             size: window_size(),
             scale: ui_core::math::Scale::ONE,
             background: color(BG_RGBA),
+            ..WindowOptions::default()
         });
         Self::build_into(app, window)
     }

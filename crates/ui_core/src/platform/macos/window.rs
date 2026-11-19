@@ -1,24 +1,71 @@
 //! 原生窗口：`NSWindow` + 自绘标题栏 + 交通灯。
 //!
-//! 状态同步（尺寸 / 缩放 / 焦点 / 可见性）走「每轮快照对比」而不是 delegate 或通知：泵每轮都要
-//! 读一次这些值（O(1)）。**例外是关闭**：`windowShouldClose:` 是 AppKit 在关窗前唯一的同步
-//! 钩子，没有它就无法拦截用户点红点 / Cmd-W（窗口已被 AppKit 关掉，泵事后才观察到，veto 也就
-//! 失去意义）。见 [`WindowDelegate`]。
+//! 状态同步（尺寸 / 缩放 / 焦点 / 可见性 / 位置）走「每轮快照对比」而不是 delegate 或通知：
+//! 泵每轮都要读一次这些值（O(1)）。delegate 回调（`windowDidMove:` 等）只**置位 + 唤醒**，
+//! 平台真值仍由 `sync_state` 快照读取，避免两个真值来源。**例外是关闭**：AppKit 的关闭是
+//! 一次性的、带否决语义的动作，没有「快照对比」可做（窗口没了就再也读不到），必须由平台
+//! 关闭回调驱动。见 [`WindowDelegate`] 与 `platform::macos_close`。
+//!
+//! # 关闭语义（B5，用户裁决 D4(a)）
+//!
+//! 目标不变量（三端统一）：平台只**通知**关闭请求，应用在 `on_close` 里裁决（可否决），
+//! 同意后平台才真正关闭；macOS 上红点 / Cmd+W / 菜单 Close **不得播放系统提示音**。
+//!
+//! - **手势路径（可否决）**：标准关闭按钮被重定向到 `GuiView` 的 `performClose:` 覆盖
+//!   （不调 `super`，因此不触发 `windowShouldClose:` ⇒ 无系统 beep）；Cmd+W / 菜单 Close 的
+//!   responder chain 也先到 first responder（`GuiView`）。两者都只置关闭桥 + 唤醒泵。
+//!   泵投递 `Event::CloseRequested` → `App::request_close` → 同意后才 `NSWindow.close()`。
+//! - **防御路径**：`windowShouldClose:` 保留（AppKit 若从非标准路径问过来），置位 + 唤醒 +
+//!   返回 `false`。**残余风险**：这条路径不是 UI 的常规路径（关闭按钮已重定向、Cmd+W 命中
+//!   first responder 的 `performClose:` 覆盖），但若有第三方/AppleScript 直接给 `NSWindow`
+//!   发 `performClose:`，AppKit 会在 delegate 返回 `false` 时播放系统提示音 —— 这是保留
+//!   `windowShouldClose:` 语义的代价，记录在案。
+//! - **外部关闭路径（不可否决）**：`windowWillClose:` 是「窗口真的关了」的唯一权威来源。
+//!   引擎自己关窗时先断 delegate 再 `close()`（不会回调），因此收到它的唯一情形是 AppKit
+//!   自己关掉了窗口；此时只做 App 侧关闭记账 + 移除原生窗口，**不**再投递事件。
+//! - **禁用 window tabbing**（类级 `setAllowsAutomaticWindowTabbing(false)` + 每窗
+//!   `TabbingMode::Disallowed`）：窗口不并入系统 tab 组，Window 菜单因此不再出现
+//!   Merge All Windows；关闭语义不会被「关一个 tab」这类非窗口级动作打乱。
 //!
 //! 可见性（R09-9）三个来源：最小化（`isMiniaturized`）、应用隐藏（`NSApp.hide`，Cmd+H）、
 //! **被完全遮挡/在别的 Space**（`occlusionState` 不含 `Visible`）。三者任一为真，帧就不再产出、
 //! display link 暂停（见 `event_loop::pump`）——交易终端最小化几小时是常态，120 Hz 唤醒是纯浪费。
+//! 可见性**只**用于帧门控：旧实现曾用它反推「窗口已关闭」，但最小化/隐藏/tab 合并都会让
+//! `isVisible` 为 false，那是误判（B5 已删除该反推，关闭只信 `windowWillClose:`）。
+//!
+//! 摆放（B3）：`WindowOptions.position` / `min_size` / `max_size` 在 [`NativeWindow::create`]
+//! 消费；坐标换算 / 工作区 clamp 的纯逻辑在 `platform::macos_placement`（Windows 可单测）。
+//! 位置变化经 `windowDidMove:` 唤醒 + `sync_state` 快照比较，产出 `Event::Moved`。
+//!
+//! # 窗口层级 / owner（X1 原生部分）
+//!
+//! - **owner**：建窗后对 owner 窗口调 `addChildWindow:ordered:`（`NSWindowAbove`），保存
+//!   owner 的强引用以便关闭时 `removeChildWindow:`。这是 AppKit 的 **transient parent**
+//!   语义：child 恒在 parent 之上、随 parent 一起进出 z 序，parent 关闭/orderOut 时 AppKit
+//!   会把 child 一并 orderOut（不销毁）。**引擎层**（`app/window_set.rs`）已负责 owner 关闭
+//!   时级联关闭 owned 窗口，两者不冲突：引擎先把 App 侧窗口关掉，平台层再各自关原生窗口；
+//!   AppKit 的自动 orderOut 至多让窗口提前离开屏幕（同一轮泵内就被移除）。
+//! - **always_on_top**：`NSFloatingWindowLevel`。
+//! - **modal**：引擎层在输入分发入口拦截 owner 的输入；原生只做「模态层级
+//!   （`NSModalPanelWindowLevel`）+ 作为 owner 的 child window」。**不用**
+//!   `runModalForWindow:` —— 那会开嵌套 run loop，与本引擎在 `NSApplication.run` 的 run
+//!   loop 上跑的泵重入（同一批 AppKit 事件会被处理两次）。层级选择（模态 > 置顶）的纯逻辑
+//!   在 `platform::macos_owner`，Windows 可单测。
+//! - 请求了 owner 但平台侧找不到对应原生窗口（创建批次顺序/非法 id）⇒ 降级为无 owner 并
+//!   写诊断，不 panic（见 `event_loop::attach_owners`）。
 
-use std::{cell::Cell, sync::Arc};
+use std::{cell::Cell, rc::Rc, sync::Arc};
 
 use objc2::{
-    DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained,
-    runtime::ProtocolObject,
+    DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+    rc::Retained,
+    runtime::{AnyObject, ProtocolObject},
 };
 use objc2_app_kit::{
-    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSWindow,
-    NSWindowCollectionBehavior, NSWindowDelegate, NSWindowOcclusionState, NSWindowStyleMask,
-    NSWindowTitleVisibility,
+    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSFloatingWindowLevel,
+    NSModalPanelWindowLevel, NSScreen, NSWindow, NSWindowButton, NSWindowCollectionBehavior,
+    NSWindowDelegate, NSWindowOcclusionState, NSWindowOrderingMode, NSWindowStyleMask,
+    NSWindowTabbingMode, NSWindowTitleVisibility,
 };
 use objc2_foundation::{
     NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -28,23 +75,36 @@ use objc2_quartz_core::CAMetalLayer;
 use crate::{
     app::App,
     error::EngineError,
-    event::Event,
+    event::{Event, ImeEvent},
     math::{Rect, Scale, Size},
     paint::style::Cursor,
     platform::{
         dispatcher::Dispatcher,
-        macos::{a11y::MacA11y, dpi, view::GuiView, wake},
+        macos::{a11y::MacA11y, dpi, menu, view::GuiView, wake},
+        macos_close::{CloseAction, CloseBridge},
+        macos_owner::WindowLevel,
+        macos_placement as placement,
+        menu::MenuCommand,
     },
     window::{WindowId, WindowOptions},
 };
 
-/// `NSWindowDelegate` 的 ivar：只记「AppKit 请求关窗」这一个事实并唤醒泵。
+/// `NSWindowDelegate` 的 ivar：只记「AppKit 关闭窗口的事实」并唤醒泵。
 ///
-/// 回调里**不碰 `App`**（与 `GuiView` 同一纪律）：置位 / 唤醒，由泵在主线程决定
-/// `App::request_close` 的裁决。`windowShouldClose:` 恒返回 `false` —— 真正的关闭由泵在
-/// 应用同意之后调 `NSWindow::close`（`close` 不再询问 delegate，因此不会递归）。
+/// 回调里**不碰 `App`**（与 `GuiView` 同一纪律）：置位关闭桥 / 唤醒，由泵在主线程裁决
+/// `App::request_close`。两种关闭来源在 `CloseBridge` 里严格区分（B5，见
+/// `platform::macos_close`）：
+///
+/// - `windowShouldClose:`（防御路径）：用户手势 · 可否决 ⇒ 置 `Requested` 并返回 `false`
+///   （AppKit 因此不关窗；引擎自己在裁决通过后 `close()`，`close` 不会再问 delegate，
+///   不会递归）。返回 `false` 的代价是非标准调用方会听到系统提示音，见模块文档。
+/// - `windowWillClose:`（外部关闭）：AppKit 真的关了窗口 ⇒ 置终态 `WillClose`，泵只记账。
+///
+/// `moved`（B3）同理：`windowDidMove:` 只置位 + `dispatcher.wake()`，位置由泵的
+/// `sync_state` 从 `NSView` 快照算出（回调里拿不到 `&mut App`，也不该在回调里换算）。
 struct WindowIvars {
-    requested: Cell<bool>,
+    close: Rc<CloseBridge>,
+    moved: Cell<bool>,
     dispatcher: Arc<Dispatcher>,
 }
 
@@ -58,12 +118,31 @@ define_class!(
     unsafe impl NSObjectProtocol for WindowDelegate {}
 
     unsafe impl NSWindowDelegate for WindowDelegate {
+        /// AppKit 的关窗防御路径（关闭按钮已被重定向到 `GuiView::performClose:`，Cmd+W /
+        /// 菜单 Close 命中 first responder；这条路径只在 AppKit 从非标准入口问起时才走）。
+        ///
+        /// 与 `performClose:` 共用同一个 [`CloseBridge`]：去重、只置一次位。返回 `false`
+        /// 保证 AppKit 不自行关窗（真正的关闭由泵在裁决通过后执行）。**残余**：若这条路径
+        /// 被触发，AppKit 会因 `false` 播放系统提示音 —— 无法两全（要否决就不能返回 YES）。
         #[unsafe(method(windowShouldClose:))]
         fn window_should_close(&self, _sender: &NSWindow) -> bool {
-            self.ivars().requested.set(true);
-            self.ivars().dispatcher.wake();
-            // 恒拒绝 AppKit 的默认关闭：由泵在 `App::request_close` 同意后再 `close()`。
+            if self.ivars().close.request() {
+                self.ivars().dispatcher.wake();
+            }
+            // 恒拒绝 AppKit 的同步关闭：真正关闭由泵在 `App::request_close` 同意后调 `close()`。
             false
+        }
+
+        /// `windowWillClose:`：**「窗口真的关了」的唯一权威来源**（B5）。
+        ///
+        /// 只置位 + 唤醒：外部关闭不可否决，泵在下一轮把它翻译成「App 侧关闭记账 + 移除原生
+        /// 窗口」。不在这里碰 `App`（回调里没有 `&mut App`，也不该在 AppKit 的关闭通知里跑
+        /// 应用关闭处理器 —— 顺序与可重入性都不可控）。
+        #[unsafe(method(windowWillClose:))]
+        fn window_will_close(&self, _notification: &NSNotification) {
+            if self.ivars().close.will_close() {
+                self.ivars().dispatcher.wake();
+            }
         }
 
         // R09-9：遮挡 / 最小化 / 恢复只**唤醒泵**——可见性是泵每轮快照读的（`sync_state`），
@@ -84,38 +163,86 @@ define_class!(
         fn window_did_deminiaturize(&self, _notification: &NSNotification) {
             self.ivars().dispatcher.wake();
         }
+
+        /// B3：窗口位置变化（拖动标题栏 / 系统摆放 / 跨屏 / `setFrame`）。
+        ///
+        /// 只置位 + 唤醒：位置换算与 `Event::Moved` 投递由泵做（回调不碰 `App`）。
+        /// 唤醒保证「拖动期间至少每个 run loop 一轮」收到位置事件。
+        #[unsafe(method(windowDidMove:))]
+        fn window_did_move(&self, _notification: &NSNotification) {
+            self.ivars().moved.set(true);
+            self.ivars().dispatcher.wake();
+        }
     }
 );
 
 impl WindowDelegate {
-    fn new(mtm: MainThreadMarker, dispatcher: Arc<Dispatcher>) -> Retained<Self> {
+    fn new(
+        mtm: MainThreadMarker,
+        close: Rc<CloseBridge>,
+        dispatcher: Arc<Dispatcher>,
+    ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(WindowIvars {
-            requested: Cell::new(false),
+            close,
+            moved: Cell::new(false),
             dispatcher,
         });
         // SAFETY: `init` 是 NSObject 的指定初始化器；`this` 由 `alloc` 产生且未初始化。
         unsafe { msg_send![super(this), init] }
     }
 
-    /// 取走「AppKit 请求关窗」标记。
-    fn take_request(&self) -> bool {
-        self.ivars().requested.replace(false)
+    /// 取走「AppKit 报告窗口移动」标记（B3；位置真值仍由 `sync_state` 快照读取）。
+    fn take_moved(&self) -> bool {
+        self.ivars().moved.replace(false)
     }
 }
 
 /// 最小客户区（逻辑像素；与 Win32 / Wayland 同源）。
 pub(crate) const MIN_SIZE_LOGICAL: (f32, f32) = (320.0, 200.0);
 
-/// 关窗请求的来源。
+/// 全部屏幕的 frame / visibleFrame 快照（B3；`NSScreen` 是主线程对象，建窗与泵都在主线程）。
+fn screen_areas(mtm: MainThreadMarker) -> Vec<placement::ScreenArea> {
+    let screens = NSScreen::screens(mtm);
+    let mut areas = Vec::with_capacity(screens.count());
+    for screen in screens.to_vec() {
+        areas.push(placement::ScreenArea::new(
+            ns_area(screen.frame()),
+            ns_area(screen.visibleFrame()),
+        ));
+    }
+    areas
+}
+
+/// `NSRect` → 平台无关的 [`placement::Area`]（AppKit 全局坐标、point）。
+fn ns_area(rect: NSRect) -> placement::Area {
+    placement::Area::new(
+        rect.origin.x,
+        rect.origin.y,
+        rect.size.width,
+        rect.size.height,
+    )
+}
+
+/// `position = None` 时的平台默认摆放（B3）：主屏工作区左上角按 26 point 阶梯级联。
 ///
-/// `Observed` 是「窗口已不可见」的事后观察：`sync_state` 已经 dispatch 过事件，
-/// 泵不能再补发一次（复审 F3 的双投递缺陷）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CloseRequestSource {
-    /// AppKit 的关窗手势（红点 / Cmd-W / performClose:）。
-    Gesture,
-    /// 「窗口已不可见」的事后观察（销毁 / 应用退出）。
-    Observed,
+/// AppKit 没有「自动摆放」的默认行为（`initWithContentRect:` 严格按给定矩形创建），
+/// 因此平台层自己做级联（等价 `NSWindow.cascadeTopLeftFromPoint:` 的步长，Qt / winit
+/// 的默认摆放同款）—— 多窗口不再完全重叠，兑现 `WindowOptions::position = None` 文档。
+fn cascade_content_origin(
+    mtm: MainThreadMarker,
+    screens: &[placement::ScreenArea],
+    size: Size,
+    index: usize,
+) -> (f64, f64) {
+    let Some(desktop) = placement::Desktop::from_screens(screens) else {
+        // 无屏幕（headless / 无显示器）：沿用历史默认位置，保证窗口仍可创建。
+        return (80.0, 80.0);
+    };
+    let main_visible = NSScreen::mainScreen(mtm)
+        .map(|screen| ns_area(screen.visibleFrame()))
+        .unwrap_or(screens[0].visible());
+    let position = placement::cascade_position(desktop, main_visible, index);
+    placement::content_origin_for_position(position, size, screens)
 }
 
 /// 一个原生窗口（`Application::run` 持有；`Drop` 时关闭）。
@@ -126,6 +253,13 @@ pub(crate) struct NativeWindow {
     view: Retained<GuiView>,
     /// `delegate` 是 **weak** 属性：必须由门面持有强引用，否则回调会打在已释放对象上。
     delegate: Retained<WindowDelegate>,
+    /// 关闭桥（B5）：view / delegate 写入、泵消费（与 `GuiView` / `WindowDelegate` 共享）。
+    close: Rc<CloseBridge>,
+    /// owner 窗口的原生引用（X1；`addChildWindow:ordered:` 的 parent）。
+    ///
+    /// 保持强引用：关闭本窗口时要 `removeChildWindow:`，即使 parent 的 `NativeWindow` 已先
+    /// 被移除，NSWindow 对象也必须仍然存活（`Retained` 保证这一点）。
+    owner: Option<Retained<NSWindow>>,
     scale: Scale,
     logical_size: Size,
     /// 最近一次同步的快照（用于检测变化）。
@@ -136,16 +270,25 @@ pub(crate) struct NativeWindow {
     was_key: bool,
     /// 当前是否**可见**（最小化 / 应用隐藏 / 完全遮挡任一为真则为 false，R09-9）。
     visible: bool,
-    /// 「窗口已不可见」的事后观察是否已经报过一次（同步 dispatch 一次给观察者）。
-    close_requested: bool,
     destroyed: bool,
     /// 最近一次下发的 IME caret 区域（逻辑坐标）。
     ime_area: Option<Rect>,
+    /// 已应用到 `GuiView` 的 IME 启用状态（B6；目标状态来自 `App::ime_enabled`）。
+    ime_enabled: bool,
+    /// `sync_state` 观察到的「窗口刚失去键盘焦点」边沿（泵在同步后消费它做 IME 清场）。
+    focus_lost: bool,
+    /// 最近一次观察到的内容区左上角（**AppKit 全局坐标**，point）：`Event::Moved` 的去重基准。
+    ///
+    /// 用 AppKit 坐标比较而不是引擎坐标：屏幕布局变化会改变两者之间的平移/翻转，用引擎
+    /// 坐标比较会在「没动过的窗口」上误报 `Event::Moved`。
+    seen_content: placement::Area,
 }
 
 impl NativeWindow {
     /// 建**隐藏**窗口（不 `makeKeyAndOrderFront`）并装好 view + a11y adapter。
     ///
+    /// `cascade_index` 是「本窗口是本次运行创建的第几个」：`WindowOptions.position = None`
+    /// 时用于平台默认的级联摆放（B3，见 `macos_placement::cascade_position`）。
     /// `a11y_consumer_epoch` 是窗口的消费端代际句柄（与引擎 `A11yBridge` 共享）：AX 重新激活
     /// 时激活回调 `bump()` 它，引擎把下一笔升成全树（E1）。
     pub(crate) fn create(
@@ -153,6 +296,7 @@ impl NativeWindow {
         id: WindowId,
         options: &WindowOptions,
         dispatcher: &Arc<Dispatcher>,
+        cascade_index: usize,
         a11y_consumer_epoch: crate::a11y::adapter::A11yConsumerEpoch,
     ) -> Result<Self, EngineError> {
         let style = NSWindowStyleMask::Titled
@@ -160,12 +304,21 @@ impl NativeWindow {
             | NSWindowStyleMask::Miniaturizable
             | NSWindowStyleMask::Resizable
             | NSWindowStyleMask::FullSizeContentView;
+        let size = Size::new(options.size.width.max(1.0), options.size.height.max(1.0));
+        // B3：`position` 是「虚拟桌面内容区左上角、y 向下」的逻辑点；平台层换算成 AppKit
+        // 的内容区矩形（左下原点、y 向上）并 clamp 进目标屏幕的 visibleFrame。`None` 走
+        // 平台默认摆放（主屏工作区左上角 26 point 阶梯级联）。
+        //
+        // 非有限的 `position`（NaN/∞）按 `None` 处理：NSRect 里塞 NaN 会让 AppKit 行为未定义。
+        let screens = screen_areas(mtm);
+        let (content_x, content_y) = match options.position.filter(|position| position.is_finite())
+        {
+            Some(position) => placement::content_origin_for_position(position, size, &screens),
+            None => cascade_content_origin(mtm, &screens, size, cascade_index),
+        };
         let rect = NSRect::new(
-            NSPoint::new(80.0, 80.0),
-            NSSize::new(
-                f64::from(options.size.width.max(1.0)),
-                f64::from(options.size.height.max(1.0)),
-            ),
+            NSPoint::new(content_x, content_y),
+            NSSize::new(f64::from(size.width), f64::from(size.height)),
         );
         // SAFETY: `alloc` + 指定初始化器是 NSWindow 的合法构造路径；`rect` 是栈上值。
         let window = unsafe {
@@ -196,16 +349,35 @@ impl NativeWindow {
         );
         window.setBackgroundColor(Some(&background));
         window.setAcceptsMouseMovedEvents(true);
+        // B3：客户区 min/max（逻辑点）。`min > max` 的钳制在平台无关纯逻辑里做；
+        // `max = None` 时不调用 `setContentMaxSize:`（保持 AppKit 的默认无限上限）。
+        let (min_size, max_size) = placement::content_size_bounds(
+            options.min_size,
+            options.max_size,
+            Size::new(MIN_SIZE_LOGICAL.0, MIN_SIZE_LOGICAL.1),
+        );
         window.setContentMinSize(NSSize::new(
-            f64::from(MIN_SIZE_LOGICAL.0),
-            f64::from(MIN_SIZE_LOGICAL.1),
+            f64::from(min_size.width),
+            f64::from(min_size.height),
         ));
+        if let Some(max_size) = max_size {
+            window.setContentMaxSize(NSSize::new(
+                f64::from(max_size.width),
+                f64::from(max_size.height),
+            ));
+        }
+        // B5：禁用本窗口的自动 tabbing（类级开关在 `event_loop::run` 里先设好；这里按窗口
+        // 再声明一次 Disallowed —— Apple 文档要求 tabbing mode 在窗口显示前设置）。窗口因此
+        // 不并入系统 tab 组，Window 菜单不再出现 Merge All Windows，关闭语义保持窗口级。
+        window.setTabbingMode(NSWindowTabbingMode::Disallowed);
+
         // 显式声明该窗口是原生全屏的 primary 窗口；默认 collectionBehavior=0 时
         // AppKit 的 fullscreen 转场会停在过渡快照上（实测：窗口/view/layer 都已
         // 1680×1050，但屏幕仍显示旧的 960×740 快照）。
         window.setCollectionBehavior(NSWindowCollectionBehavior::FullScreenPrimary);
 
-        let view = GuiView::new(mtm);
+        let close = Rc::new(CloseBridge::new());
+        let view = GuiView::new(mtm, Arc::clone(dispatcher), Rc::clone(&close));
         window.setContentView(Some(&view));
         // 原生全屏转场由 AppKit 直接改 window frame；contentView 必须随宽度/高度伸缩，
         // 否则引擎看到的一直是 960×740，layer/drawable 也不会覆盖全屏窗口。
@@ -215,15 +387,29 @@ impl NativeWindow {
         );
         view.setWantsLayer(true);
         window.makeFirstResponder(Some(&view));
+        // B5：标准关闭按钮默认把 `performClose:` 发给窗口；重定向到 view 的覆盖实现，
+        // 使红点与 Cmd+W / 菜单 Close 走同一条「置位 + 唤醒泵」路径（不触发
+        // `windowShouldClose:` ⇒ 不响系统提示音）。按钮归引擎：应用自己 setAction 会被
+        // 这里的建窗顺序覆盖，见 `WindowOptions` / `GuiView::performClose:` 文档。
+        if let Some(button) = window.standardWindowButton(NSWindowButton::CloseButton) {
+            // SAFETY: target 是同一窗口的 contentView（生命周期覆盖窗口），且刚为它实现了
+            // `performClose:`；`target` 是 weak 属性，view 由窗口持有，不会悬空。
+            let target: &AnyObject = unsafe { &*(&*view as *const GuiView).cast::<AnyObject>() };
+            unsafe { button.setTarget(Some(target)) };
+            // SAFETY: `menu::selector(MenuCommand::Close)` 就是主菜单 Close 项用的
+            // `performClose:`（同一份映射，见 `platform::macos::menu::selector`），view 已实现。
+            unsafe { button.setAction(Some(menu::selector(MenuCommand::Close))) };
+        }
 
         // 原生交通灯全部保留：关闭 / 最小化 / 缩放。标题栏透明且标题隐藏，内容铺满窗口，
         // 因此窗口控件浮在内容上方（应用用顶部安全区避让）。
         let a11y = MacA11y::new(&view, dispatcher.clone(), id, a11y_consumer_epoch)?;
         view.install_a11y(a11y);
 
-        // 关闭拦截：AppKit 的关窗手势（红点 / Cmd-W / performClose:）走 delegate，
-        // windowShouldClose: 恒返回 false 并置位，由泵问过 App::request_close 后才真正 close。
-        let delegate = WindowDelegate::new(mtm, Arc::clone(dispatcher));
+        // 关闭拦截：关闭按钮 / Cmd-W / 菜单 Close 都先到 view 的 `performClose:`（只置位 +
+        // 唤醒）；`windowShouldClose:` 是 AppKit 的防御路径（同样置位 + 返回 false）；
+        // `windowWillClose:` 报告 AppKit 真的关闭了窗口。三者共享同一份关闭桥，泵裁决。
+        let delegate = WindowDelegate::new(mtm, Rc::clone(&close), Arc::clone(dispatcher));
         // SAFETY: ProtocolObject::from_ref 要求该对象实现了目标协议 —— 上面刚 impl 过。
         let protocol: &ProtocolObject<dyn NSWindowDelegate> = ProtocolObject::from_ref(&*delegate);
         window.setDelegate(Some(protocol));
@@ -233,6 +419,10 @@ impl NativeWindow {
             window,
             view,
             delegate,
+            close,
+            // X1：owner 关系由泵在建窗批次**全部创建之后**接线（`apply_owner`）：
+            // `App` 的窗口表是 HashMap，owner 可能排在 owned 之后。
+            owner: None,
             scale: options.scale,
             logical_size: options.size,
             seen_scale: 1.0,
@@ -240,15 +430,19 @@ impl NativeWindow {
             seen_size: (0.0, 0.0),
             was_key: false,
             visible: true,
-            close_requested: false,
             destroyed: false,
             ime_area: None,
+            // 与 `App::ime_enabled` 的默认值一致（默认启用）；首次 `sync_ime_enabled`
+            // 因此不会产生任何平台调用。
+            ime_enabled: true,
+            focus_lost: false,
+            seen_content: placement::Area::new(0.0, 0.0, 0.0, 0.0),
         };
         native.sync_initial(mtm)?;
         Ok(native)
     }
 
-    /// 初次同步：读 `backingScaleFactor` / 内容尺寸，写回字段（**不**产生事件）。
+    /// 初次同步：读 `backingScaleFactor` / 内容尺寸 / 初始内容区位置，写回字段（**不**产生事件）。
     fn sync_initial(&mut self, _mtm: MainThreadMarker) -> Result<(), EngineError> {
         let factor = self.window.backingScaleFactor();
         let scale = dpi::scale_from(factor)?;
@@ -257,7 +451,20 @@ impl NativeWindow {
         let size = self.view.frame().size;
         self.seen_size = (size.width, size.height);
         self.logical_size = Size::new(size.width as f32, size.height as f32);
+        // B3：把实际生效的位置记成 `Event::Moved` 的去重基准 —— 创建时的请求位置可能被
+        // AppKit 的 frame 约束微调过（或者被我们的 visibleFrame clamp 过），这里以真值
+        // 为准，避免启动后的第一轮同步补发一条「假移动」。
+        self.seen_content = self.content_rect_in_screen();
         Ok(())
+    }
+
+    /// view 的内容区在 AppKit 全局坐标下的矩形（point）。
+    ///
+    /// 用「view 的矩形」而不是 `window.frame()`：窗口是 `FullSizeContentView`，内容区铺满
+    /// 整个 frame；`NSWindow.convertRectToScreen:` 把内容坐标系里的矩形换算成屏幕坐标，
+    /// 与创建时喂给 `initWithContentRect:` 的矩形是同一个语义，读写才能互逆。
+    fn content_rect_in_screen(&self) -> placement::Area {
+        ns_area(self.window.convertRectToScreen(self.view.frame()))
     }
 
     /// 把渲染器的 `CAMetalLayer` 挂到 view 上（`wantsLayer` 已在 `create` 里打开）。
@@ -286,6 +493,47 @@ impl NativeWindow {
 
     pub(crate) fn id(&self) -> WindowId {
         self.id
+    }
+
+    /// 原生窗口句柄（X1）：泵把 owner 的 `NSWindow` 交给 owned 窗口挂接 child 关系用。
+    pub(crate) fn window_handle(&self) -> Retained<NSWindow> {
+        self.window.clone()
+    }
+
+    /// 建窗后的 X1 接线：设置窗口层级 + 挂接 owner（`addChildWindow:ordered:`）。
+    ///
+    /// 分两阶段调用（先创建全部原生窗口、再接线）的原因见 `event_loop::attach_owners`：
+    /// `App` 的窗口表是 `HashMap`，创建批次的顺序不可控而 owner 必须先有原生窗口。
+    ///
+    /// - **层级**：选择逻辑在 `platform::macos_owner`（模态压过置顶）。`Normal` 不调用
+    ///   `setLevel:` —— 保持 AppKit 默认层级（`NSNormalWindowLevel` == 0）。
+    /// - **owner**：`addChildWindow:ordered:` 是 transient parent 语义（child 恒在 parent
+    ///   之上、随 parent 进出 z 序，parent 关闭时被 orderOut）；引擎层的 owner 关闭级联与
+    ///   它不冲突（见模块文档）。
+    pub(crate) fn apply_owner(&mut self, owner: Option<Retained<NSWindow>>, level: WindowLevel) {
+        match level {
+            WindowLevel::Normal => {}
+            WindowLevel::Floating => self.window.setLevel(NSFloatingWindowLevel),
+            WindowLevel::ModalPanel => self.window.setLevel(NSModalPanelWindowLevel),
+        }
+        if let Some(owner) = owner {
+            // SAFETY: 两个 NSWindow 都是本进程主线程上创建、由 `NativeWindow` 持有的对象；
+            // `addChildWindow:ordered:` 是 AppKit 的窗口关系 API（ordered 只决定 z 序，不转移
+            // 所有权）。调用方已过滤自指（`platform::macos_owner::resolve_owner`）。
+            unsafe { owner.addChildWindow_ordered(&self.window, NSWindowOrderingMode::Above) };
+            self.owner = Some(owner);
+        }
+    }
+
+    /// 解除 owner 关系（幂等；引擎主动关闭与外部关闭两条收尾路径共用）。
+    ///
+    /// AppKit 不保证 `NSWindow.close` 会把本窗口从 parent 的 `childWindows` 里摘掉（文档只
+    /// 承诺 parent 关闭时 child 一并 orderOut），因此显式 `removeChildWindow:`。parent 即使
+    /// 已先被关闭，其 `NSWindow` 对象仍由这里的强引用保活，调用安全。
+    fn detach_owner(&mut self) {
+        if let Some(owner) = self.owner.take() {
+            owner.removeChildWindow(&self.window);
+        }
     }
 
     pub(crate) fn scale(&self) -> Scale {
@@ -378,25 +626,44 @@ impl NativeWindow {
             }
             events.push(Event::Resized { size: logical });
         }
+        // B3：位置变化（拖动标题栏 / 系统摆放 / 跨屏 / 程序化 `setFrame`）。
+        //
+        // `windowDidMove:` 只负责尽早唤醒泵（回调不碰 App）；这里的快照比较才是权威判据：
+        // 用 AppKit 坐标的内容区左上角做去重，拖动期间每轮泵最多产出一条 `Event::Moved`
+        // （不要求每像素，但 ≥ 每个 run loop 一轮）。容差 0.5 point 与尺寸同步一致。
+        let content = self.content_rect_in_screen();
+        let appkit_moved = self.delegate.take_moved();
+        if appkit_moved
+            || (content.x() - self.seen_content.x()).abs() > 0.5
+            || (content.max_y() - self.seen_content.max_y()).abs() > 0.5
+        {
+            self.seen_content = content;
+            let screens = screen_areas(self.mtm);
+            let position = placement::position_from_content_rect(content, &screens);
+            events.push(Event::Moved { position });
+        }
         let key = self.window.isKeyWindow();
         if key != self.was_key {
             self.was_key = key;
             self.view.focus_changed(key);
             events.push(Event::FocusChanged { focused: key });
-        }
-        // 关闭判定只看「窗口真的不在了」：最小化（`isMiniaturized`）与 `NSApp.hide()`
-        // 都会让 `isVisible` 变 false，但窗口并没有被关闭。
-        let minimized = self.window.isMiniaturized();
-        let app_hidden = NSApplication::sharedApplication(self.mtm).isHidden();
-        let closed = !self.window.isVisible() && !minimized && !app_hidden;
-        if !closed {
-            self.close_requested = false;
-        } else if !self.destroyed && !self.close_requested {
-            self.close_requested = true;
-            events.push(Event::CloseRequested);
+            if !key {
+                // B9(mac)：失焦边沿留给泵做 IME 清场 —— 这里只置位（`sync_state` 可能
+                // 在嵌套/无关回调里被调用，清场要碰 `&mut App` 的公共入口，放到同一轮泵
+                // 的状态同步之后执行，见 [`Self::handle_focus_lost`]）。
+                self.focus_lost = true;
+            }
         }
         // R09-9：可见性从同一个快照里派生（不可见 = 最小化 / 应用隐藏 / 被完全遮挡），
         // 边沿处强制一次全量重绘（drawable 与 persist 的内容在暂停期间都不可信）。
+        //
+        // B5：这里**不再**反推「窗口已关闭」。旧实现用 `!isVisible && !minimized &&
+        // !appHidden` 当作关闭事件，但最小化 / 应用隐藏 / 系统 tab 合并都会让 `isVisible`
+        // 为 false，于是「窗口被遮挡/切到别的 Space」也可能被误判成关闭并投递
+        // `Event::CloseRequested`。关闭的唯一权威来源是 delegate 的 `windowWillClose:`
+        // （见 `platform::macos_close` 与泵的关闭段）。
+        let minimized = self.window.isMiniaturized();
+        let app_hidden = NSApplication::sharedApplication(self.mtm).isHidden();
         let occluded = !self
             .window
             .occlusionState()
@@ -466,12 +733,74 @@ impl NativeWindow {
         self.view.set_ime_cursor_area(area);
     }
 
+    /// 同步 IME 启用状态到 `GuiView.inputContext`（每轮泵调用；目标状态来自
+    /// `App::ime_enabled`，B6）。
+    ///
+    /// 与 Windows 的 `NativeWindow::sync_ime_enabled` 同构：每轮对账「目标状态 vs 已应用
+    /// 状态」，只在变化时执行平台动作。禁用 ⇒ AppKit 丢弃转换会话 + 清引擎组合态（有组合
+    /// 时补 `ImeEvent::End`，经 `App::dispatch` 立刻交付）+ 清 App 侧 caret hint；启用 ⇒
+    /// 下一次按键自然取回 super 的上下文，并清 `ime_area` 缓存让 hint 重发（恢复的上下文
+    /// 不保证还留着旧的候选窗/组合窗表单）。
+    ///
+    /// 清 caret hint 走 `App::clear_ime_cursor_area`（公共入口，会 `dispatcher.wake()`）。
+    /// 启停是**边沿事件**（不是每帧动作），因此这里多出的一轮空泵可忽略；不在
+    /// `sync_state` 里做是为了不破坏「`sync_state` 不唤醒泵」的纪律（R09-15②）。
+    pub(crate) fn sync_ime_enabled(&mut self, app: &mut App) {
+        let enabled = app.ime_enabled(self.id);
+        if enabled == self.ime_enabled {
+            return;
+        }
+        self.ime_enabled = enabled;
+        if !enabled {
+            app.clear_ime_cursor_area(self.id);
+        }
+        self.ime_area = None;
+        if self.view.apply_ime_enabled(enabled) {
+            app.dispatch(self.id, Event::Ime(ImeEvent::End));
+        }
+    }
+
+    /// 取走「窗口刚失去键盘焦点」边沿（`sync_state` 置位；泵唯一读点）。
+    pub(crate) fn take_focus_lost(&mut self) -> bool {
+        std::mem::take(&mut self.focus_lost)
+    }
+
+    /// 窗口失焦的 IME 清场（B9 mac 部分；泵每轮在 `sync_state` 之后调用）。
+    ///
+    /// 用户裁决的统一清场路径：**清 caret hint → 重置组合状态 → 补 `End`**。AppKit 在窗口
+    /// resign key 时通常自己会取消转换会话（走 `unmarkText:`，那条回调已经交付过 `End`），
+    /// 这里兜底「没有取消」的输入法；两种情况都做到 `End` 恰好一条。
+    ///
+    /// 不引入嵌套 runloop：全部在泵里同步完成（view 回调纪律不变 —— 回调只置位/唤醒）。
+    pub(crate) fn handle_focus_lost(&mut self, app: &mut App) {
+        app.clear_ime_cursor_area(self.id);
+        self.ime_area = None;
+        if self.view.reset_ime_composition() {
+            app.dispatch(self.id, Event::Ime(ImeEvent::End));
+        }
+    }
+
     /// 引擎请求的光标形状（R09-11；`WindowId` 的定向投递在泵里完成）。
     pub(crate) fn set_cursor(&self, cursor: Cursor) {
         self.view.set_cursor(cursor);
     }
 
-    /// 关闭窗口（幂等）。
+    /// 同步自绘标题栏拖动区到 `GuiView`（X2；泵每轮对账，值变化才写 view）。
+    ///
+    /// 区域是逻辑窗口坐标（客户区左上原点、y 向下），与指针事件同一坐标系；`mouseDown:`
+    /// 命中区域时把拖动交给 WindowServer（`performWindowDragWithEvent:`），不进入引擎指针
+    /// 分发。应用在布局/尺寸变化后重新 `App::set_drag_regions`，泵下一轮对账（Chrome
+    /// `SetDraggableRegions` 同模型）。
+    pub(crate) fn sync_drag_regions(&self, regions: &[Rect]) {
+        self.view.set_drag_regions(regions);
+    }
+
+    /// 关闭窗口（幂等；引擎主动关闭路径）。
+    ///
+    /// 先断 delegate 再 `NSWindow.close`：`close` 不会询问 `windowShouldClose:`，断掉 delegate
+    /// 还避免 AppKit 在关闭过程中回调进泵状态（我们仍持 delegate 强引用）。断 delegate 的
+    /// 直接后果是**不会**收到本次关闭的 `windowWillClose:` —— 这是刻意的：那次通知属于
+    /// 「外部关闭」路径（见 [`Self::mark_externally_closed`]），引擎主动关闭不需要再自证一次。
     pub(crate) fn close(&mut self) {
         if self.destroyed {
             return;
@@ -482,21 +811,38 @@ impl NativeWindow {
         // `view.window().unwrap()` 会 panic（穿过 ObjC 帧 = abort），且 `accessibilityChildren`
         // 会 `borrow_mut` 正在 `drop_in_place` 的 ivars（UB）。
         self.view.uninstall_a11y();
+        // X1：先解除 owner 关系（parent 可能仍存活），再关窗。
+        self.detach_owner();
         // delegate 是 weak：先断掉，避免关闭期间的 AppKit 回调打进来（我们仍持强引用）。
         self.window.setDelegate(None);
         self.window.close();
         self.destroyed = true;
     }
 
-    /// 取走「关闭已请求」标志（泵唯一读点）。
-    pub(crate) fn take_close_request(&mut self) -> Option<CloseRequestSource> {
-        // 两个来源：AppKit 的关窗手势（delegate 置位）与「窗口已不可见」的事后观察
-        // （销毁 / 应用退出等非手势路径）。调用方据此决定要不要补发 `CloseRequested`
-        // —— 观察路径已经在 `sync_state` 里发过了，再发就是双投递（复审 F3）。
-        if self.delegate.take_request() {
-            return Some(CloseRequestSource::Gesture);
+    /// 泵每轮的关闭决议（B5；唯一读点，纯状态机在 `platform::macos_close`）。
+    ///
+    /// `verdict` 只在用户手势路径被调用一次，且**先**由调用方 dispatch
+    /// `Event::CloseRequested`、再返回 `App::request_close` 的结果（事件先于处理器，与
+    /// Windows 同序）。外部关闭路径（`windowWillClose:`）不调用它。
+    pub(crate) fn decide_close(&self, verdict: impl FnOnce() -> bool) -> CloseAction {
+        self.close.decide(verdict)
+    }
+
+    /// 外部关闭（`windowWillClose:`）后的收尾：窗口已由 AppKit 关闭，引擎只做记账。
+    ///
+    /// 与 [`Self::close`] 的区别：后者是引擎主动关窗（自己 `NSWindow.close()`）；这里窗口
+    /// **已经关了**，不能再关第二次，只需卸 a11y、断 delegate、标记已销毁，让泵把原生窗口
+    /// 从列表移除。外部关闭**不可否决**（AppKit 已经执行完毕），因此这里不碰 `App` 的关闭
+    /// 处理器 —— 泵只调 `App::close_window` 做引擎侧记账（见 `event_loop::pump`）。
+    pub(crate) fn mark_externally_closed(&mut self) {
+        if self.destroyed {
+            return;
         }
-        std::mem::take(&mut self.close_requested).then_some(CloseRequestSource::Observed)
+        self.view.uninstall_a11y();
+        // X1：外部关闭同样要摘掉 owner 关系，避免 parent 的 `childWindows` 留着已关闭对象。
+        self.detach_owner();
+        self.window.setDelegate(None);
+        self.destroyed = true;
     }
 
     /// 窗口是否已被 `close()` 销毁（泵据此从列表移除）。

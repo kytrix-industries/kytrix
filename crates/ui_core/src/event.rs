@@ -1151,6 +1151,10 @@ impl InputEvent {
 /// `key` 事件），AppKit 的 `characters` 同样不受 `isARepeat` 过滤。
 /// 保留这个形参是契约的一部分：一旦有人重新拿 `repeat` 过滤文本，
 /// `should_emit_text_ignores_auto_repeat` 就会失败。
+///
+/// **与 `InputEvent::Key` 的判据不同**：文本只被「IME 接管 / 组合中」抑制，物理按键还多一条
+/// 「命令修饰键豁免」（Ctrl/Alt/Meta 组合即使组合中也必须到达绑定）。那条判据见
+/// `platform::ime::key_visible`（B4），两份契约不要混用。
 #[must_use]
 pub fn should_emit_text(
     state: KeyState,
@@ -1310,6 +1314,23 @@ pub enum Event {
     Resized {
         /// 新的逻辑尺寸。
         size: Size,
+    },
+    /// 窗口位置变化（逻辑像素；坐标语义与 [`crate::window::WindowOptions::position`] 相同：
+    /// 虚拟桌面内容区左上角为原点、x 向右、y 向下）。
+    ///
+    /// 来源与语义（三端）：
+    /// - **Windows**：`WM_MOVE`，平台层按窗口所在显示器的 scale 把物理坐标换算成逻辑坐标。
+    ///   用户拖动标题栏、系统 snap、`SetWindowPos` 都会产生；`WM_DPICHANGED` 引起的非用户
+    ///   移动由平台层过滤（那条路径只产生 `DpiChanged`）；
+    /// - **macOS**：`windowDidMove:`（AppKit 左下原点已换算成同一语义）；
+    /// - **Linux/Wayland**：**永不产生** —— `xdg_toplevel` 没有定位协议，compositor 可随意
+    ///   摆放窗口。应用不应把「收到 `Moved`」当作跨端必然成立的假设。
+    ///
+    /// 事件携带**当前完整位置**（绝对值，不是增量）：拖动期间高频到达，应用只需记录最后值
+    /// （placement 持久化由应用负责，引擎不落盘）。
+    Moved {
+        /// 客户区左上角的新位置（逻辑像素）。
+        position: Point,
     },
     /// 节点级悬停迁移（**引擎派生**，R02-4；对应 W3C `pointerover`/`pointerout` 的节点级语义
     /// 与 CSS `:hover` 的传播方式）。

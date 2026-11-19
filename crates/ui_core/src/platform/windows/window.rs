@@ -1,7 +1,8 @@
 //! 原生窗口：创建（初始隐藏）/ 显示 / 客户区尺寸 / 最小尺寸 / 销毁
 //!
-//! P09 使用**系统标题栏**（`WS_OVERLAPPEDWINDOW`，`WM_NCCALCSIZE` 交 `DefWindowProcW`）；
-//! 自绘标题栏留 P12。
+//! 使用**系统标题栏**（`WS_OVERLAPPEDWINDOW`，`WM_NCCALCSIZE` 交 `DefWindowProcW`）；应用
+//! 自绘标题栏时可以声明**拖动区**（X2 `Window::set_drag_regions`）：`WM_NCHITTEST` 命中区域
+//! 返回 `HTCAPTION`，走系统 move 模态循环（拖动区之外的非客户区仍全部交系统）。
 //!
 //! 客户区**没有**系统的重定向表面（`WS_EX_NOREDIRECTIONBITMAP`）：窗口的全部像素由
 //! [`Composition`] 合成的组合交换链提供。内容 visual 恒 1:1（resize 不缩放旧内容）；窗口放大
@@ -20,20 +21,21 @@ use windows::Win32::{
         MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromWindow,
     },
     System::LibraryLoader::GetModuleHandleW,
-    UI::WindowsAndMessaging::*,
+    UI::{Input::KeyboardAndMouse::EnableWindow, WindowsAndMessaging::*},
 };
 
 use crate::{
     app::App,
     error::EngineError,
-    math::{Rect, Scale, Size},
+    event::{Event, ImeEvent},
+    math::{PhysicalRect, Rect, Scale, Size},
     platform::{
         dispatcher::Dispatcher,
         windows::{
             composition::{self, Composition},
-            dpi,
+            dark_mode, dpi,
             event_loop::{ResizeFrameDriver, WndProcState, wndproc},
-            ime,
+            ime, placement,
         },
     },
     window::{WindowId, WindowOptions},
@@ -41,6 +43,13 @@ use crate::{
 
 /// 窗口类名（每进程注册一次）。
 const CLASS_NAME: &str = "KytrixGuiWindow";
+
+/// `WindowOptions::position = None` 时的默认窗口外框左上角（物理像素）。
+///
+/// 保持 P09 以来的确定性默认落点 `(100, 100)`（`WindowOptions` 文档把 `None` 定义为「由平台
+/// 决定」）：不改成 `CW_USEDEFAULT` 的系统级联位置 —— 固定值可预测、便于真机测试；多窗口的
+/// 错落摆放由应用用 `position` 自己控制。
+const DEFAULT_WINDOW_ORIGIN: (i32, i32) = (100, 100);
 
 /// 类光标（`IDC_ARROW`）：probe 实测「类光标 = null + `HTCLIENT`」会得到**空光标**（不可见）。
 fn load_arrow_cursor() -> HCURSOR {
@@ -77,16 +86,39 @@ pub(crate) struct NativeWindow {
     logical_size: Size,
     /// 最近一次下发的 IME caret 区域（逻辑矩形 + 当时 Scale）。
     ime_area: Option<(Rect, Scale)>,
+    /// 模态窗口打开期间被 `EnableWindow(owner, FALSE)` 禁用的 owner 窗口（X1）。
+    ///
+    /// 只有「`options.modal == true` 且 owner 存在」时才置位；销毁本窗口前必须恢复
+    /// `EnableWindow(owner, TRUE)`，否则 owner 永久不可交互（系统级灰显 + 无输入）。
+    /// owner 已被销毁时 `EnableWindow` 对失效句柄返回 FALSE（不 UB），无需特殊处理。
+    modal_owner: Option<HWND>,
+}
+
+/// 测试构建的窗口 a11y 消费端代际。
+///
+/// 平台单测只验证 `WndProc` / 建窗记账，不关心 AT 激活；生产路径的代际必须来自
+/// `App::window_a11y_epoch`（唯一真值来源，E1）。放在这里让各测试模块共用，避免每处
+/// 自造 `A11yBridge` 时散落同一段构造。
+#[cfg(test)]
+pub(crate) fn test_a11y_epoch() -> crate::a11y::adapter::A11yConsumerEpoch {
+    crate::a11y::adapter::A11yBridge::new().consumer_epoch()
 }
 
 impl NativeWindow {
     /// 创建**隐藏**窗口并把客户区调到 `options.size`（逻辑像素 × 平台 DPI）。
+    ///
+    /// `owner` 是已解析的 owner 窗口句柄（X1）：`Some` ⇒ `CreateWindowExW` 的 `hWndParent`
+    /// 走 owner 语义（不设 `WS_CHILD`，owned 窗口仍是顶层窗口）；`options.always_on_top` ⇒
+    /// `WS_EX_TOPMOST`；`options.modal` ⇒ 建窗后禁用 owner（`EnableWindow(FALSE)`），
+    /// [`Self::destroy`] 恢复。owner 的 `WindowId → HWND` 解析在平台事件循环侧完成
+    /// （`native_window::resolve_owner`，找不到时诊断降级为 None）。
     ///
     /// 失败一律 `EngineError::WindowCreate`（`CreateWindowExW` / `RegisterClassW` 的 HRESULT 与
     /// `GetLastError` 都写进 `detail`）。
     pub(crate) fn create(
         id: WindowId,
         options: &WindowOptions,
+        owner: Option<HWND>,
         dispatcher: Arc<Dispatcher>,
         app: Option<&Rc<RefCell<App>>>,
         a11y_consumer_epoch: crate::a11y::adapter::A11yConsumerEpoch,
@@ -98,33 +130,45 @@ impl NativeWindow {
 
         let class = wide(CLASS_NAME);
         let title = wide(&options.title);
-        // 先用**请求的 scale** 估算一次窗口尺寸（真实 DPI 要窗口存在后才能问）。
-        let provisional = dpi::window_size_for_client(
-            physical_client(options.size, options.scale),
-            dpi::system_dpi(),
-        );
+        // 建窗的**临时**几何：客户区尺寸按请求的 scale 估算（真实 DPI 要窗口存在后才能问），
+        // 位置按 `position` 换算到目标附近并 clamp 到最近显示器工作区 —— 窗口创建后
+        // [`Self::apply_dpi_and_size`] 用**所在显示器 DPI** 重算最终尺寸与落点。
+        let (window_x, window_y, provisional_width, provisional_height) =
+            provisional_window_rect(options, dpi::system_dpi());
         // SAFETY: `class` / `title` 是本函数栈上的 NUL 结尾 UTF-16 缓冲，`CreateWindowExW`
-        // 同步拷贝；父窗口/菜单为空，实例句柄来自本进程。窗口此时**隐藏**（无 `WS_VISIBLE`）。
+        // 同步拷贝；实例句柄来自本进程。窗口此时**隐藏**（无 `WS_VISIBLE`）。
         //
         // `WS_EX_NOREDIRECTIONBITMAP`：客户区不做系统重定向表面，全部像素来自 DirectComposition
         // （没有它，DComp 内容会和 GDI 重定向表面叠在一起，resize 时还会多一层 DWM 拉伸）。
+        // X1：`WS_EX_TOPMOST` 在创建时声明（置顶窗口），`hWndParent = owner` 走 owner 语义
+        // （`WS_OVERLAPPEDWINDOW` 顶层窗口 + owner：owned 恒在 owner 之上、随其最小化/销毁）。
+        let ex_style = if options.always_on_top {
+            WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST
+        } else {
+            WS_EX_NOREDIRECTIONBITMAP
+        };
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_NOREDIRECTIONBITMAP,
+                ex_style,
                 windows::core::PCWSTR(class.as_ptr()),
                 windows::core::PCWSTR(title.as_ptr()),
                 WS_OVERLAPPEDWINDOW,
-                100,
-                100,
-                provisional.0,
-                provisional.1,
-                None,
+                window_x,
+                window_y,
+                provisional_width,
+                provisional_height,
+                owner,
                 None,
                 Some(instance.into()),
                 None,
             )
         }
         .map_err(|error| window_error("CreateWindowExW", error))?;
+
+        // B2：标题栏明暗跟随系统主题 —— 必须在**首次显示之前**设置，否则深色主题下第一帧
+        // 会闪一条亮色标题栏。DWM 属性在隐藏窗口上设置是标准做法；失败时窗口仍可用
+        //（`set_titlebar` 内部只记诊断，标题栏退回系统默认亮色）。
+        dark_mode::set_titlebar(hwnd, dark_mode::current().unwrap_or(false));
 
         // 合成目标在窗口显示之前建立：`WS_EX_NOREDIRECTIONBITMAP` 的客户区只有 DComp 内容。
         let composition = match Composition::new(hwnd) {
@@ -145,18 +189,34 @@ impl NativeWindow {
                 Arc::clone(&composition),
             ))
         });
-        let state = match WndProcState::new(dispatcher, hwnd, id, driver, a11y_consumer_epoch) {
-            Ok(state) => Box::into_raw(Box::new(state)),
-            Err(error) => {
-                // a11y adapter 构造失败（`A11yInit`）：窗口还没显示，直接销毁，避免泄漏 HWND。
-                // SAFETY: 窗口刚由本函数创建，尚未交给任何其它所有者（`composition` 随本函数
-                // 返回一起释放；DComp 目标引用 HWND，必须先销毁窗口）。
-                unsafe {
-                    let _ = DestroyWindow(hwnd);
+        let limits = placement::ClientLimits::from_options(options);
+        let state =
+            match WndProcState::new(dispatcher, hwnd, id, limits, driver, a11y_consumer_epoch) {
+                Ok(state) => Box::into_raw(Box::new(state)),
+                Err(error) => {
+                    // a11y adapter 构造失败（`A11yInit`）：窗口还没显示，直接销毁，避免泄漏 HWND。
+                    // SAFETY: 窗口刚由本函数创建，尚未交给任何其它所有者（`composition` 随本函数
+                    // 返回一起释放；DComp 目标引用 HWND，必须先销毁窗口）。
+                    unsafe {
+                        let _ = DestroyWindow(hwnd);
+                    }
+                    return Err(error);
                 }
-                return Err(error);
+            };
+        // X1：模态窗口 —— 建窗后（显示前）禁用 owner，系统级拦截 owner 及其非客户区输入
+        // （用户无法与 owner 交互，视觉上灰显），关闭/销毁本窗口时由 `destroy` 恢复。
+        // 失败（owner 已失效等）只降级为「没有原生模态」：引擎层仍有按 owner 关系过滤输入的
+        // 兜底；不 panic、不阻止新窗口创建。放在所有可失败步骤**之后**，避免失败路径把
+        // owner 留在禁用状态。
+        let modal_owner = if options.modal { owner } else { None };
+        if let Some(owner_hwnd) = modal_owner {
+            // SAFETY: owner 由调用方保证仍是本进程存活窗口（解析来源是活着的 NativeWindow）；
+            // 即使已失效，`EnableWindow` 也只返回 FALSE，不解引用。
+            unsafe {
+                let _ = EnableWindow(owner_hwnd, false);
             }
-        };
+        }
+
         // SAFETY: `hwnd` 刚创建且本函数独占；`state` 的所有权转移给 `NativeWindow`（Drop 回收）。
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize) };
 
@@ -169,8 +229,9 @@ impl NativeWindow {
             scale: Scale::ONE,
             logical_size: options.size,
             ime_area: None,
+            modal_owner,
         };
-        window.apply_dpi_and_size(options.size)?;
+        window.apply_dpi_and_size(options)?;
         Ok(window)
     }
 
@@ -184,6 +245,11 @@ impl NativeWindow {
     /// 句柄的 `isize` 形式（引擎内部唯一允许的「无类型」传递）。
     pub(crate) fn hwnd_raw(&self) -> isize {
         self.hwnd.0 as isize
+    }
+
+    /// 原生窗口句柄（X1 owner 解析在平台事件循环侧用它建立 `WindowId → HWND` 映射）。
+    pub(crate) fn hwnd(&self) -> HWND {
+        self.hwnd
     }
 
     /// 创建者传入的窗口 id。
@@ -287,40 +353,102 @@ impl NativeWindow {
         }
     }
 
-    /// 应用 DPI / 尺寸：先问 DPI，再按 `AdjustWindowRectExForDpi` 调窗口，最后回读客户区。
-    fn apply_dpi_and_size(&mut self, size: Size) -> Result<(), EngineError> {
-        let dpi = dpi::window_dpi(self.hwnd);
-        let scale = dpi::scale_from_dpi(dpi).ok_or(EngineError::InvalidDpiScale {
-            factor: dpi as f32 / dpi::BASE_DPI as f32,
-        })?;
-        self.scale = scale;
-        // `WM_GETMINMAXINFO` 的 `ptMinTrackSize` 与 `WM_DPICHANGED` 用**同一个**换算
-        // （[`dpi::min_track_size`]）：`WndProcState` 是唯一持有者，两处分别算会在 DPI 变化后
-        // 漂移（P2-1：直接透传客户区尺寸会小一个边框 + 标题栏）。
-        // SAFETY: `state` 由本窗口独占（`Drop` 之前一直有效）；WndProc 只在消息处理期读它。
-        unsafe {
-            (*self.state).note_dpi(dpi, scale);
-        }
+    /// 应用 DPI / 尺寸 / 初始位置：先问窗口**所在显示器**的 DPI，再按
+    /// `AdjustWindowRectExForDpi` 调窗口（clamp 后落位），最后回读客户区。
+    ///
+    /// 落点语义（公共契约：[`WindowOptions::position`]）= **客户区左上角**的逻辑坐标；
+    /// 换算顺序是「逻辑点 → 物理原点（round）→ 窗口原点（加非客户区）→ clamp 到工作区」。
+    ///
+    /// 最多重算两次：建窗的临时落点用主屏 DPI 估算，`SetWindowPos` 跨屏（per-monitor v2）时
+    /// 系统可能立即发 `WM_DPICHANGED` 并按建议矩形重排 —— 第二次按**新显示器**的 DPI 重算
+    /// 尺寸与落点，收敛到公共契约的「按窗口最终落点显示器的 scale 解释」。
+    fn apply_dpi_and_size(&mut self, options: &WindowOptions) -> Result<(), EngineError> {
+        let requested = options.size;
         // 0×0 的请求尺寸没有可用的窗口矩形（`physical_client` 只会钳成 1 px）：只记账 DPI，
         // 等平台 resize / `WM_DPICHANGED` 给出真实尺寸。
-        if size.width <= 0.0 || size.height <= 0.0 {
-            self.logical_size = size;
+        if requested.width <= 0.0 || requested.height <= 0.0 {
+            let dpi = dpi::window_dpi(self.hwnd);
+            let scale = dpi::scale_from_dpi(dpi).ok_or(EngineError::InvalidDpiScale {
+                factor: dpi as f32 / dpi::BASE_DPI as f32,
+            })?;
+            self.scale = scale;
+            // SAFETY: `state` 由本窗口独占（`Drop` 之前一直有效）；WndProc 只在消息处理期读它。
+            unsafe {
+                (*self.state).note_dpi(dpi, scale);
+            }
+            self.logical_size = requested;
             return Ok(());
         }
-        let window_size = dpi::window_size_for_client(physical_client(size, scale), dpi);
-        // SAFETY: 窗口存活；只改尺寸与位置，不重新创建。
-        unsafe {
-            SetWindowPos(
-                self.hwnd,
-                None,
-                100,
-                100,
-                window_size.0,
-                window_size.1,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            )
+        // 应用配置的最小/最大客户区约束在建窗时生效（`WM_GETMINMAXINFO` 的同一个来源，
+        // B3）：请求尺寸先钳进 `[min, max]`，避免初始窗口违反自己的约束。
+        let size = self.state_mut().client_limits().clamp(requested);
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let dpi = dpi::window_dpi(self.hwnd);
+            let scale = dpi::scale_from_dpi(dpi).ok_or(EngineError::InvalidDpiScale {
+                factor: dpi as f32 / dpi::BASE_DPI as f32,
+            })?;
+            self.scale = scale;
+            // `WM_GETMINMAXINFO` 的 `ptMinTrackSize` / `ptMaxTrackSize` 与 `WM_DPICHANGED`
+            // 用**同一个**换算（[`placement::ClientLimits::track_sizes`]）：`WndProcState` 是
+            // 唯一持有者，两处分别算会在 DPI 变化后漂移（P2-1：直接透传客户区尺寸会小一个
+            // 边框 + 标题栏）。
+            // SAFETY: `state` 由本窗口独占；WndProc 只在消息处理期读它。
+            unsafe {
+                (*self.state).note_dpi(dpi, scale);
+            }
+            let client = physical_client(size, scale);
+            let (width, height) = dpi::window_size_for_client(client, dpi);
+            match options.position {
+                Some(position) => {
+                    let client_origin = dpi::physical_origin(position, scale);
+                    let (x, y) = dpi::window_origin_for_client(client_origin, client, dpi);
+                    // 公共契约：位置 clamp 到最近显示器工作区（至少标题栏可见）。
+                    let target =
+                        PhysicalRect::new(x, y, x.saturating_add(width), y.saturating_add(height));
+                    let placed = placement::clamp_to_work_area(target, &placement::work_areas());
+                    // SAFETY: 窗口存活；只改尺寸与位置，不重新创建、不激活窗口、不改 Z 序。
+                    // 可能同步重入 `WndProc`（`WM_WINDOWPOSCHANGED` / `WM_SIZE` /
+                    // `WM_DPICHANGED`）：此处不持有 `&mut WndProcState`（`note_dpi` 的借用已结束）。
+                    unsafe {
+                        SetWindowPos(
+                            self.hwnd,
+                            None,
+                            placed.x0,
+                            placed.y0,
+                            placed.width(),
+                            placed.height(),
+                            SWP_NOZORDER | SWP_NOACTIVATE,
+                        )
+                    }
+                    .map_err(|error| window_error("SetWindowPos", error))?;
+                }
+                None => {
+                    // 保持建窗时的位置（[`DEFAULT_WINDOW_ORIGIN`] 或临时落点），只改尺寸。
+                    //
+                    // SAFETY: 同上。
+                    unsafe {
+                        SetWindowPos(
+                            self.hwnd,
+                            None,
+                            0,
+                            0,
+                            width,
+                            height,
+                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE,
+                        )
+                    }
+                    .map_err(|error| window_error("SetWindowPos", error))?;
+                }
+            }
+            // 跨屏落位触发了 `WM_DPICHANGED`（系统会先按建议矩形重排）：按新显示器 DPI
+            // 再算一次。第二次之后不再重试（DPI 只可能随落点变化一次；防御性上限）。
+            if attempt >= 2 || dpi::window_dpi(self.hwnd) == dpi {
+                break;
+            }
         }
-        .map_err(|error| window_error("SetWindowPos", error))?;
+        let scale = self.scale;
         // 回读：客户区由系统按真实边框算出，逻辑尺寸以它为准（round 之后可能与请求差 1 px）。
         let client = self.client_size();
         self.note_client_resize(scale, client);
@@ -394,13 +522,20 @@ impl NativeWindow {
     /// 系统新建的默认上下文，之前写的组合/候选窗表单不保证还在，下一轮
     /// [`Self::sync_ime_cursor_area`] 必须重发。
     ///
+    /// **禁用时的清场语义**（B6/D6 三端统一）：先清应用侧 caret hint；若禁用瞬间平台仍在
+    /// 组合中，再补**恰好一条** [`ImeEvent::End`]（与失焦路径一致，应用不会停在 preedit）。
+    /// 组合态由 `ImeState` 记账，系统之后迟到的 `WM_IME_ENDCOMPOSITION` 会被禁用分支吞掉，
+    /// 不会重复投递。
+    ///
     /// 两阶段执行的原因同 [`Self::sync_ime_cursor_area`]：`ImmAssociateContext*` 会同步派发
     /// `WM_IME_SETCONTEXT`。
-    pub(crate) fn sync_ime_enabled(&mut self, app: &App) {
+    pub(crate) fn sync_ime_enabled(&mut self, app: &mut App) {
         let enabled = app.ime_enabled(self.id);
         if self.state_mut().ime_enabled() == enabled {
             return;
         }
+        // 禁用前的组合快照：`plan_ime_enabled(false)` 会清平台组合态，End 要在那之前判定。
+        let was_composing = !enabled && self.state_mut().ime_composing();
         let hwnd = self.hwnd;
         let command = self.state_mut().plan_ime_enabled(enabled);
         if let Some(command) = command {
@@ -408,6 +543,26 @@ impl NativeWindow {
             self.state_mut().note_ime_applied(applied);
         }
         self.ime_area = None;
+        if !enabled {
+            app.clear_ime_cursor_area(self.id);
+            if was_composing {
+                app.dispatch(self.id, Event::Ime(ImeEvent::End));
+            }
+        }
+    }
+
+    /// 把 `App` 里最新的自绘标题栏拖动区对账到 `WndProcState`（X2；泵每轮调用）。
+    ///
+    /// **设计**：`WndProc` 不调用应用层（平台层纪律，也避免消息处理期间借用 `App`），区域由
+    /// 泵每轮从 `App::window(id).drag_regions()` 拷进 per-window 状态；`Window::set_drag_regions`
+    /// 同值 no-op，这里再比一次避免每轮分配（同值时不碰 `Vec`）。
+    /// 区域是 `Window::set_drag_regions` 的**逻辑客户区坐标**，`WM_NCHITTEST` 在命中时返回
+    /// `HTCAPTION`（走系统 move 模态循环）。
+    pub(crate) fn sync_drag_regions(&mut self, app: &App) {
+        let Some(window) = app.window(self.id) else {
+            return;
+        };
+        self.state_mut().set_drag_regions(window.drag_regions());
     }
 
     /// 窗口是否已被销毁（`close_requested_windows` 的 retain 判据）。
@@ -486,6 +641,15 @@ impl NativeWindow {
 
     /// 销毁窗口（幂等；`Drop` 也会调）。
     pub(crate) fn destroy(&mut self) {
+        // X1：模态窗口销毁前先恢复 owner 的输入。顺序不能反：owned 窗口先没会让 owner 永久
+        // 禁用（灰显 + 收不到任何输入）。owner 已被销毁（系统随 owner 销毁 owned 窗口）时
+        // `EnableWindow` 对失效句柄只返回 FALSE，不 UB。
+        if let Some(owner) = self.modal_owner.take() {
+            // SAFETY: owner 句柄来自本进程活着的 `NativeWindow`（解析时保证）；失效时调用只返回 FALSE。
+            unsafe {
+                let _ = EnableWindow(owner, true);
+            }
+        }
         if self.hwnd.is_invalid() {
             return;
         }
@@ -522,6 +686,42 @@ impl Drop for NativeWindow {
             self.state = std::ptr::null_mut();
         }
     }
+}
+
+/// 建窗前的**临时**窗口外框 `(x, y, width, height)`（物理像素）。
+///
+/// 窗口还不存在、问不到 `GetDpiForWindow`：用主屏 DPI 粗定位 —— `position` 是逻辑客户区
+/// 左上角，换算到物理后 clamp 到最近显示器工作区，让隐藏窗口**先建在目标附近**；
+/// [`NativeWindow::apply_dpi_and_size`] 随后按窗口所在显示器 DPI 重算最终尺寸与落点。
+/// `position = None` ⇒ 确定性的 [`DEFAULT_WINDOW_ORIGIN`]。
+fn provisional_window_rect(options: &WindowOptions, dpi: u32) -> (i32, i32, i32, i32) {
+    let client = physical_client(options.size, options.scale);
+    let (width, height) = dpi::window_size_for_client(client, dpi);
+    let Some(position) = options.position else {
+        return (
+            DEFAULT_WINDOW_ORIGIN.0,
+            DEFAULT_WINDOW_ORIGIN.1,
+            width,
+            height,
+        );
+    };
+    let Some(scale) = dpi::scale_from_dpi(dpi) else {
+        return (
+            DEFAULT_WINDOW_ORIGIN.0,
+            DEFAULT_WINDOW_ORIGIN.1,
+            width,
+            height,
+        );
+    };
+    let origin = dpi::window_origin_for_client(dpi::physical_origin(position, scale), client, dpi);
+    let target = PhysicalRect::new(
+        origin.0,
+        origin.1,
+        origin.0.saturating_add(width),
+        origin.1.saturating_add(height),
+    );
+    let placed = placement::clamp_to_work_area(target, &placement::work_areas());
+    (placed.x0, placed.y0, placed.width(), placed.height())
 }
 
 /// 逻辑尺寸 × scale → 物理客户区（足够大，至少 1 px）。
@@ -574,14 +774,26 @@ fn wide(text: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use windows::Win32::UI::Input::Ime::{ImmGetContext, ImmReleaseContext};
+    use windows::Win32::UI::{
+        Input::{
+            Ime::{ImmGetContext, ImmReleaseContext},
+            KeyboardAndMouse::IsWindowEnabled,
+        },
+        WindowsAndMessaging::{
+            GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetWindow, GetWindowLongPtrW, IsWindow, SendMessageW,
+            WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WS_CHILD, WS_EX_TOPMOST,
+        },
+    };
 
     use super::{NativeWindow, refresh_hz_from_display_frequency};
     use crate::{
         app::App,
+        event::{Event, ImeEvent},
         math::{Rect, Scale, Size},
+        node::builder::NodeBuilder,
         platform::dispatcher::Dispatcher,
-        window::WindowOptions,
+        text::TextStyle,
+        window::{WindowId, WindowOptions},
     };
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
@@ -605,8 +817,9 @@ mod tests {
         let id = app.create_window(options.clone());
         // RE-01：建窗路径唯一入口（窗口 bridge 的那一份代际）。
         let a11y_epoch = app.window_a11y_epoch(id).expect("window exists");
-        let mut native = NativeWindow::create(id, &options, Dispatcher::new(), None, a11y_epoch)
-            .expect("NativeWindow::create");
+        let mut native =
+            NativeWindow::create(id, &options, None, Dispatcher::new(), None, a11y_epoch)
+                .expect("NativeWindow::create");
 
         // SAFETY: 窗口由本用例持有且存活；上下文句柄成对释放。
         let baseline = unsafe { ImmGetContext(native.hwnd) };
@@ -619,7 +832,7 @@ mod tests {
 
         // 目标状态与已应用状态相同：`sync_ime_enabled` 直接返回，不清 caret 缓存。
         native.ime_area = Some((Rect::new(0.0, 0.0, 1.0, 18.0), Scale::ONE));
-        native.sync_ime_enabled(&app);
+        native.sync_ime_enabled(&mut app);
         assert!(
             native.ime_area.is_some(),
             "目标状态未变化时不得清 caret 缓存"
@@ -628,7 +841,7 @@ mod tests {
         // 禁用：`App` 目标状态变化 ⇒ 摘除上下文，并清 caret 缓存（恢复的上下文不保证保留
         // 之前写的组合/候选窗表单，下一轮必须重发）。
         app.set_ime_enabled(id, false);
-        native.sync_ime_enabled(&app);
+        native.sync_ime_enabled(&mut app);
         assert!(
             !native.state_mut().ime_enabled(),
             "禁用态必须应用到平台状态"
@@ -642,7 +855,7 @@ mod tests {
 
         // 重新启用：还回保存的上下文（没有保存值则 `IACE_DEFAULT` 让系统关联默认上下文）。
         app.set_ime_enabled(id, true);
-        native.sync_ime_enabled(&app);
+        native.sync_ime_enabled(&mut app);
         assert!(native.state_mut().ime_enabled(), "启用态必须应用到平台状态");
         // SAFETY: 同上。
         let restored = unsafe { ImmGetContext(native.hwnd) };
@@ -658,7 +871,7 @@ mod tests {
         // 销毁前恢复：`destroy` 必须先执行 `plan_ime_release` 的命令（它会把已应用状态置回
         // 启用）；若这一步被删掉，状态会停在禁用态。
         app.set_ime_enabled(id, false);
-        native.sync_ime_enabled(&app);
+        native.sync_ime_enabled(&mut app);
         assert!(!native.state_mut().ime_enabled(), "前置：窗口处于禁用态");
         native.destroy();
         assert!(
@@ -677,8 +890,9 @@ mod tests {
         let id = app.create_window(options.clone());
         // RE-01：建窗路径唯一入口（窗口 bridge 的那一份代际）。
         let a11y_epoch = app.window_a11y_epoch(id).expect("window exists");
-        let mut native = NativeWindow::create(id, &options, Dispatcher::new(), None, a11y_epoch)
-            .expect("NativeWindow::create");
+        let mut native =
+            NativeWindow::create(id, &options, None, Dispatcher::new(), None, a11y_epoch)
+                .expect("NativeWindow::create");
 
         // 故意把 App 侧写成与平台不一致的值：恢复必须把它纠回平台真值。
         {
@@ -730,6 +944,7 @@ mod tests {
         let native = NativeWindow::create(
             crate::window::WindowId::for_test(1),
             &options,
+            None,
             Dispatcher::new(),
             None,
             // RE-01：平台层不允许自造消费端代际；测试从真实 `A11yBridge` 取。
@@ -749,5 +964,272 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── X1：owner / 模态 / 置顶的原生语义（隐藏窗口夹具）────────────────────────────────
+    //
+    // 这里只钉**平台层**的系统行为（Win32 owner / WS_EX_TOPMOST / EnableWindow）；真机 z 序、
+    // 最小化跟随与置顶视觉由 `.review/p1-b-win-x1.log` 的可见窗口探针验收。引擎层的 owner
+    // 校验 / 级联 / 模态输入过滤在 App 层（本 worktree 之外），不在本用例范围。
+
+    /// 建一个隐藏的普通顶层窗口（X1 用例的 owner / 对照）。
+    fn window(id: u32) -> NativeWindow {
+        NativeWindow::create(
+            WindowId::for_test(id),
+            &WindowOptions::default(),
+            None,
+            Dispatcher::new(),
+            None,
+            crate::platform::windows::window::test_a11y_epoch(),
+        )
+        .expect("NativeWindow::create")
+    }
+
+    /// X1 owner：`CreateWindowExW` 的 `hWndParent` 走 owner 语义 ——
+    /// `GetWindow(GW_OWNER)` 回指 owner，且窗口**不是** `WS_CHILD`（owned 窗口仍是顶层窗口）。
+    ///
+    /// 变异守卫：把 `CreateWindowExW` 的 `hWndParent` 改回 `None` ⇒ `GW_OWNER` 为 0，用例红。
+    #[test]
+    fn an_owned_window_reports_its_owner_and_is_not_a_child_window() {
+        let owner = window(1);
+        let options = WindowOptions {
+            owner: Some(WindowId::for_test(1)),
+            ..WindowOptions::default()
+        };
+        let owned = NativeWindow::create(
+            WindowId::for_test(2),
+            &options,
+            Some(owner.hwnd),
+            Dispatcher::new(),
+            None,
+            crate::platform::windows::window::test_a11y_epoch(),
+        )
+        .expect("owned window");
+
+        // SAFETY: 两个窗口都由本用例持有且仍存活；只读查询。
+        let reported = unsafe { GetWindow(owned.hwnd, GW_OWNER) }.expect("GetWindow(GW_OWNER)");
+        assert_eq!(
+            reported, owner.hwnd,
+            "owned 窗口的 GW_OWNER 必须回指 owner（hWndParent owner 语义）"
+        );
+        // SAFETY: 同上，只读查询窗口样式。
+        let style = unsafe { GetWindowLongPtrW(owned.hwnd, GWL_STYLE) };
+        assert_eq!(
+            style & (WS_CHILD.0 as isize),
+            0,
+            "owner 语义不得退化成客户区子窗口（window_set/origin 行为会完全不同）"
+        );
+    }
+
+    /// X1 置顶：`always_on_top` ⇒ 创建时 `WS_EX_TOPMOST`；普通窗口不得带该位。
+    ///
+    /// 变异守卫：删掉 `CreateWindowExW` 的 `WS_EX_TOPMOST` ⇒ 断言红。
+    #[test]
+    fn an_always_on_top_window_has_the_topmost_ex_style() {
+        let options = WindowOptions {
+            always_on_top: true,
+            ..WindowOptions::default()
+        };
+        let topmost = NativeWindow::create(
+            WindowId::for_test(3),
+            &options,
+            None,
+            Dispatcher::new(),
+            None,
+            crate::platform::windows::window::test_a11y_epoch(),
+        )
+        .expect("topmost window");
+        // SAFETY: 窗口由本用例持有且仍存活；只读查询扩展样式。
+        let ex_style = unsafe { GetWindowLongPtrW(topmost.hwnd, GWL_EXSTYLE) };
+        assert_ne!(
+            ex_style & (WS_EX_TOPMOST.0 as isize),
+            0,
+            "always_on_top 窗口必须带 WS_EX_TOPMOST"
+        );
+
+        let plain = window(4);
+        // SAFETY: 同上。
+        let plain_ex_style = unsafe { GetWindowLongPtrW(plain.hwnd, GWL_EXSTYLE) };
+        assert_eq!(
+            plain_ex_style & (WS_EX_TOPMOST.0 as isize),
+            0,
+            "普通窗口不得带 WS_EX_TOPMOST"
+        );
+    }
+
+    /// X1 模态：建窗后系统级禁用 owner（`IsWindowEnabled == false`），模态窗口销毁后恢复。
+    ///
+    /// 变异守卫：删掉 `create` 里的 `EnableWindow(owner, false)` ⇒ 第一段断言红；
+    /// 删掉 `destroy` 里的 `EnableWindow(owner, true)` ⇒ 第二段断言红。
+    #[test]
+    fn a_modal_window_disables_its_owner_until_it_is_destroyed() {
+        let owner = window(5);
+        let options = WindowOptions {
+            owner: Some(WindowId::for_test(5)),
+            modal: true,
+            ..WindowOptions::default()
+        };
+        let mut modal = NativeWindow::create(
+            WindowId::for_test(6),
+            &options,
+            Some(owner.hwnd),
+            Dispatcher::new(),
+            None,
+            crate::platform::windows::window::test_a11y_epoch(),
+        )
+        .expect("modal window");
+        // SAFETY: 两个窗口仍存活；只读查询启用状态。
+        assert!(
+            !unsafe { IsWindowEnabled(owner.hwnd) }.as_bool(),
+            "模态窗口打开期间 owner 必须被系统禁用（EnableWindow(FALSE)）"
+        );
+
+        modal.destroy();
+        // SAFETY: owner 仍存活；只读查询。
+        assert!(
+            unsafe { IsWindowEnabled(owner.hwnd) }.as_bool(),
+            "模态窗口销毁后必须恢复 owner 输入（EnableWindow(TRUE)）"
+        );
+    }
+
+    /// X1 模态反例：非模态的 owned 窗口不得禁用 owner。
+    #[test]
+    fn an_owned_window_without_modal_leaves_its_owner_enabled() {
+        let owner = window(7);
+        let options = WindowOptions {
+            owner: Some(WindowId::for_test(7)),
+            ..WindowOptions::default()
+        };
+        let _owned = NativeWindow::create(
+            WindowId::for_test(8),
+            &options,
+            Some(owner.hwnd),
+            Dispatcher::new(),
+            None,
+            crate::platform::windows::window::test_a11y_epoch(),
+        )
+        .expect("owned window");
+        // SAFETY: 两个窗口仍存活；只读查询。
+        assert!(
+            unsafe { IsWindowEnabled(owner.hwnd) }.as_bool(),
+            "非模态的 owned 窗口不得禁用 owner"
+        );
+    }
+
+    /// X1 生命周期契约（系统语义，记录用）：owner 被 `DestroyWindow` 时系统**一并销毁**其
+    /// owned 窗口（`WindowOptions::owner` 文档承诺的「owner 销毁时 owned 一并销毁」）。
+    ///
+    /// 引擎正常关闭路径由 App 层先关闭 owned 再关闭 owner（级联在 App 层实现）；本用例验证
+    /// 平台层对「句柄被系统偷走」的容错：`IsWindow` 变 false，且本层 `destroy()` 对失效句柄
+    /// 安全失败（不 panic / 不 UB）。
+    #[test]
+    fn destroying_the_owner_takes_the_owned_window_with_it() {
+        let owner = window(9);
+        let options = WindowOptions {
+            owner: Some(WindowId::for_test(9)),
+            ..WindowOptions::default()
+        };
+        let mut owned = NativeWindow::create(
+            WindowId::for_test(10),
+            &options,
+            Some(owner.hwnd),
+            Dispatcher::new(),
+            None,
+            crate::platform::windows::window::test_a11y_epoch(),
+        )
+        .expect("owned window");
+        let owned_hwnd = owned.hwnd;
+
+        drop(owner);
+        // SAFETY: 只读查询；句柄预期已随 owner 销毁而失效。
+        assert!(
+            !unsafe { IsWindow(Some(owned_hwnd)) }.as_bool(),
+            "owner 销毁时系统必须一并销毁 owned 窗口（owner 语义契约）"
+        );
+
+        // 引擎侧销毁路径对已经失效的句柄必须安全失败：`Composition::shutdown` 忽略错误、
+        // `DestroyWindow` 返回错误被忽略，不 panic。
+        owned.destroy();
+    }
+
+    /// B6/D6（Windows 对齐）：禁用 IME 瞬间平台仍在组合中 ⇒ 泵侧同步清场：应用侧 caret hint
+    /// 清零 + 补**恰好一条** `ImeEvent::End`；系统迟到的 `WM_IME_ENDCOMPOSITION` 被禁用分支
+    /// 吞掉，不会重复投递。
+    #[test]
+    fn disabling_the_ime_during_composition_emits_one_end_and_clears_the_caret_hint() {
+        let runtime = runtime();
+        let mut app = App::new(runtime.handle().clone());
+        let options = WindowOptions::default();
+        let id = app.create_window(options.clone());
+        // 文本节点 + 真实 shape，才有 IME caret hint（`App::set_ime_cursor_area` 要求 TextShape）。
+        let node = {
+            let window = app.window_mut(id).expect("窗口存在");
+            let root = window.tree().root();
+            NodeBuilder::text("abc", TextStyle::new(16.0))
+                .build(window.tree_mut(), root)
+                .expect("文本节点")
+        };
+        let _ = app.refresh_text(id).expect("窗口存在").expect("文本 pass");
+        let _ = app
+            .window_mut(id)
+            .expect("窗口存在")
+            .compute_layout()
+            .expect("布局");
+        let _ = app.layout_text(id).expect("窗口存在").expect("文本重排");
+        app.set_ime_cursor_area(id, node, 1).expect("caret hint");
+        assert!(
+            app.ime_cursor_area(id).expect("窗口存在").is_some(),
+            "前置：文本 shape 后必须有 caret hint"
+        );
+
+        let mut native = NativeWindow::create(
+            id,
+            &options,
+            None,
+            Dispatcher::new(),
+            None,
+            crate::platform::windows::window::test_a11y_epoch(),
+        )
+        .expect("NativeWindow::create");
+        let hwnd = native.hwnd;
+        // SAFETY: 窗口由本用例持有且仍存活；`SendMessageW` 同步进入生产 `wndproc`。
+        unsafe {
+            SendMessageW(hwnd, WM_IME_STARTCOMPOSITION, None, None);
+        }
+
+        app.set_ime_enabled(id, false);
+        native.sync_ime_enabled(&mut app);
+
+        assert_eq!(
+            app.ime_cursor_area(id).expect("窗口存在"),
+            None,
+            "禁用 IME 必须清应用侧 caret hint"
+        );
+        let events: Vec<Event> = app
+            .drain_events()
+            .into_iter()
+            .filter(|(window, _)| *window == id)
+            .map(|(_, event)| event)
+            .collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::Ime(ImeEvent::End)))
+                .count(),
+            1,
+            "禁用组合中的 IME 必须补恰好一条 ImeEvent::End（实际 {events:?}）"
+        );
+
+        // 禁用态下系统迟到的 ENDCOMPOSITION 被 WndProc 吞掉：不得再补 End。
+        // SAFETY: 窗口仍存活。
+        unsafe {
+            SendMessageW(hwnd, WM_IME_ENDCOMPOSITION, None, None);
+        }
+        assert!(
+            !app.drain_events()
+                .iter()
+                .any(|(window, event)| *window == id && matches!(event, Event::Ime(ImeEvent::End))),
+            "系统迟到的 WM_IME_ENDCOMPOSITION 不得重复投递 End"
+        );
     }
 }

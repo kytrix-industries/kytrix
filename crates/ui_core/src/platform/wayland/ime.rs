@@ -1,4 +1,4 @@
-//! IME 批次状态：`zwp_text_input_v3` 的双缓冲。
+//! IME 批次状态：`zwp_text_input_v3` 的双缓冲（纯逻辑，Windows 可单测）。
 //!
 //! `preedit_string` / `commit_string` / `delete_surrounding_text` 可能在同一批里到达，
 //! **只在 `done` 时原子生效**（否则 UI 会看到半状态）。XML `done` 规定求值顺序：
@@ -14,6 +14,16 @@
 //! **本平台不做提交去重**（AR1b P3-1）：协议按 `done` 双缓冲交付，一批只有一个
 //! `commit_string`；跨批的相同文本（`ll`、双空格）是用户的真实输入，必须放行。旧的
 //! `CommitDeduper` 在 Linux 上没有消费者（`begin_key` + `note` 恒为真），已删除。
+//!
+//! # 为什么在 `platform/wayland/`（B9）
+//!
+//! 本结构是纯状态机（只依赖 `ImeEvent` / `SmolStr` / 平台无关的 `preedit_carets`），但它原本
+//! 放在 Linux-only 的 `platform/linux/ime.rs` 里，开发机（Windows）的 `cargo test` 覆盖不到。
+//! B9 要求「IME 在组合中被 disable 时重置状态、并**恰好补一条** `ImeEvent::End`」，
+//! 这条清场判定必须有单测兜底（否则「组合残留 / 补两条 End」这类缺陷只能靠真机 IME 观察），
+//! 因此与其它 Wayland 纯逻辑一起放到这里：`platform::wayland` 整体在
+//! `cfg(any(target_os = "linux", test))` 下编译，Linux 驱动层（`platform/linux/surface.rs`）
+//! 只是消费者。
 
 use smol_str::SmolStr;
 
@@ -106,6 +116,19 @@ impl ImeState {
     /// string previously set*。
     pub(crate) fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    /// 因 IME 被**停用**而清场：丢弃批次与组合态，并报告是否需要给应用补一条
+    /// [`ImeEvent::End`]（B9）。
+    ///
+    /// 返回 `true` ⇔ 停用前确实存在组合串（`composing` 或本批之前的 `had_preedit`）——
+    /// 此时应用界面上的 preedit 必须被显式结束，否则会永久残留；没有组合时返回 `false`
+    /// （不得凭空补 `End`）。清场是**破坏性**的：同一次停用只能调用一次，调用方按
+    /// 「disable 只在收敛时出现一次」保证 `End` 恰好一条。
+    pub(crate) fn reset_ending(&mut self) -> bool {
+        let had_composition = self.composing || self.had_preedit;
+        self.reset();
+        had_composition
     }
 
     /// `done`：把本批的事件原子转换成 `ImeEvent`（按 XML 的顺序：commit → preedit）。
@@ -252,6 +275,65 @@ mod tests {
         ime.reset();
         assert!(!ime.composing());
         assert!(ime.take_events().is_empty(), "reset 之后旧批次不得再生效");
+    }
+
+    /// B9：IME 在组合中被**停用**（应用 `set_ime_enabled(false)` / 焦点移到非编辑控件）
+    /// ⇒ 组合与待生效批次必须清空，并且恰好要求补一条 [`ImeEvent::End`]。
+    ///
+    /// 返回值的语义是「调用方需要补 End」：第一次停用为 `true`，清场之后再调为 `false` ——
+    /// 调用方只在收敛点（disable 只出现一次）补，因此 `End` 至多一条。
+    #[test]
+    fn disabling_during_a_composition_resets_it_and_ends_it_exactly_once() {
+        let mut ime = ImeState::new();
+        ime.note_preedit(Some("ni".to_owned()), 2, 2);
+        // 组合串已经上屏（组合态立即生效，应用侧画着 preedit）。
+        let _ = ime.take_events();
+        assert!(ime.composing());
+
+        assert!(
+            ime.reset_ending(),
+            "组合中停用 ⇒ 必须让调用方补一条 ImeEvent::End"
+        );
+        assert!(
+            !ime.composing(),
+            "停用后组合态必须清空（否则键盘文本被永久抑制）"
+        );
+        assert!(ime.take_events().is_empty(), "待生效批次随停用一起丢弃");
+        assert!(
+            !ime.reset_ending(),
+            "已清场 ⇒ 不得再补 End（同一次停用只能一条）"
+        );
+    }
+
+    /// 组合批次**尚未** `done`（还在双缓冲里）时停用：同样丢弃并补 End。
+    #[test]
+    fn disabling_with_a_pending_batch_drops_it_and_ends_once() {
+        let mut ime = ImeState::new();
+        ime.note_preedit(Some("nihao".to_owned()), 5, 5);
+        assert!(ime.composing());
+
+        assert!(ime.reset_ending());
+        assert!(ime.take_events().is_empty(), "未生效的批次不得在停用后交付");
+        assert!(!ime.reset_ending());
+    }
+
+    /// 正常批次已经交付过 `End`（commit-only 批次会显式结束组合）：随后停用不得重复补。
+    #[test]
+    fn an_ime_end_already_delivered_is_not_duplicated_on_disable() {
+        let mut ime = ImeState::new();
+        ime.note_preedit(Some("ni".to_owned()), 2, 2);
+        let _ = ime.take_events();
+        ime.note_commit(Some("你".to_owned()));
+        let events = ime.take_events();
+        assert!(
+            events.contains(&ImeEvent::End),
+            "commit-only 批次必须先结束组合: {events:?}"
+        );
+
+        assert!(
+            !ime.reset_ending(),
+            "应用已经收到 End ⇒ 停用时不得再补第二条"
+        );
     }
 
     /// AR1b N4（P2 回归）：协议给的 `cursor_begin` / `cursor_end` 必须进

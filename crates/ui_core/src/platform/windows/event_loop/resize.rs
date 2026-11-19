@@ -27,6 +27,22 @@
 //! **范围**：只做「像素 / 布局 / 渲染目标」。a11y 树交付与 IME caret 表单仍由泵的 ④′ 负责
 //! （它们需要 adapter / IMM32 上下文，且拖拽期间没有键盘输入）：一次拖动结束后的下一轮泵会
 //! 把最终几何同步给 AT / IME，拖拽过程中的中间尺寸不必逐条通知。
+//!
+//! ## 模态 tick（B1：系统 move 模态循环也出帧）
+//!
+//! 拖动**标题栏**走的是系统 move 模态循环：它不产生 `WM_SIZE`（[`ResizeFrameDriver::frame`]
+//! 的输入），只占住本线程消息泵。报告 §1 的缺陷是：此时 `WM_APP_FRAME_WAKE` 被 `WndProc`
+//! 直接吞掉（`Dispatcher::frame_pending` 置位无人消费），tokio 回投的任务、`on_frame` 钩子与
+//! `App::frame` 全部停摆 —— 拖动 3 s 行情/HUD 冻结、松手后集中爆发。
+//!
+//! 修复由 [`ModalTick`] 完成：模态循环里每一条 `WM_APP_FRAME_WAKE`（目标是 attach 首窗，不
+//! 一定是被拖窗口）执行一步「drain 任务 → `run_frame_hook` → 对全部窗口 `App::frame`」。
+//! 它**不做几何**（客户区没变）也不通知 a11y / IME（仍归泵的 ②b′ / ④′）—— 与 [`ResizeFrameDriver`]
+//! 共用的是「短借用取步骤、借用外跑 `App::frame`、错误登记进 `pending_error`」这套纪律。
+//!
+//! **与 `WM_SIZE` 驱动帧的关系**：size 模态循环里 `WM_SIZE` 已经立刻出了真实帧，随后到达的
+//! wake tick 走的是**普通** `App::frame`（不是 force 通道）：刚提交过的窗口被帧预算门禁合并成
+//! `Idle`，不会重复绘制（拖动保留 force 通道只用于 `WM_SIZE` 的几何变化）。
 
 use std::{
     cell::RefCell,
@@ -38,7 +54,10 @@ use crate::{
     app::App,
     error::EngineError,
     math::{Scale, Size},
-    platform::windows::composition::{self, Composition},
+    platform::{
+        dispatcher::Dispatcher,
+        windows::composition::{self, Composition},
+    },
     window::{Window, WindowId},
 };
 
@@ -65,6 +84,27 @@ impl ResizeStep {
     /// 执行一步（不持有 `WndProcState` 借用）；返回需要冒泡的粘性错误。
     pub(crate) fn run(self) -> Option<EngineError> {
         self.driver.frame(self.scale, self.client)
+    }
+}
+
+/// 一步**模态 tick**：系统 move / size 模态循环里的 `WM_APP_FRAME_WAKE` 驱动（B1）。
+///
+/// 在 `&mut WndProcState` 的短借用里构造（只克隆 `Weak<App>` / `Arc<Dispatcher>`），出借用后
+/// [`Self::run`]；与 [`ResizeStep`] 同一套两阶段纪律，原因见文件头纪律 1。消费者：
+/// `WndProcState::modal_tick_step`（`WM_APP_FRAME_WAKE` 分支）。
+pub(crate) struct ModalTick {
+    driver: Rc<ResizeFrameDriver>,
+    dispatcher: Arc<Dispatcher>,
+}
+
+impl ModalTick {
+    pub(crate) fn new(driver: Rc<ResizeFrameDriver>, dispatcher: Arc<Dispatcher>) -> Self {
+        Self { driver, dispatcher }
+    }
+
+    /// 执行一步模态帧；返回需要冒泡的粘性错误（由调用方写回 `WndProcState::pending_error`）。
+    pub(crate) fn run(self) -> Option<EngineError> {
+        self.driver.modal_tick(&self.dispatcher)
     }
 }
 
@@ -135,4 +175,60 @@ impl ResizeFrameDriver {
             Some(Err(error)) => Some(error),
         }
     }
+
+    /// 系统 move / size 模态循环里的一步**全窗口**模态 tick（B1；见模块文档）。
+    ///
+    /// 把泵在模态循环里**停摆**的几段合并成同步的一拍：GPU 反馈（泵的 ②b）→ 回投任务
+    /// （泵的 ⑤）→ `on_frame` 钩子 + 全窗口帧（泵的 ④）。任务放在钩子 / 出帧之前是刻意的：
+    /// 同一拍里任务写下的信号与重绘请求必须被本拍的钩子 / 帧看到，否则要等下一拍（模态循环
+    /// 里没有「下一轮泵」），拖动中的行情 / HUD 会晚一拍。
+    ///
+    /// `WM_APP_FRAME_WAKE` 已经由 `WndProc` 消费（本函数是它唯一的有意义路径），因此：
+    ///
+    /// - **没有唤醒位就什么都不做**：消息可能已被上一拍消费（同一电平信号只对应一条消息），
+    ///   空转会把模态循环变成忙循环；
+    /// - **不做几何 / a11y / IME 同步**：拖动的窗口尺寸没变，这些仍由泵的 ②b′ / ④′ 负责；
+    /// - 任务里建窗不会立刻有原生窗口（泵的 ②a 未运行，下一轮补同步）；任务里关窗后本拍
+    ///   按**执行后**的窗口集出帧（`App::frame` 对已关闭 id 返回 `None`，自然收敛）。
+    ///
+    /// 返回 `Some(error)` = 粘性错误（帧管线 / 呈现失败不可重试，调用方登记进 `pending_error`
+    /// 由泵的下一轮冒泡）。
+    pub(crate) fn modal_tick(&self, dispatcher: &Arc<Dispatcher>) -> Option<EngineError> {
+        let app = self.app.upgrade()?;
+        // 帧内重入（任务 / 钩子再次触发模态 tick）：放弃本拍，绝不构造第二个 `&mut App`。
+        let mut app = app.try_borrow_mut().ok()?;
+        if !dispatcher.take_frame_wake() {
+            return None;
+        }
+        // GPU 反馈先收（设备丢失 / 呈现失败是粘性的；与泵的 ②b、`WM_SIZE` 帧路径同序）。
+        if let Err(error) = app.poll_renderers() {
+            return Some(error);
+        }
+        // ⑤ 的模态循环版本：泵不运行，回投任务只能在这里执行（否则拖到松手后才爆发）。
+        for task in dispatcher.drain_tasks() {
+            task.run(&mut app);
+        }
+        // ④ 的模态循环版本：应用钩子照常每拍一次（HUD 文本 / 动画状态 / 行情写入都在这里）。
+        app.run_frame_hook();
+        // 任务 / 钩子可能建窗 / 关窗：按执行后的窗口集出帧。用普通 `App::frame`（非 force）：
+        // size 模态循环里 `WM_SIZE` 刚出过真实帧，预算门禁会把同拍重复请求合并成 Idle。
+        let windows: Vec<WindowId> = app.windows().map(|(id, _)| id).collect();
+        for window in windows {
+            match app.frame(window) {
+                None | Some(Ok(_)) => {}
+                Some(Err(error)) => return Some(error),
+            }
+        }
+        // RB-14：模态循环里泵不运行、也不 `sync` 帧节拍线程（`FramePacer`）。若本拍有窗口的帧被
+        // 「每 refresh 最多一帧」预算推迟，就补一次**延迟唤醒**（远小于一个 refresh 周期），
+        // 让被推迟的帧在下一拍被重新判定；否则该帧要等松手/下一次外部唤醒才上屏（拖动尾部
+        // 丢一帧）。`wake_later` 是电平信号，合并成最多一个线程，被放行后不再挂。
+        if app.has_deferred_frames() {
+            dispatcher.wake_later(DEFERRED_WAKE_RETRY);
+        }
+        None
+    }
 }
+
+/// 推迟帧的重试唤醒延迟：远小于一个 refresh 周期即可（到达后仍推迟则模态 tick 再挂一次）。
+const DEFERRED_WAKE_RETRY: std::time::Duration = std::time::Duration::from_millis(4);

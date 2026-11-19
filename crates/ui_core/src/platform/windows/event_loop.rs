@@ -11,10 +11,11 @@
 //!
 //! ## 非客户区：全部交系统（R07-2）
 //!
-//! `WM_NCCALCSIZE` / `WM_NCHITTEST` / `WM_NCLBUTTONDOWN` **全部**交 `DefWindowProcW`：命中码、
-//! 边框几何、缩放光标，以及 caption 的 move 模态循环与 8 个命中码的 size 模态循环都由系统
-//! 提供（Chrome / Qt / GPUI 同款）。Aero Snap / Win11 Snap Layouts / 双击边框 /
-//! `Alt+Space` → 大小 / 拖动中跨屏 DPI 因此全部免费。
+//! `WM_NCCALCSIZE` / `WM_NCLBUTTONDOWN` **全部**交 `DefWindowProcW`；`WM_NCHITTEST` 只在应用
+//! 声明的**自绘标题栏拖动区**（X2）命中时返回 `HTCAPTION`，其余点仍交默认过程。命中码、边框
+//! 几何、缩放光标，以及 caption 的 move 模态循环与 8 个命中码的 size 模态循环都由系统提供
+//! （Chrome / Qt / GPUI 同款）。Aero Snap / Win11 Snap Layouts / 双击边框 / `Alt+Space` →
+//! 大小 / 拖动中跨屏 DPI 因此全部免费。
 //!
 //! size 模态循环期间泵的 ④ 不运行，但**重排 + 重绘并没有停**：模态循环会同步
 //! `DispatchMessage` 到本窗口的 `WndProc`，每一条 `WM_SIZE` 都由
@@ -35,7 +36,7 @@ use windows::Win32::Foundation::HWND;
 
 use crate::{
     error::EngineError,
-    math::{PhysicalRect, Scale},
+    math::{PhysicalRect, Rect, Scale},
     platform::{
         dispatcher::Dispatcher,
         event::{MessageContext, PlatformEvent, StampedEvent, TranslateState},
@@ -43,6 +44,7 @@ use crate::{
             a11y::WindowsA11y,
             dpi,
             ime::{ImeApplied, ImeCommand},
+            placement,
         },
     },
     window::WindowId,
@@ -55,7 +57,7 @@ mod resize;
 mod wndproc;
 
 pub(crate) use pump::run;
-pub(crate) use resize::{ResizeFrameDriver, ResizeStep};
+pub(crate) use resize::{ModalTick, ResizeFrameDriver, ResizeStep};
 pub(crate) use wndproc::wndproc;
 
 #[cfg(test)]
@@ -75,8 +77,13 @@ pub(crate) struct WndProcState {
     /// `WM_MOUSELEAVE` 不带坐标，而 `PointerLeave`（R02-39）要给出离开点；用最近一次移动的
     /// 位置是主流做法（Chromium 的 `WebMouseEvent.position_in_widget` 同源）。
     last_client_pos: (i32, i32),
-    /// `WM_GETMINMAXINFO` 的 `ptMinTrackSize`（物理像素，随 DPI 同步换算）。
-    min_size: (u32, u32),
+    /// `WM_GETMINMAXINFO` 的 `ptMinTrackSize`（**窗口外框**物理像素，随 DPI 同步换算）。
+    min_track_size: (u32, u32),
+    /// `WM_GETMINMAXINFO` 的 `ptMaxTrackSize`（窗口外框物理像素；`None` = 不覆盖系统默认）。
+    max_track_size: Option<(u32, u32)>,
+    /// 应用配置的客户区尺寸约束（逻辑像素；建窗时从 `WindowOptions` 解析，
+    /// `min > max` 已按 `max` 钳制 —— 解析规则在 [`placement::ClientLimits`]）。
+    limits: placement::ClientLimits,
     /// 当前消息时刻的窗口比例（`WM_DPICHANGED` **同步**更新，R07-12）。
     ///
     /// 同批次后续消息的物理→逻辑换算、`StampedEvent::scale` 与
@@ -104,15 +111,43 @@ pub(crate) struct WndProcState {
     /// （恒为 `IDC_ARROW`）—— 只在光标变化时 `SetCursor` 的写法会被系统覆盖掉，自定义光标
     /// 永远不生效（P2-3）。所以这里记住当前值，在 `WM_SETCURSOR` 里重新应用。
     cursor: crate::paint::style::Cursor,
+    /// 自绘标题栏拖动区（**逻辑窗口坐标**，客户区左上原点；X2 公共契约）。
+    ///
+    /// 泵每轮从 `App::window(id).drag_regions()` 对账到本字段
+    ///（`NativeWindow::sync_drag_regions`），`WndProc` 的 `WM_NCHITTEST` 只读 —— 窗口过程里
+    /// 不调用应用层（平台层纪律），也避免在消息处理期间借用 `App` 造成重入。
+    drag_regions: Vec<Rect>,
     /// 系统 size / move 模态循环是否进行中（`WM_ENTERSIZEMOVE` → `WM_EXITSIZEMOVE`）。
     ///
     /// 会话期间泵的 ④ 不运行：重排 + 重绘由模态循环分派的 `WM_SIZE` 直接驱动
-    /// （[`ResizeFrameDriver`]），与 Qt / Chrome 同构。
+    /// （[`ResizeFrameDriver`]），拖动标题栏（没有 `WM_SIZE`）则由 `WM_APP_FRAME_WAKE` 驱动的
+    /// 模态 tick（[`ModalTick`]，B1）保证行情 / HUD / 动画继续出帧。
+    /// 全局模态判定在 `Dispatcher::in_modal_loop`（唤醒目标可能是另一个窗口）。
     size_move: bool,
+    /// 本窗口**进入过、尚未退出**的系统模态循环层数（B1）。
+    ///
+    /// 与全局 `Dispatcher::modal_loops` 严格配对：[`Self::begin_size_move`] +1、
+    /// [`Self::end_size_move`] -1。窗口在模态循环里被销毁时收不到 `WM_EXITSIZEMOVE`，
+    /// [`Self::drop`] 把余数退回去 —— 计数绝不能泄漏成「永远在模态循环里」，否则模态循环外的
+    /// 每条 `WM_APP_FRAME_WAKE` 都会抢跑泵的 ④（重复跑钩子 / 绕过泵的 a11y、几何同步）。
+    ///
+    /// 层数而不是布尔：系统模态循环可以嵌套（例如菜单循环里再启动 move 循环），
+    /// `WM_EXITSIZEMOVE` 只退出一层。
+    modal_entries: u32,
+    /// 是否正在按系统建议矩形应用 `WM_DPICHANGED`：其内部 `SetWindowPos` 产生的 `WM_MOVE`
+    /// 属于 DPI 路径的副产物，不派发 `Event::Moved`（`Event::Moved` 的公共契约：DPI 变化
+    /// 只产生 `DpiChanged`）。用户拖动 / 程序 `SetWindowPos` 的移动不受影响（置位只覆盖那一次
+    /// 同步调用期间）。
+    suppress_move: bool,
     /// 模态循环里驱动出的粘性错误（帧管线 / 合成调用失败）：由泵的下一轮 ② 冒泡。
     ///
     /// `WndProc` 没有错误通道，但绝不能把失败吞掉 —— 帧管线失败在用户看来就是「画面冻结」。
     pending_error: Option<EngineError>,
+    /// 测试观察点：最近一次 `WM_SETTINGCHANGE("ImmersiveColorSet")` **实际成功**应用到标题栏的
+    /// 明暗（`None` = 尚未收到主题变化或 DWM 调用失败）。生产构建没有该字段；与
+    /// `pump::GeometryCache::queries` 同款 test-only 记账。
+    #[cfg(test)]
+    last_dark_titlebar: Option<bool>,
     /// 系统 size 模态循环里的成帧驱动（连接泵持有的 `App` 与本窗口的合成目标）。
     ///
     /// `None` = 没有 `App`（平台单测里只验证 `WndProc` 记账、不真正建渲染器的窗口）。
@@ -120,10 +155,13 @@ pub(crate) struct WndProcState {
 }
 
 impl WndProcState {
+    /// `limits` = 建窗时从 `WindowOptions` 解析出的客户区尺寸约束（B3：
+    /// `WM_GETMINMAXINFO` 的 `ptMinTrackSize` / `ptMaxTrackSize` 来源）。
     pub(crate) fn new(
         dispatcher: Arc<Dispatcher>,
         hwnd: HWND,
         window: WindowId,
+        limits: placement::ClientLimits,
         driver: Option<Rc<ResizeFrameDriver>>,
         a11y_consumer_epoch: crate::a11y::adapter::A11yConsumerEpoch,
     ) -> Result<Self, EngineError> {
@@ -131,13 +169,16 @@ impl WndProcState {
         let scale = dpi::scale_from_dpi(dpi).ok_or(EngineError::InvalidDpiScale {
             factor: dpi as f32 / dpi::BASE_DPI as f32,
         })?;
+        let (min_track_size, max_track_size) = limits.track_sizes(dpi);
         Ok(Self {
             dispatcher: dispatcher.clone(),
             events: Vec::with_capacity(8),
             translate: TranslateState::default(),
             wheel_lines: pump::wheel_lines_from_system(),
             last_client_pos: (0, 0),
-            min_size: dpi::min_track_size(dpi),
+            min_track_size,
+            max_track_size,
+            limits,
             scale,
             close_requested: false,
             display_recovery: false,
@@ -147,8 +188,13 @@ impl WndProcState {
             a11y: WindowsA11y::new(hwnd, dispatcher, window, a11y_consumer_epoch)?,
             suppress_capture_cancel: false,
             cursor: crate::paint::style::Cursor::Default,
+            drag_regions: Vec::new(),
             size_move: false,
+            modal_entries: 0,
+            suppress_move: false,
             pending_error: None,
+            #[cfg(test)]
+            last_dark_titlebar: None,
             driver,
         })
     }
@@ -162,19 +208,38 @@ impl WndProcState {
         self.dispatcher.wake();
     }
 
+    /// 唤醒队列 / 全局模态循环标记的来源（B1：`WM_APP_FRAME_WAKE` 的 tick 判定与
+    /// `WM_ENTERSIZEMOVE` / `WM_EXITSIZEMOVE` 的深度记账）。
+    pub(crate) fn dispatcher(&self) -> &Arc<Dispatcher> {
+        &self.dispatcher
+    }
+
     /// 当前消息时刻的窗口比例（事件换算与 `WM_GETMINMAXINFO` 都用它）。
     pub(crate) fn scale(&self) -> Scale {
         self.scale
     }
 
-    /// `WM_DPICHANGED` 的同步记账（R07-12）：新比例 + 新的最小跟踪尺寸。
+    /// 平台 IME 是否处于组合中（B6/D6：禁用 / 失焦路径据此决定是否补恰好一条
+    /// `ImeEvent::End`；组合态由 `ImeState` 记账）。
+    pub(crate) fn ime_composing(&self) -> bool {
+        self.translate.ime().is_composing()
+    }
+
+    /// `WM_DPICHANGED` 的同步记账（R07-12）：新比例 + 新的最小/最大跟踪尺寸。
     ///
     /// 必须在**投递 `Dpi` 事件之前**、在 `SetWindowPos(建议矩形)` 之前调用：`SetWindowPos`
     /// 会同步派发 `WM_SIZE`，那些事件的 `StampedEvent::scale` 与 `WM_GETMINMAXINFO` 都要看到
     /// 新值。
     pub(crate) fn note_dpi(&mut self, dpi: u32, scale: Scale) {
         self.scale = scale;
-        self.min_size = dpi::min_track_size(dpi);
+        let (min_track_size, max_track_size) = self.limits.track_sizes(dpi);
+        self.min_track_size = min_track_size;
+        self.max_track_size = max_track_size;
+    }
+
+    /// 应用配置的客户区尺寸约束（`NativeWindow::apply_dpi_and_size` 建窗时钳制请求尺寸用）。
+    pub(crate) fn client_limits(&self) -> placement::ClientLimits {
+        self.limits
     }
 
     /// 每条消息的翻译上下文（消息时间 + 系统滚轮行数 + 当时的 scale）。
@@ -335,14 +400,55 @@ impl WndProcState {
         self.cursor = cursor;
     }
 
+    /// 当前自绘标题栏拖动区（X2；`WndProc` 的 `WM_NCHITTEST` 读点）。
+    pub(crate) fn drag_regions(&self) -> &[Rect] {
+        &self.drag_regions
+    }
+
+    /// 用 `App` 的最新拖动区对账（同值 no-op；泵每轮调用，`WndProc` 的读点唯一来源）。
+    pub(crate) fn set_drag_regions(&mut self, regions: &[Rect]) {
+        if self.drag_regions == regions {
+            return;
+        }
+        self.drag_regions.clear();
+        self.drag_regions.extend_from_slice(regions);
+    }
+
     /// `WM_ENTERSIZEMOVE`：系统 size / move 模态循环开始（期间泵的 ④ 不运行）。
+    ///
+    /// 全局计数（`Dispatcher::modal_loops`）与 `size_move` 一起记账：判定必须全局，因为
+    /// `Dispatcher::wake` 的目标是 attach 的首窗，被拖动 / 缩放的窗口不一定是它（B1）。
     pub(crate) fn begin_size_move(&mut self) {
         self.size_move = true;
+        self.modal_entries = self.modal_entries.saturating_add(1);
+        self.dispatcher.enter_modal_loop();
+        // B1：把可能「已派发、未消费」的唤醒位重新投递一条消息。
+        //
+        // 模态循环**外**的 `WM_APP_FRAME_WAKE` 只返回（唤醒位由泵的 ④ 消费），而系统 move
+        // 循环是在泵的 `DispatchMessageW` 里启动的。于是存在这个竞态：
+        // ① 数据泵置位并 post 一条唤醒消息；
+        // ② 泵的 ① drain 把它派发进 `WndProc`（模态循环外 ⇒ 只返回，位仍置位）；
+        // ③ 同一批消息里紧随的鼠标按下让 `DefWindowProc` 在泵的 ④ 取走唤醒位**之前**进入
+        //    模态循环。
+        // 此时位已置位、队列里却没有唤醒消息：生产者看到「已置位」不再 post，模态循环里
+        // 永远没有 tick —— 真机实测就是「拖动 3 s 一帧不出、松手后集中爆发」。
+        //
+        // 进入循环时若仍有置位，**消费并重投**一条消息：循环里至少有一拍 tick；旧消息
+        // 之后若被派发，位已清，只是一条 no-op。
+        if self.dispatcher.take_frame_wake() {
+            self.dispatcher.wake();
+        }
     }
 
     /// `WM_EXITSIZEMOVE`：模态循环结束；之后回到泵的常规出帧路径。
+    ///
+    /// 只退出**本窗口记过**的那一层（未配对的 `WM_EXITSIZEMOVE` 不得把别的窗口的计数退掉）。
     pub(crate) fn end_size_move(&mut self) {
         self.size_move = false;
+        if self.modal_entries > 0 {
+            self.modal_entries -= 1;
+            self.dispatcher.exit_modal_loop();
+        }
     }
 
     /// 会话中的一条 `WM_SIZE`：取出「要驱动的一步」（**短借用**，纪律 1）。
@@ -357,6 +463,22 @@ impl WndProcState {
         Some(ResizeStep::new(Rc::clone(driver), self.scale, client))
     }
 
+    /// 系统模态循环里的一条 `WM_APP_FRAME_WAKE`：取出「要驱动的一步」（**短借用**，纪律 1）。
+    ///
+    /// 与 [`Self::resize_step`] 同款两阶段：这里只克隆 `Weak<App>` / `Arc<Dispatcher>`，
+    /// [`ModalTick::run`] 在借用之外跑任务 / 钩子 / 全部窗口的帧。
+    ///
+    /// **不检查本窗口的 `size_move`**：唤醒消息的目标是 attach 的首窗，被拖动 / 缩放的窗口
+    /// 不一定是它 —— 模态判定用 `Dispatcher::in_modal_loop`（全局计数，见 `WndProc` 的分支）。
+    /// `None` = 没有 `App`（平台单测里只验证 `WndProc` 记账、不真正建渲染器的窗口）。
+    pub(crate) fn modal_tick_step(&self) -> Option<ModalTick> {
+        let driver = self.driver.as_ref()?;
+        Some(ModalTick::new(
+            Rc::clone(driver),
+            Arc::clone(&self.dispatcher),
+        ))
+    }
+
     /// 登记模态循环里产生的粘性错误（泵的下一轮 ② 冒泡）。
     pub(crate) fn note_pending_error(&mut self, error: EngineError) {
         self.pending_error.get_or_insert(error);
@@ -365,5 +487,19 @@ impl WndProcState {
     /// 取走模态循环里登记的粘性错误（泵的 ② 步骤每轮检查一次）。
     pub(crate) fn take_pending_error(&mut self) -> Option<EngineError> {
         self.pending_error.take()
+    }
+}
+
+/// 窗口在系统模态循环进行中被销毁：把本窗口尚未退出的模态层数退给全局计数（B1）。
+///
+/// 异常路径的对称性：正常路径由 `WM_EXITSIZEMOVE` → [`WndProcState::end_size_move`] 退出；
+/// 但窗口若在 move / size 循环里被销毁（例如用户 / 系统在拖动中强制关窗），
+/// `WM_EXITSIZEMOVE` 不会再送到这个 `WndProc`。若不在这里退，`Dispatcher::modal_loops`
+/// 会永久 > 0，之后模态循环外的每条 `WM_APP_FRAME_WAKE` 都会在 `WndProc` 里抢跑泵的 ④。
+impl Drop for WndProcState {
+    fn drop(&mut self) {
+        for _ in 0..self.modal_entries {
+            self.dispatcher.exit_modal_loop();
+        }
     }
 }

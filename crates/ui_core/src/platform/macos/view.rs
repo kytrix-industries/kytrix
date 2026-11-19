@@ -10,10 +10,15 @@
 //!   决定（R09-2：那会让日文/韩文再変換、Shift 临时切换丢字串字）。
 //! - **`Text` 抑制与提交去重是按键作用域状态**（R09-3）：`keyDown:` 开一个作用域，`insertText:`
 //!   只在作用域内记账；作用域外（鼠标点候选窗、听写、表情面板）的提交**不会**影响下一次按键。
+//! - **裸 `Key` 在组合期不可见**（B4）：判定由平台无关的 `platform::ime::key_visible` 统一
+//!   给出，与 Win32 的 `VK_PROCESSKEY` 过滤对齐 —— 组合中 / 被输入法消费的按键不投递，
+//!   带 Cmd/Ctrl/Option 的命令组合始终投递（见 `key_down` / `key_up`）。
 
 use std::{
     cell::{Cell, RefCell},
     ptr::NonNull,
+    rc::Rc,
+    sync::Arc,
     time::Instant,
 };
 
@@ -23,8 +28,9 @@ use objc2::{
     runtime::{AnyObject, ProtocolObject},
 };
 use objc2_app_kit::{
-    NSCursor, NSEvent, NSEventModifierFlags, NSEventPhase, NSTextInputClient, NSTrackingArea,
-    NSTrackingAreaOptions, NSUserInterfaceValidations, NSValidatedUserInterfaceItem, NSView,
+    NSCursor, NSEvent, NSEventModifierFlags, NSEventPhase, NSTextInputClient, NSTextInputContext,
+    NSTrackingArea, NSTrackingAreaOptions, NSUserInterfaceValidations,
+    NSValidatedUserInterfaceItem, NSView,
 };
 use objc2_foundation::{
     NSArray, NSAttributedString, NSAttributedStringKey, NSPoint, NSProcessInfo, NSRange, NSRect,
@@ -40,17 +46,25 @@ use crate::{
     math::{Point, Rect},
     paint::style::Cursor,
     platform::{
-        ime::{CommitVerdict, KeyScopeToken, replacement_range},
+        dispatcher::Dispatcher,
+        ime::{CommitVerdict, KeyScopeToken, key_visible, replacement_range},
         macos::{a11y::MacA11y, ime::ImeState, menu},
+        macos_close::CloseBridge,
+        macos_drag::drag_region_at,
         menu::{EditAvailability, MenuCommand},
     },
 };
 
 /// `GuiView` 的实例变量（主线程独占）。
-#[derive(Debug)]
 pub(crate) struct ViewIvars {
     /// 待泵消费的平台事件（**不**在这里调 `App`）。
     events: RefCell<Vec<Event>>,
+    /// 关闭桥（B5）：`performClose:` 置位、泵消费；与 `WindowDelegate` 的
+    /// `windowShouldClose:` / `windowWillClose:` 共享同一份状态（同一窗口只有一个真值）。
+    close: Rc<CloseBridge>,
+    /// 唤醒泵：`performClose:` 只置位关闭桥，裁决与真正的 `NSWindow.close()` 在泵里做；
+    /// 不唤醒的话请求要等到下一个 run loop 事件才会被处理（关闭会「延迟一拍」）。
+    dispatcher: Arc<Dispatcher>,
     /// IME 组合状态 + 按键作用域的提交记账（R09-3）。
     ime: RefCell<ImeState>,
     /// a11y adapter（首显前构造；`None` = 尚未安装 / 已卸载）。
@@ -59,10 +73,17 @@ pub(crate) struct ViewIvars {
     modifiers: Cell<u8>,
     /// IME caret 区域（窗口逻辑坐标；`None` = 无 hint）。
     ime_cursor: Cell<Option<Rect>>,
-    /// 引擎请求的光标形状（`cursorUpdate:` / `mouseEntered:` 重新 apply 它，R09-11）。
+    /// 箭头 `cursorUpdate:` / `mouseEntered:` 重新 apply 它，R09-11）。
     cursor: Cell<Cursor>,
     /// 指针是否在 view 内（决定 `set_cursor` 能否立刻 `NSCursor::set`）。
     pointer_inside: Cell<bool>,
+    /// 应用是否允许该窗口使用 IME（B6；默认启用）。`false` ⇒ [`GuiView::input_context`]
+    /// 返回 `nil`，按下时 `keyDown:`/`keyUp:` 里的 `inputContext()` 也是 `None`，按键因此
+    /// 走普通 `characters` 通路（`InputEvent::Text`），不再被路由给输入法。
+    ///
+    /// 唯一写者是泵里的 `NativeWindow::sync_ime_enabled`（目标状态来自
+    /// `App::ime_enabled`）；平台回调只读，不在回调里改它。
+    ime_enabled: Cell<bool>,
     /// Edit 菜单项的可用性快照（泵每轮由 `sync_ime_cursor_area` 写入）：`validateUserInterfaceItem:`
     /// 与菜单动作（`run_menu_command`）据此决定启用/上抛（R09-1 收尾 / AR3 P2-11）。
     ///
@@ -70,6 +91,11 @@ pub(crate) struct ViewIvars {
     /// 侧有接收者」，而平台回调里拿不到 `App`（见文件头的纪律）。唯一生产者是
     /// `App::edit_menu_availability`。
     edit: Cell<EditAvailability>,
+    /// 自绘标题栏拖动区（X2；逻辑窗口坐标、客户区左上原点、y 向下 —— view 是 flipped，
+    /// 与 [`GuiView::logical_point`] 同一坐标系）。唯一写者是泵
+    /// （`NativeWindow::sync_drag_regions`，每轮对账、值变化才写）；`mouseDown:` 只读：
+    /// 命中即把拖动交给 WindowServer 且**不**投递 `PointerDown`（拖动区是窗口 chrome）。
+    drag_regions: RefCell<Vec<Rect>>,
 }
 
 define_class!(
@@ -100,6 +126,33 @@ define_class!(
             true
         }
 
+        /// `NSView.inputContext` 的覆盖（B6）：禁用 IME 时返回 `nil`。
+        ///
+        /// AppKit 在把按键路由给输入法之前会向第一响应者要输入上下文；返回 `nil` ⇒ 按键
+        /// 不经过输入法，`keyDown:` 里的 `characters` 直接产出 `InputEvent::Text`。这是
+        /// WebKit `-[WKView inputContext]`「非 editable 返回 nil」的同一成熟做法
+        /// （NSTextInputContext 没有公开的「摘除/恢复」API，覆盖 `inputContext` 是唯一
+        /// 不依赖私有行为的开关）。
+        ///
+        /// 启用时必须调用 **super** 的默认实现取回 AppKit 维护的上下文：`NSView::inputContext`
+        /// 是同一 selector 的 Rust 绑定，直接调用会自递归。
+        ///
+        /// `method_id`（而不是 `method`）是 `define_class!` 对**返回对象**的方法要求：
+        /// 返回值走 `RetainedReturnValue`（`Option<Retained<_>>` 是合法返回），普通
+        /// `method` 只接受 `Encode` 的值类型。
+        #[unsafe(method_id(inputContext))]
+        fn input_context(&self) -> Option<Retained<NSTextInputContext>> {
+            // 注意：`method_id` 的返回值必须走**尾部表达式**（宏把函数体包成
+            // `RetainedReturnValue` 转换），因此这里用 if/else 而不是提前 `return`。
+            if self.ivars().ime_enabled.get() {
+                // SAFETY: `inputContext` 是 NSView 的既有方法；`super(self)` 直接把消息发给
+                // 父类实现（不会重新进入本覆盖），返回值按 `Option<Retained<_>>` 持有。
+                unsafe { msg_send![super(self), inputContext] }
+            } else {
+                None
+            }
+        }
+
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
             self.note_modifiers(event.modifierFlags());
@@ -127,14 +180,24 @@ define_class!(
                 let ime = ivars.ime.borrow();
                 (ime.has_marked(), ime.takes_text(token))
             };
-            // `Key` **永不**被 IME 抑制：快捷键要能看到物理按键（与 Win32 一致）。
-            self.push_event(Event::Input(InputEvent::Key {
-                code: key_code(event.keyCode()),
-                state: KeyState::Down,
-                repeat,
-                modifiers,
-                timestamp,
-            }));
+            // B4：`Key` 的可见性与 Win32 的 `VK_PROCESSKEY` 过滤对齐（三端共用
+            // `platform::ime::key_visible`）：
+            // - 组合期（`hasMarkedText`）或被输入上下文消费的按键**不投递**裸 `Key` —— 拼音/
+            //   日语组合中的 B/S/数字若同时被应用看到，就会命中裸键绑定（下单误触级别）；
+            // - 带 Cmd/Ctrl/Option 的命令组合**始终投递**：`Cmd+C` / `Cmd+W` 不能被吞；
+            //   AppKit 的菜单键等价在 `keyDown:` 之前处理，物理按键照常投递不会二次触发
+            //   菜单动作。Shift 不算命令修饰键（`Shift+字母` 是正常上屏输入）。
+            let command_modifiers =
+                modifiers.intersects(Modifiers::CONTROL | Modifiers::ALT | Modifiers::META);
+            if key_visible(ime_handled, composing, command_modifiers) {
+                self.push_event(Event::Input(InputEvent::Key {
+                    code: key_code(event.keyCode()),
+                    state: KeyState::Down,
+                    repeat,
+                    modifiers,
+                    timestamp,
+                }));
+            }
             // `Text` 只在「本按键的正文没被 IME 交付」时才发，避免与 `ImeEvent::Commit` 重复插入。
             // 判据与 Linux 的 XKB 回退通路共用 `should_emit_text`（含「重复不得抑制文本」的回归）。
             if should_emit_text(
@@ -163,12 +226,20 @@ define_class!(
             if let Some(context) = self.inputContext() {
                 context.handleEvent(event);
             }
+            // B4/RB-02：抬起**始终**投递裸 `Key`（组合期也不例外）。
+            //
+            // 抬起不产生正文（`Text` 判定只认 Down），应用侧只拿它清 `held_keys`。组合期若把
+            // 抬起也吞掉（首键按下 → 组合开始 → 抬起），应用的「按住」状态会永久残留
+            // （`App::key_down` 长期 true）。Win32 同样只替换按下的 `VK_PROCESSKEY`，抬起以真
+            // 实 `VK_*` 到达 —— 三端在这里语义对齐。`handleEvent:` 的返回值也不作为抬起判据：
+            // 它只对按下有意义。
+            let modifiers = self.modifiers();
             self.push_event(Event::Input(InputEvent::Key {
                 code: key_code(event.keyCode()),
                 state: KeyState::Up,
                 // 抬起没有重复语义。
                 repeat: false,
-                modifiers: self.modifiers(),
+                modifiers,
                 timestamp: event_timestamp(event),
             }));
         }
@@ -223,6 +294,11 @@ define_class!(
 
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
+            // X2：自绘标题栏拖动区命中 ⇒ 同步交给 WindowServer 拖动，且**不**投递
+            // `PointerDown`（不开始引擎指针会话 —— 拖动期间没有后续 mouseUp 保证）。
+            if self.begin_window_drag(event) {
+                return;
+            }
             self.push_pointer(event, PointerPhase::Down(PointerButton::Primary));
         }
 
@@ -365,6 +441,24 @@ define_class!(
         // 引擎是自绘控件，必须自己实现这些方法才参与这条通路（否则 Cmd+C 会「无响应」）。
         // 动作**不直接改状态**：它被翻译成与物理按键等价的 `Key` 事件，走 `App::dispatch`
         // 的绑定派发（菜单、快捷键、a11y 动作因此语义一致）。
+
+        /// 标准关闭动作（B5）：红点重定向、`Cmd+W` 与菜单 Close 的 responder 路径都到这里。
+        ///
+        /// **不调用 `super`**：一旦走 `NSWindow.performClose:`，AppKit 会先问 delegate
+        /// `windowShouldClose:`，返回 `false` 就播放系统提示音（Apple 文档明确），且关闭变成
+        /// AppKit 的同步决定。这里只把请求交给关闭桥并唤醒泵，由泵统一走
+        /// 「`Event::CloseRequested` → `App::on_close` 裁决 → `NSWindow.close()`」——与 Windows
+        /// 同序、保留异步否决、无提示音。
+        ///
+        /// 红点的 target/action 在 `NativeWindow::create` 里被重定向到本 view（标准关闭按钮
+        /// 默认发 `performClose:` 给窗口，会让 AppKit 走那条会响提示音的同步路径）。
+        #[unsafe(method(performClose:))]
+        fn perform_close(&self, _sender: Option<&AnyObject>) {
+            if self.ivars().close.request() {
+                self.ivars().dispatcher.wake();
+            }
+        }
+
         #[unsafe(method(undo:))]
         fn undo(&self, _sender: Option<&AnyObject>) {
             self.run_menu_command(MenuCommand::Undo);
@@ -641,16 +735,27 @@ impl Drop for KeyScope<'_> {
 
 impl GuiView {
     /// 建 view（`frame` 先给 1×1，`NativeWindow` 随后 `setFrame`）。
-    pub(crate) fn new(mtm: MainThreadMarker) -> Retained<Self> {
+    ///
+    /// `dispatcher` 与 `close` 由 `NativeWindow` 持有并共享：关闭请求只置位关闭桥 + 唤醒泵，
+    /// 真正的裁决/关闭在泵里做（平台回调不碰 `App` 的纪律，B5）。
+    pub(crate) fn new(
+        mtm: MainThreadMarker,
+        dispatcher: Arc<Dispatcher>,
+        close: Rc<CloseBridge>,
+    ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(ViewIvars {
             events: RefCell::new(Vec::with_capacity(16)),
+            close,
+            dispatcher,
             ime: RefCell::new(ImeState::new()),
             a11y: RefCell::new(None),
             modifiers: Cell::new(0),
             ime_cursor: Cell::new(None),
+            ime_enabled: Cell::new(true),
             cursor: Cell::new(Cursor::Default),
             pointer_inside: Cell::new(false),
             edit: Cell::new(EditAvailability::NONE),
+            drag_regions: RefCell::new(Vec::new()),
         });
         // SAFETY: `initWithFrame:` 是 NSView 的指定初始化器；`this` 由 `alloc` 产生且未初始化。
         let this: Retained<Self> = unsafe {
@@ -733,6 +838,49 @@ impl GuiView {
         *self.ivars().a11y.borrow_mut() = adapter;
     }
 
+    /// 应用 IME 目标状态（B6；唯一调用点是泵里的 `NativeWindow::sync_ime_enabled`）。
+    ///
+    /// 禁用：先丢弃进行中的组合、清平台侧 IME 状态（返回值语义见
+    /// [`Self::reset_ime_composition`]），**再**翻标志位 —— 顺序不能反：一旦
+    /// `inputContext` 开始返回 `nil`，就拿不到上下文去 `discardMarkedText`，输入法那边的
+    /// 转换会话会悬空。启用只翻标志：下一次按键自然取回 super 的上下文。
+    ///
+    /// 返回 `true` = 有组合被丢弃且需要调用方补一条 `ImeEvent::End`（与焦点移走路径共用
+    /// 同一收尾判据）。
+    pub(crate) fn apply_ime_enabled(&self, enabled: bool) -> bool {
+        if enabled {
+            self.ivars().ime_enabled.set(true);
+            return false;
+        }
+        let needs_end = self.reset_ime_composition();
+        self.ivars().ime_enabled.set(false);
+        needs_end
+    }
+
+    /// 丢弃进行中的 IME 组合并清掉平台侧 IME 缓存（B6/B9 的统一清场路径：禁用 IME /
+    /// 窗口失焦）。
+    ///
+    /// 两步：① 让 AppKit 丢弃它那边的转换会话（`NSTextInputContext.discardMarkedText`，
+    /// 公开 API，WebKit/Qt 同款）；② 清引擎侧的 `ImeState` 与 caret 缓存。返回 `true` =
+    /// 需要调用方补一条 `ImeEvent::End` —— `discardMarkedText` 若同步回调了
+    /// `unmarkText:`（该回调已经 push 过 `End`），这里就不再补，**End 恰好一条**。
+    ///
+    /// caret 缓存是 AppKit 摆候选窗的依据（`firstRectForCharacterRange:`）；失焦/禁用不是
+    /// 「caret 移到别处」，清场后必须回到空矩形，否则下一次组合会拿旧插入点摆候选窗。
+    pub(crate) fn reset_ime_composition(&self) -> bool {
+        self.ivars().ime_cursor.set(None);
+        if !self.ivars().ime.borrow().has_marked() {
+            return false;
+        }
+        if let Some(context) = self.inputContext() {
+            context.discardMarkedText();
+        }
+        let mut ime = self.ivars().ime.borrow_mut();
+        let still_composing = ime.has_marked();
+        ime.clear_marked();
+        still_composing
+    }
+
     /// 取走本轮的平台事件（泵唯一读点）。
     pub(crate) fn take_events(&self) -> Vec<Event> {
         std::mem::take(&mut *self.ivars().events.borrow_mut())
@@ -758,6 +906,38 @@ impl GuiView {
         if self.ivars().pointer_inside.get() {
             self.apply_cursor();
         }
+    }
+
+    /// 保存自绘标题栏拖动区（X2；唯一调用点是泵里的 `NativeWindow::sync_drag_regions`）。
+    ///
+    /// 值不变时零写入（拖动区只在布局变化后由应用更新，泵每轮对账但绝大多数轮次相同）。
+    pub(crate) fn set_drag_regions(&self, regions: &[Rect]) {
+        let mut slot = self.ivars().drag_regions.borrow_mut();
+        if slot.as_slice() == regions {
+            return;
+        }
+        slot.clear();
+        slot.extend_from_slice(regions);
+    }
+
+    /// `mouseDown:` 的拖动区分支（X2）：命中任一区域 ⇒ `performWindowDragWithEvent:`。
+    ///
+    /// 返回 `true` = 本次按下已被拖动区消费（调用方不得再投递 `PointerDown`）。拖动由
+    /// WindowServer 同步接管（Apple 文档：可参与 Space 切换等系统行为；调用立即返回，可能
+    /// 不再收到 mouseUp）—— 因此绝不能给应用发一个没有后续 `PointerUp` 的按下会话。
+    fn begin_window_drag(&self, event: &NSEvent) -> bool {
+        let position = self.logical_point(event.locationInWindow());
+        // 借用在判定后立即结束，避免 `performWindowDragWithEvent:` 期间 AppKit 回调进来
+        // （例如拖动触发窗口状态变化）时 `RefCell` 仍被借用。
+        let hit = drag_region_at(&self.ivars().drag_regions.borrow(), position).is_some();
+        if !hit {
+            return false;
+        }
+        let Some(window) = self.window() else {
+            return false;
+        };
+        window.performWindowDragWithEvent(event);
+        true
     }
 
     /// 把光标形状交给 AppKit（`NSCursor::set`：cursor rect / `cursorUpdate:` 之外唯一有效的

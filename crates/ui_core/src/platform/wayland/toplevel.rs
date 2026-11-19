@@ -1,6 +1,6 @@
 //! `xdg_toplevel` / `xdg_surface` 的协议无关状态机：装饰模式（R10-4）、可见性（R10-7）、
-//! window geometry（R10-10）、configure 状态位与 `wm_capabilities` / `configure_bounds`
-//! 的解析（R10-15）。
+//! window geometry（R10-10）、尺寸约束（`set_min_size` / `set_max_size` + `configure_bounds`，
+//! B3）、configure 状态位与 `wm_capabilities` / `configure_bounds` 的解析（R10-15）。
 //!
 //! 这些判据的共同点是「输入是协议里的整数数组或布尔状态，输出是一个决定」：
 //!
@@ -10,7 +10,10 @@
 //! - **可见性**：`wl_surface.frame` 原文允许服务端在 surface 不可见时**不**回 callback，
 //!   因此「不可见」必须由客户端自己判定并停止请求帧（否则 200 ms 活性兜底退化成永久 5 Hz）；
 //! - **window geometry**：`xdg_surface.set_window_geometry` 定义「哪个矩形是窗口」，compositor
-//!   用它做放置/动画/阴影，不设置时等于整个 surface（含 CSD 装饰与将来的阴影边距）。
+//!   用它做放置/动画/阴影，不设置时等于整个 surface（含 CSD 装饰与将来的阴影边距）；
+//! - **尺寸约束**：应用 `min_size/max_size` 是客户区逻辑尺寸，`configure_bounds` 是 compositor
+//!   建议的 window geometry 上限；两者逐维取最小后加阴影边距才是 `set_min_size` /
+//!   `set_max_size` 的参数（[`SizeConstraintState`]）。
 
 use crate::math::Size;
 
@@ -122,6 +125,17 @@ pub(crate) struct WindowGeometry {
     pub height: i32,
 }
 
+/// CSD 阴影 / 边框在 window geometry **之外**占的整数逻辑像素（每边）。
+///
+/// 非有限值按 0 处理（`f32::NAN.round() as i32` 是 0，但显式分支让调用方意图可读）。
+fn shadow_margin(shadow: f32) -> i32 {
+    if shadow.is_finite() {
+        shadow.max(0.0).round() as i32
+    } else {
+        0
+    }
+}
+
 /// 窗口几何：逻辑尺寸扣除 `shadow` 边距（每边），并夹到至少 1×1。
 ///
 /// `shadow` 是 CSD 阴影/边框在 window geometry **之外**占的宽度（本仓目前不画阴影 ⇒ 0，
@@ -129,11 +143,7 @@ pub(crate) struct WindowGeometry {
 /// 边距传进来：阴影落在 geometry 之外，最大化时不会被裁、平铺时不留白（R10-10 的诉求）。
 #[must_use]
 pub(crate) fn window_geometry(size: Size, shadow: f32) -> WindowGeometry {
-    let margin = if shadow.is_finite() {
-        shadow.max(0.0).round() as i32
-    } else {
-        0
-    };
+    let margin = shadow_margin(shadow);
     let width = (size.width.round() as i32)
         .saturating_sub(margin * 2)
         .max(1);
@@ -148,21 +158,107 @@ pub(crate) fn window_geometry(size: Size, shadow: f32) -> WindowGeometry {
     }
 }
 
-/// `xdg_toplevel.set_min_size` 的参数：最小**客户区** + 阴影边距（window geometry 坐标）。
+/// `xdg_toplevel.set_min_size` / `set_max_size` 的最终参数（window geometry 坐标）。
 ///
-/// 不加上边距时 `set_min_size(320, 200)` 约束的是 window geometry，而 client 侧真正想保住的
-/// 是客户区（自绘标题栏 + 内容）：加阴影后必须把边距补回去，否则窗口能被缩到内容不可用。
-#[must_use]
-pub(crate) fn min_size_with_shadow(minimum: (f32, f32), shadow: f32) -> (i32, i32) {
-    let margin = if shadow.is_finite() {
-        (shadow.max(0.0).round() as i32) * 2
-    } else {
-        0
-    };
-    (
-        (minimum.0.round() as i32).saturating_add(margin).max(1),
-        (minimum.1.round() as i32).saturating_add(margin).max(1),
-    )
+/// 两个参数都是 **window geometry 坐标**（= 客户区 + 每边阴影边距），单位整数逻辑像素。
+/// `max == None` 表示没有上限：调用方用协议的 `set_max_size(0, 0)` 表达「无约束」。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SizeLimits {
+    /// `set_min_size` 参数（每维 ≥1）。
+    pub min: (i32, i32),
+    /// `set_max_size` 参数；`None` = 无上限。
+    pub max: Option<(i32, i32)>,
+}
+
+impl SizeLimits {
+    /// 客户区逻辑尺寸 + 阴影边距 → 协议参数。
+    ///
+    /// - 阴影边距对 min / max 一视同仁：协议约束的是 window geometry，而应用表达的是客户区
+    ///   （自绘标题栏 + 内容）；不加边距时窗口能被缩到内容不可用。
+    /// - 非有限 / 退化尺寸夹到至少 1×1（`set_min_size` 的 0 表示「无约束」，不能把非法输入
+    ///   原样下发）。
+    /// - `min > max` 的**维度**钳成 `min = max`（上限优先）：与 `WindowOptions` 文档的
+    ///   「min>max 先钳成 min=max」一致；上限优先是因为 `configure_bounds` 是合成器的硬性
+    ///   工作区提示、应用 `max_size` 是显式契约，而最小尺寸含引擎默认值（不该突破前者）。
+    fn from_logical(min: Size, max: Option<Size>, shadow: f32) -> Self {
+        let margin = shadow_margin(shadow).saturating_mul(2);
+        let units = |value: f32| (value.round() as i32).saturating_add(margin).max(1);
+        let mut min_width = units(min.width);
+        let mut min_height = units(min.height);
+        let max = max.map(|max| {
+            let max_width = units(max.width);
+            let max_height = units(max.height);
+            min_width = min_width.min(max_width);
+            min_height = min_height.min(max_height);
+            (max_width, max_height)
+        });
+        Self {
+            min: (min_width, min_height),
+            max,
+        }
+    }
+}
+
+/// 一个窗口的尺寸约束状态：应用 [`crate::window::WindowOptions::min_size`] /
+/// [`crate::window::WindowOptions::max_size`] + compositor 的 `xdg_toplevel.configure_bounds`
+/// → 下发给 `xdg_toplevel` 的 [`SizeLimits`]。
+///
+/// **为什么需要状态机**（而不是建窗时算一次）：`configure_bounds`（xdg-shell v4）在窗口生命
+/// 周期内会变化（面板 / 工作区改变），它是**建议上限**，与应用 `max_size` 必须**逐维取最小**
+/// （审计 §3：旧实现直接拿 bounds 覆盖 `set_max_size`，应用显式上限会被静默放大；bounds=0
+/// 表示「无建议上限」，应回到应用上限 / 不设）。同值不重复下发（与 window geometry 同一纪律）。
+pub(crate) struct SizeConstraintState {
+    /// 应用客户区最小逻辑尺寸（已解析平台默认，见 `platform/linux/window.rs` 的
+    /// `MIN_SIZE_LOGICAL`）。
+    min: Size,
+    /// 应用客户区最大逻辑尺寸（`None` = 无应用上限）。
+    max: Option<Size>,
+    /// compositor 最近一次 `configure_bounds`（`None` = 未收到 / 0×0 = 无建议上限）。
+    bounds: Option<Size>,
+    /// 最近一次**已下发**的协议参数（`None` = 还没下发过）。
+    applied: Option<SizeLimits>,
+}
+
+impl SizeConstraintState {
+    /// 建窗：`min` 是已解析的应用 / 平台默认最小客户区尺寸。
+    pub(crate) fn new(min: Size, max: Option<Size>) -> Self {
+        Self {
+            min,
+            max,
+            bounds: None,
+            applied: None,
+        }
+    }
+
+    /// `xdg_toplevel.configure_bounds`：更新 compositor 建议上限。
+    ///
+    /// 是否真的变化由 [`Self::take_pending`] 的同值比较负责，这里无条件写入（调用方随后调用
+    /// `take_pending`，无变化时不会发请求）。
+    pub(crate) fn set_bounds(&mut self, bounds: Option<Size>) {
+        self.bounds = bounds;
+    }
+
+    /// 取「还没下发」的最新限制；`None` = 与上次下发相同（同值 no-op）。
+    ///
+    /// `max` 的有效值 = 应用 `max_size` 与 `configure_bounds` 的**逐维最小值**（任一为
+    /// `None` 则取另一个；都为 `None` 则无上限）。
+    pub(crate) fn take_pending(&mut self, shadow: f32) -> Option<SizeLimits> {
+        let effective_max = match (self.max, self.bounds) {
+            (Some(app), Some(bounds)) => Some(Size::new(
+                app.width.min(bounds.width),
+                app.height.min(bounds.height),
+            )),
+            (Some(app), None) => Some(app),
+            (None, Some(bounds)) => Some(bounds),
+            (None, None) => None,
+        };
+        let limits = SizeLimits::from_logical(self.min, effective_max, shadow);
+        if self.applied == Some(limits) {
+            return None;
+        }
+        self.applied = Some(limits);
+        Some(limits)
+    }
 }
 
 /// `xdg_toplevel.wm_capabilities`（xdg-shell v5）解析结果 —— 只保留**有消费者**的三项。
@@ -217,8 +313,8 @@ impl WmCapabilities {
 #[cfg(test)]
 mod tests {
     use super::{
-        DecorationMode, ToplevelStates, Visibility, WmCapabilities, is_visible,
-        min_size_with_shadow, window_geometry,
+        DecorationMode, SizeConstraintState, SizeLimits, ToplevelStates, Visibility,
+        WmCapabilities, is_visible, window_geometry,
     };
     use crate::math::Size;
 
@@ -359,16 +455,162 @@ mod tests {
         assert_eq!((geometry.x, geometry.y), (0, 0), "非法边距按 0 处理");
     }
 
-    /// `set_min_size` 的坐标是 window geometry，必须把阴影边距加回去，否则客户区被压扁。
+    /// `set_min_size` / `set_max_size` 的坐标是 window geometry，必须把阴影边距加回去，
+    /// 否则客户区被压扁；退化尺寸夹到至少 1×1（协议里 0 表示「无约束」，不能原样下发）。
     #[test]
-    fn min_size_includes_the_shadow_margin() {
-        assert_eq!(min_size_with_shadow((320.0, 200.0), 0.0), (320, 200));
-        assert_eq!(min_size_with_shadow((320.0, 200.0), 8.0), (336, 216));
+    fn size_limits_include_the_shadow_margin_on_both_bounds() {
+        let mut state =
+            SizeConstraintState::new(Size::new(320.0, 200.0), Some(Size::new(1280.0, 720.0)));
         assert_eq!(
-            min_size_with_shadow((0.0, 0.0), 0.0),
-            (1, 1),
-            "0 不是合法的 set_min_size 参数（等价于「无约束」）"
+            state.take_pending(0.0),
+            Some(SizeLimits {
+                min: (320, 200),
+                max: Some((1280, 720)),
+            })
         );
+        assert_eq!(state.take_pending(0.0), None, "同值不得重复下发");
+
+        let mut with_shadow =
+            SizeConstraintState::new(Size::new(320.0, 200.0), Some(Size::new(1280.0, 720.0)));
+        assert_eq!(
+            with_shadow.take_pending(8.0),
+            Some(SizeLimits {
+                min: (336, 216),
+                max: Some((1296, 736)),
+            }),
+            "阴影边距对 min 与 max 一视同仁（协议约束的是 window geometry）"
+        );
+
+        let mut degenerate = SizeConstraintState::new(Size::new(0.0, -5.0), None);
+        assert_eq!(
+            degenerate.take_pending(0.0),
+            Some(SizeLimits {
+                min: (1, 1),
+                max: None,
+            }),
+            "0 / 负数不是合法的 set_min_size 参数（等价于「无约束」），必须夹到 1"
+        );
+    }
+
+    /// B3 核心：compositor 的 `configure_bounds` 是建议上限，与应用 `max_size` **逐维取最小**。
+    ///
+    /// 旧实现（当前分支修复前）在 `configure_bounds` 里直接 `set_max_size(bounds)`，会静默放大
+    /// 应用显式设置的上限（`WindowOptions::max_size` 是契约）。
+    ///
+    /// 变异检查：让 `take_pending` 忽略 bounds（恒取应用 max）⇒ 本测试红。
+    #[test]
+    fn configure_bounds_are_intersected_with_the_app_maximum() {
+        let mut state =
+            SizeConstraintState::new(Size::new(320.0, 200.0), Some(Size::new(1000.0, 800.0)));
+        let initial = state.take_pending(0.0).expect("建窗时要下发一次约束");
+        assert_eq!(initial.max, Some((1000, 800)));
+
+        // bounds 比应用上限小的一维受 bounds 约束，另一维仍取应用上限。
+        state.set_bounds(Some(Size::new(900.0, 900.0)));
+        assert_eq!(
+            state.take_pending(0.0).expect("bounds 变化必须重新下发"),
+            SizeLimits {
+                min: (320, 200),
+                max: Some((900, 800)),
+            }
+        );
+        assert_eq!(state.take_pending(0.0), None, "同值 bounds 不重复下发");
+
+        // bounds 变大：应用上限重新生效（逐维最小）。
+        state.set_bounds(Some(Size::new(1600.0, 1200.0)));
+        assert_eq!(
+            state
+                .take_pending(0.0)
+                .expect("bounds 变化必须重新下发")
+                .max,
+            Some((1000, 800))
+        );
+    }
+
+    /// 应用没设 max 时，`configure_bounds` 就是唯一上限（不能忽略）。
+    #[test]
+    fn configure_bounds_without_an_app_maximum_become_the_limit() {
+        let mut state = SizeConstraintState::new(Size::new(320.0, 200.0), None);
+        assert_eq!(state.take_pending(0.0).expect("建窗下发").max, None);
+
+        state.set_bounds(Some(Size::new(1280.0, 720.0)));
+        assert_eq!(
+            state.take_pending(0.0).expect("bounds 必须成为上限").max,
+            Some((1280, 720))
+        );
+    }
+
+    /// bounds 撤销（`configure_bounds(0, 0)`）⇒ 回到应用上限；应用也没有上限 ⇒ 返回「无上限」，
+    /// 调用方据此发 `set_max_size(0, 0)` 解除之前设置的 bounds。
+    #[test]
+    fn removing_the_bounds_restores_or_clears_the_maximum() {
+        let mut with_app_max =
+            SizeConstraintState::new(Size::new(320.0, 200.0), Some(Size::new(1000.0, 800.0)));
+        assert!(with_app_max.take_pending(0.0).is_some());
+        with_app_max.set_bounds(Some(Size::new(640.0, 480.0)));
+        assert_eq!(
+            with_app_max.take_pending(0.0).expect("bounds 生效").max,
+            Some((640, 480))
+        );
+        with_app_max.set_bounds(None);
+        assert_eq!(
+            with_app_max
+                .take_pending(0.0)
+                .expect("bounds 撤销后必须恢复应用上限")
+                .max,
+            Some((1000, 800))
+        );
+
+        let mut without_app_max = SizeConstraintState::new(Size::new(320.0, 200.0), None);
+        assert!(without_app_max.take_pending(0.0).is_some());
+        without_app_max.set_bounds(Some(Size::new(640.0, 480.0)));
+        assert!(without_app_max.take_pending(0.0).is_some());
+        without_app_max.set_bounds(None);
+        assert_eq!(
+            without_app_max
+                .take_pending(0.0)
+                .expect("撤销 bounds 必须重新下发（清除 max）")
+                .max,
+            None,
+            "无应用上限 ⇒ 调用方发 set_max_size(0, 0) 解除之前的 bounds"
+        );
+    }
+
+    /// 公共面契约：`min > max` 时先钳成 `min = max`（逐维、上限优先）。这里覆盖「引擎默认
+    /// 最小尺寸（320×200）大于应用 max」的典型场景。
+    #[test]
+    fn a_contradictory_minimum_is_clamped_to_the_maximum() {
+        let mut state =
+            SizeConstraintState::new(Size::new(800.0, 600.0), Some(Size::new(400.0, 300.0)));
+        assert_eq!(
+            state.take_pending(0.0),
+            Some(SizeLimits {
+                min: (400, 300),
+                max: Some((400, 300)),
+            }),
+            "min > max 先钳成 min = max（与 WindowOptions 公共文档一致）"
+        );
+
+        // 只有一维冲突：该维钳成相等，另一维保持原值。
+        let mut mixed =
+            SizeConstraintState::new(Size::new(800.0, 600.0), Some(Size::new(1000.0, 500.0)));
+        assert_eq!(
+            mixed.take_pending(0.0),
+            Some(SizeLimits {
+                min: (800, 500),
+                max: Some((1000, 500)),
+            })
+        );
+    }
+
+    /// 默认最小尺寸 + 应用 max：没有冲突时两者都下发（Linux 侧 `None` 的 min 用平台默认）。
+    #[test]
+    fn the_platform_default_minimum_is_used_when_the_app_does_not_set_one() {
+        let mut state =
+            SizeConstraintState::new(Size::new(320.0, 200.0), Some(Size::new(1024.0, 768.0)));
+        let limits = state.take_pending(0.0).expect("建窗下发");
+        assert_eq!(limits.min, (320, 200), "平台默认最小客户区");
+        assert_eq!(limits.max, Some((1024, 768)));
     }
 
     /// R10-15：`wm_capabilities` 是枚举值列表（不是位掩码），未收到时假定全部支持。
