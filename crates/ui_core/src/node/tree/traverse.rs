@@ -118,6 +118,9 @@ pub(crate) fn note_scroll_container(tree: &mut NodeTree, node: NodeId) {
     if !tree.scroll_containers.contains(&node) {
         tree.scroll_containers.push(node);
     }
+    // A1：滚动容器登记变化 ⇒ 绘制端的滚动槽编号必须重建 ⇒ 下一次 paint 走全量路径。
+    // 逐次 +1（同一个节点重复登记也算：`App::make_scroll` 会把 offset 重置为 0，是真的状态变化）。
+    tree.scroll_reg_epoch = tree.scroll_reg_epoch.wrapping_add(1);
 }
 
 // 消费者：`impl NodeTree::note_virtual_container` 的薄委托（外部调用点见该方法文档）。

@@ -389,6 +389,22 @@ pub(crate) struct PaintNodeState {
     pub screen_baked: bool,
 }
 
+/// paint 脏子树剪枝（A1）的可观测计数（验收 / 诊断面）。
+///
+/// 全部是真实观测值：`visited_nodes` 是最近一次 paint 遍历真正做节点状态判定的节点数
+/// （全量帧 ≈ 节点总数；脏闭包增量帧 ≈ 脏节点数 × 树深），后三项是单调累计的帧数。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PaintCounters {
+    /// 最近一帧 paint 遍历访问（做节点状态判定）的节点数。
+    pub visited_nodes: usize,
+    /// 累计：增量路径因新建 / 释放 lane 而用轻量 DFS 重建绘制序的次数（回退率观测面）。
+    pub order_rebuilds: u64,
+    /// 累计：走全量遍历的 paint 帧数。
+    pub full_frames: u64,
+    /// 累计：走脏闭包增量遍历的 paint 帧数（含没有节点被访问的纯 damage / 滚动帧）。
+    pub incremental_frames: u64,
+}
+
 /// 唯一的一棵节点树（I5）。
 ///
 /// 没有全序数组：任何"全树顺序"都由 [`NodeTree::for_each_dfs`] / [`NodeTree::dfs_ids`] 从
@@ -486,6 +502,35 @@ pub struct NodeTree {
     /// 几何节点的 per-draw 变换旁表（R05-12：`Primitive::Geometry.transform` 的来源）。
     /// 只在 `set_geometry_transform` 写入时分配条目，单位矩阵 = 无条目。
     geometry_transforms: ahash::HashMap<NodeId, Transform>,
+    /// paint 脏子树剪枝的**祖先闭包**戳记（按 arena 槽位；`paint_epoch` 的当前代次在闭包内）。
+    ///
+    /// 每帧从 `dirty_paint` 快照向 root 走标记（`mark_paint_closure`），增量遍历只下行到
+    /// 被标记的节点；与 `clip_keys` 同型（按槽位、懒扩容、卸载清空）。用代次而不是 `bool`
+    /// 是为了每帧只付 O(脏 × 深度) 标记成本、不付 O(N) 清表成本。
+    paint_marks: Vec<u32>,
+    /// 当前闭包标记代次（`0` 保留为「没有本帧闭包」；每次标记 +1）。
+    paint_epoch: u32,
+    /// 每个滚动容器节点的**合成端槽位**（按 arena 槽位；`0` = 未分配）。
+    ///
+    /// Full 路径稠密编号时写入（入口先把全表清 0，隐藏 / 未访问节点因此自动失效）；
+    /// Incremental 路径只读它把偏移写回 `scroll_slots`，**不重新编号**（结构未变 ⇒ 编号稳定）。
+    /// 缓存失效（`0`）时增量路径追加新槽，而不是重排已有编号（已烘焙进 lane 的槽号不动）。
+    scroll_slot_of: Vec<u32>,
+    /// 结构代次：`mark_structure` 每次真的改结构时 +1（增量帧的硬全量判据）。
+    structure_epoch: u32,
+    /// 上一次全量 paint 看到的结构代次。
+    painted_structure_epoch: u32,
+    /// 滚动容器**登记**代次（`note_scroll_container` +1）：运行期新增滚动容器 ⇒ 槽位表必须重建。
+    scroll_reg_epoch: u32,
+    /// 上一次全量 paint 看到的滚动容器登记代次。
+    painted_scroll_reg_epoch: u32,
+    /// 强制下一次 paint 走全量路径（仅 `force_repaint_all` 置位；分类时消费一次）。
+    force_full_paint: bool,
+    /// paint 剪枝计数（A1 的验收面；见 [`PaintCounters`]）。
+    paint_visited: usize,
+    paint_order_rebuilds: u64,
+    paint_full_frames: u64,
+    paint_incremental_frames: u64,
     /// 消费脏集合时把条目搬过来再遍历的复用缓冲（`mem::take` / `recycle` 成对使用，保容量）。
     dirty_scratch: Vec<NodeId>,
     /// 本帧"被引擎簿记访问过的不同节点"集合（仅 `test-support`；`FrameRecord::scanned_nodes`）。
@@ -829,6 +874,143 @@ impl NodeTree {
     pub(crate) fn has_paint_work(&self) -> bool {
         !self.dirty_paint.is_empty()
     }
+
+    // ── paint 剪枝（A1）：帧分类输入 / 祖先闭包 / 滚动槽缓存 / 计数 ──────────────
+    /// paint 剪枝的计数快照（验收 / 诊断；只读、不改变状态）。
+    #[must_use]
+    pub fn paint_counters(&self) -> PaintCounters {
+        PaintCounters {
+            visited_nodes: self.paint_visited,
+            order_rebuilds: self.paint_order_rebuilds,
+            full_frames: self.paint_full_frames,
+            incremental_frames: self.paint_incremental_frames,
+        }
+    }
+
+    /// 本帧 paint 开始时的**硬全量**判据：结构 / 滚动容器登记代际变化，或强制全量标志。
+    ///
+    /// 返回 `true` ⇒ 必须走全量遍历（脏节点可能新建 / 丢失 lane，滚动槽必须重新稠密编号，
+    /// 绘制序必须重建）。恒消费 `force_full_paint`；「已见代际」的写回在
+    /// [`NodeTree::note_paint_frame`]（只有真的走了全量才提交，避免判据丢失）。
+    pub(crate) fn paint_epoch_changed(&mut self) -> bool {
+        let forced = std::mem::take(&mut self.force_full_paint);
+        forced
+            || self.structure_epoch != self.painted_structure_epoch
+            || self.scroll_reg_epoch != self.painted_scroll_reg_epoch
+    }
+
+    /// 记录本帧 paint 走的是哪条路径（计数 + 全量帧的已见代际提交）。
+    pub(crate) fn note_paint_frame(&mut self, full_path: bool, visited: usize) {
+        self.paint_visited = visited;
+        if full_path {
+            self.paint_full_frames = self.paint_full_frames.saturating_add(1);
+            self.painted_structure_epoch = self.structure_epoch;
+            self.painted_scroll_reg_epoch = self.scroll_reg_epoch;
+        } else {
+            self.paint_incremental_frames = self.paint_incremental_frames.saturating_add(1);
+        }
+    }
+
+    /// 本帧没有跑 paint 遍历（a11y-only / 纯滚动快路径早期返回）：本帧访问数归零。
+    pub(crate) fn reset_paint_visited(&mut self) {
+        self.paint_visited = 0;
+    }
+
+    /// 记一次「增量路径用轻量 DFS 重建绘制序」（`rebuild_order_only` 的计数）。
+    pub(crate) fn note_order_rebuild(&mut self) {
+        self.paint_order_rebuilds = self.paint_order_rebuilds.saturating_add(1);
+    }
+
+    /// 快照本帧的 `PAINT` 脏节点（**不**清空集合；消费方必须 `recycle` 归还缓冲）。
+    ///
+    /// 与其它 `take_*` 一致：把条目记进 `test-support` 的 `scanned_nodes`（它们是引擎簿记
+    /// 访问过的节点），但**不**把闭包祖先算进去 —— 闭包规模由
+    /// [`PaintCounters::visited_nodes`] 单独观测。
+    pub(crate) fn take_paint_work(&mut self) -> Vec<NodeId> {
+        let NodeTree {
+            dirty_scratch,
+            dirty_paint,
+            ..
+        } = self;
+        let mut out = std::mem::take(dirty_scratch);
+        dirty_paint.snapshot_into(&mut out);
+        #[cfg(feature = "test-support")]
+        for node in &out {
+            self.note_scanned(*node);
+        }
+        out
+    }
+
+    /// 从脏节点集合向 root 走，标记**祖先闭包**（含自身；重复命中即停）。
+    ///
+    /// 复杂度 O(脏 × 树深)，与节点总数无关。用代次戳记（`paint_marks` / `paint_epoch`）：
+    /// 每帧只递增代次，不付 O(N) 清表成本。
+    pub(crate) fn mark_paint_closure(&mut self, dirty: &[NodeId]) {
+        self.paint_epoch = self.paint_epoch.wrapping_add(1);
+        if self.paint_epoch == 0 {
+            // u32 回绕（约 43 亿帧一次）：清表后从 1 重新开始，代价可忽略。
+            self.paint_marks.fill(0);
+            self.paint_epoch = 1;
+        }
+        let epoch = self.paint_epoch;
+        for start in dirty.iter().copied() {
+            let mut cursor = Some(start);
+            while let Some(node) = cursor {
+                let index = node.index() as usize;
+                if self.paint_marks.len() <= index {
+                    self.paint_marks.resize(index + 1, 0);
+                }
+                if self.paint_marks[index] == epoch {
+                    break;
+                }
+                self.paint_marks[index] = epoch;
+                cursor = self.arena.get(node).and_then(|target| target.parent);
+            }
+        }
+    }
+
+    /// 该节点是否在本帧的脏闭包内（`mark_paint_closure` 之后有效；`0` 代次恒为假）。
+    #[must_use]
+    pub(crate) fn paint_marked(&self, node: NodeId) -> bool {
+        self.paint_epoch != 0
+            && self
+                .paint_marks
+                .get(node.index() as usize)
+                .is_some_and(|stamp| *stamp == self.paint_epoch)
+    }
+
+    /// 强制下一次 paint 走全量路径（仅 `test-support`：oracle 的「全量」对照路径）。
+    ///
+    /// 与 [`NodeTree::force_repaint_all`] 的区别：这里**只**改帧分类，不把节点塞进脏集合 ——
+    /// 差分 oracle 因此能比较「同一脏集合、同一状态」下的增量与全量产物的逐字段一致性。
+    #[cfg(feature = "test-support")]
+    pub(crate) fn force_full_paint(&mut self) {
+        self.force_full_paint = true;
+    }
+
+    /// 全量 paint 入口：作废全部节点的滚动槽缓存（隐藏 / 未访问节点因此必须重新分配）。
+    pub(crate) fn begin_full_scroll_slots(&mut self) {
+        self.scroll_slot_of.fill(0);
+    }
+
+    /// 节点的缓存滚动槽（`0` = 未分配）。
+    #[must_use]
+    pub(crate) fn scroll_slot_cached(&self, node: NodeId) -> u32 {
+        self.scroll_slot_of
+            .get(node.index() as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// 写节点的缓存滚动槽（全量稠密编号 / 增量追加新槽时写入）。
+    pub(crate) fn set_scroll_slot(&mut self, node: NodeId, slot: u32) {
+        let index = node.index() as usize;
+        if self.scroll_slot_of.len() <= index {
+            self.scroll_slot_of.resize(index + 1, 0);
+        }
+        self.scroll_slot_of[index] = slot;
+    }
+
     /// 本帧是否有待重算动态属性的节点（O(1)；`needs_frame` 的门禁）。
     #[must_use]
     pub(crate) fn has_bind_work(&self) -> bool {

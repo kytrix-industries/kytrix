@@ -703,8 +703,11 @@ mod tests {
         assert!(!app.frame_record().damage.is_empty());
     }
 
+    /// A1（脏子树剪枝）之后 `PaintLog` 只记录**被访问**的 lane：第二帧的脏闭包只有绑定节点
+    /// 及其祖先链，未变化的兄弟子树整棵跳过。语义从「未变化节点必须复用 lane」收敛为
+    /// 「未变化节点不被访问、被访问且未重建的 lane 全部复用」。
     #[test]
-    fn second_drain_reuses_lanes() {
+    fn second_drain_visits_only_the_changed_closure() {
         let mut app = TestApp::new();
         let window = app.window_id();
         let root = app.app().window(window).expect("窗口").tree().root();
@@ -720,24 +723,35 @@ mod tests {
                 .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
                 .expect("挂载");
         }
-        let _ = mount_painted(&mut app, "b");
+        let static_node = mount_painted(&mut app, "b");
         let _ = app.drain().expect("首帧");
 
         app.app_mut().write(&color, Color::BLACK);
         let record = app.drain().expect("第二帧").clone();
         assert!(record.rendered);
         assert!(
+            !record
+                .paint_log
+                .lanes
+                .iter()
+                .any(|entry| entry.node == static_node),
+            "未变化的兄弟节点不得被访问（脏子树剪枝）：{:?}",
+            record.paint_log
+        );
+        assert!(
+            !record.dirty_nodes.contains(&static_node),
+            "未变化的兄弟节点不得被重建：{:?}",
+            record.dirty_nodes
+        );
+        assert!(
             record
                 .paint_log
                 .lanes
                 .iter()
-                .any(|entry| entry.outcome == LaneOutcome::Reused),
-            "未变化的节点必须复用 lane：{:?}",
+                .all(|entry| entry.outcome == LaneOutcome::Reused
+                    || record.dirty_nodes.contains(&entry.node)),
+            "被访问的 lane 中，未重建者必须整桶复用：{:?}",
             record.paint_log
-        );
-        assert!(
-            record.dirty_nodes.len() < record.paint_log.lanes.len(),
-            "只有被改动的节点计入 dirty"
         );
     }
 

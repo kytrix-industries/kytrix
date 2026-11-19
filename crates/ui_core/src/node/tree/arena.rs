@@ -99,6 +99,18 @@ pub(crate) fn new() -> NodeTree {
         invalid_measure: None,
         geometry_damage_escalation: false,
         geometry_transforms: ahash::HashMap::default(),
+        paint_marks: vec![0],
+        paint_epoch: 0,
+        scroll_slot_of: vec![0],
+        structure_epoch: 0,
+        painted_structure_epoch: 0,
+        scroll_reg_epoch: 0,
+        painted_scroll_reg_epoch: 0,
+        force_full_paint: false,
+        paint_visited: 0,
+        paint_order_rebuilds: 0,
+        paint_full_frames: 0,
+        paint_incremental_frames: 0,
         dirty_scratch: Vec::new(),
         #[cfg(feature = "test-support")]
         scanned: std::cell::RefCell::new(ahash::HashSet::default()),
@@ -270,6 +282,15 @@ pub(crate) fn insert_child(
         tree.clip_keys.resize_with(index + 1, || None);
     }
     tree.clip_keys[index] = None;
+    // A1：槽位复用不得继承上一代节点的 paint 剪枝侧表（闭包戳记 / 滚动槽缓存）。
+    if tree.paint_marks.len() <= index {
+        tree.paint_marks.resize(index + 1, 0);
+    }
+    tree.paint_marks[index] = 0;
+    if tree.scroll_slot_of.len() <= index {
+        tree.scroll_slot_of.resize(index + 1, 0);
+    }
+    tree.scroll_slot_of[index] = 0;
     if tree.subtree_bounds.len() <= index {
         tree.subtree_bounds.resize_with(index + 1, Rect::default);
     }
@@ -412,6 +433,12 @@ pub(crate) fn remove(
         }
         if let Some(slot) = tree.clip_keys.get_mut(index) {
             *slot = None;
+        }
+        if let Some(slot) = tree.paint_marks.get_mut(index) {
+            *slot = 0;
+        }
+        if let Some(slot) = tree.scroll_slot_of.get_mut(index) {
+            *slot = 0;
         }
         if let Some(slot) = tree.a11y_slots.get_mut(index) {
             *slot = None;

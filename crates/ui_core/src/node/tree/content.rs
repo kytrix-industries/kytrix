@@ -640,6 +640,9 @@ pub(crate) fn set_reusable(tree: &mut NodeTree, node: NodeId) {
 /// `needs_node_repaint`（O(1) 门禁）看不到工作 ⇒ 帧被判空闲（旧实现靠全树扫描才发现）。
 #[cfg(feature = "test-support")]
 pub(crate) fn force_repaint_all(tree: &mut NodeTree) {
+    // A1：oracle 的「全量」路径必须真的走**全量遍历**（而不是把每个节点都塞进脏闭包让增量
+    // 路径“看起来一样”）：绘制序 / 滚动槽编号都要按全量语义重建。
+    tree.force_full_paint();
     let mut ids: Vec<NodeId> = Vec::new();
     tree.for_each_dfs(|id| ids.push(id));
     for id in ids {

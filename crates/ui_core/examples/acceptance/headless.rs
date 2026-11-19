@@ -45,9 +45,70 @@ struct Scenario {
     frame: Samples,
     total: Samples,
     idle_frames: usize,
+    /// A1（paint 脏子树剪枝）的确定性计数：默认构建也打印（`Window::tree()` 是公开只读面）。
+    paint: PaintProbe,
     /// 本场景的 `FrameRecord` 计数区间（仅 test-support 构建）。
     #[cfg(feature = "test-support")]
     counters: Counters,
+}
+
+/// paint 剪枝的观测值（每帧访问数区间 + 累计路径计数）。
+///
+/// 与 [`Counters`]（仅 `test-support`）不同：这里没有 test-support 依赖，因此**默认特性**构建的
+/// 性能报告也能证明「本帧走的是增量路径」。
+#[derive(Clone, Copy, Debug)]
+struct PaintProbe {
+    /// 每帧 `visited_nodes` 的 [min, max]。
+    visited: (usize, usize),
+    /// 相对本场景起点的累计全量 / 增量帧数。
+    full_frames: u64,
+    incremental_frames: u64,
+    /// 相对本场景起点的绘制序兜底次数（增量路径回退率）。
+    order_rebuilds: u64,
+    /// 场景起点时的累计计数器快照。
+    start: Option<ui_core::node::tree::PaintCounters>,
+}
+
+impl PaintProbe {
+    fn new() -> Self {
+        Self {
+            visited: (usize::MAX, 0),
+            full_frames: 0,
+            incremental_frames: 0,
+            order_rebuilds: 0,
+            start: None,
+        }
+    }
+
+    fn observe(&mut self, app: &App, window: WindowId) {
+        let Some(target) = app.window(window) else {
+            return;
+        };
+        let counters = target.tree().paint_counters();
+        let start = *self.start.get_or_insert(counters);
+        self.visited.0 = self.visited.0.min(counters.visited_nodes);
+        self.visited.1 = self.visited.1.max(counters.visited_nodes);
+        self.full_frames = counters.full_frames.saturating_sub(start.full_frames);
+        self.incremental_frames = counters
+            .incremental_frames
+            .saturating_sub(start.incremental_frames);
+        self.order_rebuilds = counters.order_rebuilds.saturating_sub(start.order_rebuilds);
+    }
+
+    fn line(&self, name: &str) -> String {
+        if self.visited.0 == usize::MAX {
+            return format!("{name}: paint (no frame)");
+        }
+        format!(
+            "{name}: paint visited_nodes=[{}, {}] full_frames=+{} incremental_frames=+{} \
+             order_rebuilds=+{}",
+            self.visited.0,
+            self.visited.1,
+            self.full_frames,
+            self.incremental_frames,
+            self.order_rebuilds,
+        )
+    }
 }
 
 /// `FrameRecord` 计数的最小 / 最大值（确定性断言面）。
@@ -162,6 +223,7 @@ impl Scenario {
             frame: Samples::new(format!("{name} · 帧内 CPU"), capacity),
             total: Samples::new(format!("{name} · 合计"), capacity),
             idle_frames: 0,
+            paint: PaintProbe::new(),
             #[cfg(feature = "test-support")]
             counters: Counters::new(),
         }
@@ -289,6 +351,7 @@ pub fn run(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
         if scenario.idle_frames > 0 {
             println!("  警告：{} 帧退化为 Idle", scenario.idle_frames);
         }
+        println!("{}", scenario.paint.line(scenario.name));
         #[cfg(feature = "test-support")]
         println!("{}", scenario.counters.line(scenario.name));
     }
@@ -361,6 +424,7 @@ fn measure(
     scenario.update.push(update_time);
     scenario.frame.push(frame_time);
     scenario.total.push(update_time + frame_time);
+    scenario.paint.observe(app, window);
     #[cfg(feature = "test-support")]
     scenario.counters.observe(app, window);
     if raw {

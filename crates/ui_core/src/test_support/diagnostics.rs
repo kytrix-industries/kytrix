@@ -824,6 +824,7 @@ mod tests {
                 PhysicalRect::new(0, 0, 4, 4),
             ],
             damage_full: false,
+            delta: crate::test_support::record::DeltaRecord::default(),
             scanned_nodes: 0,
             dirty_nodes: Vec::new(),
             repainted: true,
