@@ -80,9 +80,38 @@ impl FontKey {
     }
 }
 
+/// swash 的字体身份：**稳定缓存键** + TTC 内偏移。
+///
+/// `swash::FontRef::from_index` 每次调用都会生成一个新的 `CacheKey`（内部原子计数器自增），
+/// 把它直接交给 `ScaleContext::builder` 会让 FontCache 的命中率恒为 0：每个字形都重建
+/// `ScalerProxy`（metrics / COLR / bitmap strikes / 可变字体轴解析）。swash 文档推荐的用法是
+/// 「由调用方持有字体数据与身份，按需用公开字段重建 `FontRef`」；这里把 `from_index` 的解析
+/// 结果缓存在 [`FontEntry`] 里，光栅时直接拼装 `FontRef { data, offset, key }`。
+#[derive(Clone, Copy)]
+struct SwashFont {
+    offset: u32,
+    key: swash::CacheKey,
+}
+
 /// 一个字体条目：**持有 `FontData` 的 clone（Blob 是 `Arc`）**，从而 pin 住 `FontKey::ptr`。
+///
+/// `swash` 是 `from_index` 的一次性解析结果；`None` = 字体数据坏（构造不出 `FontRef`），
+/// 光栅直接返回 `None`。
 struct FontEntry {
     font: parley::FontData,
+    swash: Option<SwashFont>,
+}
+
+impl FontEntry {
+    /// 用缓存的稳定身份重建 `FontRef`（swash 文档的「自有 Font 结构」用法）。
+    fn swash_font(&self) -> Option<swash::FontRef<'_>> {
+        let swash = self.swash?;
+        Some(swash::FontRef {
+            data: self.font.data.data(),
+            offset: swash.offset,
+            key: swash.key,
+        })
+    }
 }
 
 /// 一张光栅化后的字形位图（覆盖度，**不含**图集 padding）。
@@ -188,7 +217,9 @@ pub(crate) struct GlyphRasterizer {
 impl GlyphRasterizer {
     pub(crate) fn new() -> Self {
         Self {
-            ctx: ScaleContext::new(),
+            // 默认的 8 个缓存位在 CJK fallback 链 + 多字号下会 LRU 抖动（命中率修复后每个
+            // 条目才真正复用）；16 位内存代价是每字体几百字节。
+            ctx: ScaleContext::with_max_entries(16),
             fonts: ahash::HashMap::default(),
             font_epoch: 1,
         }
@@ -232,13 +263,18 @@ impl GlyphRasterizer {
         }
         let key = FontKey::of(font, self.font_epoch);
         let Self { ctx, fonts, .. } = self;
-        let entry = fonts
-            .entry(key)
-            .or_insert_with(|| FontEntry { font: font.clone() });
+        let entry = fonts.entry(key).or_insert_with(|| FontEntry {
+            font: font.clone(),
+            // 只在首次见到该字体时解析一次：`CacheKey` 必须跨光栅复用（见 `SwashFont`）。
+            swash: swash::FontRef::from_index(font.data.data(), font.index as usize).map(|font| {
+                SwashFont {
+                    offset: font.offset,
+                    key: font.key,
+                }
+            }),
+        });
         // 借用 self.fonts 的条目（pin 住 blob）与 self.ctx 是互不重叠的字段借用。
-        let bytes = entry.font.data.data();
-        let index = entry.font.index as usize;
-        let swash_font = swash::FontRef::from_index(bytes, index)?;
+        let swash_font = entry.swash_font()?;
         // hinting 关闭（见模块文档）：Skia/Chrome 默认只用亚像素定位，不按整数 ppem 重排笔画。
         let mut builder = ctx.builder(swash_font).size(ppem).hint(HINTING);
         if !variation.is_identity() {
@@ -287,6 +323,19 @@ impl GlyphRasterizer {
     #[cfg(test)]
     pub(crate) fn cached_fonts(&self) -> usize {
         self.fonts.len()
+    }
+
+    /// 仅测试：该字体当前用于 `ScaleContext` 缓存的 swash 键（`None` = 尚未 pin / 数据坏）。
+    ///
+    /// 取的是**光栅路径实际传给 `builder` 的 `FontRef.key`**，因此能钉住「同一字体跨光栅
+    /// 使用同一个 key」这一不变量（旧的每字形 `from_index` 实现每次都会换 key）。
+    #[cfg(test)]
+    pub(crate) fn swash_cache_key(&self, font: &parley::FontData) -> Option<u64> {
+        let key = FontKey::of(font, self.font_epoch);
+        self.fonts
+            .get(&key)
+            .and_then(FontEntry::swash_font)
+            .map(|font| font.key.value())
     }
 }
 
@@ -664,6 +713,82 @@ mod tests {
             raster.cached_fonts(),
             0,
             "epoch bump drops all pinned fonts"
+        );
+    }
+
+    /// P1（D-1）：同一字体在连续光栅之间必须使用**同一个** swash `CacheKey`。
+    ///
+    /// swash 的 `ScaleContext` 以 `FontRef.key` 为 FontCache 索引；`FontRef::from_index`
+    /// 每次调用都会生成新 key（`CacheKey` 内部原子计数器），旧的「每字形新建 FontRef」实现
+    /// 因此命中率恒 0、每字形重建 `ScalerProxy`。这里读取光栅路径实际使用的 key：
+    /// 两次（不同 ppem/相位）必须相同；同时对照一个全新 `from_index` 的 key 必须不同，
+    /// 证明断言不是恒等式。
+    #[test]
+    fn font_ref_key_is_stable_across_rasters() {
+        let Some(font) = probe_font() else {
+            eprintln!("skip: no system font available");
+            return;
+        };
+        let Some(glyph) = first_glyph(&font, 'A') else {
+            eprintln!("skip: no 'A' glyph in the first system font");
+            return;
+        };
+        let mut raster = GlyphRasterizer::new();
+        let logical = GlyphVariation::default();
+        raster
+            .rasterize(&font, u32::from(glyph), 16.0, 0, &logical)
+            .expect("first rasterize");
+        let first = raster
+            .swash_cache_key(&font)
+            .expect("font must be pinned after rasterize");
+        raster
+            .rasterize(&font, u32::from(glyph), 18.0, 2, &logical)
+            .expect("second rasterize");
+        let second = raster
+            .swash_cache_key(&font)
+            .expect("font must still be pinned");
+
+        assert_eq!(
+            first, second,
+            "同一字体的所有字形必须共享一个 swash CacheKey（否则 FontCache 恒 miss）"
+        );
+        let fresh = swash::FontRef::from_index(font.data.data(), font.index as usize)
+            .expect("probe font must be a valid swash font")
+            .key
+            .value();
+        assert_ne!(
+            fresh, second,
+            "from_index 每次生成新 key —— 这正是修复前每字形重建 ScalerProxy 的根因"
+        );
+    }
+
+    /// P1（D-1）：字体换代必须换 swash key，旧 `ScalerProxy` 不得跨代际复用。
+    #[test]
+    fn font_epoch_changes_the_swash_key() {
+        let Some(font) = probe_font() else {
+            eprintln!("skip: no system font available");
+            return;
+        };
+        let Some(glyph) = first_glyph(&font, 'A') else {
+            eprintln!("skip: no 'A' glyph in the first system font");
+            return;
+        };
+        let mut raster = GlyphRasterizer::new();
+        raster
+            .rasterize(&font, u32::from(glyph), 16.0, 0, &GlyphVariation::default())
+            .expect("first rasterize");
+        let before = raster.swash_cache_key(&font).expect("pinned");
+
+        let next_epoch = raster.font_epoch() + 1;
+        raster.set_font_epoch(next_epoch);
+        raster
+            .rasterize(&font, u32::from(glyph), 16.0, 0, &GlyphVariation::default())
+            .expect("rasterize after epoch bump");
+        let after = raster.swash_cache_key(&font).expect("pinned again");
+
+        assert_ne!(
+            before, after,
+            "字体换代后必须使用新的 swash CacheKey，避免跨字体复用 ScalerProxy"
         );
     }
 
