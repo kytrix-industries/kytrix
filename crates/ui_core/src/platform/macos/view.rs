@@ -10,6 +10,9 @@
 //!   决定（R09-2：那会让日文/韩文再変換、Shift 临时切换丢字串字）。
 //! - **`Text` 抑制与提交去重是按键作用域状态**（R09-3）：`keyDown:` 开一个作用域，`insertText:`
 //!   只在作用域内记账；作用域外（鼠标点候选窗、听写、表情面板）的提交**不会**影响下一次按键。
+//! - **裸 `Key` 在组合期不可见**（B4）：判定由平台无关的 `platform::ime::key_visible` 统一
+//!   给出，与 Win32 的 `VK_PROCESSKEY` 过滤对齐 —— 组合中 / 被输入法消费的按键不投递，
+//!   带 Cmd/Ctrl/Option 的命令组合始终投递（见 `key_down` / `key_up`）。
 
 use std::{
     cell::{Cell, RefCell},
@@ -40,7 +43,7 @@ use crate::{
     math::{Point, Rect},
     paint::style::Cursor,
     platform::{
-        ime::{CommitVerdict, KeyScopeToken, replacement_range},
+        ime::{CommitVerdict, KeyScopeToken, key_visible, replacement_range},
         macos::{a11y::MacA11y, ime::ImeState, menu},
         menu::{EditAvailability, MenuCommand},
     },
@@ -127,14 +130,24 @@ define_class!(
                 let ime = ivars.ime.borrow();
                 (ime.has_marked(), ime.takes_text(token))
             };
-            // `Key` **永不**被 IME 抑制：快捷键要能看到物理按键（与 Win32 一致）。
-            self.push_event(Event::Input(InputEvent::Key {
-                code: key_code(event.keyCode()),
-                state: KeyState::Down,
-                repeat,
-                modifiers,
-                timestamp,
-            }));
+            // B4：`Key` 的可见性与 Win32 的 `VK_PROCESSKEY` 过滤对齐（三端共用
+            // `platform::ime::key_visible`）：
+            // - 组合期（`hasMarkedText`）或被输入上下文消费的按键**不投递**裸 `Key` —— 拼音/
+            //   日语组合中的 B/S/数字若同时被应用看到，就会命中裸键绑定（下单误触级别）；
+            // - 带 Cmd/Ctrl/Option 的命令组合**始终投递**：`Cmd+C` / `Cmd+W` 不能被吞；
+            //   AppKit 的菜单键等价在 `keyDown:` 之前处理，物理按键照常投递不会二次触发
+            //   菜单动作。Shift 不算命令修饰键（`Shift+字母` 是正常上屏输入）。
+            let command_modifiers =
+                modifiers.intersects(Modifiers::CONTROL | Modifiers::ALT | Modifiers::META);
+            if key_visible(ime_handled, composing, command_modifiers) {
+                self.push_event(Event::Input(InputEvent::Key {
+                    code: key_code(event.keyCode()),
+                    state: KeyState::Down,
+                    repeat,
+                    modifiers,
+                    timestamp,
+                }));
+            }
             // `Text` 只在「本按键的正文没被 IME 交付」时才发，避免与 `ImeEvent::Commit` 重复插入。
             // 判据与 Linux 的 XKB 回退通路共用 `should_emit_text`（含「重复不得抑制文本」的回归）。
             if should_emit_text(
@@ -163,14 +176,23 @@ define_class!(
             if let Some(context) = self.inputContext() {
                 context.handleEvent(event);
             }
-            self.push_event(Event::Input(InputEvent::Key {
-                code: key_code(event.keyCode()),
-                state: KeyState::Up,
-                // 抬起没有重复语义。
-                repeat: false,
-                modifiers: self.modifiers(),
-                timestamp: event_timestamp(event),
-            }));
+            // B4：抬起遵循与按下相同的组合期判定（组合中不投递裸 `Key`，命令修饰键仍投递）。
+            // 这里**不**把 `handleEvent:` 的返回值当「被消费」信号：它只对按下有意义，而一个
+            // 被吞掉的 up 会让应用 `held_keys` 永久卡住（up 只负责清除按下状态）。
+            let modifiers = self.modifiers();
+            let composing = self.ivars().ime.borrow().has_marked();
+            let command_modifiers =
+                modifiers.intersects(Modifiers::CONTROL | Modifiers::ALT | Modifiers::META);
+            if key_visible(false, composing, command_modifiers) {
+                self.push_event(Event::Input(InputEvent::Key {
+                    code: key_code(event.keyCode()),
+                    state: KeyState::Up,
+                    // 抬起没有重复语义。
+                    repeat: false,
+                    modifiers,
+                    timestamp: event_timestamp(event),
+                }));
+            }
         }
 
         #[unsafe(method(flagsChanged:))]
