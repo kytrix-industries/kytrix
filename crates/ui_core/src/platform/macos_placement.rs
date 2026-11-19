@@ -32,10 +32,10 @@ use crate::math::{Point, Size};
 /// AppKit 全局坐标下的矩形（**point**；左下原点、y 向上）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Area {
-    pub(crate) x: f64,
-    pub(crate) y: f64,
-    pub(crate) width: f64,
-    pub(crate) height: f64,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
 }
 
 impl Area {
@@ -46,6 +46,13 @@ impl Area {
             width,
             height,
         }
+    }
+
+    /// 左边界（AppKit 的 x）。真机侧（`platform::macos::window`）读，测试构建下的纯逻辑
+    /// 单测不消费它，因此按 macOS 门控避免 Windows 测试构建出现死代码。
+    #[cfg(target_os = "macos")]
+    pub(crate) const fn x(self) -> f64 {
+        self.x
     }
 
     /// 右边界 / 上边界（AppKit 是 y 向上，所以 `max_y` 是屏幕顶部）。
@@ -80,17 +87,32 @@ impl Area {
 /// 菜单栏 / Dock / 刘海）决定窗口 clamp 的工作区。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ScreenArea {
-    pub(crate) frame: Area,
-    pub(crate) visible: Area,
+    frame: Area,
+    visible: Area,
+}
+
+impl ScreenArea {
+    /// 真机侧构造（`platform::macos::window::screen_areas`）。测试构建的纯逻辑单测与被测
+    /// 函数同模块，直接写字面量即可，因此这里按 macOS 门控避免 Windows 测试构建死代码。
+    #[cfg(target_os = "macos")]
+    pub(crate) const fn new(frame: Area, visible: Area) -> Self {
+        Self { frame, visible }
+    }
+
+    /// 工作区矩形（`visibleFrame`，已扣掉菜单栏 / Dock / 刘海）。
+    #[cfg(target_os = "macos")]
+    pub(crate) const fn visible(self) -> Area {
+        self.visible
+    }
 }
 
 /// 引擎逻辑坐标 ⇄ AppKit 全局坐标的平移（虚拟桌面**内容区左上角**在 AppKit 空间中的位置）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Desktop {
     /// 最左屏幕的左边界（多屏时可为负）。
-    pub(crate) min_x: f64,
+    min_x: f64,
     /// 最高屏幕的上边界。
-    pub(crate) max_y: f64,
+    max_y: f64,
 }
 
 impl Desktop {

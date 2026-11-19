@@ -176,7 +176,7 @@ fn cascade_content_origin(
     };
     let main_visible = NSScreen::mainScreen(mtm)
         .map(|screen| ns_area(screen.visibleFrame()))
-        .unwrap_or(screens[0].visible);
+        .unwrap_or(screens[0].visible());
     let position = placement::cascade_position(desktop, main_visible, index);
     placement::content_origin_for_position(position, size, screens)
 }
@@ -499,7 +499,7 @@ impl NativeWindow {
         let content = self.content_rect_in_screen();
         let appkit_moved = self.delegate.take_moved();
         if appkit_moved
-            || (content.x - self.seen_content.x).abs() > 0.5
+            || (content.x() - self.seen_content.x()).abs() > 0.5
             || (content.max_y() - self.seen_content.max_y()).abs() > 0.5
         {
             self.seen_content = content;
