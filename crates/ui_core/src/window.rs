@@ -208,6 +208,12 @@ pub enum WindowResizeEdge {
 ///   完全由 compositor 决定，`Event::Moved` 在该端永不产生）；`min_size`/`max_size` 走
 ///   `xdg_toplevel.set_min_size/set_max_size` 的 compositor 提示语义（不保证被强制执行）。
 ///
+/// # 窗口层级（X1）
+///
+/// [`Self::owner`] / [`Self::modal`] / [`Self::always_on_top`] 表达窗口之间的层级关系
+/// （owned 窗口、owner 的模态窗口、置顶窗口）。三端能力不同（Wayland 没有 owner/模态/
+/// 置顶的跨合成器协议），每个字段的文档写明**原生路径与降级语义** —— 引擎不得静默忽略。
+///
 /// # Windows 标题栏 / 非客户区交互
 ///
 /// **非客户区全部交系统**（R07-2）：`WM_NCCALCSIZE` / `WM_NCHITTEST` / `WM_NCLBUTTONDOWN`
@@ -249,6 +255,47 @@ pub struct WindowOptions {
     pub min_size: Option<Size>,
     /// 客户区最大逻辑尺寸（`None` = 平台默认/不额外约束）；平台对应关系同 [`Self::min_size`]。
     pub max_size: Option<Size>,
+    /// 父/属主窗口（owner，X1）。`None` = 无属主的顶层独立窗口（默认）。
+    ///
+    /// owner 不是「客户区父子关系」：owned 窗口仍是顶层窗口，只是**永远位于 owner 之上**
+    /// （系统 z 序）、owner 最小化时一并隐藏/最小化、owner 销毁时 owned 窗口一并销毁。
+    /// 模态（[`Self::modal`]）要求 owner 存在。
+    ///
+    /// 三端语义（用户裁决 X1：无原生能力的端**必须写清降级**，不得静默忽略）：
+    /// - **Windows**：`CreateWindowExW` 的 `hWndParent`（owner 语义；不设 `WS_CHILD`）。
+    /// - **macOS**：`addChildWindow:ordered:`（child window / transient parent 语义）。
+    /// - **Linux/Wayland**：`xdg_toplevel.set_parent` 只是「transient for」提示（compositor
+    ///   可忽略、且无法表达「随 owner 最小化/销毁」），**降级**：仅提交 set_parent 提示，
+    ///   不保证 z 序或生命周期联动；文档与 `Event` 不假设 owner 语义成立。
+    ///
+    /// 生命周期：owner 必须已存在（同一 `App` 内先创建的窗口）。创建时 owner 不存在/已关闭
+    /// ⇒ 按 `None` 处理并写诊断（不 panic；与「窗口句柄永不复用」一致，陈旧 id 不会误绑新窗口）。
+    pub owner: Option<WindowId>,
+    /// 是否为 owner 的**模态**窗口（X1）。
+    ///
+    /// 模态窗口打开期间，所属 owner（及其拥有的其它窗口）**不接收输入**，直到模态窗口关闭。
+    /// 模态必须是 owned 窗口（[`Self::owner`] 为 `Some`）；`modal == true` 而 `owner == None`
+    /// ⇒ 降级为普通窗口并写诊断（不 panic）。
+    ///
+    /// 平台语义（用户裁决 X1）：
+    /// - **Windows**：原生路径 —— 打开时 `EnableWindow(owner, FALSE)` 禁用 owner（系统级输入
+    ///   拦截 + 灰显），关闭/销毁时恢复；同时引擎层按同一规则过滤（UI 线程兜底，防止
+    ///   DComp/自定义消息绕过）。
+    /// - **macOS**：引擎层模态（`App` 分发层按 owner 关系过滤输入）+ 模态窗口层级
+    ///   （`NSModalPanelWindowLevel` 可选项，不依赖 `runModalForWindow:` 同步嵌套循环 ——
+    ///   那会与引擎自己的事件泵重入）。
+    /// - **Linux/Wayland**：协议没有模态；引擎层模态（同 macOS），并 `set_parent` 提示
+    ///   compositor 置于 owner 之上。
+    ///
+    /// 模态窗口被关闭/否决关闭时语义：否决 = 保持模态；真正关闭 = 恢复 owner 输入。
+    pub modal: bool,
+    /// 是否置顶（always-on-top，X1）。
+    ///
+    /// - **Windows**：`WS_EX_TOPMOST`（`SetWindowPos(HWND_TOPMOST)`）；
+    /// - **macOS**：`NSFloatingWindowLevel` 窗口层级；
+    /// - **Linux/Wayland**：**没有跨合成器协议**（KDE plasma-shell / wlr-layer-shell 都不是
+    ///   xdg-shell 标准能力）⇒ 降级为无操作并在文档写明（应用不得假设置顶成立）。
+    pub always_on_top: bool,
     /// 初始 DPI 比例（由平台在 P12 传入；headless 默认 `Scale::ONE`）。
     pub scale: Scale,
     /// 窗口背景色：内容未覆盖区域的底色（持久目标 clear；Windows 另有独立背景层）。
@@ -285,6 +332,9 @@ impl Default for WindowOptions {
             position: None,
             min_size: None,
             max_size: None,
+            owner: None,
+            modal: false,
+            always_on_top: false,
             scale: Scale::ONE,
             background: Color::BLACK,
         }

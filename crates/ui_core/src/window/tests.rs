@@ -65,6 +65,9 @@ fn window_options_default_values() {
     );
     assert_eq!(options.min_size, None, "默认无最小尺寸约束");
     assert_eq!(options.max_size, None, "默认无最大尺寸约束");
+    assert_eq!(options.owner, None, "默认没有 owner（独立顶层窗口）");
+    assert!(!options.modal, "默认不是模态窗口");
+    assert!(!options.always_on_top, "默认不置顶");
     assert_eq!(options.scale, Scale::ONE);
     assert_eq!(
         options.background,
