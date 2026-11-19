@@ -69,11 +69,21 @@ impl FrameBudget {
     }
 
     /// 本帧是否放行：`forced`（force 通道）、门禁未启用、或已到下一拍。
+    ///
+    /// 相位带 **10% 周期的提前量**：平台唤醒 / 线程调度有 0.5–1.5 ms 抖动，严格相等会让
+    /// 「与刷新同频」的写入有一半落在 `next_allowed` 前几百微秒而被多合并整整一拍（实测
+    /// 60 Hz 写入掉到 ~41 fps）。提前量把稳态上限抬到 1.11×刷新率，但保证同频写入稳定
+    /// 60 fps；Chromium 的 BeginFrame 调度同样带 deadline 容差，Qt 的 `requestUpdate`
+    /// 也有 ~5 ms 合并窗口。
     pub(crate) fn admits(&self, now: Instant, forced: bool) -> bool {
-        if forced || self.interval.is_none() {
+        if forced {
             return true;
         }
-        self.next_allowed.is_none_or(|next| now >= next)
+        let Some(interval) = self.interval else {
+            return true;
+        };
+        self.next_allowed
+            .is_none_or(|next| now + interval / 10 >= next)
     }
 
     /// 放行一帧：记下本帧起点并推进下一拍；同时清掉「推迟未补」标记。

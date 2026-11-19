@@ -278,6 +278,15 @@ pub(super) struct FramePacer {
     thread: Option<JoinHandle<()>>,
     /// 启动线程时用的刷新周期：周期变了（换屏 / 改刷新率）就重启线程。
     interval: Duration,
+    /// 节拍线程最近一次唤醒是「tick」而不是普通 wake：泵用它决定本帧走 force 通道。
+    ///
+    /// 为什么 tick 要 force（A5 对齐）：数据泵以与刷新率相同的频率写状态时，预算门禁的
+    /// `next_allowed` 是「上一帧起点 + 1/refresh」，而数据泵/节拍线程的相位独立 ⇒ 总有请求
+    /// 落在 `next_allowed` 前几百微秒，被推迟到**下一个节拍**（多等一整拍，实测 60 Hz 写入
+    /// 掉到 ~40 fps）。节拍线程的 tick 本身就是「这一拍该出帧」的信号（与 mac display link
+    /// tick 同义），走 force 既保证每拍一帧、又不会超过 refresh 节拍（节拍线程只在
+    /// 动画/有推迟帧时存在）。普通 wake（输入/行情写入）仍走预算门禁。
+    tick: Arc<AtomicBool>,
 }
 
 impl FramePacer {
@@ -286,6 +295,7 @@ impl FramePacer {
             stop: Arc::new(AtomicBool::new(false)),
             thread: None,
             interval: FALLBACK_PACE,
+            tick: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -300,13 +310,21 @@ impl FramePacer {
         }
         self.shutdown();
         let stop = Arc::new(AtomicBool::new(false));
+        let tick = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
+        let thread_tick = Arc::clone(&tick);
         let thread_dispatcher = Arc::clone(dispatcher);
         self.thread = Some(std::thread::spawn(move || {
-            pace(thread_stop, interval, thread_dispatcher);
+            pace(thread_stop, thread_tick, interval, thread_dispatcher);
         }));
         self.stop = stop;
+        self.tick = tick;
         self.interval = interval;
+    }
+
+    /// 取走「本轮流唤醒来自节拍线程」的标记（泵在 ④ 的帧门禁里用它选择 force 通道）。
+    pub(super) fn take_tick(&self) -> bool {
+        self.tick.swap(false, Ordering::AcqRel)
     }
 
     /// 停止并 join（`Drop` 也会调）。
@@ -318,6 +336,7 @@ impl FramePacer {
             let _ = thread.join();
         }
         self.interval = FALLBACK_PACE;
+        self.tick.store(false, Ordering::Release);
     }
 }
 
@@ -338,7 +357,12 @@ impl Drop for FramePacer {
 /// 每 `interval` 唤醒一次泵（`Dispatcher::wake` 是电平信号，天然合并）。被抢占 / 系统睡眠恢复
 /// 之后**重新对齐相位**而不是补拍：补拍会在恢复瞬间产生一串连续唤醒（忙循环），而少掉的动画
 /// tick 只意味着动画按真实时间前进（`tick_animations` 用真实时钟），不会卡住。
-fn pace(stop: Arc<AtomicBool>, interval: Duration, dispatcher: Arc<Dispatcher>) {
+fn pace(
+    stop: Arc<AtomicBool>,
+    tick: Arc<AtomicBool>,
+    interval: Duration,
+    dispatcher: Arc<Dispatcher>,
+) {
     let interval = interval.clamp(
         Duration::from_millis(1),
         Duration::from_millis(MAX_PACE_WAIT_MS),
@@ -367,6 +391,8 @@ fn pace(stop: Arc<AtomicBool>, interval: Duration, dispatcher: Arc<Dispatcher>) 
         if next <= now {
             next = now + interval;
         }
+        // 先置 tick 再唤醒：泵在 ④ 读到标记时本轮的 wake 位一定已置起（Release/Acquire 配对）。
+        tick.store(true, Ordering::Release);
         dispatcher.wake();
     }
 }
@@ -767,9 +793,11 @@ pub(super) fn pump_loop(
             let mut app = app_cell.borrow_mut();
             app.run_frame_hook();
         }
+        // 本轮唤醒是否来自节拍线程的 tick：tick 帧走 force 通道（见 `FramePacer::tick` 的文档）。
+        let tick = pacer.take_tick();
         if dispatcher.take_frame_wake() {
             let mut app = app_cell.borrow_mut();
-            frame_all(&mut app, windows)?;
+            frame_all(&mut app, windows, tick)?;
         }
 
         // ④a 帧预算推迟的一次性唤醒（A5）：帧被预算门禁推迟时，泵不能阻塞在 `GetMessageW`
@@ -874,9 +902,22 @@ pub(super) fn retarget_wake(windows: &[NativeWindow], dispatcher: &Arc<Dispatche
 /// 消费者：`pump_loop` 的 ④ 帧步骤。
 ///
 /// 逐窗口提交一帧；`Err` 立刻终止（device lost / swapchain 失败都不可重试）。
-pub(super) fn frame_all(app: &mut App, windows: &[NativeWindow]) -> Result<(), EngineError> {
+///
+/// `force` = 本轮由节拍线程 tick 驱动（动画 / 帧预算推迟的一次性唤醒）：走 force 通道绕过
+/// 「每 refresh 最多一帧」的预算门禁 —— tick 本身就是「这一拍该出帧」的信号；普通 wake 仍走
+/// 预算。与 macOS `frame_all` 的 `force` 同义。
+pub(super) fn frame_all(
+    app: &mut App,
+    windows: &[NativeWindow],
+    force: bool,
+) -> Result<(), EngineError> {
     for native in windows {
-        match app.frame(native.id()) {
+        let outcome = if force {
+            app.frame_forced(native.id())
+        } else {
+            app.frame(native.id())
+        };
+        match outcome {
             None => {}
             Some(Ok(_)) => {}
             Some(Err(error)) => return Err(error),

@@ -121,7 +121,7 @@ struct OutputEntry {
 
 /// `wl_output.mode.refresh`（**mHz**）→ 刷新率提示（Hz）。0 / 非正值 = 未知。
 fn refresh_hz_from_millihz(refresh_mhz: i32) -> Option<f32> {
-    (refresh_mhz > 0).then(|| refresh_mhz as f32 / 1000.0)
+    (refresh_mhz > 0).then_some(refresh_mhz as f32 / 1000.0)
 }
 
 /// 整数回退的 scale 选择（纯函数，便于单测；V-110）。

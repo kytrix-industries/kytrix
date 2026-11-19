@@ -614,9 +614,10 @@ impl Window {
     ///
     /// 已被历史窗口挤掉的帧直接忽略（不会伪造；验收侧有各自的「已结算」口径）。
     ///
-    /// 只在 Linux 生产构建与测试构建里存在：其它平台的 `presented_at` 在反馈发布时已是终值
-    /// （Windows 帧统计 / macOS tick 推断），没有异步回填路径。
-    #[cfg(any(target_os = "linux", test))]
+    /// **仅测试构建**：A4 的 Linux 平台接线（`wp_presentation` 全局绑定 / present 前 feedback
+    /// 请求 / Dispatch 回填）是明确登记的降级项（见 `.review/p1-a-impl.md`），生产路径如实
+    /// `presented_at = None`；接线启用时把本方法改回 `cfg(any(target_os = "linux", test))`。
+    #[cfg(test)]
     pub(crate) fn note_frame_presented(
         &mut self,
         index: FrameIndex,

@@ -23,6 +23,10 @@
 
 #[cfg(any(target_os = "macos", test))]
 use std::collections::VecDeque;
+/// 时间类型只在 Windows（帧统计换算）/ macOS（display link 推断）生产构建与所有平台测试
+/// 构建里使用；Linux 生产构建的呈现接线是 A4 登记的降级项（`presented_at = None`），
+/// 不能留下未使用的 import（clippy -D warnings）。
+#[cfg(any(windows, target_os = "macos", test))]
 use std::time::{Duration, Instant};
 
 #[cfg(any(target_os = "macos", test))]
@@ -31,7 +35,7 @@ use crate::render::{
     frame::{FrameFeedback, MAX_FRAMES_IN_FLIGHT},
     timer::GpuTimerSample,
 };
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", test))]
 use crate::window::FrameIndex;
 
 /// display link 的空闲滞回窗口（R06-8）。
@@ -169,6 +173,11 @@ pub(crate) fn presentation_instant(
 ///
 /// 因此它**永远不是真实上屏时刻**，只是「真实时刻 − [0, 1 vsync]」的**下界**；对外契约
 /// （[`FrameFeedback::presented_at`]）的措辞必须按这个语义使用。`None` 原样透传。
+///
+/// **cfg 说明**：Linux 生产构建的呈现反馈接线是 A4 登记的降级项（生产 `presented_at=None`），
+/// 因此该函数只在 Windows（帧统计路径）/ macOS（tick 推断）生产构建与所有平台的测试构建里
+/// 存在，避免 Linux 生产构建出现未使用代码。
+#[cfg(any(windows, target_os = "macos", test))]
 pub(crate) fn clamp_presented_at(
     presented: Option<Instant>,
     completed_at: Instant,
@@ -294,7 +303,7 @@ pub(crate) fn presented_qpc_from_frame_statistics(
 ///
 /// `presented` 事件在 vblank 之后几微秒~几毫秒到达；超过 1 秒说明时钟域选错或
 /// `clock_gettime` 读数异常（`CLOCK_REALTIME` 被 NTP 步进时也会出现），按「拿不到」处理。
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 const MAX_PRESENTATION_DELTA_SECS: f64 = 1.0;
 
 /// wp_presentation 认可的 POSIX `clockid_t`：`CLOCK_REALTIME` / `CLOCK_MONOTONIC`。
@@ -304,10 +313,10 @@ const MAX_PRESENTATION_DELTA_SECS: f64 = 1.0;
 /// `CLOCK_MONOTONIC`；`CLOCK_REALTIME` 只在旧实现里出现，换算方式相同（真正保证正确性的是用
 /// **同一时钟域**的 `clock_gettime` 与 `Instant::now()` 取锚点，见 [`presented_event_instant`]）。
 /// 其余时钟域（`MONOTONIC_RAW` / `BOOTTIME` 等）一律拒绝：它们与 `Instant` 的时基关系没有保证。
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 pub(crate) const CLOCK_REALTIME: i32 = 0;
 /// 见 [`CLOCK_REALTIME`]；绝大多数 compositor 的 presentation clock。
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 pub(crate) const CLOCK_MONOTONIC: i32 = 1;
 
 /// `(tv_sec_hi, tv_sec_lo, tv_nsec)` + 呈现时钟 → `Instant`。
@@ -321,7 +330,7 @@ pub(crate) const CLOCK_MONOTONIC: i32 = 1;
 ///
 /// 与 `completed_at` 的关系不是本函数职责：发布前由调用方经 [`clamp_presented_at`] 收口
 /// （真实呈现时刻 ≥ GPU 完成时刻，映射误差只允许把它推早）。
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 pub(crate) fn presented_event_instant(
     tv_sec_hi: u32,
     tv_sec_lo: u32,
@@ -353,7 +362,7 @@ pub(crate) fn presented_event_instant(
 }
 
 /// `wp_presentation` 的一帧呈现结果（UI 线程派发事件 → GPU 线程按 `FrameIndex` 取用）。
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PresentationOutcome {
     /// 已上屏：呈现时刻（仍是**下界证据**，发布前要经 [`clamp_presented_at`]）。
@@ -363,7 +372,7 @@ pub(crate) enum PresentationOutcome {
 }
 
 /// 邮箱容量上限：正常 ≤ 在飞帧数；超过说明反馈消费端停了，丢弃最旧并计数（诊断面）。
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 const MAX_PRESENTATION_EVENTS: usize = 16;
 
 /// 呈现反馈的进程内邮箱：Wayland 事件在 **UI 线程**派发，帧反馈在 **GPU 线程**发布。
@@ -372,7 +381,7 @@ const MAX_PRESENTATION_EVENTS: usize = 16;
 /// 每条反馈恰好一个终态（presented / discarded），重复/迟到的事件按「先到者为准」忽略。
 /// GPU 线程在等上屏证据时睡在渲染器自己的 condvar 上，本邮箱在写入后调用 `waker` 唤醒它
 /// （没有 `waker` 时事件只排队——`poll` 每轮都会来取）。
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 pub(crate) struct PresentationInbox {
     events: std::sync::Mutex<VecDeque<(FrameIndex, PresentationOutcome)>>,
     waker: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
@@ -380,7 +389,7 @@ pub(crate) struct PresentationInbox {
     dropped: std::sync::atomic::AtomicU64,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 impl PresentationInbox {
     pub(crate) fn new() -> Self {
         Self {

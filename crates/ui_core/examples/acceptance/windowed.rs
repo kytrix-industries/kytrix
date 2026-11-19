@@ -281,13 +281,17 @@ impl WindowRun {
         );
         // A5：帧预算门禁。写入快于刷新时（`--hz` > 刷新率），吞吐必须被钳到刷新率附近，
         // 且必须观测到推迟（否则说明门禁没生效，UI 帧率 = 写入率）。
+        //
+        // 门槛 = 刷新率 × 1.15：预算门禁的相位带 10% 周期的提前量（吸收平台唤醒抖动，
+        // 保证同频写入稳定 60 fps，见 `window::frame_budget::FrameBudget::admits`），稳态
+        // 上限因此是 1/(0.9×周期) ≈ 1.11×刷新率；预留到 1.15 倍余量。
         let budget_ok = match refresh_hz {
             Some(refresh) if f64::from(hz) > f64::from(refresh) + 1.0 => {
-                let capped = throughput <= f64::from(refresh) + 1.0;
+                let limit = f64::from(refresh) * 1.15;
+                let capped = throughput <= limit;
                 println!(
-                    "写入 {hz} Hz > 刷新 {refresh:.1} Hz ⇒ 吞吐钳到 ≤{:.1} fps；实测 {throughput:.2} fps，\
-                     累计推迟 {deferrals} 次 ⇒ {}",
-                    f64::from(refresh) + 1.0,
+                    "写入 {hz} Hz > 刷新 {refresh:.1} Hz ⇒ 吞吐钳到 ≤{limit:.1} fps（含 10% 相位容差）；\
+                     实测 {throughput:.2} fps，累计推迟 {deferrals} 次 ⇒ {}",
                     verdict(capped && deferrals > 0)
                 );
                 capped && deferrals > 0

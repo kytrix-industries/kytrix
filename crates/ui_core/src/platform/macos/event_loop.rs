@@ -367,7 +367,7 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
     let deferred = app.has_deferred_frames();
     let wake = state.dispatcher.take_frame_wake();
     if wake || changed || (tick && (continuous || deferred)) {
-        frame_all(app, &state.windows, tick && continuous)?;
+        frame_all(app, &state.windows, tick && (continuous || deferred))?;
     }
 
     // display link 的节奏（§5.3 + R09-9）：连续帧 / 有帧要画 / 有在飞帧时恢复，否则暂停
