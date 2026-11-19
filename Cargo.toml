@@ -115,6 +115,10 @@ jiff = "0.2.42"
 k256 = { version = "0.14.0", default-features = false }
 keyring = "4.2.0"
 kytrix_proto = { git = "https://github.com/kytrix-industries/kytrix_proto", rev = "fdb7d2b533c7737773aa5e0e7cb254dcc190f64b" }
+# A4：Linux 呈现证据要把 `wp_presentation` 的呈现时钟（POSIX clockid_t）搬到 `Instant`，
+# 需要在同一时钟域取 `clock_gettime` 锚点。已在 Cargo.lock（传递依赖 0.2.191），这里只把它
+# 提为直接依赖，不引入新 crate。
+libc = "0.2.191"
 llama_sys = { path = "crates/llama_sys" }
 log = "0.4.35"
 longbridge-proto = "5.3.0"

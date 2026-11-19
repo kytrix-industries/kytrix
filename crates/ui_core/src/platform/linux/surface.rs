@@ -27,6 +27,12 @@
 //!   的结果是异步批次），以**已有 preedit** 为判据不投递裸 `Key`（Ctrl/Alt/Meta 命令组合
 //!   豁免）。判据在 [`crate::platform::wayland::input::key_visible_while_composing`]（Windows
 //!   可单测），首键启动组合的残余风险见 `translate_key` 文档。
+//! - **呈现证据**（A4）：registry 里绑定 `wp_presentation`（可选扩展，缺失只记豁免）；GPU
+//!   线程在每次 present 之前对 `wl_surface` 请求一次 `wp_presentation.feedback`（帧序号写进
+//!   反馈 user data，见 `render/linux/renderer.rs` 的调用点）。终态事件（presented /
+//!   discarded）在 UI 线程按 user data 找回 `(WindowId, FrameIndex)`，换算成 `Instant` 后写进
+//!   邮箱，泵按 `FrameIndex` 回填窗口呈现历史。协议对象与时钟换算在
+//!   `platform/linux/presentation.rs`，本文件只做「事件翻译 + 泵接线」。
 //!
 //! 缩放（V-110 / V-122 ④）：
 //! - **fractional**：`wp_viewporter` 与 `wp_fractional_scale_manager_v1` **同时**存在时才启用
@@ -70,6 +76,7 @@ use wayland_protocols::{
         fractional_scale::v1::client::{
             wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1, wp_fractional_scale_v1,
         },
+        presentation_time::client::{wp_presentation, wp_presentation_feedback},
         text_input::zv3::client::{
             zwp_text_input_manager_v3::ZwpTextInputManagerV3,
             zwp_text_input_v3::{self, ZwpTextInputV3},
@@ -95,12 +102,19 @@ use crate::{
     math::{Point, Rect, Scale, Size},
     paint::style::Cursor,
     platform::{
-        linux::{clipboard::Clipboard, cursor::CursorManager, dpi, window},
+        linux::{
+            clipboard::Clipboard,
+            cursor::CursorManager,
+            dpi,
+            presentation::{FeedbackData, Presentation, PresentationHandle},
+            window,
+        },
         wayland::{
             configure::{AckAction, ConfigureLatch},
             frame_gate::{CallbackToken, FrameGate},
             ime::ImeState,
             input, owner,
+            presentation::PresentedOrder,
             scroll::{ScrollAccum, ScrollAxis},
             text_input::{self, ImeStateSnapshot, TextInputRoute},
             toplevel::{
@@ -109,6 +123,8 @@ use crate::{
             },
         },
     },
+    // A4：`wp_presentation_feedback` 终态事件 → 邮箱 → 泵回填窗口呈现历史。
+    render::present_evidence::{PresentationInbox, PresentationOutcome},
 };
 
 /// 客户端自报的 app id（compositor 用来匹配桌面文件）。
@@ -296,6 +312,14 @@ struct WindowSurface {
     /// 因此靠 id 区分「当前请求的 callback」与「被放弃、迟到的旧 callback」，令牌只对匹配的
     /// 回调生效。
     frame_callback: Option<(ObjectId, CallbackToken)>,
+    /// A4：presented 证据的单调判据（每窗口一份）。
+    ///
+    /// 反馈对象由 GPU 线程在 present 前创建（帧序号写进 user data）；终态事件按提交顺序送达，
+    /// 因此 presented 帧序号必须严格递增 —— 陈旧/乱序证据只能丢弃（见
+    /// [`crate::platform::wayland::presentation::PresentedOrder`]）。
+    presented_order: PresentedOrder,
+    /// A4：呈现反馈邮箱（终态事件 → 泵按 `FrameIndex` 回填窗口的呈现历史）。
+    presentation_inbox: PresentationInbox,
 }
 
 impl Drop for WindowSurface {
@@ -350,6 +374,11 @@ pub(crate) struct WaylandState {
     /// 光标下发状态（cursor-shape-v1 优先，主题回退，R10-3）。
     cursor: CursorManager,
     clipboard: Clipboard,
+    /// A4：`wp_presentation` 绑定与呈现时钟（可选扩展；缺失时 `presented_at` 记豁免）。
+    ///
+    /// 只保存工厂代理（用来创建 feedback 对象），关闭连接时不需要显式 destroy；按上面
+    /// 「协议对象声明在 `connection` 之前」的析构纪律放在这里。
+    presentation: Presentation,
     connection: Connection,
     queue_handle: QueueHandle<Self>,
     /// `wl_compositor`：每个新窗口都从它 `create_surface`（多窗口的生命周期入口）。
@@ -510,6 +539,7 @@ impl WaylandState {
             text_input_route: TextInputRoute::default(),
             outputs: Vec::with_capacity(2),
             clipboard,
+            presentation: Presentation::new(),
             xkb_context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
             xkb_state: None,
             xkb_keymap: None,
@@ -530,6 +560,8 @@ impl WaylandState {
         // `wl_output.scale`，整数回退的首帧因此能按「全部已绑定 output 的最大 scale」兜底
         // （`wl_surface.enter` 要等 surface 映射之后才到，V-110）。
         state.bind_existing_outputs(&globals);
+        // A4：可选扩展 `wp_presentation`（缺失 ⇒ presented_at 恒 None + 豁免计数，不伪造）。
+        state.bind_existing_presentation(&globals);
         state.add_window(id, options)?;
         Ok((state, queue))
     }
@@ -702,6 +734,8 @@ impl WaylandState {
             close_requested: false,
             frame_gate: FrameGate::new(),
             frame_callback: None,
+            presented_order: PresentedOrder::new(),
+            presentation_inbox: PresentationInbox::new(),
         });
         // window geometry 与首个 commit 一起生效（`set_window_geometry` 是双缓冲状态）。
         // IME 路由的每窗口策略表与 `windows` 同生命周期（下标一一对应）。
@@ -786,6 +820,27 @@ impl WaylandState {
                 self.bind_output(globals.registry(), global.name, global.version);
             }
         }
+    }
+
+    /// 绑定启动时已宣告的 `wp_presentation`（A4；可选扩展，缺了不报错）。
+    ///
+    /// 与 `wl_output` 一样走 `WlRegistry::bind`（`GlobalList` 已消费掉首轮 `global` 事件，
+    /// 运行期新宣告的实例由 `Dispatch<WlRegistry>` 的 `Global` 分支动态绑定）。
+    fn bind_existing_presentation(&mut self, globals: &GlobalList) {
+        let Some(global) = globals
+            .contents()
+            .clone_list()
+            .into_iter()
+            .find(|global| global.interface == "wp_presentation")
+        else {
+            return;
+        };
+        self.presentation.bind(
+            globals.registry(),
+            &self.queue_handle,
+            global.name,
+            global.version,
+        );
     }
 
     /// 动态绑定一个 `wl_output`（已绑定过的同名 global 幂等跳过）。
@@ -1233,6 +1288,95 @@ impl WaylandState {
     /// 本帧没有 publish（Idle / 中止）⇒ 不会 commit：把门禁重新打开（F-183 的 Idle 路径）。
     pub(crate) fn note_frame_not_committed(&mut self, index: usize) {
         self.windows[index].frame_gate.note_not_committed();
+    }
+
+    /// A4：取出一个可移到 GPU 线程的呈现反馈请求句柄（建渲染器时调用一次）。
+    ///
+    /// 返回 `None` = compositor 没有 `wp_presentation`（记豁免；该窗口 `presented_at` 恒
+    /// `None`，绝不伪造）。句柄里的 `wl_surface` 是渲染器持有的同一份代理的副本：GPU 线程
+    /// 在每次 present 前直接请求 feedback，事件仍由本线程的默认队列派发。
+    pub(crate) fn presentation_handle(&mut self, index: usize) -> Option<PresentationHandle> {
+        let window = self.windows[index].id;
+        let surface = self.windows[index].surface.clone();
+        self.presentation
+            .handle(window, &self.queue_handle, surface)
+    }
+
+    /// A4：把呈现邮箱里的终态按 `FrameIndex` 回填到 `App` 的窗口呈现历史。
+    ///
+    /// 在每轮 `app.poll_renderers()` **之后**调用（完成反馈先落账，`presented` 事件后到）。
+    /// 只回填「历史里已有、且还没有 `presented_at`」的帧：presented 事件可能早于 GPU 完成
+    /// 反馈的**观测点**到达（合成器在 vblank 之后立即发事件，而 GPU 线程每 4 ms 才观测一次
+    /// timeline），此时条目还没追加，条目留在有界邮箱里下一轮再取 —— 不会丢证据，也不会把
+    /// 迟到事件记到别的帧上。
+    pub(crate) fn backfill_presentation(&self, app: &mut App) {
+        for native in &self.windows {
+            let Some(window) = app.window_mut(native.id) else {
+                continue;
+            };
+            // 历史最多 8 条（`FRAME_PRESENTATION_HISTORY`），用位置迭代避免每轮分配；
+            // `note_frame_presented` 只改 `presented_at`、不增删条目 ⇒ 位置在循环内稳定。
+            let mut position = 0;
+            loop {
+                let Some(presentation) = window.recent_frame_presentations().nth(position) else {
+                    break;
+                };
+                position += 1;
+                if presentation.presented_at.is_some() {
+                    continue;
+                }
+                let Some(outcome) = native.presentation_inbox.take(presentation.index) else {
+                    // 事件还没到 / 已被邮箱容量上限丢弃：本轮保持 None（不伪造）。
+                    continue;
+                };
+                let presented_at = match outcome {
+                    PresentationOutcome::Presented(instant) => Some(instant),
+                    PresentationOutcome::Discarded => None,
+                };
+                window.note_frame_presented(presentation.index, presented_at);
+            }
+        }
+    }
+
+    /// A4：`wp_presentation_feedback` 终态事件 → 呈现邮箱。
+    ///
+    /// - `presented`：`(tv_sec_hi, tv_sec_lo, tv_nsec)` 按 compositor 宣告的呈现时钟换算成
+    ///   `Instant`；不可信（时钟域不支持 / nsec 越界 / 偏差超限）⇒ 记豁免、**不写邮箱**
+    ///   （该帧 `presented_at` 如实保持 `None`，绝不用别的时刻顶替）；非递增的帧序号说明
+    ///   反馈绑到了更晚的提交，同样丢弃；
+    /// - `discarded`：内容是终态「没有上屏」⇒ 写 `Discarded`，回填后该帧同样是 `None`。
+    fn note_presentation_terminal(
+        &mut self,
+        data: &FeedbackData,
+        presented: Option<(u32, u32, u32)>,
+    ) {
+        // 窗口已关闭：surface 销毁时 compositor 会给所有未决反馈补 `discarded`，这是正常路径
+        // （窗口的呈现历史已随窗口销毁，没有可回填的目标）⇒ 静默忽略，不计豁免。
+        let Some(index) = self.window_index(data.window()) else {
+            return;
+        };
+        let outcome = match presented {
+            Some((tv_sec_hi, tv_sec_lo, tv_nsec)) => {
+                // 协议按提交顺序送呈现事件；不递增只可能来自反馈绑到了更晚的提交（陈旧），
+                // 宁可丢弃该条证据（本帧如实 None），也不能记到错帧。
+                if !self.windows[index].presented_order.accept(data.frame()) {
+                    self.presentation.note_unmatched_feedback();
+                    return;
+                }
+                let Some(instant) = self
+                    .presentation
+                    .presented_instant(tv_sec_hi, tv_sec_lo, tv_nsec)
+                else {
+                    // 豁免已在换算处计数；本帧没有可信的呈现时刻。
+                    return;
+                };
+                PresentationOutcome::Presented(instant)
+            }
+            None => PresentationOutcome::Discarded,
+        };
+        self.windows[index]
+            .presentation_inbox
+            .note(data.frame(), outcome);
     }
 
     /// B10：把该窗口待确认的 configure ack 掉（若有），返回是否真的发送了 `ack_configure`。
@@ -1799,7 +1943,7 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandState {
         event: wl_registry::Event,
         _: &GlobalListContents,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        queue: &QueueHandle<Self>,
     ) {
         match event {
             // `wl_output` 是热插拔的多实例 global：新出现的实例动态绑定（热插拔显示器）。
@@ -1811,8 +1955,17 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandState {
                 if interface == "wl_output" {
                     state.bind_output(registry, name, version);
                 }
+                // A4：`wp_presentation` 通常与其它 global 一起在首轮宣告（启动时由
+                // `bind_existing_presentation` 绑定）；这里覆盖「启动之后才宣告」的情形。
+                // `bind` 幂等（已绑定 / 已存在时忽略）。
+                if interface == "wp_presentation" {
+                    state.presentation.bind(registry, queue, name, version);
+                }
             }
-            wl_registry::Event::GlobalRemove { name } => state.unbind_output(name),
+            wl_registry::Event::GlobalRemove { name } => {
+                state.unbind_output(name);
+                state.presentation.unbind(name);
+            }
             _ => {}
         }
     }
@@ -1854,6 +2007,50 @@ dispatch_unit!(
     WpCursorShapeManagerV1,
     WpCursorShapeDeviceV1,
 );
+
+impl Dispatch<wp_presentation::WpPresentation, ()> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _: &wp_presentation::WpPresentation,
+        event: wp_presentation::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // 呈现时钟域只在 bind 之后发一次（连接生命周期内不变）；记下来供 feedback 时间戳换算。
+        if let wp_presentation::Event::ClockId { clk_id } = event {
+            state.presentation.note_clock_id(clk_id);
+        }
+    }
+}
+
+impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, FeedbackData> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _: &wp_presentation_feedback::WpPresentationFeedback,
+        event: wp_presentation_feedback::Event,
+        data: &FeedbackData,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            // `presented` / `discarded` 都是 destructor 事件：一条反馈恰好一个终态，处理完
+            // 对象由 wayland-client 自动销毁（不需要也不存在 `destroy` 请求）。
+            wp_presentation_feedback::Event::Presented {
+                tv_sec_hi,
+                tv_sec_lo,
+                tv_nsec,
+                ..
+            } => state.note_presentation_terminal(data, Some((tv_sec_hi, tv_sec_lo, tv_nsec))),
+            wp_presentation_feedback::Event::Discarded => {
+                state.note_presentation_terminal(data, None);
+            }
+            // `sync_output` 只指出同步到哪块 output；`refresh` / `seq` / `flags` 是辅助预测，
+            // 本帧证据只用呈现时间戳。都不影响 `presented_at`。
+            _ => {}
+        }
+    }
+}
 
 impl Dispatch<wl_output::WlOutput, u32> for WaylandState {
     fn event(

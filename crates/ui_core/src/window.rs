@@ -30,6 +30,8 @@ use self::{
 };
 #[cfg(feature = "test-support")]
 use crate::paint::instance::InstanceBuffer;
+#[cfg(any(target_os = "linux", test))]
+use crate::render::present_evidence::clamp_presented_at;
 #[cfg(feature = "test-support")]
 use crate::test_support::record::{FrameRecord, FrameStats};
 use crate::{
@@ -716,12 +718,13 @@ impl Window {
 
     /// Linux：`wp_presentation` 的呈现事件到达，回填对应帧的 `presented_at`。
     ///
-    /// 已被历史窗口挤掉的帧直接忽略（不会伪造；验收侧有各自的「已结算」口径）。
+    /// 事件由平台泵在 **dispatch 之后**按 `FrameIndex` 从呈现邮箱里取走并调用本方法；反馈本身
+    /// 是异步的（presented 可能晚于 GPU 完成反馈若干轮），因此历史里还没有该帧时调用方先不
+    /// 取，等下一轮。已被历史窗口挤掉的帧直接忽略（不会伪造；验收侧有各自的「已结算」口径）。
     ///
-    /// **仅测试构建**：A4 的 Linux 平台接线（`wp_presentation` 全局绑定 / present 前 feedback
-    /// 请求 / Dispatch 回填）是明确登记的降级项（见 `.review/p1-a-impl.md`），生产路径如实
-    /// `presented_at = None`；接线启用时把本方法改回 `cfg(any(target_os = "linux", test))`。
-    #[cfg(test)]
+    /// `presented_at` 仍按**下界**收口：真实上屏只可能发生在 GPU 完成之后，事件时间戳与
+    /// `completed_at` 两个下界取较大者（[`clamp_presented_at`]），偏差方向恒为偏早。
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn note_frame_presented(
         &mut self,
         index: FrameIndex,
@@ -732,7 +735,7 @@ impl Window {
             .iter_mut()
             .find(|entry| entry.index == index)
         {
-            entry.presented_at = presented_at;
+            entry.presented_at = clamp_presented_at(presented_at, entry.completed_at);
         }
     }
 

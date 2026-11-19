@@ -22,6 +22,9 @@
 //! - **X1 窗口层级**（[`owner`]）：`WindowOptions::owner` → `xdg_toplevel.set_parent` 的
 //!   transient 提示解析（Wayland 没有 owner / 模态 / 置顶的跨合成器协议，降级语义在模块里
 //!   写清：模态由 `App` 层输入拦截承担、置顶无操作）。
+//! - **A4 呈现证据**（[`presentation`]）：`wp_presentation` 的纯判据 —— 呈现时钟域白名单
+//!   （`CLOCK_REALTIME` / `CLOCK_MONOTONIC`）与 presented 证据的单调判据；协议对象、GPU 线程
+//!   的 feedback 请求与时钟换算在 `platform/linux/presentation.rs`。
 //!
 //! 编译条件与 `platform/ime` 同款：Linux 构建 + 测试构建（`cfg(test)` 让 Windows 也能测）。
 
@@ -33,6 +36,7 @@ pub(crate) mod frame_gate;
 pub(crate) mod ime;
 pub(crate) mod input;
 pub(crate) mod owner;
+pub(crate) mod presentation;
 pub(crate) mod scroll;
 pub(crate) mod selection;
 pub(crate) mod text_input;

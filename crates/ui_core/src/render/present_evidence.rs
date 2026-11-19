@@ -8,9 +8,10 @@
 //! - Windows（`render/windows/renderer.rs`）：`IDXGISwapChain::GetFrameStatistics` 的
 //!   `SyncQPCTime` / 刷新计数（[`qpc_instant`] / [`presented_qpc_from_frame_statistics`] /
 //!   [`refresh_period_qpc`]）；
-//! - Linux（`platform/linux/presentation.rs` + `render/linux/renderer.rs`）：
+//! - Linux（`platform/linux/presentation.rs` + `platform/linux/surface.rs`）：
 //!   `wp_presentation_feedback.presented` 的 `(tv_sec_hi, tv_sec_lo, tv_nsec)` 呈现时钟
-//!   （[`presented_event_instant`]）与跨线程邮箱 [`PresentationInbox`]。
+//!   （[`presented_event_instant`]）与跨线程邮箱 [`PresentationInbox`]；事件在 UI 线程派发，
+//!   由泵按 `FrameIndex` 回填到窗口的呈现历史（`Window::note_frame_presented`）。
 //!
 //! 本模块**三平台无条件编译**；各端专用的项按 `cfg` 只在该端生产构建 + 所有平台的
 //! `cfg(test)` 构建里存在——这样 Windows 开发机的 `cargo test` 能跑到 Linux / macOS 的判据
@@ -21,12 +22,11 @@
 //! - `presented_at` = 真实上屏时刻的**下界**，偏差方向恒为**偏早**（见 [`clamp_presented_at`]）；
 //! - `latency` = 发布 → GPU 完成（与 `presented_at` 无关）。
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 use std::collections::VecDeque;
-/// 时间类型只在 Windows（帧统计换算）/ macOS（display link 推断）生产构建与所有平台测试
-/// 构建里使用；Linux 生产构建的呈现接线是 A4 登记的降级项（`presented_at = None`），
-/// 不能留下未使用的 import（clippy -D warnings）。
-#[cfg(any(windows, target_os = "macos", test))]
+/// 时间类型在 Windows（帧统计换算）/ macOS（display link 推断）/ Linux（presentation-time
+/// 呈现时钟换算）的生产构建与所有平台测试构建里使用。
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 use std::time::{Duration, Instant};
 
 #[cfg(any(target_os = "macos", test))]
@@ -35,7 +35,7 @@ use crate::render::{
     frame::{FrameFeedback, MAX_FRAMES_IN_FLIGHT},
     timer::GpuTimerSample,
 };
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 use crate::window::FrameIndex;
 
 /// display link 的空闲滞回窗口（R06-8）。
@@ -174,10 +174,10 @@ pub(crate) fn presentation_instant(
 /// 因此它**永远不是真实上屏时刻**，只是「真实时刻 − [0, 1 vsync]」的**下界**；对外契约
 /// （[`FrameFeedback::presented_at`]）的措辞必须按这个语义使用。`None` 原样透传。
 ///
-/// **cfg 说明**：Linux 生产构建的呈现反馈接线是 A4 登记的降级项（生产 `presented_at=None`），
-/// 因此该函数只在 Windows（帧统计路径）/ macOS（tick 推断）生产构建与所有平台的测试构建里
-/// 存在，避免 Linux 生产构建出现未使用代码。
-#[cfg(any(windows, target_os = "macos", test))]
+/// **cfg 说明**：三端生产构建都用它 —— Windows（帧统计路径）与 macOS（tick 推断）在发布
+/// 反馈前收口，Linux 在平台层把 `wp_presentation` 事件回填到窗口呈现历史时收口
+/// （[`crate::window::Window::note_frame_presented`]）；所有平台测试构建无条件可见。
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 pub(crate) fn clamp_presented_at(
     presented: Option<Instant>,
     completed_at: Instant,
@@ -308,7 +308,7 @@ pub(crate) fn presented_qpc_from_frame_statistics(
 ///
 /// `presented` 事件在 vblank 之后几微秒~几毫秒到达；超过 1 秒说明时钟域选错或
 /// `clock_gettime` 读数异常（`CLOCK_REALTIME` 被 NTP 步进时也会出现），按「拿不到」处理。
-#[cfg(test)]
+#[cfg(any(target_os = "linux", test))]
 const MAX_PRESENTATION_DELTA_SECS: f64 = 1.0;
 
 /// wp_presentation 认可的 POSIX `clockid_t`：`CLOCK_REALTIME` / `CLOCK_MONOTONIC`。
@@ -318,10 +318,10 @@ const MAX_PRESENTATION_DELTA_SECS: f64 = 1.0;
 /// `CLOCK_MONOTONIC`；`CLOCK_REALTIME` 只在旧实现里出现，换算方式相同（真正保证正确性的是用
 /// **同一时钟域**的 `clock_gettime` 与 `Instant::now()` 取锚点，见 [`presented_event_instant`]）。
 /// 其余时钟域（`MONOTONIC_RAW` / `BOOTTIME` 等）一律拒绝：它们与 `Instant` 的时基关系没有保证。
-#[cfg(test)]
+#[cfg(any(target_os = "linux", test))]
 pub(crate) const CLOCK_REALTIME: i32 = 0;
 /// 见 [`CLOCK_REALTIME`]；绝大多数 compositor 的 presentation clock。
-#[cfg(test)]
+#[cfg(any(target_os = "linux", test))]
 pub(crate) const CLOCK_MONOTONIC: i32 = 1;
 
 /// `(tv_sec_hi, tv_sec_lo, tv_nsec)` + 呈现时钟 → `Instant`。
@@ -333,9 +333,10 @@ pub(crate) const CLOCK_MONOTONIC: i32 = 1;
 /// 返回 `None`（不可信就如实留空）：未知 `clock_id`、`tv_nsec > 999_999_999`、
 /// 锚点非有限、与锚点相差超过 ±[`MAX_PRESENTATION_DELTA_SECS`]、换算结果晚于 `now`。
 ///
-/// 与 `completed_at` 的关系不是本函数职责：发布前由调用方经 [`clamp_presented_at`] 收口
+/// 与 `completed_at` 的关系不是本函数职责：Linux 由平台层在
+/// [`crate::window::Window::note_frame_presented`] 回填时经 [`clamp_presented_at`] 收口
 /// （真实呈现时刻 ≥ GPU 完成时刻，映射误差只允许把它推早）。
-#[cfg(test)]
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn presented_event_instant(
     tv_sec_hi: u32,
     tv_sec_lo: u32,
@@ -366,27 +367,28 @@ pub(crate) fn presented_event_instant(
     (instant <= now).then_some(instant)
 }
 
-/// `wp_presentation` 的一帧呈现结果（UI 线程派发事件 → GPU 线程按 `FrameIndex` 取用）。
-#[cfg(test)]
+/// `wp_presentation` 的一帧呈现结果（UI 线程派发事件 → 泵按 `FrameIndex` 回填）。
+#[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PresentationOutcome {
-    /// 已上屏：呈现时刻（仍是**下界证据**，发布前要经 [`clamp_presented_at`]）。
+    /// 已上屏：呈现时刻（仍是**下界证据**，回填时经 [`clamp_presented_at`]）。
     Presented(Instant),
     /// 内容被合成器丢弃（surface 销毁 / 被后来者取代）：如实 `None`。
     Discarded,
 }
 
 /// 邮箱容量上限：正常 ≤ 在飞帧数；超过说明反馈消费端停了，丢弃最旧并计数（诊断面）。
-#[cfg(test)]
+#[cfg(any(target_os = "linux", test))]
 const MAX_PRESENTATION_EVENTS: usize = 16;
 
-/// 呈现反馈的进程内邮箱：Wayland 事件在 **UI 线程**派发，帧反馈在 **GPU 线程**发布。
+/// 呈现反馈的进程内邮箱：Wayland 事件在 **UI 线程**派发，泵按 `FrameIndex` 回填窗口历史。
 ///
 /// 事件按 `FrameIndex` 归档（反馈对象创建时把目标 frame 写进 user data），因此到达顺序无关；
 /// 每条反馈恰好一个终态（presented / discarded），重复/迟到的事件按「先到者为准」忽略。
-/// GPU 线程在等上屏证据时睡在渲染器自己的 condvar 上，本邮箱在写入后调用 `waker` 唤醒它
-/// （没有 `waker` 时事件只排队——`poll` 每轮都会来取）。
-#[cfg(test)]
+///
+/// Linux 生产路径没有「等上屏证据的 GPU 线程」（帧节奏由 `wl_callback` 门禁承担）⇒
+/// [`Self::set_waker`] 只在测试构建里存在，生产不注册 waker。
+#[cfg(any(target_os = "linux", test))]
 pub(crate) struct PresentationInbox {
     events: std::sync::Mutex<VecDeque<(FrameIndex, PresentationOutcome)>>,
     waker: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
@@ -394,7 +396,7 @@ pub(crate) struct PresentationInbox {
     dropped: std::sync::atomic::AtomicU64,
 }
 
-#[cfg(test)]
+#[cfg(any(target_os = "linux", test))]
 impl PresentationInbox {
     pub(crate) fn new() -> Self {
         Self {
@@ -404,7 +406,8 @@ impl PresentationInbox {
         }
     }
 
-    /// 注册 GPU 线程的唤醒（`Renderer` 创建后调用一次；重复注册以后者为准）。
+    /// 注册 GPU 线程的唤醒（测试 / 未来「等上屏证据」的消费者；Linux 生产路径不设置）。
+    #[cfg(test)]
     pub(crate) fn set_waker(&self, waker: std::sync::Arc<dyn Fn() + Send + Sync>) {
         *self
             .waker
@@ -412,7 +415,7 @@ impl PresentationInbox {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(waker);
     }
 
-    /// 记录一条终态事件并唤醒 GPU 线程。同一帧的重复事件按先到者为准。
+    /// 记录一条终态事件并唤醒等待方（若注册过）。同一帧的重复事件按先到者为准。
     pub(crate) fn note(&self, index: FrameIndex, outcome: PresentationOutcome) {
         {
             let mut events = self
@@ -450,6 +453,7 @@ impl PresentationInbox {
     }
 
     /// 已排队、尚未被取走的条数（诊断）。
+    #[cfg(test)]
     pub(crate) fn pending(&self) -> usize {
         self.events
             .lock()
@@ -458,6 +462,7 @@ impl PresentationInbox {
     }
 
     /// 容量上限丢弃的条数（诊断；正常恒为 0）。
+    #[cfg(test)]
     pub(crate) fn dropped(&self) -> u64 {
         self.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -1353,5 +1358,121 @@ mod tests {
         inbox.note(index(1), PresentationOutcome::Discarded);
         inbox.note(index(2), PresentationOutcome::Presented(Instant::now()));
         assert_eq!(wakes.load(Ordering::Acquire), 2);
+    }
+
+    /// 呈现时钟判据的**双向**边界：早于锚点 1 s 内接受（事件在锚点之前生成，正常路径），
+    /// 更早 / 更晚 / 未来时间戳一律拒绝 —— 时钟域选错或 NTP 步进时绝不把假时刻写进证据。
+    #[test]
+    fn the_presentation_clock_rejects_timestamps_outside_the_plausible_window() {
+        let anchor = Instant::now();
+        let now = anchor;
+        let clock_anchor = 2_000.0_f64;
+        // 锚点前 1 s 恰好落在容差边界（`> 1 s` 才拒绝）⇒ 接受。
+        assert_eq!(
+            presented_event_instant(0, 1_999, 0, CLOCK_MONOTONIC, clock_anchor, anchor, now),
+            Some(anchor - Duration::from_secs(1)),
+            "边界内（-1 s）必须接受"
+        );
+        // 两个方向超出 1 s 容差 ⇒ 拒绝。
+        for secs in [1_998_u32, 2_002] {
+            assert!(
+                presented_event_instant(0, secs, 0, CLOCK_MONOTONIC, clock_anchor, anchor, now)
+                    .is_none(),
+                "secs={secs} 距锚点超过 1 s 必须拒绝"
+            );
+        }
+        // 纳秒边界：999_999_999 合法，1_000_000_000 越界。
+        assert!(
+            presented_event_instant(
+                0,
+                1_999,
+                999_999_999,
+                CLOCK_MONOTONIC,
+                clock_anchor,
+                anchor,
+                now
+            )
+            .is_some(),
+            "999_999_999 ns 合法"
+        );
+        assert!(
+            presented_event_instant(
+                0,
+                1_999,
+                1_000_000_000,
+                CLOCK_MONOTONIC,
+                clock_anchor,
+                anchor,
+                now
+            )
+            .is_none(),
+            "nsec ≥ 1e9 非法"
+        );
+        // 晚于采样时刻（未来）不可信。
+        assert!(
+            presented_event_instant(
+                0,
+                2_000,
+                500_000_000,
+                CLOCK_MONOTONIC,
+                clock_anchor,
+                anchor,
+                now
+            )
+            .is_none(),
+            "晚于采样时刻的呈现时间戳不可信"
+        );
+    }
+
+    /// A4 Linux 回填的**下界收口**（`Window::note_frame_presented` 内调 `clamp_presented_at`）：
+    /// compositor 的事件时间戳可能早于 GPU 完成时刻（时钟步进 / 映射误差），而上屏不可能早于
+    /// 内容画完 ⇒ 回填值必须抬到 `completed_at`。变异「去掉 clamp 调用」会让本用例红。
+    #[test]
+    fn a_presentation_timestamp_older_than_the_gpu_completion_is_clamped() {
+        use crate::window::{FramePresentation, Window, WindowId, WindowOptions};
+        let mut window = Window::new(WindowId::for_test(1), WindowOptions::default());
+        let published = Instant::now();
+        let completed = published + Duration::from_millis(2);
+        let frame = index(1);
+        window.note_frame_presentation(FramePresentation {
+            index: frame,
+            published_at: published,
+            completed_at: completed,
+            presented_at: None,
+            latency: Duration::from_millis(2),
+        });
+        // 事件时间戳比 GPU 完成早 5 ms：下界收口到 completed_at（变异去掉 clamp ⇒ 这里只剩
+        // 事件时间戳，断言红）。
+        let early = completed
+            .checked_sub(Duration::from_millis(5))
+            .expect("测试时间戳");
+        window.note_frame_presented(frame, Some(early));
+        assert_eq!(
+            window
+                .last_frame_presentation()
+                .expect("本帧还在历史里")
+                .presented_at,
+            Some(completed),
+            "presented 不得早于 GPU 完成（下界收口）"
+        );
+        // 正常路径（事件晚于完成）：保留事件时间戳。
+        let later = completed + Duration::from_millis(3);
+        window.note_frame_presented(frame, Some(later));
+        assert_eq!(
+            window
+                .last_frame_presentation()
+                .expect("本帧还在历史里")
+                .presented_at,
+            Some(later)
+        );
+        // `discarded` / 不可信：如实 None（不能用完成时刻顶替）。
+        window.note_frame_presented(frame, None);
+        assert_eq!(
+            window
+                .last_frame_presentation()
+                .expect("本帧还在历史里")
+                .presented_at,
+            None
+        );
     }
 }

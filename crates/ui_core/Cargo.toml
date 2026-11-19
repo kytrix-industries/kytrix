@@ -161,6 +161,9 @@ accesskit_unix = { workspace = true }
 ash = { workspace = true }
 calloop = { workspace = true }
 calloop-wayland-source = { workspace = true }
+# A4：`wp_presentation` 的呈现时钟锚点（`clock_gettime(CLOCK_MONOTONIC/REALTIME)`）。
+# 只用于这一个系统调用，不引入其它 libc API。
+libc = { workspace = true }
 wayland-client = { workspace = true, features = ["system"] }
 wayland-protocols = { workspace = true }
 xkbcommon = { workspace = true }

@@ -34,6 +34,9 @@
 //!   （[`crate::platform::wayland::drag`]）：主键按下命中 `Window::drag_regions()` ⇒
 //!   `WaylandState::begin_move` 发 `xdg_toplevel.move(seat, serial)`，该次 `PointerDown`
 //!   不派发（拖动区是窗口 chrome，不是内容）；区域之外完全不变。
+//! - **呈现证据**（A4）：GPU 线程在 present 前请求 `wp_presentation.feedback`（帧序号写进
+//!   反馈 user data），终态事件由本泵在 `dispatch` 里派发；每轮 `poll_renderers` 之后把
+//!   presented/discarded 按 `FrameIndex` 回填窗口呈现历史。
 
 use std::{
     sync::Arc,
@@ -216,6 +219,10 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             // 所有 Vulkan 工作都在 `kytrix-vulkan`
             // 线程上，UI 线程只读反馈（I1）。
             app.poll_renderers()?;
+            // ①c A4：`wp_presentation` 的 presented/discarded 在上一轮末尾的 `dispatch` 里进了
+            // 各窗口的呈现邮箱；这里按 `FrameIndex` 回填窗口呈现历史（完成反馈已在 ①b 落账，
+            // 事件晚于它到达；还没出现在历史里的条目留在邮箱里下一轮再取）。
+            state.backfill_presentation(&mut app);
             // ② 逐窗口镜像平台真值：**只在值变化时**设置（`set_scale` 推进 scale epoch；二者置
             // full-damage、重排根 LAYOUT，每轮无条件调用会让 UI 永久失效）。没有渲染器的窗口还没
             // 有镜像记账（首个 configure 之后才建），由 `sync_windows` 负责初次写入。
@@ -629,6 +636,9 @@ fn sync_windows(
         // viewport 的所有权交给渲染器：destination 必须与 buffer 同一次 present 生效（D1 / D2）。
         let viewport = state.take_viewport(index);
         let surface = state.surface_clone(index);
+        // A4：呈现反馈请求句柄交给 GPU 线程（在 present 前创建 `wp_presentation.feedback`）。
+        // 协议不可用时是 `None`（平台层已记豁免），该窗口 `presented_at` 如实恒为 `None`。
+        let presentation = state.presentation_handle(index);
         let Some(background) = app.window(id).map(|window| window.options().background) else {
             continue;
         };
@@ -639,6 +649,7 @@ fn sync_windows(
             background,
             viewport,
             surface,
+            presentation,
         )?;
         let Some(window) = app.window_mut(id) else {
             continue;
