@@ -15,6 +15,10 @@
 //! `apply_orientation` → 缩放 → `to_rgba8` → 预乘。`reserve` 是复刻 `ImageReader::decode` 的
 //! 「整图分配」预检：走 `into_decoder` 而漏掉它，[`MAX_DECODE_ALLOC`] 就只剩解码器中间缓冲有意义。
 //!
+//! 分配失败：本模块自己的预乘缓冲走 `try_reserve_exact` ⇒ [`DecodeCause::OutOfMemory`]；
+//! `image` 内部缓冲仍是 `vec!`（分配失败 = abort），预算准入（[`estimate_peak`] + `ResourceCache`
+//! 的 byte budget）把单张峰值压在 [`MAX_DECODE_ALLOC`] 内，残余 abort 风险只留给绕过预算的调用方。
+//!
 //! 预乘在**线性**空间完成：`srgb_decode(rgb) * alpha` 再 `srgb_encode` 存 8 bit。直接在编码域乘 alpha
 //! 在中灰半透明处会偏暗最多 60/255（probe 实测），因此用 64 KiB 的 `(color, alpha) → stored` 查找表，
 //! 每像素 3 次查表；`alpha == 255` / `alpha == 0` 走快路径，保证不透明资产**逐字节不变**。
@@ -55,6 +59,13 @@ pub(crate) const MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 /// 命中时映射成 [`DecodeCause::OutOfMemory`]。
 pub(crate) const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
 
+/// 解码峰值估算的每像素字节数：RGBA16 是 `image` 0.25 能产出的最宽输出类型（8 B/px）。
+const DECODE_PEAK_BYTES_PER_PIXEL: u64 = 8;
+
+/// 解码峰值估算的固定余量：缩放中间图 + `to_rgba8()` + 预乘输出（各在 `MAX_TILE_DIM²`
+/// 档位内 ≤ 16 MiB，合取一个 16 MiB 的保守余量）。
+const DECODE_PEAK_MARGIN: u64 = 16 * 1024 * 1024;
+
 /// 解码结果：**预乘 sRGB 编码**的 BGRA8（行主序，行宽 `width * 4`）。
 pub(crate) struct DecodedImage {
     /// 解码（必要时缩放、应用 EXIF orientation）后的像素宽。
@@ -62,7 +73,7 @@ pub(crate) struct DecodedImage {
     /// 解码（必要时缩放、应用 EXIF orientation）后的像素高。
     pub height: u32,
     /// `width * height * 4` 字节，BGR(A) 顺序。
-    pub bgra: Box<[u8]>,
+    pub bgra: Vec<u8>,
 }
 
 /// 字节 → BGRA8 预乘 sRGB。
@@ -112,8 +123,32 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<DecodedImage, DecodeCause> {
     Ok(DecodedImage {
         width,
         height,
-        bgra: premultiply(rgba.as_raw()),
+        bgra: premultiply(rgba.as_raw())?,
     })
+}
+
+/// 只读文件头拿尺寸（**不解码像素**）：`insert` / `insert_async` 的预算准入用。
+///
+/// 与 [`decode`] 共用 [`check_source_size`]：超限的图在 UI 线程直接 [`DecodeCause::TooLarge`]，
+/// 不会投递到 blocking 池（也就不占解码并发许可）。
+pub(crate) fn probe_dimensions(bytes: &[u8]) -> Result<(u32, u32), DecodeCause> {
+    let format = format_of(bytes)?;
+    let tag = format_tag(format);
+    let (width, height) = ImageReader::with_format(Cursor::new(bytes), format)
+        .into_dimensions()
+        .map_err(|error| classify(tag, error))?;
+    check_pixel_dimensions(tag, width, height)?;
+    check_source_size(width, height)?;
+    Ok((width, height))
+}
+
+/// 解码峰值估算（**准入**用，不分配）：文件头尺寸 → 上界字节数。
+///
+/// `pixels × 8 B`（RGBA16 解码缓冲，`image` 0.25 的最坏输出类型）+ [`DECODE_PEAK_MARGIN`]；
+/// [`MAX_SOURCE_PIXELS`] 之内的图估算上界 = 16 M px × 8 B + 16 MiB = 144 MiB ≤
+/// [`MAX_DECODE_ALLOC`]，因此「能合法解码的图」不会因估算本身被默认预算误拒。
+pub(crate) fn estimate_peak(width: u32, height: u32) -> u64 {
+    u64::from(width) * u64::from(height) * DECODE_PEAK_BYTES_PER_PIXEL + DECODE_PEAK_MARGIN
 }
 
 /// 解码器的显式限制：`max_alloc` = [`MAX_DECODE_ALLOC`]，单边上限 = [`MAX_SOURCE_DIM`]（strict）。
@@ -243,9 +278,13 @@ fn fit_within(width: u32, height: u32) -> (u32, u32) {
 }
 
 /// RGBA8 → 预乘 sRGB 编码的 BGRA8。
-fn premultiply(rgba: &[u8]) -> Box<[u8]> {
+///
+/// 输出缓冲用 [`Vec::try_reserve_exact`] 分配：分配失败（含容量溢出）映射成
+/// [`DecodeCause::OutOfMemory`]，而不是 `vec!` 的 abort。这是本模块自己持有的唯一整图缓冲；
+/// `image` 内部的解码 / 缩缓冲仍可能 abort（见模块文档的残余风险说明）。
+fn premultiply(rgba: &[u8]) -> Result<Vec<u8>, DecodeCause> {
     debug_assert_eq!(rgba.len() % 4, 0, "RGBA8 必须是 4 字节一组");
-    let mut out = vec![0u8; rgba.len()].into_boxed_slice();
+    let mut out = allocate_zeroed(rgba.len())?;
     for (src, dst) in rgba
         .as_chunks::<4>()
         .0
@@ -258,7 +297,18 @@ fn premultiply(rgba: &[u8]) -> Box<[u8]> {
         dst[2] = premultiply_channel(src[0], alpha);
         dst[3] = alpha;
     }
-    out
+    Ok(out)
+}
+
+/// `len` 字节的零初始化缓冲；`try_reserve_exact` 失败 ⇒ [`DecodeCause::OutOfMemory`]。
+fn allocate_zeroed(len: usize) -> Result<Vec<u8>, DecodeCause> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(len)
+        .map_err(|_| DecodeCause::OutOfMemory {
+            limit_bytes: MAX_DECODE_ALLOC,
+        })?;
+    out.resize(len, 0);
+    Ok(out)
 }
 
 /// 单通道预乘：`srgb_encode(srgb_decode(color) * alpha)`。
@@ -315,9 +365,10 @@ mod tests {
     use image::error::LimitErrorKind;
 
     use super::{
-        MAX_DECODE_ALLOC, MAX_SOURCE_BYTES, MAX_SOURCE_DIM, MAX_SOURCE_PIXELS, MAX_TILE_DIM,
-        check_source_bytes, check_source_size, classify, decode, decode_limits, fit_within,
-        premultiply_channel, srgb_decode, srgb_encode, transfer_lut,
+        DECODE_PEAK_MARGIN, MAX_DECODE_ALLOC, MAX_SOURCE_BYTES, MAX_SOURCE_DIM, MAX_SOURCE_PIXELS,
+        MAX_TILE_DIM, allocate_zeroed, check_source_bytes, check_source_size, classify, decode,
+        decode_limits, estimate_peak, fit_within, premultiply_channel, srgb_decode, srgb_encode,
+        transfer_lut,
     };
     use crate::resources::DecodeCause;
 
@@ -491,7 +542,7 @@ mod tests {
             "EXIF 6 必须交换宽高"
         );
         assert_eq!(
-            &rotated.bgra[..],
+            rotated.bgra.as_slice(),
             &[0, 0, 255, 255, 255, 0, 0, 255],
             "EXIF 6 的像素顺序：上红下蓝"
         );
@@ -500,7 +551,7 @@ mod tests {
         let flipped = decode(&png_with_exif(2, 1, &red_blue, 2)).expect("fliph png");
         assert_eq!((flipped.width, flipped.height), (2, 1), "EXIF 2 不改尺寸");
         assert_eq!(
-            &flipped.bgra[..],
+            flipped.bgra.as_slice(),
             &[255, 0, 0, 255, 0, 0, 255, 255],
             "EXIF 2 的像素顺序：左蓝右红"
         );
@@ -624,6 +675,37 @@ mod tests {
         assert!(
             MAX_DECODE_ALLOC < image::Limits::default().max_alloc.expect("默认上限"),
             "必须比 image 的默认 512 MiB 更严"
+        );
+    }
+
+    /// D-11：峰值估算必须覆盖「合法最大图」且不越过解码器的 `max_alloc` 上限。
+    #[test]
+    fn decode_peak_estimate_is_bounded_by_max_decode_alloc() {
+        assert_eq!(estimate_peak(1, 1), 8 + DECODE_PEAK_MARGIN);
+        assert_eq!(
+            estimate_peak(200, 100),
+            200 * 100 * 8 + DECODE_PEAK_MARGIN,
+            "估算按文件头像素数线性增长"
+        );
+        assert!(
+            estimate_peak(4096, 4096) <= MAX_DECODE_ALLOC,
+            "16 M px 合法图的估算上界必须仍受默认预算接纳：{}",
+            estimate_peak(4096, 4096)
+        );
+    }
+
+    /// D-11：自有 BGRA 缓冲的 `try_reserve_exact` 失败必须映射成 `OutOfMemory`（不 abort）。
+    #[test]
+    fn try_reserve_failure_maps_to_out_of_memory() {
+        let buffer = allocate_zeroed(16).expect("小缓冲分配");
+        assert_eq!(buffer, vec![0u8; 16], "缓冲必须零初始化（预乘逐像素覆盖）");
+
+        assert_eq!(
+            allocate_zeroed(usize::MAX),
+            Err(DecodeCause::OutOfMemory {
+                limit_bytes: MAX_DECODE_ALLOC
+            }),
+            "容量溢出必须走错误路径而不是 abort"
         );
     }
 

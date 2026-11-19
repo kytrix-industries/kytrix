@@ -13,27 +13,35 @@
 //! 2. 不做远程磁盘缓存、不碰 `usvg`：输入只有 `&[u8]` / `Bytes`，字节来源归应用层。
 //! 3. 失败是强类型 [`DecodeCause`]，不返回字符串错误、不包装 `image::ImageError`。
 //!
-//! # 解码不在 UI 线程（R12-15）
+//! # 解码不在 UI 线程（R12-15 / D-11）
 //!
-//! [`ResourceCache::insert_async`] 只做**轻量**校验（字节长度、内容去重），把解码投到
-//! `tokio::task::spawn_blocking`；[`ResourceCache::poll`] 每帧在 UI 线程把完成的结果装箱进图集。
-//! 后台线程只拿到 `bytes::Bytes` 与一个 `oneshot` 发送端，**从不**触碰页缓冲、也从不持有
+//! [`ResourceCache::insert_async`] 在 UI 线程只做**轻量**工作：字节长度、内容去重、文件头尺寸
+//! （[`image::probe_dimensions`]，O(header)）与**解码前预算准入**；通过后拿到解码并发许可
+//! （[`MAX_CONCURRENT_DECODES`]）才把像素解码投到 `tokio::task::spawn_blocking`。
+//! [`ResourceCache::poll`] 每帧在 UI 线程把完成的结果装箱进图集。后台线程只拿到
+//! `bytes::Bytes`、一个 `oneshot` 发送端与信号量许可，**从不**触碰页缓冲、也从不持有
 //! `&mut ResourceCache`。同步 [`ResourceCache::insert`] 保留（小图 / 没有 runtime 的宿主），
-//! 两者的结果语义完全一致。
+//! 它同样先读头 + 准入再解码，结果语义与异步路径完全一致。
 //!
 //! 源图峰值约束在 `resources::image`：像素数上限 `MAX_SOURCE_PIXELS`（16 M px，取代单纯的
 //! 单边 8192）+ 显式 `image::Limits`（`max_alloc` 256 MiB；命中 → [`DecodeCause::OutOfMemory`]）。
+//! 准入用 [`image::estimate_peak`]（像素数 × 8 B + 16 MiB 余量，≤ `MAX_DECODE_ALLOC`）：
+//! `图片页 + 存活的源字节 + 在途解码预留 + 本次估算 + 本次源字节 > 预算` ⇒ 立即
+//! [`DecodeCause::Capacity`]（[`CapacityCause::ByteBudget`]），**不投递**、不占解码线程。
+//! 在途预留从准入一直保持到 [`ResourceCache::poll`] 交付（成功/失败都归还）——完成但未交付的
+//! 解码结果（oneshot 里的 BGRA + `PendingJob.source`）仍是常驻内存，提前归还预算会高估可用空间。
 //!
 //! # 内容去重 / 归属 / 预算（R12-16）
 //!
 //! - **去重**：`ContentKey = (len, ahash(bytes))` 索引 + 原始字节 memcmp（防碰撞）。同一份字节
-//!   插入 N 次只占 1 块 tile，引用计数 N；命中时**不重新解码**。
+//!   插入 N 次只占 1 块 tile，引用计数 N；命中时**不重新解码**（也不占解码预算）。
 //! - **归属**：[`ResourceCache::insert_owned`] 把引用登记到 [`WindowId`] 名下，
 //!   [`ResourceCache::release_window`] 在该窗口关闭时（`app::window_set::close_window`）把引用
 //!   一次性还回去（按 LRU epoch 顺序）。
-//! - **预算**：字节预算（图片页 CPU 缓冲 + 去重表保留的源字节）超限 ⇒ [`DecodeCause::Capacity`]
-//!   （[`CapacityCause::ByteBudget`]）。超预算时**不会**静默淘汰仍在引用的 tile；空闲条目在
-//!   `unload` / `release_window` 里即时回收。[`ResourceCache::stats`] 是唯一的可观测面。
+//! - **预算**：字节预算（图片页 CPU 缓冲 + 去重表保留的源字节 + 在途解码预留）超限 ⇒
+//!   [`DecodeCause::Capacity`]（[`CapacityCause::ByteBudget`]）。超预算时**不会**静默淘汰仍在
+//!   引用的 tile；空闲条目在 `unload` / `release_window` 里即时回收。`ResourceCache::stats` 是
+//!   唯一的可观测面。
 //!
 //! # 应用层接线（现状）
 //!
@@ -42,13 +50,17 @@
 //! - 关窗已接线：`app::window_set::close_window` 在窗口移除后调用
 //!   [`ResourceCache::release_window`]（D-7）。
 //! - 异步交付仍由宿主驱动：[`ResourceCache::poll`] 需要每帧调一次（帧钩子 / 平台泵）。本分支
-//!   尚未把 `poll` 接进 `App` 帧循环，`insert_async` 的结果在接线前只能由调用方自己 poll。
+//!   尚未把 `poll` 接进 `App` 帧循环，`insert_async` 的结果在接线前只能由调用方自己 poll；
+//!   在交付之前，该任务的解码预算预留会一直占着（见上）。
 
-use std::{fmt, num::NonZeroU32};
+use std::{fmt, num::NonZeroU32, sync::Arc};
 
 use bytes::Bytes;
 use smol_str::SmolStr;
-use tokio::sync::oneshot::{self, error::TryRecvError};
+use tokio::sync::{
+    Semaphore,
+    oneshot::{self, error::TryRecvError},
+};
 
 use crate::{
     error::EngineError,
@@ -66,11 +78,20 @@ use crate::{
 mod cache;
 mod image;
 
-/// 默认字节预算：图片页（16 MiB）+ 去重表保留的源字节。
+/// 默认字节预算：图片页（16 MiB）+ 去重表保留的源字节 + 在途解码预留。
 ///
 /// 源字节是去重的代价（memcmp 需要原始缓冲）；图标 / logo 的压缩字节通常只有几十 KiB，
 /// 256 MiB 的预算让「5000 行 × 不同图标」这种工作集也不会误报 [`DecodeCause::Capacity`]。
+/// 单张合法最大图（16 M px、编码后 ≤ 64 MiB 字节）的准入估算 = 144 MiB 估算 + 64 MiB 源字节，
+/// 加上 16 MiB 图片页仍 ≤ 256 MiB —— 预算不会拒绝单张合法图，只拒绝**并发**的大图。
 const DEFAULT_BYTE_BUDGET: u64 = 256 * 1024 * 1024;
+
+/// 同时进行的图片解码数上限（`insert_async` 的 blocking 并发）。
+///
+/// tokio blocking 池默认上限 512 线程：批量大图不节流会把整机内存打爆（release `panic=abort`
+/// ⇒ 分配失败直接死）。2 张 4096² RGBA16 的峰值已接近默认预算，准入会先拒绝第三张；
+/// 该上限同时保证「大量小图」不会占满 blocking 池。AGENTS §1.2：不做用户配置层。
+const MAX_CONCURRENT_DECODES: usize = 2;
 
 /// 图片资源句柄（8 B，带代际）。
 ///
@@ -200,7 +221,7 @@ pub enum DecodeState {
 pub enum CapacityCause {
     /// 图片页里放不下该 tile。
     PageFull,
-    /// 字节预算（图片页缓冲 + 去重表保留的源字节）放不下该资源。
+    /// 字节预算（图片页缓冲 + 去重表保留的源字节 + 在途解码预留）放不下该资源。
     ByteBudget {
         /// 当前已用字节。
         used_bytes: u64,
@@ -326,7 +347,7 @@ pub struct ResourceStats {
     pub tiles: usize,
     /// 存活 tile 的内容区像素总和（缩放后的最终尺寸，不含 padding）。
     pub used_pixels: u64,
-    /// CPU 已用字节：图片页缓冲 + 去重表保留的源字节。
+    /// CPU 已用字节：图片页缓冲 + 去重表保留的源字节 + 在途解码预留。
     pub used_bytes: u64,
     /// tile 内容区像素 / 图片页像素（`0.0..=1.0`；没有图片页时 `0.0`）。
     pub page_occupancy: f32,
@@ -354,16 +375,23 @@ pub struct ResourceCache {
     page: Option<PageState>,
     /// 解码任务投递用的 tokio 句柄；`None` = 无 runtime（`insert_async` 退化为同步解码）。
     runtime: Option<tokio::runtime::Handle>,
+    /// 解码并发信号量：在途 blocking 解码各持有一个许可（上限 [`MAX_CONCURRENT_DECODES`]）。
+    decode_semaphore: Arc<Semaphore>,
+    /// 在途解码占用的预算（`estimate_peak + 源字节`），[`ResourceCache::poll`] 交付时归还。
+    reserved_decode_bytes: u64,
     /// 去重表保留的源字节总和（`stats.used_bytes` 的一部分）。
     source_bytes: u64,
     /// 存活 tile 的内容区像素总和。
     used_pixels: u64,
     /// LRU 时钟：每次成功引用（新建 / 去重命中）`+1`。
     epoch: u64,
-    /// 字节预算（图片页 + 去重表源字节）。
+    /// 字节预算（图片页 + 去重表源字节 + 在途解码预留）。
     byte_budget: u64,
     /// 累计 `Capacity` 失败次数。
     capacity_errors: u64,
+    /// 仅测试：已真正开始解码的 blocking 任务数（证明准入拒绝**没有投递**）。
+    #[cfg(test)]
+    decode_starts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// 图片页 + 它的分配器（同生同灭：页尺寸锁定后不再变化）。
@@ -380,6 +408,8 @@ struct PendingJob {
     state: DecodeState,
     /// 源字节（后台完成后的去重 memcmp 用；就绪槽位不保留）。
     source: Bytes,
+    /// 处于 `Pending` 时占用的预算（`estimate_peak + 源字节`）；交付时归还。
+    reservation: u64,
 }
 
 impl ResourceCache {
@@ -407,11 +437,15 @@ impl ResourceCache {
             pending_ids: Vec::new(),
             page: None,
             runtime,
+            decode_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
+            reserved_decode_bytes: 0,
             source_bytes: 0,
             used_pixels: 0,
             epoch: 0,
             byte_budget: DEFAULT_BYTE_BUDGET,
             capacity_errors: 0,
+            #[cfg(test)]
+            decode_starts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -477,7 +511,18 @@ impl ResourceCache {
         if let Some(image) = self.dedupe_hit(bytes) {
             return Ok(image);
         }
-        let decoded = image::decode(bytes)?;
+        // D-11：同步路径同样先读头 + 按峰值准入再解码（解码期间没有别的插入能改 `&mut self`，
+        // 所以这里的预留只用于复用准入逻辑，解码结束立即归还）。
+        let (width, height) = image::probe_dimensions(bytes)?;
+        let reservation = self.admit_decode(width, height, bytes.len())?;
+        let decoded = match image::decode(bytes) {
+            Ok(decoded) => decoded,
+            Err(cause) => {
+                self.release_reservation(reservation);
+                return Err(cause);
+            }
+        };
+        self.release_reservation(reservation);
         self.insert_decoded(Bytes::copy_from_slice(bytes), decoded)
     }
 
@@ -497,8 +542,10 @@ impl ResourceCache {
         Ok(image)
     }
 
-    /// 把解码投到 tokio 阻塞池，**立即**返回句柄（UI 线程只做轻量校验）。
+    /// 把解码投到 tokio 阻塞池，**立即**返回句柄（UI 线程只做轻量校验 + 头解析 + 预算准入）。
     ///
+    /// D-11：超出预算的图在**投递之前**就返回 `Failed(Capacity)`（不占解码线程、不占并发许可）；
+    /// 通过准入后在 async 任务里等并发许可（[`MAX_CONCURRENT_DECODES`]），拿到才投 blocking 解码。
     /// 结果通过 [`ResourceCache::poll`] 交付；[`ResourceCache::state`] 可随时查询。
     /// 缓存在测试 / 无 runtime 模式下（`new_unmanaged`）退化为同步解码并立即 `Ready`。
     pub fn insert_async(&mut self, bytes: Bytes) -> PendingResource {
@@ -507,17 +554,44 @@ impl ResourceCache {
                 result: None,
                 state: DecodeState::Failed(cause),
                 source: Bytes::new(),
+                reservation: 0,
             });
         }
         if let Some(image) = self.dedupe_hit(&bytes) {
-            // 去重命中：不需要解码，立刻可用。
+            // 去重命中：不需要解码，立刻可用（也不占解码预算）。
             return self.push_pending(PendingJob {
                 result: None,
                 state: DecodeState::Ready(image),
                 source: Bytes::new(),
+                reservation: 0,
             });
         }
+        // 头解析 + 预算准入都必须发生在投递之前：不合格的图不占线程、不占并发许可。
+        let (width, height) = match image::probe_dimensions(&bytes) {
+            Ok(dimensions) => dimensions,
+            Err(cause) => {
+                return self.push_pending(PendingJob {
+                    result: None,
+                    state: DecodeState::Failed(cause),
+                    source: Bytes::new(),
+                    reservation: 0,
+                });
+            }
+        };
+        let reservation = match self.admit_decode(width, height, bytes.len()) {
+            Ok(reservation) => reservation,
+            Err(cause) => {
+                return self.push_pending(PendingJob {
+                    result: None,
+                    state: DecodeState::Failed(cause),
+                    source: Bytes::new(),
+                    reservation: 0,
+                });
+            }
+        };
         let Some(runtime) = self.runtime.clone() else {
+            // 无 runtime：退化为同步解码；准入预留立即归还（该路径没有并发解码）。
+            self.release_reservation(reservation);
             let state = match image::decode(&bytes) {
                 Ok(decoded) => self.finish_decoded(bytes, decoded),
                 Err(cause) => DecodeState::Failed(cause),
@@ -526,30 +600,53 @@ impl ResourceCache {
                 result: None,
                 state,
                 source: Bytes::new(),
+                reservation: 0,
             });
         };
         let (sender, receiver) = oneshot::channel();
         let source = bytes.clone();
-        runtime.spawn_blocking(move || {
-            // 后台线程只解码字节；图集、页缓冲、LRU/预算全部留在 UI 线程。
-            let _ = sender.send(image::decode(&source));
+        let semaphore = Arc::clone(&self.decode_semaphore);
+        let blocking_runtime = runtime.clone();
+        #[cfg(test)]
+        let decode_starts = Arc::clone(&self.decode_starts);
+        runtime.spawn(async move {
+            // 并发许可在 async 任务里等（**不**占 blocking 线程）；拿到才真正投解码。
+            // 信号量只被本 cache 的解码任务共享，永不 close；拿不到只可能是防御性路径：
+            // 返回会 drop `sender`，`poll` 的 `TryRecvError::Closed` 会把预留归还。
+            let Ok(permit) = semaphore.acquire_owned().await else {
+                return;
+            };
+            blocking_runtime.spawn_blocking(move || {
+                // 许可活到解码结束（`_permit` 是绑定而不是 `_`，drop 在闭包末尾）。
+                let _permit = permit;
+                #[cfg(test)]
+                decode_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = sender.send(image::decode(&source));
+            });
         });
         self.push_pending(PendingJob {
             result: Some(receiver),
             state: DecodeState::Pending,
             source: bytes,
+            reservation,
         })
     }
 
     /// 每帧在 UI 线程调用一次：把已完成的异步解码装箱进图集。
     ///
     /// 返回**本次**就绪 / 失败的项（每项只交付一次；交付后 `PendingResource` 被回收）。
-    /// 后台线程从不触碰图集，装箱（去重 / 预算 / 分配 / 写页）只在这里发生。
+    /// 后台线程从不触碰图集，装箱（去重 / 分配 / 写页）只在这里发生。交付（成功或失败）时
+    /// 归还在途解码预算预留——完成但未交付的 oneshot 结果仍占内存，所以归还得跟着交付走。
     pub fn poll(&mut self) -> Vec<(PendingResource, DecodeState)> {
-        let ids: Vec<PendingResource> = self.pending_ids.clone();
+        // 就地消费键表（不再 clone 整张表 + 事后 filter，热路径零额外分配）。
+        let ids = std::mem::take(&mut self.pending_ids);
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
-            // 1. 同步就绪（去重命中 / 轻量校验失败 / 无 runtime 的退化路径）。
+            if self.pending.get(id).is_none() {
+                // 槽位已被回收（防御性：键表与 Arena 不应失配）。
+                continue;
+            }
+            // 1. 同步就绪（去重命中 / 轻量校验失败 / 准入拒绝 / 无 runtime 的退化路径）。
             let ready = self
                 .pending
                 .get(id)
@@ -562,28 +659,19 @@ impl ResourceCache {
             }
             // 2. 后台任务：只在这里装箱。
             let Some(completion) = self.take_completion(id) else {
+                self.pending_ids.push(id);
                 continue;
             };
-            let source = self
-                .pending
-                .get(id)
-                .map_or_else(Bytes::new, |job| job.source.clone());
+            let Some(job) = self.pending.remove(id) else {
+                continue;
+            };
+            self.release_reservation(job.reservation);
             let state = match completion {
-                Ok(decoded) => self.finish_decoded(source, decoded),
+                Ok(decoded) => self.finish_decoded(job.source, decoded),
                 Err(cause) => DecodeState::Failed(cause),
             };
-            self.pending.remove(id);
             out.push((id, state));
         }
-        let live: Vec<PendingResource> = {
-            let pending = &self.pending;
-            self.pending_ids
-                .iter()
-                .copied()
-                .filter(|id| pending.get(*id).is_some())
-                .collect()
-        };
-        self.pending_ids = live;
         out
     }
 
@@ -658,7 +746,8 @@ impl ResourceCache {
         Some(entry.image)
     }
 
-    /// 解码结果 → 图集：预算检查 → 装箱写页 → 去重索引。
+    /// 解码结果 → 图集：装箱写页 → 去重索引（预算准入已在**解码之前**由
+    /// [`ResourceCache::admit_decode`] 完成，这里不再重复检查）。
     fn insert_decoded(
         &mut self,
         source: Bytes,
@@ -666,7 +755,6 @@ impl ResourceCache {
     ) -> Result<ResourceImage, DecodeCause> {
         let key = ContentKey::new(&source);
         self.ensure_page();
-        self.ensure_budget(decoded.width, decoded.height, source.len() as u64)?;
         let image = self.place(decoded, key)?;
         self.source_bytes = self.source_bytes.saturating_add(source.len() as u64);
         if let Some(replaced) = self.dedupe.insert(
@@ -684,20 +772,26 @@ impl ResourceCache {
         Ok(image)
     }
 
-    /// 字节预算检查（图片页 CPU 缓冲 + 去重表保留的源字节）。
+    /// 解码前预算准入（D-11）：`图片页 + 源字节 + 在途预留 + estimate + 本次源字节 ≤ 预算`。
+    ///
+    /// 通过时把 `estimate + 源字节` 记进 [`ResourceCache::reserved_decode_bytes`] 并返回预留
+    /// 字节数（交付时归还）；失败是 [`CapacityCause::ByteBudget`]，**不投递**解码。
     ///
     /// 超预算时**不得**静默淘汰仍在引用的 tile（那会破坏「tile 恒有效」）。空闲条目在
-    /// `unload` / `release_window` 里已经即时回收，所以这里没有可淘汰对象，直接报
-    /// [`CapacityCause::ByteBudget`]。
-    fn ensure_budget(
+    /// `unload` / `release_window` 里已经即时回收，所以这里没有可淘汰对象，直接报错。
+    fn admit_decode(
         &mut self,
         width: u32,
         height: u32,
-        additional: u64,
-    ) -> Result<(), DecodeCause> {
+        source_len: usize,
+    ) -> Result<u64, DecodeCause> {
+        // 预算口径必须包含图片页：页是懒分配的，准入时先建页才能让 `used_bytes()` 反映真实成本。
+        self.ensure_page();
+        let reservation = image::estimate_peak(width, height).saturating_add(source_len as u64);
         let used = self.used_bytes();
-        if used.saturating_add(additional) <= self.byte_budget {
-            return Ok(());
+        if used.saturating_add(reservation) <= self.byte_budget {
+            self.reserved_decode_bytes = self.reserved_decode_bytes.saturating_add(reservation);
+            return Ok(reservation);
         }
         self.capacity_errors = self.capacity_errors.saturating_add(1);
         Err(DecodeCause::Capacity {
@@ -709,6 +803,11 @@ impl ResourceCache {
                 limit_bytes: self.byte_budget,
             },
         })
+    }
+
+    /// 归还一笔在途解码预留（交付 / 同步路径结束）。
+    fn release_reservation(&mut self, reservation: u64) {
+        self.reserved_decode_bytes = self.reserved_decode_bytes.saturating_sub(reservation);
     }
 
     /// 把解码结果装箱进图片页（预算检查已由调用方完成）。
@@ -886,7 +985,7 @@ impl ResourceCache {
 
     fn used_bytes(&self) -> u64 {
         let (width, height) = self.page_dimensions();
-        u64::from(width) * u64::from(height) * 4 + self.source_bytes
+        u64::from(width) * u64::from(height) * 4 + self.source_bytes + self.reserved_decode_bytes
     }
 }
 
@@ -902,8 +1001,8 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        CapacityCause, DecodeCause, DecodeState, PendingResource, ResourceCache, ResourceId,
-        ResourceImage, ResourceStats,
+        CapacityCause, DEFAULT_BYTE_BUDGET, DecodeCause, DecodeState, MAX_CONCURRENT_DECODES,
+        PendingResource, ResourceCache, ResourceId, ResourceImage, ResourceStats,
     };
     use crate::{
         error::EngineError,
@@ -914,14 +1013,19 @@ mod tests {
     };
 
     fn png(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
+        encoded(width, height, rgba, image::ImageFormat::Png)
+    }
+
+    /// 指定尺寸 / 颜色 / 格式的编码字节（JPEG 只能写 RGB，`write_to` 会做转换）。
+    fn encoded(width: u32, height: u32, rgba: [u8; 4], format: image::ImageFormat) -> Vec<u8> {
         let pixels: Vec<u8> = std::iter::repeat_n(rgba, (width * height) as usize)
             .flatten()
             .collect();
         let image = image::RgbaImage::from_raw(width, height, pixels).expect("raw");
         let mut out = std::io::Cursor::new(Vec::new());
         image::DynamicImage::ImageRgba8(image)
-            .write_to(&mut out, image::ImageFormat::Png)
-            .expect("encode png");
+            .write_to(&mut out, format)
+            .expect("encode");
         out.into_inner()
     }
 
@@ -1402,14 +1506,21 @@ mod tests {
         assert_eq!(cache.len(), 0);
     }
 
-    /// R12-16 预算：超预算的插入是 `Capacity`（`ByteBudget`），`unload` 之后能再插。
+    /// R12-16 预算 + D-11 准入：超预算的插入是 `Capacity`（`ByteBudget`），`unload` 之后能再插。
+    ///
+    /// D-11 起预算口径是「图片页 + 源字节 + 在途解码预留」，准入在**解码前**按
+    /// `estimate_peak(4,4) + 源字节` 预留，所以这里的预算按「页 + 一张的预留 + 第二张源字节 − 1」
+    /// 构造：第一张放得下，第二张在解码前就被拒。
     #[test]
     fn byte_budget_reports_capacity_and_recovers_after_unload() {
         let first_bytes = png(4, 4, [1, 2, 3, 255]);
         let second_bytes = png(4, 4, [4, 5, 6, 255]);
         let page_bytes = 16 * 16 * 4;
-        // 正好放得下一张（页 + 第一张源字节），放不下两张。
-        let budget = page_bytes + first_bytes.len() as u64 + second_bytes.len() as u64 - 1;
+        let budget = page_bytes
+            + super::image::estimate_peak(4, 4)
+            + first_bytes.len() as u64
+            + second_bytes.len() as u64
+            - 1;
         let mut cache = ResourceCache::for_test((16, 16), budget, None);
 
         let first = cache.insert(&first_bytes).expect("第一张必须在预算内");
@@ -1426,6 +1537,7 @@ mod tests {
         );
         assert_eq!(cache.len(), 1, "预算失败不改变既有条目");
         assert_eq!(cache.stats().capacity_errors, 1);
+        assert_eq!(cache.reserved_decode_bytes, 0, "准入失败不得留下预留");
 
         assert!(cache.unload(first.id));
         let second = cache.insert(&second_bytes).expect("unload 之后预算有空间");
@@ -1462,5 +1574,199 @@ mod tests {
         assert_eq!(stats.used_pixels, 0);
         assert_eq!(stats.used_bytes, 16 * 16 * 4, "图片页本身不释放");
         assert_eq!(stats.page_occupancy, 0.0);
+    }
+
+    /// D-11：预算准入在**投递之前**拒绝，不占解码线程、不留预留。
+    #[test]
+    fn async_decode_admission_rejects_before_spawning() {
+        let runtime = runtime();
+        let bytes = png(200, 200, [1, 2, 3, 255]);
+        let page_bytes = 16 * 16 * 4;
+        // 预算连「页 + 估算」都不够：准入必然拒绝。
+        let budget = page_bytes + super::image::estimate_peak(200, 200) - 1;
+        let mut cache = ResourceCache::for_test((16, 16), budget, Some(runtime.handle().clone()));
+
+        let pending = cache.insert_async(Bytes::from(bytes));
+        let state = cache.state(pending);
+        assert!(
+            matches!(
+                &state,
+                DecodeState::Failed(DecodeCause::Capacity {
+                    cause: CapacityCause::ByteBudget { .. },
+                    ..
+                })
+            ),
+            "超预算必须在 UI 线程立即 Failed，而不是投递后才发现：{state:?}"
+        );
+        assert_eq!(cache.stats().capacity_errors, 1);
+        assert_eq!(cache.reserved_decode_bytes, 0, "拒绝的图不得占用预算预留");
+        assert_eq!(
+            cache
+                .decode_starts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "准入拒绝不得投递解码任务"
+        );
+        assert_eq!(cache.len(), 0, "失败不得留下图集条目");
+
+        // Failed 仍然通过 poll 交付一次（与轻量校验失败同一语义）。
+        let delivered = cache.poll();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].0, pending);
+        assert_eq!(delivered[0].1, state);
+        assert!(cache.poll().is_empty(), "交付后不得重复");
+    }
+
+    /// D-11：在途解码预留从准入保持到 poll 交付；交付后归还，下一张才能插入。
+    #[test]
+    fn async_decode_reservations_are_returned_after_completion() {
+        let runtime = runtime();
+        let first_bytes = png(4, 4, [1, 2, 3, 255]);
+        let second_bytes = png(4, 4, [4, 5, 6, 255]);
+        let page_bytes = 16 * 16 * 4;
+        // 准入预留 = 峰值估算 + 源字节；预算只够**一张**的预留。
+        let first_reservation = super::image::estimate_peak(4, 4) + first_bytes.len() as u64;
+        let second_reservation = super::image::estimate_peak(4, 4) + second_bytes.len() as u64;
+        let budget = page_bytes + first_reservation + second_reservation - 1;
+        let mut cache = ResourceCache::for_test((16, 16), budget, Some(runtime.handle().clone()));
+
+        let first = cache.insert_async(Bytes::from(first_bytes));
+        assert_eq!(cache.state(first), DecodeState::Pending);
+        assert_eq!(
+            cache.reserved_decode_bytes, first_reservation,
+            "第一张必须占着在途预留（含源字节）"
+        );
+
+        // 第二张在准入被第一张的预留挡住：立即 Failed，不投递。
+        let second = cache.insert_async(Bytes::from(second_bytes.clone()));
+        assert!(
+            matches!(
+                cache.state(second),
+                DecodeState::Failed(DecodeCause::Capacity {
+                    cause: CapacityCause::ByteBudget { .. },
+                    ..
+                })
+            ),
+            "第二张必须在准入阶段被拒"
+        );
+
+        let state = poll_until(&mut cache, first);
+        assert!(matches!(state, DecodeState::Ready(_)), "{state:?}");
+        assert_eq!(cache.reserved_decode_bytes, 0, "交付后预留必须归零");
+
+        // 预留归还之后，同一份字节可以重新插入并交付。
+        let second = cache.insert_async(Bytes::from(second_bytes));
+        assert_eq!(cache.state(second), DecodeState::Pending);
+        let state = poll_until(&mut cache, second);
+        assert!(matches!(state, DecodeState::Ready(_)), "{state:?}");
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.reserved_decode_bytes, 0);
+    }
+
+    /// D-11：并发上限——许可被占满时 `insert_async` 不得开始解码，释放许可后才投 blocking。
+    #[test]
+    fn async_decodes_wait_for_a_free_concurrency_permit() {
+        use std::{
+            sync::atomic::Ordering,
+            time::{Duration, Instant},
+        };
+
+        let runtime = runtime();
+        let mut cache = ResourceCache::for_test(
+            (64, 64),
+            DEFAULT_BYTE_BUDGET,
+            Some(runtime.handle().clone()),
+        );
+        // 手动占满并发许可，模拟已有 `MAX_CONCURRENT_DECODES` 张图正在解码。
+        let mut held = Vec::with_capacity(MAX_CONCURRENT_DECODES);
+        for _ in 0..MAX_CONCURRENT_DECODES {
+            held.push(
+                cache
+                    .decode_semaphore
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("新建缓存的许可必须全部可用"),
+            );
+        }
+
+        let pending = cache.insert_async(Bytes::from(png(8, 8, [1, 2, 3, 255])));
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            cache.decode_starts.load(Ordering::SeqCst),
+            0,
+            "没有空闲许可时不得开始解码"
+        );
+        assert!(cache.poll().is_empty(), "等待许可的任务不得交付");
+
+        drop(held.pop());
+        let state = poll_until(&mut cache, pending);
+        assert!(matches!(state, DecodeState::Ready(_)), "{state:?}");
+        assert_eq!(
+            cache.decode_starts.load(Ordering::SeqCst),
+            1,
+            "拿到许可后恰好解码一次"
+        );
+
+        // 解码闭包在 send 之后才 drop 许可：稍等再断言许可已全部归还。
+        drop(held);
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while cache.decode_semaphore.available_permits() < MAX_CONCURRENT_DECODES
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            cache.decode_semaphore.available_permits(),
+            MAX_CONCURRENT_DECODES,
+            "解码结束后并发许可必须全部归还"
+        );
+    }
+
+    /// D-11：同步 `insert` 也走同一套「先读头 + 准入，再解码」。
+    #[test]
+    fn sync_insert_uses_the_same_decode_admission() {
+        let bytes = png(200, 200, [1, 2, 3, 255]);
+        let page_bytes = 16 * 16 * 4;
+        let budget = page_bytes + super::image::estimate_peak(200, 200) - 1;
+        let mut cache = ResourceCache::for_test((16, 16), budget, None);
+
+        let error = decode_cause(insert_error(&mut cache, &bytes));
+        assert!(
+            matches!(
+                &error,
+                DecodeCause::Capacity {
+                    cause: CapacityCause::ByteBudget { .. },
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.reserved_decode_bytes, 0, "同步失败路径必须归还预留");
+        assert_eq!(cache.stats().capacity_errors, 1);
+    }
+
+    /// D-11：PNG / JPEG / WebP 的「文件头尺寸」必须等于解码后的尺寸（准入估算的来源）。
+    #[test]
+    fn decode_peak_estimate_matches_header_dimensions() {
+        for format in [
+            image::ImageFormat::Png,
+            image::ImageFormat::Jpeg,
+            image::ImageFormat::WebP,
+        ] {
+            let bytes = encoded(200, 100, [90, 120, 150, 255], format);
+            let probed = super::image::probe_dimensions(&bytes).expect("probe header");
+            assert_eq!(probed, (200, 100), "{format:?} 的头尺寸");
+            let decoded = super::image::decode(&bytes).expect("decode");
+            assert_eq!(
+                (decoded.width, decoded.height),
+                probed,
+                "{format:?} 的 probe 尺寸必须等于解码尺寸"
+            );
+            assert!(
+                super::image::estimate_peak(probed.0, probed.1) > 200 * 100 * 4,
+                "{format:?} 的峰值估算必须覆盖 RGBA 输出下界"
+            );
+        }
     }
 }
