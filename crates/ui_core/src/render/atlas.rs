@@ -290,6 +290,29 @@ impl AtlasAllocator {
             .any(|slot| matches!(slot, Some(existing) if *existing == id))
     }
 
+    /// 仅探测：`content`（+padding）当前能否在本页分配。**不改动** tiles / 脏矩形 / 代际。
+    ///
+    /// 实现是「分配后立刻归还」：`etagere` 没有只读的 fit 查询；归还后 free list 与本页原状态
+    /// 等价（同一块矩形回到空闲表），不会泄漏或改变语义。仅供 [`ImageAtlasPager::would_open_new_page`]
+    /// 在**解码前预算准入**里判断是否可能新开一页（RD-2）；不在热路径。
+    pub(crate) fn has_room_for(&mut self, content: (u32, u32)) -> bool {
+        let (width, height) = content;
+        let Some(padded) = width.checked_add(2).zip(height.checked_add(2)) else {
+            return false;
+        };
+        if padded.0 > self.page.0 || padded.1 > self.page.1 {
+            return false;
+        }
+        let Some(allocation) = self
+            .allocator
+            .allocate(size2(padded.0 as i32, padded.1 as i32))
+        else {
+            return false;
+        };
+        self.allocator.deallocate(allocation.id);
+        true
+    }
+
     /// 清空并 `generation += 1`（DPI 变化 / 字体换代 / 容量逃逸）。
     pub(crate) fn clear(&mut self) {
         self.allocator = EtagereAllocator::new(size2(self.page.0 as i32, self.page.1 as i32));
@@ -404,6 +427,39 @@ impl ImageAtlasPager {
         // 与生产「空页按 LRU 回收」是同一条代码路径（测试因此覆盖真实回收逻辑）。
         self.idle.push(0);
         self.clock = 1;
+    }
+
+    /// 分配 `content` 是否**必然新开一页**（页数 +1；命中现有页空闲空间或 LRU 复用空页都不算）。
+    ///
+    /// RD-2：资源层在**解码前预算准入**时用它判断是否要额外预留一页 CPU 缓冲（16 MiB）——
+    /// 旧实现只在 `page_count()==0` 时预留一页，已开页后再新开页可让 `used_bytes` 超出预算
+    /// 最多 3 页（48 MiB）。estimate 只需保守（按源尺寸 clamp 到 `MAX_TILE_DIM`），
+    /// 多预留只会让预算更严格、不会漏。
+    pub(crate) fn would_open_new_page(&mut self, content: (u32, u32)) -> bool {
+        let (width, height) = content;
+        if width == 0 || height == 0 {
+            return false;
+        }
+        let Some(padded) = width.checked_add(2).zip(height.checked_add(2)) else {
+            return false;
+        };
+        if padded.0 > self.page_size || padded.1 > self.page_size {
+            return false;
+        }
+        // 非空页有空闲空间 ⇒ 不开新页。
+        for index in 0..self.pages.len() {
+            if self.pages[index].live == 0 {
+                continue;
+            }
+            if self.pages[index].allocator.has_room_for(content) {
+                return false;
+            }
+        }
+        // 有空闲页 ⇒ 原地回收复用，页数不变。
+        if !self.idle.is_empty() {
+            return false;
+        }
+        self.pages.len() < usize::from(MAX_IMAGE_PAGES)
     }
 
     /// 分配一块内容区（1 纹素 padding 由 [`AtlasAllocator`] 加）。返回的 `tile.page` 已设置。
@@ -1296,12 +1352,16 @@ mod tests {
         assert!(seen.iter().all(|used| *used), "每个页号都必须被用到");
     }
 
-    /// D-9：**只**回收已空的页，活 tile 永不淘汰；回收按 LRU（最久未用的空页先复用）。
+    /// D-9/RD-3：**只**回收已空的页，活 tile 永不淘汰；回收按 LRU（最久未用的空页先复用）。
+    ///
+    /// 必须钉死顺序（旧测试只断言 `recycled == 1 || 2`，把 `min_by_key` 改成 `max_by_key`
+    /// 也能通过）：62² 内容 + 1 纹素 padding = 64² 整页（每页恰好一块），页 1 先变空
+    /// （更久未用）⇒ 下一次分配必须落在页 1；页 2 其次。
     #[test]
     fn image_pager_recycles_the_least_recently_used_empty_page() {
         let mut pager = ImageAtlasPager::with_page_for_test(64);
         let mut per_page: ahash::HashMap<u16, Vec<etagere::AllocId>> = ahash::HashMap::default();
-        while let Some(allocation) = pager.allocate((18, 18)) {
+        while let Some(allocation) = pager.allocate((62, 62)) {
             per_page
                 .entry(allocation.tile.page)
                 .or_default()
@@ -1315,23 +1375,24 @@ mod tests {
         for id in per_page.remove(&2).expect("page 2 has tiles") {
             pager.deallocate(2, id);
         }
-        assert!(
-            pager.allocate((18, 18)).is_some(),
-            "存在空页时必须能继续分配"
+        let first = pager.allocate((62, 62)).expect("存在空页时必须能分配");
+        assert_eq!(
+            first.tile.page, 1,
+            "必须精确回收**最久未用**的空页（页 1），而不是任意空页"
         );
-        // 页 2 在页 1 之后变空（更近），因此下一次回收应挑页 1……但上一步已经用掉了页 1，
-        // 这里只钉「回收的是空页」这个可观测契约：重新分配必须落在 1 或 2（不是新页 4）。
-        assert_eq!(pager.page_count(), usize::from(MAX_IMAGE_PAGES));
-        let recycled = {
-            let allocation = pager.allocate((18, 18)).expect("another tile");
-            allocation.tile.page
-        };
-        assert!(
-            recycled == 1 || recycled == 2,
-            "只能复用已空的页（LRU），实际拿到页 {recycled}"
+        let second = pager.allocate((62, 62)).expect("第二个空页");
+        assert_eq!(second.tile.page, 2, "其次回收较近变空的页 2");
+        assert_eq!(
+            pager.page_count(),
+            usize::from(MAX_IMAGE_PAGES),
+            "回收空页不得增加页数"
         );
-        // 活 tile 存在时不得回收该页：把页 0 分配出去后仍应能继续用其它空页。
-        assert!(pager.allocate((18, 18)).is_some());
+        // 使用中保护：页 0/3 仍有活 tile、且此时没有空页 ⇒ 分配必须失败（4 页全满），
+        // 绝不为了腾空间回收活 tile。
+        assert!(
+            pager.allocate((62, 62)).is_none(),
+            "活 tile 的页（0/3）绝不能被回收，且不得开第 5 页"
+        );
     }
 
     /// D-9：新页第一次取脏矩形必须是整页哨兵（三端首次必须整层上传）。
