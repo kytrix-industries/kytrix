@@ -1151,6 +1151,10 @@ impl InputEvent {
 /// `key` 事件），AppKit 的 `characters` 同样不受 `isARepeat` 过滤。
 /// 保留这个形参是契约的一部分：一旦有人重新拿 `repeat` 过滤文本，
 /// `should_emit_text_ignores_auto_repeat` 就会失败。
+///
+/// **与 `InputEvent::Key` 的判据不同**：文本只被「IME 接管 / 组合中」抑制，物理按键还多一条
+/// 「命令修饰键豁免」（Ctrl/Alt/Meta 组合即使组合中也必须到达绑定）。那条判据见
+/// `platform::ime::key_visible`（B4），两份契约不要混用。
 #[must_use]
 pub fn should_emit_text(
     state: KeyState,
