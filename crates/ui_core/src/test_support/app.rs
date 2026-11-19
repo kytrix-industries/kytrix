@@ -116,7 +116,8 @@ impl TestApp {
         self.step(A11yGate::Immediate)
     }
 
-    /// 推进一帧，a11y 交付走**平台泵**的闸门：脏位在 `A11Y_THROTTLE`（100 ms）内不交付。
+    /// 推进一帧，a11y 交付走**平台泵**的闸门：单点数据增量在 `A11Y_THROTTLE`（100 ms）内不
+    /// 交付；焦点变化 / 消费端重置 / 分批未走完（首树、DPI 重建）走不节流旁路（E5）。
     ///
     /// 帧脚本（[`super::script`]）用它断言「第 k 帧的 a11y 交付被节流」——节流是平台泵的行为，
     /// [`Self::drain`] 的立即交付抓不到它。
@@ -2319,6 +2320,123 @@ mod p11_fix_tests {
             record.character_positions.is_empty() && record.character_widths.is_empty(),
             "方向为 Auto 时必须省略字符度量（不猜方向、不发错轴的值）"
         );
+    }
+
+    /// 造 `count` 个固定几何的行（`layout_override` ⇒ 边界可预测，根的直接子节点）。
+    fn rows_fixture(app: &mut TestApp, count: usize) -> Vec<NodeId> {
+        let window = app.window_id();
+        let tree = app
+            .app_mut()
+            .window_mut(window)
+            .expect("window")
+            .tree_mut();
+        let root = tree.root();
+        (0..count)
+            .map(|index| {
+                NodeBuilder::boxed()
+                    .layout_override(Rect::new(0.0, index as f32, 10.0, 1.0))
+                    .build(tree, root)
+                    .expect("row")
+            })
+            .collect()
+    }
+
+    /// E5：分批首树**不节流** —— 不推进时钟（模拟时间静止）也必须逐批交付到收敛。
+    ///
+    /// 修前行为：`A11Y_THROTTLE` 对**每一笔**生效（首笔之后每批要等 100 ms），40k 节点 ≈
+    /// 20 × 100 ms ≈ 2 s。修后只有「单点高频增量」被 100 ms 合并；还有待发批次时立即继续。
+    ///
+    /// 变异守卫：删掉 `App::a11y_pending` 的 `a11y_backlog_pending()` 旁路 ⇒ 首笔之后
+    /// `a11y_pending` 为假（时钟未推进），循环一轮都跑不了，本用例红。
+    #[test]
+    fn a_large_first_tree_is_not_throttled() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let rows = rows_fixture(&mut app, 5000);
+        let _ = app.drain_pump().expect("首帧");
+        assert!(
+            app.a11y_update().expect("首笔").tree.is_some(),
+            "首笔必须全树"
+        );
+        app.assert_a11y_contract();
+
+        let mut batches = 1usize;
+        while app.app().a11y_pending(window) {
+            let _ = app.drain_pump().expect("后续批次（不推进时钟）");
+            let update = app.a11y_update().expect("有待发批次时每轮都必须交付");
+            assert!(update.tree.is_none(), "只有首笔携带 TreeInfo");
+            app.assert_a11y_contract();
+            batches += 1;
+            assert!(batches < 16, "分批必须收敛（实际 {batches} 笔）");
+        }
+        assert!(
+            batches >= 3,
+            "5000 节点必须分多批（实际 {batches} 笔；若只有 1 笔说明预算/语义被改动）"
+        );
+
+        // 增量仍被 100 ms 合并：修复没有把「单点数据更新」也变成连续投递。
+        app.app_mut()
+            .window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .mark_a11y(rows[0]);
+        assert!(
+            !app.app().a11y_pending(window),
+            "单点增量仍在 A11Y_THROTTLE 窗口内（省电目标不变）"
+        );
+        app.advance(std::time::Duration::from_millis(100));
+        assert!(
+            app.app().a11y_pending(window),
+            "节流窗口到期后增量恢复交付"
+        );
+        let _ = app.drain_pump().expect("到期补发");
+        app.assert_a11y_contract();
+    }
+
+    /// E5：DPI 变化（`set_scale`）后的整轮全量重建同样**不受节流**、无停顿地分批补齐，
+    /// 且每批 bounds 已乘新 scale。
+    #[test]
+    fn a_dpi_change_redelivers_all_batches_without_stall() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let rows = rows_fixture(&mut app, 5000);
+        let _ = app.drain_pump().expect("首帧");
+        while app.app().a11y_pending(window) {
+            let _ = app.drain_pump().expect("首树剩余批次");
+            app.assert_a11y_contract();
+        }
+
+        let scale = Scale::new(2.0).expect("scale");
+        app.app_mut()
+            .window_mut(window)
+            .expect("window")
+            .set_scale(scale);
+        let _ = app.drain_pump().expect("DPI 首笔");
+        assert!(
+            app.a11y_update().expect("DPI 首笔").tree.is_some(),
+            "DPI 变化后的第一笔必须是全树"
+        );
+        app.assert_a11y_contract();
+        // 首笔（DFS 前 2048 节点）含 root + rows[0..2046]：bounds 必须是 逻辑 × 2。
+        let first = app.a11y().expect("DPI 首笔 snapshot").clone();
+        let record = first.node_for(rows[0]).expect("row 0 在首笔里");
+        let logical = app.probe().bounds(rows[0]).expect("logical bounds");
+        assert_eq!(
+            record.bounds,
+            logical.to_physical(scale),
+            "DPI 变化后首笔的 bounds 必须已乘新 scale（不是旧值）"
+        );
+
+        let mut batches = 1usize;
+        while app.app().a11y_pending(window) {
+            let _ = app.drain_pump().expect("DPI 剩余批次（不推进时钟）");
+            app.assert_a11y_contract();
+            batches += 1;
+            assert!(batches < 20, "DPI 全树分批必须收敛（实际 {batches} 笔）");
+        }
+        assert!(batches >= 3, "5000 节点的 DPI 全树必须分多批重发");
     }
 }
 

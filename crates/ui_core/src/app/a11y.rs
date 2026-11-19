@@ -87,10 +87,12 @@ pub(crate) fn a11y_put_handler(
 /// 该窗口本轮是否有 a11y 工作（O(1)；平台泵每轮用它过滤 `update_if_active`）。
 /// 消费者：`App::a11y_pending`。
 ///
-/// 两条不节流旁路（`A11Y_THROTTLE` 只约束**已接入后**的高频数据更新）：
+/// 三条不节流旁路（`A11Y_THROTTLE` 只约束**已接入后**的高频数据增量）：
 /// - **焦点变化**（R13-5）：读屏用户的"位置感"绑定在焦点反馈的时效上；
 /// - **消费端重置**（E1）：AT 重新激活 / adapter 停用后 AccessKit 停在 `Pending`，在收到全树
-///   之前 AT 看到的是空树；此时也没有脏位可供到期补发，必须立刻交付。
+///   之前 AT 看到的是空树；此时也没有脏位可供到期补发，必须立刻交付；
+/// - **未交付批次**（E5）：分批首树 / DPI 全量重建只发了一部分时必须连续推进 —— 否则
+///   40k 节点 ≈ 20 批 × 100 ms 节流 ≈ 2 s 的首屏可访问性延迟（审查 §3.10 P1）。
 #[must_use]
 pub(crate) fn a11y_pending(app: &App, window: WindowId) -> bool {
     let Some(target) = app.windows.get(&window) else {
@@ -101,6 +103,7 @@ pub(crate) fn a11y_pending(app: &App, window: WindowId) -> bool {
     }
     target.a11y_focus_pending()
         || target.a11y_consumer_epoch_pending()
+        || target.a11y_backlog_pending()
         || app
             .a11y_delivered
             .get(&window)

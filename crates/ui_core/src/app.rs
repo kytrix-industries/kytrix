@@ -68,10 +68,11 @@ use crate::{
 /// a11y 诊断的环形容量（与 `text_diagnostics` 同口径：超出丢最旧）。
 const A11Y_DIAGNOSTIC_CAPACITY: usize = 64;
 
-/// a11y 交付的最小间隔（按窗口；P2-6）。
+/// a11y 交付的最小间隔（按窗口；P2-6 / E5）。
 ///
-/// 100 ms 对应 10 Hz：屏幕阅读器自身也消化不了更快的变化，而实时行情会让 A11Y`r
-/// 脏位每帧为真 —— 不限流时每帧都要全树扫描并构造 TreeUpdate。
+/// 100 ms 对应 10 Hz：屏幕阅读器自身也消化不了更快的变化，而实时行情会让 A11Y 脏位每帧为真。
+/// **只约束「已接入后」的高频数据增量**（E5）：首树 / DPI 全量重建的分批（[`A11yBridge::backlog`]）
+/// 与焦点变化、消费端重置一样走不节流旁路 —— 否则 40k 节点的 20 批首树会被拖成 ≈2 s。
 const A11Y_THROTTLE: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// 一次样式求值 pass 的结果（P06 的 `FrameRecord` 会复用这些字段）。

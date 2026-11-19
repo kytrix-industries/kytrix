@@ -219,6 +219,21 @@ impl A11yBridge {
         self.focus_changed(tree, focus)
     }
 
+    /// 是否还有**未交付的批次工作**（`App::a11y_pending` 的不节流旁路；E5）。
+    ///
+    /// 两类来源：
+    /// - 全量重建**待发**（`full_pending` / DPI 代际变化）：首树、`set_scale`、捕获开启；
+    /// - 全量/增量已发了一部分、`queue` 里还有待发候选或待重发父节点。
+    ///
+    /// 这种「多笔连续投递」状态必须**连续推进**（每轮泵至少一笔），不能被 `A11Y_THROTTLE`
+    /// （100 ms/笔）拖成 20 × 100 ms ≈ 2 s；单点高频增量不受影响（这里为假 ⇒ 仍按 100 ms 合并）。
+    pub(crate) fn backlog(&self) -> bool {
+        self.full_pending
+            || self.bounds_epoch != self.seen_bounds_epoch
+            || self.queue_cursor < self.queue.len()
+            || !self.refresh.is_empty()
+    }
+
     /// 当前因每笔预算而**未交付**的重发父节点数（P2-6 的"未交付剩余量"指标）。
     ///
     /// 非 0 ⇒ 还有父节点的 `children` 未补齐：`pending()` 恒为真、平台泵的下一轮会继续发。

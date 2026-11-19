@@ -35,6 +35,13 @@ pub(crate) fn a11y_consumer_epoch_pending(window: &Window) -> bool {
     window.a11y.consumer_epoch_pending()
 }
 
+// 消费者：`impl Window::a11y_backlog_pending` 的薄委托。
+/// 是否还有未交付的 a11y 批次（首树/DPI 全量重建的分批未走完；`App::a11y_pending` 的
+/// 不节流旁路，E5）。
+pub(crate) fn a11y_backlog_pending(window: &Window) -> bool {
+    window.a11y.backlog()
+}
+
 // 消费者：`impl Window::a11y_engine_of` 的薄委托（动作解码）。
 /// 稳定 a11y id → 当前引擎句柄（未知 / 已回收 ⇒ `None`，调用方记 `StaleAction`）。
 pub(crate) fn a11y_engine_of(

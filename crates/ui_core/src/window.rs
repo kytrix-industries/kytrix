@@ -682,6 +682,11 @@ impl Window {
     pub(crate) fn a11y_consumer_epoch_pending(&self) -> bool {
         a11y::a11y_consumer_epoch_pending(self)
     }
+    /// 是否还有未交付的 a11y 批次（分批首树/DPI 全量重建未走完；不节流旁路，E5）。
+    #[must_use]
+    pub(crate) fn a11y_backlog_pending(&self) -> bool {
+        a11y::a11y_backlog_pending(self)
+    }
     /// 稳定 a11y id → 引擎句柄（`ActionRequest` 解码）。
     #[must_use]
     pub(crate) fn a11y_engine_of(
