@@ -36,6 +36,12 @@ use crate::paint::color::ColorBrush;
 /// 诊断环形缓冲上限。
 const DIAGNOSTIC_LIMIT: usize = 64;
 
+/// 配置期诊断：由配置决定、长期有效（当前只有字体栈）。字形诊断的洪峰不得把它们挤出
+/// 诊断环 —— 否则「字体栈一个候选都没命中」这类启动期问题几帧后就不可观测（D-4）。
+fn is_config_diagnostic(diagnostic: &TextDiagnostic) -> bool {
+    matches!(diagnostic, TextDiagnostic::FontStackMiss { .. })
+}
+
 /// 家族名覆盖的缓存条目上限（超过即整表重建：覆盖家族名是极低频配置）。
 const CUSTOM_FAMILY_LIMIT: usize = 16;
 
@@ -262,26 +268,34 @@ impl TextContext {
             .expect("ensure_stack_status always fills the cache")
     }
 
-    /// 首次使用时求值一次字体栈状态，并（若不健康）记一条诊断。
+    /// 求值一次字体栈状态（每栈版本一次），并（若不健康）**每次使用都重压**那条配置诊断。
+    ///
+    /// 配置期诊断是「一次配置、长期有效」的：重压 + 去重（移到最新）保证它不会因为后续字形
+    /// 诊断的洪峰而在诊断环里丢掉「最近诊断」的位置（D-4）。状态求值本身仍然每版本只跑一次
+    /// （`stack_resolutions` 的断言不变）。
     fn ensure_stack_status(&mut self) {
-        if self.font_stack_status.is_some() {
+        let status = match self.font_stack_status {
+            Some(status) => status,
+            None => {
+                self.stack_resolutions = self.stack_resolutions.wrapping_add(1);
+                let status = self.evaluate_stack_status();
+                self.font_stack_status = Some(status);
+                status
+            }
+        };
+        if status == FontStackStatus::Ready {
             return;
         }
-        self.stack_resolutions = self.stack_resolutions.wrapping_add(1);
-        let status = self.evaluate_stack_status();
-        self.font_stack_status = Some(status);
-        if status != FontStackStatus::Ready {
-            let mut tried = String::new();
-            for (index, family) in self.font_stack.families().enumerate() {
-                if index > 0 {
-                    tried.push(',');
-                }
-                tried.push_str(family);
+        let mut tried = String::new();
+        for (index, family) in self.font_stack.families().enumerate() {
+            if index > 0 {
+                tried.push(',');
             }
-            self.push_diagnostics(vec![TextDiagnostic::FontStackMiss {
-                tried: format_smolstr!("{tried}"),
-            }]);
+            tried.push_str(family);
         }
+        self.push_diagnostics(vec![TextDiagnostic::FontStackMiss {
+            tried: format_smolstr!("{tried}"),
+        }]);
     }
 
     /// 真正跑一次 fontique 查询（**只在**字体栈版本变化后的首次使用时调用）。
@@ -306,14 +320,47 @@ impl TextContext {
         &self.diagnostics
     }
 
-    /// 追加诊断（环形缓冲：超过 64 条丢最旧的）。
+    /// 追加诊断：同一诊断在窗口内**只保留一条**（重复时移到最新），环仍有界（`DIAGNOSTIC_LIMIT`）。
+    ///
+    /// 「同一诊断」= [`TextDiagnostic`] 逐字段相等（kind + font/glyph/text_range/宽度…）。没有
+    /// 去重时，每轮重排都会把同样的 `MissingGlyph`/`ColorGlyphMonochrome` 再压一遍，64 条环
+    /// 几帧就被同类条目占满、启动期的 `FontStackMiss` 被挤出去（D-4）。
+    ///
+    /// 配置期诊断（[`TextDiagnostic::FontStackMiss`]）**常驻**：环满时优先淘汰最旧的非配置
+    /// 诊断，字体栈问题不会因字形诊断洪峰而消失。
     pub(crate) fn push_diagnostics(&mut self, mut extra: Vec<TextDiagnostic>) {
+        if extra.is_empty() {
+            return;
+        }
         for diagnostic in extra.drain(..) {
-            if self.diagnostics.len() == DIAGNOSTIC_LIMIT {
-                self.diagnostics.remove(0);
+            if let Some(index) = self
+                .diagnostics
+                .iter()
+                .position(|existing| *existing == diagnostic)
+            {
+                // 去重 + 移到最新：同一诊断只出现一次，语义上随最近一次使用刷新。
+                self.diagnostics.remove(index);
+            } else if self.diagnostics.len() == DIAGNOSTIC_LIMIT {
+                self.evict_oldest_diagnostic();
             }
             self.diagnostics.push(diagnostic);
         }
+    }
+
+    /// 淘汰最旧的**非配置期**诊断；全是配置期诊断时（理论上不存在）退化为丢最旧。
+    ///
+    /// `n <= DIAGNOSTIC_LIMIT` 的冷路径：线性扫描比维护 `HashSet` 索引更简单，而
+    /// `TextDiagnostic` 含 `f32` 字段，做 `Hash/Eq` 反而要手写位级实现。
+    fn evict_oldest_diagnostic(&mut self) {
+        let Some(index) = self
+            .diagnostics
+            .iter()
+            .position(|diagnostic| !is_config_diagnostic(diagnostic))
+        else {
+            self.diagnostics.remove(0);
+            return;
+        };
+        self.diagnostics.remove(index);
     }
 
     pub(crate) fn clear_diagnostics(&mut self) {
@@ -589,8 +636,140 @@ mod tests {
             context.diagnostics().last(),
             Some(TextDiagnostic::InlineBoxOffBoundary { id, .. }) if *id as usize == super::DIAGNOSTIC_LIMIT + 9
         ));
+        // 超出上限的 10 条是最旧的：环里应剩 id 10..=73（逐条不同 ⇒ 去重不改变本测试语义）。
+        assert!(matches!(
+            context.diagnostics().first(),
+            Some(TextDiagnostic::InlineBoxOffBoundary { id, .. }) if *id as usize == 10
+        ));
         context.clear_diagnostics();
         assert!(context.diagnostics().is_empty());
+    }
+
+    /// D-4：同一诊断（kind + font + glyph + text_range）在窗口内**只出现一次**；重复压入只把
+    /// 它移到最新，环不增长。
+    #[test]
+    fn diagnostics_are_deduped() {
+        let mut context = TextContext::new();
+        let repeated = TextDiagnostic::MissingGlyph {
+            font: smol_str::SmolStr::new_static("1234#0"),
+            glyph: 0,
+            text_range: 3..9,
+        };
+        for _ in 0..100 {
+            context.push_diagnostics(vec![repeated.clone()]);
+        }
+        assert_eq!(
+            context.diagnostics().len(),
+            1,
+            "同一诊断只保留一条：{:?}",
+            context.diagnostics()
+        );
+        assert_eq!(context.diagnostics()[0], repeated);
+
+        let other = TextDiagnostic::InlineBoxOffBoundary { id: 1, index: 2 };
+        context.push_diagnostics(vec![other.clone()]);
+        context.push_diagnostics(vec![repeated.clone()]);
+        assert_eq!(
+            context.diagnostics().len(),
+            2,
+            "不同诊断各自一条：{:?}",
+            context.diagnostics()
+        );
+        assert_eq!(context.diagnostics()[0], other);
+        assert_eq!(
+            context.diagnostics().last(),
+            Some(&repeated),
+            "重复诊断必须移到最新：{:?}",
+            context.diagnostics()
+        );
+    }
+
+    /// D-4：配置期诊断（字体栈）不被字形诊断洪峰淹没，且诊断环仍然有界（<= 64）。
+    #[test]
+    fn font_stack_miss_survives_a_flood_of_glyph_diagnostics() {
+        let mut context = TextContext::new();
+        let miss = TextDiagnostic::FontStackMiss {
+            tried: smol_str::SmolStr::new_static("Segoe UI,Noto Sans"),
+        };
+        context.push_diagnostics(vec![miss.clone()]);
+        let flood: Vec<TextDiagnostic> = (0..100u32)
+            .map(|glyph| TextDiagnostic::MissingGlyph {
+                font: smol_str::format_smolstr!("{}#0", glyph),
+                glyph,
+                text_range: 0..1,
+            })
+            .collect();
+        context.push_diagnostics(flood);
+
+        assert_eq!(
+            context.diagnostics().len(),
+            super::DIAGNOSTIC_LIMIT,
+            "诊断环仍有界：{:?}",
+            context.diagnostics().len()
+        );
+        assert!(
+            context
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| matches!(diagnostic, TextDiagnostic::FontStackMiss { .. })),
+            "配置期诊断不得被字形诊断挤出环：{:?}",
+            context.diagnostics()
+        );
+        assert_eq!(
+            context.diagnostics()[0],
+            miss,
+            "常驻的配置期诊断是最旧条目（淘汰只针对非配置期诊断）"
+        );
+    }
+
+    /// D-4：字体栈不健康时，每次走 shape/refresh 路径都**重压**那条配置诊断 ⇒ 它始终位于
+    /// 最新位置；去重保证不会出现第二条。
+    #[test]
+    fn unhealthy_font_stack_repushes_its_diagnostic() {
+        let mut context = TextContext::new();
+        context.set_font_stack(FontStack::new(Vec::<&str>::new()));
+        let _ = context.font_stack_status(); // 首次求值 + 压一条
+        context.push_diagnostics(vec![
+            TextDiagnostic::InlineBoxOffBoundary { id: 7, index: 3 },
+            TextDiagnostic::InlineBoxOffBoundary { id: 8, index: 5 },
+        ]);
+        assert!(matches!(
+            context.diagnostics().first(),
+            Some(TextDiagnostic::FontStackMiss { .. })
+        ));
+        assert!(matches!(
+            context.diagnostics().last(),
+            Some(TextDiagnostic::InlineBoxOffBoundary { id, .. }) if *id == 8
+        ));
+
+        let _ = context.shape_cached(&content("refresh"));
+
+        assert!(
+            matches!(
+                context.diagnostics().last(),
+                Some(TextDiagnostic::FontStackMiss { .. })
+            ),
+            "配置期诊断必须被重压到最新：{:?}",
+            context.diagnostics()
+        );
+        assert!(
+            matches!(
+                context.diagnostics().first(),
+                Some(TextDiagnostic::InlineBoxOffBoundary { id, .. }) if *id == 7
+            ),
+            "重压只移动配置期诊断，不改变其它诊断的相对顺序：{:?}",
+            context.diagnostics()
+        );
+        assert_eq!(
+            context
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| matches!(diagnostic, TextDiagnostic::FontStackMiss { .. }))
+                .count(),
+            1,
+            "重压 + 去重不能产生第二条：{:?}",
+            context.diagnostics()
+        );
     }
 
     /// 快速路径开关：关闭后清形状缓存并回到 parley；重新打开再清一次。

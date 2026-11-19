@@ -138,6 +138,7 @@ mod tests {
             None,
             Dispatcher::new(),
             None,
+            crate::platform::windows::window::test_a11y_epoch(),
         )
         .expect("NativeWindow::create");
         let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);

@@ -457,6 +457,9 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                         .update(|| crate::a11y::adapter::build_update(&mut app, id));
                 }
             }
+            // E5 / RE-04 / RE-05：**本轮确实交付过** a11y 且仍有未走完的批次 ⇒ 立刻唤醒下一轮
+            // 泵（无 AT 客户端时无交付 ⇒ 绝不 wake，I3 空闲零唤醒）；判定 + wake 的唯一入口。
+            app.wake_for_a11y_backlog(dispatcher.as_ref());
 
             // ⑦ 连续帧（动画 / P17 HUD）：定时器语义由 `dispatch` 的 timeout 提供，
             // 醒来后主动请求一帧（否则 tick 只更新状态、不出帧）。
@@ -609,9 +612,14 @@ fn sync_windows(
         if a11ys.iter().any(|entry| entry.id == id) {
             continue;
         }
+        // RE-01：adapter 必须持有窗口 `A11yBridge` 的**那一份**消费端代际（唯一入口
+        // `App::window_a11y_epoch`）；窗口刚被关闭时本轮跳过，下一轮 remove_window 清理协议对象。
+        let Some(epoch) = app.window_a11y_epoch(id) else {
+            continue;
+        };
         a11ys.push(WindowA11y {
             id,
-            adapter: UnixA11y::new(dispatcher.clone(), id)?,
+            adapter: UnixA11y::new(dispatcher.clone(), id, epoch)?,
         });
     }
     // 渲染器只能在首个 configure 之后建：configure 之前 `xdg_surface` 没有配置的尺寸，WSI

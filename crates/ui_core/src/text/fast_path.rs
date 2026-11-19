@@ -30,12 +30,14 @@
 //!
 //! # 单行性（为什么不需要断行）
 //!
-//! 字符集里没有任何**软换行机会**（无空格；UAX#14 在 `NU`/`IS`/`PO`/`PR` 之间不换行），
-//! 唯一可能产生换行机会的是 `-`（HY）与 `/`（SY）之后 —— 因此：
+//! 快速路径的布局恒为单行，前提是文本**没有内部软换行机会**：
 //!
 //! - `TextWrap::NoWrap`：本来就不换行；
-//! - 其它策略：只有文本**不含** `-` / `/` 时才走快速路径（`/-` 之后的断行规则需按 UAX#14 的
-//!   `HY × NU` / `SY` 上下文判定，不值得为行情表引入）。
+//! - 其它策略：只有 UAX #14 判定「文本内部没有换行机会」时才走快速路径。数字串里的
+//!   `, . + - % / :` 属于数值表达式序列（`NU (SY | IS)* × …` 与 `HY × NU` 等规则），
+//!   `-1.50%` / `12/34` 这类行情文本**没有**断行机会；真正会出现机会的串（例如 `1.+`
+//!   在 `HY` 后、`SY` 前）必须退回 parley。判定用 `unicode-linebreak` 的 UAX #14 实现，
+//!   不是「含 `-` / `/` 就放弃」的保守近似（后者会让涨跌幅/分数类文本命中率为 0）。
 //!
 //! 因此快速路径的布局恒为单行：`min-content == max-content == 总 advance`，
 //! `measure` 是 O(1)、`layout` 不需要 `break_all_lines`。
@@ -43,12 +45,14 @@
 //! # 开关
 //!
 //! [`DigitFastPath::set_enabled`]（`App::set_digit_fast_path`）可整体回退到 parley 路径做对照；
-//! 命中率由 [`FastPathStats`] 计入 `TextPassReport::{fast_path_shaped, fast_path_queries}`。
+//! 命中率由 [`FastPathStats`] 计入 `TextPassReport::{fast_path_shaped, fast_path_queries,
+//! fast_path_ineligible}`（`queries` 含静态条件不满足的候选，因此命中率是真实命中率）。
 
 use std::{hash::Hasher, rc::Rc};
 
 use parley::PositionedLayoutItem;
 use smol_str::SmolStr;
+use unicode_linebreak::linebreaks;
 
 use super::{
     ShapedGlyphRun, ShapedLine, ShapedTextItem, ShapedTextLine, TextAlign, TextDirection,
@@ -75,11 +79,15 @@ fn alphabet_index(character: char) -> Option<usize> {
         .position(|candidate| *candidate == character)
 }
 
-/// `-` / `/` 之后存在 UAX#14 的软换行机会：`Wrap`/`Anywhere` 下要按上下文判定，直接放弃。
-fn has_hyphen_break_opportunity(text: &str) -> bool {
-    text.as_bytes()
-        .iter()
-        .any(|byte| *byte == b'-' || *byte == b'/')
+/// UAX #14：文本内部（不含行尾）是否存在软换行机会。
+///
+/// 数字串里的 `, . + - % / :` 处于数值表达式序列中（`NU (SY | IS)* × …`、`HY × NU` 等
+/// 规则），`-1.50%` / `12/34` 这类行情文本**没有**内部断行机会，可以安全地走单行快速路径；
+/// 真正有断行机会的串（例如 `1.+`：`.` 后、`+` 前）必须退回 parley。
+///
+/// `linebreaks` 会在 `text.len()` 处给出行尾（eot）机会，因此只接受 `< len()` 的索引。
+fn has_line_break_opportunity(text: &str) -> bool {
+    linebreaks(text).any(|(index, _)| index < text.len())
 }
 
 /// 一次验证 / 快速塑形用的字体级数据（按 `(字体栈身份, 全量样式)` 缓存）。
@@ -262,7 +270,8 @@ impl SimpleShaped {
 /// 快速路径统计（喂 `TextPassReport`；命中率 = `hits / queries`）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FastPathStats {
-    /// 进入快速路径判定的塑形次数（分母）。
+    /// 进入快速路径判定的塑形次数（分母）。**包含**静态条件不满足的候选：旧实现只在
+    /// `eligible` 之后计数，命中率是自证式的，无法观测真实热路径命中率。
     pub queries: usize,
     /// 真正走快速路径的次数（分子）。
     pub hits: usize,
@@ -272,6 +281,25 @@ pub(crate) struct FastPathStats {
     pub rejected: usize,
     /// 通过验证的字体组合数（缓存条目）。
     pub verified: usize,
+    /// 静态条件拒绝：RTL 段落。
+    pub ineligible_rtl: usize,
+    /// 静态条件拒绝：letter-spacing。
+    pub ineligible_letter_spacing: usize,
+    /// 静态条件拒绝：文本内部有 UAX #14 换行机会。
+    pub ineligible_wrap: usize,
+    /// 静态条件拒绝：字符集不在 [`ALPHABET`] 内。
+    pub ineligible_alphabet: usize,
+}
+
+impl FastPathStats {
+    /// 静态条件不满足的候选总数（`queries - hits` 中不包含「验证降级」与「字形缺失」，
+    /// 因此单独提供该口径；汇总进 `TextPassReport::fast_path_ineligible`）。
+    pub(crate) fn ineligible(&self) -> usize {
+        self.ineligible_rtl
+            + self.ineligible_letter_spacing
+            + self.ineligible_wrap
+            + self.ineligible_alphabet
+    }
 }
 
 /// 数字快速路径缓存 + 开关（进程级，由 `TextContext` 持有）。
@@ -390,10 +418,17 @@ impl DigitFastPath {
         if !self.enabled || text.is_empty() {
             return None;
         }
-        if !eligible(text, style) {
+        // 分母 = 所有候选（含静态条件不满足者）：命中率 `hits / queries` 才是真实热路径命中率。
+        self.stats.queries += 1;
+        if let Err(reason) = eligibility(text, style) {
+            match reason {
+                Ineligible::Rtl => self.stats.ineligible_rtl += 1,
+                Ineligible::LetterSpacing => self.stats.ineligible_letter_spacing += 1,
+                Ineligible::Wrap => self.stats.ineligible_wrap += 1,
+                Ineligible::Alphabet => self.stats.ineligible_alphabet += 1,
+            }
             return None;
         }
-        self.stats.queries += 1;
         let key = FastKey::new(font_identity, style);
         // 命中：摘要相同（寻址）+ 全量 shaping 输入逐字段等价（复验，防 64 位摘要碰撞）。
         if let Some(entry) = self
@@ -493,27 +528,48 @@ pub(crate) fn simple_alignment_offset(
     }
 }
 
+/// 快速路径候选被**静态条件**拒绝的原因（用于把真实命中率与拒绝原因计入 [`FastPathStats`]）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ineligible {
+    /// 段落方向是 RTL（bidi 对齐/溢出语义不由快速路径处理）。
+    Rtl,
+    /// 有 letter-spacing（逐字符 advance 不再可加）。
+    LetterSpacing,
+    /// 非 `NoWrap` 且文本内部存在 UAX #14 软换行机会（单行假设不成立）。
+    Wrap,
+    /// 字符集不在 [`ALPHABET`] 内。
+    Alphabet,
+}
+
 /// 快速路径的适用条件（除「验证通过」以外的静态条件）。
-fn eligible(text: &str, style: &TextStyle) -> bool {
+///
+/// OpenType 特性（`tnum` 等）**不在这里一刀切**：特性是 `(字体, 样式)` 的一部分，由
+/// [`verify`] 的探针塑形决定等价性 —— 上下文的 `calt`/连字会让「一字符一字形 / advance 可加」
+/// 探针失败并永久降级，而不是静默错配。
+fn eligibility(text: &str, style: &TextStyle) -> Result<(), Ineligible> {
     // RTL 段落的对齐/溢出语义要按 parley 的 bidi 规则处理（`align_when_overflowing=false`
     // 时 RTL 溢出会向左平移），而快速路径的所有字符都是 ASCII 数字，没有支持 RTL 的收益。
     // 显式拒绝，不能把安全性寄托在 bidi 探针偶然失败上。
     if style.direction == TextDirection::Rtl {
-        return false;
+        return Err(Ineligible::Rtl);
     }
     if style.letter_spacing != 0.0 {
-        return false;
+        return Err(Ineligible::LetterSpacing);
     }
-    // OpenType 特性（tnum 等）需要 GSUB 替换：快速路径不跑 shaping，直接放弃。
-    if style.font_features().is_some() {
-        return false;
-    }
-    // `Wrap`/`Anywhere` 下 `-`/`/` 之后有软换行机会（UAX#14），单行假设不成立。
-    if style.wrap != super::TextWrap::NoWrap && has_hyphen_break_opportunity(text) {
-        return false;
-    }
-    text.chars()
+    // 字符集先于断行判定：不在字母表里的文本（含空格/单位/字母）直接按「不适用」计数，
+    // 而不是被「空格产生断行机会」抢走原因。
+    if !text
+        .chars()
         .all(|character| alphabet_index(character).is_some())
+    {
+        return Err(Ineligible::Alphabet);
+    }
+    // `Wrap`/`Anywhere` 下若文本内部有断行机会，单行假设不成立（UAX #14 真判定，见
+    // `has_line_break_opportunity`）。
+    if style.wrap != super::TextWrap::NoWrap && has_line_break_opportunity(text) {
+        return Err(Ineligible::Wrap);
+    }
+    Ok(())
 }
 
 /// 由验证过的字体表构造单行 glyph 序列（任一字形缺失 ⇒ `None`，退回 parley 出 tofu 诊断）。
@@ -610,7 +666,17 @@ fn verify(
         }
     }
     let layout = probe_layout(font_cx, layout_cx, family, style, &pairs)?;
-    verify_pairs(&layout, &fast)?;
+    verify_glyph_sequence(&layout, &fast, &pairs)?;
+
+    // 3. 全字符集串 + 真实行情样本：形状缓存对「每 tick 变化的文本」会 miss，上下文形如
+    //    `tnum` / `calt` 的 GSUB 在更长上下文里仍必须保持「一字符一字形 / id 与单字符探针
+    //    一致 / advance 可加」。这一步是 D-2 允许 OpenType 特性进入快速路径的正确性依据：
+    //    验证失败会永久降级到 parley（`FastEntry::Unsupported`），不会静默错配。
+    let mut sample = String::with_capacity(ALPHABET.len() + 24);
+    sample.extend(ALPHABET);
+    sample.push_str("1,234.56-7/8%:+9");
+    let layout = probe_layout(font_cx, layout_cx, family, style, &sample)?;
+    verify_glyph_sequence(&layout, &fast, &sample)?;
     Some(fast)
 }
 
@@ -668,13 +734,19 @@ fn single_glyph(
     None
 }
 
-/// 校验「有序字符对」探针：每个字形的位置必须等于前缀 advance 之和。
-fn verify_pairs(
+/// 校验一段探针串：字形数必须等于字符数，且每个字形 id / x 与「单字符探针」一致
+/// （`x` == 前缀 advance 之和，容差 [`ADVANCE_TOLERANCE`]）。
+///
+/// 字符对探针钉住 pair 上下文（kerning/连字），全字符集样本串再钉住更长上下文的 GSUB
+/// （`tnum` 等上下文替换会让 id 与单字符探针不一致）。
+fn verify_glyph_sequence(
     layout: &parley::Layout<crate::paint::color::ColorBrush>,
     font: &FastFont,
+    text: &str,
 ) -> Option<()> {
-    let mut glyph_x: Vec<f32> = Vec::with_capacity(ALPHABET.len() * ALPHABET.len() * 2);
-    let mut glyph_ids: Vec<u32> = Vec::with_capacity(glyph_x.capacity());
+    let expected = text.chars().count();
+    let mut glyph_x: Vec<f32> = Vec::with_capacity(expected);
+    let mut glyph_ids: Vec<u32> = Vec::with_capacity(expected);
     for line in layout.lines() {
         for item in line.items() {
             let PositionedLayoutItem::GlyphRun(run) = item else {
@@ -686,27 +758,20 @@ fn verify_pairs(
             }
         }
     }
-    let expected = ALPHABET.len() * ALPHABET.len() * 2;
     if glyph_x.len() != expected {
         // 连字/替换把字符数压缩了：不满足「一字符一字形」。
         return None;
     }
-    let mut position = 0usize;
     let mut x = 0.0f32;
-    for first in ALPHABET {
-        for second in ALPHABET {
-            for character in [first, second] {
-                let fast_char = font.chars[alphabet_index(character)?]?;
-                if (glyph_x[position] - x).abs() > ADVANCE_TOLERANCE {
-                    return None;
-                }
-                if glyph_ids[position] != fast_char.glyph {
-                    return None;
-                }
-                x += fast_char.advance;
-                position += 1;
-            }
+    for (position, character) in text.chars().enumerate() {
+        let fast_char = font.chars[alphabet_index(character)?]?;
+        if (glyph_x[position] - x).abs() > ADVANCE_TOLERANCE {
+            return None;
         }
+        if glyph_ids[position] != fast_char.glyph {
+            return None;
+        }
+        x += fast_char.advance;
     }
     Some(())
 }
@@ -716,8 +781,9 @@ mod tests {
     use std::rc::Rc;
 
     use super::{
-        ADVANCE_TOLERANCE, ALPHABET, DigitFastPath, FastEntry, FastFont, SimpleShaped,
-        alphabet_index, eligible, probe_layout,
+        ADVANCE_TOLERANCE, ALPHABET, DigitFastPath, FastEntry, FastFont, Ineligible, SimpleShaped,
+        alphabet_index, eligibility, has_line_break_opportunity, probe_layout,
+        verify_glyph_sequence,
     };
     use crate::{
         paint::color::ColorBrush,
@@ -899,31 +965,129 @@ mod tests {
         assert_eq!(alphabet_index('中'), None);
     }
 
+    /// D-2 的静态条件：字符集 / 断行机会（UAX #14 真判定）/ letter-spacing / RTL / tnum。
+    ///
+    /// 旧断言把「默认 `Wrap` 下 `-1.50%` 不可用」当成正确行为（保守近似「含 `-` / `/` 就
+    /// 放弃」）；UAX #14 的数值表达式规则（`HY × NU`、`SY × NU`、`IS × NU`、`NU × NU` …）
+    /// 让涨跌幅/分数类文本**没有内部断行机会**，因此必须在默认 `Wrap` 下也命中快速路径。
     #[test]
     fn eligibility_requires_the_fast_path_alphabet() {
         let style = TextStyle::new(12.0);
-        assert!(eligible("1,234.56", &style));
-        assert!(
-            !eligible("-1.50%", &style),
-            "默认 Wrap 下 `-` 之后有软换行机会（UAX#14 HY）⇒ 单行假设不成立"
+        assert_eq!(eligibility("1,234.56", &style), Ok(()));
+        assert_eq!(
+            eligibility("-1.50%", &style),
+            Ok(()),
+            "UAX#14：`HY × NU` 不允许在负号后断行 ⇒ 涨跌幅可走单行快速路径"
         );
-        assert!(!eligible("1 234", &style), "空格不在字符集里");
-        assert!(!eligible("abc", &style));
-        assert!(
-            eligible("-1.50%", &style.clone().with_wrap(TextWrap::NoWrap)),
-            "NoWrap 不受 `-` 影响"
+        assert_eq!(
+            eligibility("12/34", &style),
+            Ok(()),
+            "UAX#14：数值序列中的 `/` 不产生断行机会"
         );
-        assert!(
-            !eligible("1,234.56", &style.clone().with_letter_spacing(0.5)),
-            "letter-spacing 不在快速路径里"
+        assert_eq!(eligibility("1 234", &style), Err(Ineligible::Alphabet));
+        assert_eq!(eligibility("abc", &style), Err(Ineligible::Alphabet));
+        assert_eq!(
+            eligibility("-1.50%", &style.clone().with_wrap(TextWrap::NoWrap)),
+            Ok(())
         );
-        assert!(
-            !eligible(
+        assert_eq!(
+            eligibility("1.+", &style),
+            Err(Ineligible::Wrap),
+            "`.+` 在 `IS` 后、`PR` 前存在真实 UAX#14 断行机会 ⇒ 单行假设不成立"
+        );
+        assert_eq!(
+            eligibility("1,234.56", &style.clone().with_letter_spacing(0.5)),
+            Err(Ineligible::LetterSpacing)
+        );
+        assert_eq!(
+            eligibility(
                 "1,234.56",
-                &style.with_font_features([crate::text::TextFeature::TABULAR_NUMBERS])
+                &style
+                    .clone()
+                    .with_font_features([crate::text::TextFeature::TABULAR_NUMBERS])
             ),
-            "OpenType 特性需要 shaping"
+            Ok(()),
+            "OpenType 特性交给验证探针判定（tnum 验证通过即可命中）"
         );
+        assert_eq!(
+            eligibility("1,234.56", &style.with_direction(TextDirection::Rtl)),
+            Err(Ineligible::Rtl)
+        );
+    }
+
+    /// D-2 正确性自证：`unicode-linebreak`（UAX #14）的「文本内部有断行机会」必须与 parley
+    /// 的实际断行行为一致（17² 有序对 + 真实行情样本）。否则「快速路径单行」与生产布局
+    /// 会在某些字符组合上漂移。
+    #[test]
+    fn uax14_break_opportunity_matches_parley() {
+        let (mut font_cx, mut layout_cx, family) = harness();
+        if !has_system_fonts(&mut font_cx) {
+            return;
+        }
+        let style = TextStyle::new(12.0);
+        let mut texts: Vec<String> = Vec::with_capacity(ALPHABET.len() * ALPHABET.len() + 8);
+        for first in ALPHABET {
+            for second in ALPHABET {
+                let mut pair = String::with_capacity(2);
+                pair.push(first);
+                pair.push(second);
+                texts.push(pair);
+            }
+        }
+        for sample in [
+            "1.+",
+            "1/-2",
+            "-1.50%",
+            "12/34",
+            "1,234.56",
+            "+42,000",
+            "1:2",
+            "0.00000001",
+        ] {
+            texts.push(String::from(sample));
+        }
+        for text in texts {
+            let mut layout = probe_layout(&mut font_cx, &mut layout_cx, &family, &style, &text)
+                .expect("probe layout");
+            layout.break_all_lines(Some(0.0));
+            let parley_has_internal_break = layout.lines().count() > 1;
+            assert_eq!(
+                has_line_break_opportunity(&text),
+                parley_has_internal_break,
+                "UAX#14 断行机会与 parley 不一致: {text:?}"
+            );
+        }
+    }
+
+    /// D-2：静态条件拒绝必须**可观测**（真实命中率 = `hits / queries`，`queries` 含候选）。
+    #[test]
+    fn ineligible_reasons_are_counted() {
+        let (mut font_cx, mut layout_cx, family) = harness();
+        let style = TextStyle::new(12.0);
+        let mut fast = DigitFastPath::new();
+        let cases: [(&str, TextStyle); 5] = [
+            ("abc", style.clone()),
+            ("1 234", style.clone()),
+            ("1,234.56", style.clone().with_letter_spacing(0.5)),
+            ("1.+", style.clone()),
+            ("1,234.56", style.with_direction(TextDirection::Rtl)),
+        ];
+        for (text, case_style) in &cases {
+            assert!(
+                fast.try_shape(&mut font_cx, &mut layout_cx, &family, 9, text, case_style)
+                    .is_none(),
+                "{text:?} must be rejected by the static conditions"
+            );
+        }
+        let stats = fast.take_stats();
+        assert_eq!(stats.queries, cases.len(), "静态拒绝也计入候选分母");
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.ineligible_alphabet, 2, "abc / 含空格");
+        assert_eq!(stats.ineligible_letter_spacing, 1);
+        assert_eq!(stats.ineligible_wrap, 1);
+        assert_eq!(stats.ineligible_rtl, 1);
+        assert_eq!(stats.ineligible(), cases.len());
+        assert_eq!(stats.verified + stats.rejected, 0, "静态拒绝不得进入验证");
     }
 
     /// 核心正确性：快速路径的 glyph id / advance / 位置 / 行度量必须与**全量样式**的 parley
@@ -931,41 +1095,52 @@ mod tests {
     ///
     /// 旧版本有两个逃逸口：参考只压 size/weight/letter_spacing（与生产探针不等价），验证被
     /// 拒绝时 `continue` 跳过。两者都已删除 —— 拒绝在这里就是失败。
+    ///
+    /// D-2 后默认 `Wrap` 下 `-1.50%`/`12/34` 也必须命中（UAX #14 内部无断行机会），且
+    /// `tnum` 特性由验证探针放行（`TextFeature::TABULAR_NUMBERS` 探针必须逐字形等价）。
     #[test]
     fn fast_path_matches_parley_advances_and_positions() {
         let (mut font_cx, mut layout_cx, family) = harness();
         if !has_system_fonts(&mut font_cx) {
             return;
         }
-        let style = TextStyle::new(12.0).with_wrap(TextWrap::NoWrap);
+        // 默认换行策略（`Wrap`）：单行假设由 UAX#14 判定，而不是「`Wrap` 一律拒绝」。
+        let style = TextStyle::new(12.0);
+        let tnum_style =
+            TextStyle::new(12.0).with_font_features([crate::text::TextFeature::TABULAR_NUMBERS]);
         let mut fast = DigitFastPath::new();
-        let probes = [
-            "0",
-            "1,234.56",
-            "9999999",
-            "-1.50%",
-            "12/34",
-            "1:2",
-            "0.00000001",
-            "+42,000",
+        let probes: [(&str, &TextStyle); 10] = [
+            ("0", &style),
+            ("1,234.56", &style),
+            ("9999999", &style),
+            ("-1.50%", &style),
+            ("12/34", &style),
+            ("1:2", &style),
+            ("0.00000001", &style),
+            ("+42,000", &style),
+            ("1,234.56", &tnum_style),
+            ("-1.50%", &tnum_style),
         ];
-        for text in probes {
+        for (text, probe_style) in probes {
             let simple = shape_fast(
                 &mut fast,
                 &mut font_cx,
                 &mut layout_cx,
                 &family,
                 text,
-                &style,
+                probe_style,
             );
-            let reference = parley_reference(&mut font_cx, &mut layout_cx, &family, text, &style);
+            let reference =
+                parley_reference(&mut font_cx, &mut layout_cx, &family, text, probe_style);
             assert_matches_reference(&simple, &reference, text);
         }
+        let total = probes.len();
         let stats = fast.take_stats();
-        assert_eq!(stats.queries, probes.len());
-        assert_eq!(stats.hits, probes.len(), "所有探针都必须走快速路径");
-        assert_eq!(stats.verified, 1, "同一 (字体, 全量样式) 只验证一次");
+        assert_eq!(stats.queries, total);
+        assert_eq!(stats.hits, total, "所有探针都必须走快速路径");
+        assert_eq!(stats.verified, 2, "普通样式与 tnum 样式各验证一次");
         assert_eq!(stats.rejected, 0);
+        assert_eq!(stats.ineligible(), 0, "全部探针都满足静态条件");
     }
 
     /// 开关：关闭后 `try_shape` 立即返回 `None`（不计查询），**且端到端逐位回到 parley**。
@@ -1122,9 +1297,10 @@ mod tests {
                 // 必须由 parley 负责，快速路径只对 LTR 段落启用。
                 assert_eq!(
                     (stats.queries, stats.hits),
-                    (0, 0),
-                    "RTL 数字必须在 eligibility 直接退回 parley"
+                    (1, 0),
+                    "RTL 数字必须在 eligibility 直接退回 parley（候选计入分母）"
                 );
+                assert_eq!(stats.ineligible_rtl, 1);
                 continue;
             }
             assert_eq!(stats.queries, 1, "{direction:?}");
@@ -1189,7 +1365,7 @@ mod tests {
         );
     }
 
-    /// 非 ASCII / 含空格 / 超字符集文本必须原样落回 parley。
+    /// 非 ASCII / 含空格 / 有真实断行机会的文本必须原样落回 parley，且拒绝原因可观测。
     #[test]
     fn ineligible_text_falls_back() {
         let (mut font_cx, mut layout_cx, family) = harness();
@@ -1198,13 +1374,53 @@ mod tests {
         }
         let style = TextStyle::new(12.0);
         let mut fast = DigitFastPath::new();
-        for text in ["1 234", "abc", "数字", "1.5 USDT"] {
+        for text in ["1 234", "abc", "数字", "1.5 USDT", "1.+"] {
             assert!(
                 fast.try_shape(&mut font_cx, &mut layout_cx, &family, 1, text, &style)
                     .is_none(),
                 "{text} must not use the fast path"
             );
         }
+        let stats = fast.take_stats();
+        assert_eq!(
+            stats.queries, 5,
+            "所有候选都计入分母（旧实现只在 eligible 后计数）"
+        );
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.ineligible_alphabet, 4, "含空格/非 ASCII 的四个候选");
+        assert_eq!(stats.ineligible_wrap, 1, "`1.+` 有真实断行机会");
+        assert_eq!(
+            (stats.verified, stats.rejected),
+            (0, 0),
+            "静态拒绝不得进入验证（省一次探针塑形）"
+        );
+    }
+
+    /// D-2：验证探针的序列校验必须真的能识别「上下文替换/连字」—— 否则第三段样本探针
+    /// （全字符集 + 行情串）只是空转。
+    #[test]
+    fn sequence_probe_rejects_contextual_glyph_changes() {
+        let (mut font_cx, mut layout_cx, family) = harness();
+        if !has_system_fonts(&mut font_cx) {
+            return;
+        }
+        let style = TextStyle::new(12.0);
+        let font = super::verify(&mut font_cx, &mut layout_cx, &family, &style)
+            .expect("host font must pass verification for the digit alphabet");
+        // 同一段文本：id / x 与单字符探针一致 ⇒ 通过。
+        let text = "1,234.56-7/8";
+        let layout = probe_layout(&mut font_cx, &mut layout_cx, &family, &style, text)
+            .expect("probe layout");
+        assert_eq!(verify_glyph_sequence(&layout, &font, text), Some(()));
+        // 换一个数字：最后一个字形 id 与单字符探针不同 ⇒ 必须拒绝。
+        let changed = "1,234.57";
+        let layout = probe_layout(&mut font_cx, &mut layout_cx, &family, &style, changed)
+            .expect("probe layout");
+        assert_eq!(
+            verify_glyph_sequence(&layout, &font, "1,234.56"),
+            None,
+            "序列校验必须发现 glyph id 与单字符探针不一致"
+        );
     }
 
     /// 缓存键含字号：不同字号各自验证，互不干扰。

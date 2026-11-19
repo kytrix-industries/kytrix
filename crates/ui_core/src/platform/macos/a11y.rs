@@ -28,6 +28,7 @@ use objc2::{rc::Retained, runtime::AnyObject};
 use objc2_foundation::NSArray;
 
 use crate::{
+    a11y::adapter::A11yConsumerEpoch,
     error::EngineError,
     platform::{
         dispatcher::{Dispatcher, UserTask},
@@ -45,12 +46,17 @@ pub(crate) struct MacA11y {
 impl MacA11y {
     /// 在窗口**首次显示之前**调用（主线程）。
     ///
+    /// `epoch` 是窗口的消费端代际句柄：NSAccessibility 重新激活时激活回调 `bump()` 它，
+    /// 引擎据此把下一笔升成全树（E1）。macOS 当前没有 deactivation 路径，统一后即使未来
+    /// 出现 AX 客户端重连也安全。
+    ///
     /// # Errors
     /// `EngineError::A11yInit`：不在主线程或 view 指针无效。
     pub(crate) fn new(
         view: &GuiView,
         dispatcher: Arc<Dispatcher>,
         window: WindowId,
+        epoch: A11yConsumerEpoch,
     ) -> Result<Self, EngineError> {
         if objc2::MainThreadMarker::new().is_none() {
             return Err(EngineError::A11yInit {
@@ -63,13 +69,17 @@ impl MacA11y {
                 detail: smol_str::SmolStr::new_static("null NSView"),
             });
         }
+        let activation = MacActivation {
+            epoch,
+            dispatcher: Arc::clone(&dispatcher),
+        };
         let actions = MacActions { dispatcher, window };
         // SAFETY: `pointer` 指向本窗口持有的 `GuiView`（`NativeWindow` 的生命周期覆盖 adapter），
         // 且已确认在主线程 —— 这正是 `Adapter::new` 文档要求的两条前提。
         let adapter = unsafe { Adapter::new(pointer, false, actions) };
         Ok(Self {
             adapter,
-            activation: MacActivation,
+            activation,
         })
     }
 
@@ -128,10 +138,19 @@ impl std::fmt::Debug for MacA11y {
 }
 
 /// 激活：首棵全树由主线程在下一轮交付（`None` ⇒ AccessKit 先给 placeholder 根）。
-pub(crate) struct MacActivation;
+///
+/// E1：`bump()` 消费端代际并唤醒主线程，保证"占位根之后的第一笔"是全树。回调在主线程的
+/// AX 请求里（`accessibilityChildren` / `hitTest` 的 `&mut self.activation`），但不能同步构造
+/// `TreeUpdate`（那要碰 `App`，而 AX 回调可能重入），所以仍是异步交付。
+pub(crate) struct MacActivation {
+    epoch: A11yConsumerEpoch,
+    dispatcher: Arc<Dispatcher>,
+}
 
 impl ActivationHandler for MacActivation {
     fn request_initial_tree(&mut self) -> Option<TreeUpdate> {
+        self.epoch.bump();
+        self.dispatcher.wake();
         None
     }
 }
@@ -148,5 +167,66 @@ impl ActionHandler for MacActions {
         self.dispatcher.push(UserTask::new(move |app| {
             crate::a11y::action::dispatch(app, window, request);
         }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use accesskit::ActivationHandler;
+
+    use super::MacActivation;
+    use crate::{app::App, platform::dispatcher::Dispatcher, window::WindowOptions};
+
+    /// RE-01（E1 接线防线，macOS）：AX 重新激活必须 ① bump 窗口 bridge 的消费端代际、
+    /// ② wake 主线程，引擎据此把下一笔升成全树。
+    ///
+    /// 变异守卫：删掉 `self.dispatcher.wake()` ⇒ wake 断言红；adapter 持另一份 epoch
+    /// （平台层已无法构造）⇒ 引擎 pending/full 断言红。
+    #[test]
+    fn activation_wakes_the_main_thread_and_forces_the_next_full_tree() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut app = App::new(runtime.handle().clone());
+        let window = app.create_window(WindowOptions::default());
+        let epoch = app.window_a11y_epoch(window).expect("窗口存在");
+        let before = epoch.current();
+        let dispatcher = Dispatcher::new();
+        let _ = dispatcher.take_frame_wake();
+        let mut activation = MacActivation {
+            epoch: epoch.clone(),
+            dispatcher: Arc::clone(&dispatcher),
+        };
+        assert!(
+            activation.request_initial_tree().is_none(),
+            "引擎异步交付首树：激活回调只标记，不同步构造 TreeUpdate"
+        );
+        assert_eq!(
+            epoch.current(),
+            before + 1,
+            "激活回调必须标记消费端已重置（否则下一笔仍是增量）"
+        );
+        assert!(
+            dispatcher.has_pending_wake(),
+            "激活必须 wake 主线程（空闲重激活否则要等下一次输入才有树）"
+        );
+        assert!(
+            app.window(window)
+                .expect("window")
+                .a11y_consumer_epoch_pending(),
+            "窗口 bridge 必须观察到同一个 epoch 变化（共享同一份句柄）"
+        );
+        assert!(
+            app.a11y_pending(window),
+            "激活后 App 门禁必须立即放行（不节流旁路）"
+        );
+        let snapshot = app.a11y_take(window).expect("重激活后的第一笔必须产出");
+        assert!(
+            snapshot.full,
+            "重激活后的第一笔必须是全树（否则 consumer panic / 永久空树）"
+        );
     }
 }

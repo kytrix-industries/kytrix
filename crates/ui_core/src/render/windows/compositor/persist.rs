@@ -110,10 +110,16 @@ pub(super) fn resize_target(
         Ok(()) => {}
         Err(error) if resize_fallback_worthwhile(error.code()) => {
             crate::render::windows::diagnostics::resize_fallback();
-            replace_swapchain(renderer, buffer)?;
+            // 回退路径里的 DXGI 调用（建链 / prime / `SetContent`）同样可能撞上设备移除：
+            // 出口统一经 `classify`，否则错误会以 `Swapchain` 逃到 GPU 线程边界（C1）。
+            replace_swapchain(renderer, buffer).map_err(|error| renderer.classify(error))?;
         }
         Err(error) => {
-            return Err(EngineError::Swapchain {
+            // C1：`ResizeBuffers` 返回的设备级 HRESULT（REMOVED/HUNG/RESET/DRIVER_INTERNAL）
+            // 必须经同一个权威判据（`GetDeviceRemovedReason`）升级为 `DeviceLost`，否则 GPU
+            // 线程会在设备已死时以「交换链错误」静默退出，粘性丢失也不置位（后续新窗口会
+            // 拿到死设备）。设备健康时保留原始交换链错误（`classify` 原样返回）。
+            return Err(renderer.classify(EngineError::Swapchain {
                 detail: smol_str::format_smolstr!(
                     "ResizeBuffers({}x{}): {:#010X} {}",
                     buffer.0,
@@ -121,7 +127,7 @@ pub(super) fn resize_target(
                     error.code().0 as u32,
                     error.code().message()
                 ),
-            });
+            }));
         }
     }
     renderer.buffer = buffer;

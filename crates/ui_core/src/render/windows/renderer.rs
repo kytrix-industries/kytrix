@@ -41,7 +41,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, MutexGuard, OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -69,10 +69,13 @@ use crate::render::timer::Section;
 use crate::render::windows::readback::ReadbackImage;
 use crate::{
     error::EngineError,
-    paint::{atlas::AtlasKind, color::Color},
+    paint::{
+        atlas::{AtlasKind, MAX_IMAGE_PAGES},
+        color::Color,
+    },
     platform::{
         dispatcher::WM_APP_COMPOSITION_WAKE,
-        windows::composition::{self, Composition},
+        windows::composition::{self, Composition, CompositionState},
     },
     render::{
         DirtyRects, RenderStats,
@@ -182,6 +185,18 @@ impl Renderer {
         }
     }
 
+    /// 请求 GPU 线程检查 / 重建 DirectComposition 设备与 visual tree（C2；泵的几何 pass 调用）。
+    ///
+    /// 泵已经在本轮消费了 `WM_PAINT` 健康检查代际并调过 `CheckDeviceState`：Invalid 时才请求，
+    /// 真正重建在 GPU 线程（`GpuRenderer::rebuild_composition`）。返回 `false` = 没有窗口目标或
+    /// GPU 线程已经不在（关闭路径），调用方不需要任何处理。
+    pub(crate) fn request_composition_rebuild(&self) -> bool {
+        match &self.target {
+            RenderTarget::Offscreen(_) => false,
+            RenderTarget::Window(window) => window.shared.request_composition_rebuild(),
+        }
+    }
+
     /// 后端运行期计数器（R08-3 / R08-7 / R08-13 的可观测面；HUD / 日志 / 测试共用）。
     pub(crate) fn diagnostics(&self) -> Diagnostics {
         crate::render::windows::diagnostics::snapshot()
@@ -245,19 +260,24 @@ impl Renderer {
     }
 
     /// 把一页图集像素交给 GPU 线程（`pixels` 是 `rects` 顺序逐矩形紧密打包的字节）。
+    ///
+    /// `layer` 是图集 texture array 的层号（图集页索引）；`extent` 是该层的页边长。
     pub(crate) fn queue_atlas_upload(
         &mut self,
         kind: AtlasKind,
-        page: u32,
+        layer: u16,
+        extent: u32,
         pixels: &[u8],
         rects: DirtyRects,
     ) -> bool {
         match &mut self.target {
             RenderTarget::Offscreen(gpu) => {
-                gpu.queue_atlas_upload(kind, page, pixels.to_vec(), rects);
+                gpu.queue_atlas_upload(kind, layer, extent, pixels.to_vec(), rects);
                 true
             }
-            RenderTarget::Window(window) => window.queue_atlas_upload(kind, page, pixels, rects),
+            RenderTarget::Window(window) => {
+                window.queue_atlas_upload(kind, layer, extent, pixels, rects)
+            }
         }
     }
 
@@ -455,7 +475,8 @@ impl WindowRenderer {
             presented: AtomicU64::new(pack_size(surface)),
             reset_epoch: AtomicU64::new(0),
             composition_pending: AtomicBool::new(false),
-            atlas_pending: [AtomicBool::new(false), AtomicBool::new(false)],
+            composition_rebuild: AtomicBool::new(false),
+            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0)],
         });
         let worker = Arc::clone(&shared);
         let thread = thread::Builder::new()
@@ -495,11 +516,12 @@ impl WindowRenderer {
     fn queue_atlas_upload(
         &mut self,
         kind: AtlasKind,
-        page: u32,
+        layer: u16,
+        extent: u32,
         pixels: &[u8],
         rects: DirtyRects,
     ) -> bool {
-        self.shared.queue_atlas(kind, page, pixels, rects)
+        self.shared.queue_atlas(kind, layer, extent, pixels, rects)
     }
 
     fn atlas_idle(&self, kind: AtlasKind) -> bool {
@@ -615,8 +637,14 @@ struct Shared {
     reset_epoch: AtomicU64,
     /// 两次唤醒都失败时的兜底标记：UI 线程在泵的几何 pass 里消费它并重算一次几何。
     composition_pending: AtomicBool,
-    /// 每 `AtlasKind` 的共享槽是否正在被 GPU 线程消费（`false` = UI 可以入队）。
-    atlas_pending: [AtomicBool; 2],
+    /// 「DirectComposition 设备可能失效，请 GPU 线程检查/重建」请求（C2）。
+    ///
+    /// 泵的几何 pass 消费 `WM_PAINT` 健康检查代际并调 `CheckDeviceState`；Invalid 时置位本标记 +
+    /// `SetEvent(work)` 唤醒 GPU 线程，由 GPU 线程重建 visual tree（需要 D3D12 设备/交换链）。
+    composition_rebuild: AtomicBool,
+    /// 每 `AtlasKind` 的图集上传槽位掩码（bit n = texture array 的第 n 层正在被 GPU 线程消费；
+    /// `0` = UI 可以入队）。图片图集一帧内会连续入队多个层，因此是位掩码而不是单一布尔。
+    atlas_pending: [AtomicU32; 2],
 }
 
 // SAFETY: `work` / `completion` 是进程范围的内核事件句柄；事件对象本身线程安全，
@@ -661,16 +689,22 @@ impl State {
     }
 }
 
-/// 图集上传槽：每个 `AtlasKind` 只留最新一份（§4.2）。
+/// 图集上传槽：字形 1 层 + 图片 `MAX_IMAGE_PAGES` 层，每层只留最新一份（§4.2）。
+///
+/// D-9-c：一个窗口一帧内会**连续**入队图片图集的多个层（逐层整页/增量），因此槽位必须按层
+/// 分开；`take` 一次性把本帧全部待上传层交给 GPU 线程（同一提交内聚合录制）。
 struct AtlasSlots {
     glyph: Option<AtlasUpload>,
-    image: Option<AtlasUpload>,
+    image: [Option<AtlasUpload>; MAX_IMAGE_PAGES as usize],
 }
 
+/// 一个待上传层：`pixels` 是 `rects` 顺序逐矩形紧密打包的字节（整页上传时就是整页）。
 struct AtlasUpload {
     kind: AtlasKind,
-    page: u32,
-    /// `rects` 顺序逐矩形紧密打包的字节（整页上传时就是整页）。
+    /// texture array 层号（字形恒 0；图片 = 图集页索引）。
+    layer: u16,
+    /// 该层的页边长（纹素；同一图集的所有层相同）。
+    extent: u32,
     pixels: Vec<u8>,
     rects: DirtyRects,
 }
@@ -679,31 +713,47 @@ impl AtlasSlots {
     const fn new() -> Self {
         Self {
             glyph: None,
-            image: None,
+            image: [const { None }; MAX_IMAGE_PAGES as usize],
         }
     }
 
-    /// 入队一次上传。**槽位由 UI 线程的 `atlas_idle` 保证空闲**（DEVIATIONS F-211）：
+    /// 入队一次上传。**层槽由 UI 线程的 `atlas_idle` 保证空闲**（DEVIATIONS F-211）：
     /// 槽里已有未消费的上传时是契约破坏（会丢行），release 也硬失败。
-    fn queue(&mut self, kind: AtlasKind, page: u32, pixels: Vec<u8>, rects: DirtyRects) {
+    fn queue(
+        &mut self,
+        kind: AtlasKind,
+        layer: u16,
+        extent: u32,
+        pixels: Vec<u8>,
+        rects: DirtyRects,
+    ) {
+        debug_assert!(
+            u32::from(layer) < kind.layers(),
+            "atlas layer {layer} out of range for {kind:?}"
+        );
         let slot = match kind {
             AtlasKind::Glyph => &mut self.glyph,
-            AtlasKind::Image => &mut self.image,
+            AtlasKind::Image => &mut self.image[usize::from(layer)],
         };
         assert!(
             slot.is_none(),
-            "atlas slot must be idle before queueing a new upload (kind {kind:?})"
+            "atlas slot must be idle before queueing a new upload (kind {kind:?}, layer {layer})"
         );
         *slot = Some(AtlasUpload {
             kind,
-            page,
+            layer,
+            extent,
             pixels,
             rects,
         });
     }
 
-    fn take(&mut self) -> [Option<AtlasUpload>; 2] {
-        [self.glyph.take(), self.image.take()]
+    /// 取走本帧全部待上传层（字形在前、图片按层号升序）。
+    fn take(&mut self) -> Vec<AtlasUpload> {
+        let mut uploads = Vec::with_capacity(1 + usize::from(MAX_IMAGE_PAGES));
+        uploads.extend(self.glyph.take());
+        uploads.extend(self.image.iter_mut().filter_map(Option::take));
+        uploads
     }
 }
 
@@ -738,21 +788,33 @@ impl Shared {
         self.wake();
     }
 
-    fn queue_atlas(&self, kind: AtlasKind, page: u32, pixels: &[u8], rects: DirtyRects) -> bool {
+    fn queue_atlas(
+        &self,
+        kind: AtlasKind,
+        layer: u16,
+        extent: u32,
+        pixels: &[u8],
+        rects: DirtyRects,
+    ) -> bool {
         let index = kind.index() as usize;
+        debug_assert!(
+            u32::from(layer) < kind.layers(),
+            "atlas layer {layer} out of range for {kind:?}"
+        );
+        let bit = 1u32 << u32::from(layer);
         // 像素在**锁外**复制：整页可达 16 MiB，不能让 GPU 线程的取帧锁等这次 memcpy。
         let pixels = pixels.to_vec();
         // 先占位再入队：GPU 线程 take 之后才释放，UI 线程据此不会覆盖未消费的上传
         // （DEVIATIONS F-211）。标志在**录制完成**后才清（`atlas_uploaded`），
         // 因此「空闲」= 上一笔已经进了命令列表，不只是「被 GPU 线程拿走」。
-        self.atlas_pending[index].store(true, Ordering::Release);
+        self.atlas_pending[index].fetch_or(bit, Ordering::Release);
         let mut state = self.lock();
         if state.shutdown || state.terminated {
-            self.atlas_pending[index].store(false, Ordering::Release);
+            self.atlas_pending[index].fetch_and(!bit, Ordering::Release);
             return false;
         }
         // 不唤醒：图集上传统一在「录制下一帧」之前落地（§4.2），单独唤醒只会空转。
-        state.atlas.queue(kind, page, pixels, rects);
+        state.atlas.queue(kind, layer, extent, pixels, rects);
         true
     }
 
@@ -770,6 +832,24 @@ impl Shared {
     /// 取走待应用的背景色（取一次清空）。
     fn take_background(&self) -> Option<[f32; 4]> {
         self.lock().background.take()
+    }
+
+    /// 请求 GPU 线程检查 / 重建 DirectComposition 设备与 visual tree（C2；UI 线程）。
+    ///
+    /// 只置位 + `SetEvent(work)`：检查与重建在 GPU 线程（需要 D3D12 设备/交换链，且 DComp 调用
+    /// 不能从 `WndProc`/泵的借用里做）。GPU 线程不可用时返回 `false`。
+    fn request_composition_rebuild(&self) -> bool {
+        if !self.alive() {
+            return false;
+        }
+        self.composition_rebuild.store(true, Ordering::Release);
+        self.wake();
+        true
+    }
+
+    /// 取走「重建 DComp」请求（GPU 线程循环顶部消费）。
+    fn take_composition_rebuild_request(&self) -> bool {
+        self.composition_rebuild.swap(false, Ordering::AcqRel)
     }
 
     /// 发布「最近一次完成 present 的内容尺寸」；尺寸变化时唤醒 UI 线程重算合成几何。
@@ -842,19 +922,19 @@ impl Shared {
         self.lock().frame.take()
     }
 
-    fn take_atlas(&self) -> [Option<AtlasUpload>; 2] {
+    fn take_atlas(&self) -> Vec<AtlasUpload> {
         // 这里**不**清 `atlas_pending`：GPU 线程只是把上传拿走，还没录进命令列表。
         // 清得太早，UI 会在本帧未录制（Retry / Idle）时入队下一笔，覆盖掉这一笔（丢行）。
         self.lock().atlas.take()
     }
 
-    /// 本帧的图集上传已经录进命令列表：共享槽这才算空（UI 可以入队下一笔）。
+    /// 本帧的图集上传已经录进命令列表：该 kind 的层槽位掩码清零。
     fn atlas_uploaded(&self, kind: AtlasKind) {
-        self.atlas_pending[kind.index() as usize].store(false, Ordering::Release);
+        self.atlas_pending[kind.index() as usize].store(0, Ordering::Release);
     }
 
     fn atlas_idle(&self, kind: AtlasKind) -> bool {
-        !self.atlas_pending[kind.index() as usize].load(Ordering::Acquire)
+        self.atlas_pending[kind.index() as usize].load(Ordering::Acquire) == 0
     }
 
     fn shutdown_requested(&self) -> bool {
@@ -1033,6 +1113,99 @@ impl FrameStatisticsClock {
     }
 }
 
+/// GPU 线程错误边界的权威判据：设备是否真的已移除（C1）。
+///
+/// 只在**非** `DeviceLost` 错误上调用（`DeviceLost` 本身就是粘性结论）：`GetDeviceRemovedReason`
+/// 是唯一权威来源，设备健康时恒 `false`。
+fn device_lost_for_boundary(renderer: Option<&GpuRenderer>) -> bool {
+    renderer.is_some_and(|current| current.check_device_lost().is_some())
+}
+
+/// GPU 线程致命错误的处置分类（C1 边界复判 + C2 的 DComp 可恢复分支）。
+///
+/// - `DeviceLost` 是粘性结论，必须整 renderer 恢复；
+/// - 其它错误（`Swapchain` / `Composition` / ...）只有权威判据确认设备已移除时才走设备恢复 ——
+///   典型来源是 `ResizeBuffers` 在 TDR / 驱动复位竞态下返回设备级 HRESULT 却被包成交换链错误；
+/// - **只有 `Composition` 错误**且 `CheckDeviceState` 判 DComp 失效时才只重建合成设备/visual tree
+///   （C2）：DComp 状态是**附加事实**，不能把 `AppInit` / `FramePipeline` / `Swapchain` 等真实
+///   致命错误吞成 visual 重建（那会掩盖原始错误，持续 Invalid 时还会以「DComp 重试耗尽」误导
+///   归因）。收窄条件放在本函数内，纯逻辑可测（review-c RC-4）。
+///
+/// 逐调用点的 `classify` 让错误**分类正确**；本判据保证**不会漏掉**尚未接线的调用点（新增 DXGI
+/// 调用点忘记 classify 时仍然恢复而不是静默退出线程）。
+fn fatal_disposition(
+    error: &EngineError,
+    device_lost: bool,
+    dcomp_invalid: bool,
+) -> FatalDisposition {
+    if matches!(error, EngineError::DeviceLost { .. }) || device_lost {
+        FatalDisposition::DeviceLost
+    } else if dcomp_invalid && matches!(error, EngineError::Composition { .. }) {
+        FatalDisposition::CompositionInvalid
+    } else {
+        FatalDisposition::Fatal
+    }
+}
+
+/// GPU 线程致命错误的处置（C1/C2）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FatalDisposition {
+    /// 真正致命：交给 UI（粘性错误）。
+    Fatal,
+    /// 设备已移除：恢复整个 renderer（D3D12 设备 + DComp visual tree）。
+    DeviceLost,
+    /// D3D12 设备健康但 DirectComposition 失效：只重建 DComp 设备 / visual tree。
+    CompositionInvalid,
+}
+
+/// DirectComposition 设备 / visual tree 重建的限次预算（C2）。
+///
+/// 与 `SharedGpu::recover`（D3D12 设备恢复）同一量级：窗口内最多
+/// [`MAX_COMPOSITION_REBUILDS`] 次。DWM 反复重启 / DComp 持续失效时，无限重建就是「每帧重建
+/// visual tree」的活锁；超限后按粘性 `Composition` 错误上报，由应用决定是否重建窗口。
+const COMPOSITION_RECOVERY_WINDOW: Duration = Duration::from_secs(5);
+const MAX_COMPOSITION_REBUILDS: usize = 3;
+
+/// DComp 重建预算（GPU 线程独占；纯逻辑，可用 `allow_rebuild` 单测）。
+struct CompositionRecovery {
+    /// 最近窗口内的重建时刻（FIFO）。
+    rebuilds: VecDeque<Instant>,
+}
+
+impl CompositionRecovery {
+    fn new() -> Self {
+        Self {
+            rebuilds: VecDeque::with_capacity(MAX_COMPOSITION_REBUILDS),
+        }
+    }
+
+    /// 登记一次重建尝试；窗口内超限返回 `false`（调用方按粘性错误上报）。
+    fn allow_rebuild(&mut self) -> bool {
+        let now = Instant::now();
+        while self
+            .rebuilds
+            .front()
+            .is_some_and(|at| now.duration_since(*at) >= COMPOSITION_RECOVERY_WINDOW)
+        {
+            self.rebuilds.pop_front();
+        }
+        if self.rebuilds.len() >= MAX_COMPOSITION_REBUILDS {
+            return false;
+        }
+        self.rebuilds.push_back(now);
+        true
+    }
+}
+
+/// 重建预算耗尽时的粘性错误（C2；文案带次数与窗口，便于诊断归因）。
+fn composition_rebuild_exhausted() -> EngineError {
+    EngineError::Composition {
+        detail: format_smolstr!(
+            "DirectComposition device stayed invalid after {MAX_COMPOSITION_REBUILDS} rebuilds within {COMPOSITION_RECOVERY_WINDOW:?}"
+        ),
+    }
+}
+
 /// GPU 线程主循环（§6.3）。
 ///
 /// 外层只做一件事（R08-4）：`run_gpu_loop` 以 `DeviceLost` 退出时先尝试**进程内恢复**
@@ -1046,6 +1219,7 @@ fn gpu_loop(renderer: GpuRenderer, shared: Arc<Shared>) {
     // 引用，再销毁 swapchain / 设备），`join` 返回时 teardown 一定已经完成（§6.7）。
     let mut renderer = Some(renderer);
     let mut submitted = VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT);
+    let mut composition_recovery = CompositionRecovery::new();
     loop {
         let result = run_gpu_loop(
             renderer
@@ -1053,31 +1227,75 @@ fn gpu_loop(renderer: GpuRenderer, shared: Arc<Shared>) {
                 .expect("renderer is present until teardown"),
             &shared,
             &mut submitted,
+            &mut composition_recovery,
         );
         match result {
             Ok(()) => break,
             Err(error) => {
-                if !matches!(error, EngineError::DeviceLost { .. }) {
-                    shared.publish_error(error);
-                    break;
-                }
-                // 设备真的被移除了：先尝试一次进程内恢复（限次在 `SharedGpu::recover` 里）。
-                submitted.clear();
-                let current = renderer.take().expect("renderer is present until teardown");
-                match current.recover() {
-                    Ok(recovered) => {
-                        crate::render::windows::diagnostics::device_recovered();
-                        renderer = Some(recovered);
-                        // 镜像已随设备重建 ⇒ UI 必须整帧重发：`InstanceMirror` 现在为空，而增量
-                        // 载荷只带「变化」的 lane，其余 lane 会画成退化实例（AR4 P1-1）。
-                        shared.note_renderer_rebuilt();
-                        if shared.shutdown_requested() {
-                            break;
+                // C1 的边界复判：任何 GPU 线程致命错误在宣布致命之前，用权威判据
+                // （`GetDeviceRemovedReason`）复查一次设备是否真的还在。逐调用点 `classify`
+                // 之外还会有遗漏（尤其 `ResizeBuffers` 这类把设备级 HRESULT 包成
+                // `Swapchain` 的出口），这里兜底：设备已死就必须走恢复，而不是退出线程。
+                let device_lost = match &error {
+                    EngineError::DeviceLost { .. } => true,
+                    _ => device_lost_for_boundary(renderer.as_ref()),
+                };
+                // C2：D3D12 健康时再取一次 DComp 的权威状态（原始事实）。「只有 `Composition`
+                // 错误才允许走 visual 重建」的收窄在 `fatal_disposition` 内完成（纯逻辑可测）：
+                // `AppInit` / `FramePipeline` / `Swapchain` 等致命错误即使 DComp 恰好 Invalid
+                // 也必须保持致命，不能被吞成 visual 重建。
+                let dcomp_invalid = !device_lost
+                    && renderer.as_ref().is_some_and(|current| {
+                        current.composition_state() == CompositionState::Invalid
+                    });
+                match fatal_disposition(&error, device_lost, dcomp_invalid) {
+                    FatalDisposition::Fatal => {
+                        shared.publish_error(error);
+                        break;
+                    }
+                    FatalDisposition::DeviceLost => {
+                        // 设备真的被移除了：先尝试一次进程内恢复（限次在 `SharedGpu::recover` 里）。
+                        submitted.clear();
+                        let current = renderer.take().expect("renderer is present until teardown");
+                        match current.recover() {
+                            Ok(recovered) => {
+                                crate::render::windows::diagnostics::device_recovered();
+                                renderer = Some(recovered);
+                                // 镜像已随设备重建 ⇒ UI 必须整帧重发：`InstanceMirror` 现在为空，
+                                // 而增量载荷只带「变化」的 lane，其余 lane 会画成退化实例
+                                // （AR4 P1-1）。
+                                shared.note_renderer_rebuilt();
+                                if shared.shutdown_requested() {
+                                    break;
+                                }
+                            }
+                            Err(fatal) => {
+                                shared.publish_error(fatal);
+                                break;
+                            }
                         }
                     }
-                    Err(fatal) => {
-                        shared.publish_error(fatal);
-                        break;
+                    FatalDisposition::CompositionInvalid => {
+                        if !composition_recovery.allow_rebuild() {
+                            shared.publish_error(composition_rebuild_exhausted());
+                            break;
+                        }
+                        let current = renderer
+                            .as_mut()
+                            .expect("renderer is present until teardown");
+                        match current.rebuild_composition() {
+                            Ok(()) => {
+                                crate::render::windows::diagnostics::composition_recovered();
+                                // visual tree 换了：旧 visual 上的内容已随旧设备释放 ⇒ UI 整帧重发。
+                                shared.note_renderer_rebuilt();
+                                // **不**清 `submitted`：D3D12 设备 / 提交 / fence 都还在，
+                                // 完成反馈与 retire 必须继续推进（否则 retire 队列会泄漏到卸载）。
+                            }
+                            Err(fatal) => {
+                                shared.publish_error(fatal);
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -1168,6 +1386,7 @@ fn run_gpu_loop(
     renderer: &mut GpuRenderer,
     shared: &Shared,
     submitted: &mut VecDeque<SubmittedFrame>,
+    composition_recovery: &mut CompositionRecovery,
 ) -> Result<(), EngineError> {
     // 已从共享槽取走、但还没被本帧命令列表消费的图集上传（按 `AtlasKind`）。共享槽标志
     // 要等这里清，UI 才不会在 `Retry` / Idle 帧覆盖掉未录制的上传（DEVIATIONS F-211）。
@@ -1184,6 +1403,24 @@ fn run_gpu_loop(
         drain_completed(renderer, shared, submitted, &mut statistics);
         if shared.shutdown_requested() {
             return Ok(());
+        }
+        // C2：泵的几何 pass 消费了 `WM_PAINT` 健康检查代际、发现 DComp 设备失效 ⇒ 请求 GPU 线程
+        // 重建 visual tree（D3D12 设备 / 交换链 / persist 全部保留，空窗 ≤1–2 帧）。这里再读一次
+        // 权威状态：请求可能已过期（DWM 恢复），只有仍然 Invalid 才真的重建。
+        if shared.take_composition_rebuild_request() {
+            match renderer.composition_state() {
+                CompositionState::Valid | CompositionState::WindowClosed => {}
+                CompositionState::Invalid => {
+                    if !composition_recovery.allow_rebuild() {
+                        return Err(composition_rebuild_exhausted());
+                    }
+                    renderer.rebuild_composition()?;
+                    crate::render::windows::diagnostics::composition_recovered();
+                    shared.note_renderer_rebuilt();
+                    // 重建后 DWM 需要一次 present 才显示内容：本帧不吃遮挡退避。
+                    force_present = true;
+                }
+            }
         }
         // 显示 / 电源恢复：拓扑 / 工作区 / 唤醒之后重建交换链（⇒ reset_epoch 让 UI 整帧重发）
         // 并清一次遮挡退避。
@@ -1247,11 +1484,16 @@ fn run_gpu_loop(
             renderer.refresh_background()?;
         }
         // 图集像素在本帧录制前落地（上传先于绘制，§4.2；像素按所有权移交给 GPU）。
-        for (index, upload) in shared.take_atlas().into_iter().enumerate() {
-            if let Some(upload) = upload {
-                atlas_awaiting[index] = true;
-                renderer.queue_atlas_upload(upload.kind, upload.page, upload.pixels, upload.rects);
-            }
+        // D-9-c：一次 take 里可能有多个层（图片图集逐层上传），同一提交内聚合录制。
+        for upload in shared.take_atlas() {
+            atlas_awaiting[upload.kind.index() as usize] = true;
+            renderer.queue_atlas_upload(
+                upload.kind,
+                upload.layer,
+                upload.extent,
+                upload.pixels,
+                upload.rects,
+            );
         }
         // 内容尺寸变化：buffer 内是纯 CPU 记账（内容 visual 恒 1:1；放大露出的区域由 1×1
         // 背景层填充，UI 只改内容 clip / 背景 scale）；内容越过 buffer 桶时在这里重建持久目标
@@ -1639,14 +1881,15 @@ fn unpack_size(packed: u64) -> (u32, u32) {
 mod tests {
     use std::sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     };
 
     use smol_str::SmolStr;
 
     use super::{
-        AtlasSlots, DisplayRecovery, FrameSink, PanicGuard, Shared, State, StickyError,
-        WindowFrameSink, pack_size, recover_display_change, unpack_size,
+        AtlasSlots, CompositionRecovery, DisplayRecovery, FatalDisposition, FrameSink, PanicGuard,
+        Shared, State, StickyError, WindowFrameSink, fatal_disposition, pack_size,
+        recover_display_change, unpack_size,
     };
     use crate::{
         error::EngineError,
@@ -1673,14 +1916,47 @@ mod tests {
     #[test]
     fn a_first_atlas_upload_keeps_its_dirty_rects() {
         let mut slots = AtlasSlots::new();
-        slots.queue(AtlasKind::Glyph, 64, vec![1, 2, 3], dirty_rects(4, 8));
-        let [glyph, image] = slots.take();
-        let glyph = glyph.expect("glyph upload");
-        assert_eq!(glyph.page, 64);
+        slots.queue(AtlasKind::Glyph, 0, 64, vec![1, 2, 3], dirty_rects(4, 8));
+        slots.queue(AtlasKind::Image, 1, 2048, vec![4, 5], dirty_rects(0, 2));
+        let mut uploads = slots.take();
+        assert_eq!(uploads.len(), 2, "字形 + 图片第 1 层");
+        let image = uploads.pop().expect("image upload");
+        assert_eq!(image.kind, AtlasKind::Image);
+        assert_eq!(image.layer, 1);
+        assert_eq!(image.extent, 2048);
+        assert_eq!(image.pixels, vec![4, 5]);
+        assert_eq!(image.rects, dirty_rects(0, 2));
+        let glyph = uploads.pop().expect("glyph upload");
+        assert_eq!(glyph.layer, 0);
+        assert_eq!(glyph.extent, 64);
         assert_eq!(glyph.pixels, vec![1, 2, 3]);
         assert_eq!(glyph.rects, dirty_rects(4, 8));
-        assert!(image.is_none());
-        assert!(slots.take().iter().all(Option::is_none), "取走后槽位为空");
+        assert!(slots.take().is_empty(), "取走后槽位为空");
+    }
+
+    /// 同一个 kind 的不同层可以**同时**入队（D-9-c：图片图集一帧内逐层上传）。
+    #[test]
+    fn multiple_image_layers_can_be_queued_in_one_frame() {
+        let mut slots = AtlasSlots::new();
+        for layer in 0..4u16 {
+            slots.queue(
+                AtlasKind::Image,
+                layer,
+                2048,
+                vec![layer as u8],
+                dirty_rects(0, 1),
+            );
+        }
+        let uploads = slots.take();
+        assert_eq!(uploads.len(), 4);
+        assert_eq!(
+            uploads
+                .iter()
+                .map(|upload| upload.layer)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3],
+            "take 必须按层号升序返回"
+        );
     }
 
     #[test]
@@ -1688,8 +1964,8 @@ mod tests {
     fn queueing_into_a_busy_atlas_slot_is_a_contract_violation() {
         // UI 线程用 `atlas_idle` 门控入队；覆盖未消费的上传会丢行，因此这里是硬失败。
         let mut slots = AtlasSlots::new();
-        slots.queue(AtlasKind::Glyph, 64, vec![1, 2, 3], dirty_rects(4, 8));
-        slots.queue(AtlasKind::Glyph, 64, vec![9, 9, 9], dirty_rects(16, 20));
+        slots.queue(AtlasKind::Glyph, 0, 64, vec![1, 2, 3], dirty_rects(4, 8));
+        slots.queue(AtlasKind::Glyph, 0, 64, vec![9, 9, 9], dirty_rects(16, 20));
     }
 
     /// `atlas_pending` 只能在**录制完成**后清：`take_atlas` 只把上传搬给 GPU 线程，清早了
@@ -1698,11 +1974,10 @@ mod tests {
     fn an_atlas_upload_stays_busy_until_it_is_recorded() {
         let shared = test_shared();
         assert!(shared.atlas_idle(AtlasKind::Glyph));
-        assert!(shared.queue_atlas(AtlasKind::Glyph, 64, &[1, 2, 3], dirty_rects(4, 8)));
+        assert!(shared.queue_atlas(AtlasKind::Glyph, 0, 64, &[1, 2, 3], dirty_rects(4, 8)));
 
-        let [glyph, image] = shared.take_atlas();
-        assert!(glyph.is_some());
-        assert!(image.is_none());
+        let uploads = shared.take_atlas();
+        assert_eq!(uploads.len(), 1);
         assert!(
             !shared.atlas_idle(AtlasKind::Glyph),
             "take 只是搬走上传，录制之前共享槽仍然是忙的"
@@ -1713,6 +1988,28 @@ mod tests {
             shared.atlas_idle(AtlasKind::Glyph),
             "录制完成之后才允许下一次入队"
         );
+    }
+
+    /// D-9-c：图片图集逐层入队 ⇒ 任一层的槽位未录制完，该 kind 都算忙；
+    /// 一次 `atlas_uploaded` 清空该 kind 的全部层（同一次提交内一起录制）。
+    #[test]
+    fn image_atlas_is_busy_until_every_queued_layer_is_recorded() {
+        let shared = test_shared();
+        assert!(shared.atlas_idle(AtlasKind::Image));
+        for layer in 0..4u16 {
+            assert!(shared.queue_atlas(
+                AtlasKind::Image,
+                layer,
+                2048,
+                &[layer as u8; 4],
+                dirty_rects(0, 1)
+            ));
+        }
+        assert!(!shared.atlas_idle(AtlasKind::Image));
+        assert_eq!(shared.take_atlas().len(), 4);
+        assert!(!shared.atlas_idle(AtlasKind::Image));
+        shared.atlas_uploaded(AtlasKind::Image);
+        assert!(shared.atlas_idle(AtlasKind::Image));
     }
 
     #[test]
@@ -1782,7 +2079,8 @@ mod tests {
             presented: AtomicU64::new(pack_size((1, 1))),
             reset_epoch: AtomicU64::new(0),
             composition_pending: AtomicBool::new(false),
-            atlas_pending: [AtomicBool::new(false), AtomicBool::new(false)],
+            composition_rebuild: AtomicBool::new(false),
+            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0)],
         })
     }
 
@@ -1802,6 +2100,109 @@ mod tests {
         assert_eq!(sink.reset_epoch(), 1, "设备恢复必须让 UI 看到新代际");
         shared.note_renderer_rebuilt();
         assert_eq!(sink.reset_epoch(), 2, "连续两次重建必须各 +1");
+    }
+
+    /// C1：GPU 线程错误边界必须先复判设备状态，再决定「恢复」还是「致命」。
+    ///
+    /// 真实故障（TDR 恰落在 `ResizeBuffers` 上）无法在 WARP 里自动触发，因此这里对**判据**做
+    /// 穷举：`DeviceLost` 恒恢复；非 `DeviceLost` 但权威判据确认移除 ⇒ 恢复（`ResizeBuffers`
+    /// 把设备级 HRESULT 包成 `Swapchain` 的路径）；健康设备上的非 `DeviceLost` 错误保持致命。
+    #[test]
+    fn the_fatal_boundary_rejudges_a_removed_device_before_publishing() {
+        let removed = EngineError::DeviceLost {
+            reason: SmolStr::new_static("DXGI_ERROR_DEVICE_REMOVED"),
+            log_path: std::path::PathBuf::from("logs/dred.txt"),
+        };
+        assert_eq!(
+            fatal_disposition(&removed, false, false),
+            FatalDisposition::DeviceLost,
+            "DeviceLost 本身已足够触发恢复"
+        );
+        assert_eq!(
+            fatal_disposition(&removed, true, true),
+            FatalDisposition::DeviceLost
+        );
+
+        let swapchain = EngineError::Swapchain {
+            detail: SmolStr::new_static("ResizeBuffers(800x600): 0x887A0005"),
+        };
+        assert_eq!(
+            fatal_disposition(&swapchain, false, false),
+            FatalDisposition::Fatal,
+            "设备健康时交换链错误必须保持致命（不无限恢复）"
+        );
+        assert_eq!(
+            fatal_disposition(&swapchain, true, false),
+            FatalDisposition::DeviceLost,
+            "ResizeBuffers 在设备移除竞态下被包成 Swapchain 时仍必须恢复"
+        );
+
+        // C2：D3D12 健康但 DComp 失效 ⇒ 可恢复（只重建 visual tree），不是致命。
+        let composition = EngineError::Composition {
+            detail: SmolStr::new_static("Device::Commit: 0x8007000E"),
+        };
+        assert_eq!(
+            fatal_disposition(&composition, false, true),
+            FatalDisposition::CompositionInvalid
+        );
+        assert_eq!(
+            fatal_disposition(&composition, false, false),
+            FatalDisposition::Fatal
+        );
+        // 设备已丢失的优先级高于 DComp 失效：必须整 renderer 恢复，而不是只重建 visual tree。
+        assert_eq!(
+            fatal_disposition(&composition, true, true),
+            FatalDisposition::DeviceLost
+        );
+
+        // review-c RC-4：DComp 恰好 Invalid **不能**把真实的致命错误吞成 visual 重建。
+        // `AppInit` / `FramePipeline` / `Swapchain` 即使 `dcomp_invalid == true` 也必须保持 Fatal，
+        // 否则原始错误被掩盖，持续 Invalid 后还会以「DComp 重建 3 次失败」误导归因。
+        let app_init = EngineError::AppInit {
+            detail: SmolStr::new_static("d3d12 persist target missing"),
+        };
+        assert_eq!(
+            fatal_disposition(&app_init, false, true),
+            FatalDisposition::Fatal,
+            "AppInit 不因 DComp 恰好 Invalid 而降级成 visual 重建"
+        );
+        let frame_pipeline = EngineError::FramePipeline {
+            detail: SmolStr::new_static("compositor thread panicked"),
+        };
+        assert_eq!(
+            fatal_disposition(&frame_pipeline, false, true),
+            FatalDisposition::Fatal
+        );
+        assert_eq!(
+            fatal_disposition(&swapchain, false, true),
+            FatalDisposition::Fatal,
+            "设备健康时交换链错误必须保持致命，即使 DComp 状态异常"
+        );
+    }
+
+    /// C2：DComp 重建预算 —— 窗口内最多 3 次，超限后由成功重建前的冷却时间复位。
+    ///
+    /// 直接跑 3 次 `allow_rebuild` 后再跑第 4 次（窗口内）必须拒绝；把窗口“拨快”到冷却之后
+    /// 再允许（这里通过时间无法注入，因此用 `COMPOSITION_RECOVERY_WINDOW` 的语义断言：持续
+    /// 重建在窗口内也不会无限通过 —— 三次后拒绝，说明预算生效）。
+    #[test]
+    fn composition_rebuilds_are_bounded_within_the_recovery_window() {
+        let mut recovery = CompositionRecovery::new();
+        assert!(recovery.allow_rebuild(), "第 1 次重建允许");
+        assert!(recovery.allow_rebuild(), "第 2 次重建允许");
+        assert!(recovery.allow_rebuild(), "第 3 次重建允许");
+        assert!(
+            !recovery.allow_rebuild(),
+            "同一窗口内第 4 次重建必须被拒绝（否则 DWM 反复失效会变成每帧重建活锁）"
+        );
+        // 诊断文案必须能归因到「限次」，而不是伪装成普通 Composition 错误。
+        let error = super::composition_rebuild_exhausted();
+        match error {
+            EngineError::Composition { detail } => {
+                assert!(detail.contains("3 rebuilds"), "{detail}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     /// R07-14：平台层的显示 / 电源恢复（拓扑变化、工作区变化、睡眠唤醒）必须让 GPU 线程

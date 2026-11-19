@@ -36,15 +36,20 @@
 //!
 //! 异步（I1 / I2 / I4）：`vkQueueSubmit` 后立即返回；`resize` 不再等设备空闲（只用
 //! `oldSwapchain` 建新的，旧资源按提交序号延迟释放）；retire 由本窗口 timeline 非阻塞推进。
-//! 阻塞只发生在 GPU 线程上：槽 fence（有界 2 s）、`vkAcquireNextImageKHR`（100 ms 上限）、
-//! 以及 swapchain 重建后的队列 idle（有界 2 s，R11-3）。
+//! 热路径上的阻塞只有槽 fence（有界 2 s）与 `vkAcquireNextImageKHR`（100 ms 上限）；旧 swapchain
+//! 的销毁在 present 路径**零等待**（C9：timeline 完成 + 新链首 present 之后异步 drop）。队列
+//! idle 只保留在 teardown（有界 2 s）与 C7 的 surface 重建强制入口。
 //!
 //! 共享图集的并发契约（多窗口）：**读锁**覆盖「页对齐 → 录制 → 提交」整个区间（页在帧内不会
 //! 变）；待上传页与共享页不一致时先释放读锁，在 `SharedGpu::rebuild_atlas_pages` 的**写锁**里
 //! 落地页换代，然后重试。多个窗口同时往同一张纹理上传因此是安全的（同一队列按提交顺序执行，
 //! 屏障序列不交错）。
 
-use std::{collections::VecDeque, sync::Arc, time::Instant};
+use std::{
+    collections::VecDeque,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use ash::vk;
 use wayland_client::protocol::wl_surface;
@@ -61,7 +66,7 @@ use super::{
     geometry::GeometryRegistry,
     memory::MemoryNeed,
     pipeline::{Pipeline, RENDER_FORMAT},
-    swapchain::{Acquire, Present, Surface, Swapchain},
+    swapchain::{Acquire, CreateFailure, Present, Surface, Swapchain},
     timer::GpuTimer,
 };
 use crate::{
@@ -83,9 +88,24 @@ use crate::{
 /// `minStorageBufferOffsetAlignment` 的保守上界（256 B）：clips 段在此偏移处开始。
 const CLIP_ALIGN: u64 = 256;
 
-/// 连续 `OUT_OF_DATE` / `SUBOPTIMAL` 的重建上限：正常合成器一次重建就能恢复；超过说明 surface
-/// 已失效或参数始终不匹配（R11-7 的「每帧重建自旋」）。
-const MAX_REBUILDS: u32 = 4;
+/// `SUBOPTIMAL` 的重建上限（**只属于 SUBOPTIMAL 策略**）：持续 SUBOPTIMAL 时每帧重建会退化成
+/// 「帧率崩塌 + 句柄/显存抖动」，超过上限就放弃重建、继续用现有链呈现（R11-7）。
+///
+/// `OUT_OF_DATE` 不共用这个常量：它是 WSI 的正常控制流，按 [`OutOfDateRecovery`] 无限重建 +
+/// 退避（用户裁决 C8）。
+const MAX_SUBOPTIMAL_REBUILDS: u32 = 4;
+
+/// 任何可恢复 WSI 重试的退避上限（用户裁决：≤50 ms）。
+///
+/// GPU 循环的 `thread::sleep` 因此最多多等这么久；关窗 `join()` 的尾延迟有同一个上界。
+pub(crate) const MAX_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+
+/// 一次 `SURFACE_LOST` 恢复失败后的重试退避序列：3 次有界重试（用户裁决 C8）。
+const SURFACE_LOST_BACKOFF: [Duration; 3] = [
+    Duration::from_millis(1),
+    Duration::from_millis(4),
+    Duration::from_millis(16),
+];
 
 /// 重建之后至少多少帧不再重建（即使 acquire / present 仍报 `SUBOPTIMAL`）。
 ///
@@ -93,6 +113,157 @@ const MAX_REBUILDS: u32 = 4;
 /// 而每次重建都要 `vkCreateSwapchainKHR` + `vkGetSwapchainImagesKHR` + N 个信号量。没有这个门槛
 /// 时，持续 SUBOPTIMAL 会退化成每帧重建：帧率崩塌 + 句柄/显存抖动，现象像「卡顿」而不是错误。
 const REBUILD_COOLDOWN_FRAMES: u64 = 60;
+
+/// 一次可恢复 WSI 故障之后的等待决策（[`OutOfDateRecovery`] 的输出）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Retry {
+    /// 下一次重试之前必须等待的时长（`OUT_OF_DATE` 恒 >0；`SURFACE_LOST` 按预算取 1/4/16 ms）。
+    after: Duration,
+    /// 本次是否要打一行低频诊断（第 1 / 16 次，之后每 64 次；不刷屏）。
+    report: bool,
+}
+
+/// `OUT_OF_DATE` / `SURFACE_LOST` 的恢复策略（**纯逻辑**，无 GPU 依赖，可单测）。
+///
+/// 用户裁决（C8）：
+/// - `VK_ERROR_OUT_OF_DATE_KHR` 是 WSI 的**正常控制流**（acquire / present 都会返回它）：
+///   无限重建 + 指数退避（1/2/4/… ≤50 ms），**永不**因它产生致命错误或结束事件循环；
+///   成功 acquire / present 之后计数与退避复位。对齐 Chromium（OOD = swap 失败后重建）与
+///   Qt（`beginFrame` 返回 `FrameOpSwapChainOutOfDate`）的处理方式。
+/// - `VK_ERROR_SURFACE_LOST_KHR` 有界重试：最多 3 次退避重试（1/4/16 ms），仍失败才上报
+///   「合成器/连接还活着但 surface 不可用」的强类型错误（区别于设备丢失）。
+#[derive(Debug, Default)]
+struct OutOfDateRecovery {
+    /// 连续 `OUT_OF_DATE` 次数（成功 acquire / present 后清零）。
+    out_of_date: u32,
+    /// 连续 surface 恢复失败次数（成功 acquire / present 后清零）。
+    surface_lost_failures: u32,
+}
+
+impl OutOfDateRecovery {
+    const fn new() -> Self {
+        Self {
+            out_of_date: 0,
+            surface_lost_failures: 0,
+        }
+    }
+
+    /// 一次 `OUT_OF_DATE`：无限重建，退避 = 1/2/4/8/16/32/50 ms（封顶）。
+    fn on_out_of_date(&mut self) -> Retry {
+        self.out_of_date += 1;
+        Retry {
+            after: out_of_date_backoff(self.out_of_date),
+            report: out_of_date_diagnostic(self.out_of_date),
+        }
+    }
+
+    /// 一次成功 acquire / present：计数与退避一起复位。
+    ///
+    /// 返回上一段连续 OOD 的次数：>1 时才值得打一行「已恢复」诊断（第 1 次 OOD 立刻恢复属于
+    /// 正常控制流，不刷屏）。
+    fn on_progress(&mut self) -> Option<u32> {
+        let recovered = self.out_of_date;
+        self.out_of_date = 0;
+        self.surface_lost_failures = 0;
+        (recovered > 1).then_some(recovered)
+    }
+
+    /// 一次 `SURFACE_LOST` 恢复失败：预算内返回本次重试前的退避，耗尽后上报。
+    ///
+    /// 预算是「3 次重试」：第 1/2/3 次失败分别退避 1/4/16 ms，第 4 次失败才返回错误。
+    fn on_surface_lost_failure(&mut self, reason: &'static str) -> Result<Duration, EngineError> {
+        self.surface_lost_failures += 1;
+        SURFACE_LOST_BACKOFF
+            .get(self.surface_lost_failures as usize - 1)
+            .copied()
+            .ok_or_else(|| EngineError::Swapchain {
+                detail: smol_str::format_smolstr!(
+                    "compositor/connection is still alive but the swapchain surface stayed lost \
+                     after {SURFACE_LOST_BACKOFF_LEN} retries ({reason})"
+                ),
+            })
+    }
+}
+
+/// `SURFACE_LOST_BACKOFF` 的条目数（错误文案与预算单测共用同一事实）。
+const SURFACE_LOST_BACKOFF_LEN: usize = SURFACE_LOST_BACKOFF.len();
+
+/// `OUT_OF_DATE` 的指数退避：第 n 次连续失败等 `min(2^(n-1) ms, 50 ms)`。
+fn out_of_date_backoff(consecutive: u32) -> Duration {
+    debug_assert!(consecutive >= 1, "the first out-of-date retry waits 1 ms");
+    let exponent = consecutive.saturating_sub(1).min(6);
+    Duration::from_millis(1u64 << exponent).min(MAX_RETRY_BACKOFF)
+}
+
+/// `OUT_OF_DATE` 诊断行的低频策略：第 1 / 16 次，之后每 64 次。
+///
+/// 1000 次连续 OOD 只产生 ~17 行；交互 resize 造成的偶发 OOD 不刷屏（用户裁决「低频诊断」）。
+fn out_of_date_diagnostic(consecutive: u32) -> bool {
+    consecutive == 1 || consecutive == 16 || consecutive.is_multiple_of(64)
+}
+
+/// 旧 swapchain 的**非阻塞**延迟销毁台账（C9）；`retired_persists` 也复用同一结构。
+///
+/// 每条 `(tag, value)` 的 `tag` 是「最后一次使用该资源的提交序号」（`last_sequence`，
+/// **不是** `FrameIndex`：UI 帧序号会跳号 / 饱和，R11-1）。timeline 确认 `completed >= tag`
+/// 之后才把 value 交给 `drop_fn` 真正释放 —— 与 `RetireQueue`（GPU 资源句柄）同一语义，
+/// 但对象类型不同（Swapchain / Persist 持有的是 Vulkan 对象 + 它们的 Drop）。
+///
+/// **present 热路径零阻塞**：`drain_ready` 只比较已观测到的 timeline 值，不做任何等待。
+struct Retired<T> {
+    entries: Vec<(u64, T)>,
+}
+
+impl<T> Retired<T> {
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// 入账：`tag` 必须是提交序号（调用方只从 `last_sequence` 取，见 `retire_swapchain`）。
+    fn retire(&mut self, tag: u64, value: T) {
+        self.entries.push((tag, value));
+    }
+
+    /// 非阻塞释放：`tag <= completed` 的条目按入账顺序交给 `drop_fn`。
+    fn drain_ready(&mut self, completed: u64, mut drop_fn: impl FnMut(T)) {
+        let mut index = 0;
+        while index < self.entries.len() {
+            if self.entries[index].0 <= completed {
+                let (_, value) = self.entries.remove(index);
+                drop_fn(value);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    /// 取出全部条目（保持顺序）；调用方负责 drop。teardown / C7 强制入口用。
+    fn take_all(&mut self) -> Vec<(u64, T)> {
+        std::mem::take(&mut self.entries)
+    }
+
+    /// 条数（安全阀 `> MAX_RETIRED_SWAPCHAINS` 与测试用）。
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// 只读遍历 value（leak 兜底要把台账里的每个对象都标记成「交给进程级回收」）。
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.entries.iter_mut().map(|(_, value)| value)
+    }
+}
+
+/// 延迟 swapchain 的容量上限（C9 安全阀）：`MAX_FRAMES_IN_FLIGHT + 1`。
+///
+/// 正常节奏下旧链在下一帧 present 后就被释放（≤2 条）；极端「慢 GPU + 高频 resize」时不允许
+/// 链 / 显存无限堆积，超过上限就退回 C7 的强制销毁（一次有界队列 idle）。
+const MAX_RETIRED_SWAPCHAINS: usize = MAX_FRAMES_IN_FLIGHT + 1;
 
 /// 一帧异步提交的结果（窗口路径）。
 pub(crate) enum Submitted {
@@ -105,8 +276,10 @@ pub(crate) enum Submitted {
         slot: usize,
         sequence: u64,
     },
-    /// 本帧没有产生 GPU 工作（acquire 未就绪 / 刚重建 swapchain）：调用方保留帧请求重试。
-    Retry,
+    /// 本帧没有产生 GPU 工作（acquire 未就绪 / 可恢复的 WSI 故障）：调用方**保留**帧请求，
+    /// 按 `after` 有界退避后重试（`None` = 立即重试；GPU 循环的 sleep 上限见
+    /// [`MAX_RETRY_BACKOFF`]）。`OUT_OF_DATE` / `SURFACE_LOST` 走这里，**永不**因此退出进程。
+    Retry { after: Option<Duration> },
 }
 
 /// 已提交、尚未被 timeline 确认完成的帧的**提交序号**（timeline 的 signal 值 = ring 的提交序号）。
@@ -155,11 +328,21 @@ pub(crate) struct GpuRenderer {
     vk_surface: Option<Surface>,
     /// 当前持久绘制目标（尺寸 = swapchain extent，格式 = `RENDER_FORMAT`）。
     persist: Persist,
-    /// 旧 persist 的延迟销毁（I4）：`u64` 提交序号完成之后才 drop（`Persist::drop` 销毁句柄）。
-    retired_persists: Vec<(u64, Persist)>,
-    /// 旧 swapchain 的延迟销毁（§7.4 / R11-3）：销毁前必须有一次**队列 idle**（presentation
-    /// engine 与在飞批次都可能仍引用它们）。
-    retired_swapchains: Vec<Swapchain>,
+    /// 旧 persist 的延迟销毁（I4 / C9 台账）：提交序号完成之后才 drop（`Persist::drop` 销毁句柄）。
+    retired_persists: Retired<Persist>,
+    /// 旧 swapchain 的延迟销毁（§7.4 / R11-3 / C9）：tag 是最后一次使用它的提交序号；timeline
+    /// 确认完成、且当前链已经成功 present 过之后由 [`Self::drain_retired_swapchains`] 非阻塞
+    /// 释放（present 热路径零等待）。强制入口 [`Self::destroy_retired_swapchains_now`] 只用于
+    /// C7 的 surface 重建与容量安全阀。
+    retired_swapchains: Retired<Swapchain>,
+    /// 当前这条 swapchain 是否已经成功 present 过至少一次（C9 的「新链首 present 门」）。
+    ///
+    /// `install_swapchain` 置 `false`、present 成功置 `true`。旧链只有在「新链至少 present 过
+    /// 一次」之后才允许销毁 —— 对齐 VVL `ResetPresentWaitSemaphores` 的启发式：旧链的
+    /// present-wait semaphore 不再被占用。unextended Vulkan 没有 present fence，这是可达的最佳
+    /// 实践（Chromium 用 FenceHelper 延迟清理旧链；Qt 在 releaseSwapChainResources 里 queue
+    /// idle）；它让旧链多活一帧，但**永不阻塞**。
+    current_presented_once: bool,
     /// 本窗口在进程级描述符池里的段（`Drop` 归还）。
     descriptors: DescriptorLease,
     /// 每帧槽上一次写进 descriptor set 的 `(上传缓冲, clips 偏移)`（R11-10）。
@@ -225,8 +408,9 @@ pub(crate) struct GpuRenderer {
     image_sync: ImageSyncStep,
     /// present 成功后需要重建 swapchain（`SUBOPTIMAL`，§7.3）。
     rebuild_swapchain: bool,
-    /// 连续 `OUT_OF_DATE` 次数（每次成功 present 清零）：超上限才报错，不无限自旋。
-    out_of_date: u32,
+    /// `OUT_OF_DATE` / `SURFACE_LOST` 的恢复策略（C8：无限退避重建 / surface 有界重试；
+    /// 失败分类见 `swapchain::CreateFailure`）。
+    out_of_date_recovery: OutOfDateRecovery,
     /// 最近一段时间的 `SUBOPTIMAL` 重建次数与上次重建的提交序号（R11-7 的门槛）。
     suboptimal_rebuilds: u32,
     last_rebuild_sequence: u64,
@@ -259,7 +443,8 @@ impl GpuRenderer {
         let size = (size.0.max(1), size.1.max(1));
         let shared = SharedGpu::process_windowed(display, surface_ptr)?;
         let vk_surface = Surface::new(&shared, display, surface_ptr)?;
-        let swapchain = Swapchain::new(&shared, vk_surface.raw(), size)?;
+        let swapchain =
+            Swapchain::new(&shared, &vk_surface, size).map_err(CreateFailure::into_error)?;
         Self::with_gpu(
             shared,
             Some(vk_surface),
@@ -313,8 +498,9 @@ impl GpuRenderer {
             vk_surface,
             swapchain,
             persist,
-            retired_persists: Vec::new(),
-            retired_swapchains: Vec::new(),
+            retired_persists: Retired::new(),
+            retired_swapchains: Retired::new(),
+            current_presented_once: false,
             descriptors,
             atlas_uploads: AtlasUploads::new(),
             upload,
@@ -340,7 +526,7 @@ impl GpuRenderer {
             present_hint: None,
             image_sync: ImageSyncStep::Full,
             rebuild_swapchain: false,
-            out_of_date: 0,
+            out_of_date_recovery: OutOfDateRecovery::new(),
             suboptimal_rebuilds: 0,
             last_rebuild_sequence: 0,
             rebuild_abandoned: false,
@@ -371,27 +557,42 @@ impl GpuRenderer {
     }
 
     /// resize（§7.4）：**不排空设备**。新 swapchain 走 `oldSwapchain`，旧 swapchain / 旧 persist
-    /// 进延迟销毁队列（旧 swapchain 在下一次队列 idle 时销毁，见 [`Self::drain_retired_swapchains`]；
-    /// 旧 persist 等提交序号完成，I4）。
+    /// 进延迟销毁台账（C9：旧链在「最后一次使用它的提交完成 + 新链首 present」之后异步 drop，
+    /// 见 [`Self::drain_retired_swapchains`]；旧 persist 等提交序号完成，I4）。
     ///
     /// 渲染目标尺寸的**唯一来源是 swapchain extent**（clamp / `currentExtent` / transform 之后，
     /// R11-9），不是 UI 请求值 —— 旧实现让 persist 用未 clamp 的请求尺寸，于是 `renderArea` 可能
     /// 超出 framebuffer（`VUID-VkRenderPassBeginInfo-*`）、`vkCmdCopyImage` 的 extent 可能超出源图。
+    ///
+    /// C8：窗口路径的建链失败按 `CreateFailure` 分类 —— `OUT_OF_DATE` / `SURFACE_LOST` 不升级为
+    /// 致命错误：链保持 absent、请求尺寸先记账，由下一次 `submit_frame` 顶部的
+    /// [`Self::ensure_swapchain`] 退避补建（`SURFACE_LOST` 会先走 C7 的表面重建）。旧实现把任何
+    /// 建链失败都变成粘性错误，正常 resize 竞争就能结束事件循环。
     pub(crate) fn resize(&mut self, size: (u32, u32)) -> Result<(), EngineError> {
         // 窗口目标的 resize 只能发生在 GPU 线程（§7.3）；离屏目标由门面同步调用。
         debug_assert!(
-            self.swapchain.is_none() || on_gpu_thread(),
+            self.vk_surface.is_none() || on_gpu_thread(),
             "resizing a window target may only run on the kytrix-vulkan thread"
         );
         let size = (size.0.max(1), size.1.max(1));
+        if self.vk_surface.is_some() {
+            if size == self.surface && self.swapchain.is_some() {
+                return Ok(());
+            }
+            // 请求尺寸先记账：建链失败后的重试按最新请求尺寸走（swapchain extent 仍由
+            // `install_swapchain` 在成功时覆盖，单一真相源不变）。
+            self.surface = size;
+            return match self.try_replace_swapchain(size) {
+                Ok(()) => Ok(()),
+                Err(CreateFailure::Fatal(error)) => Err(error),
+                // 可恢复的 WSI 状态：链保持 absent，`submit_frame` 顶部按 C8 策略恢复。
+                Err(CreateFailure::OutOfDate | CreateFailure::SurfaceLost) => Ok(()),
+            };
+        }
+        // 离屏路径：没有 swapchain，渲染目标尺寸就是请求尺寸。
         if size == self.surface {
             return Ok(());
         }
-        if self.swapchain.is_some() {
-            // 窗口路径：`install_swapchain` 按新链的 `imageExtent` 保证 persist 尺寸（单一来源）。
-            return self.replace_swapchain(size);
-        }
-        // 离屏路径：没有 swapchain，渲染目标尺寸就是请求尺寸。
         let persist = Persist::new(&self.shared, size)?;
         // 离屏路径本来就同步（`finish_sync` 已等完每次提交）⇒ 旧 persist 可以立刻释放。
         drop(std::mem::replace(&mut self.persist, persist));
@@ -403,7 +604,8 @@ impl GpuRenderer {
     /// 窗口路径：提交一帧（**不等 GPU 完成**，I2）。
     ///
     /// 调用方（`renderer.rs` 的 GPU 循环）已经在 `request.surface` 变化时调用 [`Self::resize`]。
-    /// `Retry` 表示本帧没有产生 GPU 工作，调用方必须**保留**该请求（跳过它会把 damage 弄丢）。
+    /// `Submitted::Retry` 表示本帧没有产生 GPU 工作（或遇到可恢复的 WSI 故障），调用方必须
+    /// **保留**该请求并按 `after` 退避后重试（跳过它会把 damage 弄丢）。
     pub(crate) fn submit_frame(
         &mut self,
         request: &FrameRequest,
@@ -413,13 +615,20 @@ impl GpuRenderer {
             on_gpu_thread(),
             "Vulkan 窗口帧只能在 kytrix-vulkan 线程提交"
         );
+        if let Some(error) = self.shared.lost_error() {
+            return Err(error);
+        }
+        // C8：上一次可恢复的建链失败（OOD / SURFACE_LOST）可能留下 absent 的链。统一入口先补建：
+        // 可恢复故障返回退避（保留 pending 帧），Fatal 才上报。
+        if self.swapchain.is_none()
+            && let Some(after) = self.ensure_swapchain("rebuilding the missing swapchain")?
+        {
+            return Ok(Submitted::Retry { after: Some(after) });
+        }
         debug_assert!(
             self.swapchain.is_some(),
             "window frames require a swapchain"
         );
-        if let Some(error) = self.shared.lost_error() {
-            return Err(error);
-        }
         // DPI 与 surface 同帧过线：geometry 通道的顶点是逻辑像素，root uniform 的
         // `frame.params.x` 必须与这一帧的 surface 成对（contract §6）。
         self.scale = request.scale;
@@ -445,18 +654,19 @@ impl GpuRenderer {
                     // 本帧照常 present，之后按门槛重建（§7.3 / R11-7）。
                     self.rebuild_swapchain = true;
                 }
+                // 拿到可呈现的 image = 进展：OOD / surface-lost 的连续计数复位（C8）。
+                self.note_progress();
                 index
             }
-            Ok(Acquire::NotReady) => return Ok(Submitted::Retry),
+            // 超时：帧请求保留着重试（acquire 自带 100 ms 节拍，不额外退避）。
+            Ok(Acquire::NotReady) => return Ok(Submitted::Retry { after: None }),
             Ok(Acquire::OutOfDate) => {
-                self.rebuild_out_of_date("acquire reported OUT_OF_DATE")?;
-                return Ok(Submitted::Retry);
+                return self.retry_out_of_date("acquire reported OUT_OF_DATE");
             }
             // R11-11：surface 永久失效 ⇒ 重建 `VkSurfaceKHR` + swapchain（旧实现把 acquire 的
             // `SURFACE_LOST` 混进 `OutOfDate`，于是 present 侧的同类错误直接结束 GPU 线程、窗口黑屏）。
             Ok(Acquire::SurfaceLost) => {
-                self.recover_surface("acquire reported SURFACE_LOST")?;
-                return Ok(Submitted::Retry);
+                return self.recover_surface("acquire reported SURFACE_LOST");
             }
             Err(error) => return Err(self.classify(error)),
         };
@@ -550,10 +760,12 @@ impl GpuRenderer {
                 if matches!(presented, Present::Suboptimal) {
                     self.rebuild_swapchain = true;
                 }
-                // 成功 present ⇒ 连续 OUT_OF_DATE 计数清零（上界只约束「连续」失败）。
-                self.out_of_date = 0;
+                // 成功 present = 进展：连续 OOD / surface-lost 的计数与退避复位（C8）。
+                self.note_progress();
                 frame.presented();
                 self.fresh = false;
+                // C9 的「新链首 present 门」：旧链此刻起才允许被非阻塞销毁。
+                self.current_presented_once = true;
                 // 本 image 已经被这一帧追平；其余 image 累积本帧 damage（R11-12）。
                 // 例外：本帧一个像素都没搬（`Nothing`）⇒ 欠账必须原样累积（AR3 §5.3），否则
                 // 「persist 里变了、这张 image 上没变」的矩形会被当成已同步。
@@ -566,17 +778,23 @@ impl GpuRenderer {
                         self.image_copy_plan.commit(image_index, written);
                     }
                 }
-                // 旧 swapchain 的释放条件（R11-3）：队列 idle，而不是「新链某帧的 timeline」。
-                self.drain_retired_swapchains()?;
+                // C9：present 热路径**不再**做队列 idle；旧链由 GPU 循环的完成观测点
+                // （`drain_completed` → `drain_retired_swapchains`）按 timeline 非阻塞释放。
             }
             Present::OutOfDate => {
-                // 本帧已经提交（timeline 会 signal），不能再重录；立刻重建，由下一帧补画。
-                self.rebuild_swapchain = false;
-                self.rebuild_out_of_date("present reported OUT_OF_DATE")?;
+                // present 返回 OOD 说明本帧的提交**已经发生**（timeline 会 signal）：先把提交
+                // 序号登记进 retire 流水线，再保留 pending 帧、退避后重画。
+                //
+                // 旧实现把 present-OOD 当 `Presented` 返回，pending 帧被丢弃：resize 之后如果
+                // UI 没有新帧，新链永远等不到第一次 present（黑窗），而 OOD 计数继续累计到
+                // 旧的「连续 OOD 上限」（4 次）就结束事件循环（C8 的问题本体）。
+                self.submitted.push_back(sequence);
+                return self.retry_out_of_date("present reported OUT_OF_DATE");
             }
             // R11-11：present 侧的 `SURFACE_LOST_KHR` 走与 acquire 同一条恢复路径。
             Present::SurfaceLost => {
-                self.recover_surface("present reported SURFACE_LOST")?;
+                self.submitted.push_back(sequence);
+                return self.recover_surface("present reported SURFACE_LOST");
             }
         }
         self.submitted.push_back(sequence);
@@ -632,10 +850,12 @@ impl GpuRenderer {
     /// 发布 `signal <= 完成值` 的帧反馈 —— 与 retire 同一观测点（§4.1）。timeline 只在这里读
     /// （§7.2 硬规则 2：不用于 acquire/present）。旧 swapchain / 旧 persist 在本方法里真正
     /// drop —— 即「等对应帧完成之后才释放」。
+    ///
+    /// C9：旧链的释放走 `Retired::drain_ready`（比较 timeline，不等待）+ 新链首 present 门；
+    /// 唯一可能阻塞的是超过 [`MAX_RETIRED_SWAPCHAINS`] 的安全阀（退回 C7 的强制入口）。
+    /// 链暂时缺席（C8 恢复中）时也要继续推进 ledger —— 旧实现早退会让已完成的 persist 永远
+    /// 等不到释放。
     pub(crate) fn drain_completed(&mut self) -> Result<u64, EngineError> {
-        if self.swapchain.is_none() {
-            return Ok(0);
-        }
         let value = self.sync.completed_value()?;
         while let Some(sequence) = self.submitted.front().copied() {
             if sequence > value {
@@ -649,8 +869,9 @@ impl GpuRenderer {
             // 饱和后「按帧延迟释放」会退化成「立刻释放」。
             self.sync.drain_retire(self.completed_sequence);
             self.retired_persists
-                .retain(|(sequence, _)| *sequence > self.completed_sequence);
+                .drain_ready(self.completed_sequence, drop);
         }
+        self.drain_retired_swapchains()?;
         Ok(value)
     }
 
@@ -665,12 +886,14 @@ impl GpuRenderer {
     /// 图集上传入口（P09 的字形页与 P15 的图片页共用）。
     ///
     /// `pixels` 按**所有权**移动进来（[`AtlasUploads`] 的待上传槽直接持有它），避免槽 → 纹理
-    /// 之间再复制一次整页（2048² 的图片页是 16 MiB）。入队时同时记录**当前共享页**
+    /// 之间再复制一次整页（2048² 的图片页是 16 MiB）。`layer` 是图集 texture array 的层号
+    /// （字形恒 0、图片 = 图集页索引），`extent` 是该层的页边长；入队时同时记录**当前共享页**
     /// （`SharedGpu::atlas_page`），供录制前区分「App 换代的新页」与「已被别人换代的旧页」。
     pub(crate) fn queue_atlas_upload(
         &mut self,
         kind: AtlasKind,
-        page: u32,
+        layer: u16,
+        extent: u32,
         pixels: Vec<u8>,
         rects: crate::render::atlas::DirtyRects,
     ) {
@@ -680,7 +903,7 @@ impl GpuRenderer {
         );
         let queued_page = self.shared.atlas_page(kind);
         self.atlas_uploads
-            .queue_upload(kind, page, queued_page, pixels, rects);
+            .queue_upload(kind, layer, extent, queued_page, pixels, rects);
     }
 
     /// 该图集是否有一笔上传已入队、还没被命令缓冲消费（离屏目标的空闲判据）。
@@ -961,65 +1184,185 @@ impl GpuRenderer {
         // 同步完成：本帧（以及更早的提交）都已经完成，按提交序号推进 retire。
         self.completed_sequence = sequence;
         self.sync.drain_retire(sequence);
-        self.retired_persists
-            .retain(|(retired_at, _)| *retired_at > sequence);
+        self.retired_persists.drain_ready(sequence, drop);
         Ok(())
     }
 
     /// 用 `oldSwapchain` 建新 swapchain（§7.4）：**不等设备空闲**，旧结构进延迟销毁队列。
+    ///
+    /// C8：建链失败按 [`CreateFailure`] 分类 —— 可恢复故障不在此升级为致命错误（链保持
+    /// absent，下一次 `submit_frame` 顶部的 [`Self::ensure_swapchain`] 按策略补建）；Fatal 上报。
+    /// SUBOPTIMAL 的「冷却期 + 放弃重建」策略不变（[`Self::request_rebuild`]）。
     fn recreate_swapchain(&mut self) -> Result<(), EngineError> {
         let size = self.surface;
-        self.replace_swapchain(size)
+        match self.try_replace_swapchain(size) {
+            Ok(()) => Ok(()),
+            Err(CreateFailure::Fatal(error)) => Err(error),
+            // OUT_OF_DATE / SURFACE_LOST：链已 retired，统一入口会在下一次提交前恢复。
+            Err(CreateFailure::OutOfDate | CreateFailure::SurfaceLost) => Ok(()),
+        }
     }
 
-    /// 目标尺寸变化时的 swapchain 替换（同尺寸的 `OUT_OF_DATE` / `SUBOPTIMAL` 走
-    /// [`Self::request_rebuild`]）。
-    fn replace_swapchain(&mut self, size: (u32, u32)) -> Result<(), EngineError> {
-        let surface = self.vk_surface.as_ref().map(Surface::raw);
+    /// 尝试用 `oldSwapchain` 建新链；失败按 [`CreateFailure`] 分类返回，**不在这里**重建 surface。
+    ///
+    /// 链始终先 `take()` 再建：失败时旧链已按规范 retired（`oldSwapchain` 语义），放进延迟
+    /// 销毁队列，由 [`Self::drain_retired_swapchains`] / [`Self::destroy_retired_swapchains_now`]
+    /// 在队列空闲后销毁。surface 恢复只在 [`Self::ensure_swapchain`] / [`Self::recover_surface`]
+    /// 走 C7 的唯一入口 —— 修正「任何建链失败都重建 surface」的过度归因（audit-c2 §1/§2）。
+    fn try_replace_swapchain(&mut self, size: (u32, u32)) -> Result<(), CreateFailure> {
         let old = self.swapchain.take();
-        let created = match (surface, old.as_ref()) {
-            (Some(surface), Some(old)) => {
-                Swapchain::replace(&self.shared, surface, size, old.raw())
+        let Some(surface) = self.vk_surface.as_ref() else {
+            if let Some(old) = old {
+                self.retire_swapchain(old);
             }
-            (Some(surface), None) => Swapchain::new(&self.shared, surface, size),
-            (None, _) => {
-                return Err(EngineError::Swapchain {
-                    detail: smol_str::SmolStr::new_static(
-                        "swapchain replacement requires a window surface",
-                    ),
-                });
-            }
+            return Err(CreateFailure::Fatal(EngineError::Swapchain {
+                detail: smol_str::SmolStr::new_static(
+                    "swapchain replacement requires a window surface",
+                ),
+            }));
+        };
+        let created = match old.as_ref() {
+            Some(old) => Swapchain::replace(&self.shared, surface, size, old.raw()),
+            None => Swapchain::new(&self.shared, surface, size),
         };
         match created {
-            Ok(swapchain) => self.install_swapchain(swapchain, old, size),
-            Err(error) => {
+            Ok(swapchain) => self
+                .install_swapchain(swapchain, old, size)
+                .map_err(CreateFailure::Fatal),
+            Err(failure) => {
                 if let Some(old) = old {
-                    // 规范：传给 `oldSwapchain` 的旧 swapchain 即使创建失败也已 retired，必须销毁
-                    // （销毁前置条件由 `drain_retired_swapchains` 的队列 idle 保证，R11-3）。
-                    self.retired_swapchains.push(old);
+                    // 规范：传给 `oldSwapchain` 的旧 swapchain 即使创建失败也已 retired，必须销毁。
+                    self.retire_swapchain(old);
                 }
-                // `VK_ERROR_SURFACE_LOST_KHR` 的恢复：**重建 `VkSurfaceKHR`** 后重试一次。
-                // 合成器重启 / 显卡复位后旧 surface 永久失效，只重建 swapchain 会一直失败；
-                // 重试用尽才把错误上报（有界，不无限自旋）。
-                let Some(surface) = self.vk_surface.as_mut() else {
-                    return Err(error);
-                };
-                surface.recreate()?;
-                let raw = self.vk_surface.as_ref().map(Surface::raw);
-                let Some(raw) = raw else {
-                    return Err(error);
-                };
-                let swapchain = Swapchain::new(&self.shared, raw, size)?;
-                self.install_swapchain(swapchain, None, size)
+                Err(failure)
             }
         }
     }
 
-    /// 装上新链：旧链进延迟销毁队列，差分拷贝表与描述符记账一起重置。
+    /// 链不在时的统一补建入口（C8；`submit_frame` 顶部调用）。
+    ///
+    /// 返回 `Some(delay)` = 本轮没有可用链，调用方必须保留 pending 帧、退避 `delay` 后重试；
+    /// `None` = 链已就绪、继续本帧。`OUT_OF_DATE` 无限重建（退避 ≤50 ms）；`SURFACE_LOST`
+    /// 先经 C7 的唯一入口重建 surface，再按 1/4/16 ms 有界重试（用尽才 `Err` 上报）。
+    fn ensure_swapchain(&mut self, reason: &'static str) -> Result<Option<Duration>, EngineError> {
+        if self.swapchain.is_some() {
+            return Ok(None);
+        }
+        match self.try_replace_swapchain(self.surface) {
+            Ok(()) => Ok(None),
+            Err(CreateFailure::Fatal(error)) => Err(error),
+            Err(CreateFailure::OutOfDate) => Ok(Some(self.wait_for_out_of_date(reason))),
+            Err(CreateFailure::SurfaceLost) => {
+                // C7：先把该 surface 的全部旧链强制销毁，再销毁旧 surface、建新的。
+                self.recreate_vk_surface()?;
+                // 新 surface 上立刻再试一次：多数合成器重启在这里恢复，不消耗重试预算。
+                match self.try_replace_swapchain(self.surface) {
+                    Ok(()) => Ok(None),
+                    Err(CreateFailure::Fatal(error)) => Err(error),
+                    Err(CreateFailure::OutOfDate) => Ok(Some(self.wait_for_out_of_date(reason))),
+                    Err(CreateFailure::SurfaceLost) => {
+                        Ok(Some(self.wait_for_surface_lost_retry(reason)?))
+                    }
+                }
+            }
+        }
+    }
+
+    /// 一次 `OUT_OF_DATE` 的可恢复处理（acquire / present 两个入口）。
+    ///
+    /// 立即尝试重建一次（OOD 不能被 SUBOPTIMAL 冷却期拦住：链已经不能 present），失败留给下一次
+    /// `submit_frame` 顶部的统一入口。**永远返回 `Submitted::Retry`**：OOD 是 WSI 的正常控制流，
+    /// 不能变成粘性错误 —— 旧实现里「连续 OOD 超过上限（4 次）就返回 EngineError」正是 C8 的
+    /// 问题本体。
+    fn retry_out_of_date(&mut self, reason: &'static str) -> Result<Submitted, EngineError> {
+        self.rebuild_swapchain = false;
+        let after = self.wait_for_out_of_date(reason);
+        if self.swapchain.is_some() {
+            match self.try_replace_swapchain(self.surface) {
+                Ok(()) | Err(CreateFailure::OutOfDate | CreateFailure::SurfaceLost) => {}
+                Err(CreateFailure::Fatal(error)) => return Err(error),
+            }
+        }
+        Ok(Submitted::Retry { after: Some(after) })
+    }
+
+    /// 一次 OOD 的退避决策 + 低频诊断（第 1 / 16 次，之后每 64 次）。
+    fn wait_for_out_of_date(&mut self, reason: &'static str) -> Duration {
+        let retry = self.out_of_date_recovery.on_out_of_date();
+        if retry.report {
+            eprintln!(
+                "kytrix: vulkan swapchain stayed OUT_OF_DATE ({} consecutive rebuilds, {reason}); \
+                 retrying in {} ms (extent={:?})",
+                self.out_of_date_recovery.out_of_date,
+                retry.after.as_millis(),
+                self.swapchain.as_ref().map(Swapchain::extent),
+            );
+        }
+        retry.after
+    }
+
+    /// 一次 surface 恢复失败的退避决策 + 诊断（3 次后上报；文案区分「连接还活着」与设备丢失）。
+    fn wait_for_surface_lost_retry(
+        &mut self,
+        reason: &'static str,
+    ) -> Result<Duration, EngineError> {
+        let attempts = self.out_of_date_recovery.surface_lost_failures + 1;
+        let after = self.out_of_date_recovery.on_surface_lost_failure(reason)?;
+        eprintln!(
+            "kytrix: vulkan compositor/connection is alive but the swapchain surface is still lost \
+             (recovery {attempts}/{SURFACE_LOST_BACKOFF_LEN}); retrying in {} ms",
+            after.as_millis()
+        );
+        Ok(after)
+    }
+
+    /// 成功 acquire / present 后的复位 + 恢复诊断（C8）。
+    fn note_progress(&mut self) {
+        if let Some(recovered) = self.out_of_date_recovery.on_progress() {
+            eprintln!(
+                "kytrix: vulkan swapchain recovered after {recovered} consecutive OUT_OF_DATE rebuilds"
+            );
+        }
+    }
+
+    /// `VK_ERROR_SURFACE_LOST_KHR` 的恢复（R11-11 + C8 有界预算）。
+    ///
+    /// 顺序（C7）：旧链先取出放进延迟队列 → [`Self::recreate_vk_surface`] 强制销毁它们并重建
+    /// surface → 用新 surface 建链。建链仍报 `SURFACE_LOST` 时按 1/4/16 ms 退避重试 3 次，
+    /// 用尽才上报；`OUT_OF_DATE` 走正常 OOD 退避（无限重试）。
+    fn recover_surface(&mut self, reason: &'static str) -> Result<Submitted, EngineError> {
+        if self.vk_surface.is_none() {
+            return Err(EngineError::Swapchain {
+                detail: smol_str::format_smolstr!("{reason}: no window surface"),
+            });
+        }
+        eprintln!("kytrix: vulkan {reason}: recreating VkSurfaceKHR");
+        // 旧 swapchain 必须用掉（它引用旧 surface），随后进延迟销毁队列 —— 由唯一入口在销毁
+        // surface **之前**强制排空。
+        if let Some(old) = self.swapchain.take() {
+            self.retire_swapchain(old);
+        }
+        self.recreate_vk_surface()?;
+        match self.try_replace_swapchain(self.surface) {
+            Ok(()) => Ok(Submitted::Retry { after: None }),
+            Err(CreateFailure::Fatal(error)) => Err(error),
+            Err(CreateFailure::OutOfDate) => Ok(Submitted::Retry {
+                after: Some(self.wait_for_out_of_date(reason)),
+            }),
+            Err(CreateFailure::SurfaceLost) => Ok(Submitted::Retry {
+                after: Some(self.wait_for_surface_lost_retry(reason)?),
+            }),
+        }
+    }
+
+    /// 装上新链：旧链进延迟销毁台账，差分拷贝表与描述符记账一起重置。
     ///
     /// 渲染目标的尺寸只有一个来源：**swapchain 的 `imageExtent`**（`currentExtent` / clamp /
     /// transform 之后）。同尺寸重建时它也可能变（合成器改了 `currentExtent`），所以这里比较一次，
     /// 不同就重建 persist —— 否则 `renderArea` 会超出 framebuffer（R11-9）。
+    ///
+    /// C9：旧链按 `last_sequence` 入账；新链的「首 present 门」置 `false`（旧链要等新链至少
+    /// present 一次之后才能被非阻塞销毁）。
     fn install_swapchain(
         &mut self,
         swapchain: Swapchain,
@@ -1027,7 +1370,7 @@ impl GpuRenderer {
         size: (u32, u32),
     ) -> Result<(), EngineError> {
         if let Some(old) = old {
-            self.retired_swapchains.push(old);
+            self.retire_swapchain(old);
         }
         // 新链的 image 索引与旧链无关（R11-12 / R11-9）：差分拷贝表必须整体重置。
         self.image_copy_plan.reset(swapchain.image_count());
@@ -1037,16 +1380,25 @@ impl GpuRenderer {
         self.swapchain = Some(swapchain);
         self.fresh = true;
         self.surface = size;
+        self.current_presented_once = false;
         // 上一次 present 的 hint 属于旧链的 image：新链的 image 内容未定义，第一帧必然整面拷贝
         // （`fresh` ⇒ `Plan::Full`），hint 一并作废。
         self.present_hint = None;
         if self.persist.size != (extent.width, extent.height) {
             let persist = Persist::new(&self.shared, (extent.width, extent.height))?;
             let previous = std::mem::replace(&mut self.persist, persist);
-            // 旧 persist 仍可能被在飞命令引用 ⇒ 按提交序号延迟释放（I4）。
-            self.retired_persists.push((self.last_sequence, previous));
+            // 旧 persist 仍可能被在飞命令引用 ⇒ 按提交序号延迟释放（I4 / C9 台账）。
+            self.retired_persists.retire(self.last_sequence, previous);
         }
         Ok(())
+    }
+
+    /// 旧 swapchain 入账（C9 的 retire 点**唯一**实现）。
+    ///
+    /// tag = `last_sequence`（最后一次提交的 timeline 值，**不是** `FrameIndex`：UI 帧序号会
+    /// 跳号 / 饱和，R11-1）；真正销毁在 timeline 确认完成 + 新链首 present 之后，非阻塞。
+    fn retire_swapchain(&mut self, old: Swapchain) {
+        self.retired_swapchains.retire(self.last_sequence, old);
     }
 
     /// 需要重建 swapchain 时的**门槛**入口（R11-7，`SUBOPTIMAL` 专用）。
@@ -1056,8 +1408,8 @@ impl GpuRenderer {
     /// SUBOPTIMAL 时退化成每帧重建（帧率崩塌 + 句柄/显存抖动，现象像「卡顿」而不是错误）。两道
     /// 门槛：
     /// 1. 冷却期：刚重建过 [`REBUILD_COOLDOWN_FRAMES`] 个提交内不再重建；
-    /// 2. 预算：最近一轮里超过 [`MAX_REBUILDS`] 次就**放弃重建**，记一次诊断后继续用现有链呈现
-    ///    （并由 `swapchain.rs` 的 `log_plan` 打出实际参数）。
+    /// 2. 预算：最近一轮里超过 [`MAX_SUBOPTIMAL_REBUILDS`] 次就**放弃重建**，记一次诊断后继续
+    ///    用现有链呈现（并由 `swapchain.rs` 的 `log_plan` 打出实际参数）。
     fn request_rebuild(&mut self, reason: &'static str) -> Result<(), EngineError> {
         if self.rebuild_abandoned {
             return Ok(());
@@ -1073,11 +1425,12 @@ impl GpuRenderer {
             self.suboptimal_rebuilds = 0;
         }
         self.suboptimal_rebuilds += 1;
-        if self.suboptimal_rebuilds > MAX_REBUILDS {
+        if self.suboptimal_rebuilds > MAX_SUBOPTIMAL_REBUILDS {
             self.rebuild_abandoned = true;
             eprintln!(
-                "kytrix: vulkan swapchain keeps reporting {reason} after {MAX_REBUILDS} rebuilds; \
-                 keeping the current swapchain (extent={:?} format={:?} color_space={:?})",
+                "kytrix: vulkan swapchain keeps reporting {reason} after \
+                 {MAX_SUBOPTIMAL_REBUILDS} rebuilds; keeping the current swapchain \
+                 (extent={:?} format={:?} color_space={:?})",
                 self.swapchain.as_ref().map(Swapchain::extent),
                 self.swapchain
                     .as_ref()
@@ -1092,65 +1445,77 @@ impl GpuRenderer {
         self.recreate_swapchain()
     }
 
-    /// `OUT_OF_DATE` 的重建入口：**不能**被冷却期拦住（链已经不能 present，等冷却只会继续丢帧），
-    /// 但仍然有上界（[`MAX_REBUILDS`] 次连续失败之后报强类型错误，而不是无限自旋）。
-    fn rebuild_out_of_date(&mut self, reason: &'static str) -> Result<(), EngineError> {
-        self.out_of_date += 1;
-        if self.out_of_date > MAX_REBUILDS {
-            return Err(EngineError::Swapchain {
-                detail: smol_str::format_smolstr!(
-                    "swapchain stayed out of date after {MAX_REBUILDS} rebuilds ({reason})"
-                ),
-            });
-        }
-        self.last_rebuild_sequence = self.last_sequence;
-        self.recreate_swapchain()
-    }
-
-    /// `VK_ERROR_SURFACE_LOST_KHR` 的恢复（R11-11）：重建 `VkSurfaceKHR` 与整条 swapchain。
-    fn recover_surface(&mut self, reason: &'static str) -> Result<(), EngineError> {
+    /// 销毁运行期 `Surface` 的**唯一**入口（C7）。
+    ///
+    /// 顺序 = 强制销毁该 surface 的全部延迟 swapchain（timeline 等待 + 有界队列 idle）→
+    /// 销毁旧 `VkSurfaceKHR`、用同一对 wl 句柄建新的。失败时**不销毁 surface、不清延迟队列**，
+    /// 直接返回错误：调用方只能放弃本窗口，交给 `GpuRenderer::drop` 的 `DeferredHandles` /
+    /// leak 兜底（否则在未知的队列状态下销毁句柄是二次违规）。
+    ///
+    /// `recover_surface` / `ensure_swapchain` 的失败分支都只能走这里；禁止直接调
+    /// `Surface::recreate`（源码级防回归测试钉住）。
+    fn recreate_vk_surface(&mut self) -> Result<(), EngineError> {
+        debug_assert!(
+            self.swapchain.is_none(),
+            "surface recreation requires the current swapchain to be taken out first"
+        );
+        self.destroy_retired_swapchains_now()?;
         let Some(surface) = self.vk_surface.as_mut() else {
             return Err(EngineError::Swapchain {
-                detail: smol_str::format_smolstr!("{reason}: no window surface"),
+                detail: smol_str::SmolStr::new_static(
+                    "surface recreation requires a window surface",
+                ),
             });
         };
-        eprintln!("kytrix: vulkan {reason}: recreating VkSurfaceKHR");
-        // 旧 swapchain 必须先用掉（它引用旧 surface），随后进延迟销毁队列。
-        let old = self.swapchain.take();
-        if let Some(old) = old {
-            self.retired_swapchains.push(old);
+        surface.recreate()
+    }
+
+    /// 强制销毁全部延迟 swapchain（C7 的唯一安全出口，也是 C9 安全阀的落点）。
+    ///
+    /// `vkDestroySwapchainKHR` 要求 presentation engine 已释放该链（VUID-…-01282）、
+    /// `vkDestroySemaphore` 要求引用它的批次已完成 —— 二者的共同前置条件是「本窗口 timeline
+    /// 已到 + 共享队列 idle」。两个等待都有界（2 s）；**失败时一条链都不销毁**（返回错误，
+    /// 由 teardown 的 leak 兜底）。
+    fn destroy_retired_swapchains_now(&mut self) -> Result<(), EngineError> {
+        if self.retired_swapchains.is_empty() {
+            return Ok(());
         }
-        surface.recreate()?;
-        let size = self.surface;
-        let raw =
-            self.vk_surface
-                .as_ref()
-                .map(Surface::raw)
-                .ok_or_else(|| EngineError::Swapchain {
-                    detail: smol_str::SmolStr::new_static("surface recreate lost the surface"),
-                })?;
-        let swapchain = Swapchain::new(&self.shared, raw, size)?;
-        // `install_swapchain` 会在 extent 变化时重建 persist（单一尺寸来源）；旧 surface 的
-        // 所有参数都可能变，因此这里不再重复建 persist。
-        self.install_swapchain(swapchain, None, size)?;
-        self.drain_retired_swapchains()?;
+        self.sync
+            .wait_idle()
+            .map_err(|error| self.classify(error))?;
+        self.shared
+            .wait_queue_idle()
+            .map_err(|error| self.classify(error))?;
+        // 先整队取出再 drop：销毁发生在台账清空之后，持有者的 Drop 不会看到半空台账。
+        let retired = self.retired_swapchains.take_all();
+        debug_assert!(self.retired_swapchains.is_empty());
+        drop(retired);
         Ok(())
     }
 
-    /// 旧 swapchain 的延迟销毁（§7.4 / R11-3）：销毁前必须有一次**有界队列 idle**。
+    /// 非阻塞释放「已经安全」的旧 swapchain（C9；GPU 循环的完成观测点每轮调用）。
     ///
-    /// `vkDestroySwapchainKHR` 要求「所有从该 swapchain 获取的 image 的使用已完成」，
-    /// `vkDestroySemaphore` 要求「引用该信号量的批次已完成」—— present 的 `waitSemaphores`
-    /// 也算引用。队列 idle 是这两条的共同前置条件（旧实现等的是「新链某帧的 timeline」，与旧链
-    /// 的 present 之间没有任何依赖关系，因此不构成保证）。
+    /// 安全 = ① 旧链最后一次使用它的提交已完成（timeline 提交序号 `<= completed_sequence`），
+    /// ② 当前链已经成功 present 过至少一次（[`Self::current_presented_once`]，对齐 VVL
+    /// `ResetPresentWaitSemaphores` 的启发式：旧链的 present-wait semaphore 不再被占用）。
+    /// unextended Vulkan 没有 present fence：Chromium 用 FenceHelper 延迟清理旧链、Qt 在
+    /// `releaseSwapChainResources` 里 `vkQueueWaitIdle` 后销毁；本实现是可达的最佳实践 ——
+    /// 旧链多活一帧，但 present 热路径**零等待**。
+    ///
+    /// 唯一允许阻塞的出口：台账超过 [`MAX_RETIRED_SWAPCHAINS`] 的安全阀（慢 GPU + 高频 resize
+    /// 时链不能无限堆积），退回 C7 的强制销毁（一次有界队列 idle）。
     fn drain_retired_swapchains(&mut self) -> Result<(), EngineError> {
         if self.retired_swapchains.is_empty() {
             return Ok(());
         }
-        self.shared
-            .wait_queue_idle()
-            .map_err(|error| self.classify(error))?;
-        self.retired_swapchains.clear();
+        if self.retired_swapchains.len() > MAX_RETIRED_SWAPCHAINS {
+            return self.destroy_retired_swapchains_now();
+        }
+        if !self.current_presented_once {
+            return Ok(());
+        }
+        let completed = self.completed_sequence;
+        self.retired_swapchains.drain_ready(completed, drop);
         Ok(())
     }
 
@@ -1551,10 +1916,12 @@ impl GpuRenderer {
             surface.leak();
         }
         self.persist.leak();
-        for (_, persist) in &mut self.retired_persists {
+        // C9：台账里的**全部**条目同样标记成「交给进程级回收」（否则它们的 Drop 会在
+        // 无法证明空闲时逐个 vkDestroy*）。
+        for persist in self.retired_persists.iter_mut() {
             persist.leak();
         }
-        for swapchain in &mut self.retired_swapchains {
+        for swapchain in self.retired_swapchains.iter_mut() {
             swapchain.leak();
         }
         self.sync.leak();
@@ -1598,9 +1965,10 @@ impl Drop for GpuRenderer {
             );
             self.leak_gpu_handles();
             // `Drop` 无法取消字段的 drop，所以「泄漏」只能靠每个持有者的 `handles.leaked()`
-            // 守卫（`Swapchain` / `Surface` / `Persist` / `FrameSync`）。这里只剩 CPU 内存要放掉。
-            self.retired_persists.clear();
-            self.retired_swapchains.clear();
+            // 守卫（`Swapchain` / `Surface` / `Persist` / `FrameSync`）。这里只剩 CPU 内存要放掉
+            // （条目已全部标记泄漏，drop 时不会产生任何 Vulkan 销毁）。
+            self.retired_persists.take_all();
+            self.retired_swapchains.take_all();
             return;
         }
         // SAFETY: ① 本窗口命令已完成；② 队列已 idle ⇒ 没有在飞批次引用命令池。
@@ -1609,9 +1977,10 @@ impl Drop for GpuRenderer {
                 .raw()
                 .destroy_command_pool(self.command_pool, None);
         }
-        // 旧 swapchain / 旧 persist：队列 idle 之后 presentation engine 与在飞批次都不再引用它们。
-        self.retired_persists.clear();
-        self.retired_swapchains.clear();
+        // 旧 swapchain / 旧 persist：队列 idle 之后 presentation engine 与在飞批次都不再引用它们
+        // （C9：它们是台账里剩下的条目，此刻才允许真正 drop）。
+        self.retired_persists.take_all();
+        self.retired_swapchains.take_all();
         // 每窗口注册进共享设备句柄表的资源必须主动注销（设备不会随窗口销毁）。
         self.geometry.release(&self.shared);
         self.upload.release(&self.shared);
@@ -2219,11 +2588,15 @@ fn destination_update(last: Option<(i32, i32)>, surface_local: Size) -> Option<(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use ash::vk;
 
-    use super::{GpuRenderer, ImageSyncStep, destination_update, plan_swapchain_copy};
+    use super::{
+        GpuRenderer, ImageSyncStep, MAX_RETIRED_SWAPCHAINS, MAX_RETRY_BACKOFF, OutOfDateRecovery,
+        Retired, destination_update, out_of_date_backoff, out_of_date_diagnostic,
+        plan_swapchain_copy,
+    };
     use crate::{
         math::{PhysicalRect, Size},
         paint::atlas::AtlasKind,
@@ -2335,23 +2708,23 @@ mod tests {
     }
 
     /// AR3 §5.1 / P2-5 的静态防回归：teardown 的「无法证明 GPU 空闲」分支必须**先**把句柄标记成
-    /// 「交给进程级兜底」，再清空延迟销毁队列 —— 反过来（旧实现）`clear()` 就是逐个 `vkDestroy*`，
+    /// 「交给进程级兜底」，再释放延迟销毁台账 —— 反过来（旧实现）`clear()` 就是逐个 `vkDestroy*`，
     /// 销毁的正是可能仍被在飞命令 / presentation engine 引用的对象。
     ///
     /// 该分支只能在真机「设备健康但挂起」时进入，普通 GPU 测试覆盖不到，因此用源码级断言钉住
     /// 顺序（与 D3D12 `swapchain.rs` 的 `include_str!` 防回归测试同一手法）。
     #[test]
-    fn an_unsafe_teardown_marks_the_handles_leaked_before_clearing_the_queues() {
+    fn an_unsafe_teardown_marks_the_handles_leaked_before_releasing_the_ledgers() {
         let source = include_str!("compositor.rs");
         let leak = source
             .find("self.leak_gpu_handles();")
             .expect("不安全 teardown 必须调用 leak_gpu_handles()");
-        let clear = source
-            .find("self.retired_persists.clear();")
-            .expect("延迟销毁队列仍必须被释放（只放 CPU 内存）");
+        let release = source
+            .find("self.retired_persists.take_all();")
+            .expect("延迟销毁台账仍必须被释放（只放 CPU 内存）");
         assert!(
-            leak < clear,
-            "必须先标记泄漏再清队列：否则 clear() 会在泄漏标记之前销毁在飞句柄"
+            leak < release,
+            "必须先标记泄漏再释放台账：否则 take_all 的 drop 会在泄漏标记之前销毁在飞句柄"
         );
         // 每个持有者的 `Drop` 都必须看这个标记（否则「泄漏」只是注释里的话）。
         for (file, source) in [
@@ -2364,6 +2737,386 @@ mod tests {
                 "{file}: 持有 Vulkan 句柄的 Drop 必须有 leaked() 守卫"
             );
         }
+    }
+
+    /// C9 台账边界：`completed == tag` 才释放；`tag - 1` 时条目必须仍在台账里（在飞提交仍可能
+    /// 引用该资源 —— 提前释放就是 UAF）。重复 drain 不得重复释放。
+    #[test]
+    fn retired_entries_are_released_only_after_their_own_submission_completed() {
+        let mut retired: Retired<u32> = Retired::new();
+        assert!(retired.is_empty());
+        assert_eq!(retired.len(), 0);
+        retired.retire(7, 70);
+        let mut released = Vec::new();
+        retired.drain_ready(6, |value| released.push(value));
+        assert_eq!(
+            released,
+            Vec::<u32>::new(),
+            "tag-1：提交 7 仍在飞，不得释放"
+        );
+        assert_eq!(retired.len(), 1, "未完成的条目必须留在台账里（否则 UAF）");
+        retired.drain_ready(7, |value| released.push(value));
+        assert_eq!(released, vec![70], "completed == tag 才释放");
+        assert!(retired.is_empty());
+        // 重复 drain：没有条目可释放，回调不得再被调用（不得双重 drop）。
+        retired.drain_ready(7, |value| released.push(value));
+        assert_eq!(released, vec![70]);
+    }
+
+    /// C9 台账 FIFO：多个条目按入账顺序释放；只释放已完成的，未完成的保持原顺序。
+    #[test]
+    fn multiple_retired_entries_are_released_in_fifo_order() {
+        let mut retired: Retired<u32> = Retired::new();
+        for (tag, value) in [(3, 30), (5, 50), (9, 90)] {
+            retired.retire(tag, value);
+        }
+        let mut released = Vec::new();
+        retired.drain_ready(5, |value| released.push(value));
+        assert_eq!(released, vec![30, 50], "已完成的条目按入账顺序释放");
+        assert_eq!(retired.len(), 1);
+        released.clear();
+        retired.drain_ready(8, |value| released.push(value));
+        assert!(released.is_empty(), "completed=8 不覆盖 tag=9");
+        retired.drain_ready(9, |value| released.push(value));
+        assert_eq!(released, vec![90]);
+        assert!(retired.is_empty());
+    }
+
+    /// C9：`take_all` 取出全部条目（保持顺序）并清空台账；空台账是 no-op。
+    #[test]
+    fn take_all_returns_every_entry_in_order_and_empties_the_ledger() {
+        let mut retired: Retired<u32> = Retired::new();
+        assert!(retired.take_all().is_empty(), "空台账是 no-op");
+        retired.retire(1, 10);
+        retired.retire(4, 40);
+        retired.retire(2, 20);
+        let entries = retired.take_all();
+        assert_eq!(entries, vec![(1, 10), (4, 40), (2, 20)]);
+        assert!(retired.is_empty());
+        assert_eq!(retired.len(), 0);
+        assert!(retired.take_all().is_empty(), "再次调用仍是 no-op");
+    }
+
+    /// C9：`iter_mut` 覆盖**全部**台账条目（teardown 的 leak 兜底必须标记每一个对象）。
+    #[test]
+    fn the_leak_path_visits_every_retired_entry() {
+        let mut retired: Retired<u32> = Retired::new();
+        retired.retire(1, 10);
+        retired.retire(2, 20);
+        for value in retired.iter_mut() {
+            *value += 1;
+        }
+        assert_eq!(retired.take_all(), vec![(1, 11), (2, 21)]);
+    }
+
+    /// C7 的源码级防回归：`Surface::recreate` 只能有一个调用点（`recreate_vk_surface`），且该
+    /// 入口必须先强制销毁该 surface 的全部 swapchain（VUID-vkDestroySurfaceKHR-surface-01266）。
+    ///
+    /// 旧实现的注释把「从 `Option` 取出 swapchain」当成「已销毁」，于是恢复路径在旧链仍存活时
+    /// 销毁了 surface；这条测试把顺序钉在生产代码文本上（与 teardown 的 `include_str!` 先例
+    /// 同一手法），真实 SURFACE_LOST 路径由 [`super::LiveSwapchains`] 的 debug 断言与手工
+    /// nested-Wayland 探针兜底。
+    #[test]
+    fn the_surface_is_recreated_only_after_its_swapchains_are_force_destroyed() {
+        let source = include_str!("compositor.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("production code precedes the test module")
+            .0;
+        assert_eq!(
+            production.matches("surface.recreate()").count(),
+            1,
+            "运行期 surface 重建必须只有一个入口（GpuRenderer::recreate_vk_surface）"
+        );
+        let entry = production
+            .find("fn recreate_vk_surface(&mut self)")
+            .expect("唯一入口必须存在");
+        let entry = &production[entry..];
+        assert!(
+            entry[..entry
+                .find("self.destroy_retired_swapchains_now()")
+                .expect("先强制排空")]
+                .contains("self.swapchain.is_none()"),
+            "入口必须断言当前 swapchain 已被取出（没有第三份所有权）"
+        );
+        let forced_drain = entry
+            .find("self.destroy_retired_swapchains_now()")
+            .expect("重建 surface 之前必须先强制排空该 surface 的 swapchain");
+        let recreate = entry
+            .find("surface.recreate()")
+            .expect("唯一调用点必须在入口里");
+        assert!(
+            forced_drain < recreate,
+            "顺序违反 VUID-vkDestroySurfaceKHR-surface-01266：必须先销毁 swapchain 再销毁 surface"
+        );
+        // 强制排空本身必须「先证明空闲，再销毁」。
+        let drain_entry = production
+            .find("fn destroy_retired_swapchains_now(&mut self)")
+            .expect("强制排空函数必须存在");
+        let drain = &production[drain_entry..];
+        let drain_end = drain.find("\n    fn ").unwrap_or(drain.len());
+        let drain = &drain[..drain_end];
+        let timeline = drain.find(".wait_idle(").expect("timeline 有界等待");
+        let queue = drain.find(".wait_queue_idle(").expect("队列 idle 有界等待");
+        let take = drain.find("take_all").expect("取出全部条目");
+        assert!(
+            timeline < take && queue < take,
+            "必须先证明队列空闲（有界）再销毁链，否则是 R11-3 的同步违规"
+        );
+        // teardown 的字段声明顺序就是销毁顺序：swapchain 必须先于 surface 销毁（I7-c）。
+        let swapchain_field = production
+            .find("\n    swapchain: Option<Swapchain>,\n")
+            .expect("GpuRenderer 必须按声明顺序先销毁 swapchain");
+        let surface_field = production
+            .find("\n    vk_surface: Option<Surface>,\n")
+            .expect("GpuRenderer 必须按声明顺序后销毁 surface");
+        assert!(
+            swapchain_field < surface_field,
+            "字段顺序即销毁顺序：swapchain 字段必须声明在 vk_surface 之前"
+        );
+    }
+
+    /// 生产代码文本（不含测试模块自身，避免断言字符串自匹配）。
+    fn production_source() -> &'static str {
+        include_str!("compositor.rs")
+            .split_once("#[cfg(test)]")
+            .expect("production code precedes the test module")
+            .0
+    }
+
+    /// 取以 `signature` 开头的函数的源码片段（到下一个 `\n    fn ` 为止）。
+    fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} must exist"));
+        let body = &source[start..];
+        let end = body.find("\n    fn ").unwrap_or(body.len());
+        &body[..end]
+    }
+
+    /// C9-I9-a：present 成功分支**零阻塞等待**，且不再调用任何 drain（旧实现在这里
+    /// `drain_retired_swapchains` → `wait_queue_idle`，把流水线深度强行拉回 1）。
+    ///
+    /// `drain_ready` 内部同样只比较已观测到的 timeline 值：旧链的销毁不等待 presentation
+    /// engine（unextended Vulkan 没有 present fence，唯一允许的阻塞点是 C7 强制入口与 teardown）。
+    #[test]
+    fn the_present_hot_path_and_the_ledger_drain_never_wait_for_the_queue() {
+        let production = production_source();
+        let presented = production
+            .find("Present::Presented | Present::Suboptimal =>")
+            .expect("present 成功分支必须存在");
+        let out_of_date = production
+            .find("Present::OutOfDate =>")
+            .expect("present OOD 分支必须存在");
+        let hot_path = &production[presented..out_of_date];
+        for forbidden in [
+            "wait_idle(",
+            "wait_queue_idle(",
+            "drain_retired_swapchains(",
+            "destroy_retired_swapchains_now(",
+        ] {
+            assert!(
+                !hot_path.contains(forbidden),
+                "present 热路径不得出现 `{forbidden}`（C9：旧链销毁必须非阻塞）"
+            );
+        }
+        let drain_ready = function_body(production, "fn drain_ready(&mut self");
+        assert!(
+            !drain_ready.contains("wait_idle") && !drain_ready.contains("wait_queue_idle"),
+            "drain_ready 只做非阻塞的 timeline 比较：{drain_ready}"
+        );
+        assert!(
+            drain_ready.contains("<= completed"),
+            "释放判据必须是 `tag <= completed`（改 `<` 会泄漏、无条件释放是 UAF）"
+        );
+    }
+
+    /// C9：延迟销毁的 tag 必须是**提交序号**（`last_sequence`），不能用 `FrameIndex`
+    /// （UI 帧序号会跳号 / 饱和，R11-1）；且所有入账点都走唯一的 `retire_swapchain`。
+    #[test]
+    fn retired_swapchains_are_tagged_with_the_submission_sequence_not_a_frame_index() {
+        let production = production_source();
+        let retire = function_body(production, "fn retire_swapchain(&mut self");
+        assert!(
+            retire.contains("self.last_sequence"),
+            "retire tag 必须取提交序号：{retire}"
+        );
+        assert!(
+            !retire.contains("FrameIndex"),
+            "禁止用 FrameIndex 当延迟销毁的 tag（R11-1）"
+        );
+        let install = function_body(production, "fn install_swapchain(");
+        assert!(
+            install.contains("self.retire_swapchain(old)"),
+            "install_swapchain 必须经唯一 retire 点入账"
+        );
+        let replace = function_body(production, "fn try_replace_swapchain(");
+        assert_eq!(
+            replace.matches("self.retire_swapchain(old)").count(),
+            2,
+            "建链失败时旧链已 retired，两处都必须入账（R11-3）"
+        );
+    }
+
+    /// C9-I9-d：台账容量必须有硬上限，且超限时退回 C7 的强制入口（一次有界队列 idle）——
+    /// 「慢 GPU + 高频 resize」不允许链 / 显存无限堆积。
+    #[test]
+    fn the_retired_swapchain_ledger_has_a_hard_capacity_cap() {
+        let production = production_source();
+        assert_eq!(
+            MAX_RETIRED_SWAPCHAINS,
+            crate::render::frame::MAX_FRAMES_IN_FLIGHT + 1,
+            "安全阀阈值 = MAX_FRAMES_IN_FLIGHT + 1"
+        );
+        let drain = function_body(production, "fn drain_retired_swapchains(");
+        let gate = drain
+            .find("if !self.current_presented_once")
+            .expect("新链首 present 门必须存在");
+        let valve = drain
+            .find("MAX_RETIRED_SWAPCHAINS")
+            .expect("容量安全阀必须存在");
+        let forced = drain
+            .find("destroy_retired_swapchains_now(")
+            .expect("超限必须走 C7 的强制入口");
+        assert!(valve < forced, "安全阀必须调用强制入口：{drain}");
+        assert!(
+            valve < gate,
+            "先检查容量安全阀，再看新链首 present 门：{drain}"
+        );
+        // teardown 的 leak 兜底必须覆盖台账全部条目。
+        let leak = function_body(production, "fn leak_gpu_handles(");
+        for ledger in [
+            "self.retired_persists.iter_mut()",
+            "self.retired_swapchains.iter_mut()",
+        ] {
+            assert!(
+                leak.contains(ledger),
+                "leak 兜底必须遍历 `{ledger}`（否则无法证明空闲时会逐个 vkDestroy*）"
+            );
+        }
+    }
+
+    /// C8 的核心不变量：任意次数（1000）连续 `OUT_OF_DATE` 都只产生「退避后重试」，不存在
+    /// 升级成 `EngineError` 的出口 —— `on_out_of_date` 的返回类型就是 `Retry`（没有 Err 分支），
+    /// 结构性证明「OOD 永不结束事件循环」。
+    #[test]
+    fn a_thousand_consecutive_out_of_date_events_never_escalate_to_a_fatal_error() {
+        let mut recovery = OutOfDateRecovery::new();
+        for _ in 0..1000 {
+            let retry = recovery.on_out_of_date();
+            assert!(
+                retry.after > Duration::ZERO && retry.after <= MAX_RETRY_BACKOFF,
+                "每次 OOD 都必须退避且不超过上限：{retry:?}"
+            );
+        }
+        assert_eq!(recovery.out_of_date, 1000, "计数只用于诊断，不是错误阈值");
+        // 第 1001 次仍然是普通重试。
+        let retry = recovery.on_out_of_date();
+        assert!(retry.after <= MAX_RETRY_BACKOFF);
+    }
+
+    /// C8：退避序列 1/2/4/8/16/32/50 ms，之后封顶（用户裁决「上限 ≤50 ms」）。
+    #[test]
+    fn the_out_of_date_backoff_doubles_up_to_the_fifty_millisecond_cap() {
+        let expected = [1u64, 2, 4, 8, 16, 32, 50, 50, 50];
+        for (offset, millis) in expected.into_iter().enumerate() {
+            let consecutive = offset as u32 + 1;
+            assert_eq!(
+                out_of_date_backoff(consecutive),
+                Duration::from_millis(millis),
+                "第 {consecutive} 次连续 OOD"
+            );
+        }
+        assert_eq!(MAX_RETRY_BACKOFF, Duration::from_millis(50));
+        // 任意次数的退避都落在 (0, 上限] 内：GPU 循环的 sleep 因此有界。
+        for consecutive in 1..=u32::from(u16::MAX) {
+            let after = out_of_date_backoff(consecutive);
+            assert!(after > Duration::ZERO && after <= MAX_RETRY_BACKOFF);
+        }
+    }
+
+    /// C8：成功 acquire / present（progress）之后 OOD 计数与 surface-lost 预算一起复位；
+    /// >1 次连续 OOD 才打一行「已恢复」诊断。
+    #[test]
+    fn progress_resets_both_the_out_of_date_and_surface_lost_budgets() {
+        let mut recovery = OutOfDateRecovery::new();
+        assert_eq!(recovery.on_progress(), None, "没有 OOD 时没有恢复诊断");
+        for _ in 0..5 {
+            recovery.on_out_of_date();
+        }
+        assert_eq!(
+            recovery.on_progress(),
+            Some(5),
+            "连续 5 次 OOD 后恢复：打一行低频诊断"
+        );
+        assert_eq!(recovery.out_of_date, 0);
+        // 复位之后退避从 1 ms 重新开始（不是接着上一次的封顶值）。
+        assert_eq!(recovery.on_out_of_date().after, Duration::from_millis(1));
+        // surface-lost 的预算也一起复位：复位后重新可用 3 次。
+        for expected in [1u64, 4, 16] {
+            assert_eq!(
+                recovery
+                    .on_surface_lost_failure("test")
+                    .expect("预算内的恢复失败必须返回退避"),
+                Duration::from_millis(expected)
+            );
+        }
+        recovery.on_progress();
+        assert_eq!(
+            recovery
+                .on_surface_lost_failure("test")
+                .expect("progress 之后预算重新开始"),
+            Duration::from_millis(1),
+        );
+    }
+
+    /// C8：`SURFACE_LOST` 有界重试 —— 只有预算（3 次退避重试）耗尽之后才上报，且错误文案
+    /// 必须区分「合成器/连接还活着但 surface 不可用」与设备丢失。
+    #[test]
+    fn the_surface_lost_budget_reports_only_after_three_failed_retries() {
+        let mut recovery = OutOfDateRecovery::new();
+        for expected in [1u64, 4, 16] {
+            assert_eq!(
+                recovery
+                    .on_surface_lost_failure("acquire reported SURFACE_LOST")
+                    .expect("预算内的恢复失败必须返回退避"),
+                Duration::from_millis(expected)
+            );
+        }
+        let error = recovery
+            .on_surface_lost_failure("acquire reported SURFACE_LOST")
+            .expect_err("3 次重试之后必须上报");
+        match error {
+            crate::error::EngineError::Swapchain { detail } => {
+                assert!(
+                    detail.contains("still alive"),
+                    "文案必须区分「连接还活着但 surface 不可用」：{detail}"
+                );
+                assert!(detail.contains("3 retries"), "{detail}");
+                assert!(detail.contains("SURFACE_LOST"), "{detail}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// C8：诊断低频 —— 1000 次连续 OOD 只打 ~17 行（第 1 / 16 次，之后每 64 次）。
+    #[test]
+    fn out_of_date_diagnostics_are_low_frequency() {
+        let reported: Vec<u32> = (1..=200)
+            .filter(|count| out_of_date_diagnostic(*count))
+            .collect();
+        assert_eq!(
+            reported,
+            vec![1, 16, 64, 128, 192],
+            "第 1 次、第 16 次，之后每 64 次"
+        );
+        let lines = (1..=1000)
+            .filter(|count| out_of_date_diagnostic(*count))
+            .count();
+        assert!(
+            (16..=17).contains(&lines),
+            "1000 次连续 OOD 的诊断行数应当 ≈17，实际 {lines}"
+        );
     }
 
     #[test]
@@ -2423,7 +3176,13 @@ mod tests {
             )
             .expect("renderer");
             let rects = DirtyRects::full();
-            renderer.queue_atlas_upload(AtlasKind::Glyph, 64, vec![0u8; (64 * 64) as usize], rects);
+            renderer.queue_atlas_upload(
+                AtlasKind::Glyph,
+                0,
+                64,
+                vec![0u8; (64 * 64) as usize],
+                rects,
+            );
             let mut frame = FramePlan::new(Plan::Full, true);
             let mut timings = FrameTimings::new();
             renderer
@@ -2516,7 +3275,7 @@ mod tests {
                 // 两个线程同时往**同一张共享图集纹理**整页上传相同内容：页重建是进程级串行
                 // 事件（写锁 + 有界队列 idle），上传屏障序列在同一队列上不会交错。
                 let rects = crate::render::DirtyRects::full();
-                renderer.queue_atlas_upload(AtlasKind::Glyph, 64, vec![0x40u8; 64 * 64], rects);
+                renderer.queue_atlas_upload(AtlasKind::Glyph, 0, 64, vec![0x40u8; 64 * 64], rects);
                 let scene = red_quad_scene();
                 let mut encoder = InstanceEncoder::new();
                 let buffer = encoder

@@ -78,8 +78,15 @@ fn a_positioned_window_lands_its_client_origin_on_the_logical_point() {
         ..WindowOptions::default()
     };
     let id = app.create_window(options.clone());
-    let native = NativeWindow::create(id, &options, None, Dispatcher::new(), None)
-        .expect("NativeWindow::create");
+    let native = NativeWindow::create(
+        id,
+        &options,
+        None,
+        Dispatcher::new(),
+        None,
+        crate::platform::windows::window::test_a11y_epoch(),
+    )
+    .expect("NativeWindow::create");
     let origin = client_origin_screen(raw_hwnd(&native));
     let expected = dpi::physical_origin(position, native.scale());
     assert!(
@@ -105,8 +112,15 @@ fn an_off_screen_position_is_clamped_into_a_work_area() {
         ..WindowOptions::default()
     };
     let id = app.create_window(options.clone());
-    let native = NativeWindow::create(id, &options, None, Dispatcher::new(), None)
-        .expect("NativeWindow::create");
+    let native = NativeWindow::create(
+        id,
+        &options,
+        None,
+        Dispatcher::new(),
+        None,
+        crate::platform::windows::window::test_a11y_epoch(),
+    )
+    .expect("NativeWindow::create");
     let origin = client_origin_screen(raw_hwnd(&native));
     let areas = placement::work_areas();
     assert!(
@@ -127,8 +141,15 @@ fn a_programmatic_move_is_dispatched_as_event_moved() {
     let options = WindowOptions::default();
     let id = app.create_window(options.clone());
     let dispatcher = Dispatcher::new();
-    let mut native = NativeWindow::create(id, &options, None, dispatcher.clone(), None)
-        .expect("NativeWindow::create");
+    let mut native = NativeWindow::create(
+        id,
+        &options,
+        None,
+        dispatcher.clone(),
+        None,
+        crate::platform::windows::window::test_a11y_epoch(),
+    )
+    .expect("NativeWindow::create");
     // 清掉建窗期（`apply_dpi_and_size` 的 SetWindowPos）产生的事件：只断言本次移动。
     native.state_mut().take_events();
     let _ = app.drain_events();

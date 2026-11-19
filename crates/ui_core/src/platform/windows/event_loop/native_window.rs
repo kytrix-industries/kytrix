@@ -84,8 +84,19 @@ pub(super) fn sync_native_windows(
     for (id, options) in pending {
         // X1：owner 在**已创建**的原生窗口里解析（App 层保证 owner 先于 owned 创建）。
         let owner = resolve_owner(&options, windows);
-        let mut native =
-            NativeWindow::create(id, &options, owner, dispatcher.clone(), Some(app_cell))?;
+        // RE-01：adapter 必须持有窗口 `A11yBridge` 的**那一份**消费端代际（唯一入口
+        // `App::window_a11y_epoch`）；AT 重新激活时平台回调 `bump()` 它，引擎把下一笔升成全树。
+        let Some(a11y_epoch) = app.window_a11y_epoch(id) else {
+            continue;
+        };
+        let mut native = NativeWindow::create(
+            id,
+            &options,
+            owner,
+            dispatcher.clone(),
+            Some(app_cell),
+            a11y_epoch,
+        )?;
         let client = native.client_size();
         let renderer = Renderer::new_for_hwnd(native.composition(), client, options.background)?;
         // A5：帧预算的刷新率提示（窗口所在 output；查询失败 ⇒ 门禁保持禁用）。
@@ -398,8 +409,15 @@ mod tests {
         let options = WindowOptions::default();
         let id = app.create_window(options.clone());
         let dispatcher = Dispatcher::new();
-        let mut native = NativeWindow::create(id, &options, None, Arc::clone(&dispatcher), None)
-            .expect("NativeWindow");
+        let mut native = NativeWindow::create(
+            id,
+            &options,
+            None,
+            Arc::clone(&dispatcher),
+            None,
+            app.window_a11y_epoch(id).expect("window exists"),
+        )
+        .expect("NativeWindow");
         let _ = dispatcher.take_frame_wake();
 
         native.state_mut().note_display_recovery();
@@ -438,8 +456,15 @@ mod tests {
         let options = WindowOptions::default();
         let id = app.create_window(options.clone());
         let dispatcher = Dispatcher::new();
-        let native = NativeWindow::create(id, &options, None, Arc::clone(&dispatcher), None)
-            .expect("window");
+        let native = NativeWindow::create(
+            id,
+            &options,
+            None,
+            Arc::clone(&dispatcher),
+            None,
+            app.window_a11y_epoch(id).expect("window exists"),
+        )
+        .expect("window");
         let _ = dispatcher.take_frame_wake();
 
         let mut windows = vec![native];
@@ -461,6 +486,7 @@ mod tests {
             None,
             Dispatcher::new(),
             None,
+            crate::platform::windows::window::test_a11y_epoch(),
         )
         .expect("owner window");
         let windows = vec![owner];
@@ -521,8 +547,15 @@ mod tests {
         );
 
         let dispatcher = Dispatcher::new();
-        let mut native = NativeWindow::create(id, &options, None, Arc::clone(&dispatcher), None)
-            .expect("window");
+        let mut native = NativeWindow::create(
+            id,
+            &options,
+            None,
+            Arc::clone(&dispatcher),
+            None,
+            crate::platform::windows::window::test_a11y_epoch(),
+        )
+        .expect("window");
         let _ = dispatcher.take_frame_wake();
         apply_event(
             &mut app,

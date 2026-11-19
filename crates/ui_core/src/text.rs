@@ -900,7 +900,15 @@ pub struct TextPassReport {
     /// 走数字快速路径完成的塑形次数（R12 的 `DigitFastPath` 命中数）。
     pub fast_path_shaped: usize,
     /// 进入快速路径判定的塑形次数（命中率分母：`fast_path_shaped / fast_path_queries`）。
+    ///
+    /// 包含被静态条件拒绝的候选（RTL / letter-spacing / 断行机会 / 字符集），因此这是
+    /// **真实热路径命中率**，而不是只统计已 eligible 文本的自证式口径。
     pub fast_path_queries: usize,
+    /// 候选被静态条件拒绝的次数（`fast_path_queries` 的子集，D-2）。
+    ///
+    /// 与「验证降级」（`FastPathStats::rejected`，字形/advance 等价性不成立）区分开：
+    /// 前者是文本形态不适合，后者是宿主字体的 shaping 行为不满足快速路径前提。
+    pub fast_path_ineligible: usize,
 }
 
 /// `App::layout_text` 的统计（B1 的第二阶段：按内容宽重排 + 光栅）。

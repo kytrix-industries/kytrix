@@ -116,7 +116,8 @@ impl TestApp {
         self.step(A11yGate::Immediate)
     }
 
-    /// 推进一帧，a11y 交付走**平台泵**的闸门：脏位在 `A11Y_THROTTLE`（100 ms）内不交付。
+    /// 推进一帧，a11y 交付走**平台泵**的闸门：单点数据增量在 `A11Y_THROTTLE`（100 ms）内不
+    /// 交付；焦点变化 / 消费端重置 / 分批未走完（首树、DPI 重建）走不节流旁路（E5）。
     ///
     /// 帧脚本（[`super::script`]）用它断言「第 k 帧的 a11y 交付被节流」——节流是平台泵的行为，
     /// [`Self::drain`] 的立即交付抓不到它。
@@ -419,7 +420,8 @@ impl TestApp {
     /// 像素快照：Windows 上用 WARP 真渲染当前 `Scene`；macOS 用离屏 Metal；Linux 恒 `Gpu`
     /// （`new_offscreen` 在 Wayland 下需要真实 `wl_surface`，因此 Linux 上没有离屏渲染器）。
     ///
-    /// 两张图集页都会上传：字形页恒上传，图片页只在 `App::resources` 非空时上传（P13 §8.3）。
+    /// 两张图集都会上传：字形页恒上传；图片图集是 4 层 texture array（D-9-c），按已打开页逐层
+    /// 整页上传（没有图片时不传）。
     ///
     /// # Errors
     /// [`SnapshotError::NoRenderer`]（本构建没有渲染器）或 [`SnapshotError::Gpu`]
@@ -440,14 +442,18 @@ impl TestApp {
         let mut renderer = Self::offscreen_renderer(size).map_err(gpu_error)?;
         renderer.queue_atlas_upload(
             crate::paint::atlas::AtlasKind::Glyph,
+            0,
             glyph_page.0,
             &glyph_pixels,
             crate::render::DirtyRects::full(),
         );
-        // 图片页：只有插过资源（页已分配）才上传。
-        if let Some((image_page, image_pixels)) = self.app.resource_page_pixels() {
+        // 图片图集：多页 texture array（D-9-c）⇒ 逐层整页上传；没有图片页时什么都不传。
+        for (layer, (image_page, image_pixels)) in
+            self.app.resource_page_pixels_all().into_iter().enumerate()
+        {
             renderer.queue_atlas_upload(
                 crate::paint::atlas::AtlasKind::Image,
+                layer as u16,
                 image_page.0,
                 image_pixels,
                 crate::render::DirtyRects::full(),
@@ -1733,7 +1739,7 @@ mod p11_fix_tests {
 
     use super::TestApp;
     use crate::{
-        a11y::A11yPatch,
+        a11y::{A11yOverride, A11yPatch, A11yRole},
         event::Action,
         interaction::ScrollConfig,
         layout::LayoutOverride,
@@ -1743,6 +1749,7 @@ mod p11_fix_tests {
             color::Color,
             style::{Clip, PaintSpec, Style},
         },
+        text::{TextDirection, TextStyle},
         window::FrameOutcome,
     };
 
@@ -1911,6 +1918,76 @@ mod p11_fix_tests {
         );
     }
 
+    /// E2 端到端：分批首树尚未跑完时滚动一次，**已交付**的行必须在后续笔重发新 bounds。
+    ///
+    /// 修前行为：滚动把整棵子树标脏（`a11y_note_scroll` → `invalidate_subtree`），但已交付行
+    /// 仍占着 `queued` 去重名额 ⇒ 后续笔只有尚未交付的行，读屏的高亮框/命中区域停在旧位置。
+    ///
+    /// 变异守卫：删掉交付后的 `queued.remove` ⇒ `node_for(rows[0])` 变 None 或 bounds 不变。
+    #[test]
+    fn a11y_scroll_during_a_batched_first_tree_is_not_lost() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let mut inner = taffy::Style::<SmolStr>::DEFAULT;
+        inner.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::length(200.0),
+            height: taffy::style::Dimension::length(100.0),
+        };
+        inner.position = taffy::style::Position::Relative;
+        let container = mount(&mut app, move |tree, root| {
+            NodeBuilder::boxed()
+                .style(Style {
+                    inner,
+                    clip: Clip::Bounds,
+                })
+                .id("viewport")
+                .build(tree, root)
+                .expect("container")
+        });
+        // 3000 行 ⇒ 首笔 2048 节点后队列还剩 953 个未交付节点（分批运行**未结束**）。
+        let rows: Vec<NodeId> = {
+            let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+            (0..3000)
+                .map(|index| {
+                    NodeBuilder::boxed()
+                        .layout_override(Rect::new(0.0, index as f32, 50.0, 10.0))
+                        .id(smol_str::format_smolstr!("row-{index}"))
+                        .build(tree, container)
+                        .expect("row")
+                })
+                .collect()
+        };
+        let handle = app
+            .app_mut()
+            .make_scroll(window, container, ScrollConfig::default())
+            .expect("scroll");
+        app.app_mut()
+            .set_scroll_content(&handle, Size::new(200.0, 4000.0))
+            .expect("content");
+
+        let _ = app.drain().expect("首帧");
+        let first = app.a11y().expect("首笔 a11y").clone();
+        assert!(first.full, "首笔必须是全树");
+        let before = first.node_for(rows[0]).expect("行 0 必须已交付").bounds;
+
+        // 分批运行中滚动：整棵子树 bounds 变化。
+        app.app_mut()
+            .scroll_to(&handle, crate::math::Point::new(0.0, 120.0))
+            .expect("scroll to");
+        let _ = app.drain().expect("滚动帧");
+        let snapshot = app.a11y().expect("滚动后必须有 a11y 交付");
+        let after = snapshot
+            .node_for(rows[0])
+            .expect("已交付行必须在滚动后重发")
+            .bounds;
+        assert_ne!(
+            before, after,
+            "滚动后已交付行的 bounds 必须更新（修前它永久停在旧位置）"
+        );
+        app.assert_a11y_contract();
+    }
+
     /// 审查 #6：写 `bind_a11y` 的信号**不得**产生任何像素（Idle、无 damage、无 PAINT）。
     #[test]
     fn a11y_bind_a11y_write_is_idle_without_damage() {
@@ -1969,6 +2046,578 @@ mod p11_fix_tests {
                 .expect("button")
                 .disabled,
             "补丁照常生效"
+        );
+    }
+
+    /// E1 端到端：AT 重新激活（消费端重置）后，**不推进时钟**也必须立即交付全树。
+    ///
+    /// 修前行为：平台激活回调拿到 `None` 后 AccessKit 停在 `Pending`；`drain_pump` 走生产闸门
+    /// `App::a11y_pending`，重置后既没有脏位、也不节流旁路 ⇒ 永远不交付（AT 永久空树）；
+    /// 若有脏位则交付增量（`tree: None`）⇒ `accesskit_consumer::Tree::new` panic。
+    ///
+    /// 变异守卫：删掉 `App::a11y_pending` 的 epoch 旁路（泵不交付）或 `take` 的全树升级
+    /// （`tree: None`）⇒ 本用例红。
+    #[test]
+    fn a_consumer_epoch_reset_delivers_a_full_tree_without_advancing_the_clock() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let button = mount(&mut app, |tree, root| {
+            NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, 0.0, 60.0, 24.0))
+                .paint(white())
+                .on_click(Action::custom("press"))
+                .id("press")
+                .build(tree, root)
+                .expect("button")
+        });
+        // 首笔全树（生产闸门：首笔不受节流影响）。
+        let _ = app.drain_pump().expect("首帧");
+        assert!(
+            app.a11y_update().expect("首笔").tree.is_some(),
+            "首笔必须全树"
+        );
+        app.assert_a11y_contract();
+
+        // 标脏一笔增量：时钟不动 ⇒ 仍在 `A11Y_THROTTLE` 窗口内，普通脏位不得交付
+        // （先证明节流仍然有效，否则"不推进时钟"这个前提没有意义）。
+        app.app_mut()
+            .window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .mark_a11y(button);
+        assert!(
+            !app.app().a11y_pending(window),
+            "限流窗口内的普通脏位不得立即交付"
+        );
+
+        // 消费端重置（平台 adapter 的激活/停用回调）：必须立即、全量交付。
+        let epoch = app
+            .app()
+            .window(window)
+            .expect("window")
+            .a11y_consumer_epoch();
+        epoch.bump();
+        let _ = app.drain_pump().expect("重置后的泵轮");
+        let update = app
+            .a11y_update()
+            .expect("消费端重置后必须交付（不推进时钟、不依赖脏位）")
+            .clone();
+        assert!(
+            update.tree.is_some(),
+            "重置后的第一笔必须携带 TreeInfo（否则 consumer panic / AT 空树）"
+        );
+        app.assert_a11y_contract();
+        // 额外用一份**空**影子树应用该笔：模拟 AT 重新接入时消费端从零开始。
+        let mut fresh = crate::test_support::a11y::ShadowTree::new();
+        fresh
+            .apply(&update)
+            .expect("AT 重新接入时全树笔必须能初始化一棵空树");
+        assert!(fresh.len() >= 2, "全树笔必须覆盖根 + 按钮");
+    }
+
+    /// 造一个「输入框 + 单行子文本」的夹具，返回 TextRun 的引擎句柄。
+    fn text_run_fixture(app: &mut TestApp, text: &'static str, style: TextStyle) -> NodeId {
+        let window = app.window_id();
+        let root = app.app().window(window).expect("window").tree().root();
+        // 输入框必须有真实布局（可容纳子文本节点）：用显式尺寸的 Style，不能用
+        // `layout_override`（那是叶子节点的绝对定位覆盖，禁止带子节点）。
+        let mut inner = taffy::Style::<SmolStr>::DEFAULT;
+        inner.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::length(240.0),
+            height: taffy::style::Dimension::length(24.0),
+        };
+        let input = NodeBuilder::boxed()
+            .style(Style {
+                inner,
+                clip: Clip::None,
+            })
+            .a11y(A11yOverride {
+                role: Some(A11yRole::TextInput),
+                label: Some(SmolStr::new_static("搜索")),
+                ..A11yOverride::default()
+            })
+            .id("input")
+            .build(
+                app.app_mut().window_mut(window).expect("window").tree_mut(),
+                root,
+            )
+            .expect("input");
+        NodeBuilder::text(text, style)
+            .layout_override(Rect::new(0.0, 0.0, 160.0, 24.0))
+            .id("run")
+            .build(
+                app.app_mut().window_mut(window).expect("window").tree_mut(),
+                input,
+            )
+            .expect("text run")
+    }
+
+    /// E4b：单行显式 LTR 的 TextRun 必须输出 `character_positions` / `character_widths` +
+    /// `text_direction`，且与真实 caret 一致（AccessKit 的 caret 高亮 / 屏幕放大镜依赖它）。
+    ///
+    /// 两条 shape 路径各测一遍：`"价🌍ab"`（parley，CJK+emoji）与 `"42150"`（数字快速路径）。
+    #[test]
+    fn text_run_exposes_character_metrics_for_a_single_ltr_line() {
+        for (text, expected_lengths, caret_byte, position_index) in [
+            ("价🌍ab", vec![3_u8, 4, 1, 1], 3_usize, 1_usize),
+            ("42150", vec![1_u8, 1, 1, 1, 1], 2, 2),
+        ] {
+            let mut app = TestApp::new();
+            app.enable_a11y_capture();
+            let window = app.window_id();
+            let run = text_run_fixture(
+                &mut app,
+                text,
+                TextStyle {
+                    direction: TextDirection::Ltr,
+                    ..TextStyle::new(20.0)
+                },
+            );
+            let _ = app.drain().expect("frame");
+            app.assert_a11y_contract();
+
+            let snapshot = app.a11y().expect("a11y delivery");
+            let record = snapshot.node_for(run).expect("text run record");
+            assert_eq!(record.role, A11yRole::TextRun);
+            assert_eq!(record.character_lengths, expected_lengths, "{text:?}");
+            assert_eq!(
+                record.character_positions.len(),
+                expected_lengths.len(),
+                "{text:?}：positions 必须与 character_lengths 等长"
+            );
+            assert_eq!(
+                record.character_widths.len(),
+                expected_lengths.len(),
+                "{text:?}：widths 必须与 character_lengths 等长"
+            );
+            assert!(
+                record
+                    .character_positions
+                    .windows(2)
+                    .all(|pair| pair[0] <= pair[1]),
+                "{text:?}：LTR 位置必须单调：{:?}",
+                record.character_positions
+            );
+            assert!(
+                record.character_widths.iter().all(|width| *width > 0.0),
+                "{text:?}：每个 grapheme 的 advance 必须为正：{:?}",
+                record.character_widths
+            );
+
+            let update = app.a11y_update().expect("TreeUpdate").clone();
+            let ak = update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == accesskit::NodeId(record.id.get()))
+                .map(|(_, node)| node)
+                .expect("accesskit node");
+            assert_eq!(
+                ak.text_direction(),
+                Some(accesskit::TextDirection::LeftToRight),
+                "{text:?}"
+            );
+            assert_eq!(
+                ak.character_positions(),
+                Some(record.character_positions.as_slice()),
+                "{text:?}"
+            );
+            assert_eq!(
+                ak.character_widths(),
+                Some(record.character_widths.as_slice()),
+                "{text:?}"
+            );
+
+            // 与真实 caret 交叉验证：caret 物理 x − 节点 bounds 原点 == positions[i]。
+            let caret = app
+                .app()
+                .window(window)
+                .expect("window")
+                .text_caret_rect(run, caret_byte)
+                .expect("caret");
+            let bounds = app.probe().bounds(run).expect("bounds");
+            let scale = app.app().window(window).expect("window").scale().factor();
+            let expected = (caret.min().x - bounds.origin.x) * scale;
+            let actual = record.character_positions[position_index];
+            assert!(
+                (actual - expected).abs() <= 1.0,
+                "{text:?}：positions[{position_index}]={actual} 必须与真实 caret x={expected} 一致"
+            );
+        }
+    }
+
+    /// E4b：多行 TextRun **省略**字符度量（AccessKit 的位置模型忽略 y，多行发出去会命中错行）
+    /// —— 策略是"省略而不是发错值"，AT 回退到无 caret 高亮。
+    #[test]
+    fn multi_line_text_run_omits_character_metrics() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let run = text_run_fixture(
+            &mut app,
+            "价🌍ab\n第二行",
+            TextStyle {
+                direction: TextDirection::Ltr,
+                ..TextStyle::new(20.0)
+            },
+        );
+        let _ = app.drain().expect("frame");
+        app.assert_a11y_contract();
+        let snapshot = app.a11y().expect("a11y delivery");
+        let record = snapshot.node_for(run).expect("text run record");
+        assert!(
+            !record.character_lengths.is_empty(),
+            "多行文本仍必须有 character_lengths（文本接口本身可用）"
+        );
+        assert!(
+            record.character_positions.is_empty() && record.character_widths.is_empty(),
+            "多行文本必须省略 character_positions/widths（否则 caret 会命中错行）"
+        );
+        let update = app.a11y_update().expect("TreeUpdate").clone();
+        let ak = update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == accesskit::NodeId(record.id.get()))
+            .map(|(_, node)| node)
+            .expect("accesskit node");
+        assert!(
+            ak.character_positions().is_none()
+                && ak.character_widths().is_none()
+                && ak.text_direction().is_none(),
+            "省略时不得写 character_positions/widths/text_direction（AT 回退路径）"
+        );
+    }
+
+    /// E4b：`TextDirection::Auto`（未显式声明 LTR）时也**省略**字符度量 —— 方向由首个强方向
+    /// 字符决定，consumer 只处理单一 `text_direction`（D6-A），引擎不猜。
+    #[test]
+    fn auto_direction_text_run_omits_character_metrics() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let run = text_run_fixture(
+            &mut app,
+            "价🌍ab",
+            // 默认 `TextStyle::new` 的方向就是 `Auto`。
+            TextStyle::new(20.0),
+        );
+        let _ = app.drain().expect("frame");
+        app.assert_a11y_contract();
+        let snapshot = app.a11y().expect("a11y delivery");
+        let record = snapshot.node_for(run).expect("text run record");
+        assert!(
+            !record.character_lengths.is_empty(),
+            "文本接口本身仍可用（character_lengths 与方向无关）"
+        );
+        assert!(
+            record.character_positions.is_empty() && record.character_widths.is_empty(),
+            "方向为 Auto 时必须省略字符度量（不猜方向、不发错轴的值）"
+        );
+    }
+
+    /// RE-02：TextRun 的 `A11yPatch::value` 覆盖与真实 shape 文本不一致时，`character_lengths`
+    /// 描述的是 value 串、而位置只能描述真实文本 —— 两者不一致 ⇒ **省略**位置/宽度（AT 回退），
+    /// 绝不再发出「重复位置 + 零宽尾部」的错位 caret 表。
+    #[test]
+    fn a_value_override_that_disagrees_with_the_shaped_text_omits_character_metrics() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let run = text_run_fixture(
+            &mut app,
+            "ab",
+            TextStyle {
+                direction: TextDirection::Ltr,
+                ..TextStyle::new(20.0)
+            },
+        );
+        let window = app.window_id();
+        app.app_mut()
+            .window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .set_a11y_patch(
+                run,
+                A11yPatch {
+                    value: Some(SmolStr::new_static("ABCDEFGH")),
+                    ..A11yPatch::default()
+                },
+            );
+        let _ = app.drain().expect("frame");
+        app.assert_a11y_contract();
+
+        let snapshot = app.a11y().expect("a11y delivery");
+        let record = snapshot.node_for(run).expect("text run record");
+        assert_eq!(
+            record.value.as_deref(),
+            Some("ABCDEFGH"),
+            "value 覆盖本身仍然生效"
+        );
+        assert_eq!(
+            record.character_lengths.len(),
+            8,
+            "character_lengths 仍描述 value 串（AccessKit 的 Σ == value.len() 约束成立）"
+        );
+        assert!(
+            record.character_positions.is_empty() && record.character_widths.is_empty(),
+            "value 与真实文本不一致 ⇒ 必须省略位置/宽度（否则 caret 表错位）：{:?} / {:?}",
+            record.character_positions,
+            record.character_widths
+        );
+        let update = app.a11y_update().expect("TreeUpdate").clone();
+        let ak = update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == accesskit::NodeId(record.id.get()))
+            .map(|(_, node)| node)
+            .expect("accesskit node");
+        assert!(
+            ak.character_positions().is_none()
+                && ak.character_widths().is_none()
+                && ak.text_direction().is_none(),
+            "RE-02：口径不一致时不得写 character_positions/widths/text_direction"
+        );
+    }
+
+    /// 造 `count` 个固定几何的行（`layout_override` ⇒ 边界可预测，根的直接子节点）。
+    fn rows_fixture(app: &mut TestApp, count: usize) -> Vec<NodeId> {
+        let window = app.window_id();
+        let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+        let root = tree.root();
+        (0..count)
+            .map(|index| {
+                NodeBuilder::boxed()
+                    .layout_override(Rect::new(0.0, index as f32, 10.0, 1.0))
+                    .build(tree, root)
+                    .expect("row")
+            })
+            .collect()
+    }
+
+    /// E5：分批首树**不节流** —— 不推进时钟（模拟时间静止）也必须逐批交付到收敛。
+    ///
+    /// 修前行为：`A11Y_THROTTLE` 对**每一笔**生效（首笔之后每批要等 100 ms），40k 节点 ≈
+    /// 20 × 100 ms ≈ 2 s。修后只有「单点高频增量」被 100 ms 合并；还有待发批次时立即继续。
+    ///
+    /// 变异守卫：删掉 `App::a11y_pending` 的 `a11y_backlog_pending()` 旁路 ⇒ 首笔之后
+    /// `a11y_pending` 为假（时钟未推进），循环一轮都跑不了，本用例红。
+    #[test]
+    fn a_large_first_tree_is_not_throttled() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let rows = rows_fixture(&mut app, 5000);
+        let _ = app.drain_pump().expect("首帧");
+        assert!(
+            app.a11y_update().expect("首笔").tree.is_some(),
+            "首笔必须全树"
+        );
+        app.assert_a11y_contract();
+
+        let mut batches = 1usize;
+        while app.app().a11y_pending(window) {
+            let _ = app.drain_pump().expect("后续批次（不推进时钟）");
+            let update = app.a11y_update().expect("有待发批次时每轮都必须交付");
+            assert!(update.tree.is_none(), "只有首笔携带 TreeInfo");
+            app.assert_a11y_contract();
+            batches += 1;
+            assert!(batches < 16, "分批必须收敛（实际 {batches} 笔）");
+        }
+        assert!(
+            batches >= 3,
+            "5000 节点必须分多批（实际 {batches} 笔；若只有 1 笔说明预算/语义被改动）"
+        );
+
+        // 增量仍被 100 ms 合并：修复没有把「单点数据更新」也变成连续投递。
+        app.app_mut()
+            .window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .mark_a11y(rows[0]);
+        assert!(
+            !app.app().a11y_pending(window),
+            "单点增量仍在 A11Y_THROTTLE 窗口内（省电目标不变）"
+        );
+        app.advance(std::time::Duration::from_millis(100));
+        assert!(app.app().a11y_pending(window), "节流窗口到期后增量恢复交付");
+        let _ = app.drain_pump().expect("到期补发");
+        app.assert_a11y_contract();
+    }
+
+    /// E5：DPI 变化（`set_scale`）后的整轮全量重建同样**不受节流**、无停顿地分批补齐，
+    /// 且每批 bounds 已乘新 scale。
+    #[test]
+    fn a_dpi_change_redelivers_all_batches_without_stall() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let rows = rows_fixture(&mut app, 5000);
+        let _ = app.drain_pump().expect("首帧");
+        while app.app().a11y_pending(window) {
+            let _ = app.drain_pump().expect("首树剩余批次");
+            app.assert_a11y_contract();
+        }
+
+        let scale = Scale::new(2.0).expect("scale");
+        app.app_mut()
+            .window_mut(window)
+            .expect("window")
+            .set_scale(scale);
+        let _ = app.drain_pump().expect("DPI 首笔");
+        assert!(
+            app.a11y_update().expect("DPI 首笔").tree.is_some(),
+            "DPI 变化后的第一笔必须是全树"
+        );
+        app.assert_a11y_contract();
+        // 首笔（DFS 前 2048 节点）含 root + rows[0..2046]：bounds 必须是 逻辑 × 2。
+        let first = app.a11y().expect("DPI 首笔 snapshot").clone();
+        let record = first.node_for(rows[0]).expect("row 0 在首笔里");
+        let logical = app.probe().bounds(rows[0]).expect("logical bounds");
+        assert_eq!(
+            record.bounds,
+            logical.to_physical(scale),
+            "DPI 变化后首笔的 bounds 必须已乘新 scale（不是旧值）"
+        );
+
+        let mut batches = 1usize;
+        while app.app().a11y_pending(window) {
+            let _ = app.drain_pump().expect("DPI 剩余批次（不推进时钟）");
+            app.assert_a11y_contract();
+            batches += 1;
+            assert!(batches < 20, "DPI 全树分批必须收敛（实际 {batches} 笔）");
+        }
+        assert!(batches >= 3, "5000 节点的 DPI 全树必须分多批重发");
+    }
+
+    /// E5 / RE-04：三端泵接线所读的 **App 级信号** —— 每笔非最终批次交付后
+    /// `a11y_backlog_pending()` 必须为真（平台泵据此 `dispatcher.wake()` 下一轮），收敛后为假；
+    /// 单点高频增量不得触发（否则泵会被无谓连续唤醒）。
+    ///
+    /// 边界：三端泵本身（`event_loop`/`pump` 里三行 wake 接线）需要真实事件循环，单测不执行；
+    /// 本用例钉住接线读的**唯一信号**，平台接线后的连续交付由真机/验收记录（报告 §8.3）。
+    #[test]
+    fn a11y_backlog_signals_a_pump_wake_after_every_non_final_batch() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let rows = rows_fixture(&mut app, 5000);
+        let _ = app.drain_pump().expect("首帧");
+        app.assert_a11y_contract();
+        assert!(
+            app.app().a11y_backlog_pending(),
+            "首笔之后仍有分批 ⇒ 平台必须收到 wake 信号"
+        );
+        let mut batches = 1usize;
+        let mut wakes = 1usize;
+        while app.app().a11y_pending(window) {
+            let _ = app.drain_pump().expect("后续批次（不推进时钟）");
+            app.assert_a11y_contract();
+            batches += 1;
+            if app.app().a11y_backlog_pending() {
+                wakes += 1;
+            }
+            assert!(batches < 16, "分批必须收敛（实际 {batches} 笔）");
+        }
+        assert!(batches >= 3, "5000 节点必须分多批");
+        assert_eq!(
+            wakes,
+            batches - 1,
+            "除最后一笔外每笔交付后都必须请求 wake（实际 {wakes} 次 / {batches} 批）"
+        );
+        assert!(
+            !app.app().a11y_backlog_pending(),
+            "收敛后不得残留 wake 信号（否则泵会空转）"
+        );
+        // 单点增量不满足 backlog ⇒ 平台不需要额外唤醒（仍走 100ms 合并）。
+        app.app_mut()
+            .window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .mark_a11y(rows[0]);
+        assert!(
+            !app.app().a11y_backlog_pending(),
+            "单点数据增量不得让泵连续唤醒"
+        );
+    }
+
+    /// E5 / RE-04 / RE-05：三端接线共享的 `App::wake_for_a11y_backlog` —— **只有本轮真的
+    /// 交付过** a11y 且仍有未走完的批次时才 wake；每笔非最终批次恰好一次；收敛后不再 wake。
+    ///
+    /// 变异：删掉 `dispatcher.wake()`、或把判据改回「无条件 backlog」（不看本轮交付标志）⇒
+    /// 本用例 / 无消费者用例红。
+    #[test]
+    fn the_backlog_wake_helper_wakes_only_after_a_real_delivery() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let _rows = rows_fixture(&mut app, 5000);
+        let dispatcher = app.app().dispatcher();
+
+        let mut batches = 0usize;
+        let mut wakes = 0usize;
+        loop {
+            let delivered_round = app.app().a11y_pending(window);
+            if delivered_round {
+                let _ = app.drain_pump().expect("泵轮（本批交付）");
+                app.assert_a11y_contract();
+                batches += 1;
+                assert!(batches < 16, "分批必须收敛（实际 {batches} 批）");
+            }
+            let _ = dispatcher.take_frame_wake();
+            app.app_mut().wake_for_a11y_backlog(dispatcher.as_ref());
+            let woke = dispatcher.take_frame_wake();
+            if !delivered_round {
+                assert!(!woke, "本轮没有交付 ⇒ 绝不能唤醒泵（RE-05：I3 空闲零唤醒）");
+                break;
+            }
+            if app.app().a11y_backlog_pending() {
+                assert!(
+                    woke,
+                    "交付后仍有未走完批次 ⇒ 必须唤醒下一轮（第 {batches} 批）"
+                );
+                wakes += 1;
+            } else {
+                assert!(!woke, "最后一笔交付后不得再唤醒泵（已收敛）");
+            }
+        }
+        assert!(batches >= 3, "5000 节点必须分多批");
+        assert_eq!(
+            wakes,
+            batches - 1,
+            "除最后一笔外每笔交付后必须唤醒一次（实际 {wakes} 次 / {batches} 批）"
+        );
+    }
+
+    /// **RE-05（P0 回归）**：无 AT 客户端 / 无测试捕获时 adapter 永远 Inactive，`a11y_take`
+    /// 不执行；泵轮即使 a11y 仍有「未开始的重建待发」，也**绝不能**自唤醒 —— 否则每轮
+    /// `wake()` 让泵停不下来（单核 100% 忙等，I3「空闲零唤醒」失效）。
+    ///
+    /// 变异：把 `wake_for_a11y_backlog` 判据改回无条件 backlog（不看本轮交付标志）⇒ 本用例红。
+    #[test]
+    fn a11y_backlog_never_wakes_the_pump_without_a_consumer() {
+        // 不调用 `enable_a11y_capture()`：模拟绝大多数用户的默认状态（无读屏器/自动化客户端）。
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let _rows = rows_fixture(&mut app, 5000);
+        let dispatcher = app.app().dispatcher();
+        let mut wakes = 0usize;
+        for round in 0..10 {
+            let _ = app.drain_pump().expect("泵轮（无消费者）");
+            // 丢弃其它来源的帧唤醒，只观察 a11y 自唤醒逻辑。
+            let _ = dispatcher.take_frame_wake();
+            app.app_mut().wake_for_a11y_backlog(dispatcher.as_ref());
+            if dispatcher.take_frame_wake() {
+                wakes += 1;
+            }
+            assert!(
+                !app.app().a11y_backlog_pending(),
+                "无消费者时不存在「已开始的交付批次」（round {round}）"
+            );
+            assert!(
+                app.app().a11y_pending(window),
+                "待发全量重建仍应报告工作（被叫醒后立刻交付；但不参与自唤醒）"
+            );
+        }
+        assert_eq!(
+            wakes, 0,
+            "无 AT/无捕获时 a11y 绝不能唤醒泵（RE-05：否则单核 100% 忙等）"
         );
     }
 }

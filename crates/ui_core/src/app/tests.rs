@@ -459,27 +459,32 @@ fn scale_change_relays_the_same_snapshot_at_the_new_ppem() {
     );
 }
 
-/// R12 的 `DigitFastPath` 命中率必须**可观测**（`TextPassReport`）：分母 = 进入判定的塑形数。
+/// R12 的 `DigitFastPath` 命中率必须**可观测**（`TextPassReport`）：分母 = 进入判定的塑形数，
+/// 含被静态条件拒绝的候选（D-2：真实命中率，不是只统计 eligible 文本的自证式口径）。
 #[test]
 fn digit_fast_path_hit_rate_is_observable() {
     // 数字文本：进入判定一次、命中一次。
     let (_rt, mut app, window, _node) = text_app("1,234.56", None);
     let report = refresh(&mut app, window);
-    if report.fast_path_queries == 0 || report.fast_path_shaped == 0 {
+    if report.fast_path_shaped == 0 {
         // 宿主字体对该字号的数字/标点组合验证失败（例如带 kerning）：这是合法的降级，
-        // 不是失败；命中率的可观测性由下面「字母文本不计入判定」的断言保证。
+        // 不是失败；命中率的可观测性由下面「字母文本计入候选」的断言保证。
         eprintln!("skip: the host font rejects the digit fast path");
+        assert_eq!(report.fast_path_queries, 1, "验证降级也计入候选分母");
+        assert_eq!(report.fast_path_ineligible, 0);
     } else {
         assert_eq!(report.fast_path_queries, 1);
         assert_eq!(report.fast_path_shaped, 1);
+        assert_eq!(report.fast_path_ineligible, 0);
         assert!(app.digit_fast_path_enabled());
     }
 
-    // 字母文本：不满足字符集 ⇒ 根本不计入判定（命中率分母为 0）。
+    // 字母文本：不满足字符集 ⇒ 不计命中，但必须计入候选分母与 ineligible（真实命中率）。
     let (_rt2, mut app2, window2, _node2) = text_app("frame a", None);
     let report2 = refresh(&mut app2, window2);
-    assert_eq!(report2.fast_path_queries, 0, "字母文本不进入快速路径判定");
+    assert_eq!(report2.fast_path_queries, 1, "字母文本必须计入候选分母");
     assert_eq!(report2.fast_path_shaped, 0);
+    assert_eq!(report2.fast_path_ineligible, 1);
 
     // 开关关闭 ⇒ 连判定都不做（回退验证路径）。
     let (_rt3, mut app3, window3, _node3) = text_app("1,234.56", None);
@@ -488,6 +493,7 @@ fn digit_fast_path_hit_rate_is_observable() {
     let report3 = refresh(&mut app3, window3);
     assert_eq!(report3.fast_path_queries, 0);
     assert_eq!(report3.fast_path_shaped, 0);
+    assert_eq!(report3.fast_path_ineligible, 0);
 }
 
 #[test]

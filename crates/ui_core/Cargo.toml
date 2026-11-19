@@ -83,6 +83,8 @@ color = { workspace = true }
 
 # P11：a11y `TextRun` 的 grapheme / 词边界（`character_lengths` / `word_starts`）。
 unicode-segmentation = { workspace = true }
+# P06 数字快速路径：UAX #14 断行机会判定（D-2，已在锁内，不新增编译单元）。
+unicode-linebreak = { workspace = true }
 
 # P03 节点 / 状态 / 容器
 ahash = { workspace = true }
@@ -101,6 +103,8 @@ etagere = { workspace = true }
 
 # P13 资源解码（workspace 已钉 0.25.10；六个 codec feature 已在 base_ui 的依赖图内）
 image = { workspace = true }
+# P13 资源色彩管理（D-8）：ICC → sRGB（8-bit）。image 0.25.10 的非可选依赖，锁内已有 0.8.1。
+moxcms = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [

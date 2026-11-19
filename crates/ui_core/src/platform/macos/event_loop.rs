@@ -18,7 +18,11 @@
 //! `App` 以 `Box` 存放、地址稳定；C 回调只在主线程、且主线程在 run loop 中时执行
 //! （此时没有其它 `&mut App` 存活），因此用裸指针穿透 ObjC 回调是安全的。
 
-use std::{ffi::c_void, sync::Arc, time::Duration};
+use std::{
+    ffi::c_void,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use objc2::{MainThreadMarker, rc::Retained};
 use objc2_app_kit::{
@@ -44,8 +48,8 @@ use crate::{
         macos_close::CloseAction,
         macos_owner::{OwnerResolution, resolve_owner, window_level},
     },
-    render::backend::Renderer,
-    window::{WindowId, WindowOptions},
+    render::{backend::Renderer, macos::core::GpuCore},
+    window::{Window, WindowId, WindowOptions},
 };
 
 /// 泵的共享状态（堆上、地址稳定；C 回调通过 `info` 拿到它）。
@@ -156,7 +160,7 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
     let mut windows: Vec<NativeWindow> = Vec::with_capacity(requests.len());
     // X1：两阶段建窗（先全部创建、再接线 owner/层级、最后显示 + 建渲染器）。`App` 的窗口
     // 表是 `HashMap`，创建顺序不可控，而 owner 必须先有原生窗口，见 `attach_owners`。
-    create_native_windows(mtm, &requests, &dispatcher, &mut windows)?;
+    create_native_windows(mtm, &app, &requests, &dispatcher, &mut windows)?;
     attach_owners(&requests, &mut windows, 0);
     for (native, (_, options)) in windows.iter_mut().zip(requests.iter()) {
         show_window(&mut app, native, options, &dispatcher)?;
@@ -263,6 +267,7 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
 /// 3. [`show_window`] 逐个显示 + 建渲染器。
 fn create_native_windows(
     mtm: MainThreadMarker,
+    app: &App,
     requests: &[(WindowId, WindowOptions)],
     dispatcher: &Arc<Dispatcher>,
     windows: &mut Vec<NativeWindow>,
@@ -270,12 +275,22 @@ fn create_native_windows(
     let start = windows.len();
     windows.reserve(requests.len());
     for (offset, (id, options)) in requests.iter().enumerate() {
+        // RE-01：adapter 必须持有窗口 `A11yBridge` 的**那一份**消费端代际（唯一入口
+        // `App::window_a11y_epoch`）；不存在的窗口不能建原生窗口。
+        let a11y_epoch = app
+            .window_a11y_epoch(*id)
+            .ok_or_else(|| EngineError::AppInit {
+                detail: smol_str::SmolStr::new_static(
+                    "window disappeared while creating native window",
+                ),
+            })?;
         windows.push(NativeWindow::create(
             mtm,
             *id,
             options,
             dispatcher,
             start + offset,
+            a11y_epoch,
         )?);
     }
     Ok(())
@@ -417,14 +432,17 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
     // `run` 启动时枚举一次，运行时 `App::create_window` 的窗口永远没有原生窗口与渲染器。
     sync_native_windows(app, &mut state.windows, &state.dispatcher)?;
     // 空闲时也要收 render 线程的反馈：设备丢失/提交失败不能等到下一次输入才冒泡。
-    app.poll_renderers()?;
+    // C4：**逐窗口** poll —— `DeviceLost` 当场整 renderer 重建（泵继续运行），其它 GPU 错误
+    // 保持致命并原样冒泡（应用退出语义不变）。返回 `true` = 本轮恢复过，需要在同一轮强制出帧，
+    // 否则 `force_full_republish` 只置脏位、要等下一次外部唤醒才会被消费。
+    let recovered = poll_renderers_recovering(app, &state.windows, &state.dispatcher)?;
     // R09-10：双击间隔跟随系统设置（用户可能刚在系统设置里改过双击速度）。
     sync_double_click_interval(app, &mut state.double_click);
 
     // 本轮的「有变化」标记：输入事件与窗口状态变化都必须在**同一轮**出帧。
     // R09-15②：这里不再调 `Dispatcher::wake()`（那会 signal run loop source，让同一轮多跑一次
     // 空泵）—— 状态变化直接送进下面的帧门禁。
-    let mut changed = false;
+    let mut changed = recovered;
     for native in state.windows.iter_mut() {
         let id = native.id();
         for event in native.take_events() {
@@ -499,6 +517,9 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
             native.sync_drag_regions(window.drag_regions());
         }
     }
+    // E5 / RE-04 / RE-05：**本轮确实交付过** a11y 且仍有未走完的批次 ⇒ 立刻唤醒下一轮泵
+    // （无 AT 客户端时无交付 ⇒ 绝不 wake，I3 空闲零唤醒）；判定 + wake 的唯一入口。
+    app.wake_for_a11y_backlog(state.dispatcher.as_ref());
     for task in state.dispatcher.drain_tasks() {
         task.run(app);
     }
@@ -623,12 +644,190 @@ fn sync_native_windows(
         detail: smol_str::SmolStr::new_static("window creation requires the main thread"),
     })?;
     let start = windows.len();
-    create_native_windows(mtm, &pending, dispatcher, windows)?;
+    create_native_windows(mtm, app, &pending, dispatcher, windows)?;
     attach_owners(&pending, windows, start);
     for (native, (_, options)) in windows[start..].iter_mut().zip(pending.iter()) {
         show_window(app, native, options, dispatcher)?;
     }
     Ok(())
+}
+
+/// 逐窗口 poll 的结论：`DeviceLost` 就地恢复，其它 GPU 错误保持致命。
+///
+/// 单独抽成纯函数是为了让「哪些错误触发整 renderer 重建」有可单测的唯一真值来源
+/// （audit §4.4：分类粒度是恢复正确性的前提）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryDisposition {
+    /// 设备级失败（`EngineError::DeviceLost`）：整 renderer 重建（C4）。
+    Rebuild,
+    /// 其它 GPU 错误（swapchain / persist 预算 / shader 等）：**不可重试**，保持致命。
+    ///
+    /// 这些错误不是「设备没了」的事实：重建一个设备也不会让 persist 预算变宽或让 swapchain
+    /// 参数变合法，盲目重建只会把真实缺陷藏成一次黑屏。
+    Fatal,
+}
+
+/// `DeviceLost` ⇒ 重建；其它错误 ⇒ 致命（应用退出语义不变）。
+fn recovery_disposition(error: &EngineError) -> RecoveryDisposition {
+    match error {
+        EngineError::DeviceLost { .. } => RecoveryDisposition::Rebuild,
+        _ => RecoveryDisposition::Fatal,
+    }
+}
+
+/// 恢复前置条件被破坏（窗口 / 渲染器在 poll 之后消失）：编程错误，按 `AppInit` 上报。
+fn recovery_invariant(detail: &'static str) -> EngineError {
+    EngineError::AppInit {
+        detail: smol_str::SmolStr::new_static(detail),
+    }
+}
+
+/// 轮询每个窗口的 GPU 反馈；`DeviceLost` 当场恢复，其它错误原样冒泡。
+///
+/// 返回 `true` = 本轮发生过恢复（调用方在同一轮强制出帧，见 [`request_full_republish_after_recovery`]）。
+///
+/// 两层结构：
+/// 1. **稳态快路径**仍走 `App::poll_renderers()`（每轮一次、按窗口短锁；空闲也要跑）；
+/// 2. 它冒出 `DeviceLost` 时才**逐窗口复 poll** 定位失败窗口 —— `Renderer::poll` 的错误是粘性的，
+///    失败窗口会再次返回同一条错误（成功窗口返回 `Ok(None)`）。多窗口同时设备丢失时每个窗口
+///    都能被重建；其它类型的 GPU 错误在这里保持致命（应用退出语义不变）。
+fn poll_renderers_recovering(
+    app: &mut App,
+    windows: &[NativeWindow],
+    dispatcher: &Arc<Dispatcher>,
+) -> Result<bool, EngineError> {
+    match app.poll_renderers() {
+        Ok(()) => return Ok(false),
+        Err(error) if matches!(recovery_disposition(&error), RecoveryDisposition::Rebuild) => {}
+        Err(error) => return Err(error),
+    }
+    let mut recovered = false;
+    for native in windows {
+        let id = native.id();
+        // 逐窗口 poll 才能定位失败窗口（`App::poll_renderers` 在第一个错误处就返回了）。
+        let error = match app.window_mut(id) {
+            Some(window) => window.poll_renderer().err(),
+            // `sync_native_windows` 保证原生窗口与 App 窗口一一对应；这里只是防御。
+            None => None,
+        };
+        let Some(error) = error else {
+            continue;
+        };
+        match recovery_disposition(&error) {
+            RecoveryDisposition::Fatal => return Err(error),
+            RecoveryDisposition::Rebuild => {
+                recover_window_renderer(app, native, dispatcher, &error)?;
+                recovered = true;
+            }
+        }
+    }
+    Ok(recovered)
+}
+
+/// 一个窗口的**整 renderer 重建**（C4；顺序与不变量见 `render/macos/renderer.rs` 模块文档）。
+///
+/// 步序（每一步的失败都意味着应用退出，走泵既有的 `state.error` 路径）：
+/// 1. 捕获旧 renderer 的重建输入（图层 / 背景 / 旧 core / GPU 线程）；
+/// 2. **take/drop 旧 renderer**：invalidate display link + 有界 join 旧 GPU 线程
+///    （主线程上限 250 ms，见 `render/macos/renderer.rs` 的 `JOIN_TIMEOUT`）；
+/// 3. `GpuCore::recover(&stale)`：换进程级设备（5 s 内最多 3 次；其它窗口已重建则复用）；
+/// 4. `Renderer::new_with_layer`：复用旧 `CAMetalLayer`，重建 persist / 图集页 / 上传槽 /
+///    GPU 线程 / display link；
+/// 5. 覆盖合成线程的交付端点（`compositor().register`）：不覆盖的话合成线程继续把 delta 投给
+///    已终止的旧 `Arc<Shared>` ⇒ 新 renderer 永远收不到帧（黑屏）；
+/// 6. `force_full_republish`（含 `request_repaint`）：新 GPU 侧的实例镜像 / 图集纹理 / persist
+///    都是空的，增量载荷会画成退化实例（AR4 P1-1 的同一条纪律）。
+fn recover_window_renderer(
+    app: &mut App,
+    native: &NativeWindow,
+    dispatcher: &Arc<Dispatcher>,
+    error: &EngineError,
+) -> Result<(), EngineError> {
+    let started = Instant::now();
+    let id = native.id();
+    // 恢复只对设备丢失开放（`poll_renderers_recovering` 已用 `recovery_disposition` 过滤；
+    // 这里是第二道守卫：非 DeviceLost 不允许走到后面的破坏性步骤）。
+    let EngineError::DeviceLost { reason, .. } = error else {
+        return Err(recovery_invariant(
+            "device recovery: unexpected non-device-lost error",
+        ));
+    };
+    // 平台真值（AppKit backing / DPI / 屏幕刷新率）：新 renderer 必须原样继承。
+    let size = native.backing_size();
+    let scale = f64::from(native.scale().factor());
+    let max_frame_rate = native.maximum_frames_per_second();
+
+    // 1) 捕获重建输入。`background` 用 renderer 的主线程真值（运行期可能被
+    //    `Window::set_background_color` 改过，不能回头读建窗时的 options）。
+    let (old, background) = {
+        let window = app.window_mut(id).ok_or_else(|| {
+            recovery_invariant("device recovery: the window disappeared before it was rebuilt")
+        })?;
+        let old = window.take_renderer().ok_or_else(|| {
+            recovery_invariant("device recovery: the window has no renderer to rebuild")
+        })?;
+        let background = old.background_color().ok_or_else(|| {
+            recovery_invariant("device recovery: the renderer has no window background")
+        })?;
+        (old, background)
+    };
+    let layer = old.layer_handle().ok_or_else(|| {
+        recovery_invariant("device recovery: the window renderer has no CAMetalLayer")
+    })?;
+    let stale = old
+        .gpu_core()
+        .ok_or_else(|| recovery_invariant("device recovery: the window renderer has no GpuCore"))?;
+    // 2) 有界 drop：停 display link → signal shutdown → join（超时 detach，旧线程不再 present）。
+    drop(old);
+    let join_stall = started.elapsed();
+    // 3) 设备级重建（复用/限次规则在 `render/macos/core.rs`）。
+    GpuCore::recover(&stale)?;
+    let generation = GpuCore::generation();
+    // 4) 复用旧图层的整窗口 renderer（新设备上的 persist / 图集页 / display link / GPU 线程）。
+    let renderer = Renderer::new_with_layer(
+        layer,
+        size,
+        scale,
+        max_frame_rate,
+        background,
+        Arc::clone(dispatcher),
+    )?;
+    // 5) 合成线程的交付端点必须**覆盖**：ticket 只在首个真实帧注册一次，恢复时
+    //    `submit_gpu` 看到 ticket 已存在就不会再注册。
+    let sink = renderer.frame_sink();
+    let window = app.window_mut(id).ok_or_else(|| {
+        recovery_invariant("device recovery: the window disappeared while it was rebuilt")
+    })?;
+    if window.has_compositor_ticket()
+        && let Some(sink) = sink
+    {
+        crate::render::compositor_thread::compositor().register(id, sink);
+    }
+    window.set_renderer(renderer);
+    // 图层几何 / 目标尺寸写回 AppKit 真值（新 renderer 从它自己的 `size` 起算，这里同步 UI 侧）。
+    window.set_surface(size);
+    // 6) 整帧重发。
+    request_full_republish_after_recovery(window);
+
+    eprintln!(
+        "kytrix: metal device recovered for window {id:?} (GpuCore generation {generation}): \
+         {reason}; main-thread stall {:.1} ms (old GPU thread join {:.1} ms); \
+         visible gap ~1-3 frames",
+        started.elapsed().as_secs_f64() * 1e3,
+        join_stall.as_secs_f64() * 1e3
+    );
+    Ok(())
+}
+
+/// 恢复后的 UI 侧整帧重发（C4 的第 6 步）。
+///
+/// `Window::force_full_republish` 一次性置齐三个效果（与合成线程重启的路径同一 API）：
+/// 1. `delta_builder.force_full()` ⇒ 下一帧发布**全部** lane 且 `SceneDelta::full`（整块实例缓冲）；
+/// 2. `full_damage_pending` ⇒ 下一帧的 damage 是 `Plan::Full`（新 persist 覆盖不到的区域没有
+///    其它 clear 路径）；
+/// 3. `request_repaint()` ⇒ 确保下一次泵真的会出这一帧（不依赖外部输入）。
+fn request_full_republish_after_recovery(window: &mut Window) {
+    window.force_full_republish();
 }
 
 /// 逐窗口提交一帧；`Err` 立刻终止（device lost / swapchain 失败都不可重试）。
@@ -704,4 +903,140 @@ unsafe extern "C-unwind" fn timer_callback(_timer: *mut CFRunLoopTimer, info: *m
     // SAFETY: 同 `pump_callback`。
     let state = unsafe { &mut *(info as *mut LoopState) };
     pump_and_stop(state, true);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use smol_str::SmolStr;
+
+    use super::{RecoveryDisposition, recovery_disposition, request_full_republish_after_recovery};
+    use crate::{error::EngineError, window::WindowOptions};
+
+    /// 恢复判定：只有 `DeviceLost` 触发整 renderer 重建，其它 GPU 错误保持致命。
+    ///
+    /// 变异守卫：把 `recovery_disposition` 改成「所有错误都 Rebuild」会让后半段断言变红；
+    /// 改成「所有错误都 Fatal」会让前半段变红。真实进程行为由 `acceptance window` 的注入
+    /// e2e 覆盖（删掉泵内恢复分支 ⇒ 进程以错误退出）。
+    #[test]
+    fn only_device_lost_triggers_a_renderer_rebuild() {
+        let lost = EngineError::DeviceLost {
+            reason: SmolStr::new_static("MTLCommandBufferError(11) DeviceRemoved"),
+            log_path: PathBuf::from("/tmp/kytrix-metal-diagnostics.txt"),
+        };
+        assert_eq!(
+            recovery_disposition(&lost),
+            RecoveryDisposition::Rebuild,
+            "设备丢失必须走整 renderer 重建"
+        );
+        for fatal in [
+            EngineError::Swapchain {
+                detail: SmolStr::new_static("MTLCommandBuffer failed"),
+            },
+            EngineError::AppInit {
+                detail: SmolStr::new_static("metal newTexture: returned nil"),
+            },
+            EngineError::FramePipeline {
+                detail: SmolStr::new_static("compositor inbox closed"),
+            },
+            EngineError::UnsupportedGpu {
+                os: "macos",
+                required: "D8",
+                actual: SmolStr::new_static("no Metal device"),
+            },
+        ] {
+            assert_eq!(
+                recovery_disposition(&fatal),
+                RecoveryDisposition::Fatal,
+                "{fatal:?} 不是设备丢失，不得触发整 renderer 重建（保持致命 + 应用退出）"
+            );
+        }
+    }
+
+    /// **恢复后整帧重发**（C4 的 UI 侧契约；headless 跑，不需要窗口系统）。
+    ///
+    /// 新 renderer 的 GPU 侧实例镜像 / 图集纹理 / persist 都是空的，增量载荷只会填「变化」的
+    /// 段 ⇒ 必须 `Plan::Full` + 重编码全部 lane（AR4 P1-1 的同一条纪律）。这里直接调用恢复
+    /// 驱动用的同一个 helper，钉住「恢复 ⇒ 下一帧整帧」而不是「下一帧仍是增量」。
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn recovery_forces_a_full_republish_of_the_next_frame() {
+        use crate::{
+            app::App,
+            math::{Rect, Scale, Size},
+            node::builder::NodeBuilder,
+            paint::{color::Color, style::PaintSpec},
+            window::FrameOutcome,
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut app = App::new(runtime.handle().clone());
+        let window = app.create_window(WindowOptions {
+            title: SmolStr::new_static("device-recovery"),
+            size: Size::new(320.0, 240.0),
+            scale: Scale::ONE,
+            ..WindowOptions::default()
+        });
+        let root = app.window(window).expect("window").tree().root();
+        let mut nodes = Vec::with_capacity(3);
+        for index in 0..3 {
+            let node = NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, index as f32 * 24.0, 32.0, 20.0))
+                .paint(PaintSpec {
+                    background: Color::WHITE,
+                    ..PaintSpec::default()
+                })
+                .build(app.window_mut(window).expect("window").tree_mut(), root)
+                .expect("box");
+            nodes.push(node);
+        }
+        let _ = app
+            .frame(window)
+            .expect("window")
+            .expect("first full frame");
+        // 前置条件：稳态帧是增量（只改一个节点 ⇒ 只重编码 1 条 lane）。
+        let _ = app
+            .window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .mark_paint(nodes[0]);
+        let _ = app
+            .frame(window)
+            .expect("window")
+            .expect("incremental frame");
+        let view = app.window(window).expect("window");
+        assert_eq!(
+            view.record().expect("record").stats.encoded_lanes,
+            1,
+            "前置条件：稳态帧必须是增量帧"
+        );
+
+        // 恢复驱动在挂上新 renderer 之后调用同一个 helper。
+        request_full_republish_after_recovery(app.window_mut(window).expect("window"));
+        let outcome = app
+            .frame(window)
+            .expect("window")
+            .expect("recovery republish frame");
+        assert!(
+            matches!(outcome, FrameOutcome::Committed(_)),
+            "恢复后的整帧重发必须真的提交"
+        );
+        let record = app
+            .window(window)
+            .expect("window")
+            .record()
+            .expect("record");
+        assert!(
+            record.damage_full,
+            "恢复后第一帧必须是 Plan::Full（新 persist 是空的）"
+        );
+        assert_eq!(
+            record.stats.encoded_lanes, 3,
+            "恢复后必须重编码全部 lane（新 GPU 侧实例镜像是空的）"
+        );
+    }
 }

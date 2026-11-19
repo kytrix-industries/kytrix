@@ -48,14 +48,16 @@ float4 ps_ui(VsOut input) : SV_Target {
 }
 
 float4 ps_textured_image(VsOut input) : SV_Target {
-    float4 texel = image_atlas.Sample(atlas_sampler, input.uv);
+    // 应用注册的静态纹理几何没有页概念：固定采样 layer 0（contract §8）。
+    float4 texel = image_atlas.Sample(atlas_sampler, float3(input.uv, 0.0));
     float4 color = texel * draw.color0;
     return apply_gamma(color * clip_mask(input.world_px, (uint)draw.clip.x,
                                          (uint)KYTRIX_MAX_CLIP_ITEMS));
 }
 
 float4 ps_textured_glyph(VsOut input) : SV_Target {
-    float coverage = glyph_atlas.Sample(atlas_sampler, input.uv).r;
+    // 字形图集恒 1 层：固定采样 layer 0。
+    float coverage = glyph_atlas.Sample(atlas_sampler, float3(input.uv, 0.0)).r;
     float4 color = draw.color0 * coverage;
     return apply_gamma(color * clip_mask(input.world_px, (uint)draw.clip.x,
                                          (uint)KYTRIX_MAX_CLIP_ITEMS));

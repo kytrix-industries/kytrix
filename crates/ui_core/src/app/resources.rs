@@ -6,7 +6,10 @@ use std::sync::Arc;
 
 use super::{App, AppHandle};
 use crate::{
-    error::EngineError, event::Event, platform::dispatcher::Dispatcher, resources::ResourceCache,
+    error::EngineError,
+    event::Event,
+    platform::dispatcher::Dispatcher,
+    resources::{DecodeState, PendingResource, ResourceCache},
     window::WindowId,
 };
 
@@ -20,12 +23,35 @@ pub(crate) fn on_frame(app: &mut App, hook: impl FnMut(&mut App) + 'static) {
 }
 
 /// 调用一次帧钩子（crate 私有；临时 take 以避免 `&mut self` 与闭包参数重叠）。
+///
+/// D-6：钩子之前先轮询一次异步解码结果 —— 应用在钩子里即可取到 `Ready`/`Failed`。
 /// 消费者：`App::run_frame_hook`。
 pub(crate) fn run_frame_hook(app: &mut App) {
+    poll_resources(app);
     if let Some(mut hook) = app.frame_hook.take() {
         hook(app);
         app.frame_hook = Some(hook);
     }
+}
+
+/// 轮询异步解码结果（D-6）：有交付就入缓冲并请求一帧。
+///
+/// 平台泵**每轮**调用（`App::run_frame_hook`），`App::frame` 入口也兜底一次；空闲且没有
+/// pending 时 `poll` 是 O(0)，不产生帧（I3 不变式）。
+/// 消费者：`App::poll_resources`。
+pub(crate) fn poll_resources(app: &mut App) {
+    let results = app.resources.poll();
+    if results.is_empty() {
+        return;
+    }
+    app.pending_resource_results.extend(results);
+    app.request_frame();
+}
+
+/// 取走已交付的异步解码结果（每项只交付一次；缓冲换空、容量归还）。
+/// 消费者：`App::take_resource_results`。
+pub(crate) fn take_resource_results(app: &mut App) -> Vec<(PendingResource, DecodeState)> {
+    core::mem::take(&mut app.pending_resource_results)
 }
 
 /// 跨线程句柄（`AppHandle`）。

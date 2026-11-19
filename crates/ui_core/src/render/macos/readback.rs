@@ -1,4 +1,5 @@
-//! 读回：persist（Private）→ blit 到 Shared buffer → `getBytes` 语义的 CPU 读取
+//! 读回：persist（Private）/ 图集 texture array 的某一层 → blit 到 Shared buffer → `getBytes`
+//! 语义的 CPU 读取
 //!
 //! 字节语义与 D3D12 同契约：`BGRA8Unorm_sRGB` 的存储字节是 **sRGB 编码后的预乘值**，
 //! 读回后只做 BGRA→RGBA 交换（不再做色彩转换）。仅测试 / `test-support` 构建存在。
@@ -39,12 +40,15 @@ impl Readback {
     }
 
     /// persist(Private) → blit 到 Shared buffer → 逐行去 padding → BGRA→RGBA。
+    ///
+    /// `layer` 是 texture array 的层号（非数组纹理传 0；D-9-c 的图集读回按层验证）。
     pub(crate) fn capture(
         &mut self,
         device: &Device,
         queue: &Queue,
         texture: &ProtocolObject<dyn MTLTexture>,
         size: (u32, u32),
+        layer: u16,
     ) -> Result<ReadbackImage, EngineError> {
         let row_bytes = size.0 as usize * 4;
         let total = row_bytes * size.1 as usize;
@@ -63,11 +67,12 @@ impl Readback {
         let blit = buffer
             .blitCommandEncoder()
             .ok_or_else(|| init_error("readback", "blitCommandEncoder returned nil"))?;
-        // SAFETY: 源纹理与目标 buffer 都由本结构独占；尺寸与行 pitch 在两者容量内。
+        // SAFETY: 源纹理与目标 buffer 都由本结构独占；尺寸与行 pitch 在两者容量内；
+        // `layer` 由调用方保证在源 texture array 的层数内。
         unsafe {
             blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
                 texture,
-                0,
+                usize::from(layer),
                 0,
                 MTLOrigin { x: 0, y: 0, z: 0 },
                 MTLSize {

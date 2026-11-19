@@ -57,7 +57,7 @@ use crate::{
     },
     platform::dispatcher::{Dispatcher, UserTask},
     render::{AtlasAllocator, MIN_ATLAS_PAGE},
-    resources::ResourceCache,
+    resources::{DecodeState, PendingResource, ResourceCache},
     text::{
         FontStack, FontStackStatus, TextDiagnostic, TextLayoutReport, TextPassReport,
         atlas::GlyphAtlas, context::TextContext, raster::GlyphRasterizer,
@@ -68,10 +68,11 @@ use crate::{
 /// a11y 诊断的环形容量（与 `text_diagnostics` 同口径：超出丢最旧）。
 const A11Y_DIAGNOSTIC_CAPACITY: usize = 64;
 
-/// a11y 交付的最小间隔（按窗口；P2-6）。
+/// a11y 交付的最小间隔（按窗口；P2-6 / E5）。
 ///
-/// 100 ms 对应 10 Hz：屏幕阅读器自身也消化不了更快的变化，而实时行情会让 A11Y`r
-/// 脏位每帧为真 —— 不限流时每帧都要全树扫描并构造 TreeUpdate。
+/// 100 ms 对应 10 Hz：屏幕阅读器自身也消化不了更快的变化，而实时行情会让 A11Y 脏位每帧为真。
+/// **只约束「已接入后」的高频数据增量**（E5）：首树 / DPI 全量重建的分批（[`A11yBridge::backlog`]）
+/// 与焦点变化、消费端重置一样走不节流旁路 —— 否则 40k 节点的 20 批首树会被拖成 ≈2 s。
 const A11Y_THROTTLE: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// 一次样式求值 pass 的结果（P06 的 `FrameRecord` 会复用这些字段）。
@@ -113,6 +114,10 @@ pub struct App {
     atlas: AtlasAllocator,
     /// 图片资源缓存（解码 + 图片图集页；与字形页分图集，且**不随 DPI 换代**，P13 §8.1）。
     resources: ResourceCache,
+    /// 异步解码已交付、等待应用取走的结果（D-6）。`App::poll_resources` 每轮填充；
+    /// 应用在 `on_frame` 钩子里用 [App::take_resource_results] 消费（把 Ready tile 换到节点 /
+    /// Failed 画占位）。缓冲只由 UI 线程读写，取走时 `mem::take` 换空（容量归还）。
+    pending_resource_results: Vec<(PendingResource, DecodeState)>,
     /// 静态几何的注册表（进程级；设备无关的 CPU 字节，各后端自缓存 GPU 缓冲）。
     geometry: crate::paint::geometry_store::GeometryStore,
     /// 字形 `key → tile` 缓存（与图集同事务换代）。
@@ -172,6 +177,10 @@ pub struct App {
     /// TreeUpdate 构造。按窗口限流到 A11Y_THROTTLE 一次，屏幕阅读器本身也消化不了
     /// 更快的变化。Assertive live region 同样受此限制（≤100ms 延迟，可接受）。
     a11y_delivered: ahash::HashMap<WindowId, Instant>,
+    /// **本轮泵**是否真的交付过一笔 a11y（`a11y_take` 产出过快照才置位；平台泵的
+    /// `wake_for_a11y_backlog` 消费并清零）。无 AT 客户端 / 无测试捕获时恒 false ⇒ 泵绝不
+    /// 因 a11y backlog 自唤醒（RE-05 / I3 空闲零唤醒）。
+    a11y_delivered_round: bool,
     /// 最近一次点击（双击判定）。
     last_click: Option<ClickRecord>,
     /// 动画槽（P10；`tick_animations` 推进，结束时删槽）。
@@ -393,6 +402,10 @@ impl App {
     /// 也不做 `Handle::current()`（在 runtime 之外会 panic，且会让引擎依赖「调用线程恰好在 runtime 内」）。
     #[must_use]
     pub fn new(runtime: tokio::runtime::Handle) -> Self {
+        // D-6：`ResourceCache` 需要同一个 `Dispatcher` 在解码完成时唤醒泵（空闲时泵阻塞在
+        // `GetMessageW`/`poll`，没有唤醒就永远不会有人调 `poll()`）。字段顺序要求它先于
+        // `resources` 构造，因此提到结构体字面量之前。
+        let dispatcher = Dispatcher::new();
         Self {
             store: StateStore::with_capacity(64, 16),
             graph: DependencyGraph::new(),
@@ -407,7 +420,8 @@ impl App {
                 crate::paint::atlas::AtlasKind::Glyph,
                 (MIN_ATLAS_PAGE, MIN_ATLAS_PAGE),
             ),
-            resources: ResourceCache::new(runtime),
+            resources: ResourceCache::new(runtime, Arc::clone(&dispatcher)),
+            pending_resource_results: Vec::new(),
             geometry: crate::paint::geometry_store::GeometryStore::new(),
             glyph_atlas: GlyphAtlas::new(),
             text_dirty_scratch: Vec::new(),
@@ -418,7 +432,7 @@ impl App {
             glyph_page_extent: None,
             glyph_page: Vec::new(),
             packed: Vec::new(),
-            dispatcher: Dispatcher::new(),
+            dispatcher,
             events: event_queue::EventQueue::new(),
             held_keys: ahash::HashMap::default(),
             frame_hook: None,
@@ -428,6 +442,7 @@ impl App {
             thresholds: InputThresholds::platform_default(),
             clock: Instant::now(),
             a11y_delivered: ahash::HashMap::default(),
+            a11y_delivered_round: false,
             last_click: None,
             animations: Vec::new(),
             next_animation: 1,
@@ -456,8 +471,29 @@ impl App {
     }
 
     /// 调用一次帧钩子（crate 私有；临时 take 以避免 `&mut self` 与闭包参数重叠）。
+    ///
+    /// D-6 起钩子之前先轮询一次异步解码结果（`App::poll_resources`）：平台泵每轮都会调用本函数，
+    /// 因此解码完成（工作线程已 `Dispatcher::wake`）后，结果会在这一轮交付并请求一帧。
     pub(crate) fn run_frame_hook(&mut self) {
         resources::run_frame_hook(self)
+    }
+
+    /// 轮询图片异步解码结果并请求一帧（D-6）。
+    ///
+    /// 交付项进入 [`App::take_resource_results`] 的缓冲；有交付才 `request_frame`（空闲
+    /// 无 pending 时不产生帧，I3 不变式保持）。平台泵的 `run_frame_hook` 每轮调用一次；
+    /// `App::frame` 入口也兜底调用（headless / 自驱帧宿主）。
+    pub(crate) fn poll_resources(&mut self) {
+        resources::poll_resources(self)
+    }
+
+    /// 取走已交付的异步解码结果（D-6 的公开消费面）。
+    ///
+    /// 应用在 `on_frame` 钩子里取走并把 `Ready(ResourceImage)` 应用到节点（例如
+    /// `Window::set_canvas`）或对 `Failed(DecodeCause)` 画占位/记录；每项只交付一次。
+    /// 任务仍在途时返回空列表（稍后的轮次再交付）。
+    pub fn take_resource_results(&mut self) -> Vec<(PendingResource, DecodeState)> {
+        resources::take_resource_results(self)
     }
 
     /// 跨线程句柄（`AppHandle`）。
@@ -532,7 +568,8 @@ impl App {
         text_pass::upload_glyph_page(self)
     }
 
-    /// 图片页分发：懒分配（没插过图片就没有页）+ 按脏矩形（AOI）增量（DEVIATIONS F-211 / R06-3）。
+    /// 图片图集分发：懒分配（没插过图片就没有页）+ 逐层整页 / 按脏矩形（AOI）增量
+    /// （DEVIATIONS F-211 / R06-3；D-9-c 起图片图集是 4 层 texture array，layer = 页号）。
     fn upload_image_page(&mut self) {
         text_pass::upload_image_page(self)
     }
@@ -543,10 +580,11 @@ impl App {
         text_pass::glyph_page_pixels(self)
     }
 
-    /// 图片页的当前内容（BGRA8 预乘 sRGB；`TestApp::snapshot` 的上传源）；没插过图片时 `None`。
+    /// 全部已打开图片页的当前内容（BGRA8 预乘 sRGB；`TestApp::snapshot` 的逐层上传源）。
+    /// 没有图片页时是空集；顺序 = 层号升序。
     #[cfg(feature = "test-support")]
-    pub(crate) fn resource_page_pixels(&self) -> Option<((u32, u32), &[u8])> {
-        text_pass::resource_page_pixels(self)
+    pub(crate) fn resource_page_pixels_all(&self) -> Vec<((u32, u32), &[u8])> {
+        text_pass::resource_page_pixels_all(self)
     }
 
     /// 图片资源缓存（只读）。应用层在**建树时**用 [`App::resources_mut`] 换 `AtlasTile`。
@@ -1792,6 +1830,18 @@ impl App {
         a11y::a11y_pending(self, window)
     }
 
+    /// 建窗路径的 a11y 消费端代际句柄（三端唯一入口；RE-01）。
+    ///
+    /// 与窗口 `A11yBridge` 的 `consumer_epoch` 是**同一份** `Arc`：平台 adapter 的激活/停用
+    /// 回调 bump 它，引擎才能观察到「消费端已重置」并把下一笔升成全树。`None` = 窗口不存在。
+    #[must_use]
+    pub(crate) fn window_a11y_epoch(
+        &self,
+        window: WindowId,
+    ) -> Option<crate::a11y::adapter::A11yConsumerEpoch> {
+        a11y::window_a11y_epoch(self, window)
+    }
+
     /// 是否有窗口「a11y 脏但正被限流」——平台泵据此安排**到期补发**唤醒。
     ///
     /// 没有这条，被限流挡下的最后一次变化永远不会交付：脏位留着，但没有任何机制在
@@ -1800,6 +1850,20 @@ impl App {
         a11y::a11y_retry_pending(self)
     }
 
+    /// 是否还有未交付的 a11y 批次（分批首树/DPI 全量重建未走完；不节流旁路，E5）。
+    #[must_use]
+    pub(crate) fn a11y_backlog_pending(&self) -> bool {
+        a11y::a11y_backlog_pending(self)
+    }
+
+    /// 本轮泵交付过 a11y 且仍有未走完的批次时唤醒平台泵
+    /// （三端唯一入口；E5/RE-04/RE-05）。
+    pub(crate) fn wake_for_a11y_backlog(
+        &mut self,
+        dispatcher: &crate::platform::dispatcher::Dispatcher,
+    ) {
+        a11y::wake_for_a11y_backlog(self, dispatcher)
+    }
     /// 产出一笔 a11y 交付（消费 `A11Y` 反向集合与 `full_pending`）。
     ///
     /// **必须在 `accesskit_windows::Adapter::update_if_active` 的闭包里调用**（adapter 不活跃时

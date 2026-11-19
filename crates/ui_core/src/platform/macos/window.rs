@@ -289,12 +289,15 @@ impl NativeWindow {
     ///
     /// `cascade_index` 是「本窗口是本次运行创建的第几个」：`WindowOptions.position = None`
     /// 时用于平台默认的级联摆放（B3，见 `macos_placement::cascade_position`）。
+    /// `a11y_consumer_epoch` 是窗口的消费端代际句柄（与引擎 `A11yBridge` 共享）：AX 重新激活
+    /// 时激活回调 `bump()` 它，引擎把下一笔升成全树（E1）。
     pub(crate) fn create(
         mtm: MainThreadMarker,
         id: WindowId,
         options: &WindowOptions,
         dispatcher: &Arc<Dispatcher>,
         cascade_index: usize,
+        a11y_consumer_epoch: crate::a11y::adapter::A11yConsumerEpoch,
     ) -> Result<Self, EngineError> {
         let style = NSWindowStyleMask::Titled
             | NSWindowStyleMask::Closable
@@ -400,7 +403,7 @@ impl NativeWindow {
 
         // 原生交通灯全部保留：关闭 / 最小化 / 缩放。标题栏透明且标题隐藏，内容铺满窗口，
         // 因此窗口控件浮在内容上方（应用用顶部安全区避让）。
-        let a11y = MacA11y::new(&view, dispatcher.clone(), id)?;
+        let a11y = MacA11y::new(&view, dispatcher.clone(), id, a11y_consumer_epoch)?;
         view.install_a11y(a11y);
 
         // 关闭拦截：关闭按钮 / Cmd-W / 菜单 Close 都先到 view 的 `performClose:`（只置位 +
@@ -466,10 +469,21 @@ impl NativeWindow {
 
     /// 把渲染器的 `CAMetalLayer` 挂到 view 上（`wantsLayer` 已在 `create` 里打开）。
     ///
-    /// 只在这里把 layer 交给 AppKit；`contentsScale` / `drawableSize` 的唯一写者是**主线程**的
-    /// `Renderer::set_layer_scale`（§5.3），GPU 线程只读 drawable 的实际尺寸。
+    /// 只在这里把 layer 交给 AppKit；`contentsScale` / `drawableSize` / 几何的唯一写者是**主线程**
+    /// 的 `Renderer::set_layer_scale`（§5.3 / C6），GPU 线程只读 drawable 的实际尺寸。
+    ///
+    /// 挂上之后立刻用 **view bounds 的精确点**再写一次 layer 几何（C6）：`new_layer` 建层时用的是
+    /// `backing / scale`（半像素对齐时可能差 `0.5/scale` pt），这里拿得到 view 的真值。
+    /// layer-hosting 的几何责任在 App 侧（Apple `NSView.wantsLayer`），图层在 `setLayer:` 之前
+    /// frame 是 zero；真机定案表明 AppKit 也会同步同样的值 ⇒ 本次写入是幂等防御（见
+    /// `swapchain::set_layer_geometry` 的文档）。
     pub(crate) fn attach_layer(&self, layer: Retained<CAMetalLayer>) {
         self.view.setLayer(Some(&layer));
+        let bounds = self.view.bounds();
+        crate::render::macos::swapchain::set_layer_geometry(
+            &layer,
+            (bounds.size.width, bounds.size.height),
+        );
     }
 
     pub(crate) fn show(&self) {

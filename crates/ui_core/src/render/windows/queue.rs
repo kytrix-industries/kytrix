@@ -74,13 +74,19 @@ impl WaitOutcome {
     }
 }
 
-/// 一个提交流的**水位**：它的 fence + 最后一次提交的 signal 值。
+/// 一个提交流的**水位**：它的 fence + 最后一次提交的 signal 值 + 每一代图集描述符组的弃用水位。
 ///
 /// 共享侧（[`SharedGpu`]）只持有 `Weak`：窗口销毁后条目自然失效。图集页换代用它界定
-/// 「哪些在飞工作引用了旧纹理」。
+/// 「哪些在飞工作引用了旧纹理」（C3 双代描述符）。
 pub(crate) struct StreamWatermark {
     fence: ID3D12Fence,
     value: AtomicU64,
+    /// 该流最后一次**使用某一代**图集描述符组时的提交序号（0 = 从未使用）。
+    ///
+    /// 换代（active → target）时由 `SharedGpu` 把各流的当前 `value` 写进**被弃用**那一代；
+    /// 只有 `fence.GetCompletedValue() >= 该值` 时，该代才允许被重新写入 + 重新启用
+    /// （此时该代的全部在飞引用都已执行完）。
+    retired: [AtomicU64; 2],
 }
 
 impl StreamWatermark {
@@ -88,12 +94,31 @@ impl StreamWatermark {
         Self {
             fence,
             value: AtomicU64::new(0),
+            retired: [AtomicU64::new(0), AtomicU64::new(0)],
         }
     }
 
-    /// 该流的 fence（页换代时逐条等水位用）。
-    pub(crate) fn fence(&self) -> ID3D12Fence {
-        self.fence.clone()
+    /// 登记「本流最后一次使用 `generation` 代」的提交序号（C3；由页换代在**图集写锁内**调用，
+    /// 此时本流不可能有新提交）。
+    pub(crate) fn retire_generation(&self, generation: u8, value: u64) {
+        debug_assert!(
+            (generation as usize) < self.retired.len(),
+            "atlas generation out of range"
+        );
+        self.retired[generation as usize].store(value, Ordering::Release);
+    }
+
+    /// 该代是否已无在飞引用（非阻塞：只读 fence 完成值）。从未被弃用的代恒为真。
+    pub(crate) fn generation_idle(&self, generation: u8) -> bool {
+        let retired = match self.retired.get(generation as usize) {
+            Some(retired) => retired.load(Ordering::Acquire),
+            None => return true,
+        };
+        if retired == 0 {
+            return true;
+        }
+        // SAFETY: fence 由本流持有，调用期间有效；只读查询完成值。
+        (unsafe { self.fence.GetCompletedValue() }) >= retired
     }
 
     /// 提交成功后推进水位（`Release`：页换代在写锁内 `Acquire` 读取）。
@@ -104,6 +129,15 @@ impl StreamWatermark {
     /// 当前水位（0 = 该流从未提交）。
     pub(crate) fn value(&self) -> u64 {
         self.value.load(Ordering::Acquire)
+    }
+
+    /// 测试专用：把水位直接设成给定提交序号（生产写入点是 `publish`，只在真实提交后调用）。
+    ///
+    /// review-c RC-3 需要「流使用过某一代、但 fence 尚未完成」这个状态来测试换代捕获侧：
+    /// 只有直接设值才能在 WARP 上确定性构造（真实 submit 后 fence 可能立刻完成，测试会 flaky）。
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(&self, value: u64) {
+        self.publish(value);
     }
 }
 

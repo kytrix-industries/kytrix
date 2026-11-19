@@ -6,8 +6,9 @@
 //!
 //! **本模块只产设备级对象**（R09-5 / R09-13）：两个 `MTLLibrary`（[`ShaderSet`]）与按
 //! [`PipelineKey`] 缓存的 `MTLRenderPipelineState`。缓存与"进程内只加载一次"的所有权在
-//! [`super::core::GpuCore`]（`OnceLock<Arc<GpuCore>>`）；窗口级对象只剩
-//! drawable / persist / 上传槽 / display link。
+//! [`super::core::GpuCore`]（可替换的进程级注册表，见 `core.rs` 的「设备恢复」）；窗口级对象
+//! 只剩 drawable / persist / 上传槽 / display link。设备恢复会换一个新 `GpuCore`（新
+//! `MTLDevice` ⇒ 旧 PSO/ metallib 一律作废），新窗口的 PSO 在新 core 上按同一套键重新懒编译。
 //!
 //! PSO 缓存键 = **决定 PSO 的全部输入**：目标像素格式、颜色附件混合模式、顶点布局。
 //!

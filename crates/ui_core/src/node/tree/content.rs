@@ -1,6 +1,6 @@
 //! 节点内容与旁表读写：文本 / a11y 载荷 / 绑定闭包 / 交互槽 / lane / clip。
 
-use std::rc::Rc;
+use std::{rc::Rc, sync::Arc};
 
 use smallvec::SmallVec;
 use smol_str::SmolStr;
@@ -23,6 +23,30 @@ use crate::{
 /// 文本载荷（`None` = 不是文本节点）。消费者：`App::refresh_styles` / `App::refresh_text`。
 pub(crate) fn text_content(tree: &NodeTree, node: NodeId) -> Option<&TextContent> {
     tree.arena.get(node).and_then(|target| target.kind.text())
+}
+
+// 消费者：`impl NodeTree::set_canvas` 的薄委托（外部调用点见该方法文档）。
+/// 替换 `Canvas` 节点的画布内容（D-6：异步图片交付的落地入口）。
+///
+/// 只接受 `NodeKind::Canvas` 节点；替换后标该节点**子树** `PAINT`（lane 重建 ⇒ damage 来自
+/// 重建后的图元，不会退化成整窗重绘）。不改变布局：Canvas 节点尺寸仍由布局决定。
+/// `AtlasTile` 的生命周期由调用方持有的 `ResourceImage` 决定 —— 引擎不会在替换时保留/延长
+/// 旧 tile，也不会自动 `unload` 旧资源。
+/// 返回 `false` = 节点不存在 / 不是 Canvas（**不**改动任何状态）。
+pub(crate) fn set_canvas(
+    tree: &mut NodeTree,
+    node: NodeId,
+    canvas: crate::paint::canvas::Canvas,
+) -> bool {
+    let Some(target) = tree.arena.get_mut(node) else {
+        return false;
+    };
+    let NodeKind::Canvas(existing) = &mut target.kind else {
+        return false;
+    };
+    *existing = Arc::new(canvas);
+    tree.mark_subtree_paint(node);
+    true
 }
 
 // 消费者：`impl NodeTree::set_text_content` 的薄委托（外部调用点见该方法文档）。
@@ -366,6 +390,23 @@ fn expected_layout_width(tree: &NodeTree, shaped: &ShapedText, node: NodeId) -> 
     }
 }
 
+// 消费者：`impl NodeTree::invalidate_text_line` 的薄委托（外部调用点见该方法文档）。
+/// 让**单个**文本节点的 ShapedLine 失效并进入重排队列（D-5）。
+///
+/// 与整树的 [invalidate_text_lines] 同语义（清 line + laid_* 失配 + mark_paint），但只动
+/// 一个节点：绘制前硬校验的 stale 集合通常只有 0~几个节点，没必要整窗重排。
+pub(crate) fn invalidate_text_line(tree: &mut NodeTree, node: NodeId) {
+    let index = node.index() as usize;
+    let Some(slot) = tree.text_slots.get_mut(index).and_then(Option::as_mut) else {
+        return;
+    };
+    slot.line = None;
+    slot.laid_width_bits = 0;
+    slot.laid_generation = 0;
+    tree.mark_text_layout_dirty(node);
+    tree.mark_paint(node);
+}
+
 // 消费者：`impl NodeTree::invalidate_text_layout` 的薄委托（外部调用点见该方法文档）。
 /// 文本节点的布局失效（= `invalidate_measure` + 补 `PAINT`，F-56）。
 pub(crate) fn invalidate_text_layout(tree: &mut NodeTree, node: NodeId) -> bool {
@@ -395,36 +436,6 @@ pub(crate) fn mark_all_text_dirty(tree: &mut NodeTree) {
         tree.mark_text_dirty(node);
         tree.mark_text_layout_dirty(node);
     }
-}
-
-// 消费者：`impl NodeTree::mark_all_text_paint` 的薄委托（外部调用点见该方法文档）。
-/// 把所有文本节点标 `PAINT`（**不动** `LAYOUT`），P1-2.6。
-///
-/// 用途：字形图集是**进程级**共享的，任一窗口的 DPI 变化或容量逃逸都会让
-/// `AtlasAllocator::generation` 递增、页内所有 tile 重排。此时每个窗口文本节点的
-/// `ShapedLine` 里存的是旧 `AtlasTile`（旧 UV），而 paint 的 lane 复用只认
-/// `REUSABLE`/`clip_key` —— 不标 `PAINT` 就会继续画旧 UV，表现为错字/花字。
-///
-/// 只标 `PAINT` 不标 `LAYOUT`：图集换代不改变字形宽度/行数，不需要重排（重排是纯损失）。
-/// 返回被标记的节点数（诊断 / 测试）。
-pub(crate) fn mark_all_text_paint(tree: &mut NodeTree) -> usize {
-    let mut nodes: Vec<NodeId> = Vec::new();
-    tree.for_each_dfs(|node| {
-        if tree
-            .arena
-            .get(node)
-            .is_some_and(|target| target.kind.text().is_some())
-        {
-            nodes.push(node);
-        }
-    });
-    let mut marked = 0;
-    for node in nodes {
-        if tree.mark_paint(node) {
-            marked += 1;
-        }
-    }
-    marked
 }
 
 // 消费者：`impl NodeTree::take_bind_text` 的薄委托（外部调用点见该方法文档）。

@@ -18,8 +18,8 @@ use crate::{
         A11yScroll,
         identity::{A11yIds, A11yKey},
         mapping::{
-            a11y_disabled, bounds_of, effective_actions, effective_description, effective_label,
-            effective_role, effective_value, is_hidden,
+            a11y_disabled, a11y_read_only, bounds_of, effective_actions, effective_description,
+            effective_label, effective_role, effective_value, is_hidden,
         },
         textrun,
     },
@@ -116,7 +116,9 @@ pub(crate) fn node_a11y_with_cache(
     let checked = patch.and_then(|patch| patch.checked);
     let hidden = is_hidden(target, role, label.as_ref(), over, patch);
     let disabled = a11y_disabled(tree, node);
-    let actions = effective_actions(tree, node, role, over, patch, disabled);
+    // `read_only` 必须在能力计算之前求（E3：能力集 = 分发判据，read_only 剔除值变更类动作）。
+    let read_only = a11y_read_only(tree, node);
+    let actions = effective_actions(tree, node, role, over, patch, disabled, read_only);
 
     // 诊断：自绘缺替代文本（§5.4）、交互节点无名（§5.2）。
     if role == A11yRole::Image
@@ -170,17 +172,27 @@ pub(crate) fn node_a11y_with_cache(
         }
     }
 
-    // 文本语义（A5）：`character_lengths` / `word_starts` 只对"文本就是 value"的角色有意义。
+    // 文本语义（A5/E4a）：`character_lengths` / `word_starts` 只对"文本就是 value"的角色有意义。
+    //
+    // `TextInput` / `MultilineTextInput` **不**携带字符语义（E4a 契约收窄）：AccessKit 的
+    // `TextPosition.node` 必须指向 `Role::TextRun`，输入框的字符语义由它的子文本运行承担；
+    // 输入框自身只承载 `value`（+ 可选选区属性，但 `text_selection` 只挂 TextRun）。
     let text_metrics = match role {
-        A11yRole::Label
-        | A11yRole::TextRun
-        | A11yRole::TextInput
-        | A11yRole::MultilineTextInput => value.as_deref().and_then(textrun::text_metrics),
+        A11yRole::Label | A11yRole::TextRun => value.as_deref().and_then(textrun::text_metrics),
         _ => None,
     };
     let (character_lengths, word_starts) = text_metrics.unwrap_or_default();
+    // 字符度量（E4b）：只有 TextRun 且能**正确表达**（单行 + 显式 LTR + shape 与文本一致）时
+    // 才发 `character_positions` / `character_widths`；否则留空让 AT 回退。
+    let (character_positions, character_widths) = if role == A11yRole::TextRun {
+        textrun::character_metrics(tree, node, &character_lengths, scale).unwrap_or_default()
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    // 选区只挂 `TextRun`（AccessKit 契约：`TextPosition.node` 必须是 TextRun，否则 consumer
+    // 静默丢弃整段选区）；输入框的选区由子 TextRun 承载，输入框自身不生成。
     let text_selection = match role {
-        A11yRole::TextRun | A11yRole::TextInput | A11yRole::MultilineTextInput => patch
+        A11yRole::TextRun => patch
             .and_then(|patch| patch.selection)
             .or_else(|| over.and_then(|over| over.selection))
             .map(|selection| textrun::selection(&character_lengths, selection)),
@@ -200,11 +212,7 @@ pub(crate) fn node_a11y_with_cache(
             .get(node)
             .is_ok_and(|state| state.style().clip != Clip::None);
 
-    // 表单 / 状态属性（R13-14）。
-    let read_only = patch
-        .and_then(|patch| patch.read_only)
-        .or_else(|| over.map(|over| over.read_only))
-        .unwrap_or(false);
+    // 表单 / 状态属性（R13-14）。`read_only` 已在能力计算之前求（E3）。
     let modal = patch
         .and_then(|patch| patch.modal)
         .or_else(|| over.map(|over| over.modal))
@@ -321,6 +329,8 @@ pub(crate) fn node_a11y_with_cache(
         custom_actions,
         character_lengths,
         word_starts,
+        character_positions,
+        character_widths,
         text_selection,
         read_only,
         modal,
@@ -694,7 +704,7 @@ mod tests {
 
     use super::{collect_subtree, push_ancestors, resolve_focus};
     use crate::{
-        a11y::{A11yOverride, A11yRole, A11ySort, identity::A11yIds},
+        a11y::{A11yAction, A11yOverride, A11yRole, A11ySort, identity::A11yIds},
         math::Scale,
         node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
         text::TextStyle,
@@ -1288,5 +1298,86 @@ mod tests {
         assert_ne!(a.id, b.id, "不同节点不得共享 id");
         assert_eq!(a.parent, ids.stable_of(root), "父 id 来自同一分配器");
         assert_eq!(ids.sizes().0, 3, "root + first + second 各一个引擎绑定");
+    }
+
+    /// E4a：`text_selection` **只挂 `TextRun`**（AccessKit 的 `TextPosition.node` 硬约束）：
+    /// 打在输入框上的选区补丁必须被忽略；字符语义也收窄到 `TextRun`（输入框只承载 `value`）。
+    #[test]
+    fn text_selection_only_lives_on_text_run() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let input = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::TextInput),
+                label: Some(smol_str::SmolStr::new_static("搜索")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("input");
+        let text = NodeBuilder::text("价🌍ab", TextStyle::new(12.0))
+            .build(&mut tree, input)
+            .expect("text run");
+        let selection = crate::a11y::A11yTextSelection {
+            anchor: 0,
+            focus: 3,
+        };
+        tree.set_a11y_patch(
+            input,
+            crate::a11y::A11yPatch {
+                selection: Some(selection),
+                ..crate::a11y::A11yPatch::default()
+            },
+        );
+        tree.set_a11y_patch(
+            text,
+            crate::a11y::A11yPatch {
+                selection: Some(selection),
+                ..crate::a11y::A11yPatch::default()
+            },
+        );
+
+        let mut diagnostics = Vec::new();
+        let mut ids = A11yIds::new();
+        let input_snapshot =
+            super::node_a11y(&tree, input, Scale::ONE, "", &mut ids, &mut diagnostics)
+                .expect("input snapshot");
+        assert!(
+            input_snapshot.character_lengths.is_empty(),
+            "输入框不携带字符语义（由子 TextRun 承担）"
+        );
+        assert_eq!(
+            input_snapshot.text_selection, None,
+            "打在输入框上的选区必须被忽略（consumer 只认 TextPosition.node = TextRun）"
+        );
+        assert!(input_snapshot.actions.contains(&A11yAction::SetValue));
+        assert!(
+            !input_snapshot
+                .actions
+                .contains(&A11yAction::SetTextSelection),
+            "输入框默认只宣告 SetValue，选区能力挂在 TextRun 上"
+        );
+
+        let run_snapshot =
+            super::node_a11y(&tree, text, Scale::ONE, "", &mut ids, &mut diagnostics)
+                .expect("text run snapshot");
+        assert_eq!(run_snapshot.role, A11yRole::TextRun);
+        assert_eq!(run_snapshot.character_lengths, vec![3, 4, 1, 1]);
+        // E4b：未 shape 的 TextRun **省略**字符度量（AT 回退到无 caret 高亮），绝不发错位置。
+        assert!(
+            run_snapshot.character_positions.is_empty() && run_snapshot.character_widths.is_empty(),
+            "未 shape 的文本不得输出 character_positions/widths"
+        );
+        assert_eq!(
+            run_snapshot.text_selection,
+            Some(crate::a11y::A11yTextSelection {
+                anchor: 0,
+                focus: 1
+            }),
+            "字节 3（emoji 之后）= grapheme 1"
+        );
+        assert!(
+            run_snapshot.actions.contains(&A11yAction::SetTextSelection),
+            "TextRun 默认宣告 SetTextSelection"
+        );
     }
 }

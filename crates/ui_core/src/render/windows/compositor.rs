@@ -57,7 +57,7 @@ use crate::render::windows::readback::{Readback, ReadbackImage};
 use crate::{
     error::EngineError,
     paint::atlas::AtlasKind,
-    platform::windows::composition::{self, Composition, buffer_size},
+    platform::windows::composition::{self, Composition, CompositionState, buffer_size},
     render::{
         RenderStats,
         compositor::{DamageRects, FramePlan},
@@ -240,6 +240,10 @@ impl GpuRenderer {
     ///
     /// 图集内容由 `SharedGpu::recover` 按 CPU 影子页重传，因此恢复后的窗口仍有字形与图片。
     /// 失败时把新的 `DeviceLost` 交回调用方（GPU 循环据此上报粘性错误）。
+    ///
+    /// C2：D3D12 设备丢失后，旧 DirectComposition 设备 / visual tree 与旧交换链的关联不可信
+    /// （MS《Best practices for DirectComposition》：设备失效要新建设备并重建全部内容），因此这里
+    /// 先整树重建、再由 [`Self::build_window`] 把新交换链挂回重建后的 visual。
     pub(crate) fn recover(self) -> Result<Self, EngineError> {
         let Some(composition) = self.composition.clone() else {
             return Err(EngineError::AppInit {
@@ -253,8 +257,54 @@ impl GpuRenderer {
         let stale = Arc::clone(&self.shared);
         // 设备已经丢了：`Drop` 不等待、只把句柄归还给（即将销毁的）句柄表。
         drop(self);
+        // C2：在 GPU 线程重建 DComp 设备 / visual tree（旧的 SetContent 引用已随 renderer drop 失效）。
+        composition::lock(&composition).rebuild()?;
         let shared = SharedGpu::recover(&stale)?;
         Self::build_window(shared, composition, content, background)
+    }
+
+    /// 当前 DirectComposition 合成设备的健康状态（C2；GPU 线程 / 泵的检查点调用）。
+    ///
+    /// 离屏渲染器没有 DComp（`composition == None`）：按 [`CompositionState::WindowClosed`] 处理，
+    /// 调用方不会对它发起重建。
+    pub(crate) fn composition_state(&self) -> CompositionState {
+        match self.composition.as_ref() {
+            Some(composition) => composition::lock(composition).check_device_state(),
+            None => CompositionState::WindowClosed,
+        }
+    }
+
+    /// **只重建 DirectComposition 设备 / visual tree**（C2；D3D12 设备 / 队列 / 交换链 / persist
+    /// 全部保留，空窗 ≤1–2 帧）。
+    ///
+    /// 调用点：GPU 循环消费「泵检查到 DComp 失效」的请求，以及错误边界复判到 DComp 失效时。
+    /// 顺序：持合成锁整树重建 → 新内容 visual 挂回**同一批**交换链（交换链对象未变，back buffer
+    /// 与同步记账不受影响）→ 背景层 / 几何重挂 → 一次 `Commit`。
+    ///
+    /// 返回 `Ok` 之后调用方必须让 UI 整帧重发（`Shared::note_renderer_rebuilt`）：旧 visual 上
+    /// 的内容已随旧设备释放，重建后的内容 visual 在下一帧 present 之前是空的。
+    pub(crate) fn rebuild_composition(&mut self) -> Result<(), EngineError> {
+        debug_assert!(
+            on_gpu_thread(),
+            "the DirectComposition tree may only be rebuilt on the kytrix-d3d12 thread"
+        );
+        let Some(composition) = self.composition.clone() else {
+            // 离屏渲染器没有合成目标：没有可重建的东西（不是错误）。
+            return Ok(());
+        };
+        let Some(content) = self.swapchain.as_ref() else {
+            return Ok(());
+        };
+        let mut target = composition::lock(&composition);
+        target.rebuild()?;
+        target.set_content(content.raw())?;
+        if let Some(background) = self.background_swapchain.as_ref() {
+            target.set_background_content(background.raw())?;
+        }
+        let client = target.client_size();
+        target.set_geometry(self.surface, client)?;
+        target.commit()?;
+        Ok(())
     }
 
     /// 每窗口 GPU 对象：提交流 / 共享 SRV 堆的窗口段 / 图集上传路径 / 持久目标 / RTV 堆 / 计时器。
@@ -557,11 +607,12 @@ impl GpuRenderer {
     pub(crate) fn queue_atlas_upload(
         &mut self,
         kind: AtlasKind,
-        page: u32,
+        layer: u16,
+        extent: u32,
         pixels: Vec<u8>,
         rects: crate::render::atlas::DirtyRects,
     ) {
-        upload::queue_atlas_upload(self, kind, page, pixels, rects)
+        upload::queue_atlas_upload(self, kind, layer, extent, pixels, rects)
     }
 
     /// 该图集是否有一笔上传已入队、还没被命令列表消费（离屏目标的空闲判据）。

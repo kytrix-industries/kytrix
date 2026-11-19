@@ -55,8 +55,8 @@ vertex QuadVsOut vs_main(uint vertex_id [[vertex_id]],
 fragment float4 ps_main(QuadVsOut in [[stage_in]],
                         device const GpuPrimitive* instances [[buffer(0)]],
                         device const ClipEntry* clips [[buffer(1)]],
-                        texture2d<float> glyph_atlas [[texture(0)]],
-                        texture2d<float> image_atlas [[texture(1)]],
+                        texture2d_array<float> glyph_atlas [[texture(0)]],
+                        texture2d_array<float> image_atlas [[texture(1)]],
                         sampler atlas_sampler [[sampler(0)]]) {
     GpuPrimitive p = instances[in.instance];
     uint kind = uint(p.params1.z);
@@ -66,10 +66,12 @@ fragment float4 ps_main(QuadVsOut in [[stage_in]],
 
     float4 color;
     if (kind == KYTRIX_KIND_GLYPH) {
-        float coverage = glyph_atlas.sample(atlas_sampler, in.uv).r;
+        // 字形图集恒 1 层（contract §8）：slice 硬编码 0。
+        float coverage = glyph_atlas.sample(atlas_sampler, in.uv, 0u).r;
         color = p.color0 * coverage;
     } else if (kind == KYTRIX_KIND_IMAGE) {
-        color = image_atlas.sample(atlas_sampler, in.uv) * p.color0;
+        // 图片图集是 texture array：`params1.y` 是图集页（= 层号）索引（整数编码进 f32）。
+        color = image_atlas.sample(atlas_sampler, in.uv, uint(p.params1.y)) * p.color0;
     } else if (kind == KYTRIX_KIND_SHADOW) {
         // 可分离 2D 高斯（σ = blur / 2）：矩形部分是精确解，角部按圆角半径混合。
         color = p.color0 * analytic_shadow(in.local_px, half_size, p.corner_radius,

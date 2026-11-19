@@ -38,7 +38,8 @@ use windows::Win32::{
             WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_IME_CHAR,
             WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
             WM_INPUTLANGCHANGE, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOVE, WM_NCHITTEST,
-            WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+            WM_PAINT, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSW,
+            WS_OVERLAPPEDWINDOW,
         },
     },
 };
@@ -128,7 +129,15 @@ fn hidden_window_with_limits(
         )
     }
     .expect("CreateWindowExW");
-    let state = match WndProcState::new(dispatcher, hwnd, WindowId::for_test(1), limits, None) {
+    let state = match WndProcState::new(
+        dispatcher,
+        hwnd,
+        WindowId::for_test(1),
+        limits,
+        None,
+        // RE-01：平台层不允许自造消费端代际；测试从真实 `A11yBridge` 取。
+        crate::a11y::adapter::A11yBridge::new().consumer_epoch(),
+    ) {
         Ok(state) => Box::into_raw(Box::new(state)),
         Err(error) => {
             // SAFETY: 窗口由本函数创建、尚未交给其它所有者。
@@ -218,6 +227,35 @@ fn release_capture_without_ownership_leaves_no_suppress() {
     );
     assert!(!state.suppress_capture_cancel);
     destroy_hidden_window(hwnd, state as *mut WndProcState);
+    // 占位：保证 `class_name` 活到窗口销毁之后。
+    let _ = class_name;
+}
+
+/// C2：`WM_PAINT` 必须推进进程级 DirectComposition 健康检查代际。
+///
+/// MS《Best practices for DirectComposition》：合成设备失效时系统会投递 `WM_PAINT`，应用必须
+/// 在每次 `WM_PAINT` 检查 `CheckDeviceState`。`WndProc` 里只做无锁记账（DComp 调用会同步重入
+/// 消息泵，违反文件头纪律 1），检查在泵的几何 pass、重建在 GPU 线程 —— 本用例钉住「记账」这
+/// 一段的接线：没有它，DWM 重启后引擎永远不会检查设备状态（变异：删掉 `note_device_check`
+/// 调用 ⇒ 本用例红）。
+#[test]
+fn wm_paint_advances_the_composition_check_epoch() {
+    use crate::platform::windows::composition;
+
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, class_name) = hidden_window("KytrixCompositionCheckEpoch", dispatcher);
+    let before = composition::device_check_epoch();
+    // SAFETY: `hwnd` 由本用例独占；`SendMessageW(WM_PAINT)` 同步进入生产 `WndProc`。
+    unsafe {
+        SendMessageW(hwnd, WM_PAINT, Some(WPARAM(0)), Some(LPARAM(0)));
+    }
+    let after = composition::device_check_epoch();
+    assert!(
+        after > before,
+        "WM_PAINT 必须推进 DComp 健康检查代际（before={before} after={after}）"
+    );
+    destroy_hidden_window(hwnd, state);
     // 占位：保证 `class_name` 活到窗口销毁之后。
     let _ = class_name;
 }
@@ -940,8 +978,15 @@ fn the_pump_sync_copies_drag_regions_into_the_wndproc_state() {
     let mut app = App::new(runtime.handle().clone());
     let options = WindowOptions::default();
     let id = app.create_window(options.clone());
-    let mut native = NativeWindow::create(id, &options, None, Dispatcher::new(), None)
-        .expect("NativeWindow::create");
+    let mut native = NativeWindow::create(
+        id,
+        &options,
+        None,
+        Dispatcher::new(),
+        None,
+        crate::platform::windows::window::test_a11y_epoch(),
+    )
+    .expect("NativeWindow::create");
     let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
     let scale = native.scale();
     let mut client_origin = POINT::default();
@@ -1339,8 +1384,17 @@ fn a_size_move_resize_drives_a_real_frame() {
     let id = app.create_window(options.clone());
     let app = std::rc::Rc::new(std::cell::RefCell::new(app));
     let dispatcher = Dispatcher::new();
-    let native = NativeWindow::create(id, &options, None, Arc::clone(&dispatcher), Some(&app))
-        .expect("NativeWindow");
+    // RE-01：建窗路径唯一入口（窗口 bridge 的那一份代际）。
+    let a11y_epoch = app.borrow().window_a11y_epoch(id).expect("window exists");
+    let native = NativeWindow::create(
+        id,
+        &options,
+        None,
+        Arc::clone(&dispatcher),
+        Some(&app),
+        a11y_epoch,
+    )
+    .expect("NativeWindow");
     let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
     let before = app.borrow().window(id).expect("window").frame_index();
 
@@ -1376,8 +1430,17 @@ fn a_size_after_the_modal_loop_is_only_recorded_for_the_pump() {
     let id = app.create_window(options.clone());
     let app = std::rc::Rc::new(std::cell::RefCell::new(app));
     let dispatcher = Dispatcher::new();
-    let mut native = NativeWindow::create(id, &options, None, Arc::clone(&dispatcher), Some(&app))
-        .expect("NativeWindow");
+    // RE-01：建窗路径唯一入口（窗口 bridge 的那一份代际）。
+    let a11y_epoch = app.borrow().window_a11y_epoch(id).expect("window exists");
+    let mut native = NativeWindow::create(
+        id,
+        &options,
+        None,
+        Arc::clone(&dispatcher),
+        Some(&app),
+        a11y_epoch,
+    )
+    .expect("NativeWindow");
     let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
     // 先走完一次模态循环（会话打开又关闭）。
     // SAFETY: 同 `a_size_move_resize_drives_a_real_frame`。
@@ -1437,8 +1500,15 @@ fn modal_tick_fixture(runtime: &tokio::runtime::Runtime) -> ModalFixture {
     let id = app.create_window(options.clone());
     let app = Rc::new(RefCell::new(app));
     let dispatcher = Dispatcher::new();
-    let native = NativeWindow::create(id, &options, None, Arc::clone(&dispatcher), Some(&app))
-        .expect("NativeWindow::create");
+    let native = NativeWindow::create(
+        id,
+        &options,
+        None,
+        Arc::clone(&dispatcher),
+        Some(&app),
+        crate::platform::windows::window::test_a11y_epoch(),
+    )
+    .expect("NativeWindow::create");
     let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
     let hook_runs = Rc::new(Cell::new(0u32));
     let counter = Rc::clone(&hook_runs);

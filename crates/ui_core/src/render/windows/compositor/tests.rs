@@ -56,6 +56,7 @@ fn dropping_a_renderer_releases_its_shared_device_resources() {
         let rects = crate::render::DirtyRects::full();
         renderer.queue_atlas_upload(
             AtlasKind::Glyph,
+            0,
             super::TEST_ATLAS_PAGE,
             vec![0u8; (super::TEST_ATLAS_PAGE * super::TEST_ATLAS_PAGE) as usize],
             rects,
@@ -128,7 +129,7 @@ fn two_renderers_render_concurrently_on_one_shared_gpu() {
                 row.fill(0x40);
             }
             let rects = crate::render::DirtyRects::full();
-            renderer.queue_atlas_upload(AtlasKind::Glyph, page, pixels, rects);
+            renderer.queue_atlas_upload(AtlasKind::Glyph, 0, page, pixels, rects);
 
             let text_free = one_lane_scene(quad(
                 Rect::new(2.0, 2.0, 2.0, 2.0),
@@ -678,7 +679,7 @@ fn a_rendered_frame_produces_no_corruption_messages() {
         }
     }
     let rects = crate::render::DirtyRects::full();
-    renderer.queue_atlas_upload(AtlasKind::Glyph, page, pixels, rects);
+    renderer.queue_atlas_upload(AtlasKind::Glyph, 0, page, pixels, rects);
 
     let scene = one_lane_scene(quad(
         Rect::new(0.0, 0.0, 32.0, 32.0),
@@ -852,10 +853,11 @@ fn image_primitive_samples_the_image_atlas() {
         texel[3] = 0xFF;
     }
     let rects = crate::render::atlas::DirtyRects::full();
-    renderer.queue_atlas_upload(AtlasKind::Image, page, pixels, rects);
+    renderer.queue_atlas_upload(AtlasKind::Image, 0, page, pixels, rects);
 
     let tile = AtlasTile {
         atlas: AtlasKind::Image,
+        page: 0,
         u0: 0.25,
         v0: 0.25,
         u1: 0.5,
@@ -890,6 +892,64 @@ fn image_primitive_samples_the_image_atlas() {
     );
 }
 
+/// D-9-c：图片的 `params1.y` 是 texture array 层号——画第 1 页的 tile 必须采样 layer 1
+/// 的像素，而不是 layer 0（端到端验证 SRV `TEXTURE2D_ARRAY` + HLSL `float3(uv, layer)`）。
+#[test]
+fn image_primitive_samples_its_texture_array_layer() {
+    let _guard = lock();
+    let page = super::TEST_ATLAS_PAGE;
+    let Some(mut renderer) = warp_renderer((64, 64)) else {
+        return;
+    };
+    // layer 0 = 纯蓝，layer 1 = 纯红（BGRA；同一帧入队两层）。
+    let mut blue = vec![0u8; (page * page * 4) as usize];
+    for texel in blue.as_chunks_mut::<4>().0 {
+        *texel = [0xFF, 0x00, 0x00, 0xFF];
+    }
+    let mut red = vec![0u8; (page * page * 4) as usize];
+    for texel in red.as_chunks_mut::<4>().0 {
+        *texel = [0x00, 0x00, 0xFF, 0xFF];
+    }
+    let rects = crate::render::atlas::DirtyRects::full();
+    renderer.queue_atlas_upload(AtlasKind::Image, 0, page, blue, rects.clone());
+    renderer.queue_atlas_upload(AtlasKind::Image, 1, page, red, rects);
+
+    let tile = AtlasTile {
+        atlas: AtlasKind::Image,
+        page: 1,
+        u0: 0.25,
+        v0: 0.25,
+        u1: 0.5,
+        v1: 0.5,
+        generation: 0,
+    };
+    let scene = one_lane_scene(Primitive::Image(Image {
+        bounds: Rect::new(0.0, 0.0, 32.0, 32.0),
+        tile,
+        modulation: Color::WHITE,
+    }));
+    let mut encoder = InstanceEncoder::new();
+    let buffer = encoder
+        .encode(
+            &scene,
+            Scale::ONE,
+            resolver(),
+            &crate::paint::geometry_store::GeometryStore::new(),
+        )
+        .expect("encode");
+    let mut frame = full_plan((64, 64));
+    let mut timings = FrameTimings::new();
+    renderer
+        .submit_buffer(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
+        .expect("submit");
+    let image = renderer.readback().expect("readback");
+    assert_eq!(
+        pixel(&image, 64, 16, 16),
+        [255, 0, 0, 255],
+        "第 1 页的 tile 必须采样 layer 1（红），不是 layer 0（蓝）"
+    );
+}
+
 /// 在给定页尺寸上做一次「上传 → 画字形 → 读回」的可见性探测。
 fn glyph_probe(page: u32) -> bool {
     let Some(mut renderer) = super::GpuRenderer::new_warp_offscreen((64, 64)).ok() else {
@@ -902,9 +962,10 @@ fn glyph_probe(page: u32) -> bool {
         }
     }
     let rects = crate::render::atlas::DirtyRects::full();
-    renderer.queue_atlas_upload(AtlasKind::Glyph, page, pixels, rects);
+    renderer.queue_atlas_upload(AtlasKind::Glyph, 0, page, pixels, rects);
     let tile = AtlasTile {
         atlas: AtlasKind::Glyph,
+        page: 0,
         u0: 1.0 / page as f32,
         v0: 1.0 / page as f32,
         u1: 11.0 / page as f32,

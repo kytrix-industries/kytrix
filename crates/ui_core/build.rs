@@ -56,13 +56,15 @@ const DRAW_FIELDS: [&str; 5] = ["basis", "translation", "color0", "clip_rect", "
 ///
 /// 覆盖**全部**跨端数值契约：`kind` 取值、clip 项类型 / 链上界、阴影 σ（= blur/2 及其下限）。
 /// AR2 P1-⑤：这张表漏掉任何一个，单端改动都会静默通过（实验 E4/E10b/E15/E16/E13 的教训）。
-const CONSTANTS: [&str; 15] = [
+///
+/// D-9-c 起 `params1.y` 不再是「选哪张图集」（`TEXTURE_GLYPH/TEXTURE_IMAGE` 已删），而是
+/// 图集页（texture array 层号）：采样哪张图集由 `params1.z` 的 `KIND_*` 决定；层号取值由
+/// `paint/atlas.rs` 的 `MAX_IMAGE_PAGES` 约束（shader 不读该常量，故不进本表）。
+const CONSTANTS: [&str; 13] = [
     "KIND_QUAD",
     "KIND_GLYPH",
     "KIND_IMAGE",
     "KIND_SHADOW",
-    "TEXTURE_GLYPH",
-    "TEXTURE_IMAGE",
     "GRADIENT_NONE",
     "GRADIENT_HORIZONTAL",
     "GRADIENT_VERTICAL",

@@ -129,9 +129,9 @@ pub(crate) struct GpuRenderer {
 unsafe impl Send for GpuRenderer {}
 
 impl GpuRenderer {
-    /// 产品路径（离屏 / 快照）：系统默认设备；图集页懒分配（DEVIATIONS F-208）。
+    /// 产品路径（离屏 / 快照）：系统默认设备；图集 texture array 懒分配（DEVIATIONS F-208）。
     pub(crate) fn new_offscreen(size: (u32, u32)) -> Result<Self, EngineError> {
-        let core = Arc::clone(GpuCore::shared()?);
+        let core = GpuCore::shared()?;
         // 离屏路径没有 UI 线程读者：在飞计数只被同步提交自己用（记一次、等完扣一次）。
         Self::with_device(
             Device::new()?,
@@ -144,7 +144,7 @@ impl GpuRenderer {
     }
 
     /// 真实窗口：设备与 PSO 来自进程单例（R09-5），这里只接管**本窗口**的 GPU 侧对象
-    /// （persist / 上传槽 / 图集页）。
+    /// （persist / 上传槽 / 图集 texture array）。
     ///
     /// `background_linear` 是 persist clear color（linear）：重建 persist 后新 drawable 内部的
     /// 条带由它填（旧 drawable 之外的条带由 layer 的 `backgroundColor` 填）。
@@ -169,7 +169,8 @@ impl GpuRenderer {
         let size = (size.0.max(1), size.1.max(1));
         let queue = Queue::new(&device, in_flight)?;
         let mut device = device;
-        // 图集页懒分配：初始化只有 1×1 占位纹理，绑定始终有效（DEVIATIONS F-208）。
+        // 图集 texture array 懒分配：初始化只有 1×1 占位数组（字形 1 层 / 图片 4 层），绑定始终
+        // 有效（DEVIATIONS F-208）。
         let atlas = AtlasTextures::new(&mut device)?;
         // 先申请显存额度再建纹理：超预算时窗口创建失败，而不是让驱动在显存压力下失败。
         let persist_lease = PersistLease::new(Arc::clone(&core), size)?;
@@ -436,6 +437,7 @@ impl GpuRenderer {
             &self.queue,
             self.persist.texture(),
             self.surface,
+            0,
         )
     }
 
@@ -454,20 +456,23 @@ impl GpuRenderer {
 
     /// 图集上传入口（P09 的字形页与 P15 的图片页共用）。
     ///
+    /// `kind` 决定纹理（字形 1 层 / 图片 `MAX_IMAGE_PAGES` 层的 texture array，D-9-c）；
+    /// `layer` 是目标数组层号（字形恒 0；图片 = 图集页索引），`extent` 是该层的页边长。
     /// `pixels` 按**所有权**移动进来（`AtlasTextures` 的待上传槽直接持有它），避免槽 → 纹理
     /// 之间再复制一次整页（图片页 16 MiB）；与 Windows 的 `queue_atlas_upload` 同一约定。
     pub(crate) fn queue_atlas_upload(
         &mut self,
         kind: AtlasKind,
-        page: u32,
+        layer: u16,
+        extent: u32,
         pixels: Vec<u8>,
         rects: crate::render::atlas::DirtyRects,
     ) {
         self.debug_assert_gpu_thread("queue_atlas_upload");
-        self.atlas.queue_upload(kind, page, pixels, rects);
+        self.atlas.queue_upload(kind, layer, extent, pixels, rects);
     }
 
-    /// 该图集是否有一笔上传已入队、还没被命令缓冲消费（离屏目标的空闲判据）。
+    /// 该图集是否有**任意层**的上传已入队、还没被命令缓冲消费（离屏目标的空闲判据）。
     pub(crate) fn atlas_pending(&self, kind: AtlasKind) -> bool {
         self.atlas.pending(kind)
     }

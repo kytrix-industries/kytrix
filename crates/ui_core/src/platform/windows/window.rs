@@ -94,6 +94,16 @@ pub(crate) struct NativeWindow {
     modal_owner: Option<HWND>,
 }
 
+/// 测试构建的窗口 a11y 消费端代际。
+///
+/// 平台单测只验证 `WndProc` / 建窗记账，不关心 AT 激活；生产路径的代际必须来自
+/// `App::window_a11y_epoch`（唯一真值来源，E1）。放在这里让各测试模块共用，避免每处
+/// 自造 `A11yBridge` 时散落同一段构造。
+#[cfg(test)]
+pub(crate) fn test_a11y_epoch() -> crate::a11y::adapter::A11yConsumerEpoch {
+    crate::a11y::adapter::A11yBridge::new().consumer_epoch()
+}
+
 impl NativeWindow {
     /// 创建**隐藏**窗口并把客户区调到 `options.size`（逻辑像素 × 平台 DPI）。
     ///
@@ -111,6 +121,7 @@ impl NativeWindow {
         owner: Option<HWND>,
         dispatcher: Arc<Dispatcher>,
         app: Option<&Rc<RefCell<App>>>,
+        a11y_consumer_epoch: crate::a11y::adapter::A11yConsumerEpoch,
     ) -> Result<Self, EngineError> {
         // SAFETY: 取本进程模块句柄（`None` = 当前可执行文件）；只读，不转移所有权。
         let instance = unsafe { GetModuleHandleW(None) }
@@ -179,18 +190,19 @@ impl NativeWindow {
             ))
         });
         let limits = placement::ClientLimits::from_options(options);
-        let state = match WndProcState::new(dispatcher, hwnd, id, limits, driver) {
-            Ok(state) => Box::into_raw(Box::new(state)),
-            Err(error) => {
-                // a11y adapter 构造失败（`A11yInit`）：窗口还没显示，直接销毁，避免泄漏 HWND。
-                // SAFETY: 窗口刚由本函数创建，尚未交给任何其它所有者（`composition` 随本函数
-                // 返回一起释放；DComp 目标引用 HWND，必须先销毁窗口）。
-                unsafe {
-                    let _ = DestroyWindow(hwnd);
+        let state =
+            match WndProcState::new(dispatcher, hwnd, id, limits, driver, a11y_consumer_epoch) {
+                Ok(state) => Box::into_raw(Box::new(state)),
+                Err(error) => {
+                    // a11y adapter 构造失败（`A11yInit`）：窗口还没显示，直接销毁，避免泄漏 HWND。
+                    // SAFETY: 窗口刚由本函数创建，尚未交给任何其它所有者（`composition` 随本函数
+                    // 返回一起释放；DComp 目标引用 HWND，必须先销毁窗口）。
+                    unsafe {
+                        let _ = DestroyWindow(hwnd);
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-        };
+            };
         // X1：模态窗口 —— 建窗后（显示前）禁用 owner，系统级拦截 owner 及其非客户区输入
         // （用户无法与 owner 交互，视觉上灰显），关闭/销毁本窗口时由 `destroy` 恢复。
         // 失败（owner 已失效等）只降级为「没有原生模态」：引擎层仍有按 owner 关系过滤输入的
@@ -803,8 +815,11 @@ mod tests {
         let mut app = App::new(runtime.handle().clone());
         let options = WindowOptions::default();
         let id = app.create_window(options.clone());
-        let mut native = NativeWindow::create(id, &options, None, Dispatcher::new(), None)
-            .expect("NativeWindow::create");
+        // RE-01：建窗路径唯一入口（窗口 bridge 的那一份代际）。
+        let a11y_epoch = app.window_a11y_epoch(id).expect("window exists");
+        let mut native =
+            NativeWindow::create(id, &options, None, Dispatcher::new(), None, a11y_epoch)
+                .expect("NativeWindow::create");
 
         // SAFETY: 窗口由本用例持有且存活；上下文句柄成对释放。
         let baseline = unsafe { ImmGetContext(native.hwnd) };
@@ -873,8 +888,11 @@ mod tests {
         let mut app = App::new(runtime.handle().clone());
         let options = WindowOptions::default();
         let id = app.create_window(options.clone());
-        let mut native = NativeWindow::create(id, &options, None, Dispatcher::new(), None)
-            .expect("NativeWindow::create");
+        // RE-01：建窗路径唯一入口（窗口 bridge 的那一份代际）。
+        let a11y_epoch = app.window_a11y_epoch(id).expect("window exists");
+        let mut native =
+            NativeWindow::create(id, &options, None, Dispatcher::new(), None, a11y_epoch)
+                .expect("NativeWindow::create");
 
         // 故意把 App 侧写成与平台不一致的值：恢复必须把它纠回平台真值。
         {
@@ -929,6 +947,8 @@ mod tests {
             None,
             Dispatcher::new(),
             None,
+            // RE-01：平台层不允许自造消费端代际；测试从真实 `A11yBridge` 取。
+            crate::a11y::adapter::A11yBridge::new().consumer_epoch(),
         )
         .expect("NativeWindow::create");
         match native.refresh_hz() {
@@ -960,6 +980,7 @@ mod tests {
             None,
             Dispatcher::new(),
             None,
+            crate::platform::windows::window::test_a11y_epoch(),
         )
         .expect("NativeWindow::create")
     }
@@ -981,6 +1002,7 @@ mod tests {
             Some(owner.hwnd),
             Dispatcher::new(),
             None,
+            crate::platform::windows::window::test_a11y_epoch(),
         )
         .expect("owned window");
 
@@ -1014,6 +1036,7 @@ mod tests {
             None,
             Dispatcher::new(),
             None,
+            crate::platform::windows::window::test_a11y_epoch(),
         )
         .expect("topmost window");
         // SAFETY: 窗口由本用例持有且仍存活；只读查询扩展样式。
@@ -1052,6 +1075,7 @@ mod tests {
             Some(owner.hwnd),
             Dispatcher::new(),
             None,
+            crate::platform::windows::window::test_a11y_epoch(),
         )
         .expect("modal window");
         // SAFETY: 两个窗口仍存活；只读查询启用状态。
@@ -1082,6 +1106,7 @@ mod tests {
             Some(owner.hwnd),
             Dispatcher::new(),
             None,
+            crate::platform::windows::window::test_a11y_epoch(),
         )
         .expect("owned window");
         // SAFETY: 两个窗口仍存活；只读查询。
@@ -1110,6 +1135,7 @@ mod tests {
             Some(owner.hwnd),
             Dispatcher::new(),
             None,
+            crate::platform::windows::window::test_a11y_epoch(),
         )
         .expect("owned window");
         let owned_hwnd = owned.hwnd;
@@ -1156,8 +1182,15 @@ mod tests {
             "前置：文本 shape 后必须有 caret hint"
         );
 
-        let mut native = NativeWindow::create(id, &options, None, Dispatcher::new(), None)
-            .expect("NativeWindow::create");
+        let mut native = NativeWindow::create(
+            id,
+            &options,
+            None,
+            Dispatcher::new(),
+            None,
+            crate::platform::windows::window::test_a11y_epoch(),
+        )
+        .expect("NativeWindow::create");
         let hwnd = native.hwnd;
         // SAFETY: 窗口由本用例持有且仍存活；`SendMessageW` 同步进入生产 `wndproc`。
         unsafe {

@@ -50,7 +50,7 @@ use crate::{
     platform::{
         dispatcher::{WM_APP_COMPOSITION_WAKE, WM_APP_FRAME_WAKE},
         event::{PlatformEvent, StampedEvent, hiword_signed, loword_signed, translate},
-        windows::{dark_mode, dpi, ime},
+        windows::{composition, dark_mode, dpi, ime},
     },
 };
 
@@ -153,6 +153,11 @@ pub(crate) extern "system" fn wndproc(
             let mut paint = PAINTSTRUCT::default();
             let _ = BeginPaint(hwnd, &mut paint);
             let _ = EndPaint(hwnd, &paint);
+            // C2：MS《Best practices for DirectComposition》—— 合成设备失效时 DirectComposition
+            // 会投递 `WM_PAINT`，应用必须据此检查 `IDCompositionDevice::CheckDeviceState` 并在
+            // 失效时新建设备 / 重建 visual tree。`WndProc` 里只推进无锁代际（DComp 调用可能同步
+            // 重入消息泵，违反文件头纪律 1）；检查在泵的几何 pass、重建在 GPU 线程。
+            composition::note_device_check();
             (*state).wake();
             return LRESULT(0);
         }

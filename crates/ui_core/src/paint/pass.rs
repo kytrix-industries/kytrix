@@ -48,6 +48,13 @@ pub(crate) struct PaintPass<'a> {
     pub order: &'a mut Vec<LaneId>,
     /// 本帧的焦点节点（画 `Style.focus_ring`；`None` = 无焦点）。
     pub focused: Option<NodeId>,
+    /// 当前字形图集的代际（`Some` = 绘制前硬校验；`None` = 无 App 的 headless/测试路径跳过）。
+    ///
+    /// D-5：`ShapedLine` 里的 `AtlasTile`/UV 是生成时的快照。若图集已换代而该行未被重排，
+    /// 继续编码就是画旧 UV（整窗花字）。这里把「行代际 == 当前代际」变成绘制前硬校验：
+    /// 不匹配的行**本帧不编码**，节点收进 [`PaintReport::stale_text`]，由 `App::frame` 在提交后
+    /// 重新入队（下一帧补齐）。
+    pub atlas_generation: Option<u32>,
     /// 本帧的**滚动槽表**（槽位 → （逻辑滚动位移，物理视口））。
     ///
     /// 全量路径每帧重写它：下标 0 恒是「不随滚动偏移」的哨兵（偏移 0、零面积视口），
@@ -86,6 +93,11 @@ impl PaintMode {
 pub(crate) struct PaintReport {
     pub rebuilt: usize,
     pub damage: DamageSummary,
+    /// D-5：因「行代际 ≠ 当前图集代际」而**未编码**的文本节点（本帧不画旧 UV）。
+    ///
+    /// 消费者：`App::frame` 在 `commit_frame` 之后逐节点 `mark_text_layout_dirty + mark_paint`
+    /// 并请求下一帧（下一帧的 `layout_text` 用当前代际重光栅）。
+    pub stale_text: SmallVec<[NodeId; 4]>,
     /// 本帧编码出的实例数（仅 `test-support`；`Window::paint_frame` 编码后回填）。
     #[cfg(feature = "test-support")]
     pub instances: usize,
@@ -162,6 +174,8 @@ impl PaintPass<'_> {
             scroll_slots,
             scroll_slot_nodes,
             focused: self.focused,
+            atlas_generation: self.atlas_generation,
+            stale_text: SmallVec::new(),
             #[cfg(feature = "test-support")]
             log,
             rebuilt: 0,
@@ -200,6 +214,7 @@ impl PaintPass<'_> {
         Ok(PaintReport {
             rebuilt: context.rebuilt,
             damage,
+            stale_text: context.stale_text,
             #[cfg(feature = "test-support")]
             instances: 0,
             #[cfg(feature = "test-support")]
@@ -233,6 +248,10 @@ struct PaintContext<'a> {
     /// 槽位 → 容器节点（与 `scroll_slots` 平行，下标 i ⇒ 槽位 i + 1）。
     scroll_slot_nodes: &'a mut Vec<NodeId>,
     focused: Option<NodeId>,
+    /// 当前字形图集代际（D-5 绘制前硬校验；`None` = headless/测试路径跳过）。
+    atlas_generation: Option<u32>,
+    /// 行代际不匹配、本帧未编码的文本节点（D-5）。
+    stale_text: SmallVec<[NodeId; 4]>,
     #[cfg(feature = "test-support")]
     log: PaintLog,
     rebuilt: usize,
@@ -752,6 +771,7 @@ fn rebuild_lane(
     }
 
     let mut emitter = PrimitiveEmitter {
+        node,
         lane,
         bounds,
         content_offset,
@@ -831,6 +851,8 @@ fn rebuild_lane(
 
 /// 逐图元生成 + damage 累积（§6.2 的生成表）。
 struct PrimitiveEmitter {
+    /// 发出本节点图元的节点 id（D-5：图集代际不匹配时记入 `stale_text` 重新入队）。
+    node: NodeId,
     lane: LaneId,
     bounds: Rect,
     content_offset: Point,
@@ -1191,6 +1213,18 @@ impl PrimitiveEmitter {
     }
 
     fn emit_text(&mut self, context: &mut PaintContext<'_>, line: &ShapedLine, opacity: f32) {
+        // D-5：图集代际硬校验（唯一重光栅入口之外的安全网）。`ShapedLine.atlas_generation`
+        // 是生成时的图集代际；与当前代际不等说明该行仍烘焙旧 `AtlasTile`（旧 UV）——继续
+        // 编码就是整窗花字。本帧跳过该行、记下节点，`App::frame` 提交后重新入队并在下一帧用
+        // 当前代际重光栅。`None` = 无 App 的 headless/测试路径，不做校验。
+        if let Some(generation) = context.atlas_generation
+            && line.atlas_generation != generation
+        {
+            if !context.stale_text.contains(&self.node) {
+                context.stale_text.push(self.node);
+            }
+            return;
+        }
         let origin = Point::new(
             self.bounds.origin.x + self.content_offset.x,
             self.bounds.origin.y + self.content_offset.y,
@@ -1263,6 +1297,8 @@ mod tests {
         order: Vec<LaneId>,
         scroll_slots: Vec<(Point, PhysicalRect)>,
         scroll_slot_nodes: Vec<crate::node::id::NodeId>,
+        /// D-5：绘制前图集代际校验的注入点（None = 不校验）。
+        atlas_generation: Option<u32>,
     }
 
     impl Harness {
@@ -1274,6 +1310,7 @@ mod tests {
                 order: Vec::new(),
                 scroll_slots: Vec::new(),
                 scroll_slot_nodes: Vec::new(),
+                atlas_generation: None,
             }
         }
 
@@ -1290,6 +1327,7 @@ mod tests {
                 frame: frame(),
                 order: &mut self.order,
                 focused: None,
+                atlas_generation: self.atlas_generation,
                 scroll_slots: &mut self.scroll_slots,
                 scroll_slot_nodes: &mut self.scroll_slot_nodes,
                 #[cfg(feature = "test-support")]
@@ -1320,6 +1358,7 @@ mod tests {
                 frame: frame(),
                 order: &mut self.order,
                 focused: None,
+                atlas_generation: self.atlas_generation,
                 scroll_slots: &mut self.scroll_slots,
                 scroll_slot_nodes: &mut self.scroll_slot_nodes,
                 #[cfg(feature = "test-support")]
