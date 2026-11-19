@@ -165,6 +165,14 @@ pub(crate) struct DeviceFacts {
     pub device_type: Option<ash::vk::PhysicalDeviceType>,
     /// 有 `GRAPHICS` 队列族。
     pub graphics_queue: bool,
+    /// `VkPhysicalDeviceProperties.apiVersion`（**D8 基线**：`>= 1.2`）。
+    pub api_version: u32,
+    /// `VkPhysicalDeviceVulkan12Features.descriptorIndexing`（D8 基线；`api_version < 1.2`
+    /// 的设备无法查询，恒 `false`）。
+    pub descriptor_indexing: bool,
+    /// `VkPhysicalDeviceVulkan12Features.timelineSemaphore`（D8 基线；`FrameSync` 的 retire
+    /// 记账依赖它，所以两条路径都必须要求）。
+    pub timeline_semaphore: bool,
     /// 该队列族能把图像呈现到这个 surface（离屏路径恒 `true`）。
     pub surface_queue: bool,
     /// 设备扩展含 `VK_KHR_swapchain`。
@@ -179,10 +187,29 @@ pub(crate) struct DeviceFacts {
     pub extent: bool,
 }
 
+/// 一个候选设备的选卡输入（设备枚举阶段的**值**快照；诊断 / 覆盖匹配需要名字与下标）。
+#[derive(Clone, Debug)]
+pub(crate) struct CandidateFacts {
+    /// `vkEnumeratePhysicalDevices` 的下标（`KYTRIX_VK_DEVICE=<index>` 与诊断行用）。
+    pub index: u32,
+    /// `VkPhysicalDeviceProperties.deviceName`。
+    pub name: SmolStr,
+    /// 选卡事实。
+    pub facts: DeviceFacts,
+}
+
 /// 一个候选设备被跳过的原因（写进 `UnsupportedGpu.actual`，R11-13 的「不要只说 no device」）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeviceRejection {
     NoGraphicsQueue,
+    /// D8 基线：Vulkan 1.2 是 descriptorIndexing / timelineSemaphore 被启用与使用的前提。
+    ApiVersionBelow12 {
+        actual: u32,
+    },
+    /// D8 基线：`VkPhysicalDeviceVulkan12Features.descriptorIndexing`。
+    MissingDescriptorIndexing,
+    /// D8 基线：`VkPhysicalDeviceVulkan12Features.timelineSemaphore`。
+    MissingTimelineSemaphore,
     NoSurfaceQueue,
     MissingSwapchainExtension,
     UnsupportedSurfaceFormat,
@@ -192,32 +219,70 @@ pub(crate) enum DeviceRejection {
 }
 
 impl DeviceRejection {
-    /// 诊断行里的稳定文案。
-    pub(crate) const fn describe(self) -> &'static str {
+    /// 诊断行里的稳定文案（`SmolStr`：apiVersion 需要格式化，其余是静态短串）。
+    pub(crate) fn describe(self) -> SmolStr {
         match self {
-            Self::NoGraphicsQueue => "no GRAPHICS queue family",
-            Self::NoSurfaceQueue => "queue family cannot present to the surface",
-            Self::MissingSwapchainExtension => "VK_KHR_swapchain missing",
-            Self::UnsupportedSurfaceFormat => "surface lacks B8G8R8A8_SRGB + SRGB_NONLINEAR",
-            Self::MissingPresentMode => "surface lacks VK_PRESENT_MODE_MAILBOX_KHR",
-            Self::UnsupportedUsage => "surface lacks COLOR_ATTACHMENT | TRANSFER_DST",
-            Self::DegenerateExtent => "surface image extent range is degenerate",
+            Self::NoGraphicsQueue => SmolStr::new_static("no GRAPHICS queue family"),
+            Self::ApiVersionBelow12 { actual } => smol_str::format_smolstr!(
+                "Vulkan {}.{}.{} is below the required 1.2",
+                ash::vk::api_version_major(actual),
+                ash::vk::api_version_minor(actual),
+                ash::vk::api_version_patch(actual)
+            ),
+            Self::MissingDescriptorIndexing => {
+                SmolStr::new_static("VK_EXT_descriptor_indexing (descriptorIndexing) missing")
+            }
+            Self::MissingTimelineSemaphore => {
+                SmolStr::new_static("timelineSemaphore feature missing")
+            }
+            Self::NoSurfaceQueue => {
+                SmolStr::new_static("queue family cannot present to the surface")
+            }
+            Self::MissingSwapchainExtension => SmolStr::new_static("VK_KHR_swapchain missing"),
+            Self::UnsupportedSurfaceFormat => {
+                SmolStr::new_static("surface lacks B8G8R8A8_SRGB + SRGB_NONLINEAR")
+            }
+            Self::MissingPresentMode => {
+                SmolStr::new_static("surface lacks VK_PRESENT_MODE_MAILBOX_KHR")
+            }
+            Self::UnsupportedUsage => {
+                SmolStr::new_static("surface lacks COLOR_ATTACHMENT | TRANSFER_DST")
+            }
+            Self::DegenerateExtent => {
+                SmolStr::new_static("surface image extent range is degenerate")
+            }
         }
     }
 }
 
-/// 给候选设备打分（`window_path = false` 时只要求图形队列）。
+/// 给候选设备打分（`window_path = false` 时只要求图形队列与 D8 基线）。
 ///
 /// 打分顺序：独显 4 > 集显 3 > 虚拟/其它 2 > CPU 软件光栅器 1。**CPU 不排除**：无头 CI /
 /// 远程主机常常只有 lavapipe，把它彻底拒掉会让引擎在那类环境里跑不起来（Chrome 同样保留
 /// SwiftShader 兜底）；硬件与软件都在时硬件必然胜出。
 ///
-/// 过滤条件（R11-13）：能不能**真的把这个 surface 呈现出来**。旧实现只按 `device_type` 打分，
-/// 于是多 GPU（PRIME / 独显 + 集显）上可能先选中一张「更强但呈现不了」的卡，再在 swapchain
-/// 阶段硬失败 —— 本可以退到能工作的 GPU。
+/// 过滤条件分两层：
+/// 1. **D8 基线**（C10）：`apiVersion >= 1.2` + `descriptorIndexing` + `timelineSemaphore`。
+///    这三项是 `create_device` 启用的 feature 与 `FrameSync` 的 retire 记账的前提；旧实现把它们
+///    放在「选中之后」的 `GpuCaps::check()`，于是多 GPU（旧 dGPU + 新 iGPU / lavapipe）上会先
+///    选中不合格的高分卡、再在启动阶段硬失败，而本可回退到合规设备。window / headless 两条
+///    路径都要求（离屏也要 timeline）。对齐 Chromium `VulkanDeviceQueue::Initialize`（选卡循环
+///    先过滤 `apiVersion` / 队列 / present 支持再打分）。
+/// 2. **能不能真的把这个 surface 呈现出来**（R11-13）：只在 window 路径要求。
 pub(crate) fn score_device(facts: &DeviceFacts, window_path: bool) -> Result<u32, DeviceRejection> {
     if !facts.graphics_queue {
         return Err(DeviceRejection::NoGraphicsQueue);
+    }
+    if facts.api_version < ash::vk::API_VERSION_1_2 {
+        return Err(DeviceRejection::ApiVersionBelow12 {
+            actual: facts.api_version,
+        });
+    }
+    if !facts.descriptor_indexing {
+        return Err(DeviceRejection::MissingDescriptorIndexing);
+    }
+    if !facts.timeline_semaphore {
+        return Err(DeviceRejection::MissingTimelineSemaphore);
     }
     if window_path {
         if !facts.surface_queue {
@@ -301,14 +366,79 @@ impl DeviceSelector {
     }
 }
 
+/// 选卡决策（**纯逻辑**，可单测）：过滤 → 打分 → 取最高分；`selector` 命中时直接采用。
+///
+/// 返回选中候选在 `candidates` 里的位置。错误是 `UnsupportedGpu.actual` 的完整文案：
+/// - 全部不合格：逐个列出 `#index name: reason`（现场排障要能区分「没有驱动」与「独显不提供
+///   这个 surface 的 SRGB 格式」）；
+/// - `KYTRIX_VK_DEVICE` 强制命中不合格设备：错误里带上覆盖来源与该设备的原因（保留原有语义）；
+/// - 强制指定了不存在的设备：明确失败（静默回退 auto 会让「强制选卡复现问题」失效）。
+pub(crate) fn pick_best(
+    candidates: &[CandidateFacts],
+    window_path: bool,
+    selector: &DeviceSelector,
+) -> Result<usize, SmolStr> {
+    let mut best: Option<(usize, u32)> = None;
+    let mut rejected: Vec<SmolStr> = Vec::with_capacity(candidates.len());
+    let mut overridden_rejection: Option<SmolStr> = None;
+    for (position, candidate) in candidates.iter().enumerate() {
+        let forced = selector.matches(candidate.index, &candidate.name);
+        let score = match score_device(&candidate.facts, window_path) {
+            Ok(score) => score,
+            Err(rejection) => {
+                let reason = smol_str::format_smolstr!(
+                    "#{} {:?}: {}",
+                    candidate.index,
+                    candidate.name,
+                    rejection.describe()
+                );
+                if forced {
+                    overridden_rejection = Some(reason.clone());
+                }
+                rejected.push(reason);
+                continue;
+            }
+        };
+        // 覆盖入口：命中即立刻采用（不再比较得分）。
+        if forced {
+            return Ok(position);
+        }
+        if best.is_none_or(|(_, best_score)| score > best_score) {
+            best = Some((position, score));
+        }
+    }
+    if let Some(reason) = overridden_rejection {
+        return Err(smol_str::format_smolstr!(
+            "{DEVICE_OVERRIDE_ENV}={} rejected: {reason}",
+            selector.describe()
+        ));
+    }
+    let Some((position, _)) = best else {
+        return Err(if rejected.is_empty() {
+            SmolStr::new_static("no Vulkan physical devices")
+        } else {
+            smol_str::format_smolstr!("no usable device: {}", rejected.join("; "))
+        });
+    };
+    if !matches!(selector, DeviceSelector::Auto) {
+        return Err(smol_str::format_smolstr!(
+            "{DEVICE_OVERRIDE_ENV}={} matched no device ({} candidates)",
+            selector.describe(),
+            candidates.len()
+        ));
+    }
+    Ok(position)
+}
+
 #[cfg(test)]
 mod tests {
     use ash::vk;
 
     use super::{
-        DeviceFacts, DeviceRejection, DeviceSelector, SwapchainKey, choose_composite_alpha,
-        choose_extent, choose_image_count, choose_present_mode, choose_surface_format,
-        image_extent_for_transform, score_device, transform_swaps_axes,
+        CandidateFacts, DEVICE_OVERRIDE_ENV, DeviceFacts, DeviceRejection, DeviceSelector,
+        SwapchainKey, choose_composite_alpha, choose_extent, choose_image_count,
+        choose_present_mode, choose_surface_format, image_extent_for_transform, pick_best,
+        score_device, transform_swaps_axes,
     };
 
     fn surface_format(format: vk::Format, color_space: vk::ColorSpaceKHR) -> vk::SurfaceFormatKHR {
@@ -515,12 +645,24 @@ mod tests {
         DeviceFacts {
             device_type: Some(device_type),
             graphics_queue: true,
+            // D8 基线（C10）：合规设备的默认值。
+            api_version: vk::API_VERSION_1_2,
+            descriptor_indexing: true,
+            timeline_semaphore: true,
             surface_queue: true,
             swapchain_extension: true,
             surface_format: true,
             present_mode: true,
             usage: true,
             extent: true,
+        }
+    }
+
+    fn candidate(index: u32, name: &str, facts: DeviceFacts) -> CandidateFacts {
+        CandidateFacts {
+            index,
+            name: smol_str::SmolStr::new(name),
+            facts,
         }
     }
 
@@ -632,6 +774,11 @@ mod tests {
     fn rejection_reasons_are_human_readable() {
         for rejection in [
             DeviceRejection::NoGraphicsQueue,
+            DeviceRejection::ApiVersionBelow12 {
+                actual: vk::make_api_version(0, 1, 1, 0),
+            },
+            DeviceRejection::MissingDescriptorIndexing,
+            DeviceRejection::MissingTimelineSemaphore,
             DeviceRejection::NoSurfaceQueue,
             DeviceRejection::MissingSwapchainExtension,
             DeviceRejection::UnsupportedSurfaceFormat,
@@ -641,6 +788,164 @@ mod tests {
         ] {
             assert!(!rejection.describe().is_empty());
         }
+        // apiVersion 必须格式化成可读版本号，而不是裸 `u32`。
+        let text = DeviceRejection::ApiVersionBelow12 {
+            actual: vk::make_api_version(0, 1, 1, 0),
+        }
+        .describe();
+        assert!(text.contains("1.1.0"), "{text}");
+        assert!(text.contains("1.2"), "{text}");
+    }
+
+    // ── C10：D8 基线作为选卡过滤条件 ─────────────────────────────────────
+
+    /// 3 个新 rejection 在 window / headless 两条路径上都生效：timeline 被 `FrameSync` 使用、
+    /// descriptorIndexing 在 `create_device` 里启用，与是否呈现无关。
+    #[test]
+    fn the_d8_baseline_is_enforced_on_both_the_window_and_headless_paths() {
+        let mut below_12 = windowed_facts(vk::PhysicalDeviceType::DISCRETE_GPU);
+        below_12.api_version = vk::make_api_version(0, 1, 1, 0);
+        let mut no_descriptor_indexing = windowed_facts(vk::PhysicalDeviceType::DISCRETE_GPU);
+        no_descriptor_indexing.descriptor_indexing = false;
+        let mut no_timeline = windowed_facts(vk::PhysicalDeviceType::DISCRETE_GPU);
+        no_timeline.timeline_semaphore = false;
+        for window_path in [true, false] {
+            assert_eq!(
+                score_device(&below_12, window_path),
+                Err(DeviceRejection::ApiVersionBelow12 {
+                    actual: vk::make_api_version(0, 1, 1, 0)
+                }),
+                "window_path={window_path}"
+            );
+            assert_eq!(
+                score_device(&no_descriptor_indexing, window_path),
+                Err(DeviceRejection::MissingDescriptorIndexing),
+                "window_path={window_path}"
+            );
+            assert_eq!(
+                score_device(&no_timeline, window_path),
+                Err(DeviceRejection::MissingTimelineSemaphore),
+                "window_path={window_path}"
+            );
+        }
+    }
+
+    /// I10-b：高分但 api < 1.2 的独显必须被跳过，合规的集显被选中（多 GPU / PRIME 的真实现场）。
+    #[test]
+    fn a_high_scoring_but_incompatible_device_is_skipped_for_a_compliant_one() {
+        let mut discrete = windowed_facts(vk::PhysicalDeviceType::DISCRETE_GPU);
+        discrete.api_version = vk::make_api_version(0, 1, 0, 0);
+        let integrated = windowed_facts(vk::PhysicalDeviceType::INTEGRATED_GPU);
+        let candidates = [
+            candidate(0, "Old Discrete GPU", discrete),
+            candidate(1, "New Integrated GPU", integrated),
+        ];
+        // window 与 headless 两条路径都必须退到合规的集显。
+        for window_path in [true, false] {
+            let selected = pick_best(&candidates, window_path, &DeviceSelector::Auto)
+                .expect("合规的集显必须被接受");
+            assert_eq!(selected, 1, "高分但不合规的独显不能胜出");
+            assert_eq!(
+                score_device(&candidates[selected].facts, window_path),
+                Ok(3)
+            );
+        }
+        // 只有那张不合规的独显：列出原因而不是静默启动失败。
+        let error = pick_best(&candidates[..1], true, &DeviceSelector::Auto)
+            .expect_err("没有合规设备时必须报错");
+        assert!(error.contains("no usable device"), "{error}");
+        assert!(error.contains("#0 \"Old Discrete GPU\""), "{error}");
+        assert!(error.contains("below the required 1.2"), "{error}");
+    }
+
+    /// I10-b：高分但缺 timelineSemaphore 的独显同样被跳过。
+    #[test]
+    fn a_high_scoring_device_without_timeline_semaphore_is_rejected() {
+        let mut discrete = windowed_facts(vk::PhysicalDeviceType::DISCRETE_GPU);
+        discrete.timeline_semaphore = false;
+        let integrated = windowed_facts(vk::PhysicalDeviceType::INTEGRATED_GPU);
+        let candidates = [
+            candidate(0, "Discrete", discrete),
+            candidate(1, "Integrated", integrated),
+        ];
+        assert_eq!(
+            pick_best(&candidates, true, &DeviceSelector::Auto),
+            Ok(1),
+            "不合规的高分设备必须被跳过"
+        );
+    }
+
+    /// I10-c：全部不合格时错误逐个列出每台设备的原因（含下标与名字）。
+    #[test]
+    fn pick_best_lists_every_candidate_reason_when_no_device_is_usable() {
+        let mut first = windowed_facts(vk::PhysicalDeviceType::DISCRETE_GPU);
+        first.api_version = vk::make_api_version(0, 1, 0, 0);
+        let mut second = windowed_facts(vk::PhysicalDeviceType::INTEGRATED_GPU);
+        second.timeline_semaphore = false;
+        let candidates = [
+            candidate(0, "Old Discrete", first),
+            candidate(1, "Broken Integrated", second),
+        ];
+        let error =
+            pick_best(&candidates, true, &DeviceSelector::Auto).expect_err("全部不合格必须报错");
+        assert!(error.contains("no usable device"), "{error}");
+        assert!(error.contains("#0 \"Old Discrete\""), "{error}");
+        assert!(error.contains("#1 \"Broken Integrated\""), "{error}");
+        assert!(error.contains("below the required 1.2"), "{error}");
+        assert!(
+            error.contains("timelineSemaphore feature missing"),
+            "{error}"
+        );
+    }
+
+    /// I10-c：`KYTRIX_VK_DEVICE` 强制命中不合格设备时，错误必须说明覆盖来源与该设备的原因。
+    #[test]
+    fn a_forced_selector_that_hits_an_incompatible_device_reports_the_override() {
+        let mut discrete = windowed_facts(vk::PhysicalDeviceType::DISCRETE_GPU);
+        discrete.descriptor_indexing = false;
+        let candidates = [candidate(0, "llvmpipe", discrete)];
+        let error = pick_best(&candidates, true, &DeviceSelector::Index(0))
+            .expect_err("强制命中不合格设备必须报错");
+        assert!(error.contains(DEVICE_OVERRIDE_ENV), "{error}");
+        assert!(error.contains("index=0 rejected"), "{error}");
+        assert!(error.contains("descriptorIndexing"), "{error}");
+        let error = pick_best(&candidates, true, &DeviceSelector::Name("llvmpipe".into()))
+            .expect_err("按名字覆盖命中不合格设备同样报错");
+        assert!(error.contains("name~llvmpipe rejected"), "{error}");
+    }
+
+    /// 覆盖入口命中合规设备时直接采用（即使不是最高分）：现场排障要能强制走 iGPU / dGPU。
+    #[test]
+    fn a_forced_selector_that_hits_a_compatible_device_wins_over_the_auto_score() {
+        let discrete = windowed_facts(vk::PhysicalDeviceType::DISCRETE_GPU);
+        let integrated = windowed_facts(vk::PhysicalDeviceType::INTEGRATED_GPU);
+        let candidates = [
+            candidate(0, "Discrete", discrete),
+            candidate(1, "Integrated", integrated),
+        ];
+        assert_eq!(
+            pick_best(&candidates, true, &DeviceSelector::Index(1)),
+            Ok(1)
+        );
+        // 指定了不存在的设备：明确失败，不静默回退 auto。
+        let error = pick_best(&candidates, true, &DeviceSelector::Index(7))
+            .expect_err("覆盖不存在的设备必须报错");
+        assert!(
+            error.contains("matched no device (2 candidates)"),
+            "{error}"
+        );
+    }
+
+    /// 合规的低分设备（CPU / lavapipe）必须被接受：无头 CI / 远程主机常常只有软件光栅器。
+    #[test]
+    fn a_compliant_low_score_device_is_accepted() {
+        let cpu = windowed_facts(vk::PhysicalDeviceType::CPU);
+        let candidates = [candidate(0, "llvmpipe", cpu)];
+        assert_eq!(
+            pick_best(&candidates, false, &DeviceSelector::Auto),
+            Ok(0),
+            "lavapipe 合规就必须能跑（D8 基线不排除 CPU 设备）"
+        );
     }
 
     /// `SwapchainKey` 是重建必要性的判据来源：任一字段变化都必须被认为不同。

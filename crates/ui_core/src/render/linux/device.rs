@@ -45,8 +45,8 @@ use super::{
     memory::{MemoryArena, MemoryNeed, Suballocation, pick_memory_type},
     pipeline::{DescriptorPool, MAX_WINDOWS, Pipeline},
     plan::{
-        self, DEVICE_OVERRIDE_ENV, DeviceFacts, DeviceSelector, choose_surface_format,
-        required_usage,
+        self, CandidateFacts, DEVICE_OVERRIDE_ENV, DeviceFacts, DeviceSelector,
+        choose_surface_format, required_usage,
     },
 };
 use crate::{
@@ -304,6 +304,10 @@ impl Device {
             device_selector: selector.describe(),
             device_score: score,
         };
+        // 防御层（C10）：`select_device` 已把 D8 基线（apiVersion / descriptorIndexing /
+        // timelineSemaphore）作为选卡过滤条件，auto / forced 的正常路径走不到这里 ——
+        // `create_device` 启用的 feature 必须与这里校验的基线一致，所以保留这条硬失败：
+        // 未来新增候选来源（或过滤条件被误删）时仍然拒绝，而不是带着不满足的 feature 建设备。
         caps.check()?;
         // 窗口路径需要 present：`VK_KHR_swapchain` 缺失是硬失败。
         // 离屏实例（快照）没有 surface，自然没有 swapchain：那条路径不需要 present。
@@ -424,11 +428,12 @@ fn device_selector() -> DeviceSelector {
     }
 }
 
-/// 选卡（R11-13）：**先过滤「能不能真正呈现到这个 surface」，再按类型打分**。
+/// 选卡（R11-13 / C10）：**先过滤 D8 基线与「能不能真正呈现到这个 surface」，再按类型打分**。
 ///
-/// 每一步的拒绝原因都记进 `rejected`，最终错误里列出全部候选与原因 —— 旧实现的失败文案只有
-/// 「no Vulkan device with a Wayland surface queue」，现场排障时无法区分「没有 Vulkan 驱动」
-/// 与「独显不提供这个 surface 的 SRGB 格式」。
+/// 本函数只负责把 Vulkan 查询结果收集成 [`plan::CandidateFacts`]（值快照），决策交给纯逻辑
+/// [`plan::pick_best`]（可单测：高分但不合格的设备被跳过、合规的低分设备被选中、全部不合格时
+/// 逐个列出每台设备的原因）。旧实现把 D8 基线放在「选中之后」的 `GpuCaps::check()`，多 GPU
+/// 机器上会先选高分旧卡再在启动阶段硬失败，而本可回退到合规设备。
 fn select_device(
     instance: &VulkanInstance,
     devices: &[vk::PhysicalDevice],
@@ -437,12 +442,10 @@ fn select_device(
     selector: &DeviceSelector,
 ) -> Result<(vk::PhysicalDevice, u32, u32), EngineError> {
     let surface_fn = instance.surface_fn();
-    let mut best: Option<(u32, vk::PhysicalDevice, u32)> = None;
-    let mut rejected: Vec<SmolStr> = Vec::with_capacity(devices.len());
-    // 覆盖入口命中但不可用时的原因：报错要能说明「你强制的那张卡为什么不行」。
-    let mut overridden_rejection: Option<SmolStr> = None;
+    let mut candidates: Vec<CandidateFacts> = Vec::with_capacity(devices.len());
+    // 与 `candidates` 同下标：图形队列族（`pick_best` 只会选中带图形队列的设备）。
+    let mut queue_families: Vec<Option<u32>> = Vec::with_capacity(devices.len());
     for (index, physical) in devices.iter().copied().enumerate() {
-        let index = index as u32;
         // SAFETY: 句柄由本结构独占，只读查询。
         let properties = unsafe { instance.raw().get_physical_device_properties(physical) };
         let name = unsafe { std::ffi::CStr::from_ptr(properties.device_name.as_ptr()) }
@@ -458,10 +461,26 @@ fn select_device(
         let mut facts = DeviceFacts {
             device_type: Some(properties.device_type),
             graphics_queue: family.is_some(),
+            api_version: properties.api_version,
             // 离屏实例没有 surface：只要求图形队列族。
             surface_queue: true,
             ..DeviceFacts::default()
         };
+        // D8 基线（C10）：只有 `apiVersion >= 1.2` 的设备才能查询
+        // `VkPhysicalDeviceVulkan12Features`（对 1.1 设备挂这个 pNext 是未定义用法）；
+        // 1.1 及以下三项保持默认 false，由过滤层给出「Vulkan X.Y.Z < 1.2」的可读原因。
+        if properties.api_version >= vk::API_VERSION_1_2 {
+            let mut features12 = vk::PhysicalDeviceVulkan12Features::default();
+            let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut features12);
+            // SAFETY: features 链的 `pNext` 指向本循环栈上的 `features12`；只读查询。
+            unsafe {
+                instance
+                    .raw()
+                    .get_physical_device_features2(physical, &mut features2);
+            }
+            facts.descriptor_indexing = features12.descriptor_indexing == vk::TRUE;
+            facts.timeline_semaphore = features12.timeline_semaphore == vk::TRUE;
+        }
         if window_path
             && let (Some(surface_fn), Some(surface), Some(family)) =
                 (surface_fn, pick_surface, family)
@@ -500,64 +519,25 @@ fn select_device(
                 }
             }
         }
-        let score = match plan::score_device(&facts, window_path) {
-            Ok(score) => score,
-            Err(rejection) => {
-                let reason =
-                    smol_str::format_smolstr!("#{index} {name:?}: {}", rejection.describe());
-                if selector.matches(index, &name) {
-                    overridden_rejection = Some(reason.clone());
-                }
-                rejected.push(reason);
-                continue;
-            }
-        };
-        let Some(family) = family else {
-            continue;
-        };
-        // 覆盖入口：命中即立刻采用（不再比较得分）；否则按得分取最优。
-        let forced = selector.matches(index, &name);
-        if forced {
-            return Ok((physical, family as u32, score));
+        candidates.push(CandidateFacts {
+            index: index as u32,
+            name: SmolStr::new(name),
+            facts,
+        });
+        queue_families.push(family.map(|family| family as u32));
+    }
+    let selected = plan::pick_best(&candidates, window_path, selector).map_err(|actual| {
+        EngineError::UnsupportedGpu {
+            os: "linux",
+            required: D8_REQUIRED,
+            actual,
         }
-        if best.is_none_or(|(best_score, _, _)| score > best_score) {
-            best = Some((score, physical, family as u32));
-        }
-    }
-    if let Some(reason) = overridden_rejection {
-        return Err(EngineError::UnsupportedGpu {
-            os: "linux",
-            required: D8_REQUIRED,
-            actual: smol_str::format_smolstr!(
-                "{DEVICE_OVERRIDE_ENV}={} rejected: {reason}",
-                selector.describe()
-            ),
-        });
-    }
-    let Some((score, physical, queue_family)) = best else {
-        return Err(EngineError::UnsupportedGpu {
-            os: "linux",
-            required: D8_REQUIRED,
-            actual: if rejected.is_empty() {
-                SmolStr::new_static("no Vulkan physical devices")
-            } else {
-                smol_str::format_smolstr!("no usable device: {}", rejected.join("; "))
-            },
-        });
-    };
-    // 覆盖入口指定了不存在的卡：明确失败（静默回退到 auto 会让「强制选卡复现问题」失效）。
-    if !matches!(selector, DeviceSelector::Auto) {
-        return Err(EngineError::UnsupportedGpu {
-            os: "linux",
-            required: D8_REQUIRED,
-            actual: smol_str::format_smolstr!(
-                "{DEVICE_OVERRIDE_ENV}={} matched no device ({} candidates)",
-                selector.describe(),
-                devices.len()
-            ),
-        });
-    }
-    Ok((physical, queue_family, score))
+    })?;
+    let queue_family = queue_families[selected]
+        .expect("pick_best only selects devices with a GRAPHICS queue family");
+    let score = plan::score_device(&candidates[selected].facts, window_path)
+        .expect("pick_best only selects devices that pass its own filter");
+    Ok((devices[selected], queue_family, score))
 }
 
 /// 设备扩展可用性（枚举失败当作「没有」：真正的失败会在 `create_device` / swapchain 阶段
