@@ -116,6 +116,22 @@ pub(crate) fn window_mut(app: &mut App, id: WindowId) -> Option<&mut Window> {
     app.windows.get_mut(&id)
 }
 
+/// 设置窗口的自绘标题栏拖动区（X2；坐标与平台语义见 `Window::set_drag_regions`）。
+///
+/// 值变化才唤醒平台泵：泵每轮把最新区域对账到原生窗口（Windows 的 `WM_NCHITTEST` 表 /
+/// macOS 的 `GuiView` 区域 / Linux 的 CSD move 判定）。窗口不存在时是 no-op。
+/// 消费者：`App::set_drag_regions`。
+pub(crate) fn set_drag_regions(app: &mut App, id: WindowId, regions: &[crate::math::Rect]) {
+    let Some(target) = app.windows.get_mut(&id) else {
+        return;
+    };
+    if target.drag_regions() == regions {
+        return;
+    }
+    target.set_drag_regions(regions);
+    app.dispatcher.wake();
+}
+
 /// 注册窗口的「关闭前」处理器：返回 `false` 拦下关闭（P2-8）。
 ///
 /// 平台在用户点 X / Cmd-W 时先调用它；应用可在此保存未提交状态、弹确认框。

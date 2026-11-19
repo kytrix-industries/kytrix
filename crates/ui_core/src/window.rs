@@ -522,6 +522,14 @@ pub struct Window {
     a11y: crate::a11y::adapter::A11yBridge,
     /// IME caret hint（P16：应用声明的文本节点 + UTF-8 字节偏移）。
     ime_cursor: Option<ImeCursorRequest>,
+    /// 自绘标题栏的可拖动区域（X2；逻辑窗口坐标，客户区左上角原点）。
+    ///
+    /// 空 = 没有拖动区（默认）。平台层每轮从 `App` 同步到原生窗口：
+    /// Windows 命中区域的 `WM_NCHITTEST` 返回 `HTCAPTION`（系统 move 模态循环，与系统
+    /// 标题栏同路径：双击最大化 / Aero Snap / 右键系统菜单都成立）；macOS 命中区域的
+    /// 主键按下走 `performWindowDragWithEvent:`（不进引擎指针分发）；Linux/Wayland CSD
+    /// 命中区域的主键按下请求 `xdg_toplevel.move(seat, serial)`（compositor 驱动移动）。
+    titlebar_drag_regions: Vec<Rect>,
     /// Linux：当前焦点文本域的语义类型（`zwp_text_input_v3.set_content_type` 的数据源）。
     ///
     /// 密码 / API key 输入框必须切到 [`ImeContentType::Password`]：text-input-v3 的默认值
@@ -602,6 +610,7 @@ impl Window {
             pending_damage: None,
             a11y: crate::a11y::adapter::A11yBridge::new(),
             ime_cursor: None,
+            titlebar_drag_regions: Vec::new(),
             #[cfg(target_os = "linux")]
             ime_content: ImeContentType::default(),
             #[cfg(target_os = "linux")]
@@ -1085,6 +1094,44 @@ impl Window {
     }
     pub(crate) fn ime_cursor_area(&self) -> Result<Option<Rect>, EngineError> {
         focus::ime_cursor_area(self)
+    }
+
+    // ── X2：自绘标题栏拖动区（Chrome / Electron `-webkit-app-region: drag` 模型） ──
+
+    /// 设置自绘标题栏的**可拖动区域**（X2；三端语义见 [`Self::set_drag_regions`] 的表格）。
+    ///
+    /// 区域是**逻辑窗口坐标**（客户区左上角为原点，x 右 y 下），可以有多个（顶部条带 + 侧栏
+    /// 把手）；传空切片清空。引擎不自动跟随布局：应用在布局/尺寸变化后重新调用（Chrome
+    /// `SetDraggableRegions` 同模型）。命中区域**不再投递**指针事件给应用 —— 拖动区是窗口
+    /// chrome，不是内容。
+    ///
+    /// 平台语义（用户裁决 X1/X2「不得静默忽略」）：
+    ///
+    /// - **Windows**：命中区域的 `WM_NCHITTEST` 返回 `HTCAPTION` ⇒ 走系统 move 模态循环，
+    ///   与系统标题栏完全同路径（双击最大化/还原、Aero Snap、`Alt+Space` 系统菜单都成立；
+    ///   拖动期间的出帧由 B1 的模态 tick 保证）。
+    /// - **macOS**：`GuiView mouseDown:` 命中区域 ⇒ `performWindowDragWithEvent:`（AppKit
+    ///   同步拖动），不进入引擎指针分发。用于恢复 `FullSizeContentView` 下被 view 挖掉的
+    ///   顶部拖动条（AppKit 的 drag map 只让 `mouseDownCanMoveWindow == YES` 且有内容的视图
+    ///   可拖）。
+    /// - **Linux/Wayland**：CSD 窗口命中区域的主键按下 ⇒ `xdg_toplevel.move(seat, serial)`
+    ///   交给 compositor 驱动（协议没有客户端侧拖动）；不投递 `PointerDown`。没有
+    ///   `xdg_toplevel` / compositor 不实现 move 时降级为无操作（应用仍可用
+    ///   `WindowControl::BeginMove` 的显式路径）。
+    ///
+    /// 消费者：`App::set_drag_regions`（平台泵每轮对账到原生窗口）。
+    pub fn set_drag_regions(&mut self, regions: &[Rect]) {
+        if self.titlebar_drag_regions == regions {
+            return;
+        }
+        self.titlebar_drag_regions.clear();
+        self.titlebar_drag_regions.extend_from_slice(regions);
+    }
+
+    /// 当前拖动区（平台层读点；X2）。
+    #[must_use]
+    pub(crate) fn drag_regions(&self) -> &[Rect] {
+        &self.titlebar_drag_regions
     }
 
     // ── Linux：文本输入的语义类型（`zwp_text_input_v3.set_content_type`）──

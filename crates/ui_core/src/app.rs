@@ -1595,6 +1595,15 @@ impl App {
         window_set::window_mut(self, id)
     }
 
+    /// 设置窗口的**自绘标题栏拖动区**（X2；Chrome/Electron drag-region 模型）。
+    ///
+    /// 区域是**逻辑窗口坐标**（客户区左上角原点），可多个；传空切片清空。三端语义与各自的
+    /// 原生路径见 [`Window::set_drag_regions`]。引擎不自动跟随布局：应用在布局/尺寸变化后
+    /// 重新调用。值变化才唤醒平台泵（泵每轮对账到原生窗口）；窗口不存在时是 no-op。
+    pub fn set_drag_regions(&mut self, window: WindowId, regions: &[Rect]) {
+        window_set::set_drag_regions(self, window, regions)
+    }
+
     /// 注册窗口的「关闭前」处理器：返回 `false` 拦下关闭（P2-8）。
     ///
     /// 平台在用户点 X / Cmd-W 时先调用它；应用可在此保存未提交状态、弹确认框。
