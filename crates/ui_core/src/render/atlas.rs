@@ -548,7 +548,10 @@ pub(crate) struct DirtyRects {
 }
 
 impl DirtyRects {
-    /// 段/矩形数上限：超过就折叠为整页（沿用旧 `DirtyRects` 的 8，避免碎片化上传）。
+    /// 段/矩形数上限：超过就折叠为并集外接矩形（沿用旧 `DirtyRects` 的 8，避免碎片化上传）。
+    ///
+    /// 折叠目标**不是**整页哨兵（X4）：整页上传是 16 MiB 级拷贝/尖峰，只在显式整页
+    /// （首帧 / 页尺寸变化 / 渲染器重建）时使用。
     const MAX_RECTS: usize = 8;
 
     /// 整页哨兵集合（等价于旧的 `mark(0, u32::MAX)`）。
@@ -558,7 +561,7 @@ impl DirtyRects {
         }
     }
 
-    /// 标记 `rect` 脏；空矩形忽略；被已有矩形包含则忽略；相交/相邻合并；超上限折叠整页。
+    /// 标记 `rect` 脏；空矩形忽略；被已有矩形包含则忽略；相交/相邻合并；超上限折叠为 bbox。
     pub(crate) fn mark(&mut self, rect: PhysicalRect) {
         if rect.is_empty() || self.is_full() {
             return;
@@ -588,8 +591,15 @@ impl DirtyRects {
         self.rects.push(merged);
         self.rects.sort_by_key(|rect| (rect.y0, rect.x0));
         if self.rects.len() > Self::MAX_RECTS {
+            // X4：折叠为**并集外接矩形**（bounding box）而不是整页哨兵。旧行为让「一帧 ≥9 块
+            // 图片」必然整页上传（2048² BGRA8 = 16 MiB UI 线程拷贝 + 上传尖峰）；bbox 面积恒
+            // ≤ 页面，三端 AOI 契约不变（仍按矩形盒拷贝）。
+            let mut union = self.rects[0];
+            for rect in &self.rects[1..] {
+                union = union.union(*rect);
+            }
             self.rects.clear();
-            self.rects.push(FULL_RECT);
+            self.rects.push(union);
         }
     }
 
@@ -893,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn dirty_rects_fold_to_full_when_the_limit_is_exceeded_and_clear_empties() {
+    fn dirty_rects_fold_to_a_bounding_box_when_the_limit_is_exceeded_and_clear_empties() {
         let mut rects = DirtyRects::default();
         for index in 0..DirtyRects::MAX_RECTS {
             let y = index as i32 * 16;
@@ -902,11 +912,51 @@ mod tests {
         }
         assert!(!rects.is_full());
         rects.mark(PhysicalRect::new(0, 4096, 4, 4100));
-        assert!(rects.is_full(), "超过 8 块折叠为整页哨兵");
+        // X4：超过上限折叠为**并集外接矩形**，不是整页哨兵（整页 = 16 MiB 级上传尖峰）。
+        assert!(!rects.is_full(), "折叠后不得退化为整页哨兵");
+        assert_eq!(rects.rects(), &[PhysicalRect::new(0, 0, 4, 4100)]);
+        // 页高 512：yte_count 按页裁剪（y1 4096→512），= 4 × 512 × 1 B。
+        assert_eq!(rects.byte_count(512, 1), 4 * 512);
 
         rects.clear();
         assert!(rects.is_empty());
         assert!(rects.rects().is_empty());
+    }
+
+    /// X4：一帧 9+ 块分散的图片矩形不得折叠成整页上传（旧行为 16 MiB 拷贝/尖峰）；
+    /// bbox 面积恒 ≤ 页面，上传字节数必然小于整页。
+    #[test]
+    fn nine_scattered_image_rects_fold_to_a_bounding_box_not_the_whole_page() {
+        const PAGE: u32 = 2048;
+        const TEXEL: u32 = 4;
+        let mut rects = DirtyRects::default();
+        // 9 块 32² 图片（+2 padding 的 34² 块）沿对角线/网格分散。
+        let mut expected: Option<PhysicalRect> = None;
+        for index in 0..9i32 {
+            let x = (index % 3) * 600;
+            let y = (index / 3) * 600;
+            let rect = PhysicalRect::new(x, y, x + 34, y + 34);
+            rects.mark(rect);
+            expected = Some(match expected {
+                Some(union) => union.union(rect),
+                None => rect,
+            });
+            if index < 8 {
+                assert!(!rects.is_full(), "未超上限前不得整页");
+            }
+        }
+        assert!(
+            !rects.is_full(),
+            "超过 8 块后必须折叠为 bbox，而不是整页哨兵"
+        );
+        assert_eq!(rects.rects(), &[expected.expect("有矩形")]);
+        let bytes = rects.byte_count(PAGE, TEXEL) as u64;
+        let page_bytes = u64::from(PAGE) * u64::from(PAGE) * u64::from(TEXEL);
+        assert!(
+            bytes < page_bytes,
+            "bbox 上传字节 {bytes} 必须小于整页 {page_bytes}（旧实现折叠整页）"
+        );
+        assert_eq!(rects.chunks(PAGE, TEXEL).count(), 1, "bbox 是单个矩形块");
     }
 
     #[test]

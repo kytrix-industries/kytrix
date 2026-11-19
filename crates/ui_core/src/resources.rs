@@ -1581,6 +1581,31 @@ mod tests {
         );
     }
 
+    /// X4：一帧 ≥9 块图片的脏矩形必须折叠为 **bbox**（仍 < 整页），不得退化为整页 16 MiB
+    /// 上传/拷贝尖峰。
+    #[test]
+    fn nine_image_tiles_upload_a_bounding_box_not_the_whole_page() {
+        let mut cache = ResourceCache::with_page_for_test((2048, 2048));
+        let _ = cache.take_dirty_rects(); // 首帧整页已上传
+        // 9 块 34×34 的 tile 分散在页面上（直接写脏，避免装箱把它们拼成相邻矩形而提前合并）。
+        for index in 0..9i32 {
+            let x = (index % 3) * 600;
+            let y = (index / 3) * 600;
+            cache
+                .pager
+                .mark_written(0, PhysicalRect::new(x, y, x + 34, y + 34));
+        }
+        let rects = cache.take_dirty_rects();
+        assert!(!rects.is_full(), "X4：9 块图片不得折叠成整页哨兵");
+        let page_bytes = 2048u64 * 2048 * 4;
+        let uploaded = rects.byte_count(2048, 4) as u64;
+        assert!(
+            uploaded < page_bytes,
+            "X4：上传字节 {uploaded} 必须小于整页 {page_bytes}"
+        );
+        assert_eq!(rects.chunks(2048, 4).count(), 1, "折叠结果是单个 bbox 矩形");
+    }
+
     /// D-9：活 tile 永不淘汰；只有**已空**的页按 LRU 回收复用（页号保持稳定）。
     #[test]
     fn empty_pages_are_recycled_lru() {

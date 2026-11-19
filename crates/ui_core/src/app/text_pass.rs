@@ -127,7 +127,8 @@ pub(crate) fn upload_glyph_page(app: &mut App) {
         {
             continue;
         }
-        // 整页脏（矩形数超上限折叠）：直接用整页缓冲，省掉「打包再复制」的一整页拷贝。
+        // 显式整页脏（首帧 / 页尺寸变化 / 渲染器重建）：直接用整页缓冲，省掉「打包再复制」。
+        // 注：X4 起「矩形数超上限」折叠为 bbox（不再退化整页），本分支只服务真正的整页。
         if window.atlas_rects(AtlasKind::Glyph, 0).is_full() {
             if window.queue_atlas_upload(
                 AtlasKind::Glyph,
