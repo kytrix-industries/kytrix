@@ -130,6 +130,15 @@ impl StreamWatermark {
     pub(crate) fn value(&self) -> u64 {
         self.value.load(Ordering::Acquire)
     }
+
+    /// 测试专用：把水位直接设成给定提交序号（生产写入点是 `publish`，只在真实提交后调用）。
+    ///
+    /// review-c RC-3 需要「流使用过某一代、但 fence 尚未完成」这个状态来测试换代捕获侧：
+    /// 只有直接设值才能在 WARP 上确定性构造（真实 submit 后 fence 可能立刻完成，测试会 flaky）。
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(&self, value: u64) {
+        self.publish(value);
+    }
 }
 
 /// 一个窗口在共享队列上的提交流：allocator/list + 自己的 fence + 提交记账 + retire。

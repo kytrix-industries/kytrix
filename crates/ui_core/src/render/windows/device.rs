@@ -1489,6 +1489,76 @@ mod tests {
         shared.unregister_watermark(&watermark);
     }
 
+    /// C3 的**捕获侧**（review-c RC-3）：换代时弃用水位必须登记到**离开**的那一代
+    /// （`capture_generation_watermark(active)`），下一次回到该代时用它判空闲。
+    ///
+    /// 变异 `capture_generation_watermark(active)` → `(target)`（把水位记到即将启用的代上）
+    /// 会让第二次换代误判「代 0 空闲」并改写仍被在飞帧引用的描述符。本测试用「未完成的
+    /// fence + 真实登记流」确定性构造该状态：
+    /// 1. 流水位 = 7（最后提交序号），fence 完成值 0 ⇒ 代 0 的引用仍在飞；
+    /// 2. 第一次换代（0→1）必须把**代 0**的弃用水位捕获为 7；
+    /// 3. 第二次换代（目标回到代 0）必须 `Deferred`（不写描述符/不翻代）；
+    /// 4. signal 后同一请求 `Applied`。
+    #[test]
+    fn the_retired_watermark_is_captured_for_the_departing_generation() {
+        let _guard = super::gpu_test_lock();
+        let shared = SharedGpu::new_warp().expect("WARP shared gpu");
+        let fence: ID3D12Fence =
+            unsafe { shared.raw().CreateFence(0, D3D12_FENCE_FLAG_NONE) }.expect("fence");
+        let watermark = shared.register_watermark(fence.clone());
+        // 模拟：该流最后一次使用「代 0」的提交序号是 7，且 fence 尚未完成（仍在飞）。
+        watermark.publish_for_test(7);
+        assert_eq!(watermark.value(), 7);
+
+        assert_eq!(
+            shared
+                .rebuild_atlas_pages(&[(AtlasKind::Glyph, 64)])
+                .expect("first rebuild"),
+            AtlasRebuildOutcome::Applied
+        );
+        assert_eq!(shared.atlas_generation(), 1, "第一次换代 0 → 1");
+        // 捕获侧不变量：被弃用的是代 0，弃用水位必须记在**代 0** 上（fence 未完成 ⇒ 非空闲）。
+        assert!(
+            !watermark.generation_idle(0),
+            "capture 必须把弃用水位登记到离开的代（代 0），而不是目标代（代 1）"
+        );
+        assert!(
+            watermark.generation_idle(1),
+            "代 1 从未被该流使用，必须视为空闲"
+        );
+
+        // 第二次换代目标回到代 0：其弃用水位（7）尚未完成 ⇒ 只能 Deferred。
+        assert_eq!(
+            shared
+                .rebuild_atlas_pages(&[(AtlasKind::Glyph, 128)])
+                .expect("second rebuild"),
+            AtlasRebuildOutcome::Deferred
+        );
+        assert_eq!(
+            shared.atlas_generation(),
+            1,
+            "Deferred 不得切换回仍有在飞引用的代"
+        );
+        assert_eq!(
+            shared.atlas().page(AtlasKind::Glyph),
+            64,
+            "Deferred 不得换纹理"
+        );
+
+        // fence 完成：同一请求必须成功回到代 0。
+        unsafe { fence.Signal(7) }.expect("signal fence");
+        assert!(watermark.generation_idle(0), "fence 完成后代 0 才空闲");
+        assert_eq!(
+            shared
+                .rebuild_atlas_pages(&[(AtlasKind::Glyph, 128)])
+                .expect("third rebuild"),
+            AtlasRebuildOutcome::Applied
+        );
+        assert_eq!(shared.atlas_generation(), 0, "第二次真正换代回到代 0");
+        assert_eq!(shared.atlas().page(AtlasKind::Glyph), 128);
+        shared.unregister_watermark(&watermark);
+    }
+
     /// 设备真正被移除时：`note_failure` 升级为 `DeviceLost`（粘性）并落 DRED 日志。
     ///
     /// **必须在独立进程里跑**：`RemoveDevice` 是运行时级操作，会污染同进程所有 D3D12 设备

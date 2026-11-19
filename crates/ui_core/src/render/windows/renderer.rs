@@ -1082,19 +1082,21 @@ fn device_lost_for_boundary(renderer: Option<&GpuRenderer>) -> bool {
 /// - `DeviceLost` 是粘性结论，必须整 renderer 恢复；
 /// - 其它错误（`Swapchain` / `Composition` / ...）只有权威判据确认设备已移除时才走设备恢复 ——
 ///   典型来源是 `ResizeBuffers` 在 TDR / 驱动复位竞态下返回设备级 HRESULT 却被包成交换链错误；
-/// - D3D12 设备健康、但 `CheckDeviceState` 判 DComp 失效时，只重建合成设备/visual tree（C2）：
-///   `Composition` 错误既可能来自 DWM 重启，也可能只是一次瞬态调用失败，只有权威状态无效才重建。
+/// - **只有 `Composition` 错误**且 `CheckDeviceState` 判 DComp 失效时才只重建合成设备/visual tree
+///   （C2）：DComp 状态是**附加事实**，不能把 `AppInit` / `FramePipeline` / `Swapchain` 等真实
+///   致命错误吞成 visual 重建（那会掩盖原始错误，持续 Invalid 时还会以「DComp 重试耗尽」误导
+///   归因）。收窄条件放在本函数内，纯逻辑可测（review-c RC-4）。
 ///
 /// 逐调用点的 `classify` 让错误**分类正确**；本判据保证**不会漏掉**尚未接线的调用点（新增 DXGI
 /// 调用点忘记 classify 时仍然恢复而不是静默退出线程）。
 fn fatal_disposition(
     error: &EngineError,
     device_lost: bool,
-    composition_invalid: bool,
+    dcomp_invalid: bool,
 ) -> FatalDisposition {
     if matches!(error, EngineError::DeviceLost { .. }) || device_lost {
         FatalDisposition::DeviceLost
-    } else if composition_invalid {
+    } else if dcomp_invalid && matches!(error, EngineError::Composition { .. }) {
         FatalDisposition::CompositionInvalid
     } else {
         FatalDisposition::Fatal
@@ -1194,12 +1196,15 @@ fn gpu_loop(renderer: GpuRenderer, shared: Arc<Shared>) {
                     EngineError::DeviceLost { .. } => true,
                     _ => device_lost_for_boundary(renderer.as_ref()),
                 };
-                // C2：D3D12 健康时再看 DComp —— `Composition` 错误只有权威状态判 Invalid 才重建。
-                let composition_invalid = !device_lost
+                // C2：D3D12 健康时再取一次 DComp 的权威状态（原始事实）。「只有 `Composition`
+                // 错误才允许走 visual 重建」的收窄在 `fatal_disposition` 内完成（纯逻辑可测）：
+                // `AppInit` / `FramePipeline` / `Swapchain` 等致命错误即使 DComp 恰好 Invalid
+                // 也必须保持致命，不能被吞成 visual 重建。
+                let dcomp_invalid = !device_lost
                     && renderer.as_ref().is_some_and(|current| {
                         current.composition_state() == CompositionState::Invalid
                     });
-                match fatal_disposition(&error, device_lost, composition_invalid) {
+                match fatal_disposition(&error, device_lost, dcomp_invalid) {
                     FatalDisposition::Fatal => {
                         shared.publish_error(error);
                         break;
@@ -2045,6 +2050,30 @@ mod tests {
         assert_eq!(
             fatal_disposition(&composition, true, true),
             FatalDisposition::DeviceLost
+        );
+
+        // review-c RC-4：DComp 恰好 Invalid **不能**把真实的致命错误吞成 visual 重建。
+        // `AppInit` / `FramePipeline` / `Swapchain` 即使 `dcomp_invalid == true` 也必须保持 Fatal，
+        // 否则原始错误被掩盖，持续 Invalid 后还会以「DComp 重建 3 次失败」误导归因。
+        let app_init = EngineError::AppInit {
+            detail: SmolStr::new_static("d3d12 persist target missing"),
+        };
+        assert_eq!(
+            fatal_disposition(&app_init, false, true),
+            FatalDisposition::Fatal,
+            "AppInit 不因 DComp 恰好 Invalid 而降级成 visual 重建"
+        );
+        let frame_pipeline = EngineError::FramePipeline {
+            detail: SmolStr::new_static("compositor thread panicked"),
+        };
+        assert_eq!(
+            fatal_disposition(&frame_pipeline, false, true),
+            FatalDisposition::Fatal
+        );
+        assert_eq!(
+            fatal_disposition(&swapchain, false, true),
+            FatalDisposition::Fatal,
+            "设备健康时交换链错误必须保持致命，即使 DComp 状态异常"
         );
     }
 
