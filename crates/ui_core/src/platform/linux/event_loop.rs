@@ -94,14 +94,14 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
 
     // `WaylandState::new` 要先建**一个**原生窗口（连接、协议工厂与首个 surface 的初始化在同
     // 一条路径上）；其余窗口（含启动时就存在的）由下面的 `sync_windows` 统一建。
-    let (first_id, first_size, first_title) = app
+    let (first_id, first_options) = app
         .windows()
         .next()
-        .map(|(id, window)| (id, window.size(), window.options().title.clone()))
+        .map(|(id, window)| (id, window.options().clone()))
         .ok_or(EngineError::AppInit {
             detail: smol_str::SmolStr::new_static("Application::run without a window"),
         })?;
-    let (mut state, mut queue) = WaylandState::new(first_size, first_title.as_str(), first_id)?;
+    let (mut state, mut queue) = WaylandState::new(first_id, &first_options)?;
     surface::initial_roundtrip(&mut queue, &mut state)?;
     surface::create_devices(&mut state)?;
     // **`app` 必须作为局部变量声明在 `state` 之后**：Rust 的局部变量按声明逆序析构，而函数
@@ -551,13 +551,13 @@ fn sync_windows(
         a11ys.retain(|entry| entry.id != id);
         mirrors.retain(|entry| entry.id != id);
     }
-    let missing: Vec<(WindowId, Size, smol_str::SmolStr)> = app
+    let missing: Vec<(WindowId, crate::window::WindowOptions)> = app
         .windows()
         .filter(|(id, _)| state.window_index(*id).is_none())
-        .map(|(id, window)| (id, window.size(), window.options().title.clone()))
+        .map(|(id, window)| (id, window.options().clone()))
         .collect();
-    for (id, size, title) in missing {
-        state.add_window(id, size, title.as_str())?;
+    for (id, options) in missing {
+        state.add_window(id, &options)?;
     }
     // a11y adapter 与协议对象同生命周期：`App` 里每个窗口在 `WaylandState` 里有且仅有一个。
     for index in 0..state.window_count() {

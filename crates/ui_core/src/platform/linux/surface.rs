@@ -104,7 +104,8 @@ use crate::{
             scroll::{ScrollAccum, ScrollAxis},
             text_input::{self, ImeStateSnapshot, TextInputRoute},
             toplevel::{
-                self, DecorationMode, ToplevelStates, Visibility, WindowGeometry, WmCapabilities,
+                self, DecorationMode, SizeConstraintState, ToplevelStates, Visibility,
+                WindowGeometry, WmCapabilities,
             },
         },
     },
@@ -279,8 +280,9 @@ struct WindowSurface {
     states: ToplevelStates,
     /// compositor 声明的窗口管理能力（xdg-shell v5；未收到 ⇒ 假定全部支持，R10-15）。
     wm_caps: WmCapabilities,
-    /// compositor 建议的尺寸上限（`configure_bounds`，xdg-shell v4；`None` = 未收到）。
-    bounds: Option<Size>,
+    /// 尺寸约束状态（B3）：应用 `min_size`/`max_size` + compositor `configure_bounds` →
+    /// `xdg_toplevel.set_min_size/set_max_size`。同值不重复下发。
+    size_constraints: SizeConstraintState,
     /// 最近一次下发的 window geometry（同值不重复发，R10-10）。
     geometry: Option<WindowGeometry>,
     /// 指针进入本窗口时应使用的光标（应用通过 `take_cursor_change` 设置，R10-3）。
@@ -423,13 +425,13 @@ pub(crate) struct WaylandState {
 impl WaylandState {
     /// 连上 compositor、绑定必需 global、建首个 surface/toplevel、装 IME / 剪贴板（§8.1 的 1–4）。
     ///
-    /// `size` / `title` 是应用建窗参数：compositor 的 configure 给出 `0×0` 时，客户端用请求的
+    /// `options` 是首个窗口的建窗参数（尺寸 / 标题 / min-max；`position` 在 Wayland 上按协议
+    /// 忽略，见 [`Self::add_window`]）：compositor 的 configure 给出 `0×0` 时，客户端用请求的
     /// 尺寸作为初值（否则会退到固定的 800×600）。后续窗口（运行期新增 / 启动时就存在的）都走
     /// [`Self::add_window`]，本函数只在最后为**首个**窗口调用它一次。
     pub(crate) fn new(
-        size: Size,
-        title: &str,
         id: crate::window::WindowId,
+        options: &crate::window::WindowOptions,
     ) -> Result<(Self, wayland_client::EventQueue<Self>), EngineError> {
         // R10-16：断连 / 协议错误 / 缺 global 分成三种强类型失败（不再折叠成 AppInit 字符串）。
         let connection = Connection::connect_to_env().map_err(|error| EngineError::Wayland {
@@ -528,7 +530,7 @@ impl WaylandState {
         // `wl_output.scale`，整数回退的首帧因此能按「全部已绑定 output 的最大 scale」兜底
         // （`wl_surface.enter` 要等 surface 映射之后才到，V-110）。
         state.bind_existing_outputs(&globals);
-        state.add_window(id, size, title)?;
+        state.add_window(id, options)?;
         Ok((state, queue))
     }
 
@@ -538,7 +540,7 @@ impl WaylandState {
     ///
     /// ```text
     /// create_surface → get_xdg_surface → get_toplevel
-    ///   → set_app_id / set_title / set_min_size
+    ///   → set_app_id / set_title / set_min_size + set_max_size
     ///   → get_toplevel_decoration + set_mode   ← xdg-decoration v1：必须早于首次 commit
     ///   → get_fractional_scale + get_viewport  ← 尽早创建，避免错过初始 preferred_scale
     ///   → surface.commit()                     ← 唯一触发初始 configure 的 commit
@@ -549,11 +551,22 @@ impl WaylandState {
     ///
     /// 首个 configure 由 compositor 异步发回，事件循环在收到 `configured` 之前不会为它建
     /// swapchain / 出帧。
+    ///
+    /// # `WindowOptions` 的消费（B3）
+    ///
+    /// - `size` / `title`：初始尺寸与标题（`size` 在协议层取整，见下）；
+    /// - `min_size` / `max_size`：收敛进 [`SizeConstraintState`]，在首个 commit 之前下发
+    ///   `set_min_size/set_max_size`（`None` 的 min 用平台默认 [`window::MIN_SIZE_LOGICAL`]）；
+    /// - `position`：**有意忽略** —— 这是 Wayland 的协议事实而不是遗漏：`xdg_toplevel` 没有
+    ///   任何定位请求（只有
+    ///   set_parent/set_title/set_app_id/show_window_menu/move/resize/set_max_size/set_min_size/
+    ///   set_maximized/unset_maximized/set_fullscreen/unset_fullscreen/set_minimized），窗口位置
+    ///   完全由 compositor 决定，也没有可靠的位置回读（`Event::Moved` 在 Linux 上永不产生）。
+    ///   公共文档 `WindowOptions::position` 已写明该降级语义。
     pub(crate) fn add_window(
         &mut self,
         id: crate::window::WindowId,
-        size: Size,
-        title: &str,
+        options: &crate::window::WindowOptions,
     ) -> Result<(), EngineError> {
         let surface = self.compositor.create_surface(&self.queue_handle, ());
         let xdg_surface = self
@@ -561,20 +574,22 @@ impl WaylandState {
             .get_xdg_surface(&surface, &self.queue_handle, ());
         let toplevel = xdg_surface.get_toplevel(&self.queue_handle, ());
         toplevel.set_app_id(APP_ID.to_owned());
-        toplevel.set_title(title.to_owned());
+        toplevel.set_title(options.title.to_string());
         // Wayland 的 configure / window geometry 是整数，小数的逻辑尺寸在协议层没有表示：
         // 这里先四舍五入取整，整数回退下 buffer = `round(L × N)` 因而严格是 buffer_scale 的
         // 整数倍（否则 `wl_surface.attach` 报 `invalid_size`，V-110）。
-        let size = Size::new(size.width.round().max(1.0), size.height.round().max(1.0));
+        let size = Size::new(
+            options.size.width.round().max(1.0),
+            options.size.height.round().max(1.0),
+        );
         // 首帧尺寸：**xdg-shell 没有 `set_default_size` 请求**（协议原文的 xdg_toplevel 请求只有
         // set_parent/set_title/set_app_id/show_window_menu/move/resize/set_max_size/set_min_size/
         // set_maximized/unset_maximized/set_fullscreen/unset_fullscreen/set_minimized，
         // 见 `wayland-protocols-0.32.13/protocols/stable/xdg-shell/xdg-shell.xml:622-1247`）。
         // 初始尺寸因此只有两条合法途径：compositor 在首个 `configure` 里给尺寸，或它给 0×0 表示
         // 「客户端自选」—— 后者由下面的 `Configure` 分支保留本结构里的 `size`（我们不覆盖它）。
-        // 最小尺寸是 window geometry 的逻辑像素（含 CSD 阴影边距），与 scale 无关：只需在首个
-        // commit 前设置一次。
-        window::apply_min_size(&toplevel);
+        // 尺寸约束（min/max）是 window geometry 的逻辑像素（含 CSD 阴影边距），与 scale 无关：
+        // 在首个 commit 前由 `SizeConstraintState` 下发（见 `apply_size_limits`）。
 
         // 装饰：请求 CLIENT_SIDE（没有该扩展时 compositor 自行决定）。**必须在首次 commit
         // 之前**创建，`configure` 事件里的 `mode` 才是权威的最终模式（R10-4）。
@@ -601,6 +616,9 @@ impl WaylandState {
             _ => None,
         };
         let uses_viewport = viewport.is_some();
+        // B3：`min_size = None` 用平台默认（与 Win32 / macOS 同源）；max 走应用上限，
+        // 之后由 `configure_bounds` 逐维收紧。
+        let minimum = options.min_size.unwrap_or(window::MIN_SIZE_LOGICAL);
         self.windows.push(WindowSurface {
             id,
             surface,
@@ -628,7 +646,7 @@ impl WaylandState {
             configured: false,
             states: ToplevelStates::default(),
             wm_caps: WmCapabilities::ASSUMED,
-            bounds: None,
+            size_constraints: SizeConstraintState::new(minimum, options.max_size),
             geometry: None,
             cursor: Cursor::Default,
             close_requested: false,
@@ -638,7 +656,10 @@ impl WaylandState {
         // window geometry 与首个 commit 一起生效（`set_window_geometry` 是双缓冲状态）。
         // IME 路由的每窗口策略表与 `windows` 同生命周期（下标一一对应）。
         self.text_input_route.add_window();
-        self.apply_window_geometry(self.windows.len() - 1);
+        let index = self.windows.len() - 1;
+        // B3：min/max 与 window geometry 一样是双缓冲 toplevel 状态，必须在首个 commit 之前下发。
+        self.apply_size_limits(index);
+        self.apply_window_geometry(index);
         // **唯一**触发初始 configure 的 commit：必须排在所有协议对象创建之后（R10-4）。
         self.windows[self.windows.len() - 1].surface.commit();
         Ok(())
@@ -1002,6 +1023,31 @@ impl WaylandState {
             geometry.width,
             geometry.height,
         );
+    }
+
+    /// B3：把窗口当前的尺寸约束（应用 min/max + compositor `configure_bounds`）下发给
+    /// `xdg_toplevel`。
+    ///
+    /// - 同值不重复发：[`SizeConstraintState::take_pending`] 返回 `None` 表示与上次下发的
+    ///   协议参数完全一致；
+    /// - `max == None` 时发 `set_max_size(0, 0)`：协议里 0 表示「该维无上限」，正是「撤销应用
+    ///   上限 / 清除 compositor bounds」的表示；
+    /// - 调用点两个：`add_window`（首个 commit 之前）与 `configure_bounds` 变化（下一次 commit
+    ///   之前生效）。min/max 是双缓冲 toplevel 状态，本方法只排队请求，不 commit。
+    fn apply_size_limits(&mut self, index: usize) {
+        let Some(limits) = self.windows[index]
+            .size_constraints
+            .take_pending(window::SHADOW_MARGIN)
+        else {
+            return;
+        };
+        self.windows[index]
+            .toplevel
+            .set_min_size(limits.min.0, limits.min.1);
+        let (max_width, max_height) = limits.max.unwrap_or((0, 0));
+        self.windows[index]
+            .toplevel
+            .set_max_size(max_width, max_height);
     }
 
     /// 把 `wp_viewport` 的所有权交给窗口渲染器（`Some` = fractional 模式）。
@@ -1982,20 +2028,13 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandState {
                 }
             }
             xdg_toplevel::Event::ConfigureBounds { width, height } => {
-                // R10-15：建议的尺寸上限（扣掉面板等区域）。落成 `set_max_size`，
-                // 避免最大化时向 compositor 请求超出可用工作区的尺寸。
-                if width > 0 && height > 0 {
-                    let bounds = Size::new(width as f32, height as f32);
-                    if state.windows[index].bounds != Some(bounds) {
-                        state.windows[index].bounds = Some(bounds);
-                        state.windows[index].toplevel.set_max_size(
-                            bounds.width.round() as i32,
-                            bounds.height.round() as i32,
-                        );
-                    }
-                } else {
-                    state.windows[index].bounds = None;
-                }
+                // R10-15 / B3：compositor 建议的**尺寸上限**（扣掉面板等区域；0×0 = 无建议上限）。
+                // 它与应用 `max_size` 逐维取最小后才是 `set_max_size` 的参数 —— 旧实现直接拿
+                // bounds 覆盖应用上限，应用显式设置的 max 会被静默放大（审计 §3）。
+                state.windows[index].size_constraints.set_bounds(
+                    (width > 0 && height > 0).then(|| Size::new(width as f32, height as f32)),
+                );
+                state.apply_size_limits(index);
             }
             xdg_toplevel::Event::Close => {
                 state.windows[index].close_requested = true;
