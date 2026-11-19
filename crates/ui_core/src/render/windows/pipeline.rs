@@ -394,12 +394,15 @@ fn texture_srv(kind: AtlasKind) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
             AtlasKind::Glyph => DXGI_FORMAT_R8_UNORM,
             AtlasKind::Image => DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
         },
-        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        // D-9-c：图集是 texture array（字形 1 层、图片 MAX_IMAGE_PAGES 层），层号是采样坐标。
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
         Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
         Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-            Texture2D: D3D12_TEX2D_SRV {
+            Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
                 MostDetailedMip: 0,
                 MipLevels: 1,
+                FirstArraySlice: 0,
+                ArraySize: kind.layers(),
                 PlaneSlice: 0,
                 ResourceMinLODClamp: 0.0,
             },

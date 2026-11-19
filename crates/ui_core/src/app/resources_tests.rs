@@ -224,6 +224,7 @@ fn a_busy_window_queues_its_rects_without_blocking_idle_windows() {
     assert!(
         app.window_mut(second).expect("second").queue_atlas_upload(
             AtlasKind::Glyph,
+            0,
             page,
             &vec![0u8; (page * page) as usize],
             full,
@@ -245,14 +246,14 @@ fn a_busy_window_queues_its_rects_without_blocking_idle_windows() {
     assert!(
         app.window(first)
             .expect("first")
-            .atlas_rects(AtlasKind::Glyph)
+            .atlas_rects(AtlasKind::Glyph, 0)
             .is_empty(),
         "空闲窗口的矩形必须已经发出"
     );
     let second_rects = app
         .window(second)
         .expect("second")
-        .atlas_rects(AtlasKind::Glyph);
+        .atlas_rects(AtlasKind::Glyph, 0);
     assert_eq!(second_rects.rects().len(), 1);
     assert_eq!(
         second_rects.rects()[0],
@@ -306,6 +307,7 @@ fn a_deferred_atlas_frame_requests_a_follow_up() {
     let full = DirtyRects::full();
     assert!(app.window_mut(window).expect("window").queue_atlas_upload(
         AtlasKind::Glyph,
+        0,
         page,
         &vec![0u8; (page * page) as usize],
         full,
@@ -373,6 +375,170 @@ fn image_atlas_page_is_lazy_until_the_first_insert() {
         "图片页固定最大档（P1-2.7：页尺寸与插入顺序无关）"
     );
     assert_eq!(pixels.len(), 2048 * 2048 * 4, "整页 = page² × BGRA8");
+}
+
+/// D9-c：图片图集是 4 层 texture array，逐层独立上传。
+///
+/// 用 16² 的小图片页让「第 2 页」在 3 张 4×4 图后必然出现；再在不丢矩形的前提下验证：
+/// - 新页的写入只攒到 **layer 1**（layer 0 不得被整页重传）；
+/// - 同页增量只带 AOI 矩形（字节数 << 整页）；
+/// - 忙槽空闲后矩形只入队一次并清空。
+#[cfg(windows)]
+#[test]
+fn image_pages_upload_to_their_own_texture_array_layers() {
+    use crate::{paint::atlas::AtlasKind, render::DirtyRects};
+
+    let _guard = crate::render::windows::device::gpu_test_lock();
+    let (_rt, mut app, window) = setup();
+    // 16² 的图片页：每个 4×4 tile（含 padding 6×6）一页只放得下 2 个（etagere 装箱实测）。
+    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
+    for index in 0..3u8 {
+        let _ = app
+            .resources_mut()
+            .insert(&png_rgba([index + 1, 20, 30, 255]))
+            .expect("insert");
+    }
+    assert_eq!(app.resources().page_count(), 2, "第 3 张必须开第 2 页");
+    app.window_mut(window)
+        .expect("window")
+        .enable_offscreen_renderer()
+        .expect("offscreen renderer");
+    app.upload_atlas_pages();
+
+    let extent = app.resources().page_extent();
+    {
+        let target = app.window(window).expect("window");
+        assert!(target.image_page_received(), "数组 extent 必须记账");
+        assert!(target.image_layer_received(0), "layer 0 首帧整层上传");
+        assert!(target.image_layer_received(1), "layer 1 首帧整层上传");
+        assert!(
+            !target.image_layer_received(2),
+            "没有内容的层不得记账为已初始化"
+        );
+        assert!(!target.atlas_rects_pending(), "首帧上传后不得留待传矩形");
+    }
+    // 让首帧的整层上传真正录制进 GPU 槽（离屏渲染器在下一帧提交时消费待上传层）。
+    app.window_mut(window).expect("window").request_repaint();
+    let _ = app.frame(window).expect("frame").expect("ok");
+    assert!(
+        app.window(window)
+            .expect("window")
+            .atlas_idle(AtlasKind::Image),
+        "首帧上传必须已经录制，图片图集槽才能再次入队"
+    );
+
+    // 让图片图集的共享槽停在「已入队、未录制」：后续写入只能攒在该窗口的层队列里。
+    let page_bytes = (extent as usize) * (extent as usize) * 4;
+    assert!(
+        app.window_mut(window).expect("window").queue_atlas_upload(
+            AtlasKind::Image,
+            0,
+            extent,
+            &vec![0u8; page_bytes],
+            DirtyRects::full()
+        ),
+        "offscreen 渲染器必须接受入队"
+    );
+    assert!(
+        !app.window(window)
+            .expect("window")
+            .atlas_idle(AtlasKind::Image),
+        "入队之后、录制之前图片图集必须是忙的"
+    );
+
+    // 页 0 已满 ⇒ 这张新图落在第 2 页（layer 1）。
+    let inserted = app
+        .resources_mut()
+        .insert(&png_rgba([200, 1, 2, 255]))
+        .expect("insert");
+    assert_eq!(inserted.tile.page, 1, "页 0 已满，新图必须落在 layer 1");
+    app.upload_atlas_pages();
+
+    {
+        let target = app.window(window).expect("window");
+        assert_eq!(
+            target.atlas_rects(AtlasKind::Image, 0).rects().len(),
+            0,
+            "layer 0 没有新写入 ⇒ 不得攒 layer 0 的待传矩形（更不得整页重传）"
+        );
+        let layer1 = target.atlas_rects(AtlasKind::Image, 1);
+        assert_eq!(
+            layer1.rects().len(),
+            1,
+            "layer 1 必须攒下新 tile 的 AOI 矩形"
+        );
+        assert!(
+            layer1.byte_count(extent, 4) < page_bytes,
+            "同页增量只传 AOI（{} B < 整页 {page_bytes} B）",
+            layer1.byte_count(extent, 4)
+        );
+    }
+
+    // 忙槽在下一帧被录制；随后的上传只发 layer 1 并清掉它的矩形。
+    app.window_mut(window).expect("window").request_repaint();
+    let _ = app.frame(window).expect("frame").expect("ok");
+    app.upload_atlas_pages();
+    let target = app.window(window).expect("window");
+    assert!(
+        !target.atlas_rects_pending(),
+        "layer 1 的矩形必须已经入队并清空"
+    );
+    assert_eq!(target.atlas_rects(AtlasKind::Image, 0).rects().len(), 0);
+}
+
+/// D9-c：晚挂上的窗口必须补齐**每一个已打开页**的整层内容（texture array 每层独立）。
+///
+/// 新建窗口时进程级资源页可能早就有内容、而脏矩形早已被旧窗口消费 —— 这时只能按
+/// `page_pixels_at(layer)` 逐层整页上传；只补 layer 0 会让 layer 1 的 tile 采样到未定义内容。
+#[cfg(windows)]
+#[test]
+fn a_new_window_receives_every_open_image_layer() {
+    let _guard = crate::render::windows::device::gpu_test_lock();
+    let (_rt, mut app, first) = setup();
+    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
+    for index in 0..3u8 {
+        let _ = app
+            .resources_mut()
+            .insert(&png_rgba([index + 10, 40, 50, 255]))
+            .expect("insert");
+    }
+    assert_eq!(app.resources().page_count(), 2);
+    app.window_mut(first)
+        .expect("first")
+        .enable_offscreen_renderer()
+        .expect("offscreen renderer");
+    app.upload_atlas_pages();
+
+    let second = app.create_window(WindowOptions {
+        title: "second".into(),
+        size: Size::new(64.0, 64.0),
+        scale: crate::math::Scale::ONE,
+        ..WindowOptions::default()
+    });
+    app.window_mut(second)
+        .expect("second")
+        .enable_offscreen_renderer()
+        .expect("offscreen renderer");
+    app.upload_atlas_pages();
+
+    let target = app.window(second).expect("second");
+    assert!(target.image_page_received(), "新窗口必须收到数组 extent");
+    assert!(target.image_layer_received(0), "新窗口必须补 layer 0");
+    assert!(target.image_layer_received(1), "新窗口必须补 layer 1");
+    assert!(!target.atlas_rects_pending());
+    {
+        let first = app.window(first).expect("first");
+        assert!(
+            !first.atlas_rects_pending() && first.image_layer_received(0),
+            "已同步窗口不得被新窗口的补齐拖成整页重传"
+        );
+    }
+
+    // 再跑一次：没有任何新写入，两边都不得重复上传。
+    app.upload_atlas_pages();
+    for window in [first, second] {
+        assert!(!app.window(window).expect("window").atlas_rects_pending());
+    }
 }
 
 /// D-7：关窗必须归还该窗口 `insert_owned` 的引用；去重共享的内容不得被误回收。

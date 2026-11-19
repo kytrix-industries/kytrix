@@ -420,7 +420,8 @@ impl TestApp {
     /// 像素快照：Windows 上用 WARP 真渲染当前 `Scene`；macOS 用离屏 Metal；Linux 恒 `Gpu`
     /// （`new_offscreen` 在 Wayland 下需要真实 `wl_surface`，因此 Linux 上没有离屏渲染器）。
     ///
-    /// 两张图集页都会上传：字形页恒上传，图片页只在 `App::resources` 非空时上传（P13 §8.3）。
+    /// 两张图集都会上传：字形页恒上传；图片图集是 4 层 texture array（D-9-c），按已打开页逐层
+    /// 整页上传（没有图片时不传）。
     ///
     /// # Errors
     /// [`SnapshotError::NoRenderer`]（本构建没有渲染器）或 [`SnapshotError::Gpu`]
@@ -441,14 +442,18 @@ impl TestApp {
         let mut renderer = Self::offscreen_renderer(size).map_err(gpu_error)?;
         renderer.queue_atlas_upload(
             crate::paint::atlas::AtlasKind::Glyph,
+            0,
             glyph_page.0,
             &glyph_pixels,
             crate::render::DirtyRects::full(),
         );
-        // 图片页：只有插过资源（页已分配）才上传。
-        if let Some((image_page, image_pixels)) = self.app.resource_page_pixels() {
+        // 图片图集：多页 texture array（D-9-c）⇒ 逐层整页上传；没有图片页时什么都不传。
+        for (layer, (image_page, image_pixels)) in
+            self.app.resource_page_pixels_all().into_iter().enumerate()
+        {
             renderer.queue_atlas_upload(
                 crate::paint::atlas::AtlasKind::Image,
+                layer as u16,
                 image_page.0,
                 image_pixels,
                 crate::render::DirtyRects::full(),

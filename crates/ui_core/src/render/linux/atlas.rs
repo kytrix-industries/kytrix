@@ -1,18 +1,21 @@
 //! 共享图集纹理（[`SharedAtlas`]）+ 每窗口上传器（[`AtlasUploads`]）
-//! （P1-2.9）。
+//! （P1-2.9 / D-9-c）。
 //!
-//! 字形图集是 `R8_UNORM`（线性覆盖度），图片图集是 `B8G8R8A8_SRGB`。两张纹理是**进程级
-//! 共享资源**，由 `device::SharedGpu` 持有；每窗口只有自己的**上传路径**：
+//! 字形图集是 `R8_UNORM`（线性覆盖度），图片图集是 `B8G8R8A8_SRGB`。两张纹理都是 **texture
+//! array**（字形固定 1 层、图片 `MAX_IMAGE_PAGES` 层，层号 = 图集页索引）且是**进程级共享
+//! 资源**，由 `device::SharedGpu` 持有；每窗口只有自己的**上传路径**：
 //!
-//! - [`SharedAtlas`]：两张纹理 + 一个 sampler + 当前页尺寸。懒分配：初始化只建 1×1 占位页
-//!   （描述符集合里始终有有效视图），第一次整页上传 / 页档换代时由
+//! - [`SharedAtlas`]：两张 texture array + 一个 sampler + 当前页尺寸。懒分配：初始化只建
+//!   1×1×layers 占位页（描述符集合里始终有有效视图），第一次整页上传 / 页档换代时由
 //!   `SharedGpu::rebuild_atlas_pages` 重建。新页在写锁内先转到 `SHADER_READ_ONLY_OPTIMAL`，
 //!   因此所有窗口的增量上传都走同一条 `SHADER_READ_ONLY → TRANSFER_DST → SHADER_READ_ONLY`
 //!   屏障序列 —— 不需要「哪张页初始化过」的可变状态（那是跨窗口竞态）。
-//! - [`AtlasUploads`]（每窗口）：待上传页 + 每 in-flight 槽 × 每图集的 staging。staging 必须
-//!   是每窗口的：同一份共享纹理会被多个窗口的 GPU 线程并发上传，各窗口的 staging 不能互相
-//!   覆盖；每个槽的 staging 又只在本窗口该槽的 fence 完成前复用（与 `UploadArena` 同一套
-//!   in-flight 语义）。
+//! - [`AtlasUploads`]（每窗口）：待上传层（每 kind 每层一份）+ 每 in-flight 槽 × 每图集的
+//!   staging。staging 必须是每窗口的：同一份共享纹理会被多个窗口的 GPU 线程并发上传，各窗口
+//!   的 staging 不能互相覆盖；每个槽的 staging 又只在本窗口该槽的 fence 完成前复用（与
+//!   `UploadArena` 同一套 in-flight 语义）。同一帧的多层上传**聚合进同一块 staging**：每层
+//!   每个脏矩形各占自己的偏移（共用 offset 0 会让 GPU 只读到最后一层），逐矩形把
+//!   `vkCmdCopyBufferToImage` 的 `base_array_layer` 写成层号。
 //!
 //! 并发模型（与 Windows 后端的 `SharedAtlas` / `AtlasUploads` 同构）：窗口的 GPU 线程在
 //! 图集**读锁**内录制并提交一帧（页在录制期间不会变），页重建走**写锁**并等待共享队列 idle
@@ -27,7 +30,7 @@ use ash::vk;
 
 use crate::{
     error::EngineError,
-    paint::atlas::AtlasKind,
+    paint::atlas::{AtlasKind, MAX_IMAGE_PAGES},
     render::{
         atlas::{DirtyRects, MAX_RESIDENT_STAGING_BYTES, RectChunk, texel_bytes},
         frame::MAX_FRAMES_IN_FLIGHT,
@@ -39,20 +42,24 @@ use crate::{
     },
 };
 
-/// 初始化时的占位页（1×1）：让描述符集合里的图集视图在第一次上传之前也有效。
+/// 初始化时的占位页（1×1 纹素 × 层数）：让描述符集合里的图集视图在第一次上传之前也有效。
 const PLACEHOLDER_PAGE: u32 = 1;
 
-/// 一张共享图集页（image + memory + view + 页尺寸）。
+/// 一张共享图集页（texture array + image + memory + view + 页尺寸）。
 struct SharedPage {
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
     page: u32,
+    /// texture array 层数（字形 1、图片 `MAX_IMAGE_PAGES`）；层号 = 图集页索引（D-9-c）。
+    layers: u32,
 }
 
 impl SharedPage {
     fn new(device: &Device, kind: AtlasKind, page: u32) -> Result<Self, EngineError> {
         let format = texture_format(kind);
+        // D-9-c：图集是 texture array（字形 1 层、图片 MAX_IMAGE_PAGES 层）。
+        let layers = kind.layers();
         // 产品路径只采样 / 上传，不读回图集；单测要验证「两帧各自的 staging 落到了自己的行」，
         // 因此 `cfg(test)` 下额外允许 `TRANSFER_SRC`（usage 是创建参数，测试无法事后追加）。
         let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
@@ -70,7 +77,7 @@ impl SharedPage {
                         depth: 1,
                     })
                     .mip_levels(1)
-                    .array_layers(1)
+                    .array_layers(layers)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
                     .usage(usage)
@@ -121,13 +128,14 @@ impl SharedPage {
             device.raw().create_image_view(
                 &vk::ImageViewCreateInfo::default()
                     .image(image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
+                    // D-9-c：视图覆盖整条 texture array（shader 侧声明 sampler2DArray）。
+                    .view_type(vk::ImageViewType::TYPE_2D_ARRAY)
                     .format(format)
                     .subresource_range(
                         vk::ImageSubresourceRange::default()
                             .aspect_mask(vk::ImageAspectFlags::COLOR)
                             .level_count(1)
-                            .layer_count(1),
+                            .layer_count(layers),
                     ),
                 None,
             )
@@ -147,6 +155,7 @@ impl SharedPage {
             memory,
             view,
             page,
+            layers,
         })
     }
 
@@ -171,7 +180,7 @@ pub(crate) struct SharedAtlas {
 }
 
 impl SharedAtlas {
-    /// 建两张 1×1 占位页 + sampler；真实页由 `SharedGpu::rebuild_atlas_pages` 生效。
+    /// 建两张 1×1×layers 占位页 + sampler；真实页由 `SharedGpu::rebuild_atlas_pages` 生效。
     pub(crate) fn new(device: &Device) -> Result<Self, EngineError> {
         let glyph = SharedPage::new(device, AtlasKind::Glyph, PLACEHOLDER_PAGE)?;
         let image = match SharedPage::new(device, AtlasKind::Image, PLACEHOLDER_PAGE) {
@@ -233,6 +242,11 @@ impl SharedAtlas {
         self.page_ref(kind).page
     }
 
+    /// 该图集 texture array 的层数（录制屏障必须覆盖整个数组）。
+    pub(crate) fn layers(&self, kind: AtlasKind) -> u32 {
+        self.page_ref(kind).layers
+    }
+
     fn page_ref(&self, kind: AtlasKind) -> &SharedPage {
         match kind {
             AtlasKind::Glyph => &self.glyph,
@@ -262,17 +276,14 @@ impl SharedAtlas {
 
     /// 录制「新建页从 `UNDEFINED` 转到 `SHADER_READ_ONLY_OPTIMAL`」的屏障。
     ///
-    /// 只对 `kinds` 里的页发屏障（占位页初始化 / 每次重建的新页）。
+    /// 只对 `kinds` 里的页发屏障（占位页初始化 / 每次重建的新页）；每条屏障覆盖整条 texture
+    /// array（数组各层的布局都是 `UNDEFINED`）。
     pub(crate) fn record_layout_transitions(
         &self,
         device: &ash::Device,
         command: vk::CommandBuffer,
         kinds: &[AtlasKind],
     ) {
-        let range = vk::ImageSubresourceRange::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .level_count(1)
-            .layer_count(1);
         let barriers: Vec<vk::ImageMemoryBarrier> = kinds
             .iter()
             .map(|kind| {
@@ -280,7 +291,12 @@ impl SharedAtlas {
                     .old_layout(vk::ImageLayout::UNDEFINED)
                     .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                     .image(self.image(*kind))
-                    .subresource_range(range)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .layer_count(kind.layers()),
+                    )
                     .dst_access_mask(vk::AccessFlags::SHADER_READ)
             })
             .collect();
@@ -313,8 +329,11 @@ impl Drop for SharedAtlas {
     }
 }
 
-/// 待上传的一页内容（打包 `pixels` + 页尺寸 + 脏矩形）。
+/// 待上传的一层内容（打包 `pixels` + 层号 + 页尺寸 + 脏矩形）。
 struct PendingUpload {
+    /// texture array 层号（字形恒 0；图片 = 图集页索引）。
+    layer: u16,
+    /// 该层的页边长（纹素）。
     page: u32,
     /// 入队时**共享图集**的页尺寸。
     ///
@@ -333,50 +352,62 @@ impl PendingUpload {
     }
 }
 
-/// 每窗口的图集上传路径：待上传页 + 每 in-flight 槽 × 每图集的 staging。
+/// 每窗口的图集上传路径：待上传层（每 kind 每层一份）+ 每 in-flight 槽 × 每图集的 staging。
 pub(crate) struct AtlasUploads {
-    pending: [Option<PendingUpload>; 2],
+    /// `[kind][layer]`：字形只有 `[0]`，图片 `0..MAX_IMAGE_PAGES`。
+    pending: [[Option<PendingUpload>; MAX_IMAGE_PAGES as usize]; 2],
     staging: [StagingSet; 2],
 }
 
 impl AtlasUploads {
-    pub(crate) const fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            pending: [None, None],
-            staging: [StagingSet::new(), StagingSet::new()],
+            pending: std::array::from_fn(|_| std::array::from_fn(|_| None)),
+            staging: [
+                StagingSet::new(AtlasKind::Glyph),
+                StagingSet::new(AtlasKind::Image),
+            ],
         }
     }
 
-    /// 该图集是否有一笔上传已入队、还没被命令缓冲消费（离屏目标的空闲判据）。
+    /// 该图集是否有**任意层**的上传已入队、还没被命令缓冲消费（离屏目标的空闲判据）。
     pub(crate) fn pending(&self, kind: AtlasKind) -> bool {
-        self.pending[kind.index() as usize].is_some()
+        self.pending[kind.index() as usize]
+            .iter()
+            .any(Option::is_some)
     }
 
-    /// 入队一页的脏矩形（`pixels` 是 `rects` 顺序**逐矩形紧密打包**的字节，R06-3）。
+    /// 入队一层的脏矩形（`pixels` 是 `rects` 顺序**逐矩形紧密打包**的字节，R06-3）。
     ///
     /// `pixels` 按**所有权**移动进待上传槽，避免槽 → 纹理之间再复制一次（2048² 图片页是
     /// 16 MiB）。长度必须等于 [`DirtyRects::byte_count`]（release 也硬断言：越界读会读穿堆）。
     pub(crate) fn queue_upload(
         &mut self,
         kind: AtlasKind,
+        layer: u16,
         page: u32,
         queued_page: u32,
         pixels: Vec<u8>,
         rects: DirtyRects,
     ) {
+        assert!(
+            u32::from(layer) < kind.layers(),
+            "atlas layer {layer} out of range for {kind:?}"
+        );
         let expected = rects.byte_count(page, texel_bytes(kind));
         assert_eq!(
             pixels.len(),
             expected,
-            "atlas payload size mismatch for {kind:?}: expected {expected} bytes for the dirty rects of a {page}² page, got {}",
+            "atlas payload size mismatch for {kind:?} layer {layer}: expected {expected} bytes for the dirty rects of a {page}² page, got {}",
             pixels.len()
         );
-        let slot = kind.index() as usize;
+        let slot = &mut self.pending[kind.index() as usize][usize::from(layer)];
         assert!(
-            self.pending[slot].is_none(),
-            "atlas payload slot must be consumed before the next upload (kind {kind:?})"
+            slot.is_none(),
+            "atlas payload slot must be consumed before the next upload (kind {kind:?}, layer {layer})"
         );
-        self.pending[slot] = Some(PendingUpload {
+        *slot = Some(PendingUpload {
+            layer,
             page,
             queued_page,
             pixels,
@@ -392,31 +423,44 @@ impl AtlasUploads {
     /// 直接丢弃 —— 重建回旧页会让所有窗口对错误尺寸的纹理采样，且丢弃的行会被下一次整页
     /// 上传（页内容是进程级的）覆盖。
     ///
+    /// 同一 kind 的所有层共享同一个 extent（图片图集所有页等大），因此重建请求按 extent 去重。
+    ///
     /// 调用方在 `SharedGpu` 的图集读锁内调用；返回非空时先释放读锁，
     /// `SharedGpu::rebuild_atlas_pages` 在写锁内落地新页，然后重试。
     pub(crate) fn reconcile_pages(&mut self, pages: [u32; 2]) -> Vec<(AtlasKind, u32)> {
-        let mut rebuild = Vec::new();
+        let mut rebuild: Vec<(AtlasKind, u32)> = Vec::new();
         for kind in [AtlasKind::Glyph, AtlasKind::Image] {
             let index = kind.index() as usize;
-            let Some(pending) = &self.pending[index] else {
-                continue;
-            };
-            if pending.page == pages[index] {
-                continue;
-            }
-            // 整页 + 「入队时共享页还不是它」= App 换代的**新页**：重建共享纹理。
-            // 其余（旧增量 / 入队时页就是它的旧整页）都是别的窗口已经换代之后留下的过期上传：
-            // 丢弃即可 —— 丢弃的行会在下一次整页上传时被整页内容覆盖（页内容是进程级的）。
-            if pending.covers_full_page() && pending.queued_page != pending.page {
-                rebuild.push((kind, pending.page));
-            } else {
-                self.pending[index] = None;
+            for slot in self.pending[index].iter_mut() {
+                let Some(pending) = slot.as_ref() else {
+                    continue;
+                };
+                if pending.page == pages[index] {
+                    continue;
+                }
+                // 整页 + 「入队时共享页还不是它」= App 换代的**新页**：重建共享纹理。
+                // 其余（旧增量 / 入队时页就是它的旧整页）都是别的窗口已经换代之后留下的过期
+                // 上传：丢弃即可 —— 丢弃的行会在下一次整页上传时被整页内容覆盖。
+                if pending.covers_full_page() && pending.queued_page != pending.page {
+                    let page = pending.page;
+                    if !rebuild.contains(&(kind, page)) {
+                        rebuild.push((kind, page));
+                    }
+                } else {
+                    *slot = None;
+                }
             }
         }
         rebuild
     }
 
-    /// 在本帧命令缓冲里录制全部待上传页（每页 = staging 写入 + 逐区间 `cmd_copy_buffer_to_image`）。
+    /// 在本帧命令缓冲里录制全部待上传层（每层 = staging 写入 + 逐区间
+    /// `cmd_copy_buffer_to_image`）。
+    ///
+    /// 同一 kind 的多层在一次调用里**聚合**：共用一块 staging，每层每个脏矩形的拷贝各占自己的
+    /// 偏移（共用 offset 0 会让 GPU 只读到最后一层），逐矩形把
+    /// `cmd_copy_buffer_to_image` 的 `base_array_layer` 写成层号（D-9-c 多页 texture array）。
+    /// 屏障按 kind 各一组、覆盖整条数组。
     ///
     /// 返回本帧扩容 / 一次性 staging 换下的句柄（调用方在本帧录制结束后 retire；旧的常驻
     /// staging 在本帧槽的 fence 已完成后立即销毁是安全的，这里直接在 `StagingSet` 内 drop）。
@@ -430,26 +474,28 @@ impl AtlasUploads {
         let mut retired = Vec::new();
         for kind in [AtlasKind::Glyph, AtlasKind::Image] {
             let kind_index = kind.index() as usize;
-            let Some(pending) = self.pending[kind_index].take() else {
+            let pendings: Vec<PendingUpload> = self.pending[kind_index]
+                .iter_mut()
+                .filter_map(Option::take)
+                .collect();
+            if pendings.is_empty() {
                 continue;
-            };
-            debug_assert_eq!(
-                pending.page,
-                atlas.page(kind),
+            }
+            let page = atlas.page(kind);
+            debug_assert!(
+                pendings.iter().all(|pending| pending.page == page),
                 "page changes must be applied before recording"
             );
-            if pending.page != atlas.page(kind) {
+            if pendings.iter().any(|pending| pending.page != page) {
                 // 防御：页在录制期间被改（理论上被图集读锁排除）。丢掉而不是画错内容。
                 continue;
             }
-            let image = atlas.image(kind);
             self.staging[kind_index].record(
                 shared,
-                kind,
-                image,
+                atlas,
                 slot,
                 command,
-                &pending,
+                &pendings,
                 &mut retired,
             )?;
         }
@@ -457,49 +503,77 @@ impl AtlasUploads {
     }
 }
 
+/// 一个待拷贝矩形在 staging 里的落点（staging 偏移 + 目标数组层号 + 源待上传层下标）。
+struct StagingRect {
+    chunk: RectChunk,
+    /// staging 里的起始字节偏移。
+    ///
+    /// 同帧多层**共用**一块 staging，每个矩形必须有自己的偏移：共用 offset 0 会让 GPU 只读到
+    /// 最后写入的那一层。
+    offset: u64,
+    /// 目标 texture array 层号（D-9-c：层号 = 图集页索引）。
+    layer: u16,
+    /// 源 [`PendingUpload`] 在本次聚合里的下标。
+    pending: usize,
+}
+
 /// 一个图集在每 in-flight 槽上的常驻 staging。
 struct StagingSet {
+    kind: AtlasKind,
     slots: [Option<StagingRing>; MAX_FRAMES_IN_FLIGHT],
 }
 
 impl StagingSet {
-    const fn new() -> Self {
+    const fn new(kind: AtlasKind) -> Self {
         Self {
+            kind,
             slots: [None, None, None],
         }
     }
 
-    /// 录制一页的上传：staging 写入 + 屏障 + 逐矩形 `cmd_copy_buffer_to_image` + 屏障。
+    /// 录制本帧该图集**全部待上传层**的上传：staging 写入 + 屏障 + 逐矩形
+    /// `cmd_copy_buffer_to_image` + 屏障。
     ///
     /// AOI（R06-3）：每个脏矩形单独一次 `vkCmdCopyBufferToImage`，`image_offset` 与
     /// `image_extent` 都取矩形自己的 `(x, y, w, h)`（缺 `image_offset` 会从第 0 行覆写整页；
     /// 用整页宽做 `image_extent` 就是旧的放大根因）。
+    ///
+    /// D-9-c：同一 kind 的多层聚合成**一次**调用 —— 共用本槽一块 staging（每层每个矩形各占
+    /// 自己的偏移），逐矩形把目标纹理数组的层号写进 `base_array_layer`；屏障每 kind 只有一组
+    /// （覆盖整条数组），因此同一帧的多层不会各自转一次布局。
     fn record(
         &mut self,
         shared: &SharedGpu,
-        kind: AtlasKind,
-        image: vk::Image,
+        atlas: &SharedAtlas,
         slot: usize,
         command: vk::CommandBuffer,
-        pending: &PendingUpload,
+        pendings: &[PendingUpload],
         retired: &mut Vec<GpuResourceHandle>,
     ) -> Result<(), EngineError> {
-        let page = pending.page;
+        let kind = self.kind;
+        let image = atlas.image(kind);
+        // D-9-c：屏障覆盖整条 texture array（每 kind 一次 to_dst / to_sampled）。
+        let layers = atlas.layers(kind);
         let texel = texel_bytes(kind);
-        // 打包布局（rect 顺序、行内只有 width × texel）：与该函数的 copy 顺序逐个对应。
-        let chunks: Vec<RectChunk> = pending.rects.chunks(page, texel).collect();
-        if chunks.is_empty() {
-            // 空集合 = 零上传：不分配 staging、不录 copy。
-            return Ok(());
-        }
         // staging 布局：每块起点按 4 字节对齐（Vulkan 要求 bufferOffset 是纹素块大小的倍数，
         // 4 对齐对 R8/BGRA8 都成立），块内行紧密排列（`bufferRowLength = 0`）。
-        let mut layout: Vec<(RectChunk, u64)> = Vec::with_capacity(chunks.len());
+        let mut layout: Vec<StagingRect> = Vec::new();
         let mut length = 0usize;
-        for chunk in chunks {
-            let offset = length.next_multiple_of(4);
-            length = offset + (chunk.width * chunk.height) as usize * texel as usize;
-            layout.push((chunk, offset as u64));
+        for (pending_index, pending) in pendings.iter().enumerate() {
+            for chunk in pending.rects.chunks(pending.page, texel) {
+                let offset = length.next_multiple_of(4);
+                length = offset + (chunk.width * chunk.height) as usize * texel as usize;
+                layout.push(StagingRect {
+                    chunk,
+                    offset: offset as u64,
+                    layer: pending.layer,
+                    pending: pending_index,
+                });
+            }
+        }
+        if layout.is_empty() {
+            // 空集合 = 零上传：不分配 staging、不录 copy。
+            return Ok(());
         }
         // 小上传复用每槽常驻 staging；整页级的大上传用一次性缓冲（本帧后 retire），
         // 常驻容量不随页尺寸放大（DEVIATIONS F-216）。
@@ -518,14 +592,18 @@ impl StagingSet {
             (ring.buffer, ring.ptr)
         };
         // 逐矩形把打包字节搬到 staging 的块起点（块间可能有 ≤3 字节的对齐填充）。
-        // SAFETY: 映射在创建时常驻，`offset + 块字节数 ≤ length ≤ 容量`；`pending.pixels`
-        // 的长度已由 `queue_upload` 的 `byte_count` 断言保证，`chunk.offset + 块字节数` 在界内。
+        // SAFETY: 映射在创建时常驻，`offset + 块字节数 ≤ length ≤ 容量`；每个
+        // `pending.pixels` 的长度已由 `queue_upload` 的 `byte_count` 断言保证，
+        // `chunk.offset + 块字节数` 在界内。
         unsafe {
-            for (chunk, offset) in &layout {
-                let bytes = (chunk.width * chunk.height) as usize * texel as usize;
+            for rect in &layout {
+                let bytes = (rect.chunk.width * rect.chunk.height) as usize * texel as usize;
                 std::ptr::copy_nonoverlapping(
-                    pending.pixels.as_ptr().add(chunk.offset),
-                    staging_ptr.add(*offset as usize),
+                    pendings[rect.pending]
+                        .pixels
+                        .as_ptr()
+                        .add(rect.chunk.offset),
+                    staging_ptr.add(rect.offset as usize),
                     bytes,
                 );
             }
@@ -534,7 +612,8 @@ impl StagingSet {
         let range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .level_count(1)
-            .layer_count(1);
+            // D-9-c：屏障覆盖整条 texture array（每 kind 一次 to_dst / to_sampled）。
+            .layer_count(layers);
         let to_dst = vk::ImageMemoryBarrier::default()
             .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
@@ -555,7 +634,7 @@ impl StagingSet {
                 &[],
                 &[to_dst],
             );
-            for (chunk, offset) in &layout {
+            for rect in &layout {
                 shared.raw().cmd_copy_buffer_to_image(
                     command,
                     staging_buffer,
@@ -563,24 +642,27 @@ impl StagingSet {
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     &[vk::BufferImageCopy::default()
                         // 每块在 staging 里各有偏移（块间 4 字节对齐）。
-                        .buffer_offset(*offset)
+                        .buffer_offset(rect.offset)
                         // 0 = 行按 `image_extent.width` 紧密排列（块内只有 width × texel 字节）。
                         .buffer_row_length(0)
                         .buffer_image_height(0)
-                        // AOI：目标从矩形自己的 (x, y) 开始。
+                        // AOI：目标从矩形自己的 (x, y) 开始；z 恒 0，层号由
+                        // `base_array_layer` 指定。
                         .image_offset(vk::Offset3D {
-                            x: chunk.x as i32,
-                            y: chunk.y as i32,
+                            x: rect.chunk.x as i32,
+                            y: rect.chunk.y as i32,
                             z: 0,
                         })
                         .image_subresource(
                             vk::ImageSubresourceLayers::default()
                                 .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                // D-9-c：目标数组层号 = 图集页索引。
+                                .base_array_layer(u32::from(rect.layer))
                                 .layer_count(1),
                         )
                         .image_extent(vk::Extent3D {
-                            width: chunk.width,
-                            height: chunk.height,
+                            width: rect.chunk.width,
+                            height: rect.chunk.height,
                             depth: 1,
                         })],
                 );
@@ -888,11 +970,12 @@ mod tests {
         gpu.wait_queue_idle().expect("queue idle");
     }
 
-    /// 读回图集页某个纹素的原始存储字节（BGRA，不做通道交换）。
+    /// 读回图集 texture array 某一层某个纹素的原始存储字节（BGRA，不做通道交换）。
     fn read_texel(
         gpu: &SharedGpu,
         pool: vk::CommandPool,
         image: vk::Image,
+        layer: u16,
         x: u32,
         y: u32,
     ) -> [u8; 4] {
@@ -928,9 +1011,11 @@ mod tests {
 
             let command = allocate(gpu, pool, 1)[0];
             begin(gpu, command);
+            // D-9-c：只转场 / 读回指定的数组层（base_array_layer = layer）。
             let range = vk::ImageSubresourceRange::default()
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
                 .level_count(1)
+                .base_array_layer(u32::from(layer))
                 .layer_count(1);
             let to_src = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
@@ -963,6 +1048,7 @@ mod tests {
                     .image_subresource(
                         vk::ImageSubresourceLayers::default()
                             .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .base_array_layer(u32::from(layer))
                             .layer_count(1),
                     )
                     .image_extent(vk::Extent3D {
@@ -1014,6 +1100,7 @@ mod tests {
         let mut uploads = AtlasUploads::new();
         uploads.queue_upload(
             AtlasKind::Glyph,
+            0,
             64,
             1,
             vec![0u8; (64 * 64) as usize],
@@ -1029,6 +1116,7 @@ mod tests {
         let mut uploads = AtlasUploads::new();
         uploads.queue_upload(
             AtlasKind::Glyph,
+            0,
             64,
             64,
             vec![0u8; (64 * 64) as usize],
@@ -1039,15 +1127,55 @@ mod tests {
 
         // 3) 旧增量（页与入队页相同、但共享页已经换代）：丢弃（在下一次整页上传时被覆盖）。
         let mut uploads = AtlasUploads::new();
-        uploads.queue_upload(AtlasKind::Glyph, 64, 64, vec![0u8; 64 * 2], rows(3, 5));
+        uploads.queue_upload(AtlasKind::Glyph, 0, 64, 64, vec![0u8; 64 * 2], rows(3, 5));
         assert!(uploads.reconcile_pages([128, 1]).is_empty());
         assert!(!uploads.pending(AtlasKind::Glyph), "旧增量必须丢弃");
 
         // 4) 与共享页一致的增量：保留（在帧内录制）。
         let mut uploads = AtlasUploads::new();
-        uploads.queue_upload(AtlasKind::Glyph, 64, 64, vec![0u8; 64 * 2], rows(3, 5));
+        uploads.queue_upload(AtlasKind::Glyph, 0, 64, 64, vec![0u8; 64 * 2], rows(3, 5));
         assert!(uploads.reconcile_pages([64, 1]).is_empty());
         assert!(uploads.pending(AtlasKind::Glyph), "页对齐的增量要保留");
+    }
+
+    /// D-9-c：同一 extent 的多层整页上传只产生**一次**重建请求（4 层图片图集共用数组）。
+    #[test]
+    fn reconcile_pages_deduplicates_the_rebuild_request_for_every_layer() {
+        let mut uploads = AtlasUploads::new();
+        for layer in 0..4u16 {
+            uploads.queue_upload(
+                AtlasKind::Image,
+                layer,
+                TEST_PAGE,
+                1,
+                vec![0u8; (TEST_PAGE * TEST_PAGE * 4) as usize],
+                full_rects(),
+            );
+        }
+        assert_eq!(
+            uploads.reconcile_pages([1, 1]),
+            vec![(AtlasKind::Image, TEST_PAGE)],
+            "按 extent 去重：数组只有一次重建"
+        );
+        assert!(
+            (0..4).all(|layer| uploads.pending[1][layer].is_some()),
+            "四层都要保留到重建之后上传"
+        );
+    }
+
+    /// D-9-c：越界层号必须被硬断言拦住（数组只有 `MAX_IMAGE_PAGES` 层）。
+    #[test]
+    #[should_panic(expected = "atlas layer 4 out of range")]
+    fn queueing_an_out_of_range_image_layer_is_a_contract_violation() {
+        let mut uploads = AtlasUploads::new();
+        uploads.queue_upload(
+            AtlasKind::Image,
+            4,
+            TEST_PAGE,
+            TEST_PAGE,
+            vec![0u8; 4],
+            rows(0, 1),
+        );
     }
 
     /// P1 回归：两帧在飞时各自持有自己的 staging（每窗口 × 每帧槽 × 每图集一块）。
@@ -1064,6 +1192,7 @@ mod tests {
         // 第 1 帧：整页上传（新页必须整页，DEVIATIONS F-211），内容全零。
         uploads.queue_upload(
             AtlasKind::Image,
+            0,
             TEST_PAGE,
             gpu.atlas_page(AtlasKind::Image),
             page(),
@@ -1087,7 +1216,7 @@ mod tests {
         end(&gpu, commands[0]);
         submit_and_wait(&gpu, commands[0]);
         let image = gpu.atlas().image(AtlasKind::Image);
-        assert_eq!(read_texel(&gpu, pool, image, 0, 5), [0, 0, 0, 0]);
+        assert_eq!(read_texel(&gpu, pool, image, 0, 0, 5), [0, 0, 0, 0]);
 
         // 第 2 帧：第 5 行 = 不透明深蓝（BGRA，打包的 1 行）。先只录制，不提交。
         let mut first_page = page();
@@ -1095,6 +1224,7 @@ mod tests {
         let first_row = first_page[5 * TEST_PAGE as usize * 4..6 * TEST_PAGE as usize * 4].to_vec();
         uploads.queue_upload(
             AtlasKind::Image,
+            0,
             TEST_PAGE,
             gpu.atlas_page(AtlasKind::Image),
             first_row,
@@ -1113,6 +1243,7 @@ mod tests {
             second_page[5 * TEST_PAGE as usize * 4..6 * TEST_PAGE as usize * 4].to_vec();
         uploads.queue_upload(
             AtlasKind::Image,
+            0,
             TEST_PAGE,
             gpu.atlas_page(AtlasKind::Image),
             second_row,
@@ -1127,7 +1258,7 @@ mod tests {
         // 第 2 帧完成：它写进第 5 行的必须是**自己的**深蓝（旧实现会读到橙）。
         submit_and_wait(&gpu, commands[0]);
         assert_eq!(
-            read_texel(&gpu, pool, image, 0, 5),
+            read_texel(&gpu, pool, image, 0, 0, 5),
             [0x11, 0x22, 0x33, 0xFF],
             "第 2 帧的 copy 必须读到自己 staging 的字节"
         );
@@ -1135,12 +1266,12 @@ mod tests {
         // 第 3 帧完成：后一帧覆盖前一帧。
         submit_and_wait(&gpu, commands[1]);
         assert_eq!(
-            read_texel(&gpu, pool, image, 0, 5),
+            read_texel(&gpu, pool, image, 0, 0, 5),
             [0x44, 0x55, 0x66, 0xFF],
             "后一帧的像素覆盖前一帧"
         );
         assert_eq!(
-            read_texel(&gpu, pool, image, 0, 6),
+            read_texel(&gpu, pool, image, 0, 0, 6),
             [0, 0, 0, 0],
             "未上传的行保持原样"
         );
@@ -1164,6 +1295,7 @@ mod tests {
         // 第一个整页上传（新页必须整页，DEVIATIONS F-211），内容全零。
         uploads.queue_upload(
             AtlasKind::Image,
+            0,
             TEST_PAGE,
             gpu.atlas_page(AtlasKind::Image),
             page(),
@@ -1193,6 +1325,7 @@ mod tests {
         }
         uploads.queue_upload(
             AtlasKind::Image,
+            0,
             TEST_PAGE,
             gpu.atlas_page(AtlasKind::Image),
             payload,
@@ -1207,34 +1340,180 @@ mod tests {
 
         let image = gpu.atlas().image(AtlasKind::Image);
         assert_eq!(
-            read_texel(&gpu, pool, image, 3, 5),
+            read_texel(&gpu, pool, image, 0, 3, 5),
             [0, 0, 0, 0],
             "AOI 左侧一列不得被写"
         );
         assert_eq!(
-            read_texel(&gpu, pool, image, 4, 5),
+            read_texel(&gpu, pool, image, 0, 4, 5),
             [0x11, 0x22, 0x33, 0xFF],
             "AOI 首列"
         );
         assert_eq!(
-            read_texel(&gpu, pool, image, 7, 5),
+            read_texel(&gpu, pool, image, 0, 7, 5),
             [0x11, 0x22, 0x33, 0xFF],
             "AOI 末列"
         );
         assert_eq!(
-            read_texel(&gpu, pool, image, 8, 5),
+            read_texel(&gpu, pool, image, 0, 8, 5),
             [0, 0, 0, 0],
             "AOI 右侧一列不得被写"
         );
         assert_eq!(
-            read_texel(&gpu, pool, image, 4, 4),
+            read_texel(&gpu, pool, image, 0, 4, 4),
             [0, 0, 0, 0],
             "AOI 上一行不得被写"
         );
         assert_eq!(
-            read_texel(&gpu, pool, image, 4, 6),
+            read_texel(&gpu, pool, image, 0, 4, 6),
             [0, 0, 0, 0],
             "AOI 下一行不得被写"
+        );
+
+        // SAFETY: 队列已空闲（每次提交都 wait idle），命令池没有在飞的缓冲。
+        unsafe { gpu.raw().destroy_command_pool(pool, None) };
+    }
+
+    /// D-9-c：图片图集是 4 层 texture array，`vkCmdCopyBufferToImage` 的目标层号走
+    /// `base_array_layer`。
+    ///
+    /// 每层写不同的颜色并在**同一帧**里聚合录制、随后逐层读回：证明 ① 纹理数组真的有 4 层；
+    /// ② 层号进了目标子资源；③ 同帧多层共用一块 staging 时各有偏移、不会互相覆盖。
+    #[test]
+    fn image_atlas_layers_upload_to_their_own_array_slices() {
+        let _guard = gpu_test_lock();
+        let gpu = SharedGpu::new_headless_isolated().expect("headless shared gpu");
+        let mut uploads = AtlasUploads::new();
+        let pool = command_pool(&gpu);
+        let commands = allocate(&gpu, pool, 1);
+        const COLORS: [[u8; 4]; 4] = [
+            [0x11, 0x22, 0x33, 0xFF],
+            [0x44, 0x55, 0x66, 0xFF],
+            [0x77, 0x88, 0x99, 0xFF],
+            [0xAA, 0xBB, 0xCC, 0xFF],
+        ];
+        for (layer, color) in COLORS.iter().enumerate() {
+            let mut pixels = page();
+            for texel in pixels.as_chunks_mut::<4>().0 {
+                *texel = *color;
+            }
+            uploads.queue_upload(
+                AtlasKind::Image,
+                layer as u16,
+                TEST_PAGE,
+                gpu.atlas_page(AtlasKind::Image),
+                pixels,
+                full_rects(),
+            );
+        }
+        let rebuild = uploads.reconcile_pages([
+            gpu.atlas().page(AtlasKind::Glyph),
+            gpu.atlas().page(AtlasKind::Image),
+        ]);
+        assert_eq!(
+            rebuild,
+            vec![(AtlasKind::Image, TEST_PAGE)],
+            "四层同 extent 只请求一次重建"
+        );
+        gpu.rebuild_atlas_pages(&rebuild)
+            .expect("rebuild image page");
+        begin(&gpu, commands[0]);
+        uploads
+            .record_uploads(&gpu, &gpu.atlas(), 0, commands[0])
+            .expect("record four layers");
+        end(&gpu, commands[0]);
+        submit_and_wait(&gpu, commands[0]);
+
+        let image = gpu.atlas().image(AtlasKind::Image);
+        for (layer, color) in COLORS.iter().enumerate() {
+            let layer = layer as u16;
+            assert_eq!(
+                read_texel(&gpu, pool, image, layer, 0, 0),
+                *color,
+                "第 {layer} 层的首纹素必须来自该层的上传"
+            );
+            assert_eq!(
+                read_texel(&gpu, pool, image, layer, TEST_PAGE - 1, TEST_PAGE - 1),
+                *color,
+                "第 {layer} 层的末纹素必须来自该层的上传"
+            );
+        }
+
+        // SAFETY: 队列已空闲（每次提交都 wait idle），命令池没有在飞的缓冲。
+        unsafe { gpu.raw().destroy_command_pool(pool, None) };
+    }
+
+    /// D-9-c：之后只上传第 1 层时，第 0 层的内容必须原样保留（层号没有写错子资源）。
+    #[test]
+    fn uploading_one_image_layer_preserves_the_other_layers() {
+        let _guard = gpu_test_lock();
+        let gpu = SharedGpu::new_headless_isolated().expect("headless shared gpu");
+        let mut uploads = AtlasUploads::new();
+        let pool = command_pool(&gpu);
+        let commands = allocate(&gpu, pool, 1);
+        const LAYER_ZERO: [u8; 4] = [0x11, 0x22, 0x33, 0xFF];
+        const LAYER_ONE: [u8; 4] = [0x44, 0x55, 0x66, 0xFF];
+
+        // 新页：第 0 层整页写第一种颜色。
+        let mut first = page();
+        for texel in first.as_chunks_mut::<4>().0 {
+            *texel = LAYER_ZERO;
+        }
+        uploads.queue_upload(
+            AtlasKind::Image,
+            0,
+            TEST_PAGE,
+            gpu.atlas_page(AtlasKind::Image),
+            first,
+            full_rects(),
+        );
+        let rebuild = uploads.reconcile_pages([
+            gpu.atlas().page(AtlasKind::Glyph),
+            gpu.atlas().page(AtlasKind::Image),
+        ]);
+        gpu.rebuild_atlas_pages(&rebuild)
+            .expect("rebuild image page");
+        begin(&gpu, commands[0]);
+        uploads
+            .record_uploads(&gpu, &gpu.atlas(), 0, commands[0])
+            .expect("record layer 0");
+        end(&gpu, commands[0]);
+        submit_and_wait(&gpu, commands[0]);
+        let image = gpu.atlas().image(AtlasKind::Image);
+        assert_eq!(
+            read_texel(&gpu, pool, image, 0, 0, 0),
+            LAYER_ZERO,
+            "第 0 层的整页上传"
+        );
+
+        // 第二帧：只上传第 1 层整页。
+        let mut second = page();
+        for texel in second.as_chunks_mut::<4>().0 {
+            *texel = LAYER_ONE;
+        }
+        uploads.queue_upload(
+            AtlasKind::Image,
+            1,
+            TEST_PAGE,
+            gpu.atlas_page(AtlasKind::Image),
+            second,
+            full_rects(),
+        );
+        begin(&gpu, commands[0]);
+        uploads
+            .record_uploads(&gpu, &gpu.atlas(), 0, commands[0])
+            .expect("record layer 1");
+        end(&gpu, commands[0]);
+        submit_and_wait(&gpu, commands[0]);
+        assert_eq!(
+            read_texel(&gpu, pool, image, 0, 0, 0),
+            LAYER_ZERO,
+            "上传第 1 层不得改动第 0 层"
+        );
+        assert_eq!(
+            read_texel(&gpu, pool, image, 1, 0, 0),
+            LAYER_ONE,
+            "第 1 层内容必须正确"
         );
 
         // SAFETY: 队列已空闲（每次提交都 wait idle），命令池没有在飞的缓冲。

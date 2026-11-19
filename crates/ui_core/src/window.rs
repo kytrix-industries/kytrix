@@ -38,7 +38,7 @@ use crate::{
     math::{PhysicalRect, Rect, Scale, Size},
     node::{id::NodeId, tree::NodeTree},
     paint::{
-        atlas::AtlasKind,
+        atlas::{AtlasKind, MAX_IMAGE_PAGES},
         color::{Color, ColorResolver},
         pass::PaintReport,
         scene::Scene,
@@ -442,20 +442,27 @@ pub struct Window {
     /// 每轮泵在 [`Window::poll_renderer`] 里追加 GPU 线程的反馈；Linux 的 `wp_presentation`
     /// 事件到达后按 `FrameIndex` 回填对应条目的 `presented_at`（事件晚于反馈）。
     presentation: VecDeque<FramePresentation>,
-    /// 该窗口的渲染器已收到的**完整**字形图集页尺寸（`None` = 还没收到 / 渲染器已换）。
+    /// 该窗口的渲染器已收到的**完整**字形图集 extent（`None` = 还没收到 / 渲染器已换）。
     ///
     /// 图集页是进程级共享数据，但纹理是每窗口一份（`AtlasTextures`），因此必须逐窗口记账：
     /// 第一次（或渲染器重建后 / 页尺寸变化后）必须整页上传，之后才允许按脏行增量
     /// （P13 §8.2 / 评审阻塞 ② / DEVIATIONS F-208）。
     glyph_page_received: Option<u32>,
-    /// 同上，图片图集页。
+    /// 图片图集 texture array 的 extent（整数组已按该 extent 建立；`None` = 还没收到 / 渲染器已换）。
     image_page_received: Option<u32>,
-    /// 每个图集在本窗口上「已写脏、还没入队」的矩形。
+    /// 图片图集每个 layer 是否已经拿过整层上传（新窗口 / 换渲染器 / 页换代后逐层补齐）。
+    ///
+    /// texture array 一旦建立就是 `MAX_IMAGE_PAGES` 层，但每层内容独立：某层第一次入队前
+    /// 必须整层上传（资源层新页首帧整页脏）。下标 = 层号。
+    image_layers_received: [bool; MAX_IMAGE_PAGES as usize],
+    /// 字形图集在本窗口上「已写脏、还没入队」的矩形（恒 layer 0）。
+    glyph_atlas_rects: crate::render::DirtyRects,
+    /// 图片图集每层的「已写脏、还没入队」矩形（下标 = texture array 层号）。
     ///
     /// 共享槽忙（GPU 线程还没录制上一笔上传）的窗口不参与全局等待：新矩形先攒在这里，
     /// 等该窗口的槽空闲再补发。否则一个不再出帧的窗口会永久占住图集上传（DEVIATIONS F-211）。
     /// R06-3 起是**矩形**（AOI）而不是整页宽的行区间。
-    atlas_rects: [crate::render::DirtyRects; 2],
+    image_atlas_rects: [crate::render::DirtyRects; MAX_IMAGE_PAGES as usize],
     /// 本窗口「图集行没赶上帧」的补帧次数（上限见 [`MAX_ATLAS_FOLLOWUPS`]）。
     atlas_deferrals: u8,
     /// 本帧的分段计时（容量跨帧复用）。
@@ -546,7 +553,9 @@ impl Window {
             presentation: VecDeque::with_capacity(FRAME_PRESENTATION_HISTORY),
             glyph_page_received: None,
             image_page_received: None,
-            atlas_rects: std::array::from_fn(|_| crate::render::DirtyRects::default()),
+            image_layers_received: [false; MAX_IMAGE_PAGES as usize],
+            glyph_atlas_rects: crate::render::DirtyRects::default(),
+            image_atlas_rects: std::array::from_fn(|_| crate::render::DirtyRects::default()),
             atlas_deferrals: 0,
             timings: FrameTimings::new(),
             paint_order: Vec::new(),
@@ -993,23 +1002,37 @@ impl Window {
     pub(crate) fn image_page_received(&self) -> bool {
         surface::image_page_received(self)
     }
-    pub(crate) fn atlas_page_matches(&self, kind: AtlasKind, page: u32) -> bool {
-        surface::atlas_page_matches(self, kind, page)
+    /// 图片图集某层是否已经拿过整层上传（D-9-c 多页：新窗口 / 换渲染器 / 新页要逐层补齐）。
+    pub(crate) fn image_layer_received(&self, layer: u16) -> bool {
+        surface::image_layer_received(self, layer)
     }
-    pub(crate) fn mark_atlas_page_received(&mut self, kind: AtlasKind, page: u32) {
-        surface::mark_atlas_page_received(self, kind, page)
+    pub(crate) fn atlas_page_matches(&self, kind: AtlasKind, extent: u32) -> bool {
+        surface::atlas_page_matches(self, kind, extent)
+    }
+    pub(crate) fn mark_atlas_page_received(&mut self, kind: AtlasKind, extent: u32) {
+        surface::mark_atlas_page_received(self, kind, extent)
+    }
+    pub(crate) fn mark_image_layer_received(&mut self, layer: u16) {
+        surface::mark_image_layer_received(self, layer)
     }
     pub(crate) fn mark_atlas_page_stale(&mut self, kind: AtlasKind) {
         surface::mark_atlas_page_stale(self, kind)
     }
-    pub(crate) fn atlas_rects(&self, kind: AtlasKind) -> &crate::render::DirtyRects {
-        surface::atlas_rects(self, kind)
+    pub(crate) fn atlas_rects(&self, kind: AtlasKind, layer: u16) -> &crate::render::DirtyRects {
+        surface::atlas_rects(self, kind, layer)
     }
-    pub(crate) fn atlas_rects_mut(&mut self, kind: AtlasKind) -> &mut crate::render::DirtyRects {
-        surface::atlas_rects_mut(self, kind)
+    pub(crate) fn atlas_rects_mut(
+        &mut self,
+        kind: AtlasKind,
+        layer: u16,
+    ) -> &mut crate::render::DirtyRects {
+        surface::atlas_rects_mut(self, kind, layer)
     }
-    pub(crate) fn clear_atlas_rects(&mut self, kind: AtlasKind) {
-        surface::clear_atlas_rects(self, kind)
+    pub(crate) fn clear_atlas_rects(&mut self, kind: AtlasKind, layer: u16) {
+        surface::clear_atlas_rects(self, kind, layer)
+    }
+    pub(crate) fn clear_all_atlas_rects(&mut self, kind: AtlasKind) {
+        surface::clear_all_atlas_rects(self, kind)
     }
     pub(crate) fn atlas_rects_pending(&self) -> bool {
         surface::atlas_rects_pending(self)
@@ -1023,11 +1046,12 @@ impl Window {
     pub(crate) fn queue_atlas_upload(
         &mut self,
         kind: AtlasKind,
-        page: u32,
+        layer: u16,
+        extent: u32,
         pixels: &[u8],
         rects: crate::render::DirtyRects,
     ) -> bool {
-        surface::queue_atlas_upload(self, kind, page, pixels, rects)
+        surface::queue_atlas_upload(self, kind, layer, extent, pixels, rects)
     }
     pub(crate) fn atlas_idle(&self, kind: AtlasKind) -> bool {
         surface::atlas_idle(self, kind)

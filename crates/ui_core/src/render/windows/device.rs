@@ -823,30 +823,50 @@ impl SharedGpu {
         self.atlas_generation.store(target, Ordering::Release);
         Ok(AtlasRebuildOutcome::Applied)
     }
-    /// 图集内容与被移除设备上的一致。
-    fn restore_atlas(&self, snapshot: &[Option<(u32, Vec<u8>)>; 2]) -> Result<(), EngineError> {
+
+    /// 设备恢复后按 CPU 影子页重传图集（R08-4）。
+    ///
+    /// 影子页是录制期从同一份上传字节落下来的（`SharedAtlas::update_shadow`），因此恢复后的
+    /// 图集内容与被移除设备上的一致。图片图集是 texture array：按层重传，从未上传过的层
+    /// （影子为 `None`）保持未定义 —— 那里没有 tile 会采样到它，下一次整层上传会补上。
+    fn restore_atlas(
+        &self,
+        snapshot: &[Option<crate::render::windows::atlas::ShadowAtlasSnapshot>; 2],
+    ) -> Result<(), EngineError> {
         let mut atlas = self.atlas.write().unwrap_or_else(PoisonError::into_inner);
         for kind in [AtlasKind::Glyph, AtlasKind::Image] {
             let index = kind.index() as usize;
-            let Some((page, pixels)) = snapshot[index].as_ref() else {
+            let Some(snapshot) = snapshot[index].as_ref() else {
                 continue;
             };
-            if *page <= 1 {
+            let page = snapshot.page();
+            if page <= 1 {
                 continue;
             }
-            let row_bytes = *page as usize * texel_bytes(kind) as usize;
-            if pixels.len() != row_bytes * *page as usize {
+            let row_bytes = page as usize * texel_bytes(kind) as usize;
+            if snapshot.layers().len() != kind.layers() as usize
+                || snapshot
+                    .layers()
+                    .iter()
+                    .flatten()
+                    .any(|pixels| pixels.len() != row_bytes * page as usize)
+            {
                 continue;
             }
-            atlas.recreate(self.raw(), kind, *page)?;
-            // 新设备上没有任何在飞帧：两代描述符组都指向恢复后的纹理（代际重置为 0）。
+            atlas.recreate(self.raw(), kind, page)?;
             for generation in 0..ATLAS_GENERATIONS {
                 self.srv_heap
                     .write_atlas(self.raw(), generation, kind, atlas.texture(kind));
             }
-            self.atlas_pages[index].store(*page, Ordering::Release);
+            self.atlas_pages[index].store(page, Ordering::Release);
             let texture = atlas.texture(kind).clone();
-            self.upload_atlas_page_now(&texture, kind, *page, pixels)?;
+            for (layer, pixels) in snapshot.layers().iter().enumerate() {
+                let Some(pixels) = pixels else {
+                    continue;
+                };
+                let layer = u16::try_from(layer).expect("atlas array layer fits u16");
+                self.upload_atlas_page_now(&texture, kind, page, layer, pixels)?;
+            }
         }
         // 设备恢复后没有任何在飞引用：清空旧代回收表并重置代际。
         self.atlas_switch
@@ -857,7 +877,7 @@ impl SharedGpu {
         Ok(())
     }
 
-    /// 帧外的一次性整页上传（只用于设备恢复：新设备上的图集是空纹理）。
+    /// 帧外的一次性整层上传（只用于设备恢复：新设备上的图集是空纹理）。
     ///
     /// 自己建 staging / allocator / list / fence 并同步等完成：此刻还没有任何窗口的提交流
     /// （恢复发生在窗口重建之前），不需要与它们同步。
@@ -866,6 +886,7 @@ impl SharedGpu {
         texture: &ID3D12Resource,
         kind: AtlasKind,
         page: u32,
+        layer: u16,
         pixels: &[u8],
     ) -> Result<(), EngineError> {
         let row_bytes = page as usize * texel_bytes(kind) as usize;
@@ -906,7 +927,7 @@ impl SharedGpu {
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
             D3D12_RESOURCE_STATE_COPY_DEST,
         );
-        super::atlas::copy_page(&list, texture, &staging, kind, page, row_pitch);
+        super::atlas::copy_page(&list, texture, &staging, kind, page, layer, row_pitch);
         super::atlas::transition(
             &list,
             texture,

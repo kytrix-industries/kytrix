@@ -142,43 +142,88 @@ pub(crate) fn glyph_page_received(window: &Window) -> bool {
 }
 
 // 消费者：`impl Window::image_page_received` 的薄委托（外部调用点见该方法文档）。
-/// 该窗口的渲染器是否已收到完整图片图集页（测试诊断）。
+/// 该窗口的渲染器是否已收到完整图片图集 extent（测试诊断）。
 #[cfg(test)]
 pub(crate) fn image_page_received(window: &Window) -> bool {
     window.image_page_received.is_some()
 }
 
+// 消费者：`impl Window::image_layer_received` 的薄委托（外部调用点见该方法文档）。
+/// 图片图集某层是否已经拿过整层上传（D-9-c 多页：层号 = texture array 层）。
+pub(crate) fn image_layer_received(window: &Window, layer: u16) -> bool {
+    window
+        .image_layers_received
+        .get(usize::from(layer))
+        .copied()
+        .unwrap_or(false)
+}
+
 // 消费者：`impl Window::atlas_page_matches` 的薄委托（外部调用点见该方法文档）。
-/// 已收到的整页尺寸是否就是 `page`（否则这一帧必须整页重传）。
-pub(crate) fn atlas_page_matches(window: &Window, kind: AtlasKind, page: u32) -> bool {
+/// 当前渲染器的图集 extent 是否就是 `extent`（否则这一帧必须整页 / 整层重传）。
+///
+/// 图片图集是 texture array：`extent` 匹配只表示**整数组已按该 extent 建立**，每层内容是否
+/// 初始化还要看 [`image_layer_received`]。
+pub(crate) fn atlas_page_matches(window: &Window, kind: AtlasKind, extent: u32) -> bool {
     match kind {
-        AtlasKind::Glyph => window.glyph_page_received == Some(page),
-        AtlasKind::Image => window.image_page_received == Some(page),
+        AtlasKind::Glyph => window.glyph_page_received == Some(extent),
+        AtlasKind::Image => window.image_page_received == Some(extent),
     }
 }
 
 // 消费者：`impl Window::mark_atlas_page_received` 的薄委托（外部调用点见该方法文档）。
-/// 记账：该图集页已整页入队到本窗口的渲染器（记录页尺寸）。
-pub(crate) fn mark_atlas_page_received(window: &mut Window, kind: AtlasKind, page: u32) {
+/// 记账：该图集已整页 / 整数组入队到本窗口的渲染器（记录 extent）。
+pub(crate) fn mark_atlas_page_received(window: &mut Window, kind: AtlasKind, extent: u32) {
     match kind {
-        AtlasKind::Glyph => window.glyph_page_received = Some(page),
-        AtlasKind::Image => window.image_page_received = Some(page),
+        AtlasKind::Glyph => window.glyph_page_received = Some(extent),
+        AtlasKind::Image => window.image_page_received = Some(extent),
+    }
+}
+
+// 消费者：`impl Window::mark_image_layer_received` 的薄委托（外部调用点见该方法文档）。
+/// 记账：图片图集某层已经整层入队到本窗口的渲染器。
+pub(crate) fn mark_image_layer_received(window: &mut Window, layer: u16) {
+    if let Some(slot) = window.image_layers_received.get_mut(usize::from(layer)) {
+        *slot = true;
     }
 }
 
 // 消费者：`impl Window::mark_atlas_page_stale` 的薄委托（外部调用点见该方法文档）。
 /// 该图集在本窗口的整页记账作废：下一次必须整页重传（渲染器换代 / 图集清空）。
+///
+/// `Image` 同时作废**每一层**的整层记账（数组仍在，但内容不再可信），并清空该 kind
+/// 全部层的待传矩形。
 pub(crate) fn mark_atlas_page_stale(window: &mut Window, kind: AtlasKind) {
     match kind {
-        AtlasKind::Glyph => window.glyph_page_received = None,
-        AtlasKind::Image => window.image_page_received = None,
+        AtlasKind::Glyph => {
+            window.glyph_page_received = None;
+            window.glyph_atlas_rects.clear();
+        }
+        AtlasKind::Image => {
+            window.image_page_received = None;
+            window.image_layers_received = [false; crate::paint::atlas::MAX_IMAGE_PAGES as usize];
+            for rects in &mut window.image_atlas_rects {
+                rects.clear();
+            }
+        }
     }
 }
 
 // 消费者：`impl Window::atlas_rects` 的薄委托（外部调用点见该方法文档）。
-/// 本窗口待上传的图集脏矩形（忙窗口攒着，空闲时补发）。
-pub(crate) fn atlas_rects(window: &Window, kind: AtlasKind) -> &crate::render::DirtyRects {
-    &window.atlas_rects[kind.index() as usize]
+/// 本窗口待上传的图集脏矩形（忙窗口攒着，空闲时补发）。`layer` 是 texture array 层号；
+/// 字形图集恒 layer 0。
+pub(crate) fn atlas_rects(
+    window: &Window,
+    kind: AtlasKind,
+    layer: u16,
+) -> &crate::render::DirtyRects {
+    debug_assert!(
+        u32::from(layer) < kind.layers(),
+        "atlas layer {layer} out of range for {kind:?}"
+    );
+    match kind {
+        AtlasKind::Glyph => &window.glyph_atlas_rects,
+        AtlasKind::Image => &window.image_atlas_rects[usize::from(layer)],
+    }
 }
 
 // 消费者：`impl Window::atlas_rects_mut` 的薄委托（外部调用点见该方法文档）。
@@ -186,20 +231,45 @@ pub(crate) fn atlas_rects(window: &Window, kind: AtlasKind) -> &crate::render::D
 pub(crate) fn atlas_rects_mut(
     window: &mut Window,
     kind: AtlasKind,
+    layer: u16,
 ) -> &mut crate::render::DirtyRects {
-    &mut window.atlas_rects[kind.index() as usize]
+    debug_assert!(
+        u32::from(layer) < kind.layers(),
+        "atlas layer {layer} out of range for {kind:?}"
+    );
+    match kind {
+        AtlasKind::Glyph => &mut window.glyph_atlas_rects,
+        AtlasKind::Image => &mut window.image_atlas_rects[usize::from(layer)],
+    }
 }
 
 // 消费者：`impl Window::clear_atlas_rects` 的薄委托（外部调用点见该方法文档）。
-/// 本窗口的待发矩形已入队（或已被整页上传覆盖）。
-pub(crate) fn clear_atlas_rects(window: &mut Window, kind: AtlasKind) {
-    window.atlas_rects[kind.index() as usize].clear();
+/// 本窗口某层的待发矩形已入队（或已被整页上传覆盖）。
+pub(crate) fn clear_atlas_rects(window: &mut Window, kind: AtlasKind, layer: u16) {
+    atlas_rects_mut(window, kind, layer).clear();
+}
+
+// 消费者：`impl Window::clear_all_atlas_rects` 的薄委托（外部调用点见该方法文档）。
+/// 清空该 kind 全部层的待发矩形（页换代 / 图集清空）。
+pub(crate) fn clear_all_atlas_rects(window: &mut Window, kind: AtlasKind) {
+    match kind {
+        AtlasKind::Glyph => window.glyph_atlas_rects.clear(),
+        AtlasKind::Image => {
+            for rects in &mut window.image_atlas_rects {
+                rects.clear();
+            }
+        }
+    }
 }
 
 // 消费者：`impl Window::atlas_rects_pending` 的薄委托（外部调用点见该方法文档）。
-/// 本窗口还有没赶上帧的图集矩形：这一帧会以旧图集呈现，需要补一帧。
+/// 本窗口还有没赶上帧的图集矩形（覆盖全部层）：这一帧会以旧图集呈现，需要补一帧。
 pub(crate) fn atlas_rects_pending(window: &Window) -> bool {
-    window.atlas_rects.iter().any(|rects| !rects.is_empty())
+    !window.glyph_atlas_rects.is_empty()
+        || window
+            .image_atlas_rects
+            .iter()
+            .any(|rects| !rects.is_empty())
 }
 
 // 消费者：`impl Window::note_atlas_deferral` 的薄委托（外部调用点见该方法文档）。
@@ -223,19 +293,21 @@ pub(crate) fn reset_atlas_deferrals(window: &mut Window) {
 /// 把一页图集像素交给渲染器；`false` = 没有渲染器或渲染器已关闭（**没有**入队）。
 ///
 /// `pixels` 是 `rects` 顺序**逐矩形紧密打包**的字节（行内只有 `width × texel`；整页上传时就是
-/// 整页），因此增量上传只搬脏矩形（R06-3：AOI 上传，替代旧的整页宽行区间）。消费者：
-/// `App::upload_atlas_pages`（逐窗口分发；图集页是进程级共享数据，纹理是每窗口一份）。
+/// 整页），因此增量上传只搬脏矩形（R06-3：AOI 上传，替代旧的整页宽行区间）。`layer` 是
+/// 图集 texture array 的层号（字形恒 0；图片 = 图集页索引），`extent` 是该层页边长。
+/// 消费者：`App::upload_atlas_pages`（逐窗口分发；图集页是进程级共享数据，纹理是每窗口一份）。
 pub(crate) fn queue_atlas_upload(
     window: &mut Window,
     kind: AtlasKind,
-    page: u32,
+    layer: u16,
+    extent: u32,
     pixels: &[u8],
     rects: crate::render::DirtyRects,
 ) -> bool {
     window
         .renderer
         .as_mut()
-        .is_some_and(|renderer| renderer.queue_atlas_upload(kind, page, pixels, rects))
+        .is_some_and(|renderer| renderer.queue_atlas_upload(kind, layer, extent, pixels, rects))
 }
 
 // 消费者：`impl Window::atlas_idle` 的薄委托（外部调用点见该方法文档）。
@@ -266,9 +338,7 @@ pub(crate) fn request_composition_rebuild(window: &Window) {
 /// 换渲染器 = 换一套空纹理（`AtlasTextures`），所以两张图集页都要重新整页上传。
 pub(crate) fn set_renderer(window: &mut Window, renderer: Renderer) {
     window.renderer = Some(renderer);
-    window.glyph_page_received = None;
-    window.image_page_received = None;
-    window.atlas_rects = std::array::from_fn(|_| crate::render::DirtyRects::default());
+    reset_atlas_accounting(window);
 }
 
 // 消费者：`impl Window::take_renderer` 的薄委托（调用点：macOS 设备恢复驱动）。
@@ -365,10 +435,17 @@ pub(crate) fn enable_offscreen_renderer(window: &mut Window) -> Result<(), Engin
     }
     let surface = window.physical_surface();
     window.renderer = Some(Renderer::new_offscreen(surface)?);
+    reset_atlas_accounting(window);
+    Ok(())
+}
+
+/// 换渲染器 / 新建渲染器后的图集记账复位：两套图集都必须整页重传。
+fn reset_atlas_accounting(window: &mut Window) {
     window.glyph_page_received = None;
     window.image_page_received = None;
-    window.atlas_rects = std::array::from_fn(|_| crate::render::DirtyRects::default());
-    Ok(())
+    window.image_layers_received = [false; crate::paint::atlas::MAX_IMAGE_PAGES as usize];
+    window.glyph_atlas_rects = crate::render::DirtyRects::default();
+    window.image_atlas_rects = std::array::from_fn(|_| crate::render::DirtyRects::default());
 }
 
 // 消费者：`impl Window::physical_surface` 的薄委托（外部调用点见该方法文档）。
@@ -422,4 +499,67 @@ pub(crate) fn frame_rect(window: &Window) -> PhysicalRect {
 pub(crate) fn covering_surface(size: Size, scale: Scale) -> (u32, u32) {
     let rect = Rect::new(0.0, 0.0, size.width, size.height).to_physical_covering(scale);
     (rect.width().max(1) as u32, rect.height().max(1) as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{paint::atlas::MAX_IMAGE_PAGES, window::WindowId};
+
+    fn window() -> Window {
+        Window::new(WindowId::for_test(1), WindowOptions::default())
+    }
+
+    fn one_rect() -> crate::render::DirtyRects {
+        let mut rects = crate::render::DirtyRects::default();
+        rects.mark(PhysicalRect::new(1, 2, 3, 4));
+        rects
+    }
+
+    /// D-9-c：待传矩形按 texture array 层分别记账（图片 4 层、字形恒 layer 0）。
+    #[test]
+    fn atlas_rects_are_tracked_per_texture_array_layer() {
+        let mut window = window();
+        window
+            .atlas_rects_mut(AtlasKind::Image, 2)
+            .merge_from(&one_rect());
+
+        assert!(
+            window.atlas_rects(AtlasKind::Image, 0).is_empty(),
+            "layer 0 不得看到 layer 2 的矩形"
+        );
+        assert!(!window.atlas_rects(AtlasKind::Image, 2).is_empty());
+        assert!(window.atlas_rects(AtlasKind::Glyph, 0).is_empty());
+        assert!(window.atlas_rects_pending(), "任一层有矩形即待上传");
+
+        window.clear_atlas_rects(AtlasKind::Image, 2);
+        assert!(!window.atlas_rects_pending());
+    }
+
+    /// D-9-c：整页记账作废时必须同时清空该 kind **全部层**的待传矩形与层初始化标记
+    /// （渲染器换代 / 图集清空之后，数组内容不再可信，每层都要重新整层上传）。
+    #[test]
+    fn marking_the_image_atlas_stale_clears_every_layer() {
+        let mut window = window();
+        for layer in 0..MAX_IMAGE_PAGES {
+            window
+                .atlas_rects_mut(AtlasKind::Image, layer)
+                .merge_from(&one_rect());
+            window.mark_image_layer_received(layer);
+        }
+        window.mark_atlas_page_received(AtlasKind::Image, 64);
+        assert!(window.atlas_page_matches(AtlasKind::Image, 64));
+
+        window.mark_atlas_page_stale(AtlasKind::Image);
+
+        assert!(!window.atlas_page_matches(AtlasKind::Image, 64));
+        assert!(!window.atlas_rects_pending(), "全部层的矩形必须清空");
+        for layer in 0..MAX_IMAGE_PAGES {
+            assert!(
+                !window.image_layer_received(layer),
+                "layer {layer} 的整层记账必须作废"
+            );
+            assert!(window.atlas_rects(AtlasKind::Image, layer).is_empty());
+        }
+    }
 }

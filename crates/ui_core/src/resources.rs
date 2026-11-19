@@ -1163,13 +1163,24 @@ impl ResourceCache {
         self.len() == 0
     }
 
+    /// 已打开的图片图集页数（D-9 多页；0 = 还没插过图片；上限 `MAX_IMAGE_PAGES`）。
+    pub(crate) fn page_count(&self) -> usize {
+        self.pager.page_count()
+    }
+
+    /// 图片图集单页的边长（纹素；所有页相同，生产恒 `MAX_ATLAS_PAGE`）。
+    pub(crate) fn page_extent(&self) -> u32 {
+        self.page_dimensions().0
+    }
+
     /// 某页的当前内容（`page.0 * page.1 * 4` 字节，BGRA8 预乘 sRGB）；页不存在时 `None`。
     pub(crate) fn page_pixels_at(&self, page: u16) -> Option<((u32, u32), &[u8])> {
         let buffer = self.page_buffers.get(usize::from(page))?.as_ref()?;
         Some((buffer.dimensions(), buffer.bytes()))
     }
 
-    /// 第 0 页的当前内容（单页路径的便捷入口；多页上传由 `App` 按页遍历）。
+    /// 第 0 页的当前内容（单页测试路径的便捷入口；多页上传由 `App` 按页遍历）。
+    #[cfg(test)]
     pub(crate) fn page_pixels(&self) -> Option<((u32, u32), &[u8])> {
         self.page_pixels_at(0)
     }
@@ -1179,7 +1190,8 @@ impl ResourceCache {
         self.pager.take_dirty_rects(page)
     }
 
-    /// 第 0 页的待上传矩形（单页路径的便捷入口；没有页时是空集）。
+    /// 第 0 页的待上传矩形（单页测试路径的便捷入口；没有页时是空集）。
+    #[cfg(test)]
     pub(crate) fn take_dirty_rects(&mut self) -> DirtyRects {
         self.take_dirty_rects_at(0).unwrap_or_default()
     }

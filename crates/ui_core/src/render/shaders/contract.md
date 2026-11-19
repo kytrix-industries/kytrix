@@ -22,7 +22,7 @@
 | 32      | 16   | `color0`        | 同上                          | **linear premultiplied** sRGB RGBA：实色 / 渐变起色 / 阴影色 / 字形色 / 图片调制色       |
 | 48      | 16   | `color1`        | 同上                          | 渐变终色 **或** 边框色（互斥）；无则全 0                                                 |
 | 64      | 16   | `params0`       | 同上                          | `border_width, shadow_blur, gradient_kind, aa_padding`（物理像素）                       |
-| 80      | 16   | `params1`       | 同上                          | `clip_index, texture_index, kind, clip_depth`（**整数编码进 f32**）                       |
+| 80      | 16   | `params1`       | 同上                          | `clip_index, atlas_page, kind, clip_depth`（**整数编码进 f32**）                          |
 | 96      | 16   | `uv`            | 同上                          | 图集 tile `u0, v0, u1, v1`（归一化，**用边**，无半纹素偏移）                             |
 | 112     | 16   | `clip_rect`     | 同上                          | clip 链**交集 AABB**（物理浮点，`x, y, w, h`）                                           |
 | **128** | —    | **总计**        | —                             | `size_of == 128`、`align_of == 16`、8 个 `offset_of!` 断言（已落地 `paint/instance.rs`） |
@@ -44,7 +44,7 @@
    `uv` 对非图集 kind 写 0 并忽略；`color1` 无用途时写 0。
 5. `bounds.zw` 必须 `>= 0` 且有限（编码器保证）；shader 仍取 `max(bounds.zw, 0)` 作为防御性一致。
 
-## 2. `kind` / `texture_index` / `gradient_kind` / `flags`
+## 2. `kind` / `atlas_page` / `gradient_kind` / `flags`
 
 | `kind`        | 值    | 产生者                                 | FS 分支                                    |
 |---------------|-------|----------------------------------------|--------------------------------------------|
@@ -56,7 +56,12 @@
 | 保留          | 5     | —                                      | Geometry 实例化表达（v1 走 geometry 通道） |
 | 保留          | 6–7   | —                                      | 应用自定义（v1 不做，F-29）                |
 
-`texture_index`：`TEXTURE_GLYPH = 0`（R8 覆盖度图集）、`TEXTURE_IMAGE = 1`（BGRA8 sRGB 图集）。
+`atlas_page`（`params1.y`）：**采样哪张图集由 `params1.z`（`kind`）决定，`.y` 只是该图集
+texture array 的层号（图集页索引）**。字形图集恒 1 层、页索引恒 `0`；图片图集是
+`MAX_IMAGE_PAGES = 4` 层的 texture array，页索引 `0..4` 由资源层的多页分配器
+（`render::atlas::ImageAtlasPager`）给出（D-9 多页图集 + LRU）。`MAX_IMAGE_PAGES` 只由三端
+后端用于分配数组与层号合法性断言，shader 不读上限（层号直接来自 `params1.y`）；
+对非图集 kind 写 `0` 并忽略。
 `gradient_kind`：`NONE = 0`、`HORIZONTAL = 1`、`VERTICAL = 2`、`RADIAL = 3`。
 `clip_depth`（`params1.w`）：链长，见 §1 硬约束 4。
 
@@ -236,9 +241,14 @@ API 的硬件实例基址语义**互不相同**：
 | `instances`（128 B 步进） | SRV `t0`（`StructureByteStride=128`） | `device const GpuPrimitive* [[buffer(0)]]` | set 0 binding 0，std430 `readonly buffer` |
 | `clips`（48 B 步进）      | SRV `t1`                              | `[[buffer(1)]]`                            | binding 1，std430                         |
 | `root`（112 B）           | root constants `b0`（28 DWORD）       | `[[buffer(2)]]`                            | push constants `[0, 112)`                 |
-| glyph 图集（R8）          | SRV `t2`                              | `[[texture(0)]]`                           | binding 4（combined `sampler2D`）         |
-| image 图集（BGRA8 sRGB）  | SRV `t3`                              | `[[texture(1)]]`                           | binding 5（combined `sampler2D`）         |
+| glyph 图集（R8，1 层 array） | SRV `t2`（`ViewDimension=TEXTURE2D_ARRAY`） | `[[texture(0)]]`（`texture2d_array<float>`） | binding 4（combined `sampler2DArray`） |
+| image 图集（BGRA8 sRGB，`MAX_IMAGE_PAGES` 层 array） | SRV `t3`（`ViewDimension=TEXTURE2D_ARRAY`） | `[[texture(1)]]`（`texture2d_array<float>`） | binding 5（combined `sampler2DArray`） |
 | sampler                   | static `s0`                           | `[[sampler(0)]]`                           | 同上                                      |
+
+图集是 **texture array**（D-9）：字形固定 1 层（恒采样 layer 0），图片固定 `MAX_IMAGE_PAGES = 4`
+层（layer = 图集页索引）。层号是**采样坐标**（`Texture2DArray.Sample` 的 z / `texture2d_array.sample`
+的 slice / GLSL `texture(sampler2DArray, vec3(uv, layer))`），不是 sampler/描述符索引 —— 因此三端
+都**不需要** bindless / descriptor indexing；描述符数组（bindless）与伪数组不参与本契约。
 
 采样器：`FILTER = LINEAR`、`ADDRESS = CLAMP_TO_EDGE`、无 mip（`LOD = 0`）、无比较、无各向异性。
 
@@ -289,7 +299,8 @@ resolve 附件）。`Textured` 没有覆盖率属性，其顶点写 `KYTRIX_AA_I
 
 | 项         | 约定                                                                                                                                           |
 |------------|------------------------------------------------------------------------------------------------------------------------------------------------|
-| UV         | `AtlasTile::uv()` 的**边**约定；**不加**半纹素偏移；三平台纹理原点都是左上、v 向下，**不做 v 翻转**                                            |
+| UV         | `AtlasTile::uv()` 的**边**约定；**不加**半纹素偏移；三平台纹理原点都是左上、v 向下，**不做 v 翻转**；UV 的归一化基准是**该 tile 所在页**的尺寸 |
+| 采样       | 图集是 texture array：glyph 恒 `layer = 0`；image 的 `layer = params1.y`（= `AtlasTile.page`）。应用注册的静态纹理几何（`geometry.textured_*`）没有页概念，固定 `layer = 0` |
 | glyph 图集 | `R8_UNORM`（线性覆盖度，**非** sRGB）；`out = color0 × texel.r`（4 分量同乘）                                                                  |
 | image 图集 | `BGRA8` **sRGB**；纹素是 **linear-premultiplied 后 sRGB 编码**；`out = texel × color0`                                                         |
 | 纹理视图   | image 图集的 SRV / 纹理视图**必须**声明为 sRGB 格式（`*_UNORM_SRGB` / `.bgra8Unorm_srgb` / `*_SRGB`）；glyph 图集必须保持非 sRGB 的 `R8_UNORM` |

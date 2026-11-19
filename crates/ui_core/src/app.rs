@@ -568,7 +568,8 @@ impl App {
         text_pass::upload_glyph_page(self)
     }
 
-    /// 图片页分发：懒分配（没插过图片就没有页）+ 按脏矩形（AOI）增量（DEVIATIONS F-211 / R06-3）。
+    /// 图片图集分发：懒分配（没插过图片就没有页）+ 逐层整页 / 按脏矩形（AOI）增量
+    /// （DEVIATIONS F-211 / R06-3；D-9-c 起图片图集是 4 层 texture array，layer = 页号）。
     fn upload_image_page(&mut self) {
         text_pass::upload_image_page(self)
     }
@@ -579,10 +580,11 @@ impl App {
         text_pass::glyph_page_pixels(self)
     }
 
-    /// 图片页的当前内容（BGRA8 预乘 sRGB；`TestApp::snapshot` 的上传源）；没插过图片时 `None`。
+    /// 全部已打开图片页的当前内容（BGRA8 预乘 sRGB；`TestApp::snapshot` 的逐层上传源）。
+    /// 没有图片页时是空集；顺序 = 层号升序。
     #[cfg(feature = "test-support")]
-    pub(crate) fn resource_page_pixels(&self) -> Option<((u32, u32), &[u8])> {
-        text_pass::resource_page_pixels(self)
+    pub(crate) fn resource_page_pixels_all(&self) -> Vec<((u32, u32), &[u8])> {
+        text_pass::resource_page_pixels_all(self)
     }
 
     /// 图片资源缓存（只读）。应用层在**建树时**用 [`App::resources_mut`] 换 `AtlasTile`。

@@ -314,14 +314,20 @@ pub(crate) fn frame(
     // 立刻再要一帧（全量 damage），槽空后把内容补发——否则静态窗口会把缺字的画面一直
     // 留着。槽长期不空（GPU 卡住 / 窗口不再出帧）时最多补 `MAX_ATLAS_FOLLOWUPS` 帧，不空转。
     let glyph_extent = app.atlas.page().0;
-    let image_extent = app.resources.page_pixels().map(|(page, _)| page.0);
+    // 图片图集是多页 texture array（D-9-c）：除 extent 之外，每层是否已整层初始化也必须对齐，
+    // 否则新页 / 新窗口会采样到未定义层（表现为整块花图而不是「旧图集」）。
+    let image_pages = app.resources.page_count();
+    let image_extent = (image_pages > 0).then(|| app.resources.page_extent());
+    let image_layers = image_pages as u16;
     let deferred = app.windows.get(&window).is_some_and(|target| {
         use crate::paint::atlas::AtlasKind;
         target.has_renderer()
             && (target.atlas_rects_pending()
                 || !target.atlas_page_matches(AtlasKind::Glyph, glyph_extent)
-                || image_extent
-                    .is_some_and(|extent| !target.atlas_page_matches(AtlasKind::Image, extent)))
+                || image_extent.is_some_and(|extent| {
+                    !target.atlas_page_matches(AtlasKind::Image, extent)
+                        || (0..image_layers).any(|layer| !target.image_layer_received(layer))
+                }))
     });
     if deferred {
         let retry = app

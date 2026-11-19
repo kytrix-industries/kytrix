@@ -19,7 +19,9 @@
 /// `shader` 用 `params1.y`（图集页索引）作为层号采样。
 pub const MAX_IMAGE_PAGES: u16 = 4;
 
-/// 图集分两类（字形与图片分图集）。`#[repr(u8)]` 的值即 `GpuPrimitive.params1.z` 的 `kind`。
+/// 图集分两类（字形与图片分图集）。`#[repr(u8)]` 的值是**后端内部的槽位下标**（每端按
+/// `AtlasKind::index()` 索引自己的图集槽）；它**不是** `GpuPrimitive.params1.z` 的 `kind`
+/// （那由 `paint/instance.rs` 的 `KIND_*` 决定：Glyph = 1、Image = 2）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum AtlasKind {
@@ -30,10 +32,20 @@ pub enum AtlasKind {
 }
 
 impl AtlasKind {
-    /// 该图集在 `GpuPrimitive.params1.z` 里的 `kind` 取值。
+    /// 后端槽位下标（`0 = Glyph`、`1 = Image`）。**不是** shader 的 `kind` 取值。
     #[must_use]
     pub const fn index(self) -> u32 {
         self as u32
+    }
+
+    /// 该图集 texture array 的层数（D-9-c）：字形固定 1 层（采样恒 layer 0），图片
+    /// [`MAX_IMAGE_PAGES`] 层（layer = 图集页索引）。
+    #[must_use]
+    pub const fn layers(self) -> u32 {
+        match self {
+            Self::Glyph => 1,
+            Self::Image => MAX_IMAGE_PAGES as u32,
+        }
     }
 }
 
@@ -107,9 +119,15 @@ mod tests {
     }
 
     #[test]
-    fn atlas_kind_index_matches_texture_slots() {
+    fn atlas_kind_index_and_layers_match_the_backend_slots() {
         assert_eq!(AtlasKind::Glyph.index(), 0);
         assert_eq!(AtlasKind::Image.index(), 1);
+        assert_eq!(AtlasKind::Glyph.layers(), 1, "字形图集恒 1 层 array");
+        assert_eq!(
+            AtlasKind::Image.layers(),
+            u32::from(MAX_IMAGE_PAGES),
+            "图片图集固定 MAX_IMAGE_PAGES 层 array"
+        );
     }
 
     #[test]

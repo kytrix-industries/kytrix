@@ -52,8 +52,8 @@ pub struct FrameDump {
 pub struct InstanceDump {
     /// `params1.z`（`1` = Glyph、`2` = Image、其余 = SDF quad/shadow）。
     pub kind: u32,
-    /// `params1.y`（`0` = 字形页、`1` = 图片页）。
-    pub texture: u32,
+    /// `params1.y`：图集 texture array 的层号（图集页索引；字形恒 `0`、图片 `0..4`）。
+    pub atlas_page: u32,
     /// `bounds`（物理像素 `x, y, w, h`）。
     pub bounds: [f32; 4],
     /// 四角半径（物理像素）。
@@ -120,9 +120,9 @@ impl fmt::Display for FrameDump {
         for (index, instance) in self.instances.iter().enumerate() {
             writeln!(
                 f,
-                "  inst {index} kind={} tex={} bounds={:.4},{:.4},{:.4},{:.4} clip={} uv={:.4},{:.4},{:.4},{:.4}",
+                "  inst {index} kind={} page={} bounds={:.4},{:.4},{:.4},{:.4} clip={} uv={:.4},{:.4},{:.4},{:.4}",
                 instance.kind,
-                instance.texture,
+                instance.atlas_page,
                 instance.bounds[0],
                 instance.bounds[1],
                 instance.bounds[2],
@@ -197,7 +197,7 @@ pub fn frame_dump(app: &TestApp) -> FrameDump {
 fn instance_dump(instance: &GpuPrimitive) -> InstanceDump {
     InstanceDump {
         kind: quantize(instance.params1[2]),
-        texture: quantize(instance.params1[1]),
+        atlas_page: quantize(instance.params1[1]),
         bounds: instance.bounds,
         corner_radius: instance.corner_radius,
         color0: instance.color0,

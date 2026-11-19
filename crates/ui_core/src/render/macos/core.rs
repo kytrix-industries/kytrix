@@ -14,8 +14,8 @@
 //!
 //! 严格 per-window 的只剩：drawable、persist、上传槽（背压需要）、display link、GPU 线程。
 //!
-//! 图集页仍是 per-window：共享一张图集纹理会引入跨窗口的 command buffer 重叠写/读竞争
-//! （同一 `MTLCommandQueue` 只保证**开始**顺序，不保证执行隔离），需要 `MTLEvent` 或共享
+//! 图集 texture array 仍是 per-window：共享一张图集纹理会引入跨窗口的 command buffer 重叠写/读
+//! 竞争（同一 `MTLCommandQueue` 只保证**开始**顺序，不保证执行隔离），需要 `MTLEvent` 或共享
 //! 渲染线程才能安全落地 —— 属于 wave-5 的共享渲染线程，不在本次改动范围（详见报告）。
 //!
 //! # 设备恢复（C4）：注册表可替换

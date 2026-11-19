@@ -57,9 +57,10 @@ fragment float4 ps_ui(GeomVsOut in [[stage_in]],
 fragment float4 ps_textured_image(GeomVsOut in [[stage_in]],
                                   device const ClipEntry* clips [[buffer(1)]],
                                   constant RootUniform& root [[buffer(2)]],
-                                  texture2d<float> image_atlas [[texture(1)]],
+                                  texture2d_array<float> image_atlas [[texture(1)]],
                                   sampler atlas_sampler [[sampler(0)]]) {
-    float4 texel = image_atlas.sample(atlas_sampler, in.uv);
+    // 应用注册的静态纹理几何没有页概念：固定采样 slice 0（contract §8）。
+    float4 texel = image_atlas.sample(atlas_sampler, in.uv, 0u);
     float4 color = texel * root.draw.color0;
     return apply_gamma(color * clip_mask(in.world_px, uint(root.draw.clip.x),
                                          uint(KYTRIX_MAX_CLIP_ITEMS), clips));
@@ -68,9 +69,10 @@ fragment float4 ps_textured_image(GeomVsOut in [[stage_in]],
 fragment float4 ps_textured_glyph(GeomVsOut in [[stage_in]],
                                   device const ClipEntry* clips [[buffer(1)]],
                                   constant RootUniform& root [[buffer(2)]],
-                                  texture2d<float> glyph_atlas [[texture(0)]],
+                                  texture2d_array<float> glyph_atlas [[texture(0)]],
                                   sampler atlas_sampler [[sampler(0)]]) {
-    float coverage = glyph_atlas.sample(atlas_sampler, in.uv).r;
+    // 字形图集恒 1 层：固定采样 slice 0。
+    float coverage = glyph_atlas.sample(atlas_sampler, in.uv, 0u).r;
     float4 color = root.draw.color0 * coverage;
     return apply_gamma(color * clip_mask(in.world_px, uint(root.draw.clip.x),
                                          uint(KYTRIX_MAX_CLIP_ITEMS), clips));

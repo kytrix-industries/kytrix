@@ -92,9 +92,13 @@ pub(crate) struct GpuPrimitive {
     pub color1: [f32; 4],
     /// `border_width, shadow_blur, gradient_kind, aa_padding`。
     pub params0: [f32; 4],
-    /// `clip_index, texture_index, kind, clip_depth`（整数编码进 f32；`clip_depth` 是 GPU
-    /// 裁剪链的**真实链长** = 至多一条矩形项 + k 条圆角项（k ≤ `MAX_CLIP_DEPTH`），上界
-    /// [`MAX_CLIP_ITEMS`]；shader 用它收口 clip 循环 —— 旧实现的 `flags` 位无人消费）。
+    /// `clip_index, atlas_page, kind, clip_depth`（整数编码进 f32）。
+    ///
+    /// `atlas_page` 是**图集 texture array 的层号**（图集页索引）：字形图集恒 1 层 ⇒ 恒 `0`；
+    /// 图片图集 `0..MAX_IMAGE_PAGES`（`AtlasTile.page`）。采样哪张图集由 `.z`（`kind`）决定，
+    /// `.y` 只是该图集的层号（采样坐标，不是 sampler 索引，见 contract §2/§7）。
+    /// `clip_depth` 是 GPU 裁剪链的**真实链长** = 至多一条矩形项 + k 条圆角项
+    /// （k ≤ `MAX_CLIP_DEPTH`），上界 [`MAX_CLIP_ITEMS`]；shader 用它收口 clip 循环。
     pub params1: [f32; 4],
     /// 图集 tile `(u0, v0, u1, v1)`。
     pub uv: [f32; 4],
@@ -122,9 +126,6 @@ pub(crate) const KIND_QUAD: f32 = 0.0;
 pub(crate) const KIND_GLYPH: f32 = 1.0;
 pub(crate) const KIND_IMAGE: f32 = 2.0;
 pub(crate) const KIND_SHADOW: f32 = 3.0;
-
-pub(crate) const TEXTURE_GLYPH: f32 = 0.0;
-pub(crate) const TEXTURE_IMAGE: f32 = 1.0;
 
 pub(crate) const GRADIENT_NONE: f32 = 0.0;
 pub(crate) const GRADIENT_HORIZONTAL: f32 = 1.0;
@@ -2329,7 +2330,7 @@ impl LaneEncoder<'_> {
             params0: [0.0; 4],
             params1: [
                 self.clip_index(),
-                TEXTURE_IMAGE,
+                image.tile.page_f32(),
                 KIND_IMAGE,
                 self.clip_depth(),
             ],
@@ -2352,12 +2353,7 @@ impl LaneEncoder<'_> {
             color0: color0.to_array(),
             color1: [0.0; 4],
             params0: [0.0; 4],
-            params1: [
-                self.clip_index(),
-                TEXTURE_GLYPH,
-                KIND_GLYPH,
-                self.clip_depth(),
-            ],
+            params1: [self.clip_index(), 0.0, KIND_GLYPH, self.clip_depth()],
             uv: glyph.tile.uv(),
             clip_rect: self.clip_rect(),
         };
@@ -2398,7 +2394,7 @@ mod tests {
         CLIP_KIND_RECT, CLIP_KIND_ROUNDED, ClipChain, ClipChainId, ClipKind, ClipState,
         GRADIENT_HORIZONTAL, GRADIENT_RADIAL, GRADIENT_VERTICAL, GpuPrimitive, InstanceEncoder,
         KIND_GLYPH, KIND_QUAD, KIND_SHADOW, MAX_CLIP_ITEMS, SHADOW_SIGMA_MIN, SHADOW_SIGMA_SCALE,
-        TEXTURE_GLYPH, normalize_corner_radius, snap_rect_clip_to_pixels,
+        normalize_corner_radius, snap_rect_clip_to_pixels,
     };
     use crate::{
         math::{Point, Rect, Scale, Size, Transform},
@@ -3549,10 +3545,8 @@ mod tests {
         let buffer = encode(&scene);
         assert_eq!(buffer.instances.len(), 3);
         assert!(
-            buffer
-                .instances
-                .iter()
-                .all(|i| i.params1[1] == TEXTURE_GLYPH)
+            buffer.instances.iter().all(|i| i.params1[1] == 0.0),
+            "字形图集恒 1 层：层号必须是 0"
         );
         assert!(buffer.instances.iter().all(|i| i.params1[2] == KIND_GLYPH));
         assert_ne!(buffer.instances[0].uv, buffer.instances[1].uv);
@@ -3901,10 +3895,47 @@ mod tests {
         assert_eq!(buffer.instances.len(), 1);
         let instance = buffer.instances[0];
         assert_eq!(instance.bounds, [2.0, 4.0, 20.0, 40.0]);
-        assert_eq!(instance.params1[1], super::TEXTURE_IMAGE);
+        assert_eq!(
+            instance.params1[1],
+            tile.page_f32(),
+            "params1.y 必须是图集页（texture array 层号），不是旧的 texture_index"
+        );
         assert_eq!(instance.params1[2], super::KIND_IMAGE);
         assert_eq!(instance.uv, [0.1, 0.2, 0.3, 0.4]);
         assert_eq!(instance.params1[3], 0.0, "无裁剪 ⇒ clip_depth 0");
+    }
+
+    /// D-9-c：图片的 `params1.y` 逐页编码（页 1 写 1.0，不是旧的 `TEXTURE_IMAGE = 1` 巧合值）。
+    #[test]
+    fn image_encodes_the_atlas_page_as_the_texture_array_layer() {
+        for page in [0u16, 1, 2, 3] {
+            let tile = AtlasTile {
+                atlas: AtlasKind::Image,
+                page,
+                u0: 0.0,
+                v0: 0.0,
+                u1: 1.0,
+                v1: 1.0,
+                generation: 1,
+            };
+            let scene = scene_with(|scene, lane| {
+                assert!(scene.push(
+                    lane,
+                    Primitive::Image(crate::paint::primitive::Image {
+                        bounds: rect(0.0, 0.0, 1.0, 1.0),
+                        tile,
+                        modulation: Color::WHITE,
+                    }),
+                ));
+            });
+            let buffer = encode(&scene);
+            assert_eq!(
+                buffer.instances[0].params1[1],
+                f32::from(page),
+                "页号必须整数编码进 params1.y"
+            );
+            assert_eq!(buffer.instances[0].params1[1].fract(), 0.0);
+        }
     }
 
     #[test]
