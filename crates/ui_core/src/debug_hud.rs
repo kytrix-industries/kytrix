@@ -124,8 +124,13 @@ pub(crate) struct DebugHudMetrics {
     /// UI 发布 → 本帧反馈给出的延迟（`FrameFeedback::latency`；窗口路径只有落后 ≤1 帧的值）。
     ///
     /// **三端同义**：都是「发布 → **GPU 工作完成**」（`FrameFeedback::completed_at`），不是上屏
-    /// 时刻。真实上屏时刻由 `FrameFeedback::presented_at` 单独承载（macOS 上是 display link 的
-    /// tick 推断值；Windows / Linux 没有可信来源 ⇒ 恒为 `None`），本 HUD 不显示它。
+    /// 时刻。真实上屏时刻由 `FrameFeedback::presented_at` 单独承载（macOS 是 display link 的 tick
+    /// 推断值；Windows 是 `GetFrameStatistics` 的 QPC 证据；Linux 是 `wp_presentation` 的呈现时钟）。
+    ///
+    /// A4：HUD 目前**不**显示该值——公开消费面（`Window::last_frame_presentation` /
+    /// `App::last_frame_presentation`）已经提供 `publish→presented` p50/p99 所需的全部数据，
+    /// 但把 HUD 行从 10 行扩成 11 行属于布局/产品决策（审查报告 Q 待裁决），本项只保证数据面
+    /// 可用；`acceptance window` 已在用同一数据面打印 e2e 分位数与有值率。
     pub latency: Option<Duration>,
     /// 实际发出的 draw call 数。
     pub draw_calls: u32,

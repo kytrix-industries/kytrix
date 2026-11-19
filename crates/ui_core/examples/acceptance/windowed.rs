@@ -10,12 +10,13 @@
 //!   这样测的是「数据以 60/120 Hz 到达时，引擎能否稳定每拍交一帧」——市场数据类界面的真实形态。
 //!   为什么不用「每次泵循环都写状态」：那会自己唤醒自己（写状态 ⇒ `request_frame` ⇒ 唤醒 ⇒
 //!   再写），实测变成 ~300 fps 的忙循环，测到的就不是刷新节拍了。
-//! - **present 级抖动不在本 harness 的测量面**：`FrameFeedback::presented_at`（macOS 的
-//!   `presentedTime` / Linux 的 `wl_callback`）是 crate 私有。平台节拍本身由帧时钟决定
-//!   （Windows `DCompositionWaitForCompositorClock` / macOS display link / Linux frame callback）；
-//!   Linux 的提交本来就被 `wl_callback` 门禁（`state.frame_ready`），因此 Linux 的 commit 间隔
-//!   **就是** present 间隔。HUD（`--features hud --hud`）给出引擎自报的 FPS/Frame/Latency，
-//!   作为同源旁证（报告里附截图）。
+//! - **present 级观测（A4）**：`App::last_frame_presentation` / `Window::recent_frame_presentations`
+//!   给出每帧的 `published_at / completed_at / presented_at`（`presented_at` 是真实上屏时刻的
+//!   **下界**：Windows 帧统计 / Linux `wp_presentation` / macOS display-link tick 推断）。本 harness
+//!   按 `FrameIndex` 增量消费最近若干帧的呈现快照，打印 `publish→presented` 的 p50/p99 与有值率。
+//!   `presented_at` 缺失（该端/该帧没有可信值）的帧计入「有值率」分母、不进 e2e 样本。
+//!   **阈值先测量后定**（目标 ≤2 vsync @60 Hz，即 p99 ≤ ~33 ms）：本 harness 只输出测量值，
+//!   不把它并入本次 PASS/FAIL（A2 的帧预算落地后再定门禁）。
 //!
 //! # 为什么钩子里自己提交一帧
 //!
@@ -65,6 +66,14 @@ struct WindowRun {
     intervals: Samples,
     frame_cpu: Samples,
     update_cpu: Samples,
+    /// `publish → presented`（上屏时刻下界）的 e2e 样本（A4；微秒）。
+    e2e_presented: Samples,
+    /// 已结算（有反馈且不再变化）的呈现快照帧数（有值率分母）。
+    presentation_observed: usize,
+    /// 其中 `presented_at` 有值的帧数（有值率分子）。
+    presentation_presented: usize,
+    /// 已消费到的最后一条呈现快照的 `FrameIndex`（增量消费游标）。
+    presentation_cursor: Option<u32>,
     commits: usize,
     last_commit: Option<Instant>,
     last_progress: Instant,
@@ -91,11 +100,60 @@ impl WindowRun {
             intervals: Samples::new("frame interval", capacity),
             frame_cpu: Samples::new("ui thread frame cpu", capacity),
             update_cpu: Samples::new("ui thread update cpu", capacity),
+            e2e_presented: Samples::new("publish -> presented", capacity),
+            presentation_observed: 0,
+            presentation_presented: 0,
+            presentation_cursor: None,
             commits: 0,
             last_commit: None,
             last_progress: started,
             finished: false,
             raw: config.raw,
+        }
+    }
+
+    /// 增量消费窗口上最近若干帧的呈现快照（A4）。
+    ///
+    /// 结算口径：`presented_at` 有值 ⇒ 立即结算；没有值但要等它「后面已经又来了 2 帧反馈」
+    /// 才判为 `None`（Linux 的 `wp_presentation` 事件晚于反馈一个 vsync 左右到达，不能过早
+    /// 判死）。只统计测量窗口内提交的帧（`published_at ≥ measure_at`）。
+    fn observe_presentations(&mut self, app: &App, window: WindowId) {
+        let Some(target) = app.window(window) else {
+            return;
+        };
+        let latest = target
+            .last_frame_presentation()
+            .map_or(0, |presentation| presentation.index.get());
+        for presentation in target.recent_frame_presentations() {
+            let index = presentation.index.get();
+            if self
+                .presentation_cursor
+                .is_some_and(|cursor| index <= cursor)
+            {
+                continue;
+            }
+            if presentation.published_at < self.measure_at {
+                self.presentation_cursor = Some(index);
+                continue;
+            }
+            let settled = presentation.presented_at.is_some()
+                || latest.saturating_sub(index) >= 2
+                || presentation.published_at < self.deadline - Duration::from_millis(50);
+            if !settled {
+                // 保持帧序：前面的还没结算，后面的不能先消费（否则 e2e 会被错配）。
+                break;
+            }
+            self.presentation_cursor = Some(index);
+            self.presentation_observed += 1;
+            if let Some(e2e) = presentation.publish_to_presented() {
+                self.presentation_presented += 1;
+                self.e2e_presented.push(e2e);
+                if self.raw {
+                    println!("raw,e2e_presented,{:.3}", e2e.as_secs_f64() * 1e6);
+                }
+            } else if self.raw {
+                println!("raw,e2e_presented,missing");
+            }
         }
     }
 
@@ -167,6 +225,37 @@ impl WindowRun {
             self.intervals.len()
         );
         println!("测量期吞吐          {throughput:.2} fps（帧数 / 测量时长）");
+        println!();
+        // A4：publish → presented（上屏时刻下界）的 e2e 分布与有值率。
+        println!("-- A4 e2e 呈现（publish → presented；presented 是真实上屏时刻的下界） --");
+        println!("{}", self.e2e_presented.line());
+        let ratio = if self.presentation_observed == 0 {
+            None
+        } else {
+            Some(self.presentation_presented as f64 / self.presentation_observed as f64)
+        };
+        println!(
+            "presented 有值率 {}（{} / {} 已结算帧；未结算 = 测量结束时反馈还没到）",
+            ratio.map_or("--".to_owned(), |ratio| format!("{:.2}%", ratio * 100.0)),
+            self.presentation_presented,
+            self.presentation_observed
+        );
+        if let Some(summary) = self.e2e_presented.summary() {
+            let p50_vsync = summary.p50_us / target;
+            let p99_vsync = summary.p99_us / target;
+            println!(
+                "e2e p50 = {:.3} ms（{p50_vsync:.2} vsync） / p99 = {:.3} ms（{p99_vsync:.2} vsync）",
+                summary.p50_us / 1e3,
+                summary.p99_us / 1e3
+            );
+            println!(
+                "参考阈值（目标 ≤2 vsync @ {hz} Hz）= {:.3} ms；本项为 A4 观测项，阈值待 A2 帧预算落地后定，\
+                 不并入本次 PASS/FAIL",
+                2.0 * target / 1e3
+            );
+        } else {
+            println!("没有采到 e2e 呈现样本（presented_at 恒为 None / 窗口未出帧？）");
+        }
         println!();
         println!("-- UI 线程 CPU（本帧 `App::frame`；编码在合成线程） --");
         println!("{}", self.frame_cpu.line());
@@ -269,6 +358,8 @@ pub fn run_window(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
             return;
         }
         let now = Instant::now();
+        // A4：每轮都增量消费一次呈现快照（presented 事件可能晚于反馈到达，不能只在提交时读）。
+        run.observe_presentations(app, window);
         // 只应用「一拍」：积压的节拍合并成一次更新（最新值胜），与真实行情的合并语义一致。
         if pending.swap(0, Ordering::AcqRel) > 0 {
             let update_started = Instant::now();

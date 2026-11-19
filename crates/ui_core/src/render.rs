@@ -23,10 +23,10 @@ pub(crate) mod delta;
 pub(crate) mod frame;
 /// 帧时钟抽象 + 「何时出帧 / 何时跳帧」的唯一共享实现（B6-2，架构决策 §6）。
 pub(crate) mod frame_clock;
-/// 上屏证据与呈现节奏的**平台无关**纯逻辑（R3）：`presented_at` 下界钳制、pacing 判定、
-/// `FeedbackQueue` 的 tick 证据语义。macOS 的 ObjC / display-link 薄壳调用这里；非 macOS
-/// 平台的**测试构建**也编译它，使这些断言能在 Windows/Linux 本机执行（生产构建不编译）。
-#[cfg(any(target_os = "macos", test))]
+/// 上屏证据与呈现节奏的**平台无关**逻辑（R3 / A4）：`presented_at` 的三个平台来源
+/// （macOS display-link tick 推断 / Windows `GetFrameStatistics` / Linux `wp_presentation`）、
+/// 下界钳制与反馈发布顺序。三平台无条件编译（各端专用项 `cfg` 门控）；**所有平台的
+/// `cfg(test)` 构建**都编译并运行它的单元测试，让判据在开发机（Windows）可执行。
 pub(crate) mod present_evidence;
 pub(crate) mod retire;
 /// 三套 shader 的构建期契约校验（R06-5）的唯一实现：`build.rs` 用 `include!` 编进去执行，

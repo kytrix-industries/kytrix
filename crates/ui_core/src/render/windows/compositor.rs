@@ -43,7 +43,7 @@ use std::{
 use persist::rtv_handle;
 use windows::Win32::{
     Foundation::{HANDLE, HWND},
-    Graphics::{Direct3D12::*, Dwm::*},
+    Graphics::{Direct3D12::*, Dwm::*, Dxgi::DXGI_FRAME_STATISTICS},
     UI::WindowsAndMessaging::{IsIconic, IsWindowVisible},
 };
 
@@ -393,6 +393,17 @@ impl GpuRenderer {
             "the queue fence may only be observed on the kytrix-d3d12 thread"
         );
         self.stream.completed_value()
+    }
+
+    /// 组合交换链的 `GetFrameStatistics`（A4：`presented_at` 的 Windows 证据）。
+    ///
+    /// 薄委托到 [`Swapchain::frame_statistics`]；无窗口目标（离屏 / 快照）恒 `None`。
+    pub(crate) fn frame_statistics(&self) -> Option<DXGI_FRAME_STATISTICS> {
+        debug_assert!(
+            on_gpu_thread(),
+            "frame statistics may only be observed on the kytrix-d3d12 thread"
+        );
+        self.swapchain.as_ref()?.frame_statistics()
     }
 
     /// 实现在 `persist::set_content_size`（薄委托）。

@@ -62,7 +62,7 @@ use crate::{
         FontStack, FontStackStatus, TextDiagnostic, TextLayoutReport, TextPassReport,
         atlas::GlyphAtlas, context::TextContext, raster::GlyphRasterizer,
     },
-    window::{FrameOutcome, FrameTicket, Window, WindowId, WindowOptions},
+    window::{FrameOutcome, FramePresentation, FrameTicket, Window, WindowId, WindowOptions},
 };
 
 /// a11y 诊断的环形容量（与 `text_diagnostics` 同口径：超出丢最旧）。
@@ -1561,6 +1561,20 @@ impl App {
     #[must_use]
     pub fn window(&self, id: WindowId) -> Option<&Window> {
         window_set::window(self, id)
+    }
+
+    /// 最近一帧的呈现快照（A4：`commit → presented` 的**公开**消费面）。
+    ///
+    /// 真实窗口的 GPU 反馈每轮泵由 [`Window::poll_renderer`] 落到窗口上；`presented_at` 是
+    /// 该端能给出的真实上屏时刻的**下界**（`None` = 该端/该帧没有可信值，不是「用完成时刻
+    /// 顶替」）。`acceptance window` 的 `publish→presented` p50/p99 与有值率、HUD 的后续行、
+    /// 应用侧延迟监控都从这里取（`FrameFeedback` 是 crate 私有）。
+    ///
+    /// `None`：窗口不存在，或还没有观测到任何完成帧（首帧之前 / headless）。
+    #[must_use]
+    pub fn last_frame_presentation(&self, window: WindowId) -> Option<FramePresentation> {
+        self.window(window)
+            .and_then(Window::last_frame_presentation)
     }
 
     /// 可写窗口（应用层建树的入口）。

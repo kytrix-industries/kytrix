@@ -830,6 +830,7 @@ mod tests {
             a11y_only: false,
             paint_log: crate::test_support::record::PaintLog::default(),
             a11y: None,
+            presented_latency: None,
         };
         let overlay = DamageOverlay::of(&record);
         assert_eq!(overlay.rects, record.damage);

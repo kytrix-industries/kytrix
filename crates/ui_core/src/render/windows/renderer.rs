@@ -40,7 +40,7 @@ use std::{
     os::windows::io::AsRawHandle,
     path::PathBuf,
     sync::{
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
@@ -50,8 +50,10 @@ use std::{
 use smol_str::{SmolStr, format_smolstr};
 use windows::Win32::{
     Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM},
-    System::Threading::{
-        CreateEventW, GetCurrentThreadId, INFINITE, SetEvent, WaitForMultipleObjects,
+    Graphics::Dxgi::DXGI_FRAME_STATISTICS,
+    System::{
+        Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
+        Threading::{CreateEventW, GetCurrentThreadId, INFINITE, SetEvent, WaitForMultipleObjects},
     },
     UI::WindowsAndMessaging::{
         DispatchMessageW, MSG, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, PostMessageW,
@@ -77,6 +79,10 @@ use crate::{
         color::background_linear,
         compositor::{FramePlan, Plan},
         frame::{FrameFeedback, FrameRequest, FrameSink, LatestFrame, MAX_FRAMES_IN_FLIGHT},
+        present_evidence::{
+            clamp_presented_at, presented_qpc_from_frame_statistics, qpc_instant,
+            refresh_period_qpc,
+        },
         timer::{FrameTimings, GpuTimerSample},
         windows::{
             compositor::{FrameSubmitError, GpuRenderer, enter_gpu_thread},
@@ -911,11 +917,120 @@ struct SubmittedFrame {
     samples: Vec<GpuTimerSample>,
     /// HUD 的 `latency` 起点（`FrameRequest::published_at`）。
     published_at: Instant,
+    /// A4：`Present1` 成功之后立即采样的**上屏时刻下界证据**（`None` = 该拍拿不到统计）。
+    ///
+    /// 采样点在本次 present 之后、下一次 present 之前 ⇒ 「最后一次已上屏内容」一定不晚于本帧
+    /// ⇒ 它是本帧真实上屏时刻的下界。发布前再经 [`clamp_presented_at`] 与 `completed_at`
+    /// 取较大者（两个下界取 max 仍是下界）。
+    presented: Option<Instant>,
     signal_value: u64,
     /// ring 槽位：完成时从该槽的 timestamp 读回缓冲读 GPU 时间。
     slot: usize,
     /// 本帧 present 的内容尺寸（完成时发布给 UI 线程的合成几何）。
     surface: (u32, u32),
+}
+
+/// `presented_at` 的 Windows 证据采样状态（A4）。
+///
+/// `DXGI_FRAME_STATISTICS` 只给「最近一次**已上屏**内容发生在哪个 vblank」+「最近一次 vblank
+/// 采样的 QPC 时刻」，而 `GetFrameStatistics` 是**进程级/交换链级快照**、没有逐帧归属信息：
+///
+/// - present 之后立即采样时，「最后一次已上屏内容」必然早于本帧 ⇒ 结果**恒为本帧上屏时刻的
+///   下界**（真实上屏只能更晚）；
+/// - 若本帧完成时它仍是最后一次 present（没有更晚的帧上屏），完成观测点再采一次：这一刻可能
+///   已经等到本帧自己的 vblank（值更紧）。两个下界取 `max` 仍是下界。
+///
+/// 周期：`DXGI_FRAME_STATISTICS` **没有** `SyncRefreshPeriod` 字段（`SyncGPUTime` reserved 恒 0，
+/// MS docs 与 windows crate 0.62 均已核对），因此用相邻两次采样的
+/// `ΔSyncQPCTime / ΔSyncRefreshCount` 实测（[`refresh_period_qpc`]）；`lag == 0` 时不需要周期。
+struct FrameStatisticsClock {
+    /// `QueryPerformanceFrequency`（ticks/秒；0 = 系统没给）。
+    frequency: i64,
+    /// 进程级 QPC → `Instant` 锚点（首次转换时采样一次）。
+    anchor: OnceLock<(i64, Instant)>,
+    /// 上一次采样的 `(SyncRefreshCount, SyncQPCTime)`：周期推导用。
+    last_sync: Option<(u32, i64)>,
+    /// 最近一次实测的刷新周期（QPC ticks）。
+    period_qpc: Option<i64>,
+    /// 有统计的采样次数 / 失败次数（诊断）。
+    samples: u64,
+    failures: u64,
+    /// 已经打印过「本机拿不到帧统计」的一次性诊断（不刷屏）。
+    warned: bool,
+}
+
+impl FrameStatisticsClock {
+    fn new() -> Self {
+        let mut frequency = 0i64;
+        // SAFETY: kernel32 查询；入参指向本函数栈上的变量。
+        let frequency =
+            unsafe { QueryPerformanceFrequency(&mut frequency) }.map_or(0, |()| frequency);
+        Self {
+            frequency,
+            anchor: OnceLock::new(),
+            last_sync: None,
+            period_qpc: None,
+            samples: 0,
+            failures: 0,
+            warned: false,
+        }
+    }
+
+    /// 进程级 QPC → `Instant` 锚点（`(QueryPerformanceCounter, Instant::now())` 同一次采样）。
+    fn anchor(&self) -> Option<(i64, Instant)> {
+        if let Some(anchor) = self.anchor.get() {
+            return Some(*anchor);
+        }
+        let mut counter = 0i64;
+        // SAFETY: kernel32 查询；入参指向本函数栈上的变量。
+        unsafe { QueryPerformanceCounter(&mut counter) }.ok()?;
+        let anchor = (counter, Instant::now());
+        Some(*self.anchor.get_or_init(|| anchor))
+    }
+
+    /// 一次 `GetFrameStatistics` 采样 → 本帧上屏时刻的下界证据（`None` = 该拍不可信）。
+    fn observe(&mut self, stats: Option<DXGI_FRAME_STATISTICS>) -> Option<Instant> {
+        let Some(stats) = stats else {
+            self.failures = self.failures.saturating_add(1);
+            self.warn_if_unavailable();
+            return None;
+        };
+        self.samples = self.samples.saturating_add(1);
+        let current = (stats.SyncRefreshCount, stats.SyncQPCTime);
+        if let Some(previous) = self.last_sync
+            && let Some(period) = refresh_period_qpc(previous, current, self.frequency)
+        {
+            self.period_qpc = Some(period);
+        }
+        self.last_sync = Some(current);
+        let presented_qpc = presented_qpc_from_frame_statistics(
+            stats.SyncRefreshCount,
+            stats.PresentRefreshCount,
+            stats.SyncQPCTime,
+            self.period_qpc,
+        )?;
+        let (anchor_qpc, anchor) = self.anchor()?;
+        qpc_instant(
+            presented_qpc,
+            anchor_qpc,
+            anchor,
+            Instant::now(),
+            self.frequency,
+        )
+    }
+
+    /// 连续几十帧都拿不到统计 ⇒ 本机/本显示器不提供（`presented_at` 如实为 `None`），
+    /// 打印一次诊断后不再刷屏。
+    fn warn_if_unavailable(&mut self) {
+        if self.warned || self.samples > 0 || self.failures < 60 {
+            return;
+        }
+        self.warned = true;
+        eprintln!(
+            "kytrix: IDXGISwapChain::GetFrameStatistics unavailable on this display; \
+             FrameFeedback::presented_at stays None (no fabricated timestamps)"
+        );
+    }
 }
 
 /// GPU 线程主循环（§6.3）。
@@ -1062,9 +1177,11 @@ fn run_gpu_loop(
     let mut display_recovery = DisplayRecovery::new();
     // 清退避（一次性）：恢复后的第一帧不因「不可见 / 被遮挡」退避，见 `recover_display_change`。
     let mut force_present = false;
+    // A4：`presented_at` 的证据采样状态（周期实测 + QPC 锚点；GPU 线程独占）。
+    let mut statistics = FrameStatisticsClock::new();
     loop {
         // 完成通知的唯一处理点：按提交顺序发布反馈 + 推进 retire（§4.1 / §6.5）。
-        drain_completed(renderer, shared, submitted);
+        drain_completed(renderer, shared, submitted, &mut statistics);
         if shared.shutdown_requested() {
             return Ok(());
         }
@@ -1103,7 +1220,7 @@ fn run_gpu_loop(
         force_present = false;
         // I3：先等呈现节奏，再取「此刻最新」的帧 —— 等待期间 UI 的发布覆盖旧请求并合并 damage，
         // 渲染的是最新快照而不是最多等了一个 vsync 的旧快照（§4.2 的「帧是状态不是队列」）。
-        if !wait_for_waitable(renderer, shared, submitted)? {
+        if !wait_for_waitable(renderer, shared, submitted, &mut statistics)? {
             // 没消费到 token（关闭 / 遮挡 / 超时后重查）：回到循环顶重新决策。
             continue;
         }
@@ -1122,7 +1239,7 @@ fn run_gpu_loop(
         // 取帧之后、可能 `resize_target` 之前再排空一次完成通知：`resize_target` 会 `wait_idle`，
         // 未 drain 的帧的 timestamp 读回缓冲会被后续录制覆盖（`ResolveQueryData` 的写入与 CPU
         // 读回共用同一块缓冲 → GPU 采样错帧）。
-        drain_completed(renderer, shared, submitted);
+        drain_completed(renderer, shared, submitted, &mut statistics);
         // 等 waitable 期间到达的背景色：与帧一起落地（在录制前换掉 1×1 背景层，不引入新的
         // GPU 调用点）。
         if let Some(rgba) = shared.take_background() {
@@ -1166,7 +1283,7 @@ fn run_gpu_loop(
             }
             // 该槽的上一帧刚被等到：在录制覆盖它的 timestamp 读回缓冲**之前**发布它的反馈
             // （`ResolveQueryData` 的写入与 CPU 读回共用这一块缓冲，必须按完成顺序串行化）。
-            drain_completed(renderer, shared, submitted);
+            drain_completed(renderer, shared, submitted, &mut statistics);
             let mut frame = FramePlan::new(draw_plan, renderer.is_fresh());
             if frame.is_idle() {
                 debug_assert!(false, "idle frame consumed a waitable token");
@@ -1184,11 +1301,15 @@ fn run_gpu_loop(
                             });
                         }
                     }
+                    // A4：present 之后立即采样帧统计。此刻「最后一次已上屏内容」必然早于本帧
+                    // ⇒ 采样结果恒为本帧真实上屏时刻的下界（见 `FrameStatisticsClock` 文档）。
+                    let presented = statistics.observe(renderer.frame_statistics());
                     submitted.push_back(SubmittedFrame {
                         index: request.index,
                         stats,
                         samples,
                         published_at: request.published_at,
+                        presented,
                         signal_value: slot.signal_value,
                         slot: slot.index,
                         surface: request.surface,
@@ -1235,11 +1356,12 @@ fn run_gpu_loop(
     }
 }
 
-/// 发布已观察到完成的帧（提交顺序）并推进 retire。
+/// 发布已观察到完成的帧（提交顺序）并推进 retire（A4：`presented_at` 来自帧统计下界证据）。
 fn drain_completed(
     renderer: &mut GpuRenderer,
     shared: &Shared,
     submitted: &mut VecDeque<SubmittedFrame>,
+    statistics: &mut FrameStatisticsClock,
 ) {
     let completed = renderer.completed_value();
     let mut observed = false;
@@ -1254,6 +1376,22 @@ fn drain_completed(
         }
         // 观察到完成的时刻（fence / `SetEventOnCompletion` 醒来），不是 Present 返回的时刻。
         let completed_at = Instant::now();
+        // A4：本帧的上屏时刻下界 = max(present 后采样, 完成观测点采样)。
+        //
+        // 两个采样点都满足「最后一次已上屏内容不晚于本帧」：
+        // - present 后：本帧刚提交，尚未上屏；
+        // - 完成观测点（仅当 `submitted` 已空 = 本帧是最后一次 present）：此后的 present 都还
+        //   没有，所以「最后已上屏」要么是本帧、要么更早——两种情况下都 ≤ 本帧真实上屏时刻。
+        // 其中 present 后采样的「最后已上屏」严格早于本帧，所以它单独就已经是下界；取 max 只会
+        // 更紧，不会越过真实值。
+        let mut presented = frame.presented;
+        if submitted.is_empty()
+            && let Some(refreshed) = statistics.observe(renderer.frame_statistics())
+        {
+            presented = Some(presented.map_or(refreshed, |known| known.max(refreshed)));
+        }
+        // 契约：有值 ⇒ 不早于 GPU 完成（真实上屏不可能比 GPU 工作更早；两个下界取 max 仍是下界）。
+        let presented_at = clamp_presented_at(presented, completed_at);
         shared.publish_feedback(FrameFeedback {
             index: frame.index,
             stats: frame.stats,
@@ -1261,9 +1399,8 @@ fn drain_completed(
             completed_at,
             // UI 发布 → GPU 完成（HUD 的 publish→present）。
             latency: completed_at.saturating_duration_since(frame.published_at),
-            // 该端没有可信的呈现时间戳（`GetFrameStatistics` 未接）：共享契约里 `presented_at`
-            // 是可空字段，**如实留空**——不拿 GPU 完成时刻顶替（那会让 HUD 的上屏延迟变成假数据）。
-            presented_at: None,
+            // 上屏时刻的下界（`None` = 本拍拿不到可信统计；绝不拿 GPU 完成时刻顶替）。
+            presented_at,
         });
         // 「交换链里现在有这么大一块内容」：这是 UI 线程重算 DComp 几何的正确时点（合成内容
         // 已经落地），尺寸变化时才 post 唤醒。
@@ -1328,6 +1465,7 @@ fn wait_for_waitable(
     renderer: &mut GpuRenderer,
     shared: &Shared,
     submitted: &mut VecDeque<SubmittedFrame>,
+    statistics: &mut FrameStatisticsClock,
 ) -> Result<bool, EngineError> {
     let Some(waitable) = renderer.waitable() else {
         // 离屏目标没有交换链：节奏由调用方（同步路径）决定。
@@ -1338,7 +1476,7 @@ fn wait_for_waitable(
             Some(0) => return Ok(true),
             Some(_) => {
                 // completion：先发布反馈再继续等（waitable 还没被消费）。
-                drain_completed(renderer, shared, submitted);
+                drain_completed(renderer, shared, submitted, statistics);
                 if shared.shutdown_requested() || renderer.window_occluded() {
                     return Ok(false);
                 }

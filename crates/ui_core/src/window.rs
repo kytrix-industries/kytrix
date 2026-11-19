@@ -13,7 +13,12 @@ mod surface;
 #[cfg(test)]
 mod tests;
 
-use std::{cell::Cell, rc::Rc};
+use std::{
+    cell::Cell,
+    collections::VecDeque,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use smol_str::SmolStr;
 
@@ -262,6 +267,55 @@ impl FrameIndex {
     }
 }
 
+/// 一帧的**呈现快照**（A4 的公开消费面：`commit → presented` 的 e2e 观测）。
+///
+/// 三端统一的数据面（每轮泵在 [`Window::poll_renderer`] 里从 [`crate::render::frame::FrameFeedback`]
+/// 更新；Linux 的 `wp_presentation` 事件在到达后回填 `presented_at`）：
+///
+/// - [`Self::published_at`]：UI 提交本帧的时刻（= `completed_at − latency`，两者同源，无额外误差）；
+/// - [`Self::completed_at`]：GPU 线程观察到 GPU 工作完成的时刻；
+/// - [`Self::presented_at`]：真实上屏时刻的**下界**（`None` = 该端/该帧没有可信值；偏差方向恒为
+///   偏早，**不是**「用 completed_at 顶替」的占位，契约见 `render::frame::FrameFeedback`）。
+///
+/// 这是本 crate 交给应用 / 验收 harness 的**唯一**呈现观测面：`FrameFeedback` 本身是 crate 私有。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FramePresentation {
+    /// 本帧的提交序号（与 `FrameOutcome::Committed` 同源）。
+    pub index: FrameIndex,
+    /// UI 提交本帧的时刻（`completed_at − latency`）。
+    pub published_at: Instant,
+    /// GPU 线程观察到本帧 GPU 工作完成的时刻。
+    pub completed_at: Instant,
+    /// 本帧真实上屏时刻的下界（`None` = 该端/该帧没有可信值）。
+    pub presented_at: Option<Instant>,
+    /// `completed_at − published_at`（三端同义；HUD 的 `Latency` 行同为这个口径）。
+    pub latency: Duration,
+}
+
+impl FramePresentation {
+    /// `published_at → presented_at` 的 e2e 时长（`presented_at` 为上屏时刻的下界 ⇒ 结果是
+    /// e2e 时长的**下界**）。`None` = 本帧没有可信的上屏时刻。
+    #[must_use]
+    pub fn publish_to_presented(&self) -> Option<Duration> {
+        self.presented_at
+            .map(|presented| presented.saturating_duration_since(self.published_at))
+    }
+
+    /// `completed_at → presented_at` 的残留（呈现链在 GPU 完成之后还要等多久；`None` 同上）。
+    #[must_use]
+    pub fn completion_to_presented(&self) -> Option<Duration> {
+        self.presented_at
+            .map(|presented| presented.saturating_duration_since(self.completed_at))
+    }
+}
+
+/// 每窗口保留的最近呈现快照条数（A4）。
+///
+/// 为什么不是只留最后一条：Linux 的 `wp_presentation` 事件在帧反馈**之后**才到达（GPU 完成时
+/// 还没上屏），需要按 `FrameIndex` 回填；验收 harness 也按 index 增量消费（不能因为新一轮
+/// 反馈覆盖旧条目而漏采）。8 条覆盖「事件晚到 + 采样节拍错开」的正常范围。
+const FRAME_PRESENTATION_HISTORY: usize = 8;
+
 /// 一帧的最终结果（`FrameRecord` 只存在于 `test-support`）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameOutcome {
@@ -380,6 +434,11 @@ pub struct Window {
     resolver: ColorResolver,
     /// GPU 渲染器（`None` = headless，I7 的默认；P09 的窗口层负责 attach 原生窗口）。
     renderer: Option<Renderer>,
+    /// 最近若干帧的呈现快照（A4 的公开消费面；容量 [`FRAME_PRESENTATION_HISTORY`]）。
+    ///
+    /// 每轮泵在 [`Window::poll_renderer`] 里追加 GPU 线程的反馈；Linux 的 `wp_presentation`
+    /// 事件到达后按 `FrameIndex` 回填对应条目的 `presented_at`（事件晚于反馈）。
+    presentation: VecDeque<FramePresentation>,
     /// 该窗口的渲染器已收到的**完整**字形图集页尺寸（`None` = 还没收到 / 渲染器已换）。
     ///
     /// 图集页是进程级共享数据，但纹理是每窗口一份（`AtlasTextures`），因此必须逐窗口记账：
@@ -480,6 +539,7 @@ impl Window {
             damage: DamageAccumulator::new(scale),
             resolver: ColorResolver,
             renderer: None,
+            presentation: VecDeque::with_capacity(FRAME_PRESENTATION_HISTORY),
             glyph_page_received: None,
             image_page_received: None,
             atlas_rects: std::array::from_fn(|_| crate::render::DirtyRects::default()),
@@ -517,6 +577,54 @@ impl Window {
     #[must_use]
     pub fn id(&self) -> WindowId {
         self.id
+    }
+
+    // ── A4：呈现快照（`commit → presented` 的公开消费面） ──
+
+    /// 最近一帧的呈现快照（还没观测到任何完成帧时 `None`）。
+    ///
+    /// 字段语义见 [`FramePresentation`]；`presented_at` 在 Linux 上可能晚一轮才回填（事件异步），
+    /// 需要增量采集时用 [`Self::recent_frame_presentations`] 按 `index` 消费。
+    #[must_use]
+    pub fn last_frame_presentation(&self) -> Option<FramePresentation> {
+        self.presentation.back().copied()
+    }
+
+    /// 最近若干帧的呈现快照（提交顺序，最多 [`FRAME_PRESENTATION_HISTORY`] 条）。
+    ///
+    /// 验收 harness 用它按 `index` 增量消费：Linux 的呈现事件在反馈之后到达，只看最后一条会
+    /// 漏掉被新一轮反馈挤走的帧。
+    pub fn recent_frame_presentations(&self) -> impl Iterator<Item = FramePresentation> + '_ {
+        self.presentation.iter().copied()
+    }
+
+    /// 追加一条 GPU 线程的完成反馈（`poll_renderer` 的唯一调用点）。
+    pub(crate) fn note_frame_presentation(&mut self, presentation: FramePresentation) {
+        if self.presentation.len() >= FRAME_PRESENTATION_HISTORY {
+            let _ = self.presentation.pop_front();
+        }
+        self.presentation.push_back(presentation);
+    }
+
+    /// Linux：`wp_presentation` 的呈现事件到达，回填对应帧的 `presented_at`。
+    ///
+    /// 已被历史窗口挤掉的帧直接忽略（不会伪造；验收侧有各自的「已结算」口径）。
+    ///
+    /// 只在 Linux 生产构建与测试构建里存在：其它平台的 `presented_at` 在反馈发布时已是终值
+    /// （Windows 帧统计 / macOS tick 推断），没有异步回填路径。
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn note_frame_presented(
+        &mut self,
+        index: FrameIndex,
+        presented_at: Option<Instant>,
+    ) {
+        if let Some(entry) = self
+            .presentation
+            .iter_mut()
+            .find(|entry| entry.index == index)
+        {
+            entry.presented_at = presented_at;
+        }
     }
 
     /// 节点树只读视图。

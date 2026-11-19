@@ -415,8 +415,9 @@ impl WindowRenderer {
         let Some(feedback) = self.shared.take_feedback() else {
             return Ok(None);
         };
-        // 共享契约（`render/frame.rs`）：`presented_at` 要么是**可信**的上屏时刻（Linux 恒为
-        // `None` —— `wl_surface.frame` 回调未接），要么如实为 `None`；绝不允许用完成时刻顶替。
+        // 共享契约（`render/frame.rs`）：`presented_at` 要么是**可信**的上屏时刻（A4 数据面：
+        // `wp_presentation_feedback.presented` 的呈现时钟；生产接线尚未启用 ⇒ 当前恒为 `None`），
+        // 要么如实为 `None`；绝不允许用完成时刻顶替。
         debug_assert!(
             feedback.presentation_is_consistent(),
             "presented_at must be a trustworthy on-screen instant or None"
@@ -893,8 +894,11 @@ fn drain_completed(
             completed_at,
             // UI 发布 → GPU 完成（HUD 的 publish→present）。
             latency: completed_at.saturating_duration_since(frame.published_at),
-            // 该端没有可信的呈现时间戳（`wl_surface.frame` 回调未接）：共享契约里 `presented_at`
-            // 是可空字段，**如实留空**——不拿 GPU 完成时刻顶替（那会让 HUD 的上屏延迟变成假数据）。
+            // A4：Linux 的 presented_at 来源是 `wp_presentation_feedback.presented`（呈现时钟
+            // 时间戳）。纯逻辑（`presented_event_instant` / `PresentationInbox`）已在
+            // `render::present_evidence` 落地并有本机单测，但平台层（`wp_presentation` 全局绑定、
+            // 每次 present 前 feedback 请求、事件派发）尚未接线 —— 生产路径如实留空 `None`，
+            // **不拿 GPU 完成时刻顶替**（那会让 HUD / e2e 的上屏延迟变成假数据）。
             presented_at: None,
         });
     }

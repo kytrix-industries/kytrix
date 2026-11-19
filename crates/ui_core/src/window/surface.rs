@@ -1,6 +1,6 @@
 //! 渲染目标与平台表面：尺寸 / DPI 写入 / 渲染器 / 图集同步。
 
-use super::{Window, WindowOptions};
+use super::{FramePresentation, Window, WindowOptions};
 use crate::{
     error::EngineError,
     math::{PhysicalRect, Rect, Scale, Size},
@@ -271,13 +271,35 @@ pub(crate) fn poll_renderer(window: &mut Window) -> Result<(), EngineError> {
     // 三平台窗口路径一致：`poll` 返回 `Result<Option<FrameFeedback>, EngineError>`，
     // 离屏路径恒为 `Ok(None)`。
     let feedback = renderer.poll()?;
+    let Some(feedback) = feedback else {
+        return Ok(());
+    };
+    // A4：`FrameFeedback` 是 crate 私有的；跨平台呈现快照在这里落账，公开消费面是
+    // `Window::last_frame_presentation` / `recent_frame_presentations`。
+    // `published_at` 由 `completed_at − latency` 精确还原（`latency` 的定义式就是
+    // `completed_at − published_at`；`saturating_duration_since` 在本 crate 的契约下不会截断）。
+    let published_at = feedback
+        .completed_at
+        .checked_sub(feedback.latency)
+        .unwrap_or(feedback.completed_at);
+    let presentation = FramePresentation {
+        index: feedback.index,
+        published_at,
+        completed_at: feedback.completed_at,
+        presented_at: feedback.presented_at,
+        latency: feedback.latency,
+    };
+    #[cfg(feature = "test-support")]
+    if let Some(record) = window.record.as_mut()
+        && record.frame_index == feedback.index
+    {
+        // `presented_latency` = 发布 → 上屏（下界）；`None` = 该端/该帧没有可信值。
+        record.presented_latency = presentation.publish_to_presented();
+    }
+    window.note_frame_presentation(presentation);
 
     #[cfg(feature = "hud")]
-    if let Some(feedback) = feedback {
-        super::record::note_completed_frame(window, &feedback);
-    }
-    #[cfg(not(feature = "hud"))]
-    let _ = feedback;
+    super::record::note_completed_frame(window, &feedback);
     Ok(())
 }
 

@@ -51,6 +51,13 @@ pub struct FrameRecord {
     /// **放在这里而不是 `RenderedFrame`**：纯 `A11Y` 变化不产生 damage ⇒ 本帧 `Idle`，
     /// 而 `RenderedFrame` 只存在于已提交帧。
     pub a11y: Option<crate::a11y::A11yTreeSnapshot>,
+    /// 发布 → 上屏（下界）的时长（A4）：`presented_at − published_at`，来自该帧的
+    /// `FrameFeedback`（`Window::poll_renderer` 在完成反馈到达时回填）。
+    ///
+    /// `None` = 该端/该帧没有可信的呈现时刻（Windows 拿不到帧统计 / Linux compositor 无
+    /// `wp_presentation` / 该帧被合成器丢弃），或反馈还没到达。**不是**「用 GPU 完成时刻
+    /// 顶替」的占位：`stats.compositor_thread_wait` 与本字段一起把呈现链的可观测性补齐。
+    pub presented_latency: Option<std::time::Duration>,
 }
 
 /// 已提交帧的**绘制快照**（设计 §6.3 的 `RenderedFrame`）。
@@ -207,6 +214,7 @@ impl FrameRecord {
             a11y_only: false,
             paint_log: PaintLog::default(),
             a11y: None,
+            presented_latency: None,
         }
     }
 }
@@ -277,6 +285,8 @@ pub(crate) fn capture(
         a11y_only: false,
         paint_log: report.log,
         a11y: None,
+        // 呈现时刻在 GPU 完成反馈到达时回填（`Window::poll_renderer`）；录制时还不知道。
+        presented_latency: None,
     }
 }
 

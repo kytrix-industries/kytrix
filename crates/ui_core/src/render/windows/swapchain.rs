@@ -117,6 +117,20 @@ impl Swapchain {
         self.waitable
     }
 
+    /// `IDXGISwapChain::GetFrameStatistics`（A4：`presented_at` 的 Windows 证据来源）。
+    ///
+    /// 只对 flip model 有效（`CreateSwapChainForComposition` 建的链满足；bitblt + windowed 会
+    /// 返回错误）。`DXGI_ERROR_FRAME_STATISTICS_DISJOINT`（显示模式切换 / DWM 拓扑重建）与其它
+    /// 失败一律返回 `None`：这一拍没有可信统计，调用方如实把 `presented_at` 留空，绝不另找时刻
+    /// 顶替。
+    pub(crate) fn frame_statistics(&self) -> Option<DXGI_FRAME_STATISTICS> {
+        let mut stats = DXGI_FRAME_STATISTICS::default();
+        // SAFETY: COM 调用：swapchain 句柄由本结构持有；输出指针指向本函数栈上的值，调用期间
+        // 存活；`GetFrameStatistics` 无副作用，失败按 HRESULT 处理。
+        unsafe { self.raw.GetFrameStatistics(&mut stats) }.ok()?;
+        Some(stats)
+    }
+
     /// 组合交换链本体（`IDCompositionVisual::SetContent` 的输入）。
     pub(crate) fn raw(&self) -> &IDXGISwapChain1 {
         &self.raw
