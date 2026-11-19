@@ -758,10 +758,53 @@ stateDiagram-v2
 **关键约束**：
 
 - `PlatformDispatcher::wake(FrameWake)` 只在 `Invalidate` 确认 dirty 非空后调用；平台空闲等待态不得主动唤醒（I3）。
-- 动画 tick 由平台定时器（Win32 `SetTimer` / `CVDisplayLink` 或 dispatch timer / `calloop` timer）定时唤醒，不产生常驻帧循环；动画结束即回
-  `Idle`。
+- 动画 tick 由平台帧节拍线程（Windows 按所在 output 刷新周期的 `sleep` 线程 / macOS `CAMetalDisplayLink` 的连续帧定时器 /
+  `calloop` timer）定期唤醒，不产生常驻帧循环；动画结束即回 `Idle`。
 - 一帧内多次状态写入**合并为一次失效计算**（`drain` 阶段收集所有写入，再统一 `invalidate`）。
 - `FrameIndex` 只在 `Submit` 时递增；`Idle` 期间不递增。
+
+#### 3.5.1 最终架构（A2/A3/A5，审查报告 §3.1/§3.2/§3.11）
+
+```
+状态写入（App::write / 输入 / 异步回投） ──► FrameWake（脏位 + 唤醒）
+        │
+        ▼
+App::frame 入口预算门禁（A5）          每 refresh 周期最多一帧；force 通道：
+  ├─ 被推迟 ⇒ Idle（脏位保留）           resize/拖动/系统模态循环、动画 tick
+  └─ 放行 ⇒ styles → text → layout → paint → SceneDelta
+        │
+        ▼
+合成线程（进程内 1 条，A2：**不等任何 vsync**）
+  收到 delta 立即 compose + publish（增量编码）──► LatestFrame（最新者胜 + damage 合并）
+        │
+        ▼
+每窗口 GPU 线程 + 呈现门禁（A2/A3：**present 节奏的唯一来源**）
+  Windows：DXGI waitable（主屏 cadence，MS 限制）
+  macOS  ：CAMetalDisplayLink 的 drawable（per-screen）
+  Linux  ：wl_surface.frame 回调 + FrameGate（per-surface）+ MAILBOX
+        │
+        ▼
+present → GPU 完成反馈（completed_at / presented_at / latency）──► HUD / FrameRecord / acceptance e2e
+```
+
+**关键决策与理由**：
+
+- **删除合成线程的进程级帧时钟**（旧 `FrameClock`/`TickInbox`/`FramePacing`/三平台 clock 模块）：
+  内容已就绪时不该再等一拍才编码 —— Chromium 是「每个 Display 一个 BeginFrameSource、present
+  门禁在 viz/GPU 进程」，Qt 6 是「每窗口 render loop 阻塞在 swap」，都没有进程级时钟。删除后
+  「per-window / per-output 节拍」由呈现侧天然获得，混合刷新率不再互相污染。
+- **UI 侧帧预算门禁**（A5）：`App::frame` 入口按窗口所在 output 的刷新率限制「每 refresh 最多
+  一帧」，快于刷新的写入合并到下一拍（最多晚 1 个 vsync）；resize/拖动/系统模态循环/动画 tick
+  保留 force 通道。刷新率来源：Windows `MonitorFromWindow`+`EnumDisplaySettingsW`、macOS
+  `NSScreen.maximumFramesPerSecond`、Linux `wl_output.mode.refresh`；未知时门禁禁用（退回唤醒即
+  出帧，绝不用错误周期卡帧）。
+- **presented_at 契约**：`Option<Instant>`，语义是真实上屏时刻的**下界**（偏差方向恒为偏早、最多
+  1 vsync）；不可得如实 `None`，绝不用完成时刻顶替。Windows 用 `IDXGISwapChain::GetFrameStatistics`
+  （DComp 下只到 composition，天然满足下界契约），macOS 用 display link tick 推断；
+  **Linux 用 `wp_presentation_feedback` 是计划项（A4 明确降级：数据面已实现并有单测，平台接线
+  未启用，生产路径如实 `presented_at=None`）**，接线由 Wave2 B 组在 Linux 真机完成后再改为现状。
+  验收指标 `publish→presented` 的 p50/p99 由 `acceptance window` 打印。
+
 
 ### 3.6 事件 → Action → 状态 → 失效 的闭环
 
@@ -1666,7 +1709,7 @@ platform/
 | `platform_init`      | 建立 display / app 对象、注册窗口类、D8 检测、创建 device/swapchain/pipeline、a11y adapter 直连（§7.6）        |
 | `wait`（平台等待态） | 阻塞等待原生事件；**不产生帧、不轮询**（I3）                                                                   |
 | `dispatch(event)`    | 平台事件 → `PlatformEvent` → `Event::Input` / IME / DPI / 外观 / 焦点 / 窗口尺寸；物理像素→逻辑像素换算（I11） |
-| `FrameWake`          | 执行 `frame()`：drain → invalidate → layout → paint → submit → present（§3.5）                                 |
+| `FrameWake`          | 执行 `frame()`：drain → invalidate → layout → paint → 发布 delta（§3.5）；入口有每 refresh 周期一帧的预算门禁（A5） |
 | `timer`（动画 tick） | 平台定时器唤醒，只推进显式注册的动画节点（§3.7）；动画结束回到 `wait`                                          |
 | `shutdown`           | 完成所有 in-flight 帧、清空 `RetireQueue`、a11y deactivate、释放 device                                        |
 

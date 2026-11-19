@@ -144,8 +144,8 @@ fn damage_is_local_and_idle_is_zero_frame() {
             .expect("挂载成功")
     };
 
-    // 一个完全不动的节点：用来断言「未变化的 lane 必须复用」。
-    let _static = NodeBuilder::boxed()
+    // 一个完全不动的节点：用来断言「未变化的兄弟子树整棵跳过」（A1 脏子树剪枝）。
+    let static_node = NodeBuilder::boxed()
         .layout_override(Rect::new(200.0, 10.0, 40.0, 16.0))
         .paint(PaintSpec {
             background: Color::WHITE,
@@ -181,15 +181,27 @@ fn damage_is_local_and_idle_is_zero_frame() {
         damage.iter().all(|rect| rect.area() < frame_area / 50),
         "damage 必须局部：{damage:?}"
     );
+    // A1 剪枝语义（`PaintLog` 只记录**被访问**的 lane）：
+    // ① 未变化的兄弟子树不得被访问；② 被访问的 lane 中未重建者必须整桶复用。
+    let paint_log = &report.frame(1).record.paint_log;
     assert!(
-        report
-            .frame(1)
-            .record
-            .paint_log
+        !paint_log
             .lanes
             .iter()
-            .any(|entry| entry.outcome == LaneOutcome::Reused),
-        "未变化的节点必须复用 lane"
+            .any(|entry| entry.node == static_node),
+        "未变化的兄弟节点不得被访问（脏子树剪枝）：{paint_log:?}"
+    );
+    assert!(
+        paint_log.lanes.iter().any(|entry| entry.node == label),
+        "被改动的节点必须被访问并重建 lane：{paint_log:?}"
+    );
+    assert!(
+        paint_log
+            .lanes
+            .iter()
+            .filter(|entry| entry.node != label)
+            .all(|entry| entry.outcome == LaneOutcome::Reused),
+        "被访问且未重建的 lane 必须整桶复用：{paint_log:?}"
     );
     // 脚手架断言：只改一个节点 ⇒ damage 只允许一块矩形。
     report.assert_damage_rects_at_most(1, 1);
@@ -258,4 +270,128 @@ fn idle_frames_still_record_the_a11y_snapshot() {
     );
     assert!(record.damage.is_empty(), "a11y 更新不产生 damage");
     let _ = FrameOutcome::Idle;
+}
+
+/// A1 / P1A-1c：没有结构 / lane 成员变化的增量帧，`SceneDelta` **不得**携带绘制序。
+///
+/// 携带绘制序会让编码器 `LaneStore.fast = false`（`render/delta.rs`），退回 O(lanes) 全扫 ——
+/// 那是本项剪枝收益的另一半来源。同时断言脏闭包真的只碰了变化节点 + 祖先链：
+/// `PaintCounters::visited_nodes` 远小于树规模、`full_frames` / `order_rebuilds` 不增长。
+#[test]
+fn incremental_frame_keeps_the_delta_order_fast_path() {
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let root = app.app().window(window).expect("窗口存在").tree().root();
+    let color = app.app_mut().signal(Color::WHITE);
+    // 一棵「有静态兄弟子树」的小树：未变化的兄弟必须被剪掉。
+    let mut static_nodes = Vec::new();
+    for index in 0..64 {
+        static_nodes.push(
+            NodeBuilder::boxed()
+                .layout_override(Rect::new(
+                    (index % 8) as f32 * 40.0,
+                    (index / 8) as f32 * 20.0 + 40.0,
+                    32.0,
+                    16.0,
+                ))
+                .paint(PaintSpec {
+                    background: Color::WHITE,
+                    ..PaintSpec::default()
+                })
+                .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
+                .expect("静态兄弟"),
+        );
+    }
+    let label = NodeBuilder::boxed()
+        .layout_override(LABEL)
+        .paint(PaintSpec {
+            background: Color::WHITE,
+            ..PaintSpec::default()
+        })
+        .bind_style(move |cx| StylePatch {
+            background: Some(*cx.read(&color)),
+            ..StylePatch::default()
+        })
+        .id("label")
+        .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
+        .expect("挂载成功");
+
+    // 首帧：全量（有结构变化），delta.full 与绘制序都可能携带。
+    let first = app.drain().expect("首帧").clone();
+    assert!(first.rendered, "首帧必须提交");
+    let node_count = app.app().window(window).expect("窗口").tree().len();
+    let counters_before = app
+        .app()
+        .window(window)
+        .expect("窗口")
+        .tree()
+        .paint_counters();
+
+    // 增量帧：只改一个绑定节点的颜色。
+    app.app_mut().write(&color, Color::BLACK);
+    let record = app.drain().expect("增量帧").clone();
+    assert!(record.rendered, "颜色变化必须出帧");
+    assert!(!record.delta.full, "增量帧不得整帧发布：{:?}", record.delta);
+    assert!(
+        !record.delta.order_some,
+        "没有结构 / lane 成员变化的帧必须沿用旧绘制序（否则编码器退回 O(lanes) 全扫）：{:?}",
+        record.delta
+    );
+    assert_eq!(
+        record.delta.lanes, 1,
+        "只有脏 lane 变化：{:?}",
+        record.delta
+    );
+    assert_eq!(record.delta.removed, 0);
+    assert_eq!(record.delta.scroll, 0);
+    assert_eq!(
+        record.stats.encoded_lanes, 1,
+        "编码器只能重编码那一条脏 lane（其余 {} 段复用）",
+        record.stats.reused_segments
+    );
+
+    // 遍历规模：脏闭包 = label + 祖先链（root），与 64 个静态兄弟无关。
+    let counters = app
+        .app()
+        .window(window)
+        .expect("窗口")
+        .tree()
+        .paint_counters();
+    assert!(
+        counters.visited_nodes <= 4,
+        "单节点变更帧的访问数必须只随祖先链增长：{}（树共 {node_count} 节点）",
+        counters.visited_nodes
+    );
+    assert!(
+        counters.visited_nodes * 10 < node_count,
+        "不得出现全树扫描：{} vs {node_count}",
+        counters.visited_nodes
+    );
+    assert_eq!(
+        counters.full_frames, counters_before.full_frames,
+        "增量帧不得退化为全量路径"
+    );
+    assert_eq!(
+        counters.order_rebuilds, counters_before.order_rebuilds,
+        "没有 lane 成员变化时不得重建绘制序"
+    );
+    assert!(
+        !record
+            .paint_log
+            .lanes
+            .iter()
+            .any(|entry| static_nodes.contains(&entry.node)),
+        "静态兄弟子树必须被整棵跳过：{:?}",
+        record.paint_log
+    );
+    assert!(
+        record
+            .paint_log
+            .lanes
+            .iter()
+            .any(|entry| entry.node == label),
+        "被改动的节点必须被访问：{:?}",
+        record.paint_log
+    );
+    app.assert_oracle();
 }

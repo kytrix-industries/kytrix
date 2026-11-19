@@ -60,6 +60,8 @@ pub(crate) fn mark_structure(tree: &mut NodeTree, node: NodeId) -> bool {
     ) {
         return false;
     }
+    // A1：结构真的变了 ⇒ 下一次 paint 必须走全量路径（绘制序成员 / 滚动槽编号都可能变）。
+    tree.structure_epoch = tree.structure_epoch.wrapping_add(1);
     tree.bubble_layout(node);
     tree.invalidate_caches_upwards(node);
     true

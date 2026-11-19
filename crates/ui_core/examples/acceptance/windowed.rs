@@ -10,12 +10,13 @@
 //!   这样测的是「数据以 60/120 Hz 到达时，引擎能否稳定每拍交一帧」——市场数据类界面的真实形态。
 //!   为什么不用「每次泵循环都写状态」：那会自己唤醒自己（写状态 ⇒ `request_frame` ⇒ 唤醒 ⇒
 //!   再写），实测变成 ~300 fps 的忙循环，测到的就不是刷新节拍了。
-//! - **present 级抖动不在本 harness 的测量面**：`FrameFeedback::presented_at`（macOS 的
-//!   `presentedTime` / Linux 的 `wl_callback`）是 crate 私有。平台节拍本身由帧时钟决定
-//!   （Windows `DCompositionWaitForCompositorClock` / macOS display link / Linux frame callback）；
-//!   Linux 的提交本来就被 `wl_callback` 门禁（`state.frame_ready`），因此 Linux 的 commit 间隔
-//!   **就是** present 间隔。HUD（`--features hud --hud`）给出引擎自报的 FPS/Frame/Latency，
-//!   作为同源旁证（报告里附截图）。
+//! - **present 级观测（A4）**：`App::last_frame_presentation` / `Window::recent_frame_presentations`
+//!   给出每帧的 `published_at / completed_at / presented_at`（`presented_at` 是真实上屏时刻的
+//!   **下界**：Windows 帧统计 / Linux `wp_presentation` / macOS display-link tick 推断）。本 harness
+//!   按 `FrameIndex` 增量消费最近若干帧的呈现快照，打印 `publish→presented` 的 p50/p99 与有值率。
+//!   `presented_at` 缺失（该端/该帧没有可信值）的帧计入「有值率」分母、不进 e2e 样本。
+//!   **阈值先测量后定**（目标 ≤2 vsync @60 Hz，即 p99 ≤ ~33 ms）：本 harness 只输出测量值，
+//!   不把它并入本次 PASS/FAIL（A2 的帧预算落地后再定门禁）。
 //!
 //! # 为什么钩子里自己提交一帧
 //!
@@ -65,6 +66,14 @@ struct WindowRun {
     intervals: Samples,
     frame_cpu: Samples,
     update_cpu: Samples,
+    /// `publish → presented`（上屏时刻下界）的 e2e 样本（A4；微秒）。
+    e2e_presented: Samples,
+    /// 已结算（有反馈且不再变化）的呈现快照帧数（有值率分母）。
+    presentation_observed: usize,
+    /// 其中 `presented_at` 有值的帧数（有值率分子）。
+    presentation_presented: usize,
+    /// 已消费到的最后一条呈现快照的 `FrameIndex`（增量消费游标）。
+    presentation_cursor: Option<u32>,
     commits: usize,
     last_commit: Option<Instant>,
     last_progress: Instant,
@@ -91,11 +100,60 @@ impl WindowRun {
             intervals: Samples::new("frame interval", capacity),
             frame_cpu: Samples::new("ui thread frame cpu", capacity),
             update_cpu: Samples::new("ui thread update cpu", capacity),
+            e2e_presented: Samples::new("publish -> presented", capacity),
+            presentation_observed: 0,
+            presentation_presented: 0,
+            presentation_cursor: None,
             commits: 0,
             last_commit: None,
             last_progress: started,
             finished: false,
             raw: config.raw,
+        }
+    }
+
+    /// 增量消费窗口上最近若干帧的呈现快照（A4）。
+    ///
+    /// 结算口径：`presented_at` 有值 ⇒ 立即结算；没有值但要等它「后面已经又来了 2 帧反馈」
+    /// 才判为 `None`（Linux 的 `wp_presentation` 事件晚于反馈一个 vsync 左右到达，不能过早
+    /// 判死）。只统计测量窗口内提交的帧（`published_at ≥ measure_at`）。
+    fn observe_presentations(&mut self, app: &App, window: WindowId) {
+        let Some(target) = app.window(window) else {
+            return;
+        };
+        let latest = target
+            .last_frame_presentation()
+            .map_or(0, |presentation| presentation.index.get());
+        for presentation in target.recent_frame_presentations() {
+            let index = presentation.index.get();
+            if self
+                .presentation_cursor
+                .is_some_and(|cursor| index <= cursor)
+            {
+                continue;
+            }
+            if presentation.published_at < self.measure_at {
+                self.presentation_cursor = Some(index);
+                continue;
+            }
+            let settled = presentation.presented_at.is_some()
+                || latest.saturating_sub(index) >= 2
+                || presentation.published_at < self.deadline - Duration::from_millis(50);
+            if !settled {
+                // 保持帧序：前面的还没结算，后面的不能先消费（否则 e2e 会被错配）。
+                break;
+            }
+            self.presentation_cursor = Some(index);
+            self.presentation_observed += 1;
+            if let Some(e2e) = presentation.publish_to_presented() {
+                self.presentation_presented += 1;
+                self.e2e_presented.push(e2e);
+                if self.raw {
+                    println!("raw,e2e_presented,{:.3}", e2e.as_secs_f64() * 1e6);
+                }
+            } else if self.raw {
+                println!("raw,e2e_presented,missing");
+            }
         }
     }
 
@@ -121,10 +179,22 @@ impl WindowRun {
         }
     }
 
-    /// 打印报告；返回 `true` = 帧率与抖动都达标。
-    fn report(&self, hz: u32) -> bool {
+    /// 打印报告；返回 `true` = 帧率、抖动与帧预算门禁都达标。
+    ///
+    /// `refresh_hz` = 平台上报的窗口所在 output 刷新率提示（A5；`None` = 平台没给，门禁禁用）；
+    /// `deferrals` = 累计被预算门禁推迟的请求数（证明「合并到下一拍」真的发生过）。
+    fn report(&self, hz: u32, refresh_hz: Option<f32>, deferrals: u64) -> bool {
         let elapsed = self.started.elapsed().as_secs_f64();
         println!();
+        // RA-3：刷新率提示在**平台注入之后**（`Application::run` 已启动、泵已跑过）打印，
+        // 与测量/推迟计数同点，日志自洽（旧实现在 `run` 之前打印 ⇒ 恒显示「禁用」）。
+        match refresh_hz {
+            Some(hz) => println!("帧预算门禁：刷新率提示 {hz:.1} Hz（写入快于刷新时合并到下一拍）"),
+            None => println!(
+                "帧预算门禁：平台未提供刷新率提示（headless / macOS 屏幕不可得）⇒ 门禁禁用，\
+                 吞吐仅受平台 present 门禁约束"
+            ),
+        }
         println!("-- 帧率与抖动（真机真窗口，commit → commit，驱动 {hz} Hz） --");
         println!(
             "运行 {:.1}s（预热 {:.1}s / 测量 {:.1}s）提交帧 {}；测量期间隔样本 {}",
@@ -168,6 +238,37 @@ impl WindowRun {
         );
         println!("测量期吞吐          {throughput:.2} fps（帧数 / 测量时长）");
         println!();
+        // A4：publish → presented（上屏时刻下界）的 e2e 分布与有值率。
+        println!("-- A4 e2e 呈现（publish → presented；presented 是真实上屏时刻的下界） --");
+        println!("{}", self.e2e_presented.line());
+        let ratio = if self.presentation_observed == 0 {
+            None
+        } else {
+            Some(self.presentation_presented as f64 / self.presentation_observed as f64)
+        };
+        println!(
+            "presented 有值率 {}（{} / {} 已结算帧；未结算 = 测量结束时反馈还没到）",
+            ratio.map_or("--".to_owned(), |ratio| format!("{:.2}%", ratio * 100.0)),
+            self.presentation_presented,
+            self.presentation_observed
+        );
+        if let Some(summary) = self.e2e_presented.summary() {
+            let p50_vsync = summary.p50_us / target;
+            let p99_vsync = summary.p99_us / target;
+            println!(
+                "e2e p50 = {:.3} ms（{p50_vsync:.2} vsync） / p99 = {:.3} ms（{p99_vsync:.2} vsync）",
+                summary.p50_us / 1e3,
+                summary.p99_us / 1e3
+            );
+            println!(
+                "参考阈值（目标 ≤2 vsync @ {hz} Hz）= {:.3} ms；本项为 A4 观测项，阈值待 A2 帧预算落地后定，\
+                 不并入本次 PASS/FAIL",
+                2.0 * target / 1e3
+            );
+        } else {
+            println!("没有采到 e2e 呈现样本（presented_at 恒为 None / 窗口未出帧？）");
+        }
+        println!();
         println!("-- UI 线程 CPU（本帧 `App::frame`；编码在合成线程） --");
         println!("{}", self.frame_cpu.line());
         println!("{}", self.update_cpu.line());
@@ -187,17 +288,48 @@ impl WindowRun {
             rms / 1e3,
             verdict(jitter_ok)
         );
+        // A5：帧预算门禁。写入快于刷新时（`--hz` > 刷新率），吞吐必须被钳到刷新率附近，
+        // 且必须观测到推迟（否则说明门禁没生效，UI 帧率 = 写入率）。
+        //
+        // 门槛 = 刷新率 × 1.15：预算门禁的相位带 10% 周期的提前量（吸收平台唤醒抖动，
+        // 保证同频写入稳定 60 fps，见 `window::frame_budget::FrameBudget::admits`），稳态
+        // 上限因此是 1/(0.9×周期) ≈ 1.11×刷新率；预留到 1.15 倍余量。
+        let budget_ok = match refresh_hz {
+            Some(refresh) if f64::from(hz) > f64::from(refresh) + 1.0 => {
+                let limit = f64::from(refresh) * 1.15;
+                let capped = throughput <= limit;
+                println!(
+                    "写入 {hz} Hz > 刷新 {refresh:.1} Hz ⇒ 吞吐钳到 ≤{limit:.1} fps（含 10% 相位容差）；\
+                     实测 {throughput:.2} fps，累计推迟 {deferrals} 次 ⇒ {}",
+                    verdict(capped && deferrals > 0)
+                );
+                capped && deferrals > 0
+            }
+            Some(refresh) => {
+                println!(
+                    "写入 {hz} Hz ≤ 刷新 {refresh:.1} Hz（每 refresh 最多一帧的自然满足）；\
+                     累计推迟 {deferrals} 次"
+                );
+                true
+            }
+            None => {
+                println!(
+                    "刷新率提示不可得（平台未提供）⇒ 帧预算门禁禁用，吞吐仅受平台 present 门禁约束"
+                );
+                true
+            }
+        };
         if hz < 90 {
             println!(
                 "120 Hz 能力           目标频率 60 Hz 下测得抖动 {:.3} ms；\
-                 120 Hz 的**逻辑**由 `src/render/frame_clock.rs` 的帧时钟保证（\
-                 `frame_interval(120)=8.33ms` / `normalize_refresh_hz` 24–360 Hz / \
-                 `FramePacing` 目标推导 / display link 对齐），本机显示器只有 60 Hz，\
-                 120 Hz 的**上屏**无法验证（详见报告「120 Hz」一节）。",
+                 120 Hz 的**逻辑**由「帧预算门禁（每 refresh 周期最多一帧，10% 相位容差）+ \
+                 每窗口 GPU present 门禁」保证（A2 已删除进程级帧时钟，present 节奏由 Windows \
+                 DXGI waitable / macOS CAMetalDisplayLink / Linux wl_surface.frame 决定），\
+                 本机显示器只有 60 Hz，120 Hz 的**上屏**无法验证（详见报告「120 Hz」一节）。",
                 rms / 1e3
             );
         }
-        fps_ok && jitter_ok
+        fps_ok && jitter_ok && budget_ok
     }
 }
 
@@ -238,7 +370,8 @@ pub fn run_window(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
 
     // 首帧：全量（让窗口先有内容）。
     let _ = app.frame(window);
-
+    // 注意：此刻还没有原生窗口（`Application::run` 尚未启动），平台刷新率提示不可用；
+    // 预算门禁的提示在 `report()`（计数/判定同点）打印，避免「先禁用、后启用」的误导日志（RA-3）。
     let mut run = WindowRun::new(config);
     let passed = Rc::new(Cell::new(false));
     let result_slot = Rc::clone(&passed);
@@ -269,6 +402,8 @@ pub fn run_window(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
             return;
         }
         let now = Instant::now();
+        // A4：每轮都增量消费一次呈现快照（presented 事件可能晚于反馈到达，不能只在提交时读）。
+        run.observe_presentations(app, window);
         // 只应用「一拍」：积压的节拍合并成一次更新（最新值胜），与真实行情的合并语义一致。
         if pending.swap(0, Ordering::AcqRel) > 0 {
             let update_started = Instant::now();
@@ -297,7 +432,9 @@ pub fn run_window(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
         }
         if now >= run.deadline {
             run.finished = true;
-            let ok = run.report(hz);
+            let deferrals = app.frame_budget_deferrals(window);
+            let refresh_hz = app.frame_refresh_hz(window);
+            let ok = run.report(hz, refresh_hz, deferrals);
             result_slot.set(ok);
             stop_pump.store(true, Ordering::Release);
             let _ = app.close_window(window);

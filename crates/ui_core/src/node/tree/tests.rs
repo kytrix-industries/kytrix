@@ -788,3 +788,103 @@ fn device_scale_change_republishes_bounds() {
         "开启/切换吸附比例后必须重新提交全部边界"
     );
 }
+
+// ── A1：paint 脏子树剪枝的侧表 / 代际 / 计数 ─────────────────────────────────
+
+/// 脏节点的**祖先闭包**：自身 + 到 root 的完整路径；兄弟与无关子树不标记。
+#[test]
+fn paint_closure_marks_dirty_ancestors() {
+    let mut tree = NodeTree::new();
+    let root = tree.root();
+    let a = boxed(&mut tree, root);
+    let a1 = boxed(&mut tree, a);
+    let a2 = boxed(&mut tree, a);
+    let b = boxed(&mut tree, root);
+
+    tree.mark_paint_closure(&[a1]);
+    assert!(tree.paint_marked(a1));
+    assert!(tree.paint_marked(a));
+    assert!(tree.paint_marked(root));
+    assert!(!tree.paint_marked(a2), "兄弟不得入闭包");
+    assert!(!tree.paint_marked(b), "无关子树不得入闭包");
+
+    // 第二个脏节点与 a1 共享祖先：重复命中即停不得漏标。
+    tree.mark_paint_closure(&[a2, b]);
+    assert!(tree.paint_marked(a2));
+    assert!(tree.paint_marked(b));
+    assert!(tree.paint_marked(a));
+    assert!(tree.paint_marked(root));
+    // 上一轮的独有标记随代次前进失效（`0` 代次恒为假）。
+    assert!(!tree.paint_marked(a1));
+}
+
+/// 闭包是**代次**语义：清空脏集合后的下一帧，上一帧的标记不得复活。
+#[test]
+fn paint_closure_is_epoch_scoped() {
+    let mut tree = NodeTree::new();
+    let root = tree.root();
+    let child = boxed(&mut tree, root);
+
+    assert!(!tree.paint_marked(child), "没有闭包时任何节点都不在闭包里");
+    tree.mark_paint_closure(&[child]);
+    assert!(tree.paint_marked(child));
+    tree.mark_paint_closure(&[]);
+    assert!(!tree.paint_marked(child), "空闭包之后旧标记必须失效");
+}
+
+/// 结构 / 滚动容器登记 / 强制全量三种「硬全量」判据；`note_paint_frame` 提交已见代际。
+#[test]
+fn structure_and_scroll_epochs_force_the_next_full_frame() {
+    let mut tree = NodeTree::new();
+    assert!(
+        !tree.paint_epoch_changed(),
+        "新树没有结构变化 ⇒ 代际判据不强制全量（首帧由 delta 的 full 与脏节点状态承担）"
+    );
+    tree.note_paint_frame(true, 1);
+    assert!(!tree.paint_epoch_changed(), "没有变化 ⇒ 允许增量");
+
+    let root = tree.root();
+    let child = boxed(&mut tree, root);
+    assert!(tree.paint_epoch_changed(), "结构变化必须全量");
+    tree.note_paint_frame(true, 1);
+    assert!(!tree.paint_epoch_changed());
+
+    tree.note_scroll_container(child);
+    assert!(tree.paint_epoch_changed(), "滚动容器登记必须全量");
+    tree.note_paint_frame(true, 2);
+    assert!(!tree.paint_epoch_changed());
+
+    tree.force_full_paint = true;
+    assert!(tree.paint_epoch_changed(), "强制全量标志必须被消费");
+    tree.note_paint_frame(true, 2);
+    assert!(!tree.paint_epoch_changed(), "强制标志只消费一次");
+}
+
+/// 滚动槽缓存：全量入口统一失效（隐藏 / 未访问的容器因此必须重新分配）。
+#[test]
+fn scroll_slot_cache_is_invalidated_by_the_full_entry() {
+    let mut tree = NodeTree::new();
+    let root = tree.root();
+    let child = boxed(&mut tree, root);
+
+    assert_eq!(tree.scroll_slot_cached(child), 0, "初始未分配");
+    tree.set_scroll_slot(child, 7);
+    assert_eq!(tree.scroll_slot_cached(child), 7);
+    tree.begin_full_scroll_slots();
+    assert_eq!(tree.scroll_slot_cached(child), 0, "全量入口必须清空缓存");
+}
+
+/// 计数：一帧访问数 + 累计帧数 / 绘制序兜底次数。
+#[test]
+fn paint_counters_track_frames_visits_and_order_rebuilds() {
+    let mut tree = NodeTree::new();
+    assert_eq!(tree.paint_counters(), super::PaintCounters::default());
+    tree.note_paint_frame(true, 7);
+    tree.note_paint_frame(false, 3);
+    tree.note_order_rebuild();
+    let counters = tree.paint_counters();
+    assert_eq!(counters.visited_nodes, 3, "visited 是最近一帧的值");
+    assert_eq!(counters.full_frames, 1);
+    assert_eq!(counters.incremental_frames, 1);
+    assert_eq!(counters.order_rebuilds, 1);
+}

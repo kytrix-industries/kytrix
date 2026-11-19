@@ -434,6 +434,10 @@ pub(crate) fn place_subtree(
         // 反向集合：a11y 要重发（`mark_moved_a11y` 的唯一输入）+ 帧尾要结算 damage/REUSABLE。
         tree.moved_nodes.insert(node);
         tree.dirty_settle.insert(node);
+        // A1：布局移动同样改变绝对坐标下的图元 ⇒ 必须登记进 `dirty_paint`，否则脏子树剪枝
+        // 的闭包源看不到“只被布局移动”的节点（全量路径靠遍历覆盖，增量路径只走闭包）。
+        // `REUSABLE` 上面已清、damage 的旧一侧已由 `old ∪ new` 并入，这里只补 `PAINT` 位与集合。
+        let _ = tree.mark_paint(node);
     } else if fresh {
         // 尺寸/位置没变但 border 宽可能变了（样式改 border）。
         if let Some(target) = tree.arena.get_mut(node) {

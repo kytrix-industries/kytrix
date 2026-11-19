@@ -62,7 +62,7 @@ use crate::{
         FontStack, FontStackStatus, TextDiagnostic, TextLayoutReport, TextPassReport,
         atlas::GlyphAtlas, context::TextContext, raster::GlyphRasterizer,
     },
-    window::{FrameOutcome, FrameTicket, Window, WindowId, WindowOptions},
+    window::{FrameOutcome, FramePresentation, FrameTicket, Window, WindowId, WindowOptions},
 };
 
 /// a11y 诊断的环形容量（与 `text_diagnostics` 同口径：超出丢最旧）。
@@ -1503,6 +1503,24 @@ impl App {
         animation::needs_continuous_frames(self)
     }
 
+    /// 是否有窗口的帧请求正被预算门禁推迟（A5）：平台据此挂一次性唤醒。
+    ///
+    /// 消费者：Windows 泵 / macOS 泵（按刷新率挂一次性定时器）；Linux 的补帧走
+    /// `next_deferred_deadline` + calloop timeout，不需要这个布尔查询。
+    #[cfg(any(windows, target_os = "macos"))]
+    pub(crate) fn has_deferred_frames(&self) -> bool {
+        self.windows()
+            .any(|(_, window)| window.frame_budget_deferred())
+    }
+
+    /// 所有被推迟帧里最早的放行时刻（A5）：Linux calloop timeout 的到期时刻。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn next_deferred_deadline(&self) -> Option<Instant> {
+        self.windows()
+            .filter_map(|(_, window)| window.frame_budget_deadline())
+            .min()
+    }
+
     fn mark_nodes_paint(&mut self, window: WindowId, nodes: &[NodeId]) {
         animation::mark_nodes_paint(self, window, nodes)
     }
@@ -1561,6 +1579,20 @@ impl App {
     #[must_use]
     pub fn window(&self, id: WindowId) -> Option<&Window> {
         window_set::window(self, id)
+    }
+
+    /// 最近一帧的呈现快照（A4：`commit → presented` 的**公开**消费面）。
+    ///
+    /// 真实窗口的 GPU 反馈每轮泵由 [`Window::poll_renderer`] 落到窗口上；`presented_at` 是
+    /// 该端能给出的真实上屏时刻的**下界**（`None` = 该端/该帧没有可信值，不是「用完成时刻
+    /// 顶替」）。`acceptance window` 的 `publish→presented` p50/p99 与有值率、HUD 的后续行、
+    /// 应用侧延迟监控都从这里取（`FrameFeedback` 是 crate 私有）。
+    ///
+    /// `None`：窗口不存在，或还没有观测到任何完成帧（首帧之前 / headless）。
+    #[must_use]
+    pub fn last_frame_presentation(&self, window: WindowId) -> Option<FramePresentation> {
+        self.window(window)
+            .and_then(Window::last_frame_presentation)
     }
 
     /// 可写窗口（应用层建树的入口）。
@@ -1803,12 +1835,45 @@ impl App {
     /// 完整帧：`refresh_styles` → `refresh_text` → `compute_layout`（仅 LAYOUT 脏）→ `layout_text`
     /// → paint → commit。
     ///
+    /// 入口有「每 refresh 周期最多一帧」的预算门禁（A5）：同一刷新周期内的重复请求返回
+    /// `Ok(FrameOutcome::Idle)`（脏位保留，平台一次性唤醒到期后补帧，最多晚 1 个 vsync）。
+    /// 需要**立即**出帧的路径（resize / 拖动 / 系统模态循环 / 动画 tick）使用
+    /// `App::frame_forced`（force 通道，绕过预算）。
+    ///
     /// 返回 `None` = 窗口不存在（**不**消费 wake 请求）；`Ok(FrameOutcome::Idle)` = 空闲零帧（I3，
     /// 不提交、`FrameIndex` 不变）；`Err` = 本帧已中止（damage/dirty 保留，下一帧重试）。
     ///
     /// 产品路径：含 `bind_style`/`bind_text` 的窗口只能走这里；`Window::frame` 是它的无 App 通道版本。
     pub fn frame(&mut self, window: WindowId) -> Option<Result<FrameOutcome, EngineError>> {
-        frame::frame(self, window)
+        frame::frame(self, window, false)
+    }
+
+    /// 窗口所在 output 的刷新率提示（A5 诊断面；`None` = 平台没给 / headless）。
+    #[must_use]
+    pub fn frame_refresh_hz(&self, window: WindowId) -> Option<f32> {
+        self.window(window).and_then(Window::frame_refresh_hz)
+    }
+
+    /// 该窗口累计被帧预算门禁推迟的请求数（A5 验收诊断；单调递增）。
+    #[must_use]
+    pub fn frame_budget_deferrals(&self, window: WindowId) -> u64 {
+        self.window(window)
+            .map_or(0, Window::frame_budget_deferrals)
+    }
+
+    /// 完整帧（force 通道）：绕过入口的帧预算门禁，立即出帧。
+    ///
+    /// 消费者（`crate` 内）：Windows `ResizeFrameDriver`（系统 size / move 模态循环里每条
+    /// `WM_SIZE` 必须立刻重排重绘）、macOS 连续帧定时器（display link 节拍的 tick 已经代表
+    /// 「这一拍该出帧」）。Linux 的 present 门禁本身就是 `wl_surface.frame`，没有 force 调用点
+    /// （因此该端不编译本方法：避免 dead_code warning）。普通唤醒路径不得使用：否则
+    /// `--hz 240` 的写入会绕过预算。
+    #[cfg(any(windows, target_os = "macos"))]
+    pub(crate) fn frame_forced(
+        &mut self,
+        window: WindowId,
+    ) -> Option<Result<FrameOutcome, EngineError>> {
+        frame::frame(self, window, true)
     }
 
     /// 中止本帧（不结算、不递增 `FrameIndex`）。

@@ -50,9 +50,12 @@ pub(crate) struct PaintPass<'a> {
     pub focused: Option<NodeId>,
     /// 本帧的**滚动槽表**（槽位 → （逻辑滚动位移，物理视口））。
     ///
-    /// 本 pass 每帧重写它：下标 0 恒是「不随滚动偏移」的哨兵（偏移 0、零面积视口），
+    /// 全量路径每帧重写它：下标 0 恒是「不随滚动偏移」的哨兵（偏移 0、零面积视口），
     /// 滚动容器按绘制序依次占 1..。槽位编号在树结构不变时**逐帧稳定**，因此滚动容器
     /// 的 lane 不需要因为滚动而重建（`Lane::scroll` 参与复用判据）。
+    ///
+    /// 增量路径**不重写**（结构未变 ⇒ 编号稳定）：只把被访问滚动容器的偏移 / 视口写回
+    /// 缓存槽位（`NodeTree::scroll_slot_cached`），必要时追加新槽。
     pub scroll_slots: &'a mut Vec<(Point, PhysicalRect)>,
     /// 与 `scroll_slots` 平行的「槽位 → 容器节点」（下标 i ⇒ 槽位 i + 1）。消费者：纯滚动帧
     /// 的快路径（`window/paint.rs`）据它把偏移刷进槽位表，不必重新遍历树。
@@ -60,6 +63,23 @@ pub(crate) struct PaintPass<'a> {
     /// lane 重建/复用记录（仅 `test-support`）。
     #[cfg(feature = "test-support")]
     pub log: PaintLog,
+}
+
+/// paint 遍历的两种路径（A1：脏子树剪枝的「双路径」）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaintMode {
+    /// 全量 DFS：访问每个节点、重建绘制序、重建滚动槽表（首帧 / 结构变化 / 全帧 damage /
+    /// 脏节点状态无法增量处理时的兜底）。
+    Full,
+    /// 增量 DFS：只访问 `mark_paint_closure` 的脏闭包（非 reusable 节点会保守展开整棵子树，
+    /// 以覆盖 clip / 隐藏上下文的传播），不 push 绘制序，滚动槽按缓存编号写回。
+    Incremental,
+}
+
+impl PaintMode {
+    const fn is_full(self) -> bool {
+        matches!(self, Self::Full)
+    }
 }
 
 /// 一次 paint 的产物。
@@ -83,15 +103,34 @@ pub(crate) struct PaintReport {
     pub scroll_slots: usize,
     #[cfg(feature = "test-support")]
     pub log: PaintLog,
+    /// 本帧 `SceneDelta` 的结构快照（`Window::paint_frame` 在构建 delta 后回填）。
+    #[cfg(feature = "test-support")]
+    pub delta: crate::test_support::record::DeltaRecord,
 }
 
 impl PaintPass<'_> {
-    /// 执行整帧 paint（唯一入口，消费者：`Window::paint_frame`）。
+    /// 执行整帧 paint（**全量路径**；唯一入口的消费者：`Window::paint_frame` 的帧分类）。
     ///
     /// # Errors
     /// [`EngineError::ClipDepthExceeded`]：clip 嵌套超过 `MAX_CLIP_DEPTH`。release 也必须失败——
     /// 静默丢弃最外层 clip 会让子内容越界可见（P06 二轮 / P14 审查）。
     pub(crate) fn run(&mut self) -> Result<PaintReport, EngineError> {
+        self.execute(PaintMode::Full)
+    }
+
+    /// 执行**增量路径**：只 DFS `mark_paint_closure` 的脏闭包（调用方已标记完成）。
+    ///
+    /// 与全量路径共用同一份节点状态逻辑（隐藏 / clip / 复用 / 重建 / 滚动槽），差异只有两点：
+    /// 不 push 绘制序（顺序不变时 `Scene::order` 整体保留，`delta.order` 因此是 `None`），
+    /// 以及新建 / 释放 lane 时用轻量 DFS 兜底重建绘制序。
+    ///
+    /// # Errors
+    /// 同 [`PaintPass::run`]。
+    pub(crate) fn run_incremental(&mut self) -> Result<PaintReport, EngineError> {
+        self.execute(PaintMode::Incremental)
+    }
+
+    fn execute(&mut self, mode: PaintMode) -> Result<PaintReport, EngineError> {
         let tree = &mut *self.tree;
         let scene = &mut *self.scene;
         let damage = &mut *self.damage;
@@ -102,17 +141,23 @@ impl PaintPass<'_> {
         let frame = self.frame;
         #[cfg(feature = "test-support")]
         let log = std::mem::take(&mut self.log);
-        // 槽位 0 是「不随滚动偏移」的哨兵：`FrameOp::Instances.scroll = 0` 的 op 永远拿到
-        // 零偏移，因此不需要在绘制期判断「这个 op 是否在滚动容器里」。
-        scroll_slots.clear();
-        scroll_slots.push((Point::ZERO, PhysicalRect::new(0, 0, 0, 0)));
-        scroll_slot_nodes.clear();
+        if mode.is_full() {
+            // 全量路径从零重建绘制序与滚动槽表；增量路径保留上一帧的两者（顺序 / 编号稳定）。
+            order.clear();
+            tree.begin_full_scroll_slots();
+            // 槽位 0 是「不随滚动偏移」的哨兵：`FrameOp::Instances.scroll = 0` 的 op 永远拿到
+            // 零偏移，因此不需要在绘制期判断「这个 op 是否在滚动容器里」。
+            scroll_slots.clear();
+            scroll_slots.push((Point::ZERO, PhysicalRect::new(0, 0, 0, 0)));
+            scroll_slot_nodes.clear();
+        }
         let mut context = PaintContext {
             geometry: self.geometry,
             tree,
             scene,
             damage,
             scale,
+            mode,
             order,
             scroll_slots,
             scroll_slot_nodes,
@@ -120,9 +165,12 @@ impl PaintPass<'_> {
             #[cfg(feature = "test-support")]
             log,
             rebuilt: 0,
+            visited: 0,
+            order_changed: false,
         };
         let mut clip = ClipContext::default();
         let root = context.tree.root();
+        // 全量路径的根恒访问；增量路径的根只有在闭包里（= 有脏节点）时才访问。
         paint_node(
             &mut context,
             root,
@@ -132,9 +180,23 @@ impl PaintPass<'_> {
             Point::ZERO,
             0,
             0,
+            mode.is_full(),
         )?;
-        context.scene.set_order(context.order);
+        match context.mode {
+            PaintMode::Full => context.scene.set_order(context.order),
+            PaintMode::Incremental if context.order_changed => {
+                // 绘制序成员变了（新建 / 释放 lane）：用轻量 DFS（只读 children + lane_of，
+                // 无 clip/damage 计算）重建，再让 `Scene::set_order` 与上一帧比较。
+                rebuild_order_only(context.tree, context.order);
+                context.scene.set_order(context.order);
+                context.tree.note_order_rebuild();
+            }
+            PaintMode::Incremental => {}
+        }
         let damage = context.damage.finish(frame);
+        context
+            .tree
+            .note_paint_frame(context.mode.is_full(), context.visited);
         Ok(PaintReport {
             rebuilt: context.rebuilt,
             damage,
@@ -150,6 +212,8 @@ impl PaintPass<'_> {
             scroll_slots: 0,
             #[cfg(feature = "test-support")]
             log: context.log,
+            #[cfg(feature = "test-support")]
+            delta: crate::test_support::record::DeltaRecord::default(),
         })
     }
 }
@@ -161,8 +225,10 @@ struct PaintContext<'a> {
     scene: &'a mut Scene,
     damage: &'a mut DamageAccumulator,
     scale: Scale,
+    /// 本帧走全量还是增量路径（共享节点状态逻辑里唯一的分叉点）。
+    mode: PaintMode,
     order: &'a mut Vec<LaneId>,
-    /// 滚动槽表（本帧写入；下标 0 = 哨兵）。
+    /// 滚动槽表（全量：本帧重写；增量：按缓存槽号写回，必要时追加）。
     scroll_slots: &'a mut Vec<(Point, PhysicalRect)>,
     /// 槽位 → 容器节点（与 `scroll_slots` 平行，下标 i ⇒ 槽位 i + 1）。
     scroll_slot_nodes: &'a mut Vec<NodeId>,
@@ -170,6 +236,10 @@ struct PaintContext<'a> {
     #[cfg(feature = "test-support")]
     log: PaintLog,
     rebuilt: usize,
+    /// 本帧做节点状态判定的节点数（`PaintCounters::visited_nodes` 的来源）。
+    visited: usize,
+    /// 增量路径：本帧是否新建 / 释放过 lane（绘制序成员变化 ⇒ 需要兜底重建）。
+    order_changed: bool,
 }
 
 /// 屏幕 = 内容 − `total`；图元烘焙 = 内容 − (`total` − `slot_offset`)。
@@ -285,6 +355,13 @@ fn content_needs_clip(content: &Content) -> bool {
 /// 每 op scissor（`FramePayload::scroll_clip`）。
 ///
 /// [`ScrollTable`]: crate::render::delta::ScrollTable
+///
+/// # 增量剪枝（A1）
+///
+/// `force` = 本节点所在的子树被「必须完整访问」的口径覆盖：全量路径恒真；增量路径的根为假，
+/// 但从**非 reusable** 节点向下递归时置真（该节点的 clip 上下文 / 隐藏状态可能变化，整棵子树
+/// 都可能需要重建 —— 这是唯一需要保守展开的地方）。未被覆盖且不在脏闭包里的节点整棵跳过，
+/// 它上一帧的 lane / 缓存保持不变（它们本来就是 reusable 的）。
 fn paint_node(
     context: &mut PaintContext<'_>,
     node: NodeId,
@@ -294,7 +371,12 @@ fn paint_node(
     slot_offset: Point,
     slot: u32,
     boundary: usize,
+    force: bool,
 ) -> Result<(), EngineError> {
+    if !force && !context.tree.paint_marked(node) {
+        return Ok(());
+    }
+    context.visited += 1;
     // 一次取全本节点的只读状态（不可见 / 复用判据 / lane / 子节点数 / clip 盒 / 滚动偏移）。
     //
     // 不可见的**定义只有一处**：`display: none` 或 `visible: false`。命中测试、焦点遍历、
@@ -330,21 +412,24 @@ fn paint_node(
             .lane
             .is_none_or(|lane| context.scene.lane_scroll(lane) == node_slot);
     if reusable {
-        if let Some(lane) = state.lane {
+        // 增量路径不 push 绘制序：顺序没变（结构未变、lane 成员未变），`Scene::order` 整体保留。
+        if context.mode.is_full()
+            && let Some(lane) = state.lane
+        {
             context.order.push(lane);
-            #[cfg(feature = "test-support")]
-            {
-                let primitives = context
-                    .scene
-                    .lane_primitives(lane)
-                    .map_or(0, <[Primitive]>::len);
-                context.log.lanes.push(LanePaintEntry {
-                    lane,
-                    node,
-                    outcome: LaneOutcome::Reused,
-                    primitives,
-                });
-            }
+        }
+        #[cfg(feature = "test-support")]
+        if let Some(lane) = state.lane {
+            let primitives = context
+                .scene
+                .lane_primitives(lane)
+                .map_or(0, <[Primitive]>::len);
+            context.log.lanes.push(LanePaintEntry {
+                lane,
+                node,
+                outcome: LaneOutcome::Reused,
+                primitives,
+            });
         }
     } else {
         rebuild_lane(
@@ -369,9 +454,11 @@ fn paint_node(
     }
 
     // 本节点是滚动容器 ⇒ 给它的子树分配一个槽位，并把「本槽位移」从现在起从烘焙里扣掉。
-    // 槽位编号按绘制序稠密分配（树不变 ⇒ 逐帧稳定）。槽位的**屏幕裁剪区**是「容器 padding box
-    // 与全部祖先 clip 的交集」（= 刚 push 完之后的 covering），它同时是滚动 damage 与 GPU 侧
-    // 该槽全部 op 的 scissor —— 因此滚动容器的视口 clip 不再进 lane 的裁剪链。
+    // 全量路径按绘制序**稠密编号**并写进节点缓存（树不变 ⇒ 逐帧稳定）；增量路径读缓存编号，
+    // 不重排已有槽位（已烘焙进 lane 的槽号不能动），缓存缺失时追加新槽。
+    // 槽位的**屏幕裁剪区**是「容器 padding box 与全部祖先 clip 的交集」（= 刚 push 完之后的
+    // covering），它同时是滚动 damage 与 GPU 侧该槽全部 op 的 scissor —— 因此滚动容器的视口
+    // clip 不再进 lane 的裁剪链。
     let mut child_total = total;
     let mut child_slot = node_slot;
     let mut child_slot_offset = node_slot_offset;
@@ -383,15 +470,16 @@ fn paint_node(
                 |rect| rect.to_physical_covering(context.scale),
             )
         });
-        let index = u32::try_from(context.scroll_slots.len()).unwrap_or(u32::MAX);
-        context.scroll_slots.push((own, viewport));
-        context.scroll_slot_nodes.push(node);
+        let index = scroll_slot_for(context, node, own, viewport);
         child_total = Point::new(total.x + own.x, total.y + own.y);
         child_slot = index;
         child_slot_offset = own;
         // 视口 clip 已经「花掉」：子树看到的 `clip.rects[..boundary]` 全部由屏幕裁剪区承担。
         child_boundary = clip.rects.len();
     }
+    // 非 reusable 的节点会让整棵子树的 clip 上下文 / 隐藏状态可能与上一帧不同 ⇒ 增量路径
+    // 保守展开（全量路径本来就访问全部子节点）。
+    let expand = context.mode.is_full() || !reusable;
     for index in 0..child_count {
         let child = match context.tree.get(node) {
             Ok(target) => target.children()[index],
@@ -406,12 +494,79 @@ fn paint_node(
             child_slot_offset,
             child_slot,
             child_boundary,
+            expand,
         )?;
     }
     if clip_bounds.is_some() {
         clip.pop(context.scale);
     }
     Ok(())
+}
+
+/// 本节点的滚动槽：全量路径稠密编号并缓存；增量路径复用缓存（缺失时追加新槽，不重排）。
+///
+/// 增量路径的「追加」是槽位表**只增不乱**的唯一语义：已烘焙进 lane 的槽号必须保持不变，
+/// 隐藏容器留下的旧槽（没有 lane 引用）留在表里无害；下一次全量路径会重新稠密编号。
+fn scroll_slot_for(
+    context: &mut PaintContext<'_>,
+    node: NodeId,
+    offset: Point,
+    viewport: PhysicalRect,
+) -> u32 {
+    let cached = context.tree.scroll_slot_cached(node);
+    if context.mode.is_full() || cached == 0 {
+        let index = u32::try_from(context.scroll_slots.len()).unwrap_or(u32::MAX);
+        context.scroll_slots.push((offset, viewport));
+        context.scroll_slot_nodes.push(node);
+        context.tree.set_scroll_slot(node, index);
+        return index;
+    }
+    let slot = cached as usize;
+    match slot.checked_sub(1) {
+        Some(parallel) if parallel < context.scroll_slot_nodes.len() => {
+            context.scroll_slot_nodes[parallel] = node;
+        }
+        _ => {
+            // 表比缓存短（只可能来自「恢复的缓存 + 被截短的表」，防御性追加）：
+            // 记一个新槽，保持 `scroll_slots.len() == scroll_slot_nodes.len() + 1` 的不变量。
+            let index = u32::try_from(context.scroll_slots.len()).unwrap_or(u32::MAX);
+            context.scroll_slots.push((offset, viewport));
+            context.scroll_slot_nodes.push(node);
+            context.tree.set_scroll_slot(node, index);
+            return index;
+        }
+    }
+    if let Some(slot) = context.scroll_slots.get_mut(slot) {
+        *slot = (offset, viewport);
+    }
+    cached
+}
+
+/// 增量路径的绘制序兜底：只读 `children` + `lane_of` 重建 DFS 先序（不碰 clip / damage / 图元）。
+///
+/// 触发条件：增量帧里新建或释放了 lane（绘制序成员变化）——这是唯一会让 `Scene::order` 变化
+/// 的增量情形（结构变化走全量路径）。隐藏节点不产生绘制输出，它们的空 lane 不进序。
+fn rebuild_order_only(tree: &NodeTree, order: &mut Vec<LaneId>) {
+    order.clear();
+    let mut stack: SmallVec<[(NodeId, bool); 32]> = SmallVec::new();
+    stack.push((tree.root(), false));
+    while let Some((node, parent_hidden)) = stack.pop() {
+        let Ok(target) = tree.get(node) else {
+            continue;
+        };
+        let own_hidden = matches!(target.style().inner.display, taffy::style::Display::None)
+            || target.style_patch().visible == Some(false);
+        if parent_hidden || own_hidden {
+            // 隐藏子树：`hide_subtree` 已把它的 lane 清空，全量路径同样不会把它计入绘制序。
+            continue;
+        }
+        if let Some(lane) = target.lane() {
+            order.push(lane);
+        }
+        for child in target.children().iter().rev() {
+            stack.push((*child, false));
+        }
+    }
 }
 
 /// 隐藏子树：清空每条 lane（保留分配），并把旧像素并入 damage；`clip_key` 置空
@@ -456,7 +611,12 @@ fn hide_subtree(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
         if had_primitives {
             let _ = context.scene.clear_lane(lane);
             context.rebuilt += 1;
-            context.order.push(lane);
+            // 全量路径重建绘制序：清空内容但**保留 lane 分配**的节点仍占一个绘制序位置
+            // （GPU 侧据此把该段实例清掉）。增量路径的顺序沿用上一帧，该 lane 已经在序里
+            // （「有图元的 lane 必在绘制序里」是不变式）⇒ 不 push、也不算顺序变化。
+            if context.mode.is_full() {
+                context.order.push(lane);
+            }
             #[cfg(feature = "test-support")]
             context.log.lanes.push(LanePaintEntry {
                 lane,
@@ -494,7 +654,6 @@ fn rebuild_lane(
     slot_offset: Point,
     boundary: usize,
 ) -> Result<(), EngineError> {
-    #[cfg(feature = "test-support")]
     let created = context.tree.lane_of(node).is_none();
     let lane = match context.tree.lane_of(node) {
         Some(lane) => lane,
@@ -507,6 +666,11 @@ fn rebuild_lane(
     // AR5 P2-1：旧可见内容范围必须在清空 lane **之前**记下 —— 内容收缩（长文本变短 /
     // Canvas 变小）后新图元只覆盖收缩后的区域，旧像素需要这份旧 AABB 才会被重画。
     let previous_content = painted_content(context.tree, context.scene, node);
+    // 增量路径的绘制序成员判据：清空前的「这条 lane 里有没有图元」。
+    let had_primitives = context
+        .scene
+        .lane_primitives(lane)
+        .is_some_and(|primitives| !primitives.is_empty());
     let _ = context.scene.clear_lane(lane);
     // 槽位必须写进 lane：编码器据此生成 `FrameOp::Instances.scroll`，也是段复用的判据之一。
     // `set_lane_scroll` 在槽位变化时让内容版本 +1，因此总线上不会漏掉这条 lane。
@@ -635,9 +799,18 @@ fn rebuild_lane(
         if !emitter.node_damage.is_empty() {
             context.rebuilt += 1;
         }
+        // 增量路径：释放了一条**本来在绘制序里**的 lane ⇒ 顺序成员变化，遍历结束后兜底重建。
+        if !context.mode.is_full() && (created || had_primitives) {
+            context.order_changed = true;
+        }
     } else {
         context.rebuilt += 1;
-        context.order.push(lane);
+        if context.mode.is_full() {
+            context.order.push(lane);
+        } else if created || !had_primitives {
+            // 增量路径：新建 lane，或复活了一条没有图元（不在序里）的旧 lane ⇒ 顺序成员变化。
+            context.order_changed = true;
+        }
     }
 
     #[cfg(feature = "test-support")]
@@ -1063,7 +1236,7 @@ mod tests {
     use super::PaintPass;
     use crate::{
         math::{PhysicalRect, Point, Rect, Scale},
-        node::{builder::NodeBuilder, tree::NodeTree},
+        node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
         paint::{
             canvas::Canvas,
             color::Color,
@@ -1129,8 +1302,46 @@ mod tests {
             self.try_paint().expect("paint")
         }
 
+        /// 增量路径：调用方先把脏节点标进闭包（`mark_incremental`），与 `Window::paint_frame`
+        /// 的两步（分类后 `mark_paint_closure` + `run_incremental`）一致。
+        fn try_paint_incremental(
+            &mut self,
+            dirty: &[crate::node::id::NodeId],
+        ) -> Result<super::PaintReport, crate::error::EngineError> {
+            self.damage.reset(scale());
+            self.tree.mark_paint_closure(dirty);
+            let geometry_store = crate::paint::geometry_store::GeometryStore::new();
+            let mut pass = PaintPass {
+                tree: &mut self.tree,
+                geometry: &geometry_store,
+                scene: &mut self.scene,
+                damage: &mut self.damage,
+                scale: scale(),
+                frame: frame(),
+                order: &mut self.order,
+                focused: None,
+                scroll_slots: &mut self.scroll_slots,
+                scroll_slot_nodes: &mut self.scroll_slot_nodes,
+                #[cfg(feature = "test-support")]
+                log: crate::test_support::record::PaintLog::default(),
+            };
+            pass.run_incremental()
+        }
+
+        fn paint_incremental(&mut self, dirty: &[crate::node::id::NodeId]) -> super::PaintReport {
+            self.try_paint_incremental(dirty)
+                .expect("incremental paint")
+        }
+
         fn mark_paint(&mut self, node: crate::node::id::NodeId) {
             let _ = self.tree.mark_paint(node);
+        }
+
+        /// 标脏并返回（方便一次标多个节点后走增量路径）。
+        fn mark_dirty(&mut self, nodes: &[crate::node::id::NodeId]) {
+            for node in nodes {
+                let _ = self.tree.mark_paint(*node);
+            }
         }
     }
 
@@ -1858,5 +2069,403 @@ mod tests {
                     <= usize::from(crate::paint::scene::MAX_CLIP_DEPTH)),
             "折叠后每层的 clip 深度不得超过上限"
         );
+    }
+
+    // ── A1：增量路径（脏闭包）单元测试 ─────────────────────────────────────
+
+    /// 单节点 lane 的内容版本（增量路径「未访问节点不得被触碰」的判据）。
+    fn lane_version(h: &Harness, lane: LaneId) -> u32 {
+        h.scene.lane_state(lane).expect("lane 活着").0
+    }
+
+    /// 场景的「绘制相关」快照：按 DFS 的（节点, lane 图元, 滚动槽）+ 仅含非空 lane 的绘制序 +
+    /// 滚动槽表。用于增量 vs 全量的逐字段等价断言（空 lane 是否在绘制序里不影响像素）。
+    fn rendered_state(
+        h: &Harness,
+    ) -> (
+        Vec<(NodeId, Vec<Primitive>, u32)>,
+        Vec<NodeId>,
+        Vec<(Point, PhysicalRect)>,
+    ) {
+        let ids = h.tree.dfs_ids();
+        let mut lanes = Vec::new();
+        let mut lane_nodes = ahash::HashMap::default();
+        for id in ids {
+            let Some(lane) = h.tree.lane_of(id) else {
+                continue;
+            };
+            lane_nodes.insert(lane, id);
+            let primitives = h
+                .scene
+                .lane_primitives(lane)
+                .map_or_else(Vec::new, <[Primitive]>::to_vec);
+            lanes.push((id, primitives, h.scene.lane_scroll(lane)));
+        }
+        let drawn_order: Vec<NodeId> = h
+            .order
+            .iter()
+            .filter(|lane| {
+                h.scene
+                    .lane_primitives(**lane)
+                    .is_some_and(|primitives| !primitives.is_empty())
+            })
+            .filter_map(|lane| lane_nodes.get(lane).copied())
+            .collect();
+        (lanes, drawn_order, h.scroll_slots.clone())
+    }
+
+    /// A1 / P1A-1a：增量帧只访问脏闭包（变化节点 + 祖先链），兄弟子树整棵跳过；绘制序
+    /// 与未访问 lane 完全不动（这是「不重建 order ⇒ `delta.order == None`」的单元级证据）。
+    #[test]
+    fn incremental_only_visits_the_dirty_closure() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let container = NodeBuilder::boxed()
+            .style(fixed_style(200.0, 100.0))
+            .paint(with_white())
+            .build(&mut h.tree, root)
+            .expect("container");
+        let left = NodeBuilder::boxed()
+            .layout_override(Rect::new(0.0, 0.0, 40.0, 20.0))
+            .paint(with_white())
+            .build(&mut h.tree, container)
+            .expect("left");
+        let right = NodeBuilder::boxed()
+            .layout_override(Rect::new(60.0, 0.0, 40.0, 20.0))
+            .paint(with_white())
+            .build(&mut h.tree, container)
+            .expect("right");
+        let sibling = NodeBuilder::boxed()
+            .layout_override(Rect::new(0.0, 40.0, 40.0, 20.0))
+            .paint(with_white())
+            .build(&mut h.tree, root)
+            .expect("sibling");
+        layout_all(&mut h.tree);
+
+        let first = h.paint();
+        assert_eq!(first.rebuilt, 4, "四个有图元的节点首帧都要建 lane");
+        let order_before = h.order.clone();
+        let left_lane = h.tree.lane_of(left).expect("left lane");
+        let right_lane = h.tree.lane_of(right).expect("right lane");
+        let sibling_lane = h.tree.lane_of(sibling).expect("sibling lane");
+        let (left_v, right_v, sibling_v) = (
+            lane_version(&h, left_lane),
+            lane_version(&h, right_lane),
+            lane_version(&h, sibling_lane),
+        );
+        let counters_before = h.tree.paint_counters();
+
+        h.mark_paint(left);
+        let report = h.paint_incremental(&[left]);
+        assert_eq!(report.rebuilt, 1, "只有变化节点重建 lane");
+        let counters = h.tree.paint_counters();
+        assert_eq!(
+            counters.visited_nodes, 3,
+            "访问数 = left + container + root"
+        );
+        assert!(
+            counters.visited_nodes < h.tree.len(),
+            "访问数必须小于树规模（真实负载下远小于）：{} vs {}",
+            counters.visited_nodes,
+            h.tree.len()
+        );
+        assert_eq!(
+            counters.full_frames, counters_before.full_frames,
+            "增量帧不得退化为全量"
+        );
+        assert_eq!(
+            counters.incremental_frames,
+            counters_before.incremental_frames + 1
+        );
+        assert_eq!(
+            counters.order_rebuilds, counters_before.order_rebuilds,
+            "没有 lane 成员变化 ⇒ 不得重建绘制序"
+        );
+        assert_eq!(h.order, order_before, "增量路径不得改绘制序");
+        assert_eq!(h.scene.order(), order_before.as_slice());
+        assert!(
+            lane_version(&h, left_lane) > left_v,
+            "被改 lane 的内容版本必须推进"
+        );
+        assert_eq!(
+            lane_version(&h, right_lane),
+            right_v,
+            "兄弟 lane 不得被触碰"
+        );
+        assert_eq!(
+            lane_version(&h, sibling_lane),
+            sibling_v,
+            "无关子树 lane 不得被触碰"
+        );
+        #[cfg(feature = "test-support")]
+        {
+            let log = &report.log.lanes;
+            assert!(log.iter().any(|entry| entry.node == left));
+            assert!(
+                !log.iter().any(|entry| entry.node == right),
+                "未变化的兄弟不得被访问：{log:?}"
+            );
+            assert!(
+                !log.iter().any(|entry| entry.node == sibling),
+                "无关子树不得被访问：{log:?}"
+            );
+        }
+    }
+
+    /// A1：clip 上下文变化会让整棵子树失配 ⇒ 增量路径必须保守展开子树（全量路径的语义）。
+    #[test]
+    fn incremental_expands_the_subtree_when_the_clip_context_changes() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let container = NodeBuilder::boxed()
+            .style(fixed_style(100.0, 100.0))
+            .build(&mut h.tree, root)
+            .expect("container");
+        let child = NodeBuilder::boxed()
+            .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
+            .paint(with_white())
+            .build(&mut h.tree, container)
+            .expect("child");
+        layout_all(&mut h.tree);
+        let _ = h.paint();
+        let before = lane_primitives(&h, child);
+        assert!(
+            !before
+                .iter()
+                .any(|primitive| matches!(primitive, Primitive::Clip(_))),
+            "初始没有 clip 前缀"
+        );
+
+        let mut clipped = fixed_style(100.0, 100.0);
+        clipped.clip = Clip::Bounds;
+        h.tree.set_style_for_test(container, clipped);
+        h.mark_paint(container);
+        let report = h.paint_incremental(&[container]);
+        assert!(report.rebuilt >= 1, "clip 变化必须重建子树 lane");
+        let after = lane_primitives(&h, child);
+        assert!(
+            matches!(after.first(), Some(Primitive::Clip(ClipOp::Push(_)))),
+            "clip 变化必须传播到子树：{after:?}"
+        );
+        assert!(
+            h.tree.clip_key(child).is_some_and(|(depth, _)| depth == 1),
+            "子树的 clip_key 必须写回新上下文"
+        );
+    }
+
+    /// A1：隐藏变化必须访问整棵子树（`hide_subtree`），清空它们的 lane 并产生 damage；
+    /// 但**不**改变绘制序成员（lane 保留分配 ⇒ 再次显示时位置稳定）。
+    #[test]
+    fn incremental_hides_the_whole_subtree() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let container = NodeBuilder::boxed()
+            .style(fixed_style(100.0, 100.0))
+            .paint(with_white())
+            .build(&mut h.tree, root)
+            .expect("container");
+        let child = NodeBuilder::boxed()
+            .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
+            .paint(with_white())
+            .build(&mut h.tree, container)
+            .expect("child");
+        layout_all(&mut h.tree);
+        let _ = h.paint();
+        assert!(!h.scene.is_empty());
+        let container_lane = h.tree.lane_of(container).expect("lane");
+        let child_lane = h.tree.lane_of(child).expect("lane");
+        let order_before = h.order.clone();
+
+        h.tree.set_style_patch_for_test(
+            container,
+            StylePatch {
+                visible: Some(false),
+                ..StylePatch::default()
+            },
+        );
+        h.mark_paint(container);
+        let report = h.paint_incremental(&[container]);
+        assert!(report.rebuilt >= 2, "整棵子树都要清空");
+        assert!(report.damage.rects > 0, "隐藏必须产生重绘 damage");
+        assert!(h.scene.is_empty(), "隐藏之后场景里不应还有任何内容");
+        assert!(
+            h.scene
+                .lane_primitives(container_lane)
+                .is_some_and(<[Primitive]>::is_empty),
+            "容器 lane 必须被清空（保留分配）"
+        );
+        assert!(
+            h.scene
+                .lane_primitives(child_lane)
+                .is_some_and(<[Primitive]>::is_empty),
+            "子节点 lane 也必须被清空（hide_subtree 递归）"
+        );
+        assert_eq!(h.order, order_before, "隐藏不改变绘制序成员");
+    }
+
+    /// A1：增量路径出现「新建 lane」⇒ 绘制序成员变化 ⇒ 用轻量 DFS 兜底重建绘制序。
+    #[test]
+    fn incremental_new_lane_rebuilds_the_order() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let node = NodeBuilder::boxed()
+            .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
+            .paint(with_white())
+            .build(&mut h.tree, root)
+            .expect("node");
+        layout_all(&mut h.tree);
+        // 先让它隐藏地画一帧：隐藏子树不分配 lane。
+        h.tree.set_style_patch_for_test(
+            node,
+            StylePatch {
+                visible: Some(false),
+                ..StylePatch::default()
+            },
+        );
+        let _ = h.paint();
+        assert!(
+            h.tree.lane_of(node).is_none(),
+            "隐藏节点不得在首帧分配 lane"
+        );
+        assert!(h.order.is_empty(), "隐藏节点不进绘制序");
+
+        // 重新显示：重建时新建 lane ⇒ 顺序兜底必须把它放进绘制序。
+        h.tree.set_style_patch_for_test(
+            node,
+            StylePatch {
+                visible: Some(true),
+                ..StylePatch::default()
+            },
+        );
+        h.mark_paint(node);
+        let counters_before = h.tree.paint_counters();
+        let report = h.paint_incremental(&[node]);
+        assert_eq!(report.rebuilt, 1);
+        let lane = h.tree.lane_of(node).expect("重新显示必须新建 lane");
+        assert_eq!(h.order, vec![lane], "兜底重建的绘制序必须包含新 lane");
+        assert_eq!(h.scene.order(), h.order.as_slice());
+        assert_eq!(
+            h.tree.paint_counters().order_rebuilds,
+            counters_before.order_rebuilds + 1,
+            "新建 lane 必须记一次绘制序兜底"
+        );
+    }
+
+    /// A1：增量帧访问滚动容器时用**缓存槽号**写偏移，不重新稠密编号（已烘焙进 lane 的
+    /// 槽号不能动）。
+    #[test]
+    fn incremental_reuses_the_cached_scroll_slot() {
+        use crate::{
+            interaction::{ScrollAxis, ScrollSlot},
+            math::Size,
+        };
+
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let mut style = fixed_style(100.0, 100.0);
+        style.clip = Clip::Bounds;
+        let container = NodeBuilder::boxed()
+            .style(style)
+            .paint(with_white())
+            .build(&mut h.tree, root)
+            .expect("container");
+        let child = NodeBuilder::boxed()
+            .layout_override(Rect::new(0.0, 0.0, 100.0, 20.0))
+            .paint(with_white())
+            .build(&mut h.tree, container)
+            .expect("child");
+        layout_all(&mut h.tree);
+        h.tree
+            .ensure_interaction(container)
+            .expect("interaction")
+            .scroll = Some(ScrollSlot {
+            offset: Point::ZERO,
+            content: Size::new(100.0, 400.0),
+            axis: ScrollAxis::Vertical,
+            line_height: 48.0,
+        });
+        h.tree.note_scroll_container(container);
+        let first = h.paint();
+        assert!(first.rebuilt >= 2);
+        assert_eq!(h.scroll_slots.len(), 2, "哨兵 + 一个滚动槽");
+        let child_lane = h.tree.lane_of(child).expect("child lane");
+        assert_eq!(h.scene.lane_scroll(child_lane), 1, "lane 登记槽位 1");
+
+        // 滚动 + 子树内容变化同一帧：走增量路径（有 paint 工作，用不上纯滚动快路径）。
+        h.tree.scroll_slot_mut(container).expect("slot").offset = Point::new(0.0, 30.0);
+        h.mark_paint(child);
+        let report = h.paint_incremental(&[child]);
+        assert_eq!(report.rebuilt, 1, "只有脏节点重建");
+        assert_eq!(h.scroll_slots.len(), 2, "增量路径不得重排 / 追加槽位");
+        assert_eq!(
+            h.scroll_slots[1].0,
+            Point::new(0.0, 30.0),
+            "偏移必须写回缓存的槽位"
+        );
+        assert_eq!(h.scene.lane_scroll(child_lane), 1, "槽号不得改变");
+    }
+
+    /// A1 / P1A-1b 的单元级差分 oracle：同一状态下，增量路径与全量路径产出的
+    /// lane 内容 / 每 lane 滚动槽 / 绘制序（按绘制内容归一化）/ 滚动槽表逐字段一致。
+    #[test]
+    fn incremental_and_full_paths_produce_the_same_scene() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let mut clip_style = fixed_style(100.0, 100.0);
+        clip_style.clip = Clip::Bounds;
+        let clip_container = NodeBuilder::boxed()
+            .style(clip_style)
+            .paint(with_white())
+            .build(&mut h.tree, root)
+            .expect("clip container");
+        let inner = NodeBuilder::boxed()
+            .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
+            .paint(with_white())
+            .build(&mut h.tree, clip_container)
+            .expect("inner");
+        let _sibling = NodeBuilder::boxed()
+            .layout_override(Rect::new(0.0, 50.0, 40.0, 20.0))
+            .paint(with_white())
+            .build(&mut h.tree, root)
+            .expect("sibling");
+        let hider = NodeBuilder::boxed()
+            .layout_override(Rect::new(60.0, 50.0, 40.0, 20.0))
+            .paint(with_white())
+            .build(&mut h.tree, root)
+            .expect("hider");
+        layout_all(&mut h.tree);
+        let mut first = h.paint();
+        assert!(first.rebuilt >= 4);
+
+        // 一串增量修改：clip 容器改尺寸（clip 上下文 + damage）、隐藏 hider、inner 重建。
+        let resize = crate::node::tree::LayoutBox {
+            bounds: Rect::new(0.0, 0.0, 60.0, 60.0),
+            border: crate::math::Edges::ZERO,
+        };
+        let _ = h.tree.set_layout_for_test(clip_container, resize);
+        h.tree.set_style_patch_for_test(
+            hider,
+            StylePatch {
+                visible: Some(false),
+                ..StylePatch::default()
+            },
+        );
+        h.mark_dirty(&[clip_container, hider, inner]);
+        let _ = h.paint_incremental(&[clip_container, hider, inner]);
+        let incremental = rendered_state(&h);
+
+        // 同一状态走全量路径（所有节点标脏 ⇒ 全量重放）。
+        let ids = h.tree.dfs_ids();
+        h.mark_dirty(&ids);
+        first = h.paint();
+        assert!(first.rebuilt >= 4, "全量重放必须重建全部有图元的节点");
+        let full = rendered_state(&h);
+
+        assert_eq!(
+            incremental.0.len(),
+            full.0.len(),
+            "lane 集合（按节点归一化）必须一致"
+        );
+        assert_eq!(incremental, full, "增量与全量产物必须逐字段一致");
     }
 }

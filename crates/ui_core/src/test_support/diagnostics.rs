@@ -824,12 +824,15 @@ mod tests {
                 PhysicalRect::new(0, 0, 4, 4),
             ],
             damage_full: false,
+            delta: crate::test_support::record::DeltaRecord::default(),
             scanned_nodes: 0,
             dirty_nodes: Vec::new(),
             repainted: true,
             a11y_only: false,
+            skipped_by_budget: 0,
             paint_log: crate::test_support::record::PaintLog::default(),
             a11y: None,
+            presented_latency: None,
         };
         let overlay = DamageOverlay::of(&record);
         assert_eq!(overlay.rects, record.damage);

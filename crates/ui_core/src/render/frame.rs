@@ -434,14 +434,27 @@ pub(crate) struct FrameFeedback {
     ///   逐帧真实呈现时间戳（`MTLDrawable.presentedTime` / `addPresentedHandler:`）在
     ///   display-link 驱动的 drawable 上不可靠（实测只回调数次、`presentedTime` 恒为 0），
     ///   已不再作为来源。
-    /// - Windows / Linux：恒为 `None` —— 两端都没有接真实呈现时间戳（`GetFrameStatistics` /
-    ///   `wl_surface.frame` 回调未接），没有可信值就留空。
+    /// - Windows（A4）：`IDXGISwapChain::GetFrameStatistics` 的 `SyncQPCTime`（= 最近一次 vblank
+    ///   采样的 QPC 时刻）与 `PresentRefreshCount`/`SyncRefreshCount` 还原「最后一次已上屏内容」
+    ///   的时刻，QPC 经进程级锚点映射到 `Instant`（`render::present_evidence::qpc_instant`）。
+    ///   采样点在 `Present1` 成功之后 ⇒「最后一次已上屏内容」必然不晚于本帧 ⇒ 结果恒为本帧上屏
+    ///   时刻的**下界**；若本帧完成时它仍是最后一次 present，完成观测点再采一次取较紧者。
+    ///   与 `completed_at` 取 max（两个下界取 max 仍是下界）后发布：因此该值**经常等于
+    ///   `completed_at`**（GPU 完成早于本帧自己的 vblank 时，帧统计只能证明「至少已经完成」）。
+    ///   拿不到统计 / `DXGI_ERROR_FRAME_STATISTICS_DISJOINT` ⇒ `None`（不猜刷新率、不伪造）。
+    /// - Linux（A4 数据面已就绪）：`wp_presentation_feedback.presented` 的呈现时钟时间戳
+    ///   （`CLOCK_MONOTONIC`/`CLOCK_REALTIME`，经 `clock_gettime`+`Instant::now()` 锚点换算，
+    ///   `render::present_evidence::presented_event_instant`），`discarded` ⇒ `None`。
+    ///   **当前生产接线尚未启用**（见审查报告 A4 降级说明）：Linux 生产路径仍如实为 `None`，
+    ///   不伪造。纯逻辑（换算 + `PresentationInbox` 跨线程邮箱）已落地并有单测。
     pub presented_at: Option<Instant>,
     /// `completed_at - published_at`：UI 线程发布本帧到 **GPU 工作完成**的时长。
     ///
     /// **三端同义**（B6-2 统一）：起点是 [`FrameRequest::published_at`]（UI 提交时刻），终点是
-    /// [`Self::completed_at`]。合成线程上线后这条链多了一段「合成线程等待下一拍 + 增量编码」——
-    /// 那正是 UI 发布到 GPU 完成之间的真实路径，因此数值变大是语义正确的结果，不是回归。
+    /// [`Self::completed_at`]。合成线程上线后这条链多了一段「入队 → 合成线程增量编码 → GPU
+    /// 排队」—— 那正是 UI 发布到 GPU 完成之间的真实路径，因此数值变大是语义正确的结果，不是
+    /// 回归。A2 删除了合成线程的进程级 vsync 门禁之后，这条链不再包含「等待下一拍」，
+    /// `FrameFeedback::latency` 与 HUD 的 `Latency` 随之缩短约 1 个 vsync。
     /// HUD 的 `Latency` 一行显示的就是它；「发布 → 上屏」由 [`Self::presented_at`] 单独承载，
     /// 其真实性判据见 [`Self::presentation_is_consistent`]。
     pub latency: Duration,

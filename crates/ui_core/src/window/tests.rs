@@ -1,8 +1,8 @@
 #[cfg(windows)]
 use super::frame::surface_change_plan;
 use super::{
-    FrameIndex, FrameOutcome, Window, WindowId, WindowOptions, frame::frame_reaches_gpu,
-    surface::covering_surface,
+    FrameIndex, FrameOutcome, FramePresentation, Window, WindowId, WindowOptions,
+    frame::frame_reaches_gpu, surface::covering_surface,
 };
 use crate::{
     math::{PhysicalRect, Scale, Size},
@@ -752,4 +752,58 @@ fn frame_rejects_bound_nodes_without_styles() {
         .expect("挂载成功");
 
     let _ = window.frame();
+}
+
+/// A4：呈现快照的公开消费面 —— 每帧落账、历史有界、Linux 的异步 presented 回填按 index 生效。
+#[test]
+fn frame_presentations_are_recorded_and_bounded() {
+    let mut window = window();
+    assert!(
+        window.last_frame_presentation().is_none(),
+        "没有完成帧时为空"
+    );
+    let base = std::time::Instant::now();
+    for value in 1..=(super::FRAME_PRESENTATION_HISTORY as u32 + 3) {
+        window.note_frame_presentation(FramePresentation {
+            index: FrameIndex::from_raw(value),
+            published_at: base,
+            completed_at: base + std::time::Duration::from_millis(1),
+            presented_at: Some(base + std::time::Duration::from_millis(3)),
+            latency: std::time::Duration::from_millis(1),
+        });
+    }
+    let recent: Vec<u32> = window
+        .recent_frame_presentations()
+        .map(|presentation| presentation.index.get())
+        .collect();
+    assert_eq!(recent.len(), super::FRAME_PRESENTATION_HISTORY, "历史有界");
+    assert_eq!(recent.last().copied(), Some(11), "保留最新帧");
+    assert_eq!(
+        window
+            .last_frame_presentation()
+            .expect("最新快照")
+            .publish_to_presented(),
+        Some(std::time::Duration::from_millis(3)),
+        "publish → presented（下界）"
+    );
+    // Linux 的 presented 事件晚于反馈：按 index 回填（只影响对应条目），陌生 index 不伪造。
+    window.note_frame_presented(
+        FrameIndex::from_raw(10),
+        Some(base + std::time::Duration::from_millis(9)),
+    );
+    let updated = window
+        .recent_frame_presentations()
+        .find(|presentation| presentation.index.get() == 10)
+        .expect("10 仍在历史里");
+    assert_eq!(
+        updated.completion_to_presented(),
+        Some(std::time::Duration::from_millis(8))
+    );
+    window.note_frame_presented(FrameIndex::from_raw(1), Some(base));
+    assert!(
+        window
+            .recent_frame_presentations()
+            .all(|presentation| presentation.index.get() != 1),
+        "被历史挤掉的帧不会被复活"
+    );
 }

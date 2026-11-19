@@ -415,8 +415,9 @@ impl WindowRenderer {
         let Some(feedback) = self.shared.take_feedback() else {
             return Ok(None);
         };
-        // 共享契约（`render/frame.rs`）：`presented_at` 要么是**可信**的上屏时刻（Linux 恒为
-        // `None` —— `wl_surface.frame` 回调未接），要么如实为 `None`；绝不允许用完成时刻顶替。
+        // 共享契约（`render/frame.rs`）：`presented_at` 要么是**可信**的上屏时刻（A4 数据面：
+        // `wp_presentation_feedback.presented` 的呈现时钟；生产接线尚未启用 ⇒ 当前恒为 `None`），
+        // 要么如实为 `None`；绝不允许用完成时刻顶替。
         debug_assert!(
             feedback.presentation_is_consistent(),
             "presented_at must be a trustworthy on-screen instant or None"
@@ -882,10 +883,8 @@ fn drain_completed(
         }
         // 观察到完成的时刻（timeline 非阻塞查询），不是 `Present` 返回的时刻。
         let completed_at = Instant::now();
-        // B6-2：这一拍同时是**合成线程帧时钟**的来源 —— Wayland 的 `wl_surface.frame` 回调在平台层
-        // 消费（`platform/linux/surface.rs`），而 GPU 完成观测点是同一节奏的等价信号：每 present
-        // 一帧就发布一拍，合成线程据此对齐出帧相位并反推刷新率（`render/linux/clock.rs`）。
-        crate::render::linux::clock::note_frame_callback();
+        // A2：合成线程不再有进程级帧时钟；Wayland 的 present 节奏由 `wl_surface.frame` 回调
+        // （平台层的 `FrameGate`）承担，这里不再向任何帧时钟发布节拍。
         shared.publish_feedback(FrameFeedback {
             index: frame.index,
             stats: frame.stats,
@@ -893,8 +892,11 @@ fn drain_completed(
             completed_at,
             // UI 发布 → GPU 完成（HUD 的 publish→present）。
             latency: completed_at.saturating_duration_since(frame.published_at),
-            // 该端没有可信的呈现时间戳（`wl_surface.frame` 回调未接）：共享契约里 `presented_at`
-            // 是可空字段，**如实留空**——不拿 GPU 完成时刻顶替（那会让 HUD 的上屏延迟变成假数据）。
+            // A4：Linux 的 presented_at 来源是 `wp_presentation_feedback.presented`（呈现时钟
+            // 时间戳）。纯逻辑（`presented_event_instant` / `PresentationInbox`）已在
+            // `render::present_evidence` 落地并有本机单测，但平台层（`wp_presentation` 全局绑定、
+            // 每次 present 前 feedback 请求、事件派发）尚未接线 —— 生产路径如实留空 `None`，
+            // **不拿 GPU 完成时刻顶替**（那会让 HUD / e2e 的上屏延迟变成假数据）。
             presented_at: None,
         });
     }

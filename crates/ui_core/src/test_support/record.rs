@@ -16,6 +16,24 @@ use crate::{
     window::FrameIndex,
 };
 
+/// 一帧 `SceneDelta` 的**结构快照**（A1 的差分 oracle 断言面）。
+///
+/// lane 句柄跨窗口不可比（`NodeId`/`LaneId` 带窗口 tag），因此差分测试比较的是「结构事实」：
+/// 是否整帧发布、是否携带绘制序、各类条目数。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeltaRecord {
+    /// `SceneDelta::full`（整帧重建：首帧 / DPI 变化 / 消费端重置）。
+    pub full: bool,
+    /// `SceneDelta::order` 是否 `Some`（`false` = 编码器可走「顺序沿用」快路径）。
+    pub order_some: bool,
+    /// 变化 lane 条数。
+    pub lanes: usize,
+    /// 释放 lane 条数。
+    pub removed: usize,
+    /// 滚动槽变化条数。
+    pub scroll: usize,
+}
+
 /// 一帧的**调度记录**（`drain()` 的返回值；空闲帧也有）。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FrameRecord {
@@ -31,6 +49,8 @@ pub struct FrameRecord {
     pub damage: Vec<PhysicalRect>,
     /// 是否退化为全帧。
     pub damage_full: bool,
+    /// 本帧 `SceneDelta` 的结构快照（A1 差分 oracle：增量帧的 `order_some` 必须为 `false`）。
+    pub delta: DeltaRecord,
     /// 本帧被重建 lane 的节点（DFS 先序 = 绘制序）。
     pub dirty_nodes: Vec<NodeId>,
     /// 本帧**引擎簿记访问过的不同节点数**（脏集合消费 + 全树/子树遍历的并集）。
@@ -44,6 +64,11 @@ pub struct FrameRecord {
     /// 本帧是不是 **a11y-only 帧**（R13-6）：只重算 `bind_a11y` 并让泵投递 TreeUpdate，
     /// 没有任何像素工作（`rendered == false`、`damage` 空、`encoded_lanes == 0`）。
     pub a11y_only: bool,
+    /// 本窗口**累计**被帧预算门禁推迟的帧请求数（A5；单调递增）。
+    ///
+    /// 与 `rendered == false` 一起区分「门禁推迟」（脏位保留、下一拍补上）与真正的掉帧：
+    /// 同一 refresh 周期内的多次写入只产生一次提交，其余请求计入本字段。
+    pub skipped_by_budget: u64,
     /// lane 级重建/复用记录。
     pub paint_log: PaintLog,
     /// 本帧产出的一笔 a11y 交付（`None` = 无 a11y 工作，或捕获未打开）。
@@ -51,6 +76,13 @@ pub struct FrameRecord {
     /// **放在这里而不是 `RenderedFrame`**：纯 `A11Y` 变化不产生 damage ⇒ 本帧 `Idle`，
     /// 而 `RenderedFrame` 只存在于已提交帧。
     pub a11y: Option<crate::a11y::A11yTreeSnapshot>,
+    /// 发布 → 上屏（下界）的时长（A4）：`presented_at − published_at`，来自该帧的
+    /// `FrameFeedback`（`Window::poll_renderer` 在完成反馈到达时回填）。
+    ///
+    /// `None` = 该端/该帧没有可信的呈现时刻（Windows 拿不到帧统计 / Linux compositor 无
+    /// `wp_presentation` / 该帧被合成器丢弃），或反馈还没到达。**不是**「用 GPU 完成时刻
+    /// 顶替」的占位：`stats.compositor_inbox_latency`（A2 改名）与本字段一起把「入队→编码→完成→上屏」的可观测性补齐。
+    pub presented_latency: Option<std::time::Duration>,
 }
 
 /// 已提交帧的**绘制快照**（设计 §6.3 的 `RenderedFrame`）。
@@ -120,7 +152,12 @@ pub enum PrimitiveKind {
 /// lane 级重建/复用记录。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PaintLog {
-    /// 本帧访问过的每条 lane 一条记录（DFS 先序 = 绘制序）。
+    /// 本帧**访问过**的每条 lane 一条记录（DFS 先序 = 绘制序）。
+    ///
+    /// A1 脏子树剪枝之后，「访问」与「全树」不再等价：全量帧 = 全部 lane；增量帧 = 脏闭包内
+    /// 做节点状态判定的那些 lane（未变化的兄弟子树整棵跳过，不产生记录）。因此
+    /// [`crate::test_support::record::FrameStats::reused_lanes`] 的含义随之变为
+    /// 「被访问且整桶复用的 lane 数」，**不是**「全场景复用的 lane 数」。
     pub lanes: Vec<LanePaintEntry>,
 }
 
@@ -163,7 +200,8 @@ pub struct FrameStats {
     pub layout: Option<crate::layout::LayoutReport>,
     /// 本帧重建的 lane 数。
     pub painted_lanes: usize,
-    /// 本帧复用的 lane 数。
+    /// 本帧**被访问且整桶复用**的 lane 数（A1 剪枝之后不再等于「全场景复用数」：
+    /// 未进入脏闭包的 lane 不会被访问，因此不计入这里；增量帧它通常是祖先链上的少数几条）。
     pub reused_lanes: usize,
     /// 本帧进入 `Scene` 的图元数。
     pub primitives: usize,
@@ -176,11 +214,13 @@ pub struct FrameStats {
     /// 本帧增量上传的实例字节数：渲染器路径 = 载荷实际字节数（变化段之和），
     /// headless = 编码器写入实例环的字节数（两者在「只改 1 条 lane」时相同）。
     pub uploaded_bytes: usize,
-    /// 合成线程等待下一拍的时长（B6-2；`None` = 本帧没有经过合成线程，或还没有反馈）。
+    /// 合成线程**入队 → 开始编码**的时长（A2 之后不再有 vsync 等待；`None` = 本帧没有经过
+    /// 合成线程，或还没有反馈）。
     ///
     /// 与 `encoded_lanes` 一起把「编码搬到线程」变成可断言的事实：inline 合成时恒 `None`，
-    /// 真实窗口由 `CompositorHandle::counters()` 回填（落后 ≤1 帧）。
-    pub compositor_thread_wait: Option<std::time::Duration>,
+    /// 真实窗口由 `CompositorHandle::counters()` 回填（落后 ≤1 帧）。A2 之前这个值还包含整整
+    /// 一个 vsync 的 `wait_next_frame` —— 语义变化见 `.review/p1-a-impl.md`。
+    pub compositor_inbox_latency: Option<std::time::Duration>,
     /// 本帧的编码是否发生在**合成线程**（`true` = 编码已搬离 UI 线程）。
     pub encode_on_compositor: bool,
     /// 本帧滚动偏移变化的槽数（`0` = 不是滚动帧；>0 时 `encoded_lanes` 必须是 0）。
@@ -201,12 +241,15 @@ impl FrameRecord {
             stats,
             damage: Vec::new(),
             damage_full: false,
+            delta: DeltaRecord::default(),
             dirty_nodes: Vec::new(),
             scanned_nodes: 0,
             repainted: false,
             a11y_only: false,
+            skipped_by_budget: 0,
             paint_log: PaintLog::default(),
             a11y: None,
+            presented_latency: None,
         }
     }
 }
@@ -224,10 +267,25 @@ pub(crate) fn capture(
     scanned_nodes: usize,
 ) -> FrameRecord {
     let mut lane_nodes: ahash::HashMap<LaneId, NodeId> = ahash::HashMap::default();
+    // A1：增量帧的 `PaintLog` 只含**被访问**的 lane，但 `RenderedFrame` 是「本帧场景的完整
+    // 绘制快照」（oracle / 探针依赖它）。lane → node 映射必须覆盖全部活 lane，因此这里做一次
+    // 全树 DFS（`test-support` 的帧记录不做性能承诺；生产构建没有这段代码）。
+    {
+        let mut stack: smallvec::SmallVec<[NodeId; 32]> = smallvec::SmallVec::new();
+        stack.push(tree.root());
+        while let Some(node) = stack.pop() {
+            let Ok(target) = tree.get(node) else {
+                continue;
+            };
+            if let Some(lane) = target.lane() {
+                lane_nodes.insert(lane, node);
+            }
+            stack.extend(target.children().iter().rev().copied());
+        }
+    }
     let mut reused_lanes = Vec::new();
     let mut dirty_nodes = Vec::new();
     for entry in &report.log.lanes {
-        lane_nodes.insert(entry.lane, entry.node);
         if entry.outcome == LaneOutcome::Reused {
             reused_lanes.push(entry.lane);
         } else {
@@ -270,13 +328,17 @@ pub(crate) fn capture(
         stats,
         damage,
         damage_full: report.damage.full,
+        delta: report.delta,
         dirty_nodes,
         scanned_nodes,
         // 提交帧必然产生了像素（重建 lane / damage / 编码 / 滚动偏移之一）⇒ 发生过重绘。
         repainted: true,
         a11y_only: false,
+        skipped_by_budget: 0,
         paint_log: report.log,
         a11y: None,
+        // 呈现时刻在 GPU 完成反馈到达时回填（`Window::poll_renderer`）；录制时还不知道。
+        presented_latency: None,
     }
 }
 

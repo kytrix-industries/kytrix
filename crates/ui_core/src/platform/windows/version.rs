@@ -1,9 +1,10 @@
 //! Windows 版本门禁：ui_core 只支持 Windows 11（build 22000+）。
 //!
-//! `DCompositionWaitForCompositorClock` 是 Win11 才有的导出。本 crate 不承诺 Windows 10：
-//! 启动时用 `RtlGetVersion`（与 Chromium `base::win::GetVersion` 同源，不受 manifest
-//! 兼容性 shim 影响）检查 build 号，低于 22000 直接返回可读的 `EngineError::AppInit`，
-//! 而不是让进程在加载期以 `STATUS_ENTRYPOINT_NOT_FOUND` 静默死亡。
+//! 本 crate 不承诺 Windows 10：启动时用 `RtlGetVersion`（与 Chromium `base::win::GetVersion`
+//! 同源，不受 manifest 兼容性 shim 影响）检查 build 号，低于 22000 直接返回可读的
+//! `EngineError::AppInit`。A2 删除了 `DCompositionWaitForCompositorClock` 的进程级合成器时钟
+//! 之后，启动路径不再有「Win11 专属导出」的加载期风险，但 Win11 仍是产品支持基线
+//! （DirectComposition / 窗口行为假设只在 Win11 上验证），门禁继续保留。
 //!
 //! `RtlGetVersion` 走 `GetProcAddress` 动态解析：这样即使某台机器上的 `ntdll` 异常缺失该
 //! 导出，也只会走到「版本检查失败」分支，而不会把静态导入失败提前到进程加载期。
