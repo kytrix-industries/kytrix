@@ -97,6 +97,7 @@ use crate::{
     platform::{
         linux::{clipboard::Clipboard, cursor::CursorManager, dpi, window},
         wayland::{
+            configure::{AckAction, ConfigureLatch},
             frame_gate::{CallbackToken, FrameGate},
             ime::ImeState,
             input,
@@ -206,9 +207,15 @@ struct WindowSurface {
     /// 稳定 id（与 `App` 的 `WindowId` 对应）。
     id: crate::window::WindowId,
     surface: wl_surface::WlSurface,
-    /// `xdg_surface`（首个 configure 的 ack 在 handler 里；析构顺序见 `Drop`）。
+    /// `xdg_surface`（`configure` 的 ack 时机由 [`Self::configure`] 裁决；析构顺序见 `Drop`）。
     xdg_surface: xdg_surface::XdgSurface,
     toplevel: xdg_toplevel::XdgToplevel,
+    /// xdg-shell configure 的 ack 时序锁存（B10）。
+    ///
+    /// 初始 configure 立即 ack（否则不能 attach buffer 映射）；后续**改变 buffer 状态**
+    /// （尺寸 / 窗口 states）的 configure 等「使用该状态渲染的帧已发布」之后才 ack。
+    /// 窗口销毁时锁存随协议对象一起 drop：surface 已销毁，未 ack 的 serial 不能再 ack。
+    configure: ConfigureLatch,
     /// 应用声明的 IME caret 区域（surface 逻辑坐标；`None` = 无 hint）。
     ime_cursor_area: Option<Rect>,
     /// 本窗口当前是否有**可编辑文本目标**（`App::ime_cursor_area` 有值；B9）。
@@ -599,6 +606,7 @@ impl WaylandState {
             surface,
             xdg_surface,
             toplevel,
+            configure: ConfigureLatch::new(),
             ime_cursor_area: None,
             text_target: false,
             ime_applied: None,
@@ -658,6 +666,9 @@ impl WaylandState {
         {
             self.ime_disable(false);
         }
+        // B10：configure 锁存随 `WindowSurface` 一起 drop —— 未 ack 的 serial 不再补发：
+        // surface 对象已经销毁，ack 一个不存在的对象是 `invalid_serial` 协议错误（关闭窗口
+        // 是唯一允许「丢弃 pending configure」的路径）。
         self.windows.remove(index);
         // text-input 路由存的是下标：移除之后整体前移，按位置修正（与 active 同一套规则）。
         self.text_input_route.reindex_removed(index as u32);
@@ -886,6 +897,14 @@ impl WaylandState {
             .position(|window| window.toplevel.id() == id)
     }
 
+    /// `xdg_surface` → 窗口下标（`configure` 的 ack 必须落回**这个** surface 的锁存器，B10）。
+    fn window_index_for_xdg_surface(&self, xdg_surface: &xdg_surface::XdgSurface) -> Option<usize> {
+        let id = xdg_surface.id();
+        self.windows
+            .iter()
+            .position(|window| window.xdg_surface.id() == id)
+    }
+
     /// `wl_callback` → 窗口下标（按挂起的 `frame_callback` 对象 id 匹配）。
     fn window_index_for_callback(&self, callback: &wl_callback::WlCallback) -> Option<usize> {
         let id = callback.id();
@@ -1108,6 +1127,26 @@ impl WaylandState {
     /// 本帧没有 publish（Idle / 中止）⇒ 不会 commit：把门禁重新打开（F-183 的 Idle 路径）。
     pub(crate) fn note_frame_not_committed(&mut self, index: usize) {
         self.windows[index].frame_gate.note_not_committed();
+    }
+
+    /// B10：把该窗口待确认的 configure ack 掉（若有），返回是否真的发送了 `ack_configure`。
+    ///
+    /// 两个调用契约：
+    ///
+    /// - **帧已发布**（`App::frame` 返回 `FrameOutcome::Committed`）之后调用：此时使用该
+    ///   configure 状态渲染的帧已经交给 GPU 线程（present 时 `wl_surface.commit`），compositor
+    ///   不会再把旧内容按新几何显示 —— 这是 `ConfigureLatch` 的正常 ack 路径；
+    /// - **force 路径**（窗口不可见 / 还没建渲染器 / 本帧 `Idle` 没有 publish）调用：没有帧
+    ///   可配对，立即 ack。否则静止窗口的 configure 永远不确认，compositor 可能不完成映射 /
+    ///   状态切换（比稍早 ack 更糟）。
+    ///
+    /// 一次调用最多 ack 一个 serial；同一 serial 不会被 ack 两次（`pending` 取走即清）。
+    pub(crate) fn ack_pending_configure(&mut self, index: usize) -> bool {
+        let Some(serial) = self.windows[index].configure.on_frame_published() else {
+            return false;
+        };
+        self.windows[index].xdg_surface.ack_configure(serial);
+        true
     }
 
     /// 可见性变化后的门禁同步（R10-7）：不可见 ⇒ 门禁直接回 Idle，不留挂起记录。
@@ -1858,7 +1897,7 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for WaylandState {
 
 impl Dispatch<xdg_surface::XdgSurface, ()> for WaylandState {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         xdg_surface: &xdg_surface::XdgSurface,
         event: xdg_surface::Event,
         _: &(),
@@ -1866,7 +1905,18 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for WaylandState {
         _: &QueueHandle<Self>,
     ) {
         if let xdg_surface::Event::Configure { serial } = event {
-            xdg_surface.ack_configure(serial);
+            // 归属**按对象解析**：ack 必须落回这个 surface 自己的锁存器（多窗口下不能靠
+            // `active`，同 `wl_callback` 的纪律）。
+            let Some(index) = state.window_index_for_xdg_surface(xdg_surface) else {
+                return;
+            };
+            // B10：初始 configure 立即 ack（协议：不 ack 不能 attach buffer 映射）；尺寸/状态
+            // 变化的 configure 只记账，等使用该状态渲染的帧发布后由泵 `ack_pending_configure`
+            // 发送（Qt `applyConfigureWhenPossible` 式）。
+            match state.windows[index].configure.on_surface_configure(serial) {
+                AckAction::AckNow => xdg_surface.ack_configure(serial),
+                AckAction::Defer => {}
+            }
         }
     }
 }
@@ -1891,6 +1941,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandState {
                 states,
             } => {
                 let previous = state.windows[index].size;
+                let previous_states = state.windows[index].states;
                 // 0 = 「客户端自己选」；否则用 compositor 给的建议尺寸。
                 if width > 0 && height > 0 {
                     state.windows[index].size = Size::new(width as f32, height as f32);
@@ -1900,7 +1951,13 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandState {
                 let was_configured = state.windows[index].configured;
                 state.windows[index].configured = true;
                 let size = state.windows[index].size;
+                let states_now = state.windows[index].states;
                 let window = state.windows[index].id;
+                // B10：只有**改变 buffer 状态**（尺寸 / 窗口 states）的 configure 才需要等新帧
+                // 再 ack；wm_capabilities / configure_bounds 不经过这里（它们没有重画需求）。
+                state.windows[index]
+                    .configure
+                    .on_toplevel_configure(size != previous || states_now != previous_states);
                 // R10-10：window geometry 随尺寸变化更新（与下一次 commit 一同生效）。
                 state.apply_window_geometry(index);
                 // R10-18：`xdg_toplevel.configure` 在任何状态变化时都会来（焦点、平铺、resize），

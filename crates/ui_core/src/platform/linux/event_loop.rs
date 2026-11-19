@@ -25,6 +25,11 @@
 //!   再跑 `on_close` 裁决（与 Windows / macOS 同序）；
 //! - **IME 策略**（B9）：每轮在 `event_loop.dispatch` **之前** `sync_ime_policy`：焦点离开可编辑
 //!   文本或应用 `set_ime_enabled(false)` 时，同一轮内下发 `zwp_text_input_v3.disable()`。
+//! - **configure ack 时序**（B10）：初始 configure 在 `xdg_surface` 事件里立即 ack；改变
+//!   尺寸/状态的 configure 由 [`crate::platform::wayland::configure::ConfigureLatch`] 记住
+//!   serial，等使用该状态渲染的帧发布（`App::frame` 返回 `Committed`）后才
+//!   `ack_configure`。不可见 / 没渲染器 / `Idle` 的窗口没有帧可配对，在本轮 force ack
+//!   （否则静止窗口的 configure 永远不确认）。
 
 use std::{
     sync::Arc,
@@ -340,20 +345,42 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                     match app.frame(id) {
                         None | Some(Ok(FrameOutcome::Idle)) => {
                             state.note_frame_not_committed(index);
+                            // B10：本帧没有 publish（Idle / 窗口已不在），没有「使用新状态的帧」
+                            // 可以配对 ⇒ force ack。**例外**：被帧预算门禁推迟的帧（A5）状态仍
+                            // 保留、下一拍就会真的出帧（`deferred_frames` 保证），此时不能提前
+                            // ack —— 否则 maximize 恰好撞上预算合并时又会回到「先 ack 后画」。
+                            let budget_deferred = app
+                                .window(id)
+                                .is_some_and(crate::window::Window::frame_budget_deferred);
+                            if !budget_deferred {
+                                state.ack_pending_configure(index);
+                            }
                             // A5：本帧被帧预算门禁推迟（不是空闲：脏位保留）⇒ 记进
                             // `deferred_frames`，到期后**不依赖新唤醒**补一帧（下面的 timeout 会
                             // 压到 `next_deferred_deadline`）。
-                            if app
-                                .window(id)
-                                .is_some_and(crate::window::Window::frame_budget_deferred)
-                                && !deferred_frames.contains(&id)
-                            {
+                            if budget_deferred && !deferred_frames.contains(&id) {
                                 deferred_frames.push(id);
                             }
                         }
-                        Some(Ok(FrameOutcome::Committed(_))) => {}
+                        Some(Ok(FrameOutcome::Committed(_))) => {
+                            // B10：使用 configure 状态渲染的帧已发布给 GPU 线程（present 时
+                            // `wl_surface.commit`）⇒ 现在才 ack 该 configure（Qt 式 latch）。
+                            state.ack_pending_configure(index);
+                        }
                         Some(Err(error)) => return Err(error),
                     }
+                }
+            }
+            // B10：不参与帧循环的窗口（不可见 / 还没建渲染器）永远等不到「使用新状态的帧已
+            // 发布」——在这里 force ack，否则静止窗口的 configure 会一直悬挂（compositor 可能
+            // 不完成映射 / 状态切换）。可见且已挂渲染器的窗口在帧提交或 Idle 分支 ack，不能在
+            // 这里提前发（那会回到「先 ack 后画」的旧时序）。
+            for index in 0..state.window_count() {
+                let id = state.window_id(index);
+                let renders = state.is_visible(index)
+                    && app.window(id).is_some_and(|window| window.has_renderer());
+                if !renders {
+                    state.ack_pending_configure(index);
                 }
             }
             for task in dispatcher.drain_tasks() {

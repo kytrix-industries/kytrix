@@ -18,6 +18,7 @@
 //! 编译条件与 `platform/ime` 同款：Linux 构建 + 测试构建（`cfg(test)` 让 Windows 也能测）。
 
 pub(crate) mod close;
+pub(crate) mod configure;
 pub(crate) mod cursor;
 pub(crate) mod frame_gate;
 pub(crate) mod ime;
