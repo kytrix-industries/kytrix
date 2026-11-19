@@ -95,10 +95,10 @@ use tokio::sync::{
 
 use crate::{
     error::EngineError,
-    math::{PhysicalRect, Size},
+    math::Size,
     node::id::{Arena, ArenaKey},
     paint::atlas::{AtlasKind, AtlasTile},
-    render::{AtlasAllocator, DirtyRects},
+    render::{DirtyRects, ImageAtlasPager},
     resources::{
         cache::{ContentKey, DedupeEntry, Entry, Page, VariantEntry},
         image::{DecodedImage, SourceColor},
@@ -384,11 +384,13 @@ pub struct ResourceStats {
     pub entries: usize,
     /// 图片页里已分配的 tile 数（条目与 tile 一一对应：引用计数归零即回收）。
     pub tiles: usize,
+    /// 已打开的图片图集页数（D-9 多页；0 = 还没插过图片；上限 `MAX_IMAGE_PAGES`）。
+    pub pages: usize,
     /// 存活 tile 的内容区像素总和（缩放后的最终尺寸，不含 padding）。
     pub used_pixels: u64,
     /// CPU 已用字节：图片页缓冲 + 去重表保留的源字节 + 在途解码预留。
     pub used_bytes: u64,
-    /// tile 内容区像素 / 图片页像素（`0.0..=1.0`；没有图片页时 `0.0`）。
+    /// tile 内容区像素 / 全部图片页像素（`0.0..=1.0`；没有图片页时 `0.0`）。
     pub page_occupancy: f32,
     /// 累计 [`DecodeCause::Capacity`] 失败次数（页满 / 预算不足的告警面）。
     pub capacity_errors: u64,
@@ -414,10 +416,14 @@ pub struct ResourceCache {
     pending: Arena<PendingJob, PendingResource>,
     /// `pending` 的键表（[`Arena`] 只提供按键访问，没有带键遍历）。
     pending_ids: Vec<PendingResource>,
-    /// 图片页 + 分配器：**固定用最大档**（`MAX_ATLAS_PAGE` = 2048，见 `ensure_page`），
-    /// 因此容纳能力与第一张图片的尺寸无关。没有插入过图片时不分配 CPU 页（16 MiB 量级）、
-    /// GPU 纹理与 staging。
-    page: Option<PageState>,
+    /// 图片图集的多页分配器（D-9）：每页 `MAX_ATLAS_PAGE²`，页数上限 `MAX_IMAGE_PAGES`；
+    /// 页满按需开新页、已空页按 LRU 回收。**只做分配**（不持有像素）。
+    pager: ImageAtlasPager,
+    /// 每页的 CPU 像素缓冲（下标 = 页号；`None` = 该页还没写过内容）。
+    page_buffers: Vec<Option<Page>>,
+    /// 每页最近一次使用的分配代际（页被 LRU 回收复用会换代 ⇒ CPU 页缓冲必须清零重建，
+    /// 保证新窗口整页上传时不会把上一轮的旧像素当成有效内容）。
+    page_generations: Vec<u32>,
     /// 解码任务投递用的 tokio 句柄；`None` = 无 runtime（`insert_async` 退化为同步解码）。
     runtime: Option<tokio::runtime::Handle>,
     /// 解码并发信号量：在途 blocking 解码各持有一个许可（上限 [`MAX_CONCURRENT_DECODES`]）。
@@ -441,12 +447,6 @@ pub struct ResourceCache {
     /// 仅测试：已真正开始解码的 blocking 任务数（证明准入拒绝**没有投递**）。
     #[cfg(test)]
     decode_starts: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-/// 图片页 + 它的分配器（同生同灭：页尺寸锁定后不再变化）。
-struct PageState {
-    page: Page,
-    allocator: AtlasAllocator,
 }
 
 /// 一个在途的异步解码任务。
@@ -486,7 +486,9 @@ impl ResourceCache {
             owners: ahash::HashMap::default(),
             pending: Arena::new(),
             pending_ids: Vec::new(),
-            page: None,
+            pager: ImageAtlasPager::new(),
+            page_buffers: Vec::new(),
+            page_generations: Vec::new(),
             runtime,
             decode_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
             reserved_decode_bytes: 0,
@@ -503,15 +505,24 @@ impl ResourceCache {
     }
 
     /// 仅测试：指定页尺寸 / 字节预算 / runtime 的构造器（跳过选档，便于穷尽容量与预算路径）。
+    ///
+    /// 与旧单页实现一致：构造时**预开第 0 页**（整页标脏 + CPU 页缓冲），既有「页容量/脏矩形」
+    /// 测试的初始口径不变；生产路径保持懒分配（首张图片才开页）。
     #[cfg(test)]
     fn for_test(
         page: (u32, u32),
         byte_budget: u64,
         runtime: Option<tokio::runtime::Handle>,
     ) -> Self {
+        debug_assert_eq!(page.0, page.1, "图片页必须为正方形");
         let mut cache = Self::with_runtime(runtime);
         cache.byte_budget = byte_budget;
-        cache.open_page(page.0);
+        cache.pager = ImageAtlasPager::with_page_for_test(page.0);
+        cache.pager.preopen_page_for_test();
+        cache.page_buffers.push(Some(Page::new(page.0, page.1)));
+        cache
+            .page_generations
+            .push(cache.pager.generation(0).unwrap_or(1));
         cache
     }
 
@@ -521,32 +532,16 @@ impl ResourceCache {
         Self::for_test(page, DEFAULT_BYTE_BUDGET, None)
     }
 
-    /// 建页（首次插入 / 测试注入）：整页先标记为脏，保证 GPU 侧新建纹理的其余区域是 0。
-    fn open_page(&mut self, page: u32) {
-        debug_assert!(self.page.is_none(), "图片页只建一次");
-        let mut allocator = AtlasAllocator::with_page(AtlasKind::Image, (page, page));
-        allocator.mark_written(full_page((page, page)));
-        self.page = Some(PageState {
-            page: Page::new(page, page),
-            allocator,
-        });
-    }
-
-    /// **图片页固定开最大档**（P1-2.7）。
+    /// **图片页固定最大档**（P1-2.7；D-9 起是多页）。
     ///
     /// 旧实现用 `page_for_tile(width, height)` 按**第一张**图片选档并永久锁定：先加载 16×16 图标
     /// ⇒ 页 = 512² ⇒ 之后任何 >510 px 的图必然 `Capacity`，而错误文案还让「unload 后重试」
     /// （页尺寸永不变，重试无效）。加载顺序决定整个进程的图片上限是不可接受的隐式契约。
     ///
-    /// 固定最大档后容纳能力与插入顺序无关；懒分配语义不变（没有图片就仍不占内存），代价是需要
-    /// 图片时一次性占 16 MiB —— 这本来就是文档里的图片页上限。更省内存的做法是 Skia/Impeller 式的
-    /// 多页图集（`AtlasTile` 增 `page`、三平台 `texture_index` 改纹理数组），属契约变更，留作后续。
-    fn ensure_page(&mut self) {
-        if self.page.is_none() {
-            self.open_page(crate::render::atlas::MAX_ATLAS_PAGE);
-        }
-    }
-
+    /// D-9 起每页固定最大档（2048²），容纳能力与插入顺序无关；页数按需增长到
+    /// `MAX_IMAGE_PAGES`（4 页 ≈ 14.5k 个 32² tile），已空页按 LRU 回收。懒分配语义不变
+    /// （没有图片就不占页缓冲/GPU 层）。分配器见 [`ImageAtlasPager`]。
+    ///
     /// 解码 `bytes` 并装箱，返回句柄、tile 与像素尺寸（「原始尺寸」变体）。
     ///
     /// 同一内容第二次插入是**去重命中**：不重新解码，返回同一个 [`ResourceImage`]，引用计数 +1。
@@ -925,7 +920,6 @@ impl ResourceCache {
     ) -> Result<ResourceImage, DecodeCause> {
         let color = decoded.color;
         let key = ContentKey::new(&source);
-        self.ensure_page();
         let image = self.place(decoded, key, target)?;
         // D-8 诊断面：ICC 处理结果按**解码次数**累计（去重命中不重新解码、也不重复计数）。
         match color {
@@ -986,10 +980,18 @@ impl ResourceCache {
         height: u32,
         source_len: usize,
     ) -> Result<u64, DecodeCause> {
-        // 预算口径必须包含图片页：页是懒分配的，准入时先建页才能让 `used_bytes()` 反映真实成本。
-        self.ensure_page();
+        // 预算口径必须包含图片页：页是懒分配的，准入时若还没有页，按**一页**的缓冲预留
+        // （与旧 `ensure_page` 的语义一致：单张合法图不会被自己的页成本误拒）；多页时已开的
+        // 页都计入 `used_bytes()`。
+        let (page_width, page_height) = self.page_dimensions();
+        let page_bytes = u64::from(page_width) * u64::from(page_height) * 4;
+        let pending_page_bytes = if self.pager.page_count() == 0 {
+            page_bytes
+        } else {
+            0
+        };
         let reservation = image::estimate_peak(width, height).saturating_add(source_len as u64);
-        let used = self.used_bytes();
+        let used = self.used_bytes().saturating_add(pending_page_bytes);
         if used.saturating_add(reservation) <= self.byte_budget {
             self.reserved_decode_bytes = self.reserved_decode_bytes.saturating_add(reservation);
             return Ok(reservation);
@@ -1013,7 +1015,9 @@ impl ResourceCache {
 
     /// 把解码结果装箱进图片页（预算检查已由调用方完成）。
     ///
-    /// 失败只有一种：页里放不下（[`CapacityCause::PageFull`]）；失败**不**改变既有条目与代际。
+    /// 失败只有一种：全部页都放不下（[`CapacityCause::PageFull`]）；失败**不**改变既有条目与
+    /// 代际。多页语义（D-9）：页里有空闲空间就复用；页满按需开新页；页数达 `MAX_IMAGE_PAGES`
+    /// 后按 LRU 回收**已空**的页（活 tile 永不淘汰）。
     fn place(
         &mut self,
         decoded: DecodedImage,
@@ -1022,30 +1026,41 @@ impl ResourceCache {
     ) -> Result<ResourceImage, DecodeCause> {
         let (width, height) = (decoded.width, decoded.height);
         let epoch = self.next_epoch();
-        let (allocation, page) = {
-            let state = self.page.as_mut().expect("page is ensured before placing");
-            let page = state.page.dimensions();
-            (state.allocator.allocate((width, height)), page)
-        };
-        let Some(allocation) = allocation else {
+        let Some(allocation) = self.pager.allocate((width, height)) else {
             self.capacity_errors = self.capacity_errors.saturating_add(1);
             return Err(DecodeCause::Capacity {
                 width,
                 height,
-                page,
+                page: self.page_dimensions(),
                 cause: CapacityCause::PageFull,
             });
         };
         debug_assert_eq!(allocation.tile.atlas, AtlasKind::Image);
-        {
-            let state = self.page.as_mut().expect("page is ensured before placing");
-            // padding 复用时可能残留上一块的内容：先清整块（含 padding），再写内容区。
-            state.page.clear_rect(allocation.padded);
-            state.allocator.mark_written(allocation.padded);
-            state
-                .page
-                .write(allocation.content, &decoded.bgra, width as usize * 4);
+        let page = allocation.tile.page;
+        let page_index = usize::from(page);
+        // 页缓冲：首次使用 / 页被 LRU 回收复用（分配代际改变）⇒ 重建整页（清零）。
+        let generation = self.pager.generation(page).unwrap_or(1);
+        let needs_fresh = self.page_generations.get(page_index).copied() != Some(generation)
+            || self
+                .page_buffers
+                .get(page_index)
+                .is_none_or(Option::is_none);
+        if needs_fresh {
+            let (page_width, page_height) = self.page_dimensions();
+            if self.page_buffers.len() <= page_index {
+                self.page_buffers.resize_with(page_index + 1, || None);
+                self.page_generations.resize(page_index + 1, 0);
+            }
+            self.page_buffers[page_index] = Some(Page::new(page_width, page_height));
+            self.page_generations[page_index] = generation;
         }
+        let buffer = self.page_buffers[page_index]
+            .as_mut()
+            .expect("page buffer is ensured above");
+        // padding 复用时可能残留上一块的内容：先清整块（含 padding），再写内容区。
+        buffer.clear_rect(allocation.padded);
+        buffer.write(allocation.content, &decoded.bgra, width as usize * 4);
+        self.pager.mark_written(page, allocation.padded);
         let id = self.entries.insert_with(|id| Entry {
             image: ResourceImage {
                 id,
@@ -1107,16 +1122,18 @@ impl ResourceCache {
     pub fn stats(&self) -> ResourceStats {
         let (page_width, page_height) = self.page_dimensions();
         let page_pixels = u64::from(page_width) * u64::from(page_height);
+        let pages = self.pager.page_count();
         let entries = self.entries.len();
         ResourceStats {
             entries,
             tiles: entries,
+            pages,
             used_pixels: self.used_pixels,
             used_bytes: self.used_bytes(),
-            page_occupancy: if page_pixels == 0 {
+            page_occupancy: if page_pixels == 0 || pages == 0 {
                 0.0
             } else {
-                self.used_pixels as f32 / page_pixels as f32
+                self.used_pixels as f32 / (page_pixels * pages as u64) as f32
             },
             capacity_errors: self.capacity_errors,
             color_converted: self.color_converted,
@@ -1137,20 +1154,25 @@ impl ResourceCache {
         self.len() == 0
     }
 
-    /// 图片页的当前内容（`page.0 * page.1 * 4` 字节，BGRA8 预乘 sRGB）；没插过图片时 `None`。
-    pub(crate) fn page_pixels(&self) -> Option<((u32, u32), &[u8])> {
-        self.page
-            .as_ref()
-            .map(|state| (state.page.dimensions(), state.page.bytes()))
+    /// 某页的当前内容（`page.0 * page.1 * 4` 字节，BGRA8 预乘 sRGB）；页不存在时 `None`。
+    pub(crate) fn page_pixels_at(&self, page: u16) -> Option<((u32, u32), &[u8])> {
+        let buffer = self.page_buffers.get(usize::from(page))?.as_ref()?;
+        Some((buffer.dimensions(), buffer.bytes()))
     }
 
-    /// 取走自上次上传以来被写脏的**矩形**（首次调用返回整页）；没有图片页时是空集。
+    /// 第 0 页的当前内容（单页路径的便捷入口；多页上传由 `App` 按页遍历）。
+    pub(crate) fn page_pixels(&self) -> Option<((u32, u32), &[u8])> {
+        self.page_pixels_at(0)
+    }
+
+    /// 取走某页自上次上传以来被写脏的**矩形**；页不存在时 `None`。
+    pub(crate) fn take_dirty_rects_at(&mut self, page: u16) -> Option<DirtyRects> {
+        self.pager.take_dirty_rects(page)
+    }
+
+    /// 第 0 页的待上传矩形（单页路径的便捷入口；没有页时是空集）。
     pub(crate) fn take_dirty_rects(&mut self) -> DirtyRects {
-        self.page
-            .as_mut()
-            .map_or_else(DirtyRects::default, |state| {
-                state.allocator.take_dirty_rects()
-            })
+        self.take_dirty_rects_at(0).unwrap_or_default()
     }
 
     /// 回收一条引用归零的资源：退还 tile、清零页内区域（含 padding）、从去重表删除该变体
@@ -1163,11 +1185,16 @@ impl ResourceCache {
         self.used_pixels = self
             .used_pixels
             .saturating_sub(u64::from(entry.image.width) * u64::from(entry.image.height));
-        if let Some(state) = self.page.as_mut() {
-            state.allocator.deallocate(entry.alloc);
-            state.page.clear_rect(entry.padded);
-            state.allocator.mark_written(entry.padded);
+        let page = entry.image.tile.page;
+        if let Some(buffer) = self
+            .page_buffers
+            .get_mut(usize::from(page))
+            .and_then(Option::as_mut)
+        {
+            buffer.clear_rect(entry.padded);
         }
+        self.pager.deallocate(page, entry.alloc);
+        self.pager.mark_written(page, entry.padded);
     }
 
     /// 从去重表的 `key` 内容里删掉 `(target, id)` 这一个变体；变体全部归零才删条目、释放源字节
@@ -1191,20 +1218,15 @@ impl ResourceCache {
     }
 
     fn page_dimensions(&self) -> (u32, u32) {
-        self.page
-            .as_ref()
-            .map_or((0, 0), |state| state.page.dimensions())
+        let size = self.pager.page_size();
+        (size, size)
     }
 
     fn used_bytes(&self) -> u64 {
         let (width, height) = self.page_dimensions();
-        u64::from(width) * u64::from(height) * 4 + self.source_bytes + self.reserved_decode_bytes
+        let page_bytes = u64::from(width) * u64::from(height) * 4;
+        page_bytes * self.pager.page_count() as u64 + self.source_bytes + self.reserved_decode_bytes
     }
-}
-
-/// 整页矩形（`mark_written` 的入参）。
-fn full_page(page: (u32, u32)) -> PhysicalRect {
-    PhysicalRect::new(0, 0, page.0 as i32, page.1 as i32)
 }
 
 #[cfg(test)]
@@ -1220,7 +1242,7 @@ mod tests {
     use crate::{
         error::EngineError,
         math::{PhysicalRect, Size},
-        paint::atlas::AtlasKind,
+        paint::atlas::{AtlasKind, MAX_IMAGE_PAGES},
         resources::image::{MAX_SOURCE_BYTES, MAX_SOURCE_DIM, MAX_SOURCE_PIXELS},
         window::WindowId,
     };
@@ -1444,31 +1466,61 @@ mod tests {
         assert_eq!(cache.len(), 2);
     }
 
+    /// 逐张插入不同颜色的 6×6 PNG，直到容量失败；返回成功插入的 image 列表与失败原因。
+    ///
+    /// 页尺寸固定 8×8：6×6 内容 + 2 padding 恰好占满一页，因此这个循环会按页增长地把
+    /// `MAX_IMAGE_PAGES` 页全部用满（不依赖 etagere 的具体装箱取整细节）。
+    fn fill_until_capacity(cache: &mut ResourceCache) -> (Vec<ResourceImage>, u64, DecodeCause) {
+        let mut images = Vec::new();
+        let mut source_bytes = 0u64;
+        let mut value = 1u8;
+        loop {
+            let bytes = png(
+                6,
+                6,
+                [value, value.wrapping_mul(3), value.wrapping_mul(5), 255],
+            );
+            match cache.insert(&bytes) {
+                Ok(image) => {
+                    images.push(image);
+                    source_bytes += bytes.len() as u64;
+                    value = value.wrapping_add(1);
+                }
+                Err(error) => return (images, source_bytes, decode_cause(error)),
+            }
+        }
+    }
+
     #[test]
     fn insert_reports_capacity_with_sizes() {
-        // 8×8 的页：一块 4×4（+2 padding = 6×6）之后放不下第二块。
+        // D-9 多页：必须把 `MAX_IMAGE_PAGES` 页全部填满才报 PageFull。
         let mut cache = ResourceCache::with_page_for_test((8, 8));
-        let _ = inserted(&mut cache, [7, 7, 7, 255]);
-        let error = decode_cause(insert_error(&mut cache, &png(4, 4, [8, 8, 8, 255])));
+        let (images, _source, error) = fill_until_capacity(&mut cache);
+        assert!(!images.is_empty());
+        assert_eq!(
+            cache.stats().pages,
+            usize::from(MAX_IMAGE_PAGES),
+            "容量失败前必须真的把每一页都用上"
+        );
         assert_eq!(
             error,
             DecodeCause::Capacity {
-                width: 4,
-                height: 4,
+                width: 6,
+                height: 6,
                 page: (8, 8),
                 cause: CapacityCause::PageFull,
             }
         );
-        assert_eq!(cache.len(), 1, "容量失败不改变既有条目");
+        assert_eq!(cache.len(), images.len(), "容量失败不改变既有条目");
         assert_eq!(cache.stats().capacity_errors, 1, "容量失败要计数（诊断面）");
     }
 
     #[test]
     fn capacity_failure_does_not_bump_generation() {
         let mut cache = ResourceCache::with_page_for_test((8, 8));
-        let image = inserted(&mut cache, [9, 9, 9, 255]);
+        let (images, _source, _error) = fill_until_capacity(&mut cache);
+        let image = images[0];
         let generation = image.tile.generation;
-        let _ = insert_error(&mut cache, &png(4, 4, [1, 1, 1, 255]));
 
         assert_eq!(
             cache
@@ -1480,6 +1532,94 @@ mod tests {
             image.tile
         );
         assert!(!image.tile.is_stale(generation), "容量失败不换代（F-140）");
+    }
+
+    /// D-9：多页图集——单页放满后自动开新页，页号从 0 开始逐个使用。
+    #[test]
+    fn image_atlas_grows_to_multiple_pages() {
+        let mut cache = ResourceCache::with_page_for_test((8, 8));
+        let (images, source, _error) = fill_until_capacity(&mut cache);
+        let mut pages: Vec<u16> = images.iter().map(|image| image.tile.page).collect();
+        pages.sort_unstable();
+        pages.dedup();
+        assert_eq!(
+            pages,
+            (0..MAX_IMAGE_PAGES).collect::<Vec<_>>(),
+            "每一页都必须被使用（页号 0..MAX_IMAGE_PAGES）"
+        );
+        let stats = cache.stats();
+        assert_eq!(stats.pages, usize::from(MAX_IMAGE_PAGES));
+        assert_eq!(stats.tiles, images.len());
+        // 页缓冲按页常驻：4 × 8² × 4 B + 全部存活变体的源字节。
+        assert_eq!(stats.used_bytes, 4 * 8 * 8 * 4 + source);
+        let expected = (images.len() as f32 * 36.0) / (f32::from(MAX_IMAGE_PAGES) * 64.0);
+        assert!(
+            (stats.page_occupancy - expected).abs() < 1e-6,
+            "占用率按全部页数计：{} vs {expected}",
+            stats.page_occupancy
+        );
+    }
+
+    /// D-9：活 tile 永不淘汰；只有**已空**的页按 LRU 回收复用（页号保持稳定）。
+    #[test]
+    fn empty_pages_are_recycled_lru() {
+        let mut cache = ResourceCache::with_page_for_test((8, 8));
+        let (images, _source, _error) = fill_until_capacity(&mut cache);
+        assert_eq!(cache.stats().pages, usize::from(MAX_IMAGE_PAGES));
+        // 选一个非 0 页的 tile 释放，让它的页成为唯一空闲页。
+        let victim = images
+            .iter()
+            .find(|image| image.tile.page == 1)
+            .copied()
+            .expect("page 1 must be used");
+        assert!(cache.unload(victim.id));
+        let new_image = cache
+            .insert(&png(6, 6, [9, 9, 9, 255]))
+            .expect("已空页必须被回收复用");
+        assert_eq!(
+            new_image.tile.page, victim.tile.page,
+            "已空页必须被回收复用（页号稳定）"
+        );
+        assert_eq!(
+            cache.stats().pages,
+            usize::from(MAX_IMAGE_PAGES),
+            "回收复用不得增加页数"
+        );
+        assert_ne!(
+            new_image.tile.generation, victim.tile.generation,
+            "回收复用必须换代"
+        );
+    }
+
+    /// D-9：每页有独立的 CPU 页缓冲与脏矩形（多页上传的数据面）。
+    #[test]
+    fn page_buffers_and_dirty_rects_are_per_page() {
+        let mut cache = ResourceCache::with_page_for_test((8, 8));
+        let first = cache.insert(&png(6, 6, [11, 22, 33, 255])).expect("first");
+        let second = cache.insert(&png(6, 6, [44, 55, 66, 255])).expect("second");
+        assert_eq!((first.tile.page, second.tile.page), (0, 1));
+        // 清掉两页的待上传矩形后，只写第 3 页：只有第 3 页脏。
+        let _ = cache.take_dirty_rects_at(0);
+        let _ = cache.take_dirty_rects_at(1);
+        let third = cache.insert(&png(6, 6, [77, 88, 99, 255])).expect("third");
+        assert_eq!(third.tile.page, 2);
+        assert!(
+            cache
+                .take_dirty_rects_at(2)
+                .is_some_and(|rects| !rects.is_empty())
+        );
+        assert!(
+            cache
+                .take_dirty_rects_at(0)
+                .is_some_and(|rects| rects.is_empty())
+        );
+        // 页缓冲按页可寻址，内容在各自页里。
+        let (dims, pixels) = cache.page_pixels_at(1).expect("page 1 buffer");
+        assert_eq!(dims, (8, 8));
+        let origin_x = (second.tile.u0 * 8.0).round() as usize;
+        let origin_y = (second.tile.v0 * 8.0).round() as usize;
+        let offset = (origin_y * 8 + origin_x) * 4;
+        assert_eq!(&pixels[offset..offset + 4], &[66, 55, 44, 255]);
     }
 
     #[test]
@@ -1790,6 +1930,7 @@ mod tests {
             ResourceStats {
                 entries: 0,
                 tiles: 0,
+                pages: 1,
                 used_pixels: 0,
                 used_bytes: 16 * 16 * 4,
                 page_occupancy: 0.0,
