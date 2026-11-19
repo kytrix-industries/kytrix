@@ -769,12 +769,16 @@ fn rasterize_parley(
                     let mut glyphs = Vec::new();
                     for glyph in run.positioned_glyphs() {
                         if glyph.id == 0 {
+                            // 缺字形**不能静默跳过**：与 Chrome/Skia 一致，画该 run 字体的
+                            // `.notdef` 占位（tofu 方框），至少让用户看得见「这里缺字」。
+                            // `.notdef` 的 glyph id 恒为 0，与正常字形共用 `emit_glyph` 的
+                            // 图集路径/负缓存键，因此重复缺失只会光栅一次；字体没有 `.notdef`
+                            // 轮廓时 `emit_glyph` 返回 `None`，此时只剩诊断（旧行为）。
                             diagnostics.push(TextDiagnostic::MissingGlyph {
                                 font: font_label(&font),
                                 glyph: glyph.id,
                                 text_range: text_range.clone(),
                             });
-                            continue;
                         }
                         let Some((positioned, color_glyph)) =
                             emit_glyph(ctx, &font, glyph.id, ppem, &variation, glyph.x, glyph.y)?
@@ -1087,8 +1091,8 @@ mod tests {
 
     use super::family_list;
     use crate::text::{
-        FontStack, InlineAlign, InlineBoxSpec, ShapedTextItem, TextAlign, TextContent, TextStyle,
-        TextWrap,
+        FontStack, InlineAlign, InlineBoxSpec, ShapedTextItem, TextAlign, TextContent,
+        TextDiagnostic, TextStyle, TextWrap,
     };
 
     struct Harness {
@@ -2176,6 +2180,57 @@ mod tests {
         );
         let _ = shaped.measure(none_known(), definite(width * 0.5));
         assert_eq!(shaped.measure_breaks(), 2, "换宽度才允许再次断行");
+    }
+
+    /// D-4：缺字形（glyph id 0）不得静默消失 —— 与 Chrome/Skia 一致，画该 run 字体的
+    /// `.notdef` 占位（tofu 方框），同时保留 `MissingGlyph` 诊断。
+    ///
+    /// 回归：旧实现对 `glyph.id == 0` 直接 `continue`，字符从绘制里消失（只剩诊断）。
+    #[test]
+    fn missing_glyph_draws_notdef_instead_of_vanishing() {
+        // U+10FFFD：私用面 16 的码位，宿主字体栈几乎不可能覆盖。
+        const RARE: &str = "\u{10FFFD}";
+        let mut harness = Harness::new();
+        let shaped = harness.shape(RARE, TextStyle::new(16.0));
+        let width = shaped.max_content_size().width.max(32.0);
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (line, diagnostics, stats) =
+            rasterize_line(&shaped, width, 1.0, &mut raster, &mut glyphs, &mut atlas);
+
+        let missing = diagnostics
+            .iter()
+            .filter(|diagnostic| matches!(diagnostic, TextDiagnostic::MissingGlyph { .. }))
+            .count();
+        if missing == 0 {
+            eprintln!("skip: host font stack covers U+10FFFD");
+            return;
+        }
+        assert!(missing >= 1, "缺字形必须有 MissingGlyph 诊断");
+        // 「确实尝试光栅 .notdef」的独立证据：图集至少 miss 一次。旧实现对 glyph 0 直接
+        // `continue`，图集一次都没碰（misses == 0）⇒ 没有这条断言时「字体无轮廓」的
+        // 合法空结果会和「实现根本没画」混为一谈。
+        assert!(
+            stats.misses > 0,
+            "缺字形必须走图集（.notdef 光栅）路径，实际统计 {stats:?}"
+        );
+
+        let rendered = all_glyphs(&line);
+        if rendered.is_empty() {
+            // 图集已尝试光栅但字体没有 `.notdef` 轮廓：允许不出像素，诊断必须仍在（已断言）。
+            eprintln!("skip: host font has no .notdef outline");
+            return;
+        }
+        assert_eq!(
+            rendered.len(),
+            1,
+            "单字符文本必须产出 1 个 .notdef 占位字形（旧实现为 0）：{rendered:?}"
+        );
+        let placeholder = rendered[0];
+        assert!(
+            placeholder.size.width > 0.0 && placeholder.size.height > 0.0,
+            "`.notdef` 占位必须有正尺寸：{:?}",
+            placeholder.size
+        );
     }
 
     /// R12-9：`NoWrap + Overflow::Ellipsis` 必须在超宽时截断并追加省略号字形。
