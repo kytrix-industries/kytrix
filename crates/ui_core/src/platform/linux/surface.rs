@@ -1730,8 +1730,9 @@ impl WaylandState {
         // seat 事件没有 surface 归属：派发给**焦点窗口**（active）。
         let window = self.windows[self.active].id;
         // B4：先取组合态，再按可见性决定是否投递裸 `Key`（首键启动组合的残余风险见函数文档）。
+        // RB-02：抬起始终投递（`App::held_keys` 只由 Up 清除；组合期吞 up 会让 held 永久残留）。
         let composing = self.windows[self.active].ime.composing();
-        if input::key_visible_while_composing(self.modifiers, composing) {
+        if input::key_delivered(state, self.modifiers, composing) {
             self.events.push((
                 window,
                 Event::Input(InputEvent::Key {

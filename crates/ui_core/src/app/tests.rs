@@ -1524,6 +1524,30 @@ fn ime_cursor_area_requires_text_shape_and_can_be_cleared() {
     );
 }
 
+/// RB-03（用户裁决「焦点移走/窗口失焦统一清 caret hint」）：窗口失焦必须清 IME hint。
+///
+/// 变异检查：删掉 `on_window_focus_lost` 里的 `clear_ime_cursor_request` 调用 ⇒ 本测试红。
+#[test]
+fn losing_window_focus_clears_the_ime_cursor_hint() {
+    let (_rt, mut app, window, node) = text_app("abc", None);
+    let _ = refresh(&mut app, window);
+    let _ = layout(&mut app, window);
+    let _ = text_layout(&mut app, window);
+    assert!(app.set_ime_cursor_area(window, node, 1).is_ok());
+    assert!(
+        app.ime_cursor_area(window).expect("窗口存在").is_some(),
+        "前置：失焦前应有 caret hint"
+    );
+
+    app.dispatch(window, crate::event::Event::FocusChanged { focused: false });
+
+    assert_eq!(
+        app.ime_cursor_area(window).expect("窗口存在"),
+        None,
+        "窗口失焦后 caret hint 必须清空（三端统一清场）"
+    );
+}
+
 #[test]
 fn ime_cursor_area_resolves_after_the_first_frame() {
     let (_rt, mut app, window, node) = text_app("abc", None);

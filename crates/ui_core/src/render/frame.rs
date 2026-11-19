@@ -442,11 +442,12 @@ pub(crate) struct FrameFeedback {
     ///   与 `completed_at` 取 max（两个下界取 max 仍是下界）后发布：因此该值**经常等于
     ///   `completed_at`**（GPU 完成早于本帧自己的 vblank 时，帧统计只能证明「至少已经完成」）。
     ///   拿不到统计 / `DXGI_ERROR_FRAME_STATISTICS_DISJOINT` ⇒ `None`（不猜刷新率、不伪造）。
-    /// - Linux（A4 数据面已就绪）：`wp_presentation_feedback.presented` 的呈现时钟时间戳
-    ///   （`CLOCK_MONOTONIC`/`CLOCK_REALTIME`，经 `clock_gettime`+`Instant::now()` 锚点换算，
+    /// - Linux：`wp_presentation_feedback.presented` 的呈现时钟时间戳（`CLOCK_MONOTONIC`/
+    ///   `CLOCK_REALTIME`，经 `clock_gettime`+`Instant::now()` 锚点换算，
     ///   `render::present_evidence::presented_event_instant`），`discarded` ⇒ `None`。
-    ///   **当前生产接线尚未启用**（见审查报告 A4 降级说明）：Linux 生产路径仍如实为 `None`，
-    ///   不伪造。纯逻辑（换算 + `PresentationInbox` 跨线程邮箱）已落地并有单测。
+    ///   **生产已接线**（GPU 线程 present 前请求 feedback → UI 线程派发 → `Window` 呈现历史
+    ///   回填）；缺 `wp_presentation` 的合成器记豁免、如实 `None`（不伪造）。换算锚点先取
+    ///   `Instant` 再读时钟，保证结果为真实上屏时刻的**下界**（RB-04）。
     pub presented_at: Option<Instant>,
     /// `completed_at - published_at`：UI 线程发布本帧到 **GPU 工作完成**的时长。
     ///

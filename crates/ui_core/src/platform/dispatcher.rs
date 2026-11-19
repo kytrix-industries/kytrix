@@ -78,6 +78,12 @@ pub(crate) struct Dispatcher {
     /// Linux 的模态由应用层 / compositor 表达），其它平台不编译该字段与方法。
     #[cfg(windows)]
     modal_loops: AtomicU32,
+    /// `wake_later` 是否已挂起一个延迟唤醒（Windows；RB-14 的推迟帧兜底）。
+    ///
+    /// 电平信号：已挂起时新的 `wake_later` 直接合并（迟到的唤醒会在主线程重新判定是否仍需
+    /// 再挂一次），避免每次模态 tick 都起一个线程。
+    #[cfg(windows)]
+    wake_later_armed: AtomicBool,
 }
 
 impl Dispatcher {
@@ -95,6 +101,8 @@ impl Dispatcher {
             thread: AtomicU32::new(0),
             #[cfg(windows)]
             modal_loops: AtomicU32::new(0),
+            #[cfg(windows)]
+            wake_later_armed: AtomicBool::new(false),
         })
     }
 
@@ -137,6 +145,34 @@ impl Dispatcher {
     /// 取走「有一帧要画」的信号（主线程，取走即清零）。
     pub(crate) fn take_frame_wake(&self) -> bool {
         self.frame_pending.swap(false, Ordering::AcqRel)
+    }
+
+    /// 延迟 `delay` 后再 [`Self::wake`]（Windows 模态 tick 的推迟帧兜底；RB-14）。
+    ///
+    /// 背景：系统 move / size 模态循环里泵不运行、也不 `sync` 帧节拍线程（`FramePacer`）。
+    /// `ModalTick` 用普通预算门禁出帧，若本拍有窗口的帧被推迟（预算 `deferred`），而节拍线程
+    /// 恰好未运行，就没有任何后续唤醒——该帧要等松手或下一次外部唤醒才上屏。模态 tick 在
+    /// 检测到 `App::has_deferred_frames()` 时挂一次延迟唤醒，让被推迟的帧在下一拍被重新判定。
+    ///
+    /// 合并：同一时刻最多挂一个线程（`wake_later_armed` 电平信号）；延迟取「远小于一个 refresh
+    /// 周期」的值即可（到达后若仍被推迟，模态 tick 会再挂一次），不会自激成忙循环。
+    #[cfg(windows)]
+    pub(crate) fn wake_later(self: &Arc<Self>, delay: std::time::Duration) {
+        if self.wake_later_armed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let dispatcher = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("kytrix-wake-later".to_owned())
+            .spawn(move || {
+                std::thread::sleep(delay);
+                dispatcher.wake_later_armed.store(false, Ordering::Release);
+                dispatcher.wake();
+            });
+        if spawned.is_err() {
+            // 起线程失败：清掉挂起标记，退化为「不补拍」（下一次外部唤醒仍会出帧）。
+            self.wake_later_armed.store(false, Ordering::Release);
+        }
     }
 
     /// 进入一层系统模态循环（Windows `WM_ENTERSIZEMOVE`；B1）。
@@ -184,7 +220,7 @@ impl Dispatcher {
     /// **证据边界**：这里只读 `frame_pending` 电平位，证明「生产者置了位」；真实
     /// `CFRunLoopSourceSignal` / `CFRunLoopWakeUp` 的投递由 mac 真机
     /// `acceptance window --seconds 8 --hz 1`（静止窗口每拍恢复上屏）人工验证。
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(all(test, any(target_os = "macos", windows)))]
     pub(crate) fn has_pending_wake(&self) -> bool {
         self.frame_pending.load(Ordering::Acquire)
     }
@@ -301,6 +337,38 @@ mod tests {
         dispatcher.take_frame_wake();
         dispatcher.wake();
         assert_eq!(POSTS.load(Ordering::SeqCst), 2);
+    }
+
+    /// RB-14：模态 tick 的推迟帧兜底 —— `wake_later` 只在延迟后置位一次唤醒；重复挂起合并成
+    /// 一个线程/一次 post（不得立即 post，也不得每次模态 tick 都起线程）。
+    #[cfg(windows)]
+    #[test]
+    fn wake_later_posts_once_after_the_delay_and_coalesces() {
+        let _guard = lock();
+        POSTS.store(0, Ordering::SeqCst);
+        let dispatcher = Dispatcher::with_post(counting_post);
+
+        dispatcher.wake_later(std::time::Duration::from_millis(5));
+        dispatcher.wake_later(std::time::Duration::from_millis(5));
+        assert_eq!(
+            POSTS.load(Ordering::SeqCst),
+            0,
+            "延迟唤醒不得在延迟到达前 post"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !dispatcher.has_pending_wake() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            dispatcher.has_pending_wake(),
+            "延迟唤醒必须在 2 s 内到达（否则被推迟的帧要等松手才上屏）"
+        );
+        assert_eq!(
+            POSTS.load(Ordering::SeqCst),
+            1,
+            "两次挂起必须合并成一次 post"
+        );
     }
 
     #[test]

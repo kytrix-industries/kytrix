@@ -127,7 +127,6 @@ impl ConfigureLatch {
             // 要求立即 ack 才能 attach buffer —— 初值不参与 defer 判定。
             self.phase = Phase::Mapped;
             self.changed = false;
-            self.changed = false;
             return AckAction::AckNow;
         }
         if self.changed {

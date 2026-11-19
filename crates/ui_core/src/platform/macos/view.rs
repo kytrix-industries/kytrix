@@ -226,23 +226,22 @@ define_class!(
             if let Some(context) = self.inputContext() {
                 context.handleEvent(event);
             }
-            // B4：抬起遵循与按下相同的组合期判定（组合中不投递裸 `Key`，命令修饰键仍投递）。
-            // 这里**不**把 `handleEvent:` 的返回值当「被消费」信号：它只对按下有意义，而一个
-            // 被吞掉的 up 会让应用 `held_keys` 永久卡住（up 只负责清除按下状态）。
+            // B4/RB-02：抬起**始终**投递裸 `Key`（组合期也不例外）。
+            //
+            // 抬起不产生正文（`Text` 判定只认 Down），应用侧只拿它清 `held_keys`。组合期若把
+            // 抬起也吞掉（首键按下 → 组合开始 → 抬起），应用的「按住」状态会永久残留
+            // （`App::key_down` 长期 true）。Win32 同样只替换按下的 `VK_PROCESSKEY`，抬起以真
+            // 实 `VK_*` 到达 —— 三端在这里语义对齐。`handleEvent:` 的返回值也不作为抬起判据：
+            // 它只对按下有意义。
             let modifiers = self.modifiers();
-            let composing = self.ivars().ime.borrow().has_marked();
-            let command_modifiers =
-                modifiers.intersects(Modifiers::CONTROL | Modifiers::ALT | Modifiers::META);
-            if key_visible(false, composing, command_modifiers) {
-                self.push_event(Event::Input(InputEvent::Key {
-                    code: key_code(event.keyCode()),
-                    state: KeyState::Up,
-                    // 抬起没有重复语义。
-                    repeat: false,
-                    modifiers,
-                    timestamp: event_timestamp(event),
-                }));
-            }
+            self.push_event(Event::Input(InputEvent::Key {
+                code: key_code(event.keyCode()),
+                state: KeyState::Up,
+                // 抬起没有重复语义。
+                repeat: false,
+                modifiers,
+                timestamp: event_timestamp(event),
+            }));
         }
 
         #[unsafe(method(flagsChanged:))]

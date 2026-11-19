@@ -278,8 +278,10 @@ pub struct WindowOptions {
     pub owner: Option<WindowId>,
     /// 是否为 owner 的**模态**窗口（X1）。
     ///
-    /// 模态窗口打开期间，所属 owner（及其拥有的其它窗口）**不接收输入**，直到模态窗口关闭。
-    /// 模态必须是 owned 窗口（[`Self::owner`] 为 `Some`）；`modal == true` 而 `owner == None`
+    /// 模态窗口打开期间，**直接 owner**（`owner` 字段指向的窗口）**不接收输入**，直到模态窗口
+    /// 关闭。拦截面与 Windows 原生 `EnableWindow(owner, FALSE)` 一致：只作用于 owner 本身，
+    /// **不**连带 owner 拥有的其它 owned 窗口（它们不是 `WS_CHILD`）。模态必须是 owned 窗口
+    /// （[`Self::owner`] 为 `Some`）；`modal == true` 而 `owner == None`
     /// ⇒ 降级为普通窗口并写诊断（不 panic）。
     ///
     /// 平台语义（用户裁决 X1）：
@@ -1243,7 +1245,7 @@ impl Window {
 
     // ── X2：自绘标题栏拖动区（Chrome / Electron `-webkit-app-region: drag` 模型） ──
 
-    /// 设置自绘标题栏的**可拖动区域**（X2；三端语义见 [`Self::set_drag_regions`] 的表格）。
+    /// 设置自绘标题栏的**可拖动区域**（X2；三端原生路径见下方列表）。
     ///
     /// 区域是**逻辑窗口坐标**（客户区左上角为原点，x 右 y 下），可以有多个（顶部条带 + 侧栏
     /// 把手）；传空切片清空。引擎不自动跟随布局：应用在布局/尺寸变化后重新调用（Chrome

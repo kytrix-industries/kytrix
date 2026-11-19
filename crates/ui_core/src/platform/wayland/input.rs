@@ -16,7 +16,7 @@
 //!
 //! 编译条件与同目录其它纯逻辑模块相同：Linux 构建 + 测试构建（`cfg(test)` 让 Windows 也能测）。
 
-use crate::event::{Modifiers, PointerButton};
+use crate::event::{KeyState, Modifiers, PointerButton};
 
 /// `wl_pointer.button` 的 evdev 码 → 引擎 [`PointerButton`]。
 ///
@@ -77,10 +77,25 @@ pub(crate) fn key_visible_while_composing(modifiers: Modifiers, composing: bool)
     )
 }
 
+/// B4 / RB-02：Linux 一次按键事件（按下或抬起）是否投递裸 [`crate::event::InputEvent::Key`]。
+///
+/// **抬起（`KeyState::Up`）始终投递**，组合期也不例外。原因：应用的「按住」状态
+/// （`App::held_keys`）只由 `KeyState::Up` 清除（失焦/关窗才会另外清场）。Wayland 没有同步的
+/// 「本键被 IME 消费」信号，首键启动组合时按下必然投递（见 [`key_visible_while_composing`] 的
+/// 残余风险），而 preedit 出现后的抬起若也被组合期判定吞掉，`held_keys` 就会把该键永久留成
+/// 「按下」——`App::key_down` 长期返回 true（HFT 应用的「按住」语义直接出错）。
+///
+/// 与 Win32 语义对齐：`WM_KEY*` 只把**按下**换成 `VK_PROCESSKEY`，抬起仍以真实 `VK_*` 到达
+/// （只影响绑定/动作派发，不产生正文；`Text` 通路仍由 `should_emit_text` 判 Down）。
+#[must_use]
+pub(crate) fn key_delivered(state: KeyState, modifiers: Modifiers, composing: bool) -> bool {
+    matches!(state, KeyState::Up) || key_visible_while_composing(modifiers, composing)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{key_visible_while_composing, pointer_button};
-    use crate::event::{Modifiers, PointerButton};
+    use super::{key_delivered, key_visible_while_composing, pointer_button};
+    use crate::event::{KeyState, Modifiers, PointerButton};
 
     /// B7 全表：evdev `BTN_*` → 三端一致的 `PointerButton`。
     #[test]
@@ -183,5 +198,39 @@ mod tests {
         assert!(key_visible_while_composing(Modifiers::empty(), false));
         assert!(key_visible_while_composing(Modifiers::SHIFT, false));
         assert!(key_visible_while_composing(Modifiers::CONTROL, false));
+    }
+
+    /// RB-02 回归：组合期只抑制**按下**，抬起必须投递 —— 否则「组合首键按下 → preedit 出现
+    /// → 抬起被吞」会把 `App::held_keys` 永久留成按下。
+    ///
+    /// 变异检查：把 [`key_delivered`] 改成 `key_visible_while_composing(...)`（Up 也套同一判定）
+    /// ⇒ 本测试红。
+    #[test]
+    fn a_composing_key_up_is_still_delivered() {
+        for modifiers in [
+            Modifiers::empty(),
+            Modifiers::SHIFT,
+            Modifiers::CONTROL,
+            Modifiers::ALT | Modifiers::SHIFT,
+        ] {
+            assert!(
+                key_delivered(KeyState::Up, modifiers, true),
+                "组合期抬起必须投递（held_keys 收敛；modifiers={modifiers:?}）"
+            );
+            assert!(
+                key_delivered(KeyState::Up, modifiers, false),
+                "普通抬起必须投递（modifiers={modifiers:?}）"
+            );
+        }
+    }
+
+    /// RB-02 真值表补齐：组合期按下仍按 B4 抑制（无命令修饰键）/ 投递（命令修饰键）；
+    /// 普通按下投递。
+    #[test]
+    fn key_delivered_keeps_the_down_truth_table() {
+        assert!(!key_delivered(KeyState::Down, Modifiers::empty(), true));
+        assert!(!key_delivered(KeyState::Down, Modifiers::SHIFT, true));
+        assert!(key_delivered(KeyState::Down, Modifiers::CONTROL, true));
+        assert!(key_delivered(KeyState::Down, Modifiers::empty(), false));
     }
 }

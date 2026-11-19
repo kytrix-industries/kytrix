@@ -21,11 +21,16 @@
 //!
 //! ## 失败策略
 //!
-//! `DwmSetWindowAttribute` 失败（DWM 异常、远程会话的合成器变体）⇒ 返回 `false` + 调试诊断，
-//! **不 panic、不影响窗口创建与交互**：标题栏回落到系统默认亮色。Windows 11 门禁
+//! `DwmSetWindowAttribute` 失败（DWM 异常、远程会话的合成器变体）⇒ 返回 `false` + 一次性
+//! 诊断，**不 panic、不影响窗口创建与交互**：标题栏回落到系统默认亮色。Windows 11 门禁
 //! （[`super::version`]）保证属性号 20 合法，不需要 Win10 的 19/20 双属性号兼容。
+//! 注意：不得在失败路径用 `debug_assert!`（debug 构建会在 DWM 异常环境建窗即 panic，
+//! 与降级契约矛盾；RB-16）。
 
-use std::mem::size_of;
+use std::{
+    mem::size_of,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use windows::{
     Win32::{
@@ -81,15 +86,20 @@ pub(crate) fn set_titlebar(hwnd: HWND, dark: bool) -> bool {
     };
     if let Err(error) = result {
         // 不 panic：DWM 不可用（远程会话 / 合成器变体）时窗口仍必须可用，标题栏退回系统默认。
-        // 调试构建下断言失败点，便于真机测试立刻暴露「属性号写错 / DWM 异常」。
-        debug_assert!(
-            false,
-            "DwmSetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE={dark}) 失败：{error:?}"
-        );
+        // 诊断只打一次（建窗 + 每次主题切换都会走这里，不刷屏）。
+        if !WINDOW_ATTRIBUTE_FAILURE_REPORTED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "kytrix: DwmSetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE={dark}) failed: \
+                 {error:?}; the titlebar keeps the system default color (window remains usable)"
+            );
+        }
         return false;
     }
     true
 }
+
+/// `DwmSetWindowAttribute` 失败诊断的一次性开关（RB-16：degrade, never panic）。
+static WINDOW_ATTRIBUTE_FAILURE_REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// 消费者：`current` / 注册表键名。
 fn wide(text: &str) -> Vec<u16> {

@@ -219,6 +219,16 @@ impl ResizeFrameDriver {
                 Some(Err(error)) => return Some(error),
             }
         }
+        // RB-14：模态循环里泵不运行、也不 `sync` 帧节拍线程（`FramePacer`）。若本拍有窗口的帧被
+        // 「每 refresh 最多一帧」预算推迟，就补一次**延迟唤醒**（远小于一个 refresh 周期），
+        // 让被推迟的帧在下一拍被重新判定；否则该帧要等松手/下一次外部唤醒才上屏（拖动尾部
+        // 丢一帧）。`wake_later` 是电平信号，合并成最多一个线程，被放行后不再挂。
+        if app.has_deferred_frames() {
+            dispatcher.wake_later(DEFERRED_WAKE_RETRY);
+        }
         None
     }
 }
+
+/// 推迟帧的重试唤醒延迟：远小于一个 refresh 周期即可（到达后仍推迟则模态 tick 再挂一次）。
+const DEFERRED_WAKE_RETRY: std::time::Duration = std::time::Duration::from_millis(4);

@@ -41,7 +41,7 @@
 //! compositor 没有 `wp_presentation`（或时钟域不可用 / 时间戳被判据拒绝）时，`presented_at`
 //! 如实保持 `None` 并计数 + 一次性诊断；不拿 `completed_at` 或别的时刻顶替。
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use wayland_client::{
     QueueHandle,
@@ -51,6 +51,7 @@ use wayland_protocols::wp::presentation_time::client::wp_presentation::WpPresent
 
 use super::surface::WaylandState;
 use crate::{
+    platform::wayland::presentation::{PresentationValidity, SharedPresentationValidity},
     render::present_evidence::presented_event_instant,
     window::{FrameIndex, WindowId},
 };
@@ -96,6 +97,9 @@ pub(crate) enum Exemption {
     /// presented 事件的帧归属/顺序不可信（非递增，见
     /// [`PresentedOrder`](crate::platform::wayland::presentation::PresentedOrder)）。
     Unmatched,
+    /// `wp_presentation` global 在运行期被 compositor 移除（`global_remove`）：已下发的
+    /// [`PresentationHandle`] 严格失效，`presented_at` 如实 None（RB-05；不静默 no-op）。
+    ProtocolRemoved,
 }
 
 /// 各类豁免的计数 + 一次性诊断。
@@ -108,6 +112,7 @@ pub(crate) struct Exemptions {
     clock_unavailable: u64,
     rejected: u64,
     unmatched: u64,
+    protocol_removed: u64,
 }
 
 impl Exemptions {
@@ -118,6 +123,7 @@ impl Exemptions {
             Exemption::ClockUnavailable => &mut self.clock_unavailable,
             Exemption::Rejected => &mut self.rejected,
             Exemption::Unmatched => &mut self.unmatched,
+            Exemption::ProtocolRemoved => &mut self.protocol_removed,
         };
         *count = count.saturating_add(1);
         if *count == 1 {
@@ -139,6 +145,11 @@ impl Exemptions {
                     "kytrix: wp_presentation presented event is out of submission order \
                      (stale binding); evidence dropped for that frame"
                 ),
+                Exemption::ProtocolRemoved => eprintln!(
+                    "kytrix: wp_presentation global was removed at runtime; existing presented \
+                     feedback handles are strictly invalidated (presented_at stays None for \
+                     windows rendered before the removal; recreate the window renderer to retry)"
+                ),
             }
         }
     }
@@ -157,6 +168,10 @@ pub(crate) struct Presentation {
     global_name: Option<u32>,
     /// compositor 宣告的呈现时钟域（`wp_presentation.clock_id`；`None` = 还没收到）。
     clock_id: Option<i32>,
+    /// 已下发给 GPU 线程的句柄是否仍有效（RB-05：`global_remove` 后严格失效）。
+    ///
+    /// `None` = 还没向任何渲染器下发过句柄；首次下发时创建并在后续句柄间共享。
+    validity: Option<SharedPresentationValidity>,
     /// 豁免计数 / 一次性诊断。
     exemptions: Exemptions,
 }
@@ -167,6 +182,7 @@ impl Presentation {
             proxy: None,
             global_name: None,
             clock_id: None,
+            validity: None,
             exemptions: Exemptions::default(),
         }
     }
@@ -175,6 +191,7 @@ impl Presentation {
     ///
     /// 只绑 v1：本模块只用 `clock_id` 与 `feedback` / `presented` / `discarded`，v2 对
     /// 「非常量刷新率」的 `refresh` 语义调整不影响它们；绑低版本不额外要求 compositor 版本。
+    /// 运行期重新宣告（旧 global 被移除后又出现）会换一份新的有效期，旧句柄保持失效。
     pub(crate) fn bind(
         &mut self,
         registry: &wl_registry::WlRegistry,
@@ -188,18 +205,28 @@ impl Presentation {
         let proxy = registry.bind::<WpPresentation, _, _>(name, version.min(1), queue, ());
         self.proxy = Some(proxy);
         self.global_name = Some(name);
+        // RB-05：重新宣告后新建的渲染器拿到的句柄是有效的（旧句柄已随 global_remove 严格
+        // 失效；它们对应的 renderer 需要重建才能恢复 presented_at，这是如实降级）。
+        self.validity = None;
     }
 
     /// `wl_registry.global_remove`：销毁绑定对象（协议要求客户端随后销毁它）。
     ///
     /// 已创建的 feedback 对象不受影响（`wp_presentation.destroy` 的协议原文："Existing
     /// objects created by this object are not affected"），它们的终态事件仍会到达并参与换算。
+    /// **已下发的 [`PresentationHandle`] 严格失效**（RB-05）：GPU 线程不再对已销毁代理发请求，
+    /// 记一次豁免 + 一次性诊断，`presented_at` 如实保持 `None`（不伪造）。
     pub(crate) fn unbind(&mut self, name: u32) {
         if self.global_name != Some(name) {
             return;
         }
         if let Some(proxy) = self.proxy.take() {
             proxy.destroy();
+            if let Some(validity) = self.validity.take()
+                && validity.invalidate()
+            {
+                self.exemptions.note(Exemption::ProtocolRemoved);
+            }
         }
         self.global_name = None;
     }
@@ -225,19 +252,26 @@ impl Presentation {
             self.exemptions.note(Exemption::ProtocolMissing);
             return None;
         };
+        let validity = self
+            .validity
+            .get_or_insert_with(|| Arc::new(PresentationValidity::new()))
+            .clone();
         Some(PresentationHandle {
             proxy,
             queue: queue.clone(),
             window,
             surface,
+            validity,
         })
     }
 
     /// `presented` 事件 → 可信的呈现时刻（`None` = 该帧没有可信值，已记豁免）。
     ///
-    /// 锚点取法：先 `clock_gettime(clock_id)` 读秒，再**立刻** `Instant::now()`；呈现时间戳是
-    /// 事件生成时刻（早于我们读到它），所以换算结果不会晚于锚点。1 s 的合理距离判据由
-    /// [`presented_event_instant`] 负责（`tv_nsec` 越界 / 未知时钟域 / 偏差超限 ⇒ `None`）。
+    /// 锚点取法（RB-04 修正后）：**先** `Instant::now()` 取锚点，**再**读同一时钟域的
+    /// `clock_gettime`。呈现时间戳是事件生成时刻（早于我们读到它），而时钟读数是锚点之后
+    /// 稍晚的时刻 ⇒ 换算结果 `anchor + (presented − clock_anchor)` **严格早于真实上屏时刻**
+    /// （下界，偏差方向恒为偏早）。旧顺序（先读时钟、后取锚点）会把结果抬晚一个读数间隔，
+    /// 违背 `presented_at` 的下界契约。
     pub(crate) fn presented_instant(
         &mut self,
         tv_sec_hi: u32,
@@ -253,13 +287,15 @@ impl Presentation {
             self.exemptions.note(Exemption::Rejected);
             return None;
         }
+        // RB-04：**先**取 `Instant` 锚点，再读时钟 —— 读数对应锚点之后的时刻，映射因此偏早。
+        let anchor = Instant::now();
         let Some(clock_secs) = clock_seconds(clock_id) else {
             self.exemptions.note(Exemption::ClockUnavailable);
             return None;
         };
-        let anchor = Instant::now();
+        let now = Instant::now();
         let instant = presented_event_instant(
-            tv_sec_hi, tv_sec_lo, tv_nsec, clock_id, clock_secs, anchor, anchor,
+            tv_sec_hi, tv_sec_lo, tv_nsec, clock_id, clock_secs, anchor, now,
         );
         if instant.is_none() {
             self.exemptions.note(Exemption::Rejected);
@@ -282,6 +318,8 @@ pub(crate) struct PresentationHandle {
     queue: QueueHandle<WaylandState>,
     window: WindowId,
     surface: wl_surface::WlSurface,
+    /// 与 [`Presentation`] 共享的连接有效期（RB-05：`global_remove` 后严格失效）。
+    validity: SharedPresentationValidity,
 }
 
 impl PresentationHandle {
@@ -290,12 +328,19 @@ impl PresentationHandle {
     /// 幂等由调用方按帧序号去重（重试同一帧不能重复创建对象，否则一次 commit 产生多条反馈）。
     /// 返回的代理句柄不需要保留：事件由连接的对象表按事件队列派发，`presented` / `discarded`
     /// 都是 destructor 事件，终态到达后对象自动销毁。
-    pub(crate) fn request_feedback(&self, frame: FrameIndex) {
+    ///
+    /// 返回 `false` = 连接级 `wp_presentation` 已被移除（RB-05）：本帧**不**创建反馈对象，
+    /// 该帧 `presented_at` 如实 None（UI 线程在 `global_remove` 时已记豁免/诊断）。
+    pub(crate) fn request_feedback(&self, frame: FrameIndex) -> bool {
+        if !self.validity.is_valid() {
+            return false;
+        }
         let _feedback = self.proxy.feedback(
             &self.surface,
             &self.queue,
             FeedbackData::new(self.window, frame),
         );
+        true
     }
 }
 

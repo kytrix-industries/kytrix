@@ -252,8 +252,9 @@ pub(crate) fn preedit_carets(
 ///   （`Ctrl+W` / `Cmd+C` 必须可用）；AppKit 的菜单键等价在 `keyDown:` 之前处理，不受影响；
 ///   Shift 不算命令修饰键（`Shift+字母` 是正常的上屏输入）。
 ///
-/// 提交键的 key-up 遵循同一判定（与 Win32 down/up 都丢弃对齐）：应用侧 `KeyState::Up`
-/// 分支只清 `held_keys`，漏投无副作用。
+/// 提交键的 key-up **始终投递**（不受本函数约束）：抬起不产生正文，应用只用它清
+/// `held_keys`；组合期连 up 一起吞会让「按下 → 组合开始 → 抬起」把按住状态永久残留
+/// （RB-02）。Win32 同样只把按下替换成 `VK_PROCESSKEY`，抬起以真实 `VK_*` 到达。
 ///
 /// `ImeEvent::Commit/Preedit` 通路不受本函数影响（组合结果必须交付）。
 #[cfg(any(target_os = "macos", target_os = "linux", test))]

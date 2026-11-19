@@ -48,6 +48,8 @@ const DRAG_STEP: (i32, i32) = (8, 4);
 const DRAG_STEPS: i32 = 20;
 /// 整体超时（防止窗口 / 拖动线程挂死）。
 const TIMEOUT: Duration = Duration::from_secs(20);
+/// 等待期唤醒上限（RB-15：失败环境必须有界退出，不得无界打印）。
+const MAX_WAKE_SPINS: u32 = 3000;
 
 /// 真实拖动线程的结果（与 `on_frame` 共享）。
 #[derive(Default)]
@@ -62,6 +64,10 @@ struct DragOutcome {
 struct State {
     phase: u8,
     deadline: Option<Instant>,
+    /// `finish` 已执行（关窗后 `on_frame` 可能再被调用：立即返回，不再打印/推进）。
+    finished: bool,
+    /// phase 0/1 里等待外部条件时的唤醒次数（RB-15：有界自旋，避免无界打印）。
+    wake_spins: u32,
     hit_test_ok: bool,
     drag_ok: bool,
     drag: Arc<Mutex<DragOutcome>>,
@@ -89,18 +95,24 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     app.on_frame(move |app| {
         let mut state = hook_state.borrow_mut();
+        if state.finished {
+            return;
+        }
         let now = Instant::now();
         state.deadline.get_or_insert(now + TIMEOUT);
         if state.deadline.is_some_and(|deadline| now >= deadline) {
             println!("FAIL: 证据采集超时（窗口 / 拖动线程未在 {TIMEOUT:?} 内就绪）");
-            finish(app, id, &handle, &hook_passed, &state, false);
+            finish(app, id, &handle, &hook_passed, &mut state, false);
             return;
         }
         match state.phase {
             0 => {
                 let Some(hwnd) = find_window() else {
-                    println!("等待窗口出现…");
-                    handle.wake();
+                    // RB-15：等待期有界（防止窗口找不到时以 ~100k 行/秒刷日志）。
+                    if !spin_wait(&mut state, &handle) {
+                        println!("FAIL: 等待窗口出现超时（自旋上限）");
+                        finish(app, id, &handle, &hook_passed, &mut state, false);
+                    }
                     return;
                 };
                 println!("== X2 真机证据（自绘标题栏拖动区） ==");
@@ -150,7 +162,11 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             1 => {
                 if !state.drag_done.load(Ordering::Acquire) {
-                    handle.wake();
+                    // RB-15：等待拖动线程期间同样有界（失败环境里曾无界打印 5.4M 行/554 MB）。
+                    if !spin_wait(&mut state, &handle) {
+                        println!("FAIL: 真实拖动线程未完成（自旋上限）");
+                        finish(app, id, &handle, &hook_passed, &mut state, false);
+                    }
                     return;
                 }
                 // 模态循环结束后，泵已把拖动期间的 `WM_MOVE` 收集成 `Event::Moved`。
@@ -199,7 +215,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
                     verdict(!state.moved_events.is_empty(), 3)
                 );
                 let ok = state.hit_test_ok && drag_ok && !state.moved_events.is_empty();
-                finish(app, id, &handle, &hook_passed, &state, ok);
+                finish(app, id, &handle, &hook_passed, &mut state, ok);
             }
             _ => {}
         }
@@ -356,14 +372,32 @@ fn window_rect(hwnd: HWND) -> (i32, i32, i32, i32) {
     )
 }
 
+/// 等待外部条件时的有界自旋：最多 [`MAX_WAKE_SPINS`] 次唤醒；进度每 60 次打印一次。
+/// 返回 `false` = 超过上限（调用方必须 `finish(..., false)` 并退出）。
+fn spin_wait(state: &mut State, handle: &AppHandle) -> bool {
+    state.wake_spins = state.wake_spins.saturating_add(1);
+    if state.wake_spins > MAX_WAKE_SPINS {
+        return false;
+    }
+    if state.wake_spins == 1 || state.wake_spins.is_multiple_of(60) {
+        println!("  …等待中（第 {} 次唤醒）", state.wake_spins);
+    }
+    handle.wake();
+    true
+}
+
 fn finish(
     app: &mut App,
     id: WindowId,
     handle: &AppHandle,
     passed: &Cell<bool>,
-    state: &State,
+    state: &mut State,
     ok: bool,
 ) {
+    if state.finished {
+        return;
+    }
+    state.finished = true;
     println!(
         "汇总：hit_test={} real_drag={} Event::Moved={} 条",
         state.hit_test_ok,
