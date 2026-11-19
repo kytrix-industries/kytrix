@@ -208,6 +208,61 @@ impl Drop for Surface {
     }
 }
 
+/// 建链失败的可恢复分类（C8）。
+///
+/// `VK_ERROR_OUT_OF_DATE_KHR` 是 WSI 的**正常控制流**（合成器尺寸 / 缩放 / 热插拔 / configure
+/// 竞争）：重建 + 退避重试即可，绝不升级成粘性错误（旧实现把「任何建链失败」都折叠成
+/// `EngineError::Swapchain`，第 5 次连续 OOD 就结束事件循环）。`VK_ERROR_SURFACE_LOST_KHR`
+/// 需要重建 `VkSurfaceKHR`（有界重试）。其余失败（device lost / 能力不满足 / 初始化错误）都是
+/// 致命：`SharedGpu` 的粘性分类与强类型错误只有一个出口。
+#[derive(Debug)]
+pub(crate) enum CreateFailure {
+    /// surface 与 swapchain 不匹配：重建 swapchain 后重试。
+    OutOfDate,
+    /// surface 永久失效（合成器重启 / 显卡复位）：重建 `VkSurfaceKHR` 之后重试（R11-11）。
+    SurfaceLost,
+    /// 不可恢复：原样上报（device lost 已由 `SharedGpu::classify_failure` 变成粘性错误）。
+    Fatal(EngineError),
+}
+
+impl CreateFailure {
+    /// 初始化阶段的转换：窗口第一次建链失败时还没有「重试循环」，可恢复分类降级成强类型错误
+    /// （此时确实是启动失败，和运行期 OOD 是不同的语义）。
+    pub(crate) fn into_error(self) -> EngineError {
+        match self {
+            Self::Fatal(error) => error,
+            Self::OutOfDate => EngineError::Swapchain {
+                detail: smol_str::SmolStr::new_static(
+                    "swapchain was out of date during initial window creation",
+                ),
+            },
+            Self::SurfaceLost => EngineError::Swapchain {
+                detail: smol_str::SmolStr::new_static(
+                    "surface was lost during initial window creation",
+                ),
+            },
+        }
+    }
+}
+
+/// 纯分类（可单测）：`Some` = 可恢复的 WSI 状态；`None` = 交给 `SharedGpu` 的粘性 / 初始化分类。
+///
+/// 拆成纯函数是为了让「OUT_OF_DATE / SURFACE_LOST 是控制流、DEVICE_LOST / 其它是致命」这条
+/// 判据不依赖 `SharedGpu`（单测无需 Vulkan 设备）。
+fn recoverable_create_failure(result: vk::Result) -> Option<CreateFailure> {
+    match result {
+        vk::Result::ERROR_OUT_OF_DATE_KHR => Some(CreateFailure::OutOfDate),
+        vk::Result::ERROR_SURFACE_LOST_KHR => Some(CreateFailure::SurfaceLost),
+        _ => None,
+    }
+}
+
+/// 把一次建链相关 Vulkan 调用错误分类成 [`CreateFailure`]。
+fn create_failure(shared: &SharedGpu, result: vk::Result, context: &'static str) -> CreateFailure {
+    recoverable_create_failure(result)
+        .unwrap_or_else(|| CreateFailure::Fatal(shared.classify_failure(result, context)))
+}
+
 /// swapchain + **每 image 一个** render-finished 信号量 + 建链参数快照。
 pub(crate) struct Swapchain {
     device: ash::Device,
@@ -232,7 +287,7 @@ impl Swapchain {
         shared: &SharedGpu,
         surface: &Surface,
         size: (u32, u32),
-    ) -> Result<Self, EngineError> {
+    ) -> Result<Self, CreateFailure> {
         Self::create(shared, surface, size, vk::SwapchainKHR::null())
     }
 
@@ -246,7 +301,7 @@ impl Swapchain {
         surface: &Surface,
         size: (u32, u32),
         old: vk::SwapchainKHR,
-    ) -> Result<Self, EngineError> {
+    ) -> Result<Self, CreateFailure> {
         Self::create(shared, surface, size, old)
     }
 
@@ -255,61 +310,62 @@ impl Swapchain {
         surface: &Surface,
         size: (u32, u32),
         old: vk::SwapchainKHR,
-    ) -> Result<Self, EngineError> {
+    ) -> Result<Self, CreateFailure> {
         let instance = shared.instance();
         let live_swapchains = surface.live_swapchains().clone();
         let surface = surface.raw();
-        let surface_fn = instance
-            .surface_fn()
-            .ok_or_else(|| EngineError::Swapchain {
+        let surface_fn = instance.surface_fn().ok_or_else(|| {
+            CreateFailure::Fatal(EngineError::Swapchain {
                 detail: smol_str::SmolStr::new_static("swapchain requires a Wayland surface"),
-            })?;
+            })
+        })?;
         // SAFETY: 句柄与参数都由本结构独占，调用期间有效。
         let formats =
             unsafe { surface_fn.get_physical_device_surface_formats(shared.physical(), surface) }
-                .map_err(|error| EngineError::Swapchain {
-                detail: smol_str::format_smolstr!("get_physical_device_surface_formats: {error:?}"),
+                .map_err(|error| {
+                create_failure(shared, error, "get_physical_device_surface_formats")
             })?;
         // R11-8 / R06-10：format 与 colorSpace 必须**同时**匹配引擎声明的呈现契约
         // （`render::colorspace`）。旧实现只看 format、把合成器给的 colorSpace 原样透传 ——
         // 在 HDR / P3 合成器上会把 sRGB 编码字节按 PQ/HLG 解释，整屏亮度与对比度错误。
-        let chosen =
-            choose_surface_format(&formats, crate::render::colorspace::accepts_color_space)
-                .ok_or_else(|| EngineError::UnsupportedGpu {
-                    os: "linux",
-                    required: "B8G8R8A8_SRGB surface format with VK_COLOR_SPACE_SRGB_NONLINEAR_KHR",
-                    actual: smol_str::format_smolstr!(
-                        "surface reports {:?}",
-                        formats
-                            .iter()
-                            .map(|format| (format.format, format.color_space))
-                            .collect::<Vec<_>>()
-                    ),
-                })?;
+        let chosen = choose_surface_format(
+            &formats,
+            crate::render::colorspace::accepts_color_space,
+        )
+        .ok_or_else(|| {
+            CreateFailure::Fatal(EngineError::UnsupportedGpu {
+                os: "linux",
+                required: "B8G8R8A8_SRGB surface format with VK_COLOR_SPACE_SRGB_NONLINEAR_KHR",
+                actual: smol_str::format_smolstr!(
+                    "surface reports {:?}",
+                    formats
+                        .iter()
+                        .map(|format| (format.format, format.color_space))
+                        .collect::<Vec<_>>()
+                ),
+            })
+        })?;
         // SAFETY: 只读查询；surface 由同一实例创建。
         let capabilities = unsafe {
             surface_fn.get_physical_device_surface_capabilities(shared.physical(), surface)
         }
-        .map_err(|error| EngineError::Swapchain {
-            detail: smol_str::format_smolstr!(
-                "get_physical_device_surface_capabilities: {error:?}"
-            ),
+        .map_err(|error| {
+            create_failure(shared, error, "get_physical_device_surface_capabilities")
         })?;
         // SAFETY: 只读查询。
         let present_modes = unsafe {
             surface_fn.get_physical_device_surface_present_modes(shared.physical(), surface)
         }
-        .map_err(|error| EngineError::Swapchain {
-            detail: smol_str::format_smolstr!(
-                "get_physical_device_surface_present_modes: {error:?}"
-            ),
+        .map_err(|error| {
+            create_failure(shared, error, "get_physical_device_surface_present_modes")
         })?;
-        let present_mode =
-            choose_present_mode(&present_modes).ok_or_else(|| EngineError::UnsupportedGpu {
+        let present_mode = choose_present_mode(&present_modes).ok_or_else(|| {
+            CreateFailure::Fatal(EngineError::UnsupportedGpu {
                 os: "linux",
                 required: "VK_PRESENT_MODE_MAILBOX_KHR on a Wayland surface",
                 actual: smol_str::format_smolstr!("present modes {present_modes:?}"),
-            })?;
+            })
+        })?;
         // R11-9：`currentExtent` 有两个合法形态（具体尺寸 / `0xFFFFFFFF`），且必须按
         // `preTransform` 换轴。旧实现既不用 currentExtent 也不换轴 ⇒ 驱动决定尺寸时永久
         // SUBOPTIMAL（并叠加 R11-7 变成每帧重建）。
@@ -329,37 +385,41 @@ impl Swapchain {
             size,
             capabilities.current_transform,
         )
-        .ok_or_else(|| EngineError::UnsupportedGpu {
-            os: "linux",
-            required: "a non-degenerate surface extent range",
-            actual: smol_str::format_smolstr!(
-                "min={:?} max={:?} current={:?}",
-                capabilities.min_image_extent,
-                capabilities.max_image_extent,
-                capabilities.current_extent
-            ),
+        .ok_or_else(|| {
+            CreateFailure::Fatal(EngineError::UnsupportedGpu {
+                os: "linux",
+                required: "a non-degenerate surface extent range",
+                actual: smol_str::format_smolstr!(
+                    "min={:?} max={:?} current={:?}",
+                    capabilities.min_image_extent,
+                    capabilities.max_image_extent,
+                    capabilities.current_extent
+                ),
+            })
         })?;
         if !capabilities
             .supported_usage_flags
             .contains(plan::required_usage())
         {
-            return Err(EngineError::UnsupportedGpu {
+            return Err(CreateFailure::Fatal(EngineError::UnsupportedGpu {
                 os: "linux",
                 required: "COLOR_ATTACHMENT | TRANSFER_DST swapchain images",
                 actual: smol_str::format_smolstr!(
                     "surface supports {:?}",
                     capabilities.supported_usage_flags
                 ),
-            });
+            }));
         }
         let composite_alpha = choose_composite_alpha(capabilities.supported_composite_alpha)
-            .ok_or_else(|| EngineError::UnsupportedGpu {
-                os: "linux",
-                required: "at least one composite alpha mode",
-                actual: smol_str::format_smolstr!(
-                    "surface supports {:?}",
-                    capabilities.supported_composite_alpha
-                ),
+            .ok_or_else(|| {
+                CreateFailure::Fatal(EngineError::UnsupportedGpu {
+                    os: "linux",
+                    required: "at least one composite alpha mode",
+                    actual: smol_str::format_smolstr!(
+                        "surface supports {:?}",
+                        capabilities.supported_composite_alpha
+                    ),
+                })
             })?;
         let image_count =
             choose_image_count(capabilities.min_image_count, capabilities.max_image_count);
@@ -392,11 +452,8 @@ impl Swapchain {
             .clipped(true);
         // SAFETY: `create` 的指针在本次调用期间有效；swapchain 在本结构 Drop（或调用方延迟 drop）
         // 时销毁；`VkQueue` 由共享 GPU 持有且在 `with_queue` 内串行化。
-        let raw = unsafe { fn_.create_swapchain(&create, None) }.map_err(|error| {
-            EngineError::Swapchain {
-                detail: smol_str::format_smolstr!("create_swapchain_khr: {error:?}"),
-            }
-        })?;
+        let raw = unsafe { fn_.create_swapchain(&create, None) }
+            .map_err(|error| create_failure(shared, error, "create_swapchain_khr"))?;
         // SAFETY: `raw` 刚创建；image 句柄的存活期由 swapchain 保证。
         let images = match unsafe { fn_.get_swapchain_images(raw) } {
             Ok(images) => images,
@@ -404,9 +461,7 @@ impl Swapchain {
                 // 失败路径不泄漏：swapchain 已创建，必须销毁（R11-29 的同族问题）。
                 // SAFETY: 没有任何 image / 信号量引用它。
                 unsafe { fn_.destroy_swapchain(raw, None) };
-                return Err(EngineError::Swapchain {
-                    detail: smol_str::format_smolstr!("get_swapchain_images: {error:?}"),
-                });
+                return Err(create_failure(shared, error, "get_swapchain_images"));
             }
         };
         // 每 image 一个 render-finished（§7.2 硬规则 1：不能按帧槽索引）。
@@ -428,11 +483,11 @@ impl Swapchain {
                         }
                         fn_.destroy_swapchain(raw, None);
                     }
-                    return Err(EngineError::Swapchain {
-                        detail: smol_str::format_smolstr!(
-                            "create_semaphore(render_finished): {error:?}"
-                        ),
-                    });
+                    return Err(create_failure(
+                        shared,
+                        error,
+                        "create_semaphore(render_finished)",
+                    ));
                 }
             };
             render_finished.push(semaphore);
@@ -650,8 +705,35 @@ fn present_rects(dirty: &DamageRects) -> Vec<vk::RectLayerKHR> {
 
 #[cfg(test)]
 mod tests {
-    use super::LiveSwapchains;
+    use ash::vk;
+
+    use super::{CreateFailure, LiveSwapchains, recoverable_create_failure};
     use crate::{math::PhysicalRect, render::compositor::DamageRects};
+
+    /// C8：`OUT_OF_DATE` / `SURFACE_LOST` 是 WSI 的正常控制流（可恢复）；DEVICE_LOST 与其它
+    /// 结果必须留给 `SharedGpu` 的粘性 / 初始化分类（`None` ⇒ `CreateFailure::Fatal`）。
+    #[test]
+    fn create_failures_classify_recoverable_wsi_state_and_leave_the_rest_to_the_shared_gpu() {
+        assert!(matches!(
+            recoverable_create_failure(vk::Result::ERROR_OUT_OF_DATE_KHR),
+            Some(CreateFailure::OutOfDate)
+        ));
+        assert!(matches!(
+            recoverable_create_failure(vk::Result::ERROR_SURFACE_LOST_KHR),
+            Some(CreateFailure::SurfaceLost)
+        ));
+        for fatal in [
+            vk::Result::ERROR_DEVICE_LOST,
+            vk::Result::ERROR_UNKNOWN,
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            vk::Result::SUCCESS,
+        ] {
+            assert!(
+                recoverable_create_failure(fatal).is_none(),
+                "{fatal:?} 不能当成可恢复的 WSI 状态（必须由 SharedGpu 分类成 Fatal）"
+            );
+        }
+    }
 
     /// C7 的 debug 断言语义：计数随建链 / 销毁精确变化，归零之后 surface 才允许重建。
     #[test]

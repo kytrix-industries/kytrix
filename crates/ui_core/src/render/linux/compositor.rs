@@ -44,7 +44,11 @@
 //! 落地页换代，然后重试。多个窗口同时往同一张纹理上传因此是安全的（同一队列按提交顺序执行，
 //! 屏障序列不交错）。
 
-use std::{collections::VecDeque, sync::Arc, time::Instant};
+use std::{
+    collections::VecDeque,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use ash::vk;
 use wayland_client::protocol::wl_surface;
@@ -61,7 +65,7 @@ use super::{
     geometry::GeometryRegistry,
     memory::MemoryNeed,
     pipeline::{Pipeline, RENDER_FORMAT},
-    swapchain::{Acquire, Present, Surface, Swapchain},
+    swapchain::{Acquire, CreateFailure, Present, Surface, Swapchain},
     timer::GpuTimer,
 };
 use crate::{
@@ -83,9 +87,24 @@ use crate::{
 /// `minStorageBufferOffsetAlignment` 的保守上界（256 B）：clips 段在此偏移处开始。
 const CLIP_ALIGN: u64 = 256;
 
-/// 连续 `OUT_OF_DATE` / `SUBOPTIMAL` 的重建上限：正常合成器一次重建就能恢复；超过说明 surface
-/// 已失效或参数始终不匹配（R11-7 的「每帧重建自旋」）。
-const MAX_REBUILDS: u32 = 4;
+/// `SUBOPTIMAL` 的重建上限（**只属于 SUBOPTIMAL 策略**）：持续 SUBOPTIMAL 时每帧重建会退化成
+/// 「帧率崩塌 + 句柄/显存抖动」，超过上限就放弃重建、继续用现有链呈现（R11-7）。
+///
+/// `OUT_OF_DATE` 不共用这个常量：它是 WSI 的正常控制流，按 [`OutOfDateRecovery`] 无限重建 +
+/// 退避（用户裁决 C8）。
+const MAX_SUBOPTIMAL_REBUILDS: u32 = 4;
+
+/// 任何可恢复 WSI 重试的退避上限（用户裁决：≤50 ms）。
+///
+/// GPU 循环的 `thread::sleep` 因此最多多等这么久；关窗 `join()` 的尾延迟有同一个上界。
+pub(crate) const MAX_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+
+/// 一次 `SURFACE_LOST` 恢复失败后的重试退避序列：3 次有界重试（用户裁决 C8）。
+const SURFACE_LOST_BACKOFF: [Duration; 3] = [
+    Duration::from_millis(1),
+    Duration::from_millis(4),
+    Duration::from_millis(16),
+];
 
 /// 重建之后至少多少帧不再重建（即使 acquire / present 仍报 `SUBOPTIMAL`）。
 ///
@@ -93,6 +112,94 @@ const MAX_REBUILDS: u32 = 4;
 /// 而每次重建都要 `vkCreateSwapchainKHR` + `vkGetSwapchainImagesKHR` + N 个信号量。没有这个门槛
 /// 时，持续 SUBOPTIMAL 会退化成每帧重建：帧率崩塌 + 句柄/显存抖动，现象像「卡顿」而不是错误。
 const REBUILD_COOLDOWN_FRAMES: u64 = 60;
+
+/// 一次可恢复 WSI 故障之后的等待决策（[`OutOfDateRecovery`] 的输出）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Retry {
+    /// 下一次重试之前必须等待的时长（`OUT_OF_DATE` 恒 >0；`SURFACE_LOST` 按预算取 1/4/16 ms）。
+    after: Duration,
+    /// 本次是否要打一行低频诊断（第 1 / 16 次，之后每 64 次；不刷屏）。
+    report: bool,
+}
+
+/// `OUT_OF_DATE` / `SURFACE_LOST` 的恢复策略（**纯逻辑**，无 GPU 依赖，可单测）。
+///
+/// 用户裁决（C8）：
+/// - `VK_ERROR_OUT_OF_DATE_KHR` 是 WSI 的**正常控制流**（acquire / present 都会返回它）：
+///   无限重建 + 指数退避（1/2/4/… ≤50 ms），**永不**因它产生致命错误或结束事件循环；
+///   成功 acquire / present 之后计数与退避复位。对齐 Chromium（OOD = swap 失败后重建）与
+///   Qt（`beginFrame` 返回 `FrameOpSwapChainOutOfDate`）的处理方式。
+/// - `VK_ERROR_SURFACE_LOST_KHR` 有界重试：最多 3 次退避重试（1/4/16 ms），仍失败才上报
+///   「合成器/连接还活着但 surface 不可用」的强类型错误（区别于设备丢失）。
+#[derive(Debug, Default)]
+struct OutOfDateRecovery {
+    /// 连续 `OUT_OF_DATE` 次数（成功 acquire / present 后清零）。
+    out_of_date: u32,
+    /// 连续 surface 恢复失败次数（成功 acquire / present 后清零）。
+    surface_lost_failures: u32,
+}
+
+impl OutOfDateRecovery {
+    const fn new() -> Self {
+        Self {
+            out_of_date: 0,
+            surface_lost_failures: 0,
+        }
+    }
+
+    /// 一次 `OUT_OF_DATE`：无限重建，退避 = 1/2/4/8/16/32/50 ms（封顶）。
+    fn on_out_of_date(&mut self) -> Retry {
+        self.out_of_date += 1;
+        Retry {
+            after: out_of_date_backoff(self.out_of_date),
+            report: out_of_date_diagnostic(self.out_of_date),
+        }
+    }
+
+    /// 一次成功 acquire / present：计数与退避一起复位。
+    ///
+    /// 返回上一段连续 OOD 的次数：>1 时才值得打一行「已恢复」诊断（第 1 次 OOD 立刻恢复属于
+    /// 正常控制流，不刷屏）。
+    fn on_progress(&mut self) -> Option<u32> {
+        let recovered = self.out_of_date;
+        self.out_of_date = 0;
+        self.surface_lost_failures = 0;
+        (recovered > 1).then_some(recovered)
+    }
+
+    /// 一次 `SURFACE_LOST` 恢复失败：预算内返回本次重试前的退避，耗尽后上报。
+    ///
+    /// 预算是「3 次重试」：第 1/2/3 次失败分别退避 1/4/16 ms，第 4 次失败才返回错误。
+    fn on_surface_lost_failure(&mut self, reason: &'static str) -> Result<Duration, EngineError> {
+        self.surface_lost_failures += 1;
+        SURFACE_LOST_BACKOFF
+            .get(self.surface_lost_failures as usize - 1)
+            .copied()
+            .ok_or_else(|| EngineError::Swapchain {
+                detail: smol_str::format_smolstr!(
+                    "compositor/connection is still alive but the swapchain surface stayed lost \
+                     after {SURFACE_LOST_BACKOFF_LEN} retries ({reason})"
+                ),
+            })
+    }
+}
+
+/// `SURFACE_LOST_BACKOFF` 的条目数（错误文案与预算单测共用同一事实）。
+const SURFACE_LOST_BACKOFF_LEN: usize = SURFACE_LOST_BACKOFF.len();
+
+/// `OUT_OF_DATE` 的指数退避：第 n 次连续失败等 `min(2^(n-1) ms, 50 ms)`。
+fn out_of_date_backoff(consecutive: u32) -> Duration {
+    debug_assert!(consecutive >= 1, "the first out-of-date retry waits 1 ms");
+    let exponent = consecutive.saturating_sub(1).min(6);
+    Duration::from_millis(1u64 << exponent).min(MAX_RETRY_BACKOFF)
+}
+
+/// `OUT_OF_DATE` 诊断行的低频策略：第 1 / 16 次，之后每 64 次。
+///
+/// 1000 次连续 OOD 只产生 ~17 行；交互 resize 造成的偶发 OOD 不刷屏（用户裁决「低频诊断」）。
+fn out_of_date_diagnostic(consecutive: u32) -> bool {
+    consecutive == 1 || consecutive == 16 || consecutive.is_multiple_of(64)
+}
 
 /// 一帧异步提交的结果（窗口路径）。
 pub(crate) enum Submitted {
@@ -105,8 +212,10 @@ pub(crate) enum Submitted {
         slot: usize,
         sequence: u64,
     },
-    /// 本帧没有产生 GPU 工作（acquire 未就绪 / 刚重建 swapchain）：调用方保留帧请求重试。
-    Retry,
+    /// 本帧没有产生 GPU 工作（acquire 未就绪 / 可恢复的 WSI 故障）：调用方**保留**帧请求，
+    /// 按 `after` 有界退避后重试（`None` = 立即重试；GPU 循环的 sleep 上限见
+    /// [`MAX_RETRY_BACKOFF`]）。`OUT_OF_DATE` / `SURFACE_LOST` 走这里，**永不**因此退出进程。
+    Retry { after: Option<Duration> },
 }
 
 /// 已提交、尚未被 timeline 确认完成的帧的**提交序号**（timeline 的 signal 值 = ring 的提交序号）。
@@ -227,8 +336,9 @@ pub(crate) struct GpuRenderer {
     image_sync: ImageSyncStep,
     /// present 成功后需要重建 swapchain（`SUBOPTIMAL`，§7.3）。
     rebuild_swapchain: bool,
-    /// 连续 `OUT_OF_DATE` 次数（每次成功 present 清零）：超上限才报错，不无限自旋。
-    out_of_date: u32,
+    /// `OUT_OF_DATE` / `SURFACE_LOST` 的恢复策略（C8：无限退避重建 / surface 有界重试；
+    /// 失败分类见 `swapchain::CreateFailure`）。
+    out_of_date_recovery: OutOfDateRecovery,
     /// 最近一段时间的 `SUBOPTIMAL` 重建次数与上次重建的提交序号（R11-7 的门槛）。
     suboptimal_rebuilds: u32,
     last_rebuild_sequence: u64,
@@ -261,7 +371,8 @@ impl GpuRenderer {
         let size = (size.0.max(1), size.1.max(1));
         let shared = SharedGpu::process_windowed(display, surface_ptr)?;
         let vk_surface = Surface::new(&shared, display, surface_ptr)?;
-        let swapchain = Swapchain::new(&shared, &vk_surface, size)?;
+        let swapchain =
+            Swapchain::new(&shared, &vk_surface, size).map_err(CreateFailure::into_error)?;
         Self::with_gpu(
             shared,
             Some(vk_surface),
@@ -342,7 +453,7 @@ impl GpuRenderer {
             present_hint: None,
             image_sync: ImageSyncStep::Full,
             rebuild_swapchain: false,
-            out_of_date: 0,
+            out_of_date_recovery: OutOfDateRecovery::new(),
             suboptimal_rebuilds: 0,
             last_rebuild_sequence: 0,
             rebuild_abandoned: false,
@@ -379,21 +490,36 @@ impl GpuRenderer {
     /// 渲染目标尺寸的**唯一来源是 swapchain extent**（clamp / `currentExtent` / transform 之后，
     /// R11-9），不是 UI 请求值 —— 旧实现让 persist 用未 clamp 的请求尺寸，于是 `renderArea` 可能
     /// 超出 framebuffer（`VUID-VkRenderPassBeginInfo-*`）、`vkCmdCopyImage` 的 extent 可能超出源图。
+    ///
+    /// C8：窗口路径的建链失败按 `CreateFailure` 分类 —— `OUT_OF_DATE` / `SURFACE_LOST` 不升级为
+    /// 致命错误：链保持 absent、请求尺寸先记账，由下一次 `submit_frame` 顶部的
+    /// [`Self::ensure_swapchain`] 退避补建（`SURFACE_LOST` 会先走 C7 的表面重建）。旧实现把任何
+    /// 建链失败都变成粘性错误，正常 resize 竞争就能结束事件循环。
     pub(crate) fn resize(&mut self, size: (u32, u32)) -> Result<(), EngineError> {
         // 窗口目标的 resize 只能发生在 GPU 线程（§7.3）；离屏目标由门面同步调用。
         debug_assert!(
-            self.swapchain.is_none() || on_gpu_thread(),
+            self.vk_surface.is_none() || on_gpu_thread(),
             "resizing a window target may only run on the kytrix-vulkan thread"
         );
         let size = (size.0.max(1), size.1.max(1));
+        if self.vk_surface.is_some() {
+            if size == self.surface && self.swapchain.is_some() {
+                return Ok(());
+            }
+            // 请求尺寸先记账：建链失败后的重试按最新请求尺寸走（swapchain extent 仍由
+            // `install_swapchain` 在成功时覆盖，单一真相源不变）。
+            self.surface = size;
+            return match self.try_replace_swapchain(size) {
+                Ok(()) => Ok(()),
+                Err(CreateFailure::Fatal(error)) => Err(error),
+                // 可恢复的 WSI 状态：链保持 absent，`submit_frame` 顶部按 C8 策略恢复。
+                Err(CreateFailure::OutOfDate | CreateFailure::SurfaceLost) => Ok(()),
+            };
+        }
+        // 离屏路径：没有 swapchain，渲染目标尺寸就是请求尺寸。
         if size == self.surface {
             return Ok(());
         }
-        if self.swapchain.is_some() {
-            // 窗口路径：`install_swapchain` 按新链的 `imageExtent` 保证 persist 尺寸（单一来源）。
-            return self.replace_swapchain(size);
-        }
-        // 离屏路径：没有 swapchain，渲染目标尺寸就是请求尺寸。
         let persist = Persist::new(&self.shared, size)?;
         // 离屏路径本来就同步（`finish_sync` 已等完每次提交）⇒ 旧 persist 可以立刻释放。
         drop(std::mem::replace(&mut self.persist, persist));
@@ -405,7 +531,8 @@ impl GpuRenderer {
     /// 窗口路径：提交一帧（**不等 GPU 完成**，I2）。
     ///
     /// 调用方（`renderer.rs` 的 GPU 循环）已经在 `request.surface` 变化时调用 [`Self::resize`]。
-    /// `Retry` 表示本帧没有产生 GPU 工作，调用方必须**保留**该请求（跳过它会把 damage 弄丢）。
+    /// `Submitted::Retry` 表示本帧没有产生 GPU 工作（或遇到可恢复的 WSI 故障），调用方必须
+    /// **保留**该请求并按 `after` 退避后重试（跳过它会把 damage 弄丢）。
     pub(crate) fn submit_frame(
         &mut self,
         request: &FrameRequest,
@@ -415,13 +542,20 @@ impl GpuRenderer {
             on_gpu_thread(),
             "Vulkan 窗口帧只能在 kytrix-vulkan 线程提交"
         );
+        if let Some(error) = self.shared.lost_error() {
+            return Err(error);
+        }
+        // C8：上一次可恢复的建链失败（OOD / SURFACE_LOST）可能留下 absent 的链。统一入口先补建：
+        // 可恢复故障返回退避（保留 pending 帧），Fatal 才上报。
+        if self.swapchain.is_none()
+            && let Some(after) = self.ensure_swapchain("rebuilding the missing swapchain")?
+        {
+            return Ok(Submitted::Retry { after: Some(after) });
+        }
         debug_assert!(
             self.swapchain.is_some(),
             "window frames require a swapchain"
         );
-        if let Some(error) = self.shared.lost_error() {
-            return Err(error);
-        }
         // DPI 与 surface 同帧过线：geometry 通道的顶点是逻辑像素，root uniform 的
         // `frame.params.x` 必须与这一帧的 surface 成对（contract §6）。
         self.scale = request.scale;
@@ -447,18 +581,19 @@ impl GpuRenderer {
                     // 本帧照常 present，之后按门槛重建（§7.3 / R11-7）。
                     self.rebuild_swapchain = true;
                 }
+                // 拿到可呈现的 image = 进展：OOD / surface-lost 的连续计数复位（C8）。
+                self.note_progress();
                 index
             }
-            Ok(Acquire::NotReady) => return Ok(Submitted::Retry),
+            // 超时：帧请求保留着重试（acquire 自带 100 ms 节拍，不额外退避）。
+            Ok(Acquire::NotReady) => return Ok(Submitted::Retry { after: None }),
             Ok(Acquire::OutOfDate) => {
-                self.rebuild_out_of_date("acquire reported OUT_OF_DATE")?;
-                return Ok(Submitted::Retry);
+                return self.retry_out_of_date("acquire reported OUT_OF_DATE");
             }
             // R11-11：surface 永久失效 ⇒ 重建 `VkSurfaceKHR` + swapchain（旧实现把 acquire 的
             // `SURFACE_LOST` 混进 `OutOfDate`，于是 present 侧的同类错误直接结束 GPU 线程、窗口黑屏）。
             Ok(Acquire::SurfaceLost) => {
-                self.recover_surface("acquire reported SURFACE_LOST")?;
-                return Ok(Submitted::Retry);
+                return self.recover_surface("acquire reported SURFACE_LOST");
             }
             Err(error) => return Err(self.classify(error)),
         };
@@ -552,8 +687,8 @@ impl GpuRenderer {
                 if matches!(presented, Present::Suboptimal) {
                     self.rebuild_swapchain = true;
                 }
-                // 成功 present ⇒ 连续 OUT_OF_DATE 计数清零（上界只约束「连续」失败）。
-                self.out_of_date = 0;
+                // 成功 present = 进展：连续 OOD / surface-lost 的计数与退避复位（C8）。
+                self.note_progress();
                 frame.presented();
                 self.fresh = false;
                 // 本 image 已经被这一帧追平；其余 image 累积本帧 damage（R11-12）。
@@ -572,13 +707,19 @@ impl GpuRenderer {
                 self.drain_retired_swapchains()?;
             }
             Present::OutOfDate => {
-                // 本帧已经提交（timeline 会 signal），不能再重录；立刻重建，由下一帧补画。
-                self.rebuild_swapchain = false;
-                self.rebuild_out_of_date("present reported OUT_OF_DATE")?;
+                // present 返回 OOD 说明本帧的提交**已经发生**（timeline 会 signal）：先把提交
+                // 序号登记进 retire 流水线，再保留 pending 帧、退避后重画。
+                //
+                // 旧实现把 present-OOD 当 `Presented` 返回，pending 帧被丢弃：resize 之后如果
+                // UI 没有新帧，新链永远等不到第一次 present（黑窗），而 OOD 计数继续累计到
+                // 旧的「连续 OOD 上限」（4 次）就结束事件循环（C8 的问题本体）。
+                self.submitted.push_back(sequence);
+                return self.retry_out_of_date("present reported OUT_OF_DATE");
             }
             // R11-11：present 侧的 `SURFACE_LOST_KHR` 走与 acquire 同一条恢复路径。
             Present::SurfaceLost => {
-                self.recover_surface("present reported SURFACE_LOST")?;
+                self.submitted.push_back(sequence);
+                return self.recover_surface("present reported SURFACE_LOST");
             }
         }
         self.submitted.push_back(sequence);
@@ -969,54 +1110,169 @@ impl GpuRenderer {
     }
 
     /// 用 `oldSwapchain` 建新 swapchain（§7.4）：**不等设备空闲**，旧结构进延迟销毁队列。
+    ///
+    /// C8：建链失败按 [`CreateFailure`] 分类 —— 可恢复故障不在此升级为致命错误（链保持
+    /// absent，下一次 `submit_frame` 顶部的 [`Self::ensure_swapchain`] 按策略补建）；Fatal 上报。
+    /// SUBOPTIMAL 的「冷却期 + 放弃重建」策略不变（[`Self::request_rebuild`]）。
     fn recreate_swapchain(&mut self) -> Result<(), EngineError> {
         let size = self.surface;
-        self.replace_swapchain(size)
+        match self.try_replace_swapchain(size) {
+            Ok(()) => Ok(()),
+            Err(CreateFailure::Fatal(error)) => Err(error),
+            // OUT_OF_DATE / SURFACE_LOST：链已 retired，统一入口会在下一次提交前恢复。
+            Err(CreateFailure::OutOfDate | CreateFailure::SurfaceLost) => Ok(()),
+        }
     }
 
-    /// 目标尺寸变化时的 swapchain 替换（同尺寸的 `OUT_OF_DATE` / `SUBOPTIMAL` 走
-    /// [`Self::request_rebuild`]）。
-    fn replace_swapchain(&mut self, size: (u32, u32)) -> Result<(), EngineError> {
-        let surface = self.vk_surface.as_ref();
+    /// 尝试用 `oldSwapchain` 建新链；失败按 [`CreateFailure`] 分类返回，**不在这里**重建 surface。
+    ///
+    /// 链始终先 `take()` 再建：失败时旧链已按规范 retired（`oldSwapchain` 语义），放进延迟
+    /// 销毁队列，由 [`Self::drain_retired_swapchains`] / [`Self::destroy_retired_swapchains_now`]
+    /// 在队列空闲后销毁。surface 恢复只在 [`Self::ensure_swapchain`] / [`Self::recover_surface`]
+    /// 走 C7 的唯一入口 —— 修正「任何建链失败都重建 surface」的过度归因（audit-c2 §1/§2）。
+    fn try_replace_swapchain(&mut self, size: (u32, u32)) -> Result<(), CreateFailure> {
         let old = self.swapchain.take();
-        let created = match (surface, old.as_ref()) {
-            (Some(surface), Some(old)) => {
-                Swapchain::replace(&self.shared, surface, size, old.raw())
+        let Some(surface) = self.vk_surface.as_ref() else {
+            if let Some(old) = old {
+                self.retired_swapchains.push(old);
             }
-            (Some(surface), None) => Swapchain::new(&self.shared, surface, size),
-            (None, _) => {
-                return Err(EngineError::Swapchain {
-                    detail: smol_str::SmolStr::new_static(
-                        "swapchain replacement requires a window surface",
-                    ),
-                });
-            }
+            return Err(CreateFailure::Fatal(EngineError::Swapchain {
+                detail: smol_str::SmolStr::new_static(
+                    "swapchain replacement requires a window surface",
+                ),
+            }));
+        };
+        let created = match old.as_ref() {
+            Some(old) => Swapchain::replace(&self.shared, surface, size, old.raw()),
+            None => Swapchain::new(&self.shared, surface, size),
         };
         match created {
-            Ok(swapchain) => self.install_swapchain(swapchain, old, size),
-            Err(_error) => {
+            Ok(swapchain) => self
+                .install_swapchain(swapchain, old, size)
+                .map_err(CreateFailure::Fatal),
+            Err(failure) => {
                 if let Some(old) = old {
-                    // 规范：传给 `oldSwapchain` 的旧 swapchain 即使创建失败也已 retired，必须销毁
-                    // （销毁前置条件由 `drain_retired_swapchains` 的队列 idle 保证，R11-3）。
+                    // 规范：传给 `oldSwapchain` 的旧 swapchain 即使创建失败也已 retired，必须销毁。
                     self.retired_swapchains.push(old);
                 }
-                // `VK_ERROR_SURFACE_LOST_KHR` 的恢复：**重建 `VkSurfaceKHR`** 后重试一次。
-                // 合成器重启 / 显卡复位后旧 surface 永久失效，只重建 swapchain 会一直失败；
-                // 重试用尽才把错误上报（有界，不无限自旋）。
-                //
-                // 顺序由唯一入口保证（C7）：该 surface 的全部旧链**先**被强制销毁，**再**销毁
-                // 旧 surface。任何建链失败都重建 surface 的过度归因由 C8 的 `CreateFailure`
-                // 分类收窄为只对 `SURFACE_LOST` 生效。
-                self.recreate_vk_surface()?;
-                let swapchain = {
-                    let surface = self
-                        .vk_surface
-                        .as_ref()
-                        .expect("recreate_vk_surface keeps the surface");
-                    Swapchain::new(&self.shared, surface, size)?
-                };
-                self.install_swapchain(swapchain, None, size)
+                Err(failure)
             }
+        }
+    }
+
+    /// 链不在时的统一补建入口（C8；`submit_frame` 顶部调用）。
+    ///
+    /// 返回 `Some(delay)` = 本轮没有可用链，调用方必须保留 pending 帧、退避 `delay` 后重试；
+    /// `None` = 链已就绪、继续本帧。`OUT_OF_DATE` 无限重建（退避 ≤50 ms）；`SURFACE_LOST`
+    /// 先经 C7 的唯一入口重建 surface，再按 1/4/16 ms 有界重试（用尽才 `Err` 上报）。
+    fn ensure_swapchain(&mut self, reason: &'static str) -> Result<Option<Duration>, EngineError> {
+        if self.swapchain.is_some() {
+            return Ok(None);
+        }
+        match self.try_replace_swapchain(self.surface) {
+            Ok(()) => Ok(None),
+            Err(CreateFailure::Fatal(error)) => Err(error),
+            Err(CreateFailure::OutOfDate) => Ok(Some(self.wait_for_out_of_date(reason))),
+            Err(CreateFailure::SurfaceLost) => {
+                // C7：先把该 surface 的全部旧链强制销毁，再销毁旧 surface、建新的。
+                self.recreate_vk_surface()?;
+                // 新 surface 上立刻再试一次：多数合成器重启在这里恢复，不消耗重试预算。
+                match self.try_replace_swapchain(self.surface) {
+                    Ok(()) => Ok(None),
+                    Err(CreateFailure::Fatal(error)) => Err(error),
+                    Err(CreateFailure::OutOfDate) => Ok(Some(self.wait_for_out_of_date(reason))),
+                    Err(CreateFailure::SurfaceLost) => {
+                        Ok(Some(self.wait_for_surface_lost_retry(reason)?))
+                    }
+                }
+            }
+        }
+    }
+
+    /// 一次 `OUT_OF_DATE` 的可恢复处理（acquire / present 两个入口）。
+    ///
+    /// 立即尝试重建一次（OOD 不能被 SUBOPTIMAL 冷却期拦住：链已经不能 present），失败留给下一次
+    /// `submit_frame` 顶部的统一入口。**永远返回 `Submitted::Retry`**：OOD 是 WSI 的正常控制流，
+    /// 不能变成粘性错误 —— 旧实现里「连续 OOD 超过上限（4 次）就返回 EngineError」正是 C8 的
+    /// 问题本体。
+    fn retry_out_of_date(&mut self, reason: &'static str) -> Result<Submitted, EngineError> {
+        self.rebuild_swapchain = false;
+        let after = self.wait_for_out_of_date(reason);
+        if self.swapchain.is_some() {
+            match self.try_replace_swapchain(self.surface) {
+                Ok(()) | Err(CreateFailure::OutOfDate | CreateFailure::SurfaceLost) => {}
+                Err(CreateFailure::Fatal(error)) => return Err(error),
+            }
+        }
+        Ok(Submitted::Retry { after: Some(after) })
+    }
+
+    /// 一次 OOD 的退避决策 + 低频诊断（第 1 / 16 次，之后每 64 次）。
+    fn wait_for_out_of_date(&mut self, reason: &'static str) -> Duration {
+        let retry = self.out_of_date_recovery.on_out_of_date();
+        if retry.report {
+            eprintln!(
+                "kytrix: vulkan swapchain stayed OUT_OF_DATE ({} consecutive rebuilds, {reason}); \
+                 retrying in {} ms (extent={:?})",
+                self.out_of_date_recovery.out_of_date,
+                retry.after.as_millis(),
+                self.swapchain.as_ref().map(Swapchain::extent),
+            );
+        }
+        retry.after
+    }
+
+    /// 一次 surface 恢复失败的退避决策 + 诊断（3 次后上报；文案区分「连接还活着」与设备丢失）。
+    fn wait_for_surface_lost_retry(
+        &mut self,
+        reason: &'static str,
+    ) -> Result<Duration, EngineError> {
+        let attempts = self.out_of_date_recovery.surface_lost_failures + 1;
+        let after = self.out_of_date_recovery.on_surface_lost_failure(reason)?;
+        eprintln!(
+            "kytrix: vulkan compositor/connection is alive but the swapchain surface is still lost \
+             (recovery {attempts}/{SURFACE_LOST_BACKOFF_LEN}); retrying in {} ms",
+            after.as_millis()
+        );
+        Ok(after)
+    }
+
+    /// 成功 acquire / present 后的复位 + 恢复诊断（C8）。
+    fn note_progress(&mut self) {
+        if let Some(recovered) = self.out_of_date_recovery.on_progress() {
+            eprintln!(
+                "kytrix: vulkan swapchain recovered after {recovered} consecutive OUT_OF_DATE rebuilds"
+            );
+        }
+    }
+
+    /// `VK_ERROR_SURFACE_LOST_KHR` 的恢复（R11-11 + C8 有界预算）。
+    ///
+    /// 顺序（C7）：旧链先取出放进延迟队列 → [`Self::recreate_vk_surface`] 强制销毁它们并重建
+    /// surface → 用新 surface 建链。建链仍报 `SURFACE_LOST` 时按 1/4/16 ms 退避重试 3 次，
+    /// 用尽才上报；`OUT_OF_DATE` 走正常 OOD 退避（无限重试）。
+    fn recover_surface(&mut self, reason: &'static str) -> Result<Submitted, EngineError> {
+        if self.vk_surface.is_none() {
+            return Err(EngineError::Swapchain {
+                detail: smol_str::format_smolstr!("{reason}: no window surface"),
+            });
+        }
+        eprintln!("kytrix: vulkan {reason}: recreating VkSurfaceKHR");
+        // 旧 swapchain 必须用掉（它引用旧 surface），随后进延迟销毁队列 —— 由唯一入口在销毁
+        // surface **之前**强制排空。
+        if let Some(old) = self.swapchain.take() {
+            self.retired_swapchains.push(old);
+        }
+        self.recreate_vk_surface()?;
+        match self.try_replace_swapchain(self.surface) {
+            Ok(()) => Ok(Submitted::Retry { after: None }),
+            Err(CreateFailure::Fatal(error)) => Err(error),
+            Err(CreateFailure::OutOfDate) => Ok(Submitted::Retry {
+                after: Some(self.wait_for_out_of_date(reason)),
+            }),
+            Err(CreateFailure::SurfaceLost) => Ok(Submitted::Retry {
+                after: Some(self.wait_for_surface_lost_retry(reason)?),
+            }),
         }
     }
 
@@ -1061,8 +1317,8 @@ impl GpuRenderer {
     /// SUBOPTIMAL 时退化成每帧重建（帧率崩塌 + 句柄/显存抖动，现象像「卡顿」而不是错误）。两道
     /// 门槛：
     /// 1. 冷却期：刚重建过 [`REBUILD_COOLDOWN_FRAMES`] 个提交内不再重建；
-    /// 2. 预算：最近一轮里超过 [`MAX_REBUILDS`] 次就**放弃重建**，记一次诊断后继续用现有链呈现
-    ///    （并由 `swapchain.rs` 的 `log_plan` 打出实际参数）。
+    /// 2. 预算：最近一轮里超过 [`MAX_SUBOPTIMAL_REBUILDS`] 次就**放弃重建**，记一次诊断后继续
+    ///    用现有链呈现（并由 `swapchain.rs` 的 `log_plan` 打出实际参数）。
     fn request_rebuild(&mut self, reason: &'static str) -> Result<(), EngineError> {
         if self.rebuild_abandoned {
             return Ok(());
@@ -1078,11 +1334,12 @@ impl GpuRenderer {
             self.suboptimal_rebuilds = 0;
         }
         self.suboptimal_rebuilds += 1;
-        if self.suboptimal_rebuilds > MAX_REBUILDS {
+        if self.suboptimal_rebuilds > MAX_SUBOPTIMAL_REBUILDS {
             self.rebuild_abandoned = true;
             eprintln!(
-                "kytrix: vulkan swapchain keeps reporting {reason} after {MAX_REBUILDS} rebuilds; \
-                 keeping the current swapchain (extent={:?} format={:?} color_space={:?})",
+                "kytrix: vulkan swapchain keeps reporting {reason} after \
+                 {MAX_SUBOPTIMAL_REBUILDS} rebuilds; keeping the current swapchain \
+                 (extent={:?} format={:?} color_space={:?})",
                 self.swapchain.as_ref().map(Swapchain::extent),
                 self.swapchain
                     .as_ref()
@@ -1097,52 +1354,6 @@ impl GpuRenderer {
         self.recreate_swapchain()
     }
 
-    /// `OUT_OF_DATE` 的重建入口：**不能**被冷却期拦住（链已经不能 present，等冷却只会继续丢帧），
-    /// 但仍然有上界（[`MAX_REBUILDS`] 次连续失败之后报强类型错误，而不是无限自旋）。
-    fn rebuild_out_of_date(&mut self, reason: &'static str) -> Result<(), EngineError> {
-        self.out_of_date += 1;
-        if self.out_of_date > MAX_REBUILDS {
-            return Err(EngineError::Swapchain {
-                detail: smol_str::format_smolstr!(
-                    "swapchain stayed out of date after {MAX_REBUILDS} rebuilds ({reason})"
-                ),
-            });
-        }
-        self.last_rebuild_sequence = self.last_sequence;
-        self.recreate_swapchain()
-    }
-
-    /// `VK_ERROR_SURFACE_LOST_KHR` 的恢复（R11-11）：重建 `VkSurfaceKHR` 与整条 swapchain。
-    ///
-    /// 顺序（C7）：旧链先取出放进延迟队列 → [`Self::recreate_vk_surface`] 强制销毁它们并重建
-    /// surface → 用新 surface 建链。旧实现是「取出旧链 = 以为已销毁」，在旧链仍存活时销毁了
-    /// surface（VUID-vkDestroySurfaceKHR-surface-01266）。
-    fn recover_surface(&mut self, reason: &'static str) -> Result<(), EngineError> {
-        if self.vk_surface.is_none() {
-            return Err(EngineError::Swapchain {
-                detail: smol_str::format_smolstr!("{reason}: no window surface"),
-            });
-        }
-        eprintln!("kytrix: vulkan {reason}: recreating VkSurfaceKHR");
-        // 旧 swapchain 必须用掉（它引用旧 surface），随后进延迟销毁队列 —— 由唯一入口在销毁
-        // surface **之前**强制排空。
-        if let Some(old) = self.swapchain.take() {
-            self.retired_swapchains.push(old);
-        }
-        self.recreate_vk_surface()?;
-        let size = self.surface;
-        let swapchain = {
-            let surface = self
-                .vk_surface
-                .as_ref()
-                .expect("recreate_vk_surface keeps the surface");
-            Swapchain::new(&self.shared, surface, size)?
-        };
-        // `install_swapchain` 会在 extent 变化时重建 persist（单一尺寸来源）；旧 surface 的
-        // 所有参数都可能变，因此这里不再重复建 persist。
-        self.install_swapchain(swapchain, None, size)
-    }
-
     /// 销毁运行期 `Surface` 的**唯一**入口（C7）。
     ///
     /// 顺序 = 强制销毁该 surface 的全部延迟 swapchain（timeline 等待 + 有界队列 idle）→
@@ -1150,7 +1361,7 @@ impl GpuRenderer {
     /// 直接返回错误：调用方只能放弃本窗口，交给 `GpuRenderer::drop` 的 `DeferredHandles` /
     /// leak 兜底（否则在未知的队列状态下销毁句柄是二次违规）。
     ///
-    /// `recover_surface` / `replace_swapchain` 的失败分支都只能走这里；禁止直接调
+    /// `recover_surface` / `ensure_swapchain` 的失败分支都只能走这里；禁止直接调
     /// `Surface::recreate`（源码级防回归测试钉住）。
     fn recreate_vk_surface(&mut self) -> Result<(), EngineError> {
         debug_assert!(
@@ -2285,12 +2496,13 @@ fn destination_update(last: Option<(i32, i32)>, surface_local: Size) -> Option<(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use ash::vk;
 
     use super::{
-        GpuRenderer, ImageSyncStep, destination_update, plan_swapchain_copy, take_all_in_order,
+        GpuRenderer, ImageSyncStep, MAX_RETRY_BACKOFF, OutOfDateRecovery, destination_update,
+        out_of_date_backoff, out_of_date_diagnostic, plan_swapchain_copy, take_all_in_order,
     };
     use crate::{
         math::{PhysicalRect, Size},
@@ -2551,6 +2763,129 @@ mod tests {
         assert!(
             swapchain_field < surface_field,
             "字段顺序即销毁顺序：swapchain 字段必须声明在 vk_surface 之前"
+        );
+    }
+
+    /// C8 的核心不变量：任意次数（1000）连续 `OUT_OF_DATE` 都只产生「退避后重试」，不存在
+    /// 升级成 `EngineError` 的出口 —— `on_out_of_date` 的返回类型就是 `Retry`（没有 Err 分支），
+    /// 结构性证明「OOD 永不结束事件循环」。
+    #[test]
+    fn a_thousand_consecutive_out_of_date_events_never_escalate_to_a_fatal_error() {
+        let mut recovery = OutOfDateRecovery::new();
+        for _ in 0..1000 {
+            let retry = recovery.on_out_of_date();
+            assert!(
+                retry.after > Duration::ZERO && retry.after <= MAX_RETRY_BACKOFF,
+                "每次 OOD 都必须退避且不超过上限：{retry:?}"
+            );
+        }
+        assert_eq!(recovery.out_of_date, 1000, "计数只用于诊断，不是错误阈值");
+        // 第 1001 次仍然是普通重试。
+        let retry = recovery.on_out_of_date();
+        assert!(retry.after <= MAX_RETRY_BACKOFF);
+    }
+
+    /// C8：退避序列 1/2/4/8/16/32/50 ms，之后封顶（用户裁决「上限 ≤50 ms」）。
+    #[test]
+    fn the_out_of_date_backoff_doubles_up_to_the_fifty_millisecond_cap() {
+        let expected = [1u64, 2, 4, 8, 16, 32, 50, 50, 50];
+        for (offset, millis) in expected.into_iter().enumerate() {
+            let consecutive = offset as u32 + 1;
+            assert_eq!(
+                out_of_date_backoff(consecutive),
+                Duration::from_millis(millis),
+                "第 {consecutive} 次连续 OOD"
+            );
+        }
+        assert_eq!(MAX_RETRY_BACKOFF, Duration::from_millis(50));
+        // 任意次数的退避都落在 (0, 上限] 内：GPU 循环的 sleep 因此有界。
+        for consecutive in 1..=u32::from(u16::MAX) {
+            let after = out_of_date_backoff(consecutive);
+            assert!(after > Duration::ZERO && after <= MAX_RETRY_BACKOFF);
+        }
+    }
+
+    /// C8：成功 acquire / present（progress）之后 OOD 计数与 surface-lost 预算一起复位；
+    /// >1 次连续 OOD 才打一行「已恢复」诊断。
+    #[test]
+    fn progress_resets_both_the_out_of_date_and_surface_lost_budgets() {
+        let mut recovery = OutOfDateRecovery::new();
+        assert_eq!(recovery.on_progress(), None, "没有 OOD 时没有恢复诊断");
+        for _ in 0..5 {
+            recovery.on_out_of_date();
+        }
+        assert_eq!(
+            recovery.on_progress(),
+            Some(5),
+            "连续 5 次 OOD 后恢复：打一行低频诊断"
+        );
+        assert_eq!(recovery.out_of_date, 0);
+        // 复位之后退避从 1 ms 重新开始（不是接着上一次的封顶值）。
+        assert_eq!(recovery.on_out_of_date().after, Duration::from_millis(1));
+        // surface-lost 的预算也一起复位：复位后重新可用 3 次。
+        for expected in [1u64, 4, 16] {
+            assert_eq!(
+                recovery
+                    .on_surface_lost_failure("test")
+                    .expect("预算内的恢复失败必须返回退避"),
+                Duration::from_millis(expected)
+            );
+        }
+        recovery.on_progress();
+        assert_eq!(
+            recovery
+                .on_surface_lost_failure("test")
+                .expect("progress 之后预算重新开始"),
+            Duration::from_millis(1),
+        );
+    }
+
+    /// C8：`SURFACE_LOST` 有界重试 —— 只有预算（3 次退避重试）耗尽之后才上报，且错误文案
+    /// 必须区分「合成器/连接还活着但 surface 不可用」与设备丢失。
+    #[test]
+    fn the_surface_lost_budget_reports_only_after_three_failed_retries() {
+        let mut recovery = OutOfDateRecovery::new();
+        for expected in [1u64, 4, 16] {
+            assert_eq!(
+                recovery
+                    .on_surface_lost_failure("acquire reported SURFACE_LOST")
+                    .expect("预算内的恢复失败必须返回退避"),
+                Duration::from_millis(expected)
+            );
+        }
+        let error = recovery
+            .on_surface_lost_failure("acquire reported SURFACE_LOST")
+            .expect_err("3 次重试之后必须上报");
+        match error {
+            crate::error::EngineError::Swapchain { detail } => {
+                assert!(
+                    detail.contains("still alive"),
+                    "文案必须区分「连接还活着但 surface 不可用」：{detail}"
+                );
+                assert!(detail.contains("3 retries"), "{detail}");
+                assert!(detail.contains("SURFACE_LOST"), "{detail}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// C8：诊断低频 —— 1000 次连续 OOD 只打 ~17 行（第 1 / 16 次，之后每 64 次）。
+    #[test]
+    fn out_of_date_diagnostics_are_low_frequency() {
+        let reported: Vec<u32> = (1..=200)
+            .filter(|count| out_of_date_diagnostic(*count))
+            .collect();
+        assert_eq!(
+            reported,
+            vec![1, 16, 64, 128, 192],
+            "第 1 次、第 16 次，之后每 64 次"
+        );
+        let lines = (1..=1000)
+            .filter(|count| out_of_date_diagnostic(*count))
+            .count();
+        assert!(
+            (16..=17).contains(&lines),
+            "1000 次连续 OOD 的诊断行数应当 ≈17，实际 {lines}"
         );
     }
 
