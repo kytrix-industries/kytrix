@@ -196,6 +196,47 @@ pub(crate) fn layout_if_dirty(window: &mut Window) -> Result<Option<LayoutReport
 /// 本方法只把帧发布给 GPU 线程（不等待），错误由 `poll_renderer` 粘性冒泡。编码 / 帧结算
 /// 已在 `paint_frame` 与布局阶段完成，本方法体内没有任何可失败的步骤，因此返回
 /// [`FrameOutcome`] 而不是恒 `Ok` 的 `Result`。
+// 消费者：`commit_frame`（提交门禁）与 `paint_frame`（inline 合成门禁）。
+/// 本帧是否会产生 GPU 工作；`Some(plan)` = 会发布，`None` = 退回 `Idle`。
+///
+/// **唯一判据来源**：`commit_frame` 用它决定提交/Idle，`paint_frame` 用它决定是否在
+/// inline 模式下提前合成。两份判据一旦分叉，就会出现「先合成、后丢弃」—— 编码器状态被
+/// 推进而载荷被 `release_unpublished` 丢掉，下一帧按版本判据不再重编码，lane 的新图例
+/// 字节永远上不了屏（P0-4 的 inline 形态）。
+pub(crate) enum PublishDecision {
+    /// 没有像素工作（`rebuilt == 0` 且无 damage 无滚动）：不结算、不发布。
+    NoPixels,
+    /// 有像素但本帧不会产生 GPU 工作（`Plan::Idle` 且目标尺寸未变）：结算但不发布。
+    NoGpuWork,
+    /// 会发布，计划已按平台规则夹好。
+    Publish(Plan),
+}
+
+pub(crate) fn publish_decision(
+    window: &Window,
+    report: &PaintReport,
+    scroll_pending: bool,
+) -> PublishDecision {
+    let has_pixels =
+        report.rebuilt > 0 || report.damage.full || report.damage.rects > 0 || scroll_pending;
+    if !has_pixels {
+        return PublishDecision::NoPixels;
+    }
+    // 本帧只算一次：`submit_gpu` 消费同一份 `plan`（目标尺寸也来自同一次 `frame_rect`）。
+    let frame = window.frame_rect();
+    let renderer_surface = window.renderer.as_ref().map(Renderer::surface);
+    let plan = plan(report.damage, window.damage.rects(), frame);
+    // Windows：目标尺寸变化必须整帧重画（`set_content_size` 在 buffer 内是纯 CPU 记账，
+    // `Plan::Idle` 会消费帧延迟 token 却不 present）。macOS / Linux 保持原规则。
+    #[cfg(windows)]
+    let plan = surface_change_plan(plan, renderer_surface, window.surface);
+    if scroll_pending || frame_reaches_gpu(plan, renderer_surface, window.surface) {
+        PublishDecision::Publish(plan)
+    } else {
+        PublishDecision::NoGpuWork
+    }
+}
+
 pub(crate) fn commit_frame(
     window: &mut Window,
     ticket: FrameTicket,
@@ -207,52 +248,48 @@ pub(crate) fn commit_frame(
         .pending_delta
         .as_ref()
         .is_some_and(|delta| !delta.scroll.is_empty());
-    let has_pixels =
-        report.rebuilt > 0 || report.damage.full || report.damage.rects > 0 || scroll_pending;
     // 默认构建也算的读点：摘要计数必须与累加器的实际矩形数一致（P07 消费同一累加器）。
     debug_assert_eq!(
         report.damage.rects,
         window.damage.rects().len(),
         "damage summary and accumulator disagree"
     );
-    if !has_pixels {
-        // `paint_frame` 没有跑（或没产出任何 lane / 像素）：没有节点状态需要结算，
-        // damage 与 dirty 保留给下一次重试。
-        window.scheduler.abort(ticket);
-        release_unpublished(window);
-        #[cfg(feature = "hud")]
-        {
-            window.frame_started_at = None;
-            window.frame_cpu = None;
+    let plan = match publish_decision(window, &report, scroll_pending) {
+        PublishDecision::NoPixels => {
+            // `paint_frame` 没有跑（或没产出任何 lane / 像素）：没有节点状态需要结算，
+            // damage 与 dirty 保留给下一次重试。
+            window.scheduler.abort(ticket);
+            release_unpublished(window);
+            #[cfg(feature = "hud")]
+            {
+                window.frame_started_at = None;
+                window.frame_cpu = None;
+            }
+            #[cfg(feature = "test-support")]
+            window.record_idle();
+            return FrameOutcome::Idle;
         }
-        #[cfg(feature = "test-support")]
-        window.record_idle();
-        return FrameOutcome::Idle;
-    }
-    // 本帧只算一次：`submit_gpu` 消费同一份 `plan`（目标尺寸也来自同一次 `frame_rect`）。
+        PublishDecision::NoGpuWork => {
+            // paint 已经消费了 lane 重建与 damage：即使不发布，也必须像已提交的帧一样结算节点
+            // 状态（damage / REUSABLE），否则后续会 over-damage、a11y 多标（P2-1）。
+            // 只是不推进 `FrameIndex`、不发布（V-122 ⑧ / F-183）。
+            window.tree.settle_frame();
+            window.scheduler.abort(ticket);
+            release_unpublished(window);
+            #[cfg(feature = "hud")]
+            {
+                window.frame_started_at = None;
+                window.frame_cpu = None;
+            }
+            #[cfg(feature = "test-support")]
+            window.record_idle();
+            return FrameOutcome::Idle;
+        }
+        PublishDecision::Publish(plan) => plan,
+    };
+    // 帧矩形只有 `test-support` 的帧记录读（`capture` 的参数），生产构建不消费。
+    #[cfg(feature = "test-support")]
     let frame = window.frame_rect();
-    let renderer_surface = window.renderer.as_ref().map(Renderer::surface);
-    let plan = plan(report.damage, window.damage.rects(), frame);
-    // Windows：目标尺寸变化必须整帧重画（`set_content_size` 在 buffer 内是纯 CPU 记账，
-    // `Plan::Idle` 会消费帧延迟 token 却不 present）。macOS / Linux 保持原规则。
-    #[cfg(windows)]
-    let plan = surface_change_plan(plan, renderer_surface, window.surface);
-    if !scroll_pending && !frame_reaches_gpu(plan, renderer_surface, window.surface) {
-        // paint 已经消费了 lane 重建与 damage：即使不发布，也必须像已提交的帧一样结算节点
-        // 状态（damage / REUSABLE），否则后续会 over-damage、a11y 多标（P2-1）。
-        // 只是不推进 `FrameIndex`、不发布（V-122 ⑧ / F-183）。
-        window.tree.settle_frame();
-        window.scheduler.abort(ticket);
-        release_unpublished(window);
-        #[cfg(feature = "hud")]
-        {
-            window.frame_started_at = None;
-            window.frame_cpu = None;
-        }
-        #[cfg(feature = "test-support")]
-        window.record_idle();
-        return FrameOutcome::Idle;
-    }
     let index = window.scheduler.commit(ticket);
     window.tree.settle_frame();
     if let Some(mut renderer) = window.renderer.take() {
@@ -265,6 +302,8 @@ pub(crate) fn commit_frame(
             let _ = stats;
         }
     }
+    // 已提交：delta 已被 `submit_gpu` 取走（threaded）或不再需要（inline 已编码成载荷）。
+    window.pending_delta = None;
     release_unpublished(window);
     #[cfg(feature = "test-support")]
     {
@@ -296,18 +335,14 @@ pub(crate) fn commit_frame(
 }
 
 // 消费者：`commit_frame`（三条出口：Idle×2 / Committed）。
-/// 丢弃本帧**没有被发布**的中间产物（`SceneDelta` / `ComposedFrame`）。
+/// 丢弃本帧**没有被发布**的合成载荷（`ComposedFrame`），但保留 `SceneDelta`。
 ///
-/// 它们唯一的消费者是 `submit_gpu`：threaded 模式取走 delta 交给合成线程，inline 模式取走载荷
-/// 交给渲染器。没有渲染器（headless / 离屏无 GPU）或本帧退回 `Idle` 时没人消费，**必须在本帧
-/// 结束时释放**：
-///
-/// 1. 留到下一帧没有任何意义（下一帧会重建，旧 delta 的帧序号已过期）；
-/// 2. 全量帧的 delta 是「每条 lane 一份 `Arc<[Primitive]>` 快照」，析构 10k 条 lane 需要数百 µs
-///    —— 把它留到下一帧，这笔开销就落进**下一帧的计时区**（`frame_incremental_10k` 的
-///    `paint → 下一帧` 组合尤其明显：全量帧之后的第一帧会被算上上一帧的析构）。
+/// `SceneDelta` 是 UI 侧唯一知道「哪些 lane 在这一帧变成了什么」的描述；`DeltaBuilder` 的
+/// 版本号在构建它时已经推进。如果本帧因为没有 GPU 工作（damage 被窗口/视口裁空）而不发布，
+/// 直接丢掉 delta 会让这些 lane 的**新图元永不再发送**（后续帧版本相等 ⇒ 不再产生 delta；
+/// 滚动把节点带进视口时只能看到旧图元）。因此 delta 必须留到下一次真实提交，由
+/// `paint_frame` 的 `absorb` 合并。`ComposedFrame` 是编码产物，可以从 delta 重建，释放即可。
 fn release_unpublished(window: &mut Window) {
-    window.pending_delta = None;
     window.pending_payload = None;
 }
 

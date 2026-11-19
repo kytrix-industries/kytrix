@@ -123,12 +123,10 @@ cargo run --release -p ui_core --example snapshot_demo --features test-support -
   `cargo test -p ui_core --features "hud,test-support" --example demo`（无 HUD 为 **39** 项，
   带 HUD 为 **40** 项；数据为 HEAD `8d3a8c6` 实测）。
 - **golden 详情**（字节语义 / 容差 / 平台策略 / 失败热力图）：[`tests/golden/README.md`](tests/golden/README.md)。
-- macOS / Linux 的真机验证记录随旧设计文档一起删除；结论以 CI 日志与 Git 历史为准（本 crate 不再维护该文档）。
 - 缺 shader 工具链时设 `ui_core_SKIP_SHADERS=1`（产物是占位符，**GPU 测试会失败**，只用于交叉 `cargo check`）。
   构建依赖：`pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev glslang-tools fonts-noto-cjk`。
 - 交叉 target：`cargo check -p ui_core --target {aarch64-apple-darwin, x86_64-unknown-linux-gnu}`
   （Linux 需要 `pkg-config` stub 提供 `fontconfig`）。
-- CI：[`.github/workflows/gui-ci.yml`](../../.github/workflows/gui-ci.yml)（windows / ubuntu / macos 三个 job）。
 
 ## 文档与偏差入口
 

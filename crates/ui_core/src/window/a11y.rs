@@ -119,7 +119,9 @@ pub(crate) fn a11y_only_frame(window: &Window) -> bool {
         // 变，帧尾那次夹紧与本帧无关。damage 一旦出现就说明还有像素要写。
         && !window.full_damage_pending
         && window.pending_damage.is_none()
-        && window.pending_delta.is_none()
+        // `pending_delta` **不**参与门禁：Idle 帧会保留未发布的 delta（P0-4），它不含本帧
+        // 的像素工作，也不被 a11y-only 出口消费 —— 留到下一次真实提交即可。把它算进来会
+        // 让快路径在任何 Idle 帧之后被永久饿死。
         // 图集行没上去就不能跳过帧（否则新字形永远不出现；补帧由 `App::frame` 的尾部负责）。
         && !window.atlas_rects_pending()
 }

@@ -736,6 +736,462 @@ fn a_one_pixel_scroll_frame_rebuilds_nothing_and_damages_only_the_viewport() {
     );
 }
 
+/// P0 回归：inline composer 在 Idle 帧不得提前消费并丢弃已编码的 lane 实例字节；下一
+/// 个滚动提交帧必须能重新编码出非空 payload。
+#[cfg(all(windows, feature = "test-support"))]
+#[test]
+fn an_idle_frame_does_not_advance_the_inline_composer() {
+    let (_rt, mut app, window, container, _child) = scrollable_app();
+    app.window_mut(window)
+        .expect("window")
+        .enable_offscreen_renderer()
+        .expect("offscreen renderer");
+    let third = mount_override(
+        &mut app,
+        window,
+        container,
+        Rect::new(0.0, 900.0, 200.0, 100.0),
+    );
+    let handle = app.scroll_handle(window, container).expect("scroll handle");
+    app.set_scroll_content(&handle, Size::new(200.0, 1100.0))
+        .expect("content");
+    frame(&mut app, window);
+
+    let patch = StylePatch {
+        background: Some(Color::BLACK),
+        ..StylePatch::default()
+    };
+    assert!(
+        app.window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .set_style_patch(third, patch)
+    );
+    assert!(
+        app.window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .mark_paint(third)
+    );
+    let idle = app
+        .window_mut(window)
+        .expect("window")
+        .paint_frame(&crate::paint::geometry_store::GeometryStore::new())
+        .expect("idle paint");
+    assert_eq!(
+        (idle.damage.rects, idle.damage.full),
+        (0, false),
+        "前置条件：视口外改色必须没有像素 damage（lane 可以重建，但不会提交）"
+    );
+    assert!(
+        !app.window(window).expect("window").has_pending_payload(),
+        "Idle 帧不能提前合成出已被丢弃的 inline payload"
+    );
+    assert!(
+        app.window(window)
+            .expect("window")
+            .pending_delta()
+            .is_some(),
+        "Idle 帧仍必须保留 SceneDelta"
+    );
+
+    app.scroll_to(&handle, Point::new(0.0, 900.0))
+        .expect("scroll");
+    let scroll = app
+        .window_mut(window)
+        .expect("window")
+        .paint_frame(&crate::paint::geometry_store::GeometryStore::new())
+        .expect("scroll paint");
+    assert!(
+        scroll.uploaded_bytes > 0,
+        "滚动提交帧必须重新编码出 lane 实例字节，不能沿用 Idle 帧提前推进的编码器状态"
+    );
+    assert!(
+        app.window(window).expect("window").has_pending_payload(),
+        "滚动帧必须产出可发布的 inline payload"
+    );
+}
+
+/// P0 回归：连续多个 Idle 帧保留的 delta 必须在一次提交里全部合并（lane 不丢、同槽不重复）。
+#[cfg(all(windows, feature = "test-support"))]
+#[test]
+fn consecutive_idle_frames_accumulate_their_scene_deltas() {
+    let (_rt, mut app, window, container, _child) = scrollable_app();
+    app.window_mut(window)
+        .expect("window")
+        .enable_offscreen_renderer()
+        .expect("offscreen renderer");
+    let third = mount_override(
+        &mut app,
+        window,
+        container,
+        Rect::new(0.0, 900.0, 200.0, 100.0),
+    );
+    let fourth = mount_override(
+        &mut app,
+        window,
+        container,
+        Rect::new(0.0, 1000.0, 200.0, 100.0),
+    );
+    let handle = app.scroll_handle(window, container).expect("scroll handle");
+    app.set_scroll_content(&handle, Size::new(200.0, 1100.0))
+        .expect("content");
+    frame(&mut app, window);
+    app.window_mut(window).expect("window").detach_composer();
+
+    let mut lanes = Vec::new();
+    for node in [third, fourth] {
+        let patch = StylePatch {
+            background: Some(Color::BLACK),
+            ..StylePatch::default()
+        };
+        assert!(
+            app.window_mut(window)
+                .expect("window")
+                .tree_mut()
+                .set_style_patch(node, patch)
+        );
+        assert!(
+            app.window_mut(window)
+                .expect("window")
+                .tree_mut()
+                .mark_paint(node)
+        );
+        let report = app
+            .window_mut(window)
+            .expect("window")
+            .paint_frame(&crate::paint::geometry_store::GeometryStore::new())
+            .expect("idle paint");
+        assert_eq!(
+            (report.damage.rects, report.damage.full),
+            (0, false),
+            "视口外改色必须没有像素 damage"
+        );
+        lanes.push(
+            app.window(window)
+                .expect("window")
+                .tree()
+                .lane_of(node)
+                .expect("lane"),
+        );
+    }
+
+    let pending = app
+        .window(window)
+        .expect("window")
+        .pending_delta()
+        .expect("连续 Idle 帧必须保留 delta");
+    for lane in &lanes {
+        assert!(
+            pending.lanes.iter().any(|delta| delta.lane == *lane),
+            "连续 Idle 帧的 delta 必须累积，不能只保留最后一帧"
+        );
+    }
+    assert_eq!(
+        pending
+            .lanes
+            .iter()
+            .filter(|delta| delta.lane == lanes[0])
+            .count(),
+        1,
+        "同一 lane 只能出现一次"
+    );
+
+    app.scroll_to(&handle, Point::new(0.0, 900.0))
+        .expect("scroll");
+    let report = app
+        .window_mut(window)
+        .expect("window")
+        .paint_frame(&crate::paint::geometry_store::GeometryStore::new())
+        .expect("scroll paint");
+    assert!(report.damage.rects > 0, "滚动帧必须产出 damage");
+    let pending = app
+        .window(window)
+        .expect("window")
+        .pending_delta()
+        .expect("滚动帧 delta");
+    for lane in &lanes {
+        assert!(
+            pending.lanes.iter().any(|delta| delta.lane == *lane),
+            "提交帧必须带上前几帧保留的全部 lane"
+        );
+    }
+}
+
+/// P0 回归：Idle 帧保留的 removed 必须活到下一次提交，且同槽旧 lane 不得复活。
+#[cfg(all(windows, feature = "test-support"))]
+#[test]
+fn a_removed_lane_survives_an_idle_frame_and_reaches_the_next_commit() {
+    let (_rt, mut app, window, container, _child) = scrollable_app();
+    app.window_mut(window)
+        .expect("window")
+        .enable_offscreen_renderer()
+        .expect("offscreen renderer");
+    let third = mount_override(
+        &mut app,
+        window,
+        container,
+        Rect::new(0.0, 900.0, 200.0, 100.0),
+    );
+    let handle = app.scroll_handle(window, container).expect("scroll handle");
+    app.set_scroll_content(&handle, Size::new(200.0, 1100.0))
+        .expect("content");
+    frame(&mut app, window);
+    app.window_mut(window).expect("window").detach_composer();
+
+    let patch = StylePatch {
+        background: Some(Color::BLACK),
+        ..StylePatch::default()
+    };
+    assert!(
+        app.window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .set_style_patch(third, patch)
+    );
+    assert!(
+        app.window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .mark_paint(third)
+    );
+    let idle = app
+        .window_mut(window)
+        .expect("window")
+        .paint_frame(&crate::paint::geometry_store::GeometryStore::new())
+        .expect("idle paint");
+    assert_eq!((idle.damage.rects, idle.damage.full), (0, false));
+    let lane = app
+        .window(window)
+        .expect("window")
+        .tree()
+        .lane_of(third)
+        .expect("third lane");
+    assert!(
+        app.window(window)
+            .expect("window")
+            .pending_delta()
+            .expect("idle delta")
+            .lanes
+            .iter()
+            .any(|delta| delta.lane == lane),
+        "前置条件：Idle 帧保留了这个 lane 的新图元"
+    );
+
+    app.window_mut(window)
+        .expect("window")
+        .tree_mut()
+        .remove(third)
+        .expect("remove");
+    let _ = app
+        .window_mut(window)
+        .expect("window")
+        .paint_frame(&crate::paint::geometry_store::GeometryStore::new())
+        .expect("removal paint");
+    let pending = app
+        .window(window)
+        .expect("window")
+        .pending_delta()
+        .expect("removal delta");
+    assert!(
+        pending.removed.contains(&lane),
+        "被移除的 lane 必须留在 delta 的 removed 里，等下一次提交"
+    );
+    assert!(
+        !pending
+            .lanes
+            .iter()
+            .any(|delta| delta.lane.slot() == lane.slot()),
+        "同槽的旧代际 lane 不得与 removed 同时存在（否则会复活）"
+    );
+}
+
+/// P0 回归：Idle 帧保留 delta 之后，a11y-only 快路径不得被永久饿死（R13-6）。
+#[cfg(all(windows, feature = "test-support"))]
+#[test]
+fn an_a11y_only_frame_still_runs_after_a_retained_delta() {
+    let (_rt, mut app, window, container, _child) = scrollable_app();
+    app.window_mut(window)
+        .expect("window")
+        .enable_offscreen_renderer()
+        .expect("offscreen renderer");
+    let third = mount_override(
+        &mut app,
+        window,
+        container,
+        Rect::new(0.0, 900.0, 200.0, 100.0),
+    );
+    let label_signal = app.signal(smol_str::SmolStr::new_static("旧的"));
+    let source = label_signal;
+    let label = NodeBuilder::boxed()
+        .layout_override(Rect::new(0.0, 0.0, 100.0, 20.0))
+        .paint(background())
+        .bind_a11y(move |cx| crate::a11y::A11yPatch {
+            label: Some(cx.read(&source).clone()),
+            ..crate::a11y::A11yPatch::default()
+        })
+        .build(
+            app.window_mut(window).expect("window").tree_mut(),
+            container,
+        )
+        .expect("a11y label");
+    let handle = app.scroll_handle(window, container).expect("scroll handle");
+    app.set_scroll_content(&handle, Size::new(200.0, 1100.0))
+        .expect("content");
+    frame(&mut app, window);
+    let _ = app.a11y_take(window);
+    app.window_mut(window).expect("window").detach_composer();
+
+    // 视口外改色 ⇒ Idle，且 delta 被保留（P0-4 的新不变量）。
+    let patch = StylePatch {
+        background: Some(Color::BLACK),
+        ..StylePatch::default()
+    };
+    assert!(
+        app.window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .set_style_patch(third, patch)
+    );
+    assert!(
+        app.window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .mark_paint(third)
+    );
+    let idle = app
+        .window_mut(window)
+        .expect("window")
+        .paint_frame(&crate::paint::geometry_store::GeometryStore::new())
+        .expect("idle paint");
+    assert_eq!((idle.damage.rects, idle.damage.full), (0, false));
+    assert!(
+        app.window(window)
+            .expect("window")
+            .pending_delta()
+            .is_some(),
+        "前置条件：Idle 帧必须保留 delta"
+    );
+
+    // 只写 a11y 绑定：本帧不得跑像素管线，a11y-only 快路径必须照常记一笔。
+    assert!(
+        app.write(&label_signal, smol_str::SmolStr::new_static("新的")),
+        "写 a11y 绑定必须失效"
+    );
+    let outcome = frame(&mut app, window);
+    assert!(
+        matches!(outcome, FrameOutcome::Idle),
+        "a11y-only 帧不得提交像素（实际 {outcome:?}）"
+    );
+    let record = app
+        .window(window)
+        .expect("window")
+        .record()
+        .expect("record");
+    assert!(
+        record.a11y_only,
+        "保留的 delta 不得让 a11y-only 快路径失效（否则每次 a11y 更新都跑完整像素调度）"
+    );
+    assert_eq!(record.stats.a11y_only_frames, 1);
+    let snapshot = app.a11y_take(window).expect("a11y 交付必须发生");
+    assert_eq!(
+        snapshot.node_for(label).expect("label 节点").label_text(),
+        Some("新的")
+    );
+}
+
+/// P0 回归：Idle 帧构建的 `SceneDelta` 不得被丢弃；滚入视口时必须带上该 lane 的新图元。
+///
+/// 旧实现 `release_unpublished` 直接 `pending_delta = None`，但 `DeltaBuilder` 的版本号已经
+/// 推进到新版本 ⇒ 下一帧 `collect` 认为「没变化」，滚动帧（不重建 lane）只能画出旧图元。
+/// 这里把第三行放在滚动视口外：改色帧的 damage 被裁空 ⇒ `FrameOutcome::Idle`；随后滚入
+/// 视口，滚动帧本身不重建 lane，唯一能带上新图元的通道就是被保留并合并的旧 delta。
+#[cfg(all(windows, feature = "test-support"))]
+#[test]
+fn an_idle_frame_keeps_its_scene_delta_for_the_next_scroll_frame() {
+    let (_rt, mut app, window, container, _child) = scrollable_app();
+    app.window_mut(window)
+        .expect("window")
+        .enable_offscreen_renderer()
+        .expect("offscreen renderer");
+    let third = mount_override(
+        &mut app,
+        window,
+        container,
+        Rect::new(0.0, 900.0, 200.0, 100.0),
+    );
+    let handle = app.scroll_handle(window, container).expect("scroll handle");
+    app.set_scroll_content(&handle, Size::new(200.0, 1100.0))
+        .expect("content");
+    frame(&mut app, window);
+    // 模拟真实窗口的 threaded 路径：编码器不在 UI 线程（否则 inline composer 会在 Idle
+    // 帧里提前消费 delta，测不到 UI 侧保留逻辑）。渲染器仍保留，用来让 `Plan::Idle` 真正
+    // 退回 Idle。
+    app.window_mut(window).expect("window").detach_composer();
+
+    // 只改颜色（PAINT-only）：第三行在视口 150 之外，damage 被裁空 ⇒ 本帧必须 Idle。
+    let patch = StylePatch {
+        background: Some(Color::BLACK),
+        ..StylePatch::default()
+    };
+    assert!(
+        app.window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .set_style_patch(third, patch)
+    );
+    assert!(
+        app.window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .mark_paint(third)
+    );
+    let outcome = frame(&mut app, window);
+    assert_eq!(
+        outcome,
+        FrameOutcome::Idle,
+        "视口外节点的 damage 被裁空必须退回 Idle"
+    );
+    let lane = app
+        .window(window)
+        .expect("window")
+        .tree()
+        .lane_of(third)
+        .expect("third row lane");
+    let pending = app
+        .window(window)
+        .expect("window")
+        .pending_delta()
+        .expect("Idle 帧必须保留已构建的 SceneDelta");
+    assert!(
+        pending.lanes.iter().any(|delta| delta.lane == lane),
+        "保留的 delta 必须包含第三行的新图元"
+    );
+
+    // 滚到 900：第三行进入视口。纯滚动帧不重建 lane，必须由保留的 delta 带上新颜色。
+    app.scroll_to(&handle, Point::new(0.0, 900.0))
+        .expect("scroll");
+    let report = app
+        .window_mut(window)
+        .expect("window")
+        .paint_frame(&crate::paint::geometry_store::GeometryStore::new())
+        .expect("scroll paint");
+    assert!(report.damage.rects > 0, "滚动帧必须产出视口 damage");
+    let pending = app
+        .window(window)
+        .expect("window")
+        .pending_delta()
+        .expect("滚动帧必须产出待发布 delta");
+    assert!(
+        pending.lanes.iter().any(|delta| delta.lane == lane),
+        "滚动帧的 delta 必须合并 Idle 帧保留的第三行 lane"
+    );
+    assert!(
+        !pending.scroll.is_empty(),
+        "滚动帧的 delta 必须带上滚动偏移"
+    );
+}
+
 /// **滚动合成端偏移**（架构决策 B3B6 §4 / wave-5）：滚动既不改 `layout.bounds`，也**不改图元**。
 ///
 /// 偏移移动到 `Window` 的滚动槽表里（槽位 → 偏移），合成线程只更新 `FramePayload::scroll`，

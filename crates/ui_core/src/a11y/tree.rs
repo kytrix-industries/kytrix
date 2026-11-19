@@ -9,6 +9,7 @@
 //!    滚动状态 —— 这些是引擎**已经知道**的事实，不该逼应用逐节点手填；
 //! 3. **稳定身份**：一切 id（自身 / children / parent）都经 `a11y::identity` 的分配器发放。
 
+use ahash::HashMapExt;
 use smallvec::SmallVec;
 
 use crate::{
@@ -69,14 +70,31 @@ impl std::fmt::Debug for NodeA11y {
 
 /// 构建一个节点的 a11y 快照记录（角色 → 名字 → 值 → 隐藏 → 禁用 → 动作 → 自动语义 → 稳定身份）。
 ///
+/// 生产入口是 [`node_a11y_with_cache`]：表级语义索引由调用方跨节点复用。这里只为同模块单测
+/// 保留一次性的索引（每个测试用例的树/结构独立，缓存没有复用价值）。
+///
 /// 返回 `None` = 句柄陈旧（调用方已过滤，防御性）。诊断直接推进 `diagnostics`。
 /// 稳定身份由 `ids` 发放（同一节点跨帧不变、逻辑行重建后不变）。
+#[cfg(test)]
 pub(crate) fn node_a11y(
     tree: &NodeTree,
     node: NodeId,
     scale: Scale,
     title: &str,
     ids: &mut A11yIds,
+    diagnostics: &mut Vec<A11yDiagnostic>,
+) -> Option<A11yNode> {
+    let mut tables = TableSemanticsCache::default();
+    node_a11y_with_cache(tree, node, scale, title, ids, &mut tables, diagnostics)
+}
+
+pub(crate) fn node_a11y_with_cache(
+    tree: &NodeTree,
+    node: NodeId,
+    scale: Scale,
+    title: &str,
+    ids: &mut A11yIds,
+    tables: &mut TableSemanticsCache,
     diagnostics: &mut Vec<A11yDiagnostic>,
 ) -> Option<A11yNode> {
     let target = tree.get(node).ok()?;
@@ -170,7 +188,7 @@ pub(crate) fn node_a11y(
     };
 
     // 表格语义（A2）：行/列索引与总数在没有显式声明时**自动推导**。
-    let table = derive_table_semantics(tree, node, role, over, patch);
+    let table = derive_table_semantics(tree, node, role, over, patch, tables);
     let sort = patch
         .and_then(|patch| patch.sort)
         .or_else(|| over.and_then(|over| over.sort));
@@ -397,12 +415,95 @@ struct TableSemantics {
     column_count: Option<usize>,
 }
 
+/// 表级语义索引：一张表只扫一遍直接子节点，行/列号与总数都是 O(1) 查询。
+///
+/// 旧实现每个 `Row`/`Cell` 都重新遍历整张表（`count_rows` / `count_columns` /
+/// `sibling_index_where`），5000×8 的表是 O(行×列×行) 的 arena 访问；AT 接入或 DPI
+/// 变化时按 2048/批交付，会把 UI 冻结数秒。Chrome 的 `AXTableInfo` 也是构建时一次算好
+/// row/column count，cell 只做索引查询。
+#[derive(Default)]
+pub(crate) struct TableSemanticsCache {
+    tables: ahash::HashMap<NodeId, TableIndex>,
+    /// 建索引次数（仅测试：证明每个表每笔交付只扫一次）。
+    #[cfg(test)]
+    builds: u64,
+}
+
+struct TableIndex {
+    row_count: Option<usize>,
+    column_count: Option<usize>,
+    rows: ahash::HashMap<NodeId, RowIndex>,
+}
+
+struct RowIndex {
+    row_index: usize,
+    cells: ahash::HashMap<NodeId, usize>,
+}
+
+impl TableSemanticsCache {
+    /// 开始一笔新交付：表格结构可能已经变化，索引不能跨批复用。
+    pub(crate) fn clear(&mut self) {
+        self.tables.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn builds(&self) -> u64 {
+        self.builds
+    }
+
+    fn index(&mut self, tree: &NodeTree, table: NodeId) -> &TableIndex {
+        self.tables.entry(table).or_insert_with(|| {
+            #[cfg(test)]
+            {
+                self.builds = self.builds.saturating_add(1);
+            }
+            build_table_index(tree, table)
+        })
+    }
+}
+
+/// 扫一遍表：直接 `Row` 子节点编号、每个行的 `Cell` 子节点编号、最宽行即列数。
+fn build_table_index(tree: &NodeTree, table: NodeId) -> TableIndex {
+    let table_children = children_of(tree, table).len();
+    let mut rows = ahash::HashMap::with_capacity(table_children);
+    let mut row_count = 0usize;
+    let mut widest = 0usize;
+    for row in children_of(tree, table) {
+        if !is_row_role(tree, *row) {
+            continue;
+        }
+        let mut cells = ahash::HashMap::with_capacity(children_of(tree, *row).len());
+        let mut column_index = 0usize;
+        for cell in children_of(tree, *row) {
+            if is_cell_role(tree, *cell) {
+                cells.insert(*cell, column_index);
+                column_index += 1;
+            }
+        }
+        widest = widest.max(column_index);
+        rows.insert(
+            *row,
+            RowIndex {
+                row_index: row_count,
+                cells,
+            },
+        );
+        row_count += 1;
+    }
+    TableIndex {
+        row_count: (row_count > 0).then_some(row_count),
+        column_count: (widest > 0).then_some(widest),
+        rows,
+    }
+}
+
 fn derive_table_semantics(
     tree: &NodeTree,
     node: NodeId,
     role: A11yRole,
     over: Option<&A11yOverride>,
     patch: Option<&A11yPatch>,
+    tables: &mut TableSemanticsCache,
 ) -> TableSemantics {
     let mut semantics = TableSemantics {
         row_index: patch
@@ -421,24 +522,30 @@ fn derive_table_semantics(
     let parent = tree.get(node).ok().and_then(Node::parent);
     match role {
         A11yRole::Table | A11yRole::Grid => {
-            if semantics.row_count.is_none() {
-                semantics.row_count = count_rows(tree, node);
-            }
-            if semantics.column_count.is_none() {
-                semantics.column_count = count_columns(tree, node);
+            // 声明齐全的表不需要结构扫描（旧实现对声明完整场景是 O(1)）。
+            if semantics.row_count.is_none() || semantics.column_count.is_none() {
+                let index = tables.index(tree, node);
+                if semantics.row_count.is_none() {
+                    semantics.row_count = index.row_count;
+                }
+                if semantics.column_count.is_none() {
+                    semantics.column_count = index.column_count;
+                }
             }
         }
         A11yRole::Row => {
             let Some(parent) = parent else {
                 return semantics;
             };
-            if is_table_role(tree, parent) {
+            if is_table_role(tree, parent)
+                && (semantics.row_index.is_none() || semantics.row_count.is_none())
+            {
+                let index = tables.index(tree, parent);
                 if semantics.row_index.is_none() {
-                    semantics.row_index = row_sibling_index(tree, node);
+                    semantics.row_index = index.rows.get(&node).map(|row| row.row_index);
                 }
                 if semantics.row_count.is_none() {
-                    semantics.row_count =
-                        declared_row_count(tree, parent).or_else(|| count_rows(tree, parent));
+                    semantics.row_count = declared_row_count(tree, parent).or(index.row_count);
                 }
             }
         }
@@ -446,23 +553,33 @@ fn derive_table_semantics(
             let Some(row) = parent else {
                 return semantics;
             };
+            if is_row_role(tree, row)
+                && let Some(table) = tree.get(row).ok().and_then(Node::parent)
+                && (semantics.row_index.is_none()
+                    || semantics.column_index.is_none()
+                    || semantics.row_count.is_none()
+                    || semantics.column_count.is_none())
+            {
+                let index = tables.index(tree, table);
+                let row_info = index.rows.get(&row);
+                if semantics.row_index.is_none() {
+                    semantics.row_index = row_info.map(|row| row.row_index);
+                }
+                if semantics.column_index.is_none() {
+                    semantics.column_index = row_info.and_then(|row| row.cells.get(&node).copied());
+                }
+                if semantics.row_count.is_none() {
+                    semantics.row_count = declared_row_count(tree, table).or(index.row_count);
+                }
+                if semantics.column_count.is_none() {
+                    semantics.column_count =
+                        declared_column_count(tree, table).or(index.column_count);
+                }
+            }
+            // 旧实现的兄弟索引回退：允许非 Row 容器直接挂 Cell/表头（不规范但已有调用方
+            // 依赖 `Some(0)`）。正常 Row 路径已在上面用 O(1) 的 RowIndex 命中。
             if semantics.column_index.is_none() {
                 semantics.column_index = cell_sibling_index(tree, node);
-            }
-            if is_row_role(tree, row) {
-                if semantics.row_index.is_none() {
-                    semantics.row_index = row_sibling_index(tree, row);
-                }
-                if let Some(table) = tree.get(row).ok().and_then(Node::parent) {
-                    if semantics.row_count.is_none() {
-                        semantics.row_count =
-                            declared_row_count(tree, table).or_else(|| count_rows(tree, table));
-                    }
-                    if semantics.column_count.is_none() {
-                        semantics.column_count = declared_column_count(tree, table)
-                            .or_else(|| count_columns(tree, table));
-                    }
-                }
             }
         }
         _ => {}
@@ -503,6 +620,21 @@ fn children_of(tree: &NodeTree, node: NodeId) -> &[NodeId] {
     tree.get(node).map_or(&[], |target| target.children())
 }
 
+/// `Cell` 在父容器同角色兄弟里的序号（仅在父不是声明 `Row` 的兼容路径上使用）。
+fn cell_sibling_index(tree: &NodeTree, node: NodeId) -> Option<usize> {
+    let parent = tree.get(node).ok()?.parent()?;
+    let mut index = 0usize;
+    for child in children_of(tree, parent) {
+        if *child == node {
+            return Some(index);
+        }
+        if is_cell_role(tree, *child) {
+            index += 1;
+        }
+    }
+    None
+}
+
 /// 表节点声明的行数（`row_count` 在表上声明时优先用它）。
 fn declared_row_count(tree: &NodeTree, table: NodeId) -> Option<usize> {
     let slot = tree.a11y_of(table)?;
@@ -516,58 +648,6 @@ fn declared_column_count(tree: &NodeTree, table: NodeId) -> Option<usize> {
     slot.patch
         .column_count
         .or_else(|| slot.over.as_ref().and_then(|over| over.column_count))
-}
-
-/// 行数 = 声明为 `Row` 的直接子节点数（没有 ⇒ `None`，不编造 0）。
-fn count_rows(tree: &NodeTree, table: NodeId) -> Option<usize> {
-    let rows = children_of(tree, table)
-        .iter()
-        .filter(|child| is_row_role(tree, **child))
-        .count();
-    (rows > 0).then_some(rows)
-}
-
-/// 列数 = 各行里声明为 `Cell`/`ColumnHeader`/`RowHeader` 的子节点数的最大值。
-fn count_columns(tree: &NodeTree, table: NodeId) -> Option<usize> {
-    let mut widest = 0usize;
-    for row in children_of(tree, table) {
-        if !is_row_role(tree, *row) {
-            continue;
-        }
-        let cells = children_of(tree, *row)
-            .iter()
-            .filter(|child| is_cell_role(tree, **child))
-            .count();
-        widest = widest.max(cells);
-    }
-    (widest > 0).then_some(widest)
-}
-
-/// 节点在"同角色兄弟"里的序号（`Row` 在表里、`Cell` 在行里）。
-fn sibling_index_where(
-    tree: &NodeTree,
-    node: NodeId,
-    predicate: fn(&NodeTree, NodeId) -> bool,
-) -> Option<usize> {
-    let parent = tree.get(node).ok()?.parent()?;
-    let mut index = 0usize;
-    for child in children_of(tree, parent) {
-        if *child == node {
-            return Some(index);
-        }
-        if predicate(tree, *child) {
-            index += 1;
-        }
-    }
-    None
-}
-
-fn row_sibling_index(tree: &NodeTree, node: NodeId) -> Option<usize> {
-    sibling_index_where(tree, node, is_row_role)
-}
-
-fn cell_sibling_index(tree: &NodeTree, node: NodeId) -> Option<usize> {
-    sibling_index_where(tree, node, is_cell_role)
 }
 
 /// 把 `root` 及其整棵子树（DFS 先序）推进 `out`（去重由调用方决定）。
@@ -861,6 +941,198 @@ mod tests {
         );
         // 加了一个表头单元格 ⇒ 列数变成 4（自动推导必须跟着结构走）。
         assert_eq!(snapshot(&tree, table).column_count, Some(4));
+    }
+
+    /// P0 回归：5000×8 表每笔交付只建一次语义索引，末尾行列号仍必须正确。
+    ///
+    /// 旧实现每个 cell 都重扫整张表（O(行×列×行)）；本用例的 `builds()` 断言把「每 cell
+    /// 重新扫描」变成可失败的事实：任何回退都会让 builds 变成 cell 数量级。
+    #[test]
+    fn a_large_table_builds_the_semantics_index_once() {
+        const ROWS: usize = 5000;
+        const COLS: usize = 8;
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let table = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Table),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("table");
+        let mut last_row = None;
+        let mut last_cell = None;
+        for row_index in 0..ROWS {
+            let row = NodeBuilder::boxed()
+                .a11y(A11yOverride {
+                    role: Some(A11yRole::Row),
+                    ..A11yOverride::default()
+                })
+                .build(&mut tree, table)
+                .expect("row");
+            for column_index in 0..COLS {
+                let cell = NodeBuilder::boxed()
+                    .a11y(A11yOverride {
+                        role: Some(A11yRole::Cell),
+                        ..A11yOverride::default()
+                    })
+                    .build(&mut tree, row)
+                    .expect("cell");
+                if row_index + 1 == ROWS && column_index + 1 == COLS {
+                    last_cell = Some(cell);
+                }
+            }
+            if row_index + 1 == ROWS {
+                last_row = Some(row);
+            }
+        }
+
+        let mut ids = A11yIds::new();
+        let mut tables = super::TableSemanticsCache::default();
+        let mut diagnostics = Vec::new();
+        let table_node = super::node_a11y_with_cache(
+            &tree,
+            table,
+            Scale::ONE,
+            "",
+            &mut ids,
+            &mut tables,
+            &mut diagnostics,
+        )
+        .expect("table snapshot");
+        assert_eq!(table_node.row_count, Some(ROWS));
+        assert_eq!(table_node.column_count, Some(COLS));
+        assert_eq!(tables.builds(), 1, "表容器必须只建一次索引");
+
+        let row_node = super::node_a11y_with_cache(
+            &tree,
+            last_row.expect("last row"),
+            Scale::ONE,
+            "",
+            &mut ids,
+            &mut tables,
+            &mut diagnostics,
+        )
+        .expect("row snapshot");
+        assert_eq!(row_node.row_index, Some(ROWS - 1));
+        assert_eq!(row_node.row_count, Some(ROWS));
+
+        let cell_node = super::node_a11y_with_cache(
+            &tree,
+            last_cell.expect("last cell"),
+            Scale::ONE,
+            "",
+            &mut ids,
+            &mut tables,
+            &mut diagnostics,
+        )
+        .expect("cell snapshot");
+        assert_eq!(cell_node.row_index, Some(ROWS - 1));
+        assert_eq!(cell_node.column_index, Some(COLS - 1));
+        assert_eq!(cell_node.row_count, Some(ROWS));
+        assert_eq!(cell_node.column_count, Some(COLS));
+        assert_eq!(
+            tables.builds(),
+            1,
+            "同一笔交付内所有行列查询必须复用同一个索引"
+        );
+    }
+
+    /// 声明齐全的表格语义必须保持 O(1)，不能为了「自动推导」反而扫描整表。
+    #[test]
+    fn declared_table_semantics_do_not_build_the_index() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let table = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Table),
+                row_count: Some(1),
+                column_count: Some(1),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("table");
+        let row = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Row),
+                row_index: Some(0),
+                row_count: Some(1),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, table)
+            .expect("row");
+        let cell = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Cell),
+                row_index: Some(0),
+                column_index: Some(0),
+                row_count: Some(1),
+                column_count: Some(1),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, row)
+            .expect("cell");
+
+        let mut ids = A11yIds::new();
+        let mut tables = super::TableSemanticsCache::default();
+        let mut diagnostics = Vec::new();
+        for (node, expected) in [
+            (table, (Some(1), None, None)),
+            (row, (Some(1), Some(0), None)),
+            (cell, (Some(1), Some(0), Some(0))),
+        ] {
+            let record = super::node_a11y_with_cache(
+                &tree,
+                node,
+                Scale::ONE,
+                "",
+                &mut ids,
+                &mut tables,
+                &mut diagnostics,
+            )
+            .expect("snapshot");
+            assert_eq!(
+                (record.row_count, record.row_index, record.column_index),
+                expected,
+                "node {node:?}"
+            );
+        }
+        assert_eq!(tables.builds(), 0, "声明齐全时不得构建表格索引");
+    }
+
+    /// 兼容路径：`Table > Cell`（没有 Row 容器）仍沿用旧实现的同角色兄弟序号。
+    #[test]
+    fn a_cell_directly_under_a_table_keeps_its_sibling_column_index() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let table = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Table),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("table");
+        let cell = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Cell),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, table)
+            .expect("cell");
+        let mut ids = A11yIds::new();
+        let mut tables = super::TableSemanticsCache::default();
+        let mut diagnostics = Vec::new();
+        let record = super::node_a11y_with_cache(
+            &tree,
+            cell,
+            Scale::ONE,
+            "",
+            &mut ids,
+            &mut tables,
+            &mut diagnostics,
+        )
+        .expect("cell snapshot");
+        assert_eq!(record.column_index, Some(0));
     }
 
     /// A5：文本节点的 `character_lengths` 必须与真实文本一致（CJK / emoji / ZWJ），

@@ -156,8 +156,13 @@ pub(crate) fn absorb(old: SceneDelta, new: &mut SceneDelta) {
     if !lanes.is_empty() {
         let mut kept: Vec<LaneDelta> = Vec::with_capacity(lanes.len());
         for old in lanes {
-            if !new.lanes.iter().any(|lane| lane.lane == old.lane)
-                && !new.removed.contains(&old.lane)
+            // 只按槽位判断：arena 槽位可能被新代际 lane 复用，旧代际的 LaneId 与新代际
+            // 不相等但会覆盖同一段存储；若把旧 lane 留在新 lane 后面，`LaneStore::apply`
+            // 会先写新代际再被旧代际覆盖，新 lane 永久不可见。任何同槽的新 lane/removed
+            // 都让旧条目失效。
+            let slot = old.lane.slot();
+            if !new.lanes.iter().any(|lane| lane.lane.slot() == slot)
+                && !new.removed.iter().any(|removed| removed.slot() == slot)
             {
                 kept.push(old);
             }
@@ -167,7 +172,10 @@ pub(crate) fn absorb(old: SceneDelta, new: &mut SceneDelta) {
     }
     if !removed.is_empty() {
         for lane in removed {
-            if !new.removed.contains(&lane) && !new.lanes.iter().any(|fresh| fresh.lane == lane) {
+            let slot = lane.slot();
+            if !new.removed.iter().any(|removed| removed.slot() == slot)
+                && !new.lanes.iter().any(|fresh| fresh.lane.slot() == slot)
+            {
                 new.removed.push(lane);
             }
         }
@@ -762,7 +770,7 @@ mod tests {
         math::{PhysicalRect, Point, Rect, Scale},
         paint::{
             color::Color,
-            instance::GeometryLookup,
+            instance::{GeometryLookup, LaneSource},
             primitive::{Primitive, Quad, QuadPaint},
             scene::Scene,
         },
@@ -981,6 +989,33 @@ mod tests {
             panic!("应保持 Partial");
         };
         assert_eq!(rects.len(), 2, "damage 取并集");
+    }
+
+    /// 同一 arena 槽位被新代际 lane 复用时，旧代际 lane 必须被丢弃，不能在 `LaneStore`
+    /// 中覆盖新 lane。
+    #[test]
+    fn absorb_drops_an_old_generation_lane_when_the_slot_is_reused() {
+        let mut scene = Scene::empty();
+        let old = scene.new_lane();
+        scene.release_lane(old);
+        let fresh = scene.new_lane();
+        assert_eq!(old.slot(), fresh.slot());
+        assert_ne!(old.generation(), fresh.generation());
+
+        let mut older = SceneDelta::empty(header(1, Plan::Idle));
+        older.lanes.push(lane(old, 1));
+        let mut newer = SceneDelta::empty(header(2, Plan::Idle));
+        newer.lanes.push(lane(fresh, 7));
+        absorb(older, &mut newer);
+        assert_eq!(newer.lanes.len(), 1, "同槽只保留新代际 lane");
+        assert_eq!(newer.lanes[0].lane, fresh);
+
+        let mut store = LaneStore::new();
+        assert!(store.apply(&newer));
+        assert!(
+            store.lane_state(fresh).is_some(),
+            "新代际 lane 必须能在 LaneStore 中查到，不能被旧代际覆盖"
+        );
     }
 
     /// 同一 lane 在新旧 delta 里都出现：新版本胜出，不重复。

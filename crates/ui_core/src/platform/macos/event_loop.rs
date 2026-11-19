@@ -265,6 +265,7 @@ fn open_window(
         f64::from(scale.factor()),
         native.maximum_frames_per_second(),
         options.background,
+        Arc::clone(dispatcher),
     )?;
     {
         let layer = renderer

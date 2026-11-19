@@ -422,9 +422,24 @@ impl ShapedText {
                 ctx.glyph_atlas.take_stats(),
             ));
         }
+        // 对齐偏移必须用**截断前**的完整行 advance 计算：`TextOverflow::Ellipsis` 截断后
+        // `shaped.width` 只剩「前缀 + 省略号」，用它做右对齐会把截断行整体右移；parley 在
+        // 行本身溢出且 `align_when_overflowing=false` 时保持 Start（LTR 不偏移）。同时
+        // 偏移要传给 rasterize，在亚像素拆分前生效。
+        let simple_offset = if let ShapedKind::Simple(simple) = &self.kind {
+            super::fast_path::simple_alignment_offset(
+                simple.size().width,
+                content_width,
+                alignment,
+                self.style.direction,
+            )
+        } else {
+            0.0
+        };
         let (mut shaped, diagnostics) = match &self.kind {
             ShapedKind::Simple(simple) => {
-                let shaped = simple.rasterize(self.text.clone(), &self.style, color, ctx)?;
+                let shaped =
+                    simple.rasterize(self.text.clone(), &self.style, color, ctx, simple_offset)?;
                 (shaped, Vec::new())
             }
             ShapedKind::Parley(snapshot) => {
@@ -449,6 +464,7 @@ impl ShapedText {
             color,
             ctx,
             ellipsis,
+            simple_offset,
         )?;
         Ok((shaped, diagnostics, ctx.glyph_atlas.take_stats()))
     }
@@ -479,7 +495,10 @@ impl ShapedText {
         focus: usize,
     ) -> Vec<Rect> {
         if let ShapedKind::Simple(simple) = &self.kind {
-            return simple.selection_rect(anchor, focus).into_iter().collect();
+            return simple
+                .selection_rect(width, alignment, self.style.direction, anchor, focus)
+                .into_iter()
+                .collect();
         }
         self.with_broken_layout(width, alignment, |layout| {
             inline_flow::selection_rects(layout, anchor, focus)
@@ -491,7 +510,18 @@ impl ShapedText {
     pub(crate) fn caret_rect(&self, width: f32, alignment: TextAlign, byte_index: usize) -> Rect {
         if let ShapedKind::Simple(simple) = &self.kind {
             let metrics = simple.metrics();
-            return Rect::new(simple.caret_x(byte_index), 0.0, 1.0, metrics.line_height);
+            let offset = super::fast_path::simple_alignment_offset(
+                simple.size().width,
+                width,
+                alignment,
+                self.style.direction,
+            );
+            return Rect::new(
+                offset + simple.caret_x(byte_index),
+                0.0,
+                1.0,
+                metrics.line_height,
+            );
         }
         self.with_broken_layout(width, alignment, |layout| {
             inline_flow::caret_rect(layout, byte_index)
@@ -853,6 +883,7 @@ fn apply_overflow(
     color: Color,
     ctx: &mut RasterCtx<'_>,
     ellipsis: Option<&EllipsisGlyphs>,
+    layout_offset: f32,
 ) -> Result<(), EngineError> {
     if shaped.lines.is_empty() {
         return Ok(());
@@ -873,7 +904,15 @@ fn apply_overflow(
         && let Some(ellipsis) = ellipsis
         && !ellipsis.is_empty()
     {
-        clip_with_ellipsis(shaped, ellipsis, content_width, color, style, ctx)?;
+        clip_with_ellipsis(
+            shaped,
+            ellipsis,
+            content_width,
+            color,
+            style,
+            ctx,
+            layout_offset,
+        )?;
     }
     // 重新汇总尺寸（截断后行数与宽度都变了）。
     shaped.width = shaped
@@ -893,6 +932,7 @@ fn clip_with_ellipsis(
     color: Color,
     style: &TextStyle,
     ctx: &mut RasterCtx<'_>,
+    layout_offset: f32,
 ) -> Result<(), EngineError> {
     let Some(last) = shaped.lines.last_mut() else {
         return Ok(());
@@ -916,9 +956,11 @@ fn clip_with_ellipsis(
         let mut kept: Vec<PositionedGlyph> = Vec::with_capacity(run.glyphs.len());
         let mut drop_from: Option<f32> = None;
         for glyph in &run.glyphs {
-            // 用「该字形的逻辑落点」判断：省略号必须整体放进可用宽度。
-            if glyph.position.x > limit {
-                drop_from = Some(glyph.position.x);
+            // 用「该字形未对齐的逻辑落点」判断：`layout_offset` 是行对齐的平移量，
+            // 省略号裁剪必须按未平移的前缀宽度进行（否则右对齐行会被误判为溢出）。
+            let glyph_x = glyph.position.x - layout_offset;
+            if glyph_x > limit {
+                drop_from = Some(glyph_x);
                 break;
             }
             kept.push(*glyph);
@@ -929,7 +971,7 @@ fn clip_with_ellipsis(
                 if append + ellipsis.advance <= content_width + 1e-3 {
                     break;
                 }
-                append = previous.position.x;
+                append = previous.position.x - layout_offset;
                 kept.pop();
             }
             append_x = Some(append);
@@ -944,13 +986,14 @@ fn clip_with_ellipsis(
                     *glyph_id,
                     ppem,
                     &variation,
-                    ellipsis_x,
+                    ellipsis_x + layout_offset,
                     baseline,
                 )? {
                     run.glyphs.push(positioned);
                 }
                 ellipsis_x += advance;
             }
+            // `line.advance` 是文本推进宽度，不含行对齐偏移（`shaped.width` 的语义）。
             last.advance = ellipsis_x;
             break;
         }
@@ -966,7 +1009,7 @@ fn clip_with_ellipsis(
                 *glyph_id,
                 ppem,
                 &variation,
-                x,
+                x + layout_offset,
                 baseline,
             )? {
                 rasterized.push(positioned);
@@ -1044,7 +1087,8 @@ mod tests {
 
     use super::family_list;
     use crate::text::{
-        FontStack, InlineAlign, InlineBoxSpec, ShapedTextItem, TextContent, TextStyle, TextWrap,
+        FontStack, InlineAlign, InlineBoxSpec, ShapedTextItem, TextAlign, TextContent, TextStyle,
+        TextWrap,
     };
 
     struct Harness {
@@ -1273,6 +1317,218 @@ mod tests {
     }
 
     /// R12-11：同一份快照可以在不同对齐下绘制（对齐不参与形状缓存）。
+    /// 仅测试：用指定对齐/scale 光栅一个快照（快速路径与 parley 共用同一入口）。
+    fn rasterize_at(
+        shaped: &super::ShapedText,
+        width: f32,
+        alignment: TextAlign,
+        scale: f32,
+    ) -> crate::text::ShapedLine {
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let generation = atlas.generation();
+        let mut ctx = super::RasterCtx {
+            raster: &mut raster,
+            glyph_atlas: &mut glyphs,
+            atlas: &mut atlas,
+            generation,
+            scale,
+        };
+        shaped
+            .rasterize(
+                width,
+                alignment,
+                crate::paint::color::Color::BLACK,
+                &mut ctx,
+                None,
+            )
+            .expect("rasterize")
+            .0
+    }
+
+    fn all_glyph_positions(line: &crate::text::ShapedLine) -> Vec<(f32, f32)> {
+        line.glyph_runs()
+            .flat_map(|run| run.glyphs.iter())
+            .map(|glyph| (glyph.position.x, glyph.position.y))
+            .collect()
+    }
+
+    fn assert_positions_close(actual: &[(f32, f32)], expected: &[(f32, f32)], context: &str) {
+        assert_eq!(actual.len(), expected.len(), "{context}: glyph count");
+        for (index, (a, e)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (a.0 - e.0).abs() <= 0.01 && (a.1 - e.1).abs() <= 0.01,
+                "{context} glyph {index}: {a:?} vs {e:?}"
+            );
+        }
+    }
+
+    /// P0 回归：快速路径的 raster 落点必须与 parley 在右对齐/居中下一致，且物理落点
+    /// 仍是整数（偏移必须发生在 `split_subpixel_x` 之前）。
+    #[test]
+    fn fast_path_raster_alignment_matches_parley_physical_positions() {
+        let mut enabled = crate::text::context::TextContext::new();
+        let style = TextStyle::new(16.0).with_wrap(TextWrap::NoWrap);
+        let content = TextContent::new("1,234.56", style);
+        let fast = enabled.shape_cached(&content).0;
+        let stats = enabled.take_fast_path_stats();
+        if stats.hits == 0 {
+            return; // host has no usable system font
+        }
+        assert_eq!(stats.hits, 1, "test must exercise the fast path");
+
+        let mut disabled = crate::text::context::TextContext::new();
+        disabled.set_digit_fast_path(false);
+        let parley = disabled.shape_cached(&content).0;
+
+        for scale in [1.0f32, 1.25] {
+            for alignment in [TextAlign::Right, TextAlign::Center] {
+                let fast_line = rasterize_at(&fast, 200.0, alignment, scale);
+                let parley_line = rasterize_at(&parley, 200.0, alignment, scale);
+                assert!(
+                    (fast_line.width - parley_line.width).abs() <= 0.01,
+                    "{alignment:?} scale={scale}: fast width {} vs parley {}",
+                    fast_line.width,
+                    parley_line.width
+                );
+                let fast_positions = all_glyph_positions(&fast_line);
+                let parley_positions = all_glyph_positions(&parley_line);
+                assert_eq!(
+                    fast_positions.len(),
+                    parley_positions.len(),
+                    "{alignment:?} scale={scale}: glyph count"
+                );
+                for (index, (fast_pos, parley_pos)) in
+                    fast_positions.iter().zip(&parley_positions).enumerate()
+                {
+                    assert!(
+                        (fast_pos.0 - parley_pos.0).abs() <= 0.01,
+                        "{alignment:?} scale={scale} glyph {index}: fast x {} vs parley {}",
+                        fast_pos.0,
+                        parley_pos.0
+                    );
+                    assert!(
+                        (fast_pos.0 * scale - (fast_pos.0 * scale).round()).abs() <= 1e-4,
+                        "{alignment:?} scale={scale} glyph {index}: physical x {} is not an integer",
+                        fast_pos.0 * scale
+                    );
+                }
+            }
+        }
+    }
+
+    /// P0 回归：Right/Center + Ellipsis 的偏移必须按截断前的完整 advance 计算；截断行
+    /// 仍保持 Start（parley `align_when_overflowing=false` 的 LTR 语义）。
+    #[test]
+    fn fast_path_alignment_after_ellipsis_uses_the_full_advance() {
+        let mut text_cx = crate::text::context::TextContext::new();
+        let style = TextStyle::new(16.0)
+            .with_wrap(TextWrap::NoWrap)
+            .with_overflow(crate::text::TextOverflow::Ellipsis, 1);
+        let content = TextContent::new("1234567890", style.clone());
+        let shaped = text_cx.shape_cached(&content).0;
+        if text_cx.take_fast_path_stats().hits == 0 {
+            return;
+        }
+        let ellipsis = text_cx
+            .ellipsis_for(&style)
+            .expect("host font must provide an ellipsis glyph");
+        let width = 41.84375f32; // reviewer's concrete reproduction width
+        let left = {
+            let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+            let generation = atlas.generation();
+            let mut ctx = super::RasterCtx {
+                raster: &mut raster,
+                glyph_atlas: &mut glyphs,
+                atlas: &mut atlas,
+                generation,
+                scale: 1.0,
+            };
+            shaped
+                .rasterize(
+                    width,
+                    TextAlign::Left,
+                    crate::paint::color::Color::BLACK,
+                    &mut ctx,
+                    Some(ellipsis.as_ref()),
+                )
+                .expect("left raster")
+                .0
+        };
+        let right = {
+            let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+            let generation = atlas.generation();
+            let mut ctx = super::RasterCtx {
+                raster: &mut raster,
+                glyph_atlas: &mut glyphs,
+                atlas: &mut atlas,
+                generation,
+                scale: 1.0,
+            };
+            shaped
+                .rasterize(
+                    width,
+                    TextAlign::Right,
+                    crate::paint::color::Color::BLACK,
+                    &mut ctx,
+                    Some(ellipsis.as_ref()),
+                )
+                .expect("right raster")
+                .0
+        };
+        let mut parley_cx = crate::text::context::TextContext::new();
+        parley_cx.set_digit_fast_path(false);
+        let parley_shaped = parley_cx.shape_cached(&content).0;
+        let parley_ellipsis = parley_cx
+            .ellipsis_for(&style)
+            .expect("host font must provide an ellipsis glyph");
+        let parley_right = {
+            let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+            let generation = atlas.generation();
+            let mut ctx = super::RasterCtx {
+                raster: &mut raster,
+                glyph_atlas: &mut glyphs,
+                atlas: &mut atlas,
+                generation,
+                scale: 1.0,
+            };
+            parley_shaped
+                .rasterize(
+                    width,
+                    TextAlign::Right,
+                    crate::paint::color::Color::BLACK,
+                    &mut ctx,
+                    Some(parley_ellipsis.as_ref()),
+                )
+                .expect("parley right raster")
+                .0
+        };
+        let full_width = shaped.max_content_size().width;
+        assert!(
+            left.width < full_width,
+            "ellipsis 必须截断：{} vs full {full_width}",
+            left.width
+        );
+        assert!(
+            (left.width - parley_right.width).abs() <= 0.01,
+            "fast/parley ellipsis 宽度必须一致：{} vs {}",
+            left.width,
+            parley_right.width
+        );
+        let left_positions = all_glyph_positions(&left);
+        let right_positions = all_glyph_positions(&right);
+        let parley_positions = all_glyph_positions(&parley_right);
+        assert_positions_close(
+            &right_positions,
+            &left_positions,
+            "ellipsis 溢出时 Right 与 Left",
+        );
+        assert_positions_close(
+            &left_positions,
+            &parley_positions,
+            "fast/parley ellipsis raster",
+        );
+    }
+
     #[test]
     fn one_snapshot_serves_multiple_alignments() {
         let mut harness = Harness::new();

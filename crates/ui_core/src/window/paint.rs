@@ -60,7 +60,8 @@ pub(crate) fn paint_frame(
     // P11：只有 `A11Y` 脏（`bind_a11y` 重算）的帧**没有任何像素要画**：早退让 lane 保持
     // `REUSABLE`、damage 保持空，帧末门禁把本帧退回 `Idle`（P11 审查 #6）。
     if !has_damage && !window.needs_node_repaint() && removed.is_empty() {
-        window.pending_delta = None;
+        // 本帧没有产出新 delta，但**上一帧未被发布的 delta 必须保留**（P0：Idle/裁剪帧
+        // 不能丢掉已构建的 lane 内容）；下一帧真实提交时会由下面的 `absorb` 合并。
         return Ok(PaintReport {
             rebuilt: 0,
             damage: crate::render::damage::DamageSummary::default(),
@@ -163,9 +164,24 @@ pub(crate) fn paint_frame(
     for lane in removed {
         window.delta_builder.note_removed(lane, &mut delta);
     }
-    // inline 模式（无 GPU 线程可分发的窗口）：就地合成，报告里带上编码统计（测试与 HUD 读）。
+    // 上一帧构建了 delta 但没有提交（damage 被窗口/视口裁空、或没有渲染器可发布）：
+    // 它的 lane 版本已经推进，必须并进本帧，否则这些变化永远不会到达合成端。必须等
+    // `collect`/`note_removed` 先填好本帧内容再 `absorb`，否则同 lane 会产生重复条目，
+    // 且旧的 removed 会与本帧的新增 lane 同时存在（违反 absorb 的「新者胜/不复活」契约）。
+    if let Some(previous) = window.pending_delta.take() {
+        crate::render::delta::absorb(previous, &mut delta);
+    }
+    // inline 模式（无 GPU 线程可分发的窗口）：只在**本帧确实会发布**时就地合成。
+    // 判据来自 `commit_frame` 的同一个 `publish_decision`：Idle 帧如果提前调用
+    // `WindowComposer::compose`，LaneStore 的版本与编码器状态会被推进，而
+    // `release_unpublished` 随后丢弃载荷 —— 下一帧 absorb 旧 delta 时版本已相等、重编码
+    // 为空，lane 的新实例字节永远上不了屏。
+    let scroll_pending = !delta.scroll.is_empty();
     let mut report = report;
-    if let Some(composed) = compose_inline(window, &delta)? {
+    if let super::frame::PublishDecision::Publish(_) =
+        super::frame::publish_decision(window, &report, scroll_pending)
+        && let Some(composed) = compose_inline(window, &delta)?
+    {
         report = annotate_report(report, composed.stats);
         window.pending_payload = Some(composed);
     }

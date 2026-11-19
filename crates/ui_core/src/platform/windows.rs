@@ -10,6 +10,7 @@ pub(crate) mod dpi_awareness;
 pub(crate) mod event_loop;
 pub(crate) mod frame_clock;
 pub(crate) mod ime;
+pub(crate) mod version;
 pub(crate) mod window;
 
 pub(crate) use event_loop::run;

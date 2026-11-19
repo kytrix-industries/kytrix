@@ -4,7 +4,7 @@
 //!
 //! 连续帧（**动画**；HUD 自 P-C 起是纯观察者，不再参与 `needs_continuous_frames`）由
 //! [`FramePacer`] 驱动：一条**只在需要时存在**的节拍线程阻塞在
-//! `DCompositionWaitForCompositorClock`（Win10 1809+ / MSDN 最低 Win11 build 22000；
+//! `DCompositionWaitForCompositorClock`（Windows 11 build 22000+；
 //! Chrome Viz 的 `DCLayerTree::WaitForCompositorClock` 同款），每个合成器节拍唤醒一次泵。
 //!
 //! 为什么不用 `WM_TIMER`（旧实现）：`WM_TIMER` 是**最低优先级**消息，输入密集时被饿
@@ -335,6 +335,18 @@ fn pace(stop: Arc<AtomicBool>, hwnd: isize, dispatcher: Arc<Dispatcher>) {
 /// 消费者：`platform::windows` 的 `pub(crate) use event_loop::run`。
 /// 引擎自有事件循环：建窗口 → 挂渲染器 → 显示 → 泵 → 关闭。
 pub(crate) fn run(mut app: App) -> Result<(), EngineError> {
+    // 发布基线：只支持 Windows 11（build 22000+）。必须在任何 Win11-only API 之前检查，
+    // 且 `frame_clock` 用 GetProcAddress 动态解析，避免导入表在门禁之前就让进程加载失败。
+    crate::platform::windows::version::require_windows11()?;
+    // 版本门禁只证明系统是 Win11；如果 dcomp 的合成器时钟导出仍解析失败，说明系统组件
+    // 异常。必须在启动期给出可读错误，而不是让连续帧在 `wait_next_frame` 的兜底里停摆。
+    if !crate::platform::windows::frame_clock::compositor_clock_available() {
+        return Err(EngineError::AppInit {
+            detail: smol_str::format_smolstr!(
+                "Windows 11 compositor clock is unavailable (dcomp!DCompositionWaitForCompositorClock)"
+            ),
+        });
+    }
     // R07-1：进程清单（`ui_core.manifest.xml`）声明 PerMonitorV2，启动再**校验实际值** ——
     // 清单可能被宿主忽略；不是 per-monitor v2 就带诊断失败，绝不静默按 96 dpi 排版。
     dpi_awareness::install()?;

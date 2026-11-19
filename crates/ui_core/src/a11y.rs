@@ -581,6 +581,12 @@ pub struct A11yTreeSnapshot {
     /// **独立于 `nodes`**：增量笔里焦点节点通常不在本批（只有它自己变了才会在），
     /// 因此不能靠 `nodes` 里查找（P11 审查 #4）。
     pub focus_node: A11yNode,
+    /// 焦点节点的祖先记录（根 → 直接父节点），只在焦点节点不在本批时非空。
+    ///
+    /// AccessKit 的 `TreeUpdate` 要求每个节点要么已在消费端树里、要么是本笔某个节点的
+    /// `children`。焦点节点刚挂载时还必须把父链一起重发（父的 `children` 才会包含它），
+    /// 否则 `accesskit_consumer` 会把它归入 `pending_nodes` 并 panic。
+    pub focus_ancestors: Vec<A11yNode>,
     /// 本次交付触发的诊断条数（详情在 `App::a11y_diagnostics`）。
     pub diagnostics: usize,
 }

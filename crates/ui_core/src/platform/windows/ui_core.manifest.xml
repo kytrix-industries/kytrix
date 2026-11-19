@@ -16,13 +16,14 @@
   </trustInfo>
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
     <application>
-      <!-- Windows 10：引擎的合成器节拍（DCompositionWaitForCompositorClock）要求 1809+。 -->
+      <!-- Windows 10/11 共用同一个 supportedOS GUID；引擎只支持 Windows 11 build 22000+，
+           版本门禁在启动时执行（platform/windows/version.rs）。 -->
       <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
     </application>
   </compatibility>
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
-      <!-- Windows 10 1607 及更早版本读 `dpiAware`；1703+ 读 `dpiAwareness`。两条都要有。 -->
+      <!-- 旧版系统读 `dpiAware`，支持 `dpiAwareness` 的系统读后者。两条都要有。 -->
       <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
       <!-- 引擎要求 PerMonitorV2：`WM_DPICHANGED` 带每屏建议矩形、非客户区按新 DPI 重绘。 -->
       <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>

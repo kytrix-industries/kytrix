@@ -25,7 +25,7 @@ cargo run --release -p ui_core --example acceptance -- idle --idle-seconds 60
 cargo run -p ui_core --features test-support --example acceptance -- interaction
 ```
 
-`interaction` 的同一套件也作为集成测试在 CI 里跑（默认 `cargo test` **不跑**，显式 `--ignored`）：
+`interaction` 的同一套件也作为集成测试存在（默认 `cargo test` **不跑**，显式 `--ignored`）：
 
 ```bash
 cargo test -p ui_core --features test-support --test gui_smoke -- --ignored --nocapture
@@ -36,7 +36,7 @@ cargo test -p ui_core --features test-support --test gui_smoke -- --ignored --no
 - **Windows**：离屏读回走 WARP（D3D12 软件设备，与 `tests/golden/warp/` 同一路径）；
   `window` / `idle` 模式需要交互式桌面会话。
 - **macOS**：离屏读回走 Metal（`new_offscreen`）；`window` / `idle` 需要登录图形会话。
-- **Linux**：离屏读回走 Vulkan（无 WSI 的离屏设备，CI 里用 lavapipe 即可，与
+- **Linux**：离屏读回走 Vulkan（无 WSI 的离屏设备，可用 lavapipe，与
   `tests/golden/lavapipe/` 同一口径）。**没有 compositor 时**（`WAYLAND_DISPLAY` 缺失）：
   `window` / `idle` 无法运行（没有可 present 的 surface），`cpu` 与 `interaction` 照常可用 ——
   后者就是交互闭环在这些机器上的运行形态。

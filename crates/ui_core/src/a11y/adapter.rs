@@ -25,11 +25,17 @@ use crate::{
         identity::A11yIds,
         mapping::{action_to_accesskit, live_to_accesskit, role_to_accesskit, sort_to_accesskit},
         textrun,
-        tree::{collect_subtree, node_a11y, push_ancestors, resolve_focus},
+        tree::{
+            TableSemanticsCache, collect_subtree, node_a11y_with_cache, push_ancestors,
+            resolve_focus,
+        },
     },
     app::App,
     math::Scale,
-    node::{id::NodeId, tree::NodeTree},
+    node::{
+        id::NodeId,
+        tree::{Node, NodeTree},
+    },
     window::WindowId,
 };
 
@@ -71,6 +77,8 @@ pub(crate) struct A11yBridge {
     a11y_only_frames: usize,
     /// 稳定身份分配器（跨帧不变；逻辑行重建后不变）。
     ids: A11yIds,
+    /// 表级语义索引（每笔交付重建一次；同一笔内所有 cell 共享 O(1) 查询）。
+    tables: TableSemanticsCache,
     /// 上次交付的焦点（已解析到存在的节点）。
     last_focus: Option<NodeId>,
     /// 已经交付给消费端的引擎节点（用于 `children` 过滤与分批的"父先于子"）。
@@ -110,6 +118,7 @@ impl A11yBridge {
             #[cfg(feature = "test-support")]
             a11y_only_frames: 0,
             ids: A11yIds::new(),
+            tables: TableSemanticsCache::default(),
             last_focus: None,
             delivered: ahash::HashSet::default(),
             queue: Vec::new(),
@@ -256,6 +265,8 @@ impl A11yBridge {
             return None;
         }
         self.ids.begin_delivery();
+        // 表格结构可能已经变化：索引只在**一笔**内复用（同一笔的 arena 不会变）。
+        self.tables.clear();
         let full_run = self.full_pending || self.bounds_epoch != self.seen_bounds_epoch;
         if full_run {
             // 全树：消费端会整体重置树，`delivered` 从零开始。
@@ -341,18 +352,45 @@ impl A11yBridge {
         // ② 建记录：祖先先于后代（depth 升序；同深度保持入队序）。节点数是预算内的常数，
         //    这次排序不会引入 O(N) 成本。
         batch.sort_by_key(|node| depth_of(tree, *node));
+        // 焦点解析提前到记录构建之前：焦点节点的父链必须参与本笔的 `children` 过滤，
+        // 否则父记录会把刚挂载的焦点节点裁掉（consumer 随后把焦点归入 `pending_nodes`）。
+        let (focus_id, missing) = resolve_focus(tree, focus);
+        if let Some(missing) = missing {
+            diagnostics.push(A11yDiagnostic::MissingFocusTarget { node: missing });
+        }
+        let mut focus_chain: SmallVec<[NodeId; 16]> = SmallVec::new();
+        if !batch_set.contains(&focus_id) {
+            let mut cursor = tree.get(focus_id).ok().and_then(Node::parent);
+            while let Some(parent) = cursor {
+                if !batch_set.contains(&parent) {
+                    focus_chain.push(parent);
+                }
+                cursor = tree.get(parent).ok().and_then(Node::parent);
+            }
+            focus_chain.reverse();
+        }
+        let focus_related = |engine: NodeId| engine == focus_id || focus_chain.contains(&engine);
         let mut nodes = Vec::with_capacity(batch.len());
         let mut re_refresh: SmallVec<[NodeId; 8]> = SmallVec::new();
         for node in &batch {
-            if let Some(mut record) =
-                node_a11y(tree, *node, scale, title, &mut self.ids, diagnostics)
-            {
-                // `children` 只列**已交付或同批**的子节点（AccessKit 契约）；被省略的子节点
-                // 到达时会把父节点重发一次。
+            if let Some(mut record) = node_a11y_with_cache(
+                tree,
+                *node,
+                scale,
+                title,
+                &mut self.ids,
+                &mut self.tables,
+                diagnostics,
+            ) {
+                // `children` 只列**已交付、同批或焦点父链**的子节点（AccessKit 契约）；
+                // 被省略的子节点到达时会把父节点重发一次。焦点父链必须放行：否则焦点节点
+                // 即使在本次追加，父记录也不承认它是自己的孩子。
                 let before = record.children.len();
                 record.children.retain(|child| {
                     self.ids.engine_of(*child).is_some_and(|engine| {
-                        self.delivered.contains(&engine) || batch_set.contains(&engine)
+                        self.delivered.contains(&engine)
+                            || batch_set.contains(&engine)
+                            || focus_related(engine)
                     })
                 });
                 if record.children.len() != before {
@@ -369,6 +407,36 @@ impl A11yBridge {
         self.refresh = deferred;
         self.refresh.extend(re_refresh);
 
+        // 焦点父链（根 → 直接父）：即使祖先已经交付过也必须重发一次，因为只有这一笔的
+        // `children` 才会包含新挂载的焦点节点（Chrome AXTreeSerializer 同样把新节点的
+        // 父链一起序列化）。
+        let mut focus_ancestors = Vec::with_capacity(focus_chain.len());
+        for ancestor in &focus_chain {
+            if let Some(mut record) = node_a11y_with_cache(
+                tree,
+                *ancestor,
+                scale,
+                title,
+                &mut self.ids,
+                &mut self.tables,
+                diagnostics,
+            ) {
+                let before = record.children.len();
+                record.children.retain(|child| {
+                    self.ids.engine_of(*child).is_some_and(|engine| {
+                        self.delivered.contains(&engine)
+                            || batch_set.contains(&engine)
+                            || focus_related(engine)
+                    })
+                });
+                if record.children.len() != before {
+                    self.refresh.push(*ancestor);
+                }
+                self.delivered.insert(*ancestor);
+                focus_ancestors.push(record);
+            }
+        }
+
         // ③ 收尾：队列与重发都空了 ⇒ 本次全树/增量运行结束，做一次旁表清理。
         if self.queue_cursor >= self.queue.len() && self.refresh.is_empty() {
             self.queue.clear();
@@ -383,17 +451,41 @@ impl A11yBridge {
 
         // ④ 焦点（必带；陈旧 ⇒ 回退到根 + 诊断）。焦点变化由 `pending` 的独立通道保证
         //    及时，不依赖脏位。
-        let (focus_id, missing) = resolve_focus(tree, focus);
-        if let Some(missing) = missing {
-            diagnostics.push(A11yDiagnostic::MissingFocusTarget { node: missing });
-        }
-        let mut scratch: Vec<A11yDiagnostic> = Vec::new();
-        let mut focus_node = node_a11y(tree, focus_id, scale, title, &mut self.ids, &mut scratch)
-            .expect("resolve_focus 已保证焦点节点存活");
+        let mut focus_node =
+            if let Some(record) = nodes.iter().find(|record| record.engine == focus_id) {
+                // 焦点节点在本批：复用已经过滤过 children 的记录，避免同一节点出现两份
+                // 不同 children 的副本。
+                record.clone()
+            } else {
+                let mut record = node_a11y_with_cache(
+                    tree,
+                    focus_id,
+                    scale,
+                    title,
+                    &mut self.ids,
+                    &mut self.tables,
+                    diagnostics,
+                )
+                .expect("resolve_focus 已保证焦点节点存活");
+                let before = record.children.len();
+                record.children.retain(|child| {
+                    self.ids.engine_of(*child).is_some_and(|engine| {
+                        self.delivered.contains(&engine) || batch_set.contains(&engine)
+                    })
+                });
+                if record.children.len() != before {
+                    self.refresh.push(focus_id);
+                }
+                record
+            };
         apply_caret(&mut focus_node, caret);
         for record in &mut nodes {
             apply_caret(record, caret);
         }
+        for record in &mut focus_ancestors {
+            apply_caret(record, caret);
+        }
+        self.delivered.insert(focus_id);
         self.last_focus = Some(focus_id);
         let root_id = self
             .ids
@@ -408,6 +500,7 @@ impl A11yBridge {
                 .stable_of(focus_id)
                 .expect("焦点节点刚被 node_a11y 分配 id"),
             focus_node,
+            focus_ancestors,
             diagnostics: diagnostics.len(),
         })
     }
@@ -524,7 +617,7 @@ pub(crate) fn to_tree_update(snapshot: &A11yTreeSnapshot) -> TreeUpdate {
         toolkit_name: Some(String::from("Kytrix")),
         toolkit_version: Some(String::from(env!("CARGO_PKG_VERSION"))),
     });
-    let mut nodes = Vec::with_capacity(snapshot.nodes.len() + 1);
+    let mut nodes = Vec::with_capacity(snapshot.nodes.len() + snapshot.focus_ancestors.len() + 1);
     for record in &snapshot.nodes {
         nodes.push((AkNodeId(record.id.get()), to_accesskit(record)));
     }
@@ -534,6 +627,12 @@ pub(crate) fn to_tree_update(snapshot: &A11yTreeSnapshot) -> TreeUpdate {
         .iter()
         .any(|record| record.engine == focus_engine)
     {
+        // 父链必须先于焦点节点进入本笔：父的 `children` 里包含焦点节点，consumer 才能
+        // 在一次遍历里把「新挂载的焦点节点」挂到树上（Chrome AXTreeSerializer 的父链
+        // 序列化同款）。焦点节点自己的 `children` 已在构建快照时按「已交付/同批」过滤。
+        for record in &snapshot.focus_ancestors {
+            nodes.push((AkNodeId(record.id.get()), to_accesskit(record)));
+        }
         nodes.push((
             AkNodeId(snapshot.focus_node.id.get()),
             to_accesskit(&snapshot.focus_node),
@@ -907,6 +1006,145 @@ mod tests {
             1,
             "焦点节点不得重复出现"
         );
+    }
+
+    /// P0 回归：焦点节点带未交付子节点，且父链当前不在本批时，必须真正走
+    /// `focus_ancestors` 重发分支（不是只靠本批父记录的 `focus_related` 放行）。
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn a_focus_target_with_a_deep_parent_chain_is_a_valid_tree_update() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let mut rows = Vec::with_capacity(6000);
+        for _ in 0..6000 {
+            rows.push(NodeBuilder::boxed().build(&mut tree, root).expect("row"));
+        }
+        // 焦点节点挂在最后一行下面：首笔 2048 节点只能交付 root + 前 2047 行；
+        // 第二笔的 batch 仍不包含最后一行，因此焦点父链必然非空。
+        let focus_parent = rows[5999];
+        let focus = NodeBuilder::boxed()
+            .build(&mut tree, focus_parent)
+            .expect("focus node");
+        let _cell = NodeBuilder::boxed().build(&mut tree, focus).expect("cell");
+
+        let mut bridge = A11yBridge::new();
+        let first = take(&mut bridge, &mut tree, None).expect("首批");
+        let mut shadow = crate::test_support::a11y::ShadowTree::new();
+        shadow
+            .apply(&to_tree_update(&first))
+            .expect("首批 TreeUpdate 必须合法");
+
+        let snapshot = take(&mut bridge, &mut tree, Some(focus)).expect("焦点笔");
+        assert!(
+            snapshot.node_for(focus).is_none(),
+            "前置条件：焦点节点不在本批 nodes 里"
+        );
+        assert!(
+            !snapshot.focus_ancestors.is_empty(),
+            "前置条件：焦点父链不在本批，必须走 focus_ancestors 分支"
+        );
+        let update = to_tree_update(&snapshot);
+        crate::test_support::a11y::assert_contract_holds(&mut shadow, &update);
+    }
+
+    /// P0 回归：跨 `A11yBridge::take` 必须清掉表格结构索引；增行后旧行数不得复用。
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn table_semantics_cache_is_invalidated_between_deliveries() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let table = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Table),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("table");
+        for _ in 0..2 {
+            let row = NodeBuilder::boxed()
+                .a11y(A11yOverride {
+                    role: Some(A11yRole::Row),
+                    ..A11yOverride::default()
+                })
+                .build(&mut tree, table)
+                .expect("row");
+            let _cell = NodeBuilder::boxed()
+                .a11y(A11yOverride {
+                    role: Some(A11yRole::Cell),
+                    ..A11yOverride::default()
+                })
+                .build(&mut tree, row)
+                .expect("cell");
+        }
+
+        let mut bridge = A11yBridge::new();
+        let first = take(&mut bridge, &mut tree, None).expect("首批");
+        assert_eq!(
+            first.node_for(table).and_then(|node| node.row_count),
+            Some(2),
+            "首批必须看到 2 行"
+        );
+
+        let row = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Row),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, table)
+            .expect("row");
+        let _cell = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Cell),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, row)
+            .expect("cell");
+        tree.mark_a11y(table);
+
+        let second = take(&mut bridge, &mut tree, None).expect("增行后的交付");
+        assert_eq!(
+            second.node_for(table).and_then(|node| node.row_count),
+            Some(3),
+            "新一笔交付必须重建表格索引，不能复用 2 行的旧缓存"
+        );
+    }
+
+    /// P0 回归：焦点节点带未交付子节点时，整笔 `TreeUpdate` 必须仍满足 AccessKit 契约。
+    ///
+    /// 旧实现把 `focus_node` 原样追加：它的 `children` 里含尚未交付的 cell，consumer 会把
+    /// 这些 id 归入 `pending_children` 并 panic；同时焦点节点自身也可能没有父链记录
+    /// （`pending_nodes` panic）。本用例用 6000 行 + 焦点落在最后一行来同时命中两条路径。
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn a_focus_target_with_undelivered_children_is_a_valid_tree_update() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let mut rows = Vec::with_capacity(6000);
+        for _ in 0..6000 {
+            rows.push(NodeBuilder::boxed().build(&mut tree, root).expect("row"));
+        }
+        let focus = rows[5999];
+        let _cell = NodeBuilder::boxed().build(&mut tree, focus).expect("cell");
+
+        let mut bridge = A11yBridge::new();
+        let first = take(&mut bridge, &mut tree, None).expect("首批");
+        let mut shadow = crate::test_support::a11y::ShadowTree::new();
+        shadow
+            .apply(&to_tree_update(&first))
+            .expect("首批 TreeUpdate 必须合法");
+
+        let snapshot = take(&mut bridge, &mut tree, Some(focus)).expect("焦点笔");
+        assert!(
+            snapshot.node_for(focus).is_none(),
+            "前置条件：焦点节点不在本批 nodes 里"
+        );
+        assert_eq!(
+            tree.get(focus).expect("focus row").children().len(),
+            1,
+            "前置条件：焦点节点必须带一个未交付子节点"
+        );
+        let update = to_tree_update(&snapshot);
+        crate::test_support::a11y::assert_contract_holds(&mut shadow, &update);
     }
 
     #[test]

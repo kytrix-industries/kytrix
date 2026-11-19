@@ -152,9 +152,9 @@ bless 掉了」—— AR2b P1-N1 的越界列（lavapipe 旧基线 `x=148,y=18..
 | 平台 | 状态 |
 |------|------|
 | Windows | 跑（WARP 是系统组件） |
-| Linux | 跑（Vulkan 离屏渲染器，`Renderer::with_headless`，F-150）；宿主无可用设备时 `snapshot` 返回 `Gpu`，该用例失败（CI 必须提供 lavapipe） |
+| Linux | 跑（Vulkan 离屏渲染器，`Renderer::with_headless`，F-150）；宿主无可用设备时 `snapshot` 返回 `Gpu`，该用例失败（运行环境必须提供 lavapipe） |
 | macOS | 跑（Metal 离屏渲染器，`metal-real/` 实机基线） |
 
 - Windows 上的 `SnapshotError::Gpu` 是**测试失败**（设备/渲染/读回真故障），不是跳过（I10）。
 - Linux 上「宿主没有 Vulkan 设备」是环境缺失，`snapshot_result_is_typed_per_platform` 会打印原因后返回；
-  CI 的 Linux job 有 lavapipe，必须真跑。
+  Linux 运行环境需准备 lavapipe，该路径必须真跑。

@@ -66,10 +66,13 @@ use smol_str::{SmolStr, format_smolstr};
 #[cfg(any(test, feature = "test-support"))]
 use crate::render::macos::readback::ReadbackImage;
 #[cfg(feature = "hud")]
+use crate::render::timer::GpuTimerSample;
+#[cfg(feature = "hud")]
 use crate::render::timer::Section;
 use crate::{
     error::EngineError,
     paint::{atlas::AtlasKind, color::Color},
+    platform::dispatcher::Dispatcher,
     render::{
         DirtyRects, RenderStats,
         color::background_linear,
@@ -83,7 +86,7 @@ use crate::{
             swapchain,
         },
         present_evidence::{FeedbackQueue, PacingGate, pacing_work, presentation_instant},
-        timer::{FrameTimings, GpuTimerSample},
+        timer::FrameTimings,
     },
     window::FrameIndex,
 };
@@ -155,6 +158,7 @@ impl Renderer {
         scale: f64,
         max_frame_rate: f32,
         background: Color,
+        dispatcher: Arc<Dispatcher>,
     ) -> Result<Self, EngineError> {
         let mtm = MainThreadMarker::new().ok_or(EngineError::AppInit {
             detail: SmolStr::new_static("CAMetalDisplayLink requires the main thread"),
@@ -176,6 +180,7 @@ impl Renderer {
                 size,
                 max_frame_rate,
                 shared,
+                dispatcher,
             )?),
             error: None,
         })
@@ -219,6 +224,7 @@ impl Renderer {
             RenderTarget::Offscreen(_) => None,
             RenderTarget::Window(window) => Some(Arc::new(WindowFrameSink {
                 shared: Arc::clone(&window.shared),
+                dispatcher: Arc::clone(&window.dispatcher),
             })),
         }
     }
@@ -466,10 +472,47 @@ impl DisplayLinkDelegate {
     }
 }
 
-/// 窗口渲染器的主线程句柄（最新帧槽 + 最新 drawable 槽 + 反馈槽 + display link + GPU 线程句柄）。
-/// 合成线程持有的交付端点：只包一层 `Arc<Shared>`（最新帧槽 + 唤醒原语）。
+/// `sync_pacing` 的决策内核。
+///
+/// 顺序是不变式：**先 `sample` → 决定暂停 → `apply(paused)` 落位 → 再 `sample` 兜底**。
+/// `apply` 必须在第二次采样之前执行：
+/// - 落位前发布的帧会被二次采样捞到（`pacing_work == true` ⇒ 立即 `apply(false)` 恢复）；
+/// - 落位后发布的帧由「落位 store 先于二次采样取 `Shared::state` 锁」的 release/acquire
+///   链保证读到新值 ⇒ 合成线程会 `Dispatcher::wake()`。
+///
+/// 把 `apply` 挪到二次采样之后会重新打开丢唤醒窗口：二次采样空闲返回后、`setPaused(true)`
+/// 之前发布的帧读到旧电平位、不唤醒，随后 link 真的暂停 ⇒ 永久停在暂停态。
+fn reconcile_pacing(
+    continuous: bool,
+    gate: &mut PacingGate,
+    now: Instant,
+    mut sample: impl FnMut() -> (bool, usize, bool),
+    mut apply: impl FnMut(bool),
+) -> bool {
+    let (pending, in_flight, awaiting_presentation) = sample();
+    let work = pacing_work(continuous, pending, in_flight, awaiting_presentation);
+    let paused = gate.update(work, now);
+    // 落位必须先于第二次采样（见函数文档的不变式）。
+    apply(paused);
+    if !paused {
+        return false;
+    }
+    let (pending, in_flight, awaiting_presentation) = sample();
+    if pacing_work(continuous, pending, in_flight, awaiting_presentation) {
+        gate.note_work(now);
+        apply(false);
+        false
+    } else {
+        true
+    }
+}
+/// 合成线程持有的交付端点：最新帧槽 + GPU 唤醒原语 + 主线程恢复通道。
 struct WindowFrameSink {
     shared: Arc<Shared>,
+    /// 合成线程发布帧时，若 display link 已因空闲暂停，必须叫醒主线程跑一次 `sync_pacing`
+    /// 把它恢复（P0：静止窗口的无输入数据更新不能只唤醒 GPU 线程 —— GPU 线程需要 drawable，
+    /// 而暂停的 display link 不产生 drawable）。
+    dispatcher: Arc<Dispatcher>,
 }
 
 impl FrameSink for WindowFrameSink {
@@ -478,6 +521,9 @@ impl FrameSink for WindowFrameSink {
             return false;
         }
         self.shared.publish_frame(request);
+        if self.shared.pacing_paused() {
+            self.dispatcher.wake();
+        }
         true
     }
 
@@ -486,8 +532,11 @@ impl FrameSink for WindowFrameSink {
     }
 }
 
+/// 窗口渲染器的主线程句柄（最新帧槽 + 最新 drawable 槽 + 反馈槽 + display link + GPU 线程句柄）。
 struct WindowRenderer {
     shared: Arc<Shared>,
+    /// 主线程唤醒端点（display link 暂停时的恢复通道）。
+    dispatcher: Arc<Dispatcher>,
     thread: Option<JoinHandle<()>>,
     layer: Retained<CAMetalLayer>,
     display_link: Retained<CAMetalDisplayLink>,
@@ -518,6 +567,7 @@ impl WindowRenderer {
         size: (u32, u32),
         max_frame_rate: f32,
         shared: Arc<Shared>,
+        dispatcher: Arc<Dispatcher>,
     ) -> Result<Self, EngineError> {
         let size = (size.0.max(1), size.1.max(1));
         let delegate = DisplayLinkDelegate::new(mtm, Arc::clone(&shared));
@@ -552,6 +602,7 @@ impl WindowRenderer {
             })?;
         Ok(Self {
             shared,
+            dispatcher,
             thread: Some(thread),
             layer,
             display_link,
@@ -577,6 +628,8 @@ impl WindowRenderer {
         // 「最后一次工作时刻」推进到状态机里 —— 否则同一轮稍后的 `sync_pacing` 看到共享槽
         // 暂时为空就会把 display link 又暂停回去（下一帧再付一次恢复延迟）。
         self.pacing.note_work(Instant::now());
+        // 主线程 publish（历史路径 / 单测）：与 `sync_pacing` 同步原子暂停位。
+        self.shared.set_pacing_paused(false);
         if self.display_link.isPaused() {
             self.display_link.setPaused(false);
         }
@@ -633,14 +686,32 @@ impl WindowRenderer {
     }
 
     fn sync_pacing(&mut self, continuous: bool) {
-        let (pending, in_flight, awaiting_presentation) = self.shared.pacing_state();
-        let work = pacing_work(continuous, pending, in_flight, awaiting_presentation);
-        // R06-8：空闲**不立即**暂停（保持 `IDLE_GRACE` 的运行窗口），孤立更新因此不必付
-        // 「恢复 → 下一个 vsync 回调」的一帧延迟。
-        let paused = self.pacing.update(work, Instant::now());
-        if self.display_link.isPaused() != paused {
-            self.display_link.setPaused(paused);
-        }
+        // 决策内核单独抽成 `reconcile_pacing`（落位 → 二次采样），竞态修复本身可被单测
+        // 变异覆盖：删掉二次检查/二次恢复、或把 apply 挪到二次采样之后都会让用例变红。
+        let shared = Arc::clone(&self.shared);
+        let now = Instant::now();
+        let Self {
+            pacing,
+            display_link,
+            ..
+        } = self;
+        let paused = reconcile_pacing(
+            continuous,
+            pacing,
+            now,
+            || shared.pacing_state(),
+            |paused| {
+                if display_link.isPaused() != paused {
+                    display_link.setPaused(paused);
+                }
+                shared.set_pacing_paused(paused);
+            },
+        );
+        debug_assert_eq!(
+            paused,
+            display_link.isPaused(),
+            "sync_pacing 返回后 display link 与决策必须一致"
+        );
     }
 
     fn poll(&mut self) -> Result<Option<FrameFeedback>, EngineError> {
@@ -774,6 +845,19 @@ struct Shared {
     work: Condvar,
     /// 每 `AtlasKind` 的共享槽是否正在被 GPU 线程消费（`false` = UI 可以入队）。
     atlas_pending: [AtomicBool; 2],
+    /// display link 当前是否暂停（主线程在 `sync_pacing` / `publish` 写，合成线程读）。
+    ///
+    /// 合成线程发布一帧时若看到它为真，必须经 `Dispatcher::wake` 叫醒主线程：只有主线程能
+    /// 调 `CAMetalDisplayLink::setPaused(false)`，而暂停后不会再有 drawable 回调。
+    ///
+    /// 顺序：`Release` / `Acquire` 是电平提示的最低成本正确选择；跨线程状态槽
+    /// （`Shared::state` 互斥锁）本身建立了「发布帧 → 二次采样」的 happens-before，因此
+    /// 即使降成 `Relaxed` 也不会丢唤醒 —— 但不要降：二次检查只是兜底，电平位才是主路径，
+    /// 明确顺序能让读者不必推理锁语义。
+    ///
+    /// **不变式**：落位 store 必须先于二次采样，见 [`reconcile_pacing`] 的顺序说明；顺序
+    /// 重排会让上面的 happens-before 链失效（P0-6 曾因此重新打开丢唤醒窗口）。
+    pacing_paused: AtomicBool,
     /// 已提交、尚未 drain 的帧数。提交路径在**记账之后**才登记完成回调（R09-17），
     /// `sync_pacing`（主线程）与关闭握手都读它。
     in_flight: Arc<InFlight>,
@@ -998,6 +1082,7 @@ impl Shared {
             state: Mutex::new(State::new()),
             work: Condvar::new(),
             atlas_pending: [AtomicBool::new(false), AtomicBool::new(false)],
+            pacing_paused: AtomicBool::new(true),
             in_flight,
         }
     }
@@ -1016,6 +1101,16 @@ impl Shared {
     fn alive(&self) -> bool {
         let state = self.lock();
         !state.shutdown && !state.terminated
+    }
+
+    /// 主线程：同步 display link 的暂停状态（供合成线程判断是否需要叫醒主线程）。
+    fn set_pacing_paused(&self, paused: bool) {
+        self.pacing_paused.store(paused, Ordering::Release);
+    }
+
+    /// 合成线程：display link 是否暂停（`true` ⇒ 发布帧后必须唤醒主线程）。
+    fn pacing_paused(&self) -> bool {
+        self.pacing_paused.load(Ordering::Acquire)
     }
 
     fn publish_frame(&self, request: FrameRequest) {
@@ -1521,6 +1616,8 @@ fn drain_completions(
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::RefCell,
+        rc::Rc,
         sync::Arc,
         time::{Duration, Instant},
     };
@@ -1530,12 +1627,17 @@ mod tests {
     use super::{
         AtlasSlots, InFlight, JOIN_TIMEOUT, MAX_SURFACE_MISMATCHES, PanicGuard, SHUTDOWN_GRACE,
         SendCommandBuffer, Shared, StickyError, SurfaceMismatch, SurfaceVerdict, WaitOutcome,
-        join_with_deadline, surface_within_tolerance,
+        join_with_deadline, reconcile_pacing, surface_within_tolerance,
     };
     use crate::{
         error::EngineError,
         paint::atlas::AtlasKind,
-        render::{DirtyRects, compositor::Plan, frame::LatestFrame},
+        render::{
+            DirtyRects,
+            compositor::Plan,
+            frame::{FrameSink, LatestFrame},
+            present_evidence::PacingGate,
+        },
         window::FrameIndex,
     };
 
@@ -1672,6 +1774,169 @@ mod tests {
         assert_eq!(
             surface.observe(Some((1400, 1040)), (1402, 1040)),
             SurfaceVerdict::Skip
+        );
+    }
+
+    /// P0 回归：display link 暂停时，合成线程发布帧必须叫醒主线程跑 `sync_pacing`。
+    ///
+    /// 旧实现只 `notify_all` GPU 线程；GPU 线程需要 drawable，而暂停的 display link 不再
+    /// 产生 drawable ⇒ 静止窗口的无输入数据更新永远不上屏。
+    #[test]
+    fn publishing_while_paused_wakes_the_main_thread() {
+        let shared = Arc::new(Shared::new(Arc::new(InFlight::new())));
+        shared.set_pacing_paused(true);
+        let dispatcher = crate::platform::dispatcher::Dispatcher::new();
+        let sink = super::WindowFrameSink {
+            shared: Arc::clone(&shared),
+            dispatcher: Arc::clone(&dispatcher),
+        };
+        assert!(sink.submit(request(1, (64, 64))));
+        assert!(
+            dispatcher.has_pending_wake(),
+            "暂停的 display link 收到帧请求后必须唤醒主线程"
+        );
+    }
+
+    /// 运行中的 display link 不需要额外主线程唤醒（否则每个 vsync 多一次空泵）。
+    #[test]
+    fn publishing_while_running_does_not_wake_the_main_thread() {
+        let shared = Arc::new(Shared::new(Arc::new(InFlight::new())));
+        shared.set_pacing_paused(false);
+        let dispatcher = crate::platform::dispatcher::Dispatcher::new();
+        let sink = super::WindowFrameSink {
+            shared: Arc::clone(&shared),
+            dispatcher: Arc::clone(&dispatcher),
+        };
+        assert!(sink.submit(request(1, (64, 64))));
+        assert!(!dispatcher.has_pending_wake());
+    }
+
+    /// 完整序列：暂停 → 发布唤醒 → 主线程恢复（原子位转 false）→ 再发布不再唤醒。
+    #[test]
+    fn a_publish_after_resume_does_not_wake_again() {
+        let shared = Arc::new(Shared::new(Arc::new(InFlight::new())));
+        shared.set_pacing_paused(true);
+        let dispatcher = crate::platform::dispatcher::Dispatcher::new();
+        let sink = super::WindowFrameSink {
+            shared: Arc::clone(&shared),
+            dispatcher: Arc::clone(&dispatcher),
+        };
+
+        assert!(sink.submit(request(1, (64, 64))));
+        assert!(dispatcher.has_pending_wake());
+        assert!(dispatcher.take_frame_wake(), "主线程取走暂停唤醒");
+
+        shared.set_pacing_paused(false); // 模拟 sync_pacing 已恢复
+        assert!(sink.submit(request(2, (64, 64))));
+        assert!(
+            !dispatcher.has_pending_wake(),
+            "恢复后的发布不得再产生主线程唤醒"
+        );
+    }
+
+    /// 竞态修复本体：决定暂停后必须二次采样；二次采样看到帧 ⇒ 恢复并刷新滞回窗口。
+    #[test]
+    fn sync_pacing_rechecks_for_a_frame_arriving_during_the_pause_transition() {
+        let mut gate = PacingGate::new();
+        let now = Instant::now();
+        let mut samples = 0;
+        let paused = reconcile_pacing(
+            false,
+            &mut gate,
+            now,
+            || {
+                samples += 1;
+                if samples == 1 {
+                    (false, 0, false) // 第一次：空闲 ⇒ 准备暂停
+                } else {
+                    (true, 0, false) // 合成线程恰好在窗口内发布
+                }
+            },
+            |_| {},
+        );
+        assert!(!paused, "二次采样看到帧必须恢复，否则丢唤醒");
+        assert_eq!(samples, 2, "决定暂停后必须二次采样");
+        assert!(!gate.update(false, now), "恢复后必须刷新滞回窗口");
+    }
+
+    /// 决定暂停且二次采样仍空闲：保持暂停，只采样两次。
+    #[test]
+    fn sync_pacing_stays_paused_when_the_second_sample_is_idle() {
+        let mut gate = PacingGate::new();
+        let mut samples = 0;
+        let paused = reconcile_pacing(
+            false,
+            &mut gate,
+            Instant::now(),
+            || {
+                samples += 1;
+                (false, 0, false)
+            },
+            |_| {},
+        );
+        assert!(paused);
+        assert_eq!(samples, 2);
+    }
+
+    /// 本来就有工作：直接恢复，不需要（也不应该）二次采样。
+    #[test]
+    fn sync_pacing_skips_the_second_sample_when_work_exists() {
+        let mut gate = PacingGate::new();
+        let mut samples = 0;
+        let paused = reconcile_pacing(
+            false,
+            &mut gate,
+            Instant::now(),
+            || {
+                samples += 1;
+                (true, 0, false)
+            },
+            |_| {},
+        );
+        assert!(!paused);
+        assert_eq!(samples, 1);
+    }
+
+    /// **顺序不变式**：`apply(暂停)` 必须发生在第二次采样之前，否则「二次采样空闲 →
+    /// apply(true)」之间发布的帧读到旧电平位、不唤醒，link 暂停后永久停摆。
+    ///
+    /// 变异守卫：把 `apply(paused)` 挪到二次采样之后（上一版重排）⇒ 期望序列变红。
+    #[test]
+    fn sync_pacing_applies_the_pause_before_the_second_sample() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut gate = PacingGate::new();
+        let now = Instant::now();
+
+        let sample_events = Rc::clone(&events);
+        let apply_events = Rc::clone(&events);
+        let mut samples = 0;
+        let paused = reconcile_pacing(
+            false,
+            &mut gate,
+            now,
+            || {
+                sample_events.borrow_mut().push("sample");
+                samples += 1;
+                if samples == 1 {
+                    (false, 0, false)
+                } else {
+                    (true, 0, false) // 落位后、二次采样前发布
+                }
+            },
+            |paused| {
+                apply_events.borrow_mut().push(if paused {
+                    "apply(true)"
+                } else {
+                    "apply(false)"
+                });
+            },
+        );
+
+        assert!(!paused);
+        assert_eq!(
+            *events.borrow(),
+            vec!["sample", "apply(true)", "sample", "apply(false)"],
+            "apply 必须夹在两次采样之间；挪到之后会重新打开丢唤醒窗口"
         );
     }
 

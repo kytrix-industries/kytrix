@@ -126,6 +126,17 @@ impl Dispatcher {
         self.frame_pending.swap(false, Ordering::AcqRel)
     }
 
+    /// 仅测试（macOS）：当前是否有一个尚未取走的帧唤醒（验证跨线程发布路径真的叫醒了
+    /// 主线程）。
+    ///
+    /// **证据边界**：这里只读 `frame_pending` 电平位，证明「生产者置了位」；真实
+    /// `CFRunLoopSourceSignal` / `CFRunLoopWakeUp` 的投递由 mac 真机
+    /// `acceptance window --seconds 8 --hz 1`（静止窗口每拍恢复上屏）人工验证。
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn has_pending_wake(&self) -> bool {
+        self.frame_pending.load(Ordering::Acquire)
+    }
+
     /// 入队一个主线程任务并唤醒。
     pub(crate) fn push(&self, task: UserTask) {
         if let Ok(mut tasks) = self.tasks.lock() {

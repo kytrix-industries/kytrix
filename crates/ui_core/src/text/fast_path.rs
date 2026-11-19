@@ -51,7 +51,8 @@ use parley::PositionedLayoutItem;
 use smol_str::SmolStr;
 
 use super::{
-    ShapedGlyphRun, ShapedLine, ShapedTextItem, ShapedTextLine, TextStyle,
+    ShapedGlyphRun, ShapedLine, ShapedTextItem, ShapedTextLine, TextAlign, TextDirection,
+    TextStyle,
     raster::{GlyphVariation, split_subpixel_x},
 };
 use crate::{
@@ -170,14 +171,22 @@ impl SimpleShaped {
     }
 
     /// 单行选区矩形（逻辑像素，文本盒局部）。
-    pub(crate) fn selection_rect(&self, anchor: usize, focus: usize) -> Option<Rect> {
+    pub(crate) fn selection_rect(
+        &self,
+        content_width: f32,
+        alignment: TextAlign,
+        direction: TextDirection,
+        anchor: usize,
+        focus: usize,
+    ) -> Option<Rect> {
         let (start, end) = if anchor <= focus {
             (anchor, focus)
         } else {
             (focus, anchor)
         };
-        let x0 = self.caret_x(start);
-        let x1 = self.caret_x(end);
+        let offset = simple_alignment_offset(self.width, content_width, alignment, direction);
+        let x0 = offset + self.caret_x(start);
+        let x1 = offset + self.caret_x(end);
         if (x1 - x0).abs() <= f32::EPSILON {
             return None;
         }
@@ -194,6 +203,7 @@ impl SimpleShaped {
         style: &TextStyle,
         color: Color,
         ctx: &mut super::shape::RasterCtx<'_>,
+        layout_offset: f32,
     ) -> Result<ShapedLine, crate::error::EngineError> {
         let scale = ctx.scale;
         let ppem = (style.size * scale).clamp(1.0, 512.0);
@@ -201,7 +211,10 @@ impl SimpleShaped {
         let baseline = self.metrics.baseline;
         let mut glyphs = Vec::with_capacity(self.glyphs.len());
         for glyph in &self.glyphs {
-            let (base_x, subpixel_x) = split_subpixel_x(glyph.x * scale);
+            // 对齐偏移必须在**亚像素拆分之前**进入物理坐标：`split_subpixel_x` 同时决定
+            // 整数落点和图集相位桶；先拆再平移会让 `position.x * scale` 变成非整数，且
+            // 相位仍来自未对齐的 x（右对齐/居中在非整数 DPI 下差 1 物理像素）。
+            let (base_x, subpixel_x) = split_subpixel_x((glyph.x + layout_offset) * scale);
             let tile = ctx.glyph_atlas.ensure(
                 ctx.raster,
                 ctx.atlas,
@@ -435,8 +448,59 @@ impl Default for DigitFastPath {
     }
 }
 
+/// 单行文本在给定内容宽度与对齐方式下的水平偏移（逻辑像素）。
+///
+/// 对齐是**布局属性**，与是否命中快速路径无关（Blink 的 SimpleLineLayout、Qt 的
+/// `QTextLayout` 都是先定行偏移再绘制）。快速路径只负责产出从 0 开始的字形序列，行偏移由
+/// 本函数统一给出：`Start`/`End` 按段落方向解释，`Left`/`Right` 是绝对方向，`Justify` 的
+/// 单行（末行）按 `Start` 处理。
+pub(crate) fn simple_alignment_offset(
+    line_advance: f32,
+    content_width: f32,
+    alignment: TextAlign,
+    direction: TextDirection,
+) -> f32 {
+    if !content_width.is_finite() || content_width <= line_advance {
+        return 0.0;
+    }
+    let extra = content_width - line_advance;
+    let rtl = matches!(direction, TextDirection::Rtl);
+    match alignment {
+        TextAlign::Start => {
+            if rtl {
+                extra
+            } else {
+                0.0
+            }
+        }
+        TextAlign::End => {
+            if rtl {
+                0.0
+            } else {
+                extra
+            }
+        }
+        TextAlign::Left => 0.0,
+        TextAlign::Right => extra,
+        TextAlign::Center => extra * 0.5,
+        TextAlign::Justify => {
+            if rtl {
+                extra
+            } else {
+                0.0
+            }
+        }
+    }
+}
+
 /// 快速路径的适用条件（除「验证通过」以外的静态条件）。
 fn eligible(text: &str, style: &TextStyle) -> bool {
+    // RTL 段落的对齐/溢出语义要按 parley 的 bidi 规则处理（`align_when_overflowing=false`
+    // 时 RTL 溢出会向左平移），而快速路径的所有字符都是 ASCII 数字，没有支持 RTL 的收益。
+    // 显式拒绝，不能把安全性寄托在 bidi 探针偶然失败上。
+    if style.direction == TextDirection::Rtl {
+        return false;
+    }
     if style.letter_spacing != 0.0 {
         return false;
     }
@@ -559,6 +623,11 @@ fn probe_layout(
     text: &str,
 ) -> Option<parley::Layout<crate::paint::color::ColorBrush>> {
     let mut builder = layout_cx.ranged_builder(font_cx, text, 1.0, true);
+    builder.set_base_direction(match style.direction {
+        TextDirection::Auto => parley::BaseDirection::Auto,
+        TextDirection::Ltr => parley::BaseDirection::Ltr,
+        TextDirection::Rtl => parley::BaseDirection::Rtl,
+    });
     builder.push_default(parley::StyleProperty::FontFamily(family.clone()));
     super::shape::push_shaping_defaults(&mut builder, style);
     let mut layout = builder.build(text);
@@ -703,18 +772,9 @@ mod tests {
         text: &str,
         style: &TextStyle,
     ) -> ParleyReference {
-        // 参考里没有等价入口的字段必须**显式断言**，不能静默给出一个不等价的参考：
-        // - `direction`：生产在 `ShapedText::shape` 里调 `set_base_direction`，而 `probe_layout`
-        //   用 builder 默认值；parley 的默认是 `BaseDirection::Auto`（`RangedBuilder::new`），
-        //   只有 `Auto` 与生产逐字一致；
-        // - `color` / `alignment` 不是 shaping 输入（R12-11）；
-        // - `overflow` / `max_lines` 在 shape 之后由 `apply_overflow` 应用，同样不改
-        //   glyph id / advance / 行度量。
-        assert_eq!(
-            style.direction,
-            TextDirection::Auto,
-            "parley 参考只与 Auto 基准方向逐字等价"
-        );
+        // 参考与生产共用同一套 builder 配置（含 `set_base_direction`）；没有等价入口的
+        // `color` / `alignment` 不是 shaping 输入（R12-11），`overflow` / `max_lines` 在 shape
+        // 之后由 `apply_overflow` 应用，同样不改 glyph id / advance / 行度量。
         let layout =
             probe_layout(font_cx, layout_cx, family, style, text).expect("探针布局必须能建出来");
         let mut glyphs = Vec::new();
@@ -1027,6 +1087,108 @@ mod tests {
         }
     }
 
+    /// P0 回归：快速路径的 caret / 选区几何必须与 parley 在全部对齐方式 × 段落方向下一致。
+    ///
+    /// 旧实现把 `content_width` / `alignment` 完全丢掉：只要命中快速路径，右对齐/居中的数字列
+    /// 就按 x=0 左对齐绘制，caret/选区也一起错位；而是否命中取决于文本内容（多一个空格就回到
+    /// parley），于是同一列会在不同帧之间跳变。
+    #[test]
+    fn fast_path_alignment_matches_parley() {
+        let (mut font_cx, _, _) = harness();
+        if !has_system_fonts(&mut font_cx) {
+            return;
+        }
+        let text = "1,234.56";
+        let content_width = 200.0f32;
+        let alignments = [
+            TextAlign::Start,
+            TextAlign::End,
+            TextAlign::Left,
+            TextAlign::Right,
+            TextAlign::Center,
+            TextAlign::Justify,
+        ];
+        for direction in [TextDirection::Auto, TextDirection::Ltr, TextDirection::Rtl] {
+            let style = TextStyle::new(12.0)
+                .with_wrap(TextWrap::NoWrap)
+                .with_direction(direction);
+            let content = TextContent::new(text, style);
+
+            let mut enabled = TextContext::new();
+            let fast = enabled.shape_cached(&content).0;
+            let stats = enabled.take_fast_path_stats();
+            if direction == TextDirection::Rtl {
+                // RTL 在 `eligible` 就被显式拒绝（不进入验证表）：RTL 的溢出对齐/视觉顺序
+                // 必须由 parley 负责，快速路径只对 LTR 段落启用。
+                assert_eq!(
+                    (stats.queries, stats.hits),
+                    (0, 0),
+                    "RTL 数字必须在 eligibility 直接退回 parley"
+                );
+                continue;
+            }
+            assert_eq!(stats.queries, 1, "{direction:?}");
+            assert_eq!(stats.hits, 1, "{direction:?}");
+
+            let mut disabled = TextContext::new();
+            disabled.set_digit_fast_path(false);
+            let parley = disabled.shape_cached(&content).0;
+
+            for alignment in alignments {
+                for byte_index in 0..=text.len() {
+                    let fast_caret = fast.caret_rect(content_width, alignment, byte_index);
+                    let parley_caret = parley.caret_rect(content_width, alignment, byte_index);
+                    assert!(
+                        (fast_caret.origin.x - parley_caret.origin.x).abs() <= ADVANCE_TOLERANCE,
+                        "{direction:?} {alignment:?} byte {byte_index}: caret {} vs {}",
+                        fast_caret.origin.x,
+                        parley_caret.origin.x
+                    );
+                }
+                let fast_selection = fast.selection_rects(content_width, alignment, 1, 5);
+                let parley_selection = parley.selection_rects(content_width, alignment, 1, 5);
+                assert_eq!(
+                    fast_selection.len(),
+                    parley_selection.len(),
+                    "{direction:?} {alignment:?}: selection rect count"
+                );
+                for (fast_rect, parley_rect) in fast_selection.iter().zip(&parley_selection) {
+                    assert!(
+                        (fast_rect.origin.x - parley_rect.origin.x).abs() <= ADVANCE_TOLERANCE,
+                        "{direction:?} {alignment:?}: selection x {} vs {}",
+                        fast_rect.origin.x,
+                        parley_rect.origin.x
+                    );
+                    assert!(
+                        (fast_rect.size.width - parley_rect.size.width).abs() <= ADVANCE_TOLERANCE,
+                        "{direction:?} {alignment:?}: selection width {} vs {}",
+                        fast_rect.size.width,
+                        parley_rect.size.width
+                    );
+                }
+            }
+        }
+    }
+
+    /// 对齐偏移的退化输入：非有限/负/零内容宽不得产生 NaN/Inf 或虚假偏移。
+    #[test]
+    fn alignment_offset_is_bounded_for_degenerate_widths() {
+        use super::simple_alignment_offset;
+        for width in [f32::NAN, f32::INFINITY, -1.0, 0.0, 10.0] {
+            let offset = simple_alignment_offset(10.0, width, TextAlign::Right, TextDirection::Ltr);
+            assert!(
+                offset.is_finite() && offset >= 0.0,
+                "width={width}: offset={offset}"
+            );
+            assert_eq!(offset, 0.0, "width={width} must not create free space");
+        }
+        assert!(
+            (simple_alignment_offset(10.0, 20.0, TextAlign::Center, TextDirection::Ltr) - 5.0)
+                .abs()
+                < 1e-6
+        );
+    }
+
     /// 非 ASCII / 含空格 / 超字符集文本必须原样落回 parley。
     #[test]
     fn ineligible_text_falls_back() {
@@ -1104,10 +1266,17 @@ mod tests {
         assert_eq!(simple.caret_x(0), 0.0);
         assert!((simple.caret_x(5) - simple.width()).abs() <= 1e-4);
         assert!(simple.caret_x(2) > simple.caret_x(1));
-        let rect = simple.selection_rect(1, 3).expect("non-empty selection");
+        let rect = simple
+            .selection_rect(200.0, TextAlign::Start, TextDirection::Ltr, 1, 3)
+            .expect("non-empty selection");
         assert!((rect.origin.x - simple.caret_x(1)).abs() <= 1e-4);
         assert!((rect.size.width - (simple.caret_x(3) - simple.caret_x(1))).abs() <= 1e-4);
-        assert!(simple.selection_rect(2, 2).is_none(), "collapsed selection");
+        assert!(
+            simple
+                .selection_rect(200.0, TextAlign::Start, TextDirection::Ltr, 2, 2)
+                .is_none(),
+            "collapsed selection"
+        );
     }
 
     /// P1-② 回归：只有 `line_height` 不同时**不得**命中同一条 `FastFont`。

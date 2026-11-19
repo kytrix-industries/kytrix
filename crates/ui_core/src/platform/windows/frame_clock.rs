@@ -15,36 +15,39 @@
 //! `相位 = (now - qpcVBlank) % qpcRefreshPeriod`：既能算出「还有多久可以呈现」，也能预测该帧的
 //! 呈现时刻给动画推进 `dt`。
 //!
-//! **为什么 `DCompositionWaitForCompositorClock` 传 `None`**：它的句柄数组是给「同时等合成器节拍
-//! 与自己的事件句柄」的调用方准备的（`count` 个句柄都由合成器时钟监听）。本模块只需要节拍本身，
-//! 不参与等待其它句柄，所以 `count == 0`：此时「节拍到了」就是 `WAIT_OBJECT_0`（官方复合时钟文档
-//! 的示例：`WAIT_OBJECT_0 + count` = 合成器节拍）。
+//! **为什么 `DCompositionWaitForCompositorClock` 传 `(0, nullptr)`**：它的句柄数组是给
+//! 「同时等合成器节拍与自己的事件句柄」的调用方准备的（`count` 个句柄都由合成器时钟监听）。
+//! 本模块只需要节拍本身，不参与等待其它句柄，所以 `count == 0`：此时「节拍到了」就是
+//! `WAIT_OBJECT_0`（官方复合时钟文档的示例：`WAIT_OBJECT_0 + count` = 合成器节拍）。
 //!
 //! 本文件只提供 **Windows 原语**：没有 trait 抽象，也**不接管**事件循环（泵的接线在别处）。探测
 //! 失败一律退回「按缓存刷新率推算的整帧间隔」而**不返回错误**：帧节奏不能因为一次时序探测失败
 //! 就停摆。
 //!
-//! 系统要求：`DCompositionWaitForCompositorClock` 的文档最低版本是 **Windows 11（build 22000）**。
-//! 本模块静态导入该导出，因此在更早的系统上进程会在**加载期**失败；需要兼容 Windows 10 时必须
-//! 换成 `GetProcAddress` 动态解析 + 定时器兜底（Zed/GPUI 就是这么做的）。
+//! 系统要求：本 crate 只支持 **Windows 11（build 22000+）**（启动门禁见
+//! `platform/windows/version.rs`）。`DCompositionWaitForCompositorClock` 仍通过
+//! `GetProcAddress` 动态解析：静态导入会让「版本门禁」之前就发生进程加载失败，动态解析
+//! 才能把「非 Win11」变成可读的 `EngineError`。解析不到时按帧间隔定时器兜底（防御性路径）。
 
-use std::{fmt, mem::size_of, time::Duration};
+use std::{fmt, mem::size_of, sync::OnceLock, time::Duration};
 
 use windows::{
     Win32::{
-        Foundation::{HWND, RECT, WAIT_OBJECT_0},
+        Foundation::{FARPROC, HWND, RECT, WAIT_OBJECT_0},
         Graphics::{
-            DirectComposition::DCompositionWaitForCompositorClock,
             Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo},
             Dxgi::{
                 Common::DXGI_FORMAT_B8G8R8A8_UNORM, CreateDXGIFactory1, DXGI_MODE_DESC1,
                 IDXGIFactory1, IDXGIOutput1,
             },
         },
-        System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
+        System::{
+            LibraryLoader::{GetProcAddress, LoadLibraryW},
+            Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
+        },
         UI::WindowsAndMessaging::GetWindowRect,
     },
-    core::{IUnknown, Interface},
+    core::{IUnknown, Interface, s, w},
 };
 
 /// 刷新率下限：低于它的「刷新率」只可能是采样错误（省电面板也不低于 24 Hz）。
@@ -58,6 +61,46 @@ const FALLBACK_REFRESH_HZ: f32 = 60.0;
 
 /// `wait_next_frame` 的超时上限（毫秒）：即使调用方给了更长的超时，也不许无限期卡在等待里。
 const MAX_WAIT_MS: u32 = 1_000;
+
+/// `DCompositionWaitForCompositorClock` 的 ABI（count, handles, timeout_ms → wait result）。
+type WaitForCompositorClockFn =
+    unsafe extern "system" fn(u32, *const windows::Win32::Foundation::HANDLE, u32) -> u32;
+
+/// 进程级动态解析结果（`dcomp.dll` 是系统 DLL，解析一次即可；不 FreeLibrary）。
+static WAIT_FOR_COMPOSITOR_CLOCK: OnceLock<Option<WaitForCompositorClockFn>> = OnceLock::new();
+
+fn compositor_clock_wait_fn() -> Option<WaitForCompositorClockFn> {
+    *WAIT_FOR_COMPOSITOR_CLOCK.get_or_init(|| {
+        // SAFETY: 只加载系统 DLL；失败 ⇒ None（调用方走定时器兜底）。
+        let module = unsafe { LoadLibraryW(w!("dcomp.dll")) }.ok()?;
+        // SAFETY: `module` 是有效模块；`s!` 是 NUL 结尾的静态字节串。
+        let proc: FARPROC =
+            unsafe { GetProcAddress(module, s!("DCompositionWaitForCompositorClock")) };
+        proc.map(|proc| unsafe { std::mem::transmute::<_, WaitForCompositorClockFn>(proc) })
+    })
+}
+
+/// `wait_next_frame` 的可注入内核（测试覆盖「解析失败」兜底；生产只经由
+/// [`compositor_clock_wait_fn`]）。
+fn wait_with(wait: Option<WaitForCompositorClockFn>, timeout: Duration) -> bool {
+    let timeout_ms = timeout.as_millis().clamp(1, u128::from(MAX_WAIT_MS)) as u32;
+    let Some(wait) = wait else {
+        // 防御性兜底：启动门禁已单独检查 `compositor_clock_available()`，生产不应到达。
+        // 按请求的超时睡一整个分片再返回「这一拍没等到」，绝不忙轮询（调用方的 deadline
+        // 会在一帧内收敛）。
+        std::thread::sleep(Duration::from_millis(u64::from(timeout_ms)));
+        return false;
+    };
+    // SAFETY: `count == 0` / `nullptr` = 只等合成器时钟，不参与等待其它句柄；
+    // 函数签名与 dcomp.h 的 `DCompositionWaitForCompositorClock` 一致。
+    let wait_result = unsafe { wait(0, std::ptr::null(), timeout_ms) };
+    wait_result == WAIT_OBJECT_0.0
+}
+
+/// 动态解析是否成功（启动门禁用：Win11 上仍解析失败说明系统组件异常，必须可读失败）。
+pub(crate) fn compositor_clock_available() -> bool {
+    compositor_clock_wait_fn().is_some()
+}
 
 /// 一次采样得到的合成器时钟状态。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -157,10 +200,7 @@ impl FrameClock {
     /// `WAIT_OBJECT_0`；其余值（`WAIT_TIMEOUT`、显示关闭时的 `STATUS_GRAPHICS_PRESENT_OCCLUDED`）
     /// 都算「没有节拍」。
     pub(crate) fn wait_next_frame(&self, timeout: Duration) -> bool {
-        let timeout_ms = timeout.as_millis().clamp(1, u128::from(MAX_WAIT_MS)) as u32;
-        // SAFETY: 无指针参数；`None` = 只等合成器时钟，不参与等待其它句柄。
-        let wait_result = unsafe { DCompositionWaitForCompositorClock(None, timeout_ms) };
-        wait_result == WAIT_OBJECT_0.0
+        wait_with(compositor_clock_wait_fn(), timeout)
     }
 
     /// 重新探测「刷新率 + 相位」，返回距下一次可呈现时刻的时长。
@@ -380,12 +420,65 @@ fn rect_contains(rect: RECT, point: (i32, i32)) -> bool {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Foundation::{HANDLE, HWND, WAIT_OBJECT_0, WAIT_TIMEOUT};
 
     use super::{
         FALLBACK_REFRESH_HZ, FrameClock, MAX_REFRESH_HZ, MIN_REFRESH_HZ, choose_refresh,
-        refresh_hz_from_period, refresh_hz_from_ratio, ticks_until_next_present,
+        refresh_hz_from_period, refresh_hz_from_ratio, ticks_until_next_present, wait_with,
     };
+
+    unsafe extern "system" fn fake_timeout_wait(
+        _count: u32,
+        _handles: *const HANDLE,
+        _timeout: u32,
+    ) -> u32 {
+        WAIT_TIMEOUT.0
+    }
+
+    unsafe extern "system" fn fake_beat_wait(
+        _count: u32,
+        _handles: *const HANDLE,
+        _timeout: u32,
+    ) -> u32 {
+        WAIT_OBJECT_0.0
+    }
+
+    /// 动态解析失败（`dcomp` 缺导出）时的兜底：睡满分片、返回「没有节拍」，不得忙等。
+    #[test]
+    fn wait_without_the_compositor_export_sleeps_and_reports_no_beat() {
+        let started = Instant::now();
+        let ticked = wait_with(None, Duration::from_millis(5));
+        let elapsed = started.elapsed();
+        assert!(!ticked, "解析失败时不得伪装成节拍");
+        assert!(
+            elapsed >= Duration::from_millis(4),
+            "兜底必须真的等待超时，elapsed={elapsed:?}"
+        );
+    }
+
+    /// 有函数指针时按返回值判定；`WAIT_TIMEOUT` ⇒ false（不把超时当成节拍）。
+    #[test]
+    fn wait_with_reports_a_timeout_as_no_beat() {
+        assert!(!wait_with(
+            Some(fake_timeout_wait),
+            Duration::from_millis(1)
+        ));
+    }
+
+    /// **节拍到达**必须判成 true（变异 `== WAIT_OBJECT_0.0` 的比较方向即变红）。
+    #[test]
+    fn wait_with_reports_an_object_signal_as_a_beat() {
+        assert!(wait_with(Some(fake_beat_wait), Duration::from_millis(1)));
+    }
+
+    /// Win11 上 `dcomp` 必须导出合成器时钟；启动门禁依赖这个事实。
+    #[test]
+    fn the_compositor_clock_export_resolves_on_windows_11() {
+        assert!(
+            super::compositor_clock_available(),
+            "dcomp!DCompositionWaitForCompositorClock 解析失败"
+        );
+    }
 
     #[test]
     fn period_converts_to_hz() {

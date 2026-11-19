@@ -699,6 +699,18 @@ impl Window {
     pub fn scene(&self) -> &Scene {
         paint::scene(self)
     }
+    /// 仅测试（Windows）：当前保留的 `SceneDelta`（Idle 帧不丢弃 delta 的回归断言面）。
+    #[cfg(all(windows, test, feature = "test-support"))]
+    #[must_use]
+    pub(crate) fn pending_delta(&self) -> Option<&crate::render::delta::SceneDelta> {
+        self.pending_delta.as_ref()
+    }
+    /// 仅测试（Windows）：当前是否有未发布的 inline 合成载荷。
+    #[cfg(all(windows, test, feature = "test-support"))]
+    #[must_use]
+    pub(crate) fn has_pending_payload(&self) -> bool {
+        self.pending_payload.is_some()
+    }
     #[cfg(test)]
     pub(crate) fn encoded_geometry(&self) -> &[crate::paint::instance::GeometryDrawGpu] {
         paint::encoded_geometry(self)
