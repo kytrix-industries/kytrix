@@ -214,6 +214,59 @@ pub enum EngineError {
     #[error("geometry registration failed: {detail}")]
     GeometryRegister { detail: SmolStr },
 
+    /// 几何 range 更新的目标句柄不存在：陈旧 / 已 release / 从未注册。
+    ///
+    /// 与「越界 / 非对齐」分开：陈旧句柄是**生命周期**错误（应用应停止更新或重注册），
+    /// 越界是**参数**错误（应用应修正 range），两者的处理策略不同。
+    #[error("unknown geometry handle: {geometry:?}")]
+    UnknownGeometry {
+        /// 陈旧 / 未注册的几何句柄。
+        geometry: crate::paint::geometry::GeometryId,
+    },
+
+    /// 几何 range 更新越界：`range.start` 超过缓冲当前长度，或区间反向。
+    ///
+    /// 允许在缓冲区**末尾追加**（`range.end > len` 合法），因此这里只判 `start`。
+    #[error(
+        "geometry {geometry:?} {buffer:?} update range {range:?} is out of bounds \
+         (current length {len} bytes)"
+    )]
+    GeometryRangeOutOfBounds {
+        geometry: crate::paint::geometry::GeometryId,
+        /// 作用于哪个缓冲（顶点 / 索引）。
+        buffer: crate::paint::geometry::GeometryBuffer,
+        /// 应用给的字节区间。
+        range: std::ops::Range<u32>,
+        /// 缓冲当前字节长度。
+        len: u32,
+    },
+
+    /// 几何 range 更新未按元素对齐（顶点按 `vertex_stride`，索引按 `index_type.size()`）。
+    #[error(
+        "geometry {geometry:?} {buffer:?} update range {range:?} is not aligned to {align} bytes"
+    )]
+    GeometryRangeUnaligned {
+        geometry: crate::paint::geometry::GeometryId,
+        /// 作用于哪个缓冲（顶点 / 索引）。
+        buffer: crate::paint::geometry::GeometryBuffer,
+        /// 应用给的字节区间。
+        range: std::ops::Range<u32>,
+        /// 要求的对齐字节数。
+        align: u32,
+    },
+
+    /// 几何 range 更新的载荷字节数与区间长度不一致（`bytes.len() != range.len()`）。
+    #[error("geometry {geometry:?} {buffer:?} update carries {bytes} bytes for range {range:?}")]
+    GeometryRangeBytes {
+        geometry: crate::paint::geometry::GeometryId,
+        /// 作用于哪个缓冲（顶点 / 索引）。
+        buffer: crate::paint::geometry::GeometryBuffer,
+        /// 应用给的字节区间。
+        range: std::ops::Range<u32>,
+        /// 实际提供的字节数。
+        bytes: usize,
+    },
+
     /// 引擎 / 平台初始化失败（`Application::run` 的前置条件；P08 的渲染器初始化也走这里）。
     #[error("engine initialization failed: {detail}")]
     AppInit { detail: SmolStr },

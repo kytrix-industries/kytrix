@@ -246,7 +246,7 @@ fn app_registered_geometry_reaches_the_encoder() {
     let draws = app.window(window).expect("window").encoded_geometry();
     let draw = draws.first().expect("必须编码出一条几何绘制");
     assert_eq!(
-        draw.desc.vertex_bytes.len(),
+        draw.snapshot.vertex_len() as usize,
         stride * 3,
         "App 注册的顶点必须真的到达编码器（旧缺陷：编码器持空表 ⇒ 空 desc）"
     );

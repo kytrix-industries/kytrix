@@ -613,6 +613,8 @@ pub(crate) struct GeometryEntry {
     pipeline: GeometryPipeline,
     /// 该条目对应的代际（槽位复用后必须重建缓冲，否则会画成新几何）。
     generation: u32,
+    /// 已上传的几何快照版本（数据更新 ⇒ 按页增量上传；X5 提交 3 之前是整份重建）。
+    revision: u64,
     /// 最后一次被绘制的帧号（GeometryRegistry 的单调帧号）。
     ///
     /// 用于驱逐：应用释放几何句柄后本窗口的 GPU 缓冲仍会驻留，必须按「最近使用」回收，
@@ -651,7 +653,7 @@ impl GeometryEntry {
 
 /// `GeometryId → GPU 缓冲`（按需创建；代际不匹配即重建）。
 ///
-/// 缓冲由 GPU 线程在**首次见到某个 `GeometryId`** 时创建：编码器把注册描述附在
+/// 缓冲由 GPU 线程在**首次见到某个 `GeometryId`** 时创建：编码器把几何快照附在
 /// `GeometryDrawGpu` 上随帧过线，因此这里不需要额外的跨线程注册通道。
 /// 槽位复用（`generation` 变化）会**丢弃并重建**该槽的缓冲，避免旧图元画成新几何。
 ///
@@ -716,7 +718,7 @@ impl GeometryRegistry {
         &mut self,
         shared: &super::device::SharedGpu,
         id: GeometryId,
-        desc: &crate::paint::geometry::GeometryDesc,
+        snapshot: &crate::paint::geometry::GeometrySnapshot,
         retired: &mut Vec<GpuResourceHandle>,
     ) -> Result<&GeometryEntry, EngineError> {
         let slot = id.index() as usize;
@@ -724,14 +726,16 @@ impl GeometryRegistry {
             self.entries.resize_with(slot + 1, || None);
         }
         let stale = match &self.entries[slot] {
-            Some(entry) => entry.generation != id.generation(),
+            Some(entry) => {
+                entry.generation != id.generation() || entry.revision != snapshot.revision()
+            }
             None => true,
         };
         if stale {
             if let Some(old) = self.entries[slot].take() {
                 retired.extend(old.storage());
             }
-            let entry = upload_geometry(shared, id, desc)?;
+            let entry = upload_geometry(shared, id, snapshot)?;
             self.entries[slot] = Some(entry);
         }
         // 记录使用帧号：`retain_recent` 据此驱逐长期未绘制的几何（D-1）。
@@ -750,55 +754,96 @@ impl GeometryRegistry {
     }
 }
 
-/// 按注册描述创建顶点/索引缓冲（`UPLOAD` 堆；几何是静态数据，装载期一次写入）。
+/// 按几何快照创建顶点/索引缓冲（`UPLOAD` 堆；几何是静态数据，装载期一次写入）。
 fn upload_geometry(
     shared: &super::device::SharedGpu,
     id: GeometryId,
-    desc: &crate::paint::geometry::GeometryDesc,
+    snapshot: &crate::paint::geometry::GeometrySnapshot,
 ) -> Result<GeometryEntry, EngineError> {
-    let vertex = upload_buffer(shared, &desc.vertex_bytes)?;
-    let index = upload_buffer(shared, &desc.index_bytes)?;
+    if snapshot.index_count() == 0 || snapshot.vertex_pages().is_empty() {
+        return Err(EngineError::GeometryRegister {
+            detail: smol_str::format_smolstr!(
+                "geometry {}:{} has no CPU data (stale handle or released before upload)",
+                id.index(),
+                id.generation()
+            ),
+        });
+    }
+    let vertex = upload_pages(shared, snapshot.vertex_pages(), snapshot.vertex_len())?;
+    let index = upload_pages(shared, snapshot.index_pages(), snapshot.index_len())?;
     // SAFETY: 缓冲由 `GeometryRegistry` 持有，提交前不会释放；地址只在录制期使用。
     let vertex_location = unsafe { vertex.GetGPUVirtualAddress() };
     // SAFETY: 同上。
     let index_location = unsafe { index.GetGPUVirtualAddress() };
     let vertex_handle = shared.allocate(vertex);
     let index_handle = shared.allocate(index);
-    let index_format = match desc.index_type {
+    let index_format = match snapshot.index_type() {
         IndexType::U16 => DXGI_FORMAT_R16_UINT,
         IndexType::U32 => DXGI_FORMAT_R32_UINT,
     };
     Ok(GeometryEntry {
         vertex: D3D12_VERTEX_BUFFER_VIEW {
             BufferLocation: vertex_location,
-            SizeInBytes: desc.vertex_bytes.len() as u32,
-            StrideInBytes: desc.pipeline.vertex_stride(),
+            SizeInBytes: snapshot.vertex_len(),
+            StrideInBytes: snapshot.vertex_stride(),
         },
         index: D3D12_INDEX_BUFFER_VIEW {
             BufferLocation: index_location,
-            SizeInBytes: desc.index_bytes.len() as u32,
+            SizeInBytes: snapshot.index_len(),
             Format: index_format,
         },
-        index_count: (desc.index_bytes.len() as u32) / desc.index_type.size(),
-        topology: match desc.topology {
+        index_count: snapshot.index_count(),
+        topology: match snapshot.topology() {
             Topology::TriangleList => D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             Topology::TriangleStrip => D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
         },
-        pipeline: desc.pipeline,
+        pipeline: snapshot.pipeline(),
         generation: id.generation(),
+        revision: snapshot.revision(),
         // 由 `ensure` 在返回前立刻写成当前帧号；这里只是构造初值。
         last_used_frame: 0,
         storage: [vertex_handle, index_handle],
     })
 }
 
-fn upload_buffer(
+/// 把快照的页按页偏移写进一块 UPLOAD 缓冲并返回资源。
+fn upload_pages(
     shared: &super::device::SharedGpu,
-    bytes: &[u8],
+    pages: &[bytes::Bytes],
+    len: u32,
+) -> Result<ID3D12Resource, EngineError> {
+    let resource = create_upload_buffer(shared, u64::from(len.max(4)))?;
+    if len == 0 {
+        return Ok(resource);
+    }
+    let mut pointer: *mut core::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: 映射区间由 `Map` 独占，直到同一函数的 `Unmap`；容量由该缓冲的创建尺寸保证。
+    unsafe { resource.Map(0, None, Some(&mut pointer)) }
+        .map_err(|error| init_error_from("Map(upload)", error))?;
+    for (page, data) in pages.iter().enumerate() {
+        let offset = crate::paint::geometry::GeometrySnapshot::page_offset(page) as usize;
+        // SAFETY: 页偏移 + 页长不超过缓冲长度（快照的页是缓冲的页对齐切分）。
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                pointer.cast::<u8>().add(offset),
+                data.len(),
+            );
+        }
+    }
+    // SAFETY: `Unmap` 与同一函数的 `Map` 成对，映射期间无并发访问。
+    unsafe { resource.Unmap(0, None) };
+    Ok(resource)
+}
+
+/// 建一块 `UPLOAD` 堆缓冲（CPU 可见、持久驻留；静态几何的 GPU 侧副本）。
+fn create_upload_buffer(
+    shared: &super::device::SharedGpu,
+    bytes: u64,
 ) -> Result<ID3D12Resource, EngineError> {
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: bytes.len().max(4) as u64,
+        Width: bytes.max(4),
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,
@@ -830,18 +875,9 @@ fn upload_buffer(
         )
     }
     .map_err(|error| init_error_from("CreateCommittedResource(upload)", error))?;
-    let resource = out.ok_or_else(|| EngineError::AppInit {
+    out.ok_or_else(|| EngineError::AppInit {
         detail: smol_str::SmolStr::new_static("d3d12 CreateCommittedResource returned no resource"),
-    })?;
-    let mut pointer: *mut core::ffi::c_void = std::ptr::null_mut();
-    // SAFETY: 映射区间由 `Map` 独占，直到同一函数的 `Unmap`；容量由该缓冲的创建尺寸保证。
-    unsafe { resource.Map(0, None, Some(&mut pointer)) }
-        .map_err(|error| init_error_from("Map(upload)", error))?;
-    // SAFETY: `pointer` 容量 ≥ `bytes.len()`（缓冲按该长度创建），映射期间无并发访问。
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer.cast::<u8>(), bytes.len()) };
-    // SAFETY: `Unmap` 与同一函数的 `Map` 成对，映射期间无并发访问。
-    unsafe { resource.Unmap(0, None) };
-    Ok(resource)
+    })
 }
 
 #[cfg(test)]
@@ -955,10 +991,11 @@ mod tests {
             bounds: crate::math::Rect::new(0.0, 0.0, 32.0, 32.0),
             pipeline: GeometryPipeline::Ui,
         };
+        let snapshot = crate::paint::geometry_store::snapshot_for_test(desc);
         let id = GeometryId::for_test(0, 1);
         let mut retired = Vec::new();
         let entry = registry
-            .ensure(&shared, id, &desc, &mut retired)
+            .ensure(&shared, id, &snapshot, &mut retired)
             .expect("ensure");
         assert_eq!(entry.index_count(), 3);
         assert_eq!(entry.vertex().StrideInBytes, 12);
@@ -966,9 +1003,9 @@ mod tests {
         assert_eq!(entry.storage().len(), 2);
         assert!(retired.is_empty(), "首次创建不产生退役句柄");
 
-        // 同一 id + 同一代际：命中缓存，不重建、不产生退役句柄。
+        // 同一 id + 同一快照版本：命中缓存，不重建、不产生退役句柄。
         let again = registry
-            .ensure(&shared, id, &desc, &mut retired)
+            .ensure(&shared, id, &snapshot, &mut retired)
             .expect("cached");
         assert_eq!(again.index_count(), 3);
         assert!(retired.is_empty());
@@ -976,7 +1013,7 @@ mod tests {
         // 槽位复用（代际 +1）：必须重建，并把旧句柄交还 retire。
         let reused = GeometryId::for_test(0, 2);
         let _ = registry
-            .ensure(&shared, reused, &desc, &mut retired)
+            .ensure(&shared, reused, &snapshot, &mut retired)
             .expect("rebuilt");
         assert_eq!(retired.len(), 2, "换代必须退役旧顶点/索引缓冲");
     }

@@ -648,37 +648,6 @@ impl GpuRenderer {
         self.readback()
     }
 
-    /// 测试用的静态几何注册入口：直接放进 registry（生产路径是编码器随帧带描述、
-    /// `draw_ops` 按需建缓冲）。
-    #[cfg(test)]
-    pub(crate) fn register_geometry(
-        &mut self,
-        id: crate::paint::geometry::GeometryId,
-        vertices: &[u8],
-        indices: &[u8],
-        pipeline: crate::paint::geometry::GeometryPipeline,
-        topology: crate::paint::geometry::Topology,
-        index_type: crate::paint::geometry::IndexType,
-    ) -> Result<(), EngineError> {
-        let desc = crate::paint::geometry::GeometryDesc {
-            vertex_bytes: bytes::Bytes::copy_from_slice(vertices),
-            index_bytes: bytes::Bytes::copy_from_slice(indices),
-            vertex_stride: pipeline.vertex_stride(),
-            index_type,
-            topology,
-            bounds: crate::math::Rect::new(0.0, 0.0, 1.0, 1.0),
-            pipeline,
-        };
-        let mut retired = Vec::new();
-        let _ = self
-            .geometry
-            .ensure(&self.shared, id, &desc, &mut retired)?;
-        for handle in retired {
-            self.stream.retire(self.last_sequence, handle);
-        }
-        Ok(())
-    }
-
     /// 把底层错误归类为设备丢失（粘性）或原样返回。
     fn classify(&mut self, error: EngineError) -> EngineError {
         self.shared.note_failure().unwrap_or(error)

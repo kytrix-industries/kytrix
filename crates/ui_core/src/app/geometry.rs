@@ -62,9 +62,9 @@ pub(crate) fn set_geometry_transform(
     };
     let previous = tree.geometry_transform(node);
     // 未注册（陈旧句柄）⇒ 拿不到真实范围，只能依赖 `touch` 的节点盒（与 paint 阶段的退化一致）。
-    let extra_damage = match geometry.desc_arc(id) {
-        Some(desc) => transformed_damage(previous, desc.bounds)
-            .union(transformed_damage(transform, desc.bounds)),
+    let extra_damage = match geometry.snapshot_arc(id) {
+        Some(snapshot) => transformed_damage(previous, snapshot.bounds())
+            .union(transformed_damage(transform, snapshot.bounds())),
         None => Rect::default(),
     };
     tree.set_geometry_transform(node, transform, extra_damage)
@@ -127,11 +127,16 @@ mod tests {
         test_support::app::TestApp,
     };
 
-    /// 注册一块 20×10 的几何（bounds 已知 ⇒ damage / op 范围可精确断言）。
+    /// 注册一块 20×10 的几何（真实三角形顶点，块 AABB = (0,0,20,10)；damage / op 范围可精确断言）。
     fn register(app: &mut TestApp) -> GeometryId {
+        let points = [[0.0f32, 0.0, -1.0], [20.0, 0.0, -1.0], [0.0, 10.0, -1.0]];
+        let vertex_bytes: Vec<u8> = points
+            .iter()
+            .flat_map(|point| point.iter().flat_map(|value| value.to_ne_bytes()))
+            .collect();
         let desc = GeometryDesc {
-            vertex_bytes: bytes::Bytes::from_static(&[0u8; 12 * 3]),
-            index_bytes: bytes::Bytes::from_static(&[0u8; 2]),
+            vertex_bytes: bytes::Bytes::from(vertex_bytes),
+            index_bytes: bytes::Bytes::from_static(&[0, 0, 1, 0, 2, 0]),
             vertex_stride: 12,
             index_type: IndexType::U16,
             topology: Topology::TriangleList,

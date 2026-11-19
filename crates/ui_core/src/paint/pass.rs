@@ -609,9 +609,9 @@ fn hide_subtree(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
         // 几何的可见范围可能超出节点布局盒：隐藏时也必须把 `desc.bounds` 并入
         // damage，否则溢出部分留下旧像素（「damage 帧不清屏」会长期残留；复审 A3）。
         if let NodeKind::Geometry(id) = *target.kind()
-            && let Some(desc) = context.geometry.desc_arc(id)
+            && let Some(snapshot) = context.geometry.snapshot_arc(id)
         {
-            damage_rect = damage_rect.union(desc.bounds);
+            damage_rect = damage_rect.union(snapshot.bounds());
         }
         // damage 与 bounds 都在**内容坐标**：先并集，再减祖先滚动偏移得到屏幕坐标（P10 §7.2）。
         let damage_rect = damage_rect.translate(negate(total));
@@ -901,10 +901,10 @@ fn geometry_damage(
     offset: Point,
     transform: crate::math::Transform,
 ) -> Rect {
-    let Some(desc) = geometry.desc_arc(id) else {
+    let Some(snapshot) = geometry.snapshot_arc(id) else {
         return node_bounds;
     };
-    let bounds = desc.bounds;
+    let bounds = snapshot.bounds();
     // 轴对齐仿射变换后的 AABB（与编码器 `transformed_aabb` 同一算法；四角取极值）。
     let far = Point::new(
         bounds.origin.x + bounds.size.width,

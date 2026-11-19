@@ -62,20 +62,20 @@ pub(crate) trait LaneSource {
     }
 }
 
-/// 编码期的几何描述查表（`GeometryStore` 在 UI 线程；合成线程用自己的 `GeometryCatalog`）。
+/// 编码期的几何快照查表（`GeometryStore` 在 UI 线程；合成线程用自己的 `GeometryCatalog`）。
 pub(crate) trait GeometryLookup {
-    fn desc_arc(
+    fn snapshot_arc(
         &self,
         id: crate::paint::geometry::GeometryId,
-    ) -> Option<std::sync::Arc<crate::paint::geometry::GeometryDesc>>;
+    ) -> Option<std::sync::Arc<crate::paint::geometry::GeometrySnapshot>>;
 }
 
 impl GeometryLookup for crate::paint::geometry_store::GeometryStore {
-    fn desc_arc(
+    fn snapshot_arc(
         &self,
         id: crate::paint::geometry::GeometryId,
-    ) -> Option<std::sync::Arc<crate::paint::geometry::GeometryDesc>> {
-        crate::paint::geometry_store::GeometryStore::desc_arc(self, id)
+    ) -> Option<std::sync::Arc<crate::paint::geometry::GeometrySnapshot>> {
+        crate::paint::geometry_store::GeometryStore::snapshot_arc(self, id)
     }
 }
 
@@ -696,15 +696,20 @@ pub(crate) struct InstanceBuffer {
 #[derive(Clone, Debug)]
 pub(crate) struct GeometryDrawGpu {
     pub id: crate::paint::geometry::GeometryId,
+    /// 本 op 画几何的第几块（块在索引缓冲里连续；绘制范围来自 `snapshot.chunks()[chunk]`）。
+    ///
+    /// 整块几何绘制（`Canvas::push_geometry` / `Path`）由编码器展开成每块一个 op；
+    /// 几何节点的多 lane 分块让每块 lane 只编码自己的 op（X5）。
+    pub chunk: u32,
     pub transform: Transform,
     /// linear premultiplied RGBA（`draw.color0`）。
     pub color: [f32; 4],
-    /// 几何的顶点/索引字节与布局（GPU 线程首次见到该 `GeometryId` 时据此建缓冲）。
+    /// 几何数据的不可变快照（页 + 块元数据）。
     ///
-    /// 随帧过线是**有意**的：`GeometryStore` 在 UI 线程，GPU 线程不能直接读它；把描述
-    /// 附在绘制项上，GPU 线程按 `(index, generation)` 缓存自己的缓冲，既不需要额外的
-    /// 跨线程注册通道，也让「注册后第一帧」自然完成上传。
-    pub desc: std::sync::Arc<crate::paint::geometry::GeometryDesc>,
+    /// 随帧过线是**有意**的：`GeometryStore` 在 UI 线程，GPU 线程不能直接读它；把快照附在
+    /// 绘制项上，GPU 线程按 `(index, generation)` 缓存自己的缓冲，按页 `ptr_eq` 增量上传，
+    /// 既不需要额外的跨线程注册通道，也让「注册后第一帧」自然完成上传。
+    pub snapshot: std::sync::Arc<crate::paint::geometry::GeometrySnapshot>,
 }
 
 impl InstanceBuffer {
@@ -2166,37 +2171,28 @@ impl LaneEncoder<'_> {
         }
     }
 
-    /// 取几何描述（`Arc` 克隆，不复制顶点字节）。未注册的句柄给空描述：渲染层会以
+    /// 取几何快照（`Arc` 克隆，不复制页字节）。未注册的句柄给**空快照**：渲染层会以
     /// `GeometryRegister` 错误拒绝，而不是画错东西。
-    fn geometry_desc(
+    fn geometry_snapshot(
         &self,
         id: crate::paint::geometry::GeometryId,
-    ) -> Option<std::sync::Arc<crate::paint::geometry::GeometryDesc>> {
-        self.geometry.desc_arc(id)
+    ) -> Option<std::sync::Arc<crate::paint::geometry::GeometrySnapshot>> {
+        self.geometry.snapshot_arc(id)
     }
 
-    fn missing_desc() -> std::sync::Arc<crate::paint::geometry::GeometryDesc> {
-        static MISSING: std::sync::OnceLock<std::sync::Arc<crate::paint::geometry::GeometryDesc>> =
-            std::sync::OnceLock::new();
-        std::sync::Arc::clone(MISSING.get_or_init(|| {
-            std::sync::Arc::new(crate::paint::geometry::GeometryDesc {
-                vertex_bytes: bytes::Bytes::new(),
-                index_bytes: bytes::Bytes::new(),
-                vertex_stride: 0,
-                index_type: crate::paint::geometry::IndexType::U16,
-                topology: crate::paint::geometry::Topology::TriangleList,
-                bounds: Rect::default(),
-                pipeline: crate::paint::geometry::GeometryPipeline::Ui,
-            })
-        }))
-    }
-
-    /// 追加一条几何绘制项（每帧生成 op 表时按绘制序复制进 `InstanceBuffer::geometry`）。
+    /// 追加一次几何绘制（每帧生成 op 表时按绘制序复制进 `InstanceBuffer::geometry`）。
     ///
-    /// `op_bounds`：给定则用它（`Path` 自带逻辑 AABB），否则用 `desc.bounds` 经
-    /// `transform` 变换后的 AABB（R05-12 / R05-19：旧实现对无 clip 的几何给出「全屏」
-    /// 包围盒，局部刷新时把所有几何 draw 都重发；给了 transform 却仍用未变换的 bounds
-    /// 会在平移后留残影）。
+    /// **分块展开**：几何数据按固定块大小切分（`GEOMETRY_CHUNK_INDICES`），这里每块发一个
+    /// `LanePart::Geometry` / `FrameOp::Geometry`（绘制范围 = 块的索引区间）。块在索引缓冲里
+    /// 连续，因此逐块绘制与整段绘制的像素结果完全一致；好处是失效/上传可以按块/页进行
+    /// （几何节点的多 lane 分块在此基础上让「追加只重建尾块」成立）。
+    ///
+    /// `op_bounds`：给定则用它（`Path` 自带逻辑 AABB），否则用**块 AABB**（`snapshot.chunks`，
+    /// 由引擎按顶点位置现算）；块的 AABB 为空（退化几何：全零顶点）时退回整块几何的
+    /// `snapshot.bounds()`，保持旧实现的可见范围（不因块切分而改变像素路径）。
+    ///
+    /// R05-12 / R05-19：旧实现对无 clip 的几何给出「全屏」包围盒，局部刷新时把所有几何 draw
+    /// 都重发；给了 transform 却仍用未变换的 bounds 会在平移后留残影。
     fn push_geometry_op(
         &mut self,
         id: crate::paint::geometry::GeometryId,
@@ -2204,31 +2200,51 @@ impl LaneEncoder<'_> {
         color: [f32; 4],
         op_bounds: Option<Rect>,
     ) {
-        let registered = self.geometry_desc(id);
+        let registered = self.geometry_snapshot(id);
         let clip_aabb = self.clip_aabb();
-        let visible = match (op_bounds, &registered) {
-            (Some(bounds), _) => {
-                visible_aabb(transformed_aabb(transform, bounds), self.scale, clip_aabb)
-            }
-            (None, Some(desc)) => visible_aabb(
-                transformed_aabb(transform, desc.bounds),
-                self.scale,
-                clip_aabb,
-            ),
-            // 未注册：拿不到真实范围，保守地用 clip 上界（GPU 侧会报 GeometryRegister）。
-            (None, None) => clip_aabb,
+        let clip_index = self.clip_index() as u32;
+        let clip_rect = clip_aabb.map(f32::to_bits);
+        let mut push_part = |chunk: u32, bounds: Rect, snapshot: std::sync::Arc<_>| {
+            let visible = visible_aabb(transformed_aabb(transform, bounds), self.scale, clip_aabb);
+            self.parts.push(LanePart::Geometry(Box::new(LaneGeometry {
+                draw: GeometryDrawGpu {
+                    id,
+                    chunk,
+                    transform,
+                    color,
+                    snapshot,
+                },
+                clip_index,
+                clip_rect,
+                bounds: bounds_of_aabb(visible),
+            })));
         };
-        self.parts.push(LanePart::Geometry(Box::new(LaneGeometry {
-            draw: GeometryDrawGpu {
-                id,
-                transform,
-                color,
-                desc: registered.unwrap_or_else(Self::missing_desc),
-            },
-            clip_index: self.clip_index() as u32,
-            clip_rect: clip_aabb.map(f32::to_bits),
-            bounds: bounds_of_aabb(visible),
-        })));
+        match &registered {
+            Some(snapshot) => {
+                // 快照的块表是绘制序的权威来源；空块表只可能来自未注册兜底（不会走到这里）。
+                for (chunk, meta) in snapshot.chunks().iter().enumerate() {
+                    let local = match (op_bounds, meta.bounds.is_empty()) {
+                        (Some(bounds), _) => bounds,
+                        (None, false) => meta.bounds,
+                        (None, true) => snapshot.bounds(),
+                    };
+                    push_part(chunk as u32, local, std::sync::Arc::clone(snapshot));
+                }
+            }
+            // 未注册：拿不到真实范围，保守地用 clip 上界（GPU 侧会报 GeometryRegister）。
+            None => push_part(
+                0,
+                op_bounds.unwrap_or_else(|| {
+                    Rect::new(
+                        clip_aabb[0],
+                        clip_aabb[1],
+                        (clip_aabb[2] - clip_aabb[0]).max(0.0),
+                        (clip_aabb[3] - clip_aabb[1]).max(0.0),
+                    )
+                }),
+                crate::paint::geometry_store::missing_snapshot(),
+            ),
+        }
     }
 
     // ── 实例发射 ───────────────────────────────────────────────────────────
@@ -3757,9 +3773,15 @@ mod tests {
     #[test]
     fn geometry_op_bounds_follow_the_transform() {
         let stride = crate::paint::geometry::GeometryPipeline::Ui.vertex_stride() as usize;
+        // 真实顶点位置 (0,0)/(10,0)/(0,10)：块的 AABB 由引擎按顶点现算 = (0,0,10,10)。
+        let points = [[0.0f32, 0.0, -1.0], [10.0, 0.0, -1.0], [0.0, 10.0, -1.0]];
+        let vertex_bytes: Vec<u8> = points
+            .iter()
+            .flat_map(|point| point.iter().flat_map(|value| value.to_ne_bytes()))
+            .collect();
         let desc = crate::paint::geometry::GeometryDesc {
-            vertex_bytes: bytes::Bytes::from(vec![0u8; stride * 3]),
-            index_bytes: bytes::Bytes::from(vec![0u8; 6]),
+            vertex_bytes: bytes::Bytes::from(vertex_bytes),
+            index_bytes: bytes::Bytes::from(vec![0u8, 0, 1, 0, 2, 0]),
             vertex_stride: stride as u32,
             index_type: crate::paint::geometry::IndexType::U16,
             topology: crate::paint::geometry::Topology::TriangleList,
@@ -3838,11 +3860,11 @@ mod tests {
             .expect("encode");
         let draw = buffer.geometry.first().expect("必须有一条几何绘制");
         assert_eq!(
-            draw.desc.vertex_bytes.len(),
+            draw.snapshot.vertex_len() as usize,
             stride * 3,
             "编码器必须从传入的 store 取到真实顶点（而不是空 MISSING 描述）"
         );
-        assert_eq!(draw.desc.index_bytes.len(), 6);
+        assert_eq!(draw.snapshot.index_len(), 6);
     }
 
     #[test]

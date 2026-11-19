@@ -26,7 +26,7 @@ use ash::vk;
 
 use crate::{
     error::EngineError,
-    paint::geometry::{GeometryDesc, GeometryId, GeometryPipeline, IndexType, Topology},
+    paint::geometry::{GeometryId, GeometryPipeline, GeometrySnapshot, IndexType, Topology},
     render::{
         linux::{
             device::{GpuBuffer, SharedGpu, init_error},
@@ -62,6 +62,8 @@ pub(crate) struct GeometryEntry {
     index_type: vk::IndexType,
     /// 该条目对应的代际（槽位复用后必须重建缓冲）。
     generation: u32,
+    /// 已上传的几何快照版本（数据更新 ⇒ 按页增量上传；X5 提交 3 之前是整份重建）。
+    revision: u64,
     /// 最后一次被绘制的帧号（[`GeometryRegistry`] 的单调帧号；驱逐判据）。
     last_used_frame: u64,
 }
@@ -141,14 +143,14 @@ impl GeometryRegistry {
         }
     }
 
-    /// 取该句柄的 GPU 缓冲；没有或代际不匹配时按 `desc` 现场创建。
+    /// 取该句柄的 GPU 缓冲；没有或代际 / 版本不匹配时按快照现场创建。
     ///
     /// `retired` 收集被替换掉的旧句柄（调用方在本帧录制结束后交给 retire 队列，I4）。
     pub(crate) fn ensure(
         &mut self,
         shared: &SharedGpu,
         id: GeometryId,
-        desc: &GeometryDesc,
+        snapshot: &GeometrySnapshot,
         retired: &mut Vec<GpuResourceHandle>,
     ) -> Result<&GeometryEntry, EngineError> {
         let slot = id.index() as usize;
@@ -156,14 +158,16 @@ impl GeometryRegistry {
             self.entries.resize_with(slot + 1, || None);
         }
         let stale = match &self.entries[slot] {
-            Some(entry) => entry.generation != id.generation(),
+            Some(entry) => {
+                entry.generation != id.generation() || entry.revision != snapshot.revision()
+            }
             None => true,
         };
         if stale {
             if let Some(old) = self.entries[slot].take() {
                 retired.extend(old.handles());
             }
-            let entry = upload_geometry(shared, id, desc)?;
+            let entry = upload_geometry(shared, id, snapshot)?;
             self.entries[slot] = Some(entry);
         }
         // 记录使用帧号：`retain_recent` 据此驱逐长期未绘制的几何（D-1）。
@@ -182,31 +186,45 @@ impl GeometryRegistry {
     }
 }
 
-/// 按注册描述创建顶点/索引缓冲（子分配 + 持久映射写入）。
+/// 按几何快照创建顶点/索引缓冲（子分配 + 持久映射写入）。
 fn upload_geometry(
     shared: &SharedGpu,
     id: GeometryId,
-    desc: &GeometryDesc,
+    snapshot: &GeometrySnapshot,
 ) -> Result<GeometryEntry, EngineError> {
-    let vertex = upload_buffer(shared, &desc.vertex_bytes)?;
-    let index = upload_buffer(shared, &desc.index_bytes)?;
+    if snapshot.index_count() == 0 || snapshot.vertex_pages().is_empty() {
+        return Err(EngineError::GeometryRegister {
+            detail: smol_str::format_smolstr!(
+                "geometry {}:{} has no CPU data (stale handle or released before upload)",
+                id.index(),
+                id.generation()
+            ),
+        });
+    }
+    let vertex = upload_pages(shared, snapshot.vertex_pages(), snapshot.vertex_len())?;
+    let index = upload_pages(shared, snapshot.index_pages(), snapshot.index_len())?;
     Ok(GeometryEntry {
         vertex,
         index,
-        index_count: (desc.index_bytes.len() as u32) / desc.index_type.size(),
-        pipeline: desc.pipeline,
-        topology: desc.topology,
-        index_type: index_type(desc.index_type),
+        index_count: snapshot.index_count(),
+        pipeline: snapshot.pipeline(),
+        topology: snapshot.topology(),
+        index_type: index_type(snapshot.index_type()),
         generation: id.generation(),
+        revision: snapshot.revision(),
         // 由 `ensure` 在返回前立刻写成当前帧号；这里只是构造初值。
         last_used_frame: 0,
     })
 }
 
-/// 从子分配器拿一块顶点/索引缓冲并写入 `bytes`（静态数据，写入后不再改）。
-fn upload_buffer(shared: &SharedGpu, bytes: &[u8]) -> Result<GpuBuffer, EngineError> {
+/// 从子分配器拿一块顶点/索引缓冲并按页偏移写入快照页。
+fn upload_pages(
+    shared: &SharedGpu,
+    pages: &[bytes::Bytes],
+    len: u32,
+) -> Result<GpuBuffer, EngineError> {
     let buffer = shared.allocate_buffer(
-        bytes.len().max(4) as u64,
+        u64::from(len.max(4)),
         vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER,
         MemoryNeed::HOST_WRITABLE,
     )?;
@@ -218,9 +236,12 @@ fn upload_buffer(shared: &SharedGpu, bytes: &[u8]) -> Result<GpuBuffer, EngineEr
             "suballocated geometry buffer has no host mapping",
         ));
     };
-    // SAFETY: 映射范围覆盖整个块，本缓冲的写入区间落在自己的子分配内。
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer, bytes.len());
+    for (page, data) in pages.iter().enumerate() {
+        let offset = GeometrySnapshot::page_offset(page) as usize;
+        // SAFETY: 映射范围覆盖整个块；页偏移 + 页长不超过该缓冲的 `len`。
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), pointer.add(offset), data.len());
+        }
     }
     Ok(buffer)
 }
@@ -279,6 +300,7 @@ mod tests {
             topology: Topology::TriangleList,
             index_type: vk::IndexType::UINT16,
             generation: 0,
+            revision: 0,
             last_used_frame,
         }
     }
@@ -327,7 +349,7 @@ mod tests {
         let _guard = gpu_test_lock();
         let shared = crate::render::linux::device::SharedGpu::new_headless_isolated()
             .expect("headless shared gpu");
-        let desc = GeometryDesc {
+        let snapshot = crate::paint::geometry_store::snapshot_for_test(GeometryDesc {
             vertex_bytes: Bytes::from_static(&[0u8; 24]),
             index_bytes: Bytes::from_static(&[0, 0, 1, 0, 2, 0]),
             vertex_stride: 12,
@@ -335,13 +357,13 @@ mod tests {
             topology: Topology::TriangleList,
             bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
             pipeline: GeometryPipeline::Ui,
-        };
+        });
         let mut registry = GeometryRegistry::new();
         registry.begin_frame();
         let mut retired = Vec::new();
         {
             let entry = registry
-                .ensure(&shared, GeometryId::for_test(3, 1), &desc, &mut retired)
+                .ensure(&shared, GeometryId::for_test(3, 1), &snapshot, &mut retired)
                 .expect("upload geometry");
             assert_eq!(entry.index_count(), 3);
         }
@@ -378,7 +400,7 @@ mod tests {
         // 同代际命中缓存：不重建，只把使用帧号推进。
         registry.begin_frame();
         registry
-            .ensure(&shared, GeometryId::for_test(3, 1), &desc, &mut retired)
+            .ensure(&shared, GeometryId::for_test(3, 1), &snapshot, &mut retired)
             .expect("cache hit");
         assert!(retired.is_empty());
         assert_eq!(
@@ -389,7 +411,7 @@ mod tests {
         // 槽位换代：旧缓冲的句柄进 retired，新缓冲重新登记（仍复用同一块内存）。
         registry.begin_frame();
         registry
-            .ensure(&shared, GeometryId::for_test(3, 2), &desc, &mut retired)
+            .ensure(&shared, GeometryId::for_test(3, 2), &snapshot, &mut retired)
             .expect("rebuilt geometry");
         assert_eq!(retired.len(), 2, "顶点 + 索引两个句柄");
         assert_eq!(

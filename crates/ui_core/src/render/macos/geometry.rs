@@ -10,7 +10,7 @@ use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 
 use crate::{
     error::EngineError,
-    paint::geometry::{GeometryDesc, GeometryId, GeometryPipeline, IndexType, Topology},
+    paint::geometry::{GeometryId, GeometryPipeline, GeometrySnapshot, IndexType, Topology},
     render::{
         macos::device::{Device, GpuObject, init_error},
         retire::GpuResourceHandle,
@@ -27,6 +27,8 @@ pub(crate) struct GeometryEntry {
     index_type: IndexType,
     /// 该条目对应的代际（槽位复用后必须重建缓冲）。
     generation: u32,
+    /// 已上传的几何快照版本（数据更新 ⇒ 按页增量上传；X5 提交 3 之前是整份重建）。
+    revision: u64,
     /// 最后一次被绘制的帧号（`GeometryRegistry` 的单调帧号）。
     ///
     /// 用于驱逐：应用释放几何句柄后本窗口的缓冲仍会驻留，必须按「最近使用」回收，
@@ -106,12 +108,12 @@ impl GeometryRegistry {
         }
     }
 
-    /// 取该句柄的 GPU 缓冲；没有或代际不匹配时按 `desc` 现场创建。
+    /// 取该句柄的 GPU 缓冲；没有或代际 / 版本不匹配时按快照现场创建。
     pub(crate) fn ensure(
         &mut self,
         device: &mut Device,
         id: GeometryId,
-        desc: &GeometryDesc,
+        snapshot: &GeometrySnapshot,
         retired: &mut Vec<GpuResourceHandle>,
     ) -> Result<&GeometryEntry, EngineError> {
         let slot = id.index() as usize;
@@ -119,14 +121,16 @@ impl GeometryRegistry {
             self.entries.resize_with(slot + 1, || None);
         }
         let stale = match &self.entries[slot] {
-            Some(entry) => entry.generation != id.generation(),
+            Some(entry) => {
+                entry.generation != id.generation() || entry.revision != snapshot.revision()
+            }
             None => true,
         };
         if stale {
             if let Some(old) = self.entries[slot].take() {
                 retired.extend(old.storage);
             }
-            let entry = upload_geometry(device, id, desc)?;
+            let entry = upload_geometry(device, id, snapshot)?;
             self.entries[slot] = Some(entry);
         }
         // 记录使用帧号：`retain_recent` 据此驱逐长期未绘制的几何（D-1）。
@@ -145,46 +149,63 @@ impl GeometryRegistry {
     }
 }
 
-/// 按注册描述创建顶点/索引缓冲（`StorageModeShared`，一次写入）。
+/// 按几何快照创建顶点/索引缓冲（`StorageModeShared`，一次写入）。
 fn upload_geometry(
     device: &mut Device,
     id: GeometryId,
-    desc: &GeometryDesc,
+    snapshot: &GeometrySnapshot,
 ) -> Result<GeometryEntry, EngineError> {
-    let vertex = upload_buffer(device, &desc.vertex_bytes)?;
-    let index = upload_buffer(device, &desc.index_bytes)?;
+    if snapshot.index_count() == 0 || snapshot.vertex_pages().is_empty() {
+        return Err(EngineError::GeometryRegister {
+            detail: smol_str::format_smolstr!(
+                "geometry {}:{} has no CPU data (stale handle or released before upload)",
+                id.index(),
+                id.generation()
+            ),
+        });
+    }
+    let vertex = upload_pages(device, snapshot.vertex_pages(), snapshot.vertex_len())?;
+    let index = upload_pages(device, snapshot.index_pages(), snapshot.index_len())?;
     let vertex_handle = device.allocate(GpuObject::Buffer(vertex.clone()));
     let index_handle = device.allocate(GpuObject::Buffer(index.clone()));
     Ok(GeometryEntry {
         vertex,
         index,
-        index_count: (desc.index_bytes.len() as u32) / desc.index_type.size(),
-        topology: desc.topology,
-        pipeline: desc.pipeline,
-        index_type: desc.index_type,
+        index_count: snapshot.index_count(),
+        topology: snapshot.topology(),
+        pipeline: snapshot.pipeline(),
+        index_type: snapshot.index_type(),
         generation: id.generation(),
+        revision: snapshot.revision(),
         // 由 `ensure` 在返回前立刻写成当前帧号；这里只是构造初值。
         last_used_frame: 0,
         storage: [vertex_handle, index_handle],
     })
 }
 
-/// 建一块 shared 缓冲并写入 `bytes`。
-fn upload_buffer(
+/// 建一块 shared 缓冲并按页偏移写入快照页。
+fn upload_pages(
     device: &mut Device,
-    bytes: &[u8],
+    pages: &[bytes::Bytes],
+    len: u32,
 ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, EngineError> {
     let buffer = device
         .raw()
-        .newBufferWithLength_options(bytes.len().max(4), MTLResourceOptions::StorageModeShared)
+        .newBufferWithLength_options((len as usize).max(4), MTLResourceOptions::StorageModeShared)
         .ok_or_else(|| init_error("newBufferWithLength_options(geometry)", "returned nil"))?;
-    // SAFETY: 缓冲容量按 `bytes.len()` 分配；shared 内存 CPU 可见；写入后不再改。
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            buffer.contents().as_ptr().cast::<u8>(),
-            bytes.len(),
-        );
+    if len == 0 {
+        return Ok(buffer);
+    }
+    for (page, data) in pages.iter().enumerate() {
+        let offset = GeometrySnapshot::page_offset(page) as usize;
+        // SAFETY: 缓冲容量按 `len` 分配；页偏移 + 页长不超过 `len`；shared 内存 CPU 可见。
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                buffer.contents().as_ptr().cast::<u8>().add(offset),
+                data.len(),
+            );
+        }
     }
     Ok(buffer)
 }

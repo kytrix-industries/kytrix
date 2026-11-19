@@ -1265,8 +1265,24 @@ fn draw_ops(
                         detail: smol_str::format_smolstr!("geometry op index {index} out of range"),
                     }
                 })?;
-                let entry = geometry.ensure(device, draw.id, &draw.desc, retired)?;
+                let entry = geometry.ensure(device, draw.id, &draw.snapshot, retired)?;
+                let chunk = draw.snapshot.chunk(draw.chunk).ok_or_else(|| {
+                    EngineError::GeometryRegister {
+                        detail: smol_str::format_smolstr!(
+                            "geometry {}:{} has no chunk {}",
+                            draw.id.index(),
+                            draw.id.generation(),
+                            draw.chunk
+                        ),
+                    }
+                })?;
                 let uniform = geometry_root(root, draw, clip_index, clip_rect);
+                debug_assert!(
+                    chunk.index_first + chunk.index_count <= entry.index_count(),
+                    "geometry chunk range must stay inside the uploaded index buffer"
+                );
+                // 分块绘制：索引缓冲偏移 = 块内第一个索引 × 索引字节数；顶点缓冲是整块几何的。
+                let index_offset = chunk.index_first as usize * entry.index_type().size() as usize;
                 // SAFETY: 顶点/索引缓冲由 `GeometryRegistry` 持有到本帧结束；
                 // root uniform 由 `setVertexBytes` 在录制时复制。
                 unsafe {
@@ -1291,12 +1307,11 @@ fn draw_ops(
                     encoder
                         .drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset(
                             metal_topology(entry.topology()),
-                            entry.index_count() as usize,
+                            chunk.index_count as usize,
                             metal_index_type(entry.index_type()),
                             entry.index(),
-                            0,
-                        );
-                    // 恢复实例的 **vertex buffer 0**：几何 VBO 覆盖了同一个槽，而后续
+                            index_offset,
+                        ); // 恢复实例的 **vertex buffer 0**：几何 VBO 覆盖了同一个槽，而后续
                     // `FrameOp::Instances` 不会重绑它（旧实现只在 `bind()` 绑一次，导致
                     // 「几何之后的所有实例绘制」都从几何顶点缓冲读 `GpuPrimitive`）。
                     encoder.setVertexBuffer_offset_atIndex(Some(instances), 0, 0);
