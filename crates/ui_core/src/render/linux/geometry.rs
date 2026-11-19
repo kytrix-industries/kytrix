@@ -262,11 +262,9 @@ impl GeometryRegistry {
                 vertex_copies.push(
                     vk::BufferCopy::default()
                         .src_offset(src_offset as u64)
-                        .dst_offset(
-                            crate::paint::geometry::GeometrySnapshot::page_offset(
-                                page.page as usize,
-                            ) as u64,
-                        )
+                        .dst_offset(crate::paint::geometry::GeometrySnapshot::page_offset(
+                            page.page as usize,
+                        ) as u64)
                         .size(page.bytes.len() as u64),
                 );
                 uploaded += page.bytes.len();
@@ -277,11 +275,9 @@ impl GeometryRegistry {
                 index_copies.push(
                     vk::BufferCopy::default()
                         .src_offset(src_offset as u64)
-                        .dst_offset(
-                            crate::paint::geometry::GeometrySnapshot::page_offset(
-                                page.page as usize,
-                            ) as u64,
-                        )
+                        .dst_offset(crate::paint::geometry::GeometrySnapshot::page_offset(
+                            page.page as usize,
+                        ) as u64)
                         .size(page.bytes.len() as u64),
                 );
                 uploaded += page.bytes.len();
