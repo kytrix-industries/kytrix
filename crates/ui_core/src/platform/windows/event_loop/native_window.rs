@@ -3,6 +3,8 @@
 
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
+use windows::Win32::Foundation::HWND;
+
 use super::recovery;
 use crate::{
     app::App,
@@ -16,6 +18,29 @@ use crate::{
     render::backend::Renderer,
     window::{WindowId, WindowOptions},
 };
+
+/// 消费者：`pump::run`（启动建窗）与 [`sync_native_windows`]（运行时建窗）。
+///
+/// 解析 `WindowOptions::owner` → 原生 owner 的 HWND（X1）。
+///
+/// 只在**已创建的原生窗口集合**里查：owner 必须比 owned 先创建（同一 `App` 内先创建的窗口，
+/// 由 App 层保证顺序）。找不到（owner 已关闭 / 尚未创建）⇒ 返回 `None` 降级为普通顶层窗口，
+/// 并写诊断 —— 与公共契约「按 None 处理并写诊断（不 panic）」一致。
+///
+/// 「窗口句柄永不复用」由 `WindowId` 单调分配保证：这里只按 `WindowId` 匹配，因此陈旧 id
+/// 不会误绑到后来复用同一 HWND 的新窗口。
+pub(super) fn resolve_owner(options: &WindowOptions, windows: &[NativeWindow]) -> Option<HWND> {
+    let owner_id = options.owner?;
+    match windows.iter().find(|native| native.id() == owner_id) {
+        Some(owner) => Some(owner.hwnd()),
+        None => {
+            eprintln!(
+                "kytrix: 窗口 owner={owner_id:?} 不存在（已关闭或晚于 owned 创建），按无 owner 降级"
+            );
+            None
+        }
+    }
+}
 
 /// 消费者：`pump_loop` 的 ②a 步骤。
 /// 把 `App` 的窗口集合同步到原生窗口（运行时创建 / 应用主动关闭，P1-2.8）。
@@ -48,13 +73,19 @@ pub(super) fn sync_native_windows(
     // `NativeWindow::drop` 负责 `DestroyWindow`（GPU 线程的 join 在 `Renderer::drop` 里，
     // `App::close_window` 已经丢掉了那个 `Window`，因此顺序天然正确）。
     let existing: Vec<WindowId> = windows.iter().map(NativeWindow::id).collect();
-    let pending: Vec<(WindowId, WindowOptions)> = app
+    let mut pending: Vec<(WindowId, WindowOptions)> = app
         .windows()
         .filter(|(id, _)| !existing.contains(id))
         .map(|(id, window)| (id, window.options().clone()))
         .collect();
+    // X1：owner 必须比 owned 先创建。`App` 的窗口表是哈希表（迭代顺序任意），平台层按
+    // `WindowId`（单调递增 = 创建顺序）排序后再建窗，owner 解析才稳定命中。
+    pending.sort_by_key(|(id, _)| id.to_bits());
     for (id, options) in pending {
-        let mut native = NativeWindow::create(id, &options, dispatcher.clone(), Some(app_cell))?;
+        // X1：owner 在**已创建**的原生窗口里解析（App 层保证 owner 先于 owned 创建）。
+        let owner = resolve_owner(&options, windows);
+        let mut native =
+            NativeWindow::create(id, &options, owner, dispatcher.clone(), Some(app_cell))?;
         let client = native.client_size();
         let renderer = Renderer::new_for_hwnd(native.composition(), client, options.background)?;
         // A5：帧预算的刷新率提示（窗口所在 output；查询失败 ⇒ 门禁保持禁用）。
@@ -324,7 +355,7 @@ pub(super) fn apply_event(
 mod tests {
     use std::sync::Arc;
 
-    use super::apply_display_recovery;
+    use super::{apply_display_recovery, resolve_owner};
     use crate::{
         app::App,
         platform::{dispatcher::Dispatcher, windows::window::NativeWindow},
@@ -349,7 +380,7 @@ mod tests {
         let options = WindowOptions::default();
         let id = app.create_window(options.clone());
         let dispatcher = Dispatcher::new();
-        let mut native = NativeWindow::create(id, &options, Arc::clone(&dispatcher), None)
+        let mut native = NativeWindow::create(id, &options, None, Arc::clone(&dispatcher), None)
             .expect("NativeWindow");
         let _ = dispatcher.take_frame_wake();
 
@@ -389,12 +420,55 @@ mod tests {
         let options = WindowOptions::default();
         let id = app.create_window(options.clone());
         let dispatcher = Dispatcher::new();
-        let native =
-            NativeWindow::create(id, &options, Arc::clone(&dispatcher), None).expect("window");
+        let native = NativeWindow::create(id, &options, None, Arc::clone(&dispatcher), None)
+            .expect("window");
         let _ = dispatcher.take_frame_wake();
 
         let mut windows = vec![native];
         assert!(!apply_display_recovery(&mut app, &mut windows, &dispatcher));
         assert!(!dispatcher.take_frame_wake(), "没有请求时不得唤醒一帧");
+    }
+
+    /// X1：`WindowOptions::owner` 按 `WindowId` 解析到**已创建**原生窗口的 HWND；
+    /// 查不到（owner 已关闭 / 晚于 owned 创建）⇒ 降级为无 owner（函数内写诊断，不 panic）。
+    ///
+    /// 变异守卫：删掉建窗路径对 [`resolve_owner`] 的使用、或让它恒返回 `None`
+    /// ⇒ `window.rs` 的 `an_owned_window_reports_its_owner...` 与真机 X1 证据红。
+    #[test]
+    fn owner_resolution_maps_window_ids_to_live_native_windows() {
+        let options = WindowOptions::default();
+        let owner = NativeWindow::create(
+            crate::window::WindowId::for_test(1),
+            &options,
+            None,
+            Dispatcher::new(),
+            None,
+        )
+        .expect("owner window");
+        let windows = vec![owner];
+
+        let mut options = WindowOptions {
+            owner: Some(crate::window::WindowId::for_test(1)),
+            ..WindowOptions::default()
+        };
+        assert_eq!(
+            resolve_owner(&options, &windows),
+            Some(windows[0].hwnd()),
+            "owner id 必须解析到已创建原生窗口的 HWND"
+        );
+
+        options.owner = Some(crate::window::WindowId::for_test(99));
+        assert_eq!(
+            resolve_owner(&options, &windows),
+            None,
+            "不存在的 owner 必须降级为无 owner（不 panic）"
+        );
+
+        options.owner = None;
+        assert_eq!(
+            resolve_owner(&options, &[]),
+            None,
+            "没有 owner 时直接返回 None"
+        );
     }
 }

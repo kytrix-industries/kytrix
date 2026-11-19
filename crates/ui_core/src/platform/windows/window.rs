@@ -21,7 +21,7 @@ use windows::Win32::{
         MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromWindow,
     },
     System::LibraryLoader::GetModuleHandleW,
-    UI::WindowsAndMessaging::*,
+    UI::{Input::KeyboardAndMouse::EnableWindow, WindowsAndMessaging::*},
 };
 
 use crate::{
@@ -85,16 +85,29 @@ pub(crate) struct NativeWindow {
     logical_size: Size,
     /// 最近一次下发的 IME caret 区域（逻辑矩形 + 当时 Scale）。
     ime_area: Option<(Rect, Scale)>,
+    /// 模态窗口打开期间被 `EnableWindow(owner, FALSE)` 禁用的 owner 窗口（X1）。
+    ///
+    /// 只有「`options.modal == true` 且 owner 存在」时才置位；销毁本窗口前必须恢复
+    /// `EnableWindow(owner, TRUE)`，否则 owner 永久不可交互（系统级灰显 + 无输入）。
+    /// owner 已被销毁时 `EnableWindow` 对失效句柄返回 FALSE（不 UB），无需特殊处理。
+    modal_owner: Option<HWND>,
 }
 
 impl NativeWindow {
     /// 创建**隐藏**窗口并把客户区调到 `options.size`（逻辑像素 × 平台 DPI）。
+    ///
+    /// `owner` 是已解析的 owner 窗口句柄（X1）：`Some` ⇒ `CreateWindowExW` 的 `hWndParent`
+    /// 走 owner 语义（不设 `WS_CHILD`，owned 窗口仍是顶层窗口）；`options.always_on_top` ⇒
+    /// `WS_EX_TOPMOST`；`options.modal` ⇒ 建窗后禁用 owner（`EnableWindow(FALSE)`），
+    /// [`Self::destroy`] 恢复。owner 的 `WindowId → HWND` 解析在平台事件循环侧完成
+    /// （`native_window::resolve_owner`，找不到时诊断降级为 None）。
     ///
     /// 失败一律 `EngineError::WindowCreate`（`CreateWindowExW` / `RegisterClassW` 的 HRESULT 与
     /// `GetLastError` 都写进 `detail`）。
     pub(crate) fn create(
         id: WindowId,
         options: &WindowOptions,
+        owner: Option<HWND>,
         dispatcher: Arc<Dispatcher>,
         app: Option<&Rc<RefCell<App>>>,
     ) -> Result<Self, EngineError> {
@@ -111,13 +124,20 @@ impl NativeWindow {
         let (window_x, window_y, provisional_width, provisional_height) =
             provisional_window_rect(options, dpi::system_dpi());
         // SAFETY: `class` / `title` 是本函数栈上的 NUL 结尾 UTF-16 缓冲，`CreateWindowExW`
-        // 同步拷贝；父窗口/菜单为空，实例句柄来自本进程。窗口此时**隐藏**（无 `WS_VISIBLE`）。
+        // 同步拷贝；实例句柄来自本进程。窗口此时**隐藏**（无 `WS_VISIBLE`）。
         //
         // `WS_EX_NOREDIRECTIONBITMAP`：客户区不做系统重定向表面，全部像素来自 DirectComposition
         // （没有它，DComp 内容会和 GDI 重定向表面叠在一起，resize 时还会多一层 DWM 拉伸）。
+        // X1：`WS_EX_TOPMOST` 在创建时声明（置顶窗口），`hWndParent = owner` 走 owner 语义
+        // （`WS_OVERLAPPEDWINDOW` 顶层窗口 + owner：owned 恒在 owner 之上、随其最小化/销毁）。
+        let ex_style = if options.always_on_top {
+            WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST
+        } else {
+            WS_EX_NOREDIRECTIONBITMAP
+        };
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_NOREDIRECTIONBITMAP,
+                ex_style,
                 windows::core::PCWSTR(class.as_ptr()),
                 windows::core::PCWSTR(title.as_ptr()),
                 WS_OVERLAPPEDWINDOW,
@@ -125,7 +145,7 @@ impl NativeWindow {
                 window_y,
                 provisional_width,
                 provisional_height,
-                None,
+                owner,
                 None,
                 Some(instance.into()),
                 None,
@@ -170,6 +190,20 @@ impl NativeWindow {
                 return Err(error);
             }
         };
+        // X1：模态窗口 —— 建窗后（显示前）禁用 owner，系统级拦截 owner 及其非客户区输入
+        // （用户无法与 owner 交互，视觉上灰显），关闭/销毁本窗口时由 `destroy` 恢复。
+        // 失败（owner 已失效等）只降级为「没有原生模态」：引擎层仍有按 owner 关系过滤输入的
+        // 兜底；不 panic、不阻止新窗口创建。放在所有可失败步骤**之后**，避免失败路径把
+        // owner 留在禁用状态。
+        let modal_owner = if options.modal { owner } else { None };
+        if let Some(owner_hwnd) = modal_owner {
+            // SAFETY: owner 由调用方保证仍是本进程存活窗口（解析来源是活着的 NativeWindow）；
+            // 即使已失效，`EnableWindow` 也只返回 FALSE，不解引用。
+            unsafe {
+                let _ = EnableWindow(owner_hwnd, false);
+            }
+        }
+
         // SAFETY: `hwnd` 刚创建且本函数独占；`state` 的所有权转移给 `NativeWindow`（Drop 回收）。
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize) };
 
@@ -182,6 +216,7 @@ impl NativeWindow {
             scale: Scale::ONE,
             logical_size: options.size,
             ime_area: None,
+            modal_owner,
         };
         window.apply_dpi_and_size(options)?;
         Ok(window)
@@ -197,6 +232,11 @@ impl NativeWindow {
     /// 句柄的 `isize` 形式（引擎内部唯一允许的「无类型」传递）。
     pub(crate) fn hwnd_raw(&self) -> isize {
         self.hwnd.0 as isize
+    }
+
+    /// 原生窗口句柄（X1 owner 解析在平台事件循环侧用它建立 `WindowId → HWND` 映射）。
+    pub(crate) fn hwnd(&self) -> HWND {
+        self.hwnd
     }
 
     /// 创建者传入的窗口 id。
@@ -575,6 +615,15 @@ impl NativeWindow {
 
     /// 销毁窗口（幂等；`Drop` 也会调）。
     pub(crate) fn destroy(&mut self) {
+        // X1：模态窗口销毁前先恢复 owner 的输入。顺序不能反：owned 窗口先没会让 owner 永久
+        // 禁用（灰显 + 收不到任何输入）。owner 已被销毁（系统随 owner 销毁 owned 窗口）时
+        // `EnableWindow` 对失效句柄只返回 FALSE，不 UB。
+        if let Some(owner) = self.modal_owner.take() {
+            // SAFETY: owner 句柄来自本进程活着的 `NativeWindow`（解析时保证）；失效时调用只返回 FALSE。
+            unsafe {
+                let _ = EnableWindow(owner, true);
+            }
+        }
         if self.hwnd.is_invalid() {
             return;
         }
@@ -699,14 +748,23 @@ fn wide(text: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use windows::Win32::UI::Input::Ime::{ImmGetContext, ImmReleaseContext};
+    use windows::Win32::UI::{
+        Input::{
+            Ime::{ImmGetContext, ImmReleaseContext},
+            KeyboardAndMouse::IsWindowEnabled,
+        },
+        WindowsAndMessaging::{
+            GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetWindow, GetWindowLongPtrW, IsWindow, WS_CHILD,
+            WS_EX_TOPMOST,
+        },
+    };
 
     use super::{NativeWindow, refresh_hz_from_display_frequency};
     use crate::{
         app::App,
         math::{Rect, Scale, Size},
         platform::dispatcher::Dispatcher,
-        window::WindowOptions,
+        window::{WindowId, WindowOptions},
     };
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
@@ -728,7 +786,7 @@ mod tests {
         let mut app = App::new(runtime.handle().clone());
         let options = WindowOptions::default();
         let id = app.create_window(options.clone());
-        let mut native = NativeWindow::create(id, &options, Dispatcher::new(), None)
+        let mut native = NativeWindow::create(id, &options, None, Dispatcher::new(), None)
             .expect("NativeWindow::create");
 
         // SAFETY: 窗口由本用例持有且存活；上下文句柄成对释放。
@@ -798,7 +856,7 @@ mod tests {
         let mut app = App::new(runtime.handle().clone());
         let options = WindowOptions::default();
         let id = app.create_window(options.clone());
-        let mut native = NativeWindow::create(id, &options, Dispatcher::new(), None)
+        let mut native = NativeWindow::create(id, &options, None, Dispatcher::new(), None)
             .expect("NativeWindow::create");
 
         // 故意把 App 侧写成与平台不一致的值：恢复必须把它纠回平台真值。
@@ -851,6 +909,7 @@ mod tests {
         let native = NativeWindow::create(
             crate::window::WindowId::for_test(1),
             &options,
+            None,
             Dispatcher::new(),
             None,
         )
@@ -868,5 +927,185 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── X1：owner / 模态 / 置顶的原生语义（隐藏窗口夹具）────────────────────────────────
+    //
+    // 这里只钉**平台层**的系统行为（Win32 owner / WS_EX_TOPMOST / EnableWindow）；真机 z 序、
+    // 最小化跟随与置顶视觉由 `.review/p1-b-win-x1.log` 的可见窗口探针验收。引擎层的 owner
+    // 校验 / 级联 / 模态输入过滤在 App 层（本 worktree 之外），不在本用例范围。
+
+    /// 建一个隐藏的普通顶层窗口（X1 用例的 owner / 对照）。
+    fn window(id: u32) -> NativeWindow {
+        NativeWindow::create(
+            WindowId::for_test(id),
+            &WindowOptions::default(),
+            None,
+            Dispatcher::new(),
+            None,
+        )
+        .expect("NativeWindow::create")
+    }
+
+    /// X1 owner：`CreateWindowExW` 的 `hWndParent` 走 owner 语义 ——
+    /// `GetWindow(GW_OWNER)` 回指 owner，且窗口**不是** `WS_CHILD`（owned 窗口仍是顶层窗口）。
+    ///
+    /// 变异守卫：把 `CreateWindowExW` 的 `hWndParent` 改回 `None` ⇒ `GW_OWNER` 为 0，用例红。
+    #[test]
+    fn an_owned_window_reports_its_owner_and_is_not_a_child_window() {
+        let owner = window(1);
+        let options = WindowOptions {
+            owner: Some(WindowId::for_test(1)),
+            ..WindowOptions::default()
+        };
+        let owned = NativeWindow::create(
+            WindowId::for_test(2),
+            &options,
+            Some(owner.hwnd),
+            Dispatcher::new(),
+            None,
+        )
+        .expect("owned window");
+
+        // SAFETY: 两个窗口都由本用例持有且仍存活；只读查询。
+        let reported = unsafe { GetWindow(owned.hwnd, GW_OWNER) }.expect("GetWindow(GW_OWNER)");
+        assert_eq!(
+            reported, owner.hwnd,
+            "owned 窗口的 GW_OWNER 必须回指 owner（hWndParent owner 语义）"
+        );
+        // SAFETY: 同上，只读查询窗口样式。
+        let style = unsafe { GetWindowLongPtrW(owned.hwnd, GWL_STYLE) };
+        assert_eq!(
+            style & (WS_CHILD.0 as isize),
+            0,
+            "owner 语义不得退化成客户区子窗口（window_set/origin 行为会完全不同）"
+        );
+    }
+
+    /// X1 置顶：`always_on_top` ⇒ 创建时 `WS_EX_TOPMOST`；普通窗口不得带该位。
+    ///
+    /// 变异守卫：删掉 `CreateWindowExW` 的 `WS_EX_TOPMOST` ⇒ 断言红。
+    #[test]
+    fn an_always_on_top_window_has_the_topmost_ex_style() {
+        let options = WindowOptions {
+            always_on_top: true,
+            ..WindowOptions::default()
+        };
+        let topmost = NativeWindow::create(
+            WindowId::for_test(3),
+            &options,
+            None,
+            Dispatcher::new(),
+            None,
+        )
+        .expect("topmost window");
+        // SAFETY: 窗口由本用例持有且仍存活；只读查询扩展样式。
+        let ex_style = unsafe { GetWindowLongPtrW(topmost.hwnd, GWL_EXSTYLE) };
+        assert_ne!(
+            ex_style & (WS_EX_TOPMOST.0 as isize),
+            0,
+            "always_on_top 窗口必须带 WS_EX_TOPMOST"
+        );
+
+        let plain = window(4);
+        // SAFETY: 同上。
+        let plain_ex_style = unsafe { GetWindowLongPtrW(plain.hwnd, GWL_EXSTYLE) };
+        assert_eq!(
+            plain_ex_style & (WS_EX_TOPMOST.0 as isize),
+            0,
+            "普通窗口不得带 WS_EX_TOPMOST"
+        );
+    }
+
+    /// X1 模态：建窗后系统级禁用 owner（`IsWindowEnabled == false`），模态窗口销毁后恢复。
+    ///
+    /// 变异守卫：删掉 `create` 里的 `EnableWindow(owner, false)` ⇒ 第一段断言红；
+    /// 删掉 `destroy` 里的 `EnableWindow(owner, true)` ⇒ 第二段断言红。
+    #[test]
+    fn a_modal_window_disables_its_owner_until_it_is_destroyed() {
+        let owner = window(5);
+        let options = WindowOptions {
+            owner: Some(WindowId::for_test(5)),
+            modal: true,
+            ..WindowOptions::default()
+        };
+        let mut modal = NativeWindow::create(
+            WindowId::for_test(6),
+            &options,
+            Some(owner.hwnd),
+            Dispatcher::new(),
+            None,
+        )
+        .expect("modal window");
+        // SAFETY: 两个窗口仍存活；只读查询启用状态。
+        assert!(
+            !unsafe { IsWindowEnabled(owner.hwnd) }.as_bool(),
+            "模态窗口打开期间 owner 必须被系统禁用（EnableWindow(FALSE)）"
+        );
+
+        modal.destroy();
+        // SAFETY: owner 仍存活；只读查询。
+        assert!(
+            unsafe { IsWindowEnabled(owner.hwnd) }.as_bool(),
+            "模态窗口销毁后必须恢复 owner 输入（EnableWindow(TRUE)）"
+        );
+    }
+
+    /// X1 模态反例：非模态的 owned 窗口不得禁用 owner。
+    #[test]
+    fn an_owned_window_without_modal_leaves_its_owner_enabled() {
+        let owner = window(7);
+        let options = WindowOptions {
+            owner: Some(WindowId::for_test(7)),
+            ..WindowOptions::default()
+        };
+        let _owned = NativeWindow::create(
+            WindowId::for_test(8),
+            &options,
+            Some(owner.hwnd),
+            Dispatcher::new(),
+            None,
+        )
+        .expect("owned window");
+        // SAFETY: 两个窗口仍存活；只读查询。
+        assert!(
+            unsafe { IsWindowEnabled(owner.hwnd) }.as_bool(),
+            "非模态的 owned 窗口不得禁用 owner"
+        );
+    }
+
+    /// X1 生命周期契约（系统语义，记录用）：owner 被 `DestroyWindow` 时系统**一并销毁**其
+    /// owned 窗口（`WindowOptions::owner` 文档承诺的「owner 销毁时 owned 一并销毁」）。
+    ///
+    /// 引擎正常关闭路径由 App 层先关闭 owned 再关闭 owner（级联在 App 层实现）；本用例验证
+    /// 平台层对「句柄被系统偷走」的容错：`IsWindow` 变 false，且本层 `destroy()` 对失效句柄
+    /// 安全失败（不 panic / 不 UB）。
+    #[test]
+    fn destroying_the_owner_takes_the_owned_window_with_it() {
+        let owner = window(9);
+        let options = WindowOptions {
+            owner: Some(WindowId::for_test(9)),
+            ..WindowOptions::default()
+        };
+        let mut owned = NativeWindow::create(
+            WindowId::for_test(10),
+            &options,
+            Some(owner.hwnd),
+            Dispatcher::new(),
+            None,
+        )
+        .expect("owned window");
+        let owned_hwnd = owned.hwnd;
+
+        drop(owner);
+        // SAFETY: 只读查询；句柄预期已随 owner 销毁而失效。
+        assert!(
+            !unsafe { IsWindow(Some(owned_hwnd)) }.as_bool(),
+            "owner 销毁时系统必须一并销毁 owned 窗口（owner 语义契约）"
+        );
+
+        // 引擎侧销毁路径对已经失效的句柄必须安全失败：`Composition::shutdown` 忽略错误、
+        // `DestroyWindow` 返回错误被忽略，不 panic。
+        owned.destroy();
     }
 }

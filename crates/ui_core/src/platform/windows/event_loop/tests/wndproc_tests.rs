@@ -940,8 +940,8 @@ fn the_pump_sync_copies_drag_regions_into_the_wndproc_state() {
     let mut app = App::new(runtime.handle().clone());
     let options = WindowOptions::default();
     let id = app.create_window(options.clone());
-    let mut native =
-        NativeWindow::create(id, &options, Dispatcher::new(), None).expect("NativeWindow::create");
+    let mut native = NativeWindow::create(id, &options, None, Dispatcher::new(), None)
+        .expect("NativeWindow::create");
     let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
     let scale = native.scale();
     let mut client_origin = POINT::default();
@@ -1339,7 +1339,7 @@ fn a_size_move_resize_drives_a_real_frame() {
     let id = app.create_window(options.clone());
     let app = std::rc::Rc::new(std::cell::RefCell::new(app));
     let dispatcher = Dispatcher::new();
-    let native = NativeWindow::create(id, &options, Arc::clone(&dispatcher), Some(&app))
+    let native = NativeWindow::create(id, &options, None, Arc::clone(&dispatcher), Some(&app))
         .expect("NativeWindow");
     let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
     let before = app.borrow().window(id).expect("window").frame_index();
@@ -1376,7 +1376,7 @@ fn a_size_after_the_modal_loop_is_only_recorded_for_the_pump() {
     let id = app.create_window(options.clone());
     let app = std::rc::Rc::new(std::cell::RefCell::new(app));
     let dispatcher = Dispatcher::new();
-    let mut native = NativeWindow::create(id, &options, Arc::clone(&dispatcher), Some(&app))
+    let mut native = NativeWindow::create(id, &options, None, Arc::clone(&dispatcher), Some(&app))
         .expect("NativeWindow");
     let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
     // 先走完一次模态循环（会话打开又关闭）。
@@ -1437,7 +1437,7 @@ fn modal_tick_fixture(runtime: &tokio::runtime::Runtime) -> ModalFixture {
     let id = app.create_window(options.clone());
     let app = Rc::new(RefCell::new(app));
     let dispatcher = Dispatcher::new();
-    let native = NativeWindow::create(id, &options, Arc::clone(&dispatcher), Some(&app))
+    let native = NativeWindow::create(id, &options, None, Arc::clone(&dispatcher), Some(&app))
         .expect("NativeWindow::create");
     let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
     let hook_runs = Rc::new(Cell::new(0u32));

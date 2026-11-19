@@ -34,7 +34,9 @@ use windows::Win32::{
     },
 };
 
-use super::native_window::{apply_display_recovery, collect_events, sync_native_windows};
+use super::native_window::{
+    apply_display_recovery, collect_events, resolve_owner, sync_native_windows,
+};
 use crate::{
     app::App,
     error::EngineError,
@@ -413,16 +415,22 @@ pub(crate) fn run(mut app: App) -> Result<(), EngineError> {
     // SAFETY: 无参数，返回调用线程的 id（只用于 `PostThreadMessageW`）。
     dispatcher.bind_thread(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() });
 
-    let requests: Vec<(WindowId, WindowOptions)> = app
+    let mut requests: Vec<(WindowId, WindowOptions)> = app
         .windows()
         .map(|(id, window)| (id, window.options().clone()))
         .collect();
+    // X1：owner 必须比 owned **先创建**。`App` 的窗口表是哈希表（迭代顺序任意），平台层按
+    // `WindowId`（单调递增 = 创建顺序）排序后再建窗，owner 解析才稳定命中。
+    requests.sort_by_key(|(id, _)| id.to_bits());
     // `App` 交给 `Rc<RefCell<_>>`：系统的 size / move 模态循环里，`WndProc` 要直接驱动一帧
     // 真实帧（见 `pump_loop` 的 ① 与 `ResizeFrameDriver`）。驱动的引用是 `Weak`，关闭顺序不受影响。
     let app = Rc::new(RefCell::new(app));
     let mut windows: Vec<NativeWindow> = Vec::with_capacity(requests.len());
     for (id, options) in requests {
-        let mut native = NativeWindow::create(id, &options, dispatcher.clone(), Some(&app))?;
+        // X1：owner 只在**已创建**的原生窗口里解析（`App::create_window` 保证 owner 先创建；
+        // 找不到时降级为无 owner 并写诊断）。
+        let owner = resolve_owner(&options, &windows);
+        let mut native = NativeWindow::create(id, &options, owner, dispatcher.clone(), Some(&app))?;
         let client = native.client_size();
         let renderer = Renderer::new_for_hwnd(native.composition(), client, options.background)?;
         // A5：帧预算的刷新率提示（窗口所在 output；查询失败 ⇒ 门禁保持禁用）。

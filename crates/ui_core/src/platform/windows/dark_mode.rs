@@ -132,8 +132,14 @@ mod tests {
 
     fn hidden_window() -> (NativeWindow, HWND) {
         let options = WindowOptions::default();
-        let native = NativeWindow::create(WindowId::for_test(1), &options, Dispatcher::new(), None)
-            .expect("NativeWindow::create");
+        let native = NativeWindow::create(
+            WindowId::for_test(1),
+            &options,
+            None,
+            Dispatcher::new(),
+            None,
+        )
+        .expect("NativeWindow::create");
         let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
         (native, hwnd)
     }
