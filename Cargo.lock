@@ -10527,6 +10527,7 @@ dependencies = [
  "taffy",
  "thiserror 2.0.21",
  "tokio",
+ "unicode-linebreak",
  "unicode-segmentation",
  "wayland-client",
  "wayland-protocols",

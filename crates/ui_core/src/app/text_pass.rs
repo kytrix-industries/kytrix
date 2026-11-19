@@ -339,10 +339,11 @@ pub(crate) fn refresh_text(
         );
     }
     // 数字快速路径的命中率（R12 的核心性能指标）：分子 = 走快速路径的塑形数，
-    // 分母 = 进入快速路径判定的塑形数。
+    // 分母 = 进入快速路径判定的塑形数（含静态条件不满足的候选，D-2 后是真实命中率）。
     let fast = text.take_fast_path_stats();
     report.fast_path_shaped = fast.hits;
     report.fast_path_queries = fast.queries;
+    report.fast_path_ineligible = fast.ineligible();
     // 光栅/图集统计**不在这里**：光栅发生在同帧的 `layout_text`（第二阶段），而本报告在
     // 第一阶段产出。`GlyphAtlas::take_stats` 只能取一次，第二阶段才是唯一正确的消费点
     // （此前这里取到的永远是 0，复审已确认）。见 `TextLayoutReport` 的同名字段。
