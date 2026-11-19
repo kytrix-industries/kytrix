@@ -269,6 +269,14 @@ pub(super) fn apply_event(
             dispatcher.wake();
             Event::Resized { size }
         }
+        PlatformEvent::Moved { x, y } => {
+            // B3：`WM_MOVE` 给的是**屏幕物理坐标**；按该消息的 scale 换算成公共 API 的逻辑
+            // 坐标语义（虚拟桌面内容区左上角为原点，`Event::Moved` 的契约）。窗口移动本身
+            // 不需要重画（DComp 内容随窗口移动），因此不在这里 `wake` 请求新帧。
+            Event::Moved {
+                position: to_logical(x, y),
+            }
+        }
         PlatformEvent::Dpi { dpi } => {
             // DPI 的**几何已经落地**：`WndProc` 在 `WM_DPICHANGED` 里同步 `SetWindowPos` 了系统
             // 建议矩形（R07-12），这里只做记账与渲染目标更新（P1-2a：内容重画由 GPU 线程按

@@ -24,14 +24,14 @@ use windows::Win32::{
         },
         WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, GWLP_USERDATA, GetWindowRect, HTBOTTOMRIGHT, HTCAPTION,
-            HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON, HTMINBUTTON, HTSYSMENU, HTTOPLEFT,
+            HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON, HTMINBUTTON, HTSYSMENU, HTTOPLEFT, MINMAXINFO,
             PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, RegisterClassW, SM_CXPADDEDBORDER,
             SM_CXSIZEFRAME, SPI_SETANIMATION, SPI_SETWORKAREA, SendMessageW, SetWindowLongPtrW,
-            WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_DISPLAYCHANGE, WM_ENTERSIZEMOVE,
-            WM_EXITSIZEMOVE, WM_IME_CHAR, WM_IME_COMPOSITION, WM_IME_SETCONTEXT,
-            WM_IME_STARTCOMPOSITION, WM_INPUTLANGCHANGE, WM_LBUTTONDOWN, WM_MOUSEMOVE,
-            WM_NCHITTEST, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSW,
-            WS_OVERLAPPEDWINDOW,
+            WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_DISPLAYCHANGE, WM_DPICHANGED,
+            WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_IME_CHAR, WM_IME_COMPOSITION,
+            WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_INPUTLANGCHANGE, WM_LBUTTONDOWN,
+            WM_MOUSEMOVE, WM_MOVE, WM_NCHITTEST, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_SIZE,
+            WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
         },
     },
 };
@@ -40,12 +40,14 @@ use super::super::{WndProcState, pump::A11Y_TIMER_ID, wndproc};
 use crate::{
     app::App,
     event::ImeEvent,
+    math::Size,
     platform::{
         dispatcher::{Dispatcher, WM_APP_COMPOSITION_WAKE},
         event::PlatformEvent,
         windows::{
             dark_mode, dpi,
             ime::{self, ImeApplied, ImeCommand},
+            placement,
             window::NativeWindow,
         },
     },
@@ -68,6 +70,24 @@ fn hidden_window(tag: &str, dispatcher: Arc<Dispatcher>) -> (HWND, *mut WndProcS
 fn hidden_window_sized(
     tag: &str,
     dispatcher: Arc<Dispatcher>,
+    width: i32,
+    height: i32,
+) -> (HWND, *mut WndProcState, Vec<u16>) {
+    hidden_window_with_limits(
+        tag,
+        dispatcher,
+        placement::ClientLimits::default(),
+        width,
+        height,
+    )
+}
+
+/// 与 [`hidden_window`] 相同，但 `WndProcState` 的客户区尺寸约束可指定（B3 的
+/// `WM_GETMINMAXINFO` 用例：约束来源必须是建窗时解析出的 `WindowOptions`）。
+fn hidden_window_with_limits(
+    tag: &str,
+    dispatcher: Arc<Dispatcher>,
+    limits: placement::ClientLimits,
     width: i32,
     height: i32,
 ) -> (HWND, *mut WndProcState, Vec<u16>) {
@@ -101,7 +121,7 @@ fn hidden_window_sized(
         )
     }
     .expect("CreateWindowExW");
-    let state = match WndProcState::new(dispatcher, hwnd, WindowId::for_test(1), None) {
+    let state = match WndProcState::new(dispatcher, hwnd, WindowId::for_test(1), limits, None) {
         Ok(state) => Box::into_raw(Box::new(state)),
         Err(error) => {
             // SAFETY: 窗口由本函数创建、尚未交给其它所有者。
@@ -128,6 +148,11 @@ fn destroy_hidden_window(hwnd: HWND, state: *mut WndProcState) {
 /// `WM_SIZE` 的 `lParam`：低 16 位 = 客户区物理宽，高 16 位 = 客户区物理高。
 fn encoded_client(width: u16, height: u16) -> isize {
     (((height as u32) << 16) | width as u32) as isize
+}
+
+/// `WM_MOVE` / `WM_NCHITTEST` 的 `lParam`：低 16 位 = x、高 16 位 = y（两段有符号）。
+fn encoded_point(x: i32, y: i32) -> isize {
+    ((((y as u32) << 16) | (x as u32 & 0xFFFF)) as i32) as isize
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -649,9 +674,9 @@ fn a_dpi_change_applies_immediately_and_stamps_later_events() {
     }
     // 建议矩形（800×600）比 192 dpi 下的最小跟踪尺寸大，系统不会钳制 ⇒ 位置与尺寸逐字落地。
     assert!(
-        raw.min_size.0 <= 800 && raw.min_size.1 <= 600,
-        "前置：建议矩形必须大于最小跟踪尺寸（否则会被系统钳制），min_size={:?}",
-        raw.min_size
+        raw.min_track_size.0 <= 800 && raw.min_track_size.1 <= 600,
+        "前置：建议矩形必须大于最小跟踪尺寸（否则会被系统钳制），min_track_size={:?}",
+        raw.min_track_size
     );
     assert_eq!(
         (
@@ -677,6 +702,162 @@ fn a_dpi_change_applies_immediately_and_stamps_later_events() {
         "同批后续输入必须用新 scale（R07-12）"
     );
     destroy_hidden_window(hwnd, state);
+}
+
+/// B3：`WM_GETMINMAXINFO` 的 `ptMinTrackSize` / `ptMaxTrackSize` 必须来自建窗时解析的
+/// `WindowOptions::min_size` / `max_size`（客户区逻辑尺寸 → **窗口外框**物理像素，含 DPI
+/// 换算）；`min > max` 时按 `max` 钳制（公共契约 min = max）；未配置 `max_size` 时必须保留
+/// 系统默认值（`DefWindowProcW` 预填的屏幕上限），不能被引擎写成 0。
+///
+/// 变异守卫：删掉 `ptMinTrackSize` 赋值 / 删掉 `max_track_size` 的覆盖判断 ⇒ 对应断言变红。
+#[test]
+fn wm_getminmaxinfo_applies_the_configured_client_limits() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let options = WindowOptions {
+        min_size: Some(Size::new(500.0, 300.0)),
+        max_size: Some(Size::new(1200.0, 900.0)),
+        ..WindowOptions::default()
+    };
+    let limits = placement::ClientLimits::from_options(&options);
+    let (hwnd, state, class_name) =
+        hidden_window_with_limits("KytrixWndProcMinMax", dispatcher, limits, 640, 480);
+    let dpi = dpi::window_dpi(hwnd);
+    let mut info = MINMAXINFO::default();
+
+    // SAFETY: 窗口由本测试创建且仍存活；`WM_GETMINMAXINFO` 处理期只写 `lParam` 指向的栈上结构。
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_GETMINMAXINFO,
+            None,
+            Some(LPARAM((&raw mut info) as isize)),
+        );
+    }
+
+    let min = dpi::track_size(Size::new(500.0, 300.0), dpi);
+    let max = dpi::track_size(Size::new(1200.0, 900.0), dpi);
+    assert_eq!(
+        (info.ptMinTrackSize.x, info.ptMinTrackSize.y),
+        (min.0 as i32, min.1 as i32),
+        "ptMinTrackSize 必须是配置值的窗口外框尺寸（含 DPI 换算，dpi={dpi}）"
+    );
+    assert_eq!(
+        (info.ptMaxTrackSize.x, info.ptMaxTrackSize.y),
+        (max.0 as i32, max.1 as i32),
+        "ptMaxTrackSize 必须是配置值的窗口外框尺寸（含 DPI 换算，dpi={dpi}）"
+    );
+    destroy_hidden_window(hwnd, state);
+    let _ = class_name;
+
+    // `min > max` ⇒ 按 max 钳制：两个跟踪尺寸相等。`ptMaxTrackSize` 的系统默认值必须仍被
+    // 覆盖成钳制后的值（否则用户可以拖到 max 以外）。
+    let dispatcher = Dispatcher::new();
+    let options = WindowOptions {
+        min_size: Some(Size::new(900.0, 700.0)),
+        max_size: Some(Size::new(600.0, 500.0)),
+        ..WindowOptions::default()
+    };
+    let limits = placement::ClientLimits::from_options(&options);
+    let (hwnd, state, class_name) =
+        hidden_window_with_limits("KytrixWndProcMinMaxClamped", dispatcher, limits, 640, 480);
+    // SAFETY: 同上的所有权约定。
+    let _raw = unsafe { &mut *state };
+    let dpi = dpi::window_dpi(hwnd);
+    let mut info = MINMAXINFO::default();
+    // SAFETY: 同上。
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_GETMINMAXINFO,
+            None,
+            Some(LPARAM((&raw mut info) as isize)),
+        );
+    }
+    let clamped = dpi::track_size(Size::new(600.0, 500.0), dpi);
+    assert_eq!(
+        (info.ptMinTrackSize.x, info.ptMinTrackSize.y),
+        (clamped.0 as i32, clamped.1 as i32),
+        "min > max 时最小跟踪尺寸按 max 钳制"
+    );
+    assert_eq!(
+        (info.ptMaxTrackSize.x, info.ptMaxTrackSize.y),
+        (clamped.0 as i32, clamped.1 as i32),
+        "钳制后 min == max"
+    );
+    destroy_hidden_window(hwnd, state);
+    let _ = class_name;
+}
+
+/// B3：`WM_MOVE` 必须翻译成 `PlatformEvent::Moved`（**屏幕物理坐标**）；`WM_DPICHANGED`
+/// 建议矩形重排期间系统同步派发的 `WM_MOVE` 被过滤（公共契约：DPI 路径只产生 `DpiChanged`），
+/// 且过滤只覆盖那一次重排 —— 之后的普通移动照常派发。
+///
+/// 变异守卫：删掉 `translate` 的 `WM_MOVE` 分支 ⇒ 第一条断言变红；删掉 `suppress_move`
+/// 判定 ⇒ DPI 重排期间多出一条 `Moved`，第二条断言变红。
+#[test]
+fn wm_move_is_translated_and_dpi_repositioning_moves_are_filtered() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, class_name) = hidden_window("KytrixWndProcMove", dispatcher);
+    // SAFETY: `state` 由 `hidden_window` 分配、生命周期到 `destroy_hidden_window`。
+    let raw = unsafe { &mut *state };
+    let _ = raw.take_events();
+
+    // 普通移动（负屏幕坐标也是合法的多屏位置）：一条 `Moved`，坐标不换算。
+    // SAFETY: 窗口由本测试创建且仍存活；`SendMessageW` 同步进入生产 `wndproc`。
+    unsafe {
+        SendMessageW(hwnd, WM_MOVE, None, Some(LPARAM(encoded_point(-1920, 120))));
+    }
+    let events = raw.take_events();
+    assert_eq!(events.len(), 1, "一条移动事件，实际 {events:?}");
+    assert_eq!(events[0].event, PlatformEvent::Moved { x: -1920, y: 120 });
+    assert_eq!(events[0].scale, raw.scale(), "Moved 必须带消息时刻的 scale");
+
+    // DPI 建议矩形重排：期间同步派发的 `WM_MOVE` 被过滤，DPI 事件仍在。
+    let suggested = RECT {
+        left: 40,
+        top: 50,
+        right: 840,
+        bottom: 650,
+    };
+    // SAFETY: 窗口存活；`WM_DPICHANGED` 的 lParam 在消息处理期有效。
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_DPICHANGED,
+            Some(WPARAM(192)),
+            Some(LPARAM((&raw const suggested) as isize)),
+        );
+    }
+    assert!(!raw.suppress_move, "过滤标记必须在消息处理结束时复位");
+    let events = raw.take_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.event, PlatformEvent::Dpi { dpi: 192 })),
+        "DPI 事件仍必须派发，实际 {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.event, PlatformEvent::Moved { .. })),
+        "DPI 重排期间产生的 WM_MOVE 不得派发 Event::Moved（公共契约），实际 {events:?}"
+    );
+
+    // 过滤不是永久的：之后的普通移动照常派发。
+    // SAFETY: 同上。
+    unsafe {
+        SendMessageW(hwnd, WM_MOVE, None, Some(LPARAM(encoded_point(100, 200))));
+    }
+    assert!(
+        raw.take_events()
+            .iter()
+            .any(|event| matches!(event.event, PlatformEvent::Moved { x: 100, y: 200 })),
+        "DPI 重排结束后 WM_MOVE 必须恢复派发"
+    );
+    destroy_hidden_window(hwnd, state);
+    let _ = class_name;
 }
 
 /// R07-2 回归：`WM_NCHITTEST` 必须返回**系统命中码**。

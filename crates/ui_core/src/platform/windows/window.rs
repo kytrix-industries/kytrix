@@ -26,14 +26,14 @@ use windows::Win32::{
 use crate::{
     app::App,
     error::EngineError,
-    math::{Rect, Scale, Size},
+    math::{PhysicalRect, Rect, Scale, Size},
     platform::{
         dispatcher::Dispatcher,
         windows::{
             composition::{self, Composition},
             dark_mode, dpi,
             event_loop::{ResizeFrameDriver, WndProcState, wndproc},
-            ime,
+            ime, placement,
         },
     },
     window::{WindowId, WindowOptions},
@@ -41,6 +41,13 @@ use crate::{
 
 /// 窗口类名（每进程注册一次）。
 const CLASS_NAME: &str = "KytrixGuiWindow";
+
+/// `WindowOptions::position = None` 时的默认窗口外框左上角（物理像素）。
+///
+/// 保持 P09 以来的确定性默认落点 `(100, 100)`（`WindowOptions` 文档把 `None` 定义为「由平台
+/// 决定」）：不改成 `CW_USEDEFAULT` 的系统级联位置 —— 固定值可预测、便于真机测试；多窗口的
+/// 错落摆放由应用用 `position` 自己控制。
+const DEFAULT_WINDOW_ORIGIN: (i32, i32) = (100, 100);
 
 /// 类光标（`IDC_ARROW`）：probe 实测「类光标 = null + `HTCLIENT`」会得到**空光标**（不可见）。
 fn load_arrow_cursor() -> HCURSOR {
@@ -97,11 +104,11 @@ impl NativeWindow {
 
         let class = wide(CLASS_NAME);
         let title = wide(&options.title);
-        // 先用**请求的 scale** 估算一次窗口尺寸（真实 DPI 要窗口存在后才能问）。
-        let provisional = dpi::window_size_for_client(
-            physical_client(options.size, options.scale),
-            dpi::system_dpi(),
-        );
+        // 建窗的**临时**几何：客户区尺寸按请求的 scale 估算（真实 DPI 要窗口存在后才能问），
+        // 位置按 `position` 换算到目标附近并 clamp 到最近显示器工作区 —— 窗口创建后
+        // [`Self::apply_dpi_and_size`] 用**所在显示器 DPI** 重算最终尺寸与落点。
+        let (window_x, window_y, provisional_width, provisional_height) =
+            provisional_window_rect(options, dpi::system_dpi());
         // SAFETY: `class` / `title` 是本函数栈上的 NUL 结尾 UTF-16 缓冲，`CreateWindowExW`
         // 同步拷贝；父窗口/菜单为空，实例句柄来自本进程。窗口此时**隐藏**（无 `WS_VISIBLE`）。
         //
@@ -113,10 +120,10 @@ impl NativeWindow {
                 windows::core::PCWSTR(class.as_ptr()),
                 windows::core::PCWSTR(title.as_ptr()),
                 WS_OVERLAPPEDWINDOW,
-                100,
-                100,
-                provisional.0,
-                provisional.1,
+                window_x,
+                window_y,
+                provisional_width,
+                provisional_height,
                 None,
                 None,
                 Some(instance.into()),
@@ -149,7 +156,8 @@ impl NativeWindow {
                 Arc::clone(&composition),
             ))
         });
-        let state = match WndProcState::new(dispatcher, hwnd, id, driver) {
+        let limits = placement::ClientLimits::from_options(options);
+        let state = match WndProcState::new(dispatcher, hwnd, id, limits, driver) {
             Ok(state) => Box::into_raw(Box::new(state)),
             Err(error) => {
                 // a11y adapter 构造失败（`A11yInit`）：窗口还没显示，直接销毁，避免泄漏 HWND。
@@ -174,7 +182,7 @@ impl NativeWindow {
             logical_size: options.size,
             ime_area: None,
         };
-        window.apply_dpi_and_size(options.size)?;
+        window.apply_dpi_and_size(options)?;
         Ok(window)
     }
 
@@ -291,40 +299,102 @@ impl NativeWindow {
         }
     }
 
-    /// 应用 DPI / 尺寸：先问 DPI，再按 `AdjustWindowRectExForDpi` 调窗口，最后回读客户区。
-    fn apply_dpi_and_size(&mut self, size: Size) -> Result<(), EngineError> {
-        let dpi = dpi::window_dpi(self.hwnd);
-        let scale = dpi::scale_from_dpi(dpi).ok_or(EngineError::InvalidDpiScale {
-            factor: dpi as f32 / dpi::BASE_DPI as f32,
-        })?;
-        self.scale = scale;
-        // `WM_GETMINMAXINFO` 的 `ptMinTrackSize` 与 `WM_DPICHANGED` 用**同一个**换算
-        // （[`dpi::min_track_size`]）：`WndProcState` 是唯一持有者，两处分别算会在 DPI 变化后
-        // 漂移（P2-1：直接透传客户区尺寸会小一个边框 + 标题栏）。
-        // SAFETY: `state` 由本窗口独占（`Drop` 之前一直有效）；WndProc 只在消息处理期读它。
-        unsafe {
-            (*self.state).note_dpi(dpi, scale);
-        }
+    /// 应用 DPI / 尺寸 / 初始位置：先问窗口**所在显示器**的 DPI，再按
+    /// `AdjustWindowRectExForDpi` 调窗口（clamp 后落位），最后回读客户区。
+    ///
+    /// 落点语义（公共契约：[`WindowOptions::position`]）= **客户区左上角**的逻辑坐标；
+    /// 换算顺序是「逻辑点 → 物理原点（round）→ 窗口原点（加非客户区）→ clamp 到工作区」。
+    ///
+    /// 最多重算两次：建窗的临时落点用主屏 DPI 估算，`SetWindowPos` 跨屏（per-monitor v2）时
+    /// 系统可能立即发 `WM_DPICHANGED` 并按建议矩形重排 —— 第二次按**新显示器**的 DPI 重算
+    /// 尺寸与落点，收敛到公共契约的「按窗口最终落点显示器的 scale 解释」。
+    fn apply_dpi_and_size(&mut self, options: &WindowOptions) -> Result<(), EngineError> {
+        let requested = options.size;
         // 0×0 的请求尺寸没有可用的窗口矩形（`physical_client` 只会钳成 1 px）：只记账 DPI，
         // 等平台 resize / `WM_DPICHANGED` 给出真实尺寸。
-        if size.width <= 0.0 || size.height <= 0.0 {
-            self.logical_size = size;
+        if requested.width <= 0.0 || requested.height <= 0.0 {
+            let dpi = dpi::window_dpi(self.hwnd);
+            let scale = dpi::scale_from_dpi(dpi).ok_or(EngineError::InvalidDpiScale {
+                factor: dpi as f32 / dpi::BASE_DPI as f32,
+            })?;
+            self.scale = scale;
+            // SAFETY: `state` 由本窗口独占（`Drop` 之前一直有效）；WndProc 只在消息处理期读它。
+            unsafe {
+                (*self.state).note_dpi(dpi, scale);
+            }
+            self.logical_size = requested;
             return Ok(());
         }
-        let window_size = dpi::window_size_for_client(physical_client(size, scale), dpi);
-        // SAFETY: 窗口存活；只改尺寸与位置，不重新创建。
-        unsafe {
-            SetWindowPos(
-                self.hwnd,
-                None,
-                100,
-                100,
-                window_size.0,
-                window_size.1,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            )
+        // 应用配置的最小/最大客户区约束在建窗时生效（`WM_GETMINMAXINFO` 的同一个来源，
+        // B3）：请求尺寸先钳进 `[min, max]`，避免初始窗口违反自己的约束。
+        let size = self.state_mut().client_limits().clamp(requested);
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let dpi = dpi::window_dpi(self.hwnd);
+            let scale = dpi::scale_from_dpi(dpi).ok_or(EngineError::InvalidDpiScale {
+                factor: dpi as f32 / dpi::BASE_DPI as f32,
+            })?;
+            self.scale = scale;
+            // `WM_GETMINMAXINFO` 的 `ptMinTrackSize` / `ptMaxTrackSize` 与 `WM_DPICHANGED`
+            // 用**同一个**换算（[`placement::ClientLimits::track_sizes`]）：`WndProcState` 是
+            // 唯一持有者，两处分别算会在 DPI 变化后漂移（P2-1：直接透传客户区尺寸会小一个
+            // 边框 + 标题栏）。
+            // SAFETY: `state` 由本窗口独占；WndProc 只在消息处理期读它。
+            unsafe {
+                (*self.state).note_dpi(dpi, scale);
+            }
+            let client = physical_client(size, scale);
+            let (width, height) = dpi::window_size_for_client(client, dpi);
+            match options.position {
+                Some(position) => {
+                    let client_origin = dpi::physical_origin(position, scale);
+                    let (x, y) = dpi::window_origin_for_client(client_origin, client, dpi);
+                    // 公共契约：位置 clamp 到最近显示器工作区（至少标题栏可见）。
+                    let target =
+                        PhysicalRect::new(x, y, x.saturating_add(width), y.saturating_add(height));
+                    let placed = placement::clamp_to_work_area(target, &placement::work_areas());
+                    // SAFETY: 窗口存活；只改尺寸与位置，不重新创建、不激活窗口、不改 Z 序。
+                    // 可能同步重入 `WndProc`（`WM_WINDOWPOSCHANGED` / `WM_SIZE` /
+                    // `WM_DPICHANGED`）：此处不持有 `&mut WndProcState`（`note_dpi` 的借用已结束）。
+                    unsafe {
+                        SetWindowPos(
+                            self.hwnd,
+                            None,
+                            placed.x0,
+                            placed.y0,
+                            placed.width(),
+                            placed.height(),
+                            SWP_NOZORDER | SWP_NOACTIVATE,
+                        )
+                    }
+                    .map_err(|error| window_error("SetWindowPos", error))?;
+                }
+                None => {
+                    // 保持建窗时的位置（[`DEFAULT_WINDOW_ORIGIN`] 或临时落点），只改尺寸。
+                    //
+                    // SAFETY: 同上。
+                    unsafe {
+                        SetWindowPos(
+                            self.hwnd,
+                            None,
+                            0,
+                            0,
+                            width,
+                            height,
+                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE,
+                        )
+                    }
+                    .map_err(|error| window_error("SetWindowPos", error))?;
+                }
+            }
+            // 跨屏落位触发了 `WM_DPICHANGED`（系统会先按建议矩形重排）：按新显示器 DPI
+            // 再算一次。第二次之后不再重试（DPI 只可能随落点变化一次；防御性上限）。
+            if attempt >= 2 || dpi::window_dpi(self.hwnd) == dpi {
+                break;
+            }
         }
-        .map_err(|error| window_error("SetWindowPos", error))?;
+        let scale = self.scale;
         // 回读：客户区由系统按真实边框算出，逻辑尺寸以它为准（round 之后可能与请求差 1 px）。
         let client = self.client_size();
         self.note_client_resize(scale, client);
@@ -526,6 +596,42 @@ impl Drop for NativeWindow {
             self.state = std::ptr::null_mut();
         }
     }
+}
+
+/// 建窗前的**临时**窗口外框 `(x, y, width, height)`（物理像素）。
+///
+/// 窗口还不存在、问不到 `GetDpiForWindow`：用主屏 DPI 粗定位 —— `position` 是逻辑客户区
+/// 左上角，换算到物理后 clamp 到最近显示器工作区，让隐藏窗口**先建在目标附近**；
+/// [`NativeWindow::apply_dpi_and_size`] 随后按窗口所在显示器 DPI 重算最终尺寸与落点。
+/// `position = None` ⇒ 确定性的 [`DEFAULT_WINDOW_ORIGIN`]。
+fn provisional_window_rect(options: &WindowOptions, dpi: u32) -> (i32, i32, i32, i32) {
+    let client = physical_client(options.size, options.scale);
+    let (width, height) = dpi::window_size_for_client(client, dpi);
+    let Some(position) = options.position else {
+        return (
+            DEFAULT_WINDOW_ORIGIN.0,
+            DEFAULT_WINDOW_ORIGIN.1,
+            width,
+            height,
+        );
+    };
+    let Some(scale) = dpi::scale_from_dpi(dpi) else {
+        return (
+            DEFAULT_WINDOW_ORIGIN.0,
+            DEFAULT_WINDOW_ORIGIN.1,
+            width,
+            height,
+        );
+    };
+    let origin = dpi::window_origin_for_client(dpi::physical_origin(position, scale), client, dpi);
+    let target = PhysicalRect::new(
+        origin.0,
+        origin.1,
+        origin.0.saturating_add(width),
+        origin.1.saturating_add(height),
+    );
+    let placed = placement::clamp_to_work_area(target, &placement::work_areas());
+    (placed.x0, placed.y0, placed.width(), placed.height())
 }
 
 /// 逻辑尺寸 × scale → 物理客户区（足够大，至少 1 px）。

@@ -10,6 +10,7 @@ pub(crate) mod dpi;
 pub(crate) mod dpi_awareness;
 pub(crate) mod event_loop;
 pub(crate) mod ime;
+pub(crate) mod placement;
 pub(crate) mod version;
 pub(crate) mod window;
 

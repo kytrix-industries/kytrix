@@ -43,6 +43,7 @@ use crate::{
             a11y::WindowsA11y,
             dpi,
             ime::{ImeApplied, ImeCommand},
+            placement,
         },
     },
     window::WindowId,
@@ -75,8 +76,13 @@ pub(crate) struct WndProcState {
     /// `WM_MOUSELEAVE` 不带坐标，而 `PointerLeave`（R02-39）要给出离开点；用最近一次移动的
     /// 位置是主流做法（Chromium 的 `WebMouseEvent.position_in_widget` 同源）。
     last_client_pos: (i32, i32),
-    /// `WM_GETMINMAXINFO` 的 `ptMinTrackSize`（物理像素，随 DPI 同步换算）。
-    min_size: (u32, u32),
+    /// `WM_GETMINMAXINFO` 的 `ptMinTrackSize`（**窗口外框**物理像素，随 DPI 同步换算）。
+    min_track_size: (u32, u32),
+    /// `WM_GETMINMAXINFO` 的 `ptMaxTrackSize`（窗口外框物理像素；`None` = 不覆盖系统默认）。
+    max_track_size: Option<(u32, u32)>,
+    /// 应用配置的客户区尺寸约束（逻辑像素；建窗时从 `WindowOptions` 解析，
+    /// `min > max` 已按 `max` 钳制 —— 解析规则在 [`placement::ClientLimits`]）。
+    limits: placement::ClientLimits,
     /// 当前消息时刻的窗口比例（`WM_DPICHANGED` **同步**更新，R07-12）。
     ///
     /// 同批次后续消息的物理→逻辑换算、`StampedEvent::scale` 与
@@ -109,6 +115,11 @@ pub(crate) struct WndProcState {
     /// 会话期间泵的 ④ 不运行：重排 + 重绘由模态循环分派的 `WM_SIZE` 直接驱动
     /// （[`ResizeFrameDriver`]），与 Qt / Chrome 同构。
     size_move: bool,
+    /// 是否正在按系统建议矩形应用 `WM_DPICHANGED`：其内部 `SetWindowPos` 产生的 `WM_MOVE`
+    /// 属于 DPI 路径的副产物，不派发 `Event::Moved`（`Event::Moved` 的公共契约：DPI 变化
+    /// 只产生 `DpiChanged`）。用户拖动 / 程序 `SetWindowPos` 的移动不受影响（置位只覆盖那一次
+    /// 同步调用期间）。
+    suppress_move: bool,
     /// 模态循环里驱动出的粘性错误（帧管线 / 合成调用失败）：由泵的下一轮 ② 冒泡。
     ///
     /// `WndProc` 没有错误通道，但绝不能把失败吞掉 —— 帧管线失败在用户看来就是「画面冻结」。
@@ -125,23 +136,29 @@ pub(crate) struct WndProcState {
 }
 
 impl WndProcState {
+    /// `limits` = 建窗时从 `WindowOptions` 解析出的客户区尺寸约束（B3：
+    /// `WM_GETMINMAXINFO` 的 `ptMinTrackSize` / `ptMaxTrackSize` 来源）。
     pub(crate) fn new(
         dispatcher: Arc<Dispatcher>,
         hwnd: HWND,
         window: WindowId,
+        limits: placement::ClientLimits,
         driver: Option<Rc<ResizeFrameDriver>>,
     ) -> Result<Self, EngineError> {
         let dpi = dpi::window_dpi(hwnd);
         let scale = dpi::scale_from_dpi(dpi).ok_or(EngineError::InvalidDpiScale {
             factor: dpi as f32 / dpi::BASE_DPI as f32,
         })?;
+        let (min_track_size, max_track_size) = limits.track_sizes(dpi);
         Ok(Self {
             dispatcher: dispatcher.clone(),
             events: Vec::with_capacity(8),
             translate: TranslateState::default(),
             wheel_lines: pump::wheel_lines_from_system(),
             last_client_pos: (0, 0),
-            min_size: dpi::min_track_size(dpi),
+            min_track_size,
+            max_track_size,
+            limits,
             scale,
             close_requested: false,
             display_recovery: false,
@@ -152,6 +169,7 @@ impl WndProcState {
             suppress_capture_cancel: false,
             cursor: crate::paint::style::Cursor::Default,
             size_move: false,
+            suppress_move: false,
             pending_error: None,
             #[cfg(test)]
             last_dark_titlebar: None,
@@ -173,14 +191,21 @@ impl WndProcState {
         self.scale
     }
 
-    /// `WM_DPICHANGED` 的同步记账（R07-12）：新比例 + 新的最小跟踪尺寸。
+    /// `WM_DPICHANGED` 的同步记账（R07-12）：新比例 + 新的最小/最大跟踪尺寸。
     ///
     /// 必须在**投递 `Dpi` 事件之前**、在 `SetWindowPos(建议矩形)` 之前调用：`SetWindowPos`
     /// 会同步派发 `WM_SIZE`，那些事件的 `StampedEvent::scale` 与 `WM_GETMINMAXINFO` 都要看到
     /// 新值。
     pub(crate) fn note_dpi(&mut self, dpi: u32, scale: Scale) {
         self.scale = scale;
-        self.min_size = dpi::min_track_size(dpi);
+        let (min_track_size, max_track_size) = self.limits.track_sizes(dpi);
+        self.min_track_size = min_track_size;
+        self.max_track_size = max_track_size;
+    }
+
+    /// 应用配置的客户区尺寸约束（`NativeWindow::apply_dpi_and_size` 建窗时钳制请求尺寸用）。
+    pub(crate) fn client_limits(&self) -> placement::ClientLimits {
+        self.limits
     }
 
     /// 每条消息的翻译上下文（消息时间 + 系统滚轮行数 + 当时的 scale）。

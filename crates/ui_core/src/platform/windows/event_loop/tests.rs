@@ -9,4 +9,5 @@
 //! 松手），所以「系统真的进入了 size 模态循环」这条接线由真机拖动探针
 //! `.review/diag/verify_native_resize.ps1` 验收。
 
+mod placement_tests;
 mod wndproc_tests;

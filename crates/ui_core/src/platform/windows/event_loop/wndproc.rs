@@ -78,10 +78,20 @@ pub(crate) extern "system" fn wndproc(
 
         if msg == WM_GETMINMAXINFO {
             let info = &mut *(lparam.0 as *mut MINMAXINFO);
+            // B3：应用配置的最小客户区（`WindowOptions::min_size`，缺省 = 引擎 320×200）
+            // 换算成**窗口外框**的 `ptMinTrackSize`；物理像素随 DPI 同步（`WndProcState::note_dpi`）。
             info.ptMinTrackSize = POINT {
-                x: (*state).min_size.0 as i32,
-                y: (*state).min_size.1 as i32,
+                x: (*state).min_track_size.0 as i32,
+                y: (*state).min_track_size.1 as i32,
             };
+            // 只有应用显式配置了 `max_size` 才覆盖：否则保留系统按屏幕算出的默认最大跟踪尺寸
+            //（窗口可被拖出屏幕的最大值由系统决定，引擎不越权限制）。
+            if let Some((width, height)) = (*state).max_track_size {
+                info.ptMaxTrackSize = POINT {
+                    x: width as i32,
+                    y: height as i32,
+                };
+            }
             return LRESULT(0);
         }
         // 客户区的光标由引擎决定（P2-3）：每次鼠标移动系统都会问一次，不接管就会被
@@ -181,8 +191,13 @@ pub(crate) extern "system" fn wndproc(
                 (rect.left, rect.top, rect.right, rect.bottom)
             });
             if let Some((left, top, right, bottom)) = suggested {
+                // B3：这次重新落位属于 DPI 路径（不是用户移动）：期间系统同步派发的
+                // `WM_MOVE` 不派发 `Event::Moved`（公共契约：DPI 变化只产生 `DpiChanged`）。
+                // 置位只覆盖 `SetWindowPos` 同步调用期间，之后的用户/程序移动照常派发。
+                (*state).suppress_move = true;
                 // SAFETY: `hwnd` 存活；系统建议矩形只改位置与尺寸，不激活窗口、不改 Z 序。
-                // 可能重入 `WndProc`（`WM_WINDOWPOSCHANGED` / `WM_SIZE`）：此处不持有 `&mut`。
+                // 可能重入 `WndProc`（`WM_WINDOWPOSCHANGED` / `WM_SIZE` / `WM_MOVE`）：此处
+                // 不持有 `&mut`。
                 let _ = SetWindowPos(
                     hwnd,
                     None,
@@ -192,6 +207,7 @@ pub(crate) extern "system" fn wndproc(
                     bottom - top,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
+                (*state).suppress_move = false;
             }
             (*state).wake();
             return LRESULT(0);
@@ -412,6 +428,12 @@ pub(crate) extern "system" fn wndproc(
         };
 
         if let Some(stamped) = stamped {
+            // B3：`WM_DPICHANGED` 建议矩形的重新落位是 DPI 路径的一部分 —— 期间系统同步派发的
+            // `WM_MOVE` 不产生 `Event::Moved`（公共契约：该路径只产生 `DpiChanged`；见
+            // `WndProcState::suppress_move`）。`WM_MOVE` 的默认过程返回 0，直接交默认过程。
+            if (*state).suppress_move && matches!(stamped.event, PlatformEvent::Moved { .. }) {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
             match &stamped.event {
                 PlatformEvent::PointerLeave => (*state).mouse_tracking = false,
                 // `WM_MOUSELEAVE` 不带坐标：记下最近位置供 `PointerLeave` 的离开点使用。
