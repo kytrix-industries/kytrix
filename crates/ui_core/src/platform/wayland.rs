@@ -18,7 +18,10 @@
 //! P1 追加的纯逻辑同理：
 //!
 //! - **X2 拖动区**（[`drag`]）：自绘标题栏的主键按下命中拖动区 ⇒ 平台层发 `xdg_toplevel.move`
-//!   交给 compositor 驱动移动、不投递 `PointerDown`（判定在 Windows 开发机上可单测）。
+//!   交给 compositor 驱动移动、不投递 `PointerDown`（判定在 Windows 开发机上可单测）；
+//! - **X1 窗口层级**（[`owner`]）：`WindowOptions::owner` → `xdg_toplevel.set_parent` 的
+//!   transient 提示解析（Wayland 没有 owner / 模态 / 置顶的跨合成器协议，降级语义在模块里
+//!   写清：模态由 `App` 层输入拦截承担、置顶无操作）。
 //!
 //! 编译条件与 `platform/ime` 同款：Linux 构建 + 测试构建（`cfg(test)` 让 Windows 也能测）。
 
@@ -29,6 +32,7 @@ pub(crate) mod drag;
 pub(crate) mod frame_gate;
 pub(crate) mod ime;
 pub(crate) mod input;
+pub(crate) mod owner;
 pub(crate) mod scroll;
 pub(crate) mod selection;
 pub(crate) mod text_input;

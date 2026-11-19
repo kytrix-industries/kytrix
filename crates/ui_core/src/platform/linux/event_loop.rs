@@ -98,9 +98,14 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
 
     // `WaylandState::new` 要先建**一个**原生窗口（连接、协议工厂与首个 surface 的初始化在同
     // 一条路径上）；其余窗口（含启动时就存在的）由下面的 `sync_windows` 统一建。
+    //
+    // 取**最小 id**（= 最早创建）而不是 `App` 哈希表迭代到的任意一条：X1 的 owner 语义要求
+    // owner 先于 owned 窗口建原生对象（`xdg_toplevel.set_parent` 只能引用已存在的 toplevel）。
+    // `WindowId` 单调递增（永不复用）⇒ 最早创建的窗口必是本批其它窗口可能的 owner；`sync_windows`
+    // 对剩余窗口按同一顺序排序（见那里的注释）。
     let (first_id, first_options) = app
         .windows()
-        .next()
+        .min_by_key(|(id, _)| id.to_bits())
         .map(|(id, window)| (id, window.options().clone()))
         .ok_or(EngineError::AppInit {
             detail: smol_str::SmolStr::new_static("Application::run without a window"),
@@ -579,11 +584,15 @@ fn sync_windows(
         a11ys.retain(|entry| entry.id != id);
         mirrors.retain(|entry| entry.id != id);
     }
-    let missing: Vec<(WindowId, crate::window::WindowOptions)> = app
+    let mut missing: Vec<(WindowId, crate::window::WindowOptions)> = app
         .windows()
         .filter(|(id, _)| state.window_index(*id).is_none())
         .map(|(id, window)| (id, window.options().clone()))
         .collect();
+    // X1：按**创建顺序**建原生窗口（`WindowId` 单调递增 ⇒ 升序 = 创建顺序）。owner 必须先于
+    // owned 窗口存在，否则 `set_parent` 只能降级（诊断 + 不设）；`App` 的窗口表是 `HashMap`，
+    // 迭代顺序不确定，这里显式排序钉住（启动路径与运行期新增共用本函数）。
+    missing.sort_by_key(|(id, _)| id.to_bits());
     for (id, options) in missing {
         state.add_window(id, &options)?;
     }

@@ -22,6 +22,18 @@
 //! 由 compositor 决定；`WindowOptions::position` 在 Linux 上被**有意忽略**，`Event::Moved`
 //! 在该端也永不产生（公共文档已写明）。这是协议事实，不是遗漏。
 //!
+//! **窗口层级**（X1）：`WindowOptions::owner` / `modal` / `always_on_top` 在 Wayland 上的原生
+//! 能力极弱，三个字段都是**明确降级**（用户裁决：不得静默忽略）：
+//!
+//! - `owner` ⇒ `xdg_toplevel.set_parent` 的 *transient for* 提示（compositor 可忽略；协议无法
+//!   表达「随 owner 最小化 / 销毁」⇒ z 序与生命周期都不保证）。解析在
+//!   [`crate::platform::linux::surface::WaylandState::add_window`] 里、新窗口进入窗口表之前完成：
+//!   owner 尚未创建 / 已关闭 ⇒ 降级不设并写诊断（见 [`crate::platform::wayland::owner`]）。
+//! - `modal` ⇒ 协议没有模态（`xdg_toplevel` **没有** `set_modal` 请求），语义完全由 `App` 层
+//!   输入拦截承担（与 macOS 同一套）；本端只有 owner 的 parent 提示。
+//! - `always_on_top` ⇒ xdg-shell 没有置顶请求，wlr-layer-shell / plasma-shell 都不是 xdg-shell
+//!   标准能力 ⇒ **无操作**（应用不得假设成立）。
+//!
 //! **阴影边距**（R10-10）：引擎目前不画投影，[`SHADOW_MARGIN`] 是 0，于是 window geometry
 //! 就是整个 surface，`set_min_size(320, 200)` 正好约束客户区。将来加投影时只需把边距改成非 0：
 //! `xdg_surface.set_window_geometry` 会据此收缩（阴影落在几何之外），`set_min_size` /

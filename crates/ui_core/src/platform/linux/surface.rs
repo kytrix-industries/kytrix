@@ -100,7 +100,7 @@ use crate::{
             configure::{AckAction, ConfigureLatch},
             frame_gate::{CallbackToken, FrameGate},
             ime::ImeState,
-            input,
+            input, owner,
             scroll::{ScrollAccum, ScrollAxis},
             text_input::{self, ImeStateSnapshot, TextInputRoute},
             toplevel::{
@@ -552,11 +552,16 @@ impl WaylandState {
     /// 首个 configure 由 compositor 异步发回，事件循环在收到 `configured` 之前不会为它建
     /// swapchain / 出帧。
     ///
-    /// # `WindowOptions` 的消费（B3）
+    /// # `WindowOptions` 的消费（B3 / X1）
     ///
     /// - `size` / `title`：初始尺寸与标题（`size` 在协议层取整，见下）；
     /// - `min_size` / `max_size`：收敛进 [`SizeConstraintState`]，在首个 commit 之前下发
     ///   `set_min_size/set_max_size`（`None` 的 min 用平台默认 [`window::MIN_SIZE_LOGICAL`]）；
+    /// - `owner`：解析到已存在的窗口 ⇒ `xdg_toplevel.set_parent` 的 *transient for* **提示**
+    ///   （[`owner`] 模块；compositor 可忽略，不保证 z 序 / 生命周期联动）；owner 尚未创建 /
+    ///   已关闭 ⇒ 降级不设并 `eprintln!` 诊断；
+    /// - `modal` / `always_on_top`：Wayland **没有**对应原生协议 —— 模态由 `App` 层输入拦截
+    ///   承担（本端只有上面的 parent 提示），置顶明确降级为无操作；见下方调用点的注释。
     /// - `position`：**有意忽略** —— 这是 Wayland 的协议事实而不是遗漏：`xdg_toplevel` 没有
     ///   任何定位请求（只有
     ///   set_parent/set_title/set_app_id/show_window_menu/move/resize/set_max_size/set_min_size/
@@ -575,6 +580,51 @@ impl WaylandState {
         let toplevel = xdg_surface.get_toplevel(&self.queue_handle, ());
         toplevel.set_app_id(APP_ID.to_owned());
         toplevel.set_title(options.title.to_string());
+        // X1：owner → `xdg_toplevel.set_parent` —— **transient for 提示**，不是客户区父子关系。
+        //
+        // 协议（xdg-shell.xml `set_parent`）：子 surface "should be stacked above the parent
+        // surface and all other ancestor surfaces"、父窗口被 raise 时子窗口跟着 raise。compositor
+        // **可以忽略**，协议也无法表达「随 owner 最小化 / 销毁」⇒ 本端的 owner 是降级提示
+        // （公共 `WindowOptions::owner` 文档已写明；判定与原因见 `wayland::owner` 模块文档）。
+        //
+        // 解析发生在把新窗口 push 进 `self.windows` **之前**（`window_index` 只能看到已存在的
+        // 窗口）：owner 尚未创建 / 已关闭 / 陈旧 id ⇒ `Missing` ⇒ 不设 parent 并写诊断（不
+        // panic；`WindowId` 永不复用，陈旧 id 不会误绑新窗口）。一批窗口同时创建时，
+        // `event_loop::sync_windows` 按 `WindowId` 升序（= App 的创建顺序）建原生窗口，保证
+        // owner 先于 owned 窗口落地（`run()` 的首个窗口同样取最小 id）。
+        //
+        // 生命周期：引擎层 owner 关闭时会先**级联关闭** owned 窗口（App 层职责），因此本端
+        // 不需要在 owner 销毁时对 child 清 parent；若该前提失效（child 未关），协议也没有
+        // 「父销毁」错误 —— 按协议只有 mapped 的父 surface 才能有 child，父 unmapped / 销毁后
+        // 这段 transient 关系随父对象消失，不会把子窗口一起销毁。
+        //
+        // 残余风险（协议原文）："Only mapped surfaces can have child surfaces. Setting a parent
+        // which is not mapped is equivalent to setting a null parent." 运行期对话框的 owner 通常
+        // 已映射（前提成立）；启动时同一批创建的 owner 在本请求时可能尚未映射，严格按字面执行
+        // 的 compositor 可以把提示当作 null parent（多数实现不强制，真机验收记录）。本仓不为
+        // 这条提示加延迟重发机制：owner 在 Wayland 上本来就只有降级提示（公共文档），额外状态
+        // 换不来契约级保证。
+        match owner::resolve_owner(options.owner, |owner| self.window_index(owner)) {
+            owner::OwnerResolution::Unparented => {}
+            owner::OwnerResolution::Existing(index) => {
+                toplevel.set_parent(Some(&self.windows[index].toplevel));
+            }
+            owner::OwnerResolution::Missing(owner) => eprintln!(
+                "kytrix: window owner {owner:?} does not exist yet or is already closed; \
+                 xdg_toplevel.set_parent skipped (the owned window has no transient hint)"
+            ),
+        }
+        // X1：`modal` / `always_on_top` 在 Wayland 上**没有额外原生请求**（明确降级，不是遗漏）：
+        //
+        // - `modal`：xdg-shell 没有模态协议，`xdg_toplevel` 的请求表里**没有** `set_modal`
+        //   （不要臆造）。模态语义完全由 `App` 层输入拦截承担（与 macOS 同一套）；本端只提供
+        //   上面 owner 的 `set_parent` 提示，让 compositor 把对话框叠在 owner 之上。
+        //   `modal && owner == None` 的「降级为普通窗口 + 诊断」由 App 层负责（公共契约的落地
+        //   点），这里不重复诊断。
+        // - `always_on_top`：xdg-shell 没有置顶请求；KDE plasma-shell / wlr-layer-shell 都不是
+        //   xdg-shell 标准能力，本端**不使用任何非标准协议** ⇒ 明确降级为**无操作**（应用不得
+        //   假设置顶成立，公共 `WindowOptions::always_on_top` 文档已写明）。`options.always_on_top`
+        //   因此**有意不消费**。
         // Wayland 的 configure / window geometry 是整数，小数的逻辑尺寸在协议层没有表示：
         // 这里先四舍五入取整，整数回退下 buffer = `round(L × N)` 因而严格是 buffer_scale 的
         // 整数倍（否则 `wl_surface.attach` 报 `invalid_size`，V-110）。
