@@ -95,6 +95,7 @@ use crate::{
         wayland::{
             frame_gate::{CallbackToken, FrameGate},
             input,
+            scroll::{ScrollAccum, ScrollAxis},
             text_input::{self, ImeStateSnapshot, TextInputRoute},
             toplevel::{
                 self, DecorationMode, ToplevelStates, Visibility, WindowGeometry, WmCapabilities,
@@ -186,61 +187,6 @@ struct HeldKey {
     /// 下一次应当合成重复的时刻。
     next: std::time::Instant,
 }
-
-/// 一次 `wl_pointer.frame` 内累积的滚轮增量。
-///
-/// Wayland 的 `axis` 是连续值（surface-local 单位，触控板即像素、滚轮一格通常 10–15），
-/// `axis_value120`（v8+）才是 1/120 行的高精度离散步长 —— 后者与 Windows 的
-/// `WHEEL_DELTA = 120` 同量纲，可以直接除以 120 得到行数。旧实现把 `axis` 除以 120，
-/// 于是滚轮慢约一个数量级（P1-2.11）。
-#[derive(Clone, Copy, Debug, Default)]
-struct ScrollAccum {
-    /// `axis_value120` 累积（1/120 行）。
-    discrete_x: i32,
-    discrete_y: i32,
-    /// 连续 `axis` 累积（surface-local 单位）。
-    continuous_x: f32,
-    continuous_y: f32,
-}
-
-impl ScrollAccum {
-    fn is_empty(self) -> bool {
-        self.discrete_x == 0
-            && self.discrete_y == 0
-            && self.continuous_x == 0.0
-            && self.continuous_y == 0.0
-    }
-
-    /// 换算成「行」。
-    ///
-    /// 离散部分走 `value120 / 120`（精确）；连续部分按 `CONTINUOUS_AXIS_UNITS_PER_LINE`
-    /// 折算 —— Wayland v5 起滚轮一格被规定为 10 个单位，取 10 让连续通路在滚轮上得到 1 行/格，
-    /// 触控板则按手指位移成比例平滑滚动。
-    fn lines(self) -> (f32, f32) {
-        (
-            self.discrete_x as f32 / 120.0 + self.continuous_x / CONTINUOUS_AXIS_UNITS_PER_LINE,
-            self.discrete_y as f32 / 120.0 + self.continuous_y / CONTINUOUS_AXIS_UNITS_PER_LINE,
-        )
-    }
-
-    /// 连续部分按**像素**（触控板 / `axis_source = finger` 的 1:1 跟随，R02-10）。
-    ///
-    /// 手指输入的 `axis` 值本来就是「手指移动量 × 加速度」，不做行换算才能与系统惯性对齐；
-    /// 方便起见把同时到达的离散分量按一格 = 10 个单位折算进来（正常不会同时出现）。
-    fn continuous_pixels(self) -> (f32, f32) {
-        (
-            self.continuous_x + self.discrete_x as f32 / 120.0 * CONTINUOUS_AXIS_UNITS_PER_LINE,
-            self.continuous_y + self.discrete_y as f32 / 120.0 * CONTINUOUS_AXIS_UNITS_PER_LINE,
-        )
-    }
-
-    fn clear(&mut self) {
-        *self = Self::default();
-    }
-}
-
-/// 连续 `axis` 的单位→行换算（见 [`ScrollAccum::lines`]）。
-const CONTINUOUS_AXIS_UNITS_PER_LINE: f32 = 10.0;
 
 /// 一个原生窗口的 Wayland 侧状态（surface / toplevel / 几何 / 帧节流）。
 ///
@@ -2128,22 +2074,31 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
             }
             wl_pointer::Event::Axis { axis, value, .. } => {
                 // 连续值（触控板即像素；v5 起滚轮一格 = 10 个单位）。**不能**除 120 ——
-                // 那是 `axis_value120` 的量纲（P1-2.11）。
-                match axis {
-                    wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll) => {
-                        state.scroll.continuous_x += value as f32;
-                    }
-                    _ => state.scroll.continuous_y += value as f32,
-                }
+                // 那是 `axis_value120` 的量纲（P1-2.11）。单位换算在纯逻辑层
+                // （`scroll::ScrollAccum`）：滚轮连续值按 10 单位/行，手指按 1:1 像素。
+                let axis = if matches!(
+                    axis,
+                    wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll)
+                ) {
+                    ScrollAxis::Horizontal
+                } else {
+                    ScrollAxis::Vertical
+                };
+                state.scroll.note_continuous(axis, value as f32);
             }
             wl_pointer::Event::AxisValue120 { axis, value120 } => {
                 // v8+ 的高精度离散步长：1/120 行，与 Win32 的 `WHEEL_DELTA = 120` 同量纲。
-                match axis {
-                    wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll) => {
-                        state.scroll.discrete_x = state.scroll.discrete_x.saturating_add(value120);
-                    }
-                    _ => state.scroll.discrete_y = state.scroll.discrete_y.saturating_add(value120),
-                }
+                // 它与同帧的连续 `axis` 是**同一次物理滚动**的两种表示，累积器按轴二选一
+                // （B8：相加会让一格滚轮变成两行）。
+                let axis = if matches!(
+                    axis,
+                    wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll)
+                ) {
+                    ScrollAxis::Horizontal
+                } else {
+                    ScrollAxis::Vertical
+                };
+                state.scroll.note_discrete(axis, value120);
             }
             wl_pointer::Event::AxisStop { .. } => {
                 // 一次连续手势结束：补一条 `phase = End` 的空增量事件，引擎据此结束惯性/动画
@@ -2164,14 +2119,15 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
             }
             wl_pointer::Event::Frame => {
                 // 一次 frame = 一批同属一个逻辑输入的指针事件 ⇒ 只产出一个 Scroll。
-                // 未实现 `axis_value120` 的服务端（v8 以下）只会来连续 `axis`，两条通路在此合并。
+                // v8+ 服务端对滚轮会同时发连续 `axis` 与离散 `axis_value120`；两者是同一格
+                // 滚动的两种表示，`ScrollAccum` 按轴二选一（B8：相加会一格 = 两行）。
                 if !state.scroll.is_empty() {
                     // 手指（触控板）：连续值就是像素增量，1:1 跟随；滚轮：换算成行。
                     let (delta_x, delta_y) = if state.scroll_finger {
-                        let (x, y) = state.scroll.continuous_pixels();
+                        let (x, y) = state.scroll.finger_pixels();
                         (-x, -y)
                     } else {
-                        let (x, y) = state.scroll.lines();
+                        let (x, y) = state.scroll.wheel_lines();
                         (-x, -y)
                     };
                     state.scroll.clear();
@@ -2677,67 +2633,11 @@ fn key_code(evdev: u32) -> KeyCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CONTINUOUS_AXIS_UNITS_PER_LINE, KeyRepeat, ScrollAccum, choose_integer_scale, key_code,
-        refresh_hz_from_millihz, scroll_event,
-    };
+    use super::{KeyRepeat, choose_integer_scale, key_code, refresh_hz_from_millihz, scroll_event};
     use crate::{
         event::{KeyCode, Modifiers, ScrollPhase, ScrollUnit},
         math::Point,
     };
-
-    /// P1-2.11：`axis_value120` 是 1/120 行，一格（120）= 整整一行。
-    ///
-    /// 旧实现把连续的 `axis`（一格 10–15 个单位）除以 120，于是滚轮慢约一个数量级。
-    #[test]
-    fn discrete_scroll_is_one_line_per_120_units() {
-        let one_notch = ScrollAccum {
-            discrete_y: 120,
-            ..ScrollAccum::default()
-        };
-        assert_eq!(one_notch.lines().1, 1.0, "一格 = 120/120 = 1 行");
-
-        let two_notches = ScrollAccum {
-            discrete_y: 240,
-            ..ScrollAccum::default()
-        };
-        assert_eq!(two_notches.lines().1, 2.0, "两格 = 2 行");
-    }
-
-    /// 连续 `axis`（滚轮一格 = 10 个单位）也必须得到 1 行，而不是 10/120 ≈ 0.083 行。
-    #[test]
-    fn continuous_scroll_uses_the_documented_unit() {
-        let one_notch = ScrollAccum {
-            continuous_y: CONTINUOUS_AXIS_UNITS_PER_LINE,
-            ..ScrollAccum::default()
-        };
-        assert_eq!(
-            one_notch.lines().1,
-            1.0,
-            "一格连续值 = 1 行（旧实现是 0.083）"
-        );
-    }
-
-    /// 两条通路在同一 frame 内叠加（服务端可能同时发 `axis` 与 `axis_value120`）。
-    #[test]
-    fn both_axis_paths_accumulate() {
-        let mixed = ScrollAccum {
-            discrete_x: 60,
-            continuous_x: CONTINUOUS_AXIS_UNITS_PER_LINE,
-            ..ScrollAccum::default()
-        };
-        assert_eq!(mixed.lines().0, 1.5, "0.5 行离散 + 1 行连续");
-    }
-
-    #[test]
-    fn an_empty_accumulator_reports_empty() {
-        let mut scroll = ScrollAccum::default();
-        assert!(scroll.is_empty());
-        scroll.continuous_y = -3.0;
-        assert!(!scroll.is_empty());
-        scroll.clear();
-        assert!(scroll.is_empty(), "clear 之后必须回到空态");
-    }
 
     /// `repeat_info` 的 `rate == 0` = 服务端要求关闭重复。
     #[test]
@@ -2928,16 +2828,5 @@ mod tests {
         assert_eq!(key_code(172), KeyCode::BrowserHome);
         assert_eq!(key_code(158), KeyCode::BrowserBack);
         assert_eq!(key_code(159), KeyCode::BrowserForward);
-    }
-
-    /// `ScrollAccum` 的像素通路（触控板 1:1 跟随）与行通路互相独立。
-    #[test]
-    fn continuous_pixels_are_not_converted_to_lines() {
-        let touchpad = ScrollAccum {
-            continuous_y: -24.0,
-            ..ScrollAccum::default()
-        };
-        assert_eq!(touchpad.continuous_pixels().1, -24.0);
-        assert_eq!(touchpad.lines().1, -2.4);
     }
 }
