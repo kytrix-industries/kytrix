@@ -38,6 +38,7 @@ use crate::{
             surface::{self, WaylandState},
             wake,
         },
+        wayland::close,
     },
     render::backend::Renderer,
     window::{FrameOutcome, WindowControl, WindowId},
@@ -239,19 +240,17 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                 let _ = register_pending_send(&loop_handle, pending);
             }
 
-            // ③ 关闭请求（`xdg_toplevel.close`）：先关 `App` 窗口（drop 渲染器 → GPU 线程
-            // join），再销毁原生窗口（drop 协议对象），顺序与窗口销毁的依赖方向一致。
+            // ③ 关闭请求（`xdg_toplevel.close`）：先投递 `Event::CloseRequested`（通知），再由
+            // `App::request_close` 裁决（与 Windows / macOS 同一顺序，B11）；只有批准关闭的窗口
+            // 才销毁原生对象 —— 先关 `App` 窗口（drop 渲染器 → GPU 线程 join），再 drop 协议
+            // 对象，顺序与窗口销毁的依赖方向一致。
             let mut closing: Vec<WindowId> = Vec::new();
             for index in 0..state.window_count() {
                 if state.take_close_request(index) {
                     closing.push(state.window_id(index));
                 }
             }
-            for id in closing {
-                // 先问应用：on_close 返回 false 就拦下这次关闭（P2-8）。
-                if !app.request_close(id) {
-                    continue;
-                }
+            for id in close::handle_close_requests(&mut app, &closing) {
                 state.remove_window(id);
                 a11ys.retain(|entry| entry.id != id);
                 mirrors.retain(|entry| entry.id != id);
