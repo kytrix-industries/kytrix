@@ -158,7 +158,9 @@ pub(crate) struct GpuRenderer {
     /// 旧 persist 的延迟销毁（I4）：`u64` 提交序号完成之后才 drop（`Persist::drop` 销毁句柄）。
     retired_persists: Vec<(u64, Persist)>,
     /// 旧 swapchain 的延迟销毁（§7.4 / R11-3）：销毁前必须有一次**队列 idle**（presentation
-    /// engine 与在飞批次都可能仍引用它们）。
+    /// engine 与在飞批次都可能仍引用它们）。运行期只有两个销毁入口：present 成功后的
+    /// [`Self::drain_retired_swapchains`] 与恢复路径的 [`Self::destroy_retired_swapchains_now`]
+    /// —— 后者会先强制销毁该 surface 的全部旧链（C7 的 surface 重建前置条件）。
     retired_swapchains: Vec<Swapchain>,
     /// 本窗口在进程级描述符池里的段（`Drop` 归还）。
     descriptors: DescriptorLease,
@@ -259,7 +261,7 @@ impl GpuRenderer {
         let size = (size.0.max(1), size.1.max(1));
         let shared = SharedGpu::process_windowed(display, surface_ptr)?;
         let vk_surface = Surface::new(&shared, display, surface_ptr)?;
-        let swapchain = Swapchain::new(&shared, vk_surface.raw(), size)?;
+        let swapchain = Swapchain::new(&shared, &vk_surface, size)?;
         Self::with_gpu(
             shared,
             Some(vk_surface),
@@ -975,7 +977,7 @@ impl GpuRenderer {
     /// 目标尺寸变化时的 swapchain 替换（同尺寸的 `OUT_OF_DATE` / `SUBOPTIMAL` 走
     /// [`Self::request_rebuild`]）。
     fn replace_swapchain(&mut self, size: (u32, u32)) -> Result<(), EngineError> {
-        let surface = self.vk_surface.as_ref().map(Surface::raw);
+        let surface = self.vk_surface.as_ref();
         let old = self.swapchain.take();
         let created = match (surface, old.as_ref()) {
             (Some(surface), Some(old)) => {
@@ -992,7 +994,7 @@ impl GpuRenderer {
         };
         match created {
             Ok(swapchain) => self.install_swapchain(swapchain, old, size),
-            Err(error) => {
+            Err(_error) => {
                 if let Some(old) = old {
                     // 规范：传给 `oldSwapchain` 的旧 swapchain 即使创建失败也已 retired，必须销毁
                     // （销毁前置条件由 `drain_retired_swapchains` 的队列 idle 保证，R11-3）。
@@ -1001,15 +1003,18 @@ impl GpuRenderer {
                 // `VK_ERROR_SURFACE_LOST_KHR` 的恢复：**重建 `VkSurfaceKHR`** 后重试一次。
                 // 合成器重启 / 显卡复位后旧 surface 永久失效，只重建 swapchain 会一直失败；
                 // 重试用尽才把错误上报（有界，不无限自旋）。
-                let Some(surface) = self.vk_surface.as_mut() else {
-                    return Err(error);
+                //
+                // 顺序由唯一入口保证（C7）：该 surface 的全部旧链**先**被强制销毁，**再**销毁
+                // 旧 surface。任何建链失败都重建 surface 的过度归因由 C8 的 `CreateFailure`
+                // 分类收窄为只对 `SURFACE_LOST` 生效。
+                self.recreate_vk_surface()?;
+                let swapchain = {
+                    let surface = self
+                        .vk_surface
+                        .as_ref()
+                        .expect("recreate_vk_surface keeps the surface");
+                    Swapchain::new(&self.shared, surface, size)?
                 };
-                surface.recreate()?;
-                let raw = self.vk_surface.as_ref().map(Surface::raw);
-                let Some(raw) = raw else {
-                    return Err(error);
-                };
-                let swapchain = Swapchain::new(&self.shared, raw, size)?;
                 self.install_swapchain(swapchain, None, size)
             }
         }
@@ -1108,32 +1113,81 @@ impl GpuRenderer {
     }
 
     /// `VK_ERROR_SURFACE_LOST_KHR` 的恢复（R11-11）：重建 `VkSurfaceKHR` 与整条 swapchain。
+    ///
+    /// 顺序（C7）：旧链先取出放进延迟队列 → [`Self::recreate_vk_surface`] 强制销毁它们并重建
+    /// surface → 用新 surface 建链。旧实现是「取出旧链 = 以为已销毁」，在旧链仍存活时销毁了
+    /// surface（VUID-vkDestroySurfaceKHR-surface-01266）。
     fn recover_surface(&mut self, reason: &'static str) -> Result<(), EngineError> {
-        let Some(surface) = self.vk_surface.as_mut() else {
+        if self.vk_surface.is_none() {
             return Err(EngineError::Swapchain {
                 detail: smol_str::format_smolstr!("{reason}: no window surface"),
             });
-        };
+        }
         eprintln!("kytrix: vulkan {reason}: recreating VkSurfaceKHR");
-        // 旧 swapchain 必须先用掉（它引用旧 surface），随后进延迟销毁队列。
-        let old = self.swapchain.take();
-        if let Some(old) = old {
+        // 旧 swapchain 必须用掉（它引用旧 surface），随后进延迟销毁队列 —— 由唯一入口在销毁
+        // surface **之前**强制排空。
+        if let Some(old) = self.swapchain.take() {
             self.retired_swapchains.push(old);
         }
-        surface.recreate()?;
+        self.recreate_vk_surface()?;
         let size = self.surface;
-        let raw =
-            self.vk_surface
+        let swapchain = {
+            let surface = self
+                .vk_surface
                 .as_ref()
-                .map(Surface::raw)
-                .ok_or_else(|| EngineError::Swapchain {
-                    detail: smol_str::SmolStr::new_static("surface recreate lost the surface"),
-                })?;
-        let swapchain = Swapchain::new(&self.shared, raw, size)?;
+                .expect("recreate_vk_surface keeps the surface");
+            Swapchain::new(&self.shared, surface, size)?
+        };
         // `install_swapchain` 会在 extent 变化时重建 persist（单一尺寸来源）；旧 surface 的
         // 所有参数都可能变，因此这里不再重复建 persist。
-        self.install_swapchain(swapchain, None, size)?;
-        self.drain_retired_swapchains()?;
+        self.install_swapchain(swapchain, None, size)
+    }
+
+    /// 销毁运行期 `Surface` 的**唯一**入口（C7）。
+    ///
+    /// 顺序 = 强制销毁该 surface 的全部延迟 swapchain（timeline 等待 + 有界队列 idle）→
+    /// 销毁旧 `VkSurfaceKHR`、用同一对 wl 句柄建新的。失败时**不销毁 surface、不清延迟队列**，
+    /// 直接返回错误：调用方只能放弃本窗口，交给 `GpuRenderer::drop` 的 `DeferredHandles` /
+    /// leak 兜底（否则在未知的队列状态下销毁句柄是二次违规）。
+    ///
+    /// `recover_surface` / `replace_swapchain` 的失败分支都只能走这里；禁止直接调
+    /// `Surface::recreate`（源码级防回归测试钉住）。
+    fn recreate_vk_surface(&mut self) -> Result<(), EngineError> {
+        debug_assert!(
+            self.swapchain.is_none(),
+            "surface recreation requires the current swapchain to be taken out first"
+        );
+        self.destroy_retired_swapchains_now()?;
+        let Some(surface) = self.vk_surface.as_mut() else {
+            return Err(EngineError::Swapchain {
+                detail: smol_str::SmolStr::new_static(
+                    "surface recreation requires a window surface",
+                ),
+            });
+        };
+        surface.recreate()
+    }
+
+    /// 强制销毁全部延迟 swapchain（C7 的唯一安全出口，也是 C9 安全阀的落点）。
+    ///
+    /// `vkDestroySwapchainKHR` 要求 presentation engine 已释放该链（VUID-…-01282）、
+    /// `vkDestroySemaphore` 要求引用它的批次已完成 —— 二者的共同前置条件是「本窗口 timeline
+    /// 已到 + 共享队列 idle」。两个等待都有界（2 s）；**失败时一条链都不销毁**（返回错误，
+    /// 由 teardown 的 leak 兜底）。
+    fn destroy_retired_swapchains_now(&mut self) -> Result<(), EngineError> {
+        if self.retired_swapchains.is_empty() {
+            return Ok(());
+        }
+        self.sync
+            .wait_idle()
+            .map_err(|error| self.classify(error))?;
+        self.shared
+            .wait_queue_idle()
+            .map_err(|error| self.classify(error))?;
+        // 先整队取出再 drop：销毁发生在队列清空之后，持有者的 Drop 不会看到半空队列。
+        let retired = take_all_in_order(&mut self.retired_swapchains);
+        debug_assert!(self.retired_swapchains.is_empty());
+        drop(retired);
         Ok(())
     }
 
@@ -1143,6 +1197,9 @@ impl GpuRenderer {
     /// `vkDestroySemaphore` 要求「引用该信号量的批次已完成」—— present 的 `waitSemaphores`
     /// 也算引用。队列 idle 是这两条的共同前置条件（旧实现等的是「新链某帧的 timeline」，与旧链
     /// 的 present 之间没有任何依赖关系，因此不构成保证）。
+    ///
+    /// present 成功后的常规刷新点；**恢复路径必须先走** [`Self::destroy_retired_swapchains_now`]
+    /// （C7：surface 销毁前提是它的全部 swapchain 已销毁）。
     fn drain_retired_swapchains(&mut self) -> Result<(), EngineError> {
         if self.retired_swapchains.is_empty() {
             return Ok(());
@@ -2127,6 +2184,15 @@ fn elapsed_ns(started: Instant) -> u64 {
     started.elapsed().as_nanos() as u64
 }
 
+/// 强制取走延迟销毁队列的**全部**条目（保持入队顺序）。
+///
+/// 先整队取出、调用方再 drop：销毁动作不会与「队列正在被遍历 / 半空」的状态交错，空队列是
+/// no-op。运行期只有 [`GpuRenderer::destroy_retired_swapchains_now`] 使用它（teardown 的
+/// 队列清理走 `clear`）。
+fn take_all_in_order<T>(entries: &mut Vec<T>) -> Vec<T> {
+    std::mem::take(entries)
+}
+
 /// 本帧 copy 步骤的决策：布局转场、搬运范围、present 的 hint（**纯函数**，可单测）。
 ///
 /// 三条规则（AR3 §5.2 / §5.3）：
@@ -2223,7 +2289,9 @@ mod tests {
 
     use ash::vk;
 
-    use super::{GpuRenderer, ImageSyncStep, destination_update, plan_swapchain_copy};
+    use super::{
+        GpuRenderer, ImageSyncStep, destination_update, plan_swapchain_copy, take_all_in_order,
+    };
     use crate::{
         math::{PhysicalRect, Size},
         paint::atlas::AtlasKind,
@@ -2364,6 +2432,126 @@ mod tests {
                 "{file}: 持有 Vulkan 句柄的 Drop 必须有 leaked() 守卫"
             );
         }
+    }
+
+    /// C7 的强制排空语义（真实 SURFACE_LOST 只能在真机 WSI 上触发，这里测可自动化的那一半）：
+    /// 空队列幂等、取出全部、销毁顺序 = 入队顺序、取出与销毁分离。
+    #[test]
+    fn forcing_out_the_retired_swapchains_takes_every_entry_in_order_and_is_idempotent() {
+        use std::sync::{Arc, Mutex};
+
+        struct DropProbe {
+            id: u32,
+            dropped: Arc<Mutex<Vec<u32>>>,
+        }
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.dropped
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(self.id);
+            }
+        }
+
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let mut retired = Vec::new();
+        assert!(
+            take_all_in_order(&mut retired).is_empty(),
+            "空队列必须是无副作用的 no-op（重复调用同样成立）"
+        );
+        for id in [1u32, 2, 3] {
+            retired.push(DropProbe {
+                id,
+                dropped: Arc::clone(&dropped),
+            });
+        }
+        let taken = take_all_in_order(&mut retired);
+        assert!(retired.is_empty(), "强制排空之后队列必须为空");
+        assert_eq!(taken.len(), 3, "必须取出全部条目");
+        assert!(
+            dropped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "还没 drop 的条目不能提前销毁"
+        );
+        drop(taken);
+        assert_eq!(
+            *dropped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![1, 2, 3],
+            "销毁顺序必须与入队顺序一致"
+        );
+        assert!(take_all_in_order(&mut retired).is_empty());
+    }
+
+    /// C7 的源码级防回归：`Surface::recreate` 只能有一个调用点（`recreate_vk_surface`），且该
+    /// 入口必须先强制销毁该 surface 的全部 swapchain（VUID-vkDestroySurfaceKHR-surface-01266）。
+    ///
+    /// 旧实现的注释把「从 `Option` 取出 swapchain」当成「已销毁」，于是恢复路径在旧链仍存活时
+    /// 销毁了 surface；这条测试把顺序钉在生产代码文本上（与 teardown 的 `include_str!` 先例
+    /// 同一手法），真实 SURFACE_LOST 路径由 [`super::LiveSwapchains`] 的 debug 断言与手工
+    /// nested-Wayland 探针兜底。
+    #[test]
+    fn the_surface_is_recreated_only_after_its_swapchains_are_force_destroyed() {
+        let source = include_str!("compositor.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("production code precedes the test module")
+            .0;
+        assert_eq!(
+            production.matches("surface.recreate()").count(),
+            1,
+            "运行期 surface 重建必须只有一个入口（GpuRenderer::recreate_vk_surface）"
+        );
+        let entry = production
+            .find("fn recreate_vk_surface(&mut self)")
+            .expect("唯一入口必须存在");
+        let entry = &production[entry..];
+        assert!(
+            entry[..entry
+                .find("self.destroy_retired_swapchains_now()")
+                .expect("先强制排空")]
+                .contains("self.swapchain.is_none()"),
+            "入口必须断言当前 swapchain 已被取出（没有第三份所有权）"
+        );
+        let forced_drain = entry
+            .find("self.destroy_retired_swapchains_now()")
+            .expect("重建 surface 之前必须先强制排空该 surface 的 swapchain");
+        let recreate = entry
+            .find("surface.recreate()")
+            .expect("唯一调用点必须在入口里");
+        assert!(
+            forced_drain < recreate,
+            "顺序违反 VUID-vkDestroySurfaceKHR-surface-01266：必须先销毁 swapchain 再销毁 surface"
+        );
+        // 强制排空本身必须「先证明空闲，再销毁」。
+        let drain_entry = production
+            .find("fn destroy_retired_swapchains_now(&mut self)")
+            .expect("强制排空函数必须存在");
+        let drain = &production[drain_entry..];
+        let drain_end = drain.find("\n    fn ").unwrap_or(drain.len());
+        let drain = &drain[..drain_end];
+        let timeline = drain.find(".wait_idle(").expect("timeline 有界等待");
+        let queue = drain.find(".wait_queue_idle(").expect("队列 idle 有界等待");
+        let take = drain.find("take_all_in_order").expect("取出全部条目");
+        assert!(
+            timeline < take && queue < take,
+            "必须先证明队列空闲（有界）再销毁链，否则是 R11-3 的同步违规"
+        );
+        // teardown 的字段声明顺序就是销毁顺序：swapchain 必须先于 surface 销毁（I7-c）。
+        let swapchain_field = production
+            .find("\n    swapchain: Option<Swapchain>,\n")
+            .expect("GpuRenderer 必须按声明顺序先销毁 swapchain");
+        let surface_field = production
+            .find("\n    vk_surface: Option<Surface>,\n")
+            .expect("GpuRenderer 必须按声明顺序后销毁 surface");
+        assert!(
+            swapchain_field < surface_field,
+            "字段顺序即销毁顺序：swapchain 字段必须声明在 vk_surface 之前"
+        );
     }
 
     #[test]

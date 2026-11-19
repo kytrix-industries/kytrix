@@ -23,8 +23,18 @@
 //! `SharedGpu::wait_queue_idle`（有界 2 s）。旧注释声称「`vkDeviceWaitIdle` 不能证明 presentation
 //! engine 已释放图像，因此不作为释放依据」，并因此把释放挂在「新链某帧的 timeline」上 —— 那是
 //! **更弱**的同步（两者之间没有任何依赖关系），也正是 R11-3 的成因。
+//!
+//! `VkSurfaceKHR` 的销毁顺序（C7，VUID-vkDestroySurfaceKHR-surface-01266）：**由它创建的全部
+//! swapchain 必须先销毁**。把 swapchain 从 `Option` 里 `take()` 只是转移所有权、不等于销毁，
+//! 旧的恢复路径据此在旧链仍位于延迟销毁队列时就销毁了 surface。运行期唯一允许重建 surface 的
+//! 入口是 `GpuRenderer::recreate_vk_surface`：它先强制销毁该 surface 的全部延迟 swapchain
+//! （timeline + 队列 idle 都有界），再调 [`Surface::recreate`]；[`LiveSwapchains`] 的 debug 断言
+//! 用来钉住这个前置条件。teardown 的顺序由字段声明（swapchain → surface）保证。
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{
+    Arc, Mutex, PoisonError,
+    atomic::{AtomicU32, Ordering},
+};
 
 use ash::vk::{self, Handle};
 
@@ -71,6 +81,44 @@ pub(crate) enum Present {
     SurfaceLost,
 }
 
+/// 一个 `VkSurfaceKHR` 名下的 live swapchain 计数（debug 断言 + 防未来回归）。
+///
+/// Vulkan 要求「surface 销毁前，由它创建的全部 swapchain 已经销毁」
+/// （`VUID-vkDestroySurfaceKHR-surface-01266`）；`take()` 出 `Option<Swapchain>` 只是转移所有
+/// 权，对象仍然存活。计数在 `Swapchain::create` 成功后 +1、`Swapchain` 的 `Drop` 里 -1，
+/// [`Surface::recreate`] 在 debug 构建里断言归零 —— 运行期恢复路径必须先把延迟队列强制排空。
+///
+/// release 构建里它不参与任何语义（`debug_assert` 被编译掉），只是 `Arc<AtomicU32>` 的记账。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LiveSwapchains(Arc<AtomicU32>);
+
+impl LiveSwapchains {
+    /// 建链成功后登记（`Swapchain::create` 的唯一成功出口调用）。
+    fn note_created(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 链销毁后注销（`Swapchain::drop` 调用；leak 兜底也注销 Rust 侧对象）。
+    fn note_destroyed(&self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// 当前存活数（测试 + debug 断言）。
+    fn count(&self) -> u32 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// `Surface::recreate` 的前置条件：该 surface 创建的全部 swapchain 已销毁。
+    fn debug_assert_idle(&self) {
+        debug_assert_eq!(
+            self.count(),
+            0,
+            "recreating a VkSurfaceKHR requires all of its swapchains to be destroyed first \
+             (VUID-vkDestroySurfaceKHR-surface-01266); force-drain the deferred swapchains"
+        );
+    }
+}
+
 /// 一个窗口的 `VkSurfaceKHR`（存活期 = 窗口渲染器）。
 ///
 /// 持有 `Arc<SharedGpu>`：surface 的销毁要求 `VkInstance` 还活着，而实例由共享 GPU 保活。
@@ -85,6 +133,8 @@ pub(crate) struct Surface {
     /// 所以这里只借不持有。
     display: *mut std::ffi::c_void,
     wl_surface: *mut std::ffi::c_void,
+    /// 该 surface 名下的 swapchain 存活计数（debug 断言用，见 [`LiveSwapchains`]）。
+    live_swapchains: LiveSwapchains,
     /// teardown 的兜底标记（AR3 §5.1 / P2-5）：`leaked()` 为真时 `Drop` 不销毁 surface。
     handles: DeferredHandles,
 }
@@ -101,6 +151,7 @@ impl Surface {
             raw: gpu.instance().create_surface(display, surface)?,
             display,
             wl_surface: surface,
+            live_swapchains: LiveSwapchains::default(),
             handles: DeferredHandles::default(),
         })
     }
@@ -114,11 +165,21 @@ impl Surface {
         self.raw
     }
 
+    /// 该 surface 的 live swapchain 计数（`Swapchain::create` 登记用）。
+    fn live_swapchains(&self) -> &LiveSwapchains {
+        &self.live_swapchains
+    }
+
     /// `VK_ERROR_SURFACE_LOST_KHR` 之后用同一对 wl 句柄重建 surface。
     ///
-    /// 调用方保证该 surface 的 swapchain 已经销毁（`replace_swapchain` 的失败路径先置空
-    /// swapchain 再调本函数）。
+    /// **前置条件**：由该 surface 创建的全部 `VkSwapchainKHR` 已经**销毁**
+    /// （`VUID-vkDestroySurfaceKHR-surface-01266`）。把链从 `Option` 里取出只是转移所有权：
+    /// 旧实现据此在旧链仍位于延迟销毁队列时就销毁了 surface，真机上可能 UAF / 泄漏。
+    ///
+    /// 运行期唯一调用方是 `GpuRenderer::recreate_vk_surface`（先强制排空延迟队列里的全部旧链）。
+    /// `LiveSwapchains` 的 debug 断言把「未来新增的调用点」挡在测试期。
     pub(crate) fn recreate(&mut self) -> Result<(), EngineError> {
+        self.live_swapchains.debug_assert_idle();
         let raw = self
             .gpu
             .instance()
@@ -159,6 +220,8 @@ pub(crate) struct Swapchain {
     incremental: bool,
     /// 长度 = `images.len()`：按 image index 索引（§7.2 硬规则 1）。
     render_finished: Vec<vk::Semaphore>,
+    /// 所属 surface 的 live swapchain 计数（建链 +1、`Drop` -1；见 [`LiveSwapchains`]）。
+    live_swapchains: LiveSwapchains,
     /// teardown 的兜底标记（AR3 §5.1 / P2-5）：`leaked()` 为真时 `Drop` 不销毁任何句柄。
     handles: DeferredHandles,
 }
@@ -167,7 +230,7 @@ impl Swapchain {
     /// 首次创建（窗口初始化）。
     pub(crate) fn new(
         shared: &SharedGpu,
-        surface: vk::SurfaceKHR,
+        surface: &Surface,
         size: (u32, u32),
     ) -> Result<Self, EngineError> {
         Self::create(shared, surface, size, vk::SwapchainKHR::null())
@@ -180,7 +243,7 @@ impl Swapchain {
     /// 规范：即使创建失败，旧 swapchain 也已 retired、必须销毁 —— 调用方负责把它放进延迟销毁队列。
     pub(crate) fn replace(
         shared: &SharedGpu,
-        surface: vk::SurfaceKHR,
+        surface: &Surface,
         size: (u32, u32),
         old: vk::SwapchainKHR,
     ) -> Result<Self, EngineError> {
@@ -189,11 +252,13 @@ impl Swapchain {
 
     fn create(
         shared: &SharedGpu,
-        surface: vk::SurfaceKHR,
+        surface: &Surface,
         size: (u32, u32),
         old: vk::SwapchainKHR,
     ) -> Result<Self, EngineError> {
         let instance = shared.instance();
+        let live_swapchains = surface.live_swapchains().clone();
+        let surface = surface.raw();
         let surface_fn = instance
             .surface_fn()
             .ok_or_else(|| EngineError::Swapchain {
@@ -373,7 +438,7 @@ impl Swapchain {
             render_finished.push(semaphore);
         }
         log_plan(&key, &formats);
-        Ok(Self {
+        let swapchain = Self {
             device: shared.raw().clone(),
             raw,
             fn_,
@@ -382,8 +447,12 @@ impl Swapchain {
             // 「已启用」而不是「可用」：`VkPresentRegionsKHR` 只有在扩展已启用时才合法（R11-23）。
             incremental: shared.caps().incremental_present,
             render_finished,
+            live_swapchains,
             handles: DeferredHandles::default(),
-        })
+        };
+        // 计数只在**成功建链之后**登记：任何失败路径都不会留下多计的 live 数。
+        swapchain.live_swapchains.note_created();
+        Ok(swapchain)
     }
 
     /// teardown 兜底（AR3 §5.1 / P2-5）：不再销毁本链与它的 render-finished 信号量。
@@ -512,6 +581,8 @@ impl Swapchain {
 
 impl Drop for Swapchain {
     fn drop(&mut self) {
+        // Rust 侧对象消失即注销 live 计数（leak 兜底也一样：句柄不再由本对象销毁）。
+        self.live_swapchains.note_destroyed();
         // teardown 无法证明队列已 idle：句柄已交给进程级兜底（AR3 §5.1 / P2-5）。
         if self.handles.leaked() {
             return;
@@ -579,7 +650,42 @@ fn present_rects(dirty: &DamageRects) -> Vec<vk::RectLayerKHR> {
 
 #[cfg(test)]
 mod tests {
+    use super::LiveSwapchains;
     use crate::{math::PhysicalRect, render::compositor::DamageRects};
+
+    /// C7 的 debug 断言语义：计数随建链 / 销毁精确变化，归零之后 surface 才允许重建。
+    #[test]
+    fn the_live_swapchain_counter_tracks_creation_and_destruction() {
+        let live = LiveSwapchains::default();
+        assert_eq!(live.count(), 0, "surface 新建时没有 swapchain");
+        live.note_created();
+        assert_eq!(live.count(), 1);
+        live.note_created();
+        assert_eq!(
+            live.count(),
+            2,
+            "多条链（重建期间旧链仍在延迟队列）必须都计上"
+        );
+        live.note_destroyed();
+        assert_eq!(live.count(), 1);
+        live.note_destroyed();
+        assert_eq!(live.count(), 0, "全部销毁之后才满足 recreate 的前置条件");
+        // 归零状态是合法前置条件（不 panic）。
+        live.debug_assert_idle();
+    }
+
+    /// C7 的 debug 断言语义：只要该 surface 还有一条 live swapchain，重建 surface 就是 bug。
+    ///
+    /// 该路径只能在真实 WSI 上触发（离屏测试没有 surface），这里直接断言前置条件的判据；
+    /// `debug_assert` 在 release 构建被编译掉，release 测试只验证「归零状态不 panic」。
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "VUID-vkDestroySurfaceKHR-surface-01266")]
+    fn recreating_a_surface_while_its_swapchain_is_alive_is_a_debug_error() {
+        let live = LiveSwapchains::default();
+        live.note_created();
+        live.debug_assert_idle();
+    }
 
     #[test]
     fn present_rects_mirror_the_copied_rectangles() {
