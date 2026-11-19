@@ -255,7 +255,16 @@ fn open_window(
     options: &WindowOptions,
     dispatcher: &Arc<Dispatcher>,
 ) -> Result<NativeWindow, EngineError> {
-    let native = NativeWindow::create(mtm, id, options, dispatcher)?;
+    // RE-01：adapter 必须持有窗口 `A11yBridge` 的**那一份**消费端代际（唯一入口
+    // `App::window_a11y_epoch`）；不存在的窗口不能建原生窗口。
+    let a11y_epoch = app
+        .window_a11y_epoch(id)
+        .ok_or_else(|| EngineError::AppInit {
+            detail: smol_str::SmolStr::new_static(
+                "window disappeared while creating native window",
+            ),
+        })?;
+    let native = NativeWindow::create(mtm, id, options, dispatcher, a11y_epoch)?;
     // 先显示：用户立刻看到窗口（背景色由 `NSColor` 铺底）。
     native.show();
     let scale = native.scale();
@@ -407,6 +416,9 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
         native.update_a11y(app);
         native.sync_ime_cursor_area(app);
     }
+    // E5 / RE-04 / RE-05：**本轮确实交付过** a11y 且仍有未走完的批次 ⇒ 立刻唤醒下一轮泵
+    // （无 AT 客户端时无交付 ⇒ 绝不 wake，I3 空闲零唤醒）；判定 + wake 的唯一入口。
+    app.wake_for_a11y_backlog(state.dispatcher.as_ref());
     for task in state.dispatcher.drain_tasks() {
         task.run(app);
     }

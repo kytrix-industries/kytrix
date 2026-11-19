@@ -101,7 +101,14 @@ fn hidden_window_sized(
         )
     }
     .expect("CreateWindowExW");
-    let state = match WndProcState::new(dispatcher, hwnd, WindowId::for_test(1), None) {
+    let state = match WndProcState::new(
+        dispatcher,
+        hwnd,
+        WindowId::for_test(1),
+        None,
+        // RE-01：平台层不允许自造消费端代际；测试从真实 `A11yBridge` 取。
+        crate::a11y::adapter::A11yBridge::new().consumer_epoch(),
+    ) {
         Ok(state) => Box::into_raw(Box::new(state)),
         Err(error) => {
             // SAFETY: 窗口由本函数创建、尚未交给其它所有者。
@@ -956,8 +963,16 @@ fn a_size_move_resize_drives_a_real_frame() {
     let id = app.create_window(options.clone());
     let app = std::rc::Rc::new(std::cell::RefCell::new(app));
     let dispatcher = Dispatcher::new();
-    let native = NativeWindow::create(id, &options, Arc::clone(&dispatcher), Some(&app))
-        .expect("NativeWindow");
+    // RE-01：建窗路径唯一入口（窗口 bridge 的那一份代际）。
+    let a11y_epoch = app.borrow().window_a11y_epoch(id).expect("window exists");
+    let native = NativeWindow::create(
+        id,
+        &options,
+        Arc::clone(&dispatcher),
+        Some(&app),
+        a11y_epoch,
+    )
+    .expect("NativeWindow");
     let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
     let before = app.borrow().window(id).expect("window").frame_index();
 
@@ -993,8 +1008,16 @@ fn a_size_after_the_modal_loop_is_only_recorded_for_the_pump() {
     let id = app.create_window(options.clone());
     let app = std::rc::Rc::new(std::cell::RefCell::new(app));
     let dispatcher = Dispatcher::new();
-    let mut native = NativeWindow::create(id, &options, Arc::clone(&dispatcher), Some(&app))
-        .expect("NativeWindow");
+    // RE-01：建窗路径唯一入口（窗口 bridge 的那一份代际）。
+    let a11y_epoch = app.borrow().window_a11y_epoch(id).expect("window exists");
+    let mut native = NativeWindow::create(
+        id,
+        &options,
+        Arc::clone(&dispatcher),
+        Some(&app),
+        a11y_epoch,
+    )
+    .expect("NativeWindow");
     let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
     // 先走完一次模态循环（会话打开又关闭）。
     // SAFETY: 同 `a_size_move_resize_drives_a_real_frame`。

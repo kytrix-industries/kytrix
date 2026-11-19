@@ -7,6 +7,7 @@ use smallvec::SmallVec;
 use super::{A11Y_DIAGNOSTIC_CAPACITY, A11Y_THROTTLE, App};
 use crate::{
     node::dependency::{Owner, ReadCtx, ReadTracker},
+    platform::dispatcher::Dispatcher,
     window::{Window, WindowId},
 };
 
@@ -87,8 +88,12 @@ pub(crate) fn a11y_put_handler(
 /// 该窗口本轮是否有 a11y 工作（O(1)；平台泵每轮用它过滤 `update_if_active`）。
 /// 消费者：`App::a11y_pending`。
 ///
-/// **焦点旁路**（R13-5）：焦点变化不受 `A11Y_THROTTLE` 约束 —— 读屏用户的"位置感"绑定在
-/// 焦点反馈的时效上；高频数据类更新（行情数字）仍按 100 ms 合并（省电目标不变）。
+/// 三条不节流旁路（`A11Y_THROTTLE` 只约束**已接入后**的高频数据增量）：
+/// - **焦点变化**（R13-5）：读屏用户的"位置感"绑定在焦点反馈的时效上；
+/// - **消费端重置**（E1）：AT 重新激活 / adapter 停用后 AccessKit 停在 `Pending`，在收到全树
+///   之前 AT 看到的是空树；此时也没有脏位可供到期补发，必须立刻交付；
+/// - **未交付批次**（E5）：分批首树 / DPI 全量重建只发了一部分时必须连续推进 —— 否则
+///   40k 节点 ≈ 20 批 × 100 ms 节流 ≈ 2 s 的首屏可访问性延迟（审查 §3.10 P1）。
 #[must_use]
 pub(crate) fn a11y_pending(app: &App, window: WindowId) -> bool {
     let Some(target) = app.windows.get(&window) else {
@@ -98,10 +103,47 @@ pub(crate) fn a11y_pending(app: &App, window: WindowId) -> bool {
         return false;
     }
     target.a11y_focus_pending()
+        || target.a11y_consumer_epoch_pending()
+        // 未开始交付的全量重建（首树/DPI）：被叫醒就立刻发第一笔。
+        || target.a11y_rebuild_pending()
+        // 已开始的批次未走完：被叫醒就继续推进（平台自唤醒另见 `wake_for_a11y_backlog`）。
+        || target.a11y_backlog_pending()
         || app
             .a11y_delivered
             .get(&window)
             .is_none_or(|last| app.clock.saturating_duration_since(*last) >= A11Y_THROTTLE)
+}
+
+/// 是否有**任一窗口**还有未交付的 a11y 批次（平台泵交付后据此自唤醒；E5 / RE-04）。
+///
+/// 平台泵每轮只交付**一笔**（三端 `update_a11y` 各调一次）。分批首树 / DPI 全量重建期间，
+/// 交付完这一笔后若本函数为真，平台层必须立刻 `Dispatcher::wake()` 下一轮 —— 否则 Windows
+/// 只能等 `A11Y_RETRY_MS = 100 ms` 的兜底定时器，40k 首树又回到 ≈19×100ms≈1.9s；
+/// Linux/macOS 也会退化为既有 retry 定时器的 ≈16ms/轮。`App::a11y_pending` 的 backlog 旁路
+/// 只保证「被叫醒后立刻交付」，**叫醒本身**是平台层这三行接线的职责。
+/// 消费者：三端泵的 a11y 交付步骤。
+#[must_use]
+pub(crate) fn a11y_backlog_pending(app: &App) -> bool {
+    app.windows.values().any(Window::a11y_backlog_pending)
+}
+
+/// 本轮泵**交付过** a11y 且仍有未走完的批次时，唤醒平台泵
+/// （三端唯一入口；E5/RE-04/RE-05）。
+///
+/// 判据必须同时满足：
+/// 1. **本轮确实交付过** a11y（`a11y_delivered_round`：`a11y_take` 产出过快照才置位）。
+///    adapter Inactive（无 AT 客户端 / 无测试捕获）时 `update_if_active` 不执行闭包 ⇒ 标志
+///    恒 false；
+/// 2. 交付后仍有**已开始**的剩余批次（[`A11yBridge::backlog`]，不含 `full_pending`）。
+///
+/// 只有第 2 条的实现会让无 AT 的默认场景每轮自唤醒 = 单核 100% 忙等（RE-05，I3 失效）。
+/// 标志在每次调用时消费并清零，语义是「本轮」；三端泵各留一行调用，真实事件循环不在单测
+/// 执行（App 层测试 + 真机 `acceptance idle` 覆盖，见实现报告 §6.2/§8.3）。
+pub(crate) fn wake_for_a11y_backlog(app: &mut App, dispatcher: &Dispatcher) {
+    let delivered = std::mem::take(&mut app.a11y_delivered_round);
+    if delivered && app.a11y_backlog_pending() {
+        dispatcher.wake();
+    }
 }
 
 /// 是否有窗口「a11y 脏但正被限流」——平台泵据此安排**到期补发**唤醒。
@@ -117,6 +159,21 @@ pub(crate) fn a11y_retry_pending(app: &App) -> bool {
                 .get(window)
                 .is_some_and(|last| app.clock.saturating_duration_since(*last) < A11Y_THROTTLE)
     })
+}
+
+/// 建窗路径的 a11y 消费端代际句柄（三端唯一入口；RE-01）。
+/// 消费者：`App::window_a11y_epoch`。
+///
+/// **必须返回窗口 `A11yBridge` 里的那一份句柄**（同一 `Arc`）：平台 adapter 的激活/停用回调
+/// `bump()` 它之后，引擎 `A11yBridge` 的 `seen_consumer_epoch` 才能观察到变化并强制下一笔全树。
+/// 另起一份 `A11yConsumerEpoch` 是断开的（bump 永远到不了引擎），因此该类型不向平台层开放
+/// 构造入口 —— 三个平台只能经由本函数取句柄。
+#[must_use]
+pub(crate) fn window_a11y_epoch(
+    app: &App,
+    window: WindowId,
+) -> Option<crate::a11y::adapter::A11yConsumerEpoch> {
+    app.windows.get(&window).map(Window::a11y_consumer_epoch)
 }
 
 /// 产出一笔 a11y 交付（消费 `A11Y` 反向集合与 `full_pending`）。
@@ -135,6 +192,9 @@ pub(crate) fn a11y_take(app: &mut App, window: WindowId) -> Option<crate::a11y::
     }
     if snapshot.is_some() {
         app.a11y_delivered.insert(window, app.clock);
+        // RE-05：标记「本轮泵确实交付过 a11y」，平台泵的 `wake_for_a11y_backlog` 消费它；
+        // 无 AT 客户端时（adapter Inactive，本函数不执行）绝不会因此自唤醒。
+        app.a11y_delivered_round = true;
     }
     snapshot
 }
@@ -435,5 +495,67 @@ mod tests {
             "同一帧里 bind_a11y 必须已重算"
         );
         let _ = styled;
+    }
+
+    /// E1：消费端重置（AT 重新激活 / adapter 停用）必须**立即**交付全树，不受 `A11Y_THROTTLE`。
+    ///
+    /// 变异守卫：删掉 `a11y_pending` 的 `a11y_consumer_epoch_pending()` 旁路 ⇒ 第一个
+    /// `assert!(app.a11y_pending(...))` 变红（时钟未推进，节流窗口内普通脏位不会交付）。
+    #[test]
+    fn a_consumer_epoch_reset_bypasses_the_a11y_throttle() {
+        let (_runtime, mut app, window, _label_signal, label) = fixture();
+        let _ = app.frame(window).expect("window").expect("first frame");
+        assert!(app.a11y_take(window).is_some(), "首笔 a11y 交付必为全树");
+
+        // 首笔刚交付：时钟未推进，普通脏位落在 100 ms 节流窗口内。
+        app.window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .mark_a11y(label);
+        assert!(
+            !app.a11y_pending(window),
+            "限流窗口内的普通脏位不得立即交付（否则旁路测试没有意义）"
+        );
+
+        // 消费端重置：不推进时钟也必须立即交付，且下一笔是全树。
+        let epoch = app.window(window).expect("window").a11y_consumer_epoch();
+        epoch.bump();
+        assert!(
+            app.a11y_pending(window),
+            "消费端重置必须走不节流旁路（AT 此时看到空树，等 100 ms 没有意义）"
+        );
+        let snapshot = app.a11y_take(window).expect("重置后的第一笔必须产出");
+        assert!(snapshot.full, "重置后的第一笔必须是全树");
+    }
+
+    /// RE-01：建窗路径取到的代际必须是窗口 `A11yBridge` 的**同一份** `Arc` —— 否则平台回调
+    /// bump 的是另一份计数器，引擎永远看不到重置（E1 在生产上失效但测试全绿）。
+    ///
+    /// 变异守卫：把 `window_a11y_epoch` 改成 `A11yConsumerEpoch::new()`（不可编译）或返回
+    /// 断开句柄 ⇒ 本用例红；三端平台层只允许经由本 helper 取句柄。
+    #[test]
+    fn window_a11y_epoch_is_the_bridge_handle_of_that_window() {
+        let (_runtime, mut app, window, _label_signal, _label) = fixture();
+        let other = app.create_window(WindowOptions::default());
+        let first = app.window_a11y_epoch(window).expect("窗口存在");
+        let again = app.window_a11y_epoch(window).expect("窗口存在");
+        assert!(
+            first.same_handle(&again),
+            "同一窗口多次取句柄必须是同一份 Arc"
+        );
+        let bridge = app.window(window).expect("window").a11y_consumer_epoch();
+        assert!(
+            first.same_handle(&bridge),
+            "必须与窗口 A11yBridge 的 consumer_epoch 同一份（平台回调 bump 才能被引擎看到）"
+        );
+        let other_epoch = app.window_a11y_epoch(other).expect("第二个窗口存在");
+        assert!(
+            !first.same_handle(&other_epoch),
+            "不同窗口必须有独立的消费端代际"
+        );
+        assert!(
+            app.window_a11y_epoch(WindowId::for_test(999)).is_none(),
+            "不存在的窗口返回 None（平台建窗路径据此跳过）"
+        );
     }
 }

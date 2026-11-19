@@ -327,6 +327,16 @@ fn node_summary(id: AkNodeId, node: &accesskit::Node) -> String {
     if !node.word_starts().is_empty() {
         let _ = write!(out, " word_starts={:?}", node.word_starts());
     }
+    // 字符度量 / 文本方向（E4b）：caret 高亮能力是否发出、是否单行 LTR，直接进 oracle 摘要。
+    if let Some(positions) = node.character_positions() {
+        let _ = write!(out, " character_positions={positions:?}");
+    }
+    if let Some(widths) = node.character_widths() {
+        let _ = write!(out, " character_widths={widths:?}");
+    }
+    if let Some(direction) = node.text_direction() {
+        let _ = write!(out, " text_direction={direction:?}");
+    }
     if let Some(selection) = node.text_selection() {
         let _ = write!(
             out,
