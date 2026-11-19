@@ -446,12 +446,17 @@ mod tests {
         assert!(!record.rendered, "推迟记录不是提交帧");
 
         // force 通道（resize / 拖动 / 动画 tick）：绕过预算，立即提交同一份状态。
-        let forced = app.frame_forced(window);
-        assert!(committed(forced), "force 通道必须绕过帧预算门禁");
-        assert!(
-            app.window(window).expect("窗口存在").frame_index() > first_index,
-            "force 帧必须真正提交"
-        );
+        // Linux 的 present 门禁本身就是 `wl_surface.frame`，没有 force 调用点（`frame_forced`
+        // 在该端不编译），因此这部分断言只在 Windows/macOS 上跑。
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            let forced = app.frame_forced(window);
+            assert!(committed(forced), "force 通道必须绕过帧预算门禁");
+            assert!(
+                app.window(window).expect("窗口存在").frame_index() > first_index,
+                "force 帧必须真正提交"
+            );
+        }
         // force 帧推进了相位：紧接着的普通请求又被合并。
         assert!(app.write(&value, 64));
         assert!(matches!(app.frame(window), Some(Ok(FrameOutcome::Idle))));

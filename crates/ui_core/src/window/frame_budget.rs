@@ -23,11 +23,11 @@ use std::time::{Duration, Instant};
 
 /// 刷新率下限（Hz）：低于它的提示视为不可信，禁用门禁。
 ///
-/// 24 Hz 以下是远程桌面 / 省电模式的极端值，按「未知」处理比按 24 Hz 卡帧更安全；
-/// 上限 480 Hz 覆盖当前全部高刷显示器（超范围同样禁用门禁，退回唤醒即出帧）。
+/// 24 Hz 以下是远程桌面 / 省电模式的极端值，按「未知」处理比按 24 Hz 卡帧更安全。
 const MIN_REFRESH_HZ: f32 = 24.0;
-/// 刷新率上限（Hz）；ProMotion 120 / 高刷 360 都覆盖。
-const MAX_REFRESH_HZ: f32 = 360.0;
+/// 刷新率上限（Hz）：上限 480 覆盖 ProMotion 120 / 高刷 360 / 已上市 480 Hz 显示器；
+/// 超范围同样禁用门禁（退回唤醒即出帧，绝不用错误周期卡帧）。
+const MAX_REFRESH_HZ: f32 = 480.0;
 
 /// 窗口级帧预算门禁（`Window` 的私有字段；平台层通过 `Window::set_frame_refresh_hz` 注入
 /// 刷新率提示）。
@@ -191,7 +191,7 @@ mod tests {
         assert!(budget.admits(t0 + Duration::from_millis(18), false));
     }
 
-    /// 未知 / 非法刷新率 ⇒ 门禁禁用（绝不用错误周期卡帧）。
+    /// 未知 / 非法刷新率 ⇒ 门禁禁用（绝不用错误周期卡帧）；上下限边界必须精确。
     #[test]
     fn an_unknown_or_invalid_refresh_rate_disables_the_gate() {
         let mut budget = FrameBudget::default();
@@ -204,6 +204,24 @@ mod tests {
             budget.set_refresh_hz(hz);
             assert_eq!(budget.refresh_hz(), None, "非法提示 {hz} 必须禁用门禁");
             assert!(budget.admits(t0, false));
+        }
+
+        // 边界：24 / 480 合法；略越界（23.9 / 480.1）必须禁用。
+        budget.set_refresh_hz(24.0);
+        assert!(
+            budget
+                .refresh_hz()
+                .is_some_and(|hz| (hz - 24.0).abs() < 0.01)
+        );
+        budget.set_refresh_hz(480.0);
+        assert!(
+            budget
+                .refresh_hz()
+                .is_some_and(|hz| (hz - 480.0).abs() < 0.01)
+        );
+        for hz in [23.9, 480.1] {
+            budget.set_refresh_hz(hz);
+            assert_eq!(budget.refresh_hz(), None, "边界外提示 {hz} 必须禁用门禁");
         }
     }
 

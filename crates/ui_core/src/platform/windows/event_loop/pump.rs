@@ -75,13 +75,19 @@ const PACE_STOP_SLICE_MS: u64 = 20;
 /// （多窗口同屏是常态；混合刷新率时每个窗口的帧预算仍按各自 output 独立节流，节拍线程只是
 /// 唤醒泵的粗粒度定时器 —— A3 已接受 Windows 上动画节拍随首窗的限制并在报告登记）。
 fn pace_interval(app: &App, windows: &[NativeWindow]) -> Duration {
-    windows
-        .first()
-        .and_then(|native| app.window(native.id()))
-        .and_then(Window::frame_refresh_hz)
-        .map_or(FALLBACK_PACE, |hz| {
-            Duration::from_secs_f32(1.0 / hz).min(Duration::from_millis(MAX_PACE_WAIT_MS))
-        })
+    pace_interval_from(
+        windows
+            .first()
+            .and_then(|native| app.window(native.id()))
+            .and_then(Window::frame_refresh_hz),
+    )
+}
+
+/// 刷新率提示 → 节拍周期（纯函数，可单测）：未知 ⇒ 60 Hz 兜底；周期上限 [`MAX_PACE_WAIT_MS`]。
+fn pace_interval_from(refresh_hz: Option<f32>) -> Duration {
+    refresh_hz.map_or(FALLBACK_PACE, |hz| {
+        Duration::from_secs_f32(1.0 / hz).min(Duration::from_millis(MAX_PACE_WAIT_MS))
+    })
 }
 
 /// 消费者：`run`。
@@ -1021,5 +1027,34 @@ mod geometry_cache_tests {
         cache.retain_live(|id| id == window(2));
         assert_eq!(cache.len(), 1, "关闭的窗口必须丢掉缓存项");
         assert_eq!(cache.queries(), 3);
+    }
+}
+
+#[cfg(test)]
+mod pacer_tests {
+    use std::time::Duration;
+
+    use super::{FALLBACK_PACE, MAX_PACE_WAIT_MS, pace_interval_from};
+
+    /// A5/A3：UI 侧节拍线程的周期来自窗口所在 output 的刷新率提示。
+    /// 未知 ⇒ 60 Hz 兜底（只影响动画 tick，不卡内容帧）；提示异常/过低 ⇒ 上限保护。
+    #[test]
+    fn the_pacer_interval_follows_the_output_refresh_hint() {
+        assert_eq!(pace_interval_from(None), FALLBACK_PACE);
+        let hz60 = pace_interval_from(Some(60.0));
+        assert!(
+            (hz60.as_secs_f64() - 1.0 / 60.0).abs() < 1e-6,
+            "60 Hz 提示 ⇒ 16.67 ms 周期：{hz60:?}"
+        );
+        let hz144 = pace_interval_from(Some(144.0));
+        assert!(
+            (hz144.as_secs_f64() - 1.0 / 144.0).abs() < 1e-6,
+            "144 Hz 提示 ⇒ 6.94 ms 周期：{hz144:?}"
+        );
+        assert_eq!(
+            pace_interval_from(Some(0.5)),
+            Duration::from_millis(MAX_PACE_WAIT_MS),
+            "异常低的刷新率必须被上限保护（不能睡死）"
+        );
     }
 }

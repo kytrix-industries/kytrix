@@ -1504,6 +1504,10 @@ impl App {
     }
 
     /// 是否有窗口的帧请求正被预算门禁推迟（A5）：平台据此挂一次性唤醒。
+    ///
+    /// 消费者：Windows 泵 / macOS 泵（按刷新率挂一次性定时器）；Linux 的补帧走
+    /// `next_deferred_deadline` + calloop timeout，不需要这个布尔查询。
+    #[cfg(any(windows, target_os = "macos"))]
     pub(crate) fn has_deferred_frames(&self) -> bool {
         self.windows()
             .any(|(_, window)| window.frame_budget_deferred())
@@ -1861,7 +1865,10 @@ impl App {
     ///
     /// 消费者（`crate` 内）：Windows `ResizeFrameDriver`（系统 size / move 模态循环里每条
     /// `WM_SIZE` 必须立刻重排重绘）、macOS 连续帧定时器（display link 节拍的 tick 已经代表
-    /// 「这一拍该出帧」）。普通唤醒路径不得使用：否则 `--hz 240` 的写入会绕过预算。
+    /// 「这一拍该出帧」）。Linux 的 present 门禁本身就是 `wl_surface.frame`，没有 force 调用点
+    /// （因此该端不编译本方法：避免 dead_code warning）。普通唤醒路径不得使用：否则
+    /// `--hz 240` 的写入会绕过预算。
+    #[cfg(any(windows, target_os = "macos"))]
     pub(crate) fn frame_forced(
         &mut self,
         window: WindowId,
