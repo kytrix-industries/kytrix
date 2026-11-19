@@ -451,8 +451,10 @@ pub(crate) struct FrameFeedback {
     /// `completed_at - published_at`：UI 线程发布本帧到 **GPU 工作完成**的时长。
     ///
     /// **三端同义**（B6-2 统一）：起点是 [`FrameRequest::published_at`]（UI 提交时刻），终点是
-    /// [`Self::completed_at`]。合成线程上线后这条链多了一段「合成线程等待下一拍 + 增量编码」——
-    /// 那正是 UI 发布到 GPU 完成之间的真实路径，因此数值变大是语义正确的结果，不是回归。
+    /// [`Self::completed_at`]。合成线程上线后这条链多了一段「入队 → 合成线程增量编码 → GPU
+    /// 排队」—— 那正是 UI 发布到 GPU 完成之间的真实路径，因此数值变大是语义正确的结果，不是
+    /// 回归。A2 删除了合成线程的进程级 vsync 门禁之后，这条链不再包含「等待下一拍」，
+    /// `FrameFeedback::latency` 与 HUD 的 `Latency` 随之缩短约 1 个 vsync。
     /// HUD 的 `Latency` 一行显示的就是它；「发布 → 上屏」由 [`Self::presented_at`] 单独承载，
     /// 其真实性判据见 [`Self::presentation_is_consistent`]。
     pub latency: Duration,

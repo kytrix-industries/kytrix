@@ -262,7 +262,7 @@ pub(crate) fn frame(
             uploaded_bytes: paint.uploaded_bytes,
             // B6-2 的三个合成观测字段：`submit_gpu` 在发布时按合成路径回填
             // （inline ⇒ encode_on_compositor = false；threaded ⇒ 读合成线程计数）。
-            compositor_thread_wait: None,
+            compositor_inbox_latency: None,
             encode_on_compositor: false,
             scroll_offset_frames: 0,
             // R13-6 的累计指标：本帧是像素帧，数字保持不变（a11y-only 帧才会 +1）。

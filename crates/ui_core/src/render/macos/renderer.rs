@@ -451,12 +451,12 @@ define_class!(
         ) {
             // `targetPresentationTimestamp` 是这次 vsync 被排定的**呈现时刻**（host time，与
             // `CACurrentMediaTime()` 同一时基）。它是 display link 独占的信息：**不能**再交给
-            // `presentDrawable:atTime:`（见 `render/macos/present.rs`），只作为上屏时刻的
-            // **tick 推断**来源与合成线程帧时钟的相位来源。
+            // `presentDrawable:atTime:`（见 `render/macos/present.rs`）。
+            //
+            // A2：合成线程不再有进程级帧时钟，这个目标时刻**只**作为上屏时刻的 tick 推断来源
+            // 交给 GPU 线程（同一 tick 里与 drawable 一起发布）；present 节奏由本 display link
+            // 的 drawable 门禁承担（GPU 线程只画系统给的那张 drawable）。
             let target = update.targetPresentationTimestamp();
-            // B6-2：同一时刻也交给**合成线程**的帧时钟 —— 合成线程据此对齐出帧相位，并按回调节奏
-            // 反推刷新率（`SignaledIntervalClock`）。这是 macOS 时钟源的唯一接线点。
-            crate::render::macos::clock::note_display_link_target(target);
             // 同一个 tick 里把 drawable、它的目标呈现时刻与 tick 序号交给 GPU 线程：这是
             // 「本帧被排定的上屏时刻」与「上一帧已上屏」判定的唯一来源。
             self.ivars().shared.publish_drawable(update.drawable(), target);

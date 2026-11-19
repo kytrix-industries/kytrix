@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 
 /// 刷新率下限（Hz）：低于它的提示视为不可信，禁用门禁。
 ///
-/// 与 `render::frame_clock::normalize_refresh_hz` 的 24–360 Hz 域一致；24 Hz 以下是远程桌面 /
-/// 省电模式的极端值，按「未知」处理比按 24 Hz 卡帧更安全。
+/// 24 Hz 以下是远程桌面 / 省电模式的极端值，按「未知」处理比按 24 Hz 卡帧更安全；
+/// 上限 480 Hz 覆盖当前全部高刷显示器（超范围同样禁用门禁，退回唤醒即出帧）。
 const MIN_REFRESH_HZ: f32 = 24.0;
 /// 刷新率上限（Hz）；ProMotion 120 / 高刷 360 都覆盖。
 const MAX_REFRESH_HZ: f32 = 360.0;

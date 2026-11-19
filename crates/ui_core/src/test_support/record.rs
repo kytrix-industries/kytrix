@@ -214,11 +214,13 @@ pub struct FrameStats {
     /// 本帧增量上传的实例字节数：渲染器路径 = 载荷实际字节数（变化段之和），
     /// headless = 编码器写入实例环的字节数（两者在「只改 1 条 lane」时相同）。
     pub uploaded_bytes: usize,
-    /// 合成线程等待下一拍的时长（B6-2；`None` = 本帧没有经过合成线程，或还没有反馈）。
+    /// 合成线程**入队 → 开始编码**的时长（A2 之后不再有 vsync 等待；`None` = 本帧没有经过
+    /// 合成线程，或还没有反馈）。
     ///
     /// 与 `encoded_lanes` 一起把「编码搬到线程」变成可断言的事实：inline 合成时恒 `None`，
-    /// 真实窗口由 `CompositorHandle::counters()` 回填（落后 ≤1 帧）。
-    pub compositor_thread_wait: Option<std::time::Duration>,
+    /// 真实窗口由 `CompositorHandle::counters()` 回填（落后 ≤1 帧）。A2 之前这个值还包含整整
+    /// 一个 vsync 的 `wait_next_frame` —— 语义变化见 `.review/p1-a-impl.md`。
+    pub compositor_inbox_latency: Option<std::time::Duration>,
     /// 本帧的编码是否发生在**合成线程**（`true` = 编码已搬离 UI 线程）。
     pub encode_on_compositor: bool,
     /// 本帧滚动偏移变化的槽数（`0` = 不是滚动帧；>0 时 `encoded_lanes` 必须是 0）。

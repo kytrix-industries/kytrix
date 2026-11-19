@@ -22,11 +22,12 @@
 //! 这与 Qt 在 `WM_SIZE` 里同步布局 / 重绘、Chrome 在每个 size 步 `SetScaleAndSize` 之后合成
 //! 是同一种结构：重绘由**系统分派的消息**驱动，而不是由引擎自己的顶层消息循环驱动。
 //!
-//! ## 帧节奏：合成器时钟（R07-10）
+//! ## 帧节奏：每窗口 GPU 门禁 + UI 侧节拍线程（R07-10 / A2 / A5）
 //!
-//! 连续帧（**动画**；HUD 自 P-C 起是纯观察者，不再产生帧）由 [`pump::FramePacer`] 的合成器
-//! 节拍线程驱动（`DCompositionWaitForCompositorClock`，与 Chrome Viz 同款），`WM_TIMER` 只
-//! 保留给 a11y 补发兜底；空闲时**没有**任何定时器或线程在跑。
+//! present 节奏由每窗口 GPU 线程的 DXGI waitable 门禁决定（A2 删除了合成线程的进程级时钟：
+//! 收到 delta 立即编码发布，不再等一拍）。UI 侧的 [`pump::FramePacer`] 只在「有动画」或
+//! 「有被帧预算门禁推迟的帧」时存在，按窗口所在 output 的刷新周期唤醒泵；`WM_TIMER` 只保留
+//! 给 a11y 补发兜底；空闲时**没有**任何定时器或线程在跑。
 
 use std::{rc::Rc, sync::Arc};
 

@@ -295,7 +295,7 @@ pub(crate) extern "system" fn wndproc(
             return LRESULT(0);
         }
         if msg == WM_TIMER {
-            // a11y 补发兜底：连续帧由合成器时钟（`pump::FramePacer`）驱动，**不**用 `WM_TIMER`
+            // a11y 补发兜底：连续帧由帧节拍线程（`pump::FramePacer`）驱动，**不**用 `WM_TIMER`
             // （R07-10：`WM_TIMER` 是低优先级消息，输入密集时会被饿，且不与 DWM 节拍对齐）。
             if wparam.0 == A11Y_TIMER_ID {
                 (*state).wake();

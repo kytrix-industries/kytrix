@@ -5,10 +5,11 @@
 //! ─────────────────────────────     ───────────────────────────────────    ─────────────────
 //! paint → SceneDelta ──► 邮箱 ──►  阻塞在邮箱（空闲零唤醒）
 //!                                   取 delta（每窗口合并，最新者胜）
-//!                                   阻塞到 FrameClock 的下一拍
-//!                                   FramePacing：跳过 / 钉时刻 / 立即
-//!                                   WindowComposer::compose（增量编码）
-//!                                   FrameRequest ────────────────────►  最新帧槽 → 录制/呈现
+//!                                   立即 compose（增量编码）
+//!                                   FrameRequest ────────────────────►  最新帧槽
+//!                                                                        GPU 门禁（waitable /
+//!                                                                        display link drawable /
+//!                                                                        wl_surface.frame）+ present
 //! ```
 //!
 //! ## 为什么线程是**可选**的
@@ -18,21 +19,29 @@
 //! 注册了 `FrameSink` 的真实窗口**时惰性启动，**最后一个窗口注销时有序退出** —— 这保证
 //! 「合成线程先于所有 GPU 线程退出」（`Window` 的字段顺序：注销 ticket 在 `renderer` 之前）。
 //!
+//! ## 没有进程级 vsync 门禁（A2/A3）
+//!
+//! 合成线程**不等待任何帧时钟**：邮箱里一有 delta 就编码并发布给对应窗口的 GPU 线程。present
+//! 节奏完全由每窗口的 GPU 门禁承担（Windows DXGI waitable、macOS `CAMetalDisplayLink` 的
+//! drawable、Linux `wl_surface.frame` + frame gate）—— 这是与 Chromium「每 Display 一个
+//! BeginFrameSource、present 门禁在 viz/GPU 进程」/Qt 6「每窗口 render loop 阻塞在 swap」一致
+//! 的结构：UI 与合成侧只负责**尽快产出新内容**，何时上屏由呈现侧决定。旧实现在这里
+//! `wait_next_frame()` 之后才 compose（内容已就绪却硬等多一拍 vsync 才编码、发布），端到端
+//! 固定多约 1 个 vsync（`.review/phase1-audit-a.md` §2）。
+//!
+//! 提前/更频繁地发布是安全的：`LatestFrame::publish` 会合并被覆盖帧的 plan 并把旧 payload
+//! 块「旧 → 新」吸进新载荷（`render/frame.rs`），GPU 侧实例镜像按槽持久 + 欠账补齐。
+//!
 //! ## 空闲不空转
 //!
-//! 没有 delta 时线程阻塞在邮箱的条件变量上（**不**等帧时钟），因此空闲 CPU 为 0；只有真的收到
-//! delta 才进入「等下一拍」。这是与「按 vsync 空转」的关键差别（后者空闲时也有 60 次/秒唤醒）。
+//! 没有 delta 时线程阻塞在邮箱的条件变量上，因此空闲 CPU 为 0；只有真的收到 delta 才编码。
 //!
 //! ## 不静默死亡（活性）
 //!
-//! 主循环的退出条件只有两个：邮箱关闭（有序关闭）或**时钟显式取消**。一个刷新周期内没等到
-//! 合成器节拍（显示关闭 / DWM 停摆 / 会话被调度走）只是流失一次 vsync 对齐，`FramePacing` 会
-//! 把这一 tick 判成「立即呈现」—— 把它当成关闭会让合成线程永久退出，屏幕停在最后一帧而输入
-//! 仍在工作（用户可见的「画面冻结」）。
-//!
-//! 线程仍可能因为其它原因（panic / 平台资源）静默结束：`CompositorHandle::supervise`（每帧由
-//! `App::frame` 调用一次）会检测并**重启**它，同时通知调用方让所有窗口整帧重发；重启失败则
-//! 以 [`EngineError::FramePipeline`] 显式失败，绝不退化成空转。
+//! 主循环的退出条件只有邮箱关闭（有序关闭）。线程仍可能因为其它原因（panic / 平台资源）
+//! 静默结束：`CompositorHandle::supervise`（每帧由 `App::frame` 调用一次）会检测并**重启**它，
+//! 同时通知调用方让所有窗口整帧重发；重启失败则以 [`EngineError::FramePipeline`] 显式失败，
+//! 绝不退化成空转。
 
 use std::{
     sync::{
@@ -51,7 +60,6 @@ use crate::{
         compose::{ComposeStats, WindowComposer},
         delta::{SceneDelta, absorb},
         frame::{FrameRequest, FrameSink},
-        frame_clock::{FrameClock, FramePacing, PresentDecision},
     },
     window::WindowId,
 };
@@ -64,16 +72,17 @@ pub(crate) const COMPOSITOR_THREAD_NAME: &str = "kytrix-compositor";
 pub(crate) struct CompositorCounters {
     /// 合成线程实际合成并分发的帧数。
     pub frames: u64,
-    /// 因 `FramePacing` 跳过本 vsync 的 tick 数。
-    pub skipped: u64,
     /// 被合并进后继 delta 的帧数（UI 侧发布快于合成侧时增长）。
     pub absorbed: u64,
     /// 本帧重编码的 lane 数（最近一帧）。
     pub encoded_lanes: usize,
     /// 本帧复用的 lane 段数（最近一帧）。
     pub reused_segments: usize,
-    /// 等待时钟的时长（最近一帧；`FrameRecord.compositor_thread_wait` 的来源）。
-    pub wait: Duration,
+    /// **入队 → 开始编码**的时长（最近一帧；`FrameRecord.compositor_inbox_latency` 的来源）。
+    ///
+    /// A2 之后合成线程不再等帧时钟：这个值只剩「从 UI 发布到合成线程醒来」的调度延迟
+    /// （旧实现里它还包含整整一个 vsync 的 `wait_next_frame`，是 P1A-2 的量化证据）。
+    pub inbox_latency: Duration,
     /// 编码时长（最近一帧；`FrameRecord.encode_on_compositor` 的来源）。
     pub encode: Duration,
 }
@@ -193,8 +202,6 @@ struct CompositorShared {
     inbox: CompositorInbox,
     /// 每窗口的 GPU 线程交付端点。
     sinks: Mutex<ahash::HashMap<WindowId, Arc<dyn FrameSink>>>,
-    /// 帧时钟的打断句柄（线程启动时写入；关闭路径用它唤醒时钟等待）。
-    cancel: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// 线程句柄（最后一个窗口注销时 join）。
     join: Mutex<Option<JoinHandle<()>>>,
     counters: Mutex<CompositorCounters>,
@@ -222,18 +229,14 @@ impl CompositorShared {
         }
     }
 
-    fn record(&self, frame: Option<(ComposeStats, Duration, Duration)>) {
+    fn record(&self, frame: (ComposeStats, Duration, Duration)) {
+        let (stats, inbox_latency, encode) = frame;
         let mut counters = self.counters.lock().unwrap_or_else(PoisonError::into_inner);
-        match frame {
-            Some((stats, wait, encode)) => {
-                counters.frames = counters.frames.saturating_add(1);
-                counters.encoded_lanes = stats.encoded_lanes;
-                counters.reused_segments = stats.reused_segments;
-                counters.wait = wait;
-                counters.encode = encode;
-            }
-            None => counters.skipped = counters.skipped.saturating_add(1),
-        }
+        counters.frames = counters.frames.saturating_add(1);
+        counters.encoded_lanes = stats.encoded_lanes;
+        counters.reused_segments = stats.reused_segments;
+        counters.inbox_latency = inbox_latency;
+        counters.encode = encode;
     }
 
     fn take_error(&self) -> Option<EngineError> {
@@ -263,7 +266,6 @@ impl CompositorHandle {
             shared: Arc::new(CompositorShared {
                 inbox: CompositorInbox::new(),
                 sinks: Mutex::new(ahash::HashMap::default()),
-                cancel: Mutex::new(None),
                 join: Mutex::new(None),
                 counters: Mutex::new(CompositorCounters::default()),
                 error: Mutex::new(None),
@@ -352,14 +354,9 @@ impl CompositorHandle {
         if !finished {
             return Ok(false);
         }
-        // 死线程没有机会清这些：未消费的 delta 与过期的取消句柄全部作废，重建线程。
+        // 死线程没有机会清这些：未消费的 delta 作废，重建线程。
         self.shared.inbox.clear();
         self.shared.running.store(false, Ordering::Release);
-        *self
-            .shared
-            .cancel
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = None;
         self.ensure_running();
         if !self.shared.running.load(Ordering::Acquire) {
             return Err(EngineError::FramePipeline {
@@ -401,18 +398,9 @@ impl CompositorHandle {
         }
     }
 
-    /// 有序关闭：关闭邮箱 → 打断时钟等待 → join。可重复调用。
+    /// 有序关闭：关闭邮箱（唤醒阻塞中的线程 → `take_blocking` 返回 `None`）→ join。可重复调用。
     pub(crate) fn shutdown(&self) {
         self.shared.inbox.close();
-        if let Some(cancel) = self
-            .shared
-            .cancel
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
-            cancel();
-        }
         let handle = self
             .shared
             .join
@@ -432,49 +420,32 @@ pub(crate) fn compositor() -> &'static Arc<CompositorHandle> {
     HANDLE.get_or_init(|| Arc::new(CompositorHandle::new()))
 }
 
-/// 合成线程入口：构造时钟并把取消句柄登记给关闭路径，然后进入主循环。
+/// 合成线程入口（A2：不再构造进程级帧时钟）。
 fn run(shared: Arc<CompositorShared>) {
-    let mut clock = crate::render::frame_clock::compositor_clock();
-    // 关闭路径的时钟打断句柄必须在线程等待之前注册。
-    *shared.cancel.lock().unwrap_or_else(PoisonError::into_inner) = Some(clock.signal_handle());
-    serve(&shared, clock.as_mut());
+    serve(&shared);
 }
 
-/// 合成线程主循环（时钟可注入：单测用脚本化时钟钉死「错过一拍 ≠ 关闭」）。
+/// 合成线程主循环：**收到 delta 立即 compose + publish**（present 节奏交给每窗口 GPU 门禁）。
 ///
-/// 退出条件只有两个：邮箱关闭（有序关闭 / 最后一个窗口注销），或时钟报告**取消**
-/// （`FrameTick::cancelled`，只来自 `signal_handle`）。一个刷新周期内没有节拍**不是**退出
-/// 条件 —— 那只是流失了一次 vsync 对齐，`FramePacing` 会把这一 tick 判成「立即呈现」。
-fn serve(shared: &Arc<CompositorShared>, clock: &mut dyn FrameClock) {
-    let mut pacing = FramePacing::new();
+/// 退出条件只有一个：邮箱关闭（有序关闭 / 最后一个窗口注销）。旧实现在这里先
+/// `clock.wait_next_frame()` 再编码 —— 内容已经就绪却要硬等到某个 vsync 才编码、发布，GPU
+/// 线程再等下一次呈现机会，端到端固定多约 1 个 vsync（P1A-2 的机制来源）。
+fn serve(shared: &Arc<CompositorShared>) {
     let mut composers: ahash::HashMap<WindowId, WindowComposer> = ahash::HashMap::default();
-    let mut pending: Option<Vec<(WindowId, SceneDelta)>> = None;
     loop {
-        // 没有活 ⇒ 阻塞在邮箱上（空闲零唤醒：**不等**帧时钟）。
-        if pending.is_none() {
-            match shared.take_batch() {
-                Some(batch) => pending = Some(batch),
-                None => break,
-            }
-        }
-        // 有活 ⇒ 对齐到下一拍（跳帧/迟到由共享的 FramePacing 决定）。
-        let wait_started = Instant::now();
-        let tick = clock.wait_next_frame();
-        let wait = wait_started.elapsed();
-        if tick.cancelled {
+        // 没有活 ⇒ 阻塞在邮箱上（空闲零唤醒）。有活 ⇒ 立刻编码并发布，不等任何节拍。
+        let Some(batch) = shared.take_batch() else {
             break;
-        }
-        match pacing.plan(tick) {
-            PresentDecision::Skip => {
-                shared.record(None);
-                continue;
-            }
-            PresentDecision::AtTime(_) | PresentDecision::Now => {}
-        }
-        let Some(batch) = pending.take() else {
-            continue;
         };
         let encoding_started = Instant::now();
+        // 入队 → 开始编码：只剩「从 UI 发布到合成线程醒来」的调度延迟（旧实现还多一个 vsync）。
+        let inbox_latency = batch
+            .iter()
+            .map(|(_, delta)| delta.header.published_at)
+            .min()
+            .map_or(Duration::ZERO, |published| {
+                encoding_started.saturating_duration_since(published)
+            });
         let mut last_stats: Option<ComposeStats> = None;
         for (window, delta) in batch {
             let composer = composers.entry(window).or_insert_with(WindowComposer::new);
@@ -505,12 +476,11 @@ fn serve(shared: &Arc<CompositorShared>, clock: &mut dyn FrameClock) {
             composers.remove(&window);
         }
         if let Some(stats) = last_stats {
-            shared.record(Some((stats, wait, encode)));
+            shared.record((stats, inbox_latency, encode));
         }
     }
     // 退出前清空：延迟到这里的 delta 没有下游可交付（下次启动会整帧重建）。
     composers.clear();
-    *shared.cancel.lock().unwrap_or_else(PoisonError::into_inner) = None;
 }
 
 /// 把「注销」变成 RAII：字段声明在 `renderer` **之前**，因此先于 GPU 线程 join 执行。
@@ -537,16 +507,13 @@ impl Drop for CompositorTicket {
 mod tests {
     use std::{
         sync::{
-            Arc, Mutex, PoisonError,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc, PoisonError,
+            atomic::{AtomicUsize, Ordering},
         },
         time::{Duration, Instant},
     };
 
-    use super::{
-        CompositorHandle, CompositorInbox, CompositorShared, FrameRequest, FrameSink, compositor,
-        serve,
-    };
+    use super::{CompositorHandle, CompositorInbox, FrameRequest, FrameSink, compositor};
     #[cfg(target_os = "linux")]
     use crate::math::Size;
     use crate::{
@@ -554,7 +521,6 @@ mod tests {
         render::{
             compositor::{DamageRects, Plan},
             delta::{FrameHeader, SceneDelta},
-            frame_clock::{FrameClock, FrameTick},
         },
         window::{FrameIndex, WindowId},
     };
@@ -674,113 +640,48 @@ mod tests {
         assert!(std::ptr::eq(first, second));
     }
 
-    /// **本 bug 的回归防线（合成线程侧）**：一次「错过一拍」的 tick 不得让主循环退出。
+    /// **P1A-2a 的核心回归防线**：合成线程**不等待任何 vsync 门禁** —— 连续多笔 delta
+    /// 的「入队 → 交付」总时长必须只含编码成本。
     ///
-    /// 脚本化时钟返回 `cancelled == false` 的 tick（目标时刻在过去 ⇒ `FramePacing` 判「立即
-    /// 呈现」）。旧实现把「一个刷新周期内没等到节拍」也塞进 `completed == false`，主循环据此
-    /// 直接 `break` ⇒ 本测试里的 delta 永远不会被合成，sink 一次都收不到（画面永久冻结）。
+    /// 旧实现每笔 delta 都先 `wait_next_frame()`：串行 30 笔至少 30 × 16.7 ms ≈ 500 ms（不管
+    /// 相位如何，门禁每拍只放一帧）。本测试给 300 ms 的上限：新实现只需几十微秒；若有人把
+    /// 「等下一拍」重新接回合成线程，测试会稳定变红（不是测调度抖动）。
     #[test]
-    fn a_missed_beat_does_not_stop_the_compositor_loop() {
-        struct MissedBeats;
-
-        impl FrameClock for MissedBeats {
-            fn wait_next_frame(&mut self) -> FrameTick {
-                let now = Instant::now();
-                FrameTick {
-                    now,
-                    // 错过一拍之后的典型状态：没有可对准的目标时刻。
-                    present_time: now - Duration::from_millis(1),
-                    refresh_hz: 60.0,
-                    cancelled: false,
-                }
-            }
-
-            fn signal_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
-                Arc::new(|| {})
-            }
-        }
-
-        let shared = Arc::new(CompositorShared {
-            inbox: CompositorInbox::new(),
-            sinks: Mutex::new(ahash::HashMap::default()),
-            cancel: Mutex::new(None),
-            join: Mutex::new(None),
-            counters: Mutex::new(super::CompositorCounters::default()),
-            error: Mutex::new(None),
-            running: AtomicBool::new(true),
-        });
+    fn the_compositor_never_waits_for_a_vsync_before_encoding() {
+        let handle = Arc::new(CompositorHandle::new());
         let sink = Arc::new(RecordingSink::default());
-        let window = WindowId::from_raw(9);
-        shared.lock_sinks().insert(window, sink.clone());
-        let mut pending = SceneDelta::empty(header(1));
-        pending.header.window = window;
-        pending.full = true;
-        assert_eq!(shared.inbox.publish(window, pending), Some(false));
-
-        let runner = {
-            let shared = Arc::clone(&shared);
-            std::thread::spawn(move || {
-                let mut clock = MissedBeats;
-                serve(&shared, &mut clock);
-            })
-        };
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while sink.submitted.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
+        let window = WindowId::from_raw(13);
+        handle.register(window, sink.clone());
+        let started = Instant::now();
+        for index in 1..=30u32 {
+            let mut delta = SceneDelta::empty(header(index));
+            delta.header.window = window;
+            delta.full = false;
+            let before = sink.submitted.load(Ordering::Acquire);
+            handle.publish(delta).expect("publish");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while sink.submitted.load(Ordering::Acquire) == before && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_micros(50));
+            }
+            assert_eq!(
+                sink.submitted.load(Ordering::Acquire),
+                before + 1,
+                "第 {index} 笔 delta 必须被合成并交付"
+            );
         }
-        let delivered = sink.submitted.load(Ordering::Acquire);
-        // 有序退出：关闭邮箱让 `take_blocking` 返回 `None`。
-        shared.inbox.close();
-        runner.join().expect("compositor loop");
+        let elapsed = started.elapsed();
+        let counters = handle.counters();
+        handle.unregister(window);
         assert!(
-            delivered >= 1,
-            "错过一拍必须继续合成并交付；若在这里为 0，说明主循环把「没等到节拍」当成了关闭"
+            elapsed < Duration::from_millis(300),
+            "30 笔串行 delta 的合成总时长 {elapsed:?} 必须只含编码成本；\
+             若 ≈30×16.7 ms 说明合成线程又在等 vsync（旧实现 500 ms 起）"
         );
-    }
-
-    /// 取消（关闭路径）必须**先于**合成退出：取消的 tick 不得再合成 / 交付。
-    #[test]
-    fn a_cancelled_tick_stops_the_loop_before_delivering() {
-        struct CancelledClock;
-
-        impl FrameClock for CancelledClock {
-            fn wait_next_frame(&mut self) -> FrameTick {
-                let now = Instant::now();
-                FrameTick {
-                    now,
-                    present_time: now + Duration::from_millis(8),
-                    refresh_hz: 60.0,
-                    cancelled: true,
-                }
-            }
-
-            fn signal_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
-                Arc::new(|| {})
-            }
-        }
-
-        let shared = Arc::new(CompositorShared {
-            inbox: CompositorInbox::new(),
-            sinks: Mutex::new(ahash::HashMap::default()),
-            cancel: Mutex::new(None),
-            join: Mutex::new(None),
-            counters: Mutex::new(super::CompositorCounters::default()),
-            error: Mutex::new(None),
-            running: AtomicBool::new(true),
-        });
-        let sink = Arc::new(RecordingSink::default());
-        let window = WindowId::from_raw(10);
-        shared.lock_sinks().insert(window, sink.clone());
-        let mut pending = SceneDelta::empty(header(1));
-        pending.header.window = window;
-        pending.full = true;
-        assert_eq!(shared.inbox.publish(window, pending), Some(false));
-
-        serve(&shared, &mut CancelledClock);
-        assert_eq!(
-            sink.submitted.load(Ordering::Acquire),
-            0,
-            "取消之后不得再交付帧（关闭路径优先）"
+        assert_eq!(counters.frames, 30, "每笔 delta 都必须产生一帧");
+        assert!(
+            counters.inbox_latency < Duration::from_millis(20),
+            "入队→开始编码只剩调度延迟：{:?}",
+            counters.inbox_latency
         );
     }
 
@@ -872,8 +773,7 @@ mod tests {
 
     /// 一帧真实数据走完整条链路：UI 线程发布 delta → 合成线程编码 → sink 收到载荷。
     ///
-    /// 用 `ManualClock` 之外的真实时钟（合成线程内部构造平台时钟）：这里只断言**时序**
-    /// （一段有限时间内必有一帧到达），不断言具体时刻。
+    /// 只断言**时序下界**（一段有限时间内必有一帧到达），不断言具体时刻。
     #[test]
     fn a_published_delta_reaches_the_sink() {
         let handle = Arc::new(CompositorHandle::new());

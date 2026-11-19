@@ -418,7 +418,7 @@ pub(crate) fn submit_gpu(
             // 合成线程的计数落后 ≤1 帧（与 `render_stats` 同一口径）：本帧读到的是上一帧的合成
             // 结果。`encode_on_compositor` 因此是「最近一次编码发生在合成线程」的事实。
             let counters = crate::render::compositor_thread::compositor().counters();
-            window.stats.compositor_thread_wait = Some(counters.wait);
+            window.stats.compositor_inbox_latency = Some(counters.inbox_latency);
             window.stats.encode_on_compositor = counters.encoded_on_compositor();
             window.stats.encoded_lanes = counters.encoded_lanes;
             window.stats.reused_segments = counters.reused_segments;
@@ -438,7 +438,7 @@ pub(crate) fn submit_gpu(
         window.stats.instances = composed.stats.drawn_instances as usize;
         window.stats.scroll_offset_frames = composed.stats.scroll_slots;
         window.stats.encode_on_compositor = false;
-        window.stats.compositor_thread_wait = None;
+        window.stats.compositor_inbox_latency = None;
     }
     let payload = composed.payload;
     #[cfg(feature = "test-support")]

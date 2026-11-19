@@ -1,19 +1,18 @@
-//! 消息泵：`run`（建窗 → 挂渲染器 → 显示）、每轮固定步骤、唤醒与帧驱动、合成器节拍。
+//! 消息泵：`run`（建窗 → 挂渲染器 → 显示）、每轮固定步骤、唤醒与帧驱动、帧节拍。
 //!
-//! ## 帧节奏（R07-10）
+//! ## 帧节奏（R07-10 / A2 / A5）
 //!
-//! 连续帧（**动画**；HUD 自 P-C 起是纯观察者，不再参与 `needs_continuous_frames`）由
-//! [`FramePacer`] 驱动：一条**只在需要时存在**的节拍线程阻塞在
-//! `DCompositionWaitForCompositorClock`（Windows 11 build 22000+；
-//! Chrome Viz 的 `DCLayerTree::WaitForCompositorClock` 同款），每个合成器节拍唤醒一次泵。
+//! 连续帧（**动画**）与「被帧预算门禁推迟的帧」由 [`FramePacer`] 驱动：一条**只在需要时存在**
+//! 的节拍线程按窗口所在 output 的刷新周期唤醒一次泵。A2 删除了进程级合成器时钟（旧实现阻塞在
+//! `DCompositionWaitForCompositorClock` 上等一拍才编码 —— 端到端固定多约 1 个 vsync）：
+//! present 节奏由 GPU 线程的 DXGI waitable 门禁承担，UI 侧只需要按刷新率推进动画与补帧。
 //!
-//! 为什么不用 `WM_TIMER`（旧实现）：`WM_TIMER` 是**最低优先级**消息，输入密集时被饿
-//! （1000 Hz 鼠标下动画反而更抖）；`SetTimer` 的最小粒度受系统定时器分辨率限制
-//! （默认 15.6 ms），且不与 DWM 的合成节拍对齐 ⇒ 60 Hz 拍频、120 Hz 显示器用不上。
-//! `WM_TIMER` 现在只保留给 a11y 补发兜底（[`A11Y_TIMER_ID`]），空闲时没有定时器。
+//! 为什么不用 `WM_TIMER`：`WM_TIMER` 是**最低优先级**消息，输入密集时被饿（1000 Hz 鼠标下
+//! 动画反而更抖）；且 `SetTimer` 的最小粒度受系统定时器分辨率限制（默认 15.6 ms）。`WM_TIMER`
+//! 现在只保留给 a11y 补发兜底（[`A11Y_TIMER_ID`]），空闲时没有定时器。
 //!
-//! 为什么需要一条独立线程：`DCompositionWaitForCompositorClock` 是阻塞调用，而 UI 线程是
-//! 唯一的消息泵 —— 把它放进泵里就等于暂停输入。Chrome 同样是「合成线程等时钟、UI 线程消费」。
+//! 为什么需要一条独立线程：节拍线程要 `sleep` 到下一拍，而 UI 线程是唯一的消息泵 —— 把它放进
+//! 泵里就等于暂停输入（Chrome 同样是独立合成线程等节拍、UI 线程消费消息）。
 
 use std::{
     cell::RefCell,
@@ -23,7 +22,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use windows::Win32::{
@@ -41,14 +40,14 @@ use crate::{
     error::EngineError,
     platform::{
         dispatcher::Dispatcher,
-        windows::{composition, dpi_awareness, frame_clock::FrameClock, window::NativeWindow},
+        windows::{composition, dpi_awareness, window::NativeWindow},
     },
     render::backend::Renderer,
     window::{Window, WindowId, WindowOptions},
 };
 
 /// 消费者：`wndproc` 的 `WM_TIMER` 分支与 `pump_loop` 的定时器管理。
-/// a11y 补发兜底定时器 id（**唯一**保留的 `WM_TIMER` 用途；连续帧走合成器节拍）。
+/// a11y 补发兜底定时器 id（**唯一**保留的 `WM_TIMER` 用途；连续帧走节拍线程）。
 pub(super) const A11Y_TIMER_ID: usize = 1;
 
 /// a11y 补发兜底定时器的周期（毫秒）。
@@ -57,15 +56,33 @@ pub(super) const A11Y_TIMER_ID: usize = 1;
 /// 否则屏幕阅读器会永远收不到最后一笔更新。
 const A11Y_RETRY_MS: u32 = 100;
 
-/// 节拍线程单次等待的**下限**（毫秒）：`DCompositionWaitForCompositorClock` 不接受 0 超时，
-/// 且过小的超时会让线程退化成忙轮询。
-const MIN_PACE_WAIT_MS: u64 = 1;
-
-/// 节拍线程单次等待的**上限**（毫秒）。
+/// 刷新率提示不可得时的节拍周期（60 Hz 兜底）。
 ///
-/// 正常路径靠合成器节拍唤醒（120 Hz 下 8.3 ms），这个上限只在合成器停摆时生效；它同时是
-/// 「停止后的最长退出延迟」，所以不能大。
+/// 只影响**动画 tick 的频率**（内容帧率仍由每窗口 GPU 门禁决定）；`App` 侧的帧预算门禁在刷新率
+/// 未知时保持禁用，因此不会用这个兜底值卡帧。
+const FALLBACK_PACE: Duration = Duration::from_millis(16);
+
+/// 节拍线程的唤醒周期上限（毫秒）：极低刷新率 / 未知刷新率时也不能睡死，同时是停止后的最长
+/// 退出延迟（`shutdown` 的 join 不能长时间阻塞 UI 线程）。
 const MAX_PACE_WAIT_MS: u64 = 100;
+
+/// 停止检查分片（毫秒）：`sleep` 期间定期检查 stop 标志，保证 `shutdown` 能及时 join。
+const PACE_STOP_SLICE_MS: u64 = 20;
+
+/// 节拍线程的周期：窗口所在 output 的刷新率提示（A5/A3 的 per-output 来源）。
+///
+/// 提示不可得时退回 60 Hz：动画在未知刷新率的显示器上仍以可用频率前进。取**首窗**的提示
+/// （多窗口同屏是常态；混合刷新率时每个窗口的帧预算仍按各自 output 独立节流，节拍线程只是
+/// 唤醒泵的粗粒度定时器 —— A3 已接受 Windows 上动画节拍随首窗的限制并在报告登记）。
+fn pace_interval(app: &App, windows: &[NativeWindow]) -> Duration {
+    windows
+        .first()
+        .and_then(|native| app.window(native.id()))
+        .and_then(Window::frame_refresh_hz)
+        .map_or(FALLBACK_PACE, |hz| {
+            Duration::from_secs_f32(1.0 / hz).min(Duration::from_millis(MAX_PACE_WAIT_MS))
+        })
+}
 
 /// 消费者：`run`。
 /// 用系统设置初始化输入阈值（R02-15）。
@@ -244,15 +261,17 @@ fn apply_interaction_actions(actions: Vec<InteractionAction>) {
     }
 }
 
-/// 合成器节拍线程（R07-10）。
+/// 帧节拍线程（R07-10 / A5）。
 ///
-/// 生命周期跟随 `App::needs_continuous_frames()`：需要连续帧时起、不需要时停 —— 空闲时
-/// **没有线程、没有定时器、没有周期唤醒**（`DCompositionWaitForCompositorClock` 只用一次）。
+/// 生命周期跟随「`App::needs_continuous_frames()`（动画）**或**有被帧预算门禁推迟的帧」：
+/// 需要时起、不需要时停 —— 空闲时**没有线程、没有定时器、没有周期唤醒**（I3）。
+/// A2 之前它阻塞在 `DCompositionWaitForCompositorClock` 上；现在按窗口 refresh 周期 sleep，
+/// present 对齐由 GPU 线程的 DXGI waitable 负责。
 pub(super) struct FramePacer {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    /// 启动线程时用的窗口句柄（用于刷新率采样）：窗口换过就重启线程。
-    hwnd: isize,
+    /// 启动线程时用的刷新周期：周期变了（换屏 / 改刷新率）就重启线程。
+    interval: Duration,
 }
 
 impl FramePacer {
@@ -260,18 +279,17 @@ impl FramePacer {
         Self {
             stop: Arc::new(AtomicBool::new(false)),
             thread: None,
-            hwnd: 0,
+            interval: FALLBACK_PACE,
         }
     }
 
-    /// 启动/停止/改指向节拍线程（幂等）。
-    pub(super) fn sync(&mut self, active: bool, hwnd: HWND, dispatcher: &Arc<Dispatcher>) {
-        let target = hwnd.0 as isize;
+    /// 启动/停止/改周期（幂等）。
+    pub(super) fn sync(&mut self, active: bool, interval: Duration, dispatcher: &Arc<Dispatcher>) {
         if !active {
             self.shutdown();
             return;
         }
-        if self.thread.is_some() && self.hwnd == target {
+        if self.thread.is_some() && self.interval == interval {
             return;
         }
         self.shutdown();
@@ -279,21 +297,21 @@ impl FramePacer {
         let thread_stop = Arc::clone(&stop);
         let thread_dispatcher = Arc::clone(dispatcher);
         self.thread = Some(std::thread::spawn(move || {
-            pace(thread_stop, target, thread_dispatcher);
+            pace(thread_stop, interval, thread_dispatcher);
         }));
         self.stop = stop;
-        self.hwnd = target;
+        self.interval = interval;
     }
 
     /// 停止并 join（`Drop` 也会调）。
     pub(super) fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
-            // 等待上限是 `CLOCK_WAIT_TIMEOUT_MS`：不能因为线程还在等节拍就跳过 join
+            // 等待上限是 `PACE_STOP_SLICE_MS`：不能因为线程还在 sleep 就跳过 join
             //（跳过会让节拍线程活过 `Dispatcher`）。
             let _ = thread.join();
         }
-        self.hwnd = 0;
+        self.interval = FALLBACK_PACE;
     }
 }
 
@@ -311,42 +329,49 @@ impl Drop for FramePacer {
 
 /// 消费者：`FramePacer::sync` 的线程体。
 ///
-/// 每个合成器节拍唤醒一次泵（`Dispatcher::wake` 是电平信号，天然合并）；时钟不可用
-/// （显示器关闭 / 远程桌面）时按采样给出的「距下一次可呈现时刻」退避，避免忙等。
-fn pace(stop: Arc<AtomicBool>, hwnd: isize, dispatcher: Arc<Dispatcher>) {
-    let mut clock = FrameClock::new(HWND(hwnd as *mut core::ffi::c_void));
-    let floor = Duration::from_millis(MIN_PACE_WAIT_MS);
-    let ceiling = Duration::from_millis(MAX_PACE_WAIT_MS);
-    while !stop.load(Ordering::Acquire) {
-        // 采样决定两件事：这次等待的上限（两个帧间隔，120 Hz ⇒ 16.6 ms），以及合成器停摆时
-        // 的退避量。采样失败不是错误：`sample` 会退回「整整一帧」。
-        let sample = clock.sample();
-        let timeout = (clock.frame_interval() * 2).clamp(floor, ceiling);
-        if clock.wait_next_frame(timeout) {
-            dispatcher.wake();
-        } else if !stop.load(Ordering::Acquire) {
-            // 没有节拍（屏幕不亮 / 会话断开 / DWM 停摆）：睡到下一个可呈现时刻再试，
-            // 绝不忙等，也不永久停摆（屏幕恢复后下一拍就会醒）。
-            std::thread::sleep(sample.until_next_present.clamp(floor, ceiling));
+/// 每 `interval` 唤醒一次泵（`Dispatcher::wake` 是电平信号，天然合并）。被抢占 / 系统睡眠恢复
+/// 之后**重新对齐相位**而不是补拍：补拍会在恢复瞬间产生一串连续唤醒（忙循环），而少掉的动画
+/// tick 只意味着动画按真实时间前进（`tick_animations` 用真实时钟），不会卡住。
+fn pace(stop: Arc<AtomicBool>, interval: Duration, dispatcher: Arc<Dispatcher>) {
+    let interval = interval.clamp(
+        Duration::from_millis(1),
+        Duration::from_millis(MAX_PACE_WAIT_MS),
+    );
+    let slice = Duration::from_millis(PACE_STOP_SLICE_MS);
+    let mut next = Instant::now() + interval;
+    loop {
+        // 分片睡眠：每片检查一次 stop，保证 `shutdown` 的 join 延迟 ≤ 一片。
+        loop {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            let now = Instant::now();
+            if now >= next {
+                break;
+            }
+            let remaining = next.saturating_duration_since(now);
+            std::thread::sleep(remaining.min(slice));
         }
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        // 落后超过一个周期（被抢占 / 唤醒恢复）⇒ 从当前时刻重新对齐，不补拍。
+        let now = Instant::now();
+        next += interval;
+        if next <= now {
+            next = now + interval;
+        }
+        dispatcher.wake();
     }
 }
 
 /// 消费者：`platform::windows` 的 `pub(crate) use event_loop::run`。
 /// 引擎自有事件循环：建窗口 → 挂渲染器 → 显示 → 泵 → 关闭。
 pub(crate) fn run(mut app: App) -> Result<(), EngineError> {
-    // 发布基线：只支持 Windows 11（build 22000+）。必须在任何 Win11-only API 之前检查，
-    // 且 `frame_clock` 用 GetProcAddress 动态解析，避免导入表在门禁之前就让进程加载失败。
+    // 发布基线：只支持 Windows 11（build 22000+）。A2 删除了 dcomp 合成器时钟之后启动路径
+    // 不再有 GetProcAddress 解析失败面，但 Win11 仍是产品支持基线（DirectComposition /
+    // 窗口行为假设只在 Win11 上验证）；版本门禁保留在启动期，早失败好过运行期行为异常。
     crate::platform::windows::version::require_windows11()?;
-    // 版本门禁只证明系统是 Win11；如果 dcomp 的合成器时钟导出仍解析失败，说明系统组件
-    // 异常。必须在启动期给出可读错误，而不是让连续帧在 `wait_next_frame` 的兜底里停摆。
-    if !crate::platform::windows::frame_clock::compositor_clock_available() {
-        return Err(EngineError::AppInit {
-            detail: smol_str::format_smolstr!(
-                "Windows 11 compositor clock is unavailable (dcomp!DCompositionWaitForCompositorClock)"
-            ),
-        });
-    }
     // R07-1：进程清单（`ui_core.manifest.xml`）声明 PerMonitorV2，启动再**校验实际值** ——
     // 清单可能被宿主忽略；不是 per-monitor v2 就带诊断失败，绝不静默按 96 dpi 排版。
     dpi_awareness::install()?;
@@ -691,9 +716,14 @@ pub(super) fn pump_loop(
                 app.a11y_retry_pending(),
             )
         };
-        if let Some(native) = windows.first_mut() {
+        if !windows.is_empty() {
+            let interval = {
+                let app = app_cell.borrow();
+                pace_interval(&app, windows)
+            };
+            pacer.sync(continuous || deferred, interval, dispatcher);
+            let native = windows.first_mut().expect("上面已检查非空");
             let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
-            pacer.sync(continuous || deferred, hwnd, dispatcher);
             // 定时器随宿主窗口销毁而失效：宿主已不是当前首窗 ⇒ 清掉记录，下面在新首窗重建
             //（否则首窗关闭后其余窗口的 a11y 补发永远不再触发，P2-4）。
             if a11y_timer.is_some_and(|owner| owner != native.id()) {
@@ -715,7 +745,7 @@ pub(super) fn pump_loop(
                 _ => {}
             }
         } else {
-            pacer.sync(false, HWND::default(), dispatcher);
+            pacer.sync(false, FALLBACK_PACE, dispatcher);
         }
 
         // ③ 关闭：关掉 App 里的窗口与原生窗口；一个不剩就退出。
@@ -744,12 +774,14 @@ pub(super) fn pump_loop(
             let app = app_cell.borrow();
             (app.needs_continuous_frames(), app.has_deferred_frames())
         };
-        match windows.first_mut() {
-            Some(native) => {
-                let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
-                pacer.sync(continuous || deferred, hwnd, dispatcher);
-            }
-            None => pacer.sync(false, HWND::default(), dispatcher),
+        if windows.is_empty() {
+            pacer.sync(false, FALLBACK_PACE, dispatcher);
+        } else {
+            let interval = {
+                let app = app_cell.borrow();
+                pace_interval(&app, windows)
+            };
+            pacer.sync(continuous || deferred, interval, dispatcher);
         }
 
         // ④′ a11y：纯 `A11Y` 变化不会提交帧（`FrameOutcome::Idle`），所以**每轮**都要给 adapter

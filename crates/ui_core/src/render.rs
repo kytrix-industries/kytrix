@@ -21,8 +21,6 @@ pub(crate) mod damage;
 /// `SceneDelta` 协议（UI → 合成线程）：B6-2。
 pub(crate) mod delta;
 pub(crate) mod frame;
-/// 帧时钟抽象 + 「何时出帧 / 何时跳帧」的唯一共享实现（B6-2，架构决策 §6）。
-pub(crate) mod frame_clock;
 /// 上屏证据与呈现节奏的**平台无关**逻辑（R3 / A4）：`presented_at` 的三个平台来源
 /// （macOS display-link tick 推断 / Windows `GetFrameStatistics` / Linux `wp_presentation`）、
 /// 下界钳制与反馈发布顺序。三平台无条件编译（各端专用项 `cfg` 门控）；**所有平台的

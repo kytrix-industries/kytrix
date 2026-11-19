@@ -4,8 +4,6 @@
 //! （workspace lint `definition_in_module_root`）；`Renderer` 的实现在 [`compositor`]。
 
 pub(crate) mod atlas;
-/// 合成线程的帧时钟源（display link 目标时刻 + 单调间隔兜底）：B6-2。
-pub(crate) mod clock;
 pub(crate) mod compositor;
 /// 进程级 GPU 单例（device / metallib / PSO 缓存 / 采样器）：R09-5 / R09-13。
 pub(crate) mod core;
