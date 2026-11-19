@@ -1213,24 +1213,23 @@ impl App {
         focus::clear_ime_cursor_area(self, window)
     }
 
-    /// 启用/禁用某个窗口的输入法（IME，P2-7）。
+    /// 启用/禁用某个窗口的输入法（IME，P2-7；三端统一语义 B6/B9）。
     ///
-    /// 禁用后该窗口不再接收 IME 组合输入：Windows 平台在下一轮泵里对窗口调用
-    /// `ImmAssociateContext(hwnd, None)` 把输入上下文摘下来（旧 `HIMC` 由平台保存），字母/
-    /// 数字键因此作为普通 `WM_KEYDOWN` 到达应用；重新启用时恢复保存的上下文（禁用时窗口
-    /// 本来就没有上下文则让系统关联默认上下文）。窗口销毁前平台会自动恢复关联，`HIMC`
-    /// 不会泄漏。
+    /// 禁用后该窗口的按键**不再路由给 IME**，字母/数字作为普通 `InputEvent::Key` /
+    /// `InputEvent::Text` 到达应用；重新启用恢复系统路由：
     ///
-    /// 典型用途：自绘搜索框的「英文直输」模式、只接受快捷键的图表/表格区 —— 用户开着
-    /// 中文/日文输入法时，字母键不会被 IME 变成组合输入。
+    /// - **Windows**：下一轮泵对窗口调用 `ImmAssociateContext(hwnd, None)` 摘上下文
+    ///   （旧 `HIMC` 由平台保存），重新启用时恢复；窗口销毁前平台自动恢复关联。
+    /// - **macOS**：`GuiView` 的 `inputContext` 返回 `nil`（WebKit 同款做法），按键走普通
+    ///   `keyDown:` → `characters` 通路；禁用瞬间 `discardMarkedText` 并清空组合状态。
+    /// - **Linux**：焦点目标的 `zwp_text_input_v3.disable()`；重新启用且目标仍是文本时整份
+    ///   重发 `enable` + `set_*` 状态。
     ///
     /// 这是**每窗口**的目标状态，默认启用；状态变化不标脏、不请求重绘，只在变化时唤醒
     /// 平台事件循环。窗口不存在时是 no-op。
     ///
-    /// 若调用时该窗口正在 IME 组合中，禁用会直接丢弃组合（不补发 `ImeEvent::End`）：
-    /// 调用方应在关闭 IME 的同时自己清空 preedit 状态。
-    ///
-    /// 平台支持：目前只有 Windows 落实（macOS / Linux 保持系统默认 IME 行为）。
+    /// 若调用时该窗口正在 IME 组合中，禁用会丢弃组合并补发一条 [`crate::event::ImeEvent::End`]
+    /// （与焦点移走/窗口失焦的统一清场路径一致），应用不会停在 preedit 状态。**不**改变引擎焦点。
     pub fn set_ime_enabled(&mut self, window: WindowId, enabled: bool) {
         focus::set_ime_enabled(self, window, enabled)
     }
@@ -1560,11 +1559,7 @@ impl App {
         self.clock
     }
 
-    /// 本窗口的 IME 目标状态（Windows 平台泵每轮读它与已应用状态比较，P2-7）。
-    ///
-    /// 只在 Windows 平台层消费，因此按平台门控：其它平台的 `set_ime_enabled` 只记录状态，
-    /// 没有读取方（也就不会出现 dead_code 警告）。
-    #[cfg(target_os = "windows")]
+    /// 本窗口的 IME 目标状态（三端平台泵每轮读它与已应用状态比较，P2-7 / B6 / B9）。
     pub(crate) fn ime_enabled(&self, window: WindowId) -> bool {
         focus::ime_enabled(self, window)
     }
