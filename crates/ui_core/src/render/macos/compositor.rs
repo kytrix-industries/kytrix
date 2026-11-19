@@ -131,7 +131,7 @@ unsafe impl Send for GpuRenderer {}
 impl GpuRenderer {
     /// 产品路径（离屏 / 快照）：系统默认设备；图集页懒分配（DEVIATIONS F-208）。
     pub(crate) fn new_offscreen(size: (u32, u32)) -> Result<Self, EngineError> {
-        let core = Arc::clone(GpuCore::shared()?);
+        let core = GpuCore::shared()?;
         // 离屏路径没有 UI 线程读者：在飞计数只被同步提交自己用（记一次、等完扣一次）。
         Self::with_device(
             Device::new()?,

@@ -987,6 +987,16 @@ impl Window {
     pub(crate) fn set_renderer(&mut self, renderer: Renderer) {
         surface::set_renderer(self, renderer)
     }
+    /// 实现见子模块 `surface::take_renderer`（macOS 设备恢复：先摘旧 renderer 再重建）。
+    #[cfg(target_os = "macos")]
+    pub(crate) fn take_renderer(&mut self) -> Option<Renderer> {
+        surface::take_renderer(self)
+    }
+    /// 实现见子模块 `surface::has_compositor_ticket`（设备恢复据此决定是否覆盖合成线程 sink）。
+    #[cfg(target_os = "macos")]
+    pub(crate) fn has_compositor_ticket(&self) -> bool {
+        surface::has_compositor_ticket(self)
+    }
     pub(crate) fn poll_renderer(&mut self) -> Result<(), EngineError> {
         surface::poll_renderer(self)
     }

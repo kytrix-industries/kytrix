@@ -443,6 +443,15 @@ pub fn run_window(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
     });
 
     Application::new().run(app)?;
+    // C4 设备恢复的注入验收（macOS + test-support）：`KYTRIX_METAL_INJECT_DEVICE_LOST=1` 让
+    // GPU 线程在首个有待画帧的 tick 发布一次 `DeviceLost`。恢复成功后进程仍正常退出（exit 0），
+    // 且 `GpuCore` 恰好重建一次（首次创建 = 1，恢复一次 ⇒ 2）；恢复失败/超限会让 `run` 返回
+    // `Err`、进程以 exit 2 退出，走不到这一行。
+    #[cfg(all(target_os = "macos", feature = "test-support"))]
+    println!(
+        "metal_gpu_core_generation={}（首次创建=1；设备恢复一次 ⇒ 2）",
+        ui_core::test_support::diagnostics::metal_gpu_core_generation()
+    );
     Ok(passed.get())
 }
 

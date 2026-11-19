@@ -31,9 +31,38 @@
 //!   一次 hover）直接命中运行态，不必付「display link 恢复 → 下一个 vsync 才回调」的一帧延迟。
 
 //!
-//! 设备级对象（`MTLDevice` / 两个 metallib / 4 条 PSO / 采样器）全部来自进程单例
+//! 设备级对象（`MTLDevice` / 两个 metallib / 4 条 PSO / 采样器）全部来自进程注册表
 //! [`GpuCore`]（R09-5）：本模块的每窗口状态只剩 drawable、persist、上传槽、display link 与
 //! GPU 线程。
+//!
+//! # 设备恢复（C4）：整 renderer 重建
+//!
+//! `DeviceLost` 的恢复粒度是**整 renderer 重建**（对齐 Chrome：Metal 后端在 GPU 进程中，设备
+//! 丢失 = GPU 侧进程级状态重建，粗粒度重建比 in-place 修复可控）：
+//!
+//! 1. 平台泵发现窗口的粘性 `DeviceLost` 后先 take/drop 旧 `Renderer`（[`WindowRenderer::drop`]：
+//!    invalidate display link + 有界 join GPU 线程，主线程上限 [`JOIN_TIMEOUT`] = 250 ms）；
+//! 2. [`GpuCore::recover`] 把进程注册表换成新实例（5 s 内最多 3 次；其它窗口已重建则复用）；
+//! 3. [`Renderer::new_with_layer`] 用**旧 `CAMetalLayer`**（只 `setDevice(new)` + 窗口级属性
+//!    重写 + 几何/drawableSize 重放，见 `swapchain::reuse_layer`）新建 persist / 图集页 /
+//!    上传槽 / GPU 线程 / display link；
+//! 4. 平台泵把新 renderer 挂回窗口，并 `compositor().register(id, new_sink)` 覆盖旧 sink
+//!    （否则合成线程继续把 delta 投给已死的 `Arc<Shared>` ⇒ 黑屏），再
+//!    `Window::force_full_republish()` + `request_repaint()` 整帧重发。
+//!
+//! 代价（登记为残余风险，不触发性能门禁）：恢复发生在 UI 泵内，**主线程阻塞上限 250 ms**
+//! （旧 GPU 线程 join）＋新 GPU 线程首帧 PSO 编译数十毫秒；**可见空窗约 1–3 帧**（旧帧保留到
+//! 新 renderer 出第一帧）。恢复期间交易终端看不到新行情，需要产品侧提示时由应用层决定。
+//!
+//! 恢复失败/超限把错误交回泵：泵写入 `state.error` 走**既有退出路径**（应用退出语义不变）。
+//!
+//! # 测试注入（`test-support`）
+//!
+//! 真实 `MTLCommandBufferError.DeviceRemoved` 无法在测试里制造，因此 `test-support` 构建下
+//! 环境变量 `KYTRIX_METAL_INJECT_DEVICE_LOST=1` 会让 `kytrix-metal` 线程在**第一个有待画帧的
+//! tick** 发布一次 `DeviceLost`（进程内只注入一次，见 [`take_injected_device_lost`]）。
+//! `acceptance window` 用它验收「进程不退出 + GpuCore 重建一次 + 帧计数恢复」；生产构建
+//! （无 `test-support`）不编译该分支，环境变量也无效果（cfg + 环境变量双门）。
 //!
 //! 关闭握手（§4.5 / F-169）：`Drop` 里停 display link → signal shutdown → **有界等待** GPU 线程
 //! 退出（[`JOIN_TIMEOUT`]，超时 detach，见 [`join_with_deadline`]）；GPU 线程在退出前自行 drain
@@ -142,13 +171,15 @@ impl Renderer {
         })
     }
 
-    /// 真实窗口：主线程建图层（GPU 侧对象随后整体移交），建 `CAMetalDisplayLink` 并挂到
-    /// 主 run loop 的 common modes。
+    /// 真实窗口（首建）：主线程建图层（GPU 侧对象随后整体移交），建 `CAMetalDisplayLink` 并挂
+    /// 到主 run loop 的 common modes。
+    ///
+    /// 恢复路径不走这里（那会丢掉旧图层的几何历史）——见 [`Self::new_with_layer`]。
     ///
     /// `background` 同时写进图层的 `backgroundColor`（sRGB，旧 drawable 之外）与 persist 的
     /// clear color（linear，新 drawable 内部）。
     ///
-    /// **主线程只做窗口级工作**（R09-5）：设备 / metallib / PSO 全部来自进程单例
+    /// **主线程只做窗口级工作**（R09-5）：设备 / metallib / PSO 全部来自进程注册表
     /// [`GpuCore`]（首次调用后才需要加载，之后是纯读），本函数新建的只有图层、persist、
     /// 三槽上传缓冲与 1×1 占位图集页 —— 都是 `newTexture` / `newBuffer` 级的小分配。
     /// PSO 的首次编译（数十毫秒）落在 `kytrix-metal` 线程的首帧录制里，不阻塞开窗。
@@ -162,25 +193,90 @@ impl Renderer {
         background: Color,
         dispatcher: Arc<Dispatcher>,
     ) -> Result<Self, EngineError> {
+        let core = GpuCore::shared()?;
+        let device = Device::new()?;
+        let layer = swapchain::new_layer(&device, size, scale, background)?;
+        Self::with_layer(
+            core,
+            device,
+            layer,
+            size,
+            max_frame_rate,
+            background,
+            dispatcher,
+        )
+    }
+
+    /// 设备恢复：用**旧 `CAMetalLayer`** 重建一个完整窗口渲染器（C4）。
+    ///
+    /// 与 [`Self::new_for_layer`] 的唯一区别是图层复用：旧图层已经承载过 drawable 与几何
+    /// （C6 的 layer-hosting 责任），只把 `device` 换成恢复后的当前实例并重写窗口级属性
+    /// （见 `swapchain::reuse_layer` 的取舍说明）。persist / 图集页 / 上传槽 / display link /
+    /// GPU 线程全部是新的 —— 旧对象属于旧设备，不能跨设备复用。
+    ///
+    /// 调用者（macOS 泵的恢复驱动）必须**先** take/drop 旧 `Renderer`：旧 display link 必须已经
+    /// invalidate、旧 GPU 线程必须已经有界退出，否则这里改图层 `device` 会与旧线程的 present
+    /// 竞争。
+    ///
+    /// # Errors
+    /// 设备创建、图层重配失败（`AppInit`），或新 GPU 线程无法启动。
+    pub(crate) fn new_with_layer(
+        layer: Retained<CAMetalLayer>,
+        size: (u32, u32),
+        scale: f64,
+        max_frame_rate: f32,
+        background: Color,
+        dispatcher: Arc<Dispatcher>,
+    ) -> Result<Self, EngineError> {
+        let core = GpuCore::shared()?;
+        let device = Device::new()?;
+        swapchain::reuse_layer(&layer, &device, size, scale, background)?;
+        Self::with_layer(
+            core,
+            device,
+            layer,
+            size,
+            max_frame_rate,
+            background,
+            dispatcher,
+        )
+    }
+
+    /// 窗口渲染器的公共构造：GPU 侧对象（persist / 上传槽 / 图集页）+ display link + GPU 线程。
+    ///
+    /// `layer` 必须已经绑定 `device`（两个入口分别是 `new_layer` / `reuse_layer`）。
+    fn with_layer(
+        core: Arc<GpuCore>,
+        device: Device,
+        layer: Retained<CAMetalLayer>,
+        size: (u32, u32),
+        max_frame_rate: f32,
+        background: Color,
+        dispatcher: Arc<Dispatcher>,
+    ) -> Result<Self, EngineError> {
         let mtm = MainThreadMarker::new().ok_or(EngineError::AppInit {
             detail: SmolStr::new_static("CAMetalDisplayLink requires the main thread"),
         })?;
-        let core = Arc::clone(GpuCore::shared()?);
-        let device = Device::new()?;
-        let layer = swapchain::new_layer(&device, size, scale, background)?;
         // 在飞计数必须在 `Queue` 构造之前建好：提交路径（GPU 线程）与 `sync_pacing`
         // （主线程）读写同一份（R09-17）。
         let in_flight = Arc::new(InFlight::new());
         let shared = Arc::new(Shared::new(Arc::clone(&in_flight)));
-        let gpu =
-            GpuRenderer::new_window(device, core, in_flight, size, background_linear(background))?;
+        let gpu = GpuRenderer::new_window(
+            device,
+            Arc::clone(&core),
+            in_flight,
+            size,
+            background_linear(background),
+        )?;
         Ok(Self {
             target: RenderTarget::Window(WindowRenderer::new(
                 mtm,
                 gpu,
+                core,
                 layer,
                 size,
                 max_frame_rate,
+                background,
                 shared,
                 dispatcher,
             )?),
@@ -193,6 +289,26 @@ impl Renderer {
         match &self.target {
             RenderTarget::Offscreen(_) => None,
             RenderTarget::Window(window) => Some(window.layer.clone()),
+        }
+    }
+
+    /// 本窗口正在使用的设备实例（设备恢复驱动用它做 `GpuCore::recover(&stale)` 的判据）。
+    ///
+    /// 离屏目标没有 `DeviceLost` 恢复路径（同步渲染由调用方重建），返回 `None`。
+    pub(crate) fn gpu_core(&self) -> Option<Arc<GpuCore>> {
+        match &self.target {
+            RenderTarget::Offscreen(_) => None,
+            RenderTarget::Window(window) => Some(Arc::clone(&window.core)),
+        }
+    }
+
+    /// 本窗口当前的背景色（主线程侧真值：`set_background_color` 会更新它）。
+    ///
+    /// 设备恢复必须把运行期改过的背景色带到新 renderer（否则会闪回建窗时的颜色）。
+    pub(crate) fn background_color(&self) -> Option<Color> {
+        match &self.target {
+            RenderTarget::Offscreen(_) => None,
+            RenderTarget::Window(window) => Some(window.background),
         }
     }
 
@@ -541,6 +657,12 @@ struct WindowRenderer {
     dispatcher: Arc<Dispatcher>,
     thread: Option<JoinHandle<()>>,
     layer: Retained<CAMetalLayer>,
+    /// 本窗口的 GPU 侧对象（与 GPU 线程里那份 `GpuRenderer` 是同一个设备实例的两份引用）。
+    ///
+    /// 主线程保留一份是为设备恢复：`GpuCore::recover(&stale)` 需要判断「这个窗口用的是不是
+    /// 注册表里的当前实例」。旧 renderer 被 drop 之后旧 `Arc<GpuCore>` 仍活到本字段释放，
+    /// 因此旧设备的对象不会在回收前被提前销毁。
+    core: Arc<GpuCore>,
     display_link: Retained<CAMetalDisplayLink>,
     /// `delegate` 是 **weak** 属性（objc2 与 Apple 文档都如此）：必须由门面持有强引用，
     /// 否则回调会打在已释放的对象上（§5.1）。
@@ -550,6 +672,8 @@ struct WindowRenderer {
     /// 最近一次写进图层的物理尺寸 / DPI（避免每帧重复写 CA 属性，§5.3）。
     layer_size: (u32, u32),
     layer_scale: f64,
+    /// 当前窗口背景色（主线程真值；设备恢复时带给新 renderer）。
+    background: Color,
     /// 当前写进 display link 的偏好帧率（换屏时比较用）。
     frame_rate: f32,
     /// display link 的暂停状态机（R06-8 的空闲滞回；与 `display_link.isPaused()` 同步）。
@@ -565,9 +689,11 @@ impl WindowRenderer {
     fn new(
         mtm: MainThreadMarker,
         gpu: GpuRenderer,
+        core: Arc<GpuCore>,
         layer: Retained<CAMetalLayer>,
         size: (u32, u32),
         max_frame_rate: f32,
+        background: Color,
         shared: Arc<Shared>,
         dispatcher: Arc<Dispatcher>,
     ) -> Result<Self, EngineError> {
@@ -607,11 +733,13 @@ impl WindowRenderer {
             dispatcher,
             thread: Some(thread),
             layer,
+            core,
             display_link,
             _delegate: delegate,
             surface: size,
             layer_size: size,
             layer_scale: 0.0,
+            background,
             frame_rate: target,
             // 与下面 `display_link.setPaused(true)` 同一个初始状态（R06-8 的状态机也从暂停开始）。
             pacing: PacingGate::new(),
@@ -682,7 +810,11 @@ impl WindowRenderer {
     ///
     /// 顺序不能反：图层属性只能在主线程写，而 GPU 线程一被唤醒就要读共享槽；两者都来自同一个
     /// `Color`，所以条带颜色永远一致。
-    fn set_background_color(&self, color: Color) {
+    ///
+    /// 主线程侧同时记一份 `background`：设备恢复要把它带到新 renderer（见
+    /// [`Renderer::background_color`]），否则运行期改过的背景色会在恢复后闪回建窗时的值。
+    fn set_background_color(&mut self, color: Color) {
+        self.background = color;
         swapchain::set_layer_background(&self.layer, color);
         self.shared.set_background(background_linear(color));
     }
@@ -1428,6 +1560,56 @@ fn with_frame_pool<T>(f: impl FnOnce() -> T) -> T {
     autoreleasepool(|_pool| f())
 }
 
+/// `test-support` 的故障注入额度：**进程内只生效一次**。
+///
+/// 恢复后新建的 GPU 线程不能再次注入 —— 否则「注入 → 恢复 → 新线程再注入」会烧穿
+/// [`GpuCore`] 的恢复限次（5 s / 3 次）并让验收进程以超限错误退出，掩盖真正的恢复缺陷。
+#[cfg(any(test, feature = "test-support"))]
+struct InjectionGate {
+    consumed: AtomicBool,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl InjectionGate {
+    const fn new() -> Self {
+        Self {
+            consumed: AtomicBool::new(false),
+        }
+    }
+
+    /// `true` = 本次调用是被注入的那一次（`armed == false` 时恒不注入，也不消耗额度）。
+    fn take(&self, armed: bool) -> bool {
+        if !armed {
+            return false;
+        }
+        !self.consumed.swap(true, Ordering::AcqRel)
+    }
+}
+
+/// 是否要在本次 tick 注入一次 `DeviceLost`（`test-support`；生产构建不编译）。
+///
+/// 门是 **cfg + 环境变量**双重的：没有 `test-support` 时本函数不存在，环境变量完全无效；
+/// 有特性时也要求 `KYTRIX_METAL_INJECT_DEVICE_LOST=1`（显式开启，不会误伤开发者机器）。
+#[cfg(any(test, feature = "test-support"))]
+fn take_injected_device_lost() -> Option<EngineError> {
+    static GATE: InjectionGate = InjectionGate::new();
+    // 环境变量在进程启动前设置；缓存一次，避免每帧 tick 都做一次环境查找。
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let armed = *ARMED
+        .get_or_init(|| std::env::var("KYTRIX_METAL_INJECT_DEVICE_LOST").is_ok_and(|v| v == "1"));
+    if !GATE.take(armed) {
+        return None;
+    }
+    let reason =
+        SmolStr::new_static("injected MTLCommandBufferError.DeviceRemoved (test-support hook)");
+    let log_path = crate::render::macos::device::write_diagnostics(&reason, 0);
+    eprintln!(
+        "kytrix: test-support injected a DeviceLost on the kytrix-metal thread \
+         (KYTRIX_METAL_INJECT_DEVICE_LOST=1)"
+    );
+    Some(EngineError::DeviceLost { reason, log_path })
+}
+
 /// GPU 线程主循环（§5.2 / C5）。
 ///
 /// 每轮在 pool 外做阻塞等待与待定背景色，池内把一个 tick 的全部 Metal 工作交给 [`frame_tick`]。
@@ -1496,6 +1678,16 @@ fn frame_tick(
     surface: &mut SurfaceMismatch,
     atlas_awaiting: &mut [bool; 2],
 ) -> ControlFlow<()> {
+    // `test-support` 故障注入（见模块文档「测试注入」）：模拟「第一个有待画帧的 tick 上
+    // 命令缓冲失败」。必须在任何 GPU 工作之前发布，恢复路径才看到与真实 DeviceLost 相同的
+    // 状态（GPU 线程以粘性错误退出、不再提交）。
+    #[cfg(any(test, feature = "test-support"))]
+    if shared.has_pending_frame()
+        && let Some(error) = take_injected_device_lost()
+    {
+        shared.publish_error(error);
+        return ControlFlow::Break(());
+    }
     // 上屏证据先落地：一个更新的 display link tick 到达 ⇒ 目标 tick 更早的帧已经上屏
     // （该 vsync 的呈现截止时刻已经过去）。这是 `presented_at` 的唯一推导来源。
     feedback.observe_tick(shared.tick_sequence());
@@ -1671,9 +1863,10 @@ mod tests {
     use smol_str::SmolStr;
 
     use super::{
-        AtlasSlots, InFlight, JOIN_TIMEOUT, MAX_SURFACE_MISMATCHES, PanicGuard, SHUTDOWN_GRACE,
-        SendCommandBuffer, Shared, StickyError, SurfaceMismatch, SurfaceVerdict, WaitOutcome,
-        join_with_deadline, reconcile_pacing, surface_within_tolerance, with_frame_pool,
+        AtlasSlots, InFlight, InjectionGate, JOIN_TIMEOUT, MAX_SURFACE_MISMATCHES, PanicGuard,
+        SHUTDOWN_GRACE, SendCommandBuffer, Shared, StickyError, SurfaceMismatch, SurfaceVerdict,
+        WaitOutcome, join_with_deadline, reconcile_pacing, surface_within_tolerance,
+        with_frame_pool,
     };
     use crate::{
         error::EngineError,
@@ -2320,6 +2513,22 @@ mod tests {
         assert!(
             weak.load().is_none(),
             "pool 必须在 tick 结束时 drain（否则每帧的 Metal 临时对象全部泄漏）"
+        );
+    }
+
+    /// C4：`test-support` 的 `DeviceLost` 注入额度**每个进程只生效一次**。
+    ///
+    /// 恢复会新建 GPU 线程；如果新线程也能注入，就会「注入 → 恢复 → 再注入」烧穿 5 s/3 次的
+    /// 恢复限次，把「恢复失败」伪装成「超限」（验收会误判）。未武装（环境变量缺失）时不得注入，
+    /// 也不消耗额度。
+    #[test]
+    fn the_device_lost_injection_fires_at_most_once_per_process() {
+        let gate = InjectionGate::new();
+        assert!(!gate.take(false), "未武装时不得注入");
+        assert!(gate.take(true), "第一次武装必须注入");
+        assert!(
+            !gate.take(true),
+            "同一进程只能注入一次（否则恢复限次会被烧穿）"
         );
     }
 

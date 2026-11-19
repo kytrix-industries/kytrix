@@ -17,13 +17,37 @@
 //! 图集页仍是 per-window：共享一张图集纹理会引入跨窗口的 command buffer 重叠写/读竞争
 //! （同一 `MTLCommandQueue` 只保证**开始**顺序，不保证执行隔离），需要 `MTLEvent` 或共享
 //! 渲染线程才能安全落地 —— 属于 wave-5 的共享渲染线程，不在本次改动范围（详见报告）。
+//!
+//! # 设备恢复（C4）：注册表可替换
+//!
+//! 旧实现是 `OnceLock<Arc<GpuCore>>`：设备一旦初始化就永不替换，`DeviceLost` 只能让整个应用
+//! 退出（audit §4）。现在进程级状态是 [`Registry`]（`Mutex` 保护）：`shared()` 返回**当前**
+//! 实例，[`GpuCore::recover`] 在设备丢失后把注册表换成新建的 `GpuCore`（新 `MTLDevice` + 采样器
+//! + 空 PSO 缓存），generation 递增。
+//!
+//! 恢复粒度是**整 renderer 重建**（对齐 Chrome 的粗粒度重建：Metal 后端在 GPU 进程中，
+//! 设备丢失 = 进程级 GPU 状态重建）：设备级对象进新 core，窗口级对象（persist / 图集页 /
+//! 上传槽 / display link / GPU 线程）由 `renderer::Renderer::new_with_layer` 在新 core 上重建，
+//! 旧 `CAMetalLayer` 复用（C6 已让图层显式持有几何）。
+//!
+//! 两条恢复纪律：
+//! - **限次**：[`RecoveryBudget`] 在 5 s 内最多允许 3 次设备重建；超限返回粘性
+//!   `EngineError::DeviceLost`（应用退出），避免驱动持续失效时每帧重建的活锁。
+//! - **多窗口只删建一次**：`recover(stale)` 看到注册表里的当前实例不是调用方的 `stale`（说明
+//!   另一个窗口已经重建过）时直接复用，不再 `MTLCreateSystemDefaultDevice`（多窗口同时收到
+//!   `DeviceLost` 时系统限流/反复删建设备是真实风险，audit §4.5）。
+//!
+//! 代价（登记为残余风险，不触发性能门禁）：恢复发生在 UI 泵内，**主线程阻塞上限 250 ms**
+//! （旧 GPU 线程的 `join_with_deadline`）；可见空窗约 **1–3 帧**（旧帧保留 + 新 GPU 线程首帧
+//! PSO 编译数十毫秒）。恢复成功后 `Window::force_full_republish()` 让 UI 整帧重发。
 
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Mutex, OnceLock, PoisonError,
+        Arc, Mutex, MutexGuard, OnceLock, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use ahash::RandomState;
@@ -42,10 +66,125 @@ use crate::{
     },
 };
 
-/// 进程级单例（首次成功初始化之后常驻；失败不缓存，下一个调用点会重试并再次拿到错误）。
-static CORE: OnceLock<Arc<GpuCore>> = OnceLock::new();
+/// 设备恢复的时间窗（与 Windows `render/windows/device.rs` 的 `RECOVERY_WINDOW` 同口径）。
+const RECOVERY_WINDOW: Duration = Duration::from_secs(5);
 
-/// 设备级 GPU 对象（进程唯一）。
+/// 一个时间窗内最多重建几次 `MTLDevice`（第 4 次请求 ⇒ 粘性 `DeviceLost`）。
+const MAX_DEVICE_RECOVERIES: usize = 3;
+
+/// 进程级设备注册表（见模块文档「设备恢复」）。
+static REGISTRY: Mutex<Registry> = Mutex::new(Registry::new());
+
+/// 设备注册表：当前实例 + 安装代际 + 重建限次。
+///
+/// 「当前实例」可替换是 C4 的核心改动：旧实现用 `OnceLock`，设备丢失后进程里没有任何合法
+/// 路径拿到新设备，只能退出应用。
+struct Registry {
+    core: Option<Arc<GpuCore>>,
+    /// 成功安装过几次 `GpuCore`（首次创建 = 1，每次恢复 +1）。诊断/测试用它数重建次数。
+    generation: u64,
+    budget: RecoveryBudget,
+}
+
+/// 设备重建的限次窗口（进程级）。
+///
+/// 只在**真正要删建 `MTLDevice`** 时扣一次；「复用其它窗口已重建的实例」不扣 —— 那条路径不
+/// 触碰设备，没有限流风险。
+struct RecoveryBudget {
+    /// 时间窗内的尝试时刻（`None` = 空槽；满槽 = 超限）。
+    attempts: [Option<Instant>; MAX_DEVICE_RECOVERIES],
+}
+
+impl RecoveryBudget {
+    const fn new() -> Self {
+        Self {
+            attempts: [None; MAX_DEVICE_RECOVERIES],
+        }
+    }
+
+    /// 过窗的尝试作废（窗口是滑动的：`5 s` 内的尝试才计数）。
+    fn expire(&mut self, now: Instant) {
+        for attempt in &mut self.attempts {
+            if attempt.is_some_and(|at| now.saturating_duration_since(at) >= RECOVERY_WINDOW) {
+                *attempt = None;
+            }
+        }
+    }
+
+    /// 申请一次设备重建额度。
+    ///
+    /// 失败以**粘性** `DeviceLost` 表达（与「设备真的没了」同一公开语义：调用方据此退出），
+    /// `reason` 明确写出「恢复超限 + 下一次可重试的剩余时间」。
+    fn charge(&mut self, now: Instant) -> Result<(), EngineError> {
+        self.expire(now);
+        if let Some(slot) = self.attempts.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(now);
+            return Ok(());
+        }
+        let oldest = self.attempts.iter().flatten().min().copied().unwrap_or(now);
+        let retry_in = RECOVERY_WINDOW.saturating_sub(now.saturating_duration_since(oldest));
+        let reason = smol_str::format_smolstr!(
+            "device recovery limit reached ({MAX_DEVICE_RECOVERIES} attempts within \
+             {RECOVERY_WINDOW:?}); retry in {retry_in:?}"
+        );
+        Err(device_lost(reason))
+    }
+}
+
+/// 构造 `EngineError::DeviceLost`：恢复相关失败也必须带已落盘的诊断文件（公开错误契约）。
+fn device_lost(reason: SmolStr) -> EngineError {
+    let log_path = super::device::write_diagnostics(&reason, 0);
+    EngineError::DeviceLost { reason, log_path }
+}
+
+impl Registry {
+    const fn new() -> Self {
+        Self {
+            core: None,
+            generation: 0,
+            budget: RecoveryBudget::new(),
+        }
+    }
+
+    /// 首次创建（之后是纯读）：失败不缓存，下一个调用点会重试并再次拿到错误。
+    fn shared(&mut self) -> Result<Arc<GpuCore>, EngineError> {
+        if let Some(core) = &self.core {
+            return Ok(Arc::clone(core));
+        }
+        self.install()
+    }
+
+    /// 设备丢失后的整设备重建（多窗口只删建一次，见模块文档）。
+    ///
+    /// `stale` 是调用方窗口正在用的实例：
+    /// - 注册表当前实例**不是** `stale` ⇒ 另一个窗口已经重建过，直接返回当前实例（复用）；
+    /// - 否则扣一次限次额度后新建 `GpuCore`（新 `MTLDevice` + caps 校验 + 采样器 + 空 PSO
+    ///   缓存），generation +1。
+    fn recover(&mut self, stale: &Arc<GpuCore>, now: Instant) -> Result<Arc<GpuCore>, EngineError> {
+        if let Some(current) = &self.core
+            && !Arc::ptr_eq(current, stale)
+        {
+            return Ok(Arc::clone(current));
+        }
+        self.budget.charge(now)?;
+        self.install()
+    }
+
+    /// 新建一个 `GpuCore` 并把它装进注册表（`shared` / `recover` 的唯一安装点）。
+    fn install(&mut self) -> Result<Arc<GpuCore>, EngineError> {
+        let core = Arc::new(GpuCore::create()?);
+        self.core = Some(Arc::clone(&core));
+        self.generation += 1;
+        Ok(core)
+    }
+}
+
+/// 取注册表锁：锁只在整个创建/替换区间持有（恢复本来就是主线程串行的稀有事件）。
+fn registry() -> MutexGuard<'static, Registry> {
+    REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// 设备级 GPU 对象（进程唯一，可被 [`GpuCore::recover`] 替换）。
 ///
 /// 线程归属：`kytrix-metal` 线程与 UI / 主线程都可以取用 —— Metal 的 device / library / PSO /
 /// sampler 按 Apple 文档都是线程安全的，本结构里唯一可变的状态（PSO 缓存、shader 懒加载）
@@ -68,21 +207,28 @@ unsafe impl Send for GpuCore {}
 unsafe impl Sync for GpuCore {}
 
 impl GpuCore {
-    /// 取进程单例（首次调用做设备创建 + D8 基线校验，之后是纯读）。
+    /// 取**当前**设备实例（首次调用做设备创建 + D8 基线校验，之后是纯读注册表）。
     ///
-    /// 并发首次调用最坏情况是"两份被创建、只有一份留下"：两份来自同一个
-    /// `MTLCreateSystemDefaultDevice`，语义等价；真实调用点（主线程建窗 / 首个离屏渲染器）
-    /// 都是串行的。
-    pub(crate) fn shared() -> Result<&'static Arc<Self>, EngineError> {
-        if let Some(core) = CORE.get() {
-            return Ok(core);
-        }
-        let core = Arc::new(Self::create()?);
-        let _ = CORE.set(core);
-        Ok(CORE.get().expect("the singleton was initialized above"))
+    /// 返回 `Arc` 而不是 `&'static`：注册表可替换（C4），任何持有旧实例的窗口在旧设备上继续
+    /// 工作是未定义行为；`DeviceLost` 之后活动窗口都必须经 `recover` 拿到新实例。
+    pub(crate) fn shared() -> Result<Arc<Self>, EngineError> {
+        registry().shared()
     }
 
-    /// 设备创建 + caps 采集 + 基线校验（只有 `shared()` 会调用）。
+    /// 设备丢失后的整设备重建；见 [`Registry::recover`] 的复用/限次规则。
+    ///
+    /// 返回的实例可能是新建的，也可能是**其它窗口已重建**的当前实例（多窗口只删建一次设备）。
+    /// 旧 Arc 的持有者（例如尚未被重建的其它窗口）仍可安全读取旧对象，但不得再提交 GPU 工作。
+    pub(crate) fn recover(stale: &Arc<Self>) -> Result<Arc<Self>, EngineError> {
+        registry().recover(stale, Instant::now())
+    }
+
+    /// 进程成功安装过几个 `GpuCore`（首次创建 = 1，每次设备重建 +1）。
+    pub(crate) fn generation() -> u64 {
+        registry().generation
+    }
+
+    /// 设备创建 + caps 采集 + 基线校验（只有 [`Registry::install`] 会调用）。
     fn create() -> Result<Self, EngineError> {
         let device =
             objc2_metal::MTLCreateSystemDefaultDevice().ok_or(EngineError::UnsupportedGpu {
@@ -314,12 +460,15 @@ fn create_sampler(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::PoisonError;
+    use std::{
+        sync::{Arc, PoisonError},
+        time::{Duration, Instant},
+    };
 
     use objc2_metal::{MTLDevice, MTLPixelFormat};
 
-    use super::GpuCore;
-    use crate::render::macos::pipeline::BlendMode;
+    use super::{GpuCore, RECOVERY_WINDOW, RecoveryBudget, Registry};
+    use crate::{error::EngineError, render::macos::pipeline::BlendMode};
 
     /// 缓存条目数（同模块内可直接读私有字段）。
     fn cached_pipelines(core: &GpuCore) -> usize {
@@ -376,18 +525,109 @@ mod tests {
 
     /// R09-5：第二个"窗口"（第二个渲染器）必须拿到同一个 `GpuCore`，而不是重建设备。
     #[test]
-    fn the_core_is_a_process_singleton() {
+    fn the_core_is_a_process_singleton_until_a_device_loss_replaces_it() {
         let first = GpuCore::shared().expect("metal device");
         let second = GpuCore::shared().expect("metal device");
         assert!(
-            std::ptr::eq(first, second),
-            "GpuCore 必须是进程单例（OnceLock）：否则每个窗口又各建一份 device"
+            Arc::ptr_eq(&first, &second),
+            "稳态下 GpuCore 必须是进程单例：否则每个窗口又各建一份 device"
         );
         assert!(!first.device().name().to_string().is_empty());
         assert!(
             std::ptr::eq(first.sampler(), second.sampler()),
             "采样器也只有一份"
         );
+    }
+
+    /// **C4 核心不变量**：`recover` 之后注册表换成新实例（generation +1），旧 Arc 仍有效；
+    /// 另一个窗口（还持有旧实例）来恢复时**复用**已重建的实例，不再删建 `MTLDevice`。
+    #[test]
+    fn a_lost_device_is_replaced_once_and_then_reused_by_the_other_windows() {
+        let mut registry = Registry::new();
+        let first = registry.shared().expect("metal device");
+        assert_eq!(registry.generation, 1, "首次创建算第一次安装");
+        assert!(Arc::ptr_eq(
+            &first,
+            &registry.shared().expect("metal device")
+        ));
+
+        let now = Instant::now();
+        let recovered = registry.recover(&first, now).expect("rebuild device");
+        assert!(
+            !Arc::ptr_eq(&first, &recovered),
+            "恢复必须换成新实例（新 MTLDevice + 空 PSO 缓存）"
+        );
+        assert_eq!(registry.generation, 2, "一次恢复 = generation +1");
+        assert!(
+            !first.device().name().to_string().is_empty(),
+            "旧 Arc 仍被本窗口/旧 lease 持有，读取必须仍然安全"
+        );
+        assert!(
+            Arc::ptr_eq(&recovered, &registry.shared().expect("metal device")),
+            "shared() 必须返回恢复后的当前实例"
+        );
+
+        // 第二个窗口晚一拍才发现设备丢失（它手里的 stale 仍是 first）：复用，不重建。
+        let reused = registry.recover(&first, now).expect("reuse rebuilt device");
+        assert!(
+            Arc::ptr_eq(&recovered, &reused),
+            "其它窗口已重建 ⇒ 直接复用，避免多窗口重复删建 MTLDevice"
+        );
+        assert_eq!(registry.generation, 2, "复用不产生新的设备");
+    }
+
+    /// 恢复限次：5 s 内最多 3 次（第 4 次拒绝），过窗后额度复位。
+    #[test]
+    fn the_recovery_budget_allows_three_attempts_per_five_seconds() {
+        let mut budget = RecoveryBudget::new();
+        let now = Instant::now();
+        for attempt in 0..3u32 {
+            budget
+                .charge(now + Duration::from_millis(u64::from(attempt)))
+                .unwrap_or_else(|error| panic!("attempt {attempt} must be allowed: {error:?}"));
+        }
+        let exhausted = budget
+            .charge(now + Duration::from_millis(3))
+            .expect_err("第 4 次恢复必须被拒绝");
+        match exhausted {
+            EngineError::DeviceLost { reason, log_path } => {
+                assert!(
+                    reason.contains("recovery limit reached"),
+                    "超限理由必须可诊断：{reason}"
+                );
+                assert!(
+                    log_path.exists(),
+                    "DeviceLost 契约要求诊断文件已落盘：{log_path:?}"
+                );
+            }
+            other => panic!("超限必须是粘性 DeviceLost：{other:?}"),
+        }
+        // 过窗复位：最早一次尝试失效之后又能重建（滑动窗口，不是永久熔断）。
+        budget
+            .charge(now + RECOVERY_WINDOW)
+            .expect("过窗后额度必须复位");
+    }
+
+    /// 限次耗尽后的 `recover` 必须把超限作为 `DeviceLost` 报给调用方（泵据此走既有退出路径）。
+    #[test]
+    fn an_exhausted_registry_reports_device_lost_instead_of_rebuilding() {
+        let mut registry = Registry::new();
+        let now = Instant::now();
+        let mut stale = registry.shared().expect("metal device");
+        for _ in 0..3 {
+            stale = registry
+                .recover(&stale, now)
+                .expect("attempt within budget");
+        }
+        let error = match registry.recover(&stale, now) {
+            Ok(_) => panic!("第 4 次设备重建必须被拒绝"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, EngineError::DeviceLost { .. }),
+            "超限必须上报粘性 DeviceLost：{error:?}"
+        );
+        assert_eq!(registry.generation, 4, "1 次创建 + 3 次重建");
     }
 
     /// PSO 懒建 + 缓存：同一键第二次请求必须命中缓存（同一对象地址），
@@ -401,13 +641,17 @@ mod tests {
         let first = core
             .pipeline_set(format, BlendMode::Premultiplied)
             .expect("pipeline set");
-        let cached = cached_pipelines(core);
+        let cached = cached_pipelines(&core);
         assert_eq!(cached, 4, "一套 PSO 是 4 条（quad / ui / image / glyph）");
         assert!(first.distinct_states(), "4 条 PSO 不能是同一个对象");
         let second = core
             .pipeline_set(format, BlendMode::Premultiplied)
             .expect("pipeline set");
-        assert_eq!(cached_pipelines(core), cached, "第二次请求不能新增缓存条目");
+        assert_eq!(
+            cached_pipelines(&core),
+            cached,
+            "第二次请求不能新增缓存条目"
+        );
         // 同一键返回同一个对象（地址相等）。`&ProtocolObject` 的地址即 ObjC 对象地址。
         assert!(std::ptr::eq(first.quad(), second.quad()), "quad 命中缓存");
         for pipeline in [

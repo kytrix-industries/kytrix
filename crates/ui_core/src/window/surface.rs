@@ -271,6 +271,28 @@ pub(crate) fn set_renderer(window: &mut Window, renderer: Renderer) {
     window.atlas_rects = std::array::from_fn(|_| crate::render::DirtyRects::default());
 }
 
+// 消费者：`impl Window::take_renderer` 的薄委托（调用点：macOS 设备恢复驱动）。
+/// 摘走渲染器（**不 drop**：调用方决定何时/在哪 drop）。
+///
+/// 设备恢复要按「先 take/drop 旧 renderer（有界）→ 建新 renderer」的顺序落地：旧
+/// `WindowRenderer::drop` 会 invalidate display link 并**有界等待**旧 GPU 线程退出
+/// （主线程上限 250 ms），而新 renderer 要复用旧图层 ⇒ 必须先让旧线程停止 present。
+#[cfg(target_os = "macos")]
+pub(crate) fn take_renderer(window: &mut Window) -> Option<Renderer> {
+    window.renderer.take()
+}
+
+// 消费者：`impl Window::has_compositor_ticket` 的薄委托（调用点：macOS 设备恢复驱动）。
+/// 该窗口是否已把交付端点注册到合成线程（`CompositorTicket` 的生命周期）。
+///
+/// 设备恢复只在**已注册**时覆盖 sink：未注册时新 renderer 的 `submit_gpu` 会按首个真实帧
+/// 的正常路径注册 —— 在恢复驱动里无条件 `register` 会造出一个没有 ticket 的注册项
+/// （关窗时无人 `unregister` ⇒ 合成线程永不退出）。
+#[cfg(target_os = "macos")]
+pub(crate) fn has_compositor_ticket(window: &Window) -> bool {
+    window.compositor_ticket.is_some()
+}
+
 // 消费者：`impl Window::poll_renderer` 的薄委托（外部调用点见该方法文档）。
 /// 轮询 renderer 的反馈 / 错误（三平台窗口路径；空闲时也要跑）。
 ///
