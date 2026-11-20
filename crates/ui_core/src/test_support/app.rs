@@ -420,7 +420,7 @@ impl TestApp {
     /// 像素快照：Windows 上用 WARP 真渲染当前 `Scene`；macOS 用离屏 Metal；Linux 恒 `Gpu`
     /// （`new_offscreen` 在 Wayland 下需要真实 `wl_surface`，因此 Linux 上没有离屏渲染器）。
     ///
-    /// 两张图集都会上传：字形页恒上传；图片图集是 4 层 texture array（D-9-c），按已打开页逐层
+    /// 两张图集都会上传：字形页恒上传（1 层）；图片图集的层数 = 已打开的页数，按已打开页逐层
     /// 整页上传（没有图片时不传）。
     ///
     /// # Errors
@@ -437,24 +437,32 @@ impl TestApp {
             surface.width().max(1) as u32,
             surface.height().max(1) as u32,
         );
-        // 快照的渲染器是临时建的：页尺寸随整页上传一起给出（DEVIATIONS F-211）。
+        // 快照的渲染器是临时建的：页尺寸随整页上传一起给出（DEVIATIONS F-211），array 规格
+        // （页边长 + 层数）同样过线 —— 图片层数 = 当前打开的图集页数。
         let (glyph_page, glyph_pixels) = self.app.glyph_page_pixels();
         let mut renderer = Self::offscreen_renderer(size).map_err(gpu_error)?;
         renderer.queue_atlas_upload(
             crate::paint::atlas::AtlasKind::Glyph,
             0,
-            glyph_page.0,
+            crate::render::AtlasArraySpec {
+                page: glyph_page.0,
+                layers: 1,
+            },
             &glyph_pixels,
             crate::render::DirtyRects::full(),
         );
-        // 图片图集：多页 texture array（D-9-c）⇒ 逐层整页上传；没有图片页时什么都不传。
-        for (layer, (image_page, image_pixels)) in
-            self.app.resource_page_pixels_all().into_iter().enumerate()
-        {
+        // 图片图集：多页 texture array ⇒ 逐层整页上传；数组层数 = 已打开的页数；没有图片页时
+        // 什么都不传（占位数组 1 层）。
+        let image_pages = self.app.resource_page_pixels_all();
+        let image_layers = u32::try_from(image_pages.len()).expect("image page count fits u32");
+        for (layer, (image_page, image_pixels)) in image_pages.into_iter().enumerate() {
             renderer.queue_atlas_upload(
                 crate::paint::atlas::AtlasKind::Image,
                 layer as u16,
-                image_page.0,
+                crate::render::AtlasArraySpec {
+                    page: image_page.0,
+                    layers: image_layers,
+                },
                 image_pixels,
                 crate::render::DirtyRects::full(),
             );

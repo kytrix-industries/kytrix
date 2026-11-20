@@ -578,13 +578,27 @@ pub struct Window {
     /// 第一次（或渲染器重建后 / 页尺寸变化后）必须整页上传，之后才允许按脏行增量
     /// （P13 §8.2 / 评审阻塞 ② / DEVIATIONS F-208）。
     glyph_page_received: Option<u32>,
-    /// 图片图集 texture array 的 extent（整数组已按该 extent 建立；`None` = 还没收到 / 渲染器已换）。
-    image_page_received: Option<u32>,
+    /// 图片图集 texture array 的规格（整数组已按该 `page × layers` 建立；`None` = 还没收到 /
+    /// 渲染器已换）。
+    ///
+    /// 层数随资源层打开的图集页数增长（`ImageAtlasPager::page_count`）：层数不匹配 ⇒ 该窗口的
+    /// 数组必须重建，且**每个**已打开层都要整层重传（重建后的数组内容是未定义的）。
+    image_page_received: Option<crate::render::AtlasArraySpec>,
     /// 图片图集每个 layer 是否已经拿过整层上传（新窗口 / 换渲染器 / 页换代后逐层补齐）。
     ///
-    /// texture array 一旦建立就是 `MAX_IMAGE_PAGES` 层，但每层内容独立：某层第一次入队前
-    /// 必须整层上传（资源层新页首帧整页脏）。下标 = 层号。
+    /// 数组层数是运行时值（当前打开的页数），但每层内容独立：某层第一次入队前必须整层上传
+    /// （资源层新页首帧整页脏）。下标 = 层号，数组界 = `MAX_IMAGE_PAGES`（页数上限）。
     image_layers_received: [bool; MAX_IMAGE_PAGES as usize],
+    /// 本帧图片图集的可画层数上限（fail-closed，RBT-01 不变量 1；见
+    /// [`Window::image_drawable_layers`]）。默认 `u32::MAX` = 不过滤：只有走 `App` 图集上传
+    /// pass 的窗口才会被改成「已整组入队的层数」。
+    image_drawable_layers: u32,
+    /// 仅测试：注入「本轮不参与渲染」（遮挡 / 最小化被 GPU 循环跳过）的状态。
+    ///
+    /// 生产真值来自渲染器（Windows `Shared::atlas_participating`，与 GPU 循环的跳过决策同源）；
+    /// offscreen 测试渲染器恒参与，因此用本注入点构造 RBT-10 的回归场景。
+    #[cfg(test)]
+    atlas_participating_override: Option<bool>,
     /// 字形图集在本窗口上「已写脏、还没入队」的矩形（恒 layer 0）。
     glyph_atlas_rects: crate::render::DirtyRects,
     /// 图片图集每层的「已写脏、还没入队」矩形（下标 = texture array 层号）。
@@ -692,6 +706,9 @@ impl Window {
             glyph_page_received: None,
             image_page_received: None,
             image_layers_received: [false; MAX_IMAGE_PAGES as usize],
+            image_drawable_layers: u32::MAX,
+            #[cfg(test)]
+            atlas_participating_override: None,
             glyph_atlas_rects: crate::render::DirtyRects::default(),
             image_atlas_rects: std::array::from_fn(|_| crate::render::DirtyRects::default()),
             atlas_deferrals: 0,
@@ -1145,15 +1162,64 @@ impl Window {
     pub(crate) fn image_page_received(&self) -> bool {
         surface::image_page_received(self)
     }
-    /// 图片图集某层是否已经拿过整层上传（D-9-c 多页：新窗口 / 换渲染器 / 新页要逐层补齐）。
+    /// 图片图集在本窗口已建立的 array 规格（`None` = 还没整组入队 / 渲染器已换）。
+    ///
+    /// 消费者：`App::upload_image_page`（逐窗口同步判据）+ Windows 离屏 App 测试。
+    pub(crate) fn image_array_spec(&self) -> Option<crate::render::AtlasArraySpec> {
+        self.image_page_received
+    }
+    /// 图片图集某层是否已经拿过整层上传（多页：新窗口 / 换渲染器 / 新页要逐层补齐）。
     pub(crate) fn image_layer_received(&self, layer: u16) -> bool {
         surface::image_layer_received(self, layer)
     }
-    pub(crate) fn atlas_page_matches(&self, kind: AtlasKind, extent: u32) -> bool {
-        surface::atlas_page_matches(self, kind, extent)
+    /// 本帧图片图集**可画层数上限**（fail-closed，RBT-01 不变量 1）。
+    ///
+    /// 只有该窗口渲染器已按当前数组规格**整组入队**过的层才允许进 draw（层号 `>=` 上限的
+    /// `Primitive::Image` 不产出实例）。`u32::MAX` = 不做过滤：没有 App 图集记账的驱动
+    /// （快照 / `Window::frame`）自行整份上传，保持旧行为。
+    /// 本帧图片图集可画层上限（测试诊断；只在 Windows 的 App 图集测试里消费）。
+    #[cfg(all(test, windows))]
+    pub(crate) fn image_drawable_layers(&self) -> u32 {
+        self.image_drawable_layers
     }
-    pub(crate) fn mark_atlas_page_received(&mut self, kind: AtlasKind, extent: u32) {
-        surface::mark_atlas_page_received(self, kind, extent)
+    /// 设置本帧可画层上限。消费者：`App::upload_image_page`（每帧逐窗口刷新）。
+    pub(crate) fn set_image_drawable_layers(&mut self, layers: u32) {
+        self.image_drawable_layers = layers;
+    }
+    /// 该窗口本轮是否**参与渲染**（扩层闸门只统计参与窗口，RBT-10）。
+    ///
+    /// 生产真值来自渲染器：Windows 的 GPU 循环在遮挡 / 最小化时先跳过、不消费 `take_atlas`，
+    /// 它把这一轮的决策发布成 `Shared::atlas_participating`（与真正的跳过同源）；macOS / Linux
+    /// 没有这条「跳过在 take 之前」的路径，恒为参与。没有渲染器的窗口不参与（上传 pass 会跳过）。
+    pub(crate) fn atlas_participating(&self) -> bool {
+        #[cfg(test)]
+        if let Some(participating) = self.atlas_participating_override {
+            return participating;
+        }
+        self.renderer
+            .as_ref()
+            .is_some_and(|renderer| renderer.atlas_participating())
+    }
+    /// 仅测试：注入「不参与渲染」状态（RBT-10 回归；offscreen 渲染器恒参与，无法天然构造）。
+    /// 消费方只有 Windows 的 App 图集测试。
+    #[cfg(all(test, windows))]
+    pub(crate) fn set_atlas_participating_for_test(&mut self, participating: bool) {
+        self.atlas_participating_override = Some(participating);
+    }
+    /// 该图集在本窗口已建立的 array 规格是否就是 `spec`（页边长 + 层数；层数随页数增长）。
+    pub(crate) fn atlas_page_matches(
+        &self,
+        kind: AtlasKind,
+        spec: crate::render::AtlasArraySpec,
+    ) -> bool {
+        surface::atlas_page_matches(self, kind, spec)
+    }
+    pub(crate) fn mark_atlas_page_received(
+        &mut self,
+        kind: AtlasKind,
+        spec: crate::render::AtlasArraySpec,
+    ) {
+        surface::mark_atlas_page_received(self, kind, spec)
     }
     pub(crate) fn mark_image_layer_received(&mut self, layer: u16) {
         surface::mark_image_layer_received(self, layer)
@@ -1190,14 +1256,19 @@ impl Window {
         &mut self,
         kind: AtlasKind,
         layer: u16,
-        extent: u32,
+        spec: crate::render::AtlasArraySpec,
         pixels: &[u8],
         rects: crate::render::DirtyRects,
     ) -> bool {
-        surface::queue_atlas_upload(self, kind, layer, extent, pixels, rects)
+        surface::queue_atlas_upload(self, kind, layer, spec, pixels, rects)
     }
     pub(crate) fn atlas_idle(&self, kind: AtlasKind) -> bool {
         surface::atlas_idle(self, kind)
+    }
+    /// 测试：离屏渲染器上某图集**已入队未录制**的层号（窗口路径返回 `None`）。
+    #[cfg(all(test, windows))]
+    pub(crate) fn atlas_pending_layers(&self, kind: AtlasKind) -> Option<Vec<u16>> {
+        surface::atlas_pending_layers(self, kind)
     }
     pub(crate) fn set_renderer(&mut self, renderer: Renderer) {
         surface::set_renderer(self, renderer)

@@ -30,6 +30,11 @@ fn lock() -> std::sync::MutexGuard<'static, ()> {
     crate::render::windows::device::gpu_test_lock()
 }
 
+/// 图集 array 规格（测试页 + 层数）：字形恒 1 层，图片 = 本测试上传的层数。
+fn spec(page: u32, layers: u32) -> crate::render::AtlasArraySpec {
+    crate::render::AtlasArraySpec { page, layers }
+}
+
 /// WARP 设备不可用时**跳过并诊断**（设计允许；设备被移除过的进程里 WARP 创建可能失败）。
 fn warp_renderer(size: (u32, u32)) -> Option<GpuRenderer> {
     match GpuRenderer::new_warp_offscreen(size) {
@@ -57,7 +62,7 @@ fn dropping_a_renderer_releases_its_shared_device_resources() {
         renderer.queue_atlas_upload(
             AtlasKind::Glyph,
             0,
-            super::TEST_ATLAS_PAGE,
+            spec(super::TEST_ATLAS_PAGE, 1),
             vec![0u8; (super::TEST_ATLAS_PAGE * super::TEST_ATLAS_PAGE) as usize],
             rects,
         );
@@ -129,7 +134,7 @@ fn two_renderers_render_concurrently_on_one_shared_gpu() {
                 row.fill(0x40);
             }
             let rects = crate::render::DirtyRects::full();
-            renderer.queue_atlas_upload(AtlasKind::Glyph, 0, page, pixels, rects);
+            renderer.queue_atlas_upload(AtlasKind::Glyph, 0, spec(page, 1), pixels, rects);
 
             let text_free = one_lane_scene(quad(
                 Rect::new(2.0, 2.0, 2.0, 2.0),
@@ -678,7 +683,7 @@ fn a_rendered_frame_produces_no_corruption_messages() {
         }
     }
     let rects = crate::render::DirtyRects::full();
-    renderer.queue_atlas_upload(AtlasKind::Glyph, 0, page, pixels, rects);
+    renderer.queue_atlas_upload(AtlasKind::Glyph, 0, spec(page, 1), pixels, rects);
 
     let scene = one_lane_scene(quad(
         Rect::new(0.0, 0.0, 32.0, 32.0),
@@ -933,7 +938,7 @@ fn image_primitive_samples_the_image_atlas() {
         texel[3] = 0xFF;
     }
     let rects = crate::render::atlas::DirtyRects::full();
-    renderer.queue_atlas_upload(AtlasKind::Image, 0, page, pixels, rects);
+    renderer.queue_atlas_upload(AtlasKind::Image, 0, spec(page, 1), pixels, rects);
 
     let tile = AtlasTile {
         atlas: AtlasKind::Image,
@@ -991,8 +996,8 @@ fn image_primitive_samples_its_texture_array_layer() {
         *texel = [0x00, 0x00, 0xFF, 0xFF];
     }
     let rects = crate::render::atlas::DirtyRects::full();
-    renderer.queue_atlas_upload(AtlasKind::Image, 0, page, blue, rects.clone());
-    renderer.queue_atlas_upload(AtlasKind::Image, 1, page, red, rects);
+    renderer.queue_atlas_upload(AtlasKind::Image, 0, spec(page, 2), blue, rects.clone());
+    renderer.queue_atlas_upload(AtlasKind::Image, 1, spec(page, 2), red, rects);
 
     let tile = AtlasTile {
         atlas: AtlasKind::Image,
@@ -1030,6 +1035,132 @@ fn image_primitive_samples_its_texture_array_layer() {
     );
 }
 
+/// RBT-02：**同页扩层**必须走生产重建入口（`SharedGpu::rebuild_atlas_pages` 的代际 / retire /
+/// SRV 重写），而不是测试里直接 `SharedAtlas::recreate`。
+///
+/// 两帧：帧 1 建 1 层数组并上传 layer 0（蓝）；帧 2 在同一页把数组扩到 2 层、整组重传两层
+/// （layer 0 蓝、layer 1 红）并**同时画两层**。断言：
+/// - 资源 `DepthOrArraySize` 真的变成 2（`GetDesc`，不是只看记账字段）；
+/// - 旧层（layer 0）内容仍在、新层（layer 1）内容正确 ⇒ SRV 指向的是新纹理；
+/// - 变异「重建过滤只比 page、忽略 layers」会让 layer 1 的上传落进 1 层数组 ⇒ 层号断言 panic。
+#[test]
+fn growing_the_shared_image_array_in_place_uses_the_production_rebuild_path() {
+    let _guard = lock();
+    let page = super::TEST_ATLAS_PAGE;
+    let Some(mut renderer) = warp_renderer((64, 64)) else {
+        return;
+    };
+    let rects = crate::render::atlas::DirtyRects::full();
+    let blue = {
+        let mut pixels = vec![0u8; (page * page * 4) as usize];
+        for texel in pixels.as_chunks_mut::<4>().0 {
+            *texel = [0xFF, 0x00, 0x00, 0xFF];
+        }
+        pixels
+    };
+    let red = {
+        let mut pixels = vec![0u8; (page * page * 4) as usize];
+        for texel in pixels.as_chunks_mut::<4>().0 {
+            *texel = [0x00, 0x00, 0xFF, 0xFF];
+        }
+        pixels
+    };
+
+    // 帧 1：1 层数组；只画 layer 0。
+    renderer.queue_atlas_upload(
+        AtlasKind::Image,
+        0,
+        spec(page, 1),
+        blue.clone(),
+        rects.clone(),
+    );
+    submit_image_layers(&mut renderer, 1);
+    {
+        let atlas = renderer.shared.atlas();
+        assert_eq!(atlas.layers(AtlasKind::Image), 1, "首帧是 1 层数组");
+        assert_eq!(
+            atlas.resource_array_size(AtlasKind::Image),
+            1,
+            "资源 DepthOrArraySize 必须是 1"
+        );
+    }
+    let image = renderer.readback().expect("readback frame 1");
+    assert_eq!(pixel(&image, 64, 16, 16), [0, 0, 255, 255], "layer 0 = 蓝");
+
+    // 帧 2：同页扩到 2 层（生产入口重建），两层整组重传；同时画两层。
+    renderer.queue_atlas_upload(AtlasKind::Image, 0, spec(page, 2), blue, rects.clone());
+    renderer.queue_atlas_upload(AtlasKind::Image, 1, spec(page, 2), red, rects);
+    submit_image_layers(&mut renderer, 2);
+    {
+        let atlas = renderer.shared.atlas();
+        assert_eq!(
+            atlas.layers(AtlasKind::Image),
+            2,
+            "同页扩层后记账层数必须是 2"
+        );
+        assert_eq!(
+            atlas.resource_array_size(AtlasKind::Image),
+            2,
+            "同页扩层必须真的重建资源（DepthOrArraySize = 2）"
+        );
+    }
+    let image = renderer.readback().expect("readback frame 2");
+    assert_eq!(
+        pixel(&image, 64, 16, 16),
+        [0, 0, 255, 255],
+        "重建后 layer 0（旧层内容）仍必须正确（App 整组重传）"
+    );
+    assert_eq!(
+        pixel(&image, 64, 48, 16),
+        [255, 0, 0, 255],
+        "同页扩层后 layer 1 必须可采样（SRV 指向新纹理）"
+    );
+}
+
+/// 帮助函数：把 `0..layers` 每一层各画一块 32×32（layer N 画在 x = N×32 处），用于同帧多层
+/// 采样断言。
+fn submit_image_layers(renderer: &mut super::GpuRenderer, layers: u16) {
+    let mut encoder = InstanceEncoder::new();
+    {
+        let mut canvas = crate::paint::canvas::Canvas::new(Rect::new(0.0, 0.0, 64.0, 32.0));
+        for layer in 0..layers {
+            let tile = AtlasTile {
+                atlas: AtlasKind::Image,
+                page: layer,
+                u0: 0.25,
+                v0: 0.25,
+                u1: 0.5,
+                v1: 0.5,
+                generation: 0,
+            };
+            canvas.push_image(Image {
+                bounds: Rect::new(f32::from(layer) * 32.0, 0.0, 32.0, 32.0),
+                tile,
+                modulation: Color::WHITE,
+            });
+        }
+        let scene = one_lane_scene(Primitive::Canvas(std::sync::Arc::new(canvas)));
+        encoder
+            .encode(
+                &scene,
+                Scale::ONE,
+                resolver(),
+                &crate::paint::geometry_store::GeometryStore::new(),
+            )
+            .expect("encode");
+    }
+    let mut frame = full_plan((64, 64));
+    let mut timings = FrameTimings::new();
+    renderer
+        .submit_buffer(
+            FrameIndex::from_raw(2),
+            encoder.buffer(),
+            &mut frame,
+            &mut timings,
+        )
+        .expect("submit");
+}
+
 /// 在给定页尺寸上做一次「上传 → 画字形 → 读回」的可见性探测。
 fn glyph_probe(page: u32) -> bool {
     let Some(mut renderer) = super::GpuRenderer::new_warp_offscreen((64, 64)).ok() else {
@@ -1042,7 +1173,7 @@ fn glyph_probe(page: u32) -> bool {
         }
     }
     let rects = crate::render::atlas::DirtyRects::full();
-    renderer.queue_atlas_upload(AtlasKind::Glyph, 0, page, pixels, rects);
+    renderer.queue_atlas_upload(AtlasKind::Glyph, 0, spec(page, 1), pixels, rects);
     let tile = AtlasTile {
         atlas: AtlasKind::Glyph,
         page: 0,

@@ -56,7 +56,8 @@ pub(crate) fn texel_bytes(kind: AtlasKind) -> u32 {
     }
 }
 
-/// 图集纹理重建位：页尺寸变化（懒创建 / 字形页换代）后，调用方必须重写该图集的绑定。
+/// 图集纹理重建位：页尺寸变化（懒创建 / 字形页换代 / 图片图集层数增长）后，调用方必须重写该
+/// 图集的绑定。
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct AtlasRebuilt {
     pub glyph: bool,
@@ -70,6 +71,75 @@ impl AtlasRebuilt {
             AtlasKind::Image => self.image = true,
         }
     }
+}
+
+/// 一张图集 texture array 的**运行时**规格：页边长（纹素）+ 层数。
+///
+/// 层数**不是**编译期常量（P2-B3 修复）：图片图集的层数 = App 侧
+/// [`ImageAtlasPager::page_count`]（当前实际打开的图集页数；0 页时三端仍保留 1 层的 1×1
+/// 占位数组，好让 SRV / 纹理视图始终指向有效资源），字形恒 1 层。
+///
+/// 层数**单调不减**：图集页槽只增不减（空页按 LRU **原地**回收复用，见
+/// [`ImageAtlasPager::allocate`]），因此 `page_count` 不会回退；缩容 array 会让所有窗口
+/// `AtlasTile.page` 指向不存在的层，是契约破坏。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AtlasArraySpec {
+    /// 页边长（纹素；同一图集的所有页等大）。
+    pub page: u32,
+    /// texture array 层数（`1..=MAX_IMAGE_PAGES`；层号 = 图集页索引）。
+    pub layers: u32,
+}
+
+/// 一次图集 array 重建请求：Windows / Linux `SharedGpu::rebuild_atlas_pages` 的唯一入口。
+///
+/// 调用方（每窗口上传器）在待上传层与当前共享 array 的 `spec` 不一致时产出请求：
+/// - 页边长变化（字形页扩容阶梯 / App 换代）⇒ 换成新页尺寸；
+/// - **层数增长**（图片图集开了新页）⇒ 换成更多层，旧层内容由 App 的整层重传补齐
+///   （增长帧每个已打开页都会整页上传，见 `App::upload_image_page`）。
+///
+/// macOS 的图集数组是**每窗口一份**（`AtlasTextures`），`prepare` 直接按 [`AtlasArraySpec`]
+/// 比对即可，没有「进程级重建请求」这一层，因此本类型与 [`merge_page_request`] 只在
+/// Windows / Linux 编译。
+///
+/// **fail-closed 契约（RBT-01 不变量 2）**：`spec.layers` 大于当前层数的请求要求**每一层**都
+/// 带整页上传（`App::upload_image_page` 的扩层帧保证这一点）。三端上传器在发出重建前都会校验，
+/// 缺层 / 增量层直接返回 [`EngineError::AtlasGrowthIncomplete`](crate::error::EngineError)
+/// —— release 也生效：重建后让半成品层进 draw 是未定义采样，比拒绝一帧糟得多。
+#[cfg(any(windows, target_os = "linux"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AtlasPageRequest {
+    pub kind: AtlasKind,
+    /// 目标规格：页边长 + 层数。
+    pub spec: AtlasArraySpec,
+}
+
+/// 合并一条 array 重建请求：同一 kind 只留一条，层数取最大（层数只增不减）。
+///
+/// Windows / Linux 上传器的 `reconcile_pages` 共用这一段判据：同一图集的多个待上传层会各自
+/// 产出请求（同一页边长、不同层数），重建只需要一次，且必须按最大的层数建数组。
+#[cfg(any(windows, target_os = "linux"))]
+pub(crate) fn merge_page_request(
+    requests: &mut Vec<AtlasPageRequest>,
+    kind: AtlasKind,
+    requested: AtlasArraySpec,
+    current: AtlasArraySpec,
+) {
+    let layers = requested.layers.max(current.layers);
+    if let Some(existing) = requests.iter_mut().find(|request| request.kind == kind) {
+        debug_assert_eq!(
+            existing.spec.page, requested.page,
+            "one atlas cannot rebuild to two page extents in the same frame"
+        );
+        existing.spec.layers = existing.spec.layers.max(layers);
+        return;
+    }
+    requests.push(AtlasPageRequest {
+        kind,
+        spec: AtlasArraySpec {
+            page: requested.page,
+            layers,
+        },
+    });
 }
 
 /// 一个脏矩形在**页内**的落点 + 它在紧密打包缓冲里的字节偏移（AOI 上传契约，R06-3）。
@@ -352,12 +422,16 @@ impl AtlasAllocator {
 ///
 /// 语义（用户裁决「多页图集 + LRU」，取代审计 D-9 的单页容量文档方案）：
 /// - 每页一个 `MAX_ATLAS_PAGE²` 的 [`AtlasAllocator`]；`AtlasTile.page` 是页号
-///   （`0..MAX_IMAGE_PAGES`），三端用 `GpuPrimitive.params1.y` 作 texture array 的层号。
+///   （`0..page_count`），三端用 `GpuPrimitive.params1.y` 作 texture array 的层号。
+/// - **`page_count()` 就是三端图片图集 texture array 的层数**：没有图片时是 0（三端保留 1 层的
+///   1×1 占位数组），每开一页层数 +1，App 侧把它作为 `AtlasArraySpec::layers` 下发给渲染器。
 /// - 分配先试现有页；页满且页数未达上限 ⇒ 开新页（新页整页标记脏：三端首次必须整层上传）；
 ///   页数达上限时，若存在**没有活 tile** 的页 ⇒ 按 LRU 复用最久未用的空页（`clear` 换代后
 ///   原地重新分配，页号稳定）；否则 `None`（上层报 `Capacity{PageFull}`）。
 /// - `deallocate` 只释放单块；页变空后进入空闲表，等下一次分配回收。
 /// - **活 tile 永不淘汰**（tile 恒有效契约）：LRU 只作用于已空的页。
+/// - **页槽只增不减**：`page_count()` 单调不减（回收是原地复用，不是删除页槽）⇒ 数组层数
+///   单调不减，缩容（会让已有 `AtlasTile.page` 失效）在结构上不可能发生。
 pub(crate) struct ImageAtlasPager {
     /// 页槽：下标 == 页号。页槽只增不减（页号稳定；回收 = `clear` 原地复用）。
     pages: Vec<PagerPage>,
@@ -399,7 +473,10 @@ impl ImageAtlasPager {
         Self::with_page_size(page_size)
     }
 
-    /// 已打开的页数（含空闲页；页缓冲/GPU 纹理按这个数常驻）。
+    /// 已打开的页数（含空闲页；页缓冲 / GPU texture array 的层数按这个数常驻）。
+    ///
+    /// **单调不减**：空页按 LRU 原地回收（`clear` 换代后复用同一个页槽），页槽不会被删除。
+    /// 这就是三端图片图集 texture array 的层数来源（见 [`AtlasArraySpec`]）。
     pub(crate) fn page_count(&self) -> usize {
         self.pages.len()
     }
@@ -1395,6 +1472,40 @@ mod tests {
         );
     }
 
+    /// 层数单调不减（P2-B3）：空闲页被 LRU **原地**回收后 `page_count()`（= 三端 texture array
+    /// 的层数）不变小，回收页上重新分配的 tile 层号仍落在数组内。
+    ///
+    /// 变异：`page_count()` 改成「非空闲页数」⇒ 回收后页数变小 ⇒ 本测试失败（生产上会缩容
+    /// 数组，让所有窗口已有 `AtlasTile.page` 指向不存在的层）。
+    #[test]
+    fn the_image_array_layer_count_never_shrinks_when_an_idle_page_is_recycled() {
+        let mut pager = ImageAtlasPager::with_page_for_test(64);
+        let first = pager.allocate((62, 62)).expect("page 0 tile");
+        let second = pager.allocate((62, 62)).expect("page 1 tile");
+        assert_eq!(pager.page_count(), 2, "两块 62² tile 各占满一页");
+        assert_ne!(first.tile.page, second.tile.page);
+
+        // 页变空 ⇒ 进入空闲表（LRU 候选）。
+        pager.deallocate(first.tile.page, first.id);
+        assert_eq!(
+            pager.page_count(),
+            2,
+            "页变空不得减少页数（数组层数只增不减）"
+        );
+
+        // 下一次分配原地回收这个空页：页号稳定、层数不变、层号仍在数组范围内。
+        let recycled = pager.allocate((62, 62)).expect("空页可原地回收");
+        assert_eq!(
+            recycled.tile.page, first.tile.page,
+            "回收必须复用同一个页号（旧 tile 的 page 语义不受影响）"
+        );
+        assert_eq!(pager.page_count(), 2, "回收复用不得改变数组层数");
+        assert!(
+            u32::from(recycled.tile.page) < pager.page_count() as u32,
+            "回收后分配的层号必须仍在数组范围内"
+        );
+    }
+
     /// D-9：新页第一次取脏矩形必须是整页哨兵（三端首次必须整层上传）。
     #[test]
     fn image_pager_new_page_is_fully_dirty() {
@@ -1464,5 +1575,34 @@ mod tests {
         // 页已空：下一次分配应能复用页 0（若幂等失败，活计数为负/丢页会表现成开新页或错误）。
         let next = pager.allocate((18, 18)).expect("fits");
         assert_eq!(next.tile.page, 0);
+    }
+
+    /// RBT-12：三端「整页上传」判据统一为 `covers_page`（按页尺寸判覆盖）。
+    ///
+    /// `is_full` 只认 [`FULL_RECT`] 哨兵；一个**恰好覆盖整页但不是哨兵**的矩形在旧口径下会被
+    /// macOS 判成「不是整页」而 Windows/Linux 接受（三端语义分叉）。扩层 fail-closed 校验必须用
+    /// `covers_page`，否则未来整页构造方式一变就会只在 macOS 报 `AtlasGrowthIncomplete`。
+    #[test]
+    fn covers_page_accepts_a_page_sized_rect_without_the_full_sentinel() {
+        let page_sized = DirtyRects {
+            rects: vec![PhysicalRect::new(0, 0, 64, 64)],
+        };
+        assert!(
+            page_sized.covers_page(64),
+            "恰好覆盖整页的矩形必须算整页（与 Windows/Linux 的 covers_full_page 同义）"
+        );
+        assert!(
+            !page_sized.is_full(),
+            "它不是 FULL_RECT 哨兵 —— 这正是 macOS 旧口径会误判的原因"
+        );
+        assert!(DirtyRects::full().covers_page(64), "整页哨兵也算覆盖整页");
+        assert!(
+            DirtyRects::full().covers_page(2048),
+            "整页哨兵（i32::MAX 边）覆盖任意页尺寸"
+        );
+        assert!(
+            !page_sized.covers_page(128),
+            "64² 的矩形不覆盖 128² 页（按页尺寸判定，不是只看哨兵）"
+        );
     }
 }

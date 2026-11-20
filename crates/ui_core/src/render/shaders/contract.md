@@ -57,11 +57,12 @@
 | 保留          | 6–7   | —                                      | 应用自定义（v1 不做，F-29）                |
 
 `atlas_page`（`params1.y`）：**采样哪张图集由 `params1.z`（`kind`）决定，`.y` 只是该图集
-texture array 的层号（图集页索引）**。字形图集恒 1 层、页索引恒 `0`；图片图集是
-`MAX_IMAGE_PAGES = 4` 层的 texture array，页索引 `0..4` 由资源层的多页分配器
-（`render::atlas::ImageAtlasPager`）给出（D-9 多页图集 + LRU）。`MAX_IMAGE_PAGES` 只由三端
-后端用于分配数组与层号合法性断言，shader 不读上限（层号直接来自 `params1.y`）；
-对非图集 kind 写 `0` 并忽略。
+texture array 的层号（图集页索引）**。字形图集恒 1 层、页索引恒 `0`；图片图集的层数是**运行时
+值**：等于 App 当前打开的资源图集页数（`render::atlas::ImageAtlasPager::page_count`，上限
+`MAX_IMAGE_PAGES = 4`），页索引 `0..page_count` 由资源层的多页分配器给出（D-9 多页图集 + LRU）。
+数组按当前页数懒创建、**只增不减**（页数增长时按新层数重建数组 + App 全量重传每个已打开层；
+没有图片时是 1 层的 1×1 占位数组，不占 16 MiB）。`MAX_IMAGE_PAGES` 只是页号 / 待上传槽的上限，
+shader 不读任何上限（层号直接来自 `params1.y`）；对非图集 kind 写 `0` 并忽略。
 `gradient_kind`：`NONE = 0`、`HORIZONTAL = 1`、`VERTICAL = 2`、`RADIAL = 3`。
 `clip_depth`（`params1.w`）：链长，见 §1 硬约束 4。
 
@@ -242,13 +243,16 @@ API 的硬件实例基址语义**互不相同**：
 | `clips`（48 B 步进）      | SRV `t1`                              | `[[buffer(1)]]`                            | binding 1，std430                         |
 | `root`（112 B）           | root constants `b0`（28 DWORD）       | `[[buffer(2)]]`                            | push constants `[0, 112)`                 |
 | glyph 图集（R8，1 层 array） | SRV `t2`（`ViewDimension=TEXTURE2D_ARRAY`） | `[[texture(0)]]`（`texture2d_array<float>`） | binding 4（combined `sampler2DArray`） |
-| image 图集（BGRA8 sRGB，`MAX_IMAGE_PAGES` 层 array） | SRV `t3`（`ViewDimension=TEXTURE2D_ARRAY`） | `[[texture(1)]]`（`texture2d_array<float>`） | binding 5（combined `sampler2DArray`） |
+| image 图集（BGRA8 sRGB，`page_count` 层 array） | SRV `t3`（`ViewDimension=TEXTURE2D_ARRAY`） | `[[texture(1)]]`（`texture2d_array<float>`） | binding 5（combined `sampler2DArray`） |
 | sampler                   | static `s0`                           | `[[sampler(0)]]`                           | 同上                                      |
 
-图集是 **texture array**（D-9）：字形固定 1 层（恒采样 layer 0），图片固定 `MAX_IMAGE_PAGES = 4`
-层（layer = 图集页索引）。层号是**采样坐标**（`Texture2DArray.Sample` 的 z / `texture2d_array.sample`
-的 slice / GLSL `texture(sampler2DArray, vec3(uv, layer))`），不是 sampler/描述符索引 —— 因此三端
-都**不需要** bindless / descriptor indexing；描述符数组（bindless）与伪数组不参与本契约。
+图集是 **texture array**（D-9）：字形固定 1 层（恒采样 layer 0）；图片的层数 = App 当前打开的
+图集页数（`1..=MAX_IMAGE_PAGES`；没有图片时是 1 层的 1×1 占位数组），layer = 图集页索引。
+层数**只增不减**：页数增长时数组重建为更多层且 App 重传每个已打开层；缩容会让所有窗口已有
+`AtlasTile.page` 指向不存在的层，因此永不缩容。层号是**采样坐标**（`Texture2DArray.Sample` 的 z /
+`texture2d_array.sample` 的 slice / GLSL `texture(sampler2DArray, vec3(uv, layer))`），不是
+sampler/描述符索引 —— 因此三端都**不需要** bindless / descriptor indexing；描述符数组（bindless）
+与伪数组不参与本契约。
 
 采样器：`FILTER = LINEAR`、`ADDRESS = CLAMP_TO_EDGE`、无 mip（`LOD = 0`）、无比较、无各向异性。
 

@@ -30,13 +30,14 @@ use crate::{
 ///
 /// `pixels` 是 `rects` 顺序逐矩形紧密打包的字节（整页上传时就是整页），按**所有权**移动进待上传槽，
 /// 避免槽 → 纹理之间再复制一次（DEVIATIONS F-211）。`layer` 是图集 texture array 的层号
-/// （字形恒 0、图片 = 图集页索引），`extent` 是该层页边长。入队时同时记录**当前共享页**
-/// （`SharedGpu::atlas_page`），供录制前区分「App 换代的新页」与「已被别人换代的旧页」。
+/// （字形恒 0、图片 = 图集页索引），`spec` 是该 array 的规格（页边长 + 层数）。入队时同时记录
+/// **当前共享页**（`SharedGpu::atlas_page`），供录制前区分「App 换代的新页」与「已被别人换代的
+/// 旧页」；层数不需要记录入队值 —— 层数只增不减，超过当前层数就是扩层请求。
 pub(super) fn queue_atlas_upload(
     renderer: &mut GpuRenderer,
     kind: AtlasKind,
     layer: u16,
-    extent: u32,
+    spec: crate::render::AtlasArraySpec,
     pixels: Vec<u8>,
     rects: crate::render::atlas::DirtyRects,
 ) {
@@ -44,10 +45,10 @@ pub(super) fn queue_atlas_upload(
         renderer.swapchain.is_none() || on_gpu_thread(),
         "window atlas uploads may only be queued on the kytrix-d3d12 thread"
     );
-    let queued_extent = renderer.shared.atlas_page(kind);
+    let queued_page = renderer.shared.atlas_page(kind);
     renderer
         .atlas_uploads
-        .queue_upload(kind, layer, extent, queued_extent, pixels, rects);
+        .queue_upload(kind, layer, spec, queued_page, pixels, rects);
 }
 
 /// 消费者：`UploadArena::new`（`compositor.rs` 的薄委托）。

@@ -191,6 +191,25 @@ pub enum EngineError {
     #[error("atlas {kind:?} is exhausted: no free tile fits after a clear and rebuild")]
     AtlasExhausted { kind: AtlasKind },
 
+    /// 图集扩层违反 fail-closed 契约：请求把 texture array 扩到 `layers` 层，但第 `layer` 层
+    /// 没有整页上传（缺失或是增量矩形）。
+    ///
+    /// 扩层会重建整个数组（重建后的层内容未定义），因此只允许在「**每一层**的整页内容都已
+    /// 在同一次重传里入队」时发生（RBT-01 不变量 2）。这里是 release 也生效的最后防线
+    /// （不是 `debug_assert`）：出现即说明上层（`App::upload_image_page`）的记账被绕过，
+    /// 继续重建会让该帧采样到半成品层 —— 必须显式失败而不是画错内容。
+    #[error(
+        "atlas {kind:?} growth to {layers} layers rejected: layer {layer} has no full-page upload"
+    )]
+    AtlasGrowthIncomplete {
+        /// 哪个图集要扩层。
+        kind: AtlasKind,
+        /// 缺整页上传的层号。
+        layer: u16,
+        /// 请求的目标层数。
+        layers: u32,
+    },
+
     /// clip 链超过 `MAX_CLIP_DEPTH`（8 项，`paint/scene.rs`；三套 shader 的固定循环上限）。
     ///
     /// **编码期硬失败**：轴对齐矩形 clip 在编码期求交合并成一条表项（Skia `SkClipStack`
@@ -381,6 +400,11 @@ mod tests {
             },
             EngineError::AtlasExhausted {
                 kind: AtlasKind::Glyph,
+            },
+            EngineError::AtlasGrowthIncomplete {
+                kind: AtlasKind::Image,
+                layer: 1,
+                layers: 2,
             },
             EngineError::GeometryRegister {
                 detail: SmolStr::new_static("geometry id 0:0 has no GPU buffers"),

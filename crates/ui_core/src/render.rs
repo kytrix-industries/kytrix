@@ -45,7 +45,13 @@ pub(crate) mod macos;
 #[cfg(windows)]
 pub(crate) mod windows;
 
-pub(crate) use atlas::{Allocation, AtlasAllocator, DirtyRects, ImageAtlasPager, MIN_ATLAS_PAGE};
+pub(crate) use atlas::{
+    Allocation, AtlasAllocator, AtlasArraySpec, DirtyRects, ImageAtlasPager, MIN_ATLAS_PAGE,
+};
+/// 进程级图集重建请求：只有 Windows / Linux 的逐窗口上传器使用（macOS 每窗口一份数组，
+/// `prepare` 直接按 `AtlasArraySpec` 比对），因此按平台收口，避免其它平台的 dead_code。
+#[cfg(any(windows, target_os = "linux"))]
+pub(crate) use atlas::{AtlasPageRequest, merge_page_request};
 #[cfg(target_os = "linux")]
 pub(crate) use linux as backend;
 #[cfg(target_os = "macos")]

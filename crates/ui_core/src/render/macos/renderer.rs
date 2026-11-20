@@ -392,17 +392,17 @@ impl Renderer {
         &mut self,
         kind: AtlasKind,
         layer: u16,
-        extent: u32,
+        spec: crate::render::AtlasArraySpec,
         pixels: &[u8],
         rects: DirtyRects,
     ) -> bool {
         match &mut self.target {
             RenderTarget::Offscreen(gpu) => {
-                gpu.queue_atlas_upload(kind, layer, extent, pixels.to_vec(), rects);
+                gpu.queue_atlas_upload(kind, layer, spec, pixels.to_vec(), rects);
                 true
             }
             RenderTarget::Window(window) => {
-                window.queue_atlas_upload(kind, layer, extent, pixels, rects)
+                window.queue_atlas_upload(kind, layer, spec, pixels, rects)
             }
         }
     }
@@ -414,6 +414,14 @@ impl Renderer {
             RenderTarget::Offscreen(gpu) => !gpu.atlas_pending(kind),
             RenderTarget::Window(window) => window.atlas_idle(kind),
         }
+    }
+
+    /// 该窗口本轮是否参与渲染（扩层闸门只统计参与窗口，RBT-10）。
+    ///
+    /// 本端没有 Windows 那种「遮挡跳过发生在 `take_atlas` 之前」的 GPU 循环：只要提交了帧，
+    /// 图集上传就会在本窗口的录制里被消费，因此恒为参与。
+    pub(crate) fn atlas_participating(&self) -> bool {
+        true
     }
 
     /// 图层属性（`contentsScale` / `drawableSize`）的**唯一**写入口：只有主线程可调用（§5.3）。
@@ -777,11 +785,11 @@ impl WindowRenderer {
         &mut self,
         kind: AtlasKind,
         layer: u16,
-        extent: u32,
+        spec: crate::render::AtlasArraySpec,
         pixels: &[u8],
         rects: DirtyRects,
     ) -> bool {
-        self.shared.queue_atlas(kind, layer, extent, pixels, rects)
+        self.shared.queue_atlas(kind, layer, spec, pixels, rects)
     }
 
     fn atlas_idle(&self, kind: AtlasKind) -> bool {
@@ -1106,9 +1114,10 @@ struct Completion {
     buffer: SendCommandBuffer,
 }
 
-/// 图集上传槽：字形 1 层 + 图片 `MAX_IMAGE_PAGES` 层，**每层**只留最新一份（§4.2）。
+/// 图集上传槽：字形 1 层 + 图片 `MAX_IMAGE_PAGES` 层（页数上限），**每层**只留最新一份（§4.2）。
 ///
-/// D-9-c：一个窗口一帧内会**连续**入队图片图集的多个层（逐层整页 / 增量），因此槽位必须按层
+/// 数组的**当前**层数是运行时值（`AtlasArraySpec::layers`），槽位数组只按页数上限留位。
+/// 一个窗口一帧内会**连续**入队图片图集的多个层（逐层整页 / 增量），因此槽位必须按层
 /// 分开；`take` 一次性把本帧全部待上传层交给 GPU 线程（同一 command buffer 内聚合录制）。
 struct AtlasSlots {
     glyph: Option<AtlasUpload>,
@@ -1120,8 +1129,8 @@ struct AtlasUpload {
     kind: AtlasKind,
     /// texture array 层号（字形恒 0；图片 = 图集页索引）。
     layer: u16,
-    /// 该层的页边长（纹素；同一图集的所有层相同）。
-    extent: u32,
+    /// 该图集 array 的规格（页边长 + 层数；图片层数随打开的页数增长）。
+    spec: crate::render::AtlasArraySpec,
     pixels: Vec<u8>,
     rects: DirtyRects,
 }
@@ -1140,12 +1149,12 @@ impl AtlasSlots {
         &mut self,
         kind: AtlasKind,
         layer: u16,
-        extent: u32,
+        spec: crate::render::AtlasArraySpec,
         pixels: Vec<u8>,
         rects: DirtyRects,
     ) {
-        debug_assert!(
-            u32::from(layer) < kind.layers(),
+        assert!(
+            u32::from(layer) < spec.layers,
             "atlas layer {layer} out of range for {kind:?}"
         );
         let slot = match kind {
@@ -1159,7 +1168,7 @@ impl AtlasSlots {
         *slot = Some(AtlasUpload {
             kind,
             layer,
-            extent,
+            spec,
             pixels,
             rects,
         });
@@ -1293,13 +1302,13 @@ impl Shared {
         &self,
         kind: AtlasKind,
         layer: u16,
-        extent: u32,
+        spec: crate::render::AtlasArraySpec,
         pixels: &[u8],
         rects: DirtyRects,
     ) -> bool {
         let index = kind.index() as usize;
-        debug_assert!(
-            u32::from(layer) < kind.layers(),
+        assert!(
+            u32::from(layer) < spec.layers,
             "atlas layer {layer} out of range for {kind:?}"
         );
         let bit = 1u32 << u32::from(layer);
@@ -1313,7 +1322,7 @@ impl Shared {
             return false;
         }
         // 不唤醒：图集上传统一在「录制下一帧」之前落地（§4.2），单独唤醒只会空转。
-        state.atlas.queue(kind, layer, extent, pixels, rects);
+        state.atlas.queue(kind, layer, spec, pixels, rects);
         true
     }
 
@@ -1804,13 +1813,13 @@ fn frame_tick(
         renderer.set_background_color(linear);
     }
     // 图集像素在本帧录制前落地（上传先于绘制，§4.2；像素按所有权移交给 GPU）。
-    // D-9-c：图片图集是 texture array，一次 take 里可能有多个层（逐层上传），逐条录制。
+    // 图片图集是 texture array，一次 take 里可能有多个层（逐层上传），逐条录制。
     for upload in shared.take_atlas() {
         atlas_awaiting[upload.kind.index() as usize] = true;
         renderer.queue_atlas_upload(
             upload.kind,
             upload.layer,
-            upload.extent,
+            upload.spec,
             upload.pixels,
             upload.rects,
         );
@@ -1939,6 +1948,11 @@ mod tests {
         rects
     }
 
+    /// 图集 array 规格（测试页 + 层数）。
+    fn spec(page: u32, layers: u32) -> crate::render::AtlasArraySpec {
+        crate::render::AtlasArraySpec { page, layers }
+    }
+
     fn index(value: u32) -> FrameIndex {
         FrameIndex::from_raw(value)
     }
@@ -1957,21 +1971,33 @@ mod tests {
     #[test]
     fn a_first_atlas_upload_keeps_its_dirty_rects() {
         let mut slots = AtlasSlots::new();
-        slots.queue(AtlasKind::Glyph, 0, 64, vec![1, 2, 3], dirty_rects(4, 8));
-        slots.queue(AtlasKind::Image, 1, 2048, vec![4, 5], dirty_rects(0, 2));
+        slots.queue(
+            AtlasKind::Glyph,
+            0,
+            spec(64, 1),
+            vec![1, 2, 3],
+            dirty_rects(4, 8),
+        );
+        slots.queue(
+            AtlasKind::Image,
+            1,
+            spec(2048, 2),
+            vec![4, 5],
+            dirty_rects(0, 2),
+        );
         let uploads = slots.take();
         assert_eq!(uploads.len(), 2, "字形 + 图片第 1 层");
         // `take` 的顺序固定：字形在前、图片按层号升序。
         let glyph = &uploads[0];
         assert_eq!(glyph.kind, AtlasKind::Glyph);
         assert_eq!(glyph.layer, 0);
-        assert_eq!(glyph.extent, 64);
+        assert_eq!(glyph.spec, spec(64, 1));
         assert_eq!(glyph.pixels, vec![1, 2, 3]);
         assert_eq!(glyph.rects, dirty_rects(4, 8));
         let image = &uploads[1];
         assert_eq!(image.kind, AtlasKind::Image);
         assert_eq!(image.layer, 1);
-        assert_eq!(image.extent, 2048);
+        assert_eq!(image.spec, spec(2048, 2));
         assert_eq!(image.pixels, vec![4, 5]);
         assert_eq!(image.rects, dirty_rects(0, 2));
         assert!(slots.take().is_empty(), "取走后槽位为空");
@@ -1985,7 +2011,7 @@ mod tests {
             slots.queue(
                 AtlasKind::Image,
                 layer,
-                2048,
+                spec(2048, 4),
                 vec![layer as u8],
                 dirty_rects(0, 1),
             );
@@ -2007,8 +2033,20 @@ mod tests {
     fn queueing_into_a_busy_atlas_slot_is_a_contract_violation() {
         // UI 线程用 `atlas_idle` 门控入队；覆盖未消费的上传会丢行，因此这里是硬失败。
         let mut slots = AtlasSlots::new();
-        slots.queue(AtlasKind::Glyph, 0, 64, vec![1, 2, 3], dirty_rects(4, 8));
-        slots.queue(AtlasKind::Glyph, 0, 64, vec![9, 9, 9], dirty_rects(16, 20));
+        slots.queue(
+            AtlasKind::Glyph,
+            0,
+            spec(64, 1),
+            vec![1, 2, 3],
+            dirty_rects(4, 8),
+        );
+        slots.queue(
+            AtlasKind::Glyph,
+            0,
+            spec(64, 1),
+            vec![9, 9, 9],
+            dirty_rects(16, 20),
+        );
     }
 
     /// `atlas_pending` 只能在**录制完成**后清：`take_atlas` 只把上传搬给 GPU 线程，清早了
@@ -2017,7 +2055,13 @@ mod tests {
     fn an_atlas_upload_stays_busy_until_it_is_recorded() {
         let shared = Shared::new(Arc::new(InFlight::new()));
         assert!(shared.atlas_idle(AtlasKind::Glyph));
-        assert!(shared.queue_atlas(AtlasKind::Glyph, 0, 64, &[1, 2, 3], dirty_rects(4, 8)));
+        assert!(shared.queue_atlas(
+            AtlasKind::Glyph,
+            0,
+            spec(64, 1),
+            &[1, 2, 3],
+            dirty_rects(4, 8)
+        ));
 
         let uploads = shared.take_atlas();
         assert_eq!(uploads.len(), 1);
@@ -2043,7 +2087,7 @@ mod tests {
             assert!(shared.queue_atlas(
                 AtlasKind::Image,
                 layer,
-                2048,
+                spec(2048, 4),
                 &[layer as u8; 4],
                 dirty_rects(0, 1)
             ));

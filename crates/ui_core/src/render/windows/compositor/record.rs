@@ -42,7 +42,7 @@ use crate::{
         timer::{FrameTimings, GpuTimerSample, Section},
         uniform::{ROOT_UNIFORM_DWORDS, RootUniform},
         windows::{
-            device::AtlasRebuildOutcome,
+            device::{AtlasRebuildOutcome, SharedGpu},
             diagnostics,
             hresult::PresentOutcome,
             pipeline::{GeometryRegistry, Pipeline, SrvHeap},
@@ -191,20 +191,26 @@ pub(super) fn submit_recorded(
         if let Some(error) = shared.lost_error() {
             return Err(error);
         }
-        // 图集读锁：持有到本帧提交完成（页重建是写锁，会等这里释放）。
-        let atlas = shared.atlas();
-        // 待上传页 ≠ 共享页 ⇒ 先落地页换代：全页上传触发重建，过期增量直接丢弃。
-        let rebuild = renderer
-            .atlas_uploads
-            .reconcile_pages([atlas.page(AtlasKind::Glyph), atlas.page(AtlasKind::Image)]);
+        // 先对齐 array 规格：待上传页与共享页不一致 ⇒ 落地换代 / 扩层。`reconcile_pages` 在
+        // release 也拒绝「扩层但某层没有整页上传」的请求（RBT-01 不变量 2）。
+        let rebuild = {
+            let atlas = shared.atlas();
+            renderer
+                .atlas_uploads
+                .reconcile_pages([atlas.spec(AtlasKind::Glyph), atlas.spec(AtlasKind::Image)])?
+        };
         if !rebuild.is_empty() {
-            drop(atlas);
+            // RBT-01 跨窗口 fail-closed：重建 + 本窗口整组上传 + draw + 提交必须在**同一个**
+            // 图集写锁临界区里完成。否则「数组已换、新数组内容还没拷」的空档里，别的窗口可能
+            // 拿新数组录制一帧并采样到未定义层（进程级共享数组）。
+            let mut atlas = shared.atlas_write();
             match shared
-                .rebuild_atlas_pages(&rebuild)
+                .rebuild_atlas_pages_locked(&mut atlas, &rebuild)
                 .map_err(|error| renderer.classify(error))?
             {
                 AtlasRebuildOutcome::Applied => {}
                 AtlasRebuildOutcome::Deferred => {
+                    drop(atlas);
                     let deadline = *defer_deadline
                         .get_or_insert_with(|| Instant::now() + ATLAS_REBUILD_DEFER_LIMIT);
                     if Instant::now() >= deadline {
@@ -215,61 +221,102 @@ pub(super) fn submit_recorded(
                         });
                     }
                     std::thread::sleep(ATLAS_REBUILD_DEFER_RETRY);
+                    continue;
                 }
             }
-            continue;
+            return record_and_submit(
+                renderer,
+                &shared,
+                &atlas,
+                slot,
+                payload,
+                frame,
+                timings,
+                frame_started,
+            );
         }
-        // staging 对齐到共享页（第一次上传 / 页换代之后整组重建本窗口的 staging）。
-        // 被换下来的旧 staging 句柄必须走 retire（R08-2：D3D12 不替应用保活命令列表引用）。
-        let mut staging_retired: Vec<GpuResourceHandle> = Vec::new();
-        renderer
-            .atlas_uploads
-            .sync_staging(&shared, &atlas, &mut staging_retired)
-            .map_err(|error| renderer.classify(error))?;
+        // 图集读锁：持有到本帧提交完成（页重建是写锁，会等这里释放）。
+        let atlas = shared.atlas();
+        return record_and_submit(
+            renderer,
+            &shared,
+            &atlas,
+            slot,
+            payload,
+            frame,
+            timings,
+            frame_started,
+        );
+    }
+}
 
-        renderer
-            .stream
-            .reset_slot(slot)
-            .map_err(|error| renderer.classify(error))?;
-
-        let recorded = {
-            let swapchain = renderer.swapchain.as_ref();
-            let mut recorder = FrameRecorder {
-                shared: &shared,
-                stream: &mut renderer.stream,
-                pipeline: shared.pipeline(),
-                descriptors: &renderer.descriptors,
-                atlas: &atlas,
-                atlas_uploads: &mut renderer.atlas_uploads,
-                persist: &renderer.persist,
-                upload: &mut renderer.upload,
-                geometry_upload: &mut renderer.geometry_upload,
-                mirror: &mut renderer.mirror,
-                geometry: &mut renderer.geometry,
-                timer: renderer.timer.as_ref(),
-                swapchain,
-                clear_color: renderer.clear_color,
-                content: renderer.surface,
-                scale: renderer.scale,
-                target: &mut renderer.target,
-                syncs: &mut renderer.buffer_syncs,
-                buckets: &mut renderer.op_buckets,
-                prime: false,
-            };
-            recorder.record(slot, payload, frame, timings, frame_started)
-        }
+/// 在已持有的图集锁（读锁或写锁）下录制并提交一帧。
+///
+/// 写锁路径只出现在「本帧触发重建」时：调用方（[`submit_recorded`]）在写锁里先落地重建，再用
+/// 本函数把**本窗口的整组上传**（`sync_staging` + `record` 里的 `record_uploads`）与 draw 一起
+/// 录进同一个命令列表并提交 —— 于是新数组的内容在本帧提交时已经完整，写锁释放后别的窗口看到
+/// 的一定是有内容的新数组。
+fn record_and_submit(
+    renderer: &mut GpuRenderer,
+    shared: &Arc<SharedGpu>,
+    atlas: &crate::render::windows::atlas::SharedAtlas,
+    slot: FrameSlot,
+    payload: &FramePayload,
+    frame: &mut FramePlan,
+    timings: &mut FrameTimings,
+    frame_started: Instant,
+) -> Result<(RecordedFrame, FrameSlot), EngineError> {
+    let shared_gpu = shared.as_ref();
+    // staging 对齐到共享页（第一次上传 / 页换代之后整组重建本窗口的 staging）。
+    // 被换下来的旧 staging 句柄必须走 retire（R08-2：D3D12 不替应用保活命令列表引用）。
+    let mut staging_retired: Vec<GpuResourceHandle> = Vec::new();
+    renderer
+        .atlas_uploads
+        .sync_staging(shared_gpu, atlas, &mut staging_retired)
         .map_err(|error| renderer.classify(error))?;
 
-        renderer
-            .stream
-            .submit(slot)
-            .map_err(|error| renderer.classify(error))?;
-        renderer.last_sequence = slot.signal_value;
-        for handle in staging_retired {
-            renderer.stream.retire(slot.signal_value, handle);
-        }
-        return Ok((recorded, slot));
+    renderer
+        .stream
+        .reset_slot(slot)
+        .map_err(|error| renderer.classify(error))?;
+
+    let recorded = {
+        let swapchain = renderer.swapchain.as_ref();
+        let mut recorder = FrameRecorder {
+            shared: shared_gpu,
+            stream: &mut renderer.stream,
+            pipeline: shared_gpu.pipeline(),
+            descriptors: &renderer.descriptors,
+            atlas,
+            atlas_uploads: &mut renderer.atlas_uploads,
+            persist: &renderer.persist,
+            upload: &mut renderer.upload,
+            geometry_upload: &mut renderer.geometry_upload,
+            mirror: &mut renderer.mirror,
+            geometry: &mut renderer.geometry,
+            timer: renderer.timer.as_ref(),
+            swapchain,
+            clear_color: renderer.clear_color,
+            content: renderer.surface,
+            scale: renderer.scale,
+            target: &mut renderer.target,
+            syncs: &mut renderer.buffer_syncs,
+            buckets: &mut renderer.op_buckets,
+            prime: false,
+        };
+        recorder.record(slot, payload, frame, timings, frame_started)
     }
+    .map_err(|error| renderer.classify(error))?;
+
+    renderer
+        .stream
+        .submit(slot)
+        .map_err(|error| renderer.classify(error))?;
+    renderer.last_sequence = slot.signal_value;
+    for handle in staging_retired {
+        renderer.stream.retire(slot.signal_value, handle);
+    }
+    Ok((recorded, slot))
 }
 
 /// 消费者：`FrameRecorder::record`（`compositor.rs` 的薄委托）。

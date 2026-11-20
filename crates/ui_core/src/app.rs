@@ -141,6 +141,20 @@ pub struct App {
     ///
     /// 页尺寸变化时缓冲必须**清零重建**：旧页的行宽不同，残留字节会被当成新页内容上传。
     glyph_page_extent: Option<u32>,
+    /// 图片图集 texture array 的**已建立**规格（`None` = 三端仍是 1×1 占位数组）。
+    ///
+    /// 「已建立」= 至少有一个窗口的渲染器已按该规格**整组入队**过（每层都是整页上传）。
+    /// 它是 fail-closed 的增长闸门（RBT-01 不变量 2）：层数提升只有在**所有带渲染器的窗口**
+    /// 本帧都能整组入队时才发生；否则这一帧不扩（旧 spec 的层内容仍然有效），下一帧重试。
+    /// 设备侧的 `AtlasUploads::reconcile_pages` / `AtlasTextures::prepare` 会在 release 也
+    /// 拒绝「有层没有整页上传」的重建请求（`EngineError::AtlasGrowthIncomplete`）。
+    image_array_established: Option<crate::render::AtlasArraySpec>,
+    /// 扩层闸门连续被「有窗口的共享槽不空闲」挡住的帧数（RBT-10 的有界兜底计数）。
+    ///
+    /// 正常窗口的忙槽只持续 1–2 帧；达到 `text_pass::IMAGE_GROWTH_DEFER_LIMIT` 仍被挡 ⇒ 该
+    /// 窗口的 GPU 循环已经不消费上传（遮挡 / 最小化 / 卡死），本帧把忙窗口按「不参与闸门」
+    /// 处理（记账作废、可画层 0），只用参与且空闲的窗口推进数组。
+    image_growth_deferrals: u32,
     /// 字形页的整页 CPU 缓冲（跨上传复用，避免每次上传都分配）。
     glyph_page: Vec<u8>,
     /// 增量上传的打包缓冲（脏矩形逐个紧密排列；跨帧复用，避免每次上传都分配）。
@@ -430,6 +444,8 @@ impl App {
             atlas_generation_seen: 0,
             pending_dirty: crate::render::DirtyRects::default(),
             glyph_page_extent: None,
+            image_array_established: None,
+            image_growth_deferrals: 0,
             glyph_page: Vec::new(),
             packed: Vec::new(),
             dispatcher,
@@ -569,7 +585,7 @@ impl App {
     }
 
     /// 图片图集分发：懒分配（没插过图片就没有页）+ 逐层整页 / 按脏矩形（AOI）增量
-    /// （DEVIATIONS F-211 / R06-3；D-9-c 起图片图集是 4 层 texture array，layer = 页号）。
+    /// （DEVIATIONS F-211 / R06-3；图片图集的 texture array 层数 = 当前打开的页数，layer = 页号）。
     fn upload_image_page(&mut self) {
         text_pass::upload_image_page(self)
     }

@@ -32,7 +32,8 @@ use std::{
     ffi::c_void,
     path::PathBuf,
     sync::{
-        Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, Weak,
+        Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        Weak,
         atomic::{AtomicU8, AtomicU32, Ordering},
     },
     time::{Duration, Instant},
@@ -68,6 +69,7 @@ use crate::{
     error::EngineError,
     paint::atlas::AtlasKind,
     render::{
+        AtlasArraySpec, AtlasPageRequest,
         atlas::{AtlasRebuilt, texel_bytes},
         retire::GpuResourceHandle,
         windows::pipeline::{ATLAS_GENERATIONS, DescriptorArena, MAX_WINDOWS, Pipeline, SrvHeap},
@@ -591,7 +593,13 @@ impl SharedGpu {
         // C3：两代描述符组都指向当前占位纹理（真正换代时只写未在用的那一代）。
         for generation in 0..ATLAS_GENERATIONS {
             for kind in [AtlasKind::Glyph, AtlasKind::Image] {
-                srv_heap.write_atlas(device.raw(), generation, kind, atlas.texture(kind));
+                srv_heap.write_atlas(
+                    device.raw(),
+                    generation,
+                    kind,
+                    atlas.texture(kind),
+                    atlas.layers(kind),
+                );
             }
         }
         // 能力快照是进程级共享事实：启动时记录一行（诊断 / A-B 对照；P3-1 的 review 建议）。
@@ -661,6 +669,12 @@ impl SharedGpu {
     /// 图集读锁：持有期间页不会变（录制 + 提交一帧的整个区间）。
     pub(crate) fn atlas(&self) -> RwLockReadGuard<'_, SharedAtlas> {
         self.atlas.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 图集写锁：重建的唯一入口（正常重建走 [SharedGpu::rebuild_atlas_pages]；录制路径需要
+    /// 「重建 + 整组上传 + draw + 提交」在同一临界区里完成时用它，见 compositor::record）。
+    pub(crate) fn atlas_write(&self) -> RwLockWriteGuard<'_, SharedAtlas> {
+        self.atlas.write().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// 共享图集当前页尺寸的无锁快照（上传入队时记录「入队页」，见 `AtlasUploads`）。
@@ -762,10 +776,10 @@ impl SharedGpu {
         self.device_lock().live_resources()
     }
 
-    /// 把一个或多个图集页重建到指定页尺寸（C3：双代描述符组）。
+    /// 把一个或多个图集 array 重建到指定规格（页边长 + 层数；C3：双代描述符组）。
     ///
     /// 契约：
-    /// 1. 写锁内重新检查（排队期间别的窗口可能已经建好同一页）；
+    /// 1. 写锁内重新检查（排队期间别的窗口可能已经建好同一 array）；
     /// 2. 只把新 SRV 写进**没有在飞引用**的那一代 —— 目标代是否空闲由各窗口登记的代际弃用
     ///    水位**非阻塞**判定；不空闲返回 [`AtlasRebuildOutcome::Deferred`]，此时**什么都没改**
     ///    （不换纹理、不写描述符、不翻转代际），调用方短暂退避后重试；
@@ -773,18 +787,48 @@ impl SharedGpu {
     ///    挂进当前代的回收表 → 写目标代描述符 → 登记当前代的弃用水位 → 翻转
     ///    `atlas_generation`。全部发生在图集写锁内（录制方持读锁，不会看到中间态）。
     ///
-    /// 页重建是**进程级事件**：只有第一个看到「App 换代的新页」的窗口会真正重建（窗口侧的
+    /// 重建是**进程级事件**：只有第一个看到「App 换代的页 / 新层数」的窗口会真正重建（窗口侧的
     /// `AtlasUploads::reconcile_pages` 已经把「别的窗口换代之后留下的旧页上传」丢弃），其余
-    /// 窗口在写锁释放后发现页已对齐，直接录制自己的上传。
+    /// 窗口在写锁释放后发现 array 已对齐，直接录制自己的上传。
+    ///
+    /// **层数增长**：新数组的旧层内容由 App 在扩层帧的整层重传补齐（每个已打开的页都整页上传，
+    /// 见 `AtlasUploads::reconcile_pages` 的层数分支）—— 增长不会丢已上传的图。层数只增不减：
+    /// 请求里的层数与当前层数取最大，缩容会让所有窗口的 `AtlasTile.page` 失效。
+    /// 仅测试便捷入口（拿写锁 + 落地重建）。生产路径是录制线程在**已持有写锁**的临界区里调
+    /// [`SharedGpu::rebuild_atlas_pages_locked`]（重建 + 整组上传 + draw + 提交一次完成）。
+    #[cfg(test)]
     pub(crate) fn rebuild_atlas_pages(
         &self,
-        requests: &[(AtlasKind, u32)],
+        requests: &[AtlasPageRequest],
     ) -> Result<AtlasRebuildOutcome, EngineError> {
-        let mut atlas = self.atlas.write().unwrap_or_else(PoisonError::into_inner);
-        let pending: Vec<(AtlasKind, u32)> = requests
+        let mut atlas = self.atlas_write();
+        self.rebuild_atlas_pages_locked(&mut atlas, requests)
+    }
+
+    /// 重建的锁内实现：调用方必须已经持有 [SharedGpu::atlas_write] 的写锁。
+    ///
+    /// 录制路径（compositor::record）用它在**同一个写锁临界区**里完成「重建 → 本窗口整组
+    /// 上传 → draw → 提交」：这样新数组的内容在写锁释放前就已经全部进命令列表，别的窗口
+    /// 不可能在「数组已换、内容还没拷」的空档里录制一帧（RBT-01 的跨窗口半成品窗口）。
+    pub(crate) fn rebuild_atlas_pages_locked(
+        &self,
+        atlas: &mut SharedAtlas,
+        requests: &[AtlasPageRequest],
+    ) -> Result<AtlasRebuildOutcome, EngineError> {
+        let pending: Vec<AtlasPageRequest> = requests
             .iter()
-            .copied()
-            .filter(|(kind, page)| atlas.page(*kind) != *page)
+            .filter(|request| atlas.spec(request.kind) != request.spec)
+            .map(|request| {
+                // 层数只增不减：旧 array 层数更多时（不可能由 App 产生）保留更多的一边。
+                let current = atlas.spec(request.kind);
+                AtlasPageRequest {
+                    kind: request.kind,
+                    spec: AtlasArraySpec {
+                        page: request.spec.page,
+                        layers: request.spec.layers.max(current.layers),
+                    },
+                }
+            })
             .collect();
         if pending.is_empty() {
             return Ok(AtlasRebuildOutcome::Applied);
@@ -805,13 +849,19 @@ impl SharedGpu {
         switch.retired_textures[target as usize].clear();
         // 3) 创建新纹理；被换下来的当前代纹理仍可能被在飞帧采样 ⇒ 按当前代挂进回收表。
         let mut rebuilt = AtlasRebuilt::default();
-        for (kind, page) in pending {
-            let old = atlas.recreate(self.raw(), kind, page)?;
+        for request in pending {
+            let old = atlas.recreate(self.raw(), request.kind, request.spec)?;
             switch.retired_textures[active as usize].push(old);
-            self.srv_heap
-                .write_atlas(self.raw(), target, kind, atlas.texture(kind));
-            self.atlas_pages[kind.index() as usize].store(page, Ordering::Release);
-            rebuilt.mark(kind);
+            self.srv_heap.write_atlas(
+                self.raw(),
+                target,
+                request.kind,
+                atlas.texture(request.kind),
+                atlas.layers(request.kind),
+            );
+            self.atlas_pages[request.kind.index() as usize]
+                .store(request.spec.page, Ordering::Release);
+            rebuilt.mark(request.kind);
         }
         debug_assert!(
             rebuilt.glyph || rebuilt.image,
@@ -827,8 +877,9 @@ impl SharedGpu {
     /// 设备恢复后按 CPU 影子页重传图集（R08-4）。
     ///
     /// 影子页是录制期从同一份上传字节落下来的（`SharedAtlas::update_shadow`），因此恢复后的
-    /// 图集内容与被移除设备上的一致。图片图集是 texture array：按层重传，从未上传过的层
-    /// （影子为 `None`）保持未定义 —— 那里没有 tile 会采样到它，下一次整层上传会补上。
+    /// 图集内容与被移除设备上的一致。图片图集是 texture array：按层重传，层数取影子自己的
+    /// 长度（= 被移除设备上数组的层数）；从未上传过的层（影子为 `None`）保持未定义 ——
+    /// 那里没有 tile 会采样到它，下一次整层上传会补上。
     fn restore_atlas(
         &self,
         snapshot: &[Option<crate::render::windows::atlas::ShadowAtlasSnapshot>; 2],
@@ -843,20 +894,30 @@ impl SharedGpu {
             if page <= 1 {
                 continue;
             }
+            let layers =
+                u32::try_from(snapshot.layers().len()).expect("atlas shadow layer count fits u32");
+            if layers == 0 {
+                continue;
+            }
             let row_bytes = page as usize * texel_bytes(kind) as usize;
-            if snapshot.layers().len() != kind.layers() as usize
-                || snapshot
-                    .layers()
-                    .iter()
-                    .flatten()
-                    .any(|pixels| pixels.len() != row_bytes * page as usize)
+            if snapshot
+                .layers()
+                .iter()
+                .flatten()
+                .any(|pixels| pixels.len() != row_bytes * page as usize)
             {
                 continue;
             }
-            atlas.recreate(self.raw(), kind, page)?;
+            let spec = crate::render::AtlasArraySpec { page, layers };
+            atlas.recreate(self.raw(), kind, spec)?;
             for generation in 0..ATLAS_GENERATIONS {
-                self.srv_heap
-                    .write_atlas(self.raw(), generation, kind, atlas.texture(kind));
+                self.srv_heap.write_atlas(
+                    self.raw(),
+                    generation,
+                    kind,
+                    atlas.texture(kind),
+                    atlas.layers(kind),
+                );
             }
             self.atlas_pages[index].store(page, Ordering::Release);
             let texture = atlas.texture(kind).clone();
@@ -1360,7 +1421,19 @@ mod tests {
     };
 
     use super::{AtlasRebuildOutcome, Device, SharedGpu};
-    use crate::{error::EngineError, paint::atlas::AtlasKind};
+    use crate::{
+        error::EngineError,
+        paint::atlas::AtlasKind,
+        render::{AtlasArraySpec, AtlasPageRequest},
+    };
+
+    /// 字形 array 的重建请求（1 层）。
+    fn glyph_request(page: u32) -> AtlasPageRequest {
+        AtlasPageRequest {
+            kind: AtlasKind::Glyph,
+            spec: AtlasArraySpec { page, layers: 1 },
+        }
+    }
 
     fn debug_texture(device: &Device) -> Result<ID3D12Resource, EngineError> {
         let desc = D3D12_RESOURCE_DESC {
@@ -1437,7 +1510,7 @@ mod tests {
         assert_eq!(shared.atlas_generation(), 0);
         assert_eq!(
             shared
-                .rebuild_atlas_pages(&[(AtlasKind::Glyph, 64)])
+                .rebuild_atlas_pages(&[glyph_request(64)])
                 .expect("rebuild"),
             AtlasRebuildOutcome::Applied
         );
@@ -1452,7 +1525,7 @@ mod tests {
         // 同一页重复请求是 no-op：不换代（其余窗口在写锁释放后不必再重建）。
         assert_eq!(
             shared
-                .rebuild_atlas_pages(&[(AtlasKind::Glyph, 64)])
+                .rebuild_atlas_pages(&[glyph_request(64)])
                 .expect("no-op rebuild"),
             AtlasRebuildOutcome::Applied
         );
@@ -1462,7 +1535,7 @@ mod tests {
         // 第二次真正换代回到代 0（没有窗口登记水位 ⇒ 代 1 已空闲、可立即复用）。
         assert_eq!(
             shared
-                .rebuild_atlas_pages(&[(AtlasKind::Glyph, 128)])
+                .rebuild_atlas_pages(&[glyph_request(128)])
                 .expect("rebuild"),
             AtlasRebuildOutcome::Applied
         );
@@ -1485,7 +1558,7 @@ mod tests {
 
         assert_eq!(
             shared
-                .rebuild_atlas_pages(&[(AtlasKind::Glyph, 64)])
+                .rebuild_atlas_pages(&[glyph_request(64)])
                 .expect("deferred rebuild"),
             AtlasRebuildOutcome::Deferred
         );
@@ -1501,7 +1574,7 @@ mod tests {
         assert!(watermark.generation_idle(1));
         assert_eq!(
             shared
-                .rebuild_atlas_pages(&[(AtlasKind::Glyph, 64)])
+                .rebuild_atlas_pages(&[glyph_request(64)])
                 .expect("rebuild"),
             AtlasRebuildOutcome::Applied
         );
@@ -1533,7 +1606,7 @@ mod tests {
 
         assert_eq!(
             shared
-                .rebuild_atlas_pages(&[(AtlasKind::Glyph, 64)])
+                .rebuild_atlas_pages(&[glyph_request(64)])
                 .expect("first rebuild"),
             AtlasRebuildOutcome::Applied
         );
@@ -1551,7 +1624,7 @@ mod tests {
         // 第二次换代目标回到代 0：其弃用水位（7）尚未完成 ⇒ 只能 Deferred。
         assert_eq!(
             shared
-                .rebuild_atlas_pages(&[(AtlasKind::Glyph, 128)])
+                .rebuild_atlas_pages(&[glyph_request(128)])
                 .expect("second rebuild"),
             AtlasRebuildOutcome::Deferred
         );
@@ -1571,7 +1644,7 @@ mod tests {
         assert!(watermark.generation_idle(0), "fence 完成后代 0 才空闲");
         assert_eq!(
             shared
-                .rebuild_atlas_pages(&[(AtlasKind::Glyph, 128)])
+                .rebuild_atlas_pages(&[glyph_request(128)])
                 .expect("third rebuild"),
             AtlasRebuildOutcome::Applied
         );

@@ -316,19 +316,26 @@ pub(crate) fn frame(
     // 立刻再要一帧（全量 damage），槽空后把内容补发——否则静态窗口会把缺字的画面一直
     // 留着。槽长期不空（GPU 卡住 / 窗口不再出帧）时最多补 `MAX_ATLAS_FOLLOWUPS` 帧，不空转。
     let glyph_extent = app.atlas.page().0;
-    // 图片图集是多页 texture array（D-9-c）：除 extent 之外，每层是否已整层初始化也必须对齐，
-    // 否则新页 / 新窗口会采样到未定义层（表现为整块花图而不是「旧图集」）。
+    // 图片图集是多页 texture array（D-9-c）：除页边长之外，**层数**（= 当前打开的页数）与每层
+    // 是否已整层初始化也必须对齐，否则新页 / 新窗口 / 层数增长后的数组会采样到未定义层
+    // （表现为整块花图而不是「旧图集」）。
     let image_pages = app.resources.page_count();
-    let image_extent = (image_pages > 0).then(|| app.resources.page_extent());
-    let image_layers = image_pages as u16;
+    let image_spec = (image_pages > 0).then(|| crate::render::AtlasArraySpec {
+        page: app.resources.page_extent(),
+        layers: u32::try_from(image_pages).expect("image atlas page count fits u32"),
+    });
+    let glyph_spec = crate::render::AtlasArraySpec {
+        page: glyph_extent,
+        layers: 1,
+    };
     let deferred = app.windows.get(&window).is_some_and(|target| {
         use crate::paint::atlas::AtlasKind;
         target.has_renderer()
             && (target.atlas_rects_pending()
-                || !target.atlas_page_matches(AtlasKind::Glyph, glyph_extent)
-                || image_extent.is_some_and(|extent| {
-                    !target.atlas_page_matches(AtlasKind::Image, extent)
-                        || (0..image_layers).any(|layer| !target.image_layer_received(layer))
+                || !target.atlas_page_matches(AtlasKind::Glyph, glyph_spec)
+                || image_spec.is_some_and(|spec| {
+                    !target.atlas_page_matches(AtlasKind::Image, spec)
+                        || (0..spec.layers as u16).any(|layer| !target.image_layer_received(layer))
                 }))
     });
     if deferred {

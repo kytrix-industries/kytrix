@@ -67,7 +67,7 @@ struct GpuPrimitive {
 StructuredBuffer<GpuPrimitive> instances : register(t0);
 StructuredBuffer<ClipEntry> clips : register(t1);
 
-// 图集是 texture array（D-9）：字形恒 1 层、图片 MAX_IMAGE_PAGES 层；采样层号由
+// 图集是 texture array（D-9）：字形恒 1 层；图片层数 = 当前打开的图集页数（运行时值，只增不减）；采样层号由
 // `params1.y`（图集页索引）给出，字形恒 0。见 contract.md §7/§8。
 Texture2DArray<float>  glyph_atlas : register(t2);
 Texture2DArray<float4> image_atlas : register(t3);
