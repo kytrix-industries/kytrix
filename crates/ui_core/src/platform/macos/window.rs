@@ -866,10 +866,15 @@ impl NativeWindow {
     /// `App::ime_enabled`，B6）。
     ///
     /// 与 Windows 的 `NativeWindow::sync_ime_enabled` 同构：每轮对账「目标状态 vs 已应用
-    /// 状态」，只在变化时执行平台动作。禁用 ⇒ AppKit 丢弃转换会话 + 清引擎组合态（有组合
-    /// 时补 `ImeEvent::End`，经 `App::dispatch` 立刻交付）+ 清 App 侧 caret hint；启用 ⇒
+    /// 状态」，只在变化时执行平台动作。禁用 ⇒ AppKit 丢弃转换会话 + 清引擎组合态（欠一条
+    /// 收尾时补 `ImeEvent::End`，经 `App::dispatch` 立刻交付）+ 清 App 侧 caret hint；启用 ⇒
     /// 下一次按键自然取回 super 的上下文，并清 `ime_area` 缓存让 hint 重发（恢复的上下文
     /// 不保证还留着旧的候选窗/组合窗表单）。
+    ///
+    /// 「恰好一条 `End`」由 `GuiView::reset_ime_composition` 的**回调记账**给出（RB-09），
+    /// 不由 `hasMarkedText` 推断：`discardMarkedText` 可能走 `unmarkText:`（回调自己投递
+    /// `End`）、`setMarkedText:@""`（补一条）、异步 `unmarkText:`（补一条后吞掉迟到的回调）
+    /// 或 `insertText:`（`Commit` 收尾、不补）。
     ///
     /// 清 caret hint 走 `App::clear_ime_cursor_area`（公共入口，会 `dispatcher.wake()`）。
     /// 启停是**边沿事件**（不是每帧动作），因此这里多出的一轮空泵可忽略；不在
@@ -896,9 +901,10 @@ impl NativeWindow {
 
     /// 窗口失焦的 IME 清场（B9 mac 部分；泵每轮在 `sync_state` 之后调用）。
     ///
-    /// 用户裁决的统一清场路径：**清 caret hint → 重置组合状态 → 补 `End`**。AppKit 在窗口
-    /// resign key 时通常自己会取消转换会话（走 `unmarkText:`，那条回调已经交付过 `End`），
-    /// 这里兜底「没有取消」的输入法；两种情况都做到 `End` 恰好一条。
+    /// 用户裁决的统一清场路径：**清 caret hint → 重置组合状态 → 按记账补 `End`**。AppKit 在
+    /// 窗口 resign key 时通常自己会取消转换会话（走 `unmarkText:`，那条回调已经交付过
+    /// `End`），这里兜底「没有取消」的输入法；两种形态都由 `ImeState` 的收尾记账保证
+    /// `End` 恰好一条（RB-09：不再用 `hasMarkedText` 推断 —— 回调形态不同会得到 0 或 2 条）。
     ///
     /// 不引入嵌套 runloop：全部在泵里同步完成（view 回调纪律不变 —— 回调只置位/唤醒）。
     pub(crate) fn handle_focus_lost(&mut self, app: &mut App) {

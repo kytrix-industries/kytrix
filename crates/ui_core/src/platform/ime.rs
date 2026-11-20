@@ -266,6 +266,56 @@ pub(crate) const fn key_visible(
     command_modifiers || (!ime_consumed && !composing)
 }
 
+/// IME 组合「恰好一条 `End`」的显式记账（RB-09）。
+///
+/// # 为什么不能用 `hasMarkedText` 推断
+///
+/// 清场路径（禁用 IME / 窗口失焦）调用 `NSTextInputContext.discardMarkedText` 让 AppKit 丢弃
+/// 转换会话，但 AppKit **没有承诺**它会回调哪个 `NSTextInputClient` 方法：
+///
+/// | `discardMarkedText` 的回调形态 | 修复前按 `hasMarkedText` 推断的后果 |
+/// |---|---|
+/// | 同步 `unmarkText:`（回调自己投递 `End`） | 0 条补充 → 恰好一条（唯一侥幸成立的形态） |
+/// | `setMarkedText:@""`（清空组合串、不投 `End`） | 推断为「已结束」→ **0 条 `End`**（preedit 残留） |
+/// | 异步 `unmarkText:`（返回后才回调） | 推断为「仍在组合」→ 补一条 + 回调一条 = **2 条 `End`** |
+/// | `insertText:`（提交正文，投 `Commit`） | 推断为「已结束」→ 0 条 `End`（可接受，但 Commit 不是 End） |
+///
+/// 因此收尾不能由「组合串是否还在」推断，必须由**回调记账**：应用收到过 `Preedit` 就欠一条
+/// 收尾；`End` 只在欠账时投递一次，`Commit` 同样销账（正文已上屏，不需要 `End`）。迟到的
+/// `unmarkText:` 看到账已销 ⇒ 吞掉，不会出现第二条。
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Default)]
+pub(crate) struct ImeCompositionEnd {
+    /// 应用收到过 `Preedit` 且尚未收到收尾（`End` 或 `Commit`）。
+    pending: bool,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl ImeCompositionEnd {
+    /// 组合串已交给应用（`Preedit`）：从现在起欠一条收尾。
+    pub(crate) fn note_preedit(&mut self) {
+        self.pending = true;
+    }
+
+    /// 投递 `End` 的决策：返回 `true` = 现在该投（并销账）；`false` = 已经收尾过，吞掉。
+    ///
+    /// 同一个函数既服务回调路径（`unmarkText:`）也服务清场兜底（`discardMarkedText` 之后）：
+    /// 谁先到谁销账，后到的一方看到已销账就不再投 —— 这正是「恰好一条」的全部内容。
+    pub(crate) fn note_end(&mut self) -> bool {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// 提交（`insertText:` → `Commit`）：组合以正文结束，收尾不再补 `End`。
+    pub(crate) fn note_commit(&mut self) {
+        self.pending = false;
+    }
+
+    /// 是否欠一条收尾（清场入口据此决定要不要真的 `discardMarkedText`）。
+    pub(crate) fn is_pending(&self) -> bool {
+        self.pending
+    }
+}
+
 /// 一次**原生输入事件**的作用域令牌（macOS 的每个 `keyDown:` 一个）。
 ///
 /// 用令牌而不是裸 `bool` 的原因：`insertText:` 可能由非按键路径触发（鼠标点候选窗、听写、
@@ -648,6 +698,78 @@ mod tests {
     #[test]
     fn an_ordinary_key_is_visible() {
         assert!(key_visible(false, false, false));
+    }
+}
+
+/// IME 组合收尾的「恰好一条 `End`」记账单测（RB-09）。
+///
+/// 三种回调形态各一条用例：它们必须在**同一条**记账规则下都得到「恰好一条收尾」——
+/// 同步 `unmarkText:`（回调投 End）、`setMarkedText:@""`（无 End，清场补）、异步
+/// `unmarkText:`（清场先补、回调迟到）。修复前按 `hasMarkedText` 推断的实现在后两种形态下
+/// 分别是 0 条与 2 条 End。
+#[cfg(test)]
+mod end_bookkeeping_tests {
+    use super::ImeCompositionEnd;
+
+    /// 形态 1：`discardMarkedText` 同步回调 `unmarkText:` —— 回调投递 End，清场不得再补。
+    #[test]
+    fn a_synchronous_unmark_during_discard_emits_exactly_one_end() {
+        let mut end = ImeCompositionEnd::default();
+        end.note_preedit();
+        assert!(end.note_end(), "unmarkText: 回调应当投递 End");
+        assert!(!end.note_end(), "清场兜底不得再补第二条 End");
+        assert!(!end.is_pending());
+    }
+
+    /// 形态 2：`discardMarkedText` 只清空组合串（`setMarkedText:@""`）—— 没有 End 回调，
+    /// 清场必须补一条，否则应用侧 preedit 永远收不到收尾。
+    #[test]
+    fn a_discard_that_only_clears_the_marked_text_still_emits_one_end() {
+        let mut end = ImeCompositionEnd::default();
+        end.note_preedit();
+        // `setMarkedText:@""` 只清组合串，不调用 `note_end`。
+        assert!(end.is_pending());
+        assert!(end.note_end(), "清场必须补一条 End（否则 preedit 残留）");
+        assert!(!end.note_end(), "补过之后不得再补");
+    }
+
+    /// 形态 3：`discardMarkedText` 异步回调 `unmarkText:` —— 清场先补一条，迟到的回调被吞，
+    /// 总数恰好一条（修复前的推断会补一条 + 回调一条 = 两条）。
+    #[test]
+    fn a_late_unmark_after_the_teardown_fallback_is_swallowed() {
+        let mut end = ImeCompositionEnd::default();
+        end.note_preedit();
+        assert!(end.note_end(), "discardMarkedText 返回时还没收尾 ⇒ 补一条");
+        assert!(!end.note_end(), "迟到的 unmarkText: 不得再投第二条 End");
+    }
+
+    /// 形态 4：`discardMarkedText` 走 `insertText:`（Commit）—— 组合以正文结束，不补 End。
+    #[test]
+    fn a_commit_during_discard_emits_no_end() {
+        let mut end = ImeCompositionEnd::default();
+        end.note_preedit();
+        end.note_commit();
+        assert!(!end.note_end(), "Commit 已经销账，清场不得再补 End");
+        assert!(!end.is_pending());
+    }
+
+    /// 记账不能被上一次清场永久置为已销账：下一次组合仍要恰好一条 End。
+    #[test]
+    fn a_new_composition_gets_its_own_end() {
+        let mut end = ImeCompositionEnd::default();
+        end.note_preedit();
+        assert!(end.note_end());
+        end.note_preedit();
+        assert!(end.note_end(), "下一次组合仍要恰好一条 End");
+    }
+
+    /// 没有 `Preedit` 就没有 `End`：`unmarkText:` 可能在没有组合时被 AppKit 调用（应用侧
+    /// 从未看到 preedit，凭空补一条 End 会让文本层清掉别的状态）。
+    #[test]
+    fn an_unmark_without_a_preedit_never_emits_an_end() {
+        let mut end = ImeCompositionEnd::default();
+        assert!(!end.note_end());
+        assert!(!end.note_end());
     }
 }
 

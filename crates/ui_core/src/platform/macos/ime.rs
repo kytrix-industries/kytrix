@@ -4,7 +4,7 @@
 //! 提交去重与 `Text` 抑制的作用域记账在平台无关的
 //! [`crate::platform::ime::ImeCommitScope`] 里（可在开发机上单测）。
 
-use crate::platform::ime::{CommitVerdict, ImeCommitScope, KeyScopeToken};
+use crate::platform::ime::{CommitVerdict, ImeCommitScope, ImeCompositionEnd, KeyScopeToken};
 
 /// 一个窗口的 IME 状态（`GuiView` 的 ivars）。
 #[derive(Debug, Default)]
@@ -15,6 +15,9 @@ pub(crate) struct ImeState {
     selected: (usize, usize),
     /// 按键作用域的提交记账（R09-3）：本按键的正文是否已由 IME 交付。
     scope: ImeCommitScope,
+    /// 「恰好一条 `End`」的收尾记账（RB-09）：应用收到过 `Preedit` 就欠一条收尾，
+    /// `End`/`Commit` 谁先到谁销账。
+    end: ImeCompositionEnd,
 }
 
 impl ImeState {
@@ -69,6 +72,11 @@ impl ImeState {
         let location = selected.0.min(len);
         let length = selected.1.min(len - location);
         self.selected = (location, length);
+        // RB-09：非空组合串已经作为 `Preedit` 交给应用 ⇒ 欠一条收尾。空串是 AppKit
+        // 「清空组合」的形态（`setMarkedText:@""`），不算新的组合开始。
+        if !self.marked.is_empty() {
+            self.end.note_preedit();
+        }
     }
 
     pub(crate) fn clear_marked(&mut self) {
@@ -78,7 +86,19 @@ impl ImeState {
 
     /// 记录一次提交并给出裁决（作用域内/外/重复，见 [`CommitVerdict`]）。
     pub(crate) fn note_commit(&mut self, text: &str) -> CommitVerdict {
+        // RB-09：`Commit` 也算收尾（正文已上屏，清场不再补 `End`）。
+        self.end.note_commit();
         self.scope.note_commit(text)
+    }
+
+    /// 投递 `ImeEvent::End` 的决策（RB-09）：`true` = 现在该投（并销账）。
+    pub(crate) fn note_end(&mut self) -> bool {
+        self.end.note_end()
+    }
+
+    /// 是否欠一条 `End`（清场入口据此决定要不要 `discardMarkedText`）。
+    pub(crate) fn has_pending_end(&self) -> bool {
+        self.end.is_pending()
     }
 }
 

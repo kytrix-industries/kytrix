@@ -656,8 +656,14 @@ define_class!(
 
         #[unsafe(method(unmarkText))]
         fn unmark_text(&self) {
-            self.ivars().ime.borrow_mut().clear_marked();
-            self.push_event(Event::Ime(ImeEvent::End));
+            let mut ime = self.ivars().ime.borrow_mut();
+            ime.clear_marked();
+            // RB-09：`End` 只在「应用见过 `Preedit` 且还没收尾」时投递一次。清场兜底
+            // （`reset_ime_composition`）可能已经补过一条，迟到的 `unmarkText:` 看到账已销
+            // 就吞掉 —— 否则真实输入法上会出现两条 `End`。
+            if ime.note_end() {
+                self.push_event(Event::Ime(ImeEvent::End));
+            }
         }
 
         #[unsafe(method(selectedRange))]
@@ -874,8 +880,8 @@ impl GuiView {
     /// `inputContext` 开始返回 `nil`，就拿不到上下文去 `discardMarkedText`，输入法那边的
     /// 转换会话会悬空。启用只翻标志：下一次按键自然取回 super 的上下文。
     ///
-    /// 返回 `true` = 有组合被丢弃且需要调用方补一条 `ImeEvent::End`（与焦点移走路径共用
-    /// 同一收尾判据）。
+    /// 返回 `true` = 欠一条 `ImeEvent::End`，需要调用方补（与焦点移走路径共用同一份收尾
+    /// 记账，见 [`Self::reset_ime_composition`]）。
     pub(crate) fn apply_ime_enabled(&self, enabled: bool) -> bool {
         if enabled {
             self.ivars().ime_enabled.set(true);
@@ -891,23 +897,31 @@ impl GuiView {
     ///
     /// 两步：① 让 AppKit 丢弃它那边的转换会话（`NSTextInputContext.discardMarkedText`，
     /// 公开 API，WebKit/Qt 同款）；② 清引擎侧的 `ImeState` 与 caret 缓存。返回 `true` =
-    /// 需要调用方补一条 `ImeEvent::End` —— `discardMarkedText` 若同步回调了
-    /// `unmarkText:`（该回调已经 push 过 `End`），这里就不再补，**End 恰好一条**。
+    /// 调用方要补一条 `ImeEvent::End`。
+    ///
+    /// 「恰好一条 `End`」由 [`ImeState`] 的收尾记账给出（RB-09），**不**由
+    /// `discardMarkedText` 之后的 `hasMarkedText` 推断：AppKit 可能走同步 `unmarkText:`
+    /// （回调已投递 `End`）、`setMarkedText:@""`（0 条 End，必须补）、异步 `unmarkText:`
+    /// （返回时还没回调，补一条后迟到的那条被记账吞掉）或 `insertText:`（`Commit` 收尾，
+    /// 不再补 End）。记账在 `discardMarkedText` **前后**都由回调更新，因此任何回调形态下
+    /// 应用侧都恰好收到一条收尾。
     ///
     /// caret 缓存是 AppKit 摆候选窗的依据（`firstRectForCharacterRange:`）；失焦/禁用不是
     /// 「caret 移到别处」，清场后必须回到空矩形，否则下一次组合会拿旧插入点摆候选窗。
     pub(crate) fn reset_ime_composition(&self) -> bool {
         self.ivars().ime_cursor.set(None);
-        if !self.ivars().ime.borrow().has_marked() {
+        // 应用没有「待收尾的组合」⇒ 不凭空补 End（`unmarkText:` 也可能在没有组合时被调用）。
+        if !self.ivars().ime.borrow().has_pending_end() {
             return false;
         }
         if let Some(context) = self.inputContext() {
             context.discardMarkedText();
         }
         let mut ime = self.ivars().ime.borrow_mut();
-        let still_composing = ime.has_marked();
         ime.clear_marked();
-        still_composing
+        // 回调已经销账（同步 `unmarkText:` / `insertText:`）⇒ `false`；还没收尾
+        // （`setMarkedText:@""` / 异步回调）⇒ `true`，由调用方补一条并销账。
+        ime.note_end()
     }
 
     /// 取走本轮的平台事件（泵唯一读点）。
