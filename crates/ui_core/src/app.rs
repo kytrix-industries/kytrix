@@ -154,6 +154,10 @@ pub struct App {
     /// 正常窗口的忙槽只持续 1–2 帧；达到 `text_pass::IMAGE_GROWTH_DEFER_LIMIT` 仍被挡 ⇒ 该
     /// 窗口的 GPU 循环已经不消费上传（遮挡 / 最小化 / 卡死），本帧把忙窗口按「不参与闸门」
     /// 处理（记账作废、可画层 0），只用参与且空闲的窗口推进数组。
+    ///
+    /// 只在**成功推进**时归零（RBT-16）：blocked 变空但没有成功推进（例如这一帧
+    /// `needs_growth` 短暂为假、参与集合变化）时也保留计数 —— 刻意跨 episode 累计，持续慢的
+    /// 窗口不必让每个 episode 都等满 8 帧，第二次起更快触发降级。行为仍是 fail-closed。
     image_growth_deferrals: u32,
     /// 字形页的整页 CPU 缓冲（跨上传复用，避免每次上传都分配）。
     glyph_page: Vec<u8>,
@@ -692,6 +696,14 @@ impl App {
     #[cfg(test)]
     pub(crate) fn dependency_edge_count_for_test(&self) -> usize {
         signal_api::dependency_edge_count(self)
+    }
+
+    /// 测试：App 记账的「已建立图片 texture array」（`Window::image_array_spec` 是每窗口收据）。
+    ///
+    /// RBT-13 用它断言「部分层入队失败 ⇒ 数组不推进」。
+    #[cfg(all(test, windows))]
+    pub(crate) fn image_array_established_for_test(&self) -> Option<crate::render::AtlasArraySpec> {
+        self.image_array_established
     }
 
     /// 仅测试：把下一个窗口句柄推到指定值（验证「句柄用尽」的行为）。

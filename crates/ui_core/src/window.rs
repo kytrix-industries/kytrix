@@ -568,6 +568,12 @@ pub struct Window {
     /// offscreen 测试渲染器恒参与，因此用本注入点构造 RBT-10 的回归场景。
     #[cfg(test)]
     atlas_participating_override: Option<bool>,
+    /// 仅测试：注入「从第 N 层起入队失败」（RBT-13 的部分层入队失败场景）。
+    ///
+    /// 生产上 `queue_atlas_upload` 只在渲染器 shutdown / terminated 时返回 false（那会让整个
+    /// 窗口一层都入不了），无法天然构造「前几层成功、后面失败」；这里用注入口构造该边界。
+    #[cfg(all(test, windows))]
+    atlas_upload_failure_from: Option<u16>,
     /// 字形图集在本窗口上「已写脏、还没入队」的矩形（恒 layer 0）。
     glyph_atlas_rects: crate::render::DirtyRects,
     /// 图片图集每层的「已写脏、还没入队」矩形（下标 = texture array 层号）。
@@ -678,6 +684,8 @@ impl Window {
             image_drawable_layers: u32::MAX,
             #[cfg(test)]
             atlas_participating_override: None,
+            #[cfg(all(test, windows))]
+            atlas_upload_failure_from: None,
             glyph_atlas_rects: crate::render::DirtyRects::default(),
             image_atlas_rects: std::array::from_fn(|_| crate::render::DirtyRects::default()),
             atlas_deferrals: 0,
@@ -1171,6 +1179,15 @@ impl Window {
     #[cfg(all(test, windows))]
     pub(crate) fn set_atlas_participating_for_test(&mut self, participating: bool) {
         self.atlas_participating_override = Some(participating);
+    }
+
+    /// 仅测试：从第 `from` 层起让 `queue_atlas_upload` 返回 false（`None` = 恢复正常）。
+    ///
+    /// 用于构造「部分层入队成功、其它层失败」的边界（RBT-13）：生产上只有渲染器 shutdown 会让
+    /// 入队失败，而那会让整个窗口都入不了，无法覆盖「前几层成功、后面失败」。
+    #[cfg(all(test, windows))]
+    pub(crate) fn set_atlas_upload_failure_for_test(&mut self, from: Option<u16>) {
+        self.atlas_upload_failure_from = from;
     }
     /// 该图集在本窗口已建立的 array 规格是否就是 `spec`（页边长 + 层数；层数随页数增长）。
     pub(crate) fn atlas_page_matches(

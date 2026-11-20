@@ -308,7 +308,6 @@ pub(crate) fn upload_image_page(app: &mut App) {
                 let mut enqueued = Vec::with_capacity(page_count);
                 for layer in 0..layers {
                     let Some((dims, pixels)) = resources.page_pixels_at(layer) else {
-                        enqueued.clear();
                         break;
                     };
                     debug_assert_eq!(
@@ -323,11 +322,13 @@ pub(crate) fn upload_image_page(app: &mut App) {
                         pixels,
                         full_rects.clone(),
                     ) {
-                        enqueued.clear();
                         break;
                     }
                     enqueued.push(layer);
                 }
+                // 只有**每一个已打开层**都入队成功才算完成（RBT-13）：长度比较是唯一判据。
+                // 失败路径刻意**不**清空 `enqueued` —— 让「部分层成功」在这里可见，否则把判据
+                // 弱化成「至少一层成功」（`!enqueued.is_empty()`）也无法被测试/变异区分。
                 if enqueued.len() == page_count {
                     for layer in enqueued {
                         window.mark_image_layer_received(layer);
@@ -398,7 +399,6 @@ pub(crate) fn upload_image_page(app: &mut App) {
                         continue;
                     }
                     let Some((dims, pixels)) = resources.page_pixels_at(layer) else {
-                        enqueued.clear();
                         break;
                     };
                     debug_assert_eq!(
@@ -413,7 +413,6 @@ pub(crate) fn upload_image_page(app: &mut App) {
                         pixels,
                         full_rects.clone(),
                     ) {
-                        enqueued.clear();
                         break;
                     }
                     enqueued.push(layer);
