@@ -328,6 +328,14 @@ resolve 附件）。`Textured` 没有覆盖率属性，其顶点写 `KYTRIX_AA_I
 | 纹理视图   | image 图集的 SRV / 纹理视图**必须**声明为 sRGB 格式（`*_UNORM_SRGB` / `.bgra8Unorm_srgb` / `*_SRGB`）；glyph 图集必须保持非 sRGB 的 `R8_UNORM` |
 | 上传方职责 | P15 必须「linear 空间预乘 → sRGB 编码」后写图集；改成直通 alpha 时 shader 与本文件必须同时改（`texel.rgb *= texel.a`）                         |
 
+**CPU 侧 `AtlasTile`（不进 GPU 字节布局）**：`paint/atlas.rs` 的 `AtlasTile` 是 I2 的**CPU 数据契约**
+（`{ atlas, page, u0, v0, u1, v1, generation }`，v2.1 E1d 起再带分配身份 `slot: u32` / `slot_epoch: u32`）。
+GPU 只消费 `uv()`（上表 UV 行）、`page`（编码进 `params1.y`）与 `atlas`（`params1.z` 的 `kind` 由来）；
+`slot` / `slot_epoch` 只是 CPU 侧**淘汰检测身份**（`render/atlas.rs` 的 `AtlasAllocator::is_alive`
+用它做 O(1) 判活，供编码期过滤失效字形 run），既不在 `GpuPrimitive` 的 128 B 里，也不出现在任何
+shader / uniform / 顶点布局中。因此 `AtlasTile` 的 CPU 侧尺寸变化（24 → 32 B）**不是**渲染契约变更：
+三端 shader、绑定表与 `GpuPrimitive` 偏移都不受影响，无需改动本文件 §1–§7。
+
 ## 9. 禁止项
 
 1. 位重解释：`asuint` / `asfloat` / `as_type<>` / `floatBitsToUint` / `floatBitsToInt` / `bitcast`。

@@ -846,6 +846,7 @@ mod tests {
             skipped_by_budget: 0,
             paint_log: crate::test_support::record::PaintLog::default(),
             a11y: None,
+            stale_canvas_runs: 0,
             presented_latency: None,
         };
         let overlay = DamageOverlay::of(&record);

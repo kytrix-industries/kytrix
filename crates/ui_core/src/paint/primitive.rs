@@ -225,6 +225,8 @@ mod tests {
             u1: 0.5,
             v1: 0.5,
             generation: 1,
+            slot: 0,
+            slot_epoch: 0,
         }
     }
 

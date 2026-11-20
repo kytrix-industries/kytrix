@@ -26,7 +26,10 @@ mod virtual_list;
 mod window_set;
 
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -44,7 +47,7 @@ use crate::{
         ScrollConfig, ScrollHandle, ScrollState, VirtualList, VirtualListConfig, VirtualListState,
     },
     layout::hit_test::HitResult,
-    math::{Point, Rect, Size},
+    math::{Point, Rect, Scale, Size},
     node::{
         builder::NodeBuilder,
         dependency::{DependencyGraph, EvalStack, ReadCtx},
@@ -59,8 +62,9 @@ use crate::{
     render::{AtlasAllocator, MIN_ATLAS_PAGE},
     resources::{DecodeState, PendingResource, ResourceCache},
     text::{
-        FontStack, FontStackStatus, TextDiagnostic, TextLayoutReport, TextPassReport,
-        atlas::GlyphAtlas, context::TextContext, raster::GlyphRasterizer,
+        FontStack, FontStackStatus, InlineBoxSpec, ShapedInlineBox, ShapedTextHandle,
+        TextDiagnostic, TextLayoutReport, TextPassReport, TextStyle, atlas::GlyphAtlas,
+        context::TextContext, raster::GlyphRasterizer,
     },
     window::{FrameOutcome, FramePresentation, FrameTicket, Window, WindowId, WindowOptions},
 };
@@ -135,6 +139,29 @@ pub struct App {
     /// 页内所有 tile 重排。文本 lane 里存的是旧 `AtlasTile`（旧 UV），所以代际一变就必须
     /// 让**所有窗口**的文本节点重绘；否则画的是旧 UV（错字/花字）。
     atlas_generation_seen: u32,
+    /// 图集租约：`ShapedTextHandle::is_stale` 与 `Canvas::push_shaped_text` 读取的
+    /// **当前** `(generation, eviction_epoch)`（单一真源仍是图集本身：`atlas.generation()` 与
+    /// `glyph_atlas.eviction_epoch()`，打包见 [`crate::text::pack_atlas_lease`]）。
+    ///
+    /// 任何可能改变图集状态的入口（`layout_text` 的扩容/清空/逐 tile 淘汰、`set_font_stack`、
+    /// `reload_system_fonts`、`shape_text` 自身）返回后都由
+    /// `App::sync_atlas_generation_lease` 写入，因此独立于窗口的 shaping 句柄也能在图集换代
+    /// **或**任一 tile 被淘汰后立即判定失活（D-5：不画旧 UV）。
+    atlas_generation_lease: Arc<AtomicU64>,
+    /// canvas 文本的**App 级默认光栅 scale**（v2.1 E1b，`§11.1`）：默认 1.0，焦点窗口的 DPI
+    /// 变化时跟随（`App::note_window_focus` / `App::note_window_dpi`），可被
+    /// [`App::set_text_scale`] 显式覆盖。
+    ///
+    /// 节点文本不用它（节点路径按各自窗口的 `Window::scale` 光栅）；它只服务
+    /// `App::shape_text` 的无窗口 shaping。
+    default_text_scale: f32,
+    /// 应用显式覆盖的文本 scale（`None` = 跟随焦点窗口 DPI）。
+    text_scale_override: Option<f32>,
+    /// 当前持有键盘焦点的窗口（`Event::FocusChanged` 维护；`None` = 没有窗口有焦点）。
+    ///
+    /// 只用于「焦点窗口 DPI → canvas 文本默认 scale」这一条派生；无焦点时保留上一次的
+    /// `default_text_scale`（最后一个焦点窗口的 DPI，语义见 [`App::text_scale`]）。
+    focused_window: Option<WindowId>,
     /// 累积的图集脏矩形（P09 的增量上传输入；`layout_text` 合并、上传后清空；R06-3 起是 AOI 矩形）。
     pending_dirty: crate::render::DirtyRects,
     /// 字形页整页缓冲上次按哪个页尺寸重建（`None` = 还没建 / 刚清空）。
@@ -426,6 +453,15 @@ impl App {
         // `GetMessageW`/`poll`，没有唤醒就永远不会有人调 `poll()`）。字段顺序要求它先于
         // `resources` 构造，因此提到结构体字面量之前。
         let dispatcher = Dispatcher::new();
+        // 图集构造在字面量之前：代际租约的初值必须与图集的初始代际一致。
+        let atlas = AtlasAllocator::with_page(
+            crate::paint::atlas::AtlasKind::Glyph,
+            (MIN_ATLAS_PAGE, MIN_ATLAS_PAGE),
+        );
+        let atlas_generation_lease = Arc::new(AtomicU64::new(crate::text::pack_atlas_lease(
+            atlas.generation(),
+            0,
+        )));
         Self {
             store: StateStore::with_capacity(64, 16),
             graph: DependencyGraph::new(),
@@ -436,10 +472,7 @@ impl App {
             runtime: runtime.clone(),
             text: TextContext::new(),
             raster: GlyphRasterizer::new(),
-            atlas: AtlasAllocator::with_page(
-                crate::paint::atlas::AtlasKind::Glyph,
-                (MIN_ATLAS_PAGE, MIN_ATLAS_PAGE),
-            ),
+            atlas,
             resources: ResourceCache::new(runtime, Arc::clone(&dispatcher)),
             pending_resource_results: Vec::new(),
             geometry: crate::paint::geometry_store::GeometryStore::new(),
@@ -448,6 +481,10 @@ impl App {
             text_layout_scratch: Vec::new(),
             scale_epochs: ahash::HashMap::default(),
             atlas_generation_seen: 0,
+            atlas_generation_lease,
+            default_text_scale: 1.0,
+            text_scale_override: None,
+            focused_window: None,
             pending_dirty: crate::render::DirtyRects::default(),
             glyph_page_extent: None,
             image_array_established: None,
@@ -2189,7 +2226,222 @@ impl App {
         &mut self,
         window: WindowId,
     ) -> Option<Result<TextLayoutReport, EngineError>> {
-        text_pass::layout_text(self, window)
+        let result = text_pass::layout_text(self, window);
+        self.sync_atlas_generation_lease();
+        result
+    }
+
+    /// 无节点归属的文本 shaping（v2.1 E1，`§11.1`）：canvas 内文本的公开入口。
+    ///
+    /// 按 `style` 与 `max_width` 塑形、断行并光栅/装箱，返回**可长期持有**的句柄。同一文本 +
+    /// 同一 shaping 输入命中形状缓存（与 `refresh_text` 同一份 `ShapeKey`），不重复塑形；
+    /// `max_width = None` = 不限宽（单行），`Some(w)` = 按 `w` 断行（等价
+    /// `break_all_lines(Some(w))`）。
+    ///
+    /// `inline_boxes` 与节点路径同源（`TextContent.inline_boxes`）：落点经
+    /// [`App::shaped_inline_boxes`] 读取；传空切片 = 无行内盒。E1 只保证落点可读，
+    /// `InlineBoxPaint` 的绘制归 E2（`§11.2`）。
+    ///
+    /// 句柄带**图集租约** `(generation, eviction_epoch)`：图集换代**或**任一 tile 被 LRU 淘汰后
+    /// [`ShapedTextHandle::is_stale`] 为真，[`crate::paint::canvas::Canvas::push_shaped_text`]
+    /// 返回 `false` 且不编码旧 UV（D-5）；应用应丢弃句柄并重新调用本方法。
+    ///
+    /// 光栅 scale 取 [`App::text_scale`]（焦点窗口 DPI / 显式覆盖），句柄可用
+    /// [`ShapedTextHandle::scale`] 读回。**应用义务**：窗口 DPI 变化 / 跨屏移动 / 焦点切换后
+    /// 必须重新 shape（引擎不会自动重光栅已有句柄）。
+    ///
+    /// # Errors
+    /// - [`EngineError::TextShapeStandalone`]：`max_width` 非有限 / 为负，或字体栈为空；
+    /// - [`EngineError::AtlasExhausted`]：字形图集在扩容 + LRU 淘汰后仍放不下本次工作集。
+    ///
+    /// # Panics: none
+    pub fn shape_text(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+        max_width: Option<f32>,
+        inline_boxes: &[InlineBoxSpec],
+    ) -> Result<ShapedTextHandle, EngineError> {
+        let App {
+            text: text_context,
+            raster,
+            atlas,
+            glyph_atlas,
+            pending_dirty,
+            atlas_generation_lease,
+            default_text_scale,
+            windows,
+            ..
+        } = self;
+        let scale = *default_text_scale;
+        let result = crate::text::standalone::shape(
+            text_context,
+            raster,
+            atlas,
+            glyph_atlas,
+            pending_dirty,
+            atlas_generation_lease,
+            text,
+            style,
+            max_width,
+            inline_boxes,
+            scale,
+        );
+        // 本次 shape 可能触发扩容 / 满页清空 / 逐 tile 淘汰：进程级图集的状态变化会让**所有
+        // 窗口**已发布的 `ShapedLine` 与 Canvas 图元烘焙旧 UV（D-5）。收尾必须**无条件**执行
+        // —— 失败路径（`AtlasExhausted` 等）同样可能已经淘汰了节点文本的 tile、前进了租约，
+        // 用 `?` 早退会让节点文本继续画被复用的旧 UV、并让旧句柄短暂「假活」。
+        let evicted = glyph_atlas.take_evicted();
+        if evicted > 0 {
+            for window in windows.values_mut() {
+                window.tree_mut().invalidate_text_lines();
+                window.tree_mut().mark_canvas_nodes_paint();
+            }
+        }
+        // 租约同步同样无条件执行：失败路径上发生的换代 / 淘汰必须立即对已发出的句柄可见。
+        self.sync_atlas_generation_lease();
+        result
+    }
+
+    /// 行内盒落点（v2.1 E1，`§11.1`）：顺序与 `shape_text` 传入的 `inline_boxes` 一一对应，
+    /// `id` 原样保留；供应用画 `<img>` / `<kbd>`。
+    ///
+    /// 坐标是**文本盒局部**逻辑像素（与 `handle.line()` 的字形位置同域）：应用画图时加上文本盒
+    /// 在窗口中的绝对原点。空切片 = 无行内盒。
+    ///
+    /// # Panics: none
+    #[must_use]
+    pub fn shaped_inline_boxes<'a>(&self, handle: &'a ShapedTextHandle) -> &'a [ShapedInlineBox] {
+        handle.inline_boxes()
+    }
+
+    /// 让代际租约与图集对齐：任何可能改变图集状态的 App 入口返回后调用（`shaped_text` 句柄的
+    /// `is_stale` 依赖它）。原语是 `(atlas.generation(), glyph_atlas.eviction_epoch())`，这里只是
+    /// 把同一真源打包写进共享槽。
+    fn sync_atlas_generation_lease(&self) {
+        self.atlas_generation_lease.store(
+            crate::text::pack_atlas_lease(
+                self.atlas.generation(),
+                self.glyph_atlas.eviction_epoch(),
+            ),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// canvas 文本的当前**默认光栅 scale**（v2.1 E1b，`§11.1`）。
+    ///
+    /// 语义：默认 1.0；焦点窗口获得焦点 / 其 DPI 变化时跟随该窗口的 `Window::scale()`（DPI
+    /// 变化用 `Event::DpiChanged.scale` 这个权威值，三端事件顺序不同但结果一致）；没有
+    /// 焦点窗口时保留上一次的值；[`App::set_text_scale`] 可显式覆盖（离屏 / 测试 / 固定 DPI）。
+    ///
+    /// [`App::shape_text`] 用它光栅，句柄用 [`ShapedTextHandle::scale`] 记录。
+    ///
+    /// # Panics: none
+    #[must_use]
+    pub fn text_scale(&self) -> f32 {
+        self.default_text_scale
+    }
+
+    /// 显式覆盖 canvas 文本的光栅 scale（`§11.1`，v2.1 E1b）。
+    ///
+    /// 覆盖一旦设置就**不再跟随**焦点窗口 DPI（多窗口不同 DPI 下应用应显式 `shape_text` 时
+    /// 用哪个 scale）；调用 [`App::clear_text_scale_override`] 恢复跟随。已有的
+    /// [`ShapedTextHandle`] 不会自动重新光栅 —— 应用须丢弃并重新 `shape_text`。
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidTextScale`]：`scale` 非有限值或 `<= 0`（光栅 ppem = 字号 × scale，
+    /// 非法值会让 parley/swash 得到 NaN 尺寸；不静默钳制）。
+    ///
+    /// # Panics: none
+    pub fn set_text_scale(&mut self, scale: f32) -> Result<(), EngineError> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(EngineError::InvalidTextScale { scale });
+        }
+        self.text_scale_override = Some(scale);
+        self.default_text_scale = scale;
+        Ok(())
+    }
+
+    /// 取消 [`App::set_text_scale`] 的显式覆盖，恢复「跟随焦点窗口 DPI」。
+    ///
+    /// 当前有焦点窗口 ⇒ 立即采用它的 DPI；没有焦点窗口 ⇒ 保留当前值（与「无窗口时保持上次值」
+    /// 同口径）。已有句柄不会自动重新光栅（应用须重新 `shape_text`）。
+    ///
+    /// # Panics: none
+    pub fn clear_text_scale_override(&mut self) {
+        self.text_scale_override = None;
+        self.follow_focused_window_scale();
+    }
+
+    /// 事件：窗口焦点变化（`Event::FocusChanged` 的唯一处理点，v2.1 E1b）。
+    ///
+    /// 获得焦点 ⇒ 记录焦点窗口并跟随其 DPI 作为 canvas 文本默认 scale；失去焦点 ⇒ 只清焦点
+    /// 窗口记录、**保留**当前 scale（「无窗口时保持上次值」）。
+    pub(crate) fn note_window_focus(&mut self, window: WindowId, focused: bool) {
+        if focused {
+            self.focused_window = Some(window);
+            self.follow_focused_window_scale();
+        } else if self.focused_window == Some(window) {
+            self.focused_window = None;
+        }
+    }
+
+    /// 事件：窗口 DPI 变化。只有焦点窗口的 DPI 变化才更新 canvas 文本默认 scale；显式覆盖期间
+    /// 不跟随。
+    ///
+    /// 用**事件自带的** `scale`（`Event::DpiChanged.scale` 是本次变化的权威值），不读
+    /// `Window::scale`：Wayland 的事件循环在派发事件**之后**才镜像 `Window::set_scale`
+    /// （`platform/linux/event_loop.rs` 的「① 事件 → ② 平台真值镜像」顺序），读窗口会落后一次
+    /// DPI。Windows / macOS 先写 `Window::scale` 再派发，两种顺序下结果一致。
+    pub(crate) fn note_window_dpi(&mut self, window: WindowId, scale: Scale) {
+        if self.focused_window == Some(window) {
+            self.apply_text_scale(scale.factor());
+        }
+    }
+
+    /// 让 `default_text_scale` 采用 `scale`（显式覆盖期间是 no-op）。
+    fn apply_text_scale(&mut self, scale: f32) {
+        if self.text_scale_override.is_some() {
+            return;
+        }
+        self.default_text_scale = scale;
+    }
+
+    /// 让 `default_text_scale` 跟随焦点窗口的当前 DPI（显式覆盖期间是 no-op）。
+    fn follow_focused_window_scale(&mut self) {
+        let Some(window) = self.focused_window else {
+            return;
+        };
+        let scale = self
+            .windows
+            .get(&window)
+            .map(|target| target.scale().factor());
+        if let Some(scale) = scale {
+            self.apply_text_scale(scale);
+        }
+    }
+
+    /// 仅测试（E1b F1/F3 回归）：把字形图集页档钉到 `page` 并同步清空字形缓存。
+    ///
+    /// `cap_page_for_test` 本身会换代（`clear` ⇒ `generation + 1`），这里同步把两级缓存的记录
+    /// 清掉、租约前进 —— 之后的小页分配即可在几十个 tile 内触发逐 tile LRU 淘汰。
+    #[cfg(test)]
+    pub(crate) fn cap_glyph_atlas_page_for_test(&mut self, page: u32) {
+        self.atlas.cap_page_for_test(page);
+        self.glyph_atlas.clear();
+        self.sync_atlas_generation_lease();
+    }
+
+    /// 仅测试：当前字形图集代际。
+    #[cfg(test)]
+    pub(crate) fn glyph_atlas_generation_for_test(&self) -> u32 {
+        self.atlas.generation()
+    }
+
+    /// 仅测试：当前累计淘汰纪元。
+    #[cfg(test)]
+    pub(crate) fn glyph_atlas_eviction_epoch_for_test(&self) -> u32 {
+        self.glyph_atlas.eviction_epoch()
     }
 
     /// 当前字体栈。
@@ -2218,12 +2470,16 @@ impl App {
     /// 换字体栈：版本 +1、字体代际 +1、清形状缓存与字形图集、所有窗口的文本节点
     /// `LAYOUT | PAINT`。返回新版本号。
     pub fn set_font_stack(&mut self, stack: FontStack) -> u32 {
-        text_pass::set_font_stack(self, stack)
+        let version = text_pass::set_font_stack(self, stack);
+        self.sync_atlas_generation_lease();
+        version
     }
 
     /// 系统字体安装/卸载/语言切换后调用：重载 + 与 [`App::set_font_stack`] 相同的失效。
     pub fn reload_system_fonts(&mut self) -> u32 {
-        text_pass::reload_system_fonts(self)
+        let version = text_pass::reload_system_fonts(self);
+        self.sync_atlas_generation_lease();
+        version
     }
 
     /// 数字快速路径开关（`DigitFastPath`，R12 的性能项）。
@@ -2254,7 +2510,8 @@ impl App {
     ///
     /// 对照 Skia：glyph atlas / strike cache 换代时会让所有引用旧 strike 的绘制数据失效。
     fn repaint_text_if_atlas_changed(&mut self) {
-        text_pass::repaint_text_if_atlas_changed(self)
+        text_pass::repaint_text_if_atlas_changed(self);
+        self.sync_atlas_generation_lease();
     }
 
     fn invalidate_all_text(&mut self) {

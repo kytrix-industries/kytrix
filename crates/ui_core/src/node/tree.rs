@@ -1149,6 +1149,10 @@ impl NodeTree {
     pub(crate) fn invalidate_text_lines(&mut self) -> usize {
         content::invalidate_text_lines(self)
     }
+    /// 让所有 `Canvas` 节点的 lane 重建（图集换代后的 canvas 编码期安全网入口；v2.1 E1b）。
+    pub(crate) fn mark_canvas_nodes_paint(&mut self) -> usize {
+        content::mark_canvas_nodes_paint(self)
+    }
     pub(crate) fn set_text_shaped(
         &mut self,
         node: NodeId,

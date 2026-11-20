@@ -29,7 +29,10 @@ use crate::{
         scene::{LaneId, Scene},
         style::{Clip, PaintSpec, StylePatch},
     },
-    render::damage::{DamageAccumulator, DamageSummary},
+    render::{
+        AtlasAllocator,
+        damage::{DamageAccumulator, DamageSummary},
+    },
     text::{ShapedLine, ShapedTextItem},
 };
 
@@ -48,13 +51,17 @@ pub(crate) struct PaintPass<'a> {
     pub order: &'a mut Vec<LaneId>,
     /// 本帧的焦点节点（画 `Style.focus_ring`；`None` = 无焦点）。
     pub focused: Option<NodeId>,
-    /// 当前字形图集的代际（`Some` = 绘制前硬校验；`None` = 无 App 的 headless/测试路径跳过）。
+    /// 本帧的字形图集（`Some` = 绘制前硬校验 + 编码期逐 tile 存活校验；`None` = 无 App 的
+    /// headless/测试路径跳过）。
     ///
     /// D-5：`ShapedLine` 里的 `AtlasTile`/UV 是生成时的快照。若图集已换代而该行未被重排，
     /// 继续编码就是画旧 UV（整窗花字）。这里把「行代际 == 当前代际」变成绘制前硬校验：
     /// 不匹配的行**本帧不编码**，节点收进 [`PaintReport::stale_text`]，由 `App::frame` 在提交后
     /// 重新入队（下一帧补齐）。
-    pub atlas_generation: Option<u32>,
+    ///
+    /// E1d（F15 方案①）：Canvas 内已经写入的 tile 用 [`AtlasAllocator::is_alive`] 逐 tile 校验
+    /// （代际 + 槽位分配身份），把「逐 tile 淘汰不换代」这类失效也拦在编码前。
+    pub atlas: Option<&'a AtlasAllocator>,
     /// 本帧的**滚动槽表**（槽位 → （逻辑滚动位移，物理视口））。
     ///
     /// 全量路径每帧重写它：下标 0 恒是「不随滚动偏移」的哨兵（偏移 0、零面积视口），
@@ -98,6 +105,14 @@ pub(crate) struct PaintReport {
     /// 消费者：`App::frame` 在 `commit_frame` 之后逐节点 `mark_text_layout_dirty + mark_paint`
     /// 并请求下一帧（下一帧的 `layout_text` 用当前代际重光栅）。
     pub stale_text: SmallVec<[NodeId; 4]>,
+    /// D-5 的 canvas 半边（v2.1 E1b + E1d）：因含**已失效 `AtlasTile`**（整页换代，或逐 tile
+    /// LRU 淘汰后 tile 已被复用）而**未编码**的 `GlyphRun` 数（Canvas 内文本）。
+    ///
+    /// Canvas 内容归应用所有，引擎无法自动重建：这里只止损（不画旧 UV，少字优于花字）并计数。
+    /// 应用义务：发现句柄 `is_stale()` 后重新 `shape_text` 并用新句柄重建 Canvas。消费者：
+    /// `App::frame`（压 [`crate::text::TextDiagnostic::CanvasTextStale`]）与
+    /// `test_support::record::FrameRecord::stale_canvas_runs`（帧记录）。
+    pub stale_canvas_runs: usize,
     /// 本帧编码出的实例数（仅 `test-support`；`Window::paint_frame` 编码后回填）。
     #[cfg(feature = "test-support")]
     pub instances: usize,
@@ -180,8 +195,9 @@ impl PaintPass<'_> {
             scroll_slots,
             scroll_slot_nodes,
             focused: self.focused,
-            atlas_generation: self.atlas_generation,
+            atlas: self.atlas,
             stale_text: SmallVec::new(),
+            stale_canvas_runs: 0,
             #[cfg(feature = "test-support")]
             log,
             rebuilt: 0,
@@ -223,6 +239,7 @@ impl PaintPass<'_> {
             rebuilt: context.rebuilt,
             damage,
             stale_text: context.stale_text,
+            stale_canvas_runs: context.stale_canvas_runs,
             #[cfg(feature = "test-support")]
             instances: 0,
             #[cfg(feature = "test-support")]
@@ -260,10 +277,12 @@ struct PaintContext<'a> {
     /// 槽位 → 容器节点（与 `scroll_slots` 平行，下标 i ⇒ 槽位 i + 1）。
     scroll_slot_nodes: &'a mut Vec<NodeId>,
     focused: Option<NodeId>,
-    /// 当前字形图集代际（D-5 绘制前硬校验；`None` = headless/测试路径跳过）。
-    atlas_generation: Option<u32>,
+    /// 字形图集（D-5 绘制前硬校验 + E1d 编码期逐 tile 存活校验；`None` = headless/测试路径跳过）。
+    atlas: Option<&'a AtlasAllocator>,
     /// 行代际不匹配、本帧未编码的文本节点（D-5）。
     stale_text: SmallVec<[NodeId; 4]>,
+    /// Canvas 内含已失效 tile、本帧未编码的字形 run 数（D-5 的 canvas 半边，E1b/E1d）。
+    stale_canvas_runs: usize,
     #[cfg(feature = "test-support")]
     log: PaintLog,
     rebuilt: usize,
@@ -1681,7 +1700,21 @@ impl PrimitiveEmitter {
 
             Content::Canvas(canvas) => {
                 let canvas_bounds = canvas.bounds();
-                self.push(context, Primitive::Canvas(Arc::clone(&canvas)));
+                // E1b F2 + E1d：编码期安全网。`push_shaped_text` 只在 push 时校验租约；push 之后
+                // 同帧的图集换代**或逐 tile LRU 淘汰**（不换代）都会让已写入的 tile 变旧 UV。
+                // 逐 tile 用 `AtlasAllocator::is_alive` 校验（O(1)，代际 + 槽位分配身份），失效
+                // run 不编码（少字优于花字），计数进 `PaintReport`/`FrameRecord`。换代时
+                // `App::repaint_text_if_atlas_changed`、淘汰时 `App::layout_text`/`shape_text`
+                // 的收尾已把 Canvas 节点标 PAINT，保证本分支在复用路径上也会执行。
+                let (canvas, stale_runs) = match context.atlas {
+                    Some(atlas) => match canvas.without_stale_glyph_runs(atlas) {
+                        Some((filtered, dropped)) => (Arc::new(filtered), dropped),
+                        None => (Arc::clone(&canvas), 0),
+                    },
+                    None => (Arc::clone(&canvas), 0),
+                };
+                context.stale_canvas_runs += stale_runs;
+                self.push(context, Primitive::Canvas(canvas));
                 context.damage.push(canvas_bounds, 1.0, self.clip);
             }
             Content::Text(line) => {
@@ -1701,8 +1734,8 @@ impl PrimitiveEmitter {
         // 是生成时的图集代际；与当前代际不等说明该行仍烘焙旧 `AtlasTile`（旧 UV）——继续
         // 编码就是整窗花字。本帧跳过该行、记下节点，`App::frame` 提交后重新入队并在下一帧用
         // 当前代际重光栅。`None` = 无 App 的 headless/测试路径，不做校验。
-        if let Some(generation) = context.atlas_generation
-            && line.atlas_generation != generation
+        if let Some(atlas) = context.atlas
+            && line.atlas_generation != atlas.generation()
         {
             if !context.stale_text.contains(&self.node) {
                 context.stale_text.push(self.node);
@@ -1781,8 +1814,9 @@ mod tests {
         order: Vec<LaneId>,
         scroll_slots: Vec<(Point, PhysicalRect)>,
         scroll_slot_nodes: Vec<crate::node::id::NodeId>,
-        /// D-5：绘制前图集代际校验的注入点（None = 不校验）。
-        atlas_generation: Option<u32>,
+        /// D-5 / E1d：绘制前图集校验的注入点（None = 不校验；Some = 编码期逐 tile 用
+        /// `AtlasAllocator::is_alive` 判活）。
+        atlas: Option<crate::render::AtlasAllocator>,
         /// 几何注册表（几何节点的块 lane 测试用；X5）。
         geometry: crate::paint::geometry_store::GeometryStore,
     }
@@ -1796,7 +1830,7 @@ mod tests {
                 order: Vec::new(),
                 scroll_slots: Vec::new(),
                 scroll_slot_nodes: Vec::new(),
-                atlas_generation: None,
+                atlas: None,
                 geometry: crate::paint::geometry_store::GeometryStore::new(),
             }
         }
@@ -1814,7 +1848,7 @@ mod tests {
                 frame: frame(),
                 order: &mut self.order,
                 focused: None,
-                atlas_generation: self.atlas_generation,
+                atlas: self.atlas.as_ref(),
                 scroll_slots: &mut self.scroll_slots,
                 scroll_slot_nodes: &mut self.scroll_slot_nodes,
                 #[cfg(feature = "test-support")]
@@ -1845,7 +1879,7 @@ mod tests {
                 frame: frame(),
                 order: &mut self.order,
                 focused: None,
-                atlas_generation: self.atlas_generation,
+                atlas: self.atlas.as_ref(),
                 scroll_slots: &mut self.scroll_slots,
                 scroll_slot_nodes: &mut self.scroll_slot_nodes,
                 #[cfg(feature = "test-support")]

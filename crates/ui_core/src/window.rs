@@ -703,6 +703,11 @@ pub struct Window {
     image_atlas_rects: [crate::render::DirtyRects; MAX_IMAGE_PAGES as usize],
     /// 本窗口「图集行没赶上帧」的补帧次数（上限见 [`MAX_ATLAS_FOLLOWUPS`]）。
     atlas_deferrals: u8,
+    /// 本窗口的 Canvas 失效 run 被编码期丢弃后，已为哪个图集代际补过帧（`None` = 还没补过）。
+    ///
+    /// 每个代际至多补一帧：Canvas 归应用所有，重建义务（重新 `shape_text` + `set_canvas`）只在
+    /// 下一帧的 `on_frame` 钩子里才可执行；但应用忽略义务时不能让补帧变成 I3 空转。
+    stale_canvas_followup_generation: Option<u32>,
     /// 本帧的分段计时（容量跨帧复用）。
     timings: FrameTimings,
     /// 本帧 lane 绘制序的复用缓冲（避免每帧分配）。
@@ -828,6 +833,7 @@ impl Window {
             glyph_atlas_rects: crate::render::DirtyRects::default(),
             image_atlas_rects: std::array::from_fn(|_| crate::render::DirtyRects::default()),
             atlas_deferrals: 0,
+            stale_canvas_followup_generation: None,
             timings: FrameTimings::new(),
             paint_order: Vec::new(),
             full_damage_pending: false,
@@ -1170,9 +1176,9 @@ impl Window {
     pub(crate) fn paint_frame(
         &mut self,
         geometry: &crate::paint::geometry_store::GeometryStore,
-        atlas_generation: Option<u32>,
+        atlas: Option<&crate::render::AtlasAllocator>,
     ) -> Result<PaintReport, EngineError> {
-        paint::paint_frame(self, geometry, atlas_generation)
+        paint::paint_frame(self, geometry, atlas)
     }
     fn needs_node_repaint(&self) -> bool {
         paint::needs_node_repaint(self)
@@ -1381,6 +1387,11 @@ impl Window {
     }
     pub(crate) fn reset_atlas_deferrals(&mut self) {
         surface::reset_atlas_deferrals(self)
+    }
+    /// 记一次「Canvas 失效 run 已被编码期丢弃」；返回是否应为该图集代际补一帧
+    /// （实现见子模块 `surface::note_stale_canvas_followup`）。
+    pub(crate) fn note_stale_canvas_followup(&mut self, generation: u32) -> bool {
+        surface::note_stale_canvas_followup(self, generation)
     }
     pub(crate) fn queue_atlas_upload(
         &mut self,

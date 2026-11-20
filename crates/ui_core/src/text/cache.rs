@@ -237,6 +237,42 @@ mod tests {
         }
     }
 
+    /// E1b F5（变异 M5 的守护）：`inline_boxes` 是 shaping 输入（§4.5 / §11.1），必须参与
+    /// `ShapeKey`。删掉 `ShapeKey::new` 里的 inline-box 哈希后本用例必须变红。
+    #[test]
+    fn shape_key_distinguishes_inline_boxes() {
+        use crate::{
+            math::Size,
+            text::{InlineAlign, InlineBoxSpec},
+        };
+
+        let spec = |id: u64, index: usize, width: f32| InlineBoxSpec {
+            id,
+            index,
+            size: Size::new(width, 8.0),
+            baseline: None,
+            align: InlineAlign::Baseline,
+        };
+        let content = |boxes: &[InlineBoxSpec]| {
+            TextContent::new("ab cd", TextStyle::new(16.0)).with_inline_boxes(boxes.iter().copied())
+        };
+
+        let plain = ShapeKey::new(&TextContent::new("ab cd", TextStyle::new(16.0)), 1);
+        let one = ShapeKey::new(&content(&[spec(1, 2, 8.0)]), 1);
+        let other_id = ShapeKey::new(&content(&[spec(2, 2, 8.0)]), 1);
+        let other_index = ShapeKey::new(&content(&[spec(1, 4, 8.0)]), 1);
+        let other_size = ShapeKey::new(&content(&[spec(1, 2, 12.0)]), 1);
+        let two = ShapeKey::new(&content(&[spec(1, 2, 8.0), spec(2, 4, 8.0)]), 1);
+
+        assert_ne!(plain, one, "有/无 inline_boxes 必须区分（变异 M5 的守卫）");
+        assert_ne!(one, other_id, "id 必须参与键");
+        assert_ne!(one, other_index, "index 必须参与键");
+        assert_ne!(one, other_size, "size 必须参与键");
+        assert_ne!(one, two, "行内盒序列必须参与键");
+        // 同一输入 ⇒ 同键（哈希不能把等价输入打散，否则缓存命中率归零）。
+        assert_eq!(one, ShapeKey::new(&content(&[spec(1, 2, 8.0)]), 1));
+    }
+
     #[test]
     fn shape_key_distinguishes_text_and_style() {
         let style = TextStyle::new(16.0);
