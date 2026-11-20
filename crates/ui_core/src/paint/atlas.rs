@@ -193,7 +193,7 @@ mod tests {
         assert_eq!(
             size_of::<AtlasTile>() - 24,
             8,
-            "相对 24 B 版本的增量（内存影响见 spec-delta §7.2）"
+            "相对 24 B 版本的增量（内存影响见 spec-delta §7.4）"
         );
     }
 }
