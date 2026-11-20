@@ -327,6 +327,33 @@ pub enum EngineError {
         /// 目标节点。
         node: NodeId,
     },
+
+    /// 虚拟列表入口参数与当前条目数不符（E3 §11.3）。
+    ///
+    /// 两种来源共用同一变体（语义都是「入口参数与条目数不符」）：
+    /// - `App::set_virtual_extents`：`extents.len() != count`（`expected = count`、
+    ///   `actual = extents.len()`）；
+    /// - `App::scroll_to_item`：`index >= count`（`expected = count`、`actual = index + 1`，
+    ///   即 1-based 的请求位置，避免 `index == count` 时文案自相矛盾）。
+    #[error("virtual list item count mismatch: expected {expected}, got {actual}")]
+    VirtualListExtents {
+        /// 当前条目数。
+        expected: usize,
+        /// 实际参数所指向的位置 / 长度。
+        actual: usize,
+    },
+
+    /// 逐项行高非法（非有限值或负值；E3 §11.3 入口校验）。
+    #[error(
+        "virtual list extent at index {index} is invalid: {value} \
+         (extents must be finite and non-negative)"
+    )]
+    InvalidVirtualExtent {
+        /// 非法值在 `extents` 里的下标。
+        index: usize,
+        /// 应用给的值。
+        value: f32,
+    },
     /// 窗口已关闭 / 从未存在（P10：需要返回句柄或开启动画时无法静默）。
     #[error("unknown window: {window:?}")]
     UnknownWindow {

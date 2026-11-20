@@ -336,13 +336,35 @@ impl VirtualList {
     }
 }
 
-/// 虚拟列表参数（v1 只支持均匀行高）。
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// 虚拟列表参数（v2.1 / E3：可选逐项高度）。
+///
+/// `extents = None` ⇒ 与 v1 逐字节一致（行位置 `index * extent`、内容高度 `count * extent`）；
+/// `extents = Some(..)` ⇒ 逐项高度，`extent` 仅作为条目数变化后新高度尚未送达时的回落值。
+///
+/// 创建时就已知行高时可在 `make_virtual_list` 里给 `extents`：引擎先记住它，`set_virtual_items`
+/// 的条目数与之匹配时生效；不匹配则丢弃（应用随后用 [`crate::app::App::set_virtual_extents`]
+/// 整体替换）。
+#[derive(Clone, Debug, PartialEq)]
 pub struct VirtualListConfig {
     /// 每行高度（逻辑像素，`> 0`）。
     pub extent: f32,
+    /// 逐项高度（逻辑像素，有限且 `>= 0`）：`Some` 时以它为准（条目数变化丢弃后回落到 `extent`）。
+    pub extents: Option<Box<[f32]>>,
     /// 视口外多挂几行（上下一侧各 `overscan`）。
     pub overscan: usize,
+}
+
+/// `scroll_to_item` 的对齐方式（E3）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ItemAlign {
+    /// 条目顶边贴视口顶边。
+    Start,
+    /// 条目中心对齐视口中心。
+    Center,
+    /// 条目底边贴视口底边。
+    End,
+    /// 已完全可见则不滚，否则滚到最近的边界。
+    Nearest,
 }
 
 /// 虚拟列表状态快照（也供 a11y 计算 `pos_in_set` / `set_size`）。
@@ -364,8 +386,15 @@ pub struct VirtualListState {
 
 /// 虚拟列表槽（`Node.interaction.virtual_list`）。
 pub(crate) struct VirtualSlot {
-    /// 行高。
+    /// 行高（`extents = None` 或逐项高度尚未与条目数对齐时的回落值）。
     pub extent: f32,
+    /// 逐项高度（E3）。`Some` 时 `prefix` 同步可用。
+    pub extents: Option<Box<[f32]>>,
+    /// `extents` 的前缀和缓存（`len == extents.len() + 1`、`prefix[0] = 0`）。
+    ///
+    /// **只在 `set_extents` / `clear_extents` 里重建**：滚动帧只做二分查询（O(log n)），
+    /// 不每帧重算（I3 的预算前提）。
+    prefix: Vec<f32>,
     /// overscan。
     pub overscan: usize,
     /// 条目总数。
@@ -376,10 +405,61 @@ pub(crate) struct VirtualSlot {
     pub mounted: Vec<(usize, NodeId)>,
 }
 
+impl VirtualSlot {
+    /// 空槽（`make_virtual_list` 的唯一构造点；`prefix` 只随 [`VirtualSlot::set_extents`] 变化）。
+    pub(crate) fn new(extent: f32, overscan: usize) -> Self {
+        Self {
+            extent,
+            extents: None,
+            prefix: Vec::new(),
+            overscan,
+            count: 0,
+            builder: None,
+            mounted: Vec::new(),
+        }
+    }
+
+    /// 整体替换逐项高度并重算前缀和（O(n)）。
+    pub(crate) fn set_extents(&mut self, extents: Box<[f32]>) {
+        self.prefix.clear();
+        self.prefix.reserve(extents.len() + 1);
+        self.prefix.push(0.0);
+        let mut total = 0.0;
+        for &height in &extents {
+            total += height;
+            self.prefix.push(total);
+        }
+        self.extents = Some(extents);
+    }
+
+    /// 丢弃逐项高度，回落到单一 [`VirtualSlot::extent`]。
+    pub(crate) fn clear_extents(&mut self) {
+        self.extents = None;
+        self.prefix.clear();
+    }
+
+    /// 当前**生效**的逐项高度：`Some` ⇔ 长度与 [`VirtualSlot::count`] 一致。
+    ///
+    /// 不一致只出现在「`make_virtual_list` 预置高度 → `set_virtual_items`」之间：那段时间
+    /// 没有行、也没有帧，按单一 `extent` 处理。
+    pub(crate) fn active_extents(&self) -> Option<&[f32]> {
+        self.extents
+            .as_deref()
+            .filter(|extents| extents.len() == self.count)
+    }
+
+    /// 前缀和缓存（长度 `count + 1`；仅当 [`VirtualSlot::active_extents`] 为 `Some` 时可用）。
+    pub(crate) fn prefix(&self) -> &[f32] {
+        &self.prefix
+    }
+}
+
 impl std::fmt::Debug for VirtualSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VirtualSlot")
             .field("extent", &self.extent)
+            .field("extents", &self.extents.as_deref().map(<[f32]>::len))
+            .field("prefix", &self.prefix.len())
             .field("overscan", &self.overscan)
             .field("count", &self.count)
             .field("builder", &self.builder.as_ref().map(|_| "<closure>"))

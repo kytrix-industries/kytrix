@@ -40,8 +40,8 @@ use crate::{
     },
     interaction::{
         ActionCtx, AnimatedValue, AnimationId, AnimationSpec, DragInfo, DragState, Easing,
-        InputThresholds, Overlay, OverlayDismiss, OverlayOptions, OverlayPlacement, ScrollConfig,
-        ScrollHandle, ScrollState, VirtualList, VirtualListConfig, VirtualListState,
+        InputThresholds, ItemAlign, Overlay, OverlayDismiss, OverlayOptions, OverlayPlacement,
+        ScrollConfig, ScrollHandle, ScrollState, VirtualList, VirtualListConfig, VirtualListState,
     },
     layout::hit_test::HitResult,
     math::{Point, Rect, Size},
@@ -1526,6 +1526,35 @@ impl App {
     #[must_use]
     pub fn virtual_row_index(&self, list: &VirtualList, row: NodeId) -> Option<usize> {
         virtual_list::virtual_row_index(self, list, row)
+    }
+
+    /// 逐项高度**整体替换**（E3；`extents.len()` 必须等于当前条目数）。
+    ///
+    /// 引擎重算前缀和（O(n)），并按锚点补偿滚动偏移：替换前的「首个可见 index + 行内偏移」
+    /// 在替换后保持不变（同一调用内完成，不额外请求帧，I3）。与旧高度逐项相同时是纯 no-op。
+    ///
+    /// # Errors
+    /// `NotVirtualList`（list 失效 / 未 `make_virtual_list`）；`VirtualListExtents`（长度与
+    /// 条目数不符）；`InvalidVirtualExtent`（逐项高度非有限或为负）。
+    pub fn set_virtual_extents(
+        &mut self,
+        list: &VirtualList,
+        extents: &[f32],
+    ) -> Result<(), EngineError> {
+        virtual_list::set_virtual_extents(self, list, extents)
+    }
+
+    /// 把第 `index` 项按 `align` 对齐到视口（E3）；`Nearest` = 已完全可见则不滚。
+    ///
+    /// # Errors
+    /// `NotVirtualList`（list 失效）；`VirtualListExtents`（`index` 越界）。
+    pub fn scroll_to_item(
+        &mut self,
+        list: &VirtualList,
+        index: usize,
+        align: ItemAlign,
+    ) -> Result<(), EngineError> {
+        virtual_list::scroll_to_item(self, list, index, align)
     }
 
     /// 布局后/视口变化后修复所有虚拟列表的可见窗口（幂等：区间不变则零工作）。

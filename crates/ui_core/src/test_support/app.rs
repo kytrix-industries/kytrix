@@ -1711,6 +1711,7 @@ mod p11_tests {
                 container,
                 crate::interaction::VirtualListConfig {
                     extent: 20.0,
+                    extents: None,
                     overscan: 1,
                 },
             )
