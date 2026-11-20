@@ -185,14 +185,14 @@ pub struct GeometryDesc {
     pub pipeline: GeometryPipeline,
 }
 
-/// 一次 `GeometryStore::update_vertices` / `update_indices` 成功的回执。
+/// 一次 `GeometryStore::update_vertices` / `update_indices` / `truncate` 成功的回执。
 ///
 /// `damaged` 是**受影响块**「旧 bounds ∪ 新 bounds」的并集（逻辑像素）。顶点位移时旧位置与新
-/// 位置都必须重画，因此是两侧并集而不是新值；没有块受影响（比如追加了一段暂时未被索引引用的
-/// 顶点）时为空矩形。
+/// 位置都必须重画，因此是两侧并集而不是新值；截断时是被移除块（以及变短的尾块）的**旧 AABB**；
+/// 没有可见变化（比如追加了一段暂时未被索引引用的顶点、截断到当前长度）时为空矩形。
 ///
-/// 消费者：`App::update_geometry_*` 把它并入绑定几何节点的 damage（节点由引擎自动标脏，应用
-/// 不需要自己再声明 damage）。
+/// 消费者：`App::update_geometry_*` / `App::truncate_geometry` 把它并入绑定节点的标脏判断
+/// （节点由引擎自动标脏，应用不需要自己再声明 damage）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GeometryUpdate {
     /// 更新后的几何版本（单调递增；无可见变化时也会前进）。GPU 侧据此判断快照新旧。

@@ -4,9 +4,9 @@
 //! 只用于日志 / CI / 开发者；面向用户的本地化文案由应用层按变体生成（i18n 留应用层）。
 //!
 //! **变体表随阶段演进增删，不保持向后兼容**（AGENTS §1.1；应用代码按变体匹配，不按数量）。
-//! 当前 21 个变体的 payload 与语义以各变体定义为准；其中与静态几何增量更新（X5）相关的 4 个
-//! 是 [`EngineError::UnknownGeometry`] / [`EngineError::GeometryRangeOutOfBounds`] /
-//! [`EngineError::GeometryRangeUnaligned`] / [`EngineError::GeometryRangeBytes`]，
+//! 静态几何增量更新（X5）相关的是 [`EngineError::UnknownGeometry`] /
+//! [`EngineError::GeometryRangeOutOfBounds`] / [`EngineError::GeometryRangeUnaligned`] /
+//! [`EngineError::GeometryRangeBytes`] / [`EngineError::GeometryTruncateGrows`]，
 //! [`EngineError::GeometryRegister`] 由三端 GPU 后端（快照缺失 / 非法数据）生产。
 //! `LayoutInvalid` 暂无生产者（保留给布局契约的显式失败路径）。
 
@@ -264,6 +264,25 @@ pub enum EngineError {
         range: std::ops::Range<u32>,
         /// 实际提供的字节数。
         bytes: usize,
+    },
+
+    /// 几何截断的目标长度大于当前长度：截断只能缩短，增长必须走 range 更新（尾随追加）。
+    ///
+    /// 单独一个变体而不是复用 [`Self::GeometryRangeOutOfBounds`]：后者描述「range 越界」，
+    /// 处理策略是修正 range 参数；这里的处理策略是**换 API**（`update_vertices` /
+    /// `update_indices`），调用方按变体就能区分。
+    #[error(
+        "geometry {geometry:?} {buffer:?} truncate to {requested} elements would grow it \
+         (current length {current} elements)"
+    )]
+    GeometryTruncateGrows {
+        geometry: crate::paint::geometry::GeometryId,
+        /// 作用于哪个缓冲（顶点 / 索引）。
+        buffer: crate::paint::geometry::GeometryBuffer,
+        /// 应用要求的元素个数。
+        requested: u32,
+        /// 缓冲当前元素个数。
+        current: u32,
     },
 
     /// 引擎 / 平台初始化失败（`Application::run` 的前置条件；P08 的渲染器初始化也走这里）。

@@ -4,7 +4,8 @@
 //!
 //! `GeometryId` 的字段是私有的，唯一合法的铸造点是 [`GeometryStore`]。应用只在装载期注册
 //! （[`GeometryStore::insert`]），之后用 **range 更新**（`update_vertices` / `update_indices`）
-//! 原地修改顶点/索引子区间，而不是每 tick 重注册整段几何。
+//! 原地修改顶点/索引子区间，或用 **成对截断**（[`GeometryStore::truncate`]）缩短滑动窗口，
+//! 而不是每 tick 重注册整段几何。
 //!
 //! # 与成熟实现的关系
 //!
@@ -71,7 +72,7 @@ struct GeometryRecord {
     bounds: Rect,
     /// 几何版本（单调递增；每次真正改到数据 +1）。
     revision: u64,
-    /// 块元数据（按索引序；块数只随索引增长而增加）。
+    /// 块元数据（按索引序；块数随索引长度变化：追加增长 / 截断缩短）。
     chunks: Vec<ChunkRecord>,
     /// 顶点页（`bytes::Bytes` 不可变；未变的页跨更新共享同一份分配）。
     vertex_pages: Vec<Bytes>,
@@ -431,6 +432,115 @@ impl GeometryStore {
         Ok(GeometryUpdate { revision, damaged })
     }
 
+    /// **成对截断**顶点 / 索引缓冲（X5 滑动窗口：删掉最旧的 N 根 K 线 + 追加新的）。
+    ///
+    /// `vertices` / `indices` 是**元素个数**（不是字节数），必须各自 `<=` 当前个数；截断只能
+    /// 缩短，增长走 [`GeometryStore::update_vertices`] / [`GeometryStore::update_indices`]。
+    /// 两个目标都等于当前个数时是 **no-op**（不推进版本、不产生 damage）。
+    ///
+    /// 语义：
+    /// - 数据先截断，再按新长度重写页表：末端页按实际长度存、多余页丢弃；未触碰的页保持原
+    ///   `Bytes`（GPU 侧仍按页 `ptr_eq` 做增量上传）。
+    /// - 块数按 `chunk_count(topology, indices)` 重算（只减）；被移除块的**旧 AABB** 并入
+    ///   `damaged`（旧像素要重画），尾块若真的变短/重扫出不同 AABB 也并入旧 AABB。
+    /// - 尾块（最后一个保留块）的 block revision 只在它的索引区间 / 顶点引用 / AABB 真的变化时
+    ///   推进；paint 因此只重建这条块 lane，其余块 lane 整段复用。
+    /// - 截断后可以继续用 `update_vertices` / `update_indices` 做**尾随追加**（同一条追加路径）。
+    ///
+    /// 契约：应用必须保证截断后剩余索引不引用被移除的顶点（与 `insert` 一样，引擎只校验结构，
+    /// 不校验索引值的合法性；越界索引在 GPU 侧是未定义行为）。
+    ///
+    /// # Errors
+    /// - [`EngineError::UnknownGeometry`]：句柄陈旧 / 已释放；
+    /// - [`EngineError::GeometryTruncateGrows`]：目标个数大于当前个数。
+    pub fn truncate(
+        &mut self,
+        id: GeometryId,
+        vertices: u32,
+        indices: u32,
+    ) -> Result<GeometryUpdate, EngineError> {
+        let Some(record) = self.entries.get_mut(id) else {
+            return Err(EngineError::UnknownGeometry { geometry: id });
+        };
+        let stride = record.layout.vertex_stride as usize;
+        let index_size = record.layout.index_type.size() as usize;
+        let current_vertices = (record.vertex.len() / stride) as u32;
+        let current_indices = (record.index.len() / index_size) as u32;
+        for (buffer, requested, current) in [
+            (GeometryBuffer::Vertex, vertices, current_vertices),
+            (GeometryBuffer::Index, indices, current_indices),
+        ] {
+            if requested > current {
+                return Err(EngineError::GeometryTruncateGrows {
+                    geometry: id,
+                    buffer,
+                    requested,
+                    current,
+                });
+            }
+        }
+        if vertices == current_vertices && indices == current_indices {
+            return Ok(GeometryUpdate {
+                revision: record.revision,
+                damaged: Rect::default(),
+            });
+        }
+        // 1) 数据 + 页：先截断数据，再缩短页表（末端页按实际长度重写、多余页丢弃）。
+        record.vertex.truncate(vertices as usize * stride);
+        truncate_pages(&record.vertex, &mut record.vertex_pages);
+        record.index.truncate(indices as usize * index_size);
+        truncate_pages(&record.index, &mut record.index_pages);
+        // 2) 块表：块数只减。先按**旧**块表算 damage（被移除块的旧 AABB）。
+        let wanted = chunk_count(record.layout.topology, indices);
+        let previous_chunks = record.chunks.len();
+        let mut damaged = Rect::default();
+        for chunk in wanted as usize..previous_chunks {
+            damaged = damaged.union(record.chunks[chunk].bounds);
+        }
+        self.revision += 1;
+        let revision = self.revision;
+        // 3) 尾块：索引区间变短（或顶点被截断）时重扫 AABB / 顶点引用；只有真的变化才推进
+        //    该块 revision（paint 据此决定是否重建这条块 lane）。
+        if let Some(tail) = wanted.checked_sub(1) {
+            let tail = tail as usize;
+            let old = &record.chunks[tail];
+            let old_bounds = old.bounds;
+            let old_count = old.index_count;
+            let old_vertex_first = old.vertex_first;
+            let old_vertex_end = old.vertex_end;
+            let range = chunk_index_range(record.layout.topology, indices, tail as u32)
+                .expect("tail < chunk_count 时区间必须存在");
+            let count = range.end - range.start;
+            if count != old_count || vertices < current_vertices {
+                let scan = scan_chunk(
+                    &record.layout,
+                    &record.vertex,
+                    &record.index,
+                    range.start,
+                    count,
+                );
+                let changed = count != old_count
+                    || scan.vertex_first != old_vertex_first
+                    || scan.vertex_end != old_vertex_end
+                    || scan.bounds != old_bounds;
+                if changed {
+                    damaged = damaged.union(old_bounds).union(scan.bounds);
+                    let meta = &mut record.chunks[tail];
+                    meta.index_first = range.start;
+                    meta.index_count = count;
+                    meta.vertex_first = scan.vertex_first;
+                    meta.vertex_end = scan.vertex_end;
+                    meta.bounds = scan.bounds;
+                    meta.revision = revision;
+                }
+            }
+        }
+        record.chunks.truncate(wanted as usize);
+        record.revision = revision;
+        record.snapshot = rebuild_snapshot(record);
+        Ok(GeometryUpdate { revision, damaged })
+    }
+
     /// 已注册数量（诊断 / 测试）。
     #[must_use]
     pub fn len(&self) -> usize {
@@ -588,6 +698,20 @@ fn rebuild_pages(data: &[u8], pages: &mut Vec<Bytes>, range: Range<usize>) {
         let start = page * GEOMETRY_PAGE_BYTES;
         let end = (start + GEOMETRY_PAGE_BYTES).min(data.len());
         *slot = Bytes::copy_from_slice(&data[start..end]);
+    }
+}
+
+/// 缩短页表以匹配**已截断**的数据：末端页按实际长度重写、多余页丢弃。
+///
+/// 未触碰的整页保持原 `Bytes`（引用计数共享），因此截断后的 GPU 上传仍只覆盖新末页。
+fn truncate_pages(data: &[u8], pages: &mut Vec<Bytes>) {
+    let keep = data.len().div_ceil(GEOMETRY_PAGE_BYTES);
+    pages.truncate(keep);
+    if !data.len().is_multiple_of(GEOMETRY_PAGE_BYTES)
+        && let Some(page) = pages.last_mut()
+    {
+        let start = (keep - 1) * GEOMETRY_PAGE_BYTES;
+        *page = Bytes::copy_from_slice(&data[start..]);
     }
 }
 
@@ -1258,5 +1382,290 @@ mod tests {
         // 旧快照仍可用（在途帧持有 Arc），但 store 不再提供它。
         assert_eq!(snapshot.vertex_len(), 36);
         assert!(store.snapshot_arc(id).is_none());
+    }
+
+    // ── 截断：块数只减 / 旧块 damage / 页收缩 / 截断后追加 ───────────────────
+
+    /// 4106 个三角形 = 2 块（块 1 只有 30 个索引）；截断到 4096 个三角形后只剩块 0，
+    /// damage 必须覆盖被移除块 1 的旧 AABB，且块 0 没变 ⇒ 它的 revision 不推进。
+    #[test]
+    fn truncate_shrinks_chunks_and_damages_the_removed_blocks() {
+        let mut store = GeometryStore::new();
+        let id = store.insert(long_desc(4096 + 10)).expect("valid");
+        let before = snapshot(&store, id);
+        assert_eq!(before.chunks().len(), 2, "4106 三角形 = 两块");
+        let removed = before.chunk(1).expect("chunk").bounds;
+        let kept_revision = before.chunk(0).expect("chunk").revision;
+        assert!(!removed.is_empty());
+
+        let update = store.truncate(id, 4096 * 3, 4096 * 3).expect("成对截断");
+        assert!(update.revision > before.revision(), "revision 必须前进");
+        assert!(
+            update.damaged.origin.x <= removed.origin.x
+                && update.damaged.origin.y <= removed.origin.y
+                && update.damaged.max().x >= removed.max().x
+                && update.damaged.max().y >= removed.max().y,
+            "damage 必须覆盖被移除块的旧 AABB：removed={removed:?} damaged={:?}",
+            update.damaged
+        );
+
+        let after = snapshot(&store, id);
+        assert_eq!(after.revision(), update.revision);
+        assert_eq!(after.chunks().len(), 1, "块数只减");
+        assert_eq!(after.chunk(0).expect("chunk").index_count, 4096 * 3);
+        assert_eq!(
+            after.chunk(0).expect("chunk").revision,
+            kept_revision,
+            "尾块完全没变 ⇒ 不推进 revision（paint 复用它的块 lane）"
+        );
+        assert_eq!(after.vertex_len(), 4096 * 3 * 12);
+        assert_eq!(after.index_len(), 4096 * 3 * 2);
+    }
+
+    /// 末端页按新长度重写、多余页丢弃；未触碰的整页仍与旧快照共享同一份 `Bytes`。
+    #[test]
+    fn truncate_shortens_the_tail_page_and_drops_extra_pages() {
+        // 500 三角形 = 18000 B 顶点（5 页：4 × 4096 + 1616）+ 3000 B 索引（1 页）。
+        let mut store = GeometryStore::new();
+        let id = store.insert(long_desc(500)).expect("valid");
+        let before = snapshot(&store, id);
+        assert_eq!(before.vertex_pages().len(), 5);
+        assert_eq!(before.index_pages().len(), 1);
+        let old_tail_page = Bytes::clone(&before.vertex_pages()[3]);
+        assert_eq!(before.vertex_pages()[4].len(), 1616);
+        let old_chunk_bounds = before.chunk(0).expect("chunk").bounds;
+
+        // 400 三角形 = 14400 B 顶点（4 页：3 × 4096 + 2112）+ 2400 B 索引（1 页）。
+        let update = store.truncate(id, 1200, 1200).expect("截断");
+        let after = snapshot(&store, id);
+        assert_eq!(after.vertex_len(), 14400);
+        assert_eq!(after.index_len(), 2400);
+        assert_eq!(after.vertex_pages().len(), 4, "多余页必须丢弃");
+        assert_eq!(
+            after.vertex_pages()[3].len(),
+            14400 - 3 * GEOMETRY_PAGE_BYTES
+        );
+        assert_eq!(
+            &after.vertex_pages()[3][..],
+            &old_tail_page[..14400 - 3 * GEOMETRY_PAGE_BYTES],
+            "新末页必须是旧末页的前缀（数据没被改写，只是变短）"
+        );
+        for page in 0..3 {
+            assert_eq!(
+                after.vertex_pages()[page].as_ptr(),
+                before.vertex_pages()[page].as_ptr(),
+                "未触碰的页必须共享同一份分配：page {page}"
+            );
+        }
+        assert_eq!(after.index_pages().len(), 1);
+        assert_eq!(after.index_pages()[0].len(), 2400);
+        assert_eq!(after.chunks().len(), 1);
+        assert_eq!(after.chunk(0).expect("chunk").index_count, 1200);
+        assert_eq!(
+            update.damaged, old_chunk_bounds,
+            "damage = 变短的尾块旧 AABB ∪ 新 AABB = 旧 AABB"
+        );
+    }
+
+    /// 截断后继续尾随追加：走现有的 append 路径，只动尾块；damage 覆盖追加的新位置。
+    #[test]
+    fn truncate_then_append_reuses_the_tail_append_path() {
+        let mut store = GeometryStore::new();
+        let id = store.insert(long_desc(4096 + 2)).expect("valid");
+        // 先追加一个三角形（尾块 6 → 9 个索引）。
+        let appended = snapshot(&store, id);
+        let base = (appended.vertex_len() / 12) as u16;
+        let vertex_at = appended.vertex_len();
+        store
+            .update_vertices(
+                id,
+                vertex_at..vertex_at + 36,
+                &vertex_bytes(&[[200.0, 200.0], [201.0, 200.0], [200.0, 201.0]]),
+            )
+            .expect("追加顶点");
+        let index_at = appended.index_len();
+        store
+            .update_indices(
+                id,
+                index_at..index_at + 6,
+                &index_bytes_u16(&[base, base + 1, base + 2]),
+            )
+            .expect("追加索引");
+        assert_eq!(snapshot(&store, id).chunk(1).expect("chunk").index_count, 9);
+        let base_count = u32::from(base);
+
+        // 截掉刚才那个三角形：尾块回到 6 个索引，damage 覆盖 (200,200) 的旧位置。
+        let update = store.truncate(id, base_count, base_count).expect("截断");
+        assert!(
+            update.damaged.max().x >= 201.0 && update.damaged.max().y >= 201.0,
+            "被截掉三角形的新位置必须进 damage：{:?}",
+            update.damaged
+        );
+        let truncated = snapshot(&store, id);
+        assert_eq!(truncated.chunks().len(), 2);
+        assert_eq!(truncated.chunk(1).expect("chunk").index_count, 6);
+        assert_eq!(truncated.vertex_len(), base_count * 12);
+        assert_eq!(truncated.index_len(), base_count * 2);
+
+        // 截断后再追加（同一路径）：尾块回到 9 个索引，新位置进 damage。
+        let vertex_at = truncated.vertex_len();
+        store
+            .update_vertices(
+                id,
+                vertex_at..vertex_at + 36,
+                &vertex_bytes(&[[300.0, 300.0], [301.0, 300.0], [300.0, 301.0]]),
+            )
+            .expect("再次追加顶点");
+        let index_at = truncated.index_len();
+        let update = store
+            .update_indices(
+                id,
+                index_at..index_at + 6,
+                &index_bytes_u16(&[base, base + 1, base + 2]),
+            )
+            .expect("再次追加索引");
+        let again = snapshot(&store, id);
+        assert_eq!(again.chunks().len(), 2);
+        assert_eq!(again.chunk(1).expect("chunk").index_count, 9);
+        assert!(
+            update.damaged.max().x >= 301.0,
+            "再次追加的新位置必须进 damage：{:?}",
+            update.damaged
+        );
+        assert!(
+            again.chunk(1).expect("chunk").bounds.max().x >= 301.0,
+            "尾块 AABB 必须包含新三角形：{:?}",
+            again.chunk(1).expect("chunk").bounds
+        );
+    }
+
+    /// 截断删掉尾块后，下一次追加必须能重新建出块 1（块表不能残留在「已删除」状态）。
+    #[test]
+    fn append_after_truncation_creates_the_next_chunk_again() {
+        let mut store = GeometryStore::new();
+        let id = store.insert(long_desc(4096 + 2)).expect("valid");
+        let update = store.truncate(id, 4096 * 3, 4096 * 3).expect("截断到一块");
+        assert_eq!(snapshot(&store, id).chunks().len(), 1);
+        assert!(!update.damaged.is_empty(), "被移除的块 1 必须进 damage");
+
+        let truncated = snapshot(&store, id);
+        let vertex_at = truncated.vertex_len();
+        store
+            .update_vertices(
+                id,
+                vertex_at..vertex_at + 36,
+                &vertex_bytes(&[[100.0, 100.0], [101.0, 100.0], [100.0, 101.0]]),
+            )
+            .expect("追加顶点");
+        let index_at = truncated.index_len();
+        let update = store
+            .update_indices(
+                id,
+                index_at..index_at + 6,
+                &index_bytes_u16(&[12288, 12289, 12290]),
+            )
+            .expect("追加索引");
+        let after = snapshot(&store, id);
+        assert_eq!(after.chunks().len(), 2, "被截掉的尾块必须能重新建出来");
+        assert_eq!(
+            (
+                after.chunk(1).expect("chunk").index_first,
+                after.chunk(1).expect("chunk").index_count
+            ),
+            (12288, 3)
+        );
+        assert!(
+            update.damaged.max().x >= 101.0,
+            "新块的 bounds 必须进 damage：{:?}",
+            update.damaged
+        );
+    }
+
+    /// 截断到 0：全部块消失、页表清空；之后可以从空缓冲重新增长回一块。
+    #[test]
+    fn truncate_to_zero_drops_every_chunk_and_can_grow_again() {
+        let mut store = GeometryStore::new();
+        let id = store.insert(long_desc(4096 + 2)).expect("valid");
+        let before = snapshot(&store, id);
+        assert_eq!(before.chunks().len(), 2);
+        let update = store.truncate(id, 0, 0).expect("清空");
+        assert!(!update.damaged.is_empty(), "被移除的全部块都必须进 damage");
+        let empty = snapshot(&store, id);
+        assert_eq!(empty.chunks().len(), 0);
+        assert_eq!(empty.vertex_len(), 0);
+        assert_eq!(empty.index_len(), 0);
+        assert!(empty.vertex_pages().is_empty());
+        assert!(empty.index_pages().is_empty());
+
+        // 空缓冲上重新追加一个三角形。
+        store
+            .update_vertices(
+                id,
+                0..36,
+                &vertex_bytes(&[[7.0, 7.0], [8.0, 7.0], [7.0, 8.0]]),
+            )
+            .expect("从空缓冲追加顶点");
+        store
+            .update_indices(id, 0..6, &index_bytes_u16(&[0, 1, 2]))
+            .expect("从空缓冲追加索引");
+        let after = snapshot(&store, id);
+        assert_eq!(after.chunks().len(), 1);
+        assert_eq!(after.chunk(0).expect("chunk").index_count, 3);
+        assert_eq!(after.vertex_len(), 36);
+        let _ = before;
+    }
+
+    /// 目标个数大于当前个数是**独立的强类型错误**（处理策略是换 API，不是修 range）。
+    #[test]
+    fn truncate_growth_is_a_typed_error() {
+        let mut store = GeometryStore::new();
+        let id = store.insert(triangle_desc()).expect("valid");
+        let before = snapshot(&store, id);
+        match store.truncate(id, 4, 3) {
+            Err(EngineError::GeometryTruncateGrows {
+                geometry,
+                buffer,
+                requested,
+                current,
+            }) => {
+                assert_eq!(geometry, id);
+                assert_eq!(buffer, GeometryBuffer::Vertex);
+                assert_eq!((requested, current), (4, 3));
+            }
+            other => panic!("顶点增长必须报 GeometryTruncateGrows，实际 {other:?}"),
+        }
+        match store.truncate(id, 3, 4) {
+            Err(EngineError::GeometryTruncateGrows { buffer, .. }) => {
+                assert_eq!(buffer, GeometryBuffer::Index);
+            }
+            other => panic!("索引增长必须报 GeometryTruncateGrows，实际 {other:?}"),
+        }
+        // 失败不得改动任何状态（版本、长度、快照都保持）。
+        let after = snapshot(&store, id);
+        assert_eq!(after.revision(), before.revision());
+        assert_eq!(after.vertex_len(), 36);
+        assert_eq!(after.index_len(), 6);
+
+        let stale = crate::paint::geometry::GeometryId::for_test(99, 1);
+        match store.truncate(stale, 0, 0) {
+            Err(EngineError::UnknownGeometry { geometry }) => assert_eq!(geometry, stale),
+            other => panic!("陈旧句柄必须报 UnknownGeometry，实际 {other:?}"),
+        }
+    }
+
+    /// 截断到当前长度 = no-op：不推进版本、不产生 damage、不重建快照。
+    #[test]
+    fn truncate_to_the_current_lengths_is_a_noop() {
+        let mut store = GeometryStore::new();
+        let id = store.insert(triangle_desc()).expect("valid");
+        let before = snapshot(&store, id);
+        let update = store.truncate(id, 3, 3).expect("等长截断是 no-op");
+        assert_eq!(update.revision, before.revision(), "no-op 不推进版本");
+        assert!(update.damaged.is_empty(), "no-op 不产生 damage");
+        let after = snapshot(&store, id);
+        assert!(
+            std::sync::Arc::ptr_eq(&before, &after),
+            "no-op 不得重建快照（GPU 侧没有任何可上传的差异）"
+        );
     }
 }

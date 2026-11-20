@@ -605,6 +605,10 @@ impl App {
     }
 
     /// 静态几何注册表（可变）：`insert` / `release` 的唯一入口。
+    ///
+    /// 注意：直接调用 store 的 `update_vertices` / `update_indices` / `truncate` 只改数据，
+    /// **不会**标脏绑定节点、也不会请求帧；要自动标脏请用 [`App::update_geometry_vertices`] /
+    /// [`App::update_geometry_indices`] / [`App::truncate_geometry`]。
     pub fn geometry_mut(&mut self) -> &mut crate::paint::geometry_store::GeometryStore {
         resources::geometry_mut(self)
     }
@@ -664,6 +668,39 @@ impl App {
         bytes: &[u8],
     ) -> Result<crate::paint::geometry::GeometryUpdate, EngineError> {
         geometry::update_indices(self, geometry, range, bytes)
+    }
+
+    /// 几何数据的**成对截断**（X5 滑动窗口）：把顶点/索引缓冲同时缩短到给定的**元素个数**。
+    ///
+    /// `vertices` / `indices` 是**元素个数**（顶点个数 / 索引个数，不是字节数），必须各自
+    /// `<=` 当前个数。截断只能缩短；增长走 [`App::update_geometry_vertices`] /
+    /// [`App::update_geometry_indices`]（尾随追加）。两者都等于当前个数是 no-op（不推进版本、
+    /// 不产生 damage、不标脏、不请求帧）。
+    ///
+    /// 语义（K 线滑动窗口：删掉最旧的 N 根 + 追加新的）：
+    /// - 块数按新索引个数重算（**只减**）：被移除的块 lane 由 paint 释放，返回的 `damaged`
+    ///   覆盖它们的旧 AABB（**逻辑像素**），旧像素因此会被重画；
+    /// - 末端页按新长度缩短、多余页丢弃；未触碰的页仍与上一版本共享同一分配 ⇒ GPU 侧继续按页
+    ///   增量上传（不需要 `release` + `insert` 全量重建）；
+    /// - 截断后可以继续用 `update_geometry_*` 做**尾随追加**（同一条追加路径，只重建尾块）。
+    ///
+    /// 契约：应用必须保证截断后剩余索引不引用被移除的顶点（与注册期一致，引擎不校验索引值的
+    /// 合法性；越界索引在 GPU 侧是未定义行为）。
+    ///
+    /// 与 range 更新一样：所有窗口里绑定该几何的节点（几何节点 / 引用该几何的 Canvas 节点）
+    /// 会自动标脏，并自动请求一帧。
+    ///
+    /// # Errors
+    /// - [`EngineError::UnknownGeometry`]：句柄陈旧 / 已释放；
+    /// - [`EngineError::GeometryTruncateGrows`]：目标个数大于当前个数（增长应走
+    ///   `update_geometry_*`）。
+    pub fn truncate_geometry(
+        &mut self,
+        geometry: crate::paint::geometry::GeometryId,
+        vertices: u32,
+        indices: u32,
+    ) -> Result<crate::paint::geometry::GeometryUpdate, EngineError> {
+        geometry::truncate(self, geometry, vertices, indices)
     }
 
     /// 依赖图（只读；`test-support` 的 `diagnostics::dependency_dump` 用）。

@@ -4,12 +4,14 @@
 //!   变换（`GeometryDraw.transform` → 顶点着色器的 `draw.basis` / `draw.translation`），
 //!   **不重建顶点缓冲**；
 //! - **数据更新**（`App::update_geometry_vertices/indices`，X5）：按 range 就地更新几何快照，
-//!   只重建块版本变化的块 lane / 只上传变化的 4 KiB 页。
+//!   只重建块版本变化的块 lane / 只上传变化的 4 KiB 页；
+//! - **成对截断**（`App::truncate_geometry`，X5）：滑动窗口（删尾 + 追加）把顶点/索引同时
+//!   缩短，块数只减、被移除块的旧 AABB 进 damage。
 //!
-//! 数据更新会把**所有窗口**里绑定该几何的节点标 PAINT（`GeometryStore` 是进程级，一个
-//! `GeometryId` 可被多个窗口的节点引用），并自动请求一帧；空 range / 没有任何块受影响时
-//! 不标脏、不请求帧。绑定节点包括几何节点（`NodeBuilder::geometry`）与内容里引用该几何的
-//! `Canvas` 节点（`Canvas::push_geometry` / `push_path`）。
+//! 数据更新 / 截断会把**所有窗口**里绑定该几何的节点标 PAINT（`GeometryStore` 是进程级，一个
+//! `GeometryId` 可被多个窗口的节点引用），并自动请求一帧；空 range / 没有任何块受影响 /
+//! 截断到当前长度时不标脏、不请求帧。绑定节点包括几何节点（`NodeBuilder::geometry`）与内容里
+//! 引用该几何的 `Canvas` 节点（`Canvas::push_geometry` / `push_path`）。
 //!
 //! # damage 必须两侧都算
 //!
@@ -78,10 +80,30 @@ pub(crate) fn update_indices(
     Ok(update)
 }
 
+/// [`update_vertices`] 的截断版本（X5 滑动窗口）：数据层成对缩短 + 绑定节点自动标脏。
+///
+/// 与 range 更新共用同一条「damaged 非空 ⇒ 标脏 ⇒ request_frame」路径；截断到当前个数时
+/// `damaged` 为空 ⇒ 不标脏、不请求帧。
+///
+/// # Errors
+/// 同 [`crate::paint::geometry_store::GeometryStore::truncate`]（陈旧句柄 / 目标个数大于当前）。
+pub(crate) fn truncate(
+    app: &mut App,
+    id: GeometryId,
+    vertices: u32,
+    indices: u32,
+) -> Result<GeometryUpdate, EngineError> {
+    let update = app.geometry.truncate(id, vertices, indices)?;
+    if mark_bound_nodes(app, id, update.damaged) {
+        app.request_frame();
+    }
+    Ok(update)
+}
+
 /// 把所有窗口里绑定到 `geometry` 的节点（几何节点 / 引用该几何的 Canvas）标 PAINT，
 /// 返回「是否有节点被标脏」。
 ///
-/// `damaged` 为空 = 没有块受影响（空 range / 只改了未被块引用的顶点）⇒
+/// `damaged` 为空 = 没有可见变化（空 range / 只改了未被块引用的顶点 / 截断到当前长度）⇒
 /// 不标脏、不请求帧。返回 `true` 时调用方负责 `request_frame`（与 `App::request_repaint` /
 /// signal 写入同语义）。
 fn mark_bound_nodes(app: &mut App, geometry: GeometryId, damaged: Rect) -> bool {
@@ -858,5 +880,103 @@ mod tests {
             app.app().frame_requests() > requests,
             "新几何更新必须请求一帧"
         );
+    }
+
+    // ── 子项 2：truncate 接线：块 lane 释放 / 请求帧 / 截断后追加 ─────────────
+
+    /// 截断 2 块 → 1 块：绑定节点标脏、窗口请求一帧，下一帧释放多余块 lane 并把被移除块的
+    /// 旧 AABB 并入 damage；随后追加跨块会重新建出块 lane（绘制序再次发布）。
+    #[test]
+    fn truncating_geometry_releases_block_lanes_and_requests_a_frame() {
+        let mut app = TestApp::new();
+        let id = register_long(&mut app, 4096 + 10);
+        let node = mount(&mut app, id);
+        let window = app.window_id();
+        assert_eq!(
+            app.app()
+                .window(window)
+                .expect("窗口存在")
+                .tree()
+                .lane_count(node),
+            2,
+            "2 块几何 = 2 条块 lane"
+        );
+        let snapshot = app.app().geometry().snapshot_arc(id).expect("快照");
+        let removed = snapshot.chunk(1).expect("块 1").bounds;
+        let vertices = snapshot.vertex_len() / 12;
+        let indices = snapshot.index_len() / 2;
+        assert_eq!((vertices, indices), (4096 * 3 + 30, 4096 * 3 + 30));
+
+        let requests = app.app().frame_requests();
+        let update = app
+            .app_mut()
+            .truncate_geometry(id, 4096 * 3, 4096 * 3)
+            .expect("截断成一块");
+        assert!(
+            update.damaged.origin.x <= removed.origin.x
+                && update.damaged.origin.y <= removed.origin.y
+                && update.damaged.max().x >= removed.max().x
+                && update.damaged.max().y >= removed.max().y,
+            "damage 必须覆盖被移除块的旧 AABB：removed={removed:?} update={update:?}"
+        );
+        assert!(
+            app.app().frame_requests() > requests,
+            "截断必须自动请求一帧"
+        );
+
+        let record = app.drain().expect("截断帧");
+        assert!(
+            record.delta.order_some,
+            "释放了一条有图元的块 lane ⇒ 绘制序必须重新发布"
+        );
+        assert!(
+            damage_hits(
+                &record.damage,
+                removed.origin.x + 1.0,
+                removed.origin.y + 0.5
+            ),
+            "被移除块的旧位置必须进帧 damage：removed={removed:?} damage={:?}",
+            record.damage
+        );
+        assert_eq!(
+            app.app()
+                .window(window)
+                .expect("窗口存在")
+                .tree()
+                .lane_count(node),
+            1,
+            "块数减少后多余块 lane 必须释放"
+        );
+
+        // 截断到当前长度 = no-op：不标脏、不请求帧。
+        let requests = app.app().frame_requests();
+        let update = app
+            .app_mut()
+            .truncate_geometry(id, 4096 * 3, 4096 * 3)
+            .expect("等长截断是 no-op");
+        assert!(update.damaged.is_empty());
+        assert_eq!(app.app().frame_requests(), requests, "no-op 不请求帧");
+
+        // 截断后追加一个三角形（跨块）：重新建出块 lane，绘制序再次变化。
+        append_triangle(&mut app, id, 100.0, 100.0);
+        let record = app.drain().expect("追加帧");
+        assert!(record.delta.order_some, "新建块 lane ⇒ 绘制序必须重新发布");
+        assert!(
+            damage_hits(&record.damage, 100.0, 100.0),
+            "追加的三角形必须进 damage：{:?}",
+            record.damage
+        );
+        assert_eq!(
+            app.app()
+                .window(window)
+                .expect("窗口存在")
+                .tree()
+                .lane_count(node),
+            2,
+            "跨块追加必须重新建出块 1 的 lane"
+        );
+        let idle = app.drain().expect("后续帧");
+        assert!(!idle.rendered, "顺序已发布后的无变化帧必须空闲");
+        assert_eq!(idle.stats.encoded_lanes, 0);
     }
 }
