@@ -9,6 +9,7 @@ use crate::{
         primitive::{Image, Primitive},
         style::PaintSpec,
     },
+    render::AtlasArraySpec,
     resources::{DecodeState, ResourceImage},
     window::{WindowId, WindowOptions},
 };
@@ -41,6 +42,11 @@ fn png_rgba(rgba: [u8; 4]) -> Vec<u8> {
         .write_to(&mut out, image::ImageFormat::Png)
         .expect("encode png");
     out.into_inner()
+}
+
+/// 字形图集的 array 规格（恒 1 层）。
+fn glyph_spec(page: u32) -> AtlasArraySpec {
+    AtlasArraySpec { page, layers: 1 }
 }
 
 /// 图集页内某个 tile 内容区左上角的 BGRA 字节。
@@ -217,7 +223,7 @@ fn a_busy_window_queues_its_rects_without_blocking_idle_windows() {
     for window in [first, second] {
         app.window_mut(window)
             .expect("window")
-            .mark_atlas_page_received(AtlasKind::Glyph, page);
+            .mark_atlas_page_received(AtlasKind::Glyph, glyph_spec(page));
     }
     // 让 second 的共享槽停在「已入队、未录制」：这就是忙窗口。
     let full = DirtyRects::full();
@@ -225,7 +231,7 @@ fn a_busy_window_queues_its_rects_without_blocking_idle_windows() {
         app.window_mut(second).expect("second").queue_atlas_upload(
             AtlasKind::Glyph,
             0,
-            page,
+            glyph_spec(page),
             &vec![0u8; (page * page) as usize],
             full,
         ),
@@ -302,13 +308,13 @@ fn a_deferred_atlas_frame_requests_a_follow_up() {
     app.glyph_page = vec![0u8; (page * page) as usize];
     app.window_mut(window)
         .expect("window")
-        .mark_atlas_page_received(AtlasKind::Glyph, page);
+        .mark_atlas_page_received(AtlasKind::Glyph, glyph_spec(page));
     // 共享槽停在「已入队、未录制」：本帧的图集矩形只能攒着。
     let full = DirtyRects::full();
     assert!(app.window_mut(window).expect("window").queue_atlas_upload(
         AtlasKind::Glyph,
         0,
-        page,
+        glyph_spec(page),
         &vec![0u8; (page * page) as usize],
         full,
     ));
@@ -377,7 +383,7 @@ fn image_atlas_page_is_lazy_until_the_first_insert() {
     assert_eq!(pixels.len(), 2048 * 2048 * 4, "整页 = page² × BGRA8");
 }
 
-/// D9-c：图片图集是 4 层 texture array，逐层独立上传。
+/// D9-c：图片图集是多层 texture array（层数 = 打开的页数），逐层独立上传。
 ///
 /// 用 16² 的小图片页让「第 2 页」在 3 张 4×4 图后必然出现；再在不丢矩形的前提下验证：
 /// - 新页的写入只攒到 **layer 1**（layer 0 不得被整页重传）；
@@ -429,11 +435,15 @@ fn image_pages_upload_to_their_own_texture_array_layers() {
 
     // 让图片图集的共享槽停在「已入队、未录制」：后续写入只能攒在该窗口的层队列里。
     let page_bytes = (extent as usize) * (extent as usize) * 4;
+    let layers = app.resources().page_count() as u32;
     assert!(
         app.window_mut(window).expect("window").queue_atlas_upload(
             AtlasKind::Image,
             0,
-            extent,
+            AtlasArraySpec {
+                page: extent,
+                layers,
+            },
             &vec![0u8; page_bytes],
             DirtyRects::full()
         ),
@@ -484,6 +494,80 @@ fn image_pages_upload_to_their_own_texture_array_layers() {
         "layer 1 的矩形必须已经入队并清空"
     );
     assert_eq!(target.atlas_rects(AtlasKind::Image, 0).rects().len(), 0);
+}
+
+/// **P2-B3 核心语义**：图片 array 的层数 = 当前打开的图集页数。页数 1 → 2 时 App 必须
+/// 扩层（数组重建为 2 层），并且对**每个已打开的层**整页重传 —— 只补新层会让重建后的数组
+/// 丢掉 layer 0 的图。
+///
+/// 变异：App 的「数组缺失」判据忽略层数（只比页边长）⇒ 扩层帧只入队 layer 1 ⇒ 本测试的
+/// 待上传层断言失败。
+#[cfg(windows)]
+#[test]
+fn growing_the_image_array_reuploads_every_open_layer() {
+    use crate::{paint::atlas::AtlasKind, render::AtlasArraySpec};
+
+    let _guard = crate::render::windows::device::gpu_test_lock();
+    let (_rt, mut app, window) = setup();
+    // 16² 图片页：每页放 2 个 4×4 tile（6² 含 padding）⇒ 2 张图占一页，第 3 张开第 2 页。
+    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
+    for index in 0..2u8 {
+        let _ = app
+            .resources_mut()
+            .insert(&png_rgba([index + 1, 20, 30, 255]))
+            .expect("insert");
+    }
+    assert_eq!(app.resources().page_count(), 1);
+    app.window_mut(window)
+        .expect("window")
+        .enable_offscreen_renderer()
+        .expect("offscreen renderer");
+
+    // 一页：数组 1 层，首帧只上传 layer 0。
+    app.upload_atlas_pages();
+    assert_eq!(
+        app.window(window).expect("window").image_array_spec(),
+        Some(AtlasArraySpec {
+            page: 16,
+            layers: 1
+        }),
+        "1 页 ⇒ 1 层数组"
+    );
+    assert_eq!(
+        app.window(window)
+            .expect("window")
+            .atlas_pending_layers(AtlasKind::Image),
+        Some(vec![0]),
+        "首帧只上传已打开的 layer 0"
+    );
+    // 让离屏渲染器录制首帧，槽位回到空闲。
+    app.window_mut(window).expect("window").request_repaint();
+    let _ = app.frame(window).expect("frame").expect("ok");
+
+    // 第 3 张图 ⇒ 第 2 页。扩层帧：两个已打开的层都必须整页重传。
+    let _ = app
+        .resources_mut()
+        .insert(&png_rgba([200, 1, 2, 255]))
+        .expect("insert");
+    assert_eq!(app.resources().page_count(), 2);
+    app.upload_atlas_pages();
+    assert_eq!(
+        app.window(window).expect("window").image_array_spec(),
+        Some(AtlasArraySpec {
+            page: 16,
+            layers: 2
+        }),
+        "2 页 ⇒ 数组记账必须前进到 2 层"
+    );
+    assert_eq!(
+        app.window(window)
+            .expect("window")
+            .atlas_pending_layers(AtlasKind::Image),
+        Some(vec![0, 1]),
+        "扩层帧必须把 layer 0 也整页重传（增长不能丢已上传的图）"
+    );
+    assert!(app.window(window).expect("window").image_layer_received(0));
+    assert!(app.window(window).expect("window").image_layer_received(1));
 }
 
 /// D9-c：晚挂上的窗口必须补齐**每一个已打开页**的整层内容（texture array 每层独立）。

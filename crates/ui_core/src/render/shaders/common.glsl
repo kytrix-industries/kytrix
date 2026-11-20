@@ -64,7 +64,7 @@ struct GpuPrimitive {
 layout(std430, set = 0, binding = 0) readonly buffer Instances { GpuPrimitive instances[]; };
 layout(std430, set = 0, binding = 1) readonly buffer Clips { ClipEntry clips[]; };
 layout(push_constant) uniform RootPush { FrameUniform frame; GeometryDrawUniform draw; } root;
-// 图集是 texture array（D-9）：字形恒 1 层、图片 MAX_IMAGE_PAGES 层；采样层号由
+// 图集是 texture array（D-9）：字形恒 1 层；图片层数 = 当前打开的图集页数（运行时值，只增不减）；采样层号由
 // `params1.y`（图集页索引）给出，字形恒 0。见 contract.md §7/§8。
 layout(set = 0, binding = 4) uniform sampler2DArray glyph_atlas;
 layout(set = 0, binding = 5) uniform sampler2DArray image_atlas;

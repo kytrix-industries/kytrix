@@ -107,7 +107,7 @@ pub(crate) struct GpuPrimitive {
     /// `clip_index, atlas_page, kind, clip_depth`（整数编码进 f32）。
     ///
     /// `atlas_page` 是**图集 texture array 的层号**（图集页索引）：字形图集恒 1 层 ⇒ 恒 `0`；
-    /// 图片图集 `0..MAX_IMAGE_PAGES`（`AtlasTile.page`）。采样哪张图集由 `.z`（`kind`）决定，
+    /// 图片图集 `0..page_count`（`AtlasTile.page`；`MAX_IMAGE_PAGES` 只是页号上限）。采样哪张图集由 `.z`（`kind`）决定，
     /// `.y` 只是该图集的层号（采样坐标，不是 sampler 索引，见 contract §2/§7）。
     /// `clip_depth` 是 GPU 裁剪链的**真实链长** = 至多一条矩形项 + k 条圆角项
     /// （k ≤ `MAX_CLIP_DEPTH`），上界 [`MAX_CLIP_ITEMS`]；shader 用它收口 clip 循环。

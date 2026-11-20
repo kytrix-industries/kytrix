@@ -15,8 +15,10 @@
 /// - 页满且页数未达上限 ⇒ 开新页；达到上限且全部页满 ⇒ `DecodeCause::Capacity { PageFull }`；
 /// - 已空的页按 LRU 回收（**只**回收没有活 tile 的页；tile 恒有效契约不因淘汰破坏）。
 ///
-/// 该常量是跨端契约：三端图片图集纹理是 `MAX_IMAGE_PAGES` 层的 texture array，
-/// `shader` 用 `params1.y`（图集页索引）作为层号采样。
+/// 该常量只是**上限**（页号与每窗口待上传槽的数组界），**不是** texture array 的层数：
+/// 三端图片图集的层数由 App 侧 [`crate::render::ImageAtlasPager::page_count`] 决定并按需
+/// 增长（见 `render::atlas::AtlasArraySpec`）。`shader` 用 `params1.y`（图集页索引）作为
+/// 层号采样，不读这个上限。
 pub const MAX_IMAGE_PAGES: u16 = 4;
 
 /// 图集分两类（字形与图片分图集）。`#[repr(u8)]` 的值是**后端内部的槽位下标**（每端按
@@ -37,16 +39,6 @@ impl AtlasKind {
     pub const fn index(self) -> u32 {
         self as u32
     }
-
-    /// 该图集 texture array 的层数（D-9-c）：字形固定 1 层（采样恒 layer 0），图片
-    /// [`MAX_IMAGE_PAGES`] 层（layer = 图集页索引）。
-    #[must_use]
-    pub const fn layers(self) -> u32 {
-        match self {
-            Self::Glyph => 1,
-            Self::Image => MAX_IMAGE_PAGES as u32,
-        }
-    }
 }
 
 /// 图集里的一块矩形 + 代际。只读数据：应用层（P15）持有它来画图标，引擎（P07）把它编码进
@@ -57,8 +49,12 @@ pub struct AtlasTile {
     /// 图集页索引（页内 UV 的归一化基准是**这一页**的尺寸）。
     ///
     /// - `Glyph` 图集当前单页，恒 0；
-    /// - `Image` 图集 0..`MAX_IMAGE_PAGES`，由 `resources` 的多页分配器给出；编码进
+    /// - `Image` 图集 `0..page_count`，由 `resources` 的多页分配器给出；编码进
     ///   `GpuPrimitive.params1.y`，shader 用它作 texture array 的层号。
+    ///
+    /// texture array 的层数不是常量：图片图集的层数 = App 当前打开的图集页数
+    /// （`render::atlas::AtlasArraySpec`），页数增长时三端按 CPU 影子页 / App 重传重建数组，
+    /// **只增不减**（缩容会让已有 tile 的 `page` 指向不存在的层）。
     pub page: u16,
     /// 归一化 UV 的左边界（**内容区**，不含 padding）。
     pub u0: f32,
@@ -119,15 +115,24 @@ mod tests {
     }
 
     #[test]
-    fn atlas_kind_index_and_layers_match_the_backend_slots() {
+    fn atlas_kind_index_matches_the_backend_slots() {
         assert_eq!(AtlasKind::Glyph.index(), 0);
         assert_eq!(AtlasKind::Image.index(), 1);
-        assert_eq!(AtlasKind::Glyph.layers(), 1, "字形图集恒 1 层 array");
+    }
+
+    /// texture array 的层数是**运行时值**，不是 `AtlasKind` 的方法：`MAX_IMAGE_PAGES` 只是
+    /// 页号 / 待上传槽的上限。图片图集的层数由 App 的分页器页数决定（P2-B3 修复：旧实现让
+    /// 每窗口一旦有图就常驻 4 层 × 2048² BGRA8 = 64 MiB）。
+    #[test]
+    fn max_image_pages_is_an_upper_bound_not_an_array_layer_count() {
+        assert_eq!(MAX_IMAGE_PAGES, 4, "契约上限：4 页 = 约 14.5k 个 32² tile");
+        let per_layer_bytes = 2048u64 * 2048 * 4;
         assert_eq!(
-            AtlasKind::Image.layers(),
-            u32::from(MAX_IMAGE_PAGES),
-            "图片图集固定 MAX_IMAGE_PAGES 层 array"
+            per_layer_bytes * u64::from(MAX_IMAGE_PAGES),
+            64 * 1024 * 1024,
+            "旧实现的常驻量：每窗口 4 层 × 16 MiB"
         );
+        assert_eq!(per_layer_bytes, 16 * 1024 * 1024, "单页/单层 = 16 MiB");
     }
 
     #[test]

@@ -45,7 +45,10 @@ pub(crate) mod macos;
 #[cfg(windows)]
 pub(crate) mod windows;
 
-pub(crate) use atlas::{Allocation, AtlasAllocator, DirtyRects, ImageAtlasPager, MIN_ATLAS_PAGE};
+pub(crate) use atlas::{
+    Allocation, AtlasAllocator, AtlasArraySpec, AtlasPageRequest, DirtyRects, ImageAtlasPager,
+    MIN_ATLAS_PAGE, merge_page_request,
+};
 #[cfg(target_os = "linux")]
 pub(crate) use linux as backend;
 #[cfg(target_os = "macos")]

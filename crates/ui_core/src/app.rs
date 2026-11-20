@@ -569,7 +569,7 @@ impl App {
     }
 
     /// 图片图集分发：懒分配（没插过图片就没有页）+ 逐层整页 / 按脏矩形（AOI）增量
-    /// （DEVIATIONS F-211 / R06-3；D-9-c 起图片图集是 4 层 texture array，layer = 页号）。
+    /// （DEVIATIONS F-211 / R06-3；图片图集的 texture array 层数 = 当前打开的页数，layer = 页号）。
     fn upload_image_page(&mut self) {
         text_pass::upload_image_page(self)
     }

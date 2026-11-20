@@ -35,12 +35,17 @@ pub(crate) fn upload_atlas_pages(app: &mut App) {
 /// 字形页分发：页级变化（尺寸 / 清空）走整页，其余按脏矩形（AOI）增量。
 /// 消费者：`App::upload_glyph_page`。
 pub(crate) fn upload_glyph_page(app: &mut App) {
-    use crate::paint::atlas::AtlasKind;
+    use crate::{paint::atlas::AtlasKind, render::AtlasArraySpec};
 
     let page = app.atlas.page();
     debug_assert_eq!(page.0, page.1, "glyph atlas page must stay square");
     let extent = page.0;
     let len = extent as usize * extent as usize;
+    // 字形图集恒 1 层 texture array（采样恒 layer 0）。
+    let spec = AtlasArraySpec {
+        page: extent,
+        layers: 1,
+    };
 
     // 图集被清空过（DPI 换代 / 容量逃逸重排）：旧代际的 tile 全部失效，CPU 页与每个
     // 窗口的纹理都要整页重建（padding 里可能残留旧字形的覆盖度）。
@@ -67,14 +72,15 @@ pub(crate) fn upload_glyph_page(app: &mut App) {
 
     let dirty = std::mem::take(&mut app.pending_dirty);
     let has_rects = !dirty.is_empty();
-    let any_missing = app.windows.values().any(|window| {
-        window.has_renderer() && !window.atlas_page_matches(AtlasKind::Glyph, extent)
-    });
+    let any_missing = app
+        .windows
+        .values()
+        .any(|window| window.has_renderer() && !window.atlas_page_matches(AtlasKind::Glyph, spec));
     // 只有「缺页且空闲」的窗口会在本帧拿整页；忙的缺页窗口等它空闲那一帧再重建整页
     // （否则一个长期忙的窗口会让 `write_page` 每帧重写整页）。
     let any_stale_idle = app.windows.values().any(|window| {
         window.has_renderer()
-            && !window.atlas_page_matches(AtlasKind::Glyph, extent)
+            && !window.atlas_page_matches(AtlasKind::Glyph, spec)
             && window.atlas_idle(AtlasKind::Glyph)
     });
     let any_queued = app
@@ -99,7 +105,7 @@ pub(crate) fn upload_glyph_page(app: &mut App) {
             continue;
         }
         // 字形图集是 1 层 texture array：层号恒 0。
-        if !window.atlas_page_matches(AtlasKind::Glyph, extent) {
+        if !window.atlas_page_matches(AtlasKind::Glyph, spec) {
             // 整页是唯一正确的来源：页尺寸变了 / 图集清空过 / 新渲染器。
             if !window.atlas_idle(AtlasKind::Glyph) {
                 continue;
@@ -107,12 +113,12 @@ pub(crate) fn upload_glyph_page(app: &mut App) {
             let uploaded = window.queue_atlas_upload(
                 AtlasKind::Glyph,
                 0,
-                extent,
+                spec,
                 &app.glyph_page,
                 full_rects.clone(),
             );
             if uploaded {
-                window.mark_atlas_page_received(AtlasKind::Glyph, extent);
+                window.mark_atlas_page_received(AtlasKind::Glyph, spec);
                 window.clear_atlas_rects(AtlasKind::Glyph, 0);
             }
             continue;
@@ -133,7 +139,7 @@ pub(crate) fn upload_glyph_page(app: &mut App) {
             if window.queue_atlas_upload(
                 AtlasKind::Glyph,
                 0,
-                extent,
+                spec,
                 &app.glyph_page,
                 full_rects.clone(),
             ) {
@@ -150,7 +156,7 @@ pub(crate) fn upload_glyph_page(app: &mut App) {
             &mut packed,
         );
         let rects = window.atlas_rects(AtlasKind::Glyph, 0).clone();
-        if window.queue_atlas_upload(AtlasKind::Glyph, 0, extent, &packed, rects) {
+        if window.queue_atlas_upload(AtlasKind::Glyph, 0, spec, &packed, rects) {
             window.clear_atlas_rects(AtlasKind::Glyph, 0);
         }
         app.packed = packed;
@@ -160,16 +166,21 @@ pub(crate) fn upload_glyph_page(app: &mut App) {
 /// 图片页分发：懒分配（没插过图片就没有页）+ 逐层整页 / 按脏矩形（AOI）增量
 /// （DEVIATIONS F-211 / R06-3 / D-9-c 多页 texture array）。
 ///
-/// 图片图集是 `MAX_IMAGE_PAGES` 层的 texture array，layer = 图集页索引。每个窗口的每一层
-/// 独立记账：
-/// 1. **整数组建立**（新窗口 / 换渲染器 / extent 变化）或某层第一次出现 ⇒ 该层整页上传
-///    （资源层新页首帧整页脏，见 `ImageAtlasPager::allocate`）；
+/// 图片图集的 texture array **层数 = 当前打开的图集页数**（`ImageAtlasPager::page_count`，
+/// 不是 `MAX_IMAGE_PAGES` 常量）：没有图片时三端只保留 1 层的 1×1 占位数组，每开一页层数 +1。
+/// layer = 图集页索引。每个窗口的每一层独立记账：
+/// 1. **整数组建立**（新窗口 / 换渲染器 / 页尺寸变化 / **层数增长**）或某层第一次出现 ⇒
+///    **每个已打开的层**都整页上传（重建后的数组内容是未定义的；增长不能丢已上传的图，
+///    `App` 侧全量重传是三端统一的补内容路径，见 `AtlasPageRequest`）；
 /// 2. 其余帧逐层增量：先并入本窗口该层的待传矩形，槽空闲时按 AOI 打包上传；
 /// 3. 共享槽忙的窗口不等待，矩形留在自己的队列里（一个不出帧的窗口不拖住其它窗口）。
 ///
 /// 消费者：`App::upload_image_page`。
 pub(crate) fn upload_image_page(app: &mut App) {
-    use crate::paint::atlas::{AtlasKind, MAX_IMAGE_PAGES};
+    use crate::{
+        paint::atlas::{AtlasKind, MAX_IMAGE_PAGES},
+        render::AtlasArraySpec,
+    };
 
     let page_count = app.resources.page_count();
     if page_count == 0 {
@@ -181,7 +192,12 @@ pub(crate) fn upload_image_page(app: &mut App) {
         page_count <= usize::from(MAX_IMAGE_PAGES),
         "image atlas pages must respect MAX_IMAGE_PAGES"
     );
-    let layers = page_count as u16;
+    let layers = u16::try_from(page_count).expect("image atlas page count fits u16");
+    // 三端按这个规格建 texture array：页边长 + 当前打开的页数（层数单调不减）。
+    let spec = AtlasArraySpec {
+        page: extent,
+        layers: u32::from(layers),
+    };
 
     // 先逐页取走脏矩形（进程级共享，统一消费一次再逐窗口分发：与字形页同一条纪律，
     // 否则第一个窗口消费后其余窗口永远收不到内容）。
@@ -191,7 +207,7 @@ pub(crate) fn upload_image_page(app: &mut App) {
     let has_rects = dirty.iter().any(|rects| !rects.is_empty());
     let any_missing = app.windows.values().any(|window| {
         window.has_renderer()
-            && (!window.atlas_page_matches(AtlasKind::Image, extent)
+            && (!window.atlas_page_matches(AtlasKind::Image, spec)
                 || (0..layers).any(|layer| !window.image_layer_received(layer)))
     });
     let any_queued = app.windows.values().any(|window| {
@@ -217,7 +233,8 @@ pub(crate) fn upload_image_page(app: &mut App) {
         if !window.has_renderer() {
             continue;
         }
-        let array_missing = !window.atlas_page_matches(AtlasKind::Image, extent);
+        // 层数或页边长与数组记账不一致 ⇒ 数组必须重建 ⇒ 每个已打开层都要整页重传。
+        let array_missing = !window.atlas_page_matches(AtlasKind::Image, spec);
         let missing_layers =
             array_missing || (0..layers).any(|layer| !window.image_layer_received(layer));
         if missing_layers {
@@ -230,8 +247,8 @@ pub(crate) fn upload_image_page(app: &mut App) {
                         .merge_from(&dirty[usize::from(layer)]);
                 }
             }
-            // 整数组建立 / 新层补齐：逐层整页上传（只上传已分配过页的层；尚未分配的层
-            // 在它第一次出现的那一帧走同一条路径）。
+            // 整数组建立 / 新层补齐 / 层数增长：逐层整页上传（只上传已分配过页的层；尚未分配
+            // 的层在它第一次出现的那一帧走同一条路径）。
             if !window.atlas_idle(AtlasKind::Image) {
                 continue;
             }
@@ -253,7 +270,7 @@ pub(crate) fn upload_image_page(app: &mut App) {
                 if !window.queue_atlas_upload(
                     AtlasKind::Image,
                     layer,
-                    extent,
+                    spec,
                     pixels,
                     full_rects.clone(),
                 ) {
@@ -267,7 +284,7 @@ pub(crate) fn upload_image_page(app: &mut App) {
                     window.mark_image_layer_received(layer);
                     window.clear_atlas_rects(AtlasKind::Image, layer);
                 }
-                window.mark_atlas_page_received(AtlasKind::Image, extent);
+                window.mark_atlas_page_received(AtlasKind::Image, spec);
                 if array_missing {
                     window.clear_all_atlas_rects(AtlasKind::Image);
                 }
@@ -304,7 +321,7 @@ pub(crate) fn upload_image_page(app: &mut App) {
                 if window.queue_atlas_upload(
                     AtlasKind::Image,
                     layer,
-                    extent,
+                    spec,
                     pixels,
                     full_rects.clone(),
                 ) {
@@ -321,7 +338,7 @@ pub(crate) fn upload_image_page(app: &mut App) {
                 &mut buf,
             );
             let rects = window.atlas_rects(AtlasKind::Image, layer).clone();
-            if window.queue_atlas_upload(AtlasKind::Image, layer, extent, &buf, rects) {
+            if window.queue_atlas_upload(AtlasKind::Image, layer, spec, &buf, rects) {
                 window.clear_atlas_rects(AtlasKind::Image, layer);
             }
             *packed = buf;
@@ -341,8 +358,9 @@ pub(crate) fn glyph_page_pixels(app: &App) -> ((u32, u32), Vec<u8>) {
 
 /// 全部已打开图片页的当前内容（BGRA8 预乘 sRGB；`TestApp::snapshot` / 像素读回的上传源）。
 ///
-/// D-9-c 起图片图集是 `MAX_IMAGE_PAGES` 层 texture array：快照必须逐层上传，否则多页场景的
-/// 第 2 页会采样到未定义层。返回顺序 = 层号升序；未分配页已由 `page_count` 排除。
+/// 图片图集是「层数 = 当前打开的页数」的 texture array（层数随页数增长，上限
+/// `MAX_IMAGE_PAGES`）：快照必须逐层上传，否则多页场景的第 2 页会采样到未定义层。
+/// 返回顺序 = 层号升序；未分配页已由 `page_count` 排除。
 /// 消费者：`App::resource_page_pixels_all`。
 #[cfg(feature = "test-support")]
 pub(crate) fn resource_page_pixels_all(app: &App) -> Vec<((u32, u32), &[u8])> {

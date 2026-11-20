@@ -48,23 +48,30 @@ pub fn render_offscreen(
 ) -> Result<SnapshotImage, EngineError> {
     let (offsets, clip) = scroll_payload(scroll, scale);
     let mut renderer = offscreen_gpu(size)?;
-    // 字形页恒上传；图片页只在 App 侧有页时上传（与 `TestApp::snapshot` 同一口径）。
+    // 字形页恒上传（1 层 array）；图片页只在 App 侧有页时上传（与 `TestApp::snapshot` 同一口径），
+    // 数组层数 = 当前打开的图集页数。
     let (glyph_page, glyph_pixels) = app.glyph_page_pixels();
     renderer.queue_atlas_upload(
         AtlasKind::Glyph,
         0,
-        glyph_page.0,
+        crate::render::AtlasArraySpec {
+            page: glyph_page.0,
+            layers: 1,
+        },
         glyph_pixels,
         DirtyRects::full(),
     );
-    // 图片图集：多页 texture array（D-9-c）⇒ 逐层整页上传；没有图片页时什么都不传。
-    for (layer, (image_page, image_pixels)) in
-        app.resource_page_pixels_all().into_iter().enumerate()
-    {
+    // 图片图集：多页 texture array ⇒ 逐层整页上传；没有图片页时什么都不传。
+    let image_pages = app.resource_page_pixels_all();
+    let image_layers = u32::try_from(image_pages.len()).expect("image page count fits u32");
+    for (layer, (image_page, image_pixels)) in image_pages.into_iter().enumerate() {
         renderer.queue_atlas_upload(
             AtlasKind::Image,
             layer as u16,
-            image_page.0,
+            crate::render::AtlasArraySpec {
+                page: image_page.0,
+                layers: image_layers,
+            },
             image_pixels.to_vec(),
             DirtyRects::full(),
         );
