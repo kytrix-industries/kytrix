@@ -78,6 +78,7 @@ pub(crate) fn paint_frame(
             rebuilt: 0,
             damage: crate::render::damage::DamageSummary::default(),
             stale_text: smallvec::SmallVec::new(),
+            stale_canvas_runs: 0,
             #[cfg(feature = "test-support")]
             instances: 0,
             #[cfg(feature = "test-support")]
@@ -129,6 +130,7 @@ pub(crate) fn paint_frame(
                 rebuilt: 0,
                 damage,
                 stale_text: smallvec::SmallVec::new(),
+                stale_canvas_runs: 0,
                 #[cfg(feature = "test-support")]
                 instances: 0,
                 #[cfg(feature = "test-support")]

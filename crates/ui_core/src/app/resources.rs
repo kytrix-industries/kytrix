@@ -104,7 +104,15 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, event: Event) {
             app.sync_clock();
             app.dispatch_input(window, input.clone());
         }
-        Event::FocusChanged { focused: false } => app.on_window_focus_lost(window),
+        Event::FocusChanged { focused } => {
+            if !focused {
+                app.on_window_focus_lost(window);
+            }
+            // v2.1 E1b：canvas 文本的 App 级默认 scale 跟随焦点窗口的 DPI。
+            app.note_window_focus(window, *focused);
+        }
+        // DPI 已在平台侧写进 `Window::scale`，这里只让默认文本 scale 跟随焦点窗口。
+        Event::DpiChanged { .. } => app.note_window_dpi(window),
         _ => {}
     }
     app.events.push(window, event);

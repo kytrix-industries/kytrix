@@ -801,9 +801,11 @@ pub(crate) fn layout_text(
         }
         // 有 tile 被淘汰 / 图集换代：本 pass 早先的 `ShapedLine` 可能引用已失效的矩形。
         // 把全部文本重新入队后重跑（有界：淘汰只发生在容量不足时，第二轮会优先淘汰
-        // 不在本帧使用的 tile，工作集放得下就收敛）。
+        // 不在本帧使用的 tile，工作集放得下就收敛）。Canvas 节点同样要重画（编码期丢弃
+        // 失效 run，见 `paint/pass.rs` 的 D-5 canvas 安全网）。
         any_eviction = true;
         tree.invalidate_text_lines();
+        tree.mark_canvas_nodes_paint();
         round += 1;
         if round >= MAX_LAYOUT_TEXT_PASSES {
             // 兜底：不再重跑本帧。此时行刚被清空、全部文本节点**已入队**（`invalidate_text_lines`），
@@ -824,6 +826,7 @@ pub(crate) fn layout_text(
                 continue;
             }
             other.tree_mut().invalidate_text_lines();
+            other.tree_mut().mark_canvas_nodes_paint();
         }
     }
     // 可见失败兜底：连续 `ATLAS_FULL_ESCALATION_FRAMES` 个 pass 都以软失败收尾 ⇒ 上报
@@ -933,7 +936,11 @@ pub(crate) fn repaint_text_if_atlas_changed(app: &mut App) {
     }
     app.atlas_generation_seen = generation;
     for window in app.windows.values_mut() {
-        window.tree_mut().invalidate_text_lines();
+        let tree = window.tree_mut();
+        tree.invalidate_text_lines();
+        // E1b F2：Canvas 图元里同样烘焙了 `AtlasTile`（应用经 `push_shaped_text` 写入）。
+        // 只是文本节点失效的话，Canvas 节点会整桶复用旧 lane，编码期逐 run 校验不会执行。
+        tree.mark_canvas_nodes_paint();
     }
 }
 

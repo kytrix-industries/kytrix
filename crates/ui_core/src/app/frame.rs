@@ -291,6 +291,9 @@ pub(crate) fn frame(
     };
     // D-5：绘制前硬校验跳过的旧代际文本行先取出来（commit_frame 会消费 paint）。
     let stale_text = core::mem::take(&mut paint.stale_text);
+    // E1b F2：Canvas 内被编码期安全网丢弃的失效 run 数（Canvas 归应用所有，引擎只能止损 +
+    // 诊断，不能重建 —— 压一条 `TextDiagnostic` 让「少字」不静默）。
+    let stale_canvas_runs = paint.stale_canvas_runs;
     let outcome = target.commit_frame(ticket, paint);
     // HUD 是纯观察者：提交成功后只清掉已经落进 paint 的待写文本（没有帧就保持上一次文本）。
     #[cfg(feature = "hud")]
@@ -311,6 +314,15 @@ pub(crate) fn frame(
             }
         }
         app.request_frame();
+    }
+    // E1b F2：canvas 文本的编码期安全网丢掉了失效 run（少字优于花字）。Canvas 归应用所有，
+    // 引擎不能替它重建 —— 用文本诊断把「少字」变成可观测事实（D17），应用据此重新
+    // `shape_text` 并重建 Canvas。诊断环有界 + 同值去重，不会随帧数增长。
+    if stale_canvas_runs > 0 {
+        app.text
+            .push_diagnostics(vec![crate::text::TextDiagnostic::CanvasTextStale {
+                runs: stale_canvas_runs,
+            }]);
     }
     // 图集行/整页没赶上本帧（窗口的共享槽还在消费上一笔）：这一帧会以旧图集呈现，因此
     // 立刻再要一帧（全量 damage），槽空后把内容补发——否则静态窗口会把缺字的画面一直

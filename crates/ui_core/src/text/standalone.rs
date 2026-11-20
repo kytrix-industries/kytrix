@@ -6,40 +6,43 @@
 //! （`text::cache::ShapeKey`）、同一条光栅/装箱路径（`ShapedText::rasterize`）与同一个字形
 //! 图集，因此同一文本 + 同一 shaping 输入重复 shape 命中缓存、不重复塑形。
 //!
-//! # 图集代际（D-5 的等价面）
+//! # 图集租约（D-5 的等价面）
 //!
-//! 句柄记录构造时的 `AtlasAllocator::generation`；`App` 侧另存一份**当前**代际（代际租约），
-//! 任何可能换代的入口（`App::{layout_text, set_font_stack, reload_system_fonts}` 等）都会同步
-//! 它。换代后 [`super::ShapedTextHandle::is_stale`] 为真，`Canvas::push_shaped_text` 不编码旧
-//! UV —— 这正是 D-5 修掉的花字问题。本次 shape 自身触发的扩容 / 清空会让**本进程其它窗口**的
-//! 文本行一起失效，调用方（`App::shape_text`）负责把它们重新入队。
+//! 句柄记录构造时的图集租约 `(AtlasAllocator::generation, GlyphAtlas::eviction_epoch)`；
+//! `App` 侧另存一份**当前**租约（打包的 `AtomicU64`），任何可能改变图集状态的入口
+//! （`App::{layout_text, set_font_stack, reload_system_fonts, shape_text}` 等）都会同步它。
+//! 换代**或**任何 tile 被 LRU 淘汰后 [`super::ShapedTextHandle::is_stale`] 为真，
+//! `Canvas::push_shaped_text` 不编码旧 UV —— 这正是 D-5 修掉的花字问题。本次 shape 自身触发
+//! 的扩容 / 清空 / 淘汰会让**本进程其它窗口**的文本行与 Canvas 一起失效，调用方
+//! （`App::shape_text`）负责把它们重新入队。
 //!
 //! # 设备 scale
 //!
-//! `§11.1` 的 `App::shape_text` 签名没有 window / scale 参数：本实现按**逻辑像素 1:1**
-//! （[`STANDALONE_SCALE`]）光栅，`ShapedLine::scale` 因此恒为 1.0；paint 阶段仍按窗口
-//! `Scale` 放大。hidpi 下要按物理 ppem 光栅需要规格补充「scale 从哪来」（显式参数 / App 级
-//! 默认 scale），不在 E1 范围内（见本批次提交说明的偏差项）。
+//! `§11.1` 的 `App::shape_text` 签名没有 window / scale 参数，因此本实现使用 **App 级默认
+//! scale**（v2.1 E1b 用户裁决）：`App` 跟踪当前焦点窗口的 DPI 作为默认值，并提供显式覆盖
+//! （`App::set_text_scale`）供离屏 / 测试 / 固定 DPI 场景使用。`ShapedLine::scale` 与句柄的
+//! [`super::ShapedTextHandle::scale`] 都是该值；paint 阶段仍按窗口 `Scale` 放大。
+//!
+//! **应用义务**：句柄的 tile 位图按 shape 时刻的 scale 光栅。多窗口不同 DPI、或窗口被拖到
+//! 另一块屏（DPI 变化）后，应用必须丢弃句柄并重新 `shape_text` —— 引擎不会自动重光栅。
 
 use std::sync::{
     Arc,
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicU64, Ordering},
 };
 
 use smol_str::{SmolStr, format_smolstr};
 
 use super::{
     InlineBoxSpec, ShapedInlineBox, ShapedTextHandle, ShapedTextItem, TextContent, TextStyle,
-    atlas::GlyphAtlas, context::TextContext, raster::GlyphRasterizer, shape::RasterCtx,
+    atlas::GlyphAtlas, context::TextContext, pack_atlas_lease, raster::GlyphRasterizer,
+    shape::RasterCtx,
 };
 use crate::{
     error::EngineError,
     paint::atlas::AtlasKind,
     render::{AtlasAllocator, DirtyRects},
 };
-
-/// 无窗口 shaping 的光栅 scale（逻辑像素 1:1；理由见模块文档「设备 scale」）。
-const STANDALONE_SCALE: f32 = 1.0;
 
 /// 单次 `shape_text` 因图集换代（阶梯扩容 / 容量逃逸清空）重跑光栅的最大轮数。
 ///
@@ -57,11 +60,12 @@ pub(crate) fn shape(
     atlas: &mut AtlasAllocator,
     glyph_atlas: &mut GlyphAtlas,
     pending_dirty: &mut DirtyRects,
-    lease: &Arc<AtomicU32>,
+    lease: &Arc<AtomicU64>,
     text: &str,
     style: &TextStyle,
     max_width: Option<f32>,
     inline_boxes: &[InlineBoxSpec],
+    scale: f32,
 ) -> Result<ShapedTextHandle, EngineError> {
     // 入口校验：宽度约束必须是有限非负值（NaN 会让 parley 的断行结果不可复现）。
     if let Some(width) = max_width
@@ -102,7 +106,7 @@ pub(crate) fn shape(
                 glyph_atlas,
                 atlas,
                 generation,
-                scale: STANDALONE_SCALE,
+                scale,
             };
             shaped.rasterize(
                 width,
@@ -131,12 +135,20 @@ pub(crate) fn shape(
                     ShapedTextItem::GlyphRun(_) => None,
                 })
                 .collect();
-            // 句柄记录上**最终**代际：换代在 pass 内发生后已重跑，产出的 tile 属于这一代。
-            lease.store(generation, Ordering::Relaxed);
+            // 句柄记录上**最终**租约：换代在 pass 内发生后已重跑，产出的 tile 属于这一代；
+            // 本次 pass 自身造成的逐 tile 淘汰也把纪元带到最新（本 pass 用过的 tile 不会被
+            // 自己淘汰，因此这份快照对刚产出的行仍然有效）。
+            let eviction_epoch = glyph_atlas.eviction_epoch();
+            lease.store(
+                pack_atlas_lease(generation, eviction_epoch),
+                Ordering::Relaxed,
+            );
             return Ok(ShapedTextHandle::new(
                 Arc::new(line),
                 inline_boxes,
                 generation,
+                eviction_epoch,
+                scale,
                 Arc::clone(lease),
             ));
         }
@@ -156,10 +168,15 @@ mod tests {
     use super::*;
     use crate::{
         app::App,
-        math::{Point, Rect, Size},
+        event::Event,
+        math::{Point, Rect, Scale, Size},
+        node::builder::NodeBuilder,
         paint::{canvas::Canvas, primitive::Primitive},
         text::{FontStack, InlineAlign, ShapedLine, TextOverflow, TextStyle},
+        window::WindowOptions,
     };
+    #[cfg(feature = "test-support")]
+    use crate::{node::id::NodeId, window::WindowId};
 
     fn new_app() -> (tokio::runtime::Runtime, App) {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -242,7 +259,8 @@ mod tests {
         assert_eq!(handle.size(), line.size());
         assert_eq!(handle.size(), Size::new(line.width, line.height));
         assert!(line.first_baseline.is_some_and(|baseline| baseline > 0.0));
-        assert_eq!(line.scale, STANDALONE_SCALE);
+        assert_eq!(line.scale, app.text_scale());
+        assert_eq!(handle.scale(), app.text_scale(), "句柄必须记录光栅 scale");
         assert_eq!(line.text.as_str(), "line metrics");
     }
 
@@ -492,5 +510,434 @@ mod tests {
         );
         assert!(!first.is_stale());
         assert!(!second.is_stale());
+    }
+
+    // ── E1b：App 级默认 scale（hidpi 用户裁决）────────────────────────────────
+
+    #[test]
+    fn default_text_scale_is_one() {
+        let (_runtime, mut app) = new_app();
+        assert_eq!(app.text_scale(), 1.0, "默认 scale = 1.0（逻辑像素 1:1）");
+        let handle = app
+            .shape_text("scale", &TextStyle::new(16.0), None, &[])
+            .expect("塑形");
+        assert_eq!(handle.scale(), 1.0);
+        assert_eq!(handle.line().scale, 1.0, "快照与句柄记录的 scale 同源");
+    }
+
+    /// 显式覆盖：进入光栅（同一文本在 2.0 下按 32 ppem 出 tile，与 1.0 的 16 ppem 不同），
+    /// 且非法值返回强类型错误、不改变当前值。
+    #[test]
+    fn explicit_text_scale_override_enters_the_raster_and_is_validated() {
+        let (_runtime, mut app) = new_app();
+        let style = TextStyle::new(16.0);
+        let one = app.shape_text("Hi", &style, None, &[]).expect("1.0");
+        assert_eq!(one.scale(), 1.0);
+
+        app.set_text_scale(2.0).expect("有限正数是合法的");
+        assert_eq!(app.text_scale(), 2.0);
+        let two = app.shape_text("Hi", &style, None, &[]).expect("2.0");
+        assert_eq!(two.scale(), 2.0);
+        assert_eq!(two.line().scale, 2.0);
+
+        // `ShapeKey` 不含 scale（§4.5，逻辑坐标 shaping）：命中同一份快照，但 tile 属于不同 ppem。
+        let first_tile = |handle: &ShapedTextHandle| {
+            handle
+                .line()
+                .glyph_runs()
+                .next()
+                .and_then(|run| run.glyphs.first())
+                .map(|glyph| glyph.tile)
+                .expect("至少一个可见字形")
+        };
+        assert_ne!(
+            first_tile(&one),
+            first_tile(&two),
+            "scale 必须经 ppem（16 vs 32）进入字形 tile"
+        );
+
+        for invalid in [f32::NAN, f32::INFINITY, 0.0, -1.0] {
+            assert!(
+                matches!(
+                    app.set_text_scale(invalid),
+                    Err(EngineError::InvalidTextScale { .. })
+                ),
+                "scale {invalid} 必须返回 InvalidTextScale"
+            );
+            assert_eq!(app.text_scale(), 2.0, "非法值不得改变当前 scale");
+        }
+    }
+
+    /// 焦点窗口 DPI → App 级默认 scale：获得焦点 / DPI 变化时跟随；失焦保留上次值；
+    /// 显式覆盖优先；取消覆盖后恢复跟随（多窗口不同 DPI 下应用义务见 `App::text_scale` 文档）。
+    #[test]
+    fn focused_window_dpi_drives_the_default_text_scale() {
+        let (_runtime, mut app) = new_app();
+        let window = app.create_window(WindowOptions {
+            scale: Scale::new(1.5).expect("有限正数"),
+            ..WindowOptions::default()
+        });
+        assert_eq!(app.text_scale(), 1.0, "还没有焦点事件 ⇒ 保持默认 1.0");
+
+        app.dispatch(window, Event::FocusChanged { focused: true });
+        assert_eq!(app.text_scale(), 1.5, "焦点窗口的 DPI 成为默认 scale");
+        let handle = app
+            .shape_text("dpi", &TextStyle::new(16.0), None, &[])
+            .expect("塑形");
+        assert_eq!(handle.scale(), 1.5);
+        assert_eq!(handle.line().scale, 1.5);
+
+        // 窗口被拖到另一块屏：平台先 `set_scale`，再投递 `DpiChanged`。
+        let two = Scale::new(2.0).expect("有限正数");
+        app.window_mut(window).expect("窗口存在").set_scale(two);
+        app.dispatch(
+            window,
+            Event::DpiChanged {
+                dpi: 192,
+                scale: two,
+            },
+        );
+        assert_eq!(app.text_scale(), 2.0);
+
+        // 失焦保留上次值（「无焦点窗口时保持上次值」）。
+        app.dispatch(window, Event::FocusChanged { focused: false });
+        assert_eq!(app.text_scale(), 2.0);
+
+        // 显式覆盖优先于 DPI 跟随；取消覆盖后回到焦点窗口 DPI。
+        app.set_text_scale(1.0).expect("合法覆盖");
+        app.dispatch(window, Event::FocusChanged { focused: true });
+        assert_eq!(app.text_scale(), 1.0, "覆盖期间不跟随焦点窗口 DPI");
+        app.clear_text_scale_override();
+        assert_eq!(app.text_scale(), 2.0);
+    }
+
+    // ── E1b F1/F3：淘汰纪元与错误路径收尾 ────────────────────────────────────
+
+    /// F1：长期句柄的 tile 在容量压力下被 LRU 淘汰 ⇒ `is_stale()`（代际不变、淘汰纪元前进）⇒
+    /// push 拒绝 ⇒ 重新 shape 恢复。
+    #[test]
+    fn tile_eviction_makes_long_lived_handles_stale_and_reshaping_recovers() {
+        let (_runtime, mut app) = new_app();
+        // 32² 的页只放得下一两个 16 ppem 字形 ⇒ 十几个单字 shape 就必然触发逐 tile LRU 淘汰。
+        app.cap_glyph_atlas_page_for_test(32);
+        let generation = app.glyph_atlas_generation_for_test();
+        let first = app
+            .shape_text("A", &TextStyle::new(16.0), None, &[])
+            .expect("首个句柄");
+        assert_eq!(app.glyph_atlas_eviction_epoch_for_test(), 0);
+        assert!(!first.is_stale());
+        let mut canvas = canvas();
+        assert!(canvas.push_shaped_text(&first, Point::ZERO));
+        let before = canvas.primitives().len();
+        assert!(before > 0);
+
+        for glyph in ["B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M"] {
+            app.shape_text(glyph, &TextStyle::new(16.0), None, &[])
+                .expect("小页只能靠淘汰腾位置，单字 shape 必须成功");
+        }
+        assert_eq!(
+            app.glyph_atlas_generation_for_test(),
+            generation,
+            "逐 tile 淘汰不换代（本用例只走淘汰路径）"
+        );
+        assert!(
+            app.glyph_atlas_eviction_epoch_for_test() > 0,
+            "淘汰必须前进纪元"
+        );
+        assert!(first.is_stale(), "代际不变、tile 已被复用 ⇒ 句柄也必须失效");
+        assert!(!canvas.push_shaped_text(&first, Point::ZERO));
+        assert_eq!(
+            canvas.primitives().len(),
+            before,
+            "stale 句柄不得产生任何图元"
+        );
+
+        // 重新 shape：在淘汰腾出的空间里重新装箱，句柄属于当前租约。
+        let fresh = app
+            .shape_text("A", &TextStyle::new(16.0), None, &[])
+            .expect("重新 shape");
+        assert!(!fresh.is_stale());
+        assert!(canvas.push_shaped_text(&fresh, Point::new(1.0, 2.0)));
+    }
+
+    /// F3：`App::shape_text` 的失败路径同样必须完成「淘汰失效 + 租约同步」收尾。
+    ///
+    /// 变异守卫：把收尾改回 `?` 早退（返回前跳过 `take_evicted` / lease 同步）本用例必须变红
+    /// （句柄假活 + 节点文本行不失效）。
+    #[test]
+    fn failed_shape_still_invalidates_text_lines_and_syncs_the_lease() {
+        let (_runtime, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        let node = {
+            let target = app.window_mut(window).expect("窗口存在");
+            let root = target.tree().root();
+            NodeBuilder::text("node label", TextStyle::new(16.0))
+                .build(target.tree_mut(), root)
+                .expect("文本节点")
+        };
+        // 先跑一帧：节点文本的 `ShapedLine` 落进槽位（后续断言「失效」的前置）。
+        app.frame(window).expect("窗口存在").expect("首帧成功");
+        assert!(
+            app.window(window)
+                .expect("窗口存在")
+                .tree()
+                .text_line(node)
+                .is_some(),
+            "前置：节点文本必须已排版"
+        );
+
+        // 小页：cap 自身换代后两级缓存清空，之后 32² 页只放得下一个 tile。
+        app.cap_glyph_atlas_page_for_test(32);
+        let handle = app
+            .shape_text("A", &TextStyle::new(16.0), None, &[])
+            .expect("首个句柄");
+        assert!(!handle.is_stale());
+        let generation = app.glyph_atlas_generation_for_test();
+
+        // 一串互不相同的字形：先淘汰旧 tile（句柄 / 节点文本），随后以 AtlasExhausted 失败。
+        let error = app
+            .shape_text(
+                "abcdefghijklmnopqrstuvwxyz",
+                &TextStyle::new(16.0),
+                None,
+                &[],
+            )
+            .expect_err("32² 页放不下 26 个字形，必须报容量失败");
+        assert!(matches!(
+            error,
+            EngineError::AtlasExhausted {
+                kind: AtlasKind::Glyph
+            }
+        ));
+        assert_eq!(
+            app.glyph_atlas_generation_for_test(),
+            generation,
+            "失败路径只发生逐 tile 淘汰，不换代"
+        );
+        assert!(app.glyph_atlas_eviction_epoch_for_test() > 0);
+        assert!(handle.is_stale(), "失败路径也必须同步租约：旧句柄不能假活");
+        let tree = app.window(window).expect("窗口存在").tree();
+        assert!(
+            tree.text_line(node).is_none(),
+            "失败路径发生的淘汰必须让节点文本行失效（否则下一帧复用旧 UV）"
+        );
+        assert!(
+            tree.text_layout_dirty_len() > 0,
+            "节点文本必须重新入队等待重排"
+        );
+    }
+
+    // ── E1b F5：§11.1 明列的 emoji 与 L2 FrameRecord 断言 ─────────────────────
+
+    /// §11.1 测试要求「CJK + emoji」：emoji 走彩色字形（COLR/CBDT）的 alpha 压平路径
+    /// （`TextDiagnostic::ColorGlyphMonochrome`），这里只要求不 panic、度量单调（宿主字体不一定
+    /// 带 emoji 字形，缺失走 tofu / 回退也必须成功）。
+    #[test]
+    fn cjk_and_emoji_mix_shapes_with_monotonic_metrics() {
+        let (_runtime, mut app) = new_app();
+        let style = TextStyle::new(16.0);
+        let mixed = app
+            .shape_text("Hello 🌍🚀 世界", &style, None, &[])
+            .expect("CJK + emoji 必须能塑形");
+        assert!(mixed.size().width > 0.0);
+        assert!(mixed.size().height > 0.0);
+        assert!(glyph_count(mixed.line()) > 0, "emoji 行必须有可见字形");
+        let latin = app.shape_text("Hello ", &style, None, &[]).expect("Latin");
+        assert!(
+            mixed.size().width > latin.size().width,
+            "emoji + CJK 必须比纯 Latin 前缀更宽"
+        );
+        let more = app
+            .shape_text("Hello 🌍🚀🌍 世界", &style, None, &[])
+            .expect("更多 emoji");
+        assert!(
+            more.size().width > mixed.size().width,
+            "多一个 emoji 必须更宽（度量单调）"
+        );
+        // 限宽断行也不得 panic。
+        let wrapped = app
+            .shape_text("Hello 🌍🚀 世界", &style, Some(60.0), &[])
+            .expect("限宽");
+        assert!(wrapped.line().lines.len() > 1);
+    }
+
+    /// E1b F2：canvas 编码期安全网。push 之后同帧换代（换字体栈 ⇒ 图集换代），编码输出不得
+    /// 含失效 run、`FrameRecord::stale_canvas_runs` 逐条计数；同代际帧正常编码。
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn stale_canvas_glyph_runs_are_dropped_at_encode_time_and_counted() {
+        use crate::{
+            paint::{
+                color::Color,
+                primitive::{Quad, QuadPaint},
+            },
+            test_support::{app::TestApp, record::PrimitiveKind},
+            text::TextDiagnostic,
+        };
+
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let handle = app
+            .app_mut()
+            .shape_text("Canvas text", &TextStyle::new(16.0), None, &[])
+            .expect("塑形");
+        assert!(!handle.is_stale());
+        let run_count = handle
+            .line()
+            .glyph_runs()
+            .filter(|run| !run.glyphs.is_empty())
+            .count();
+        assert!(run_count > 0);
+        let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 200.0, 40.0));
+        // 一个非文本图元：过滤只应删失效 run，Canvas 本身仍要上屏。
+        canvas.push_quad(Quad {
+            bounds: Rect::new(0.0, 0.0, 200.0, 40.0),
+            corner_radius: [0.0; 4],
+            paint: QuadPaint::Solid {
+                fill: Color::WHITE,
+                border: None,
+            },
+        });
+        assert!(canvas.push_shaped_text(&handle, Point::new(2.0, 3.0)));
+        let canvas_node = {
+            let target = app.app_mut().window_mut(window).expect("窗口存在");
+            let root = target.tree().root();
+            NodeBuilder::canvas(canvas)
+                .layout_override(Rect::new(0.0, 0.0, 200.0, 40.0))
+                .id("canvas.text")
+                .build(target.tree_mut(), root)
+                .expect("Canvas 节点")
+        };
+
+        // 同代际：正常编码，Canvas 内的 GlyphRun 数 = 非空 run 数。
+        let record = app.drain().expect("帧成功");
+        assert_eq!(record.stale_canvas_runs, 0, "同代际不得丢弃任何 run");
+        let rendered = record.frame.as_ref().expect("已提交帧");
+        assert!(
+            rendered
+                .primitives
+                .iter()
+                .any(|primitive| primitive.node == canvas_node
+                    && primitive.kind == PrimitiveKind::Canvas),
+            "Canvas 节点必须以一个 Canvas 图元进帧记录"
+        );
+        assert_eq!(
+            canvas_scene_glyph_run_count(app.app(), window),
+            run_count,
+            "同代际：Canvas 内 GlyphRun 图元数 = 非空 run 数"
+        );
+
+        // 换字体栈 ⇒ 图集换代；应用持有的 Canvas 仍是旧 tile（没有重建）。应用侧标重绘
+        //（本测试没有 a11y 消费者，单靠唤醒会被 a11y-only 快速路径吞掉）后引擎重绘。
+        app.app_mut()
+            .set_font_stack(FontStack::new(["Kytrix No Such Family"]));
+        assert!(handle.is_stale(), "换代后句柄必须失活");
+        assert!(
+            app.app_mut()
+                .request_node_repaint(window, canvas_node)
+                .expect("请求重绘")
+        );
+        let record = app.drain().expect("帧成功");
+        assert_eq!(
+            record.stale_canvas_runs, run_count,
+            "失效 run 必须逐条计入诊断（少字优于花字）"
+        );
+        assert!(
+            app.app()
+                .text_diagnostics()
+                .iter()
+                .any(|diagnostic| matches!(
+                    diagnostic,
+                    TextDiagnostic::CanvasTextStale { runs } if *runs == run_count
+                )),
+            "少字必须经 `TextDiagnostic::CanvasTextStale` 可观测（D17 不静默）：{:?}",
+            app.app().text_diagnostics()
+        );
+        assert_eq!(
+            canvas_scene_glyph_run_count(app.app(), window),
+            0,
+            "编码输出不得含任何失效 run"
+        );
+    }
+
+    /// 场景里所有 Canvas 图元的内部 `GlyphRun` 数（E1b 的 L2 断言面：FrameRecord 把 Canvas 当
+    /// 不透明图元，内层图元数只能在场景上核对）。
+    #[cfg(feature = "test-support")]
+    fn canvas_scene_glyph_run_count(app: &App, window: WindowId) -> usize {
+        let target = app.window(window).expect("窗口存在");
+        let scene = target.scene();
+        let mut runs = 0usize;
+        for lane in scene.order() {
+            for primitive in scene.lane_primitives(*lane).unwrap_or(&[]) {
+                if let Primitive::Canvas(canvas) = primitive {
+                    runs += canvas
+                        .primitives()
+                        .iter()
+                        .filter(|inner| matches!(inner, Primitive::GlyphRun(_)))
+                        .count();
+                }
+            }
+        }
+        runs
+    }
+
+    /// L2（§11.1）：节点文本走帧后，`FrameRecord` 里的 `Primitive::GlyphRun` 全部落在节点盒内，
+    /// 且 lane 的 GlyphRun 图元数 = 非空 run 数（与 canvas 的 `push_shaped_text` 同一套 run 语义）。
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn frame_record_glyph_runs_stay_inside_the_text_node_box() {
+        use crate::test_support::{app::TestApp, record::PrimitiveKind};
+
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let node = {
+            let target = app.app_mut().window_mut(window).expect("窗口存在");
+            let root = target.tree().root();
+            NodeBuilder::text("Frame L2 text", TextStyle::new(16.0))
+                .layout_override(Rect::new(10.0, 20.0, 220.0, 40.0))
+                .id("text.l2")
+                .build(target.tree_mut(), root)
+                .expect("文本节点")
+        };
+        let record = app.drain().expect("帧成功");
+        // 先把帧记录里的断言面拷出来，结束对 `app` 的独占借用。
+        let glyph_runs: Vec<(NodeId, Rect)> = record
+            .frame
+            .as_ref()
+            .expect("已提交帧")
+            .primitives
+            .iter()
+            .filter(|primitive| primitive.kind == PrimitiveKind::GlyphRun)
+            .map(|primitive| (primitive.node, primitive.bounds))
+            .collect();
+        let target = app.app().window(window).expect("窗口存在");
+        let node_bounds = target.tree().get(node).expect("节点").layout().bounds;
+        let line = target.tree().text_line(node).expect("文本行").clone();
+        let expected_runs = line
+            .glyph_runs()
+            .filter(|run| !run.glyphs.is_empty())
+            .count();
+        let node_runs: Vec<Rect> = glyph_runs
+            .into_iter()
+            .filter(|(owner, _)| *owner == node)
+            .map(|(_, bounds)| bounds)
+            .collect();
+        assert_eq!(
+            node_runs.len(),
+            expected_runs,
+            "节点 lane 的 GlyphRun 图元数 = 非空 run 数"
+        );
+        assert!(!node_runs.is_empty());
+        for bounds in node_runs {
+            assert!(
+                bounds.origin.x >= node_bounds.origin.x - 0.5
+                    && bounds.origin.y >= node_bounds.origin.y - 0.5
+                    && bounds.origin.x + bounds.size.width
+                        <= node_bounds.origin.x + node_bounds.size.width + 0.5
+                    && bounds.origin.y + bounds.size.height
+                        <= node_bounds.origin.y + node_bounds.size.height + 0.5,
+                "GlyphRun bounds {bounds:?} 必须 ⊆ 节点盒 {node_bounds:?}"
+            );
+        }
     }
 }

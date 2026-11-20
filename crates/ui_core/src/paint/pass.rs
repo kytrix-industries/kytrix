@@ -98,6 +98,14 @@ pub(crate) struct PaintReport {
     /// 消费者：`App::frame` 在 `commit_frame` 之后逐节点 `mark_text_layout_dirty + mark_paint`
     /// 并请求下一帧（下一帧的 `layout_text` 用当前代际重光栅）。
     pub stale_text: SmallVec<[NodeId; 4]>,
+    /// D-5 的 canvas 半边（v2.1 E1b）：因 `AtlasTile` 代际 ≠ 当前图集代际而**未编码**的
+    /// `GlyphRun` 数（Canvas 内文本）。
+    ///
+    /// Canvas 内容归应用所有，引擎无法自动重建：这里只止损（不画旧 UV，少字优于花字）并计数。
+    /// 应用义务：发现句柄 `is_stale()` 后重新 `shape_text` 并用新句柄重建 Canvas。消费者：
+    /// `App::frame`（压 [`crate::text::TextDiagnostic::CanvasTextStale`]）与
+    /// `test_support::record::FrameRecord::stale_canvas_runs`（帧记录）。
+    pub stale_canvas_runs: usize,
     /// 本帧编码出的实例数（仅 `test-support`；`Window::paint_frame` 编码后回填）。
     #[cfg(feature = "test-support")]
     pub instances: usize,
@@ -182,6 +190,7 @@ impl PaintPass<'_> {
             focused: self.focused,
             atlas_generation: self.atlas_generation,
             stale_text: SmallVec::new(),
+            stale_canvas_runs: 0,
             #[cfg(feature = "test-support")]
             log,
             rebuilt: 0,
@@ -223,6 +232,7 @@ impl PaintPass<'_> {
             rebuilt: context.rebuilt,
             damage,
             stale_text: context.stale_text,
+            stale_canvas_runs: context.stale_canvas_runs,
             #[cfg(feature = "test-support")]
             instances: 0,
             #[cfg(feature = "test-support")]
@@ -264,6 +274,8 @@ struct PaintContext<'a> {
     atlas_generation: Option<u32>,
     /// 行代际不匹配、本帧未编码的文本节点（D-5）。
     stale_text: SmallVec<[NodeId; 4]>,
+    /// Canvas 内代际不匹配、本帧未编码的字形 run 数（D-5 的 canvas 半边，v2.1 E1b）。
+    stale_canvas_runs: usize,
     #[cfg(feature = "test-support")]
     log: PaintLog,
     rebuilt: usize,
@@ -1650,7 +1662,20 @@ impl PrimitiveEmitter {
 
             Content::Canvas(canvas) => {
                 let canvas_bounds = canvas.bounds();
-                self.push(context, Primitive::Canvas(Arc::clone(&canvas)));
+                // E1b F2：编码期安全网。`push_shaped_text` 只在 push 时校验租约；push 之后
+                // 同帧的图集换代会让已写入的 tile 变旧 UV。逐 run 校验代际，失效 run 不编码
+                //（少字优于花字），计数进 `PaintReport`/`FrameRecord`。换代时
+                // `App::repaint_text_if_atlas_changed` 已把 Canvas 节点标 PAINT，保证本分支
+                // 在复用路径上也会执行。
+                let (canvas, stale_runs) = match context.atlas_generation {
+                    Some(generation) => match canvas.without_stale_glyph_runs(generation) {
+                        Some((filtered, dropped)) => (Arc::new(filtered), dropped),
+                        None => (Arc::clone(&canvas), 0),
+                    },
+                    None => (Arc::clone(&canvas), 0),
+                };
+                context.stale_canvas_runs += stale_runs;
+                self.push(context, Primitive::Canvas(canvas));
                 context.damage.push(canvas_bounds, 1.0, self.clip);
             }
             Content::Text(line) => {

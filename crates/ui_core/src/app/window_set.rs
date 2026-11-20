@@ -315,6 +315,11 @@ pub(crate) fn close_window(app: &mut App, id: WindowId) -> bool {
     app.close_handlers.remove(&id);
     app.a11y_delivered.remove(&id);
     app.scale_epochs.remove(&id);
+    // E1b：焦点窗口记录不能指向已关闭的窗口；`default_text_scale` 保留最后值
+    //（「无窗口时保持上次值」）。
+    if app.focused_window == Some(id) {
+        app.focused_window = None;
+    }
     // 平台 IME 目标状态：窗口没了就没有「已应用状态」可对齐，留着只会在 create/close
     // 循环下无界增长（WindowId 不复用，不会串到新窗口）。
     app.ime_disabled.remove(&id);

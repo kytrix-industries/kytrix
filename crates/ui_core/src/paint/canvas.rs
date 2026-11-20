@@ -3,6 +3,8 @@
 //! `Canvas` 内部持有一个 crate 私有的绘制桶（`scene::Lane`），公开的 `push_*` 方法把引擎图元写进去；
 //! 引擎在 P03/P07 把它包成 `Primitive::Canvas` 嵌进真实 lane。所有权与 API 契约见
 
+use std::sync::Arc;
+
 use crate::{
     math::{Point, Rect},
     paint::{
@@ -79,9 +81,13 @@ impl Canvas {
     /// §5.9）；多行文本的所有行一起偏移。字形来自 [`ShapedTextHandle`]，应用不接触
     /// `AtlasTile` / `GlyphRun` 的构造。
     ///
-    /// **引擎负责代际校验**（等价 D-5 的「唯一重光栅入口」）：句柄在图集换代后已失效时
-    /// **不产生任何图元**并返回 `false` —— 绝不把旧 UV 编码进图元（那正是 D-5 修掉的花字）。
-    /// 应用收到 `false` 应丢弃句柄并重新 `App::shape_text`。
+    /// **引擎负责租约校验**（等价 D-5 的「唯一重光栅入口」）：句柄在图集换代**或**其 tile
+    /// 被逐 tile 淘汰后已失效时**不产生任何图元**并返回 `false` —— 绝不把旧 UV 编码进图元
+    /// （那正是 D-5 修掉的花字）。应用收到 `false` 应丢弃句柄并重新 `App::shape_text`。
+    ///
+    /// push **之后**才发生的图集换代由 paint 的编码期安全网兜底
+    /// （[`Canvas::without_stale_glyph_runs`]，失效 run 不编码）；但 Canvas 内容归应用所有，
+    /// 应用仍须在句柄失效后重建 Canvas（`§11.1` 的应用义务）。
     ///
     /// 空文本（0 行）返回 `true` 且不产生图元：句柄本身有效，只是没有可画内容。
     ///
@@ -117,6 +123,68 @@ impl Canvas {
             }
         }
         true
+    }
+
+    /// 编码期安全网（v2.1 E1b，`§11.1` 的「不允许画旧 UV」）：按当前图集代际过滤 Canvas 内的
+    /// 字形 run。
+    ///
+    /// [`Canvas::push_shaped_text`] 只在 **push 时**校验句柄租约；push 之后同帧发生的图集换代
+    /// （`layout_text` 扩容 / 清空、换字体栈）会让已写入的 `AtlasTile` 指向旧 UV。paint 在 emit
+    /// 本 Canvas 前调用本方法：任一 tile 代际 ≠ 当前代际的 run **整段丢弃**（少字优于花字，与
+    /// 节点文本的 D-5 编码期硬校验同口径），其余图元（含 clip 括号）原样保留、顺序不变。
+    ///
+    /// 返回 `None` = 没有失效 run（调用方复用原值，零分配）；否则返回过滤后的 Canvas 与
+    /// **丢弃的 run 数**（`PaintReport::stale_canvas_runs` 的诊断计数）。
+    ///
+    /// # Panics: none
+    #[must_use]
+    pub(crate) fn without_stale_glyph_runs(
+        &self,
+        current_generation: u32,
+    ) -> Option<(Canvas, usize)> {
+        fn run_is_stale(run: &GlyphRun, current_generation: u32) -> bool {
+            run.glyphs
+                .iter()
+                .any(|glyph| glyph.tile.is_stale(current_generation))
+        }
+
+        let mut filtered = Lane::new();
+        let mut dropped = 0usize;
+        let mut changed = false;
+        for primitive in self.lane.primitives() {
+            match primitive {
+                Primitive::GlyphRun(run) => {
+                    if run_is_stale(run, current_generation) {
+                        dropped += 1;
+                        changed = true;
+                    } else {
+                        filtered.push(primitive.clone());
+                    }
+                }
+                // 嵌套 Canvas（应用构造不出口，但值语义下可能经其它路径出现）：递归过滤。
+                Primitive::Canvas(inner) => {
+                    match inner.without_stale_glyph_runs(current_generation) {
+                        Some((sanitized, inner_dropped)) => {
+                            dropped += inner_dropped;
+                            changed = true;
+                            filtered.push(Primitive::Canvas(Arc::new(sanitized)));
+                        }
+                        None => filtered.push(primitive.clone()),
+                    }
+                }
+                _ => filtered.push(primitive.clone()),
+            }
+        }
+        if !changed {
+            return None;
+        }
+        Some((
+            Canvas {
+                bounds: self.bounds,
+                lane: filtered,
+            },
+            dropped,
+        ))
     }
 
     /// debug 构建断言 `image.tile.atlas == AtlasKind::Image` 且页号 < `MAX_IMAGE_PAGES`（页号上限；
@@ -462,15 +530,20 @@ mod tests {
         canvas.push_text(run);
     }
 
-    /// v2.1 E1：`push_shaped_text` 的唯一入口语义 —— 代际校验 + origin 偏移 + 按 run 拆图元。
+    /// v2.1 E1b：`push_shaped_text` 的唯一入口语义 —— 图集租约校验 + origin 偏移 + 按 run 拆图元。
     ///
-    /// `generation` 是句柄构造时的图集代际，`current` 是共享租约里的当前代际：
-    /// 两者不等 ⇒ 句柄已失效。
-    fn shaped_handle(generation: u32, current: u32) -> crate::text::ShapedTextHandle {
-        use std::sync::{Arc, atomic::AtomicU32};
+    /// `(generation, eviction_epoch)` 是句柄构造时的租约，`current` 是共享租约里的当前值：
+    /// 任一不等 ⇒ 句柄已失效（整页换代与逐 tile 淘汰都算）。
+    fn shaped_handle(
+        generation: u32,
+        eviction_epoch: u32,
+        current: (u32, u32),
+    ) -> crate::text::ShapedTextHandle {
+        use std::sync::{Arc, atomic::AtomicU64};
 
         use crate::text::{
             ShapedGlyphRun, ShapedLine, ShapedTextHandle, ShapedTextItem, ShapedTextLine,
+            pack_atlas_lease,
         };
 
         let glyph = PositionedGlyph {
@@ -510,14 +583,16 @@ mod tests {
             Arc::new(line),
             Box::new([]),
             generation,
-            Arc::new(AtomicU32::new(current)),
+            eviction_epoch,
+            1.0,
+            Arc::new(AtomicU64::new(pack_atlas_lease(current.0, current.1))),
         )
     }
 
     #[test]
     fn push_shaped_text_offsets_glyphs_by_the_origin() {
         let mut canvas = Canvas::new(bounds());
-        let handle = shaped_handle(7, 7);
+        let handle = shaped_handle(7, 2, (7, 2));
         assert!(
             canvas.push_shaped_text(&handle, Point::new(10.0, 20.0)),
             "当前代际的句柄必须能编码"
@@ -543,7 +618,7 @@ mod tests {
         canvas.push_quad(quad());
         let before = canvas.primitives().len();
         // 句柄记录 7 代，图集已经到 8 代 ⇒ 旧 UV 已失效。
-        let stale = shaped_handle(7, 8);
+        let stale = shaped_handle(7, 0, (8, 0));
         assert!(stale.is_stale());
         assert!(
             !canvas.push_shaped_text(&stale, Point::ZERO),
@@ -554,14 +629,26 @@ mod tests {
             before,
             "stale push 不得产生任何图元（不画旧 UV）"
         );
+        // E1b F1：代际不变、但句柄构造后发生过逐 tile 淘汰 ⇒ 同样失效。
+        let evicted = shaped_handle(7, 2, (7, 3));
+        assert!(
+            evicted.is_stale(),
+            "淘汰纪元前进必须让句柄失效（tile 已被别的字形复用）"
+        );
+        assert!(
+            !canvas.push_shaped_text(&evicted, Point::ZERO),
+            "淘汰后的句柄不得编码旧 UV"
+        );
+        assert_eq!(canvas.primitives().len(), before);
     }
 
     #[test]
     fn push_shaped_text_splits_multiple_runs_into_multiple_primitives() {
-        use std::sync::{Arc, atomic::AtomicU32};
+        use std::sync::{Arc, atomic::AtomicU64};
 
         use crate::text::{
             ShapedGlyphRun, ShapedLine, ShapedTextHandle, ShapedTextItem, ShapedTextLine,
+            pack_atlas_lease,
         };
 
         let run = |x: f32| ShapedGlyphRun {
@@ -605,8 +692,14 @@ mod tests {
             font_stack_version: 1,
             scale: 1.0,
         };
-        let handle =
-            ShapedTextHandle::new(Arc::new(line), Box::new([]), 3, Arc::new(AtomicU32::new(3)));
+        let handle = ShapedTextHandle::new(
+            Arc::new(line),
+            Box::new([]),
+            3,
+            0,
+            1.0,
+            Arc::new(AtomicU64::new(pack_atlas_lease(3, 0))),
+        );
         let mut canvas = Canvas::new(bounds());
         assert!(canvas.push_shaped_text(&handle, Point::new(1.0, 2.0)));
         assert_eq!(

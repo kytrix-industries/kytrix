@@ -67,7 +67,7 @@
 use core::ops::Range;
 use std::sync::{
     Arc,
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicU64, Ordering},
 };
 
 use smallvec::SmallVec;
@@ -891,16 +891,29 @@ pub struct ShapedInlineBox {
     pub baseline: Option<f32>,
 }
 
+/// 图集租约的打包值：高 32 位 = `generation`，低 32 位 = `eviction_epoch`。
+///
+/// 打包成一个 `AtomicU64` 而不是两个 `AtomicU32`：两者必须**原子地一起前进**，否则
+/// `is_stale` 可能读到「新代际 + 旧纪元」的撕裂组合（换代与淘汰相邻发生时短暂假活）。
+/// 唯一写入者见 [`crate::app::App`] 的租约同步点。
+#[must_use]
+pub(crate) const fn pack_atlas_lease(generation: u32, eviction_epoch: u32) -> u64 {
+    (generation as u64) << 32 | eviction_epoch as u64
+}
+
 /// 一次**无节点归属**的 shaping 的长期句柄（v2.1 E1，`§11.1`）。
 ///
 /// 由 [`crate::app::App::shape_text`] 产出，应用只读：字形位置 / 行 / 行内盒走
-/// [`Self::line`]，内容尺寸走 [`Self::size`]，行内盒落点走
+/// [`Self::line`]，内容尺寸走 [`Self::size`]，光栅 scale 走 [`Self::scale`]，行内盒落点走
 /// [`crate::app::App::shaped_inline_boxes`]。句柄**没有公开构造器**，也不给应用
 /// `AtlasTile` / `GlyphRun` 的构造权（`§11.1`：应用永不构造裸 `GlyphRun` / `AtlasTile`）。
 ///
-/// 句柄带**图集代际租约**：图集换代（DPI 变化 / 字形容量逃逸 / 字体栈切换）后
-/// [`Self::is_stale`] 为真，`Canvas::push_shaped_text` 拒绝编码（不画旧 UV，等价 D-5 的
-/// 「唯一重光栅入口」）；应用应丢弃句柄并重新 `shape_text`。
+/// 句柄带**图集租约** `(generation, eviction_epoch)`（v2.1 E1b）：
+/// - 图集换代（DPI 变化 / 字形容量逃逸 / 字体栈切换）⇒ `generation` 变化；
+/// - 逐 tile LRU 淘汰（容量压力下任何 tile 被复用）⇒ `eviction_epoch` 变化。
+///
+/// 任一变化后 [`Self::is_stale`] 为真，`Canvas::push_shaped_text` 拒绝编码（不画旧 UV，等价
+/// D-5 的「唯一重光栅入口」）；应用应丢弃句柄并重新 `shape_text`。
 #[derive(Debug)]
 pub struct ShapedTextHandle {
     /// 塑形快照（只读）。
@@ -909,8 +922,12 @@ pub struct ShapedTextHandle {
     inline_boxes: Box<[ShapedInlineBox]>,
     /// 构造时的图集代际。
     generation: u32,
-    /// 与 `App` 共享的**当前**图集代际（代际租约；图集换代方负责写入）。
-    lease: Arc<AtomicU32>,
+    /// 构造时的图集累计淘汰纪元（任何 tile 被 LRU 淘汰即前进）。
+    eviction_epoch: u32,
+    /// 构造时的光栅 scale（App 级默认 scale；`line().scale` 的同一值）。
+    scale: f32,
+    /// 与 `App` 共享的**当前**图集租约（打包的 `(generation, eviction_epoch)`）。
+    lease: Arc<AtomicU64>,
 }
 
 impl ShapedTextHandle {
@@ -919,12 +936,16 @@ impl ShapedTextHandle {
         line: Arc<ShapedLine>,
         inline_boxes: Box<[ShapedInlineBox]>,
         generation: u32,
-        lease: Arc<AtomicU32>,
+        eviction_epoch: u32,
+        scale: f32,
+        lease: Arc<AtomicU64>,
     ) -> Self {
         Self {
             line,
             inline_boxes,
             generation,
+            eviction_epoch,
+            scale,
             lease,
         }
     }
@@ -937,13 +958,15 @@ impl ShapedTextHandle {
         &self.line
     }
 
-    /// 图集是否已换代：`true` = 句柄里的 `AtlasTile` 已失效（旧 UV），必须重新
-    /// `shape_text`；此时 `Canvas::push_shaped_text` 返回 `false` 且不产生任何图元。
+    /// 图集租约是否已失效：`true` = 句柄里的 `AtlasTile` 已失效（旧 UV / 已被复用），必须
+    /// 重新 `shape_text`；此时 `Canvas::push_shaped_text` 返回 `false` 且不产生任何图元。
+    ///
+    /// `generation`（整页换代）或 `eviction_epoch`（逐 tile 淘汰）任一前进即为真。
     ///
     /// # Panics: none
     #[must_use]
     pub fn is_stale(&self) -> bool {
-        self.lease.load(Ordering::Relaxed) != self.generation
+        self.lease.load(Ordering::Relaxed) != pack_atlas_lease(self.generation, self.eviction_epoch)
     }
 
     /// 内容尺寸（逻辑像素）。
@@ -952,6 +975,17 @@ impl ShapedTextHandle {
     #[must_use]
     pub fn size(&self) -> Size {
         self.line.size()
+    }
+
+    /// 本次 shaping 使用的光栅 scale（`§11.1` 的 App 级默认 scale；默认 1.0）。
+    ///
+    /// 句柄内的 tile 位图按 `字号 × scale` 的物理 ppem 光栅；应用把句柄画到 DPI 不同的窗口
+    /// （或窗口 DPI 变化）后必须重新 `shape_text` —— 引擎不会自动重光栅已有句柄。
+    ///
+    /// # Panics: none
+    #[must_use]
+    pub fn scale(&self) -> f32 {
+        self.scale
     }
 
     /// 行内盒落点（crate 内部：`App::shaped_inline_boxes` 的唯一出口）。
@@ -1086,6 +1120,16 @@ pub enum TextDiagnostic {
     AtlasFull {
         /// 该节点本轮没画出的字形数（`>= 1`）。
         skipped: usize,
+    },
+    /// Canvas 内文本因图集租约失效而在**编码期**被丢弃（v2.1 E1b，`§11.1` 的 D-5 canvas 半边）。
+    ///
+    /// `Canvas` 内容归应用所有：`push_shaped_text` 之后图集换代（DPI 变化 / 字体栈切换 /
+    /// 容量逃逸）会让已写入的 `AtlasTile` 指向旧 UV，编码期为避免花字整段丢弃失效 run。
+    /// 引擎**无法**代应用重建 Canvas —— 应用应在句柄 `is_stale()` 后重新 `shape_text` 并用新
+    /// 句柄重建 Canvas。这条诊断让「少字」不静默（D17：可见失败优于静默缺字）。
+    CanvasTextStale {
+        /// 本帧被丢弃的 `GlyphRun` 数（`>= 1`；每个 run 一段文本）。
+        runs: usize,
     },
 }
 
