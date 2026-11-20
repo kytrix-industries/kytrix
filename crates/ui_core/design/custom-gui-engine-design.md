@@ -1,23 +1,25 @@
 # Kytrix 定制化跨平台 GUI 引擎 · 系统设计文档
 
 > **文档类型**：系统设计规格 —— 只描述最终架构、接口、实现与约束
-> **版本**：v2.1（2026-11-20）
-> **v2.1 变更摘要**（2026-11-20）：按 `.docs/gui-migration/assess/09-design-reconciliation.md`（22 条事实错误 + 6 条次级偏差）
-> 与 `08-gap-verification.md`（E1–E6 引擎扩展）回写。逐条改动台账（序号 / 章节 / 原文摘要 / 改法 / 依据 / 风险）见
-> `.docs/gui-migration/design-changes.md`。**本版是 GUI 迁移的实现/审查规格基线。**
+> **版本**：v2.2（2026-11-21）
+> **v2.2 变更摘要**（2026-11-21）：**P1 引擎扩展 E1–E6 已全部实现并合入 `gui-engine-migration`（迁移分支 HEAD `e1e4ff6`）**。
+> 本版把 §11 从「新增规格（待落地）」回写为**实现后的精确规格**（API 形状 / 语义 / 错误 / 不变式 / 测试面），并同步
+> §1.3 公开 API 白名单、§2.9 错误变体计数（**35**）、§4.5 缓存键、§5.5/§5.9、§6.3/§6.8/§6.9、§8.2/§8.6（平台能力表）、
+> §10.2 状态与附录。**E2b 候选**（§11.2）与**已接受残余**（§11.8）单列并明确标注为未实现/限制，不得当作已交付能力引用。
+> 逐条回写台账（spec-delta 条目 → 章节 → 源码证据）见 `.docs/gui-migration/design-changes.md` §10。
 > **适用平台**：Windows（x64 / ARM64）、macOS（Apple Silicon / 受支持 Intel）、Linux（x64 / ARM64，**仅 Wayland**）
 > **上游关系**：技术路线论证见 `custom-gui-engine-technical-research.md`；本文是其定案（D1–D25）的实现规格，不重复论证
 > **工程约束**：`AGENTS.md`（模块化、`lib.rs` 只做模块声明、强类型错误、不做预防性抽象、单测与生产代码同模块；验收
 > `cargo test` + `cargo +nightly clippy -- -D warnings` + `cargo +nightly fmt`）
-> **代码状态**（v2.1 审查修复后再次校准；逐条差异见台账 §7）：本文正文的**已实现部分**已与 `crates/ui_core/src` 的公开面
-> 逐项对齐（类型名 / 方法名 / 签名 / 字段以源码为准）；`crates/ui_core` 之外的迁移目标（`base_ui` / widgets / `*_ui` / `kytrix`）仍是
+> **代码状态**（v2.2 校准）：本文正文与 `crates/ui_core/src` 的 `pub` 面逐项对齐（类型名 / 方法名 / 签名 / 字段以源码为准）；
+> E1–E6 的引擎增量已全部实现（§11）。`crates/ui_core` 之外的迁移目标（`base_ui` / widgets / `*_ui` / `kytrix`）仍是
 > **待迁移**。Rust 片段分三类，各自必须显式标注：
 >
 > 1. **已实现契约**——与源码一致，片段只是摘要；
-> 2. **`v2.1 新增规格`（E1–E6，见 §11）**——**尚未实现**，是迁移前要落地的引擎增量，落地前任何应用层代码不得依赖；
+> 2. **E2b 候选 / 已接受残余**——明确标注为**未实现候选或受限项**（§11.2 / §11.8），应用不得依赖；
 > 3. **接口草图**——固定语义与形状、非可编译实现。
 >
-> 任何未标 `v2.1 新增规格` 的条目都视为「现在就可依赖的能力」；若与源码冲突，**以源码为准并回写本文**。
+> 任何未标「E2b 候选 / 已接受残余」的条目都视为「现在就可依赖的能力」；若与源码冲突，**以源码为准并回写本文**。
 
 ---
 
@@ -52,7 +54,7 @@
 | #   | 不变量                                                                                                                                                        | 违反后果                                            |
 |-----|---------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------|
 | I1  | **编译期单一后端**：`render/` 与 `platform/` 三平台子模块按 `#[cfg(target_os)]` 选择，运行时不存在后端枚举、不存在可插拔 `Renderer` / 事件循环 trait          | 退化为通用框架抽象，违反 D2                         |
-| I2  | **一套数据契约**：`Scene` / `#[repr(C)] GpuPrimitive` / `PhysicalRect`（damage）/ `AtlasTile` / `GeometryDesc` / `Color` 只有一份定义，三套 renderer 只消费不重定义；迁移期的引擎扩展只允许「**不改** `GpuPrimitive` 字节布局、不改 `render/shaders/contract.md`」的能力，唯一例外是 E4（`GeometryDraw.range`），它必须三端 encoder + `contract.md` + 参数 golden 同步（§11.4）      | 三份代码语义漂移                                    |
+| I2  | **一套数据契约**：`Scene` / `#[repr(C)] GpuPrimitive` / `PhysicalRect`（damage）/ `AtlasTile` / `GeometryDesc` / `Color` 只有一份定义，三套 renderer 只消费不重定义；迁移期的引擎扩展只允许「**不改** `GpuPrimitive` 字节布局、不改 `render/shaders/contract.md`」的能力，唯一例外是 E4（`GeometryDraw.range`），已按「三端 encoder 共享参数纯函数 + `contract.md` + 参数单测/WARP 子区间像素测试」同批落地（§11.4）      | 三份代码语义漂移                                    |
 | I3  | **空闲不提交帧**：无任何 dirty 标记时，帧调度器停在 `Idle`，不录制命令、不 present。**受管动画是唯一「自动」连续帧入口**（`App::animate(window, AnimatedValue, &[NodeId], AnimationSpec)`；`needs_continuous_frames` 的判据来自「有活跃动画」）；应用自驱的逐帧路径（`on_frame` + `set_canvas` 等）必须自带收敛条件并在收敛后停止请求，不得无条件 `request_repaint`（§8.4 / §11.7） | 空闲 GPU 占用与功耗 |
 | I4  | **GPU 资源只经延迟销毁**：任何释放请求按 `FrameIndex` 入队，fence / semaphore / command buffer 完成后才真正释放                                               | GPU 端 use-after-free、驱动相关花屏                 |
 | I5  | **节点树与布局树同一份存储**：引擎节点实现 taffy `LayoutPartialTree`，不维护第二棵布局树                                                                      | 双树同步错误、命中盒与布局不一致                    |
@@ -221,40 +223,42 @@ pub(crate) use windows as backend;
 
 ### 1.3 引擎 / 应用层边界（D15 / D24 具体化）
 
-引擎对应用层暴露的**公开 API 类别**（**非穷尽**：本表是审查时判断「是否越界」的类别基线；完整清单以源码 `pub` 面为准，逐项签名见 §3 / §4 / §5 / §8 与附录 A）。三条**机制性前提**（v2.1 修正，依据 `src/lib.rs:1-27` 与根 `Cargo.toml` 的 `pub_use = "forbid"`）：
+引擎对应用层暴露的**公开 API 类别**（**非穷尽**：本表是审查时判断「是否越界」的类别基线；完整清单以源码 `pub` 面为准，逐项签名见 §3 / §4 / §5 / §8 与附录 A）。三条**机制性前提**（v2.1 修正，依据 `src/lib.rs` 与根 `Cargo.toml` 的 `pub_use = "forbid"`）：
 
 1. **不做 re-export**：`ui_core/src/lib.rs` 只有 `mod` 声明，workspace lint 禁止 `pub use`。应用一律走**深路径**：
    `ui_core::paint::scene::Scene`、`ui_core::node::builder::NodeBuilder`、`ui_core::test_support::app::TestApp`。
 2. **模块可见性**：`render` / `platform` 是**私有**模块，GPU 与平台类型（`GpuPrimitive`、`Device`、`HWND`…）不在公开面；
    `test_support` 由 `feature = "test-support"` 门控（不进发布物，I7）。
 3. **白名单语义**：下表是「应用层允许依赖的类型与入口」，深路径省略 `ui_core::` 前缀；`error::EngineError` 是所有可失败
-   API 的返回错误（缺它无法写应用代码）。E1–E6 的新增公开面见本章末尾子表，**落地前不可依赖**。
+   API 的返回错误（缺它无法写应用代码）。**E1–E6 的公开面已全部实现**（P1 完成，§11），应用现在即可依赖。
 
 | 类别 | 可依赖类型 / 入口（深路径省略 `ui_core::`） | 一句话用途 / 边界 |
 |---|---|---|
-| 错误 | `error::EngineError`（顶层 29 个变体，§2.9） | 所有 `Result` 的错误类型；应用按变体分类处理（`StaleNode` / `UnknownWindow` / `NotVirtualList` 等；E6 新增 `UnsupportedWindowCapability`，§11.6），禁止字符串错误穿透 |
-| 应用 | `app::{App, AppHandle, Application, StylePassReport}`、`window::{WindowId, Window, WindowOptions, FrameIndex, FrameOutcome, FramePresentation}`、`window::{WindowControl, WindowState, WindowResizeEdge}`（**仅 `cfg(target_os = "linux")`**，E6 后三端可见）、`window::ImeContentType`、`App::{on_frame, create_window, window, window_mut, frame, set_drag_regions, request_node_repaint, take_resource_results, handle, runtime_handle}`、`Window::state`（Win/mac 由 E6 补齐） | 启动、建窗、帧驱动；`AppHandle::{wake, send, spawn}` 是**唯一跨线程入口**（`platform` 私有，应用看不到 `PlatformDispatcher`） |
-| 节点 | `node::id::NodeId`、`node::builder::NodeBuilder`、`node::tree::{NodeTree, Node, NodeKind, LayoutBox}`、`node::dirty::DirtyFlags`、`NodeTree::{new, root, get, append_child, remove, set_style, set_layout_override, invalidate_measure, hit_test, text_selection_rects, text_caret_rect, len, is_empty, debug_id}`、`Window::{tree, tree_mut}` | 建树与增删子节点（`NodeTree::{append_child, remove}`）；**没有 `NodeHandle` / `Children` / 声明式子节点 `Slot`**（`node::id::Slot<T>` 是私有 arena 槽，且 workspace lint 禁止半公开） |
+| 错误 | `error::EngineError`（顶层 **35** 个变体，§2.9；含 E1–E6 新增的 `TextShapeStandalone` / `InvalidTextScale` / `VirtualListExtents` / `InvalidVirtualExtent` / `UnsupportedWindowCapability` / `WindowIcon`） | 所有 `Result` 的错误类型；应用按变体分类处理（`StaleNode` 同时覆盖「不能作为文本命中目标」，§11.5），禁止字符串错误穿透 |
+| 应用 | `app::{App, AppHandle, Application, StylePassReport}`、`window::{WindowId, Window, WindowOptions, FrameIndex, FrameOutcome, FramePresentation, Decorations}`、`window::{WindowControl, WindowState, WindowResizeEdge}`（**三端可见**：E6 已移除 `cfg(target_os = "linux")`）、`window::ImeContentType`、`App::{on_frame, create_window, window, window_mut, frame, set_drag_regions, request_node_repaint, take_resource_results, handle, runtime_handle, close_window, set_title, request_window_control, set_traffic_light_position, traffic_light_inset, shape_text, shaped_inline_boxes, text_scale, set_text_scale, clear_text_scale_override}`、`Window::{state, text_byte_index_at, text_caret_rect, set_drag_regions, set_canvas, scene}` | 启动、建窗、帧驱动、窗口 chrome（E6：装饰 / 标题 / 系统按钮 / 交通灯 / 状态回报）；`AppHandle::{wake, send, spawn}` 是**唯一跨线程入口**（`platform` 私有，应用看不到 `PlatformDispatcher`） |
+| 节点 | `node::id::NodeId`、`node::builder::NodeBuilder`、`node::tree::{NodeTree, Node, NodeKind, LayoutBox}`、`node::dirty::DirtyFlags`、`NodeTree::{new, root, get, append_child, remove, set_style, set_layout_override, invalidate_measure, hit_test, text_selection_rects, text_caret_rect, len, is_empty, debug_id}`、`Window::{tree, tree_mut}` | 建树与增删子节点（`NodeTree::{append_child, remove}`）；**没有 `NodeHandle` / `Children` / 声明式子节点 `Slot`**（`node::id::Slot<T>` 是私有 arena 槽，且 workspace lint 禁止半公开）。`NodeTree::text_byte_index_at` / `text_line` 是 `pub(crate)`，公开入口只有 `Window::*`（§11.5） |
 | 状态 | `node::signal::{Signal, SignalId, Derived, Transient, SignalScope}`、`node::dependency::ReadCtx`、`App::{signal, signal_scope, signal_scoped, window_signal, release_scope, transient, derived, batch, write, write_with, update, update_with, read, read_with, write_transient, read_transient}` | 状态写入与依赖追踪。`read` 返回 `SignalRef<T>` 读守卫（守卫存活期写同一信号 **panic**）。**没有 `TaskHandle`**：异步回投是 `AppHandle::{send, spawn}`；资源解码结果经 `App::take_resource_results()` 取回 |
-| 样式 / 布局 | `paint::style::{Style, PaintSpec, StylePatch, FocusRing, ShadowSpec, Clip, Cursor}`、`layout::{MeasureFn, LayoutOverride}`、`layout::hit_test::HitShape`、`math::{Rect, Size, Point, Transform, Scale, Edges, PhysicalRect}`、`NodeBuilder::{boxed, text, canvas, geometry, style, paint, bind_style, bind_text, bind_a11y, a11y, measure, hit_shape, layout_override, focus_ring, tab_stop, id, inline_boxes, on_click, on_action, on_drag, build}` | 挂载期静态样式 / 动态补丁。`bind_*` **恰好三个**（`bind_text` / `bind_style` / `bind_a11y`），且**只在 `App::frame` 求值**（`Window::frame()` 不求值） |
-| 绘制 | `paint::scene::Scene`（**只能经 `Window::scene()` 取 `&Scene`**，写方法属引擎内部）、`paint::primitive::{Primitive, Quad, QuadPaint, Border, Gradient, GradientKind, GlyphRun, PositionedGlyph, Image, Path, Shadow, ClipOp, ClipRect, GeometryDraw}`、`paint::canvas::Canvas`、`paint::geometry::{GeometryId, GeometryDesc, GeometryPipeline, GeometryUpdate, IndexType, Topology}`、`paint::geometry_store::GeometryStore`（经 `App::geometry_mut()`）、`paint::color::{Color, ColorResolver}`、`paint::atlas::{AtlasKind, AtlasTile}`、`Window::set_canvas` | 自绘（`Canvas` 只装引擎 8 类图元，§5.9）、注册静态几何（`App::geometry_mut().insert(desc)`）、颜色解析。**没有裸类型 `Geometry`、没有 `Brush`** |
-| 文本 | `text::{TextStyle, TextStyleExtras, TextContent, TextAlign, TextSlant, TextWrap, TextDirection, TextOverflow, TextLineBreak, FontStack, FontStackStatus, TextDiagnostic, InlineBoxSpec, InlineAlign, ShapedLine, ShapedTextLine, ShapedTextItem, ShapedGlyphRun, ShapedInlineBox, ThinSlice, FeatureSet, FontVariationSet, TextFeature, TextFontVariation, TextPassReport, TextLayoutReport}`；`App::{refresh_text, layout_text, font_stack, font_stack_version, set_font_stack, reload_system_fonts, text_diagnostics, font_stack_status}` | 文本组件。**`ShapedLine` 类型公开但应用拿不到实例**（唯一出口 `NodeTree::text_line` 是 `pub(crate)`）；canvas 内 shaping 的公开面是 `v2.1 新增规格 E1`（§11.1），富文本是 E2（§11.2） |
-| 资源 | `resources::{ResourceId, ResourceCache, ResourceImage, DecodeState, ResourceStats, PendingResource}`、`App::{resources, resources_mut}` | 图标 / 图片 / 远程头像；`ResourceImage.tile` 恒有效直到 unload |
-| 交互 | `interaction::{FocusScope, ScrollHandle, ScrollConfig, ScrollState, ScrollAxis, VirtualList, VirtualListConfig, VirtualListState, Overlay, OverlayOptions, OverlayPlacement, OverlayDismiss, AnchorSide, DragState, DragInfo, DragPhase, AnimationId, Easing, AnimatedValue, AnimationSpec, ActionCtx, InputThresholds}`；`App::{make_scroll, set_scroll_content, scroll_to, scroll_by, scroll_state, capture_pointer, focused, hovered, key_down, set_focus, focus_next, focus_prev, make_virtual_list, set_virtual_items, virtual_list_state, virtual_row_index, create_overlay, close_overlay, place_overlay, bring_overlay_to_front, overlays, drag_state, drag, cancel_drag, animate, cancel_animation, animations_running}` | 通用交互机制。`VirtualList` **只支持等高行**（`VirtualListConfig { extent, overscan }`）；变高是 `v2.1 新增规格 E3`（§11.3）。**没有 `AnimationClock`**：动画是 `App::animate(window, AnimatedValue, &[NodeId], AnimationSpec)` |
+| 样式 / 布局 | `paint::style::{Style, PaintSpec, StylePatch, FocusRing, ShadowSpec, Clip, Cursor}`、`layout::{MeasureFn, LayoutOverride}`、`layout::hit_test::HitShape`、`math::{Rect, Size, Point, Transform, Scale, Edges, PhysicalRect}`、`NodeBuilder::{boxed, text, canvas, geometry, style, paint, bind_style, bind_text, bind_a11y, a11y, measure, hit_shape, layout_override, focus_ring, tab_stop, id, inline_boxes, runs, on_click, on_action, on_drag, build}` | 挂载期静态样式 / 动态补丁。`bind_*` **恰好三个**（`bind_text` / `bind_style` / `bind_a11y`），且**只在 `App::frame` 求值**（`Window::frame()` 不求值）。`NodeBuilder::runs` 是多 run 覆盖样式的挂载入口（E2，§11.2） |
+| 绘制 | `paint::scene::Scene`（**只能经 `Window::scene()` 取 `&Scene`**，写方法属引擎内部）、`paint::primitive::{Primitive, Quad, QuadPaint, Border, Gradient, GradientKind, GlyphRun, PositionedGlyph, Image, Path, Shadow, ClipOp, ClipRect, GeometryDraw}`（`GeometryDraw` 含 E4 的 `range: Range<u32>` 与 `GeometryDraw::full`）、`paint::canvas::Canvas`（含 E1 的 `push_shaped_text`）、`paint::geometry::{GeometryId, GeometryDesc, GeometryPipeline, GeometryUpdate, IndexType, Topology}`、`paint::geometry_store::GeometryStore`（经 `App::geometry_mut()`）、`paint::color::{Color, ColorResolver}`、`paint::atlas::{AtlasKind, AtlasTile}`（`AtlasTile` 含 E1d 的 CPU 侧 `slot` / `slot_epoch`）、`Window::set_canvas` | 自绘（`Canvas` 只装引擎 8 类图元，§5.9；canvas 文本走 `App::shape_text` + `Canvas::push_shaped_text`，§11.1）、注册静态几何与子区间绘制（§5.5 / §11.4）、颜色解析。**没有裸类型 `Geometry`、没有 `Brush`**；`AtlasAllocator::is_alive` 是 `pub(crate)`，不进公开面 |
+| 文本 | `text::{TextStyle, TextStyleExtras, TextContent, TextRun, TextDecoration, TextAlign, TextSlant, TextWrap, TextDirection, TextOverflow, TextLineBreak, FontStack, FontStackStatus, TextDiagnostic, InlineBoxSpec, InlineBoxPaint, InlineAlign, ShapedLine, ShapedTextHandle, ShapedTextLine, ShapedTextItem, ShapedGlyphRun, ShapedInlineBox, ThinSlice, FeatureSet, FontVariationSet, TextFeature, TextFontVariation, TextPassReport, TextLayoutReport}`；`App::{refresh_text, layout_text, font_stack, font_stack_version, set_font_stack, reload_system_fonts, text_diagnostics, font_stack_status, shape_text, shaped_inline_boxes, text_scale, set_text_scale, clear_text_scale_override}`；`TextContent::{runs, with_runs}`、`TextStyle::{decoration, with_decoration}` | 文本组件。**`ShapedLine` 类型公开但节点文本路径的应用拿不到实例**（`NodeTree::text_line` 是 `pub(crate)`）；无节点归属的 shaping 用 `App::shape_text` 拿 `ShapedTextHandle`（E1），富文本 runs / 装饰 / InlineBox 绘制与诊断为 E2（§11.2） |
+| 资源 | `resources::{ResourceId, ResourceCache, ResourceImage, DecodeState, ResourceStats, PendingResource}`、`App::{resources, resources_mut}` | 图标 / 图片 / 远程头像；`ResourceImage.tile` 恒有效直到 unload（图片 tile 不参与 E1d 的编码期逐 tile 判活，§11.8） |
+| 交互 | `interaction::{FocusScope, ScrollHandle, ScrollConfig, ScrollState, ScrollAxis, VirtualList, VirtualListConfig, VirtualListState, ItemAlign, Overlay, OverlayOptions, OverlayPlacement, OverlayDismiss, AnchorSide, DragState, DragInfo, DragPhase, AnimationId, Easing, AnimatedValue, AnimationSpec, ActionCtx, InputThresholds}`；`App::{make_scroll, set_scroll_content, scroll_to, scroll_by, scroll_state, capture_pointer, focused, hovered, key_down, set_focus, focus_next, focus_prev, make_virtual_list, set_virtual_items, set_virtual_extents, scroll_to_item, virtual_list_state, virtual_row_index, create_overlay, close_overlay, place_overlay, bring_overlay_to_front, overlays, drag_state, drag, cancel_drag, animate, cancel_animation, animations_running}` | 通用交互机制。`VirtualListConfig { extent, extents, overscan }`：`extents = None` 等高行、`Some(..)` 逐项高度（E3 已实现，§11.3；`VirtualListConfig` 因 `Box<[f32]>` **不再是 `Copy`**）。**没有 `AnimationClock`**：动画是 `App::animate(window, AnimatedValue, &[NodeId], AnimationSpec)` |
 | 事件 | `event::{Event, InputEvent, InputOutcome, Action, ActionSource, KeyBinding, Key, KeyCode, Modifiers, PointerButton, ImeEvent}`、`layout::hit_test::HitResult`、`App::{drain_events, on_action, off_action, bind_key, unbind_key, dispatch_action, dispatch_action_focused}` | 事件处理与快捷键。`Action` 是 `{ FocusNext, FocusPrev, Dismiss, Custom(SmolStr) }`：**应用动作只能是字符串 key**（没有强类型变体表）；「怎么触发」在 `ActionSource` |
 | 无障碍 | `a11y::{A11yRole, A11yNode, A11yLabel, A11yAction, A11yOverride, A11yPatch, A11yActionCtx, A11yActionData, A11yDiagnostic, A11yTreeSnapshot, A11yLive, A11ySort}`、`NodeBuilder::{a11y, bind_a11y}`、`App::{on_a11y_action, off_a11y_action, a11y_diagnostics}` | 自定义组件声明语义。`a11y` 接受**整值** `A11yOverride`（不是 `(role, label 闭包)`） |
-| 测试（`test-support` feature） | `test_support::app::{TestApp, TestWindow}`、`test_support::probe::{Probe, Selector}`、`test_support::record::{FrameRecord, RenderedFrame, QuadRecord, PrimitiveRecord, PrimitiveKind, PaintLog, LanePaintEntry, LaneOutcome, DeltaRecord, FrameStats}`、`test_support::script::{FrameScript, ScriptFrame, FrameSample, ScriptReport, A11yCapture, A11yDelivery}`、`test_support::snapshot::{SnapshotCase, SnapshotScene, SnapshotTheme, SnapshotImage, SnapshotDiff, SnapshotError, GoldenError, Tolerance, PixelBounds}`、`test_support::{a11y, acceptance, gui_smoke, pixels, diagnostics}` | 布局与图形测试（§6.2–§6.5）。**没有 `TestApp::mount`、没有 `TestApp::new(renderer: None)`、没有 `Probe::a11y()`，`Selector` 只有 `Id` / `Text` / `Path`（无 `Role`）** |
+| 测试（`test-support` feature） | `test_support::app::{TestApp, TestWindow}`、`test_support::probe::{Probe, Selector}`、`test_support::record::{FrameRecord, RenderedFrame, QuadRecord, PrimitiveRecord, PrimitiveKind, PaintLog, LanePaintEntry, LaneOutcome, DeltaRecord, FrameStats}`、`test_support::script::{FrameScript, ScriptFrame, FrameSample, ScriptReport, A11yCapture, A11yDelivery}`、`test_support::snapshot::{SnapshotCase, SnapshotScene, SnapshotTheme, SnapshotImage, SnapshotDiff, SnapshotError, GoldenError, Tolerance, PixelBounds}`、`test_support::{a11y, acceptance, gui_smoke, pixels, diagnostics}` | 布局与图形测试（§6.2–§6.5）。**没有 `TestApp::mount`、没有 `TestApp::new(renderer: None)`、没有 `Probe::a11y()`，`Selector` 只有 `Id` / `Text` / `Path`（无 `Role`）**。E1–E6 新增观测面：`FrameRecord.stale_canvas_runs`、`Window::inline_box_image_diagnostics()`、`App::frame_requests()`（§6.3 / §6.8） |
 
-**`v2.1 新增规格`（E1–E6）的公开面（尚未实现，落地前应用层不可依赖）**：
+**E1–E6 已实现的公开面（P1 完成；均可依赖）**：
 
 | 扩展 | 新增公开面 | 章节 |
 |---|---|---|
-| E1 | `text::ShapedTextHandle`、`App::{shape_text, shaped_inline_boxes}`、`Canvas::push_shaped_text` | §11.1 |
-| E2 | `text::{TextRun, TextDecoration, InlineBoxPaint}`、`TextContent.runs`、`TextStyle.decoration`、`InlineBoxSpec.paint`、`NodeBuilder::runs` | §11.2 |
-| E3 | `VirtualListConfig.extents`、`ItemAlign`、`App::{set_virtual_extents, scroll_to_item}` | §11.3 |
+| E1 | `text::ShapedTextHandle`（无公开构造器；`ShapedInlineBox` 经 `App::shaped_inline_boxes` 读取）、`App::{shape_text, shaped_inline_boxes, text_scale, set_text_scale, clear_text_scale_override}`、`ShapedTextHandle::{line, is_stale, size, scale}`、`Canvas::push_shaped_text`、`AtlasTile::{slot, slot_epoch}`（CPU 侧数据字段） | §11.1 |
+| E2 | `text::{TextRun, TextDecoration, InlineBoxPaint}`、`TextContent::{runs, with_runs}`、`TextStyle::{decoration, with_decoration}`、`InlineBoxSpec.paint`、`NodeBuilder::runs`、`TextDiagnostic::{InvalidTextRun, TextRunClipped, InlineBoxImageMissing}` | §11.2 |
+| E3 | `VirtualListConfig.extents`、`ItemAlign`、`App::{set_virtual_extents, scroll_to_item}`、`EngineError::{VirtualListExtents, InvalidVirtualExtent}` | §11.3 |
 | E4 | `GeometryDraw.range`、`GeometryDraw::full` | §11.4 |
 | E5 | `Window::text_byte_index_at` | §11.5 |
-| E6 | `Decorations`、`WindowOptions::{decorations, icon}`、`App::{set_title, set_traffic_light_position, traffic_light_inset, request_window_control}`、三端 `WindowControl` / `WindowState` | §11.6 |
+| E6 | `Decorations`、`WindowOptions::{decorations, icon}`、`App::{set_title, request_window_control, set_traffic_light_position, traffic_light_inset}`、三端 `WindowControl` / `WindowState` / `WindowResizeEdge`、`EngineError::{UnsupportedWindowCapability, WindowIcon}`、`WindowIconCause` | §11.6 |
+
+**E2b 候选（未实现，仅登记，不得依赖）**：Canvas / standalone shaping 不绘制装饰与行内盒；节点文本路径的 InlineBox 命中只读访问面（`App::shaped_inline_boxes` 只覆盖 standalone handle）。详见 §11.2。
 
 **明确留在应用层**：`base_ui` 全部设计系统模块与主题语义色 / 调色板 / 深浅色映射、54 个 Phosphor SVG + 7 品牌 PNG + 23
 预览图 + WAV、`IconKind → path` 映射、全部 widget 业务与几何、i18n、widget 注册表，以及 **D24 的薄 `StyleBuilder`**。
@@ -561,12 +565,17 @@ pub enum EngineError {
 ```
 
 > 上面的 5 + 1 个变体只是示例；**冻结表以源码为准**：计数口径 = `crates/ui_core/src/error.rs` 的 `pub enum EngineError`
-> **顶层变体**（不含 `WaylandErrorKind` 的 4 个细分），共 **29 个**：
+> **顶层变体**（不含 `WaylandErrorKind` 的 4 个细分、`WindowIconCause` 的 3 个细分与 `DecodeCause` 等嵌套分类），共 **35 个**：
 > `UnsupportedGpu` / `DeviceLost` / `Wayland` / `ShaderLoad` / `Swapchain` / `Composition` / `FramePipeline` /
-> `InvalidDpiScale` / `StaleNode` / `CyclicDerived` / `InvalidMeasure` / `TextShape` / `AtlasExhausted` /
-> `AtlasGrowthIncomplete` / `ClipDepthExceeded` / `GeometryRegister` / `UnknownGeometry` / `GeometryRangeOutOfBounds` /
-> `GeometryRangeUnaligned` / `GeometryRangeBytes` / `GeometryTruncateGrows` / `AppInit` / `WindowCreate` / `Clipboard` /
-> `NotScrollable` / `NotVirtualList` / `UnknownWindow` / `A11yInit` / `ResourceDecode`。
+> `InvalidDpiScale` / `StaleNode` / `CyclicDerived` / `InvalidMeasure` / `TextShape` / `TextShapeStandalone` /
+> `InvalidTextScale` / `AtlasExhausted` / `AtlasGrowthIncomplete` / `ClipDepthExceeded` / `GeometryRegister` /
+> `UnknownGeometry` / `GeometryRangeOutOfBounds` / `GeometryRangeUnaligned` / `GeometryRangeBytes` /
+> `GeometryTruncateGrows` / `AppInit` / `WindowCreate` / `Clipboard` / `NotScrollable` / `NotVirtualList` /
+> `VirtualListExtents` / `InvalidVirtualExtent` / `UnknownWindow` / `A11yInit` / `ResourceDecode` /
+> `UnsupportedWindowCapability` / `WindowIcon`。
+> 计数分解：迁移前基线 29 + E1 的 `TextShapeStandalone` + E1b 的 `InvalidTextScale` + E3 的 `VirtualListExtents` /
+> `InvalidVirtualExtent` + E6 的 `UnsupportedWindowCapability` / `WindowIcon` = **35**。`StaleNode` 的语义在 E5 扩展为
+> 「句柄不可用（从未存在 / 已卸载 / root）**或不能作为文本命中目标**」（§11.5），Display 文案同步、**不新增变体**。
 > `Composition` 是 2026-11-15 追加的 Windows DirectComposition **运行时**错误（几何 / `Commit` /
 > `SetContent` / 换链）；`AppInit` 只覆盖 `Composition::new` 的 COM 创建（DEVIATIONS §36 F-204）。
 
@@ -1044,14 +1053,16 @@ fn break_and_align(&mut self, layout: &mut Layout<ColorBrush>, content_width: f3
     layout.align(style.alignment, AlignmentOptions::default());   // 0.12 为 2 参数
 }
 
-// ③ 遍历结果 → 字形图集（paint/pass.rs::emit_text 消费的是 ShapedLine）
+// ③ 遍历结果 → 字形图集 / 装饰 / 行内盒（paint/pass.rs::emit_text 消费的是 ShapedLine）
 for line in layout.lines() {
     for item in line.items() {
         match item {
             PositionedLayoutItem::GlyphRun(run) => { /* glyph_id + x/y/advance → raster → atlas → AtlasTile */ }
-            PositionedLayoutItem::InlineBox(_) => { /* v2.1 前**不绘制**、落点不可读：`emit_text` 直接 continue（E2 修复，§11.2） */ }
+            PositionedLayoutItem::InlineBox(_) => { /* E2：按 ShapedInlineBox.rect + InlineBoxSpec.paint 生成 Quad/Image（§11.2） */ }
         }
     }
+    // E2：装饰（下划线 / 删除线）生成**普通 Primitive::Quad**，压在本行 items 之上；几何常量、硬换行与
+    // RTL/bidi 视觉并集规则见 §11.2。装饰不参与布局、不进 shader（不触发 I8）。
 }
 
 // ④ 溢出 / 行数上限：TextOverflow::{Clip, Ellipsis} + TextStyle.max_lines 在建行阶段裁剪
@@ -1059,10 +1070,16 @@ for line in layout.lines() {
 
 **缓存键**（`text/cache.rs::ShapeKey`）：文本哈希 + 文本长度 + **shaping 输入的样式哈希**（`TextStyle::hash_into`：family / size / weight /
 slant / line_height / letter_spacing / wrap / direction / overflow / max_lines / font_features / locale / stretch / word_spacing /
-line_break / font_variations；**不含 color / alignment**）+ `inline_boxes` 的 id/index/size/baseline/align + `font_stack_version`。
-**不含 `scale`**（R12-4：逻辑坐标 shaping，DPI 变化不清缓存）、**不含 `atlas_generation`**（图集换代只影响 tile，不影响 glyph id / advance /
-基线 / 行数；`ShapedLine` 快照另带代际，换代后重建）。宽度变化**不重建
-`Layout`**，只重跑 `break_all_lines` + `align` —— 直接支撑 §3.4 的「文本变化但尺寸不变只 `PAINT`」。
+line_break / font_variations；**不含 color / alignment**）+ **富文本 runs**（每个 run 的 `range` + shaping 输入哈希 + 颜色；E2 起必须入键，
+否则不同 run 会误命中）+ **`normalized_runs`**（非法 runs 归一化计数的诊断随快照复用，不能让「有诊断的内容」命中「没诊断的快照」）
++ `inline_boxes` 的 id/index/size/baseline/align + `font_stack_version`。**不含 `scale`**（R12-4：逻辑坐标 shaping，DPI 变化不清缓存）、
+**不含 `atlas_generation`**（图集换代只影响 tile，不影响 glyph id / advance / 基线 / 行数；`ShapedLine` 快照另带代际，换代后重建）、
+**不含 inline box 的 `paint`**（绘制方式在 paint 期从内容声明解析，不是 shaping 输入）。宽度变化**不重建 `Layout`**，只重跑
+`break_all_lines` + `align` —— 直接支撑 §3.4 的「文本变化但尺寸不变只 `PAINT`」。
+
+`App::shape_text` 的 standalone shaping 复用同一份 `ShapeKey` 与缓存；其**光栅 scale** 取 `App::text_scale()`（§11.1），scale 只进光栅
+（`GlyphKey` 的量化 ppem），不进缓存键；节点文本的光栅 scale 取窗口 `Scale`。bidi / 字素簇边界由 parley 决定，引擎不假设单 run 或 LTR
+（文本命中语义见 §11.5）。
 
 ### 4.6 字体策略（D17）
 
@@ -1371,7 +1388,8 @@ pub struct GeometryDesc {
   `RenderStats.geometry_uploaded_bytes` 为真实 staging 字节。
 - **damage 交互**：数据更新的 damage = 受影响块「旧 AABB ∪ 新 AABB」经 per-draw 变换后的物理
   并集，**只覆盖更新范围**；`set_transform` 只改 uniform、不重建 lane，damage = 变换前后包围盒
-  并集（外扩 AA 半径）。
+  并集（外扩 AA 半径）。`GeometryDraw.range`（E4，§11.4）变化同样视为「lane 重建 + damage」：相交块「旧 ∪ 新」
+  AABB 经 per-draw 变换后的物理并集，**不是**整节点盒；Canvas 内的 range 变化是**画布粒度**例外（见下）。
 - **已知限制**（本阶段明确不做）：滑动窗口删头只能走 `App::truncate_geometry`（已实现；**不能**用负增长 range）；
   `TriangleStrip` 单块退化；非 `NodeBuilder::geometry` 节点的几何引用不自动标脏；
   已 `release` 的快照在 UI 侧 delta builder / 合成端 catalog 中要到下一次整帧（`delta.full`）
@@ -1380,8 +1398,21 @@ pub struct GeometryDesc {
   20 万点折线（1,199,994 索引）≈ **98 个几何 op**（X5 前是 1 个）；块大小是「增量粒度 ↔ op 数」
   的折中（12288 索引 ⇒ K 线追加只重扫尾块 ≈ 0.4 MB 顶点 = 1/98 全量）。若图表几何成为 draw
   call 瓶颈，后续优化方向是「相邻同变换块合并成一次 `DrawIndexed`」（仍保留块级失效 / 页级上传）。
-- **契约**：§5.2 的 `GpuPrimitive` 字节布局与 `contract.md` **不变**；几何绘制复用既有 PSO /
-  根签名，几何顶点布局由 `GeometryDesc.vertex_stride` 描述。
+- **绘制子区间（E4，已实现）**：`GeometryDraw.range: Range<u32>` 是索引**元素**区间（半开；与 `IndexType` 无关），
+  `GeometryDraw::full()` = `0..u32::MAX`，空区间 / `start >= end` = 不绘制（无 op、无 damage、不标脏）。range 先 **clamp** 到
+  `index_count`（几何可被 `truncate_geometry` 变短，不报错），再与块表求交；不相交的块不产生 op、不重建 lane。
+  **`TriangleList` 两端由引擎向下对齐到 3 的倍数**（`start = floor3(clamp(start))`、`end = floor3(clamp(end))`）：块边界
+  `GEOMETRY_CHUNK_INDICES = 12288 = 4096 × 3` 也落在同一网格上，因此逐块绘制与单次 `DrawIndexed` 画整段的三角形集合等价；
+  起点不在三角形边界时最多多画起点之前的 2 个索引（**绝不漏画**、不会把后续三角形前移），不足一个三角形的尾部不产生 draw。
+  `TriangleStrip` 是单块拓扑，**不截断**、按索引原样保留。每块 draw 参数由共享纯函数
+  `paint::instance::draw_indexed_params(first_index, count, uploaded_index_count) -> Result<DrawIndexedArgs, EngineError>`
+  （`pub(crate)`；`base_vertex` 恒 0；`count == 0` / 越界 / `first_index + count` 溢出返回 `GeometryRegister`，不回绕）推导，
+  三端 encoder 只经 `GeometryDrawGpu::draw_indexed` 转发，不各自算 `range.end - range.start`。
+- **Canvas 内的 damage 例外（E4）**：Canvas 内 `GeometryDraw.range` 变化的 damage 粒度 = **Canvas AABB（旧 ∪ 新）**，
+  不是相交块粒度；前提是应用遵守 `Canvas.bounds ⊇ 内部图元可见 bounds` 契约（§5.9）。引擎接受该画布粒度 over-damage，
+  换取不需要跨帧的逐块历史；应用违反 bounds 契约造成的旧像素漏 damage 由应用负责。
+- **契约**：§5.2 的 `GpuPrimitive` 字节布局与 `contract.md` **不变**；range 是 CPU 侧裁剪，不进 `GpuPrimitive` / uniform /
+  顶点布局 / 三端 shader。几何绘制复用既有 PSO / 根签名，几何顶点布局由 `GeometryDesc.vertex_stride` 描述。
 
 ### 5.6 图集、批次与 draw call
 
@@ -1462,6 +1493,9 @@ impl Canvas {
     pub fn new(bounds: Rect) -> Self;
     pub fn push_quad(&mut self, quad: Quad);
     pub fn push_text(&mut self, run: GlyphRun);      // 应用**不应**自造 GlyphRun（AtlasTile 只能由图集分配器产出）
+    /// E1：应用画文本的唯一合法入口；`origin` 是文本盒左上角的绝对窗口逻辑像素。
+    /// 句柄失效（图集换代 / 逐 tile 淘汰）⇒ 返回 false 且**不产生任何图元**（不画旧 UV）。
+    pub fn push_shaped_text(&mut self, handle: &ShapedTextHandle, origin: Point) -> bool;
     pub fn push_image(&mut self, image: Image);
     pub fn push_path(&mut self, path: Path);
     pub fn push_shadow(&mut self, shadow: Shadow);
@@ -1478,8 +1512,12 @@ impl Canvas {
 
 - **只能装引擎 8 类图元**（`Quad` / `GlyphRun` / `Image` / `Path` / `Shadow` / `Clip` / `Geometry` + 嵌套 `Canvas` 由引擎从
   Canvas 节点生成，**没有 `push_canvas`**）。应用可构造 **6 类**：`Quad` / `Image` / `Path` / `Shadow` / `Clip` / `Geometry`；
-  `GlyphRun` 需要 `AtlasTile`（图集分配器的产物），因此**canvas 内文本在 v2.1 前不可行** —— 公开面由 `v2.1 新增规格 E1`
-  （`App::shape_text` + `Canvas::push_shaped_text`，§11.1）补齐。
+  `GlyphRun` 需要 `AtlasTile`（图集分配器的产物），应用**不构造**裸 `GlyphRun` —— canvas 内文本由 E1 的
+  `App::shape_text` + `Canvas::push_shaped_text` 提供（§11.1，已实现）：应用持有 `ShapedTextHandle`，在句柄失效
+  （`is_stale()`）后重新 shape 并重建 Canvas。
+- **canvas 文本的坐标与 bounds 契约**：`origin` 是文本盒左上角的**绝对窗口逻辑像素**（与 Canvas 内其它图元同域）；
+  `origin + handle.size()` **必须落在 `Canvas::bounds` 内**（damage / 命中只看 `Canvas::bounds`，引擎**不会**自动 union —— 
+  F10 的 P3 建议）。多行文本的所有行一起偏移。
 - **坐标系**：`Canvas.bounds` 是逻辑像素 AABB 契约（**必须 ⊇ 内部图元 bounds 并集**，damage / 命中只用它）；内部图元的坐标是
   **绝对窗口逻辑像素**（不是节点相对）—— 应用自绘时必须自己把内容平移到节点在窗口中的位置（I11）。
 - **clip**：`push_clip` / `pop_clip` 是**圆角层预算制**（`MAX_CLIP_DEPTH = 8`，四角半径非全 0 才占一层；直角 clip 不占预算），
@@ -1487,14 +1525,25 @@ impl Canvas {
 - **挂载与更新**：`NodeBuilder::canvas(Canvas)` 在建树时吃一个**值**；每帧替换走
   `Window::set_canvas(&mut self, node: NodeId, canvas: Canvas) -> Result<bool, EngineError>`——官方路径是
   在 `App::on_frame` 钩子里「读上一帧 `Node::layout().bounds` → 重建 Canvas → `set_canvas`」（本帧稍后重建 lane，不额外请求帧）。
-- `StylePatch::opacity` **不作用于 Canvas 内容**（应用自己生成的颜色引擎不解析）；需要整组淡出请用组不透明度（离屏 layer，尚未实现）。
+- **编码期安全网（E1b + E1d）**：`push_shaped_text` 只在 push 时校验句柄租约；push 之后同帧发生的图集换代（扩容 / 清空 /
+  换字体栈）**或逐 tile LRU 淘汰**（不换代）会让已写入的 `AtlasTile` 变成旧 UV。paint 在编码 `Primitive::Canvas` 前调用
+  crate 私有的 `Canvas::without_stale_glyph_runs(&AtlasAllocator)`：逐 tile 用 `AtlasAllocator::is_alive`（代际 + 槽位分配身份
+  `(slot, slot_epoch)`，O(1)）判活，**任一 tile 失效的 run 整段丢弃**（少字优于花字，与节点文本 D-5 同口径），其余图元（含 clip
+  括号）顺序不变；丢弃数进 `PaintReport::stale_canvas_runs` → `FrameRecord::stale_canvas_runs` → `TextDiagnostic::CanvasTextStale
+  { runs }`。**能力边界（应用义务）**：Canvas 内容归应用所有，引擎无法重建 —— 止损后该 Canvas 会持续少字，直到应用在句柄
+  `is_stale()` 后重新 shape 并重建 Canvas；图集因容量压力逐 tile 淘汰时同样适用。
+- **有界补帧**：编码期丢弃失效 run 后，引擎按 `(window, atlas generation)` **至多补一帧**（`Window::note_stale_canvas_followup`），
+  给应用执行重建义务的窗口；应用忽略义务也不会造成 I3 空转（同代际不重复请求）。
+- **Canvas 的 damage 粒度**：`Canvas` 的 damage 取 `Canvas::bounds`；Canvas 内 `GeometryDraw.range` 变化时 damage = 旧画布 AABB ∪
+  新画布 AABB（画布粒度，§5.5 的 E4 例外）。
+- `StylePatch::opacity` **不作用于 Canvas 内容**（应用自己生成的颜色引擎不解析）；组不透明度需要离屏 layer，不在本设计范围；应用应改用逐图元 `opacity`。
 
 **明确不做**（v2.1 起删除旧承诺，理由按强度排序）：
 
 | 不做 | 理由 |
 |---|---|
 | 应用注册自有 pipeline（顶点布局 / uniform / shader 句柄） | 与 **I2**（一套数据契约）冲突：会引入应用侧第二份顶点/uniform 契约，必须写进 `contract.md` 并让三套手写 shader 都支持（D11 的 3× 工作量） |
-| `Primitive::Canvas(CustomDraw { pipeline, buffers, uniform, damage })` | 该形状**在实现中不存在**（实际载荷是 `Arc<Canvas>`）；继续承诺等于承诺未实现能力 |
+| `Primitive::Canvas(CustomDraw { pipeline, buffers, uniform, damage })` | 该形状**在实现中不存在**（实际载荷是 `Arc<Canvas>`）；继续承诺等于虚构一个不存在的形状 |
 | 任意 GPU 命令插入 / 应用持有 GPU buffer、uniform | 与 **I4**（GPU 资源只经延迟销毁）直接矛盾：应用持有的资源生命周期无法纳入 `RetireQueue` 的 `FrameIndex` 队列 |
 | 扩一整套自定义 pipeline 的视觉基线 | 与 **I8** 冲突：现有 L3 只有 14 个 case（42 张 golden），重开基线等于重做像素回归 |
 
@@ -1641,6 +1690,7 @@ pub struct FrameRecord {
     pub skipped_by_budget: u64,         // 被帧预算推迟的次数
     pub paint_log: PaintLog,            // 每条 lane 的 Rebuilt / Reused
     pub presented_latency: Option<Duration>,
+    pub stale_canvas_runs: usize,       // 本帧编码期丢弃的 Canvas 内失效字形 run 数（E1d；0 = 正常）
     pub a11y_only: bool,                 // 本帧是否是 a11y-only 帧（无像素工作）
     pub a11y: Option<A11yTreeSnapshot>,  // 本帧的一笔 a11y 交付（捕获未开 = None）
 }
@@ -1651,6 +1701,10 @@ pub struct RenderedFrame {
     pub reused_lanes: Vec<LaneId>,
 }
 ```
+
+`Primitive::Canvas` 在 `RenderedFrame.primitives` 里是**不透明**图元（一条 `Canvas`）：Canvas 内层 `GlyphRun` 的计数与
+bounds 要在 `Window::scene()` 的 Canvas 值上核对；`FrameRecord.stale_canvas_runs` 是编码期安全网丢弃的失效 run 数（§11.1），
+无失效 run 时为 0。
 
 **断言示例**：
 
@@ -1771,6 +1825,11 @@ state、颜色空间标记与插值空间 —— **零容差**，可在 CPU 侧�
 | 无（新增） | `SnapshotCase` + `SnapshotScene` / `SnapshotTheme` + `Tolerance` + golden | L3 | 14 case × 3 设备 = 42 张 golden；**不含文字像素** |
 | 无（新增） | `criterion` bench：`perf` / `layout_postpass` | L4 | 非闸门 |
 
+**P1（E1–E6）新增的 L2 观测面**（用于断言；不改变上面的迁移量口径）：`FrameRecord.stale_canvas_runs`（Canvas 编码期丢弃的
+失效字形 run 数，0 = 正常；`test-support` 类型）、`Window::inline_box_image_diagnostics()`（`Window::frame` 路径跳过的行内图片，
+最近一帧快照、每帧重建不增长）、`App::frame_requests()`（有界补帧断言）、`App::text_diagnostics()`（`CanvasTextStale` /
+`InvalidTextRun` / `TextRunClipped` / `InlineBoxImageMissing` 等按诊断值去重）。这些面都是只读诊断，不改变帧语义。
+
 **`#[tokio::test]`（794 个，数字准确但口径要改）**：现有约 794 个 `#[tokio::test]` **不能整体判定为可保留**。正确做法是**先分桶**：
 按「`use gpui_kit`」把 794 分成 **641 个纯桶（文件不 `use gpui_kit`，可批量信任）** 与 **153 个需抽查**（A5 §3）—— 不是逐个抽查 794。
 
@@ -1795,9 +1854,17 @@ cargo test -p ui_core --features test-support -- --ignored   # 真实窗口冒�
 cargo xtask gates --platform win|mac|linux|all --scope <crates> --step fast|quick|layer
 ```
 
-**门禁执行体（D-07）**：唯一执行入口是 `cargo xtask gates`（P0-2 交付：封装 Windows 本机 fast、mac/linux 远端 quick
-（ssh + 共享 `CARGO_TARGET_DIR` + mkdir 锁）与三端 layer；**不新增任何 GitHub Actions 测试/门禁工作流**）。本地预演与
-远端执行是同一条命令，证据落 `.review/mig-<batch>-*.log`。**.github/ 保持不变**。
+**门禁执行体（D-07，已落地 P0-2）**：唯一执行入口是 `cargo xtask gates`（`xtask/src/gates.rs` + `xtask/src/gates/remote.rs`，
+P0-2 的 `065ae66` / `80637ab` 合入 `ee2a80f`；退出码由 `xtask/tests/gates_exit_code.rs` 守护）：
+- `--step fast`（仅 Windows 本机）：`fmt --check` / `clippy --all-targets --all-features -D warnings` / `test`；`ui_core` 附
+  `--features hud,test-support` 的 lib 测试 + `--test snapshot`；
+- `--step quick`（仅 mac / linux 远端）：`check --all-targets`（`ui_core` 用 `--all-features`，因为单测依赖 `test-support`；
+  ssh + 共享 `CARGO_TARGET_DIR` + per-host mkdir 锁，默认 1800 s 等待超时）；
+- `--step layer`（三端）：`fast` 的同一套 + `--test gui_smoke -- --ignored --nocapture`（三端离屏）；涉及 `kytrix` 时追加 release build；
+- 另有 `--step release`（scope 的 release build）/ `bench`（`ui_core` perf bench `--no-run`）/ `accept`（`ui_core` acceptance
+  example）/ `all`（quick + layer 组合）。
+命令逐条回显、记录退出码与耗时；任一失败 ⇒ 进程非零退出并在结尾汇总失败命令；证据落 `.review/mig-<batch>-*.log`。
+本地预演与远端执行是同一条命令。**不新增任何 GitHub Actions 测试/门禁工作流**（**D-07 不恢复 CI**）；`.github/` 保持不变。
 
 **L3 的设备映射（test-only）**：Windows WARP / Linux lavapipe 是 test-only 软件设备，不编译进发布物、不作为启动兜底、
 不进产品 `cfg`；macOS 用带 Metal 硬件的实机 GPU。三端各跑一遍 `--step layer`（golden 按设备目录比对、跨设备不互比），
@@ -1806,16 +1873,16 @@ cargo xtask gates --platform win|mac|linux|all --scope <crates> --step fast|quic
 **合并闸门（目标态，脚本/人工语义）**：前 4 项全绿 + 三端 L3 golden 全绿（Windows WARP / Linux lavapipe / macOS 实机 GPU）
 + 参数 golden 零差异。该判据由 `cargo xtask gates --step layer` 的输出与 `.review/` 日志留证，**不依赖托管 CI 的门禁状态**。
 
-**现状（v2.1 校准）**：仓库**只有** `.github/workflows/release.yml`（仅 `workflow_dispatch`，只跑 `cargo build --release` +
-`cargo packager`，不跑 test / clippy / fmt）；旧 GUI CI 工作流已于 `f93cec0` 删除；`release.yml:144` 仍引用不存在的
-`ci.yml`（历史遗留，不在本批写作用域）。迁移前引擎基线的门禁是 `.review/p1-gates.ps1`（Windows 6 步）+
-`.review/p1-remote.ps1`（mac/linux ssh）**手工执行**的证据。因此「三端 golden 全绿才可合入」目前是**人工核对**；落地项
-（P0-2，不是 CI）：
+**现状（v2.2 校准）**：仓库**只有** `.github/workflows/release.yml`（仅 `workflow_dispatch`，只跑 `cargo build --release` +
+`cargo packager`，不跑 test / clippy / fmt）；旧 GUI CI 工作流已于 `f93cec0` 删除；`release.yml` 对已不存在的 `ci.yml` 的引用是
+历史遗留，不在迁移写作用域。迁移前引擎基线的门禁是 `.review/p1-gates.ps1`（Windows 6 步）+ `.review/p1-remote.ps1`
+（mac/linux ssh）**手工执行**的证据；P0-2 已把同一套命令语义固化为 `cargo xtask gates`，因此「三端 golden 全绿才可合入」
+仍由脚本输出 + `.review/` 日志核对（不依赖托管 CI 的门禁状态）。**已落地项（P0-2，不是 CI）**：
 
-1. `cargo xtask gates` 把两个 `.review` 脚本的命令语义固化（fast / quick / layer 三级 + 共享 target/锁）；
-2. L3 三端 golden 入口（按设备目录、跨设备不互比）纳入 `--step layer`；
-3. `gui_smoke --ignored`、`cargo bench --no-run`、环境指纹（`adapter / driver / FL / SM / Tier`）纳入 layer 输出；
-4. 「测试-only 软件设备」边界断言（不进发布物、不作为启动兜底、不进产品 `cfg`）；
+1. `cargo xtask gates` 固化 fast / quick / layer 三级 + 共享 target / per-host 锁（`--platform win|mac|linux|all`，`--scope` 指定 crate）；
+2. L3 三端 golden 入口（按设备目录、跨设备不互比）由 `--step layer` 的 snapshot 套件承担；`gui_smoke --ignored` 也在 layer；
+3. `release` / `bench`（只 build 不跑）/ `accept` 三个补充步骤已实现（`release` 构建、`bench` 编译 perf、`accept` 跑 CPU 验收 example）；
+4. 「测试-only 软件设备」边界仍由 §6.4 的 golden 目录与产品 `cfg` 约束表达；三端任一端不可用时 `layer` **失败**而不是静默跳过；
 5. 迁移期增量门禁：`cargo test -p ui_core` + `cargo test -p <正在迁移的 crate>`；`cargo test --workspace` 在
    「迁移期旧 crate 必红」的现实下**不能**作为合入门（§10.2 的迁移期验证门据此改写）。
 
@@ -2087,20 +2154,21 @@ platform/                     # 模块本身私有：应用只见 AppHandle 与 
 ### 8.2 窗口、标题栏、DPI、外观
 
 - **窗口句柄**：引擎**自己创建并持有**原生句柄（`HWND` / `NSWindow`+`NSView` / `wl_display`+`wl_surface`），句柄只在
-  `platform/` 与 `render/{os}/` 内使用（I9）。**不对应用导出原生句柄**，也没有 `raw-window-handle` 依赖 / 互操作导出（源码 0 引用；未实现，不在 v2.1 范围）。
-- **窗口装饰（现状，v2.1 校准；契约见 §8.6）**：三端**能力不同且都已实现各自路径** ——
-  **Windows**：`WS_OVERLAPPEDWINDOW` + **系统标题栏**（`WM_NCCALCSIZE` 交 `DefWindowProcW`，Aero Snap / Snap Layouts /
-  双击最大化 / `Alt+Space` 全部由系统提供）；应用可声明**自绘 header 的拖动区**（`App::set_drag_regions` →
-  `Window::set_drag_regions` → `WM_NCHITTEST` 返回 `HTCAPTION`）。
+  `platform/` 与 `render/{os}/` 内使用（I9）。**不对应用导出原生句柄**，也没有 `raw-window-handle` 依赖 / 互操作导出（源码 0 引用；该互操作导出不在设计范围，后续需要时另立裁决）。
+- **窗口装饰（E6 已实现；权威能力表见 §8.6.1）**：三端**能力不同且都已实现各自路径** ——
+  **Windows**：默认 `Decorations::Native`（`WS_OVERLAPPEDWINDOW` + 系统标题栏，`WM_NCCALCSIZE` 交 `DefWindowProcW`，
+  Aero Snap（拖边）/ 双击最大化 / `Alt+Space` / 右键系统菜单由系统提供）；`WindowOptions.decorations = Decorations::None`
+  时切 frameless（引擎接管 `WM_NCCALCSIZE` / `WM_NCHITTEST`），`WindowControl` / `WindowState` / `App::set_title` /
+  `WindowOptions.icon` 全部可用；**Win11 Snap Layouts 悬停浮层未实现**（§11.8）。
   **macOS**：标题栏透明 + 标题隐藏 + 内容铺满窗口（`setTitlebarAppearsTransparent(true)` / `setTitleVisibility(Hidden)`），
-  **原生交通灯保留并浮在内容上方**（应用用顶部安全区避让；红点重定向到引擎关闭桥）；自绘 header 的拖动区经
-  `mouseDown:` → `performWindowDragWithEvent:` 实现。
-  **Linux/Wayland**：客户端装饰（自绘标题栏），引擎提供 `WindowControl`（`Minimize` / `ToggleMaximize` / `ToggleFullscreen` /
-  `BeginMove` / `BeginResize`）+ `WindowState`（`client_decoration` / `maximized` / `fullscreen` / `can_*`）+
-  `App::request_window_control`；拖动区命中后转 `xdg_toplevel.move`（compositor 驱动）。
-  **三端 `Window::set_drag_regions` 都生效**（语义不同，见 §8.6.2）。**应用层唯一入口**是引擎 API；Windows 的
-  frameless / 三枚系统按钮 / 窗口图标 / 运行时改标题由 `v2.1 新增规格 E6`（P1-E6，§11.6）提供，macOS 的交通灯位置与
-  运行时改标题同属 E6。
+  **原生交通灯保留并浮在内容上方**（应用按 `App::traffic_light_inset` 安全区避让；红点重定向到引擎关闭桥）；自绘 header
+  的拖动区经 `mouseDown:` → `performWindowDragWithEvent:` 实现；`Decorations::None` / `WindowOptions.icon` 是**文档化降级**。
+  **Linux/Wayland**：客户端装饰（自绘标题栏），三端统一的 `WindowControl`（`Minimize` / `ToggleMaximize` /
+  `ToggleFullscreen` / `BeginMove` / `BeginResize`）+ `WindowState`（`client_decoration` / `maximized` / `fullscreen` /
+  `can_*`）+ `App::request_window_control` 已可用；拖动区命中后转 `xdg_toplevel.move`（compositor 驱动）；
+  `Decorations::None` 与 `Native` 的协议请求相同、`WindowOptions.icon` 文档化降级（§8.6.1）。
+  **三端 `Window::set_drag_regions` 都生效**（语义不同，见 §8.6.2）。**应用层唯一入口**是引擎 API；`HWND` / `NSWindow` /
+  `xdg_toplevel` 不出引擎（I9）。
 - **DPI**：平台事件（Win32 `WM_DPICHANGED` / macOS `backingScaleFactor` 变更 / Wayland `wl_output` scale +
   `wp_fractional_scale_v1`）→ `scale` 写入引擎 → 根 `LAYOUT` + offscreen 重建 + 全部文本 measure 版本递增；**VBO 不重建**
   （§5.5）。
@@ -2140,80 +2208,92 @@ platform/                     # 模块本身私有：应用只见 AppHandle 与 
 - 主题语义色、调色板、深浅色映射、i18n 全在应用层；引擎只暴露 `Color` / `ColorResolver` / 混合模式 / `TextStyle` 接口。
 - 合规缺口（GPLv3 元数据、Phosphor MIT 无 LICENSE、ODbL 公开副本 URL）**仅登记 RK9，按 D19 不在本次范围**。
 
-### 8.6 自绘标题栏契约（v2.1 新增；E6 的引擎侧前提）
+### 8.6 自绘标题栏契约（E6 已实现）
 
-kytrix 外壳需要「自绘透明标题栏 + 三枚系统按钮」。本条把**语义**固定在引擎侧（I9 落地前提）：应用只描述「这条区域可以拖动 /
-这三个按钮是系统按钮 / 我要知道是不是最大化」，平台细节全部在 `platform/`。**E6 已由 D-02 裁决必做，排在 P1-E6**：
-Windows 在 E6 落地前沿用系统标题栏（当前基线），E6 落地后由 `WindowOptions.decorations = Decorations::None` 切到
-frameless；macOS 已是「透明标题栏 + 原生交通灯浮在内容上」（E6 补交通灯位置与运行时标题），Linux 已是客户端装饰。
-若 E6 在 Win11 真机验证失败，按 `plan.md` 风险 R1 回退系统标题栏并请示用户，不静默降级。
+kytrix 外壳需要「自绘透明标题栏 + 三枚系统按钮」。本条把**语义固定在引擎侧**（I9 的落地前提）：应用只描述「这条区域可以拖动 /
+这三个按钮是系统按钮 / 我要知道是不是最大化」，平台细节全部在 `platform/`。**E6（P1-E6）已实现并合入**：Windows frameless
+`Decorations::None`、三端 `WindowControl` / `WindowState`、`App::{set_title, request_window_control, set_traffic_light_position,
+traffic_light_inset}`、`WindowOptions::{decorations, icon}`。下面 §8.6.1 的**平台能力表是权威**：I10 的「不支持就必须强类型错误
+或文档化降级」逐行可查；任何「听起来已实现」的措辞与表冲突时以表为准。
 
-#### 8.6.1 三端标题栏语义（契约，不是实现细节）
+#### 8.6.1 平台能力表（权威；I10 逐行可查）
 
-| 端 | 标题栏归属 | 应用职责 | 引擎职责 | 现状 |
-|---|---|---|---|---|
-| Windows | **系统标题栏**（现状）/ E6 后可由 `WindowOptions.decorations = Decorations::None` 改为应用自绘 | 在自绘 header 上声明拖动区与三枚按钮的 hit 区域；读 `WindowState.maximized` 决定图标 | `WM_NCCALCSIZE`（E6 后自算 resize border）、`WM_NCHITTEST`（八边 + 拖动区 `HTCAPTION`）、`SetWindowTextW`、`WM_SETICON`、`IsZoomed` / `SW_MAXIMIZE` | 系统标题栏 + 拖动区（`set_drag_regions`） |
-| macOS | **系统的交通灯保留**，标题栏透明、内容铺满（已实现） | 用顶部**安全区**（交通灯高度）避让；三枚按钮不需要自绘 | 交通灯位置（E6 的 `App::set_traffic_light_position` / `App::traffic_light_inset`）、红点走的关闭桥、全屏转场 | 已实现（`setTitlebarAppearsTransparent` / `setTitleVisibility(Hidden)` / 原生按钮保留） |
-| Linux（Wayland） | **客户端装饰**（应用自绘标题栏） | 画 header + 三枚按钮，调 `App::request_window_control` | `xdg_toplevel` 的 `move` / `resize` / `set_minimized` / `set_maximized` / `set_fullscreen`；`WindowState` 镜像 | 已实现（`WindowControl` / `WindowState` / `request_window_control`） |
+| 能力 | Windows | macOS | Linux/Wayland |
+|---|---|---|---|
+| 自绘标题栏（`Decorations::None`） | 原生 frameless（`WM_NCCALCSIZE` 返回 0 + 自算 `WM_NCHITTEST`） | **文档化降级**：保留原生交通灯，`WindowState.client_decoration` **恒 `false`**（AppKit 无「无装饰」语义） | **文档化降级**：CSD surface 本来铺满，`None` 与 `Native` 的协议请求相同（`ClientSide`），最终模式以 compositor `configure` 为准 |
+| 系统按钮（`Minimize` / `ToggleMaximize`） | 原生（`ShowWindow`） | 原生（`performMiniaturize:` / `performZoom:`） | 原生（`xdg_toplevel`） |
+| 全屏（`ToggleFullscreen`） | **不支持**：`UnsupportedWindowCapability { capability: "fullscreen window control" }`；`WindowState.can_fullscreen == false`（**初值即 false**） | 原生（`toggleFullScreen:`） | 原生（`set_fullscreen` / `unset_fullscreen`） |
+| 程序化 move / resize（`BeginMove` / `BeginResize`） | **不支持**（强类型错误；拖动 / 缩放走 `set_drag_regions` + 系统命中码） | **不支持**（没有可用的 `NSEvent`） | 原生（`xdg_toplevel.move` / `resize`；用最近一次指针按键的 serial） |
+| 窗口图标（`WindowOptions::icon`） | 原生（PNG/ICO → `WM_SETICON`；单边 ≤ 1024 px，超出 `WindowIconCause::TooLarge`） | **文档化降级**（Dock 图标是 app 级，窗口无等价物） | **文档化降级**（xdg-shell 无图标协议；`set_app_id` 是应用身份，不是图标） |
+| 运行时标题（`App::set_title`） | `SetWindowTextW` | `setTitle:` | `xdg_toplevel.set_title`（双缓冲，随 commit 生效） |
+| 交通灯位置 / 安全区 | 无（setter 强类型错误、getter `None`） | 位置 **set-once**；安全区只读（`Option<Point>`，原生全屏 `None`） | 无（同 Windows） |
+| 窗口状态（`WindowState`） | 每轮 `IsZoomed` 回报（状态变化 `PAINT` + 请求一帧） | 每轮 `isZoomed` + `styleMask.fullScreen` | compositor `configure` 镜像 |
+| 双击 header 最大化 / Aero Snap（拖边）/ `Alt+Space` / 右键系统菜单 | 系统提供（`HTCAPTION` / `HT*` 命中走系统模态循环） | 系统提供（原生标题栏行为） | compositor / 桌面环境提供（引擎不保证） |
+| Win11 **Snap Layouts 悬停浮层** | **未实现**（需 `HTMAXBUTTON`；`WM_NCHITTEST` 只返回八向 `HT*` / `HTCAPTION` / `HTCLIENT`） | 不属于引擎能力（由系统红绿灯提供） | 无 |
+
+> 「文档化降级」= 字段/请求被忽略且**文档写明原因**（不存在「请求了却不知道没生效」）；「不支持」= 返回强类型
+> `EngineError::UnsupportedWindowCapability`（或建窗参数错误），不静默假装成功。
 
 #### 8.6.2 拖动区（三端统一语义）
 
 - **坐标系**：`Window::set_drag_regions(&[Rect])` 的每个 `Rect` 是**逻辑客户区坐标**（原点 = 客户区左上角），可多次调用整体替换；
   空切片 = 取消拖动区。
 - **命中**：Windows 在 `WM_NCHITTEST` 里把命中点换算成逻辑客户区坐标后判定，**命中返回 `HTCAPTION`**（走系统 move 模态循环：
-  Aero Snap / Win11 Snap Layouts / 双击最大化 / `Alt+Space` 全部免费）；其余点仍交 `DefWindowProcW`。
+  Aero Snap（拖边）/ 双击最大化 / `Alt+Space` / 右键系统菜单由系统提供；**Win11 Snap Layouts 悬停浮层未实现**，需要
+  `HTMAXBUTTON`，见 §8.6.1）；其余点按 frameless 命中表返回 `HTCLIENT` / 八向 resize 码。
 - **与 resize 边的关系**：拖动区**不得**覆盖系统 resize 边框/边角（那会让缩放光标与 size 模态循环失效）；应用声明的区域是
   「客户区内部」的矩形，引擎负责在边角处让位。
-- **E6 后仍然成立**：`decorations = None` 时引擎自算 resize border（八边 `WM_NCHITTEST`），拖动区语义不变；**不要**让应用声明
-  「整条窗口顶部」——应用只声明**它自己画的那条 header**。
-- **三端已各自实现（v2.1 修正）**：`Window::set_drag_regions` 无 `cfg` 门控，三端都有原生路径 —— Windows 在
-  `WM_NCHITTEST` 返回 `HTCAPTION`（系统 move 模态循环）；macOS 在 `GuiView mouseDown:` 命中后调用
-  `performWindowDragWithEvent:`（AppKit 同步拖动）；Wayland 在命中区主键按下后发 `xdg_toplevel.move(seat, serial)`
-  （compositor 驱动）。**语义不同**：Windows 是系统 move 模态循环（Aero Snap / Snap Layouts / 双击最大化免费）、
-  macOS 是 WindowServer 拖动、Wayland 是 compositor move。**降级**：Wayland 没有 `xdg_toplevel` 或 compositor 不实现
-  交互移动时按「无操作」处理（应用仍可用 `WindowControl::BeginMove` 显式路径）；应用**不得**假设「拖动区一定生效」。
+- **frameless 下仍然成立**：`Decorations::None` 时引擎自算 resize border（八向 `WM_NCHITTEST`），拖动区语义不变；**不要**让应用
+  声明「整条窗口顶部」——应用只声明**它自己画的那条 header**。
+- **三端语义不同**：Windows 是系统 move 模态循环（Aero Snap / 双击最大化免费）；macOS 在 `GuiView mouseDown:` 命中后调用
+  `performWindowDragWithEvent:`（AppKit 同步拖动）；Wayland 在命中区主键按下后发 `xdg_toplevel.move(seat, serial)`（compositor
+  驱动）。**降级**：Wayland 没有 `xdg_toplevel` 或 compositor 不实现交互移动时按「无操作」处理（应用仍可用
+  `WindowControl::BeginMove` 的显式路径）；应用**不得**假设「拖动区一定生效」。
 
-#### 8.6.3 系统按钮 → Action（应用只见引擎类型）
+#### 8.6.3 系统按钮 → 引擎请求（应用只见引擎类型）
 
-应用**不**调用平台 API，只发引擎请求；每端的具体请求由引擎翻译：
+应用**不**调用平台 API，只发引擎请求；每端的具体请求由引擎翻译（三端统一，已实现）：
 
 ```rust
-// Linux（已实现）：应用按钮 → App::request_window_control
+// 三端统一（E6 起 WindowControl 不再是 Linux 专属）
 app.request_window_control(window, WindowControl::Minimize)?;
 app.request_window_control(window, WindowControl::ToggleMaximize)?;
-// 关闭：应用自己决策（App::close_window / on_close 钩子），不走 WindowControl
-// 拖动/缩放：WindowControl::BeginMove / BeginResize(WindowResizeEdge)
-
-// Windows / macOS（v2.1 新增规格 E6，§11.6）：同一组请求去 cfg(linux) 限制，三端统一
-app.request_window_control(window, WindowControl::ToggleMaximize)?;
 app.set_title(window, SmolStr::new_static("Kytrix — BTC/USDT"))?;
+// 关闭：应用自己决策（App::close_window / on_close 钩子），不走 WindowControl
+// 拖动/缩放：Linux/Wayland 支持 WindowControl::BeginMove / BeginResize(WindowResizeEdge)；
+//           Windows / macOS 返回 UnsupportedWindowCapability（见 §8.6.1），拖动走 set_drag_regions
 ```
 
-- `WindowControl` **不再是 Linux 专属**（E6 移除 `cfg(target_os = "linux")`）；三端都接受同一枚举，平台层各自翻译（Windows
-  `ShowWindow(SW_MINIMIZE/SW_MAXIMIZE)`、macOS `performMiniaturize:` / `performZoom:`）。
-- **双击 header 最大化**：macOS/Windows 由系统提供（`HTCAPTION` / AppKit）；E6 的 frameless 路径必须保留（`WM_NCLBUTTONDBLCLK`
-  在 `HTCAPTION` 上的默认语义不得被吃掉）。
+- 请求是**异步**的：`App::request_window_control` 只登记目标，平台泵在同一轮 / 下一轮执行；最终状态一律以 `WindowState`
+  （平台回报）为准，应用不得假设请求一定生效（I10）。
+- **双击 header 最大化**：macOS/Windows 由系统提供（`HTCAPTION` / AppKit）；frameless 路径保留 `WM_NCLBUTTONDBLCLK` 在
+  `HTCAPTION` 上的默认语义，引擎不得吃掉。
 - **禁止**：应用侧 `use windows::…` / `objc2::…` 绕过（I9）；也**不允许**引擎为「自绘标题栏」新增可插拔 trait（I14）。
 
 #### 8.6.4 最大化状态信号
 
-- 状态只能**从平台读**：Linux 读 `WindowState`（compositor 的 `configure` 状态位 + `wm_capabilities`）；Windows（E6）读
-  `IsZoomed(hwnd)`；macOS（E6）读 `NSWindow.isZoomed`。
-- 变化必须**主动通知**应用（否则按钮图标不刷新）：E6 规格要求 `WindowState` 在 Win/mac 也可见，并在状态变化时给窗口根节点标
-  `PAINT` + 请求一帧（与应用写信号同一路径，I3 不破）。
+- 状态只能**从平台读**：Windows 每轮泵 `IsZoomed(hwnd)`（`WM_SIZE` 只置 `chrome_dirty`，下一轮 `sync_chrome` 读 `IsZoomed`
+  写回 `WindowState`；应用控制请求执行后泵在同一轮补收一次平台事件再对账，保证「控制后首帧」的状态与客户区尺寸同时是新值）；
+  macOS 每轮 `isZoomed` + `styleMask.fullScreen`；Linux 读 compositor `configure` 的状态位 + `wm_capabilities`。
+- 变化必须**主动通知**应用（否则按钮图标不刷新）：`WindowState` 变化时给窗口根节点标 `PAINT` + 请求一帧（与应用写信号同一路径，
+  I3 不破）。
 - 应用**不得**自行维护「我点过最大化」的布尔值：compositor / 系统策略可以拒绝或改变请求（Linux 明确如此），必须以引擎回报的
   状态为准（I10：不静默降级、不猜测）。
 
 #### 8.6.5 DPI、全屏与安全区
 
 - **DPI**：拖动区与自绘 header 的坐标全为**逻辑像素**；`WM_DPICHANGED` / `backingScaleFactor` / `wl_output.scale` 变化时引擎更新
-  `Window::scale()` 并使根 `LAYOUT` 失效，应用重新布局 header 即可（不需要自己换算物理像素，I11）。
-- **全屏**：Linux 全屏时 `WindowState.fullscreen == true` ⇒ 应用**不画**标题栏（此时没有窗口装饰语义）；Windows E6 frameless 全屏
-  时引擎隐藏 resize border 与拖动区命中；macOS 原生全屏（`FullScreenPrimary`）下交通灯由 AppKit 隐藏/浮现，应用按
-  `WindowState` 或安全区变化重排。
-- **安全区**：macOS 顶部交通灯占用固定高度。E6 提供**只读查询** `App::traffic_light_inset(window) -> Option<Point>`
-  （`v2.1 新增规格`，归属 `App`，与 setter 同层；`None` = 非 macOS，或原生全屏下交通灯被系统隐藏），应用按返回值留白。
-  `App::set_traffic_light_position` 只是**设置**入口，不能替代读取；应用**不能**把可点击控件放到交通灯下（会与系统按钮抢命中）。
+  `Window::scale()` 并使根 `LAYOUT` 失效，应用重新布局 header 即可（不需要自己换算物理像素，I11）。**canvas 文本**的句柄按
+  窗口 DPI 光栅（`App::text_scale`，§11.1）：DPI 变化 / 跨屏移动 / 多窗口不同 DPI 后应用必须重新 `shape_text` 并重建 Canvas。
+- **全屏**：Linux 全屏时 `WindowState.fullscreen == true` ⇒ 应用**不画**标题栏（此时没有窗口装饰语义）；macOS 原生全屏
+  （`FullScreenPrimary`）下交通灯由 AppKit 隐藏/浮现，应用按 `WindowState` 或安全区变化重排。**Windows 不支持全屏控制**
+  （§8.6.1：`ToggleFullscreen` → `UnsupportedWindowCapability { capability: "fullscreen window control" }`，
+  `WindowState.can_fullscreen == false` 初值）——不存在「frameless 全屏时隐藏 resize border / 拖动区」的状态。
+- **安全区**：macOS 顶部交通灯占用固定高度。`App::traffic_light_inset(window) -> Option<Point>` 是**只读回报**（`None` = 非
+  macOS / 窗口不存在 / 原生全屏下交通灯被系统隐藏），引擎内部缓存（只在首次、位置应用后、全屏边沿、上次取到无效值时重算；
+  稳态每轮 0 次 AppKit 换算）。`App::set_traffic_light_position` 是 **set-once**：只在建窗时决定一次，首次生效后运行期修改被
+  忽略（返回 `Ok(())`、不唤醒泵）；AppKit resize / 全屏转场后的按钮重排**不追回**，改回 `None`（系统默认位置）**不可撤销**
+  ——需要「可切换」布局的应用必须重建窗口。应用**不能**把可点击控件放到交通灯下（会与系统按钮抢命中）。
 
 #### 8.6.6 不变量约束
 
@@ -2221,7 +2301,7 @@ app.set_title(window, SmolStr::new_static("Kytrix — BTC/USDT"))?;
 |---|---|
 | **I9** | 应用只见引擎类型：`WindowControl` / `WindowState` / `set_drag_regions` / `set_title` / `WindowOptions`；不得出现 `HWND` / `NSWindow` / `xdg_toplevel` |
 | **I14** | 三端各自实现，**不引入**可插拔「窗口装饰 trait」；`Decorations` 是数据枚举，不是扩展点 |
-| **I10** | 平台不支持时必须**明确报错或文档化降级**（例如 Wayland 没有 owner/置顶已按此处理）；不得静默假装成功 |
+| **I10** | 平台不支持时必须**明确报错或文档化降级**（§8.6.1 的权威表逐行可查）；不得静默假装成功 |
 | **I3** | 状态变化通知走「标 `PAINT` + 请求一帧」，不得为轮询窗口状态起定时器 |
 | **I11** | 拖动区/header 全用逻辑像素；物理像素换算只在平台层做 |
 
@@ -2310,7 +2390,7 @@ D19：本节**不设数值门槛**、不细化人月与排期；指标采集方�
 
 **明确不进依赖图**：`wgpu` / `wgpu-hal` / `naga`、`gpui-*` 全族（含 `gpui-pre-scheduler`）、`glyphon`、Vello 系、`cosmic-text`
 主链路、`gpui-fast`、`widget_tokio_runtime`、`winit` / `accesskit_winit`、`x11rb` / X11 / XIM 相关库（D25），以及随 GPUI 移除的
-`async-task` / `pollster` / `smol` 系应用级依赖。`cosmic-text` 仅可作为 PoC 阶段 CJK 正确性对照语料来源。`raw-window-handle` 不在依赖图（未实现互操作导出，§8.2）。
+`async-task` / `pollster` / `smol` 系应用级依赖。`cosmic-text` 仅可作为 PoC 阶段 CJK 正确性对照语料来源。`raw-window-handle` 不在依赖图（不做互操作导出，§8.2）。
 
 **发布前复核（非需求决策）**：`Skrifa` 精确版本、0.25 系各平台 adapter 签名、`VK_KHR_incremental_present` 在目标 Linux
 驱动上的支持率、系统内置 WARP 的 SM 上限、D3D12 FL/SM/Tier 的具体冻结值（由 PoC 实测决定）。
@@ -2334,7 +2414,7 @@ D18 定案「主干冻结窗口」：约定一段时间内不发布、在主干�
 
 ### 10.2 切换顺序（执行编号以 `plan.md` 为准）
 
-**状态列口径**：`✅ 已完成` / `⚠️ 部分`（列未落地项）/ `⬜ 待做`；证据基线 `main@54c1b50`（2026-11-20）。
+**状态列口径**：`✅ 已完成` / `⚠️ 部分`（列未落地项）/ `⬜ 待做`；迁移前证据基线 `main@54c1b50`（2026-11-20），引擎扩展（P1）证据基线 `gui-engine-migration@e1e4ff6`（2026-11-21）。
 **编号纪律（v2.1 修复）**：执行编号**只有一套** —— `.docs/gui-migration/plan.md` 的阶段 **P0–P6**、里程碑 **M1–M7**、
 批次 **P0-1…P6-3**（P1 的引擎扩展批次为 **P1-E1…P1-E6**）。本文**不再定义**自己的里程碑编号；v2.0/v2.1 旧版的
 `M0–M8 / M6.x` 已停用，只作为读历史报告的映射键（见本节末「旧设计里程碑 → plan 批次」）。任务、提交信息、评审意见
@@ -2344,15 +2424,15 @@ D18 定案「主干冻结窗口」：约定一段时间内不发布、在主干�
 
 | plan 阶段 | 批次 | 交付 | 验证门（plan §2.4） | 状态 |
 |---|---|---|---|---|
-| **P0 规格与门禁基座** | P0-1 | 本文 v2.1 回写（22+6 事实修正、§5.9、§1.3、E1–E6 规格、§6.8/§6.9/§6.10、§8.6、§9.2、§10.2） | 文档 diff + `design-changes.md` + 独立审查 | ✅ 已完成（本批；审查修复见台账） |
-| | P0-2 | `xtask gates`（`--platform win\|mac\|linux\|all --scope <crates> --step fast\|quick\|layer`；远端共享 target + 锁）；**不新增 CI** | `cargo xtask gates --help` + Windows fast + 两端 quick | ⬜ 待做 |
-| | P0-3 | 基线确认（只读）：三端 fast/层末门禁、`widget_tokio_runtime` 42/43、`WIDGET_NOTICE_SOURCES`、`cargo test -p kytrix` | `.review/mig-baseline-*` 日志 + 台账 | ⬜ 待做 |
-| **P1 引擎扩展** | P1-E1 | 文本 shaping 公开面（§11.1） | L0/L1/L2 + Windows fast + 两端 quick | ⬜ 待做 |
-| | P1-E2 | 富文本（§11.2；**D-03 已裁决必做**） | 同上 + golden 重建 + 合并点三端 layer | ⬜ 待做 |
-| | P1-E3 | 变高虚拟列表（§11.3） | 同上 | ⬜ 待做 |
-| | P1-E4 | `GeometryDraw.range`（§11.4） | 同上 + 三端 encoder/`contract.md`/参数 golden 同批 | ⬜ 待做 |
-| | P1-E5 | `text_byte_index_at`（§11.5） | 同上 | ⬜ 待做 |
-| | P1-E6 | Windows chrome + macOS 交通灯（§11.6；**D-02 已裁决必做**） | L1/L5 + Win11 真机 + 合并点三端 layer | ⬜ 待做 |
+| **P0 规格与门禁基座** | P0-1 | 本文 v2.1 回写（22+6 事实修正、§5.9、§1.3、E1–E6 规格、§6.8/§6.9/§6.10、§8.6、§9.2、§10.2） | 文档 diff + `design-changes.md` + 独立审查 | ✅ 已完成（本批；审查修复见台账）；v2.2 在 P1-E6 合入后回写 E1–E6 实现规格（§11） |
+| | P0-2 | `xtask gates`（`--platform win\|mac\|linux\|all --scope <crates> --step fast\|quick\|layer`；远端共享 target + 锁）；**不新增 CI** | `cargo xtask gates --help` + Windows fast + 两端 quick | ✅ 已完成（合入 `ee2a80f`；`xtask/src/gates.rs` + `gates/remote.rs`） |
+| | P0-3 | 基线确认（只读）：三端 fast/层末门禁、`widget_tokio_runtime` 42/43、`WIDGET_NOTICE_SOURCES`、`cargo test -p kytrix` | `.review/mig-baseline-*` 日志 + 台账 | ✅ 已完成（`assess/10-baseline.md`） |
+| **P1 引擎扩展** | P1-E1 | 文本 shaping 公开面（§11.1） | L0/L1/L2 + Windows fast + 两端 quick | ✅ 已完成（P1 各批合入 `e1e4ff6`） |
+| | P1-E2 | 富文本（§11.2；**D-03 已裁决必做**） | 同上 + golden 重建 + 合并点三端 layer | ✅ 已完成（P1 各批合入 `e1e4ff6`） |
+| | P1-E3 | 变高虚拟列表（§11.3） | 同上 | ✅ 已完成（P1 各批合入 `e1e4ff6`） |
+| | P1-E4 | `GeometryDraw.range`（§11.4） | 同上 + 三端 encoder/`contract.md`/参数 golden 同批 | ✅ 已完成（P1 各批合入 `e1e4ff6`） |
+| | P1-E5 | `text_byte_index_at`（§11.5） | 同上 | ✅ 已完成（P1 各批合入 `e1e4ff6`） |
+| | P1-E6 | Windows chrome + macOS 交通灯（§11.6；**D-02 已裁决必做**） | L1/L5 + Win11 真机 + 合并点三端 layer | ✅ 已完成（P1 各批合入 `e1e4ff6`；真机覆盖见 §11.8） |
 | **P2 base_ui** | P2-1a | 主题与颜色基座 + 薄 `StyleBuilder`（首个交付）+ `.hsla` 全删 + 64 角色×2 外观基线 | `cargo test -p base_ui` + gallery 出帧 | ⬜ 待做 |
 | | P2-1b | 资产与基础件（icon/assets/brand/size/format/motion/animation/join + `test_support`；含旧 M4 遗留的「图标构建期转换」） | 同上 | ⬜ 待做 |
 | | P2-2 | 容器与列表（`static_sized_list` / `scroll_bar` / `table` / `tree` / `deque_*`；`grid_list` 删） | 同上 + E3 | ⬜ 待做 |
@@ -2387,7 +2467,7 @@ M6 kytrix 启动 = P4-1…P4-3；M7 最终验收 = P6-1…P6-3（P5 是 M6 与 M
 | 旧 M1 | 引擎骨架：`ui_core`、三端自建事件循环与最小窗口、三平台 device 初始化、D8 检测与可读错误 | ✅ 已完成（Win11 build ≥ 22000 门禁在 `platform/windows/version.rs`） |
 | 旧 M2 | 渲染核心：`Scene` / `GpuPrimitive`、三套 shader、图集、`Geometry` VBO、damage/compositor、`Color` | ✅ 已完成 |
 | 旧 M3 | 节点树 + 依赖追踪 + 布局 + 命中 + `Style`/`PaintSpec`/`StylePatch` + full-refresh oracle | ✅ 已完成 |
-| 旧 M4 | 文本 + `ResourceCache` + `TestApp`/`Probe`/`FrameRecord` + 图标构建期转换 | ⚠️ 部分：「图标构建期转换」未实现 → P2-1b 迁入项 |
+| 旧 M4 | 文本 + `ResourceCache` + `TestApp`/`Probe`/`FrameRecord` + 图标构建期转换 | ⚠️ 部分：「图标构建期转换」尚未落地 → P2-1b 迁入项 |
 | 旧 M5 | 交互 + a11y + L3 像素快照（14 case × 3 设备 = 42 golden）+ 薄 `StyleBuilder` | ⚠️ 部分：L3 已落地；薄 `StyleBuilder` 属应用层 → P2-1a 首个交付 |
 
 **旧设计里程碑 → plan 批次（读旧报告时用；按 plan 批次也可反查旧编号）**：
@@ -2485,261 +2565,374 @@ M6 kytrix 启动 = P4-1…P4-3；M7 最终验收 = P6-1…P6-3（P5 是 M6 与 M
 
 ---
 
-## 11. v2.1 引擎扩展规格（E1–E6）
+## 11. 引擎扩展实现规格（E1–E6，已实现）
 
-> **本章全部条目是 `v2.1 新增规格`：尚未实现。** 落地前任何应用层代码**不得依赖**；每条落地时必须带 L1/L2 断言（改变视觉输出的还需
-> L3 golden）。依据：`.docs/gui-migration/assess/08-gap-verification.md` §2.1（6 项最小可行增量）与 `00-summary.md` §3；
-> 不变量判定见 `09-design-reconciliation.md` §9。
+> **本章全部条目已实现并合入 `gui-engine-migration`（P1-E1…P1-E6，迁移分支 HEAD `e1e4ff6`）。** 本章是**实现后的精确规格**
+> （API 形状 / 语义 / 错误 / 不变量 / 测试面），也是 P2（base_ui）与 P3（widget）的规格基线；与源码冲突时**以源码为准并回写本章**。
+> 依据：`.docs/gui-migration/assess/08-gap-verification.md` §2.1（6 项最小可行增量）与各批差异清单
+> `.docs/gui-migration/spec-deltas/E1–E6.md`；逐条回写台账见 `.docs/gui-migration/design-changes.md` §10。
+> **状态口径**：§11.1–§11.6 全部 ✅ 已实现；**E2b 候选**（§11.2 末）与**已接受残余**（§11.8）明确标注为未实现/限制，不得当作已交付能力引用。
 
-### 11.0 总表、分级与准入规则
+### 11.0 总表、分级与准入规则（E1–E6 全量落地）
 
-| ID | 增量 | 量级 | 受影响不变量 | 阻塞 crate（08 口径） | 分级 | 落地批次 |
+| ID | 增量 | 量级 | 受影响不变量 | 阻塞 crate（08 口径） | 分级 | 状态 / 批次 |
 |---|---|---|---|---|---|---|
-| **E1** | 文本 shaping 公开面（`ShapedTextHandle` + `App::shape_text` + `Canvas::push_shaped_text` + InlineBox 读取） | **M** | I2（不加 `Primitive` 变体）、I4（tile 生命周期仍归图集/retire）、I12（非像素断言）、I17 | candlestick / order_book / heatmap / prediction_market / perp / chokepoint + 4 个图表类 | **硬阻塞** | **P1-E1** |
-| **E2** | 富文本（多 `TextRun` + 文本装饰 + InlineBox 绘制与命中） | **L** | I2、I17、I12、I8（装饰走普通 `Quad`、不进 shader ⇒ 不触发 golden） | base_ui markdown 全组（empty / news / x） | **必做（D-03 扩展 E2）** | **P1-E2**（引擎）→ P2-3（base_ui 消费） |
-| **E3** | 变高虚拟列表（extents 前缀和 + 锚点 + `set_virtual_extents` / `scroll_to_item`） | **M** | I5（行高来自布局，回写必须走同一棵 taffy 树）、I3（锚点补偿不得额外出帧）、I11（全逻辑像素） | news / x / eth/sol 钱包（`DequeUnsizedList`）、6 张表的 wrap 行 | **硬阻塞** | **P1-E3** |
-| **E4** | `GeometryDraw.range`（索引元素子区间） | **M** | **I2（唯一契约变更点）**、I4（页级上传不变）、I8（同几何不同 range 的 golden） | global_shipping_chokepoint（LOD 4 档 / 22,876 三角形） | **硬阻塞** | **P1-E4** |
-| **E5** | `Window::text_byte_index_at`（点 → 字节索引） | **S** | I6（只读查询，不改状态） | 全部文本输入 / 选择 / 链接命中 | **硬阻塞** | **P1-E5** |
-| **E6** | Windows chrome（`Decorations` / `icon` / `set_title` / `WindowControl` 三端 / `WindowState`）+ macOS 交通灯位置 | **M** | **I9（平台能力留在引擎）**、I14（三端各自实现，不引入可插拔 trait）、I10（不静默降级）、I3（状态变化通知不轮询） | kytrix 外壳（自绘标题栏） | **必做（D-02 保留自绘标题栏）** | **P1-E6**（引擎）→ P4-3（外壳接线） |
+| **E1** | 文本 shaping 公开面（`ShapedTextHandle` + `App::shape_text` + `Canvas::push_shaped_text` + InlineBox 读取） | **M** | I2（不加 `Primitive` 变体）、I4（tile 生命周期仍归图集/retire）、I12（非像素断言）、I17 | candlestick / order_book / heatmap / prediction_market / perp / chokepoint + 4 个图表类 | **硬阻塞** | ✅ 已实现（P1-E1） |
+| **E2** | 富文本（多 `TextRun` + 文本装饰 + InlineBox 绘制与诊断） | **L** | I2、I17、I12、I8（装饰走普通 `Quad`、不进 shader ⇒ 不触发 golden） | base_ui markdown 全组（empty / news / x） | **必做（D-03 扩展 E2）** | ✅ 已实现（P1-E2） |
+| **E3** | 变高虚拟列表（extents 前缀和 + 锚点 + `set_virtual_extents` / `scroll_to_item`） | **M** | I5（行高来自布局，回写必须走同一棵 taffy 树）、I3（锚点补偿不得额外出帧）、I11（全逻辑像素） | news / x / eth/sol 钱包（`DequeUnsizedList`）、6 张表的 wrap 行 | **硬阻塞** | ✅ 已实现（P1-E3） |
+| **E4** | `GeometryDraw.range`（索引元素子区间） | **M** | **I2（唯一契约变更点）**、I4（页级上传不变）、I8（同几何不同 range 的像素覆盖） | global_shipping_chokepoint（LOD 4 档 / 22,876 三角形） | **硬阻塞** | ✅ 已实现（P1-E4） |
+| **E5** | `Window::text_byte_index_at`（点 → 字节索引） | **S** | I6（只读查询，不改状态） | 全部文本输入 / 选择 / 链接命中 | **硬阻塞** | ✅ 已实现（P1-E5） |
+| **E6** | Windows chrome（`Decorations` / `icon` / `set_title` / `WindowControl` 三端 / `WindowState`）+ macOS 交通灯位置 | **M** | **I9（平台能力留在引擎）**、I14（三端各自实现，不引入可插拔 trait）、I10（不静默降级）、I3（状态变化通知不轮询） | kytrix 外壳（自绘标题栏） | **必做（D-02 保留自绘标题栏）** | ✅ 已实现（P1-E6；真机覆盖见 §11.8） |
 
 **量级口径**：S ≤ 1 人日、M = 2–5 人日、L ≥ 6 人日（仅引擎侧改动，不含迁移）。**分级口径**：硬阻塞 = 不做就无法实现既有功能；
 **必做（已裁决）** = 产品/架构取舍已由用户裁决必须实现（D-02 保留自绘标题栏 ⇒ E6、D-03 扩展富文本 ⇒ E2），属于必须实现项，不存在降级替代。
 
-**引擎扩展准入规则（v2.1 起生效，迁移期全程适用）**：
+**引擎扩展准入规则（v2.1 起生效，迁移期全程适用；E1–E6 均按此验收）**：
 
-1. 只允许「**不改** `GpuPrimitive` 字节布局、不改 `render/shaders/contract.md`」的能力扩展；**E4 是唯一例外**，它必须三端
+1. 只允许「**不改** `GpuPrimitive` 字节布局、不改 `render/shaders/contract.md`」的能力扩展；**E4 是唯一例外**，已按此交付：三端
    encoder（Windows `render/windows/compositor.rs` 的 `GeometryRegistry`；macOS `render/macos/geometry.rs`；Linux
-   `render/linux/geometry.rs`；共享 `render/compositor.rs`）+ `contract.md` + 参数 golden **同批**交付。
+   `render/linux/geometry.rs`；共享 `render/compositor.rs`）+ `contract.md`（「range 是 CPU 侧裁剪，不进 `GpuPrimitive`」）+ 参数单测
+   （`draw_indexed_params`）+ Windows WARP 子区间像素测试**同批**（§11.4）。E1d 的 `AtlasTile` 字段扩展按 I2 的「CPU 侧契约扩展、
+   不改 `GpuPrimitive` / 三端 shader」口径记录（§11.1）。
 2. **不新增 `Primitive` 变体**（I2）；不新增可插拔 trait / 运行时后端枚举（I1 / I14）。
-3. 新增的公开 API 必须写进 §1.3 白名单与本文件对应章节，并补 `EngineError` 变体（强类型、可分类、可本地化）。
-4. 每条落地必须带 L1/L2 断言；改变绘制输出的必须补 L3 golden 或（文本类）结构与度量断言（§4.5 / §6.10）。
-5. 不得以「兼容层 / 预埋 API / 未使用字段」占位（AGENTS §1.1 / §2.1）。
+3. 新增的公开 API 已写进 §1.3 白名单与本章对应小节，并登记 `EngineError` 变体（强类型、可分类、可本地化）。
+4. 每条落地带 L1/L2 断言；改变绘制输出的补 L3 golden 或（文本类）结构与度量断言（§4.5 / §6.10）。
+5. 不以「兼容层 / 预埋 API / 未使用字段」占位（AGENTS §1.1 / §2.1）。
 
-### 11.1 E1 · 文本 shaping 公开面（`v2.1 新增规格`，量级 M，P1-E1）
+### 11.1 E1 · 文本 shaping 公开面（已实现，量级 M，P1-E1）
 
-**现状与缺口**：`ShapedLine` 类型公开、字段全 `pub`，但**应用拿不到实例**（唯一出口 `NodeTree::text_line` 是 `pub(crate)`）；
-`text/*` 7 个子模块全 `pub(crate)`；`Canvas::push_text` 需要 `GlyphRun`，而 `PositionedGlyph.tile: AtlasTile` **只能由图集分配器
-产出**（`AtlasTile` 是引擎内部句柄）。因此 canvas 内文本只能走「每标签一个 `NodeBuilder::text` 节点」，600 单元格/帧量级不可接受。
+**实现事实**：`ShapedLine` 仍是公开只读类型，但节点文本路径的应用拿不到实例（`NodeTree::text_line` 仍 `pub(crate)`）；E1 新增
+**无节点归属**的 shaping 公开面：`App::shape_text` 产出可长期持有的 `ShapedTextHandle`，canvas 用 `Canvas::push_shaped_text` 编码，
+行内盒落点经 `App::shaped_inline_boxes` 读取。`text/*` 子模块仍全部 `pub(crate)`（实现细节），公开契约只有 `text.rs` 的类型。
 
 ```rust
-// ── text.rs（v2.1 新增；未实现） ──
-pub struct ShapedTextHandle { /* Arc<ShapedLine> + 图集代际 + 形状缓存键 */ }
+// text.rs（已实现；字段私有，无公开构造器）
+pub struct ShapedTextHandle { /* Arc<ShapedLine> + Box<[ShapedInlineBox]> + (generation, eviction_epoch) 租约 + scale + Arc<AtomicU64> */ }
 impl ShapedTextHandle {
-    pub fn line(&self) -> &ShapedLine;      // 只读快照（glyph 位置、行、inline box）
-    pub fn is_stale(&self) -> bool;         // 图集已换代 ⇒ 必须重新 shape
+    pub fn line(&self) -> &ShapedLine;      // 只读快照（glyph 位置、行、装饰、inline box）
+    pub fn is_stale(&self) -> bool;         // 图集换代或逐 tile 淘汰后为真
     pub fn size(&self) -> Size;             // 内容尺寸（逻辑像素）
+    pub fn scale(&self) -> f32;             // 本次 shaping 的光栅 scale（App::text_scale 的值）
 }
 
 impl App {
-    /// 按样式、最大宽度与行内盒塑形，返回**可长期持有**的句柄（内部命中形状缓存，不重复光栅）。
+    /// 按样式、最大宽度与行内盒塑形；复用 `text/cache.rs` 的形状缓存。
     pub fn shape_text(
         &mut self, text: &str, style: &TextStyle, max_width: Option<f32>, inline_boxes: &[InlineBoxSpec],
-    )
-        -> Result<ShapedTextHandle, EngineError>;
-    /// 行内盒落点（供应用画 <img>/<kbd>）；顺序与 `shape_text` 传入的 `inline_boxes` 一一对应，`id` 原样保留。
-    pub fn shaped_inline_boxes(&self, handle: &ShapedTextHandle) -> &[ShapedInlineBox];
+    ) -> Result<ShapedTextHandle, EngineError>;
+    /// 行内盒落点（文本盒局部逻辑像素；顺序 = 行内位置顺序，`id` 原样保留）。
+    pub fn shaped_inline_boxes<'a>(&self, handle: &'a ShapedTextHandle) -> &'a [ShapedInlineBox];
+    /// canvas 文本的 App 级默认光栅 scale（初始 1.0）。
+    pub fn text_scale(&self) -> f32;
+    /// 显式覆盖（离屏 / 测试 / 固定 DPI）；覆盖期间不跟随焦点窗口 DPI。
+    pub fn set_text_scale(&mut self, scale: f32) -> Result<(), EngineError>;
+    /// 取消覆盖，恢复跟随焦点窗口 DPI（无焦点窗口时保留当前值）。
+    pub fn clear_text_scale_override(&mut self);
 }
 
-// ── paint/canvas.rs（v2.1 新增） ──
+// paint/canvas.rs（已实现）
 impl Canvas {
-    /// 引擎负责：代际校验（等价 D-5）、origin 偏移、按 run 拆 `Primitive::GlyphRun`。
-    /// 返回 false = 句柄已失效（应用应丢弃并重新 `shape_text`）。
+    /// 引擎负责：租约校验（等价 D-5）、origin 偏移、按 run 拆 `Primitive::GlyphRun`。
+    /// 返回 false = 句柄已失效（应用应丢弃并重新 `shape_text`），此时**不产生任何图元**。
     pub fn push_shaped_text(&mut self, handle: &ShapedTextHandle, origin: Point) -> bool;
 }
 ```
 
 **语义**：
 
-- 应用**永远不构造裸 `GlyphRun` / `AtlasTile`**：`Canvas::push_text(GlyphRun)` 保持现状（文档已写「应用层不应自行构造」），
-  应用侧入口只有 `push_shaped_text`。
-- `origin` 是**绝对窗口逻辑像素**（与 `Canvas` 内其他图元同一坐标系，§5.9）；多行文本的 `origin` 是文本盒左上角。
-- `inline_boxes` 与节点路径同源（`TextContent.inline_boxes`）；传空切片 = 无行内盒。E1 只保证落点可读（`shaped_inline_boxes`），
-  `InlineBoxPaint` 的绘制归 E2（§11.2）。
-- `max_width = None` = 不限宽（单行）；`Some(w)` 触发断行（等价 `break_all_lines(Some(w))`）。
-- 代际：句柄在构造时记录 `atlas_generation`；图集换代后 `is_stale()` 为真，`push_shaped_text` 返回 `false` 且**不产生任何图元**
-  （不允许「画旧 UV」——这正是 D-5 修掉的花字问题）。
-- 缓存：复用 `text/cache.rs` 的 `ShapeKey`（与 `App::refresh_text` 同一份键）：文本 + shaping 输入的 `TextStyle` + `inline_boxes` +
-  `font_stack_version`；**不含 `scale`**（逻辑坐标 shaping）。因此同一文本 + 同一 shaping 输入重复 `shape_text` 是命中路径。
-  E2 的 `runs`（逐 run 覆盖样式）落地时**必须并入键**（`ShapeKey` 的样式哈希或新增 run 摘要），否则不同 run 会误命中。
+1. **应用永不构造裸 `GlyphRun` / `AtlasTile`**：`Canvas::push_text(GlyphRun)` 保持现状（文档已写「应用层不应自行构造」），应用画文本的
+   唯一合法入口是 `push_shaped_text`；`AtlasTile` 字段虽 `pub`，但应用没有图集分配器，生产路径只能来自句柄。
+2. **`origin`** 是文本盒左上角的**绝对窗口逻辑像素**（与 Canvas 内其它图元同一坐标系，§5.9）；多行文本的所有行一起偏移。
+   **应用义务**：`origin + handle.size()` 必须落在 `Canvas::bounds` 内 —— damage / 命中只看 `Canvas::bounds`，引擎**不会**自动 union
+   （P3 建议 F10；越界内容的自绘责任归应用）。
+3. **行内盒**：`inline_boxes` 与节点路径同源（`TextContent.inline_boxes`），传空切片 = 无行内盒。`shaped_inline_boxes` 的落点按
+   **parley 布局顺序**（行内位置顺序）返回，`id` 原样保留；输入 `index` 非单调时**不保证**与传入 `inline_boxes` 一一对应，应用用 `id`
+   映射（F7 的语义收紧，不是实现偏差）。E1 只保证落点可读；装饰与 `InlineBoxPaint` 的绘制归 E2（§11.2）。
+4. **`max_width`**：`None` = 不限宽（单行）；`Some(w)` 触发断行（等价 `break_all_lines(Some(w))`）；非有限值或负数 ⇒
+   `EngineError::TextShapeStandalone`。
+5. **图集租约 = `(generation, eviction_epoch)`**：`generation` 是整页换代（扩容 / 清空 / 字体栈切换 / DPI 世代），`eviction_epoch` 是
+   **累计淘汰纪元**（`GlyphAtlas` 每淘汰一个 tile +1，只增不减）。句柄构造时记录两者；任一前进 ⇒ `is_stale()` 为真、
+   `push_shaped_text` 返回 `false` 且**不产生任何图元**（不允许「画旧 UV」——正是 D-5 修掉的花字问题）。实现用单个打包的
+   `AtomicU64` 租约（高 32 位 `generation`、低 32 位 `eviction_epoch`，`text::pack_atlas_lease`）保证两者原子地一起前进。
+   句柄**不持有**形状缓存键；形状缓存复用发生在 `shape_text` 内部（`ShapeKey`，§4.5）。
+6. **编码期安全网（push 之后）**：`push_shaped_text` 只在 push 时校验租约；push 之后同帧的图集换代（`layout_text` 扩容 / 清空、换
+   字体栈）**或逐 tile LRU 淘汰**（不换代）会让已写入的 `AtlasTile` 指向旧 UV。paint 在编码 `Primitive::Canvas` 前逐 `GlyphRun`
+   用 `AtlasAllocator::is_alive`（代际 + 槽位分配身份 `(slot, slot_epoch)`，O(1)）判活：**失效 run 整段丢弃**（少字优于花字，与节点
+   文本的 D-5 编码期硬校验同口径），其余图元（含 clip 括号）与顺序不变；丢弃数进 `PaintReport::stale_canvas_runs` →
+   `FrameRecord::stale_canvas_runs` → `TextDiagnostic::CanvasTextStale { runs }`。**有界补帧**：同一 `(window, atlas generation)` 至多
+   补一帧（`Window::note_stale_canvas_followup`），给应用执行重建义务的窗口；应用忽略义务也不造成 I3 空转。
+7. **应用义务（canvas 文本）**：Canvas 内容归应用所有，引擎**不能**代替应用重建 —— 丢弃后该 Canvas 会持续少字，直到应用在
+   `is_stale()` 后重新 `shape_text` 并用新句柄重建 Canvas；图集因容量压力逐 tile 淘汰时同样适用（代际不变、句柄已失效）。
+8. **App 级默认光栅 scale**：`App` 维护 `default_text_scale`（初始 1.0）。当前焦点窗口获得焦点或焦点窗口 DPI 变化时采用该窗口的
+   `Window::scale()`；`Event::DpiChanged.scale` 是本次变化的**权威值**（Windows / macOS 先镜像再派发、Wayland 先派发再镜像 —— 顺序
+   不同但结果一致）；没有焦点窗口时保留上一次的值。`set_text_scale` 提供**显式覆盖**（覆盖期间不再跟随焦点窗口 DPI），值必须是
+   **有限正数**，否则返回 `EngineError::InvalidTextScale { scale }`（不静默钳制、错误路径不改变当前 scale）；
+   `clear_text_scale_override` 取消覆盖并立即恢复跟随（无焦点窗口时保留当前值）。`shape_text` 用该 scale 光栅（ppem = 字号 × scale，
+   经 `GlyphKey` 的量化 ppem 维进字形缓存键）；`ShapedTextHandle::scale()` 与 `ShapedLine::scale` 都是该值；paint 阶段仍按窗口
+   `Scale` 放大（几何落点是逻辑像素）。**应用义务**：句柄的 tile 位图按 shape 时刻的 scale 光栅；多窗口不同 DPI、焦点切换、窗口被
+   拖到另一块屏（DPI 变化）后，应用**必须**丢弃句柄并重新 `shape_text`；引擎不会自动重光栅已有句柄。
+9. **错误路径的收尾**：`shape_text` 接住 `Result` 后**无条件**执行淘汰失效（文本行 + Canvas 节点标 PAINT）与租约同步，错误路径
+   不 `?` 早退（失败 shaping 也可能已淘汰节点文本的 tile / 前进租约）。
+10. **`AtlasTile` 的淘汰可检测身份（E1d，CPU 侧契约扩展）**：`AtlasTile` 增加 `slot: u32`（所属分配器槽位表下标）与
+    `slot_epoch: u32`（槽位分配纪元，分配器每次放入槽位都前进，`clear` / `grow` 不回退）；`(slot, slot_epoch)` 唯一标识一次分配，
+    `AtlasAllocator::is_alive(&self, tile) -> bool`（`render/atlas.rs`，**`pub(crate)`**，不是公开 API）O(1) 判定「图集种类一致 +
+    代际一致 + 槽位仍被占用且纪元相同」。字段**不进** `GpuPrimitive` 128 B 布局、不进 uniform / 顶点布局 / 三端 shader；
+    `AtlasTile` 24 → 32 B（`PositionedGlyph` 40 → 48 B，单字形 +8 B）。`push` 期不逐 tile 扫描：句柄租约已等价且更早覆盖逐 tile
+    失效，`AtlasAllocator` 是 crate 私有、不能进公开签名。
 
-**错误**（新增变体，需与 §2.9 一并登记）：
+**错误**：
 
 | 变体 | 触发 |
 |---|---|
-| `EngineError::TextShapeStandalone { detail: SmolStr }` | 无节点归属的 shaping 失败（字体栈空 / parley 构建失败） |
-| `EngineError::AtlasExhausted { kind: AtlasKind }`（**已有**） | 字形图集容量逃逸且扩容失败 |
+| `EngineError::TextShapeStandalone { detail: SmolStr }` | 无节点归属的 shaping 失败（字体栈为空 / `max_width` 非有限或为负 / parley 构建失败） |
+| `EngineError::InvalidTextScale { scale: f32 }` | `App::set_text_scale` 的 scale 非有限或 `<= 0`（与平台 DPI 错误 `InvalidDpiScale` 分开） |
+| `EngineError::AtlasExhausted { kind: AtlasKind }` | 字形图集在扩容 + LRU 淘汰后仍放不下本次工作集 |
 
-**不变量影响**：I2 ✅（`Primitive` 不加变体；`Canvas` 仍只装 8 类图元）；I4 ✅（tile 生命周期仍归引擎的图集/retire）；
-I12 ✅（提供非像素断言：`handle.line().glyphs` 数量、`size()`、`text_range`）；I17 ✅（句柄是只读快照，文本内容变化仍走
-`bind_text` 或重新 shape，不绕过 Signal）。
+**不变量影响**：I2 ✅（`Primitive` 不加变体；`Canvas` 仍只装 8 类图元；`AtlasTile` 的字段扩展是 CPU 侧、不改 GPU 布局与 `contract.md`）；
+I4 ✅（tile 生命周期仍归引擎的图集 / retire）；I12 ✅（非像素断言：`handle.line().glyphs` 数量、`size()`、`text_range`、
+`FrameRecord.stale_canvas_runs`）；I17 ✅（句柄是只读快照，文本内容变化仍走 `bind_text` 或重新 shape，不绕过 Signal）。
 
-**测试要求**：L0/L1 —— `shape_text` 的 `size()` / 行数 / 字形数；`max_width` 断行；CJK + emoji；传入 `inline_boxes` 后 `shaped_inline_boxes()` 的 `rect` 与行内盒数量/顺序一致；`is_stale()` 在图集换代后为真；
-`push_shaped_text` 在 stale 时返回 `false` 且 `Canvas::primitives()` 长度不变。L2 —— `FrameRecord` 中 `Primitive::GlyphRun`
-的 bounds ⊆ `origin + line.size()`，且节点 lane 的图元数与 run 数一致。**不引入 L3**（文字像素不做 golden，§4.5）。
+**测试面**：
 
-### 11.2 E2 · 富文本：多 run + 装饰 + InlineBox 绘制/命中（`v2.1 新增规格`，量级 L，P1-E2）
+- L0/L1：`shape_text` 的 `size()` / 行数 / 字形数；`max_width` 断行；CJK + emoji 混合塑形（度量单调、不 panic，彩色字形压平可退 tofu）；
+  传入 `inline_boxes` 后 `shaped_inline_boxes()` 的数量与 `id`；`is_stale()` 在整页换代与逐 tile 淘汰后为真、
+  `push_shaped_text` 在 stale 时返回 `false` 且 `Canvas::primitives()` 长度不变；失败 shaping 仍失效节点文本并同步租约；
+  DPI 事件用自带 `scale` 作权威值；形状缓存键区分 `inline_boxes`（变异 M3 守护）。
+- L2：`FrameRecord.stale_canvas_runs` 无失效 run 时为 0、换代 / 淘汰后等于被丢弃 run 数；`Primitive::Canvas` 作为不透明图元进帧记录时，
+  Canvas 内层 `GlyphRun` 计数与 bounds 在 `Window::scene()` 核对；节点文本路径的 `Primitive::GlyphRun` bounds ⊆ 节点盒且 lane 图元数 =
+  非空 run 数。守护用例：`stale_canvas_runs_request_exactly_one_bounded_follow_up_frame`、
+  `failed_shape_still_invalidates_text_lines_and_syncs_the_lease`、`tile_eviction_makes_long_lived_handles_stale_and_reshaping_recovers`、
+  `evicted_canvas_tiles_are_filtered_at_encode_time_without_a_generation_bump`、
+  `without_stale_glyph_runs_drops_evicted_tiles_and_keeps_live_ones`、
+  `is_alive_tracks_allocation_eviction_slot_reuse_and_page_growth`、`frame_record_glyph_runs_stay_inside_the_text_node_box`。
+- **不引入 L3**（文字像素不做 golden，§4.5 / I12）。
 
-**现状与缺口**：`TextContent` 是「单段文本 + 单 `TextStyle` + inline box 列表」；`TextStyle` **无 decoration**；
-`paint/pass.rs::emit_text` 对 `InlineBox` 直接 `continue`（**不绘制**）；`ShapedLine` 本身是 `pub struct`（字段 pub），但应用**拿不到
-实例**（唯一出口 `NodeTree::text_line` 是 `pub(crate)`），所以 `ShapedInlineBox.rect` 对应用不可达；`text/inline_flow.rs` 自述
-「AST → `Vec<InlineFragment>` 的数据管线不在本阶段」。→ markdown 行内流（粗/斜/链接/`kbd`/行内图）无落点。
+### 11.2 E2 · 富文本：多 run + 装饰 + InlineBox（已实现，量级 L，P1-E2）
+
+**实现事实**：`TextContent` 支持 runs（逐区间覆盖样式）；`TextStyle` 支持装饰；`emit_text` 按 `InlineBoxPaint` 生成引擎既有图元；
+装饰是 shaping 期烘好的 `ShapedDecoration` 几何、paint 期编码为普通 `Quad`。
 
 ```rust
-// ── text.rs（v2.1 新增；未实现） ──
-pub struct TextRun { pub range: Range<usize>, pub style: TextStyle }   // 字节区间 + 覆盖样式
+// text.rs（已实现；数据形状以源码为准）
+pub struct TextRun { pub range: Range<usize>, pub style: TextStyle }
+impl TextRun { pub fn new(range: Range<usize>, style: TextStyle) -> Self; }
 
 pub enum TextDecoration {
     Underline { color: Option<Color>, thickness: f32 },
     Strikethrough { color: Option<Color>, thickness: f32 },
 }
-pub struct TextStyle { /* 现有 12 字段 + */ pub decoration: Option<TextDecoration> }
+impl TextDecoration {
+    pub fn underline(thickness: f32) -> Self;
+    pub fn strikethrough(thickness: f32) -> Self;
+    pub fn with_color(self, color: Option<Color>) -> Self;
+    pub fn color(self) -> Option<Color>;
+    pub fn thickness(self) -> f32;
+}
 
-pub enum InlineBoxPaint {                       // v2.1 新增：引擎负责画，应用只声明
+// TextStyle：decoration 收进低频 `TextStyleExtras`（`extras: Option<Box<TextStyleExtras>>`），公开访问面是访问器 + 构造器；
+// `TextStyle` 仍 56 B。装饰不参与布局。
+impl TextStyle {
+    pub fn decoration(&self) -> Option<TextDecoration>;
+    pub fn with_decoration(self, decoration: TextDecoration) -> Self;
+}
+
+pub enum InlineBoxPaint {                 // 引擎负责画，应用只声明
     Image { resource: ResourceId, modulation: Color },
     Quad { color: Color, corner_radius: [f32; 4] },
 }
-pub struct InlineBoxSpec { /* 现有 5 字段 + */ pub paint: Option<InlineBoxPaint> }
+pub struct InlineBoxSpec { /* 现有 5 字段 + */ pub paint: Option<InlineBoxPaint> }   // 72 B
 
 pub struct TextContent {
     pub text: SmolStr,
-    pub style: TextStyle,           // 兜底样式
-    pub runs: Box<[TextRun]>,       // 覆盖区间；空 = 全段用 style
+    pub style: TextStyle,                              // 兜底样式
+    runs: Option<Box<ThinSlice<TextRun>>>,             // 私有：只能经 with_runs / NodeBuilder::runs 构造
+    normalized_runs: u16,                              // 私有：构造期归一化计数
     pub inline_boxes: Box<[InlineBoxSpec]>,
 }
-```
-
-`TextContent` 目前只能由 `NodeBuilder::text(text, style)` + `NodeBuilder::inline_boxes(..)` 构造，**没有 runs 入口**；E2 同批新增
-挂载 API（登记在 §1.3 的「v2.1 新增规格公开面」子表，落地前不可依赖）：
-
-```rust
-impl NodeBuilder {
-    /// v2.1 新增：多 run 覆盖样式（与 `text` 的整段 `style` 并存；空 runs = 整段 style）。
-    pub fn runs(self, runs: impl IntoIterator<Item = TextRun>) -> Self;
+impl TextContent {
+    pub fn runs(&self) -> &[TextRun];                  // 空切片 = 全段用 style
+    pub fn with_runs(self, runs: impl IntoIterator<Item = TextRun>) -> Self;
 }
+impl NodeBuilder { pub fn runs(self, runs: impl IntoIterator<Item = TextRun>) -> Self; }
 ```
+
+**尺寸基线**（E2b 实测，守护测试 `text_payload_sizes_are_budgeted` / `node_size_after_p06`）：`TextStyle` 56 / `TextContent` 112 /
+`InlineBoxSpec` 72 / `ShapedLine` 80 / **`Node` 328 B（硬上限 336 B）**。`TextContent` 在 `NodeKind::Text` 里是 `Box` 装载 ⇒
+`Node` 尺寸不变（E2 自述的「Node 328→336」不成立）。
 
 **语义**：
 
-- `runs` 覆盖 `[0, text.len())`，区间必须**升序、不重叠、落在 char boundary**；未覆盖区间用 `TextContent.style` 兜底。
-  非升序/越界 ⇒ `EngineError::TextShapeStandalone`（或节点版 `TextShape`）+ 诊断，**不 panic**。
-- `bind_text` **只换整段文本、保留 `runs` 与 `inline_boxes`**（`style_pass` 已是这个结构）：新文本更短时按新长度裁剪 runs，
-  越界 run 丢弃并写 `TextDiagnostic`（不静默改变样式归属）。
-- `decoration` 绘制为**引擎生成的 `Primitive::Quad`**（下划线/删除线用行内矩形，位置来自 `ShapedTextLine.baseline` 与 run 的
-  advance），因此 L2 帧记录可直接断言；装饰矩形**不参与布局**。
-- InlineBox：`paint = Some(..)` ⇒ 引擎在 `emit_text` 里按 `ShapedInlineBox.rect` 生成 `Image` / `Quad` 图元；
-  `paint = None` ⇒ 位置仍可读（`App::shaped_inline_boxes` / 节点 `text_line` 路径），但**不绘制**（保持现状语义）。
-- InlineBox 的 `Image { resource }` 在 paint 阶段经 `ResourceCache` 解析 `ResourceId → ResourceImage.tile`；资源未加载 / 解码失败时
-  **跳过该图元并写 `TextDiagnostic`**（不生成占位图、不 panic）；`Quad` 直接生成 `Quad` 图元。
-- 命中：InlineBox 命中由应用用 `ShapedInlineBox.rect` 与 `HitResult.local_point` 比对（**不新增**引擎命中 API）；文本内字符命中走 E5。
+1. **run 覆盖 = 逐属性继承 + 可选覆盖**（不是「整段换一套样式」）：`Option` 字段（`family` / `font_features` / `stretch` /
+   `word_spacing` / `locale` / `font_variations` / `line_break` / `decoration`）`Some` 覆盖该属性、`None` **继承** `TextContent.style`
+   的同名属性（因此 `None` 不能把兜底样式的非默认值清回默认）；其余字段（字号 / 字重 / 倾斜 / 行高 / 字距 / 颜色 / `wrap`）总是取 run
+   自己的值。**`wrap` 的实际归属是整段兜底样式**：`push_run_style` 只在 run 为 `NoWrap` / `Anywhere` 时向该区间下发收紧属性，
+   `Wrap` 是空操作 ⇒ run **无法**把 base 的 `NoWrap` / `Anywhere` 复位成可换行；应用要「局部可换行」必须让 `TextContent.style.wrap`
+   保持 `Wrap`。段落级字段（`alignment` / `overflow` / `max_lines` / `direction`）不参与逐 run，由 `TextContent.style` 决定。
+2. **非法 runs = 构造期归一化 + 诊断（不新增 `EngineError`）**：`with_runs` / `NodeBuilder::runs` 在构造期把区间夹到 char boundary 与
+   文本长度、丢弃重叠 / 空区间（只缩小覆盖，不挪样式），不 panic；被改动（内收或丢弃）的 run 数记入私有 `normalized_runs`，
+   `shape` 期压**一条** `TextDiagnostic::InvalidTextRun { runs }`（每内容一条计数，不逐 run 刷屏；`TextContext` 诊断环按值去重）。
+   `normalized_runs` 进 `ShapeKey` 与命中判据（诊断随快照复用，不能让「有诊断的内容」命中「没诊断的快照」）。`bind_text` 换整段文本
+   时 runs 按新长度裁剪 / 丢弃，被改动数写一条 `TextDiagnostic::TextRunClipped { runs }`（不静默改变样式归属）。
+3. **装饰几何**：下划线中心 = `baseline + 0.10 em`；删除线中心 = `baseline − 0.30 em`（`em` = 装饰所属样式的字号）；线宽 = `thickness`
+   （非有限 / `<= 0` 不画）。软换行时每行一条；**硬换行行尾按「行内容区间」裁剪**（去掉行尾 `\n` / `\r`，可见字符才画线；修复前
+   `"ab\ncd"` 除末行外整行丢装饰，现为每行都有）；省略号截断后末行装饰夹到 `[line_offset, line_offset + advance]`，夹成零宽后丢弃。
+   兜底样式的装饰只覆盖「未被**带装饰的 run** 占用的区间」（不叠双线）；run 的 `decoration = None` = 继承兜底。
+4. **装饰的 RTL / bidi 跨度**：装饰 x 跨度 = 区间内**所有** cluster 的视觉并集
+   `[min(visual_offset), max(visual_offset + advance)]`（按行内视觉顺序取首/末相交 cluster，再取 min/max 归一）；**不能**只取逻辑首 /
+   末字符所属 cluster 的端点（RTL 片段里逻辑首字符在视觉右端，端点法只覆盖中间一段）。LTR+RTL 混排与跨 run RTL 同规则。
+5. **绘制序**：同一行先 `items`（字形 run / 行内盒，按序），随后 decorations（普通 `Quad`，压在字形 / 行内盒之上）；在内容 clip 内、
+   同一 lane。装饰**不参与布局**、不进 shader ⇒ 不触发 I8 的 shader 契约 / golden。
+6. **`foreground` 交互**：`StylePatch::foreground` 同时覆盖**字形颜色与装饰线色**（含显式 `TextDecoration::color`）；
+   `foreground = None` 时装饰色 = shaping 期解析出的颜色（显式线色 > run 文本色；兜底装饰取整段文本色）。
+7. **InlineBox 绘制**：`paint = Some(InlineBoxPaint::Image)` 在 paint 阶段经 `ResourceCache` 解析 `ResourceId → ResourceImage.tile`，
+   资源未加载 / 已卸载时**跳过图元**（不画占位图），`PaintReport::skipped_inline_images` 收集 `id`，`App::frame` 压
+   `TextDiagnostic::InlineBoxImageMissing { id }`（同帧按 id 去重；跨帧由 `TextContext` 按值去重）。`Some(Quad)` 生成 `Primitive::Quad`；
+   `None` 只算落点、不绘制。无 `App` 通道的 `Window::frame` 没有 `ResourceCache`：行内图片一律跳过并记
+   `Window::inline_box_image_diagnostics()`（最近一帧快照，每帧重建、不增长），需要行内图片请走 `App::frame`。
+8. **命中边界**：文本内字符命中走 E5 的 `Window::text_byte_index_at`；InlineBox 命中由应用用 `ShapedInlineBox.rect` +
+   `HitResult.local_point` 比对（**不新增**引擎命中 API）。节点文本路径的 `ShapedInlineBox.rect` 只读访问面**不存在** ——
+   `App::shaped_inline_boxes` 只覆盖 standalone handle，节点路径的只读访问面见下方 E2b 候选。
 
-**错误**：`TextShape { node, detail }`（已有）+ `TextShapeStandalone { detail }`（E1 新增）；run 区间非法 → 同上 + `TextDiagnostic`。
+**错误 / 诊断**：不新增 `EngineError`；非法 runs 归一化 + `InvalidTextRun` / `TextRunClipped` 诊断；`bind_text` 的
+`TextDiagnostic::TextRunClipped { runs }` 语义不变。
 
 **不变量影响**：I2 ✅（装饰与 inline box 都复用既有 8 类图元）；I17 ✅（`TextContent` 是静态载荷，动态文本仍 `bind_text`）；
-I12 ✅（装饰矩形 / run 边界 / inline box rect 都是非像素断言对象）；I8 ⚠️（若装饰颜色/线宽进 shader 常量则触发 golden —— 本规格
-**不进** shader，装饰是普通 `Quad`，因此不触发）。
+I12 ✅（装饰矩形 / run 边界 / inline box rect 都是非像素断言对象）；I8 ✅（装饰是普通 `Quad`，不进 shader）。
 
-**测试要求**：L1 —— run 边界（`ShapedGlyphRun.text_range` 与 run 区间一致）；换行后 run 跨行正确；装饰矩形数量 = 有装饰的 run 数；
-inline box `paint = Some(Image)` 生成的 `Image` 图元 bounds == `shaped_inline_boxes()[i].rect + 文本盒原点`。L2 ——
-`RenderedFrame.primitives` 中 `PrimitiveKind::Quad` 的装饰矩形 item 数与 line/baseline 一致。L3 —— **不新增**（文字像素不做 golden）。
+**测试面**：L1 —— run 边界（`ShapedGlyphRun.text_range` 与 run 区间一致）；换行后 run 跨行正确；装饰矩形数量 = 每个有装饰的
+(run, 行) 段数；硬换行 / 纯 RTL / LTR 内 RTL run / 跨 run RTL 的装饰跨度；`foreground` 同时覆盖字形与装饰色；非法 runs 只产一条诊断；
+inline box `paint = Some(Image)` 的 `Image` 图元 bounds == `shaped_inline_boxes()[i].rect + 文本盒原点`。L2 —— `RenderedFrame.primitives`
+的 `PrimitiveKind::Quad` 装饰 item 数与 line / baseline 一致；`app_frame_reports_missing_inline_box_images_once`；
+`window_frame_reports_skipped_inline_box_images`。L3 —— **不新增**（文字像素不做 golden）。守护用例：
+`decoration_survives_hard_line_breaks`、`run_decoration_clipped_at_hard_line_break`、`decoration_range_excludes_the_hard_break_tail`、
+`rtl_decoration_covers_the_full_visual_span`、`foreground_overrides_glyph_and_decoration_colors`、
+`normalized_runs_emit_one_invalid_text_run_diagnostic`。
 
-### 11.3 E3 · 变高虚拟列表（`v2.1 新增规格`，量级 M，P1-E3）
+**E2b 候选（未实现，仅登记，不得依赖）**：
 
-**现状与缺口**：单一 `extent`（`VirtualListConfig { extent, overscan }`）；行位置硬编码 `index * extent`、`content = count * extent`；
-`visible_range(offset, viewport, extent, count, overscan)` 是纯数学。→ wrap 行 / 高度不一的行（news、钱包、6 张表）无法表达。
+1. **Canvas / standalone shaping 不绘制装饰与行内盒**：`Canvas::push_shaped_text` 只编码 glyph run；`App::shape_text` 的 standalone
+   路径同样不绘制 —— `InlineBoxPaint` / `TextDecoration` 的绘制只覆盖节点文本路径（`emit_text`）。
+2. **节点文本路径的 InlineBox 命中只读访问面**：`NodeTree::text_line` 仍 `pub(crate)`，且 `App::shape_text` 不接受 runs、无法复现节点
+   文本的行内盒落点；因此「InlineBox 命中」目前仅 standalone handle 路径可行。链接文本命中可先用 E5 的 `text_byte_index_at` + 应用
+   自持 run 区间判定。
+
+### 11.3 E3 · 变高虚拟列表（已实现，量级 M，P1-E3）
+
+**实现事实**：`VirtualListConfig` 增加 `extents`；`ItemAlign` / `App::{set_virtual_extents, scroll_to_item}` 落地；引擎维护前缀和缓存，
+滚动帧只做 O(log n) 二分，不每帧重算。
 
 ```rust
-// ── interaction.rs（v2.1 新增/扩展；未实现） ──
+// interaction.rs（已实现；`VirtualListConfig` 因 Box<[f32]> 不再是 Copy）
 pub struct VirtualListConfig {
-    pub extent: f32,                    // 现状：等高行（保留）
-    pub extents: Option<Box<[f32]>>,    // v2.1 新增：逐项高度；Some 时忽略 extent
+    pub extent: f32,                    // 等高行；也是条目数变化 / 预置失效时的回落值
+    pub extents: Option<Box<[f32]>>,    // 逐项高度（每项有限且 >= 0，累计和必须有限）
     pub overscan: usize,
 }
-pub enum ItemAlign { Start, Center, End, Nearest }   // v2.1 新增
+pub enum ItemAlign { Start, Center, End, Nearest }
 
 impl App {
-    /// 逐项高度**整体替换**（`extents.len()` 必须等于当前 `VirtualListState.count`）；引擎重算前缀和并按锚点补偿滚动偏移。
     pub fn set_virtual_extents(&mut self, list: &VirtualList, extents: &[f32]) -> Result<(), EngineError>;
-    /// 把第 index 项按 align 对齐到视口；`Nearest` = 已可见则不滚。
-    pub fn scroll_to_item(&mut self, list: &VirtualList, index: usize, align: ItemAlign)
-        -> Result<(), EngineError>;
+    pub fn scroll_to_item(&mut self, list: &VirtualList, index: usize, align: ItemAlign) -> Result<(), EngineError>;
 }
 ```
 
 **语义**：
 
-- `extents = None` ⇒ **行为与现状逐字节一致**（`index * extent`、`count * extent`）。
-- `extents = Some(..)` ⇒ 引擎维护 `prefix: Vec<f32>`（长度 count+1，`prefix[0] = 0`、`prefix[i+1] = prefix[i] + extents[i]`）；
-  可见区间 = 「`prefix` 上对 `[offset, offset + viewport]` 做二分」+ overscan；`content.height = prefix[count]`；行 `i` 的 top =
-  `prefix[i]`、height = `extents[i]`。
-- **锚点规则**（`set_virtual_extents` 时）：替换前记录「首个可见 index `f` + 该行内偏移 `d = offset - prefix[f]`」；替换后
-  `scroll_to(prefix'[f] + d)`，**同一次调用内完成**、不额外请求帧（I3）。`count` 由 `App::set_virtual_items` 决定；items 数变化时
-  先 `set_virtual_items`（锚点用旧 `prefix` 的 `f` 并 clamp 到新 count）再 `set_virtual_extents`，**不在 extents 调用里改变 count**。行数变化（items 变多/变少）时锚点按 clamp 处理（越界退到末项）。
-- **明确不做：引擎自动测量**。行高必须由应用给（例如 `DequeUnsizedList` 的缓存行高、或应用在 `Node::layout()` 后自己收集再回写）。
-  理由：行高来自文本换行 ⇒ 若要引擎自动测量就必须「布局 → 测量 → 回写 → 重新布局」，会在**同一棵 taffy 树**上反复 `mark_dirty`
-  （I5 的树被震荡），且引入不可收敛的帧循环风险（I3）。
-- **行布局回写路径（不新增第二棵布局树）**：`extents` → prefix → 复用现有 `NodeTree::set_virtual_row(row, top, height)`
-  （`pub(crate)`：写该行节点的 `position:absolute` + `inset.top` + `size.height`，仍是同一棵 taffy 树的节点布局输入）；
-  可见区间由 `visible_range` 的 `index*extent` 换成 prefix 二分。行高只进入同一棵树的布局输入，**不引入第二份布局真相**。
-- 变更 `extents` 或 `count` ⇒ 受影响行标 `LAYOUT + PAINT`；`content` 尺寸变化走 `set_scroll_content`（引擎内部完成）。
+1. `extents = None` ⇒ **行为与 v1 逐字节一致**（行位置 `index * extent`、内容高度 `count * extent`）。
+2. `extents = Some(..)` ⇒ 引擎维护 `prefix: Vec<f32>`（长度 count+1，`prefix[0] = 0`、`prefix[i+1] = prefix[i] + extents[i]`）；
+   可见区间 = 对 `[offset, offset + viewport]` 在 prefix 上二分 + overscan；`content.height = prefix[count]`；行 `i` 的 top = `prefix[i]`、
+   height = `extents[i]`。`VirtualListConfig.extents` 是**创建期预置缓存**：`make_virtual_list` 记住并校验；`set_virtual_items` 首次调用且
+   `count` 与长度匹配时生效，不匹配则丢弃并回落 `config.extent`。
+3. **锚点规则**：`set_virtual_extents` 替换前记录「首个可见 index `f` + 行内偏移 `d = offset − prefix[f]`」；替换后 `scroll_to(prefix'[f] + d)`，
+   **同一次调用内完成**、不额外请求帧（I3）；与旧高度逐项相同时是纯 no-op。`count` 只由 `App::set_virtual_items` 决定，extents 调用不改 count。
+4. **条目数变化 / 预置高度失效**：`set_virtual_items` 发现 `extents` 长度与新 `count` 不符 ⇒ **丢弃逐项高度、回落到 `config.extent`**：偏移按
+   旧锚点 `(f, d)` 在单一 extent 布局下重算并 clamp（count 未变则不动偏移），**已挂载行几何同步重排**（top = `i * extent`、height = `extent`，
+   只重写几何真的变化的行）；应用随后应调用 `set_virtual_extents` 提供新高度。建议接入方把两次调用包在 `App::batch` 内（否则多一次唤醒 / 中间布局）。
+5. **零内容（全零行高）锚点**：`prefix[count] <= 0` ⇒ 锚点固定 `(0, 0)`，**不得**选到末项；与零内容时可见窗口为空（`0..0`）同口径。
+   理由：全零行高是「尚未测量 / 全部折叠」的过渡态，首次回填真实高度不得跳到底部。
+6. **`content` 写入**：引擎内部**直接写 `ScrollSlot.content`**（不重入 `App::set_scroll_content`，避免 `tree_mut` 借用重入）；写入前必须保证
+   `content` 有限：`extents` 逐项有限非负且累计和有限。违反时返回 `InvalidVirtualExtent`，**不写任何状态**（原子性）。
+7. **`ItemAlign` 落点**：`Start` / `Center` / `End` 分别按顶边 / 中心 / 底边对齐；`Nearest` = 条目**完全位于视口内**时不滚（`target == current`
+   ⇒ 不请求帧），完全在视口上方 ⇒ 顶边贴视口顶边，完全在视口下方 ⇒ 底边贴视口底边。四种对齐的落点都先按「内容高度 − 视口高度」夹紧
+   （`>= 0`），再走 `App::scroll_to` 的唯一偏移写点。
+8. **明确不做：引擎自动测量**。行高必须由应用给（布局回写环 + I5 震荡 + I3 风险，理由不变）。
+9. **行布局回写**：`extents` → prefix → `NodeTree::set_virtual_row(row, top, height)`（`pub(crate)`，仍是同一棵 taffy 树的布局输入）；
+   `extents` / `count` 变化 ⇒ 受影响行标 `LAYOUT + PAINT`。
 
-**错误**：`EngineError::NotVirtualList { node }`（已有，字段只有 `node`）；新增 `EngineError::VirtualListExtents { expected: usize, actual: usize }`
-（`extents.len() != items.len()`，含空 extents 但 count > 0）；`scroll_to_item` 的 index 越界 ⇒ `VirtualListExtents`（同语义：入口参数与
-当前条目数不符），不 panic。
+**错误**：`EngineError::NotVirtualList { node }`（已有，字段只有 `node`）；`EngineError::VirtualListExtents { expected, actual }`
+（`extents.len() != count`；`scroll_to_item` 越界复用同变体：`expected = count`、`actual = index + 1`，即 **1-based 的请求位置**，不是长度）；
+`EngineError::InvalidVirtualExtent { index, value }`：`extents` 第 `index` 项非有限 / 为负，或该项使前缀和累计值溢出到非有限（此时
+`index` = 首次溢出的项，该项自身可能合法）；`make_virtual_list` 的预置高度与 `set_virtual_extents` 共用同一校验，任何状态写入前返回。
 
 **不变量影响**：I5 ⚠️（不改树结构，只改「行节点 top/height」这一布局输入，仍走同一棵 taffy 树）；I3 ✅（锚点补偿不额外出帧）；
 I11 ✅（全逻辑像素）。
 
-**测试要求**：L0 —— `prefix` + 二分 + overscan + 边界 clamp 的纯函数用例（含 0 高行、首/末行、viewport 未知）。L1 ——
-`set_virtual_extents` 后 `Probe::bounds(row_i).origin.y == prefix[i]`；锚点在替换前后「同一 first index + 同一内偏移」；
-`scroll_to_item` 三种 align 的落点。L2 —— `FrameRecord.damage` 不是整帧；一次 extents 替换只产生**一帧**（`repainted` 次数与写入次数一致）。
+**测试面**：L0 —— prefix + 二分 + overscan + 边界 clamp 的纯函数用例（含 0 高行、首/末行、viewport 未知、累计溢出）。L1 ——
+`Probe::bounds(row_i).origin.y == prefix[i]`；`replacing_extents_preserves_the_visible_anchor`；`scroll_to_item_follows_the_four_alignments`；
+`zero_heights_then_real_heights_keep_the_visible_anchor_at_the_top`；`config_extents_are_adopted_and_stale_heights_are_dropped`
+（条目数变化丢弃逐项高度 + 已挂载行几何回落）；`an_empty_list_accepts_empty_extents_and_rejects_any_index`。L2 —— `FrameRecord.damage` 不是整帧；
+一次 extents 替换只产生**一帧**（`repainted` 次数与写入次数一致）。
 
-### 11.4 E4 · `GeometryDraw.range`：索引子区间绘制（`v2.1 新增规格`，量级 M，P1-E4）
+### 11.4 E4 · `GeometryDraw.range`：索引子区间绘制（已实现，量级 M，P1-E4）
 
-**现状与缺口**：`GeometryDesc` 无 range；`GeometryDraw { id, transform, color }` 无 range；引擎按固定块
-（`GEOMETRY_CHUNK_INDICES = 12288` 索引 = 4096 三角形）切块并按块 `DrawIndexed`。应用要「只画几何的一段」（LOD 档 / 可见 cell 子集）
-只能注册多份几何或 `truncate` + 重写索引。
+**实现事实**：`GeometryDraw` 增加 `range: Range<u32>` 与 `GeometryDraw::full`；引擎把 range 与块表求交后逐块产出绘制 op；三端 encoder 共享
+参数纯函数。
 
 ```rust
-// ── paint/primitive.rs（v2.1 新增字段；未实现） ──
+// paint/primitive.rs（已实现）
 pub struct GeometryDraw {
     pub id: GeometryId,
     pub transform: Transform,
     pub color: Color,
-    /// 索引**元素**区间（半开；`0..u32::MAX` = 整份）。空区间 = 不绘制。
+    /// 索引**元素**区间（半开；与 IndexType 无关，TriangleStrip 同样按索引计）。
+    /// 0..u32::MAX = 整份；空区间 / start >= end = 不绘制；超出 index_count 的一端由引擎 clamp。
     pub range: Range<u32>,
 }
 impl GeometryDraw {
-    /// 整份几何（现有所有构造点的迁移目标，range = 0..u32::MAX）。
-    pub fn full(id: GeometryId, transform: Transform, color: Color) -> Self;
+    pub fn full(id: GeometryId, transform: Transform, color: Color) -> Self;   // range = 0..u32::MAX
 }
+// paint/instance.rs（pub(crate)）
+pub(crate) fn draw_indexed_params(
+    first_index: u32, count: u32, uploaded_index_count: u32,
+) -> Result<DrawIndexedArgs, EngineError>;
 ```
 
 **语义**：
 
-- `range` 单位是**索引元素**（不是字节），与 `index_type`（U16/U32）无关；`TriangleStrip` 同样按索引计。
-- 引擎把 range 与块表求交：对每个相交块算 `draw = (first_index = max(range.start, chunk.index_first),
-  count = min(range.end, chunk.index_first + chunk.index_count) - first_index)`；**不相交的块不产生 op、不产生 lane 重建**。
-- `range.start >= index_count` 或 `start >= end` ⇒ 空绘制（无 op、无 damage、不标脏）。
-- 超出 `index_count` 的 `range.end` **clamp**（几何可能被 `truncate` 变短，不报错）。
-- damage = 相交块「旧 ∪ 新」AABB 经 per-draw 变换后的物理并集（与现有块 damage 同口径），并把 range 变化本身视为
-  「lane 重建 + damage」。
-- **三端同步消费**：Windows `render/windows/compositor.rs`（`GeometryRegistry`）、`render/macos/geometry.rs`、
-  `render/linux/geometry.rs` 与共享 `render/compositor.rs` 的块 draw 都必须用裁剪后的
-  `first_index/count`；`render/shaders/contract.md` 记录「range 是 CPU 侧裁剪，不进 `GpuPrimitive`」；**参数 golden** 增加一条
-  「裁剪后的 `DrawIndexed` 参数（first_index/count）三端一致」的零容差断言。
-- LOD 用法：应用注册多份几何（不同档）+ 用 range 选子区间；**不新增** LOD API。
+1. `range` 单位是**索引元素**（不是字节），与 `index_type`（U16/U32）无关；`TriangleStrip` 同样按索引计。
+2. **`TriangleList` 两端由引擎向下对齐到 3 的倍数**：`start = floor3(clamp(start))`、`end = floor3(clamp(end))`。三角形网格锚定在索引缓冲的 0 上，
+   块边界 `GEOMETRY_CHUNK_INDICES = 12288 = 4096 × 3` 也落在同一网格 ⇒ 逐块绘制与单次 `DrawIndexed` 画整段的像素结果等价；起点不在三角形
+   边界时最多多画起点之前的 2 个索引（**不会漏画、不会把后续三角形前移**），不足一个三角形的尾部不产生 draw。**`TriangleStrip` 是单块拓扑，
+   不截断**、按索引原样保留。复现例：`12286..12294`（跨块、start 非对齐）⇒ `12285..12294` 的 3 个三角形；`12287..12290` ⇒ `12285..12288`；
+   `1..4` ⇒ `0..3`；`0..10` ⇒ `0..9`；`1..2` ⇒ 空绘制。
+3. **与块表求交**：range 先 clamp 到 `index_count`，再对每个相交块算 `draw = (first_index = max(range.start, chunk.index_first),
+   count = min(range.end, chunk.index_first + chunk.index_count) − first_index)`；**不相交的块不产生 op、不重建 lane**。
+4. **空 / 越界**：`range.start >= index_count` 或 `start >= end` ⇒ 空绘制（无 op、无 damage、不标脏）；超出 `index_count` 的 `range.end`
+   **clamp**（几何可能被 `truncate_geometry` 变短，不报错）。
+5. **damage**：相交块「旧 ∪ 新」AABB 经 per-draw 变换后的物理并集（与现有块 damage 同口径），range 变化本身视为「lane 重建 + damage」。
+   **Canvas 内例外**：damage 粒度 = Canvas AABB（旧 ∪ 新），不是相交块粒度；前提 `Canvas.bounds ⊇ 内部图元可见 bounds`（§5.5 / §5.9）。
+6. **三端参数唯一来源**：`draw_indexed_params`（`pub(crate)`，`paint/instance.rs`）是**唯一**参数推导点：`first_index` / `count` /
+   `base_vertex = 0`；`count == 0`、越界、`first_index + count` 溢出返回 `EngineError::GeometryRegister`（不回绕）。三端 encoder 统一经
+   `GeometryDrawGpu::draw_indexed` 调用，不各自算 `range.end − range.start`。
+7. **LOD 用法**：应用注册多份几何（不同档）+ 用 range 选子区间；**不新增** LOD API。
+8. **契约**：`render/shaders/contract.md` 记录「range 是 CPU 侧裁剪，不进 `GpuPrimitive`」；三端 shader / 顶点布局 / uniform 不变。
+9. **像素覆盖口径**：本批不新增 L3 的「同几何不同 range」像素 golden —— 由参数单测（三端共享）+ Windows WARP 子区间像素测试承担；
+   如需 L3 场景由后续集成批补（豁免条款，不是已交付能力）。
 
-**不变量影响**：**I2 ⚠️ 唯一契约变更点**（三端 encoder + `contract.md` + 参数 golden 同批）；I4 ✅（GPU 资源与页级上传不变，
-range 只改 draw 参数）；I8 ⚠️（若 range 导致可见三角形集合变化，视觉 golden 需覆盖「同几何不同 range」的 case）。
+**不变量影响**：**I2 ⚠️ 唯一契约变更点**（已按准入规则同批交付：三端 encoder + `contract.md` + 参数单测/WARP 测试）；I4 ✅（GPU 资源与
+页级上传不变，range 只改 draw 参数）；I8 ⚠️（同几何不同 range 的可见三角形集合变化由 WARP 像素测试覆盖；L3 场景见第 9 条）。
 
-**测试要求**：L0 —— range × chunk 求交纯函数（含边界：正好在块边界、单块内、跨块、空、越界 clamp）。L1/L2 ——
-`RenderedFrame.primitives` 的 `PrimitiveKind::Geometry` bounds == 相交块 AABB 并集；几何 op 数 = 相交块数；
-空 range 时该节点无几何 op 且无 damage。L3 —— golden 增加「同几何、不同 range」对照（像素完全相同于「只注册该子区间」的等价场景）。
+**测试面**：L0 —— `unaligned_start_crossing_chunks_keeps_the_global_triangle_grid`；`triangle_list_alignment_is_a_production_clamp`；
+`draw_indexed_params_passes_through_the_clipped_range` / `..._rejects_empty_count` / `..._rejects_out_of_bounds_ranges` /
+`..._rejects_overflowing_ranges` / `..._always_uses_zero_base_vertex`。L1/L2 —— 几何 op 数 = 相交块数；空 range 时该节点无几何 op 且无 damage；
+`canvas_geometry_range_change_reencodes_and_damages_locally`（旧 ∪ 新两侧断言）。WARP 像素 ——
+`geometry_subrange_draws_only_the_selected_triangles`（真 GPU，`range 3..6` 只画第二个三角形）。
 
-### 11.5 E5 · `text_byte_index_at`：点 → 字节索引（`v2.1 新增规格`，量级 S，P1-E5）
+### 11.5 E5 · `Window::text_byte_index_at`：点 → 字节索引（已实现，量级 S，P1-E5）
 
-**现状与缺口**：只有 byte → rect（`NodeTree::text_caret_rect` / `text_selection_rects`），**没有**反向；点选光标 / 选区锚点只能二分
-逼近（hack）。编辑状态机本身可应用层自建（`drain_events` 已交付 `Text` / `ImeEvent`），本项只补这一个原语。
+**实现事实**：`Window::text_byte_index_at` 落地；底层算法在 `NodeTree::text_byte_index_at`（`pub(crate)`），`Window` 层只做
+`content_offset`（border + padding）换算的薄委托；断行 / 对齐在快照的 parley 布局上就地重排（与 `text_caret_rect` / `selection_rects`
+同一路径）。
 
 ```rust
 impl Window {
@@ -2750,41 +2943,61 @@ impl Window {
 
 **语义**：
 
-- 输入是节点 **border box 局部坐标**；引擎内部减去 `content_offset` 得到文本盒局部坐标（与 `NodeTree::text_caret_rect` 同域）。
-  注意 `Window::text_caret_rect` 返回的是**窗口绝对坐标**（已加 border box 原点、内容偏移与祖先滚动偏移），**不能**直接作为本方法入参。
-- **clamp**：点落在文本盒外时返回最近边界 —— 在盒上方取 `0`、下方取 `text.len()`；同一行内取该行首/行尾（水平越界）。
-- 返回索引**保证落在 char boundary**（parley `Cursor::from_point` → byte index，再按 char boundary 收敛）；空文本返回 `0`。
-- 只读：不登记依赖、不改任何状态（I6）。
+1. **坐标域**：入参 = 节点 border box 局部坐标（`HitResult.local_point` 同域）；引擎减去内容偏移后进入文本盒局部坐标（与
+   `NodeTree::text_caret_rect` 输出同域）。`Window::text_caret_rect` 返回窗口绝对坐标（含滚动），**不能**直接作为本方法入参。
+2. **命中**：parley `Cursor::from_point(layout, x, y)`，在与 `text_caret_rect` 完全相同的 `break_and_align(width, alignment)` 断行 / 对齐
+   状态上取点，再按 char boundary 收敛；bidi / 连字 / emoji ZWJ 等字素簇边界全部由 parley 决定，引擎不假设单 run、不假设 LTR。
+3. **clamp 精确式**：`y < 0 → 0`；`y > layout.height() → text.len()`（`y == 0` / `y == height` 视为盒内，走行命中）；同一行内水平越界由
+   `Cursor::from_point` 收敛到该行首 / 行尾（半簇取整）；空文本恒 `0`。**不做**整体性水平预 clamp（多行时不能拿整段 `0 / len` 代替行首尾）。
+   「文本盒」= **shaping 结果的布局盒**（宽 = 断行后的 `Layout::width`，高 = `Layout::height`），不是节点 border / content box。
+4. **就绪判据（否则 `StaleNode`）**：`NodeKind::Text` + `TextSlot` 存在 + `ShapedLine` 存在 + 快照文本 / 样式 + **富文本 runs** / 行内盒与
+   当前 `TextContent` 一致 + `laid_width_bits == expected_layout_width`（与最近一次文本 pass 的断行宽度一致）。原因：点 → 字节必须与最近一次
+   文本 pass 的断行宽度一致，否则 caret 几何与命中会错位；「内容 / 样式 / runs / 行内盒 / 断行宽度在文本 pass 之后又变了」也返回
+   `StaleNode`（等下一帧再查，不返回旧快照算出的索引）。图集满导致的 `laid_generation`「待重排」哨兵**不影响**本 API —— 几何 / 断行未变时
+   照常可用（E5 §4 的软失败口径）。
+5. **错误**：全部为 `EngineError::StaleNode { node }`（复用既有变体）：① 节点不存在 / 已卸载；② 不是 `NodeKind::Text`；③ 文本尚未 shape /
+   `ShapedLine` 尚未重建；④ 内容 / 样式 / runs / 行内盒 / 断行宽度在该次 shape 之后变了。**不 panic**。该变体的 Display 同时覆盖
+   「不能作为文本命中目标」；`text_caret_rect` 对同一批前置条件返回 `TextShape`，应用需要两套错误处理。
+6. **快速路径**：数字快速路径（`DigitFastPath`，单行 ASCII，无 parley 布局）同样实现本 API：x 先减 `simple_alignment_offset`（与
+   `caret_rect` 同一函数），再按「半簇取整」解析；垂直 clamp 用 `line_height`；越界由首/尾簇收敛到 `0 / len`。两条路径对应用可见的语义一致。
+7. **bidi 往返容差**：返回 parley `Cursor::from_point` 的**最近簇边界**、不带 affinity；bidi 重排后同一视觉 x 可对应两个逻辑边界
+   （RTL run 端点 / bidi-neutral 空格邻接）。因此往返口径是「点在 caret 的**精确边界 x** 时，返回共享该视觉位置的某个逻辑边界」，
+   即返回值满足 `text_caret_rect(idx).origin.x`（或其 Upstream affinity 几何）与入参 x 相同；`caret.center()` 的 ±0.5px 往返只适用于
+   单 run LTR / 纯 RTL 段落，跨 run 时允许相邻逻辑边界。需要逐字符精确 bidi 选择 UI 时，应用应使用 `text_selection_rects` / affinity 语义，
+   而不是本 API（本 API 无 affinity）。
+8. **max_lines / ellipsis 命中范围**：命中 = **未截断**的 shaping 布局（`layout.height()` / 完整行集合），被截断 / 省略号区域的视觉裁剪由
+   调用方用节点盒 / `max_lines` 处理；与既有 `text_caret_rect` / `selection_rects` 同口径。若未来改为 visible 高度 clamp，必须**同时**改
+   `caret_rect` / `selection_rects`，不能只改命中。
+9. **只读（I6）**：`&self` 全链路；不登记依赖、不标脏、不请求帧；`with_broken_layout` 写 parley 布局的断行 / 对齐 memo（与既有
+   `text_caret_rect` 完全一致），不产生引擎可观测状态。
+10. **不新增辅助公开面**：没有 `text_inline_box_at` 之类 API；应用可用本方法拿字节索引后，结合 `TextContent.inline_boxes` 的 index 范围
+    自行判定行内盒命中（E2b 候选见 §11.2）。
 
-**错误**：`EngineError::StaleNode { node }`（复用既有变体，语义 =「该节点不能作为文本命中目标」：节点不存在 / 不是 `NodeKind::Text` /
-尚无 `ShapedLine`）。
+**不变量影响**：I6 ✅（只读）；I11 ✅（逻辑像素入参）；无新状态、**不新增错误变体**。
 
-**不变量影响**：I6 ✅（只读）；I11 ✅（逻辑像素入参）；无新状态。
+**测试面**：L1 —— 单行 LTR 每个 caret 中心往返；盒外四方向 clamp；多行取最近行（每行行首 + 行间点）；显式换行 → 下一行行首；
+CJK 3 字节（中点吸附 + 全行扫描不越 char boundary）；emoji（ZWJ 多码元簇）；空文本 → 0；多行逐行水平 clamp；纯 RTL / LTR 内 RTL run /
+RTL 跨 run（精确边界 → 同视觉位置 + 视觉反转断言，不用 `center()`）；数字快速路径（往返 + clamp + Center/Right 对齐）；
+四条就绪判据各一反例（文本 / 样式 / 行内盒 / 断行宽度改后 → `StaleNode`，下一帧恢复）；只读性（帧请求数 / 脏位 / `has_paint_work` 不变）。
+守护用例：`byte_index_at_clamps_points_outside_the_text_box`、`text_byte_index_at_clamps_in_border_box_local_coordinates`、
+`text_byte_index_at_rejects_layout_width_changed_after_the_text_pass`、`text_byte_index_at_guards_the_numeric_fast_path_alignment_offset`。
 
-**测试要求**：L1 —— 行内点 → 期望字节；行间点 → 最近行；盒外四方向 → clamp（0 / len / 行首 / 行尾）；CJK（3 字节）、emoji（4 字节 +
-ZWJ 序列）、bidi 文本；空文本 → 0。**往返一致**：`text_caret_rect` 返回窗口绝对坐标（含滚动偏移），测试必须先把它换成
-目标节点的 border box 局部坐标 —— `let p = text_caret_rect(node, i)?.center(); let local = window.tree().hit_test(p)?.local_point;`
-然后 `text_byte_index_at(node, local) ≈ i`（对若干 i 抽样；fixture 需保证该点未被其它节点遮挡）。
+### 11.6 E6 · Windows chrome + macOS 交通灯（已实现，量级 M，P1-E6）
 
-### 11.6 E6 · Windows chrome + macOS 交通灯（`v2.1 新增规格`，量级 M，P1-E6）
-
-**现状与缺口**（逐项事实）：Windows 强制系统标题栏（`WS_OVERLAPPEDWINDOW`，`WM_NCCALCSIZE` 交 `DefWindowProcW`）；
-`WindowOptions` 无 `icon` / `decorations`；`hIcon: HICON::default()`；无运行时 `set_title`；`WindowControl` / `WindowState` /
-`App::request_window_control` **仅 `cfg(target_os = "linux")`**；`platform/menu.rs` 全 `pub(crate)`。macOS 已是「透明标题栏 + 原生
-交通灯浮在内容上」，但**交通灯位置不可配**。
+**实现事实**：Windows 支持 `Decorations::None` frameless + 引擎接管非客户区；`WindowOptions::{decorations, icon}`、`App::{set_title,
+request_window_control, set_traffic_light_position, traffic_light_inset}`、三端 `WindowControl` / `WindowState` / `WindowResizeEdge` 已落地。
+平台能力差异以 **§8.6.1 的权威表**为准（全屏不支持 / Snap Layouts 未实现 / mac·Linux 降级都在那里逐行登记）。
 
 ```rust
-// ── window.rs（v2.1 新增/扩展；未实现） ──
-pub enum Decorations { Native, None }     // **数据枚举**，不是扩展点（I14）
+// window.rs（已实现）
+pub enum Decorations { Native, None }     // 数据枚举，不是扩展点（I14）
 
 pub struct WindowOptions {
-    // 现有 10 字段（title / size / position / min_size / max_size / owner / modal /
-    //   always_on_top / scale / background）
-    pub decorations: Decorations,        // v2.1 新增；默认 Native
-    pub icon: Option<Bytes>,             // v2.1 新增：窗口/任务栏图标（PNG 或 ICO 字节）
+    // 既有字段：title / size / position / min_size / max_size / owner / modal / always_on_top / scale / background
+    pub decorations: Decorations,        // 默认 Native
+    pub icon: Option<Bytes>,             // PNG 或 ICO 字节；仅 Windows 生效（mac/Linux 文档化降级）
 }
 
-// WindowControl / WindowState **去掉 cfg(target_os = "linux")**（三端可见）
 pub enum WindowControl { Minimize, ToggleMaximize, ToggleFullscreen, BeginMove, BeginResize(WindowResizeEdge) }
 pub struct WindowState {
     pub client_decoration: bool,
@@ -2797,57 +3010,78 @@ pub struct WindowState {
 
 impl App {
     pub fn set_title(&mut self, window: WindowId, title: SmolStr) -> Result<(), EngineError>;
-    pub fn request_window_control(&mut self, window: WindowId, control: WindowControl)
-        -> Result<(), EngineError>;      // 去掉 cfg(linux)
-    /// macOS 专用（其它端返回 UnsupportedWindowCapability，不静默）
+    pub fn request_window_control(&mut self, window: WindowId, control: WindowControl) -> Result<(), EngineError>;
+    /// macOS 专用（其它端返回 UnsupportedWindowCapability，不静默）。
     pub fn set_traffic_light_position(&mut self, window: WindowId, inset: Point) -> Result<(), EngineError>;
-    /// macOS 专用只读查询（`v2.1 新增规格`，归属 `App`，与 setter 同层）：交通灯占用的安全区 inset
+    /// macOS 专用只读查询（归属 App，与 setter 同层）；非 macOS / 原生全屏隐藏 / 未知窗口 ⇒ None。
     pub fn traffic_light_inset(&self, window: WindowId) -> Option<Point>;
 }
-impl Window { pub fn state(&self) -> WindowState; }   // 三端都有（Linux 现已实现，Win/mac 由本条补齐）
+impl Window { pub fn state(&self) -> WindowState; }   // 三端都有
 ```
 
-`WindowState.client_decoration` 的**三端语义（E6 统一）**：`true` = 窗口装饰由应用自绘（Linux compositor 要求 CSD；
-Windows `Decorations::None`）；`false` = 系统装饰（Linux compositor 要求 SSD；Windows `Decorations::Native`；macOS 恒 `false`
-—— 原生交通灯 + 透明标题栏由系统绘制，应用只按 `traffic_light_inset` 留白）。
+**`WindowState.client_decoration` 的三端语义**：`true` = 窗口装饰由应用自绘（Linux compositor 要求 CSD；Windows `Decorations::None`）；
+`false` = 系统装饰（Linux compositor 要求 SSD；Windows `Decorations::Native`；macOS **恒 `false`** —— 原生交通灯 + 透明标题栏由系统绘制，
+应用只按 `traffic_light_inset` 留白）。`WindowState::for_decorations` 的建窗初值：Windows `can_fullscreen == false`（无全屏控制，避免首轮
+`sync_chrome` 校正产生多余状态变化 + 根 PAINT）；macOS `client_decoration` 恒 `false`。
 
 **Windows 实现要点（`Decorations::None`）**：
 
 - `CreateWindowExW` 仍带 `WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME`（保留系统手势的入场券），
-  **`WM_NCCALCSIZE` 在 `wparam == TRUE` 时返回 0** 把客户区扩到整个窗口；**最大化时必须补偿边框**（`AdjustWindowRectExForDpi` /
-  `GetSystemMetrics(SM_CXSIZEFRAME) + SM_CXPADDEDBORDER`，按 DPI），否则最大化后内容被裁 1–8 px。
-- **`WM_NCHITTEST` 八边 + 四角**：按 DPI 换算的 `SM_CXSIZEFRAME + SM_CXPADDEDBORDER` 计算命中带，返回 `HTLEFT/HTRIGHT/HTTOP/
-  HTTOPLEFT/…`；再判应用声明的拖动区（§8.6.2）→ `HTCAPTION`；其余 `HTCLIENT`。**不得**把 captions 逻辑交给 `DefWindowProcW`
-  （frameless 下客户区已铺满，`DefWindowProcW` 会返回 `HTCLIENT` 而吃掉系统手势）。
-- **保留系统语义**：`WM_NCLBUTTONDOWN` 的 move/size 模态循环不改写（`HTCAPTION` 由系统处理 → Aero Snap / Snap Layouts /
-  双击最大化 / `Alt+Space` 全部保留）；`DWM` 阴影与圆角用 `DwmExtendFrameIntoClientArea` / `DWMWA_WINDOW_CORNER_PREFERENCE`。
+  `WM_NCCALCSIZE` 在 `wParam == TRUE` 时返回 0 把客户区扩到整个窗口，`wParam == FALSE` 变体交 `DefWindowProcW`（与 Raymond Chen
+  custom-frame / Electron `NativeWindowViews` 同构）；**最大化补偿** = `GetSystemMetricsForDpi(SM_CXSIZEFRAME) + SM_CXPADDEDBORDER`
+  （按窗口 DPI），`WM_NCCALCSIZE` 与 `WM_NCHITTEST` **共用同一个值**；`AdjustWindowRectExForDpi` 只用于 `Decorations::Native` 的外框换算。
+- **`WM_NCHITTEST` 八边 + 四角**：按 DPI 换算的 `SM_CXSIZEFRAME + SM_CXPADDEDBORDER` 计算命中带，返回 `HTLEFT/HTRIGHT/HTTOP/HTTOPLEFT/…`；
+  再判应用声明的拖动区（§8.6.2）→ `HTCAPTION`；其余 `HTCLIENT`。**不得**把 captions 逻辑交给 `DefWindowProcW`（frameless 下客户区已铺满，
+  `DefWindowProcW` 会返回 `HTCLIENT` 而吃掉系统手势）。
+- **`WM_SIZE` 不重算 `resize_border` / 拖动区**：`resize_border` 在 `WM_DPICHANGED`（`note_dpi`）重算；拖动区由泵每轮 `sync_drag_regions`
+  对账；`WM_SIZE` 只置 `chrome_dirty`（下一轮泵 `sync_chrome` 读 `IsZoomed` 写回 `WindowState`）。
+- **DWM**：只用 `DWMWA_WINDOW_CORNER_PREFERENCE`（圆角偏好），**不使用** `DwmExtendFrameIntoClientArea`（客户区每个像素由
+  DirectComposition 提供，扩展 frame 会让 DWM 把边框叠在内容上）。
+- **控制同帧闭环**：应用控制请求执行后，同一轮补收一次平台事件（`WM_SIZE` 的客户区）再对账 chrome —— 否则最大化 / 还原各出现
+  ≈1 帧「新状态 + 旧客户区尺寸」画面。L1 验收：控制后首帧 `WindowState.maximized` 与 `Window::size()` 必须同时是新值。
 - `WindowState.maximized` ← `IsZoomed(hwnd)`；`ToggleMaximize` → `ShowWindow(SW_MAXIMIZE / SW_RESTORE)`；`Minimize` → `SW_MINIMIZE`；
-  `WM_SIZE` 里重算 resize border / 拖动区命中缓存。状态变化时给窗口根节点标 `PAINT` + 请求一帧（I3）。
-- `set_title` → `SetWindowTextW`；`icon` → `WM_SETICON`（`ICON_BIG` + `ICON_SMALL`，由 `Bytes` 解码为 BGRA 后
-  `CreateIconIndirect`/`CreateIconFromResourceEx`）。
+  `ToggleFullscreen` / `BeginMove` / `BeginResize` ⇒ `UnsupportedWindowCapability`（capability 名分别为
+  `"fullscreen window control"` / `"interactive move window control"` / `"interactive resize window control"`）。
+- `set_title` → `SetWindowTextW`；`icon` → `WM_SETICON(ICON_BIG | ICON_SMALL)`（PNG/ICO 解码为 BGRA 后 `CreateIconIndirect` /
+  `CreateIconFromResourceEx`；单边上限 1024 px 是引擎内部常量 `window::MAX_WINDOW_ICON_DIM`（`pub(crate)`），超出 ⇒
+  `EngineError::WindowIcon { window, cause: WindowIconCause::TooLarge { width, height } }`，不静默裁剪）。
 - **Win11 build ≥ 22000 硬门禁不变**（`platform/windows/version.rs`：`RtlGetVersion` + `satisfies(major >= 10 && build >= 22_000)`）。
 
-**macOS 实现要点**：`set_title` → `NSWindow.setTitle:`；`icon` **无任务栏等价物**（Dock 图标是 app 级）⇒ 文档化降级；
-`set_traffic_light_position` → 调整三个 `standardWindowButton` 的 `frame.origin`（保持标题栏透明+标题隐藏时仍可点）；
-`App::traffic_light_inset` 返回同一几何的只读值（应用据此留白，不需要自己猜）；`WindowState.maximized` ← `isZoomed`、
-`fullscreen` ← `styleMask.contains(.fullScreen)`。
+**macOS 实现要点**：`set_title` → `NSWindow.setTitle:`；`icon` 无任务栏等价物（Dock 图标是 app 级）⇒ 文档化降级；`Decorations::None`
+保留原生交通灯、`client_decoration` 恒 `false` ⇒ 文档化降级；`set_traffic_light_position` 调整三个 `standardWindowButton` 的
+`frame.origin`（保持标题栏透明 + 标题隐藏时仍可点），**set-once**：首次生效后运行期再次调用返回 `Ok(())`、不唤醒泵；AppKit 在
+resize / 全屏转场后的重排**不追回**，改回 `None` 不可撤销（引擎不保存系统默认布局副本）；`traffic_light_inset` 是只读缓存回报
+（首次 / 位置应用后 / 全屏边沿 / 上次取到无效值时重算；稳态每轮 0 次 `standardWindowButton:` + `convertRect:toView:`；
+原生全屏下 `None`）；`WindowState.maximized` ← `isZoomed`、`fullscreen` ← `styleMask.contains(.fullScreen)`。跨端可测降级逻辑抽在
+`platform/macos_chrome.rs` 的纯函数（`traffic_light_inset` / `traffic_light_position_to_apply` / `should_refresh_traffic_light_inset`）。
 
-**Linux 实现要点**：现有能力**对齐**即可（`WindowControl` / `WindowState` / `request_window_control` 已实现）；
-`set_title` → `xdg_toplevel.set_title`；`icon` → 无等价协议 ⇒ 文档化降级（`set_app_id` 是另一件事）。
+**Linux 实现要点**：现有能力对齐（`WindowControl` / `WindowState` / `request_window_control` 已实现）；`set_title` →
+`xdg_toplevel.set_title`（双缓冲，随 commit 生效）；`icon` 无等价协议 ⇒ 文档化降级（`set_app_id` 是另一件事）；`Decorations::None`
+与 `Native` 的协议请求相同（CSD surface 本来铺满），最终模式以 compositor `configure` 为准；`Minimize` / `ToggleMaximize` /
+`ToggleFullscreen` 走 `xdg_toplevel`，`BeginMove` / `BeginResize` 用最近一次指针按键的 serial。
 
-**错误**（新增变体）：`EngineError::UnsupportedWindowCapability { window: WindowId, capability: &'static str }` —— 平台无等价能力且
-**不允许静默降级**时返回（I10）。已有 `UnknownWindow { window }`。
+**错误**：
 
-**不变量影响**：**I9 ✅（关键）**——应用只见 `Decorations` / `icon` / `WindowControl` / `WindowState` / `set_title`，`HWND` / `NSWindow`
-不出引擎；**I14 ✅**——三端各自实现，不引入可插拔窗口装饰 trait；**I10 ⚠️**——mac/Linux 无 frameless / 图标的等价物时必须走
-`UnsupportedWindowCapability` 或文档化降级；**I3 ✅**——状态变化用「标 PAINT + 请求帧」通知。
+| 变体 | 触发 |
+|---|---|
+| `EngineError::UnsupportedWindowCapability { window, capability: &'static str }` | 平台无等价能力且不允许静默降级（Windows 全屏 / 程序化 move·resize；macOS 程序化 move·resize；非 macOS 的交通灯位置） |
+| `EngineError::WindowIcon { window, cause: WindowIconCause }` | 建窗图标字节非法（`WindowIconCause::{UnsupportedFormat, DecodeFailed, TooLarge { width, height }}`）；只在提供 `icon` 时可能发生 |
+| `EngineError::UnknownWindow { window }` | 窗口不存在 / 已关闭（所有 E6 运行时入口） |
 
-**风险与验收**：这是本清单**唯一有平台回归风险**的项 —— `WM_NCCALCSIZE` 自算 resize border 与 Snap / DWM / 混合 DPI / 最大化边框
-必须**在 Win11 真机**验证（L5，不能用软件设备代替）。L1 断言：`WindowState` 在最大化/还原后正确、`set_title` 后回读一致、
-`Decorations::None` 下拖动区命中 `HTCAPTION`（`SendMessageW(WM_NCHITTEST)` 的既有测试模式可复用）。L5 实机矩阵：显示器拔插 /
-混合 DPI 跨屏拖动 / Snap Layouts / 系统菜单 / 全屏进出 / 任务栏图标。
+**不变量影响**：**I9 ✅**（应用只见 `Decorations` / `icon` / `WindowControl` / `WindowState` / `set_title`；`HWND` / `NSWindow` 不出引擎）；
+**I14 ✅**（三端各自实现，不引入可插拔窗口装饰 trait）；**I10 ✅**（不支持 ⇒ 强类型错误或 §8.6.1 的文档化降级，不静默假装成功）；
+**I3 ✅**（状态变化用「标 PAINT + 请求帧」通知）。
 
-### 11.7 明确**不**进本批的引擎扩展（避免范围膨胀）
+**测试面**：L1 —— `decorations_drive_the_initial_client_decoration_state`（Windows `can_fullscreen=false` 初值 / mac `client_decoration`
+恒 false）；`wm_size_marks_chrome_dirty_for_the_next_sync`；`maximizing_a_window_reports_the_state_through_sync_chrome`；
+`the_pump_consumes_the_control_wm_size_before_reconciling_chrome`（控制 → `collect_events` → `sync_chrome` 的源码级接线断言）；
+`maximized_inset_matches_the_work_area_at_every_dpi`（96/120/144/192）；`dpi::tests::the_frameless_resize_border_is_dpi_scaled_and_positive`；
+macOS 纯函数 `traffic_light_position_applies_once_and_never_rolls_back` / 安全区刷新决策单测。L5 真机 ——
+`platform::windows::window::tests::a_maximized_frameless_window_matches_the_work_area`（`ShowWindow(SW_MAXIMIZE)` 后
+`GetClientRect == GetMonitorInfoW(rcWork)` 逐像素相等；125% DPI 实测客户区 3840×2100 物理 == 工作区，窗口 3858×2118）；
+`frameless_smoke` example 自检；八向命中 / 拖动区 `HTCAPTION`（`SendMessageW(WM_NCHITTEST)`）。**真机覆盖与残余见 §11.8**。
+
+### 11.7 明确**不**进 E1–E6 的引擎扩展（范围基线）
 
 `08-gap-verification.md` §2.4 的「可选增量」**全部不进 E1–E6**，只登记（应用层绕行已够，或收益/成本不划算）：
 
@@ -2862,12 +3096,27 @@ Windows `Decorations::None`）；`false` = 系统装饰（Linux compositor 要�
 | `open_url` | 不做；应用层 `std::process::Command` |
 | SVG 光栅化进引擎 | **不做**；应用层构建期转换（§8.5） |
 
+### 11.8 已接受残余与限制（v2.2 单列）
+
+以下条目**不是已交付能力**；引用 / 审查时按「已知限制」处理，不得写成已实现：
+
+| # | 残余 / 限制 | 内容与影响 | 处置 |
+|---|---|---|---|
+| R-11 | `AtlasTile.slot_epoch` wrap | `slot_epoch` / `eviction_epoch` 是 `u32`；wrap 后理论上可能与 2^32 次分配前的身份相撞（实际不可达）。 | 接受；不修 |
+| R-12 | 图片图集未接编码期判活 | 编码期安全网只对 `GlyphRun` 逐 tile 判活；图片 tile 走 `ResourceImage.tile` 的「恒有效直到 unload」契约、图片页只回收空页 ⇒ Canvas 内 `Image` 不参与 `is_alive`。若未来图片 tile 改为可淘汰，必须同批接编码期判活。 | 接受；契约不变 |
+| R-13 | 真机 DPI 覆盖仅 125% | E6 只在 125% 真机做过带回读的冒烟；100% / 150% / 200% 与混合 DPI 跨屏由纯函数（96/120/144/192）覆盖。mac / Linux 仍只有编译门禁 + 平台无关纯函数单测（交通灯 AppKit 行为、Wayland 标题生效时点建议 P5 前各跑一次真机回读）。 | 接受；后续补真机矩阵 |
+| R-14 | Win11 Snap Layouts `HTMAXBUTTON` 未实现 | 自绘最大化按钮无法触发系统 Snap Layouts 悬停浮层；`WM_NCHITTEST` 只返回八向 `HT*` / `HTCAPTION` / `HTCLIENT`。Aero Snap（拖边）/ 双击最大化 / `Alt+Space` / 右键系统菜单仍由系统提供。 | 接受；后续增强批次 |
+| R-15 | Windows 全屏不支持 | `ToggleFullscreen` ⇒ `UnsupportedWindowCapability { capability: "fullscreen window control" }`；`WindowState.can_fullscreen == false` 初值。理由：kytrix 现有 UI 只有最小化/最大化/关闭（A4 证据）；`WS_POPUP` 独占全屏会改 Snap / DWM / 任务栏 / Alt+Tab 语义，需重新整轮真机验收。 | 用户裁决接受（Lead task-11）；后续如需独占全屏单独立批 |
+| R-16 | E2b 候选两项 | ① Canvas / standalone shaping 不绘制装饰与行内盒；② 节点文本路径的 InlineBox 命中只读访问面不存在（仅 standalone handle 路径可读落点）。 | 未实现，登记于 §11.2 |
+| R-17 | 合并提交不可单独构建（bisect 例外） | P1 各批以 merge 提交合入 `gui-engine-migration`，部分 merge 提交单独 checkout 不保证可构建（跨分支 crate / 特性依赖）。`git bisect` / 回溯以 batch 的**功能提交**为单位，不以 merge 提交为构建判据。 | 接受（流程例外） |
+| R-18 | `WM_NCCALCSIZE` `wParam == FALSE` 无测试 | 该变体交 `DefWindowProcW`（与成熟实现同构）；本仓无 `SWP_FRAMECHANGED` 运行期样式变更路径，风险低。若未来引入运行期样式变更需回归。 | 接受；登记 |
+
 ---
 
-## 附录 A：核心接口草图汇总（v2.1 起与 `crates/ui_core/src` 对齐）
+## 附录 A：核心接口草图汇总（v2.2 起与 `crates/ui_core/src` 对齐）
 
-> 本附录只列**已实现**的公开形状（摘录，不是全量；全量见 §1.3 与源码）。E1–E6 的新增 API **不在此处**，见 §11（避免把未实现
-> 能力混进「现在就能用」的清单）。
+> 本附录只列**已实现**的公开形状（摘录，不是全量；全量见 §1.3 与源码）。**E1–E6 的公开面同样已实现**，精确规格与签名见 §11
+> （本附录不重复，避免两处签名漂移）。
 
 ```rust
 // ── 应用启动（引擎自有事件循环；D8 检测在 platform_init 内） ──
@@ -3016,10 +3265,10 @@ impl TestApp {
 | `Path(Path)` | `bounds: Rect`、`geometry: GeometryId`、`fill: Color` | ✅ | geometry pipeline |
 | `Shadow(Shadow)` | `rect: Rect`（未偏移未模糊）、`offset: Point`、`blur: f32`（σ = blur/2）、`color: Color`、`corner_radius: [f32;4]` | ✅ | uber-quad |
 | `Clip(ClipOp)` | `Push(ClipRect { rect: Rect, corner_radius: [f32;4] })` / `Pop` | ✅ | uber-quad mask |
-| `Geometry(GeometryDraw)` | `id: GeometryId`、`transform: Transform`、`color: Color`（E4 起再加 `range: Range<u32>`） | ✅ | geometry（静态 VBO，按块 draw） |
+| `Geometry(GeometryDraw)` | `id: GeometryId`、`transform: Transform`、`color: Color`、`range: Range<u32>`（E4；`GeometryDraw::full()` = `0..u32::MAX`） | ✅ | geometry（静态 VBO，按块 draw；range 是 CPU 侧裁剪，§11.4） |
 | `Canvas(Arc<Canvas>)` | `Canvas { bounds: Rect, 私有 Lane }`：容器内是 8 类图元的序列（`Canvas::primitives()`） | ✅（逐个内部图元可见） | 展开为内部图元；**没有**「应用注册 pipeline」（§5.9） |
 
 > 坐标全为**绝对窗口逻辑像素**（`GeometryDraw.transform` 是唯一 per-primitive 变换）；`Primitive` 实测 `size_of == 80` B（软上限 128 B）。
 ---
 
-*文档完 · 本文描述 D1–D25 定案下的最终设计（v2.1）；已实现部分与 `crates/ui_core/src` 对齐，`v2.1 新增规格`（E1–E6，§11）尚未实现。*
+*文档完 · 本文描述 D1–D25 定案下的最终设计（v2.2）；已实现部分与 `crates/ui_core/src` 对齐，E1–E6（§11）已全部实现；E2b 候选（§11.2）与已接受残余（§11.8）明确标注为未实现/限制，不得当作已交付能力。*
