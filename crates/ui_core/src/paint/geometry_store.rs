@@ -506,10 +506,10 @@ impl GeometryStore {
         truncate_pages(&record.index, &mut record.index_pages);
         // 2) 块表：块数只减。先按**旧**块表算 damage（被移除块的旧 AABB）。
         let wanted = chunk_count(record.layout.topology, indices);
-        let previous_chunks = record.chunks.len();
         let mut damaged = Rect::default();
-        for chunk in wanted as usize..previous_chunks {
-            damaged = damaged.union(record.chunks[chunk].bounds);
+        // `wanted <= 旧块数`（截断只减），所以后缀就是被移除的块。
+        for removed in &record.chunks[wanted as usize..] {
+            damaged = damaged.union(removed.bounds);
         }
         self.revision += 1;
         let revision = self.revision;

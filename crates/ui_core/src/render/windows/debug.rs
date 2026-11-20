@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[cfg(debug_assertions)]
 use windows::Win32::Graphics::Direct3D12::*;
+#[cfg(debug_assertions)]
 use windows::core::Interface;
 
 /// InfoQueue 里我们关心的三类消息的累计计数（进程级）。
