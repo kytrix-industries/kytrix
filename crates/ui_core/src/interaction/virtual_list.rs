@@ -125,6 +125,12 @@ pub(crate) fn offset_anchor(slot: &VirtualSlot, offset: f32) -> (usize, f32) {
     }
     match slot.active_extents() {
         Some(_) => {
+            // 全零内容（尚未测量 / 全部折叠）没有可分辨的锚点：所有 top 并列 0，
+            // `partition_point` 会选到末项，首次拿到真实行高时视图从顶部跳到底部。
+            // 与 `visible_range_extents` 的零内容早返回同口径 ⇒ 固定 (0, 0)。
+            if slot.prefix()[slot.count] <= 0.0 {
+                return (0, 0.0);
+            }
             let tops = &slot.prefix()[..slot.count];
             let first = tops
                 .partition_point(|top| *top <= offset)
@@ -310,6 +316,19 @@ mod tests {
             "越界锚点退到末项"
         );
         assert_eq!(offset_for_anchor(&slot(20.0, 0, 0, None), 5, 10.0), 0.0);
+    }
+
+    /// F1 回归：全零内容（未测量 / 全折叠）没有可分辨的锚点 ⇒ 固定 (0,0)，不得选到末项。
+    #[test]
+    fn a_zero_content_list_anchors_at_the_top() {
+        let folded = slot(10.0, 10, 0, Some(vec![0.0; 10]));
+        assert_eq!(content_height(&folded), 0.0);
+        assert_eq!(offset_anchor(&folded, 0.0), (0, 0.0));
+        assert_eq!(offset_for_anchor(&folded, 0, 0.0), 0.0);
+        // 拿到真实行高后从 (0, 0) 反算仍是顶部（修复前零高并列会让锚点落到末项 ⇒ 900）。
+        let mut measured = slot(10.0, 10, 0, None);
+        measured.set_extents(vec![100.0; 10].into_boxed_slice());
+        assert_eq!(offset_for_anchor(&measured, 0, 0.0), 0.0);
     }
 
     #[test]

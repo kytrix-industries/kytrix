@@ -31,7 +31,7 @@ use crate::{
 /// [`App::set_virtual_extents`] 整体替换。
 ///
 /// # Errors
-/// `StaleNode` / `NotVirtualList` / `InvalidVirtualExtent`（预置行高非有限或为负）。
+/// `StaleNode` / `NotVirtualList` / `InvalidVirtualExtent`（预置行高非有限、为负或累计溢出）。
 /// 消费者：`App::make_virtual_list`。
 pub(crate) fn make_virtual_list(
     app: &mut App,
@@ -76,6 +76,7 @@ pub(crate) fn make_virtual_list(
 /// 条目数变化时若旧逐项高度长度不符：先把旧锚点（旧 prefix 的 first + 行内偏移）按新条目数
 /// clamp 并回落到单一 `extent`，再丢弃旧高度（§11.3：count 由本方法决定、不在
 /// `set_virtual_extents` 里改变；应用随后应调用 `set_virtual_extents` 提供新高度）。
+/// 回落时**已挂载行同步按 `extent` 重排**，不会把旧逐项布局的 top/height 留到中间帧。
 ///
 /// # Errors
 /// `NotVirtualList`（未 `make_virtual_list`）。
@@ -103,7 +104,7 @@ pub(crate) fn set_virtual_items(
     let viewport_width = scroll::viewport(target.tree(), node).size.width;
     let anchor = virtual_list::offset_anchor(slot, offset);
     // 写侧：条目数 / 行工厂 / a11y 集合总数；旧逐项高度失效时锚点补偿。
-    let anchored = {
+    let (anchored, extents_dropped) = {
         let Some(target) = app.windows.get_mut(&window) else {
             return Ok(());
         };
@@ -111,6 +112,7 @@ pub(crate) fn set_virtual_items(
             return Err(EngineError::NotVirtualList { node });
         };
         let mut anchored = None;
+        let mut extents_dropped = false;
         if slot
             .extents
             .as_deref()
@@ -118,6 +120,7 @@ pub(crate) fn set_virtual_items(
         {
             slot.clear_extents();
             slot.count = count;
+            extents_dropped = true;
             if count != old_count {
                 anchored = Some(virtual_list::offset_for_anchor(slot, anchor.0, anchor.1));
             }
@@ -132,7 +135,7 @@ pub(crate) fn set_virtual_items(
         {
             scroll.content = Size::new(viewport_width, content);
         }
-        anchored
+        (anchored, extents_dropped)
     };
     // 锚点补偿走唯一偏移写点（clamp / damage / a11y / 取消滚轮动画都在 `scroll_to` 里）；
     // 与重建窗口同批 ⇒ 条目数变化最多唤醒一帧（I3）。
@@ -146,6 +149,11 @@ pub(crate) fn set_virtual_items(
             )?;
         }
         app.rewindow_virtual(window, node);
+        // 逐项高度被丢弃 ⇒ 已挂载行必须按单一 `extent` 同步重排：只重建可见窗口会留下
+        // 旧逐项布局的 top/height，中间帧把可见行画到视口外（列表空白，F2）。
+        if extents_dropped {
+            reposition_mounted_rows(app, window, node);
+        }
         Ok(())
     })
 }
@@ -303,7 +311,7 @@ pub(crate) fn rewindow_virtual(app: &mut App, window: WindowId, node: NodeId) {
 ///
 /// # Errors
 /// `NotVirtualList`（list 失效 / 未 `make_virtual_list`）、`VirtualListExtents`
-/// （长度与条目数不符）、`InvalidVirtualExtent`（逐项高度非有限或为负）。
+/// （长度与条目数不符）、`InvalidVirtualExtent`（逐项高度非有限、为负或累计溢出）。
 /// 消费者：`App::set_virtual_extents`。
 pub(crate) fn set_virtual_extents(
     app: &mut App,
@@ -380,12 +388,20 @@ fn apply_virtual_extents(
     }
     app.rewindow_virtual(window, node);
     // 受影响行：top/height 与新前缀不一致的已挂载行标 `LAYOUT|PAINT`（同一棵 taffy 树）。
+    reposition_mounted_rows(app, window, node);
+    Ok(())
+}
+
+/// 已挂载行按当前生效行布局重排（只对几何真的变化的行调 `set_virtual_row`）。
+///
+/// 两处调用：`set_virtual_extents`（新 prefix）与 `set_virtual_items` 丢弃逐项高度后的回落。
+fn reposition_mounted_rows(app: &mut App, window: WindowId, node: NodeId) {
     let rows: Vec<(NodeId, f32, f32)> = {
         let Some(target) = app.windows.get(&window) else {
-            return Ok(());
+            return;
         };
         let Some(slot) = target.tree().virtual_slot(node) else {
-            return Ok(());
+            return;
         };
         slot.mounted
             .iter()
@@ -395,20 +411,19 @@ fn apply_virtual_extents(
             })
             .collect()
     };
-    let mut rows_moved = false;
+    let mut moved = false;
     if let Some(target) = app.windows.get_mut(&window) {
         for (row, top, height) in rows {
             if row_matches(target.tree(), row, top, height) {
                 continue;
             }
             target.tree_mut().set_virtual_row(row, top, height);
-            rows_moved = true;
+            moved = true;
         }
     }
-    if rows_moved {
+    if moved {
         app.request_frame();
     }
-    Ok(())
 }
 
 /// 把第 `index` 项按 `align` 对齐到视口；`Nearest` = 已完全可见则不滚。
@@ -472,10 +487,20 @@ pub(crate) fn scroll_to_item(
     })
 }
 
-/// 逐项高度入口校验：必须有限且非负（`0` 合法：折叠行）。
+/// 逐项高度入口校验：每项必须有限且非负（`0` 合法：折叠行），**累计高度也必须有限**
+/// （否则 `prefix[count]` 溢出到 `inf`：内容高度 / clamp / `scroll_to_item` 全部失真）。
+///
+/// 在任何状态写入前调用（`make_virtual_list` 预置高度、`set_virtual_extents`），
+/// 因此错误路径不改动 `extents` / `content` / `offset`。累计溢出的 `index` 指向
+/// **使累计值首次变为非有限**的那一项。
 fn validate_extents(extents: &[f32]) -> Result<(), EngineError> {
+    let mut total = 0.0_f32;
     for (index, value) in extents.iter().copied().enumerate() {
         if !value.is_finite() || value < 0.0 {
+            return Err(EngineError::InvalidVirtualExtent { index, value });
+        }
+        total += value;
+        if !total.is_finite() {
             return Err(EngineError::InvalidVirtualExtent { index, value });
         }
     }
@@ -855,6 +880,91 @@ mod tests {
         }
     }
 
+    /// F1 回归：全零高度（应用尚未测量）→ 真实高度时视图必须停在顶部（锚点 (0, 0)）。
+    #[test]
+    fn zero_heights_then_real_heights_keep_the_visible_anchor_at_the_top() {
+        let (_rt, mut app, window, container, list) = fixture(100.0, 0, None);
+        set_items(&mut app, &list, 10);
+        frame(&mut app, window);
+        app.set_virtual_extents(&list, &[0.0; 10])
+            .expect("zero heights");
+        frame(&mut app, window);
+        assert_eq!(content_height(&app, window, container), 0.0);
+        let folded = app.virtual_list_state(&list).expect("state");
+        assert_eq!(
+            (folded.offset.y, folded.first, folded.mounted),
+            (0.0, 0, 0),
+            "零内容：无可见行、偏移 0"
+        );
+
+        // 首次拿到真实行高：零内容锚点固定 (0, 0)，偏移保持 0（修复前会跳到底部 900）。
+        app.set_virtual_extents(&list, &[100.0; 10])
+            .expect("measured heights");
+        frame(&mut app, window);
+        let measured = app.virtual_list_state(&list).expect("state");
+        assert_eq!(
+            (measured.offset.y, measured.first),
+            (0.0, 0),
+            "零高 → 真实高度不得跳底"
+        );
+        assert_eq!(content_height(&app, window, container), 1_000.0);
+    }
+
+    /// F3 回归：单值有限但累计溢出 ⇒ `InvalidVirtualExtent`，且在任何状态写入前失败。
+    #[test]
+    fn overflowing_extent_totals_are_rejected_before_any_state_change() {
+        let (_rt, mut app, window, container, list) = fixture(25.0, 0, None);
+        set_items(&mut app, &list, 3);
+        frame(&mut app, window);
+        let before = app.virtual_list_state(&list).expect("state");
+        let requests = app.frame_requests();
+        // 3e38 单项有限、两项累计到 inf（修复前 Ok，content=inf 且随后 scroll_to_item 假报
+        // NotScrollable）。
+        match app.set_virtual_extents(&list, &[3e38, 3e38, 1.0]) {
+            Err(EngineError::InvalidVirtualExtent { index: 1, value }) => {
+                assert_eq!(value, 3e38);
+            }
+            other => panic!("累计溢出必须是 InvalidVirtualExtent：{other:?}"),
+        }
+        assert_eq!(
+            content_height(&app, window, container),
+            75.0,
+            "错误路径不得半写 content"
+        );
+        assert_eq!(
+            app.virtual_list_state(&list).expect("state"),
+            before,
+            "错误路径不改状态（先校验、后写入）"
+        );
+        assert_eq!(app.frame_requests(), requests, "错误路径不请求帧");
+        // 同量级但累计有限 ⇒ 校验通过。
+        validate_extents(&[3e38, 1.0, 1.0]).expect("finite total");
+
+        // 预置高度（创建入口）同样校验累计，且在写入任何槽之前失败。
+        let (_runtime, mut app, window, container) = app_with_container();
+        match app.make_virtual_list(
+            window,
+            container,
+            VirtualListConfig {
+                extent: 25.0,
+                extents: Some(vec![3e38, 3e38].into_boxed_slice()),
+                overscan: 0,
+            },
+        ) {
+            Err(EngineError::InvalidVirtualExtent { index: 1, .. }) => {}
+            other => panic!("预置高度累计溢出必须是 InvalidVirtualExtent：{other:?}"),
+        }
+        let tree = app.window(window).expect("window").tree();
+        assert!(
+            tree.virtual_slot(container).is_none(),
+            "失败入口不得写虚拟槽"
+        );
+        assert!(
+            tree.scroll_slot(container).is_none(),
+            "失败入口不得写滚动槽"
+        );
+    }
+
     #[test]
     fn an_empty_list_accepts_empty_extents_and_rejects_any_index() {
         let (_rt, mut app, window, container, list) = fixture(25.0, 0, None);
@@ -904,6 +1014,23 @@ mod tests {
         assert_eq!(scroll_offset(&app, window, container), 650.0, "3*200 + 50");
         frame(&mut app, window);
         assert_eq!(content_height(&app, window, container), 1_000.0);
+        // F2 回归：丢弃逐项高度 ⇒ 已挂载行几何必须同步回落到单一 `extent`
+        // （修复前 row3 仍留着旧逐项布局的 300/100，中间帧把可见行画出视口 ⇒ 列表空白）。
+        let mounted = mounted_rows(&app, window, &list);
+        assert_eq!(
+            mounted.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            vec![3],
+            "650..750 只覆盖第 3 行"
+        );
+        for (index, row) in mounted {
+            let bounds = row_bounds(&app, window, container, row);
+            assert_eq!(
+                bounds.origin.y,
+                index as f32 * 200.0,
+                "row {index} 回落到单一 extent 的 top"
+            );
+            assert_eq!(bounds.size.height, 200.0, "row {index} 回落 height");
+        }
 
         // 应用随后给新高度：锚点（uniform 的 f=3、d=50）⇒ prefix'[3] + 50 = 350。
         app.set_virtual_extents(&list, &[100.0; 5])

@@ -343,10 +343,12 @@ pub enum EngineError {
         actual: usize,
     },
 
-    /// 逐项行高非法（非有限值或负值；E3 §11.3 入口校验）。
+    /// 逐项行高非法（非有限值、负值，或累计高度溢出到非有限；E3 §11.3 入口校验）。
+    ///
+    /// 累计溢出的 `index` 是**使累计值首次变为非有限**的那一项。
     #[error(
         "virtual list extent at index {index} is invalid: {value} \
-         (extents must be finite and non-negative)"
+         (each extent must be finite and non-negative and their total must be finite)"
     )]
     InvalidVirtualExtent {
         /// 非法值在 `extents` 里的下标。

@@ -1493,7 +1493,7 @@ impl App {
     /// 让一个滚动容器变成虚拟列表（要求 `Clip::Bounds` + `position: relative`）。
     ///
     /// # Errors
-    /// `StaleNode` / `NotVirtualList`。
+    /// `StaleNode` / `NotVirtualList` / `InvalidVirtualExtent`（预置行高非法）。
     pub fn make_virtual_list(
         &mut self,
         window: WindowId,
@@ -1535,7 +1535,7 @@ impl App {
     ///
     /// # Errors
     /// `NotVirtualList`（list 失效 / 未 `make_virtual_list`）；`VirtualListExtents`（长度与
-    /// 条目数不符）；`InvalidVirtualExtent`（逐项高度非有限或为负）。
+    /// 条目数不符）；`InvalidVirtualExtent`（逐项高度非有限、为负或累计溢出）。
     pub fn set_virtual_extents(
         &mut self,
         list: &VirtualList,

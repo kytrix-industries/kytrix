@@ -348,7 +348,8 @@ impl VirtualList {
 pub struct VirtualListConfig {
     /// 每行高度（逻辑像素，`> 0`）。
     pub extent: f32,
-    /// 逐项高度（逻辑像素，有限且 `>= 0`）：`Some` 时以它为准（条目数变化丢弃后回落到 `extent`）。
+    /// 逐项高度（逻辑像素，每项有限且 `>= 0`，累计高度必须有限）：`Some` 时以它为准
+    /// （条目数变化丢弃后回落到 `extent`）。
     pub extents: Option<Box<[f32]>>,
     /// 视口外多挂几行（上下一侧各 `overscan`）。
     pub overscan: usize,
