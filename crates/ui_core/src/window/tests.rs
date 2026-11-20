@@ -513,6 +513,73 @@ fn painted_window() -> (Window, crate::node::id::NodeId) {
     (window, node)
 }
 
+/// v2.1 E2b（审查 F11，D17）：`Window::frame` 没有 `ResourceCache`，行内盒图片一律跳过 ——
+/// 跳过不能静默：本帧跳过的 id 必须出现在 `Window::inline_box_image_diagnostics`。
+#[test]
+fn window_frame_reports_skipped_inline_box_images() {
+    use crate::text::{
+        InlineAlign, InlineBoxPaint, InlineBoxSpec, ShapedInlineBox, ShapedLine, ShapedTextItem,
+        ShapedTextLine, TextContent, TextDiagnostic, TextStyle,
+    };
+
+    let mut window = Window::new(WindowId::for_test(1), WindowOptions::default());
+    let spec = InlineBoxSpec {
+        id: 21,
+        index: 1,
+        size: Size::new(8.0, 8.0),
+        baseline: None,
+        align: InlineAlign::Baseline,
+        paint: Some(InlineBoxPaint::Image {
+            resource: crate::resources::ResourceId::for_test(4242, 1),
+            modulation: Color::WHITE,
+        }),
+    };
+    let content = TextContent::new("a b", TextStyle::new(16.0)).with_inline_boxes([spec]);
+    let shaped_line = ShapedLine {
+        text: smol_str::SmolStr::new_static("a b"),
+        lines: vec![ShapedTextLine {
+            text_range: 0..3,
+            baseline: 12.0,
+            line_height: 16.0,
+            advance: 20.0,
+            items: vec![ShapedTextItem::InlineBox(ShapedInlineBox {
+                id: 21,
+                rect: Rect::new(2.0, 2.0, 8.0, 8.0),
+                baseline: None,
+            })],
+            decorations: Vec::new(),
+        }],
+        width: 20.0,
+        height: 16.0,
+        first_baseline: Some(12.0),
+        atlas_generation: 0,
+        font_stack_version: 1,
+        scale: 1.0,
+    };
+    let node = {
+        let root = window.tree().root();
+        let node = NodeBuilder::text("a b", TextStyle::new(16.0))
+            .layout_override(Rect::new(0.0, 0.0, 40.0, 16.0))
+            .build(window.tree_mut(), root)
+            .expect("挂载成功");
+        let tree = window.tree_mut();
+        assert!(tree.set_text_content(node, content.clone()), "文本载荷");
+        assert!(
+            tree.install_text_line_for_test(node, &content, std::rc::Rc::new(shaped_line), 40.0),
+            "注入行快照"
+        );
+        node
+    };
+    let outcome = window.frame().expect("帧成功");
+    assert!(matches!(outcome, FrameOutcome::Committed(_)));
+    assert_eq!(
+        window.inline_box_image_diagnostics(),
+        [TextDiagnostic::InlineBoxImageMissing { id: 21 }],
+        "Window::frame 路径的图片跳过必须可观测（D17）"
+    );
+    let _ = node;
+}
+
 /// V-122 ⑧：提交判据的纯函数（不碰 GPU）。Full/Partial 有工作；Idle 只在目标尺寸变化时
 /// 才有工作；没有 renderer 的 headless 帧恒有工作。
 #[test]

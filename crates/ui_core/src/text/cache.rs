@@ -63,6 +63,9 @@ impl ShapeKey {
             run.style.hash_into(&mut style_hasher);
             color_bits(run.style.color).hash(&mut style_hasher);
         }
+        // 归一化计数决定 `ShapedText.inline_diagnostics`（`InvalidTextRun`）⇒ 必须进键，否则
+        // 「非法 runs 归一化后与合法 runs 相同」的内容会误命中一份没有诊断的快照。
+        content.normalized_runs().hash(&mut style_hasher);
         for inline in content.inline_boxes.iter() {
             inline.id.hash(&mut style_hasher);
             inline.index.hash(&mut style_hasher);

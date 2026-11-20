@@ -190,6 +190,7 @@ impl TextContext {
         if let Some(hit) = self.cache.get(&key)
             && hit.text() == content.text
             && hit.same_shaping_inputs(&content.style, content.runs())
+            && hit.normalized_runs() == content.normalized_runs()
             && hit.inline_boxes() == content.inline_boxes.as_ref()
         {
             return (hit, true);
@@ -202,6 +203,7 @@ impl TextContext {
         // 逐 run 颜色 / 装饰几何；装饰也不是纯数字字形序列的属性）。
         if content.inline_boxes.is_empty()
             && content.runs().is_empty()
+            && content.normalized_runs() == 0
             && content.style.decoration().is_none()
             && let Some(simple) = self.fast.try_shape(
                 &mut self.font_cx,

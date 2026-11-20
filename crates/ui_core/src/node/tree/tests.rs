@@ -190,9 +190,9 @@ fn node_and_handle_sizes() {
     );
     assert_eq!(
         size_of::<crate::text::TextContent>(),
-        104,
-        "TextContent 的尺寸基线（P1-2.3 从 112 降到 96；v2.1 E2 的 `runs: Option<Box<ThinSlice>>` \
-         最小内联表示 +8，空 runs 不分配；Node 仍 ≤ 336 B 预算）"
+        112,
+        "TextContent 的尺寸基线（v2.1 E2 的 `runs: Option<Box<ThinSlice>>` +8；E2b 的归一化诊断 \
+         计数 +8。`NodeKind::Text` 装箱持有 TextContent ⇒ Node 仍 328 B，上限 336 B）"
     );
     assert_eq!(
         size_of::<Option<NodeId>>(),

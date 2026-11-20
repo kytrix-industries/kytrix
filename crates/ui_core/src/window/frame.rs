@@ -546,6 +546,9 @@ pub(crate) fn frame(window: &mut Window) -> Result<FrameOutcome, EngineError> {
             return Err(error);
         }
     };
+    // F11（D17）：这条路径没有 ResourceCache，`InlineBoxPaint::Image` 一定被跳过；不能静默
+    // ——把本帧的缺失 id 记进窗口级诊断（App::frame 路径有 TextContext 诊断环，不走这里）。
+    window.note_skipped_inline_images(&report.skipped_inline_images);
     Ok(window.commit_frame(ticket, report))
 }
 

@@ -300,6 +300,10 @@ pub(crate) fn frame(
     let stale_canvas_runs = paint.stale_canvas_runs;
     // v2.1 E2（`§11.2`）：行内盒图片资源未加载 / 已卸载 ⇒ 本帧跳过图元。引擎不画占位图，
     // 但必须让「跳过」可观测（D17）：逐 id 压一条文本诊断。
+    //
+    // E2b（审查 F12）：**不必在这里做帧级去重** —— `TextContext::push_diagnostics` 按诊断值
+    // 去重（D-4：同一条只保留一份、重复时移到最新），因此同一 id 每帧重压不会让 64 条环增长，
+    // 也不会挤掉其它诊断。paint 侧同帧内也已按 id 去重（`skipped_inline_images`）。
     if !paint.skipped_inline_images.is_empty() {
         app.text.push_diagnostics(
             paint

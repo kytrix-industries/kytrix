@@ -2741,6 +2741,112 @@ mod tests {
         assert!(report.rebuilt > 0);
     }
 
+    /// v2.1 E2b（审查 F6，变异 M5 的守护）：`StylePatch::foreground` 同时覆盖**字形颜色与
+    /// 装饰线色**（含显式 `TextDecoration::color`）；`foreground` 缺省时装饰跟 shaping 期
+    /// 解析出的颜色（显式线色 > 兜底文本色，见 `decoration_segments`）。
+    #[test]
+    fn foreground_overrides_glyph_and_decoration_colors() {
+        let text_color = Color::Srgb {
+            r: 0.1,
+            g: 0.1,
+            b: 0.1,
+            alpha: 1.0,
+        };
+        let explicit_line = Color::Srgb {
+            r: 0.9,
+            g: 0.8,
+            b: 0.1,
+            alpha: 1.0,
+        };
+        let foreground = Color::Srgb {
+            r: 0.0,
+            g: 0.7,
+            b: 0.2,
+            alpha: 1.0,
+        };
+        let mut h = Harness::new();
+        let node = spawn_text(
+            &mut h,
+            TextContent::new("ab", TextStyle::new(16.0).with_color(text_color)),
+            shaped_line(
+                vec![ShapedTextItem::GlyphRun(glyph_run(text_color, 0..2, 0.0))],
+                vec![
+                    // `color = None` 的装饰：shaping 期解析为该 run 的文本色。
+                    ShapedDecoration {
+                        rect: Rect::new(0.0, 14.5, 10.0, 1.0),
+                        color: text_color,
+                    },
+                    // 显式 `TextDecoration::color`：随 shaping 期烘焙进 `ShapedDecoration.color`。
+                    ShapedDecoration {
+                        rect: Rect::new(10.0, 8.0, 10.0, 1.0),
+                        color: explicit_line,
+                    },
+                ],
+            ),
+        );
+        let decoration_fills = |h: &Harness| -> Vec<Color> {
+            lane_primitives(h, node)
+                .into_iter()
+                .filter_map(|primitive| match primitive {
+                    Primitive::Quad(quad) => match quad.paint {
+                        QuadPaint::Solid { fill, .. } => Some(fill),
+                        QuadPaint::Gradient(_) => None,
+                    },
+                    _ => None,
+                })
+                .collect()
+        };
+        let glyph_colors = |h: &Harness| -> Vec<Color> {
+            lane_primitives(h, node)
+                .into_iter()
+                .filter_map(|primitive| match primitive {
+                    Primitive::GlyphRun(run) => Some(run.color),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // 1) 无 `foreground`：装饰跟随 shaping 期颜色（文本色 / 显式线色），字形跟随 run 颜色。
+        let _ = h.paint();
+        assert_eq!(decoration_fills(&h), vec![text_color, explicit_line]);
+        assert_eq!(glyph_colors(&h), vec![text_color]);
+
+        // 2) `foreground` 覆盖：字形与两条装饰线（含显式线色）统一为 foreground。
+        assert!(h.tree.set_style_patch(
+            node,
+            StylePatch {
+                foreground: Some(foreground),
+                ..StylePatch::default()
+            }
+        ));
+        h.mark_paint(node);
+        let _ = h.paint();
+        assert_eq!(
+            decoration_fills(&h),
+            vec![foreground, foreground],
+            "foreground 必须覆盖装饰线色（含显式 TextDecoration::color）"
+        );
+        assert_eq!(
+            glyph_colors(&h),
+            vec![foreground],
+            "foreground 必须覆盖字形颜色"
+        );
+
+        // 3) foreground 与 style.color 相同 ⇒ 等价于「foreground = None 时跟 style.color」：
+        //    显式线色仍然被覆盖（foreground 优先级高于装饰自带颜色）。
+        assert!(h.tree.set_style_patch(
+            node,
+            StylePatch {
+                foreground: Some(text_color),
+                ..StylePatch::default()
+            }
+        ));
+        h.mark_paint(node);
+        let _ = h.paint();
+        assert_eq!(decoration_fills(&h), vec![text_color, text_color]);
+        assert_eq!(glyph_colors(&h), vec![text_color]);
+    }
+
     /// v2.1 E2：`InlineBoxPaint::Quad` 按落点矩形绘制；`paint = None` 只保留落点、不绘制。
     #[test]
     fn inline_box_quad_paint_uses_the_landing_rect() {

@@ -108,6 +108,9 @@ pub(crate) struct ShapedText {
     /// 富文本 runs（v2.1 E2）：`ShapeKey` 与缓存命中判据都包含它（run 的颜色/装饰被烘进
     /// `ShapedLine`：逐 run 的 `ShapedGlyphRun.color`、`ShapedTextLine.decorations`）。
     runs: Box<[TextRun]>,
+    /// 构造期被归一化的 run 数（`TextDiagnostic::InvalidTextRun` 的计数来源；也进缓存键与
+    /// 命中判据 —— 诊断随快照复用，不能让「有诊断的内容」命中「没诊断的快照」）。
+    normalized_runs: u16,
     font_stack_version: u32,
     kind: ShapedKind,
     /// 行内盒的边界/超宽诊断（shape 期间产生，随 `rasterize` 交给 `TextContext`）。
@@ -229,23 +232,14 @@ impl ShapedText {
     ) -> Self {
         let style = &content.style;
         let mut inline_diagnostics: Vec<TextDiagnostic> = Vec::new();
-        // 防御：`TextContent::with_runs` 已归一化（升序 / char boundary / 文本范围内），这里
-        // 再验一次 —— 若应用绕过构造期写入非法 runs（`set_text_content` 直写），不能静默把
-        // 样式贴到别的字符上（D17），至少留诊断。
-        let mut previous_end = 0usize;
-        for run in content.runs() {
-            if run.range.start < previous_end
-                || run.range.start >= run.range.end
-                || run.range.end > content.text.len()
-                || !content.text.is_char_boundary(run.range.start)
-                || !content.text.is_char_boundary(run.range.end)
-            {
-                inline_diagnostics.push(TextDiagnostic::InvalidTextRun {
-                    start: run.range.start,
-                    end: run.range.end,
-                });
-            }
-            previous_end = previous_end.max(run.range.end);
+        // `§11.2` 的非法 runs 语义（E2 审查 F4，Lead 裁定 b）：构造期归一化 + 诊断。归一化
+        // 发生在 `TextContent::with_runs` / `NodeBuilder::runs`，这里把改动计数压成一条诊断
+        // （不逐 run 刷屏；`TextContext` 诊断环按值去重）。归一化后的 runs 已合法，因此不再
+        // 需要形状期防御校验（旧的逐 run `InvalidTextRun{start,end}` 路径不可达，已删除）。
+        if content.normalized_runs() > 0 {
+            inline_diagnostics.push(TextDiagnostic::InvalidTextRun {
+                runs: usize::from(content.normalized_runs()),
+            });
         }
         let mut builder = layout_cx.ranged_builder(font_cx, &content.text, 1.0, true);
         builder.set_base_direction(match style.direction {
@@ -274,6 +268,7 @@ impl ShapedText {
             text: content.text.clone(),
             style: style.clone(),
             runs: content.runs().to_vec().into_boxed_slice(),
+            normalized_runs: content.normalized_runs(),
             font_stack_version,
             kind: ShapedKind::Parley(RefCell::new(ParleySnapshot::new(layout, style.max_lines()))),
             inline_diagnostics,
@@ -297,6 +292,7 @@ impl ShapedText {
             text: content.text.clone(),
             style: content.style.clone(),
             runs: Box::new([]),
+            normalized_runs: 0,
             font_stack_version,
             kind: ShapedKind::Simple(simple),
             inline_diagnostics: Vec::new(),
@@ -310,6 +306,11 @@ impl ShapedText {
     #[cfg(test)]
     pub(crate) fn runs(&self) -> &[TextRun] {
         &self.runs
+    }
+
+    /// 该快照对应的「构造期归一化 run 数」（缓存命中判据的一部分）。
+    pub(crate) fn normalized_runs(&self) -> u16 {
+        self.normalized_runs
     }
 
     pub(crate) fn inline_boxes(&self) -> &[InlineBoxSpec] {
@@ -331,6 +332,7 @@ impl ShapedText {
             text,
             style: style.clone(),
             runs: Box::new([]),
+            normalized_runs: 0,
             font_stack_version: 1,
             kind: ShapedKind::Parley(RefCell::new(ParleySnapshot::new(
                 parley::Layout::new(),
@@ -975,21 +977,36 @@ const UNDERLINE_OFFSET_EM: f32 = 0.10;
 /// 删除线中心相对基线的偏移（em，向上为正）。
 const STRIKETHROUGH_OFFSET_EM: f32 = 0.30;
 
+/// 一行的**内容区间终点**：去掉行尾硬换行符（`\n` / `\r\n`）。
+///
+/// parley 的 `Line::text_range()` 对硬换行行**包含行尾换行符**，而换行符不是可见字符：
+/// 装饰（下划线/删除线）不能画到换行符上，否则行尾会多出一小段线；更重要的是旧实现把
+/// 「末字符是换行」当成整段不可映射直接丢弃，导致**整行**装饰消失（E2 审查 F1）。
+fn line_content_end(text: &str, line_range: &core::ops::Range<usize>) -> usize {
+    let bytes = text.as_bytes();
+    let mut end = line_range.end.min(text.len());
+    while end > line_range.start && matches!(bytes.get(end - 1), Some(b'\n' | b'\r')) {
+        end -= 1;
+    }
+    end
+}
+
 /// 一行内的文本装饰几何（v2.1 E2，`§11.2`）。
 ///
 /// 绘制序：**兜底样式的装饰在前**（覆盖未被装饰 run 占用的区间），run 的装饰在后（后者覆盖
 /// 前者，与 CSS 的 text-decoration 传播直觉一致）。坐标是文本盒局部逻辑像素；py 由 `baseline`
-/// 与装饰所属样式的字号决定，x 由 `Cluster::visual_offset`（已含行对齐偏移）映射。
+/// 与装饰所属样式的字号决定，x 由区间内 cluster 的 `visual_offset`（已含行对齐偏移）极值映射。
 fn decoration_segments(
-    layout: &parley::Layout<ColorBrush>,
-    line_range: core::ops::Range<usize>,
+    line: &parley::Line<'_, ColorBrush>,
     baseline: f32,
     text: &str,
     runs: &[TextRun],
     base_style: &TextStyle,
     base_color: Color,
 ) -> Vec<ShapedDecoration> {
-    let line_end = line_range.end;
+    let line_range = line.text_range();
+    // 硬换行行：行尾的 `\n` / `\r\n` 不属于装饰范围（F1）。
+    let line_end = line_content_end(text, &line_range);
     // (区间, 装饰, 该 run 的字号, 文本色)
     let decorated: Vec<(core::ops::Range<usize>, TextDecoration, f32, Color)> = runs
         .iter()
@@ -1024,7 +1041,7 @@ fn decoration_segments(
 
     let mut out = Vec::with_capacity(segments.len());
     for (range, decoration, em, text_color) in segments {
-        let Some((left, width)) = decoration_span(layout, text, range) else {
+        let Some((left, width)) = decoration_span(line, text, range) else {
             continue;
         };
         let thickness = decoration.thickness();
@@ -1048,13 +1065,13 @@ fn decoration_segments(
 
 /// 字节区间 → 行内 x 跨度（`left, width`）；区间为空 / 没有可映射字符时 `None`。
 ///
-/// 用 parley 的 `Cluster::visual_offset`（**已含行对齐偏移**）取区间首尾的可见 x：
-/// - 起点 = 区间首字符所属 cluster 的 visual offset；
-/// - 终点 = 区间末字符所属 cluster 的 visual offset + 该 cluster 的 advance。
-///
-/// 视觉顺序（RTL）下起点可能大于终点：取 min/max 归一。
+/// 取区间内**所有** cluster 的视觉并集：[`min(visual_offset)`, `max(visual_offset + advance)`]。
+/// 不能只取「逻辑首/末字符所属 cluster」的端点（E2 审查 F2）：`visual_offset` 是**视觉左边缘**，
+/// RTL 片段里逻辑首字符在视觉右端、逻辑末字符在视觉左端，端点法会只画出中间一段（两端各少
+/// 一个 cluster 的宽度）；bidi 混排（一行内多个方向段）同理。区间内 cluster 按视觉顺序遍历，
+/// 第一个 = 最左、最后一个 = 最右。
 fn decoration_span(
-    layout: &parley::Layout<ColorBrush>,
+    line: &parley::Line<'_, ColorBrush>,
     text: &str,
     range: core::ops::Range<usize>,
 ) -> Option<(f32, f32)> {
@@ -1063,14 +1080,21 @@ fn decoration_span(
     if start >= end {
         return None;
     }
-    let (last_byte, last_char) = text[..end].char_indices().next_back()?;
-    // 行尾的硬换行不属于可见字符：装饰到换行前为止（`\n` / `\r` 不画线）。
-    if matches!(last_char, '\n' | '\r') {
-        return None;
+    let mut first: Option<parley::Cluster<'_, ColorBrush>> = None;
+    let mut last: Option<parley::Cluster<'_, ColorBrush>> = None;
+    for run in line.runs() {
+        for cluster in run.visual_clusters() {
+            let cluster_range = cluster.text_range();
+            if cluster_range.end <= start || cluster_range.start >= end {
+                continue;
+            }
+            first.get_or_insert(cluster);
+            last = Some(cluster);
+        }
     }
-    let first = parley::Cluster::from_byte_index(layout, start)?;
+    let first = first?;
+    let last = last?;
     let x0 = first.visual_offset()?;
-    let last = parley::Cluster::from_byte_index(layout, last_byte)?;
     let x1 = last.visual_offset()? + last.advance();
     let left = x0.min(x1);
     let width = (x1 - x0).abs();
@@ -1113,17 +1137,20 @@ fn rasterize_parley(
                     let run_text_range = parley_run.text_range();
                     let item_color = run.style().brush.color;
                     // item 的字节区间：消耗该 run 的 visual cluster 直到覆盖 item 的字形数。
-                    let clusters = match &cluster_cache {
-                        Some((range, clusters)) if *range == run_text_range => clusters,
-                        _ => {
-                            let clusters: Vec<(core::ops::Range<usize>, usize)> = parley_run
-                                .visual_clusters()
-                                .map(|cluster| (cluster.text_range(), cluster.glyphs().count()))
-                                .collect();
-                            cluster_cache = Some((run_text_range.clone(), clusters));
-                            &cluster_cache.as_ref().expect("just built").1
-                        }
-                    };
+                    let (cached_range, clusters) = cluster_cache.get_or_insert_with(|| {
+                        let clusters: Vec<(core::ops::Range<usize>, usize)> = parley_run
+                            .visual_clusters()
+                            .map(|cluster| (cluster.text_range(), cluster.glyphs().count()))
+                            .collect();
+                        (run_text_range.clone(), clusters)
+                    });
+                    if *cached_range != run_text_range {
+                        *cached_range = run_text_range.clone();
+                        *clusters = parley_run
+                            .visual_clusters()
+                            .map(|cluster| (cluster.text_range(), cluster.glyphs().count()))
+                            .collect();
+                    }
                     let mut cursor = match &cluster_cursor {
                         Some((range, cursor)) if *range == run_text_range => *cursor,
                         _ => 0,
@@ -1215,15 +1242,8 @@ fn rasterize_parley(
                 }
             }
         }
-        let decorations = decoration_segments(
-            layout,
-            line.text_range(),
-            metrics.baseline,
-            text,
-            runs,
-            base_style,
-            color,
-        );
+        let decorations =
+            decoration_segments(&line, metrics.baseline, text, runs, base_style, color);
         lines.push(ShapedTextLine {
             text_range: line.text_range(),
             baseline: metrics.baseline,
@@ -2527,6 +2547,261 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// v2.1 E2b（审查 F1）：硬换行（`\n` / `\r\n`）行不得整行丢装饰 —— 装饰按「行内容区间」
+    /// 裁剪（行尾换行符不画线），空行/连续换行没有装饰。
+    #[test]
+    fn decoration_survives_hard_line_breaks() {
+        let underline = TextDecoration::underline(1.0);
+        let mut harness = Harness::new();
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        for (text, expected) in [
+            ("ab\ncd", vec![1usize, 1]),
+            ("ab\r\ncd", vec![1, 1]),
+            ("ab\n\ncd", vec![1, 0, 1]),
+            ("ab\n", vec![1, 0]),
+        ] {
+            let content = TextContent::new(text, TextStyle::new(16.0).with_decoration(underline));
+            let shaped = harness.shape_content(&content);
+            let (line, _diagnostics, _stats) = rasterize_line(
+                &shaped,
+                shaped.max_content_size().width,
+                1.0,
+                &mut raster,
+                &mut glyphs,
+                &mut atlas,
+            );
+            let counts: Vec<usize> = line
+                .lines
+                .iter()
+                .map(|shaped_line| shaped_line.decorations.len())
+                .collect();
+            assert_eq!(
+                counts, expected,
+                "硬换行行尾不属于装饰范围（也不得整行丢弃）：{text:?} -> {line:?}"
+            );
+            for shaped_line in &line.lines {
+                for decoration in &shaped_line.decorations {
+                    assert!(
+                        decoration.rect.size.width > 0.0,
+                        "装饰必须有正宽度：{decoration:?}"
+                    );
+                    assert!(
+                        decoration.rect.origin.x >= -1e-3
+                            && decoration.rect.origin.x + decoration.rect.size.width
+                                <= shaped_line.advance + 1e-3,
+                        "装饰不得超出该行内容推进：{decoration:?} / advance {}",
+                        shaped_line.advance
+                    );
+                }
+            }
+        }
+    }
+
+    /// v2.1 E2b（审查 F1）：行的「装饰可用区间」必须排除行尾硬换行符（`\n` / `\r\n`）。
+    ///
+    /// 这是 F1 的直接守护：变异「`line_content_end` 退化为 `line_range.end`」会让本测试红
+    /// （端到端数值之所以看不出来：parley 的换行 cluster advance 恒为 0）。
+    #[test]
+    fn decoration_range_excludes_the_hard_break_tail() {
+        assert_eq!(super::line_content_end("ab\ncd", &(0..3)), 2);
+        assert_eq!(super::line_content_end("ab\r\ncd", &(0..4)), 2);
+        assert_eq!(
+            super::line_content_end("ab\n\ncd", &(3..4)),
+            3,
+            "空行没有内容"
+        );
+        assert_eq!(super::line_content_end("\n", &(0..1)), 0);
+        assert_eq!(
+            super::line_content_end("ab", &(0..2)),
+            2,
+            "末行无换行时原样保留"
+        );
+        assert_eq!(
+            super::line_content_end("ab\t", &(0..3)),
+            3,
+            "非换行字符不裁剪"
+        );
+    }
+
+    /// v2.1 E2b（审查 F1）：run 装饰覆盖到硬换行时，两行各自得到自己的装饰几何，而不是整段
+    /// 丢弃；第二行的跨度 = 该行内容（`cd`）的 cluster 推进。
+    #[test]
+    fn run_decoration_clipped_at_hard_line_break() {
+        let underline = TextDecoration::underline(1.0);
+        let mut harness = Harness::new();
+        // "ab\ncd"：run 覆盖全部 5 字节 ⇒ 行 0 与行 1 各一条装饰。
+        let content = TextContent::new("ab\ncd", TextStyle::new(16.0)).with_runs([TextRun::new(
+            0..5,
+            TextStyle::new(16.0).with_decoration(underline),
+        )]);
+        let shaped = harness.shape_content(&content);
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let counts: Vec<usize> = line
+            .lines
+            .iter()
+            .map(|shaped_line| shaped_line.decorations.len())
+            .collect();
+        assert_eq!(
+            counts,
+            vec![1, 1],
+            "跨硬换行的 run 装饰必须逐行生成：{line:?}"
+        );
+        let second = &line.lines[1];
+        let decoration = second.decorations[0];
+        assert!(
+            decoration.rect.origin.x.abs() < 1e-2
+                && (decoration.rect.size.width - second.advance).abs() < 1e-2,
+            "第二行装饰跨度 = 内容区间（不含行尾换行）：{decoration:?} / advance {}",
+            second.advance
+        );
+    }
+
+    /// v2.1 E2b（审查 F2）：RTL 装饰跨度必须取区间内**所有** cluster 的视觉并集，而不是
+    /// 「逻辑首/末字符」端点（旧实现只覆盖中间一段，两端各少一个 cluster）。
+    #[test]
+    fn rtl_decoration_covers_the_full_visual_span() {
+        let underline = TextDecoration::underline(1.0);
+        let rtl = TextStyle::new(16.0).with_direction(TextDirection::Rtl);
+        let mut harness = Harness::new();
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+
+        // 纯 RTL 整段兜底装饰：必须覆盖 [0, advance]。
+        let content = TextContent::new("שלום עולם", rtl.clone().with_decoration(underline));
+        let shaped = harness.shape_content(&content);
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        assert_eq!(line.lines.len(), 1, "不限宽 ⇒ 单行");
+        let shaped_line = &line.lines[0];
+        assert_eq!(
+            shaped_line.decorations.len(),
+            1,
+            "整段兜底装饰一条：{:?}",
+            shaped_line.decorations
+        );
+        let decoration = shaped_line.decorations[0];
+        let right = decoration.rect.origin.x + decoration.rect.size.width;
+        assert!(
+            decoration.rect.origin.x <= 1.0,
+            "RTL 装饰必须从行左边缘开始（旧实现从中间开始）：{decoration:?}"
+        );
+        assert!(
+            (right - shaped_line.advance).abs() <= 1.0,
+            "RTL 装饰必须覆盖到行推进末端：{decoration:?} / advance {}",
+            shaped_line.advance
+        );
+
+        // RTL 跨 run：两个 run 各带装饰（视觉右半 / 左半），并集仍覆盖整行。
+        let content = TextContent::new("שלום עולם", rtl.clone()).with_runs([
+            TextRun::new(0..4, rtl.clone().with_decoration(underline)),
+            TextRun::new(4..8, rtl.with_decoration(underline)),
+        ]);
+        let shaped = harness.shape_content(&content);
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let shaped_line = &line.lines[0];
+        assert_eq!(
+            shaped_line.decorations.len(),
+            2,
+            "两个 RTL run 各一条装饰：{:?}",
+            shaped_line.decorations
+        );
+        let left = shaped_line
+            .decorations
+            .iter()
+            .map(|decoration| decoration.rect.origin.x)
+            .fold(f32::INFINITY, f32::min);
+        let right = shaped_line
+            .decorations
+            .iter()
+            .map(|decoration| decoration.rect.origin.x + decoration.rect.size.width)
+            .fold(f32::NEG_INFINITY, f32::max);
+        // 两个 run 合起来覆盖逻辑前 8 字节（= 视觉右半的词）；旧端点法每个 run 只剩内部
+        // 一小段（宽度接近 0），并集会明显缩水。
+        assert!(
+            shaped_line
+                .decorations
+                .iter()
+                .all(|decoration| decoration.rect.size.width > 10.0),
+            "每个 RTL run 的装饰必须覆盖整段视觉宽度（旧实现只剩中间）：{:?}",
+            shaped_line.decorations
+        );
+        assert!(
+            left <= 40.0,
+            "跨 run 的 RTL 装饰必须覆盖到词左端：{shaped_line:?}"
+        );
+        assert!(
+            (right - shaped_line.advance).abs() <= 1.0,
+            "跨 run 的 RTL 装饰必须覆盖到行推进末端：{shaped_line:?}"
+        );
+
+        // LTR 段落里的 RTL run：装饰必须贴合该 run 的字形落点（旧实现两端各少约一个 cluster）。
+        let content =
+            TextContent::new("abc שלום def", TextStyle::new(16.0)).with_runs([TextRun::new(
+                4..12,
+                TextStyle::new(16.0).with_decoration(underline),
+            )]);
+        let shaped = harness.shape_content(&content);
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let shaped_line = &line.lines[0];
+        assert_eq!(shaped_line.decorations.len(), 1, "只有 RTL run 有装饰");
+        let decoration = shaped_line.decorations[0];
+        let (run_left, run_right) = shaped_line
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ShapedTextItem::GlyphRun(run) if run.text_range == (4..12) => {
+                    let left = run
+                        .glyphs
+                        .iter()
+                        .map(|glyph| glyph.position.x)
+                        .fold(f32::INFINITY, f32::min);
+                    let right = run
+                        .glyphs
+                        .iter()
+                        .map(|glyph| glyph.position.x + glyph.size.width)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    Some((left, right))
+                }
+                ShapedTextItem::GlyphRun(_) | ShapedTextItem::InlineBox(_) => None,
+            })
+            .expect("RTL run 必须存在");
+        assert!(
+            decoration.rect.origin.x <= run_left + 1.5,
+            "LTR 段落里的 RTL run：装饰左端不得从 run 内部开始：{decoration:?} vs run {run_left}..{run_right}"
+        );
+        assert!(
+            decoration.rect.origin.x + decoration.rect.size.width >= run_right - 1.5,
+            "LTR 段落里的 RTL run：装饰右端不得止于 run 内部：{decoration:?} vs run {run_left}..{run_right}"
+        );
     }
 
     #[test]
