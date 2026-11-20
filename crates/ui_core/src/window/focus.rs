@@ -47,6 +47,31 @@ pub(crate) fn text_caret_rect(
     ))
 }
 
+// 消费者：`impl Window::text_byte_index_at` 的薄委托（外部调用点见该方法文档）。
+/// 节点 border box 局部坐标 → 文本节点最近的合法字节边界（E5/§11.5）。
+///
+/// 引擎先减去内容盒偏移（border + padding）把点换到**文本盒局部坐标**（与
+/// `NodeTree::text_caret_rect` 的输出同域），再交给 `NodeTree::text_byte_index_at` 按 shaping
+/// 结果命中字素簇。入参与 `HitResult::local_point` 同域，因此调用方不需要自己做坐标换算。
+///
+/// # Errors
+/// `StaleNode`：节点不存在 / 不是可命中的文本节点 / 文本尚未 shape 或文本 pass 尚未重建
+/// 当前内容与断行宽度（语义见 `Window::text_byte_index_at`）。
+pub(crate) fn text_byte_index_at(
+    window: &Window,
+    node: NodeId,
+    local_point: Point,
+) -> Result<usize, EngineError> {
+    let content_offset = window.tree.content_offset(node);
+    window.tree.text_byte_index_at(
+        node,
+        Point::new(
+            local_point.x - content_offset.x,
+            local_point.y - content_offset.y,
+        ),
+    )
+}
+
 // 消费者：`impl Window::set_ime_cursor_request` 的薄委托（外部调用点见该方法文档）。
 // ── P16：IME caret hint ────────────────────────────────────────────────────
 

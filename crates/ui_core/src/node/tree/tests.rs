@@ -3,7 +3,7 @@ use smallvec::smallvec;
 use super::{LayoutBox, Node, NodeKind, NodeSpec, NodeTree};
 use crate::{
     error::EngineError,
-    math::{Edges, Rect},
+    math::{Edges, Point, Rect},
     node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId, signal::SignalId},
     paint::style::{Clip, Style, StylePatch},
 };
@@ -512,6 +512,51 @@ fn text_caret_rect_reports_preconditions() {
         .text_caret_rect(root, 0)
         .expect_err("非文本节点必须报错");
     assert!(matches!(error, EngineError::TextShape { .. }));
+}
+
+/// E5/§11.5：点 → 字节索引的前置条件全部收敛到 `StaleNode`（语义 =「该节点不能作为文本命中
+/// 目标」）：未 shape 的文本 / 非文本节点（盒子、Canvas）/ 已卸载节点。
+#[test]
+fn text_byte_index_at_reports_preconditions() {
+    let (mut tree, node) = text_tree("abcdef");
+    let root = tree.root();
+    let point = Point::new(1.0, 1.0);
+
+    let error = tree
+        .text_byte_index_at(node, point)
+        .expect_err("尚未 shape 的文本节点必须报错");
+    assert!(matches!(
+        error,
+        EngineError::StaleNode { node: reported } if reported == node
+    ));
+
+    let error = tree
+        .text_byte_index_at(root, point)
+        .expect_err("盒子节点不是文本命中目标");
+    assert!(matches!(
+        error,
+        EngineError::StaleNode { node: reported } if reported == root
+    ));
+
+    let canvas = NodeBuilder::canvas(crate::paint::canvas::Canvas::default())
+        .build(&mut tree, root)
+        .expect("挂载 Canvas 节点");
+    let error = tree
+        .text_byte_index_at(canvas, point)
+        .expect_err("Canvas 节点不是文本命中目标");
+    assert!(matches!(
+        error,
+        EngineError::StaleNode { node: reported } if reported == canvas
+    ));
+
+    assert!(tree.remove(node).is_ok());
+    let error = tree
+        .text_byte_index_at(node, point)
+        .expect_err("已卸载节点必须报错");
+    assert!(matches!(
+        error,
+        EngineError::StaleNode { node: reported } if reported == node
+    ));
 }
 
 #[test]

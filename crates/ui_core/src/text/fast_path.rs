@@ -178,6 +178,21 @@ impl SimpleShaped {
         self.x_at(byte_index.min(self.text_len))
     }
 
+    /// `x`（已减对齐偏移的文本盒局部坐标）→ 最近字节边界（ASCII ⇒ 字节下标 == 字符下标）。
+    ///
+    /// 与 parley `Cursor::from_point` 同一条「半簇取整」规则：`x` 落在第 i 个簇中点的左侧 ⇒ i，
+    /// 右侧 ⇒ i + 1；越界由首/尾簇自然收敛到 `0` / `text_len`（E5/§11.5 的行内 clamp）。
+    pub(crate) fn byte_index_at(&self, x: f32) -> usize {
+        for index in 0..self.glyphs.len() {
+            let edge = self.x_at(index);
+            let next = self.x_at(index + 1);
+            if x <= edge + (next - edge) * 0.5 {
+                return index;
+            }
+        }
+        self.text_len
+    }
+
     /// 单行选区矩形（逻辑像素，文本盒局部）。
     pub(crate) fn selection_rect(
         &self,

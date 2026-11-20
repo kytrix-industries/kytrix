@@ -1509,6 +1509,30 @@ impl Window {
     pub fn text_caret_rect(&self, node: NodeId, byte_index: usize) -> Result<Rect, EngineError> {
         focus::text_caret_rect(self, node, byte_index)
     }
+    /// 文本节点 **border box 局部坐标**（与 `HitResult::local_point` 同域）→ 最近合法字节边界
+    /// （v2.1 E5，`§11.5`）。
+    ///
+    /// 这是 [`Window::text_caret_rect`] 的逆向：入参是节点 border box 局部坐标（**不是**窗口绝对
+    /// 坐标），引擎内部减去内容偏移（border + padding）后按 shaping 结果命中字素簇；返回索引
+    /// **保证落在 UTF-8 char boundary**，空文本恒返回 `0`。
+    ///
+    /// **clamp**：点落在文本盒外时返回最近边界 —— 盒上方 `0`、下方 `text.len()`；同一行内水平
+    /// 越界取该行首/行尾；多行文本取最近行。断行/对齐与该节点最近一次文本 pass 完全一致，
+    /// 因此 `text_caret_rect(node, i)` → 点 → 本方法可往返得到 `i`。
+    ///
+    /// 只读：不登记依赖、不改任何节点/帧状态（I6）。
+    ///
+    /// # Errors
+    /// [`EngineError::StaleNode`]：节点不存在、不是文本节点（`Canvas` / 几何 / 盒子等）、文本
+    /// 尚未 shape 或 `ShapedLine` 尚未重建，或内容/样式/断行宽度在该次文本 pass 之后又变了
+    /// （等下一帧再查，不返回旧快照算出的索引）。
+    pub fn text_byte_index_at(
+        &self,
+        node: NodeId,
+        local_point: Point,
+    ) -> Result<usize, EngineError> {
+        focus::text_byte_index_at(self, node, local_point)
+    }
     pub(crate) fn set_ime_cursor_request(&mut self, node: NodeId, byte_index: usize) -> bool {
         focus::set_ime_cursor_request(self, node, byte_index)
     }

@@ -659,6 +659,34 @@ impl ShapedText {
         .unwrap_or_default()
     }
 
+    /// 文本盒局部坐标 → 最近合法字节边界（[`Self::caret_rect`] 的逆向，E5/§11.5）。
+    ///
+    /// 与 `caret_rect` 共用同一断行/对齐状态（`break_and_align(width, alignment)`），因此
+    /// 「矩形 → 点 → 矩形」在两次调用之间保持一致；快速路径（单行 ASCII）用同一套半簇取整规则
+    /// 解析，不走 parley。垂直 clamp 由两条路径各自实现 —— 上方 `0`、下方 `text.len()`。
+    pub(crate) fn byte_index_at(&self, width: f32, alignment: TextAlign, point: Point) -> usize {
+        if let ShapedKind::Simple(simple) = &self.kind {
+            if point.y < 0.0 {
+                return 0;
+            }
+            let metrics = simple.metrics();
+            if point.y > metrics.line_height {
+                return simple.text_len();
+            }
+            let offset = super::fast_path::simple_alignment_offset(
+                simple.size().width,
+                width,
+                alignment,
+                self.style.direction,
+            );
+            return simple.byte_index_at(point.x - offset);
+        }
+        self.with_broken_layout(width, alignment, |layout| {
+            inline_flow::byte_index_at(layout, self.text.as_str(), point)
+        })
+        .unwrap_or_default()
+    }
+
     /// 仅测试：当前快照的 parley 布局（共享借用；调用期间不得再触发 `measure`/`rasterize`）。
     #[cfg(test)]
     pub(crate) fn layout(&self) -> std::cell::Ref<'_, parley::Layout<ColorBrush>> {
