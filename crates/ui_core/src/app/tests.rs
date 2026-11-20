@@ -1979,3 +1979,145 @@ fn closing_the_owner_cascades_to_owned_and_modal_windows() {
     assert!(app.window(modal).is_none(), "模态窗口级联关闭");
     assert!(app.window(grandchild).is_none(), "级联必须递归");
 }
+
+// ── E6（P1-E6）：窗口 chrome 的运行时 API ──────────────────────────────
+
+/// E6：`App::set_title` 写窗口参数（泵下一轮对账到原生窗口）并拒绝未知窗口；
+/// 同值写是 no-op（不产生额外的平台系统调用）。
+#[test]
+fn set_title_updates_the_window_and_rejects_unknown_windows() {
+    let (_rt, mut app) = new_app();
+    let window = app.create_window(WindowOptions {
+        title: smol_str::SmolStr::new_static("before"),
+        ..WindowOptions::default()
+    });
+
+    app.set_title(window, smol_str::SmolStr::new_static("after"))
+        .expect("已知窗口必须接受标题");
+    assert_eq!(
+        app.window(window).expect("窗口存在").options().title,
+        "after"
+    );
+    // 同值：仍是 Ok 且不改任何东西（幂等）。
+    app.set_title(window, smol_str::SmolStr::new_static("after"))
+        .expect("同值标题必须成功");
+
+    let error = app
+        .set_title(WindowId::for_test(999), smol_str::SmolStr::new_static("x"))
+        .expect_err("未知窗口必须是强类型错误");
+    assert!(
+        matches!(error, crate::error::EngineError::UnknownWindow { .. }),
+        "必须是 UnknownWindow：{error:?}"
+    );
+}
+
+/// E6：`App::request_window_control` 三端可见（去 `cfg(linux)`）：窗口存在性优先，其次是
+/// 平台能力判定；请求进入单槽，由平台泵取走执行。
+#[test]
+fn request_window_control_queues_supported_controls_and_rejects_unknown_windows() {
+    use crate::window::{WindowControl, WindowResizeEdge};
+
+    let (_rt, mut app) = new_app();
+    let window = app.create_window(WindowOptions::default());
+
+    let error = app
+        .request_window_control(WindowId::for_test(999), WindowControl::Minimize)
+        .expect_err("未知窗口必须优先报错");
+    assert!(matches!(
+        error,
+        crate::error::EngineError::UnknownWindow { .. }
+    ));
+
+    app.request_window_control(window, WindowControl::Minimize)
+        .expect("Minimize 三端都支持");
+    assert_eq!(
+        app.take_window_control(),
+        Some((window, WindowControl::Minimize)),
+        "请求必须进单槽由平台泵取走"
+    );
+    assert_eq!(app.take_window_control(), None, "取走后槽必须为空");
+
+    // 平台能力差异：Windows 没有全屏 / 程序化 move / resize；macOS 没有程序化 move / resize。
+    let unsupported: &[(&str, WindowControl)] = if cfg!(windows) {
+        &[
+            ("fullscreen", WindowControl::ToggleFullscreen),
+            ("interactive move", WindowControl::BeginMove),
+            (
+                "interactive resize",
+                WindowControl::BeginResize(WindowResizeEdge::TopLeft),
+            ),
+        ]
+    } else if cfg!(target_os = "macos") {
+        &[
+            ("interactive move", WindowControl::BeginMove),
+            (
+                "interactive resize",
+                WindowControl::BeginResize(WindowResizeEdge::BottomRight),
+            ),
+        ]
+    } else {
+        &[]
+    };
+    for (needle, control) in unsupported {
+        let error = app
+            .request_window_control(window, *control)
+            .expect_err("该端必须强类型拒绝");
+        let crate::error::EngineError::UnsupportedWindowCapability { capability, .. } = &error
+        else {
+            panic!("必须是 UnsupportedWindowCapability：{error:?}");
+        };
+        assert!(
+            capability.contains(needle),
+            "capability 诊断名必须可 grep（期望含 {needle}）：{capability}"
+        );
+    }
+    // 被拒绝的控制不得留在槽里。
+    assert_eq!(app.take_window_control(), None);
+
+    // 三端都支持的控制（Windows/macOS 的 Minimize/ToggleMaximize；Linux 全部）仍可入队。
+    app.request_window_control(window, WindowControl::ToggleMaximize)
+        .expect("ToggleMaximize 三端都支持");
+    assert_eq!(
+        app.take_window_control(),
+        Some((window, WindowControl::ToggleMaximize))
+    );
+}
+
+/// E6 / I10：非 macOS 的交通灯 API 必须**强类型**报错（setter）或如实返回 None（getter），
+/// 不得静默成功；未知窗口仍然优先。
+#[test]
+fn traffic_light_api_is_unsupported_off_macos() {
+    let (_rt, mut app) = new_app();
+    let window = app.create_window(WindowOptions::default());
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        use crate::math::Point;
+
+        assert_eq!(app.traffic_light_inset(window), None, "非 macOS 没有交通灯");
+        let error = app
+            .set_traffic_light_position(window, Point::new(8.0, 8.0))
+            .expect_err("非 macOS 必须强类型拒绝");
+        let crate::error::EngineError::UnsupportedWindowCapability { capability, .. } = &error
+        else {
+            panic!("必须是 UnsupportedWindowCapability：{error:?}");
+        };
+        assert!(capability.contains("traffic light"), "{capability}");
+
+        let error = app
+            .set_traffic_light_position(WindowId::for_test(999), Point::ZERO)
+            .expect_err("未知窗口优先");
+        assert!(matches!(
+            error,
+            crate::error::EngineError::UnknownWindow { .. }
+        ));
+        assert_eq!(app.traffic_light_inset(WindowId::for_test(999)), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // 建窗路径（AppKit）由平台层在 real run loop 里完成；headless 的 `App` 没有原生窗口，
+        // 这里只验证 API 契约的两端都存在（`None` 表示「尚未由平台写入」）。
+        assert_eq!(app.traffic_light_inset(window), None);
+    }
+}

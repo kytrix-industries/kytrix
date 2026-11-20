@@ -23,6 +23,7 @@ use std::{
     },
 };
 
+use smol_str::SmolStr;
 use windows::{
     Win32::{
         Foundation::{FALSE, HANDLE, HWND, LPARAM, RECT, TRUE},
@@ -44,13 +45,14 @@ use crate::{
     platform::{
         dispatcher::Dispatcher,
         windows::{
+            chrome,
             composition::{self, Composition},
             dark_mode, dpi,
             event_loop::{ResizeFrameDriver, WndProcState, wndproc},
-            ime, placement,
+            icon, ime, placement,
         },
     },
-    window::{WindowId, WindowOptions},
+    window::{Decorations, WindowControl, WindowId, WindowOptions, WindowState},
 };
 
 /// 窗口类名（每进程注册一次）。
@@ -85,6 +87,31 @@ fn load_arrow_cursor() -> HCURSOR {
     unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default()
 }
 
+/// 本端没有等价实现的窗口控制（`None` = 支持）。
+///
+/// E6（§11.6）只把**真正有原生路径**的请求接进 Windows：
+///
+/// - `Minimize` / `ToggleMaximize`：`ShowWindow(SW_MINIMIZE / SW_MAXIMIZE / SW_RESTORE)`；
+/// - `ToggleFullscreen`：Windows 没有「全屏」窗口态（产品语义要么是 frameless + 自算布局，要么
+///   是 `WS_POPUP` 独占全屏，两者都会改变 Snap / DWM / 任务栏语义）。E6 不做，返回强类型错误
+///   而不是假装成功（I10）；
+/// - `BeginMove` / `BeginResize`：程序化 move/size 模态循环只能靠 `SendMessage(WM_NCLBUTTONDOWN)
+///   或 `PostMessage` 触发，且需要与引擎泵的 `&mut App` 借用严格隔离。拖动 / 缩放已有**系统路径**
+///   （`Window::set_drag_regions` → `HTCAPTION`、frameless 的八向命中码），不提供第二条入口。
+///
+/// 消费者：`app::window_set::request_window_control`（能力判定在任何状态变更之前）。
+pub(crate) const fn unsupported_window_control(
+    control: crate::window::WindowControl,
+) -> Option<&'static str> {
+    use crate::window::WindowControl;
+    match control {
+        WindowControl::Minimize | WindowControl::ToggleMaximize => None,
+        WindowControl::ToggleFullscreen => Some("fullscreen window control"),
+        WindowControl::BeginMove => Some("interactive move window control"),
+        WindowControl::BeginResize(_) => Some("interactive resize window control"),
+    }
+}
+
 /// `DEVMODEW.dmDisplayFrequency` → 帧预算的刷新率提示（纯函数，可单测）。
 ///
 /// MS 文档：`dmDisplayFrequency` 为 **0** = 硬件默认、**1** = 显示器的默认/由驱动决定的速率 ——
@@ -114,6 +141,13 @@ pub(crate) struct NativeWindow {
     logical_size: Size,
     /// 最近一次下发的 IME caret 区域（逻辑矩形 + 当时 Scale）。
     ime_area: Option<(Rect, Scale)>,
+    /// 建窗时的装饰模式（E6）：`Decorations::None` ⇒ frameless（DWM 圆角、`WindowState` 的
+    /// `client_decoration` 都从这里派生）。运行期不可变。
+    decorations: Decorations,
+    /// 最近一次成功应用的窗口标题（泵每轮与 `WindowOptions.title` 比较，同值 no-op）。
+    title: SmolStr,
+    /// 窗口 / 任务栏图标（`WindowOptions.icon` 解码出的 `HICON`；`destroy` 时销毁）。
+    icon: Option<HICON>,
 }
 
 /// 测试构建的窗口 a11y 消费端代际。
@@ -214,19 +248,26 @@ impl NativeWindow {
             ))
         });
         let limits = placement::ClientLimits::from_options(options);
-        let state =
-            match WndProcState::new(dispatcher, hwnd, id, limits, driver, a11y_consumer_epoch) {
-                Ok(state) => Box::into_raw(Box::new(state)),
-                Err(error) => {
-                    // a11y adapter 构造失败（`A11yInit`）：窗口还没显示，直接销毁，避免泄漏 HWND。
-                    // SAFETY: 窗口刚由本函数创建，尚未交给任何其它所有者（`composition` 随本函数
-                    // 返回一起释放；DComp 目标引用 HWND，必须先销毁窗口）。
-                    unsafe {
-                        let _ = DestroyWindow(hwnd);
-                    }
-                    return Err(error);
+        let state = match WndProcState::new(
+            dispatcher,
+            hwnd,
+            id,
+            limits,
+            options.decorations,
+            driver,
+            a11y_consumer_epoch,
+        ) {
+            Ok(state) => Box::into_raw(Box::new(state)),
+            Err(error) => {
+                // a11y adapter 构造失败（`A11yInit`）：窗口还没显示，直接销毁，避免泄漏 HWND。
+                // SAFETY: 窗口刚由本函数创建，尚未交给任何其它所有者（`composition` 随本函数
+                // 返回一起释放；DComp 目标引用 HWND，必须先销毁窗口）。
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
                 }
-            };
+                return Err(error);
+            }
+        };
         // X1 / RB-13：模态窗口 —— 建窗后（显示前）禁用 owner，系统级拦截 owner 及其非客户区
         // 输入（用户无法与 owner 交互，视觉上灰显），关闭/销毁本窗口时由 `destroy` 恢复。
         //
@@ -274,6 +315,13 @@ impl NativeWindow {
         // SAFETY: `hwnd` 刚创建且本函数独占；`state` 的所有权转移给 `NativeWindow`（Drop 回收）。
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize) };
 
+        // E6：frameless 的 DWM 圆角偏好必须在**首次显示之前**设置（DWM 属性在隐藏窗口上设置是
+        // 标准做法）。DWM 阴影由 `WS_THICKFRAME` 提供、不需要调用；失败只影响观感（方角），
+        // 窗口继续可用（`chrome::apply_frameless_dwm` 内部一次性诊断）。
+        if options.decorations == Decorations::None {
+            let _ = chrome::apply_frameless_dwm(hwnd);
+        }
+
         let mut window = Self {
             id,
             hwnd,
@@ -283,8 +331,20 @@ impl NativeWindow {
             scale: Scale::ONE,
             logical_size: options.size,
             ime_area: None,
+            decorations: options.decorations,
+            title: options.title.clone(),
+            icon: None,
         };
         window.apply_dpi_and_size(options)?;
+        // E6：窗口图标在建窗完成之后应用（失败时 `Self` 已完整构造 ⇒ Drop 会销毁 HWND / 合成
+        // 目标；HICON 尚未创建，没有额外泄漏）。解码 / 创建都在显示之前，任务栏首帧即正确。
+        if let Some(bytes) = options.icon.as_deref() {
+            let bitmap = icon::decode(bytes)
+                .map_err(|cause| EngineError::WindowIcon { window: id, cause })?;
+            let handle = icon::create(&bitmap)?;
+            icon::apply_to_window(hwnd, handle);
+            window.icon = Some(handle);
+        }
         Ok(window)
     }
 
@@ -452,11 +512,12 @@ impl NativeWindow {
                 (*self.state).note_dpi(dpi, scale);
             }
             let client = physical_client(size, scale);
-            let (width, height) = dpi::window_size_for_client(client, dpi);
+            let (width, height) = dpi::window_size_for_client(client, dpi, self.decorations);
             match options.position {
                 Some(position) => {
                     let client_origin = dpi::physical_origin(position, scale);
-                    let (x, y) = dpi::window_origin_for_client(client_origin, client, dpi);
+                    let (x, y) =
+                        dpi::window_origin_for_client(client_origin, client, dpi, self.decorations);
                     // 公共契约：位置 clamp 到最近显示器工作区（至少标题栏可见）。
                     let target =
                         PhysicalRect::new(x, y, x.saturating_add(width), y.saturating_add(height));
@@ -618,6 +679,92 @@ impl NativeWindow {
         self.state_mut().set_drag_regions(window.drag_regions());
     }
 
+    // ── E6（P1-E6）：窗口 chrome 的运行时对账 ──────────────────────────────
+
+    /// 每轮泵对账：标题（`SetWindowTextW`）与窗口 chrome 状态（`IsZoomed` → `WindowState`）。
+    ///
+    /// - **标题**：与 `App` 窗口里的 `WindowOptions.title` 比较，值变化才调 `SetWindowTextW`
+    ///   （应用常在 `on_frame` 里按行情更新标题，同值不该有系统调用）。原生调用失败只记诊断
+    ///   （标题保持旧值，窗口可用），不回滚 `App` 侧的值 —— 下一轮会重试。
+    /// - **状态**：只在 `WM_SIZE` 置位的 `chrome_dirty` 为真时查询 `IsZoomed`（最大化 / 还原 /
+    ///   Snap 必然改变客户区）；变化时写 `Window::set_state`（它给根节点标 `PAINT`）并请求一帧
+    ///   （§8.6.4 / I3）。稳态每轮 0 次 `IsZoomed` 调用。
+    pub(crate) fn sync_chrome(&mut self, app: &mut App) {
+        let Some(window) = app.window(self.id) else {
+            return;
+        };
+        let desired_title = window.options().title.clone();
+        if desired_title != self.title && set_window_title(self.hwnd, &desired_title) {
+            self.title = desired_title;
+        }
+        if !self.state_mut().take_chrome_dirty() {
+            return;
+        }
+        let state = self.current_state();
+        let changed = app
+            .window_mut(self.id)
+            .is_some_and(|window| window.set_state(state));
+        if changed {
+            app.request_frame();
+        }
+    }
+
+    /// 当前窗口状态真值（`IsZoomed` + 建窗时的装饰模式）。
+    ///
+    /// `can_fullscreen = false`：Windows 侧没有全屏控制（`WindowControl::ToggleFullscreen`
+    /// 返回 `UnsupportedWindowCapability`，见 [`unsupported_window_control`]），应用据此隐藏按钮。
+    fn current_state(&self) -> WindowState {
+        WindowState {
+            client_decoration: self.decorations == Decorations::None,
+            // SAFETY: `self.hwnd` 由本结构独占且存活；`IsZoomed` 只读窗口状态。
+            maximized: unsafe { IsZoomed(self.hwnd) }.as_bool(),
+            fullscreen: false,
+            can_maximize: true,
+            can_minimize: true,
+            can_fullscreen: false,
+        }
+    }
+
+    /// 执行一条已通过能力判定的窗口控制（`App::request_window_control` 的落点）。
+    ///
+    /// 调用方（泵）**不持有** `&mut App`：`ShowWindow` 会同步派发 `WM_SIZE` / `WM_WINDOWPOSCHANGED`
+    /// 并重入 `WndProc`（文件头纪律 1）。`SW_MAXIMIZE` / `SW_RESTORE` 后 `WM_SIZE` 置位
+    /// `chrome_dirty`，同一轮泵的 [`Self::sync_chrome`] 会把真实状态写回 `App`。
+    pub(crate) fn apply_window_control(&self, control: WindowControl) {
+        match control {
+            WindowControl::Minimize => {
+                // SAFETY: `self.hwnd` 存活；`ShowWindow` 只改窗口显示状态。
+                unsafe {
+                    let _ = ShowWindow(self.hwnd, SW_MINIMIZE);
+                }
+            }
+            WindowControl::ToggleMaximize => {
+                // SAFETY: 同 Minimize；`IsZoomed` 只读。
+                let command = unsafe {
+                    if IsZoomed(self.hwnd).as_bool() {
+                        SW_RESTORE
+                    } else {
+                        SW_MAXIMIZE
+                    }
+                };
+                // SAFETY: 同上。
+                unsafe {
+                    let _ = ShowWindow(self.hwnd, command);
+                }
+            }
+            // `App::request_window_control` 已按 `unsupported_window_control` 拒绝这三项；
+            // 到达这里说明能力表与执行分支不一致（debug 构建立刻暴露）。
+            WindowControl::ToggleFullscreen
+            | WindowControl::BeginMove
+            | WindowControl::BeginResize(_) => {
+                debug_assert!(
+                    false,
+                    "unsupported window control reached the Windows pump: {control:?}"
+                );
+            }
+        }
+    }
+
     /// 窗口是否已被销毁（`close_requested_windows` 的 retain 判据）。
     pub(crate) fn is_destroyed(&self) -> bool {
         self.hwnd.is_invalid()
@@ -694,6 +841,10 @@ impl NativeWindow {
 
     /// 销毁窗口（幂等；`Drop` 也会调）。
     pub(crate) fn destroy(&mut self) {
+        // E6：`WM_SETICON` 不接管 HICON 所有权（系统只存句柄），销毁窗口时由引擎释放。
+        // 放在最前面：`destroy` 对 owner 级联销毁的僵尸句柄会提前 return，图标与 HWND 无关，
+        // 不能因为窗口已被系统销毁而泄漏 HICON（`take` 保证幂等路径只释放一次）。
+        icon::destroy(self.icon.take());
         // X1 / RB-13：模态窗口销毁前决定是否恢复 owner 的输入。顺序不能反：owned 窗口先没会
         // 让 owner 永久禁用（灰显 + 收不到任何输入）。
         //
@@ -839,7 +990,7 @@ fn another_modal_window_for(owner: HWND, excluded: HWND) -> bool {
 /// `position = None` ⇒ 确定性的 [`DEFAULT_WINDOW_ORIGIN`]。
 fn provisional_window_rect(options: &WindowOptions, dpi: u32) -> (i32, i32, i32, i32) {
     let client = physical_client(options.size, options.scale);
-    let (width, height) = dpi::window_size_for_client(client, dpi);
+    let (width, height) = dpi::window_size_for_client(client, dpi, options.decorations);
     let Some(position) = options.position else {
         return (
             DEFAULT_WINDOW_ORIGIN.0,
@@ -856,7 +1007,12 @@ fn provisional_window_rect(options: &WindowOptions, dpi: u32) -> (i32, i32, i32,
             height,
         );
     };
-    let origin = dpi::window_origin_for_client(dpi::physical_origin(position, scale), client, dpi);
+    let origin = dpi::window_origin_for_client(
+        dpi::physical_origin(position, scale),
+        client,
+        dpi,
+        options.decorations,
+    );
     let target = PhysicalRect::new(
         origin.0,
         origin.1,
@@ -911,20 +1067,52 @@ fn window_error(stage: &'static str, error: windows::core::Error) -> EngineError
     }
 }
 
+/// E6：把标题写进原生窗口（`SetWindowTextW`）；返回是否成功。
+///
+/// 失败只记诊断（窗口继续可用，标题保持旧值，下一轮泵会重试）：`SetWindowTextW` 只在句柄已
+/// 失效 / 跨进程窗口上失败，对本窗口是不可恢复的异常情况，但不该让泵崩掉（degrade, never panic）。
+fn set_window_title(hwnd: HWND, title: &str) -> bool {
+    let text = wide(title);
+    // SAFETY: `hwnd` 由 `NativeWindow` 持有且存活；`text` 是 NUL 结尾的 UTF-16 栈上缓冲，
+    // `SetWindowTextW` 同步拷贝字符串。
+    match unsafe { SetWindowTextW(hwnd, PCWSTR(text.as_ptr())) } {
+        Ok(()) => true,
+        Err(error) => {
+            if !TITLE_FAILURE_REPORTED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "kytrix: SetWindowTextW failed: {error:?}; the window keeps its previous title \
+                     (the engine retries on the next pump round)"
+                );
+            }
+            false
+        }
+    }
+}
+
+/// [`set_window_title`] 失败诊断的一次性开关（不刷屏；与 `dark_mode` 同口径）。
+static TITLE_FAILURE_REPORTED: AtomicBool = AtomicBool::new(false);
+
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use windows::Win32::UI::{
-        Input::{
-            Ime::{ImmGetContext, ImmReleaseContext},
-            KeyboardAndMouse::IsWindowEnabled,
-        },
-        WindowsAndMessaging::{
-            GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetWindow, GetWindowLongPtrW, IsWindow, SendMessageW,
-            WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WS_CHILD, WS_EX_TOPMOST,
+    use bytes::Bytes;
+    use windows::Win32::{
+        Foundation::{HWND, LPARAM, RECT, WPARAM},
+        UI::{
+            Input::{
+                Ime::{ImmGetContext, ImmReleaseContext},
+                KeyboardAndMouse::IsWindowEnabled,
+            },
+            WindowsAndMessaging::{
+                GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetWindow, GetWindowLongPtrW,
+                GetWindowRect, GetWindowTextW, ICON_BIG, IsWindow, NCCALCSIZE_PARAMS, SendMessageW,
+                WM_GETICON, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_NCCALCSIZE,
+                WS_CAPTION, WS_CHILD, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
+                WS_THICKFRAME,
+            },
         },
     };
 
@@ -936,7 +1124,7 @@ mod tests {
         node::builder::NodeBuilder,
         platform::dispatcher::Dispatcher,
         text::TextStyle,
-        window::{WindowId, WindowOptions},
+        window::{Decorations, WindowId, WindowOptions},
     };
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
@@ -1488,6 +1676,258 @@ mod tests {
                 .iter()
                 .any(|(window, event)| *window == id && matches!(event, Event::Ime(ImeEvent::End))),
             "系统迟到的 WM_IME_ENDCOMPOSITION 不得重复投递 End"
+        );
+    }
+
+    // ── E6（P1-E6）：frameless / 标题 / 图标 / 状态 ─────────────────────────
+
+    /// 建一个指定建窗参数的隐藏窗口（E6 用例共用）。
+    fn window_with_options(id: u32, options: &WindowOptions) -> NativeWindow {
+        NativeWindow::create(
+            WindowId::for_test(id),
+            options,
+            None,
+            Dispatcher::new(),
+            None,
+            crate::platform::windows::window::test_a11y_epoch(),
+        )
+        .expect("NativeWindow::create")
+    }
+
+    /// 读窗口标题（`WM_SETTEXT` / `WM_SETICON` 的只读回读；`GetWindowTextW` 不派发消息）。
+    fn window_title(hwnd: HWND) -> String {
+        let mut buffer = [0u16; 256];
+        // SAFETY: `hwnd` 由调用方保证存活；`buffer` 是栈上输出区，长度以 u16 数给出。
+        let length = unsafe { GetWindowTextW(hwnd, &mut buffer) };
+        String::from_utf16_lossy(&buffer[..usize::try_from(length).unwrap_or(0)])
+    }
+
+    /// 16×16 不透明红色 PNG（图标用例的合法字节）。
+    fn png_icon() -> Vec<u8> {
+        use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
+
+        let rgba = [0xFFu8, 0x00, 0x00, 0xFF].repeat(16 * 16);
+        let mut png = Vec::new();
+        PngEncoder::new(&mut png)
+            .write_image(&rgba, 16, 16, ExtendedColorType::Rgba8)
+            .expect("PNG 编码");
+        png
+    }
+
+    /// E6 / §11.6：frameless 仍必须带 `WS_OVERLAPPEDWINDOW` 的全部位（含 `WS_THICKFRAME` /
+    /// `WS_CAPTION`）—— 这是 Aero Snap / Snap Layouts / DWM 阴影 / 最大化动画保留的架构前提
+    /// （换成 `WS_POPUP` 会全部丢失）。
+    ///
+    /// 变异守卫：把 frameless 的窗口样式改成「去掉 WS_THICKFRAME」⇒ 本用例红。
+    #[test]
+    fn a_frameless_window_keeps_the_overlapped_window_style() {
+        let options = WindowOptions {
+            decorations: Decorations::None,
+            ..WindowOptions::default()
+        };
+        let native = window_with_options(31, &options);
+        // SAFETY: 窗口由本用例持有且仍存活；只读查询窗口样式。
+        let style = unsafe { GetWindowLongPtrW(native.hwnd, GWL_STYLE) } as u32;
+        for flag in [
+            WS_CAPTION,
+            WS_SYSMENU,
+            WS_THICKFRAME,
+            WS_MINIMIZEBOX,
+            WS_MAXIMIZEBOX,
+        ] {
+            assert_ne!(
+                style & flag.0,
+                0,
+                "frameless 窗口必须保留 {flag:?}（系统手势 / DWM 的入场券）"
+            );
+        }
+    }
+
+    /// E6 / §11.6：`WM_NCCALCSIZE`（wparam == TRUE）在 frameless 下返回 0 且客户区 = 整个窗口
+    /// 矩形；Native 仍由系统扣掉标题栏 / 边框（默认路径回归）。
+    ///
+    /// 变异守卫：删掉 `wndproc` 的 frameless 分支（交 `DefWindowProcW`）⇒ 第一条断言红。
+    #[test]
+    fn wm_nccalcsize_makes_the_frameless_client_area_cover_the_whole_window() {
+        let frameless = window_with_options(
+            32,
+            &WindowOptions {
+                decorations: Decorations::None,
+                ..WindowOptions::default()
+            },
+        );
+        let mut window_rect = RECT::default();
+        // SAFETY: 窗口由本用例持有且仍存活；`GetWindowRect` 只写栈上结构。
+        unsafe { GetWindowRect(frameless.hwnd, &mut window_rect) }.expect("GetWindowRect");
+        let mut params = NCCALCSIZE_PARAMS {
+            rgrc: [window_rect, window_rect, window_rect],
+            lppos: std::ptr::null_mut(),
+        };
+        // SAFETY: 窗口存活；`WM_NCCALCSIZE` 处理期只读写 `lParam` 指向的 `NCCALCSIZE_PARAMS`。
+        let result = unsafe {
+            SendMessageW(
+                frameless.hwnd,
+                WM_NCCALCSIZE,
+                Some(WPARAM(1)),
+                Some(LPARAM((&raw mut params) as isize)),
+            )
+        };
+        assert_eq!(result.0, 0, "frameless 的 WM_NCCALCSIZE 必须返回 0");
+        assert_eq!(
+            (
+                params.rgrc[0].left,
+                params.rgrc[0].top,
+                params.rgrc[0].right,
+                params.rgrc[0].bottom
+            ),
+            (
+                window_rect.left,
+                window_rect.top,
+                window_rect.right,
+                window_rect.bottom
+            ),
+            "frameless 客户区必须铺满整个窗口（否则屏幕上仍有一条系统标题栏）"
+        );
+
+        // 对照：Native 路径交 `DefWindowProcW`，窗口矩形比客户区大一圈（标题栏 / 边框）。
+        // 用真实 `GetWindowRect` / `GetClientRect` 对照而不是合成 `WM_NCCALCSIZE`：后者的
+        // `NCCALCSIZE_PARAMS.lppos` 语义由 USER 内部状态决定，合成消息会得到不可靠结果。
+        let native = window(33);
+        let mut native_window = RECT::default();
+        // SAFETY: 窗口由本用例持有且仍存活；只读查询。
+        unsafe { GetWindowRect(native.hwnd, &mut native_window) }.expect("GetWindowRect");
+        let mut native_client = RECT::default();
+        // SAFETY: 同上。
+        unsafe { GetClientRect(native.hwnd, &mut native_client) }.expect("GetClientRect");
+        assert!(
+            native_window.right - native_window.left > native_client.right - native_client.left
+                && native_window.bottom - native_window.top
+                    > native_client.bottom - native_client.top,
+            "Native 窗口必须保留系统非客户区（默认路径回归）：window={native_window:?} \
+             client={native_client:?}"
+        );
+    }
+
+    /// E6：frameless 的客户区尺寸 = 请求的逻辑尺寸 × DPI（窗口外框不再多一圈边框 / 标题栏）。
+    #[test]
+    fn a_frameless_window_client_is_exactly_the_requested_size() {
+        let options = WindowOptions {
+            decorations: Decorations::None,
+            size: Size::new(480.0, 320.0),
+            ..WindowOptions::default()
+        };
+        let native = window_with_options(34, &options);
+        let dpi = crate::platform::windows::dpi::window_dpi(native.hwnd);
+        let scale = crate::platform::windows::dpi::scale_from_dpi(dpi).expect("scale");
+        let client = native.client_size();
+        assert_eq!(
+            client,
+            (
+                (480.0 * scale.factor()).round() as u32,
+                (320.0 * scale.factor()).round() as u32
+            ),
+            "frameless 的客户区必须正好是请求尺寸（dpi={dpi}）"
+        );
+        // 窗口矩形与客户区一致（没有非客户区）。
+        let mut window_rect = RECT::default();
+        // SAFETY: 窗口存活。
+        unsafe { GetWindowRect(native.hwnd, &mut window_rect) }.expect("GetWindowRect");
+        let mut client_rect = RECT::default();
+        // SAFETY: 窗口存活。
+        unsafe { GetClientRect(native.hwnd, &mut client_rect) }.expect("GetClientRect");
+        assert_eq!(
+            (
+                window_rect.right - window_rect.left,
+                window_rect.bottom - window_rect.top
+            ),
+            (
+                client_rect.right - client_rect.left,
+                client_rect.bottom - client_rect.top
+            ),
+            "frameless 的窗口矩形必须等于客户区"
+        );
+    }
+
+    /// E6：运行时标题 + `WindowState` 对账（`sync_chrome` 的唯一落点）。
+    ///
+    /// 变异守卫：删掉 `sync_chrome` 的 `SetWindowTextW` 调用 ⇒ 标题回读仍是 "before"。
+    #[test]
+    fn sync_chrome_applies_the_runtime_title_and_reports_window_state() {
+        let runtime = runtime();
+        let mut app = App::new(runtime.handle().clone());
+        let options = WindowOptions {
+            title: smol_str::SmolStr::new_static("before"),
+            decorations: Decorations::None,
+            ..WindowOptions::default()
+        };
+        let id = app.create_window(options.clone());
+        // `NativeWindow` 的 `id` 必须与 `App` 的窗口 id 一致：`sync_chrome` 用它查 `App` 窗口。
+        let mut native = NativeWindow::create(
+            WindowId::for_test(id.to_bits()),
+            &options,
+            None,
+            Dispatcher::new(),
+            None,
+            crate::platform::windows::window::test_a11y_epoch(),
+        )
+        .expect("NativeWindow::create");
+        native.sync_chrome(&mut app);
+        assert_eq!(window_title(native.hwnd), "before");
+
+        let state = app.window(id).expect("窗口存在").state();
+        assert!(state.client_decoration, "frameless ⇒ 应用自绘装饰");
+        assert!(!state.maximized, "新建窗口不是最大化");
+        assert!(!state.can_fullscreen, "Windows 没有全屏控制");
+
+        app.set_title(id, smol_str::SmolStr::new_static("after"))
+            .expect("标题必须被接受");
+        native.sync_chrome(&mut app);
+        assert_eq!(window_title(native.hwnd), "after");
+        // 同值再同步：没有新变化（泵每轮调用，必须幂等）。
+        native.sync_chrome(&mut app);
+        assert_eq!(
+            window_title(native.hwnd),
+            "after",
+            "同值同步不得反复写标题（幂等）"
+        );
+    }
+
+    /// E6：合法图标在建窗时变成真实的 `WM_SETICON` 句柄（大小图标槽都设置）。
+    #[test]
+    fn a_window_icon_is_applied_to_the_native_window() {
+        let options = WindowOptions {
+            icon: Some(Bytes::from(png_icon())),
+            ..WindowOptions::default()
+        };
+        let native = window_with_options(36, &options);
+        for slot in [ICON_BIG, 0u32] {
+            // SAFETY: 窗口存活；`WM_GETICON` 只读图标句柄。
+            let icon =
+                unsafe { SendMessageW(native.hwnd, WM_GETICON, Some(WPARAM(slot as usize)), None) };
+            assert_ne!(icon.0, 0, "WM_SETICON 槽 {slot} 必须拿回非空 HICON");
+        }
+    }
+
+    /// E6：非法图标字节 ⇒ 建窗返回强类型 `WindowIcon`（I10，不静默丢图标）。
+    #[test]
+    fn an_invalid_icon_fails_window_creation_with_a_strong_error() {
+        let options = WindowOptions {
+            icon: Some(Bytes::from_static(b"definitely not a png or ico")),
+            ..WindowOptions::default()
+        };
+        let error = NativeWindow::create(
+            WindowId::for_test(37),
+            &options,
+            None,
+            Dispatcher::new(),
+            None,
+            crate::platform::windows::window::test_a11y_epoch(),
+        )
+        .err()
+        .expect("非法图标必须让建窗失败");
+        assert!(
+            matches!(error, crate::error::EngineError::WindowIcon { .. }),
+            "必须是强类型 WindowIcon 错误：{error:?}"
         );
     }
 }

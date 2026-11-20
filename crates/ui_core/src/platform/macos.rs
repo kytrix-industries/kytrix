@@ -16,3 +16,4 @@ pub(crate) mod wake;
 pub(crate) mod window;
 
 pub(crate) use event_loop::run;
+pub(crate) use window::unsupported_window_control;

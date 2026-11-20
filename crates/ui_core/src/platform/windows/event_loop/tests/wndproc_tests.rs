@@ -30,9 +30,10 @@ use windows::Win32::{
             KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture},
         },
         WindowsAndMessaging::{
-            CreateWindowExW, DestroyWindow, GWLP_USERDATA, GetWindowRect, HTBOTTOMRIGHT, HTCAPTION,
-            HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON, HTMINBUTTON, HTSYSMENU, HTTOPLEFT, MINMAXINFO,
-            MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PM_REMOVE, PeekMessageW, RegisterClassW,
+            CreateWindowExW, DestroyWindow, GWLP_USERDATA, GetClientRect, GetWindowRect, HTBOTTOM,
+            HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON,
+            HTMINBUTTON, HTRIGHT, HTSYSMENU, HTTOP, HTTOPLEFT, HTTOPRIGHT, MINMAXINFO, MSG,
+            PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PM_REMOVE, PeekMessageW, RegisterClassW,
             SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SPI_SETANIMATION, SPI_SETWORKAREA, SendMessageW,
             SetWindowLongPtrW, WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_DISPLAYCHANGE,
             WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_IME_CHAR,
@@ -59,7 +60,7 @@ use crate::{
             window::NativeWindow,
         },
     },
-    window::{WindowId, WindowOptions},
+    window::{Decorations, WindowId, WindowOptions},
 };
 
 fn wide(text: &str) -> Vec<u16> {
@@ -85,6 +86,24 @@ fn hidden_window_sized(
         tag,
         dispatcher,
         placement::ClientLimits::default(),
+        Decorations::Native,
+        width,
+        height,
+    )
+}
+
+/// E6：frameless（`Decorations::None`）的隐藏窗口（`WM_NCCALCSIZE` / `WM_NCHITTEST` 用例）。
+fn frameless_hidden_window(
+    tag: &str,
+    dispatcher: Arc<Dispatcher>,
+    width: i32,
+    height: i32,
+) -> (HWND, *mut WndProcState, Vec<u16>) {
+    hidden_window_with_limits(
+        tag,
+        dispatcher,
+        placement::ClientLimits::default(),
+        Decorations::None,
         width,
         height,
     )
@@ -96,6 +115,7 @@ fn hidden_window_with_limits(
     tag: &str,
     dispatcher: Arc<Dispatcher>,
     limits: placement::ClientLimits,
+    decorations: Decorations,
     width: i32,
     height: i32,
 ) -> (HWND, *mut WndProcState, Vec<u16>) {
@@ -134,6 +154,7 @@ fn hidden_window_with_limits(
         hwnd,
         WindowId::for_test(1),
         limits,
+        decorations,
         None,
         // RE-01：平台层不允许自造消费端代际；测试从真实 `A11yBridge` 取。
         crate::a11y::adapter::A11yBridge::new().consumer_epoch(),
@@ -783,8 +804,14 @@ fn wm_getminmaxinfo_applies_the_configured_client_limits() {
         ..WindowOptions::default()
     };
     let limits = placement::ClientLimits::from_options(&options);
-    let (hwnd, state, class_name) =
-        hidden_window_with_limits("KytrixWndProcMinMax", dispatcher, limits, 640, 480);
+    let (hwnd, state, class_name) = hidden_window_with_limits(
+        "KytrixWndProcMinMax",
+        dispatcher,
+        limits,
+        Decorations::Native,
+        640,
+        480,
+    );
     let dpi = dpi::window_dpi(hwnd);
     let mut info = MINMAXINFO::default();
 
@@ -798,8 +825,8 @@ fn wm_getminmaxinfo_applies_the_configured_client_limits() {
         );
     }
 
-    let min = dpi::track_size(Size::new(500.0, 300.0), dpi);
-    let max = dpi::track_size(Size::new(1200.0, 900.0), dpi);
+    let min = dpi::track_size(Size::new(500.0, 300.0), dpi, Decorations::Native);
+    let max = dpi::track_size(Size::new(1200.0, 900.0), dpi, Decorations::Native);
     assert_eq!(
         (info.ptMinTrackSize.x, info.ptMinTrackSize.y),
         (min.0 as i32, min.1 as i32),
@@ -822,8 +849,14 @@ fn wm_getminmaxinfo_applies_the_configured_client_limits() {
         ..WindowOptions::default()
     };
     let limits = placement::ClientLimits::from_options(&options);
-    let (hwnd, state, class_name) =
-        hidden_window_with_limits("KytrixWndProcMinMaxClamped", dispatcher, limits, 640, 480);
+    let (hwnd, state, class_name) = hidden_window_with_limits(
+        "KytrixWndProcMinMaxClamped",
+        dispatcher,
+        limits,
+        Decorations::Native,
+        640,
+        480,
+    );
     // SAFETY: 同上的所有权约定。
     let _raw = unsafe { &mut *state };
     let dpi = dpi::window_dpi(hwnd);
@@ -837,7 +870,7 @@ fn wm_getminmaxinfo_applies_the_configured_client_limits() {
             Some(LPARAM((&raw mut info) as isize)),
         );
     }
-    let clamped = dpi::track_size(Size::new(600.0, 500.0), dpi);
+    let clamped = dpi::track_size(Size::new(600.0, 500.0), dpi, Decorations::Native);
     assert_eq!(
         (info.ptMinTrackSize.x, info.ptMinTrackSize.y),
         (clamped.0 as i32, clamped.1 as i32),
@@ -1930,4 +1963,148 @@ fn losing_keyboard_focus_outside_composition_emits_no_ime_end() {
             .any(|event| matches!(event.event, PlatformEvent::Focus(false))),
         "失焦事件本身仍必须派发"
     );
+}
+
+// ── E6（P1-E6）：frameless 的命中码 / 跟踪尺寸 ─────────────────────────────
+
+/// E6 / §11.6：frameless 的 `WM_NCHITTEST` 必须由**引擎**回答：八向 resize 命中码（按 DPI 缩放
+/// 的 `SM_CXSIZEFRAME + SM_CXPADDEDBORDER`）、拖动区 `HTCAPTION`、其余 `HTCLIENT`。
+///
+/// 变异守卫：删掉 `wndproc` 的 frameless `WM_NCHITTEST` 分支（交 `DefWindowProcW`）⇒ 第一条
+/// 断言变红（frameless 下客户区铺满，系统一律返回 `HTCLIENT`）。
+#[test]
+fn frameless_hit_test_returns_resize_codes_caption_and_client() {
+    let _runtime = runtime();
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, class_name) =
+        frameless_hidden_window("KytrixFramelessHitTest", dispatcher, 640, 480);
+    let mut client = RECT::default();
+    // SAFETY: 窗口由本测试创建且仍存活；只读查询。
+    unsafe { GetClientRect(hwnd, &mut client) }.expect("GetClientRect");
+    let width = client.right - client.left;
+    let height = client.bottom - client.top;
+    assert!(width > 32 && height > 32, "前置：客户区必须足够大");
+    let mut origin = POINT { x: 0, y: 0 };
+    // SAFETY: 窗口存活；`ClientToScreen` 只做坐标换算。
+    unsafe {
+        let _ = ClientToScreen(hwnd, &mut origin);
+    }
+    let center_x = f32::from(i16::try_from(width / 2).expect("width"));
+    let center_y = f32::from(i16::try_from(height / 2).expect("height"));
+    let right_x = f32::from(i16::try_from(width - 2).expect("width"));
+    let bottom_y = f32::from(i16::try_from(height - 2).expect("height"));
+
+    assert_eq!(
+        hit_test(hwnd, Scale::ONE, origin, 1.0, 1.0),
+        HTTOPLEFT,
+        "左上角必须是 HTTOPLEFT"
+    );
+    assert_eq!(
+        hit_test(hwnd, Scale::ONE, origin, right_x, 1.0),
+        HTTOPRIGHT,
+        "右上角必须是 HTTOPRIGHT"
+    );
+    assert_eq!(
+        hit_test(hwnd, Scale::ONE, origin, 1.0, bottom_y),
+        HTBOTTOMLEFT,
+        "左下角必须是 HTBOTTOMLEFT"
+    );
+    assert_eq!(
+        hit_test(hwnd, Scale::ONE, origin, right_x, bottom_y),
+        HTBOTTOMRIGHT,
+        "右下角必须是 HTBOTTOMRIGHT"
+    );
+    assert_eq!(
+        hit_test(hwnd, Scale::ONE, origin, 1.0, center_y),
+        HTLEFT,
+        "左边必须是 HTLEFT"
+    );
+    assert_eq!(
+        hit_test(hwnd, Scale::ONE, origin, right_x, center_y),
+        HTRIGHT,
+        "右边必须是 HTRIGHT"
+    );
+    assert_eq!(
+        hit_test(hwnd, Scale::ONE, origin, center_x, 1.0),
+        HTTOP,
+        "上边必须是 HTTOP"
+    );
+    assert_eq!(
+        hit_test(hwnd, Scale::ONE, origin, center_x, bottom_y),
+        HTBOTTOM,
+        "下边必须是 HTBOTTOM"
+    );
+    assert_eq!(
+        hit_test(hwnd, Scale::ONE, origin, center_x, center_y),
+        HTCLIENT,
+        "客户区内部必须是 HTCLIENT"
+    );
+
+    // X2 拖动区：命中返回 HTCAPTION（系统 move 模态循环），区域外仍 HTCLIENT；
+    // resize 带**优先于**拖动区（§8.6.2：拖动区不得覆盖系统 resize 边框）。
+    // SAFETY: `state` 由 `frameless_hidden_window` 分配、生命周期到测试结束。
+    unsafe {
+        (*state).set_drag_regions(&[Rect::new(0.0, 0.0, 200.0, 24.0)]);
+    }
+    assert_eq!(
+        hit_test(hwnd, Scale::ONE, origin, 100.0, 12.0),
+        HTCAPTION,
+        "拖动区命中必须返回 HTCAPTION"
+    );
+    assert_eq!(
+        hit_test(hwnd, Scale::ONE, origin, 100.0, 100.0),
+        HTCLIENT,
+        "拖动区之外仍是 HTCLIENT"
+    );
+    assert_eq!(
+        hit_test(hwnd, Scale::ONE, origin, 2.0, 2.0),
+        HTTOPLEFT,
+        "resize 带优先于拖动区"
+    );
+    destroy_hidden_window(hwnd, state);
+    let _ = class_name;
+}
+
+/// E6：frameless 的 `WM_GETMINMAXINFO` 跟踪尺寸 = 客户区物理尺寸（不再加标题栏 / 边框）；
+/// 同参数下 Native 的 `ptMinTrackSize` 必须更大（防「两条分支其实一样」）。
+#[test]
+fn frameless_track_size_is_the_client_size_without_the_non_client_area() {
+    let _runtime = runtime();
+    let limits = placement::ClientLimits::default();
+    let dpi = crate::platform::windows::dpi::system_dpi();
+    let frameless = dpi::track_size(Size::new(400.0, 300.0), dpi, Decorations::None);
+    let native = dpi::track_size(Size::new(400.0, 300.0), dpi, Decorations::Native);
+    assert!(
+        native.0 > frameless.0 && native.1 > frameless.1,
+        "Native 的跟踪尺寸必须多一圈非客户区：frameless={frameless:?} native={native:?}"
+    );
+
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, class_name) = hidden_window_with_limits(
+        "KytrixFramelessMinMax",
+        dispatcher,
+        limits,
+        Decorations::None,
+        640,
+        480,
+    );
+    let mut info = MINMAXINFO::default();
+    // SAFETY: 窗口由本测试创建且仍存活；`WM_GETMINMAXINFO` 只写 `lParam` 指向的栈上结构。
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_GETMINMAXINFO,
+            None,
+            Some(LPARAM((&raw mut info) as isize)),
+        );
+    }
+    let dpi = dpi::window_dpi(hwnd);
+    let expected = dpi::track_size(dpi::MIN_SIZE_LOGICAL, dpi, Decorations::None);
+    assert_eq!(
+        (info.ptMinTrackSize.x, info.ptMinTrackSize.y),
+        (expected.0 as i32, expected.1 as i32),
+        "frameless 的 ptMinTrackSize 必须是客户区物理尺寸（dpi={dpi}）"
+    );
+    destroy_hidden_window(hwnd, state);
+    let _ = class_name;
 }

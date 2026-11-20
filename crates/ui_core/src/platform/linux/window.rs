@@ -134,3 +134,18 @@ const _: () = assert!(
     SHADOW_MARGIN.to_bits() == 0,
     "SHADOW_MARGIN 改成非 0 时必须同时实现 wl_surface.set_input_region（见本模块文档「wl_region 的已知取舍」）"
 );
+
+/// 本端没有等价实现的窗口控制（`None` = 支持；E6 §11.6）。
+///
+/// Wayland 的 `xdg_toplevel` 请求表覆盖全部 [`crate::window::WindowControl`]：`Minimize` →
+/// `set_minimized`、`ToggleMaximize` → `set_maximized` / `unset_maximized`、`ToggleFullscreen` →
+/// `set_fullscreen` / `unset_fullscreen`、`BeginMove` / `BeginResize` → `_move` / `resize`
+/// （compositor 可能忽略请求，最终状态一律以 [`crate::window::WindowState`] 为准）。因此本端
+/// 没有「无等价能力」的控制。
+///
+/// 消费者：`app::window_set::request_window_control`（能力判定在任何状态变更之前）。
+pub(crate) const fn unsupported_window_control(
+    _control: crate::window::WindowControl,
+) -> Option<&'static str> {
+    None
+}

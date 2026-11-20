@@ -84,25 +84,27 @@ use objc2::{
     runtime::{AnyObject, ProtocolObject},
 };
 use objc2_app_kit::{
-    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSFloatingWindowLevel,
-    NSModalPanelWindowLevel, NSScreen, NSWindow, NSWindowButton, NSWindowCollectionBehavior,
-    NSWindowDelegate, NSWindowOcclusionState, NSWindowOrderingMode, NSWindowStyleMask,
-    NSWindowTabbingMode, NSWindowTitleVisibility,
+    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSColor,
+    NSFloatingWindowLevel, NSModalPanelWindowLevel, NSScreen, NSView, NSWindow, NSWindowButton,
+    NSWindowCollectionBehavior, NSWindowDelegate, NSWindowOcclusionState, NSWindowOrderingMode,
+    NSWindowStyleMask, NSWindowTabbingMode, NSWindowTitleVisibility,
 };
 use objc2_foundation::{
     NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
 use objc2_quartz_core::CAMetalLayer;
+use smol_str::SmolStr;
 
 use crate::{
     app::App,
     error::EngineError,
     event::{Event, ImeEvent},
-    math::{Rect, Scale, Size},
+    math::{Point, Rect, Scale, Size},
     paint::style::Cursor,
     platform::{
         dispatcher::Dispatcher,
         macos::{a11y::MacA11y, dpi, menu, view::GuiView, wake},
+        macos_chrome::{self, LightRect},
         macos_close::{CloseAction, CloseBridge},
         macos_owner::{
             ModalOwnerChromes, ModalOwnerRelease, OwnerChrome, WindowKeyInput, WindowLevel,
@@ -110,7 +112,7 @@ use crate::{
         macos_placement as placement,
         menu::MenuCommand,
     },
-    window::{WindowId, WindowOptions},
+    window::{WindowControl, WindowId, WindowOptions, WindowState},
 };
 
 /// `NSWindowDelegate` 的 ivar：只记「AppKit 关闭窗口的事实」并唤醒泵。
@@ -223,6 +225,28 @@ impl WindowDelegate {
 
 /// 最小客户区（逻辑像素；与 Win32 / Wayland 同源）。
 pub(crate) const MIN_SIZE_LOGICAL: (f32, f32) = (320.0, 200.0);
+
+/// 本端没有等价实现的窗口控制（`None` = 支持；E6 §11.6）。
+///
+/// macOS 的原生路径：`Minimize` → `performMiniaturize:`、`ToggleMaximize` → `performZoom:`、
+/// `ToggleFullscreen` → `toggleFullScreen:`。`BeginMove` / `BeginResize` 需要**触发它的
+/// `NSEvent`**（`performWindowDragWithEvent:` / 边框拖拽都是事件驱动的），而
+/// `App::request_window_control` 是纯数据调用、没有事件对象 ⇒ 返回强类型错误（I10，不静默排队）。
+/// 拖动仍可走 [`crate::window::Window::set_drag_regions`]（`GuiView mouseDown:` 有真实事件）。
+///
+/// 消费者：`app::window_set::request_window_control`（能力判定在任何状态变更之前）。
+pub(crate) const fn unsupported_window_control(
+    control: crate::window::WindowControl,
+) -> Option<&'static str> {
+    use crate::window::WindowControl;
+    match control {
+        WindowControl::Minimize
+        | WindowControl::ToggleMaximize
+        | WindowControl::ToggleFullscreen => None,
+        WindowControl::BeginMove => Some("interactive move window control"),
+        WindowControl::BeginResize(_) => Some("interactive resize window control"),
+    }
+}
 
 /// 全部屏幕的 frame / visibleFrame 快照（B3；`NSScreen` 是主线程对象，建窗与泵都在主线程）。
 fn screen_areas(mtm: MainThreadMarker) -> Vec<placement::ScreenArea> {
@@ -373,6 +397,13 @@ pub(crate) struct NativeWindow {
     destroyed: bool,
     /// 最近一次下发的 IME caret 区域（逻辑坐标）。
     ime_area: Option<Rect>,
+    /// 最近一次成功应用（写进 `NSWindow.setTitle:`）的标题（泵每轮与 `WindowOptions.title` 比较，
+    /// 同值 no-op；E6 运行时改标题）。
+    title: SmolStr,
+    /// 最近一次应用到三个标准按钮的交通灯位置（逻辑点，内容区左上原点；`None` = 系统默认）。
+    ///
+    /// 泵每轮与 `Window::traffic_light_position` 比较；值变化才调整按钮 frame（E6 §8.6.5）。
+    traffic_light_position: Option<Point>,
     /// 已应用到 `GuiView` 的 IME 启用状态（B6；目标状态来自 `App::ime_enabled`）。
     ime_enabled: bool,
     /// `sync_state` 观察到的「窗口刚失去键盘焦点」边沿（泵在同步后消费它做 IME 清场）。
@@ -537,6 +568,8 @@ impl NativeWindow {
             visible: true,
             destroyed: false,
             ime_area: None,
+            title: options.title.clone(),
+            traffic_light_position: None,
             // 与 `App::ime_enabled` 的默认值一致（默认启用）；首次 `sync_ime_enabled`
             // 因此不会产生任何平台调用。
             ime_enabled: true,
@@ -921,6 +954,178 @@ impl NativeWindow {
             window.request_repaint();
         }
         true
+    }
+
+    // ── E6（P1-E6）：窗口 chrome 的运行时对账 ──────────────────────────────
+
+    /// 每轮泵对账：标题 / 交通灯位置 / `WindowState`（`isZoomed` + `styleMask` 全屏位）。
+    ///
+    /// 返回 `true` = 本轮 chrome 有变化（泵据此在**同一轮**出帧；`Window::set_state` 已给根节点
+    /// 标 `PAINT`，与其它平台事件走同一条帧门禁，不额外唤醒 run loop —— R09-15②）。
+    ///
+    /// 三端口径（§8.6.1）：macOS 的 `client_decoration` **恒 `false`**（原生交通灯 + 透明标题栏
+    /// 由系统绘制，应用只按安全区留白）；`can_fullscreen = true`（`toggleFullScreen:` 是原生能力）；
+    /// 原生全屏下 AppKit 隐藏交通灯 ⇒ `Window::set_traffic_light_inset(None)`（§8.6.5）。
+    ///
+    /// `Decorations::None` 在 macOS 上是**文档化降级**（[`crate::window::Decorations`]）：窗口形态
+    /// 不变，`client_decoration` 仍为 `false` —— AppKit 的「无装饰窗口」会同时失去关闭 / 最小化 /
+    /// 缩放按钮与 WindowServer 手势，E6 不做。
+    pub(crate) fn sync_chrome(&mut self, app: &mut App) -> bool {
+        let Some(window) = app.window(self.id) else {
+            return false;
+        };
+        let desired_title = window.options().title.clone();
+        let desired_position = window.traffic_light_position();
+        let mut changed = false;
+        if desired_title != self.title {
+            self.window
+                .setTitle(&NSString::from_str(desired_title.as_str()));
+            self.title = desired_title;
+        }
+        if desired_position != self.traffic_light_position {
+            self.traffic_light_position = desired_position;
+            self.apply_traffic_light_position();
+            changed = true;
+        } else if self.traffic_light_position.is_some() {
+            // AppKit 在窗口 resize / 全屏转场后会**重新布局**标准按钮：自定义位置必须每轮对账
+            // （already-at-target 时 `apply_traffic_light_position` 是 no-op）。
+            self.apply_traffic_light_position();
+        }
+        let fullscreen = self
+            .window
+            .styleMask()
+            .contains(NSWindowStyleMask::FullScreen);
+        let state = WindowState {
+            client_decoration: false,
+            maximized: self.window.isZoomed(),
+            fullscreen,
+            can_maximize: true,
+            can_minimize: true,
+            can_fullscreen: true,
+        };
+        let inset = if fullscreen {
+            None
+        } else {
+            self.traffic_light_inset()
+        };
+        let Some(window) = app.window_mut(self.id) else {
+            return changed;
+        };
+        if window.set_state(state) {
+            changed = true;
+        }
+        if window.set_traffic_light_inset(inset) {
+            changed = true;
+        }
+        changed
+    }
+
+    /// 执行一条已通过能力判定的窗口控制（`App::request_window_control` 的落点）。
+    ///
+    /// 三个系统按钮的 AppKit 语义：`performMiniaturize:` / `performZoom:` / `toggleFullScreen:`。
+    /// `BeginMove` / `BeginResize` 已在上游按能力拒绝（需要真实的 `NSEvent`，见
+    /// [`unsupported_window_control`]）。
+    pub(crate) fn apply_window_control(&self, control: WindowControl) {
+        match control {
+            WindowControl::Minimize => self.window.performMiniaturize(None),
+            WindowControl::ToggleMaximize => self.window.performZoom(None),
+            WindowControl::ToggleFullscreen => self.window.toggleFullScreen(None),
+            WindowControl::BeginMove | WindowControl::BeginResize(_) => {
+                debug_assert!(
+                    false,
+                    "unsupported window control reached the macOS pump: {control:?}"
+                );
+            }
+        }
+    }
+
+    /// 三个标准按钮在**内容区坐标系**（左上原点、y 向下）里的矩形。
+    ///
+    /// `convertRect:toView:` 负责 flip（`GuiView` 是 flipped、titlebar 容器不是）—— 手算 y 方向
+    /// 会在半像素 / RTL 布局上错；`standardWindowButton:` 返回 nil（原生全屏隐藏）时跳过。
+    fn traffic_light_rects(&self) -> Vec<LightRect> {
+        let Some(content) = self.window.contentView() else {
+            return Vec::new();
+        };
+        let mut rects = Vec::with_capacity(3);
+        for button in [
+            NSWindowButton::CloseButton,
+            NSWindowButton::MiniaturizeButton,
+            NSWindowButton::ZoomButton,
+        ] {
+            let Some(button) = self.window.standardWindowButton(button) else {
+                continue;
+            };
+            let frame = button.convertRect_toView(button.bounds(), Some(&content));
+            rects.push(LightRect {
+                x: frame.origin.x,
+                y: frame.origin.y,
+                width: frame.size.width,
+                height: frame.size.height,
+            });
+        }
+        rects
+    }
+
+    /// 当前交通灯安全区（`None` = 取不到任何按钮：原生全屏 / 尚未布局）。
+    fn traffic_light_inset(&self) -> Option<Point> {
+        macos_chrome::traffic_light_inset(&self.traffic_light_rects())
+    }
+
+    /// 把三个标准按钮的**分组左上角**移到应用请求的位置（逻辑点，内容区左上原点、y 向下）。
+    ///
+    /// 布局基准是按钮当前 frame（系统默认布局），只平移整组、保持系统间距；`convertPoint:toView:`
+    /// 把目标点换算回按钮父视图的坐标系（`setFrameOrigin:` 的参数空间）。已经是目标位置时
+    /// no-op（每轮调用，见 [`Self::sync_chrome`]）。`None` = 恢复系统默认 —— 本引擎不保存系统
+    /// 默认布局的副本，因此运行期把自定义位置改回 `None` 不可撤销（应用应在建窗时决定；
+    /// 文档化的限制，见 `App::set_traffic_light_position`）。
+    fn apply_traffic_light_position(&self) {
+        let Some(target) = self.traffic_light_position else {
+            return;
+        };
+        let Some(content) = self.window.contentView() else {
+            return;
+        };
+        let mut entries: Vec<(Retained<NSButton>, Retained<NSView>, NSRect)> =
+            Vec::with_capacity(3);
+        for button in [
+            NSWindowButton::CloseButton,
+            NSWindowButton::MiniaturizeButton,
+            NSWindowButton::ZoomButton,
+        ] {
+            let Some(button) = self.window.standardWindowButton(button) else {
+                continue;
+            };
+            // SAFETY: `superview` 是 NSView 的 ObjC 只读方法；`Retained` 在本次调用期间保活父视图
+            // （按钮由窗口持有，父视图生命周期覆盖窗口）。
+            let Some(superview) = (unsafe { button.superview() }) else {
+                continue;
+            };
+            let frame = button.convertRect_toView(button.bounds(), Some(&content));
+            entries.push((button, superview, frame));
+        }
+        let (Some(min_x), Some(min_y)) = (
+            entries
+                .iter()
+                .map(|(_, _, frame)| frame.origin.x)
+                .reduce(f64::min),
+            entries
+                .iter()
+                .map(|(_, _, frame)| frame.origin.y)
+                .reduce(f64::min),
+        ) else {
+            return;
+        };
+        let dx = f64::from(target.x) - min_x;
+        let dy = f64::from(target.y) - min_y;
+        if dx.abs() <= 0.5 && dy.abs() <= 0.5 {
+            return;
+        }
+        for (button, superview, frame) in entries {
+            let target_origin = NSPoint::new(frame.origin.x + dx, frame.origin.y + dy);
+            let super_origin = content.convertPoint_toView(target_origin, Some(&superview));
+            button.setFrameOrigin(super_origin);
+        }
     }
 
     /// 交付一笔 a11y 更新（`a11y_pending` 为 O(1) 过滤；adapter 不活跃时闭包不执行）。

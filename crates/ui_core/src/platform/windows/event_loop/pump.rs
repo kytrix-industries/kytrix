@@ -704,6 +704,28 @@ pub(super) fn pump_loop(
             // ②b GPU 线程反馈：设备丢失 / 呈现失败是粘性的，在这里冒泡出去（三平台统一）。
             app.poll_renderers()?;
         }
+        // ②a″ E6：窗口 chrome 对账（标题 `SetWindowTextW` + 最大化状态 `IsZoomed` → `WindowState`）。
+        //
+        // 顺序：先应用应用侧登记的控制请求（`ShowWindow` 会同步派发 `WM_SIZE` ⇒ 置
+        // `chrome_dirty`），再逐窗口对账 —— 这样同一轮就能把真实的最大化状态写回 `App` 并出帧。
+        //
+        // 借用纪律：`ShowWindow` 可能同步重入 `WndProc`，因此**不持有** `&mut App` 执行；标题 /
+        // 状态对账要碰 `App`，放在短借用里逐窗口做（`WndProc` 不调用应用层）。
+        {
+            let pending_control = {
+                let mut app = app_cell.borrow_mut();
+                app.take_window_control()
+            };
+            if let Some((id, control)) = pending_control
+                && let Some(native) = windows.iter().find(|native| native.id() == id)
+            {
+                native.apply_window_control(control);
+            }
+            let mut app = app_cell.borrow_mut();
+            for native in windows.iter_mut() {
+                native.sync_chrome(&mut app);
+            }
+        }
         // ②b″ 模态循环里由 `ResizeFrameDriver` 登记的错误：帧管线失败不可重试，必须冒泡。
         for native in windows.iter_mut() {
             if let Some(error) = native.state_mut().take_pending_error() {
