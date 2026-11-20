@@ -15,6 +15,7 @@ use accesskit::{Action, ActionData, ActionRequest};
 use crate::{
     a11y::{
         A11yAction, A11yActionCtx, A11yActionData, A11yDiagnostic, A11yNodeId, A11yRole,
+        A11yTextPosition,
         mapping::{action_from_accesskit, effective_role_of},
         textrun,
     },
@@ -258,6 +259,9 @@ fn increment_payload(
 }
 
 /// 把 `accesskit::ActionData` 翻译成引擎 payload。
+///
+/// `SetTextSelection` **不在这里**：它需要把 AT 的 grapheme 下标换算成字节并保留位置宿主的
+/// `TextRun` 身份（见 [`selection_payload`]），是唯一在入口处单独翻译的 payload。
 fn payload_of(data: Option<&ActionData>, action: A11yAction) -> A11yActionData<'_> {
     match (action, data) {
         (A11yAction::Custom(id), _) => A11yActionData::Custom(id),
@@ -266,10 +270,6 @@ fn payload_of(data: Option<&ActionData>, action: A11yAction) -> A11yActionData<'
         // 旧实现把它落到 `A11yActionData::None`，应用无法知道 AT 要求的目标数值，
         // 于是「滑块能被 AT 读到数值、却不能被 AT 设值」（review P2-5）。
         (_, Some(ActionData::NumericValue(value))) => A11yActionData::NumericValue(*value),
-        (_, Some(ActionData::SetTextSelection(selection))) => A11yActionData::Selection {
-            anchor: selection.anchor.character_index,
-            focus: selection.focus.character_index,
-        },
         (_, Some(ActionData::SetScrollOffset(point))) => {
             A11yActionData::ScrollOffset(Point::new(point.x as f32, point.y as f32))
         }
@@ -277,12 +277,14 @@ fn payload_of(data: Option<&ActionData>, action: A11yAction) -> A11yActionData<'
     }
 }
 
-/// E4a：AT 的文本选区 → 应用层 payload（**UTF-8 字节偏移**）+ 归一后的 handler 目标。
+/// E4a/E4b：AT 的文本选区 → 应用层 payload（**UTF-8 字节偏移 + 端点宿主**）+ 归一后的
+/// handler 目标。
 ///
 /// `accesskit::TextPosition.character_index` 是 `character_lengths`（grapheme 划分）的下标；
 /// 应用侧（`A11yTextSelection` / IME caret / `String`）统一用字节偏移，所以两端都在这里换算并
-/// 夹紧（越界 = 文本末尾的 caret）。位置节点的稳定 id 经窗口分配器解回引擎句柄；任一端解析
-/// 失败时回退到目标自身（仅当目标本身是 TextRun），否则返回 `None` 由调用方拒绝。
+/// 夹紧（越界 = 该 run 文本末尾的 caret）。位置节点的稳定 id 经窗口分配器解回引擎句柄，**两端
+/// 各自保留自己的 `TextRun` 宿主**（多 run 输入框的跨 run 选区据此还原）；任一端解析失败时
+/// 回退到目标自身（仅当目标本身是 TextRun），否则返回 `None` 由调用方拒绝。
 fn selection_payload(
     app: &App,
     window: WindowId,
@@ -294,14 +296,14 @@ fn selection_payload(
     };
     let window_state = app.window(window)?;
     let tree = window_state.tree();
-    let anchor = selection_byte_index(
+    let anchor = selection_position(
         tree,
         window_state,
         selection.anchor.node.0,
         selection.anchor.character_index,
         target,
     )?;
-    let focus = selection_byte_index(
+    let focus = selection_position(
         tree,
         window_state,
         selection.focus.node.0,
@@ -314,21 +316,24 @@ fn selection_payload(
     ))
 }
 
-/// 选区一端的 AT 位置（稳定 id + grapheme 下标）→ UTF-8 字节偏移。
-fn selection_byte_index(
+/// 选区一端的 AT 位置（稳定 id + grapheme 下标）→ 宿主 `TextRun` 节点 + 该 run 内的 UTF-8 字节。
+fn selection_position(
     tree: &NodeTree,
     window: &Window,
     stable: u64,
     character_index: usize,
     fallback: NodeId,
-) -> Option<usize> {
+) -> Option<A11yTextPosition> {
     let run = window
         .a11y_engine_of(A11yNodeId::from_stable(stable))
         .filter(|engine| is_text_run(tree, *engine))
         .or_else(|| is_text_run(tree, fallback).then_some(fallback))?;
     let content = tree.text_content(run)?;
     let (lengths, _) = textrun::text_metrics(&content.text)?;
-    Some(textrun::byte_index(&lengths, character_index))
+    Some(A11yTextPosition {
+        node: run,
+        byte_index: textrun::byte_index(&lengths, character_index),
+    })
 }
 
 /// 选区动作的 handler 目标归一：Windows 把 `SetTextSelection` 打在 `TextRun` 上，macOS/AT-SPI
@@ -1002,21 +1007,23 @@ mod tests {
         (input, text, stable)
     }
 
-    /// E4a：AT 的 grapheme 下标在引擎边界换算成**应用层的 UTF-8 字节偏移**；macOS/AT-SPI 的
-    /// 目标是输入框，`ctx.node()` 必须仍是输入框。
+    /// E4a/E4b：AT 的 grapheme 下标在引擎边界换算成**应用层的 UTF-8 字节偏移**，并保留端点
+    /// 宿主 `TextRun` 身份；macOS/AT-SPI 的目标是输入框，`ctx.node()` 必须仍是输入框。
     #[test]
-    fn set_text_selection_uses_byte_offsets() {
+    fn set_text_selection_uses_byte_offsets_in_the_host_run() {
         let (_runtime, mut app, window) = setup();
-        let (input, _text, run) = text_input_fixture(&mut app, window);
-        let seen = Rc::new(Cell::new((
-            usize::MAX,
-            usize::MAX,
-            None::<crate::node::id::NodeId>,
-        )));
+        let (input, text, run) = text_input_fixture(&mut app, window);
+        let seen = Rc::new(Cell::new(
+            None::<(
+                crate::a11y::A11yTextPosition,
+                crate::a11y::A11yTextPosition,
+                crate::node::id::NodeId,
+            )>,
+        ));
         let sink = Rc::clone(&seen);
         app.on_a11y_action(A11yAction::SetTextSelection, move |ctx| {
             if let A11yActionData::Selection { anchor, focus } = ctx.data() {
-                sink.set((anchor, focus, Some(ctx.node())));
+                sink.set(Some((anchor, focus, ctx.node())));
             }
         });
 
@@ -1038,8 +1045,18 @@ mod tests {
         );
         assert_eq!(
             seen.get(),
-            (3, 8, Some(input)),
-            "grapheme 1..3 → 字节 3..8（CJK 3 + emoji 4），目标归一为输入框"
+            Some((
+                crate::a11y::A11yTextPosition {
+                    node: text,
+                    byte_index: 3,
+                },
+                crate::a11y::A11yTextPosition {
+                    node: text,
+                    byte_index: 8,
+                },
+                input,
+            )),
+            "grapheme 1..3 → 字节 3..8（CJK 3 + emoji 4）；两端宿主 = 该 TextRun；目标归一为输入框"
         );
         assert_no_action_diagnostics(&app, "合法选区不得记未处理诊断");
     }
@@ -1125,6 +1142,149 @@ mod tests {
             "拒绝必须留 InvalidActionData 诊断：{:?}",
             app.a11y_diagnostics()
         );
+    }
+
+    /// 造一个「输入框 + **两个**子文本运行 `"价格"` / `"42"`」的夹具（跨 run 选区用），
+    /// 返回 `(input, first_run, second_run)` 与两个 run 已分配的稳定 id。
+    fn two_run_text_input_fixture(
+        app: &mut App,
+        window: crate::window::WindowId,
+    ) -> (
+        crate::node::id::NodeId,
+        crate::node::id::NodeId,
+        crate::node::id::NodeId,
+        crate::a11y::A11yNodeId,
+        crate::a11y::A11yNodeId,
+    ) {
+        let root = app.window(window).expect("window").tree().root();
+        let input = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(crate::a11y::A11yRole::TextInput),
+                label: Some(SmolStr::new_static("价格")),
+                ..A11yOverride::default()
+            })
+            .build(app.window_mut(window).expect("window").tree_mut(), root)
+            .expect("input");
+        let first = NodeBuilder::text("价格", crate::text::TextStyle::new(12.0))
+            .build(app.window_mut(window).expect("window").tree_mut(), input)
+            .expect("first run");
+        let second = NodeBuilder::text("42", crate::text::TextStyle::new(12.0))
+            .build(app.window_mut(window).expect("window").tree_mut(), input)
+            .expect("second run");
+        let _ = app
+            .a11y_take(window)
+            .expect("首笔 a11y 交付（分配稳定 id）");
+        let state = app.window(window).expect("window");
+        let first_stable = state.a11y_stable_id(first).expect("first run 的稳定 id");
+        let second_stable = state.a11y_stable_id(second).expect("second run 的稳定 id");
+        (input, first, second, first_stable, second_stable)
+    }
+
+    /// E4a/E4b：输入框有**两个** TextRun 子节点时，跨 run 选区必须分别保留两端的 run 身份与
+    /// 各自的 run 内字节偏移（修复前 payload 只有裸字节区间，应用无法还原「从 run A 的哪个字节
+    /// 到 run B 的哪个字节」；且 `ctx.node()` 仍是归一化的输入框）。
+    #[test]
+    fn a_selection_across_two_text_runs_keeps_each_end_its_run_identity() {
+        let (_runtime, mut app, window) = setup();
+        let (input, first, second, first_stable, second_stable) =
+            two_run_text_input_fixture(&mut app, window);
+        let seen = Rc::new(Cell::new(
+            None::<(
+                crate::a11y::A11yTextPosition,
+                crate::a11y::A11yTextPosition,
+                crate::node::id::NodeId,
+            )>,
+        ));
+        let sink = Rc::clone(&seen);
+        app.on_a11y_action(A11yAction::SetTextSelection, move |ctx| {
+            if let A11yActionData::Selection { anchor, focus } = ctx.data() {
+                sink.set(Some((anchor, focus, ctx.node())));
+            }
+        });
+
+        dispatch_request(
+            &mut app,
+            window,
+            AkAction::SetTextSelection,
+            input,
+            Some(ActionData::SetTextSelection(accesskit::TextSelection {
+                anchor: accesskit::TextPosition {
+                    node: AkNodeId(first_stable.get()),
+                    character_index: 2,
+                },
+                focus: accesskit::TextPosition {
+                    node: AkNodeId(second_stable.get()),
+                    character_index: 1,
+                },
+            })),
+        );
+        assert_eq!(
+            seen.get(),
+            Some((
+                crate::a11y::A11yTextPosition {
+                    node: first,
+                    byte_index: 6,
+                },
+                crate::a11y::A11yTextPosition {
+                    node: second,
+                    byte_index: 1,
+                },
+                input,
+            )),
+            "跨 run 选区：anchor 在 run「价格」末尾（字节 6）、focus 在 run「42」的第 1 字节，\
+             两端身份各自独立；ctx.node() 仍是输入框"
+        );
+        assert_no_action_diagnostics(&app, "合法跨 run 选区不得记未处理诊断");
+    }
+
+    /// E4a 现状保持：字符下标越过该 run 的 grapheme 数时**夹紧**到 run 内文本末尾（AT 可能拿着
+    /// 旧快照的位置），宿主身份仍属于这个 run（不漂移到另一端的 run）。
+    #[test]
+    fn an_out_of_range_character_index_clamps_inside_the_host_run() {
+        let (_runtime, mut app, window) = setup();
+        let (input, first, second, first_stable, second_stable) =
+            two_run_text_input_fixture(&mut app, window);
+        let seen = Rc::new(Cell::new(
+            None::<(crate::a11y::A11yTextPosition, crate::a11y::A11yTextPosition)>,
+        ));
+        let sink = Rc::clone(&seen);
+        app.on_a11y_action(A11yAction::SetTextSelection, move |ctx| {
+            if let A11yActionData::Selection { anchor, focus } = ctx.data() {
+                sink.set(Some((anchor, focus)));
+            }
+        });
+
+        dispatch_request(
+            &mut app,
+            window,
+            AkAction::SetTextSelection,
+            input,
+            Some(ActionData::SetTextSelection(accesskit::TextSelection {
+                anchor: accesskit::TextPosition {
+                    node: AkNodeId(first_stable.get()),
+                    character_index: 99,
+                },
+                focus: accesskit::TextPosition {
+                    node: AkNodeId(second_stable.get()),
+                    character_index: 99,
+                },
+            })),
+        );
+        assert_eq!(
+            seen.get(),
+            Some((
+                crate::a11y::A11yTextPosition {
+                    node: first,
+                    byte_index: 6,
+                },
+                crate::a11y::A11yTextPosition {
+                    node: second,
+                    byte_index: 2,
+                },
+            )),
+            "越界下标夹紧到各自 run 的文本末尾（不是另一端的 run）"
+        );
+        assert_no_action_diagnostics(&app, "夹紧仍属合法 payload");
     }
 
     #[test]

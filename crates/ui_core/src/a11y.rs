@@ -169,6 +169,21 @@ pub struct A11yTextSelection {
     pub focus: usize,
 }
 
+/// 入向文本选区的**一个端点**：宿主 `TextRun` 节点 + 该节点文本内的 **UTF-8 字节偏移**。
+///
+/// 语义对齐 `accesskit::TextPosition { node: NodeId, character_index: usize }`：AccessKit 要求
+/// `TextPosition.node` 指向 `Role::TextRun`（`accesskit_consumer::text` 会丢弃节点不是 TextRun
+/// 的选区），所以「位置属于哪个 run」是 AT 契约的一部分，引擎在应用边界必须保留它 ——
+/// 输入框有多个 `TextRun` 子节点时，应用无法从裸字节区间还原「从 run A 的哪个字节到 run B 的
+/// 哪个字节」。单 `TextRun` 输入框里两个端点指向同一个 run，调用方无需额外分支。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct A11yTextPosition {
+    /// 位置所属的 `TextRun` 节点（AT 侧 `TextPosition.node` 的引擎口径）。
+    pub node: NodeId,
+    /// 该 `TextRun` 文本内的 UTF-8 字节偏移（落在 char boundary；越界夹紧到该 run 的文本末尾）。
+    pub byte_index: usize,
+}
+
 /// 一个自定义动作（`accesskit::CustomAction` 的 id + 给 AT 读的名字）。
 ///
 /// `A11yAction::Custom(id)` 只是"能力"（`Copy + Eq + Hash` 的 handler 键）；要真正出现在
@@ -815,16 +830,20 @@ pub enum A11yActionData<'a> {
     None,
     /// 文本值（`SetValue` / `ReplaceSelectedText`）。
     Value(&'a str),
-    /// 文本选区（**UTF-8 字节偏移**，与 `A11yTextSelection` / IME caret / `String` 同一口径；
-    /// E4a 由引擎在唯一入口把 AT 的 grapheme 下标换算成字节并夹紧）。
+    /// 文本选区（**UTF-8 字节偏移 + 端点宿主**，E4a 字节口径 / E4b 跨 run 身份）。
+    ///
+    /// 两端各自描述「输入框里哪个 `TextRun` 的哪个字节」（[`A11yTextPosition`]）：AT 的
+    /// `TextPosition` 带节点身份，引擎归一化时只把**动作目标**折成输入框（`ctx.node()`），
+    /// 位置本身的宿主身份必须保留下来 —— 多 `TextRun` 的输入框（分段样式/富文本）里，
+    /// 「anchor 在 run A、focus 在 run B」是应用还原选区的唯一依据。
     ///
     /// 目标语义：Windows 的 `SetTextSelection` 打在 `TextRun` 上、macOS/AT-SPI 打在输入框上；
     /// 引擎把 `ctx.node()` 归一为**输入框节点**（三端一致），应用无需关心平台差异。
     Selection {
-        /// 起点（UTF-8 字节偏移，落在 char boundary）。
-        anchor: usize,
-        /// 活动端（UTF-8 字节偏移，落在 char boundary）。
-        focus: usize,
+        /// 起点（不随扩展/收缩改变）。
+        anchor: A11yTextPosition,
+        /// 活动端（无选区时 = caret 位置）。
+        focus: A11yTextPosition,
     },
     /// 滚动偏移。
     ScrollOffset(Point),
