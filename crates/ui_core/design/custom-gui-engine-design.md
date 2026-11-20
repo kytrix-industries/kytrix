@@ -143,16 +143,17 @@ flowchart TB
 ```text
 crates/ui_core/
 ├── Cargo.toml                 # 依赖按 target 分组；shader 工具链为 build-dependency
-├── build.rs                   # 调 DXC / Metal / glslang 编译到 OUT_DIR；构建期 shader 契约校验
+├── build.rs                   # dxc / xcrun metal / glslangValidator 编译到 OUT_DIR/shaders；构建期 shader 契约校验
 ├── src/
 │   ├── lib.rs                 # **只做 mod 声明**；公共 API 走模块路径，不做 re-export（`pub_use = "forbid"`）
 │   ├── error.rs               # EngineError（强类型）+ D8 可读错误文案
 │   ├── math.rs                # Rect / Size / Point / Transform / Scale / Edges / PhysicalRect
 │   ├── event.rs               # Event / InputEvent / Action / KeyBinding / 事件类型
+│   ├── debug_hud.rs           # feature = "hud" 的调试 HUD（`mod debug_hud`）
 │   ├── app.rs + app/          # Application / App / AppHandle / 启动与退出 / tokio Handle
 │   │                          #   app/{frame,style_pass,text_pass,invalidate,event_queue,focus,geometry,input,
 │   │                          #        interaction,overlay,scroll,signal_api,virtual_list,window_set,resources,
-│   │                          #        a11y,animation,debug,tests}.rs
+│   │                          #        a11y,animation,debug,tests}.rs（另有 interaction_tests / invalidate_tests / resources_tests 测试子模块）
 │   ├── window.rs + window/    # WindowId / Window / WindowOptions / FrameIndex / FrameScheduler / FrameRecord
 │   │                          #   window/{focus,frame,frame_budget,paint,record,scale,surface,a11y,tests}.rs
 │   ├── node.rs + node/        # Node / NodeId / Arena（id.rs）/ Signal（signal.rs）/ ReadCtx + 依赖图（dependency.rs）/
@@ -166,17 +167,19 @@ crates/ui_core/
 │   │                          #   Canvas（canvas.rs）/ Color（color.rs）/ Atlas（atlas.rs）
 │   ├── render.rs + render/    # **只做模块声明与 crate 内出口**（cfg 规则见下）；共享层：
 │   │                          #   atlas/color/colorspace/compose/compositor/compositor_thread/damage/delta/frame/
-│   │                          #   geometry_upload/present_evidence/retire/stats/timer/uniform + shaders/
-│   │                          #   render/{windows,macos,linux}/：device/queue/pipeline/swapchain/compositor/renderer/
-│   │                          #   atlas/readback/timer（各端自有类型，pub(crate)；Windows 的几何编码在 compositor/ 子模块）
+│   │                          #   geometry_upload/present_evidence/retire/stats/timer/uniform + shader_contract.rs（cfg(test)）
+│   │                          #   根模块 windows.rs / macos.rs / linux.rs（cfg 分派）；shaders/（平铺 15 个源文件 + contract.md）
+│   │                          #   render/{windows,macos,linux}/：各端自有 device/queue/instance/pipeline/swapchain/compositor/renderer/
+│   │                          #   atlas/geometry/readback/timer 等（文件名按端不同；Windows 的几何编码在 compositor/ 子模块）
 │   ├── interaction.rs + interaction/  # focus/scroll/virtual_list/overlay/drag/animation
 │   ├── resources.rs + resources/      # cache.rs / image.rs（字节 → 解码 → 图集）
-│   ├── platform.rs + platform/        # dispatcher.rs / event.rs / ime.rs / menu.rs + 三端实现：
+│   ├── platform.rs + platform/        # dispatcher.rs / event.rs / ime.rs / menu.rs / windows.rs / macos.rs / linux.rs / wayland.rs
+│   │                          #   + macos_{close,drag,owner,placement}.rs（macOS 分片）；三端实现：
 │   │                          #   platform/windows/{event_loop.rs, event_loop/{pump,wndproc,resize,native_window,recovery,tests}.rs,
 │   │                          #     window,ime,clipboard,composition,dark_mode,dpi,dpi_awareness,placement,version,a11y}.rs
 │   │                          #   platform/macos/{event_loop,view,window,app_delegate,menu,ime,clipboard,dpi,wake,a11y}.rs
-│   │                          #   platform/linux/{event_loop.rs, event_loop/*, surface,toplevel,configure,input,ime,clipboard,
-│   │                          #     frame_gate,presentation,wake,cursor,drag,selection,a11y}.rs
+│   │                          #   platform/linux/{event_loop.rs, event_loop/*, surface,window,cursor,dpi,wake,presentation,
+│   │                          #     clipboard,a11y}.rs
 │   │                          #   platform/wayland/{drag,toplevel,configure,input,text_input,ime,selection,parent,owner,
 │   │                          #     close,cursor,frame_gate,presentation,scroll}.rs（Wayland 协议适配）
 │   ├── a11y.rs + a11y/        # tree/mapping/adapter/action/textrun/identity
@@ -250,7 +253,7 @@ pub(crate) use windows as backend;
 | E3 | `VirtualListConfig.extents`、`ItemAlign`、`App::{set_virtual_extents, scroll_to_item}` | §11.3 |
 | E4 | `GeometryDraw.range`、`GeometryDraw::full` | §11.4 |
 | E5 | `Window::text_byte_index_at` | §11.5 |
-| E6 | `Decorations`、`WindowOptions::{decorations, icon}`、`App::{set_title, set_traffic_light_position, request_window_control}`、三端 `WindowControl` / `WindowState`、`Window::traffic_light_inset` | §11.6 |
+| E6 | `Decorations`、`WindowOptions::{decorations, icon}`、`App::{set_title, set_traffic_light_position, traffic_light_inset, request_window_control}`、三端 `WindowControl` / `WindowState` | §11.6 |
 
 **明确留在应用层**：`base_ui` 全部设计系统模块与主题语义色 / 调色板 / 深浅色映射、54 个 Phosphor SVG + 7 品牌 PNG + 23
 预览图 + WAV、`IconKind → path` 映射、全部 widget 业务与几何、i18n、widget 注册表，以及 **D24 的薄 `StyleBuilder`**。
@@ -599,9 +602,14 @@ pub(crate) struct FrameTimings { /* frame + samples，容量复用 */ }
 
 ### 2.11 Shader 工程（D11：三套独立手写）
 
-**目录与产物**：`render/shaders/quad.{hlsl,metal,glsl}` + `geometry.*` + `common/`（三份各自手写、语义等价的公共函数），
-`build.rs` 调用 DXC / Metal 编译器 / glslang 编译到 `OUT_DIR`，产物按 `(target, shader, hash)` 缓存并入库校验；门禁脚本
-只做「产物存在、可加载、静态断言一致」。**不使用 naga / WGSL 单一源翻译**（D11）。
+**目录与产物**：`render/shaders/` 是**平铺的 15 个源文件**（`build.rs` 的静态清单）——
+`quad.{hlsl,metal}` + `quad.{vert,frag}.glsl`、`geometry.{hlsl,metal}` + `geometry.ui.{vert,frag}.glsl` +
+`geometry.textured.vert.glsl` + `geometry.textured_{image,glyph}.frag.glsl`、`common.{hlsl,metal,glsl}` + `common.frag.glsl`，外加唯一的
+`contract.md`。`build.rs` 按 host target 只编译本端：Windows → `dxc`（DXIL）、macOS → `xcrun metal`（metallib）、
+Linux → `glslangValidator`（SPIR-V），产物写 `OUT_DIR/shaders/`；`ui_core_SKIP_SHADERS=1` 或 host≠target 时写占位产物。
+构建期契约校验由 `src/render/shader_contract.rs`（`build.rs` 内执行 + `#[cfg(test)]` 覆盖失败路径）完成；**没有**
+按 `(target, shader, hash)` 的产物缓存或入库机制。门禁脚本只做「产物存在、可加载、静态断言一致」。
+**不使用 naga / WGSL 单一源翻译**（D11）。
 
 **共享契约（`contract.md`，唯一权威）**：
 
@@ -1048,7 +1056,11 @@ for line in layout.lines() {
 // ④ 溢出 / 行数上限：TextOverflow::{Clip, Ellipsis} + TextStyle.max_lines 在建行阶段裁剪
 ```
 
-**缓存键**：`text + color + font_size + TextStyle + scale + font_stack_version + atlas_generation`。宽度变化**不重建
+**缓存键**（`text/cache.rs::ShapeKey`）：文本哈希 + 文本长度 + **shaping 输入的样式哈希**（`TextStyle::hash_into`：family / size / weight /
+slant / line_height / letter_spacing / wrap / direction / overflow / max_lines / font_features / locale / stretch / word_spacing /
+line_break / font_variations；**不含 color / alignment**）+ `inline_boxes` 的 id/index/size/baseline/align + `font_stack_version`。
+**不含 `scale`**（R12-4：逻辑坐标 shaping，DPI 变化不清缓存）、**不含 `atlas_generation`**（图集换代只影响 tile，不影响 glyph id / advance /
+基线 / 行数；`ShapedLine` 快照另带代际，换代后重建）。宽度变化**不重建
 `Layout`**，只重跑 `break_all_lines` + `align` —— 直接支撑 §3.4 的「文本变化但尺寸不变只 `PAINT`」。
 
 ### 4.6 字体策略（D17）
@@ -1485,7 +1497,11 @@ impl Canvas {
 | 任意 GPU 命令插入 / 应用持有 GPU buffer、uniform | 与 **I4**（GPU 资源只经延迟销毁）直接矛盾：应用持有的资源生命周期无法纳入 `RetireQueue` 的 `FrameIndex` 队列 |
 | 扩一整套自定义 pipeline 的视觉基线 | 与 **I8** 冲突：现有 L3 只有 14 个 case（42 张 golden），重开基线等于重做像素回归 |
 
-**消费者核实**：全仓 `crates/{base_ui,kytrix,*_ui}`（排除 `target/`）对 `shader` / `wgpu` / `VertexBuffer` / `render_pipeline` 的**代码引用为 0**；仅 `crates/base_ui/src/color_picker.rs:1195` 一处注释提到 “no gradient shader”（本轮 177 个 `.rs` 复核）。GPUI 本身也不向应用暴露自定义 pipeline，因此**没有任何 widget 依赖自有 shader / GPU 缓冲**。应用自绘的典型场景（图表、地图、K 线）已能由 `Canvas::push_*` + 静态 `Geometry`（两种 `GeometryPipeline`：`Ui` / `Textured`）覆盖。
+**消费者核实**（统计范围 = 下列应用层 crate（不含 `ui_core`）：`crates/base_ui`、`crates/kytrix`、`crates/widgets/*`、其余
+`crates/*_ui`，递归 `*.rs` 并排除 `target/`；本轮实测 **371 个 `.rs`**）：对 `shader` / `wgpu` / `VertexBuffer` /
+`render_pipeline`（不区分大小写）的**代码引用为 0**；唯一命中是 `crates/base_ui/src/color_picker.rs:1195` 一处注释
+（“no gradient shader”）。复现命令（PowerShell）：
+`Get-ChildItem crates/base_ui,crates/kytrix,crates/widgets,(Get-ChildItem crates -Directory | ? Name -like '*_ui') -Recurse -Filter *.rs | ? FullName -notmatch '\\target\\' | Select-String -Pattern 'shader|wgpu|VertexBuffer|render_pipeline'`。
 GPUI 本身也不向应用暴露自定义 pipeline，因此**没有任何 widget 依赖自有 shader / GPU 缓冲**。应用自绘的典型场景（图表、地图、
 K 线）已能由 `Canvas::push_*` + 静态 `Geometry`（两种 `GeometryPipeline`：`Ui` / `Textured`）覆盖。
 
@@ -2125,7 +2141,7 @@ frameless；macOS 已是「透明标题栏 + 原生交通灯浮在内容上」�
 | 端 | 标题栏归属 | 应用职责 | 引擎职责 | 现状 |
 |---|---|---|---|---|
 | Windows | **系统标题栏**（现状）/ E6 后可由 `WindowOptions.decorations = Decorations::None` 改为应用自绘 | 在自绘 header 上声明拖动区与三枚按钮的 hit 区域；读 `WindowState.maximized` 决定图标 | `WM_NCCALCSIZE`（E6 后自算 resize border）、`WM_NCHITTEST`（八边 + 拖动区 `HTCAPTION`）、`SetWindowTextW`、`WM_SETICON`、`IsZoomed` / `SW_MAXIMIZE` | 系统标题栏 + 拖动区（`set_drag_regions`） |
-| macOS | **系统的交通灯保留**，标题栏透明、内容铺满（已实现） | 用顶部**安全区**（交通灯高度）避让；三枚按钮不需要自绘 | 交通灯位置（E6 的 `set_traffic_light_position` / `traffic_light_inset`）、红点走的关闭桥、全屏转场 | 已实现（`setTitlebarAppearsTransparent` / `setTitleVisibility(Hidden)` / 原生按钮保留） |
+| macOS | **系统的交通灯保留**，标题栏透明、内容铺满（已实现） | 用顶部**安全区**（交通灯高度）避让；三枚按钮不需要自绘 | 交通灯位置（E6 的 `App::set_traffic_light_position` / `App::traffic_light_inset`）、红点走的关闭桥、全屏转场 | 已实现（`setTitlebarAppearsTransparent` / `setTitleVisibility(Hidden)` / 原生按钮保留） |
 | Linux（Wayland） | **客户端装饰**（应用自绘标题栏） | 画 header + 三枚按钮，调 `App::request_window_control` | `xdg_toplevel` 的 `move` / `resize` / `set_minimized` / `set_maximized` / `set_fullscreen`；`WindowState` 镜像 | 已实现（`WindowControl` / `WindowState` / `request_window_control`） |
 
 #### 8.6.2 拖动区（三端统一语义）
@@ -2183,9 +2199,9 @@ app.set_title(window, SmolStr::new_static("Kytrix — BTC/USDT"))?;
 - **全屏**：Linux 全屏时 `WindowState.fullscreen == true` ⇒ 应用**不画**标题栏（此时没有窗口装饰语义）；Windows E6 frameless 全屏
   时引擎隐藏 resize border 与拖动区命中；macOS 原生全屏（`FullScreenPrimary`）下交通灯由 AppKit 隐藏/浮现，应用按
   `WindowState` 或安全区变化重排。
-- **安全区**：macOS 顶部交通灯占用固定高度。E6 提供**只读查询** `Window::traffic_light_inset() -> Option<Point>`
-  （系统交通灯占用的 inset；`None` = 非 macOS，或原生全屏下交通灯被系统隐藏），应用按返回值留白。`App::set_traffic_light_position`
-  只是**设置**入口，不能替代读取；应用**不能**把可点击控件放到交通灯下（会与系统按钮抢命中）。
+- **安全区**：macOS 顶部交通灯占用固定高度。E6 提供**只读查询** `App::traffic_light_inset(window) -> Option<Point>`
+  （`v2.1 新增规格`，归属 `App`，与 setter 同层；`None` = 非 macOS，或原生全屏下交通灯被系统隐藏），应用按返回值留白。
+  `App::set_traffic_light_position` 只是**设置**入口，不能替代读取；应用**不能**把可点击控件放到交通灯下（会与系统按钮抢命中）。
 
 #### 8.6.6 不变量约束
 
@@ -2381,12 +2397,12 @@ M6 kytrix 启动 = P4-1…P4-3；M7 最终验收 = P6-1…P6-3（P5 是 M6 与 M
 
 | 旧编号 | 来源 | 归入 |
 |---|---|---|
-| B0 门禁基座 / B1 base_ui 基础 / B2 widget 契约 / B3 20 widget / B4 六个 `*_ui` / B5 kytrix 外壳 / B6 运行时收口+删除 / B7 三端验收 | `04` §7.2 | B0→P0-2；B1→P2-1a/1b；B2→P3-1…P3-3；B3→P3-W1…W9；B4→P4-1/2；B5→P4-3；B6→P5-1/2；**B7→P6 三端验收** |
-| P0 引擎增量 / P1 地基 / P2 容器列表 / P3 文本输入 / P4 交互浮层 / P5 外壳联调 | `02` §10.3 | P0→P1-E1…E6；**P1–P4→P2-1a…P2-5（base_ui 自身批次）**；P5→P4-3 |
-| B0 保留文件搬运 / B1 签名定稿+`empty` / B2 `surface`+binding / B3 registry+gallery | `03` §5 | 全部→P3-1…P3-3 |
-| R1 heatmap→order_book / R2 perp∥pred / R3 chokepoint / R4 candlestick | `06` §3 | R1/R2/R4→P3-W1/W2/W7；R3→P3-W6 |
-| B1 标杆 / B2 表格列表族 / B3 钱包族 / B4 自绘族 / B5 x | `07` §3 | 全部→P3-W1…W9 |
-| T0 摘耦合 / T1 base_ui 单测 / T2/T3 widget / T4 外壳 / T5 收尾 | `05` §7.1 | T0→P2-1a 前置；T1–T4→贯穿 P2–P4；T5→P4-3 尾 / P5 |
+| B0 门禁基座 / B1 base_ui 基础 / B2 widget 契约 / B3 20 widget / B4 六个 `*_ui` / B5 kytrix 外壳 / B6 运行时收口+删除 / B7 三端验收 | `04` §7.2 | B0→P0-2（CI 工作流部分按 D-07 取消）+ P0-3（基线确认）；B1→P2-1a…P2-5（base_ui 全组）；B2→P3-1、P3-2、P3-3；B3→P3-W1…W9；B4→P4-1、P4-2（`widget_gallery_ui` 归 P3-3）；B5→P4-3（E6 能力=P1-E6）；B6→P5-1、P5-2；**B7→P6-1…P6-3** |
+| P0 引擎增量 / P1 地基 / P2 容器列表 / P3 文本输入 / P4 交互浮层 / P5 外壳联调 | `02` §10.3 | P0→P1-E1…E6（G5 滚动条→P2-2、G11 构建期 SVG→P2-1b 属应用层）；P1→P2-1a、P2-1b；P2→P2-2；P3→P2-3；P4→P2-4；P5→P2-5 + P4-3 |
+| B0 保留文件搬运 / B1 签名定稿+`empty` / B2 `surface`+binding / B3 registry+gallery | `03` §9.4 | B0→P3-1；B1→P3-1（view/any/status）+ P3-2（empty）；B2→P3-2（surface/placeholder/binding）+ P3-W9（watch_list）；B3→P3-3 |
+| R1 volume_heatmap→order_book / R2 perpetual_statistics∥prediction_market / R3 chokepoint / R4 candlestick | `06` §3 | **R1→P3-W4（volume_heatmap/order_book）；R2→P3-W5（perpetual_statistics/prediction_market）；R3→P3-W6（chokepoint）；R4→P3-W7（candlestick）** |
+| B1 标杆 / B2 表格列表族 / B3 钱包族 / B4 自绘族 / B5 x | `07` 0.5/3 节 | B1→P3-2（empty）+ P3-W1（news/force_order）；B2→P3-W2（market_trade/financial_calendar）+ P3-W3（financial_index）+ P3-W9（watch_list）；B3→P3-W8（ethereum_wallet/solana_wallet）+ P3-W9（hyperliquid_wallet）；B4→P3-W2（pentagon_pizza_index）+ P3-W3（coin_market_cap_fear_and_greed_index/cryptocurrency_etf）；B5→P3-W9（x） |
+| T0 摘耦合 / T1 base_ui 单测 / T2/T3 widget / T4 外壳 / T5 收尾 | `05` §7.1 | T0→P0-3（基线确认）+ P2-1a 前置；T1→P2-1a…P2-5；T2→P3-1…P3-3；T3→P3-W1…W9；T4→P4-1…P4-3；T5→随 P1-E1…E6 与 P2/P3 各批落地（不单列批次） |
 
 **迁移期验证门（plan P2–P5 各批次）**：`#[gpui_kit::test]` **1,652** 个 + 迁移面 **5,443** 个（可机械 3,610 / 必须重写
 1,711 / 删 9 / 未解析 122），以「**crate 全绿 + 台账逐条对账**」为验收，不按 API 批量。`cargo test --workspace` 在迁移期
@@ -2528,7 +2544,9 @@ impl Canvas {
 - `max_width = None` = 不限宽（单行）；`Some(w)` 触发断行（等价 `break_all_lines(Some(w))`）。
 - 代际：句柄在构造时记录 `atlas_generation`；图集换代后 `is_stale()` 为真，`push_shaped_text` 返回 `false` 且**不产生任何图元**
   （不允许「画旧 UV」——这正是 D-5 修掉的花字问题）。
-- 缓存：形状缓存键与 `App::refresh_text` 同源（`text + TextStyle + scale + font_stack_version`），因此同一文本重复 shape 是命中路径。
+- 缓存：复用 `text/cache.rs` 的 `ShapeKey`（与 `App::refresh_text` 同一份键）：文本 + shaping 输入的 `TextStyle` + `inline_boxes` +
+  `font_stack_version`；**不含 `scale`**（逻辑坐标 shaping）。因此同一文本 + 同一 shaping 输入重复 `shape_text` 是命中路径。
+  E2 的 `runs`（逐 run 覆盖样式）落地时**必须并入键**（`ShapeKey` 的样式哈希或新增 run 摘要），否则不同 run 会误命中。
 
 **错误**（新增变体，需与 §2.9 一并登记）：
 
@@ -2769,7 +2787,7 @@ impl App {
         -> Result<(), EngineError>;      // 去掉 cfg(linux)
     /// macOS 专用（其它端返回 UnsupportedWindowCapability，不静默）
     pub fn set_traffic_light_position(&mut self, window: WindowId, inset: Point) -> Result<(), EngineError>;
-    /// macOS 专用只读查询：交通灯占用的安全区 inset（`None` = 非 macOS / 原生全屏隐藏）。
+    /// macOS 专用只读查询（`v2.1 新增规格`，归属 `App`，与 setter 同层）：交通灯占用的安全区 inset
     pub fn traffic_light_inset(&self, window: WindowId) -> Option<Point>;
 }
 impl Window { pub fn state(&self) -> WindowState; }   // 三端都有（Linux 现已实现，Win/mac 由本条补齐）
@@ -2797,7 +2815,7 @@ Windows `Decorations::None`）；`false` = 系统装饰（Linux compositor 要�
 
 **macOS 实现要点**：`set_title` → `NSWindow.setTitle:`；`icon` **无任务栏等价物**（Dock 图标是 app 级）⇒ 文档化降级；
 `set_traffic_light_position` → 调整三个 `standardWindowButton` 的 `frame.origin`（保持标题栏透明+标题隐藏时仍可点）；
-`traffic_light_inset` 返回同一几何的只读值（应用据此留白，不需要自己猜）；`WindowState.maximized` ← `isZoomed`、
+`App::traffic_light_inset` 返回同一几何的只读值（应用据此留白，不需要自己猜）；`WindowState.maximized` ← `isZoomed`、
 `fullscreen` ← `styleMask.contains(.fullScreen)`。
 
 **Linux 实现要点**：现有能力**对齐**即可（`WindowControl` / `WindowState` / `request_window_control` 已实现）；
