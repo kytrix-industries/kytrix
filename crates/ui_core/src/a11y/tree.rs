@@ -182,11 +182,9 @@ pub(crate) fn node_a11y_with_cache(
         _ => None,
     };
     let (character_lengths, word_starts) = text_metrics.unwrap_or_default();
-    // 字符度量（E4b）：只有 TextRun 且能**正确表达**（单行 + 显式 LTR + shape 与文本一致）时
-    // 才发 `character_positions` / `character_widths`；否则留空让 AT 回退。
-    // 字符度量（E4b）：只有 TextRun 且能**正确表达**（a11y `value` 与已 shape 文本逐字节相同 +
-    // 解析后 LTR + 单行）时才发 `character_positions` / `character_widths`；否则留空让 AT 回退。
-    // `value` 同时是 `character_lengths` 的口径来源，两者必须描述同一串文本（RBA-01）。
+    // 字符度量（E4b）：只有 TextRun 且能**正确表达**时才发 `character_positions` /
+    // `character_widths`（a11y `value` 与已 shape 文本逐字节相同 + 解析后 LTR + 单行 + shape
+    // 输入一致），否则留空让 AT 回退。`value` 同时是 `character_lengths` 的口径来源（RBA-01）。
     let (character_positions, character_widths) = match (role, value.as_deref()) {
         (A11yRole::TextRun, Some(value)) => {
             textrun::character_metrics(tree, node, value, &character_lengths, scale)
