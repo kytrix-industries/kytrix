@@ -1164,6 +1164,16 @@ impl NodeTree {
     ) -> bool {
         content::set_text_shaped(self, node, shaped, key, scale_epoch, measured, size_changed)
     }
+    #[cfg(test)]
+    pub(crate) fn install_text_line_for_test(
+        &mut self,
+        node: NodeId,
+        content: &crate::text::TextContent,
+        line: Rc<ShapedLine>,
+        width: f32,
+    ) -> bool {
+        content::install_text_line_for_test(self, node, content, line, width)
+    }
     pub(crate) fn set_text_line(
         &mut self,
         node: NodeId,

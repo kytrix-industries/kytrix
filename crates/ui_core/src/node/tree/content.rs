@@ -270,6 +270,25 @@ pub(crate) fn set_text_shaped(
     }
 }
 
+// 消费者：`impl NodeTree::install_text_line_for_test` 的薄委托（仅测试）。
+/// 仅测试：把 `ShapedLine` 直接装进文本槽（paint 测试只消费快照，不需要真 shaping）。
+#[cfg(test)]
+pub(crate) fn install_text_line_for_test(
+    tree: &mut NodeTree,
+    node: NodeId,
+    content: &TextContent,
+    line: Rc<ShapedLine>,
+    width: f32,
+) -> bool {
+    let shaped = Rc::new(crate::text::shape::ShapedText::blank_for_text_test(
+        content.text.clone(),
+        content.style.clone(),
+    ));
+    let key = crate::text::cache::ShapeKey::new(content, 1);
+    let _ = set_text_shaped(tree, node, shaped, key, 1, Size::ZERO, false);
+    set_text_line(tree, node, line, width, 0)
+}
+
 // 消费者：`impl NodeTree::set_text_line` 的薄委托（外部调用点见该方法文档）。
 /// 挂上只读快照（P06 的 paint 输入）；`width`/`generation` 记下这次重排的依据。
 ///
@@ -397,7 +416,7 @@ pub(crate) fn text_caret_rect(
     };
     let text = content.text.as_str();
     if shaped.text() != text
-        || !shaped.same_shaping_inputs(&content.style)
+        || !shaped.same_shaping_inputs(&content.style, content.runs())
         || shaped.inline_boxes() != content.inline_boxes.as_ref()
     {
         return Err(EngineError::TextShape {
