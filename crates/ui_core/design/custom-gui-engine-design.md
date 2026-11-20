@@ -9,8 +9,8 @@
 > **上游关系**：技术路线论证见 `custom-gui-engine-technical-research.md`；本文是其定案（D1–D25）的实现规格，不重复论证
 > **工程约束**：`AGENTS.md`（模块化、`lib.rs` 只做模块声明、强类型错误、不做预防性抽象、单测与生产代码同模块；验收
 > `cargo test` + `cargo +nightly clippy -- -D warnings` + `cargo +nightly fmt`）
-> **代码状态**（v2.1 校准）：本文正文的**已实现部分**已与 `crates/ui_core/src` 的公开面逐项对齐（类型名 / 方法名 / 签名 /
-> 字段以源码为准，本文不再保留「计划中的形状」）；`crates/ui_core` 之外的迁移目标（`base_ui` / widgets / `*_ui` / `kytrix`）仍是
+> **代码状态**（v2.1 审查修复后再次校准；逐条差异见台账 §7）：本文正文的**已实现部分**已与 `crates/ui_core/src` 的公开面
+> 逐项对齐（类型名 / 方法名 / 签名 / 字段以源码为准）；`crates/ui_core` 之外的迁移目标（`base_ui` / widgets / `*_ui` / `kytrix`）仍是
 > **待迁移**。Rust 片段分三类，各自必须显式标注：
 >
 > 1. **已实现契约**——与源码一致，片段只是摘要；
@@ -36,7 +36,7 @@
 | Shader      | D11             | **HLSL / MSL / GLSL→SPIR-V 三套独立手写**，不用 naga 或 WGSL 单一源翻译                                                                                                                                                         |
 | 文本        | D12 / D17       | **Parley** 系文本栈 + 引擎自建字形图集；系统字体 + `Fontique` 回退 + 显式 zh-CN CJK 字体栈，零内化字体、不要求三平台像素级一致                                                                                                  |
 | 颜色        | D23             | **引擎一等 `Color` 类型**：负责 OKLCH 解析、插值空间、色域映射、转 linear premultiplied RGBA；调色板与语义角色留应用层                                                                                                          |
-| 测试        | D13 / D14 / D20 | 引入像素快照回归并纳入 v1；D8 只约束产品运行时，CI 允许 test-only 软件设备（Windows WARP / Linux lavapipe）；**macOS 用带 Metal 硬件的实机 GPU runner**，保留「三平台 golden 全通过才允许合入」门禁                             |
+| 测试        | D13 / D14 / D20 | 引入像素快照回归并纳入 v1；D8 只约束产品运行时，门禁允许 test-only 软件设备（Windows WARP / Linux lavapipe）；**macOS 用带 Metal 硬件的实机 GPU**，保留「三平台 golden 全通过才允许合入」门禁                             |
 | 运行时      | D21             | **完全移除 `widget_tokio_runtime`**；全仓单一 tokio multi-thread runtime，`main` 创建、`App` 持有 `Handle`                                                                                                                      |
 | 窗口 / 事件 | D22 / D25       | **放弃 winit，引擎自建三平台事件循环**（Win32 / AppKit / **Wayland**）；a11y adapter 直连。**Linux 不支持 X11**，代码与依赖中不存在任何 X11 路径                                                                                |
 | 架构        | D15 / D16       | 引擎 = **核心 + 通用交互机制**（`base_ui` 视觉组件、主题、资源、widget 业务与几何、i18n 留应用层）；编程模型 = **保留式节点树 + 细粒度依赖追踪**，不保留 GPUI 的 `Render` / `IntoElement` / `Styled` / `Entity` / `cx.notify()` |
@@ -53,20 +53,20 @@
 |-----|---------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------|
 | I1  | **编译期单一后端**：`render/` 与 `platform/` 三平台子模块按 `#[cfg(target_os)]` 选择，运行时不存在后端枚举、不存在可插拔 `Renderer` / 事件循环 trait          | 退化为通用框架抽象，违反 D2                         |
 | I2  | **一套数据契约**：`Scene` / `#[repr(C)] GpuPrimitive` / `PhysicalRect`（damage）/ `AtlasTile` / `GeometryDesc` / `Color` 只有一份定义，三套 renderer 只消费不重定义；迁移期的引擎扩展只允许「**不改** `GpuPrimitive` 字节布局、不改 `render/shaders/contract.md`」的能力，唯一例外是 E4（`GeometryDraw.range`），它必须三端 encoder + `contract.md` + 参数 golden 同步（§11.4）      | 三份代码语义漂移                                    |
-| I3  | **空闲不提交帧**：无任何 dirty 标记时，帧调度器停在 `Idle`，不录制命令、不 present。**允许连续帧的唯一入口**是 `App::animate(window, AnimatedValue, &[NodeId], AnimationSpec)` 注册的受管动画（`needs_continuous_frames` 的判据来自「有活跃动画」）；应用不得在 `on_frame` 钩子里无条件 `request_repaint`，逐帧自绘动画必须自带收敛条件并在收敛后停止请求（§8.4）                                                                            | 空闲 GPU 占用与功耗                                 |
+| I3  | **空闲不提交帧**：无任何 dirty 标记时，帧调度器停在 `Idle`，不录制命令、不 present。**受管动画是唯一「自动」连续帧入口**（`App::animate(window, AnimatedValue, &[NodeId], AnimationSpec)`；`needs_continuous_frames` 的判据来自「有活跃动画」）；应用自驱的逐帧路径（`on_frame` + `set_canvas` 等）必须自带收敛条件并在收敛后停止请求，不得无条件 `request_repaint`（§8.4 / §11.7） | 空闲 GPU 占用与功耗 |
 | I4  | **GPU 资源只经延迟销毁**：任何释放请求按 `FrameIndex` 入队，fence / semaphore / command buffer 完成后才真正释放                                               | GPU 端 use-after-free、驱动相关花屏                 |
 | I5  | **节点树与布局树同一份存储**：引擎节点实现 taffy `LayoutPartialTree`，不维护第二棵布局树                                                                      | 双树同步错误、命中盒与布局不一致                    |
-| I6  | **UI 可见状态只能经 `Signal` 写入**：应用层不得直接改节点字段；读取必须经 `ReadCtx::read()` 登记依赖，返回 `SignalRef<T>` **读守卫**（`Rc`）——**守卫存活期再写同一信号会 panic**，必须改用 `App::{write_with, update_with}` 或先 clone 再写；`Window::tree_mut()` 只允许用于挂载期 `NodeBuilder::build` / `NodeTree::remove`，**不得直接改已有节点的样式或绑定**（§6.10 迁移纪律）                                                                | stale drawing                                       |
-| I7  | **测试 harness 默认无 GPU**：`renderer = None` 是默认配置，CPU 帧记录契约与 device 无关                                                                       | 测试基建无法在 CI 复现                              |
+| I6  | **UI 可见状态只能经 `Signal` 写入**：应用层不得直接改节点字段。**布局 / 绘制 / `bind_*` 求值上下文内**的读取必须经 `ReadCtx::read()` 登记依赖并返回 `SignalRef<T>` **读守卫**（`Rc`；守卫存活期再写同一信号会 panic，必须改用 `App::{write_with, update_with}` 或先 clone 再写）；上下文外的一次性读取用 `App::read`（不登记依赖、不参与失效传播）。`Window::tree_mut()` 的允许集合 = 挂载期 `NodeBuilder::build` / `NodeTree::remove` / `NodeTree::{set_style, set_layout_override, invalidate_measure}`；**不得**直接改节点字段或绑定闭包（§6.10 迁移纪律） | stale drawing |
+| I7  | **测试 harness 默认无 GPU**：`renderer = None` 是默认配置，CPU 帧记录契约与 device 无关                                                                       | 测试基建无法在门禁复现                              |
 | I8  | **三套 shader 共享字节布局与视觉 golden**：任何 `GpuPrimitive` / uniform / `Color` / 主题色 / 文本栈变更必须触发像素快照回归                                  | 三平台视觉不一致                                    |
 | I9  | **应用层不接触平台 API**：`base_ui` / widgets 只见引擎类型，不见 `HWND` / `MTLDevice` / `VkDevice` / `wl_surface`。自绘标题栏、窗口按钮（最小化/最大化/关闭）、任务栏图标、运行时改标题等**平台能力必须由引擎提供**（§8.6 契约、§11.6 E6 规格）；**不允许**给应用层开平台口子（那会同时违反 I9 与 D15）                                             | 平台差异泄漏到业务 crate                            |
 | I10 | **不做静默降级**：D8 检测失败即给出可读错误并退出；不做兼容层、不做 migration、不做软件渲染回退                                                               | 与 D3 / D8 冲突                                     |
 | I11 | **所有几何以逻辑像素存储、以物理像素绘制**：只在 paint / present 边界做一次缩放与舍入                                                                         | 高分屏 1px 缝、AA 抖动                              |
-| I12 | **绘制指令与像素结果分别验证**：CPU 帧记录断言「发了什么」，像素快照断言「画成什么样」。**已知限制**：L3 的 10 个 case（42 张 golden）**不含文字像素**（`test_support/snapshot.rs` 的 `SnapshotScene` 没有 `Glyphs` 变体），因此迁移期文本正确性由 L2 帧记录（`FrameRecord`/`RenderedFrame`）+ 结构度量断言保证，像素 golden 只作辅助（§6.10）                                                                        | D11 三套独立源无 oracle                             |
+| I12 | **绘制指令与像素结果分别验证**：CPU 帧记录断言「发了什么」，像素快照断言「画成什么样」。**已知限制**：L3 的 14 个 case（42 张 golden）**不含文字像素**（`test_support/snapshot.rs` 的 `SnapshotScene` 没有 `Glyphs` 变体），因此迁移期文本正确性由 L2 帧记录（`FrameRecord`/`RenderedFrame`）+ 结构度量断言保证，像素 golden 只作辅助（§6.10） | D11 三套独立源无 oracle |
 | I13 | **全仓单一 tokio runtime**（D21）：无第二套 executor、无 GPUI `PlatformDispatcher`、无双运行时桥接；主线程通过显式 `Handle` 提交任务                          | 退回双 executor 分裂与「无 runtime 上下文」panic    |
 | I14 | **窗口 / 事件循环由引擎自有**（D22）：平台层按 `#[cfg(target_os)]` 编译期确定单一实现，不依赖 winit / `accesskit_winit`，不存在可插拔事件循环 trait           | 平台能力受第三方 WndProc / NSTextInputClient 约束   |
 | I15 | **颜色只有引擎一份 `Color` 语义**（D23）：调色板与语义角色留应用层，但解析 / 插值 / 色域 / 到 GPU 的转换只在引擎实现。**现状**：`ColorResolver` 是**零大小（ZST）无状态**类型，只有 `resolve` / `lerp` / `lerp_color` 三个方法，插值空间固定为**线性预乘**（没有可配置的插值空间 / gamut / 版本），返回 `LinearPremulRgba`；base_ui 的 `.hsla`（586 处）与 OKLab 渐变假设**在实现上不成立**，迁移期一律 OKLCH→`Color` 静态解析 + 线性预乘插值                                          | 三套 shader 与文本 / SDF 收到不同空间的值           |
-| I16 | **Linux 仅 Wayland**（D25）：`platform/linux/`、`render/linux/`、依赖清单、CI 矩阵中不存在 X11 / XIM / XRandR / `x11rb` / X11 selection 路径。**作用域（v2.1 澄清）**：本条当前成立的范围是「`ui_core` 依赖闭包」（实测 0 X11）；**workspace 级**的 `x11rb` 来自 `gpui-pre-linux` / `gpui-fast-linux` / `zed-xim`，随 M8 删除 gpui 系后消失 —— 因此「零 `x11rb`」是 **M8 的判据**，不是今天的全仓事实                  | 违反项目支持范围，产生不受测的第三套输入 / 窗口实现 |
+| I16 | **Linux 仅 Wayland**（D25）：`platform/linux/`、`render/linux/`、依赖清单、门禁矩阵中不存在 X11 / XIM / XRandR / `x11rb` / X11 selection 路径。**作用域（v2.1 澄清）**：本条当前成立的范围是「`ui_core` 依赖闭包」（实测 0 X11）；**workspace 级**的 `x11rb` 来自 `gpui-pre-linux` / `gpui-fast-linux` / `zed-xim`，随 P5-2 删除 gpui 系后消失 —— 因此「零 `x11rb`」是 **P5-2 的判据**，不是今天的全仓事实                  | 违反项目支持范围，产生不受测的第三套输入 / 窗口实现 |
 | I17 | **样式静态结构与动态属性分离**（D24）：静态结构挂载时一次写入 `Style`；动态属性只能经 `Signal` + `bind_style` / `StylePatch` 重算；DSL 只在应用层且保持「薄」。**组件 API 形态（v2.1 口径）**：`base_ui` 组件只允许 ①接受 `Style` / `PaintSpec` 整值（挂载时一次）或 ②接受 `impl FnOnce(&mut StyleBuilder) -> Style` 的**挂载期**闭包；运行期变体必须声明为 `bind_style` + `StylePatch` 闭包；**不复活** `Styled` / `refine_style` / `.when()` 形态（§4.9） | 把 GPUI「每帧重建整棵 Element 树」的缺陷带进新引擎  |
 
 ### 0.3 术语与符号
@@ -137,137 +137,103 @@ flowchart TB
 
 ### 1.2 Crate / 模块划分
 
-单一引擎 crate `..`。
+单一引擎 crate `ui_core`。模块布局是 **Rust 标准布局**：每个模块是模块根 `src/<name>.rs`（只做 `mod` 声明与 crate 内
+出口）+ 子模块目录 `src/<name>/`；仓库里**没有 `mod.rs`**。
 
 ```text
 crates/ui_core/
-├── Cargo.toml                 # 依赖按 target 分组；三套 shader 工具链为 build-dependency
-├── build.rs                   # 调用 xtask 编译 HLSL/MSL/GLSL，产出 OUT_DIR 中的 DXIL/.metallib/.spv
+├── Cargo.toml                 # 依赖按 target 分组；shader 工具链为 build-dependency
+├── build.rs                   # 调 DXC / Metal / glslang 编译到 OUT_DIR；构建期 shader 契约校验
 ├── src/
-│   ├── lib.rs                 # **只做 mod 声明**；公共 API 走模块路径，**不做 re-export**（`pub_use = "forbid"`）
-│   ├── app.rs                 # Application / App / AppHandle / 启动与退出 / tokio Handle
-│   ├── window.rs              # WindowId / Window / WindowOptions / FrameScheduler
-│   ├── event.rs               # Event / InputEvent / Action / HitTest / 事件分发
+│   ├── lib.rs                 # **只做 mod 声明**；公共 API 走模块路径，不做 re-export（`pub_use = "forbid"`）
 │   ├── error.rs               # EngineError（强类型）+ D8 可读错误文案
-│   ├── node/
-│   │   ├── mod.rs
-│   │   ├── id.rs              # NodeId / Generation / Arena / NodeIdSet
-│   │   ├── tree.rs            # Node / NodeTree / 挂载与卸载
-│   │   ├── signal.rs          # Signal<T> / Derived<T> / Transient<T> / StateStore
-│   │   ├── dependency.rs      # ReadTracker / DependencyGraph / invalidate
-│   │   ├── dirty.rs           # DirtyFlags / dirty 传播 / damage 累积
-│   │   └── tests.rs           # 单元测与生产代码同模块
-│   ├── layout/
-│   │   ├── mod.rs             # 引擎 Layout 外观、逻辑/物理像素换算
-│   │   ├── taffy_tree.rs      # impl TraversePartialTree + LayoutPartialTree for NodeTree
-│   │   ├── measure.rs         # 文本 measure / 自定义 leaf measure / root 逃生口
-│   │   └── hit_test.rs        # 命中测试（绘制序 + clip + 布局盒）
-│   ├── text.rs                # 文本**公共契约**（TextStyle / TextContent / FontStack / InlineBoxSpec / ShapedLine）
-│   ├── text/                  # 实现子模块，全部 pub(crate)（应用不可达）
-│   │   ├── context.rs         # FontContext / LayoutContext / CJK 字体栈配置
-│   │   ├── shape.rs           # Parley RangedBuilder → Layout<B> → PositionedLayoutItem
-│   │   ├── inline_flow.rs     # 行内盒参与断行 / 选区 rect（InlineFragment 管线尚未实现）
-│   │   ├── raster.rs          # Skrifa 轮廓 → swash/自写光栅 → alpha 位图
-│   │   ├── atlas.rs           # 字形图集装箱与增量上传（与 render/atlas 共享分配器）
-│   │   ├── cache.rs           # ShapedLine 缓存（key = text+style+size+scale）
-│   │   └── fast_path.rs       # 数字快速路径
-│   ├── paint/
-│   │   ├── mod.rs
-│   │   ├── style.rs           # Style / StylePatch / bind_style 契约（D24）
-│   │   ├── primitive.rs       # Primitive 8 类 + 绘制序
-│   │   ├── scene.rs           # Scene / clip 栈 / lane
-│   │   ├── instance.rs        # #[repr(C)] GpuPrimitive / InstanceBuffer / 静态布局断言
-│   │   ├── geometry.rs        # GeometryId / GeometryDesc / 块与页元数据（GEOMETRY_CHUNK_INDICES）
-│   │   ├── geometry_store.rs  # GeometryStore：insert / update_* / truncate / release（应用经 App::geometry_mut）
-│   │   ├── pass.rs            # paint pass：lane 重建 / 复用、文本与几何编码
-│   │   ├── canvas.rs          # Canvas：应用自绘的图元容器（只装引擎 8 类图元，§5.9）
-│   │   └── color.rs           # Color / ColorResolver / gamut mapping（D23）
-│   ├── render/
-│   │   ├── mod.rs             # #[cfg] 选择具体后端类型（pub(crate)，**不导出、不定义 trait**）
-│   │   ├── device.rs          # GpuCaps / D8 基线检测 / DeviceInitError
-│   │   ├── frame.rs           # FrameIndex / FrameResources / in-flight 轮转
-│   │   ├── retire.rs          # 延迟销毁队列（共享策略）
-│   │   ├── damage.rs          # DamageRect / 合并 / 外扩 / 退化阈值
-│   │   ├── atlas.rs           # AtlasTile / 图集分配与脏行上传
-│   │   ├── timer.rs           # GpuTimer 统一接口 + CPU 分段计时
-│   │   ├── compositor.rs      # 逐 rect scissor、持久 offscreen、前帧拷贝
-│   │   ├── windows/           # D3D12：device/queue/heap/pipeline/present/dred
-│   │   ├── macos/             # Metal：device/queue/layer/pipeline/present
-│   │   ├── linux/             # Vulkan：instance/device/queue/swapchain/pipeline/present（Wayland WSI）
-│   │   └── shaders/
-│   │       ├── contract.md    # GpuPrimitive 字节布局 + uniform + 颜色/语义契约（唯一权威）
-│   │       ├── quad.hlsl      # uber-quad（DXC → DXIL, SM 6.x）
-│   │       ├── quad.metal     # uber-quad（Metal library）
-│   │       ├── quad.glsl      # uber-quad（glslang → SPIR-V）
-│   │       ├── geometry.*     # 三套 geometry pipeline
-│   │       └── common/        # 三份「语义等价」的公共函数（各自手写，不共享源码）
-│   ├── interaction/
-│   │   ├── mod.rs / focus.rs / scroll.rs / virtual_list.rs / overlay.rs / drag.rs / animation.rs
-│   ├── resources/
-│   │   ├── mod.rs / cache.rs / image.rs   # 字节 → 解码 → 图集（SVG 光栅不在引擎内，见 §8.5）
-│   ├── platform/
-│   │   ├── mod.rs             # cfg 分派：窗口句柄、标题栏、外观、剪贴板、IME
-│   │   ├── dispatcher.rs      # PlatformDispatcher：线程安全唤醒队列 + 主线程 Handle
-│   │   ├── event.rs           # PlatformEvent → Event::Input / IME / DPI / Appearance / Focus / Resize
-│   │   ├── windows/           # event_loop/(pump,wndproc,resize,native_window) / window.rs / ime.rs / clipboard.rs / a11y.rs / composition.rs / dpi.rs / dark_mode.rs / placement.rs / version.rs
-│   │   ├── macos/             # event_loop.rs / app_delegate.rs / view.rs / window.rs / ime.rs / clipboard.rs / menu.rs / a11y.rs / dpi.rs / wake.rs
-│   │   └── linux/             # event_loop.rs + event_loop/calloop_wayland.rs / surface.rs / toplevel.rs / input.rs / ime.rs / clipboard.rs / a11y.rs / frame_gate.rs / presentation.rs（仅 Wayland）
-│   ├── a11y/
-│   │   ├── mod.rs / tree.rs / mapping.rs / adapter.rs / action.rs / tests.rs
-│   └── test_support.rs        # 模块根（`feature = "test-support"`，不进发布物；无 re-export）
-│       └── test_support/
-│           ├── app.rs         # TestApp / TestWindow：无头帧驱动、事件注入、帧同步点
-│           ├── probe.rs       # Probe / Selector：稳定元素探针（selector → bounds）
-│           ├── record.rs      # FrameRecord / RenderedFrame / PaintLog（L2 帧记录）
-│           ├── script.rs      # FrameScript / ScriptFrame：多帧脚本 + 逐帧断言
-│           ├── snapshot.rs    # L3：SnapshotCase / 容差 / golden 读写 / compare
-│           ├── pixels.rs      # 像素读回工具
-│           ├── a11y.rs        # TreeUpdate 影子树 / 契约校验 / 机器可读快照
-│           ├── acceptance.rs  # 最终验收缩比负载夹具 + 增量不变量
-│           ├── gui_smoke.rs   # 真实窗口冒烟（`--ignored`）
-│           └── diagnostics.rs # 帧 / 依赖图 / damage 诊断导出
-└── tests/                     # integration test（只走公开 API）
-    ├── layout/                # 布局盒、命中、事件注入
-    ├── frame_record/          # CPU 绘制指令断言
-    ├── golden/                # 按设备类型分目录的像素 golden（不进发布物）
-    │   ├── warp/  ├── lavapipe/  └── metal-real/
-    └── perf/                  # criterion bench 入口
+│   ├── math.rs                # Rect / Size / Point / Transform / Scale / Edges / PhysicalRect
+│   ├── event.rs               # Event / InputEvent / Action / KeyBinding / 事件类型
+│   ├── app.rs + app/          # Application / App / AppHandle / 启动与退出 / tokio Handle
+│   │                          #   app/{frame,style_pass,text_pass,invalidate,event_queue,focus,geometry,input,
+│   │                          #        interaction,overlay,scroll,signal_api,virtual_list,window_set,resources,
+│   │                          #        a11y,animation,debug,tests}.rs
+│   ├── window.rs + window/    # WindowId / Window / WindowOptions / FrameIndex / FrameScheduler / FrameRecord
+│   │                          #   window/{focus,frame,frame_budget,paint,record,scale,surface,a11y,tests}.rs
+│   ├── node.rs + node/        # Node / NodeId / Arena（id.rs）/ Signal（signal.rs）/ ReadCtx + 依赖图（dependency.rs）/
+│   │                          #   DirtyFlags（dirty.rs）/ NodeBuilder（builder.rs）/
+│   │                          #   NodeTree（tree.rs + tree/{arena,content,dirty,layout,traverse,tests}.rs）
+│   ├── layout.rs + layout/    # 逻辑/物理像素换算；taffy_tree.rs（impl LayoutPartialTree）/ measure.rs / hit_test.rs
+│   ├── text.rs + text/        # 公共文本契约（TextStyle / TextContent / FontStack / ShapedLine / InlineBoxSpec）
+│   │                          #   text/{context,shape,inline_flow,raster,atlas,cache,fast_path}.rs（全部 pub(crate)）
+│   ├── paint.rs + paint/      # Style/PaintSpec/StylePatch（style.rs）/ 8 类 Primitive（primitive.rs）/ Scene（scene.rs）/
+│   │                          #   GpuPrimitive（instance.rs）/ Geometry（geometry.rs, geometry_store.rs）/ PaintPass（pass.rs）/
+│   │                          #   Canvas（canvas.rs）/ Color（color.rs）/ Atlas（atlas.rs）
+│   ├── render.rs + render/    # **只做模块声明与 crate 内出口**（cfg 规则见下）；共享层：
+│   │                          #   atlas/color/colorspace/compose/compositor/compositor_thread/damage/delta/frame/
+│   │                          #   geometry_upload/present_evidence/retire/stats/timer/uniform + shaders/
+│   │                          #   render/{windows,macos,linux}/：device/queue/pipeline/swapchain/compositor/renderer/
+│   │                          #   atlas/readback/timer（各端自有类型，pub(crate)；Windows 的几何编码在 compositor/ 子模块）
+│   ├── interaction.rs + interaction/  # focus/scroll/virtual_list/overlay/drag/animation
+│   ├── resources.rs + resources/      # cache.rs / image.rs（字节 → 解码 → 图集）
+│   ├── platform.rs + platform/        # dispatcher.rs / event.rs / ime.rs / menu.rs + 三端实现：
+│   │                          #   platform/windows/{event_loop.rs, event_loop/{pump,wndproc,resize,native_window,recovery,tests}.rs,
+│   │                          #     window,ime,clipboard,composition,dark_mode,dpi,dpi_awareness,placement,version,a11y}.rs
+│   │                          #   platform/macos/{event_loop,view,window,app_delegate,menu,ime,clipboard,dpi,wake,a11y}.rs
+│   │                          #   platform/linux/{event_loop.rs, event_loop/*, surface,toplevel,configure,input,ime,clipboard,
+│   │                          #     frame_gate,presentation,wake,cursor,drag,selection,a11y}.rs
+│   │                          #   platform/wayland/{drag,toplevel,configure,input,text_input,ime,selection,parent,owner,
+│   │                          #     close,cursor,frame_gate,presentation,scroll}.rs（Wayland 协议适配）
+│   ├── a11y.rs + a11y/        # tree/mapping/adapter/action/textrun/identity
+│   └── test_support.rs + test_support/  # feature = "test-support"；app/probe/record/script/snapshot/pixels/a11y/
+│                              #   acceptance/gui_smoke/diagnostics（无 re-export，不进发布物）
+├── benches/                   # perf.rs / layout_postpass.rs（`harness = false`）
+└── tests/                     # 集成测试（只走公开 API）：layout.rs / frame_record.rs / snapshot.rs /
+                               #   gui_smoke.rs / hud.rs；golden/{warp,lavapipe,metal-real}/（各 14 张 PNG，不进发布物）
 ```
 
-**cfg 规则（I1）**：`render/mod.rs` 只做编译期选择，不定义 trait、不定义枚举、**不做 re-export**（后端类型是
-`pub(crate)`，应用层看不到任何 GPU 类型）：
+**cfg 规则（I1）**：`render.rs` 与 `platform.rs` 是**模块根**（不是 `mod.rs`），只做编译期选择，不定义 trait /
+不定义枚举、**不做 re-export**（后端类型是 `pub(crate)`，应用层看不到任何 GPU 类型）：
 
 ```rust
-// render/mod.rs —— 编译期选择单一后端；类型名相同，上层只写一份调用代码
-#[cfg(target_os = "windows")]
-mod backend;
-#[cfg(target_os = "macos")]
-mod backend;
+// render.rs —— 模块声明 + crate 内出口；三端各导出同名 pub(crate) 类型，上层只写一份调用代码
+pub(crate) mod atlas;
+pub(crate) mod color;
+// …共享层（compositor/damage/frame/retire/timer/uniform/…）
 #[cfg(target_os = "linux")]
-mod backend;
-pub(crate) use backend::{Device, Swapchain, Encoder, Presenter, AtlasTexture, GpuTimerImpl};
+pub(crate) mod linux;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos;
+#[cfg(windows)]
+pub(crate) mod windows;
+
+#[cfg(target_os = "linux")]
+pub(crate) use linux as backend;
+#[cfg(target_os = "macos")]
+pub(crate) use macos as backend;
+#[cfg(windows)]
+pub(crate) use windows as backend;
 ```
 
-三套 `backend` **导出同名具体类型**（`pub(crate)`），`render/` 上层只写一份调用代码。`platform/` 同样按 `cfg` 分派单一实现
-（`platform` 模块本身是私有的，应用只经 `AppHandle` 与引擎事件接触）。这是编译期替身，不是运行时抽象。
+三套后端各自导出同名 `pub(crate)` 类型（`GpuCaps` 在 `render/{windows,macos,linux}/device.rs`；**没有**共享的
+`Device / Swapchain / Encoder` re-export，也**没有**共享计时器 trait —— 计时器按平台各自实现，§2.10）。`platform/` 同理，
+由 `platform.rs` 按 `cfg` 分派单一实现（`platform` 模块本身是私有的，应用只经 `AppHandle` 与引擎事件接触）。这是编译期
+替身，不是运行时抽象。
 
 ### 1.3 引擎 / 应用层边界（D15 / D24 具体化）
 
-引擎对应用层暴露的**完整公开 API 表面**（超出此表即越界）。三条**机制性前提**（v2.1 修正，依据 `src/lib.rs:1-27` 与根 `Cargo.toml` 的 `pub_use = "forbid"`）：
+引擎对应用层暴露的**公开 API 类别**（**非穷尽**：本表是审查时判断「是否越界」的类别基线；完整清单以源码 `pub` 面为准，逐项签名见 §3 / §4 / §5 / §8 与附录 A）。三条**机制性前提**（v2.1 修正，依据 `src/lib.rs:1-27` 与根 `Cargo.toml` 的 `pub_use = "forbid"`）：
 
 1. **不做 re-export**：`ui_core/src/lib.rs` 只有 `mod` 声明，workspace lint 禁止 `pub use`。应用一律走**深路径**：
    `ui_core::paint::scene::Scene`、`ui_core::node::builder::NodeBuilder`、`ui_core::test_support::app::TestApp`。
 2. **模块可见性**：`render` / `platform` 是**私有**模块，GPU 与平台类型（`GpuPrimitive`、`Device`、`HWND`…）不在公开面；
    `test_support` 由 `feature = "test-support"` 门控（不进发布物，I7）。
-3. **白名单语义**：下表的类型名是「可依赖的**类型**」，深路径省略 `ui_core::` 前缀；签名与语义细节以 §3 / §4 / §5 / §8 与源码为准。
+3. **白名单语义**：下表是「应用层允许依赖的类型与入口」，深路径省略 `ui_core::` 前缀；`error::EngineError` 是所有可失败
+   API 的返回错误（缺它无法写应用代码）。E1–E6 的新增公开面见本章末尾子表，**落地前不可依赖**。
 
-| 类别 | 可依赖类型（深路径省略 `ui_core::`） | 一句话用途 / 边界 |
+| 类别 | 可依赖类型 / 入口（深路径省略 `ui_core::`） | 一句话用途 / 边界 |
 |---|---|---|
-| 应用 | `app::{App, AppHandle, Application, StylePassReport}`、`window::{WindowId, Window, WindowOptions, FrameIndex, FrameOutcome, FramePresentation}`、`window::{WindowControl, WindowState, WindowResizeEdge}`（**仅 `cfg(target_os = "linux")`**）、`window::ImeContentType` | 启动、建窗、帧驱动；`AppHandle::{wake, send, spawn}` 是**唯一跨线程入口**（`platform` 私有，应用看不到 `PlatformDispatcher`） |
-| 节点 | `node::id::NodeId`、`node::builder::NodeBuilder`、`node::tree::{NodeTree, Node, NodeKind, LayoutBox}`、`node::dirty::DirtyFlags` | 建树与增删子节点（`NodeTree::{append_child, remove}`）；**没有 `NodeHandle` / `Children` / 声明式子节点 `Slot`**（`node::id::Slot<T>` 是私有 arena 槽，且 workspace lint 禁止半公开） |
+| 错误 | `error::EngineError`（顶层 29 个变体，§2.9） | 所有 `Result` 的错误类型；应用按变体分类处理（`StaleNode` / `UnknownWindow` / `NotVirtualList` 等；E6 新增 `UnsupportedWindowCapability`，§11.6），禁止字符串错误穿透 |
+| 应用 | `app::{App, AppHandle, Application, StylePassReport}`、`window::{WindowId, Window, WindowOptions, FrameIndex, FrameOutcome, FramePresentation}`、`window::{WindowControl, WindowState, WindowResizeEdge}`（**仅 `cfg(target_os = "linux")`**，E6 后三端可见）、`window::ImeContentType`、`App::{on_frame, create_window, window, window_mut, frame, set_drag_regions, request_node_repaint, take_resource_results, handle, runtime_handle}`、`Window::state`（Win/mac 由 E6 补齐） | 启动、建窗、帧驱动；`AppHandle::{wake, send, spawn}` 是**唯一跨线程入口**（`platform` 私有，应用看不到 `PlatformDispatcher`） |
+| 节点 | `node::id::NodeId`、`node::builder::NodeBuilder`、`node::tree::{NodeTree, Node, NodeKind, LayoutBox}`、`node::dirty::DirtyFlags`、`NodeTree::{new, root, get, append_child, remove, set_style, set_layout_override, invalidate_measure, hit_test, text_selection_rects, text_caret_rect, len, is_empty, debug_id}`、`Window::{tree, tree_mut}` | 建树与增删子节点（`NodeTree::{append_child, remove}`）；**没有 `NodeHandle` / `Children` / 声明式子节点 `Slot`**（`node::id::Slot<T>` 是私有 arena 槽，且 workspace lint 禁止半公开） |
 | 状态 | `node::signal::{Signal, SignalId, Derived, Transient, SignalScope}`、`node::dependency::ReadCtx`、`App::{signal, signal_scope, signal_scoped, window_signal, release_scope, transient, derived, batch, write, write_with, update, update_with, read, read_with, write_transient, read_transient}` | 状态写入与依赖追踪。`read` 返回 `SignalRef<T>` 读守卫（守卫存活期写同一信号 **panic**）。**没有 `TaskHandle`**：异步回投是 `AppHandle::{send, spawn}`；资源解码结果经 `App::take_resource_results()` 取回 |
-| 样式 / 布局 | `paint::style::{Style, PaintSpec, StylePatch, FocusRing, ShadowSpec, Clip, Cursor}`、`layout::{MeasureFn, LayoutOverride}`、`layout::hit_test::HitShape`、`math::{Rect, Size, Point, Transform, Scale, Edges, PhysicalRect}`、`NodeBuilder::{style, paint, bind_style, bind_text, bind_a11y, measure, hit_shape, layout_override, focus_ring, tab_stop}` | 挂载期静态样式 / 动态补丁。`bind_*` **恰好三个**（`bind_text` / `bind_style` / `bind_a11y`），且**只在 `App::frame` 求值**（`Window::frame()` 不求值） |
-| 绘制 | `paint::scene::Scene`（**只能经 `Window::scene()` 取 `&Scene`**，写方法属引擎内部）、`paint::primitive::{Primitive, Quad, QuadPaint, Border, Gradient, GradientKind, GlyphRun, PositionedGlyph, Image, Path, Shadow, ClipOp, ClipRect, GeometryDraw}`、`paint::canvas::Canvas`、`paint::geometry::{GeometryId, GeometryDesc, GeometryPipeline, GeometryUpdate, IndexType, Topology}`、`paint::geometry_store::GeometryStore`（经 `App::geometry_mut()`）、`paint::color::{Color, ColorResolver}`、`paint::atlas::{AtlasKind, AtlasTile}` | 自绘（`Canvas` 只装引擎 8 类图元，§5.9）、注册静态几何（`App::geometry_mut().insert(desc)`）、颜色解析。**没有裸类型 `Geometry`、没有 `Brush`** |
+| 样式 / 布局 | `paint::style::{Style, PaintSpec, StylePatch, FocusRing, ShadowSpec, Clip, Cursor}`、`layout::{MeasureFn, LayoutOverride}`、`layout::hit_test::HitShape`、`math::{Rect, Size, Point, Transform, Scale, Edges, PhysicalRect}`、`NodeBuilder::{boxed, text, canvas, geometry, style, paint, bind_style, bind_text, bind_a11y, a11y, measure, hit_shape, layout_override, focus_ring, tab_stop, id, inline_boxes, on_click, on_action, on_drag, build}` | 挂载期静态样式 / 动态补丁。`bind_*` **恰好三个**（`bind_text` / `bind_style` / `bind_a11y`），且**只在 `App::frame` 求值**（`Window::frame()` 不求值） |
+| 绘制 | `paint::scene::Scene`（**只能经 `Window::scene()` 取 `&Scene`**，写方法属引擎内部）、`paint::primitive::{Primitive, Quad, QuadPaint, Border, Gradient, GradientKind, GlyphRun, PositionedGlyph, Image, Path, Shadow, ClipOp, ClipRect, GeometryDraw}`、`paint::canvas::Canvas`、`paint::geometry::{GeometryId, GeometryDesc, GeometryPipeline, GeometryUpdate, IndexType, Topology}`、`paint::geometry_store::GeometryStore`（经 `App::geometry_mut()`）、`paint::color::{Color, ColorResolver}`、`paint::atlas::{AtlasKind, AtlasTile}`、`Window::set_canvas` | 自绘（`Canvas` 只装引擎 8 类图元，§5.9）、注册静态几何（`App::geometry_mut().insert(desc)`）、颜色解析。**没有裸类型 `Geometry`、没有 `Brush`** |
 | 文本 | `text::{TextStyle, TextStyleExtras, TextContent, TextAlign, TextSlant, TextWrap, TextDirection, TextOverflow, TextLineBreak, FontStack, FontStackStatus, TextDiagnostic, InlineBoxSpec, InlineAlign, ShapedLine, ShapedTextLine, ShapedTextItem, ShapedGlyphRun, ShapedInlineBox, ThinSlice, FeatureSet, FontVariationSet, TextFeature, TextFontVariation, TextPassReport, TextLayoutReport}`；`App::{refresh_text, layout_text, font_stack, font_stack_version, set_font_stack, reload_system_fonts, text_diagnostics, font_stack_status}` | 文本组件。**`ShapedLine` 类型公开但应用拿不到实例**（唯一出口 `NodeTree::text_line` 是 `pub(crate)`）；canvas 内 shaping 的公开面是 `v2.1 新增规格 E1`（§11.1），富文本是 E2（§11.2） |
 | 资源 | `resources::{ResourceId, ResourceCache, ResourceImage, DecodeState, ResourceStats, PendingResource}`、`App::{resources, resources_mut}` | 图标 / 图片 / 远程头像；`ResourceImage.tile` 恒有效直到 unload |
 | 交互 | `interaction::{FocusScope, ScrollHandle, ScrollConfig, ScrollState, ScrollAxis, VirtualList, VirtualListConfig, VirtualListState, Overlay, OverlayOptions, OverlayPlacement, OverlayDismiss, AnchorSide, DragState, DragInfo, DragPhase, AnimationId, Easing, AnimatedValue, AnimationSpec, ActionCtx, InputThresholds}`；`App::{make_scroll, set_scroll_content, scroll_to, scroll_by, scroll_state, capture_pointer, focused, hovered, key_down, set_focus, focus_next, focus_prev, make_virtual_list, set_virtual_items, virtual_list_state, virtual_row_index, create_overlay, close_overlay, place_overlay, bring_overlay_to_front, overlays, drag_state, drag, cancel_drag, animate, cancel_animation, animations_running}` | 通用交互机制。`VirtualList` **只支持等高行**（`VirtualListConfig { extent, overscan }`）；变高是 `v2.1 新增规格 E3`（§11.3）。**没有 `AnimationClock`**：动画是 `App::animate(window, AnimatedValue, &[NodeId], AnimationSpec)` |
@@ -275,13 +241,24 @@ pub(crate) use backend::{Device, Swapchain, Encoder, Presenter, AtlasTexture, Gp
 | 无障碍 | `a11y::{A11yRole, A11yNode, A11yLabel, A11yAction, A11yOverride, A11yPatch, A11yActionCtx, A11yActionData, A11yDiagnostic, A11yTreeSnapshot, A11yLive, A11ySort}`、`NodeBuilder::{a11y, bind_a11y}`、`App::{on_a11y_action, off_a11y_action, a11y_diagnostics}` | 自定义组件声明语义。`a11y` 接受**整值** `A11yOverride`（不是 `(role, label 闭包)`） |
 | 测试（`test-support` feature） | `test_support::app::{TestApp, TestWindow}`、`test_support::probe::{Probe, Selector}`、`test_support::record::{FrameRecord, RenderedFrame, QuadRecord, PrimitiveRecord, PrimitiveKind, PaintLog, LanePaintEntry, LaneOutcome, DeltaRecord, FrameStats}`、`test_support::script::{FrameScript, ScriptFrame, FrameSample, ScriptReport, A11yCapture, A11yDelivery}`、`test_support::snapshot::{SnapshotCase, SnapshotScene, SnapshotTheme, SnapshotImage, SnapshotDiff, SnapshotError, GoldenError, Tolerance, PixelBounds}`、`test_support::{a11y, acceptance, gui_smoke, pixels, diagnostics}` | 布局与图形测试（§6.2–§6.5）。**没有 `TestApp::mount`、没有 `TestApp::new(renderer: None)`、没有 `Probe::a11y()`，`Selector` 只有 `Id` / `Text` / `Path`（无 `Role`）** |
 
+**`v2.1 新增规格`（E1–E6）的公开面（尚未实现，落地前应用层不可依赖）**：
+
+| 扩展 | 新增公开面 | 章节 |
+|---|---|---|
+| E1 | `text::ShapedTextHandle`、`App::{shape_text, shaped_inline_boxes}`、`Canvas::push_shaped_text` | §11.1 |
+| E2 | `text::{TextRun, TextDecoration, InlineBoxPaint}`、`TextContent.runs`、`TextStyle.decoration`、`InlineBoxSpec.paint`、`NodeBuilder::runs` | §11.2 |
+| E3 | `VirtualListConfig.extents`、`ItemAlign`、`App::{set_virtual_extents, scroll_to_item}` | §11.3 |
+| E4 | `GeometryDraw.range`、`GeometryDraw::full` | §11.4 |
+| E5 | `Window::text_byte_index_at` | §11.5 |
+| E6 | `Decorations`、`WindowOptions::{decorations, icon}`、`App::{set_title, set_traffic_light_position, request_window_control}`、三端 `WindowControl` / `WindowState`、`Window::traffic_light_inset` | §11.6 |
+
 **明确留在应用层**：`base_ui` 全部设计系统模块与主题语义色 / 调色板 / 深浅色映射、54 个 Phosphor SVG + 7 品牌 PNG + 23
 预览图 + WAV、`IconKind → path` 映射、全部 widget 业务与几何、i18n、widget 注册表，以及 **D24 的薄 `StyleBuilder`**。
 引擎只提供「资源字节 → GPU 图集」与「颜色值 → GPU 值」的机制，不持有资源文件或调色板。
 
 > **`base_ui::StyleBuilder` 的落点（v2.1 新增要求）**：引擎**不提供** builder（`Style` 只有 `Default`，无构造器/访问器），
 > `base_ui` 必须自己新建：`crates/base_ui/Cargo.toml` 增加 `ui_core = { workspace = true }` 与 `taffy = { workspace = true }`
-> （根 `Cargo.toml` 的 `[workspace.dependencies]` 目前**没有 `ui_core` 行**，需先补），并在 **M6.1 的首个交付**里落地（§4.9.5、§10.2）。
+> （根 `Cargo.toml` 的 `[workspace.dependencies]` 目前**没有 `ui_core` 行**，需先补），并在 **P2-1a 的首个交付**里落地（§4.9.5、§10.2）。
 
 ### 1.4 所有权与线程模型
 
@@ -315,7 +292,7 @@ flowchart LR
 - **GPU 提交在主线程**，资源回收由完成信号驱动（§2.7）。
 - **单一 tokio runtime（D21）**：`main` 创建 multi-thread runtime，`App` 显式持有 `Handle`。引擎自有的平台事件循环运行在主线程，
   **该线程不在 tokio worker 上下文里**，因此主线程内不得直接调 `tokio::spawn` / `Handle::current()`（会 panic）；所有提交走
-  `app.handle.spawn(...)`，tokio 任务内部才可直接 `tokio::spawn`。这不是双 executor，只是单一 runtime 的句柄传递。完整模型见
+  `app.handle().spawn(...)`，tokio 任务内部才可直接 `tokio::spawn`。这不是双 executor，只是单一 runtime 的句柄传递。完整模型见
   §9.2。
 
 ### 1.5 启动时序
@@ -440,8 +417,8 @@ const _: () = assert!(std::mem::size_of::<GpuPrimitive>() == 128);
 | `PhysicalRect`（本文旧称 `DamageRect`） | `{ x0, y0, x1, y1 }` 物理像素整数矩形（`math::PhysicalRect`）              | 由节点变更前后的 AABB 并集生成，按 AA 半径外扩；超过 16 个合并或退化为全帧 |
 | `AtlasTile`      | `{ atlas: AtlasKind, page: u16, u0, v0, u1, v1, generation: u32 }`    | UV 归一化（相对本页）；`page` 是 texture array 层号；`generation` 用于图集重排后失效缓存 |
 | `GeometryDesc`   | `{ vertex_bytes: Bytes, index_bytes: Bytes, vertex_stride, index_type, topology, bounds: Rect, pipeline: GeometryPipeline }` | 装载期注册后不可变；只有 range 更新与 per-draw uniform 可变 |
-| `FrameIndex`     | `u64` 单调递增                                                       | 驱动 in-flight 轮转与延迟销毁                                              |
-| `GpuTimerSample` | `{ section: Section, cpu_ns, gpu_ns }`                               | `Section` = build / layout / shape / paint / upload / gpu / present        |
+| `FrameIndex`     | `u32` 单调递增（`FrameIndex(u32)`；0 = 从未提交，首帧 = 1） | 驱动 in-flight 轮转与延迟销毁；`FrameScheduler::commit` 唯一递增点，`u32::MAX` 时**饱和**不回落（0 是哨兵，回绕会让 in-flight 判据失效） |
+| `GpuTimerSample` | `{ section: Section, cpu_ns, gpu_ns }` | `Section` = `Upload` / `Gpu` / `Present`（当前有生产者的 3 段；`build/layout/shape/paint` 是 profiling 框架目标，尚未分别建模，§2.10） |
 
 `render/shaders/contract.md` 是**唯一权威**：字段布局、uniform 语义、颜色空间与 premultiplied alpha 约定都写在此处；任何变更必须同时改
 Rust 与三份 shader，并触发像素快照回归（I8）。
@@ -579,12 +556,13 @@ pub enum EngineError {
 }
 ```
 
-> 上面的 5 + 1 个变体只是示例；**冻结表以源码为准**：`crates/ui_core/src/error.rs` 的 `EngineError` 共 **32 个错误变体**
-> （含 `UnsupportedGpu` / `DeviceLost` / `Wayland` / `ShaderLoad` / `Swapchain` / `Composition` / `FramePipeline` /
+> 上面的 5 + 1 个变体只是示例；**冻结表以源码为准**：计数口径 = `crates/ui_core/src/error.rs` 的 `pub enum EngineError`
+> **顶层变体**（不含 `WaylandErrorKind` 的 4 个细分），共 **29 个**：
+> `UnsupportedGpu` / `DeviceLost` / `Wayland` / `ShaderLoad` / `Swapchain` / `Composition` / `FramePipeline` /
 > `InvalidDpiScale` / `StaleNode` / `CyclicDerived` / `InvalidMeasure` / `TextShape` / `AtlasExhausted` /
 > `AtlasGrowthIncomplete` / `ClipDepthExceeded` / `GeometryRegister` / `UnknownGeometry` / `GeometryRangeOutOfBounds` /
 > `GeometryRangeUnaligned` / `GeometryRangeBytes` / `GeometryTruncateGrows` / `AppInit` / `WindowCreate` / `Clipboard` /
-> `NotScrollable` / `NotVirtualList` / `UnknownWindow` / `ResourceDecode` 等）与 `WaylandErrorKind` 4 个细分。
+> `NotScrollable` / `NotVirtualList` / `UnknownWindow` / `A11yInit` / `ResourceDecode`。
 > `Composition` 是 2026-11-15 追加的 Windows DirectComposition **运行时**错误（几何 / `Commit` /
 > `SetContent` / 换链）；`AppInit` 只覆盖 `Composition::new` 的 COM 创建（DEVIATIONS §36 F-204）。
 
@@ -603,24 +581,26 @@ pub enum EngineError {
   但**不重建 `Geometry` VBO 与实例缓冲容量**，只更新 uniform 与 scissor —— 这是消除 17.5 ms/次
   改尺寸成本的关键。
 
-### 2.10 `GpuTimer` 统一接口
+### 2.10 `GpuTimer` 数据契约（各平台各自实现，无共享 trait）
 
 ```rust
-pub trait GpuTimerImpl { // 仅平台层内部实现，非共享层抽象
-    fn begin_section(&mut self, section: Section, encoder: &mut Encoder);
-    fn end_section(&mut self, section: Section, encoder: &mut Encoder);
-    fn resolve(&mut self) -> Vec<GpuTimerSample>;
-}
+// render/timer.rs：共享的**纯数据**（不是可插拔接口）
+pub(crate) enum Section { Upload, Gpu, Present }   // 当前有生产者的段
+pub(crate) struct GpuTimerSample { pub section: Section, pub cpu_ns: u64, pub gpu_ns: u64 }
+pub(crate) struct FrameTimings { /* frame + samples，容量复用 */ }
 ```
 
-三个实现分别用 D3D12 timestamp query heap、Metal GPU counters / sample timings、Vulkan `vkCmdWriteTimestamp`。CPU 侧
-`profiling` 风格分段（build / layout / shape / paint / upload / gpu / present）与 GPU 采样按 `FrameIndex` 对齐，作为 §6.7
-指标的数据源；不依赖 `.docs/perf` 的 PowerShell 进程采样。
+- 三端各自有 `GpuTimer`（`render/{windows,macos,linux}/timer.rs`，`pub(crate)`）：D3D12 timestamp query heap、Metal GPU
+  counters / sample timings、Vulkan `vkCmdWriteTimestamp`。**不存在共享 trait**（I1 / I14：平台层是编译期单一实现，
+  不做运行时抽象）。
+- CPU 侧 `build / layout / shape / paint` 分段是 profiling 框架的**设计目标**，当前**尚未分别建模**（`Section` 只有
+  `Upload / Gpu / Present` 三个有生产者的段）；新增分段必须同时补生产者与 `FrameTimings` 消费点，不能只加枚举值。
+- 采样按 `FrameIndex` 与 CPU 分段对齐，作为 §6.7 指标的数据源；不依赖 `.docs/perf` 的 PowerShell 进程采样。
 
 ### 2.11 Shader 工程（D11：三套独立手写）
 
 **目录与产物**：`render/shaders/quad.{hlsl,metal,glsl}` + `geometry.*` + `common/`（三份各自手写、语义等价的公共函数），
-`build.rs` 调用 DXC / Metal 编译器 / glslang 编译到 `OUT_DIR`，产物按 `(target, shader, hash)` 缓存并入库校验，CI
+`build.rs` 调用 DXC / Metal 编译器 / glslang 编译到 `OUT_DIR`，产物按 `(target, shader, hash)` 缓存并入库校验；门禁脚本
 只做「产物存在、可加载、静态断言一致」。**不使用 naga / WGSL 单一源翻译**（D11）。
 
 **共享契约（`contract.md`，唯一权威）**：
@@ -670,10 +650,11 @@ pub struct NodeId {
     index: u32,
     generation: u32
 }
-pub struct Arena<T> {
+pub(crate) struct Arena<T, K: ArenaKey = NodeId> {
     slots: Vec<Slot<T>>,
-    free: Vec<u32>
-}   // 代际防悬垂
+    free: Vec<u32>,
+    // retired / scope / _marker：代际用尽永久退休、窗口作用域、键类型
+}   // 代际防悬垂；**不对外公开**（类型与字段均 pub(crate)）
 
 // node/tree.rs —— `Node` 字段**全部私有**；应用只见公开只读访问器，写入只经 `NodeBuilder` / `App` / `Window`
 pub struct Node {
@@ -726,7 +707,7 @@ impl NodeTree {
 ```
 
 ```rust
-// node/signal.rs（实现细节：值存 `App.state` 的 StateStore，`Signal` 只是 id 句柄）
+// node/signal.rs（实现细节：值存 `App` 内部的 `StateStore`，`Signal` 只是 id 句柄）
 pub struct Signal<T> { /* SignalId + PhantomData<T>；Clone 是句柄拷贝 */ }
 pub struct Transient<T> { /* 高频但不入依赖图的值（§3.7） */ }
 pub struct Derived<T> { /* 惰性求值的缓存派生值；注册时 DFS 检测环 */ }
@@ -735,26 +716,25 @@ pub struct SignalScope { /* 面板级状态生命周期；App::release_scope 释
 // 写：`App::{write, write_with, update, update_with}`（等值写短路返回 false；读守卫存活时 panic）
 ```
 
-**所有权**：`Signal<T>` 是**句柄**，值存在 `App.state`（`StateStore`）。应用层持有 `Signal<T>` 但只能通过 `App::write()`
+**所有权**：`Signal<T>` 是**句柄**，值存在 `App` 内部的 `StateStore`。应用层持有 `Signal<T>` 但只能通过 `App::write()`
 改值；节点不持有值，只持有 `SignalId`。`NodeId` 带代际，卸载后旧句柄读取返回 `EngineError::StaleNode`。
 
 ### 3.3 `tracked reads`：显式上下文
 
-不使用 thread-local 隐式追踪，而用显式的 `ReadCtx`。所有读取都必须经过 `ctx.read(&signal)`，编译器即可阻止「绕过依赖登记」，也让
-CPU harness 精确记录每次读取。
+不使用 thread-local 隐式追踪，而用显式的 `ReadCtx`。**布局 / 绘制 / `bind_*` 求值上下文内**的所有读取都必须经过
+`ctx.read(&signal)`（编译器即可阻止「绕过依赖登记」，也让 CPU harness 精确记录每次读取）；上下文外的一次性读取用
+`App::read`（不登记依赖，§1.3）。
 
 ```rust
 pub struct ReadCtx<'a> {
-    store: &'a StateStore,
-    tracker: &'a mut ReadTracker,
-    node: NodeId,
+    // 私有字段：状态存储 / 派生存储 / 依赖图 / 本 owner 的 ReadTracker / 求值栈 / Owner（见 `node/dependency.rs`）
 }
 impl<'a> ReadCtx<'a> {
     /// 登记依赖并返回**读守卫**（`Rc`）。守卫存活期写同一信号会 panic（§3.3 末尾）。
     pub fn read<T: 'static>(&mut self, signal: &Signal<T>) -> SignalRef<T>;
     pub fn read_transient<T: 'static>(&mut self, transient: &Transient<T>) -> SignalRef<T>;
     pub fn read_derived<T: 'static>(&mut self, derived: &Derived<T>) -> SignalRef<T>;
-    /// 读值但**不登记依赖**（诊断 / 断言）。类型公开、可用于测试（不是「仅测试可用」）。
+    /// 测试专用：读值但**不登记依赖**。`#[cfg(test)]`：只在本 crate 的单元测试构建里存在，生产构建与集成测试都不可见。
     pub fn peek<T: 'static>(&self, signal: &Signal<T>) -> SignalRef<T>;
 }
 
@@ -875,7 +855,6 @@ present → GPU 完成反馈（completed_at / presented_at / latency）──►
   `wp_presentation` 的合成器记豁免、如实 `None`）。验收指标 `publish→presented` 的 p50/p99 由
   `acceptance window` 与 `examples/p1_linux_presentation`（Linux 异步结算口径）打印。
 
-
 ### 3.6 事件 → Action → 状态 → 失效 的闭环
 
 ```text
@@ -906,14 +885,14 @@ D22）；**禁止**在异步任务里直接写状态或改节点（I6）。**没
 
 | 成因                                     | 现象                                             | 对策                                                                                                         |
 |------------------------------------------|--------------------------------------------------|--------------------------------------------------------------------------------------------------------------|
-| 读取绕过 `ReadCtx`                       | 节点读了信号但没登记依赖                         | 编译期：`StateStore` 私有，`Signal` 只暴露 `id`；`peek()` 仅测试可用并记日志                                 |
+| 读取绕过 `ReadCtx`                       | 节点读了信号但没登记依赖                         | 编译期：`StateStore` 私有，`Signal` 只暴露 `id`；`ReadCtx::peek` 是 `#[cfg(test)]` 的 crate 内测试专用方法（生产构建不存在、不登记依赖），不构成应用可用的绕过通道 |
 | 条件分支留下幽灵依赖                     | 上一帧读过 `a`，本帧不该读，`a` 写入仍失效本节点 | 每帧用「本帧实际读取」**替换** `deps`（§3.3），不做累积                                                      |
 | lane 复用但祖先 clip / 变换改变          | 绘制内容正确、位置 / 裁剪错误                    | 绘制序 / clip 变化强制重建受影响子树的 lane；`clip` 变更冒泡到子树                                          |
 | 图集重排使旧 `AtlasTile.generation` 失效 | 显示旧图块                                       | 图集 `generation` 递增 → 所有引用该图集的节点 `PAINT`                                                        |
 | 布局缓存命中但 measure 输入变化          | 文字换行错误                                     | taffy `Cache` 命中条件绑定 `(available_space, measure_version)`；`ShapedLine` 缓存 key 含 scale 与字体栈版本 |
 
 **full-refresh oracle**：`TestApp::{invalidate_all_lanes, oracle_diff, assert_oracle}`（§6.3）提供「强制全量重绘」模式 —— 同一状态序列跑两遍，一遍走细粒度路径、一遍清空所有
-`REUSABLE` 并全量重建，对比两者 `Scene` 的 `(Primitive, order, bounds)` 序列与像素输出。任何差异即判定 stale drawing，CI
+`REUSABLE` 并全量重建，对比两者 `Scene` 的 `(Primitive, order, bounds)` 序列与像素输出。任何差异即判定 stale drawing，三端门禁
 必跑（PoC P2 判定标准）。
 
 ### 3.9 内存与回收
@@ -924,7 +903,7 @@ D22）；**禁止**在异步任务里直接写状态或改节点（I6）。**没
 | Signal 值           | 显式 `StateStore::drop(signal)` | 引用计数（应用层持有句柄），无引用即释放                                             |
 | `dependents` 表项   | 每帧替换 `deps` 时              | 差分清理；空集合立即移除，避免表膨胀                                                 |
 | GPU 资源            | I4 / §2.7                       | `RetireQueue` 按完成帧释放                                                           |
-| `Geometry` VBO      | 引用计数归零                    | 应用持有 `GeometryId`，dropping 触发 retire                                          |
+| `Geometry` VBO      | 显式 `App::geometry_mut().release(id)` | 没有 `Drop` 实现：应用持有的 `GeometryId` 只是句柄，drop 不释放；释放必须经 `release` 入 `RetireQueue`（§5.5） |
 | `ShapedLine` / 图集 | LRU + generation                | 容量上限显式；超限统一重排并触发依赖节点 `PAINT`                                     |
 
 **循环依赖**：`Derived` 链在注册时做 DFS 检测环，命中即 `EngineError::CyclicDerived`，拒绝注册。
@@ -999,7 +978,7 @@ impl taffy::LayoutPartialTree for NodeTree {
 | 逃生口                          | 适用                                | 实现                                                                                                                                           |
 |---------------------------------|-------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
 | leaf measure                    | 文本、Markdown 行内流、K 线坐标标签 | 闭包接收 `Size<AvailableSpace>` → 调用 `text::ShapeCache` 得到 `LayoutOutput`；结果按 `(text_hash, max_width, font_stack_version, scale)` 缓存 |
-| `LayoutOverride`（root 逃生口） | 分栏拖拽、`Canvas` 自绘、地图视口   | **任意节点**可经 `NodeBuilder::layout_override(Rect)` 跳过 taffy 子布局、直接采用应用给定的 `LayoutBox`；`NodeKind::{Canvas, Geometry}` 是**布局叶子**（引擎 debug_assert 禁止挂子节点）；仍参与父级命中测试 |
+| `LayoutOverride`（root 逃生口） | 分栏拖拽、`Canvas` 自绘、地图视口   | **任意节点**可经 `NodeBuilder::layout_override(Rect)` 跳过 taffy 子布局、直接采用应用给定的 `LayoutBox`；`NodeKind::{Text, Canvas, Geometry}` 是**布局叶子**；**任何带 `LayoutOverride` 的节点同样禁止子节点**（`NodeBuilder::build` 的 debug_assert 检查「叶子或带 override」）；仍参与父级命中测试 |
 | `InlineBox`（Parley 0.12）      | 行内图片、`kbd` 盒、链接图标        | 由 `text::inline_flow` 生成，交给 Parley 参与断行                                                                                              |
 
 **约束**：measure 闭包必须是**纯函数**（不读 `Signal`、不写状态），否则会把布局结果绑到易变状态、破坏缓存命中条件；业务状态一律通过
@@ -1077,7 +1056,7 @@ for line in layout.lines() {
 | 项           | 设计                                                                                                                                                                           |
 |--------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | 字体来源     | 系统字体（`Fontique::Collection` 枚举），**零内化字体文件、零子集化工具链、零体积增长**                                                                                        |
-| CJK 字体栈   | 显式配置：`zh-CN → ["PingFang SC", "Microsoft YaHei UI", "Noto Sans CJK SC", "Source Han Sans SC"]`，按平台顺序探测；由 `Fontique` 的 `Query` / `FallbackKey` 按 `Script` 回退 |
+| CJK 字体栈   | 引擎固定 `pub(crate) const SYSTEM_UI_FAMILIES`（13 项，跨平台排序：Segoe UI Variable Text / Segoe UI / SF Pro Text / Helvetica Neue / Noto Sans / DejaVu Sans / Microsoft YaHei UI / Microsoft YaHei / PingFang SC / Noto Sans CJK SC / Source Han Sans SC / Noto Sans SC / WenQuanYi Micro Hei）；`FontStack::system_ui()` 直接用它，**不按 locale 映射**（没有 `zh-CN → [...]` 表）；缺字形由 `Fontique` 的 `Query` / `FallbackKey` 按 `Script` 继续回退 |
 | emoji / bidi | `ICU4X` 分析脚本与断行，emoji 走系统 emoji 字体回退；`Fontique` 无候选时标记 `tofu` 并写诊断日志（**不静默替换**）                                                             |
 | 三平台一致性 | **不要求像素级一致**；视觉一致性由像素快照回归在「同平台设备类型内」约束，golden 按设备类型分目录（§6.4）                                                                      |
 | 刷新         | 系统字体安装 / 卸载、深浅色切换、语言切换 → `font_stack_version += 1` → 所有文本节点 `LAYOUT + PAINT`                                                                          |
@@ -1218,7 +1197,7 @@ let panel = NodeBuilder::boxed()
 ```rust
 let disabled: Signal<bool> = app.signal(false);
 
-NodeBuilder::button()
+NodeBuilder::boxed()
     .style(StyleBuilder::new().flex_row().items_center().gap(8.0).px(16.0).rounded(6.0).build())
     .bind_style({
         let disabled = disabled.clone();
@@ -1237,7 +1216,7 @@ NodeBuilder::button()
         let disabled = disabled.clone();
         move |cx: &mut ReadCtx<'_>| A11yPatch { disabled: Some(cx.read(&disabled)), ..A11yPatch::default() }
     })
-    .on_click(Action::Submit)
+    .on_click(Action::Custom(SmolStr::new_static("submit")))
     .build(tree, parent)?;
 
 app.write(&disabled, true);   // → 一个节点 → 一个 lane → 一个 damage rect
@@ -1261,7 +1240,7 @@ app.write(&disabled, true);   // → 一个节点 → 一个 lane → 一个 dam
 | 项 | 内容 |
 |---|---|
 | 依赖前置 | `crates/base_ui/Cargo.toml` 增加 `ui_core = { workspace = true }` + `taffy = { workspace = true }`；根 `Cargo.toml` 的 `[workspace.dependencies]` 目前**没有 `ui_core` 行**，需先补 |
-| 交付位置 | **M6.1 的首个交付物**，先于任何 `base_ui` 组件迁移（`style` 被约 100 处引用） |
+| 交付位置 | **P2-1a 的首个交付物**，先于任何 `base_ui` 组件迁移（`style` 被约 100 处引用） |
 | 方法面 | 固定约 26 个高频方法（flex 方向 / `gap` / padding / `size` / `background` / `rounded` / `border` …）；`affects_layout` 由 builder 在「设置尺寸类属性」时**自动置位**（否则尺寸变化不重排） |
 | 禁止 | `Styled` / `StyleRefinement` / `refine_style` / `.when()` / `.map()` / 宏；不得返回可继续链式修改的对象 |
 | 验收 | `base_ui` 内 `.when(`（30 处 / 13 文件）与 `refine_style`（14 处）全部改写成 `bind_style` + `Signal`，**不留兼容层** |
@@ -1306,7 +1285,7 @@ X5 的几何增量更新（§5.3 / §5.5）**不改变**本节字节布局与 `c
   与节点盒 damage，其余块 lane 只有「祖先 clip 前缀 + 内容 clip + 本块几何图元」。
   `TriangleStrip` 无法在索引缓冲里独立 draw，固定退化为单块（1 条 lane，已文档化）。
 - **块间绘制序 = 块序 = 索引缓冲顺序**：块 lane 按块号排在 `order` 里，clip 栈语义与单 lane
-  时代完全一致（每块 lane 展开同一份祖先 clip 前缀/后缀 + 内容 clip）；golden 10/10 证明像素路径
+  时代完全一致（每块 lane 展开同一份祖先 clip 前缀/后缀 + 内容 clip）；三端 golden 全通过证明像素路径
   不变。
 - `order: Vec<NodeId>` 稳定排序；块 lane 顺序在节点内部固定。**纯数据更新不改变 lane 集合 ⇒
   不重排绘制序**（`delta.order == None` 快路径）；只有块数变化（追加跨块）或节点增删才标
@@ -1397,8 +1376,8 @@ pub struct GeometryDesc {
 - 批次按 `(clip_chain, pipeline, texture_index)` 归并；启用平台原生 bindless 后不再因纹理切换切批（§2.8）。
 - **目标**：典型场景 `draw_calls_per_frame ≤ 8`（uber-quad + geometry）；遮挡区域由 damage 剔除，不生成 `Primitive`。
 - 运行时**不做** SVG 光栅：54 个图标必须在**应用层构建期**转成路径数据（`Geometry`）或预生成 PNG 图集；引擎不依赖
-  `usvg` / `resvg`。**M4 的「图标构建期转换」尚未落地**（无 `svg_build.rs`、`ResourceCache` 只收 PNG/JPEG/WebP），
-  迁移时它是 `base_ui` 的交付项（§10.2 M6.0 迁入项）。
+  `usvg` / `resvg`。**迁移前引擎基线的「图标构建期转换」尚未落地**（无 `svg_build.rs`、`ResourceCache` 只收 PNG/JPEG/WebP），
+  迁移时它是 `base_ui` 的交付项（P2-1b 迁入项，§10.2）。
 
 ### 5.7 脏矩形合成
 
@@ -1504,9 +1483,9 @@ impl Canvas {
 | 应用注册自有 pipeline（顶点布局 / uniform / shader 句柄） | 与 **I2**（一套数据契约）冲突：会引入应用侧第二份顶点/uniform 契约，必须写进 `contract.md` 并让三套手写 shader 都支持（D11 的 3× 工作量） |
 | `Primitive::Canvas(CustomDraw { pipeline, buffers, uniform, damage })` | 该形状**在实现中不存在**（实际载荷是 `Arc<Canvas>`）；继续承诺等于承诺未实现能力 |
 | 任意 GPU 命令插入 / 应用持有 GPU buffer、uniform | 与 **I4**（GPU 资源只经延迟销毁）直接矛盾：应用持有的资源生命周期无法纳入 `RetireQueue` 的 `FrameIndex` 队列 |
-| 扩一整套自定义 pipeline 的视觉基线 | 与 **I8** 冲突：现有 L3 只有 10 个 case（42 张 golden），重开基线等于重做像素回归 |
+| 扩一整套自定义 pipeline 的视觉基线 | 与 **I8** 冲突：现有 L3 只有 14 个 case（42 张 golden），重开基线等于重做像素回归 |
 
-**消费者核实**：全仓 `crates/{widgets,base_ui,kytrix,*_ui}` 对 `Shader` / `wgpu` / `VertexBuffer` / `render_pipeline` 的命中为 **0**；
+**消费者核实**：全仓 `crates/{base_ui,kytrix,*_ui}`（排除 `target/`）对 `shader` / `wgpu` / `VertexBuffer` / `render_pipeline` 的**代码引用为 0**；仅 `crates/base_ui/src/color_picker.rs:1195` 一处注释提到 “no gradient shader”（本轮 177 个 `.rs` 复核）。GPUI 本身也不向应用暴露自定义 pipeline，因此**没有任何 widget 依赖自有 shader / GPU 缓冲**。应用自绘的典型场景（图表、地图、K 线）已能由 `Canvas::push_*` + 静态 `Geometry`（两种 `GeometryPipeline`：`Ui` / `Textured`）覆盖。
 GPUI 本身也不向应用暴露自定义 pipeline，因此**没有任何 widget 依赖自有 shader / GPU 缓冲**。应用自绘的典型场景（图表、地图、
 K 线）已能由 `Canvas::push_*` + 静态 `Geometry`（两种 `GeometryPipeline`：`Ui` / `Textured`）覆盖。
 
@@ -1538,13 +1517,13 @@ K 线）已能由 `Canvas::push_*` + 静态 `Geometry`（两种 `GeometryPipelin
 | L2 | **图形测试 · CPU 帧记录** | ❌                                              | `Scene` / `Quad` / `PaintLog` / lane 复用语义                  |
 | L3 | **图形测试 · 像素快照**   | ✅（WARP / lavapipe 软件设备 + macOS 实机 GPU） | 三平台实际像素输出、AA / 色彩 / 字形光栅                       |
 | L4 | 性能基准                  | ✅（实机）                                      | 帧时间、内存、draw call、damage 比、GPU 计时                   |
-| L5 | 实机 / 驱动矩阵           | ✅（真实 GPU）                                  | 6 个发布 target 的启动、feature、device lost、CI golden 有效性 |
+| L5 | 实机 / 驱动矩阵           | ✅（真实 GPU）                                  | 6 个发布 target 的启动、feature、device lost、golden 有效性 |
 
 L1 / L2 完全不依赖 GPU（I7）：`TestApp::new()` 默认**无 renderer**，`Scene` 照常生成、`FrameRecord` / `RenderedFrame` 照常记录、
 `present` 为 no-op。L3 是专门补 D11 三套独立 shader 视觉 oracle 的一层。
 
 **L3 现状（v2.1 校准）**：**GPUI 侧**没有任何像素 / 帧缓冲 / `render_to_image` 断言；但 `ui_core` **已建成 L3**：
-`crates/ui_core/tests/snapshot.rs` 的 10 个 case × 3 个设备目录（`warp` / `lavapipe` / `metal-real`）= **42 张 golden**，
+`crates/ui_core/tests/snapshot.rs` 的 14 个 case × 3 个设备目录（`warp` / `lavapipe` / `metal-real`）= **42 张 golden**，
 容差「逐通道 2 + 不匹配 ≤ 0.1%」。**文字像素不在其中**（`SnapshotScene` 没有 `Glyphs` 变体）—— 文本正确性靠结构与度量
 断言（§4.5「为什么没有文本像素 golden」），迁移期的等价性折算见 §6.10。
 
@@ -1634,6 +1613,8 @@ pub struct FrameRecord {
     pub skipped_by_budget: u64,         // 被帧预算推迟的次数
     pub paint_log: PaintLog,            // 每条 lane 的 Rebuilt / Reused
     pub presented_latency: Option<Duration>,
+    pub a11y_only: bool,                 // 本帧是否是 a11y-only 帧（无像素工作）
+    pub a11y: Option<A11yTreeSnapshot>,  // 本帧的一笔 a11y 交付（捕获未开 = None）
 }
 pub struct RenderedFrame {
     pub frame_index: FrameIndex,
@@ -1648,7 +1629,7 @@ pub struct RenderedFrame {
 ```rust
 let frame = app.frame_record();
 let rendered = frame.frame.as_ref().expect("本帧应已渲染");
-assert_eq!(rendered.quads[0].fill, theme::surface().resolve());        // LinearPremulRgba 相等
+assert_eq!(rendered.quads[0].fill, ColorResolver.resolve(theme::surface()));        // LinearPremulRgba 相等
 assert_eq!(rendered.quads[0].bounds, Rect::new(0.0, 0.0, 240.0, 32.0));
 assert!(rendered.reused_lanes.contains(&chart_lane));                  // lane 复用
 assert!(frame.damage.iter().all(|r| r.area() < viewport.area() / 50)); // 局部重绘
@@ -1669,7 +1650,7 @@ oracle**（I8 / I12）。
 
 ```text
 SnapshotCase（合成场景 + 分辨率 + scale + 主题）
-  → 三平台各自 CI 设备（WARP / lavapipe / macOS 实机 GPU）创建离屏纹理
+  → 三平台各自门禁设备（WARP / lavapipe / macOS 实机 GPU）创建离屏纹理
   → 走同一份 Scene / GpuPrimitive / Color / 视觉参数渲染
   → CPU 读回（D3D12 readback heap / Vulkan host-visible image / Metal shared getBytes）
   → image 解码为 RGBA8
@@ -1678,31 +1659,31 @@ SnapshotCase（合成场景 + 分辨率 + scale + 主题）
 ```
 
 **golden 组织**：`tests/golden/{warp,lavapipe,metal-real}/{case}_{scale}_{theme}.png`，按设备类型分组，不进发布物。Linux
-lavapipe job 用**离屏 image** 渲染读回，不依赖 Wayland compositor 或 swapchain surface。
+lavapipe 门禁运行 用**离屏 image** 渲染读回，不依赖 Wayland compositor 或 swapchain surface。
 
 | 项           | 规则                                                                                                                                   |
 |--------------|----------------------------------------------------------------------------------------------------------------------------------------|
-| 触发         | 任何 shader / `GpuPrimitive` 布局 / `Color` / 主题色 / 文本栈 / 字体栈版本变更；CI 三平台各一份 job                                    |
+| 触发         | 任何 shader / `GpuPrimitive` 布局 / `Color` / 主题色 / 文本栈 / 字体栈版本变更；三端门禁脚本各跑一遍                                    |
 | 容差         | AA 与字形光栅允许 ±1px 与每通道小幅色差；**具体阈值由 PoC P7 在三平台实测定，本文不预设数值**（D19）                                   |
 | 零差异项     | 布局盒、元素存在性、命中结果、L2 帧记录序列                                                                                            |
 | 静态断言     | 构建期比对三套 shader 的 `GpuPrimitive` 声明与 Rust `size_of/offset_of`                                                                |
 | 软件 vs 真机 | P7 对 WARP / lavapipe 做一次「软件设备 golden vs 真实 GPU 输出」对照并量化差异；macOS 直接使用真实 GPU golden，不存在软件 / 真机差异项 |
 
-**CI 设备映射（D14 / D20）**：
+**门禁设备映射（D14 / D20；本地/远端脚本，不恢复 CI）**：
 
 | 平台    | 设备                                                                                  | 性质                                     |
 |---------|---------------------------------------------------------------------------------------|------------------------------------------|
 | Windows | `IDXGIFactory4::EnumWarpAdapter` + `D3D12CreateDevice`（系统 WARP 支持 FL 12_0/12_1） | test-only 软件设备                       |
 | Linux   | Mesa **lavapipe**，`VK_ICD_FILENAMES` 指向 `lvp_icd.*.json`                           | test-only 软件设备                       |
-| macOS   | **带 Metal 硬件的实机 / GPU 直通 runner**                                             | 真实 GPU（macOS 无官方软件 `MTLDevice`） |
+| macOS   | **带 Metal 硬件的实机 / GPU 直通机器**                                             | 真实 GPU（macOS 无官方软件 `MTLDevice`） |
 
 Windows / Linux 软件设备**不编译进发布物、不作为启动兜底、不进入产品 `cfg` 分支**（D8 边界）；macOS 使用真实硬件，同样不构成产品运行时的回退路径。
-**macOS runner 不可用时该 job 应保持阻塞而非静默跳过。**
+**macOS 实机 GPU 不可用时该端门禁必须失败/阻塞，不得静默跳过。**
 
-**CI 能力集约束**：系统内置 WARP（`d3d10warp.dll`）与 NuGet `Microsoft.Direct3D.WARP`（1.0.x）能力集不同（只有后者 ≥1.0.1 明确支持
-SM 6.6 dynamic resources）。每次 job 必须打印
+**门禁设备能力集约束**：系统内置 WARP（`d3d10warp.dll`）与 NuGet `Microsoft.Direct3D.WARP`（1.0.x）能力集不同（只有后者 ≥1.0.1 明确支持
+SM 6.6 dynamic resources）。每次门禁运行必须打印
 `adapter name / driver version / MaxSupportedFeatureLevel / HighestShaderModel / ResourceBindingTier`，把两种 WARP 当作两个
-target；若 CI 用系统 WARP 而启用了 SM 6.6 变体，**golden 与真实 GPU 的 shader 特性集会分叉** —— 此时显式跳过该变体并记录，不静默失败。即便
+target；若门禁机用系统 WARP 而启用了 SM 6.6 变体，**golden 与真实 GPU 的 shader 特性集会分叉** —— 此时显式跳过该变体并记录，不静默失败。即便
 SM 相同，软件光栅与硬件的浮点 / 导数 / 采样数值仍可能不同，由 P7 量化进容差。
 
 ### 6.5 三套 shader 一致性（D11 的验收面）
@@ -1718,7 +1699,7 @@ SM 相同，软件光栅与硬件的浮点 / 导数 / 采样数值仍可能不�
 | 缩放     | scale 1 / 1.25 / 2 / 3，验证 NDC / Y 方向与 AA                                                        |
 | 几何     | `Geometry` 静态 VBO + uniform 变换、路径三角化                                                        |
 
-**参数 golden**：除像素外，CI 还比对三套 shader 的编译产物元信息、`GpuPrimitive` 字段偏移、uniform 布局、blend
+**参数 golden**：除像素外，门禁脚本还比对三套 shader 的编译产物元信息、`GpuPrimitive` 字段偏移、uniform 布局、blend
 state、颜色空间标记与插值空间 —— **零容差**，可在 CPU 侧断言，不需要 GPU。
 
 ### 6.6 无 GPU harness（I7）
@@ -1740,7 +1721,7 @@ state、颜色空间标记与插值空间 —— **零容差**，可在 CPU 侧�
 
 **统计口径**：`crates/**/*.rs`（排除 `target/`，实测 1,037 个文件）；「次数」= 命中的**行数**，「文件数」= 命中行的去重文件数。
 **迁移面**（A5，已核实）：全仓 7,729 个测试函数，迁移范围 **5,443** —— 可机械迁移 **3,610（66.3%）**、必须重写 **1,711（31.4%）**、
-应删除 **9**、未解析 **122**。因此 §10.2 的 M6 验收按「**5,443 迁移面 + crate 全绿**」而不是单一 API 数。
+应删除 **9**、未解析 **122**。因此 §10.2 的 P2–P4 验收按「**5,443 迁移面 + crate 全绿**」而不是单一 API 数。
 
 | GPUI 现有 API（迁移量） | 新引擎等价物（深路径） | 层 | 等价性判据 / 陷阱 |
 |---|---|---|---|
@@ -1750,29 +1731,30 @@ state、颜色空间标记与插值空间 —— **零容差**，可在 CPU 侧�
 | `#[gpui_kit::test]`（**1,652**） | `#[test]` + `TestApp::new()`（需要帧/探针）或纯 `#[test]`（纯函数，L0） | L0/L1 | 两级目标；不是一律降级 |
 | `debug_selector`（**405 / 75**） | `Probe::by_selector(Selector)` | L1 | `Selector` 只有 `Id` / `Text` / `Path`，**无 `Role`** |
 | `debug_bounds`（**1,215 / 63**） | `Probe::bounds(NodeId) -> Option<Rect>` | L1 | 节点树直查；逻辑像素、窗口绝对 |
-| `painted_quads()`（10 / 10） | `RenderedFrame.quads` / `primitives`（`frame_record().frame`） | L2 | 量级远小于其余 API |
+| `painted_quads()`（**10 / 9**） | `RenderedFrame.quads` / `primitives`（`frame_record().frame`） | L2 | 量级远小于其余 API；A5 表与复算均为 10 行 / 9 文件（见口径注） |
 | `PaintLog` / `reuse_paint` / `refresh` | `FrameRecord.paint_log` / `RenderedFrame.reused_lanes` / `TestApp::drain()` | L2 | `PaintLog` 在 `FrameRecord` 上，不在 `RenderedFrame` 上 |
 | `simulate_*` | `TestApp::inject(InputEvent) -> InputOutcome` | L1 | — |
 | `run_until_parked`（**573 / 78**） | **循环** `TestApp::drain()` 直到 `frame_record().repainted == false`；或 `TestApp::advance(dt)` / `FrameScript` | L1 | `drain()` **只推进一帧**；573 处里约 266 个函数同时用 `advance_clock` / `simulate_next_frame`，必须逐处改写 |
 | `advance_clock` / `simulate_next_frame` | `TestApp::advance(Duration)` / `FrameScript::push(ScriptFrame::advance(dt))` | L1 | 多帧序列用 `FrameScript` + `ScriptReport::assert_*` |
 | `Runtime::for_test`（**125–127 / 35**） | `#[tokio::test]` 自带 runtime，或显式 `Handle` 注入 | L0 | `widget_tokio_runtime` 整体删除（§9.2） |
-| `current_test_handle`（**154 / 23**）/ `test_handle`（**157 / 23**） | `App::runtime_handle()`（`&Handle`）/ `App::handle()`（`AppHandle`） | L0 | 逃逸口随 M8 删除 |
+| `current_test_handle`（**154 / 23**）/ `test_handle`（**159 / 23**） | `App::runtime_handle()`（`&Handle`）/ `App::handle()`（`AppHandle`） | L0 | 逃逸口随 P5-2 删除 |
 | 无（新增） | `FrameScript` + `ScriptReport`（多帧脚本 + 逐帧断言） | L2.5 | `test_support::script` |
 | 无（新增） | `TestApp::{assert_oracle, oracle_diff, assert_a11y_oracle}` | L2 | full-refresh oracle / a11y oracle |
-| 无（新增） | `SnapshotCase` + `SnapshotScene` / `SnapshotTheme` + `Tolerance` + golden | L3 | 10 case × 3 设备 = 42 张 golden；**不含文字像素** |
+| 无（新增） | `SnapshotCase` + `SnapshotScene` / `SnapshotTheme` + `Tolerance` + golden | L3 | 14 case × 3 设备 = 42 张 golden；**不含文字像素** |
 | 无（新增） | `criterion` bench：`perf` / `layout_postpass` | L4 | 非闸门 |
 
 **`#[tokio::test]`（794 个，数字准确但口径要改）**：现有约 794 个 `#[tokio::test]` **不能整体判定为可保留**。正确做法是**先分桶**：
 按「`use gpui_kit`」把 794 分成 **641 个纯桶（文件不 `use gpui_kit`，可批量信任）** 与 **153 个需抽查**（A5 §3）—— 不是逐个抽查 794。
 
-**测试基建的已知缺口**（M6.0 前置，见 §10.2）：`Probe` 无 a11y 查询、`Selector` 无 `Role`、`TestApp` 无 `mount`；其中 a11y 用
+**测试基建的已知缺口**（P2-1a 前置，见 §10.2）：`Probe` 无 a11y 查询、`Selector` 无 `Role`、`TestApp` 无 `mount`；其中 a11y 用
 `TestApp::a11y()` / `assert_a11y_contract` / `assert_a11y_oracle` 覆盖，`Role` 选择器推迟到 P14（F-63）。
 
 > **口径注（v2.1）**：`debug_bounds` / `debug_selector` / `Runtime::for_test` 的 A5 计数（1,215 / 405 / 125）与本轮复算
 > （1,212 / 403 / 127，同为「行命中」口径）差 2–3 行，差异来自注释行与定义处；本表采用 A5 口径，复算差异记在
-> `.docs/gui-migration/design-changes.md` 的注记里。**量级结论不受影响**。
+> `.docs/gui-migration/design-changes.md` 的注记里。`painted_quads` 的 A5 计数是 **10 / 9**（v2.1 初版误写 10 / 10），
+> 本表与 A5 表、本轮复算一致。**量级结论不受影响**。
 
-### 6.9 验收命令与 CI 门禁
+### 6.9 验收命令与门禁执行（D-07：脚本化，不恢复 CI）
 
 ```text
 cargo test --workspace                          # L0 + L1 + L2（含 full-refresh oracle）
@@ -1782,26 +1764,32 @@ cargo +nightly fmt --all -- --check
 cargo bench -p ui_core --bench perf             # L4（非合并闸门）
 cargo bench -p ui_core --bench layout_postpass  # L4（非合并闸门）
 cargo test -p ui_core --features test-support -- --ignored   # 真实窗口冒烟（gui_smoke）
-ci: pixel-snapshot-windows (WARP)                      # L3 / test-only 软件设备
-ci: pixel-snapshot-linux   (lavapipe)                  # L3 / test-only 软件设备
-ci: pixel-snapshot-macos   (metal-real / 实机 GPU runner)  # L3
+cargo xtask gates --platform win|mac|linux|all --scope <crates> --step fast|quick|layer
 ```
 
-**合并闸门（目标态）**：前 4 项全绿 + **三平台 L3 job 全绿**（含 macOS 实机 GPU job）+ 参数 golden 零差异。
+**门禁执行体（D-07）**：唯一执行入口是 `cargo xtask gates`（P0-2 交付：封装 Windows 本机 fast、mac/linux 远端 quick
+（ssh + 共享 `CARGO_TARGET_DIR` + mkdir 锁）与三端 layer；**不新增任何 GitHub Actions 测试/门禁工作流**）。本地预演与
+远端执行是同一条命令，证据落 `.review/mig-<batch>-*.log`。**.github/ 保持不变**。
 
-**现状（v2.1 校准，必须写清）**：仓库**只有** `.github/workflows/release.yml`（仅 `workflow_dispatch`，只跑
-`cargo build --release` + `cargo packager`，**不跑 test / clippy / fmt**）；`gui-ci.yml` 已于 `f93cec0` 删除；
-`release.yml:144` 仍引用**从不存在的** `ci.yml`。M1–M5 的门禁是 `.review/p1-gates.ps1`（Windows 6 步）+
-`.review/p1-remote.ps1`（mac/linux ssh）**手工执行**的证据。因此「三端 golden 全绿才可合入」目前**零实现**，落地清单见 §10.2 M6.0：
+**L3 的设备映射（test-only）**：Windows WARP / Linux lavapipe 是 test-only 软件设备，不编译进发布物、不作为启动兜底、
+不进产品 `cfg`；macOS 用带 Metal 硬件的实机 GPU。三端各跑一遍 `--step layer`（golden 按设备目录比对、跨设备不互比），
+任一端不可用时该端门禁**必须失败/阻塞**，不得静默跳过。
 
-1. 恢复 `gui-ci.yml` 并修 6 处（`paths` 通配、补 `gui_smoke --ignored`、macOS 用实机 GPU 且**不可静默跳过**、Linux 断言
-   「无 Vulkan 设备则 FAIL」、`cargo bench --no-run`、打印环境指纹 `adapter / driver / FL / SM / Tier`）；
-2. 门禁执行体统一为 `cargo xtask gates --platform <win|mac|linux>`（把两个 `.review` 脚本语义固化），CI 只调用它 → 本地预演 = CI 执行；
-3. 三端 golden 作为 **required check**，golden 按设备目录比对、跨设备不互比；
-4. 修 `release.yml:144` 的 `ci.yml` 引用；
-5. 补「测试-only 软件设备」边界断言（不进发布物、不作为启动兜底、不进产品 `cfg`）；
-6. 补迁移期增量门禁：`cargo test -p ui_core` + `cargo test -p <正在迁移的 crate>`；`cargo test --workspace` 在「M6 期间旧
-   crate 必红」的现实下**不能**作为合入门（§10.2 的 M6 验证门据此改写）。
+**合并闸门（目标态，脚本/人工语义）**：前 4 项全绿 + 三端 L3 golden 全绿（Windows WARP / Linux lavapipe / macOS 实机 GPU）
++ 参数 golden 零差异。该判据由 `cargo xtask gates --step layer` 的输出与 `.review/` 日志留证，**不依赖托管 CI 的门禁状态**。
+
+**现状（v2.1 校准）**：仓库**只有** `.github/workflows/release.yml`（仅 `workflow_dispatch`，只跑 `cargo build --release` +
+`cargo packager`，不跑 test / clippy / fmt）；旧 GUI CI 工作流已于 `f93cec0` 删除；`release.yml:144` 仍引用不存在的
+`ci.yml`（历史遗留，不在本批写作用域）。迁移前引擎基线的门禁是 `.review/p1-gates.ps1`（Windows 6 步）+
+`.review/p1-remote.ps1`（mac/linux ssh）**手工执行**的证据。因此「三端 golden 全绿才可合入」目前是**人工核对**；落地项
+（P0-2，不是 CI）：
+
+1. `cargo xtask gates` 把两个 `.review` 脚本的命令语义固化（fast / quick / layer 三级 + 共享 target/锁）；
+2. L3 三端 golden 入口（按设备目录、跨设备不互比）纳入 `--step layer`；
+3. `gui_smoke --ignored`、`cargo bench --no-run`、环境指纹（`adapter / driver / FL / SM / Tier`）纳入 layer 输出；
+4. 「测试-only 软件设备」边界断言（不进发布物、不作为启动兜底、不进产品 `cfg`）；
+5. 迁移期增量门禁：`cargo test -p ui_core` + `cargo test -p <正在迁移的 crate>`；`cargo test --workspace` 在
+   「迁移期旧 crate 必红」的现实下**不能**作为合入门（§10.2 的迁移期验证门据此改写）。
 
 **按 D19，本节不设任何帧时间 / 内存数值门槛。**
 
@@ -1816,7 +1804,7 @@ ci: pixel-snapshot-macos   (metal-real / 实机 GPU runner)  # L3
 |---|---|---|---|
 | **A 纯逻辑保留** | 被测算函数不接触 GPUI 类型（数值 / 几何 / 格式化 / LOD / 三角预算） | 原样保留（必要时换数值类型 `Pixels → f32`），`#[test]` 原函数即可 | 迁移前后同一断言通过 |
 | **B UI 行为重写** | 断言「元素在哪 / 命中谁 / 谁失效 / 画了什么指令」 | `TestApp` + `Probe` + `FrameRecord`（必要时 `FrameScript`）重写；**逐条**对照原断言 | 新断言覆盖原断言的**全部被观察量**（bounds / dirty 集合 / primitive 序列 / damage） |
-| **C 视觉验收** | 断言像素 | 引擎侧：`SnapshotCase` + golden（10 case × 3 设备，**不含文字像素**）；应用层场景：**三端手工验收 + 截图证据**（带环境指纹） | golden diff 通过 / 手工验收记录 + adapter 指纹 |
+| **C 视觉验收** | 断言像素 | 引擎侧：`SnapshotCase` + golden（14 case × 3 设备，**不含文字像素**）；应用层场景：**三端手工验收 + 截图证据**（带环境指纹） | golden diff 通过 / 手工验收记录 + adapter 指纹 |
 | **D 删除** | 测试对象整体消失（GPUI 专有机制：`Entity` 生命周期、`cx.notify` 广播、`render_to_image`） | 删除**必须逐条登记台账**（测试名 / 为什么没有等价语义 / 替代覆盖在哪） | 台账条目；无条目的删除视为违约 |
 
 #### 6.10.2 折算的硬规则
@@ -1837,7 +1825,7 @@ ci: pixel-snapshot-macos   (metal-real / 实机 GPU runner)  # L3
 #### 6.10.3 台账格式（`.docs/gui-migration/`）
 
 每个被迁移/删除的测试模块一行：`测试文件 → 类别（A/B/C/D）→ 原断言摘要 → 新落点（文件 + 测试名）→ 等价性说明`。
-台账缺行的模块**不得**在 M6 各批次的验证门里算「已迁移」。
+台账缺行的模块**不得**在 P2–P4 各批次的验证门里算「已迁移」。
 
 ---
 
@@ -1975,10 +1963,11 @@ adapter.set_root_window_bounds(outer, inner);
 
 ### 7.9 无障碍测试（不需要平台 adapter）
 
-`A11yTreeSnapshot` 是 `RenderedFrame` 的一部分（§6.3），在纯 CPU harness 中生成：
-`A11yTreeSnapshot` 由 `test_support::a11y` 在纯 CPU harness 中生成（经
-`TestApp::{enable_a11y_capture, a11y, a11y_update, assert_a11y_contract, assert_a11y_oracle}` 取用）；它**不是**
-`RenderedFrame` 的字段（v2.1 修正）。快照提供 `nodes()` / `node(A11yNodeId)` / `node_for(NodeId)` / `focus()` /
+`A11yTreeSnapshot` **不是** `RenderedFrame` 的字段（`RenderedFrame` 只有 `frame_index / quads / primitives / reused_lanes`）。
+a11y 交付挂在本帧的 `FrameRecord.a11y: Option<A11yTreeSnapshot>` 上（a11y-only 帧没有 `RenderedFrame`，§6.3），由
+`test_support::a11y` 在纯 CPU harness 中生成，经
+`TestApp::{enable_a11y_capture, a11y, a11y_update, assert_a11y_contract, assert_a11y_oracle}` 取用。快照提供 `nodes()` /
+`node(A11yNodeId)` / `node_for(NodeId)` / `focus()` /
 `focus_node()`，断言从**引擎句柄**出发：
 
 ```rust
@@ -2004,7 +1993,7 @@ assert!(!node.hidden);
 | Action 往返               | 注入 `ActionRequest::Click` → 与 `InputEvent` 注入产生相同的状态变化 |
 | `bind_a11y` 正确性        | `A11yPatch`（如 `disabled`）按依赖失效，且不产生视觉 damage          |
 
-平台 adapter 的真实联动（UIA / NSAccessibility / AT-SPI）放在 L5 实机矩阵验证，不在 CI 的 CPU 层断言。
+平台 adapter 的真实联动（UIA / NSAccessibility / AT-SPI）放在 L5 实机矩阵验证，不在门禁的 CPU 层断言。
 
 ---
 
@@ -2070,17 +2059,20 @@ platform/                     # 模块本身私有：应用只见 AppHandle 与 
 ### 8.2 窗口、标题栏、DPI、外观
 
 - **窗口句柄**：引擎**自己创建并持有**原生句柄（`HWND` / `NSWindow`+`NSView` / `wl_display`+`wl_surface`），句柄只在
-  `platform/` 与 `render/{os}/` 内使用（I9）。`raw-window-handle 0.6` 仅作为**对外互操作**的可选导出（供第三方库嵌入），不进内核路径。
+  `platform/` 与 `render/{os}/` 内使用（I9）。**不对应用导出原生句柄**，也没有 `raw-window-handle` 依赖 / 互操作导出（源码 0 引用；未实现，不在 v2.1 范围）。
 - **窗口装饰（现状，v2.1 校准；契约见 §8.6）**：三端**能力不同且都已实现各自路径** ——
   **Windows**：`WS_OVERLAPPEDWINDOW` + **系统标题栏**（`WM_NCCALCSIZE` 交 `DefWindowProcW`，Aero Snap / Snap Layouts /
-  双击最大化 / `Alt+Space` 全部由系统提供）；应用只能声明**自绘 header 的拖动区**（`Window::set_drag_regions` →
-  `WM_NCHITTEST` 返回 `HTCAPTION`）。
+  双击最大化 / `Alt+Space` 全部由系统提供）；应用可声明**自绘 header 的拖动区**（`App::set_drag_regions` →
+  `Window::set_drag_regions` → `WM_NCHITTEST` 返回 `HTCAPTION`）。
   **macOS**：标题栏透明 + 标题隐藏 + 内容铺满窗口（`setTitlebarAppearsTransparent(true)` / `setTitleVisibility(Hidden)`），
-  **原生交通灯保留并浮在内容上方**（应用用顶部安全区避让；红点重定向到引擎关闭桥）。
+  **原生交通灯保留并浮在内容上方**（应用用顶部安全区避让；红点重定向到引擎关闭桥）；自绘 header 的拖动区经
+  `mouseDown:` → `performWindowDragWithEvent:` 实现。
   **Linux/Wayland**：客户端装饰（自绘标题栏），引擎提供 `WindowControl`（`Minimize` / `ToggleMaximize` / `ToggleFullscreen` /
   `BeginMove` / `BeginResize`）+ `WindowState`（`client_decoration` / `maximized` / `fullscreen` / `can_*`）+
-  `App::request_window_control`。
-  **应用层唯一入口**是引擎 API；Win/mac 的 frameless / 窗口按钮 / 图标 / 运行时改标题是 `v2.1 新增规格 E6`（§11.6）。
+  `App::request_window_control`；拖动区命中后转 `xdg_toplevel.move`（compositor 驱动）。
+  **三端 `Window::set_drag_regions` 都生效**（语义不同，见 §8.6.2）。**应用层唯一入口**是引擎 API；Windows 的
+  frameless / 三枚系统按钮 / 窗口图标 / 运行时改标题由 `v2.1 新增规格 E6`（P1-E6，§11.6）提供，macOS 的交通灯位置与
+  运行时改标题同属 E6。
 - **DPI**：平台事件（Win32 `WM_DPICHANGED` / macOS `backingScaleFactor` 变更 / Wayland `wl_output` scale +
   `wp_fractional_scale_v1`）→ `scale` 写入引擎 → 根 `LAYOUT` + offscreen 重建 + 全部文本 measure 版本递增；**VBO 不重建**
   （§5.5）。
@@ -2116,22 +2108,24 @@ platform/                     # 模块本身私有：应用只见 AppHandle 与 
 - 引擎提供 `ResourceCache`：字节 → 解码 → GPU 句柄 / `AtlasTile`，含远程图片的磁盘缓存；资源**文件**在 `base_ui`。
 - **54 个 Phosphor SVG** 的转换**不在引擎内**（引擎不依赖 `usvg` / `resvg` / `tiny-skia`）：应用层在**构建期**把它们转成
   路径数据（`GeometryDesc`）或预生成 PNG；品牌 PNG / 预览 PNG 走 `image 0.25` + 图集（`ResourceCache` 只收 PNG / JPEG / WebP）。
-  **M4 的「图标构建期转换」尚未落地**，是 M6.0 的迁入项（§10.2）。
+  **迁移前引擎基线的「图标构建期转换」尚未落地**，是 P2-1b 的迁入项（§10.2）。
 - 主题语义色、调色板、深浅色映射、i18n 全在应用层；引擎只暴露 `Color` / `ColorResolver` / 混合模式 / `TextStyle` 接口。
 - 合规缺口（GPLv3 元数据、Phosphor MIT 无 LICENSE、ODbL 公开副本 URL）**仅登记 RK9，按 D19 不在本次范围**。
 
 ### 8.6 自绘标题栏契约（v2.1 新增；E6 的引擎侧前提）
 
 kytrix 外壳需要「自绘透明标题栏 + 三枚系统按钮」。本条把**语义**固定在引擎侧（I9 落地前提）：应用只描述「这条区域可以拖动 /
-这三个按钮是系统按钮 / 我要知道是不是最大化」，平台细节全部在 `platform/`。**E6 落地前**：Windows 用系统标题栏（零改动），
-macOS 已是「透明标题栏 + 原生交通灯浮在内容上」，Linux 已是客户端装饰。
+这三个按钮是系统按钮 / 我要知道是不是最大化」，平台细节全部在 `platform/`。**E6 已由 D-02 裁决必做，排在 P1-E6**：
+Windows 在 E6 落地前沿用系统标题栏（当前基线），E6 落地后由 `WindowOptions.decorations = Decorations::None` 切到
+frameless；macOS 已是「透明标题栏 + 原生交通灯浮在内容上」（E6 补交通灯位置与运行时标题），Linux 已是客户端装饰。
+若 E6 在 Win11 真机验证失败，按 `plan.md` 风险 R1 回退系统标题栏并请示用户，不静默降级。
 
 #### 8.6.1 三端标题栏语义（契约，不是实现细节）
 
 | 端 | 标题栏归属 | 应用职责 | 引擎职责 | 现状 |
 |---|---|---|---|---|
 | Windows | **系统标题栏**（现状）/ E6 后可由 `WindowOptions.decorations = Decorations::None` 改为应用自绘 | 在自绘 header 上声明拖动区与三枚按钮的 hit 区域；读 `WindowState.maximized` 决定图标 | `WM_NCCALCSIZE`（E6 后自算 resize border）、`WM_NCHITTEST`（八边 + 拖动区 `HTCAPTION`）、`SetWindowTextW`、`WM_SETICON`、`IsZoomed` / `SW_MAXIMIZE` | 系统标题栏 + 拖动区（`set_drag_regions`） |
-| macOS | **系统的交通灯保留**，标题栏透明、内容铺满（已实现） | 用顶部**安全区**（交通灯高度）避让；三枚按钮不需要自绘 | 交通灯位置（E6 的 `traffic_light_position`）、红点走的关闭桥、全屏转场 | 已实现（`setTitlebarAppearsTransparent` / `setTitleVisibility(Hidden)` / 原生按钮保留） |
+| macOS | **系统的交通灯保留**，标题栏透明、内容铺满（已实现） | 用顶部**安全区**（交通灯高度）避让；三枚按钮不需要自绘 | 交通灯位置（E6 的 `set_traffic_light_position` / `traffic_light_inset`）、红点走的关闭桥、全屏转场 | 已实现（`setTitlebarAppearsTransparent` / `setTitleVisibility(Hidden)` / 原生按钮保留） |
 | Linux（Wayland） | **客户端装饰**（应用自绘标题栏） | 画 header + 三枚按钮，调 `App::request_window_control` | `xdg_toplevel` 的 `move` / `resize` / `set_minimized` / `set_maximized` / `set_fullscreen`；`WindowState` 镜像 | 已实现（`WindowControl` / `WindowState` / `request_window_control`） |
 
 #### 8.6.2 拖动区（三端统一语义）
@@ -2144,8 +2138,12 @@ macOS 已是「透明标题栏 + 原生交通灯浮在内容上」，Linux 已�
   「客户区内部」的矩形，引擎负责在边角处让位。
 - **E6 后仍然成立**：`decorations = None` 时引擎自算 resize border（八边 `WM_NCHITTEST`），拖动区语义不变；**不要**让应用声明
   「整条窗口顶部」——应用只声明**它自己画的那条 header**。
-- **降级**：macOS/Linux **没有** `set_drag_regions` 的等价能力（mac 拖动由 AppKit 的标题栏/背景拖动提供、Linux 由
-  `BeginMove` 请求提供）；应用可以无条件调用（引擎按平台忽略或转译），但**不得**假设「拖动区一定生效」。
+- **三端已各自实现（v2.1 修正）**：`Window::set_drag_regions` 无 `cfg` 门控，三端都有原生路径 —— Windows 在
+  `WM_NCHITTEST` 返回 `HTCAPTION`（系统 move 模态循环）；macOS 在 `GuiView mouseDown:` 命中后调用
+  `performWindowDragWithEvent:`（AppKit 同步拖动）；Wayland 在命中区主键按下后发 `xdg_toplevel.move(seat, serial)`
+  （compositor 驱动）。**语义不同**：Windows 是系统 move 模态循环（Aero Snap / Snap Layouts / 双击最大化免费）、
+  macOS 是 WindowServer 拖动、Wayland 是 compositor move。**降级**：Wayland 没有 `xdg_toplevel` 或 compositor 不实现
+  交互移动时按「无操作」处理（应用仍可用 `WindowControl::BeginMove` 显式路径）；应用**不得**假设「拖动区一定生效」。
 
 #### 8.6.3 系统按钮 → Action（应用只见引擎类型）
 
@@ -2185,8 +2183,9 @@ app.set_title(window, SmolStr::new_static("Kytrix — BTC/USDT"))?;
 - **全屏**：Linux 全屏时 `WindowState.fullscreen == true` ⇒ 应用**不画**标题栏（此时没有窗口装饰语义）；Windows E6 frameless 全屏
   时引擎隐藏 resize border 与拖动区命中；macOS 原生全屏（`FullScreenPrimary`）下交通灯由 AppKit 隐藏/浮现，应用按
   `WindowState` 或安全区变化重排。
-- **安全区**：macOS 顶部交通灯占用固定高度，引擎提供该值（E6 的 `traffic_light_position` 同时给出 inset）；应用只能「留白」，
-  **不能**把可点击控件放到交通灯下（会与系统按钮抢命中）。
+- **安全区**：macOS 顶部交通灯占用固定高度。E6 提供**只读查询** `Window::traffic_light_inset() -> Option<Point>`
+  （系统交通灯占用的 inset；`None` = 非 macOS，或原生全屏下交通灯被系统隐藏），应用按返回值留白。`App::set_traffic_light_position`
+  只是**设置**入口，不能替代读取；应用**不能**把可点击控件放到交通灯下（会与系统按钮抢命中）。
 
 #### 8.6.6 不变量约束
 
@@ -2218,14 +2217,14 @@ main()
   ├ let handle  = runtime.handle().clone();          // 单一 runtime 的显式句柄
   ├ let app     = App::new(handle);                  // 不是 Global，不是单独 crate
   └ PlatformLoop::run(&mut app)                      // 引擎自有事件循环，主线程
-       ├ 帧内提交任务：app.handle.spawn(async { ... })
+       ├ 帧内提交任务：app.handle().spawn(async { ... })
   ├ 任务完成：`AppHandle::send` / `wake` → 主线程 drain
        └ 主线程 drain 后 → App::write(signal, ...) → 失效 → 唤醒帧（§3.6）
 ```
 
 | 线程                                                | 允许做什么                                                                              | 禁止做什么                                                                                     |
 |-----------------------------------------------------|-----------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------|
-| 主线程（引擎自有平台事件循环，**非 tokio worker**） | 全部 UI 状态、节点树、布局、paint、GPU 提交、a11y 更新；经 `App.handle` 提交 tokio 任务 | 阻塞等待 GPU；**直接调 `tokio::spawn` / `Handle::current()`**（不在 runtime 上下文，会 panic） |
+| 主线程（引擎自有平台事件循环，**非 tokio worker**） | 全部 UI 状态、节点树、布局、paint、GPU 提交、a11y 更新；经 `App::handle()` 提交 tokio 任务 | 阻塞等待 GPU；**直接调 `tokio::spawn` / `Handle::current()`**（不在 runtime 上下文，会 panic） |
 | **单一 tokio runtime**                              | IO、网络、行情解析、业务计算；任务内可直接 `tokio::spawn` / `spawn_blocking`            | 写 `Signal`、改节点、创建 GPU 资源（一律经 `AppHandle::send` 回投主线程）                      |
 | GPU 完成信号                                        | 推进 `RetireQueue.completed`                                                            | 直接改 UI 状态                                                                                 |
 | 平台 a11y adapter                                   | 接收辅助技术请求                                                                        | 直接改节点（回投主线程）                                                                       |
@@ -2238,26 +2237,26 @@ main()
 |------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------|
 | 整个 crate `widget_tokio_runtime`（3 个 `.rs`）及其 workspace 声明                 | 无替代，`main` 直接建 runtime                                                                                               |
 | 约 **30** 个 `Cargo.toml` 的依赖声明、**77 个 `.rs` 文件中的 103 行**调用（生产 47 行 / 43 文件 + 测试 56 行 / 50 文件，A3 实测） | `tokio::runtime::Handle` 由 composition root 传参，或直接 `#[tokio::test]`                                                  |
-| `global::install` / `global::handle` / `global::try_handle`                        | `App { handle: Handle }`                                                                                                    |
+| `global::install` / `global::handle` / `global::try_handle`                        | `App` 私有的 `runtime: Handle`（经 `App::handle()` / `App::runtime_handle()` 暴露） |
 | `Runtime` 作为服务构造参数注入（45 处）                                            | 传 `Handle` 或让服务自己持有 `Arc`                                                                                          |
-| `clippy.toml` 的 `disallowed-methods`（禁用 `spawn_blocking` / `Handle::current`） | 改为一条新约定：主线程只经 `App::spawn` / `app.handle.spawn(...)`，禁止裸 `tokio::spawn`；用编译期 lint 与 code review 约束 |
+| `clippy.toml` 的 `disallowed-methods`（禁用 `spawn_blocking` / `Handle::current`） | 改为一条新约定：主线程只经 `AppHandle::spawn` / `app.handle().spawn(...)`，禁止裸 `tokio::spawn`；用编译期 lint 与 code review 约束 |
 | `runtime.rs` 的 workspace 遍历测试（硬编码「恰好 42 crate」；`crates/` 下实测 **43** 个 `Cargo.toml` ⇒ 判据与现实不一致，随本项一并删除或改判据） | 删除                                                                                                                        |
-| `Runtime::for_test()`（**127 处 / 35 文件**）/ `current_test_handle()`（**154 / 23**）/ `test_handle()`（**157 / 23**）逃逸 | `#[tokio::test]` 自带 runtime，或显式 `Handle` 注入                                                                         |
-| `gpui-*` 全族带来的 `gpui-pre-scheduler` / `async-task` / `pollster` / `smol` 系   | 随 M8 一并清理                                                                                                              |
+| `Runtime::for_test()`（**127 处 / 35 文件**）/ `current_test_handle()`（**154 / 23**）/ `test_handle()`（**159 / 23**）逃逸 | `#[tokio::test]` 自带 runtime，或显式 `Handle` 注入                                                                         |
+| `gpui-*` 全族带来的 `gpui-pre-scheduler` / `async-task` / `pollster` / `smol` 系   | 随 P5-2 一并清理                                                                                                              |
 
 **不移除项**：
 
 - `kytrix_service_provider/src/auth/session.rs` 的专用 `new_current_thread` runtime（业务自身的线程隔离设计，不是双
-  executor 桥接）；M8 阶段复核是否合并进共享 runtime。
+  executor 桥接）；P5 阶段复核是否合并进共享 runtime。
 - `accesskit_unix` / `zbus` 内部拉入的 `async-executor` 是库内部实现，不属于应用级 executor，D21 不要求移除。
-- `tokio 1.54.1` + `features = ["full"]` 保持不变；各 crate 的细粒度 features 可在 M8 收敛。
+- `tokio 1.54.1` + `features = ["full"]` 保持不变；各 crate 的细粒度 features 可在 P5 收敛。
 
 ### 9.3 资源预算与内存策略
 
 | 项             | 策略                                                             |
 |----------------|------------------------------------------------------------------|
 | 实例缓冲       | 装载期按上限一次分配，只写 dirty 区间；**不出现 `2^n` 跨档翻倍** |
-| `Geometry` VBO | 常驻、引用计数、retire 释放；地图 / K 线静态网格只一份           |
+| `Geometry` VBO | 常驻、显式 `release`、retire 释放；地图 / K 线静态网格只一份           |
 | 图集           | `etagere` + LRU + `generation`；重排时整体 retire 并失效引用节点 |
 | `ShapedLine`   | 容量上限显式；key 含 scale 与字体栈版本                          |
 | 持久 offscreen | 每窗口一份完整帧纹理；resize 时重建（不动 VBO）                  |
@@ -2271,7 +2270,7 @@ D19：本节**不设数值门槛**、不细化人月与排期；指标采集方�
 |--------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------|
 | GPU API                  | `windows 0.62` / `objc2-metal` / `ash`                                                                                                                                                                                                                            | 系统 API；精确版本按 `Cargo.lock` 冻结                                  |
 | Shader 工具链            | DXC / Metal 编译器 / glslang                                                                                                                                                                                                                                      | 构建期；产物入库校验                                                    |
-| 窗口 / 事件              | **引擎自建三平台事件循环**：`windows 0.62`（Win32_UI_WindowsAndMessaging / Ime / Dwm）、`objc2` + `objc2-app-kit` + `objc2-quartz-core`、**`wayland-client` + `wayland-protocols` + `calloop` + `xkbcommon`（仅 Wayland）**；`raw-window-handle 0.6` 仅可选互操作 | 三套平台依赖按 target 分组；L5 实机矩阵覆盖启动 / 暂停 / 退出           |
+| 窗口 / 事件              | **引擎自建三平台事件循环**：`windows 0.62`（Win32_UI_WindowsAndMessaging / Ime / Dwm）、`objc2` + `objc2-app-kit` + `objc2-quartz-core`、**`wayland-client` + `wayland-protocols` + `calloop` + `xkbcommon`（仅 Wayland）** | 三套平台依赖按 target 分组；L5 实机矩阵覆盖启动 / 暂停 / 退出           |
 | 布局                     | `taffy 0.15.x`（`LayoutPartialTree`）                                                                                                                                                                                                                             | 仓库 `Cargo.lock` 已有 0.15.0                                           |
 | 文本                     | `Parley 0.12` + `Fontique` + `HarfRust` + `Skrifa` + `ICU4X` + `swash`                                                                                                                                                                                            | `Parley 0.12.0` / `Fontique 0.12.0` 已确认；`Skrifa` 精确版本发布前复核 |
 | 无障碍                   | `accesskit 0.25.0` + `accesskit_windows` / `accesskit_macos` / `accesskit_unix`（**直连**）                                                                                                                                                                       | adapter 批次版本逐个核对                                                |
@@ -2283,7 +2282,7 @@ D19：本节**不设数值门槛**、不细化人月与排期；指标采集方�
 
 **明确不进依赖图**：`wgpu` / `wgpu-hal` / `naga`、`gpui-*` 全族（含 `gpui-pre-scheduler`）、`glyphon`、Vello 系、`cosmic-text`
 主链路、`gpui-fast`、`widget_tokio_runtime`、`winit` / `accesskit_winit`、`x11rb` / X11 / XIM 相关库（D25），以及随 GPUI 移除的
-`async-task` / `pollster` / `smol` 系应用级依赖。`cosmic-text` 仅可作为 PoC 阶段 CJK 正确性对照语料来源。
+`async-task` / `pollster` / `smol` 系应用级依赖。`cosmic-text` 仅可作为 PoC 阶段 CJK 正确性对照语料来源。`raw-window-handle` 不在依赖图（未实现互操作导出，§8.2）。
 
 **发布前复核（非需求决策）**：`Skrifa` 精确版本、0.25 系各平台 adapter 签名、`VK_KHR_incremental_present` 在目标 Linux
 驱动上的支持率、系统内置 WARP 的 SM 上限、D3D12 FL/SM/Tier 的具体冻结值（由 PoC 实测决定）。
@@ -2305,47 +2304,94 @@ D19：本节**不设数值门槛**、不细化人月与排期；指标采集方�
 D18 定案「主干冻结窗口」：约定一段时间内不发布、在主干集中重写，期间以里程碑保证可运行性，**不引入兼容层或双栈**。每个里程碑的判定是「
 `cargo test` + clippy + fmt 全绿」与「最小窗口可出帧」。具体时长按 D19 不在本次细化。
 
-### 10.2 切换顺序
+### 10.2 切换顺序（执行编号以 `plan.md` 为准）
 
 **状态列口径**：`✅ 已完成` / `⚠️ 部分`（列未落地项）/ `⬜ 待做`；证据基线 `main@54c1b50`（2026-11-20）。
-**批次命名纪律（v2.1 新增）**：评估报告里存在 **4 套互不兼容的编号**（`04` 的 B0–B7、`03` 的 B0–B3、`07` 的 B1–B5、`02` 的 P0–P5、
-`06` 的 R1–R4、`05` 的 T0–T5）。**本表是唯一权威编号**；执行代理一律引用 `M6.x`，不得只写 `B2` / `R1` / `P0`。
+**编号纪律（v2.1 修复）**：执行编号**只有一套** —— `.docs/gui-migration/plan.md` 的阶段 **P0–P6**、里程碑 **M1–M7**、
+批次 **P0-1…P6-3**（P1 的引擎扩展批次为 **P1-E1…P1-E6**）。本文**不再定义**自己的里程碑编号；v2.0/v2.1 旧版的
+`M0–M8 / M6.x` 已停用，只作为读历史报告的映射键（见本节末「旧设计里程碑 → plan 批次」）。任务、提交信息、评审意见
+一律引用 plan 编号；plan.md 与本表冲突时**以 plan.md 为准**。
 
-| 阶段 | 交付 | 验证门 | 状态 |
-|---|---|---|---|
-| M0 | PoC 旁路原型（不进 workspace members）：三平台各一个单窗口 + 原生 device 清屏 → uber-quad → 静态几何 → damage 合成 | P1–P7（§10.4） | ✅ 已完成（PoC 产物未入库） |
-| M1 | 引擎骨架：`ui_core` crate、三平台自建事件循环（Win32 / AppKit / Wayland）与最小窗口、三平台 device 初始化、D8 检测与可读错误 | 6 target 启动 / 失败路径 / 三套消息循环可退出 | ✅ 已完成（P1 交付；Win11 build ≥ 22000 门禁在 `platform/windows/version.rs`） |
-| M2 | 渲染核心：`Scene` / `GpuPrimitive`、三套 shader、实例缓冲、图集、`Geometry` VBO、damage/compositor、`Color` / `ColorResolver` | 三平台合成场景出帧 + 参数 golden 零差异 | ✅ 已完成（P2 交付） |
-| M3 | 节点树 + 依赖追踪 + 布局（`LayoutPartialTree`）+ 命中测试 + `Style` / `PaintSpec` / `StylePatch` / `bind_style` + full-refresh oracle | P2 无 stale drawing；L1/L2 全绿 | ✅ 已完成 |
-| M4 | 文本（Parley + 自建图集）、`ResourceCache`、`TestApp` / `Probe` / `FrameRecord`、图标构建期转换 | P4 语料回放；先迁 1–2 个 crate 的测试 | ⚠️ 部分：文本 / 资源 / 测试基建已落地；**「图标构建期转换」未实现**（无 `svg_build.rs`、`ResourceCache` 只收 PNG/JPEG/WebP）、「先迁 1–2 个 crate」未做 → 登记为 M6.0 迁入项 |
-| M5 | 交互机制 + a11y 树 / adapter + 像素快照回归基建（10 case × 3 设备 = 42 golden）+ 薄 `StyleBuilder` | L3 具备设备前提的 job 全绿；§7.9 断言全绿 | ⚠️ 部分：交互 / a11y / L3 已落地；**薄 `StyleBuilder` 属应用层且未落地** → 迁入 M6.1 首个交付；L3 的 CI job 仍缺（§6.9） |
-| **M6.0** | **门禁基座 + 引擎缺口**：`gui-ci.yml` 复活（§6.9 六条）、`cargo xtask gates`、**E1–E6 中迁移阻塞项（E1 / E3 / E4 / E5）**、测试基建补齐（`Selector::Role` 推迟项登记、a11y oracle 落点确认）、迁移台账骨架（§6.10.3） | `cargo test -p ui_core` 全绿；三端门禁脚本可一键复现；E1/E3/E4/E5 各自的 L1/L2 断言落地 | ⬜ 待做 |
-| **M6.1** | **`base_ui` 地基**：`Cargo.toml` 加 `ui_core` + `taffy`；**薄 `StyleBuilder`（首个交付）**；主题层（`.hsla` 586 处 → `Color` / OKLCH 静态解析）；`base_ui::test_support`；M4 遗留的「图标构建期转换」 | `cargo test -p base_ui` 全绿；`StyleBuilder` 方法清单冻结（§4.9.5） | ⬜ 待做 |
-| **M6.2** | **widget 契约层**（`crates/widget`）：保留文件搬运 → `view` / `any` / `status` / `surface` 签名冻结 + `empty` → `registry` + gallery | 契约测试全绿；签名冻结评审通过（冻结前不得并行 widget 批次） | ⬜ 待做 |
-| **M6.3** | **20 个 widget**（K 线 / 地图优先）：重绘族（heatmap → order_book；perp ∥ pred；chokepoint；candlestick）先做，其余按标杆 → 表格列表族 → 钱包族 → 自绘族 | 每 crate `cargo test -p <crate>` 全绿 + full-refresh oracle；L2 断言覆盖 canvas 内容 | ⬜ 待做 |
-| **M6.4** | **6 个 `*_ui` 页面**：`settings_ui` / `instrument_selector_ui` / `updater_ui` / `profile_ui` / `widget_gallery_ui` / `market_participants_ui` | 每 crate 全绿；页面级 L1/L2 | ⬜ 待做 |
-| **M6.5** | **`kytrix` 外壳适配**：`main` 启动链重写（runtime → App → 首窗 → 首帧树 → `on_frame` 初始化 → `run`）、自绘标题栏（§8.6）、服务注入（`Rc<Services>` 构造链）、i18n | 最小窗口 example 作为**活体证据**（M6 期间 `cargo build -p kytrix` 必红，不能作为门） | ⬜ 待做 |
-| **M7.1** | 平台收尾（**引擎侧**）：E6 = 自绘标题栏 / 窗口按钮 / 图标 / 运行时改标题 / 外观查询 | L5 实机矩阵（含三平台中文输入法 × 高分屏多屏 × emoji 混输） | ⬜ 待做 |
-| **M7.2** | 平台收尾（**应用/构建侧**）：`Packager.toml`、`app.rc`、6 个 CI target、安装包资源 | 6 target 安装包可构建 | ⬜ 待做 |
-| M8 | 删除：`gpui-kit` 及 36 个 crate 的 `test-support` dev-dependency、`Cargo.lock` 中整套 `gpui-*`、`widget_tokio_runtime`（30 manifest）、旧窗口层残留、`AGENTS.md` 中 GPUI 约定、`app.rc` 框架隐式约定 | 零 `gpui-*`（36 包）/ 零 `wgpu*`（9 包）/ 零 `widget_tokio_runtime` / 零 `x11rb` / 零 `winit`（现状已 0，维持） | ⬜ 待做 |
+**阶段与批次（与 plan.md §3 一致）**：
 
-**M6 的内部顺序（以依赖链为准，v2.1 修正）**：`base_ui` → widget 契约 → **20 个 widget** → `*_ui` 页面 → `kytrix` 外壳。
-旧文档的「`base_ui` → widget 契约 → 各 `*_ui` → 20 个 widget」把 `*_ui` 排在 widget 之前，与依赖方向相反（`*_ui` 直接消费 widget），
-按本表执行。
+| plan 阶段 | 批次 | 交付 | 验证门（plan §2.4） | 状态 |
+|---|---|---|---|---|
+| **P0 规格与门禁基座** | P0-1 | 本文 v2.1 回写（22+6 事实修正、§5.9、§1.3、E1–E6 规格、§6.8/§6.9/§6.10、§8.6、§9.2、§10.2） | 文档 diff + `design-changes.md` + 独立审查 | ✅ 已完成（本批；审查修复见台账） |
+| | P0-2 | `xtask gates`（`--platform win\|mac\|linux\|all --scope <crates> --step fast\|quick\|layer`；远端共享 target + 锁）；**不新增 CI** | `cargo xtask gates --help` + Windows fast + 两端 quick | ⬜ 待做 |
+| | P0-3 | 基线确认（只读）：三端 fast/层末门禁、`widget_tokio_runtime` 42/43、`WIDGET_NOTICE_SOURCES`、`cargo test -p kytrix` | `.review/mig-baseline-*` 日志 + 台账 | ⬜ 待做 |
+| **P1 引擎扩展** | P1-E1 | 文本 shaping 公开面（§11.1） | L0/L1/L2 + Windows fast + 两端 quick | ⬜ 待做 |
+| | P1-E2 | 富文本（§11.2；**D-03 已裁决必做**） | 同上 + golden 重建 + 合并点三端 layer | ⬜ 待做 |
+| | P1-E3 | 变高虚拟列表（§11.3） | 同上 | ⬜ 待做 |
+| | P1-E4 | `GeometryDraw.range`（§11.4） | 同上 + 三端 encoder/`contract.md`/参数 golden 同批 | ⬜ 待做 |
+| | P1-E5 | `text_byte_index_at`（§11.5） | 同上 | ⬜ 待做 |
+| | P1-E6 | Windows chrome + macOS 交通灯（§11.6；**D-02 已裁决必做**） | L1/L5 + Win11 真机 + 合并点三端 layer | ⬜ 待做 |
+| **P2 base_ui** | P2-1a | 主题与颜色基座 + 薄 `StyleBuilder`（首个交付）+ `.hsla` 全删 + 64 角色×2 外观基线 | `cargo test -p base_ui` + gallery 出帧 | ⬜ 待做 |
+| | P2-1b | 资产与基础件（icon/assets/brand/size/format/motion/animation/join + `test_support`；含旧 M4 遗留的「图标构建期转换」） | 同上 | ⬜ 待做 |
+| | P2-2 | 容器与列表（`static_sized_list` / `scroll_bar` / `table` / `tree` / `deque_*`；`grid_list` 删） | 同上 + E3 | ⬜ 待做 |
+| | P2-3 | 文本与输入（markdown parse/source/document 纯移植；inline_flow/view 用 E2；`input` / `select`） | 同上 | ⬜ 待做 |
+| | P2-4 | 交互与浮层（button/toggle/badge/interactive/tab_bar/dropdown/menu/context_menu/tooltip/overlay/dialog/alert/layer/color_picker） | 同上 | ⬜ 待做 |
+| | P2-5 | base_ui 收口（gallery、删 `Styled`/`refine_style`/`.when(` 残留、测试折算台账、视觉基线） | 同上 | ⬜ 待做 |
+| **P3 widget 契约 + 20 widgets** | P3-1 | 契约层搬运 + `view`/`any`/`status` 重写 + `WidgetCx`/`AnyWidget` 定稿 | 契约测试 + 签名冻结评审 | ⬜ 待做 |
+| | P3-2 | `surface` / `ui/placeholder` / `binding` + `empty` 标杆 + 运行时 Handle 接线 | 同上 | ⬜ 待做 |
+| | P3-3 | `widget_registry` + `widget_gallery_ui`（24 条注册表遍历） | 同上 | ⬜ 待做 |
+| | P3-W1…W9 | 20 个 widget（K 线 / 地图优先；W1 news∥force_order … W9 hyperliquid∥watch_list∥x） | 每 crate 全绿 + full-refresh oracle + L2 | ⬜ 待做 |
+| **P4 `*_ui` 与 kytrix 外壳** | P4-1 | `market_participants_ui` ∥ `profile_ui` ∥ `updater_ui` | 每 crate 全绿 + 页面级 L1/L2 | ⬜ 待做 |
+| | P4-2 | `instrument_selector_ui` ∥ `settings_ui` | 同上 | ⬜ 待做 |
+| | P4-3 | kytrix 外壳：`main` 启动链（runtime → App → 首窗 → 首帧树 → `on_frame` → `run`）、`windows/root/window.rs` 拆分、`components/{sidebar,workspace,system_button,pages}`、**自绘标题栏（接线 P1-E6 的引擎能力）**、服务注入、i18n | 最小窗口 example 作活体证据（P2–P4 期间 `cargo build -p kytrix` 必红，不能作为门） | ⬜ 待做 |
+| **P5 收口与删除 GPUI** | P5-1 | 删除 `widget_tokio_runtime`（crate + 30 manifest + 全部调用点 → `App` 持有 Handle / `#[tokio::test]`）；workspace 遍历测试与 `clippy.toml` 相关规则清理 | 相关 crate 全绿 + 零 `widget_tokio_runtime` | ⬜ 待做 |
+| | P5-2 | 删除 `gpui-kit`（36 crate×2 行 + workspace + dev-deps）；`Cargo.lock` 零 `gpui-*`/`wgpu`；`AGENTS.md` GPUI 约定；`Packager.toml` deb 去 `libxcb1`；`app.rc`/图标；examples 与资源收尾；**「零 `x11rb`」判据在此兑现** | 零 `gpui-*`（36）/ 零 `wgpu*`（9）/ 零 `widget_tokio_runtime` / 零 `x11rb` / 零 `winit`（现状已 0，维持） | ⬜ 待做 |
+| **P6 三端验收** | P6-1 | Windows 本机真机验收：点击/拖拽/键盘/IME/widget 画布绘图/presented 统计；截图/录屏 | plan §2.4 accept | ⬜ 待做 |
+| | P6-2 | macOS（用户配置后远程）+ Linux（Wayland）同上 | accept | ⬜ 待做 |
+| | P6-3 | 验收报告 + 台账收口 + 合并 `main` | accept + 用户可见报告 | ⬜ 待做 |
 
-**M6 的验证门（v2.1 修正）**：`#[gpui_kit::test]` **1,652** 个 + 迁移面 **5,443** 个（可机械 3,610 / 必须重写 1,711 / 删 9 / 未解析 122），
-以「**crate 全绿 + 台账逐条对账**」为验收，不按 API 批量。`release 全绿` 取决于 M6.0 的 CI 门禁（§6.9）—— 门禁落地前该门**不可自动验证**。
+> **依赖与顺序（以 plan §3 为准）**：P0 → P1 → P2 → P3（契约先于 widgets）→ P4 → P5 → P6；P1 内 E2/E4/E6 的合并点追加
+> 三端 layer 门禁；P2 与 P3.1 可部分并行，P3 的 widget 批次之间完全并行。
 
-**编号映射（供读旧报告时对齐）**：
+**plan 里程碑（plan §2.2，M1–M7）与本表对应**：M1 引擎扩展完成 = P1-E1…E6；M2 base_ui 地基 = P2-1a/P2-1b；
+M3 base_ui 全量 = P2-2…P2-5；M4 widget 契约+标杆 = P3-1…P3-3 + 前 3 个标杆 widget；M5 20 widgets = P3-W1…W9；
+M6 kytrix 启动 = P4-1…P4-3；M7 最终验收 = P6-1…P6-3（P5 是 M6 与 M7 之间的删除收口，不单列里程碑）。
+
+**历史：迁移前引擎基线（旧设计 M0–M5，编号已停用）**：
+
+| 旧设计里程碑 | 交付 | 状态 |
+|---|---|---|
+| 旧 M0 | PoC 旁路原型（不进 workspace members）：三平台单窗口 + 原生 device 清屏 → uber-quad → 静态几何 → damage 合成 | ✅ 已完成（PoC 产物未入库） |
+| 旧 M1 | 引擎骨架：`ui_core`、三端自建事件循环与最小窗口、三平台 device 初始化、D8 检测与可读错误 | ✅ 已完成（Win11 build ≥ 22000 门禁在 `platform/windows/version.rs`） |
+| 旧 M2 | 渲染核心：`Scene` / `GpuPrimitive`、三套 shader、图集、`Geometry` VBO、damage/compositor、`Color` | ✅ 已完成 |
+| 旧 M3 | 节点树 + 依赖追踪 + 布局 + 命中 + `Style`/`PaintSpec`/`StylePatch` + full-refresh oracle | ✅ 已完成 |
+| 旧 M4 | 文本 + `ResourceCache` + `TestApp`/`Probe`/`FrameRecord` + 图标构建期转换 | ⚠️ 部分：「图标构建期转换」未实现 → P2-1b 迁入项 |
+| 旧 M5 | 交互 + a11y + L3 像素快照（14 case × 3 设备 = 42 golden）+ 薄 `StyleBuilder` | ⚠️ 部分：L3 已落地；薄 `StyleBuilder` 属应用层 → P2-1a 首个交付 |
+
+**旧设计里程碑 → plan 批次（读旧报告时用；按 plan 批次也可反查旧编号）**：
+
+| 旧设计编号 | plan 阶段/批次 | 说明 |
+|---|---|---|
+| 旧 M0–M5 | 迁移前基线（不在 plan 批次内） | 见上表；M4/M5 遗留分别进 P2-1b / P2-1a |
+| 旧 M6.0 | P0-2 + P1-E1…E6 | 门禁基座 = P0-2；引擎缺口 = 全部 E1–E6（E2/E6 已裁决必做，均在 P1） |
+| 旧 M6.1 | P2-1a、P2-1b | base_ui 地基 |
+| 旧 M6.2 | P3-1、P3-2、P3-3 | widget 契约层 |
+| 旧 M6.3 | P3-W1…W9 | 20 widgets |
+| 旧 M6.4 | P4-1、P4-2 | 六个 `*_ui` |
+| 旧 M6.5 | P4-3 | kytrix 外壳（自绘标题栏在此接线） |
+| 旧 M7.1 | P1-E6（引擎侧）+ P6-2（真机） | 平台收尾的引擎部分在 P1-E6，验收在 P6 |
+| 旧 M7.2 | P5-2 + P6-1…P6-3 | 构建/安装包收尾 + 三端验收 |
+| 旧 M8 | P5-1、P5-2 | 删除 GPUI / 运行时收口 |
+
+**其它报告编号 → plan 批次（供读旧报告时对齐）**：
 
 | 旧编号 | 来源 | 归入 |
 |---|---|---|
-| B0 门禁基座 / B1 base_ui 基础 / B2 widget 契约 / B3 20 widget / B4 六个 `*_ui` / B5 kytrix 外壳 / B6 运行时收口+删除 / B7 三端验收 | `04` §7.2 | B0→M6.0；B1→M6.1；B2→M6.2；B3→M6.3；B4→M6.4；B5→M6.5；B6→M8；B7→M7.1 |
-| P0 引擎增量 / P1 地基 / P2 容器列表 / P3 文本输入 / P4 交互浮层 / P5 外壳联调 | `02` §10.3 | P0→M6.0；P1–P4→M6.1/M6.3；P5→M6.5 |
-| B0 保留文件搬运 / B1 签名定稿+`empty` / B2 `surface`+binding / B3 registry+gallery | `03` §5 | 全部→M6.2 |
-| R1 heatmap→order_book / R2 perp∥pred / R3 chokepoint / R4 candlestick | `06` §3 | 全部→M6.3 |
-| B1 标杆 / B2 表格列表族 / B3 钱包族 / B4 自绘族 / B5 x | `07` §3 | 全部→M6.3 |
-| T0 摘耦合 / T1 base_ui 单测 / T2/T3 widget / T4 外壳 / T5 收尾 | `05` §7.1 | T0→M6.0；T1–T4→贯穿 M6.x；T5→M6.5 尾 |
+| B0 门禁基座 / B1 base_ui 基础 / B2 widget 契约 / B3 20 widget / B4 六个 `*_ui` / B5 kytrix 外壳 / B6 运行时收口+删除 / B7 三端验收 | `04` §7.2 | B0→P0-2；B1→P2-1a/1b；B2→P3-1…P3-3；B3→P3-W1…W9；B4→P4-1/2；B5→P4-3；B6→P5-1/2；**B7→P6 三端验收** |
+| P0 引擎增量 / P1 地基 / P2 容器列表 / P3 文本输入 / P4 交互浮层 / P5 外壳联调 | `02` §10.3 | P0→P1-E1…E6；**P1–P4→P2-1a…P2-5（base_ui 自身批次）**；P5→P4-3 |
+| B0 保留文件搬运 / B1 签名定稿+`empty` / B2 `surface`+binding / B3 registry+gallery | `03` §5 | 全部→P3-1…P3-3 |
+| R1 heatmap→order_book / R2 perp∥pred / R3 chokepoint / R4 candlestick | `06` §3 | R1/R2/R4→P3-W1/W2/W7；R3→P3-W6 |
+| B1 标杆 / B2 表格列表族 / B3 钱包族 / B4 自绘族 / B5 x | `07` §3 | 全部→P3-W1…W9 |
+| T0 摘耦合 / T1 base_ui 单测 / T2/T3 widget / T4 外壳 / T5 收尾 | `05` §7.1 | T0→P2-1a 前置；T1–T4→贯穿 P2–P4；T5→P4-3 尾 / P5 |
+
+**迁移期验证门（plan P2–P5 各批次）**：`#[gpui_kit::test]` **1,652** 个 + 迁移面 **5,443** 个（可机械 3,610 / 必须重写
+1,711 / 删 9 / 未解析 122），以「**crate 全绿 + 台账逐条对账**」为验收，不按 API 批量。`cargo test --workspace` 在迁移期
+不可作为合并门（旧 crate 必红）；门禁按 plan §2.4 的 fast/quick/layer 三级执行，执行体是 `cargo xtask gates`（P0-2），
+**不恢复 CI**。
 
 ### 10.3 可移植 / 必须重写判定
 
@@ -2402,8 +2448,8 @@ D18 定案「主干冻结窗口」：约定一段时间内不发布、在主干�
 | RK11 旧基线过期                         | 低   | §6.7 全部指标在新引擎重测                                                                                                                                                                  |
 | RK12 三套 shader 漂移                   | 高   | §2.11 契约 + §6.4 / §6.5 双重 oracle                                                                                                                                                       |
 | RK13 自建事件循环的三平台工作量与一致性 | 高   | 三套消息循环、WndProc / NSView / Wayland、IME、剪贴板、DPI / 外观、窗口装饰、任务回投全部自实现；§8.1 平台层契约 + 三套平台测试基建 + L5 实机矩阵；PoC P6 增加「三套事件循环同时出帧」判定 |
-| RK14 CI 软件设备与真机特性集分叉        | 中   | §6.4 显式打印 adapter/driver/FL/SM/Tier，两种 WARP 分 target，缺能力时跳过变体并显式记录                                                                                                   |
-| RK15 样式链迁移量                       | 高   | 约 4,752 次链式调用、133 个文件，且语义从每帧求值改为挂载时一次求值；D24 已定案，先做 1–2 个 crate 的迁移验证；full-refresh oracle 与 L1 布局测试兜底（M6）                                |
+| RK14 门禁软件设备与真机特性集分叉        | 中   | §6.4 显式打印 adapter/driver/FL/SM/Tier，两种 WARP 分 target，缺能力时跳过变体并显式记录                                                                                                   |
+| RK15 样式链迁移量                       | 高   | 约 4,752 次链式调用、133 个文件，且语义从每帧求值改为挂载时一次求值；D24 已定案，先做 1–2 个 crate 的迁移验证；full-refresh oracle 与 L1 布局测试兜底（P2–P4）                                |
 | RK16 颜色语义与 gamut mapping           | 中   | 现状：`ColorResolver` 是 ZST、插值固定线性预乘（§5.8.3）；高彩度 OKLCH 的 sRGB gamut mapping 由**应用层**在解析期处理，并进视觉 golden |
 | RK17 Wayland compositor 差异            | 中   | D25 后只面对 Wayland；`xdg-shell` / `zwp_text_input_v3` / 分数缩放 / 剪贴板在各主流 compositor 的行为列入 L5 矩阵；不满足基线时按 §2.9 明确报错退出                                        |
 
@@ -2419,26 +2465,27 @@ D18 定案「主干冻结窗口」：约定一段时间内不发布、在主干�
 
 | ID | 增量 | 量级 | 受影响不变量 | 阻塞 crate（08 口径） | 分级 | 落地批次 |
 |---|---|---|---|---|---|---|
-| **E1** | 文本 shaping 公开面（`ShapedTextHandle` + `App::shape_text` + `Canvas::push_shaped_text` + InlineBox 读取） | **M** | I2（不加 `Primitive` 变体）、I12（非像素断言）、I17 | candlestick / order_book / heatmap / prediction_market / perp / chokepoint + 4 个图表类 | **硬阻塞** | **M6.0** |
-| **E2** | 富文本（多 `TextRun` + 文本装饰 + InlineBox 绘制与命中） | **L** | I2、I17、I12 | base_ui markdown 全组（empty / news / x） | 路线相关（可降级为纯文本 + 分行节点） | M6.0 启（引擎）→ M6.1（base_ui） |
-| **E3** | 变高虚拟列表（extents 前缀和 + 锚点 + `set_virtual_extents` / `scroll_to_item`） | **M** | I5（行高来自布局，回写必须走同一棵 taffy 树）、I3（锚点补偿不得额外出帧） | news / x / eth/sol 钱包（`DequeUnsizedList`）、6 张表的 wrap 行 | **硬阻塞** | **M6.0** |
-| **E4** | `GeometryDraw.range`（索引元素子区间） | **M** | **I2（唯一契约变更点）**、I4（页级上传不变） | global_shipping_chokepoint（LOD 4 档 / 22,876 三角形） | **硬阻塞** | **M6.0** |
-| **E5** | `Window::text_byte_index_at`（点 → 字节索引） | **S** | I6（只读查询，不改状态） | 全部文本输入 / 选择 / 链接命中 | **硬阻塞** | **M6.0** |
-| **E6** | Windows chrome（`Decorations` / `icon` / `set_title` / `WindowControl` 三端 / `WindowState`）+ macOS 交通灯位置 | **M** | **I9（平台能力留在引擎）**、I14（三端各自实现，不引入可插拔 trait）、I10（不静默降级） | kytrix 外壳（自绘标题栏） | 路线相关（改用系统标题栏即零改动） | M7.1 |
+| **E1** | 文本 shaping 公开面（`ShapedTextHandle` + `App::shape_text` + `Canvas::push_shaped_text` + InlineBox 读取） | **M** | I2（不加 `Primitive` 变体）、I4（tile 生命周期仍归图集/retire）、I12（非像素断言）、I17 | candlestick / order_book / heatmap / prediction_market / perp / chokepoint + 4 个图表类 | **硬阻塞** | **P1-E1** |
+| **E2** | 富文本（多 `TextRun` + 文本装饰 + InlineBox 绘制与命中） | **L** | I2、I17、I12、I8（装饰走普通 `Quad`、不进 shader ⇒ 不触发 golden） | base_ui markdown 全组（empty / news / x） | **必做（D-03 扩展 E2）** | **P1-E2**（引擎）→ P2-3（base_ui 消费） |
+| **E3** | 变高虚拟列表（extents 前缀和 + 锚点 + `set_virtual_extents` / `scroll_to_item`） | **M** | I5（行高来自布局，回写必须走同一棵 taffy 树）、I3（锚点补偿不得额外出帧）、I11（全逻辑像素） | news / x / eth/sol 钱包（`DequeUnsizedList`）、6 张表的 wrap 行 | **硬阻塞** | **P1-E3** |
+| **E4** | `GeometryDraw.range`（索引元素子区间） | **M** | **I2（唯一契约变更点）**、I4（页级上传不变）、I8（同几何不同 range 的 golden） | global_shipping_chokepoint（LOD 4 档 / 22,876 三角形） | **硬阻塞** | **P1-E4** |
+| **E5** | `Window::text_byte_index_at`（点 → 字节索引） | **S** | I6（只读查询，不改状态） | 全部文本输入 / 选择 / 链接命中 | **硬阻塞** | **P1-E5** |
+| **E6** | Windows chrome（`Decorations` / `icon` / `set_title` / `WindowControl` 三端 / `WindowState`）+ macOS 交通灯位置 | **M** | **I9（平台能力留在引擎）**、I14（三端各自实现，不引入可插拔 trait）、I10（不静默降级）、I3（状态变化通知不轮询） | kytrix 外壳（自绘标题栏） | **必做（D-02 保留自绘标题栏）** | **P1-E6**（引擎）→ P4-3（外壳接线） |
 
 **量级口径**：S ≤ 1 人日、M = 2–5 人日、L ≥ 6 人日（仅引擎侧改动，不含迁移）。**分级口径**：硬阻塞 = 不做就无法实现既有功能；
-路线相关 = 取决于产品/架构取舍（E2 降级为纯文本、E6 改用系统标题栏）。
+**必做（已裁决）** = 产品/架构取舍已由用户裁决必须实现（D-02 保留自绘标题栏 ⇒ E6、D-03 扩展富文本 ⇒ E2），属于必须实现项，不存在降级替代。
 
 **引擎扩展准入规则（v2.1 起生效，迁移期全程适用）**：
 
 1. 只允许「**不改** `GpuPrimitive` 字节布局、不改 `render/shaders/contract.md`」的能力扩展；**E4 是唯一例外**，它必须三端
-   encoder（`render/{windows,macos,linux}/geometry.rs` + `render/compositor.rs`）+ `contract.md` + 参数 golden **同批**交付。
+   encoder（Windows `render/windows/compositor.rs` 的 `GeometryRegistry`；macOS `render/macos/geometry.rs`；Linux
+   `render/linux/geometry.rs`；共享 `render/compositor.rs`）+ `contract.md` + 参数 golden **同批**交付。
 2. **不新增 `Primitive` 变体**（I2）；不新增可插拔 trait / 运行时后端枚举（I1 / I14）。
 3. 新增的公开 API 必须写进 §1.3 白名单与本文件对应章节，并补 `EngineError` 变体（强类型、可分类、可本地化）。
 4. 每条落地必须带 L1/L2 断言；改变绘制输出的必须补 L3 golden 或（文本类）结构与度量断言（§4.5 / §6.10）。
 5. 不得以「兼容层 / 预埋 API / 未使用字段」占位（AGENTS §1.1 / §2.1）。
 
-### 11.1 E1 · 文本 shaping 公开面（`v2.1 新增规格`，量级 M，M6.0）
+### 11.1 E1 · 文本 shaping 公开面（`v2.1 新增规格`，量级 M，P1-E1）
 
 **现状与缺口**：`ShapedLine` 类型公开、字段全 `pub`，但**应用拿不到实例**（唯一出口 `NodeTree::text_line` 是 `pub(crate)`）；
 `text/*` 7 个子模块全 `pub(crate)`；`Canvas::push_text` 需要 `GlyphRun`，而 `PositionedGlyph.tile: AtlasTile` **只能由图集分配器
@@ -2454,10 +2501,12 @@ impl ShapedTextHandle {
 }
 
 impl App {
-    /// 按样式与最大宽度塑形，返回**可长期持有**的句柄（内部命中形状缓存，不重复光栅）。
-    pub fn shape_text(&mut self, text: &str, style: &TextStyle, max_width: Option<f32>)
+    /// 按样式、最大宽度与行内盒塑形，返回**可长期持有**的句柄（内部命中形状缓存，不重复光栅）。
+    pub fn shape_text(
+        &mut self, text: &str, style: &TextStyle, max_width: Option<f32>, inline_boxes: &[InlineBoxSpec],
+    )
         -> Result<ShapedTextHandle, EngineError>;
-    /// 行内盒落点（供应用画 <img>/<kbd>）；顺序与 `TextContent.inline_boxes` 的 `id` 对应。
+    /// 行内盒落点（供应用画 <img>/<kbd>）；顺序与 `shape_text` 传入的 `inline_boxes` 一一对应，`id` 原样保留。
     pub fn shaped_inline_boxes(&self, handle: &ShapedTextHandle) -> &[ShapedInlineBox];
 }
 
@@ -2474,6 +2523,8 @@ impl Canvas {
 - 应用**永远不构造裸 `GlyphRun` / `AtlasTile`**：`Canvas::push_text(GlyphRun)` 保持现状（文档已写「应用层不应自行构造」），
   应用侧入口只有 `push_shaped_text`。
 - `origin` 是**绝对窗口逻辑像素**（与 `Canvas` 内其他图元同一坐标系，§5.9）；多行文本的 `origin` 是文本盒左上角。
+- `inline_boxes` 与节点路径同源（`TextContent.inline_boxes`）；传空切片 = 无行内盒。E1 只保证落点可读（`shaped_inline_boxes`），
+  `InlineBoxPaint` 的绘制归 E2（§11.2）。
 - `max_width = None` = 不限宽（单行）；`Some(w)` 触发断行（等价 `break_all_lines(Some(w))`）。
 - 代际：句柄在构造时记录 `atlas_generation`；图集换代后 `is_stale()` 为真，`push_shaped_text` 返回 `false` 且**不产生任何图元**
   （不允许「画旧 UV」——这正是 D-5 修掉的花字问题）。
@@ -2490,16 +2541,16 @@ impl Canvas {
 I12 ✅（提供非像素断言：`handle.line().glyphs` 数量、`size()`、`text_range`）；I17 ✅（句柄是只读快照，文本内容变化仍走
 `bind_text` 或重新 shape，不绕过 Signal）。
 
-**测试要求**：L0/L1 —— `shape_text` 的 `size()` / 行数 / 字形数；`max_width` 断行；CJK + emoji；`is_stale()` 在图集换代后为真；
+**测试要求**：L0/L1 —— `shape_text` 的 `size()` / 行数 / 字形数；`max_width` 断行；CJK + emoji；传入 `inline_boxes` 后 `shaped_inline_boxes()` 的 `rect` 与行内盒数量/顺序一致；`is_stale()` 在图集换代后为真；
 `push_shaped_text` 在 stale 时返回 `false` 且 `Canvas::primitives()` 长度不变。L2 —— `FrameRecord` 中 `Primitive::GlyphRun`
 的 bounds ⊆ `origin + line.size()`，且节点 lane 的图元数与 run 数一致。**不引入 L3**（文字像素不做 golden，§4.5）。
 
-### 11.2 E2 · 富文本：多 run + 装饰 + InlineBox 绘制/命中（`v2.1 新增规格`，量级 L，M6.0 启）
+### 11.2 E2 · 富文本：多 run + 装饰 + InlineBox 绘制/命中（`v2.1 新增规格`，量级 L，P1-E2）
 
 **现状与缺口**：`TextContent` 是「单段文本 + 单 `TextStyle` + inline box 列表」；`TextStyle` **无 decoration**；
-`paint/pass.rs::emit_text` 对 `InlineBox` 直接 `continue`（**不绘制**），`ShapedInlineBox.rect` 在 `pub(crate)` 的 `ShapedLine`
-里拿不到；`text/inline_flow.rs` 自述「AST → `Vec<InlineFragment>` 的数据管线不在本阶段」。→ markdown 行内流（粗/斜/链接/`kbd`/
-行内图）无落点。
+`paint/pass.rs::emit_text` 对 `InlineBox` 直接 `continue`（**不绘制**）；`ShapedLine` 本身是 `pub struct`（字段 pub），但应用**拿不到
+实例**（唯一出口 `NodeTree::text_line` 是 `pub(crate)`），所以 `ShapedInlineBox.rect` 对应用不可达；`text/inline_flow.rs` 自述
+「AST → `Vec<InlineFragment>` 的数据管线不在本阶段」。→ markdown 行内流（粗/斜/链接/`kbd`/行内图）无落点。
 
 ```rust
 // ── text.rs（v2.1 新增；未实现） ──
@@ -2525,6 +2576,16 @@ pub struct TextContent {
 }
 ```
 
+`TextContent` 目前只能由 `NodeBuilder::text(text, style)` + `NodeBuilder::inline_boxes(..)` 构造，**没有 runs 入口**；E2 同批新增
+挂载 API（登记在 §1.3 的「v2.1 新增规格公开面」子表，落地前不可依赖）：
+
+```rust
+impl NodeBuilder {
+    /// v2.1 新增：多 run 覆盖样式（与 `text` 的整段 `style` 并存；空 runs = 整段 style）。
+    pub fn runs(self, runs: impl IntoIterator<Item = TextRun>) -> Self;
+}
+```
+
 **语义**：
 
 - `runs` 覆盖 `[0, text.len())`，区间必须**升序、不重叠、落在 char boundary**；未覆盖区间用 `TextContent.style` 兜底。
@@ -2535,6 +2596,8 @@ pub struct TextContent {
   advance），因此 L2 帧记录可直接断言；装饰矩形**不参与布局**。
 - InlineBox：`paint = Some(..)` ⇒ 引擎在 `emit_text` 里按 `ShapedInlineBox.rect` 生成 `Image` / `Quad` 图元；
   `paint = None` ⇒ 位置仍可读（`App::shaped_inline_boxes` / 节点 `text_line` 路径），但**不绘制**（保持现状语义）。
+- InlineBox 的 `Image { resource }` 在 paint 阶段经 `ResourceCache` 解析 `ResourceId → ResourceImage.tile`；资源未加载 / 解码失败时
+  **跳过该图元并写 `TextDiagnostic`**（不生成占位图、不 panic）；`Quad` 直接生成 `Quad` 图元。
 - 命中：InlineBox 命中由应用用 `ShapedInlineBox.rect` 与 `HitResult.local_point` 比对（**不新增**引擎命中 API）；文本内字符命中走 E5。
 
 **错误**：`TextShape { node, detail }`（已有）+ `TextShapeStandalone { detail }`（E1 新增）；run 区间非法 → 同上 + `TextDiagnostic`。
@@ -2547,7 +2610,7 @@ I12 ✅（装饰矩形 / run 边界 / inline box rect 都是非像素断言对�
 inline box `paint = Some(Image)` 生成的 `Image` 图元 bounds == `shaped_inline_boxes()[i].rect + 文本盒原点`。L2 ——
 `RenderedFrame.primitives` 中 `PrimitiveKind::Quad` 的装饰矩形 item 数与 line/baseline 一致。L3 —— **不新增**（文字像素不做 golden）。
 
-### 11.3 E3 · 变高虚拟列表（`v2.1 新增规格`，量级 M，M6.0）
+### 11.3 E3 · 变高虚拟列表（`v2.1 新增规格`，量级 M，P1-E3）
 
 **现状与缺口**：单一 `extent`（`VirtualListConfig { extent, overscan }`）；行位置硬编码 `index * extent`、`content = count * extent`；
 `visible_range(offset, viewport, extent, count, overscan)` 是纯数学。→ wrap 行 / 高度不一的行（news、钱包、6 张表）无法表达。
@@ -2562,7 +2625,7 @@ pub struct VirtualListConfig {
 pub enum ItemAlign { Start, Center, End, Nearest }   // v2.1 新增
 
 impl App {
-    /// 逐项高度**整体替换**（count 必须等于当前 items 数）；N=count 时引擎重算前缀和并按锚点补偿滚动偏移。
+    /// 逐项高度**整体替换**（`extents.len()` 必须等于当前 `VirtualListState.count`）；引擎重算前缀和并按锚点补偿滚动偏移。
     pub fn set_virtual_extents(&mut self, list: &VirtualList, extents: &[f32]) -> Result<(), EngineError>;
     /// 把第 index 项按 align 对齐到视口；`Nearest` = 已可见则不滚。
     pub fn scroll_to_item(&mut self, list: &VirtualList, index: usize, align: ItemAlign)
@@ -2577,13 +2640,17 @@ impl App {
   可见区间 = 「`prefix` 上对 `[offset, offset + viewport]` 做二分」+ overscan；`content.height = prefix[count]`；行 `i` 的 top =
   `prefix[i]`、height = `extents[i]`。
 - **锚点规则**（`set_virtual_extents` 时）：替换前记录「首个可见 index `f` + 该行内偏移 `d = offset - prefix[f]`」；替换后
-  `scroll_to(prefix'[f] + d)`，**同一次调用内完成**、不额外请求帧（I3）。行数变化（items 变多/变少）时锚点按 clamp 处理（越界退到末项）。
+  `scroll_to(prefix'[f] + d)`，**同一次调用内完成**、不额外请求帧（I3）。`count` 由 `App::set_virtual_items` 决定；items 数变化时
+  先 `set_virtual_items`（锚点用旧 `prefix` 的 `f` 并 clamp 到新 count）再 `set_virtual_extents`，**不在 extents 调用里改变 count**。行数变化（items 变多/变少）时锚点按 clamp 处理（越界退到末项）。
 - **明确不做：引擎自动测量**。行高必须由应用给（例如 `DequeUnsizedList` 的缓存行高、或应用在 `Node::layout()` 后自己收集再回写）。
   理由：行高来自文本换行 ⇒ 若要引擎自动测量就必须「布局 → 测量 → 回写 → 重新布局」，会在**同一棵 taffy 树**上反复 `mark_dirty`
   （I5 的树被震荡），且引入不可收敛的帧循环风险（I3）。
+- **行布局回写路径（不新增第二棵布局树）**：`extents` → prefix → 复用现有 `NodeTree::set_virtual_row(row, top, height)`
+  （`pub(crate)`：写该行节点的 `position:absolute` + `inset.top` + `size.height`，仍是同一棵 taffy 树的节点布局输入）；
+  可见区间由 `visible_range` 的 `index*extent` 换成 prefix 二分。行高只进入同一棵树的布局输入，**不引入第二份布局真相**。
 - 变更 `extents` 或 `count` ⇒ 受影响行标 `LAYOUT + PAINT`；`content` 尺寸变化走 `set_scroll_content`（引擎内部完成）。
 
-**错误**：`EngineError::NotVirtualList { window, node }`（已有）；新增 `EngineError::VirtualListExtents { expected: usize, actual: usize }`
+**错误**：`EngineError::NotVirtualList { node }`（已有，字段只有 `node`）；新增 `EngineError::VirtualListExtents { expected: usize, actual: usize }`
 （`extents.len() != items.len()`，含空 extents 但 count > 0）；`scroll_to_item` 的 index 越界 ⇒ `VirtualListExtents`（同语义：入口参数与
 当前条目数不符），不 panic。
 
@@ -2594,7 +2661,7 @@ I11 ✅（全逻辑像素）。
 `set_virtual_extents` 后 `Probe::bounds(row_i).origin.y == prefix[i]`；锚点在替换前后「同一 first index + 同一内偏移」；
 `scroll_to_item` 三种 align 的落点。L2 —— `FrameRecord.damage` 不是整帧；一次 extents 替换只产生**一帧**（`repainted` 次数与写入次数一致）。
 
-### 11.4 E4 · `GeometryDraw.range`：索引子区间绘制（`v2.1 新增规格`，量级 M，M6.0）
+### 11.4 E4 · `GeometryDraw.range`：索引子区间绘制（`v2.1 新增规格`，量级 M，P1-E4）
 
 **现状与缺口**：`GeometryDesc` 无 range；`GeometryDraw { id, transform, color }` 无 range；引擎按固定块
 （`GEOMETRY_CHUNK_INDICES = 12288` 索引 = 4096 三角形）切块并按块 `DrawIndexed`。应用要「只画几何的一段」（LOD 档 / 可见 cell 子集）
@@ -2624,7 +2691,8 @@ impl GeometryDraw {
 - 超出 `index_count` 的 `range.end` **clamp**（几何可能被 `truncate` 变短，不报错）。
 - damage = 相交块「旧 ∪ 新」AABB 经 per-draw 变换后的物理并集（与现有块 damage 同口径），并把 range 变化本身视为
   「lane 重建 + damage」。
-- **三端同步消费**：`render/{windows,macos,linux}/geometry.rs` 与 `render/compositor.rs` 的块 draw 都必须用裁剪后的
+- **三端同步消费**：Windows `render/windows/compositor.rs`（`GeometryRegistry`）、`render/macos/geometry.rs`、
+  `render/linux/geometry.rs` 与共享 `render/compositor.rs` 的块 draw 都必须用裁剪后的
   `first_index/count`；`render/shaders/contract.md` 记录「range 是 CPU 侧裁剪，不进 `GpuPrimitive`」；**参数 golden** 增加一条
   「裁剪后的 `DrawIndexed` 参数（first_index/count）三端一致」的零容差断言。
 - LOD 用法：应用注册多份几何（不同档）+ 用 range 选子区间；**不新增** LOD API。
@@ -2636,7 +2704,7 @@ range 只改 draw 参数）；I8 ⚠️（若 range 导致可见三角形集合�
 `RenderedFrame.primitives` 的 `PrimitiveKind::Geometry` bounds == 相交块 AABB 并集；几何 op 数 = 相交块数；
 空 range 时该节点无几何 op 且无 damage。L3 —— golden 增加「同几何、不同 range」对照（像素完全相同于「只注册该子区间」的等价场景）。
 
-### 11.5 E5 · `text_byte_index_at`：点 → 字节索引（`v2.1 新增规格`，量级 S，M6.0）
+### 11.5 E5 · `text_byte_index_at`：点 → 字节索引（`v2.1 新增规格`，量级 S，P1-E5）
 
 **现状与缺口**：只有 byte → rect（`NodeTree::text_caret_rect` / `text_selection_rects`），**没有**反向；点选光标 / 选区锚点只能二分
 逼近（hack）。编辑状态机本身可应用层自建（`drain_events` 已交付 `Text` / `ImeEvent`），本项只补这一个原语。
@@ -2650,19 +2718,23 @@ impl Window {
 
 **语义**：
 
-- 输入是节点 **border box 局部坐标**；引擎内部减去 `content_offset` 得到文本盒局部坐标（与 `text_caret_rect` 同域）。
+- 输入是节点 **border box 局部坐标**；引擎内部减去 `content_offset` 得到文本盒局部坐标（与 `NodeTree::text_caret_rect` 同域）。
+  注意 `Window::text_caret_rect` 返回的是**窗口绝对坐标**（已加 border box 原点、内容偏移与祖先滚动偏移），**不能**直接作为本方法入参。
 - **clamp**：点落在文本盒外时返回最近边界 —— 在盒上方取 `0`、下方取 `text.len()`；同一行内取该行首/行尾（水平越界）。
 - 返回索引**保证落在 char boundary**（parley `Cursor::from_point` → byte index，再按 char boundary 收敛）；空文本返回 `0`。
 - 只读：不登记依赖、不改任何状态（I6）。
 
-**错误**：`EngineError::StaleNode { node }`（节点不存在，或不是文本节点、尚无 `ShapedLine`）。
+**错误**：`EngineError::StaleNode { node }`（复用既有变体，语义 =「该节点不能作为文本命中目标」：节点不存在 / 不是 `NodeKind::Text` /
+尚无 `ShapedLine`）。
 
 **不变量影响**：I6 ✅（只读）；I11 ✅（逻辑像素入参）；无新状态。
 
 **测试要求**：L1 —— 行内点 → 期望字节；行间点 → 最近行；盒外四方向 → clamp（0 / len / 行首 / 行尾）；CJK（3 字节）、emoji（4 字节 +
-ZWJ 序列）、bidi 文本；空文本 → 0。**往返一致**：`text_byte_index_at(node, text_caret_rect(node, i)?.center()) ≈ i`（对若干 i 抽样）。
+ZWJ 序列）、bidi 文本；空文本 → 0。**往返一致**：`text_caret_rect` 返回窗口绝对坐标（含滚动偏移），测试必须先把它换成
+目标节点的 border box 局部坐标 —— `let p = text_caret_rect(node, i)?.center(); let local = window.tree().hit_test(p)?.local_point;`
+然后 `text_byte_index_at(node, local) ≈ i`（对若干 i 抽样；fixture 需保证该点未被其它节点遮挡）。
 
-### 11.6 E6 · Windows chrome + macOS 交通灯（`v2.1 新增规格`，量级 M，M7.1）
+### 11.6 E6 · Windows chrome + macOS 交通灯（`v2.1 新增规格`，量级 M，P1-E6）
 
 **现状与缺口**（逐项事实）：Windows 强制系统标题栏（`WS_OVERLAPPEDWINDOW`，`WM_NCCALCSIZE` 交 `DefWindowProcW`）；
 `WindowOptions` 无 `icon` / `decorations`；`hIcon: HICON::default()`；无运行时 `set_title`；`WindowControl` / `WindowState` /
@@ -2697,9 +2769,15 @@ impl App {
         -> Result<(), EngineError>;      // 去掉 cfg(linux)
     /// macOS 专用（其它端返回 UnsupportedWindowCapability，不静默）
     pub fn set_traffic_light_position(&mut self, window: WindowId, inset: Point) -> Result<(), EngineError>;
+    /// macOS 专用只读查询：交通灯占用的安全区 inset（`None` = 非 macOS / 原生全屏隐藏）。
+    pub fn traffic_light_inset(&self, window: WindowId) -> Option<Point>;
 }
 impl Window { pub fn state(&self) -> WindowState; }   // 三端都有（Linux 现已实现，Win/mac 由本条补齐）
 ```
+
+`WindowState.client_decoration` 的**三端语义（E6 统一）**：`true` = 窗口装饰由应用自绘（Linux compositor 要求 CSD；
+Windows `Decorations::None`）；`false` = 系统装饰（Linux compositor 要求 SSD；Windows `Decorations::Native`；macOS 恒 `false`
+—— 原生交通灯 + 透明标题栏由系统绘制，应用只按 `traffic_light_inset` 留白）。
 
 **Windows 实现要点（`Decorations::None`）**：
 
@@ -2719,7 +2797,8 @@ impl Window { pub fn state(&self) -> WindowState; }   // 三端都有（Linux �
 
 **macOS 实现要点**：`set_title` → `NSWindow.setTitle:`；`icon` **无任务栏等价物**（Dock 图标是 app 级）⇒ 文档化降级；
 `set_traffic_light_position` → 调整三个 `standardWindowButton` 的 `frame.origin`（保持标题栏透明+标题隐藏时仍可点）；
-`WindowState.maximized` ← `isZoomed`、`fullscreen` ← `styleMask.contains(.fullScreen)`。
+`traffic_light_inset` 返回同一几何的只读值（应用据此留白，不需要自己猜）；`WindowState.maximized` ← `isZoomed`、
+`fullscreen` ← `styleMask.contains(.fullScreen)`。
 
 **Linux 实现要点**：现有能力**对齐**即可（`WindowControl` / `WindowState` / `request_window_control` 已实现）；
 `set_title` → `xdg_toplevel.set_title`；`icon` → 无等价协议 ⇒ 文档化降级（`set_app_id` 是另一件事）。
@@ -2742,7 +2821,7 @@ impl Window { pub fn state(&self) -> WindowState; }   // 三端都有（Linux �
 
 | 候选 | 结论 |
 |---|---|
-| `on_frame` 直传 `&[(NodeId, Rect)]` / 允许多个钩子 | 不做；`on_frame` + `Node::layout()` + `set_canvas` 是官方路径（05 的 `ChartSurface` 封装可解决 1 帧滞后） |
+| `on_frame` 直传 `&[(NodeId, Rect)]` / 允许多个钩子 | 不做；`on_frame` + `Node::layout()` + `set_canvas` 是官方**自驱**路径，但必须先收敛后停止请求（I3）（05 的 `ChartSurface` 封装可解决 1 帧滞后） |
 | `ReadCtx::window_state()`（hover/pressed/focused 只读） | 不做；`on_frame` 里把 `App::hovered` 镜像进 `Signal`（等值写短路保 I3） |
 | `NodeHandle(NodeId)` 薄新类型 / `NodeTree::set_geometry` | 不做；`NodeId` 已稳定，重建 = `remove` + `build` |
 | `Signal::subscribe(Fn())` | 不做；`AppHandle::send` + `SignalScope` + 自建注销表 |
@@ -2750,7 +2829,6 @@ impl Window { pub fn state(&self) -> WindowState; }   // 三端都有（Linux �
 | `AnimationSpec { repeat, on_end }` / 补 `EaseInOut*` | 不做（只登记）；迁移期受管动画只覆盖标量/颜色插值 |
 | `open_url` | 不做；应用层 `std::process::Command` |
 | SVG 光栅化进引擎 | **不做**；应用层构建期转换（§8.5） |
-
 
 ---
 
@@ -2765,9 +2843,12 @@ pub struct Application;
 impl Application {
     pub fn run(self, app: App) -> Result<(), EngineError>;      // 不是 run(build 闭包)
 }
-pub struct App { /* 字段全私有：state / windows / handle / handlers / … */ }
+pub struct App { /* 字段全私有：store / graph / windows / runtime / handlers / … */ }
 impl App {
     pub fn new(runtime: tokio::runtime::Handle) -> Self;
+    pub fn on_frame(&mut self, hook: impl FnMut(&mut App) + 'static);
+    pub fn set_drag_regions(&mut self, window: WindowId, regions: &[Rect]);
+    pub fn request_node_repaint(&mut self, window: WindowId, node: NodeId) -> Result<bool, EngineError>;
     pub fn signal<T: Clone + 'static>(&mut self, initial: T) -> Signal<T>;
     pub fn write<T: Clone + PartialEq + 'static>(&mut self, s: &Signal<T>, v: T) -> bool;  // 等值短路
     pub fn write_with<T: Clone + PartialEq + 'static>(&mut self, s: &Signal<T>, f: impl FnOnce(&T) -> T) -> bool;
@@ -2807,6 +2888,11 @@ impl NodeBuilder {
     pub fn hit_shape(self, s: HitShape) -> Self;
     pub fn layout_override(self, rect: Rect) -> Self;
     pub fn id(self, id: impl Into<SmolStr>) -> Self;                     // Probe 的稳定 id
+    pub fn on_action(self, action: Action) -> Self;
+    pub fn on_drag(self, action: Action) -> Self;
+    pub fn inline_boxes(self, boxes: impl IntoIterator<Item = InlineBoxSpec>) -> Self;
+    pub fn focus_ring(self, ring: FocusRing) -> Self;
+    pub fn tab_stop(self, tab_stop: bool) -> Self;
     pub fn on_click(self, action: Action) -> Self;
     pub fn build(self, tree: &mut NodeTree, parent: NodeId) -> Result<NodeId, EngineError>;
 }
@@ -2814,7 +2900,7 @@ impl ReadCtx<'_> {
     pub fn read<T: 'static>(&mut self, s: &Signal<T>) -> SignalRef<T>;             // 登记依赖 + 读守卫
     pub fn read_transient<T: 'static>(&mut self, t: &Transient<T>) -> SignalRef<T>;
     pub fn read_derived<T: 'static>(&mut self, d: &Derived<T>) -> SignalRef<T>;
-    pub fn peek<T: 'static>(&self, s: &Signal<T>) -> SignalRef<T>;                 // 不登记依赖（公开可用）
+
 }
 
 // ── 颜色（D23） ─────────────────────────────────────────────────
@@ -2835,10 +2921,23 @@ impl Window { pub fn scene(&self) -> &Scene; }                       // 应用�
 pub(crate) struct GpuPrimitive { /* 128 B，见附录 B；pub(crate) 内部契约 */ }
 
 // ── 渲染层：编译期单一后端（I1；类型 pub(crate)，不导出） ──────────
-#[cfg(target_os = "windows")] mod backend;
-#[cfg(target_os = "macos")]   mod backend;
-#[cfg(target_os = "linux")]   mod backend;
-pub(crate) use backend::{Device, Swapchain, Encoder, Presenter, AtlasTexture, GpuTimerImpl};
+// render.rs 的实际形状：三端模块 + 条件编译的 `use ... as backend`（不定义类型、不导出 GPU 类型）
+pub(crate) mod atlas;
+pub(crate) mod color;
+// …共享层（compositor / damage / frame / retire / timer / uniform / …）
+#[cfg(target_os = "linux")]
+pub(crate) mod linux;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos;
+#[cfg(windows)]
+pub(crate) mod windows;
+
+#[cfg(target_os = "linux")]
+pub(crate) use linux as backend;
+#[cfg(target_os = "macos")]
+pub(crate) use macos as backend;
+#[cfg(windows)]
+pub(crate) use windows as backend;
 
 // ── 测试（feature = "test-support"） ──────────────────────────────
 pub struct TestApp { /* 默认无 renderer */ }
@@ -2855,6 +2954,8 @@ impl TestApp {
     pub fn assert_oracle(&mut self);
 }
 ```
+
+> `ReadCtx::peek` **不在本清单**：它是 `#[cfg(test)]` 的 crate 内测试专用方法（生产构建不存在；`ReadCtx` 对外可用的方法只有 `read` / `read_transient` / `read_derived`）。
 
 ## 附录 B：`GpuPrimitive` 字节布局（`render/shaders/contract.md` 镜像）
 
