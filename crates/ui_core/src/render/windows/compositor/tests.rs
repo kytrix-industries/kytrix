@@ -30,6 +30,11 @@ fn lock() -> std::sync::MutexGuard<'static, ()> {
     crate::render::windows::device::gpu_test_lock()
 }
 
+/// 图集 array 规格（测试页 + 层数）：字形恒 1 层，图片 = 本测试上传的层数。
+fn spec(page: u32, layers: u32) -> crate::render::AtlasArraySpec {
+    crate::render::AtlasArraySpec { page, layers }
+}
+
 /// WARP 设备不可用时**跳过并诊断**（设计允许；设备被移除过的进程里 WARP 创建可能失败）。
 fn warp_renderer(size: (u32, u32)) -> Option<GpuRenderer> {
     match GpuRenderer::new_warp_offscreen(size) {
@@ -57,7 +62,7 @@ fn dropping_a_renderer_releases_its_shared_device_resources() {
         renderer.queue_atlas_upload(
             AtlasKind::Glyph,
             0,
-            super::TEST_ATLAS_PAGE,
+            spec(super::TEST_ATLAS_PAGE, 1),
             vec![0u8; (super::TEST_ATLAS_PAGE * super::TEST_ATLAS_PAGE) as usize],
             rects,
         );
@@ -129,7 +134,7 @@ fn two_renderers_render_concurrently_on_one_shared_gpu() {
                 row.fill(0x40);
             }
             let rects = crate::render::DirtyRects::full();
-            renderer.queue_atlas_upload(AtlasKind::Glyph, 0, page, pixels, rects);
+            renderer.queue_atlas_upload(AtlasKind::Glyph, 0, spec(page, 1), pixels, rects);
 
             let text_free = one_lane_scene(quad(
                 Rect::new(2.0, 2.0, 2.0, 2.0),
@@ -678,7 +683,7 @@ fn a_rendered_frame_produces_no_corruption_messages() {
         }
     }
     let rects = crate::render::DirtyRects::full();
-    renderer.queue_atlas_upload(AtlasKind::Glyph, 0, page, pixels, rects);
+    renderer.queue_atlas_upload(AtlasKind::Glyph, 0, spec(page, 1), pixels, rects);
 
     let scene = one_lane_scene(quad(
         Rect::new(0.0, 0.0, 32.0, 32.0),
@@ -933,7 +938,7 @@ fn image_primitive_samples_the_image_atlas() {
         texel[3] = 0xFF;
     }
     let rects = crate::render::atlas::DirtyRects::full();
-    renderer.queue_atlas_upload(AtlasKind::Image, 0, page, pixels, rects);
+    renderer.queue_atlas_upload(AtlasKind::Image, 0, spec(page, 1), pixels, rects);
 
     let tile = AtlasTile {
         atlas: AtlasKind::Image,
@@ -991,8 +996,8 @@ fn image_primitive_samples_its_texture_array_layer() {
         *texel = [0x00, 0x00, 0xFF, 0xFF];
     }
     let rects = crate::render::atlas::DirtyRects::full();
-    renderer.queue_atlas_upload(AtlasKind::Image, 0, page, blue, rects.clone());
-    renderer.queue_atlas_upload(AtlasKind::Image, 1, page, red, rects);
+    renderer.queue_atlas_upload(AtlasKind::Image, 0, spec(page, 2), blue, rects.clone());
+    renderer.queue_atlas_upload(AtlasKind::Image, 1, spec(page, 2), red, rects);
 
     let tile = AtlasTile {
         atlas: AtlasKind::Image,
@@ -1042,7 +1047,7 @@ fn glyph_probe(page: u32) -> bool {
         }
     }
     let rects = crate::render::atlas::DirtyRects::full();
-    renderer.queue_atlas_upload(AtlasKind::Glyph, 0, page, pixels, rects);
+    renderer.queue_atlas_upload(AtlasKind::Glyph, 0, spec(page, 1), pixels, rects);
     let tile = AtlasTile {
         atlas: AtlasKind::Glyph,
         page: 0,

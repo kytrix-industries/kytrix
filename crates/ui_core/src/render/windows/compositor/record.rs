@@ -193,10 +193,11 @@ pub(super) fn submit_recorded(
         }
         // 图集读锁：持有到本帧提交完成（页重建是写锁，会等这里释放）。
         let atlas = shared.atlas();
-        // 待上传页 ≠ 共享页 ⇒ 先落地页换代：全页上传触发重建，过期增量直接丢弃。
+        // 待上传 array 规格 ≠ 共享 array 规格 ⇒ 先落地换代 / 扩层：全页上传触发重建，过期增量
+        // 直接丢弃。层数增长时 App 已对每个已打开页整页重传（见 `AtlasUploads::reconcile_pages`）。
         let rebuild = renderer
             .atlas_uploads
-            .reconcile_pages([atlas.page(AtlasKind::Glyph), atlas.page(AtlasKind::Image)]);
+            .reconcile_pages([atlas.spec(AtlasKind::Glyph), atlas.spec(AtlasKind::Image)]);
         if !rebuild.is_empty() {
             drop(atlas);
             match shared

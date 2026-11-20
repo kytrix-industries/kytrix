@@ -295,6 +295,9 @@ impl SrvHeap {
 
     /// 写**指定代**里一个图集的 SRV（另一代与另一图集的描述符保持不变）。
     ///
+    /// `layers` 是该图集 texture array 的**运行时**层数（字形 1、图片 = App 当前打开的图集页数）：
+    /// SRV 的 `ArraySize` 必须与纹理的数组长度一致，否则 D3D12 创建视图失败。
+    ///
     /// 调用方负责代际前置条件：只允许写「没有在飞命令列表引用」的那一代（C3；由
     /// `SharedGpu::rebuild_atlas_pages` 的代际水位判据保证）。
     pub(crate) fn write_atlas(
@@ -303,12 +306,13 @@ impl SrvHeap {
         generation: u8,
         kind: AtlasKind,
         texture: &ID3D12Resource,
+        layers: u32,
     ) {
         debug_assert!(
             generation < ATLAS_GENERATIONS,
             "atlas generation out of range"
         );
-        let srv = texture_srv(kind);
+        let srv = texture_srv(kind, layers);
         let index = u32::from(generation) * ATLAS_SRVS + kind.index();
         // SAFETY: 设备 / 堆句柄由调用方持有，调用期间有效；描述符索引在固定段内。
         unsafe {
@@ -387,14 +391,14 @@ fn buffer_srv(num_elements: u32, stride: u32) -> D3D12_SHADER_RESOURCE_VIEW_DESC
     }
 }
 
-fn texture_srv(kind: AtlasKind) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+fn texture_srv(kind: AtlasKind, layers: u32) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     D3D12_SHADER_RESOURCE_VIEW_DESC {
         // 字形图集是线性覆盖率，**不能**声明 sRGB（P07 §2.9）。
         Format: match kind {
             AtlasKind::Glyph => DXGI_FORMAT_R8_UNORM,
             AtlasKind::Image => DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
         },
-        // D-9-c：图集是 texture array（字形 1 层、图片 MAX_IMAGE_PAGES 层），层号是采样坐标。
+        // 图集是 texture array（字形 1 层、图片 = 当前打开的图集页数），层号是采样坐标。
         ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
         Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
         Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
@@ -402,7 +406,8 @@ fn texture_srv(kind: AtlasKind) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
                 MostDetailedMip: 0,
                 MipLevels: 1,
                 FirstArraySlice: 0,
-                ArraySize: kind.layers(),
+                // 必须等于纹理的数组长度（`AtlasArraySpec::layers`），否则视图创建失败。
+                ArraySize: layers,
                 PlaneSlice: 0,
                 ResourceMinLODClamp: 0.0,
             },

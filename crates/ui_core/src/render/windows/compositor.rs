@@ -615,16 +615,22 @@ impl GpuRenderer {
         &mut self,
         kind: AtlasKind,
         layer: u16,
-        extent: u32,
+        spec: crate::render::AtlasArraySpec,
         pixels: Vec<u8>,
         rects: crate::render::atlas::DirtyRects,
     ) {
-        upload::queue_atlas_upload(self, kind, layer, extent, pixels, rects)
+        upload::queue_atlas_upload(self, kind, layer, spec, pixels, rects)
     }
 
     /// 该图集是否有一笔上传已入队、还没被命令列表消费（离屏目标的空闲判据）。
     pub(crate) fn atlas_pending(&self, kind: AtlasKind) -> bool {
         self.atlas_uploads.pending(kind)
+    }
+
+    /// 测试：该图集已入队未录制的层号（诊断「扩层帧是否重传了每个已打开层」）。
+    #[cfg(test)]
+    pub(crate) fn atlas_pending_layers(&self, kind: AtlasKind) -> Vec<u16> {
+        self.atlas_uploads.pending_layers(kind)
     }
 
     /// 读回持久 offscreen（快照；阻塞到 GPU 完成）。
