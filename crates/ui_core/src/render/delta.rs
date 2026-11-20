@@ -1515,11 +1515,7 @@ mod tests {
         let lane = scene.new_lane();
         assert!(scene.push(
             lane,
-            Primitive::Geometry(GeometryDraw {
-                id,
-                transform: Transform::IDENTITY,
-                color: Color::WHITE,
-            })
+            Primitive::Geometry(GeometryDraw::full(id, Transform::IDENTITY, Color::WHITE))
         ));
         scene.set_order(&[lane]);
         let mut builder = DeltaBuilder::new();
@@ -1557,11 +1553,11 @@ mod tests {
         let through_geometry = register(&mut geometry);
         let through_path = register(&mut geometry);
         let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 8.0, 8.0));
-        canvas.push_geometry(GeometryDraw {
-            id: through_geometry,
-            transform: Transform::IDENTITY,
-            color: Color::WHITE,
-        });
+        canvas.push_geometry(GeometryDraw::full(
+            through_geometry,
+            Transform::IDENTITY,
+            Color::WHITE,
+        ));
         canvas.push_path(Path {
             bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
             geometry: through_path,
@@ -1638,16 +1634,12 @@ mod tests {
         let first = register(&mut geometry);
         let second = register(&mut geometry);
         let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 8.0, 8.0));
-        canvas.push_geometry(GeometryDraw {
-            id: first,
-            transform: Transform::IDENTITY,
-            color: Color::WHITE,
-        });
-        canvas.push_geometry(GeometryDraw {
-            id: second,
-            transform: Transform::IDENTITY,
-            color: Color::WHITE,
-        });
+        canvas.push_geometry(GeometryDraw::full(first, Transform::IDENTITY, Color::WHITE));
+        canvas.push_geometry(GeometryDraw::full(
+            second,
+            Transform::IDENTITY,
+            Color::WHITE,
+        ));
         let lane = scene.new_lane();
         assert!(scene.push(lane, Primitive::Canvas(Arc::new(canvas))));
         scene.set_order(&[lane]);

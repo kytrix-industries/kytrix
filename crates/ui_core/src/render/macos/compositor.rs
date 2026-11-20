@@ -1283,23 +1283,16 @@ fn draw_ops(
                             draw.id.generation()
                         ),
                     })?;
-                let chunk = draw.snapshot.chunk(draw.chunk).ok_or_else(|| {
-                    EngineError::GeometryRegister {
-                        detail: smol_str::format_smolstr!(
-                            "geometry {}:{} has no chunk {}",
-                            draw.id.index(),
-                            draw.id.generation(),
-                            draw.chunk
-                        ),
-                    }
-                })?;
+                // 三端唯一的参数入口：校验裁剪后的区间并推导 `first_index/count/base_vertex`
+                // （纯函数 `draw_indexed_params` 的返回值，三端单测钉住）。
+                let args = draw.draw_indexed(entry.index_count())?;
                 let uniform = geometry_root(root, draw, clip_index, clip_rect);
-                debug_assert!(
-                    chunk.index_first + chunk.index_count <= entry.index_count(),
-                    "geometry chunk range must stay inside the uploaded index buffer"
-                );
-                // 分块绘制：索引缓冲偏移 = 块内第一个索引 × 索引字节数；顶点缓冲是整块几何的。
-                let index_offset = chunk.index_first as usize * entry.index_type().size() as usize;
+                // Metal 没有 base vertex 参数：共享参数必须为 0，否则上游契约已被破坏。
+                debug_assert_eq!(args.base_vertex, 0, "Metal 没有 base vertex 参数");
+                // E4 / §11.4：绘制区间 = UI 线程按 `GeometryDraw.range` ∩ 块表裁剪后的索引元素
+                // 区间；索引缓冲偏移 = `first_index × 索引字节数`（不是字节区间截断）。
+                let index_offset = args.first_index as usize * entry.index_type().size() as usize;
+                let index_count = args.count as usize;
                 // SAFETY: 顶点/索引缓冲由 `GeometryRegistry` 持有到本帧结束；
                 // root uniform 由 `setVertexBytes` 在录制时复制。
                 unsafe {
@@ -1324,7 +1317,7 @@ fn draw_ops(
                     encoder
                         .drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset(
                             metal_topology(entry.topology()),
-                            chunk.index_count as usize,
+                            index_count,
                             metal_index_type(entry.index_type()),
                             entry.index(),
                             index_offset,

@@ -1179,7 +1179,7 @@ mod tests {
         let draw = |snapshot: std::sync::Arc<crate::paint::geometry::GeometrySnapshot>| {
             crate::paint::instance::GeometryDrawGpu {
                 id,
-                chunk: 0,
+                range: 0..3,
                 transform: crate::math::Transform::IDENTITY,
                 color: [1.0; 4],
                 snapshot,

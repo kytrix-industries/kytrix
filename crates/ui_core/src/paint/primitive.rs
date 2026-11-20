@@ -3,11 +3,16 @@
 //! 坐标全为**绝对窗口逻辑像素**，没有 per-primitive 变换（`GeometryDraw.transform` 是唯一例外）。
 //! 字段语义与「与附录 C 的差异」。
 
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 use crate::{
     math::{Point, Rect, Size, Transform},
-    paint::{atlas::AtlasTile, canvas::Canvas, color::Color, geometry::GeometryId},
+    paint::{
+        atlas::AtlasTile,
+        canvas::Canvas,
+        color::Color,
+        geometry::{FULL_INDEX_RANGE, GeometryId},
+    },
 };
 
 /// 一帧绘制指令的最小单位。顺序即绘制序（后画的覆盖先画的）。
@@ -148,18 +153,45 @@ pub struct ClipRect {
     pub corner_radius: [f32; 4],
 }
 
-/// 静态几何的每帧部分（变换与颜色是唯一的 per-primitive 参数）。
+/// 静态几何的每帧部分（变换、颜色与索引子区间是唯一的 per-primitive 参数）。
 ///
-/// **两个字段都必须被渲染层消费**：`transform` 进 `draw.basis`/`draw.translation`、
-/// `color` 进 `draw.color0`（`contract.md` §6）。此前 `Path.fill` 在编码期被丢弃、`transform`
-/// 被平台硬编码成单位矩阵，导致几何通道画成不透明白且无法平移 —— 这是 P0-1.2 的核心症状。
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// **字段都必须被渲染层消费**：`transform` 进 `draw.basis`/`draw.translation`、
+/// `color` 进 `draw.color0`（`contract.md` §6）、`range` 在 CPU 侧与 4096 B 页级上传的块表求交后
+/// 变成逐块的 `DrawIndexed(first_index, index_count)`（E4 / §11.4；不进 `GpuPrimitive`）。
+/// 此前 `Path.fill` 在编码期被丢弃、`transform` 被平台硬编码成单位矩阵，导致几何通道画成
+/// 不透明白且无法平移 —— 这是 P0-1.2 的核心症状。
+#[derive(Clone, Debug, PartialEq)]
 pub struct GeometryDraw {
     pub id: GeometryId,
     /// 每帧 uniform 变换（局部空间 → 内容空间，**逻辑像素**；shader 再乘 DPI）。
     pub transform: Transform,
     /// 填充色 / 调制色（`GeometryPipeline::Ui` 是实色，`Textured` 是调制色）。
     pub color: Color,
+    /// 索引**元素**区间（半开；与 `IndexType` 无关，`TriangleStrip` 同样按索引计）。
+    ///
+    /// - `0..u32::MAX` = 整份几何（[`GeometryDraw::full`]）；
+    /// - 空区间 / `start >= end` = 不绘制（无 op、无 damage）；
+    /// - 超出 `index_count` 的一端由引擎 **clamp**（几何可能被 `truncate_geometry` 变短，不报错）；
+    /// - `TriangleList` 的 range 两端由引擎**向下**对齐到 3 的倍数（起点向下取整、长度向下取整：
+    ///   起点不在三角形边界时，起点之前的至多 2 个索引一并画出，保证与整段绘制的三角形集合一致；
+    ///   不足一个三角形的尾部索引不产生 draw）；`TriangleStrip` 不截断。
+    ///
+    /// 引擎把 range 与块表求交，**逐块**产出绘制 op（块间顺序 = 索引顺序）；应用不需要知道块
+    /// 大小（§5.5 的块是引擎内部策略）。
+    pub range: Range<u32>,
+}
+
+impl GeometryDraw {
+    /// 整份几何（`range = 0..u32::MAX`；现有所有构造点的迁移目标）。空区间 = 不绘制。
+    #[must_use]
+    pub fn full(id: GeometryId, transform: Transform, color: Color) -> Self {
+        Self {
+            id,
+            transform,
+            color,
+            range: FULL_INDEX_RANGE,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -263,11 +295,11 @@ mod tests {
             ),
             (
                 "Geometry",
-                Primitive::Geometry(GeometryDraw {
-                    id: geometry_id(),
-                    transform: Transform::IDENTITY,
-                    color: Color::WHITE,
-                }),
+                Primitive::Geometry(GeometryDraw::full(
+                    geometry_id(),
+                    Transform::IDENTITY,
+                    Color::WHITE,
+                )),
             ),
             ("Canvas", Primitive::Canvas(Arc::new(Canvas::new(rect())))),
         ]
@@ -301,6 +333,23 @@ mod tests {
         // 实测 80 B（= Quad 变体）；软上限 128 B，超出需评审。
         assert_eq!(size_of::<Primitive>(), 80);
         assert!(size_of::<Primitive>() <= 128);
+    }
+
+    /// E4：`range` 是**索引元素**区间，`full` 是 `0..u32::MAX` 哨兵；子区间不同 ⇒ 绘制不同。
+    #[test]
+    fn geometry_draw_range_is_part_of_the_value() {
+        let full = GeometryDraw::full(geometry_id(), Transform::IDENTITY, Color::WHITE);
+        assert_eq!(
+            full.range,
+            0..u32::MAX,
+            "`full` 必须用整份哨兵（几何可增长）"
+        );
+        let mut subset = full.clone();
+        subset.range = 3..9;
+        assert_ne!(subset, full, "不同子区间是不同的绘制（参与相等性）");
+        let mut empty = subset.clone();
+        empty.range = 6..6;
+        assert_ne!(empty, subset, "空区间与子区间不同");
     }
 
     #[test]
