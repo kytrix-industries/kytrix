@@ -661,6 +661,78 @@ fn remove_reports_every_lane_of_a_multi_lane_node() {
     assert_eq!(tree.drain_removed_lanes().count(), 0, "取走即清空");
 }
 
+/// Canvas 内容里引用的几何必须登记在反向绑定表：数据更新能自动标脏 Canvas 节点，
+/// 内容替换与卸载会解绑（绑定表是树内私有旁表，只有树单测能直接观察）。
+///
+/// 探针：删掉 `arena::insert_child` 的 Canvas 分支 ⇒ 首段断言红；删掉 `set_canvas` 的
+/// 解绑/重建 ⇒ 第二段红；删掉 `arena::remove` 的 Canvas 解绑 ⇒ 末段红。
+#[test]
+fn canvas_referenced_geometries_are_bound_and_unbound() {
+    use crate::paint::{
+        canvas::Canvas, color::Color, geometry::GeometryId, primitive::GeometryDraw,
+    };
+
+    let first = GeometryId::for_test(1, 1);
+    let second = GeometryId::for_test(2, 1);
+    let draw = |id| GeometryDraw {
+        id,
+        transform: crate::math::Transform::IDENTITY,
+        color: Color::WHITE,
+    };
+    let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+    canvas.push_geometry(draw(first));
+    canvas.push_geometry(draw(first));
+    let mut tree = NodeTree::new();
+    let root = tree.root();
+    let node = NodeBuilder::canvas(canvas)
+        .build(&mut tree, root)
+        .expect("挂载 Canvas");
+    assert_eq!(
+        tree.geometry_bindings
+            .get(&first)
+            .map_or(0, smallvec::SmallVec::len),
+        1,
+        "同一个几何在一个 Canvas 里重复引用只登记一次"
+    );
+    assert!(!tree.geometry_bindings.contains_key(&second));
+
+    // 内容替换：旧引用解绑、新引用登记。
+    let mut fresh = Canvas::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+    fresh.push_geometry(draw(second));
+    assert!(tree.set_canvas(node, fresh), "替换 Canvas 内容");
+    assert!(
+        !tree.geometry_bindings.contains_key(&first),
+        "旧内容引用的几何必须解绑"
+    );
+    assert!(
+        tree.geometry_bindings
+            .get(&second)
+            .is_some_and(|nodes| nodes.contains(&node)),
+        "新内容引用的几何必须登记"
+    );
+
+    // 标脏路径：Canvas 节点必须被标 PAINT（整条 lane 重建）并清 REUSABLE。
+    tree.clear_all_dirty_for_test();
+    assert_eq!(tree.mark_geometry_updated(second), 1);
+    let state = tree.get(node).expect("节点存在");
+    assert!(
+        state.dirty().contains(DirtyFlags::PAINT),
+        "Canvas 节点必须被标 PAINT：{:?}",
+        state.dirty()
+    );
+    assert!(
+        !state.dirty().contains(DirtyFlags::REUSABLE),
+        "Canvas 没有块级 revision 判据 ⇒ 必须清 REUSABLE 让 lane 重建"
+    );
+
+    // 卸载：反向绑定清空。
+    tree.remove(node).expect("卸载 Canvas");
+    assert!(
+        !tree.geometry_bindings.contains_key(&second),
+        "卸载后必须解绑"
+    );
+}
+
 #[test]
 fn debug_id_roundtrip_and_slot_reuse() {
     let mut tree = NodeTree::new();

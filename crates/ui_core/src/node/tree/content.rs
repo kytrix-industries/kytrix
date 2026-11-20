@@ -32,6 +32,13 @@ pub(crate) fn text_content(tree: &NodeTree, node: NodeId) -> Option<&TextContent
 /// 重建后的图元，不会退化成整窗重绘）。不改变布局：Canvas 节点尺寸仍由布局决定。
 /// `AtlasTile` 的生命周期由调用方持有的 `ResourceImage` 决定 —— 引擎不会在替换时保留/延长
 /// 旧 tile，也不会自动 `unload` 旧资源。
+///
+/// **几何绑定表同步重建**：Canvas 里可以引用任意多个 `GeometryId`（`push_geometry` /
+/// `push_path`），这些引用登记在 `geometry_bindings` 反向索引里，几何数据 range 更新时
+/// Canvas 节点因此和数据更新后的自动标脏共用同一条路径。旧内容的引用在这里解绑、新内容的
+/// 引用重新登记（同一个 id 同时在旧新内容里时先解后绑，语义不变）。扫描只在**替换**时发生
+/// （异步图片交付，不是热路径）。
+///
 /// 返回 `false` = 节点不存在 / 不是 Canvas（**不**改动任何状态）。
 pub(crate) fn set_canvas(
     tree: &mut NodeTree,
@@ -44,9 +51,38 @@ pub(crate) fn set_canvas(
     let NodeKind::Canvas(existing) = &mut target.kind else {
         return false;
     };
-    *existing = Arc::new(canvas);
+    let fresh = Arc::new(canvas);
+    let previous = std::mem::replace(existing, Arc::clone(&fresh));
+    for geometry in canvas_geometry_ids(&previous) {
+        unbind_geometry_node(tree, geometry, node);
+    }
+    for geometry in canvas_geometry_ids(&fresh) {
+        bind_geometry_node(tree, geometry, node);
+    }
     tree.mark_subtree_paint(node);
     true
+}
+
+/// `Canvas` 内容里引用的几何 id（`Primitive::Geometry` / `Primitive::Path`，去重保序）。
+///
+/// 消费者：`arena::insert_child` / [`set_canvas`] / `arena::remove` 维护反向绑定表
+/// `geometry_bindings`，让「Canvas 里画的几何」和几何节点走同一条自动标脏路径。
+/// **不在 paint 热路径调用**：Canvas 引用集合只在挂载 / 内容替换 / 卸载时扫描。
+pub(crate) fn canvas_geometry_ids(
+    canvas: &crate::paint::canvas::Canvas,
+) -> SmallVec<[GeometryId; 2]> {
+    let mut ids: SmallVec<[GeometryId; 2]> = SmallVec::new();
+    for primitive in canvas.primitives() {
+        let id = match primitive {
+            crate::paint::primitive::Primitive::Geometry(draw) => draw.id,
+            crate::paint::primitive::Primitive::Path(path) => path.geometry,
+            _ => continue,
+        };
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
 }
 
 // 消费者：`impl NodeTree::set_text_content` 的薄委托（外部调用点见该方法文档）。
@@ -615,7 +651,15 @@ pub(crate) fn set_baked_geometry_chunk(
 }
 
 // 消费者：`impl NodeTree::mark_geometry_updated` 的薄委托（外部调用点见该方法文档）。
-/// 把绑定到 `geometry` 的几何节点标 `PAINT`（**不清 `REUSABLE`、不并节点盒 damage**）。
+/// 把绑定到 `geometry` 的节点标 `PAINT`，返回标脏的节点数。
+///
+/// 两类绑定节点的语义不同：
+/// - **几何节点**（`NodeKind::Geometry`）：只登记脏集合，**不清 `REUSABLE`、不并节点盒
+///   damage**。块 lane 的复用判据是「快照块 revision 是否变化」，paint 会对每个块按旧∪新
+///   AABB 记 damage；清 `REUSABLE` 会把全部块 lane 拖去重建（K 线追加只该重建尾块）。
+/// - **Canvas 节点**（`NodeKind::Canvas`）：Canvas 内容按引用重新编码（图元里是
+///   `Primitive::Geometry`，没有块级 revision 判据），因此必须清 `REUSABLE` 并让 lane
+///   重建；damage 由 `emit_content` 按 Canvas 内容范围记（整块 Canvas 重画，不按几何块切分）。
 pub(crate) fn mark_geometry_updated(tree: &mut NodeTree, geometry: GeometryId) -> usize {
     let Some(nodes) = tree.geometry_bindings.get(&geometry) else {
         return 0;
@@ -626,17 +670,23 @@ pub(crate) fn mark_geometry_updated(tree: &mut NodeTree, geometry: GeometryId) -
     let nodes: SmallVec<[NodeId; 2]> = nodes.iter().copied().collect();
     let mut touched = 0;
     for node in nodes {
-        if tree.arena.get(node).is_none() {
+        let Some(target) = tree.arena.get(node) else {
             continue;
+        };
+        let is_canvas = matches!(target.kind(), NodeKind::Canvas(_));
+        if is_canvas {
+            // Canvas 的图元没有块级 revision（引用的是整条几何），只能整节点重建。
+            tree.mark_paint(node);
+        } else {
+            tree.dirty_paint.insert(node);
+            tree.dirty_settle.insert(node);
         }
-        tree.dirty_paint.insert(node);
-        tree.dirty_settle.insert(node);
         touched += 1;
     }
     touched
 }
 
-/// 注册「几何 id → 几何节点」绑定（消费者：`arena::insert_child`）。
+/// 注册「几何 id → 引用它的节点」绑定（消费者：`arena::insert_child` 的几何 / Canvas 分支）。
 pub(crate) fn bind_geometry_node(tree: &mut NodeTree, geometry: GeometryId, node: NodeId) {
     let entry = tree.geometry_bindings.entry(geometry).or_default();
     if !entry.contains(&node) {
@@ -644,7 +694,7 @@ pub(crate) fn bind_geometry_node(tree: &mut NodeTree, geometry: GeometryId, node
     }
 }
 
-/// 移除一个节点的全部反向绑定（消费者：`arena::remove`）。
+/// 移除一个节点的全部反向绑定（消费者：`arena::remove` / Canvas 内容替换）。
 pub(crate) fn unbind_geometry_node(tree: &mut NodeTree, geometry: GeometryId, node: NodeId) {
     if let Some(nodes) = tree.geometry_bindings.get_mut(&geometry) {
         nodes.retain(|existing| *existing != node);

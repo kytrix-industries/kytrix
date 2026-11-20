@@ -316,13 +316,16 @@ pub(crate) fn insert_child(
     if let Some(node) = tree.arena.get_mut(parent) {
         node.children.push(id);
     }
-    // 几何节点登记反向绑定：几何数据 range 更新后 O(绑定数) 标脏（X5）。
-    let geometry = match tree.arena.get(id).map(Node::kind) {
-        Some(NodeKind::Geometry(geometry)) => Some(*geometry),
-        _ => None,
-    };
-    if let Some(geometry) = geometry {
-        tree.bind_geometry_node(geometry, id);
+    // 几何数据 range 更新后 O(绑定数) 标脏（X5）：几何节点绑定自身句柄，Canvas 节点绑定它
+    // 内容里引用到的每个 `GeometryId`（`push_geometry` / `push_path`）。
+    match tree.arena.get(id).map(Node::kind) {
+        Some(NodeKind::Geometry(geometry)) => tree.bind_geometry_node(*geometry, id),
+        Some(NodeKind::Canvas(canvas)) => {
+            for geometry in super::content::canvas_geometry_ids(canvas) {
+                tree.bind_geometry_node(geometry, id);
+            }
+        }
+        _ => {}
     }
     tree.mark_structure(parent);
     Ok(id)
@@ -464,9 +467,14 @@ pub(crate) fn remove(
         tree.hoisted.remove(id);
         tree.geometry_transforms.remove(id);
         tree.geometry_chunks.remove(id);
-        if let Some(target) = tree.arena.get(*id)
-            && let NodeKind::Geometry(geometry) = *target.kind()
-        {
+        // 反向绑定：几何节点解绑自身句柄；Canvas 节点解绑它引用到的每个几何。
+        let geometry_ids: SmallVec<[crate::paint::geometry::GeometryId; 2]> =
+            match tree.arena.get(*id).map(Node::kind) {
+                Some(NodeKind::Geometry(geometry)) => SmallVec::from_slice(&[*geometry]),
+                Some(NodeKind::Canvas(canvas)) => super::content::canvas_geometry_ids(canvas),
+                _ => SmallVec::new(),
+            };
+        for geometry in geometry_ids {
             super::content::unbind_geometry_node(tree, geometry, *id);
         }
         let had_bind = tree
