@@ -29,6 +29,15 @@
 //!   表达「随 owner 最小化 / 销毁」⇒ z 序与生命周期都不保证）。解析在
 //!   [`crate::platform::linux::surface::WaylandState::add_window`] 里、新窗口进入窗口表之前完成：
 //!   owner 尚未创建 / 已关闭 ⇒ 降级不设并写诊断（见 [`crate::platform::wayland::owner`]）。
+//!
+//!   **发送时机**（RB-11）：协议规定 *"Only mapped surfaces can have child surfaces. Setting a
+//!   parent which is not mapped is equivalent to setting a null parent."* ⇒ owner 尚未映射时
+//!   当场发等于把 parent 设成 null，提示会丢。实现因此分两条路：owner 已映射 ⇒ 立刻发；owner
+//!   已存在但尚未映射（启动批 / 同轮建 owner + owned 的典型情形）⇒ 登记 pending，等 owner
+//!   收到**首帧 `wl_callback.done`**（协议可观测的映射证据：initial configure 已 ack 且
+//!   attach buffer 的 commit 已被 compositor 处理）后补发一次，见
+//!   [`crate::platform::wayland::parent`] 与 `WaylandState::flush_pending_parent_hints`。
+//!   owner 在补发前关闭 ⇒ pending 丢弃（不 panic、不泄漏）。
 //! - `modal` ⇒ 协议没有模态（`xdg_toplevel` **没有** `set_modal` 请求），语义完全由 `App` 层
 //!   输入拦截承担（与 macOS 同一套）；本端只有 owner 的 parent 提示。
 //! - `always_on_top` ⇒ xdg-shell 没有置顶请求，wlr-layer-shell / plasma-shell 都不是 xdg-shell

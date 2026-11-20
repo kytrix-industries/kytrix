@@ -114,6 +114,7 @@ use crate::{
             frame_gate::{CallbackToken, FrameGate},
             ime::ImeState,
             input, owner,
+            parent::{ParentAction, ParentHints},
             presentation::PresentedOrder,
             scroll::{ScrollAccum, ScrollAxis, ScrollSource},
             text_input::{self, ImeStateSnapshot, TextInputRoute},
@@ -292,6 +293,15 @@ struct WindowSurface {
     entered_once: bool,
     focused: bool,
     configured: bool,
+    /// 本窗口的 surface 是否**已映射**（RB-11 的 owner 判据）。
+    ///
+    /// 只在**首帧 `wl_callback.done`** 到达时置 `true`：该回调是客户端能拿到的、证明
+    /// 「首个 `xdg_surface.configure` 已 ack 且 attach buffer 的 `wl_surface.commit` 已被
+    /// compositor 处理」的协议证据（`wl_surface.frame` 的回调由 compositor 在处理完已提交
+    /// 内容之后发送）。只看「configure 已到」不够 —— ack 之后 buffer 还没 commit，surface
+    /// 仍未 mapped，此时 `xdg_toplevel.set_parent` 等价 null parent（见
+    /// [`crate::platform::wayland::parent`] 模块文档）。
+    mapped: bool,
     /// 最近一次 configure 的状态位（`Maximized` / `Fullscreen` / `Suspended` / `Tiled*`）。
     states: ToplevelStates,
     /// compositor 声明的窗口管理能力（xdg-shell v5；未收到 ⇒ 假定全部支持，R10-15）。
@@ -444,6 +454,11 @@ pub(crate) struct WaylandState {
     scroll: ScrollAccum,
     /// 连续滚动手势是否进行中（`axis_source` 之后、`axis_stop` 之前）。
     scroll_active: bool,
+    /// RB-11：owner 尚未映射时等待补发的 `xdg_toplevel.set_parent` 表。
+    ///
+    /// 判定与补发时机在 [`crate::platform::wayland::parent`]；真实协议调用在
+    /// [`Self::flush_pending_parent_hints`]。
+    parent_hints: ParentHints,
     pointer_pos: Point,
     /// 「需要下一次循环补一帧」的请求（可见性恢复 / 装饰模式变化 / 尺寸变化等）。
     ///
@@ -553,6 +568,7 @@ impl WaylandState {
             held_keys: Vec::new(),
             scroll: ScrollAccum::default(),
             scroll_active: false,
+            parent_hints: ParentHints::default(),
             pointer_pos: Point::new(0.0, 0.0),
             redraw: false,
         };
@@ -590,8 +606,10 @@ impl WaylandState {
     /// - `min_size` / `max_size`：收敛进 [`SizeConstraintState`]，在首个 commit 之前下发
     ///   `set_min_size/set_max_size`（`None` 的 min 用平台默认 [`window::MIN_SIZE_LOGICAL`]）；
     /// - `owner`：解析到已存在的窗口 ⇒ `xdg_toplevel.set_parent` 的 *transient for* **提示**
-    ///   （[`owner`] 模块；compositor 可忽略，不保证 z 序 / 生命周期联动）；owner 尚未创建 /
-    ///   已关闭 ⇒ 降级不设并 `eprintln!` 诊断；
+    ///   （[`owner`] 模块；compositor 可忽略，不保证 z 序 / 生命周期联动）。owner 已映射就
+    ///   当场发；尚未映射（启动批）则登记 pending，等 owner 首帧回调后补发（RB-11，见
+    ///   [`crate::platform::wayland::parent`]）；owner 尚未创建 / 已关闭 ⇒ 降级不设并
+    ///   `eprintln!` 诊断；
     /// - `modal` / `always_on_top`：Wayland **没有**对应原生协议 —— 模态由 `App` 层输入拦截
     ///   承担（本端只有上面的 parent 提示），置顶明确降级为无操作；见下方调用点的注释。
     /// - `position`：**有意忽略** —— 这是 Wayland 的协议事实而不是遗漏：`xdg_toplevel` 没有
@@ -625,21 +643,30 @@ impl WaylandState {
         // `event_loop::sync_windows` 按 `WindowId` 升序（= App 的创建顺序）建原生窗口，保证
         // owner 先于 owned 窗口落地（`run()` 的首个窗口同样取最小 id）。
         //
-        // 生命周期：引擎层 owner 关闭时会先**级联关闭** owned 窗口（App 层职责），因此本端
-        // 不需要在 owner 销毁时对 child 清 parent；若该前提失效（child 未关），协议也没有
-        // 「父销毁」错误 —— 按协议只有 mapped 的父 surface 才能有 child，父 unmapped / 销毁后
-        // 这段 transient 关系随父对象消失，不会把子窗口一起销毁。
+        // **时机**（RB-11）：协议原文 *"Only mapped surfaces can have child surfaces. Setting a
+        // parent which is not mapped is equivalent to setting a null parent."* —— 启动批里
+        // owner 与 owned 同轮建窗，此时 owner 的 `wl_surface.commit()` 刚发出、首个 configure
+        // 还没回来，当场发 `set_parent` 会被当成 null parent，提示永久丢失。所以：
+        // - owner 已映射 ⇒ 立刻发；
+        // - owner 已存在但**尚未映射** ⇒ 登记进 [`parent`]，等 owner 首帧 `wl_callback.done`
+        //   （协议可观测的映射证据，见 [`crate::platform::wayland::parent`] 模块文档）后由
+        //   [`Self::flush_pending_parent_hints`] 补发；
+        // - owner 不存在 ⇒ `Missing` ⇒ 现有的降级路径（诊断 + 不设）不变。
         //
-        // 残余风险（协议原文）："Only mapped surfaces can have child surfaces. Setting a parent
-        // which is not mapped is equivalent to setting a null parent." 运行期对话框的 owner 通常
-        // 已映射（前提成立）；启动时同一批创建的 owner 在本请求时可能尚未映射，严格按字面执行
-        // 的 compositor 可以把提示当作 null parent（多数实现不强制，真机验收记录）。本仓不为
-        // 这条提示加延迟重发机制：owner 在 Wayland 上本来就只有降级提示（公共文档），额外状态
-        // 换不来契约级保证。
+        // 生命周期：引擎层 owner 关闭时会先**级联关闭** owned 窗口（App 层职责）；若该前提
+        // 失效（owner 先关），[`Self::remove_window`] 丢弃它的 pending —— 不会留悬空对象、
+        // 也不会 panic。
         match owner::resolve_owner(options.owner, |owner| self.window_index(owner)) {
             owner::OwnerResolution::Unparented => {}
             owner::OwnerResolution::Existing(index) => {
-                toplevel.set_parent(Some(&self.windows[index].toplevel));
+                let owner = self.windows[index].id;
+                let owner_mapped = self.windows[index].mapped;
+                match self.parent_hints.note(id, owner, owner_mapped) {
+                    ParentAction::SendNow => {
+                        toplevel.set_parent(Some(&self.windows[index].toplevel));
+                    }
+                    ParentAction::Deferred => {}
+                }
             }
             owner::OwnerResolution::Missing(owner) => eprintln!(
                 "kytrix: window owner {owner:?} does not exist yet or is already closed; \
@@ -726,6 +753,7 @@ impl WaylandState {
             entered_once: false,
             focused: false,
             configured: false,
+            mapped: false,
             states: ToplevelStates::default(),
             wm_caps: WmCapabilities::ASSUMED,
             size_constraints: SizeConstraintState::new(minimum, options.max_size),
@@ -747,6 +775,29 @@ impl WaylandState {
         // **唯一**触发初始 configure 的 commit：必须排在所有协议对象创建之后（R10-4）。
         self.windows[self.windows.len() - 1].surface.commit();
         Ok(())
+    }
+
+    /// owner 首次映射 ⇒ 给它等待中的 owned 窗口补发 `xdg_toplevel.set_parent`（RB-11）。
+    ///
+    /// 调用点只有一个：`wl_callback` 的 `Done` 分支里 `mapped` 从 `false` 变 `true` 的那一次
+    /// （首帧回调 = owner 已完成 ack + buffer commit，判据见
+    /// [`crate::platform::wayland::parent`] 模块文档）。
+    ///
+    /// **幂等**：pending 项取走即删（[`ParentHints::take_children_of`]），已经发过的不再发。
+    /// 补发时按 id 重新查表：等待期间窗口可能已经关闭（[`Self::remove_window`] 会清掉相关
+    /// pending，这里查不到就丢弃，不对已销毁的 toplevel 发请求）。
+    fn flush_pending_parent_hints(&mut self, owner: crate::window::WindowId) {
+        for child in self.parent_hints.take_children_of(owner) {
+            let (Some(child_index), Some(owner_index)) =
+                (self.window_index(child), self.window_index(owner))
+            else {
+                continue;
+            };
+            // 先取父 toplevel 的代理副本，再对子 toplevel 发请求（同一 `self.windows` 的
+            // 两个下标不能同时可变借用）。
+            let parent = self.windows[owner_index].toplevel.clone();
+            self.windows[child_index].toplevel.set_parent(Some(&parent));
+        }
     }
 
     /// 移除一个窗口（从 [`Self::windows`] 摘除；`WindowSurface` 的 `Drop` 按角色逆序销毁协议
@@ -774,6 +825,9 @@ impl WaylandState {
         // B10：configure 锁存随 `WindowSurface` 一起 drop —— 未 ack 的 serial 不再补发：
         // surface 对象已经销毁，ack 一个不存在的对象是 `invalid_serial` 协议错误（关闭窗口
         // 是唯一允许「丢弃 pending configure」的路径）。
+        // RB-11：以本窗口为 owner 或 child 的 pending `set_parent` 一并丢弃 —— 对象即将销毁，
+        // 之后既不能补发（没有 toplevel 可引用）也不该补发。
+        self.parent_hints.forget(id);
         self.windows.remove(index);
         // text-input 路由存的是下标：移除之后整体前移，按位置修正（与 active 同一套规则）。
         self.text_input_route.reindex_removed(index as u32);
@@ -2179,6 +2233,15 @@ impl Dispatch<wl_callback::WlCallback, ()> for WaylandState {
             let token = *token;
             state.windows[index].frame_callback = None;
             state.windows[index].frame_gate.on_callback(token);
+            // RB-11：首帧回调是「surface 已映射」的**协议证据**（首个 configure 已 ack 且
+            // attach buffer 的 commit 已被 compositor 处理 —— 回调由 compositor 在处理完已提交
+            // 内容之后发送）。owner 到这一刻才能接受 child：现在给等待中的 owned 窗口补发
+            // `xdg_toplevel.set_parent`（协议：parent 未映射时 set_parent 等价 null parent）。
+            if !state.windows[index].mapped {
+                state.windows[index].mapped = true;
+                let window = state.windows[index].id;
+                state.flush_pending_parent_hints(window);
+            }
         }
     }
 }
