@@ -53,6 +53,7 @@ use crate::{
     error::EngineError,
     paint::atlas::AtlasKind,
     render::{
+        AtlasArraySpec, AtlasPageRequest,
         atlas::AtlasRebuilt,
         frame::{FrameSlot, InFlightRing, MAX_FRAMES_IN_FLIGHT},
         retire::{GpuResourceHandle, RetireQueue},
@@ -927,36 +928,50 @@ impl SharedGpu {
         self.atlas_pages[kind.index() as usize].load(Ordering::Acquire)
     }
 
-    /// 把一个或多个图集页重建到指定页尺寸。
+    /// 把一个或多个图集 array 重建到指定规格（页边长 + 层数）。
     ///
-    /// 写锁内重新检查（排队期间别的窗口可能已经建好同一页），然后等共享队列 idle：此后没有
+    /// 写锁内重新检查（排队期间别的窗口可能已经建好同一 array），然后等共享队列 idle：此后没有
     /// 任何窗口的 GPU 工作引用旧纹理 / 旧描述符。新纹理先转到 `SHADER_READ_ONLY_OPTIMAL`
     /// （之后所有窗口的增量上传都从该布局出发），最后重写全部窗口描述符段里的图集绑定。
+    ///
+    /// **层数增长**：新数组的旧层内容由 App 在扩层帧的整层重传补齐（每个已打开的页都整页上传，
+    /// 见 `AtlasUploads::reconcile_pages` 的层数分支）—— 增长不会丢已上传的图。层数只增不减：
+    /// 请求里的层数与当前层数取最大（缩容会让所有窗口的 `AtlasTile.page` 失效）。
     pub(crate) fn rebuild_atlas_pages(
         &self,
-        requests: &[(AtlasKind, u32)],
+        requests: &[AtlasPageRequest],
     ) -> Result<AtlasRebuilt, EngineError> {
         let mut atlas = self.atlas.write().unwrap_or_else(PoisonError::into_inner);
-        let pending: Vec<(AtlasKind, u32)> = requests
+        let pending: Vec<AtlasPageRequest> = requests
             .iter()
-            .copied()
-            .filter(|(kind, page)| atlas.page(*kind) != *page)
+            .filter(|request| atlas.spec(request.kind) != request.spec)
+            .map(|request| {
+                let current = atlas.spec(request.kind);
+                AtlasPageRequest {
+                    kind: request.kind,
+                    spec: AtlasArraySpec {
+                        page: request.spec.page,
+                        layers: request.spec.layers.max(current.layers),
+                    },
+                }
+            })
             .collect();
         let mut rebuilt = AtlasRebuilt::default();
         if pending.is_empty() {
             return Ok(rebuilt);
         }
         self.wait_queue_idle()?;
-        for (kind, page) in &pending {
-            atlas.recreate(&self.device, *kind, *page)?;
-            self.atlas_pages[kind.index() as usize].store(*page, Ordering::Release);
-            rebuilt.mark(*kind);
+        for request in &pending {
+            atlas.recreate(&self.device, request.kind, request.spec)?;
+            self.atlas_pages[request.kind.index() as usize]
+                .store(request.spec.page, Ordering::Release);
+            rebuilt.mark(request.kind);
         }
         debug_assert!(
             rebuilt.glyph || rebuilt.image,
             "a non-empty rebuild must recreate at least one atlas page"
         );
-        let kinds: Vec<AtlasKind> = pending.iter().map(|(kind, _)| *kind).collect();
+        let kinds: Vec<AtlasKind> = pending.iter().map(|request| request.kind).collect();
         self.transition_atlas_layout(&atlas, &kinds)?;
         {
             let descriptors = self
@@ -1631,7 +1646,18 @@ mod tests {
     use ash::vk;
 
     use super::{GpuObject, ResourceTable, SharedGpu, gpu_test_lock};
-    use crate::paint::atlas::AtlasKind;
+    use crate::{
+        paint::atlas::AtlasKind,
+        render::{AtlasArraySpec, AtlasPageRequest},
+    };
+
+    /// 字形 array 的重建请求（1 层）。
+    fn glyph_request(page: u32) -> AtlasPageRequest {
+        AtlasPageRequest {
+            kind: AtlasKind::Glyph,
+            spec: AtlasArraySpec { page, layers: 1 },
+        }
+    }
 
     /// 引用计数单例：两次取到的是同一个 `SharedGpu`（实例 / 设备 / queue / PSO / 图集只建一次）。
     #[test]
@@ -1653,7 +1679,7 @@ mod tests {
         let shared = SharedGpu::new_headless_isolated().expect("headless shared gpu");
         assert_eq!(shared.atlas().page(AtlasKind::Glyph), 1, "占位页是 1×1");
         shared
-            .rebuild_atlas_pages(&[(AtlasKind::Glyph, 64)])
+            .rebuild_atlas_pages(&[glyph_request(64)])
             .expect("rebuild");
         assert_eq!(shared.atlas().page(AtlasKind::Glyph), 64);
         assert_eq!(
@@ -1663,7 +1689,7 @@ mod tests {
         );
         // 同一页重复请求是 no-op（其余窗口在写锁释放后不必再重建）。
         shared
-            .rebuild_atlas_pages(&[(AtlasKind::Glyph, 64)])
+            .rebuild_atlas_pages(&[glyph_request(64)])
             .expect("no-op rebuild");
         assert_eq!(shared.atlas().page(AtlasKind::Glyph), 64);
     }
