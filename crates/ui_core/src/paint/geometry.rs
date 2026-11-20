@@ -7,7 +7,8 @@
 //! 并维护**页级**的快照（[`GEOMETRY_PAGE_BYTES`] / 页）：
 //!
 //! - **块**（`GeometryChunk`）是绘制/失效单位：paint 的一条块 lane、编码器的一条几何 op、
-//!   damage 的一个矩形都对应一个块；块之间在索引缓冲里连续，因此绘制序与单块完全一致。
+//!   damage 的一个矩形都对应一个块；块之间在索引缓冲里连续，且 `TriangleList` 的 range 两端
+//!   都向下对齐到 3 的倍数（块边界也是 3 的倍数），因此逐块绘制与整段绘制等价。
 //! - **页**（[`GeometrySnapshot::vertex_pages`] / [`GeometrySnapshot::index_pages`]）是 GPU
 //!   增量上传单位：一次 [`GeometryStore::update_vertices`] / `update_indices` 只重建被触碰的
 //!   4 KiB 页，三端后端按页比较（`ptr_eq`）后只上传变化的页。
@@ -426,8 +427,11 @@ pub(crate) const FULL_INDEX_RANGE: Range<u32> = Range {
 /// - `requested` 单位是**索引元素**，与 [`IndexType`] 无关；`TriangleStrip` 同样按索引计；
 /// - 超出 `index_count` 的一端 **clamp**（几何可能被 `truncate_geometry` 变短，不报错）；
 /// - `start >= end` / `start >= index_count` / 与块不相交 ⇒ `None`（空绘制：无 op、无 damage）；
-/// - `TriangleList` 的绘制长度截到 3 的倍数：GPU 的三角形列表只消费整三角形，不足一个三角形的
-///   尾部索引本来就画不出像素。`TriangleStrip` 不截。
+/// - `TriangleList` 的两端都**向下**对齐到 3 的倍数（E4b 裁决）：三角形网格锚定在索引缓冲的
+///   0 上，块边界（`GEOMETRY_CHUNK_INDICES = 4096 × 3`）也落在同一张网格上，因此对齐后每一块
+///   画出的都是「整段 `DrawIndexed` 会画出的同一批三角形」；起点不在三角形边界时最多多画
+///   `requested.start` 之前的 2 个索引（不会漏画，也不会画错位置的三角形）。`TriangleStrip`
+///   是**单块**拓扑，不截断、按索引原样保留。
 ///
 /// 返回值是**索引缓冲里的绝对区间**（不是块内相对偏移）：
 /// `DrawIndexed(first_index = range.start, index_count = range.end - range.start)`。
@@ -442,16 +446,30 @@ pub(crate) fn chunk_draw_range(
     if start >= end {
         return None;
     }
+    // 三角形对齐：两端向下取整到 3 的倍数。clamp 之后仍可能 `start == end`（例如
+    // `requested` 落在同一个未对齐的 3 索引窗口内）⇒ 空绘制，而不是一个非法 draw。
+    let (start, end) = if topology == Topology::TriangleList {
+        (start - start % 3, end - end % 3)
+    } else {
+        (start, end)
+    };
+    if start >= end {
+        return None;
+    }
     let first = start.max(chunk.index_first);
     let last = end.min(chunk.index_first.saturating_add(chunk.index_count));
     if first >= last {
         return None;
     }
-    let mut count = last - first;
     if topology == Topology::TriangleList {
-        count -= count % 3;
+        // 生产块表由 `chunk_index_range` 构造（块首 = 4096 的倍数 = 3 的倍数），因此两端
+        // 对齐后求交仍是对齐的。真出现未对齐的块元数据说明块表被破坏（debug 构建立即暴露）。
+        debug_assert!(
+            first % 3 == 0 && last % 3 == 0,
+            "TriangleList 的块边界必须是 3 的倍数：first={first} last={last}"
+        );
     }
-    (count > 0).then_some(first..first + count)
+    Some(first..last)
 }
 
 #[cfg(test)]
@@ -703,7 +721,7 @@ mod tests {
         );
     }
 
-    /// `TriangleList` 的非对齐长度截到整三角形；`TriangleStrip` 保持索引语义、不截。
+    /// `TriangleList` 的 range 两端向下对齐到 3 的倍数；`TriangleStrip` 保持索引语义、不截断。
     #[test]
     fn triangle_list_alignment_is_a_production_clamp() {
         let block = chunk(0, 100);
@@ -714,7 +732,18 @@ mod tests {
         );
         assert_eq!(
             chunk_draw_range(Topology::TriangleList, 100, &block, 1..4),
-            Some(1..4)
+            Some(0..3),
+            "未对齐的 start 向下对齐：range 起点之前最多 2 个索引一并画出（E4b 裁决）"
+        );
+        assert_eq!(
+            chunk_draw_range(Topology::TriangleList, 100, &block, 2..5),
+            Some(0..3),
+            "2..5 只覆盖网格里的第一个三角形 ⇒ 画 0..3"
+        );
+        assert_eq!(
+            chunk_draw_range(Topology::TriangleList, 100, &block, 1..2),
+            None,
+            "对齐后 start == end ⇒ 不产生 draw"
         );
         assert_eq!(
             chunk_draw_range(Topology::TriangleList, 100, &block, 0..2),
@@ -729,5 +758,58 @@ mod tests {
             chunk_draw_range(Topology::TriangleStrip, 100, &block, 2..7),
             Some(2..7)
         );
+    }
+
+    /// 非对齐 start 跨块：块边界不重新起算三角形（E4b / 审查 F1）。
+    ///
+    /// 块 0 = `0..12288`、块 1 = `12288..12294`（`GEOMETRY_CHUNK_INDICES = 4096 × 3`）。
+    /// `12286..12294` 的两端对齐后是 `12285..12294`：块 0 得 `12285..12288`（起点处那个
+    /// 合法三角形），块 1 得 `12288..12294`；两块拼起来恰好是整段 `DrawIndexed(12285, 9)`
+    /// 画出的三个三角形。旧实现逐块 `count -= count % 3` 会把块 0 的 3 个索引截成 0。
+    #[test]
+    fn unaligned_start_crossing_chunks_keeps_the_global_triangle_grid() {
+        let first = chunk(0, GEOMETRY_CHUNK_INDICES);
+        let tail = chunk(GEOMETRY_CHUNK_INDICES, 6);
+        let index_count = GEOMETRY_CHUNK_INDICES + 6;
+        let requested = 12_286u32..12_294;
+        assert_eq!(
+            chunk_draw_range(
+                Topology::TriangleList,
+                index_count,
+                &first,
+                requested.clone()
+            ),
+            Some(12_285..12_288),
+            "未对齐 start 向下对齐后，块 0 仍画出起点处的三角形"
+        );
+        assert_eq!(
+            chunk_draw_range(Topology::TriangleList, index_count, &tail, requested),
+            Some(12_288..12_294),
+            "块 1 从块边界继续，不重新起算三角形"
+        );
+        // 起点处 3 个索引组成的三角形合法（旧实现在跨块时会把整个 range 丢掉）。
+        assert_eq!(
+            chunk_draw_range(Topology::TriangleList, index_count, &first, 12_287..12_290),
+            Some(12_285..12_288)
+        );
+        assert_eq!(
+            chunk_draw_range(Topology::TriangleList, index_count, &tail, 12_287..12_290),
+            None,
+            "range 只碰到块 0 的尾部"
+        );
+        // 每块结果都是 3 的倍数长度；拼接顺序 = 索引序。
+        for range in [
+            chunk_draw_range(Topology::TriangleList, index_count, &first, 12_286..12_294),
+            chunk_draw_range(Topology::TriangleList, index_count, &tail, 12_286..12_294),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert_eq!(
+                (range.end - range.start) % 3,
+                0,
+                "每个块只画整三角形：{range:?}"
+            );
+        }
     }
 }

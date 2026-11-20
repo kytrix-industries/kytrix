@@ -726,43 +726,93 @@ pub(crate) struct GeometryDrawGpu {
     pub snapshot: std::sync::Arc<crate::paint::geometry::GeometrySnapshot>,
 }
 
+/// 三端 `DrawIndexed` 的**唯一参数载体**（E4 / §11.4；审查 F2 的守护面）。
+///
+/// 参数推导与校验只在 [`draw_indexed_params`] 一处发生，三个后端只负责把这些值转发给各自的
+/// API：D3D12 `DrawIndexedInstanced(count, 1, first_index, base_vertex, 0)`、Vulkan
+/// `cmd_draw_indexed(count, 1, first_index, base_vertex, 0)`、Metal
+/// `drawIndexedPrimitives(count, index_type, buffer, first_index × index_type.size())`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DrawIndexedArgs {
+    /// 索引**元素**起点（不是字节偏移；Metal 自己乘索引字节数）。
+    pub first_index: u32,
+    /// 索引**元素**个数。
+    pub count: u32,
+    /// 基础顶点偏移。**恒 0**：块只切索引，顶点缓冲是整块几何的（D3D12 / Vulkan 的
+    /// base vertex / vertex offset 参数；Metal 没有对应概念）。
+    pub base_vertex: i32,
+}
+
+/// 由裁剪后的索引区间推导三端 `DrawIndexed` 参数（纯函数；三端 encoder 的唯一来源）。
+///
+/// 校验的是**引擎内部不变量**，不是应用输入（应用侧的越界已在
+/// [`crate::paint::geometry::chunk_draw_range`] clamp）：
+/// - `count == 0`：空区间不该产生 op；
+/// - `first_index + count` 溢出：`u32` 索引区间非法；
+/// - `first_index + count > uploaded_index_count`：越过已上传的索引缓冲（不静默越界读）。
+///
+/// 失败都返回 [`EngineError::GeometryRegister`]（与 `draw_indexed` 的其它失败同一错误族）。
+pub(crate) fn draw_indexed_params(
+    first_index: u32,
+    count: u32,
+    uploaded_index_count: u32,
+) -> Result<DrawIndexedArgs, EngineError> {
+    if count == 0 {
+        return Err(EngineError::GeometryRegister {
+            detail: smol_str::format_smolstr!(
+                "empty DrawIndexed range (first_index {first_index})"
+            ),
+        });
+    }
+    let end = first_index
+        .checked_add(count)
+        .ok_or_else(|| EngineError::GeometryRegister {
+            detail: smol_str::format_smolstr!(
+                "DrawIndexed range {first_index}+{count} overflows the u32 index space"
+            ),
+        })?;
+    if end > uploaded_index_count {
+        return Err(EngineError::GeometryRegister {
+            detail: smol_str::format_smolstr!(
+                "DrawIndexed range {first_index}..{end} exceeds the uploaded index count {uploaded_index_count}"
+            ),
+        });
+    }
+    Ok(DrawIndexedArgs {
+        first_index,
+        count,
+        base_vertex: 0,
+    })
+}
+
 impl GeometryDrawGpu {
-    /// 三端 GPU encoder 的**唯一**绘制区间入口：校验裁剪后的区间落在已上传的索引缓冲内。
+    /// 三端 GPU encoder 的**唯一**绘制参数入口：校验 op 的裁剪后区间，交给
+    /// [`draw_indexed_params`] 推导共享参数。
     ///
-    /// 返回值的语义固定为 `DrawIndexed(first_index = range.start, count = range.end - start)`
-    /// （Metal 的 `indexBufferOffset` 要再乘 `index_type.size()`）。三个后端因此消费同一份
-    /// 区间，不存在「某端自己再和块表求交」的漂移余地。
+    /// 三个后端都只调用本方法，不存在「某端自己再算一次 `first_index/count`」的漂移余地；
+    /// 参数本身（含 `base_vertex == 0`）由纯函数单测钉住。
     ///
     /// # Errors
-    /// [`EngineError::GeometryRegister`]：区间为空（不应产生 op）或越过已上传的 `index_count`
-    /// —— 都是**引擎内部不变量被破坏**的强类型错误，绝不静默越界读。
-    pub(crate) fn draw_range(
+    /// [`EngineError::GeometryRegister`]：区间为空 / 反向（不应产生 op），或越过已上传的
+    /// `index_count` —— 都是**引擎内部不变量被破坏**的强类型错误，绝不静默越界读。
+    pub(crate) fn draw_indexed(
         &self,
         uploaded_index_count: u32,
-    ) -> Result<std::ops::Range<u32>, EngineError> {
-        if self.range.is_empty() {
-            return Err(EngineError::GeometryRegister {
+    ) -> Result<DrawIndexedArgs, EngineError> {
+        let count = self
+            .range
+            .end
+            .checked_sub(self.range.start)
+            .ok_or_else(|| EngineError::GeometryRegister {
                 detail: smol_str::format_smolstr!(
-                    "geometry {}:{} has an empty draw range {}..{}",
+                    "geometry {}:{} has a reversed draw range {}..{}",
                     self.id.index(),
                     self.id.generation(),
                     self.range.start,
                     self.range.end
                 ),
-            });
-        }
-        if self.range.end > uploaded_index_count {
-            return Err(EngineError::GeometryRegister {
-                detail: smol_str::format_smolstr!(
-                    "geometry {}:{} draw range {}..{} exceeds uploaded index count {uploaded_index_count}",
-                    self.id.index(),
-                    self.id.generation(),
-                    self.range.start,
-                    self.range.end
-                ),
-            });
-        }
-        Ok(self.range.clone())
+            })?;
+        draw_indexed_params(self.range.start, count, uploaded_index_count)
     }
 }
 
@@ -2326,8 +2376,10 @@ impl LaneEncoder<'_> {
     /// 追加一次几何绘制（每帧生成 op 表时按绘制序复制进 `InstanceBuffer::geometry`）。
     ///
     /// **range ∩ 块表**（E4 / §11.4）：绘制区间按索引元素给出，这里与快照块表求交后**逐块**
-    /// 展开成 `LanePart::Geometry`（每块一个 op，块间顺序 = 索引顺序；块在索引缓冲里连续，
-    /// 因此逐块绘制与整段绘制的像素结果完全一致）。不相交的块不产生 op，空 range ⇒ 零 op、
+    /// 展开成 `LanePart::Geometry`（每块一个 op，块间顺序 = 索引顺序）。`TriangleList` 的
+    /// range 两端在 [`crate::paint::geometry::chunk_draw_range`] 里向下对齐到全局 3 的倍数
+    /// （块边界也在同一张三角形网格上），因此逐块绘制与「单次 `DrawIndexed` 画整段」的像素
+    /// 结果一致；`TriangleStrip` 是单块拓扑、不截断。不相交的块不产生 op，空 range ⇒ 零 op、
     /// 零上传、零 draw call。逐块的好处是失效/上传可以按块/页进行（几何节点的多 lane 分块在
     /// 此基础上让「追加只重建尾块」成立）。
     ///
@@ -2623,11 +2675,12 @@ mod tests {
 
     use super::{
         CLIP_KIND_RECT, CLIP_KIND_ROUNDED, ClipChain, ClipChainId, ClipKind, ClipState,
-        GRADIENT_HORIZONTAL, GRADIENT_RADIAL, GRADIENT_VERTICAL, GpuPrimitive, InstanceEncoder,
-        KIND_GLYPH, KIND_QUAD, KIND_SHADOW, MAX_CLIP_ITEMS, SHADOW_SIGMA_MIN, SHADOW_SIGMA_SCALE,
-        normalize_corner_radius, snap_rect_clip_to_pixels,
+        DrawIndexedArgs, GRADIENT_HORIZONTAL, GRADIENT_RADIAL, GRADIENT_VERTICAL, GpuPrimitive,
+        InstanceEncoder, KIND_GLYPH, KIND_QUAD, KIND_SHADOW, MAX_CLIP_ITEMS, SHADOW_SIGMA_MIN,
+        SHADOW_SIGMA_SCALE, draw_indexed_params, normalize_corner_radius, snap_rect_clip_to_pixels,
     };
     use crate::{
+        error::EngineError,
         math::{Point, Rect, Scale, Size, Transform},
         paint::{
             atlas::{AtlasKind, AtlasTile},
@@ -4241,9 +4294,10 @@ mod tests {
         assert_eq!(encoded.ranges, vec![0..12288, 12288..12297]);
     }
 
-    /// 三端 encoder 的唯一 range 入口：空区间 / 越过已上传索引数都是强类型错误（不静默越界读）。
+    /// 三端 encoder 的唯一 range 入口：空区间 / 反向区间 / 越过已上传索引数都是强类型错误
+    /// （不静默越界读）；正常区间推导出 D3D12/Vulkan/Metal 共用的 `first_index/count/base_vertex`。
     #[test]
-    fn gpu_draw_range_validates_against_the_uploaded_index_count() {
+    fn gpu_draw_indexed_validates_against_the_uploaded_index_count() {
         let (store, id) = register_triangles(3);
         let snapshot = store.snapshot_arc(id).expect("快照");
         let draw = |range: std::ops::Range<u32>| crate::paint::instance::GeometryDrawGpu {
@@ -4253,15 +4307,98 @@ mod tests {
             color: [1.0; 4],
             snapshot: Arc::clone(&snapshot),
         };
-        assert_eq!(draw(3..9).draw_range(9).expect("合法区间"), 3..9);
+        assert_eq!(
+            draw(3..9).draw_indexed(9).expect("合法区间"),
+            DrawIndexedArgs {
+                first_index: 3,
+                count: 6,
+                base_vertex: 0,
+            },
+            "count 是区间长度（不是 range.end）：三端参数由同一纯函数推导"
+        );
         assert!(
-            draw(3..10).draw_range(9).is_err(),
+            draw(3..10).draw_indexed(9).is_err(),
             "越过已上传的索引数必须报 GeometryRegister，不得静默越界读"
         );
         assert!(
-            draw(3..3).draw_range(9).is_err(),
+            draw(3..3).draw_indexed(9).is_err(),
             "空区间不应出现在几何 op 表里"
         );
+        assert!(
+            draw(std::ops::Range { start: 9, end: 3 })
+                .draw_indexed(9)
+                .is_err(),
+            "反向区间必须报 GeometryRegister"
+        );
+    }
+
+    /// 共享参数纯函数：正常区间原样返回、`base_vertex` 恒 0（三端都不做 base vertex）。
+    #[test]
+    fn draw_indexed_params_passes_through_the_clipped_range() {
+        assert_eq!(
+            draw_indexed_params(3, 6, 9).expect("合法区间"),
+            DrawIndexedArgs {
+                first_index: 3,
+                count: 6,
+                base_vertex: 0,
+            }
+        );
+        // 整块几何：第二块 = 12288..12297（尾块 9 个索引）。
+        assert_eq!(
+            draw_indexed_params(12288, 9, 12297).expect("尾块"),
+            DrawIndexedArgs {
+                first_index: 12288,
+                count: 9,
+                base_vertex: 0,
+            }
+        );
+    }
+
+    /// 共享参数纯函数：空区间是强类型错误（空区间不应出现在几何 op 表里）。
+    #[test]
+    fn draw_indexed_params_rejects_empty_count() {
+        match draw_indexed_params(3, 0, 9) {
+            Err(EngineError::GeometryRegister { .. }) => {}
+            other => panic!("count = 0 必须报 GeometryRegister，实际 {other:?}"),
+        }
+    }
+
+    /// 共享参数纯函数：越过已上传索引数是强类型错误（不静默越界读）。
+    #[test]
+    fn draw_indexed_params_rejects_out_of_bounds_ranges() {
+        match draw_indexed_params(3, 7, 9) {
+            Err(EngineError::GeometryRegister { .. }) => {}
+            other => panic!("越过已上传索引数必须报 GeometryRegister，实际 {other:?}"),
+        }
+        match draw_indexed_params(9, 1, 9) {
+            Err(EngineError::GeometryRegister { .. }) => {}
+            other => panic!("first_index == uploaded_index_count 必须报错，实际 {other:?}"),
+        }
+    }
+
+    /// 共享参数纯函数：`first_index + count` 溢出必须报错（不得回绕成合法区间）。
+    #[test]
+    fn draw_indexed_params_rejects_overflowing_ranges() {
+        match draw_indexed_params(u32::MAX, 2, u32::MAX) {
+            Err(EngineError::GeometryRegister { .. }) => {}
+            other => panic!("first_index + count 溢出必须报错（不得回绕），实际 {other:?}"),
+        }
+        match draw_indexed_params(u32::MAX - 1, 3, u32::MAX) {
+            Err(EngineError::GeometryRegister { .. }) => {}
+            other => panic!("first_index + count 溢出必须报错（不得回绕），实际 {other:?}"),
+        }
+    }
+
+    /// 共享参数纯函数：合法区间的 `base_vertex` 恒 0（三端 vertex offset / base vertex 都为 0）。
+    #[test]
+    fn draw_indexed_params_always_uses_zero_base_vertex() {
+        for (first_index, count, uploaded) in [(0, 3, 3), (0, 12288, 12297), (12288, 9, 12297)] {
+            let args = draw_indexed_params(first_index, count, uploaded).expect("合法区间");
+            assert_eq!(
+                args.base_vertex, 0,
+                "first_index={first_index} count={count}"
+            );
+        }
     }
 
     #[test]

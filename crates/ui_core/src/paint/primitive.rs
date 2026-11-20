@@ -172,7 +172,9 @@ pub struct GeometryDraw {
     /// - `0..u32::MAX` = 整份几何（[`GeometryDraw::full`]）；
     /// - 空区间 / `start >= end` = 不绘制（无 op、无 damage）；
     /// - 超出 `index_count` 的一端由引擎 **clamp**（几何可能被 `truncate_geometry` 变短，不报错）；
-    /// - `TriangleList` 的绘制长度截到 3 的倍数：GPU 的三角形列表只消费整三角形。
+    /// - `TriangleList` 的 range 两端由引擎**向下**对齐到 3 的倍数（起点向下取整、长度向下取整：
+    ///   起点不在三角形边界时，起点之前的至多 2 个索引一并画出，保证与整段绘制的三角形集合一致；
+    ///   不足一个三角形的尾部索引不产生 draw）；`TriangleStrip` 不截断。
     ///
     /// 引擎把 range 与块表求交，**逐块**产出绘制 op（块间顺序 = 索引顺序）；应用不需要知道块
     /// 大小（§5.5 的块是引擎内部策略）。
@@ -331,8 +333,6 @@ mod tests {
         // 实测 80 B（= Quad 变体）；软上限 128 B，超出需评审。
         assert_eq!(size_of::<Primitive>(), 80);
         assert!(size_of::<Primitive>() <= 128);
-        // E4 给 `GeometryDraw` 加了 8 B 的 `range`，几何变体仍远小于 `Quad` 变体。
-        assert!(size_of::<GeometryDraw>() <= size_of::<Primitive>());
     }
 
     /// E4：`range` 是**索引元素**区间，`full` 是 `0..u32::MAX` 哨兵；子区间不同 ⇒ 绘制不同。

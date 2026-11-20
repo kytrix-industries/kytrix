@@ -877,7 +877,9 @@ pub(super) fn draw_ops(
                             draw.id.generation()
                         ),
                     })?;
-                let range = draw.draw_range(entry.index_count())?;
+                // 三端唯一的参数入口：校验裁剪后的区间并推导 `first_index/count/base_vertex`
+                // （纯函数 `draw_indexed_params` 的返回值，三端单测钉住）。
+                let args = draw.draw_indexed(entry.index_count())?;
                 let uniform = geometry_root(root, draw.clone(), clip_index, clip_rect);
                 // SAFETY: 顶点/索引缓冲由 `GeometryRegistry` 持有到本帧结束；
                 // `entry.topology()` 与注册时的图元类型一致。
@@ -901,10 +903,10 @@ pub(super) fn draw_ops(
                     }
                     list.IASetVertexBuffers(0, Some(&[entry.vertex()]));
                     list.IASetIndexBuffer(Some(&entry.index()));
-                    // E4 / §11.4：绘制区间 = UI 线程按 `GeometryDraw.range` ∩ 块表裁剪后的索引
-                    // 元素区间（`range.start .. range.end`）。顶点缓冲是**整块几何**的（块只切
-                    // 索引），因此 vertex offset 恒 0、blocks 顺序 = 索引序。
-                    list.DrawIndexedInstanced(range.end - range.start, 1, range.start, 0, 0);
+                    // E4 / §11.4：绘制参数 = UI 线程按 `GeometryDraw.range` ∩ 块表裁剪后，
+                    // 由 `GeometryDrawGpu::draw_indexed` 推导的索引元素区间。顶点缓冲是**整块
+                    // 几何**的（块只切索引），因此 base vertex 恒 0、blocks 顺序 = 索引序。
+                    list.DrawIndexedInstanced(args.count, 1, args.first_index, args.base_vertex, 0);
                 }
                 draw_calls = draw_calls.saturating_add(1);
             }

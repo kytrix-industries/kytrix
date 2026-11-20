@@ -1263,7 +1263,8 @@ fn paint_geometry_node(
             });
         }
     }
-    // 块数减少（当前 API 只能增长，保留这条路径给「重置/截断」的后续语义）：释放多余 lane。
+    // 块数减少（`truncate_geometry` 变短 / 几何被替换成更短的版本）：释放多余 lane，
+    // 并把被移除块的**旧** bounds 并入 damage（新一侧已经没有这些块了）。
     for chunk in desired..old_lanes {
         let Some(lane) = context.tree.lane_at(node, chunk) else {
             continue;

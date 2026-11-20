@@ -917,6 +917,74 @@ fn geometry_incremental_page_upload_updates_pixels() {
     );
 }
 
+/// E4b / §11.4：子区间 range 在真实 D3D12（WARP）编码路径上只画被选中的三角形。
+///
+/// 审查变异 M5（D3D12 `IndexCount = range.end`）在旧的 full-range 测试上存活；本测试用三个
+/// 互不重叠的三角形 + `range 3..6` 同时钉住 `first_index` 与 `count`：忽略任一参数都会让
+/// range 之外的三角形出现在像素里。
+#[test]
+fn geometry_subrange_draws_only_the_selected_triangles() {
+    let _guard = lock();
+    let Some(mut renderer) = warp_renderer((64, 64)) else {
+        return;
+    };
+    // A = 左上 (0,0)-(20,20)、B = 右上 (24,0)-(44,20)、C = 左下 (0,24)-(20,44)。
+    #[rustfmt::skip]
+    let vertices: [f32; 27] = [
+        0.0, 0.0, -1.0,  20.0, 0.0, -1.0,  0.0, 20.0, -1.0,
+        24.0, 0.0, -1.0, 44.0, 0.0, -1.0,  24.0, 20.0, -1.0,
+        0.0, 24.0, -1.0, 20.0, 24.0, -1.0, 0.0, 44.0, -1.0,
+    ];
+    let indices: [u16; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+    let vertex_bytes: Vec<u8> = vertices.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let mut store = crate::paint::geometry_store::GeometryStore::new();
+    let id = store
+        .insert(crate::paint::geometry::GeometryDesc {
+            vertex_bytes: bytes::Bytes::from(vertex_bytes),
+            index_bytes: bytes::Bytes::from(index_bytes),
+            vertex_stride: GeometryPipeline::Ui.vertex_stride(),
+            index_type: IndexType::U16,
+            topology: Topology::TriangleList,
+            bounds: Rect::new(0.0, 0.0, 44.0, 44.0),
+            pipeline: GeometryPipeline::Ui,
+        })
+        .expect("注册几何");
+
+    // 索引元素区间 3..6 = 第二个三角形 B（不是整份 0..9）。
+    let scene = one_lane_scene(Primitive::Geometry(GeometryDraw {
+        id,
+        transform: Transform::IDENTITY,
+        color: Color::WHITE,
+        range: 3..6,
+    }));
+    let mut encoder = InstanceEncoder::new();
+    let buffer = encoder
+        .encode(&scene, Scale::ONE, resolver(), &store)
+        .expect("encode");
+    let mut frame = full_plan((64, 64));
+    let mut timings = FrameTimings::new();
+    renderer
+        .submit_buffer(FrameIndex::from_raw(1), buffer, &mut frame, &mut timings)
+        .expect("submit");
+    let image = renderer.readback().expect("readback");
+    assert_eq!(
+        pixel(&image, 64, 30, 6),
+        [255, 255, 255, 255],
+        "range 3..6 必须画出 B（`first_index = 3`、`count = 3`）"
+    );
+    assert_eq!(
+        pixel(&image, 64, 6, 6),
+        [0, 0, 0, 0],
+        "A 在 range 之外：`first_index` 不能被忽略成 0"
+    );
+    assert_eq!(
+        pixel(&image, 64, 6, 30),
+        [0, 0, 0, 0],
+        "C 在 range 之外：`count` 不能把区间尾之后一起画出来"
+    );
+}
+
 /// image（`GeometryPipeline::Textured` 的 quad 路径）：UV 采样命中上传的像素（B1/B5）。
 #[test]
 fn image_primitive_samples_the_image_atlas() {

@@ -1158,10 +1158,12 @@ mod tests {
         );
         clear_dirty(&mut app);
 
-        // 换成只画第二块；画布 AABB 覆盖整份几何（Canvas 契约：bounds ⊇ 内部图元 bounds）。
+        // 换成只画第二块；画布 bounds 收缩到新 range 的可见块 AABB（Canvas 契约：
+        // bounds ⊇ 内部图元 bounds）。首帧画布是 40×40 ⇒ 旧侧区域（y < 64）只能由
+        // 「旧画布 AABB」这一侧 damage 覆盖，所以下面的旧侧断言能钉住旧∪新的并集。
         let window = app.window_id();
-        let canvas_bounds = Rect::new(0.0, 0.0, 64.0, 100.0);
-        let mut canvas = Canvas::new(canvas_bounds);
+        let visible_bounds = Rect::new(0.0, 64.0, 10.0, 1.0);
+        let mut canvas = Canvas::new(visible_bounds);
         canvas.push_geometry(GeometryDraw {
             id,
             transform: Transform::IDENTITY,
@@ -1180,8 +1182,13 @@ mod tests {
         assert!(record.rendered, "range 变更必须提交一帧");
         assert!(!record.damage_full, "子范围变更的 damage 不得整帧");
         assert!(
-            damage_hits(&record.damage, 5.0, 65.0),
-            "新 range 的可见范围必须进 damage（旧画布 AABB ∪ 新画布 AABB）：{:?}",
+            damage_hits(&record.damage, 5.0, 64.0),
+            "新 range 的可见范围必须进 damage（新画布 AABB）：{:?}",
+            record.damage
+        );
+        assert!(
+            damage_hits(&record.damage, 5.0, 5.0),
+            "旧画布 AABB（缩小的新画布不覆盖的部分）必须进 damage（旧 ∪ 新）：{:?}",
             record.damage
         );
         assert_eq!(
@@ -1191,7 +1198,7 @@ mod tests {
         );
 
         // 空 range：该 draw 不产生任何几何 op，但旧像素必须由画布 damage 重画。
-        let mut canvas = Canvas::new(canvas_bounds);
+        let mut canvas = Canvas::new(visible_bounds);
         canvas.push_geometry(GeometryDraw {
             id,
             transform: Transform::IDENTITY,
@@ -1209,6 +1216,11 @@ mod tests {
         let record = app.drain().expect("空 range 帧");
         assert!(record.rendered, "旧 range 的像素必须重画（damage 非空）");
         assert!(!record.damage_full, "空 range 变更同样不得整帧");
+        assert!(
+            damage_hits(&record.damage, 5.0, 64.0),
+            "上一帧 range 的旧像素（旧画布 AABB）必须进 damage：{:?}",
+            record.damage
+        );
         assert!(ranges(&app).is_empty(), "空 range 的 draw 不产生几何 op");
     }
 }
