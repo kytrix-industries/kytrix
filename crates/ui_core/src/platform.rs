@@ -45,21 +45,25 @@ pub(crate) mod macos_placement;
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod macos_close;
 
-/// macOS 窗口层级的**平台无关纯逻辑**（X1 原生部分）：`always_on_top` / `modal` →
-/// AppKit `NSWindowLevel` 的选择（模态 > 置顶 > 普通），以及 `WindowOptions.owner` →
-/// `addChildWindow:ordered:` 关系的解析（含「平台侧找不到 owner 原生窗口」的降级判据）。
+/// macOS 窗口层级的**平台无关纯逻辑**（X1 原生部分）：`always_on_top` / `modal` → AppKit
+/// `NSWindowLevel` 的选择（模态 > 置顶 > 普通）、`WindowOptions.owner` →
+/// `addChildWindow:ordered:` 关系的解析（含「平台侧找不到 owner 原生窗口」的降级判据），以及
+/// 模态期对 owner 的**原生 chrome 拦截**（`OwnerChrome` 快照/恢复、同 owner 多模态的派生
+/// 恢复判据、泵级 key 预扫描 `reclaim_modal_keys`，RB-07/RB-13-mac/RBM-01）。
 ///
 /// 与 [`macos_close`] 同一模式：`platform::macos` 整模块 macOS-only，这里不依赖 AppKit
 /// 类型，映射与优先级必须在开发机（Windows）单测。
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod macos_owner;
 
-/// macOS 自绘标题栏**拖动区**的命中判定纯逻辑（X2）：区域是逻辑窗口坐标（客户区左上原点、
-/// y 向下），`GuiView` 是 flipped，因此只需半开区间矩形包含判定；命中后真机侧把拖动交给
-/// WindowServer（`performWindowDragWithEvent:`）而不投递 `PointerDown`。
+/// macOS 自绘标题栏**拖动区**的纯逻辑（X2）：区域是逻辑窗口坐标（客户区左上原点、y 向下），
+/// `GuiView` 是 flipped，因此只需半开区间矩形包含判定；命中后真机侧把拖动交给 WindowServer
+/// （`performWindowDragWithEvent:`）而不投递 `PointerDown`，并用 [`WindowDragState`] 记录
+/// 「命中后的主键 Up/Move 没有配对 Down」的吞并状态（RB-08）。
 ///
-/// 与 [`macos_owner`] 同一模式：`platform::macos` 整模块 macOS-only，命中判定必须在开发机
-/// （Windows）单测（区域内/外、边界点、空/负尺寸区域、多区域顺序、y 向下）。
+/// 与 [`macos_owner`] 同一模式：`platform::macos` 整模块 macOS-only，命中判定与配对状态机必须
+/// 在开发机（Windows）单测（区域内/外、边界点、空/负尺寸区域、多区域顺序、y 向下、拖动期
+/// Up/Dragged 吞并、hover 结束拖动）。
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod macos_drag;
 

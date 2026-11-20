@@ -50,7 +50,7 @@ use crate::{
         ime::{CommitVerdict, KeyScopeToken, key_visible, replacement_range},
         macos::{a11y::MacA11y, ime::ImeState, menu},
         macos_close::CloseBridge,
-        macos_drag::drag_region_at,
+        macos_drag::{WindowDragState, drag_region_at},
         menu::{EditAvailability, MenuCommand},
     },
 };
@@ -96,6 +96,10 @@ pub(crate) struct ViewIvars {
     /// （`NativeWindow::sync_drag_regions`，每轮对账、值变化才写）；`mouseDown:` 只读：
     /// 命中即把拖动交给 WindowServer 且**不**投递 `PointerDown`（拖动区是窗口 chrome）。
     drag_regions: RefCell<Vec<Rect>>,
+    /// 拖动区命中后的主键指针事件配对状态（RB-08）：命中期间补发的 Up / Dragged 没有配对的
+    /// Down，必须吞掉。状态机（含「何时清状态」）在平台无关的
+    /// [`crate::platform::macos_drag::WindowDragState`]，这里只存当前值。
+    window_drag: Cell<WindowDragState>,
 }
 
 define_class!(
@@ -274,11 +278,29 @@ define_class!(
 
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, event: &NSEvent) {
-            self.push_pointer(event, PointerPhase::Move);
+            // RB-08：Apple 约定 `mouseMoved:` 只在**没有按键按下**时投递（拖动中发
+            // `mouseDragged:`）⇒ 它证明上一次拖动会话已经结束（AppKit 可能始终没补发
+            // `mouseUp:`）。在这里清掉配对状态，否则拖动结束后悬停会一直冻到下一次点击。
+            //
+            // RBM-05 兜底：真读到主键仍按下（某个 AppKit 版本在拖动期间补发 `mouseMoved:`）
+            // 时**既不结束状态、也不投递**这条 Move —— 只保护状态不保护投递仍会泄漏一条
+            // 无 Down 配对的 Move。
+            let mut drag = self.ivars().window_drag.get();
+            let deliver = drag.hover_move((NSEvent::pressedMouseButtons() & 1) != 0);
+            self.ivars().window_drag.set(drag);
+            if deliver {
+                self.push_pointer(event, PointerPhase::Move);
+            }
         }
 
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &NSEvent) {
+            // RB-08：命中拖动区的那次按下把拖动交给了 WindowServer、没有投递 `PointerDown`；
+            // AppKit 补发的主键 `mouseDragged:` 因此没有配对的 Down ⇒ 吞掉（拖动区是窗口
+            // chrome，拖动期间不进入引擎指针分发）。
+            if self.ivars().window_drag.get().is_dragging() {
+                return;
+            }
             self.push_pointer(event, PointerPhase::Move);
         }
 
@@ -296,15 +318,27 @@ define_class!(
         fn mouse_down(&self, event: &NSEvent) {
             // X2：自绘标题栏拖动区命中 ⇒ 同步交给 WindowServer 拖动，且**不**投递
             // `PointerDown`（不开始引擎指针会话 —— 拖动期间没有后续 mouseUp 保证）。
-            if self.begin_window_drag(event) {
-                return;
+            //
+            // RB-08：命中状态记进 `WindowDragState`，后续主键 Up / Dragged 据此吞掉；非命中
+            // 的按下会清掉上一次拖动可能残留的状态（拖动区外的一次点击 = 正常指针会话）。
+            let hit = self.begin_window_drag(event);
+            let mut drag = self.ivars().window_drag.get();
+            let deliver = drag.primary_down(hit);
+            self.ivars().window_drag.set(drag);
+            if deliver {
+                self.push_pointer(event, PointerPhase::Down(PointerButton::Primary));
             }
-            self.push_pointer(event, PointerPhase::Down(PointerButton::Primary));
         }
 
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, event: &NSEvent) {
-            self.push_pointer(event, PointerPhase::Up(PointerButton::Primary));
+            // RB-08：拖动区消费的按下没有投递 Down，补发的 Up 同样没有配对 ⇒ 吞掉。
+            let mut drag = self.ivars().window_drag.get();
+            let deliver = drag.primary_up();
+            self.ivars().window_drag.set(drag);
+            if deliver {
+                self.push_pointer(event, PointerPhase::Up(PointerButton::Primary));
+            }
         }
 
         #[unsafe(method(rightMouseDown:))]
@@ -590,6 +624,16 @@ define_class!(
                         text: smol_str::SmolStr::new(value),
                         replace,
                     }));
+                    // RBM-02：三端一致 —— **有组合串的提交**之后仍有一条 `End`（Win32
+                    // `WM_IME_ENDCOMPOSITION` / Wayland commit-only 批次 / 这里）。记账只在
+                    // 「应用见过 Preedit 且还没收尾」时返回 true 并销账 ⇒ 迟到的
+                    // `unmarkText:` / 失焦清场不会再补第二条；没有组合串的提交（应用从未
+                    // 收到 Preedit）只有 `Commit`，与 Win32/Wayland 的「没有组合就不发 End」
+                    // 一致。
+                    let emit_end = self.ivars().ime.borrow_mut().note_commit_end();
+                    if emit_end {
+                        self.push_event(Event::Ime(ImeEvent::End));
+                    }
                 }
             }
         }
@@ -628,8 +672,14 @@ define_class!(
 
         #[unsafe(method(unmarkText))]
         fn unmark_text(&self) {
-            self.ivars().ime.borrow_mut().clear_marked();
-            self.push_event(Event::Ime(ImeEvent::End));
+            let mut ime = self.ivars().ime.borrow_mut();
+            ime.clear_marked();
+            // RB-09：`End` 只在「应用见过 `Preedit` 且还没收尾」时投递一次。清场兜底
+            // （`reset_ime_composition`）可能已经补过一条，迟到的 `unmarkText:` 看到账已销
+            // 就吞掉 —— 否则真实输入法上会出现两条 `End`。
+            if ime.note_end() {
+                self.push_event(Event::Ime(ImeEvent::End));
+            }
         }
 
         #[unsafe(method(selectedRange))]
@@ -756,6 +806,7 @@ impl GuiView {
             pointer_inside: Cell::new(false),
             edit: Cell::new(EditAvailability::NONE),
             drag_regions: RefCell::new(Vec::new()),
+            window_drag: Cell::new(WindowDragState::default()),
         });
         // SAFETY: `initWithFrame:` 是 NSView 的指定初始化器；`this` 由 `alloc` 产生且未初始化。
         let this: Retained<Self> = unsafe {
@@ -845,8 +896,8 @@ impl GuiView {
     /// `inputContext` 开始返回 `nil`，就拿不到上下文去 `discardMarkedText`，输入法那边的
     /// 转换会话会悬空。启用只翻标志：下一次按键自然取回 super 的上下文。
     ///
-    /// 返回 `true` = 有组合被丢弃且需要调用方补一条 `ImeEvent::End`（与焦点移走路径共用
-    /// 同一收尾判据）。
+    /// 返回 `true` = 欠一条 `ImeEvent::End`，需要调用方补（与焦点移走路径共用同一份收尾
+    /// 记账，见 [`Self::reset_ime_composition`]）。
     pub(crate) fn apply_ime_enabled(&self, enabled: bool) -> bool {
         if enabled {
             self.ivars().ime_enabled.set(true);
@@ -862,23 +913,31 @@ impl GuiView {
     ///
     /// 两步：① 让 AppKit 丢弃它那边的转换会话（`NSTextInputContext.discardMarkedText`，
     /// 公开 API，WebKit/Qt 同款）；② 清引擎侧的 `ImeState` 与 caret 缓存。返回 `true` =
-    /// 需要调用方补一条 `ImeEvent::End` —— `discardMarkedText` 若同步回调了
-    /// `unmarkText:`（该回调已经 push 过 `End`），这里就不再补，**End 恰好一条**。
+    /// 调用方要补一条 `ImeEvent::End`。
+    ///
+    /// 「恰好一条 `End`」由 [`ImeState`] 的收尾记账给出（RB-09），**不**由
+    /// `discardMarkedText` 之后的 `hasMarkedText` 推断：AppKit 可能走同步 `unmarkText:`
+    /// （回调已投递 `End`）、`setMarkedText:@""`（0 条 End，必须补）、异步 `unmarkText:`
+    /// （返回时还没回调，补一条后迟到的那条被记账吞掉）或 `insertText:`（`Commit` 收尾，
+    /// 不再补 End）。记账在 `discardMarkedText` **前后**都由回调更新，因此任何回调形态下
+    /// 应用侧都恰好收到一条收尾。
     ///
     /// caret 缓存是 AppKit 摆候选窗的依据（`firstRectForCharacterRange:`）；失焦/禁用不是
     /// 「caret 移到别处」，清场后必须回到空矩形，否则下一次组合会拿旧插入点摆候选窗。
     pub(crate) fn reset_ime_composition(&self) -> bool {
         self.ivars().ime_cursor.set(None);
-        if !self.ivars().ime.borrow().has_marked() {
+        // 应用没有「待收尾的组合」⇒ 不凭空补 End（`unmarkText:` 也可能在没有组合时被调用）。
+        if !self.ivars().ime.borrow().has_pending_end() {
             return false;
         }
         if let Some(context) = self.inputContext() {
             context.discardMarkedText();
         }
         let mut ime = self.ivars().ime.borrow_mut();
-        let still_composing = ime.has_marked();
         ime.clear_marked();
-        still_composing
+        // 回调已经销账（同步 `unmarkText:` / `insertText:`）⇒ `false`；还没收尾
+        // （`setMarkedText:@""` / 异步回调）⇒ `true`，由调用方补一条并销账。
+        ime.note_end()
     }
 
     /// 取走本轮的平台事件（泵唯一读点）。
@@ -925,6 +984,10 @@ impl GuiView {
     /// 返回 `true` = 本次按下已被拖动区消费（调用方不得再投递 `PointerDown`）。拖动由
     /// WindowServer 同步接管（Apple 文档：可参与 Space 切换等系统行为；调用立即返回，可能
     /// 不再收到 mouseUp）—— 因此绝不能给应用发一个没有后续 `PointerUp` 的按下会话。
+    ///
+    /// 返回 `false` 有两种情形：没命中拖动区；或命中了但窗口已消失（无法发起原生拖动）——
+    /// 后者必须回退成普通点击（投递 `PointerDown`），否则这次点击被静默吃掉。配对状态机
+    /// （[`WindowDragState`]）据此区分「命中且已拖动」与「命中但没拖动」。
     fn begin_window_drag(&self, event: &NSEvent) -> bool {
         let position = self.logical_point(event.locationInWindow());
         // 借用在判定后立即结束，避免 `performWindowDragWithEvent:` 期间 AppKit 回调进来

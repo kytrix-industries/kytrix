@@ -676,8 +676,9 @@ impl WaylandState {
         // X1：`modal` / `always_on_top` 在 Wayland 上**没有额外原生请求**（明确降级，不是遗漏）：
         //
         // - `modal`：xdg-shell 没有模态协议，`xdg_toplevel` 的请求表里**没有** `set_modal`
-        //   （不要臆造）。模态语义完全由 `App` 层输入拦截承担（与 macOS 同一套）；本端只提供
-        //   上面 owner 的 `set_parent` 提示，让 compositor 把对话框叠在 owner 之上。
+        //   （不要臆造）。模态语义完全由 `App` 层输入拦截承担（macOS/Windows 另有原生拦截，
+        //   见 RB-07 / `EnableWindow`；本端**只有**这一层）；本端只提供上面 owner 的
+        //   `set_parent` 提示，让 compositor 把对话框叠在 owner 之上。
         //   `modal && owner == None` 的「降级为普通窗口 + 诊断」由 App 层负责（公共契约的落地
         //   点），这里不重复诊断。
         // - `always_on_top`：xdg-shell 没有置顶请求；KDE plasma-shell / wlr-layer-shell 都不是
