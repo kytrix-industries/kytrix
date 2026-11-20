@@ -1070,6 +1070,46 @@ fn a_new_window_without_an_array_gets_zero_drawable_layers_while_growth_is_block
     }
 }
 
+/// RBT-10 的初始化例外：数组**建立**（`image_array_established == None`）不能被
+/// 「窗口暂时不参与渲染」挡住。Windows 窗口在 `ShowWindow` 之前是 hidden，GPU 循环按遮挡
+/// 跳过；若把首次建数组也排除在外，图集建立会被拖到可见之后，并与后续扩层叠加放大首帧尖峰。
+/// 这个边界用 `set_atlas_participating_for_test(false)` 在单窗口上直接构造。
+#[cfg(windows)]
+#[test]
+fn initial_array_establishment_ignores_participation() {
+    use crate::render::AtlasArraySpec;
+
+    let _guard = crate::render::windows::device::gpu_test_lock();
+    let (_rt, mut app, window) = setup();
+    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
+    let _ = app
+        .resources_mut()
+        .insert(&png_rgba([7, 8, 9, 255]))
+        .expect("insert");
+    app.window_mut(window)
+        .expect("window")
+        .enable_offscreen_renderer()
+        .expect("offscreen renderer");
+    app.window_mut(window)
+        .expect("window")
+        .set_atlas_participating_for_test(false);
+
+    app.upload_atlas_pages();
+    assert_eq!(
+        app.window(window).expect("window").image_array_spec(),
+        Some(AtlasArraySpec {
+            page: 16,
+            layers: 1
+        }),
+        "首次建数组必须先于参与状态：hidden 窗口不能挡住初始化"
+    );
+    assert_eq!(
+        app.window(window).expect("window").image_drawable_layers(),
+        1,
+        "初始化完成后窗口按已建立层数可画"
+    );
+}
+
 /// RBT-10：不参与渲染（遮挡 / 最小化被 GPU 循环跳过）的窗口**不参与扩层闸门**；它恢复后
 /// 按「整组重传」重新同步，而不是沿用旧记账假装已入队。
 #[cfg(windows)]
@@ -1140,8 +1180,8 @@ fn an_occluded_window_does_not_block_growth_and_resyncs_when_it_returns() {
     assert_eq!(app.window(first).expect("first").image_drawable_layers(), 2);
     assert_eq!(
         app.window(second).expect("second").image_drawable_layers(),
-        0,
-        "不参与渲染的窗口本帧一层都不能画"
+        1,
+        "不参与渲染的窗口保留自己的已建立层数（不清零；恢复后按 received != target 重传）"
     );
 
     app.window_mut(second)

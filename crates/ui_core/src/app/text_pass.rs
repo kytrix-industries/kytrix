@@ -230,6 +230,11 @@ pub(crate) fn upload_image_page(app: &mut App) {
     //   循环自己的跳过决策同源（`Shared::atlas_participating`），恢复可见后走非增长路径的
     //   「整组重传」重新同步。
     let established = app.image_array_established;
+    // 数组建立（established == None）是进程级初始化，必须先于「窗口是否参与渲染」：
+    // 窗口在 ShowWindow 之前是 hidden（GPU 循环按遮挡跳过），若把它排除在闸门外，首次建数组
+    // 要等到可见后才发生；这段延迟会让首帧的图集状态与后续扩层叠加，放大首帧尖峰。
+    // 建立完成后才让遮挡窗口不参与（RBT-10 的活性收益保留）。
+    let bootstrap = established.is_none();
     let needs_growth =
         established.is_none_or(|spec| spec.page != target.page || spec.layers < target.layers);
     if needs_growth {
@@ -238,7 +243,7 @@ pub(crate) fn upload_image_page(app: &mut App) {
             .iter()
             .filter(|(_, window)| {
                 window.has_renderer()
-                    && window.atlas_participating()
+                    && (bootstrap || window.atlas_participating())
                     && !window.atlas_idle(AtlasKind::Image)
             })
             .map(|(id, _)| *id)
@@ -260,11 +265,10 @@ pub(crate) fn upload_image_page(app: &mut App) {
                     }
                     // RBT-09：按**窗口**收敛，不能用 App 级 `established` 抬高未同步窗口的上限
                     // （macOS 每窗口一份数组，新窗口 / 重挂渲染器仍是 1×1×1 占位）。
-                    let drawable = if window.atlas_participating() {
-                        window.image_array_spec().map_or(0, |spec| spec.layers)
-                    } else {
-                        0
-                    };
+                    // 不参与渲染的窗口保留它自己的已建立层数：它的 GPU 循环没有消费本帧上传，
+                    // 但也没有丢弃数组内容 —— 这里清零会在恢复可见时制造 0↔N 的整帧重编码，
+                    // 且与设备侧图集代际叠加后可能触发设备挂死（P2 真机回归）。
+                    let drawable = window.image_array_spec().map_or(0, |spec| spec.layers);
                     window.set_image_drawable_layers(drawable);
                 }
                 // 让槽忙的窗口尽快出帧，把上一笔上传消费掉（否则增长会被一直挡着）。
@@ -281,7 +285,9 @@ pub(crate) fn upload_image_page(app: &mut App) {
             // 非增长路径整组重传），本帧不画任何图片层；本帧继续往下，只用参与且空闲的窗口
             // 推进数组 —— 长期不渲染的窗口不会让其它窗口的新页永远上不了屏。
             for window in app.windows.values_mut() {
-                if window.has_renderer() && !window.atlas_idle(AtlasKind::Image) {
+                if (bootstrap || window.atlas_participating())
+                    && !window.atlas_idle(AtlasKind::Image)
+                {
                     window.mark_atlas_page_stale(AtlasKind::Image);
                     window.set_image_drawable_layers(0);
                 }
@@ -299,10 +305,13 @@ pub(crate) fn upload_image_page(app: &mut App) {
                 if !window.has_renderer() {
                     continue;
                 }
-                if !window.atlas_participating() || !window.atlas_idle(AtlasKind::Image) {
+                if (!bootstrap && !window.atlas_participating())
+                    || !window.atlas_idle(AtlasKind::Image)
+                {
                     // 不参与渲染（遮挡 / 最小化）或不消费上传（兜底路径）：不整组入队
-                    // （不推进 `atlas_pending`），可画层归零（它的数组可能是占位）。
-                    window.set_image_drawable_layers(0);
+                    // （不推进 `atlas_pending`），保留窗口自己的已建立层数（与 blocked 分支同源）。
+                    let drawable = window.image_array_spec().map_or(0, |spec| spec.layers);
+                    window.set_image_drawable_layers(drawable);
                     continue;
                 }
                 let mut enqueued = Vec::with_capacity(page_count);
@@ -372,7 +381,8 @@ pub(crate) fn upload_image_page(app: &mut App) {
                             .merge_from(&dirty[usize::from(layer)]);
                     }
                 }
-                window.set_image_drawable_layers(0);
+                let drawable = window.image_array_spec().map_or(0, |spec| spec.layers);
+                window.set_image_drawable_layers(drawable);
                 continue;
             }
             let received = window.image_array_spec();

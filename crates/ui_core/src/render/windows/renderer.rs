@@ -1774,6 +1774,12 @@ fn wait_for_waitable(
         // 离屏目标没有交换链：节奏由调用方（同步路径）决定。
         return Ok(true);
     };
+    // 首帧 / `ResizeBuffers` / 显示恢复后的第一帧：还没有上一帧需要限速。部分驱动/DWM
+    // 组合下 waitable 在第一次 Present 之前不会 signal，先等只会白等两次 1 s 超时
+    // （真机首帧慢、拖动卡死的共同症状）；直接 Present 一帧建立节奏。
+    if renderer.take_first_present_skip() {
+        return Ok(true);
+    }
     loop {
         match wait_for_pair(waitable, shared.completion, "waitable, completion")? {
             Some(0) => return Ok(true),

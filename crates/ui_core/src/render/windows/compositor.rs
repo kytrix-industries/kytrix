@@ -154,6 +154,13 @@ pub(crate) struct GpuRenderer {
     buffer: (u32, u32),
     /// 当前**内容**尺寸（绘制 / copy / present 的范围；窗口客户区变化时只改这个字段）。
     surface: (u32, u32),
+    /// 交换链创建 / `ResizeBuffers` / 显示恢复之后，**首个用户帧**是否还需要等
+    /// frame-latency waitable。
+    ///
+    /// `false` ⇒ 下一帧直接 Present（此时没有需要限速的上一帧）；Present 成功后再由
+    /// `wait_for_waitable` 正常等待。部分驱动 / DWM 组合下，waitable 在第一次 Present 之前不会
+    /// signal，先等会白等两次 1 s 超时（真机首帧慢 / 拖动卡死的共同症状）。
+    waitable_primed: bool,
     /// **唯一**的「必须全量」状态源（R08-11）。
     target: TargetState,
     /// 每个 back buffer 与 persist 的同步记账（R08-8）。
@@ -359,6 +366,7 @@ impl GpuRenderer {
             clear_color: [0.0, 0.0, 0.0, 0.0],
             buffer: size,
             surface: size,
+            waitable_primed: false,
             target: TargetState::Fresh,
             buffer_syncs: BufferSyncs::new(),
             op_buckets: OpBuckets::new(),
@@ -403,6 +411,19 @@ impl GpuRenderer {
             "the frame-latency waitable may only be waited on the kytrix-d3d12 thread"
         );
         self.swapchain.as_ref().map(Swapchain::waitable)
+    }
+
+    /// 首帧 / 目标重建后的第一个用户帧：返回 `true` 表示**跳过** waitable 等待。
+    ///
+    /// 此时还没有「上一帧」需要限速；先 Present 一帧把 waitable 的节奏建立起来，避免部分
+    /// 驱动/DWM 组合下 waitable 在首 Present 前不 signal 造成 2×1 s 的空白首帧。
+    pub(crate) fn take_first_present_skip(&mut self) -> bool {
+        if self.swapchain.is_some() && !self.waitable_primed {
+            self.waitable_primed = true;
+            true
+        } else {
+            false
+        }
     }
 
     /// 取本帧的 ring 槽（**按提交次数轮转**；提交成功后才推进 fence 记账）。
@@ -465,14 +486,25 @@ impl GpuRenderer {
 
     /// 实现在 `persist::set_content_size`（薄委托）。
     pub(crate) fn set_content_size(&mut self, content: (u32, u32)) -> Result<(), EngineError> {
-        persist::set_content_size(self, content)
+        let previous_buffer = self.buffer;
+        persist::set_content_size(self, content)?;
+        if self.buffer != previous_buffer {
+            // 内容越过 buffer 桶 ⇒ `ResizeBuffers` 已发生。重建后的交换链 waitable 在第一次
+            // Present 前可能不 signal：下一帧跳过等待，先让 Present 把节奏建立起来。
+            self.waitable_primed = false;
+        }
+        Ok(())
     }
 
     /// 实现在 `persist::resize_target`（薄委托）：把合成面调整到当前内容所需的桶。
     ///
     /// 消费者：GPU 循环在 `Present1` 报告交换链 out of date 时重试（R08-7）。
     pub(crate) fn resize_target(&mut self) -> Result<(), EngineError> {
-        persist::resize_target(self, self.surface)
+        persist::resize_target(self, self.surface)?;
+        // 这里只在目标真的需要重建时被调用（桶变化 / `Present1` out-of-date 重试）；
+        // 重建后的 waitable 在首 Present 前可能不 signal，下一帧先跳过等待。
+        self.waitable_primed = false;
+        Ok(())
     }
 
     /// 实现在 `persist::rebuild_target`（薄委托）：显示 / 电源恢复之后的**整链重建**（R07-14）。
@@ -481,7 +513,11 @@ impl GpuRenderer {
     /// 交换链的显示器关联与持久目标内容都不可信，只 `ResizeBuffers`（同尺寸时是 no-op）
     /// 修不好。返回 `Ok(false)` = 设备健康但还有在飞工作，调用方下一轮重试。
     pub(crate) fn rebuild_target(&mut self) -> Result<bool, EngineError> {
-        persist::rebuild_target(self)
+        let rebuilt = persist::rebuild_target(self)?;
+        if rebuilt {
+            self.waitable_primed = false;
+        }
+        Ok(rebuilt)
     }
 
     /// 实现在 `persist::resize_offscreen`（薄委托）。
