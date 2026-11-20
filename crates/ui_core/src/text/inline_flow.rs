@@ -526,4 +526,215 @@ mod tests {
             assert_eq!(byte_index_at(&layout, "", point), 0, "{point:?}");
         }
     }
+
+    /// 多行：同一行内水平越界必须收敛到**该行**行首/行尾，不得退化为整段 `0`/`len`。
+    #[test]
+    fn byte_index_at_clamps_horizontally_within_each_wrapped_line() {
+        let text = "alpha beta gamma delta";
+        let layout = layout_of_width(text, 60.0);
+        let lines: Vec<_> = layout.lines().collect();
+        assert!(lines.len() >= 3, "fixture 必须折成多行");
+        let width = layout.width();
+
+        let mut left_hits = Vec::with_capacity(lines.len());
+        let mut right_hits = Vec::with_capacity(lines.len());
+        for (line_index, line) in lines.iter().enumerate() {
+            let metrics = line.metrics();
+            let y = (metrics.block_min_coord + metrics.block_max_coord) * 0.5;
+            let range = line.text_range();
+            let left = byte_index_at(&layout, text, Point::new(-50.0, y));
+            let right = byte_index_at(&layout, text, Point::new(width + 50.0, y));
+            for (side, index) in [("左", left), ("右", right)] {
+                assert!(
+                    range.start <= index && index <= range.end,
+                    "第 {line_index} 行{side}侧越界的命中 {index} 必须落在该行范围 {range:?}"
+                );
+            }
+            left_hits.push(left);
+            right_hits.push(right);
+        }
+
+        // 中间行左右越界必须收敛到该行行首/行尾：若退化成「整段 0/len」，中间行会失守。
+        assert!(
+            left_hits
+                .iter()
+                .enumerate()
+                .any(|(index, &hit)| index + 1 < left_hits.len() && hit > 0),
+            "左侧越界不得全部收敛到整段 0：{left_hits:?}"
+        );
+        assert!(
+            right_hits
+                .iter()
+                .enumerate()
+                .any(|(index, &hit)| index + 1 < right_hits.len() && hit < text.len()),
+            "右侧越界不得全部收敛到整段 len：{right_hits:?}"
+        );
+    }
+
+    // ── bidi 命中（§11.5 测试要求：bidi 文本）─────────────────────────────
+    //
+    // 口径：命中点是 caret 的**精确边界 x**（`caret_rect(..).origin.x`），断言返回值与该点
+    // **共享视觉位置**（某个 affinity 的 caret x 相同）。不能用 `caret.center()`（+0.5px）：
+    // bidi 重排后同一视觉 x 可对应两个逻辑边界，+0.5px 会落进相邻 run，往返本身就无定义。
+
+    /// 指定段落基准方向的布局（bidi 用例需要显式 RTL/LTR 段落方向）。
+    fn layout_of_direction(
+        text: &str,
+        width: f32,
+        direction: parley::BaseDirection,
+    ) -> parley::Layout<ColorBrush> {
+        layout_of_direction_with_run(text, width, direction, 0..0)
+    }
+
+    /// 指定段落方向 + 一个额外 run（字号不同 ⇒ 切成两个 run）的布局。
+    fn layout_of_direction_with_run(
+        text: &str,
+        width: f32,
+        direction: parley::BaseDirection,
+        run: core::ops::Range<usize>,
+    ) -> parley::Layout<ColorBrush> {
+        let mut font_cx = parley::FontContext::new();
+        let mut layout_cx: parley::LayoutContext<ColorBrush> = parley::LayoutContext::new();
+        let mut builder = layout_cx.ranged_builder(&mut font_cx, text, 1.0, true);
+        builder.push_default(parley::StyleProperty::FontSize(16.0));
+        builder.push_default(parley::StyleProperty::Brush(ColorBrush::default()));
+        builder.set_base_direction(direction);
+        if !run.is_empty() {
+            builder.push(parley::StyleProperty::FontSize(20.0), run);
+        }
+        let mut layout = builder.build(text);
+        layout.break_all_lines(Some(width));
+        layout.align(
+            parley::Alignment::Start,
+            parley::AlignmentOptions::default(),
+        );
+        layout
+    }
+
+    /// 同一逻辑边界的两个视觉 caret x（bidi 边界上 Downstream/Upstream 可能落在不同 x）。
+    fn caret_xs(layout: &parley::Layout<ColorBrush>, byte_index: usize) -> [f32; 2] {
+        [parley::Affinity::Downstream, parley::Affinity::Upstream].map(|affinity| {
+            parley::editing::Cursor::from_byte_index(layout, byte_index, affinity)
+                .geometry(layout, 1.0)
+                .x0 as f32
+        })
+    }
+
+    /// 点在 caret 的精确边界 x：返回值必须是 char boundary，且与点共享视觉位置。
+    fn assert_exact_boundary_hit(
+        layout: &parley::Layout<ColorBrush>,
+        text: &str,
+        byte_index: usize,
+    ) {
+        let rect = caret_rect(layout, byte_index);
+        let point = Point::new(rect.origin.x, rect.origin.y + rect.size.height * 0.5);
+        let hit = byte_index_at(layout, text, point);
+        assert!(
+            text.is_char_boundary(hit),
+            "caret({byte_index}) 的命中 {hit} 不是 char boundary"
+        );
+        let xs = caret_xs(layout, hit);
+        assert!(
+            xs.iter().any(|x| (x - point.x).abs() <= 0.05),
+            "caret({byte_index}) 精确边界 x={} 的命中 {hit} 必须共享该视觉位置（caret x = {xs:?}）",
+            point.x
+        );
+    }
+
+    /// 纯 RTL 段落：bidi 重排后逻辑递增的字符视觉 x 递减；每个 caret 精确边界都能命中同一视觉位置。
+    #[test]
+    fn byte_index_at_handles_a_pure_rtl_paragraph() {
+        let text = "אבג abc";
+        let layout = layout_of_direction(text, 400.0, parley::BaseDirection::Rtl);
+        assert_eq!(layout.lines().count(), 1, "fixture 必须单行");
+        let x = |index: usize| caret_rect(&layout, index).origin.x;
+
+        // 希伯来簇（逻辑 0/2/4）在 RTL 段落里视觉反转：x(0) > x(2) > x(4)。
+        assert!(
+            x(0) > x(2) + 1.0 && x(2) > x(4) + 1.0,
+            "RTL 段落必须视觉反转：x = {:?}",
+            [x(0), x(2), x(4)]
+        );
+
+        for index in 0..=text.len() {
+            if text.is_char_boundary(index) {
+                assert_exact_boundary_hit(&layout, text, index);
+            }
+        }
+
+        // 段落末尾（视觉最左）的精确边界：命中必须落在末尾附近，而不是逻辑 0。
+        let last = caret_rect(&layout, text.len());
+        let hit = byte_index_at(
+            &layout,
+            text,
+            Point::new(last.origin.x, last.origin.y + last.size.height * 0.5),
+        );
+        assert!(
+            hit >= 6,
+            "RTL 段落视觉最左端必须命中逻辑末尾附近（不是 0），实际 {hit}"
+        );
+    }
+
+    /// LTR 段落内的 RTL run：run 内视觉反转，精确边界命中同一视觉位置。
+    #[test]
+    fn byte_index_at_handles_an_rtl_run_inside_an_ltr_paragraph() {
+        let text = "abc אבג xyz";
+        let layout = layout_of_direction(text, 400.0, parley::BaseDirection::Ltr);
+        assert_eq!(layout.lines().count(), 1, "fixture 必须单行");
+        let x = |index: usize| caret_rect(&layout, index).origin.x;
+
+        // 逻辑 4/6/8 是 RTL run 的簇起点：视觉 x 递减（run 内反转），且整段仍是单行。
+        assert!(
+            x(4) > x(6) + 1.0 && x(6) > x(8) + 1.0,
+            "LTR 段内的 RTL run 必须视觉反转：x = {:?}",
+            [x(4), x(6), x(8)]
+        );
+
+        for index in 0..=text.len() {
+            if text.is_char_boundary(index) {
+                assert_exact_boundary_hit(&layout, text, index);
+            }
+        }
+    }
+
+    /// RTL 跨 run：同一 RTL 段落切成两个 run，视觉顺序仍按 bidi 重排；命中按视觉位置而非 run 顺序。
+    #[test]
+    fn byte_index_at_handles_rtl_text_across_runs() {
+        let text = "אבגדהו";
+        // 两个 run（字号不同）：0..4 与 4..12 都是合法 char boundary。
+        let layout = layout_of_direction_with_run(text, 400.0, parley::BaseDirection::Rtl, 0..4);
+        assert_eq!(layout.lines().count(), 1, "fixture 必须单行");
+        let run_count = layout.lines().next().expect("单行").runs().count();
+        assert!(run_count >= 2, "fixture 必须切成多个 run，实际 {run_count}");
+        let x = |index: usize| caret_rect(&layout, index).origin.x;
+
+        // RTL 段落：逻辑递增 ⇒ 视觉 x 递减（跨 run 仍然成立）。
+        assert!(
+            x(0) > x(4) + 1.0 && x(4) > x(8) + 1.0 && x(8) > x(12) + 1.0,
+            "跨 run 的 RTL 段落必须视觉反转：x = {:?}",
+            [x(0), x(4), x(8), x(12)]
+        );
+
+        for index in 0..=text.len() {
+            if text.is_char_boundary(index) {
+                assert_exact_boundary_hit(&layout, text, index);
+            }
+        }
+
+        // 视觉右半（逻辑 0..4 的 run）的中间点必须命中该 run 的逻辑区间，而不是另一个 run。
+        let y = caret_center(&layout, 0).y;
+        let right_mid = Point::new((x(0) + x(4)) * 0.5, y);
+        let right_hit = byte_index_at(&layout, text, right_mid);
+        assert!(
+            right_hit <= 4,
+            "视觉右半必须命中逻辑 0..=4 的 run，实际 {right_hit}"
+        );
+        // 视觉左半（逻辑 4..12 的 run）同理。
+        let left_mid = Point::new((x(4) + x(12)) * 0.5, y);
+        let left_hit = byte_index_at(&layout, text, left_mid);
+        assert!(
+            left_hit >= 4,
+            "视觉左半必须命中逻辑 4..=12 的 run，实际 {left_hit}"
+        );
+    }
 }

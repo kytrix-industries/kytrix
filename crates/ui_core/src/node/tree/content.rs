@@ -505,7 +505,7 @@ pub(crate) fn text_byte_index_at(
     // 返回旧快照算出的索引会让应用把光标锚到错误的字符上。
     if tree.text_line(node).is_none()
         || shaped.text() != content.text.as_str()
-        || !shaped.same_shaping_inputs(&content.style)
+        || !shaped.same_shaping_inputs(&content.style, content.runs())
         || shaped.inline_boxes() != content.inline_boxes.as_ref()
     {
         return Err(EngineError::StaleNode { node });
