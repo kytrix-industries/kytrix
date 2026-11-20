@@ -115,7 +115,7 @@ use crate::{
             ime::ImeState,
             input, owner,
             presentation::PresentedOrder,
-            scroll::{ScrollAccum, ScrollAxis},
+            scroll::{ScrollAccum, ScrollAxis, ScrollSource},
             text_input::{self, ImeStateSnapshot, TextInputRoute},
             toplevel::{
                 self, DecorationMode, SizeConstraintState, ToplevelStates, Visibility,
@@ -437,10 +437,11 @@ pub(crate) struct WaylandState {
     /// 当前按下的键（用于合成重复）。顺序即按下顺序，释放时按 keycode 移除。
     held_keys: Vec<HeldKey>,
     /// 本帧尚未提交的滚轮累积（按 `wl_pointer.frame` 成批，P1-2.11）。
+    ///
+    /// 滚动源也在这里（[`ScrollAccum`] 持有）：`axis_source` 是**帧作用域**的，
+    /// `Frame` 结束时随累积一起复位成 `Unknown`（RB-10；见
+    /// [`crate::platform::wayland::scroll`] 模块文档）。
     scroll: ScrollAccum,
-    /// 当前滚动是否来自**触控板 / 手指**（`wl_pointer.axis_source = finger`，R02-10）：
-    /// 是 ⇒ 像素单位、连续阶段；否 ⇒ 行单位、离散滚轮。
-    scroll_finger: bool,
     /// 连续滚动手势是否进行中（`axis_source` 之后、`axis_stop` 之前）。
     scroll_active: bool,
     pointer_pos: Point,
@@ -551,7 +552,6 @@ impl WaylandState {
             key_repeat: KeyRepeat::default(),
             held_keys: Vec::new(),
             scroll: ScrollAccum::default(),
-            scroll_finger: false,
             scroll_active: false,
             pointer_pos: Point::new(0.0, 0.0),
             redraw: false,
@@ -2537,12 +2537,22 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 }
             }
             wl_pointer::Event::AxisSource { axis_source } => {
-                // R02-10：`axis_source` 区分「滚轮 / 手指 / 连续设备」——只有手指（触控板）才是
-                // 像素级 1:1 跟随 + 连续阶段；滚轮是离散行。
-                state.scroll_finger = matches!(
-                    axis_source,
-                    wayland_client::WEnum::Value(wl_pointer::AxisSource::Finger)
-                );
+                // R02-10 / RB-10：`axis_source` 区分「滚轮 / 手指 / 连续设备」。它只描述**本帧**
+                // 内 axis 事件的来源（协议：*"carries the source information for all events
+                // within that frame"*），帧结束时复位成 `Unknown`（见下面的 `Frame` 分支），
+                // 绝不做跨帧持久状态。`Unknown` 按滚轮处理（协议允许服务端不发该事件）。
+                let source = match axis_source {
+                    wayland_client::WEnum::Value(wl_pointer::AxisSource::Finger) => {
+                        ScrollSource::Finger
+                    }
+                    wayland_client::WEnum::Value(wl_pointer::AxisSource::Continuous) => {
+                        ScrollSource::Continuous
+                    }
+                    // `wheel_tilt`（v6+）是「横向倾斜的滚轮」：仍是离散格，按滚轮处理。
+                    wayland_client::WEnum::Value(_) => ScrollSource::Wheel,
+                    wayland_client::WEnum::Unknown(_) => ScrollSource::Unknown,
+                };
+                state.scroll.note_source(source);
             }
             wl_pointer::Event::Axis { axis, value, .. } => {
                 // 连续值（触控板即像素；v5 起滚轮一格 = 10 个单位）。**不能**除 120 ——
@@ -2558,6 +2568,21 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 };
                 state.scroll.note_continuous(axis, value as f32);
             }
+            wl_pointer::Event::AxisDiscrete { axis, discrete } => {
+                // v5–v7 服务端的离散步长：`discrete` 是**格数**（1 = 一格），协议保证它与同帧
+                // 的一条连续 `axis` 描述同一次物理滚动（*"coupled with exactly one axis
+                // event"*）。旧实现直接丢弃它 ⇒ 只能拿 `axis/10` 近似（mutter/wlroots 一格常
+                // 是 15 ⇒ 1.5 行，RB-10）。v8+ 由 `axis_value120` 取代（本分支不再到达）。
+                let axis = if matches!(
+                    axis,
+                    wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll)
+                ) {
+                    ScrollAxis::Horizontal
+                } else {
+                    ScrollAxis::Vertical
+                };
+                state.scroll.note_notches(axis, discrete);
+            }
             wl_pointer::Event::AxisValue120 { axis, value120 } => {
                 // v8+ 的高精度离散步长：1/120 行，与 Win32 的 `WHEEL_DELTA = 120` 同量纲。
                 // 它与同帧的连续 `axis` 是**同一次物理滚动**的两种表示，累积器按轴二选一
@@ -2570,11 +2595,15 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 } else {
                     ScrollAxis::Vertical
                 };
-                state.scroll.note_discrete(axis, value120);
+                state.scroll.note_value120(axis, value120);
             }
             wl_pointer::Event::AxisStop { .. } => {
                 // 一次连续手势结束：补一条 `phase = End` 的空增量事件，引擎据此结束惯性/动画
                 // （Chrome 的 `WebMouseWheelEvent.phase = kScrollPhaseEnded` 同义）。
+                //
+                // 单位取**本帧**的源：`axis_stop` 帧通常没有滚动分量（delta = 0 ⇒ 单位不影响
+                // 任何数值，阶段才是这条事件的语义）。源的复位由随后必到的 `Frame` 完成 ——
+                // 协议允许 `axis_stop` 与另一根轴的 `axis` 同帧，当场清源会把那条 axis 错判。
                 state.scroll_active = false;
                 if let Some(window) = state.pointer_window() {
                     state.events.push((
@@ -2582,7 +2611,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                         Event::Input(scroll_event(
                             state.pointer_pos,
                             (0.0, 0.0),
-                            state.scroll_finger,
+                            state.scroll.is_finger(),
                             ScrollPhase::End,
                             state.modifiers,
                         )),
@@ -2591,19 +2620,23 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
             }
             wl_pointer::Event::Frame => {
                 // 一次 frame = 一批同属一个逻辑输入的指针事件 ⇒ 只产出一个 Scroll。
-                // v8+ 服务端对滚轮会同时发连续 `axis` 与离散 `axis_value120`；两者是同一格
-                // 滚动的两种表示，`ScrollAccum` 按轴二选一（B8：相加会一格 = 两行）。
+                // v8+ 服务端对滚轮会同时发连续 `axis` 与离散 `axis_value120`；v5–v7 发
+                // `axis_discrete`；三者是同一格滚动的不同表示，`ScrollAccum` 按轴三选一
+                // （B8：相加会一格 = 两行；RB-10：v5–v7 的格数优先于近似换算）。
                 if !state.scroll.is_empty() {
-                    // 手指（触控板）：连续值就是像素增量，1:1 跟随；滚轮：换算成行。
-                    let (delta_x, delta_y) = if state.scroll_finger {
+                    // 手指（触控板）：连续值就是像素增量，1:1 跟随；其余（滚轮 / 未知源）：
+                    // 换算成行。源是**帧作用域**的：`axis_source` 只描述本帧，没有 source 的帧
+                    // 按滚轮处理（RB-10：手指手势之后的无 source 滚轮帧不得沿用 finger，那会
+                    // 造成约 10× 灵敏度）。
+                    let finger = state.scroll.is_finger();
+                    let (delta_x, delta_y) = if finger {
                         let (x, y) = state.scroll.finger_pixels();
                         (-x, -y)
                     } else {
                         let (x, y) = state.scroll.wheel_lines();
                         (-x, -y)
                     };
-                    state.scroll.clear();
-                    let phase = if state.scroll_finger {
+                    let phase = if finger {
                         let phase = if state.scroll_active {
                             ScrollPhase::Update
                         } else {
@@ -2620,13 +2653,17 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                             Event::Input(scroll_event(
                                 state.pointer_pos,
                                 (delta_x, delta_y),
-                                state.scroll_finger,
+                                finger,
                                 phase,
                                 state.modifiers,
                             )),
                         ));
                     }
                 }
+                // 帧结束：无论本帧有没有滚动分量都把源复位（协议：`axis_source` 只描述本帧；
+                // `axis_stop` 的复位也由这里覆盖）。空帧同样要清 —— 只带 `axis_source` 的帧
+                // 若不清，源会漏进下一帧，RB-10 的 10× 灵敏度就回来了。
+                state.scroll.clear();
             }
             wl_pointer::Event::Leave { .. } => {
                 // R10-3：离开时隐藏光标 —— 否则指针移到别的 surface 上时，compositor 会继续
