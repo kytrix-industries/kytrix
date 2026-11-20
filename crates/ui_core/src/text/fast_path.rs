@@ -1015,6 +1015,40 @@ mod tests {
         );
     }
 
+    /// RBA-02：`ShapedText::has_only_ltr_runs` 的 `Simple` 分支恒 `true` 依赖两个**真实前提**，
+    /// 这里给出可失败的不变量（不是对常量的断言）：
+    ///
+    /// 1. 快速路径构造前必过 [`eligibility`]，它拒绝 `TextDirection::Rtl`（否则 RTL 段落也会被
+    ///    当成单行 ASCII 走快速路径）；
+    /// 2. [`ALPHABET`] 不含强 RTL 字符 —— 这里断言全 ASCII（`R`/`AL` 类字符都不是 ASCII），
+    ///    且字符集整体在 `NoWrap` 下可命中（前提不被 `Wrap` / `Alphabet` 拒绝掩盖）。
+    ///
+    /// 变异守卫：给 `ALPHABET` 加一个 RTL 字母 ⇒ 第 2 条红；删掉 [`eligibility`] 的 `Rtl`
+    /// 拒绝 ⇒ 第 1 条红。
+    #[test]
+    fn eligibility_rejects_rtl_paragraphs_and_the_alphabet_has_only_ascii() {
+        let style = TextStyle::new(12.0).with_wrap(TextWrap::NoWrap);
+        assert_eq!(
+            eligibility("42150", &style.clone().with_direction(TextDirection::Rtl)),
+            Err(Ineligible::Rtl),
+            "Simple 快照只能由 eligibility 放行的样式构造：显式 Rtl 必须被拒绝"
+        );
+        let mut assembled = String::with_capacity(ALPHABET.len());
+        for character in ALPHABET {
+            assert!(
+                character.is_ascii(),
+                "快速路径字符集必须全是 ASCII（ASCII 里没有 R/AL 类，任何段落方向都不会形成 \
+                 RTL run）：ALPHABET 出现了 {character:?}"
+            );
+            assembled.push(character);
+        }
+        assert_eq!(
+            eligibility(&assembled, &style),
+            Ok(()),
+            "完整字符集在 NoWrap 下必须可命中（否则「全 LTR run」前提会被别的拒绝理由掩盖）"
+        );
+    }
+
     /// D-2 正确性自证：`unicode-linebreak`（UAX #14）的「文本内部有断行机会」必须与 parley
     /// 的实际断行行为一致（17² 有序对 + 真实行情样本）。否则「快速路径单行」与生产布局
     /// 会在某些字符组合上漂移。

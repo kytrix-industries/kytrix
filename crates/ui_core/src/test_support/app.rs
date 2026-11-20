@@ -1749,7 +1749,7 @@ mod p11_fix_tests {
             color::Color,
             style::{Clip, PaintSpec, Style},
         },
-        text::{TextDirection, TextStyle},
+        text::{TextAlign, TextDirection, TextStyle},
         window::FrameOutcome,
     };
 
@@ -2287,18 +2287,157 @@ mod p11_fix_tests {
         );
     }
 
-    /// E4b：`TextDirection::Auto`（未显式声明 LTR）时也**省略**字符度量 —— 方向由首个强方向
-    /// 字符决定，consumer 只处理单一 `text_direction`（D6-A），引擎不猜。
+    /// E4b：`TextDirection::Auto`（`TextStyle` 的默认值）**且解析后是 LTR** ⇒ 必须输出字符度量。
+    ///
+    /// 修复前按 `TextStyle.direction` 的**字面值**判（`!= Ltr` 就直接省略）：默认样式的应用
+    /// 与 demo 都拿不到 `character_positions`，读屏的字符级 caret 高亮 / 文本定位不可用
+    /// （Chromium `AXPlatformNodeTextRangeProvider` 与 Qt
+    /// `QAccessibleTextInterface::characterRect` 对文本域恒提供字符度量）。
+    ///
+    /// 两条 shape 路径各测一遍：`"Hello"`（parley，`Auto` 基准方向解析成 LTR）与 `"42150"`
+    /// （数字快速路径，`Simple` 快照）。
     #[test]
-    fn auto_direction_text_run_omits_character_metrics() {
+    fn auto_direction_text_run_exposes_character_metrics_for_ltr_text() {
+        for (text, caret_byte, position_index) in [("Hello", 2_usize, 2_usize), ("42150", 3, 3)] {
+            let mut app = TestApp::new();
+            app.enable_a11y_capture();
+            let window = app.window_id();
+            // `TextStyle::new` 的方向就是 `Auto`（不显式声明）。
+            let run = text_run_fixture(&mut app, text, TextStyle::new(20.0));
+            let _ = app.drain().expect("frame");
+            app.assert_a11y_contract();
+
+            let snapshot = app.a11y().expect("a11y delivery");
+            let record = snapshot.node_for(run).expect("text run record");
+            assert_eq!(record.role, A11yRole::TextRun);
+            assert_eq!(record.character_lengths, vec![1_u8, 1, 1, 1, 1], "{text:?}");
+            assert_eq!(
+                record.character_positions.len(),
+                record.character_lengths.len(),
+                "{text:?}：Auto + 纯 LTR 必须输出 character_positions"
+            );
+            assert_eq!(
+                record.character_widths.len(),
+                record.character_lengths.len(),
+                "{text:?}：Auto + 纯 LTR 必须输出 character_widths"
+            );
+            assert!(
+                record
+                    .character_positions
+                    .windows(2)
+                    .all(|pair| pair[0] <= pair[1]),
+                "{text:?}：LTR 位置必须单调：{:?}",
+                record.character_positions
+            );
+            assert!(
+                record.character_widths.iter().all(|width| *width > 0.0),
+                "{text:?}：每个 grapheme 的 advance 必须为正：{:?}",
+                record.character_widths
+            );
+
+            let update = app.a11y_update().expect("TreeUpdate").clone();
+            let ak = update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == accesskit::NodeId(record.id.get()))
+                .map(|(_, node)| node)
+                .expect("accesskit node");
+            assert_eq!(
+                ak.text_direction(),
+                Some(accesskit::TextDirection::LeftToRight),
+                "{text:?}：解析后是 LTR ⇒ text_direction 必须是 LeftToRight"
+            );
+            assert_eq!(
+                ak.character_positions(),
+                Some(record.character_positions.as_slice()),
+                "{text:?}"
+            );
+
+            // 与真实 caret 交叉验证：caret 物理 x − 节点 bounds 原点 == positions[i]。
+            let caret = app
+                .app()
+                .window(window)
+                .expect("window")
+                .text_caret_rect(run, caret_byte)
+                .expect("caret");
+            let bounds = app.probe().bounds(run).expect("bounds");
+            let scale = app.app().window(window).expect("window").scale().factor();
+            let expected = (caret.min().x - bounds.origin.x) * scale;
+            let actual = record.character_positions[position_index];
+            assert!(
+                (actual - expected).abs() <= 1.0,
+                "{text:?}：positions[{position_index}]={actual} 必须与真实 caret x={expected} 一致"
+            );
+        }
+    }
+
+    /// E4b：`Auto` + CJK/emoji（**非 ASCII**，但都是 LTR 强方向）⇒ 仍然输出字符度量 ——
+    /// 方向判定看解析结果，不是「非 ASCII 就不给」。
+    #[test]
+    fn auto_direction_cjk_text_run_exposes_character_metrics() {
         let mut app = TestApp::new();
         app.enable_a11y_capture();
-        let run = text_run_fixture(
-            &mut app,
-            "价🌍ab",
-            // 默认 `TextStyle::new` 的方向就是 `Auto`。
-            TextStyle::new(20.0),
+        let window = app.window_id();
+        let run = text_run_fixture(&mut app, "价🌍ab", TextStyle::new(20.0));
+        let _ = app.drain().expect("frame");
+        app.assert_a11y_contract();
+
+        let snapshot = app.a11y().expect("a11y delivery");
+        let record = snapshot.node_for(run).expect("text run record");
+        assert_eq!(
+            record.character_lengths,
+            vec![3_u8, 4, 1, 1],
+            "CJK/emoji 仍按 grapheme 计字节长度"
         );
+        assert_eq!(
+            record.character_positions.len(),
+            4,
+            "CJK 是 LTR 方向 ⇒ 必须输出 character_positions：{:?}",
+            record.character_positions
+        );
+        assert_eq!(
+            record.character_widths.len(),
+            4,
+            "CJK 是 LTR 方向 ⇒ 必须输出 character_widths：{:?}",
+            record.character_widths
+        );
+        assert!(
+            record
+                .character_positions
+                .windows(2)
+                .all(|pair| pair[0] <= pair[1]),
+            "LTR 位置必须单调：{:?}",
+            record.character_positions
+        );
+        assert!(
+            record.character_widths.iter().all(|width| *width > 0.0),
+            "CJK/emoji 的 advance 必须为正：{:?}",
+            record.character_widths
+        );
+        // 与真实 caret 交叉验证：第 2 个 grapheme（🌍）的起点 = 字节 3。
+        let caret = app
+            .app()
+            .window(window)
+            .expect("window")
+            .text_caret_rect(run, 3)
+            .expect("caret");
+        let bounds = app.probe().bounds(run).expect("bounds");
+        let scale = app.app().window(window).expect("window").scale().factor();
+        let expected = (caret.min().x - bounds.origin.x) * scale;
+        assert!(
+            (record.character_positions[1] - expected).abs() <= 1.0,
+            "positions[1]={} 必须与真实 caret x={expected} 一致",
+            record.character_positions[1]
+        );
+    }
+
+    /// E4b：`Auto` 但段落里出现 **RTL run** ⇒ 省略字符度量 —— 段内混排表达不了
+    /// （`character_positions` 只有一条 `text_direction` 轴，发出去会让 caret 命中错轴）。
+    #[test]
+    fn auto_direction_text_run_omits_character_metrics_when_a_run_is_rtl() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let run = text_run_fixture(&mut app, "abc אבג", TextStyle::new(20.0));
         let _ = app.drain().expect("frame");
         app.assert_a11y_contract();
         let snapshot = app.a11y().expect("a11y delivery");
@@ -2309,7 +2448,53 @@ mod p11_fix_tests {
         );
         assert!(
             record.character_positions.is_empty() && record.character_widths.is_empty(),
-            "方向为 Auto 时必须省略字符度量（不猜方向、不发错轴的值）"
+            "解析后含 RTL run ⇒ 必须省略位置/宽度（不猜单轴、不发错轴的值）：{:?} / {:?}",
+            record.character_positions,
+            record.character_widths
+        );
+        let update = app.a11y_update().expect("TreeUpdate").clone();
+        let ak = update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == accesskit::NodeId(record.id.get()))
+            .map(|(_, node)| node)
+            .expect("accesskit node");
+        assert!(
+            ak.character_positions().is_none()
+                && ak.character_widths().is_none()
+                && ak.text_direction().is_none(),
+            "省略时不得写 character_positions/widths/text_direction（AT 回退路径）"
+        );
+    }
+
+    /// E4b：显式 `TextDirection::Rtl` 仍**省略**字符度量（RTL 的 inline 轴与 AccessKit 的 LTR
+    /// 位置模型相反，D6-A；现状保持）。
+    #[test]
+    fn rtl_direction_text_run_omits_character_metrics() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let run = text_run_fixture(
+            &mut app,
+            "אבג",
+            TextStyle {
+                direction: TextDirection::Rtl,
+                ..TextStyle::new(20.0)
+            },
+        );
+        let _ = app.drain().expect("frame");
+        app.assert_a11y_contract();
+        let snapshot = app.a11y().expect("a11y delivery");
+        let record = snapshot.node_for(run).expect("text run record");
+        assert_eq!(
+            record.character_lengths,
+            vec![2_u8, 2, 2],
+            "希伯来字母每个 2 字节，仍是文本接口的输入"
+        );
+        assert!(
+            record.character_positions.is_empty() && record.character_widths.is_empty(),
+            "显式 RTL 必须省略位置/宽度：{:?} / {:?}",
+            record.character_positions,
+            record.character_widths
         );
     }
 
@@ -2373,6 +2558,132 @@ mod p11_fix_tests {
                 && ak.character_widths().is_none()
                 && ak.text_direction().is_none(),
             "RE-02：口径不一致时不得写 character_positions/widths/text_direction"
+        );
+    }
+
+    /// RBA-01：RE-02 守卫的**等长缺口** —— `A11yPatch::value` 覆盖成与 shape 文本**等字节长度、
+    /// 等 grapheme 数**但内容不同的字符串（`"ab"` → `"xy"`）时，`character_lengths` 描述 value 串、
+    /// 位置却只能描述已 shape 的 `"ab"` ⇒ 必须省略度量。
+    ///
+    /// 旧守卫只比「Σ character_lengths == 文本字节数」（2 == 2 ⇒ 通过），于是发出的是 `"ab"` 的
+    /// caret 表 —— AT 会把它当成 `"xy"` 的位置（整表错位）。修复前本用例红。
+    #[test]
+    fn an_equal_length_value_override_that_differs_from_the_shaped_text_omits_character_metrics() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let run = text_run_fixture(
+            &mut app,
+            "ab",
+            TextStyle {
+                direction: TextDirection::Ltr,
+                ..TextStyle::new(20.0)
+            },
+        );
+        let window = app.window_id();
+        app.app_mut()
+            .window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .set_a11y_patch(
+                run,
+                A11yPatch {
+                    value: Some(SmolStr::new_static("xy")),
+                    ..A11yPatch::default()
+                },
+            );
+        let _ = app.drain().expect("frame");
+        app.assert_a11y_contract();
+
+        let snapshot = app.a11y().expect("a11y delivery");
+        let record = snapshot.node_for(run).expect("text run record");
+        assert_eq!(
+            record.value.as_deref(),
+            Some("xy"),
+            "value 覆盖本身仍然生效"
+        );
+        assert_eq!(
+            record.character_lengths,
+            vec![1_u8, 1],
+            "character_lengths 仍按 value 串划分（AccessKit 的 Σ == value.len() 约束不变）"
+        );
+        assert!(
+            record.character_positions.is_empty() && record.character_widths.is_empty(),
+            "等长但内容不同的 value 覆盖同样必须省略位置/宽度（旧守卫只比字节总长会漏掉）：\
+             {:?} / {:?}",
+            record.character_positions,
+            record.character_widths
+        );
+        let update = app.a11y_update().expect("TreeUpdate").clone();
+        let ak = update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == accesskit::NodeId(record.id.get()))
+            .map(|(_, node)| node)
+            .expect("accesskit node");
+        assert!(
+            ak.character_positions().is_none()
+                && ak.character_widths().is_none()
+                && ak.text_direction().is_none(),
+            "RBA-01：等长口径不一致时不得写 character_positions/widths/text_direction"
+        );
+    }
+
+    /// RBA-03：单行判定的 **y 判据必须是承重的** —— `TextAlign::End` + 尾随硬换行时，末尾 caret
+    /// 的 x 恰好回到行尾（`delta == 0`，非负宽度守卫拦不住），只有「末尾 caret 与首个 grapheme
+    /// 起点同 y」能拦住第二行（空行）。逐 grapheme 的冗余 y 比较已删除。
+    ///
+    /// 修复前（删掉唯一的 y 判据）本用例红：会发出第二行的 caret（AT 的位置模型忽略 y）。
+    #[test]
+    fn end_aligned_text_with_a_trailing_line_break_omits_character_metrics() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let run = text_run_fixture(
+            &mut app,
+            "abc\n",
+            TextStyle {
+                direction: TextDirection::Ltr,
+                alignment: TextAlign::End,
+                ..TextStyle::new(20.0)
+            },
+        );
+        let _ = app.drain().expect("frame");
+        app.assert_a11y_contract();
+        let snapshot = app.a11y().expect("a11y delivery");
+        let record = snapshot.node_for(run).expect("text run record");
+        assert_eq!(
+            record.character_lengths,
+            vec![1_u8, 1, 1, 1],
+            "文本接口本身仍可用（含换行符的 grapheme）"
+        );
+        assert!(
+            record.character_positions.is_empty() && record.character_widths.is_empty(),
+            "尾随硬换行 ⇒ 两行 ⇒ 必须省略位置/宽度（End 对齐下宽度守卫拦不住）：{:?} / {:?}",
+            record.character_positions,
+            record.character_widths
+        );
+    }
+
+    /// RBA-04：`Auto` + **纯 RTL** 文本（首个强方向字符就是 RTL，段落解析成 RTL）⇒ 省略度量。
+    /// 与混排用例一起覆盖 `has_only_ltr_runs() == false` 的两条主路径。
+    #[test]
+    fn auto_direction_pure_rtl_text_run_omits_character_metrics() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let run = text_run_fixture(&mut app, "אבג", TextStyle::new(20.0));
+        let _ = app.drain().expect("frame");
+        app.assert_a11y_contract();
+        let snapshot = app.a11y().expect("a11y delivery");
+        let record = snapshot.node_for(run).expect("text run record");
+        assert_eq!(
+            record.character_lengths,
+            vec![2_u8, 2, 2],
+            "希伯来字母每个 2 字节，文本接口本身可用"
+        );
+        assert!(
+            record.character_positions.is_empty() && record.character_widths.is_empty(),
+            "Auto + 纯 RTL ⇒ 解析后不是 LTR ⇒ 必须省略位置/宽度：{:?} / {:?}",
+            record.character_positions,
+            record.character_widths
         );
     }
 

@@ -88,21 +88,29 @@ pub(crate) fn selection(lengths: &[u8], selection: A11yTextSelection) -> A11yTex
 /// 用 `point.x - bounds.x0` 对比 `character_positions`，见 `accesskit_consumer::text` 的
 /// `character_index_at_point`），宽度是同一 grapheme 的 advance。数组长度 == `lengths.len()`。
 ///
+/// `value` 是节点 a11y 侧的可访问值（`character_lengths` 就是按它划分的），`lengths` 是它的
+/// grapheme 字节长度表（调用方已算好）；`content.text` 是**已 shape 的真实文本**。
+///
 /// **只在能正确表达时返回**（否则 `None` ⇒ AT 回退到无 caret 高亮，绝不发错值）：
-/// - **文本口径一致**：`Σ character_lengths == content.text.len()`。`character_lengths` 来自
-///   节点 a11y `value`（可被 `A11yPatch::value` 覆盖），位置来自**已 shape 的真实文本**；
-///   两者不一致（TextRun 上覆盖了 value）时描述的是两串不同文本，输出位置就是错位的 caret
-///   表（RE-02：重复位置 + 零宽尾部），因此省略；
+/// - **文本口径一致**：`value` 与 `content.text` **逐字节相同**。`value` 可被
+///   `A11yPatch::value` 覆盖，位置却只能来自已 shape 的文本；两者描述不同字符串时，输出位置就是
+///   错位的 caret 表 —— 长度不同时是「重复位置 + 零宽尾部」，**等长但内容不同**时是整表错位
+///   （RBA-01：只比字节总长拦不住这种覆盖）；
 /// - `TextRun` 已被 shape 且与当前文本一致：直接复用 `NodeTree::text_caret_rect` 的**全部**
 ///   输入校验（`text == shaped.text`、`same_shaping_inputs`、行内盒一致、laid 宽度 == 期望宽度、
 ///   byte 在 char boundary）—— 与 `apply` 用的是同一份真值，不会读到半新半旧的 shape；
-/// - **显式 LTR**：`Auto` 需要逐段方向判定、RTL 的 inline 轴方向相反，而 consumer 只处理单一
-///   `text_direction`（D6-A）；
-/// - **单行**：所有 grapheme 起点 + 末尾 caret 必须落在同一 y（软换行/硬换行都会让 y 变化；
-///   AccessKit 的位置模型忽略 y，多行发出去会命中错行）。
+/// - **解析后是 LTR**：consumer 只处理单一 `text_direction`，RTL 的 inline 轴方向相反（D6-A）。
+///   判定按**解析后**的结果（[`ShapedText::has_only_ltr_runs`]）而不是 `TextStyle.direction`
+///   的字面值 —— 后者默认是 `Auto`（`TextStyle::new` / `Default`），按字面值判会让默认样式的
+///   应用永远拿不到 caret 度量（Chromium `AXPlatformNodeTextRangeProvider` 与 Qt
+///   `QAccessibleTextInterface::characterRect` 对文本域恒提供字符度量）；
+/// - **单行**：末尾 caret 必须与首个 grapheme 起点同 y（见函数内注释：caret 的 y 随行单调不降，
+///   所以这一条等价于「全文单行」；软换行/硬换行都会让 y 变化，而 AccessKit 的位置模型忽略 y，
+///   多行发出去会命中错行）。
 pub(crate) fn character_metrics(
     tree: &NodeTree,
     node: NodeId,
+    value: &str,
     lengths: &[u8],
     scale: Scale,
 ) -> Option<(Vec<f32>, Vec<f32>)> {
@@ -110,43 +118,51 @@ pub(crate) fn character_metrics(
         return None;
     }
     let content = tree.text_content(node)?;
-    // RE-02：`character_lengths` 来自节点的 a11y `value`（`A11yPatch::value` 可覆盖），而位置是用
-    // **已 shape 的真实文本** `content.text` 算的。TextRun 上覆盖出不同的 value 时，两者描述的是
-    // 两串不同文本 —— 此时发出位置就是「错位的 caret 表」（实测会得到重复位置 + 零宽尾部）。
-    // 只在 Σlengths == 真实文本字节数时输出，否则省略（AT 回退）。
-    let described_bytes: usize = lengths.iter().map(|len| usize::from(*len)).sum();
-    if described_bytes != content.text.len() {
-        return None;
-    }
-    if content.style.direction != TextDirection::Ltr {
+    // RE-02 + RBA-01：`character_lengths` 按 a11y `value` 划分，位置只能按**已 shape 的真实文本**
+    // `content.text` 算。两者必须是同一串文本（逐字节相等），否则 AT 拿到的 caret 表描述的是另一
+    // 串字符：长度不同 ⇒ 重复位置 + 零宽尾部；等长但内容不同 ⇒ 整表错位（旧守卫只比字节总长，
+    // 漏掉后者）。不一致时省略（AT 回退），绝不发近似值。
+    if value != content.text.as_str() {
         return None;
     }
     let slot = tree.text_slot(node)?;
+    let shaped = slot.shaped();
+    // E4b：方向按**解析后**的段落方向判定（`TextStyle.direction` 默认 `Auto`，按字面值判会让
+    // 默认样式的应用永远不输出字符度量）：
+    // - `Ltr`：显式声明，恒可表达；
+    // - `Rtl`：inline 轴方向与 AccessKit 的 LTR 位置模型相反，不输出（D6-A）；
+    // - `Auto`：问已 shape 的快照解析出的实际方向 —— 全 LTR run 才输出。
+    let direction_is_ltr = match content.style.direction {
+        TextDirection::Ltr => true,
+        TextDirection::Rtl => false,
+        TextDirection::Auto => shaped.has_only_ltr_runs(),
+    };
+    if !direction_is_ltr {
+        return None;
+    }
     // 完整输入校验（失败 = 文本/样式/宽度与上次 shape 不一致，等文本 pass 之后再来）。
     tree.text_caret_rect(node, 0).ok()?;
-    let shaped = slot.shaped();
     let width = f32::from_bits(slot.laid_width_bits());
     let alignment = content.style.alignment;
     let scale_factor = scale.factor();
     let content_x = tree.content_offset(node).x;
 
+    // 单行判定的**唯一** y 判据：末尾 caret 与首个 grapheme 起点同 y。caret 的 y 随字节位置在行内
+    // 恒定、跨行单调不降，且末尾 caret 必落在最后一行 ⇒「同一 y」即「全文单行」（含尾随硬换行产生
+    // 的空行）。刻意不再逐 grapheme 比较 y（那是这里的冗余副本）：`TextAlign::End` + 尾随换行时
+    // 末尾 caret 的 x 刚好回到行尾（delta 0），只有 y 能拦住第二行 —— 见
+    // `end_aligned_text_with_a_trailing_line_break_omits_character_metrics`。
+    let first_y = shaped.caret_rect(width, alignment, 0).min().y;
     let mut positions = Vec::with_capacity(lengths.len());
     let mut byte = 0usize;
-    let mut line_y: Option<f32> = None;
     for len in lengths {
         let rect = shaped.caret_rect(width, alignment, byte);
-        let y = rect.min().y;
-        match line_y {
-            None => line_y = Some(y),
-            Some(expected) if expected != y => return None,
-            Some(_) => {}
-        }
         positions.push((content_x + rect.min().x) * scale_factor);
         byte += usize::from(*len);
     }
-    // 末尾 caret 参与单行判定，并提供最后一个 grapheme 的 advance。
+    // 末尾 caret 既提供单行判定，也提供最后一个 grapheme 的 advance。
     let end = shaped.caret_rect(width, alignment, byte);
-    if Some(end.min().y) != line_y {
+    if end.min().y != first_y {
         return None;
     }
     positions.push((content_x + end.min().x) * scale_factor);
