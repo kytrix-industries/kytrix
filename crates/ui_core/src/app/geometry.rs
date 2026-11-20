@@ -1158,10 +1158,26 @@ mod tests {
         );
         clear_dirty(&mut app);
 
-        // 换成只画第二块；画布 bounds 收缩到新 range 的可见块 AABB（Canvas 契约：
-        // bounds ⊇ 内部图元 bounds）。首帧画布是 40×40 ⇒ 旧侧区域（y < 64）只能由
-        // 「旧画布 AABB」这一侧 damage 覆盖，所以下面的旧侧断言能钉住旧∪新的并集。
+        // 中间帧：把画布 bounds 扩到整份几何（64×100；节点盒只有 40×40）。这样下一步收缩
+        // range 时，「旧画布 AABB」里节点盒之外的部分（如 y = 50）只能由旧侧 damage 覆盖——
+        // 下面的旧侧断言因此对「删除旧画布 damage」的变异敏感（节点盒 damage 覆盖不到 y = 50）。
         let window = app.window_id();
+        let mut wide = Canvas::new(Rect::new(0.0, 0.0, 64.0, 100.0));
+        wide.push_geometry(GeometryDraw::full(id, Transform::IDENTITY, Color::WHITE));
+        assert!(
+            app.app_mut()
+                .window_mut(window)
+                .expect("窗口存在")
+                .set_canvas(node, wide)
+                .expect("窗口存在"),
+            "Canvas 内容必须替换成功"
+        );
+        let record = app.drain().expect("画布扩展帧");
+        assert!(record.rendered, "画布扩展必须提交一帧");
+        clear_dirty(&mut app);
+
+        // 换成只画第二块；画布 bounds 收缩到新 range 的可见块 AABB（Canvas 契约：
+        // bounds ⊇ 内部图元 bounds）。旧侧区域（y = 50，见上）只能由旧画布 AABB 覆盖。
         let visible_bounds = Rect::new(0.0, 64.0, 10.0, 1.0);
         let mut canvas = Canvas::new(visible_bounds);
         canvas.push_geometry(GeometryDraw {
@@ -1187,8 +1203,8 @@ mod tests {
             record.damage
         );
         assert!(
-            damage_hits(&record.damage, 5.0, 5.0),
-            "旧画布 AABB（缩小的新画布不覆盖的部分）必须进 damage（旧 ∪ 新）：{:?}",
+            damage_hits(&record.damage, 5.0, 50.0),
+            "旧画布 AABB（新画布/节点盒之外的部分）必须进 damage（旧 ∪ 新）：{:?}",
             record.damage
         );
         assert_eq!(
