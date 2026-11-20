@@ -90,12 +90,17 @@ pub(crate) struct AtlasArraySpec {
     pub layers: u32,
 }
 
-/// 一次图集 array 重建请求：三端 `SharedGpu::rebuild_atlas_pages` 的唯一入口。
+/// 一次图集 array 重建请求：Windows / Linux `SharedGpu::rebuild_atlas_pages` 的唯一入口。
 ///
 /// 调用方（每窗口上传器）在待上传层与当前共享 array 的 `spec` 不一致时产出请求：
 /// - 页边长变化（字形页扩容阶梯 / App 换代）⇒ 换成新页尺寸；
 /// - **层数增长**（图片图集开了新页）⇒ 换成更多层，旧层内容由 App 的整层重传补齐
 ///   （增长帧每个已打开页都会整页上传，见 `App::upload_image_page`）。
+///
+/// macOS 的图集数组是**每窗口一份**（`AtlasTextures`），`prepare` 直接按 [`AtlasArraySpec`]
+/// 比对即可，没有「进程级重建请求」这一层，因此本类型与 [`merge_page_request`] 只在
+/// Windows / Linux 编译。
+#[cfg(any(windows, target_os = "linux"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AtlasPageRequest {
     pub kind: AtlasKind,
@@ -105,8 +110,9 @@ pub(crate) struct AtlasPageRequest {
 
 /// 合并一条 array 重建请求：同一 kind 只留一条，层数取最大（层数只增不减）。
 ///
-/// 三端上传器的 `reconcile_pages` 共用这一段判据：同一图集的多个待上传层会各自产出请求
-/// （同一页边长、不同层数），重建只需要一次，且必须按最大的层数建数组。
+/// Windows / Linux 上传器的 `reconcile_pages` 共用这一段判据：同一图集的多个待上传层会各自
+/// 产出请求（同一页边长、不同层数），重建只需要一次，且必须按最大的层数建数组。
+#[cfg(any(windows, target_os = "linux"))]
 pub(crate) fn merge_page_request(
     requests: &mut Vec<AtlasPageRequest>,
     kind: AtlasKind,

@@ -1115,8 +1115,9 @@ impl Window {
     pub(crate) fn image_page_received(&self) -> bool {
         surface::image_page_received(self)
     }
-    /// 图片图集在本窗口已建立的 array 规格（测试诊断：层数 = 当前打开的图集页数）。
-    #[cfg(test)]
+    /// 图片图集在本窗口已建立的 array 规格（测试诊断：层数 = 当前打开的图集页数；仅 Windows 的
+    /// 离屏 App 测试消费，其它平台的 cfg 构建不编译它）。
+    #[cfg(all(test, windows))]
     pub(crate) fn image_array_spec(&self) -> Option<crate::render::AtlasArraySpec> {
         self.image_page_received
     }

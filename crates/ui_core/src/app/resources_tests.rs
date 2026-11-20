@@ -1,4 +1,7 @@
 use super::App;
+// 只有 Windows 的离屏上传测试用得到 array 规格（其它平台没有离屏 App 渲染器）。
+#[cfg(windows)]
+use crate::render::AtlasArraySpec;
 use crate::{
     math::{Rect, Size},
     node::{builder::NodeBuilder, dirty::DirtyFlags},
@@ -9,7 +12,6 @@ use crate::{
         primitive::{Image, Primitive},
         style::PaintSpec,
     },
-    render::AtlasArraySpec,
     resources::{DecodeState, ResourceImage},
     window::{WindowId, WindowOptions},
 };
@@ -44,7 +46,8 @@ fn png_rgba(rgba: [u8; 4]) -> Vec<u8> {
     out.into_inner()
 }
 
-/// 字形图集的 array 规格（恒 1 层）。
+/// 字形图集的 array 规格（恒 1 层）。只在 Windows 的离屏 App 上传测试里用。
+#[cfg(windows)]
 fn glyph_spec(page: u32) -> AtlasArraySpec {
     AtlasArraySpec { page, layers: 1 }
 }

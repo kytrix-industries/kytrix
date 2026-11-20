@@ -79,16 +79,6 @@ struct AtlasTexture {
     pending: Vec<Option<PendingUpload>>,
 }
 
-impl AtlasTexture {
-    /// 该数组的当前规格（页边长 + 层数）—— 上传器对齐 / 重建判据。
-    fn spec(&self) -> crate::render::AtlasArraySpec {
-        crate::render::AtlasArraySpec {
-            page: self.page,
-            layers: self.layers,
-        }
-    }
-}
-
 /// 每 in-flight 槽一块常驻 staging（`StorageModeShared`，CPU 直接写）。
 struct StagingBuffer {
     buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -265,6 +255,14 @@ impl AtlasTextures {
 }
 
 impl AtlasTexture {
+    /// 该数组的当前规格（页边长 + 层数）—— 上传器对齐 / 重建判据。
+    fn spec(&self) -> crate::render::AtlasArraySpec {
+        crate::render::AtlasArraySpec {
+            page: self.page,
+            layers: self.layers,
+        }
+    }
+
     fn new(device: &mut Device, kind: AtlasKind) -> Result<Self, EngineError> {
         let placeholder = crate::render::AtlasArraySpec {
             page: PLACEHOLDER_PAGE,
