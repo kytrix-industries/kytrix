@@ -463,11 +463,45 @@ impl AtlasUploads {
     pub(crate) fn reconcile_pages(
         &mut self,
         current: [crate::render::AtlasArraySpec; 2],
-    ) -> Vec<AtlasPageRequest> {
+    ) -> Result<Vec<AtlasPageRequest>, EngineError> {
         let mut rebuild: Vec<AtlasPageRequest> = Vec::with_capacity(2);
         for kind in [AtlasKind::Glyph, AtlasKind::Image] {
             let index = kind.index() as usize;
             let current = current[index];
+            // fail-closed（RBT-01 不变量 2）：扩层请求必须每一层都带整页上传（扩层会重建整个
+            // 数组，旧层内容全部作废）；否则 release 也拒绝这一帧的重建，绝不让半成品层进 draw。
+            let pending_spec = self.pending[index]
+                .iter()
+                .flatten()
+                .map(|pending| pending.spec)
+                .fold(None, |acc: Option<crate::render::AtlasArraySpec>, spec| {
+                    Some(match acc {
+                        Some(acc) => crate::render::AtlasArraySpec {
+                            page: spec.page,
+                            layers: acc.layers.max(spec.layers),
+                        },
+                        None => spec,
+                    })
+                });
+            if let Some(pending_spec) = pending_spec
+                && pending_spec.layers > current.layers
+            {
+                for layer in 0..pending_spec.layers {
+                    let full = self.pending[index]
+                        .get(layer as usize)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|pending| {
+                            pending.spec.page == pending_spec.page && pending.covers_full_page()
+                        });
+                    if !full {
+                        return Err(EngineError::AtlasGrowthIncomplete {
+                            kind,
+                            layer: u16::try_from(layer).unwrap_or(u16::MAX),
+                            layers: pending_spec.layers,
+                        });
+                    }
+                }
+            }
             for layer in 0..self.pending[index].len() {
                 let Some(pending) = &self.pending[index][layer] else {
                     continue;
@@ -494,9 +528,8 @@ impl AtlasUploads {
                 }
             }
         }
-        rebuild
+        Ok(rebuild)
     }
-
     /// 在本帧命令缓冲里录制全部待上传层（每层 = staging 写入 + 逐区间
     /// `cmd_copy_buffer_to_image`）。
     ///
@@ -1169,7 +1202,9 @@ mod tests {
             full_rects(),
         );
         assert_eq!(
-            uploads.reconcile_pages([spec(1, 1), spec(1, 1)]),
+            uploads
+                .reconcile_pages([spec(1, 1), spec(1, 1)])
+                .expect("reconcile pages"),
             vec![request(AtlasKind::Glyph, 64, 1)]
         );
         assert!(uploads.pending(AtlasKind::Glyph), "新页要留到重建之后上传");
@@ -1187,6 +1222,7 @@ mod tests {
         assert!(
             uploads
                 .reconcile_pages([spec(128, 1), spec(1, 1)])
+                .expect("reconcile pages")
                 .is_empty()
         );
         assert!(!uploads.pending(AtlasKind::Glyph), "旧整页必须丢弃");
@@ -1204,6 +1240,7 @@ mod tests {
         assert!(
             uploads
                 .reconcile_pages([spec(128, 1), spec(1, 1)])
+                .expect("reconcile pages")
                 .is_empty()
         );
         assert!(!uploads.pending(AtlasKind::Glyph), "旧增量必须丢弃");
@@ -1221,6 +1258,7 @@ mod tests {
         assert!(
             uploads
                 .reconcile_pages([spec(64, 1), spec(1, 1)])
+                .expect("reconcile pages")
                 .is_empty()
         );
         assert!(uploads.pending(AtlasKind::Glyph), "页对齐的增量要保留");
@@ -1241,7 +1279,9 @@ mod tests {
             );
         }
         assert_eq!(
-            uploads.reconcile_pages([spec(1, 1), spec(1, 1)]),
+            uploads
+                .reconcile_pages([spec(1, 1), spec(1, 1)])
+                .expect("reconcile pages"),
             vec![request(AtlasKind::Image, TEST_PAGE, 4)],
             "按 extent 去重：数组只有一次重建，且层数取最大值"
         );
@@ -1287,10 +1327,12 @@ mod tests {
             page(),
             full_rects(),
         );
-        let rebuild = uploads.reconcile_pages([
-            gpu.atlas().spec(AtlasKind::Glyph),
-            gpu.atlas().spec(AtlasKind::Image),
-        ]);
+        let rebuild = uploads
+            .reconcile_pages([
+                gpu.atlas().spec(AtlasKind::Glyph),
+                gpu.atlas().spec(AtlasKind::Image),
+            ])
+            .expect("reconcile pages");
         assert_eq!(rebuild, vec![request(AtlasKind::Image, TEST_PAGE, 1)]);
         gpu.rebuild_atlas_pages(&rebuild)
             .expect("rebuild image page");
@@ -1390,10 +1432,12 @@ mod tests {
             page(),
             full_rects(),
         );
-        let rebuild = uploads.reconcile_pages([
-            gpu.atlas().spec(AtlasKind::Glyph),
-            gpu.atlas().spec(AtlasKind::Image),
-        ]);
+        let rebuild = uploads
+            .reconcile_pages([
+                gpu.atlas().spec(AtlasKind::Glyph),
+                gpu.atlas().spec(AtlasKind::Image),
+            ])
+            .expect("reconcile pages");
         gpu.rebuild_atlas_pages(&rebuild)
             .expect("rebuild image page");
         begin(&gpu, commands[0]);
@@ -1495,10 +1539,12 @@ mod tests {
                 full_rects(),
             );
         }
-        let rebuild = uploads.reconcile_pages([
-            gpu.atlas().spec(AtlasKind::Glyph),
-            gpu.atlas().spec(AtlasKind::Image),
-        ]);
+        let rebuild = uploads
+            .reconcile_pages([
+                gpu.atlas().spec(AtlasKind::Glyph),
+                gpu.atlas().spec(AtlasKind::Image),
+            ])
+            .expect("reconcile pages");
         assert_eq!(
             rebuild,
             vec![request(AtlasKind::Image, TEST_PAGE, 4)],
@@ -1568,10 +1614,12 @@ mod tests {
             fill(LAYER_ZERO),
             full_rects(),
         );
-        let rebuild = uploads.reconcile_pages([
-            gpu.atlas().spec(AtlasKind::Glyph),
-            gpu.atlas().spec(AtlasKind::Image),
-        ]);
+        let rebuild = uploads
+            .reconcile_pages([
+                gpu.atlas().spec(AtlasKind::Glyph),
+                gpu.atlas().spec(AtlasKind::Image),
+            ])
+            .expect("reconcile pages");
         assert_eq!(rebuild, vec![request(AtlasKind::Image, TEST_PAGE, 1)]);
         gpu.rebuild_atlas_pages(&rebuild)
             .expect("rebuild image page");
@@ -1600,10 +1648,12 @@ mod tests {
                 full_rects(),
             );
         }
-        let rebuild = uploads.reconcile_pages([
-            gpu.atlas().spec(AtlasKind::Glyph),
-            gpu.atlas().spec(AtlasKind::Image),
-        ]);
+        let rebuild = uploads
+            .reconcile_pages([
+                gpu.atlas().spec(AtlasKind::Glyph),
+                gpu.atlas().spec(AtlasKind::Image),
+            ])
+            .expect("reconcile pages");
         assert_eq!(
             rebuild,
             vec![request(AtlasKind::Image, TEST_PAGE, 2)],
@@ -1661,10 +1711,12 @@ mod tests {
             first,
             full_rects(),
         );
-        let rebuild = uploads.reconcile_pages([
-            gpu.atlas().spec(AtlasKind::Glyph),
-            gpu.atlas().spec(AtlasKind::Image),
-        ]);
+        let rebuild = uploads
+            .reconcile_pages([
+                gpu.atlas().spec(AtlasKind::Glyph),
+                gpu.atlas().spec(AtlasKind::Image),
+            ])
+            .expect("reconcile pages");
         gpu.rebuild_atlas_pages(&rebuild)
             .expect("rebuild image page");
         begin(&gpu, commands[0]);

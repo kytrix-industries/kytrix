@@ -769,6 +769,24 @@ impl InstanceBuffer {
         self.used
     }
 
+    /// 仅测试 / 诊断：本帧**存活**实例里图片图元引用的 texture array 层号（升序，含重复）。
+    ///
+    /// 消费者：fail-closed 回归测试（RBT-01 不变量 1 —— 「扩层未建立时不得有任何 Image draw
+    /// 引用新层，旧层照画」）。空洞与已释放段不参与（实例环里它们的字节是垃圾）。
+    #[cfg(test)]
+    pub(crate) fn image_layers(&self) -> Vec<u16> {
+        let mut layers = Vec::new();
+        for segment in self.segments.iter().flatten() {
+            for instance in &self.instances[segment.start as usize..segment.end as usize] {
+                if instance.params1[2] == KIND_IMAGE {
+                    layers.push(instance.params1[1] as u16);
+                }
+            }
+        }
+        layers.sort_unstable();
+        layers
+    }
+
     /// `GpuPrimitive` 数组的字节视图（P02 §8.1 的 128 B 布局；全量载荷的上传源）。
     pub(crate) fn as_bytes(&self) -> &[u8] {
         bytemuck::cast_slice(&self.instances)
@@ -1135,6 +1153,13 @@ pub(crate) struct InstanceEncoder {
     /// 走增量快路径的帧数（仅测试：守住「快路径没被悄悄关掉」这条性能不变量）。
     #[cfg(test)]
     fast_encodes: u32,
+    /// 本帧图片图集**可画层数上限**（fail-closed，RBT-01 不变量 1）：`Image` 图元引用的
+    /// texture array 层号 `>=` 它时**不产出实例**（不画占位、不画错层）。
+    ///
+    /// 生产者是 `App::upload_image_page` 的逐窗口记账（`Window::image_drawable_layers`），
+    /// 经 `SceneDelta` 送到合成端；没有 App 图集记账的驱动（快照 / `Window::frame`）保持
+    /// `u32::MAX` = 不过滤（它们自己整份上传，层数上限仍由 `MAX_IMAGE_PAGES` 兜底）。
+    image_layers: u32,
 }
 
 impl InstanceEncoder {
@@ -1154,9 +1179,19 @@ impl InstanceEncoder {
             reused_segments: 0,
             written_bytes: 0,
             primed: false,
+            image_layers: u32::MAX,
             #[cfg(test)]
             fast_encodes: 0,
         }
+    }
+
+    /// 设置本帧图片图集可画层数上限（fail-closed，RBT-01 不变量 1）。
+    ///
+    /// 消费者：`render::compose::WindowComposer::compose`（每帧从 `SceneDelta` 取 App 的逐窗口
+    /// 记账）。上限变小/变大都会让受影响 lane 的实例内容变化 —— 合成端在**上限变化的那一帧**
+    /// 强制整帧重编码 + 全量载荷（见 `compose` 的 `limit_changed`），所以这里不需要自己通知。
+    pub(crate) fn set_image_layers(&mut self, layers: u32) {
+        self.image_layers = layers;
     }
 
     /// 编码整帧（增量：只重编码版本变化的 lane）。消费者：`Window::paint_frame`。
@@ -1232,6 +1267,7 @@ impl InstanceEncoder {
             colors,
             scratch,
             scratch_parts,
+            image_layers,
             encoded_lanes,
             encoded_geometry_chunks,
             reused_segments,
@@ -1288,6 +1324,7 @@ impl InstanceEncoder {
                         chunk_scope: geometry_chunk,
                         emitted_geometry_chunks: 0,
                         run_start: 0,
+                        image_layers: *image_layers,
                     };
                     lane.encode_lane(primitives, geometry_chunk)?;
                     *encoded_geometry_chunks += lane.emitted_geometry_chunks;
@@ -1392,6 +1429,7 @@ impl InstanceEncoder {
                 colors,
                 scratch,
                 scratch_parts,
+                image_layers,
                 encoded_lanes,
                 encoded_geometry_chunks,
                 written_bytes,
@@ -1450,6 +1488,7 @@ impl InstanceEncoder {
                         chunk_scope: geometry_chunk,
                         emitted_geometry_chunks: 0,
                         run_start: 0,
+                        image_layers: *image_layers,
                     };
                     lane.encode_lane(primitives, geometry_chunk)?;
                     *encoded_geometry_chunks += lane.emitted_geometry_chunks;
@@ -1983,6 +2022,8 @@ struct LaneEncoder<'a> {
     /// 本 lane 编码出的几何块 op 数（编码完成后由调用方累进 `InstanceEncoder`）。
     emitted_geometry_chunks: usize,
     run_start: usize,
+    /// 本帧图片图集可画层数上限（fail-closed，RBT-01 不变量 1；来自 `InstanceEncoder`）。
+    image_layers: u32,
 }
 
 impl LaneEncoder<'_> {
@@ -2408,6 +2449,12 @@ impl LaneEncoder<'_> {
             "image tile page {} out of range (MAX_IMAGE_PAGES={MAX_IMAGE_PAGES})",
             image.tile.page
         );
+        // fail-closed（RBT-01 不变量 1）：本帧数组里**还没有确定内容**的层不画 —— 不画占位、
+        // 不画错层。上限来自 App 的逐窗口图集记账（`Window::image_drawable_layers`），
+        // 与「所有窗口都整组入队才推进数组」是同一条不变量；这里不是常量判据。
+        if u32::from(image.tile.page) >= self.image_layers {
+            return;
+        }
         let page = image.tile.page.min(MAX_IMAGE_PAGES - 1);
         let physical = image.bounds.to_physical(self.scale);
         let color0 = self.colors.resolve(&self.resolver, image.modulation);

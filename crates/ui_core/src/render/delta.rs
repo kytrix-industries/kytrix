@@ -111,6 +111,12 @@ pub(crate) struct SceneDelta {
     pub geometries: Vec<(GeometryId, Arc<crate::paint::geometry::GeometrySnapshot>)>,
     /// 是否整帧重建（首帧 / DPI 变化 / 裁剪表重建）：合成线程会重置 lane 表与编码器。
     pub full: bool,
+    /// 本帧**可画的图片图集层数上限**（fail-closed，RBT-01 不变量 1）。
+    ///
+    /// 生产者是 `Window::image_drawable_layers`（App 的逐窗口图集记账：只有该窗口渲染器已整组
+    /// 入队过的层才可画）。合成端把它交给编码器，`Primitive::Image` 引用层号 `>=` 上限时不产出
+    /// 实例。`u32::MAX` = 不过滤（没有 App 图集记账的快照 / `Window::frame` 驱动）。
+    pub image_layers: u32,
 }
 
 impl SceneDelta {
@@ -124,6 +130,7 @@ impl SceneDelta {
             scroll: Vec::with_capacity(0),
             geometries: Vec::with_capacity(0),
             full: false,
+            image_layers: u32::MAX,
         }
     }
 }
@@ -147,6 +154,9 @@ pub(crate) fn absorb(old: SceneDelta, new: &mut SceneDelta) {
         scroll,
         geometries,
         full,
+        // 可画层上限是**当前帧**的窗口状态：`new` 的值由 `Window::paint_frame` 在 absorb 之后
+        // 写入，旧帧的值不参与合并（旧 lane 会按新上限重新过滤/编码）。
+        ..
     } = old;
     // 旧帧的 damage 必须并进新帧（被覆盖的帧不产生 GPU 工作，但它的像素变化要补画）。
     new.header.plan = header.plan.merge(new.header.plan);

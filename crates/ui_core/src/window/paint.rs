@@ -247,6 +247,10 @@ pub(crate) fn paint_frame(
     if let Some(previous) = window.pending_delta.take() {
         crate::render::delta::absorb(previous, &mut delta);
     }
+    // 本帧图片图集的**可画层上限**（fail-closed，RBT-01 不变量 1）：App 在图集上传 pass 里按
+    // 「该窗口渲染器已整组入队的层数」写进窗口；合成端据此过滤 `Primitive::Image`，并且在
+    // 上限变化的那一帧强制整帧重编码 + 全量载荷（旧实例里可能还留着不该画的层）。
+    delta.image_layers = window.image_drawable_layers;
     // inline 模式（无 GPU 线程可分发的窗口）：只在**本帧确实会发布**时就地合成。
     // 判据来自 `commit_frame` 的同一个 `publish_decision`：Idle 帧如果提前调用
     // `WindowComposer::compose`，LaneStore 的版本与编码器状态会被推进，而

@@ -181,6 +181,17 @@ impl SharedAtlas {
         }
     }
 
+    /// 仅测试：资源的 `DepthOrArraySize`（D3D12 对 `TEXTURE2D` 解释为数组长度）。
+    ///
+    /// 直接读 `ID3D12Resource::GetDesc()`，用来验证**生产重建入口**
+    /// （`SharedGpu::rebuild_atlas_pages`）真的把资源建成了 N 层，而不是只看记账字段。
+    #[cfg(test)]
+    pub(crate) fn resource_array_size(&self, kind: AtlasKind) -> u16 {
+        // SAFETY: 只读查询；资源由本结构持有。
+        let desc = unsafe { self.page_ref(kind).resource.GetDesc() };
+        desc.DepthOrArraySize
+    }
+
     /// 该图集当前的 staging 行 pitch（字节，256 对齐）。
     pub(crate) fn row_pitch(&self, kind: AtlasKind) -> u32 {
         self.page_ref(kind).row_pitch
@@ -687,11 +698,47 @@ impl AtlasUploads {
     pub(crate) fn reconcile_pages(
         &mut self,
         current: [AtlasArraySpec; 2],
-    ) -> Vec<AtlasPageRequest> {
+    ) -> Result<Vec<AtlasPageRequest>, EngineError> {
         let mut rebuild: Vec<AtlasPageRequest> = Vec::with_capacity(2);
         for kind in [AtlasKind::Glyph, AtlasKind::Image] {
             let index = kind.index() as usize;
             let current = current[index];
+            // fail-closed（RBT-01 不变量 2）：**扩层请求必须每一层都带整页上传**。扩层会重建整个
+            // 数组（旧层内容全部作废），只有「所有已打开层的整页内容都在同一次重传里入队」才
+            // 允许扩张；否则这一帧直接拒绝（release 也生效，不是 debug_assert）——重建后让
+            // 半成品层进 draw 比拒绝一帧糟得多。
+            let pending_spec = self.pending[index]
+                .iter()
+                .flatten()
+                .map(|pending| pending.spec)
+                .fold(None, |acc: Option<AtlasArraySpec>, spec| {
+                    Some(match acc {
+                        Some(acc) => AtlasArraySpec {
+                            page: spec.page,
+                            layers: acc.layers.max(spec.layers),
+                        },
+                        None => spec,
+                    })
+                });
+            if let Some(pending_spec) = pending_spec
+                && pending_spec.layers > current.layers
+            {
+                for layer in 0..pending_spec.layers {
+                    let full = self.pending[index]
+                        .get(layer as usize)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|pending| {
+                            pending.spec.page == pending_spec.page && pending.covers_full_page()
+                        });
+                    if !full {
+                        return Err(EngineError::AtlasGrowthIncomplete {
+                            kind,
+                            layer: u16::try_from(layer).unwrap_or(u16::MAX),
+                            layers: pending_spec.layers,
+                        });
+                    }
+                }
+            }
             for layer in 0..self.pending[index].len() {
                 let Some(pending) = &self.pending[index][layer] else {
                     continue;
@@ -718,7 +765,7 @@ impl AtlasUploads {
                 }
             }
         }
-        rebuild
+        Ok(rebuild)
     }
 
     /// teardown：把本窗口 staging 的句柄交回共享设备（GPU 线程已 idle，列表已重置）。
@@ -1105,10 +1152,13 @@ mod tests {
 
         /// array 对齐（重建到待上传规格）+ staging 对齐 + 把当前全部待上传层录进一次立即提交。
         fn flush(&mut self) -> Vec<crate::render::retire::GpuResourceHandle> {
-            let mut rebuild = self.uploads.reconcile_pages([
-                self.atlas.spec(AtlasKind::Glyph),
-                self.atlas.spec(AtlasKind::Image),
-            ]);
+            let mut rebuild = self
+                .uploads
+                .reconcile_pages([
+                    self.atlas.spec(AtlasKind::Glyph),
+                    self.atlas.spec(AtlasKind::Image),
+                ])
+                .expect("reconcile pages");
             for request in rebuild.drain(..) {
                 let _old = self
                     .atlas
@@ -1205,6 +1255,7 @@ mod tests {
         assert!(
             uploads
                 .reconcile_pages([spec(TEST_PAGE * 8, 1), spec(1, 1)])
+                .expect("reconcile pages")
                 .is_empty(),
             "非整页的旧页增量不应触发重建"
         );
@@ -1223,13 +1274,16 @@ mod tests {
             full_rects(),
         );
         assert_eq!(
-            uploads.reconcile_pages([spec(TEST_PAGE * 8, 1), spec(1, 1)]),
+            uploads
+                .reconcile_pages([spec(TEST_PAGE * 8, 1), spec(1, 1)])
+                .expect("reconcile pages"),
             vec![request(AtlasKind::Glyph, TEST_PAGE, 1)],
             "整页上传必须要求把共享 array 重建到它自己的页尺寸"
         );
         assert!(
             uploads
                 .reconcile_pages([spec(TEST_PAGE, 1), spec(1, 1)])
+                .expect("reconcile pages")
                 .is_empty(),
             "页已对齐时不再要求重建"
         );
@@ -1252,7 +1306,9 @@ mod tests {
             );
         }
         assert_eq!(
-            uploads.reconcile_pages([spec(1, 1), spec(1, 1)]),
+            uploads
+                .reconcile_pages([spec(1, 1), spec(1, 1)])
+                .expect("reconcile pages"),
             vec![request(AtlasKind::Image, TEST_PAGE, 4)],
             "按 extent 去重：数组只有一次重建，且层数取最大值"
         );
@@ -1282,6 +1338,7 @@ mod tests {
         assert!(
             uploads
                 .reconcile_pages([spec(1024, 1), spec(1, 1)])
+                .expect("reconcile pages")
                 .is_empty(),
             "旧页整页上传不得触发重建"
         );
@@ -1815,6 +1872,13 @@ mod tests {
     fn the_image_atlas_shadow_is_tracked_per_layer() {
         let _guard = crate::render::windows::device::gpu_test_lock();
         let mut harness = Harness::new();
+        // 数组先按「App 已完成完整扩层」建到 3 层（重建本身要求所有层整页上传，见
+        // `reconcile_pages` 的 fail-closed 判据）；本测试只验证**影子内容**逐层独立：
+        // 只上传 layer 0 / 2，layer 1 应当没有影子。
+        let _grown = harness
+            .atlas
+            .recreate(harness.shared.raw(), AtlasKind::Image, spec(TEST_PAGE, 3))
+            .expect("grow image array to 3 layers");
         harness.queue(
             AtlasKind::Image,
             0,
@@ -1883,5 +1947,90 @@ mod tests {
         assert_eq!(row(299), 0, "row before the second rect");
         assert_eq!(row(305), 0x55, "second rect content");
         assert_eq!(row(511), 0, "untouched row after the last rect");
+    }
+
+    /// fail-closed（RBT-01 不变量 2）：扩层重建要求**每一层都有整页上传**。缺层、或某层只有
+    /// 增量矩形，都必须**拒绝**（release 也生效，不是 `debug_assert`）——重建后的数组会有
+    /// 半成品层，一旦被 draw 采样就是未定义内容。
+    #[test]
+    fn reconcile_pages_rejects_growth_without_a_full_page_upload_for_every_layer() {
+        // 情形 1：缺层（layer 1 完全没有待上传）。
+        let mut uploads = AtlasUploads::new();
+        for layer in [0u16, 2] {
+            uploads.queue_upload(
+                AtlasKind::Image,
+                layer,
+                spec(TEST_PAGE, 3),
+                1,
+                vec![0u8; (TEST_PAGE * TEST_PAGE * 4) as usize],
+                full_rects(),
+            );
+        }
+        let error = uploads
+            .reconcile_pages([spec(TEST_PAGE, 3), spec(1, 1)])
+            .expect_err("缺层的扩层请求必须被拒绝");
+        assert!(
+            matches!(
+                error,
+                crate::error::EngineError::AtlasGrowthIncomplete {
+                    kind: AtlasKind::Image,
+                    layer: 1,
+                    layers: 3,
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+
+        // 情形 2：层在，但只带增量矩形（不是整页）。
+        let mut uploads = AtlasUploads::new();
+        for layer in 0..3u16 {
+            let rects = if layer == 1 { rows(2, 4) } else { full_rects() };
+            let bytes = rects.byte_count(TEST_PAGE, 4);
+            uploads.queue_upload(
+                AtlasKind::Image,
+                layer,
+                spec(TEST_PAGE, 3),
+                1,
+                vec![0u8; bytes],
+                rects,
+            );
+        }
+        let error = uploads
+            .reconcile_pages([spec(TEST_PAGE, 3), spec(1, 1)])
+            .expect_err("非整页的扩层请求必须被拒绝");
+        assert!(
+            matches!(
+                error,
+                crate::error::EngineError::AtlasGrowthIncomplete {
+                    kind: AtlasKind::Image,
+                    layer: 1,
+                    layers: 3,
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    /// 反例（正路径）：每层都整页 ⇒ 接受，并按最大层数去重成一条请求。
+    #[test]
+    fn reconcile_pages_accepts_growth_when_every_layer_is_a_full_page() {
+        let mut uploads = AtlasUploads::new();
+        for layer in 0..3u16 {
+            uploads.queue_upload(
+                AtlasKind::Image,
+                layer,
+                spec(TEST_PAGE, 3),
+                1,
+                vec![0u8; (TEST_PAGE * TEST_PAGE * 4) as usize],
+                full_rects(),
+            );
+        }
+        assert_eq!(
+            uploads
+                .reconcile_pages([spec(TEST_PAGE, 3), spec(1, 1)])
+                .expect("全层整页的扩层请求必须被接受"),
+            vec![request(AtlasKind::Image, TEST_PAGE, 3)],
+            "一次重建、层数取最大值"
+        );
     }
 }

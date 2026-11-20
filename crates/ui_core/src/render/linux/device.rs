@@ -31,7 +31,7 @@ use std::{
     ffi::c_void,
     path::PathBuf,
     sync::{
-        Arc, Mutex, OnceLock, PoisonError, RwLock, RwLockReadGuard, Weak,
+        Arc, Mutex, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
 };
@@ -923,6 +923,12 @@ impl SharedGpu {
         self.atlas.read().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// 图集写锁：重建的唯一入口（正常重建走 [SharedGpu::rebuild_atlas_pages]；录制路径需要
+    /// 「重建 + 整组上传 + draw + 提交」在同一临界区里完成时用它，见 compositor::record_frame）。
+    pub(crate) fn atlas_write(&self) -> RwLockWriteGuard<'_, SharedAtlas> {
+        self.atlas.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// 共享图集当前页尺寸的无锁快照（上传入队时记录「入队页」）。
     pub(crate) fn atlas_page(&self, kind: AtlasKind) -> u32 {
         self.atlas_pages[kind.index() as usize].load(Ordering::Acquire)
@@ -937,11 +943,27 @@ impl SharedGpu {
     /// **层数增长**：新数组的旧层内容由 App 在扩层帧的整层重传补齐（每个已打开的页都整页上传，
     /// 见 `AtlasUploads::reconcile_pages` 的层数分支）—— 增长不会丢已上传的图。层数只增不减：
     /// 请求里的层数与当前层数取最大（缩容会让所有窗口的 `AtlasTile.page` 失效）。
+    /// 仅测试便捷入口（拿写锁 + 落地重建）。生产路径是录制线程在**已持有写锁**的临界区里调
+    /// [`SharedGpu::rebuild_atlas_pages_locked`]（重建 + 整组上传 + draw + 提交一次完成）。
+    #[cfg(test)]
     pub(crate) fn rebuild_atlas_pages(
         &self,
         requests: &[AtlasPageRequest],
     ) -> Result<AtlasRebuilt, EngineError> {
-        let mut atlas = self.atlas.write().unwrap_or_else(PoisonError::into_inner);
+        let mut atlas = self.atlas_write();
+        self.rebuild_atlas_pages_locked(&mut atlas, requests)
+    }
+
+    /// 重建的锁内实现：调用方必须已经持有 [`SharedGpu::atlas_write`] 的写锁。
+    ///
+    /// 录制路径（`compositor::record_frame`）用它在**同一个写锁临界区**里完成「重建 → 本窗口
+    /// 整组上传 → draw → 提交」：新数组的内容在写锁释放前已经全部进队列，别的窗口不可能在
+    /// 「数组已换、内容还没拷」的空档里录制一帧（RBT-01 的跨窗口半成品窗口）。
+    pub(crate) fn rebuild_atlas_pages_locked(
+        &self,
+        atlas: &mut SharedAtlas,
+        requests: &[AtlasPageRequest],
+    ) -> Result<AtlasRebuilt, EngineError> {
         let pending: Vec<AtlasPageRequest> = requests
             .iter()
             .filter(|request| atlas.spec(request.kind) != request.spec)

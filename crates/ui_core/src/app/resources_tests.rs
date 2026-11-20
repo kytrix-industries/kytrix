@@ -573,6 +573,314 @@ fn growing_the_image_array_reuploads_every_open_layer() {
     assert!(app.window(window).expect("window").image_layer_received(1));
 }
 
+/// RBT-01 不变量 1（编码期过滤）：扩层还没发生时，引用新层的 `Primitive::Image` **不产生实例**
+/// —— 不画占位、不画错层；旧层的图照画（不变量 3）。上限变化的那一帧由合成端强制重编码 +
+/// 全量载荷，所以这里连续两帧能直接看到实例层的集合变化。
+#[test]
+fn images_on_layers_without_an_established_array_are_not_drawn() {
+    let (_rt, mut app, window) = setup();
+    let root = app.window(window).expect("窗口存在").tree().root();
+    let canvas_node = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 64.0, 32.0)))
+        .layout_override(Rect::new(0.0, 0.0, 64.0, 32.0))
+        .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
+        .expect("canvas 节点");
+    let tile = |page: u16| AtlasTile {
+        atlas: AtlasKind::Image,
+        page,
+        u0: 0.25,
+        v0: 0.25,
+        u1: 0.5,
+        v1: 0.5,
+        generation: 0,
+    };
+    let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 64.0, 32.0));
+    canvas.push_image(Image {
+        bounds: Rect::new(0.0, 0.0, 32.0, 32.0),
+        tile: tile(0),
+        modulation: Color::WHITE,
+    });
+    canvas.push_image(Image {
+        bounds: Rect::new(32.0, 0.0, 32.0, 32.0),
+        tile: tile(1),
+        modulation: Color::WHITE,
+    });
+    app.window_mut(window)
+        .expect("窗口存在")
+        .set_canvas(canvas_node, canvas)
+        .expect("节点存活");
+
+    // 没有渲染器的窗口不参与 App 图集记账：上限由测试直接设定（= 数组只有 1 层）。
+    app.window_mut(window)
+        .expect("窗口存在")
+        .set_image_drawable_layers(1);
+    app.window_mut(window).expect("窗口存在").request_repaint();
+    let _ = app.frame(window).expect("帧").expect("首帧不报错");
+    let buffer = app
+        .window(window)
+        .expect("窗口存在")
+        .instance_buffer()
+        .expect("inline 合成器");
+    assert_eq!(
+        buffer.image_layers(),
+        vec![0],
+        "层 1 还没有建立 ⇒ 它的 Image 图元不得产生实例；层 0 照画"
+    );
+
+    // 上限抬到 2（= 扩层已完成）：两层的图元都上屏。
+    app.window_mut(window)
+        .expect("窗口存在")
+        .set_image_drawable_layers(2);
+    app.window_mut(window).expect("窗口存在").request_repaint();
+    let _ = app.frame(window).expect("帧").expect("次帧不报错");
+    let buffer = app
+        .window(window)
+        .expect("窗口存在")
+        .instance_buffer()
+        .expect("inline 合成器");
+    assert_eq!(
+        buffer.image_layers(),
+        vec![0, 1],
+        "数组建立之后两层的图元都必须上屏"
+    );
+}
+
+/// RBT-01 回归（忙槽 + 扩层，单窗口形态）：窗口的上传槽还在消费上一笔时页数 1 → 2，
+/// 这一帧**不扩层、不入队新层**（旧层照画、新层不可画），槽空闲后的下一帧才前进。
+#[cfg(windows)]
+#[test]
+fn a_busy_upload_slot_defers_the_image_array_growth() {
+    use crate::{
+        paint::atlas::AtlasKind,
+        render::{AtlasArraySpec, DirtyRects},
+    };
+
+    let _guard = crate::render::windows::device::gpu_test_lock();
+    let (_rt, mut app, window) = setup();
+    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
+    for index in 0..2u8 {
+        let _ = app
+            .resources_mut()
+            .insert(&png_rgba([index + 1, 20, 30, 255]))
+            .expect("insert");
+    }
+    assert_eq!(app.resources().page_count(), 1);
+    app.window_mut(window)
+        .expect("window")
+        .enable_offscreen_renderer()
+        .expect("offscreen renderer");
+    app.upload_atlas_pages();
+    assert_eq!(
+        app.window(window).expect("window").image_array_spec(),
+        Some(AtlasArraySpec {
+            page: 16,
+            layers: 1
+        })
+    );
+    app.window_mut(window).expect("window").request_repaint();
+    let _ = app.frame(window).expect("frame").expect("ok");
+
+    // 第 3 张图 ⇒ 第 2 页；同时让槽停在「已入队、未录制」（旧 spec 的增量，不触发扩层）。
+    let _ = app
+        .resources_mut()
+        .insert(&png_rgba([200, 1, 2, 255]))
+        .expect("insert");
+    assert_eq!(app.resources().page_count(), 2);
+    let page_bytes = 16usize * 16 * 4;
+    assert!(
+        app.window_mut(window).expect("window").queue_atlas_upload(
+            AtlasKind::Image,
+            0,
+            AtlasArraySpec {
+                page: 16,
+                layers: 1
+            },
+            &vec![0u8; page_bytes],
+            DirtyRects::full(),
+        ),
+        "offscreen 渲染器必须接受入队"
+    );
+
+    app.upload_atlas_pages();
+    let target = app.window(window).expect("window");
+    assert_eq!(
+        target.image_array_spec(),
+        Some(AtlasArraySpec {
+            page: 16,
+            layers: 1
+        }),
+        "槽忙 ⇒ 这一帧不得扩层（数组仍是旧 spec）"
+    );
+    assert_eq!(
+        target.image_drawable_layers(),
+        1,
+        "新层不可画（编码期过滤）、旧层照画"
+    );
+    assert_eq!(
+        target.atlas_pending_layers(AtlasKind::Image),
+        Some(vec![0]),
+        "不得在扩层前把 layer 1 入队（否则设备侧会拒绝重建）"
+    );
+    assert!(
+        !target.atlas_rects(AtlasKind::Image, 1).is_empty(),
+        "新页的写入必须留在该窗口的待传队列里，不能丢"
+    );
+
+    // 槽空闲之后：数组前进到 2 层，且对两个已打开层整组重传。
+    app.window_mut(window).expect("window").request_repaint();
+    let _ = app.frame(window).expect("frame").expect("ok");
+    app.upload_atlas_pages();
+    let target = app.window(window).expect("window");
+    assert_eq!(
+        target.image_array_spec(),
+        Some(AtlasArraySpec {
+            page: 16,
+            layers: 2
+        }),
+        "槽空闲后的下一帧才扩层"
+    );
+    assert_eq!(target.image_drawable_layers(), 2);
+    assert_eq!(
+        target.atlas_pending_layers(AtlasKind::Image),
+        Some(vec![0, 1]),
+        "扩层帧必须整组重传（layer 0 也要）"
+    );
+}
+/// RBT-01 不变量 2 / 3：**所有**带渲染器的窗口都能整组入队时数组才扩层；任一窗口的共享槽还在
+/// 消费上一笔上传 ⇒ 这一帧不推进（旧 spec 的层照画、新层不可画），下一帧补上。
+#[cfg(windows)]
+#[test]
+fn growing_the_image_array_waits_until_every_window_can_take_the_whole_array() {
+    use crate::{
+        paint::atlas::AtlasKind,
+        render::{AtlasArraySpec, DirtyRects},
+    };
+
+    let _guard = crate::render::windows::device::gpu_test_lock();
+    let (_rt, mut app, first) = setup();
+    // 16² 图片页：每页 2 个 4×4 tile（6² 含 padding）⇒ 2 张图占 1 页，第 3 张开第 2 页。
+    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
+    for index in 0..2u8 {
+        let _ = app
+            .resources_mut()
+            .insert(&png_rgba([index + 1, 20, 30, 255]))
+            .expect("insert");
+    }
+    assert_eq!(app.resources().page_count(), 1);
+    app.window_mut(first)
+        .expect("first")
+        .enable_offscreen_renderer()
+        .expect("offscreen renderer");
+    app.upload_atlas_pages();
+    assert_eq!(
+        app.window(first).expect("first").image_array_spec(),
+        Some(AtlasArraySpec {
+            page: 16,
+            layers: 1
+        })
+    );
+
+    // 第二个窗口：同一数组（非增长路径补齐），随后两帧把首帧上传录制掉。
+    let second = app.create_window(WindowOptions {
+        title: "second".into(),
+        size: Size::new(64.0, 64.0),
+        scale: crate::math::Scale::ONE,
+        ..WindowOptions::default()
+    });
+    app.window_mut(second)
+        .expect("second")
+        .enable_offscreen_renderer()
+        .expect("offscreen renderer");
+    app.upload_atlas_pages();
+    assert_eq!(
+        app.window(second).expect("second").image_array_spec(),
+        Some(AtlasArraySpec {
+            page: 16,
+            layers: 1
+        })
+    );
+    for window in [first, second] {
+        app.window_mut(window).expect("window").request_repaint();
+        let _ = app.frame(window).expect("frame").expect("ok");
+        assert!(
+            app.window(window)
+                .expect("window")
+                .atlas_idle(AtlasKind::Image),
+            "录制之后共享槽必须空闲"
+        );
+    }
+
+    // 第 3 张图 ⇒ 第 2 页（扩层待定）。让第二个窗口的槽停在「已入队、未录制」。
+    let _ = app
+        .resources_mut()
+        .insert(&png_rgba([200, 1, 2, 255]))
+        .expect("insert");
+    assert_eq!(app.resources().page_count(), 2);
+    let page_bytes = 16usize * 16 * 4;
+    assert!(
+        app.window_mut(second).expect("second").queue_atlas_upload(
+            AtlasKind::Image,
+            0,
+            AtlasArraySpec {
+                page: 16,
+                layers: 1
+            },
+            &vec![0u8; page_bytes],
+            DirtyRects::full(),
+        ),
+        "offscreen 渲染器必须接受入队"
+    );
+    assert!(
+        !app.window(second)
+            .expect("second")
+            .atlas_idle(AtlasKind::Image)
+    );
+
+    app.upload_atlas_pages();
+    for window in [first, second] {
+        assert_eq!(
+            app.window(window).expect("window").image_array_spec(),
+            Some(AtlasArraySpec {
+                page: 16,
+                layers: 1
+            }),
+            "任一窗口的槽忙 ⇒ 这一帧不得扩层（不变量 2）"
+        );
+        assert_eq!(
+            app.window(window).expect("window").image_drawable_layers(),
+            1,
+            "旧层照画、新层不可画（不变量 3 / 1）"
+        );
+    }
+
+    // 槽空闲之后才扩层：两个窗口都必须前进到 2 层，且扩层帧整组重传。
+    for window in [second, first] {
+        app.window_mut(window).expect("window").request_repaint();
+        let _ = app.frame(window).expect("frame").expect("ok");
+    }
+    app.upload_atlas_pages();
+    for window in [first, second] {
+        assert_eq!(
+            app.window(window).expect("window").image_array_spec(),
+            Some(AtlasArraySpec {
+                page: 16,
+                layers: 2
+            }),
+            "所有窗口都就绪之后数组才前进到 2 层"
+        );
+        assert_eq!(
+            app.window(window).expect("window").image_drawable_layers(),
+            2,
+            "扩层完成后新层可画"
+        );
+    }
+    assert_eq!(
+        app.window(second)
+            .expect("second")
+            .atlas_pending_layers(AtlasKind::Image),
+        Some(vec![0, 1]),
+        "扩层帧必须对每个已打开层整页重传"
+    );
+}
 /// D9-c：晚挂上的窗口必须补齐**每一个已打开页**的整层内容（texture array 每层独立）。
 ///
 /// 新建窗口时进程级资源页可能早就有内容、而脏矩形早已被旧窗口消费 —— 这时只能按

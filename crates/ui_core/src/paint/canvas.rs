@@ -70,7 +70,8 @@ impl Canvas {
         self.lane.push(Primitive::GlyphRun(run));
     }
 
-    /// debug 构建断言 `image.tile.atlas == AtlasKind::Image` 且页号 < `MAX_IMAGE_PAGES`（页号上限；\n    /// texture array 的层数是运行时值，见 `render::atlas::AtlasArraySpec`）。
+    /// debug 构建断言 `image.tile.atlas == AtlasKind::Image` 且页号 < `MAX_IMAGE_PAGES`（页号上限；
+    /// texture array 的层数是运行时值，见 `render::atlas::AtlasArraySpec`）。
     ///
     /// # Panics: debug 构建下 tile 非法（放错图集 / 越界层号）时断言失败
     pub fn push_image(&mut self, image: Image) {

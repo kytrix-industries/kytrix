@@ -67,6 +67,11 @@ pub(crate) struct WindowComposer {
     geometry_uploads: GeometryUploadTracker,
     scroll: ScrollTable,
     stats: ComposeStats,
+    /// 上一次合成用的图片图集可画层上限（fail-closed，RBT-01 不变量 1）。
+    ///
+    /// 上限变化会让「已经编码进实例环的旧 Image 实例」失效（要么该画、要么不该画），因此变化
+    /// 的那一帧强制整帧重编码 + 全量载荷 —— 与 `delta.full` 同一条处理路径。
+    image_layers: u32,
 }
 
 impl WindowComposer {
@@ -78,6 +83,7 @@ impl WindowComposer {
             geometry_uploads: GeometryUploadTracker::new(),
             scroll: ScrollTable::new(),
             stats: ComposeStats::default(),
+            image_layers: u32::MAX,
         }
     }
 
@@ -116,11 +122,22 @@ impl WindowComposer {
             .filter_map(|scroll| scroll_damage(scroll.viewport))
             .collect();
         let plan = push_scroll_damage(delta.header.plan, &viewports);
-        if delta.full {
-            // 整帧重建（首帧 / DPI 变化 / 裁剪表重建）：编码器必须丢弃全部段与裁剪表。
+        // fail-closed（RBT-01 不变量 1）：图片图集**可画层上限**变了 ⇒ 已编码的 Image 实例里
+        // 有些必须消失 / 重现。上限只在建数组 / 扩层 / 换渲染器时变（一次会话 ≤ 几次），按
+        // 「整帧重建」处理：丢弃全部段、按新上限重编码、发全量载荷（GPU 镜像里残留的旧实例
+        // 只能靠全量载荷覆盖）。
+        let limit_changed = delta.image_layers != self.image_layers;
+        if limit_changed {
+            self.image_layers = delta.image_layers;
+        }
+        self.encoder.set_image_layers(self.image_layers);
+        let full = delta.full || limit_changed;
+        if full {
+            // 整帧重建（首帧 / DPI 变化 / 裁剪表重建 / 可画层上限变化）：编码器必须丢弃全部段
+            // 与裁剪表。
             self.encoder.invalidate();
         }
-        if lanes_changed || delta.full || self.encoder.needs_reset(scale) {
+        if lanes_changed || full || self.encoder.needs_reset(scale) {
             self.encoder
                 .encode(&self.lanes, scale, resolver, &self.geometry)?;
             let buffer = self.encoder.buffer();
@@ -154,7 +171,7 @@ impl WindowComposer {
         // 整帧重建（首帧 / DPI 变化 / 新渲染器挂上）必须发**整块**实例缓冲：GPU 侧的实例镜像
         // 只会被载荷填满，不发全量它就永远缺内容（`InstanceMirror` 的 `needs_full` 只是「整块
         // 写镜像」，镜像本身仍要靠载荷喂）。
-        let payload = if delta.full {
+        let payload = if full {
             let payload = FramePayload::full(self.encoder.buffer(), scroll_payload, scroll_clip);
             // 全量块已经包含全部变化 ⇒ 变化区间清零（否则下一次增量会把它们再发一遍）。
             self.encoder.buffer_mut().clear_changes();

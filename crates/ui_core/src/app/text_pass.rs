@@ -184,6 +184,13 @@ pub(crate) fn upload_image_page(app: &mut App) {
 
     let page_count = app.resources.page_count();
     if page_count == 0 {
+        // 没有图片页：三端数组保持 1×1×1 占位。带渲染器的窗口可画层归零（fail-closed；
+        // 正常情况下也不会有 Image 图元引用任何层）。
+        for window in app.windows.values_mut() {
+            if window.has_renderer() {
+                window.set_image_drawable_layers(0);
+            }
+        }
         return;
     }
     let extent = app.resources.page_extent();
@@ -194,7 +201,7 @@ pub(crate) fn upload_image_page(app: &mut App) {
     );
     let layers = u16::try_from(page_count).expect("image atlas page count fits u16");
     // 三端按这个规格建 texture array：页边长 + 当前打开的页数（层数单调不减）。
-    let spec = AtlasArraySpec {
+    let target = AtlasArraySpec {
         page: extent,
         layers: u32::from(layers),
     };
@@ -205,143 +212,231 @@ pub(crate) fn upload_image_page(app: &mut App) {
         .map(|layer| app.resources.take_dirty_rects_at(layer).unwrap_or_default())
         .collect();
     let has_rects = dirty.iter().any(|rects| !rects.is_empty());
-    let any_missing = app.windows.values().any(|window| {
-        window.has_renderer()
-            && (!window.atlas_page_matches(AtlasKind::Image, spec)
-                || (0..layers).any(|layer| !window.image_layer_received(layer)))
-    });
-    let any_queued = app.windows.values().any(|window| {
-        window.has_renderer()
-            && (0..usize::from(MAX_IMAGE_PAGES)).any(|layer| {
-                !window
-                    .atlas_rects(AtlasKind::Image, layer as u16)
-                    .is_empty()
-            })
-    });
-    if !has_rects && !any_missing && !any_queued {
-        return;
-    }
     let full_rects = crate::render::DirtyRects::full();
 
-    let App {
-        resources,
-        windows,
-        packed,
-        ..
-    } = app;
-    for window in windows.values_mut() {
-        if !window.has_renderer() {
-            continue;
+    // fail-closed 增长闸门（RBT-01 不变量 2）：数组**建立 / 扩层**必须所有带渲染器的窗口本帧
+    // 都能整组入队（每层整页）。任一窗口的共享槽还在消费上一笔上传时，这一帧不扩：
+    // - 旧 spec 的层内容仍然有效 ⇒ 旧图照常画（不变量 3）；
+    // - 新页所在层不画（窗口的 `image_drawable_layers` 保持在旧层数，编码期过滤；不变量 1），
+    //   下一帧再试。
+    let established = app.image_array_established;
+    let needs_growth =
+        established.is_none_or(|spec| spec.page != target.page || spec.layers < target.layers);
+    if needs_growth {
+        let blocked: Vec<crate::window::WindowId> = app
+            .windows
+            .iter()
+            .filter(|(_, window)| window.has_renderer() && !window.atlas_idle(AtlasKind::Image))
+            .map(|(id, _)| *id)
+            .collect();
+        if !blocked.is_empty() {
+            let drawable = established.map_or(0, |spec| spec.layers);
+            for window in app.windows.values_mut() {
+                if !window.has_renderer() {
+                    continue;
+                }
+                if has_rects {
+                    for layer in 0..layers {
+                        window
+                            .atlas_rects_mut(AtlasKind::Image, layer)
+                            .merge_from(&dirty[usize::from(layer)]);
+                    }
+                }
+                window.set_image_drawable_layers(drawable);
+            }
+            // 让槽忙的窗口尽快出帧，把上一笔上传消费掉（否则增长会被一直挡着）。
+            for id in blocked {
+                if let Some(window) = app.windows.get_mut(&id) {
+                    window.request_repaint();
+                }
+            }
+            app.dispatcher.wake();
+            return;
         }
-        // 层数或页边长与数组记账不一致 ⇒ 数组必须重建 ⇒ 每个已打开层都要整页重传。
-        let array_missing = !window.atlas_page_matches(AtlasKind::Image, spec);
-        let missing_layers =
-            array_missing || (0..layers).any(|layer| !window.image_layer_received(layer));
-        if missing_layers {
-            // 已经在同步的层仍要收下本帧写入：整层上传只补「缺的层」，不能因此丢掉其它层的
-            // 增量（否则忙窗口错过一帧写入后永远缺那一块像素）。缺的层随后整页上传覆盖。
-            if has_rects {
+        // 所有带渲染器的窗口都空闲：整组入队（每个已打开层整页）。这一步就是「数组只在全层
+        // 就绪时扩张」：重建后的数组内容由本帧每个窗口的整层重传补齐，任何窗口都不会看到
+        // 半成品层。渲染器已关闭（`queue_atlas_upload` 返回 false = shutdown/terminated）的
+        // 窗口永远不会再出帧，不阻塞数组前进。
+        {
+            let App {
+                resources, windows, ..
+            } = app;
+            for window in windows.values_mut() {
+                if !window.has_renderer() {
+                    continue;
+                }
+                let mut enqueued = Vec::with_capacity(page_count);
                 for layer in 0..layers {
+                    let Some((dims, pixels)) = resources.page_pixels_at(layer) else {
+                        enqueued.clear();
+                        break;
+                    };
+                    debug_assert_eq!(
+                        (dims.0, dims.1),
+                        (extent, extent),
+                        "image atlas page must be square and uniform"
+                    );
+                    if !window.queue_atlas_upload(
+                        AtlasKind::Image,
+                        layer,
+                        target,
+                        pixels,
+                        full_rects.clone(),
+                    ) {
+                        enqueued.clear();
+                        break;
+                    }
+                    enqueued.push(layer);
+                }
+                if enqueued.len() == page_count {
+                    for layer in enqueued {
+                        window.mark_image_layer_received(layer);
+                    }
+                    window.mark_atlas_page_received(AtlasKind::Image, target);
+                    window.clear_all_atlas_rects(AtlasKind::Image);
+                    window.set_image_drawable_layers(target.layers);
+                } else {
+                    // 渲染器已关闭：本窗口不会出帧，可画层归零（fail-closed）。
+                    window.set_image_drawable_layers(0);
+                }
+            }
+        }
+        app.image_array_established = Some(target);
+        return;
+    }
+
+    // 不增长：逐窗口同步（新窗口 / 换渲染器 / 落后于 established）+ 增量上传。
+    {
+        let App {
+            resources,
+            windows,
+            packed,
+            ..
+        } = app;
+        for window in windows.values_mut() {
+            if !window.has_renderer() {
+                continue;
+            }
+            let received = window.image_array_spec();
+            let array_missing = received != Some(target);
+            let missing_layers =
+                array_missing || (0..layers).any(|layer| !window.image_layer_received(layer));
+            if missing_layers {
+                // 已经在同步的层仍要收下本帧写入：整层上传只补「缺的层」，不能因此丢掉其它层的
+                // 增量（否则忙窗口错过一帧写入后永远缺那一块像素）。
+                if has_rects {
+                    for layer in 0..layers {
+                        window
+                            .atlas_rects_mut(AtlasKind::Image, layer)
+                            .merge_from(&dirty[usize::from(layer)]);
+                    }
+                }
+                if !window.atlas_idle(AtlasKind::Image) {
+                    window.set_image_drawable_layers(received.map_or(0, |spec| spec.layers));
+                    continue;
+                }
+                let mut enqueued = Vec::with_capacity(page_count);
+                for layer in 0..layers {
+                    if !array_missing && window.image_layer_received(layer) {
+                        continue;
+                    }
+                    let Some((dims, pixels)) = resources.page_pixels_at(layer) else {
+                        enqueued.clear();
+                        break;
+                    };
+                    debug_assert_eq!(
+                        (dims.0, dims.1),
+                        (extent, extent),
+                        "image atlas page must be square and uniform"
+                    );
+                    if !window.queue_atlas_upload(
+                        AtlasKind::Image,
+                        layer,
+                        target,
+                        pixels,
+                        full_rects.clone(),
+                    ) {
+                        enqueued.clear();
+                        break;
+                    }
+                    enqueued.push(layer);
+                }
+                let needed: usize = if array_missing {
+                    page_count
+                } else {
+                    (0..layers)
+                        .filter(|layer| !window.image_layer_received(*layer))
+                        .count()
+                };
+                if enqueued.len() == needed {
+                    for layer in enqueued {
+                        window.mark_image_layer_received(layer);
+                        window.clear_atlas_rects(AtlasKind::Image, layer);
+                    }
+                    window.mark_atlas_page_received(AtlasKind::Image, target);
+                    if array_missing {
+                        window.clear_all_atlas_rects(AtlasKind::Image);
+                    }
+                    window.set_image_drawable_layers(target.layers);
+                } else {
+                    window.set_image_drawable_layers(received.map_or(0, |spec| spec.layers));
+                }
+                continue;
+            }
+            // 已同步：本窗口每一层都可画（层数就是已建立数组的层数）。
+            window.set_image_drawable_layers(target.layers);
+            // 增量：逐层并入本帧脏矩形，槽空闲时按 AOI 上传（整页脏直接整页）。
+            let idle = window.atlas_idle(AtlasKind::Image);
+            if !idle {
+                if has_rects {
+                    for layer in 0..layers {
+                        window
+                            .atlas_rects_mut(AtlasKind::Image, layer)
+                            .merge_from(&dirty[usize::from(layer)]);
+                    }
+                }
+                continue;
+            }
+            for layer in 0..layers {
+                if has_rects {
                     window
                         .atlas_rects_mut(AtlasKind::Image, layer)
                         .merge_from(&dirty[usize::from(layer)]);
                 }
-            }
-            // 整数组建立 / 新层补齐 / 层数增长：逐层整页上传（只上传已分配过页的层；尚未分配
-            // 的层在它第一次出现的那一帧走同一条路径）。
-            if !window.atlas_idle(AtlasKind::Image) {
-                continue;
-            }
-            let mut uploaded_layers = Vec::with_capacity(page_count);
-            let mut uploaded = true;
-            for layer in 0..layers {
-                if !array_missing && window.image_layer_received(layer) {
+                if window.atlas_rects(AtlasKind::Image, layer).is_empty() {
                     continue;
                 }
                 let Some((dims, pixels)) = resources.page_pixels_at(layer) else {
-                    uploaded = false;
-                    break;
+                    window.clear_atlas_rects(AtlasKind::Image, layer);
+                    continue;
                 };
-                debug_assert_eq!(
-                    (dims.0, dims.1),
-                    (extent, extent),
-                    "image atlas page must be square and uniform"
+                debug_assert_eq!((dims.0, dims.1), (extent, extent));
+                if window.atlas_rects(AtlasKind::Image, layer).is_full() {
+                    if window.queue_atlas_upload(
+                        AtlasKind::Image,
+                        layer,
+                        target,
+                        pixels,
+                        full_rects.clone(),
+                    ) {
+                        window.clear_atlas_rects(AtlasKind::Image, layer);
+                    }
+                    continue;
+                }
+                let mut buf = std::mem::take(packed);
+                crate::render::atlas::pack_rects(
+                    pixels,
+                    extent,
+                    4,
+                    window.atlas_rects(AtlasKind::Image, layer),
+                    &mut buf,
                 );
-                if !window.queue_atlas_upload(
-                    AtlasKind::Image,
-                    layer,
-                    spec,
-                    pixels,
-                    full_rects.clone(),
-                ) {
-                    uploaded = false;
-                    break;
-                }
-                uploaded_layers.push(layer);
-            }
-            if uploaded {
-                for layer in uploaded_layers {
-                    window.mark_image_layer_received(layer);
+                let rects = window.atlas_rects(AtlasKind::Image, layer).clone();
+                if window.queue_atlas_upload(AtlasKind::Image, layer, target, &buf, rects) {
                     window.clear_atlas_rects(AtlasKind::Image, layer);
                 }
-                window.mark_atlas_page_received(AtlasKind::Image, spec);
-                if array_missing {
-                    window.clear_all_atlas_rects(AtlasKind::Image);
-                }
+                *packed = buf;
             }
-            continue;
-        }
-        // 增量：逐层并入本帧脏矩形，槽空闲时按 AOI 上传（整页脏直接整页）。
-        let idle = window.atlas_idle(AtlasKind::Image);
-        if !idle {
-            if has_rects {
-                for layer in 0..layers {
-                    window
-                        .atlas_rects_mut(AtlasKind::Image, layer)
-                        .merge_from(&dirty[usize::from(layer)]);
-                }
-            }
-            continue;
-        }
-        for layer in 0..layers {
-            if has_rects {
-                window
-                    .atlas_rects_mut(AtlasKind::Image, layer)
-                    .merge_from(&dirty[usize::from(layer)]);
-            }
-            if window.atlas_rects(AtlasKind::Image, layer).is_empty() {
-                continue;
-            }
-            let Some((dims, pixels)) = resources.page_pixels_at(layer) else {
-                window.clear_atlas_rects(AtlasKind::Image, layer);
-                continue;
-            };
-            debug_assert_eq!((dims.0, dims.1), (extent, extent));
-            if window.atlas_rects(AtlasKind::Image, layer).is_full() {
-                if window.queue_atlas_upload(
-                    AtlasKind::Image,
-                    layer,
-                    spec,
-                    pixels,
-                    full_rects.clone(),
-                ) {
-                    window.clear_atlas_rects(AtlasKind::Image, layer);
-                }
-                continue;
-            }
-            let mut buf = std::mem::take(packed);
-            crate::render::atlas::pack_rects(
-                pixels,
-                extent,
-                4,
-                window.atlas_rects(AtlasKind::Image, layer),
-                &mut buf,
-            );
-            let rects = window.atlas_rects(AtlasKind::Image, layer).clone();
-            if window.queue_atlas_upload(AtlasKind::Image, layer, spec, &buf, rects) {
-                window.clear_atlas_rects(AtlasKind::Image, layer);
-            }
-            *packed = buf;
         }
     }
 }

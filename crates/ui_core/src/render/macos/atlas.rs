@@ -207,6 +207,27 @@ impl AtlasTextures {
             if spec == texture.spec() {
                 continue;
             }
+            // fail-closed（RBT-01 不变量 2）：**扩层请求必须每一层都带整页上传**。重建后的数组
+            // 内容未定义，只有「所有已打开层的整页内容都在同一次重传里入队」才允许扩张；否则
+            // 这一帧直接拒绝（release 也生效，不是 debug_assert）。
+            if spec.layers > texture.spec().layers {
+                for layer in 0..spec.layers {
+                    let full = texture
+                        .pending
+                        .get(layer as usize)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|pending| {
+                            pending.spec.page == spec.page && pending.rects.is_full()
+                        });
+                    if !full {
+                        return Err(EngineError::AtlasGrowthIncomplete {
+                            kind,
+                            layer: u16::try_from(layer).unwrap_or(u16::MAX),
+                            layers: spec.layers,
+                        });
+                    }
+                }
+            }
             texture.recreate(device, queue, sequence, spec)?;
             rebuilt.mark(kind);
             // 重建后的数组内容未定义：本帧该图集上的每个待上传层都必须整页上传。

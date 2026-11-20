@@ -209,6 +209,9 @@ pub(crate) fn mark_atlas_page_stale(window: &mut Window, kind: AtlasKind) {
         AtlasKind::Image => {
             window.image_page_received = None;
             window.image_layers_received = [false; crate::paint::atlas::MAX_IMAGE_PAGES as usize];
+            // fail-closed（RBT-01 不变量 1）：数组内容不再可信 ⇒ 本帧一个图片层都不可画，
+            // 直到 `App::upload_image_page` 重新整组入队并把上限抬回来。
+            window.image_drawable_layers = 0;
             for rects in &mut window.image_atlas_rects {
                 rects.clear();
             }
@@ -475,6 +478,10 @@ fn reset_atlas_accounting(window: &mut Window) {
     window.glyph_page_received = None;
     window.image_page_received = None;
     window.image_layers_received = [false; crate::paint::atlas::MAX_IMAGE_PAGES as usize];
+    // fail-closed（RBT-01 不变量 1）：新渲染器还没有任何图片层内容 ⇒ 上限归零，等
+    // `App::upload_image_page` 整组入队后再抬回来。没有渲染器（headless / 快照）的窗口不走
+    // 这条路径，上限保持 `u32::MAX`（不过滤）。
+    window.image_drawable_layers = 0;
     window.glyph_atlas_rects = crate::render::DirtyRects::default();
     window.image_atlas_rects = std::array::from_fn(|_| crate::render::DirtyRects::default());
 }

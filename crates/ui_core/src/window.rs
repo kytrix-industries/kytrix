@@ -558,6 +558,10 @@ pub struct Window {
     /// 数组层数是运行时值（当前打开的页数），但每层内容独立：某层第一次入队前必须整层上传
     /// （资源层新页首帧整页脏）。下标 = 层号，数组界 = `MAX_IMAGE_PAGES`（页数上限）。
     image_layers_received: [bool; MAX_IMAGE_PAGES as usize],
+    /// 本帧图片图集的可画层数上限（fail-closed，RBT-01 不变量 1；见
+    /// [`Window::image_drawable_layers`]）。默认 `u32::MAX` = 不过滤：只有走 `App` 图集上传
+    /// pass 的窗口才会被改成「已整组入队的层数」。
+    image_drawable_layers: u32,
     /// 字形图集在本窗口上「已写脏、还没入队」的矩形（恒 layer 0）。
     glyph_atlas_rects: crate::render::DirtyRects,
     /// 图片图集每层的「已写脏、还没入队」矩形（下标 = texture array 层号）。
@@ -665,6 +669,7 @@ impl Window {
             glyph_page_received: None,
             image_page_received: None,
             image_layers_received: [false; MAX_IMAGE_PAGES as usize],
+            image_drawable_layers: u32::MAX,
             glyph_atlas_rects: crate::render::DirtyRects::default(),
             image_atlas_rects: std::array::from_fn(|_| crate::render::DirtyRects::default()),
             atlas_deferrals: 0,
@@ -1115,15 +1120,28 @@ impl Window {
     pub(crate) fn image_page_received(&self) -> bool {
         surface::image_page_received(self)
     }
-    /// 图片图集在本窗口已建立的 array 规格（测试诊断：层数 = 当前打开的图集页数；仅 Windows 的
-    /// 离屏 App 测试消费，其它平台的 cfg 构建不编译它）。
-    #[cfg(all(test, windows))]
+    /// 图片图集在本窗口已建立的 array 规格（`None` = 还没整组入队 / 渲染器已换）。
+    ///
+    /// 消费者：`App::upload_image_page`（逐窗口同步判据）+ Windows 离屏 App 测试。
     pub(crate) fn image_array_spec(&self) -> Option<crate::render::AtlasArraySpec> {
         self.image_page_received
     }
     /// 图片图集某层是否已经拿过整层上传（多页：新窗口 / 换渲染器 / 新页要逐层补齐）。
     pub(crate) fn image_layer_received(&self, layer: u16) -> bool {
         surface::image_layer_received(self, layer)
+    }
+    /// 本帧图片图集**可画层数上限**（fail-closed，RBT-01 不变量 1）。
+    ///
+    /// 只有该窗口渲染器已按当前数组规格**整组入队**过的层才允许进 draw（层号 `>=` 上限的
+    /// `Primitive::Image` 不产出实例）。`u32::MAX` = 不做过滤：没有 App 图集记账的驱动
+    /// （快照 / `Window::frame`）自行整份上传，保持旧行为。
+    #[cfg(test)]
+    pub(crate) fn image_drawable_layers(&self) -> u32 {
+        self.image_drawable_layers
+    }
+    /// 设置本帧可画层上限。消费者：`App::upload_image_page`（每帧逐窗口刷新）。
+    pub(crate) fn set_image_drawable_layers(&mut self, layers: u32) {
+        self.image_drawable_layers = layers;
     }
     /// 该图集在本窗口已建立的 array 规格是否就是 `spec`（页边长 + 层数；层数随页数增长）。
     pub(crate) fn atlas_page_matches(

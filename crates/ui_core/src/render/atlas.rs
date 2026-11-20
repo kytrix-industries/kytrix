@@ -100,6 +100,11 @@ pub(crate) struct AtlasArraySpec {
 /// macOS 的图集数组是**每窗口一份**（`AtlasTextures`），`prepare` 直接按 [`AtlasArraySpec`]
 /// 比对即可，没有「进程级重建请求」这一层，因此本类型与 [`merge_page_request`] 只在
 /// Windows / Linux 编译。
+///
+/// **fail-closed 契约（RBT-01 不变量 2）**：`spec.layers` 大于当前层数的请求要求**每一层**都
+/// 带整页上传（`App::upload_image_page` 的扩层帧保证这一点）。三端上传器在发出重建前都会校验，
+/// 缺层 / 增量层直接返回 [`EngineError::AtlasGrowthIncomplete`](crate::error::EngineError)
+/// —— release 也生效：重建后让半成品层进 draw 是未定义采样，比拒绝一帧糟得多。
 #[cfg(any(windows, target_os = "linux"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AtlasPageRequest {

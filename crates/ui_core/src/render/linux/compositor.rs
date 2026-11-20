@@ -1074,7 +1074,11 @@ impl GpuRenderer {
         ))
     }
 
-    /// 图集读锁内的「页对齐 → 录制 → 提交」循环（页换代需要释放读锁重试）。
+    /// 图集锁内的「页对齐 → 录制 → 提交」。
+    ///
+    /// 需要重建时在**写锁**里完成「重建 → 本窗口整组上传 → draw → 提交」，写锁释放前新数组的
+    /// 内容已经全部进队列 —— 别的窗口不会在「数组已换、内容还没拷」的空档里录制一帧
+    /// （RBT-01 跨窗口 fail-closed）。
     fn record_frame(
         &mut self,
         shared: &SharedGpu,
@@ -1086,89 +1090,121 @@ impl GpuRenderer {
         retired: &mut Vec<GpuResourceHandle>,
     ) -> Result<(u32, usize), EngineError> {
         let full = frame.is_full();
-        loop {
-            // 图集读锁：持有到本帧提交完成（页重建是写锁，会等这里释放）。
+        // 待上传 array 规格 ≠ 共享 array 规格 ⇒ 先落地换代 / 扩层。`reconcile_pages` 在 release
+        // 也拒绝「扩层但某层没有整页上传」的请求（RBT-01 不变量 2）。
+        let rebuild = {
             let atlas = shared.atlas();
-            // 待上传 array 规格 ≠ 共享 array 规格 ⇒ 先落地换代 / 扩层：整页上传触发重建，过期
-            // 上传直接丢弃。层数增长时 App 已对每个已打开页整页重传
-            // （见 `AtlasUploads::reconcile_pages`）。
-            let rebuild = self
-                .atlas_uploads
-                .reconcile_pages([atlas.spec(AtlasKind::Glyph), atlas.spec(AtlasKind::Image)]);
-            if !rebuild.is_empty() {
-                drop(atlas);
-                shared
-                    .rebuild_atlas_pages(&rebuild)
-                    .map_err(|error| self.classify(error))?;
-                continue;
-            }
-            // R11-10：描述符只在句柄真的变化时重写。上传缓冲只在扩容时换句柄，`clips` 的偏移
-            // 随容量固定 ⇒ 大多数帧这里什么都不做（旧实现每帧 2 次 `vkUpdateDescriptorSets`，
-            // 且要持进程级描述符池锁）。
-            let upload_buffer = self.upload.buffer(slot.index);
-            let previous = self.written_slots[slot.index];
-            if previous != Some((upload_buffer, clip_offset)) {
-                shared.write_slot(
-                    self.descriptors.sets(),
-                    slot.index,
-                    upload_buffer,
-                    clip_offset,
-                );
-                self.written_slots[slot.index] = Some((upload_buffer, clip_offset));
-            }
-            let command = self.commands[slot.index];
-            // SAFETY: 命令缓冲由本结构的命令池分配；本槽的上一次提交已由 `wait_slot` 等到。
-            unsafe {
-                shared
-                    .raw()
-                    .reset_command_buffer(command, vk::CommandBufferResetFlags::empty())
-                    .map_err(|error| init_error("reset_command_buffer", format!("{error:?}")))?;
-                shared
-                    .raw()
-                    .begin_command_buffer(
-                        command,
-                        &vk::CommandBufferBeginInfo::default()
-                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                    )
-                    .map_err(|error| init_error("begin_command_buffer", format!("{error:?}")))?;
-            }
-            if let Some(timer) = self.timer.as_ref() {
-                timer.begin(command, slot.index);
-            }
-            let atlas_retired = self
-                .atlas_uploads
-                .record_uploads(shared, &atlas, slot.index, command)?;
-            retired.extend(atlas_retired);
-            // X5：几何缓冲的页级增量上传（staging + `vkCmdCopyBuffer`）。必须在 begin render
-            // pass 之前：copy / buffer barrier 不能出现在 render pass 内。
-            let geometry_uploaded_bytes =
-                self.geometry
-                    .prepare(shared, command, payload.geometry(), retired)?;
-            let (draw_calls, geometry_retired) =
-                self.draw(shared, command, slot.index, payload, frame, full)?;
-            retired.extend(geometry_retired);
-            if let Some(image_index) = image_index {
-                self.copy_to_swapchain(shared, command, image_index, frame_written(frame))?;
-            }
-            if let Some(timer) = self.timer.as_ref() {
-                timer.end(command, slot.index);
-            }
-            // SAFETY: 命令录制的收尾。
-            unsafe {
-                shared
-                    .raw()
-                    .end_command_buffer(command)
-                    .map_err(|error| init_error("end_command_buffer", format!("{error:?}")))?;
-            }
-            self.submit_commands(shared, slot, command, slot.signal_value, image_index)?;
-            self.sync.advance(slot);
-            self.last_sequence = slot.signal_value;
-            // 读锁在这里释放（present 不需要它）。
-            drop(atlas);
-            return Ok((draw_calls, geometry_uploaded_bytes));
+            self.atlas_uploads
+                .reconcile_pages([atlas.spec(AtlasKind::Glyph), atlas.spec(AtlasKind::Image)])?
+        };
+        if !rebuild.is_empty() {
+            let mut atlas = shared.atlas_write();
+            shared
+                .rebuild_atlas_pages_locked(&mut atlas, &rebuild)
+                .map_err(|error| self.classify(error))?;
+            return self.record_locked(
+                shared,
+                &atlas,
+                slot,
+                payload,
+                frame,
+                image_index,
+                clip_offset,
+                retired,
+                full,
+            );
         }
+        // 图集读锁：持有到本帧提交完成（页重建是写锁，会等这里释放）。
+        let atlas = shared.atlas();
+        self.record_locked(
+            shared,
+            &atlas,
+            slot,
+            payload,
+            frame,
+            image_index,
+            clip_offset,
+            retired,
+            full,
+        )
     }
 
+    /// 在已持有的图集锁（读锁或写锁）下录制并提交一帧；重建由调用方在写锁里先落地。
+    fn record_locked(
+        &mut self,
+        shared: &SharedGpu,
+        atlas: &SharedAtlas,
+        slot: FrameSlot,
+        payload: &FramePayload,
+        frame: &mut FramePlan,
+        image_index: Option<u32>,
+        clip_offset: u64,
+        retired: &mut Vec<GpuResourceHandle>,
+        full: bool,
+    ) -> Result<(u32, usize), EngineError> {
+        // R11-10：描述符只在句柄真的变化时重写。上传缓冲只在扩容时换句柄，`clips` 的偏移
+        // 随容量固定 ⇒ 大多数帧这里什么都不做（旧实现每帧 2 次 `vkUpdateDescriptorSets`，
+        // 且要持进程级描述符池锁）。
+        let upload_buffer = self.upload.buffer(slot.index);
+        let previous = self.written_slots[slot.index];
+        if previous != Some((upload_buffer, clip_offset)) {
+            shared.write_slot(
+                self.descriptors.sets(),
+                slot.index,
+                upload_buffer,
+                clip_offset,
+            );
+            self.written_slots[slot.index] = Some((upload_buffer, clip_offset));
+        }
+        let command = self.commands[slot.index];
+        // SAFETY: 命令缓冲由本结构的命令池分配；本槽的上一次提交已由 `wait_slot` 等到。
+        unsafe {
+            shared
+                .raw()
+                .reset_command_buffer(command, vk::CommandBufferResetFlags::empty())
+                .map_err(|error| init_error("reset_command_buffer", format!("{error:?}")))?;
+            shared
+                .raw()
+                .begin_command_buffer(
+                    command,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .map_err(|error| init_error("begin_command_buffer", format!("{error:?}")))?;
+        }
+        if let Some(timer) = self.timer.as_ref() {
+            timer.begin(command, slot.index);
+        }
+        let atlas_retired = self
+            .atlas_uploads
+            .record_uploads(shared, atlas, slot.index, command)?;
+        retired.extend(atlas_retired);
+        // X5：几何缓冲的页级增量上传（staging + `vkCmdCopyBuffer`）。必须在 begin render
+        // pass 之前：copy / buffer barrier 不能出现在 render pass 内。
+        let geometry_uploaded_bytes =
+            self.geometry
+                .prepare(shared, command, payload.geometry(), retired)?;
+        let (draw_calls, geometry_retired) =
+            self.draw(shared, command, slot.index, payload, frame, full)?;
+        retired.extend(geometry_retired);
+        if let Some(image_index) = image_index {
+            self.copy_to_swapchain(shared, command, image_index, frame_written(frame))?;
+        }
+        if let Some(timer) = self.timer.as_ref() {
+            timer.end(command, slot.index);
+        }
+        // SAFETY: 命令录制的收尾。
+        unsafe {
+            shared
+                .raw()
+                .end_command_buffer(command)
+                .map_err(|error| init_error("end_command_buffer", format!("{error:?}")))?;
+        }
+        self.submit_commands(shared, slot, command, slot.signal_value, image_index)?;
+        self.sync.advance(slot);
+        self.last_sequence = slot.signal_value;
+        Ok((draw_calls, geometry_uploaded_bytes))
+    }
     /// 同步路径的收尾：等本帧完成 → 读本帧 GPU 时间 → 推进 retire（I4）。
     fn finish_sync(
         &mut self,
