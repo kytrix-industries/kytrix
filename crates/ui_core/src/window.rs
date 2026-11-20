@@ -769,6 +769,9 @@ impl Window {
     /// - 替换后标该节点**子树** `PAINT`：下一帧重建 lane，damage 来自新图元；**不**置整窗
     ///   damage，也**不**重算布局 —— Canvas 节点的尺寸仍由布局 / `LayoutOverride` 决定，
     ///   应用换画布前应保证尺寸与内容匹配（否则溢出/留白由应用负责）。
+    /// - 同时重建该节点的**几何反向绑定**：旧画布引用的 `GeometryId` 解绑、新画布引用的重新
+    ///   绑定。之后 `App::update_geometry_*` / `App::truncate_geometry` 会把这个 Canvas 节点
+    ///   标脏（画布引用的几何不再需要应用自己请求重绘）。
     /// - `AtlasTile` 的生命周期由调用方持有的 [`crate::resources::ResourceImage`] 决定：
     ///   引擎不会因替换而保留/延长旧 tile，也不会自动 `unload` 旧资源；应用负责对不再引用的
     ///   资源调用 `ResourceCache::unload`（或关窗时 `release_window`）。

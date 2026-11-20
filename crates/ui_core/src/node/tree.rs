@@ -533,9 +533,11 @@ pub struct NodeTree {
     ///
     /// 只在几何节点上有条目；paint 用它判断「哪些块的版本变了、只需要重建哪几条 lane」。
     geometry_chunks: ahash::HashMap<NodeId, SmallVec<[BakedGeometryChunk; 2]>>,
-    /// 几何 id → 绑定它的几何节点（**反向索引**，X5）。
+    /// 几何 id → 绑定它的节点（**反向索引**，X5）。
     ///
-    /// 几何数据 range 更新后据此 O(绑定数) 把节点标 `PAINT`（不扫描全树）；节点卸载时同步移除。
+    /// 绑定节点 = 几何节点（`NodeKind::Geometry`）+ 内容里引用了该几何的 Canvas 节点
+    /// （`Primitive::Geometry` / `Primitive::Path`）。几何数据 range 更新后据此 O(绑定数) 把
+    /// 节点标 `PAINT`（不扫描全树）；节点卸载 / Canvas 内容替换时同步重建。
     geometry_bindings: ahash::HashMap<GeometryId, SmallVec<[NodeId; 1]>>,
     /// paint 脏子树剪枝的**祖先闭包**戳记（按 arena 槽位；`paint_epoch` 的当前代次在闭包内）。
     ///
@@ -1110,6 +1112,9 @@ impl NodeTree {
         content::text_content(self, node)
     }
     /// 替换 Canvas 节点的画布内容（D-6 异步图片交付入口；语义见 `content::set_canvas`）。
+    ///
+    /// 同时**重建该节点的几何反向绑定**（旧内容引用的 `GeometryId` 解绑、新内容的重新绑定），
+    /// 几何数据 range 更新后该 Canvas 节点因此会自动标脏。
     pub(crate) fn set_canvas(
         &mut self,
         node: NodeId,
@@ -1294,17 +1299,20 @@ impl NodeTree {
     pub(crate) fn truncate_lanes(&mut self, node: NodeId, len: usize) {
         content::truncate_lanes(self, node, len)
     }
-    /// 把绑定到 `geometry` 的几何节点标 `PAINT`（几何数据 range 更新后由 `App` 调用）。
+    /// 把绑定到 `geometry` 的节点标 `PAINT`（几何数据 range 更新后由 `App` 调用）。
     ///
-    /// 与 `mark_paint` 的差别：**不清 `REUSABLE`、不并节点盒 damage** —— 几何数据的变化范围
-    /// 由块 bounds 精确给出（`paint` 在块 lane 重建时按旧∪新 bounds 记 damage），节点盒与
-    /// 其它绘制输出都没变，保守清 `REUSABLE` 会把整节点（含全部块 lane）都拖去重建。
+    /// 绑定节点有两类：几何节点（`NodeKind::Geometry`）与内容里引用了该几何的 Canvas 节点。
+    /// 对**几何节点**：**不清 `REUSABLE`、不并节点盒 damage** —— 几何数据的变化范围由块 bounds
+    /// 精确给出（`paint` 在块 lane 重建时按旧∪新 bounds 记 damage），节点盒与其它绘制输出都
+    /// 没变，保守清 `REUSABLE` 会把整节点（含全部块 lane）都拖去重建。
+    /// 对 **Canvas 节点**：内容按几何引用整体重新编码，因此走 `mark_paint`（清 `REUSABLE`、
+    /// 重建整条 lane、damage 按 Canvas 内容范围记）。
     ///
-    /// 返回标脏的节点数（`0` = 该几何没有绑定几何节点）。
+    /// 返回标脏的节点数（`0` = 该几何没有任何绑定节点）。
     pub(crate) fn mark_geometry_updated(&mut self, geometry: GeometryId) -> usize {
         content::mark_geometry_updated(self, geometry)
     }
-    /// 注册「几何 id → 几何节点」绑定（消费者：`arena::insert_child`）。
+    /// 注册「几何 id → 引用它的节点」绑定（消费者：`arena::insert_child` 的几何 / Canvas 分支）。
     pub(crate) fn bind_geometry_node(&mut self, geometry: GeometryId, node: NodeId) {
         content::bind_geometry_node(self, geometry, node)
     }

@@ -923,19 +923,21 @@ fn geometry_node_state(
     })
 }
 
-/// 某块在**逻辑空间**的 AABB（快照块表；空块退回整块几何 bounds）。`None` = 未注册句柄。
+/// 某块在**逻辑空间**的 AABB（快照块表；空块退回整块几何 `bounds`）。`None` = 未注册句柄。
+///
+/// **缺失块**（`truncate` 到 0 块时 paint 仍保留一条装饰 lane）不回退整块几何 `bounds`：
+/// 这条 lane 里没有几何内容，退回注册范围会把整个几何 bounds 并入 damage（清空图表时闪一次
+/// 过大 damage）。未注册句柄的退化（`None`）仍由调用方用节点盒 / clip 处理。
 fn geometry_chunk_local_bounds(
     snapshot: Option<&std::sync::Arc<crate::paint::geometry::GeometrySnapshot>>,
     chunk: usize,
 ) -> Option<Rect> {
     let snapshot = snapshot?;
-    Some(
-        snapshot
-            .chunk(chunk as u32)
-            .map(|meta| meta.bounds)
-            .filter(|bounds| !bounds.is_empty())
-            .unwrap_or_else(|| snapshot.bounds()),
-    )
+    Some(match snapshot.chunk(chunk as u32) {
+        Some(meta) if !meta.bounds.is_empty() => meta.bounds,
+        Some(_) => snapshot.bounds(),
+        None => Rect::default(),
+    })
 }
 
 /// 几何节点不可见 / 零尺寸：释放全部块 lane、清空块状态，并把旧块范围并入 damage。
@@ -1024,7 +1026,9 @@ fn paint_geometry_node(
     total: Point,
 ) -> Result<(), EngineError> {
     let snapshot = context.geometry.snapshot_arc(geometry_id);
-    // 块数：未注册句柄保守按 1 块（GPU 侧报 `GeometryRegister`，与旧行为一致）。
+    // 块数：未注册句柄保守按 1 块；已注册但 **0 块**（`truncate` 到 0 / 空几何）也保留 1 条
+    // 装饰 lane —— 几何 op 因 `snapshot.chunk(0)` 缺失而不发射，但节点自己的背景 / 边框 /
+    // 焦点环 / 节点盒 damage 仍需要一条 lane 承载（空数据不应让节点样式消失）。
     let desired = snapshot
         .as_ref()
         .map_or(1, |snapshot| snapshot.chunks().len().max(1));

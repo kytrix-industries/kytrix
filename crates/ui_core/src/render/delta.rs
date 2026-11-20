@@ -426,6 +426,13 @@ impl DeltaBuilder {
     }
 
     /// 一条 lane 引用的几何描述（只有变化 lane 会重新收集；未变化的 lane 的描述仍在缓存里）。
+    ///
+    /// **`Canvas` 内容也要收集**：`Primitive::Canvas` 是 lane 顶层的自绘逃生口，内容里的
+    /// `Primitive::Geometry` / `Primitive::Path` 只在编码期由 `paint/instance.rs::encode_primitive`
+    /// 递归展开；合成线程的 `GeometryCatalog` 只由 `delta.geometries` 填充，漏掉这一层会让
+    /// Canvas 内几何在 GPU 侧永远处于「未 prepare」状态（`GeometryRegister`）。`Canvas` 不能再
+    /// 嵌套 `Canvas`（`Canvas` 只有 `push_*`，没有 `push_canvas`），因此内层只需看一层。
+    /// 成本只发生在**变化 lane** 上（与顶层图元的收集同一处），稳态帧零工作。
     fn collect_geometries(
         &mut self,
         primitives: &[Primitive],
@@ -433,24 +440,41 @@ impl DeltaBuilder {
         delta: &mut SceneDelta,
     ) {
         for primitive in primitives {
-            let id = match primitive {
-                Primitive::Geometry(draw) => draw.id,
-                Primitive::Path(path) => path.geometry,
-                _ => continue,
-            };
-            let Some(snapshot) = store.snapshot_arc(id) else {
-                continue;
-            };
-            let known = self
-                .geometries
-                .get(&id)
-                .is_some_and(|cached| Arc::ptr_eq(cached, &snapshot));
-            if known {
-                continue;
+            match primitive {
+                Primitive::Geometry(draw) => self.note_geometry(draw.id, store, delta),
+                Primitive::Path(path) => self.note_geometry(path.geometry, store, delta),
+                Primitive::Canvas(canvas) => {
+                    for inner in canvas.primitives() {
+                        match inner {
+                            Primitive::Geometry(draw) => {
+                                self.note_geometry(draw.id, store, delta);
+                            }
+                            Primitive::Path(path) => {
+                                self.note_geometry(path.geometry, store, delta);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
             }
-            self.geometries.insert(id, Arc::clone(&snapshot));
-            delta.geometries.push((id, snapshot));
         }
+    }
+
+    /// 把一条几何引用并入 delta（缓存命中同一 `Arc` ⇒ 本帧不重复过线）。
+    fn note_geometry(&mut self, id: GeometryId, store: &GeometryStore, delta: &mut SceneDelta) {
+        let Some(snapshot) = store.snapshot_arc(id) else {
+            return;
+        };
+        let known = self
+            .geometries
+            .get(&id)
+            .is_some_and(|cached| Arc::ptr_eq(cached, &snapshot));
+        if known {
+            return;
+        }
+        self.geometries.insert(id, Arc::clone(&snapshot));
+        delta.geometries.push((id, snapshot));
     }
 
     /// lane 被释放：清掉它的版本与快照，并记进 delta 的移除表（回收实例段）。
@@ -837,6 +861,24 @@ mod tests {
 
     fn store() -> crate::paint::geometry_store::GeometryStore {
         crate::paint::geometry_store::GeometryStore::new()
+    }
+
+    /// 注册一个最小合法几何（delta 只关心 id + 快照，不看顶点内容）。
+    fn register(
+        store: &mut crate::paint::geometry_store::GeometryStore,
+    ) -> crate::paint::geometry::GeometryId {
+        use crate::paint::geometry::{GeometryDesc, GeometryPipeline, IndexType, Topology};
+        store
+            .insert(GeometryDesc {
+                vertex_bytes: bytes::Bytes::from_static(&[0u8; 12]),
+                index_bytes: bytes::Bytes::from_static(&[0u8; 6]),
+                vertex_stride: 12,
+                index_type: IndexType::U16,
+                topology: Topology::TriangleList,
+                bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
+                pipeline: GeometryPipeline::Ui,
+            })
+            .expect("注册几何")
     }
 
     /// 版本未变的 lane 不进入 delta（增量编码的 UI 侧判据）。
@@ -1483,5 +1525,164 @@ mod tests {
         let mut catalog = GeometryCatalog::new();
         catalog.apply(&delta);
         assert!(catalog.snapshot_arc(id).is_some());
+    }
+
+    /// Canvas 内容里的几何引用（`push_geometry` 的 `Geometry` 与 `push_path` 的 `Path` 两种来源）
+    /// 必须被收集进 `delta.geometries` —— 否则合成线程的 `GeometryCatalog` 拿不到快照，Canvas 内
+    /// 几何在 GPU 侧永远处于未 prepare 状态（`GeometryRegister`）。
+    ///
+    /// 这是基线缺口：`collect_geometries` 只认 lane 顶层图元，Canvas 内容只在编码期展开。
+    #[test]
+    fn canvas_contents_contribute_their_geometry_descriptions() {
+        use crate::{
+            math::Transform,
+            paint::{
+                canvas::Canvas,
+                geometry::GeometryId,
+                primitive::{GeometryDraw, Path},
+            },
+        };
+        let mut scene = Scene::empty();
+        let mut geometry = store();
+        let through_geometry = register(&mut geometry);
+        let through_path = register(&mut geometry);
+        let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+        canvas.push_geometry(GeometryDraw {
+            id: through_geometry,
+            transform: Transform::IDENTITY,
+            color: Color::WHITE,
+        });
+        canvas.push_path(Path {
+            bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
+            geometry: through_path,
+            fill: Color::WHITE,
+        });
+        let lane = scene.new_lane();
+        assert!(scene.push(lane, Primitive::Canvas(Arc::new(canvas))));
+        scene.set_order(&[lane]);
+
+        let mut builder = DeltaBuilder::new();
+        let mut delta = SceneDelta::empty(header(1, Plan::Full));
+        builder.collect(&mut scene, &geometry, &[], true, &mut delta);
+        let ids: Vec<GeometryId> = delta.geometries.iter().map(|(id, _)| *id).collect();
+        assert!(
+            ids.contains(&through_geometry),
+            "Canvas 内 `GeometryDraw` 引用的几何必须进 delta.geometries：{ids:?}"
+        );
+        assert!(
+            ids.contains(&through_path),
+            "Canvas 内 `Path` 引用的几何走同一条收集路径（也必须进 delta.geometries）：{ids:?}"
+        );
+        assert_eq!(delta.geometries.len(), 2, "两个不同 id 各携带一次");
+
+        // 同一条 lane 内容版本再变一次：快照 `Arc` 已缓存 ⇒ 不重复过线。
+        assert!(scene.push(lane, quad()));
+        let mut again = SceneDelta::empty(header(2, Plan::Partial(DamageRects::new())));
+        builder.collect(&mut scene, &geometry, &[], false, &mut again);
+        assert_eq!(again.lanes.len(), 1, "lane 内容确实变了");
+        assert!(again.geometries.is_empty(), "描述已缓存 ⇒ 不重复过线");
+    }
+
+    /// 顶层 `Primitive::Path` 原本就已被收集（缺口只在 Canvas 容器内部，不是 Path 图元本身）。
+    #[test]
+    fn top_level_paths_are_already_collected() {
+        use crate::paint::primitive::Path;
+        let mut scene = Scene::empty();
+        let mut geometry = store();
+        let id = register(&mut geometry);
+        let lane = scene.new_lane();
+        assert!(scene.push(
+            lane,
+            Primitive::Path(Path {
+                bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
+                geometry: id,
+                fill: Color::WHITE,
+            })
+        ));
+        scene.set_order(&[lane]);
+        let mut builder = DeltaBuilder::new();
+        let mut delta = SceneDelta::empty(header(1, Plan::Full));
+        builder.collect(&mut scene, &geometry, &[], true, &mut delta);
+        assert_eq!(
+            delta
+                .geometries
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![id]
+        );
+    }
+
+    /// `set_canvas` 换成不含几何的内容后（lane 重建 = 清空 + push 新 Canvas）：
+    /// - 变化帧（`full == false`）不再携带旧几何描述；
+    /// - `GeometryCatalog::apply` 的**现有语义**：非 full 只增不清（旧快照仍在），full 先清空再并入
+    ///   本帧描述（旧快照在帧内不再被引用 ⇒ 被驱逐）。测试按这个语义断言，不发明驱逐逻辑。
+    #[test]
+    fn replacing_canvas_contents_stops_carrying_the_old_geometries() {
+        use crate::{
+            math::Transform,
+            paint::{canvas::Canvas, primitive::GeometryDraw},
+        };
+        let mut scene = Scene::empty();
+        let mut geometry = store();
+        let first = register(&mut geometry);
+        let second = register(&mut geometry);
+        let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+        canvas.push_geometry(GeometryDraw {
+            id: first,
+            transform: Transform::IDENTITY,
+            color: Color::WHITE,
+        });
+        canvas.push_geometry(GeometryDraw {
+            id: second,
+            transform: Transform::IDENTITY,
+            color: Color::WHITE,
+        });
+        let lane = scene.new_lane();
+        assert!(scene.push(lane, Primitive::Canvas(Arc::new(canvas))));
+        scene.set_order(&[lane]);
+        let mut builder = DeltaBuilder::new();
+        let mut first_delta = SceneDelta::empty(header(1, Plan::Full));
+        builder.collect(&mut scene, &geometry, &[], true, &mut first_delta);
+        assert_eq!(first_delta.geometries.len(), 2);
+
+        // 换成不含几何的 Canvas（与 `NodeTree::set_canvas` 的 lane 重建同构）。
+        assert!(scene.clear_lane(lane));
+        assert!(scene.push(
+            lane,
+            Primitive::Canvas(Arc::new(Canvas::new(Rect::new(0.0, 0.0, 8.0, 8.0))))
+        ));
+        let mut changed = SceneDelta::empty(header(2, Plan::Partial(DamageRects::new())));
+        builder.collect(&mut scene, &geometry, &[], false, &mut changed);
+        assert_eq!(changed.lanes.len(), 1, "lane 版本必须变化");
+        assert!(
+            changed.geometries.is_empty(),
+            "新内容不引用几何 ⇒ 变化帧不得携带旧描述：{:?}",
+            changed.geometries
+        );
+
+        // 非 full：catalog 只增不清 ⇒ 旧快照仍在（现有语义，不是本测试要修的行为）。
+        let mut incremental = GeometryCatalog::new();
+        incremental.apply(&first_delta);
+        incremental.apply(&changed);
+        for id in [first, second] {
+            assert!(
+                incremental.snapshot_arc(id).is_some(),
+                "非 full 的 catalog 不驱逐旧描述（现有语义）"
+            );
+        }
+        // full：catalog 先清空；本帧内容里已没有几何 ⇒ 旧快照被驱逐。
+        let mut full_delta = SceneDelta::empty(header(3, Plan::Full));
+        builder.collect(&mut scene, &geometry, &[], true, &mut full_delta);
+        assert!(full_delta.geometries.is_empty());
+        let mut full = GeometryCatalog::new();
+        full.apply(&first_delta);
+        full.apply(&full_delta);
+        for id in [first, second] {
+            assert!(
+                full.snapshot_arc(id).is_none(),
+                "full 帧清空后旧描述不再被引用 ⇒ catalog 查不到"
+            );
+        }
     }
 }

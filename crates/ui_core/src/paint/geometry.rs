@@ -185,17 +185,23 @@ pub struct GeometryDesc {
     pub pipeline: GeometryPipeline,
 }
 
-/// 一次 `GeometryStore::update_vertices` / `update_indices` 成功的回执。
+/// 一次 `GeometryStore::update_vertices` / `update_indices` / `truncate` 成功的回执。
 ///
-/// `damaged` 是**受影响块**「旧 bounds ∪ 新 bounds」的并集（逻辑像素）。顶点位移时旧位置与新
-/// 位置都必须重画，因此是两侧并集而不是新值；没有块受影响（比如追加了一段暂时未被索引引用的
-/// 顶点）时为空矩形。
+/// `damaged` 是**受影响块**「旧 bounds ∪ 新 bounds」的并集（逻辑像素），与 `update_*` 同口径：
+/// 顶点位移时旧位置与新位置都必须重画；截断时 = 被移除块的**旧 AABB** ∪ 变短尾块的
+/// **旧 ∪ 新 AABB**（收缩时新通常是旧的子集，代码仍按两侧并集计算，保持与 update 一致）。
+/// 没有可见变化（比如追加了一段暂时未被索引引用的顶点、截断到当前长度）时为空矩形。
 ///
-/// 消费者：`App::update_geometry_*` 把它并入绑定几何节点的 damage（节点由引擎自动标脏，应用
-/// 不需要自己再声明 damage）。
+/// 消费者：`App::update_geometry_*` / `App::truncate_geometry` 把它并入绑定节点的标脏判断
+/// （节点由引擎自动标脏，应用不需要自己再声明 damage）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GeometryUpdate {
-    /// 更新后的几何版本（单调递增；无可见变化时也会前进）。GPU 侧据此判断快照新旧。
+    /// 更新后的几何版本。
+    ///
+    /// - `update_vertices` / `update_indices`：**只要真的改了数据就前进**（即使没有块受影响、
+    ///   没有可见变化也会前进；GPU 侧据此判断快照新旧）；
+    /// - `truncate`：真的缩短时前进；**两个目标都等于当前长度（合法 no-op）时返回当前版本、
+    ///   不前进**（没有可上传的差异，也不 damage / 不标脏）。
     pub revision: u64,
     /// 受影响块的旧 ∪ 新 AABB（逻辑像素；空 = 本次更新没有改变任何块的可见范围）。
     pub damaged: Rect,
