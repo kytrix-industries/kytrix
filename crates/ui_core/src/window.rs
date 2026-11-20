@@ -1167,7 +1167,8 @@ impl Window {
             .is_some_and(|renderer| renderer.atlas_participating())
     }
     /// 仅测试：注入「不参与渲染」状态（RBT-10 回归；offscreen 渲染器恒参与，无法天然构造）。
-    #[cfg(test)]
+    /// 消费方只有 Windows 的 App 图集测试。
+    #[cfg(all(test, windows))]
     pub(crate) fn set_atlas_participating_for_test(&mut self, participating: bool) {
         self.atlas_participating_override = Some(participating);
     }
