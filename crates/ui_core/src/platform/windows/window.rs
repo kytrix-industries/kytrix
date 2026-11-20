@@ -7,11 +7,20 @@
 //! 客户区**没有**系统的重定向表面（`WS_EX_NOREDIRECTIONBITMAP`）：窗口的全部像素由
 //! [`Composition`] 合成的组合交换链提供。内容 visual 恒 1:1（resize 不缩放旧内容）；窗口放大
 //! 露出的新区域由下方独立的背景层填充。
+//!
+//! **owner / 模态**（X1 / RB-13）：owned 窗口走 `CreateWindowExW` 的 `hWndParent` owner 语义；
+//! 模态窗口把「本窗口是 owner 的模态窗口」登记在**窗口自身的 Win32 属性表**里
+//! （[`MODAL_OWNER_PROPERTY`]，随窗口销毁由 USER 回收），owner 的恢复判据是**枚举同线程活窗口
+//! 的派生值**（[`another_modal_window_for`]）—— 不是引用计数，因此同一 owner 的多个模态窗口
+//! 关其一时不会提前恢复。
 
 use std::{
     cell::RefCell,
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use windows::{
@@ -55,6 +64,13 @@ const CLASS_NAME: &str = "KytrixGuiWindow";
 /// 「owner 上还有几个活模态窗口」永远是**当前窗口集合的派生值**（销毁时用
 /// [`another_modal_window_for`] 枚举本线程窗口读出），不存在需要在异常路径上维护的计数器。
 const MODAL_OWNER_PROPERTY: &str = "KytrixModalOwner";
+
+/// [`MODAL_OWNER_PROPERTY`] 写入失败诊断的一次性开关（RBW-04：degrade, never panic）。
+///
+/// 属性表分配失败（≈OOM）时窗口降级为「没有原生模态」：owner 保持可交互，但引擎分发层
+/// 仍按 `App` 窗口表把它当模态 owner 拦输入。失败本身不可注入 e2e，因此至少让第一次降级
+/// 在日志里可见（与 `dark_mode::WINDOW_ATTRIBUTE_FAILURE_REPORTED` 同一口径，不刷屏）。
+static MODAL_PROPERTY_FAILURE_REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// `WindowOptions::position = None` 时的默认窗口外框左上角（物理像素）。
 ///
@@ -217,12 +233,17 @@ impl NativeWindow {
         // **先登记、再禁用**：把「本窗口是 owner 的模态窗口」写在**本窗口自己**的窗口属性表里
         //（[`MODAL_OWNER_PROPERTY`]，值 = owner HWND）。属性随窗口对象一起销毁，所以
         // `destroy` 可以按「当前还活着的窗口」派生 owner 的禁用状态，而不是维护一个会在建窗
-        // 失败 / `DestroyWindow` 失败 / 级联关闭时漂移的计数器。登记失败（属性表分配失败）
-        // ⇒ 降级为「没有原生模态」并且**不**禁用 owner：宁可只靠引擎层拦截，也不留下一个
-        // 「禁用了却没有任何恢复依据」的状态。
+        // 失败 / `DestroyWindow` 失败 / 级联关闭时漂移的计数器。
         //
-        // 放在所有可失败步骤**之后**：此后的失败只有 `apply_dpi_and_size`，它返回 `Err` 时
-        // `window` 会被 `Drop`（进而 `destroy`）回收，owner 由同一套派生逻辑恢复。
+        // 登记失败（属性表分配失败）⇒ 降级为「没有原生模态」并且**不**禁用 owner：宁可只靠
+        // 引擎层拦截，也不留下一个「禁用了却没有任何恢复依据」的状态。降级语义：引擎分发层
+        //（`app::window_set::is_input_blocked_by_modal`）仍按 `App` 窗口表把 owner 当模态 owner
+        // 拦输入，只是原生 owner 可交互、不灰显 —— 与 `EnableWindow` 失败的既有降级同口径；
+        // 第一次降级写一条诊断（[`MODAL_PROPERTY_FAILURE_REPORTED`]）。
+        //
+        // 放在 `create` 内所有可失败步骤**之后**：此后的失败（这里的 `apply_dpi_and_size`，
+        // 以及 `create` 返回后调用方的 `Renderer::new_for_hwnd` / `composition.set_geometry`）
+        // 都由 `Drop` → `destroy` 回收，owner 由同一套派生逻辑恢复。
         if options.modal
             && let Some(owner_hwnd) = owner
         {
@@ -239,6 +260,14 @@ impl NativeWindow {
                 unsafe {
                     let _ = EnableWindow(owner_hwnd, false);
                 }
+            } else if !MODAL_PROPERTY_FAILURE_REPORTED.swap(true, Ordering::Relaxed) {
+                // RBW-04：属性表分配失败只降级、不 panic；诊断只打一次（同 dark_mode 口径），
+                // 让「原生 owner 不禁用、引擎仍按模态拦输入」的降级可被观测（≈OOM 不可 e2e 注入）。
+                eprintln!(
+                    "kytrix: SetPropW({MODAL_OWNER_PROPERTY}) failed; this modal window carries no \
+                     native mark, so its owner is not disabled natively (the engine still filters \
+                     the owner's input as modal)"
+                );
             }
         }
 
@@ -677,23 +706,26 @@ impl NativeWindow {
         // 随窗口销毁消失，因此建窗失败 / `DestroyWindow` 失败 / owner 级联销毁都不会留下
         // 一个需要单独维护、会漂移的计数。
         //
-        // 本窗口已被系统随 owner 一起销毁时（`hwnd` 失效）没有标记可摘，也无需恢复：
-        // owned 窗口只会在 owner 销毁时被系统带走，而那时 owner 本身已失效。
+        // 本窗口可能已被系统随 owner 一起销毁（owner 级联销毁路径）：`HWND::is_invalid()` 只查
+        // 空指针，此时 `self.hwnd` 是**已销毁但非空**的僵尸句柄。下面的代码不假设句柄仍存活：
+        // USER 对已销毁句柄只做校验失败 —— `GetPropW` 返回 NULL（于是不走恢复）、
+        // `RemovePropW` / `EnableWindow` 只返回失败，不会解引用；随后的 IME/合成清理与
+        // `DestroyWindow` 对僵尸句柄同样安全失败。
         if !self.hwnd.is_invalid() {
             let property = wide(MODAL_OWNER_PROPERTY);
-            // SAFETY: `self.hwnd` 仍存活（本函数随后的 `DestroyWindow` 才销毁它）；`property`
-            // 是本函数栈上的 NUL 结尾 UTF-16 缓冲；`GetPropW` / `RemovePropW` 只动本进程
-            // 窗口的属性表。
+            // SAFETY: `self.hwnd` **可能已失效但非空**（owner 级联销毁，见上）；`GetPropW` /
+            // `RemovePropW` 只按句柄查本进程窗口的属性表，句柄失效时 USER 返回 NULL / 失败、
+            // 不解引用。`property` 是本函数栈上的 NUL 结尾 UTF-16 缓冲（调用同步拷贝）。
             let owner = unsafe { GetPropW(self.hwnd, PCWSTR(property.as_ptr())) };
             if !owner.is_invalid() {
-                // SAFETY: 同上；属性值只是 owner 句柄，系统不接管所有权。
+                // SAFETY: 同上（属性表查找按句柄校验；数据只是 owner 句柄，系统不接管所有权）。
                 unsafe {
                     let _ = RemovePropW(self.hwnd, PCWSTR(property.as_ptr()));
                 }
                 let owner = HWND(owner.0);
                 if !another_modal_window_for(owner, self.hwnd) {
-                    // SAFETY: owner 句柄来自本进程活着的 `NativeWindow`（解析时保证）；
-                    // 失效时调用只返回 FALSE，不 UB。
+                    // SAFETY: owner 可能也已失效（级联路径）；`EnableWindow` 对失效句柄只返回
+                    // FALSE、不解引用。有效时它来自本进程活着的 `NativeWindow`（解析时保证）。
                     unsafe {
                         let _ = EnableWindow(owner, true);
                     }
