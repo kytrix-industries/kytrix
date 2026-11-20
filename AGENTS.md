@@ -128,85 +128,7 @@ Dicebear 相关代码可以例外。
 
 ---
 
-## 5. 测试组织
-
-遵循 Rust 官方对 unit test 和 integration test 的职责划分。
-
-### 5.1 Unit Tests
-
-* Unit test 放在 `src/` 中，并与被测试的生产代码保持在同一模块内。
-* 使用 `#[cfg(test)] mod tests` 组织 unit test。
-* Unit test 可以访问被测试模块的私有字段、私有函数和内部实现。
-* 测试单个模块或内部实现时，使用 unit test。
-* 测试代码较多时，可以按照项目统一的模块布局拆分为多个文件，但生产代码和对应测试仍应保持在同一模块边界内。
-* 不创建 crate 级别和 module 级别的独立 `tests.rs` 集中存放 unit test。
-* 如果确实有需要在多个测试之间共享的基础设置，则在同一模块下引入 `test_support.rs`。
-
-### 5.2 Integration Tests
-
-* Integration test 放在 crate 根目录的 `tests/` 下。
-* `tests/` 下的每个顶层 `.rs` 文件都是独立的 integration-test target。
-* Integration test 只能通过 crate 的公开 API 访问被测试代码。
-* Integration test 不使用 `#[cfg(test)]`。
-* 当测试多个模块之间的协作、完整功能流程或 crate 的公共 API 时，使用 integration test。
-* 不要为了访问私有实现而将 unit test 改成 integration test。
-
-### 5.3 测试代码组织
-
-* 禁止使用 `#[path = "..."]` 引入测试模块。
-* Integration test 应保持独立和清晰，避免为了少量共享 helper 引入额外抽象。
-* 确实需要跨多个 integration test 共享复杂测试基础设施时，应采用符合项目模块规范的明确测试支持方案。
-
-### 5.4 Binary Crate
-
-* 如果 crate 是 binary crate，应将主要业务逻辑放入 `src/` 下独立的模块中。
-* `src/main.rs` 尽量只负责程序启动、参数解析和顶层组装。
-* 如果需要通过 integration test 测试业务逻辑，可以提供 `src/lib.rs` 作为 library crate 的入口，但 `lib.rs` 只负责模块声明和公开
-  API 导出，不直接实现业务逻辑。
-* 不要将大量业务逻辑直接堆在 `src/main.rs`，也不要为了 integration test 而将业务逻辑堆积到 `src/lib.rs`。
-
-### 5.5 Library Crate
-
-* `src/lib.rs` 只负责统一管理 crate 的模块声明和导入。
-* `src/lib.rs` 不编写生产代码。
-* `src/lib.rs` 不编写测试代码。
-* 不在 `lib.rs` 中定义结构体、枚举、trait、函数、常量、类型别名或其他业务实现。
-* `lib.rs` 中仅允许存在必要的 `mod`、`pub mod` 两种模块组织代码，具体实现必须放在对应的模块文件中。
-* Unit test 必须放在实际被测试的模块中，而不是 `lib.rs`。
-* 如果 `lib.rs` 中的模块声明较多，也不要为了减少 `lib.rs` 内容而增加额外的聚合层；保持 `lib.rs` 作为 crate 的模块入口即可。
-* 对于 binary crate，即使需要提供 integration test 使用的 library crate，也必须遵守本规则；业务逻辑应放入 `src/` 下独立的模块中，由
-  `lib.rs` 统一导出。
-
-例如：
-
-```text
-src/
-├── lib.rs
-├── main.rs
-├── config.rs
-├── service.rs
-├── database.rs
-├── trading.rs
-└── trading/
-    ├── order.rs
-    └── position.rs
-```
-
-其中 `lib.rs` 只负责模块组织：
-
-```rust
-mod config;
-mod database;
-mod service;
-pub mod trading;
-```
-
-而不应该直接在 `lib.rs` 中实现 `Service`、测试函数或其他业务逻辑。
-
-
----
-
-## 6. 依赖管理
+## 5. 依赖管理
 
 * 所有依赖必须在 workspace 根目录的 `Cargo.toml` 中声明。
 * 各个 crate 通过 workspace dependency 使用这些依赖。
@@ -216,7 +138,7 @@ pub mod trading;
 
 ---
 
-## 7. 小型函数与无意义抽象
+## 6. 小型函数与无意义抽象
 
 * 禁止为了“封装”而封装超小型函数。
 * 特别禁止创建只返回一个或多个变量、常量或简单表达式的函数。
@@ -225,7 +147,7 @@ pub mod trading;
 
 ---
 
-## 8. 实现前检查清单
+## 7. 实现前检查清单
 
 在实现新的功能或修改架构之前：
 
@@ -240,7 +162,7 @@ pub mod trading;
 
 ---
 
-## 9. 验收
+## 8. 验收
 
 1. `cargo test` 通过
 2. `cargo +nightly clippy -- -D warnings` 通过
