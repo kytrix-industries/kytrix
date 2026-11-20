@@ -881,6 +881,91 @@ fn growing_the_image_array_waits_until_every_window_can_take_the_whole_array() {
         "扩层帧必须对每个已打开层整页重传"
     );
 }
+/// RBT-13：**部分层入队失败** ⇒ 数组不推进、可画层不抬、设备侧只会看到 fail-closed 错误。
+///
+/// 这是 P1 修复（RBT-01 不变量 2「数组只在全层就绪时扩张」）的核心安全前提：`advanced` 必须
+/// 要求**每一个已打开层**都入队成功，而不是「至少入队了一层」。变异 M18（判据改成
+/// `!enqueued.is_empty()`）⇒ 本测试红。
+#[cfg(windows)]
+#[test]
+fn a_partial_layer_enqueue_does_not_advance_the_image_array() {
+    use crate::{paint::atlas::AtlasKind, render::AtlasArraySpec};
+
+    let _guard = crate::render::windows::device::gpu_test_lock();
+    let (_rt, mut app, first) = setup();
+    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
+    for index in 0..2u8 {
+        let _ = app
+            .resources_mut()
+            .insert(&png_rgba([index + 1, 20, 30, 255]))
+            .expect("insert");
+    }
+    app.window_mut(first)
+        .expect("first")
+        .enable_offscreen_renderer()
+        .expect("offscreen renderer");
+    app.upload_atlas_pages();
+    assert_eq!(
+        app.image_array_established_for_test(),
+        Some(AtlasArraySpec {
+            page: 16,
+            layers: 1
+        })
+    );
+    app.window_mut(first).expect("first").request_repaint();
+    let _ = app.frame(first).expect("frame").expect("ok");
+
+    // 第 3 张图 ⇒ 第 2 页；注入「layer 0 成功、layer 1 起失败」的部分入队。
+    let _ = app
+        .resources_mut()
+        .insert(&png_rgba([200, 1, 2, 255]))
+        .expect("insert");
+    assert_eq!(app.resources().page_count(), 2);
+    app.window_mut(first)
+        .expect("first")
+        .set_atlas_upload_failure_for_test(Some(1));
+    app.upload_atlas_pages();
+    assert_eq!(
+        app.image_array_established_for_test(),
+        Some(AtlasArraySpec {
+            page: 16,
+            layers: 1
+        }),
+        "部分层入队失败不得推进 App 记账的图片数组"
+    );
+    assert_eq!(
+        app.window(first).expect("first").image_array_spec(),
+        Some(AtlasArraySpec {
+            page: 16,
+            layers: 1
+        }),
+        "该窗口仍只有旧层可用"
+    );
+    assert_eq!(
+        app.window(first).expect("first").image_drawable_layers(),
+        0,
+        "可画层不得抬起（本帧一层都不可画是 fail-closed 的代价）"
+    );
+    assert_eq!(
+        app.window(first)
+            .expect("first")
+            .atlas_pending_layers(AtlasKind::Image),
+        Some(vec![0]),
+        "只有第 0 层被入队（部分层），设备侧不应收到完整扩层请求"
+    );
+    // 再跑一次（注入仍生效）：仍不得推进；设备侧的 release 校验由
+    // `reconcile_pages_rejects_growth_without_a_full_page_upload_for_every_layer` 单独覆盖。
+    app.upload_atlas_pages();
+    assert_eq!(
+        app.image_array_established_for_test(),
+        Some(AtlasArraySpec {
+            page: 16,
+            layers: 1
+        }),
+        "重复遇到部分层入队失败也不得推进"
+    );
+}
+
 /// RBT-09：扩层被忙槽挡住时，可画层必须**按窗口**收敛。
 ///
 /// macOS 的图片数组是每窗口一份：新窗口 / 刚重挂渲染器的窗口此时仍是 1×1×1 占位

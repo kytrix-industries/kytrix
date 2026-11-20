@@ -823,6 +823,18 @@ impl Shared {
         self.atlas_participating.load(Ordering::Acquire)
     }
 
+    /// 发布「本轮是否参与渲染」，并返回本轮是否**跳过渲染**（遮挡 / 最小化且非
+    /// `force_present`）。
+    ///
+    /// 「跳过」与「不参与扩层闸门」必须由同一个表达式决定（RBT-10 / RBT-14）：GPU 循环只
+    /// 调用本函数，不再自己拼条件。跳过 ⇒ 本循环不会 `take_atlas`，待上传位会一直亮着，必须
+    /// 让 App 的扩层闸门把它排除在外；恢复可见（或 `force_present` 放行）⇒ 重新参与。
+    fn publish_atlas_participation(&self, occluded: bool, force_present: bool) -> bool {
+        let skip = occluded && !force_present;
+        self.set_atlas_participating(!skip);
+        skip
+    }
+
     fn publish_frame(&self, request: FrameRequest) {
         let mut state = self.lock();
         if state.shutdown || state.terminated {
@@ -1485,17 +1497,15 @@ fn run_gpu_loop(
         // R07-14：显示 / 电源恢复之后的**第一帧**例外（`force_present`）—— 锁屏 / RDP 断连 /
         // 睡眠回来时 `IsIconic` / `DWMWA_CLOAKED` 可能仍是陈旧值，若照常退避，「唤醒后出帧」
         // 就要等用户再碰一下窗口，恢复等于没做。
-        if renderer.window_occluded() && !force_present {
+        //
+        // RBT-10：这一轮是否跳过渲染与「是否参与图集扩层闸门」由**同一个函数**决定
+        // （`Shared::publish_atlas_participation`）：跳过 ⇒ 不参与（本循环不会 `take_atlas`，
+        // 待上传位会一直亮着，计入 `atlas_idle` 门禁会永久挡住其它窗口的扩层）。
+        if shared.publish_atlas_participation(renderer.window_occluded(), force_present) {
             crate::render::windows::diagnostics::occluded_skipped();
-            // RBT-10：本轮不参与渲染 —— 本循环不会 `take_atlas`，待上传位会一直亮着。把状态
-            // 发布给 UI 的扩层闸门，让它把本窗口排除在 `atlas_idle` 门禁之外（否则会永久
-            // 挡住其它窗口的扩层）；恢复可见时再置回 true。
-            shared.set_atlas_participating(false);
             wait_for_work_or_completion(shared, Some(OCCLUDED_POLL_INTERVAL))?;
             continue;
         }
-        // 能走到这里 ⇒ 本轮会正常取帧 / 消费图集上传（遮挡分支已排除）。判据与真正的跳过同源。
-        shared.set_atlas_participating(true);
         if !shared.has_pending_frame() {
             // 空闲：睡在 [work, completion] 上（完成由 fence 的 `SetEventOnCompletion` 明确唤醒，
             // 不轮询；没有待画帧时也不等 waitable，I3 的「每帧恰好一次」）。
@@ -2169,6 +2179,39 @@ mod tests {
             atlas_pending: [AtomicU32::new(0), AtomicU32::new(0)],
             atlas_participating: AtomicBool::new(true),
         })
+    }
+
+    /// RBT-14：真实接线同源 —— 「本轮跳过渲染」与「不参与图集扩层闸门」由**同一个判据**
+    /// 发布（`Shared::publish_atlas_participation`，GPU 循环只调用它）。
+    ///
+    /// 覆盖三种组合：遮挡+非 force_present ⇒ 跳过且不参与；可见 ⇒ 不跳过且参与；
+    /// 遮挡+force_present（R07-14 恢复放行）⇒ 不跳过且参与（与 `take_frame` 一致）。
+    ///
+    /// 变异 M19（删掉 false 写入 / 恒写 true）⇒ 本测试红。
+    #[test]
+    fn atlas_participation_follows_the_same_occlusion_decision() {
+        let shared = test_shared();
+        assert!(
+            shared.publish_atlas_participation(true, false),
+            "遮挡且非 force_present ⇒ 跳过渲染"
+        );
+        assert!(
+            !shared.atlas_participating(),
+            "跳过的窗口必须不参与扩层闸门（否则待上传位永久挡住其它窗口）"
+        );
+        assert!(
+            !shared.publish_atlas_participation(false, false),
+            "可见 ⇒ 不跳过"
+        );
+        assert!(shared.atlas_participating(), "可见窗口必须参与扩层闸门");
+        assert!(
+            !shared.publish_atlas_participation(true, true),
+            "force_present 放行 ⇒ 不跳过（恢复后的第一帧必须出帧）"
+        );
+        assert!(
+            shared.atlas_participating(),
+            "放行的那一帧同样参与（与 take_frame 的实际行为一致）"
+        );
     }
 
     /// AR4 P1-1（GPU 侧）：渲染器重建（设备恢复）必须让 UI 通过 `FrameSink::reset_epoch` 看到

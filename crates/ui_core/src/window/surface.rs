@@ -328,6 +328,14 @@ pub(crate) fn queue_atlas_upload(
     pixels: &[u8],
     rects: crate::render::DirtyRects,
 ) -> bool {
+    // RBT-13 测试注入：从第 `from` 层起返回 false，构造「部分层入队成功」的边界。
+    #[cfg(all(test, windows))]
+    if window
+        .atlas_upload_failure_from
+        .is_some_and(|from| layer >= from)
+    {
+        return false;
+    }
     window
         .renderer
         .as_mut()
