@@ -1468,6 +1468,7 @@ fn virtual_rows_carry_their_position_in_the_set() {
             container,
             VirtualListConfig {
                 extent: 25.0,
+                extents: None,
                 overscan: 0,
             },
         )
@@ -1518,6 +1519,7 @@ fn virtual_list_mounts_the_visible_window_and_recycles() {
             container,
             VirtualListConfig {
                 extent: 25.0,
+                extents: None,
                 overscan: 0,
             },
         )
@@ -2063,6 +2065,7 @@ fn virtual_list_mounts_rows_on_the_first_frame_and_grows_on_resize() {
             container,
             VirtualListConfig {
                 extent: 25.0,
+                extents: None,
                 overscan: 0,
             },
         )
@@ -2135,6 +2138,7 @@ fn virtual_rows_are_laid_out_with_the_configured_extent() {
             container,
             VirtualListConfig {
                 extent: 25.0,
+                extents: None,
                 overscan: 0,
             },
         )
