@@ -291,6 +291,15 @@ impl Renderer {
         }
     }
 
+    /// 该窗口本轮是否参与渲染（遮挡 / 最小化跳过的窗口不参与图集扩层闸门，RBT-10）。
+    pub(crate) fn atlas_participating(&self) -> bool {
+        match &self.target {
+            // 离屏目标由调用方同步提交帧，没有「跳过」状态。
+            RenderTarget::Offscreen(_) => true,
+            RenderTarget::Window(window) => window.atlas_participating(),
+        }
+    }
+
     /// 测试：离屏目标上某图集**已入队未录制**的层号（窗口路径的上传在 GPU 线程里，返回 `None`）。
     #[cfg(test)]
     pub(crate) fn atlas_pending_layers(&self, kind: AtlasKind) -> Option<Vec<u16>> {
@@ -487,6 +496,7 @@ impl WindowRenderer {
             composition_pending: AtomicBool::new(false),
             composition_rebuild: AtomicBool::new(false),
             atlas_pending: [AtomicU32::new(0), AtomicU32::new(0)],
+            atlas_participating: AtomicBool::new(true),
         });
         let worker = Arc::clone(&shared);
         let thread = thread::Builder::new()
@@ -536,6 +546,11 @@ impl WindowRenderer {
 
     fn atlas_idle(&self, kind: AtlasKind) -> bool {
         self.shared.atlas_idle(kind)
+    }
+
+    /// 本轮该窗口是否参与渲染（GPU 循环遮挡 / 最小化跳过的窗口不参与图集扩层闸门）。
+    fn atlas_participating(&self) -> bool {
+        self.shared.atlas_participating()
     }
 
     fn set_background_color(&self, rgba: [f32; 4]) {
@@ -655,6 +670,11 @@ struct Shared {
     /// 每 `AtlasKind` 的图集上传槽位掩码（bit n = texture array 的第 n 层正在被 GPU 线程消费；
     /// `0` = UI 可以入队）。图片图集一帧内会连续入队多个层，因此是位掩码而不是单一布尔。
     atlas_pending: [AtomicU32; 2],
+    /// GPU 循环本轮是否**参与渲染**（遮挡 / 最小化时置 false，见 `run_gpu_loop`）。
+    ///
+    /// App 的扩层闸门据此把「暂时不渲染的窗口」排除在外（RBT-10）：这类窗口不会消费
+    /// `take_atlas`，若仍计入 `atlas_idle` 门禁，它的待上传位会**永久**挡住其它窗口的扩层。
+    atlas_participating: AtomicBool,
 }
 
 // SAFETY: `work` / `completion` 是进程范围的内核事件句柄；事件对象本身线程安全，
@@ -787,6 +807,20 @@ impl Shared {
     fn alive(&self) -> bool {
         let state = self.lock();
         !state.shutdown && !state.terminated
+    }
+
+    /// 发布「本轮是否参与渲染」。GPU 循环在遮挡 / 最小化跳过时置 false，恢复后置 true。
+    ///
+    /// 判据与真正的跳过**同源**（`GpuRenderer::window_occluded()` 的那次判断），不是另猜
+    /// DComp 状态：App 的扩层闸门读到的就是 GPU 循环自己这一轮的决策（RBT-10）。
+    fn set_atlas_participating(&self, participating: bool) {
+        self.atlas_participating
+            .store(participating, Ordering::Release);
+    }
+
+    /// 该窗口本轮是否参与渲染（遮挡 / 最小化跳过的窗口不参与图集闸门）。
+    fn atlas_participating(&self) -> bool {
+        self.atlas_participating.load(Ordering::Acquire)
     }
 
     fn publish_frame(&self, request: FrameRequest) {
@@ -1453,9 +1487,15 @@ fn run_gpu_loop(
         // 就要等用户再碰一下窗口，恢复等于没做。
         if renderer.window_occluded() && !force_present {
             crate::render::windows::diagnostics::occluded_skipped();
+            // RBT-10：本轮不参与渲染 —— 本循环不会 `take_atlas`，待上传位会一直亮着。把状态
+            // 发布给 UI 的扩层闸门，让它把本窗口排除在 `atlas_idle` 门禁之外（否则会永久
+            // 挡住其它窗口的扩层）；恢复可见时再置回 true。
+            shared.set_atlas_participating(false);
             wait_for_work_or_completion(shared, Some(OCCLUDED_POLL_INTERVAL))?;
             continue;
         }
+        // 能走到这里 ⇒ 本轮会正常取帧 / 消费图集上传（遮挡分支已排除）。判据与真正的跳过同源。
+        shared.set_atlas_participating(true);
         if !shared.has_pending_frame() {
             // 空闲：睡在 [work, completion] 上（完成由 fence 的 `SetEventOnCompletion` 明确唤醒，
             // 不轮询；没有待画帧时也不等 waitable，I3 的「每帧恰好一次」）。
@@ -2127,6 +2167,7 @@ mod tests {
             composition_pending: AtomicBool::new(false),
             composition_rebuild: AtomicBool::new(false),
             atlas_pending: [AtomicU32::new(0), AtomicU32::new(0)],
+            atlas_participating: AtomicBool::new(true),
         })
     }
 

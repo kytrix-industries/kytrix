@@ -416,6 +416,14 @@ impl Renderer {
         }
     }
 
+    /// 该窗口本轮是否参与渲染（扩层闸门只统计参与窗口，RBT-10）。
+    ///
+    /// 本端没有 Windows 那种「遮挡跳过发生在 `take_atlas` 之前」的 GPU 循环：只要提交了帧，
+    /// 图集上传就会在本窗口的录制里被消费，因此恒为参与。
+    pub(crate) fn atlas_participating(&self) -> bool {
+        true
+    }
+
     /// 图层属性（`contentsScale` / `drawableSize`）的**唯一**写入口：只有主线程可调用（§5.3）。
     pub(crate) fn set_layer_scale(&mut self, surface: (u32, u32), scale: f32) {
         if let RenderTarget::Window(window) = &mut self.target {

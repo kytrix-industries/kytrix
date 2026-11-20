@@ -163,6 +163,11 @@ pub(crate) fn upload_glyph_page(app: &mut App) {
     }
 }
 
+/// 扩层闸门允许「有窗口的共享槽一直不空闲」连续多少帧，之后按「不参与闸门」降级推进
+/// （RBT-10 的有界兜底）。8 帧 ≈ 60 Hz 下约 130 ms：正常窗口的忙槽只持续 1–2 帧，
+/// 超过这个量说明它的 GPU 循环已经不再消费上传（遮挡 / 最小化 / 卡死）。
+const IMAGE_GROWTH_DEFER_LIMIT: u32 = 8;
+
 /// 图片页分发：懒分配（没插过图片就没有页）+ 逐层整页 / 按脏矩形（AOI）增量
 /// （DEVIATIONS F-211 / R06-3 / D-9-c 多页 texture array）。
 ///
@@ -214,11 +219,16 @@ pub(crate) fn upload_image_page(app: &mut App) {
     let has_rects = dirty.iter().any(|rects| !rects.is_empty());
     let full_rects = crate::render::DirtyRects::full();
 
-    // fail-closed 增长闸门（RBT-01 不变量 2）：数组**建立 / 扩层**必须所有带渲染器的窗口本帧
-    // 都能整组入队（每层整页）。任一窗口的共享槽还在消费上一笔上传时，这一帧不扩：
+    // fail-closed 增长闸门（RBT-01 不变量 2；RBT-09 按窗口收敛；RBT-10 只统计参与渲染的窗口）。
+    //
+    // 数组**建立 / 扩层**必须所有**当前参与渲染**的窗口本帧都能整组入队（每层整页）。
     // - 旧 spec 的层内容仍然有效 ⇒ 旧图照常画（不变量 3）；
-    // - 新页所在层不画（窗口的 `image_drawable_layers` 保持在旧层数，编码期过滤；不变量 1），
-    //   下一帧再试。
+    // - 新页所在层不画（窗口的 `image_drawable_layers` 按**该窗口**已建立的层数收敛，编码期
+    //   过滤；不变量 1），下一帧再试；
+    // - 遮挡 / 最小化的窗口（Windows GPU 循环在 `take_atlas` 之前跳过）**不参与闸门**：它不会
+    //   消费上传，计入 `atlas_idle` 会让待上传位永久挡住其它窗口的扩层（RBT-10）。判据与 GPU
+    //   循环自己的跳过决策同源（`Shared::atlas_participating`），恢复可见后走非增长路径的
+    //   「整组重传」重新同步。
     let established = app.image_array_established;
     let needs_growth =
         established.is_none_or(|spec| spec.page != target.page || spec.layers < target.layers);
@@ -226,43 +236,73 @@ pub(crate) fn upload_image_page(app: &mut App) {
         let blocked: Vec<crate::window::WindowId> = app
             .windows
             .iter()
-            .filter(|(_, window)| window.has_renderer() && !window.atlas_idle(AtlasKind::Image))
+            .filter(|(_, window)| {
+                window.has_renderer()
+                    && window.atlas_participating()
+                    && !window.atlas_idle(AtlasKind::Image)
+            })
             .map(|(id, _)| *id)
             .collect();
         if !blocked.is_empty() {
-            let drawable = established.map_or(0, |spec| spec.layers);
-            for window in app.windows.values_mut() {
-                if !window.has_renderer() {
-                    continue;
+            app.image_growth_deferrals = app.image_growth_deferrals.saturating_add(1);
+            let degraded = app.image_growth_deferrals >= IMAGE_GROWTH_DEFER_LIMIT;
+            if !degraded {
+                for window in app.windows.values_mut() {
+                    if !window.has_renderer() {
+                        continue;
+                    }
+                    if has_rects {
+                        for layer in 0..layers {
+                            window
+                                .atlas_rects_mut(AtlasKind::Image, layer)
+                                .merge_from(&dirty[usize::from(layer)]);
+                        }
+                    }
+                    // RBT-09：按**窗口**收敛，不能用 App 级 `established` 抬高未同步窗口的上限
+                    // （macOS 每窗口一份数组，新窗口 / 重挂渲染器仍是 1×1×1 占位）。
+                    let drawable = if window.atlas_participating() {
+                        window.image_array_spec().map_or(0, |spec| spec.layers)
+                    } else {
+                        0
+                    };
+                    window.set_image_drawable_layers(drawable);
                 }
-                if has_rects {
-                    for layer in 0..layers {
-                        window
-                            .atlas_rects_mut(AtlasKind::Image, layer)
-                            .merge_from(&dirty[usize::from(layer)]);
+                // 让槽忙的窗口尽快出帧，把上一笔上传消费掉（否则增长会被一直挡着）。
+                for id in blocked {
+                    if let Some(window) = app.windows.get_mut(&id) {
+                        window.request_repaint();
                     }
                 }
-                window.set_image_drawable_layers(drawable);
+                app.dispatcher.wake();
+                return;
             }
-            // 让槽忙的窗口尽快出帧，把上一笔上传消费掉（否则增长会被一直挡着）。
-            for id in blocked {
-                if let Some(window) = app.windows.get_mut(&id) {
-                    window.request_repaint();
+            // 有界兜底（RBT-10）：连续 N 帧仍被挡 ⇒ 这些窗口的 GPU 循环已不再消费上传
+            // （遮挡 / 最小化 / 卡死）。把它们按「不参与闸门」处理：整页记账作废（恢复后由
+            // 非增长路径整组重传），本帧不画任何图片层；本帧继续往下，只用参与且空闲的窗口
+            // 推进数组 —— 长期不渲染的窗口不会让其它窗口的新页永远上不了屏。
+            for window in app.windows.values_mut() {
+                if window.has_renderer() && !window.atlas_idle(AtlasKind::Image) {
+                    window.mark_atlas_page_stale(AtlasKind::Image);
+                    window.set_image_drawable_layers(0);
                 }
             }
-            app.dispatcher.wake();
-            return;
         }
-        // 所有带渲染器的窗口都空闲：整组入队（每个已打开层整页）。这一步就是「数组只在全层
-        // 就绪时扩张」：重建后的数组内容由本帧每个窗口的整层重传补齐，任何窗口都不会看到
-        // 半成品层。渲染器已关闭（`queue_atlas_upload` 返回 false = shutdown/terminated）的
-        // 窗口永远不会再出帧，不阻塞数组前进。
+        // 整组入队（每个已打开层整页）：重建后的数组内容由本帧参与窗口的整层重传补齐，任何
+        // 窗口都不会看到半成品层。渲染器已关闭（`queue_atlas_upload` 返回 false）或本轮不参与
+        // 渲染 / 仍不空闲（有界兜底路径）的窗口跳过，等它们恢复后走非增长路径补齐。
+        let mut advanced = false;
         {
             let App {
                 resources, windows, ..
             } = app;
             for window in windows.values_mut() {
                 if !window.has_renderer() {
+                    continue;
+                }
+                if !window.atlas_participating() || !window.atlas_idle(AtlasKind::Image) {
+                    // 不参与渲染（遮挡 / 最小化）或不消费上传（兜底路径）：不整组入队
+                    // （不推进 `atlas_pending`），可画层归零（它的数组可能是占位）。
+                    window.set_image_drawable_layers(0);
                     continue;
                 }
                 let mut enqueued = Vec::with_capacity(page_count);
@@ -295,13 +335,17 @@ pub(crate) fn upload_image_page(app: &mut App) {
                     window.mark_atlas_page_received(AtlasKind::Image, target);
                     window.clear_all_atlas_rects(AtlasKind::Image);
                     window.set_image_drawable_layers(target.layers);
+                    advanced = true;
                 } else {
                     // 渲染器已关闭：本窗口不会出帧，可画层归零（fail-closed）。
                     window.set_image_drawable_layers(0);
                 }
             }
         }
-        app.image_array_established = Some(target);
+        if advanced {
+            app.image_array_established = Some(target);
+            app.image_growth_deferrals = 0;
+        }
         return;
     }
 
@@ -315,6 +359,19 @@ pub(crate) fn upload_image_page(app: &mut App) {
         } = app;
         for window in windows.values_mut() {
             if !window.has_renderer() {
+                continue;
+            }
+            if !window.atlas_participating() {
+                // 不参与渲染（遮挡 / 最小化 / GPU 循环跳过）：不推进它的上传（它的待上传位可能
+                // 永远不消费），恢复可见后由本路径按 `received != target` 整组重传（RBT-10）。
+                if has_rects {
+                    for layer in 0..layers {
+                        window
+                            .atlas_rects_mut(AtlasKind::Image, layer)
+                            .merge_from(&dirty[usize::from(layer)]);
+                    }
+                }
+                window.set_image_drawable_layers(0);
                 continue;
             }
             let received = window.image_array_spec();

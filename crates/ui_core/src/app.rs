@@ -149,6 +149,12 @@ pub struct App {
     /// 设备侧的 `AtlasUploads::reconcile_pages` / `AtlasTextures::prepare` 会在 release 也
     /// 拒绝「有层没有整页上传」的重建请求（`EngineError::AtlasGrowthIncomplete`）。
     image_array_established: Option<crate::render::AtlasArraySpec>,
+    /// 扩层闸门连续被「有窗口的共享槽不空闲」挡住的帧数（RBT-10 的有界兜底计数）。
+    ///
+    /// 正常窗口的忙槽只持续 1–2 帧；达到 `text_pass::IMAGE_GROWTH_DEFER_LIMIT` 仍被挡 ⇒ 该
+    /// 窗口的 GPU 循环已经不消费上传（遮挡 / 最小化 / 卡死），本帧把忙窗口按「不参与闸门」
+    /// 处理（记账作废、可画层 0），只用参与且空闲的窗口推进数组。
+    image_growth_deferrals: u32,
     /// 字形页的整页 CPU 缓冲（跨上传复用，避免每次上传都分配）。
     glyph_page: Vec<u8>,
     /// 增量上传的打包缓冲（脏矩形逐个紧密排列；跨帧复用，避免每次上传都分配）。
@@ -439,6 +445,7 @@ impl App {
             pending_dirty: crate::render::DirtyRects::default(),
             glyph_page_extent: None,
             image_array_established: None,
+            image_growth_deferrals: 0,
             glyph_page: Vec::new(),
             packed: Vec::new(),
             dispatcher,

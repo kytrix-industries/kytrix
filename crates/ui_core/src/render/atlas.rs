@@ -1576,4 +1576,33 @@ mod tests {
         let next = pager.allocate((18, 18)).expect("fits");
         assert_eq!(next.tile.page, 0);
     }
+
+    /// RBT-12：三端「整页上传」判据统一为 `covers_page`（按页尺寸判覆盖）。
+    ///
+    /// `is_full` 只认 [`FULL_RECT`] 哨兵；一个**恰好覆盖整页但不是哨兵**的矩形在旧口径下会被
+    /// macOS 判成「不是整页」而 Windows/Linux 接受（三端语义分叉）。扩层 fail-closed 校验必须用
+    /// `covers_page`，否则未来整页构造方式一变就会只在 macOS 报 `AtlasGrowthIncomplete`。
+    #[test]
+    fn covers_page_accepts_a_page_sized_rect_without_the_full_sentinel() {
+        let page_sized = DirtyRects {
+            rects: vec![PhysicalRect::new(0, 0, 64, 64)],
+        };
+        assert!(
+            page_sized.covers_page(64),
+            "恰好覆盖整页的矩形必须算整页（与 Windows/Linux 的 covers_full_page 同义）"
+        );
+        assert!(
+            !page_sized.is_full(),
+            "它不是 FULL_RECT 哨兵 —— 这正是 macOS 旧口径会误判的原因"
+        );
+        assert!(DirtyRects::full().covers_page(64), "整页哨兵也算覆盖整页");
+        assert!(
+            DirtyRects::full().covers_page(2048),
+            "整页哨兵（i32::MAX 边）覆盖任意页尺寸"
+        );
+        assert!(
+            !page_sized.covers_page(128),
+            "64² 的矩形不覆盖 128² 页（按页尺寸判定，不是只看哨兵）"
+        );
+    }
 }

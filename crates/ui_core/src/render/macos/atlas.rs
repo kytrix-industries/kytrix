@@ -210,6 +210,9 @@ impl AtlasTextures {
             // fail-closed（RBT-01 不变量 2）：**扩层请求必须每一层都带整页上传**。重建后的数组
             // 内容未定义，只有「所有已打开层的整页内容都在同一次重传里入队」才允许扩张；否则
             // 这一帧直接拒绝（release 也生效，不是 debug_assert）。
+            //
+            // 判据用 `covers_page`（按页尺寸判覆盖）而不是 `is_full`（只认 FULL_RECT 哨兵）：
+            // 与 Windows/Linux 的 `covers_full_page` 同一语义（RBT-12）。
             if spec.layers > texture.spec().layers {
                 for layer in 0..spec.layers {
                     let full = texture
@@ -217,7 +220,7 @@ impl AtlasTextures {
                         .get(layer as usize)
                         .and_then(Option::as_ref)
                         .is_some_and(|pending| {
-                            pending.spec.page == spec.page && pending.rects.is_full()
+                            pending.spec.page == spec.page && pending.rects.covers_page(spec.page)
                         });
                     if !full {
                         return Err(EngineError::AtlasGrowthIncomplete {

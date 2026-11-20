@@ -562,6 +562,12 @@ pub struct Window {
     /// [`Window::image_drawable_layers`]）。默认 `u32::MAX` = 不过滤：只有走 `App` 图集上传
     /// pass 的窗口才会被改成「已整组入队的层数」。
     image_drawable_layers: u32,
+    /// 仅测试：注入「本轮不参与渲染」（遮挡 / 最小化被 GPU 循环跳过）的状态。
+    ///
+    /// 生产真值来自渲染器（Windows `Shared::atlas_participating`，与 GPU 循环的跳过决策同源）；
+    /// offscreen 测试渲染器恒参与，因此用本注入点构造 RBT-10 的回归场景。
+    #[cfg(test)]
+    atlas_participating_override: Option<bool>,
     /// 字形图集在本窗口上「已写脏、还没入队」的矩形（恒 layer 0）。
     glyph_atlas_rects: crate::render::DirtyRects,
     /// 图片图集每层的「已写脏、还没入队」矩形（下标 = texture array 层号）。
@@ -670,6 +676,8 @@ impl Window {
             image_page_received: None,
             image_layers_received: [false; MAX_IMAGE_PAGES as usize],
             image_drawable_layers: u32::MAX,
+            #[cfg(test)]
+            atlas_participating_override: None,
             glyph_atlas_rects: crate::render::DirtyRects::default(),
             image_atlas_rects: std::array::from_fn(|_| crate::render::DirtyRects::default()),
             atlas_deferrals: 0,
@@ -1143,6 +1151,25 @@ impl Window {
     /// 设置本帧可画层上限。消费者：`App::upload_image_page`（每帧逐窗口刷新）。
     pub(crate) fn set_image_drawable_layers(&mut self, layers: u32) {
         self.image_drawable_layers = layers;
+    }
+    /// 该窗口本轮是否**参与渲染**（扩层闸门只统计参与窗口，RBT-10）。
+    ///
+    /// 生产真值来自渲染器：Windows 的 GPU 循环在遮挡 / 最小化时先跳过、不消费 `take_atlas`，
+    /// 它把这一轮的决策发布成 `Shared::atlas_participating`（与真正的跳过同源）；macOS / Linux
+    /// 没有这条「跳过在 take 之前」的路径，恒为参与。没有渲染器的窗口不参与（上传 pass 会跳过）。
+    pub(crate) fn atlas_participating(&self) -> bool {
+        #[cfg(test)]
+        if let Some(participating) = self.atlas_participating_override {
+            return participating;
+        }
+        self.renderer
+            .as_ref()
+            .is_some_and(|renderer| renderer.atlas_participating())
+    }
+    /// 仅测试：注入「不参与渲染」状态（RBT-10 回归；offscreen 渲染器恒参与，无法天然构造）。
+    #[cfg(test)]
+    pub(crate) fn set_atlas_participating_for_test(&mut self, participating: bool) {
+        self.atlas_participating_override = Some(participating);
     }
     /// 该图集在本窗口已建立的 array 规格是否就是 `spec`（页边长 + 层数；层数随页数增长）。
     pub(crate) fn atlas_page_matches(
