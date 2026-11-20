@@ -587,7 +587,8 @@ mod tests {
         assert_eq!(handle.scale(), 1.5);
         assert_eq!(handle.line().scale, 1.5);
 
-        // 窗口被拖到另一块屏：平台先 `set_scale`，再投递 `DpiChanged`。
+        // 窗口被拖到另一块屏：`DpiChanged` 自带新 scale（Win/mac 先镜像 `Window::scale` 再派发；
+        // Wayland 在派发之后镜像 —— 事件值才是权威，见下一条用例）。
         let two = Scale::new(2.0).expect("有限正数");
         app.window_mut(window).expect("窗口存在").set_scale(two);
         app.dispatch(
@@ -609,6 +610,57 @@ mod tests {
         assert_eq!(app.text_scale(), 1.0, "覆盖期间不跟随焦点窗口 DPI");
         app.clear_text_scale_override();
         assert_eq!(app.text_scale(), 2.0);
+    }
+
+    /// F14（复核轮次 2）：Wayland 的 `DpiChanged` 在事件循环镜像 `Window::set_scale` **之前**
+    /// 派发（`platform/linux/event_loop.rs` 的「① 事件 → ② 平台真值镜像」顺序）。默认 scale
+    /// 必须取事件自带的 `scale`，不能读还停在旧值的 `Window::scale`（否则 text_scale 落后一次
+    /// DPI，与 Windows / macOS 不一致）。
+    #[test]
+    fn dpi_event_scale_is_authoritative_before_the_window_mirror() {
+        let (_runtime, mut app) = new_app();
+        let window = app.create_window(WindowOptions {
+            scale: Scale::ONE,
+            ..WindowOptions::default()
+        });
+        app.dispatch(window, Event::FocusChanged { focused: true });
+        assert_eq!(app.text_scale(), 1.0);
+
+        // Wayland 顺序：先派发事件；窗口镜像在同一轮事件循环稍后发生。
+        let two = Scale::new(2.0).expect("有限正数");
+        app.dispatch(
+            window,
+            Event::DpiChanged {
+                dpi: 192,
+                scale: two,
+            },
+        );
+        assert_eq!(
+            app.window(window).expect("窗口存在").scale(),
+            Scale::ONE,
+            "本用例必须复现「事件先于镜像」的顺序：此时 `Window::scale` 仍是旧值"
+        );
+        assert_eq!(
+            app.text_scale(),
+            2.0,
+            "默认 scale 必须取事件自带的 scale，而不是旧的 `Window::scale`"
+        );
+
+        // 事件循环随后镜像 `Window::scale`：同一事件不得再改变默认 scale。
+        app.window_mut(window).expect("窗口存在").set_scale(two);
+        assert_eq!(app.text_scale(), 2.0);
+
+        // 显式覆盖期间 DPI 事件不跟随（三端语义一致）。
+        app.set_text_scale(1.25).expect("合法覆盖");
+        let three = Scale::new(3.0).expect("有限正数");
+        app.dispatch(
+            window,
+            Event::DpiChanged {
+                dpi: 288,
+                scale: three,
+            },
+        );
+        assert_eq!(app.text_scale(), 1.25, "覆盖期间不跟随 DPI 事件");
     }
 
     // ── E1b F1/F3：淘汰纪元与错误路径收尾 ────────────────────────────────────
@@ -858,6 +910,132 @@ mod tests {
             0,
             "编码输出不得含任何失效 run"
         );
+    }
+
+    /// F13（复核轮次 2）：Canvas 失效 run 在编码期被丢弃后必须**有界补帧**。
+    ///
+    /// 静态窗口不会因为「应用还没重建 Canvas」而自然再出帧：不补帧 ⇒ 应用义务（在下一帧的
+    /// `on_frame` 钩子里重新 `shape_text` + `set_canvas`）不可执行，canvas 文本会无限期缺失。
+    /// 补帧必须按图集代际有界：同一代际至多一次，应用忽略义务时不能变成 I3 空转。
+    ///
+    /// 变异守卫：删掉 `App::frame` 里 `stale_canvas_runs > 0` 分支的补帧请求 ⇒ 本用例变红。
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn stale_canvas_runs_request_exactly_one_bounded_follow_up_frame() {
+        use crate::{
+            paint::{
+                color::Color,
+                primitive::{Quad, QuadPaint},
+            },
+            test_support::app::TestApp,
+        };
+
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let style = TextStyle::new(16.0);
+        let handle = app
+            .app_mut()
+            .shape_text("Canvas follow-up", &style, None, &[])
+            .expect("塑形");
+        let run_count = handle
+            .line()
+            .glyph_runs()
+            .filter(|run| !run.glyphs.is_empty())
+            .count();
+        assert!(run_count > 0);
+        let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 240.0, 40.0));
+        // 非文本图元：编码期安全网只丢弃失效 run，Canvas 本身仍要上屏。
+        canvas.push_quad(Quad {
+            bounds: Rect::new(0.0, 0.0, 240.0, 40.0),
+            corner_radius: [0.0; 4],
+            paint: QuadPaint::Solid {
+                fill: Color::WHITE,
+                border: None,
+            },
+        });
+        assert!(canvas.push_shaped_text(&handle, Point::new(2.0, 3.0)));
+        let canvas_node = {
+            let target = app.app_mut().window_mut(window).expect("窗口存在");
+            let root = target.tree().root();
+            NodeBuilder::canvas(canvas)
+                .layout_override(Rect::new(0.0, 0.0, 240.0, 40.0))
+                .id("canvas.followup")
+                .build(target.tree_mut(), root)
+                .expect("Canvas 节点")
+        };
+
+        // 无失效 run：静态窗口不产生任何额外帧（I3）。
+        let record = app.drain().expect("帧成功");
+        assert_eq!(record.stale_canvas_runs, 0);
+        let requests = app.app().frame_requests();
+        let record = app.drain().expect("帧成功");
+        assert!(!record.rendered, "无失效 run 的静态窗口必须停在 Idle");
+        assert_eq!(
+            app.app().frame_requests(),
+            requests,
+            "无失效 run 时不得请求补帧（0 额外帧）"
+        );
+
+        // 换代（换字体栈）⇒ 已 push 的 tile 失活；应用侧请求一次重绘（生产里同构）。
+        app.app_mut()
+            .set_font_stack(FontStack::new(["Kytrix No Such Family"]));
+        assert!(handle.is_stale());
+        app.app_mut()
+            .request_node_repaint(window, canvas_node)
+            .expect("请求重绘");
+        let requests = app.app().frame_requests();
+        let record = app.drain().expect("帧成功");
+        assert_eq!(
+            record.stale_canvas_runs, run_count,
+            "换代的失效 run 必须被编码期安全网丢弃（少字优于花字）"
+        );
+        assert_eq!(
+            app.app().frame_requests(),
+            requests + 1,
+            "丢弃失效 run 后必须恰好补一帧：应用义务只有在下一帧的钩子里可执行"
+        );
+        assert_eq!(
+            canvas_scene_glyph_run_count(app.app(), window),
+            0,
+            "本帧不得编码任何失效 run"
+        );
+
+        // 补帧之前（= 应用在补帧的 `on_frame` 钩子里）：重新 shape + 重建 Canvas。
+        let fresh = app
+            .app_mut()
+            .shape_text("Canvas follow-up", &style, None, &[])
+            .expect("重新塑形");
+        assert!(!fresh.is_stale(), "新句柄属于当前图集租约");
+        let mut rebuilt = Canvas::new(Rect::new(0.0, 0.0, 240.0, 40.0));
+        rebuilt.push_quad(Quad {
+            bounds: Rect::new(0.0, 0.0, 240.0, 40.0),
+            corner_radius: [0.0; 4],
+            paint: QuadPaint::Solid {
+                fill: Color::WHITE,
+                border: None,
+            },
+        });
+        assert!(rebuilt.push_shaped_text(&fresh, Point::new(2.0, 3.0)));
+        assert!(
+            app.app_mut()
+                .window_mut(window)
+                .expect("窗口存在")
+                .set_canvas(canvas_node, rebuilt)
+                .expect("节点存活")
+        );
+
+        // 引擎请求的补帧：重建后的文本恢复上屏，且不再丢弃 run。
+        let record = app.drain().expect("帧成功");
+        assert!(record.rendered, "补帧必须真的运行（应用义务依赖它）");
+        assert_eq!(record.stale_canvas_runs, 0);
+        assert_eq!(
+            canvas_scene_glyph_run_count(app.app(), window),
+            run_count,
+            "重 push 后 canvas 文本必须恢复"
+        );
+        // 同一图集代际只补一帧：补帧后窗口重新回到 Idle（不空转）。
+        let record = app.drain().expect("帧成功");
+        assert!(!record.rendered, "同一图集代际只补一帧（I3）");
     }
 
     /// 场景里所有 Canvas 图元的内部 `GlyphRun` 数（E1b 的 L2 断言面：FrameRecord 把 Canvas 当

@@ -47,7 +47,7 @@ use crate::{
         ScrollConfig, ScrollHandle, ScrollState, VirtualList, VirtualListConfig, VirtualListState,
     },
     layout::hit_test::HitResult,
-    math::{Point, Rect, Size},
+    math::{Point, Rect, Scale, Size},
     node::{
         builder::NodeBuilder,
         dependency::{DependencyGraph, EvalStack, ReadCtx},
@@ -2264,7 +2264,8 @@ impl App {
 
     /// canvas 文本的当前**默认光栅 scale**（v2.1 E1b，`§11.1`）。
     ///
-    /// 语义：默认 1.0；焦点窗口获得焦点 / 其 DPI 变化时跟随该窗口的 `Window::scale()`；没有
+    /// 语义：默认 1.0；焦点窗口获得焦点 / 其 DPI 变化时跟随该窗口的 `Window::scale()`（DPI
+    /// 变化用 `Event::DpiChanged.scale` 这个权威值，三端事件顺序不同但结果一致）；没有
     /// 焦点窗口时保留上一次的值；[`App::set_text_scale`] 可显式覆盖（离屏 / 测试 / 固定 DPI）。
     ///
     /// [`App::shape_text`] 用它光栅，句柄用 [`ShapedTextHandle::scale`] 记录。
@@ -2319,24 +2320,38 @@ impl App {
         }
     }
 
-    /// 事件：窗口 DPI 变化（`DpiChanged` 已先作用在 `Window::scale` 上）：只有焦点窗口的 DPI
-    /// 变化才更新 canvas 文本默认 scale；显式覆盖期间不跟随。
-    pub(crate) fn note_window_dpi(&mut self, window: WindowId) {
+    /// 事件：窗口 DPI 变化。只有焦点窗口的 DPI 变化才更新 canvas 文本默认 scale；显式覆盖期间
+    /// 不跟随。
+    ///
+    /// 用**事件自带的** `scale`（`Event::DpiChanged.scale` 是本次变化的权威值），不读
+    /// `Window::scale`：Wayland 的事件循环在派发事件**之后**才镜像 `Window::set_scale`
+    /// （`platform/linux/event_loop.rs` 的「① 事件 → ② 平台真值镜像」顺序），读窗口会落后一次
+    /// DPI。Windows / macOS 先写 `Window::scale` 再派发，两种顺序下结果一致。
+    pub(crate) fn note_window_dpi(&mut self, window: WindowId, scale: Scale) {
         if self.focused_window == Some(window) {
-            self.follow_focused_window_scale();
+            self.apply_text_scale(scale.factor());
         }
+    }
+
+    /// 让 `default_text_scale` 采用 `scale`（显式覆盖期间是 no-op）。
+    fn apply_text_scale(&mut self, scale: f32) {
+        if self.text_scale_override.is_some() {
+            return;
+        }
+        self.default_text_scale = scale;
     }
 
     /// 让 `default_text_scale` 跟随焦点窗口的当前 DPI（显式覆盖期间是 no-op）。
     fn follow_focused_window_scale(&mut self) {
-        if self.text_scale_override.is_some() {
-            return;
-        }
         let Some(window) = self.focused_window else {
             return;
         };
-        if let Some(target) = self.windows.get(&window) {
-            self.default_text_scale = target.scale().factor();
+        let scale = self
+            .windows
+            .get(&window)
+            .map(|target| target.scale().factor());
+        if let Some(scale) = scale {
+            self.apply_text_scale(scale);
         }
     }
 

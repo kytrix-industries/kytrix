@@ -318,11 +318,22 @@ pub(crate) fn frame(
     // E1b F2：canvas 文本的编码期安全网丢掉了失效 run（少字优于花字）。Canvas 归应用所有，
     // 引擎不能替它重建 —— 用文本诊断把「少字」变成可观测事实（D17），应用据此重新
     // `shape_text` 并重建 Canvas。诊断环有界 + 同值去重，不会随帧数增长。
+    // E1c F13：应用的重建义务只有在**下一帧**的 `on_frame` 钩子里才可执行；静态窗口在下一次
+    // 平台唤醒前不会再出帧 ⇒ 不补帧的话 canvas 文本会无限期缺失（与节点文本的 D-5 补齐路径
+    // 对称）。每个图集代际至多补一帧：应用忽略义务时同一代际的后续帧不再请求（I3 不空转）。
     if stale_canvas_runs > 0 {
         app.text
             .push_diagnostics(vec![crate::text::TextDiagnostic::CanvasTextStale {
                 runs: stale_canvas_runs,
             }]);
+        let generation = app.atlas.generation();
+        let follow_up = app
+            .windows
+            .get_mut(&window)
+            .is_some_and(|target| target.note_stale_canvas_followup(generation));
+        if follow_up {
+            app.request_frame();
+        }
     }
     // 图集行/整页没赶上本帧（窗口的共享槽还在消费上一笔）：这一帧会以旧图集呈现，因此
     // 立刻再要一帧（全量 damage），槽空后把内容补发——否则静态窗口会把缺字的画面一直
