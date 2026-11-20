@@ -284,17 +284,31 @@ pub struct WindowOptions {
     /// （[`Self::owner`] 为 `Some`）；`modal == true` 而 `owner == None`
     /// ⇒ 降级为普通窗口并写诊断（不 panic）。
     ///
+    /// **多个模态窗口**（同一个 owner）是合法用法：owner 在**所有**以它为 owner 的模态窗口
+    /// 关闭之前一直不接收输入 —— 关掉其中任意一个都不恢复，最后一个关闭时才恢复。三端都不用
+    /// 「引用计数」表达该状态：
+    /// - **Windows**：原生 `EnableWindow(owner, FALSE)` 的 owner 禁用态是**派生值** —— 「本窗口
+    ///   是 owner 的模态窗口」登记在窗口自身的 Win32 属性表里（随窗口销毁由 USER 回收），销毁
+    ///   时按「当前还活着的模态窗口」重新判定，只有最后一个关闭才 `EnableWindow(owner, TRUE)`；
+    ///   没有计数器，建窗中途失败 / 销毁失败 / owner 级联销毁都不会让它漂移。
+    /// - **macOS/Linux**：没有原生输入禁用；拦输入由引擎分发层按 `App` 窗口表派生
+    ///   （`app::window_set::is_input_blocked_by_modal`），多模态天然成立。macOS 的模态窗口
+    ///   chrome（`NSModalPanelWindowLevel` 层级 + `addChildWindow:` 关系）由窗口的
+    ///   `modal`/`owner` 配置派生，只表达层级、不参与输入拦截。
+    ///
     /// 平台语义（用户裁决 X1）：
     /// - **Windows**：原生路径 —— 打开时 `EnableWindow(owner, FALSE)` 禁用 owner（系统级输入
-    ///   拦截 + 灰显），关闭/销毁时恢复；同时引擎层按同一规则过滤（UI 线程兜底，防止
-    ///   DComp/自定义消息绕过）。
+    ///   拦截 + 灰显），**最后一个**模态窗口销毁时恢复；同时引擎层按同一规则过滤（UI 线程
+    ///   兜底，防止 DComp/自定义消息绕过）。
     /// - **macOS**：引擎层模态（`App` 分发层按 owner 关系过滤输入）+ 模态窗口层级
     ///   （`NSModalPanelWindowLevel` 可选项，不依赖 `runModalForWindow:` 同步嵌套循环 ——
     ///   那会与引擎自己的事件泵重入）。
     /// - **Linux/Wayland**：协议没有模态；引擎层模态（同 macOS），并 `set_parent` 提示
     ///   compositor 置于 owner 之上。
     ///
-    /// 模态窗口被关闭/否决关闭时语义：否决 = 保持模态；真正关闭 = 恢复 owner 输入。
+    /// 模态窗口被关闭/否决关闭时语义：否决 = 保持模态；真正关闭 = 若该 owner 已无其它活模态
+    /// 窗口，则恢复 owner 输入（Windows 走原生 `EnableWindow(owner, TRUE)`；macOS/Linux 由
+    /// 引擎分发层不再拦 owner 的事件）。
     pub modal: bool,
     /// 是否置顶（always-on-top，X1）。
     ///
