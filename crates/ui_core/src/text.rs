@@ -65,6 +65,10 @@
 //!   规则也必须固定。
 
 use core::ops::Range;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU32, Ordering},
+};
 
 use smallvec::SmallVec;
 use smol_str::SmolStr;
@@ -81,6 +85,7 @@ pub(crate) mod fast_path;
 pub(crate) mod inline_flow;
 pub(crate) mod raster;
 pub(crate) mod shape;
+pub(crate) mod standalone;
 
 /// 文本水平对齐（映射到 parley `Alignment`，`text/shape.rs`）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
@@ -884,6 +889,75 @@ pub struct ShapedInlineBox {
     pub rect: Rect,
     /// 盒内基线（相对 `rect` 顶边）；`None` = 底边对齐。
     pub baseline: Option<f32>,
+}
+
+/// 一次**无节点归属**的 shaping 的长期句柄（v2.1 E1，`§11.1`）。
+///
+/// 由 [`crate::app::App::shape_text`] 产出，应用只读：字形位置 / 行 / 行内盒走
+/// [`Self::line`]，内容尺寸走 [`Self::size`]，行内盒落点走
+/// [`crate::app::App::shaped_inline_boxes`]。句柄**没有公开构造器**，也不给应用
+/// `AtlasTile` / `GlyphRun` 的构造权（`§11.1`：应用永不构造裸 `GlyphRun` / `AtlasTile`）。
+///
+/// 句柄带**图集代际租约**：图集换代（DPI 变化 / 字形容量逃逸 / 字体栈切换）后
+/// [`Self::is_stale`] 为真，`Canvas::push_shaped_text` 拒绝编码（不画旧 UV，等价 D-5 的
+/// 「唯一重光栅入口」）；应用应丢弃句柄并重新 `shape_text`。
+#[derive(Debug)]
+pub struct ShapedTextHandle {
+    /// 塑形快照（只读）。
+    line: Arc<ShapedLine>,
+    /// 行内盒落点（顺序 = `shape_text` 传入的 `inline_boxes`，`id` 原样保留）。
+    inline_boxes: Box<[ShapedInlineBox]>,
+    /// 构造时的图集代际。
+    generation: u32,
+    /// 与 `App` 共享的**当前**图集代际（代际租约；图集换代方负责写入）。
+    lease: Arc<AtomicU32>,
+}
+
+impl ShapedTextHandle {
+    /// 引擎内部构造（唯一调用者：`text::standalone::shape`）。
+    pub(crate) fn new(
+        line: Arc<ShapedLine>,
+        inline_boxes: Box<[ShapedInlineBox]>,
+        generation: u32,
+        lease: Arc<AtomicU32>,
+    ) -> Self {
+        Self {
+            line,
+            inline_boxes,
+            generation,
+            lease,
+        }
+    }
+
+    /// 只读快照（字形位置、行、行内盒）。
+    ///
+    /// # Panics: none
+    #[must_use]
+    pub fn line(&self) -> &ShapedLine {
+        &self.line
+    }
+
+    /// 图集是否已换代：`true` = 句柄里的 `AtlasTile` 已失效（旧 UV），必须重新
+    /// `shape_text`；此时 `Canvas::push_shaped_text` 返回 `false` 且不产生任何图元。
+    ///
+    /// # Panics: none
+    #[must_use]
+    pub fn is_stale(&self) -> bool {
+        self.lease.load(Ordering::Relaxed) != self.generation
+    }
+
+    /// 内容尺寸（逻辑像素）。
+    ///
+    /// # Panics: none
+    #[must_use]
+    pub fn size(&self) -> Size {
+        self.line.size()
+    }
+
+    /// 行内盒落点（crate 内部：`App::shaped_inline_boxes` 的唯一出口）。
+    pub(crate) fn inline_boxes(&self) -> &[ShapedInlineBox] {
+        &self.inline_boxes
+    }
 }
 
 /// 一次文本 pass 的统计（P06 帧记录 / L1 断言）。

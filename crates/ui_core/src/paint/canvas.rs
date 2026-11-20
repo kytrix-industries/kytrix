@@ -4,14 +4,16 @@
 //! 引擎在 P03/P07 把它包成 `Primitive::Canvas` 嵌进真实 lane。所有权与 API 契约见
 
 use crate::{
-    math::Rect,
+    math::{Point, Rect},
     paint::{
         atlas::AtlasKind,
         primitive::{
-            ClipOp, ClipRect, GeometryDraw, GlyphRun, Image, Path, Primitive, Quad, Shadow,
+            ClipOp, ClipRect, GeometryDraw, GlyphRun, Image, Path, PositionedGlyph, Primitive,
+            Quad, Shadow,
         },
         scene::{Lane, MAX_CLIP_DEPTH},
     },
+    text::{ShapedTextHandle, ShapedTextItem},
 };
 
 /// §7.4 C4：clip 矩形的坐标/尺寸/圆角都必须是有限值，尺寸非负。
@@ -68,6 +70,53 @@ impl Canvas {
             "glyph run contains a tile from a non-glyph atlas or non-zero layer"
         );
         self.lane.push(Primitive::GlyphRun(run));
+    }
+
+    /// 应用层画文本的**唯一**合法入口（v2.1 E1，`§11.1`）：按 run 拆 `Primitive::GlyphRun`，
+    /// 每个字形的落点平移 `origin`。
+    ///
+    /// `origin` 是文本盒左上角的**绝对窗口逻辑像素**（与 `Canvas` 内其它图元同一坐标系，
+    /// §5.9）；多行文本的所有行一起偏移。字形来自 [`ShapedTextHandle`]，应用不接触
+    /// `AtlasTile` / `GlyphRun` 的构造。
+    ///
+    /// **引擎负责代际校验**（等价 D-5 的「唯一重光栅入口」）：句柄在图集换代后已失效时
+    /// **不产生任何图元**并返回 `false` —— 绝不把旧 UV 编码进图元（那正是 D-5 修掉的花字）。
+    /// 应用收到 `false` 应丢弃句柄并重新 `App::shape_text`。
+    ///
+    /// 空文本（0 行）返回 `true` 且不产生图元：句柄本身有效，只是没有可画内容。
+    ///
+    /// # Panics: none
+    #[must_use]
+    pub fn push_shaped_text(&mut self, handle: &ShapedTextHandle, origin: Point) -> bool {
+        if handle.is_stale() {
+            return false;
+        }
+        for shaped_line in &handle.line().lines {
+            for item in &shaped_line.items {
+                let ShapedTextItem::GlyphRun(run) = item else {
+                    continue;
+                };
+                if run.glyphs.is_empty() {
+                    continue;
+                }
+                let mut glyphs = Vec::with_capacity(run.glyphs.len());
+                for glyph in &run.glyphs {
+                    glyphs.push(PositionedGlyph {
+                        tile: glyph.tile,
+                        position: Point::new(
+                            origin.x + glyph.position.x,
+                            origin.y + glyph.position.y,
+                        ),
+                        size: glyph.size,
+                    });
+                }
+                self.push_text(GlyphRun {
+                    color: run.color,
+                    glyphs,
+                });
+            }
+        }
+        true
     }
 
     /// debug 构建断言 `image.tile.atlas == AtlasKind::Image` 且页号 < `MAX_IMAGE_PAGES`（页号上限；
@@ -411,5 +460,168 @@ mod tests {
         let mut run = glyph_run();
         run.glyphs[0].tile.page = 1;
         canvas.push_text(run);
+    }
+
+    /// v2.1 E1：`push_shaped_text` 的唯一入口语义 —— 代际校验 + origin 偏移 + 按 run 拆图元。
+    ///
+    /// `generation` 是句柄构造时的图集代际，`current` 是共享租约里的当前代际：
+    /// 两者不等 ⇒ 句柄已失效。
+    fn shaped_handle(generation: u32, current: u32) -> crate::text::ShapedTextHandle {
+        use std::sync::{Arc, atomic::AtomicU32};
+
+        use crate::text::{
+            ShapedGlyphRun, ShapedLine, ShapedTextHandle, ShapedTextItem, ShapedTextLine,
+        };
+
+        let glyph = PositionedGlyph {
+            tile: AtlasTile {
+                atlas: AtlasKind::Glyph,
+                page: 0,
+                u0: 0.0,
+                v0: 0.0,
+                u1: 0.5,
+                v1: 0.5,
+                generation,
+            },
+            position: Point::new(2.0, 3.0),
+            size: Size::new(8.0, 8.0),
+        };
+        let line = ShapedLine {
+            text: smol_str::SmolStr::new_static("e1"),
+            lines: vec![ShapedTextLine {
+                text_range: 0..2,
+                baseline: 12.0,
+                line_height: 14.0,
+                advance: 10.0,
+                items: vec![ShapedTextItem::GlyphRun(ShapedGlyphRun {
+                    color: Color::BLACK,
+                    text_range: 0..2,
+                    glyphs: vec![glyph],
+                })],
+            }],
+            width: 10.0,
+            height: 14.0,
+            first_baseline: Some(12.0),
+            atlas_generation: generation,
+            font_stack_version: 1,
+            scale: 1.0,
+        };
+        ShapedTextHandle::new(
+            Arc::new(line),
+            Box::new([]),
+            generation,
+            Arc::new(AtomicU32::new(current)),
+        )
+    }
+
+    #[test]
+    fn push_shaped_text_offsets_glyphs_by_the_origin() {
+        let mut canvas = Canvas::new(bounds());
+        let handle = shaped_handle(7, 7);
+        assert!(
+            canvas.push_shaped_text(&handle, Point::new(10.0, 20.0)),
+            "当前代际的句柄必须能编码"
+        );
+        assert_eq!(canvas.primitives().len(), 1);
+        let Primitive::GlyphRun(run) = &canvas.primitives()[0] else {
+            panic!("push_shaped_text 只能产生 GlyphRun 图元");
+        };
+        let glyph = run.glyphs[0];
+        assert_eq!(
+            glyph.position,
+            Point::new(10.0 + 2.0, 20.0 + 3.0),
+            "origin 是文本盒左上角的绝对窗口逻辑像素"
+        );
+        assert_eq!(glyph.size, Size::new(8.0, 8.0));
+        assert_eq!(glyph.tile.generation, 7);
+        assert_eq!(run.color, Color::BLACK);
+    }
+
+    #[test]
+    fn push_shaped_text_refuses_a_stale_handle() {
+        let mut canvas = Canvas::new(bounds());
+        canvas.push_quad(quad());
+        let before = canvas.primitives().len();
+        // 句柄记录 7 代，图集已经到 8 代 ⇒ 旧 UV 已失效。
+        let stale = shaped_handle(7, 8);
+        assert!(stale.is_stale());
+        assert!(
+            !canvas.push_shaped_text(&stale, Point::ZERO),
+            "stale 句柄必须返回 false"
+        );
+        assert_eq!(
+            canvas.primitives().len(),
+            before,
+            "stale push 不得产生任何图元（不画旧 UV）"
+        );
+    }
+
+    #[test]
+    fn push_shaped_text_splits_multiple_runs_into_multiple_primitives() {
+        use std::sync::{Arc, atomic::AtomicU32};
+
+        use crate::text::{
+            ShapedGlyphRun, ShapedLine, ShapedTextHandle, ShapedTextItem, ShapedTextLine,
+        };
+
+        let run = |x: f32| ShapedGlyphRun {
+            color: Color::BLACK,
+            text_range: 0..1,
+            glyphs: vec![PositionedGlyph {
+                tile: AtlasTile {
+                    atlas: AtlasKind::Glyph,
+                    page: 0,
+                    u0: x / 8.0,
+                    v0: 0.0,
+                    u1: (x + 8.0) / 8.0,
+                    v1: 1.0,
+                    generation: 3,
+                },
+                position: Point::new(x, 0.0),
+                size: Size::new(8.0, 8.0),
+            }],
+        };
+        let line = ShapedLine {
+            text: smol_str::SmolStr::new_static("ab"),
+            lines: vec![ShapedTextLine {
+                text_range: 0..2,
+                baseline: 12.0,
+                line_height: 14.0,
+                advance: 16.0,
+                items: vec![
+                    ShapedTextItem::GlyphRun(run(0.0)),
+                    ShapedTextItem::InlineBox(crate::text::ShapedInlineBox {
+                        id: 5,
+                        rect: Rect::new(4.0, 0.0, 8.0, 8.0),
+                        baseline: None,
+                    }),
+                    ShapedTextItem::GlyphRun(run(8.0)),
+                ],
+            }],
+            width: 16.0,
+            height: 14.0,
+            first_baseline: Some(12.0),
+            atlas_generation: 3,
+            font_stack_version: 1,
+            scale: 1.0,
+        };
+        let handle =
+            ShapedTextHandle::new(Arc::new(line), Box::new([]), 3, Arc::new(AtomicU32::new(3)));
+        let mut canvas = Canvas::new(bounds());
+        assert!(canvas.push_shaped_text(&handle, Point::new(1.0, 2.0)));
+        assert_eq!(
+            canvas.primitives().len(),
+            2,
+            "按 run 拆图元：行内盒不产生图元（E1 只保证落点可读）"
+        );
+        let positions: Vec<Point> = canvas
+            .primitives()
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::GlyphRun(run) => run.glyphs.first().map(|glyph| glyph.position),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(positions, vec![Point::new(1.0, 2.0), Point::new(9.0, 2.0)]);
     }
 }

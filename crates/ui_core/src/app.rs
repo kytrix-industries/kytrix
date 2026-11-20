@@ -26,7 +26,10 @@ mod virtual_list;
 mod window_set;
 
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -59,8 +62,9 @@ use crate::{
     render::{AtlasAllocator, MIN_ATLAS_PAGE},
     resources::{DecodeState, PendingResource, ResourceCache},
     text::{
-        FontStack, FontStackStatus, TextDiagnostic, TextLayoutReport, TextPassReport,
-        atlas::GlyphAtlas, context::TextContext, raster::GlyphRasterizer,
+        FontStack, FontStackStatus, InlineBoxSpec, ShapedInlineBox, ShapedTextHandle,
+        TextDiagnostic, TextLayoutReport, TextPassReport, TextStyle, atlas::GlyphAtlas,
+        context::TextContext, raster::GlyphRasterizer,
     },
     window::{FrameOutcome, FramePresentation, FrameTicket, Window, WindowId, WindowOptions},
 };
@@ -135,6 +139,14 @@ pub struct App {
     /// 页内所有 tile 重排。文本 lane 里存的是旧 `AtlasTile`（旧 UV），所以代际一变就必须
     /// 让**所有窗口**的文本节点重绘；否则画的是旧 UV（错字/花字）。
     atlas_generation_seen: u32,
+    /// 图集代际租约：`ShapedTextHandle::is_stale` 与 `Canvas::push_shaped_text` 读取的
+    /// **当前**代际（单一真源仍是 `atlas.generation()`）。
+    ///
+    /// 任何可能换代的入口（`layout_text` 的扩容/清空、`set_font_stack`、
+    /// `reload_system_fonts`、`shape_text` 自身）返回后都由
+    /// `App::sync_atlas_generation_lease` 写入，因此独立于窗口的 shaping 句柄也能在图集换代
+    /// 后立即判定失活（D-5：不画旧 UV）。
+    atlas_generation_lease: Arc<AtomicU32>,
     /// 累积的图集脏矩形（P09 的增量上传输入；`layout_text` 合并、上传后清空；R06-3 起是 AOI 矩形）。
     pending_dirty: crate::render::DirtyRects,
     /// 字形页整页缓冲上次按哪个页尺寸重建（`None` = 还没建 / 刚清空）。
@@ -424,6 +436,12 @@ impl App {
         // `GetMessageW`/`poll`，没有唤醒就永远不会有人调 `poll()`）。字段顺序要求它先于
         // `resources` 构造，因此提到结构体字面量之前。
         let dispatcher = Dispatcher::new();
+        // 图集构造在字面量之前：代际租约的初值必须与图集的初始代际一致。
+        let atlas = AtlasAllocator::with_page(
+            crate::paint::atlas::AtlasKind::Glyph,
+            (MIN_ATLAS_PAGE, MIN_ATLAS_PAGE),
+        );
+        let atlas_generation_lease = Arc::new(AtomicU32::new(atlas.generation()));
         Self {
             store: StateStore::with_capacity(64, 16),
             graph: DependencyGraph::new(),
@@ -434,10 +452,7 @@ impl App {
             runtime: runtime.clone(),
             text: TextContext::new(),
             raster: GlyphRasterizer::new(),
-            atlas: AtlasAllocator::with_page(
-                crate::paint::atlas::AtlasKind::Glyph,
-                (MIN_ATLAS_PAGE, MIN_ATLAS_PAGE),
-            ),
+            atlas,
             resources: ResourceCache::new(runtime, Arc::clone(&dispatcher)),
             pending_resource_results: Vec::new(),
             geometry: crate::paint::geometry_store::GeometryStore::new(),
@@ -446,6 +461,7 @@ impl App {
             text_layout_scratch: Vec::new(),
             scale_epochs: ahash::HashMap::default(),
             atlas_generation_seen: 0,
+            atlas_generation_lease,
             pending_dirty: crate::render::DirtyRects::default(),
             glyph_page_extent: None,
             image_array_established: None,
@@ -2094,7 +2110,88 @@ impl App {
         &mut self,
         window: WindowId,
     ) -> Option<Result<TextLayoutReport, EngineError>> {
-        text_pass::layout_text(self, window)
+        let result = text_pass::layout_text(self, window);
+        self.sync_atlas_generation_lease();
+        result
+    }
+
+    /// 无节点归属的文本 shaping（v2.1 E1，`§11.1`）：canvas 内文本的公开入口。
+    ///
+    /// 按 `style` 与 `max_width` 塑形、断行并光栅/装箱，返回**可长期持有**的句柄。同一文本 +
+    /// 同一 shaping 输入命中形状缓存（与 `refresh_text` 同一份 `ShapeKey`），不重复塑形；
+    /// `max_width = None` = 不限宽（单行），`Some(w)` = 按 `w` 断行（等价
+    /// `break_all_lines(Some(w))`）。
+    ///
+    /// `inline_boxes` 与节点路径同源（`TextContent.inline_boxes`）：落点经
+    /// [`App::shaped_inline_boxes`] 读取；传空切片 = 无行内盒。E1 只保证落点可读，
+    /// `InlineBoxPaint` 的绘制归 E2（`§11.2`）。
+    ///
+    /// 句柄带**图集代际租约**：图集换代后 [`ShapedTextHandle::is_stale`] 为真，
+    /// [`crate::paint::canvas::Canvas::push_shaped_text`] 返回 `false` 且不编码旧 UV（D-5）；
+    /// 应用应丢弃句柄并重新调用本方法。
+    ///
+    /// # Errors
+    /// - [`EngineError::TextShapeStandalone`]：`max_width` 非有限 / 为负，或字体栈为空；
+    /// - [`EngineError::AtlasExhausted`]：字形图集在扩容 + LRU 淘汰后仍放不下本次工作集。
+    ///
+    /// # Panics: none
+    pub fn shape_text(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+        max_width: Option<f32>,
+        inline_boxes: &[InlineBoxSpec],
+    ) -> Result<ShapedTextHandle, EngineError> {
+        let App {
+            text: text_context,
+            raster,
+            atlas,
+            glyph_atlas,
+            pending_dirty,
+            atlas_generation_lease,
+            windows,
+            ..
+        } = self;
+        let handle = crate::text::standalone::shape(
+            text_context,
+            raster,
+            atlas,
+            glyph_atlas,
+            pending_dirty,
+            atlas_generation_lease,
+            text,
+            style,
+            max_width,
+            inline_boxes,
+        )?;
+        // 本次 shape 可能触发扩容 / 满页清空：进程级图集换代会让**所有窗口**已发布的
+        // `ShapedLine` 烘焙旧 UV（D-5）。这里与 `layout_text` 的淘汰收尾同口径：重新入队，
+        // 下一帧（或本帧稍后的 `layout_text`）用当前代际重光栅。
+        if glyph_atlas.take_evicted() > 0 {
+            for window in windows.values_mut() {
+                window.tree_mut().invalidate_text_lines();
+            }
+        }
+        Ok(handle)
+    }
+
+    /// 行内盒落点（v2.1 E1，`§11.1`）：顺序与 `shape_text` 传入的 `inline_boxes` 一一对应，
+    /// `id` 原样保留；供应用画 `<img>` / `<kbd>`。
+    ///
+    /// 坐标是**文本盒局部**逻辑像素（与 `handle.line()` 的字形位置同域）：应用画图时加上文本盒
+    /// 在窗口中的绝对原点。空切片 = 无行内盒。
+    ///
+    /// # Panics: none
+    #[must_use]
+    pub fn shaped_inline_boxes<'a>(&self, handle: &'a ShapedTextHandle) -> &'a [ShapedInlineBox] {
+        handle.inline_boxes()
+    }
+
+    /// 让代际租约与图集对齐：任何可能换代的 App 入口返回后调用（`shaped_text` 句柄的
+    /// `is_stale` 依赖它）。原语是 `atlas.generation()`，这里只是把同一真源写进共享槽。
+    fn sync_atlas_generation_lease(&self) {
+        self.atlas_generation_lease
+            .store(self.atlas.generation(), Ordering::Relaxed);
     }
 
     /// 当前字体栈。
@@ -2123,12 +2220,16 @@ impl App {
     /// 换字体栈：版本 +1、字体代际 +1、清形状缓存与字形图集、所有窗口的文本节点
     /// `LAYOUT | PAINT`。返回新版本号。
     pub fn set_font_stack(&mut self, stack: FontStack) -> u32 {
-        text_pass::set_font_stack(self, stack)
+        let version = text_pass::set_font_stack(self, stack);
+        self.sync_atlas_generation_lease();
+        version
     }
 
     /// 系统字体安装/卸载/语言切换后调用：重载 + 与 [`App::set_font_stack`] 相同的失效。
     pub fn reload_system_fonts(&mut self) -> u32 {
-        text_pass::reload_system_fonts(self)
+        let version = text_pass::reload_system_fonts(self);
+        self.sync_atlas_generation_lease();
+        version
     }
 
     /// 数字快速路径开关（`DigitFastPath`，R12 的性能项）。
@@ -2159,7 +2260,8 @@ impl App {
     ///
     /// 对照 Skia：glyph atlas / strike cache 换代时会让所有引用旧 strike 的绘制数据失效。
     fn repaint_text_if_atlas_changed(&mut self) {
-        text_pass::repaint_text_if_atlas_changed(self)
+        text_pass::repaint_text_if_atlas_changed(self);
+        self.sync_atlas_generation_lease();
     }
 
     fn invalidate_all_text(&mut self) {

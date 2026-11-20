@@ -187,6 +187,15 @@ pub enum EngineError {
     #[error("text shaping failed for {node:?}: {detail}")]
     TextShape { node: NodeId, detail: SmolStr },
 
+    /// **无节点归属**的 shaping 失败（v2.1 E1，§11.1）：`App::shape_text` 的文本不属于任何
+    /// 节点，因此无法用 [`EngineError::TextShape`] 的 `node` 字段定位。
+    ///
+    /// 触发：字体栈为空（没有任何候选家族）、`max_width` 非有限值或为负、parley 构建失败。
+    /// 与 `TextShape` 分开的理由：调用方的处理策略不同 —— 节点版由节点失效通道重试，
+    /// 独立版只能由应用修正输入（换字体栈 / 改正宽度）后重新 `shape_text`。
+    #[error("standalone text shaping failed: {detail}")]
+    TextShapeStandalone { detail: SmolStr },
+
     /// 图集无法容纳新图元（清空重建后仍失败，P02 §10.6 / P01 §6.2.2 #12）。
     #[error("atlas {kind:?} is exhausted: no free tile fits after a clear and rebuild")]
     AtlasExhausted { kind: AtlasKind },
@@ -398,6 +407,9 @@ mod tests {
                 node: NodeId::for_test(5, 1),
                 detail: SmolStr::new_static("font stack is empty"),
             },
+            EngineError::TextShapeStandalone {
+                detail: SmolStr::new_static("font stack is empty"),
+            },
             EngineError::AtlasExhausted {
                 kind: AtlasKind::Glyph,
             },
@@ -477,6 +489,23 @@ mod tests {
         assert!(text.contains("text shaping failed"), "{text}");
         assert!(text.contains("n6.2"), "{text}");
         assert!(text.contains("char boundary"), "{text}");
+    }
+
+    /// §11.1：`App::shape_text` 的失败没有节点归属，必须是独立变体（调用方按变体决定是
+    /// 「等节点失效重试」还是「修正输入后重新 shape」）。
+    #[test]
+    fn standalone_text_shape_display_has_no_node_handle() {
+        let text = EngineError::TextShapeStandalone {
+            detail: SmolStr::new_static("max_width 0 must be finite and non-negative"),
+        }
+        .to_string();
+
+        assert!(text.contains("standalone text shaping failed"), "{text}");
+        assert!(text.contains("max_width"), "{text}");
+        assert!(
+            !text.contains("node"),
+            "独立 shaping 错误不得暗示节点归属：{text}"
+        );
     }
 
     #[test]

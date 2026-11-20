@@ -576,6 +576,12 @@ fn growing_the_image_array_reuploads_every_open_layer() {
 /// RBT-01 不变量 1（编码期过滤）：扩层还没发生时，引用新层的 `Primitive::Image` **不产生实例**
 /// —— 不画占位、不画错层；旧层的图照画（不变量 3）。上限变化的那一帧由合成端强制重编码 +
 /// 全量载荷，所以这里连续两帧能直接看到实例层的集合变化。
+///
+/// 断言读的是 `Window::instance_buffer()`（inline 合成器的编码产物），该 API 只在
+/// `feature = "test-support"` 构建里存在（它把 `InstanceBuffer` 拉进测试面），因此本用例
+/// 必须带同一个 feature 守卫 —— 否则 `cargo check -p ui_core --all-targets`（默认特性）
+/// 会因「方法不存在」失败，而 `--features test-support` 下照常运行。
+#[cfg(feature = "test-support")]
 #[test]
 fn images_on_layers_without_an_established_array_are_not_drawn() {
     let (_rt, mut app, window) = setup();

@@ -773,7 +773,11 @@ impl InstanceBuffer {
     ///
     /// 消费者：fail-closed 回归测试（RBT-01 不变量 1 —— 「扩层未建立时不得有任何 Image draw
     /// 引用新层，旧层照画」）。空洞与已释放段不参与（实例环里它们的字节是垃圾）。
-    #[cfg(test)]
+    ///
+    /// 该方法的唯一消费者是 `app::resources_tests` 里读 `Window::instance_buffer()` 的用例，
+    /// 而后者本身由 `feature = "test-support"` 门控（`InstanceBuffer` 只在测试面暴露）；
+    /// 因此方法也带同一 feature 守卫，默认特性（无测试消费者）下不会变成 dead code。
+    #[cfg(all(test, feature = "test-support"))]
     pub(crate) fn image_layers(&self) -> Vec<u16> {
         let mut layers = Vec::new();
         for segment in self.segments.iter().flatten() {
