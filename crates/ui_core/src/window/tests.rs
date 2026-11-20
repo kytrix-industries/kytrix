@@ -841,7 +841,9 @@ fn frame_presentations_are_recorded_and_bounded() {
 
 // ── E6（P1-E6）：窗口 chrome 的数据面 ───────────────────────────────────
 
-/// E6：`Decorations` 决定 `client_decoration` 的建窗初值（Windows `None` ⇒ 应用自绘）；
+/// E6：`Decorations` 与平台能力决定 `WindowState` 的**建窗初值**：Windows `None` ⇒ 应用自绘、
+/// 且 `can_fullscreen` 初值就是 `false`（没有全屏控制，不能等首轮泵校正 —— 审查 F8）；macOS
+/// `client_decoration` **恒 `false`**（原生交通灯，`Decorations::None` 是文档化降级）。
 /// 默认值保持 `Native`（默认路径回归）。
 #[test]
 fn decorations_drive_the_initial_client_decoration_state() {
@@ -854,6 +856,16 @@ fn decorations_drive_the_initial_client_decoration_state() {
     assert!(!native.state().client_decoration, "Native ⇒ 系统装饰");
     assert!(!native.state().maximized);
     assert!(!native.state().fullscreen);
+    assert!(native.state().can_maximize);
+    assert!(native.state().can_minimize);
+    if cfg!(windows) {
+        assert!(
+            !native.state().can_fullscreen,
+            "Windows 没有全屏控制：初值就必须是 false（首轮泵不产生校正性状态变化）"
+        );
+    } else {
+        assert!(native.state().can_fullscreen, "macOS/Linux 原生支持全屏");
+    }
 
     let frameless = Window::new(
         WindowId::for_test(2),
@@ -862,7 +874,14 @@ fn decorations_drive_the_initial_client_decoration_state() {
             ..WindowOptions::default()
         },
     );
-    assert!(frameless.state().client_decoration, "None ⇒ 应用自绘装饰");
+    if cfg!(target_os = "macos") {
+        assert!(
+            !frameless.state().client_decoration,
+            "macOS 恒由系统装饰（原生交通灯）：Decorations::None 是文档化降级"
+        );
+    } else {
+        assert!(frameless.state().client_decoration, "None ⇒ 应用自绘装饰");
+    }
 }
 
 /// E6 / §8.6.4 / I3：`set_state` 同值 no-op；值变化时给**根节点**标 `PAINT`（应用据此重画

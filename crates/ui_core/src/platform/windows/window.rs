@@ -729,7 +729,8 @@ impl NativeWindow {
     ///
     /// 调用方（泵）**不持有** `&mut App`：`ShowWindow` 会同步派发 `WM_SIZE` / `WM_WINDOWPOSCHANGED`
     /// 并重入 `WndProc`（文件头纪律 1）。`SW_MAXIMIZE` / `SW_RESTORE` 后 `WM_SIZE` 置位
-    /// `chrome_dirty`，同一轮泵的 [`Self::sync_chrome`] 会把真实状态写回 `App`。
+    /// `chrome_dirty`；泵在控制执行后**同一轮**补收一次平台事件（消费新客户区）再调
+    /// [`Self::sync_chrome`]（把真实状态写回 `App`）—— 两者在同一帧里生效（P2-1 同帧闭环）。
     pub(crate) fn apply_window_control(&self, control: WindowControl) {
         match control {
             WindowControl::Minimize => {
@@ -1098,9 +1099,14 @@ fn wide(text: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use bytes::Bytes;
     use windows::Win32::{
         Foundation::{HWND, LPARAM, RECT, WPARAM},
+        Graphics::Gdi::{
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+        },
         UI::{
             Input::{
                 Ime::{ImmGetContext, ImmReleaseContext},
@@ -1108,10 +1114,10 @@ mod tests {
             },
             WindowsAndMessaging::{
                 GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetWindow, GetWindowLongPtrW,
-                GetWindowRect, GetWindowTextW, ICON_BIG, IsWindow, NCCALCSIZE_PARAMS, SendMessageW,
-                WM_GETICON, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_NCCALCSIZE,
-                WS_CAPTION, WS_CHILD, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
-                WS_THICKFRAME,
+                GetWindowRect, GetWindowTextW, ICON_BIG, IsWindow, IsZoomed, NCCALCSIZE_PARAMS,
+                SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SendMessageW, ShowWindow, WM_GETICON,
+                WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_NCCALCSIZE, WS_CAPTION,
+                WS_CHILD, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
             },
         },
     };
@@ -1715,8 +1721,10 @@ mod tests {
     }
 
     /// E6 / §11.6：frameless 仍必须带 `WS_OVERLAPPEDWINDOW` 的全部位（含 `WS_THICKFRAME` /
-    /// `WS_CAPTION`）—— 这是 Aero Snap / Snap Layouts / DWM 阴影 / 最大化动画保留的架构前提
-    /// （换成 `WS_POPUP` 会全部丢失）。
+    /// `WS_CAPTION`）—— 这是 DWM 阴影 / 最大化动画 / Aero Snap（拖边）/ 双击最大化保留的架构
+    /// 前提（换成 `WS_POPUP` 会全部丢失）。Win11 **Snap Layouts 的悬停浮层**需要自绘最大化按钮
+    /// 返回 `HTMAXBUTTON`，本批未实现（见 `platform/windows/chrome` 模块文档），不在本样式位的
+    /// 保护范围内。
     ///
     /// 变异守卫：把 frameless 的窗口样式改成「去掉 WS_THICKFRAME」⇒ 本用例红。
     #[test]
@@ -1746,7 +1754,12 @@ mod tests {
     /// E6 / §11.6：`WM_NCCALCSIZE`（wparam == TRUE）在 frameless 下返回 0 且客户区 = 整个窗口
     /// 矩形；Native 仍由系统扣掉标题栏 / 边框（默认路径回归）。
     ///
-    /// 变异守卫：删掉 `wndproc` 的 frameless 分支（交 `DefWindowProcW`）⇒ 第一条断言红。
+    /// **证据边界（审查 F5 更正）**：本条只用**合成** `WM_NCCALCSIZE` 钉住「返回 0、不改 `rgrc`」
+    /// 这一半；`NCCALCSIZE_PARAMS.lppos` 的语义由 USER 内部状态决定，删掉 frameless 分支后本条
+    /// 仍可能绿（审查变异 M1）。系统几何面的真正守护者是：
+    /// [`a_frameless_window_client_is_exactly_the_requested_size`]（非最大化：窗口矩形 == 客户区）
+    /// 与 [`a_maximized_frameless_window_matches_the_work_area_and_updates_state`]（最大化：客户区 ==
+    /// 工作区）。
     #[test]
     fn wm_nccalcsize_makes_the_frameless_client_area_cover_the_whole_window() {
         let frameless = window_with_options(
@@ -1890,6 +1903,133 @@ mod tests {
             "after",
             "同值同步不得反复写标题（幂等）"
         );
+    }
+
+    /// E6 / §11.6 / P2-2：frameless 最大化后客户区必须**逐像素**等于监视器工作区 ——
+    /// `WM_NCCALCSIZE` 的 `IsZoomed → inset_for_maximized` 补偿（`SM_CXSIZEFRAME +
+    /// SM_CXPADDEDBORDER`，按窗口 DPI）。这是审查点名的「头号坑」：少了补偿，客户区会多出
+    /// 2 × 边框物理像素（实机 125% 下 2×9 px），内容四边被裁。
+    ///
+    /// 变异守卫：删掉 `wndproc` 里 `WM_NCCALCSIZE` 的 `IsZoomed` 内缩（审查 M2，实机客户区
+    /// 3086×1694）⇒ 第一条断言变红。
+    #[test]
+    fn a_maximized_frameless_window_matches_the_work_area() {
+        let options = WindowOptions {
+            decorations: Decorations::None,
+            ..WindowOptions::default()
+        };
+        let native = window_with_options(35, &options);
+        // SAFETY: 窗口由本用例持有且仍存活；`ShowWindow(SW_MAXIMIZE)` 同步派发 `WM_NCCALCSIZE`
+        // 与 `WM_SIZE`（同一线程），随后只读查询几何。
+        unsafe {
+            let _ = ShowWindow(native.hwnd, SW_MAXIMIZE);
+        }
+        assert!(
+            // SAFETY: 同上，只读窗口状态。
+            unsafe { IsZoomed(native.hwnd) }.as_bool(),
+            "前置：ShowWindow(SW_MAXIMIZE) 后窗口必须真的最大化"
+        );
+
+        let mut client = RECT::default();
+        // SAFETY: 窗口存活；只读查询。
+        unsafe { GetClientRect(native.hwnd, &mut client) }.expect("GetClientRect");
+        // SAFETY: 窗口存活；只取它所在显示器。
+        let monitor = unsafe { MonitorFromWindow(native.hwnd, MONITOR_DEFAULTTONEAREST) };
+        let mut info = MONITORINFO {
+            cbSize: u32::try_from(std::mem::size_of::<MONITORINFO>()).expect("MONITORINFO size"),
+            ..Default::default()
+        };
+        // SAFETY: `monitor` 由 `MonitorFromWindow` 返回；`info.cbSize` 已填，只写栈上结构。
+        assert!(
+            unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool(),
+            "GetMonitorInfoW"
+        );
+        let client_size = (client.right - client.left, client.bottom - client.top);
+        let work_size = (
+            info.rcWork.right - info.rcWork.left,
+            info.rcWork.bottom - info.rcWork.top,
+        );
+        assert_eq!(
+            client_size, work_size,
+            "最大化客户区必须逐像素等于工作区（多/少一像素都是边框补偿错误；\
+             client={client:?} work={:?}）",
+            info.rcWork
+        );
+
+        // 还原 + 隐藏：不给宿主桌面留下一个最大化窗口（`NativeWindow::drop` 随后销毁）。
+        // SAFETY: 窗口由本用例持有且仍存活。
+        unsafe {
+            let _ = ShowWindow(native.hwnd, SW_RESTORE);
+            let _ = ShowWindow(native.hwnd, SW_HIDE);
+        }
+    }
+
+    /// E6 / §8.6.4 / P2-3：`WM_SIZE → chrome_dirty → sync_chrome → WindowState` 的接线。
+    ///
+    /// 最大化 / 还原 / Snap 必然改变客户区：`WndProc` 的 `WM_SIZE` 分支置 `chrome_dirty`，泵的
+    /// `sync_chrome` 据此查询 `IsZoomed` 写回 `App` 并请求一帧（I3）。缺了任何一环，应用自绘的
+    /// 最大化按钮图标都不会刷新。
+    ///
+    /// 变异守卫：删掉 `WM_SIZE` 分支的 `note_chrome_dirty()`（审查 M7）⇒ `sync_chrome` 不再读
+    /// `IsZoomed`，`maximized` 保持 `false`、第二条断言变红，且不会请求帧。
+    #[test]
+    fn maximizing_a_window_reports_the_state_through_sync_chrome() {
+        let runtime = runtime();
+        let mut app = App::new(runtime.handle().clone());
+        let options = WindowOptions {
+            decorations: Decorations::None,
+            ..WindowOptions::default()
+        };
+        let id = app.create_window(options.clone());
+        let dispatcher = Dispatcher::new();
+        let mut native = NativeWindow::create(
+            WindowId::for_test(id.to_bits()),
+            &options,
+            None,
+            Arc::clone(&dispatcher),
+            None,
+            crate::platform::windows::window::test_a11y_epoch(),
+        )
+        .expect("NativeWindow::create");
+
+        // 建窗期的 `WM_SIZE` 已经置过帧唤醒；先清空，下面只观察控制带来的变化。
+        let _ = dispatcher.take_frame_wake();
+        let _ = app.take_wake_request();
+        // 首轮对账消费建窗时的 `chrome_dirty`（初值必须已是真值 ⇒ 不请求帧；也守住
+        // `WindowState::for_decorations` 的 Windows 初值：`can_fullscreen=false`）。
+        native.sync_chrome(&mut app);
+        assert!(
+            !app.take_wake_request(),
+            "首轮对账不得因初值校正而请求一帧（Windows 的初始 WindowState 必须已是真值）"
+        );
+        assert!(
+            !app.window(id).expect("窗口存在").state().maximized,
+            "前置：窗口未最大化"
+        );
+
+        // SAFETY: 窗口由本用例持有且仍存活；`ShowWindow` 在本线程同步派发 `WM_SIZE`。
+        unsafe {
+            let _ = ShowWindow(native.hwnd, SW_MAXIMIZE);
+        }
+        // 消费 `WM_SIZE` 事件自身带来的帧唤醒（与状态变化无关），再验证 chrome 对账。
+        let _ = dispatcher.take_frame_wake();
+        let _ = app.take_wake_request();
+        native.sync_chrome(&mut app);
+
+        assert!(
+            app.window(id).expect("窗口存在").state().maximized,
+            "WM_SIZE 之后 sync_chrome 必须把 IsZoomed 写回 WindowState.maximized（P2-3）"
+        );
+        assert!(
+            app.take_wake_request(),
+            "状态变化必须请求一帧（§8.6.4 / I3）"
+        );
+
+        // SAFETY: 窗口由本用例持有且仍存活。
+        unsafe {
+            let _ = ShowWindow(native.hwnd, SW_RESTORE);
+            let _ = ShowWindow(native.hwnd, SW_HIDE);
+        }
     }
 
     /// E6：合法图标在建窗时变成真实的 `WM_SETICON` 句柄（大小图标槽都设置）。

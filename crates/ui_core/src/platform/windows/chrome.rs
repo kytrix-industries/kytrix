@@ -2,13 +2,16 @@
 //!
 //! ## 结构：系统仍拥有交互，引擎只改「客户区在哪 / 命中码是哪个」
 //!
-//! E6 不重写 caption 的 move 模态循环，也不重写 size 模态循环 —— 那样会丢掉 Aero Snap /
-//! Win11 Snap Layouts / 双击最大化 / `Alt+Space`（§8.6.2 用户裁决）。frameless 只做两件事：
+//! E6 不重写 caption 的 move 模态循环，也不重写 size 模态循环 —— 那样会丢掉 Aero Snap（拖边）/
+//! 双击最大化 / `Alt+Space` / 右键系统菜单（§8.6.2 用户裁决）。Win11 **Snap Layouts 的悬停浮层**
+//! 则由系统在 `WM_NCHITTEST` 返回 `HTMAXBUTTON`（最大化按钮）时弹出：本批 `WM_NCHITTEST` 只返回
+//! 八向 `HT*` / `HTCAPTION` / `HTCLIENT`，**没有**实现 `HTMAXBUTTON` ⇒ Snap Layouts 浮层在本批
+//! **不成立**（规格 §8.6.3 的原文过于宽泛，偏差已登记在 `spec-deltas/E6.md`）。frameless 只做两件事：
 //!
 //! 1. **`WM_NCCALCSIZE`（wparam == TRUE）返回 0**：客户区 = 整个窗口矩形（去掉系统标题栏与
 //!    非客户区绘画）。窗口样式仍是 `WS_OVERLAPPEDWINDOW`（含 `WS_THICKFRAME` / `WS_CAPTION`），
-//!    因此 **DWM 阴影、圆角、最大化动画、Snap 命中全部保留** —— 这是不换成 `WS_POPUP` 的
-//!    唯一理由，也是本模块存在的边界。
+//!    因此 **DWM 阴影、圆角、最大化动画、Aero Snap 的顶边命中全部保留** —— 这是不换成
+//!    `WS_POPUP` 的唯一理由，也是本模块存在的边界。
 //! 2. **`WM_NCHITTEST` 自算八向 resize 命中**（[`resize_edge_at`]）：返回 `HTLEFT`… /
 //!    `HTBOTTOMRIGHT` 走系统 size 模态循环；应用声明的拖动区返回 `HTCAPTION` 走系统 move
 //!    模态循环；其余 `HTCLIENT`。
@@ -278,5 +281,33 @@ mod tests {
         );
         // 退化输入不产生反向矩形（钳成零尺寸）。
         assert_eq!(inset_for_maximized((0, 0, 4, 4), (8, 8)), (8, 8, 8, 8));
+    }
+
+    /// P2-2：最大化几何的**纯函数**守护 —— 系统把最大化窗口撑到「工作区 + 每边一个
+    /// `resize_border`」（`SM_CXSIZEFRAME + SM_CXPADDEDBORDER`，按窗口 DPI 换算）；内缩之后
+    /// 客户区必须**逐像素**等于工作区。DPI 表覆盖 100 / 125 / 150 / 200%（与
+    /// `WM_NCHITTEST` 的命中带共用同一个值）。
+    #[test]
+    fn maximized_inset_matches_the_work_area_at_every_dpi() {
+        let work_area = (0, 0, 1920, 1080);
+        for dpi in [96, 120, 144, 192] {
+            let border = crate::platform::windows::dpi::resize_border(dpi);
+            assert!(
+                border.0 > 0 && border.1 > 0,
+                "{dpi} dpi 的 resize 命中带必须为正：{border:?}"
+            );
+            // 系统给最大化装饰窗口预留的一圈 frame：窗口矩形 = 工作区四边各扩 border。
+            let maximized_window = (
+                work_area.0 - border.0,
+                work_area.1 - border.1,
+                work_area.2 + border.0,
+                work_area.3 + border.1,
+            );
+            assert_eq!(
+                inset_for_maximized(maximized_window, border),
+                work_area,
+                "{dpi} dpi：最大化客户区必须逐像素等于工作区（补偿 = 同一个 resize_border）"
+            );
+        }
     }
 }

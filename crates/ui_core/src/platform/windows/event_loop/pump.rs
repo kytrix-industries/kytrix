@@ -706,22 +706,42 @@ pub(super) fn pump_loop(
         }
         // ②a″ E6：窗口 chrome 对账（标题 `SetWindowTextW` + 最大化状态 `IsZoomed` → `WindowState`）。
         //
-        // 顺序：先应用应用侧登记的控制请求（`ShowWindow` 会同步派发 `WM_SIZE` ⇒ 置
-        // `chrome_dirty`），再逐窗口对账 —— 这样同一轮就能把真实的最大化状态写回 `App` 并出帧。
+        // 顺序（P2-1 同帧闭环）：先应用应用侧登记的控制请求 → **立刻补收一次平台事件** → 再逐窗口
+        // 对账。`ShowWindow(SW_MAXIMIZE / SW_RESTORE)` 在调用内**同步**派发 `WM_SIZE`（`WndProc`
+        // 把新的客户区 `Resize` 事件入队并置 `chrome_dirty`）；②b 已经跑过，若不在控制之后补收，
+        // 本轮 ④ 会用「新 `maximized` + 旧客户区尺寸」出一帧 —— 最大化 / 还原各出现 ≈1 帧旧尺寸
+        // 画面（P1-E6 审查 F1 的真实机日志）。补收放在对账之前，尺寸与状态在同一轮落地。
+        //
+        // 只有真的执行了控制才补收：常规轮次仍然只有 ②b 一次事件收集、④ 出帧数不变（I3）——
+        // `WM_SIZE` 事件本身与状态变化各请求一次同一帧（`Dispatcher::wake` 合并位）。
         //
         // 借用纪律：`ShowWindow` 可能同步重入 `WndProc`，因此**不持有** `&mut App` 执行；标题 /
         // 状态对账要碰 `App`，放在短借用里逐窗口做（`WndProc` 不调用应用层）。
-        {
+        let applied_control = {
             let pending_control = {
                 let mut app = app_cell.borrow_mut();
                 app.take_window_control()
             };
-            if let Some((id, control)) = pending_control
-                && let Some(native) = windows.iter().find(|native| native.id() == id)
-            {
+            let target = pending_control.and_then(|(id, control)| {
+                windows
+                    .iter()
+                    .find(|native| native.id() == id && !native.is_destroyed())
+                    .map(|native| (native, control))
+            });
+            if let Some((native, control)) = target {
                 native.apply_window_control(control);
+                true
+            } else {
+                false
             }
+        };
+        {
             let mut app = app_cell.borrow_mut();
+            if applied_control {
+                // 控制执行后同步派发的 `WM_SIZE`（新客户区 + `chrome_dirty`）必须在同一轮被
+                // 消费：见上面的 P2-1 注释。
+                collect_events(&mut app, windows, dispatcher)?;
+            }
             for native in windows.iter_mut() {
                 native.sync_chrome(&mut app);
             }
@@ -1307,6 +1327,41 @@ mod composition_health_tests {
         assert!(
             source.contains(request),
             "pump.rs 必须把 Invalid 清单落到 request_composition_rebuild（删掉请求即红）"
+        );
+    }
+}
+
+#[cfg(test)]
+mod chrome_loop_wiring_tests {
+    /// P2-1 接线防回归：`pump_loop` 的 ②a″ 必须按「应用控制 → **补收 `WM_SIZE` 事件** →
+    /// `sync_chrome` 对账」排序。
+    ///
+    /// `ShowWindow(SW_MAXIMIZE / SW_RESTORE)` 在调用内同步派发 `WM_SIZE`；若控制之后不补收
+    /// 事件（或把补收挪到 `sync_chrome` 之后），本轮 ④ 就会用「新 `maximized` + 旧客户区尺寸」
+    /// 出一帧 —— 最大化 / 还原各出现 ≈1 帧旧尺寸画面（P1-E6 审查 F1）。删除补收调用、或把
+    /// `sync_chrome` 移到补收之前，本断言变红。
+    ///
+    /// 用 `concat!` 拼接 needle，避免本测试源码自身命中（源码里不会出现完整字符串）。
+    #[test]
+    fn the_pump_consumes_the_control_wm_size_before_reconciling_chrome() {
+        let source = include_str!("pump.rs");
+        let control = source
+            .find(concat!("native.apply_window", "_control(control);"))
+            .expect("pump_loop 必须应用窗口控制请求");
+        let after_control = &source[control..];
+        let collect = after_control
+            .find(concat!(
+                "collect_events",
+                "(&mut app, windows, dispatcher)?"
+            ))
+            .expect("控制执行后必须在同一轮补收 `WM_SIZE` 事件（P2-1 同帧闭环；删掉补收即红）");
+        let sync = after_control
+            .find(concat!("native.sync_chrome", "(&mut app)"))
+            .expect("泵必须在事件消费之后逐窗口对账 chrome");
+        assert!(
+            collect < sync,
+            "顺序必须是：应用控制 → 补收 `WM_SIZE` → `sync_chrome`（P2-1）；实际 collect={collect} \
+             sync={sync}"
         );
     }
 }

@@ -400,10 +400,24 @@ pub(crate) struct NativeWindow {
     /// 最近一次成功应用（写进 `NSWindow.setTitle:`）的标题（泵每轮与 `WindowOptions.title` 比较，
     /// 同值 no-op；E6 运行时改标题）。
     title: SmolStr,
-    /// 最近一次应用到三个标准按钮的交通灯位置（逻辑点，内容区左上原点；`None` = 系统默认）。
+    /// 最近一次**应用**到三个标准按钮的交通灯位置（逻辑点，内容区左上原点；`None` = 系统默认）。
     ///
-    /// 泵每轮与 `Window::traffic_light_position` 比较；值变化才调整按钮 frame（E6 §8.6.5）。
+    /// **set-once**（审查 F7 / Lead 裁决）：只有第一次看到非 `None` 的请求时调整按钮 frame；
+    /// 之后不再比较 / 重排 —— AppKit 在 resize / 全屏转场后的重排不追回，运行期改位置或改回
+    /// `None` 都不可撤销（应用应在建窗时决定一次，见 `App::set_traffic_light_position`）。
     traffic_light_position: Option<Point>,
+    /// 最近一次观察到的原生全屏状态（`styleMask.contains(.fullScreen)`）。
+    ///
+    /// 边沿用于让交通灯安全区缓存失效：进出全屏时 AppKit 隐藏 / 恢复标准按钮。
+    fullscreen: bool,
+    /// 交通灯安全区缓存（`None` = 尚未取到有效值；原生全屏下按 `None` 上报）。
+    ///
+    /// 每轮重算 `standardWindowButton:` 的 3 次 `convertRect:toView:` 是纯浪费（审查 F7）：
+    /// 只在首次 / 位置应用之后 / 全屏转场 / 上次取到无效值时刷新（决策见
+    /// [`macos_chrome::should_refresh_traffic_light_inset`]，可在开发机单测）。
+    traffic_light_inset_cache: Option<Point>,
+    /// 安全区缓存是否待刷新（由位置应用 / 全屏边沿 / 上次无效置位）。
+    traffic_light_inset_refresh: bool,
     /// 已应用到 `GuiView` 的 IME 启用状态（B6；目标状态来自 `App::ime_enabled`）。
     ime_enabled: bool,
     /// `sync_state` 观察到的「窗口刚失去键盘焦点」边沿（泵在同步后消费它做 IME 清场）。
@@ -570,6 +584,9 @@ impl NativeWindow {
             ime_area: None,
             title: options.title.clone(),
             traffic_light_position: None,
+            fullscreen: false,
+            traffic_light_inset_cache: None,
+            traffic_light_inset_refresh: true,
             // 与 `App::ime_enabled` 的默认值一致（默认启用）；首次 `sync_ime_enabled`
             // 因此不会产生任何平台调用。
             ime_enabled: true,
@@ -958,7 +975,8 @@ impl NativeWindow {
 
     // ── E6（P1-E6）：窗口 chrome 的运行时对账 ──────────────────────────────
 
-    /// 每轮泵对账：标题 / 交通灯位置 / `WindowState`（`isZoomed` + `styleMask` 全屏位）。
+    /// 每轮泵对账：标题 / 交通灯位置（**set-once**）/ 交通灯安全区（缓存）/ `WindowState`
+    /// （`isZoomed` + `styleMask` 全屏位）。
     ///
     /// 返回 `true` = 本轮 chrome 有变化（泵据此在**同一轮**出帧；`Window::set_state` 已给根节点
     /// 标 `PAINT`，与其它平台事件走同一条帧门禁，不额外唤醒 run loop —— R09-15②）。
@@ -982,19 +1000,38 @@ impl NativeWindow {
                 .setTitle(&NSString::from_str(desired_title.as_str()));
             self.title = desired_title;
         }
-        if desired_position != self.traffic_light_position {
-            self.traffic_light_position = desired_position;
+        // 位置 set-once（审查 F7）：只在第一次看到请求时调整按钮 frame；运行期改动被忽略。
+        if let Some(target) = macos_chrome::traffic_light_position_to_apply(
+            self.traffic_light_position,
+            desired_position,
+        ) {
+            self.traffic_light_position = Some(target);
             self.apply_traffic_light_position();
+            // 按钮移动之后安全区必须重算（同一轮的下方缓存逻辑会刷新）。
+            self.traffic_light_inset_refresh = true;
             changed = true;
-        } else if self.traffic_light_position.is_some() {
-            // AppKit 在窗口 resize / 全屏转场后会**重新布局**标准按钮：自定义位置必须每轮对账
-            // （already-at-target 时 `apply_traffic_light_position` 是 no-op）。
-            self.apply_traffic_light_position();
         }
         let fullscreen = self
             .window
             .styleMask()
             .contains(NSWindowStyleMask::FullScreen);
+        if fullscreen != self.fullscreen {
+            // 全屏边沿：AppKit 隐藏 / 恢复标准按钮 ⇒ 安全区缓存失效。
+            self.fullscreen = fullscreen;
+            self.traffic_light_inset_refresh = true;
+        }
+        // 安全区缓存（审查 F7）：稳态每轮 0 次 `standardWindowButton:` + `convertRect:toView:`；
+        // 只在首次 / 位置应用后 / 全屏边沿 / 上次无效（转场期 nil / NSZeroRect）时重算。
+        if macos_chrome::should_refresh_traffic_light_inset(
+            fullscreen,
+            self.traffic_light_inset_refresh,
+            self.traffic_light_inset_cache,
+        ) {
+            let computed = self.traffic_light_inset();
+            // 取到有效值才清待刷新位；`None`（尚未布局 / 转场）下一轮重试。
+            self.traffic_light_inset_refresh = computed.is_none();
+            self.traffic_light_inset_cache = computed;
+        }
         let state = WindowState {
             client_decoration: false,
             maximized: self.window.isZoomed(),
@@ -1006,7 +1043,7 @@ impl NativeWindow {
         let inset = if fullscreen {
             None
         } else {
-            self.traffic_light_inset()
+            self.traffic_light_inset_cache
         };
         let Some(window) = app.window_mut(self.id) else {
             return changed;
@@ -1075,9 +1112,10 @@ impl NativeWindow {
     /// 把三个标准按钮的**分组左上角**移到应用请求的位置（逻辑点，内容区左上原点、y 向下）。
     ///
     /// 布局基准是按钮当前 frame（系统默认布局），只平移整组、保持系统间距；`convertPoint:toView:`
-    /// 把目标点换算回按钮父视图的坐标系（`setFrameOrigin:` 的参数空间）。已经是目标位置时
-    /// no-op（每轮调用，见 [`Self::sync_chrome`]）。`None` = 恢复系统默认 —— 本引擎不保存系统
-    /// 默认布局的副本，因此运行期把自定义位置改回 `None` 不可撤销（应用应在建窗时决定；
+    /// 把目标点换算回按钮父视图的坐标系（`setFrameOrigin:` 的参数空间）。**set-once**：只由
+    /// [`Self::sync_chrome`] 在第一次看到请求时调用一次（决策见
+    /// [`macos_chrome::traffic_light_position_to_apply`]）；AppKit 之后的重排不追回。本引擎不
+    /// 保存系统默认布局的副本，因此运行期改位置 / 改回 `None` 不可撤销（应用应在建窗时决定；
     /// 文档化的限制，见 `App::set_traffic_light_position`）。
     fn apply_traffic_light_position(&self) {
         let Some(target) = self.traffic_light_position else {

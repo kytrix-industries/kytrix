@@ -14,8 +14,9 @@
 //! `WM_NCCALCSIZE` / `WM_NCLBUTTONDOWN` **全部**交 `DefWindowProcW`；`WM_NCHITTEST` 只在应用
 //! 声明的**自绘标题栏拖动区**（X2）命中时返回 `HTCAPTION`，其余点仍交默认过程。命中码、边框
 //! 几何、缩放光标，以及 caption 的 move 模态循环与 8 个命中码的 size 模态循环都由系统提供
-//! （Chrome / Qt / GPUI 同款）。Aero Snap / Win11 Snap Layouts / 双击边框 / `Alt+Space` →
-//! 大小 / 拖动中跨屏 DPI 因此全部免费。
+//! （Chrome / Qt / GPUI 同款）。Aero Snap（拖边）/ 双击边框 / `Alt+Space` → 大小 / 拖动中跨屏
+//! DPI 因此全部免费。Win11 Snap Layouts 的悬停浮层需要 `HTMAXBUTTON`，本批未实现（见
+//! `wndproc` 的 `WM_NCHITTEST` 注释与 spec-delta E6）。
 //!
 //! size 模态循环期间泵的 ④ 不运行，但**重排 + 重绘并没有停**：模态循环会同步
 //! `DispatchMessage` 到本窗口的 `WndProc`，每一条 `WM_SIZE` 都由

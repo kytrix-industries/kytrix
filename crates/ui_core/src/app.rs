@@ -1866,6 +1866,10 @@ impl App {
     /// 保持系统间距。与 [`Self::traffic_light_inset`] 是同一几何的写 / 读两端：应用据此把可点击
     /// 控件放到交通灯之外（§8.6.5 —— 应用**不能**把可点击控件放到交通灯下面，会与系统按钮抢命中）。
     ///
+    /// **set-once（§8.6.5 文档化限制）**：位置只在建窗时决定一次；首次调用生效后，运行期再次
+    /// 调用不会改变已应用的位置（AppKit 在 resize / 全屏转场后的重排不追回）。本 API **没有**
+    /// 「恢复系统默认位置」的入口 —— 引擎不保存 AppKit 系统按钮布局的副本。
+    ///
     /// # Errors
     /// - [`EngineError::UnknownWindow`]：窗口不存在。
     /// - [`EngineError::UnsupportedWindowCapability`]：非 macOS。

@@ -444,7 +444,10 @@ pub(crate) fn set_title(
     Ok(())
 }
 
-/// macOS：写交通灯目标位置并唤醒泵（泵每轮对账，值变化才调 AppKit）。
+/// macOS：写交通灯目标位置（**set-once**：只在建窗时决定一次）并唤醒泵。
+///
+/// 首次调用之后再次设置不改变已登记的位置（返回 `Ok(())` 且不唤醒泵）：引擎不保存 AppKit
+/// 系统按钮布局的副本，运行期改位置 / 改回 `None` 都不可撤销（§8.6.5 的文档化限制）。
 #[cfg(target_os = "macos")]
 pub(crate) fn set_traffic_light_position(
     app: &mut App,
@@ -454,6 +457,10 @@ pub(crate) fn set_traffic_light_position(
     let Some(target) = app.windows.get_mut(&window) else {
         return Err(EngineError::UnknownWindow { window });
     };
+    // set-once：已有目标位置 ⇒ 不覆盖、不唤醒（运行期修改被忽略，见函数文档）。
+    if target.traffic_light_position().is_some() {
+        return Ok(());
+    }
     target.set_traffic_light_position(inset);
     app.dispatcher.wake();
     Ok(())

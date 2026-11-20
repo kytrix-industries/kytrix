@@ -114,8 +114,11 @@ pub enum Decorations {
 /// （[`WindowIconCause::TooLarge`]），避免一次建窗为图标分配几十 MB，同时不拒绝合法的
 /// 256×256 高 DPI 图标。
 ///
+/// crate 私有：这是**引擎实现常量**，不是公共契约（规格 §11.6 的公开面只有
+/// `WindowOptions::icon` + `WindowIconCause::TooLarge`）；应用经错误文案看到具体数值即可。
+///
 /// [`WindowIconCause::TooLarge`]: crate::error::WindowIconCause::TooLarge
-pub const MAX_WINDOW_ICON_DIM: u32 = 1024;
+pub(crate) const MAX_WINDOW_ICON_DIM: u32 = 1024;
 
 /// 应用发起的窗口控制请求（自绘标题栏的系统按钮 / 拖动 / 缩放）。
 ///
@@ -181,18 +184,25 @@ pub struct WindowState {
 }
 
 impl WindowState {
-    /// 建窗时的初始状态：`client_decoration` 由 [`Decorations`] 派生，其余字段取「引擎窗口默认
-    /// 可关闭 / 可最小化 / 可最大化 / 可缩放」的保守值；平台泵在首个真值到达后覆盖
-    /// （Windows/macOS 每轮 `sync_chrome`、Linux 每轮 `configure` 镜像）。
+    /// 建窗时的初始状态：**平台能力已知的部分直接给真值**，其余取保守值，平台泵在首个真值到达
+    /// 后覆盖（Windows/macOS 每轮 `sync_chrome`、Linux 每轮 `configure` 镜像）。
+    ///
+    /// - `client_decoration`：Windows `None` ⇒ 应用自绘；macOS **恒 `false`**（原生交通灯 + 透明
+    ///   标题栏由系统绘制，`Decorations::None` 是文档化降级）；Linux 由 compositor `configure` 的
+    ///   装饰模式覆盖（初值只表达请求倾向）。
+    /// - `can_fullscreen`：Windows **没有全屏控制**（`ToggleFullscreen` 返回
+    ///   `UnsupportedWindowCapability`）⇒ 初值必须是 `false`，否则首轮 `sync_chrome` 的校正会
+    ///   产生一次多余的 `WindowState` 变化 + 根 `PAINT`（审查 F8）。
     #[must_use]
     pub(crate) const fn for_decorations(decorations: Decorations) -> Self {
         Self {
-            client_decoration: matches!(decorations, Decorations::None),
+            client_decoration: matches!(decorations, Decorations::None)
+                && !cfg!(target_os = "macos"),
             maximized: false,
             fullscreen: false,
             can_maximize: true,
             can_minimize: true,
-            can_fullscreen: true,
+            can_fullscreen: !cfg!(target_os = "windows"),
         }
     }
 }
@@ -273,15 +283,16 @@ pub enum ImeContentType {
 ///
 /// 默认（[`Decorations::Native`]）**非客户区全部交系统**（R07-2）：`WM_NCCALCSIZE` /
 /// `WM_NCHITTEST` / `WM_NCLBUTTONDOWN` 默认都不改写 —— 拖动标题栏、双击最大化/还原、右键系统
-/// 菜单、`Alt+Space`、**Aero Snap / Win11 Snap Layouts** 与边框拖拽都由系统的 move / size
-/// 模态循环提供（Chrome / GPUI / Qt 同样不接管它们）。唯一例外是应用显式声明的自绘标题栏
-/// 拖动区（X2 [`Window::set_drag_regions`]）：命中区域的 `WM_NCHITTEST` 返回 `HTCAPTION`，让
-/// 自绘标题栏复用系统标题栏的同一套拖动语义；未声明时非客户区行为完全不变。
+/// 菜单、`Alt+Space`、**Aero Snap（拖边）** 与边框拖拽都由系统的 move / size 模态循环提供
+/// （Chrome / GPUI / Qt 同样不接管它们）。唯一例外是应用显式声明的自绘标题栏拖动区（X2
+/// [`Window::set_drag_regions`]）：命中区域的 `WM_NCHITTEST` 返回 `HTCAPTION`，让自绘标题栏
+/// 复用系统标题栏的同一套拖动语义；未声明时非客户区行为完全不变。Win11 **Snap Layouts 的
+/// 悬停浮层**需要按钮返回 `HTMAXBUTTON`，引擎本批未实现（不把它算作已交付的系统手势）。
 ///
 /// `decorations = None`（E6 frameless，§11.6）时引擎接管非客户区：`WM_NCCALCSIZE` 返回 0
 /// 让客户区铺满窗口（最大化时按 DPI 补偿边框），`WM_NCHITTEST` 自算八向 resize 命中并保留
-/// `drag_regions → HTCAPTION`；窗口样式仍是 `WS_OVERLAPPEDWINDOW`，Aero Snap / Snap Layouts /
-/// DWM 阴影与最大化动画由系统提供（与 `HTCAPTION` / `HT*` 命中码走同一条系统模态循环）。
+/// `drag_regions → HTCAPTION`；窗口样式仍是 `WS_OVERLAPPEDWINDOW`，Aero Snap（拖边）/ DWM 阴影
+/// 与最大化动画由系统提供（与 `HTCAPTION` / `HT*` 命中码走同一条系统模态循环）。
 ///
 /// 系统 size 模态循环会占住本线程消息泵，但**重排 + 重绘不会停**：模态循环把 `WM_SIZE`
 /// 同步分派到 `WndProc`，平台层在每条 `WM_SIZE` 上直接更新客户区、对齐 DirectComposition
@@ -744,8 +755,10 @@ pub struct Window {
     traffic_light_inset: Option<Point>,
     /// macOS：应用请求的交通灯位置（逻辑点，客户区左上原点、y 向下；`None` = 系统默认位置）。
     ///
-    /// 写入入口 `App::set_traffic_light_position`；平台泵每轮对账，值变化时调整三个
-    /// `standardWindowButton:` 的 frame.origin（保持透明标题栏 + 隐藏标题下仍可点击）。
+    /// 写入入口 `App::set_traffic_light_position`。**set-once**（§8.6.5 的文档化限制）：平台泵
+    /// 只在第一次看到非 `None` 值时把三个 `standardWindowButton:` 的 frame.origin 调整一次
+    /// （保持透明标题栏 + 隐藏标题下仍可点击）；之后 AppKit 的 resize / 全屏重排不追回，运行期
+    /// 改位置或改回 `None` 不可撤销 —— 应用应在建窗时决定一次。
     #[cfg(target_os = "macos")]
     traffic_light_position: Option<Point>,
     /// 最近一帧**完成**帧的实际 GPU 绘制统计（P17 HUD）。
@@ -1580,7 +1593,8 @@ impl Window {
 
     /// macOS：应用请求的交通灯位置（目标状态；`None` = 系统默认）。
     ///
-    /// 值变化只有平台泵关心：每轮对账后调整 `standardWindowButton:` 的 frame.origin。
+    /// 值不变时平台泵不做任何 AppKit 调用；非 `None` 的目标只在 NativeWindow 的首次对账里应用
+    /// 一次（**set-once**，见字段文档与 `App::set_traffic_light_position`）。
     #[cfg(target_os = "macos")]
     pub(crate) fn set_traffic_light_position(&mut self, inset: Point) {
         self.traffic_light_position = Some(inset);

@@ -957,8 +957,9 @@ fn wm_move_is_translated_and_dpi_repositioning_moves_are_filtered() {
 }
 
 /// X2：`WM_NCHITTEST` 命中应用声明的**自绘标题栏拖动区**时返回 `HTCAPTION`（系统 move
-/// 模态循环的入场券：双击最大化/还原、Aero Snap、Snap Layouts 全部照常）；区域之外仍是系统的
-/// `HTCLIENT`；清空区域后恢复系统命中码。
+/// 模态循环的入场券：双击最大化/还原、Aero Snap（拖边）、`Alt+Space` 全部照常；Win11 Snap
+/// Layouts 的悬停浮层需要 `HTMAXBUTTON`，本批未实现）；区域之外仍是系统的 `HTCLIENT`；
+/// 清空区域后恢复系统命中码。
 ///
 /// 变异守卫：删掉 `WM_NCHITTEST` 分支里的拖动区判定 ⇒ 第一条断言变红（返回 `HTCLIENT`）。
 #[test]
@@ -1061,9 +1062,9 @@ fn the_pump_sync_copies_drag_regions_into_the_wndproc_state() {
 /// R07-2 回归：`WM_NCHITTEST` 必须返回**系统命中码**。
 ///
 /// `HTCAPTION` / `HT*` 是系统 move/size 模态循环的入场券：`DefWindowProcW` 只有在按下
-/// `HTCAPTION` 时才进入原生拖动循环（Aero Snap / Snap Layouts / 双击最大化 / 右键系统菜单
-/// 都在里面）。引擎接管过这些区域 ⇒ 全部系统手势消失。这张命中表把「系统拥有非客户区」
-/// 钉死在测试里。
+/// `HTCAPTION` 时才进入原生拖动循环（Aero Snap（拖边）/ 双击最大化 / 右键系统菜单都在里面；
+/// Snap Layouts 浮层需要 `HTMAXBUTTON`，本批未实现）。引擎接管过这些区域 ⇒ 全部系统手势消失。
+/// 这张命中表把「系统拥有非客户区」钉死在测试里。
 #[test]
 fn nonclient_hit_table_returns_system_hit_codes() {
     let _runtime = runtime();
@@ -2104,6 +2105,45 @@ fn frameless_track_size_is_the_client_size_without_the_non_client_area() {
         (info.ptMinTrackSize.x, info.ptMinTrackSize.y),
         (expected.0 as i32, expected.1 as i32),
         "frameless 的 ptMinTrackSize 必须是客户区物理尺寸（dpi={dpi}）"
+    );
+    destroy_hidden_window(hwnd, state);
+    let _ = class_name;
+}
+
+/// E6 / §8.6.4 / P2-3：`WM_SIZE` 必须置 `chrome_dirty`（`NativeWindow::sync_chrome` 的唯一读点）。
+///
+/// 最大化 / 还原 / Snap 必然改变客户区：`WndProc` 只置位（读 `IsZoomed` / 写 `WindowState` 要碰
+/// `App`，不能在窗口过程里做），泵的 `sync_chrome` 据此对账。删掉 `note_chrome_dirty()` 后
+/// `sync_chrome` 永远不查询 `IsZoomed`（审查变异 M7 全绿 ⇒ 实机表现正确只是巧合）。
+#[test]
+fn wm_size_marks_chrome_dirty_for_the_next_sync() {
+    let dispatcher = Dispatcher::new();
+    let (hwnd, state, class_name) =
+        frameless_hidden_window("KytrixChromeDirty", Arc::clone(&dispatcher), 320, 240);
+    // 建窗期的 `chrome_dirty` 初值（true）先消费掉，避免把初值当成 `WM_SIZE` 的效果。
+    // SAFETY: `state` 由 `frameless_hidden_window` 分配、生命周期到本用例结束。
+    assert!(
+        unsafe { (*state).take_chrome_dirty() },
+        "建窗初值必须待对账（首轮泵据此校正 WindowState）"
+    );
+    // SAFETY: 窗口由本测试创建且仍存活；`WM_SIZE` 同步进入生产 `WndProc`。
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_SIZE,
+            Some(WPARAM(0)),
+            Some(LPARAM(encoded_client(640, 480))),
+        );
+    }
+    assert!(
+        // SAFETY: 同上，短借用读取状态。
+        unsafe { (*state).take_chrome_dirty() },
+        "WM_SIZE 必须置 chrome_dirty（否则最大化 / 还原的 WindowState 永不刷新）"
+    );
+    assert!(
+        // SAFETY: 同上。
+        !unsafe { (*state).take_chrome_dirty() },
+        "取走即清：同一条 WM_SIZE 只允许触发一次对账"
     );
     destroy_hidden_window(hwnd, state);
     let _ = class_name;

@@ -113,15 +113,17 @@ pub(crate) extern "system" fn wndproc(
 
         // 非客户区命中：`Decorations::Native` 用**系统命中码**（`HTCAPTION` / `HTLEFT` /
         // `HTBOTTOMRIGHT` / `HTCLOSE`…）：命中码、边框几何、缩放光标形状都由系统算。
-        // `WM_NCLBUTTONDOWN` 也不改写（R07-2）：caption 的 move 模态循环（Aero Snap / Snap
-        // Layouts / 双击最大化 / 右键系统菜单）与 8 个命中码的 size 模态循环都只存在于
-        // `DefWindowProcW` 内部。
+        // `WM_NCLBUTTONDOWN` 也不改写（R07-2）：caption 的 move 模态循环（Aero Snap（拖边）/
+        // 双击最大化 / 右键系统菜单 / `Alt+Space`）与 8 个命中码的 size 模态循环都只存在于
+        // `DefWindowProcW` 内部。Win11 Snap Layouts 的**悬停浮层**需要 `HTMAXBUTTON`，本批未实现
+        // （保持如实：`WM_NCHITTEST` 不返回 `HTMAXBUTTON`）。
         //
         // **X2 的唯一例外**（两种装饰模式都有）：自绘标题栏拖动区（应用通过
         // `Window::set_drag_regions` 声明，泵每轮同步到 [`WndProcState::drag_regions`]）命中时
-        // 返回 `HTCAPTION` —— 与系统标题栏走同一条 move 模态循环（双击最大化/还原、Aero Snap、
-        // Snap Layouts、`Alt+Space` 全部成立）；区域是**逻辑客户区坐标**：屏幕物理坐标
-        // （`WM_NCHITTEST` 的 lParam）→ `ScreenToClient` → 除以本消息时刻的 scale。
+        // 返回 `HTCAPTION` —— 与系统标题栏走同一条 move 模态循环（双击最大化/还原、Aero Snap
+        // 拖边、`Alt+Space`、右键系统菜单全部成立；Snap Layouts 浮层除外，见上）；区域是
+        // **逻辑客户区坐标**：屏幕物理坐标（`WM_NCHITTEST` 的 lParam）→ `ScreenToClient` →
+        // 除以本消息时刻的 scale。
         //
         // **E6 frameless 的另一半**：引擎自算 8 向 resize 命中（`chrome::resize_edge_at`，
         // 按 DPI 缩放的 `SM_CXSIZEFRAME + SM_CXPADDEDBORDER`）并返回对应 `HT*`：frameless 下
