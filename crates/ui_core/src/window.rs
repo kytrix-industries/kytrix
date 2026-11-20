@@ -1135,7 +1135,8 @@ impl Window {
     /// 只有该窗口渲染器已按当前数组规格**整组入队**过的层才允许进 draw（层号 `>=` 上限的
     /// `Primitive::Image` 不产出实例）。`u32::MAX` = 不做过滤：没有 App 图集记账的驱动
     /// （快照 / `Window::frame`）自行整份上传，保持旧行为。
-    #[cfg(test)]
+    /// 本帧图片图集可画层上限（测试诊断；只在 Windows 的 App 图集测试里消费）。
+    #[cfg(all(test, windows))]
     pub(crate) fn image_drawable_layers(&self) -> u32 {
         self.image_drawable_layers
     }
