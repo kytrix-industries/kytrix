@@ -893,6 +893,17 @@ impl ResourceCache {
             .map_or(DecodeState::Pending, |job| job.state.clone())
     }
 
+    /// 按句柄取**存活**图片的 tile 信息（v2.1 E2，`§11.2`：`InlineBoxPaint::Image` 的 paint 期
+    /// 解析）。
+    ///
+    /// 语义：只返回引用计数 > 0 的条目；资源被 `unload` / `release_window` 回收后返回 `None`
+    /// （旧句柄不复活 —— `ResourceId` 带代际）。消费者：`paint/pass.rs::emit_text`；返回 `None`
+    /// 时跳过该图元并压 `TextDiagnostic::InlineBoxImageMissing`（不画占位图、不 panic）。
+    #[must_use]
+    pub(crate) fn image(&self, id: ResourceId) -> Option<ResourceImage> {
+        self.entries.get(id).map(|entry| entry.image)
+    }
+
     fn push_pending(&mut self, job: PendingJob) -> PendingResource {
         let id = self.pending.insert_with(|_| job);
         self.pending_ids.push(id);

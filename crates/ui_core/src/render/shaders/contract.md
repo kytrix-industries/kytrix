@@ -336,6 +336,13 @@ GPU 只消费 `uv()`（上表 UV 行）、`page`（编码进 `params1.y`）与 `
 shader / uniform / 顶点布局中。因此 `AtlasTile` 的 CPU 侧尺寸变化（24 → 32 B）**不是**渲染契约变更：
 三端 shader、绑定表与 `GpuPrimitive` 偏移都不受影响，无需改动本文件 §1–§7。
 
+**CPU 侧：文本装饰与 InlineBox 绘制（v2.1 E2，不进 GPU 字节布局）**：`paint/pass.rs` 把
+`ShapedTextLine.decorations`（下划线/删除线）与 `InlineBoxPaint::{Quad, Image}` 编码成**既有的**
+`Primitive::Quad` / `Primitive::Image`（I2：不新增图元变体、不改 `GpuPrimitive`）。装饰矩形就是普通
+实色 quad（`color0` + 全 0 `corner_radius`/`params0`），InlineBox 图片就是普通图集 image（`uv` 来自
+`ResourceImage.tile`，`color0` = 调制色）。因此三端 shader / 绑定 / §1–§7 **零变更**，也不触发
+参数 golden（I8）；像素 golden 只受「单 run 无装饰」路径影响（与改动前逐位一致）。
+
 ## 9. 禁止项
 
 1. 位重解释：`asuint` / `asfloat` / `as_type<>` / `floatBitsToUint` / `floatBitsToInt` / `bitcast`。

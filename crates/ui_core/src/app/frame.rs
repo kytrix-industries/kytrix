@@ -226,11 +226,12 @@ pub(crate) fn frame(
             windows,
             geometry,
             atlas,
+            resources,
             ..
         } = app;
         windows
             .get_mut(&window)
-            .map(|target| target.paint_frame(geometry, Some(&*atlas)))
+            .map(|target| target.paint_frame(geometry, Some(&*atlas), Some(&*resources)))
     };
     let mut paint = match painted {
         Some(Ok(report)) => report,
@@ -297,6 +298,17 @@ pub(crate) fn frame(
     // E1b F2：Canvas 内被编码期安全网丢弃的失效 run 数（Canvas 归应用所有，引擎只能止损 +
     // 诊断，不能重建 —— 压一条 `TextDiagnostic` 让「少字」不静默）。
     let stale_canvas_runs = paint.stale_canvas_runs;
+    // v2.1 E2（`§11.2`）：行内盒图片资源未加载 / 已卸载 ⇒ 本帧跳过图元。引擎不画占位图，
+    // 但必须让「跳过」可观测（D17）：逐 id 压一条文本诊断。
+    if !paint.skipped_inline_images.is_empty() {
+        app.text.push_diagnostics(
+            paint
+                .skipped_inline_images
+                .iter()
+                .map(|id| crate::text::TextDiagnostic::InlineBoxImageMissing { id: *id })
+                .collect(),
+        );
+    }
     let outcome = target.commit_frame(ticket, paint);
     // HUD 是纯观察者：提交成功后只清掉已经落进 paint 的待写文本（没有帧就保持上一次文本）。
     #[cfg(feature = "hud")]

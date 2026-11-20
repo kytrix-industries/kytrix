@@ -76,6 +76,7 @@ use smol_str::SmolStr;
 use crate::{
     math::{Rect, Size},
     paint::{color::Color, primitive::PositionedGlyph},
+    resources::ResourceId,
 };
 
 pub(crate) mod atlas;
@@ -115,6 +116,102 @@ pub enum TextSlant {
     Italic,
     /// 伪斜（`Oblique(None)`）。
     Oblique,
+}
+
+/// 文本装饰（v2.1 E2，`§11.2`）：下划线 / 删除线。
+///
+/// 装饰**不参与布局**（不改变字形位置、advance、断行、行高）：引擎在 `ShapedLine` 上产出
+/// [`ShapedDecoration`] 几何，paint 阶段按普通 `Primitive::Quad` 编码（`§11.2`：不进 shader，
+/// 因此不触发 I8 的 shader 契约/golden）。
+///
+/// `color = None` ⇒ 跟随该 run 的文本色（`TextStyle::color`；`bind_style` 的 `foreground`
+/// 覆盖对文本与装饰同时生效）。`thickness` 是逻辑像素线宽（`<= 0` / 非有限值时该装饰不绘制）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TextDecoration {
+    /// 下划线（基线下方）。
+    Underline {
+        /// 线色；`None` = 跟随文本色。
+        color: Option<Color>,
+        /// 线宽（逻辑像素）。
+        thickness: f32,
+    },
+    /// 删除线（字形中部）。
+    Strikethrough {
+        /// 线色；`None` = 跟随文本色。
+        color: Option<Color>,
+        /// 线宽（逻辑像素）。
+        thickness: f32,
+    },
+}
+
+impl TextDecoration {
+    /// 下划线（颜色跟随文本色）。
+    #[must_use]
+    pub const fn underline(thickness: f32) -> Self {
+        Self::Underline {
+            color: None,
+            thickness,
+        }
+    }
+
+    /// 删除线（颜色跟随文本色）。
+    #[must_use]
+    pub const fn strikethrough(thickness: f32) -> Self {
+        Self::Strikethrough {
+            color: None,
+            thickness,
+        }
+    }
+
+    /// 显式线色（`None` 清掉覆盖、回到跟随文本色）。
+    #[must_use]
+    pub const fn with_color(self, color: Option<Color>) -> Self {
+        match self {
+            Self::Underline { thickness, .. } => Self::Underline { color, thickness },
+            Self::Strikethrough { thickness, .. } => Self::Strikethrough { color, thickness },
+        }
+    }
+
+    /// 线色；`None` = 跟随文本色。
+    #[must_use]
+    pub const fn color(self) -> Option<Color> {
+        match self {
+            Self::Underline { color, .. } | Self::Strikethrough { color, .. } => color,
+        }
+    }
+
+    /// 线宽（逻辑像素）。
+    #[must_use]
+    pub const fn thickness(self) -> f32 {
+        match self {
+            Self::Underline { thickness, .. } | Self::Strikethrough { thickness, .. } => thickness,
+        }
+    }
+
+    /// 是否下划线（几何位置断言 / 诊断用）。
+    #[must_use]
+    pub const fn is_underline(self) -> bool {
+        matches!(self, Self::Underline { .. })
+    }
+
+    /// 装饰是否可绘制（线宽有限且为正）。
+    #[must_use]
+    pub fn is_visible(self) -> bool {
+        self.thickness().is_finite() && self.thickness() > 0.0
+    }
+
+    /// 形状缓存键的一部分（`Option<Color>` 的 f32 分量按 `to_bits` 哈希）。
+    pub(crate) fn hash_into(self, hasher: &mut ahash::AHasher) {
+        use core::hash::Hash;
+
+        let (tag, color, thickness) = match self {
+            Self::Underline { color, thickness } => (0u8, color, thickness),
+            Self::Strikethrough { color, thickness } => (1u8, color, thickness),
+        };
+        tag.hash(hasher);
+        color.map(color_bits).hash(hasher);
+        thickness.to_bits().hash(hasher);
+    }
 }
 
 /// 软换行策略（映射到 `TextWrapMode` / `WordBreak` / `OverflowWrap`）。
@@ -291,6 +388,12 @@ pub struct TextStyleExtras {
     pub word_spacing: Option<f32>,
     /// 断行严格度（CSS `line-break`）。
     pub line_break: Option<TextLineBreak>,
+    /// 文本装饰（v2.1 E2，`§11.2`）。
+    ///
+    /// 收进 `extras` 而不是内联进 `TextStyle`：装饰是低频配置，而 `TextStyle` 内联在
+    /// `TextContent` / `Node` 里（`node_size_after_p06` 预算 336 B，TextContent 必须保持
+    /// 低占用）。与 `family` / `locale` 等「RareInheritedData」字段同一取舍。
+    pub decoration: Option<TextDecoration>,
 }
 
 /// 一组 OpenType 特性。
@@ -439,6 +542,12 @@ impl TextStyle {
     #[must_use]
     pub fn max_lines(&self) -> Option<u16> {
         (self.max_lines > 0).then_some(self.max_lines)
+    }
+
+    /// 文本装饰（`None` = 无；v2.1 E2）。
+    #[must_use]
+    pub fn decoration(&self) -> Option<TextDecoration> {
+        self.extras.as_ref().and_then(|extras| extras.decoration)
     }
 
     /// 溢出裁剪策略。
@@ -604,6 +713,13 @@ impl TextStyle {
         self
     }
 
+    /// 链式：文本装饰（v2.1 E2）。
+    #[must_use]
+    pub fn with_decoration(mut self, decoration: TextDecoration) -> Self {
+        self.extras_mut().decoration = Some(decoration);
+        self
+    }
+
     /// 形状缓存的样式哈希（f32 全部按 `to_bits`；字段集即缓存契约，改动即失效）。
     ///
     /// **不含 `color` / `alignment`**（R12-11）：两者不改变 glyph id / advance / 断行。
@@ -635,27 +751,83 @@ impl TextStyle {
                     .collect::<Vec<_>>()
             })
             .hash(hasher);
+        // v2.1 E2：装饰被烘进 `ShapedLine` 的 `ShapedDecoration` 几何 ⇒ 必须进键（否则
+        // 装饰变更会命中旧快照、旧装饰被继续绘制）。`color` 的 f32 用 `to_bits`（NaN 可复现）。
+        match self.decoration() {
+            Some(decoration) => {
+                true.hash(hasher);
+                decoration.hash_into(hasher);
+            }
+            None => false.hash(hasher),
+        }
     }
 }
 
-/// 节点载荷：文本 + 样式 + 行内盒（`NodeKind::Text` 的内容）。
+/// 颜色分量的位模式（`Color` 没有 `Hash`：f32 用 `to_bits`，五个色彩空间各自编码）。
+pub(crate) fn color_bits(color: Color) -> [u32; 5] {
+    let (space, [c0, c1, c2, alpha]) = match color {
+        Color::Srgb { r, g, b, alpha } => (0u32, [r, g, b, alpha]),
+        Color::LinearSrgb { r, g, b, alpha } => (1u32, [r, g, b, alpha]),
+        Color::DisplayP3 { r, g, b, alpha } => (2u32, [r, g, b, alpha]),
+        Color::Oklab { l, a, b, alpha } => (3u32, [l, a, b, alpha]),
+        Color::Oklch { l, c, h, alpha } => (4u32, [l, c, h, alpha]),
+    };
+    [
+        space,
+        c0.to_bits(),
+        c1.to_bits(),
+        c2.to_bits(),
+        alpha.to_bits(),
+    ]
+}
+
+/// 富文本的一段覆盖样式（v2.1 E2，`§11.2`）。
+///
+/// `range` 是源文本的 **UTF-8 字节区间**（升序、不重叠、落在 char boundary）。`style` **整体
+/// 覆盖** `TextContent.style` 在该区间的全部样式字段（不是增量补丁）；未覆盖区间用
+/// `TextContent.style` 兜底。run 的段落级字段（`alignment` / `overflow` / `max_lines` /
+/// `direction`）不生效 —— 这些是整段文本的属性，由 `TextContent.style` 决定。
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextRun {
+    /// 覆盖的源文本字节区间（半开）。
+    pub range: Range<usize>,
+    /// 该区间的覆盖样式。
+    pub style: TextStyle,
+}
+
+impl TextRun {
+    /// 以字节区间 + 覆盖样式构造。
+    #[must_use]
+    pub fn new(range: Range<usize>, style: TextStyle) -> Self {
+        Self { range, style }
+    }
+}
+
+/// 节点载荷：文本 + 默认样式 + 富文本 runs + 行内盒（`NodeKind::Text` 的内容）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextContent {
     /// 源文本。
     pub text: SmolStr,
-    /// 样式。
+    /// 兜底样式（`runs` 未覆盖的区间用它）。
     pub style: TextStyle,
+    /// 富文本逐区间覆盖样式（v2.1 E2）：空 = 全段用 `style`。
+    ///
+    /// 字段私有：只能经 [`TextContent::with_runs`] 写入，构造点保证「升序、不重叠、落在 char
+    /// boundary、在 `text` 范围内」（越界 / 非法区间按构造期归一化裁剪，不 panic）。读取走
+    /// [`TextContent::runs`]。
+    runs: Option<Box<ThinSlice<TextRun>>>,
     /// 行内盒（`<img>` / `kbd`）：参与断行与行高，位置由引擎算（§12）。
     pub inline_boxes: Box<[InlineBoxSpec]>,
 }
 
 impl TextContent {
-    /// 构造（无行内盒）。
+    /// 构造（无 runs、无行内盒）。
     #[must_use]
     pub fn new(text: impl Into<SmolStr>, style: TextStyle) -> Self {
         Self {
             text: text.into(),
             style,
+            runs: None,
             inline_boxes: Box::new([]),
         }
     }
@@ -666,6 +838,95 @@ impl TextContent {
         self.inline_boxes = boxes.into_iter().collect();
         self
     }
+
+    /// 链式：富文本 runs（`NodeBuilder::runs` 的落点；v2.1 E2）。
+    ///
+    /// 越界 / 非 char boundary / 非升序的区间在这里**归一化**（向字符边界内收、重叠部分丢弃）；
+    /// 空区间丢弃。归一化只让覆盖范围变小，不会把样式挪到别的字符上。
+    #[must_use]
+    pub fn with_runs(self, runs: impl IntoIterator<Item = TextRun>) -> Self {
+        let mut content = self;
+        content.set_runs(runs);
+        content
+    }
+
+    /// 替换 runs（语义同 [`TextContent::with_runs`]，供 `NodeBuilder::runs` 就地写）。
+    pub(crate) fn set_runs(&mut self, runs: impl IntoIterator<Item = TextRun>) {
+        let (normalized, _altered) = normalize_runs(&self.text, runs);
+        self.runs = thin_slice(normalized);
+    }
+
+    /// 富文本 runs（空切片 = 全段用 [`TextContent::style`]）。
+    #[must_use]
+    pub fn runs(&self) -> &[TextRun] {
+        self.runs.as_deref().map_or(&[], |runs| runs.as_slice())
+    }
+
+    /// `bind_text` 换整段文本后裁剪 runs（v2.1 E2，`§11.2`）：保留 runs，越界部分按新文本
+    /// 长度内收 / 丢弃。返回**被改动**（裁剪或丢弃）的 run 数，调用方据此写
+    /// [`TextDiagnostic::TextRunClipped`]（不静默改变样式归属）。
+    pub(crate) fn clip_runs_to_text(&mut self) -> usize {
+        let Some(runs) = self.runs.take() else {
+            return 0;
+        };
+        let mut altered = 0usize;
+        let mut kept: Vec<TextRun> = Vec::with_capacity(runs.len());
+        for mut run in runs.iter().cloned() {
+            let start = ceil_char_boundary(&self.text, run.range.start);
+            let end = floor_char_boundary(&self.text, run.range.end);
+            if start != run.range.start || end != run.range.end {
+                altered += 1;
+            }
+            if start >= end {
+                continue;
+            }
+            run.range = start..end;
+            kept.push(run);
+        }
+        self.runs = thin_slice(kept);
+        altered
+    }
+}
+
+/// 归一化 runs：裁剪到文本范围 / 字符边界，丢弃空区间与非升序区间的重叠部分。
+fn normalize_runs(text: &str, runs: impl IntoIterator<Item = TextRun>) -> (Vec<TextRun>, usize) {
+    let mut normalized = Vec::with_capacity(4);
+    let mut altered = 0usize;
+    let mut previous_end = 0usize;
+    for mut run in runs {
+        let raw = run.range.clone();
+        let start = ceil_char_boundary(text, run.range.start).max(previous_end);
+        let end = floor_char_boundary(text, run.range.end);
+        if start >= end {
+            altered += 1;
+            continue;
+        }
+        if start != raw.start || end != raw.end {
+            altered += 1;
+        }
+        run.range = start..end;
+        previous_end = end;
+        normalized.push(run);
+    }
+    (normalized, altered)
+}
+
+/// 向上取最近的 char boundary（`index >= text.len()` 时夹到 `len`）。
+fn ceil_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+/// 向下取最近的 char boundary。
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 /// 字体栈（D17）：有序候选家族名 + 版本号。
@@ -765,6 +1026,30 @@ pub enum InlineAlign {
     Bottom,
 }
 
+/// 行内盒的应用声明绘制方式（v2.1 E2，`§11.2`）。
+///
+/// 引擎在 `paint/pass.rs::emit_text` 里按 [`ShapedInlineBox::rect`] 生成既有 8 类图元
+/// （I2：不新增 `Primitive` 变体）：`Quad` 走 `Primitive::Quad`，`Image` 走 `Primitive::Image`。
+/// 引擎负责在 paint 阶段把 `ResourceId` 解析成 `ResourceImage.tile`；资源未加载 / 已卸载时
+/// **跳过该图元**并压 `TextDiagnostic::InlineBoxImageMissing`（不做占位图、不 panic）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum InlineBoxPaint {
+    /// 图片（`<img>` / 行内图标）：`ResourceCache` 解析后的 tile 按 `rect` 拉伸绘制。
+    Image {
+        /// 资源句柄（`ResourceCache::insert*` 返回的 `ResourceImage.id`）。
+        resource: ResourceId,
+        /// 调制色（`Color::WHITE` = 原色）。
+        modulation: Color,
+    },
+    /// 装饰盒（`kbd` 圆角块 / 行内代码底色）。
+    Quad {
+        /// 填充色。
+        color: Color,
+        /// 四角半径 `[tl, tr, br, bl]`（逻辑像素）。
+        corner_radius: [f32; 4],
+    },
+}
+
 /// 行内盒说明（`<img>` / `kbd` / 行内图标）：**尺寸由应用给，位置由引擎算**。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InlineBoxSpec {
@@ -778,6 +1063,8 @@ pub struct InlineBoxSpec {
     pub baseline: Option<f32>,
     /// 盒在行内的垂直对齐。
     pub align: InlineAlign,
+    /// 引擎绘制方式（v2.1 E2）：`None` = 只算落点、不绘制（E1 的现状语义）。
+    pub paint: Option<InlineBoxPaint>,
 }
 
 /// 一段文本的**只读**布局结果（一个 parley `Layout` 的快照，字形已装箱）。
@@ -855,6 +1142,22 @@ pub struct ShapedTextLine {
     pub advance: f32,
     /// 行的项：字形 run 与行内盒**按绘制序**交替。
     pub items: Vec<ShapedTextItem>,
+    /// 该行的文本装饰几何（v2.1 E2，`§11.2`）：按绘制序（兜底样式在前、run 装饰在后）。
+    /// 坐标是文本盒局部逻辑像素；paint 按普通 `Primitive::Quad` 编码。
+    pub decorations: Vec<ShapedDecoration>,
+}
+
+/// 一条文本装饰的已定位几何（v2.1 E2，`§11.2`）。
+///
+/// 由 `shape` 的 rasterize 阶段从「字符 → 行内 x」映射算出：`rect.y` 由该行 `baseline` 与装饰
+/// 所属样式的字号决定（下划线在基线下 `em × 0.10`，删除线在基线上方 `em × 0.30`），
+/// `rect` 的 x 跨度是该 run 在本行的可见字符范围。装饰**不参与布局**、也不进 shader。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShapedDecoration {
+    /// 文本盒局部矩形（逻辑像素）。
+    pub rect: Rect,
+    /// 已解析的线色（`TextDecoration::color = None` 时取文本色 / `bind_style` 覆盖色）。
+    pub color: Color,
 }
 
 /// 行内项。
@@ -1136,6 +1439,27 @@ pub enum TextDiagnostic {
         /// 本帧被丢弃的 `GlyphRun` 数（`>= 1`；每个 run 一段文本）。
         runs: usize,
     },
+    /// `TextContent.runs` 里有非法区间（越界 / 不在 char boundary / 非升序），已按构造期
+    /// 归一化裁剪（v2.1 E2，`§11.2`）。只在防御路径出现：`TextContent::with_runs` 已归一化，
+    /// `bind_text` 换文本时会裁剪。
+    InvalidTextRun {
+        /// 原始区间起点（字节）。
+        start: usize,
+        /// 原始区间终点（字节）。
+        end: usize,
+    },
+    /// `bind_text` 换整段文本后 runs 被裁剪 / 丢弃（v2.1 E2，`§11.2`：不静默改变样式归属）。
+    TextRunClipped {
+        /// 被改动（内收或丢弃）的 run 数（`>= 1`）。
+        runs: usize,
+    },
+    /// 行内盒的图片资源未加载 / 已卸载：该 `Primitive::Image` 被跳过（v2.1 E2，`§11.2`）。
+    ///
+    /// 引擎不画占位图、不 panic（D17：跳过必须可观测）；应用在资源就绪后重画该节点。
+    InlineBoxImageMissing {
+        /// [`InlineBoxSpec::id`]（应用句柄）。
+        id: u64,
+    },
 }
 
 #[cfg(test)]
@@ -1208,6 +1532,86 @@ mod tests {
         assert_ne!(a, c);
     }
 
+    /// v2.1 E2：`TextRun` 覆盖语义 + `TextContent.runs` 访问器（空 = 全段兜底样式）。
+    #[test]
+    fn text_content_runs_are_ordered_and_normalized() {
+        use super::TextRun;
+
+        let base = TextContent::new("a界b", TextStyle::new(16.0));
+        assert!(base.runs().is_empty(), "默认无 runs");
+
+        let red = TextStyle::new(16.0).with_color(Color::WHITE);
+        let content = base.with_runs([
+            TextRun::new(0..1, red.clone()),
+            // `界` 占 3 字节（1..4）：越界 + 中段边界的区间必须向内收到 char boundary。
+            TextRun::new(1..2, red.clone()),
+            TextRun::new(4..6, red.clone()),
+        ]);
+        let runs = content.runs();
+        assert_eq!(runs.len(), 2, "非边界空区间被归一化丢弃：{runs:?}");
+        assert_eq!(runs[0].range, 0..1);
+        assert_eq!(runs[1].range, 4..5, "越界端点夹到文本长度");
+        assert_eq!(runs[0].style, red);
+        assert_eq!(content.clone(), content, "runs 参与 TextContent 相等性");
+        assert_ne!(
+            content,
+            TextContent::new("a界b", TextStyle::new(16.0)),
+            "有/无 runs 必须可区分"
+        );
+    }
+
+    /// `bind_text` 换文本后的裁剪：内收 / 丢弃越界 run，返回被改动的数量。
+    #[test]
+    fn text_content_clips_runs_to_the_new_text() {
+        use super::TextRun;
+
+        let mut content = TextContent::new("abcdef", TextStyle::new(16.0)).with_runs([
+            TextRun::new(0..2, TextStyle::new(16.0).with_weight(700)),
+            TextRun::new(2..6, TextStyle::new(16.0).with_weight(800)),
+        ]);
+        content.text = smol_str::SmolStr::new_static("abc");
+        let altered = content.clip_runs_to_text();
+        assert_eq!(altered, 1, "第二个 run 被裁剪");
+        assert_eq!(content.runs().len(), 2);
+        assert_eq!(content.runs()[1].range, 2..3, "越界端点按新文本内收");
+        // 再次裁剪是幂等的（没有新的改动）。
+        assert_eq!(content.clip_runs_to_text(), 0);
+        assert_eq!(content.runs()[1].range, 2..3);
+    }
+
+    /// v2.1 E2：装饰构造器 + 可绘制判定（非有限 / 非正线宽不画）。
+    #[test]
+    fn text_decoration_helpers_resolve_color_and_visibility() {
+        let underline = super::TextDecoration::underline(1.5);
+        assert!(underline.is_underline());
+        assert_eq!(underline.thickness(), 1.5);
+        assert!(underline.color().is_none());
+        assert!(underline.is_visible());
+        let colored = underline.with_color(Some(Color::WHITE));
+        assert_eq!(colored.color(), Some(Color::WHITE));
+        let strike = super::TextDecoration::strikethrough(2.0);
+        assert!(!strike.is_underline());
+        assert!(!super::TextDecoration::underline(0.0).is_visible());
+        assert!(!super::TextDecoration::underline(f32::NAN).is_visible());
+    }
+
+    /// v2.1 E2：装饰收进 `TextStyleExtras`（不撑大 `TextStyle` 的内联尺寸）。
+    #[test]
+    fn text_decoration_lives_in_extras() {
+        let plain = TextStyle::new(16.0);
+        assert_eq!(plain.decoration(), None);
+        let decorated = plain
+            .clone()
+            .with_decoration(super::TextDecoration::underline(1.0));
+        assert!(decorated.decoration().is_some());
+        assert_eq!(
+            size_of::<TextStyle>(),
+            size_of::<TextStyle>(),
+            "装饰不能改变 TextStyle 尺寸（编译期常量断言见 text_payload_sizes_are_budgeted）"
+        );
+        assert_ne!(plain, decorated);
+    }
+
     #[test]
     fn text_payload_sizes_are_budgeted() {
         // P1-2.3 新增 font_features（等宽数字 tnum），同时把 family 与它一起收进
@@ -1217,9 +1621,12 @@ mod tests {
         // 既拿到了 ellipsis/截断与 locale/变体轴/字宽/词距/断行严格度，又不给 `Node` 加负担。
         // word_spacing / line_break 全部收进 `extras` 的 `Box`，不占内联空间）。
         // `TextContent` 随之内联 +8。`ShapedLine` 不变（80 B）。
+        // `TextContent` 随之内联 +8（v2.1 E2：`runs: Option<Box<ThinSlice<TextRun>>>` 是最小
+        // 内联表示 —— `Box<[T]>` 胖指针 16 B 会超 `Node` 的 336 B 预算；空 runs 不分配）。
+        // `ShapedLine` 不变（80 B；装饰几何在堆上的 `ShapedTextLine.decorations`）。
         assert_eq!(size_of::<TextStyle>(), 56);
-        assert_eq!(size_of::<TextContent>(), 96);
-        assert_eq!(size_of::<InlineBoxSpec>(), 40);
+        assert_eq!(size_of::<TextContent>(), 104);
+        assert_eq!(size_of::<InlineBoxSpec>(), 72);
         assert_eq!(size_of::<ShapedLine>(), 80);
     }
 

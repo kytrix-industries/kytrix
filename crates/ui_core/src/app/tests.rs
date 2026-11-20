@@ -1669,6 +1669,7 @@ fn inline_boxes_changes_relayout() {
         size: crate::math::Size::new(20.0, 20.0),
         baseline: None,
         align: crate::text::InlineAlign::Baseline,
+        paint: None,
     };
     let node = {
         let w = app.window_mut(window).expect("window");
@@ -1688,6 +1689,7 @@ fn inline_boxes_changes_relayout() {
         size: crate::math::Size::new(40.0, 10.0),
         baseline: Some(8.0),
         align: crate::text::InlineAlign::Top,
+        paint: None,
     };
     {
         let tree = app.window_mut(window).expect("window").tree_mut();
@@ -1711,6 +1713,7 @@ fn bind_text_preserves_inline_boxes() {
         size: crate::math::Size::new(16.0, 16.0),
         baseline: None,
         align: crate::text::InlineAlign::Baseline,
+        paint: None,
     };
     let node = {
         let w = app.window_mut(window).expect("window");

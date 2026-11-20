@@ -190,8 +190,9 @@ fn node_and_handle_sizes() {
     );
     assert_eq!(
         size_of::<crate::text::TextContent>(),
-        96,
-        "TextContent 的尺寸基线（P1-2.3：family + font_features 收进 TextStyleExtras 后从 112 降到 96）"
+        104,
+        "TextContent 的尺寸基线（P1-2.3 从 112 降到 96；v2.1 E2 的 `runs: Option<Box<ThinSlice>>` \
+         最小内联表示 +8，空 runs 不分配；Node 仍 ≤ 336 B 预算）"
     );
     assert_eq!(
         size_of::<Option<NodeId>>(),

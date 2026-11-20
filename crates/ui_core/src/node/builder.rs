@@ -188,6 +188,18 @@ impl NodeBuilder {
         self
     }
 
+    /// 富文本 runs（v2.1 E2，`§11.2`）：逐区间覆盖样式；空 = 整段用 `text()` 的兜底样式。
+    ///
+    /// 与 `inline_boxes` 同一形态：只对 `NodeBuilder::text` 节点生效。区间在
+    /// `TextContent::with_runs` 里归一化（裁剪到 char boundary / 文本范围，不 panic）。
+    #[must_use]
+    pub fn runs(mut self, runs: impl IntoIterator<Item = crate::text::TextRun>) -> Self {
+        if let NodeKind::Text(content) = &mut self.kind {
+            content.set_runs(runs);
+        }
+        self
+    }
+
     /// 动态文本：每次 `refresh_styles` 求值（与 `bind_style` 同一机制、同一依赖图）。
     ///
     /// 返回值是 `SmolStr`（不是 `String`）：短字符串零分配（AGENTS §2.2）。

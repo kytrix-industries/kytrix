@@ -1177,8 +1177,9 @@ impl Window {
         &mut self,
         geometry: &crate::paint::geometry_store::GeometryStore,
         atlas: Option<&crate::render::AtlasAllocator>,
+        resources: Option<&crate::resources::ResourceCache>,
     ) -> Result<PaintReport, EngineError> {
-        paint::paint_frame(self, geometry, atlas)
+        paint::paint_frame(self, geometry, atlas, resources)
     }
     fn needs_node_repaint(&self) -> bool {
         paint::needs_node_repaint(self)

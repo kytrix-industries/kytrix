@@ -776,7 +776,11 @@ fn an_idle_frame_does_not_advance_the_inline_composer() {
     let idle = app
         .window_mut(window)
         .expect("window")
-        .paint_frame(&crate::paint::geometry_store::GeometryStore::new(), None)
+        .paint_frame(
+            &crate::paint::geometry_store::GeometryStore::new(),
+            None,
+            None,
+        )
         .expect("idle paint");
     assert_eq!(
         (idle.damage.rects, idle.damage.full),
@@ -800,7 +804,11 @@ fn an_idle_frame_does_not_advance_the_inline_composer() {
     let scroll = app
         .window_mut(window)
         .expect("window")
-        .paint_frame(&crate::paint::geometry_store::GeometryStore::new(), None)
+        .paint_frame(
+            &crate::paint::geometry_store::GeometryStore::new(),
+            None,
+            None,
+        )
         .expect("scroll paint");
     assert!(
         scroll.uploaded_bytes > 0,
@@ -860,7 +868,11 @@ fn consecutive_idle_frames_accumulate_their_scene_deltas() {
         let report = app
             .window_mut(window)
             .expect("window")
-            .paint_frame(&crate::paint::geometry_store::GeometryStore::new(), None)
+            .paint_frame(
+                &crate::paint::geometry_store::GeometryStore::new(),
+                None,
+                None,
+            )
             .expect("idle paint");
         assert_eq!(
             (report.damage.rects, report.damage.full),
@@ -902,7 +914,11 @@ fn consecutive_idle_frames_accumulate_their_scene_deltas() {
     let report = app
         .window_mut(window)
         .expect("window")
-        .paint_frame(&crate::paint::geometry_store::GeometryStore::new(), None)
+        .paint_frame(
+            &crate::paint::geometry_store::GeometryStore::new(),
+            None,
+            None,
+        )
         .expect("scroll paint");
     assert!(report.damage.rects > 0, "滚动帧必须产出 damage");
     let pending = app
@@ -958,7 +974,11 @@ fn a_removed_lane_survives_an_idle_frame_and_reaches_the_next_commit() {
     let idle = app
         .window_mut(window)
         .expect("window")
-        .paint_frame(&crate::paint::geometry_store::GeometryStore::new(), None)
+        .paint_frame(
+            &crate::paint::geometry_store::GeometryStore::new(),
+            None,
+            None,
+        )
         .expect("idle paint");
     assert_eq!((idle.damage.rects, idle.damage.full), (0, false));
     let lane = app
@@ -986,7 +1006,11 @@ fn a_removed_lane_survives_an_idle_frame_and_reaches_the_next_commit() {
     let _ = app
         .window_mut(window)
         .expect("window")
-        .paint_frame(&crate::paint::geometry_store::GeometryStore::new(), None)
+        .paint_frame(
+            &crate::paint::geometry_store::GeometryStore::new(),
+            None,
+            None,
+        )
         .expect("removal paint");
     let pending = app
         .window(window)
@@ -1062,7 +1086,11 @@ fn an_a11y_only_frame_still_runs_after_a_retained_delta() {
     let idle = app
         .window_mut(window)
         .expect("window")
-        .paint_frame(&crate::paint::geometry_store::GeometryStore::new(), None)
+        .paint_frame(
+            &crate::paint::geometry_store::GeometryStore::new(),
+            None,
+            None,
+        )
         .expect("idle paint");
     assert_eq!((idle.damage.rects, idle.damage.full), (0, false));
     assert!(
@@ -1174,7 +1202,11 @@ fn an_idle_frame_keeps_its_scene_delta_for_the_next_scroll_frame() {
     let report = app
         .window_mut(window)
         .expect("window")
-        .paint_frame(&crate::paint::geometry_store::GeometryStore::new(), None)
+        .paint_frame(
+            &crate::paint::geometry_store::GeometryStore::new(),
+            None,
+            None,
+        )
         .expect("scroll paint");
     assert!(report.damage.rects > 0, "滚动帧必须产出视口 damage");
     let pending = app
