@@ -151,11 +151,12 @@ crates/ui_core/
 │   ├── event.rs               # Event / InputEvent / Action / KeyBinding / 事件类型
 │   ├── debug_hud.rs           # feature = "hud" 的调试 HUD（`mod debug_hud`）
 │   ├── app.rs + app/          # Application / App / AppHandle / 启动与退出 / tokio Handle
-│   │                          #   app/{frame,style_pass,text_pass,invalidate,event_queue,focus,geometry,input,
-│   │                          #        interaction,overlay,scroll,signal_api,virtual_list,window_set,resources,
-│   │                          #        a11y,animation,debug,tests}.rs（另有 interaction_tests / invalidate_tests / resources_tests 测试子模块）
-│   ├── window.rs + window/    # WindowId / Window / WindowOptions / FrameIndex / FrameScheduler / FrameRecord
+│   │                          #   app/{frame,style_pass,text_pass,invalidate,event_queue,focus,geometry,input,overlay,
+│   │                          #        scroll,signal_api,virtual_list,window_set,resources,a11y,animation,debug,tests}.rs
+│   │                          #   （测试子模块：interaction_tests / invalidate_tests / resources_tests）
+│   ├── window.rs + window/    # WindowId / Window / WindowOptions / FrameIndex / FrameScheduler
 │   │                          #   window/{focus,frame,frame_budget,paint,record,scale,surface,a11y,tests}.rs
+│   │                          #   （record.rs 是 Window::record 的委托；FrameRecord 类型在 test_support/record.rs）
 │   ├── node.rs + node/        # Node / NodeId / Arena（id.rs）/ Signal（signal.rs）/ ReadCtx + 依赖图（dependency.rs）/
 │   │                          #   DirtyFlags（dirty.rs）/ NodeBuilder（builder.rs）/
 │   │                          #   NodeTree（tree.rs + tree/{arena,content,dirty,layout,traverse,tests}.rs）
@@ -184,7 +185,7 @@ crates/ui_core/
 │   │                          #     close,cursor,frame_gate,presentation,scroll}.rs（Wayland 协议适配）
 │   ├── a11y.rs + a11y/        # tree/mapping/adapter/action/textrun/identity
 │   └── test_support.rs + test_support/  # feature = "test-support"；app/probe/record/script/snapshot/pixels/a11y/
-│                              #   acceptance/gui_smoke/diagnostics（无 re-export，不进发布物）
+│                              #   acceptance/gui_smoke/diagnostics（`FrameRecord`/`RenderedFrame` 在 record.rs；无 re-export，不进发布物）
 ├── benches/                   # perf.rs / layout_postpass.rs（`harness = false`）
 └── tests/                     # 集成测试（只走公开 API）：layout.rs / frame_record.rs / snapshot.rs /
                                #   gui_smoke.rs / hud.rs；golden/{warp,lavapipe,metal-real}/（各 14 张 PNG，不进发布物）
@@ -1497,11 +1498,22 @@ impl Canvas {
 | 任意 GPU 命令插入 / 应用持有 GPU buffer、uniform | 与 **I4**（GPU 资源只经延迟销毁）直接矛盾：应用持有的资源生命周期无法纳入 `RetireQueue` 的 `FrameIndex` 队列 |
 | 扩一整套自定义 pipeline 的视觉基线 | 与 **I8** 冲突：现有 L3 只有 14 个 case（42 张 golden），重开基线等于重做像素回归 |
 
-**消费者核实**（统计范围 = 下列应用层 crate（不含 `ui_core`）：`crates/base_ui`、`crates/kytrix`、`crates/widgets/*`、其余
-`crates/*_ui`，递归 `*.rs` 并排除 `target/`；本轮实测 **371 个 `.rs`**）：对 `shader` / `wgpu` / `VertexBuffer` /
+**消费者核实**（统计范围 = 下列应用层 crate（不含 `ui_core`）：`crates/base_ui`、`crates/kytrix`、`crates/widgets/*`、
+其余 `crates/*_ui`；递归 `*.rs`，排除 `target/` 与 `.git/`）：**371 个 `.rs`**；对 `shader` / `wgpu` / `VertexBuffer` /
 `render_pipeline`（不区分大小写）的**代码引用为 0**；唯一命中是 `crates/base_ui/src/color_picker.rs:1195` 一处注释
-（“no gradient shader”）。复现命令（PowerShell）：
-`Get-ChildItem crates/base_ui,crates/kytrix,crates/widgets,(Get-ChildItem crates -Directory | ? Name -like '*_ui') -Recurse -Filter *.rs | ? FullName -notmatch '\\target\\' | Select-String -Pattern 'shader|wgpu|VertexBuffer|render_pipeline'`。
+（“no gradient shader”）。复现命令（PowerShell，已去重；`*_ui` 排除 `base_ui` 以免重复计数）：
+
+```powershell
+$ui = Get-ChildItem crates -Directory | Where-Object { $_.Name -like '*_ui' -and $_.Name -ne 'base_ui' }
+$roots = @('crates/base_ui','crates/kytrix') + $ui.FullName + (Get-ChildItem crates/widgets -Directory).FullName
+$files = Get-ChildItem -Path $roots -Recurse -File -Filter *.rs |
+         Where-Object { $_.FullName -notmatch '[\/](target|\.git)[\/]' }
+$files.Count
+$files | Select-String -Pattern 'shader|wgpu|VertexBuffer|render_pipeline'
+```
+
+结果：**371** / **1 条**（`base_ui/src/color_picker.rs:1195`）。**若把 `base_ui` 同时经 `*_ui` 通配再计入一次**，会得到
+449 个文件 / 2 条命中 —— 那是重复计数的假象（base_ui 的 78 个文件被数两次），不是额外消费者。
 GPUI 本身也不向应用暴露自定义 pipeline，因此**没有任何 widget 依赖自有 shader / GPU 缓冲**。应用自绘的典型场景（图表、地图、
 K 线）已能由 `Canvas::push_*` + 静态 `Geometry`（两种 `GeometryPipeline`：`Ui` / `Textured`）覆盖。
 
@@ -2397,13 +2409,15 @@ M6 kytrix 启动 = P4-1…P4-3；M7 最终验收 = P6-1…P6-3（P5 是 M6 与 M
 
 | 旧编号 | 来源 | 归入 |
 |---|---|---|
-| B0 门禁基座 / B1 base_ui 基础 / B2 widget 契约 / B3 20 widget / B4 六个 `*_ui` / B5 kytrix 外壳 / B6 运行时收口+删除 / B7 三端验收 | `04` §7.2 | B0→P0-2（CI 工作流部分按 D-07 取消）+ P0-3（基线确认）；B1→P2-1a…P2-5（base_ui 全组）；B2→P3-1、P3-2、P3-3；B3→P3-W1…W9；B4→P4-1、P4-2（`widget_gallery_ui` 归 P3-3）；B5→P4-3（E6 能力=P1-E6）；B6→P5-1、P5-2；**B7→P6-1…P6-3** |
-| P0 引擎增量 / P1 地基 / P2 容器列表 / P3 文本输入 / P4 交互浮层 / P5 外壳联调 | `02` §10.3 | P0→P1-E1…E6（G5 滚动条→P2-2、G11 构建期 SVG→P2-1b 属应用层）；P1→P2-1a、P2-1b；P2→P2-2；P3→P2-3；P4→P2-4；P5→P2-5 + P4-3 |
+| B0 门禁基座 / B1 base_ui 基础 / B2 widget 契约 / B3 20 widget / B4 六个 `*_ui` / B5 kytrix 外壳 / B6 运行时收口+删除 / B7 三端验收 | `04` §7.2 | B0→P0-2（门禁；CI 工作流部分按 D-07 取消）+ P0-3（基线确认）+ **P2-1a（`ui_core`/`taffy` 进 `Cargo.toml`，plan P2-1a 已列）**；**B0 的「最小 kytrix example」：plan 未列，建议归 P0-2 或新增 P0-4（当前不存在）**；B1→P2-1a…P2-5（base_ui 全组）；B2→P3-1、P3-2、P3-3；B3→P3-W1…W9；B4→P4-1、P4-2（`widget_gallery_ui` 归 P3-3）；B5→P4-3（E6 能力=P1-E6）；B6→P5-1、P5-2；**B7→P6-1…P6-3** |
+| P0 引擎增量 / P1 地基 / P2 容器列表 / P3 文本输入 / P4 交互浮层 / P5 外壳联调 | `02` §10.3 | **P0**：G1→P1-E1/E5（引擎 shaping / 点→字符）+ P2-3（应用层编辑状态机）；G3→P2-4（`interactive`/hover 消费；引擎 `InputEvent`/pointer 已实现，**plan 无独立批次**）；G7→P2-4/P2-3（`Canvas`/`set_canvas` 已实现，组件消费方；**plan 无独立批次**）；G4→P1-E3；G5→P2-2；G11→P2-1b；**P1**→P2-1a、P2-1b；**P2**→P2-2；**P3**→P2-3；**P4**→P2-4；**P5（含删除 gpui）**→P4-3（layer 塌缩/kytrix 外壳）+ P2-5（26 examples→gallery/视觉基线）+ **P5-1、P5-2（删除 gpui / widget_tokio_runtime）** |
 | B0 保留文件搬运 / B1 签名定稿+`empty` / B2 `surface`+binding / B3 registry+gallery | `03` §9.4 | B0→P3-1；B1→P3-1（view/any/status）+ P3-2（empty）；B2→P3-2（surface/placeholder/binding）+ P3-W9（watch_list）；B3→P3-3 |
 | R1 volume_heatmap→order_book / R2 perpetual_statistics∥prediction_market / R3 chokepoint / R4 candlestick | `06` §3 | **R1→P3-W4（volume_heatmap/order_book）；R2→P3-W5（perpetual_statistics/prediction_market）；R3→P3-W6（chokepoint）；R4→P3-W7（candlestick）** |
 | B1 标杆 / B2 表格列表族 / B3 钱包族 / B4 自绘族 / B5 x | `07` 0.5/3 节 | B1→P3-2（empty）+ P3-W1（news/force_order）；B2→P3-W2（market_trade/financial_calendar）+ P3-W3（financial_index）+ P3-W9（watch_list）；B3→P3-W8（ethereum_wallet/solana_wallet）+ P3-W9（hyperliquid_wallet）；B4→P3-W2（pentagon_pizza_index）+ P3-W3（coin_market_cap_fear_and_greed_index/cryptocurrency_etf）；B5→P3-W9（x） |
-| T0 摘耦合 / T1 base_ui 单测 / T2/T3 widget / T4 外壳 / T5 收尾 | `05` §7.1 | T0→P0-3（基线确认）+ P2-1a 前置；T1→P2-1a…P2-5；T2→P3-1…P3-3；T3→P3-W1…W9；T4→P4-1…P4-3；T5→随 P1-E1…E6 与 P2/P3 各批落地（不单列批次） |
+| T0 摘耦合 / T1 base_ui 单测 / T2/T3 widget / T4 外壳 / T5 收尾 | `05` §7.1 | T0→P0-3（5 个纯 crate / 720 免迁移基线登记）+ **P5-1（`Runtime::for_test`→`Handle` 机械改写，提前执行）** + **P5-2（i18n 去 gpui dev-dep；最终删除）**；plan 未单列 T0 前置批次；T1→P2-1a…P2-5；T2→P3-1…P3-3；T3→P3-W1…W9；T4→P4-1、P4-2、P4-3（5 个 `*_ui` + kytrix；其中 **`app_config_provider`/`download_provider`/`kytrix_service_provider`：plan 未列，建议归 P4-3（外壳服务注入）或 P5-2；`market_participants_connector`（纯逻辑/协议）→P4-1**）；T5→随 P1-E1…E6 与 P2/P3 各批落地（不单列批次） |
 
+> 注：表中「plan 未列」= `.docs/gui-migration/plan.md` 没有对应批次；执行前由 Lead 决定并入就近批次或新增 P0-4（当前不存在），
+> 不得自行扩批。其余所有 `P*-*` 批次 ID 均存在于 plan.md。
 **迁移期验证门（plan P2–P5 各批次）**：`#[gpui_kit::test]` **1,652** 个 + 迁移面 **5,443** 个（可机械 3,610 / 必须重写
 1,711 / 删 9 / 未解析 122），以「**crate 全绿 + 台账逐条对账**」为验收，不按 API 批量。`cargo test --workspace` 在迁移期
 不可作为合并门（旧 crate 必红）；门禁按 plan §2.4 的 fast/quick/layer 三级执行，执行体是 `cargo xtask gates`（P0-2），
