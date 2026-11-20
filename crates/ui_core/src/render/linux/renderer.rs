@@ -1084,19 +1084,25 @@ mod tests {
             vec![1, 2, 3],
             dirty_rects(4, 8),
         );
-        slots.queue(AtlasKind::Image, 1, 2048, vec![4, 5], dirty_rects(0, 2));
+        slots.queue(
+            AtlasKind::Image,
+            1,
+            spec(2048, 2),
+            vec![4, 5],
+            dirty_rects(0, 2),
+        );
         let mut uploads = slots.take();
         assert_eq!(uploads.len(), 2, "字形 + 图片第 1 层");
         let image = uploads.pop().expect("image upload");
         assert_eq!(image.kind, AtlasKind::Image);
         assert_eq!(image.layer, 1);
-        assert_eq!(image.extent, 2048);
+        assert_eq!(image.spec, spec(2048, 2));
         assert_eq!(image.pixels, vec![4, 5]);
         assert_eq!(image.rects, dirty_rects(0, 2));
         let glyph = uploads.pop().expect("glyph upload");
         assert_eq!(glyph.kind, AtlasKind::Glyph);
         assert_eq!(glyph.layer, 0);
-        assert_eq!(glyph.extent, 64);
+        assert_eq!(glyph.spec, spec(64, 1));
         assert_eq!(glyph.pixels, vec![1, 2, 3]);
         assert_eq!(glyph.rects, dirty_rects(4, 8));
         assert!(slots.take().is_empty(), "取走后槽位为空");
@@ -1110,7 +1116,7 @@ mod tests {
             slots.queue(
                 AtlasKind::Image,
                 layer,
-                2048,
+                spec(2048, 4),
                 vec![layer as u8],
                 dirty_rects(0, 1),
             );

@@ -278,7 +278,7 @@ impl AtlasTexture {
             staging: std::array::from_fn(|_| None),
             handle: None,
             page: placeholder.page,
-            pending: vec![None; placeholder.layers as usize],
+            pending: (0..placeholder.layers as usize).map(|_| None).collect(),
         })
     }
 
