@@ -434,17 +434,30 @@ impl GeometryStore {
 
     /// **成对截断**顶点 / 索引缓冲（X5 滑动窗口：删掉最旧的 N 根 K 线 + 追加新的）。
     ///
-    /// `vertices` / `indices` 是**元素个数**（不是字节数），必须各自 `<=` 当前个数；截断只能
-    /// 缩短，增长走 [`GeometryStore::update_vertices`] / [`GeometryStore::update_indices`]。
-    /// 两个目标都等于当前个数时是 **no-op**（不推进版本、不产生 damage）。
+    /// 参数顺序固定为 `(vertices, indices)`：`vertices` 是目标**顶点个数**，`indices` 是目标
+    /// **索引个数**（都是元素个数，不是字节数），各自必须 `<=` 当前个数。两个字面量相邻且同型，
+    /// 调用处容易传反 —— 建议用命名局部变量 / 注释写清单位，例如 K 线（每根 4 顶点 + 6 索引、
+    /// 保留 `roots` 根）：
+    ///
+    /// ```text
+    /// let vertices = roots * 4;
+    /// let indices = roots * 6;
+    /// store.truncate(id, vertices, indices)?;
+    /// ```
+    ///
+    /// 截断只能缩短，增长走 [`GeometryStore::update_vertices`] /
+    /// [`GeometryStore::update_indices`]（尾随追加）。两个目标都等于当前个数时是 **no-op**：不推进
+    /// 版本（返回当前 `revision`）、不产生 damage、不重建快照。
     ///
     /// 语义：
     /// - 数据先截断，再按新长度重写页表：末端页按实际长度存、多余页丢弃；未触碰的页保持原
     ///   `Bytes`（GPU 侧仍按页 `ptr_eq` 做增量上传）。
-    /// - 块数按 `chunk_count(topology, indices)` 重算（只减）；被移除块的**旧 AABB** 并入
-    ///   `damaged`（旧像素要重画），尾块若真的变短/重扫出不同 AABB 也并入旧 AABB。
+    /// - 块数按 `chunk_count(topology, indices)` 重算（只减）；`damaged` = 被移除块的**旧 AABB**
+    ///   ∪ 变短尾块的**旧 ∪ 新 AABB**（与 `update_*` 的「旧 ∪ 新」同口径；收缩时新通常是旧的
+    ///   子集）。
     /// - 尾块（最后一个保留块）的 block revision 只在它的索引区间 / 顶点引用 / AABB 真的变化时
-    ///   推进；paint 因此只重建这条块 lane，其余块 lane 整段复用。
+    ///   推进；paint 因此只重建这条块 lane，其余块 lane 整段复用。截断到 0 块时节点仍保留一条
+    ///   承载装饰（背景/边框/焦点环/节点盒 damage）的 lane，几何 op 不发射（见 `paint/pass.rs`）。
     /// - 截断后可以继续用 `update_vertices` / `update_indices` 做**尾随追加**（同一条追加路径）。
     ///
     /// 契约：应用必须保证截断后剩余索引不引用被移除的顶点（与 `insert` 一样，引擎只校验结构，
@@ -452,7 +465,8 @@ impl GeometryStore {
     ///
     /// # Errors
     /// - [`EngineError::UnknownGeometry`]：句柄陈旧 / 已释放；
-    /// - [`EngineError::GeometryTruncateGrows`]：目标个数大于当前个数。
+    /// - [`EngineError::GeometryTruncateGrows`]：目标个数大于当前个数（`requested` / `current`
+    ///   指向具体缓冲，应用据此修参数或改走增长 API）。
     pub fn truncate(
         &mut self,
         id: GeometryId,

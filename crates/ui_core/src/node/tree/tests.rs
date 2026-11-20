@@ -664,24 +664,38 @@ fn remove_reports_every_lane_of_a_multi_lane_node() {
 /// Canvas 内容里引用的几何必须登记在反向绑定表：数据更新能自动标脏 Canvas 节点，
 /// 内容替换与卸载会解绑（绑定表是树内私有旁表，只有树单测能直接观察）。
 ///
+/// 两条公开几何引用路径都必须覆盖：`push_geometry(GeometryDraw)` 与
+/// `push_path(Path{geometry})`（前者在 delta 侧有测试，但绑定表侧曾漏掉后者，审查 RBG-01）。
+///
 /// 探针：删掉 `arena::insert_child` 的 Canvas 分支 ⇒ 首段断言红；删掉 `set_canvas` 的
-/// 解绑/重建 ⇒ 第二段红；删掉 `arena::remove` 的 Canvas 解绑 ⇒ 末段红。
+/// 解绑/重建 ⇒ 第二段红；删掉 `arena::remove` 的 Canvas 解绑 ⇒ 末段红；
+/// 删掉 `canvas_geometry_ids` 的 `Path` 分支（G10）⇒ 首段 Path 断言红。
 #[test]
 fn canvas_referenced_geometries_are_bound_and_unbound() {
     use crate::paint::{
-        canvas::Canvas, color::Color, geometry::GeometryId, primitive::GeometryDraw,
+        canvas::Canvas,
+        color::Color,
+        geometry::GeometryId,
+        primitive::{GeometryDraw, Path},
     };
 
     let first = GeometryId::for_test(1, 1);
     let second = GeometryId::for_test(2, 1);
+    let third = GeometryId::for_test(3, 1);
     let draw = |id| GeometryDraw {
         id,
         transform: crate::math::Transform::IDENTITY,
         color: Color::WHITE,
     };
+    let path = |id| Path {
+        bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
+        geometry: id,
+        fill: Color::WHITE,
+    };
     let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 8.0, 8.0));
     canvas.push_geometry(draw(first));
     canvas.push_geometry(draw(first));
+    canvas.push_path(path(third));
     let mut tree = NodeTree::new();
     let root = tree.root();
     let node = NodeBuilder::canvas(canvas)
@@ -694,21 +708,31 @@ fn canvas_referenced_geometries_are_bound_and_unbound() {
         1,
         "同一个几何在一个 Canvas 里重复引用只登记一次"
     );
+    assert!(
+        tree.geometry_bindings
+            .get(&third)
+            .is_some_and(|nodes| nodes.contains(&node)),
+        "`push_path` 引用的几何也必须登记（第二条公开几何引用路径）"
+    );
     assert!(!tree.geometry_bindings.contains_key(&second));
 
-    // 内容替换：旧引用解绑、新引用登记。
+    // 内容替换：旧引用（Geometry 与 Path 两种来源）解绑、新引用登记。
     let mut fresh = Canvas::new(Rect::new(0.0, 0.0, 8.0, 8.0));
-    fresh.push_geometry(draw(second));
+    fresh.push_path(path(second));
     assert!(tree.set_canvas(node, fresh), "替换 Canvas 内容");
     assert!(
         !tree.geometry_bindings.contains_key(&first),
         "旧内容引用的几何必须解绑"
     );
     assert!(
+        !tree.geometry_bindings.contains_key(&third),
+        "旧内容里 `push_path` 引用的几何也必须解绑"
+    );
+    assert!(
         tree.geometry_bindings
             .get(&second)
             .is_some_and(|nodes| nodes.contains(&node)),
-        "新内容引用的几何必须登记"
+        "新内容（`push_path`）引用的几何必须登记"
     );
 
     // 标脏路径：Canvas 节点必须被标 PAINT（整条 lane 重建）并清 REUSABLE。

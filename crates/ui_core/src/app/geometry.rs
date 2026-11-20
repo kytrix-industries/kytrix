@@ -1001,4 +1001,134 @@ mod tests {
         assert!(!idle.rendered, "顺序已发布后的无变化帧必须空闲");
         assert_eq!(idle.stats.encoded_lanes, 0);
     }
+
+    /// 截断到 0：节点保留一条**装饰 lane**（几何 op 不发射），damage 只覆盖被移除的块、不把
+    /// 整个注册 `bounds` 拖进来；随后追加会自动恢复块 lane 与几何 op。
+    ///
+    /// 审查 RBG-03：`desired.max(1)` 保留装饰 lane 是**有意行为**（空数据不应让节点背景/边框/
+    /// 焦点环消失）；但缺失块不能回退整块注册 bounds（否则清空图表时闪一次覆盖整个几何范围的
+    /// damage）。
+    #[test]
+    fn truncating_geometry_to_zero_keeps_the_decorative_lane_and_can_grow_back() {
+        let mut app = TestApp::new();
+        let id = register_long(&mut app, 4096 + 10);
+        let node = mount(&mut app, id);
+        let window = app.window_id();
+        let snapshot = app.app().geometry().snapshot_arc(id).expect("快照");
+        // 两块 AABB：(0,0,64,64) 与 (0,64,10,1)；注册 bounds 是 (0,0,64,100)。
+        let first_bounds = snapshot.chunk(0).expect("块 0").bounds;
+        let second_bounds = snapshot.chunk(1).expect("块 1").bounds;
+        assert_eq!(snapshot.bounds(), Rect::new(0.0, 0.0, 64.0, 100.0));
+
+        let _ = app
+            .app_mut()
+            .truncate_geometry(id, 0, 0)
+            .expect("清空成 0 块");
+        let record = app.drain().expect("清空帧");
+        assert!(
+            damage_hits(
+                &record.damage,
+                first_bounds.origin.x + 1.0,
+                first_bounds.origin.y + 1.0
+            ),
+            "被移除的块 0 必须进 damage：{:?}",
+            record.damage
+        );
+        assert!(
+            damage_hits(&record.damage, 5.0, second_bounds.origin.y + 0.5),
+            "被移除的块 1 必须进 damage：{:?}",
+            record.damage
+        );
+        assert!(
+            record.damage.iter().all(|rect| rect.y1 <= 70),
+            "缺失块不得回退整个注册 bounds（高 100）：{:?}",
+            record.damage
+        );
+        let window_state = app.app().window(window).expect("窗口存在");
+        assert_eq!(
+            window_state.tree().lane_count(node),
+            1,
+            "0 块时仍保留一条承载装饰的 lane"
+        );
+        assert!(
+            window_state.encoded_geometry().is_empty(),
+            "0 块时不得发射几何 op：{:?}",
+            window_state.encoded_geometry()
+        );
+
+        // 追加：块 lane 与几何 op 都必须恢复。
+        append_triangle(&mut app, id, 100.0, 100.0);
+        let record = app.drain().expect("追加帧");
+        assert!(record.rendered, "追加必须提交");
+        assert!(
+            damage_hits(&record.damage, 100.0, 100.0),
+            "追加的三角形必须进 damage：{:?}",
+            record.damage
+        );
+        let window_state = app.app().window(window).expect("窗口存在");
+        assert_eq!(
+            window_state.tree().lane_count(node),
+            1,
+            "0 块上追加一个三角形后仍是 1 条块 lane"
+        );
+        assert!(
+            !window_state.encoded_geometry().is_empty(),
+            "追加后必须恢复几何 op"
+        );
+    }
+
+    /// Canvas 引用 2 块几何：`truncate_geometry` 后 Canvas 节点被自动标脏/请求帧，重建 lane 后
+    /// 编码器按**新快照**只发射 1 个几何 op（块 1 的 op 消失）。
+    ///
+    /// 审查 RBG-06/07：Canvas 绑定 × truncate 的交叉面（两个修复点组合）此前没有测试。
+    #[test]
+    fn truncating_geometry_reencodes_the_canvas_that_references_it() {
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let id = register_long(&mut app, 4096 + 10);
+        let node = mount_canvas(&mut app, &[id]);
+        let _ = app.drain().expect("首帧");
+        let ops_before = app
+            .app()
+            .window(window)
+            .expect("窗口存在")
+            .encoded_geometry()
+            .iter()
+            .filter(|draw| draw.id == id)
+            .count();
+        assert_eq!(ops_before, 2, "Canvas 内容按块展开：2 块 = 2 个几何 op");
+        clear_dirty(&mut app);
+
+        let requests = app.app().frame_requests();
+        let update = app
+            .app_mut()
+            .truncate_geometry(id, 4096 * 3, 4096 * 3)
+            .expect("截断成一块");
+        assert!(!update.damaged.is_empty());
+        assert!(
+            is_paint_dirty(&app, node),
+            "Canvas 引用的几何被截断后 Canvas 节点必须被标 PAINT"
+        );
+        assert!(
+            app.app().frame_requests() > requests,
+            "截断必须为 Canvas 请求一帧"
+        );
+
+        let _ = app.drain().expect("截断帧");
+        let ops: Vec<_> = app
+            .app()
+            .window(window)
+            .expect("窗口存在")
+            .encoded_geometry()
+            .iter()
+            .filter(|draw| draw.id == id)
+            .cloned()
+            .collect();
+        assert_eq!(ops.len(), 1, "截断后 Canvas 内几何只应展开 1 块：{ops:?}");
+        assert_eq!(ops[0].chunk, 0);
+        assert!(
+            ops[0].snapshot.revision() > 0 && !ops[0].snapshot.vertex_pages().is_empty(),
+            "Canvas 内几何 op 必须携带截断后的真实快照"
+        );
+    }
 }
