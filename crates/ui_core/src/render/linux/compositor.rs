@@ -58,7 +58,7 @@ use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 #[cfg(feature = "test-support")]
 use super::readback::{Readback, ReadbackImage};
 use super::{
-    atlas::AtlasUploads,
+    atlas::{AtlasUploads, SharedAtlas},
     device::{
         DeferredHandles, DescriptorLease, FrameSync, GpuBuffer, SharedGpu, init_error,
         on_gpu_thread,

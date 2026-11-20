@@ -1677,13 +1677,17 @@ mod tests {
     #[should_panic(expected = "atlas layer 2 out of range")]
     fn queueing_an_out_of_range_image_layer_is_a_contract_violation() {
         let mut uploads = AtlasUploads::new();
+        // 载荷长度**正好**等于 `rows(0, 1)` 的字节数：唯一的失败点只能是层号断言（否则删掉
+        // 层号断言后载荷长度断言仍会 panic，掩盖变异）。
+        let rects = rows(0, 1);
+        let bytes = rects.byte_count(TEST_PAGE, 4);
         uploads.queue_upload(
             AtlasKind::Image,
             2,
             spec(TEST_PAGE, 2),
             TEST_PAGE,
-            vec![0u8; 4],
-            rows(0, 1),
+            vec![0u8; bytes],
+            rects,
         );
     }
 
