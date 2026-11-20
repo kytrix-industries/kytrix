@@ -284,6 +284,24 @@ resolve 附件）。`Textured` 没有覆盖率属性，其顶点写 `KYTRIX_AA_I
 只会出现上面列出的走样。这与「与 Skia 的 AA 三角化一致」的旧表述不同：Skia 在 CPU 侧完成了
 三角化 + 覆盖率顶点生成，本引擎把它交给应用。
 
+### `GeometryDraw.range`（E4：CPU 侧索引子区间）
+
+`GeometryDraw.range` 是**索引元素**的半开区间（与 `IndexType` 无关；`TriangleStrip` 同样按索引计），
+**只在 CPU 侧裁剪，不进 `GpuPrimitive`、不改本文件任何字节布局或 shader 源**：
+
+| 项         | 契约                                                                                                                                                                                                                   |
+|------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 整份       | `0..u32::MAX`（`GeometryDraw::full`）。用哨兵而不是 `0..index_count`：几何可被 `update_*` / `truncate_geometry` 改变长度，真正的上界在绘制期裁剪                                                                        |
+| 空绘制     | 空区间 / `start >= end` / `start >= index_count` ⇒ 无 op、无 damage、无 draw call                                                                                                                                     |
+| 越界       | `end > index_count` 的一端 **clamp**（几何可能被 `truncate_geometry` 变短，不报错）；越界不产生越界读                                                                                                                 |
+| 三角形对齐 | `TriangleList` 的绘制长度截到 3 个索引的倍数（不足一个三角形的尾部索引不产生 draw）；`TriangleStrip` 不截                                                                                                              |
+| 块求交     | 引擎把 range 与 4096 B 页级上传的**块表**求交，逐块产出 op（块间顺序 = 索引顺序）；`first_index` / `index_count` 是**索引缓冲里的绝对索引区间**                                                                         |
+| 三端一致   | 三端 `DrawIndexed` 只消费裁剪后的区间（`GeometryDrawGpu::draw_range` 是唯一入口）：D3D12 / Vulkan 直接给 `first_index`，Metal 的 `indexBufferOffset` = `first_index × index_type.size()`；vertex offset / base vertex 恒 0 |
+| 错误       | 区间越过**已上传**的索引数是引擎内部不变量被破坏 ⇒ `EngineError::GeometryRegister`（不静默越界读）；应用侧越界按上表 clamp                                                                                            |
+
+块大小（`GEOMETRY_CHUNK_INDICES = 12288` 索引）是引擎内部策略（主设计 §5.5），应用不可见、本文件
+也不暴露。视觉回归（I8）必须覆盖「同几何、不同 range」的 case：可见三角形集合变化 ⇒ 像素快照变化。
+
 ### 呈现色彩空间（R06-10）
 
 引擎只产出一件事：**sRGB 编码的 8-bit RGBA**（`apply_gamma` 恒等，编码由 sRGB 渲染目标完成一次）。

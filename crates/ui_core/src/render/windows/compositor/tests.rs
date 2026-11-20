@@ -280,7 +280,7 @@ fn geometry_root_matches_common_hlsl_layout() {
     let clip_rect = [4.0f32, 5.0, 100.0, 120.0].map(f32::to_bits);
     let draw = GeometryDrawGpu {
         id: GeometryId::for_test(0, 1),
-        chunk: 0,
+        range: 0..3,
         transform: Transform::translate(11.0, 13.0),
         color: resolver().resolve(Color::WHITE).to_array(),
         snapshot: test_snapshot(),
@@ -313,7 +313,7 @@ fn geometry_root_consumes_transform_and_color() {
     let frame = root_uniform(64.0, 32.0, 2.0);
     let draw = GeometryDrawGpu {
         id: GeometryId::for_test(0, 1),
-        chunk: 0,
+        range: 0..3,
         transform: Transform::scale(3.0, 4.0),
         color: resolver()
             .resolve(Color::srgb(1.0, 0.0, 0.0, 1.0))
@@ -336,7 +336,7 @@ fn geometry_root_without_clip_uses_the_viewport() {
     let frame = root_uniform(64.0, 32.0, 1.0);
     let draw = GeometryDrawGpu {
         id: GeometryId::for_test(0, 1),
-        chunk: 0,
+        range: 0..3,
         transform: Transform::IDENTITY,
         color: resolver().resolve(Color::WHITE).to_array(),
         snapshot: test_snapshot(),
@@ -609,11 +609,7 @@ fn ops_outside_the_damage_are_skipped() {
     // 几何 op 会 flush 当前实例段 ⇒ 后面那个 quad 落进独立的 op。
     assert!(scene.push(
         lane,
-        Primitive::Geometry(GeometryDraw {
-            id,
-            transform: Transform::IDENTITY,
-            color: Color::WHITE,
-        })
+        Primitive::Geometry(GeometryDraw::full(id, Transform::IDENTITY, Color::WHITE))
     ));
     assert!(scene.push(
         lane,
@@ -809,11 +805,11 @@ fn geometry_ui_triangle_renders_white() {
         })
         .expect("注册几何");
 
-    let scene = one_lane_scene(Primitive::Geometry(GeometryDraw {
+    let scene = one_lane_scene(Primitive::Geometry(GeometryDraw::full(
         id,
-        transform: Transform::IDENTITY,
-        color: Color::WHITE,
-    }));
+        Transform::IDENTITY,
+        Color::WHITE,
+    )));
     let mut encoder = InstanceEncoder::new();
     let buffer = encoder
         .encode(&scene, Scale::ONE, resolver(), &store)
@@ -870,11 +866,11 @@ fn geometry_incremental_page_upload_updates_pixels() {
         })
         .expect("注册几何");
     let scene = || {
-        one_lane_scene(Primitive::Geometry(GeometryDraw {
+        one_lane_scene(Primitive::Geometry(GeometryDraw::full(
             id,
-            transform: Transform::IDENTITY,
-            color: Color::WHITE,
-        }))
+            Transform::IDENTITY,
+            Color::WHITE,
+        )))
     };
     let mut timings = FrameTimings::new();
 

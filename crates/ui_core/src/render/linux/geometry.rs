@@ -573,7 +573,7 @@ mod tests {
         let snapshot_vertex_len = snapshot.vertex_len();
         let draw = GeometryDrawGpu {
             id,
-            chunk: 0,
+            range: 0..3,
             transform: Transform::IDENTITY,
             color: [1.0; 4],
             snapshot,
@@ -608,7 +608,7 @@ mod tests {
         let snapshot = store.snapshot_arc(id).expect("快照");
         let draw = GeometryDrawGpu {
             id,
-            chunk: 0,
+            range: 0..3,
             transform: Transform::IDENTITY,
             color: [1.0; 4],
             snapshot,

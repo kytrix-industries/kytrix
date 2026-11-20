@@ -707,11 +707,14 @@ pub(crate) struct InstanceBuffer {
 #[derive(Clone, Debug)]
 pub(crate) struct GeometryDrawGpu {
     pub id: crate::paint::geometry::GeometryId,
-    /// 本 op 画几何的第几块（块在索引缓冲里连续；绘制范围来自 `snapshot.chunks()[chunk]`）。
+    /// 本 op 的绘制区间（**索引元素**、半开，已在 UI 线程按 `GeometryDraw.range` ∩ 块表裁剪）。
     ///
-    /// 整块几何绘制（`Canvas::push_geometry` / `Path`）由编码器展开成每块一个 op；
-    /// 几何节点的多 lane 分块让每块 lane 只编码自己的 op（X5）。
-    pub chunk: u32,
+    /// E4 / §11.4：这一条区间就是三端 `DrawIndexed` 的 `first_index .. first_index + count`，
+    /// 三个 GPU encoder 不再各自查块表（同一份数据契约，I2）。整块几何绘制
+    /// （`Canvas::push_geometry` / `Path`）由编码器展开成每块一个 op；几何节点的多 lane 分块让
+    /// 每块 lane 只编码自己的 op（X5）。空区间只出现在「未注册句柄」的兜底 op 上（GPU 侧由
+    /// `GeometryRegistry::prepare` 报 `GeometryRegister`）。
+    pub range: std::ops::Range<u32>,
     pub transform: Transform,
     /// linear premultiplied RGBA（`draw.color0`）。
     pub color: [f32; 4],
@@ -721,6 +724,46 @@ pub(crate) struct GeometryDrawGpu {
     /// 绘制项上，GPU 线程按 `(index, generation)` 缓存自己的缓冲，按页 `ptr_eq` 增量上传，
     /// 既不需要额外的跨线程注册通道，也让「注册后第一帧」自然完成上传。
     pub snapshot: std::sync::Arc<crate::paint::geometry::GeometrySnapshot>,
+}
+
+impl GeometryDrawGpu {
+    /// 三端 GPU encoder 的**唯一**绘制区间入口：校验裁剪后的区间落在已上传的索引缓冲内。
+    ///
+    /// 返回值的语义固定为 `DrawIndexed(first_index = range.start, count = range.end - start)`
+    /// （Metal 的 `indexBufferOffset` 要再乘 `index_type.size()`）。三个后端因此消费同一份
+    /// 区间，不存在「某端自己再和块表求交」的漂移余地。
+    ///
+    /// # Errors
+    /// [`EngineError::GeometryRegister`]：区间为空（不应产生 op）或越过已上传的 `index_count`
+    /// —— 都是**引擎内部不变量被破坏**的强类型错误，绝不静默越界读。
+    pub(crate) fn draw_range(
+        &self,
+        uploaded_index_count: u32,
+    ) -> Result<std::ops::Range<u32>, EngineError> {
+        if self.range.is_empty() {
+            return Err(EngineError::GeometryRegister {
+                detail: smol_str::format_smolstr!(
+                    "geometry {}:{} has an empty draw range {}..{}",
+                    self.id.index(),
+                    self.id.generation(),
+                    self.range.start,
+                    self.range.end
+                ),
+            });
+        }
+        if self.range.end > uploaded_index_count {
+            return Err(EngineError::GeometryRegister {
+                detail: smol_str::format_smolstr!(
+                    "geometry {}:{} draw range {}..{} exceeds uploaded index count {uploaded_index_count}",
+                    self.id.index(),
+                    self.id.generation(),
+                    self.range.start,
+                    self.range.end
+                ),
+            });
+        }
+        Ok(self.range.clone())
+    }
 }
 
 impl InstanceBuffer {
@@ -1678,6 +1721,18 @@ impl InstanceEncoder {
                 }
             }
         }
+        // 几何表不变量（E4）：绘制区间必须是合法的半开区间，且非空区间不得越过快照的索引长度。
+        // 空区间只允许出现在「未注册句柄」的兜底 op 上（GPU 侧由 prepare 报 `GeometryRegister`）。
+        for draw in &buffer.geometry {
+            debug_assert!(
+                draw.range.start <= draw.range.end,
+                "geometry draw range must be a half-open interval"
+            );
+            debug_assert!(
+                draw.range.is_empty() || draw.range.end <= draw.snapshot.index_count(),
+                "geometry draw range must stay inside the snapshot index buffer"
+            );
+        }
         // 段表不变量：范围在环内、绘制项与段长一致、段之间不重叠。
         //
         // 注意：段表里可以有**不在本帧绘制序**的段（lane 被 `Scene::release_lane` 释放、
@@ -2080,13 +2135,20 @@ impl LaneEncoder<'_> {
                 self.flush_run();
                 let color = self.colors.resolve(&self.resolver, path.fill).to_array();
                 // Path 的顶点在逻辑窗口空间、无 per-primitive 变换（`Path` 没有 transform
-                // 字段）；damage 用它自己的 bounds 而不是 clip AABB（R05-19）。
-                self.push_geometry_op(path.geometry, Transform::IDENTITY, color, Some(path.bounds));
+                // 字段）；damage 用它自己的 bounds 而不是 clip AABB（R05-19）。Path 没有
+                // range（三角化网格一次性注册）⇒ 整份几何。
+                self.push_geometry_op(
+                    path.geometry,
+                    Transform::IDENTITY,
+                    color,
+                    crate::paint::geometry::FULL_INDEX_RANGE,
+                    Some(path.bounds),
+                );
             }
             Primitive::Geometry(draw) => {
                 self.flush_run();
                 let color = self.colors.resolve(&self.resolver, draw.color).to_array();
-                self.push_geometry_op(draw.id, draw.transform, color, None);
+                self.push_geometry_op(draw.id, draw.transform, color, draw.range.clone(), None);
             }
             Primitive::Canvas(canvas) => {
                 debug_assert_eq!(canvas_depth, 0, "Canvas nesting depth must be <= 1");
@@ -2263,10 +2325,14 @@ impl LaneEncoder<'_> {
 
     /// 追加一次几何绘制（每帧生成 op 表时按绘制序复制进 `InstanceBuffer::geometry`）。
     ///
-    /// **分块展开**：几何数据按固定块大小切分（`GEOMETRY_CHUNK_INDICES`），这里每块发一个
-    /// `LanePart::Geometry` / `FrameOp::Geometry`（绘制范围 = 块的索引区间）。块在索引缓冲里
-    /// 连续，因此逐块绘制与整段绘制的像素结果完全一致；好处是失效/上传可以按块/页进行
-    /// （几何节点的多 lane 分块在此基础上让「追加只重建尾块」成立）。
+    /// **range ∩ 块表**（E4 / §11.4）：绘制区间按索引元素给出，这里与快照块表求交后**逐块**
+    /// 展开成 `LanePart::Geometry`（每块一个 op，块间顺序 = 索引顺序；块在索引缓冲里连续，
+    /// 因此逐块绘制与整段绘制的像素结果完全一致）。不相交的块不产生 op，空 range ⇒ 零 op、
+    /// 零上传、零 draw call。逐块的好处是失效/上传可以按块/页进行（几何节点的多 lane 分块在
+    /// 此基础上让「追加只重建尾块」成立）。
+    ///
+    /// `range`：应用的索引子区间（`Path` 恒整份 = `FULL_INDEX_RANGE`）。块 lane 只遍历自己
+    /// 那一块（`chunk_scope` 快速路径），整块几何绘制（Canvas / Path）遍历全部块。
     ///
     /// `op_bounds`：给定则用它（`Path` 自带逻辑 AABB），否则用**块 AABB**（`snapshot.chunks`，
     /// 由引擎按顶点位置现算）；块的 AABB 为空（退化几何：全零顶点）时退回整块几何的
@@ -2279,6 +2345,7 @@ impl LaneEncoder<'_> {
         id: crate::paint::geometry::GeometryId,
         transform: Transform,
         color: [f32; 4],
+        range: std::ops::Range<u32>,
         op_bounds: Option<Rect>,
     ) {
         let registered = self.geometry_snapshot(id);
@@ -2288,39 +2355,36 @@ impl LaneEncoder<'_> {
         // 块 lane（几何节点的一条块 lane）只发它自己那一块；整块几何绘制（Canvas/Path）展开全部块。
         let scope = self.chunk_scope.filter(|(scoped, _)| *scoped == id);
         let mut emitted = 0usize;
-        let mut push_part =
-            |emitted: &mut usize, chunk: u32, bounds: Rect, snapshot: std::sync::Arc<_>| {
-                let visible =
-                    visible_aabb(transformed_aabb(transform, bounds), self.scale, clip_aabb);
-                self.parts.push(LanePart::Geometry(Box::new(LaneGeometry {
-                    draw: GeometryDrawGpu {
-                        id,
-                        chunk,
-                        transform,
-                        color,
-                        snapshot,
-                    },
-                    clip_index,
-                    clip_rect,
-                    bounds: bounds_of_aabb(visible),
-                })));
-                *emitted += 1;
-            };
+        let mut push_part = |emitted: &mut usize,
+                             clipped: std::ops::Range<u32>,
+                             bounds: Rect,
+                             snapshot: std::sync::Arc<_>| {
+            let visible = visible_aabb(transformed_aabb(transform, bounds), self.scale, clip_aabb);
+            self.parts.push(LanePart::Geometry(Box::new(LaneGeometry {
+                draw: GeometryDrawGpu {
+                    id,
+                    range: clipped,
+                    transform,
+                    color,
+                    snapshot,
+                },
+                clip_index,
+                clip_rect,
+                bounds: bounds_of_aabb(visible),
+            })));
+            *emitted += 1;
+        };
         match (&registered, scope) {
             // 块 lane：只编码本块（块 AABB 为空时退回整块几何 bounds，保持旧可见范围）。
             (Some(snapshot), Some((_, chunk))) => {
-                if let Some(meta) = snapshot.chunk(chunk) {
-                    let local = match (op_bounds, meta.bounds.is_empty()) {
-                        (Some(bounds), _) => bounds,
-                        (None, false) => meta.bounds,
-                        (None, true) => snapshot.bounds(),
-                    };
-                    push_part(&mut emitted, chunk, local, std::sync::Arc::clone(snapshot));
-                }
-            }
-            (Some(snapshot), None) => {
-                // 快照的块表是绘制序的权威来源；空块表只可能来自未注册兜底（不会走到这里）。
-                for (chunk, meta) in snapshot.chunks().iter().enumerate() {
+                if let Some(meta) = snapshot.chunk(chunk)
+                    && let Some(clipped) = crate::paint::geometry::chunk_draw_range(
+                        snapshot.topology(),
+                        snapshot.index_count(),
+                        meta,
+                        range,
+                    )
+                {
                     let local = match (op_bounds, meta.bounds.is_empty()) {
                         (Some(bounds), _) => bounds,
                         (None, false) => meta.bounds,
@@ -2328,7 +2392,31 @@ impl LaneEncoder<'_> {
                     };
                     push_part(
                         &mut emitted,
-                        chunk as u32,
+                        clipped,
+                        local,
+                        std::sync::Arc::clone(snapshot),
+                    );
+                }
+            }
+            (Some(snapshot), None) => {
+                // 快照的块表是绘制序的权威来源；空块表只可能来自未注册兜底（不会走到这里）。
+                for meta in snapshot.chunks() {
+                    let Some(clipped) = crate::paint::geometry::chunk_draw_range(
+                        snapshot.topology(),
+                        snapshot.index_count(),
+                        meta,
+                        range.clone(),
+                    ) else {
+                        continue;
+                    };
+                    let local = match (op_bounds, meta.bounds.is_empty()) {
+                        (Some(bounds), _) => bounds,
+                        (None, false) => meta.bounds,
+                        (None, true) => snapshot.bounds(),
+                    };
+                    push_part(
+                        &mut emitted,
+                        clipped,
                         local,
                         std::sync::Arc::clone(snapshot),
                     );
@@ -2337,7 +2425,8 @@ impl LaneEncoder<'_> {
             // 未注册：拿不到真实范围，保守地用 clip 上界（GPU 侧会报 GeometryRegister）。
             (None, _) => push_part(
                 &mut emitted,
-                0,
+                // 空区间只用于这条兜底 op：GPU 侧 `prepare` 会先报 `GeometryRegister`。
+                0..0,
                 op_bounds.unwrap_or_else(|| {
                     Rect::new(
                         clip_aabb[0],
@@ -3852,11 +3941,11 @@ mod tests {
         ));
         assert!(scene.push(
             lane,
-            Primitive::Geometry(GeometryDraw {
-                id: geometry,
-                transform: Transform::IDENTITY,
-                color: crate::paint::color::Color::WHITE,
-            }),
+            Primitive::Geometry(GeometryDraw::full(
+                geometry,
+                Transform::IDENTITY,
+                crate::paint::color::Color::WHITE,
+            )),
         ));
         assert!(scene.push(lane, Primitive::Clip(ClipOp::Pop)));
         scene.set_order(&[lane]);
@@ -3906,11 +3995,11 @@ mod tests {
         let lane = scene.new_lane();
         assert!(scene.push(
             lane,
-            Primitive::Geometry(GeometryDraw {
+            Primitive::Geometry(GeometryDraw::full(
                 id,
-                transform: Transform::translate(5.0, 5.0),
-                color: crate::paint::color::Color::WHITE,
-            }),
+                Transform::translate(5.0, 5.0),
+                crate::paint::color::Color::WHITE,
+            )),
         ));
         scene.set_order(&[lane]);
 
@@ -3958,11 +4047,11 @@ mod tests {
         let lane = scene.new_lane();
         assert!(scene.push(
             lane,
-            Primitive::Geometry(GeometryDraw {
+            Primitive::Geometry(GeometryDraw::full(
                 id,
-                transform: Transform::IDENTITY,
-                color: crate::paint::color::Color::WHITE,
-            }),
+                Transform::IDENTITY,
+                crate::paint::color::Color::WHITE,
+            )),
         ));
         scene.set_order(&[lane]);
         let mut encoder = InstanceEncoder::new();
@@ -3978,6 +4067,203 @@ mod tests {
         assert_eq!(draw.snapshot.index_len(), 6);
     }
 
+    // ── E4：`GeometryDraw.range` 的逐块展开（§11.4）──────────────────────────
+
+    /// 注册 `triangles` 个独立三角形（每 4096 个三角形一块），返回 store 与句柄。
+    fn register_triangles(
+        triangles: u32,
+    ) -> (crate::paint::geometry_store::GeometryStore, GeometryId) {
+        let mut vertices = Vec::with_capacity(triangles as usize * 36);
+        let mut indices = Vec::with_capacity(triangles as usize * 6);
+        for triangle in 0..triangles {
+            let base = (triangle * 3) as u16;
+            let x = (triangle % 64) as f32;
+            let y = (triangle / 64) as f32;
+            for (dx, dy) in [(0.0f32, 0.0f32), (1.0, 0.0), (0.0, 1.0)] {
+                vertices.extend_from_slice(&(x + dx).to_ne_bytes());
+                vertices.extend_from_slice(&(y + dy).to_ne_bytes());
+                vertices.extend_from_slice(&(-1.0f32).to_ne_bytes());
+            }
+            for index in [base, base + 1, base + 2] {
+                indices.extend_from_slice(&index.to_ne_bytes());
+            }
+        }
+        let mut store = crate::paint::geometry_store::GeometryStore::new();
+        let id = store
+            .insert(crate::paint::geometry::GeometryDesc {
+                vertex_bytes: bytes::Bytes::from(vertices),
+                index_bytes: bytes::Bytes::from(indices),
+                vertex_stride: crate::paint::geometry::GeometryPipeline::Ui.vertex_stride(),
+                index_type: crate::paint::geometry::IndexType::U16,
+                topology: crate::paint::geometry::Topology::TriangleList,
+                bounds: Rect::new(0.0, 0.0, 64.0, 100.0),
+                pipeline: crate::paint::geometry::GeometryPipeline::Ui,
+            })
+            .expect("注册几何");
+        (store, id)
+    }
+
+    /// 编码结果里与 E4 相关的断言面（几何 op 数 / 每 op 的绘制区间 / 块计数）。
+    struct GeometryEncoded {
+        ops: Vec<super::FrameOp>,
+        ranges: Vec<std::ops::Range<u32>>,
+        encoded_chunks: usize,
+    }
+
+    fn encode_geometry(
+        scene: &Scene,
+        store: &crate::paint::geometry_store::GeometryStore,
+    ) -> GeometryEncoded {
+        let mut encoder = InstanceEncoder::new();
+        let (ops, ranges) = {
+            let buffer = encoder
+                .encode(scene, scale(), resolver(), store)
+                .expect("encode geometry scene");
+            (
+                buffer.ops.clone(),
+                buffer
+                    .geometry
+                    .iter()
+                    .map(|draw| draw.range.clone())
+                    .collect(),
+            )
+        };
+        GeometryEncoded {
+            ops,
+            ranges,
+            encoded_chunks: encoder.encoded_geometry_chunks(),
+        }
+    }
+
+    fn range_draw(id: GeometryId, range: std::ops::Range<u32>) -> Primitive {
+        Primitive::Geometry(GeometryDraw {
+            id,
+            transform: Transform::IDENTITY,
+            color: Color::WHITE,
+            range,
+        })
+    }
+
+    /// range ∩ 块表 ⇒ 每块一个 op，块间顺序 = 索引顺序；单块内子区间只画一块。
+    #[test]
+    fn geometry_range_expands_to_one_op_per_intersecting_chunk() {
+        // 4096 三角形 + 3 三角形 = 12297 个索引 ⇒ 两块（块 1 = 12288..12297）。
+        let (store, id) = register_triangles(4096 + 3);
+
+        // 整份哨兵：两块都画，尾块按索引长度（12297）裁剪。
+        let scene = scene_with(|scene, lane| {
+            assert!(scene.push(lane, range_draw(id, 0..u32::MAX)));
+        });
+        let encoded = encode_geometry(&scene, &store);
+        assert_eq!(encoded.ops.len(), 2, "整份几何 = 两块 = 两个几何 op");
+        assert_eq!(encoded.ranges, vec![0..12288, 12288..12297]);
+        assert_eq!(encoded.encoded_chunks, 2);
+
+        // 跨块子区间：块 0 的尾部 3 个索引 + 块 1 的头部 6 个索引（块间顺序 = 索引序）。
+        let scene = scene_with(|scene, lane| {
+            assert!(scene.push(lane, range_draw(id, 12285..12294)));
+        });
+        let encoded = encode_geometry(&scene, &store);
+        assert_eq!(encoded.ranges, vec![12285..12288, 12288..12294]);
+
+        // 单块内子区间：只画一块。
+        let scene = scene_with(|scene, lane| {
+            assert!(scene.push(lane, range_draw(id, 6..12)));
+        });
+        let encoded = encode_geometry(&scene, &store);
+        assert_eq!(encoded.ranges, vec![6..12]);
+        assert_eq!(encoded.ops.len(), 1);
+    }
+
+    /// 空 range / 越界 start / 与块不相交 ⇒ 零 op、零块计数（不产生命令、不产生 damage 锚点）。
+    #[test]
+    fn empty_geometry_ranges_produce_no_op() {
+        let (store, id) = register_triangles(3);
+        for range in [6..6, std::ops::Range { start: 9, end: 3 }, 0..0, 9..12] {
+            let scene = scene_with(|scene, lane| {
+                assert!(scene.push(lane, range_draw(id, range.clone())));
+            });
+            let encoded = encode_geometry(&scene, &store);
+            assert!(
+                encoded.ops.is_empty(),
+                "range {range:?} 不得产生几何 op：{:?}",
+                encoded.ranges
+            );
+            assert!(encoded.ranges.is_empty());
+            assert_eq!(encoded.encoded_chunks, 0);
+        }
+    }
+
+    /// `TriangleList` 的非对齐 range 在生产路径截到整三角形（不产生非法 draw）。
+    #[test]
+    fn unaligned_triangle_list_range_is_clamped_to_whole_triangles() {
+        let (store, id) = register_triangles(4);
+        let scene = scene_with(|scene, lane| {
+            assert!(scene.push(lane, range_draw(id, 0..10)));
+        });
+        let encoded = encode_geometry(&scene, &store);
+        assert_eq!(encoded.ranges, vec![0..9], "10 个索引只能画 3 个三角形");
+    }
+
+    /// 多 draw 同 geometry、不同 range：各自独立裁剪，op 顺序 = 绘制序。
+    #[test]
+    fn multiple_draws_of_one_geometry_keep_their_own_ranges() {
+        let (store, id) = register_triangles(4096 + 3);
+        let scene = scene_with(|scene, lane| {
+            for range in [0..6, 12288..12291, 6..6] {
+                assert!(scene.push(lane, range_draw(id, range)));
+            }
+        });
+        let encoded = encode_geometry(&scene, &store);
+        assert_eq!(
+            encoded.ranges,
+            vec![0..6, 12288..12291],
+            "空 range 的 draw 不产生 op，其余保持绘制序"
+        );
+        assert_eq!(encoded.ops.len(), 2);
+    }
+
+    /// `Path` 没有 range（三角化网格整份）⇒ 仍按块展开（回归：E4 不改变 Path 的逐块绘制）。
+    #[test]
+    fn path_draws_every_chunk() {
+        let (store, id) = register_triangles(4096 + 3);
+        let scene = scene_with(|scene, lane| {
+            assert!(scene.push(
+                lane,
+                Primitive::Path(crate::paint::primitive::Path {
+                    bounds: rect(0.0, 0.0, 10.0, 10.0),
+                    geometry: id,
+                    fill: Color::WHITE,
+                })
+            ));
+        });
+        let encoded = encode_geometry(&scene, &store);
+        assert_eq!(encoded.ranges, vec![0..12288, 12288..12297]);
+    }
+
+    /// 三端 encoder 的唯一 range 入口：空区间 / 越过已上传索引数都是强类型错误（不静默越界读）。
+    #[test]
+    fn gpu_draw_range_validates_against_the_uploaded_index_count() {
+        let (store, id) = register_triangles(3);
+        let snapshot = store.snapshot_arc(id).expect("快照");
+        let draw = |range: std::ops::Range<u32>| crate::paint::instance::GeometryDrawGpu {
+            id,
+            range,
+            transform: Transform::IDENTITY,
+            color: [1.0; 4],
+            snapshot: Arc::clone(&snapshot),
+        };
+        assert_eq!(draw(3..9).draw_range(9).expect("合法区间"), 3..9);
+        assert!(
+            draw(3..10).draw_range(9).is_err(),
+            "越过已上传的索引数必须报 GeometryRegister，不得静默越界读"
+        );
+        assert!(
+            draw(3..3).draw_range(9).is_err(),
+            "空区间不应出现在几何 op 表里"
+        );
+    }
+
     #[test]
     fn frame_ops_preserve_order() {
         let geometry = GeometryId::for_test(0, 1);
@@ -3986,11 +4272,11 @@ mod tests {
         assert!(scene.push(lane, quad_primitive(solid())));
         assert!(scene.push(
             lane,
-            Primitive::Geometry(GeometryDraw {
-                id: geometry,
-                transform: Transform::IDENTITY,
-                color: crate::paint::color::Color::WHITE,
-            }),
+            Primitive::Geometry(GeometryDraw::full(
+                geometry,
+                Transform::IDENTITY,
+                crate::paint::color::Color::WHITE,
+            )),
         ));
         assert!(scene.push(lane, quad_primitive(solid())));
         scene.set_order(&[lane]);

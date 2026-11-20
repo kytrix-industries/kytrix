@@ -744,11 +744,7 @@ mod tests {
         let root = app.app().window(window).expect("窗口存在").tree().root();
         let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 40.0, 40.0));
         for id in geometries {
-            canvas.push_geometry(GeometryDraw {
-                id: *id,
-                transform: Transform::IDENTITY,
-                color: Color::WHITE,
-            });
+            canvas.push_geometry(GeometryDraw::full(*id, Transform::IDENTITY, Color::WHITE));
         }
         NodeBuilder::canvas(canvas)
             .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
@@ -858,11 +854,11 @@ mod tests {
         // 换成只引用 second 的内容。
         let window = app.window_id();
         let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 40.0, 40.0));
-        canvas.push_geometry(GeometryDraw {
-            id: second,
-            transform: Transform::IDENTITY,
-            color: Color::WHITE,
-        });
+        canvas.push_geometry(GeometryDraw::full(
+            second,
+            Transform::IDENTITY,
+            Color::WHITE,
+        ));
         assert!(
             app.app_mut()
                 .window_mut(window)
@@ -1125,10 +1121,94 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(ops.len(), 1, "截断后 Canvas 内几何只应展开 1 块：{ops:?}");
-        assert_eq!(ops[0].chunk, 0);
+        assert_eq!(
+            ops[0].range,
+            0..12288,
+            "整块几何绘制的绘制区间 = 截断后唯一的块（E4：op 携带裁剪后的 range）"
+        );
         assert!(
             ops[0].snapshot.revision() > 0 && !ops[0].snapshot.vertex_pages().is_empty(),
             "Canvas 内几何 op 必须携带截断后的真实快照"
         );
+    }
+
+    /// E4 / §11.4：Canvas 内 `GeometryDraw.range` 切换子区间 ⇒ 只编码新 range 相交的块；
+    /// damage 覆盖画布旧 ∪ 新范围且**不是整帧**（子范围变化不损伤整个窗口）。
+    #[test]
+    fn canvas_geometry_range_change_reencodes_and_damages_locally() {
+        let mut app = TestApp::new();
+        let id = register_long(&mut app, 4096 + 10);
+        let node = mount_canvas(&mut app, &[id]);
+        let _ = app.drain().expect("首帧");
+        let ranges = |app: &TestApp| -> Vec<std::ops::Range<u32>> {
+            let window = app.window_id();
+            app.app()
+                .window(window)
+                .expect("窗口存在")
+                .encoded_geometry()
+                .iter()
+                .filter(|draw| draw.id == id)
+                .map(|draw| draw.range.clone())
+                .collect()
+        };
+        assert_eq!(
+            ranges(&app),
+            vec![0..12288, 12288..12318],
+            "整份绘制的 Canvas 内几何按块展开（E4：每 op 携带本块的裁剪后区间）"
+        );
+        clear_dirty(&mut app);
+
+        // 换成只画第二块；画布 AABB 覆盖整份几何（Canvas 契约：bounds ⊇ 内部图元 bounds）。
+        let window = app.window_id();
+        let canvas_bounds = Rect::new(0.0, 0.0, 64.0, 100.0);
+        let mut canvas = Canvas::new(canvas_bounds);
+        canvas.push_geometry(GeometryDraw {
+            id,
+            transform: Transform::IDENTITY,
+            color: Color::WHITE,
+            range: 12288..12318,
+        });
+        assert!(
+            app.app_mut()
+                .window_mut(window)
+                .expect("窗口存在")
+                .set_canvas(node, canvas)
+                .expect("窗口存在"),
+            "Canvas 内容必须替换成功"
+        );
+        let record = app.drain().expect("range 变更帧");
+        assert!(record.rendered, "range 变更必须提交一帧");
+        assert!(!record.damage_full, "子范围变更的 damage 不得整帧");
+        assert!(
+            damage_hits(&record.damage, 5.0, 65.0),
+            "新 range 的可见范围必须进 damage（旧画布 AABB ∪ 新画布 AABB）：{:?}",
+            record.damage
+        );
+        assert_eq!(
+            ranges(&app),
+            vec![12288..12318],
+            "只编码新 range 相交的块（不相交的块不产生 op）"
+        );
+
+        // 空 range：该 draw 不产生任何几何 op，但旧像素必须由画布 damage 重画。
+        let mut canvas = Canvas::new(canvas_bounds);
+        canvas.push_geometry(GeometryDraw {
+            id,
+            transform: Transform::IDENTITY,
+            color: Color::WHITE,
+            range: 6..6,
+        });
+        assert!(
+            app.app_mut()
+                .window_mut(window)
+                .expect("窗口存在")
+                .set_canvas(node, canvas)
+                .expect("窗口存在"),
+            "Canvas 内容必须替换成功"
+        );
+        let record = app.drain().expect("空 range 帧");
+        assert!(record.rendered, "旧 range 的像素必须重画（damage 非空）");
+        assert!(!record.damage_full, "空 range 变更同样不得整帧");
+        assert!(ranges(&app).is_empty(), "空 range 的 draw 不产生几何 op");
     }
 }

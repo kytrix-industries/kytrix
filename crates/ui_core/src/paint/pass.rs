@@ -940,6 +940,30 @@ fn geometry_chunk_local_bounds(
     })
 }
 
+/// 块 lane 的绘制区间（索引元素，半开）：本块在索引缓冲里的区间按 §11.4 的 range 语义裁剪。
+///
+/// 未注册句柄 / 缺失块返回**空区间**（`GeometryDraw.range` 空 = 不绘制）：缺失块本来就没有
+/// 内容可画，空区间让编码器不产生 op；未注册句柄的错误路径不变（编码器以 `missing_snapshot`
+/// 报 `GeometryRegister`）。
+fn geometry_chunk_draw_range(
+    snapshot: Option<&std::sync::Arc<crate::paint::geometry::GeometrySnapshot>>,
+    chunk: usize,
+) -> std::ops::Range<u32> {
+    let Some(snapshot) = snapshot else {
+        return 0..0;
+    };
+    let Some(meta) = snapshot.chunk(chunk as u32) else {
+        return 0..0;
+    };
+    crate::paint::geometry::chunk_draw_range(
+        snapshot.topology(),
+        snapshot.index_count(),
+        meta,
+        crate::paint::geometry::FULL_INDEX_RANGE,
+    )
+    .unwrap_or_default()
+}
+
 /// 几何节点不可见 / 零尺寸：释放全部块 lane、清空块状态，并把旧块范围并入 damage。
 fn clear_geometry_lanes(
     context: &mut PaintContext<'_>,
@@ -1166,7 +1190,12 @@ fn paint_geometry_node(
         if chunk == 0 {
             emitter.emit_decorations(context, opacity);
         }
-        emitter.emit_geometry_chunk(context, geometry_id, chunk as u32, opacity);
+        emitter.emit_geometry_chunk(
+            context,
+            geometry_id,
+            geometry_chunk_draw_range(snapshot.as_ref(), chunk),
+            opacity,
+        );
         if chunk == 0 {
             emitter.emit_focus_ring(context, opacity);
             emitter.emit_node_damage(context);
@@ -1587,18 +1616,18 @@ impl PrimitiveEmitter {
         }
     }
 
-    /// 几何块的内容：内容 clip 括号 + 一条 Primitive::Geometry（X5 的块 lane 内容）。
+    /// 几何块的内容：内容 clip 括号 + 一条 `Primitive::Geometry`（X5 的块 lane 内容）。
     ///
-    /// chunk 是块号（编码器据此只发该块的 draw range）；paint_geometry_node 已把旧/新块
+    /// `range` 是本块在索引缓冲里的绘制区间（索引元素、半开；E4 / §11.4），空区间 = 本块没有
+    /// 可画内容（`truncate` 到 0 块）⇒ 编码器不产生几何 op；paint_geometry_node 已把旧/新块
     /// bounds 的 damage 记好，这里只负责「画什么」。
     fn emit_geometry_chunk(
         &mut self,
         context: &mut PaintContext<'_>,
         id: crate::paint::geometry::GeometryId,
-        chunk: u32,
+        range: std::ops::Range<u32>,
         opacity: f32,
     ) {
-        let _ = chunk;
         let content_clip = self.content_clip.map(|rect| ClipRect {
             rect,
             corner_radius: [0.0; 4],
@@ -1618,6 +1647,7 @@ impl PrimitiveEmitter {
                     .foreground
                     .unwrap_or(Color::WHITE)
                     .with_opacity(opacity),
+                range,
             }),
         );
         if content_clip.is_some() {
@@ -3053,6 +3083,98 @@ mod tests {
                 "每条块 lane 恰好一条几何绘制"
             );
         }
+        // E4 / §11.4：每条块 lane 的 `GeometryDraw.range` = 本块在索引缓冲里的区间（块间 = 索引序）。
+        let ranges: Vec<std::ops::Range<u32>> = [first, second]
+            .iter()
+            .map(|lane| {
+                let primitives = h.scene.lane_primitives(*lane).expect("lane 活着");
+                match primitives
+                    .iter()
+                    .find(|primitive| matches!(primitive, Primitive::Geometry(_)))
+                {
+                    Some(Primitive::Geometry(draw)) => draw.range.clone(),
+                    _ => panic!("块 lane 必须有几何绘制"),
+                }
+            })
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                0..crate::paint::geometry::GEOMETRY_CHUNK_INDICES,
+                12288..12318
+            ],
+            "块 lane 只携带本块的索引区间（尾块按实际索引数）"
+        );
+    }
+
+    /// E4 / §11.4：几何变短（`truncate_geometry`）时块 lane 的 range 收缩 ⇒ damage =
+    /// **受影响块**的旧 ∪ 新 AABB（不是整帧，也不是整个几何 bounds），且多画的那块 lane 被释放。
+    #[test]
+    fn geometry_truncation_damages_only_the_removed_chunk_bounds() {
+        let mut h = Harness::new();
+        // 两块：块 0 = 4096 个三角形（y ∈ 0..64），块 1 = 10 个三角形（y ∈ 64..65）。
+        let id = h
+            .geometry
+            .insert(long_geometry(4096 + 10))
+            .expect("注册两块几何");
+        let node = mount_geometry(&mut h, id, Clip::None);
+        h.paint();
+        let old_tail = h
+            .geometry
+            .snapshot_arc(id)
+            .expect("快照")
+            .chunk(1)
+            .expect("块 1")
+            .bounds;
+        assert!(
+            old_tail.origin.y >= 64.0,
+            "尾块的旧 AABB 必须在块的 y 段上：{old_tail:?}"
+        );
+
+        // 截断到一块（4096 个三角形 = 12288 顶点 / 索引）。
+        let update = h
+            .geometry
+            .truncate(id, 4096 * 3, crate::paint::geometry::GEOMETRY_CHUNK_INDICES)
+            .expect("截断成一块");
+        assert!(
+            !update.damaged.is_empty(),
+            "被移除的块必须有 store 级 damage"
+        );
+        h.tree.mark_geometry_updated(id);
+        let report = h.paint_incremental(&[node]);
+
+        assert!(
+            !report.damage.full,
+            "块级 range 收缩是局部 damage，不得退化为整帧"
+        );
+        assert_eq!(h.tree.lane_count(node), 1, "截断后只剩一条块 lane");
+        let rects = h.damage.rects();
+        let hits = |x: i32, y: i32| {
+            rects
+                .iter()
+                .any(|rect| rect.x0 <= x && x < rect.x1 && rect.y0 <= y && y < rect.y1)
+        };
+        let probe_y = old_tail.origin.y as i32;
+        assert!(
+            hits(1, probe_y),
+            "被移除块的旧像素必须并入 damage（否则留残影）：{rects:?}"
+        );
+        // 新尾块（块 0）的尾部索引区间必须仍是 0..12288：range 收缩只影响被移除的那块。
+        let lane = h.tree.lane_at(node, 0).expect("块 0 lane");
+        let Some(Primitive::Geometry(draw)) = h
+            .scene
+            .lane_primitives(lane)
+            .expect("lane 活着")
+            .iter()
+            .find(|primitive| matches!(primitive, Primitive::Geometry(_)))
+        else {
+            panic!("块 0 lane 必须有几何绘制")
+        };
+        assert_eq!(
+            draw.range,
+            0..crate::paint::geometry::GEOMETRY_CHUNK_INDICES,
+            "保留下来的块仍画整块"
+        );
     }
 
     /// X5：几何数据只改尾块 ⇒ 增量帧只重建尾块 lane，前面的块一条都不动、绘制序不变。

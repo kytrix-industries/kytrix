@@ -417,7 +417,7 @@ mod tests {
                 &command,
                 &[GeometryDrawGpu {
                     id,
-                    chunk: 0,
+                    range: 0..3,
                     transform: Transform::IDENTITY,
                     color: [1.0; 4],
                     snapshot,
@@ -441,7 +441,7 @@ mod tests {
                 &command,
                 &[GeometryDrawGpu {
                     id,
-                    chunk: 0,
+                    range: 0..3,
                     transform: Transform::IDENTITY,
                     color: [1.0; 4],
                     snapshot,

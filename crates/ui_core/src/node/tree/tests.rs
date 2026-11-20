@@ -682,11 +682,7 @@ fn canvas_referenced_geometries_are_bound_and_unbound() {
     let first = GeometryId::for_test(1, 1);
     let second = GeometryId::for_test(2, 1);
     let third = GeometryId::for_test(3, 1);
-    let draw = |id| GeometryDraw {
-        id,
-        transform: crate::math::Transform::IDENTITY,
-        color: Color::WHITE,
-    };
+    let draw = |id| GeometryDraw::full(id, crate::math::Transform::IDENTITY, Color::WHITE);
     let path = |id| Path {
         bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
         geometry: id,

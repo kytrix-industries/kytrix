@@ -381,9 +381,10 @@ mod tests {
         id: GeometryId,
         snapshot: Arc<crate::paint::geometry::GeometrySnapshot>,
     ) -> GeometryDrawGpu {
+        let range = 0..snapshot.index_count();
         GeometryDrawGpu {
             id,
-            chunk: 0,
+            range,
             transform: Transform::IDENTITY,
             color: [1.0; 4],
             snapshot,

@@ -877,21 +877,8 @@ pub(super) fn draw_ops(
                             draw.id.generation()
                         ),
                     })?;
-                let chunk = draw.snapshot.chunk(draw.chunk).ok_or_else(|| {
-                    EngineError::GeometryRegister {
-                        detail: smol_str::format_smolstr!(
-                            "geometry {}:{} has no chunk {}",
-                            draw.id.index(),
-                            draw.id.generation(),
-                            draw.chunk
-                        ),
-                    }
-                })?;
+                let range = draw.draw_range(entry.index_count())?;
                 let uniform = geometry_root(root, draw.clone(), clip_index, clip_rect);
-                debug_assert!(
-                    chunk.index_first + chunk.index_count <= entry.index_count(),
-                    "geometry chunk range must stay inside the uploaded index buffer"
-                );
                 // SAFETY: 顶点/索引缓冲由 `GeometryRegistry` 持有到本帧结束；
                 // `entry.topology()` 与注册时的图元类型一致。
                 unsafe {
@@ -914,9 +901,10 @@ pub(super) fn draw_ops(
                     }
                     list.IASetVertexBuffers(0, Some(&[entry.vertex()]));
                     list.IASetIndexBuffer(Some(&entry.index()));
-                    // 分块绘制：块的索引区间是 `[index_first, index_first + index_count)`；
-                    // 顶点缓冲是**整块几何**的（块只切索引），因此 vertex offset 恒 0。
-                    list.DrawIndexedInstanced(chunk.index_count, 1, chunk.index_first, 0, 0);
+                    // E4 / §11.4：绘制区间 = UI 线程按 `GeometryDraw.range` ∩ 块表裁剪后的索引
+                    // 元素区间（`range.start .. range.end`）。顶点缓冲是**整块几何**的（块只切
+                    // 索引），因此 vertex offset 恒 0、blocks 顺序 = 索引序。
+                    list.DrawIndexedInstanced(range.end - range.start, 1, range.start, 0, 0);
                 }
                 draw_calls = draw_calls.saturating_add(1);
             }
