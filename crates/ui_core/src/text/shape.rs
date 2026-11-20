@@ -299,8 +299,9 @@ impl ShapedText {
     /// - 快速路径（[`SimpleShaped`]）：恒 `true`。`fast_path::eligibility` 已显式拒绝
     ///   `TextDirection::Rtl`（`Ineligible::Rtl`），所以走到这里的段落基准方向只可能是 LTR，
     ///   而 `fast_path::ALPHABET` 只有 ASCII 数字与 `. , + - % / :`（bidi 类 `EN` / `CS` / `ES` /
-    ///   `ET`，在 LTR 段落里全部是偶数 level）—— 不会形成 RTL run。`ALPHABET` 变化
-    ///   （例如加入 RTL 字母）时必须同步这里。
+    ///   `ET`，在 LTR 段落里全部是偶数 level）—— 不会形成 RTL run。这两个前提由 `fast_path` 的
+    ///   单测 `eligibility_rejects_rtl_paragraphs_and_the_alphabet_has_only_ascii` 守护
+    ///   （给 `ALPHABET` 加 RTL 字母、或放开 `Rtl` 拒绝时它真红），本分支只做防御性断言。
     pub(crate) fn has_only_ltr_runs(&self) -> bool {
         match &self.kind {
             ShapedKind::Parley(snapshot) => snapshot
@@ -308,7 +309,13 @@ impl ShapedText {
                 .layout
                 .lines()
                 .all(|line| line.runs().all(|run| !run.is_rtl())),
-            ShapedKind::Simple(_) => true,
+            ShapedKind::Simple(_) => {
+                debug_assert!(
+                    self.style.direction != TextDirection::Rtl,
+                    "Simple 快照不应带显式 RTL 段落方向（`eligibility` 应已拒绝）"
+                );
+                true
+            }
         }
     }
 
@@ -3317,19 +3324,22 @@ mod tests {
         }
     }
 
-    /// 快速路径快照（单行 ASCII 数字）永远没有 RTL run：`Simple` 分支的回答。ASCII 数字是
-    /// bidi 类 `EN`（偶数 level），快速路径的字符集也排除了 RTL 文本。
+    /// 数字文本（数字快速路径命中，或宿主字体拒绝后回退 parley）永远没有 RTL run。
+    ///
+    /// **不是** `Simple => true` 的证明（那是对常量的断言）：`Simple` 分支的前提由 `fast_path`
+    /// 的单测 `eligibility_rejects_rtl_paragraphs_and_the_alphabet_has_only_ascii` 守护
+    /// （`eligibility` 拒绝 `Rtl` + 字符集无强 RTL 字符），本用例只做字符串层面的端到端确认 ——
+    /// 两条 shape 路径都必须满足该不变量，因此**不按宿主字体跳过**。
     #[test]
-    fn the_digit_fast_path_snapshot_never_has_rtl_runs() {
+    fn numeric_text_never_has_rtl_runs() {
         let mut text_cx = crate::text::context::TextContext::new();
-        let content = TextContent::new("42150", TextStyle::new(16.0).with_wrap(TextWrap::NoWrap));
-        let shaped = text_cx.shape_cached(&content).0;
-        if text_cx.take_fast_path_stats().hits == 0 {
-            return; // 宿主字体拒绝快速路径（合法降级）：Simple 分支无从构造
+        for text in ["42150", "-1.50%", "1,234.56", "12/34:56"] {
+            let content = TextContent::new(text, TextStyle::new(16.0).with_wrap(TextWrap::NoWrap));
+            let shaped = text_cx.shape_cached(&content).0;
+            assert!(
+                shaped.has_only_ltr_runs(),
+                "{text:?} 是纯 ASCII 数字文本：无论走快速路径还是 parley，都不该有 RTL run"
+            );
         }
-        assert!(
-            shaped.has_only_ltr_runs(),
-            "ASCII 数字的快速路径快照永远是 LTR run"
-        );
     }
 }

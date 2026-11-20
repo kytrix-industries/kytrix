@@ -179,6 +179,10 @@ pub struct A11yTextSelection {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct A11yTextPosition {
     /// 位置所属的 `TextRun` 节点（AT 侧 `TextPosition.node` 的引擎口径）。
+    ///
+    /// **只在处理这次动作的 handler 内有效**：它是引擎句柄（含 generation/scope），跨帧或跨
+    /// 快照保存后可能失效（查询会得到 `StaleNode`/查不到，不会 UB 但会静默错）。要跨帧保存，
+    /// 请换稳定 id（`Window::a11y_stable_id` 口径的 `A11yNodeId`）。
     pub node: NodeId,
     /// 该 `TextRun` 文本内的 UTF-8 字节偏移（落在 char boundary；越界夹紧到该 run 的文本末尾）。
     pub byte_index: usize,
