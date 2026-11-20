@@ -161,8 +161,14 @@ pub enum EngineError {
     #[error("invalid DPI scale factor {factor}: must be finite and greater than zero")]
     InvalidDpiScale { factor: f32 },
 
-    /// 节点句柄不可用：从未存在、已卸载（代际不匹配），或**不是可移除的子节点**（root）。
-    #[error("stale node handle {node:?}: the node was unmounted or never existed in this window")]
+    /// 节点句柄不可用：从未存在、已卸载（代际不匹配），**不是可移除的子节点**（root），
+    /// 或**不能作为文本命中目标**（v2.1 E5/§11.5：非 `NodeKind::Text` / 文本尚未 shape /
+    /// 快照已过期 —— 语义统一为「该节点不能作为文本命中目标」，见
+    /// `Window::text_byte_index_at`）。
+    #[error(
+        "stale node handle {node:?}: the node was unmounted or never existed in this window, \
+         or cannot be used as a text hit target"
+    )]
     StaleNode { node: NodeId },
 
     /// 派生值形成环（或该派生的闭包上次 panic 未放回）。
@@ -658,6 +664,10 @@ mod tests {
 
         assert!(text.contains("n3.1"), "{text}");
         assert!(text.contains("unmounted or never existed"), "{text}");
+        assert!(
+            text.contains("text hit target"),
+            "v2.1 E5 复用该变体表示「不能作为文本命中目标」：{text}"
+        );
     }
 
     #[test]

@@ -1198,6 +1198,14 @@ impl NodeTree {
     pub fn text_caret_rect(&self, node: NodeId, byte_index: usize) -> Result<Rect, EngineError> {
         content::text_caret_rect(self, node, byte_index)
     }
+    /// 实现见子模块 `content::text_byte_index_at`（本文件只保留签名）。
+    pub(crate) fn text_byte_index_at(
+        &self,
+        node: NodeId,
+        local_point: Point,
+    ) -> Result<usize, EngineError> {
+        content::text_byte_index_at(self, node, local_point)
+    }
     /// 让单个文本节点的 ShapedLine 失效并进入重排队列（D-5 绘制前硬校验用）。
     pub(crate) fn invalidate_text_line(&mut self, node: NodeId) {
         content::invalidate_text_line(self, node)

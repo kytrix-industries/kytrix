@@ -454,6 +454,50 @@ fn expected_layout_width(tree: &NodeTree, shaped: &ShapedText, node: NodeId) -> 
     }
 }
 
+// 消费者：`impl NodeTree::text_byte_index_at` 的薄委托（外部调用点见该方法文档）。
+/// 文本盒局部坐标（与 [`NodeTree::text_caret_rect`] 的输出同域）→ 最近合法字节边界（E5/§11.5）。
+///
+/// 只读：不登记依赖、不改任何节点/帧状态（I6）；断行与对齐在快照的 parley 布局上现场重跑
+/// （与 `caret_rect` / `selection_rects` 同一条路径）。快速路径文本（单行 ASCII）不经过 parley，
+/// 但返回同一套「半簇取整 + 垂直 clamp」语义。
+///
+/// # Errors
+/// `StaleNode`：节点不存在 / 不是 `NodeKind::Text` / 尚未 shape 或 `ShapedLine` 尚未重建 /
+/// 文本内容、样式或断行宽度在该次文本 pass 之后又变了（等下一帧再查）。
+pub(crate) fn text_byte_index_at(
+    tree: &NodeTree,
+    node: NodeId,
+    local_point: Point,
+) -> Result<usize, EngineError> {
+    let Some(target) = tree.arena.get(node) else {
+        return Err(EngineError::StaleNode { node });
+    };
+    if target.kind.text().is_none() {
+        return Err(EngineError::StaleNode { node });
+    }
+    let Some(slot) = tree.text_slot(node) else {
+        return Err(EngineError::StaleNode { node });
+    };
+    let Some(content) = tree.text_content(node) else {
+        return Err(EngineError::StaleNode { node });
+    };
+    let shaped = slot.shaped();
+    // 「尚无 ShapedLine」与「快照不是当前内容」都不能作为命中目标（§11.5 的错误语义）：
+    // 返回旧快照算出的索引会让应用把光标锚到错误的字符上。
+    if tree.text_line(node).is_none()
+        || shaped.text() != content.text.as_str()
+        || !shaped.same_shaping_inputs(&content.style)
+        || shaped.inline_boxes() != content.inline_boxes.as_ref()
+    {
+        return Err(EngineError::StaleNode { node });
+    }
+    let width = expected_layout_width(tree, shaped, node);
+    if slot.laid_width_bits() != width.to_bits() {
+        return Err(EngineError::StaleNode { node });
+    }
+    Ok(shaped.byte_index_at(width, content.style.alignment, local_point))
+}
+
 // 消费者：`impl NodeTree::invalidate_text_line` 的薄委托（外部调用点见该方法文档）。
 /// 让**单个**文本节点的 ShapedLine 失效并进入重排队列（D-5）。
 ///
