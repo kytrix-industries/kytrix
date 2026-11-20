@@ -1,8 +1,8 @@
 #[cfg(windows)]
 use super::frame::surface_change_plan;
 use super::{
-    FrameIndex, FrameOutcome, FramePresentation, Window, WindowId, WindowOptions,
-    frame::frame_reaches_gpu, surface::covering_surface,
+    Decorations, FrameIndex, FrameOutcome, FramePresentation, Window, WindowId, WindowOptions,
+    WindowState, frame::frame_reaches_gpu, surface::covering_surface,
 };
 use crate::{
     math::{PhysicalRect, Rect, Scale, Size},
@@ -837,4 +837,89 @@ fn frame_presentations_are_recorded_and_bounded() {
             .all(|presentation| presentation.index.get() != 1),
         "被历史挤掉的帧不会被复活"
     );
+}
+
+// ── E6（P1-E6）：窗口 chrome 的数据面 ───────────────────────────────────
+
+/// E6：`Decorations` 与平台能力决定 `WindowState` 的**建窗初值**：Windows `None` ⇒ 应用自绘、
+/// 且 `can_fullscreen` 初值就是 `false`（没有全屏控制，不能等首轮泵校正 —— 审查 F8）；macOS
+/// `client_decoration` **恒 `false`**（原生交通灯，`Decorations::None` 是文档化降级）。
+/// 默认值保持 `Native`（默认路径回归）。
+#[test]
+fn decorations_drive_the_initial_client_decoration_state() {
+    let native = window();
+    assert_eq!(
+        native.options().decorations,
+        Decorations::Native,
+        "WindowOptions 默认必须是 Native（既有行为）"
+    );
+    assert!(!native.state().client_decoration, "Native ⇒ 系统装饰");
+    assert!(!native.state().maximized);
+    assert!(!native.state().fullscreen);
+    assert!(native.state().can_maximize);
+    assert!(native.state().can_minimize);
+    if cfg!(windows) {
+        assert!(
+            !native.state().can_fullscreen,
+            "Windows 没有全屏控制：初值就必须是 false（首轮泵不产生校正性状态变化）"
+        );
+    } else {
+        assert!(native.state().can_fullscreen, "macOS/Linux 原生支持全屏");
+    }
+
+    let frameless = Window::new(
+        WindowId::for_test(2),
+        WindowOptions {
+            decorations: Decorations::None,
+            ..WindowOptions::default()
+        },
+    );
+    if cfg!(target_os = "macos") {
+        assert!(
+            !frameless.state().client_decoration,
+            "macOS 恒由系统装饰（原生交通灯）：Decorations::None 是文档化降级"
+        );
+    } else {
+        assert!(frameless.state().client_decoration, "None ⇒ 应用自绘装饰");
+    }
+}
+
+/// E6 / §8.6.4 / I3：`set_state` 同值 no-op；值变化时给**根节点**标 `PAINT`（应用据此重画
+/// 最大化 / 还原按钮），平台泵随后请求一帧。
+///
+/// 变异守卫：删掉 `set_state` 里的 `mark_paint(root)` ⇒ 第二条断言红。
+#[test]
+fn set_state_is_idempotent_and_marks_the_root_for_paint_when_it_changes() {
+    let mut window = window();
+    let root = window.tree().root();
+    window.tree_mut().clear_paint(root);
+    assert!(!window.tree().has_paint_work(), "前置：根节点已清脏");
+
+    let unchanged = window.state();
+    assert!(!window.set_state(unchanged), "同值必须是 no-op");
+    assert!(!window.tree().has_paint_work(), "同值不得标 PAINT");
+
+    let changed = WindowState {
+        maximized: true,
+        ..unchanged
+    };
+    assert!(window.set_state(changed), "状态变化必须报告 true");
+    assert!(
+        window.tree().has_paint_work(),
+        "状态变化必须给根节点标 PAINT（I3：走与应用写信号同一条失效路径）"
+    );
+    assert!(window.state().maximized);
+}
+
+/// E6：`WindowOptions::icon` 只是建窗参数，三端都可设置；`PartialEq`（含 `Bytes`）保持可派生
+/// —— `WindowOptions` 的 clone/比较是平台层对账的基础。
+#[test]
+fn window_options_carry_an_optional_icon() {
+    assert_eq!(WindowOptions::default().icon, None);
+    let options = WindowOptions {
+        icon: Some(bytes::Bytes::from_static(&[1, 2, 3])),
+        ..WindowOptions::default()
+    };
+    assert_eq!(options.clone(), options);
+    assert!(options.icon.is_some());
 }

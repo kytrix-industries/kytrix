@@ -22,6 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bytes::Bytes;
 use smol_str::SmolStr;
 
 use self::{
@@ -79,69 +80,152 @@ impl WindowId {
     }
 }
 
-/// Linux/wayland 客户端装饰（自绘标题栏）的窗口控制请求。
+/// 窗口装饰模式（**数据枚举**，不是扩展点；I14）。
 ///
-/// 其它平台有原生标题栏，不需要应用发这些请求；本类型只在 Linux 构建里存在。
-#[cfg(target_os = "linux")]
+/// 三端语义（§8.6.1 / §11.6，用户裁决 E6）：
+///
+/// - [`Self::Native`]（默认）：**系统绘制**的窗口装饰 —— Windows 用 `WS_OVERLAPPEDWINDOW` 的
+///   系统标题栏与边框（E6 落地前的既有行为，逐字节不变）；macOS 用系统的「透明标题栏 + 原生
+///   交通灯」；Linux/Wayland 请求客户端装饰（`zxdg_toplevel_decoration_v1` 的 `client_side`，
+///   既有行为；compositor 可改为服务端装饰，最终以 `WindowState::client_decoration` 为准）。
+/// - [`Self::None`]：**不自绘系统装饰** —— Windows 切到 frameless（`WM_NCCALCSIZE` / `WM_NCHITTEST`
+///   由引擎实现，见 `platform/windows`），应用自绘标题栏；macOS 与 Linux **无等价能力**，按 I10
+///   **文档化降级**：macOS 仍保留原生交通灯（AppKit 无「无装饰」窗口语义，去掉 `Titled` 会同时
+///   失去关闭 / 最小化 / 缩放与 WindowServer 的手势），应用按 [`App::traffic_light_inset`] 的
+///   安全区留白后自绘其余 chrome；Linux/Wayland 的 surface 本来就铺满整个窗口（CSD），
+///   `None` 与 `Native` 的协议请求相同，应用自行决定画不画标题栏（`WindowState::client_decoration`
+///   仍是 compositor 的权威答复）。
+///
+/// 不存在「半装饰」组合：要隐藏系统标题栏就必须自己接管全部 chrome 交互（§8.6.2）。
+///
+/// [`App::traffic_light_inset`]: crate::app::App::traffic_light_inset
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Decorations {
+    /// 系统装饰（默认；默认路径回归的既有行为）。
+    #[default]
+    Native,
+    /// 无系统装饰（Windows frameless；macOS/Linux 文档化降级，见类型文档）。
+    None,
+}
+
+/// 窗口图标（`WindowOptions::icon`）解码后的单边像素上限（E6）。
+///
+/// 任务栏 / 标题栏图标的标准尺寸是 16–256 px；超过该上限的字节视为调用方错误
+/// （[`WindowIconCause::TooLarge`]），避免一次建窗为图标分配几十 MB，同时不拒绝合法的
+/// 256×256 高 DPI 图标。
+///
+/// crate 私有：这是**引擎实现常量**，不是公共契约（规格 §11.6 的公开面只有
+/// `WindowOptions::icon` + `WindowIconCause::TooLarge`）；应用经错误文案看到具体数值即可。
+///
+/// [`WindowIconCause::TooLarge`]: crate::error::WindowIconCause::TooLarge
+pub(crate) const MAX_WINDOW_ICON_DIM: u32 = 1024;
+
+/// 应用发起的窗口控制请求（自绘标题栏的系统按钮 / 拖动 / 缩放）。
+///
+/// 三端都接受同一枚举（E6 去掉 `cfg(target_os = "linux")`），平台层各自翻译：
+///
+/// | 控制 | Windows | macOS | Linux/Wayland |
+/// |---|---|---|---|
+/// | `Minimize` | `ShowWindow(SW_MINIMIZE)` | `performMiniaturize:` | `xdg_toplevel.set_minimized` |
+/// | `ToggleMaximize` | `ShowWindow(SW_MAXIMIZE / SW_RESTORE)` | `performZoom:` | `set_maximized` / `unset_maximized` |
+/// | `ToggleFullscreen` | **无等价能力** ⇒ `UnsupportedWindowCapability` | `toggleFullScreen:` | `set_fullscreen` / `unset_fullscreen` |
+/// | `BeginMove` / `BeginResize` | **无等价请求** ⇒ `UnsupportedWindowCapability`（拖动/缩放由 `Window::set_drag_regions` + 系统命中码承担） | 同左（没有可用的 `NSEvent`） | `xdg_toplevel.move` / `resize` |
+///
+/// 关闭**不**在这个枚举里：应用自己决策（`App::close_window` / `App::on_close`，§8.6.3），
+/// 引擎不为「关闭」提供平台请求。
+///
+/// 请求是**异步**的：`App::request_window_control` 只登记目标，平台泵在同一轮 / 下一轮执行；
+/// 最终状态一律以 [`WindowState`]（平台回报）为准，应用不得假设请求一定生效（I10）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowControl {
-    /// 最小化（`xdg_toplevel.set_minimized`）。
+    /// 最小化。
     Minimize,
-    /// 在最大化与还原之间切换（`set_maximized` / `unset_maximized`）。
+    /// 在最大化与还原之间切换。
     ToggleMaximize,
-    /// 进入 / 退出全屏（`set_fullscreen` / `unset_fullscreen`）。
-    ///
-    /// 最终状态以 compositor 的 `configure` 为准（`xdg_toplevel` 的 `Fullscreen` 状态位）：
-    /// 只发请求不假设结果，两者之间可能被策略拒绝（compositor 忽略请求）。
+    /// 进入 / 退出全屏（平台无等价能力时返回 `UnsupportedWindowCapability`）。
     ToggleFullscreen,
-    /// 开始交互式移动（`xdg_toplevel._move(seat, serial)`）。
+    /// 开始交互式移动（拖动）。
     BeginMove,
-    /// 开始交互式缩放（`xdg_toplevel.resize(seat, serial, edge)`）。
+    /// 开始交互式缩放。
     BeginResize(WindowResizeEdge),
 }
 
-/// Linux：compositor 侧的窗口状态镜像（应用自绘标题栏的唯一数据源）。
+/// 窗口状态的**平台回报**（应用自绘标题栏的唯一数据源）。
 ///
-/// Wayland 的窗口状态**只由 compositor 决定**（`configure` 的状态位与 `wm_capabilities`），
-/// 应用不能直接假设：请求了最大化不等于真的最大化了。本结构由平台层每轮泵写入，应用在画
-/// 标题栏时读 [`Window::state`]：
+/// 只有平台层能写（每轮泵镜像 `IsZoomed` / `isZoomed` / compositor `configure` 的真值），应用只读
+/// [`Window::state`]。状态变化时平台层给窗口根节点标 `PAINT` 并请求一帧（I3），应用据此重画
+/// 最大化 / 还原图标。
 ///
-/// - `client_decoration == false` ⇒ compositor 要求服务端装饰（SSD）：**不要画标题栏**，
-///   否则屏幕上出现两条（R10-4）；此时客户区就是整个 surface。
-/// - `can_maximize` / `can_minimize` / `can_fullscreen` ⇒ 对应按钮是否可用（不可用时隐藏或
-///   禁用，否则用户点了没反应，R10-15）。
-/// - `maximized` / `fullscreen` ⇒ 当前真实状态（按钮应显示「还原 / 退出全屏」）。
-#[cfg(target_os = "linux")]
+/// 字段的三端语义：
+///
+/// - `client_decoration`（E6 统一口径）：`true` = 窗口装饰由应用自绘（Linux compositor 要求
+///   CSD；Windows `Decorations::None`）；`false` = 系统装饰（Linux compositor 要求 SSD；
+///   Windows `Decorations::Native`；macOS **恒** `false` —— 原生交通灯 + 透明标题栏由系统绘制，
+///   应用只按 [`App::traffic_light_inset`] 留白）。
+/// - `maximized` / `fullscreen`：当前真实状态（compositor / 系统可拒绝或改变请求）。
+/// - `can_maximize` / `can_minimize` / `can_fullscreen`：对应按钮是否可用（不可用时隐藏或禁用，
+///   否则用户点了没反应）。
+///
+/// [`App::traffic_light_inset`]: crate::app::App::traffic_light_inset
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowState {
-    /// compositor 是否要求**客户端**装饰（`true` = 自绘标题栏）。
+    /// 窗口装饰是否由**应用自绘**（见类型文档的三端口径）。
     pub client_decoration: bool,
     /// 当前是否最大化。
     pub maximized: bool,
     /// 当前是否全屏。
     pub fullscreen: bool,
-    /// compositor 是否支持最大化请求。
+    /// 平台是否支持最大化请求。
     pub can_maximize: bool,
-    /// compositor 是否支持最小化请求。
+    /// 平台是否支持最小化请求。
     pub can_minimize: bool,
-    /// compositor 是否支持全屏请求。
+    /// 平台是否支持全屏请求。
     pub can_fullscreen: bool,
 }
 
-#[cfg(target_os = "linux")]
-impl Default for WindowState {
-    fn default() -> Self {
-        // 未收到 `wm_capabilities` 时的保守默认：假定全部支持（与旧行为一致，不会凭空禁用
-        // 按钮）；装饰默认为客户端自绘（引擎的一贯行为）。
+impl WindowState {
+    /// 建窗时的初始状态：**平台能力已知的部分直接给真值**，其余取保守值，平台泵在首个真值到达
+    /// 后覆盖（Windows/macOS 每轮 `sync_chrome`、Linux 每轮 `configure` 镜像）。
+    ///
+    /// - `client_decoration`：Windows `None` ⇒ 应用自绘；macOS **恒 `false`**（原生交通灯 + 透明
+    ///   标题栏由系统绘制，`Decorations::None` 是文档化降级）；Linux 由 compositor `configure` 的
+    ///   装饰模式覆盖（初值只表达请求倾向）。
+    /// - `can_fullscreen`：Windows **没有全屏控制**（`ToggleFullscreen` 返回
+    ///   `UnsupportedWindowCapability`）⇒ 初值必须是 `false`，否则首轮 `sync_chrome` 的校正会
+    ///   产生一次多余的 `WindowState` 变化 + 根 `PAINT`（审查 F8）。
+    #[must_use]
+    pub(crate) const fn for_decorations(decorations: Decorations) -> Self {
         Self {
-            client_decoration: true,
+            client_decoration: matches!(decorations, Decorations::None)
+                && !cfg!(target_os = "macos"),
             maximized: false,
             fullscreen: false,
             can_maximize: true,
             can_minimize: true,
-            can_fullscreen: true,
+            can_fullscreen: !cfg!(target_os = "windows"),
         }
     }
+}
+
+/// 自绘标题栏的缩放边（与 `xdg_toplevel.resize` / Win32 `HT*` 命中码 / macOS 的语义一一对应）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowResizeEdge {
+    /// 上边。
+    Top,
+    /// 下边。
+    Bottom,
+    /// 左边。
+    Left,
+    /// 右边。
+    Right,
+    /// 左上角。
+    TopLeft,
+    /// 右上角。
+    TopRight,
+    /// 左下角。
+    BottomLeft,
+    /// 右下角。
+    BottomRight,
 }
 
 /// Linux/Wayland 文本输入的语义类型（`zwp_text_input_v3.set_content_type`）。
@@ -168,33 +252,12 @@ pub enum ImeContentType {
     Number,
 }
 
-/// 自绘标题栏的缩放边（与 `xdg_toplevel.resize` 的边一一对应）。
-#[cfg(target_os = "linux")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WindowResizeEdge {
-    /// 上边。
-    Top,
-    /// 下边。
-    Bottom,
-    /// 左边。
-    Left,
-    /// 右边。
-    Right,
-    /// 左上角。
-    TopLeft,
-    /// 右上角。
-    TopRight,
-    /// 左下角。
-    BottomLeft,
-    /// 右下角。
-    BottomRight,
-}
-
 /// 建窗参数（平台层在创建原生窗口时消费）。
 ///
 /// 三个平台创建的窗口默认都是**可关闭 / 最小化 / 最大化 / 可缩放**的：Windows 用
-/// `WS_OVERLAPPEDWINDOW` 的系统标题栏，macOS 保留三个原生交通灯，Linux/Wayland 请求
-/// 客户端装饰并由应用自绘标题栏（`WindowControl` 提供按钮/拖动所需的平台请求）。
+/// `WS_OVERLAPPEDWINDOW` 的系统标题栏（`decorations = Native`），macOS 保留三个原生交通灯，
+/// Linux/Wayland 请求客户端装饰并由应用自绘标题栏（`WindowControl` 提供按钮/拖动所需的平台
+/// 请求）。`decorations = None` 的三端语义与降级见 [`Decorations`]。
 ///
 /// # 坐标语义（三端统一）
 ///
@@ -218,12 +281,18 @@ pub enum WindowResizeEdge {
 ///
 /// # Windows 标题栏 / 非客户区交互
 ///
-/// **非客户区全部交系统**（R07-2）：`WM_NCCALCSIZE` / `WM_NCHITTEST` / `WM_NCLBUTTONDOWN`
-/// 默认都不改写 —— 拖动标题栏、双击最大化/还原、右键系统菜单、`Alt+Space`、**Aero Snap /
-/// Win11 Snap Layouts** 与边框拖拽都由系统的 move / size 模态循环提供（Chrome / GPUI / Qt
-/// 同样不接管它们）。唯一的例外是应用显式声明的自绘标题栏拖动区（X2
+/// 默认（[`Decorations::Native`]）**非客户区全部交系统**（R07-2）：`WM_NCCALCSIZE` /
+/// `WM_NCHITTEST` / `WM_NCLBUTTONDOWN` 默认都不改写 —— 拖动标题栏、双击最大化/还原、右键系统
+/// 菜单、`Alt+Space`、**Aero Snap（拖边）** 与边框拖拽都由系统的 move / size 模态循环提供
+/// （Chrome / GPUI / Qt 同样不接管它们）。唯一例外是应用显式声明的自绘标题栏拖动区（X2
 /// [`Window::set_drag_regions`]）：命中区域的 `WM_NCHITTEST` 返回 `HTCAPTION`，让自绘标题栏
-/// 复用系统标题栏的同一套拖动语义；未声明时非客户区行为完全不变。
+/// 复用系统标题栏的同一套拖动语义；未声明时非客户区行为完全不变。Win11 **Snap Layouts 的
+/// 悬停浮层**需要按钮返回 `HTMAXBUTTON`，引擎本批未实现（不把它算作已交付的系统手势）。
+///
+/// `decorations = None`（E6 frameless，§11.6）时引擎接管非客户区：`WM_NCCALCSIZE` 返回 0
+/// 让客户区铺满窗口（最大化时按 DPI 补偿边框），`WM_NCHITTEST` 自算八向 resize 命中并保留
+/// `drag_regions → HTCAPTION`；窗口样式仍是 `WS_OVERLAPPEDWINDOW`，Aero Snap（拖边）/ DWM 阴影
+/// 与最大化动画由系统提供（与 `HTCAPTION` / `HT*` 命中码走同一条系统模态循环）。
 ///
 /// 系统 size 模态循环会占住本线程消息泵，但**重排 + 重绘不会停**：模态循环把 `WM_SIZE`
 /// 同步分派到 `WndProc`，平台层在每条 `WM_SIZE` 上直接更新客户区、对齐 DirectComposition
@@ -334,6 +403,23 @@ pub struct WindowOptions {
     /// - **Linux/Wayland**：**没有跨合成器协议**（KDE plasma-shell / wlr-layer-shell 都不是
     ///   xdg-shell 标准能力）⇒ 降级为无操作并在文档写明（应用不得假设置顶成立）。
     pub always_on_top: bool,
+    /// 窗口装饰模式（E6；默认 [`Decorations::Native`] = 既有行为）。
+    ///
+    /// `Decorations::None` 在 Windows 上切到 frameless（引擎接管 `WM_NCCALCSIZE` /
+    /// `WM_NCHITTEST`），应用自绘标题栏并配合 `Window::set_drag_regions` / [`WindowControl`] /
+    /// [`WindowState`]；macOS / Linux 无等价能力，按 I10 文档化降级（见 [`Decorations`]）。
+    pub decorations: Decorations,
+    /// 窗口 / 任务栏图标（PNG 或 ICO 字节；E6）。
+    ///
+    /// - **Windows**：建窗时解码为 `HICON` 并 `WM_SETICON(ICON_BIG | ICON_SMALL)`；解码失败返回
+    ///   强类型 [`crate::error::EngineError::WindowIcon`]（不静默）。I/O 与缩放成本只在建窗时付一次。
+    /// - **macOS**：**文档化降级** —— Dock 图标是应用级（`NSApplication.applicationIconImage`），
+    ///   窗口没有任务栏图标等价物；本字段被忽略（不是「静默成功」，见类型文档与 §11.6）。
+    /// - **Linux/Wayland**：**文档化降级** —— xdg-shell 没有窗口图标协议（`set_app_id` 是应用
+    ///   身份，不是图标）；本字段被忽略。
+    ///
+    /// 运行时改图标不在 E6 范围内：图标只在建窗时应用。
+    pub icon: Option<Bytes>,
     /// 初始 DPI 比例（由平台在 P12 传入；headless 默认 `Scale::ONE`）。
     pub scale: Scale,
     /// 窗口背景色：内容未覆盖区域的底色（持久目标 clear；Windows 另有独立背景层）。
@@ -373,6 +459,8 @@ impl Default for WindowOptions {
             owner: None,
             modal: false,
             always_on_top: false,
+            decorations: Decorations::Native,
+            icon: None,
             scale: Scale::ONE,
             background: Color::BLACK,
         }
@@ -651,9 +739,28 @@ pub struct Window {
     /// （`hint = none` / `purpose = normal`）会让输入法对其做联想与**用户词库学习**。
     #[cfg(target_os = "linux")]
     ime_content: ImeContentType,
-    /// Linux：compositor 侧的窗口状态镜像（最大化 / 全屏 / 装饰模式 / 可用能力）。
-    #[cfg(target_os = "linux")]
+    /// 平台回报的窗口状态（E6 起三端都可见：Windows `IsZoomed` / macOS `isZoomed` +
+    /// `styleMask` / Linux compositor `configure` 的镜像）。
+    ///
+    /// 平台泵每轮 `sync_state` 写入；值变化时**同时**给根节点标 `PAINT`（在本字段的写入口
+    /// [`Window::set_state`] 里），平台据此请求一帧（I3）。应用只读 [`Window::state`]。
     state: WindowState,
+    /// macOS：三个原生交通灯当前占用的**安全区**（逻辑点，客户区左上原点、y 向下；
+    /// E6 §8.6.5）。
+    ///
+    /// 每轮泵由 `platform/macos` 从 `standardWindowButton:` 的真实 frame 算出并写入（原生全屏下
+    /// 系统隐藏交通灯 ⇒ `None`）。应用经 `App::traffic_light_inset` 只读；其它平台恒 `None`
+    /// （字段不存在）。
+    #[cfg(target_os = "macos")]
+    traffic_light_inset: Option<Point>,
+    /// macOS：应用请求的交通灯位置（逻辑点，客户区左上原点、y 向下；`None` = 系统默认位置）。
+    ///
+    /// 写入入口 `App::set_traffic_light_position`。**set-once**（§8.6.5 的文档化限制）：平台泵
+    /// 只在第一次看到非 `None` 值时把三个 `standardWindowButton:` 的 frame.origin 调整一次
+    /// （保持透明标题栏 + 隐藏标题下仍可点击）；之后 AppKit 的 resize / 全屏重排不追回，运行期
+    /// 改位置或改回 `None` 不可撤销 —— 应用应在建窗时决定一次。
+    #[cfg(target_os = "macos")]
+    traffic_light_position: Option<Point>,
     /// 最近一帧**完成**帧的实际 GPU 绘制统计（P17 HUD）。
     ///
     /// threaded 路径（真实窗口）由 [`crate::window::record`] 的完成反馈写入；inline 路径
@@ -679,6 +786,7 @@ impl Window {
     pub(crate) fn new(id: WindowId, options: WindowOptions) -> Self {
         let scale = options.scale;
         let surface = covering_surface(options.size, scale);
+        let state = WindowState::for_decorations(options.decorations);
         let mut tree = NodeTree::new();
         // B7：非整数 DPI 才开启布局提交前的设备像素吸附（见 `NodeTree::set_device_scale`）。
         // 窗口 id 的绑定在 `App::create_window`（`NodeTree::bind_window`）—— 那里才确定
@@ -735,8 +843,13 @@ impl Window {
             titlebar_drag_regions: Vec::new(),
             #[cfg(target_os = "linux")]
             ime_content: ImeContentType::default(),
-            #[cfg(target_os = "linux")]
-            state: WindowState::default(),
+            // `options` 已被移动进结构体：用它的 `decorations` 派生初始状态必须在移动**之前**
+            // 完成（见函数开头的 `let state = ...`）。
+            state,
+            #[cfg(target_os = "macos")]
+            traffic_light_inset: None,
+            #[cfg(target_os = "macos")]
+            traffic_light_position: None,
             #[cfg(feature = "hud")]
             render_stats: crate::render::RenderStats::default(),
             #[cfg(feature = "hud")]
@@ -1426,25 +1539,72 @@ impl Window {
         self.ime_content
     }
 
-    // ── Linux：compositor 侧的窗口状态镜像 ──
+    // ── E6：窗口 chrome（标题 / 状态 / macOS 交通灯） ──
 
-    /// 平台写入的窗口状态（compositor 说了算；应用画标题栏时读它）。
-    #[cfg(target_os = "linux")]
+    /// 平台写入的窗口状态（平台真值：compositor / `IsZoomed` / `isZoomed`；应用画标题栏时读它）。
     #[must_use]
     pub fn state(&self) -> WindowState {
         self.state
     }
 
-    /// 平台层写入新状态；返回是否真的变化（同值 no-op，避免每轮无意义地失效样式）。
+    /// 平台层写入新状态；返回是否真的变化（同值 no-op）。
     ///
-    /// 消费者：`platform::linux::event_loop` 的逐窗口镜像。
-    #[cfg(target_os = "linux")]
+    /// 值变化时给**根节点**标 `PAINT`（§8.6.4 / I3：状态变化与应用写信号走同一条失效路径），
+    /// 调用方随后请求一帧（平台泵；`App` 的帧请求入口是 `request_frame`）。
+    ///
+    /// 消费者：三端泵的逐窗口 chrome 同步（Windows `sync_chrome` / macOS `sync_chrome` /
+    /// Linux 的 `configure` 镜像）。
     pub(crate) fn set_state(&mut self, state: WindowState) -> bool {
         if self.state == state {
             return false;
         }
         self.state = state;
+        // 状态只影响应用自绘的标题栏：根节点 PAINT 足以让应用重画自己的 header（更细的失效由
+        // 应用在 `on_frame` 里比较状态后写信号完成，I3 不破）。
+        let root = self.tree.root();
+        self.tree.mark_paint(root);
         true
+    }
+
+    /// 运行时改标题（`App::set_title` 的唯一写入口；平台泵每轮对账到原生窗口）。
+    ///
+    /// Windows `SetWindowTextW` / macOS `setTitle:` / Linux `xdg_toplevel.set_title`；
+    /// 同值 no-op（避免每轮泵重复系统调用）。
+    pub(crate) fn set_title(&mut self, title: SmolStr) {
+        self.options.title = title;
+    }
+
+    /// macOS：平台写入交通灯安全区（`None` = 原生全屏下系统隐藏交通灯）。
+    #[cfg(target_os = "macos")]
+    pub(crate) fn set_traffic_light_inset(&mut self, inset: Option<Point>) -> bool {
+        if self.traffic_light_inset == inset {
+            return false;
+        }
+        self.traffic_light_inset = inset;
+        true
+    }
+
+    /// macOS：交通灯安全区（只读；`App::traffic_light_inset` 的唯一数据源）。
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub(crate) fn traffic_light_inset(&self) -> Option<Point> {
+        self.traffic_light_inset
+    }
+
+    /// macOS：应用请求的交通灯位置（目标状态；`None` = 系统默认）。
+    ///
+    /// 值不变时平台泵不做任何 AppKit 调用；非 `None` 的目标只在 NativeWindow 的首次对账里应用
+    /// 一次（**set-once**，见字段文档与 `App::set_traffic_light_position`）。
+    #[cfg(target_os = "macos")]
+    pub(crate) fn set_traffic_light_position(&mut self, inset: Point) {
+        self.traffic_light_position = Some(inset);
+    }
+
+    /// macOS：平台泵读点（同值 no-op 由泵侧的应用状态比较保证）。
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub(crate) fn traffic_light_position(&self) -> Option<Point> {
+        self.traffic_light_position
     }
 
     // ── record：实现见 `record` 子模块的自由函数 ──

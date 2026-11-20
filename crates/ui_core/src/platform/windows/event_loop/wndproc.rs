@@ -66,32 +66,70 @@ pub(crate) extern "system" fn wndproc(
     // 并在 `NativeWindow::drop` 之前清空（销毁后不会再有消息）。下面所有对 `state` 的访问都是
     // **短借用**：会重入 `WndProc` 的调用之前必须已经释放借用（见文件头纪律 1）。
     unsafe {
-        // 客户区**自绘**（DComp 提供全部像素，没有系统重定向表面）：系统仍按系统边框计算
-        // 客户区，因此这里必须交默认过程 —— 自己返回 0 等于要求引擎画标题栏与边框。
-        if msg == WM_NCCALCSIZE {
-            return DefWindowProcW(hwnd, msg, wparam, lparam);
-        }
-
         let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WndProcState;
         if state.is_null() {
+            // 创建期（尚未绑定状态）：没有装饰模式可读，交默认过程。
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
 
-        // 非客户区命中：**系统命中码**（`HTCAPTION` / `HTLEFT` / `HTBOTTOMRIGHT` / `HTCLOSE`…）。
+        // ── E6 frameless：客户区铺满整个窗口（§11.6）─────────────────────────────
         //
-        // 命中码、边框几何、缩放光标形状都由系统算。`WM_NCLBUTTONDOWN` 也不改写（R07-2）：
-        // caption 的 move 模态循环（Aero Snap / Snap Layouts / 双击最大化 / 右键系统菜单）与
-        // 8 个命中码的 size 模态循环都只存在于 `DefWindowProcW` 内部。曾经把 `HTCAPTION`
-        // 接管的实现因此丢掉了全部系统手势（多显示器用户最常用的窗口布局方式）；曾经自持
-        // 8 个 resize 命中码的实现则要自己重实现整套平台语义（见 `resize.rs` 的模块文档：
-        // 现在改为「系统拥有交互，`WM_SIZE` 驱动真实帧」）。
+        // `Decorations::Native` 完全交默认过程（既有行为逐字节不变）。
         //
-        // **X2 的唯一例外**：自绘标题栏拖动区（应用通过 `Window::set_drag_regions` 声明，泵
-        // 每轮同步到 [`WndProcState::drag_regions`]）命中时返回 `HTCAPTION` —— 与系统标题栏走
-        // 同一条 move 模态循环（双击最大化/还原、Aero Snap、Snap Layouts、`Alt+Space` 全部
-        // 成立）；区域之外仍交 `DefWindowProcW`，上面的系统语义不变。区域是**逻辑客户区
-        // 坐标**：屏幕物理坐标（`WM_NCHITTEST` 的 lParam）→ `ScreenToClient` → 除以本消息
-        // 时刻的 scale。
+        // `Decorations::None`：wparam == TRUE 时**返回 0** = 「客户区已由应用算好」—— 不修改
+        // `rgrc[0]` 就是客户区 = 整个窗口矩形（去掉系统标题栏 / 边框的非客户区绘画）。窗口样式
+        // 仍带 `WS_THICKFRAME` / `WS_CAPTION`（见 `NativeWindow::create`），因此 **DWM 阴影 /
+        // 圆角 / 最大化动画 / Aero Snap 全部保留**（`platform/windows/chrome` 模块文档）：
+        // 不换成 `WS_POPUP` 是本节唯一的架构前提。
+        //
+        // 最大化补偿：系统把最大化窗口的窗口矩形撑到「工作区 + 一圈边框」（装饰窗口的 frame
+        // 厚度），客户区若仍等于窗口矩形，内容会在屏幕四边被裁掉 1–8 px。按与 `WM_NCHITTEST`
+        // 命中带**同一个** `resize_border` 向内缩，客户区正好等于工作区。
+        //
+        // wparam == FALSE（`lParam` 是窗口 RECT、不是 `NCCALCSIZE_PARAMS`）交默认过程：该变体只
+        // 允许应用给出客户区矩形，frameless 不需要改写它（Raymond Chen 的 custom frame 系列
+        // 同样只处理 TRUE）。20 年的 recipe 与本仓的差别只在这里的注释与测试。
+        if msg == WM_NCCALCSIZE
+            && wparam.0 != 0
+            && (*state).decorations() == crate::window::Decorations::None
+        {
+            let params = &mut *(lparam.0 as *mut NCCALCSIZE_PARAMS);
+            if IsZoomed(hwnd).as_bool() {
+                let border = (*state).resize_border();
+                let current = params.rgrc[0];
+                let inset = super::super::chrome::inset_for_maximized(
+                    (current.left, current.top, current.right, current.bottom),
+                    border,
+                );
+                params.rgrc[0] = windows::Win32::Foundation::RECT {
+                    left: inset.0,
+                    top: inset.1,
+                    right: inset.2,
+                    bottom: inset.3,
+                };
+            }
+            return LRESULT(0);
+        }
+
+        // 非客户区命中：`Decorations::Native` 用**系统命中码**（`HTCAPTION` / `HTLEFT` /
+        // `HTBOTTOMRIGHT` / `HTCLOSE`…）：命中码、边框几何、缩放光标形状都由系统算。
+        // `WM_NCLBUTTONDOWN` 也不改写（R07-2）：caption 的 move 模态循环（Aero Snap（拖边）/
+        // 双击最大化 / 右键系统菜单 / `Alt+Space`）与 8 个命中码的 size 模态循环都只存在于
+        // `DefWindowProcW` 内部。Win11 Snap Layouts 的**悬停浮层**需要 `HTMAXBUTTON`，本批未实现
+        // （保持如实：`WM_NCHITTEST` 不返回 `HTMAXBUTTON`）。
+        //
+        // **X2 的唯一例外**（两种装饰模式都有）：自绘标题栏拖动区（应用通过
+        // `Window::set_drag_regions` 声明，泵每轮同步到 [`WndProcState::drag_regions`]）命中时
+        // 返回 `HTCAPTION` —— 与系统标题栏走同一条 move 模态循环（双击最大化/还原、Aero Snap
+        // 拖边、`Alt+Space`、右键系统菜单全部成立；Snap Layouts 浮层除外，见上）；区域是
+        // **逻辑客户区坐标**：屏幕物理坐标（`WM_NCHITTEST` 的 lParam）→ `ScreenToClient` →
+        // 除以本消息时刻的 scale。
+        //
+        // **E6 frameless 的另一半**：引擎自算 8 向 resize 命中（`chrome::resize_edge_at`，
+        // 按 DPI 缩放的 `SM_CXSIZEFRAME + SM_CXPADDEDBORDER`）并返回对应 `HT*`：frameless 下
+        // 客户区已铺满，若交 `DefWindowProcW` 它只会返回 `HTCLIENT`，缩放光标与 size 模态循环
+        // 全部消失。resize 带**优先于**拖动区（§8.6.2：应用声明的拖动区不得覆盖系统 resize
+        // 边框）；最大化时没有可缩放的非客户区，直接进入拖动区 / `HTCLIENT` 判定。
         if msg == WM_NCHITTEST {
             let mut point = POINT {
                 x: loword_signed(lparam.0),
@@ -100,6 +138,20 @@ pub(crate) extern "system" fn wndproc(
             // `ScreenToClient` 只做坐标换算、不派发消息（不违反纪律 1）；`hwnd` 存活由外层
             // `unsafe` 块的 SAFETY 注释覆盖。
             if ScreenToClient(hwnd, &mut point).as_bool() {
+                let frameless = (*state).decorations() == crate::window::Decorations::None;
+                if frameless && !IsZoomed(hwnd).as_bool() {
+                    // `GetClientRect` 只查询、不派发消息（同 `ScreenToClient`）。
+                    let mut client = windows::Win32::Foundation::RECT::default();
+                    if GetClientRect(hwnd, &mut client).is_ok()
+                        && let Some(edge) = super::super::chrome::resize_edge_at(
+                            (point.x, point.y),
+                            (client.right - client.left, client.bottom - client.top),
+                            (*state).resize_border(),
+                        )
+                    {
+                        return LRESULT(super::super::chrome::hit_test_code(edge) as isize);
+                    }
+                }
                 let scale = (*state).scale();
                 let logical = Point::new(
                     scale.to_logical(point.x as f32),
@@ -111,6 +163,11 @@ pub(crate) extern "system" fn wndproc(
                     .any(|region| region.contains(logical))
                 {
                     return LRESULT(HTCAPTION as isize);
+                }
+                if frameless {
+                    // 客户区内部：必须是 `HTCLIENT`（frameless 下客户区铺满，不能再交默认过程 ——
+                    // 那会把内容点当非客户区处理，吃掉输入）。
+                    return LRESULT(HTCLIENT as isize);
                 }
             }
             return DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -538,6 +595,10 @@ pub(crate) extern "system" fn wndproc(
             //（泵的 ④ 这段时间不运行；`WM_EXITSIZEMOVE` 之后回到常规路径，队列里的事件
             // 因同值幂等而不会重复出帧）。
             if msg == WM_SIZE {
+                // E6：最大化 / 还原 / Snap 必然改变客户区 ⇒ 本窗口的 chrome 状态（`IsZoomed`）
+                // 需要在下一轮泵对账（`NativeWindow::sync_chrome`）。这里只置位：读 `IsZoomed` /
+                // 写 `WindowState` 要碰 `App`，不能在窗口过程里做；本分支之前已经 `wake()`。
+                (*state).note_chrome_dirty();
                 // `WM_SIZE` 的低 / 高 16 位 = 客户区物理宽 / 高（与 `TranslateState` 同源）。
                 let raw = lparam_value as usize;
                 let client = ((raw & 0xFFFF) as u32, ((raw >> 16) & 0xFFFF) as u32);

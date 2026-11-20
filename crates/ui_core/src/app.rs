@@ -219,8 +219,10 @@ pub struct App {
     /// `ImmAssociateContext`（Windows）。用集合而不是单槽：一轮内多个窗口各自关一次 IME
     /// 时单槽会丢请求。
     ime_disabled: ahash::HashSet<WindowId>,
-    /// 待执行的 Linux 客户端装饰窗口控制（自绘标题栏的按钮 / 拖动）。
-    #[cfg(target_os = "linux")]
+    /// 待执行的窗口控制请求（自绘标题栏的按钮 / 拖动 / 缩放；E6 起三端共用）。
+    ///
+    /// Linux 由 Wayland 事件循环在同一轮执行；Windows/macOS 由各自的泵在下一轮执行
+    /// （`show` / `performMiniaturize:` 等系统调用不能发生在持有 `&mut App` 的借用里）。
     window_control: Option<(WindowId, crate::window::WindowControl)>,
     /// a11y 动作的 handler 表（P11；同 `A11yAction` 后写覆盖）。
     a11y_handlers: ahash::HashMap<
@@ -469,7 +471,6 @@ impl App {
             cursor_pending: None,
             capture_requests: ahash::HashMap::default(),
             ime_disabled: ahash::HashSet::default(),
-            #[cfg(target_os = "linux")]
             window_control: None,
             a11y_handlers: ahash::HashMap::default(),
             a11y_diagnostics: Vec::new(),
@@ -997,7 +998,10 @@ impl App {
     /// 不生效时定位到这一点。
     ///
     /// 批处理内（[`App::batch`]）只登记推迟位，由最外层批处理结束时合并成**一次**请求。
-    fn request_frame(&mut self) {
+    ///
+    /// E6 起的额外消费者：三端泵在窗口 chrome 状态变化（最大化 / 还原）时请求一帧 —— 根节点
+    /// 的 `PAINT` 已由 [`Window::set_state`] 标好（§8.6.4 / I3，与应用写信号同一路径）。
+    pub(crate) fn request_frame(&mut self) {
         if self.batch_depth > 0 {
             self.batch_wake = true;
             return;
@@ -1828,15 +1832,28 @@ impl App {
         window_set::close_window(self, id)
     }
 
-    /// 请求一次 Linux 客户端装饰的窗口控制（自绘标题栏专用）。
+    /// 请求一次窗口控制（自绘标题栏的系统按钮 / 拖动 / 缩放；E6 起三端统一入口）。
     ///
-    /// 请求由 Wayland 事件循环在**同一轮**内执行；`BeginMove` / `BeginResize` 使用最近一次
-    /// 指针按键的 serial，因此只应从输入事件的动作处理器里调用（拖动/点击的 handler）。
-    /// 其它平台有原生标题栏，不提供本入口。
+    /// 请求是**异步**的：只登记目标，平台泵在同一轮 / 下一轮执行（Linux Wayland 事件循环、
+    /// Windows 泵、macOS 泵）。最终状态一律以 [`Window::state`] 为准 —— 不得假设请求一定生效
+    /// （compositor / 系统可以拒绝或改变请求，I10）。
+    ///
+    /// 平台能力差异（完整表见 [`crate::window::WindowControl`]）：
+    /// - **Windows**：`Minimize` / `ToggleMaximize` 原生（`ShowWindow`）；`ToggleFullscreen` /
+    ///   `BeginMove` / `BeginResize` 无等价请求 ⇒ `UnsupportedWindowCapability`（拖动 / 缩放由
+    ///   [`Self::set_drag_regions`] + 系统命中码承担）。
+    /// - **macOS**：`Minimize` / `ToggleMaximize` / `ToggleFullscreen` 原生
+    ///   （`performMiniaturize:` / `performZoom:` / `toggleFullScreen:`）；`BeginMove` /
+    ///   `BeginResize` 没有可用的 `NSEvent` ⇒ `UnsupportedWindowCapability`。
+    /// - **Linux/Wayland**：全部由 `xdg_toplevel` 请求承担；`BeginMove` / `BeginResize` 使用最近
+    ///   一次指针按键的 serial，因此只应从输入事件的动作处理器里调用。
+    ///
+    /// **关闭不在本入口**：应用自己决策（[`Self::close_window`] / [`Self::on_close`]，§8.6.3），
+    /// 引擎不为「关闭」提供平台请求。
     ///
     /// # Errors
-    /// `EngineError::UnknownWindow`：窗口不存在（已经关闭）。
-    #[cfg(target_os = "linux")]
+    /// - [`EngineError::UnknownWindow`]：窗口不存在（已经关闭）。
+    /// - [`EngineError::UnsupportedWindowCapability`]：该端没有这个控制（见上表）。
     pub fn request_window_control(
         &mut self,
         window: WindowId,
@@ -1845,12 +1862,61 @@ impl App {
         window_set::request_window_control(self, window, control)
     }
 
-    /// 取走待执行的窗口控制请求（Wayland 事件循环的唯一读点）。
-    #[cfg(target_os = "linux")]
+    /// 取走待执行的窗口控制请求（三端泵的唯一读点）。
     pub(crate) fn take_window_control(
         &mut self,
     ) -> Option<(WindowId, crate::window::WindowControl)> {
         window_set::take_window_control(self)
+    }
+
+    // ── E6（P1-E6）：窗口 chrome 的运行时 API（独立区块，便于与并行批次合并） ──
+
+    /// 运行时改窗口标题（三端生效：Windows `SetWindowTextW` / macOS `setTitle:` /
+    /// Linux `xdg_toplevel.set_title`）。
+    ///
+    /// 只写窗口参数并唤醒平台泵：**下一轮泵**对账到原生窗口（同值 no-op，不重复系统调用）。
+    /// 平台原生调用失败由平台层记诊断（窗口仍可用，标题保持旧值；不 panic），未知窗口是强类型
+    /// 错误。
+    ///
+    /// # Errors
+    /// [`EngineError::UnknownWindow`]：窗口不存在（已经关闭）。
+    pub fn set_title(
+        &mut self,
+        window: WindowId,
+        title: smol_str::SmolStr,
+    ) -> Result<(), EngineError> {
+        window_set::set_title(self, window, title)
+    }
+
+    /// macOS：设置三个原生交通灯的位置（其它平台返回 [`EngineError::UnsupportedWindowCapability`]，
+    /// 不静默降级）。
+    ///
+    /// `inset` 是**逻辑点**（客户区左上原点、y 向下）：交通灯分组的左上角落在该点，按钮之间
+    /// 保持系统间距。与 [`Self::traffic_light_inset`] 是同一几何的写 / 读两端：应用据此把可点击
+    /// 控件放到交通灯之外（§8.6.5 —— 应用**不能**把可点击控件放到交通灯下面，会与系统按钮抢命中）。
+    ///
+    /// **set-once（§8.6.5 文档化限制）**：位置只在建窗时决定一次；首次调用生效后，运行期再次
+    /// 调用不会改变已应用的位置（AppKit 在 resize / 全屏转场后的重排不追回）。本 API **没有**
+    /// 「恢复系统默认位置」的入口 —— 引擎不保存 AppKit 系统按钮布局的副本。
+    ///
+    /// # Errors
+    /// - [`EngineError::UnknownWindow`]：窗口不存在。
+    /// - [`EngineError::UnsupportedWindowCapability`]：非 macOS。
+    pub fn set_traffic_light_position(
+        &mut self,
+        window: WindowId,
+        inset: crate::math::Point,
+    ) -> Result<(), EngineError> {
+        window_set::set_traffic_light_position(self, window, inset)
+    }
+
+    /// macOS：交通灯占用的**安全区**（逻辑点，客户区左上原点、y 向下；应用按返回值留白）。
+    ///
+    /// `None` = 非 macOS，或原生全屏下系统隐藏了交通灯（§8.6.5），或窗口不存在。这是只读查询，
+    /// 与 setter 同层；应用不需要自己猜按钮位置，也不应把可点击控件放进该区域。
+    #[must_use]
+    pub fn traffic_light_inset(&self, window: WindowId) -> Option<crate::math::Point> {
+        window_set::traffic_light_inset(self, window)
     }
 
     /// 遍历全部窗口（顺序不保证）并带出 `WindowId`。

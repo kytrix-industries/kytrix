@@ -491,6 +491,17 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
     {
         native.make_key();
     }
+    // E6：窗口控制请求（自绘标题栏的系统按钮 / 全屏；原生 AppKit 路径）。先应用控制、再对账
+    // chrome（见下面的 `sync_chrome`）：`performZoom:` / `toggleFullScreen:` 之后同一轮就能读到
+    // 新的 `isZoomed` / `styleMask` 状态并把变化写回 `App` + 出帧。
+    if let Some((window, control)) = app.take_window_control()
+        && let Some(native) = state
+            .windows
+            .iter()
+            .find(|native| native.id() == window && !native.is_destroyed())
+    {
+        native.apply_window_control(control);
+    }
     for native in state.windows.iter_mut() {
         let id = native.id();
         for event in native.take_events() {
@@ -498,6 +509,9 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
             changed = true;
         }
         changed |= native.sync_state(app)?;
+        // E6：标题 / 交通灯位置 / `WindowState`（`isZoomed` + `styleMask` 全屏位）。变化时
+        // `Window::set_state` 已给根节点标 `PAINT`，本函数返回 true ⇒ 同一轮走下面的帧门禁。
+        changed |= native.sync_chrome(app);
         // B9(mac)：窗口刚失去键盘焦点 ⇒ IME 统一清场（清 caret hint / 丢弃组合 / 补 End）。
         // 放在 `sync_state` 之后：`FocusChanged { focused: false }` 已经按事件顺序投递，
         // 清场产生的 `ImeEvent::End` 排在其后；清场要 `&mut App`，因此由泵执行而不是在

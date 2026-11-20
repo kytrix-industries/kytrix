@@ -3,9 +3,8 @@
 //! `app.rs` 的 `impl App` 只保留同名薄委托，方法体在这里（零行为变更的纯拆分）。
 
 use super::App;
-#[cfg(target_os = "linux")]
-use crate::error::EngineError;
 use crate::{
+    error::EngineError,
     interaction,
     node::{dependency::Owner, id::NodeId},
     window::{Window, WindowId, WindowOptions},
@@ -366,45 +365,133 @@ pub(crate) fn close_window(app: &mut App, id: WindowId) -> bool {
     true
 }
 
-/// 请求一次 Linux 客户端装饰的窗口控制（自绘标题栏专用）。
+/// 请求一次窗口控制（自绘标题栏的系统按钮 / 拖动 / 缩放；E6 起三端统一）。
 ///
-/// 请求由 Wayland 事件循环在**同一轮**内执行；`BeginMove` / `BeginResize` 使用最近一次
-/// 指针按键的 serial，因此只应从输入事件的动作处理器里调用（拖动/点击的 handler）。
-/// 其它平台有原生标题栏，不提供本入口。
+/// 能力判定由平台层给出（[`crate::platform::native::unsupported_window_control`]）：该端没有
+/// 等价请求时返回 [`EngineError::UnsupportedWindowCapability`]（I10，不静默排队后再丢弃）。
+/// 其余请求登记进单槽，由平台泵在**同一轮 / 下一轮**执行（`ShowWindow` / `performZoom:` 等系统
+/// 调用不能发生在持有 `&mut App` 的借用里）。
+///
+/// 消费者：`App::request_window_control`。
 ///
 /// # Errors
-/// `EngineError::UnknownWindow`：窗口不存在（已经关闭）。
-/// 消费者：`App::request_window_control`。
-#[cfg(target_os = "linux")]
+/// - [`EngineError::UnknownWindow`]：窗口不存在（已经关闭；优先于能力错误）。
+/// - [`EngineError::UnsupportedWindowCapability`]：该端没有这个控制。
 pub(crate) fn request_window_control(
     app: &mut App,
     window: WindowId,
     control: crate::window::WindowControl,
 ) -> Result<(), EngineError> {
-    let Some(target) = app.windows.get_mut(&window) else {
+    if !app.windows.contains_key(&window) {
         return Err(EngineError::UnknownWindow { window });
-    };
+    }
+    if let Some(capability) = crate::platform::native::unsupported_window_control(control) {
+        return Err(EngineError::UnsupportedWindowCapability { window, capability });
+    }
+    // 移动 / 缩放一旦交给 compositor，客户端就收不到后续指针抬起：主动结束本地拖拽会话，
+    // 避免下一次移动被误当成标题栏/边框拖拽（Wayland 专属路径；Windows/macOS 的
+    // `BeginMove` / `BeginResize` 已在上面按能力拒绝）。
+    #[cfg(target_os = "linux")]
     if matches!(
         control,
         crate::window::WindowControl::BeginMove | crate::window::WindowControl::BeginResize(_)
     ) {
-        // 移动/缩放一旦交给 compositor，客户端就收不到后续指针抬起：主动结束本地拖拽
-        // 会话，避免下一次移动被误当成标题栏/边框拖拽。
-        target.pointer_mut().end_drag();
-        target.pointer_mut().press = None;
-        app.capture_requests.insert(window, false);
+        end_local_drag_session(app, window);
     }
     app.window_control = Some((window, control));
     Ok(())
 }
 
-/// 取走待执行的窗口控制请求（Wayland 事件循环的唯一读点）。
-/// 消费者：`App::take_window_control`。
+/// Linux：把本地指针拖拽会话收尾（`xdg_toplevel.move` / `resize` 之后不会再收到 Up）。
 #[cfg(target_os = "linux")]
+fn end_local_drag_session(app: &mut App, window: WindowId) {
+    let Some(target) = app.windows.get_mut(&window) else {
+        return;
+    };
+    target.pointer_mut().end_drag();
+    target.pointer_mut().press = None;
+    app.capture_requests.insert(window, false);
+}
+
+/// 取走待执行的窗口控制请求（三端泵的唯一读点）。
+/// 消费者：三端事件循环（`Take` 之后在不持有 `&mut App` 的借用里执行系统调用）。
 pub(crate) fn take_window_control(
     app: &mut App,
 ) -> Option<(WindowId, crate::window::WindowControl)> {
     app.window_control.take()
+}
+
+/// 运行时改标题（写窗口参数 + 唤醒泵；平台泵每轮对账到原生窗口）。
+///
+/// 同值 no-op 在这里短路：避免每轮泵都做一次 `SetWindowTextW` / `setTitle:`（应用常在
+/// `on_frame` 里按行情更新标题，值没变时不该有系统调用）。
+///
+/// # Errors
+/// [`EngineError::UnknownWindow`]：窗口不存在（已经关闭）。
+pub(crate) fn set_title(
+    app: &mut App,
+    window: WindowId,
+    title: smol_str::SmolStr,
+) -> Result<(), EngineError> {
+    let Some(target) = app.windows.get_mut(&window) else {
+        return Err(EngineError::UnknownWindow { window });
+    };
+    if target.options().title == title {
+        return Ok(());
+    }
+    target.set_title(title);
+    app.dispatcher.wake();
+    Ok(())
+}
+
+/// macOS：写交通灯目标位置（**set-once**：只在建窗时决定一次）并唤醒泵。
+///
+/// 首次调用之后再次设置不改变已登记的位置（返回 `Ok(())` 且不唤醒泵）：引擎不保存 AppKit
+/// 系统按钮布局的副本，运行期改位置 / 改回 `None` 都不可撤销（§8.6.5 的文档化限制）。
+#[cfg(target_os = "macos")]
+pub(crate) fn set_traffic_light_position(
+    app: &mut App,
+    window: WindowId,
+    inset: crate::math::Point,
+) -> Result<(), EngineError> {
+    let Some(target) = app.windows.get_mut(&window) else {
+        return Err(EngineError::UnknownWindow { window });
+    };
+    // set-once：已有目标位置 ⇒ 不覆盖、不唤醒（运行期修改被忽略，见函数文档）。
+    if target.traffic_light_position().is_some() {
+        return Ok(());
+    }
+    target.set_traffic_light_position(inset);
+    app.dispatcher.wake();
+    Ok(())
+}
+
+/// 非 macOS：交通灯位置没有等价能力 ⇒ 强类型错误（I10；调用方按变体处理，不静默）。
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn set_traffic_light_position(
+    app: &mut App,
+    window: WindowId,
+    _inset: crate::math::Point,
+) -> Result<(), EngineError> {
+    if !app.windows.contains_key(&window) {
+        return Err(EngineError::UnknownWindow { window });
+    }
+    Err(EngineError::UnsupportedWindowCapability {
+        window,
+        capability: "traffic light position",
+    })
+}
+
+/// macOS：交通灯安全区（泵写入的只读镜像；窗口不存在 ⇒ `None`）。
+#[cfg(target_os = "macos")]
+pub(crate) fn traffic_light_inset(app: &App, window: WindowId) -> Option<crate::math::Point> {
+    app.windows.get(&window)?.traffic_light_inset()
+}
+
+/// 非 macOS：没有交通灯 ⇒ `None`（只读查询的契约，不是错误）。
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn traffic_light_inset(_app: &App, _window: WindowId) -> Option<crate::math::Point> {
+    None
 }
 
 /// 遍历全部窗口（顺序不保证）并带出 `WindowId`。

@@ -84,6 +84,8 @@ struct WindowMirror {
     id: WindowId,
     scale: Scale,
     size: Size,
+    /// 最近一次下发的标题（`App::set_title` → `xdg_toplevel.set_title`；同值 no-op，E6）。
+    title: smol_str::SmolStr,
 }
 
 /// `Application::run` 的平台入口。
@@ -260,8 +262,18 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                     window.clear_frame_budget_deferred();
                 }
                 // ③ R10-4 / R10-15：compositor 侧的窗口状态（装饰模式、最大化/全屏、可用能力）
-                // 镜像给应用 —— 自绘标题栏据此决定是否画、按钮是否可用。
-                window.set_state(state.window_state(index));
+                // 镜像给应用 —— 自绘标题栏据此决定是否画、按钮是否可用。值变化时
+                // `Window::set_state` 已给根节点标 `PAINT`，这里再请求一帧（§8.6.4 / I3）。
+                if window.set_state(state.window_state(index)) {
+                    dispatcher.wake();
+                }
+                // E6：运行时标题（`App::set_title`）对账到 `xdg_toplevel.set_title`；同值 no-op。
+                // 标题是双缓冲 toplevel 状态，随下一次 commit（present）生效。
+                let title = window.options().title.clone();
+                if title != mirrored.title {
+                    state.set_title(index, &title);
+                    mirrored.title = title;
+                }
             }
             // ②b 焦点状态 → a11y（键盘焦点窗口可能不同于指针进入窗口）。
             for window_a11y in &mut a11ys {
@@ -675,7 +687,12 @@ fn sync_windows(
         window.set_surface(physical);
         // R10-4 / R10-15：首次写入 compositor 侧状态（装饰模式 / 最大化 / 全屏 / 可用能力）。
         window.set_state(state.window_state(index));
-        mirrors.push(WindowMirror { id, scale, size });
+        mirrors.push(WindowMirror {
+            id,
+            scale,
+            size,
+            title: window.options().title.clone(),
+        });
     }
     Ok(())
 }

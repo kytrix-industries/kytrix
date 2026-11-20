@@ -375,6 +375,72 @@ pub enum EngineError {
         /// 失败分类。
         cause: DecodeCause,
     },
+
+    // ── E6（P1-E6）：窗口 chrome 的平台能力错误 ──────────────────────────────
+    /// 平台没有该窗口能力的等价实现，且**不允许静默降级**（I10 / §11.6）。
+    ///
+    /// 生产者是 `App::request_window_control` / `App::set_traffic_light_position`：调用前的
+    /// 能力判定由平台层给出（Windows 的 `ToggleFullscreen` / `BeginMove` / `BeginResize`；
+    /// macOS 的 `BeginMove` / `BeginResize`；非 macOS 的交通灯位置）。`capability` 是稳定的
+    /// 英文诊断名（日志 / CI 可 grep；面向用户的本地化文案由应用层按变体生成）。
+    ///
+    /// 已知的**文档化降级**（不是本错误）：`WindowOptions::icon` 在 macOS / Linux、
+    /// `WindowOptions::decorations = None` 在 macOS / Linux —— 这些字段的文档写明被忽略的原因，
+    /// 调用方在选择这些取值时就已被告知（不存在「请求了却不知道没生效」）。
+    #[error("window {window:?} has no {capability} on this platform")]
+    UnsupportedWindowCapability {
+        /// 目标窗口。
+        window: WindowId,
+        /// 缺失能力的稳定诊断名。
+        capability: &'static str,
+    },
+
+    /// 窗口图标（`WindowOptions::icon`）解码失败（E6；Windows 建窗路径）。
+    ///
+    /// 图标字节是**建窗参数**而不是可选装饰：非法字节 ⇒ 建窗失败（I10 不静默丢弃，也不假装
+    /// 设置成功）。只在真的提供 `icon` 时可能发生。
+    #[error("window {window:?} icon decode failed: {cause}")]
+    WindowIcon {
+        /// 目标窗口。
+        window: WindowId,
+        /// 强类型失败分类。
+        cause: WindowIconCause,
+    },
+}
+
+/// [`EngineError::WindowIcon`] 的强类型失败分类。
+///
+/// 与 [`DecodeCause`]（图片**资源**解码，进图集 / 有占位图语义）分开：窗口图标的处理策略只有
+/// 「修字节」或「不传图标」，不需要资源层的容量 / 色彩管理分类。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowIconCause {
+    /// 不是 PNG / ICO（E6 只支持这两种格式：任务栏图标的标准输入）。
+    UnsupportedFormat,
+    /// 字节损坏 / 解码器失败（截断、CRC 错、非法 ICO 目录等）。
+    DecodeFailed,
+    /// 解码出的尺寸超过引擎上限（`MAX_WINDOW_ICON_DIM`）。
+    TooLarge {
+        /// 解码出的像素宽。
+        width: u32,
+        /// 解码出的像素高。
+        height: u32,
+    },
+}
+
+impl std::fmt::Display for WindowIconCause {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedFormat => {
+                formatter.write_str("unsupported format (PNG or ICO required)")
+            }
+            Self::DecodeFailed => formatter.write_str("decode failed"),
+            Self::TooLarge { width, height } => write!(
+                formatter,
+                "decoded size {width}x{height} exceeds the {} px limit",
+                crate::window::MAX_WINDOW_ICON_DIM
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -454,6 +520,14 @@ mod tests {
                     page: (2048, 2048),
                     cause: crate::resources::CapacityCause::PageFull,
                 },
+            },
+            EngineError::UnsupportedWindowCapability {
+                window: crate::window::WindowId::for_test(7),
+                capability: "fullscreen",
+            },
+            EngineError::WindowIcon {
+                window: crate::window::WindowId::for_test(8),
+                cause: WindowIconCause::DecodeFailed,
             },
         ]
     }
@@ -706,6 +780,45 @@ mod tests {
         let debug = format!("{:?}", unsupported_gpu());
 
         assert!(debug.contains("UnsupportedGpu"), "{debug}");
+    }
+
+    /// E6：平台能力缺失必须可 grep（稳定诊断名）+ 指名窗口/能力，调用方按变体分派。
+    #[test]
+    fn unsupported_window_capability_display_names_window_and_capability() {
+        let error = EngineError::UnsupportedWindowCapability {
+            window: crate::window::WindowId::for_test(3),
+            capability: "fullscreen",
+        };
+        let text = error.to_string();
+        assert!(
+            text.contains("WindowId(3)"),
+            "window id 必须在文案里：{text}"
+        );
+        assert!(text.contains("fullscreen"), "{text}");
+        assert!(text.contains("no fullscreen"), "{text}");
+    }
+
+    /// E6：图标解码失败是强类型分类（调用方不需要解析字符串），文案说清限制的格式。
+    #[test]
+    fn window_icon_display_names_the_cause() {
+        let error = EngineError::WindowIcon {
+            window: crate::window::WindowId::for_test(4),
+            cause: WindowIconCause::UnsupportedFormat,
+        };
+        let text = error.to_string();
+        assert!(text.contains("WindowId(4)"), "{text}");
+        assert!(text.contains("PNG or ICO"), "{text}");
+
+        let too_large = EngineError::WindowIcon {
+            window: crate::window::WindowId::for_test(4),
+            cause: WindowIconCause::TooLarge {
+                width: 2048,
+                height: 4096,
+            },
+        }
+        .to_string();
+        assert!(too_large.contains("2048x4096"), "{too_large}");
+        assert!(too_large.contains("1024"), "{too_large}");
     }
 
     #[test]

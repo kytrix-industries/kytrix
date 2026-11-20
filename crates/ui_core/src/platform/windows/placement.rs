@@ -186,10 +186,17 @@ impl ClientLimits {
 
     /// `WM_GETMINMAXINFO` 的两个跟踪尺寸：`(ptMinTrackSize, ptMaxTrackSize)`（**窗口外框**、
     /// 物理像素，随 DPI 换算；`max = None` 时不覆盖系统默认）。
-    pub(crate) fn track_sizes(self, dpi: u32) -> ((u32, u32), Option<(u32, u32)>) {
+    ///
+    /// `decorations` 决定是否把系统标题栏 / 边框算进外框：frameless 的窗口外框 = 客户区
+    /// （`WM_NCCALCSIZE` 返回 0），多算一圈会让最小跟踪尺寸凭空变大。
+    pub(crate) fn track_sizes(
+        self,
+        dpi: u32,
+        decorations: crate::window::Decorations,
+    ) -> ((u32, u32), Option<(u32, u32)>) {
         (
-            dpi::track_size(self.min, dpi),
-            self.max.map(|max| dpi::track_size(max, dpi)),
+            dpi::track_size(self.min, dpi, decorations),
+            self.max.map(|max| dpi::track_size(max, dpi, decorations)),
         )
     }
 }
