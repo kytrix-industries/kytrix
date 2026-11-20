@@ -13,11 +13,14 @@ image = { workspace = true }
 rust-embed = { workspace = true }
 smallvec = { workspace = true }
 smol_str = { workspace = true }
+taffy = { workspace = true }
+ui_core = { workspace = true }
 
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
 i18n = { workspace = true }
+ui_core = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true
