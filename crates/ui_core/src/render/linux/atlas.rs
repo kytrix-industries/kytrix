@@ -1711,6 +1711,16 @@ mod tests {
             first,
             full_rects(),
         );
+        // 扩层要求**每一层**都有整页上传（RBT-01 不变量 2）：第 1 层也整页上传（全 0），
+        // 否则重建请求会被设备侧拒绝。
+        uploads.queue_upload(
+            AtlasKind::Image,
+            1,
+            spec(TEST_PAGE, 2),
+            gpu.atlas_page(AtlasKind::Image),
+            page(),
+            full_rects(),
+        );
         let rebuild = uploads
             .reconcile_pages([
                 gpu.atlas().spec(AtlasKind::Glyph),

@@ -832,10 +832,18 @@ mod tests {
         let mut queue = Queue::new(&device, std::sync::Arc::new(InFlight::new())).expect("queue");
         let mut atlas = AtlasTextures::new(&mut device).expect("atlas");
 
-        // 第 1 帧：layer 0 整页上传（全 0），数组按 spec 建成 2 层（既有第 2 页存在）。
+        // 第 1 帧：建 2 层数组（扩层要求**每一层**都有整页上传，RBT-01 不变量 2）：
+        // layer 0 / layer 1 都整页上传全 0。
         atlas.queue_upload(
             AtlasKind::Image,
             0,
+            spec(TEST_PAGE, 2),
+            page(),
+            full_rects(),
+        );
+        atlas.queue_upload(
+            AtlasKind::Image,
+            1,
             spec(TEST_PAGE, 2),
             page(),
             full_rects(),
