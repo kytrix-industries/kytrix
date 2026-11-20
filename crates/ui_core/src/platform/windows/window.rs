@@ -14,14 +14,17 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use windows::Win32::{
-    Foundation::{HWND, RECT},
-    Graphics::Gdi::{
-        DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW, GetMonitorInfoW, HBRUSH,
-        MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromWindow,
+use windows::{
+    Win32::{
+        Foundation::{FALSE, HANDLE, HWND, LPARAM, RECT, TRUE},
+        Graphics::Gdi::{
+            DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW, GetMonitorInfoW, HBRUSH,
+            MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromWindow,
+        },
+        System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
+        UI::{Input::KeyboardAndMouse::EnableWindow, WindowsAndMessaging::*},
     },
-    System::LibraryLoader::GetModuleHandleW,
-    UI::{Input::KeyboardAndMouse::EnableWindow, WindowsAndMessaging::*},
+    core::{BOOL, PCWSTR},
 };
 
 use crate::{
@@ -43,6 +46,15 @@ use crate::{
 
 /// 窗口类名（每进程注册一次）。
 const CLASS_NAME: &str = "KytrixGuiWindow";
+
+/// 模态窗口在自己 HWND 上记录 owner 的窗口属性名（X1 / RB-13）。
+///
+/// 值 = 被本窗口 `EnableWindow(FALSE)` 禁用的 owner HWND（`HANDLE`）。这是「哪些活窗口是
+/// 某个 owner 的模态窗口」的**唯一**记录：属性挂在窗口对象自己身上，窗口销毁（含 owner
+/// 级联销毁、系统回收）时随之消失，因此
+/// 「owner 上还有几个活模态窗口」永远是**当前窗口集合的派生值**（销毁时用
+/// [`another_modal_window_for`] 枚举本线程窗口读出），不存在需要在异常路径上维护的计数器。
+const MODAL_OWNER_PROPERTY: &str = "KytrixModalOwner";
 
 /// `WindowOptions::position = None` 时的默认窗口外框左上角（物理像素）。
 ///
@@ -86,12 +98,6 @@ pub(crate) struct NativeWindow {
     logical_size: Size,
     /// 最近一次下发的 IME caret 区域（逻辑矩形 + 当时 Scale）。
     ime_area: Option<(Rect, Scale)>,
-    /// 模态窗口打开期间被 `EnableWindow(owner, FALSE)` 禁用的 owner 窗口（X1）。
-    ///
-    /// 只有「`options.modal == true` 且 owner 存在」时才置位；销毁本窗口前必须恢复
-    /// `EnableWindow(owner, TRUE)`，否则 owner 永久不可交互（系统级灰显 + 无输入）。
-    /// owner 已被销毁时 `EnableWindow` 对失效句柄返回 FALSE（不 UB），无需特殊处理。
-    modal_owner: Option<HWND>,
 }
 
 /// 测试构建的窗口 a11y 消费端代际。
@@ -109,8 +115,10 @@ impl NativeWindow {
     ///
     /// `owner` 是已解析的 owner 窗口句柄（X1）：`Some` ⇒ `CreateWindowExW` 的 `hWndParent`
     /// 走 owner 语义（不设 `WS_CHILD`，owned 窗口仍是顶层窗口）；`options.always_on_top` ⇒
-    /// `WS_EX_TOPMOST`；`options.modal` ⇒ 建窗后禁用 owner（`EnableWindow(FALSE)`），
-    /// [`Self::destroy`] 恢复。owner 的 `WindowId → HWND` 解析在平台事件循环侧完成
+    /// `WS_EX_TOPMOST`；`options.modal` ⇒ 建窗后在**本窗口**上写 [`MODAL_OWNER_PROPERTY`]
+    /// 标记并禁用 owner（`EnableWindow(FALSE)`），[`Self::destroy`] 按「还有没有别的活模态
+    /// 窗口」派生是否恢复（`EnableWindow` 是布尔状态不是引用计数，多模态窗口关其一不得恢复）。
+    /// owner 的 `WindowId → HWND` 解析在平台事件循环侧完成
     /// （`native_window::resolve_owner`，找不到时诊断降级为 None）。
     ///
     /// 失败一律 `EngineError::WindowCreate`（`CreateWindowExW` / `RegisterClassW` 的 HRESULT 与
@@ -203,17 +211,34 @@ impl NativeWindow {
                     return Err(error);
                 }
             };
-        // X1：模态窗口 —— 建窗后（显示前）禁用 owner，系统级拦截 owner 及其非客户区输入
-        // （用户无法与 owner 交互，视觉上灰显），关闭/销毁本窗口时由 `destroy` 恢复。
-        // 失败（owner 已失效等）只降级为「没有原生模态」：引擎层仍有按 owner 关系过滤输入的
-        // 兜底；不 panic、不阻止新窗口创建。放在所有可失败步骤**之后**，避免失败路径把
-        // owner 留在禁用状态。
-        let modal_owner = if options.modal { owner } else { None };
-        if let Some(owner_hwnd) = modal_owner {
-            // SAFETY: owner 由调用方保证仍是本进程存活窗口（解析来源是活着的 NativeWindow）；
-            // 即使已失效，`EnableWindow` 也只返回 FALSE，不解引用。
-            unsafe {
-                let _ = EnableWindow(owner_hwnd, false);
+        // X1 / RB-13：模态窗口 —— 建窗后（显示前）禁用 owner，系统级拦截 owner 及其非客户区
+        // 输入（用户无法与 owner 交互，视觉上灰显），关闭/销毁本窗口时由 `destroy` 恢复。
+        //
+        // **先登记、再禁用**：把「本窗口是 owner 的模态窗口」写在**本窗口自己**的窗口属性表里
+        //（[`MODAL_OWNER_PROPERTY`]，值 = owner HWND）。属性随窗口对象一起销毁，所以
+        // `destroy` 可以按「当前还活着的窗口」派生 owner 的禁用状态，而不是维护一个会在建窗
+        // 失败 / `DestroyWindow` 失败 / 级联关闭时漂移的计数器。登记失败（属性表分配失败）
+        // ⇒ 降级为「没有原生模态」并且**不**禁用 owner：宁可只靠引擎层拦截，也不留下一个
+        // 「禁用了却没有任何恢复依据」的状态。
+        //
+        // 放在所有可失败步骤**之后**：此后的失败只有 `apply_dpi_and_size`，它返回 `Err` 时
+        // `window` 会被 `Drop`（进而 `destroy`）回收，owner 由同一套派生逻辑恢复。
+        if options.modal
+            && let Some(owner_hwnd) = owner
+        {
+            let property = wide(MODAL_OWNER_PROPERTY);
+            // SAFETY: `hwnd` 刚由本函数创建、尚未交给任何其它所有者；`property` 是本函数栈上
+            // 的 NUL 结尾 UTF-16 缓冲（`SetPropW` 同步拷贝字符串）；属性值只是一个 owner
+            // 句柄，系统只原样保存，不接管所有权、不解引用。
+            let marked =
+                unsafe { SetPropW(hwnd, PCWSTR(property.as_ptr()), Some(HANDLE(owner_hwnd.0))) }
+                    .is_ok();
+            if marked {
+                // SAFETY: owner 由调用方保证仍是本进程存活窗口（解析来源是活着的 NativeWindow）；
+                // 即使已失效，`EnableWindow` 也只返回 FALSE，不解引用。
+                unsafe {
+                    let _ = EnableWindow(owner_hwnd, false);
+                }
             }
         }
 
@@ -229,7 +254,6 @@ impl NativeWindow {
             scale: Scale::ONE,
             logical_size: options.size,
             ime_area: None,
-            modal_owner,
         };
         window.apply_dpi_and_size(options)?;
         Ok(window)
@@ -641,13 +665,39 @@ impl NativeWindow {
 
     /// 销毁窗口（幂等；`Drop` 也会调）。
     pub(crate) fn destroy(&mut self) {
-        // X1：模态窗口销毁前先恢复 owner 的输入。顺序不能反：owned 窗口先没会让 owner 永久
-        // 禁用（灰显 + 收不到任何输入）。owner 已被销毁（系统随 owner 销毁 owned 窗口）时
-        // `EnableWindow` 对失效句柄只返回 FALSE，不 UB。
-        if let Some(owner) = self.modal_owner.take() {
-            // SAFETY: owner 句柄来自本进程活着的 `NativeWindow`（解析时保证）；失效时调用只返回 FALSE。
-            unsafe {
-                let _ = EnableWindow(owner, true);
+        // X1 / RB-13：模态窗口销毁前决定是否恢复 owner 的输入。顺序不能反：owned 窗口先没会
+        // 让 owner 永久禁用（灰显 + 收不到任何输入）。
+        //
+        // `EnableWindow` 是**布尔状态不是引用计数**：同一个 owner 上可以同时有多个模态窗口，
+        // 关掉其中任意一个都不能恢复 owner（引擎层 `is_input_blocked_by_modal` 只要还有模态
+        // 窗口就继续拦输入，提前恢复会让「原生可交互 vs 引擎丢事件」分叉）。
+        //
+        // 判据是**派生**的：摘掉本窗口的模态标记，再枚举本线程仍存活的窗口，看还有没有窗口
+        // 以同一 HWND 为模态 owner（[`another_modal_window_for`]）。标记挂在窗口对象上、
+        // 随窗口销毁消失，因此建窗失败 / `DestroyWindow` 失败 / owner 级联销毁都不会留下
+        // 一个需要单独维护、会漂移的计数。
+        //
+        // 本窗口已被系统随 owner 一起销毁时（`hwnd` 失效）没有标记可摘，也无需恢复：
+        // owned 窗口只会在 owner 销毁时被系统带走，而那时 owner 本身已失效。
+        if !self.hwnd.is_invalid() {
+            let property = wide(MODAL_OWNER_PROPERTY);
+            // SAFETY: `self.hwnd` 仍存活（本函数随后的 `DestroyWindow` 才销毁它）；`property`
+            // 是本函数栈上的 NUL 结尾 UTF-16 缓冲；`GetPropW` / `RemovePropW` 只动本进程
+            // 窗口的属性表。
+            let owner = unsafe { GetPropW(self.hwnd, PCWSTR(property.as_ptr())) };
+            if !owner.is_invalid() {
+                // SAFETY: 同上；属性值只是 owner 句柄，系统不接管所有权。
+                unsafe {
+                    let _ = RemovePropW(self.hwnd, PCWSTR(property.as_ptr()));
+                }
+                let owner = HWND(owner.0);
+                if !another_modal_window_for(owner, self.hwnd) {
+                    // SAFETY: owner 句柄来自本进程活着的 `NativeWindow`（解析时保证）；
+                    // 失效时调用只返回 FALSE，不 UB。
+                    unsafe {
+                        let _ = EnableWindow(owner, true);
+                    }
+                }
             }
         }
         if self.hwnd.is_invalid() {
@@ -686,6 +736,67 @@ impl Drop for NativeWindow {
             self.state = std::ptr::null_mut();
         }
     }
+}
+
+/// [`another_modal_window_for`] 的 `EnumThreadWindows` 探测上下文。
+///
+/// 回调只有 C ABI、不能捕获环境，因此状态经 `LPARAM` 以栈上指针传入（`EnumThreadWindows`
+/// 是同步调用，栈上值在全部回调期间有效）。
+struct ModalOwnerProbe {
+    /// [`MODAL_OWNER_PROPERTY`] 的 NUL 结尾 UTF-16 形式（指向调用方栈上的缓冲）。
+    property: PCWSTR,
+    /// 要找的 owner。
+    owner: HWND,
+    /// 正在销毁的窗口：它自己的标记可能还没摘掉，不算「别的」模态窗口。
+    excluded: HWND,
+    /// 已找到另一个以 `owner` 为模态 owner 的活窗口。
+    found: bool,
+}
+
+/// `EnumThreadWindows` 回调：`hwnd` 是否「不是 `excluded` 且以 `probe.owner` 为模态 owner」。
+///
+/// 返回 `FALSE` 停止枚举（已经有一个反例就够了）。
+///
+/// # Safety
+///
+/// `lparam` 必须是调用方栈上存活的 [`ModalOwnerProbe`]（`EnumThreadWindows` 同步枚举完才
+/// 返回，回调期间该指针一直有效）；`hwnd` 由系统在枚举时给出且枚举期间存活。
+unsafe extern "system" fn probe_modal_owner(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    // SAFETY: 见函数的安全契约 —— 调用方保证 `lparam` 指向存活的 `ModalOwnerProbe`。
+    let probe = unsafe { &mut *(lparam.0 as *mut ModalOwnerProbe) };
+    // SAFETY: `hwnd` 是枚举给出的存活窗口；`GetPropW` 只读它的属性表，不改状态。
+    if hwnd != probe.excluded && unsafe { GetPropW(hwnd, probe.property) } == HANDLE(probe.owner.0)
+    {
+        probe.found = true;
+        return FALSE;
+    }
+    TRUE
+}
+
+/// 「本线程还有没有**别的**活窗口以 `owner` 为模态 owner」（除 `excluded` 之外，RB-13）。
+///
+/// 判据完全来自**真实活着的窗口**：模态标记写在窗口自己的属性表里
+/// （[`MODAL_OWNER_PROPERTY`]），窗口销毁时标记随之消失；枚举范围是当前线程的顶层窗口 ——
+/// 引擎的全部窗口（含 owner 与模态窗口）都创建在跑事件循环的 UI 线程上、`destroy` 也在
+/// 该线程调用，线程外的窗口不可能是本引擎的模态窗口。
+fn another_modal_window_for(owner: HWND, excluded: HWND) -> bool {
+    let property = wide(MODAL_OWNER_PROPERTY);
+    let mut probe = ModalOwnerProbe {
+        property: PCWSTR(property.as_ptr()),
+        owner,
+        excluded,
+        found: false,
+    };
+    // SAFETY: `probe` 在本调用期间存活；`EnumThreadWindows` 同步枚举当前线程的顶层窗口，
+    // 回调只读窗口属性、只写 `probe`；`probe_modal_owner` 的安全契约由此满足。
+    unsafe {
+        let _ = EnumThreadWindows(
+            GetCurrentThreadId(),
+            Some(probe_modal_owner),
+            LPARAM(std::ptr::from_mut(&mut probe) as isize),
+        );
+    }
+    probe.found
 }
 
 /// 建窗前的**临时**窗口外框 `(x, y, width, height)`（物理像素）。
@@ -985,6 +1096,24 @@ mod tests {
         .expect("NativeWindow::create")
     }
 
+    /// 建一个隐藏的、以 `owner` 为 owner 的模态窗口（X1 / RB-13 的多模态用例）。
+    fn modal_window(id: u32, owner: &NativeWindow) -> NativeWindow {
+        let options = WindowOptions {
+            owner: Some(owner.id()),
+            modal: true,
+            ..WindowOptions::default()
+        };
+        NativeWindow::create(
+            WindowId::for_test(id),
+            &options,
+            Some(owner.hwnd),
+            Dispatcher::new(),
+            None,
+            crate::platform::windows::window::test_a11y_epoch(),
+        )
+        .expect("modal window")
+    }
+
     /// X1 owner：`CreateWindowExW` 的 `hWndParent` 走 owner 语义 ——
     /// `GetWindow(GW_OWNER)` 回指 owner，且窗口**不是** `WS_CHILD`（owned 窗口仍是顶层窗口）。
     ///
@@ -1092,6 +1221,85 @@ mod tests {
         );
     }
 
+    /// X1 / RB-13：`EnableWindow` 是**布尔状态不是引用计数** —— 同一个 owner 上打开两个模态
+    /// 窗口后，关闭其中**一个**不得恢复 owner 的原生输入（引擎层 `is_input_blocked_by_modal`
+    /// 只要还有模态窗口就继续拦 owner 的输入，原生提前恢复会让 owner 看起来可用、事件却被
+    /// 引擎丢掉）。
+    ///
+    /// 变异守卫：把 `destroy` 的派生恢复改回无条件 `EnableWindow(owner, TRUE)`（修复前的
+    /// 行为）⇒ 第二段断言红。
+    #[test]
+    fn closing_one_of_two_modal_windows_keeps_the_owner_disabled() {
+        let owner = window(11);
+        let mut first = modal_window(12, &owner);
+        let _second = modal_window(13, &owner);
+        // SAFETY: 三个窗口都由本用例持有且存活；只读查询启用状态。
+        assert!(
+            !unsafe { IsWindowEnabled(owner.hwnd) }.as_bool(),
+            "前置：两个模态窗口打开时 owner 必须被系统禁用"
+        );
+
+        first.destroy();
+        // SAFETY: owner 与第二个模态窗口仍存活；只读查询。
+        assert!(
+            !unsafe { IsWindowEnabled(owner.hwnd) }.as_bool(),
+            "关闭两个模态窗口中的一个后 owner 必须仍然禁用（EnableWindow 不是引用计数）"
+        );
+    }
+
+    /// X1 / RB-13：只有**最后一个**模态窗口销毁时才恢复 owner 的输入 —— 关闭顺序无关
+    /// （先关较新的、后关较旧的同样成立）。
+    ///
+    /// 变异守卫：同 [`closing_one_of_two_modal_windows_keeps_the_owner_disabled`]。
+    #[test]
+    fn closing_the_last_modal_window_restores_the_owner() {
+        let owner = window(14);
+        let mut first = modal_window(15, &owner);
+        let mut second = modal_window(16, &owner);
+
+        second.destroy();
+        // SAFETY: owner 与第一个模态窗口仍存活；只读查询。
+        assert!(
+            !unsafe { IsWindowEnabled(owner.hwnd) }.as_bool(),
+            "先关较新的模态窗口时 owner 必须仍然禁用（较旧的模态窗口还活着）"
+        );
+
+        first.destroy();
+        // SAFETY: owner 仍存活；只读查询。
+        assert!(
+            unsafe { IsWindowEnabled(owner.hwnd) }.as_bool(),
+            "最后一个模态窗口销毁后必须恢复 owner 输入"
+        );
+    }
+
+    /// X1 / RB-13 反例：判定必须按 **owner** 精确匹配 —— 另一个 owner 的模态窗口既不得阻止
+    /// 本 owner 恢复，也不得被本 owner 的关闭影响。
+    #[test]
+    fn another_owners_modal_window_does_not_change_this_owners_state() {
+        let first_owner = window(17);
+        let second_owner = window(18);
+        let mut first_modal = modal_window(19, &first_owner);
+        let _second_modal = modal_window(20, &second_owner);
+        // SAFETY: 四个窗口都由本用例持有且存活；只读查询。
+        assert!(
+            !unsafe { IsWindowEnabled(first_owner.hwnd) }.as_bool()
+                && !unsafe { IsWindowEnabled(second_owner.hwnd) }.as_bool(),
+            "前置：两个 owner 都被各自的模态窗口禁用"
+        );
+
+        first_modal.destroy();
+        // SAFETY: 同上。
+        assert!(
+            unsafe { IsWindowEnabled(first_owner.hwnd) }.as_bool(),
+            "本 owner 已没有活模态窗口时必须恢复（别的 owner 的模态窗口不算）"
+        );
+        // SAFETY: 同上。
+        assert!(
+            !unsafe { IsWindowEnabled(second_owner.hwnd) }.as_bool(),
+            "另一个 owner 的模态窗口必须继续禁用那个 owner"
+        );
+    }
+
     /// X1 模态反例：非模态的 owned 窗口不得禁用 owner。
     #[test]
     fn an_owned_window_without_modal_leaves_its_owner_enabled() {
@@ -1150,6 +1358,24 @@ mod tests {
         // 引擎侧销毁路径对已经失效的句柄必须安全失败：`Composition::shutdown` 忽略错误、
         // `DestroyWindow` 返回错误被忽略，不 panic。
         owned.destroy();
+    }
+
+    /// X1 / RB-13 异常路径：owner **先**被销毁时系统级联销毁模态窗口 —— 模态窗口的
+    /// `destroy()` 对失效 HWND 必须安全失败。此时它的模态标记已随窗口对象消失，不存在
+    /// 「恢复一个已死的 owner」或留下漂移计数的路径（真正的恢复由同一套派生判定完成）。
+    #[test]
+    fn destroying_the_owner_with_a_live_modal_window_is_safe() {
+        let owner = window(21);
+        let mut modal = modal_window(22, &owner);
+        let modal_hwnd = modal.hwnd;
+
+        drop(owner);
+        // SAFETY: 只读查询；句柄预期已随 owner 销毁而失效。
+        assert!(
+            !unsafe { IsWindow(Some(modal_hwnd)) }.as_bool(),
+            "owner 销毁时系统必须一并销毁其模态窗口"
+        );
+        modal.destroy();
     }
 
     /// B6/D6（Windows 对齐）：禁用 IME 瞬间平台仍在组合中 ⇒ 泵侧同步清场：应用侧 caret hint
