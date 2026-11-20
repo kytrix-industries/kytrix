@@ -963,6 +963,10 @@ impl ShapedTextHandle {
     ///
     /// `generation`（整页换代）或 `eviction_epoch`（逐 tile 淘汰）任一前进即为真。
     ///
+    /// **已写入 `Canvas` 的旧 tile** 不靠本方法兜底（句柄已不在 Canvas 里）：编码期用
+    /// `AtlasAllocator::is_alive` 逐 tile 判活，失效 run 不编码并计入
+    /// [`TextDiagnostic::CanvasTextStale`]（v2.1 E1d）。
+    ///
     /// # Panics: none
     #[must_use]
     pub fn is_stale(&self) -> bool {
@@ -1121,10 +1125,11 @@ pub enum TextDiagnostic {
         /// 该节点本轮没画出的字形数（`>= 1`）。
         skipped: usize,
     },
-    /// Canvas 内文本因图集租约失效而在**编码期**被丢弃（v2.1 E1b，`§11.1` 的 D-5 canvas 半边）。
+    /// Canvas 内文本因图集租约失效而在**编码期**被丢弃（v2.1 E1b + E1d，`§11.1` 的 D-5 canvas 半边）。
     ///
     /// `Canvas` 内容归应用所有：`push_shaped_text` 之后图集换代（DPI 变化 / 字体栈切换 /
-    /// 容量逃逸）会让已写入的 `AtlasTile` 指向旧 UV，编码期为避免花字整段丢弃失效 run。
+    /// 容量逃逸）**或逐 tile LRU 淘汰**（不换代）会让已写入的 `AtlasTile` 指向旧 UV，编码期为
+    /// 避免花字整段丢弃失效 run（逐 tile 用分配身份 `(slot, slot_epoch)` 判活）。
     /// 引擎**无法**代应用重建 Canvas —— 应用应在句柄 `is_stale()` 后重新 `shape_text` 并用新
     /// 句柄重建 Canvas。这条诊断让「少字」不静默（D17：可见失败优于静默缺字）。
     CanvasTextStale {

@@ -598,6 +598,8 @@ fn images_on_layers_without_an_established_array_are_not_drawn() {
         u1: 0.5,
         v1: 0.5,
         generation: 0,
+        slot: 0,
+        slot_epoch: 0,
     };
     let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 64.0, 32.0));
     canvas.push_image(Image {
@@ -1554,6 +1556,8 @@ fn set_canvas_replaces_canvas_content_and_marks_subtree_paint() {
         u1: 0.25,
         v1: 0.25,
         generation: 1,
+        slot: 0,
+        slot_epoch: 0,
     };
     let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 32.0, 32.0));
     canvas.push_image(Image {

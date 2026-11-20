@@ -38,7 +38,7 @@ use crate::{
 pub(crate) fn paint_frame(
     window: &mut Window,
     geometry: &crate::paint::geometry_store::GeometryStore,
-    atlas_generation: Option<u32>,
+    atlas: Option<&crate::render::AtlasAllocator>,
 ) -> Result<PaintReport, EngineError> {
     window.tree.reset_paint_visited();
     // 借用式取出（保容量）：`tree` 与 `scene` 是不同字段，循环内可同时可变借用。
@@ -199,7 +199,7 @@ pub(crate) fn paint_frame(
                 frame,
                 order: &mut window.paint_order,
                 focused,
-                atlas_generation,
+                atlas,
                 // 全量路径每帧重写槽位表；增量路径按缓存槽号写回（见 `PaintPass` 的字段文档）。
                 scroll_slots: &mut window.scroll_slots,
                 scroll_slot_nodes: &mut window.scroll_slot_nodes,

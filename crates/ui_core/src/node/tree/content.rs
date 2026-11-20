@@ -147,12 +147,13 @@ pub(crate) fn text_layout_dirty_len(tree: &NodeTree) -> usize {
 }
 
 // 消费者：`impl NodeTree::mark_canvas_nodes_paint` 的薄委托（外部调用点见该方法文档）。
-/// 让所有 `Canvas` 节点的 lane 重建（v2.1 E1b：图集换代后的 canvas 编码期安全网入口）。
+/// 让所有 `Canvas` 节点的 lane 重建（v2.1 E1b：图集换代后的 canvas 编码期安全网入口；
+/// E1d 起逐 tile LRU 淘汰的收尾同样调用它）。
 ///
 /// Canvas 图元里的 `GlyphRun` 同样烘焙了 `AtlasTile`（应用经 `Canvas::push_shaped_text` 写入）。
-/// 图集换代后 lane 里缓存的 Canvas 值仍是旧 UV，而 `invalidate_text_lines` 只遍历文本节点 ——
-/// 不标 PAINT 的话 paint 会整桶复用它，编码期逐 run 校验（`paint/pass.rs`）根本不会执行。
-/// 标 PAINT 让 paint 重新 emit：失效 run 被丢弃（少字优于花字），节点计入诊断计数。
+/// 图集换代 / 逐 tile 淘汰后 lane 里缓存的 Canvas 值仍是旧 UV，而 `invalidate_text_lines` 只遍历
+/// 文本节点 —— 不标 PAINT 的话 paint 会整桶复用它，编码期逐 tile 判活（`paint/pass.rs`）根本
+/// 不会执行。标 PAINT 让 paint 重新 emit：失效 run 被丢弃（少字优于花字），节点计入诊断计数。
 ///
 /// 返回被标记的节点数（0 = 场景里没有 Canvas 节点，冷路径不产生额外开销）。
 pub(crate) fn mark_canvas_nodes_paint(tree: &mut NodeTree) -> usize {

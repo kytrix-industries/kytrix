@@ -9,6 +9,13 @@
 //! **脏矩形（AOI）上传**（R06-3）：脏集合是**页内矩形**而不是整页宽的行区间。单个 8×11 字形
 //! 只上传 88 B（旧「整页宽 × 行区间」语义要传 11 × page 字节：512² 页上是 5632 B，64 倍放大）。
 //! 合并策略见 [`DirtyRects`]（Skia `SkRegion` 的整数矩形并集思路）。
+//!
+//! **分配身份与淘汰检测**（v2.1 E1d / F15 方案①）：每次分配都占用一个槽位并写入单调递增的
+//! **分配纪元**，`AtlasTile` 因此携带 `(slot, slot_epoch)`。`generation` 只表达整页换代，
+//! 逐 tile LRU 淘汰不换代却会让旧 tile 指向被复用的矩形；[`AtlasAllocator::is_alive`] 用
+//! 上述二元组 O(1) 判定「这个 tile 现在是否还活着」，编码期据此过滤失效的字形 run。
+//! 判据**不进 GPU 字节布局**（`GpuPrimitive` / 三端 shader 不含槽位与纪元），也不改变
+//! 分配 / 淘汰 / 页扩容的语义与复杂度（淘汰仍然 O(1)）。
 
 use etagere::{AllocId, AtlasAllocator as EtagereAllocator, size2};
 
@@ -199,6 +206,18 @@ pub(crate) fn pack_rects(
     }
 }
 
+/// 一个槽位的**当前占用**：释放键 + 分配纪元（E1d：淘汰可检测身份）。
+#[derive(Clone, Copy, Debug)]
+struct Slot {
+    /// etagere 的释放键（[`AtlasAllocator::deallocate`] 的唯一入参）。
+    id: AllocId,
+    /// 该槽位**本次占用**的分配纪元（来自分配器的单调 `next_epoch`）。
+    ///
+    /// 槽位被复用（旧 tile 淘汰 / 释放后重新分配）时纪元一定前进 ⇒ 旧 `AtlasTile` 的
+    /// `(slot, slot_epoch)` 不再匹配，[`AtlasAllocator::is_alive`] 因此 O(1) 判死。
+    epoch: u32,
+}
+
 /// 一个 `AtlasKind` 的**单页**分配器（P02 §10.4）。
 pub(crate) struct AtlasAllocator {
     /// 页档阶梯的上限（生产 = `MAX_ATLAS_PAGE`；测试可以调小，用于在几十个 tile 内验证
@@ -214,8 +233,12 @@ pub(crate) struct AtlasAllocator {
     /// 槽位表：`deallocate` 的幂等守卫（`etagere` 对陈旧 `AllocId` 会 `assert!` panic）。
     ///
     /// P13 起是**生产**字段：`ResourceCache::unload` 需要真正逐块释放（F-147）。
-    tiles: Vec<Option<AllocId>>,
+    /// E1d 起每个占用还带分配纪元（[`Slot::epoch`]），编码期靠它判「tile 是否还活着」。
+    tiles: Vec<Option<Slot>>,
     free: Vec<usize>,
+    /// 下一个分配纪元：**单调递增**，`clear` / `grow` 也不回退（换代的失效由 `generation`
+    /// 承担，纪元只表达"同一槽位是否换过占用"）。
+    next_epoch: u32,
     generation: u32,
     dirty: DirtyRects,
 }
@@ -225,7 +248,8 @@ pub(crate) struct AtlasAllocator {
 pub(crate) struct Allocation {
     /// 释放键（etagere 对非法 id 会 panic，见模块文档）。
     pub id: AllocId,
-    /// 可直接进 `Primitive::GlyphRun` / `Primitive::Image` 的图集矩形（内容区 UV + 代际）。
+    /// 可直接进 `Primitive::GlyphRun` / `Primitive::Image` 的图集矩形（内容区 UV + 代际 +
+    /// 分配身份 `(slot, slot_epoch)`；后者只供 CPU 侧淘汰检测）。
     pub tile: AtlasTile,
     /// 内容区像素矩形（页面坐标，不含 padding）。
     pub content: PhysicalRect,
@@ -244,6 +268,8 @@ impl AtlasAllocator {
             allocator: EtagereAllocator::new(size2(page.0 as i32, page.1 as i32)),
             tiles: Vec::with_capacity(64),
             free: Vec::new(),
+            // 纪元从 1 起：0 是「从未分配」的哨兵（手工构造的 `AtlasTile` 恒为 0 ⇒ 永不误判存活）。
+            next_epoch: 1,
             generation: 1,
             dirty: DirtyRects::default(),
         }
@@ -276,6 +302,10 @@ impl AtlasAllocator {
     }
 
     /// 分配 `content` 大小的内容区（内部加 1 纹素 padding）。`None` = 本页放不下。
+    ///
+    /// 每次成功分配都会占用一个槽位并写入**新的分配纪元**（[`AtlasTile::slot_epoch`]）：
+    /// 复用被 LRU 淘汰 / 释放的旧槽位时纪元一定前进，因此旧 tile 的
+    /// `(slot, slot_epoch)` 永不与复用者相同（[`AtlasAllocator::is_alive`] 的判据）。
     pub(crate) fn allocate(&mut self, content: (u32, u32)) -> Option<Allocation> {
         let (width, height) = content;
         // 1. 拒绝空尺寸
@@ -298,7 +328,23 @@ impl AtlasAllocator {
         // 6. 内容区原点 = 分配矩形左上 + 1 纹素 padding
         let origin_x = rectangle.min.x + 1;
         let origin_y = rectangle.min.y + 1;
-        // 7. UV 用边、不用纹素中心（P02 §10.2）
+        // 7. 槽位 + 分配纪元（E1d：编码期的 O(1) 淘汰检测身份）。
+        //
+        // 槽位数受页容量约束（2048² 页 / 最小 3×3 padded tile ⇒ < 2^32），`as u32` 不截断。
+        let slot = match self.free.pop() {
+            Some(index) => index,
+            None => {
+                self.tiles.push(None);
+                self.tiles.len() - 1
+            }
+        };
+        let slot_epoch = self.next_epoch;
+        self.next_epoch = self.next_epoch.wrapping_add(1);
+        self.tiles[slot] = Some(Slot {
+            id: allocation.id,
+            epoch: slot_epoch,
+        });
+        // 8. UV 用边、不用纹素中心（P02 §10.2）
         let page_w = self.page.0 as f32;
         let page_h = self.page.1 as f32;
         let tile = AtlasTile {
@@ -309,6 +355,8 @@ impl AtlasAllocator {
             u1: (origin_x + width as i32) as f32 / page_w,
             v1: (origin_y + height as i32) as f32 / page_h,
             generation: self.generation,
+            slot: slot as u32,
+            slot_epoch,
         };
         let content_rect = PhysicalRect::new(
             origin_x,
@@ -323,11 +371,6 @@ impl AtlasAllocator {
             rectangle.max.y,
         );
         debug_assert_eq!(tile.atlas, self.kind(), "tile must carry its atlas kind");
-        if let Some(index) = self.free.pop() {
-            self.tiles[index] = Some(allocation.id);
-        } else {
-            self.tiles.push(Some(allocation.id));
-        }
         self.mark_written(content_rect);
         Some(Allocation {
             id: allocation.id,
@@ -340,11 +383,12 @@ impl AtlasAllocator {
     /// 幂等释放：`id` 不在槽位表里就忽略（etagere 对陈旧 id 会 panic）。
     ///
     /// P13 起是生产代码（`ResourceCache::unload` 的唯一调用点）；不换代，因此在用 tile 的 UV 不受影响。
+    /// 释放后该槽位 `None`：用旧 tile 调 [`AtlasAllocator::is_alive`] 立即为假（不必等槽位被复用）。
     pub(crate) fn deallocate(&mut self, id: AllocId) {
         let Some(index) = self
             .tiles
             .iter()
-            .position(|slot| matches!(slot, Some(existing) if *existing == id))
+            .position(|slot| matches!(slot, Some(existing) if existing.id == id))
         else {
             return;
         };
@@ -357,7 +401,27 @@ impl AtlasAllocator {
     pub(crate) fn is_live(&self, id: AllocId) -> bool {
         self.tiles
             .iter()
-            .any(|slot| matches!(slot, Some(existing) if *existing == id))
+            .any(|slot| matches!(slot, Some(existing) if existing.id == id))
+    }
+
+    /// 该 tile 是否仍是本分配器的**活 tile**（E1d / F15 方案①：编码期 O(1) 判据）。
+    ///
+    /// 判据（全部 O(1)，不扫描槽位表、不改变分配/淘汰语义）：
+    /// 1. 图集种类一致（防止拿图片 tile 查字形分配器）；
+    /// 2. `tile.generation == self.generation`（整页换代 / `clear` / `grow` 后旧 tile 失效）；
+    /// 3. 槽位仍被占用，且槽位的分配纪元等于 `tile.slot_epoch`（逐 tile LRU 淘汰 / 释放后
+    ///    复用槽位都会让旧纪元失配 —— `generation` 表达不了的那一类失效）。
+    ///
+    /// 消费方：`Canvas::without_stale_glyph_runs`（paint 编码 `Primitive::Canvas` 前逐 tile
+    /// 过滤）。淘汰仍然 O(1)：本函数不参与分配/淘汰路径。
+    pub(crate) fn is_alive(&self, tile: &AtlasTile) -> bool {
+        tile.atlas == self.kind
+            && tile.generation == self.generation
+            && self
+                .tiles
+                .get(tile.slot as usize)
+                .and_then(Option::as_ref)
+                .is_some_and(|slot| slot.epoch == tile.slot_epoch)
     }
 
     /// 仅探测：`content`（+padding）当前能否在本页分配。**不改动** tiles / 脏矩形 / 代际。
@@ -384,6 +448,9 @@ impl AtlasAllocator {
     }
 
     /// 清空并 `generation += 1`（DPI 变化 / 字体换代 / 容量逃逸）。
+    ///
+    /// 槽位表清空 ⇒ 所有旧 tile 的 [`AtlasAllocator::is_alive`] 为假；分配纪元**不回退**
+    /// （`next_epoch` 保持单调），因此换代后重新分配出来的 tile 不会与旧身份相撞。
     pub(crate) fn clear(&mut self) {
         self.allocator = EtagereAllocator::new(size2(self.page.0 as i32, self.page.1 as i32));
         self.tiles.clear();
@@ -980,6 +1047,61 @@ mod tests {
         assert_eq!(atlas.generation(), before + 1);
         assert!(old_tile.is_stale(atlas.generation()));
         assert!(!old_tile.is_stale(before));
+    }
+
+    /// E1d（F15 方案①）：`AtlasAllocator::is_alive` 是**分配 / 释放 / 槽位复用 / 页扩容 /
+    /// 陈旧槽位**五条路径的 O(1) 判据。
+    ///
+    /// 变异守卫：分配时复用槽位却不换 `slot_epoch` ⇒「复用后旧 tile 必须失效」断言变红
+    /// （本用例正是该变异的目标）。
+    #[test]
+    fn is_alive_tracks_allocation_eviction_slot_reuse_and_page_growth() {
+        let mut atlas = AtlasAllocator::with_page(AtlasKind::Glyph, (64, 64));
+        let first = atlas.allocate((8, 8)).expect("fits");
+        assert!(atlas.is_alive(&first.tile), "刚分配的 tile 必须活着");
+        assert_ne!(
+            first.tile.slot_epoch, 0,
+            "分配纪元从 1 起（0 = 从未分配的哨兵）"
+        );
+
+        // 1) 释放 ⇒ 立刻判死（不必等槽位被复用）。
+        atlas.deallocate(first.id);
+        assert!(!atlas.is_alive(&first.tile), "释放后的 tile 必须失效");
+
+        // 2) 复用同一槽位：纪元前进 ⇒ 旧 tile 永不再活，新 tile 活着。
+        let reused = atlas.allocate((8, 8)).expect("释放出的槽位可复用");
+        assert_eq!(
+            reused.tile.slot, first.tile.slot,
+            "64² 页只放得下一块 10×10 padded tile：必须复用同一槽位"
+        );
+        assert_ne!(
+            reused.tile.slot_epoch, first.tile.slot_epoch,
+            "复用槽位必须换分配纪元（否则旧 tile 会假活）"
+        );
+        assert!(atlas.is_alive(&reused.tile));
+        assert!(
+            !atlas.is_alive(&first.tile),
+            "槽位复用后旧身份必须失效（generation 不变时的逐 tile 淘汰）"
+        );
+
+        // 3) 整页扩容（换代 + 清空 + 纪元继续单调）⇒ 全部旧 tile 失效。
+        assert!(atlas.grow());
+        assert!(!atlas.is_alive(&reused.tile), "页扩容后旧代际 tile 失效");
+
+        // 4) 陈旧 / 越界槽位判死而不是 panic（编码期可能读到任意旧值）。
+        let mut fabricated = reused.tile;
+        fabricated.slot = u32::MAX;
+        fabricated.generation = atlas.generation();
+        assert!(!atlas.is_alive(&fabricated), "越界槽位必须判死");
+
+        // 5) 图集种类不同 ⇒ 不能拿这个分配器判活（槽位表互不相干）。
+        let mut images = AtlasAllocator::with_page(AtlasKind::Image, (64, 64));
+        let image_tile = images.allocate((8, 8)).expect("fits").tile;
+        assert!(
+            !atlas.is_alive(&image_tile),
+            "字形分配器不得把图片 tile 判成活的"
+        );
+        assert!(images.is_alive(&image_tile));
     }
 
     #[test]

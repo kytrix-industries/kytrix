@@ -948,6 +948,8 @@ fn image_primitive_samples_the_image_atlas() {
         u1: 0.5,
         v1: 0.5,
         generation: 0,
+        slot: 0,
+        slot_epoch: 0,
     };
     let scene = one_lane_scene(Primitive::Image(Image {
         bounds: Rect::new(0.0, 0.0, 32.0, 32.0),
@@ -1007,6 +1009,8 @@ fn image_primitive_samples_its_texture_array_layer() {
         u1: 0.5,
         v1: 0.5,
         generation: 0,
+        slot: 0,
+        slot_epoch: 0,
     };
     let scene = one_lane_scene(Primitive::Image(Image {
         bounds: Rect::new(0.0, 0.0, 32.0, 32.0),
@@ -1132,6 +1136,8 @@ fn submit_image_layers(renderer: &mut super::GpuRenderer, layers: u16) {
                 u1: 0.5,
                 v1: 0.5,
                 generation: 0,
+                slot: 0,
+                slot_epoch: 0,
             };
             canvas.push_image(Image {
                 bounds: Rect::new(f32::from(layer) * 32.0, 0.0, 32.0, 32.0),
@@ -1182,6 +1188,8 @@ fn glyph_probe(page: u32) -> bool {
         u1: 11.0 / page as f32,
         v1: 11.0 / page as f32,
         generation: 0,
+        slot: 0,
+        slot_epoch: 0,
     };
     let scene = one_lane_scene(Primitive::GlyphRun(GlyphRun {
         color: Color::WHITE,

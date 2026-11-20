@@ -35,8 +35,11 @@
 //! `(generation, eviction_epoch)`，任一变化都判定失效 —— 句柄因此不会把被复用的 UV 编码上屏。
 //!
 //! 纪元是**进程级**的（图集是进程级共享），与 `generation` 同一真源：`App::sync_atlas_generation_lease`
-//! 把两者打包写进租约。`Canvas` 内已编码的图元不受句柄保护（push 之后发生的淘汰无法从
-//! `AtlasTile` 反推），应用义务见 E1 规格：图集换代/容量压力后重新 `shape_text` 并重建 Canvas。
+//! 把两者打包写进租约。`Canvas` 内已编码的图元不受句柄保护（句柄在 push 后就不在 Canvas 里），
+//! 由**编码期逐 tile 判活**兜底（v2.1 E1d / F15 方案①）：`AtlasTile` 携带分配身份
+//! `(slot, slot_epoch)`，paint 编码 `Primitive::Canvas` 前用 `AtlasAllocator::is_alive` 逐 tile
+//! 校验，失效 run 不编码并计入 `stale_canvas_runs` / [`crate::text::TextDiagnostic::CanvasTextStale`]。
+//! 应用义务不变：句柄 `is_stale()` 为真后重新 `shape_text` 并重建 Canvas（少字优于花字）。
 
 use super::raster::{FontKey, GlyphRasterizer};
 use crate::{

@@ -912,6 +912,122 @@ mod tests {
         );
     }
 
+    /// E1d（F15 方案①）：push 之后发生的**逐 tile LRU 淘汰**（`generation` 不变）同样会让
+    /// Canvas 里已写入的 `AtlasTile` 失效；编码期逐 tile `is_alive` 必须在编码前过滤并计数。
+    ///
+    /// 这正是 F15 记录的场景：旧实现只比「tile 代际 == 当前代际」，逐 tile 淘汰不换代 ⇒
+    /// 过滤 0 条、把被复用的旧 UV 编码上屏（花字 + 无诊断）。本用例断言：代际不变、淘汰纪元
+    /// 前进的帧里，Canvas 的旧 run 被**全部**丢弃、计数 = run 数、诊断可观测。
+    ///
+    /// 变异守卫：`AtlasAllocator::is_alive` 恒真 ⇒ `stale_canvas_runs == 0` ⇒ 本用例 RED。
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn evicted_canvas_tiles_are_filtered_at_encode_time_without_a_generation_bump() {
+        use crate::{
+            paint::{
+                color::Color,
+                primitive::{Quad, QuadPaint},
+            },
+            test_support::app::TestApp,
+            text::TextDiagnostic,
+        };
+
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        // 32² 的小页只放得下一两块 16 ppem 字形 ⇒ 十几个单字 shape 就必然触发 LRU 淘汰。
+        app.app_mut().cap_glyph_atlas_page_for_test(32);
+        let generation = app.app().glyph_atlas_generation_for_test();
+        let handle = app
+            .app_mut()
+            .shape_text("A", &TextStyle::new(16.0), None, &[])
+            .expect("首个小页字形");
+        assert!(!handle.is_stale());
+        let run_count = handle
+            .line()
+            .glyph_runs()
+            .filter(|run| !run.glyphs.is_empty())
+            .count();
+        assert!(run_count > 0);
+        let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 200.0, 40.0));
+        // 非文本图元：编码期安全网只丢弃失效 run，Canvas 本身仍要上屏。
+        canvas.push_quad(Quad {
+            bounds: Rect::new(0.0, 0.0, 200.0, 40.0),
+            corner_radius: [0.0; 4],
+            paint: QuadPaint::Solid {
+                fill: Color::WHITE,
+                border: None,
+            },
+        });
+        // push 时句柄有效：旧实现的「正常路径」把 tile 写进 Canvas 值。
+        assert!(canvas.push_shaped_text(&handle, Point::new(2.0, 3.0)));
+        let canvas_node = {
+            let target = app.app_mut().window_mut(window).expect("窗口存在");
+            let root = target.tree().root();
+            NodeBuilder::canvas(canvas)
+                .layout_override(Rect::new(0.0, 0.0, 200.0, 40.0))
+                .id("canvas.evicted")
+                .build(target.tree_mut(), root)
+                .expect("Canvas 节点")
+        };
+
+        // 淘汰前：租约未变 ⇒ 正常编码、零过滤（回归：正常路径零额外过滤）。
+        let record = app.drain().expect("帧成功");
+        assert_eq!(record.stale_canvas_runs, 0, "淘汰前不得丢弃任何 run");
+        assert_eq!(
+            canvas_scene_glyph_run_count(app.app(), window),
+            run_count,
+            "淘汰前 Canvas 文本必须正常编码"
+        );
+
+        // 容量压力：小页 + 一串互不相同的单字 ⇒ 逐 tile LRU 淘汰（不换代）。句柄因此失活，
+        // 但 Canvas 里已经写好的 tile 仍指向被复用的矩形 —— F15 的失效面。
+        for glyph in ["B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M"] {
+            app.app_mut()
+                .shape_text(glyph, &TextStyle::new(16.0), None, &[])
+                .expect("小页只能靠逐 tile 淘汰腾位置，单字 shape 必须成功");
+        }
+        assert_eq!(
+            app.app().glyph_atlas_generation_for_test(),
+            generation,
+            "本用例只走淘汰路径（generation 不变）"
+        );
+        assert!(
+            app.app().glyph_atlas_eviction_epoch_for_test() > 0,
+            "必须真的发生过逐 tile 淘汰"
+        );
+        assert!(handle.is_stale(), "淘汰后旧句柄必须失活");
+
+        // 编码：`App::shape_text` 的淘汰收尾已把 Canvas 节点标 PAINT，本帧重建 lane。
+        let record = app.drain().expect("帧成功");
+        assert_eq!(
+            record.stale_canvas_runs, run_count,
+            "F15：淘汰后的旧 tile 必须在编码期被过滤（旧实现只比代际 ⇒ 这里会是 0）"
+        );
+        assert_eq!(
+            canvas_scene_glyph_run_count(app.app(), window),
+            0,
+            "编码输出不得含任何被复用的旧 UV（无花字）"
+        );
+        assert!(
+            app.app()
+                .text_diagnostics()
+                .iter()
+                .any(|diagnostic| matches!(
+                    diagnostic,
+                    TextDiagnostic::CanvasTextStale { runs } if *runs == run_count
+                )),
+            "淘汰导致的少字必须经 `TextDiagnostic::CanvasTextStale` 可观测（D17 不静默）"
+        );
+        assert!(
+            app.app()
+                .window(window)
+                .expect("窗口存在")
+                .tree()
+                .get(canvas_node)
+                .is_ok(),
+            "过滤只丢弃失效 run，Canvas 节点本身必须在场"
+        );
+    }
     /// F13（复核轮次 2）：Canvas 失效 run 在编码期被丢弃后必须**有界补帧**。
     ///
     /// 静态窗口不会因为「应用还没重建 Canvas」而自然再出帧：不补帧 ⇒ 应用义务（在下一帧的

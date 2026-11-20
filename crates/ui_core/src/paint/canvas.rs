@@ -15,6 +15,7 @@ use crate::{
         },
         scene::{Lane, MAX_CLIP_DEPTH},
     },
+    render::AtlasAllocator,
     text::{ShapedTextHandle, ShapedTextItem},
 };
 
@@ -85,9 +86,9 @@ impl Canvas {
     /// 被逐 tile 淘汰后已失效时**不产生任何图元**并返回 `false` —— 绝不把旧 UV 编码进图元
     /// （那正是 D-5 修掉的花字）。应用收到 `false` 应丢弃句柄并重新 `App::shape_text`。
     ///
-    /// push **之后**才发生的图集换代由 paint 的编码期安全网兜底
-    /// （[`Canvas::without_stale_glyph_runs`]，失效 run 不编码）；但 Canvas 内容归应用所有，
-    /// 应用仍须在句柄失效后重建 Canvas（`§11.1` 的应用义务）。
+    /// push **之后**才发生的图集换代**或逐 tile LRU 淘汰**（不换代）由 paint 的编码期安全网
+    /// 兜底（[`Canvas::without_stale_glyph_runs`]：逐 tile 判活，失效 run 不编码）；但 Canvas
+    /// 内容归应用所有，应用仍须在句柄失效后重建 Canvas（`§11.1` 的应用义务）。
     ///
     /// 空文本（0 行）返回 `true` 且不产生图元：句柄本身有效，只是没有可画内容。
     ///
@@ -125,13 +126,15 @@ impl Canvas {
         true
     }
 
-    /// 编码期安全网（v2.1 E1b，`§11.1` 的「不允许画旧 UV」）：按当前图集代际过滤 Canvas 内的
-    /// 字形 run。
+    /// 编码期安全网（v2.1 E1b + E1d，`§11.1` 的「不允许画旧 UV」）：按图集**当前状态**过滤
+    /// Canvas 内的字形 run。
     ///
-    /// [`Canvas::push_shaped_text`] 只在 **push 时**校验句柄租约；push 之后同帧发生的图集换代
-    /// （`layout_text` 扩容 / 清空、换字体栈）会让已写入的 `AtlasTile` 指向旧 UV。paint 在 emit
-    /// 本 Canvas 前调用本方法：任一 tile 代际 ≠ 当前代际的 run **整段丢弃**（少字优于花字，与
-    /// 节点文本的 D-5 编码期硬校验同口径），其余图元（含 clip 括号）原样保留、顺序不变。
+    /// [`Canvas::push_shaped_text`] 只在 **push 时**校验句柄租约；push 之后发生的图集换代
+    /// （`layout_text` 扩容 / 清空、换字体栈）**或逐 tile LRU 淘汰**（不换代）都会让已写入的
+    /// `AtlasTile` 指向旧 UV。paint 在 emit 本 Canvas 前调用本方法：逐 tile 用
+    /// [`AtlasAllocator::is_alive`]（代际 + 槽位分配身份 `(slot, slot_epoch)`，O(1)）校验，
+    /// 任一 tile 已失效的 run **整段丢弃**（少字优于花字，与节点文本的 D-5 编码期硬校验同口径），
+    /// 其余图元（含 clip 括号）原样保留、顺序不变。
     ///
     /// 返回 `None` = 没有失效 run（调用方复用原值，零分配）；否则返回过滤后的 Canvas 与
     /// **丢弃的 run 数**（`PaintReport::stale_canvas_runs` 的诊断计数）。
@@ -140,21 +143,17 @@ impl Canvas {
     #[must_use]
     pub(crate) fn without_stale_glyph_runs(
         &self,
-        current_generation: u32,
+        atlas: &AtlasAllocator,
     ) -> Option<(Canvas, usize)> {
-        fn run_is_stale(run: &GlyphRun, current_generation: u32) -> bool {
-            run.glyphs
-                .iter()
-                .any(|glyph| glyph.tile.is_stale(current_generation))
-        }
-
         let mut filtered = Lane::new();
         let mut dropped = 0usize;
         let mut changed = false;
         for primitive in self.lane.primitives() {
             match primitive {
                 Primitive::GlyphRun(run) => {
-                    if run_is_stale(run, current_generation) {
+                    // 逐 tile 判活：整页换代（generation 前进）与逐 tile 淘汰（槽位纪元前进）
+                    // 都由 `is_alive` 覆盖，且都是 O(1)。
+                    if run.glyphs.iter().any(|glyph| !atlas.is_alive(&glyph.tile)) {
                         dropped += 1;
                         changed = true;
                     } else {
@@ -162,16 +161,14 @@ impl Canvas {
                     }
                 }
                 // 嵌套 Canvas（应用构造不出口，但值语义下可能经其它路径出现）：递归过滤。
-                Primitive::Canvas(inner) => {
-                    match inner.without_stale_glyph_runs(current_generation) {
-                        Some((sanitized, inner_dropped)) => {
-                            dropped += inner_dropped;
-                            changed = true;
-                            filtered.push(Primitive::Canvas(Arc::new(sanitized)));
-                        }
-                        None => filtered.push(primitive.clone()),
+                Primitive::Canvas(inner) => match inner.without_stale_glyph_runs(atlas) {
+                    Some((sanitized, inner_dropped)) => {
+                        dropped += inner_dropped;
+                        changed = true;
+                        filtered.push(Primitive::Canvas(Arc::new(sanitized)));
                     }
-                }
+                    None => filtered.push(primitive.clone()),
+                },
                 _ => filtered.push(primitive.clone()),
             }
         }
@@ -297,7 +294,8 @@ mod tests {
             atlas::{AtlasKind, AtlasTile},
             color::Color,
             primitive::{
-                ClipRect, GlyphRun, Image, PositionedGlyph, Primitive, Quad, QuadPaint, Shadow,
+                ClipOp, ClipRect, GlyphRun, Image, PositionedGlyph, Primitive, Quad, QuadPaint,
+                Shadow,
             },
             scene::MAX_CLIP_DEPTH,
         },
@@ -344,6 +342,8 @@ mod tests {
                 u1: 1.0,
                 v1: 1.0,
                 generation: 0,
+                slot: 0,
+                slot_epoch: 0,
             },
             modulation: Color::WHITE,
         }
@@ -371,6 +371,8 @@ mod tests {
                     u1: 0.5,
                     v1: 0.5,
                     generation: 0,
+                    slot: 0,
+                    slot_epoch: 0,
                 },
                 position: Point::new(2.0, 3.0),
                 size: Size::new(8.0, 8.0),
@@ -555,6 +557,8 @@ mod tests {
                 u1: 0.5,
                 v1: 0.5,
                 generation,
+                slot: 0,
+                slot_epoch: 0,
             },
             position: Point::new(2.0, 3.0),
             size: Size::new(8.0, 8.0),
@@ -663,6 +667,8 @@ mod tests {
                     u1: (x + 8.0) / 8.0,
                     v1: 1.0,
                     generation: 3,
+                    slot: 0,
+                    slot_epoch: 0,
                 },
                 position: Point::new(x, 0.0),
                 size: Size::new(8.0, 8.0),
@@ -716,5 +722,80 @@ mod tests {
             })
             .collect();
         assert_eq!(positions, vec![Point::new(1.0, 2.0), Point::new(9.0, 2.0)]);
+    }
+
+    /// E1d（F15 方案①）：编码期安全网按**分配身份**逐 tile 判活。
+    ///
+    /// 这里直接构造「已被复用槽位」的旧 tile（`generation` **不变**）：这正是 E1b 的代际过滤
+    /// 无法检测、F15 记录的场景 —— 逐 tile LRU 淘汰后旧 `GlyphRun` 仍在 Canvas 值里。
+    ///
+    /// 变异守卫：`is_alive` 恒真（或过滤删掉 `is_alive`）⇒ 本用例的「丢弃 1 条 / 保持顺序」
+    /// 断言变红。
+    #[test]
+    fn without_stale_glyph_runs_drops_evicted_tiles_and_keeps_live_ones() {
+        let mut atlas = crate::render::AtlasAllocator::with_page(AtlasKind::Glyph, (64, 64));
+        let kept = atlas.allocate((8, 8)).expect("fits");
+        let evicted = atlas.allocate((8, 8)).expect("fits");
+        let run_with = |tile: AtlasTile| GlyphRun {
+            color: Color::BLACK,
+            glyphs: vec![PositionedGlyph {
+                tile,
+                position: Point::new(1.0, 2.0),
+                size: Size::new(8.0, 8.0),
+            }],
+        };
+        let mut canvas = Canvas::new(bounds());
+        assert!(canvas.push_clip(clip()));
+        canvas.push_text(run_with(evicted.tile));
+        canvas.push_text(run_with(kept.tile));
+        assert!(canvas.pop_clip());
+        canvas.push_quad(quad());
+
+        // 5. 正常路径：全部 tile 活着 ⇒ 零过滤（调用方复用原值、零分配）。
+        assert!(
+            canvas.without_stale_glyph_runs(&atlas).is_none(),
+            "无失效 tile 时不得产生任何过滤（回归：正常路径零额外过滤）"
+        );
+
+        // 1. 逐 tile 淘汰（generation 不变）：槽位被新分配复用、纪元前进 ⇒ 旧 tile 失效。
+        let generation = atlas.generation();
+        atlas.deallocate(evicted.id);
+        let replacement = atlas.allocate((8, 8)).expect("淘汰出的槽位会被复用");
+        assert_eq!(
+            replacement.tile.slot, evicted.tile.slot,
+            "本页只放得下两块：淘汰出的槽位必然被复用"
+        );
+        assert_ne!(
+            replacement.tile.slot_epoch, evicted.tile.slot_epoch,
+            "槽位复用必须换纪元"
+        );
+        assert_eq!(
+            atlas.generation(),
+            generation,
+            "F15 的关键前提：逐 tile 淘汰不换代"
+        );
+
+        let (filtered, dropped) = canvas
+            .without_stale_glyph_runs(&atlas)
+            .expect("失效 tile 的 run 必须被过滤");
+        assert_eq!(dropped, 1, "只丢弃失效的那一条 run（诊断计数 +1）");
+        // 2. 未淘汰 tile 的 run 正常保留；顺序与 clip 括号、非字形图元原样不变。
+        let kinds: Vec<(u8, bool)> = filtered
+            .primitives()
+            .iter()
+            .map(|primitive| match primitive {
+                Primitive::Clip(ClipOp::Push(_)) => (0, false),
+                Primitive::GlyphRun(run) => (1, run.glyphs[0].tile == kept.tile),
+                Primitive::Clip(ClipOp::Pop) => (2, false),
+                Primitive::Quad(_) => (3, false),
+                _ => (9, false),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![(0, false), (1, true), (2, false), (3, false)],
+            "过滤后顺序 = 原顺序，clip 括号与非字形图元保留，只剩有效 tile 的 run"
+        );
+        assert_eq!(filtered.bounds(), canvas.bounds(), "bounds 不变");
     }
 }

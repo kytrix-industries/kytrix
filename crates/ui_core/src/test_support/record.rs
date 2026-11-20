@@ -76,11 +76,11 @@ pub struct FrameRecord {
     /// **放在这里而不是 `RenderedFrame`**：纯 `A11Y` 变化不产生 damage ⇒ 本帧 `Idle`，
     /// 而 `RenderedFrame` 只存在于已提交帧。
     pub a11y: Option<crate::a11y::A11yTreeSnapshot>,
-    /// D-5 的 canvas 半边（v2.1 E1b）：本帧因 `AtlasTile` 代际失效而**未编码**的 Canvas 内
-    /// `GlyphRun` 数（少字优于花字）。
+    /// D-5 的 canvas 半边（v2.1 E1b + E1d）：本帧因 `AtlasTile` **失效**（整页换代，或逐 tile
+    /// LRU 淘汰后 tile 已被复用）而**未编码**的 Canvas 内 `GlyphRun` 数（少字优于花字）。
     ///
-    /// 非零说明应用持有含旧 UV 的 Canvas（`push_shaped_text` 之后图集换代）；应用义务是重新
-    /// `shape_text` 并用新句柄重建 Canvas。引擎无法代劳（Canvas 值归应用所有）。
+    /// 非零说明应用持有含旧 UV 的 Canvas（`push_shaped_text` 之后图集换代 / 容量淘汰）；应用义务
+    /// 是重新 `shape_text` 并用新句柄重建 Canvas。引擎无法代劳（Canvas 值归应用所有）。
     pub stale_canvas_runs: usize,
     /// 发布 → 上屏（下界）的时长（A4）：`presented_at − published_at`，来自该帧的
     /// `FrameFeedback`（`Window::poll_renderer` 在完成反馈到达时回填）。

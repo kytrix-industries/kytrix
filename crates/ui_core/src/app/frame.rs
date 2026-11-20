@@ -217,17 +217,20 @@ pub(crate) fn frame(
     }
     // 图集页上传（P13：逐窗口分发，两张页分开、顺序固定以便帧记录复现）。
     app.upload_atlas_pages();
-    // D-5：图集代际在本帧 paint 之前取一次（`paint_frame` 的绘制前硬校验用）。
-    let atlas_generation = app.atlas.generation();
-    // 借用拆分：`windows` 与 `geometry` 是不同字段，可同时借出（几何表只读）。
+    // D-5 / E1d：图集句柄在本帧 paint 之前取一次（`paint_frame` 的绘制前硬校验与编码期
+    // 逐 tile 存活校验都用它）。
+    // 借用拆分：`windows` / `geometry` / `atlas` 是不同字段，可同时借出（几何表与图集只读）。
     // 先取结果、结束后再处理错误 —— 解构 `self` 期间不能再调 `self.abort_frame`。
     let painted = {
         let App {
-            windows, geometry, ..
+            windows,
+            geometry,
+            atlas,
+            ..
         } = app;
         windows
             .get_mut(&window)
-            .map(|target| target.paint_frame(geometry, Some(atlas_generation)))
+            .map(|target| target.paint_frame(geometry, Some(&*atlas)))
     };
     let mut paint = match painted {
         Some(Ok(report)) => report,
@@ -315,9 +318,10 @@ pub(crate) fn frame(
         }
         app.request_frame();
     }
-    // E1b F2：canvas 文本的编码期安全网丢掉了失效 run（少字优于花字）。Canvas 归应用所有，
-    // 引擎不能替它重建 —— 用文本诊断把「少字」变成可观测事实（D17），应用据此重新
-    // `shape_text` 并重建 Canvas。诊断环有界 + 同值去重，不会随帧数增长。
+    // E1b F2 + E1d：canvas 文本的编码期安全网丢掉了失效 run（整页换代 **或** 逐 tile LRU 淘汰
+    // 导致 tile 已被复用；少字优于花字）。Canvas 归应用所有，引擎不能替它重建 —— 用文本诊断把
+    // 「少字」变成可观测事实（D17），应用据此重新 `shape_text` 并重建 Canvas。诊断环有界 +
+    // 同值去重，不会随帧数增长。
     // E1c F13：应用的重建义务只有在**下一帧**的 `on_frame` 钩子里才可执行；静态窗口在下一次
     // 平台唤醒前不会再出帧 ⇒ 不补帧的话 canvas 文本会无限期缺失（与节点文本的 D-5 补齐路径
     // 对称）。每个图集代际至多补一帧：应用忽略义务时同一代际的后续帧不再请求（I3 不空转）。

@@ -3632,6 +3632,8 @@ mod tests {
             u1: 1.0,
             v1: 1.0,
             generation: 0,
+            slot: 0,
+            slot_epoch: 0,
         };
         let scene = scene_with(|scene, lane| {
             assert!(scene.push(
@@ -3662,6 +3664,8 @@ mod tests {
             u1: u0 + 0.1,
             v1: 0.1,
             generation: 0,
+            slot: 0,
+            slot_epoch: 0,
         };
         let scene = scene_with(|scene, lane| {
             assert!(scene.push(
@@ -4032,6 +4036,8 @@ mod tests {
             u1: 0.3,
             v1: 0.4,
             generation: 0,
+            slot: 0,
+            slot_epoch: 0,
         };
         let scene = scene_with(|scene, lane| {
             assert!(scene.push(
@@ -4070,6 +4076,8 @@ mod tests {
             u1: 1.0,
             v1: 1.0,
             generation: 0,
+            slot: 0,
+            slot_epoch: 0,
         };
         let scene = scene_with(|scene, lane| {
             assert!(scene.push(
@@ -4096,6 +4104,8 @@ mod tests {
                 u1: 1.0,
                 v1: 1.0,
                 generation: 1,
+                slot: 0,
+                slot_epoch: 0,
             };
             let scene = scene_with(|scene, lane| {
                 assert!(scene.push(
