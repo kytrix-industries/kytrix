@@ -783,6 +783,7 @@ mod tests {
     #[test]
     fn canvas_referencing_geometry_is_marked_when_the_geometry_data_updates() {
         let mut app = TestApp::new();
+        let window = app.window_id();
         let id = register_long(&mut app, 4);
         let node = mount_canvas(&mut app, &[id]);
         let _ = app.drain().expect("首帧");
@@ -812,6 +813,27 @@ mod tests {
             damage_hits(&record.damage, 0.0, 0.0),
             "Canvas 重建必须把它的内容范围并入 damage：{:?}",
             record.damage
+        );
+        // 端到端（headless 合成路径）：编码出的几何 op 必须携带**真实快照**。修复前
+        // `SceneDelta.geometries` 不含 Canvas 内几何 ⇒ 合成端 catalog 查不到 ⇒ 这里会是
+        // `missing_snapshot`（revision 0 / 空页），GPU 侧随之报 `GeometryRegister`。
+        let encoded = app
+            .app()
+            .window(window)
+            .expect("窗口存在")
+            .encoded_geometry();
+        let draw = encoded
+            .iter()
+            .find(|draw| draw.id == id)
+            .expect("Canvas 内几何必须被编码成几何 op");
+        assert!(
+            draw.snapshot.revision() > 0,
+            "Canvas 内几何必须携带真实快照（修复前是 missing_snapshot）：revision={}",
+            draw.snapshot.revision()
+        );
+        assert!(
+            !draw.snapshot.vertex_pages().is_empty() && !draw.snapshot.index_pages().is_empty(),
+            "真实快照必须有页数据（空页会让 GPU 报 GeometryRegister）"
         );
     }
 
