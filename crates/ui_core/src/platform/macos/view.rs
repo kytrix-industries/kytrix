@@ -50,7 +50,7 @@ use crate::{
         ime::{CommitVerdict, KeyScopeToken, key_visible, replacement_range},
         macos::{a11y::MacA11y, ime::ImeState, menu},
         macos_close::CloseBridge,
-        macos_drag::drag_region_at,
+        macos_drag::{WindowDragState, drag_region_at},
         menu::{EditAvailability, MenuCommand},
     },
 };
@@ -96,6 +96,10 @@ pub(crate) struct ViewIvars {
     /// （`NativeWindow::sync_drag_regions`，每轮对账、值变化才写）；`mouseDown:` 只读：
     /// 命中即把拖动交给 WindowServer 且**不**投递 `PointerDown`（拖动区是窗口 chrome）。
     drag_regions: RefCell<Vec<Rect>>,
+    /// 拖动区命中后的主键指针事件配对状态（RB-08）：命中期间补发的 Up / Dragged 没有配对的
+    /// Down，必须吞掉。状态机（含「何时清状态」）在平台无关的
+    /// [`crate::platform::macos_drag::WindowDragState`]，这里只存当前值。
+    window_drag: Cell<WindowDragState>,
 }
 
 define_class!(
@@ -274,11 +278,23 @@ define_class!(
 
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, event: &NSEvent) {
+            // RB-08：`mouseMoved:` 只在**没有按键按下**时到达 ⇒ 它证明上一次拖动会话已经结束
+            // （AppKit 可能始终没补发 `mouseUp:`）。在这里清掉配对状态，否则拖动结束后悬停
+            // 会一直冻到下一次点击。悬停移动本身与拖动无关，照常投递。
+            let mut drag = self.ivars().window_drag.get();
+            drag.hover_move();
+            self.ivars().window_drag.set(drag);
             self.push_pointer(event, PointerPhase::Move);
         }
 
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &NSEvent) {
+            // RB-08：命中拖动区的那次按下把拖动交给了 WindowServer、没有投递 `PointerDown`；
+            // AppKit 补发的主键 `mouseDragged:` 因此没有配对的 Down ⇒ 吞掉（拖动区是窗口
+            // chrome，拖动期间不进入引擎指针分发）。
+            if self.ivars().window_drag.get().is_dragging() {
+                return;
+            }
             self.push_pointer(event, PointerPhase::Move);
         }
 
@@ -296,15 +312,27 @@ define_class!(
         fn mouse_down(&self, event: &NSEvent) {
             // X2：自绘标题栏拖动区命中 ⇒ 同步交给 WindowServer 拖动，且**不**投递
             // `PointerDown`（不开始引擎指针会话 —— 拖动期间没有后续 mouseUp 保证）。
-            if self.begin_window_drag(event) {
-                return;
+            //
+            // RB-08：命中状态记进 `WindowDragState`，后续主键 Up / Dragged 据此吞掉；非命中
+            // 的按下会清掉上一次拖动可能残留的状态（拖动区外的一次点击 = 正常指针会话）。
+            let hit = self.begin_window_drag(event);
+            let mut drag = self.ivars().window_drag.get();
+            let deliver = drag.primary_down(hit);
+            self.ivars().window_drag.set(drag);
+            if deliver {
+                self.push_pointer(event, PointerPhase::Down(PointerButton::Primary));
             }
-            self.push_pointer(event, PointerPhase::Down(PointerButton::Primary));
         }
 
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, event: &NSEvent) {
-            self.push_pointer(event, PointerPhase::Up(PointerButton::Primary));
+            // RB-08：拖动区消费的按下没有投递 Down，补发的 Up 同样没有配对 ⇒ 吞掉。
+            let mut drag = self.ivars().window_drag.get();
+            let deliver = drag.primary_up();
+            self.ivars().window_drag.set(drag);
+            if deliver {
+                self.push_pointer(event, PointerPhase::Up(PointerButton::Primary));
+            }
         }
 
         #[unsafe(method(rightMouseDown:))]
@@ -756,6 +784,7 @@ impl GuiView {
             pointer_inside: Cell::new(false),
             edit: Cell::new(EditAvailability::NONE),
             drag_regions: RefCell::new(Vec::new()),
+            window_drag: Cell::new(WindowDragState::default()),
         });
         // SAFETY: `initWithFrame:` 是 NSView 的指定初始化器；`this` 由 `alloc` 产生且未初始化。
         let this: Retained<Self> = unsafe {
@@ -925,6 +954,10 @@ impl GuiView {
     /// 返回 `true` = 本次按下已被拖动区消费（调用方不得再投递 `PointerDown`）。拖动由
     /// WindowServer 同步接管（Apple 文档：可参与 Space 切换等系统行为；调用立即返回，可能
     /// 不再收到 mouseUp）—— 因此绝不能给应用发一个没有后续 `PointerUp` 的按下会话。
+    ///
+    /// 返回 `false` 有两种情形：没命中拖动区；或命中了但窗口已消失（无法发起原生拖动）——
+    /// 后者必须回退成普通点击（投递 `PointerDown`），否则这次点击被静默吃掉。配对状态机
+    /// （[`WindowDragState`]）据此区分「命中且已拖动」与「命中但没拖动」。
     fn begin_window_drag(&self, event: &NSEvent) -> bool {
         let position = self.logical_point(event.locationInWindow());
         // 借用在判定后立即结束，避免 `performWindowDragWithEvent:` 期间 AppKit 回调进来
