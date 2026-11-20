@@ -994,7 +994,7 @@ impl SharedGpu {
             "a non-empty rebuild must recreate at least one atlas page"
         );
         let kinds: Vec<AtlasKind> = pending.iter().map(|request| request.kind).collect();
-        self.transition_atlas_layout(&atlas, &kinds)?;
+        self.transition_atlas_layout(atlas, &kinds)?;
         {
             let descriptors = self
                 .descriptors
