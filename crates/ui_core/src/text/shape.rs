@@ -286,6 +286,32 @@ impl ShapedText {
         self.style.same_shaping_inputs(style)
     }
 
+    /// 快照里所有行内所有 run 是否都**不是** RTL（bidi level 为偶数）。
+    ///
+    /// 用途：`TextStyle::direction == Auto` 的**解析结果**判定 —— `Auto` 的基准方向由首个强方向
+    /// 字符解析，**没有任何 RTL run ⟺ 解析成 LTR**（首个强方向字符若是 RTL，必然产生 RTL run）。
+    /// 它**不是**「段落方向」本身：显式 `Rtl` 段落的段落方向是 RTL，但纯 LTR 文本的 run 在
+    /// UAX #9 里取下一个偶数 level（因此本方法对它们是 `true`）—— 显式方向由调用方按声明值
+    /// 判定，这个方法只回答「有没有 RTL run」。
+    ///
+    /// - parley 路径：遍历所有行、所有 run 的 `Run::is_rtl()`。断行只切分 run 的区间、不改变
+    ///   bidi level，所以按当前断行状态遍历不会漏掉段落里的方向段；
+    /// - 快速路径（[`SimpleShaped`]）：恒 `true`。`fast_path::eligibility` 已显式拒绝
+    ///   `TextDirection::Rtl`（`Ineligible::Rtl`），所以走到这里的段落基准方向只可能是 LTR，
+    ///   而 `fast_path::ALPHABET` 只有 ASCII 数字与 `. , + - % / :`（bidi 类 `EN` / `CS` / `ES` /
+    ///   `ET`，在 LTR 段落里全部是偶数 level）—— 不会形成 RTL run。`ALPHABET` 变化
+    ///   （例如加入 RTL 字母）时必须同步这里。
+    pub(crate) fn has_only_ltr_runs(&self) -> bool {
+        match &self.kind {
+            ShapedKind::Parley(snapshot) => snapshot
+                .borrow()
+                .layout
+                .lines()
+                .all(|line| line.runs().all(|run| !run.is_rtl())),
+            ShapedKind::Simple(_) => true,
+        }
+    }
+
     /// max-content 尺寸（逻辑像素）。
     ///
     /// **宽度**是全文不折行时的内容宽（`layout_text` 在「无内容宽」时拿它当回退宽度，
@@ -1123,7 +1149,7 @@ mod tests {
     use super::family_list;
     use crate::text::{
         FontStack, InlineAlign, InlineBoxSpec, ShapedTextItem, TextAlign, TextContent,
-        TextDiagnostic, TextStyle, TextWrap,
+        TextDiagnostic, TextDirection, TextStyle, TextWrap,
     };
 
     struct Harness {
@@ -3242,6 +3268,68 @@ mod tests {
         assert!(
             distinct.len() >= 2,
             "different families must produce different advances: {widths:?}"
+        );
+    }
+
+    /// E4b：`has_only_ltr_runs` 必须回答**解析后**的 bidi level —— `TextStyle.direction` 默认是
+    /// `Auto`，也要能答（否则默认样式的应用永远拿不到 `character_positions`）。
+    ///
+    /// 变异守卫：让它恒返回 `true` ⇒ 混排 RTL 用例红；让它按 `TextStyle.direction` 字面值判
+    /// ⇒ `Auto` 的两个 LTR 用例红。
+    #[test]
+    fn has_only_ltr_runs_follows_the_resolved_bidi_levels() {
+        let mut harness = Harness::new();
+        for (text, style, expected) in [
+            // `Auto` + 纯 LTR（字母不在快速路径字符集里 ⇒ 走 parley）。
+            ("Hello", TextStyle::new(16.0), true),
+            // `Auto` + CJK/emoji：非 ASCII，但都是 LTR 强方向。
+            ("价🌍ab", TextStyle::new(16.0), true),
+            // `Auto` + 段内混排：基准方向由首个强方向字符解析成 LTR，但段内有 RTL run ——
+            // 单一 `text_direction` 表达不了，必须答 `false`。
+            ("abc אבג", TextStyle::new(16.0), false),
+            // 显式 LTR：全 LTR run。
+            (
+                "abc",
+                TextStyle::new(16.0).with_direction(TextDirection::Ltr),
+                true,
+            ),
+            // 显式 LTR + 希伯来文：LTR 段落里的 RTL 段是奇数 level ⇒ 有 RTL run。
+            (
+                "אבג",
+                TextStyle::new(16.0).with_direction(TextDirection::Ltr),
+                false,
+            ),
+            // 显式 RTL 段落里的纯 LTR 文本：UAX #9 把它解析成偶数 level（段落方向 RTL，但
+            // run 不 RTL）—— 本方法只回答「有没有 RTL run」，声明方向由调用方判定。
+            (
+                "abc",
+                TextStyle::new(16.0).with_direction(TextDirection::Rtl),
+                true,
+            ),
+        ] {
+            let direction = style.direction;
+            let shaped = harness.shape(text, style);
+            assert_eq!(
+                shaped.has_only_ltr_runs(),
+                expected,
+                "{text:?} direction={direction:?}"
+            );
+        }
+    }
+
+    /// 快速路径快照（单行 ASCII 数字）永远没有 RTL run：`Simple` 分支的回答。ASCII 数字是
+    /// bidi 类 `EN`（偶数 level），快速路径的字符集也排除了 RTL 文本。
+    #[test]
+    fn the_digit_fast_path_snapshot_never_has_rtl_runs() {
+        let mut text_cx = crate::text::context::TextContext::new();
+        let content = TextContent::new("42150", TextStyle::new(16.0).with_wrap(TextWrap::NoWrap));
+        let shaped = text_cx.shape_cached(&content).0;
+        if text_cx.take_fast_path_stats().hits == 0 {
+            return; // 宿主字体拒绝快速路径（合法降级）：Simple 分支无从构造
+        }
+        assert!(
+            shaped.has_only_ltr_runs(),
+            "ASCII 数字的快速路径快照永远是 LTR run"
         );
     }
 }

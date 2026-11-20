@@ -96,8 +96,11 @@ pub(crate) fn selection(lengths: &[u8], selection: A11yTextSelection) -> A11yTex
 /// - `TextRun` 已被 shape 且与当前文本一致：直接复用 `NodeTree::text_caret_rect` 的**全部**
 ///   输入校验（`text == shaped.text`、`same_shaping_inputs`、行内盒一致、laid 宽度 == 期望宽度、
 ///   byte 在 char boundary）—— 与 `apply` 用的是同一份真值，不会读到半新半旧的 shape；
-/// - **显式 LTR**：`Auto` 需要逐段方向判定、RTL 的 inline 轴方向相反，而 consumer 只处理单一
-///   `text_direction`（D6-A）；
+/// - **解析后是 LTR**：consumer 只处理单一 `text_direction`，RTL 的 inline 轴方向相反（D6-A）。
+///   判定按**解析后**的结果（[`ShapedText::has_only_ltr_runs`]）而不是 `TextStyle.direction`
+///   的字面值 —— 后者默认是 `Auto`（`TextStyle::new` / `Default`），按字面值判会让默认样式的
+///   应用永远拿不到 caret 度量（Chromium `AXPlatformNodeTextRangeProvider` 与 Qt
+///   `QAccessibleTextInterface::characterRect` 对文本域恒提供字符度量）；
 /// - **单行**：所有 grapheme 起点 + 末尾 caret 必须落在同一 y（软换行/硬换行都会让 y 变化；
 ///   AccessKit 的位置模型忽略 y，多行发出去会命中错行）。
 pub(crate) fn character_metrics(
@@ -118,13 +121,23 @@ pub(crate) fn character_metrics(
     if described_bytes != content.text.len() {
         return None;
     }
-    if content.style.direction != TextDirection::Ltr {
+    let slot = tree.text_slot(node)?;
+    let shaped = slot.shaped();
+    // E4b：方向按**解析后**的段落方向判定（`TextStyle.direction` 默认 `Auto`，按字面值判会让
+    // 默认样式的应用永远不输出字符度量）：
+    // - `Ltr`：显式声明，恒可表达；
+    // - `Rtl`：inline 轴方向与 AccessKit 的 LTR 位置模型相反，不输出（D6-A）；
+    // - `Auto`：问已 shape 的快照解析出的实际方向 —— 全 LTR run 才输出。
+    let direction_is_ltr = match content.style.direction {
+        TextDirection::Ltr => true,
+        TextDirection::Rtl => false,
+        TextDirection::Auto => shaped.has_only_ltr_runs(),
+    };
+    if !direction_is_ltr {
         return None;
     }
-    let slot = tree.text_slot(node)?;
     // 完整输入校验（失败 = 文本/样式/宽度与上次 shape 不一致，等文本 pass 之后再来）。
     tree.text_caret_rect(node, 0).ok()?;
-    let shaped = slot.shaped();
     let width = f32::from_bits(slot.laid_width_bits());
     let alignment = content.style.alignment;
     let scale_factor = scale.factor();
