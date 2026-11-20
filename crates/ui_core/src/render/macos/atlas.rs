@@ -813,17 +813,18 @@ mod tests {
         let mut queue = Queue::new(&device, std::sync::Arc::new(InFlight::new())).expect("queue");
         let mut atlas = AtlasTextures::new(&mut device).expect("atlas");
 
-        // 第 1 帧：layer 0 整页上传（全 0）建立 `TEST_PAGE² × 4` 的数组。
+        // 第 1 帧：layer 0 整页上传（全 0），数组按 spec 建成 2 层（既有第 2 页存在）。
         atlas.queue_upload(
             AtlasKind::Image,
             0,
-            spec(TEST_PAGE, 1),
+            spec(TEST_PAGE, 2),
             page(),
             full_rects(),
         );
         submit_frame(&mut device, &mut queue, &mut atlas, 1);
+        assert_eq!(atlas.image.layers, 2, "2 层的 spec ⇒ 数组一开始就是 2 层");
 
-        // 第 2 帧：layer 1 的第 5 行 = 不透明深蓝。
+        // 第 2 帧：layer 1 的第 5 行 = 不透明深蓝（数组已是 2 层，不触发扩层重建）。
         let mut second = page();
         fill_row(&mut second, 5, [0x11, 0x22, 0x33, 0xFF]);
         atlas.queue_upload(
