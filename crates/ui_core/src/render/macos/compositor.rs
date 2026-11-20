@@ -456,20 +456,21 @@ impl GpuRenderer {
 
     /// 图集上传入口（P09 的字形页与 P15 的图片页共用）。
     ///
-    /// `kind` 决定纹理（字形 1 层 / 图片 `MAX_IMAGE_PAGES` 层的 texture array，D-9-c）；
-    /// `layer` 是目标数组层号（字形恒 0；图片 = 图集页索引），`extent` 是该层的页边长。
+    /// `kind` 决定纹理（字形 1 层 / 图片「层数 = 当前打开的图集页数」的 texture array）；
+    /// `layer` 是目标数组层号（字形恒 0；图片 = 图集页索引），`spec` 是该 array 的规格
+    /// （页边长 + 层数）。
     /// `pixels` 按**所有权**移动进来（`AtlasTextures` 的待上传槽直接持有它），避免槽 → 纹理
     /// 之间再复制一次整页（图片页 16 MiB）；与 Windows 的 `queue_atlas_upload` 同一约定。
     pub(crate) fn queue_atlas_upload(
         &mut self,
         kind: AtlasKind,
         layer: u16,
-        extent: u32,
+        spec: crate::render::AtlasArraySpec,
         pixels: Vec<u8>,
         rects: crate::render::atlas::DirtyRects,
     ) {
         self.debug_assert_gpu_thread("queue_atlas_upload");
-        self.atlas.queue_upload(kind, layer, extent, pixels, rects);
+        self.atlas.queue_upload(kind, layer, spec, pixels, rects);
     }
 
     /// 该图集是否有**任意层**的上传已入队、还没被命令缓冲消费（离屏目标的空闲判据）。

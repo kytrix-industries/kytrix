@@ -1,10 +1,11 @@
 //! 图集纹理：字形 `R8Unorm` + 图片 `BGRA8Unorm_sRGB` 的 **texture array**（D-9-c），脏矩形（AOI）
 //! 上传。
 //!
-//! 字形图集固定 **1 层**、图片图集固定 [`MAX_IMAGE_PAGES`] 层；**层号 = 图集页索引**，shader 用
-//! `params1.y` 作 texture array 的层号采样（三端同一契约）。像素来源由上层持有（P05 §10.6 的
-//! 定案：渲染层不保 CPU 副本）；本模块只做「staging 写 → blit 到数组层」与「generation 变化时整页
-//! 重传」。
+//! 字形图集恒 **1 层**；图片图集的层数 = App 当前打开的图集页数（`ImageAtlasPager::page_count`，
+//! [`crate::render::AtlasArraySpec`]），**随页数增长**（只增不减）。**层号 = 图集页索引**，shader
+//! 用 `params1.y` 作 texture array 的层号采样（三端同一契约）。像素来源由上层持有（P05 §10.6 的
+//! 定案：渲染层不保 CPU 副本）；本模块只做「staging 写 → blit 到数组层」与「规格变化时重建数组
+//! + 整页重传」。懒创建：没有图片时图片图集是 1×1×1 的占位数组（4 B，不是 16 MiB）。
 //!
 //! **staging 是每 in-flight 槽一块常驻的 `MTLBuffer`**（DEVIATIONS F-212）：槽位复用由
 //! `Queue::begin` 的三槽 permit 保证「上一帧已完成」，因此本帧可以直接覆盖写；容量不够时
@@ -39,7 +40,7 @@ use crate::{
     },
 };
 
-/// 初始化时的占位页（1×1）：让参数缓冲里的图集纹理在第一次上传之前也有效。
+/// 初始化时的占位页（1×1×1）：让参数缓冲里的图集纹理在第一次上传之前也有效。
 const PLACEHOLDER_PAGE: u32 = 1;
 
 /// staging 的每块起点 / 行 pitch 的对齐：Metal 的 buffer→texture 拷要求行 pitch 是像素尺寸的
@@ -64,7 +65,7 @@ struct MetalRect {
 /// 一张图集页（texture array）。
 struct AtlasTexture {
     kind: AtlasKind,
-    /// texture array 的层数（字形 1、图片 [`MAX_IMAGE_PAGES`]）：层号 = 图集页索引。
+    /// texture array 的层数（字形 1、图片 = App 当前打开的图集页数）：层号 = 图集页索引。
     layers: u32,
     texture: Retained<ProtocolObject<dyn MTLTexture>>,
     /// 每 in-flight 槽一块常驻 staging（DEVIATIONS F-212）：槽位复用由 `Queue::begin` 的
@@ -73,8 +74,19 @@ struct AtlasTexture {
     /// 占位页没有句柄（它从未进入任何帧）；真实页重建时旧句柄按提交序号 retire。
     handle: Option<GpuResourceHandle>,
     page: u32,
-    /// `[layer]`：每层一个待上传槽（D-9-c：一帧内可能同帧上传多个层）。
+    /// `[layer]`：每层一个待上传槽（一帧内可能同帧上传多个层）。长度 ≥ 数组当前层数
+    /// （入队时按 `AtlasArraySpec::layers` 扩到需要的长度）。
     pending: Vec<Option<PendingUpload>>,
+}
+
+impl AtlasTexture {
+    /// 该数组的当前规格（页边长 + 层数）—— 上传器对齐 / 重建判据。
+    fn spec(&self) -> crate::render::AtlasArraySpec {
+        crate::render::AtlasArraySpec {
+            page: self.page,
+            layers: self.layers,
+        }
+    }
 }
 
 /// 每 in-flight 槽一块常驻 staging（`StorageModeShared`，CPU 直接写）。
@@ -84,13 +96,14 @@ struct StagingBuffer {
     capacity: usize,
 }
 
-/// 待上传的一层（打包 `pixels` + 层号 + 层尺寸 + 脏矩形）。
+/// 待上传的一层（打包 `pixels` + 层号 + array 规格 + 脏矩形）。
 #[derive(Debug)]
 struct PendingUpload {
     /// texture array 层号（字形恒 0；图片 = 图集页索引）。
     layer: u16,
-    /// 该层的页边长（纹素）。
-    page: u32,
+    /// 入队时 App 要求的 array 规格（页边长 + 层数）。层数可能大于当前数组层数（新页刚打开）
+    /// ⇒ `prepare` 必须先扩层再 blit。
+    spec: crate::render::AtlasArraySpec,
     /// `rects` 顺序逐矩形紧密打包的字节（整页上传时就是整页）。
     pixels: Vec<u8>,
     rects: DirtyRects,
@@ -101,7 +114,7 @@ pub(crate) struct AtlasTextures {
     glyph: AtlasTexture,
     image: AtlasTexture,
     /// `[kind][layer]`：`prepare` 重建过纹理之后，本帧该层必须整页上传（新数组内容未定义）。
-    /// 图片固定 [`MAX_IMAGE_PAGES`] 层、字形只有下标 0，数组取两者上限。
+    /// 下标上界 = `MAX_IMAGE_PAGES`（页数上限；数组当前层数可能更小）。
     force_full: [[bool; MAX_IMAGE_PAGES as usize]; 2],
 }
 
@@ -125,32 +138,35 @@ impl AtlasTextures {
 
     /// 登记一层的脏矩形上传（`pixels` 是 `rects` 顺序逐矩形紧密打包的字节，R06-3）。
     ///
-    /// `layer` 是 texture array 的层号（字形恒 0；图片 = 图集页索引），`page` 是该层页边长；
-    /// 长度必须等于 [`DirtyRects::byte_count`]（release 也硬断言：越界读会读穿堆）。
+    /// `layer` 是 texture array 的层号（字形恒 0；图片 = 图集页索引），`spec` 是该 array 的
+    /// **运行时**规格（页边长 + 层数；图片层数 = 当前打开的图集页数）；层号硬断言按
+    /// `spec.layers` 校验，不是 `MAX_IMAGE_PAGES` 常量。长度必须等于
+    /// [`DirtyRects::byte_count`]（release 也硬断言：越界读会读穿堆）。
     pub(crate) fn queue_upload(
         &mut self,
         kind: AtlasKind,
         layer: u16,
-        page: u32,
+        spec: crate::render::AtlasArraySpec,
         pixels: Vec<u8>,
         rects: DirtyRects,
     ) {
         assert!(
-            u32::from(layer) < kind.layers(),
+            u32::from(layer) < spec.layers,
             "atlas layer {layer} out of range for {kind:?}"
         );
-        let expected = rects.byte_count(page, texel_bytes(kind));
+        let expected = rects.byte_count(spec.page, texel_bytes(kind));
         assert_eq!(
             pixels.len(),
             expected,
-            "atlas payload size mismatch for {kind:?} layer {layer}: expected {expected} bytes for the dirty rects of a {page}² page, got {}",
+            "atlas payload size mismatch for {kind:?} layer {layer}: expected {expected} bytes for the dirty rects of a {}² page, got {}",
+            spec.page,
             pixels.len()
         );
         let texture = match kind {
             AtlasKind::Glyph => &mut self.glyph,
             AtlasKind::Image => &mut self.image,
         };
-        texture.queue_upload(layer, page, pixels, rects);
+        texture.queue_upload(layer, spec, pixels, rects);
     }
 
     /// 本帧是否有待上传的矩形（任一层）。
@@ -166,13 +182,14 @@ impl AtlasTextures {
         }
     }
 
-    /// 在编码本帧 blit **之前**把页尺寸变化落地（DEVIATIONS F-208）。
+    /// 在编码本帧 blit **之前**把 array 规格变化落地（DEVIATIONS F-208）。
     ///
     /// 旧纹理可能在飞帧仍采样：新数组建好后把旧纹理句柄按本帧的 `sequence`（`u64` 提交序号）
     /// retire。绑定是每帧 `setFragmentTexture` 现场写的，不需要额外重写。
     ///
-    /// 同一图集的所有层共享同一页尺寸（图片图集所有页等大）；页尺寸只在字形图的扩容阶梯
-    /// （512 → 1024 → 2048）上变化。重建之后本帧在该图集上的每个待上传层都必须是整页上传。
+    /// 规格变化 = 页尺寸（字形扩容阶梯 / App 换代）或**层数增长**（图片图集开了新页；App 在
+    /// 该帧对每个已打开页整页重传，因此重建后的数组内容全部由本帧的待上传层补齐 —— 增长不会
+    /// 丢已上传的图）。重建之后本帧在该图集上的每个待上传层都必须是整页上传。
     pub(crate) fn prepare(
         &mut self,
         device: &mut Device,
@@ -186,7 +203,7 @@ impl AtlasTextures {
                 AtlasKind::Glyph => &mut self.glyph,
                 AtlasKind::Image => &mut self.image,
             };
-            let Some(page) = texture.pending_page() else {
+            let Some(spec) = texture.pending_spec() else {
                 continue;
             };
             debug_assert!(
@@ -194,13 +211,13 @@ impl AtlasTextures {
                     .pending
                     .iter()
                     .flatten()
-                    .all(|pending| pending.page == page),
+                    .all(|pending| pending.spec.page == spec.page),
                 "all layers of one atlas must share the same page extent"
             );
-            if page == texture.page {
+            if spec == texture.spec() {
                 continue;
             }
-            texture.recreate(device, queue, sequence, page)?;
+            texture.recreate(device, queue, sequence, spec)?;
             rebuilt.mark(kind);
             // 重建后的数组内容未定义：本帧该图集上的每个待上传层都必须整页上传。
             let mut force_layers = Vec::new();
@@ -249,15 +266,19 @@ impl AtlasTextures {
 
 impl AtlasTexture {
     fn new(device: &mut Device, kind: AtlasKind) -> Result<Self, EngineError> {
-        let texture = create_texture(device, kind, PLACEHOLDER_PAGE)?;
+        let placeholder = crate::render::AtlasArraySpec {
+            page: PLACEHOLDER_PAGE,
+            layers: 1,
+        };
+        let texture = create_texture(device, kind, placeholder)?;
         Ok(Self {
             kind,
-            layers: kind.layers(),
+            layers: placeholder.layers,
             texture,
             staging: std::array::from_fn(|_| None),
             handle: None,
-            page: PLACEHOLDER_PAGE,
-            pending: (0..kind.layers()).map(|_| None).collect(),
+            page: placeholder.page,
+            pending: vec![None; placeholder.layers as usize],
         })
     }
 
@@ -266,14 +287,36 @@ impl AtlasTexture {
         self.pending.iter().flatten().next()
     }
 
-    /// 待上传内容的页尺寸（同一图集的所有层共享同一页尺寸）。
-    fn pending_page(&self) -> Option<u32> {
-        self.first_pending().map(|pending| pending.page)
+    /// 待上传层要求的 array 规格：页边长取自任一层（同一图集所有页等大），层数取**最大**的
+    /// 待上传层（层数只增不减；入队层数 = App 当前打开的页数）。
+    fn pending_spec(&self) -> Option<crate::render::AtlasArraySpec> {
+        let first = self.first_pending()?;
+        let layers = self
+            .pending
+            .iter()
+            .flatten()
+            .map(|pending| pending.spec.layers)
+            .max()
+            .unwrap_or(first.spec.layers);
+        Some(crate::render::AtlasArraySpec {
+            page: first.spec.page,
+            layers,
+        })
     }
 
-    fn queue_upload(&mut self, layer: u16, page: u32, pixels: Vec<u8>, rects: DirtyRects) {
+    fn queue_upload(
+        &mut self,
+        layer: u16,
+        spec: crate::render::AtlasArraySpec,
+        pixels: Vec<u8>,
+        rects: DirtyRects,
+    ) {
         if rects.is_empty() {
             return;
+        }
+        // 待上传槽位表按运行时层数增长（新页刚打开的那一帧层数可能大于当前数组）。
+        if self.pending.len() < spec.layers as usize {
+            self.pending.resize_with(spec.layers as usize, || None);
         }
         let slot = &mut self.pending[usize::from(layer)];
         assert!(
@@ -283,7 +326,7 @@ impl AtlasTexture {
         );
         *slot = Some(PendingUpload {
             layer,
-            page,
+            spec,
             pixels,
             rects,
         });
@@ -310,7 +353,9 @@ impl AtlasTexture {
             return Ok(());
         }
         debug_assert!(
-            pendings.iter().all(|pending| pending.page == self.page),
+            pendings
+                .iter()
+                .all(|pending| pending.spec.page == self.page),
             "page changes must be applied by AtlasTextures::prepare before recording"
         );
         debug_assert!(
@@ -464,41 +509,47 @@ impl AtlasTexture {
         Ok(())
     }
 
-    /// 换页：建新数组、旧纹理按本帧的提交序号 retire（可能在飞帧仍采样它）。
+    /// 换 array：按新规格（页边长 + 层数）建新数组、旧纹理按本帧的提交序号 retire
+    /// （可能在飞帧仍采样它）。
     fn recreate(
         &mut self,
         device: &mut Device,
         queue: &mut Queue,
         sequence: u64,
-        page: u32,
+        spec: crate::render::AtlasArraySpec,
     ) -> Result<(), EngineError> {
-        let texture = create_texture(device, self.kind, page)?;
+        let texture = create_texture(device, self.kind, spec)?;
         let handle = device.allocate(GpuObject::Texture(texture.clone()));
         let old_texture = std::mem::replace(&mut self.texture, texture);
         if let Some(old_handle) = self.handle.replace(handle) {
             queue.retire(sequence, old_handle);
         }
         drop(old_texture);
-        self.page = page;
+        self.page = spec.page;
+        self.layers = spec.layers;
         Ok(())
     }
 }
 
-/// 建一张 `page × page`、`kind.layers()` 层的图集 texture array（占位页与真实页共用）。
+/// 建一张 `page × page`、`layers` 层的图集 texture array（占位页与真实页共用）。
 fn create_texture(
     device: &Device,
     kind: AtlasKind,
-    page: u32,
+    spec: crate::render::AtlasArraySpec,
 ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>, EngineError> {
+    debug_assert!(
+        spec.layers > 0,
+        "texture array must have at least one layer"
+    );
     let descriptor = MTLTextureDescriptor::new();
     descriptor.setTextureType(MTLTextureType::Type2DArray);
     descriptor.setPixelFormat(texture_format(kind));
-    // SAFETY: 尺寸 / 层数 / mip 数来自本模块的页档与 `AtlasKind`（page ≥ 1，layers ≤ 4，
+    // SAFETY: 尺寸 / 层数 / mip 数来自运行时 array 规格（page ≥ 1，layers 1..=MAX_IMAGE_PAGES，
     // mip 恒 1），都在 Metal 的 texture array 合法范围内。
     unsafe {
-        descriptor.setWidth(page as usize);
-        descriptor.setHeight(page as usize);
-        descriptor.setArrayLength(kind.layers() as usize);
+        descriptor.setWidth(spec.page as usize);
+        descriptor.setHeight(spec.page as usize);
+        descriptor.setArrayLength(spec.layers as usize);
         descriptor.setMipmapLevelCount(1);
     }
     descriptor.setUsage(MTLTextureUsage::ShaderRead);
@@ -538,6 +589,11 @@ mod tests {
 
     /// 小页（16²）够验证行落位；真实页 2048² 在单测里代价过高。
     const TEST_PAGE: u32 = 16;
+
+    /// 图集 array 规格（测试页 + 层数）。
+    fn spec(page: u32, layers: u32) -> crate::render::AtlasArraySpec {
+        crate::render::AtlasArraySpec { page, layers }
+    }
 
     /// 一张图集页的整页像素（BGRA8，行优先；初始全 0）。
     fn page() -> Vec<u8> {
@@ -634,7 +690,13 @@ mod tests {
         let mut atlas = AtlasTextures::new(&mut device).expect("atlas");
 
         // 第 1 帧：layer 0 整页上传（新页必须整页，DEVIATIONS F-211），内容全零。
-        atlas.queue_upload(AtlasKind::Image, 0, TEST_PAGE, page(), full_rects());
+        atlas.queue_upload(
+            AtlasKind::Image,
+            0,
+            spec(TEST_PAGE, 1),
+            page(),
+            full_rects(),
+        );
         let slot_full = queue.try_acquire().expect("upload slot full");
         let command_full = queue.begin().expect("command full");
         atlas
@@ -669,7 +731,13 @@ mod tests {
         let mut first_page = page();
         fill_row(&mut first_page, 5, [0x11, 0x22, 0x33, 0xFF]);
         let first_row = row_pixels(&first_page, 5);
-        atlas.queue_upload(AtlasKind::Image, 0, TEST_PAGE, first_row, rows(5, 6));
+        atlas.queue_upload(
+            AtlasKind::Image,
+            0,
+            spec(TEST_PAGE, 1),
+            first_row,
+            rows(5, 6),
+        );
         let slot1 = queue.try_acquire().expect("upload slot 1");
         let command1 = queue.begin().expect("command 1");
         atlas
@@ -692,7 +760,13 @@ mod tests {
         let mut second_page = page();
         fill_row(&mut second_page, 7, [0x44, 0x55, 0x66, 0xFF]);
         let second_row = row_pixels(&second_page, 7);
-        atlas.queue_upload(AtlasKind::Image, 0, TEST_PAGE, second_row, rows(7, 8));
+        atlas.queue_upload(
+            AtlasKind::Image,
+            0,
+            spec(TEST_PAGE, 1),
+            second_row,
+            rows(7, 8),
+        );
         let slot2 = queue.try_acquire().expect("upload slot 2");
         let command2 = queue.begin().expect("command 2");
         atlas
@@ -732,7 +806,7 @@ mod tests {
         assert_eq!(read_row(&image, 6), [0, 0, 0, 0], "未上传的行保持原样");
     }
 
-    /// D-9-c：图片图集是 4 层 texture array，layer 1 的上传只落 layer 1，layer 0 的读回不变。
+    /// D-9-c：图片图集是多层 texture array（层数 = 打开的页数），layer 1 的上传只落 layer 1，layer 0 的读回不变。
     #[test]
     fn an_upload_lands_on_its_own_array_layer() {
         let mut device = Device::new().expect("metal device");
@@ -740,7 +814,13 @@ mod tests {
         let mut atlas = AtlasTextures::new(&mut device).expect("atlas");
 
         // 第 1 帧：layer 0 整页上传（全 0）建立 `TEST_PAGE² × 4` 的数组。
-        atlas.queue_upload(AtlasKind::Image, 0, TEST_PAGE, page(), full_rects());
+        atlas.queue_upload(
+            AtlasKind::Image,
+            0,
+            spec(TEST_PAGE, 1),
+            page(),
+            full_rects(),
+        );
         submit_frame(&mut device, &mut queue, &mut atlas, 1);
 
         // 第 2 帧：layer 1 的第 5 行 = 不透明深蓝。
@@ -749,7 +829,7 @@ mod tests {
         atlas.queue_upload(
             AtlasKind::Image,
             1,
-            TEST_PAGE,
+            spec(TEST_PAGE, 2),
             row_pixels(&second, 5),
             rows(5, 6),
         );
@@ -770,6 +850,76 @@ mod tests {
         );
     }
 
+    /// 页数 1 → 2（P2-B3 核心语义）：数组从 1 层重建为 **2 层**，且第 0 层内容仍在。
+    ///
+    /// 扩层帧 App 对每个已打开页整页重传（`App::upload_image_page` 的 `array_missing` 分支）。
+    /// 变异：`prepare` 只比较页边长、忽略层数 ⇒ 不重建（数组仍 1 层）⇒ 层数断言失败。
+    #[test]
+    fn growing_the_image_array_keeps_the_existing_layer_content() {
+        let mut device = Device::new().expect("metal device");
+        let mut queue = Queue::new(&device, std::sync::Arc::new(InFlight::new())).expect("queue");
+        let mut atlas = AtlasTextures::new(&mut device).expect("atlas");
+        const LAYER_ZERO: [u8; 4] = [0x11, 0x22, 0x33, 0xFF];
+        const LAYER_ONE: [u8; 4] = [0x44, 0x55, 0x66, 0xFF];
+        const ZERO_RGBA: [u8; 4] = [LAYER_ZERO[2], LAYER_ZERO[1], LAYER_ZERO[0], LAYER_ZERO[3]];
+        const ONE_RGBA: [u8; 4] = [LAYER_ONE[2], LAYER_ONE[1], LAYER_ONE[0], LAYER_ONE[3]];
+        let fill = |colour: [u8; 4]| {
+            let mut pixels = page();
+            for texel in pixels.as_chunks_mut::<4>().0 {
+                *texel = colour;
+            }
+            pixels
+        };
+
+        // 第 1 帧：1 层数组，layer 0 整页 = 颜色 A。
+        atlas.queue_upload(
+            AtlasKind::Image,
+            0,
+            spec(TEST_PAGE, 1),
+            fill(LAYER_ZERO),
+            full_rects(),
+        );
+        submit_frame(&mut device, &mut queue, &mut atlas, 1);
+        assert_eq!(atlas.image.layers, 1, "1 页 ⇒ 1 层");
+        let mut readback = Readback::new();
+        assert_eq!(
+            read_row(&read_layer(&mut readback, &device, &queue, &atlas, 0), 0),
+            ZERO_RGBA,
+            "1 层数组的第 0 层内容"
+        );
+
+        // 第 2 帧：扩层到 2 层，同一帧把两个已打开页整页重传。
+        atlas.queue_upload(
+            AtlasKind::Image,
+            0,
+            spec(TEST_PAGE, 2),
+            fill(LAYER_ZERO),
+            full_rects(),
+        );
+        atlas.queue_upload(
+            AtlasKind::Image,
+            1,
+            spec(TEST_PAGE, 2),
+            fill(LAYER_ONE),
+            full_rects(),
+        );
+        submit_frame(&mut device, &mut queue, &mut atlas, 2);
+        assert_eq!(
+            atlas.image.layers, 2,
+            "页数 1 → 2 ⇒ texture array 必须重建为 2 层"
+        );
+        assert_eq!(
+            read_row(&read_layer(&mut readback, &device, &queue, &atlas, 0), 0),
+            ZERO_RGBA,
+            "重建后第 0 层内容必须仍在（增长不能丢已上传的图）"
+        );
+        assert_eq!(
+            read_row(&read_layer(&mut readback, &device, &queue, &atlas, 1), 0),
+            ONE_RGBA,
+            "第 1 层（新页）内容必须正确"
+        );
+    }
+
     /// D-9-c：同一帧把 4 层聚合上传，各自落位（staging 偏移不能共用 0、层号不能串）。
     #[test]
     fn four_layers_uploaded_in_one_frame_each_land_on_their_layer() {
@@ -779,9 +929,19 @@ mod tests {
 
         // 第 1 帧：4 层整页全 0（同一帧聚合；新数组的每个待上传层必须整页）。
         for layer in 0..4u16 {
-            atlas.queue_upload(AtlasKind::Image, layer, TEST_PAGE, page(), full_rects());
+            atlas.queue_upload(
+                AtlasKind::Image,
+                layer,
+                spec(TEST_PAGE, 4),
+                page(),
+                full_rects(),
+            );
         }
         submit_frame(&mut device, &mut queue, &mut atlas, 1);
+        assert_eq!(
+            atlas.image.layers, 4,
+            "请求 4 层 ⇒ texture array 必须建成 4 层"
+        );
 
         // 第 2 帧：4 层各写**不同行**（同一帧聚合，各层各自 staging 偏移）。
         let mut expected: Vec<(u16, u32, [u8; 4])> = Vec::with_capacity(4);
@@ -793,7 +953,7 @@ mod tests {
             atlas.queue_upload(
                 AtlasKind::Image,
                 layer,
-                TEST_PAGE,
+                spec(TEST_PAGE, 4),
                 row_pixels(&pixels, row),
                 rows(row, row + 1),
             );
@@ -833,6 +993,6 @@ mod tests {
         let mut short = page();
         // 20 字节 ≠ 1 行 × 16 × 4。
         short.truncate(20);
-        atlas.queue_upload(AtlasKind::Image, 0, TEST_PAGE, short, rows(0, 1));
+        atlas.queue_upload(AtlasKind::Image, 0, spec(TEST_PAGE, 1), short, rows(0, 1));
     }
 }
