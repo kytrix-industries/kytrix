@@ -240,7 +240,7 @@ pub(crate) use windows as backend;
 | 状态 | `node::signal::{Signal, SignalId, Derived, Transient, SignalScope}`、`node::dependency::ReadCtx`、`App::{signal, signal_scope, signal_scoped, window_signal, release_scope, transient, derived, batch, write, write_with, update, update_with, read, read_with, write_transient, read_transient}` | 状态写入与依赖追踪。`read` 返回 `SignalRef<T>` 读守卫（守卫存活期写同一信号 **panic**）。**没有 `TaskHandle`**：异步回投是 `AppHandle::{send, spawn}`；资源解码结果经 `App::take_resource_results()` 取回 |
 | 样式 / 布局 | `paint::style::{Style, PaintSpec, StylePatch, FocusRing, ShadowSpec, Clip, Cursor}`、`layout::{MeasureFn, LayoutOverride}`、`layout::hit_test::HitShape`、`math::{Rect, Size, Point, Transform, Scale, Edges, PhysicalRect}`、`NodeBuilder::{boxed, text, canvas, geometry, style, paint, bind_style, bind_text, bind_a11y, a11y, measure, hit_shape, layout_override, focus_ring, tab_stop, id, inline_boxes, runs, on_click, on_action, on_drag, build}` | 挂载期静态样式 / 动态补丁。`bind_*` **恰好三个**（`bind_text` / `bind_style` / `bind_a11y`），且**只在 `App::frame` 求值**（`Window::frame()` 不求值）。`NodeBuilder::runs` 是多 run 覆盖样式的挂载入口（E2，§11.2） |
 | 绘制 | `paint::scene::Scene`（**只能经 `Window::scene()` 取 `&Scene`**，写方法属引擎内部）、`paint::primitive::{Primitive, Quad, QuadPaint, Border, Gradient, GradientKind, GlyphRun, PositionedGlyph, Image, Path, Shadow, ClipOp, ClipRect, GeometryDraw}`（`GeometryDraw` 含 E4 的 `range: Range<u32>` 与 `GeometryDraw::full`）、`paint::canvas::Canvas`（含 E1 的 `push_shaped_text`）、`paint::geometry::{GeometryId, GeometryDesc, GeometryPipeline, GeometryUpdate, IndexType, Topology}`、`paint::geometry_store::GeometryStore`（经 `App::geometry_mut()`）、`paint::color::{Color, ColorResolver}`、`paint::atlas::{AtlasKind, AtlasTile}`（`AtlasTile` 含 E1d 的 CPU 侧 `slot` / `slot_epoch`）、`Window::set_canvas` | 自绘（`Canvas` 只装引擎 8 类图元，§5.9；canvas 文本走 `App::shape_text` + `Canvas::push_shaped_text`，§11.1）、注册静态几何与子区间绘制（§5.5 / §11.4）、颜色解析。**没有裸类型 `Geometry`、没有 `Brush`**；`AtlasAllocator::is_alive` 是 `pub(crate)`，不进公开面 |
-| 文本 | `text::{TextStyle, TextStyleExtras, TextContent, TextRun, TextDecoration, TextAlign, TextSlant, TextWrap, TextDirection, TextOverflow, TextLineBreak, FontStack, FontStackStatus, TextDiagnostic, InlineBoxSpec, InlineBoxPaint, InlineAlign, ShapedLine, ShapedTextHandle, ShapedTextLine, ShapedTextItem, ShapedGlyphRun, ShapedInlineBox, ThinSlice, FeatureSet, FontVariationSet, TextFeature, TextFontVariation, TextPassReport, TextLayoutReport}`；`App::{refresh_text, layout_text, font_stack, font_stack_version, set_font_stack, reload_system_fonts, text_diagnostics, font_stack_status, shape_text, shaped_inline_boxes, text_scale, set_text_scale, clear_text_scale_override}`；`TextContent::{runs, with_runs}`、`TextStyle::{decoration, with_decoration}` | 文本组件。**`ShapedLine` 类型公开但节点文本路径的应用拿不到实例**（`NodeTree::text_line` 是 `pub(crate)`）；无节点归属的 shaping 用 `App::shape_text` 拿 `ShapedTextHandle`（E1），富文本 runs / 装饰 / InlineBox 绘制与诊断为 E2（§11.2） |
+| 文本 | `text::{TextStyle, TextStyleExtras, TextContent, TextRun, TextDecoration, TextAlign, TextSlant, TextWrap, TextDirection, TextOverflow, TextLineBreak, FontStack, FontStackStatus, TextDiagnostic, InlineBoxSpec, InlineBoxPaint, InlineAlign, ShapedLine, ShapedTextHandle, ShapedTextLine, ShapedTextItem, ShapedGlyphRun, ShapedInlineBox, ShapedDecoration, ThinSlice, FeatureSet, FontVariationSet, TextFeature, TextFontVariation, TextPassReport, TextLayoutReport}`；`App::{refresh_text, layout_text, font_stack, font_stack_version, set_font_stack, reload_system_fonts, text_diagnostics, font_stack_status, shape_text, shaped_inline_boxes, text_scale, set_text_scale, clear_text_scale_override}`；`TextContent::{runs, with_runs}`、`TextStyle::{decoration, with_decoration}` | 文本组件。**`ShapedLine` 类型公开但节点文本路径的应用拿不到实例**（`NodeTree::text_line` 是 `pub(crate)`）；无节点归属的 shaping 用 `App::shape_text` 拿 `ShapedTextHandle`（E1），富文本 runs / 装饰 / InlineBox 绘制与诊断为 E2（§11.2） |
 | 资源 | `resources::{ResourceId, ResourceCache, ResourceImage, DecodeState, ResourceStats, PendingResource}`、`App::{resources, resources_mut}` | 图标 / 图片 / 远程头像；`ResourceImage.tile` 恒有效直到 unload（图片 tile 不参与 E1d 的编码期逐 tile 判活，§11.8） |
 | 交互 | `interaction::{FocusScope, ScrollHandle, ScrollConfig, ScrollState, ScrollAxis, VirtualList, VirtualListConfig, VirtualListState, ItemAlign, Overlay, OverlayOptions, OverlayPlacement, OverlayDismiss, AnchorSide, DragState, DragInfo, DragPhase, AnimationId, Easing, AnimatedValue, AnimationSpec, ActionCtx, InputThresholds}`；`App::{make_scroll, set_scroll_content, scroll_to, scroll_by, scroll_state, capture_pointer, focused, hovered, key_down, set_focus, focus_next, focus_prev, make_virtual_list, set_virtual_items, set_virtual_extents, scroll_to_item, virtual_list_state, virtual_row_index, create_overlay, close_overlay, place_overlay, bring_overlay_to_front, overlays, drag_state, drag, cancel_drag, animate, cancel_animation, animations_running}` | 通用交互机制。`VirtualListConfig { extent, extents, overscan }`：`extents = None` 等高行、`Some(..)` 逐项高度（E3 已实现，§11.3；`VirtualListConfig` 因 `Box<[f32]>` **不再是 `Copy`**）。**没有 `AnimationClock`**：动画是 `App::animate(window, AnimatedValue, &[NodeId], AnimationSpec)` |
 | 事件 | `event::{Event, InputEvent, InputOutcome, Action, ActionSource, KeyBinding, Key, KeyCode, Modifiers, PointerButton, ImeEvent}`、`layout::hit_test::HitResult`、`App::{drain_events, on_action, off_action, bind_key, unbind_key, dispatch_action, dispatch_action_focused}` | 事件处理与快捷键。`Action` 是 `{ FocusNext, FocusPrev, Dismiss, Custom(SmolStr) }`：**应用动作只能是字符串 key**（没有强类型变体表）；「怎么触发」在 `ActionSource` |
@@ -1070,7 +1070,7 @@ for line in layout.lines() {
 
 **缓存键**（`text/cache.rs::ShapeKey`）：文本哈希 + 文本长度 + **shaping 输入的样式哈希**（`TextStyle::hash_into`：family / size / weight /
 slant / line_height / letter_spacing / wrap / direction / overflow / max_lines / font_features / locale / stretch / word_spacing /
-line_break / font_variations；**不含 color / alignment**）+ **富文本 runs**（每个 run 的 `range` + shaping 输入哈希 + 颜色；E2 起必须入键，
+line_break / font_variations / decoration；**不含 color / alignment**）+ **富文本 runs**（每个 run 的 `range` + shaping 输入哈希 + 颜色；E2 起必须入键，
 否则不同 run 会误命中）+ **`normalized_runs`**（非法 runs 归一化计数的诊断随快照复用，不能让「有诊断的内容」命中「没诊断的快照」）
 + `inline_boxes` 的 id/index/size/baseline/align + `font_stack_version`。**不含 `scale`**（R12-4：逻辑坐标 shaping，DPI 变化不清缓存）、
 **不含 `atlas_generation`**（图集换代只影响 tile，不影响 glyph id / advance / 基线 / 行数；`ShapedLine` 快照另带代际，换代后重建）、
@@ -2710,7 +2710,7 @@ I4 ✅（tile 生命周期仍归引擎的图集 / retire）；I12 ✅（非像�
 ### 11.2 E2 · 富文本：多 run + 装饰 + InlineBox（已实现，量级 L，P1-E2）
 
 **实现事实**：`TextContent` 支持 runs（逐区间覆盖样式）；`TextStyle` 支持装饰；`emit_text` 按 `InlineBoxPaint` 生成引擎既有图元；
-装饰是 shaping 期烘好的 `ShapedDecoration` 几何、paint 期编码为普通 `Quad`。
+装饰是 shaping 期烘好的 `ShapedDecoration` 几何、paint 期编码为普通 `Quad`；公开只读面：`ShapedTextLine.decorations: Vec<ShapedDecoration>`、`ShapedDecoration { rect: Rect, color: Color }`（`text.rs:1174,1184`），应用可据此断言，渲染仍由引擎 `Quad` 承担。
 
 ```rust
 // text.rs（已实现；数据形状以源码为准）
@@ -2722,13 +2722,13 @@ pub enum TextDecoration {
     Strikethrough { color: Option<Color>, thickness: f32 },
 }
 impl TextDecoration {
-    pub fn underline(thickness: f32) -> Self;
-    pub fn strikethrough(thickness: f32) -> Self;
-    pub fn with_color(self, color: Option<Color>) -> Self;
-    pub fn color(self) -> Option<Color>;
-    pub fn thickness(self) -> f32;
+    pub const fn underline(thickness: f32) -> Self;
+    pub const fn strikethrough(thickness: f32) -> Self;
+    pub const fn with_color(self, color: Option<Color>) -> Self;
+    pub const fn color(self) -> Option<Color>;
+    pub const fn thickness(self) -> f32;
+    pub fn is_visible(self) -> bool;   // thickness 有限且 > 0 才绘制
 }
-
 // TextStyle：decoration 收进低频 `TextStyleExtras`（`extras: Option<Box<TextStyleExtras>>`），公开访问面是访问器 + 构造器；
 // `TextStyle` 仍 56 B。装饰不参与布局。
 impl TextStyle {
@@ -2956,8 +2956,8 @@ impl Window {
    `StaleNode`（等下一帧再查，不返回旧快照算出的索引）。图集满导致的 `laid_generation`「待重排」哨兵**不影响**本 API —— 几何 / 断行未变时
    照常可用（E5 §4 的软失败口径）。
 5. **错误**：全部为 `EngineError::StaleNode { node }`（复用既有变体）：① 节点不存在 / 已卸载；② 不是 `NodeKind::Text`；③ 文本尚未 shape /
-   `ShapedLine` 尚未重建；④ 内容 / 样式 / runs / 行内盒 / 断行宽度在该次 shape 之后变了。**不 panic**。该变体的 Display 同时覆盖
-   「不能作为文本命中目标」；`text_caret_rect` 对同一批前置条件返回 `TextShape`，应用需要两套错误处理。
+   `ShapedLine` 尚未重建；④ 内容 / 样式 / runs / 行内盒 / 断行宽度在该次 shape 之后变了。**不 panic**。Display 同时覆盖「不能作为文本命中目标」。
+   对照 `text_caret_rect`（`node/tree/content.rs:386-470`）：它**并非**同一错误 —— 句柄/内容缺失返回 `StaleNode`，其余（非文本节点、未 shape、内容/样式/runs/行内盒或断行宽度已变、`byte_index` 越界/不在 char boundary）返回 `TextShape`；应用需两套处理。
 6. **快速路径**：数字快速路径（`DigitFastPath`，单行 ASCII，无 parley 布局）同样实现本 API：x 先减 `simple_alignment_offset`（与
    `caret_rect` 同一函数），再按「半簇取整」解析；垂直 clamp 用 `line_height`；越界由首/尾簇收敛到 `0 / len`。两条路径对应用可见的语义一致。
 7. **bidi 往返容差**：返回 parley `Cursor::from_point` 的**最近簇边界**、不带 affinity；bidi 重排后同一视觉 x 可对应两个逻辑边界
