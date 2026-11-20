@@ -1,14 +1,15 @@
 //! The remote half of `cargo xtask gates`: the macOS/Linux runner.
 //!
 //! It reuses the protocol `.review/p1-remote.ps1` established by hand: the local
-//! HEAD is force-pushed to the host's bare mirror `~/kytrix-p1.git`, a dedicated
-//! clean source directory is reset to that branch, the shared
-//! `CARGO_TARGET_DIR=~/kytrix-review-target` is reused, and a `mkdir` lock
+//! HEAD is force-pushed to the host's bare mirror `~/kytrix-p1.git` under the branch
+//! `mig-<name>`, a dedicated clean source directory is reset to that branch, the
+//! shared `CARGO_TARGET_DIR=~/kytrix-review-target` is reused, and a `mkdir` lock
 //! serialises the runs on the host (macOS has no `flock(1)`; `mkdir` is the one
 //! primitive both hosts have). The lock is the directory the P1/P2 scripts take,
-//! and the source directory uses a `kytrix-mig-src-` prefix, so a migration gate
-//! run never compiles into the shared target directory while a reviewer's run
-//! does and never touches the reviewer's checkouts.
+//! the branch carries a `mig-` prefix, and the source directory uses a
+//! `kytrix-mig-src-` prefix, so a migration gate run never compiles into the shared
+//! target directory while a reviewer's run does and never pushes over a reviewer's
+//! validation branch or touches their checkouts.
 
 use std::{
     fs::{self, File},
@@ -18,8 +19,8 @@ use std::{
 };
 
 use super::{
-    GateError, GateResult, GatesConfig, Output, PlatformPlan, RemoteNames, StreamKind,
-    describe_exit, format_elapsed, stream_command,
+    GateError, GateResult, GatesConfig, Heads, Output, PlatformPlan, ProcessOutput, RemoteNames,
+    StreamKind, describe_exit, format_elapsed, stream_command,
 };
 
 /// The same lock `.review/p1-remote.ps1` takes, which is what keeps both flows
@@ -28,6 +29,10 @@ const LOCK_DIRECTORY: &str = "/tmp/kytrix-p1-remote.lock";
 
 /// The prefix of the per-run scratch checkout on every host.
 const SOURCE_PREFIX: &str = "kytrix-mig-src-";
+
+/// `ssh` exits 255 when the connection itself fails (DNS, TCP, authentication).
+/// Any other status came from the remote script or from a process on the host.
+const SSH_TRANSPORT_FAILURE: i32 = 255;
 
 /// Runs one remote platform's plan and reports what each command did.
 pub(super) fn run(
@@ -69,17 +74,7 @@ pub(super) fn run(
 
     let script_path = write_script(&script)?;
     let script_file = File::open(&script_path);
-    let arguments = vec![
-        "-o".to_owned(),
-        "BatchMode=yes".to_owned(),
-        "-o".to_owned(),
-        "ServerAliveInterval=30".to_owned(),
-        "-o".to_owned(),
-        "ServerAliveCountMax=4".to_owned(),
-        host.to_owned(),
-        "bash".to_owned(),
-        "-s".to_owned(),
-    ];
+    let arguments = ssh_arguments(host);
     output.clear_heads();
     let session = match script_file {
         Ok(file) => stream_command("ssh", &arguments, root, Stdio::from(file), output),
@@ -104,19 +99,60 @@ pub(super) fn run(
 
     let heads = output.take_heads();
     let markers = output.take_markers();
+    interpret(plan, session, &heads, &markers, host)
+}
 
+/// The `ssh` invocation for a host: never prompt, fail a dead TCP connect in 15 s
+/// instead of hanging, and give up on a silently dropped link after two minutes.
+pub(super) fn ssh_arguments(host: &str) -> Vec<String> {
+    [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=15",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "ServerAliveCountMax=4",
+        host,
+        "bash",
+        "-s",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+/// Turns what a remote script wrote into one result per command, or names why the
+/// run stopped short.
+///
+/// Everything is decided from the marker lines and the ssh exit status, so the
+/// classification is unit-testable without a host. The remote script ends with
+/// `KYTRIX_TOTAL_EXIT`, but a script that is killed (OOM, ENOSPC, a connection
+/// lost mid-run) never gets there: that is a remote abort, not an authentication
+/// failure, unless the ssh transport itself failed with [`SSH_TRANSPORT_FAILURE`].
+pub(super) fn interpret(
+    plan: &PlatformPlan,
+    session: ProcessOutput,
+    heads: &Heads,
+    markers: &[RemoteMarker],
+    host: &str,
+) -> Result<Vec<GateResult>, GateError> {
     let completed = markers
         .iter()
         .any(|marker| matches!(marker, RemoteMarker::TotalExit(_)));
     if !completed {
-        // The script stopped before its summary: name the stage it stopped at,
-        // with the leading output, which is where ssh explains a broken host.
+        // The host lock is held by another run, which the script names explicitly.
         if let Some(timeout) = markers.iter().find_map(|marker| match marker {
             RemoteMarker::LockTimeout(seconds) => Some(*seconds),
             _ => None,
         }) {
-            return Err(GateError::RemoteLockTimeout { timeout });
+            return Err(GateError::RemoteLockTimeout {
+                host: host.to_owned(),
+                timeout,
+            });
         }
+        // The scratch checkout could not be prepared; name the stage.
         if let Some(stage) = markers.iter().find_map(|marker| match marker {
             RemoteMarker::Abort(stage) => Some(stage.as_str()),
             _ => None,
@@ -127,15 +163,31 @@ pub(super) fn run(
                 head: heads.render(),
             });
         }
-        return Err(GateError::SshFailed {
+        if session.exit_code == Some(SSH_TRANSPORT_FAILURE) {
+            return Err(GateError::SshFailed {
+                host: host.to_owned(),
+                exit: describe_exit(session.exit_code),
+                head: heads.render(),
+            });
+        }
+        // ssh connected, so the script died on the host: an OOM-killed cargo, a
+        // full disk, a shell that lost its terminal. Blaming key authentication
+        // here sends the reader in the wrong direction, so report the status that
+        // actually came back; `Heads` keeps the stderr tail that explains it.
+        return Err(GateError::RemoteAborted {
             host: host.to_owned(),
-            exit: describe_exit(session.exit_code),
+            detail: format!(
+                "the gate script died before its summary ({})",
+                describe_exit(session.exit_code)
+            ),
             head: heads.render(),
         });
     }
 
     let mut results = Vec::with_capacity(plan.commands.len());
     for (index, command) in plan.commands.iter().enumerate() {
+        // The first marker for an index wins: the script writes exactly one per
+        // command, so a repeat can only come from output echoing a marker line.
         let reported = markers.iter().find_map(|marker| match marker {
             RemoteMarker::GateExit {
                 index: reported_index,
@@ -146,9 +198,11 @@ pub(super) fn run(
             }
             _ => None,
         });
+        // A command that never reported a marker is not a pass: its exit code
+        // stays absent, which `all_passed` treats as a failure.
         let (exit_code, elapsed) = reported.unwrap_or((None, Duration::ZERO));
         results.push(GateResult {
-            platform,
+            platform: plan.platform,
             label: command.label.clone(),
             command: command.render(),
             exit_code,

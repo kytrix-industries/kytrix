@@ -12,6 +12,7 @@
 mod remote;
 
 use std::{
+    collections::VecDeque,
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -27,17 +28,29 @@ use thiserror::Error;
 /// The crate whose gates carry the extra feature sets and test suites.
 const UI_CORE: &str = "ui_core";
 
+/// The product crate whose layer gates include a release build (plan §2.4).
+const KYTRIX: &str = "kytrix";
+
 /// `rustfmt` and `clippy` live in the nightly toolchain of this workspace.
 const NIGHTLY: &str = "+nightly";
 
-/// `ui_core`'s gates run with the features the P1/P2 baselines used.
-const UI_CORE_FEATURES: &str = "hud,test-support";
+/// `ui_core`'s test run with the features the P1/P2 baselines used.
+const UI_CORE_TEST_FEATURES: &str = "hud,test-support";
+
+/// The `snapshot` and `gui_smoke` suites run with the P1/P2 scripts' feature set
+/// (`test-support` alone), so their golden/GUI evidence stays comparable with the
+/// historical `.review/p1-*` logs.
+const UI_CORE_TEST_SUPPORT: &str = "test-support";
 
 /// How long a remote run waits for the shared host lock by default.
 const DEFAULT_LOCK_TIMEOUT_SECS: u64 = 1800;
 
 /// Output lines kept per stream for failure diagnostics; the log keeps it all.
 const HEAD_LINES: usize = 40;
+
+/// Trailing stderr lines kept for failures that explain themselves at the end
+/// (a linker error, a write that hit ENOSPC, a process killed mid-build).
+const TAIL_LINES: usize = 20;
 
 /// Which host a gate command runs on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,7 +103,14 @@ enum Step {
     Fast,
     Quick,
     Layer,
-    /// Every step the selected hosts can run.
+    /// Release builds of the scope (plan §2.4, `.review/p1-gates.ps1`'s `release`).
+    Release,
+    /// The `ui_core` perf bench, built but not run (`.review/p1-remote.ps1`'s `no-run-bench`).
+    Bench,
+    /// The `ui_core` acceptance harness in its headless CPU mode
+    /// (`.review/p1-remote.ps1`'s `acceptance-cpu`).
+    Accept,
+    /// Every step the selected hosts can run: `quick` plus `layer`.
     All,
 }
 
@@ -100,6 +120,9 @@ impl Step {
             "fast" => Some(Self::Fast),
             "quick" => Some(Self::Quick),
             "layer" => Some(Self::Layer),
+            "release" => Some(Self::Release),
+            "bench" => Some(Self::Bench),
+            "accept" => Some(Self::Accept),
             "all" => Some(Self::All),
             _ => None,
         }
@@ -110,6 +133,9 @@ impl Step {
             Self::Fast => "fast",
             Self::Quick => "quick",
             Self::Layer => "layer",
+            Self::Release => "release",
+            Self::Bench => "bench",
+            Self::Accept => "accept",
             Self::All => "all",
         }
     }
@@ -159,10 +185,10 @@ impl Scope {
         }
     }
 
-    fn includes_ui_core(&self) -> bool {
+    fn includes(&self, name: &str) -> bool {
         match self {
             Self::Workspace => true,
-            Self::Crates(crates) => crates.iter().any(|name| name == UI_CORE),
+            Self::Crates(crates) => crates.iter().any(|crate_name| crate_name == name),
         }
     }
 
@@ -257,12 +283,29 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<GatesConfig,
     let mut log: Option<PathBuf> = None;
     let mut remote_dir: Option<String> = None;
     let mut lock_timeout_secs = DEFAULT_LOCK_TIMEOUT_SECS;
+    let mut seen = [false; 6];
 
     while let Some(argument) = args.next() {
         let (name, inline) = match argument.split_once('=') {
             Some((name, value)) => (name, Some(value.to_owned())),
             None => (argument.as_str(), None),
         };
+        let option = match name {
+            "--platform" => Some(0),
+            "--scope" => Some(1),
+            "--step" => Some(2),
+            "--log" => Some(3),
+            "--remote-dir" => Some(4),
+            "--lock-timeout-secs" => Some(5),
+            _ => None,
+        };
+        // Last-wins would silently drop half of a mistyped invocation, so a
+        // repeated option is a usage error instead.
+        if let Some(index) = option
+            && std::mem::replace(&mut seen[index], true)
+        {
+            return Err(GateError::DuplicateOption(name.to_owned()));
+        }
         match name {
             "--platform" => {
                 let value = inline
@@ -345,9 +388,12 @@ pub fn run(root: &Path, config: &GatesConfig) -> Result<bool, GateError> {
             source,
         })?;
     }
+    // The log file is this run's evidence, so an explicit `--log` path is
+    // truncated: appending would mix a previous run's failures into this one's.
     let log = OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(&log_path)
         .map_err(|source| GateError::LogOpen {
             path: log_path.clone(),
@@ -424,7 +470,17 @@ pub fn run(root: &Path, config: &GatesConfig) -> Result<bool, GateError> {
         return Err(GateError::LogWrite { source });
     }
 
-    Ok(results.iter().all(|result| result.exit_code == Some(0)))
+    Ok(all_passed(&results))
+}
+
+/// Whether every command of a run passed.
+///
+/// This is the single place the exit-code contract is decided: the process exits
+/// non-zero as soon as any command reports anything other than exit 0, including
+/// a command that produced no exit status at all. An empty result set is not a
+/// pass either: a run that executed nothing has gated nothing.
+fn all_passed(results: &[GateResult]) -> bool {
+    !results.is_empty() && results.iter().all(|result| result.exit_code == Some(0))
 }
 
 /// Executes the local Windows plan.
@@ -458,6 +514,7 @@ fn run_local_plan(
 }
 
 /// One finished gate command.
+#[derive(Debug)]
 struct GateResult {
     platform: Platform,
     label: String,
@@ -471,7 +528,7 @@ fn step_runs_on(step: Step, platform: Platform) -> bool {
     match step {
         Step::Fast => platform == Platform::Win,
         Step::Quick => platform != Platform::Win,
-        Step::Layer | Step::All => true,
+        Step::Layer | Step::Release | Step::Bench | Step::Accept | Step::All => true,
     }
 }
 
@@ -494,6 +551,12 @@ fn build_plan(config: &GatesConfig) -> Result<Vec<PlatformPlan>, GateError> {
         Step::Quick if platforms.is_empty() => return Err(GateError::QuickNeedsRemote),
         _ => {}
     }
+    // `bench` and `accept` drive `ui_core`'s perf bench and acceptance harness;
+    // there is nothing for them to run on another crate, so a scope without
+    // `ui_core` is rejected instead of producing an empty plan.
+    if matches!(config.step, Step::Bench | Step::Accept) && !config.scope.includes(UI_CORE) {
+        return Err(GateError::StepNeedsUiCore(config.step.name()));
+    }
 
     Ok(platforms
         .into_iter()
@@ -506,21 +569,34 @@ fn build_plan(config: &GatesConfig) -> Result<Vec<PlatformPlan>, GateError> {
 }
 
 fn commands_for(step: Step, platform: Platform, scope: &Scope) -> Vec<CargoCommand> {
-    let mut commands: Vec<CargoCommand> = Vec::with_capacity(7);
+    let mut commands: Vec<CargoCommand> = Vec::with_capacity(9);
 
     // `quick` is the cheap remote compile check, so it goes first: a broken
     // compile fails the run before the full test set is spent on it.
     if matches!(step, Step::Quick | Step::All) && platform != Platform::Win {
         commands.extend(check_commands(scope));
     }
-    if step != Step::Quick {
-        // `layer` and `all` also run the Windows GUI smoke test, which is the
-        // D3D12/WARP path that `fast` deliberately leaves out.
-        commands.extend(fmt_clippy_test_commands(
-            platform,
-            matches!(step, Step::Layer | Step::All),
-            scope,
-        ));
+    match step {
+        Step::Quick => {}
+        Step::Fast => commands.extend(gate_commands(scope, false)),
+        Step::Layer | Step::All => {
+            // `layer` runs the ignored `gui_smoke` suite on every platform: it is
+            // offscreen on all three (Windows WARP/D3D12, macOS Metal, Linux
+            // Vulkan via lavapipe), and the P1/P2 baselines ran it on mac and
+            // linux as well as on Windows.
+            commands.extend(gate_commands(scope, true));
+            // Plan §2.4: a layer run that involves the product crate also checks
+            // that it still builds in release mode.
+            if scope.includes(KYTRIX) {
+                commands.push(CargoCommand {
+                    label: format!("release({KYTRIX})"),
+                    args: release_args(&PackageSelection::Crates(vec![KYTRIX.to_owned()]), false),
+                });
+            }
+        }
+        Step::Release => commands.extend(release_commands(scope)),
+        Step::Bench => commands.extend(bench_commands()),
+        Step::Accept => commands.extend(accept_commands()),
     }
 
     commands
@@ -534,7 +610,7 @@ fn check_commands(scope: &Scope) -> Vec<CargoCommand> {
             args: check_args(&packages, false),
         });
     }
-    if scope.includes_ui_core() {
+    if scope.includes(UI_CORE) {
         // `--all-features` is not optional here: `ui_core`'s unit tests use
         // `test-support` APIs (`Window::instance_buffer`, the fixture seams), so
         // a default-feature `--all-targets` check cannot compile on any platform.
@@ -549,11 +625,7 @@ fn check_commands(scope: &Scope) -> Vec<CargoCommand> {
 }
 
 /// The fmt/clippy/test/snapshot set that `fast` and `layer` share on every host.
-fn fmt_clippy_test_commands(
-    platform: Platform,
-    gui_smoke: bool,
-    scope: &Scope,
-) -> Vec<CargoCommand> {
+fn gate_commands(scope: &Scope, gui_smoke: bool) -> Vec<CargoCommand> {
     let mut commands = vec![CargoCommand {
         label: "fmt".to_owned(),
         args: fmt_args(scope),
@@ -570,17 +642,17 @@ fn fmt_clippy_test_commands(
         });
     }
 
-    if scope.includes_ui_core() {
+    if scope.includes(UI_CORE) {
         let ui_core = PackageSelection::Crates(vec![UI_CORE.to_owned()]);
         commands.push(CargoCommand {
             label: "clippy(ui_core,all-features)".to_owned(),
             args: clippy_args(&ui_core, true),
         });
         commands.push(CargoCommand {
-            label: format!("test(ui_core,{UI_CORE_FEATURES})"),
-            args: test_args(&ui_core, Some(UI_CORE_FEATURES)),
+            label: format!("test(ui_core,{UI_CORE_TEST_FEATURES})"),
+            args: test_args(&ui_core, Some(UI_CORE_TEST_FEATURES)),
         });
-        let mut snapshot = test_args(&ui_core, Some(UI_CORE_FEATURES));
+        let mut snapshot = test_args(&ui_core, Some(UI_CORE_TEST_SUPPORT));
         snapshot.push("--test".to_owned());
         snapshot.push("snapshot".to_owned());
         commands.push(CargoCommand {
@@ -588,8 +660,8 @@ fn fmt_clippy_test_commands(
             args: snapshot,
         });
 
-        if gui_smoke && platform == Platform::Win {
-            let mut gui_smoke = test_args(&ui_core, Some(UI_CORE_FEATURES));
+        if gui_smoke {
+            let mut gui_smoke = test_args(&ui_core, Some(UI_CORE_TEST_SUPPORT));
             for argument in ["--test", "gui_smoke", "--", "--ignored", "--nocapture"] {
                 gui_smoke.push(argument.to_owned());
             }
@@ -601,6 +673,52 @@ fn fmt_clippy_test_commands(
     }
 
     commands
+}
+
+/// The `--step release` set: every package of the scope in release mode.
+fn release_commands(scope: &Scope) -> Vec<CargoCommand> {
+    let mut commands = Vec::with_capacity(2);
+    if let Some(packages) = scope.default_feature_packages() {
+        commands.push(CargoCommand {
+            label: "release".to_owned(),
+            args: release_args(&packages, false),
+        });
+    }
+    if scope.includes(UI_CORE) {
+        // `.review/p1-gates.ps1`'s `release` step builds `ui_core` with
+        // `--all-features`, so the released feature surface is the full one.
+        let ui_core = PackageSelection::Crates(vec![UI_CORE.to_owned()]);
+        commands.push(CargoCommand {
+            label: "release(ui_core,all-features)".to_owned(),
+            args: release_args(&ui_core, true),
+        });
+    }
+    commands
+}
+
+/// The `--step bench` set: the perf bench the P1/P2 scripts built but did not run.
+fn bench_commands() -> Vec<CargoCommand> {
+    vec![CargoCommand {
+        label: "bench(ui_core,perf)".to_owned(),
+        args: bench_args(),
+    }]
+}
+
+/// The `--step accept` set: the headless CPU acceptance harness.
+fn accept_commands() -> Vec<CargoCommand> {
+    vec![CargoCommand {
+        label: "accept(ui_core,cpu)".to_owned(),
+        args: vec![
+            "run".to_owned(),
+            "--release".to_owned(),
+            "-p".to_owned(),
+            UI_CORE.to_owned(),
+            "--example".to_owned(),
+            "acceptance".to_owned(),
+            "--".to_owned(),
+            "cpu".to_owned(),
+        ],
+    }]
 }
 
 fn fmt_args(scope: &Scope) -> Vec<String> {
@@ -638,6 +756,28 @@ fn clippy_args(packages: &PackageSelection, all_features: bool) -> Vec<String> {
     args
 }
 
+fn release_args(packages: &PackageSelection, all_features: bool) -> Vec<String> {
+    let mut args = vec!["build".to_owned()];
+    packages.push_args(&mut args);
+    args.push("--release".to_owned());
+    if all_features {
+        args.push("--all-features".to_owned());
+    }
+    args
+}
+
+fn bench_args() -> Vec<String> {
+    let mut args = vec!["bench".to_owned()];
+    let ui_core = PackageSelection::Crates(vec![UI_CORE.to_owned()]);
+    ui_core.push_args(&mut args);
+    args.push("--features".to_owned());
+    args.push(UI_CORE_TEST_SUPPORT.to_owned());
+    for argument in ["--bench", "perf", "--no-run"] {
+        args.push(argument.to_owned());
+    }
+    args
+}
+
 fn test_args(packages: &PackageSelection, features: Option<&str>) -> Vec<String> {
     let mut args = vec!["test".to_owned()];
     packages.push_args(&mut args);
@@ -665,7 +805,11 @@ fn platform_label(platforms: &[Platform]) -> &'static str {
 }
 
 fn validate_remote_directory(value: &str) -> Result<String, GateError> {
-    let valid = !value.is_empty()
+    let starts_well = value
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_lowercase() || character.is_ascii_digit());
+    let valid = starts_well
         && value.len() <= 64
         && value.chars().all(|character| {
             character.is_ascii_lowercase()
@@ -682,21 +826,25 @@ fn validate_remote_directory(value: &str) -> Result<String, GateError> {
 }
 
 /// Resolves the scratch branch/directory name shared by the remote hosts.
+///
+/// The branch always carries the `mig-` prefix, so a run started from `main` or a
+/// P1/P2 branch (`p1-a`, `main`) cannot force-push over that branch in the shared
+/// bare mirror; the scratch directory keeps the `kytrix-mig-src-` prefix instead.
 fn remote_names(config: &GatesConfig, root: &Path) -> Result<RemoteNames, GateError> {
-    if let Some(name) = &config.remote_dir {
-        return Ok(RemoteNames {
-            branch: name.clone(),
-            directory: name.clone(),
-        });
-    }
-
-    let branch = current_branch(root)?;
-    let name =
-        sanitize_branch(&branch).ok_or_else(|| GateError::RemoteNameFromBranch(branch.clone()))?;
-    Ok(RemoteNames {
-        branch: name.clone(),
-        directory: name,
-    })
+    let directory = match &config.remote_dir {
+        Some(name) => name.clone(),
+        None => {
+            let branch = current_branch(root)?;
+            sanitize_branch(&branch)
+                .ok_or_else(|| GateError::RemoteNameFromBranch(branch.clone()))?
+        }
+    };
+    let branch = if directory.starts_with("mig-") {
+        directory.clone()
+    } else {
+        format!("mig-{directory}")
+    };
+    Ok(RemoteNames { branch, directory })
 }
 
 fn current_branch(root: &Path) -> Result<String, GateError> {
@@ -914,21 +1062,26 @@ enum StreamKind {
     Stderr,
 }
 
-/// The leading lines of each stream, kept so a failure can be diagnosed from the
-/// summary without opening the log.
+/// The leading lines of each stream plus the trailing stderr, kept so a failure
+/// can be diagnosed from the summary without opening the log.
 #[derive(Default)]
 struct Heads {
     stdout: Vec<String>,
     stderr: Vec<String>,
+    stderr_tail: VecDeque<String>,
     truncated: bool,
 }
 
 impl Heads {
     fn render(&self) -> String {
-        let mut lines: Vec<String> = Vec::with_capacity(HEAD_LINES + 3);
+        let mut lines: Vec<String> = Vec::with_capacity(HEAD_LINES + TAIL_LINES + 4);
         if !self.stderr.is_empty() {
             lines.push("  stderr:".to_owned());
             lines.extend(self.stderr.iter().map(|line| format!("    {line}")));
+        }
+        if self.truncated && !self.stderr_tail.is_empty() {
+            lines.push("  stderr (tail):".to_owned());
+            lines.extend(self.stderr_tail.iter().map(|line| format!("    {line}")));
         }
         if !self.stdout.is_empty() {
             lines.push("  stdout:".to_owned());
@@ -995,6 +1148,13 @@ impl Output {
         {
             state.markers.push(marker);
         }
+        if kind == StreamKind::Stderr {
+            let tail = &mut state.heads.stderr_tail;
+            if tail.len() == TAIL_LINES {
+                tail.pop_front();
+            }
+            tail.push_back(text.to_owned());
+        }
         let head = match kind {
             StreamKind::Stdout => &mut state.heads.stdout,
             StreamKind::Stderr => &mut state.heads.stderr,
@@ -1034,30 +1194,34 @@ pub enum GateError {
     MissingOption(&'static str),
     #[error("option `{0}` needs a value")]
     MissingValue(&'static str),
+    #[error("option `{0}` was given more than once; pass it once")]
+    DuplicateOption(String),
     #[error("unknown option `{0}`")]
     UnknownOption(String),
     #[error("unknown platform `{0}`; expected win, mac, linux, or all")]
     InvalidPlatform(String),
-    #[error("unknown step `{0}`; expected fast, quick, layer, or all")]
+    #[error("unknown step `{0}`; expected fast, quick, layer, release, bench, accept, or all")]
     InvalidStep(String),
     #[error("`--scope` names no crate; pass a comma separated crate list or `all`")]
     EmptyScope,
     #[error("invalid crate name `{0}`: crate names may only contain a-z, 0-9, `-`, and `_`")]
     InvalidCrateName(String),
     #[error(
-        "invalid `--remote-dir` `{0}`: use at most 64 characters from a-z, 0-9, `.`, `-`, and `_`"
+        "invalid `--remote-dir` `{0}`: use at most 64 characters from a-z, 0-9, `.`, `-`, and `_`, starting with a letter or digit"
     )]
     InvalidRemoteDirectory(String),
     #[error("invalid `--lock-timeout-secs` `{0}`: expected a positive whole number of seconds")]
     InvalidLockTimeout(String),
     #[error(
-        "step `fast` runs only on the local Windows host; use `--platform win`, and `quick`, `layer`, or `all` for the remote hosts"
+        "step `fast` runs only on the local Windows host; use `--platform win`, or a remote-capable step (`quick`, `layer`, `all`, `release`, `bench`, `accept`) for the other hosts"
     )]
     FastNeedsLocalWindows,
     #[error(
-        "step `quick` covers only the remote hosts; the local Windows host has no quick step, so use `fast`, `layer`, or `all`"
+        "step `quick` covers only the remote hosts; the local Windows host has no quick step, so use `fast`, `layer`, `all`, `release`, `bench`, or `accept`"
     )]
     QuickNeedsRemote,
+    #[error("step `{0}` runs the `ui_core` harness; include `ui_core` in `--scope`")]
+    StepNeedsUiCore(&'static str),
     #[error(transparent)]
     Git(io::Error),
     #[error(
@@ -1096,7 +1260,7 @@ pub enum GateError {
         exit: String,
     },
     #[error(
-        "ssh to `{host}` failed ({exit}); check that `ssh {host}` reaches the host with key authentication. Output:\n{head}"
+        "ssh to `{host}` failed at the transport layer ({exit}); check that `ssh {host}` reaches the host with key authentication. Output:\n{head}"
     )]
     SshFailed {
         host: String,
@@ -1112,9 +1276,9 @@ pub enum GateError {
         head: String,
     },
     #[error(
-        "timed out after {timeout}s waiting for the remote gate lock; another gate run is using the shared target directory on that host"
+        "timed out after {timeout}s waiting for the remote gate lock on `{host}`; another gate run there is using the shared target directory"
     )]
-    RemoteLockTimeout { timeout: u64 },
+    RemoteLockTimeout { host: String, timeout: u64 },
 }
 
 #[cfg(test)]
@@ -1173,7 +1337,7 @@ mod tests {
                     "cargo +nightly clippy -p ui_core --all-targets --all-features -- -D warnings"
                         .to_owned(),
                     "cargo test -p ui_core --features hud,test-support".to_owned(),
-                    "cargo test -p ui_core --features hud,test-support --test snapshot".to_owned(),
+                    "cargo test -p ui_core --features test-support --test snapshot".to_owned(),
                 ]
             )]
         );
@@ -1193,7 +1357,7 @@ mod tests {
                     "cargo +nightly clippy -p ui_core --all-targets --all-features -- -D warnings"
                         .to_owned(),
                     "cargo test -p ui_core --features hud,test-support".to_owned(),
-                    "cargo test -p ui_core --features hud,test-support --test snapshot".to_owned(),
+                    "cargo test -p ui_core --features test-support --test snapshot".to_owned(),
                 ]
             )]
         );
@@ -1212,7 +1376,7 @@ mod tests {
                     "cargo test --workspace --exclude ui_core".to_owned(),
                     "cargo +nightly clippy -p ui_core --all-targets --all-features -- -D warnings".to_owned(),
                     "cargo test -p ui_core --features hud,test-support".to_owned(),
-                    "cargo test -p ui_core --features hud,test-support --test snapshot".to_owned(),
+                    "cargo test -p ui_core --features test-support --test snapshot".to_owned(),
                 ]
             )]
         );
@@ -1228,12 +1392,12 @@ mod tests {
         assert_eq!(last.label, "gui-smoke");
         assert_eq!(
             last.render(),
-            "cargo test -p ui_core --features hud,test-support --test gui_smoke -- --ignored --nocapture"
+            "cargo test -p ui_core --features test-support --test gui_smoke -- --ignored --nocapture"
         );
     }
 
     #[test]
-    fn a_layer_run_on_a_remote_host_keeps_the_fast_set() {
+    fn a_layer_run_runs_the_gui_smoke_on_every_platform() {
         let config = parse(&["--platform", "all", "--scope", "ui_core", "--step", "layer"])
             .expect("parse the layer run");
         let plans = build_plan(&config).expect("build the gate plan");
@@ -1242,16 +1406,7 @@ mod tests {
             [Platform::Win, Platform::Mac, Platform::Linux]
         );
 
-        let gui_smoke = plans
-            .iter()
-            .map(|plan| {
-                plan.commands
-                    .iter()
-                    .any(|command| command.label == "gui-smoke")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(gui_smoke, [true, false, false]);
-        for plan in plans.iter().skip(1) {
+        for plan in &plans {
             let labels = plan
                 .commands
                 .iter()
@@ -1263,8 +1418,120 @@ mod tests {
                     "fmt",
                     "clippy(ui_core,all-features)",
                     "test(ui_core,hud,test-support)",
-                    "snapshot"
+                    "snapshot",
+                    "gui-smoke"
+                ],
+                "the layer set on {:?} must run the offscreen gui smoke suite",
+                plan.platform
+            );
+            let gui_smoke = plan.commands.last().expect("a last command");
+            assert_eq!(
+                gui_smoke.render(),
+                "cargo test -p ui_core --features test-support --test gui_smoke -- --ignored --nocapture"
+            );
+        }
+    }
+
+    #[test]
+    fn a_kytrix_layer_run_adds_the_release_build() {
+        let config = parse(&["--platform", "win", "--scope", "kytrix", "--step", "layer"])
+            .expect("parse the layer run");
+        let plans = rendered_plan(&config);
+        assert_eq!(
+            plans[0].1.last().map(String::as_str),
+            Some("cargo build -p kytrix --release")
+        );
+
+        let ui_core = parse(&["--platform", "win", "--scope", "ui_core", "--step", "layer"])
+            .expect("parse the layer run");
+        assert!(
+            !rendered_plan(&ui_core)[0]
+                .1
+                .iter()
+                .any(|command| command.contains("--release")),
+            "a ui_core layer run has no release build"
+        );
+    }
+
+    #[test]
+    fn the_release_step_builds_the_scope_in_release_mode() {
+        let config = parse(&[
+            "--platform",
+            "win",
+            "--scope",
+            "ui_core,xtask",
+            "--step",
+            "release",
+        ])
+        .expect("parse the release run");
+        assert_eq!(
+            rendered_plan(&config),
+            [(
+                Platform::Win,
+                vec![
+                    "cargo build -p xtask --release".to_owned(),
+                    "cargo build -p ui_core --release --all-features".to_owned(),
                 ]
+            )]
+        );
+    }
+
+    #[test]
+    fn the_bench_step_builds_the_ui_core_perf_bench() {
+        let config = parse(&[
+            "--platform",
+            "linux",
+            "--scope",
+            "ui_core",
+            "--step",
+            "bench",
+        ])
+        .expect("parse the bench run");
+        assert_eq!(
+            rendered_plan(&config),
+            [(
+                Platform::Linux,
+                vec![
+                    "cargo bench -p ui_core --features test-support --bench perf --no-run"
+                        .to_owned()
+                ]
+            )]
+        );
+    }
+
+    #[test]
+    fn the_accept_step_runs_the_acceptance_harness_on_every_platform() {
+        let config = parse(&[
+            "--platform",
+            "all",
+            "--scope",
+            "ui_core",
+            "--step",
+            "accept",
+        ])
+        .expect("parse the accept run");
+        let accept = "cargo run --release -p ui_core --example acceptance -- cpu".to_owned();
+        assert_eq!(
+            rendered_plan(&config),
+            [
+                (Platform::Win, vec![accept.clone()]),
+                (Platform::Mac, vec![accept.clone()]),
+                (Platform::Linux, vec![accept]),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_ui_core_harness_steps_need_ui_core_in_scope() {
+        for step in ["bench", "accept"] {
+            let config = parse(&["--platform", "win", "--scope", "xtask", "--step", step])
+                .expect("parse the run");
+            assert!(
+                matches!(
+                    build_plan(&config),
+                    Err(GateError::StepNeedsUiCore(needed)) if needed == step
+                ),
+                "step `{step}` without ui_core must be rejected"
             );
         }
     }
@@ -1344,14 +1611,16 @@ mod tests {
             "cargo +nightly clippy -p ui_core --all-targets --all-features -- -D warnings"
                 .to_owned(),
             "cargo test -p ui_core --features hud,test-support".to_owned(),
-            "cargo test -p ui_core --features hud,test-support --test snapshot".to_owned(),
+            "cargo test -p ui_core --features test-support --test snapshot".to_owned(),
+            "cargo test -p ui_core --features test-support --test gui_smoke -- --ignored --nocapture"
+                .to_owned(),
         ];
         assert_eq!(plans[1].1, remote);
         assert_eq!(plans[2].1, remote);
         assert_eq!(
             plans[0].1.last().map(String::as_str),
             Some(
-                "cargo test -p ui_core --features hud,test-support --test gui_smoke -- --ignored --nocapture"
+                "cargo test -p ui_core --features test-support --test gui_smoke -- --ignored --nocapture"
             )
         );
     }
@@ -1438,6 +1707,33 @@ mod tests {
     }
 
     #[test]
+    fn repeated_options_are_rejected_instead_of_overwriting() {
+        assert!(matches!(
+            parse(&[
+                "--platform",
+                "win",
+                "--platform",
+                "mac",
+                "--scope",
+                "xtask",
+                "--step",
+                "fast"
+            ]),
+            Err(GateError::DuplicateOption(name)) if name == "--platform"
+        ));
+        assert!(matches!(
+            parse(&[
+                "--platform=win",
+                "--scope=xtask",
+                "--step=fast",
+                "--log=a",
+                "--log=b"
+            ]),
+            Err(GateError::DuplicateOption(name)) if name == "--log"
+        ));
+    }
+
+    #[test]
     fn invalid_values_are_rejected() {
         assert!(matches!(
             parse(&[
@@ -1493,19 +1789,24 @@ mod tests {
             ]),
             Err(GateError::InvalidLockTimeout(_))
         ));
-        assert!(matches!(
-            parse(&[
-                "--platform",
-                "win",
-                "--scope",
-                "xtask",
-                "--step",
-                "fast",
-                "--remote-dir",
-                "a b"
-            ]),
-            Err(GateError::InvalidRemoteDirectory(_))
-        ));
+        for invalid in [".", "..", ".hidden", "-leading", "_leading", "a b"] {
+            assert!(
+                matches!(
+                    parse(&[
+                        "--platform",
+                        "win",
+                        "--scope",
+                        "xtask",
+                        "--step",
+                        "fast",
+                        "--remote-dir",
+                        invalid,
+                    ]),
+                    Err(GateError::InvalidRemoteDirectory(_))
+                ),
+                "`--remote-dir {invalid}` must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -1526,6 +1827,41 @@ mod tests {
         assert_eq!(sanitize_branch("P0/A--B"), Some("p0-a-b".to_owned()));
         assert_eq!(sanitize_branch("///"), None);
         assert_eq!(sanitize_branch(""), None);
+    }
+
+    #[test]
+    fn the_remote_branch_always_carries_the_mig_prefix() {
+        let config = parse(&[
+            "--platform",
+            "mac",
+            "--scope",
+            "xtask",
+            "--step",
+            "quick",
+            "--remote-dir",
+            "p1-a",
+        ])
+        .expect("parse the remote run");
+        let names = remote_names(&config, Path::new("E:/kytrix")).expect("resolve the names");
+        assert_eq!(names.branch, "mig-p1-a");
+        assert_eq!(names.directory, "p1-a");
+
+        // A name that already starts with `mig-` is not prefixed twice, so a
+        // migration branch keeps its own remote branch instead of a `mig-mig-*`.
+        let config = parse(&[
+            "--platform",
+            "mac",
+            "--scope",
+            "xtask",
+            "--step",
+            "quick",
+            "--remote-dir",
+            "mig-p0-2",
+        ])
+        .expect("parse the remote run");
+        let names = remote_names(&config, Path::new("E:/kytrix")).expect("resolve the names");
+        assert_eq!(names.branch, "mig-p0-2");
+        assert_eq!(names.directory, "mig-p0-2");
     }
 
     #[test]
@@ -1596,6 +1932,29 @@ mod tests {
             script.contains("echo \"KYTRIX_TOTAL_EXIT=$overall\""),
             "{script}"
         );
+        // The lock must be released on every exit path, successful or not: a
+        // leaked lock makes the next run on that host wait for the full timeout.
+        assert!(
+            script.contains("trap 'rmdir \"$LOCKDIR\" 2>/dev/null' EXIT"),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn the_ssh_invocation_sets_a_connect_timeout() {
+        let arguments = remote::ssh_arguments("my_macos");
+        assert!(
+            arguments.contains(&"ConnectTimeout=15".to_owned()),
+            "{arguments:?}"
+        );
+        assert!(
+            arguments.contains(&"BatchMode=yes".to_owned()),
+            "{arguments:?}"
+        );
+        assert_eq!(
+            &arguments[arguments.len() - 3..],
+            ["my_macos", "bash", "-s"]
+        );
     }
 
     #[test]
@@ -1654,6 +2013,7 @@ mod tests {
         let mut heads = Heads {
             stdout: vec!["compiling".to_owned(), "running tests".to_owned()],
             stderr: vec!["warning: unused".to_owned()],
+            stderr_tail: VecDeque::new(),
             truncated: false,
         };
         let rendered = heads.render();
@@ -1665,6 +2025,199 @@ mod tests {
         assert!(!rendered.contains("truncated"), "{rendered}");
 
         heads.truncated = true;
-        assert!(heads.render().contains("truncated"));
+        heads.stderr_tail = VecDeque::from(["error: out of disk".to_owned()]);
+        let rendered = heads.render();
+        assert!(rendered.contains("truncated"), "{rendered}");
+        assert!(
+            rendered.contains("stderr (tail):\n    error: out of disk"),
+            "{rendered}"
+        );
+    }
+
+    fn gate_result(exit_code: Option<i32>) -> GateResult {
+        GateResult {
+            platform: Platform::Win,
+            label: "test".to_owned(),
+            command: "cargo test".to_owned(),
+            exit_code,
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn a_run_passes_only_when_every_command_passed() {
+        assert!(all_passed(&[gate_result(Some(0)), gate_result(Some(0))]));
+        assert!(!all_passed(&[gate_result(Some(0)), gate_result(Some(101))]));
+        // A command that never produced an exit status did not pass.
+        assert!(!all_passed(&[gate_result(None)]));
+        // A run that executed nothing has not gated anything.
+        assert!(!all_passed(&[]));
+    }
+
+    fn remote_plan(platform: Platform, scope: &str, step: &str) -> PlatformPlan {
+        let config = parse(&[
+            "--platform",
+            platform.name(),
+            "--scope",
+            scope,
+            "--step",
+            step,
+        ])
+        .expect("parse the remote run");
+        build_plan(&config)
+            .expect("build the remote plan")
+            .remove(0)
+    }
+
+    fn session(exit_code: Option<i32>) -> ProcessOutput {
+        ProcessOutput {
+            exit_code,
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn a_remote_summary_maps_every_marker_to_its_command() {
+        let plan = remote_plan(Platform::Mac, "ui_core", "layer");
+        let markers = [
+            RemoteMarker::GateExit {
+                index: 0,
+                exit_code: 0,
+                elapsed_secs: 1,
+            },
+            RemoteMarker::GateExit {
+                index: 2,
+                exit_code: 101,
+                elapsed_secs: 3,
+            },
+            RemoteMarker::TotalExit(1),
+        ];
+        let results = remote::interpret(
+            &plan,
+            session(Some(1)),
+            &Heads::default(),
+            &markers,
+            "my_macos",
+        )
+        .expect("a completed run");
+        assert_eq!(results.len(), plan.commands.len());
+        assert_eq!(results[0].exit_code, Some(0));
+        assert_eq!(results[0].elapsed, Duration::from_secs(1));
+        // A command without its own marker never counts as a pass.
+        assert_eq!(results[1].exit_code, None);
+        assert_eq!(results[2].exit_code, Some(101));
+        assert_eq!(results[4].exit_code, None);
+        assert!(!all_passed(&results));
+    }
+
+    #[test]
+    fn the_first_marker_for_a_command_wins() {
+        let plan = remote_plan(Platform::Mac, "ui_core", "layer");
+        let markers = [
+            RemoteMarker::GateExit {
+                index: 1,
+                exit_code: 0,
+                elapsed_secs: 4,
+            },
+            RemoteMarker::GateExit {
+                index: 1,
+                exit_code: 101,
+                elapsed_secs: 9,
+            },
+            RemoteMarker::TotalExit(0),
+        ];
+        let results = remote::interpret(
+            &plan,
+            session(Some(0)),
+            &Heads::default(),
+            &markers,
+            "my_macos",
+        )
+        .expect("a completed run");
+        assert_eq!(results[1].exit_code, Some(0));
+        assert_eq!(results[1].elapsed, Duration::from_secs(4));
+    }
+
+    #[test]
+    fn a_remote_lock_timeout_names_the_host() {
+        let plan = remote_plan(Platform::Linux, "xtask", "layer");
+        let error = remote::interpret(
+            &plan,
+            session(Some(9)),
+            &Heads::default(),
+            &[RemoteMarker::LockTimeout(1800)],
+            "my_ubuntu",
+        )
+        .expect_err("a lock timeout is an error");
+        assert!(
+            matches!(&error, GateError::RemoteLockTimeout { host, timeout } if host == "my_ubuntu" && *timeout == 1800),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_remote_checkout_abort_names_the_stage() {
+        let plan = remote_plan(Platform::Mac, "xtask", "quick");
+        let error = remote::interpret(
+            &plan,
+            session(Some(5)),
+            &Heads::default(),
+            &[RemoteMarker::Abort("checkout".to_owned())],
+            "my_macos",
+        )
+        .expect_err("an aborted checkout is an error");
+        let message = error.to_string();
+        assert!(message.contains("my_macos"), "{message}");
+        assert!(message.contains("checkout"), "{message}");
+    }
+
+    #[test]
+    fn an_ssh_transport_failure_is_reported_as_ssh() {
+        let plan = remote_plan(Platform::Mac, "xtask", "quick");
+        let error = remote::interpret(
+            &plan,
+            session(Some(255)),
+            &Heads::default(),
+            &[],
+            "my_macos",
+        )
+        .expect_err("a transport failure is an error");
+        assert!(
+            matches!(&error, GateError::SshFailed { host, .. } if host == "my_macos"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_script_killed_before_its_summary_is_a_remote_abort() {
+        let plan = remote_plan(Platform::Linux, "xtask", "layer");
+        let heads = Heads {
+            stdout: Vec::new(),
+            stderr: (0..HEAD_LINES)
+                .map(|line| format!("compiling line {line}"))
+                .collect(),
+            stderr_tail: VecDeque::from(["error: Disk quota exceeded (os error 122)".to_owned()]),
+            truncated: true,
+        };
+        let error = remote::interpret(&plan, session(Some(137)), &heads, &[], "my_ubuntu")
+            .expect_err("a killed script is an error");
+        assert!(matches!(&error, GateError::RemoteAborted { .. }), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("my_ubuntu"), "{message}");
+        assert!(message.contains("exit 137"), "{message}");
+        assert!(
+            message.contains("Disk quota exceeded"),
+            "the stderr tail must be kept: {message}"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_script_is_not_reported_as_an_ssh_failure() {
+        // ssh itself was killed locally (no exit status): the classification must
+        // not point the reader at key authentication.
+        let plan = remote_plan(Platform::Mac, "xtask", "quick");
+        let error = remote::interpret(&plan, session(None), &Heads::default(), &[], "my_macos")
+            .expect_err("an interrupted run is an error");
+        assert!(matches!(&error, GateError::RemoteAborted { .. }), "{error}");
     }
 }
