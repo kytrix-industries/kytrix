@@ -25,6 +25,11 @@
 //! - **A4 呈现证据**（[`presentation`]）：`wp_presentation` 的纯判据 —— 呈现时钟域白名单
 //!   （`CLOCK_REALTIME` / `CLOCK_MONOTONIC`）与 presented 证据的单调判据；协议对象、GPU 线程
 //!   的 feedback 请求与时钟换算在 `platform/linux/presentation.rs`。
+//! - **RB-11 owner 提示的延迟补发**（[`parent`]）：协议规定 *"Setting a parent which is not
+//!   mapped is equivalent to setting a null parent"* ⇒ owner 尚未映射时 `set_parent` 必须先
+//!   登记 pending，等 owner 收到首帧 `wl_callback.done`（协议可观测的映射证据）后再补发。
+//!   表项增删与补发时机在纯逻辑层，真实 `xdg_toplevel.set_parent` 在
+//!   `platform/linux/surface.rs`。
 //!
 //! 编译条件与 `platform/ime` 同款：Linux 构建 + 测试构建（`cfg(test)` 让 Windows 也能测）。
 
@@ -36,6 +41,7 @@ pub(crate) mod frame_gate;
 pub(crate) mod ime;
 pub(crate) mod input;
 pub(crate) mod owner;
+pub(crate) mod parent;
 pub(crate) mod presentation;
 pub(crate) mod scroll;
 pub(crate) mod selection;
