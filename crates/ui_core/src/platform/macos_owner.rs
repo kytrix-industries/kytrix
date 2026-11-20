@@ -7,8 +7,8 @@
 //! `platform::macos` 整模块只在 macOS 目标编译（objc2 依赖也是 macOS-only）；这里的映射
 //! 是纯数据 + 纯函数，必须能在开发机（Windows）单测 —— 与 [`crate::platform::macos_placement`]、
 //! [`crate::platform::macos_close`] 同一模式。真机侧只把枚举翻成 AppKit 常量、调
-//! `NSWindow.setLevel:` 与 `addChildWindow:ordered:`，以及按 [`OwnerChrome`] 读写
-//! `ignoresMouseEvents` / 标准按钮的启用状态。
+//! `NSWindow.setLevel:` / `addChildWindow:ordered:` / `makeKeyWindow`，以及按
+//! [`OwnerChrome`] 读写 `ignoresMouseEvents` / 标准按钮的启用状态。
 //!
 //! # 层级选择
 //!
@@ -23,8 +23,8 @@
 //!
 //! **模态不在原生层用 `runModalForWindow:`**：那会创建嵌套 run loop，与引擎自己的事件泵
 //! 重入冲突（泵在 `NSApplication.run` 的 run loop 上跑，嵌套模态循环会让同一批回调重入）。
-//! 引擎层的模态输入拦截 + 这里的层级 + `addChildWindow:` 三者合起来表达模态语义
-//! （与 `WindowOptions::modal` 文档一致）。
+//! 引擎层的输入过滤 + 原生 chrome 拦截/key 接管 + 这里的层级 + `addChildWindow:` 合起来
+//! 表达模态语义（与 `WindowOptions::modal` 文档一致）。
 //!
 //! # 模态期对 owner 的原生拦截（RB-07，用户批准方案 A）
 //!
@@ -272,11 +272,44 @@ pub(crate) const fn modal_takes_key(modal: bool, owner_is_key: bool, modal_is_ke
     modal && owner_is_key && !modal_is_key
 }
 
+/// 泵级 key 预扫描的单个窗口输入（RBM-01）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WindowKeyInput {
+    pub window: WindowId,
+    /// 本窗口的 owner（`None` = 顶层窗口）。
+    pub owner: Option<WindowId>,
+    /// 本窗口是否是已接线 owner 的模态窗口。
+    pub modal: bool,
+    /// 本窗口当前是否 key（`NSWindow.isKeyWindow`，应用内语义）。
+    pub is_key: bool,
+}
+
+/// 泵级 key 预扫描：返回本轮应被 `makeKeyWindow` 的模态窗口（`None` = 无需对账）。
+///
+/// **必须在任何窗口读取自己的焦点快照之前调用**（`pump` 的逐窗口 `sync_state` 循环之前）。
+/// 若把对账放进各窗口自己的 `sync_state`，窗口按创建顺序逐个同步（owner 先建、先 sync）：
+/// owner 会先看到 `isKeyWindow == true` 并投递 `FocusChanged{focused: true}`，随后模态窗口
+/// 的 sync 才把 key 拿回 ⇒ 下一轮 owner 再看到 `false`、再投 `FocusChanged{focused: false}`
+/// 并触发一次多余的失焦 IME 清场（RBM-01 的假翻转）。预扫描先跑，owner 的快照就永远看不到
+/// 「自己是 key」。
+pub(crate) fn reclaim_modal_keys(windows: &[WindowKeyInput]) -> Option<WindowId> {
+    let is_key = |id: WindowId| {
+        windows
+            .iter()
+            .any(|candidate| candidate.window == id && candidate.is_key)
+    };
+    windows.iter().find_map(|state| {
+        let owner_is_key = state.owner.is_some_and(is_key);
+        modal_takes_key(state.modal, owner_is_key, state.is_key).then_some(state.window)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ModalOwnerChromes, ModalOwnerRelease, OwnerChrome, OwnerResolution, WindowId, WindowLevel,
-        modal_takes_key, resolve_owner, window_level,
+        ModalOwnerChromes, ModalOwnerRelease, OwnerChrome, OwnerResolution, WindowId,
+        WindowKeyInput, WindowLevel, modal_takes_key, reclaim_modal_keys, resolve_owner,
+        window_level,
     };
 
     /// 默认（无置顶、无模态）不抬高层级：保持 AppKit 默认，避免无谓的 `setLevel:` 调用。
@@ -500,6 +533,205 @@ mod tests {
         assert!(
             !modal_takes_key(false, true, false),
             "非模态窗口不抢 owner 的焦点"
+        );
+    }
+
+    // ── RBM-01：泵级 key 预扫描的窗口执行顺序 ────────────────────────────────
+
+    /// RBM-01 核心回归：key 对账必须在**逐窗口焦点快照之前**完成。
+    ///
+    /// 模拟 `pump` 的两个阶段：① 泵级预扫描（[`reclaim_modal_keys`]）→ ② 逐窗口读焦点快照。
+    /// 窗口按创建顺序排列（owner 先建，常态）。若把对账放回各窗口自己的 `sync_state`，阶段 ②
+    /// 里 owner 会先看到 `is_key == true` ⇒ 投递假 `FocusChanged{true}`，随后模态窗口才把 key
+    /// 拿回 ⇒ 下一轮 owner 再投 `FocusChanged{false}` 并触发多余的失焦 IME 清场。
+    #[test]
+    fn the_key_prescan_prevents_the_owner_from_being_key_during_the_snapshot_phase() {
+        let owner = WindowId::from_raw(1);
+        let modal = WindowId::from_raw(2);
+        let mut windows = [
+            WindowKeyInput {
+                window: owner,
+                owner: None,
+                modal: false,
+                is_key: true,
+            },
+            WindowKeyInput {
+                window: modal,
+                owner: Some(owner),
+                modal: true,
+                is_key: false,
+            },
+        ];
+
+        // 阶段 ①：泵级预扫描（在所有窗口读快照之前）。
+        let reclaim = reclaim_modal_keys(&windows);
+        assert_eq!(
+            reclaim,
+            Some(modal),
+            "预扫描必须识别出「owner 抢到 key、模态不是 key」并交给模态窗口"
+        );
+        if let Some(modal_id) = reclaim {
+            // `makeKeyWindow` 的应用内效果：模态成为 key，其余窗口退出 key。
+            for state in &mut windows {
+                state.is_key = state.window == modal_id;
+            }
+        }
+
+        // 阶段 ②：逐窗口读焦点快照（owner 先）。owner 不得看到自己是 key。
+        let owner_state = windows
+            .iter()
+            .find(|state| state.window == owner)
+            .expect("owner 窗口");
+        assert!(
+            !owner_state.is_key,
+            "预扫描之后 owner 在快照阶段必须看到 is_key=false（否则会投递假 FocusChanged{{true}} 并触发多余 IME 清场）"
+        );
+        assert!(
+            windows
+                .iter()
+                .find(|state| state.window == modal)
+                .expect("模态窗口")
+                .is_key,
+            "模态窗口保持 key"
+        );
+    }
+
+    /// 没有「owner 抢到 key」时预扫描不做任何动作（不抢正常窗口的焦点）。
+    #[test]
+    fn the_key_prescan_leaves_ordinary_focus_alone() {
+        let owner = WindowId::from_raw(1);
+        let modal = WindowId::from_raw(2);
+        let other = WindowId::from_raw(3);
+        let windows = [
+            WindowKeyInput {
+                window: owner,
+                owner: None,
+                modal: false,
+                is_key: false,
+            },
+            WindowKeyInput {
+                window: modal,
+                owner: Some(owner),
+                modal: true,
+                is_key: false,
+            },
+            WindowKeyInput {
+                window: other,
+                owner: None,
+                modal: false,
+                is_key: true,
+            },
+        ];
+        assert_eq!(
+            reclaim_modal_keys(&windows),
+            None,
+            "key 在无关窗口上时不得抢焦点"
+        );
+        // 模态自己已是 key ⇒ 不重复抢。
+        let windows = [
+            WindowKeyInput {
+                window: owner,
+                owner: None,
+                modal: false,
+                is_key: false,
+            },
+            WindowKeyInput {
+                window: modal,
+                owner: Some(owner),
+                modal: true,
+                is_key: true,
+            },
+        ];
+        assert_eq!(reclaim_modal_keys(&windows), None);
+    }
+
+    // ── RBM-08：ModalOwnerChromes 的 API 边界 ────────────────────────────────
+
+    /// 按 owner 分组：两个不同 owner 的快照/恢复互不干扰（退化成单条目会在这里红）。
+    #[test]
+    fn two_owners_keep_independent_modal_ledgers() {
+        let owner_a = WindowId::from_raw(1);
+        let owner_b = WindowId::from_raw(2);
+        let modal_a = WindowId::from_raw(3);
+        let modal_b = WindowId::from_raw(4);
+        let chrome_a = OwnerChrome {
+            ignores_mouse_events: false,
+            movable_by_window_background: true,
+            close_button_enabled: false,
+            minimize_button_enabled: true,
+            zoom_button_enabled: true,
+        };
+        let chrome_b = OwnerChrome {
+            ignores_mouse_events: false,
+            movable_by_window_background: false,
+            close_button_enabled: true,
+            minimize_button_enabled: false,
+            zoom_button_enabled: true,
+        };
+        let mut chromes = ModalOwnerChromes::default();
+        assert!(chromes.open(modal_a, owner_a, chrome_a));
+        assert!(chromes.open(modal_b, owner_b, chrome_b));
+        // 关掉 A 的模态窗口不得动 B 的记账/快照。
+        assert_eq!(
+            chromes.close(modal_a, true, true),
+            ModalOwnerRelease::Last {
+                chrome: chrome_a,
+                return_key: true,
+            }
+        );
+        assert_eq!(
+            chromes.close(modal_b, true, true),
+            ModalOwnerRelease::Last {
+                chrome: chrome_b,
+                return_key: true,
+            }
+        );
+    }
+
+    /// 同一窗口重复 `open`（防御路径）不得把集合写重：关闭一次就应当是最后一个（恢复），
+    /// 而不是误判「还有其它模态窗口」保持拦截。
+    #[test]
+    fn opening_the_same_modal_window_twice_does_not_duplicate_it() {
+        let owner = WindowId::from_raw(1);
+        let modal = WindowId::from_raw(2);
+        let mut chromes = ModalOwnerChromes::default();
+        assert!(chromes.open(modal, owner, APP_CHROME));
+        assert!(
+            !chromes.open(modal, owner, OwnerChrome::BLOCKED),
+            "重复 open 不得再次快照/施加拦截"
+        );
+        assert_eq!(
+            chromes.close(modal, true, true),
+            ModalOwnerRelease::Last {
+                chrome: APP_CHROME,
+                return_key: true,
+            },
+            "重复 open 不得让集合残留第二个条目（否则关一次仍判 Remaining）"
+        );
+    }
+
+    /// owner 在模态期间不可用（外部关闭 / 最小化）：多模态两种关闭顺序的**中间态**仍必须
+    /// 保持拦截，最后一次恢复 chrome 但不得把焦点还给不可用的 owner。
+    #[test]
+    fn an_unavailable_owner_keeps_the_intermediate_modal_state() {
+        let owner = WindowId::from_raw(1);
+        let first = WindowId::from_raw(2);
+        let second = WindowId::from_raw(3);
+        let mut chromes = ModalOwnerChromes::default();
+        assert!(chromes.open(first, owner, APP_CHROME));
+        assert!(!chromes.open(second, owner, OwnerChrome::BLOCKED));
+        assert_eq!(
+            chromes.close(first, true, false),
+            ModalOwnerRelease::Remaining { hand_key: true },
+            "owner 不可用不影响「仍有模态窗口 ⇒ 保持拦截」"
+        );
+        assert_eq!(
+            chromes.close(second, true, false),
+            ModalOwnerRelease::Last {
+                chrome: APP_CHROME,
+                return_key: false,
+            },
+            "最后一个关闭仍恢复 chrome，但不得把焦点还给不可用的 owner"
         );
     }
 }

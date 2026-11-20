@@ -35,6 +35,7 @@ use objc2_core_foundation::{
     CFRunLoop, CFRunLoopActivity, CFRunLoopObserver, CFRunLoopObserverContext, CFRunLoopTimer,
 };
 use objc2_foundation::NSPoint;
+use smallvec::SmallVec;
 
 use crate::{
     app::App,
@@ -48,7 +49,10 @@ use crate::{
             window::{NativeWindow, OwnerWindow},
         },
         macos_close::CloseAction,
-        macos_owner::{ModalOwnerChromes, OwnerResolution, resolve_owner, window_level},
+        macos_owner::{
+            ModalOwnerChromes, OwnerResolution, WindowKeyInput, reclaim_modal_keys, resolve_owner,
+            window_level,
+        },
     },
     render::{backend::Renderer, macos::core::GpuCore},
     window::{Window, WindowId, WindowOptions},
@@ -475,6 +479,18 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
     // R09-15②：这里不再调 `Dispatcher::wake()`（那会 signal run loop source，让同一轮多跑一次
     // 空泵）—— 状态变化直接送进下面的帧门禁。
     let mut changed = recovered;
+    // RBM-01：模态 key 对账必须是**泵级预扫描**，并且在任何窗口读取自己的焦点快照之前完成。
+    // 若放进逐窗口的 `sync_state`，窗口按创建顺序同步（owner 先建、先 sync）：owner 会先看到
+    // `isKeyWindow == true` 并投递假 `FocusChanged{true}`，随后模态窗口才把 key 拿回 ⇒ 下一轮
+    // owner 再投 `FocusChanged{false}` 并触发多余的失焦 IME 清场。判定在平台无关的
+    // `platform::macos_owner::reclaim_modal_keys`（Windows 可单测）。
+    let key_inputs: SmallVec<[WindowKeyInput; 8]> =
+        state.windows.iter().map(NativeWindow::key_input).collect();
+    if let Some(modal) = reclaim_modal_keys(&key_inputs)
+        && let Some(native) = state.windows.iter().find(|native| native.id() == modal)
+    {
+        native.make_key();
+    }
     for native in state.windows.iter_mut() {
         let id = native.id();
         for event in native.take_events() {

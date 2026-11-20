@@ -66,19 +66,22 @@ impl WindowDragState {
         !std::mem::take(&mut self.dragging)
     }
 
-    /// `mouseMoved:`（悬停移动）到达：结束拖动状态（主键仍按下时不动，见下）。
+    /// `mouseMoved:`（悬停移动）到达：返回 `true` = 投递 `PointerMove`。
     ///
     /// Apple 文档对 `NSWindow.acceptsMouseMovedEvents` / `mouseMoved:` 的约定是「**没有**鼠标
     /// 按键按下时才投递」（拖动中发 `mouseDragged:`），因此它出现即代表拖动会话已经结束
     /// （即使始终没收到 `mouseUp:`）；不结束的话拖动后的悬停/光标形状会一直冻到下一次点击。
     ///
     /// `primary_button_down` 是调用方读到的 `NSEvent.pressedMouseButtons` 主键位：作为**兜底**
-    /// —— 若某个 AppKit 版本在拖动期间仍补发 `mouseMoved:`，主键仍按下 ⇒ 不清状态，后续
-    /// 主键 Up/Move 继续按拖动会话吞掉（不会重新泄漏无 Down 配对的事件）。
-    pub(crate) fn hover_move(&mut self, primary_button_down: bool) {
-        if !primary_button_down {
-            self.dragging = false;
+    /// —— 若某个 AppKit 版本在拖动期间仍补发 `mouseMoved:`，主键仍按下 ⇒ **既不结束状态、
+    /// 也不投递**这条 Move（RBM-05：只保护状态不保护投递仍会泄漏无 Down 配对的 Move），
+    /// 后续主键 Up/Move 继续按拖动会话吞掉。
+    pub(crate) fn hover_move(&mut self, primary_button_down: bool) -> bool {
+        if primary_button_down {
+            return false;
         }
+        self.dragging = false;
+        true
     }
 }
 
@@ -254,21 +257,28 @@ mod tests {
     fn a_hover_move_ends_a_drag_that_never_reported_mouse_up() {
         let mut state = WindowDragState::default();
         assert!(!state.primary_down(true));
-        state.hover_move(false);
+        assert!(
+            state.hover_move(false),
+            "主键未按下：结束拖动并投递这条 Move"
+        );
         assert!(!state.is_dragging(), "悬停移动证明拖动已结束");
-        // 拖动结束后的悬停移动照常投递（调用方无条件 push，这里只校验状态已清）。
+        // 拖动结束后的悬停移动照常投递（调用方按返回值 push），这里只校验状态已清。
         // 之后的一次新点击必须是干净的会话。
         assert!(state.primary_down(false));
         assert!(state.primary_up());
     }
 
-    /// 兜底：若某个 AppKit 版本在拖动期间仍补发 `mouseMoved:`（主键仍按下），**不得**提前
-    /// 清拖动状态 —— 否则后续补发的 Up/Move 会重新变成无 Down 配对的事件（RB-08 回归）。
+    /// RBM-05 兜底：若某个 AppKit 版本在拖动期间仍补发 `mouseMoved:`（主键仍按下），
+    /// **既不结束状态、也不投递**这条 Move —— 否则会泄漏一条无 Down 配对的 Move；后续
+    /// 补发的 Up/Move 继续按拖动会话吞掉。
     #[test]
     fn a_hover_move_while_the_primary_button_is_still_down_keeps_the_drag_state() {
         let mut state = WindowDragState::default();
         assert!(!state.primary_down(true));
-        state.hover_move(true);
+        assert!(
+            !state.hover_move(true),
+            "主键仍按下：这条 Move 不得投递（只保护状态不保护投递仍会泄漏）"
+        );
         assert!(state.is_dragging(), "主键仍按下时不得清拖动状态");
         assert!(
             !state.primary_up(),

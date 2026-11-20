@@ -278,36 +278,48 @@ pub(crate) const fn key_visible(
 /// | 同步 `unmarkText:`（回调自己投递 `End`） | 0 条补充 → 恰好一条（唯一侥幸成立的形态） |
 /// | `setMarkedText:@""`（清空组合串、不投 `End`） | 推断为「已结束」→ **0 条 `End`**（preedit 残留） |
 /// | 异步 `unmarkText:`（返回后才回调） | 推断为「仍在组合」→ 补一条 + 回调一条 = **2 条 `End`** |
-/// | `insertText:`（提交正文，投 `Commit`） | 推断为「已结束」→ 0 条 `End`（可接受，但 Commit 不是 End） |
+/// | `insertText:`（提交正文，投 `Commit`） | 推断为「已结束」→ 0 条 `End`（修复前；修复后由提交路径补一条，见下） |
 ///
 /// 因此收尾不能由「组合串是否还在」推断，必须由**回调记账**：应用收到过 `Preedit` 就欠一条
-/// 收尾；`End` 只在欠账时投递一次，`Commit` 同样销账（正文已上屏，不需要 `End`）。迟到的
-/// `unmarkText:` 看到账已销 ⇒ 吞掉，不会出现第二条。
+/// `End`；`End` 只在欠账时投递一次（谁先到谁销账，后到的一方看到账已销 ⇒ 吞掉，不会出现
+/// 第二条）。迟到的 `unmarkText:` 看到账已销 ⇒ 吞掉，不会出现第二条。
+///
+/// # `Commit` 不是收尾（RBM-02：三端一致）
+///
+/// 有组合串的提交（`insertText:`）之后仍必须有一条 `End`：Win32 在 `GCS_RESULTSTR` 投
+/// `Commit` 后由 `WM_IME_ENDCOMPOSITION` 投 `End`，Wayland 在 commit-only 批次显式补
+/// `End`（R10-35），macOS 走同一条契约（`insertText:` 投完 `Commit` 后用本记账的
+/// [`Self::note_end`] 补 `End`）。没有组合串的提交（应用从未收到 `Preedit`）只有
+/// `Commit` —— 与 Win32/Wayland 的「没有组合就不发 End」一致。
 #[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Default)]
 pub(crate) struct ImeCompositionEnd {
-    /// 应用收到过 `Preedit` 且尚未收到收尾（`End` 或 `Commit`）。
+    /// 应用收到过 `Preedit` 且尚未收到 `End`。
     pending: bool,
 }
 
 #[cfg(any(target_os = "macos", test))]
 impl ImeCompositionEnd {
-    /// 组合串已交给应用（`Preedit`）：从现在起欠一条收尾。
+    /// 组合串已交给应用（`Preedit`）：从现在起欠一条 `End`。
     pub(crate) fn note_preedit(&mut self) {
         self.pending = true;
     }
 
     /// 投递 `End` 的决策：返回 `true` = 现在该投（并销账）；`false` = 已经收尾过，吞掉。
     ///
-    /// 同一个函数既服务回调路径（`unmarkText:`）也服务清场兜底（`discardMarkedText` 之后）：
+    /// 同一个函数服务两条路径：`unmarkText:` 回调与清场兜底（`discardMarkedText` 之后）。
     /// 谁先到谁销账，后到的一方看到已销账就不再投 —— 这正是「恰好一条」的全部内容。
     pub(crate) fn note_end(&mut self) -> bool {
         std::mem::take(&mut self.pending)
     }
 
-    /// 提交（`insertText:` → `Commit`）：组合以正文结束，收尾不再补 `End`。
-    pub(crate) fn note_commit(&mut self) {
-        self.pending = false;
+    /// 提交路径的收尾决策（RBM-02）：有组合串的提交之后仍要有一条 `End`。
+    ///
+    /// 返回 `true` = 调用方应在投完 `Commit` 后立刻补一条 `End`（并销账）；`false` = 应用
+    /// 从未收到 `Preedit`（没有组合可收尾）或已经收尾过 —— 只有 `Commit`，与 Win32/Wayland
+    /// 的「没有组合就不发 End」一致。
+    pub(crate) fn note_commit(&mut self) -> bool {
+        self.note_end()
     }
 
     /// 是否欠一条收尾（清场入口据此决定要不要真的 `discardMarkedText`）。
@@ -743,13 +755,49 @@ mod end_bookkeeping_tests {
         assert!(!end.note_end(), "迟到的 unmarkText: 不得再投第二条 End");
     }
 
-    /// 形态 4：`discardMarkedText` 走 `insertText:`（Commit）—— 组合以正文结束，不补 End。
+    /// 形态 4（RBM-02）：有组合串的提交（`insertText:` → `Commit`）之后仍要补一条 `End`
+    /// —— 与 Win32 `WM_IME_ENDCOMPOSITION` / Wayland commit-only 批次一致；补完销账，迟到的
+    /// `unmarkText:` / 失焦清场不得再补第二条。
     #[test]
-    fn a_commit_during_discard_emits_no_end() {
+    fn a_commit_of_a_composition_is_followed_by_exactly_one_end() {
         let mut end = ImeCompositionEnd::default();
         end.note_preedit();
-        end.note_commit();
-        assert!(!end.note_end(), "Commit 已经销账，清场不得再补 End");
+        // `insertText:` 路径：先投 `Commit`，再用同一记账决定是否补 `End`。
+        assert!(end.note_commit(), "有组合串的提交之后必须补一条 End");
+        assert!(
+            !end.note_end(),
+            "补过之后，迟到的 unmarkText / 清场不得再补"
+        );
+        assert!(!end.is_pending());
+    }
+
+    /// 提交之后才到的 `unmarkText:`：Commit 已经销账 ⇒ 不得再投第二条 End。
+    #[test]
+    fn a_late_unmark_after_a_commit_is_swallowed() {
+        let mut end = ImeCompositionEnd::default();
+        end.note_preedit();
+        assert!(end.note_commit(), "Commit 后补一条 End");
+        assert!(!end.note_end(), "提交后的迟到 unmarkText: 被吞");
+    }
+
+    /// 清场兜底先投了 End、提交回调迟到：Commit 仍要交付（正文不能丢），但不得再补 End。
+    #[test]
+    fn a_commit_after_the_teardown_fallback_does_not_emit_a_second_end() {
+        let mut end = ImeCompositionEnd::default();
+        end.note_preedit();
+        assert!(end.note_end(), "清场兜底补一条");
+        assert!(
+            !end.note_commit(),
+            "迟到的 Commit 不得再补 End（正文由 Commit 自身交付）"
+        );
+    }
+
+    /// 没有组合串的提交（应用从未收到 `Preedit`）：只有 `Commit`，不补 `End` —— 与
+    /// Win32/Wayland 的「没有组合就不发 End」一致。
+    #[test]
+    fn a_commit_without_a_preedit_needs_no_end() {
+        let mut end = ImeCompositionEnd::default();
+        assert!(!end.note_commit(), "没有组合串的提交不欠 End");
         assert!(!end.is_pending());
     }
 

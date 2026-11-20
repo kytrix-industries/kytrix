@@ -282,12 +282,15 @@ define_class!(
             // `mouseDragged:`）⇒ 它证明上一次拖动会话已经结束（AppKit 可能始终没补发
             // `mouseUp:`）。在这里清掉配对状态，否则拖动结束后悬停会一直冻到下一次点击。
             //
-            // 兜底：真读到主键仍按下（某个 AppKit 版本在拖动期间补发 `mouseMoved:`）时不清
-            // 状态，后续主键 Up/Move 继续按拖动会话吞掉，不会重新泄漏无 Down 配对的事件。
+            // RBM-05 兜底：真读到主键仍按下（某个 AppKit 版本在拖动期间补发 `mouseMoved:`）
+            // 时**既不结束状态、也不投递**这条 Move —— 只保护状态不保护投递仍会泄漏一条
+            // 无 Down 配对的 Move。
             let mut drag = self.ivars().window_drag.get();
-            drag.hover_move((NSEvent::pressedMouseButtons() & 1) != 0);
+            let deliver = drag.hover_move((NSEvent::pressedMouseButtons() & 1) != 0);
             self.ivars().window_drag.set(drag);
-            self.push_pointer(event, PointerPhase::Move);
+            if deliver {
+                self.push_pointer(event, PointerPhase::Move);
+            }
         }
 
         #[unsafe(method(mouseDragged:))]
@@ -621,6 +624,16 @@ define_class!(
                         text: smol_str::SmolStr::new(value),
                         replace,
                     }));
+                    // RBM-02：三端一致 —— **有组合串的提交**之后仍有一条 `End`（Win32
+                    // `WM_IME_ENDCOMPOSITION` / Wayland commit-only 批次 / 这里）。记账只在
+                    // 「应用见过 Preedit 且还没收尾」时返回 true 并销账 ⇒ 迟到的
+                    // `unmarkText:` / 失焦清场不会再补第二条；没有组合串的提交（应用从未
+                    // 收到 Preedit）只有 `Commit`，与 Win32/Wayland 的「没有组合就不发 End」
+                    // 一致。
+                    let emit_end = self.ivars().ime.borrow_mut().note_commit_end();
+                    if emit_end {
+                        self.push_event(Event::Ime(ImeEvent::End));
+                    }
                 }
             }
         }

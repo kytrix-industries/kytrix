@@ -1283,6 +1283,11 @@ pub enum ImeEvent {
         replace: Option<Range<usize>>,
     },
     /// 组合结束。
+    ///
+    /// 三端契约：**有组合串的提交**（`Commit`）之后仍会收到一条 `End` —— Win32 由
+    /// `WM_IME_ENDCOMPOSITION` 投递，Wayland 在 commit-only 批次显式补（R10-35），macOS 在
+    /// `insertText:` 路径投完 `Commit` 后补（RBM-02）。没有组合串的提交（应用从未收到
+    /// `Preedit`）只有 `Commit`，三端一致不补 `End`。应用按 `End` 收尾组合态即可。
     End,
 }
 

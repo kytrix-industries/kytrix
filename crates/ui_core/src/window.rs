@@ -296,7 +296,10 @@ pub struct WindowOptions {
     ///   owner 会被模态过滤丢弃，模态对话框收不到键）。关闭时按打开前的**快照**恢复 owner
     ///   的 chrome 并把键盘焦点还给仍可用的 owner。**不用** `beginSheet:`（会改变窗口形态）
     ///   与 `runModalForWindow:`（嵌套 run loop 与引擎事件泵冲突）。引擎分发层同时按 owner
-    ///   关系过滤输入（原生拦截被绕过时的兜底）。
+    ///   关系过滤输入（原生拦截被绕过时的兜底）。**已知语义差异（RBM-10）**：AppKit 的
+    ///   `ignoresMouseEvents` 只承诺「窗口对鼠标透明」，不承诺「吞掉事件」—— 点击被拦截的
+    ///   owner 会**穿透到下层窗口**（可能是别的应用/桌面），这与 Windows `EnableWindow`
+    ///   吃掉点击不同；若产品不接受该差异需改方案（overlay/sheet，均不在当前范围）。
     /// - **Linux/Wayland**：协议没有模态；引擎层模态（同 macOS 的兜底路径），并 `set_parent`
     ///   提示 compositor 置于 owner 之上。
     ///

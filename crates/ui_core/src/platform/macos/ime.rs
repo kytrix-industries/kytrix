@@ -85,15 +85,22 @@ impl ImeState {
     }
 
     /// 记录一次提交并给出裁决（作用域内/外/重复，见 [`CommitVerdict`]）。
+    ///
+    /// 提交**不**动收尾记账（RBM-02）：有组合串的提交之后仍欠一条 `End`，由调用方在投完
+    /// `Commit` 后用 [`Self::note_end`] 补（与 Win32 `WM_IME_ENDCOMPOSITION` / Wayland
+    /// commit-only 批次一致）。
     pub(crate) fn note_commit(&mut self, text: &str) -> CommitVerdict {
-        // RB-09：`Commit` 也算收尾（正文已上屏，清场不再补 `End`）。
-        self.end.note_commit();
         self.scope.note_commit(text)
     }
 
     /// 投递 `ImeEvent::End` 的决策（RB-09）：`true` = 现在该投（并销账）。
     pub(crate) fn note_end(&mut self) -> bool {
         self.end.note_end()
+    }
+
+    /// 提交路径的收尾决策（RBM-02）：有组合串的提交之后补一条 `End`（并销账）。
+    pub(crate) fn note_commit_end(&mut self) -> bool {
+        self.end.note_commit()
     }
 
     /// 是否欠一条 `End`（清场入口据此决定要不要 `discardMarkedText`）。
