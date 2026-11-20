@@ -1,4 +1,5 @@
 mod bump;
+mod gates;
 
 use std::{io, path::PathBuf, process::ExitCode};
 
@@ -13,7 +14,7 @@ fn main() -> ExitCode {
     }
 
     match run_cli(args) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(exit_code) => exit_code,
         Err(error) => {
             eprintln!("error: {error}");
             ExitCode::FAILURE
@@ -21,12 +22,27 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_cli(args: Vec<String>) -> Result<(), CliError> {
+fn run_cli(args: Vec<String>) -> Result<ExitCode, CliError> {
     let mut args = args.into_iter();
     let command = args.next().ok_or(CliError::MissingCommand)?;
     match command.as_str() {
-        "bump-version" => run_bump(args),
+        "bump-version" => {
+            run_bump(args)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        "gates" => run_gates(args),
         command => Err(CliError::UnknownCommand(command.to_owned())),
+    }
+}
+
+fn run_gates(args: impl Iterator<Item = String>) -> Result<ExitCode, CliError> {
+    let config = gates::parse_args(args)?;
+    let root = repository_root()?;
+
+    if gates::run(&root, &config)? {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::FAILURE)
     }
 }
 
@@ -72,20 +88,67 @@ fn print_outcome(outcome: &BumpOutcome) {
 
 fn print_usage() {
     println!(concat!(
-        "Usage: cargo xtask bump-version <major|minor|patch>\n",
+        "Usage:\n",
+        "  cargo xtask bump-version <major|minor|patch>\n",
+        "  cargo xtask gates --platform <win|mac|linux|all> --scope <crate,...|all> --step <fast|quick|layer|all>\n",
+        "                    [--log <path>] [--remote-dir <name>] [--lock-timeout-secs <n>]\n",
         "\n",
         "bump-version bumps [workspace.package] version in Cargo.toml and the top-level\n",
         "version in Packager.toml, and creates release_notes/vX.Y.Z/en.md and zh-CN.md\n",
         "when the version directory is missing. A version directory that already exists\n",
-        "must hold both files."
+        "must hold both files.\n",
+        "\n",
+        "gates runs the three-platform gate set for changes to `crates/ui_core`. For every\n",
+        "crate in --scope it runs the same commands the P1/P2 gate scripts ran by hand:\n",
+        "\n",
+        "  fast   local Windows only: `cargo +nightly fmt --check`, `cargo +nightly clippy\n",
+        "         --all-targets -- -D warnings`, `cargo test`. When `ui_core` is in scope\n",
+        "         it also runs the feature-enabled suite with `--features hud,test-support`,\n",
+        "         clippy with `--all-features` (the P1/P2 baseline coverage) and the pixel\n",
+        "         `--test snapshot` suite.\n",
+        "  quick  remote only (mac, linux): `cargo check --all-targets` over ssh, on a\n",
+        "         clean scratch checkout sharing the host's compiled-target cache.\n",
+        "         `ui_core` is checked with `--all-features` because its unit tests use\n",
+        "         `test-support` APIs, which a default-feature `--all-targets` build\n",
+        "         cannot compile on any platform.\n",
+        "  layer  every selected platform: the `fast` set, plus the ignored `gui_smoke`\n",
+        "         test on Windows (the D3D12/WARP path), and the same fmt/clippy/test/\n",
+        "         snapshot set over ssh on mac and linux.\n",
+        "  all    every step the selected hosts can run: on the remote hosts the cheap\n",
+        "         `check` first and then the `layer` set; on Windows the `layer` set.\n",
+        "\n",
+        "`--platform` selects the hosts and each step runs only where it has work:\n",
+        "`fast` on win, `quick` on mac and linux, `layer` and `all` on all three.\n",
+        "`--platform all` therefore runs `quick` on both remote hosts and `layer`\n",
+        "everywhere; a selection that leaves the step nothing to run is an error\n",
+        "rather than a silent no-op.\n",
+        "\n",
+        "`--scope` takes a comma separated crate list (names are validated against\n",
+        "[a-z0-9_-]) or `all`, which selects every workspace member (`--workspace`, and\n",
+        "`--all` for `cargo fmt`).\n",
+        "\n",
+        "A remote run force-pushes HEAD to the host's bare mirror `~/kytrix-p1.git`, resets\n",
+        "`~/kytrix-mig-src-<name>` to that branch, touches `crates/ui_core/build.rs` so no\n",
+        "build script can be reused across commits, and holds the same mkdir lock\n",
+        "(`/tmp/kytrix-p1-remote.lock`) as `.review/p1-remote.ps1` while it runs, because\n",
+        "the target directory is shared. `--remote-dir` names the scratch branch and\n",
+        "directory; by default it is the current branch with everything outside\n",
+        "`a-z0-9._-` replaced by `-`.\n",
+        "\n",
+        "Every command is echoed with its exit code and elapsed time. `--log` writes the\n",
+        "run log to <path> (default `.review/mig-gates-<unix-seconds>-<platform>.log` of\n",
+        "the main checkout). `--lock-timeout-secs` bounds the wait for the remote lock\n",
+        "(default 1800). A failed command does not stop the remaining commands of its\n",
+        "host; when any command fails the process exits non-zero and the failed commands\n",
+        "are listed last."
     ));
 }
 
 #[derive(Debug, Error)]
 enum CliError {
-    #[error("missing subcommand; expected `bump-version`")]
+    #[error("missing subcommand; expected `bump-version` or `gates`")]
     MissingCommand,
-    #[error("unknown subcommand `{0}`; expected `bump-version`")]
+    #[error("unknown subcommand `{0}`; expected `bump-version` or `gates`")]
     UnknownCommand(String),
     #[error("missing bump kind; expected major, minor, or patch")]
     MissingKind,
@@ -97,4 +160,6 @@ enum CliError {
     CurrentDirectory(#[source] io::Error),
     #[error(transparent)]
     Bump(#[from] bump::BumpError),
+    #[error(transparent)]
+    Gates(#[from] gates::GateError),
 }
