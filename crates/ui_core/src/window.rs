@@ -288,13 +288,21 @@ pub struct WindowOptions {
     /// - **Windows**：原生路径 —— 打开时 `EnableWindow(owner, FALSE)` 禁用 owner（系统级输入
     ///   拦截 + 灰显），关闭/销毁时恢复；同时引擎层按同一规则过滤（UI 线程兜底，防止
     ///   DComp/自定义消息绕过）。
-    /// - **macOS**：引擎层模态（`App` 分发层按 owner 关系过滤输入）+ 模态窗口层级
-    ///   （`NSModalPanelWindowLevel` 可选项，不依赖 `runModalForWindow:` 同步嵌套循环 ——
-    ///   那会与引擎自己的事件泵重入）。
-    /// - **Linux/Wayland**：协议没有模态；引擎层模态（同 macOS），并 `set_parent` 提示
-    ///   compositor 置于 owner 之上。
+    /// - **macOS**：原生路径（RB-07，用户批准方案 A）—— 打开时对 owner 的 `NSWindow` 施加
+    ///   原生拦截：`setIgnoresMouseEvents:YES`（owner 的内容区与红点/标题栏都不再响应鼠标）、
+    ///   禁用红点/最小化/缩放、关闭背景拖动；模态窗口用 `NSModalPanelWindowLevel` 且作为
+    ///   owner 的 child window。模态窗口显示时 `makeKeyAndOrderFront:` 接管键盘焦点，之后
+    ///   若 owner 通过 AppKit 窗口循环抢回 key，泵每轮把焦点拿回模态窗口（否则键盘事件进
+    ///   owner 会被模态过滤丢弃，模态对话框收不到键）。关闭时按打开前的**快照**恢复 owner
+    ///   的 chrome 并把键盘焦点还给仍可用的 owner。**不用** `beginSheet:`（会改变窗口形态）
+    ///   与 `runModalForWindow:`（嵌套 run loop 与引擎事件泵冲突）。引擎分发层同时按 owner
+    ///   关系过滤输入（原生拦截被绕过时的兜底）。
+    /// - **Linux/Wayland**：协议没有模态；引擎层模态（同 macOS 的兜底路径），并 `set_parent`
+    ///   提示 compositor 置于 owner 之上。
     ///
-    /// 模态窗口被关闭/否决关闭时语义：否决 = 保持模态；真正关闭 = 恢复 owner 输入。
+    /// 模态窗口被关闭/否决关闭时语义：否决 = 保持模态；真正关闭 = 恢复 owner 输入（三端
+    /// 一致；macOS 的原生拦截在关闭 / 外部关闭 / 级联关闭 / App 关闭 / Drop 每条收尾路径上
+    /// 都恢复，且恢复幂等 —— 不会把 owner 永久留在不可交互状态）。
     pub modal: bool,
     /// 是否置顶（always-on-top，X1）。
     ///

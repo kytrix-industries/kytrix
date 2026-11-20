@@ -303,6 +303,10 @@ fn create_native_windows(
 ///   （创建顺序之外的竞态 / 非法 id）⇒ 降级为无 owner 并写诊断，不 panic。
 /// - **层级**：模态（owner 已解析）> 置顶 > 普通；纯逻辑在
 ///   `platform::macos_owner::window_level`（Windows 可单测）。
+/// - **模态原生拦截**（RB-07）：`ModalPanel` 层级 ⇒ `apply_owner` 对 owner 快照并施加
+///   [`crate::platform::macos_owner::OwnerChrome::BLOCKED`]（`ignoresMouseEvents` + 禁用
+///   标准按钮 + 关闭背景拖动），模态窗口关闭时按快照恢复。owner 没解析出来的模态窗口按
+///   普通窗口处理（没有可拦截的对象），引擎层的输入过滤同样不会命中它。
 fn attach_owners(
     requests: &[(WindowId, WindowOptions)],
     windows: &mut [NativeWindow],

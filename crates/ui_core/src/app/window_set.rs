@@ -74,7 +74,7 @@ pub(crate) fn remove_node(app: &mut App, window: WindowId, node: NodeId) -> bool
 
 // ── 窗口 ──────────────────────────────────────────────────────────────────
 
-/// 本窗口的输入是否被某个**打开中的模态窗口**拦截（X1 引擎层模态）。
+/// 本窗口的输入是否被某个**打开中的模态窗口**拦截（X1 引擎层模态兜底）。
 ///
 /// 判据：存在一个窗口 `m`，`m.options().modal == true` 且 `m.options().owner == Some(window)`。
 /// 即「本窗口是模态窗口的 owner」⇒ 模态期间 owner 不接收输入，直到模态窗口关闭。
@@ -83,7 +83,10 @@ pub(crate) fn remove_node(app: &mut App, window: WindowId, node: NodeId) -> bool
 /// `EnableWindow(owner, FALSE)` 的作用面一致 —— 被禁用的是 owner 本身；owned 窗口在系统
 /// 语义里不是 owner 的子窗口（不是 `WS_CHILD`），不会自动禁用。
 ///
-/// 消费者：`app::resources::dispatch`（三端统一兜底；Windows 另有原生 `EnableWindow` 路径）。
+/// 消费者：`app::resources::dispatch`（三端统一兜底）。Windows 与 macOS 都另有**原生**拦截
+/// （`EnableWindow(owner, FALSE)` / `ignoresMouseEvents` + 禁用标准按钮，RB-07）：这条引擎
+/// 过滤保留为兜底 —— 原生拦截被 AppKit/系统绕过、或平台侧降级为无 owner 时，输入语义仍然
+/// 与「模态窗口打开期间 owner 不接收输入」一致。
 pub(crate) fn is_input_blocked_by_modal(app: &App, window: WindowId) -> bool {
     app.windows
         .values()
