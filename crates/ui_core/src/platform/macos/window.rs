@@ -49,11 +49,16 @@
 //! - **modal**（RB-07，用户批准方案 A）：原生路径 = 模态层级（`NSModalPanelWindowLevel`）
 //!   与「作为 owner 的 child window」；此外**打开期间对 owner 施加原生拦截**：快照 owner 的
 //!   chrome（[`OwnerChrome`]）后设 `ignoresMouseEvents:YES`、禁用红点/最小化/缩放、关闭
-//!   背景拖动，关闭时按快照恢复（含把键盘焦点还给仍可用的 owner）。模态窗口显示时
-//!   `makeKeyAndOrderFront:` 接管键盘焦点，泵每轮用 `macos_owner::modal_takes_key` 把被
-//!   owner 抢回的 key 拿回来 —— 否则键盘事件进 owner 会被引擎的模态输入过滤丢弃，模态窗口
-//!   收不到键。引擎层（`app/window_set.rs` 的 `is_input_blocked_by_modal`）仍按 owner 关系
-//!   过滤输入，作为原生拦截被绕过的兜底。
+//!   背景拖动。模态窗口显示时 `makeKeyAndOrderFront:` 接管键盘焦点，泵每轮用
+//!   `macos_owner::modal_takes_key` 把被 owner 抢回的 key 拿回来 —— 否则键盘事件进 owner 会
+//!   被引擎的模态输入过滤丢弃，模态窗口收不到键。引擎层（`app/window_set.rs` 的
+//!   `is_input_blocked_by_modal`）仍按 owner 关系过滤输入，作为原生拦截被绕过的兜底。
+//!
+//!   **同一 owner 多个模态窗口**（RB-13 的 mac 同类）：拦截/恢复由共享的
+//!   [`ModalOwnerChromes`] 记账，判据是派生值「该 owner 还有没有活着的模态窗口」（建窗登记、
+//!   关窗注销，两个写点；窗口对象的唯一所有者仍是 `LoopState.windows`）。关掉第一个模态
+//!   窗口时 owner **保持拦截**、焦点交给另一个仍活着的模态窗口；只有最后一个关闭才按第一个
+//!   窗口记录的快照恢复 chrome 并把焦点还给 owner —— 与 Windows RB-13 修复后的目标语义一致。
 //!
 //!   模态**不用** `runModalForWindow:`（嵌套 run loop 与本引擎在 `NSApplication.run` 的 run
 //!   loop 上跑的泵重入）与 `beginSheet:`（会改变窗口形态、把模态窗口嵌进 owner 的标题栏；
@@ -64,7 +69,11 @@
 //!   的模态输入过滤也不会命中它（`is_input_blocked_by_modal` 判的是直接 owner），与
 //!   `WindowOptions::modal` 的降级口径一致。
 
-use std::{cell::Cell, rc::Rc, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    sync::Arc,
+};
 
 use objc2::{
     DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
@@ -92,7 +101,9 @@ use crate::{
         dispatcher::Dispatcher,
         macos::{a11y::MacA11y, dpi, menu, view::GuiView, wake},
         macos_close::{CloseAction, CloseBridge},
-        macos_owner::{OwnerChrome, WindowLevel, modal_takes_key, release_modal_owner},
+        macos_owner::{
+            ModalOwnerChromes, ModalOwnerRelease, OwnerChrome, WindowLevel, modal_takes_key,
+        },
         macos_placement as placement,
         menu::MenuCommand,
     },
@@ -270,6 +281,30 @@ fn apply_owner_chrome(window: &NSWindow, chrome: OwnerChrome) {
     }
 }
 
+/// 把键盘焦点交给 owner 的**另一个**模态窗口（RB-13-mac）。
+///
+/// 关闭持有 key 的模态窗口、但 owner 上仍有其它模态窗口时，焦点不能还给 owner（owner 仍被
+/// 拦截，键盘事件会被引擎的模态过滤丢弃 ⇒ 另一个模态窗口收不到键）。这里从 AppKit 自己的
+/// child window 列表里找：`addChildWindow:ordered:` 已把模态窗口挂成 owner 的 child，模态
+/// 窗口的层级是 [`NSModalPanelWindowLevel`]（`apply_owner` 里设置）——因此**不需要**在平台侧
+/// 再维护一份「模态窗口 → NSWindow」的表（AppKit 的窗口关系就是真值来源）。
+fn hand_key_to_another_modal(owner: &NSWindow, closing: &NSWindow) {
+    let Some(children) = owner.childWindows() else {
+        return;
+    };
+    for child in children.to_vec() {
+        // SAFETY: 指针只用于比较两个仍存活的 AppKit 对象身份（不 deref）。
+        if std::ptr::eq(&*child, closing) {
+            continue;
+        }
+        if child.level() != NSModalPanelWindowLevel || !child.isVisible() {
+            continue;
+        }
+        child.makeKeyWindow();
+        return;
+    }
+}
+
 /// `position = None` 时的平台默认摆放（B3）：主屏工作区左上角按 26 point 阶梯级联。
 ///
 /// AppKit 没有「自动摆放」的默认行为（`initWithContentRect:` 严格按给定矩形创建），
@@ -292,6 +327,15 @@ fn cascade_content_origin(
     placement::content_origin_for_position(position, size, screens)
 }
 
+/// owner 窗口的 `WindowId` + 原生引用（X1）。
+///
+/// `WindowId` 只用于模态拦截记账（[`ModalOwnerChromes`] 按 owner 分组）；`Retained` 保证
+/// parent 的 `NativeWindow` 先被移除后对象仍然存活（关闭时要 `removeChildWindow:`）。
+pub(crate) struct OwnerWindow {
+    pub id: WindowId,
+    pub window: Retained<NSWindow>,
+}
+
 /// 一个原生窗口（`Application::run` 持有；`Drop` 时关闭）。
 pub(crate) struct NativeWindow {
     mtm: MainThreadMarker,
@@ -302,17 +346,16 @@ pub(crate) struct NativeWindow {
     delegate: Retained<WindowDelegate>,
     /// 关闭桥（B5）：view / delegate 写入、泵消费（与 `GuiView` / `WindowDelegate` 共享）。
     close: Rc<CloseBridge>,
-    /// owner 窗口的原生引用（X1；`addChildWindow:ordered:` 的 parent）。
+    /// owner 窗口（X1；`addChildWindow:ordered:` 的 parent）。
+    owner: Option<OwnerWindow>,
+    /// 本窗口是否是**已接线 owner 的模态窗口**（RB-07）。
     ///
-    /// 保持强引用：关闭本窗口时要 `removeChildWindow:`，即使 parent 的 `NativeWindow` 已先
-    /// 被移除，NSWindow 对象也必须仍然存活（`Retained` 保证这一点）。
-    owner: Option<Retained<NSWindow>>,
-    /// 模态窗口对 owner 施加原生拦截前的 chrome 快照（RB-07）。
-    ///
-    /// `Some` = 本窗口是模态窗口且已拦截 owner（`None` = 没有施加拦截）。关闭时按快照恢复
-    /// 并 `take` 掉，因此「关闭 / 外部关闭 / 级联关闭 / Drop / App 关闭」多条收尾路径都幂等、
-    /// 不会把 owner 永久留在不可交互状态。
-    modal_owner_chrome: Option<OwnerChrome>,
+    /// `true` ⇒ 本窗口在 `modal_registry` 里登记过，`close` / 外部关闭 / Drop 时负责注销；
+    /// `sync_state` 的 key 对账也据此判定「模态窗口应从 owner 手里拿回焦点」。
+    modal: bool,
+    /// 平台侧模态拦截记账（RB-07 / RB-13-mac）：与所有 `NativeWindow` 共享，用于「该 owner
+    /// 是否还有其它活着的模态窗口」的派生判定（`close` / `Drop` 拿不到 `&App`）。
+    modal_registry: Rc<RefCell<ModalOwnerChromes>>,
     scale: Scale,
     logical_size: Size,
     /// 最近一次同步的快照（用于检测变化）。
@@ -344,6 +387,7 @@ impl NativeWindow {
     /// 时用于平台默认的级联摆放（B3，见 `macos_placement::cascade_position`）。
     /// `a11y_consumer_epoch` 是窗口的消费端代际句柄（与引擎 `A11yBridge` 共享）：AX 重新激活
     /// 时激活回调 `bump()` 它，引擎把下一笔升成全树（E1）。
+    /// `modal_registry` 是所有原生窗口共享的模态拦截记账（RB-07；见 [`ModalOwnerChromes`]）。
     pub(crate) fn create(
         mtm: MainThreadMarker,
         id: WindowId,
@@ -351,6 +395,7 @@ impl NativeWindow {
         dispatcher: &Arc<Dispatcher>,
         cascade_index: usize,
         a11y_consumer_epoch: crate::a11y::adapter::A11yConsumerEpoch,
+        modal_registry: Rc<RefCell<ModalOwnerChromes>>,
     ) -> Result<Self, EngineError> {
         let style = NSWindowStyleMask::Titled
             | NSWindowStyleMask::Closable
@@ -476,8 +521,9 @@ impl NativeWindow {
             // X1：owner 关系由泵在建窗批次**全部创建之后**接线（`apply_owner`）：
             // `App` 的窗口表是 HashMap，owner 可能排在 owned 之后。
             owner: None,
-            // RB-07：模态窗口在 `apply_owner` 接线 owner 时快照并拦截；这里还没有 owner。
-            modal_owner_chrome: None,
+            // RB-07：模态窗口在 `apply_owner` 接线 owner 时登记并拦截；这里还没有 owner。
+            modal: false,
+            modal_registry,
             scale: options.scale,
             logical_size: options.size,
             seen_scale: 1.0,
@@ -576,7 +622,7 @@ impl NativeWindow {
     /// - **模态**：owner 接线成功后对 owner 施加 [`OwnerChrome::BLOCKED`] 原生拦截（RB-07，
     ///   见 [`Self::block_modal_owner`]）。`ModalPanel` 层级只会在 owner 已解析时出现
     ///   （`attach_owners` 的判据），因此这里不需要再判 owner 是否存在。
-    pub(crate) fn apply_owner(&mut self, owner: Option<Retained<NSWindow>>, level: WindowLevel) {
+    pub(crate) fn apply_owner(&mut self, owner: Option<OwnerWindow>, level: WindowLevel) {
         match level {
             WindowLevel::Normal => {}
             WindowLevel::Floating => self.window.setLevel(NSFloatingWindowLevel),
@@ -586,7 +632,11 @@ impl NativeWindow {
             // SAFETY: 两个 NSWindow 都是本进程主线程上创建、由 `NativeWindow` 持有的对象；
             // `addChildWindow:ordered:` 是 AppKit 的窗口关系 API（ordered 只决定 z 序，不转移
             // 所有权）。调用方已过滤自指（`platform::macos_owner::resolve_owner`）。
-            unsafe { owner.addChildWindow_ordered(&self.window, NSWindowOrderingMode::Above) };
+            unsafe {
+                owner
+                    .window
+                    .addChildWindow_ordered(&self.window, NSWindowOrderingMode::Above)
+            };
             self.owner = Some(owner);
         }
         if matches!(level, WindowLevel::ModalPanel) {
@@ -596,10 +646,10 @@ impl NativeWindow {
 
     /// 打开模态窗口时对 owner 施加原生拦截（RB-07，用户批准方案 A）。
     ///
-    /// 快照 owner 的 chrome **再**施加 [`OwnerChrome::BLOCKED`]：owner 对鼠标透明、标准按钮
-    /// （红点 / 最小化 / 缩放）禁用、不可由背景拖动 —— 与 Windows `EnableWindow(owner, FALSE)`
-    /// 同语义。快照存在 `modal_owner_chrome`，关闭时由 [`Self::restore_modal_owner`] 按原值
-    /// 恢复（不假设默认值：应用可能自己禁用过红点、开启过背景拖动）。
+    /// 在共享记账 [`ModalOwnerChromes`] 里登记本窗口；**只有该 owner 的第一个模态窗口**才
+    /// 快照 chrome 并施加 [`OwnerChrome::BLOCKED`]（owner 对鼠标透明、标准按钮禁用、不可由
+    /// 背景拖动 —— 与 Windows `EnableWindow(owner, FALSE)` 同语义）。第二个及之后的模态
+    /// 窗口不重复快照（否则最后关闭的窗口会把拦截态当成原值恢复，owner 永久不可交互）。
     ///
     /// 拦截只是语义对齐的一半：模态窗口的键盘焦点由 `show()`（显示时 `makeKeyAndOrderFront:`）
     /// 与 `sync_state`（每轮把被 owner 抢走的 key 拿回来）保证。
@@ -607,36 +657,50 @@ impl NativeWindow {
         let Some(owner) = self.owner.as_ref() else {
             return;
         };
-        let original = read_owner_chrome(owner);
-        apply_owner_chrome(owner, OwnerChrome::BLOCKED);
-        self.modal_owner_chrome = Some(original);
+        let observed = read_owner_chrome(&owner.window);
+        let first = self
+            .modal_registry
+            .borrow_mut()
+            .open(self.id, owner.id, observed);
+        self.modal = true;
+        if first {
+            apply_owner_chrome(&owner.window, OwnerChrome::BLOCKED);
+        }
     }
 
-    /// 恢复被模态拦截的 owner（RB-07；幂等）。
+    /// 注销本模态窗口并按**派生判据**收尾 owner（RB-07；RB-13-mac）。
     ///
-    /// 关闭 / 外部关闭 / 级联关闭（owner 关闭导致 owned 关闭）/ Drop / App 关闭都汇到这里：
-    /// `modal_owner_chrome` 被 `take`，第二次调用是 no-op。恢复目标由平台无关的
-    /// [`release_modal_owner`] 决定（只在 owner 仍处拦截态时写回快照；多模态窗口下不会被
-    /// 后来的窗口把拦截态写回去）。owner 仍可用时把键盘焦点还给它 —— 与 Windows
-    /// `EnableWindow(owner, TRUE)` 的恢复语义对齐。
+    /// 关闭 / 外部关闭 / 级联关闭（owner 关闭导致 owned 关闭）/ Drop / App 关闭都汇到这里；
+    /// `self.modal` 置假，第二次调用是 no-op。收尾动作由平台无关的 [`ModalOwnerChromes`]
+    /// 给出：owner 仍有其它活着的模态窗口 ⇒ **保持拦截**并把焦点交给另一个模态窗口（不能
+    /// 提前恢复、不能把焦点还给 owner）；最后一个模态窗口关闭 ⇒ 按第一个窗口记录的快照恢复
+    /// chrome，并按需把焦点还给 owner（与 Windows `EnableWindow(owner, TRUE)` 对齐）。
     fn restore_modal_owner(&mut self) {
-        let Some(original) = self.modal_owner_chrome.take() else {
+        if !self.modal {
             return;
-        };
+        }
+        self.modal = false;
         let Some(owner) = self.owner.as_ref() else {
             return;
         };
-        let release = release_modal_owner(
-            read_owner_chrome(owner),
-            original,
+        let release = self.modal_registry.borrow_mut().close(
+            self.id,
             self.window.isKeyWindow(),
-            owner.isVisible() && !owner.isMiniaturized(),
+            owner.window.isVisible() && !owner.window.isMiniaturized(),
         );
-        if let Some(chrome) = release.chrome {
-            apply_owner_chrome(owner, chrome);
-        }
-        if release.return_key {
-            owner.makeKeyWindow();
+        match release {
+            ModalOwnerRelease::Last { chrome, return_key } => {
+                apply_owner_chrome(&owner.window, chrome);
+                if return_key {
+                    owner.window.makeKeyWindow();
+                }
+            }
+            ModalOwnerRelease::Remaining { hand_key } => {
+                if hand_key {
+                    hand_key_to_another_modal(&owner.window, &self.window);
+                }
+            }
+            ModalOwnerRelease::None => {}
         }
     }
 
@@ -647,7 +711,7 @@ impl NativeWindow {
     /// 已先被关闭，其 `NSWindow` 对象仍由这里的强引用保活，调用安全。
     fn detach_owner(&mut self) {
         if let Some(owner) = self.owner.take() {
-            owner.removeChildWindow(&self.window);
+            owner.window.removeChildWindow(&self.window);
         }
     }
 
@@ -763,12 +827,11 @@ impl NativeWindow {
         // key 而模态不是 key ⇒ 在读取本轮焦点快照**之前**拿回来，应用因此看不到一次假的
         // 失焦（也不会触发失焦的 IME 清场）。判定在平台无关的
         // `platform::macos_owner::modal_takes_key`（Windows 可单测）。
-        let owner_is_key = self.owner.as_ref().is_some_and(|owner| owner.isKeyWindow());
-        if modal_takes_key(
-            self.modal_owner_chrome.is_some(),
-            owner_is_key,
-            self.window.isKeyWindow(),
-        ) {
+        let owner_is_key = self
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.window.isKeyWindow());
+        if modal_takes_key(self.modal, owner_is_key, self.window.isKeyWindow()) {
             self.window.makeKeyWindow();
         }
         let key = self.window.isKeyWindow();

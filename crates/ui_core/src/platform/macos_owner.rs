@@ -35,12 +35,23 @@
 //!
 //! 因此模态窗口打开期间对 owner 的 `NSWindow` 施加 [`OwnerChrome::BLOCKED`]：窗口对鼠标
 //! 透明（`setIgnoresMouseEvents:YES`）、不可由背景拖动、三个标准按钮禁用。打开前把 owner
-//! 的**原值**快照下来，关闭时按 [`release_modal_owner`] 的决策逐项恢复（不假设默认值）。
+//! 的**原值**快照下来，关闭时按 [`ModalOwnerChromes`] 的派生判据逐项恢复（不假设默认值）。
 //! 模态窗口显示时 `makeKeyAndOrderFront:` 接管键盘焦点，泵每轮再用 [`modal_takes_key`]
 //! 把被 AppKit 窗口循环抢回 owner 的 key 拿回来；关闭时把 key 还给仍可用的 owner。
 //!
+//! # 同一 owner 多个模态窗口（RB-13 的 mac 同类）
+//!
+//! 恢复条件不是「关闭了一个模态窗口」，而是**派生值**：该 owner 已没有任何活着的模态窗口
+//! （[`ModalOwnerChromes`] 维护「仍活着的模态窗口集合」，在 `NativeWindow` 的建窗 / 关窗
+//! 两处登记与注销）。只关掉第一个模态窗口时 owner 的 chrome **保持拦截**，焦点交给另一个
+//! 仍活着的模态窗口 —— 与 Windows `EnableWindow(owner, FALSE)` 在多模态下的目标语义一致
+//! （Windows 侧 RB-13 的计数缺陷另行修复）。快照只由第一个模态窗口记录、由最后一个关闭的
+//! 窗口恢复，避免第二个窗口把「拦截态」当成原值写回。
+//!
 //! **不用** `beginSheet:`（会改变窗口形态、把模态窗口嵌进 owner 的标题栏）与
 //! `runModalForWindow:`（嵌套 run loop 与引擎泵冲突）。
+
+use std::collections::hash_map::Entry;
 
 use crate::window::WindowId;
 
@@ -133,33 +144,122 @@ impl OwnerChrome {
     };
 }
 
-/// 模态关闭时对 owner 的收尾决策（RB-07）。
+/// 模态窗口关闭后对 owner 的收尾决策（RB-07；RB-13 的 mac 同类）。
+///
+/// 判据是**派生值**：owner 上还有没有活着的模态窗口（见 [`ModalOwnerChromes`]），不是
+/// +/-1 计数 —— 计数在异常收尾路径上会漂移，集合则与窗口对象的生命周期同源。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ModalOwnerRelease {
-    /// 要写回 owner 的 chrome（`None` = owner 已不在拦截态，保持现状）。
-    pub chrome: Option<OwnerChrome>,
-    /// 是否把键盘焦点还给 owner（`NSWindow.makeKeyWindow`）。
-    pub return_key: bool,
+pub(crate) enum ModalOwnerRelease {
+    /// owner 已没有任何模态窗口：按打开前的快照恢复 chrome；`return_key` = 关闭的是 key
+    /// 窗口且 owner 仍可用 ⇒ 把键盘焦点还给 owner（与 Windows `EnableWindow(owner, TRUE)`
+    /// 后焦点回到 owner 的恢复语义对齐）。
+    Last {
+        chrome: OwnerChrome,
+        return_key: bool,
+    },
+    /// owner 仍有其它活着的模态窗口：chrome **保持拦截**（不能提前恢复，否则原生/引擎语义
+    /// 分叉 —— 引擎层仍在拦输入，owner 的原生 chrome 却可点了）。`hand_key` = 关闭的是 key
+    /// 窗口 ⇒ 焦点交给另一个仍活着的模态窗口（**不是** owner）。
+    Remaining { hand_key: bool },
+    /// 本窗口没有登记（不是模态窗口 / owner 未解析 / 已经释放过）：什么都不做。
+    None,
 }
 
-/// 模态关闭时对 owner 应用什么（纯决策；真机侧翻成 AppKit 调用）。
+/// 一个 owner 的模态拦截记账：**仍活着的模态窗口** + 打开前的 chrome 快照。
 ///
-/// `current` 是**关闭这一刻**读到的 owner chrome，`original` 是打开模态时的快照：
+/// # 恢复判据是派生值，不是计数器
 ///
-/// - `chrome`：只在 `current == OwnerChrome::BLOCKED` 时恢复快照。若 owner 已经被别的模态
-///   窗口恢复过（同一 owner 上多个模态窗口，任意关闭顺序）或应用自己改过 chrome，盲目写
-///   快照会把 owner 永久留在拦截态（A 关闭恢复原值 → B 关闭又写回 B 快照到的「拦截态」）。
-/// - `return_key`：模态窗口仍持有键盘焦点、且 owner 仍可用（可见、未最小化）时把焦点还给
-///   owner —— 与 Windows `EnableWindow(owner, TRUE)` 后焦点回到 owner 的恢复语义对齐。
-pub(crate) fn release_modal_owner(
-    current: OwnerChrome,
+/// 同一 owner 上可以有多个模态窗口（API 允许）。恢复 owner 原生交互的条件必须是
+/// 「该 owner 已没有任何活着的模态窗口」，而不是「关闭了一个模态窗口」：否则关掉第一个就
+/// 恢复，与引擎层仍按 owner 关系拦截输入的事实分叉（Windows RB-13 的同类缺陷）。
+///
+/// 这里用 `modals: Vec<WindowId>` 表达「仍活着的模态窗口集合」，在**建窗 / 关窗**两处维护；
+/// 关窗时按集合的**当前内容**派生收尾动作。窗口对象的唯一所有者仍是 macOS 事件循环的
+/// `LoopState.windows`：任何收尾路径（引擎关闭 / 外部关闭 / 级联关闭 / App 关闭 / Drop）
+/// 都会走到 `NativeWindow::close` 的注销，因此集合不会因异常路径永久漂移。
+///
+/// 打开前的 chrome 快照只由**第一个**模态窗口记录、由**最后一个**关闭的模态窗口恢复：
+/// 第二个及之后的窗口若重新快照，会把拦截态当成原值写回（owner 永久不可交互）。
+#[derive(Debug, Default)]
+pub(crate) struct ModalOwnerChromes {
+    owners: ahash::HashMap<WindowId, OwnerModalWindows>,
+}
+
+/// 单个 owner 的模态记账（`ModalOwnerChromes` 的内部条目）。
+#[derive(Debug)]
+struct OwnerModalWindows {
+    /// 打开前的 owner chrome（第一个模态窗口记录；最后一个模态窗口恢复）。
     original: OwnerChrome,
-    modal_is_key: bool,
-    owner_usable: bool,
-) -> ModalOwnerRelease {
-    ModalOwnerRelease {
-        chrome: (current == OwnerChrome::BLOCKED).then_some(original),
-        return_key: modal_is_key && owner_usable,
+    /// 仍活着的模态窗口（非空；最后一个关闭时整条记录移除）。
+    modals: Vec<WindowId>,
+}
+
+impl ModalOwnerChromes {
+    /// 模态窗口打开（唯一写点之一：`NativeWindow::apply_owner` 接线 owner 时）。
+    ///
+    /// 返回 `true` = 这是该 owner 的**第一个**模态窗口：快照已记录，调用方应施加
+    /// [`OwnerChrome::BLOCKED`]；返回 `false` = 该 owner 已被其它模态窗口拦截，chrome 保持
+    /// 现状（不重复快照、不重复施加）。
+    pub(crate) fn open(&mut self, modal: WindowId, owner: WindowId, observed: OwnerChrome) -> bool {
+        match self.owners.entry(owner) {
+            Entry::Occupied(mut entry) => {
+                let windows = entry.get_mut();
+                // 同一窗口重复 open（防御：接线只有一次）不得把集合写重。
+                if !windows.modals.contains(&modal) {
+                    windows.modals.push(modal);
+                }
+                false
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(OwnerModalWindows {
+                    original: observed,
+                    modals: vec![modal],
+                });
+                true
+            }
+        }
+    }
+
+    /// 模态窗口关闭（唯一写点之二：`NativeWindow::restore_modal_owner`，被 close /
+    /// 外部关闭 / Drop 共用）。
+    ///
+    /// 从活集合移除后按**当前内容**派生：集合空 ⇒ 恢复快照 + 按需归还 owner 焦点；集合
+    /// 非空 ⇒ 保持拦截 + 按需把焦点交给另一个仍活着的模态窗口。
+    pub(crate) fn close(
+        &mut self,
+        modal: WindowId,
+        modal_is_key: bool,
+        owner_usable: bool,
+    ) -> ModalOwnerRelease {
+        // 按窗口 id 找它所属的 owner 条目：模态窗口数量是个位数，线性扫描即可；不引入
+        // 「模态 → owner」的第二张表（多一个需要同步的真值来源）。
+        let Some((owner, windows)) = self
+            .owners
+            .iter_mut()
+            .find(|(_, windows)| windows.modals.contains(&modal))
+        else {
+            return ModalOwnerRelease::None;
+        };
+        let owner = *owner;
+        let Some(index) = windows
+            .modals
+            .iter()
+            .position(|candidate| *candidate == modal)
+        else {
+            return ModalOwnerRelease::None;
+        };
+        windows.modals.swap_remove(index);
+        if !windows.modals.is_empty() {
+            return ModalOwnerRelease::Remaining {
+                hand_key: modal_is_key,
+            };
+        }
+        let original = windows.original;
+        self.owners.remove(&owner);
+        ModalOwnerRelease::Last {
+            chrome: original,
+            return_key: modal_is_key && owner_usable,
+        }
     }
 }
 
@@ -175,8 +275,8 @@ pub(crate) const fn modal_takes_key(modal: bool, owner_is_key: bool, modal_is_ke
 #[cfg(test)]
 mod tests {
     use super::{
-        ModalOwnerRelease, OwnerChrome, OwnerResolution, WindowId, WindowLevel, modal_takes_key,
-        release_modal_owner, resolve_owner, window_level,
+        ModalOwnerChromes, ModalOwnerRelease, OwnerChrome, OwnerResolution, WindowId, WindowLevel,
+        modal_takes_key, resolve_owner, window_level,
     };
 
     /// 默认（无置顶、无模态）不抬高层级：保持 AppKit 默认，避免无谓的 `setLevel:` 调用。
@@ -252,63 +352,133 @@ mod tests {
     }
 
     /// 恢复必须回到**打开前的原值**（不能假设默认值）：应用自己禁用过的红点、开启过的背景
-    /// 拖动都要原样还回去。
+    /// 拖动都要原样还回去；单个模态窗口关闭时同时把焦点还给 owner。
     #[test]
-    fn releasing_a_modal_owner_restores_the_snapshot_not_the_defaults() {
-        let release = release_modal_owner(OwnerChrome::BLOCKED, APP_CHROME, true, true);
-        assert_eq!(
-            release.chrome,
-            Some(APP_CHROME),
-            "关闭时必须逐项写回打开前的快照"
-        );
+    fn the_last_modal_window_restores_the_snapshot_and_the_owner_key() {
+        let owner = WindowId::from_raw(1);
+        let modal = WindowId::from_raw(2);
+        let mut chromes = ModalOwnerChromes::default();
         assert!(
-            release.return_key,
-            "模态持有 key 且 owner 可用 ⇒ 焦点还给 owner"
+            chromes.open(modal, owner, APP_CHROME),
+            "第一个模态窗口必须快照"
+        );
+        assert_eq!(
+            chromes.close(modal, true, true),
+            ModalOwnerRelease::Last {
+                chrome: APP_CHROME,
+                return_key: true,
+            },
+            "最后一个模态窗口关闭：按快照恢复 chrome，并把焦点还给 owner"
+        );
+        assert_eq!(
+            chromes.close(modal, true, true),
+            ModalOwnerRelease::None,
+            "重复关闭不得再恢复一次（幂等）"
         );
     }
 
-    /// 恢复是幂等的：第二次释放看到 owner 已不在拦截态 ⇒ 保持现状，不把拦截态写回去。
+    /// owner 不可用（已关闭 / 最小化）时 chrome 仍要恢复，但不得抢键盘焦点。
     #[test]
-    fn releasing_twice_keeps_the_restored_chrome() {
-        let first = release_modal_owner(OwnerChrome::BLOCKED, APP_CHROME, true, true);
-        let restored = first.chrome.expect("第一次释放必须恢复");
-        assert_eq!(restored, APP_CHROME);
-        let second = release_modal_owner(restored, APP_CHROME, true, true);
-        assert_eq!(second.chrome, None, "已恢复的 chrome 不得再被写一遍");
+    fn a_closed_owner_still_gets_its_chrome_back_without_the_key() {
+        let owner = WindowId::from_raw(1);
+        let modal = WindowId::from_raw(2);
+        let mut chromes = ModalOwnerChromes::default();
+        assert!(chromes.open(modal, owner, APP_CHROME));
+        assert_eq!(
+            chromes.close(modal, true, false),
+            ModalOwnerRelease::Last {
+                chrome: APP_CHROME,
+                return_key: false,
+            }
+        );
     }
 
-    /// 同一 owner 上的两个模态窗口：**任意关闭顺序**最终都回到打开前的原值，不会把 owner
-    /// 永久留在拦截态（B 的快照本身就是拦截态，盲目写回会永久禁用 owner）。
+    /// **RB-13 的 mac 同类核心回归**：同一 owner 上两个模态窗口，关掉第一个**不得**恢复
+    /// owner 的 chrome —— 引擎层仍按 owner 关系拦截输入，提前恢复原生交互会造成语义分叉；
+    /// 关闭的是 key 窗口时焦点应交给**另一个仍活着的模态窗口**，不是 owner。
+    /// 只有最后一个模态窗口关闭才恢复打开前的快照并把焦点还给 owner。
     #[test]
-    fn two_modal_windows_on_one_owner_never_leave_it_blocked() {
-        // 模拟真机侧：open 快照并施加 BLOCKED，close 按决策恢复。
-        fn open(owner: &mut OwnerChrome) -> OwnerChrome {
-            let snapshot = *owner;
-            *owner = OwnerChrome::BLOCKED;
-            snapshot
-        }
-        fn close(owner: &mut OwnerChrome, snapshot: OwnerChrome) {
-            let release: ModalOwnerRelease = release_modal_owner(*owner, snapshot, true, true);
-            if let Some(chrome) = release.chrome {
-                *owner = chrome;
+    fn closing_the_first_of_two_modal_windows_keeps_the_owner_blocked() {
+        let owner = WindowId::from_raw(1);
+        let first = WindowId::from_raw(2);
+        let second = WindowId::from_raw(3);
+
+        // 顺序 1（FIFO）：先关第一个。
+        let mut chromes = ModalOwnerChromes::default();
+        assert!(chromes.open(first, owner, APP_CHROME));
+        assert!(
+            !chromes.open(second, owner, OwnerChrome::BLOCKED),
+            "第二个模态窗口不得把拦截态重新快照成原值"
+        );
+        assert_eq!(
+            chromes.close(first, true, true),
+            ModalOwnerRelease::Remaining { hand_key: true },
+            "仍有模态窗口：owner chrome 必须保持 blocked，key 交给另一个模态窗口"
+        );
+        assert_eq!(
+            chromes.close(second, true, true),
+            ModalOwnerRelease::Last {
+                chrome: APP_CHROME,
+                return_key: true,
+            },
+            "最后一个关闭：恢复打开前的快照并把 key 还给 owner"
+        );
+
+        // 顺序 2（LIFO）：先关第二个。中间态同样必须保持拦截。
+        let mut chromes = ModalOwnerChromes::default();
+        assert!(chromes.open(first, owner, APP_CHROME));
+        assert!(!chromes.open(second, owner, OwnerChrome::BLOCKED));
+        assert_eq!(
+            chromes.close(second, true, true),
+            ModalOwnerRelease::Remaining { hand_key: true }
+        );
+        assert_eq!(
+            chromes.close(first, true, true),
+            ModalOwnerRelease::Last {
+                chrome: APP_CHROME,
+                return_key: true,
             }
-        }
+        );
+    }
 
-        // 顺序 1：A 先开、B 后开；先关 A 再关 B（非 LIFO，最坏情况）。
-        let mut owner = APP_CHROME;
-        let a = open(&mut owner);
-        let b = open(&mut owner);
-        close(&mut owner, a);
-        close(&mut owner, b);
-        assert_eq!(owner, APP_CHROME, "先关旧模态也不得永久拦截 owner");
+    /// 关闭的不是 key 模态窗口时不得抢焦点（owner 与其它模态窗口都不动），但拦截/恢复判据
+    /// 不变。
+    #[test]
+    fn closing_a_non_key_modal_window_never_steals_the_key() {
+        let owner = WindowId::from_raw(1);
+        let first = WindowId::from_raw(2);
+        let second = WindowId::from_raw(3);
+        let mut chromes = ModalOwnerChromes::default();
+        assert!(chromes.open(first, owner, APP_CHROME));
+        assert!(!chromes.open(second, owner, OwnerChrome::BLOCKED));
+        assert_eq!(
+            chromes.close(first, false, true),
+            ModalOwnerRelease::Remaining { hand_key: false }
+        );
+        assert_eq!(
+            chromes.close(second, false, true),
+            ModalOwnerRelease::Last {
+                chrome: APP_CHROME,
+                return_key: false,
+            }
+        );
+    }
 
-        // 顺序 2：LIFO 关闭（B 先关）。
-        let mut owner = APP_CHROME;
-        let a = open(&mut owner);
-        let b = open(&mut owner);
-        close(&mut owner, b);
-        close(&mut owner, a);
-        assert_eq!(owner, APP_CHROME);
+    /// 未登记的窗口关闭是 no-op（不是模态窗口 / owner 未解析 / 已释放）。
+    #[test]
+    fn closing_an_unregistered_window_is_a_noop() {
+        let owner = WindowId::from_raw(1);
+        let mut chromes = ModalOwnerChromes::default();
+        assert_eq!(
+            chromes.close(WindowId::from_raw(9), true, true),
+            ModalOwnerRelease::None
+        );
+        assert!(chromes.open(WindowId::from_raw(2), owner, APP_CHROME));
+        assert_eq!(
+            chromes.close(WindowId::from_raw(9), true, true),
+            ModalOwnerRelease::None,
+            "别的窗口关闭不得动这个 owner 的记账"
+        );
     }
 
     /// 模态窗口必须从 owner 手里拿回键盘焦点：owner 抢到 key 后键盘事件进 owner，会被引擎的

@@ -19,7 +19,9 @@
 //! （此时没有其它 `&mut App` 存活），因此用裸指针穿透 ObjC 回调是安全的。
 
 use std::{
+    cell::RefCell,
     ffi::c_void,
+    rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -43,10 +45,10 @@ use crate::{
         macos::{
             app_delegate::{AppDelegate, QuitHandshake},
             menu, wake,
-            window::NativeWindow,
+            window::{NativeWindow, OwnerWindow},
         },
         macos_close::CloseAction,
-        macos_owner::{OwnerResolution, resolve_owner, window_level},
+        macos_owner::{ModalOwnerChromes, OwnerResolution, resolve_owner, window_level},
     },
     render::{backend::Renderer, macos::core::GpuCore},
     window::{Window, WindowId, WindowOptions},
@@ -58,6 +60,9 @@ struct LoopState {
     app: *mut App,
     windows: Vec<NativeWindow>,
     dispatcher: Arc<Dispatcher>,
+    /// 模态 owner 拦截记账（RB-07；RB-13-mac 的派生判据）：与所有 `NativeWindow` 共享，
+    /// 运行期新建的窗口也必须用同一份（见 `sync_native_windows`）。
+    modal_registry: Rc<RefCell<ModalOwnerChromes>>,
     /// `NSApp.run()` 需要一个稳定的 Retained；退出时 `stop(None)`。
     ns_app: Retained<NSApplication>,
     /// `NSApplication.delegate` 是 **weak** 属性：必须由门面持有强引用，否则回调会打在已释放
@@ -158,9 +163,19 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
         .map(|(id, window)| (id, window.options().clone()))
         .collect();
     let mut windows: Vec<NativeWindow> = Vec::with_capacity(requests.len());
+    // RB-07：模态 owner 拦截记账（启动批与运行期建窗共用同一份；见 `LoopState`）。
+    let modal_registry: Rc<RefCell<ModalOwnerChromes>> =
+        Rc::new(RefCell::new(ModalOwnerChromes::default()));
     // X1：两阶段建窗（先全部创建、再接线 owner/层级、最后显示 + 建渲染器）。`App` 的窗口
     // 表是 `HashMap`，创建顺序不可控，而 owner 必须先有原生窗口，见 `attach_owners`。
-    create_native_windows(mtm, &app, &requests, &dispatcher, &mut windows)?;
+    create_native_windows(
+        mtm,
+        &app,
+        &requests,
+        &dispatcher,
+        &mut windows,
+        &modal_registry,
+    )?;
     attach_owners(&requests, &mut windows, 0);
     for (native, (_, options)) in windows.iter_mut().zip(requests.iter()) {
         show_window(&mut app, native, options, &dispatcher)?;
@@ -173,6 +188,7 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
         app: Box::into_raw(Box::new(app)),
         windows,
         dispatcher: dispatcher.clone(),
+        modal_registry,
         ns_app: ns_app.clone(),
         _delegate: delegate,
         quit: Arc::clone(&quit),
@@ -271,6 +287,7 @@ fn create_native_windows(
     requests: &[(WindowId, WindowOptions)],
     dispatcher: &Arc<Dispatcher>,
     windows: &mut Vec<NativeWindow>,
+    modal_registry: &Rc<RefCell<ModalOwnerChromes>>,
 ) -> Result<(), EngineError> {
     let start = windows.len();
     windows.reserve(requests.len());
@@ -291,6 +308,7 @@ fn create_native_windows(
             dispatcher,
             start + offset,
             a11y_epoch,
+            Rc::clone(modal_registry),
         )?);
     }
     Ok(())
@@ -303,10 +321,12 @@ fn create_native_windows(
 ///   （创建顺序之外的竞态 / 非法 id）⇒ 降级为无 owner 并写诊断，不 panic。
 /// - **层级**：模态（owner 已解析）> 置顶 > 普通；纯逻辑在
 ///   `platform::macos_owner::window_level`（Windows 可单测）。
-/// - **模态原生拦截**（RB-07）：`ModalPanel` 层级 ⇒ `apply_owner` 对 owner 快照并施加
+/// - **模态原生拦截**（RB-07；RB-13-mac）：`ModalPanel` 层级 ⇒ `apply_owner` 在共享记账
+///   （`ModalOwnerChromes`）登记该模态窗口；只有该 owner 的**第一个**模态窗口才快照并施加
 ///   [`crate::platform::macos_owner::OwnerChrome::BLOCKED`]（`ignoresMouseEvents` + 禁用
-///   标准按钮 + 关闭背景拖动），模态窗口关闭时按快照恢复。owner 没解析出来的模态窗口按
-///   普通窗口处理（没有可拦截的对象），引擎层的输入过滤同样不会命中它。
+///   标准按钮 + 关闭背景拖动），最后一个关闭的模态窗口按快照恢复（多模态窗口时 owner 保持
+///   拦截，焦点交给另一个模态窗口）。owner 没解析出来的模态窗口按普通窗口处理（没有可拦截
+///   的对象），引擎层的输入过滤同样不会命中它。
 fn attach_owners(
     requests: &[(WindowId, WindowOptions)],
     windows: &mut [NativeWindow],
@@ -321,7 +341,10 @@ fn attach_owners(
             OwnerResolution::Attach(owner) => windows
                 .iter()
                 .find(|native| native.id() == owner)
-                .map(NativeWindow::window_handle),
+                .map(|native| OwnerWindow {
+                    id: owner,
+                    window: native.window_handle(),
+                }),
             OwnerResolution::None => None,
             OwnerResolution::Missing => {
                 // 引擎层（`app/window_set.rs`）保证 options.owner 合法；走到这里说明平台侧
@@ -434,7 +457,12 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
     app.sync_clock();
     // 运行时窗口生命周期（P1-2.8）：`App` 里新增/移除的窗口要同步到原生窗口。旧实现只在
     // `run` 启动时枚举一次，运行时 `App::create_window` 的窗口永远没有原生窗口与渲染器。
-    sync_native_windows(app, &mut state.windows, &state.dispatcher)?;
+    sync_native_windows(
+        app,
+        &mut state.windows,
+        &state.dispatcher,
+        &state.modal_registry,
+    )?;
     // 空闲时也要收 render 线程的反馈：设备丢失/提交失败不能等到下一次输入才冒泡。
     // C4：**逐窗口** poll —— `DeviceLost` 当场整 renderer 重建（泵继续运行），其它 GPU 错误
     // 保持致命并原样冒泡（应用退出语义不变）。返回 `true` = 本轮恢复过，需要在同一轮强制出帧，
@@ -632,6 +660,7 @@ fn sync_native_windows(
     app: &mut App,
     windows: &mut Vec<NativeWindow>,
     dispatcher: &Arc<Dispatcher>,
+    modal_registry: &Rc<RefCell<ModalOwnerChromes>>,
 ) -> Result<(), EngineError> {
     windows.retain(|native| app.window(native.id()).is_some());
     let existing: Vec<WindowId> = windows.iter().map(NativeWindow::id).collect();
@@ -648,7 +677,7 @@ fn sync_native_windows(
         detail: smol_str::SmolStr::new_static("window creation requires the main thread"),
     })?;
     let start = windows.len();
-    create_native_windows(mtm, app, &pending, dispatcher, windows)?;
+    create_native_windows(mtm, app, &pending, dispatcher, windows, modal_registry)?;
     attach_owners(&pending, windows, start);
     for (native, (_, options)) in windows[start..].iter_mut().zip(pending.iter()) {
         show_window(app, native, options, dispatcher)?;

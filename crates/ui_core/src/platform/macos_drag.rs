@@ -35,7 +35,8 @@ use crate::math::{Point, Rect};
 ///
 /// - 主键 `mouseUp:`（拖动结束时 AppKit 若补发 Up，吞掉并清状态）；
 /// - 主键 `mouseDown:`（下一次点击的命中判定直接覆盖状态）；
-/// - `mouseMoved:`（无按键的悬停移动证明拖动会话已结束，见 [`Self::hover_move`]）。
+/// - `mouseMoved:`（Apple 约定只在无按键时投递的悬停移动，证明拖动会话已结束，见
+///   [`Self::hover_move`]；实现仍用 `NSEvent.pressedMouseButtons` 兜底，主键仍按下时不清）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct WindowDragState {
     /// 主键按下命中了拖动区、已把拖动交给 WindowServer（没有投递 `PointerDown`）。
@@ -65,13 +66,19 @@ impl WindowDragState {
         !std::mem::take(&mut self.dragging)
     }
 
-    /// `mouseMoved:`（无按键的悬停移动）到达：结束拖动状态。
+    /// `mouseMoved:`（悬停移动）到达：结束拖动状态（主键仍按下时不动，见下）。
     ///
-    /// AppKit 只在没有按键按下时发 `mouseMoved:`，因此它出现即代表拖动会话已经结束（即使
-    /// 始终没收到 `mouseUp:`）。不在这里清状态的话，拖动结束后悬停/光标形状会一直冻到下一次
-    /// 点击 —— 那正是「避免永久吞事件」要防的形态。
-    pub(crate) fn hover_move(&mut self) {
-        self.dragging = false;
+    /// Apple 文档对 `NSWindow.acceptsMouseMovedEvents` / `mouseMoved:` 的约定是「**没有**鼠标
+    /// 按键按下时才投递」（拖动中发 `mouseDragged:`），因此它出现即代表拖动会话已经结束
+    /// （即使始终没收到 `mouseUp:`）；不结束的话拖动后的悬停/光标形状会一直冻到下一次点击。
+    ///
+    /// `primary_button_down` 是调用方读到的 `NSEvent.pressedMouseButtons` 主键位：作为**兜底**
+    /// —— 若某个 AppKit 版本在拖动期间仍补发 `mouseMoved:`，主键仍按下 ⇒ 不清状态，后续
+    /// 主键 Up/Move 继续按拖动会话吞掉（不会重新泄漏无 Down 配对的事件）。
+    pub(crate) fn hover_move(&mut self, primary_button_down: bool) {
+        if !primary_button_down {
+            self.dragging = false;
+        }
     }
 }
 
@@ -247,12 +254,27 @@ mod tests {
     fn a_hover_move_ends_a_drag_that_never_reported_mouse_up() {
         let mut state = WindowDragState::default();
         assert!(!state.primary_down(true));
-        state.hover_move();
+        state.hover_move(false);
         assert!(!state.is_dragging(), "悬停移动证明拖动已结束");
         // 拖动结束后的悬停移动照常投递（调用方无条件 push，这里只校验状态已清）。
         // 之后的一次新点击必须是干净的会话。
         assert!(state.primary_down(false));
         assert!(state.primary_up());
+    }
+
+    /// 兜底：若某个 AppKit 版本在拖动期间仍补发 `mouseMoved:`（主键仍按下），**不得**提前
+    /// 清拖动状态 —— 否则后续补发的 Up/Move 会重新变成无 Down 配对的事件（RB-08 回归）。
+    #[test]
+    fn a_hover_move_while_the_primary_button_is_still_down_keeps_the_drag_state() {
+        let mut state = WindowDragState::default();
+        assert!(!state.primary_down(true));
+        state.hover_move(true);
+        assert!(state.is_dragging(), "主键仍按下时不得清拖动状态");
+        assert!(
+            !state.primary_up(),
+            "拖动中的 Up 仍必须吞掉（不能因为一次 mouseMoved 就泄漏）"
+        );
+        assert!(!state.is_dragging());
     }
 
     /// 上一次拖动没收到 `mouseUp:` 时，下一次**非命中**的 `mouseDown:` 也会清状态：

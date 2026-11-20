@@ -278,11 +278,14 @@ define_class!(
 
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, event: &NSEvent) {
-            // RB-08：`mouseMoved:` 只在**没有按键按下**时到达 ⇒ 它证明上一次拖动会话已经结束
-            // （AppKit 可能始终没补发 `mouseUp:`）。在这里清掉配对状态，否则拖动结束后悬停
-            // 会一直冻到下一次点击。悬停移动本身与拖动无关，照常投递。
+            // RB-08：Apple 约定 `mouseMoved:` 只在**没有按键按下**时投递（拖动中发
+            // `mouseDragged:`）⇒ 它证明上一次拖动会话已经结束（AppKit 可能始终没补发
+            // `mouseUp:`）。在这里清掉配对状态，否则拖动结束后悬停会一直冻到下一次点击。
+            //
+            // 兜底：真读到主键仍按下（某个 AppKit 版本在拖动期间补发 `mouseMoved:`）时不清
+            // 状态，后续主键 Up/Move 继续按拖动会话吞掉，不会重新泄漏无 Down 配对的事件。
             let mut drag = self.ivars().window_drag.get();
-            drag.hover_move();
+            drag.hover_move((NSEvent::pressedMouseButtons() & 1) != 0);
             self.ivars().window_drag.set(drag);
             self.push_pointer(event, PointerPhase::Move);
         }
