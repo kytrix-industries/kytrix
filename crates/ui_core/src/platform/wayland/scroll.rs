@@ -16,6 +16,14 @@
 //! [`ScrollAccum::wheel_lines`] 逐轴按 `axis_discrete`（格数，精确）> `axis_value120`（/120）>
 //! 连续 `axis`（/约定值）取第一个非零值。
 //!
+//! **v8+ 用 `axis_value120` 取代 `axis_discrete` 的依据**（NBL-04）：`wayland.xml:2481-2482`
+//! 原文 *"This event replaces the wl_pointer.axis_discrete event in clients supporting
+//! wl_pointer version 8 or later"*；同文件 `:2484-2486` *"Where a wl_pointer.axis_source event
+//! occurs in the same wl_pointer.frame, the axis source applies to this event"*，与
+//! `axis_source` 的帧作用域条文（`:2377-2404`）共同支持「v8+ 服务端发 value120、v5–v7 服务端发
+//! axis_discrete、二者与连续 axis 是同一次滚动的不同表示」这一模型 —— 因此三条通路在本模块里
+//! 是**同一量纲族的三选一**，而不是三次独立滚动。
+//!
 //! # 滚动源（`axis_source`）是**手势作用域**，离散通道是滚轮的充分证据（RBL-02）
 //!
 //! 协议（`wayland.xml` 的 `axis_source`）：*"It is sent before a wl_pointer.frame event and
@@ -26,7 +34,7 @@
 //!
 //! 因此源按**手势**而不是按帧建模（[`PointerScroll`]）：
 //!
-//! 1. `axis_source` 到达即更新为权威源；源**保持到 `axis_stop` 所在帧收尾**
+//! 1. `axis_source` 到达即更新为权威源；源**保持到整个手势结束**
 //!    （finger 手势协议保证以 `axis_stop` 结束：*"If the source is wl_pointer.axis_source.finger,
 //!    a wl_pointer.axis_stop event will be sent when the user lifts the finger off the device"*）。
 //!    这样「finger 手势内某些帧没发 source」仍按 finger 处理；
@@ -38,11 +46,20 @@
 //! 3. 帧里既无 source 也无离散通道（纯连续 `axis`）⇒ 沿用最后一次已知源，未知则按**滚轮**
 //!    （不发 `axis_source` 的服务端上绝大多数输入是滚轮；把未知源当手指会把一格 10–15 单位
 //!    当 10–15 px，约 10× 灵敏度）；
-//! 4. `axis_stop` 与另一根轴的 `axis` **可以同帧**（`wl_pointer.frame` 原文：*"When a
-//!    wl_pointer.axis and a wl_pointer.axis_stop event occur within the same frame, this indicates
-//!    that axis movement in one axis has stopped but continues in the other axis"*）⇒ 同帧的 axis
-//!    数据仍按**停止前**的源解释；源的复位与「手势结束」都放在该帧收尾时执行。`axis_stop`
-//!    的 `End` 事件在 stop 当场产出（零增量），单位取当时仍未被复位的源。
+//! 4. **`axis_stop` 只停一根轴**（NBL-01）：`axis_stop{axis}` 的语义是「这根轴的 axis 序列
+//!    结束」（同文件 `axis_stop` 原文：*"Any wl_pointer.axis events with the same axis_source
+//!    after this event should be considered as the start of a new axis motion"*），而对角滚动时
+//!    合成器可以**先停一根轴、另一根继续**（`wl_pointer.frame` 原文：*"When a wl_pointer.axis
+//!    and a wl_pointer.axis_stop event occur within the same frame, this indicates that axis
+//!    movement in one axis has stopped but continues in the other axis"*）。所以本模块维护
+//!    「手势内仍活跃的轴集合」：**只有全部轴都停**才产出一条零增量 `End` 并在帧收尾复位源；
+//!    任一轴仍活跃时 stop 只把该轴移出集合，继续轴（同帧 / 后续帧）仍按当前源解释 —— 否则
+//!    触控板对角滚动会在中途掉回滚轮单位（约 10× 灵敏度）且提前给应用发 `End`；
+//! 5. **换源兜底**：`axis_stop` 对 wheel / continuous 源可能根本不发（协议：*"clients must not
+//!    rely on receiving an axis_stop event for these sources"*），若某合成器只停一根轴就再也
+//!    不发 stop，活跃集合会永远非空。此时**下一次 `axis_source` 与当前源不同**视为新的 axis
+//!    序列：若旧手势还有活跃轴，先产出一条零增量 `End` 收尾（客户端兜底；协议没有「换源 =
+//!    手势结束」的条文，但不收尾会让应用永远等不到 End），再清空活跃集合、更新源。
 //!
 //! `Continuous`（协议 `continuous`，按钮滚动等）当前与 `Wheel` 同义（都按行归一），保留该变体
 //! 只为忠实映射协议枚举。
@@ -122,8 +139,11 @@ pub(crate) enum ScrollEvent {
         /// 连续值。
         value: f32,
     },
-    /// `axis_stop`：一次轴运动的结束通知。
-    Stop,
+    /// `axis_stop`：**一根轴**的 axis 序列结束（协议事件自带轴号）。
+    Stop {
+        /// 停止的轴（只停这一根，另一根可以继续）。
+        axis: ScrollAxis,
+    },
     /// `wl_pointer.frame`：本批事件收尾。
     Frame,
 }
@@ -160,9 +180,12 @@ struct ScrollAccum {
 }
 
 impl ScrollAccum {
-    /// 累积一条 `wl_pointer.axis_discrete`（`notches` = **格数**，1 = 一格；v5–v7）。
+    /// 累積一條 `wl_pointer.axis_discrete`（`notches` = **格数**，1 = 一格；v5–v7）。
     ///
     /// 与 [`Self::note_value120`] 是**不同量纲**：这里 1 = 一格，value120 的 120 = 一格。
+    /// 协议规定同一帧同一轴最多一条 `axis_discrete`（*"A wl_pointer.frame must not contain more
+    /// than one axis_discrete event per axis type"*）；这里的 `saturating_add` 只是**防御性**
+    /// 实现（不 panic / 不溢出），不是把非法输入固化成契约（NBL-02）。
     fn note_notches(&mut self, axis: ScrollAxis, notches: i32) {
         let slot = match axis {
             ScrollAxis::Horizontal => &mut self.notches_x,
@@ -243,43 +266,84 @@ fn lines_for(notches: i32, value120: i32, continuous: f32) -> f32 {
 pub(crate) struct PointerScroll {
     /// 本帧增量（`Frame` 收尾时清空）。
     accum: ScrollAccum,
-    /// 最近一次已知源：`axis_source` 到达即更新；`axis_stop` 所在帧收尾后复位成 `Unknown`。
+    /// 最近一次已知源：`axis_source` 到达即更新；整个手势结束（全部轴 `axis_stop`）后复位成
+    /// `Unknown`（模块文档第 1、4 条）。
     source: ScrollSource,
-    /// 本帧出现过 `axis_stop`：帧收尾时先按旧源解释同帧 axis，再复位源（模块文档第 4 条）。
+    /// 本帧「全部轴都已停」：帧收尾时先按旧源解释同帧 axis，再复位源 / 清空活跃轴（第 4 条）。
     stop_pending: bool,
-    /// 手指手势是否进行中（已产出 `Begin` / `Update`，`axis_stop` 结束）。
+    /// 手指手势是否进行中（已产出 `Begin` / `Update`，全部轴停止后结束）。
     active: bool,
+    /// 手势内仍活跃的轴：收到过滚动数据、且尚未收到它的 `axis_stop`（NBL-01）。
+    ///
+    /// 对角滚动时合成器可以只停一根轴、另一根继续；只有集合清空才算手势结束。
+    horizontal_active: bool,
+    vertical_active: bool,
 }
 
 impl PointerScroll {
     /// 喂入一个滚动事件，返回**本事件当场要投递的**滚动输出。
     ///
-    /// - `Source` / `Discrete` / `Value120` / `Continuous`：只累积，返回 `None`；
-    /// - `Stop`：产出零增量的 `End`（单位取当时仍有效的源），并把「帧收尾复位源」登记为
-    ///   pending；
-    /// - `Frame`：产出本批的滚动输出（没有分量时 `None`），清空增量；若本帧有 `axis_stop`
-    ///   则在收尾后把源复位成 `Unknown`（RBL-02 ①）。
+    /// - `Source`：更新权威源；源变化且旧手势还有活跃轴时先产出零增量 `End`（换源兜底，第 5 条）；
+    /// - `Discrete` / `Value120` / `Continuous`：累积并把该轴标记为活跃，返回 `None`；
+    /// - `Stop { axis }`：只把该轴移出活跃集合；集合非空 ⇒ `None`（另一根轴继续），集合空 ⇒
+    ///   零增量 `End` 并登记「帧收尾复位源」；
+    /// - `Frame`：产出本批的滚动输出（没有分量时 `None`），清空增量；本帧全部轴停止时在收尾
+    ///   复位源并清空活跃轴。
     pub(crate) fn apply(&mut self, event: ScrollEvent) -> Option<ScrollOutput> {
         match event {
             ScrollEvent::Source(source) => {
+                let changed = source != self.source;
+                // `axis_source` 描述**随后**的 axis 事件（协议原文见模块文档）；换源意味着新的
+                // axis 序列（可能是另一台设备）。若旧手势还有活跃轴（某些源根本不发 axis_stop，
+                // 或合成器只停了一根轴），必须先收尾，否则应用永远等不到 `End`（第 5 条）。
+                let output = if changed && (self.horizontal_active || self.vertical_active) {
+                    let finger = self.frame_is_finger();
+                    self.active = false;
+                    Some(ScrollOutput {
+                        delta: (0.0, 0.0),
+                        finger,
+                        phase: ScrollPhase::End,
+                    })
+                } else {
+                    None
+                };
+                if changed {
+                    // 新序列开始：旧序列的活跃轴 / 待复位标记不再适用（新序列若还要 stop，
+                    // 会重新登记自己的集合与 pending）。
+                    self.horizontal_active = false;
+                    self.vertical_active = false;
+                    self.stop_pending = false;
+                }
                 self.source = source;
-                None
+                output
             }
             ScrollEvent::Discrete { axis, notches } => {
                 self.accum.note_notches(axis, notches);
+                self.mark_axis_active(axis);
                 None
             }
             ScrollEvent::Value120 { axis, value120 } => {
                 self.accum.note_value120(axis, value120);
+                self.mark_axis_active(axis);
                 None
             }
             ScrollEvent::Continuous { axis, value } => {
                 self.accum.note_continuous(axis, value);
+                self.mark_axis_active(axis);
                 None
             }
-            ScrollEvent::Stop => {
-                // End 在 stop 当场产出（零增量），单位取**尚未复位**的源：finger 手势的
-                // stop 帧通常不带 axis_source，但源按手势保持到本帧收尾（模块文档第 1、4 条）。
+            ScrollEvent::Stop { axis } => {
+                // `axis_stop` 只停**一根轴**：对角滚动时另一根轴可以继续（协议 frame 原文见模块
+                // 文档第 4 条）。只要还有活跃轴就不产 `End`、不复位源，同帧 / 后续帧的 axis
+                // 继续按当前源解释 —— 否则触控板对角滚动中途会掉回滚轮（约 10× 灵敏度）。
+                match axis {
+                    ScrollAxis::Horizontal => self.horizontal_active = false,
+                    ScrollAxis::Vertical => self.vertical_active = false,
+                }
+                if self.horizontal_active || self.vertical_active {
+                    return None;
+                }
+                // 全部轴都停了 ⇒ 手势结束：零增量 End（单位取尚未复位的源），帧收尾复位源。
                 self.active = false;
                 self.stop_pending = true;
                 Some(ScrollOutput {
@@ -292,7 +356,7 @@ impl PointerScroll {
         }
     }
 
-    /// 帧收尾：产出本批滚动输出、清空增量，并在本帧出现过 `axis_stop` 时复位源。
+    /// 帧收尾：产出本批滚动输出、清空增量，并在本帧全部轴停止时复位源与活跃集合。
     fn flush_frame(&mut self) -> Option<ScrollOutput> {
         let stop_pending = std::mem::take(&mut self.stop_pending);
         let finger = self.frame_is_finger();
@@ -324,12 +388,22 @@ impl PointerScroll {
         };
         self.accum.clear();
         if stop_pending {
-            // 连续手势以 axis_stop 结束（finger 手势协议保证有 stop）⇒ 手势作用域结束：
-            // 之后的帧没有新 source 时从 `Unknown`（= 滚轮）重新开始，不会把上一手势的
-            // finger 泄漏到滚轮帧（RB-10 的原始缺陷）。
+            // 整个手势结束（全部轴都 stop 过）⇒ 手势作用域收尾：之后的帧没有新 source 时从
+            // `Unknown`（= 滚轮）重新开始，不会把上一手势的 finger 泄漏到滚轮帧（RB-10 的
+            // 原始缺陷）。活跃集合清空：同帧最后一条 axis 之后到达的数据属于新序列。
             self.source = ScrollSource::Unknown;
+            self.horizontal_active = false;
+            self.vertical_active = false;
         }
         output
+    }
+
+    /// 把该轴标记为手势内活跃（收到过滚动数据）。
+    fn mark_axis_active(&mut self, axis: ScrollAxis) {
+        match axis {
+            ScrollAxis::Horizontal => self.horizontal_active = true,
+            ScrollAxis::Vertical => self.vertical_active = true,
+        }
     }
 
     /// 本帧按手指（像素）解释吗：**离散通道是滚轮的充分证据**，否则看手势源。
@@ -525,15 +599,20 @@ mod tests {
         assert_eq!(scroll.finger_pixels(), (0.0, 0.0));
     }
 
-    /// `axis_discrete` 同样在一帧内累积（协议：每轴每帧最多一条，但多轴 / 拆批都允许）。
+    /// `axis_discrete` 在同一帧内**同一轴**不得出现两条（协议原文：*"A wl_pointer.frame must not
+    /// contain more than one axis_discrete event per axis type"*）—— 非法输入不需要契约，因此这里
+    /// 没有「同轴两条离散值累加」的测试；`note_notches` 的饱和加法只是防御（不 panic / 不溢出），
+    /// 不是把非法输入固化成行为约定（NBL-02）。
     #[test]
-    fn axis_discrete_notches_accumulate_until_the_frame_is_flushed() {
+    fn per_axis_discrete_notches_are_single_events_by_protocol() {
         let mut scroll = ScrollAccum::default();
         scroll.note_notches(ScrollAxis::Vertical, 1);
-        scroll.note_notches(ScrollAxis::Vertical, -2);
-        assert_eq!(scroll.wheel_lines().1, -1.0, "1 + (-2) = -1 格 = -1 行");
-        scroll.clear();
-        assert!(scroll.is_empty());
+        scroll.note_notches(ScrollAxis::Horizontal, -1);
+        assert_eq!(
+            scroll.wheel_lines(),
+            (-1.0, 1.0),
+            "两根轴各一条（合法输入）"
+        );
     }
 
     #[test]
@@ -661,17 +740,20 @@ mod tests {
         assert_eq!(second.phase, ScrollPhase::Update);
     }
 
-    /// RBL-02 ①/④：`axis_stop` 产出零增量 `End`（单位按当时源），帧收尾后源复位 ⇒ 下一条
-    /// 没有 source 的纯连续帧按滚轮（行）处理（原始 RB-10 缺陷的回归防线）。
+    /// RBL-02 ①/④（NBL-01 之后仍是单轴语义）：单轴 finger 手势的 `axis_stop{axis}` 产出零增量
+    /// `End`（单位按当时源），帧收尾后源复位 ⇒ 下一条没有 source 的纯连续帧按滚轮（行）处理
+    /// （原始 RB-10 缺陷的回归防线）。
     #[test]
-    fn axis_stop_ends_the_gesture_and_resets_the_source() {
+    fn a_single_axis_gesture_ends_with_one_end_and_resets_the_source() {
         let mut scroll = PointerScroll::default();
         for event in finger_frame(-24.0) {
             scroll.apply(event);
         }
         let end = scroll
-            .apply(ScrollEvent::Stop)
-            .expect("axis_stop 当场产出 End");
+            .apply(ScrollEvent::Stop {
+                axis: ScrollAxis::Vertical,
+            })
+            .expect("最后一根轴停止 ⇒ 当场产出 End");
         assert_eq!(end.delta, (0.0, 0.0), "End 是零增量事件");
         assert!(end.finger, "finger 手势的 End 仍是像素单位");
         assert_eq!(end.phase, ScrollPhase::End);
@@ -685,37 +767,206 @@ mod tests {
         let wheel = scroll
             .apply(ScrollEvent::Frame)
             .expect("滚轮帧必须产出事件");
-        assert!(!wheel.finger, "axis_stop 之后源复位为 Unknown（按滚轮）");
+        assert!(!wheel.finger, "全部轴 stop 之后源复位为 Unknown（按滚轮）");
         assert_eq!(wheel.delta, (0.0, -1.5), "15 / 约定 10 = 1.5 行");
         assert_eq!(wheel.phase, ScrollPhase::Discrete);
     }
 
-    /// RBL-02 ④：`axis_stop` 与另一根轴的 `axis` 同帧 ⇒ 该 axis 仍按**停止前**的源解释
-    /// （协议：一帧里 axis + axis_stop = 一根轴停、另一根继续），源在帧收尾才复位。
+    /// NBL-01 ①：对角手势先停一根轴、另一根继续 ⇒ **不产 `End`、不复位源**，继续轴在后续帧
+    /// 仍按 finger 像素解释（变异「任意 stop 即整手势结束」⇒ 本测试红）。
+    #[test]
+    fn stopping_one_axis_keeps_the_two_axis_gesture_alive() {
+        let mut scroll = PointerScroll::default();
+        scroll.apply(ScrollEvent::Source(ScrollSource::Finger));
+        // 第一帧：两轴都在动（水平 -12、垂直 -24）。
+        scroll.apply(ScrollEvent::Continuous {
+            axis: ScrollAxis::Horizontal,
+            value: -12.0,
+        });
+        scroll.apply(ScrollEvent::Continuous {
+            axis: ScrollAxis::Vertical,
+            value: -24.0,
+        });
+        let first = scroll.apply(ScrollEvent::Frame).expect("第一帧必须有输出");
+        assert!(first.finger);
+        assert_eq!(first.delta, (12.0, 24.0));
+
+        // 垂直轴先停：水平轴还活跃 ⇒ 不得提前结束手势。
+        assert_eq!(
+            scroll.apply(ScrollEvent::Stop {
+                axis: ScrollAxis::Vertical,
+            }),
+            None,
+            "还有轴在动：stop 不得产出 End、也不得复位源"
+        );
+        scroll.apply(ScrollEvent::Continuous {
+            axis: ScrollAxis::Horizontal,
+            value: -6.0,
+        });
+        let continuing = scroll
+            .apply(ScrollEvent::Frame)
+            .expect("继续轴必须产出事件");
+        assert!(
+            continuing.finger,
+            "继续的那根轴必须仍按手势源（finger）解释，不得掉回滚轮"
+        );
+        assert_eq!(continuing.delta, (6.0, 0.0));
+        assert_eq!(continuing.phase, ScrollPhase::Update, "手势仍在进行");
+
+        // 最后一根轴停下才算结束。
+        let end = scroll
+            .apply(ScrollEvent::Stop {
+                axis: ScrollAxis::Horizontal,
+            })
+            .expect("全部轴停止 ⇒ 产出 End");
+        assert_eq!(end.phase, ScrollPhase::End);
+        assert!(end.finger);
+    }
+
+    /// NBL-01 ②：两轴都停 ⇒ **恰好一条** `End`，帧收尾后源复位（下一条无 source 帧按滚轮）。
+    #[test]
+    fn stopping_both_axes_produces_exactly_one_end_and_resets_the_source() {
+        let mut scroll = PointerScroll::default();
+        scroll.apply(ScrollEvent::Source(ScrollSource::Finger));
+        scroll.apply(ScrollEvent::Continuous {
+            axis: ScrollAxis::Horizontal,
+            value: -10.0,
+        });
+        scroll.apply(ScrollEvent::Continuous {
+            axis: ScrollAxis::Vertical,
+            value: -20.0,
+        });
+        scroll.apply(ScrollEvent::Frame);
+
+        assert_eq!(
+            scroll.apply(ScrollEvent::Stop {
+                axis: ScrollAxis::Horizontal,
+            }),
+            None,
+            "还剩垂直轴 ⇒ 不产 End"
+        );
+        let end = scroll
+            .apply(ScrollEvent::Stop {
+                axis: ScrollAxis::Vertical,
+            })
+            .expect("最后一根轴停止 ⇒ 产出一条 End");
+        assert_eq!(end.phase, ScrollPhase::End);
+        assert_eq!(scroll.apply(ScrollEvent::Frame), None, "End 不重复");
+
+        scroll.apply(ScrollEvent::Continuous {
+            axis: ScrollAxis::Vertical,
+            value: -15.0,
+        });
+        let wheel = scroll
+            .apply(ScrollEvent::Frame)
+            .expect("后续帧必须产出事件");
+        assert!(!wheel.finger, "全部轴 stop 之后源复位 ⇒ 按滚轮");
+        assert_eq!(wheel.delta, (0.0, 1.5));
+        assert_eq!(wheel.phase, ScrollPhase::Discrete);
+    }
+
+    /// NBL-01 ④：`axis_stop` 只停一根轴；同帧另一根轴的 `axis` 属于**同一个手势**，仍按停止前
+    /// 的源解释（协议：一帧里 axis + axis_stop = 一根轴停、另一根继续）。
     #[test]
     fn axis_stop_with_a_continuing_axis_in_the_same_frame_keeps_the_pre_stop_source() {
         let mut scroll = PointerScroll::default();
         scroll.apply(ScrollEvent::Source(ScrollSource::Finger));
-        // 水平轴先停，垂直轴同帧还在动。
-        let end = scroll.apply(ScrollEvent::Stop).expect("stop 当场产出 End");
-        assert_eq!(end.phase, ScrollPhase::End);
+        // 第一帧两轴都在动 ⇒ 两轴都进入活跃集合。
+        scroll.apply(ScrollEvent::Continuous {
+            axis: ScrollAxis::Horizontal,
+            value: -9.0,
+        });
+        scroll.apply(ScrollEvent::Continuous {
+            axis: ScrollAxis::Vertical,
+            value: -4.0,
+        });
+        scroll.apply(ScrollEvent::Frame);
+
+        // 同一帧：水平轴 stop，垂直轴还在动。
+        assert_eq!(
+            scroll.apply(ScrollEvent::Stop {
+                axis: ScrollAxis::Horizontal,
+            }),
+            None,
+            "垂直轴仍活跃 ⇒ 不产 End"
+        );
         scroll.apply(ScrollEvent::Continuous {
             axis: ScrollAxis::Vertical,
             value: -18.0,
         });
         let output = scroll
             .apply(ScrollEvent::Frame)
-            .expect("同帧继续轴必须产出事件");
+            .expect("继续轴必须产出事件");
         assert!(
             output.finger,
             "axis_stop 同帧的 axis 属于停止前的手势（不得错判成滚轮）"
         );
         assert_eq!(output.delta, (0.0, 18.0));
+        assert_eq!(output.phase, ScrollPhase::Update);
+    }
+
+    /// NBL-01 兜底：某合成器只停一根轴就再也不发 stop ⇒ 下一次**换源**视为新手势信号，
+    /// 先用零增量 `End` 收尾旧手势，再按新源开始（否则应用永远等不到 End）。
+    #[test]
+    fn a_new_source_closes_a_gesture_whose_remaining_axis_never_stops() {
+        let mut scroll = PointerScroll::default();
+        scroll.apply(ScrollEvent::Source(ScrollSource::Finger));
+        scroll.apply(ScrollEvent::Continuous {
+            axis: ScrollAxis::Horizontal,
+            value: -12.0,
+        });
+        scroll.apply(ScrollEvent::Continuous {
+            axis: ScrollAxis::Vertical,
+            value: -12.0,
+        });
+        scroll.apply(ScrollEvent::Frame);
+        // 只停水平轴，垂直轴永远不再收到 stop。
         assert_eq!(
-            output.phase,
-            ScrollPhase::Begin,
-            "手势收尾后新运动从 Begin 开始"
+            scroll.apply(ScrollEvent::Stop {
+                axis: ScrollAxis::Horizontal,
+            }),
+            None
         );
+        // 下一次滚轮输入带来新源 ⇒ 兜底收尾旧手势。
+        let end = scroll
+            .apply(ScrollEvent::Source(ScrollSource::Wheel))
+            .expect("换源必须收尾旧手势（零增量 End）");
+        assert_eq!(end.phase, ScrollPhase::End);
+        assert!(end.finger, "旧手势是 finger ⇒ End 仍按像素单位");
+
+        // 新序列按新源（滚轮）解释。
+        scroll.apply(ScrollEvent::Value120 {
+            axis: ScrollAxis::Vertical,
+            value120: 120,
+        });
+        let wheel = scroll
+            .apply(ScrollEvent::Frame)
+            .expect("新序列必须产出事件");
+        assert!(!wheel.finger);
+        assert_eq!(wheel.delta, (0.0, -1.0));
+        assert_eq!(wheel.phase, ScrollPhase::Discrete);
+    }
+
+    /// NBL-01：对一根**从未动过**的轴发 `axis_stop` 不得结束仍在进行的手势。
+    #[test]
+    fn an_axis_stop_for_an_axis_that_never_moved_does_not_end_the_gesture() {
+        let mut scroll = PointerScroll::default();
+        for event in finger_frame(-24.0) {
+            scroll.apply(event);
+        }
+        assert_eq!(
+            scroll.apply(ScrollEvent::Stop {
+                axis: ScrollAxis::Horizontal,
+            }),
+            None,
+            "水平轴从未活跃：它的 stop 不得结束垂直轴的手势"
+        );
+        let end = scroll
+            .apply(ScrollEvent::Stop {
+                axis: ScrollAxis::Vertical,
+            })
+            .expect("垂直轴停止才结束手势");
+        assert_eq!(end.phase, ScrollPhase::End);
     }
 
     /// RBL-01 M-a 覆盖：`Frame` 必须清空增量，否则两帧会累加（帧作用域失效）。
@@ -775,14 +1026,18 @@ mod tests {
         }
     }
 
-    /// 空帧（只有 `frame`，没有滚动分量）不产出事件；`axis_stop` 帧的 `End` 已在 stop 当场
-    /// 产出，帧收尾不会重复。
+    /// 空帧（只有 `frame`，没有滚动分量）不产出事件；一根从未活跃的轴 `axis_stop` 视为唯一
+    /// 活跃轴已停（集合本来就是空）⇒ 产出一条 `End`，帧收尾不会重复。
     #[test]
     fn an_empty_frame_yields_no_event() {
         let mut scroll = PointerScroll::default();
         assert_eq!(scroll.apply(ScrollEvent::Frame), None);
         assert_eq!(
-            scroll.apply(ScrollEvent::Stop).map(|o| o.phase),
+            scroll
+                .apply(ScrollEvent::Stop {
+                    axis: ScrollAxis::Vertical,
+                })
+                .map(|output| output.phase),
             Some(ScrollPhase::End)
         );
         assert_eq!(scroll.apply(ScrollEvent::Frame), None, "End 只产出一次");

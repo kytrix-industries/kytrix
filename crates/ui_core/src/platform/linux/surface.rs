@@ -2967,7 +2967,9 @@ fn pointer_scroll_event(event: &wl_pointer::Event) -> Option<ScrollEvent> {
             axis: scroll_axis(axis),
             value120: *value120,
         },
-        wl_pointer::Event::AxisStop { .. } => ScrollEvent::Stop,
+        wl_pointer::Event::AxisStop { axis, .. } => ScrollEvent::Stop {
+            axis: scroll_axis(axis),
+        },
         wl_pointer::Event::Frame => ScrollEvent::Frame,
         _ => return None,
     })
@@ -3416,7 +3418,10 @@ mod tests {
                 time: 0,
                 axis: WEnum::Value(wl_pointer::Axis::VerticalScroll),
             }),
-            Some(ScrollEvent::Stop)
+            Some(ScrollEvent::Stop {
+                axis: ScrollAxis::Vertical,
+            }),
+            "axis_stop 必须带上轴号（NBL-01：逐轴 stop，不能当整手势结束）"
         );
         assert_eq!(
             pointer_scroll_event(&wl_pointer::Event::Frame),
