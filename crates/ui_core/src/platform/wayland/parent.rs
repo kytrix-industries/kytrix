@@ -14,18 +14,25 @@
 //! owner + owned 时正是这种情况：`event_loop::sync_windows` 按 `WindowId` 升序建原生窗口，
 //! owner 的 `wl_surface.commit()` 刚发出、compositor 的首个 `configure` 还没回来。
 //!
-//! # 「owner 已映射」的判据（协议可观测）
+//! # 「owner 已映射」的判据（协议可观测 + 一条显式耦合）
 //!
-//! 平台层只认两个前提同时成立：
+//! **协议可观测的前提**：owner 的首个 `xdg_surface.configure` 已被 `ack_configure`
+//! （[`crate::platform::wayland::configure`] 的映射阶段 —— 协议要求先 ack 才允许 attach
+//! buffer 映射），且 attach buffer 的那次 `wl_surface.commit` 已被 compositor 处理。客户端能
+//! 拿到的协议证据是**首帧 `wl_callback.done`**（`wl_surface.frame` 的回调由 compositor 在处理
+//! 完已提交内容之后发送）。「configure 已到」本身不够：ack 之后 buffer 还没 commit，surface
+//! 仍未 mapped（映射的定义就是 attach 了 buffer 且被合成），此时 `set_parent` 依然等价 null
+//! parent。
 //!
-//! 1. owner 的首个 `xdg_surface.configure` 已被 `ack_configure`（[`crate::platform::wayland::configure`]
-//!    的映射阶段 —— 协议要求先 ack 才允许 attach buffer 映射）；
-//! 2. attach buffer 的那次 `wl_surface.commit` 已被 compositor 处理：客户端拿到的协议证据是
-//!    **首帧 `wl_callback.done`**（`wl_surface.frame` 的回调由 compositor 在处理完已提交内容
-//!    之后发送）。
+//! **显式耦合（不是协议强制，是设计取舍）**：平台层把「补发时机」绑在**渲染路径**上（`mapped`
+//! 只由帧回调置位）。本仓对不可见窗口**根本不请求帧**（`event_loop.rs` 的 `frame_windows` 只含
+//! `is_visible && has_renderer` 的窗口），因此：
 //!
-//! 「configure 已到」本身不够：ack 之后 buffer 还没 commit，surface 仍未 mapped（映射的定义
-//! 就是 attach 了 buffer 且被合成），此时 `set_parent` 依然等价 null parent。
+//! - owner 在生命周期内**从未呈现**（启动即最小化 / 一直被完全遮挡）⇒ pending 永远不会补发，
+//!   提示彻底丢失（与修复前的行为等价，不是「晚到」）；
+//! - owner 首次呈现之后的补发不会被撤销；owner 之后 unmapped 再 mapped 也不重复补发
+//!   （协议：*"If the now-unmapped surface becomes mapped again, its parent-child relationship
+//!   is not restored"*）。
 //!
 //! # 为什么放在 `platform/wayland/`
 //!

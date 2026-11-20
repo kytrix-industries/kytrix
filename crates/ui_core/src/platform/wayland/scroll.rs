@@ -1,47 +1,65 @@
-//! `wl_pointer` 滚轮/触控板的增量累积与「按源归一」（R02-10 / B8 / RB-10）。
+//! `wl_pointer` 滚轮/触控板的**事件翻译边界 + 累积与源状态机**（R02-10 / B8 / RB-10 / RBL-01 /
+//! RBL-02）。
 //!
 //! # 三条离散通路是**同一次物理滚动**的不同表示
 //!
-//! - `axis`：连续值（v5 起一格滚轮规定为 10 个 surface-local 单位，mutter/wlroots 实际常见
-//!   10 或 15；触控板是像素增量）；
-//! - `axis_discrete`（v5–v7）：**整数格数**（1 = 一格）。协议原文 *"This event carries the axis
-//!   value of the wl_pointer.axis event in discrete steps (e.g. mouse wheel clicks)"* 且 *"each
-//!   axis_discrete event is always followed by exactly one axis event with the same axis number
-//!   within the same wl_pointer.frame"*；v8 起不再发给支持 v8 的客户端，由 `axis_value120`
-//!   取代；
+//! - `axis`：连续值。**协议不规定单位**（`wayland.xml` 的 `wl_pointer.axis` 没有量纲条文）；
+//!   「一格滚轮 = 10 个 surface-local 单位」是 libinput / GTK / Qt 的事实约定，mutter/wlroots
+//!   常见 10 或 15 —— 客户端**不得依赖**该约定，这里只把它当滚轮通路的后备换算；
+//! - `axis_discrete`（v5–v7）：**整数格数**（`discrete` 1 = 一格）。协议原文 *"This event
+//!   carries the axis value of the wl_pointer.axis event in discrete steps (e.g. mouse wheel
+//!   clicks)"*，且 *"each axis_discrete event is always followed by exactly one axis event with
+//!   the same axis number within the same wl_pointer.frame"*；v8 起不再发给支持 v8 的客户端；
 //! - `axis_value120`（v8+）：高精度离散步长，一格 = 120（与 Win32 `WHEEL_DELTA` 同量纲）。
 //!
-//! 旧实现只处理 v8+ 的 `axis_value120` 与连续 `axis`，v5–v7 服务端发来的 `axis_discrete` 被
-//! 直接丢弃 ⇒ 只剩 `axis / 10` 换算；mutter/wlroots 实测一格 `axis` 常是 15 ⇒ 一格滚出 1.5 行
-//! （RB-10）。三者**不能相加**（描述同一次滚动），也不该让低版本服务端落到近似换算：
+//! 三者**不能相加**（描述同一次滚动），也不该让低版本服务端落到近似换算：
 //! [`ScrollAccum::wheel_lines`] 逐轴按 `axis_discrete`（格数，精确）> `axis_value120`（/120）>
-//! 连续 `axis`（/10）取第一个非零值。
+//! 连续 `axis`（/约定值）取第一个非零值。
 //!
-//! # `axis_source` 是**帧作用域**
+//! # 滚动源（`axis_source`）是**手势作用域**，离散通道是滚轮的充分证据（RBL-02）
 //!
 //! 协议（`wayland.xml` 的 `axis_source`）：*"It is sent before a wl_pointer.frame event and
-//! carries the source information for all events within that frame"*，且 *"This event is
-//! optional. If the source is unknown for a particular axis event sequence, no event is sent."*
-//! ⇒ 源只描述**它所在的这一帧**，不是「一直沿用到下一次 source 为止」的持久状态。旧实现把
-//! `axis_source == finger` 写进 `WaylandState.scroll_finger` 长存：手指手势之后的下一条**没有**
-//! `axis_source` 的滚轮帧继续被当成手指（像素 1:1）⇒ 一格（10 或 15 个单位）只滚 10–15 px，
-//! 约 10× 灵敏度。
+//! carries the source information for all events within that frame"*；*"This event is optional.
+//! If the source is unknown for a particular axis event **sequence**, no event is sent"*；
+//! *"Only one wl_pointer.axis_source event is permitted per frame"*。即：**若发**，它只描述本帧；
+//! 但协议**没有**「每帧必发」的保证 —— 只在手势首帧发一次的实现是合法的。
 //!
-//! 本模块把源建成显式状态：[`ScrollAccum::note_source`] 记录**本帧**的源，
-//! [`ScrollAccum::clear`]（`wl_pointer.frame` 结束时调用）把它复位成 [`ScrollSource::Unknown`]；
-//! `Unknown` 按**滚轮**处理 —— 不发 `axis_source` 的服务端上绝大多数输入是滚轮，把未知源当
-//! 手指才会造成 10× 灵敏度。`axis_stop` 的复位由「它所在的帧结束」覆盖：协议允许 `axis` 与
-//! `axis_stop` 同帧（*"this indicates that axis movement in one axis has stopped but continues
-//! in the other axis"*），在 `axis_stop` 当场清源会把**同帧另一根轴**的滚动错判成滚轮。
+//! 因此源按**手势**而不是按帧建模（[`PointerScroll`]）：
 //!
-//! 累积器按 `wl_pointer.frame` 成批（一次 frame = 一个逻辑滚动输入），`surface.rs` 在
-//! `Frame` 事件里取走该批并只产出一条 `InputEvent::Scroll`。
+//! 1. `axis_source` 到达即更新为权威源；源**保持到 `axis_stop` 所在帧收尾**
+//!    （finger 手势协议保证以 `axis_stop` 结束：*"If the source is wl_pointer.axis_source.finger,
+//!    a wl_pointer.axis_stop event will be sent when the user lifts the finger off the device"*）。
+//!    这样「finger 手势内某些帧没发 source」仍按 finger 处理；
+//! 2. **离散通道是滚轮的充分证据**：一帧里出现 `axis_discrete` / `axis_value120` ⇒ 该帧一定
+//!    是离散滚轮（触控板 / 连续设备不发离散通道：`axis_discrete` 原文 *"continuous scrolling
+//!    devices like two-finger scrolling on touchpads do not have discrete steps and do not
+//!    generate this event"*），即使上一手势的源还是 finger 也按滚轮算 —— 这条把「finger 之后
+//!    无 source 的滚轮帧」彻底堵死；
+//! 3. 帧里既无 source 也无离散通道（纯连续 `axis`）⇒ 沿用最后一次已知源，未知则按**滚轮**
+//!    （不发 `axis_source` 的服务端上绝大多数输入是滚轮；把未知源当手指会把一格 10–15 单位
+//!    当 10–15 px，约 10× 灵敏度）；
+//! 4. `axis_stop` 与另一根轴的 `axis` **可以同帧**（`wl_pointer.frame` 原文：*"When a
+//!    wl_pointer.axis and a wl_pointer.axis_stop event occur within the same frame, this indicates
+//!    that axis movement in one axis has stopped but continues in the other axis"*）⇒ 同帧的 axis
+//!    数据仍按**停止前**的源解释；源的复位与「手势结束」都放在该帧收尾时执行。`axis_stop`
+//!    的 `End` 事件在 stop 当场产出（零增量），单位取当时仍未被复位的源。
 //!
-//! 纯逻辑放在这里而不是 Linux-only 的 `platform/linux/surface.rs`：Wayland 驱动层在开发机
-//! （Windows）上不编译，旧实现因此只能靠真机观察（审计 §13 第 6 条）。本模块由
-//! `platform::wayland` 整体的 `cfg(any(target_os = "linux", test))` 门控。
+//! `Continuous`（协议 `continuous`，按钮滚动等）当前与 `Wheel` 同义（都按行归一），保留该变体
+//! 只为忠实映射协议枚举。
+//!
+//! # 为什么放在 `platform/wayland/`
+//!
+//! `platform/linux/**` 只在 Linux 目标编译，开发机（Windows）的 `cargo test` 覆盖不到；而
+//! 「协议事件 → 累积器 → 单位/相位/帧收尾」这条边界必须能被独立验证（RBL-01）。本模块定义
+//! 自己的纯枚举 [`ScrollEvent`]：`platform/linux/surface.rs` 的 `Dispatch<wl_pointer>` 只做
+//! 「`wl_pointer::Event` → [`ScrollEvent`]」的**机械翻译**（该翻译是 Linux-only 的几行匹配，
+//! 在 `surface.rs` 的 Linux 单测里覆盖），所有判定都在 [`PointerScroll::apply`] 里（Windows +
+//! Linux 单测）。
 
-/// 连续 `axis` 的单位 → 行换算（v5 起滚轮一格 = 10 个 surface-local 单位）。
+use crate::event::ScrollPhase;
+
+/// 连续 `axis` 的单位 → 行换算（**约定**，不是协议规定：libinput / GTK / Qt 的一格约定，
+/// mutter/wlroots 常见 10 或 15；客户端不得依赖该值）。
 const CONTINUOUS_AXIS_UNITS_PER_LINE: f32 = 10.0;
 
 /// `axis_value120` 的单位：一格（与 Win32 `WHEEL_DELTA` 同量纲）。
@@ -59,31 +77,77 @@ pub(crate) enum ScrollAxis {
 /// `wl_pointer.axis_source` 在纯逻辑层的表示（协议 v5+；事件本身是**可选**的）。
 ///
 /// 只有 [`Self::Finger`] 改变单位语义（像素 1:1 + 连续阶段）；其余（含 [`Self::Unknown`]）
-/// 都按离散滚轮处理。理由：协议允许服务端不发 `axis_source`（*"If the source is unknown for a
-/// particular axis event sequence, no event is sent"*），而不发该事件的服务端上绝大多数输入是
-/// 滚轮；`Unknown` 若按手指处理，一格（10 或 15 个单位）只会滚 10–15 px（约 10× 灵敏度）。
+/// 都按离散滚轮处理。`Wheel` / `Continuous` / `Unknown` 目前行为相同（都按行），保留前两者
+/// 只为忠实映射协议枚举（协议里 `continuous` 是「非手指的连续坐标设备」，未来若要给它单独
+/// 单位再启用）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ScrollSource {
-    /// 本帧没有 `axis_source` 事件（源未知）⇒ 按滚轮处理（安全默认）。
+    /// 还没有任何 `axis_source`（源未知）⇒ 按滚轮处理（安全默认）。
     #[default]
     Unknown,
     /// 物理滚轮（协议 `wheel` / `wheel_tilt`）：离散格。
     Wheel,
     /// 手指 / 触控板（协议 `finger`）：连续像素增量，1:1 跟随。
     Finger,
-    /// 非手指的连续坐标设备（协议 `continuous`，例如按住按钮时的滚动）：与修复前一致按行归一。
+    /// 非手指的连续坐标设备（协议 `continuous`）：当前与 [`Self::Wheel`] 同义（按行）。
     Continuous,
 }
 
-/// 一次 `wl_pointer.frame` 内累积的滚动增量。
+/// 一个 `wl_pointer` 滚动相关事件在纯逻辑层的表示。
+///
+/// `platform/linux/surface.rs` 的 `Dispatch<wl_pointer>` 只负责把协议事件**机械翻译**成这个
+/// 枚举；单位、相位、源作用域、帧收尾全部由 [`PointerScroll::apply`] 决定（RBL-01）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ScrollEvent {
+    /// 本帧的 `axis_source`（权威源，保持到 `axis_stop` 所在帧收尾）。
+    Source(ScrollSource),
+    /// `axis_discrete`：`notches` 是**格数**（v5–v7）。
+    Discrete {
+        /// 轴。
+        axis: ScrollAxis,
+        /// 格数（1 = 一格）。
+        notches: i32,
+    },
+    /// `axis_value120`：`value120 = 120` 是一格（v8+）。
+    Value120 {
+        /// 轴。
+        axis: ScrollAxis,
+        /// 1/120 行。
+        value120: i32,
+    },
+    /// 连续 `axis`（surface-local 单位；手指手势即像素）。
+    Continuous {
+        /// 轴。
+        axis: ScrollAxis,
+        /// 连续值。
+        value: f32,
+    },
+    /// `axis_stop`：一次轴运动的结束通知。
+    Stop,
+    /// `wl_pointer.frame`：本批事件收尾。
+    Frame,
+}
+
+/// 一次帧收尾要投递的滚动事件（由 [`PointerScroll::apply`] 产出）。
+///
+/// `platform/linux/surface.rs` 把它原样装进 `InputEvent::Scroll`（取反后的 delta、单位、相位）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ScrollOutput {
+    /// `(水平, 垂直)`，已按引擎约定取反（与 `InputEvent::Scroll.delta` 同向）。
+    pub delta: (f32, f32),
+    /// `true` = 像素单位（手指）；`false` = 行单位（滚轮 / 未知源）。
+    pub finger: bool,
+    /// 相位：滚轮是 `Discrete`，手指手势是 `Begin` / `Update` / `End`。
+    pub phase: ScrollPhase,
+}
+
+/// 一次帧内的滚动增量（纯换算，不含源）。
 ///
 /// 每根轴各存三份（同一物理滚动的三种表示）：连续 `axis`（surface-local 单位）、
 /// `axis_value120`（1/120 行）、`axis_discrete`（**格**）。[`Self::wheel_lines`] 按轴三选一、
 /// **绝不相加**。
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct ScrollAccum {
-    /// 本帧的滚动源（`axis_source`，帧结束时复位，见模块文档）。
-    source: ScrollSource,
+struct ScrollAccum {
     /// `axis_discrete` 累积（**格**：1 = 一格；v5–v7 服务端）。
     notches_x: i32,
     notches_y: i32,
@@ -96,19 +160,10 @@ pub(crate) struct ScrollAccum {
 }
 
 impl ScrollAccum {
-    /// 记录本帧的滚动源（`wl_pointer.axis_source`）。
-    ///
-    /// 协议保证一帧最多一条 `axis_source`，且它与 `axis_discrete` / `axis_value120` 的到达
-    /// 顺序不确定（*"The order of wl_pointer.axis_discrete and wl_pointer.axis_source is not
-    /// guaranteed"*）—— 所以源与增量分开记录、到 `Frame` 才一起消费。
-    pub(crate) fn note_source(&mut self, source: ScrollSource) {
-        self.source = source;
-    }
-
-    /// 累积一条 `wl_pointer.axis_discrete`（`discrete` = **格数**，1 = 一格；v5–v7）。
+    /// 累积一条 `wl_pointer.axis_discrete`（`notches` = **格数**，1 = 一格；v5–v7）。
     ///
     /// 与 [`Self::note_value120`] 是**不同量纲**：这里 1 = 一格，value120 的 120 = 一格。
-    pub(crate) fn note_notches(&mut self, axis: ScrollAxis, notches: i32) {
+    fn note_notches(&mut self, axis: ScrollAxis, notches: i32) {
         let slot = match axis {
             ScrollAxis::Horizontal => &mut self.notches_x,
             ScrollAxis::Vertical => &mut self.notches_y,
@@ -117,7 +172,7 @@ impl ScrollAccum {
     }
 
     /// 累积一条 `wl_pointer.axis_value120`（`value120 = 120` 是一格；v8+）。
-    pub(crate) fn note_value120(&mut self, axis: ScrollAxis, value120: i32) {
+    fn note_value120(&mut self, axis: ScrollAxis, value120: i32) {
         let slot = match axis {
             ScrollAxis::Horizontal => &mut self.value120_x,
             ScrollAxis::Vertical => &mut self.value120_y,
@@ -126,7 +181,7 @@ impl ScrollAccum {
     }
 
     /// 累积一条 `wl_pointer.axis`（连续值）。
-    pub(crate) fn note_continuous(&mut self, axis: ScrollAxis, value: f32) {
+    fn note_continuous(&mut self, axis: ScrollAxis, value: f32) {
         let slot = match axis {
             ScrollAxis::Horizontal => &mut self.continuous_x,
             ScrollAxis::Vertical => &mut self.continuous_y,
@@ -134,55 +189,38 @@ impl ScrollAccum {
         *slot += value;
     }
 
-    /// 本帧的滚动源是否手指 / 触控板（像素单位 + 连续阶段）。
-    #[must_use]
-    pub(crate) fn is_finger(self) -> bool {
-        matches!(self.source, ScrollSource::Finger)
+    /// 本帧是否带离散通道（`axis_discrete` / `axis_value120` 任一非零）。
+    fn has_discrete(self) -> bool {
+        self.notches_x != 0 || self.notches_y != 0 || self.value120_x != 0 || self.value120_y != 0
     }
 
-    /// 本批是否没有任何滚动分量（`Frame` 据此跳过空事件）。
-    #[must_use]
-    pub(crate) fn is_empty(self) -> bool {
-        self.notches_x == 0
-            && self.notches_y == 0
-            && self.value120_x == 0
-            && self.value120_y == 0
-            && self.continuous_x == 0.0
-            && self.continuous_y == 0.0
+    /// 本帧是否没有任何滚动分量。
+    fn is_empty(self) -> bool {
+        !self.has_discrete() && self.continuous_x == 0.0 && self.continuous_y == 0.0
     }
 
-    /// 清空本批并把滚动源复位成 [`ScrollSource::Unknown`]（`wl_pointer.frame` 结束时调用）。
-    ///
-    /// **源必须随帧复位**：协议把 `axis_source` 定义为「本帧内事件」的来源信息；不复位就会
-    /// 把上一帧的 `finger` 沿用给下一条没有 `axis_source` 的滚轮帧（RB-10）。
-    pub(crate) fn clear(&mut self) {
+    /// 清空本帧的增量（帧收尾与 `PointerScroll` 的源状态无关：源由后者按手势管理）。
+    fn clear(&mut self) {
         *self = Self::default();
     }
 
     /// 滚轮：换算成「行」（`(水平, 垂直)`）。
     ///
     /// **每轴独立、三路取一**：该轴有 `axis_discrete` 格数就只用它（精确）；否则用
-    /// `axis_value120 / 120`；再否则用连续值 `axis / 10`。三者描述的是同一次滚动，相加会把
-    /// 一格算成两行（B8），而忽略 `axis_discrete` 会让 v5–v7 服务端的一格按近似值算出 1.5 行
-    /// （RB-10）。
-    #[must_use]
-    pub(crate) fn wheel_lines(self) -> (f32, f32) {
+    /// `axis_value120 / 120`；再否则用连续值 `/ 约定值`。三者描述同一次滚动，相加会把一格算成
+    /// 两行（B8），忽略 `axis_discrete` 会让 v5–v7 服务端的一格落到近似换算（RB-10）。
+    fn wheel_lines(self) -> (f32, f32) {
         (
             lines_for(self.notches_x, self.value120_x, self.continuous_x),
             lines_for(self.notches_y, self.value120_y, self.continuous_y),
         )
     }
 
-    /// 手指 / 触控板：连续值按**像素** 1:1 跟随，`(水平, 垂直)`。
+    /// 手指 / 触控板：连续值就是**像素**增量，1:1 跟随。
     ///
-    /// 连续值为 0 的轴（服务端只发离散值、没发 `axis` 的兼容情况）才把离散值折算成像素
-    /// （一格 = 10 个 surface-local 单位）：否则该轴的滚动会在触控板上完全丢失。
-    #[must_use]
-    pub(crate) fn finger_pixels(self) -> (f32, f32) {
-        (
-            pixels_for(self.notches_x, self.value120_x, self.continuous_x),
-            pixels_for(self.notches_y, self.value120_y, self.continuous_y),
-        )
+    /// 离散通道只会出现在滚轮帧（见模块文档第 2 条），所以这里不需要离散回退。
+    fn finger_pixels(self) -> (f32, f32) {
+        (self.continuous_x, self.continuous_y)
     }
 }
 
@@ -197,20 +235,132 @@ fn lines_for(notches: i32, value120: i32, continuous: f32) -> f32 {
     }
 }
 
-/// 单轴手指：连续值即像素；没有连续值时按「一格 = 10 单位」折算离散值。
-fn pixels_for(notches: i32, value120: i32, continuous: f32) -> f32 {
-    if continuous != 0.0 {
-        continuous
-    } else if notches != 0 {
-        notches as f32 * CONTINUOUS_AXIS_UNITS_PER_LINE
-    } else {
-        value120 as f32 / VALUE120_UNITS_PER_LINE * CONTINUOUS_AXIS_UNITS_PER_LINE
+/// 滚动输入的累积 + 手势源状态机：`wl_pointer` 滚动事件 → 每次帧收尾至多一条滚动输出。
+///
+/// 生命周期与 `WaylandState` 一致（一个 seat 的指针滚动状态）。帧与帧之间的相位/源状态都在
+/// 这里，驱动层不再持有任何滚动语义（RBL-01）。
+#[derive(Default)]
+pub(crate) struct PointerScroll {
+    /// 本帧增量（`Frame` 收尾时清空）。
+    accum: ScrollAccum,
+    /// 最近一次已知源：`axis_source` 到达即更新；`axis_stop` 所在帧收尾后复位成 `Unknown`。
+    source: ScrollSource,
+    /// 本帧出现过 `axis_stop`：帧收尾时先按旧源解释同帧 axis，再复位源（模块文档第 4 条）。
+    stop_pending: bool,
+    /// 手指手势是否进行中（已产出 `Begin` / `Update`，`axis_stop` 结束）。
+    active: bool,
+}
+
+impl PointerScroll {
+    /// 喂入一个滚动事件，返回**本事件当场要投递的**滚动输出。
+    ///
+    /// - `Source` / `Discrete` / `Value120` / `Continuous`：只累积，返回 `None`；
+    /// - `Stop`：产出零增量的 `End`（单位取当时仍有效的源），并把「帧收尾复位源」登记为
+    ///   pending；
+    /// - `Frame`：产出本批的滚动输出（没有分量时 `None`），清空增量；若本帧有 `axis_stop`
+    ///   则在收尾后把源复位成 `Unknown`（RBL-02 ①）。
+    pub(crate) fn apply(&mut self, event: ScrollEvent) -> Option<ScrollOutput> {
+        match event {
+            ScrollEvent::Source(source) => {
+                self.source = source;
+                None
+            }
+            ScrollEvent::Discrete { axis, notches } => {
+                self.accum.note_notches(axis, notches);
+                None
+            }
+            ScrollEvent::Value120 { axis, value120 } => {
+                self.accum.note_value120(axis, value120);
+                None
+            }
+            ScrollEvent::Continuous { axis, value } => {
+                self.accum.note_continuous(axis, value);
+                None
+            }
+            ScrollEvent::Stop => {
+                // End 在 stop 当场产出（零增量），单位取**尚未复位**的源：finger 手势的
+                // stop 帧通常不带 axis_source，但源按手势保持到本帧收尾（模块文档第 1、4 条）。
+                self.active = false;
+                self.stop_pending = true;
+                Some(ScrollOutput {
+                    delta: (0.0, 0.0),
+                    finger: self.frame_is_finger(),
+                    phase: ScrollPhase::End,
+                })
+            }
+            ScrollEvent::Frame => self.flush_frame(),
+        }
+    }
+
+    /// 帧收尾：产出本批滚动输出、清空增量，并在本帧出现过 `axis_stop` 时复位源。
+    fn flush_frame(&mut self) -> Option<ScrollOutput> {
+        let stop_pending = std::mem::take(&mut self.stop_pending);
+        let finger = self.frame_is_finger();
+        let output = if self.accum.is_empty() {
+            None
+        } else {
+            let (x, y) = if finger {
+                self.accum.finger_pixels()
+            } else {
+                self.accum.wheel_lines()
+            };
+            let phase = if finger {
+                let phase = if self.active {
+                    ScrollPhase::Update
+                } else {
+                    ScrollPhase::Begin
+                };
+                self.active = true;
+                phase
+            } else {
+                ScrollPhase::Discrete
+            };
+            // 协议轴方向与引擎 scroll delta 方向相反 ⇒ 这里统一取反（与旧实现一致）。
+            Some(ScrollOutput {
+                delta: (-x, -y),
+                finger,
+                phase,
+            })
+        };
+        self.accum.clear();
+        if stop_pending {
+            // 连续手势以 axis_stop 结束（finger 手势协议保证有 stop）⇒ 手势作用域结束：
+            // 之后的帧没有新 source 时从 `Unknown`（= 滚轮）重新开始，不会把上一手势的
+            // finger 泄漏到滚轮帧（RB-10 的原始缺陷）。
+            self.source = ScrollSource::Unknown;
+        }
+        output
+    }
+
+    /// 本帧按手指（像素）解释吗：**离散通道是滚轮的充分证据**，否则看手势源。
+    ///
+    /// 这条规则同时覆盖两种历史缺陷：v5–v7 的 `axis_discrete` 帧不再被近似换算成 1.5 行；
+    /// finger 手势之后的滚轮帧即使没有 `axis_source` 也不会沿用像素单位。
+    fn frame_is_finger(&self) -> bool {
+        !self.accum.has_discrete() && matches!(self.source, ScrollSource::Finger)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CONTINUOUS_AXIS_UNITS_PER_LINE, ScrollAccum, ScrollAxis, ScrollSource};
+    use super::{
+        CONTINUOUS_AXIS_UNITS_PER_LINE, PointerScroll, ScrollAccum, ScrollAxis, ScrollEvent,
+        ScrollPhase, ScrollSource,
+    };
+
+    /// 一个 finger 帧的便捷构造（源 + 垂直连续值 + 帧收尾）。
+    fn finger_frame(value: f32) -> Vec<ScrollEvent> {
+        vec![
+            ScrollEvent::Source(ScrollSource::Finger),
+            ScrollEvent::Continuous {
+                axis: ScrollAxis::Vertical,
+                value,
+            },
+            ScrollEvent::Frame,
+        ]
+    }
+
+    // ── 纯换算（ScrollAccum）──────────────────────────────────────────────────────────
 
     /// 一格 = `axis_value120 = 120` = 1 行。
     #[test]
@@ -224,7 +374,7 @@ mod tests {
         assert_eq!(two_notches.wheel_lines().1, 2.0, "两格 = 2 行");
     }
 
-    /// v5 服务端只发 `axis`（一格 = 10 个单位）：也必须是 1 行，而不是 10/120 ≈ 0.083 行。
+    /// v5 服务端只发 `axis`：一格约定值（10 单位）= 1 行，而不是 10/120 ≈ 0.083 行。
     #[test]
     fn a_v5_server_that_only_sends_axis_still_yields_one_line() {
         let mut one_notch = ScrollAccum::default();
@@ -237,7 +387,7 @@ mod tests {
     }
 
     /// RB-10：v5–v7 服务端的 `axis_discrete = 1` 是**一格**，同帧的连续 `axis` 是同一格的近似
-    /// 表示（mutter/wlroots 实测 15 个单位）⇒ 必须恰好 1 行。
+    /// 表示（按约定常见 10–15 个单位）⇒ 必须恰好 1 行。
     ///
     /// 修复前只认 `axis_value120` 与连续值，于是 `15 / 10 = 1.5` 行（一格滚出一行半）。
     #[test]
@@ -282,8 +432,7 @@ mod tests {
 
     /// B8 核心回归：同一格滚轮同时收到 `axis_value120 = 120` 与 `axis = 10` ⇒ **1 行**。
     ///
-    /// 旧实现把两条通路相加（`120/120 + 10/10`）得到 2 行，即「滚一格跳两行」；
-    /// 旧测试 `both_axis_paths_accumulate` 把这个错误行为钉成了契约。
+    /// 旧实现把两条通路相加（`120/120 + 10/10`）得到 2 行，即「滚一格跳两行」。
     #[test]
     fn wheel_both_channels_yield_one_line() {
         let mut notch = ScrollAccum::default();
@@ -339,115 +488,24 @@ mod tests {
         );
     }
 
-    /// 手指（触控板）：连续值就是像素增量，1:1 跟随 —— 同时到达的 v120 不叠加。
+    /// 手指通路只按连续值 1:1：离散通道的存在与否不改变换算（离散帧永远不会走这条通路，
+    /// 见 [`PointerScroll::frame_is_finger`] 的规则）。
     #[test]
-    fn finger_uses_continuous_pixels_and_ignores_value120() {
+    fn finger_pixels_are_the_continuous_values() {
         let mut touchpad = ScrollAccum::default();
-        touchpad.note_source(ScrollSource::Finger);
         touchpad.note_continuous(ScrollAxis::Vertical, -24.0);
-        touchpad.note_value120(ScrollAxis::Vertical, 120);
         assert_eq!(
             touchpad.finger_pixels().1,
             -24.0,
-            "触控板按像素 1:1（不是行），且离散分量不得叠加"
+            "触控板按像素 1:1（不是行）"
         );
-        // 与滚轮换算是两套单位：同一批数据在手指通路上是 -24 像素，在滚轮通路上是行。
+        // 与滚轮换算是两套单位：同一批数据在滚轮通路上是行。
+        touchpad.note_value120(ScrollAxis::Vertical, 120);
         assert_eq!(touchpad.wheel_lines().1, 1.0, "滚轮通路用离散值 = 1 行");
     }
 
-    /// 服务端只发 `axis_value120`、没发 `axis` 的手指滚动：必须折算成像素而不是整轴丢失。
-    #[test]
-    fn finger_falls_back_to_value120_when_axis_is_missing() {
-        let mut touchpad = ScrollAccum::default();
-        touchpad.note_value120(ScrollAxis::Vertical, 120);
-        assert_eq!(
-            touchpad.finger_pixels().1,
-            CONTINUOUS_AXIS_UNITS_PER_LINE,
-            "一格 v120 折算成一格的连续单位（10 像素），不能变成 1 像素也不能丢失"
-        );
-    }
-
-    /// RB-10：v5–v7 服务端只发 `axis_discrete`、没发 `axis` 的手指滚动同样要折算成像素。
-    #[test]
-    fn finger_falls_back_to_axis_discrete_when_axis_is_missing() {
-        let mut touchpad = ScrollAccum::default();
-        touchpad.note_notches(ScrollAxis::Vertical, 1);
-        assert_eq!(
-            touchpad.finger_pixels().1,
-            CONTINUOUS_AXIS_UNITS_PER_LINE,
-            "一格 axis_discrete 折算成像素（10），不能整轴丢失"
-        );
-    }
-
-    /// RB-10：源只描述**本帧**。手指帧（像素 1:1）之后 `clear()`（= `wl_pointer.frame` 结束）
-    /// ⇒ 下一帧没有 `axis_source` 时按滚轮处理：连续值 15 个单位 ≈ 1.5 行，而不是 15 像素。
-    ///
-    /// 修复前 `scroll_finger` 长存 ⇒ 手指手势之后的无 source 滚轮帧继续按像素 1:1（约 10×
-    /// 灵敏度）。变异检查：让 `clear()` 保留 `source` ⇒ 本测试红。
-    #[test]
-    fn a_finger_frame_does_not_make_the_next_sourceless_frame_pixels() {
-        let mut scroll = ScrollAccum::default();
-        scroll.note_source(ScrollSource::Finger);
-        scroll.note_continuous(ScrollAxis::Vertical, 24.0);
-        assert!(scroll.is_finger(), "本帧有 axis_source = finger");
-        assert_eq!(scroll.finger_pixels().1, 24.0, "手指按像素 1:1 跟随");
-        scroll.clear();
-
-        assert!(
-            !scroll.is_finger(),
-            "帧结束后源必须复位成 Unknown（axis_source 只描述本帧）"
-        );
-        scroll.note_continuous(ScrollAxis::Vertical, 15.0);
-        assert_eq!(
-            scroll.wheel_lines().1,
-            1.5,
-            "无 source 的滚轮帧按行换算（15/10），不是 15 像素"
-        );
-    }
-
-    /// RB-10：`axis_source` 只影响它所在的帧，三个方向都钉住：
-    /// 显式 `finger` 帧 → 像素；显式 `wheel` / `continuous` 帧 → 行；没有 source 帧（Unknown）
-    /// → 行（安全默认）。
-    #[test]
-    fn axis_source_covers_only_its_own_frame() {
-        for source in [
-            ScrollSource::Wheel,
-            ScrollSource::Continuous,
-            ScrollSource::Unknown,
-        ] {
-            let mut scroll = ScrollAccum::default();
-            scroll.note_source(source);
-            scroll.note_continuous(ScrollAxis::Vertical, 20.0);
-            assert!(!scroll.is_finger(), "{source:?} 不是手指");
-            assert_eq!(
-                scroll.wheel_lines().1,
-                2.0,
-                "{source:?} 必须按行归一（20/10），不得按像素 20"
-            );
-            scroll.clear();
-        }
-
-        // 同一批数据在 finger 帧里是 20 像素，换一帧就回到行单位。
-        let mut scroll = ScrollAccum::default();
-        scroll.note_source(ScrollSource::Finger);
-        scroll.note_continuous(ScrollAxis::Vertical, 20.0);
-        assert_eq!(scroll.finger_pixels().1, 20.0);
-        scroll.clear();
-        assert!(!scroll.is_finger());
-    }
-
-    /// 协议：`axis_source` 是**可选**的（未知源不发事件）⇒ 未知源必须是滚轮，不能沿用上一帧
-    /// 的 finger。
-    #[test]
-    fn an_unknown_source_is_a_wheel_not_a_finger() {
-        let mut scroll = ScrollAccum::default();
-        scroll.note_continuous(ScrollAxis::Vertical, -CONTINUOUS_AXIS_UNITS_PER_LINE);
-        assert!(!scroll.is_finger(), "默认 / 无 source 时按滚轮处理");
-        assert_eq!(scroll.wheel_lines().1, -1.0);
-    }
-
     /// 一个 frame 里的多条 `axis_value120` 先累积，`Frame` 取走时一次算清
-    /// （高精度滚轮会把一格拆成多条事件；`clear()` 之后下一帧从零开始）。
+    /// （高精度滚轮会把一格拆成多条事件；清空之后下一帧从零开始）。
     #[test]
     fn value120_events_accumulate_until_the_frame_is_flushed() {
         let mut scroll = ScrollAccum::default();
@@ -455,6 +513,12 @@ mod tests {
         scroll.note_value120(ScrollAxis::Vertical, 60);
         assert_eq!(scroll.wheel_lines().1, 1.0, "两条 60 合起来是一格");
         assert!(!scroll.is_empty());
+        let mut device = PointerScroll::default();
+        assert_eq!(
+            device.apply(ScrollEvent::Frame),
+            None,
+            "没有分量时不产出事件"
+        );
         scroll.clear();
         assert!(scroll.is_empty(), "clear 之后下一帧从零开始");
         assert_eq!(scroll.wheel_lines(), (0.0, 0.0));
@@ -480,5 +544,247 @@ mod tests {
         assert!(!scroll.is_empty());
         scroll.clear();
         assert!(scroll.is_empty(), "clear 之后必须回到空态");
+    }
+
+    // ── 接线（PointerScroll：事件 → 累积器 → 单位/相位/帧收尾）──────────────────────────
+
+    /// RBL-01 ①：`Source(Finger)` + 连续值 ⇒ 像素单位 + `Begin`；下一帧 ⇒ `Update`（手势延续）。
+    #[test]
+    fn a_finger_frame_yields_pixels_and_keeps_the_gesture_open() {
+        let mut scroll = PointerScroll::default();
+        let mut outputs = Vec::new();
+        for event in finger_frame(-24.0) {
+            if let Some(output) = scroll.apply(event) {
+                outputs.push(output);
+            }
+        }
+        assert_eq!(outputs.len(), 1, "一个 frame 只产出一条滚动事件");
+        assert_eq!(
+            outputs[0].delta,
+            (0.0, 24.0),
+            "手指按像素 1:1，方向取反（协议正方向 ↔ 引擎 delta）"
+        );
+        assert!(outputs[0].finger, "finger 源 ⇒ 像素单位");
+        assert_eq!(outputs[0].phase, ScrollPhase::Begin);
+
+        // 手势延续：同一手势内第二帧没有 `axis_source`（协议只保证「若发则只描述本帧」）。
+        assert_eq!(
+            scroll.apply(ScrollEvent::Continuous {
+                axis: ScrollAxis::Vertical,
+                value: -12.0,
+            }),
+            None
+        );
+        let update = scroll
+            .apply(ScrollEvent::Frame)
+            .expect("第二帧必须产出滚动事件");
+        assert_eq!(update.delta, (0.0, 12.0));
+        assert!(update.finger, "手势内没有 source 的帧仍按 finger 处理");
+        assert_eq!(update.phase, ScrollPhase::Update);
+    }
+
+    /// RBL-02 ②：一帧出现 `axis_value120` ⇒ 该帧是滚轮（行单位、`Discrete`），**即使**手势源
+    /// 仍是 finger（触控板不发离散通道）。
+    #[test]
+    fn a_value120_frame_is_a_wheel_even_inside_a_finger_gesture() {
+        let mut scroll = PointerScroll::default();
+        for event in finger_frame(-24.0) {
+            scroll.apply(event);
+        }
+        // 同一手势内（没有 axis_stop）来了一帧 value120。
+        assert_eq!(
+            scroll.apply(ScrollEvent::Value120 {
+                axis: ScrollAxis::Vertical,
+                value120: 120,
+            }),
+            None
+        );
+        let output = scroll
+            .apply(ScrollEvent::Frame)
+            .expect("离散帧必须产出滚动事件");
+        assert_eq!(output.delta, (0.0, -1.0), "120/120 = 1 行");
+        assert!(
+            !output.finger,
+            "离散通道是滚轮的充分证据：不得沿用上一手势的 finger"
+        );
+        assert_eq!(output.phase, ScrollPhase::Discrete);
+    }
+
+    /// RBL-02 ② / RB-10：`axis_discrete` 帧同样按滚轮（行），格数直接进输出 —— 这是 v5–v7
+    /// 服务端一格一行的接线证据（`note_notches` 被真正调用）。
+    #[test]
+    fn an_axis_discrete_frame_is_a_wheel_and_carries_its_notches() {
+        let mut scroll = PointerScroll::default();
+        assert_eq!(
+            scroll.apply(ScrollEvent::Discrete {
+                axis: ScrollAxis::Vertical,
+                notches: 1,
+            }),
+            None
+        );
+        // 同帧的连续近似值（常见 15）不得让它变成 1.5 行。
+        scroll.apply(ScrollEvent::Continuous {
+            axis: ScrollAxis::Vertical,
+            value: 15.0,
+        });
+        let output = scroll
+            .apply(ScrollEvent::Frame)
+            .expect("一格滚轮必须产出一条滚动事件");
+        assert_eq!(output.delta, (0.0, -1.0), "axis_discrete = 1 格 = 1 行");
+        assert!(!output.finger);
+        assert_eq!(output.phase, ScrollPhase::Discrete);
+    }
+
+    /// RBL-02 ③：一帧既无 source 也无离散通道（纯连续 `axis`）⇒ 沿用最后一次已知源（finger）。
+    #[test]
+    fn a_sourceless_continuous_frame_keeps_the_last_known_source() {
+        let mut scroll = PointerScroll::default();
+        scroll.apply(ScrollEvent::Source(ScrollSource::Finger));
+        scroll.apply(ScrollEvent::Continuous {
+            axis: ScrollAxis::Vertical,
+            value: 30.0,
+        });
+        let first = scroll.apply(ScrollEvent::Frame).expect("第一帧必须有输出");
+        assert!(first.finger);
+
+        // 第二帧完全没有 axis_source（协议允许「每 sequence 只发一次」）。
+        scroll.apply(ScrollEvent::Continuous {
+            axis: ScrollAxis::Vertical,
+            value: -20.0,
+        });
+        let second = scroll.apply(ScrollEvent::Frame).expect("第二帧必须有输出");
+        assert!(
+            second.finger,
+            "纯连续帧没有新 source ⇒ 沿用最后一次已知源（finger），不得退化成滚轮"
+        );
+        assert_eq!(second.delta, (0.0, 20.0));
+        assert_eq!(second.phase, ScrollPhase::Update);
+    }
+
+    /// RBL-02 ①/④：`axis_stop` 产出零增量 `End`（单位按当时源），帧收尾后源复位 ⇒ 下一条
+    /// 没有 source 的纯连续帧按滚轮（行）处理（原始 RB-10 缺陷的回归防线）。
+    #[test]
+    fn axis_stop_ends_the_gesture_and_resets_the_source() {
+        let mut scroll = PointerScroll::default();
+        for event in finger_frame(-24.0) {
+            scroll.apply(event);
+        }
+        let end = scroll
+            .apply(ScrollEvent::Stop)
+            .expect("axis_stop 当场产出 End");
+        assert_eq!(end.delta, (0.0, 0.0), "End 是零增量事件");
+        assert!(end.finger, "finger 手势的 End 仍是像素单位");
+        assert_eq!(end.phase, ScrollPhase::End);
+        assert_eq!(scroll.apply(ScrollEvent::Frame), None, "stop 帧没有数据");
+
+        // 手势结束后的无 source 帧：按滚轮（行），不是像素 —— 旧实现在这里约 10× 灵敏度。
+        scroll.apply(ScrollEvent::Continuous {
+            axis: ScrollAxis::Vertical,
+            value: 15.0,
+        });
+        let wheel = scroll
+            .apply(ScrollEvent::Frame)
+            .expect("滚轮帧必须产出事件");
+        assert!(!wheel.finger, "axis_stop 之后源复位为 Unknown（按滚轮）");
+        assert_eq!(wheel.delta, (0.0, -1.5), "15 / 约定 10 = 1.5 行");
+        assert_eq!(wheel.phase, ScrollPhase::Discrete);
+    }
+
+    /// RBL-02 ④：`axis_stop` 与另一根轴的 `axis` 同帧 ⇒ 该 axis 仍按**停止前**的源解释
+    /// （协议：一帧里 axis + axis_stop = 一根轴停、另一根继续），源在帧收尾才复位。
+    #[test]
+    fn axis_stop_with_a_continuing_axis_in_the_same_frame_keeps_the_pre_stop_source() {
+        let mut scroll = PointerScroll::default();
+        scroll.apply(ScrollEvent::Source(ScrollSource::Finger));
+        // 水平轴先停，垂直轴同帧还在动。
+        let end = scroll.apply(ScrollEvent::Stop).expect("stop 当场产出 End");
+        assert_eq!(end.phase, ScrollPhase::End);
+        scroll.apply(ScrollEvent::Continuous {
+            axis: ScrollAxis::Vertical,
+            value: -18.0,
+        });
+        let output = scroll
+            .apply(ScrollEvent::Frame)
+            .expect("同帧继续轴必须产出事件");
+        assert!(
+            output.finger,
+            "axis_stop 同帧的 axis 属于停止前的手势（不得错判成滚轮）"
+        );
+        assert_eq!(output.delta, (0.0, 18.0));
+        assert_eq!(
+            output.phase,
+            ScrollPhase::Begin,
+            "手势收尾后新运动从 Begin 开始"
+        );
+    }
+
+    /// RBL-01 M-a 覆盖：`Frame` 必须清空增量，否则两帧会累加（帧作用域失效）。
+    #[test]
+    fn frames_do_not_accumulate_across_the_frame_boundary() {
+        let mut scroll = PointerScroll::default();
+        scroll.apply(ScrollEvent::Value120 {
+            axis: ScrollAxis::Vertical,
+            value120: 120,
+        });
+        let first = scroll.apply(ScrollEvent::Frame).expect("第一帧必须有输出");
+        assert_eq!(first.delta, (0.0, -1.0));
+
+        scroll.apply(ScrollEvent::Value120 {
+            axis: ScrollAxis::Vertical,
+            value120: 240,
+        });
+        let second = scroll.apply(ScrollEvent::Frame).expect("第二帧必须有输出");
+        assert_eq!(
+            second.delta,
+            (0.0, -2.0),
+            "第二帧只含自己的 240/120 = 2 行（若 Frame 忘了清空会是 3 行）"
+        );
+    }
+
+    /// 未知源 + 无离散通道 ⇒ 按滚轮（安全默认）。
+    #[test]
+    fn an_unknown_source_is_a_wheel_not_a_finger() {
+        let mut scroll = PointerScroll::default();
+        scroll.apply(ScrollEvent::Continuous {
+            axis: ScrollAxis::Vertical,
+            value: -CONTINUOUS_AXIS_UNITS_PER_LINE,
+        });
+        let output = scroll
+            .apply(ScrollEvent::Frame)
+            .expect("滚轮帧必须产出事件");
+        assert!(!output.finger, "未知源按滚轮处理");
+        assert_eq!(output.delta, (0.0, 1.0));
+        assert_eq!(output.phase, ScrollPhase::Discrete);
+    }
+
+    /// 显式 `wheel` / `continuous` 源都按行（`Continuous` 当前与 `Wheel` 同义）。
+    #[test]
+    fn explicit_non_finger_sources_are_lines() {
+        for source in [ScrollSource::Wheel, ScrollSource::Continuous] {
+            let mut scroll = PointerScroll::default();
+            scroll.apply(ScrollEvent::Source(source));
+            scroll.apply(ScrollEvent::Continuous {
+                axis: ScrollAxis::Horizontal,
+                value: CONTINUOUS_AXIS_UNITS_PER_LINE,
+            });
+            let output = scroll
+                .apply(ScrollEvent::Frame)
+                .expect("非手指源必须产出事件");
+            assert!(!output.finger, "{source:?} 必须按行");
+            assert_eq!(output.delta, (-1.0, 0.0));
+        }
+    }
+
+    /// 空帧（只有 `frame`，没有滚动分量）不产出事件；`axis_stop` 帧的 `End` 已在 stop 当场
+    /// 产出，帧收尾不会重复。
+    #[test]
+    fn an_empty_frame_yields_no_event() {
+        let mut scroll = PointerScroll::default();
+        assert_eq!(scroll.apply(ScrollEvent::Frame), None);
+        assert_eq!(
+            scroll.apply(ScrollEvent::Stop).map(|o| o.phase),
+            Some(ScrollPhase::End)
+        );
+        assert_eq!(scroll.apply(ScrollEvent::Frame), None, "End 只产出一次");
     }
 }

@@ -116,7 +116,7 @@ use crate::{
             input, owner,
             parent::{ParentAction, ParentHints},
             presentation::PresentedOrder,
-            scroll::{ScrollAccum, ScrollAxis, ScrollSource},
+            scroll::{PointerScroll, ScrollAxis, ScrollEvent, ScrollSource},
             text_input::{self, ImeStateSnapshot, TextInputRoute},
             toplevel::{
                 self, DecorationMode, SizeConstraintState, ToplevelStates, Visibility,
@@ -301,6 +301,9 @@ struct WindowSurface {
     /// 内容之后发送）。只看「configure 已到」不够 —— ack 之后 buffer 还没 commit，surface
     /// 仍未 mapped，此时 `xdg_toplevel.set_parent` 等价 null parent（见
     /// [`crate::platform::wayland::parent`] 模块文档）。
+    ///
+    /// **已知耦合**：补发时机绑在渲染路径上；owner 生命周期内从未呈现（启动即最小化 /
+    /// 一直被完全遮挡）时永远等不到该回调 ⇒ 补发不会发生（与修复前等价，不是「晚到」）。
     mapped: bool,
     /// 最近一次 configure 的状态位（`Maximized` / `Fullscreen` / `Suspended` / `Tiled*`）。
     states: ToplevelStates,
@@ -446,14 +449,12 @@ pub(crate) struct WaylandState {
     key_repeat: KeyRepeat,
     /// 当前按下的键（用于合成重复）。顺序即按下顺序，释放时按 keycode 移除。
     held_keys: Vec<HeldKey>,
-    /// 本帧尚未提交的滚轮累积（按 `wl_pointer.frame` 成批，P1-2.11）。
+    /// 滚轮 / 触控板的累积与**手势源状态机**（按 `wl_pointer.frame` 成批，P1-2.11 / RBL-01）。
     ///
-    /// 滚动源也在这里（[`ScrollAccum`] 持有）：`axis_source` 是**帧作用域**的，
-    /// `Frame` 结束时随累积一起复位成 `Unknown`（RB-10；见
-    /// [`crate::platform::wayland::scroll`] 模块文档）。
-    scroll: ScrollAccum,
-    /// 连续滚动手势是否进行中（`axis_source` 之后、`axis_stop` 之前）。
-    scroll_active: bool,
+    /// 驱动层不持有任何滚动语义：`Dispatch<wl_pointer>` 只把协议事件翻译成
+    /// [`crate::platform::wayland::scroll::ScrollEvent`]，单位 / 相位 / 源作用域 / 帧收尾都在
+    /// [`PointerScroll::apply`]（Windows + Linux 单测，见该模块文档）。
+    scroll: PointerScroll,
     /// RB-11：owner 尚未映射时等待补发的 `xdg_toplevel.set_parent` 表。
     ///
     /// 判定与补发时机在 [`crate::platform::wayland::parent`]；真实协议调用在
@@ -566,8 +567,7 @@ impl WaylandState {
             modifiers: Modifiers::empty(),
             key_repeat: KeyRepeat::default(),
             held_keys: Vec::new(),
-            scroll: ScrollAccum::default(),
-            scroll_active: false,
+            scroll: PointerScroll::default(),
             parent_hints: ParentHints::default(),
             pointer_pos: Point::new(0.0, 0.0),
             redraw: false,
@@ -2521,6 +2521,27 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        // 滚动事件走**唯一**的纯逻辑入口（RBL-01）：这里只做「`wl_pointer::Event` →
+        // [`ScrollEvent`]」的机械翻译（[`pointer_scroll_event`]），单位 / 相位 / 源作用域 /
+        // 帧收尾全部由 [`PointerScroll::apply`] 决定（`platform/wayland/scroll.rs`，Windows +
+        // Linux 单测）；`Dispatch::event` 本身需要真实代理 / `Connection`，无法在单测里构造。
+        if let Some(scroll) = pointer_scroll_event(&event) {
+            if let Some(output) = state.scroll.apply(scroll)
+                && let Some(window) = state.pointer_window()
+            {
+                state.events.push((
+                    window,
+                    Event::Input(scroll_event(
+                        state.pointer_pos,
+                        output.delta,
+                        output.finger,
+                        output.phase,
+                        state.modifiers,
+                    )),
+                ));
+            }
+            return;
+        }
         match event {
             wl_pointer::Event::Enter {
                 serial,
@@ -2598,135 +2619,6 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                         state.events.push((window, Event::Input(event)));
                     }
                 }
-            }
-            wl_pointer::Event::AxisSource { axis_source } => {
-                // R02-10 / RB-10：`axis_source` 区分「滚轮 / 手指 / 连续设备」。它只描述**本帧**
-                // 内 axis 事件的来源（协议：*"carries the source information for all events
-                // within that frame"*），帧结束时复位成 `Unknown`（见下面的 `Frame` 分支），
-                // 绝不做跨帧持久状态。`Unknown` 按滚轮处理（协议允许服务端不发该事件）。
-                let source = match axis_source {
-                    wayland_client::WEnum::Value(wl_pointer::AxisSource::Finger) => {
-                        ScrollSource::Finger
-                    }
-                    wayland_client::WEnum::Value(wl_pointer::AxisSource::Continuous) => {
-                        ScrollSource::Continuous
-                    }
-                    // `wheel_tilt`（v6+）是「横向倾斜的滚轮」：仍是离散格，按滚轮处理。
-                    wayland_client::WEnum::Value(_) => ScrollSource::Wheel,
-                    wayland_client::WEnum::Unknown(_) => ScrollSource::Unknown,
-                };
-                state.scroll.note_source(source);
-            }
-            wl_pointer::Event::Axis { axis, value, .. } => {
-                // 连续值（触控板即像素；v5 起滚轮一格 = 10 个单位）。**不能**除 120 ——
-                // 那是 `axis_value120` 的量纲（P1-2.11）。单位换算在纯逻辑层
-                // （`scroll::ScrollAccum`）：滚轮连续值按 10 单位/行，手指按 1:1 像素。
-                let axis = if matches!(
-                    axis,
-                    wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll)
-                ) {
-                    ScrollAxis::Horizontal
-                } else {
-                    ScrollAxis::Vertical
-                };
-                state.scroll.note_continuous(axis, value as f32);
-            }
-            wl_pointer::Event::AxisDiscrete { axis, discrete } => {
-                // v5–v7 服务端的离散步长：`discrete` 是**格数**（1 = 一格），协议保证它与同帧
-                // 的一条连续 `axis` 描述同一次物理滚动（*"coupled with exactly one axis
-                // event"*）。旧实现直接丢弃它 ⇒ 只能拿 `axis/10` 近似（mutter/wlroots 一格常
-                // 是 15 ⇒ 1.5 行，RB-10）。v8+ 由 `axis_value120` 取代（本分支不再到达）。
-                let axis = if matches!(
-                    axis,
-                    wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll)
-                ) {
-                    ScrollAxis::Horizontal
-                } else {
-                    ScrollAxis::Vertical
-                };
-                state.scroll.note_notches(axis, discrete);
-            }
-            wl_pointer::Event::AxisValue120 { axis, value120 } => {
-                // v8+ 的高精度离散步长：1/120 行，与 Win32 的 `WHEEL_DELTA = 120` 同量纲。
-                // 它与同帧的连续 `axis` 是**同一次物理滚动**的两种表示，累积器按轴二选一
-                // （B8：相加会让一格滚轮变成两行）。
-                let axis = if matches!(
-                    axis,
-                    wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll)
-                ) {
-                    ScrollAxis::Horizontal
-                } else {
-                    ScrollAxis::Vertical
-                };
-                state.scroll.note_value120(axis, value120);
-            }
-            wl_pointer::Event::AxisStop { .. } => {
-                // 一次连续手势结束：补一条 `phase = End` 的空增量事件，引擎据此结束惯性/动画
-                // （Chrome 的 `WebMouseWheelEvent.phase = kScrollPhaseEnded` 同义）。
-                //
-                // 单位取**本帧**的源：`axis_stop` 帧通常没有滚动分量（delta = 0 ⇒ 单位不影响
-                // 任何数值，阶段才是这条事件的语义）。源的复位由随后必到的 `Frame` 完成 ——
-                // 协议允许 `axis_stop` 与另一根轴的 `axis` 同帧，当场清源会把那条 axis 错判。
-                state.scroll_active = false;
-                if let Some(window) = state.pointer_window() {
-                    state.events.push((
-                        window,
-                        Event::Input(scroll_event(
-                            state.pointer_pos,
-                            (0.0, 0.0),
-                            state.scroll.is_finger(),
-                            ScrollPhase::End,
-                            state.modifiers,
-                        )),
-                    ));
-                }
-            }
-            wl_pointer::Event::Frame => {
-                // 一次 frame = 一批同属一个逻辑输入的指针事件 ⇒ 只产出一个 Scroll。
-                // v8+ 服务端对滚轮会同时发连续 `axis` 与离散 `axis_value120`；v5–v7 发
-                // `axis_discrete`；三者是同一格滚动的不同表示，`ScrollAccum` 按轴三选一
-                // （B8：相加会一格 = 两行；RB-10：v5–v7 的格数优先于近似换算）。
-                if !state.scroll.is_empty() {
-                    // 手指（触控板）：连续值就是像素增量，1:1 跟随；其余（滚轮 / 未知源）：
-                    // 换算成行。源是**帧作用域**的：`axis_source` 只描述本帧，没有 source 的帧
-                    // 按滚轮处理（RB-10：手指手势之后的无 source 滚轮帧不得沿用 finger，那会
-                    // 造成约 10× 灵敏度）。
-                    let finger = state.scroll.is_finger();
-                    let (delta_x, delta_y) = if finger {
-                        let (x, y) = state.scroll.finger_pixels();
-                        (-x, -y)
-                    } else {
-                        let (x, y) = state.scroll.wheel_lines();
-                        (-x, -y)
-                    };
-                    let phase = if finger {
-                        let phase = if state.scroll_active {
-                            ScrollPhase::Update
-                        } else {
-                            ScrollPhase::Begin
-                        };
-                        state.scroll_active = true;
-                        phase
-                    } else {
-                        ScrollPhase::Discrete
-                    };
-                    if let Some(window) = state.pointer_window() {
-                        state.events.push((
-                            window,
-                            Event::Input(scroll_event(
-                                state.pointer_pos,
-                                (delta_x, delta_y),
-                                finger,
-                                phase,
-                                state.modifiers,
-                            )),
-                        ));
-                    }
-                }
-                // 帧结束：无论本帧有没有滚动分量都把源复位（协议：`axis_source` 只描述本帧；
-                // `axis_stop` 的复位也由这里覆盖）。空帧同样要清 —— 只带 `axis_source` 的帧
-                // 若不清，源会漏进下一帧，RB-10 的 10× 灵敏度就回来了。
-                state.scroll.clear();
             }
             wl_pointer::Event::Leave { .. } => {
                 // R10-3：离开时隐藏光标 —— 否则指针移到别的 surface 上时，compositor 会继续
@@ -3044,6 +2936,55 @@ fn scroll_event(
     }
 }
 
+/// `wl_pointer` 的滚动相关事件 → 纯逻辑事件（[`crate::platform::wayland::scroll::ScrollEvent`]）。
+///
+/// **机械翻译**：只做「协议枚举 → 纯枚举」与量纲类型转换，不含任何判定（单位 / 相位 / 源
+/// 作用域 / 帧收尾都在 [`PointerScroll::apply`]，可 Windows + Linux 单测）。
+///
+/// 返回 `None` = 不是滚动事件（进 `Dispatch` 的常规分支）。协议事件**值**可以直接构造，
+/// 因此这条翻译可以在 Linux 单测里逐变体钉住；`Dispatch::event` 本身需要真实 `wl_pointer`
+/// 代理 / `Connection`，无法在无 Wayland 连接的单测里调用（RBL-01）。
+fn pointer_scroll_event(event: &wl_pointer::Event) -> Option<ScrollEvent> {
+    Some(match event {
+        wl_pointer::Event::AxisSource { axis_source } => ScrollEvent::Source(match axis_source {
+            wayland_client::WEnum::Value(wl_pointer::AxisSource::Finger) => ScrollSource::Finger,
+            wayland_client::WEnum::Value(wl_pointer::AxisSource::Continuous) => {
+                ScrollSource::Continuous
+            }
+            // `wheel_tilt`（v6+）是「横向倾斜的滚轮」：仍是离散格，按滚轮处理。
+            wayland_client::WEnum::Value(_) => ScrollSource::Wheel,
+            wayland_client::WEnum::Unknown(_) => ScrollSource::Unknown,
+        }),
+        wl_pointer::Event::Axis { axis, value, .. } => ScrollEvent::Continuous {
+            axis: scroll_axis(axis),
+            value: *value as f32,
+        },
+        wl_pointer::Event::AxisDiscrete { axis, discrete } => ScrollEvent::Discrete {
+            axis: scroll_axis(axis),
+            notches: *discrete,
+        },
+        wl_pointer::Event::AxisValue120 { axis, value120 } => ScrollEvent::Value120 {
+            axis: scroll_axis(axis),
+            value120: *value120,
+        },
+        wl_pointer::Event::AxisStop { .. } => ScrollEvent::Stop,
+        wl_pointer::Event::Frame => ScrollEvent::Frame,
+        _ => return None,
+    })
+}
+
+/// 协议轴 → 纯逻辑轴（`HorizontalScroll` 之外都按垂直：协议目前只有这两个值）。
+fn scroll_axis(axis: &wayland_client::WEnum<wl_pointer::Axis>) -> ScrollAxis {
+    if matches!(
+        axis,
+        wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll)
+    ) {
+        ScrollAxis::Horizontal
+    } else {
+        ScrollAxis::Vertical
+    }
+}
+
 /// `evdev` 键码 → 引擎 [`KeyCode`]（W3C `KeyboardEvent.code` 语义，R02-1）。
 ///
 /// **必须用 evdev 码而不是 keysym**：`xkb_state.key_get_one_sym()` 返回的是**布局相关**的
@@ -3205,7 +3146,10 @@ fn key_code(evdev: u32) -> KeyCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{KeyRepeat, choose_integer_scale, key_code, refresh_hz_from_millihz, scroll_event};
+    use super::{
+        KeyRepeat, choose_integer_scale, key_code, pointer_scroll_event, refresh_hz_from_millihz,
+        scroll_event,
+    };
     use crate::{
         event::{KeyCode, Modifiers, ScrollPhase, ScrollUnit},
         math::Point,
@@ -3400,5 +3344,99 @@ mod tests {
         assert_eq!(key_code(172), KeyCode::BrowserHome);
         assert_eq!(key_code(158), KeyCode::BrowserBack);
         assert_eq!(key_code(159), KeyCode::BrowserForward);
+    }
+
+    /// RBL-01：`wl_pointer::Event` → 纯逻辑事件的**机械翻译**逐变体钉住。
+    ///
+    /// `Dispatch::event` 需要真实 `wl_pointer` 代理 / `Connection`（单测无法构造），但协议事件
+    /// **值**可以直接构造：把翻译抽成 [`pointer_scroll_event`] 后，「v5–v7 的 `axis_discrete`
+    /// 真的被送进累积器」这一段就有了红灯（M-b 变异点），不再只能靠真机观察。
+    #[test]
+    fn pointer_scroll_events_are_translated_to_the_pure_scroll_enum() {
+        use wayland_client::{WEnum, protocol::wl_pointer};
+
+        use crate::platform::wayland::scroll::{ScrollAxis, ScrollEvent, ScrollSource};
+
+        assert_eq!(
+            pointer_scroll_event(&wl_pointer::Event::AxisSource {
+                axis_source: WEnum::Value(wl_pointer::AxisSource::Finger),
+            }),
+            Some(ScrollEvent::Source(ScrollSource::Finger)),
+            "finger 源必须映射到 ScrollSource::Finger（RBL-02 的手势源）"
+        );
+        assert_eq!(
+            pointer_scroll_event(&wl_pointer::Event::AxisSource {
+                axis_source: WEnum::Value(wl_pointer::AxisSource::WheelTilt),
+            }),
+            Some(ScrollEvent::Source(ScrollSource::Wheel)),
+            "wheel_tilt 是横向倾斜的滚轮 ⇒ 按滚轮"
+        );
+        assert_eq!(
+            pointer_scroll_event(&wl_pointer::Event::AxisSource {
+                axis_source: WEnum::Unknown(42),
+            }),
+            Some(ScrollEvent::Source(ScrollSource::Unknown)),
+            "未知枚举值必须降级成 Unknown（按滚轮），不得 panic"
+        );
+        assert_eq!(
+            pointer_scroll_event(&wl_pointer::Event::AxisDiscrete {
+                axis: WEnum::Value(wl_pointer::Axis::VerticalScroll),
+                discrete: 1,
+            }),
+            Some(ScrollEvent::Discrete {
+                axis: ScrollAxis::Vertical,
+                notches: 1,
+            }),
+            "axis_discrete 的 discrete 是格数，必须原样进 Discrete（v5–v7 唯一通路）"
+        );
+        assert_eq!(
+            pointer_scroll_event(&wl_pointer::Event::AxisValue120 {
+                axis: WEnum::Value(wl_pointer::Axis::VerticalScroll),
+                value120: 120,
+            }),
+            Some(ScrollEvent::Value120 {
+                axis: ScrollAxis::Vertical,
+                value120: 120,
+            })
+        );
+        assert_eq!(
+            pointer_scroll_event(&wl_pointer::Event::Axis {
+                time: 0,
+                axis: WEnum::Value(wl_pointer::Axis::HorizontalScroll),
+                value: 15.0,
+            }),
+            Some(ScrollEvent::Continuous {
+                axis: ScrollAxis::Horizontal,
+                value: 15.0,
+            }),
+            "水平轴必须保留（逐轴归一的前提）"
+        );
+        assert_eq!(
+            pointer_scroll_event(&wl_pointer::Event::AxisStop {
+                time: 0,
+                axis: WEnum::Value(wl_pointer::Axis::VerticalScroll),
+            }),
+            Some(ScrollEvent::Stop)
+        );
+        assert_eq!(
+            pointer_scroll_event(&wl_pointer::Event::Frame),
+            Some(ScrollEvent::Frame)
+        );
+    }
+
+    /// 非滚动事件不进滚动通路：`Dispatch` 的早期 `return` 只对滚动事件生效，motion / button
+    /// 必须继续走常规分支（否则光标和点击会消失）。
+    #[test]
+    fn non_scroll_pointer_events_are_not_translated() {
+        use wayland_client::protocol::wl_pointer;
+
+        assert_eq!(
+            pointer_scroll_event(&wl_pointer::Event::Motion {
+                time: 0,
+                surface_x: 0.0,
+                surface_y: 0.0,
+            }),
+            None
+        );
     }
 }
