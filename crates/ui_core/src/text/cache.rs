@@ -15,7 +15,7 @@ use std::{
 
 use ahash::AHasher;
 
-use super::{TextContent, shape::ShapedText};
+use super::{TextContent, color_bits, shape::ShapedText};
 
 /// 条目上限（§9.3 的「容量上限显式」）。
 ///
@@ -53,6 +53,19 @@ impl ShapeKey {
         text_hasher.write(content.text.as_bytes());
         let mut style_hasher = AHasher::default();
         content.style.hash_into(&mut style_hasher);
+        // v2.1 E2（§11.2）：`runs` 是 shaping 输入，且 run 的颜色/装饰被烘进 `ShapedLine`
+        // （逐 run 的 `ShapedGlyphRun.color`、`ShapedTextLine.decorations`）⇒ 必须进键。
+        // 只哈希 shaping 输入 + 被烘焙的绘制输入；run 的段落级字段（alignment 等）不参与。
+        content.runs().len().hash(&mut style_hasher);
+        for run in content.runs() {
+            run.range.start.hash(&mut style_hasher);
+            run.range.end.hash(&mut style_hasher);
+            run.style.hash_into(&mut style_hasher);
+            color_bits(run.style.color).hash(&mut style_hasher);
+        }
+        // 归一化计数决定 `ShapedText.inline_diagnostics`（`InvalidTextRun`）⇒ 必须进键，否则
+        // 「非法 runs 归一化后与合法 runs 相同」的内容会误命中一份没有诊断的快照。
+        content.normalized_runs().hash(&mut style_hasher);
         for inline in content.inline_boxes.iter() {
             inline.id.hash(&mut style_hasher);
             inline.index.hash(&mut style_hasher);
@@ -252,6 +265,7 @@ mod tests {
             size: Size::new(width, 8.0),
             baseline: None,
             align: InlineAlign::Baseline,
+            paint: None,
         };
         let content = |boxes: &[InlineBoxSpec]| {
             TextContent::new("ab cd", TextStyle::new(16.0)).with_inline_boxes(boxes.iter().copied())
@@ -271,6 +285,76 @@ mod tests {
         assert_ne!(one, two, "行内盒序列必须参与键");
         // 同一输入 ⇒ 同键（哈希不能把等价输入打散，否则缓存命中率归零）。
         assert_eq!(one, ShapeKey::new(&content(&[spec(1, 2, 8.0)]), 1));
+    }
+
+    /// v2.1 E2（`§11.2`）：`runs` 是 shaping 输入（逐 run 的字形形状）且 run 的颜色/装饰被烘进
+    /// `ShapedLine` ⇒ 必须进 `ShapeKey`。删掉 `ShapeKey::new` 里的 runs 哈希后本用例变红。
+    #[test]
+    fn shape_key_distinguishes_runs() {
+        use crate::{
+            paint::color::Color,
+            text::{TextDecoration, TextRun},
+        };
+
+        let plain = TextContent::new("abcdef", TextStyle::new(16.0));
+        let one = plain
+            .clone()
+            .with_runs([TextRun::new(0..3, TextStyle::new(16.0).with_weight(700))]);
+        let other_range = plain
+            .clone()
+            .with_runs([TextRun::new(1..4, TextStyle::new(16.0).with_weight(700))]);
+        let other_style = plain
+            .clone()
+            .with_runs([TextRun::new(0..3, TextStyle::new(16.0).with_weight(800))]);
+        let other_size = plain
+            .clone()
+            .with_runs([TextRun::new(0..3, TextStyle::new(18.0))]);
+        let colored = plain.clone().with_runs([TextRun::new(
+            0..3,
+            TextStyle::new(16.0).with_color(Color::WHITE),
+        )]);
+        let decorated = plain.clone().with_runs([TextRun::new(
+            0..3,
+            TextStyle::new(16.0).with_decoration(TextDecoration::underline(1.0)),
+        )]);
+        let two = plain.clone().with_runs([
+            TextRun::new(0..3, TextStyle::new(16.0).with_weight(700)),
+            TextRun::new(3..6, TextStyle::new(16.0).with_weight(800)),
+        ]);
+        // 同样的 run 序列 ⇒ 同一个键（哈希不能把等价输入打散）。
+        let same = plain
+            .clone()
+            .with_runs([TextRun::new(0..3, TextStyle::new(16.0).with_weight(700))]);
+
+        let base = ShapeKey::new(&plain, 1);
+        let one_key = ShapeKey::new(&one, 1);
+        assert_ne!(base, one_key, "有/无 runs 必须区分");
+        // 同一 run 数（1 个）下逐维比较：范围 / 样式 / 颜色 / 装饰任一变化都必须换键。
+        for (name, content) in [
+            ("range", &other_range),
+            ("weight", &other_style),
+            ("size", &other_size),
+            ("color", &colored),
+            ("decoration", &decorated),
+            ("run count", &two),
+        ] {
+            assert_ne!(
+                one_key,
+                ShapeKey::new(content, 1),
+                "{name} 必须参与形状缓存键"
+            );
+        }
+        assert_eq!(one_key, ShapeKey::new(&same, 1));
+        // 命中判据与键同源：run 不同 ⇒ `same_shaping_inputs` 必须失配。
+        let shaped = crate::text::shape::ShapedText::blank_for_text_test(
+            plain.text.clone(),
+            plain.style.clone(),
+        );
+        assert!(
+            shaped.same_shaping_inputs(&plain.style, plain.runs()),
+            "空 runs 的快照必须与空 runs 的内容同源"
+        );
+        assert!(!shaped.same_shaping_inputs(&plain.style, one.runs()));
     }
 
     #[test]

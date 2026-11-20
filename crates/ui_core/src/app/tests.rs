@@ -1669,6 +1669,7 @@ fn inline_boxes_changes_relayout() {
         size: crate::math::Size::new(20.0, 20.0),
         baseline: None,
         align: crate::text::InlineAlign::Baseline,
+        paint: None,
     };
     let node = {
         let w = app.window_mut(window).expect("window");
@@ -1688,6 +1689,7 @@ fn inline_boxes_changes_relayout() {
         size: crate::math::Size::new(40.0, 10.0),
         baseline: Some(8.0),
         align: crate::text::InlineAlign::Top,
+        paint: None,
     };
     {
         let tree = app.window_mut(window).expect("window").tree_mut();
@@ -1698,6 +1700,66 @@ fn inline_boxes_changes_relayout() {
     let pass = refresh(&mut app, window);
     assert_eq!(pass.shaped, 1, "inline boxes are part of the shape key");
     assert_eq!(text_layout(&mut app, window).laid, 1);
+}
+
+/// v2.1 E2b（审查 F11/F12）：`App::frame` 把行内盒图片缺失接成 `InlineBoxImageMissing`
+/// 诊断（D17 不静默）；同一 id 的重复帧由 `TextContext` 按值去重，环里始终只有一条。
+#[test]
+fn app_frame_reports_missing_inline_box_images_once() {
+    let (_rt, mut app) = new_app();
+    let window = app.create_window(WindowOptions::default());
+    let spec = crate::text::InlineBoxSpec {
+        id: 11,
+        index: 1,
+        size: crate::math::Size::new(16.0, 16.0),
+        baseline: None,
+        align: crate::text::InlineAlign::Baseline,
+        paint: Some(crate::text::InlineBoxPaint::Image {
+            resource: crate::resources::ResourceId::for_test(4242, 1),
+            modulation: crate::paint::color::Color::WHITE,
+        }),
+    };
+    {
+        let w = app.window_mut(window).expect("window");
+        let root = w.tree().root();
+        NodeBuilder::text("a b", crate::text::TextStyle::new(16.0))
+            .inline_boxes([spec])
+            .build(w.tree_mut(), root)
+            .expect("build");
+    }
+    let missing_count = |app: &App| {
+        app.text_diagnostics()
+            .iter()
+            .filter(|diagnostic| {
+                matches!(
+                    diagnostic,
+                    crate::text::TextDiagnostic::InlineBoxImageMissing { id: 11 }
+                )
+            })
+            .count()
+    };
+    let outcome = app.frame(window).expect("窗口存在").expect("帧成功");
+    assert!(matches!(outcome, FrameOutcome::Committed(_)));
+    assert_eq!(
+        missing_count(&app),
+        1,
+        "App::frame 必须把跳过的行内图片接成诊断：{:?}",
+        app.text_diagnostics()
+    );
+    let _ = app.frame(window).expect("窗口存在").expect("帧不报错");
+    assert_eq!(
+        missing_count(&app),
+        1,
+        "同一诊断按值去重，不随帧数增长：{:?}",
+        app.text_diagnostics()
+    );
+    assert!(
+        app.window(window)
+            .expect("window")
+            .inline_box_image_diagnostics()
+            .is_empty(),
+        "App 路径的文本诊断不写窗口级快照"
+    );
 }
 
 #[test]
@@ -1711,6 +1773,7 @@ fn bind_text_preserves_inline_boxes() {
         size: crate::math::Size::new(16.0, 16.0),
         baseline: None,
         align: crate::text::InlineAlign::Baseline,
+        paint: None,
     };
     let node = {
         let w = app.window_mut(window).expect("window");

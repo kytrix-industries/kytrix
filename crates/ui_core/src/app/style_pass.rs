@@ -87,6 +87,7 @@ pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePas
         store,
         graph,
         windows,
+        text,
         eval_stack,
         ..
     } = app;
@@ -183,13 +184,22 @@ pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePas
                 .text_content(node)
                 .is_none_or(|content| content.text != value);
             if changed {
-                // 只换 text/style，**保留** inline_boxes（N1 回归）。
+                // v2.1 E2（`§11.2`）：只换整段 text/style，**保留** runs 与 inline_boxes
+                // （静态载荷不被动态文本清空）。新文本更短时按新长度裁剪 / 丢弃越界 runs，
+                // 并压诊断 —— 不静默改变样式归属（`clip_runs_to_text` 的返回值就是被改动的
+                // run 数）。
                 let mut content = tree
                     .text_content(node)
                     .cloned()
                     .unwrap_or_else(|| TextContent::new(value.clone(), style.clone()));
                 content.text = value;
                 content.style = style;
+                let clipped_runs = content.clip_runs_to_text();
+                if clipped_runs > 0 {
+                    text.push_diagnostics(vec![crate::text::TextDiagnostic::TextRunClipped {
+                        runs: clipped_runs,
+                    }]);
+                }
                 tree.set_text_content(node, content);
                 text_changed += 1;
                 text_changed_here = true;
@@ -316,5 +326,139 @@ pub(crate) fn invalidate(app: &mut App, signal: SignalId) {
     if marked > 0 {
         // 批处理内只登记推迟位（最外层 `App::batch` 结束时合并成一次请求）。
         app.request_frame();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use smol_str::SmolStr;
+
+    use super::{App, refresh_styles};
+    use crate::{
+        node::builder::NodeBuilder,
+        text::{InlineAlign, InlineBoxSpec, TextRun, TextStyle},
+        window::WindowOptions,
+    };
+
+    fn new_app() -> (tokio::runtime::Runtime, App) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let app = App::new(runtime.handle().clone());
+        (runtime, app)
+    }
+
+    /// v2.1 E2（`§11.2`）：`bind_text` 只换整段文本，**保留** runs（静态载荷不被清空）。
+    #[test]
+    fn bind_text_preserves_runs() {
+        use crate::paint::color::Color;
+
+        let (_runtime, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        let signal = app.signal(SmolStr::new_static("abcdef"));
+        let bold = TextStyle::new(16.0).with_weight(700);
+        let red = TextStyle::new(16.0).with_color(Color::WHITE);
+        let node = {
+            let w = app.window_mut(window).expect("window");
+            let root = w.tree().root();
+            NodeBuilder::text("abcdef", TextStyle::new(16.0))
+                .runs([
+                    TextRun::new(0..2, bold.clone()),
+                    TextRun::new(2..6, red.clone()),
+                ])
+                .bind_text(move |cx| cx.read(&signal).clone())
+                .build(w.tree_mut(), root)
+                .expect("build")
+        };
+        let _ = refresh_styles(&mut app, window);
+        let content = app
+            .window(window)
+            .expect("window")
+            .tree()
+            .text_content(node)
+            .expect("text")
+            .clone();
+        assert_eq!(content.runs().len(), 2, "runs 在 bind_text 后必须保留");
+        assert_eq!(content.runs()[0].range, 0..2);
+        assert_eq!(content.runs()[0].style, bold);
+        assert_eq!(content.runs()[1].range, 2..6);
+        assert_eq!(content.runs()[1].style, red);
+    }
+
+    /// v2.1 E2：新文本更短时按新长度裁剪 runs（不越界），并压 `TextRunClipped` 诊断
+    /// （不静默改变样式归属）。
+    #[test]
+    fn bind_text_crops_runs_to_the_new_text_and_diagnoses() {
+        let (_runtime, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        let signal = app.signal(SmolStr::new_static("abcdef"));
+        let bold = TextStyle::new(16.0).with_weight(700);
+        let node = {
+            let w = app.window_mut(window).expect("window");
+            let root = w.tree().root();
+            NodeBuilder::text("abcdef", TextStyle::new(16.0))
+                .runs([TextRun::new(0..2, bold.clone()), TextRun::new(2..6, bold)])
+                .bind_text(move |cx| cx.read(&signal).clone())
+                .build(w.tree_mut(), root)
+                .expect("build")
+        };
+        let _ = refresh_styles(&mut app, window);
+        app.write(&signal, SmolStr::new_static("abc"));
+        let _ = refresh_styles(&mut app, window);
+        let content = app
+            .window(window)
+            .expect("window")
+            .tree()
+            .text_content(node)
+            .expect("text")
+            .clone();
+        assert_eq!(content.text, "abc");
+        assert_eq!(content.runs().len(), 2, "裁剪保留 run（只内收区间）");
+        assert_eq!(content.runs()[1].range, 2..3, "越界端点按新文本内收");
+        assert!(
+            app.text_diagnostics().iter().any(|diagnostic| matches!(
+                diagnostic,
+                crate::text::TextDiagnostic::TextRunClipped { runs } if *runs == 1
+            )),
+            "裁剪必须可观测：{:?}",
+            app.text_diagnostics()
+        );
+    }
+
+    /// v2.1 E2：inline_boxes 与 runs 在同一段文本上共存（静态载荷不互相覆盖）。
+    #[test]
+    fn bind_text_preserves_runs_and_inline_boxes_together() {
+        let (_runtime, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        let signal = app.signal(SmolStr::new_static("a b"));
+        let spec = InlineBoxSpec {
+            id: 9,
+            index: 2,
+            size: crate::math::Size::new(8.0, 8.0),
+            baseline: None,
+            align: InlineAlign::Baseline,
+            paint: None,
+        };
+        let node = {
+            let w = app.window_mut(window).expect("window");
+            let root = w.tree().root();
+            NodeBuilder::text("a b", TextStyle::new(16.0))
+                .runs([TextRun::new(0..1, TextStyle::new(16.0).with_weight(700))])
+                .inline_boxes([spec])
+                .bind_text(move |cx| cx.read(&signal).clone())
+                .build(w.tree_mut(), root)
+                .expect("build")
+        };
+        let _ = refresh_styles(&mut app, window);
+        let content = app
+            .window(window)
+            .expect("window")
+            .tree()
+            .text_content(node)
+            .expect("text")
+            .clone();
+        assert_eq!(content.text, "a b");
+        assert_eq!(content.runs().len(), 1);
+        assert_eq!(content.inline_boxes.len(), 1);
     }
 }

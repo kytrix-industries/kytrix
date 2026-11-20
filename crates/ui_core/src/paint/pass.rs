@@ -23,8 +23,8 @@ use crate::{
     paint::{
         color::Color,
         primitive::{
-            ClipOp, ClipRect, GeometryDraw, GlyphRun, Gradient, PositionedGlyph, Primitive, Quad,
-            QuadPaint, Shadow,
+            ClipOp, ClipRect, GeometryDraw, GlyphRun, Gradient, Image, PositionedGlyph, Primitive,
+            Quad, QuadPaint, Shadow,
         },
         scene::{LaneId, Scene},
         style::{Clip, PaintSpec, StylePatch},
@@ -33,7 +33,8 @@ use crate::{
         AtlasAllocator,
         damage::{DamageAccumulator, DamageSummary},
     },
-    text::{ShapedLine, ShapedTextItem},
+    resources::ResourceCache,
+    text::{InlineBoxPaint, ShapedLine, ShapedTextItem},
 };
 
 /// 一帧的 lane 重建/复用。字段是 crate 内可见（`pub(crate)` 结构的 `pub` 字段不触发 lint）。
@@ -62,6 +63,10 @@ pub(crate) struct PaintPass<'a> {
     /// E1d（F15 方案①）：Canvas 内已经写入的 tile 用 [`AtlasAllocator::is_alive`] 逐 tile 校验
     /// （代际 + 槽位分配身份），把「逐 tile 淘汰不换代」这类失效也拦在编码前。
     pub atlas: Option<&'a AtlasAllocator>,
+    /// 图片资源缓存（v2.1 E2）：`InlineBoxPaint::Image` 在 paint 阶段解析
+    /// `ResourceId → ResourceImage.tile`（`§11.2`）。`None` = 无 App 的 headless/测试路径：
+    /// 带图片声明的行内盒**跳过**（不画占位图）并计入 `PaintReport::skipped_inline_images`。
+    pub resources: Option<&'a ResourceCache>,
     /// 本帧的**滚动槽表**（槽位 → （逻辑滚动位移，物理视口））。
     ///
     /// 全量路径每帧重写它：下标 0 恒是「不随滚动偏移」的哨兵（偏移 0、零面积视口），
@@ -113,6 +118,10 @@ pub(crate) struct PaintReport {
     /// `App::frame`（压 [`crate::text::TextDiagnostic::CanvasTextStale`]）与
     /// `test_support::record::FrameRecord::stale_canvas_runs`（帧记录）。
     pub stale_canvas_runs: usize,
+    /// v2.1 E2（`§11.2`）：行内盒图片因资源未加载 / 已卸载而被**跳过**的 `InlineBoxSpec::id`
+    /// （本帧不画占位图）。消费者：`App::frame` 压 `TextDiagnostic::InlineBoxImageMissing`；
+    /// 测试直接断言该列表。
+    pub skipped_inline_images: SmallVec<[u64; 4]>,
     /// 本帧编码出的实例数（仅 `test-support`；`Window::paint_frame` 编码后回填）。
     #[cfg(feature = "test-support")]
     pub instances: usize,
@@ -196,8 +205,10 @@ impl PaintPass<'_> {
             scroll_slot_nodes,
             focused: self.focused,
             atlas: self.atlas,
+            resources: self.resources,
             stale_text: SmallVec::new(),
             stale_canvas_runs: 0,
+            skipped_inline_images: SmallVec::new(),
             #[cfg(feature = "test-support")]
             log,
             rebuilt: 0,
@@ -240,6 +251,7 @@ impl PaintPass<'_> {
             damage,
             stale_text: context.stale_text,
             stale_canvas_runs: context.stale_canvas_runs,
+            skipped_inline_images: context.skipped_inline_images,
             #[cfg(feature = "test-support")]
             instances: 0,
             #[cfg(feature = "test-support")]
@@ -283,6 +295,10 @@ struct PaintContext<'a> {
     stale_text: SmallVec<[NodeId; 4]>,
     /// Canvas 内含已失效 tile、本帧未编码的字形 run 数（D-5 的 canvas 半边，E1b/E1d）。
     stale_canvas_runs: usize,
+    /// 行内盒图片被跳过的 id（v2.1 E2，`§11.2`）。
+    skipped_inline_images: SmallVec<[u64; 4]>,
+    /// 图片资源缓存（`InlineBoxPaint::Image` 解析；`None` = headless 路径跳过并记诊断）。
+    resources: Option<&'a ResourceCache>,
     #[cfg(feature = "test-support")]
     log: PaintLog,
     rebuilt: usize,
@@ -1746,37 +1762,170 @@ impl PrimitiveEmitter {
             self.bounds.origin.x + self.content_offset.x,
             self.bounds.origin.y + self.content_offset.y,
         );
+        // v2.1 E2：行内盒的绘制声明（按 `id` 与 `ShapedInlineBox` 配对；两者顺序同源，
+        // 但 id 是应用句柄、更稳）。只在有行内盒时分配。
+        let inline_paints: SmallVec<[(u64, Option<InlineBoxPaint>); 4]> = context
+            .tree
+            .text_content(self.node)
+            .map(|content| {
+                content
+                    .inline_boxes
+                    .iter()
+                    .map(|spec| (spec.id, spec.paint))
+                    .collect()
+            })
+            .unwrap_or_default();
         for shaped_line in &line.lines {
             for item in &shaped_line.items {
-                let ShapedTextItem::GlyphRun(run) = item else {
-                    continue;
-                };
-                if run.glyphs.is_empty() {
-                    continue;
+                match item {
+                    ShapedTextItem::GlyphRun(run) => {
+                        if run.glyphs.is_empty() {
+                            continue;
+                        }
+                        let mut glyphs = Vec::with_capacity(run.glyphs.len());
+                        let mut glyph_bounds = Rect::default();
+                        for glyph in &run.glyphs {
+                            let position = Point::new(
+                                origin.x + glyph.position.x,
+                                origin.y + glyph.position.y,
+                            );
+                            let rect = Rect::from_origin_size(position, glyph.size);
+                            glyph_bounds = glyph_bounds.union(rect);
+                            glyphs.push(PositionedGlyph {
+                                tile: glyph.tile,
+                                position,
+                                size: glyph.size,
+                            });
+                        }
+                        // v2.1 E2：`run.color` 来自 shaping 期的 parley 画刷（逐 run 样式），
+                        // `bind_style.foreground` 覆盖时整段统一（与单 run 的旧语义一致）。
+                        let color = self
+                            .patch
+                            .foreground
+                            .unwrap_or(run.color)
+                            .with_opacity(opacity);
+                        if color.is_transparent() {
+                            continue;
+                        }
+                        self.push(context, Primitive::GlyphRun(GlyphRun { color, glyphs }));
+                        self.push_damage(context, glyph_bounds, 0.0);
+                    }
+                    ShapedTextItem::InlineBox(inline) => {
+                        let paint = inline_paints
+                            .iter()
+                            .find(|(id, _)| *id == inline.id)
+                            .and_then(|(_, paint)| *paint);
+                        self.emit_inline_box(
+                            context,
+                            inline.rect,
+                            inline.id,
+                            paint,
+                            origin,
+                            opacity,
+                        );
+                    }
                 }
-                let mut glyphs = Vec::with_capacity(run.glyphs.len());
-                let mut glyph_bounds = Rect::default();
-                for glyph in &run.glyphs {
-                    let position =
-                        Point::new(origin.x + glyph.position.x, origin.y + glyph.position.y);
-                    let rect = Rect::from_origin_size(position, glyph.size);
-                    glyph_bounds = glyph_bounds.union(rect);
-                    glyphs.push(PositionedGlyph {
-                        tile: glyph.tile,
-                        position,
-                        size: glyph.size,
-                    });
-                }
+            }
+            // v2.1 E2（`§11.2`）：文本装饰 = 普通 `Quad`（不进 shader），在字形/行内盒之上绘制。
+            // 不参与布局：几何来自 shaping 期烘好的 `ShapedTextLine::decorations`。
+            for decoration in &shaped_line.decorations {
                 let color = self
                     .patch
                     .foreground
-                    .unwrap_or(run.color)
+                    .unwrap_or(decoration.color)
                     .with_opacity(opacity);
-                if color.is_transparent() {
+                if color.is_transparent()
+                    || decoration.rect.size.width <= 0.0
+                    || decoration.rect.size.height <= 0.0
+                {
                     continue;
                 }
-                self.push(context, Primitive::GlyphRun(GlyphRun { color, glyphs }));
-                self.push_damage(context, glyph_bounds, 0.0);
+                let bounds = decoration.rect.translate(origin);
+                self.push(
+                    context,
+                    Primitive::Quad(Quad {
+                        bounds,
+                        corner_radius: [0.0; 4],
+                        paint: QuadPaint::Solid {
+                            fill: color,
+                            border: None,
+                        },
+                    }),
+                );
+                self.push_damage(context, bounds, 0.0);
+            }
+        }
+    }
+
+    /// 行内盒的引擎绘制（v2.1 E2，`§11.2`）：`Quad` 直接编码；`Image` 经 `ResourceCache` 解析
+    /// `ResourceId → ResourceImage.tile`，资源缺失时**跳过并记诊断**（不画占位图、不 panic）。
+    ///
+    /// `paint = None` = 只算落点、不绘制（E1 的现状语义）。
+    fn emit_inline_box(
+        &mut self,
+        context: &mut PaintContext<'_>,
+        rect: Rect,
+        id: u64,
+        paint: Option<InlineBoxPaint>,
+        origin: Point,
+        opacity: f32,
+    ) {
+        let bounds = rect.translate(origin);
+        if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+            return;
+        }
+        match paint {
+            None => {}
+            Some(InlineBoxPaint::Quad {
+                color,
+                corner_radius,
+            }) => {
+                let color = color.with_opacity(opacity);
+                if color.is_transparent() {
+                    return;
+                }
+                self.push(
+                    context,
+                    Primitive::Quad(Quad {
+                        bounds,
+                        corner_radius,
+                        paint: QuadPaint::Solid {
+                            fill: color,
+                            border: None,
+                        },
+                    }),
+                );
+                self.push_damage(context, bounds, 0.0);
+            }
+            Some(InlineBoxPaint::Image {
+                resource,
+                modulation,
+            }) => {
+                let image = context
+                    .resources
+                    .and_then(|resources| resources.image(resource));
+                let Some(image) = image else {
+                    // 资源未加载 / 已卸载：跳过图元并记录 id（`App::frame` 压
+                    // `TextDiagnostic::InlineBoxImageMissing`）。headless 路径（无 ResourceCache）
+                    // 同样跳过 —— 没有资源就没有可画的 tile。
+                    if !context.skipped_inline_images.contains(&id) {
+                        context.skipped_inline_images.push(id);
+                    }
+                    return;
+                };
+                let modulation = modulation.with_opacity(opacity);
+                if modulation.is_transparent() {
+                    return;
+                }
+                self.push(
+                    context,
+                    Primitive::Image(Image {
+                        bounds,
+                        tile: image.tile,
+                        modulation,
+                    }),
+                );
+                self.push_damage(context, bounds, 0.0);
             }
         }
     }
@@ -1784,6 +1933,8 @@ impl PrimitiveEmitter {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use super::PaintPass;
     use crate::{
         math::{PhysicalRect, Point, Rect, Scale},
@@ -1797,6 +1948,10 @@ mod tests {
             style::{Clip, PaintSpec, ShadowSpec, Style, StylePatch},
         },
         render::damage::DamageAccumulator,
+        text::{
+            InlineAlign, InlineBoxPaint, InlineBoxSpec, ShapedDecoration, ShapedGlyphRun,
+            ShapedInlineBox, ShapedLine, ShapedTextItem, ShapedTextLine, TextContent, TextStyle,
+        },
     };
 
     fn scale() -> Scale {
@@ -1817,6 +1972,8 @@ mod tests {
         /// D-5 / E1d：绘制前图集校验的注入点（None = 不校验；Some = 编码期逐 tile 用
         /// `AtlasAllocator::is_alive` 判活）。
         atlas: Option<crate::render::AtlasAllocator>,
+        /// v2.1 E2：行内盒图片解析用的资源缓存（`None` = 跳过图片并记 `skipped_inline_images`）。
+        resources: Option<crate::resources::ResourceCache>,
         /// 几何注册表（几何节点的块 lane 测试用；X5）。
         geometry: crate::paint::geometry_store::GeometryStore,
     }
@@ -1831,6 +1988,7 @@ mod tests {
                 scroll_slots: Vec::new(),
                 scroll_slot_nodes: Vec::new(),
                 atlas: None,
+                resources: None,
                 geometry: crate::paint::geometry_store::GeometryStore::new(),
             }
         }
@@ -1849,6 +2007,7 @@ mod tests {
                 order: &mut self.order,
                 focused: None,
                 atlas: self.atlas.as_ref(),
+                resources: self.resources.as_ref(),
                 scroll_slots: &mut self.scroll_slots,
                 scroll_slot_nodes: &mut self.scroll_slot_nodes,
                 #[cfg(feature = "test-support")]
@@ -1880,6 +2039,7 @@ mod tests {
                 order: &mut self.order,
                 focused: None,
                 atlas: self.atlas.as_ref(),
+                resources: self.resources.as_ref(),
                 scroll_slots: &mut self.scroll_slots,
                 scroll_slot_nodes: &mut self.scroll_slot_nodes,
                 #[cfg(feature = "test-support")]
@@ -2373,6 +2533,477 @@ mod tests {
             lane_primitives(&h, geometry).first(),
             Some(Primitive::Geometry(_))
         ));
+    }
+
+    /// v2.1 E2：一个最小的 1×1 RGBA PNG（`ResourceCache::insert` 的真实解码路径）。
+    const ONE_PIXEL_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    fn glyph_tile() -> crate::paint::atlas::AtlasTile {
+        crate::paint::atlas::AtlasTile {
+            atlas: crate::paint::atlas::AtlasKind::Glyph,
+            page: 0,
+            u0: 0.0,
+            v0: 0.0,
+            u1: 1.0,
+            v1: 1.0,
+            generation: 1,
+            slot: 0,
+            slot_epoch: 0,
+        }
+    }
+
+    fn glyph_run(color: Color, text_range: core::ops::Range<usize>, x: f32) -> ShapedGlyphRun {
+        ShapedGlyphRun {
+            color,
+            text_range,
+            glyphs: vec![crate::paint::primitive::PositionedGlyph {
+                tile: glyph_tile(),
+                position: Point::new(x, 2.0),
+                size: crate::math::Size::new(8.0, 8.0),
+            }],
+        }
+    }
+
+    fn shaped_line(items: Vec<ShapedTextItem>, decorations: Vec<ShapedDecoration>) -> ShapedLine {
+        ShapedLine {
+            text: smol_str::SmolStr::new_static("ab"),
+            lines: vec![ShapedTextLine {
+                text_range: 0..2,
+                baseline: 12.0,
+                line_height: 16.0,
+                advance: 20.0,
+                items,
+                decorations,
+            }],
+            width: 20.0,
+            height: 16.0,
+            first_baseline: Some(12.0),
+            atlas_generation: 0,
+            font_stack_version: 1,
+            scale: 1.0,
+        }
+    }
+
+    /// 挂一个文本节点并注入 `ShapedLine`（paint 只消费快照，不跑 text pass）。
+    fn spawn_text(h: &mut Harness, content: TextContent, line: ShapedLine) -> NodeId {
+        let root = h.tree.root();
+        let node = NodeBuilder::text(content.text.clone(), content.style.clone())
+            .style(fixed_style(50.0, 20.0))
+            .build(&mut h.tree, root)
+            .expect("text node");
+        let content_for_shaping = content.clone();
+        assert!(h.tree.set_text_content(node, content), "text content");
+        assert!(
+            h.tree
+                .install_text_line_for_test(node, &content_for_shaping, Rc::new(line), 20.0),
+            "text line"
+        );
+        layout_all(&mut h.tree);
+        node
+    }
+
+    fn text_origin(h: &Harness, node: NodeId) -> Point {
+        h.tree.get(node).expect("node").layout().bounds.origin
+    }
+
+    /// v2.1 E2：多 run 文本按 run 逐段编码，颜色取各 run（不新增 `Primitive` 变体）；`bind_style`
+    /// 的 `foreground` 仍整段覆盖。
+    #[test]
+    fn multi_run_text_encodes_each_run_with_its_color() {
+        let red = Color::Srgb {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            alpha: 1.0,
+        };
+        let blue = Color::Srgb {
+            r: 0.0,
+            g: 0.0,
+            b: 1.0,
+            alpha: 1.0,
+        };
+        let green = Color::Srgb {
+            r: 0.0,
+            g: 1.0,
+            b: 0.0,
+            alpha: 1.0,
+        };
+        let mut h = Harness::new();
+        let node = spawn_text(
+            &mut h,
+            TextContent::new("ab", TextStyle::new(16.0)),
+            shaped_line(
+                vec![
+                    ShapedTextItem::GlyphRun(glyph_run(red, 0..1, 0.0)),
+                    ShapedTextItem::GlyphRun(glyph_run(blue, 1..2, 8.0)),
+                ],
+                Vec::new(),
+            ),
+        );
+        let report = h.paint();
+        let primitives = lane_primitives(&h, node);
+        let runs: Vec<&Primitive> = primitives
+            .iter()
+            .filter(|primitive| matches!(primitive, Primitive::GlyphRun(_)))
+            .collect();
+        assert_eq!(runs.len(), 2, "每个 TextRun 一段 GlyphRun：{primitives:?}");
+        let colors: Vec<Color> = runs
+            .iter()
+            .map(|primitive| match primitive {
+                Primitive::GlyphRun(run) => run.color,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(colors, vec![red, blue], "逐 run 颜色必须分别编码");
+        assert!(report.rebuilt > 0);
+        // `foreground` 覆盖仍整段生效（旧语义）。
+        assert!(h.tree.set_style_patch(
+            node,
+            StylePatch {
+                foreground: Some(green),
+                ..StylePatch::default()
+            }
+        ));
+        h.mark_paint(node);
+        let _ = h.paint();
+        for primitive in lane_primitives(&h, node) {
+            if let Primitive::GlyphRun(run) = primitive {
+                assert_eq!(run.color, green, "foreground 覆盖逐 run 颜色");
+            }
+        }
+    }
+
+    /// v2.1 E2（`§11.2`）：文本装饰 = 普通 `Quad`，几何 = shaping 期算好的局部矩形 + 文本盒原点。
+    #[test]
+    fn text_decorations_are_encoded_as_quads_at_their_geometry() {
+        let underline_color = Color::Srgb {
+            r: 0.2,
+            g: 0.4,
+            b: 0.8,
+            alpha: 1.0,
+        };
+        let strike_color = Color::Srgb {
+            r: 0.8,
+            g: 0.2,
+            b: 0.2,
+            alpha: 1.0,
+        };
+        let under = Rect::new(1.0, 14.5, 10.0, 1.0);
+        let strike = Rect::new(11.0, 8.0, 6.0, 2.0);
+        let mut h = Harness::new();
+        let node = spawn_text(
+            &mut h,
+            TextContent::new("ab", TextStyle::new(16.0)),
+            shaped_line(
+                vec![ShapedTextItem::GlyphRun(glyph_run(Color::BLACK, 0..2, 0.0))],
+                vec![
+                    ShapedDecoration {
+                        rect: under,
+                        color: underline_color,
+                    },
+                    ShapedDecoration {
+                        rect: strike,
+                        color: strike_color,
+                    },
+                ],
+            ),
+        );
+        let origin = text_origin(&h, node);
+        let report = h.paint();
+        let quads: Vec<Primitive> = lane_primitives(&h, node)
+            .into_iter()
+            .filter(|primitive| matches!(primitive, Primitive::Quad(_)))
+            .collect();
+        assert_eq!(quads.len(), 2, "每条装饰一个 Quad：{quads:?}");
+        let expected = [(under, underline_color), (strike, strike_color)];
+        for (index, primitive) in quads.iter().enumerate() {
+            let Primitive::Quad(quad) = primitive else {
+                unreachable!()
+            };
+            assert_eq!(
+                quad.bounds,
+                expected[index].0.translate(origin),
+                "装饰 Quad 的 bounds = 局部矩形 + 文本盒原点"
+            );
+            assert_eq!(quad.corner_radius, [0.0; 4]);
+            let QuadPaint::Solid { fill, border } = &quad.paint else {
+                panic!("装饰必须是实色 Quad");
+            };
+            assert_eq!(*fill, expected[index].1);
+            assert!(border.is_none(), "装饰没有边框");
+        }
+        assert!(report.rebuilt > 0);
+    }
+
+    /// v2.1 E2b（审查 F6，变异 M5 的守护）：`StylePatch::foreground` 同时覆盖**字形颜色与
+    /// 装饰线色**（含显式 `TextDecoration::color`）；`foreground` 缺省时装饰跟 shaping 期
+    /// 解析出的颜色（显式线色 > 兜底文本色，见 `decoration_segments`）。
+    #[test]
+    fn foreground_overrides_glyph_and_decoration_colors() {
+        let text_color = Color::Srgb {
+            r: 0.1,
+            g: 0.1,
+            b: 0.1,
+            alpha: 1.0,
+        };
+        let explicit_line = Color::Srgb {
+            r: 0.9,
+            g: 0.8,
+            b: 0.1,
+            alpha: 1.0,
+        };
+        let foreground = Color::Srgb {
+            r: 0.0,
+            g: 0.7,
+            b: 0.2,
+            alpha: 1.0,
+        };
+        let mut h = Harness::new();
+        let node = spawn_text(
+            &mut h,
+            TextContent::new("ab", TextStyle::new(16.0).with_color(text_color)),
+            shaped_line(
+                vec![ShapedTextItem::GlyphRun(glyph_run(text_color, 0..2, 0.0))],
+                vec![
+                    // `color = None` 的装饰：shaping 期解析为该 run 的文本色。
+                    ShapedDecoration {
+                        rect: Rect::new(0.0, 14.5, 10.0, 1.0),
+                        color: text_color,
+                    },
+                    // 显式 `TextDecoration::color`：随 shaping 期烘焙进 `ShapedDecoration.color`。
+                    ShapedDecoration {
+                        rect: Rect::new(10.0, 8.0, 10.0, 1.0),
+                        color: explicit_line,
+                    },
+                ],
+            ),
+        );
+        let decoration_fills = |h: &Harness| -> Vec<Color> {
+            lane_primitives(h, node)
+                .into_iter()
+                .filter_map(|primitive| match primitive {
+                    Primitive::Quad(quad) => match quad.paint {
+                        QuadPaint::Solid { fill, .. } => Some(fill),
+                        QuadPaint::Gradient(_) => None,
+                    },
+                    _ => None,
+                })
+                .collect()
+        };
+        let glyph_colors = |h: &Harness| -> Vec<Color> {
+            lane_primitives(h, node)
+                .into_iter()
+                .filter_map(|primitive| match primitive {
+                    Primitive::GlyphRun(run) => Some(run.color),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // 1) 无 `foreground`：装饰跟随 shaping 期颜色（文本色 / 显式线色），字形跟随 run 颜色。
+        let _ = h.paint();
+        assert_eq!(decoration_fills(&h), vec![text_color, explicit_line]);
+        assert_eq!(glyph_colors(&h), vec![text_color]);
+
+        // 2) `foreground` 覆盖：字形与两条装饰线（含显式线色）统一为 foreground。
+        assert!(h.tree.set_style_patch(
+            node,
+            StylePatch {
+                foreground: Some(foreground),
+                ..StylePatch::default()
+            }
+        ));
+        h.mark_paint(node);
+        let _ = h.paint();
+        assert_eq!(
+            decoration_fills(&h),
+            vec![foreground, foreground],
+            "foreground 必须覆盖装饰线色（含显式 TextDecoration::color）"
+        );
+        assert_eq!(
+            glyph_colors(&h),
+            vec![foreground],
+            "foreground 必须覆盖字形颜色"
+        );
+
+        // 3) foreground 与 style.color 相同 ⇒ 等价于「foreground = None 时跟 style.color」：
+        //    显式线色仍然被覆盖（foreground 优先级高于装饰自带颜色）。
+        assert!(h.tree.set_style_patch(
+            node,
+            StylePatch {
+                foreground: Some(text_color),
+                ..StylePatch::default()
+            }
+        ));
+        h.mark_paint(node);
+        let _ = h.paint();
+        assert_eq!(decoration_fills(&h), vec![text_color, text_color]);
+        assert_eq!(glyph_colors(&h), vec![text_color]);
+    }
+
+    /// v2.1 E2：`InlineBoxPaint::Quad` 按落点矩形绘制；`paint = None` 只保留落点、不绘制。
+    #[test]
+    fn inline_box_quad_paint_uses_the_landing_rect() {
+        let fill = Color::Srgb {
+            r: 0.1,
+            g: 0.1,
+            b: 0.1,
+            alpha: 1.0,
+        };
+        let spec = |id: u64, index: usize, paint: Option<InlineBoxPaint>| InlineBoxSpec {
+            id,
+            index,
+            size: crate::math::Size::new(12.0, 12.0),
+            baseline: None,
+            align: InlineAlign::Baseline,
+            paint,
+        };
+        let content = TextContent::new("a b", TextStyle::new(16.0)).with_inline_boxes([
+            spec(
+                7,
+                1,
+                Some(InlineBoxPaint::Quad {
+                    color: fill,
+                    corner_radius: [2.0, 3.0, 4.0, 5.0],
+                }),
+            ),
+            spec(8, 2, None),
+        ]);
+        let boxes = [
+            ShapedInlineBox {
+                id: 7,
+                rect: Rect::new(4.0, 0.0, 12.0, 12.0),
+                baseline: None,
+            },
+            ShapedInlineBox {
+                id: 8,
+                rect: Rect::new(20.0, 0.0, 12.0, 12.0),
+                baseline: None,
+            },
+        ];
+        let mut h = Harness::new();
+        let node = spawn_text(
+            &mut h,
+            content,
+            shaped_line(
+                vec![
+                    ShapedTextItem::InlineBox(boxes[0]),
+                    ShapedTextItem::InlineBox(boxes[1]),
+                ],
+                Vec::new(),
+            ),
+        );
+        let origin = text_origin(&h, node);
+        let _ = h.paint();
+        let quads: Vec<Primitive> = lane_primitives(&h, node)
+            .into_iter()
+            .filter(|primitive| matches!(primitive, Primitive::Quad(_)))
+            .collect();
+        assert_eq!(quads.len(), 1, "只有 paint = Some 的行内盒绘制：{quads:?}");
+        let Primitive::Quad(quad) = &quads[0] else {
+            unreachable!()
+        };
+        assert_eq!(quad.bounds, boxes[0].rect.translate(origin));
+        assert_eq!(quad.corner_radius, [2.0, 3.0, 4.0, 5.0]);
+    }
+
+    /// v2.1 E2：`InlineBoxPaint::Image` 经 `ResourceCache` 解析 tile；资源卸载后跳过图元并记
+    /// `PaintReport::skipped_inline_images`（不画占位图、不 panic）。
+    #[test]
+    fn inline_box_image_paint_resolves_tiles_and_skips_missing_resources() {
+        let mut resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
+        let image = resources
+            .insert(ONE_PIXEL_PNG)
+            .expect("1×1 PNG 必须解码成功");
+        let spec = |id: u64, paint: InlineBoxPaint| InlineBoxSpec {
+            id,
+            index: 1,
+            size: crate::math::Size::new(8.0, 8.0),
+            baseline: None,
+            align: InlineAlign::Baseline,
+            paint: Some(paint),
+        };
+        let content = TextContent::new("a b", TextStyle::new(16.0)).with_inline_boxes([
+            spec(
+                5,
+                InlineBoxPaint::Image {
+                    resource: image.id,
+                    modulation: Color::WHITE,
+                },
+            ),
+            // 未加载的句柄：`ResourceId::for_test` 的代际不命中任何存活条目。
+            spec(
+                6,
+                InlineBoxPaint::Image {
+                    resource: crate::resources::ResourceId::for_test(99, 1),
+                    modulation: Color::WHITE,
+                },
+            ),
+        ]);
+        let boxes = [
+            ShapedInlineBox {
+                id: 5,
+                rect: Rect::new(2.0, 1.0, 8.0, 8.0),
+                baseline: None,
+            },
+            ShapedInlineBox {
+                id: 6,
+                rect: Rect::new(14.0, 1.0, 8.0, 8.0),
+                baseline: None,
+            },
+        ];
+        let mut h = Harness::new();
+        h.resources = Some(resources);
+        let node = spawn_text(
+            &mut h,
+            content,
+            shaped_line(
+                vec![
+                    ShapedTextItem::GlyphRun(glyph_run(Color::BLACK, 0..2, 0.0)),
+                    ShapedTextItem::InlineBox(boxes[0]),
+                    ShapedTextItem::InlineBox(boxes[1]),
+                ],
+                Vec::new(),
+            ),
+        );
+        let origin = text_origin(&h, node);
+        let report = h.paint();
+        let images: Vec<Primitive> = lane_primitives(&h, node)
+            .into_iter()
+            .filter(|primitive| matches!(primitive, Primitive::Image(_)))
+            .collect();
+        assert_eq!(images.len(), 1, "只有已加载的资源绘制：{images:?}");
+        let Primitive::Image(primed) = &images[0] else {
+            unreachable!()
+        };
+        assert_eq!(primed.tile, image.tile, "tile 必须来自 ResourceImage");
+        assert_eq!(primed.bounds, boxes[0].rect.translate(origin));
+        assert_eq!(primed.modulation, Color::WHITE);
+        assert_eq!(report.skipped_inline_images.as_slice(), &[6]);
+
+        // 卸载 → 下一帧跳过、记诊断；不产生 Image，也不 panic。
+        let mut cache = h.resources.take().expect("resources");
+        assert!(cache.unload(image.id));
+        h.resources = Some(cache);
+        h.mark_paint(node);
+        let report = h.paint();
+        assert!(
+            lane_primitives(&h, node)
+                .iter()
+                .all(|primitive| !matches!(primitive, Primitive::Image(_))),
+            "资源卸载后不得编码旧 tile"
+        );
+        assert_eq!(
+            report.skipped_inline_images.as_slice(),
+            &[5, 6],
+            "已卸载 + 未加载的图片都要可观测"
+        );
     }
 
     #[test]

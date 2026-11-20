@@ -268,6 +268,9 @@ impl SimpleShaped {
                 text_range: 0..text.len(),
                 glyphs,
             })],
+            // 快速路径只接「无 runs 且无装饰」的纯数字文本（`TextContext::shape_cached` 前置
+            // 拒绝富文本）⇒ 没有装饰几何。
+            decorations: Vec::new(),
         };
         Ok(ShapedLine {
             text,

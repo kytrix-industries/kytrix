@@ -146,6 +146,7 @@ mod tests {
             size: Size::new(10.0, 10.0),
             baseline: None,
             align: InlineAlign::Baseline,
+            paint: None,
         }
     }
 

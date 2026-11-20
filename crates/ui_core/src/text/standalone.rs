@@ -345,6 +345,7 @@ mod tests {
                 size: Size::new(12.0, 12.0),
                 baseline: None,
                 align: InlineAlign::Baseline,
+                paint: None,
             },
             InlineBoxSpec {
                 id: 9,
@@ -352,6 +353,7 @@ mod tests {
                 size: Size::new(8.0, 8.0),
                 baseline: Some(1.0),
                 align: InlineAlign::Middle,
+                paint: None,
             },
         ];
         let handle = app

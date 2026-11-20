@@ -720,6 +720,13 @@ pub struct Window {
     /// 最近一帧的调度/绘制记录（仅 `test-support`）。
     #[cfg(feature = "test-support")]
     record: Option<FrameRecord>,
+    /// 无 App 通道（`Window::frame`）**最近一帧**因没有 `ResourceCache` 而跳过的行内盒图片
+    /// 诊断（v2.1 E2b，审查 F11：D17 跳过必须可观测）。
+    ///
+    /// `App::frame` 路径不写这里（它有 `TextContext`，诊断进 `App::text_diagnostics`，带
+    /// 64 条环 + 按值去重）。这条路径没有文本上下文，因此用窗口级的「最近一帧快照」：每帧
+    /// 重建、同帧按 id 去重，不随帧数增长。
+    inline_box_image_diagnostics: Vec<crate::text::TextDiagnostic>,
     /// 焦点（P10 的唯一权威源）。
     focus: FocusScope,
     /// 指针状态（hover / 光标 / 按下 / 拖拽 / 捕获）。
@@ -841,6 +848,7 @@ impl Window {
             stats: FrameStats::default(),
             #[cfg(feature = "test-support")]
             record: None,
+            inline_box_image_diagnostics: Vec::new(),
             focus: FocusScope::default(),
             pointer: PointerState::new(),
             pending_damage: None,
@@ -1159,8 +1167,29 @@ impl Window {
         frame::abort_frame(self, ticket)
     }
     /// 实现见子模块 `frame::frame`（本文件只保留签名）。
+    ///
+    /// **无 App 通道**：没有 `ResourceCache`，`InlineBoxPaint::Image` 一律跳过。跳过不是静默
+    /// 的：本帧跳过的 id 会进 [`Window::inline_box_image_diagnostics`]（D17）。需要真正画
+    /// 行内图片的窗口请走 `App::frame`。
     pub fn frame(&mut self) -> Result<FrameOutcome, EngineError> {
         frame::frame(self)
+    }
+    /// 无 App 通道（[`Window::frame`]）**最近一帧**的行内盒图片缺失诊断（v2.1 E2b，D17）。
+    ///
+    /// 走 `App::frame` 的窗口不产生这些条目：它有 `TextContext`，诊断进
+    /// [`crate::app::App::text_diagnostics`]（64 条环 + 按值去重）。这里没有文本上下文，
+    /// 因此是窗口级的「最近一帧快照」——每帧重建，不随帧数增长。
+    #[must_use]
+    pub fn inline_box_image_diagnostics(&self) -> &[crate::text::TextDiagnostic] {
+        &self.inline_box_image_diagnostics
+    }
+    /// 记录本帧跳过的行内盒图片 id（`Window::frame` 路径；同帧按 id 去重）。
+    pub(crate) fn note_skipped_inline_images(&mut self, ids: &[u64]) {
+        self.inline_box_image_diagnostics.clear();
+        self.inline_box_image_diagnostics.extend(
+            ids.iter()
+                .map(|id| crate::text::TextDiagnostic::InlineBoxImageMissing { id: *id }),
+        );
     }
     /// 实现见子模块 `frame::frame_index`（本文件只保留签名）。
     #[must_use]
@@ -1177,8 +1206,9 @@ impl Window {
         &mut self,
         geometry: &crate::paint::geometry_store::GeometryStore,
         atlas: Option<&crate::render::AtlasAllocator>,
+        resources: Option<&crate::resources::ResourceCache>,
     ) -> Result<PaintReport, EngineError> {
-        paint::paint_frame(self, geometry, atlas)
+        paint::paint_frame(self, geometry, atlas, resources)
     }
     fn needs_node_repaint(&self) -> bool {
         paint::needs_node_repaint(self)
