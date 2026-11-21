@@ -75,6 +75,7 @@ pub struct Button {
     size: UnifiedSize,
     icon: Option<IconKind>,
     label: Option<SmolStr>,
+    a11y_label: Option<SmolStr>,
     disabled: bool,
     loading: bool,
     selected: bool,
@@ -99,6 +100,7 @@ impl Button {
             size: UnifiedSize::Medium,
             icon: None,
             label: None,
+            a11y_label: None,
             disabled: false,
             loading: false,
             selected: false,
@@ -163,6 +165,16 @@ impl Button {
     #[must_use]
     pub fn label(mut self, label: impl Into<SmolStr>) -> Self {
         self.label = Some(label.into());
+        self
+    }
+
+    /// 只给 a11y 的可访问名（icon-only 按钮必需；`label` 仍画可见文字，两者都给时用这个当名字）。
+    ///
+    /// 旧 `Interactive` 只能把可见文字当名字，图标按钮因此在 AT 树里是「无名按钮」；本方法是
+    /// 最小补齐（P2-4d1 审查 D5）。文案由调用方给（i18n 在调用侧解析）。
+    #[must_use]
+    pub fn a11y_label(mut self, label: impl Into<SmolStr>) -> Self {
+        self.a11y_label = Some(label.into());
         self
     }
 
@@ -254,7 +266,7 @@ impl Button {
         parent: NodeId,
     ) -> Result<NodeId, EngineError> {
         let mut interactive = self.interactive.clone().with_unified_size(self.size);
-        if let Some(label) = &self.label {
+        if let Some(label) = self.a11y_label.as_ref().or(self.label.as_ref()) {
             interactive = interactive.label(label.clone());
         }
         if let Some(action) = &self.action {
@@ -610,6 +622,29 @@ mod tests {
         let record = snapshot.node_for(node).expect("a11y node");
         assert_eq!(record.role, A11yRole::Button);
         assert_eq!(record.label_text(), Some("Save"));
+    }
+
+    /// icon-only 按钮用 `a11y_label` 补可访问名（旧缺口：可见文字为空 ⇒ AT 读「无名按钮」）。
+    #[test]
+    fn an_icon_only_button_reports_its_a11y_label() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let button = Button::new(app.app_mut(), theme, "icon-only")
+            .icon(IconKind::X)
+            .a11y_label("Close");
+        let window = app.window_id();
+        let root = app.app().window(window).expect("window").tree().root();
+        let node = button.build(app.app_mut(), window, root).expect("build");
+        let _ = app.drain().expect("frame");
+        let snapshot = app.a11y().expect("a11y");
+        let record = snapshot.node_for(node).expect("a11y node");
+        assert_eq!(record.role, A11yRole::Button);
+        assert_eq!(
+            record.label_text(),
+            Some("Close"),
+            "icon-only 按钮必须有可访问名"
+        );
     }
 
     /// 点击回调：指针点击触发，程序化禁用派发被守卫拦下。

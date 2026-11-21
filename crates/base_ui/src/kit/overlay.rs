@@ -627,7 +627,8 @@ impl OverlaySurface {
         }
     }
 
-    /// 对话框面板（旧 `dialog.rs`：`bg SurfaceOverlay`、`rounded_sm`、`p_2`、对话框阴影）。
+    /// 对话框面板（旧 `dialog.rs`：`bg SurfaceOverlay`、`rounded_sm`、`p_2`、
+    /// `box_shadow(0, 25, 50, -12)` + 黑 0.25 —— 负 spread 由 E13 `ShadowSpec.spread` 表达）。
     #[must_use]
     pub fn dialog() -> Self {
         let tokens = ComponentTokens::standard();
@@ -636,9 +637,9 @@ impl OverlaySurface {
             corner_radius: 4.0,
             padding: 8.0,
             shadow: Some(ShadowSpec {
-                offset: Point::new(0.0, 4.0),
-                blur: 12.0,
-                spread: 0.0,
+                offset: Point::new(0.0, 25.0),
+                blur: 50.0,
+                spread: -12.0,
                 color: Color::BLACK.with_opacity(tokens.shadow.dialog_alpha),
             }),
         }

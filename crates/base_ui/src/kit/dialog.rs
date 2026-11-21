@@ -22,15 +22,26 @@
 //!   `confirm` / `cancel` / 关闭按钮 / [`Dialog::close`]，Esc 由引擎关闭最上层浮层，点外部默认
 //!   **不关**（[`DismissPolicy::Explicit`]）——`OutsideClick` 由调用方显式开启。Esc / 点外部是
 //!   引擎的**立即卸载**（无退场动画），程序化关闭才有淡出（与 [`crate::kit::overlay`] 同一差异）。
+//! - **关闭中重开**：淡出窗口内再调 [`Dialog::open`] 按旧语义「关闭完成后才能再开」——先把上一次
+//!   关闭收尾（派发一次 `on_close`），再按新内容重建；不静默丢弃打开请求。
+//! - **Esc 无法禁用（引擎差异）**：旧 dialog / alert 都**不可能**被 Esc 关掉；新实现的 Esc 是引擎
+//!   默认键绑定（对任意 [`DismissPolicy`] 都关闭最上层浮层），kit 层既不注册也不改写它 ⇒ 当前
+//!   引擎下做不出「必须显式确认、不能被 Esc 关掉」的模态。kit 不新增 Esc 入口（保持旧语义面），
+//!   差异登记为引擎候选（`OverlayOptions` 的关闭请求钩子 / 可禁用默认绑定，E 候选）。
 //! - **内容所有权**：旧 `Entity<AnyView>` 由 layer 强引用、退场结束才释放；新实现是节点树 +
 //!   `SignalScope`，卸载节点不等于释放应用层信号，调用方在对话框生命周期结束时调
 //!   [`Dialog::release`]（与 `overlay` / `alert` / `button` 的释放契约一致）。
 //! - **alert 内容自带 `Dialog` 角色**（P2-4a 交付），与 dialog 包装层的 `Dialog` / `AlertDialog`
-//!   重复；AT 会读两层对话框。修复属 alert 批次（内容根应为通用容器），本批登记残余。
-//! - **视觉**：面板阴影用旧值 `(0, 25, 50, -12)`（E13 `ShadowSpec.spread`）；Dark 外观的 1 px
-//!   `line.divider` 边缘、旧实现的 8 px 上滑入场与标题居中偏移未复刻（像素基线批次）。
-//! - **关闭按钮**是图标按钮，`Button` 目前没有独立 a11y 名通道（icon-only 按钮无名字，P2-4a 已
-//!   登记缺口）；关闭按钮与 Esc / 点外部同义（[`DialogClose::Dismissed`]），不触发取消回调。
+//!   重复；AT 会读两层对话框。**归属：P2-4a3（alert 批次）修内容根角色**，本批不改 `kit::alert`，
+//!   只登记（见 `spec-deltas/kit-dialog.md` §8）。
+//! - **视觉**：面板阴影用旧值 `(0, 25, 50, -12)`（[`OverlaySurface::dialog`]，E13
+//!   `ShadowSpec.spread`）；Dark 外观的 1 px `line.divider` 边缘、旧实现的 8 px 上滑入场与长标题
+//!   右侧留白未复刻（像素基线批次）。
+//! - **关闭按钮**：普通对话框右上角图标按钮（默认在，可 [`DialogBuilder::close_label`] 给 a11y
+//!   名）；**alert 形状恒不建**（旧 alert 没有关闭按钮，X 也无法绕过 alert 的 `cancel_action`）。
+//!   关闭按钮与 Esc / 点外部同义（[`DialogClose::Dismissed`]），不触发确认 / 取消回调。
+//! - **alert 的 Esc 语义**：引擎立即卸载并报 `Dismissed`，**不跑** alert 的 `cancel_action`
+//!   （引擎没有应用层可拦截的关闭钩子）；alert 形状的用户关闭路径只有 OK / Cancel。
 //!
 //! # 用法（组合根）
 //!
@@ -69,7 +80,7 @@
 use std::{
     cell::{Cell, RefCell},
     fmt,
-    rc::Rc,
+    rc::{Rc, Weak},
 };
 
 use smol_str::{SmolStr, format_smolstr};
@@ -85,10 +96,7 @@ use ui_core::{
         signal::{Signal, SignalScope},
         tree::NodeTree,
     },
-    paint::{
-        color::Color,
-        style::{ShadowSpec, StylePatch},
-    },
+    paint::style::StylePatch,
     text::{TextAlign, TextStyle},
     window::WindowId,
 };
@@ -98,6 +106,7 @@ use crate::{
         alert::{Alert, AlertBuilder},
         button::Button,
         icon::IconKind,
+        layer::Band,
         overlay::{
             Anchor, AnimationRouter, DismissPolicy, Overlay, OverlayA11y, OverlayError,
             OverlayOptions, OverlaySurface, Placement, Scrim,
@@ -105,7 +114,7 @@ use crate::{
         size::UnifiedSizable,
     },
     style_builder::StyleBuilder,
-    theme::{components::ComponentTokens, handle::ThemeHandle, role::Role},
+    theme::{handle::ThemeHandle, role::Role},
 };
 
 /// 对话框内容宽度（旧 alert 的 `.w_96()` = 384 px；通用对话框默认同宽）。
@@ -193,13 +202,14 @@ pub type DialogAction = Rc<dyn Fn(&mut App)>;
 pub type DialogCloseCallback = Rc<dyn Fn(DialogClose, &mut App)>;
 
 /// 对话框配置（builder 内部值；对外只经 [`DialogBuilder`] 的方法设置）。
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 struct DialogConfig {
     title: SmolStr,
     role: DialogRole,
     width: f32,
     header: bool,
     close_button: bool,
+    close_label: SmolStr,
     dismiss: DismissPolicy,
     fade: bool,
 }
@@ -212,16 +222,17 @@ impl DialogConfig {
             width: CONTENT_WIDTH,
             header: true,
             close_button: true,
+            close_label: SmolStr::new_static("Close"),
             dismiss: DismissPolicy::Explicit,
             fade: true,
         }
     }
 
-    fn band(&self) -> crate::kit::layer::Band {
+    fn band(&self) -> Band {
         match self.role {
-            DialogRole::Dialog => crate::kit::layer::Band::Dialog,
+            DialogRole::Dialog => Band::Dialog,
             // 旧 alert 槽：恒高于所有 dialog、至多一个（`Layer::register` 的单例替换语义）。
-            DialogRole::AlertDialog => crate::kit::layer::Band::Alert,
+            DialogRole::AlertDialog => Band::Alert,
         }
     }
 
@@ -239,6 +250,17 @@ struct DialogState {
     window: Option<WindowId>,
     /// 内容列（标题下的正文容器；alert 也挂在这里）。
     body: Option<NodeId>,
+}
+
+/// [`Dialog::begin_close`] 的结果：用户回调只在 `Started` 这一次跑（淡出中双击不得重复执行）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseStart {
+    /// 本次调用真的开始了关闭（写原因 + 淡出 / 立即卸载）。
+    Started,
+    /// 已经在关闭（淡出中）：幂等，不重启动画，也不再跑用户回调。
+    AlreadyClosing,
+    /// 对话框不处于打开态（已关闭 / 从未打开）。
+    NotOpen,
 }
 
 struct DialogInner {
@@ -295,7 +317,11 @@ impl DialogBuilder {
     }
 
     /// alert 形状：内容面板由 `build` 造 [`AlertBuilder`]，dialog 只做容器（`AlertDialog` 角色、
-    /// `Band::Alert` 槽、无标题行 —— alert 自己画标题）。
+    /// `Band::Alert` 槽、无标题行 —— alert 自己画标题、**无关闭按钮**）。
+    ///
+    /// alert 形状没有关闭按钮：旧 alert 只有 OK / Cancel；X 无法（在不改 `kit::alert` 的前提下）
+    /// 路由到 alert 的 `cancel_action`，保留它就会绕过用户语义。Esc 仍由引擎关闭（`Dismissed`，
+    /// 不跑 `cancel_action`，见模块文档）。
     ///
     /// 回调每次打开都会被调用：alert 的 OK / Cancel 动作里可以拿传入的 [`Dialog`] 句柄关闭对话框
     ///（`AlertBuilder` 的校验失败不会调用 OK 动作，因此「校验通过才关」自然成立）。
@@ -350,10 +376,22 @@ impl DialogBuilder {
         self
     }
 
-    /// 右上角关闭按钮（默认在；关闭 = [`DialogClose::Dismissed`]，不触发取消回调）。
+    /// 右上角关闭按钮（普通对话框默认在；**alert 形状恒不建**，见 [`DialogBuilder::alert`]）。
+    ///
+    /// 关闭 = [`DialogClose::Dismissed`]，不触发确认 / 取消回调。
     #[must_use]
     pub fn close_button(mut self, shown: bool) -> Self {
         self.config.close_button = shown;
+        self
+    }
+
+    /// 关闭按钮的 a11y 可访问名（icon-only 按钮在 AT 里需要名字；默认 `Close`）。
+    ///
+    /// 文案由调用方给（i18n 在调用侧解析，例如 `close_label(t!(cx, "dialog.close"))`）；只影响
+    /// 会建关闭按钮的普通对话框。
+    #[must_use]
+    pub fn close_label(mut self, label: impl Into<SmolStr>) -> Self {
+        self.config.close_label = label.into();
         self
     }
 
@@ -367,6 +405,9 @@ impl DialogBuilder {
     }
 
     /// 关闭策略（默认 [`DismissPolicy::Explicit`] = 点外部不关，旧 dialog / alert 语义）。
+    ///
+    /// 只影响**点外部**：Esc 是引擎默认键绑定（对任意策略都关闭最上层浮层），kit 层无法禁用或
+    /// 改写 —— 「必须显式确认、不能被 Esc 关掉」的模态在当前引擎下做不到（见模块文档）。
     #[must_use]
     pub fn dismiss(mut self, dismiss: DismissPolicy) -> Self {
         self.config.dismiss = dismiss;
@@ -420,7 +461,7 @@ impl DialogBuilder {
                 modal: true,
                 restore_focus: true,
                 band: self.config.band(),
-                surface: dialog_surface(),
+                surface: OverlaySurface::dialog(),
                 scrim: Some(Scrim::default()),
                 a11y: self.config.a11y(),
                 fade: self.config.fade,
@@ -452,16 +493,25 @@ impl DialogBuilder {
 
 impl Dialog {
     /// 打开对话框（建浮层 + 面板内容；首帧按零尺寸落位，[`Dialog::sync`] 读到实测尺寸后居中并
-    /// 揭开）。已经打开时返回 `Ok(false)`（幂等）。
+    /// 揭开）。
+    ///
+    /// **幂等**：真的处于打开态（未在关闭、浮层还在）时返回 `Ok(false)`。**关闭中重开**（淡出窗口
+    /// 内 / 引擎侧已卸载但状态还没 sync 收尾）按旧语义「关闭完成后才能再开」处理：先把上一次关闭
+    /// 收尾（派发一次 `on_close`，原因取已记录的那一个），再按新内容重建，返回 `Ok(true)`。
     ///
     /// # Errors
     /// [`DialogError::Overlay`]：窗口已关闭 / 建浮层失败；[`DialogError::Engine`]：内容节点 /
     /// alert 面板建树失败（此时浮层已卸载，不留半成品）。
     pub fn open(&self, app: &mut App, window: WindowId) -> Result<bool, DialogError> {
         if *app.read(&self.inner.open) {
-            return Ok(false);
+            if !self.inner.closing.get() && self.inner.overlay.is_open(app) {
+                return Ok(false);
+            }
+            // 关闭中 / 引擎侧已卸载：收尾上一次关闭（`on_close` 派发一次），再重建内容。
+            self.inner.overlay.close_now(app);
+            self.finalize(app);
         }
-        // 引擎侧残留（状态还没 sync 收尾）：先彻底关掉旧的，再按新的一次打开。
+        // 引擎侧残留（状态异常）：先彻底关掉旧的，再按新的一次打开。
         if self.inner.overlay.is_open(app) {
             self.inner.overlay.close_now(app);
         }
@@ -496,22 +546,31 @@ impl Dialog {
         Ok(true)
     }
 
-    /// 程序化关闭（淡出；`fade = false` 时浮层立即卸载）。返回是否有对话框被关（已关闭 ⇒ `false`）。
+    /// 程序化关闭（淡出；`fade = false` 时浮层立即卸载）。返回是否有对话框被关（已关闭 ⇒ `false`；
+    /// 淡出中再次关闭幂等返回 `true`，但不会重启动画，也不会再跑用户回调）。
     ///
     /// 关闭原因记 [`DialogClose::Dismissed`]；状态收尾在 [`Dialog::sync`]（`is_open` 变 `false`
     /// 并派发 `on_close`），与引擎侧关闭（Esc / 点外部）同一模型。Esc / 点外部由引擎直接卸载节点，
     /// 原因同样是 `Dismissed`。
     pub fn close(&self, app: &mut App) -> bool {
-        self.begin_close(app, DialogClose::Dismissed)
+        !matches!(
+            self.begin_close(app, DialogClose::Dismissed),
+            CloseStart::NotOpen
+        )
     }
 
     /// 立即关闭（不播淡出；已关闭 ⇒ `false`）。
+    ///
+    /// 已记录的原因（确认 / 取消 / 关闭按钮先开始的关闭）保留：混合路径（退场中再 `close_now`）
+    /// 不得把 `Confirmed` / `Cancelled` 改写成 `Dismissed`。
     pub fn close_now(&self, app: &mut App) -> bool {
         if !*app.read(&self.inner.open) {
             return false;
         }
         self.inner.closing.set(true);
-        self.inner.reason.set(Some(DialogClose::Dismissed));
+        if self.inner.reason.get().is_none() {
+            self.inner.reason.set(Some(DialogClose::Dismissed));
+        }
         self.inner.overlay.close_now(app);
         self.finalize(app);
         true
@@ -622,10 +681,16 @@ impl Dialog {
         self.inner.alert.borrow().as_ref().map(read)
     }
 
-    /// 释放组件（浮层 / 按钮 / alert 的信号作用域与 Action handler；节点已卸载后调用一次）。
+    /// 释放组件（浮层 / 按钮 / alert 的信号作用域与 Action handler；幂等）。
+    ///
+    /// **打开中调用 = 放弃关闭收尾**：浮层立即卸载，但**不派发** `on_close`（没有「关闭完成」这件
+    /// 事）；需要关闭事件时先 [`Dialog::close_now`]。释放后句柄不可再用（`sync` / `open` 会读已
+    /// 回收的信号而 panic），与 `overlay` / `alert` / `button` 的释放契约一致。
     pub fn release(&self, app: &mut App) {
         self.inner.overlay.release(app);
         self.release_content(app);
+        self.inner.closing.set(false);
+        let _ = self.inner.reason.take();
         let _ = app.write(&self.inner.open, false);
         self.inner.state.borrow_mut().window = None;
         let _ = app.release_scope(self.inner.scope);
@@ -633,7 +698,11 @@ impl Dialog {
 
     // ── 内部 ──────────────────────────────────────────────────────────────
 
-    /// 建面板内容（标题行 / 关闭按钮 / 内容列 / 按钮行）。内容列记进 state，alert 随后挂进去。
+    /// 建面板内容（标题行 / 内容列 / 按钮行 / 关闭按钮）。内容列记进 state，alert 随后挂进去。
+    ///
+    /// **关闭按钮最后建**：引擎的绘制序 / 命中优先序就是子节点序（倒序命中），而它绝对定位在内容
+    /// 列右上角。`header(false)`（alert 形状 / 无标题行）时内容列从面板顶端开始铺满整宽，先建的
+    /// 关闭按钮会被内容整块盖住、永远收不到命中（P2-4d1 审查 D1：alert 形状的「死控件」）。
     fn build_content(&self, app: &mut App, window: WindowId) -> Result<(), DialogError> {
         let panel = self
             .inner
@@ -667,26 +736,6 @@ impl Dialog {
             })
             .build(tree_mut(app, window)?, root)?;
         }
-        if self.inner.config.close_button {
-            let weak = Rc::downgrade(&self.inner);
-            let button = Button::new(
-                app,
-                self.inner.theme.clone(),
-                format_smolstr!("{key}:close"),
-            )
-            .icon(IconKind::X)
-            .ghost()
-            .small()
-            .on_click(move |ctx: &mut ActionCtx<'_>| {
-                if let Some(inner) = weak.upgrade() {
-                    let dialog = Dialog { inner };
-                    let _ = dialog.begin_close(ctx.app_mut(), DialogClose::Dismissed);
-                }
-            });
-            let node = button.build(app, window, root)?;
-            position_close_button(app, window, node)?;
-            *self.inner.close_button.borrow_mut() = Some(button);
-        }
         let body = NodeBuilder::boxed()
             .id(format_smolstr!("{key}:body"))
             .style(
@@ -704,6 +753,28 @@ impl Dialog {
         }
         if self.inner.confirm.is_some() || self.inner.cancel.is_some() {
             self.build_button_row(app, window, root, key)?;
+        }
+        // alert 形状恒不建关闭按钮（旧 alert 没有 X；X 也无法走 alert 的 `cancel_action`）。
+        if self.inner.config.close_button && matches!(self.inner.config.role, DialogRole::Dialog) {
+            let weak = Rc::downgrade(&self.inner);
+            let button = Button::new(
+                app,
+                self.inner.theme.clone(),
+                format_smolstr!("{key}:close"),
+            )
+            .icon(IconKind::X)
+            .a11y_label(self.inner.config.close_label.clone())
+            .ghost()
+            .small()
+            .on_click(move |ctx: &mut ActionCtx<'_>| {
+                if let Some(inner) = weak.upgrade() {
+                    let dialog = Dialog { inner };
+                    let _ = dialog.begin_close(ctx.app_mut(), DialogClose::Dismissed);
+                }
+            });
+            let node = button.build(app, window, root)?;
+            position_close_button(app, window, node)?;
+            *self.inner.close_button.borrow_mut() = Some(button);
         }
         Ok(())
     }
@@ -727,11 +798,9 @@ impl Dialog {
             let button = Button::new(app, self.inner.theme.clone(), format_smolstr!("{key}:ok"))
                 .label(label.clone())
                 .on_click(move |ctx: &mut ActionCtx<'_>| {
-                    if let Some(inner) = weak.upgrade() {
-                        let dialog = Dialog { inner };
-                        let _ = dialog.begin_close(ctx.app_mut(), DialogClose::Confirmed);
+                    if confirm_started(&weak, ctx.app_mut(), DialogClose::Confirmed) {
+                        action(ctx.app_mut());
                     }
-                    action(ctx.app_mut());
                 });
             let button = if paired { button.joined(0, 2) } else { button };
             let node = button.build(app, window, row)?;
@@ -750,11 +819,9 @@ impl Dialog {
             .label(label.clone())
             .joined(1, 2)
             .on_click(move |ctx: &mut ActionCtx<'_>| {
-                if let Some(inner) = weak.upgrade() {
-                    let dialog = Dialog { inner };
-                    let _ = dialog.begin_close(ctx.app_mut(), DialogClose::Cancelled);
+                if confirm_started(&weak, ctx.app_mut(), DialogClose::Cancelled) {
+                    action(ctx.app_mut());
                 }
-                action(ctx.app_mut());
             });
             let node = button.build(app, window, row)?;
             stretch_button(app, window, node)?;
@@ -826,21 +893,21 @@ impl Dialog {
             .is_ok()
     }
 
-    /// 开始程序化关闭（幂等）：写原因、播淡出。
+    /// 开始程序化关闭（幂等）：写原因、播淡出。见 [`CloseStart`] 的三个结果。
     ///
     /// 状态收尾统一在 [`Dialog::sync`]（或立即关闭的 [`Dialog::close_now`]）里做 —— 引擎侧关闭
     /// 与程序化关闭走同一个 `finalize` 点，`on_close` 的时序不随 `fade` 配置而变化。
-    fn begin_close(&self, app: &mut App, reason: DialogClose) -> bool {
+    fn begin_close(&self, app: &mut App, reason: DialogClose) -> CloseStart {
         if !*app.read(&self.inner.open) {
-            return false;
+            return CloseStart::NotOpen;
         }
         if self.inner.closing.get() {
-            return true;
+            return CloseStart::AlreadyClosing;
         }
         self.inner.closing.set(true);
         self.inner.reason.set(Some(reason));
         self.inner.overlay.close(app);
-        true
+        CloseStart::Started
     }
 
     /// 关闭收尾：清状态、派发关闭回调（每完成一次关闭一次）。
@@ -878,20 +945,18 @@ impl Dialog {
 
 // ── 免费函数 ──────────────────────────────────────────────────────────────
 
-/// 对话框面板表面：旧 `dialog.rs` 的数值（`SurfaceOverlay`、`rounded_sm`、`p_2`、
-/// `(0, 25, 50, -12)` 阴影 —— E13 的 `ShadowSpec.spread` 才能表达负扩边）。
-fn dialog_surface() -> OverlaySurface {
-    let tokens = ComponentTokens::standard();
-    OverlaySurface {
-        background: Role::SurfaceOverlay,
-        corner_radius: 4.0,
-        padding: 8.0,
-        shadow: Some(ShadowSpec {
-            offset: Point::new(0.0, 25.0),
-            blur: 50.0,
-            spread: -12.0,
-            color: Color::BLACK.with_opacity(tokens.shadow.dialog_alpha),
-        }),
+/// 确认 / 取消按钮点击的关闭守卫：返回 `true` = 本次点击真的开始了关闭（调用方的回调跟着跑）。
+///
+/// 淡出窗口内第二次点击时 [`Dialog::begin_close`] 返回 [`CloseStart::AlreadyClosing`]：忽略这次
+/// 点击，避免删除类确认动作被执行两次（旧 dialog 用 `capture_any_mouse_down` 吞掉按下；P2-4d1
+/// 审查 D2）。句柄已被释放（`weak` 升不起来）时没有可关闭的对话框，但点击仍按旧行为跑回调。
+fn confirm_started(weak: &Weak<DialogInner>, app: &mut App, reason: DialogClose) -> bool {
+    match weak.upgrade() {
+        Some(inner) => matches!(
+            (Dialog { inner }).begin_close(app, reason),
+            CloseStart::Started
+        ),
+        None => true,
     }
 }
 
@@ -1958,5 +2023,386 @@ mod tests {
         );
         assert!(dialog.overlay_node().is_none());
         dialog.release(harness.app.app_mut());
+    }
+
+    // ── P2-4d1 审查修复的回归测试（D1/D2/D3/D5/D8/D9/D10/D11）──────────────────────
+
+    /// D1：`header(false)`（无标题行）时关闭按钮必须真的可点 —— 它最后建，命中序在内容之上。
+    #[test]
+    fn the_close_button_is_hittable_when_the_header_is_hidden() {
+        let mut harness = Harness::new();
+        let reason = Rc::new(Cell::new(None));
+        let dialog = harness.dialog(
+            DialogBuilder::new("Headerless")
+                .header(false)
+                .fade(false)
+                .content(content_box(320.0, 40.0))
+                .confirm("OK", |_| panic!("关闭按钮不得跑确认回调"))
+                .cancel("Cancel", |_| panic!("关闭按钮不得跑取消回调"))
+                .on_close(record_close(reason.clone())),
+            "headerless-close",
+        );
+        let close = dialog
+            .close_button()
+            .expect("关闭按钮")
+            .node()
+            .expect("关闭按钮节点");
+        harness.click_node(close);
+        let _ = dialog.sync(harness.app.app_mut()).expect("收尾");
+        assert!(
+            !dialog.is_open(harness.app.app()),
+            "无标题行时内容列从面板顶端开始：关闭按钮必须最后建才不被盖住（D1）"
+        );
+        assert_eq!(reason.get(), Some(DialogClose::Dismissed));
+    }
+
+    /// D5：icon-only 关闭按钮必须有独立 a11y 名（默认 `Close`，可本地化覆盖）。
+    #[test]
+    fn the_close_button_declares_an_a11y_name() {
+        let mut harness = Harness::new();
+        harness.app.enable_a11y_capture();
+        let dialog = harness.dialog(DialogBuilder::new("Named").fade(false), "close-a11y");
+        let close = dialog
+            .close_button()
+            .expect("关闭按钮")
+            .node()
+            .expect("关闭按钮节点");
+        let snapshot = full_a11y(&mut harness.app);
+        let record = snapshot.node_for(close).expect("关闭按钮必须在 a11y 树里");
+        assert_eq!(record.role, A11yRole::Button);
+        assert_eq!(record.label_text(), Some("Close"), "默认可访问名");
+
+        let localized = harness.build(
+            DialogBuilder::new("Named custom")
+                .fade(false)
+                .close_label("关闭"),
+            "close-a11y-custom",
+        );
+        assert!(
+            localized
+                .open(harness.app.app_mut(), harness.window)
+                .expect("打开")
+        );
+        harness.settle(&localized);
+        let localized_close = localized
+            .close_button()
+            .expect("关闭按钮")
+            .node()
+            .expect("关闭按钮节点");
+        let snapshot = full_a11y(&mut harness.app);
+        let record = snapshot
+            .node_for(localized_close)
+            .expect("本地化关闭按钮在 a11y 树里");
+        assert_eq!(record.label_text(), Some("关闭"), "调用方可以给本地化名字");
+    }
+
+    /// D11（审查 D3）：alert 形状没有关闭按钮 —— 旧 alert 只有 OK / Cancel，X 会绕过
+    /// `cancel_action`；显式 `close_button(true)` 也不生效（alert 形状恒无 X）。
+    #[test]
+    fn an_alert_dialog_never_builds_a_close_button() {
+        let mut harness = Harness::new();
+        let dialog = harness.dialog(
+            DialogBuilder::alert("No close", |_dialog, _theme| {
+                AlertBuilder::new().ok_cancel("No close", "Old alerts have no close button.")
+            })
+            .close_button(true)
+            .fade(false),
+            "alert-no-close",
+        );
+        assert!(
+            dialog.close_button().is_none(),
+            "alert 形状恒不建关闭按钮（旧 alert 语义；X 无法路由到 cancel_action）"
+        );
+    }
+
+    /// D11（审查 D3）：Esc 由引擎立即卸载 alert（`Dismissed`），不跑 alert 的 `cancel_action`。
+    #[test]
+    fn escape_closes_an_alert_without_running_its_actions() {
+        let mut harness = Harness::new();
+        let ok_runs = Rc::new(Cell::new(0u32));
+        let cancel_runs = Rc::new(Cell::new(0u32));
+        let reason = Rc::new(Cell::new(None));
+        let dialog = harness.dialog(
+            DialogBuilder::alert("Esc alert", {
+                let ok_runs = ok_runs.clone();
+                let cancel_runs = cancel_runs.clone();
+                move |_dialog, _theme| {
+                    let ok_counter = ok_runs.clone();
+                    let cancel_counter = cancel_runs.clone();
+                    AlertBuilder::new()
+                        .ok_cancel("Esc alert", "Esc closes it.")
+                        .ok_action(move |_, _| ok_counter.set(ok_counter.get() + 1))
+                        .cancel_action(move |_| cancel_counter.set(cancel_counter.get() + 1))
+                }
+            })
+            .on_close(record_close(reason.clone())),
+            "alert-esc",
+        );
+        harness.escape();
+        let _ = dialog.sync(harness.app.app_mut()).expect("收尾");
+        assert!(!dialog.is_open(harness.app.app()));
+        assert_eq!(
+            reason.get(),
+            Some(DialogClose::Dismissed),
+            "Esc = 引擎默认 Dismiss"
+        );
+        assert_eq!(ok_runs.get(), 0);
+        assert_eq!(
+            cancel_runs.get(),
+            0,
+            "Esc 是引擎立即卸载：不跑 alert 的 cancel_action（无应用层关闭钩子）"
+        );
+    }
+
+    /// D2：退场淡出窗口内第二次点击不得再跑用户回调（旧 dialog 用 capture 阶段吞掉按下）。
+    #[test]
+    fn a_second_click_during_the_fade_runs_no_action() {
+        let mut harness = Harness::new();
+        let confirms = Rc::new(Cell::new(0u32));
+        let reason = Rc::new(Cell::new(None));
+        let dialog = harness.dialog(
+            DialogBuilder::new("Double click")
+                .confirm("OK", {
+                    let confirms = confirms.clone();
+                    move |_| confirms.set(confirms.get() + 1)
+                })
+                .cancel("Cancel", |_| panic!("取消回调不得被双击触发"))
+                .on_close(record_close(reason.clone())),
+            "double-click",
+        );
+        harness.app.advance(Duration::from_millis(200));
+        let _ = harness.app.drain().expect("淡入帧");
+        let _ = dialog.sync(harness.app.app_mut()).expect("同步");
+        let ok = dialog
+            .confirm_button()
+            .expect("确认按钮")
+            .node()
+            .expect("节点");
+        harness.click_node(ok);
+        assert_eq!(confirms.get(), 1, "第一次点击跑确认回调");
+        assert!(dialog.is_closing(), "第一次点击开始淡出");
+        harness.click_node(ok);
+        assert_eq!(
+            confirms.get(),
+            1,
+            "淡出中的第二次点击不得再跑用户回调（D2）"
+        );
+        for _ in 0..24 {
+            harness.app.advance(Duration::from_millis(16));
+            let _ = dialog.sync(harness.app.app_mut()).expect("同步");
+            let _ = harness.app.drain().expect("帧");
+            if !dialog.is_open(harness.app.app()) {
+                break;
+            }
+        }
+        assert!(!dialog.is_open(harness.app.app()));
+        assert_eq!(
+            reason.get(),
+            Some(DialogClose::Confirmed),
+            "关闭原因保持第一次的 Confirmed"
+        );
+    }
+
+    /// D3（审查 D4）：关闭淡出中 `open` 必须收尾上一次关闭（`on_close` 一次）并重建，不得静默丢弃。
+    #[test]
+    fn reopening_while_closing_finishes_the_close_then_reopens() {
+        let mut harness = Harness::new();
+        let closes = Rc::new(Cell::new(0u32));
+        let reason = Rc::new(Cell::new(None));
+        let dialog = harness.dialog(
+            DialogBuilder::new("Reopen while closing").on_close({
+                let closes = closes.clone();
+                let reason = reason.clone();
+                move |closed, _app| {
+                    closes.set(closes.get() + 1);
+                    reason.set(Some(closed));
+                }
+            }),
+            "reopen-closing",
+        );
+        harness.app.advance(Duration::from_millis(200));
+        let _ = harness.app.drain().expect("淡入帧");
+        let _ = dialog.sync(harness.app.app_mut()).expect("同步");
+        assert!(dialog.close(harness.app.app_mut()));
+        assert!(dialog.is_closing(), "进入淡出");
+        assert!(
+            dialog
+                .open(harness.app.app_mut(), harness.window)
+                .expect("关闭中重开"),
+            "关闭中 open 必须真的重开（不得返回 Ok(false) 静默丢弃）"
+        );
+        assert!(dialog.is_open(harness.app.app()));
+        assert!(!dialog.is_closing());
+        assert_eq!(closes.get(), 1, "上一次关闭必须先收尾（on_close 派发一次）");
+        assert_eq!(reason.get(), Some(DialogClose::Dismissed));
+        harness.settle(&dialog);
+        let panel = dialog.panel_node().expect("重开后的面板");
+        assert!(harness.tree_has(panel), "重开必须有新面板");
+        assert_eq!(harness.layer.len(harness.window), 1, "旧浮层不得残留");
+    }
+
+    /// D3（审查 D4）：`fade=false` 下浮层已卸载但状态还没 sync 时重开，同样先收尾再重建。
+    #[test]
+    fn reopening_before_the_closed_state_is_synced_reopens() {
+        let mut harness = Harness::new();
+        let reason = Rc::new(Cell::new(None));
+        let dialog = harness.dialog(
+            DialogBuilder::new("Unsynced")
+                .fade(false)
+                .on_close(record_close(reason.clone())),
+            "reopen-unsynced",
+        );
+        let close = dialog
+            .close_button()
+            .expect("关闭按钮")
+            .node()
+            .expect("关闭按钮节点");
+        harness.click_node(close);
+        assert!(
+            dialog.is_open(harness.app.app()),
+            "fade=false 已卸载：状态在帧边界更新"
+        );
+        assert!(dialog.is_closing());
+        assert!(
+            dialog
+                .open(harness.app.app_mut(), harness.window)
+                .expect("未收尾时重开"),
+            "未收尾的关闭必须先收尾再重开"
+        );
+        assert!(dialog.is_open(harness.app.app()));
+        assert!(!dialog.is_closing());
+        assert_eq!(reason.get(), Some(DialogClose::Dismissed));
+        harness.settle(&dialog);
+        assert!(harness.tree_has(dialog.panel_node().expect("新面板")));
+    }
+
+    /// D8：`close_now` 走混合路径时保留已记录的原因，不得改写成 `Dismissed`。
+    #[test]
+    fn close_now_keeps_the_reason_the_close_started_with() {
+        let mut harness = Harness::new();
+        let reason = Rc::new(Cell::new(None));
+        let dialog = harness.dialog(
+            DialogBuilder::new("Reason")
+                .confirm("OK", |_| {})
+                .on_close(record_close(reason.clone())),
+            "reason",
+        );
+        harness.app.advance(Duration::from_millis(200));
+        let _ = harness.app.drain().expect("淡入帧");
+        let _ = dialog.sync(harness.app.app_mut()).expect("同步");
+        let ok = dialog
+            .confirm_button()
+            .expect("确认按钮")
+            .node()
+            .expect("节点");
+        harness.click_node(ok);
+        assert!(dialog.is_closing());
+        assert!(dialog.close_now(harness.app.app_mut()), "立即关闭");
+        assert!(!dialog.is_open(harness.app.app()));
+        assert_eq!(
+            reason.get(),
+            Some(DialogClose::Confirmed),
+            "close_now 不得把 Confirmed 改写成 Dismissed（D8）"
+        );
+    }
+
+    /// D9：`release` 必须摘掉按钮的 Action handler（变异「release 不释放」→ 本测试红）。
+    #[test]
+    fn release_removes_the_dialog_button_action_handlers() {
+        let mut harness = Harness::new();
+        let dialog = harness.dialog(
+            DialogBuilder::new("Release")
+                .fade(false)
+                .confirm("OK", |_| {})
+                .cancel("Cancel", |_| {}),
+            "release",
+        );
+        let actions: Vec<Action> = [
+            dialog.confirm_button(),
+            dialog.cancel_button(),
+            dialog.close_button(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|button| button.action_identity().expect("按钮动作身份"))
+        .collect();
+        assert_eq!(actions.len(), 3, "确认 / 取消 / 关闭三个按钮");
+        for action in &actions {
+            assert!(
+                harness.app.app().has_action_handler(action),
+                "{action:?} 必须在册"
+            );
+        }
+        dialog.release(harness.app.app_mut());
+        for action in &actions {
+            assert!(
+                !harness.app.app().has_action_handler(action),
+                "{action:?} 必须在 release 后摘除（D9）"
+            );
+        }
+        dialog.release(harness.app.app_mut());
+        assert!(dialog.close_button().is_none(), "release 后按钮句柄已释放");
+    }
+
+    /// D9：alert 内容面板的按钮 Action handler 同样由 `Dialog::release` 摘除。
+    #[test]
+    fn release_removes_the_alert_content_action_handlers() {
+        let mut harness = Harness::new();
+        let dialog = harness.dialog(
+            DialogBuilder::alert("Release alert", |_dialog, _theme| {
+                AlertBuilder::new()
+                    .ok_cancel("Release alert", "Content")
+                    .ok_action(|_, _| {})
+                    .cancel_action(|_| {})
+            })
+            .fade(false),
+            "release-alert",
+        );
+        let ok_action = dialog
+            .with_alert(|alert| alert.ok_button().action_identity())
+            .flatten()
+            .expect("alert OK 动作身份");
+        let cancel_action = dialog
+            .with_alert(|alert| {
+                alert
+                    .cancel_button()
+                    .and_then(|button| button.action_identity())
+            })
+            .flatten()
+            .expect("alert Cancel 动作身份");
+        for action in [&ok_action, &cancel_action] {
+            assert!(harness.app.app().has_action_handler(action));
+        }
+        dialog.release(harness.app.app_mut());
+        for action in [&ok_action, &cancel_action] {
+            assert!(
+                !harness.app.app().has_action_handler(action),
+                "{action:?} 必须在 release 后摘除（alert 内容侧）"
+            );
+        }
+    }
+
+    /// D10：I3 在**默认** `fade = true` 下也成立（稳态零帧）。
+    #[test]
+    fn a_settled_dialog_with_the_default_fade_requests_no_frames() {
+        let mut harness = Harness::new();
+        let dialog = harness.dialog(
+            DialogBuilder::new("Idle fade").content(content_box(40.0, 20.0)),
+            "idle-fade",
+        );
+        harness.app.advance(Duration::from_millis(200));
+        let _ = harness.app.drain().expect("淡入帧");
+        let _ = dialog.sync(harness.app.app_mut()).expect("同步");
+        assert!(
+            !dialog.sync(harness.app.app_mut()).expect("同步"),
+            "淡入完成后的稳态 sync 必须返回 false（I3，默认 fade=true）"
+        );
+        let outcome = harness
+            .app
+            .app_mut()
+            .frame(harness.window)
+            .expect("窗口")
+            .expect("帧");
+        assert_eq!(outcome, FrameOutcome::Idle, "稳态不请求帧");
     }
 }
