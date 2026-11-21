@@ -45,6 +45,27 @@ pub(crate) fn bind_key(app: &mut App, binding: KeyBinding) {
     app.bindings.push(binding);
 }
 
+/// 添加/替换一条焦点作用域化的键盘绑定（同 `(window, scope, key, modifiers)` 后写覆盖）。
+/// 消费者：`App::bind_key_scoped`。
+pub(crate) fn bind_key_scoped(
+    app: &mut App,
+    window: crate::window::WindowId,
+    scope: crate::node::id::NodeId,
+    binding: KeyBinding,
+) {
+    app.scoped_bindings.retain(|existing| {
+        !(existing.window == window
+            && existing.scope == scope
+            && existing.binding.key == binding.key
+            && existing.binding.modifiers == binding.modifiers)
+    });
+    app.scoped_bindings.push(super::ScopedKeyBinding {
+        window,
+        scope,
+        binding,
+    });
+}
+
 /// 删除一条键盘绑定（返回是否真的删了）。
 /// 消费者：`App::unbind_key`。
 pub(crate) fn unbind_key(app: &mut App, key: KeyCode, modifiers: Modifiers) -> bool {

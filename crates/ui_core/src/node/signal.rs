@@ -927,7 +927,19 @@ impl StateStore {
     }
 
     pub(crate) fn push_transient<T: 'static>(&mut self, value: T) -> SignalId {
-        self.push_slot(SignalValue::Transient(Rc::new(value)), SignalScope::ROOT)
+        self.push_transient_scoped(SignalScope::ROOT, value)
+    }
+
+    /// 在指定作用域里注册瞬态值（随作用域释放回收）。
+    ///
+    /// # Panics
+    /// 作用域已释放（引擎误用：释放后不可再 mint 值）。
+    pub(crate) fn push_transient_scoped<T: 'static>(
+        &mut self,
+        scope: SignalScope,
+        value: T,
+    ) -> SignalId {
+        self.push_slot(SignalValue::Transient(Rc::new(value)), scope)
     }
 
     pub(crate) fn push_derived(

@@ -10,10 +10,21 @@
 //!
 //! # 键盘
 //!
-//! [`Tree::bind_keys`] 注册 `Up/Down/Left/Right` 四个全局绑定（引擎按键绑定是**全应用一份**
-//! 表，同一 App 里只能有一个树实例绑定方向键；作用域化的绑定属 P2-4 机制）；`Enter/Space` 走
-//! 引擎的「焦点节点激活」通道（列表容器的 Action），由 [`List::on_activate`] 回调触发折叠。
-//! 绑定只在焦点落在本树的列表容器上时生效。
+//! [`Tree::bind_keys`] 注册 `Up/Down/Left/Right` 四个**焦点作用域化**绑定（引擎
+//! `App::bind_key_scoped`：只有焦点落在本树 viewport 子树内时才消费；同屏多个树互不干扰，
+//! 其它滚动容器的方向键默认滚动也不受影响）。`Enter/Space` 走引擎的「焦点节点激活」通道
+//! （列表容器的 Action），由 [`List::on_activate`] 回调触发折叠。
+//!
+//! # 禁用行
+//!
+//! `TreeItem::disabled` 的行不可点击 / 不可键盘导航 / 不可程序化选中（列表内核的 disabled
+//! 集 + [`TreeState::apply_key`] 跳过）；渲染仍是弱化色（旧 gpui `Button::disabled` 语义）。
+//!
+//! # a11y
+//!
+//! 引擎 `A11yRole` 没有 `Tree` / `TreeItem` 角色（§7.4 只列到列表 / 表格），树以 `List` +
+//! `ListBoxOption` 行表达：行标签、展开态、禁用态、选中 / 集合位置均已声明。**树层级导航与
+//! `TreeItem` 专有语义（AT 的展开/折叠树模式）登记为缺口**，待引擎补角色（属引擎批）。
 //!
 //! # 折叠标
 //!
@@ -24,11 +35,17 @@ use std::{cell::RefCell, collections::BTreeSet, rc::Rc};
 
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
+    a11y::A11yPatch,
     app::App,
     error::EngineError,
     event::{Action, KeyBinding, KeyCode, Modifiers},
-    interaction::ItemAlign,
-    node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
+    interaction::{ActionCtx, ItemAlign},
+    node::{
+        builder::NodeBuilder,
+        id::NodeId,
+        signal::{Signal, SignalScope},
+        tree::NodeTree,
+    },
     paint::style::StylePatch,
     text::TextStyle,
     window::WindowId,
@@ -152,9 +169,12 @@ impl TreeState {
         self.expanded.contains(id)
     }
 
-    /// 展开 / 折叠（非文件夹返回 `false`）。
+    /// 展开 / 折叠（非文件夹 / 禁用返回 `false`）。
     pub fn toggle(&mut self, id: &str) -> bool {
-        if self.find(id).is_none_or(|item| !item.is_folder()) {
+        if self
+            .find(id)
+            .is_none_or(|item| !item.is_folder() || item.disabled)
+        {
             return false;
         }
         if !self.expanded.remove(id) {
@@ -163,9 +183,18 @@ impl TreeState {
         true
     }
 
-    /// 展开（非文件夹 / 已展开返回 `false`）。
+    /// 该 id 是否禁用（不存在的 id / 非禁用返回 `false`）。
+    #[must_use]
+    pub fn is_disabled(&self, id: &str) -> bool {
+        self.find(id).is_some_and(|item| item.disabled)
+    }
+
+    /// 展开（非文件夹 / 已展开 / 禁用返回 `false`）。
     pub fn expand(&mut self, id: &str) -> bool {
-        if self.find(id).is_none_or(|item| !item.is_folder()) {
+        if self
+            .find(id)
+            .is_none_or(|item| !item.is_folder() || item.disabled)
+        {
             return false;
         }
         self.expanded.insert(SmolStr::new(id))
@@ -234,8 +263,10 @@ impl TreeState {
 
     /// 键盘导航：返回要执行的结果；`selected` 是当前选中行。
     ///
-    /// - `Up/Down`：在可见行里移动；
-    /// - `Right`：折叠的文件夹展开；已展开的文件夹选到第一个子节点；叶子上移到下一行；
+    /// 不可交互行（[`TreeItem::disabled`]）不展开 / 不折叠 / 不激活；上下移动会跳过它们。
+    ///
+    /// - `Up/Down`：在可见行里移动（跳过禁用行）；
+    /// - `Right`：折叠的文件夹展开；已展开的文件夹选到第一个子节点；叶子无动作；
     /// - `Left`：展开的文件夹折叠；否则选到父节点；
     /// - `Enter`：文件夹折叠 / 展开；叶子无动作。
     pub fn apply_key(&mut self, selected: Option<usize>, key: TreeKey) -> KeyOutcome {
@@ -246,20 +277,24 @@ impl TreeState {
         let last = rows.len() - 1;
         let current = selected.unwrap_or(0).min(last);
         let row = &rows[current];
+        if row.disabled && matches!(key, TreeKey::Left | TreeKey::Right | TreeKey::Enter) {
+            return KeyOutcome::None;
+        }
         match key {
-            TreeKey::Up => KeyOutcome::Select(current.saturating_sub(1)),
-            TreeKey::Down => KeyOutcome::Select((current + 1).min(last)),
+            TreeKey::Up => KeyOutcome::Select(step_over_disabled(&rows, current, false)),
+            TreeKey::Down => KeyOutcome::Select(step_over_disabled(&rows, current, true)),
             TreeKey::Right => {
-                if row.folder && !row.expanded {
-                    if self.expand(&row.id) {
+                if row.folder {
+                    if row.expanded {
+                        KeyOutcome::Select(step_over_disabled(&rows, current, true))
+                    } else if self.expand(&row.id) {
                         KeyOutcome::Toggle { row: current }
                     } else {
                         KeyOutcome::None
                     }
-                } else if self.collapse_if_leaf_selected(&rows, current) {
-                    KeyOutcome::None
                 } else {
-                    KeyOutcome::Select((current + 1).min(last))
+                    // 叶子上右键是 no-op（常见树语义；旧实现的「跳到下一行」会意外移动选中）。
+                    KeyOutcome::None
                 }
             }
             TreeKey::Left => {
@@ -285,12 +320,19 @@ impl TreeState {
             }
         }
     }
+}
 
-    /// `Right` 在「已展开文件夹的最后一个子节点」上不越到父节点之后——由调用方的行表决定；
-    /// 这里只处理「选中的不是文件夹」的情况（返回 `false` 表示继续走默认右移）。
-    fn collapse_if_leaf_selected(&mut self, rows: &[FlatRow], current: usize) -> bool {
-        let _ = (rows, current);
-        false
+/// 朝 `forward` 方向找下一行可交互行（跳过禁用行；没有则停在原地）。
+fn step_over_disabled(rows: &[FlatRow], current: usize, forward: bool) -> usize {
+    if forward {
+        (current + 1..rows.len())
+            .find(|index| !rows[*index].disabled)
+            .unwrap_or(current)
+    } else {
+        (0..current)
+            .rev()
+            .find(|index| !rows[*index].disabled)
+            .unwrap_or(current)
     }
 }
 
@@ -374,6 +416,7 @@ impl TreeOptions {
 
 struct TreeInner {
     key: SmolStr,
+    scope: SignalScope,
     state: Signal<TreeState>,
     flat: Rc<RefCell<Vec<FlatRow>>>,
     list: List,
@@ -410,9 +453,10 @@ impl Tree {
         options: TreeOptions,
     ) -> Self {
         let key = key.into();
+        let scope = app.signal_scope();
         let state = TreeState::new(roots);
         let flat = Rc::new(RefCell::new(state.rows()));
-        let signal = app.signal(state);
+        let signal = app.signal_scoped(scope, state);
         let key_list = key.clone();
         let theme_list = theme.clone();
         let flat_rows = flat.clone();
@@ -443,8 +487,26 @@ impl Tree {
         );
         let count = flat.borrow().len();
         list.set_initial_count(app, count);
+        let disabled = disabled_rows(&flat.borrow());
+        list.set_disabled_rows(disabled);
+        // 行级 a11y：树目前用「列表 + 行」语义（引擎 `A11yRole` 没有 `Tree` / `TreeItem`，
+        // 见模块文档〈a11y〉）：行标签、展开态、禁用态在这里声明，选中 / 位置由列表基线给。
+        let flat_a11y = flat.clone();
+        list.set_row_a11y(move |index| {
+            let flat = flat_a11y.borrow();
+            let Some(row) = flat.get(index) else {
+                return A11yPatch::default();
+            };
+            A11yPatch {
+                label: Some(row.label.clone()),
+                expanded: row.folder.then_some(row.expanded),
+                disabled: Some(row.disabled),
+                ..A11yPatch::default()
+            }
+        });
         let inner = TreeInner {
             list,
+            scope,
             state: signal,
             flat,
             geometry: RefCell::new(TreeGeometry::default()),
@@ -533,8 +595,17 @@ impl Tree {
         Ok(outer)
     }
 
-    /// 注册方向键绑定（全应用一份绑定表：同一 App 只应有一个树实例绑定方向键）。
+    /// 注册方向键绑定（**实例级**：只有本树的列表容器内有焦点时才消费）。
+    ///
+    /// 引擎的 [`App::bind_key_scoped`] 在焦点不在本树 viewport 子树内时**不消费**按键，因此
+    /// 同屏多个树互不干扰，其它滚动容器的方向键默认滚动也不受影响（P2-2 审查 P2）。
+    /// 必须在 [`Tree::attach`] 之后调用（需要窗口与 viewport 节点）；`attach` 会自动调用。
     pub fn bind_keys(&self, app: &mut App) {
+        let (Some(window), Some(viewport)) =
+            (*self.inner.window.borrow(), self.inner.list.viewport_node())
+        else {
+            return;
+        };
         let keys = [
             (KeyCode::ArrowUp, self.inner.actions.up.clone(), TreeKey::Up),
             (
@@ -554,16 +625,27 @@ impl Tree {
             ),
         ];
         for (code, action, key) in keys {
-            app.bind_key(KeyBinding {
-                key: code,
-                modifiers: Modifiers::empty(),
-                action: action.clone(),
-            });
+            app.bind_key_scoped(
+                window,
+                viewport,
+                KeyBinding {
+                    key: code,
+                    modifiers: Modifiers::empty(),
+                    action: action.clone(),
+                },
+            );
             let tree = self.clone();
             app.on_action(action, move |ctx| {
                 tree.on_key(ctx, key);
             });
         }
+    }
+
+    /// 释放本组件的信号作用域（动态创建 / 销毁的树必须调用；先卸载节点再释放）。
+    ///
+    /// 返回被释放的槽位数（展开状态 + 行体列表 / 滚动条的状态）；重复调用返回 0（幂等）。
+    pub fn release(&self, app: &mut App) -> usize {
+        self.inner.list.release(app) + app.release_scope(self.inner.scope)
     }
 
     /// 展开 / 折叠一行；返回行表是否变了。
@@ -574,7 +656,7 @@ impl Tree {
         let Some(flat) = self.inner.flat.borrow().get(row).cloned() else {
             return Ok(false);
         };
-        if !flat.folder {
+        if flat.disabled || !flat.folder {
             return Ok(false);
         }
         let mut state = app.read_with(&self.inner.state, TreeState::clone);
@@ -590,24 +672,30 @@ impl Tree {
     /// `List::set_count` 的引擎错误。
     pub fn toggle(&self, app: &mut App, id: &str) -> Result<bool, EngineError> {
         let mut state = app.read_with(&self.inner.state, TreeState::clone);
-        if !state.toggle(id) {
+        if state.is_disabled(id) || !state.toggle(id) {
             return Ok(false);
         }
         self.rebuild_rows(app, state)
     }
 
-    /// 换根数据（行表 / 展开集全部替换，选中清空）。
+    /// 换根数据（行表 / 展开集全部替换，**滚回顶部**，选中清空）。
     ///
     /// # Errors
-    /// `List::set_count` 的引擎错误。
+    /// `List::set_items` 的引擎错误。
     pub fn set_roots(
         &self,
         app: &mut App,
         roots: impl IntoIterator<Item = TreeItem>,
     ) -> Result<(), EngineError> {
         let state = TreeState::new(roots);
-        self.rebuild_rows(app, state)?;
-        self.inner.list.clear_selection(app);
+        let rows = state.rows();
+        let count = rows.len();
+        let disabled = disabled_rows(&rows);
+        *self.inner.flat.borrow_mut() = rows;
+        self.inner.list.set_disabled_rows(disabled);
+        app.write(&self.inner.state, state);
+        // 换根 = 换数据：重置滚动位置与选中（`set_count` 会保留旧偏移，语义不符）。
+        self.inner.list.set_items(app, count)?;
         Ok(())
     }
 
@@ -615,7 +703,9 @@ impl Tree {
     fn rebuild_rows(&self, app: &mut App, state: TreeState) -> Result<bool, EngineError> {
         let rows = state.rows();
         let count = rows.len();
+        let disabled = disabled_rows(&rows);
         *self.inner.flat.borrow_mut() = rows;
+        self.inner.list.set_disabled_rows(disabled);
         app.write(&self.inner.state, state);
         self.inner.list.set_count(app, count)?;
         Ok(true)
@@ -694,17 +784,47 @@ impl Tree {
         self.inner.geometry.borrow().outer
     }
 
-    fn on_key(&self, ctx: &mut ui_core::interaction::ActionCtx<'_>, key: TreeKey) {
-        let (Some(window), Some(viewport)) =
-            (*self.inner.window.borrow(), self.inner.list.viewport_node())
-        else {
+    fn on_key(&self, ctx: &mut ActionCtx<'_>, key: TreeKey) {
+        // 绑定是实例作用域的；这里再校验一次「焦点在本树 viewport 子树内」，因为多窗口 / 陈旧
+        // 焦点的时序可能让绑定求值与事件分发之间焦点变化。`ctx.window()` 是**事件**所属窗口
+        // （旧实现读树的建窗窗口，多窗口下会用另一窗口的陈旧焦点误操作本树）。
+        let window = ctx.window();
+        let Some(viewport) = self.inner.list.viewport_node() else {
             return;
         };
-        if ctx.app_mut().focused(window) != Some(viewport) {
+        let Some(focused) = ctx.app_mut().focused(window) else {
+            return;
+        };
+        let in_scope = ctx
+            .app_mut()
+            .window(window)
+            .is_some_and(|target| node_in_subtree(target.tree(), focused, viewport));
+        if !in_scope {
             return;
         }
         let _ = self.handle_key(ctx.app_mut(), key);
     }
+}
+
+/// `node` 是否是 `ancestor` 或它的后代（焦点作用域判定）。
+fn node_in_subtree(tree: &NodeTree, node: NodeId, ancestor: NodeId) -> bool {
+    let mut cursor = Some(node);
+    while let Some(current) = cursor {
+        if current == ancestor {
+            return true;
+        }
+        cursor = tree.get(current).ok().and_then(|target| target.parent());
+    }
+    false
+}
+
+/// 行表里不可交互行的下标。
+fn disabled_rows(rows: &[FlatRow]) -> Vec<usize> {
+    rows.iter()
+        .enumerate()
+        .filter(|(_, row)| row.disabled)
+        .map(|(index, _)| index)
+        .collect()
 }
 
 /// 一行内容：缩进 + 层级线 + 折叠标 + 文本。
@@ -898,6 +1018,54 @@ mod tests {
     }
 
     #[test]
+    fn right_on_a_leaf_is_a_no_op() {
+        let mut state = TreeState::new(folders());
+        assert_eq!(
+            state.apply_key(Some(1), TreeKey::Right),
+            KeyOutcome::None,
+            "叶子上的右键不移动选中（常见树语义）"
+        );
+        assert_eq!(state.rows().len(), 3, "行表不变");
+    }
+
+    #[test]
+    fn disabled_rows_are_skipped_and_do_not_toggle() {
+        let mut state = TreeState::new(vec![
+            TreeItem::new("first", "first").child(TreeItem::new("first/a", "a")),
+            TreeItem::new("disabled", "disabled").disabled(),
+            TreeItem::new("disabled-folder", "disabled-folder")
+                .child(TreeItem::new("disabled-folder/a", "a"))
+                .disabled(),
+            TreeItem::new("leaf", "leaf"),
+        ]);
+        // 0 → 1 是禁用行：下移动跳过，落到 3。
+        assert_eq!(
+            state.apply_key(Some(0), TreeKey::Down),
+            KeyOutcome::Select(3),
+            "下移跳过禁用行"
+        );
+        assert_eq!(
+            state.apply_key(Some(3), TreeKey::Up),
+            KeyOutcome::Select(0),
+            "上移跳过禁用行"
+        );
+        assert_eq!(
+            state.apply_key(Some(2), TreeKey::Enter),
+            KeyOutcome::None,
+            "禁用文件夹不能展开"
+        );
+        assert_eq!(
+            state.apply_key(Some(2), TreeKey::Right),
+            KeyOutcome::None,
+            "禁用行不响应右键"
+        );
+        assert!(!state.toggle("disabled-folder"), "禁用文件夹不能切换");
+        assert!(!state.is_expanded("disabled-folder"));
+        assert!(state.is_disabled("disabled"));
+        assert!(!state.is_disabled("leaf"));
+    }
+
+    #[test]
     fn indent_depth_and_folder_flags_survive_flattening() {
         let mut state =
             TreeState::new(vec![TreeItem::new("root", "root").child(
@@ -928,7 +1096,10 @@ mod tests {
 mod ui_tests {
     use smol_str::SmolStr;
     use ui_core::{
-        event::{InputEvent, KeyCode, Modifiers, PointerButton},
+        a11y::A11yRole,
+        event::{Action, InputEvent, KeyCode, Modifiers, PointerButton},
+        interaction::ScrollConfig,
+        math::Size,
         node::{builder::NodeBuilder, tree::NodeKind},
         test_support::app::TestApp,
     };
@@ -953,15 +1124,13 @@ mod ui_tests {
     }
 
     fn harness() -> Harness {
+        harness_with(items())
+    }
+
+    fn harness_with(items: Vec<TreeItem>) -> Harness {
         let mut app = TestApp::new();
         let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
-        let tree = Tree::new(
-            app.app_mut(),
-            theme,
-            "tree",
-            items(),
-            TreeOptions::default(),
-        );
+        let tree = Tree::new(app.app_mut(), theme, "tree", items, TreeOptions::default());
         let window = app.window_id();
         let root = app.app().window(window).expect("window").tree().root();
         let parent = {
@@ -1123,5 +1292,247 @@ mod ui_tests {
             !harness.tree.sync(harness.app.app_mut()).expect("sync"),
             "无变化的 sync 不写状态"
         );
+    }
+
+    fn key_on(app: &mut TestApp, code: KeyCode) {
+        let _ = app.inject(InputEvent::key_down(code, Modifiers::empty()));
+    }
+
+    #[test]
+    fn disabled_rows_reject_clicks_selection_and_toggle() {
+        let mut harness = harness_with(vec![
+            TreeItem::new("first", "first").child(TreeItem::new("first/a", "a")),
+            TreeItem::new("disabled", "disabled").disabled(),
+            TreeItem::new("disabled-folder", "disabled-folder")
+                .child(TreeItem::new("disabled-folder/a", "a"))
+                .disabled(),
+            TreeItem::new("leaf", "leaf"),
+        ]);
+        // 点击禁用行不选中。
+        click_row(&mut harness, 1);
+        assert_eq!(harness.tree.selected_row(harness.app.app()), None);
+        // 程序化选中被拒绝。
+        harness
+            .tree
+            .select_row(harness.app.app_mut(), 2)
+            .expect("select");
+        assert_eq!(
+            harness.tree.selected_row(harness.app.app()),
+            None,
+            "程序化选中禁用行被拒绝"
+        );
+        // 键盘上下跳过禁用行（0 → 3）。
+        click_row(&mut harness, 0);
+        assert_eq!(harness.tree.selected_row(harness.app.app()), Some(0));
+        key(&mut harness, KeyCode::ArrowDown);
+        assert_eq!(
+            harness.tree.selected_row(harness.app.app()),
+            Some(3),
+            "方向键跳过禁用行"
+        );
+        key(&mut harness, KeyCode::ArrowUp);
+        assert_eq!(harness.tree.selected_row(harness.app.app()), Some(0));
+        // 禁用文件夹不能程序化展开 / 折叠。
+        assert!(
+            !harness
+                .tree
+                .toggle(harness.app.app_mut(), "disabled-folder")
+                .expect("toggle")
+        );
+        assert!(
+            !harness
+                .tree
+                .is_expanded(harness.app.app(), "disabled-folder")
+        );
+    }
+
+    #[test]
+    fn arrow_keys_are_scoped_to_the_focused_tree_and_leave_other_scroll_containers_alone() {
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let first = Tree::new(
+            app.app_mut(),
+            theme.clone(),
+            "tree-a",
+            items(),
+            TreeOptions::default(),
+        );
+        let second = Tree::new(
+            app.app_mut(),
+            theme,
+            "tree-b",
+            items(),
+            TreeOptions::default(),
+        );
+        let root = app.app().window(window).expect("window").tree().root();
+        for tree in [&first, &second] {
+            let parent = {
+                let tree_mut = app.app_mut().window_mut(window).expect("window").tree_mut();
+                NodeBuilder::boxed()
+                    .style(StyleBuilder::new().width(240.0).height(180.0).build())
+                    .build(tree_mut, root)
+                    .expect("parent")
+            };
+            tree.mount(app.app_mut(), window, parent).expect("mount");
+        }
+        let external = {
+            let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+            NodeBuilder::boxed()
+                .style(
+                    StyleBuilder::new()
+                        .relative()
+                        .width(100.0)
+                        .height(100.0)
+                        .overflow_hidden()
+                        .build(),
+                )
+                .on_click(Action::custom("external-scroll-focus"))
+                .build(tree, root)
+                .expect("external")
+        };
+        let handle = app
+            .app_mut()
+            .make_scroll(window, external, ScrollConfig::default())
+            .expect("scrollable");
+        app.app_mut()
+            .set_scroll_content(&handle, Size::new(100.0, 400.0))
+            .expect("content");
+        for _ in 0..4 {
+            let _ = app.drain().expect("frame");
+            let _ = first.sync(app.app_mut()).expect("sync");
+            let _ = second.sync(app.app_mut()).expect("sync");
+        }
+        let first_viewport = first.list().viewport_node().expect("first viewport");
+        let second_viewport = second.list().viewport_node().expect("second viewport");
+
+        // 焦点在第一棵树：只有它消费方向键。
+        app.app_mut().set_focus(window, Some(first_viewport));
+        key_on(&mut app, KeyCode::ArrowDown);
+        assert_eq!(first.selected_row(app.app()), Some(1));
+        assert_eq!(second.selected_row(app.app()), None, "未聚焦的树不动");
+
+        // 焦点换到第二棵树：反过来成立。
+        app.app_mut().set_focus(window, Some(second_viewport));
+        key_on(&mut app, KeyCode::ArrowDown);
+        assert_eq!(second.selected_row(app.app()), Some(1));
+        assert_eq!(first.selected_row(app.app()), Some(1), "第一棵树保持不动");
+
+        // 焦点在别的滚动容器：方向键的**默认滚动**照常生效（树不再吞键）。
+        app.app_mut().set_focus(window, Some(external));
+        key_on(&mut app, KeyCode::ArrowDown);
+        let offset = app
+            .app()
+            .scroll_state(&handle)
+            .expect("scroll state")
+            .offset
+            .y;
+        assert!(
+            offset > 0.0,
+            "树的实例级绑定不得吞掉其它控件的默认方向键滚动（offset={offset}）"
+        );
+        assert_eq!(first.selected_row(app.app()), Some(1));
+        assert_eq!(second.selected_row(app.app()), Some(1));
+    }
+
+    #[test]
+    fn tree_rows_declare_list_semantics_to_a11y() {
+        let mut harness = harness();
+        harness.app.enable_a11y_capture();
+        let _ = harness.app.drain().expect("frame");
+        let row0 = harness
+            .tree
+            .list()
+            .row_node(harness.app.app(), 0)
+            .expect("row 0");
+        let viewport = harness.tree.list().viewport_node().expect("viewport");
+        {
+            let snapshot = harness.app.a11y().expect("a11y snapshot");
+            let container = snapshot.node_for(viewport).expect("viewport a11y");
+            assert_eq!(container.role, A11yRole::List);
+            assert_eq!(container.size_of_set, Some(3));
+            let row = snapshot.node_for(row0).expect("row 0 a11y");
+            assert_eq!(row.role, A11yRole::ListBoxOption);
+            assert_eq!(
+                row.label.as_ref().map(ui_core::a11y::A11yLabel::text),
+                Some("first")
+            );
+            assert_eq!(row.expanded, Some(false), "文件夹行宣告折叠态");
+            assert_eq!(row.pos_in_set, Some(0));
+        }
+        // 选中 + 展开后行语义更新。a11y 增量与全量对账一次，顺带拿到最近一笔完整交付。
+        click_row(&mut harness, 0);
+        key(&mut harness, KeyCode::Enter);
+        settle(&mut harness);
+        let row0 = harness
+            .tree
+            .list()
+            .row_node(harness.app.app(), 0)
+            .expect("row 0");
+        assert!(
+            harness.app.a11y_oracle_diff().is_none(),
+            "a11y 增量与强制全树一致"
+        );
+        let snapshot = harness.app.a11y().expect("a11y snapshot");
+        let row = snapshot.node_for(row0).expect("row 0 a11y");
+        assert_eq!(row.selected, Some(true));
+        assert_eq!(row.expanded, Some(true), "展开后折叠态更新");
+    }
+
+    #[test]
+    fn replacing_the_roots_resets_scroll_and_selection() {
+        let mut harness = harness_with(vec![
+            TreeItem::new("a", "a"),
+            TreeItem::new("b", "b"),
+            TreeItem::new("c", "c"),
+            TreeItem::new("d", "d"),
+            TreeItem::new("e", "e"),
+            TreeItem::new("f", "f"),
+            TreeItem::new("g", "g"),
+            TreeItem::new("h", "h"),
+        ]);
+        click_row(&mut harness, 4);
+        harness
+            .tree
+            .list()
+            .scroll_to_item(
+                harness.app.app_mut(),
+                6,
+                ui_core::interaction::ItemAlign::Start,
+            )
+            .expect("scroll");
+        let _ = harness.app.drain().expect("frame");
+        assert!(harness.tree.list().offset(harness.app.app()).unwrap_or(0.0) > 0.0);
+        harness
+            .tree
+            .set_roots(harness.app.app_mut(), vec![TreeItem::new("only", "only")])
+            .expect("roots");
+        settle(&mut harness);
+        assert_eq!(harness.tree.rows().len(), 1);
+        assert_eq!(
+            harness.tree.list().offset(harness.app.app()),
+            Some(0.0),
+            "换根数据回到顶部"
+        );
+        assert_eq!(harness.tree.selected_row(harness.app.app()), None);
+    }
+
+    #[test]
+    fn releasing_the_tree_scope_reclaims_its_signal_slots() {
+        let mut app = TestApp::new();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let tree = Tree::new(
+            app.app_mut(),
+            theme,
+            "released-tree",
+            items(),
+            TreeOptions::default(),
+        );
+        let released = tree.release(app.app_mut());
+        assert!(
+            released >= 6,
+            "展开状态 + 行体列表 / 滚动条信号必须被回收（实际 {released}）"
+        );
+        assert_eq!(tree.release(app.app_mut()), 0, "重复释放幂等");
     }
 }

@@ -13,7 +13,21 @@
 //! - **悬停 / 淡出**：`ScrollbarMode::Hover` 时滑块 `Transient<f32>` 不透明度在悬停 / 拖拽时
 //!   动画到 1、离开后回到 0（`App::animate` + `AnimationSpec::short()`）；`Always` 恒为 1。
 //!   悬停态由 [`ScrollBar::sync`] 读 `App::hovered` 镜像到 `Signal<bool>`（引擎的 hover 不进
-//!   `ReadCtx`，与本批列表的悬停镜像同一机制）。
+//!   `ReadCtx`，与本批列表的悬停镜像同一机制）。动画只在**目标变化**时启动：引擎的
+//!   `animate` 每次都用当前值作新起点并重置时长，逐帧重启会把 120 ms 拉长到 0.4–0.5 s。
+//!
+//! # 模式
+//!
+//! [`ScrollbarMode::Always`] 恒显示、[`ScrollbarMode::Hover`] 悬停 / 拖拽时淡入。旧
+//! `gpui_kit` 的第三种模式 `Scrolling`（滚动时显示、空闲后淡出）本批**未实现**：它需要
+//! 时钟 / 超时状态与帧源接入（滚动停止后还要有一次帧来启动淡出），属后续批次；登记为范围
+//! 缺口（P3-01），旧表 / 菜单 / 侧栏在 widget 迁移前依赖默认模式的调用点需要显式选择
+//! `Always` 或 `Hover`。
+//!
+//! # 生命周期
+//!
+//! 组件的信号与瞬态值归属**自有** `SignalScope`（[`ScrollBar::release`] 释放）。动态创建 /
+//! 销毁的滚动条在卸载节点后调用一次；引用淡出瞬态值的动画槽由引擎在释放时同批取消。
 //!
 //! # 轴
 //!
@@ -26,7 +40,10 @@
 //! 与淡出**只在变化时**写：偏移不变时 `LayoutOverride` 等值 no-op、`Transient` 已到目标时不再
 //! `animate`（I3：静止无帧）。
 
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
@@ -39,7 +56,7 @@ use ui_core::{
     node::{
         builder::NodeBuilder,
         id::NodeId,
-        signal::{Signal, Transient},
+        signal::{Signal, SignalScope, Transient},
         tree::NodeTree,
     },
     paint::style::StylePatch,
@@ -90,6 +107,7 @@ pub enum ScrollbarMode {
     Always,
     /// 指针在滚动条上或拖动时才显示（淡入淡出）。
     Hover,
+    // 旧 `gpui_kit` 的 `Scrolling`（滚动时显示、空闲淡出）未实现：见模块文档〈模式〉。
 }
 
 /// 滚动条参数。
@@ -145,9 +163,17 @@ struct ScrollBarInner {
     theme: ThemeHandle,
     axis: ScrollbarAxis,
     options: ScrollbarOptions,
+    /// 组件自有信号作用域（动态创建 / 销毁的滚动条释放它回收槽位）。
+    scope: SignalScope,
     hovered: Signal<bool>,
     scrollable: Signal<bool>,
     fade: Transient<f32>,
+    /// 淡出动画**当前目标**：只在目标变化时启动动画。
+    ///
+    /// 旧实现在动画在飞时（`current != target`）每帧重新 `animate`，而引擎每次重启都会用
+    /// **当前值**作新起点、重置时钟 —— 120 ms 的动画被拉长到 0.4–0.5 s。这里记住目标，
+    /// 稳态（目标没变）不再启动。
+    fade_target: Cell<Option<f32>>,
     drag: Transient<Option<DragStart>>,
     geometry: RefCell<Geometry>,
     track_action: Action,
@@ -184,12 +210,15 @@ impl ScrollBar {
         } else {
             0.0
         };
+        let scope = app.signal_scope();
         Self {
             inner: Rc::new(ScrollBarInner {
-                hovered: app.signal(false),
-                scrollable: app.signal(false),
-                fade: app.transient(initial_fade),
-                drag: app.transient(None),
+                scope,
+                hovered: app.signal_scoped(scope, false),
+                scrollable: app.signal_scoped(scope, false),
+                fade: app.transient_scoped(scope, initial_fade),
+                fade_target: Cell::new(None),
+                drag: app.transient_scoped(scope, None),
                 geometry: RefCell::new(Geometry::default()),
                 track_action: Action::Custom(format_smolstr!("{key}.track")),
                 thumb_action: Action::Custom(format_smolstr!("{key}.thumb")),
@@ -268,15 +297,7 @@ impl ScrollBar {
     }
 
     /// 接滚动容器：取 `ScrollHandle` 并注册交互。
-    ///
-    /// # Errors
-    /// 无（滚动容器尚未可滚动时 `sync` 保持静默）；保留 `Result` 以便后续引擎校验错误外传。
-    pub fn attach(
-        &self,
-        app: &mut App,
-        window: WindowId,
-        scroll_node: NodeId,
-    ) -> Result<(), EngineError> {
+    pub fn attach(&self, app: &mut App, window: WindowId, scroll_node: NodeId) {
         let handle = app.scroll_handle(window, scroll_node);
         {
             let mut geometry = self.inner.geometry.borrow_mut();
@@ -287,16 +308,22 @@ impl ScrollBar {
         app.on_action(self.inner.track_action.clone(), move |ctx| {
             track.on_track_click(ctx);
         });
-        let thumb = self.clone();
         app.on_action(self.inner.thumb_action.clone(), move |_ctx| {
-            // 滑块上的按下由拖拽会话消费；点击不做事，只吞掉轨道点击（避免误跳）。
-            let _ = &thumb;
+            // 滑块上的点击/拖拽已经消费了事件；保留一个空 handler 是为了让命中**停在这里**
+            // （动作沿命中节点 → 祖先冒泡取第一条），否则同一次点击还会触发轨道的页面跳转。
         });
         let drag = self.clone();
         app.on_action(self.inner.drag_action.clone(), move |ctx| {
             drag.on_thumb_drag(ctx);
         });
-        Ok(())
+    }
+
+    /// 释放本组件的信号作用域（动态创建 / 销毁的滚动条调用；先卸载节点再释放）。
+    ///
+    /// 返回被释放的槽位数（悬停 / 可滚动 / 淡出不透明度 / 拖拽快照）；引用淡出瞬态值的动画
+    /// 由引擎在释放时同批取消。重复调用返回 0（幂等）。
+    pub fn release(&self, app: &mut App) -> usize {
+        app.release_scope(self.inner.scope)
     }
 
     /// 轨道 / 滑块节点（测试用）。
@@ -407,17 +434,22 @@ impl ScrollBar {
             }
         };
         let current_opacity = *app.read_transient(&self.inner.fade);
-        if (current_opacity - target_opacity).abs() > 1.0e-4 {
-            app.animate(
-                window,
-                AnimatedValue::Scalar {
-                    target: self.inner.fade,
-                    to: target_opacity,
-                },
-                &[thumb],
-                AnimationSpec::short(),
-            )?;
-            changed = true;
+        // 只在**目标变化**时启动动画：目标不变时（动画在飞）不重启，否则引擎每次都用当前值
+        // 作新起点并重置时钟，120 ms 的规格会被拖长到 0.4–0.5 s（P2-2b）。
+        if self.inner.fade_target.get() != Some(target_opacity) {
+            if (current_opacity - target_opacity).abs() > 1.0e-4 {
+                app.animate(
+                    window,
+                    AnimatedValue::Scalar {
+                        target: self.inner.fade,
+                        to: target_opacity,
+                    },
+                    &[thumb],
+                    AnimationSpec::short(),
+                )?;
+                changed = true;
+            }
+            self.inner.fade_target.set(Some(target_opacity));
         }
         Ok(changed)
     }
@@ -795,8 +827,7 @@ mod ui_tests {
             let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
             bar.build(tree, container).expect("scrollbar");
         }
-        bar.attach(app.app_mut(), window, container)
-            .expect("attach");
+        bar.attach(app.app_mut(), window, container);
         let mut harness = ScrollHarness {
             app,
             bar,
@@ -894,6 +925,106 @@ mod ui_tests {
             0.0,
             "离开后滑块淡出到 0"
         );
+    }
+
+    /// 淡出动画只在**目标变化**时启动：16 ms 采样在规格时长（120 ms）内到达端点，
+    /// 动画在飞时 `sync` 不再重复 `animate`（旧实现逐帧重启 ⇒ 128 ms 只到 0.95）。
+    #[test]
+    fn the_fade_reaches_its_target_within_the_spec_without_restarting() {
+        let mut harness = harness(ScrollbarMode::Hover);
+        let (track, _) = harness.bar.nodes();
+        let track = track.expect("track");
+        let bounds = harness.app.probe().bounds(track).expect("track bounds");
+        let inside = ui_core::math::Point::new(
+            bounds.origin.x + bounds.size.width / 2.0,
+            bounds.origin.y + bounds.size.height / 2.0,
+        );
+        let _ = harness
+            .app
+            .inject(InputEvent::pointer_move(inside, Modifiers::empty()));
+        let mut started = false;
+        for _ in 0..8 {
+            harness.app.advance(Duration::from_millis(16));
+            let _ = harness.app.drain().expect("frame");
+            let changed = harness.bar.sync(harness.app.app_mut()).expect("sync");
+            if started {
+                assert!(
+                    !changed,
+                    "动画在飞、目标未变时不得重复启动（sync 必须是 no-op）"
+                );
+            } else {
+                assert!(changed, "悬停必须启动淡入动画");
+                started = true;
+            }
+        }
+        let opacity = harness.bar.opacity(harness.app.app());
+        assert!(
+            opacity >= 0.999,
+            "120 ms 规格内到达 1（128 ms 实际 {opacity}）"
+        );
+
+        let outside = ui_core::math::Point::new(bounds.origin.x - 60.0, bounds.origin.y);
+        let _ = harness
+            .app
+            .inject(InputEvent::pointer_move(outside, Modifiers::empty()));
+        let mut started = false;
+        for _ in 0..8 {
+            harness.app.advance(Duration::from_millis(16));
+            let _ = harness.app.drain().expect("frame");
+            let changed = harness.bar.sync(harness.app.app_mut()).expect("sync");
+            if started {
+                assert!(!changed, "淡出同样只在目标变化时启动");
+            } else {
+                assert!(changed, "离开必须启动淡出动画");
+                started = true;
+            }
+        }
+        let opacity = harness.bar.opacity(harness.app.app());
+        assert!(
+            opacity <= 0.001,
+            "淡出在 120 ms 规格内到达 0（实际 {opacity}）"
+        );
+    }
+
+    /// 释放作用域回收信号 / 瞬态槽位；在飞淡出动画被引擎同批取消（无死槽位写入）。
+    #[test]
+    fn releasing_the_scope_reclaims_state_and_cancels_the_fade() {
+        let mut harness = harness(ScrollbarMode::Hover);
+        let (track, _) = harness.bar.nodes();
+        let track = track.expect("track");
+        let bounds = harness.app.probe().bounds(track).expect("track bounds");
+        let inside = ui_core::math::Point::new(
+            bounds.origin.x + bounds.size.width / 2.0,
+            bounds.origin.y + bounds.size.height / 2.0,
+        );
+        let _ = harness
+            .app
+            .inject(InputEvent::pointer_move(inside, Modifiers::empty()));
+        let _ = harness.app.drain().expect("frame");
+        let _ = harness.bar.sync(harness.app.app_mut()).expect("sync");
+        let window = harness.app.window_id();
+        let removed = harness
+            .app
+            .app_mut()
+            .window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .remove(harness.container)
+            .expect("remove container");
+        assert!(!removed.is_empty());
+        let released = harness.bar.release(harness.app.app_mut());
+        assert!(
+            released >= 4,
+            "悬停 / 可滚动 / 淡出不透明度 / 拖拽快照必须被回收（实际 {released}）"
+        );
+        assert_eq!(
+            harness.bar.release(harness.app.app_mut()),
+            0,
+            "重复释放幂等"
+        );
+        // 动画槽已被取消：推进时钟 + 出帧不得写已回收的瞬态值。
+        harness.app.advance(Duration::from_millis(200));
+        let _ = harness.app.drain().expect("frame");
     }
 
     #[test]

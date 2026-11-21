@@ -212,6 +212,12 @@ pub struct App {
     close_handlers: ahash::HashMap<WindowId, CloseHandler>,
     /// 键盘绑定表（线性扫描：默认 3 条 + 应用若干）。
     bindings: Vec<KeyBinding>,
+    /// **焦点作用域化**的键盘绑定（线性扫描；只在焦点落在 `scope` 子树内时消费）。
+    ///
+    /// 与 [`App::bindings`] 的区别是「谁有资格吃这个键」：全局绑定（`Ctrl+S` / `Tab` / `Esc`）
+    /// 是应用级语义；而文本框的编辑键、树的方向键这类只在**某个实例聚焦时**成立。放在全局表里
+    /// 会吞掉其它控件的默认键盘行为（引擎在命中绑定后不再走 `default_key_scroll`）。
+    scoped_bindings: Vec<ScopedKeyBinding>,
     /// 输入判定阈值（probe 真值；平台在 `platform_init` 覆盖）。
     thresholds: InputThresholds,
     /// 引擎时钟（生产由平台每轮 `sync_clock`，测试由 `TestApp::advance` 推进）。
@@ -286,6 +292,19 @@ struct ClickRecord {
     count: u8,
 }
 
+/// 一条焦点作用域化的键盘绑定（`App::bind_key_scoped`）。
+///
+/// 命中条件 = `(key, modifiers)` 精确匹配 **且** 该窗口的焦点节点在 `scope` 子树内（含
+/// `scope` 自身）。不满足焦点条件时**不消费**，继续走全局绑定 / 默认键盘行为。
+struct ScopedKeyBinding {
+    /// 绑定所属窗口（焦点是每窗口状态；同一 `NodeId` 不会跨窗口）。
+    window: WindowId,
+    /// 焦点作用域根：焦点必须是它或它的后代。
+    scope: NodeId,
+    /// 实际绑定（键 + 修饰键 + 动作）。
+    binding: KeyBinding,
+}
+
 /// 一个动画槽（`tick_animations` 推进；`t == 1.0` 时删槽）。
 struct AnimationSlot {
     /// 单调 id（`AnimationId` 的载荷）。
@@ -341,6 +360,15 @@ impl AnimationTarget {
                 *left == *right
             }
             _ => false,
+        }
+    }
+
+    /// 是否驱动 `ids` 里的某个瞬态值（作用域释放时取消动画用）。
+    fn targets_any(&self, ids: &[SignalId]) -> bool {
+        match self {
+            Self::Scalar { transient, .. } => ids.contains(&transient.id()),
+            Self::Color { transient, .. } => ids.contains(&transient.id()),
+            Self::Scroll { .. } => false,
         }
     }
 }
@@ -498,6 +526,7 @@ impl App {
             handlers: ahash::HashMap::default(),
             close_handlers: ahash::HashMap::default(),
             bindings: default_bindings(),
+            scoped_bindings: Vec::new(),
             thresholds: InputThresholds::platform_default(),
             clock: Instant::now(),
             a11y_delivered: ahash::HashMap::default(),
@@ -843,14 +872,18 @@ impl App {
         signal_api::signal_scoped(self, scope, initial)
     }
 
-    /// 释放信号作用域：其值**立即回收**（槽位归还空闲栈、代际 +1），依赖图里以它们为键的边被
-    /// **立即**删除；此后旧句柄的读 panic、写/更新是 no-op（见 [`SignalScope`]）。
+    /// 释放信号作用域：其值（信号 / 瞬态值）**立即回收**（槽位归还空闲栈、代际 +1），依赖图里
+    /// 以它们为键的边被**立即**删除；此后旧句柄的读 panic、写/更新是 no-op（见 [`SignalScope`]）。
+    /// 引用该作用域瞬态值的动画槽同批取消，不会在下一帧写死槽位。
     ///
     /// **派生侧**：根作用域派生的闭包若捕获了本作用域的句柄，释放后既不会再被失效（缓存永久
     /// 陈旧），又会在下次重算时读死句柄 panic。引擎无法检测不透明闭包，因此这是应用层硬契约
     /// （禁止跨作用域捕获，见 [`App::derived`] 与 [`Derived`]）。
     ///
-    /// 返回被释放的信号数（重复释放返回 0；根作用域不可释放）。
+    /// **节点侧**：`bind_style` / `bind_text` / `bind_a11y` 闭包捕获的句柄在释放后一求值就
+    /// panic。组件先卸载自己的节点、再释放作用域（`base_ui` 组件的 `release` 即此顺序契约）。
+    ///
+    /// 返回被释放的值槽位数（信号 + 瞬态值；重复释放返回 0；根作用域不可释放）。
     pub fn release_scope(&mut self, scope: SignalScope) -> usize {
         signal_api::release_scope(self, scope)
     }
@@ -858,6 +891,22 @@ impl App {
     /// 建一个瞬态值（读不登记、写不失效）。
     pub fn transient<T: Clone + 'static>(&mut self, initial: T) -> Transient<T> {
         signal_api::transient(self, initial)
+    }
+
+    /// 在指定作用域里注册瞬态值（随 [`App::release_scope`] 一起回收）。
+    ///
+    /// 与 [`App::transient`] 语义相同，只是归属组件自有作用域：动态创建/销毁的组件（滚动条
+    /// 淡出、拖拽快照）用它在卸载时释放槽位。释放后旧句柄的读 panic / 写 no-op；引用它的
+    /// 动画槽在释放时一并取消（否则下一帧会写已回收的槽位）。
+    ///
+    /// # Panics
+    /// `scope` 已释放（引擎误用：释放后不可再 mint 值）。
+    pub fn transient_scoped<T: Clone + 'static>(
+        &mut self,
+        scope: SignalScope,
+        initial: T,
+    ) -> Transient<T> {
+        signal_api::transient_scoped(self, scope, initial)
     }
 
     /// 注册一个派生值（**不**立即求值；环在运行期检测）。
@@ -1058,8 +1107,23 @@ impl App {
     }
 
     /// 添加/替换一条键盘绑定（同 `(key, modifiers)` 后写覆盖）。
+    ///
+    /// 这是**应用级**绑定：不论焦点落在哪个控件上都命中（`Ctrl+S` / `Tab` / `Esc`）。
+    /// 只在某个实例聚焦时才成立的键（文本编辑键、树方向键）用 [`App::bind_key_scoped`]。
     pub fn bind_key(&mut self, binding: KeyBinding) {
         style_pass::bind_key(self, binding)
+    }
+
+    /// 添加/替换一条**焦点作用域化**的键盘绑定（同 `(window, scope, key, modifiers)` 后写覆盖）。
+    ///
+    /// 只有该窗口的焦点节点落在 `scope` 子树内时，绑定才命中并消费按键；否则按键继续走全局
+    /// 绑定与默认键盘行为（方向键滚动等）。作用域根恒为普通节点（不是 `Action`）：多个实例
+    /// （同屏多个树 / 文本域）可以各自绑定同一个键，互不干扰。
+    ///
+    /// 焦点节点在绑定求值时读取（`App::focused` 已过滤陈旧 / 模态作用域外焦点），因此多窗口与
+    /// 节点回收后不会误操作。
+    pub fn bind_key_scoped(&mut self, window: WindowId, scope: NodeId, binding: KeyBinding) {
+        style_pass::bind_key_scoped(self, window, scope, binding)
     }
 
     /// 删除一条键盘绑定（返回是否真的删了）。

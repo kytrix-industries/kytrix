@@ -16,9 +16,18 @@
 //! 2. 内核在 [`List::sync`] 里给还没有子节点的行容器补一个**内容容器**
 //!    （`"{key}:row:{index}:content"`），再调用应用的行内容回调把子树建进内容容器。
 //!
-//! 行内容因此最多晚一帧出现：引擎在帧内挂载行（滚动 / 重排之后），组合根在下一帧的 `on_frame`
-//! 钩子里调用 `sync` 补内容。旧 gpui 列表是同步渲染的，这是引擎行工厂形态带来的真实差异，
-//! 已登记到评审意见（替代方案是自建挂载，会绕开 E3 虚拟列表）。
+//! `sync` 与重建路径（`set_items` / `set_count` / `push`）都**同步**补内容，因此非滚动重建
+//! 后首帧就有行内容。仍有两类晚一帧：①**首帧**——`attach` 时视口尚未布局，引擎只挂行容器，
+//! 下一帧 `rewindow_virtuals` 才挂行；②**帧内挂载的新行**——`scroll_to_item` / 树选中滚动
+//! 把行挂进当帧，内容在下一帧 `sync` 补（滚动时 overscan 的新行多在视口外，影响小）。这是
+//! 引擎行工厂（`FnMut(usize) -> NodeBuilder` 单节点）的限制，登记为残余；替代方案是行工厂
+//! 返回子树 / rewindow 后回调。
+//!
+//! # 生命周期
+//!
+//! 组件的信号（选中 / 悬停 / 条目数，以及滚动条的状态）都归属**组件自有** `SignalScope`
+//! （[`List::release`] 释放，槽位立即回收）。动态创建 / 销毁列表（对话框、选择面板）必须在
+//! 卸载节点后调用 `release`；常驻组件可以不调（与根作用域等价）。
 //!
 //! # 行高
 //!
@@ -27,7 +36,7 @@
 //!   `set_virtual_extents` 回写（引擎重算前缀和并按锚点补偿偏移，E3 语义）。未挂载的行保持
 //!   估计值，滚动到那里后再量。
 //!
-//! 应用层的 [`RowHeights`] 只服务双端列表锚点换算与测量回写，滚动帧不重建它（前缀和只在行高
+//! 应用层的 `RowHeights` 只服务双端列表锚点换算与测量回写，滚动帧不重建它（前缀和只在行高
 //! 变更时重建）。
 //!
 //! # 双端列表（deque）
@@ -47,6 +56,7 @@ use std::{cell::RefCell, collections::BTreeSet, rc::Rc};
 
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
+    a11y::A11yPatch,
     app::App,
     error::EngineError,
     event::{Action, Modifiers},
@@ -54,7 +64,12 @@ use ui_core::{
         ActionCtx, ItemAlign, ScrollHandle, VirtualList, VirtualListConfig, VirtualListState,
     },
     math::Point,
-    node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
+    node::{
+        builder::NodeBuilder,
+        id::NodeId,
+        signal::{Signal, SignalScope},
+        tree::NodeTree,
+    },
     paint::style::StylePatch,
     window::WindowId,
 };
@@ -296,7 +311,7 @@ impl Selection {
 }
 
 /// 一次点击对选中集的作用（纯函数：`Ctrl` 切换、`Shift` 区间、普通单选）。
-pub fn apply_click(
+pub(crate) fn apply_click(
     selection: &mut Selection,
     index: usize,
     mode: SelectionMode,
@@ -323,8 +338,10 @@ pub fn apply_click(
 /// 引擎 `VirtualSlot` 里已有一份同语义的前缀和（布局真相）；这里再存一份是给应用层的
 /// **双端列表锚点换算**与测量回写用（需要在 `&mut App` 之外做纯计算、且可单测）。
 /// 只有测量 / 双端 push 会改它，滚动帧不碰（I3 的预算前提）。
+///
+/// 实现细节（`pub(crate)`）：没有下游消费者，公开面只保留组件本身。
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct RowHeights {
+pub(crate) struct RowHeights {
     heights: Vec<f32>,
     prefix: Vec<f32>,
 }
@@ -353,8 +370,9 @@ impl RowHeights {
     }
 
     /// 当前条目数。
+    #[cfg(test)]
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.heights.len()
     }
 
@@ -371,8 +389,9 @@ impl RowHeights {
     }
 
     /// 第 `index` 项的高度。
+    #[cfg(test)]
     #[must_use]
-    pub fn get(&self, index: usize) -> Option<f32> {
+    pub(crate) fn get(&self, index: usize) -> Option<f32> {
         self.heights.get(index).copied()
     }
 
@@ -462,7 +481,7 @@ impl RowHeights {
 
 /// 双端 push 之前的读者位置。
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PushAnchor {
+pub(crate) struct PushAnchor {
     /// 读者读的条目在旧下标里的位置。
     pub index: usize,
     /// 该条目内的偏移。
@@ -476,7 +495,7 @@ pub struct PushAnchor {
 /// 返回 `None` = 没有可保持的位置（列表此前为空），调用方按 0 处理；否则是
 /// `(新下标, 行内偏移)`。`full` 表示 push 前容量已满（会丢最旧一条）。
 #[must_use]
-pub fn push_anchor_after(
+pub(crate) fn push_anchor_after(
     anchor: PushAnchor,
     full: bool,
     reverse: bool,
@@ -498,6 +517,57 @@ pub fn push_anchor_after(
 /// 行内容回调：把一行（或单元格）的子树建进 `parent`（应用侧建树，内核不解释内容）。
 pub type RowContent = dyn Fn(&mut NodeTree, NodeId, usize) -> Result<(), EngineError>;
 
+/// 把 `over` 里 `Some` 的 a11y 字段覆盖到 `base`（`None` 保留基线）。
+///
+/// `A11yPatch` 是值语义的「本帧补丁」：两条来源（列表行基线 + 组合控件的行补丁）必须合并成
+/// 一份，`bind_a11y` 一个节点只能有一条通道。
+fn merge_a11y(base: &mut A11yPatch, over: A11yPatch) {
+    macro_rules! cover {
+        ($($field:ident),+ $(,)?) => {
+            $(
+                if over.$field.is_some() {
+                    base.$field = over.$field;
+                }
+            )+
+        };
+    }
+    cover!(
+        role,
+        label,
+        value,
+        description,
+        disabled,
+        hidden,
+        row_index,
+        column_index,
+        row_count,
+        column_count,
+        checked,
+        selected,
+        expanded,
+        live,
+        pos_in_set,
+        size_of_set,
+        numeric_value,
+        min_numeric_value,
+        max_numeric_value,
+        numeric_value_step,
+        numeric_value_jump,
+        actions,
+        key,
+        sort,
+        selection,
+        custom_actions,
+        read_only,
+        modal,
+        busy,
+        invalid,
+        error_message,
+        placeholder,
+        level,
+    );
+}
+
 /// 列表的内核句柄（`Rc` 浅拷贝：`bind_style` / Action handler 里各持一份）。
 #[derive(Clone)]
 pub struct List {
@@ -509,9 +579,15 @@ struct ListInner {
     theme: ThemeHandle,
     options: ListOptions,
     content: Rc<RowContent>,
+    /// 本组件自有的信号作用域（动态创建 / 销毁的列表释放它回收槽位）。
+    scope: SignalScope,
     selection: Signal<Selection>,
     hovered: Signal<Option<usize>>,
     count: Signal<usize>,
+    /// 不可交互行（树用它表达 `TreeItem::disabled`）：命中 / 选中 / 激活都跳过。
+    disabled: RefCell<BTreeSet<usize>>,
+    /// 行级 a11y 补丁（表 / 树在列表基线上叠加角色 / 标签 / 展开态）。
+    row_a11y: RefCell<Option<Rc<dyn Fn(usize) -> A11yPatch>>>,
     heights: RefCell<RowHeights>,
     geometry: RefCell<Geometry>,
     select_action: Action,
@@ -546,11 +622,15 @@ impl List {
             ScrollbarAxis::Vertical,
             ScrollbarOptions::default(),
         );
+        let scope = app.signal_scope();
         Self {
             inner: Rc::new(ListInner {
-                selection: app.signal(Selection::new()),
-                hovered: app.signal(None),
-                count: app.signal(0usize),
+                scope,
+                selection: app.signal_scoped(scope, Selection::new()),
+                hovered: app.signal_scoped(scope, None),
+                count: app.signal_scoped(scope, 0usize),
+                disabled: RefCell::new(BTreeSet::new()),
+                row_a11y: RefCell::new(None),
                 heights: RefCell::new(RowHeights::default()),
                 geometry: RefCell::new(Geometry::default()),
                 content: Rc::new(content),
@@ -568,6 +648,36 @@ impl List {
     #[must_use]
     pub fn key(&self) -> &str {
         &self.inner.key
+    }
+
+    /// 释放本组件的信号作用域（动态创建 / 销毁的列表必须调用一次）。
+    ///
+    /// 返回被释放的槽位数（选中 / 悬停 / 条目数 + 滚动条的状态）。**先卸载节点再释放**：
+    /// `bind_style` / `bind_a11y` 闭包捕获了这些句柄，释放后一次求值就会读死句柄 panic。
+    /// 重复调用返回 0（幂等）。
+    pub fn release(&self, app: &mut App) -> usize {
+        self.inner.scrollbar.release(app) + app.release_scope(self.inner.scope)
+    }
+
+    /// 登记不可交互行（组合控件用：树的 `TreeItem::disabled`）。
+    ///
+    /// 内核在点击 / 程序化选中 / 键盘激活入口过滤这些行；行内容本身仍会渲染（弱化色由调用方
+    /// 的 `bind_style` 决定）。
+    pub(crate) fn set_disabled_rows(&self, rows: impl IntoIterator<Item = usize>) {
+        *self.inner.disabled.borrow_mut() = rows.into_iter().collect();
+    }
+
+    /// 该行是否不可交互。
+    #[must_use]
+    pub(crate) fn is_disabled(&self, index: usize) -> bool {
+        self.inner.disabled.borrow().contains(&index)
+    }
+
+    /// 行级 a11y 补丁（组合控件用：表格在列表基线上叠加 `Row` / 单元格语义，树叠加标签 /
+    /// 展开态）。补丁里 `Some` 的字段覆盖列表基线（`selected` / `pos_in_set` /
+    /// `size_of_set` / `disabled`），`None` 保留基线。
+    pub(crate) fn set_row_a11y(&self, row_a11y: impl Fn(usize) -> A11yPatch + 'static) {
+        *self.inner.row_a11y.borrow_mut() = Some(Rc::new(row_a11y));
     }
 
     /// 只建节点（外层 + 虚拟列表容器 + 滚动条），不接引擎。
@@ -596,10 +706,17 @@ impl List {
             .min_height_0()
             .overflow_hidden()
             .build();
+        let count = self.inner.count;
         let viewport = NodeBuilder::boxed()
             .id(format_smolstr!("{key}:viewport"))
             .style(viewport_style)
             .on_click(self.inner.select_action.clone())
+            // a11y：虚拟列表容器的角色由引擎按种类推导成 `List`；这里补集合大小，
+            // 屏幕阅读器才能播报「第 N 项，共 M 项」（§7.4）。
+            .bind_a11y(move |cx| A11yPatch {
+                size_of_set: Some(*cx.read(&count)),
+                ..A11yPatch::default()
+            })
             .build(tree, outer)?;
         if self.inner.options.scrollbar {
             self.inner.scrollbar.build(tree, outer)?;
@@ -645,7 +762,7 @@ impl List {
             geometry.handle = handle;
         }
         if options.scrollbar {
-            self.inner.scrollbar.attach(app, window, viewport)?;
+            self.inner.scrollbar.attach(app, window, viewport);
         }
         let select = self.clone();
         app.on_action(self.inner.select_action.clone(), move |ctx| {
@@ -722,9 +839,10 @@ impl List {
         self.inner.hovered
     }
 
-    /// 行高表快照（变高列表的测量结果；固定行高时为空表）。
+    /// 行高表快照（变高列表的测量结果；固定行高时为空表）。测试专用：没有下游消费者。
+    #[cfg(test)]
     #[must_use]
-    pub fn row_heights(&self) -> RowHeights {
+    pub(crate) fn row_heights(&self) -> RowHeights {
         self.inner.heights.borrow().clone()
     }
 
@@ -770,7 +888,12 @@ impl List {
     }
 
     /// 选中 `index`（单选语义；`None` = 清空）。
+    ///
+    /// 不可交互行（[`List::set_disabled_rows`]）不接受程序化选中：返回 `false` 且不改选中集。
     pub fn select(&self, app: &mut App, index: Option<usize>) -> bool {
+        if index.is_some_and(|index| self.is_disabled(index)) {
+            return false;
+        }
         let mut selection = Selection::new();
         if let Some(index) = index {
             selection.select(index);
@@ -908,41 +1031,9 @@ impl List {
         let mut changed = false;
         let rows = self.mounted_rows(app);
         // ① 补行内容（引擎只挂了行容器）。
-        let mut populated_now: Vec<usize> = Vec::new();
-        for &(index, row) in &rows {
-            let needs_content = app
-                .window(window)
-                .and_then(|target| target.tree().get(row).ok())
-                .is_some_and(|node| node.children().is_empty());
-            if !needs_content {
-                continue;
-            }
-            let content = self.inner.content.clone();
-            let content_id = format_smolstr!("{}:row:{}:content", self.inner.key, index);
-            let content_style = StyleBuilder::new()
-                .flex_row()
-                .width_full()
-                .min_width_0()
-                .min_height_0()
-                .build();
-            {
-                let Some(target) = app.window_mut(window) else {
-                    return Ok(changed);
-                };
-                let tree = target.tree_mut();
-                let parent = NodeBuilder::boxed()
-                    .id(content_id)
-                    .style(content_style)
-                    .build(tree, row)?;
-                content(tree, parent, index)?;
-            }
-            populated_now.push(index);
-            changed = true;
-        }
+        let populated_now = self.fill_row_contents(app, window)?;
         if !populated_now.is_empty() {
-            for &(_, row) in &rows {
-                app.request_node_repaint(window, row)?;
-            }
+            changed = true;
         }
         // ② 悬停行镜像（引擎的 hover 是全局 Event，ReadCtx 读不到；P2-4 的机制前移到本批的
         //    最小镜像：sync 时比对一次，变了才写信号）。
@@ -996,6 +1087,54 @@ impl List {
         Ok(changed)
     }
 
+    /// 给「已挂载但还没有子节点」的行补内容容器 + 应用行内容；返回本次补了内容的下标。
+    ///
+    /// 同步建树（不是帧驱动）：`sync` 与 `rebuild`（`set_items` / `set_count` / `push`）都调它，
+    /// 因此重建路径首帧就有行内容。只有**引擎在帧内挂载**的新行（首帧、`scroll_to_item` 跳跃）
+    /// 要等下一帧的 `sync` 才补 —— 见模块文档〈行内容的挂载时机〉。
+    fn fill_row_contents(
+        &self,
+        app: &mut App,
+        window: WindowId,
+    ) -> Result<Vec<usize>, EngineError> {
+        let rows = self.mounted_rows(app);
+        let mut populated: Vec<usize> = Vec::new();
+        for &(index, row) in &rows {
+            let needs_content = app
+                .window(window)
+                .and_then(|target| target.tree().get(row).ok())
+                .is_some_and(|node| node.children().is_empty());
+            if !needs_content {
+                continue;
+            }
+            let content = self.inner.content.clone();
+            let content_id = format_smolstr!("{}:row:{}:content", self.inner.key, index);
+            let content_style = StyleBuilder::new()
+                .flex_row()
+                .width_full()
+                .min_width_0()
+                .min_height_0()
+                .build();
+            let Some(target) = app.window_mut(window) else {
+                break;
+            };
+            let tree = target.tree_mut();
+            let parent = NodeBuilder::boxed()
+                .id(content_id)
+                .style(content_style)
+                .build(tree, row)?;
+            content(tree, parent, index)?;
+            populated.push(index);
+        }
+        // P3-11：只标本次真的补了内容的行（旧实现把整个可见窗口都标脏）。
+        for &(index, row) in &rows {
+            if populated.contains(&index) {
+                app.request_node_repaint(window, row)?;
+            }
+        }
+        Ok(populated)
+    }
+
     /// 行容器节点（已挂载时）。
     #[must_use]
     pub fn row_node(&self, app: &App, index: usize) -> Option<NodeId> {
@@ -1042,7 +1181,9 @@ impl List {
         let hit_node = ctx.hit().map(|hit| hit.node);
         if hit_node.is_none() {
             let selected = self.selection(ctx.app_mut()).first();
-            if let Some(index) = selected {
+            if let Some(index) = selected
+                && !self.is_disabled(index)
+            {
                 let callback = self.inner.activate.borrow().clone();
                 if let Some(callback) = callback {
                     callback(ctx.app_mut(), index);
@@ -1053,6 +1194,10 @@ impl List {
         let Some(index) = self.row_index_at_node(ctx.app_mut(), hit_node) else {
             return;
         };
+        // 不可交互行：点击既不选中也不激活（旧 gpui `Button::disabled` 语义）。
+        if self.is_disabled(index) {
+            return;
+        }
         let mode = self.inner.options.selection;
         if mode != SelectionMode::None {
             let ctrl = ctx.modifiers().contains(Modifiers::CONTROL);
@@ -1078,7 +1223,9 @@ impl List {
         let theme = self.inner.theme.clone();
         let selection = self.inner.selection;
         let hovered = self.inner.hovered;
+        let count = self.inner.count;
         let options = self.inner.options.clone();
+        let inner = self.inner.clone();
         move |index| {
             let row_style = StyleBuilder::new()
                 .flex_row()
@@ -1098,6 +1245,7 @@ impl List {
                 row_style.items_center().build()
             };
             let row_theme = theme.clone();
+            let a11y_inner = inner.clone();
             NodeBuilder::boxed()
                 .id(format_smolstr!("{key}:row:{index}"))
                 .style(row_style)
@@ -1116,6 +1264,23 @@ impl List {
                         ..StylePatch::default()
                     }
                 })
+                // a11y 行基线（§7.4：虚拟列表行 = `ListBoxOption`，位置走 `pos_in_set` /
+                // `size_of_set`）：选中 / 禁用 / 集合位置由内核声明；组合控件（表格 / 树）的
+                // `set_row_a11y` 补丁在此基础上叠加角色 / 标签 / 展开态。
+                .bind_a11y(move |cx| {
+                    let mut patch = A11yPatch {
+                        selected: Some(cx.read(&selection).contains(index)),
+                        pos_in_set: Some(index),
+                        size_of_set: Some(*cx.read(&count)),
+                        disabled: Some(a11y_inner.disabled.borrow().contains(&index)),
+                        ..A11yPatch::default()
+                    };
+                    let row_a11y = a11y_inner.row_a11y.borrow().clone();
+                    if let Some(row_a11y) = row_a11y {
+                        merge_a11y(&mut patch, row_a11y(index));
+                    }
+                    patch
+                })
         }
     }
 
@@ -1126,6 +1291,7 @@ impl List {
         count: usize,
         target_offset: Option<f32>,
     ) -> Result<(), EngineError> {
+        let window = self.inner.geometry.borrow().window;
         let (Some(list), Some(handle)) = (
             self.inner.geometry.borrow().list,
             self.inner.geometry.borrow().handle,
@@ -1153,6 +1319,11 @@ impl List {
             Ok(())
         })?;
         app.write(&self.inner.count, count);
+        // 同步补行内容（P2-2b）：`set_virtual_items` 已把行容器挂上，这里立刻建内容子树，
+        // 重建路径的首帧就不是空行。`scroll_to_item` 在帧内挂载的新行仍走下一帧 `sync`。
+        if let Some(window) = window {
+            let _ = self.fill_row_contents(app, window)?;
+        }
         Ok(())
     }
 }
@@ -1221,15 +1392,16 @@ impl ListInner {
     }
 }
 
-/// 一行容器的调试 id。
+/// 一行容器的调试 id（测试用：生产侧只解析、不拼装）。
+#[cfg(test)]
 #[must_use]
-pub fn row_debug_id(key: &str, index: usize) -> SmolStr {
+pub(crate) fn row_debug_id(key: &str, index: usize) -> SmolStr {
     format_smolstr!("{key}:row:{index}")
 }
 
 /// 从行容器的调试 id 解析下标（内容容器 / 其他 id 返回 `None`）。
 #[must_use]
-pub fn parse_row_index(key: &str, id: &str) -> Option<usize> {
+pub(crate) fn parse_row_index(key: &str, id: &str) -> Option<usize> {
     id.strip_prefix(key)?.strip_prefix(":row:")?.parse().ok()
 }
 
@@ -1474,6 +1646,106 @@ mod ui_tests {
         out
     }
 
+    /// 重建路径（`set_items` / `set_count` / `push`）同步补行内容：调用返回时行内容已经挂好。
+    #[test]
+    fn rebuilding_items_populates_row_contents_in_the_same_call() {
+        let mut harness = harness(10);
+        harness
+            .list
+            .set_items(harness.app.app_mut(), 5)
+            .expect("set items");
+        assert_eq!(harness.list.count(harness.app.app()), 5);
+        // 不 drain、不 sync：重建路径在 `set_virtual_items` 之后同步建内容容器 + 行内容。
+        assert_eq!(
+            row_texts(harness.app.app(), harness.app.window_id(), &harness.list, 0),
+            vec![SmolStr::new_static("row0")],
+            "set_items 返回时首行内容已挂载"
+        );
+        assert_eq!(
+            row_texts(harness.app.app(), harness.app.window_id(), &harness.list, 4),
+            vec![SmolStr::new_static("row4")]
+        );
+        let _ = harness.app.drain().expect("frame");
+        let _ = harness.list.sync(harness.app.app_mut()).expect("sync");
+        assert_eq!(harness.list.count(harness.app.app()), 5);
+    }
+
+    /// 禁用行：点击不选中、程序化选中被拒绝（旧 gpui `Button::disabled` 语义）。
+    #[test]
+    fn disabled_rows_reject_clicks_and_programmatic_selection() {
+        let mut harness = harness(5);
+        harness.list.set_disabled_rows([1usize]);
+        let row = harness.list.row_node(harness.app.app(), 1).expect("row 1");
+        let point = center(&harness.app, row);
+        click(&mut harness.app, point);
+        assert!(
+            harness.list.selection(harness.app.app()).is_empty(),
+            "点击禁用行不选中"
+        );
+        let row = harness.list.row_node(harness.app.app(), 0).expect("row 0");
+        let point = center(&harness.app, row);
+        click(&mut harness.app, point);
+        assert_eq!(harness.list.selection(harness.app.app()).first(), Some(0));
+        assert!(
+            !harness.list.select(harness.app.app_mut(), Some(1)),
+            "程序化选中禁用行被拒绝"
+        );
+        assert_eq!(
+            harness.list.selection(harness.app.app()).first(),
+            Some(0),
+            "拒绝后选中集不变"
+        );
+        assert!(harness.list.select(harness.app.app_mut(), Some(2)));
+    }
+
+    /// 行信号暴露 a11y 语义（§7.4）：容器 `List`、行 `ListBoxOption`、选中 / 位置 / 集合大小。
+    #[test]
+    fn rows_declare_list_semantics_to_a11y() {
+        let mut harness = harness(4);
+        harness.app.enable_a11y_capture();
+        let _ = harness.app.drain().expect("frame");
+        let viewport = harness.list.viewport_node().expect("viewport");
+        let row0 = harness.list.row_node(harness.app.app(), 0).expect("row 0");
+        let row1 = harness.list.row_node(harness.app.app(), 1).expect("row 1");
+        {
+            let snapshot = harness.app.a11y().expect("a11y snapshot");
+            let container = snapshot.node_for(viewport).expect("viewport a11y");
+            assert_eq!(container.role, ui_core::a11y::A11yRole::List);
+            assert_eq!(container.size_of_set, Some(4), "列表宣告集合大小");
+            let row = snapshot.node_for(row0).expect("row 0 a11y");
+            assert_eq!(row.role, ui_core::a11y::A11yRole::ListBoxOption);
+            assert_eq!(row.pos_in_set, Some(0));
+            assert_eq!(row.size_of_set, Some(4));
+            assert_eq!(row.selected, Some(false));
+        }
+        let point = center(&harness.app, row1);
+        click(&mut harness.app, point);
+        let _ = harness.app.drain().expect("frame");
+        let snapshot = harness.app.a11y().expect("a11y snapshot");
+        let row = snapshot.node_for(row1).expect("row 1 a11y");
+        assert_eq!(row.selected, Some(true), "选中态进 a11y");
+    }
+
+    /// 组件自有信号作用域：`release` 回收槽位（动态列表不泄漏），重复调用幂等。
+    #[test]
+    fn releasing_the_list_scope_reclaims_its_signal_slots() {
+        let mut app = TestApp::new();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let list = List::new(
+            app.app_mut(),
+            theme,
+            "released",
+            ListOptions::fixed(ROW_EXTENT),
+            text_row,
+        );
+        let released = list.release(app.app_mut());
+        assert!(
+            released >= 5,
+            "三条列表信号 + 滚动条两条信号必须被回收（实际 {released}）"
+        );
+        assert_eq!(list.release(app.app_mut()), 0, "重复释放幂等");
+    }
+
     #[test]
     fn a_fixed_list_mounts_only_the_visible_window() {
         let harness = harness(20);
@@ -1690,6 +1962,11 @@ mod ui_tests {
             data.push_back(8);
         }
         harness.list.push(harness.app.app_mut()).expect("push");
+        assert_eq!(
+            row_texts(harness.app.app(), harness.app.window_id(), &harness.list, 0),
+            vec![SmolStr::new_static("row1")],
+            "push 返回时行内容已按新下标同步重建"
+        );
         settle(&mut harness);
         assert_eq!(harness.list.count(harness.app.app()), 8);
         assert_eq!(

@@ -717,7 +717,38 @@ pub(crate) fn on_key(
                 return;
             }
         }
-        // ③ 全局绑定（精确匹配 key + modifiers）。
+        // ③a 焦点作用域化绑定（P2-2 修复批）：只有本窗口焦点落在 `scope` 子树内时才命
+        //     中并消费；焦点不在作用域内时**不消费**，继续走 ③b 全局绑定与 ④ 默认键盘行为。
+        //     这是「树的方向键只在自己聚焦时吃掉」与「文本框编辑键」的机制；放在全局绑定
+        //     之前，因此实例级绑定优先于应用级快捷键。
+        let focused = app.focused(window);
+        let scoped_action = focused.and_then(|focused| {
+            let tree = app.windows.get(&window)?.tree();
+            app.scoped_bindings
+                .iter()
+                .find(|scoped| {
+                    scoped.window == window
+                        && scoped.binding.key == code
+                        && scoped.binding.modifiers == modifiers
+                        && crate::interaction::overlay::is_in_subtree(tree, focused, scoped.scope)
+                })
+                .map(|scoped| scoped.binding.action.clone())
+        });
+        if let (Some(action), Some(node)) = (scoped_action, focused)
+            && app.dispatch_action_with_hit(
+                window,
+                node,
+                action.clone(),
+                ActionSource::Key,
+                None,
+                modifiers,
+            )
+        {
+            outcome.action = Some(action);
+            outcome.target = Some(node);
+            return;
+        }
+        // ③b 全局绑定（精确匹配 key + modifiers）。
         //
         //    绑定是**应用级**语义（`Ctrl+S`、`Tab`、`Esc`），不是「激活某个节点」：它不受模态
         //    作用域限制（对话框里仍要能按 Esc 关闭、Tab 遍历模态内控件）。target 只是
@@ -729,9 +760,8 @@ pub(crate) fn on_key(
             .find(|binding| binding.key == code && binding.modifiers == modifiers)
             .map(|binding| binding.action.clone());
         if let Some(action) = binding {
-            let node = app
-                .focused(window)
-                .or_else(|| app.windows.get(&window).map(|target| target.tree().root()));
+            let node =
+                focused.or_else(|| app.windows.get(&window).map(|target| target.tree().root()));
             let Some(node) = node else {
                 return;
             };

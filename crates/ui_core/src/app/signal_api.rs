@@ -49,6 +49,18 @@ pub(crate) fn transient<T: Clone + 'static>(app: &mut App, initial: T) -> Transi
     Transient::new(id)
 }
 
+/// 建一个**作用域内**的瞬态值（组件自有生命周期；随作用域释放回收）。
+///
+/// 作用域已释放时 panic（引擎误用）。消费者：`App::transient_scoped`。
+pub(crate) fn transient_scoped<T: Clone + 'static>(
+    app: &mut App,
+    scope: SignalScope,
+    initial: T,
+) -> Transient<T> {
+    let id = app.store.push_transient_scoped(scope, initial);
+    Transient::new(id)
+}
+
 /// 注册一个派生值（**不**立即求值；环在运行期检测）。
 /// 消费者：`App::derived`。
 ///
@@ -73,8 +85,11 @@ pub(crate) fn signal_scope(app: &mut App) -> SignalScope {
 /// 释放信号作用域：其值**立即回收**（槽位归还空闲栈、代际 +1），依赖图里以它们为键的边
 /// **立即**删除，旧句柄从此读 panic / 写 no-op（见 [`SignalScope`]）。
 ///
-/// 返回被释放的信号数。重复释放返回 0（幂等）；根作用域不会被释放（返回 0）。
+/// 返回被释放的值槽位数（信号 + 瞬态值）。重复释放返回 0（幂等）；根作用域不会被释放（返回 0）。
 /// 消费者：`App::release_scope` / `App::close_window`。
+///
+/// 引用这些瞬态值的动画槽同批取消：否则下一帧 `tick_animations` 会写已回收的槽位（引擎不变式
+/// 被破坏）。取消发生在槽位回收之后、同一调用内 —— 中间没有帧推进，不会读到死句柄。
 ///
 /// 只清值槽位与依赖边：**根作用域里捕获了这些句柄的派生不会被失效**（旧边已删），下次因其它
 /// 依赖重算会读死句柄 panic —— 跨作用域捕获是应用层硬禁令（R5c，见 `Derived` 文档）。
@@ -83,6 +98,10 @@ pub(crate) fn release_scope(app: &mut App, scope: SignalScope) -> usize {
         return 0;
     };
     let released = signals.len();
+    if !signals.is_empty() {
+        app.animations
+            .retain(|slot| !slot.target.targets_any(&signals));
+    }
     for signal in signals {
         // 立即删边（不是"等下次写时惰性清理"）：释放的价值就是之后的写不再遍历任何 owner。
         // 键是完整 `SignalId`（下标 + 代际），复用后的新信号代际不同 ⇒ 不会继承这些边。
