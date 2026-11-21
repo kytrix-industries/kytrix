@@ -267,7 +267,8 @@ pub(crate) fn on_pointer_down(
             target.pointer_mut().press = None;
             target.pointer_mut().pending_drag = None;
         }
-        app.remove_node(window, node);
+        // 节点已由别的路径卸载时不再重复收尾：本次按下仍然整体消费（不落到下层控件）。
+        let _ = app.remove_node(window, node);
         return;
     }
     // ② 模态浮层的焦点作用域（R02-12）：作用域外的按下整体消费 —— 不抢焦点、不激活下层

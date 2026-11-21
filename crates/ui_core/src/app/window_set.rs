@@ -2,23 +2,72 @@
 //!
 //! `app.rs` 的 `impl App` 只保留同名薄委托，方法体在这里（零行为变更的纯拆分）。
 
-use super::App;
+use super::{App, RemoveOutcome};
 use crate::{
     error::EngineError,
     interaction,
-    node::{dependency::Owner, id::NodeId},
+    node::{dependency::Owner, id::NodeId, signal::SignalScope},
     window::{Window, WindowId, WindowOptions},
 };
 
-/// 消费者：`App::remove_node`。
+/// 消费者：`App::remove_node`（不带作用域释放）。
+pub(crate) fn remove_node(
+    app: &mut App,
+    window: WindowId,
+    node: NodeId,
+) -> Result<RemoveOutcome, EngineError> {
+    remove(app, window, node, None)
+}
+
+/// 消费者：`App::remove_node_with_scope`（卸载节点后同一调用里释放 `scope`）。
+pub(crate) fn remove_node_with_scope(
+    app: &mut App,
+    window: WindowId,
+    node: NodeId,
+    scope: SignalScope,
+) -> Result<RemoveOutcome, EngineError> {
+    remove(app, window, node, Some(scope))
+}
+
+/// 卸载子树并自动清理引擎级生命周期资源（R-21 引擎下沉，E16）。
 ///
-/// 删除浮层时顺带处理**焦点恢复**（R02-12）：`App::close_overlay`、`Dismiss` 动作与
-/// 「点击外部关闭」三条路径都经过这里，把恢复集中在此才不会漏掉其中一条。
+/// 这是 `App::remove_node` / `App::remove_node_with_scope` 的唯一实现。删除浮层时顺带处理
+/// **焦点恢复**（R02-12）：`App::close_overlay`、`Dismiss` 动作与「点击外部关闭」三条路径都
+/// 经过这里，把恢复集中在此才不会漏掉其中一条。
 ///
 /// 删除子树时还必须**作废落在子树内的指针会话**（R02-8）：捕获目标被卸载后，旧实现让
 /// `pointer_captured()` 永久返回死节点、平台捕获永不释放、按下记录卡在「按住」。
-pub(crate) fn remove_node(app: &mut App, window: WindowId, node: NodeId) -> bool {
-    // 先取浮层的 opener（删除之后槽随节点一起消失）。
+///
+/// # 顺序（不可交换，理由见 `App::remove_node` 的文档）
+///
+/// 校验（无副作用）→ 浮层 / 指针会话记取 → 删树 + detach 依赖边 → scoped 键绑定 →
+/// `after_scoped` 定时器 → 动画槽 → 模态 a11y / 焦点恢复 → 可选 `release_scope` → 请求一帧。
+fn remove(
+    app: &mut App,
+    window: WindowId,
+    node: NodeId,
+    scope: Option<SignalScope>,
+) -> Result<RemoveOutcome, EngineError> {
+    // ① 校验**先于任何副作用**：`UnknownWindow` / `StaleNode`（含 root）调用后状态不变。
+    let (mut outcome, removed_set) = {
+        let Some(target) = app.windows.get(&window) else {
+            return Err(EngineError::UnknownWindow { window });
+        };
+        let tree = target.tree();
+        // 跨窗口句柄在 `NodeTree::get` 处确定性失败；root 不是可移除的子节点（N11）。
+        if tree.get(node).is_err() || node == tree.root() {
+            return Err(EngineError::StaleNode { node });
+        }
+        let mut ids: Vec<NodeId> = Vec::with_capacity(16);
+        tree.for_each_subtree(node, |id| ids.push(id));
+        let outcome = RemoveOutcome {
+            removed_nodes: ids.len(),
+            ..RemoveOutcome::default()
+        };
+        (outcome, ids)
+    };
+    let removed_set: ahash::HashSet<NodeId> = removed_set.into_iter().collect();
+    // ② 先取浮层的 opener（删除之后槽随节点一起消失）。
     let (opener, modal) = app.windows.get(&window).map_or((None, false), |target| {
         let slot = target.tree().overlay_slot(node);
         (
@@ -31,11 +80,10 @@ pub(crate) fn remove_node(app: &mut App, window: WindowId, node: NodeId) -> bool
     // `DragPhase::Cancel`）、清按压/待定拖拽、请求平台释放捕获、清悬停。
     let captured = app.windows.get(&window).is_some_and(|target| {
         let tree = target.tree();
-        tree.get(node).is_ok()
-            && target
-                .pointer()
-                .capture
-                .is_some_and(|captured| interaction::overlay::is_in_subtree(tree, captured, node))
+        target
+            .pointer()
+            .capture
+            .is_some_and(|captured| interaction::overlay::is_in_subtree(tree, captured, node))
     });
     if captured {
         app.cancel_pointer_session(window);
@@ -48,41 +96,92 @@ pub(crate) fn remove_node(app: &mut App, window: WindowId, node: NodeId) -> bool
             }),
         );
     }
-    let Some(target) = app.windows.get_mut(&window) else {
-        return false;
+    // ③ 删树：`NodeTree::remove` 把被删节点的 deps 交还，这里逐条 detach（P1-2.5）。
+    // 否则死边会随「挂载/卸载」次数无界累积，而 `App::write` 是最高频热路径 —— 成本会从
+    // O(活跃读者) 退化成 O(历史挂载过的所有读者)。
+    let detached = {
+        let Some(target) = app.windows.get_mut(&window) else {
+            // 校验与删树之间没有 `&mut App` 调用，窗口不可能消失；防御性收口。
+            return Err(EngineError::UnknownWindow { window });
+        };
+        target.tree_mut().remove(node)?
     };
-    // 卸载子树必须同步解开依赖边（P1-2.5）：`NodeTree::remove` 把被删节点的 deps 交还，
-    // 这里逐条 detach。否则死边会随「挂载/卸载」次数无界累积，而 `App::write` 是最高频
-    // 热路径 —— 成本会从 O(活跃读者) 退化成 O(历史挂载过的所有读者)。
-    let removed = match target.tree_mut().remove(node) {
-        Ok(detached) => {
-            for (node, deps) in detached {
-                for signal in deps {
-                    app.graph.detach(signal, Owner::Node { window, node });
-                }
-            }
-            true
+    for (removed_node, deps) in detached {
+        for signal in deps {
+            app.graph.detach(
+                signal,
+                Owner::Node {
+                    window,
+                    node: removed_node,
+                },
+            );
         }
-        Err(_) => false,
-    };
-    if removed {
-        // E8：`bind_key_scoped` 的 scope 若落在被卸载的子树内，绑定必须同批清除 —— 否则
-        // 表项会一直留到关窗（视觉上「没反应」，实际是永不命中的泄漏）。只卸载后代的场景
-        // 不受影响：祖先 scope 仍在树里，绑定保留。
+    }
+    // ④–⑥ 引擎级生命周期资源：scoped 键绑定 / `after_scoped` 定时器 / 与子树绑定的动画槽。
+    let (scoped_key_bindings, timers, animations) =
+        cleanup_removed_subtree(app, window, &removed_set);
+    outcome.scoped_key_bindings = scoped_key_bindings;
+    outcome.timers = timers;
+    outcome.animations = animations;
+    // ⑦ 模态浮层关闭 ⇒ 背景的 a11y `hidden` 语义整体恢复：全树标 `A11Y`，下一笔增量交付
+    // 必须把「背景重新可见」送到 AT（与 `create_overlay` 的打开路径对称）。
+    if modal && let Some(target) = app.windows.get_mut(&window) {
+        crate::a11y::tree::mark_modal_scope_changed(target.tree_mut());
+    }
+    super::focus::restore_focus(app, window, opener);
+    // ⑧ 可选的作用域释放：必须在节点已卸载之后（`bind_*` 闭包不得求值到已回收句柄）。
+    if let Some(scope) = scope {
+        let animations_before = app.animations.len();
+        outcome.released_values = app.release_scope(scope);
+        // `release_scope` 取消引用被释放瞬态值的动画槽（`Released`），与本函数 ⑥ 的判据
+        // 互补；计数合并（同一槽只可能被其中一条路径取消）。
+        outcome.animations += animations_before - app.animations.len();
+    }
+    // ⑨ 卸载改变了像素 ⇒ 请求一帧（与 `App::set_focus` 等 App 级变更同口径）。只在帧调度
+    // 空闲时唤醒：帧内卸载（浮层淡出收尾 / 动画完成回调）已在本帧管线里，重复唤醒会让泵
+    // 多跑一轮空提交。清理本身（解绑 / 取消定时器 / 取消动画）不请求帧、不进入连续帧（I3）。
+    if app.windows.get(&window).is_some_and(Window::frame_idle) {
+        app.request_frame();
+    }
+    Ok(outcome)
+}
+
+/// 卸载后自动清理引擎级生命周期资源（E16 / R-21），返回
+/// `(scoped_key_bindings, timers, animations)` 三类清理条数。
+///
+/// 调用前提：节点**已从树里移除**（scoped 绑定 / 定时器按「scope 不再存活」判定），`removed`
+/// 是被卸载子树的句柄集合（动画按重绘节点 / 滚动目标归属）。
+///
+/// 消费者：
+/// - [`remove`]：`App::remove_node` 的完整语义（另有指针会话 / 浮层 / 焦点 / 作用域释放）；
+/// - **虚拟列表行回收**（`app::virtual_list::rewindow_virtual`，引擎内部高频路径）：行上的
+///   scoped 资源同样必须在回收时清掉，否则滚动会留下永不命中的绑定、到期回调跑在死行上的
+///   定时器、以及给死行标脏的动画（否则 R-21 只是在公开入口闭合了一半）。
+pub(crate) fn cleanup_removed_subtree(
+    app: &mut App,
+    window: WindowId,
+    removed: &ahash::HashSet<NodeId>,
+) -> (usize, usize, usize) {
+    // E8：`bind_key_scoped` 的 scope 若落在被卸载的子树内，绑定必须同批清除 —— 否则表项会
+    // 一直留到关窗（视觉上「没反应」，实际是永不命中的泄漏）。只卸载后代的场景不受影响：
+    // 祖先 scope 仍在树里，绑定保留。
+    let scoped_key_bindings = {
+        let Some(target) = app.windows.get(&window) else {
+            return (0, 0, 0);
+        };
         let tree = target.tree();
+        let before = app.scoped_bindings.len();
         app.scoped_bindings
             .retain(|scoped| scoped.window != window || tree.get(scoped.scope).is_ok());
-        // 模态浮层关闭 ⇒ 背景的 a11y `hidden` 语义整体恢复：全树标 `A11Y`，下一笔增量
-        // 交付必须把「背景重新可见」送到 AT（与 `create_overlay` 的打开路径对称）。
-        if modal {
-            crate::a11y::tree::mark_modal_scope_changed(target.tree_mut());
-        }
-        // E10：`after_scoped` 的节点作用域若落在被卸载的子树内，定时器同批取消（与 scoped 键
-        // 绑定同一生命周期规则）；不取消的话到期回调会跑在「组件已经不存在」的状态上。
-        super::timer::retain_live_scopes(app, window);
-        super::focus::restore_focus(app, window, opener);
-    }
-    removed
+        before - app.scoped_bindings.len()
+    };
+    // E10：`after_scoped` 的节点作用域若落在被卸载的子树内，定时器同批取消（与 scoped 键
+    // 绑定同一生命周期规则）；不取消的话到期回调会跑在「组件已经不存在」的状态上。
+    let timers = super::timer::retain_live_scopes(app, window);
+    // 动画槽：重绘节点 / 滚动目标落在被卸载子树内的槽同批取消。不取消的话
+    // `tick_animations` 会继续给死节点标脏、为一条已经看不见的动画持续请求帧。
+    let animations = super::animation::cancel_node_animations(app, window, removed);
+    (scoped_key_bindings, timers, animations)
 }
 
 // ── 窗口 ──────────────────────────────────────────────────────────────────

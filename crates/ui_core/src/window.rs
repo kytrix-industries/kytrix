@@ -940,6 +940,11 @@ impl Window {
     }
 
     /// 应用层建树的唯一入口（`NodeBuilder::build` 的 `&mut NodeTree` 来自这里）。
+    ///
+    /// **卸载必须走 [`App::remove_node`](crate::app::App::remove_node)**：这里拿到的
+    /// `NodeTree::remove` 是引擎内部原语，**不做 scoped 清理**（键绑定 / `after_scoped` 定时器 /
+    /// 动画槽 / 指针会话 / 浮层焦点恢复）。直接调它会留下永不命中的 scoped 绑定、到期后跑在
+    /// 死节点上的定时器、以及给死节点标脏的动画（R-21，E16）。
     pub fn tree_mut(&mut self) -> &mut NodeTree {
         &mut self.tree
     }
@@ -1167,6 +1172,13 @@ impl Window {
     }
     pub(crate) fn begin_frame(&mut self) -> Option<FrameTicket> {
         frame::begin_frame(self)
+    }
+    /// 帧调度是否空闲（没有已请求 / 进行中的帧）。
+    ///
+    /// 消费者：`App::remove_node` —— 树改动后只在真正空闲时唤醒泵；帧内 / 已有待办帧时本帧
+    /// 管线会消费这次改动，重复唤醒会让泵多跑一轮空提交。
+    pub(crate) fn frame_idle(&self) -> bool {
+        self.scheduler.is_idle()
     }
     /// 实现见子模块 `frame::force_full_republish`（合成线程重启之后整帧重发）。
     pub(crate) fn force_full_republish(&mut self) {

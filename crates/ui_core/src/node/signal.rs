@@ -2236,8 +2236,11 @@ mod tests {
             "跨窗口节点不得成为另一窗口的指针捕获目标"
         );
         assert!(
-            !app.remove_node(second, node),
-            "跨窗口节点不得被另一窗口卸载"
+            matches!(
+                app.remove_node(second, node),
+                Err(EngineError::StaleNode { node: reported }) if reported == node
+            ),
+            "跨窗口节点不得被另一窗口卸载（强类型 StaleNode）"
         );
         assert!(
             app.window(first)

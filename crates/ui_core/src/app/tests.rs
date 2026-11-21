@@ -825,7 +825,7 @@ fn removing_a_node_detaches_its_dependencies() {
         .tree_mut()
         .remove(bare)
         .expect("裸卸载");
-    assert!(app.remove_node(window, managed), "App 路径卸载");
+    assert!(app.remove_node(window, managed).is_ok(), "App 路径卸载");
 
     let after = crate::test_support::diagnostics::dependency_dump(&app);
     assert_eq!(

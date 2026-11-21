@@ -105,7 +105,7 @@ pub(crate) fn create_overlay(
 /// 关闭浮层（节点不存在 ⇒ `false`）。
 /// 消费者：`App::close_overlay`。
 pub(crate) fn close_overlay(app: &mut App, overlay: &Overlay) -> bool {
-    app.remove_node(overlay.window(), overlay.node())
+    app.remove_node(overlay.window(), overlay.node()).is_ok()
 }
 
 /// 帧首按**上一帧布局的实测尺寸**重新求值锚点定位（P2-6）。
@@ -238,7 +238,7 @@ pub(crate) fn dismiss_overlay(app: &mut App, window: WindowId) -> bool {
         overlay_util::topmost(tree, tree.root()).map(|(node, _)| node)
     });
     match node {
-        Some(node) => app.remove_node(window, node),
+        Some(node) => app.remove_node(window, node).is_ok(),
         None => false,
     }
 }

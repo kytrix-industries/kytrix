@@ -100,6 +100,26 @@ pub struct StylePassReport {
     pub text_changed: usize,
 }
 
+/// 一次节点子树卸载的清理计数（[`App::remove_node`] / [`App::remove_node_with_scope`]）。
+///
+/// 只做**诊断 / 断言**用：计数描述「引擎替应用清掉了什么」，不是业务状态。没有可清理的条目
+/// 时为零（例如叶子节点没有任何 scoped 绑定 / 定时器 / 动画）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RemoveOutcome {
+    /// 被卸载的节点数（含整棵子树）。
+    pub removed_nodes: usize,
+    /// 自动清除的焦点作用域化键绑定条数（`App::bind_key_scoped`）。
+    pub scoped_key_bindings: usize,
+    /// 自动取消的一次性定时器条数（`App::after_scoped`）。
+    pub timers: usize,
+    /// 自动取消的动画槽条数（重绘节点全部落在被卸载子树内 / 滚动动画目标节点被卸载 /
+    /// 作用域释放路径取消）。
+    pub animations: usize,
+    /// [`App::remove_node_with_scope`] 释放的信号作用域值槽位数（信号 + 瞬态值；
+    /// [`App::remove_node`] 恒为 0）。
+    pub released_values: usize,
+}
+
 /// 引擎侧全部状态。字段全私有（`field_scoped_visibility_modifiers` 禁止字段级可见性）。
 pub struct App {
     store: StateStore,
@@ -424,6 +444,11 @@ pub enum AnimationEndKind {
     Replaced,
     /// 驱动值所属作用域被释放（`App::release_scope`）—— 目标已回收，旧槽同批取消。
     Released,
+    /// 动画的重绘节点 / 滚动目标所在子树被 [`App::remove_node`] 卸载（E16）。
+    ///
+    /// 与 [`AnimationEndKind::Cancelled`] 区分：应用没有持有 [`AnimationId`] 主动取消，是引擎
+    /// 在卸载路径上替它收尾（[`RemoveOutcome::animations`] 也给出条数）。终值**没有**写入。
+    Removed,
 }
 
 /// 一次动画终止事件（[`App::on_animation_complete`] 的载荷；E10）。
@@ -1974,11 +1999,89 @@ impl App {
         overlay::dismiss_overlay(self, window)
     }
 
-    /// 卸载一棵子树（浮层关闭 / 虚拟列表回收 / 应用主动移除的公共出口）。
+    /// 卸载一棵子树，并**自动清理挂在这棵子树上的引擎级生命周期资源**（R-21 引擎下沉，E16）。
     ///
-    /// 只接受**该窗口**的节点句柄：跨窗口句柄在 `NodeTree::get` 处确定性失败（返回 `false`）。
-    pub(crate) fn remove_node(&mut self, window: WindowId, node: NodeId) -> bool {
+    /// 这是应用卸载容器 / 面板 / 浮层的**唯一入口**。`NodeTree::remove` / `Window::tree_mut`
+    /// 是引擎内部原语：不经本方法会留下 scoped 键绑定、`after_scoped` 定时器与动画槽（见这
+    /// 两个 API 的文档）。
+    ///
+    /// # 清理顺序（不可交换）
+    ///
+    /// 1. 校验窗口与节点 —— **错误路径不产生任何副作用**；
+    /// 2. 记取浮层 opener / 模态状态与「捕获目标落在子树内」的指针会话，必要时先收尾
+    ///    （派发 `PointerCancel`、请求平台释放捕获、清按压 / 拖拽 / 悬停）；
+    /// 3. `NodeTree::remove`（结构 + lane 回收 + 容器登记 + damage），逐条 detach 被删节点的
+    ///    信号依赖边；
+    /// 4. **scoped 键绑定**（[`App::bind_key_scoped`]）：`scope` 落在被卸载子树内的条目删除，
+    ///    祖先 scope 的绑定保留；
+    /// 5. **`after_scoped` 定时器**（[`App::after_scoped`]）：`scope` 落在被卸载子树内的条目取消，
+    ///    未派发的回调不会再跑在「组件已不存在」的状态上；
+    /// 6. **动画槽**（[`App::animate`]）：重绘节点**全部**落在被卸载子树内、或滚动动画的
+    ///    `ScrollHandle` 节点被卸载的槽取消，并按 [`AnimationEndKind::Removed`] 入队完成事件；
+    ///    部分重绘节点存活的槽保留并剔除死节点（共享动画不被误杀）；
+    /// 7. 模态浮层关闭的 a11y 背景语义恢复 + 焦点还给 opener（与 `App::close_overlay` 同路径）；
+    /// 8. 若由 [`App::remove_node_with_scope`] 调用，在节点已卸载之后 `release_scope`：其瞬态值
+    ///    被回收，引用它们的动画同批取消（[`AnimationEndKind::Released`]）；
+    /// 9. 请求一帧（卸载改变了像素；帧内卸载不重复唤醒 —— 本帧管线会消费脏位）。
+    ///
+    /// 顺序不可交换：先卸载节点再释放作用域，`bind_style` / `bind_text` / `bind_a11y` 闭包
+    /// 才不会被求值到已回收的句柄上（E8 组件契约）；作用域释放放在动画清理之后，保证同一个
+    /// 动画槽只被一条路径取消 / 计数。
+    ///
+    /// # 不清理的部分（应用义务，最小安全边界）
+    ///
+    /// - **Action handler**（[`App::on_action`]）：按 `Action` 全局索引，同一个动作可能被多个
+    ///   组件 / 窗口共享，引擎无法把它归属到一棵子树。自动摘除会静默破坏其它存活组件，因此
+    ///   仍由调用方 [`App::off_action`]；
+    /// - **全局键绑定**（[`App::bind_key`]）：同理，按 `(key, modifiers)` 全局索引；
+    /// - **`SignalScope`**：节点的生命周期与信号作用域是两套正交句柄（E8）。`remove_node`
+    ///   不释放作用域；需要一次调用完成「卸载 + 回收」时用
+    ///   [`App::remove_node_with_scope`]，或随后自行 [`App::release_scope`]（幂等）。
+    ///
+    /// # 语义
+    ///
+    /// - **重复删除**：第二次返回 [`EngineError::StaleNode`] 且不产生副作用（显式失败，不是
+    ///   静默 no-op）；
+    /// - **祖先删除**：整个子树（含所有后代 scope / 定时器 / 动画）一并清理；只删除后代不影响
+    ///   祖先 scope 的绑定与定时器；
+    /// - **root 不可删除**（[`EngineError::StaleNode`]）；
+    /// - 跨窗口句柄返回 [`EngineError::StaleNode`]，不会触碰其真正宿主窗口；
+    /// - **I3**：取消定时器 / 动画不请求帧、不让平台进入连续帧；`animations_running` 随动画
+    ///   取消回落。只有第 9 步的「树变了要重画」会请求**一帧**。
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::UnknownWindow`]：窗口不存在（已关闭 / 从未创建）；
+    /// - [`EngineError::StaleNode`]：`node` 不在该窗口的节点树中（已卸载 / 从未挂载 / 属于另一
+    ///   窗口）或是 root。
+    pub fn remove_node(
+        &mut self,
+        window: WindowId,
+        node: NodeId,
+    ) -> Result<RemoveOutcome, EngineError> {
         window_set::remove_node(self, window, node)
+    }
+
+    /// 卸载子树并在**节点已卸载之后**释放组件的信号作用域
+    /// （= [`App::remove_node`] + [`App::release_scope`] 的同调用组合）。
+    ///
+    /// 适用于「一个组件 = 一棵子树 + 一个 `SignalScope`」的常规形态：先卸节点、再回收作用域值
+    /// 的顺序由引擎保证（`bind_*` 闭包不会被求值到已回收的句柄）。作用域里的瞬态值被回收时，
+    /// 引用它们的动画槽同批取消（[`AnimationEndKind::Released`]），计入返回值的 `animations`。
+    ///
+    /// `scope` 已释放时按幂等处理（`released_values == 0`），节点删除照常完成；错误面与
+    /// [`App::remove_node`] 相同，**错误发生在任何清理之前**，`scope` 不会被提前释放。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`App::remove_node`]。
+    pub fn remove_node_with_scope(
+        &mut self,
+        window: WindowId,
+        node: NodeId,
+        scope: SignalScope,
+    ) -> Result<RemoveOutcome, EngineError> {
+        window_set::remove_node_with_scope(self, window, node, scope)
     }
 
     /// 当前拖拽会话。
@@ -2030,7 +2133,8 @@ impl App {
     ///    因此回调里做的收尾（卸载节点 / 关浮层）**参与本帧绘制**；回调里改状态触发的重绘
     ///    由应用按常规方式请求（`App::write` 自动请求）或由下一轮补上。
     /// 2. **帧外终止**（[`AnimationEndKind::Cancelled`] / [`AnimationEndKind::Replaced`] /
-    ///    [`AnimationEndKind::Released`] / 0 ms 动画的 `Finished`）：在**下一帧入口**（或平台泵
+    ///    [`AnimationEndKind::Released`] / [`AnimationEndKind::Removed`] / 0 ms 动画的
+    ///    `Finished`）：在**下一帧入口**（或平台泵
     ///    下一轮的钩子步骤）派发 —— 调用点只入队 + 唤醒泵一次（`Dispatcher::wake`，**不请求
     ///    帧**，I3）；因此应用最迟在「下一帧开始前」观测到。
     /// 3. **与 `on_frame` 的关系**：`on_frame` 钩子在帧**之前**运行，看不到本帧刚写入的终值。
@@ -3045,3 +3149,9 @@ mod scoped_tests;
 /// 缺失的时序面。
 #[cfg(all(test, feature = "test-support"))]
 mod e10_tests;
+
+/// E16：节点子树卸载的自动清理（R-21 引擎下沉）—— 清理计数 / 语义边界 / 1000 轮 churn /
+/// 关窗路径不变 / I3。断言面用到 `test-support` 的观测入口（`timer_count_for_test` /
+/// `has_action_handler` / `scoped_key_binding_count`），因此只在特性开启时编译。
+#[cfg(all(test, feature = "test-support"))]
+mod removal_tests;
