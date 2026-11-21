@@ -34,7 +34,10 @@ use crate::{
     a11y::{
         A11yDiagnostic, A11yLabelSource, A11yNode, A11yNodeId, A11yRole, A11yTreeSnapshot,
         identity::A11yIds,
-        mapping::{action_to_accesskit, live_to_accesskit, role_to_accesskit, sort_to_accesskit},
+        mapping::{
+            action_to_accesskit, live_to_accesskit, orientation_to_accesskit, role_to_accesskit,
+            sort_to_accesskit,
+        },
         textrun,
         tree::{
             CollectionSemanticsCache, collect_subtree, node_a11y_with_cache, push_ancestors,
@@ -864,6 +867,12 @@ pub(crate) fn to_accesskit(record: &crate::a11y::A11yNode) -> accesskit::Node {
         node.set_scroll_y_min(0.0);
         node.set_scroll_x_max(f64::from(scroll.x_max));
         node.set_scroll_y_max(f64::from(scroll.y_max));
+    }
+    // 方向（E15）：显式声明优先（滑条 / 色盘等轴向控件），否则滚动容器按轴向推导。
+    // 两个生产者共存时显式声明胜出 —— 应用的语义声明不该被「顺带带出来的滚动轴」覆盖。
+    if let Some(orientation) = record.orientation {
+        node.set_orientation(orientation_to_accesskit(orientation));
+    } else if let Some(scroll) = record.scroll {
         node.set_orientation(if scroll.vertical {
             accesskit::Orientation::Vertical
         } else {
@@ -2095,5 +2104,173 @@ mod tests {
                 "被卸载行的 a11y 节点必须从影子树里消失"
             );
         }
+    }
+
+    /// E15：新增角色必须真的落进 `accesskit::Node`（平台 adapter 只按 `accesskit::Role` 映射）。
+    #[test]
+    fn the_new_roles_materialize_into_accesskit_nodes() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let mut ids = crate::a11y::identity::A11yIds::new();
+        let mut diagnostics = Vec::new();
+        let mut tables = crate::a11y::tree::CollectionSemanticsCache::default();
+        for (role, expected) in [
+            (A11yRole::ComboBox, accesskit::Role::ComboBox),
+            (A11yRole::ListBox, accesskit::Role::ListBox),
+            (
+                A11yRole::MenuItemCheckBox,
+                accesskit::Role::MenuItemCheckBox,
+            ),
+            (A11yRole::MenuItemRadio, accesskit::Role::MenuItemRadio),
+            (A11yRole::ColorWell, accesskit::Role::ColorWell),
+        ] {
+            let node = NodeBuilder::boxed()
+                .a11y(A11yOverride {
+                    role: Some(role),
+                    label: Some(SmolStr::new_static("控件")),
+                    ..A11yOverride::default()
+                })
+                .build(&mut tree, root)
+                .expect("node");
+            tree.set_a11y_patch(
+                node,
+                A11yPatch {
+                    checked: Some(true),
+                    ..A11yPatch::default()
+                },
+            );
+            let record = crate::a11y::tree::node_a11y_with_cache(
+                &tree,
+                node,
+                scale(),
+                "",
+                &mut ids,
+                &mut tables,
+                &mut diagnostics,
+            )
+            .expect("record");
+            let ak = to_accesskit(&record);
+            assert_eq!(ak.role(), expected, "{role:?} 的 accesskit 角色");
+            // 可勾选菜单项的勾选态走 `Toggled`（UIA TogglePattern / SelectionItemPattern，
+            // macOS value，AT-SPI checked）—— 不是 `selected`。
+            assert_eq!(
+                ak.toggled(),
+                Some(accesskit::Toggled::True),
+                "{role:?} 的 checked 必须落进 Toggled"
+            );
+        }
+    }
+
+    /// E15：`ColorWell` 的值通道（当前颜色文本）必须进 `accesskit::Node` 的 value。
+    #[test]
+    fn a_color_well_reports_its_color_through_value() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let well = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::ColorWell),
+                label: Some(SmolStr::new_static("主题色")),
+                value: Some(SmolStr::new_static("#336699")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("color well");
+        let mut ids = crate::a11y::identity::A11yIds::new();
+        let mut diagnostics = Vec::new();
+        let mut tables = crate::a11y::tree::CollectionSemanticsCache::default();
+        let record = crate::a11y::tree::node_a11y_with_cache(
+            &tree,
+            well,
+            scale(),
+            "",
+            &mut ids,
+            &mut tables,
+            &mut diagnostics,
+        )
+        .expect("record");
+        let ak = to_accesskit(&record);
+        assert_eq!(ak.role(), accesskit::Role::ColorWell);
+        assert_eq!(ak.value(), Some("#336699"));
+    }
+
+    /// E15：显式 `orientation` 优先于滚动容器自动推导的轴向（应用声明不该被滚动轴覆盖）。
+    #[test]
+    fn explicit_orientation_wins_over_the_scroll_axis() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let scrolling = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::ScrollView),
+                label: Some(SmolStr::new_static("列表")),
+                // 垂直滚动容器，但应用显式声明水平（构造一个反例钉住优先级）。
+                orientation: Some(crate::a11y::A11yOrientation::Horizontal),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("scroll node");
+        tree.ensure_interaction(scrolling)
+            .expect("interaction")
+            .scroll = Some(crate::interaction::ScrollSlot {
+            offset: crate::math::Point::ZERO,
+            content: crate::math::Size::new(10.0, 100.0),
+            axis: crate::interaction::ScrollAxis::Vertical,
+            line_height: 40.0,
+        });
+        let mut ids = crate::a11y::identity::A11yIds::new();
+        let mut diagnostics = Vec::new();
+        let mut tables = crate::a11y::tree::CollectionSemanticsCache::default();
+        let record = crate::a11y::tree::node_a11y_with_cache(
+            &tree,
+            scrolling,
+            scale(),
+            "",
+            &mut ids,
+            &mut tables,
+            &mut diagnostics,
+        )
+        .expect("record");
+        assert_eq!(
+            record.orientation,
+            Some(crate::a11y::A11yOrientation::Horizontal)
+        );
+        assert_eq!(
+            to_accesskit(&record).orientation(),
+            Some(accesskit::Orientation::Horizontal),
+            "显式声明必须胜过 scroll.vertical 推导"
+        );
+
+        // 没有显式声明时仍按滚动轴推导（旧行为不变）。
+        let derived = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::ScrollView),
+                label: Some(SmolStr::new_static("列表")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("derived scroll node");
+        tree.ensure_interaction(derived)
+            .expect("interaction")
+            .scroll = Some(crate::interaction::ScrollSlot {
+            offset: crate::math::Point::ZERO,
+            content: crate::math::Size::new(10.0, 100.0),
+            axis: crate::interaction::ScrollAxis::Vertical,
+            line_height: 40.0,
+        });
+        let record = crate::a11y::tree::node_a11y_with_cache(
+            &tree,
+            derived,
+            scale(),
+            "",
+            &mut ids,
+            &mut tables,
+            &mut diagnostics,
+        )
+        .expect("record");
+        assert_eq!(record.orientation, None);
+        assert_eq!(
+            to_accesskit(&record).orientation(),
+            Some(accesskit::Orientation::Vertical),
+            "滚动容器无显式方向 ⇒ 按 vertical 轴推导"
+        );
     }
 }

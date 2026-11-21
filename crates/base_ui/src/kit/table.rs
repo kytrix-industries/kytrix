@@ -945,7 +945,7 @@ impl Table {
 mod tests {
     use smol_str::SmolStr;
     use ui_core::{
-        a11y::{A11yRole, A11ySort},
+        a11y::{A11yAction, A11yRole, A11ySort},
         event::{InputEvent, Modifiers, PointerButton},
         interaction::ItemAlign,
         node::{
@@ -1480,6 +1480,35 @@ mod tests {
             "逻辑总行数 = 表头 1 行 + 100 个条目（含未挂载行）"
         );
         assert_eq!(table_a11y.column_count, Some(2));
+        // E15b/F4（E9 R2 后半）：行窗口被平台 `common_filter` 透明上提后，它承载的滚动语义
+        // 必须由 `Table` 接管 —— 否则读屏用户无法滚动虚拟化表格。
+        assert_eq!(
+            table_a11y.size_of_set,
+            Some(100),
+            "集合大小 = 行窗口的条目总数（窗口自身被过滤）"
+        );
+        assert!(
+            table_a11y.clips_children,
+            "滚动容器的裁剪感知必须随语义上提"
+        );
+        let scroll = table_a11y
+            .scroll
+            .expect("Table 必须接管行窗口的 scroll（E9 R2 后半）");
+        assert!(scroll.vertical);
+        assert!(
+            scroll.y_max > 0.0,
+            "滚动范围来自行窗口的内容高度：{scroll:?}"
+        );
+        for action in [
+            A11yAction::ScrollUp,
+            A11yAction::ScrollDown,
+            A11yAction::ScrollIntoView,
+        ] {
+            assert!(
+                table_a11y.actions.contains(&action),
+                "Table 必须宣告 {action:?}（上提的滚动动作）"
+            );
+        }
         // 表头行 = 第 0 行，父 = Table；列头父 = 表头行。
         let header = a11y_of(&snapshot, header_row);
         assert_eq!(header.role, A11yRole::Row);
@@ -1496,9 +1525,14 @@ mod tests {
         assert_eq!(header_cell.row_index, Some(0));
         assert_eq!(header_cell.row_count, Some(101));
         assert_eq!(header_cell.column_index, Some(0));
-        // 行窗口被 E9 领养规则跳过：不再列出行。
+        // 行窗口被 E9 领养规则跳过：不再列出行；E15b 起也不再以 `List` 暴露（集合行窗口抑制，
+        // 平台 `common_filter` 会把 `GenericContainer` 透明上提，AT 看到干净的 Table → Row）。
         let window = a11y_of(&snapshot, viewport);
-        assert_eq!(window.role, A11yRole::List);
+        assert_eq!(
+            window.role,
+            A11yRole::GenericContainer,
+            "集合行窗口不得再自动声明 List（否则 AT 读到「表格里套列表」）"
+        );
         assert!(window.children.is_empty(), "行窗口不得再列行（E9 领养）");
         // 数据行 / 单元格：父链 Table → Row → Cell；行号 = 1（表头）+ 条目逻辑下标。
         for (index, row) in &mounted {

@@ -918,8 +918,14 @@ impl NodeTree {
     }
     /// 整棵子树标 `A11Y`（不冒泡、不产生像素工作）。
     ///
-    /// 消费者：`app::virtual_list::set_virtual_items`（条目数变化 ⇒ 行数 / 行号 / 集合位置等
-    /// 派生字段整体失效，必须重进下一笔增量交付）。
+    /// 用于「本节点的变化会改变**后代**的 a11y 语义、但后代没有自己的脏位」：
+    /// - `app::virtual_list::set_virtual_items`：条目数变化 ⇒ 行数 / 行号 / 集合位置等派生字段
+    ///   整体失效，必须重进下一笔增量交付；
+    /// - `a11y::tree::write_a11y_patch`（E15b F2/F3，`bind_a11y` 两个写点 +
+    ///   `App::set_a11y_patch` 共用）：`role` / `hidden` 变化 ⇒ 后代派生角色（`TextRun` ↔
+    ///   `Label`）、集合领养、被跳过祖先的隐藏声明整体失效；
+    /// - `app::style_pass::refresh_styles`：`StylePatch::{visible, interactive}` 变化 ⇒ 后代的
+    ///   隐式 `Focus` / `Click` / `disabled` 能力翻转（祖先链输入）。
     pub(crate) fn mark_subtree_a11y(&mut self, node: NodeId) -> usize {
         dirty::mark_subtree_a11y(self, node)
     }

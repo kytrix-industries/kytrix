@@ -2497,6 +2497,25 @@ impl App {
         a11y::off_a11y_action(self, action)
     }
 
+    /// 写一个节点的**动态** a11y 补丁并登记交付（应用通道；E15b F3/F5 收敛）。
+    ///
+    /// 详细语义见 `app::a11y::set_a11y_patch`（与 `bind_a11y` 共用差分、`affects_descendants`
+    /// 子树标记、请求帧、覆盖关系）。**公开面保留**：E15 已把本通道登记为 base_ui
+    /// `List::set_row_a11y` 静态快照的动态失效面（spec-delta E15 §4/D4，消费者在 base_ui 后续
+    /// 批），不是"未来可能需要"的预留 API；`A11yPatch::affects_descendants` 则收敛为
+    /// `pub(crate)`（只有引擎内部消费者）。
+    ///
+    /// # Errors
+    /// `EngineError::UnknownWindow`（窗口已关闭）/ `EngineError::StaleNode`（节点已卸载）。
+    pub fn set_a11y_patch(
+        &mut self,
+        window: WindowId,
+        node: NodeId,
+        patch: crate::a11y::A11yPatch,
+    ) -> Result<(), EngineError> {
+        a11y::set_a11y_patch(self, window, node, patch)
+    }
+
     /// a11y 诊断（与 `text_diagnostics` 同型；上限 `A11Y_DIAGNOSTIC_CAPACITY`，超出丢最旧）。
     #[must_use]
     pub fn a11y_diagnostics(&self) -> &[crate::a11y::A11yDiagnostic] {

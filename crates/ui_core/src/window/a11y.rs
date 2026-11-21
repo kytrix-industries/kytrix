@@ -122,8 +122,16 @@ pub(crate) fn a11y_take(
 
 // 消费者：`impl Window::a11y_note_scroll` 的薄委托（外部调用点见该方法文档）。
 /// 某个子树内容整体平移（滚动：子孙 bounds 全变 ⇒ 重发整棵子树）。
+///
+/// E15b/F4：被抑制的虚拟窗口把 `scroll_x/y` / `clips_children` / `size_of_set` / 滚动动作
+/// 上提到了集合根（[`crate::a11y::tree::lifted_scroll_root`]）——集合根记录里的偏移是**派生**
+/// 值，`invalidate_subtree(container)` 只覆盖窗口以下，集合根本身不会重发。这里额外标集合根
+/// `A11Y`，下一次增量笔才会带上新偏移（否则 oracle 的增量/全树在此分叉）。
 pub(crate) fn a11y_note_scroll(window: &mut Window, container: crate::node::id::NodeId) {
     window.a11y.invalidate_subtree(container);
+    if let Some(root) = crate::a11y::tree::lifted_scroll_root(&window.tree, container) {
+        window.tree.mark_a11y(root);
+    }
 }
 
 // 消费者：`impl Window::a11y_note_binding` 的薄委托（外部调用点见该方法文档）。

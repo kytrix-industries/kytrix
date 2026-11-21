@@ -1540,9 +1540,14 @@ mod ui_tests {
                 Some(tree.id),
                 "树项的 a11y 父是 Tree（行窗口只是布局包裹层）"
             );
-            // 行窗口被 E9 领养规则跳过：它不再列出树项。
+            // 行窗口被 E9 领养规则跳过：它不再列出树项；E15b 起也不再以 `List` 暴露（集合
+            // 行窗口抑制，平台 `common_filter` 会把 `GenericContainer` 透明上提）。
             let window = a11y_of(snapshot, viewport);
-            assert_eq!(window.role, A11yRole::List);
+            assert_eq!(
+                window.role,
+                A11yRole::GenericContainer,
+                "集合行窗口不得再自动声明 List（否则 AT 读到「树里套列表」）"
+            );
             assert!(window.children.is_empty(), "行窗口不得再列树项");
             // 折叠标 / 重复的行标签文本显式 hidden：读屏不应读到「▸」或把名字读两遍。
             assert!(
