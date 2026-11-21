@@ -318,11 +318,16 @@ impl ScrollBar {
         });
     }
 
-    /// 释放本组件的信号作用域（动态创建 / 销毁的滚动条调用；先卸载节点再释放）。
+    /// 释放本组件的信号作用域与引擎侧注册（动态创建 / 销毁的滚动条调用；先卸载节点再释放）。
     ///
+    /// 清理面：轨道 / 滑块 / 拖拽三个 Action handler（[`App::off_action`]）+ 本组件的信号作用域。
+    /// 只释放信号不摘 handler 会让 `App` 永久持有 `Rc<ScrollBar>` 闭包（P2-2 复核 R2.2 的泄漏）。
     /// 返回被释放的槽位数（悬停 / 可滚动 / 淡出不透明度 / 拖拽快照）；引用淡出瞬态值的动画
     /// 由引擎在释放时同批取消。重复调用返回 0（幂等）。
     pub fn release(&self, app: &mut App) -> usize {
+        app.off_action(&self.inner.track_action);
+        app.off_action(&self.inner.thumb_action);
+        app.off_action(&self.inner.drag_action);
         app.release_scope(self.inner.scope)
     }
 

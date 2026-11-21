@@ -46,13 +46,22 @@ pub(crate) fn bind_key(app: &mut App, binding: KeyBinding) {
 }
 
 /// 添加/替换一条焦点作用域化的键盘绑定（同 `(window, scope, key, modifiers)` 后写覆盖）。
+///
+/// 注册前校验窗口与 `scope` 节点：**永不命中**的绑定必须在注册期拒绝（否则表项会一直留到
+/// 窗口关闭，见 `App::bind_key_scoped` 的清理契约）。
 /// 消费者：`App::bind_key_scoped`。
 pub(crate) fn bind_key_scoped(
     app: &mut App,
     window: crate::window::WindowId,
     scope: crate::node::id::NodeId,
     binding: KeyBinding,
-) {
+) -> Result<(), crate::error::EngineError> {
+    use crate::error::EngineError;
+    let Some(target) = app.windows.get(&window) else {
+        return Err(EngineError::UnknownWindow { window });
+    };
+    // `NodeId` 携带窗口身份：另一窗口的节点在这里确定性失败（`StaleNode`），不会串窗命中。
+    target.tree().get(scope)?;
     app.scoped_bindings.retain(|existing| {
         !(existing.window == window
             && existing.scope == scope
@@ -64,6 +73,39 @@ pub(crate) fn bind_key_scoped(
         scope,
         binding,
     });
+    Ok(())
+}
+
+/// 删除一条 scoped 绑定（返回是否真的删了）。
+/// 消费者：`App::unbind_key_scoped`。
+pub(crate) fn unbind_key_scoped(
+    app: &mut App,
+    window: crate::window::WindowId,
+    scope: crate::node::id::NodeId,
+    key: KeyCode,
+    modifiers: Modifiers,
+) -> bool {
+    let before = app.scoped_bindings.len();
+    app.scoped_bindings.retain(|existing| {
+        !(existing.window == window
+            && existing.scope == scope
+            && existing.binding.key == key
+            && existing.binding.modifiers == modifiers)
+    });
+    app.scoped_bindings.len() != before
+}
+
+/// 删除某个 scope 在某个窗口上的**全部** scoped 绑定，返回删除条数。
+/// 消费者：`App::unbind_scope_keys`（组件 `release` 不需要复述自己绑定过哪些键）。
+pub(crate) fn unbind_scope_keys(
+    app: &mut App,
+    window: crate::window::WindowId,
+    scope: crate::node::id::NodeId,
+) -> usize {
+    let before = app.scoped_bindings.len();
+    app.scoped_bindings
+        .retain(|existing| !(existing.window == window && existing.scope == scope));
+    before - app.scoped_bindings.len()
 }
 
 /// 删除一条键盘绑定（返回是否真的删了）。

@@ -506,10 +506,14 @@ impl Table {
         &self.inner.list
     }
 
-    /// 释放本组件的信号作用域（动态创建 / 销毁的表格必须调用；先卸载节点再释放）。
+    /// 释放本组件的信号作用域与引擎侧注册（动态创建 / 销毁的表格必须调用；先卸载节点再释放）。
     ///
+    /// 清理面：排序 Action handler（[`App::off_action`]）+ 行体列表（含滚动条）的 handler /
+    /// 信号作用域 + 本表格的信号作用域。只释放信号不摘 handler 会让 `App` 永久持有
+    /// `Rc<Table>` 闭包（P2-2 复核 R2.2 的泄漏）。
     /// 返回被释放的槽位数（排序状态 + 行体列表 / 滚动条的状态）；重复调用返回 0（幂等）。
     pub fn release(&self, app: &mut App) -> usize {
+        app.off_action(&self.inner.sort_action);
         self.inner.list.release(app) + app.release_scope(self.inner.scope)
     }
 
@@ -1155,6 +1159,24 @@ mod tests {
             Some((0, SortOrder::Descending)),
             "再点切到降序"
         );
+    }
+
+    /// `release` 必须摘掉表头排序 handler：泄漏的 handler 会在释放后读已回收的排序信号 ⇒
+    /// panic（P2-2 复核 R2.2 的 Rc/handler 泄漏）。
+    #[test]
+    fn releasing_the_table_removes_its_sort_handler() {
+        let mut app = TestApp::new();
+        let table = table_with_rows(&mut app, 3);
+        mount(&mut app, &table);
+        let header = table.header_node(app.app(), 0).expect("header cell");
+        let point = center(&app, header);
+        click(&mut app, point);
+        assert_eq!(table.sort(app.app()), Some((0, SortOrder::Ascending)));
+
+        assert!(table.release(app.app_mut()) > 0);
+        // 不卸载节点直接释放：点击表头若还挂着泄漏的 handler 就会读死排序信号。
+        click(&mut app, point);
+        // 排序信号已释放，不能再读；没有 panic 即证明 handler 已摘除。
     }
 
     /// 空态：行数为 0 时提示可见、行体没有行；加行后提示消失。

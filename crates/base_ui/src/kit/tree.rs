@@ -567,11 +567,12 @@ impl Tree {
     /// 接引擎：列表 + 键盘绑定。
     ///
     /// # Errors
-    /// 同 [`List::attach`]。
+    /// 同 [`List::attach`]；方向键作用域绑定也要求 viewport 已挂载（`bind_key_scoped` 的
+    /// `StaleNode` 在这里只可能是引擎不变量被破坏）。
     pub fn attach(&self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
         self.inner.list.attach(app, window)?;
         *self.inner.window.borrow_mut() = Some(window);
-        self.bind_keys(app);
+        self.bind_keys(app)?;
         Ok(())
     }
 
@@ -600,11 +601,17 @@ impl Tree {
     /// 引擎的 [`App::bind_key_scoped`] 在焦点不在本树 viewport 子树内时**不消费**按键，因此
     /// 同屏多个树互不干扰，其它滚动容器的方向键默认滚动也不受影响（P2-2 审查 P2）。
     /// 必须在 [`Tree::attach`] 之后调用（需要窗口与 viewport 节点）；`attach` 会自动调用。
-    pub fn bind_keys(&self, app: &mut App) {
+    ///
+    /// 绑定的生命周期归 [`App`] 管：`release` 用 [`App::unbind_scope_keys`] 显式摘除，
+    /// 即使漏掉也会在节点卸载 / 关窗时自动清理（见 `App::bind_key_scoped`）。
+    ///
+    /// # Errors
+    /// [`EngineError::UnknownWindow`] / [`EngineError::StaleNode`]：窗口或 viewport 已失效。
+    pub fn bind_keys(&self, app: &mut App) -> Result<(), EngineError> {
         let (Some(window), Some(viewport)) =
             (*self.inner.window.borrow(), self.inner.list.viewport_node())
         else {
-            return;
+            return Ok(());
         };
         let keys = [
             (KeyCode::ArrowUp, self.inner.actions.up.clone(), TreeKey::Up),
@@ -633,18 +640,36 @@ impl Tree {
                     modifiers: Modifiers::empty(),
                     action: action.clone(),
                 },
-            );
+            )?;
             let tree = self.clone();
             app.on_action(action, move |ctx| {
                 tree.on_key(ctx, key);
             });
         }
+        Ok(())
     }
 
-    /// 释放本组件的信号作用域（动态创建 / 销毁的树必须调用；先卸载节点再释放）。
+    /// 释放本组件的信号作用域与引擎侧注册（动态创建 / 销毁的树必须调用；先卸载节点再释放）。
+    ///
+    /// 清理面：4 条方向键的 scoped 绑定（[`App::unbind_scope_keys`]）+ 4 个方向键 Action
+    /// handler（[`App::off_action`]）+ 行体列表（含滚动条）的 handler / 信号作用域。只释放信号
+    /// 不摘 handler 会让 `App` 永久持有 `Rc<Tree>` 闭包与绑定表项（P2-2 复核 R2.2 的泄漏）。
     ///
     /// 返回被释放的槽位数（展开状态 + 行体列表 / 滚动条的状态）；重复调用返回 0（幂等）。
     pub fn release(&self, app: &mut App) -> usize {
+        if let (Some(window), Some(viewport)) =
+            (*self.inner.window.borrow(), self.inner.list.viewport_node())
+        {
+            app.unbind_scope_keys(window, viewport);
+        }
+        for action in [
+            &self.inner.actions.up,
+            &self.inner.actions.down,
+            &self.inner.actions.left,
+            &self.inner.actions.right,
+        ] {
+            app.off_action(action);
+        }
         self.inner.list.release(app) + app.release_scope(self.inner.scope)
     }
 
@@ -1534,5 +1559,25 @@ mod ui_tests {
             "展开状态 + 行体列表 / 滚动条信号必须被回收（实际 {released}）"
         );
         assert_eq!(tree.release(app.app_mut()), 0, "重复释放幂等");
+    }
+
+    /// `release` 必须摘掉 4 条 scoped 键绑定与 4 个方向键 handler：泄漏的 handler 会在释放后
+    /// 读已回收的 `TreeState` 信号 ⇒ 直接 panic（P2-2 复核 R2.2 的 Rc/handler/绑定泄漏）。
+    #[test]
+    fn releasing_the_tree_unbinds_its_keys_and_removes_the_handlers() {
+        let mut harness = harness();
+        click_row(&mut harness, 0);
+        assert_eq!(
+            harness.tree.selected_row(harness.app.app()),
+            Some(0),
+            "释放前方向键/点击正常"
+        );
+
+        assert!(harness.tree.release(harness.app.app_mut()) >= 6);
+        // 不卸载节点直接释放：这些输入若还挂着泄漏的闭包就会读死句柄。
+        key(&mut harness, KeyCode::ArrowDown);
+        click_row(&mut harness, 1);
+        // 解析出的节点仍可查（纯树查询，不读信号）；没有 panic 即通过。
+        assert!(harness.tree.list().row_node(harness.app.app(), 1).is_some());
     }
 }
