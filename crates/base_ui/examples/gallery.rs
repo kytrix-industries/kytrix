@@ -32,8 +32,13 @@
 //! # 验收钩子（`--` 之后的参数）
 //!
 //! - `--auto-demo`：1.2 s 后经 `App::dispatch_action(.., ActionSource::Programmatic)` 触发主按钮，
-//!   打印派发前后的帧号并写一条交互日志（没有 GUI 注入能力的环境用它证明动作路径可用）；
+//!   打印派发前后的帧号并写一条交互日志（没有 GUI 注入能力的环境用它证明动作路径可用）。
+//!   **帧号断言口径**：动作只写第 ⑮ 分区的日志（页在顶部时在视口外 ⇒ 引擎按 I3 结算 Idle、
+//!   帧号不变是正确的），因此这里同时写一次**顶栏 status**（屏内 `bind_text`）——「定时器回调
+//!   写信号 → 出帧」由帧号推进证明（P2-6a G4）；
 //! - `--idle-check`：1 s 取基线帧号，再过 3 s 比较：空闲帧增量 ≤ 2 打印 PASS（I3），然后关窗；
+//! - `--dump-overlay`：0.6 s 把页面滚到 ⑫⑭ 那一屏、0.9 s 程序化打开 Menu，随后每 600 ms 打印
+//!   浮层子树（调试 id / 布局盒 / 子节点数 / 滚动槽）与 ColorPicker 的 `is_open`（G2/G5 探针）；
 //! - `--auto-close=<秒>`：到点关闭窗口（无人值守验收用；默认不自动关）。
 //!
 //! 退出码：`0` = 正常关窗（或 idle-check PASS）；`3` = idle-check FAIL。
@@ -41,7 +46,13 @@
 //! 本示例真实窗口运行中暴露的 kit / 引擎缺口记录在
 //! `.docs/gui-migration/spec-deltas/kit-gallery.md`。
 
-use std::{borrow::Cow, cell::RefCell, rc::Rc, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    cell::{Cell, RefCell},
+    rc::Rc,
+    sync::Arc,
+    time::Duration,
+};
 
 use base_ui::{
     kit::{
@@ -192,6 +203,8 @@ struct Flags {
     auto_close: Option<u64>,
     /// 打印关键节点布局盒（计算外部点击坐标用）。
     probe: bool,
+    /// 程序化打开浮层（Menu / ColorPicker）并打印浮层子树（真实窗口浮层空白缺陷的探针）。
+    dump_overlay: bool,
     /// 打开后自动把页面滚到指定纵向偏移（无人值守截图用；避开滚轮路径的引擎缺陷）。
     scroll_to: Option<f32>,
 }
@@ -208,6 +221,8 @@ fn parse_flags() -> Flags {
             flags.auto_close = value.parse::<u64>().ok();
         } else if arg == "--probe" {
             flags.probe = true;
+        } else if arg == "--dump-overlay" {
+            flags.dump_overlay = true;
         } else if let Some(value) = arg.strip_prefix("--scroll-to=") {
             flags.scroll_to = value.parse::<f32>().ok();
         } else {
@@ -487,6 +502,8 @@ struct Gallery {
     flags: Flags,
     /// 空闲检查结果。
     idle: Rc<RefCell<IdleReport>>,
+    /// `--auto-demo` 已派发（顶栏 status 追加可见标记，证明「定时器回调写信号 → 出帧」）。
+    demo_fired: Rc<Cell<bool>>,
     /// 关键节点（`--probe` 打印布局盒，便于外部驱动点击）。
     probe_nodes: Vec<(SmolStr, NodeId)>,
 }
@@ -1421,7 +1438,7 @@ impl Gallery {
             }
         });
         let menu_action = Action::Custom(SmolStr::new_static("gallery.menu.open"));
-        let _menu_trigger = demo_trigger(
+        let menu_trigger = demo_trigger(
             app,
             window,
             overlay_row,
@@ -1461,7 +1478,7 @@ impl Gallery {
             move |app, id| log_line(app, &log, format_smolstr!("context-menu: 点击 {id}"))
         });
         let context_action = Action::Custom(SmolStr::new_static("gallery.context.open"));
-        let _context_trigger = demo_trigger(
+        let context_trigger = demo_trigger(
             app,
             window,
             overlay_row,
@@ -1663,6 +1680,8 @@ impl Gallery {
         if let Some(node) = color_picker.trigger_node() {
             probe_nodes.push((SmolStr::new_static("color_picker"), node));
         }
+        probe_nodes.push((SmolStr::new_static("menu"), menu_trigger));
+        probe_nodes.push((SmolStr::new_static("context"), context_trigger));
         if let Some(node) = dialog.confirm_button().and_then(|button| button.node()) {
             probe_nodes.push((SmolStr::new_static("dialog_confirm"), node));
         }
@@ -1702,6 +1721,7 @@ impl Gallery {
             color_picker,
             flags,
             idle: Rc::new(RefCell::new(IdleReport::default())),
+            demo_fired: Rc::new(Cell::new(false)),
             probe_nodes,
         }
     }
@@ -1754,6 +1774,56 @@ impl Gallery {
                 });
             });
         }
+        if self.flags.dump_overlay {
+            // 真实窗口浮层探针（G2/G5 的复现口径见 `.docs/gui-migration/spec-deltas/kit-gallery.md`）：
+            // 600 ms 把页面滚到 ⑫⑭ 那一屏（Menu / ColorPicker 都在这里），900 ms 程序化打开
+            // Menu（确定性证据），随后每 600 ms 打一次浮层子树 —— 外部脚本可以在这中间做真实
+            // OS 点击（色板触发器），因此「点前 / 点后」两帧的浮层状态都能看到。
+            let viewport = self.viewport;
+            let menu = self.menu.clone();
+            let color_picker = self.color_picker.clone();
+            let nodes = self.probe_nodes.clone();
+            let _ = app.after(window, Duration::from_millis(600), move |app| {
+                if let Some(handle) = app.scroll_handle(window, viewport) {
+                    let _ = app.scroll_to(&handle, Point::new(0.0, 3_150.0));
+                }
+                print_probe_rects(app, window, &nodes, "overlay ");
+                app.handle().wake();
+                let menu = menu.clone();
+                let color_picker = color_picker.clone();
+                let _ = app.after(window, Duration::from_millis(300), move |app| {
+                    if let Some((_, anchor)) = nodes.iter().find(|(name, _)| name == "menu") {
+                        let opened = menu.open(app, window, Anchor::node(*anchor));
+                        println!("gallery: overlay-probe menu.open -> {opened:?}");
+                    }
+                    app.handle().wake();
+                    for round in 0..6_u32 {
+                        let color_picker = color_picker.clone();
+                        let delay = Duration::from_millis(u64::from(600 * (round + 1)));
+                        let dump = move |app: &mut App| {
+                            let frame = app
+                                .window(window)
+                                .map(|target| target.frame_index().get())
+                                .unwrap_or(0);
+                            println!(
+                                "gallery: overlay-probe round={round} frame={frame} color-picker is_open={}",
+                                color_picker.is_open(app)
+                            );
+                            dump_overlay_nodes(
+                                app,
+                                window,
+                                &["gallery.menu:panel", "gallery.color-picker"],
+                            );
+                            app.handle().wake();
+                        };
+                        if let Err(error) = app.after(window, delay, move |app| dump(app)) {
+                            println!("gallery: overlay-probe timer failed: {error}");
+                            break;
+                        }
+                    }
+                });
+            });
+        }
         if let Some(offset) = self.flags.scroll_to {
             let viewport = self.viewport;
             let _ = app.after(window, Duration::from_millis(8_000), move |app| {
@@ -1765,13 +1835,22 @@ impl Gallery {
             });
         }
         if self.flags.auto_demo {
+            // **探针口径（P2-6a G4）**：帧号断言只有在「写了**屏内**节点」时才有意义。
+            // `log_line` 写的日志在第 ⑮ 分区（内容坐标 y≈4500），页在顶部时它在视口外 ⇒ 本帧没有
+            // GPU 工作，引擎按 I3 / V-122⑧ 结算为 Idle、`FrameIndex` 不变（这是正确行为，不是丢帧）。
+            // 因此这里额外写一次**顶栏 status**（屏内 `bind_text` 节点）：它必然产生 damage 与发布。
+            // 实测：定时器回调里写信号 → 帧号 3→13（含浮层淡入动画），见 `.review/mig-p2-6a-*`。
             let button = self.primary_button.clone();
             let log = self.log;
+            let demo = self.demo_fired.clone();
             let _ = app.after(window, Duration::from_millis(1_200), move |app| {
                 let before = app
                     .window(window)
                     .map(|target| target.frame_index().get())
                     .unwrap_or(0);
+                // 屏内信号：顶栏 status 加「auto-demo ✓」后缀（`tick` 里拼）。
+                demo.set(true);
+                app.handle().wake();
                 let fired = match (button.node(), button.action_identity()) {
                     (Some(node), Some(action)) => {
                         app.dispatch_action(window, node, action, ActionSource::Programmatic)
@@ -1863,6 +1942,12 @@ impl Gallery {
                 size.width,
                 size.height
             );
+            // `--auto-demo` 的可见标记（G4 探针：屏内文本变化才产生可发布的帧）。
+            let text = if self.demo_fired.get() {
+                format_smolstr!("{text} · auto-demo ✓")
+            } else {
+                text
+            };
             app.write(&self.status, text);
         }
         // 组件帧同步（`sync` 只在变化时写节点）。
@@ -2130,6 +2215,57 @@ fn print_probe_rects(app: &mut App, window: WindowId, nodes: &[(SmolStr, NodeId)
                 bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height
             ),
             None => println!("gallery: probe {prefix}{name} node={node:?} missing"),
+        }
+    }
+}
+
+/// 打印匹配前缀的浮层子树（`--dump-overlay`：真实窗口浮层空白缺陷的探针）。
+///
+/// 逐节点打印「缩进 + 调试 id + 布局盒 + 子节点数 + 滚动槽状态」，因此能看到
+/// 「面板壳有尺寸、虚拟列表 viewport 子节点 0、滚动内容高度 0」这类真实窗口事实。
+fn dump_overlay_nodes(app: &mut App, window: WindowId, prefixes: &[&str]) {
+    let Some(target) = app.window(window) else {
+        println!("gallery: overlay-dump window missing");
+        return;
+    };
+    let tree = target.tree();
+    let root = tree.root();
+    let mut stack: Vec<(NodeId, usize)> = vec![(root, 0)];
+    while let Some((node, depth)) = stack.pop() {
+        let Ok(entry) = tree.get(node) else {
+            continue;
+        };
+        let id = tree.debug_id(node).unwrap_or("<no-id>");
+        if prefixes.iter().any(|prefix| id.starts_with(prefix)) {
+            let bounds = entry.layout().bounds;
+            let children = entry.children().len();
+            let scroll = app
+                .scroll_handle(window, node)
+                .and_then(|handle| app.scroll_state(&handle));
+            let scroll = scroll.map_or_else(
+                || SmolStr::new_static("-"),
+                |state| {
+                    format_smolstr!(
+                        "offset={:.1} content={:.1}x{:.1} viewport={:.1}x{:.1}",
+                        state.offset.y,
+                        state.content.width,
+                        state.content.height,
+                        state.viewport.width,
+                        state.viewport.height
+                    )
+                },
+            );
+            println!(
+                "gallery: overlay-dump {indent}{id} rect=({:.1},{:.1} {:.1}x{:.1}) children={children} scroll={scroll}",
+                bounds.origin.x,
+                bounds.origin.y,
+                bounds.size.width,
+                bounds.size.height,
+                indent = "  ".repeat(depth)
+            );
+        }
+        for child in entry.children().iter().rev() {
+            stack.push((*child, depth + 1));
         }
     }
 }
