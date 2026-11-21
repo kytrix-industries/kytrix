@@ -227,6 +227,11 @@ pub struct Node {
     interaction: Option<Box<NodeInteraction>>,
     /// 该节点 lane 上次生成时的**累计滚动偏移**（paint 的复用判据，§7.6）。`Point::ZERO` = 未滚动。
     lane_offset: Point,
+    /// 上次重建 lane 时**实际乘进图元**的有效不透明度（自身补丁 × 祖先链；E13 组不透明度的复用戳）。
+    ///
+    /// paint 的复用判据之一：与本次遍历算出的继承值不等 ⇒ 本节点（及其子树）必须重建。
+    /// 初值 `1.0`（无补丁、无祖先调光）。
+    paint_opacity: f32,
 }
 
 /// **手写 `Debug`**（N4）：`bind_style` / `measure` / `hit_shape` 是闭包（不实现 `Debug`），
@@ -260,6 +265,7 @@ impl fmt::Debug for Node {
             .field("dirty", &self.dirty)
             .field("interaction", &self.interaction)
             .field("lane_offset", &self.lane_offset)
+            .field("paint_opacity", &self.paint_opacity)
             .finish()
     }
 }
@@ -423,6 +429,11 @@ pub(crate) struct PaintNodeState {
     /// 坐标），因此这两类节点的 lane 不能登记滚动槽：它们留在屏幕坐标里，祖先/自身滚动时
     /// 照旧重建（正确性优先，成本只落在自绘节点上）。
     pub screen_baked: bool,
+    /// 本节点的**有效**不透明度（自身补丁 × 全部祖先链，已 clamp 到 `[0, 1]`；E13 组不透明度）。
+    ///
+    /// 既是乘进本节点图元的值，也是子节点继承的父值；`reusable` 里与节点上的
+    /// `paint_opacity` 戳比较（不等 ⇒ 子树要重建）。
+    pub opacity: f32,
 }
 
 /// 几何节点一条**块 lane** 上次烘焙时的块状态（X5）。
@@ -1426,18 +1437,31 @@ impl NodeTree {
     pub(crate) fn clip_key(&self, node: NodeId) -> Option<(u8, Option<PhysicalRect>)> {
         content::clip_key(self, node)
     }
+    /// 写回节点的有效不透明度戳（paint 重建 lane 时调用；E13 组不透明度的复用判据）。
+    pub(crate) fn set_paint_opacity(&mut self, node: NodeId, opacity: f32) {
+        content::set_paint_opacity(self, node, opacity)
+    }
     /// 一次取全 paint 所需的只读状态（消费者：`paint::pass::paint_node`）。
     ///
     /// `screen_offset` = 完整祖先滚动位移（屏幕 = 内容 − 它）；`bake_offset` = 图元烘焙偏移
-    /// （不含本节点所属滚动槽自己的位移，见 `paint/pass.rs` 的 `paint_node`）。
+    /// （不含本节点所属滚动槽自己的位移，见 `paint/pass.rs` 的 `paint_node`）；
+    /// `inherited_opacity` = 祖先链累计的不透明度（不含本节点自己的补丁值）。
     pub(crate) fn paint_state(
         &self,
         node: NodeId,
         screen_offset: Point,
         bake_offset: Point,
         clip_key: (u8, Option<PhysicalRect>),
+        inherited_opacity: f32,
     ) -> Option<PaintNodeState> {
-        content::paint_state(self, node, screen_offset, bake_offset, clip_key)
+        content::paint_state(
+            self,
+            node,
+            screen_offset,
+            bake_offset,
+            clip_key,
+            inherited_opacity,
+        )
     }
     pub(crate) fn set_clip_key(&mut self, node: NodeId, key: (u8, Option<PhysicalRect>)) {
         content::set_clip_key(self, node, key)

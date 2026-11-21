@@ -59,6 +59,7 @@ pub(crate) fn new() -> NodeTree {
         dirty: DirtyFlags::LAYOUT | DirtyFlags::PAINT | DirtyFlags::A11Y,
         interaction: None,
         lane_offset: Point::ZERO,
+        paint_opacity: 1.0,
     });
     let mut dirty_layout = DirtySet::new();
     dirty_layout.insert(root);
@@ -254,6 +255,7 @@ pub(crate) fn insert_child(
         dirty: DirtyFlags::LAYOUT | DirtyFlags::PAINT | DirtyFlags::A11Y,
         interaction,
         lane_offset: Point::ZERO,
+        paint_opacity: 1.0,
     });
     // E7：新挂载的图片节点需要在首次布局之前解析内在尺寸（安装 measure 闭包）。
     if tree

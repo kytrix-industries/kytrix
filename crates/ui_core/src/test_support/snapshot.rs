@@ -25,7 +25,7 @@ use crate::{
         canvas::Canvas,
         color::Color,
         primitive::{Border, Gradient, GradientKind, Image},
-        style::{Clip, PaintSpec, ShadowSpec, Style},
+        style::{Clip, PaintSpec, ShadowSpec, Shadows, Style},
     },
     test_support::app::TestApp,
     window::WindowOptions,
@@ -849,9 +849,10 @@ fn build_shadow(app: &mut TestApp, root: NodeId, palette: &Palette) {
         Rect::new(40.0, 30.0, 120.0, 50.0),
         PaintSpec {
             background: palette.surface,
-            shadow: Some(ShadowSpec {
+            shadows: Shadows::from(ShadowSpec {
                 offset: crate::math::Point::new(2.0, 4.0),
                 blur: 4.0,
+                spread: 0.0,
                 color: palette.ink,
             }),
             ..PaintSpec::default()
@@ -865,9 +866,10 @@ fn build_shadow(app: &mut TestApp, root: NodeId, palette: &Palette) {
         PaintSpec {
             background: palette.surface,
             corner_radius: [8.0; 4],
-            shadow: Some(ShadowSpec {
+            shadows: Shadows::from(ShadowSpec {
                 offset: crate::math::Point::new(0.0, 6.0),
                 blur: 16.0,
+                spread: 0.0,
                 color: palette.muted,
             }),
             ..PaintSpec::default()

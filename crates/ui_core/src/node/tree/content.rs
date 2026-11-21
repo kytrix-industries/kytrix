@@ -815,13 +815,15 @@ pub(crate) fn set_lane_offset(tree: &mut NodeTree, node: NodeId, offset: Point) 
 ///
 /// `screen_offset` 是**祖先滚动偏移的累计值**（屏幕 = 内容 − offset；`clip_bounds` 用它）；
 /// `bake_offset` 是图元真正烘焙用的偏移（**不含本节点所属滚动槽自己的偏移**，滚动因此不
-/// 重建 lane）；`clip_key` 是本帧当前的祖先 clip 上下文。
+/// 重建 lane）；`clip_key` 是本帧当前的祖先 clip 上下文；`inherited_opacity` 是祖先链累计的
+/// 不透明度（E13 组不透明度，调用方保证已 clamp）。
 pub(crate) fn paint_state(
     tree: &NodeTree,
     node: NodeId,
     screen_offset: Point,
     bake_offset: Point,
     clip_key: (u8, Option<PhysicalRect>),
+    inherited_opacity: f32,
 ) -> Option<super::PaintNodeState> {
     let target = tree.arena.get(node)?;
     let hidden = matches!(target.style.inner.display, taffy::style::Display::None)
@@ -836,9 +838,17 @@ pub(crate) fn paint_state(
     } else {
         bake_offset
     };
+    // 组不透明度（E13）：自身补丁 × 祖先链；NaN 视作 0（与逐图元的旧钳制口径一致）。
+    let opacity = inherited_opacity
+        * match target.style_patch().opacity {
+            Some(value) if value.is_nan() => 0.0,
+            Some(value) => value.clamp(0.0, 1.0),
+            None => 1.0,
+        };
     let reusable = target.dirty.contains(DirtyFlags::REUSABLE)
         && tree.clip_key(node) == Some(clip_key)
-        && target.lane_offset == effective_bake;
+        && target.lane_offset == effective_bake
+        && target.paint_opacity == opacity;
     let clip_bounds = (target.style.clip == crate::paint::style::Clip::Bounds).then(|| {
         target
             .layout
@@ -864,7 +874,16 @@ pub(crate) fn paint_state(
         clip_bounds,
         scroll,
         screen_baked,
+        opacity,
     })
+}
+
+// 消费者：`impl NodeTree::set_paint_opacity` 的薄委托（外部调用点见该方法文档）。
+/// 写回本节点 lane 实际乘进图元的有效不透明度（E13：paint 的组不透明度复用戳）。
+pub(crate) fn set_paint_opacity(tree: &mut NodeTree, node: NodeId, opacity: f32) {
+    if let Some(target) = tree.arena.get_mut(node) {
+        target.paint_opacity = opacity;
+    }
 }
 
 // 消费者：`impl NodeTree::clip_key` 的薄委托（外部调用点见该方法文档）。

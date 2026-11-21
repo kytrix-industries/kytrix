@@ -52,7 +52,7 @@ use taffy::{
 use ui_core::paint::{
     color::Color,
     primitive::Border,
-    style::{Clip, PaintSpec, ShadowSpec, Style},
+    style::{Clip, PaintSpec, ShadowSpec, Shadows, Style},
 };
 
 /// 薄布局样式构建器：把高频布局组合写进引擎 [`Style`] 的 `inner`（taffy）与 `clip`。
@@ -420,10 +420,11 @@ impl PaintBuilder {
         self
     }
 
-    /// 解析阴影（`rect` 由布局盒给出，不进样式）。
+    /// 解析阴影（`rect` 由布局盒给出，不进样式）。单层入口；多层阴影直接写
+    /// `PaintSpec.shadows`（E13 的 `Shadows`）。
     #[must_use]
     pub fn shadow(mut self, shadow: ShadowSpec) -> Self {
-        self.paint.shadow = Some(shadow);
+        self.paint.shadows = Shadows::from(shadow);
         self
     }
 
@@ -453,7 +454,7 @@ mod tests {
     use ui_core::paint::{
         color::Color,
         primitive::Border,
-        style::{Clip, PaintSpec, ShadowSpec, Style},
+        style::{Clip, PaintSpec, ShadowSpec, Shadows, Style},
     };
 
     use super::{PaintBuilder, StyleBuilder};
@@ -923,6 +924,7 @@ mod tests {
         let shadow = ShadowSpec {
             offset: ui_core::math::Point::new(0.0, 2.0),
             blur: 8.0,
+            spread: 0.0,
             color: Color::srgb(0.0, 0.0, 0.0, 0.25),
         };
         let built = PaintBuilder::new()
@@ -938,7 +940,7 @@ mod tests {
                 color: Color::WHITE,
             }),
             corner_radius: [6.0; 4],
-            shadow: Some(shadow),
+            shadows: Shadows::from(shadow),
             gradient: None,
         };
 
@@ -963,7 +965,7 @@ mod tests {
             })
         );
         assert_eq!(paint.background, Color::TRANSPARENT);
-        assert!(paint.shadow.is_none());
+        assert!(paint.shadows.is_empty());
         assert!(paint.gradient.is_none());
     }
 }
