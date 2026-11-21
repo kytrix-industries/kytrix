@@ -77,7 +77,9 @@ pub(crate) fn remove_node(app: &mut App, window: WindowId, node: NodeId) -> bool
         if modal {
             crate::a11y::tree::mark_modal_scope_changed(target.tree_mut());
         }
-        app.request_frame();
+        // E10：`after_scoped` 的节点作用域若落在被卸载的子树内，定时器同批取消（与 scoped 键
+        // 绑定同一生命周期规则）；不取消的话到期回调会跑在「组件已经不存在」的状态上。
+        super::timer::retain_live_scopes(app, window);
         super::focus::restore_focus(app, window, opener);
     }
     removed
@@ -340,6 +342,10 @@ pub(crate) fn close_window(app: &mut App, id: WindowId) -> bool {
     app.ime_disabled.remove(&id);
     // 动画槽引用窗口内的节点与瞬态值：窗口关闭时必须一并清掉（否则 `SetTimer` 永不停）。
     app.animations.retain(|slot| slot.window != id);
+    // E10：该窗口的一次性定时器与尚未派发的动画终止事件一并丢弃 —— 窗口与节点已经不存在，
+    // 应用回调没有可收尾的对象；留着只会在下一轮把死窗口句柄交出去。
+    super::timer::cancel_window(app, id);
+    super::animation::drop_completions_for_window(app, id);
     // 「按住集合」是每窗口状态（R02-16）：关掉持有键盘焦点的窗口后，它按住的键不得继续
     // 在 `key_down` 里为真。指针捕获请求与待推光标同理 —— 窗口没了，请求没有接收方，
     // 留着只会在 create/close 循环下无界增长。

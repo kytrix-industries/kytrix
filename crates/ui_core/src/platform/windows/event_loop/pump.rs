@@ -7,9 +7,11 @@
 //! `DCompositionWaitForCompositorClock` 上等一拍才编码 —— 端到端固定多约 1 个 vsync）：
 //! present 节奏由 GPU 线程的 DXGI waitable 门禁承担，UI 侧只需要按刷新率推进动画与补帧。
 //!
-//! 为什么不用 `WM_TIMER`：`WM_TIMER` 是**最低优先级**消息，输入密集时被饿（1000 Hz 鼠标下
-//! 动画反而更抖）；且 `SetTimer` 的最小粒度受系统定时器分辨率限制（默认 15.6 ms）。`WM_TIMER`
-//! 现在只保留给 a11y 补发兜底（[`A11Y_TIMER_ID`]），空闲时没有定时器。
+//! 为什么不用 `WM_TIMER` 驱动连续帧：`WM_TIMER` 是**最低优先级**消息，输入密集时被饿（1000 Hz
+//! 鼠标下动画反而更抖）；且 `SetTimer` 的最小粒度受系统定时器分辨率限制（默认 15.6 ms）。
+//! `WM_TIMER` 只保留两个用途：a11y 补发兜底（[`A11Y_TIMER_ID`]）与 E10 一次性截止时刻
+//! （[`DEADLINE_TIMER_ID`]）；空闲态只在**有待派发定时器**时挂一只一次性定时器，没有动画也没有
+//! 待派发定时器时不挂表。
 //!
 //! 为什么需要一条独立线程：节拍线程要 `sleep` 到下一拍，而 UI 线程是唯一的消息泵 —— 把它放进
 //! 泵里就等于暂停输入（Chrome 同样是独立合成线程等节拍、UI 线程消费消息）。
@@ -53,8 +55,29 @@ use crate::{
 };
 
 /// 消费者：`wndproc` 的 `WM_TIMER` 分支与 `pump_loop` 的定时器管理。
-/// a11y 补发兜底定时器 id（**唯一**保留的 `WM_TIMER` 用途；连续帧走节拍线程）。
+/// a11y 补发兜底定时器 id（`WM_TIMER` 的两种保留用途之一；另一种是 [`DEADLINE_TIMER_ID`]
+/// 的一次性截止时刻；连续帧仍走 [`FramePacer`] 节拍线程）。
 pub(super) const A11Y_TIMER_ID: usize = 1;
+
+/// E10：一次性定时器（`App::after` 的最早到期时刻）的 `SetTimer` id。
+///
+/// `WM_TIMER` 是低优先级消息、且受系统定时器粒度（约 15.6 ms）限制，但对**一次性** UI 定时器
+/// 足够：消息本身把 `GetMessageW` 唤醒，泵下一轮的钩子步骤（`App::run_frame_hook`）按**引擎
+/// 时钟**派发到期回调 —— 系统晚到只是晚一轮，不会漏派发（泵每轮按绝对 deadline 重新挂表）。
+/// 定时器等待期间不进入连续帧模式（I3），也不轮询。
+pub(super) const DEADLINE_TIMER_ID: usize = 2;
+
+/// 到期时刻 → `SetTimer` 的毫秒数（向上取整、下限 1 ms、上限 `u32::MAX`）。
+///
+/// 向上取整是刻意的：`WM_TIMER` 不能早于 deadline 唤醒（早到的那一轮会因引擎时钟未到而不派发，
+/// 且下一轮没有新唤醒）；向下取整可能早到 1 ms。
+fn deadline_timer_millis(deadline: Instant, now: Instant) -> u32 {
+    let nanos = deadline.saturating_duration_since(now).as_nanos();
+    let millis = nanos.saturating_add(999_999) / 1_000_000;
+    u32::try_from(millis.min(u128::from(u32::MAX)))
+        .unwrap_or(u32::MAX)
+        .max(1)
+}
 
 /// a11y 补发兜底定时器的周期（毫秒）。
 ///
@@ -651,6 +674,8 @@ pub(super) fn pump_loop(
     // 归属判定用 `WindowId` 而不是 HWND 裸值：首窗销毁后系统可能把同一个 HWND 复用给新窗，
     // 裸值比较会「看起来仍匹配」而不重建定时器（复审 P2-8）。
     let mut a11y_timer: Option<WindowId> = None;
+    // E10：一次性定时器当前挂在哪个宿主窗口上（每轮 ⑤′ 先 KillTimer 再按最新 deadline 重挂）。
+    let mut deadline_timer: Option<WindowId> = None;
     // C2：已消费的 DirectComposition 健康检查代际（`WM_PAINT` 在 `WndProc` 推进）。
     let mut composition_epoch_seen = composition::device_check_epoch();
     loop {
@@ -981,6 +1006,40 @@ pub(super) fn pump_loop(
         for task in dispatcher.drain_tasks() {
             let mut app = app_cell.borrow_mut();
             task.run(&mut app);
+        }
+
+        // ⑤′ E10 一次性定时器：把 ⑥ 的阻塞等待截止到最早的定时器到期时刻。
+        //
+        // 必须在 ⑤ 之后：任务里注册的定时器要在同一轮挂表，否则泵会在本轮末尾睡过到期点，
+        // 永远没有下一次唤醒。每轮先 KillTimer 再按**最新** deadline 重挂：剩余毫秒由绝对
+        // deadline 现算，重复挂表不会把到点时刻往后推；`SetTimer` 本身不产生帧、不进连续帧
+        // 模式（I3），到点只发一条 `WM_TIMER` 把 `GetMessageW` 唤醒一次。
+        {
+            let desired = {
+                let app = app_cell.borrow();
+                app.next_wake_deadline()
+            };
+            if let Some(host) = deadline_timer.take()
+                && let Some(native) = windows
+                    .iter()
+                    .find(|native| native.id() == host && !native.is_destroyed())
+            {
+                let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
+                // SAFETY: `DEADLINE_TIMER_ID` 由本线程在 host 上创建；已触发 / 已随窗口销毁时
+                // 是 no-op。
+                let _ = unsafe { KillTimer(Some(hwnd), DEADLINE_TIMER_ID) };
+            }
+            if let Some(deadline) = desired
+                && let Some(native) = windows.iter().find(|native| !native.is_destroyed())
+            {
+                let millis = deadline_timer_millis(deadline, Instant::now());
+                let hwnd = HWND(native.hwnd_raw() as *mut core::ffi::c_void);
+                // SAFETY: hwnd 是本进程存活窗口；`SetTimer` 只登记本线程的一次性消息定时器。
+                let id = unsafe { SetTimer(Some(hwnd), DEADLINE_TIMER_ID, millis, None) };
+                if id != 0 {
+                    deadline_timer = Some(native.id());
+                }
+            }
         }
 
         // ⑥ 阻塞等待（I3）：没有消息时停在这里。连续帧的唤醒由节拍线程 `PostMessageW` 送来。
@@ -1362,6 +1421,48 @@ mod chrome_loop_wiring_tests {
             collect < sync,
             "顺序必须是：应用控制 → 补收 `WM_SIZE` → `sync_chrome`（P2-1）；实际 collect={collect} \
              sync={sync}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod e10_deadline_timer_tests {
+    use std::time::{Duration, Instant};
+
+    use super::deadline_timer_millis;
+
+    /// 到期时刻 → `SetTimer` 毫秒：**向上取整**（不能早于 deadline 唤醒）、下限 1 ms、
+    /// 巨大剩余时长夹到 `u32::MAX`。
+    ///
+    /// 变异守卫：把 `saturating_add(999_999) / 1_000_000` 换成直接 `as_millis()` 截断 ⇒ 前半段
+    /// 变红（500.4 ms 被截成 500 ms，允许系统提前唤醒）；去掉 `.max(1)` ⇒ 已过期分支变红
+    /// （`SetTimer(0)` = 取消定时器，泵会睡过到期点）。
+    #[test]
+    fn the_deadline_timer_rounds_up_and_never_arms_zero() {
+        let now = Instant::now();
+        assert_eq!(
+            deadline_timer_millis(now + Duration::from_micros(500_400), now),
+            501,
+            "向上取整：500.4 ms 必须挂 501 ms（不能早于 deadline 唤醒）"
+        );
+        assert_eq!(
+            deadline_timer_millis(now + Duration::from_millis(500), now),
+            500
+        );
+        assert_eq!(
+            deadline_timer_millis(now, now),
+            1,
+            "已到期 / 立即到期必须挂 1 ms（SetTimer(0) 是取消，会睡过到期点）"
+        );
+        assert_eq!(
+            deadline_timer_millis(now.checked_sub(Duration::from_secs(1)).unwrap_or(now), now),
+            1,
+            "过去的 deadline 同样夹到 1 ms"
+        );
+        assert_eq!(
+            deadline_timer_millis(now + Duration::from_secs(u64::from(u32::MAX)), now),
+            u32::MAX,
+            "超长延时夹到 u32::MAX，不得回绕"
         );
     }
 }

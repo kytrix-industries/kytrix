@@ -257,7 +257,7 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                     window.set_frame_refresh_hz(hz);
                 }
                 // RA-5：不可见窗口不参与帧循环（`frame_windows` 过滤掉它），推迟标记必须清掉；
-                // 否则 `next_deferred_deadline()` 一直返回已过期时刻 ⇒ calloop timeout=0 空转。
+                // 否则 `next_wake_deadline()` 一直返回已过期时刻 ⇒ calloop timeout=0 空转。
                 if !state.is_visible(index) {
                     window.clear_frame_budget_deferred();
                 }
@@ -409,7 +409,7 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                             }
                             // A5：本帧被帧预算门禁推迟（不是空闲：脏位保留）⇒ 记进
                             // `deferred_frames`，到期后**不依赖新唤醒**补一帧（下面的 timeout 会
-                            // 压到 `next_deferred_deadline`）。
+                            // 压到 `next_wake_deadline`）。
                             if budget_deferred && !deferred_frames.contains(&id) {
                                 deferred_frames.push(id);
                             }
@@ -508,7 +508,9 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             // A5：被帧预算门禁推迟的帧到期后必须自己醒来（不依赖下一次无关事件；与 Windows
             // 的 FramePacer / macOS 连续帧定时器同义）。RA-5：不可见窗口的推迟标记已在上面
             // 清掉；这里再夹一个 1 ms 下限，避免已过期 deadline 让 calloop timeout=0 空转。
-            let timeout = match app.next_deferred_deadline() {
+            // E10：同一条 timeout 也承载**一次性定时器**的到期时刻（`App::after`）—— 定时器
+            // 等待期间不请求帧、不进连续帧模式，只在到点时唤醒一次泵。
+            let timeout = match app.next_wake_deadline() {
                 Some(deadline) => timeout
                     .min(deadline.saturating_duration_since(Instant::now()))
                     .max(Duration::from_millis(1)),

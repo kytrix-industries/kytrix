@@ -58,6 +58,13 @@ pub(crate) fn frame(
     window: WindowId,
     forced: bool,
 ) -> Option<Result<FrameOutcome, EngineError>> {
+    // E10：帧外产生的动画终止事件与已到期的一次性定时器在帧入口兜底派发。
+    //
+    // 平台泵的正常路径已经在钩子步骤（`App::run_frame_hook`）派发过；这里覆盖 headless /
+    // 自驱帧宿主（没有泵钩子）以及「事件在钩子之后、帧之前入队」的窗口。两者都是 O(1)
+    // 空表早退，空闲帧（I3）不受影响。
+    super::timer::run_due(app);
+    super::animation::dispatch_completions(app);
     if !app.windows.contains_key(&window) {
         return None;
     }
