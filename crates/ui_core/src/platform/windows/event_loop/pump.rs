@@ -7,9 +7,11 @@
 //! `DCompositionWaitForCompositorClock` 上等一拍才编码 —— 端到端固定多约 1 个 vsync）：
 //! present 节奏由 GPU 线程的 DXGI waitable 门禁承担，UI 侧只需要按刷新率推进动画与补帧。
 //!
-//! 为什么不用 `WM_TIMER`：`WM_TIMER` 是**最低优先级**消息，输入密集时被饿（1000 Hz 鼠标下
-//! 动画反而更抖）；且 `SetTimer` 的最小粒度受系统定时器分辨率限制（默认 15.6 ms）。`WM_TIMER`
-//! 现在只保留给 a11y 补发兜底（[`A11Y_TIMER_ID`]），空闲时没有定时器。
+//! 为什么不用 `WM_TIMER` 驱动连续帧：`WM_TIMER` 是**最低优先级**消息，输入密集时被饿（1000 Hz
+//! 鼠标下动画反而更抖）；且 `SetTimer` 的最小粒度受系统定时器分辨率限制（默认 15.6 ms）。
+//! `WM_TIMER` 只保留两个用途：a11y 补发兜底（[`A11Y_TIMER_ID`]）与 E10 一次性截止时刻
+//! （[`DEADLINE_TIMER_ID`]）；空闲态只在**有待派发定时器**时挂一只一次性定时器，没有动画也没有
+//! 待派发定时器时不挂表。
 //!
 //! 为什么需要一条独立线程：节拍线程要 `sleep` 到下一拍，而 UI 线程是唯一的消息泵 —— 把它放进
 //! 泵里就等于暂停输入（Chrome 同样是独立合成线程等节拍、UI 线程消费消息）。
@@ -53,7 +55,8 @@ use crate::{
 };
 
 /// 消费者：`wndproc` 的 `WM_TIMER` 分支与 `pump_loop` 的定时器管理。
-/// a11y 补发兜底定时器 id（**唯一**保留的 `WM_TIMER` 用途；连续帧走节拍线程）。
+/// a11y 补发兜底定时器 id（`WM_TIMER` 的两种保留用途之一；另一种是 [`DEADLINE_TIMER_ID`]
+/// 的一次性截止时刻；连续帧仍走 [`FramePacer`] 节拍线程）。
 pub(super) const A11Y_TIMER_ID: usize = 1;
 
 /// E10：一次性定时器（`App::after` 的最早到期时刻）的 `SetTimer` id。

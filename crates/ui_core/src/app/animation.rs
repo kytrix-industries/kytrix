@@ -277,7 +277,8 @@ pub(crate) fn animations_running(app: &App, window: WindowId) -> bool {
 }
 
 /// 全部窗口是否还有未完成的动画（[`needs_continuous_frames`] 的组成部分：只有动画需要按显示节拍
-/// 推进；连续帧由平台泵的合成器节拍线程 `FramePacer` 提供，`SetTimer` 只剩 a11y 补发兜底）。
+/// 推进；连续帧由平台泵的合成器节拍线程 `FramePacer` 提供，`SetTimer` 只保留 a11y 补发与 E10
+/// 一次性截止时刻，空闲无动画且无待派发定时器时不挂表）。
 /// 消费者：`App::has_animations`。
 pub(crate) fn has_animations(app: &App) -> bool {
     !app.animations.is_empty()
