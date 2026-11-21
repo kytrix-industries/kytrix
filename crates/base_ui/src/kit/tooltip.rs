@@ -37,6 +37,9 @@
 //!
 //! - 新增 **500 ms 延迟**（旧实现无延迟；`TooltipOptions::delay` 可调，`Duration::ZERO` = 立即）。
 //! - 新增 **focus 触发**（键盘用户的提示不能只靠 hover）。
+//! - 淡入淡出是**整组不透明度**（E13 经 [`Overlay`] 接入）：面板背景 + 文本 + 快捷键在同一棵
+//!   子树里，一次动画全部跟随，不需要逐节点读 `Overlay::progress`；实现仍暴露 `progress`
+//!   （调试 / 应用自绘内容用）。
 //! - 内容变化（[`Tooltip::set_content`]）在提示显示期间 = 先完整收起（淡出），再按**新内容**
 //!   重开：`Overlay::open` 的同窗重入只换锚点、不重建面板内容，所以不能靠它撤销量变化
 //!   （旧实现靠「撤回内容关、恢复内容不复活」的 hover 语义；引擎没有 per-node hover 回调，
@@ -211,7 +214,9 @@ impl Tooltip {
     /// `layer` 必须是**组合根的共享 Layer**（与菜单 / 对话框同一个）：提示要在
     /// [`Band::Tooltip`] 层带上参与跨组件 z 序仲裁（R09）。
     /// `router` 必须是**组合根的共享 [`AnimationRouter`]**（与所有 overlay 同一个单槽）：
-    /// 淡出收尾依赖 E10 完成回调，各自注册会互相覆盖（E10-R02）。
+    /// 淡出收尾依赖 E10 完成回调，各自注册会互相覆盖（E10-R02）。**kit 路由是应用唯一的完成
+    /// 回调注册者（B3）**：应用不得再调 `App::on_animation_complete`；需要多消费者时扩展 kit
+    /// 路由（见 [`AnimationRouter`] 的文档），不加引擎 API。
     pub fn new(
         app: &mut App,
         theme: ThemeHandle,
@@ -350,7 +355,11 @@ impl Tooltip {
                         self.start_delay(app);
                         changed = true;
                     }
-                } else {
+                } else if !self.inner.overlay.is_open(app) {
+                    // 只有旧浮层**真的关掉之后**才清标记（B1）：淡出窗口内离开触发器时若清掉，
+                    // 随后重新进入会走 `Overlay::open` 的同窗重入（只换锚点、不重建内容）——
+                    // 屏上复活的是旧文本，而 `shown` 已经是新内容。`pending_restart` 只能在
+                    // 「旧浮层已关闭」或 `reset()`（触发器丢失 / 引擎侧关闭）时清。
                     self.inner.pending_restart.set(false);
                 }
             }
@@ -506,6 +515,11 @@ impl Tooltip {
     }
 
     /// 取消在飞的延迟定时器（幂等；到期 / 已取消返回 false 不需要处理）。
+    ///
+    /// **冗余防御（B5）**：`start_delay`（重登记前）/ [`Tooltip::hide`] / [`Tooltip::reset`] 三处
+    /// 都会调用。行为契约只有一条——「离开 / 撤回 / 改绑后旧的到期点不得生效」；真正兜底的是
+    /// 重登记前的取消 + `delay_ready` 复位，单点删除不改变可观察行为（测试按行为断言，不按
+    /// 取消点断言）。
     fn cancel_delay(&self, app: &mut App) {
         self.inner.delay_ready.set(false);
         if let Some(id) = self.inner.delay_timer.take() {
@@ -836,19 +850,28 @@ mod tests {
             harness.tip.overlay().overlay_node().is_some(),
             "淡出期间节点保留"
         );
-        // 真实泵序：淡出到终值的那一帧由 E10 完成回调卸载（断言紧跟该轮帧，不补 sync）。
+        // 真实泵序：淡出到终值的那一帧由 E10 完成回调卸载。**帧精确**（B2）：断言绑在
+        // 「`animations_running` 变 false 的那一轮 `drain` 之后」（该轮钩子已跑过，不补 sync）；
+        // 旧 P0 形态（完成回调不卸载、等下一轮 sync 观测终值）在这里必红。
         let mut unloaded_in_the_completion_frame = false;
-        for _ in 0..16 {
+        for _ in 0..20 {
             harness.pump(Duration::from_millis(16));
-            if harness.tip.overlay().overlay_node().is_none() {
+            if !harness.app.app().animations_running(harness.window) {
+                assert!(
+                    harness.tip.overlay().overlay_node().is_none(),
+                    "动画完成的那一轮 drain 之后节点必须已卸载（完成回调同帧收尾；\
+                     等下一轮 sync 的旧形态会在这里变红）"
+                );
                 unloaded_in_the_completion_frame = true;
                 break;
             }
         }
         assert!(
             unloaded_in_the_completion_frame,
-            "淡出结束必须由 E10 完成回调收尾（真实泵序下 sync 观测不到终值）"
+            "淡出必须在 20 轮内走完并触发完成回调"
         );
+        assert!(!harness.tip.is_visible(harness.app.app()));
+        assert!(!harness.tip.overlay().is_open(harness.app.app()));
     }
 
     #[test]
@@ -1203,8 +1226,85 @@ mod tests {
     }
 
     #[test]
-    fn leaving_during_the_delay_cancels_the_timer_and_restarts_it_on_reentry() {
-        // E10 定时器生命周期：离开触发器 / 撤回内容时取消；再次进入重新计时（不是沿用旧到期点）。
+    fn re_entering_during_the_content_change_fade_still_rebuilds_the_new_text() {
+        // B1（P1）：N1 的同类变体。内容变化 → 旧面板淡出（`pending_restart`）→ 淡出窗口内**离开
+        // 触发器再重新进入**。旧实现在 `Phase::Idle` 的 else 分支无条件清 `pending_restart`，
+        // 重新进入会走 `Overlay::open` 的同窗重入（只换锚点、不重建内容）⇒ 屏上复活旧面板，
+        // 而 `shown` 已是新内容，之后不再重建。修复：只有旧浮层真的关闭后才清标记。
+        let mut harness = Harness::new(TooltipOptions {
+            delay: Duration::ZERO,
+            ..TooltipOptions::default()
+        });
+        harness.hover(harness.trigger_center());
+        let _ = harness.sync();
+        assert!(
+            harness.tip.is_visible(harness.app.app()),
+            "前置：提示已显示"
+        );
+        harness.advance(Duration::from_millis(200));
+        let _ = harness.app.drain().expect("淡入帧");
+        let _ = harness.sync();
+        assert_eq!(harness.tip.overlay().progress(harness.app.app()), 1.0);
+        let old_panel = harness.tip.overlay().panel_node().expect("旧面板");
+        assert!(
+            texts_of(&harness, old_panel).contains("保存"),
+            "前置：屏上是旧文本"
+        );
+
+        // 显示中改内容：旧面板开始淡出，等它完整关闭后按新内容重建（`pending_restart`）。
+        assert!(harness.tip.set_content(Some(TooltipContent::new("新建"))));
+        let _ = harness.sync();
+        assert!(!harness.tip.is_visible(harness.app.app()));
+        assert!(
+            harness.tip.overlay().overlay_node().is_some(),
+            "前置：仍在淡出窗口内"
+        );
+
+        // 淡出窗口内离开触发器（不推进时钟 ⇒ 淡出动画不 tick，节点一定还在）。
+        harness.hover(Point::new(10.0, 10.0));
+        let _ = harness.sync();
+        assert!(
+            harness.tip.overlay().overlay_node().is_some(),
+            "前置：离开后仍在淡出窗口内"
+        );
+        // 淡出窗口内重新进入：不得撤销关闭复活旧面板（B1 变异：这里 `is_visible` 会变 true）。
+        harness.hover(harness.trigger_center());
+        let _ = harness.sync();
+        assert!(
+            !harness.tip.is_visible(harness.app.app()),
+            "内容变化的淡出窗口内重新进入不得复活旧面板"
+        );
+        assert!(
+            harness.tip.overlay().overlay_node().is_some(),
+            "前置：仍在淡出窗口内，旧面板尚未卸载"
+        );
+
+        // 旧浮层由 E10 完成回调卸载 → 下一轮 Idle 分支按新内容重建。
+        for _ in 0..20 {
+            harness.pump(Duration::from_millis(16));
+            if harness.tip.is_visible(harness.app.app()) {
+                break;
+            }
+        }
+        assert!(
+            harness.tip.is_visible(harness.app.app()),
+            "旧面板关闭后必须按新内容重新显示"
+        );
+        let panel = harness.tip.overlay().panel_node().expect("新面板");
+        let texts = texts_of(&harness, panel);
+        assert!(
+            texts.contains("新建"),
+            "重开的面板必须是新文本，实际 {texts:?}"
+        );
+        assert!(!texts.contains("保存"), "旧文本不得复活，实际 {texts:?}");
+    }
+
+    #[test]
+    fn leaving_during_the_delay_prevents_the_stale_deadline_from_showing() {
+        // E10 定时器生命周期（B5：声明收敛到**可验证**的口径）：「离开后旧的到期点不得生效」
+        // 是行为契约；实现里 `start_delay`（重登记前）/ `hide` / `reset` 三处取消互为冗余，
+        // 单删任一处行为仍正确（旧测试名「必须取消」在单点变异下不成立，已改名）。本测试断言
+        // 可观察行为：走过原到期点不显示、重新进入后重新计满延迟（不沿用旧到期点）。
         let mut harness = Harness::new(TooltipOptions {
             delay: Duration::from_millis(500),
             ..TooltipOptions::default()
@@ -1215,13 +1315,13 @@ mod tests {
         let _ = harness.sync();
         assert!(!harness.tip.is_visible(harness.app.app()));
 
-        // 离开后即使走过原到期点也不得显示（定时器已取消）。
+        // 离开后即使走过原到期点也不得显示（旧到期点已失效；任一取消点生效即可）。
         harness.advance(Duration::from_millis(700));
         let _ = harness.app.drain().expect("帧");
         let _ = harness.sync();
         assert!(
             !harness.tip.is_visible(harness.app.app()),
-            "离开后定时器必须取消（否则旧到期点会弹出提示）"
+            "离开后旧的到期点不得生效（否则提示会在没有悬停时弹出）"
         );
 
         // 重新进入：重新计满 500 ms 才显示。

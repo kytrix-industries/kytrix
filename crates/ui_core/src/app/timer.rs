@@ -16,10 +16,21 @@
 //!
 //! # 时钟与精度
 //!
-//! 到期判定用**引擎时钟**（平台泵每轮 `sync_clock`；测试用 `TestApp::advance`），因此
-//! **不会早于**登记的 `delay` 触发；平台唤醒本身受系统定时器粒度影响（Windows `WM_TIMER`
-//! 约 15.6 ms 粒度、Linux calloop 毫秒级、macOS `CFRunLoopTimer`），唤醒**晚到**只是让回调
-//! 晚一轮派发，不会漏派发（未到期时平台会在下一轮重新挂表）。
+//! 到期判定用**引擎时钟**（平台泵每轮 `sync_clock_live`；测试用 `TestApp::advance`）。
+//!
+//! **登记基准**（E10c）：生产构建（`App::new` 即活时钟，`App::clock_live`）用**登记瞬间的
+//! 真实时间** `Instant::now()` 作基准 —— 包括**首次泵启动之前**登记的定时器（E10c-R01：
+//! `Application::run` 之前的建窗/初始化耗时不折算进 `delay`）；测试宿主 `TestApp` 用引擎时钟
+//! （`TestApp::advance` 是唯一推进源，deadline 必须精确等于 `clock + delay` 才可断言）。
+//!
+//! 为什么不能用泵起点同步的引擎时钟当基准：泵在**开始**同步时钟，之后还有事件派发、窗口状态
+//! 同步、渲染器轮询等本帧前置工作；应用在 `on_frame` 里登记定时器时，引擎时钟已经落后真实
+//! 时间那段工作。拿它做基准会把这段前置工作算进 `delay` ⇒ 平台定时器在「登记后 delay」之前
+//! 到点（macOS 真机实测 `398.648 ms < 400 ms`）。`run_due` 的到点判定用**泵起点**的引擎时钟，
+//! 因此也不会把平台定时器的提前唤醒当作到期（未到期就下一轮重新挂表，只晚不早）。
+//!
+//! 平台唤醒本身受系统定时器粒度影响（Windows `WM_TIMER` 约 15.6 ms 粒度、Linux calloop
+//! 毫秒级、macOS `CFRunLoopTimer`），唤醒**晚到**只是让回调晚一轮派发，不会漏派发。
 
 use std::time::{Duration, Instant};
 
@@ -64,10 +75,18 @@ pub(crate) fn after(
     }
     let id = app.next_timer;
     app.next_timer = app.next_timer.wrapping_add(1);
+    // E10c：登记基准 = 生产（活时钟，`App::new` 即置位 ⇒ 首次泵启动前登记同样成立）取
+    // **登记瞬间**真实时间；测试宿主取引擎时钟（可 `advance` 精确断言）。见模块文档
+    // 「时钟与精度」。
+    let reference = if app.clock_live {
+        Instant::now()
+    } else {
+        app.clock
+    };
     // 超出 `Instant` 表示范围的延时按「立即到期」处理（不 panic）：`delay` 是应用给的
     // `Duration`，几十年的延时在 UI 语义上与「不再醒来」等价，但立即到期至少是确定性的，
     // 且下一轮就会被派发掉、不会在表里永久驻留。
-    let deadline = app.clock.checked_add(delay).unwrap_or(app.clock);
+    let deadline = reference.checked_add(delay).unwrap_or(reference);
     app.timers.push(TimerEntry {
         id,
         window,

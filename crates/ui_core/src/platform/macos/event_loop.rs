@@ -53,6 +53,7 @@ use crate::{
             ModalOwnerChromes, OwnerResolution, WindowKeyInput, reclaim_modal_keys, resolve_owner,
             window_level,
         },
+        macos_pump,
     },
     render::{backend::Renderer, macos::core::GpuCore},
     window::{Window, WindowId, WindowOptions},
@@ -458,7 +459,7 @@ fn pump_and_stop(state: &mut LoopState, tick: bool) {
 fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
     // SAFETY: `app` 指针由 `run` 保证有效，且此刻没有其它 `&mut App`。
     let app = unsafe { &mut *state.app };
-    app.sync_clock();
+    app.sync_clock_live();
     // 运行时窗口生命周期（P1-2.8）：`App` 里新增/移除的窗口要同步到原生窗口。旧实现只在
     // `run` 启动时枚举一次，运行时 `App::create_window` 的窗口永远没有原生窗口与渲染器。
     sync_native_windows(
@@ -501,6 +502,9 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
             .find(|native| native.id() == window && !native.is_destroyed())
     {
         native.apply_window_control(control);
+        // 控制请求的应用效果（`isZoomed` / `styleMask` / 尺寸）在下一轮的 `sync_chrome` /
+        // `sync_state` 才会被读到；本轮按「有工作」处理，不把它并进空闲轮。
+        changed = true;
     }
     for native in state.windows.iter_mut() {
         let id = native.id();
@@ -521,6 +525,40 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
         }
     }
 
+    // E10c：纯 vsync tick 的空闲轮不跑完整应用轮。
+    //
+    // 泵由 `BeforeWaiting` 观察者每轮 run loop 驱动，而 display link 挂在主 run loop 上按刷新率
+    // 唤醒 run loop（R06-8 的空闲滞回让它最后一次工作后继续跑 ≤ `IDLE_GRACE`）。这些 tick 只对
+    // 渲染器有意义（drawable / pacing / 上屏反馈），不该调用应用回调、出帧或跑任务 —— 否则一次
+    // `App::after` 的等待期里 `on_frame` 会被空转几十轮（macOS 真机实测 54 轮 / 400 ms，Windows
+    // 同代码 1 轮），I3 的「空闲零唤醒」在应用层被破坏。
+    //
+    // 判据是平台无关纯函数（`platform::macos_pump`，Windows 可单测）：输入事件 / 窗口状态 /
+    // 跨线程唤醒 / 到点定时器 / 动画 / a11y / 退出都会让本轮走完整路径；只有「什么都没有」的
+    // tick 才走空闲路径（pacing + a11y 投递对账，不碰应用回调、不出帧）。
+    let gate = macos_pump::RoundInputs {
+        tick,
+        changed,
+        pending_wake: state.dispatcher.has_pending_wake(),
+        timer_due: app
+            .next_wake_deadline()
+            .is_some_and(|deadline| deadline <= Instant::now()),
+        continuous: app.needs_continuous_frames(),
+        deferred: app.has_deferred_frames(),
+        a11y_retry: app.a11y_retry_pending(),
+        a11y_backlog: app.a11y_backlog_pending(),
+        quit: state.quit.pending(),
+    };
+    if !macos_pump::app_round(gate) {
+        sync_display_pacing(app, &state.windows, gate.continuous);
+        for native in state.windows.iter_mut() {
+            // a11y 投递对账留在每轮：AT 客户端连接 / 断开时 adapter 的活跃状态会变，而这不经过
+            // 应用写路径（没有 App 脏位、没有唤醒）。adapter 不活跃时这里是 O(1) 早退。
+            native.update_a11y(app);
+        }
+        return Ok(());
+    }
+
     app.run_frame_hook();
     // 连续帧的节奏由定时器（observer 每轮一次）提供；`tick` 为真时直接出帧，不再写回
     // `Dispatcher::wake`。source/observer 路径只响应显式 wake（输入、任务、应用请求）。
@@ -538,19 +576,7 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
     // display link 的节奏（§5.3 + R09-9）：连续帧 / 有帧要画 / 有在飞帧时恢复，否则暂停
     // （空闲 0 唤醒）。**不可见**（最小化 / 应用隐藏 / 被完全遮挡）时无条件停帧 —— 那三种
     // 状态下窗口一个像素都不显示，却会产生帧请求把 display link 永久钉在 120 Hz。
-    for native in state.windows.iter() {
-        let visible = native.is_visible();
-        if let Some(window) = app.window_mut(native.id()) {
-            // A5：窗口可能被拖到另一块屏（刷新率不同）⇒ 每轮泵更新预算提示（同值幂等）。
-            window.set_frame_refresh_hz(native.maximum_frames_per_second());
-            // RA-5：不可见窗口不产帧（下面 `sync_pacing` 会停 display link），推迟标记必须清掉，
-            // 否则 `has_deferred_frames()` 让连续帧定时器常驻（空闲零唤醒不变式被破坏）。
-            if !visible {
-                window.clear_frame_budget_deferred();
-            }
-            window.sync_pacing(continuous && visible);
-        }
-    }
+    sync_display_pacing(app, &state.windows, continuous);
 
     // 交互反馈：光标形状按 **WindowId 定向**投递（R09-11 / R09-25）。
     // 旧实现只把 `Cursor` 施加到第一个窗口，其余窗口的光标请求被静默丢弃。
@@ -648,6 +674,27 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
         state.exit = true;
     }
     Ok(())
+}
+
+/// display link 的暂停/恢复对账（完整应用轮与空闲轮共用；§5.3 + R09-9 + I3）。
+///
+/// 只有 macOS 需要它：Windows/Linux 的节奏完全由事件 / 合成器驱动，没有可暂停的源。
+/// `sync_pacing` 内部按 `PacingGate` 的滞回决定（有工作立刻恢复、最后一次工作后 ≤ `IDLE_GRACE`
+/// 再暂停），因此空闲轮调它不会把 display link 重新拉起来。
+fn sync_display_pacing(app: &mut App, windows: &[NativeWindow], continuous: bool) {
+    for native in windows {
+        let visible = native.is_visible();
+        if let Some(window) = app.window_mut(native.id()) {
+            // A5：窗口可能被拖到另一块屏（刷新率不同）⇒ 每轮泵更新预算提示（同值幂等）。
+            window.set_frame_refresh_hz(native.maximum_frames_per_second());
+            // RA-5：不可见窗口不产帧（`sync_pacing` 会停 display link），推迟标记必须清掉，
+            // 否则 `has_deferred_frames()` 让连续帧定时器常驻（空闲零唤醒不变式被破坏）。
+            if !visible {
+                window.clear_frame_budget_deferred();
+            }
+            window.sync_pacing(continuous && visible);
+        }
+    }
 }
 
 /// 退出握手：先询问全部窗口，再关窗（R09-16 / AR3 P1-2）。
@@ -962,10 +1009,13 @@ unsafe extern "C-unwind" fn observer_callback(
 /// # Safety
 ///
 /// 同 [`pump_callback`]：`info` 是 `run` 安装的 `LoopState` 指针，调用只在主线程发生。
-unsafe extern "C-unwind" fn timer_callback(_timer: *mut CFRunLoopTimer, info: *mut c_void) {
+unsafe extern "C-unwind" fn timer_callback(timer: *mut CFRunLoopTimer, info: *mut c_void) {
     if info.is_null() {
         return;
     }
+    // E10c-R06：一次性定时器触发后 CF 会把它失效；先标记槽，泵末尾的 `set_deadline` 才会
+    // 重建（提前触发 + target 仍在未来时，不复用已失效的表，否则这次唤醒丢失）。
+    wake::note_deadline_fired(timer);
     // SAFETY: 同 `pump_callback`。
     let state = unsafe { &mut *(info as *mut LoopState) };
     pump_and_stop(state, true);

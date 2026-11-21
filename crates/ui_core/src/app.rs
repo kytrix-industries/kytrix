@@ -227,6 +227,14 @@ pub struct App {
     thresholds: InputThresholds,
     /// 引擎时钟（生产由平台每轮 `sync_clock`，测试由 `TestApp::advance` 推进）。
     clock: Instant,
+    /// 一次性定时器的登记基准是否取**登记瞬间的真实时间**（活时钟模式）。
+    ///
+    /// E10c-R01：真正的语义不能以「泵是否启动过」为准 —— 应用在 `Application::run` **之前**
+    /// 就能建窗并登记定时器，那也必须「只晚不早」。因此 `App::new` 的生产默认就是置位；
+    /// 测试宿主 `TestApp` 构造后显式关闭（`TestApp::advance` 是唯一推进源，deadline 必须能
+    /// 精确断言）。平台泵通过 [`App::sync_clock_live`] 每轮刷新时钟并保持置位；
+    /// `App::dispatch` 的 `sync_clock` 不置位（测试也会派发输入）。
+    clock_live: bool,
     /// 每个窗口最近一次 a11y 交付的时钟值（节流用，P2-6）。
     ///
     /// 高频实时数据（行情数字）会让 A11Y 脏位每帧都为真，而每次交付都要全树扫描 +
@@ -610,6 +618,9 @@ impl App {
             scoped_bindings: Vec::new(),
             thresholds: InputThresholds::platform_default(),
             clock: Instant::now(),
+            // E10c-R01：生产默认活时钟（首次泵启动前登记的定时器也以登记瞬间为基准）；
+            // `TestApp` 在构造后显式关闭（见 `TestApp::with_options`）。
+            clock_live: true,
             a11y_delivered: ahash::HashMap::default(),
             a11y_delivered_round: false,
             last_click: None,
@@ -2036,12 +2047,16 @@ impl App {
         self.animation_complete_handler = Some(Box::new(handler));
     }
 
-    /// 注册一个**一次性定时器**（E10）：`delay` 之后（引擎时钟）在 UI 线程回调一次。
+    /// 注册一个**一次性定时器**（E10）：`delay` 之后在 UI 线程回调一次。
+    ///
+    /// `delay` 的基准是**登记瞬间**（生产取真实时间，E10c-R01；测试宿主 `TestApp` 取引擎
+    /// 时钟，见 `TestApp::advance`）—— **首次泵启动之前**登记同样成立（`Application::run`
+    /// 之前建窗 → 初始化 → 登记，初始化耗时不折算进 `delay`）。
     ///
     /// 定时器归属 `window`：窗口关闭时自动取消（不会在关窗后再跑应用闭包）。到期前**不请求帧、
     /// 不让平台进入连续帧**（I3）；平台泵把阻塞等待截止到 `App::next_wake_deadline()` 并在到点
     /// 唤醒**一次**。派发点 = 平台泵每轮的钩子步骤（`App::run_frame_hook`）或 `App::frame` 入口，
-    /// 因此回调最迟在到期后的**下一个引擎轮次**运行（不会早于 `delay`）。
+    /// 因此回调最迟在到期后的**下一个引擎轮次**运行（**不会早于** `delay`）。
     ///
     /// 不新建线程：复用平台泵已有的定时器（Windows `SetTimer` / macOS `CFRunLoopTimer` /
     /// Linux calloop timeout）与引擎时钟；`App` 的 tokio runtime 不参与。
@@ -2179,6 +2194,26 @@ impl App {
     /// 把引擎时钟推进到真实时间（平台泵每轮一次；测试用 `TestApp::advance`）。
     pub(crate) fn sync_clock(&mut self) {
         animation::sync_clock(self)
+    }
+
+    /// 平台泵的轮首时钟同步：推进到真实时间并**标记为活时钟**（E10c）。
+    ///
+    /// 与 [`App::sync_clock`] 的区别是置 `clock_live`：一次性定时器的登记基准据此选择
+    /// 「登记瞬间真实时间」（生产）还是「引擎时钟」（测试宿主）。生产在 `App::new` 就已是
+    /// 活时钟（E10c-R01：首次泵启动前登记也必须只晚不早）；平台泵（Windows/macOS/Linux）
+    /// 每轮调用本方法以刷新时钟；`App::dispatch` 里的时钟同步**不**置位（测试也会派发输入）。
+    pub(crate) fn sync_clock_live(&mut self) {
+        animation::sync_clock_live(self)
+    }
+
+    /// 测试宿主专用：把定时器登记基准切回**引擎时钟**（`TestApp::advance` 是唯一推进源，
+    /// deadline 必须能精确断言）。
+    ///
+    /// 生产默认是活时钟（`App::new` 即置位，E10c-R01），因此测试宿主必须显式关闭；该方法只在
+    /// 测试基建（`test-support`，不进发布物）里存在。
+    #[cfg(feature = "test-support")]
+    pub(crate) fn use_engine_clock(&mut self) {
+        self.clock_live = false;
     }
 
     /// 推进测试时钟（`TestApp::advance` 的唯一实现；只在测试构建里存在）。
