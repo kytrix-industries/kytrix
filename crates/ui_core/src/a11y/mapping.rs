@@ -626,13 +626,25 @@ pub(crate) fn is_hidden(
     if matches!(target.style().inner.display, taffy::style::Display::None) {
         return true;
     }
-    // 自绘 / 图片节点必须有替代文本，否则 hidden + 诊断（§7.4 / §5.4）。E7：图片节点的
-    // 可访问名只能来自 `A11yOverride::label`（`ImageContent` 不承载 alt），没有则视为装饰图。
+    // 自绘 / 图片节点必须有替代文本，否则 hidden（§7.4 / §5.4）。E7：图片节点的可访问名只能
+    // 来自 `A11yOverride::label`（`ImageContent` 不承载 alt），没有则视为装饰图。注意这是
+    // **兜底** hidden：显式 `A11yOverride { hidden: true }` 才是装饰声明（免 `MissingAltText`，
+    // 见 `a11y::tree` 的诊断判定），两者对 `hidden` 的结论相同、对诊断的结论不同。
     matches!(
         target.kind(),
         NodeKind::Canvas(_) | NodeKind::Geometry(_) | NodeKind::Image(_)
     ) && label.is_none()
         && role == A11yRole::Image
+}
+
+/// 图片节点的**显式装饰声明**（P2-1b3 裁决）：`A11yOverride { hidden: true }`。
+///
+/// 与 [`is_hidden`] 的兜底区分：没有 label 的图片本来就会被兜底标 `hidden`，但只有**显式**
+/// hidden 才是「这是装饰图、不需要可访问名」的语义声明 —— 免 `MissingAltText` 诊断；兜底
+/// hidden 的图片仍记诊断（应用应给 label 或显式声明装饰）。`Canvas` / `Geometry` 不适用
+/// （它们的替代文本是必需语义，hidden 不是装饰声明）。
+pub(crate) fn is_decorative_image(target: &Node, over: Option<&A11yOverride>) -> bool {
+    over.is_some_and(|over| over.hidden) && matches!(target.kind(), NodeKind::Image(_))
 }
 
 /// 禁用判定：动态/静态声明，或 `interactive == Some(false)`（与 `focusable` 同源）。

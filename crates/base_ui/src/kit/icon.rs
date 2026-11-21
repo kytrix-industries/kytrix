@@ -1,4 +1,4 @@
-//! 图标：Phosphor 字形的枚举、构建期 PNG 与引擎图片节点挂载。
+//! 图标：Phosphor 字形的枚举、构建期 PNG 与 E7 图片节点挂载。
 //!
 //! # 数据流
 //!
@@ -10,20 +10,23 @@
 //!
 //! 运行期：IconKind ──name()──▶ <stem> ──raster(tier)──▶ &'static [u8]
 //!          ── Window::scale() 选档 ──▶ ResourceCache::insert_owned_at_size(逻辑尺寸 × scale)
-//!          ── ResourceId ──▶ InlineBoxPaint::Image { resource, modulation: color }
-//!          ──▶ Primitive::Image（引擎在 paint 期解析 tile 并乘调制色）
+//!          ── ResourceId ──▶ NodeBuilder::image(id, ImageFit::Fill)
+//!              .image_modulation(color) + 显式 Style 尺寸
+//!          ──▶ 引擎 refresh_images 解析内在尺寸、paint 期产出 Primitive::Image（texel × 调制色）
 //! ```
+//!
+//! 图标节点是 E7 的**一等图片叶子**（`NodeKind::Image`）：没有占位文本、没有行内盒、没有写死的
+//! measure；尺寸来自显式 `Style`，颜色走 `ImageContent.modulation`，a11y 显式 `hidden`。
 //!
 //! # 颜色调制
 //!
 //! 旧实现是 `svg().path(..).text_color(..)`：GPUI 渲染 SVG 时把 `currentColor` 换成文本色。
-//! 引擎的图片通道只有 `Primitive::Image.modulation`（`texel * modulation`，预乘空间），所以
-//! 图标烘成**白色**字形，运行期 `Color` 就是最终颜色；`Color::WHITE` = 原样（白色），
-//! `Color::TRANSPARENT` = 不画（paint 跳过透明调制）。
+//! 图标因此烘成**白色**字形，运行期 `Color` 走 E7 图片节点的调制通道（`texel * modulation`，
+//! 预乘空间），`Color::WHITE` = 原样（白色），`Color::TRANSPARENT` = 不画（paint 跳过透明调制）。
 //!
-//! # 档位选择
+//! # 档位选择与 DPI
 //!
-//! 两档 48 / 96 px，按**目标窗口的 DPI** 选（`Window::scale()`）：
+//! 两档 48 / 96 px，按**挂载时**目标窗口的 DPI 选（`Window::scale()`）：
 //!
 //! | 窗口 scale | 档位 | 典型逻辑尺寸 → 物理目标 |
 //! |---|---|---|
@@ -32,8 +35,11 @@
 //!
 //! 旧实现的图标逻辑尺寸只有 8 / 12 / 16 px（`crate::size::UnifiedSize::icon_size` 与
 //! `.size_4()`；统计见 spec-delta §2），所以两档足够覆盖 1× / 2× 且图集不会无谓膨胀。
-//! **DPI 变化不会自动换档**：同一节点的 `ResourceId` 是挂载期定的变体，换屏后需要重新挂载
-//! 图标节点（引擎的 DPI 失效只重排不重解图片，见 spec-delta §6 遗留项）。
+//!
+//! **DPI 变化时 E7 只重解析内在尺寸，不替应用换资产变体**（`spec-deltas/E7.md` §3.2）：tile 的
+//! 物理像素不变，逻辑内在尺寸随 scale 变化。本模块给图标节点写**显式 `Style` 尺寸**，所以布局
+//! 不随 DPI 抖动；采样密度由 [`IconSpec::reselect`] 恢复 —— 应用在 `Event::DpiChanged`（或检测
+//! 到 `Window::scale_epoch()` 变化）后对已挂载节点调用一次即可（事件接线在 P2-4 组件批）。
 //!
 //! # 错误语义
 //!
@@ -47,12 +53,17 @@
 use std::fmt;
 
 use smol_str::SmolStr;
+use taffy::style::Dimension;
 use ui_core::{
-    app::App, error::EngineError, math::Size, node::id::NodeId, paint::color::Color,
+    a11y::A11yOverride,
+    app::App,
+    error::EngineError,
+    math::Size,
+    node::{builder::NodeBuilder, id::NodeId, image::ImageFit},
+    paint::{color::Color, style::Style},
+    resources::ResourceImage,
     window::WindowId,
 };
-
-use crate::kit::image_node;
 
 /// 构造图标时的默认逻辑边长（旧用法里最常见的 16 px；`UnifiedSize::icon_size` 的 Large 档）。
 pub const DEFAULT_ICON_SIZE: f32 = 16.0;
@@ -426,14 +437,17 @@ impl IconSpec {
         self
     }
 
-    /// 把图标挂到 `parent` 末尾，返回图片节点句柄。
+    /// 把图标挂到 `parent` 末尾，返回 E7 图片节点句柄。
     ///
     /// 语义：
     /// - 按**窗口 DPI** 选 PNG 档位，并把「逻辑尺寸 × scale」作为物理目标取图集变体
-    ///   （`ResourceCache::insert_owned_at_size`：不放大、等比 fit；同 内容+变体 只占一个 tile）；
-    /// - 资源引用登记在窗口名下（关窗统一回收），重复挂载同一图标只增引用计数；
-    /// - 节点是**参与布局的图片节点**（空文本 + 行内盒图片，见 `kit::image_node` 的模块文档），
-    ///   颜色经 `InlineBoxPaint::Image.modulation` 在 paint 期调制。
+    ///   （`ResourceCache::insert_owned_at_size` 是 `insert_for_display` 的窗口归属版：
+    ///   同样的 D-10 物理像素口径 + 关窗统一回收；不放大、等比 fit；同内容+变体只占一个 tile）；
+    /// - 节点是 `NodeKind::Image` 叶子：显式 `Style` 尺寸 = 逻辑正方形、`ImageFit::Fill`
+    ///   （图标 PNG 是正方形，`Fill` 与 `Contain` 几何等价，取 `Fill` 避免额外的等比计算）、
+    ///   `image_modulation(color)` 走 E7 调制通道；
+    /// - a11y 显式 `hidden`（装饰性叶子：显式 hidden = 装饰声明，引擎不产生
+    ///   `MissingAltText` 诊断；有语义的图标由使用方在容器上给 role/label）。
     ///
     /// # Errors
     /// - [`IconError::UnknownWindow`]：窗口已关闭；
@@ -454,21 +468,82 @@ impl IconSpec {
             .ok_or(IconError::UnknownWindow { window })?
             .scale()
             .factor();
+        let resource = self.resource_for(app, window, scale)?;
+        let mut style = Style::default();
+        style.inner.size.width = Dimension::length(self.size);
+        style.inner.size.height = Dimension::length(self.size);
+        NodeBuilder::image(resource.id, ImageFit::Fill)
+            .image_modulation(self.color)
+            .style(style)
+            .a11y(A11yOverride {
+                hidden: true,
+                ..A11yOverride::default()
+            })
+            .build(
+                app.window_mut(window)
+                    .ok_or(IconError::UnknownWindow { window })?
+                    .tree_mut(),
+                parent,
+            )
+            .map_err(IconError::Node)
+    }
+
+    /// DPI 变化后**重选光栅档位**并把新变体换到已挂载的图标节点上（E7 `set_image_resource`）。
+    ///
+    /// E7 在窗口 `scale_epoch` 变化时只重解析内在尺寸（tile 物理像素 ÷ 新 scale），不会替应用
+    /// 重选资产变体；应用在 `Event::DpiChanged` 后调用本方法即可恢复像素密度，**不需要**重建
+    /// 节点。图标节点的尺寸是显式 `Style` 尺寸，所以换变体不会改变布局（只是采样变清晰）。
+    ///
+    /// 本方法只重选档位：`kind` / `size` / `color` 的语义变化（例如主题切换）仍应重建节点。
+    /// 换句柄本身不请求帧；这里显式调用 [`App::request_repaint`]，保证帧外调用（事件处理器）
+    /// 后下一帧会重绘。
+    ///
+    /// 返回值 = 新插入的图集变体（含新 `ResourceImage.id` / `tile` / 物理像素尺寸）。
+    ///
+    /// # Errors
+    /// - [`IconError::UnknownWindow`] / [`IconError::InvalidSize`]：同 [`IconSpec::build`]；
+    /// - [`IconError::NotImageNode`]：`node` 不是图片节点（例如传成了容器）；
+    /// - [`IconError::Decode`] / [`IconError::Node`]：引擎强类型错误（陈旧节点是
+    ///   `Node(EngineError::StaleNode { .. })`）。
+    pub fn reselect(
+        self,
+        app: &mut App,
+        window: WindowId,
+        node: NodeId,
+    ) -> Result<ResourceImage, IconError> {
+        if !self.size.is_finite() || self.size <= 0.0 {
+            return Err(IconError::InvalidSize { size: self.size });
+        }
+        let scale = app
+            .window(window)
+            .ok_or(IconError::UnknownWindow { window })?
+            .scale()
+            .factor();
+        let resource = self.resource_for(app, window, scale)?;
+        let accepted = app
+            .window_mut(window)
+            .ok_or(IconError::UnknownWindow { window })?
+            .set_image_resource(node, resource.id)
+            .map_err(IconError::Node)?;
+        if !accepted {
+            return Err(IconError::NotImageNode { node });
+        }
+        app.request_repaint(window).map_err(IconError::Node)?;
+        Ok(resource)
+    }
+
+    /// 按 `scale` 选档 + 取图集变体（`build` / `reselect` 共用的插入路径）。
+    fn resource_for(
+        self,
+        app: &mut App,
+        window: WindowId,
+        scale: f32,
+    ) -> Result<ResourceImage, IconError> {
         let tier = RasterTier::for_scale(scale);
         let physical = Size::new(self.size * scale, self.size * scale);
-        let resource = app
-            .resources_mut()
+        app.resources_mut()
             .insert_owned_at_size(window, raster(self.kind, tier), physical)
-            .map_err(IconError::Decode)?;
-        image_node::mount(
-            app,
-            window,
-            parent,
-            resource.id,
-            Size::new(self.size, self.size),
-            self.color,
-        )
-        .map_err(IconError::Node)
+            .map_err(IconError::Decode)
     }
 }
 
@@ -490,9 +565,14 @@ pub enum IconError {
         /// 未知的名字。
         name: SmolStr,
     },
+    /// `reselect` 的目标节点不是 E7 图片节点。
+    NotImageNode {
+        /// 传入的节点句柄。
+        node: NodeId,
+    },
     /// 图标 PNG 解码 / 图集装箱失败（引擎错误）。
     Decode(EngineError),
-    /// 建树失败（引擎错误）。
+    /// 建树 / 换句柄失败（引擎错误）。
     Node(EngineError),
 }
 
@@ -511,6 +591,12 @@ impl fmt::Display for IconError {
                     "unknown icon kind `{name}` (not a Phosphor icon name)"
                 )
             }
+            IconError::NotImageNode { node } => {
+                write!(
+                    formatter,
+                    "icon reselect target {node:?} is not an image node"
+                )
+            }
             IconError::Decode(error) => write!(formatter, "icon raster decode failed: {error}"),
             IconError::Node(error) => write!(formatter, "icon node mount failed: {error}"),
         }
@@ -523,7 +609,8 @@ impl std::error::Error for IconError {
             IconError::Decode(error) | IconError::Node(error) => Some(error),
             IconError::UnknownWindow { .. }
             | IconError::InvalidSize { .. }
-            | IconError::UnknownKind { .. } => None,
+            | IconError::UnknownKind { .. }
+            | IconError::NotImageNode { .. } => None,
         }
     }
 }
@@ -531,10 +618,20 @@ impl std::error::Error for IconError {
 #[cfg(test)]
 mod tests {
     use image::{GenericImageView, ImageFormat, imageops::FilterType};
-    use ui_core::math::Rect;
+    use ui_core::{
+        a11y::{A11yDiagnostic, A11yDrawKind, A11yRole},
+        math::{Rect, Scale, Size},
+        node::{
+            id::NodeId,
+            image::{ImageFit, ImageSource},
+            tree::NodeKind,
+        },
+        paint::color::Color,
+        test_support::app::TestApp,
+    };
 
     use super::{DEFAULT_ICON_SIZE, IconError, IconKind, IconSpec, RasterTier, raster};
-    use crate::kit::test_support::{image_primitives, test_app, test_app_with_scale};
+    use crate::kit::test_support::{bounds, image_primitives, test_app, test_app_with_scale};
 
     // 构建期清单（`build.rs` 写进 `OUT_DIR/icons/built.rs`）：资产 ⇄ 枚举一一对应的机器证据。
     include!(concat!(env!("OUT_DIR"), "/icons/built.rs"));
@@ -759,15 +856,15 @@ mod tests {
         assert_eq!(RasterTier::Large96.pixels(), 96);
     }
 
-    /// 挂载后的节点是 16×16 的图片节点，paint 出 `Primitive::Image`，调制色就是 `IconSpec.color`。
+    /// 挂载后的节点是 E7 图片叶子：布局盒 = 逻辑尺寸、`ImageFit::Fill`、调制色 = `IconSpec.color`。
     ///
-    /// 变异防线：颜色调制失效（例如固定 `Color::WHITE`）⇒ 本用例变红。
+    /// 变异防线：颜色调制失效（删除 `image_modulation` / 固定 `Color::WHITE`）⇒ 本用例变红。
     #[test]
     fn an_icon_mounts_one_image_primitive_with_the_modulation_color() {
         let mut app = test_app_with_scale(1.0);
         let window = app.window_id();
         let root = app.app().window(window).expect("test window").tree().root();
-        let color = ui_core::paint::color::Color::from_rgba8([0x33, 0x99, 0xFF, 0xFF]);
+        let color = Color::from_rgba8([0x33, 0x99, 0xFF, 0xFF]);
 
         let node = IconSpec::new(IconKind::CheckCircle)
             .with_size(16.0)
@@ -776,12 +873,28 @@ mod tests {
             .expect("图标挂载");
         let _ = app.drain().expect("首帧");
 
-        let bounds = app.probe().bounds(node).expect("图标节点几何");
         assert_eq!(
-            bounds,
-            Rect::new(0.0, 0.0, 16.0, 16.0),
-            "图片节点的布局盒必须正好是逻辑尺寸（空文本 + line_height 1.0 的契约）"
+            bounds(&app, node),
+            Some(Rect::new(0.0, 0.0, 16.0, 16.0)),
+            "图片节点的布局盒必须正好是显式 Style 尺寸"
         );
+        {
+            let tree = app.app().window(window).expect("test window").tree();
+            let icon = tree.get(node).expect("图标节点");
+            match icon.kind() {
+                NodeKind::Image(content) => {
+                    assert_eq!(content.fit(), ImageFit::Fill, "图标用 Fill 到逻辑尺寸");
+                    assert_eq!(content.modulation(), color, "调制色写在 E7 载荷里");
+                    assert!(
+                        matches!(content.source(), ImageSource::Ready(_)),
+                        "图标是同步插入的就绪资源：{:?}",
+                        content.source()
+                    );
+                }
+                other => panic!("图标必须是 E7 图片节点，实际 {other:?}"),
+            }
+            assert!(icon.children().is_empty(), "图标是叶子，不能挂子节点");
+        }
         let images = image_primitives(&app);
         assert_eq!(
             images.len(),
@@ -792,7 +905,7 @@ mod tests {
         assert_eq!(
             images[0].bounds,
             Rect::new(0.0, 0.0, 16.0, 16.0),
-            "图片图元必须落在节点盒里"
+            "Fill 图元必须落在节点盒里"
         );
     }
 
@@ -866,11 +979,13 @@ mod tests {
         assert!(matches!(error, IconError::UnknownWindow { window: closed } if closed == window));
     }
 
-    /// 图标节点是**装饰性叶子**：a11y 树里必须 `hidden`，占位空格不得被 AT 播报。
+    /// 图标节点是**装饰性叶子**：E7 `Image` 角色 + 显式 `hidden`，不得被 AT 播报，也不得产生
+    /// `MissingAltText` 诊断。
     ///
-    /// 引擎没有图片节点，图标走「空格文本 + 行内盒图片」（`kit::image_node`）——占位空格是
-    /// 实现细节，对 a11y 必须不可见。审查的变异「删掉 `.a11y(hidden)`」曾存活（38/38 全绿），
-    /// 本用例锁死它：去掉那三行后 `record.hidden` 变 false / 可见节点里出现空白文本 ⇒ 变红。
+    /// 变异防线：E7 对无 label 的图片**默认** hidden，所以 `record.hidden` 无法区分「显式装饰
+    /// 声明」与「引擎兜底」——删掉 `.a11y(hidden: true)` 后本用例原来仍然绿（P2-1b3 审查 F1）。
+    /// 真正的防线是诊断断言：显式 `hidden` 让引擎把节点视为装饰图而**免**诊断；删掉
+    /// `.a11y(hidden: true)` 后本图标会被记一条 `MissingAltText { kind: Image }` ⇒ 本用例变红。
     #[test]
     fn icon_nodes_are_hidden_from_the_a11y_tree() {
         let mut app = test_app();
@@ -884,27 +999,186 @@ mod tests {
         let _ = app.drain().expect("首帧");
 
         let snapshot = app.a11y().expect("a11y 快照（开启捕获后的首帧是全树）");
-        if let Some(record) = snapshot.node_for(node) {
-            assert!(
-                record.hidden,
-                "图标节点必须在 a11y 树里标记 hidden（占位空格是装饰性文本）：{record:?}"
-            );
-        }
-        // 无论引擎把 hidden 节点留在快照里还是整棵剔除，「可见节点」视图都不得含空白文本。
-        for record in snapshot.visible_nodes_in_batch() {
-            if let Some(label) = record.label_text() {
-                assert!(
-                    !label.trim().is_empty(),
-                    "可见的 a11y 节点不得只有空白文本（图标占位空格被播报了）：{record:?}"
-                );
-            }
-        }
+        let record = snapshot.node_for(node).expect("图片节点必须在 a11y 树里");
+        assert_eq!(record.role, A11yRole::Image, "E7 图片节点的默认角色");
+        assert!(record.hidden, "图标节点必须标记 hidden：{record:?}");
         assert!(
-            snapshot
-                .nodes()
-                .iter()
-                .all(|record| record.engine != node || record.hidden),
-            "图标节点只能以 hidden 的形式出现在 a11y 树里"
+            !snapshot
+                .visible_nodes_in_batch()
+                .any(|visible| visible.engine == node),
+            "图标节点不得出现在可见 a11y 视图里"
         );
+
+        // 装饰图免诊断（P2-1b3 裁决）：显式 hidden 是装饰声明，缺失的替代文本不是缺陷。
+        let diagnostics = app.app().a11y_diagnostics();
+        assert!(
+            !diagnostics.iter().any(|diagnostic| matches!(
+                diagnostic,
+                A11yDiagnostic::MissingAltText {
+                    node: target,
+                    kind: A11yDrawKind::Image
+                } if *target == node
+            )),
+            "显式装饰的图标不得产生 MissingAltText 诊断：{diagnostics:?}"
+        );
+    }
+
+    /// **绕行遗迹**：图标是 E7 图片叶子，不是「空格文本 + 行内盒 + 写死 measure」。
+    ///
+    /// 覆盖旧实现的三类逻辑尺寸（8 / 12 / 16 px，见 spec-delta §2）：布局盒 = 显式尺寸、图元盒 =
+    /// 节点盒（`Fill`），且树里**没有任何文本节点**（占位空格已随 `kit::image_node` 一起删除）。
+    #[test]
+    fn icons_are_first_class_image_nodes_without_text_or_inline_box_residue() {
+        let mut app = test_app();
+        let window = app.window_id();
+        let root = app.app().window(window).expect("test window").tree().root();
+        let sizes = [8.0f32, 12.0, 16.0];
+        let nodes: Vec<NodeId> = sizes
+            .iter()
+            .map(|size| {
+                IconSpec::new(IconKind::CaretDown)
+                    .with_size(*size)
+                    .build(app.app_mut(), window, root)
+                    .expect("图标挂载")
+            })
+            .collect();
+        let _ = app.drain().expect("首帧");
+
+        let primitives = image_primitives(&app);
+        assert_eq!(primitives.len(), sizes.len(), "每个图标一个图元");
+        for (node, size) in nodes.iter().zip(sizes) {
+            let node_bounds = bounds(&app, *node).expect("图标布局盒");
+            assert_eq!(
+                node_bounds.size,
+                Size::new(size, size),
+                "{size} px 图标的布局盒必须等于显式尺寸"
+            );
+            let image = primitives
+                .iter()
+                .find(|image| image.bounds == node_bounds)
+                .unwrap_or_else(|| panic!("{size} px 图标没有落在节点盒里的图元：{primitives:?}"));
+            assert_eq!(image.modulation, Color::WHITE, "默认不染色");
+        }
+
+        // 无绕行残留：整棵树里不得出现文本节点（旧实现每颗图标挂一个空格文本叶子）。
+        let tree = app.app().window(window).expect("test window").tree();
+        let mut stack = vec![root];
+        let mut text_nodes = 0usize;
+        while let Some(id) = stack.pop() {
+            let node = tree.get(id).expect("树里的节点必须存活");
+            if matches!(node.kind(), NodeKind::Text(_)) {
+                text_nodes += 1;
+            }
+            stack.extend(node.children().iter().copied());
+        }
+        assert_eq!(text_nodes, 0, "图标树里不得残留占位空格文本节点");
+    }
+
+    /// **DPI 换档**：2× 后 `reselect` 用 96 档重取变体（物理 32 px）并换句柄；显式 `Style` 尺寸
+    /// 保证布局不跳。
+    ///
+    /// 变异防线：删掉 `set_image_resource` 调用 / 档位写死 48 ⇒ 本用例的变体相等断言变红。
+    #[test]
+    fn reselecting_after_a_dpi_change_swaps_to_the_96_pixel_tier() {
+        let mut app = test_app_with_scale(1.0);
+        let window = app.window_id();
+        let root = app.app().window(window).expect("test window").tree().root();
+        let spec = IconSpec::new(IconKind::GearSix).with_size(16.0);
+        let node = spec.build(app.app_mut(), window, root).expect("图标挂载");
+        let _ = app.drain().expect("1× 首帧");
+
+        set_window_scale(&mut app, 2.0);
+        let _ = app.drain().expect("2× 首帧（E7 只重解析内在尺寸）");
+        assert_eq!(
+            bounds(&app, node),
+            Some(Rect::new(0.0, 0.0, 16.0, 16.0)),
+            "显式 Style 尺寸：DPI 变化不得让图标布局跳动"
+        );
+        assert_eq!(image_primitives(&app).len(), 1, "换变体前旧图元照常绘制");
+
+        let resource = spec
+            .reselect(app.app_mut(), window, node)
+            .expect("重选档位");
+        let expected = app
+            .app_mut()
+            .resources_mut()
+            .insert_for_display(
+                raster(IconKind::GearSix, RasterTier::Large96),
+                Size::new(16.0, 16.0),
+                2.0,
+            )
+            .expect("引擎的 E7 显示变体");
+        assert_eq!(
+            resource, expected,
+            "reselect 必须等价于 insert_for_display(96 档, 2×)"
+        );
+        assert_eq!(
+            (resource.width, resource.height),
+            (32, 32),
+            "96 档在 2× 下的物理目标"
+        );
+
+        let _ = app.drain().expect("换句柄后一帧");
+        let after = image_primitives(&app);
+        assert_eq!(after.len(), 1, "换句柄不得复制图元：{after:?}");
+        assert_eq!(after[0].tile, resource.tile, "图元必须用新变体的 tile");
+        assert_eq!(
+            after[0].bounds,
+            Rect::new(0.0, 0.0, 16.0, 16.0),
+            "换档不改变布局盒"
+        );
+    }
+
+    /// `reselect` 只接受活着的图片节点：非图片 / 陈旧句柄都是强类型错误。
+    #[test]
+    fn reselect_rejects_non_image_and_stale_nodes() {
+        let mut app = test_app_with_scale(1.0);
+        let window = app.window_id();
+        let root = app.app().window(window).expect("test window").tree().root();
+        let spec = IconSpec::new(IconKind::X).with_size(16.0);
+
+        let container = ui_core::node::builder::NodeBuilder::boxed()
+            .build(
+                app.app_mut()
+                    .window_mut(window)
+                    .expect("test window")
+                    .tree_mut(),
+                root,
+            )
+            .expect("容器");
+        let error = spec
+            .reselect(app.app_mut(), window, container)
+            .expect_err("非图片节点必须失败");
+        assert!(
+            matches!(error, IconError::NotImageNode { node } if node == container),
+            "非图片节点的错误分类不对：{error:?}"
+        );
+
+        let stale = spec.build(app.app_mut(), window, root).expect("临时图标");
+        app.app_mut()
+            .window_mut(window)
+            .expect("test window")
+            .tree_mut()
+            .remove(stale)
+            .expect("移除临时图标");
+        let error = spec
+            .reselect(app.app_mut(), window, stale)
+            .expect_err("陈旧节点必须失败");
+        assert!(
+            matches!(
+                error,
+                IconError::Node(ui_core::error::EngineError::StaleNode { node }) if node == stale
+            ),
+            "陈旧节点的错误分类不对：{error:?}"
+        );
+    }
+
+    /// 改窗口 DPI（`Window::set_scale` 递增 `scale_epoch`；E7 在下一帧布局前重解析内在尺寸）。
+    fn set_window_scale(app: &mut TestApp, scale: f32) {
+        let window = app.window_id();
+        app.app_mut()
+            .window_mut(window)
+            .expect("test window")
+            .set_scale(Scale::new(scale).expect("测试 DPI 必须是有限正数"));
     }
 }

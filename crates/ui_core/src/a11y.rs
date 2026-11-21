@@ -334,6 +334,10 @@ pub struct A11yOverride {
     /// 显式动作表；`None` ⇒ 按角色默认。
     pub actions: Option<Vec<A11yAction>>,
     /// 应用强制隐藏。
+    ///
+    /// E7 图片节点：`true` 同时是**装饰声明** —— 没有 `label` 时不再记
+    /// [`A11yDiagnostic::MissingAltText`]（装饰图不需要可访问名）；有语义的图片应给 `label`
+    /// 而不是 hidden。
     pub hidden: bool,
     /// 应用强制禁用。
     pub disabled: bool,
@@ -728,6 +732,9 @@ pub enum A11yDrawKind {
     /// `NodeKind::Geometry`。
     Geometry,
     /// `NodeKind::Image`（E7：图片节点没有 alt 时按装饰图处理）。
+    ///
+    /// 只有**未**显式 `A11yOverride { hidden: true }` 的图片才会产生该诊断：显式 hidden 是
+    /// 装饰声明，装饰图不需要可访问名。
     Image,
 }
 
@@ -740,7 +747,10 @@ pub enum A11yDrawKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum A11yDiagnostic {
-    /// `Canvas` / `Geometry` 缺替代文本（节点被标 `hidden`，**不**静默丢弃）。
+    /// `Canvas` / `Geometry` / `Image` 缺替代文本（节点被标 `hidden`，**不**静默丢弃）。
+    ///
+    /// `Image` 的例外（E7 / P2-1b3）：显式 `A11yOverride { hidden: true }` = 装饰声明，免诊断
+    /// （装饰图不需要可访问名）；没有显式 hidden 的图片仍记诊断，提示给 label 或声明装饰。
     MissingAltText {
         /// 节点。
         node: NodeId,

@@ -15,6 +15,18 @@
 //!    `App::take_resource_results`，由 [`AssetImages::poll`] 并入状态。UI 线程只做轻量工作，
 //!    解码在引擎的 blocking 池里（设计 §8.5 / D-11：解码不在 UI 线程）。
 //!
+//! # E7 图片节点语义
+//!
+//! 交付状态直接就是 E7 图片节点的挂载来源（[`AssetImageState::node_source`]）：
+//!
+//! - `Pending(pending)` ⇒ `NodeBuilder::image_pending(pending, fit)`：节点先占位，解码到达后由
+//!   `App::poll_resources` **自动**改写为 Ready + 内在尺寸 + `LAYOUT | PAINT`（不需要重建节点）；
+//! - `Ready(image)` ⇒ `NodeBuilder::image(image.id, fit)`；
+//! - `Failed(cause)` ⇒ 没有可挂的来源（`None`），由应用按 `DecodeCause` 决定重试/换图。
+//!
+//! [`AssetImages::request_source`] 是「请求 + 取挂载来源」的一步入口。查找（[`find`] /
+//! [`bytes`] / [`list`]）与异步分发契约（[`AssetImages::poll`] / [`AssetImages::poll_all`]）不变。
+//!
 //! # 交付缓冲是全局的：单消费者契约
 //!
 //! `App::take_resource_results` 是**整个 App** 一个的交付缓冲（引擎每帧 `poll_resources`
@@ -45,6 +57,7 @@ use smol_str::SmolStr;
 use ui_core::{
     app::App,
     math::Size,
+    node::image::ImageSource,
     resources::{DecodeCause, DecodeState, PendingResource, ResourceImage},
 };
 
@@ -153,14 +166,43 @@ pub fn list(prefix: &str) -> impl Iterator<Item = &'static str> {
 }
 
 /// 一张资产图的解码状态（引擎 `DecodeState` 的应用层镜像）。
+///
+/// `Pending` 携带引擎在途句柄：状态本身就够挂 E7 图片节点（[`AssetImageState::node_source`]），
+/// 应用不需要另存一份 `PendingResource`。
 #[derive(Clone, Debug, PartialEq)]
 pub enum AssetImageState {
-    /// 后台解码中（尚未经 `poll` 交付）。
-    Pending,
+    /// 后台解码中（尚未经 `poll` 交付）：`PendingResource` 可直接给 `NodeBuilder::image_pending`。
+    ///
+    /// **一次性句柄（审查 F3）**：引擎交付（`Ready` / `Failed`）后句柄被回收，
+    /// `ResourceCache::state` 对旧句柄只会返回 `Pending`，不会重投递。因此把它存进视图状态、
+    /// 跨帧重建节点会得到**永远空白**的占位图且不报错 —— 交付后必须重新
+    /// [`AssetImages::poll`]，再从 [`AssetImages::state`] / [`AssetImages::node_source`] 取当前
+    /// 来源，不要复用首次请求的 `Pending`。
+    Pending(PendingResource),
     /// 已进图集，可直接画。
     Ready(ResourceImage),
     /// 解码 / 装箱失败（强类型原因）。
     Failed(DecodeCause),
+}
+
+impl AssetImageState {
+    /// 挂 E7 图片节点用的资源来源：`Pending` / `Ready` ⇒ `Some`；`Failed` ⇒ `None`。
+    ///
+    /// 用法：`Some(Pending)` ⇒ [`ui_core::node::builder::NodeBuilder::image_pending`]；
+    /// `Some(Ready(image))` ⇒ `NodeBuilder::image(image.id, fit)`。`Failed` 没有可挂来源，
+    /// 应用按 [`DecodeCause`] 决定重试 / 换图。
+    ///
+    /// **`Pending` 只在交付前有效**（一次性句柄，见 [`AssetImageState::Pending`]）：跨帧重建节点
+    /// 时必须先 `poll` 再从 [`AssetImages::node_source`] / [`AssetImages::state`] 重新取，不能
+    /// 把首次请求的 `Pending` 存起来复用。
+    #[must_use]
+    pub fn node_source(&self) -> Option<ImageSource> {
+        match self {
+            AssetImageState::Pending(pending) => Some(ImageSource::Pending(*pending)),
+            AssetImageState::Ready(image) => Some(ImageSource::Ready(image.id)),
+            AssetImageState::Failed(_) => None,
+        }
+    }
 }
 
 /// 一次交付（[`AssetImages::poll`] 的返回值）：哪张图变成了哪个状态。
@@ -217,8 +259,36 @@ impl AssetImages {
             .insert_async_at_size(Bytes::from_static(asset.bytes), display);
         let path = SmolStr::new(path);
         self.pending.insert(pending, path.clone());
-        self.entries.insert(path, AssetImageState::Pending);
-        Ok(AssetImageState::Pending)
+        let state = AssetImageState::Pending(pending);
+        self.entries.insert(path, state.clone());
+        Ok(state)
+    }
+
+    /// 请求一张图并**一步取到 E7 图片节点的挂载来源**（首次请求会启动异步解码）。
+    ///
+    /// 返回值：
+    /// - `Some(ImageSource::Pending(handle))` ⇒ `NodeBuilder::image_pending(handle, fit)`；
+    /// - `Some(ImageSource::Ready(image))` ⇒ `NodeBuilder::image(image.id, fit)`（去重命中时首次
+    ///   请求就已就绪）；
+    /// - `None` ⇒ 解码已失败（`Failed`），应用按 [`AssetImages::state`] 的 `DecodeCause` 决定
+    ///   重试 / 换图。
+    ///
+    /// 交付契约与 [`AssetImages::request`] 相同（同一路径只解码第一次请求的尺寸）。
+    ///
+    /// **`Pending` 返回值的有效期只到本次交付**（一次性句柄）：引擎交付后同一句柄不再复活，
+    /// 跨帧重建节点时必须重新 `poll` 并调用本方法 / [`AssetImages::node_source`] 取当前来源
+    /// （见 [`AssetImageState::Pending`]）。
+    ///
+    /// # Errors
+    /// [`AssetError::UnknownAsset`]：路径没登记在 [`ASSETS`] 里。
+    pub fn request_source(
+        &mut self,
+        app: &mut App,
+        path: &str,
+        display: Size,
+    ) -> Result<Option<ImageSource>, AssetError> {
+        let state = self.request(app, path, display)?;
+        Ok(state.node_source())
     }
 
     /// 每帧一次：取走引擎已交付的解码结果并并入**本**缓存（只返回本缓存的交付）。
@@ -262,7 +332,7 @@ impl AssetImages {
     fn accept(&mut self, pending: PendingResource, state: DecodeState) -> Option<AssetLoaded> {
         let path = self.pending.remove(&pending)?;
         let state = match state {
-            DecodeState::Pending => AssetImageState::Pending,
+            DecodeState::Pending => AssetImageState::Pending(pending),
             DecodeState::Ready(image) => AssetImageState::Ready(image),
             DecodeState::Failed(cause) => AssetImageState::Failed(cause),
         };
@@ -276,12 +346,20 @@ impl AssetImages {
         self.entries.get(path)
     }
 
-    /// 已就绪的图（可直接塞进 `Primitive::Image` / `InlineBoxPaint::Image`）。
+    /// 当前状态对应的 E7 图片节点来源（`None` = 未请求 / 解码失败）。
+    ///
+    /// 等价于 `self.state(path)?.node_source()`；请求走 [`AssetImages::request_source`]。
+    #[must_use]
+    pub fn node_source(&self, path: &str) -> Option<ImageSource> {
+        self.entries.get(path)?.node_source()
+    }
+
+    /// 已就绪的图（挂 E7 图片节点用 [`AssetImageState::node_source`]；也含 tile / 物理像素尺寸）。
     #[must_use]
     pub fn image(&self, path: &str) -> Option<ResourceImage> {
         match self.entries.get(path)? {
             AssetImageState::Ready(image) => Some(*image),
-            AssetImageState::Pending | AssetImageState::Failed(_) => None,
+            AssetImageState::Pending(_) | AssetImageState::Failed(_) => None,
         }
     }
 }
@@ -310,7 +388,21 @@ impl std::error::Error for AssetError {}
 
 #[cfg(test)]
 mod tests {
-    use ui_core::{math::Size, resources::ResourceImage};
+    use bytes::Bytes;
+    use smol_str::SmolStr;
+    use taffy::style::Dimension;
+    use ui_core::{
+        app::App,
+        math::{Rect, Size},
+        node::{
+            builder::NodeBuilder,
+            image::{ImageFit, ImageSource},
+            tree::NodeKind,
+        },
+        paint::{primitive::Primitive, style::Style},
+        resources::ResourceImage,
+        window::WindowId,
+    };
 
     use super::{
         ASSETS, AssetError, AssetImageState, AssetImages, AssetKind, AssetLoaded, bytes, find, list,
@@ -380,6 +472,8 @@ mod tests {
     }
 
     /// 异步解码：UI 线程只投递，解码结果由引擎的帧轮询交付，且每项只交付一次。
+    ///
+    /// `Pending` 状态必须携带在途句柄（E7 图片节点的挂载来源）；`Ready` 必须给出资源句柄。
     #[test]
     fn async_asset_decoding_is_delivered_by_the_engine_poll() {
         let mut harness = DecodeApp::new();
@@ -388,7 +482,14 @@ mod tests {
         let state = images
             .request(harness.app_mut(), path, Size::new(24.0, 24.0))
             .expect("已登记的资产");
-        assert_eq!(state, AssetImageState::Pending, "首次请求是异步的");
+        let AssetImageState::Pending(pending) = state else {
+            panic!("首次请求必须是 Pending，实际 {state:?}");
+        };
+        assert_eq!(
+            images.node_source(path),
+            Some(ImageSource::Pending(pending)),
+            "Pending 状态必须携带可挂 E7 图片节点的在途句柄"
+        );
 
         let loaded = harness.poll_until(600, |app| {
             let loaded = images.poll(app);
@@ -411,6 +512,11 @@ mod tests {
                 height: 24,
             })
         );
+        assert_eq!(
+            images.node_source(path),
+            Some(ImageSource::Ready(image.id)),
+            "Ready 状态必须给出 E7 图片节点的资源句柄"
+        );
 
         // 再 poll 一次不重复交付（引擎的交付缓冲已被取空）。
         assert!(images.poll(harness.app_mut()).is_empty());
@@ -421,6 +527,158 @@ mod tests {
                 .expect("已登记"),
             AssetImageState::Ready(image)
         );
+        // 去重命中的 `request_source` 直接给 `Ready` 来源（不再投递解码）。
+        assert_eq!(
+            images
+                .request_source(harness.app_mut(), path, Size::new(24.0, 24.0))
+                .expect("已登记"),
+            Some(ImageSource::Ready(image.id)),
+            "去重命中时 request_source 必须直接给出 Ready 来源"
+        );
+    }
+
+    /// **失败来源**（P2-1b3b / 审查 F8）：解码失败的资产没有可挂来源（`Failed` ⇒ `node_source`
+    /// 为 `None`），且 `request_source` 不会重新投递。
+    ///
+    /// 注册表里的资产都是合法 PNG，所以这里绕过 [`AssetImages::request`]，直接投递一段无法解析
+    /// 的字节，并按 `request` 的记账方式登记到缓存（tests 与实现同模块，可访问私有字段）。
+    #[test]
+    fn a_failed_decode_has_no_image_source() {
+        let mut harness = DecodeApp::new();
+        let mut images = AssetImages::new();
+        let path = "widgets/news.png";
+        let pending = harness
+            .app_mut()
+            .resources_mut()
+            .insert_async_at_size(Bytes::from_static(b"not a png"), Size::new(8.0, 8.0));
+        images.pending.insert(pending, SmolStr::new_static(path));
+        images
+            .entries
+            .insert(SmolStr::new_static(path), AssetImageState::Pending(pending));
+
+        let loaded = harness
+            .poll_until(600, |app| {
+                let loaded = images.poll(app);
+                (!loaded.is_empty()).then_some(loaded)
+            })
+            .expect("失败结果也必须经引擎交付");
+        assert_eq!(loaded.len(), 1);
+        assert!(
+            matches!(loaded[0].state, AssetImageState::Failed(_)),
+            "无法解析的字节必须交付 Failed，实际 {:?}",
+            loaded[0].state
+        );
+        assert_eq!(images.state(path), Some(&loaded[0].state));
+        assert_eq!(
+            images.node_source(path),
+            None,
+            "Failed 状态没有可挂的 E7 图片来源"
+        );
+        assert_eq!(
+            images
+                .request_source(harness.app_mut(), path, Size::new(8.0, 8.0))
+                .expect("已登记的路径"),
+            None,
+            "Failed 后 request_source 不得重新投递或给出来源"
+        );
+    }
+
+    /// **E7 节点语义（pending → 到达自动重绘）**：把 `PendingResource` 挂成图片节点后，引擎在
+    /// 解码到达时**自动**改写节点并重绘（应用不重建节点、不改资源句柄）。
+    ///
+    /// 变异防线：删掉引擎 `poll_resources` 里的 pending 写回（E7 `apply_resource_results`）⇒
+    /// 节点永远停在 Pending，本用例的「图元出现 + 节点已 Ready」断言变红。
+    #[test]
+    fn a_pending_asset_node_repaints_when_the_decode_arrives() {
+        let mut harness = DecodeApp::new();
+        let mut images = AssetImages::new();
+        let path = "brands/Binance/binance.png";
+        let source = images
+            .request_source(harness.app_mut(), path, Size::new(24.0, 24.0))
+            .expect("已登记的资产")
+            .expect("首次请求必须是可挂来源（Pending）");
+        let ImageSource::Pending(pending) = source else {
+            panic!("首次请求必须是 Pending（异步宿主），实际 {source:?}");
+        };
+
+        let window = harness.window_id();
+        let root = harness.app().window(window).expect("窗口").tree().root();
+        let mut style = Style::default();
+        style.inner.size.width = Dimension::length(24.0);
+        style.inner.size.height = Dimension::length(24.0);
+        let node = NodeBuilder::image_pending(pending, ImageFit::Contain)
+            .style(style)
+            .build(
+                harness
+                    .app_mut()
+                    .window_mut(window)
+                    .expect("窗口")
+                    .tree_mut(),
+                root,
+            )
+            .expect("挂 E7 占位图片节点");
+        assert!(
+            matches!(
+                image_source(&harness, window, node),
+                Some(ImageSource::Pending(handle)) if handle == pending
+            ),
+            "挂载时节点必须持有 Pending 句柄"
+        );
+
+        // 驱动 runtime：交付到达时引擎自动改写节点并重排重绘。
+        let loaded = harness
+            .poll_until(600, |app| {
+                let loaded = images.poll(app);
+                (!loaded.is_empty()).then_some(loaded)
+            })
+            .expect("异步解码必须在 ≈3 s 内交付");
+        assert!(matches!(loaded[0].state, AssetImageState::Ready(_)));
+        let _ = harness.app_mut().frame(window).expect("交付后一帧");
+
+        assert!(
+            matches!(
+                image_source(&harness, window, node),
+                Some(ImageSource::Ready(_))
+            ),
+            "引擎必须把节点从 Pending 自动改写为 Ready（不需要应用重建节点）"
+        );
+        assert!(matches!(
+            images.node_source(path),
+            Some(ImageSource::Ready(_))
+        ));
+        let painted = scene_images(harness.app(), window);
+        assert_eq!(painted.len(), 1, "资源到达后必须画出图片图元：{painted:?}");
+        assert_eq!(
+            painted[0].bounds,
+            Rect::new(0.0, 0.0, 24.0, 24.0),
+            "Binance 是正方形，Contain 填满正方形节点盒"
+        );
+    }
+
+    /// 节点的 E7 图片来源（不是图片节点 ⇒ `None`）。
+    fn image_source(
+        harness: &DecodeApp,
+        window: WindowId,
+        node: ui_core::node::id::NodeId,
+    ) -> Option<ImageSource> {
+        let tree = harness.app().window(window).expect("窗口").tree();
+        match tree.get(node).expect("节点必须存活").kind() {
+            NodeKind::Image(content) => Some(content.source()),
+            _ => None,
+        }
+    }
+
+    /// 当前场景里的图片图元。
+    fn scene_images(app: &App, window: WindowId) -> Vec<ui_core::paint::primitive::Image> {
+        app.window(window)
+            .expect("窗口")
+            .scene()
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::Image(image) => Some(*image),
+                _ => None,
+            })
+            .collect()
     }
 
     /// **F3**：同一帧里两个缓存各自请求一张图时，交付缓冲只取一次、按在途句柄分发 —— 谁都
