@@ -36,6 +36,33 @@ pub(crate) fn off_action(app: &mut App, action: &Action) -> bool {
     app.handlers.remove(action).is_some()
 }
 
+/// 仅测试（`test-support`）：某个动作当前是否注册了处理器。
+///
+/// 组件 `release` 清理的**直接证据面**：泄漏的 handler 不一定会 panic（`ctx.update` 对死
+/// 句柄是 no-op、滚动条 handler 只写引擎状态），所以「重放输入不 panic」不足以证明表项被摘掉。
+/// 消费者：`App::has_action_handler`（base_ui release 测试）。
+#[cfg(feature = "test-support")]
+pub(crate) fn has_action_handler(app: &App, action: &Action) -> bool {
+    app.handlers.contains_key(action)
+}
+
+/// 仅测试（`test-support`）：某个 `(window, scope)` 上剩余的焦点作用域化键绑定条数。
+///
+/// `App::unbind_scope_keys` 的直接证据面（树 release）：只删除绑定时重放按键不会 panic
+/// （handler 已摘 ⇒ 不消费、回落默认行为），因此必须观察表项本身。
+/// 消费者：`App::scoped_key_binding_count`（base_ui `Tree::release` 测试）。
+#[cfg(feature = "test-support")]
+pub(crate) fn scoped_binding_count(
+    app: &App,
+    window: WindowId,
+    scope: crate::node::id::NodeId,
+) -> usize {
+    app.scoped_bindings
+        .iter()
+        .filter(|binding| binding.window == window && binding.scope == scope)
+        .count()
+}
+
 /// 添加/替换一条键盘绑定（同 `(key, modifiers)` 后写覆盖）。
 /// 消费者：`App::bind_key`。
 pub(crate) fn bind_key(app: &mut App, binding: KeyBinding) {

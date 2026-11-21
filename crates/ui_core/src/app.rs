@@ -1022,8 +1022,14 @@ impl App {
 
     /// 写一个瞬态值：**不**失效、**不**请求唤醒（滚动偏移/悬浮态，§3.7）。
     ///
+    /// 与 [`App::write`] 的失效句柄语义**不同**：普通信号在作用域释放后的迟到写是 no-op
+    /// （返回 `false`，R03-6 的僵尸唤醒防护），而瞬态值没有「返回 false」的第二形态 —— 读
+    /// 会 panic，写同样 panic，绝不静默丢弃或写到槽位复用后的新值。
+    ///
     /// # Panics
-    /// 该瞬态值存在活跃读守卫。
+    ///
+    /// - 该瞬态值存在活跃读守卫；
+    /// - 该句柄已失效（所属作用域已释放 / 槽位已回收）：与读同口径的**确定性失败**。
     pub fn write_transient<T: 'static>(&mut self, transient: &Transient<T>, value: T) {
         signal_api::write_transient(self, transient, value)
     }
@@ -1135,6 +1141,26 @@ impl App {
     /// 删除处理器（返回是否真的删了）。
     pub fn off_action(&mut self, action: &Action) -> bool {
         style_pass::off_action(self, action)
+    }
+
+    /// 仅测试（`test-support`）：某个动作当前是否注册了处理器。
+    ///
+    /// 组件 `release` 清理的直接证据面：泄漏的 handler 不一定会 panic（指针路径对死句柄是
+    /// no-op、滚动条 handler 只写引擎滚动状态），「重放输入不 panic」不能证明表项被摘掉。
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn has_action_handler(&self, action: &Action) -> bool {
+        style_pass::has_action_handler(self, action)
+    }
+
+    /// 仅测试（`test-support`）：某个 `(window, scope)` 上剩余的焦点作用域化键绑定条数。
+    ///
+    /// `App::unbind_scope_keys` 的直接证据面（`Tree::release`）：handler 被摘但绑定残留时，
+    /// 重放按键既不 panic 也不消费（回落到默认行为），只能直接观察表项。
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn scoped_key_binding_count(&self, window: WindowId, scope: NodeId) -> usize {
+        style_pass::scoped_binding_count(self, window, scope)
     }
 
     /// 添加/替换一条键盘绑定（同 `(key, modifiers)` 后写覆盖）。

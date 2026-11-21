@@ -38,9 +38,18 @@
 //! 4. **派生值**（`Derived`）的读守卫是**缓存快照**：重新求值只会替换缓存里的 `Rc`，
 //!    已发出的守卫继续指向旧值（快照语义），因此派生读**不会**阻塞写上游。
 //! 5. **作用域回收**（[`SignalScope`]）：作用域释放后，其信号的值**立即回收**（槽位归还空闲
-//!    栈、代际递增）。此后旧句柄的**写是 no-op**（返回 `false`、不标脏、不请求帧 —— 迟到写入
-//!    不得产生僵尸唤醒），**读是确定性失败**（panic，消息给出槽位/代际/槽位状态：值已经不
-//!    在，引擎绝不能把复用后的新值交给旧句柄）。详见下文〈作用域回收与句柄失效〉。
+//!    栈、代际递增）。此后旧**普通信号**句柄的写是 no-op（返回 `false`、不标脏、不请求帧 ——
+//!    迟到写入不得产生僵尸唤醒），读是确定性失败（panic，消息给出槽位/代际/槽位状态）；旧
+//!    **瞬态值**句柄的读与写则**都 panic**（`Transient` 的写没有 no-op 形态，见 [`Transient`]）。
+//!    无论是哪种，引擎都绝不把复用后的新值交给旧句柄。详见下文〈作用域回收与句柄失效〉。
+//!
+//! ## 普通信号 / 瞬态值 / 派生值的差别（公开面）
+//!
+//! | 句柄 | 失效后读 | 失效后写 | 原因 |
+//! |---|---|---|---|
+//! | [`Signal`] | panic | no-op（`false` / `None`） | 关闭窗口后的迟到写入（异步回投、定时器）不得产生僵尸唤醒（R03-6），也不得把 UI 线程 panic 掉 |
+//! | [`Transient`] | panic | **panic** | 写没有「失败」的第二形态（返回 `()`），静默 no-op 会把应用 bug 藏起来；瞬态写与读同口径地显式失败 |
+//! | [`Derived`] | panic（重算求值时） | —（无公开写入口） | 派生值不可直接写；上游失效才会重算 |
 //!
 //! # 作用域回收与句柄失效
 //!
@@ -55,12 +64,14 @@
 //! | 操作 | 旧句柄（代际不匹配） | 原因 |
 //! |---|---|---|
 //! | 读（`App::read` / `ReadCtx::read` / `App::read_with` / `ReadCtx::read_transient`） | **panic**（确定性失败），消息含 `stale` + 槽位下标/代际/槽位状态 | 值已被 drop，没有可返回的东西；宁可确定性失败也**不**返回复用后的新值 |
-//! | 写 / 更新（`App::write` / `App::update` / `App::update_with`） | **no-op**（`false` / `None`） | 关闭窗口后的迟到写入（异步回投、定时器）不得产生僵尸唤醒（R03-6），也不得把 UI 线程 panic 掉 |
+//! | 普通信号写 / 更新（`App::write` / `App::update` / `App::update_with`） | **no-op**（`false` / `None`） | 关闭窗口后的迟到写入（异步回投、定时器）不得产生僵尸唤醒（R03-6），也不得把 UI 线程 panic 掉 |
 //! | `App::write_with` | **no-op**（`false`，闭包不会被调用） | 同上：它是「先读旧值再写」组合子，失效时读一步不能 panic |
+//! | 瞬态写（`App::write_transient`） | **panic**（与读同口径） | 写返回 `()`，没有「失败」形态；静默 no-op 会把应用 bug 藏起来 |
 //!
 //! 这个"混合"不是随意的两个政策，而是**唯一的签名约束下的唯一解**：读没有返回值的第二形态
-//! （`SignalRef` 不是 `Result`），写有既定的 no-op 契约。两者的共同保证是**绝不触碰复用后的
-//! 槽位**——读 panic 在取值之前，写在同一处代际比较处直接返回。
+//! （`SignalRef` 不是 `Result`），普通信号的写有既定的 no-op 契约，而瞬态写既无返回值也无
+//! no-op 契约。三者的共同保证是**绝不触碰复用后的槽位**——读/瞬态写的 panic 在取值/写入之前，
+//! 普通信号的写在同一处代际比较处直接返回。
 //!
 //! **依赖边是槽位级的**：依赖图的键是完整 `SignalId`（下标 + 代际）。释放时按旧 id 删除全部边；
 //! 复用后的新信号代际不同 ⇒ 键不同、不会继承旧边，旧句柄的写也不会遍历任何 owner。
@@ -257,6 +268,13 @@ impl<T> Derived<T> {
 }
 
 /// 瞬态值句柄（滚动偏移/悬浮态，§3.7）：读不登记、写不失效。
+///
+/// # 作用域释放后的失效语义
+///
+/// 用 `App::transient_scoped` 铸造的句柄随所属 [`SignalScope`] 释放而失效：旧句柄的**读与
+/// 写都 panic**（确定性失败，绝不读/写槽位复用后的新值）。与普通 [`Signal`] 不同，瞬态写
+/// **不是** no-op —— `App::write_transient` 返回 `()`，没有「失败」的第二形态，静默丢弃会把
+/// 应用 bug（过期组件仍持有句柄）藏起来。
 pub struct Transient<T> {
     id: SignalId,
     _marker: PhantomData<fn() -> T>,
@@ -431,13 +449,15 @@ impl<T: fmt::Display> fmt::Display for SignalRef<T> {
 ///    （这是长跑「建窗 → 关窗」churn 时槽位峰值不增长的前提）；
 /// 2. 依赖图里以这些信号为键的边被**立即删除**（不是"等下次写时惰性清理"），
 ///    因此释放后 `dependency_dump` 里查不到它们、`App::write` 也不再遍历任何 owner；
-/// 3. **旧句柄失效**（见模块文档〈作用域回收与句柄失效〉）：读 **panic**（确定性失败，绝不
-///    返回复用后的新值），写/更新是 **no-op**（`false`/`None`，不标脏、不唤醒）；
+/// 3. **旧句柄失效**（见模块文档〈作用域回收与句柄失效〉）：普通信号句柄的读 **panic**
+///    （确定性失败，绝不返回复用后的新值）、写/更新是 **no-op**（`false`/`None`，不标脏、
+///    不唤醒）；瞬态值句柄的读与写**都 panic**（见 [`Transient`] 的失效语义）；
 /// 4. 已释放的作用域**不能再 mint 新信号**（引擎误用 ⇒ panic）；根作用域（`App::signal` /
 ///    `App::transient` / `App::derived` 的归属）**永不释放**（`release_scope` 对它返回 0）。
 ///
 /// 槽位复用时旧句柄可能与新信号共享下标，因此**不要**在作用域释放后继续持有/使用句柄：引擎
-/// 能做的是让读确定性失败、写 no-op（见上文），而不是替应用记住"这个句柄已经死了"。
+/// 能做的是让读确定性失败、普通信号写 no-op、瞬态写 panic（见上文），而不是替应用记住"这个
+/// 句柄已经死了"。
 ///
 /// **派生闭包同样不得捕获本作用域的句柄（AR5 P2-4 / R5c）**：派生归属根作用域，释放后它既不会
 /// 再被失效（依赖边已删 ⇒ 缓存永久陈旧），又会在下次因其它依赖重算时读死句柄 panic。这条禁令
@@ -677,8 +697,9 @@ fn stale_handle_panic(id: SignalId, slot: &SignalSlot) -> ! {
     panic!(
         "signal #{}.{}: handle is stale — slot #{} is {state}, slot generation {}. \
          A handle must not be used after its scope is released: the value was dropped, so reads \
-         fail deterministically instead of returning the new occupant's value (writes are no-ops: \
-         `App::write` returns false, `App::update_with` returns None).",
+         fail deterministically instead of returning the new occupant's value. Plain-signal writes \
+         are no-ops (`App::write` returns false, `App::update_with` returns None); transient writes \
+         (`App::write_transient`) panic like reads.",
         id.index(),
         id.generation(),
         id.index(),

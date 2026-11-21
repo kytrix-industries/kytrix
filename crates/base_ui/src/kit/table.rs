@@ -1082,6 +1082,23 @@ mod tests {
         ));
     }
 
+    /// 点击并返回抬起事件的 outcome（`action = Some(..)` ⇔ 点击真的调用了 handler）。
+    fn click_outcome(
+        app: &mut TestApp,
+        point: ui_core::math::Point,
+    ) -> ui_core::event::InputOutcome {
+        let _ = app.inject(InputEvent::pointer_down(
+            point,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        app.inject(InputEvent::pointer_up(
+            point,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ))
+    }
+
     /// 行虚拟化：只挂可见行；单元格按列宽摆放（固定列 120、弹性列占剩余）。
     #[test]
     fn rows_are_virtualized_and_columns_align() {
@@ -1161,22 +1178,38 @@ mod tests {
         );
     }
 
-    /// `release` 必须摘掉表头排序 handler：泄漏的 handler 会在释放后读已回收的排序信号 ⇒
-    /// panic（P2-2 复核 R2.2 的 Rc/handler 泄漏）。
+    /// `release` 必须摘掉表头排序 handler。
+    ///
+    /// 两条证据：handler 表项直接消失（`App::has_action_handler`）+ 重放点击的 `InputOutcome`
+    /// 不再带 action（没有 handler 可调用）。泄漏的 handler 会在释放后读已回收的排序信号 ⇒ panic。
     #[test]
     fn releasing_the_table_removes_its_sort_handler() {
         let mut app = TestApp::new();
         let table = table_with_rows(&mut app, 3);
         mount(&mut app, &table);
+        let sort_action = table.inner.sort_action.clone();
+        assert!(
+            app.app().has_action_handler(&sort_action),
+            "attach 必须注册排序 handler"
+        );
         let header = table.header_node(app.app(), 0).expect("header cell");
         let point = center(&app, header);
-        click(&mut app, point);
+        let click0 = click_outcome(&mut app, point);
+        assert_eq!(
+            click0.action,
+            Some(sort_action.clone()),
+            "释放前点击表头必须由排序 handler 消费"
+        );
         assert_eq!(table.sort(app.app()), Some((0, SortOrder::Ascending)));
 
         assert!(table.release(app.app_mut()) > 0);
-        // 不卸载节点直接释放：点击表头若还挂着泄漏的 handler 就会读死排序信号。
-        click(&mut app, point);
-        // 排序信号已释放，不能再读；没有 panic 即证明 handler 已摘除。
+        assert!(
+            !app.app().has_action_handler(&sort_action),
+            "release 必须摘掉排序 handler"
+        );
+        // 不卸载节点直接释放：重放点击不得再调用已摘除的 handler（否则读死信号 panic）。
+        let click1 = click_outcome(&mut app, point);
+        assert_eq!(click1.action, None, "释放后重放点击不得再命中排序 handler");
     }
 
     /// 空态：行数为 0 时提示可见、行体没有行；加行后提示消失。

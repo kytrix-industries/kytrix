@@ -567,7 +567,8 @@ impl Tree {
     /// 接引擎：列表 + 键盘绑定。
     ///
     /// # Errors
-    /// 同 [`List::attach`]；方向键作用域绑定也要求 viewport 已挂载（`bind_key_scoped` 的
+    /// 同 [`List::attach`]（含 `make_virtual_list` / 行工厂建树 / 首帧 `compute_layout` 的
+    /// 错误，都会原样传播）；方向键作用域绑定也要求 viewport 已挂载（`bind_key_scoped` 的
     /// `StaleNode` 在这里只可能是引擎不变量被破坏）。
     pub fn attach(&self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
         self.inner.list.attach(app, window)?;
@@ -1179,7 +1180,7 @@ mod ui_tests {
         let _ = harness.app.drain().expect("frame");
     }
 
-    fn click_row(harness: &mut Harness, row: usize) {
+    fn click_row(harness: &mut Harness, row: usize) -> ui_core::event::InputOutcome {
         let node = harness
             .tree
             .list()
@@ -1195,17 +1196,17 @@ mod ui_tests {
             PointerButton::Primary,
             Modifiers::empty(),
         ));
-        let _ = harness.app.inject(InputEvent::pointer_up(
+        harness.app.inject(InputEvent::pointer_up(
             point,
             PointerButton::Primary,
             Modifiers::empty(),
-        ));
+        ))
     }
 
-    fn key(harness: &mut Harness, code: KeyCode) {
-        let _ = harness
+    fn key(harness: &mut Harness, code: KeyCode) -> ui_core::event::InputOutcome {
+        harness
             .app
-            .inject(InputEvent::key_down(code, Modifiers::empty()));
+            .inject(InputEvent::key_down(code, Modifiers::empty()))
     }
 
     fn row_texts(harness: &Harness, row: usize) -> Vec<SmolStr> {
@@ -1561,11 +1562,35 @@ mod ui_tests {
         assert_eq!(tree.release(app.app_mut()), 0, "重复释放幂等");
     }
 
-    /// `release` 必须摘掉 4 条 scoped 键绑定与 4 个方向键 handler：泄漏的 handler 会在释放后
-    /// 读已回收的 `TreeState` 信号 ⇒ 直接 panic（P2-2 复核 R2.2 的 Rc/handler/绑定泄漏）。
+    /// `release` 必须解绑 4 条 scoped 方向键绑定并摘掉 4 个方向键 handler。
+    ///
+    /// 两种遗漏必须分别可观测：
+    /// - 只漏 `off_action`：绑定表项归零但 handler 残留 ⇒ `has_action_handler` 抓到；
+    /// - 只漏 `unbind_scope_keys`：handler 已摘，重放按键既不 panic 也不消费 ⇒ 只有绑定表
+    ///   计数（`scoped_key_binding_count`）能抓到。
     #[test]
     fn releasing_the_tree_unbinds_its_keys_and_removes_the_handlers() {
         let mut harness = harness();
+        let window = harness.app.window_id();
+        let viewport = harness.tree.list().viewport_node().expect("viewport");
+        let actions = [
+            harness.tree.inner.actions.up.clone(),
+            harness.tree.inner.actions.down.clone(),
+            harness.tree.inner.actions.left.clone(),
+            harness.tree.inner.actions.right.clone(),
+        ];
+        for action in &actions {
+            assert!(
+                harness.app.app().has_action_handler(action),
+                "attach 必须注册 4 个方向键 handler"
+            );
+        }
+        assert_eq!(
+            harness.app.app().scoped_key_binding_count(window, viewport),
+            4,
+            "attach 必须注册 4 条焦点作用域化方向键绑定"
+        );
+
         click_row(&mut harness, 0);
         assert_eq!(
             harness.tree.selected_row(harness.app.app()),
@@ -1574,10 +1599,30 @@ mod ui_tests {
         );
 
         assert!(harness.tree.release(harness.app.app_mut()) >= 6);
-        // 不卸载节点直接释放：这些输入若还挂着泄漏的闭包就会读死句柄。
-        key(&mut harness, KeyCode::ArrowDown);
-        click_row(&mut harness, 1);
-        // 解析出的节点仍可查（纯树查询，不读信号）；没有 panic 即通过。
+        assert_eq!(
+            harness.app.app().scoped_key_binding_count(window, viewport),
+            0,
+            "release 必须解绑全部 4 条 scoped 方向键（节点未卸载，自动清理不会触发）"
+        );
+        for action in &actions {
+            assert!(
+                !harness.app.app().has_action_handler(action),
+                "release 必须摘掉方向键 handler"
+            );
+        }
+
+        // 不卸载节点直接释放：重放按键 / 点击不得再调用已清理的绑定与 handler。
+        let key_outcome = key(&mut harness, KeyCode::ArrowDown);
+        assert_eq!(
+            key_outcome.action, None,
+            "释放后重放方向键不得命中已解绑的 scoped 绑定"
+        );
+        let click_outcome = click_row(&mut harness, 1);
+        assert_eq!(
+            click_outcome.action, None,
+            "释放后重放点击不得命中已摘除的行选择 handler"
+        );
+        // 解析出的节点仍可查（纯树查询，不读信号）。
         assert!(harness.tree.list().row_node(harness.app.app(), 1).is_some());
     }
 }

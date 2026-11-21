@@ -16,15 +16,18 @@ use super::App;
 use crate::{
     error::EngineError,
     event::{Action, InputEvent, KeyBinding, KeyCode, Modifiers},
-    interaction::{AnimatedValue, AnimationSpec, Easing},
+    interaction::{AnimatedValue, AnimationSpec, Easing, ScrollAxis, ScrollConfig},
     math::{Scale, Size},
     node::{
         builder::NodeBuilder,
         id::NodeId,
         signal::{Signal, Transient},
     },
-    paint::{color::Color, style::Style},
-    window::{WindowId, WindowOptions},
+    paint::{
+        color::Color,
+        style::{Clip, Style},
+    },
+    window::{FrameOutcome, WindowId, WindowOptions},
 };
 
 fn setup() -> (tokio::runtime::Runtime, App, WindowId) {
@@ -64,6 +67,31 @@ fn mount_box(app: &mut App, window: WindowId, parent: NodeId) -> NodeId {
 
 fn mount_scope(app: &mut App, window: WindowId, parent: NodeId) -> NodeId {
     mount_box(app, window, parent)
+}
+
+/// 显式尺寸 + 裁剪的滚动容器（默认方向键滚动的落点）。
+fn mount_scroll_container(app: &mut App, window: WindowId, parent: NodeId) -> NodeId {
+    let mut style = Style::default();
+    style.inner.size = taffy::geometry::Size {
+        width: taffy::style::Dimension::length(200.0),
+        height: taffy::style::Dimension::length(150.0),
+    };
+    style.clip = Clip::Bounds;
+    NodeBuilder::boxed()
+        .style(style)
+        .build(app.window_mut(window).expect("window").tree_mut(), parent)
+        .expect("scroll container")
+}
+
+/// 一直出帧到 `Idle`：把挂载 / 焦点变化产生的帧请求排干净，后续断言只观察被测操作。
+fn settle(app: &mut App, window: WindowId) {
+    for _ in 0..8 {
+        let outcome = app.frame(window).expect("window").expect("frame");
+        if matches!(outcome, FrameOutcome::Idle) {
+            return;
+        }
+    }
+    panic!("帧管线在 8 帧内没有回到 Idle");
 }
 
 fn binding(key: KeyCode, action: Action) -> KeyBinding {
@@ -162,6 +190,112 @@ fn a_scoped_binding_without_a_handler_does_not_swallow_the_key() {
     );
     assert_eq!(hits.get(), 1);
     assert_eq!(outcome.action, Some(global));
+}
+
+/// 无 handler 的 scoped 命中不只回落全局绑定，还继续走**默认方向键滚动**：
+/// 焦点在滚动容器内 ⇒ 偏移按 `line_height` 前进；注册 handler 后同一个键被消费、不再滚动。
+#[test]
+fn a_scoped_binding_without_a_handler_falls_back_to_default_key_scroll() {
+    let (_rt, mut app, window) = setup();
+    let root = root(&app, window);
+    let container = mount_scroll_container(&mut app, window, root);
+    let scope = mount_scope(&mut app, window, container);
+    let inside = mount_box(&mut app, window, scope);
+    settle(&mut app, window);
+    let handle = app
+        .make_scroll(
+            window,
+            container,
+            ScrollConfig {
+                axis: ScrollAxis::Vertical,
+                line_height: 48.0,
+            },
+        )
+        .expect("scrollable");
+    app.set_scroll_content(&handle, Size::new(200.0, 400.0))
+        .expect("content");
+    settle(&mut app, window);
+    set_focus(&mut app, window, inside);
+
+    let action = Action::custom("unhandled");
+    app.bind_key_scoped(window, scope, binding(KeyCode::ArrowDown, action.clone()))
+        .expect("bind");
+    let outcome = app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::ArrowDown, Modifiers::empty()),
+    );
+    assert_eq!(
+        outcome.action, None,
+        "没有 handler 的 scoped 命中不消费按键"
+    );
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset.y,
+        48.0,
+        "必须回落默认方向键滚动（一行 = line_height 48）"
+    );
+
+    // 同一个键注册 handler 后：scoped 绑定消费，默认滚动不再执行（证明上一步确实走了默认路径）。
+    let hits = hit_counter(&mut app, &action);
+    let outcome = app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::ArrowDown, Modifiers::empty()),
+    );
+    assert_eq!(hits.get(), 1);
+    assert_eq!(outcome.action, Some(action));
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset.y,
+        48.0,
+        "scoped 命中并消费后不得再走默认滚动"
+    );
+}
+
+/// I3：注册 / 解绑 / 命中 scoped 绑定本身都不产生帧（handler 不写状态时）。
+#[test]
+fn scoped_key_registration_resolution_and_unbinding_do_not_request_frames() {
+    let (_rt, mut app, window) = setup();
+    let root = root(&app, window);
+    let scope = mount_scope(&mut app, window, root);
+    let inside = mount_box(&mut app, window, scope);
+    set_focus(&mut app, window, inside);
+    settle(&mut app, window);
+
+    let action = Action::custom("counted");
+    let hits = hit_counter(&mut app, &action);
+    app.bind_key_scoped(window, scope, binding(KeyCode::ArrowDown, action.clone()))
+        .expect("bind");
+    assert!(!app.take_wake_request(), "注册 scoped 绑定不得请求帧");
+
+    let outcome = app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::ArrowDown, Modifiers::empty()),
+    );
+    assert_eq!(
+        outcome.action,
+        Some(action),
+        "命中必须真的分派到 handler（否则本用例没有走命中路径）"
+    );
+    assert_eq!(hits.get(), 1);
+    assert!(
+        !app.take_wake_request(),
+        "命中（handler 无状态写入）不得请求帧"
+    );
+    assert!(
+        matches!(
+            app.frame(window).expect("window").expect("frame"),
+            FrameOutcome::Idle
+        ),
+        "命中之后下一帧必须 Idle（没有脏位 / 没有帧请求）"
+    );
+
+    assert!(
+        app.unbind_key_scoped(window, scope, KeyCode::ArrowDown, Modifiers::empty()),
+        "绑定确实存在"
+    );
+    assert!(!app.take_wake_request(), "解绑不得请求帧");
+    assert!(matches!(
+        app.frame(window).expect("window").expect("frame"),
+        FrameOutcome::Idle
+    ));
 }
 
 /// 嵌套 scope：由内向外尝试；内层没有 handler 时外层仍有机会（事件冒泡语义）。
@@ -485,6 +619,40 @@ fn releasing_a_scope_reclaims_scoped_transients_and_cancels_their_animations() {
 
     // 重复释放幂等：不再回收任何槽位。
     assert_eq!(app.release_scope(scope), 0);
+}
+
+/// 释放作用域后瞬态值的**写**与读同口径地 panic；对照普通信号的写是 no-op（R03-6）。
+///
+/// 与 `releasing_a_scope_reclaims_scoped_transients_and_cancels_their_animations` 的读 panic
+/// 分开断言：`App::write_transient` 没有「返回 false」的失败形态，不能沿用普通信号的 no-op。
+#[test]
+fn writing_a_released_scoped_transient_panics_like_reading_it() {
+    let (_rt, mut app, _window) = setup();
+    let scope = app.signal_scope();
+    let fade: Transient<f32> = app.transient_scoped(scope, 0.0);
+    let plain: Signal<u32> = app.signal_scoped(scope, 1);
+    assert_eq!(app.release_scope(scope), 2, "瞬态值 + 普通信号");
+
+    let write = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        app.write_transient(&fade, 1.0);
+    }))
+    .expect_err("已释放瞬态值的写必须 panic（不是 no-op）");
+    let message = panic_message(write);
+    assert!(message.contains("stale"), "panic 必须点名 stale：{message}");
+    assert!(
+        message.contains("write_transient"),
+        "panic 必须区分瞬态写与普通信号写：{message}"
+    );
+
+    // 对照：同一作用域的普通信号失效后写是 no-op（不 panic）。
+    assert!(!app.write(&plain, 2), "普通信号的失效写是 no-op");
+
+    // 读 panic 与写 panic 是两条独立断言（读在取值之前失败）。
+    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = *app.read_transient(&fade);
+    }))
+    .expect_err("已释放瞬态值的读必须 panic");
+    assert!(panic_message(read).contains("stale"));
 }
 
 /// 释放作用域后不能再铸造值（引擎误用 ⇒ 显式 panic，而不是静默泄漏）。

@@ -730,10 +730,19 @@ impl List {
 
     /// 接进引擎：`make_virtual_list` + 行工厂 + 点击 Action + 滚动条。
     ///
-    /// 必须先 [`List::build`]；未 build 时是 no-op（`Ok(())`）。
+    /// 必须先 [`List::build`]；未 build 时是 no-op（`Ok(())`）。成功返回时首帧的可见行内容
+    /// 已经建好（见 [`List::populate_first_frame`]）。
     ///
     /// # Errors
-    /// `NotVirtualList` / `InvalidVirtualExtent`（引擎侧校验）。
+    ///
+    /// - [`EngineError::UnknownWindow`] / [`EngineError::StaleNode`]：窗口已关闭，或 `build`
+    ///   时的节点已不在该窗口（`make_virtual_list` / `set_virtual_items` / `fill_row_contents`
+    ///   的引擎校验）；
+    /// - [`EngineError::NotVirtualList`] / [`EngineError::InvalidVirtualExtent`]：`viewport`
+    ///   不是可虚拟化容器 / 行高预置非法；
+    /// - [`EngineError::InvalidMeasure`]：首帧同步建行时跑一次
+    ///   `Window::compute_layout`，measure 闭包返回非有限 / 负尺寸时从这里冒泡；
+    /// - 行工厂（`content`）建树失败时原样传播（通常是 `StaleNode`）。
     pub fn attach(&self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
         let (Some(viewport), Some(outer)) = (
             self.inner.geometry.borrow().viewport,
@@ -1333,6 +1342,21 @@ impl List {
 
     /// 首帧同步建行（P2-2 复核遗留）：让**首帧**就有行内容，而不是空行容器。
     ///
+    /// # 前置条件依赖（重要）
+    ///
+    /// 本方法在帧外调用 [`Window::compute_layout`]，而该 API 的文档要求「文本节点必须先在本帧
+    /// 调用 `App::refresh_text`（shape）后再测量，否则文本测量为 0×0」。这里的正确性**不是**
+    /// 靠满足那个前置条件，而是靠两个已成立的性质，改动其中任一个都可能把未 shape 的文本冻结
+    /// 成 0 高度：
+    ///
+    /// 1. `set_text_shaped`（`node::tree::content`）无条件清掉 `node..root` 的 taffy 缓存 ——
+    ///    首帧 `refresh_text` 把真实文本 shape 完之后，缓存已失效，布局会重新测量；
+    /// 2. 本次 `set_virtual_items` 新挂的行容器 / 内容子树带 `LAYOUT` 脏位 —— 首帧一定重跑
+    ///    布局，不会沿用这次冷路径布局的 0 高度结果。
+    ///
+    /// 若未来把本路径改成引擎级 `App::settle_layout(window)`（E8.md §9.3 的候选），这些依赖由
+    /// 引擎入口承担，这里的注释随之更新。
+    ///
     /// 引擎在视口未知（首次布局前）时按「挂首行 + overscan」处理可见窗口
     /// （`interaction::virtual_list` 的「视口未知」分支），其余可见行要等首帧
     /// `rewindow_virtuals`（布局之后）才挂 —— 而列表只能在 `sync` 里补内容，于是首帧画出来
@@ -1654,6 +1678,23 @@ mod ui_tests {
         ));
     }
 
+    /// 点击并返回抬起事件的 outcome（`action = Some(..)` ⇔ 点击真的调用了 handler）。
+    fn click_outcome(
+        app: &mut TestApp,
+        point: ui_core::math::Point,
+    ) -> ui_core::event::InputOutcome {
+        let _ = app.inject(InputEvent::pointer_down(
+            point,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        app.inject(InputEvent::pointer_up(
+            point,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ))
+    }
+
     fn collect_texts(tree: &NodeTree, node: NodeId, out: &mut Vec<SmolStr>) {
         let Ok(target) = tree.get(node) else {
             return;
@@ -1664,6 +1705,23 @@ mod ui_tests {
         for child in target.children() {
             collect_texts(tree, *child, out);
         }
+    }
+
+    /// 子树里第一个文本节点（首帧测量断言用）。
+    fn first_text_node(tree: &NodeTree, node: NodeId) -> Option<NodeId> {
+        let target = tree.get(node).ok()?;
+        for child in target.children() {
+            let Ok(child_target) = tree.get(*child) else {
+                continue;
+            };
+            if matches!(child_target.kind(), ui_core::node::tree::NodeKind::Text(_)) {
+                return Some(*child);
+            }
+            if let Some(found) = first_text_node(tree, *child) {
+                return Some(found);
+            }
+        }
+        None
     }
 
     fn row_texts(
@@ -1738,16 +1796,49 @@ mod ui_tests {
                 "首帧第 {index} 行不得是空行"
             );
         }
+
+        // 一次渲染即 Idle：首帧之后没有新脏位 / 帧请求，不得持续出帧。
+        for frame_number in 0..5 {
+            let record = app.drain().expect("frame");
+            assert!(
+                !record.rendered,
+                "首帧之后第 {} 帧不得再渲染（出帧循环）",
+                frame_number + 2
+            );
+        }
+
+        // 首帧行文本必须已 shape + 布局（不是 0×0 的空文本节点）。
+        let row0 = list.row_node(app.app(), 0).expect("row 0");
+        let text = first_text_node(app.app().window(window).expect("window").tree(), row0)
+            .expect("第 0 行必须有文本节点");
+        let bounds = app.probe().bounds(text).expect("行文本 bounds");
+        assert!(
+            bounds.size.width > 0.0 && bounds.size.height > 0.0,
+            "首帧行文本必须已布局（bounds 非零）：{bounds:?}"
+        );
     }
 
-    /// 组件 release 必须摘掉点击 Action handler：泄漏的 handler 会在释放后读已回收的选中
-    /// 信号（`ctx.update(&selection)`）⇒ 直接 panic（P2-2 复核 R2.2 的 Rc/handler 泄漏）。
+    /// 组件 release 必须摘掉点击 Action handler。
+    ///
+    /// 「重放点击不 panic」不足以证明清理生效：`List` 的指针路径对死句柄只做 `ctx.update`
+    /// （no-op，不 panic）。这里直接观察 handler 表项，并用 `InputOutcome::action`（= handler
+    /// 真的被调用）验证重放点击不再命中。
     #[test]
     fn releasing_the_list_removes_its_click_handler() {
         let mut harness = harness(5);
+        let select_action = harness.list.inner.select_action.clone();
+        assert!(
+            harness.app.app().has_action_handler(&select_action),
+            "attach 必须注册点击 handler"
+        );
         let row0 = harness.list.row_node(harness.app.app(), 0).expect("row 0");
         let point0 = center(&harness.app, row0);
-        click(&mut harness.app, point0);
+        let click0 = click_outcome(&mut harness.app, point0);
+        assert_eq!(
+            click0.action,
+            Some(select_action.clone()),
+            "释放前点击必须由列表 handler 消费"
+        );
         assert_eq!(
             harness.list.selection(harness.app.app()).first(),
             Some(0),
@@ -1755,11 +1846,16 @@ mod ui_tests {
         );
 
         assert!(harness.list.release(harness.app.app_mut()) > 0);
-        // 不卸载节点直接释放（正常契约是先卸载再 release）：这里专门验证 handler 已被摘除。
+        assert!(
+            !harness.app.app().has_action_handler(&select_action),
+            "release 必须摘掉点击 handler（否则 App 永久持有 Rc<List>）"
+        );
+
+        // 不卸载节点直接释放（正常契约是先卸载再 release）：重放点击不得再调用已摘除的 handler。
         let row1 = harness.list.row_node(harness.app.app(), 1).expect("row 1");
         let point1 = center(&harness.app, row1);
-        click(&mut harness.app, point1);
-        // 选中信号已随作用域释放，之后不能再读；没有 panic 即证明 handler 已摘除。
+        let click1 = click_outcome(&mut harness.app, point1);
+        assert_eq!(click1.action, None, "释放后重放点击不得再命中列表 handler");
     }
 
     /// 重建路径（`set_items` / `set_count` / `push`）同步补行内容：调用返回时行内容已经挂好。
