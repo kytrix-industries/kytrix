@@ -407,7 +407,8 @@ fn content_needs_clip(content: &Content) -> bool {
         Content::Text(line) => line.is_some(),
         Content::Canvas(_) => true,
         // 图片的图元恒落在节点盒内（Contain 内嵌 / Cover 用 UV 裁切而不是溢出 + clip），
-        // 不占 clip 深度。
+        // 不占 clip 深度。后果（§11.8 R-20）：图片按 border box 绘制、不内缩 padding/border，
+        // 节点自身有 border 时图片会盖住边框，且 `Clip::Bounds` 不作用于图片内容。
         Content::Image(_) => false,
     }
 }
@@ -1879,7 +1880,9 @@ impl PrimitiveEmitter {
     ///   `image_modulation`，再乘节点不透明度。
     ///
     /// 图元 bounds 取节点 **border box**（`image` 是替换元素语义的最小实现）：需要留白的图
-    /// 由容器 padding / 显式尺寸承担（残余见 `spec-deltas/E7.md`）。
+    /// 由容器 padding / 显式尺寸承担（残余见 `spec-deltas/E7.md`）。注意这不是 CSS 的
+    /// content box：节点自身的 border/padding 不会为图片让位（图片盖住 border，
+    /// `Clip::Bounds` 也不作用于图片内容，§11.8 R-20）。
     fn emit_image(&mut self, context: &mut PaintContext<'_>, content: &ImageContent, opacity: f32) {
         let Some(image) = context.resources.and_then(|resources| {
             content
@@ -1921,6 +1924,9 @@ impl PrimitiveEmitter {
                 modulation,
             }),
         );
+        // damage 的正确性由节点盒覆盖（`touch` 的当前盒、`place_subtree` 的旧 ∪ 新盒、lane
+        // 重建并入的旧图元 AABB）；这里是保守冗余（与 `emit_inline_box` 的局部记录同型），
+        // 不是正确性依赖 —— 见 §11.8 R-20 的 damage 说明。
         self.push_damage(context, rect, 0.0);
     }
 

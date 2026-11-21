@@ -81,7 +81,10 @@ pub(crate) fn apply_resource_results(
 
 /// E7：在布局之前解析图片节点的内在尺寸（首帧 / DPI 换档 / 资源句柄替换）。
 ///
-/// O(1) 早退条件：树没有「需要解析」标记且窗口 `scale_epoch` 没有变化。返回尺寸变了的节点数。
+/// **稳态** O(1) 早退条件：树没有「需要解析」标记且窗口 `scale_epoch` 没有变化。
+/// 全树 DFS 只发生在三类低频帧（与 `refresh_text` 的「有脏就全扫」同型）：首帧
+/// （`image_scale_epochs` 无记录）、挂载图片节点 / `set_image_resource` 换句柄、DPI 变化。
+/// 返回尺寸变了的节点数。
 pub(crate) fn refresh_images(app: &mut App, window: WindowId) -> usize {
     let App {
         windows,

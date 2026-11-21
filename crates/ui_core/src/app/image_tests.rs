@@ -15,7 +15,7 @@ use smol_str::SmolStr;
 use taffy::style::Dimension;
 
 use crate::{
-    a11y::{A11yAction, A11yOverride, A11yRole},
+    a11y::{A11yAction, A11yDiagnostic, A11yDrawKind, A11yOverride, A11yRole},
     app::App,
     math::{Rect, Scale, Size},
     node::{builder::NodeBuilder, id::NodeId, image::ImageFit, tree::NodeTree},
@@ -534,6 +534,42 @@ fn dpi_change_reresolves_the_intrinsic_size_and_accepts_a_new_variant() {
     );
 }
 
+/// `Window::set_image_resource` 的公开面契约（与 `Window::set_canvas` 同型）：
+/// 图片节点 ⇒ `Ok(true)`；非图片节点 ⇒ `Ok(false)` 且不改状态；陈旧句柄 ⇒ `StaleNode`。
+#[test]
+fn set_image_resource_accepts_only_live_image_nodes() {
+    let mut fixture = Fixture::new();
+    let resource = fixture.insert(&png(8, 8));
+    let other_resource = fixture.insert(&png(4, 4));
+    let image = fixture.mount(|tree, root| {
+        NodeBuilder::image(resource.id, ImageFit::Fill)
+            .build(tree, root)
+            .expect("image")
+    });
+    let other = fixture.mount(|tree, root| NodeBuilder::boxed().build(tree, root).expect("box"));
+    let window = fixture.app.window_mut(fixture.window).expect("window");
+    assert!(
+        !window
+            .set_image_resource(other, other_resource.id)
+            .expect("节点存活"),
+        "非图片节点必须返回 Ok(false)（与 set_canvas 同型）"
+    );
+    assert!(
+        window
+            .set_image_resource(image, other_resource.id)
+            .expect("节点存活"),
+        "图片节点必须接受新句柄"
+    );
+    let stale = NodeId::for_test(999, 1);
+    assert!(
+        matches!(
+            window.set_image_resource(stale, resource.id),
+            Err(crate::error::EngineError::StaleNode { node }) if node == stale
+        ),
+        "陈旧句柄必须返回 StaleNode"
+    );
+}
+
 /// I3：稳定后的图片节点不再产生帧。
 #[test]
 fn a_steady_image_node_does_not_request_frames() {
@@ -600,5 +636,25 @@ fn image_nodes_map_to_the_image_role_with_optional_label() {
     assert!(
         decorative_node.hidden,
         "没有 alt 的图片节点按装饰图 hidden（不静默播报空节点）"
+    );
+
+    // §7.4 的诊断面与 hidden 语义配套：无 alt ⇒ `MissingAltText{kind: Image}`；有 alt ⇒ 无诊断。
+    let diagnostics = app.app().a11y_diagnostics();
+    assert!(
+        diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic,
+            A11yDiagnostic::MissingAltText {
+                node,
+                kind: A11yDrawKind::Image
+            } if *node == decorative
+        )),
+        "无 alt 的图片节点必须记 MissingAltText{{kind: Image}}，实际 {diagnostics:?}"
+    );
+    assert!(
+        !diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic,
+            A11yDiagnostic::MissingAltText { node, .. } if *node == labelled
+        )),
+        "有 alt 的图片节点不得记 MissingAltText，实际 {diagnostics:?}"
     );
 }

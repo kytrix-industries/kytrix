@@ -1184,20 +1184,15 @@ impl NodeTree {
     ) -> usize {
         image::invalidate_dead(self, resources)
     }
-    /// 替换图片节点的资源句柄（E7：DPI 换档 / 换图的公开入口）。
+    /// 替换图片节点的资源句柄（E7：DPI 换档 / 换图的引擎实现，公开入口是
+    /// `Window::set_image_resource`；与 `set_canvas` 同型）。
     ///
-    /// 新资源的内在尺寸在下一次 `App::frame` 的布局前重解析（尺寸可能变），同时标
-    /// `LAYOUT | PAINT` 保证该帧一定出现。返回 `false` = 节点不是图片节点。
-    ///
-    /// # Errors
-    /// [`EngineError::StaleNode`]：节点不存在 / 已卸载。
-    pub fn set_image_resource(
-        &mut self,
-        node: NodeId,
-        resource: ResourceId,
-    ) -> Result<bool, EngineError> {
-        self.get(node)?;
-        Ok(image::set_resource(self, node, resource))
+    /// 只改载荷并标该节点 `LAYOUT | PAINT`（尺寸可能变）：新资源的内在尺寸由**下一次**
+    /// `App::refresh_images` 在布局之前重解析。帧外（非 `on_frame` 钩子）调用后需配
+    /// [`App::request_repaint`](crate::app::App::request_repaint) 才会出帧，见
+    /// `Window::set_image_resource` 的文档。返回 `false` = 节点不是图片节点。
+    pub(crate) fn set_image_resource(&mut self, node: NodeId, resource: ResourceId) -> bool {
+        image::set_resource(self, node, resource)
     }
 
     pub(crate) fn set_text_content(&mut self, node: NodeId, content: TextContent) -> bool {

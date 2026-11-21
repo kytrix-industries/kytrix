@@ -1210,6 +1210,8 @@ impl ResourceCache {
     ///
     /// **契约**：调用方必须保证不再有 `Image` 图元引用该 tile（通常是先卸载/重建对应节点）。
     /// 误用时该区域被清零（表现为透明），若区域随后被新资源复用则旧图元会采样到新图。
+    /// **节点引用的图片请用 [`crate::app::App::unload_resource`]**：它同时让引用节点失效重绘；
+    /// 本方法只还引用计数，**不**触发节点失效（§11.8 R-19）。
     /// 返回 `false` = 陈旧句柄 / 引用已归零（幂等）。
     pub fn unload(&mut self, id: ResourceId) -> bool {
         let Some(entry) = self.entries.get_mut(id) else {

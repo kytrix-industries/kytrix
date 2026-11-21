@@ -51,12 +51,6 @@ impl ImageSource {
             Self::Pending(_) => None,
         }
     }
-
-    /// 是否已就绪（可以直接画）。
-    #[must_use]
-    pub const fn is_ready(self) -> bool {
-        matches!(self, Self::Ready(_))
-    }
 }
 
 /// 图片节点载荷（`NodeKind::Image`）。
@@ -285,8 +279,6 @@ mod tests {
     fn image_source_ready_and_pending_are_distinct() {
         let ready = ImageSource::Ready(ResourceId::for_test(3, 1));
         let pending = ImageSource::Pending(PendingResource::for_test(4, 2));
-        assert!(ready.is_ready());
-        assert!(!pending.is_ready());
         assert_eq!(ready.resource(), Some(ResourceId::for_test(3, 1)));
         assert_eq!(pending.resource(), None);
         assert_ne!(ready, pending);

@@ -511,7 +511,7 @@ mod tests {
             NodeKind::Image(content) => {
                 assert_eq!(content.source(), ImageSource::Pending(pending));
                 assert_eq!(content.fit(), ImageFit::Contain);
-                assert!(!content.source().is_ready());
+                assert_eq!(content.source().resource(), None, "Pending 没有就绪句柄");
             }
             other => panic!("expected Image, got {other:?}"),
         }
