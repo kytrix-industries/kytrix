@@ -18,10 +18,22 @@
 //!
 //! 因此本模块**不拥有内容**（dialog / alert / menu 的实体栈属于各自的迁移批次），只拥有：
 //!
-//! - **层带表**：`View < Dialog < Alert < Popup < ContextMenu < Tooltip`（旧 layer + POPUP_PRIORITY
+//! - **层带表**：`Dialog < Alert < Popup < ContextMenu < Tooltip`（旧 layer + POPUP_PRIORITY
 //!   的等价次序：普通弹层在 alert 之上，context menu 在弹层之上，tooltip 最高）；
 //! - **排序仲裁**：登记 / 移除 / 提前 / 关闭最上层，以及把引擎的 root 子节点顺序对齐到层带；
-//! - **层内焦点与点击穿透的查询面**：最上层模态（焦点作用域根）、最上层是哪个浮层（命中优先）。
+//! - **层内焦点与点击穿透的查询面**：最上层模态（焦点作用域根）、最上层是哪个浮层（命中优先）；
+//! - **旧 `layer.rs` 的三条槽位不变量**：打开 dialog / alert 前先收起 context menu；alert 与
+//!   context menu 各自**至多一个**（后开替换先开，见 [`Layer::register`]）。这三条不依赖引擎
+//!   批，属于旧 `Layer` 的可移植语义，因此留在本模块；dialog / alert / context_menu 批次的
+//!   **内容所有权与实体栈**仍属于各自批次。
+//!
+//! # 一个 Layer / 按窗口分区
+//!
+//! [`Layer`] 是**应用级（组合根唯一）**的登记表，内部**按 `WindowId` 分区**：每条登记都从
+//! 引擎浮层句柄取窗口（[`EngineOverlay::window`]），所有查询 / [`Layer::enforce`] / 关闭操作
+//! 都只作用于指定窗口。这样多窗口共用一个 `Layer` 时，窗口 A 的 `enforce` 不会把窗口 B 的
+//! 节点算进 `desired`（否则两边互相重排、永不收敛）。**不要**为每个窗口各建一个 `Layer`：
+//! 组合根只有一个（与旧实现「每窗唯一 Layer」等价的是「每窗口一个分区」）。
 //!
 //! # 与 overlay 的分工
 //!
@@ -56,39 +68,27 @@ use ui_core::{
 
 /// 固定层带（旧 `layer.rs` 的四段层序 + `POPUP_PRIORITY` 的等价次序）。
 ///
-/// 数值只用于排序，**不是**像素；同一层带内按登记序（后登记 = 更上）。
+/// 数值只用于排序，**不是**像素；同一层带内按登记序（后登记 = 更上）。窗口根视图（旧
+/// `Layer::view`）不是浮层，不在表里 —— 引擎 root 永远在最底层，不需要登记。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Band {
-    /// 窗口根视图（旧 `Layer::view`）：不是浮层，任何浮层都在它之上，仅用于表达「底」。
-    View,
     /// 对话框栈（旧 `dialogs`，旧→新）：后开的 dialog 在旧的之上。
     Dialog,
-    /// 提示框（旧 `alert`）：恒高于所有 dialog，**包括后开的 dialog**。
+    /// 提示框（旧 `alert`）：恒高于所有 dialog，**包括后开的 dialog**；至多一个。
     Alert,
     /// 普通弹层（旧 `POPUP_PRIORITY`）：dropdown / select / menu / color_picker 的面板。
     Popup,
-    /// 上下文菜单（旧 `CONTEXT_MENU_PRIORITY = POPUP_PRIORITY + 1`）。
+    /// 上下文菜单（旧 `CONTEXT_MENU_PRIORITY = POPUP_PRIORITY + 1`）：至多一个。
     ContextMenu,
     /// tooltip（旧 `POPUP_PRIORITY + 2`）：菜单项上的提示不被菜单埋住。
     Tooltip,
 }
 
 impl Band {
-    /// 全部层带，从底到顶。
-    pub const ALL: [Self; 6] = [
-        Self::View,
-        Self::Dialog,
-        Self::Alert,
-        Self::Popup,
-        Self::ContextMenu,
-        Self::Tooltip,
-    ];
-
     /// 排序键（层带序号，小的在下面）。
     #[must_use]
     pub const fn order(self) -> u8 {
         match self {
-            Self::View => 0,
             Self::Dialog => 10,
             Self::Alert => 20,
             Self::Popup => 30,
@@ -103,7 +103,7 @@ impl Band {
 pub struct Entry {
     /// 层带。
     pub band: Band,
-    /// 引擎浮层句柄（`App::create_overlay` 铸出）。
+    /// 引擎浮层句柄（`App::create_overlay` 铸出；窗口从它取）。
     pub overlay: EngineOverlay,
     /// 是否模态（焦点作用域根 + 遮罩由浮层自己画）。
     pub modal: bool,
@@ -117,9 +117,16 @@ impl Entry {
     pub fn node(self) -> NodeId {
         self.overlay.node()
     }
+
+    /// 该层所属窗口。
+    #[must_use]
+    pub fn window(self) -> WindowId {
+        self.overlay.window()
+    }
 }
 
 struct LayerInner {
+    /// 全部窗口的登记（查询 / 排序按窗口过滤后使用，见模块文档「一个 Layer / 按窗口分区」）。
     entries: RefCell<Vec<Entry>>,
     next_sequence: Cell<u64>,
 }
@@ -148,12 +155,31 @@ impl Layer {
         }
     }
 
-    /// 登记一层（返回登记序号）。
+    /// 登记一层（返回登记序号），并执行旧 `layer.rs` 的槽位不变量：
+    ///
+    /// - 打开 `Dialog` / `Alert` 之前先收起本窗口的 `ContextMenu`（旧实现里 dialog / alert 是
+    ///   模态的，菜单不能压在它们上面继续吃按下）；
+    /// - `Alert` 与 `ContextMenu` 各自**至多一个**：后登记的替换先登记的（旧实现的单例槽位）。
+    ///
+    /// 替换靠引擎 [`App::close_overlay`] 立即卸载旧节点（旧实现在菜单替换时走 `dismiss` 退出
+    /// 转场；引擎没有应用层可拦截的退出钩子，差异已登记）。被替换的浮层的 kit 状态由它自己
+    /// 的下一次 `Overlay::sync` 收尾（关闭路径统一走 `finish_close`，登记不会泄漏）。
     ///
     /// 登记只改变本栈的次序记录，不动引擎树；下一次 [`Layer::enforce`] 才把 root 子节点
     /// 顺序对齐（浮层通常是刚由 `App::create_overlay` 挂到 root 末尾的，所以这一帧往往已经
-    /// 在正确位置，`enforce` 会零成本早退）。
-    pub fn register(&self, band: Band, overlay: EngineOverlay, modal: bool) -> u64 {
+    /// 在正确位置，`enforce` 会零成本早退）。跨窗口登记的浮层不参与本窗口的槽位不变量。
+    pub fn register(&self, app: &mut App, band: Band, overlay: EngineOverlay, modal: bool) -> u64 {
+        let window = overlay.window();
+        if matches!(band, Band::Dialog | Band::Alert) {
+            while self.top_of(window, Band::ContextMenu).is_some() {
+                let _ = self.close_top_of(app, window, Band::ContextMenu);
+            }
+        }
+        if matches!(band, Band::Alert | Band::ContextMenu) {
+            while self.top_of(window, band).is_some() {
+                let _ = self.close_top_of(app, window, band);
+            }
+        }
         let sequence = self.inner.next_sequence.get();
         self.inner.next_sequence.set(sequence + 1);
         self.inner.entries.borrow_mut().push(Entry {
@@ -173,100 +199,125 @@ impl Layer {
         entries.len() != before
     }
 
-    /// 已登记层数。
+    /// 某窗口已登记层数。
     #[must_use]
-    pub fn len(&self) -> usize {
-        self.inner.entries.borrow().len()
+    pub fn len(&self, window: WindowId) -> usize {
+        self.inner
+            .entries
+            .borrow()
+            .iter()
+            .filter(|entry| entry.window() == window)
+            .count()
     }
 
-    /// 是否空栈。
+    /// 某窗口是否空栈。
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    pub fn is_empty(&self, window: WindowId) -> bool {
+        self.len(window) == 0
     }
 
-    /// 全部层，**自下而上**（层带升序，同带按登记序）。
+    /// 某窗口的全部层，**自下而上**（层带升序，同带按登记序）。
     #[must_use]
-    pub fn entries(&self) -> Vec<Entry> {
-        let mut entries = self.inner.entries.borrow().clone();
+    pub fn entries(&self, window: WindowId) -> Vec<Entry> {
+        let mut entries: Vec<Entry> = self
+            .inner
+            .entries
+            .borrow()
+            .iter()
+            .copied()
+            .filter(|entry| entry.window() == window)
+            .collect();
         entries.sort_unstable_by_key(|entry| (entry.band, entry.sequence));
         entries
     }
 
-    /// 最上层（自下而上最后一项）。
+    /// 某窗口的最上层（自下而上最后一项）。
     #[must_use]
-    pub fn top(&self) -> Option<Entry> {
-        self.entries().pop()
+    pub fn top(&self, window: WindowId) -> Option<Entry> {
+        self.entries(window).pop()
     }
 
-    /// 某层带的最上层。
+    /// 某窗口某层带的最上层。
     #[must_use]
-    pub fn top_of(&self, band: Band) -> Option<Entry> {
-        self.entries()
+    pub fn top_of(&self, window: WindowId, band: Band) -> Option<Entry> {
+        self.entries(window)
             .into_iter()
             .rev()
             .find(|entry| entry.band == band)
     }
 
-    /// 最上层**模态**层（焦点作用域根；`None` = 窗口没有模态浮层）。
+    /// 某窗口最上层**模态**层（焦点作用域根；`None` = 该窗口没有模态浮层）。
     ///
     /// 与引擎 `interaction::overlay::focus_scope_root` 同源：最上层带 `trap_focus` 的浮层说了算，
     /// 非模态层不改变焦点作用域。
     #[must_use]
-    pub fn modal_scope(&self) -> Option<Entry> {
-        self.entries().into_iter().rev().find(|entry| entry.modal)
+    pub fn modal_scope(&self, window: WindowId) -> Option<Entry> {
+        self.entries(window)
+            .into_iter()
+            .rev()
+            .find(|entry| entry.modal)
     }
 
-    /// 该节点是否是某个已登记层的浮层节点。
+    /// 某窗口里 `node` 是否是某个已登记层的浮层节点。
     #[must_use]
-    pub fn contains_node(&self, node: NodeId) -> bool {
-        self.inner
-            .entries
-            .borrow()
+    pub fn contains_node(&self, window: WindowId, node: NodeId) -> bool {
+        self.entries(window)
             .iter()
             .any(|entry| entry.node() == node)
     }
 
-    /// 某浮层在当前栈里的高度序号（自下而上，`0` = 最底；未登记 ⇒ `None`）。
+    /// `overlay` 在某窗口当前栈里的高度序号（自下而上，`0` = 最底；未登记 ⇒ `None`）。
     #[must_use]
-    pub fn position(&self, overlay: &EngineOverlay) -> Option<usize> {
-        self.entries()
+    pub fn position(&self, window: WindowId, overlay: &EngineOverlay) -> Option<usize> {
+        self.entries(window)
             .iter()
             .position(|entry| entry.overlay == *overlay)
     }
 
     /// 把引擎 root 子节点顺序对齐到层带表；返回是否真的重排了（已对齐 ⇒ `false`，I3）。
     ///
-    /// 只要求**已登记浮层之间的相对顺序**正确：窗口里若有本栈未登记的浮层（理论上不应存在，
-    /// 组合根应把所有浮层登记到同一个栈），它们的相对位置不参与判定；一旦需要重排，已登记层
-    /// 会被整体提到它们之上 —— 登记的层恒在未登记的 root 子节点之上，语义确定。
+    /// 判定只看**本窗口已登记浮层之间**的相对顺序：窗口里若有本栈未登记的浮层（理论上不应
+    /// 存在，组合根应把所有浮层登记到同一个栈），它们的相对位置不参与判定；一旦需要重排，
+    /// 已登记层会被整体提到它们之上。其它窗口的登记不参与判定、也不会被重排（R04）。
+    ///
+    /// 进入判定前先**剪除**引擎里已经不存在的登记（`overlays(window)` 里没有的节点）：外部
+    /// 卸载（点外部 / Esc / 绕过 kit 直接 `close_overlay`）即使没走 {`Overlay::finish_close`}，
+    /// 也不会让 `desired` 永远失配、把 `enforce` 变成每轮重排 + 出帧（R03 的防御面）。
     ///
     /// 重排用 [`ui_core::app::App::bring_overlay_to_front`]（把节点重挂到 root 末尾），按层带
     /// 自下而上依次调用，最终顺序即层带顺序。整条路径只在失配时发生，稳态零成本。
     pub fn enforce(&self, app: &mut App, window: WindowId) -> bool {
-        let desired: Vec<NodeId> = self.entries().iter().map(|entry| entry.node()).collect();
+        let current: Vec<NodeId> = app
+            .overlays(window)
+            .into_iter()
+            .map(|(node, _)| node)
+            .collect();
+        self.prune(window, &current);
+        let desired: Vec<NodeId> = self
+            .entries(window)
+            .iter()
+            .map(|entry| entry.node())
+            .collect();
         if desired.is_empty() {
             return false;
         }
-        let current: Vec<(NodeId, _)> = app.overlays(window);
         let current_registered: Vec<NodeId> = current
-            .iter()
-            .map(|(node, _)| *node)
-            .filter(|node| self.contains_node(*node))
+            .into_iter()
+            .filter(|node| desired.contains(node))
             .collect();
         if current_registered == desired {
             return false;
         }
         // 未登记浮层不参与排序：把它们留在原位，只把登记层按次序提到末尾。
-        for entry in self.entries() {
+        for entry in self.entries(window) {
             app.bring_overlay_to_front(&entry.overlay);
         }
         true
     }
 
-    /// 关闭最上层（自下而上最后一项）；引擎负责恢复焦点。返回是否有层被关闭。
-    pub fn close_top(&self, app: &mut App) -> bool {
-        let Some(entry) = self.top() else {
+    /// 关闭某窗口最上层（自下而上最后一项）；引擎负责恢复焦点。返回是否有层被关闭。
+    pub fn close_top(&self, app: &mut App, window: WindowId) -> bool {
+        let Some(entry) = self.top(window) else {
             return false;
         };
         let closed = app.close_overlay(&entry.overlay);
@@ -274,15 +325,23 @@ impl Layer {
         closed
     }
 
-    /// 关闭某层带的最上层（旧「第二次 alert 替换第一次」/「新 context menu 替换旧的」的
-    /// 通用入口）。返回是否有层被关闭。
-    pub fn close_top_of(&self, app: &mut App, band: Band) -> bool {
-        let Some(entry) = self.top_of(band) else {
+    /// 关闭某窗口某层带的最上层（旧「第二次 alert 替换第一次」/「新 context menu 替换旧的」
+    /// 的通用入口）。返回引擎是否真的卸载了节点（登记已移除时仍可能返回 `false`）。
+    pub fn close_top_of(&self, app: &mut App, window: WindowId, band: Band) -> bool {
+        let Some(entry) = self.top_of(window, band) else {
             return false;
         };
         let closed = app.close_overlay(&entry.overlay);
         self.remove(&entry.overlay);
         closed
+    }
+
+    /// 剪除某窗口里引擎已经卸载的登记（只动该窗口，跨窗口登记不受影响）。
+    fn prune(&self, window: WindowId, current: &[NodeId]) {
+        self.inner
+            .entries
+            .borrow_mut()
+            .retain(|entry| entry.window() != window || current.contains(&entry.node()));
     }
 }
 
@@ -293,14 +352,20 @@ mod tests {
     use super::Band;
 
     #[test]
-    fn bands_order_from_view_to_tooltip() {
-        assert_eq!(Band::ALL.len(), 6);
-        for window in Band::ALL.windows(2) {
+    fn bands_order_from_dialog_to_tooltip() {
+        let bands = [
+            Band::Dialog,
+            Band::Alert,
+            Band::Popup,
+            Band::ContextMenu,
+            Band::Tooltip,
+        ];
+        for pair in bands.windows(2) {
             assert!(
-                window[0].order() < window[1].order(),
+                pair[0].order() < pair[1].order(),
                 "{:?} 必须在 {:?} 之下",
-                window[0],
-                window[1]
+                pair[0],
+                pair[1]
             );
         }
         // 旧实现的固定关系（评估 G6）：alert 恒高于 dialog，context menu 高于 popup，tooltip 最高。
@@ -308,14 +373,14 @@ mod tests {
         assert!(Band::ContextMenu.order() > Band::Popup.order());
         assert!(Band::Tooltip.order() > Band::ContextMenu.order());
         assert!(Band::Popup.order() > Band::Alert.order());
-        assert_eq!(Band::View.order(), 0);
+        assert_eq!(Band::Dialog.order(), 10);
     }
 }
 
 #[cfg(test)]
 mod ui_tests {
     //! 需要真实引擎树的断言：层带排序落到 root 子节点顺序、命中优先、模态作用域、
-    //! 点击穿透与"关闭上层露出下层"。
+    //! 点击穿透、"关闭上层露出下层"、按窗口分区与旧槽位不变量。
 
     use ui_core::{
         event::{Action, InputEvent, Modifiers, PointerButton},
@@ -323,7 +388,7 @@ mod ui_tests {
         math::{Point, Size},
         node::{builder::NodeBuilder, id::NodeId},
         test_support::app::TestApp,
-        window::WindowId,
+        window::{WindowId, WindowOptions},
     };
 
     use super::{Band, Layer};
@@ -435,6 +500,15 @@ mod ui_tests {
         ));
     }
 
+    fn node_exists(app: &TestApp, window: WindowId, node: NodeId) -> bool {
+        app.app()
+            .window(window)
+            .expect("窗口")
+            .tree()
+            .get(node)
+            .is_ok()
+    }
+
     #[test]
     fn a_dialog_opened_after_an_alert_stays_below_it() {
         // 旧 layer 的固定层序（评估 G6）：alert 恒高于所有 dialog，**包括后开的**。
@@ -455,8 +529,8 @@ mod ui_tests {
             OverlayDismiss::Explicit,
             true,
         );
-        layer.register(Band::Alert, alert, true);
-        layer.register(Band::Dialog, dialog, true);
+        layer.register(app.app_mut(), Band::Alert, alert, true);
+        layer.register(app.app_mut(), Band::Dialog, dialog, true);
         let _ = app.drain().expect("首帧");
 
         assert_eq!(
@@ -511,8 +585,8 @@ mod ui_tests {
             OverlayDismiss::Explicit,
             false,
         );
-        layer.register(Band::Dialog, first, false);
-        layer.register(Band::Dialog, second, false);
+        layer.register(app.app_mut(), Band::Dialog, first, false);
+        layer.register(app.app_mut(), Band::Dialog, second, false);
         let _ = app.drain().expect("首帧");
 
         // 先制造一个错误次序：把先登记的提到最上。
@@ -550,8 +624,8 @@ mod ui_tests {
             OverlayDismiss::Explicit,
             false,
         );
-        layer.register(Band::Dialog, lower, false);
-        layer.register(Band::Popup, upper, false);
+        layer.register(app.app_mut(), Band::Dialog, lower, false);
+        layer.register(app.app_mut(), Band::Popup, upper, false);
         let _ = app.drain().expect("首帧");
 
         assert!(!layer.enforce(app.app_mut(), window), "已对齐必须零工作");
@@ -572,10 +646,19 @@ mod ui_tests {
     #[test]
     fn nested_layers_keep_their_bands() {
         // 对话框里开的下拉（Popup）恒在对话框之上、且仍属于对话框的模态作用域；
-        // 下拉里的子菜单（ContextMenu）又在弹出层之上；提示（Tooltip）最高。
+        // 下拉里的子菜单（ContextMenu）又在弹出层之上；提示（Tooltip）最高；
+        // alert 恒高于 dialog（含后开的 dialog）。
         let (mut app, window, _root) = harness();
         let layer = Layer::new();
-        // 故意用「子层先开、父层后开」的注册序制造失配。
+        // 故意用「子层先开、父层后开」的注册序制造失配。alert 先登记，避免它的槽位不变量
+        // （打开 alert 先收起 context menu）影响本用例；dialog 后登记仍必须落在 alert 之下。
+        let alert = overlay_at(
+            &mut app,
+            window,
+            Point::new(10.0, 10.0),
+            OverlayDismiss::Explicit,
+            true,
+        );
         let popup = overlay_at(
             &mut app,
             window,
@@ -604,23 +687,30 @@ mod ui_tests {
             OverlayDismiss::Explicit,
             false,
         );
-        layer.register(Band::Popup, popup, false);
-        layer.register(Band::Dialog, dialog, true);
-        layer.register(Band::ContextMenu, submenu, false);
-        layer.register(Band::Tooltip, tooltip, false);
+        layer.register(app.app_mut(), Band::Alert, alert, true);
+        layer.register(app.app_mut(), Band::Popup, popup, false);
+        layer.register(app.app_mut(), Band::Dialog, dialog, true);
+        layer.register(app.app_mut(), Band::ContextMenu, submenu, false);
+        layer.register(app.app_mut(), Band::Tooltip, tooltip, false);
         let _ = app.drain().expect("首帧");
         assert!(layer.enforce(app.app_mut(), window));
         let _ = app.drain().expect("帧");
 
         assert_eq!(
             ordered_nodes(&app, window),
-            vec![dialog.node(), popup.node(), submenu.node(), tooltip.node()],
-            "自下而上必须是 Dialog < Popup < ContextMenu < Tooltip"
+            vec![
+                dialog.node(),
+                alert.node(),
+                popup.node(),
+                submenu.node(),
+                tooltip.node()
+            ],
+            "自下而上必须是 Dialog < Alert < Popup < ContextMenu < Tooltip"
         );
         assert_eq!(
-            layer.modal_scope().map(|entry| entry.node()),
-            Some(dialog.node()),
-            "焦点作用域根是最上层模态（对话框），弹出层不改变它"
+            layer.modal_scope(window).map(|entry| entry.node()),
+            Some(alert.node()),
+            "焦点作用域根是最上层模态（alert 恒高于 dialog），弹出层不改变它"
         );
     }
 
@@ -642,12 +732,15 @@ mod ui_tests {
             OverlayDismiss::Explicit,
             false,
         );
-        layer.register(Band::Dialog, lower, false);
-        layer.register(Band::Dialog, upper, false);
+        layer.register(app.app_mut(), Band::Dialog, lower, false);
+        layer.register(app.app_mut(), Band::Dialog, upper, false);
         assert!(layer.remove(&lower));
         assert!(!layer.remove(&lower), "重复移除返回 false");
-        assert_eq!(layer.len(), 1);
-        assert_eq!(layer.top().map(|entry| entry.node()), Some(upper.node()));
+        assert_eq!(layer.len(window), 1);
+        assert_eq!(
+            layer.top(window).map(|entry| entry.node()),
+            Some(upper.node())
+        );
     }
 
     #[test]
@@ -668,15 +761,15 @@ mod ui_tests {
             OverlayDismiss::Explicit,
             true,
         );
-        layer.register(Band::Dialog, lower, true);
-        layer.register(Band::Dialog, upper, true);
+        layer.register(app.app_mut(), Band::Dialog, lower, true);
+        layer.register(app.app_mut(), Band::Dialog, upper, true);
         let _ = app.drain().expect("首帧");
 
         assert_eq!(
-            layer.modal_scope().map(|entry| entry.node()),
+            layer.modal_scope(window).map(|entry| entry.node()),
             Some(upper.node())
         );
-        assert!(layer.close_top(app.app_mut()));
+        assert!(layer.close_top(app.app_mut(), window));
         let _ = app.drain().expect("帧");
 
         assert_eq!(
@@ -685,7 +778,7 @@ mod ui_tests {
             "关闭上层后只剩下层"
         );
         assert_eq!(
-            layer.modal_scope().map(|entry| entry.node()),
+            layer.modal_scope(window).map(|entry| entry.node()),
             Some(lower.node()),
             "焦点作用域回落到下一个模态"
         );
@@ -716,21 +809,27 @@ mod ui_tests {
             OverlayDismiss::OutsideClick,
             false,
         );
-        layer.register(Band::Alert, alert, true);
-        layer.register(Band::Dialog, dialog, true);
-        layer.register(Band::ContextMenu, menu, false);
+        layer.register(app.app_mut(), Band::Alert, alert, true);
+        layer.register(app.app_mut(), Band::Dialog, dialog, true);
+        layer.register(app.app_mut(), Band::ContextMenu, menu, false);
         let _ = app.drain().expect("首帧");
 
-        assert!(layer.close_top_of(app.app_mut(), Band::Alert), "关掉 alert");
-        layer.remove(&alert);
+        assert!(
+            layer.close_top_of(app.app_mut(), window, Band::Alert),
+            "关掉 alert"
+        );
         let _ = app.drain().expect("帧");
-        assert_eq!(layer.len(), 2);
-        assert_eq!(layer.top_of(Band::Alert), None);
-        assert!(layer.top_of(Band::Dialog).is_some());
-        assert!(layer.top_of(Band::ContextMenu).is_some());
-        // 定向关闭不动其它层的引擎节点。
-        assert!(ordered_nodes(&app, window).contains(&dialog.node()));
-        assert!(ordered_nodes(&app, window).contains(&menu.node()));
+        assert_eq!(layer.len(window), 2);
+        assert_eq!(layer.top_of(window, Band::Alert), None);
+        assert!(layer.top_of(window, Band::Dialog).is_some());
+        assert!(layer.top_of(window, Band::ContextMenu).is_some());
+        // 定向关闭不动其它层的引擎节点，且被关的节点真的卸载了。
+        assert!(
+            !node_exists(&app, window, alert.node()),
+            "被关闭的 alert 节点必须已卸载"
+        );
+        assert!(node_exists(&app, window, dialog.node()));
+        assert!(node_exists(&app, window, menu.node()));
     }
 
     #[test]
@@ -747,7 +846,7 @@ mod ui_tests {
             OverlayDismiss::Explicit,
             false,
         );
-        layer.register(Band::Popup, popup, false);
+        layer.register(app.app_mut(), Band::Popup, popup, false);
         let _ = app.drain().expect("首帧");
 
         let at = center(&app, button_node);
@@ -774,7 +873,7 @@ mod ui_tests {
             OverlayDismiss::Explicit,
             true,
         );
-        layer.register(Band::Dialog, modal, true);
+        layer.register(app.app_mut(), Band::Dialog, modal, true);
         let _ = app.drain().expect("首帧");
 
         let at = center(&app, button_node);
@@ -785,6 +884,211 @@ mod ui_tests {
             0,
             "模态作用域外的按下不得触发下层动作"
         );
-        assert!(layer.contains_node(modal.node()));
+        assert!(layer.contains_node(window, modal.node()));
+    }
+
+    #[test]
+    fn a_shared_layer_is_partitioned_by_window() {
+        // R04：多窗口共用一个 Layer。窗口 A 的 enforce 只能看到 A 的登记；跨窗口的登记既不
+        // 参与判定（否则 desired 永不相等 ⇒ 每轮重排 + 出帧），也不能被重排到另一个窗口。
+        let (mut app, window_a, _root_a) = harness();
+        let layer = Layer::new();
+        let window_b = app.app_mut().create_window(WindowOptions::default());
+        let alert_a = overlay_at(
+            &mut app,
+            window_a,
+            Point::new(20.0, 20.0),
+            OverlayDismiss::Explicit,
+            true,
+        );
+        let dialog_b = overlay_at(
+            &mut app,
+            window_b,
+            Point::new(20.0, 20.0),
+            OverlayDismiss::Explicit,
+            true,
+        );
+        layer.register(app.app_mut(), Band::Alert, alert_a, true);
+        layer.register(app.app_mut(), Band::Dialog, dialog_b, true);
+        let order_b = ordered_nodes(&app, window_b);
+
+        assert_eq!(layer.len(window_a), 1);
+        assert_eq!(layer.len(window_b), 1);
+        assert!(
+            !layer.enforce(app.app_mut(), window_a),
+            "窗口 A 已对齐；窗口 B 的登记不参与 A 的判定（否则永不收敛）"
+        );
+        assert!(!layer.enforce(app.app_mut(), window_b), "窗口 B 同样已对齐");
+        assert_eq!(
+            ordered_nodes(&app, window_a),
+            vec![alert_a.node()],
+            "A 的 root 顺序不变"
+        );
+        assert_eq!(
+            ordered_nodes(&app, window_b),
+            order_b,
+            "A 的 enforce 不得重排 B 的 root"
+        );
+        assert_eq!(
+            layer.modal_scope(window_b).map(|entry| entry.node()),
+            Some(dialog_b.node()),
+            "modal_scope 按窗口分区"
+        );
+        assert_eq!(
+            layer.modal_scope(window_a).map(|entry| entry.node()),
+            Some(alert_a.node())
+        );
+    }
+
+    #[test]
+    fn enforce_prunes_entries_whose_overlay_was_closed_elsewhere() {
+        // R03 防御面：绕过 kit 的引擎卸载（外部 `close_overlay` / 点外部 / Esc 后 sync 之前）
+        // 不会让登记永远失配；下一轮 enforce 剪掉死登记并回到零工作。stale entry 也不能继续
+        // 冒充 `modal_scope()`。
+        let (mut app, window, _root) = harness();
+        let layer = Layer::new();
+        let first = overlay_at(
+            &mut app,
+            window,
+            Point::ZERO,
+            OverlayDismiss::Explicit,
+            true,
+        );
+        let second = overlay_at(
+            &mut app,
+            window,
+            Point::ZERO,
+            OverlayDismiss::Explicit,
+            true,
+        );
+        layer.register(app.app_mut(), Band::Dialog, first, true);
+        layer.register(app.app_mut(), Band::Dialog, second, true);
+        let _ = app.drain().expect("首帧");
+        assert_eq!(
+            layer.modal_scope(window).map(|entry| entry.node()),
+            Some(second.node())
+        );
+        assert!(app.app_mut().close_overlay(&second), "引擎侧卸载最上层模态");
+        assert_eq!(
+            layer.len(window),
+            2,
+            "登记暂时还在（等下一轮 sync / enforce）"
+        );
+
+        assert!(
+            !layer.enforce(app.app_mut(), window),
+            "剪除死登记后已对齐 ⇒ 零工作（不得每轮重排）"
+        );
+        assert_eq!(layer.len(window), 1, "死登记必须被剪除");
+        assert_eq!(
+            layer.modal_scope(window).map(|entry| entry.node()),
+            Some(first.node()),
+            "modal_scope 必须回落到仍然存活的模态（不得对已死节点说谎）"
+        );
+        assert!(!layer.enforce(app.app_mut(), window), "此后稳态零工作");
+    }
+
+    #[test]
+    fn registering_a_dialog_or_alert_dismisses_the_context_menu() {
+        // 旧 layer.rs：dialog / alert 是模态的，打开前先收起 context menu（菜单不能压在模态
+        // 之上继续吃按下）。
+        let (mut app, window, _root) = harness();
+        let layer = Layer::new();
+        let menu = overlay_at(
+            &mut app,
+            window,
+            Point::ZERO,
+            OverlayDismiss::OutsideClick,
+            false,
+        );
+        layer.register(app.app_mut(), Band::ContextMenu, menu, false);
+        let dialog = overlay_at(
+            &mut app,
+            window,
+            Point::ZERO,
+            OverlayDismiss::Explicit,
+            true,
+        );
+        layer.register(app.app_mut(), Band::Dialog, dialog, true);
+        assert_eq!(layer.len(window), 1, "菜单被替换掉");
+        assert!(layer.top_of(window, Band::ContextMenu).is_none());
+        assert!(!node_exists(&app, window, menu.node()), "菜单节点已卸载");
+
+        let menu = overlay_at(
+            &mut app,
+            window,
+            Point::ZERO,
+            OverlayDismiss::OutsideClick,
+            false,
+        );
+        layer.register(app.app_mut(), Band::ContextMenu, menu, false);
+        let alert = overlay_at(
+            &mut app,
+            window,
+            Point::ZERO,
+            OverlayDismiss::Explicit,
+            true,
+        );
+        layer.register(app.app_mut(), Band::Alert, alert, true);
+        assert!(layer.top_of(window, Band::ContextMenu).is_none());
+        assert!(
+            !node_exists(&app, window, menu.node()),
+            "alert 打开也收起菜单"
+        );
+    }
+
+    #[test]
+    fn a_second_alert_replaces_the_first_and_a_second_menu_replaces_the_first() {
+        // 旧 layer.rs 的单例槽位：alert / context menu 至多一个，后开的替换先开的。
+        let (mut app, window, _root) = harness();
+        let layer = Layer::new();
+        let first_alert = overlay_at(
+            &mut app,
+            window,
+            Point::ZERO,
+            OverlayDismiss::Explicit,
+            true,
+        );
+        layer.register(app.app_mut(), Band::Alert, first_alert, true);
+        let second_alert = overlay_at(
+            &mut app,
+            window,
+            Point::new(10.0, 10.0),
+            OverlayDismiss::Explicit,
+            true,
+        );
+        layer.register(app.app_mut(), Band::Alert, second_alert, true);
+        assert_eq!(
+            layer.top_of(window, Band::Alert).map(|entry| entry.node()),
+            Some(second_alert.node())
+        );
+        assert_eq!(layer.len(window), 1, "alert 槽位至多一个");
+        assert!(
+            !node_exists(&app, window, first_alert.node()),
+            "旧 alert 已卸载"
+        );
+
+        let first_menu = overlay_at(
+            &mut app,
+            window,
+            Point::ZERO,
+            OverlayDismiss::OutsideClick,
+            false,
+        );
+        layer.register(app.app_mut(), Band::ContextMenu, first_menu, false);
+        let second_menu = overlay_at(
+            &mut app,
+            window,
+            Point::new(10.0, 10.0),
+            OverlayDismiss::OutsideClick,
+            false,
+        );
+        layer.register(app.app_mut(), Band::ContextMenu, second_menu, false);
+        assert_eq!(layer.len(window), 2, "alert + 最新菜单");
+        assert!(
+            !node_exists(&app, window, first_menu.node()),
+            "旧菜单已卸载"
+        );
+        assert!(node_exists(&app, window, second_menu.node()));
     }
 }

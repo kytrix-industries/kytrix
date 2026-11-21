@@ -20,7 +20,7 @@
 //! | 能力 | 落点 |
 //! |---|---|
 //! | 12 向 placement（4 边 × 3 对齐） | [`Placement`] + [`resolve_origin`]（纯函数） |
-//! | flip（首选边放不下时翻到对边） | [`PlacementConfig::flip`] + [`resolve_origin`] |
+//! | flip（**主轴**放不下时翻到对边，横轴交给 clamp） | [`PlacementConfig::flip`] + [`resolve_origin`] |
 //! | clamp（视口内，含视口边距） | [`PlacementConfig::margin`] + [`resolve_origin`] |
 //! | 锚点几何读取（含滚动容器偏移） | [`anchor_rect`]（`Window::tree` 的布局盒 − 祖先滚动偏移） |
 //! | 面板实测后纠位 | [`Overlay::place`] / [`Overlay::sync`]（measure-then-place） |
@@ -40,9 +40,14 @@
 //! - **遮罩是浮层自己的子节点**：与浮层同生命周期（引擎的「点击外部关闭」只移除浮层节点），
 //!   负偏移铺满窗口；因为 `interactive: false`，命中会落到背景节点 ⇒ 引擎的
 //!   `outside_click_target` 判定「点在浮层外」，于是「点遮罩 = 点外部」自然成立。
-//! - **入场位置可能晚一帧**：浮层首帧不知道自己的尺寸（引擎只有 `OverlayPlacement::Anchor`
-//!   的 4 向纠位，没有应用层 12 向 placement 的自动再求值），所以首帧按零尺寸落位、
-//!   [`Overlay::sync`] 在下一帧按实测尺寸纠位（最多两帧收敛，收敛后零工作，I3）。
+//! - **首帧不显示**：浮层刚建出来时还不知道自己的尺寸（引擎只有 `OverlayPlacement::Anchor`
+//!   的 4 向纠位，没有应用层 12 向 placement 的自动再求值），首帧若直接画会落在「零尺寸
+//!   候选位置」上跳一下。面板 / 遮罩在首次实测（[`Overlay::place`] 读到非零尺寸）之前
+//!   `StylePatch.visible = false`，位置由 [`Overlay::sync`] 在下一帧按实测尺寸纠位后一起显示
+//!   （最多两帧收敛，收敛后零工作，I3）；`fade: false` 因此也没有跳变。
+//! - **参数非法是强类型错误**：`gap` / `margin` 为 NaN / ±∞ 时 [`Overlay::open`] 返回
+//!   [`OverlayError::PlacementConfig`]（纯函数 [`resolve_origin`] 对同样的输入回退
+//!   [`Point::ZERO`]，两者是「不 panic 的兜底」与「调用方配置错误」两个不同层）。
 //!
 //! # 用法（组合根）
 //!
@@ -68,6 +73,7 @@
 
 use std::{
     cell::{Cell, RefCell},
+    fmt,
     rc::Rc,
 };
 
@@ -91,7 +97,7 @@ use ui_core::{
         color::Color,
         style::{ShadowSpec, Style, StylePatch},
     },
-    window::WindowId,
+    window::{FrameIndex, WindowId},
 };
 
 use crate::{
@@ -203,18 +209,80 @@ impl Default for PlacementConfig {
     }
 }
 
+impl PlacementConfig {
+    /// 校验参数：`gap` / `margin` 必须有限（NaN / ±∞ 会让落点也是非有限值）。
+    ///
+    /// 纯函数 [`resolve_origin`] 对同样的输入回退 [`Point::ZERO`]（不 panic 的安全兜底）；
+    /// [`Overlay::open`] 用本方法把「调用方配置错误」变成强类型错误，而不是悄悄落回 (0, 0)。
+    fn validate(self) -> Result<(), OverlayError> {
+        if self.gap.is_finite() && self.margin.is_finite() {
+            Ok(())
+        } else {
+            Err(OverlayError::PlacementConfig {
+                gap: self.gap,
+                margin: self.margin,
+            })
+        }
+    }
+}
+
+/// 浮层的强类型错误。
+#[derive(Debug)]
+pub enum OverlayError {
+    /// 定位参数非法：`gap` / `margin` 必须有限。
+    PlacementConfig {
+        /// 原始间隙。
+        gap: f32,
+        /// 原始视口边距。
+        margin: f32,
+    },
+    /// 引擎错误（窗口关闭 / 建树失败等）原样传播。
+    Engine(EngineError),
+}
+
+impl From<EngineError> for OverlayError {
+    fn from(error: EngineError) -> Self {
+        Self::Engine(error)
+    }
+}
+
+impl fmt::Display for OverlayError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PlacementConfig { gap, margin } => write!(
+                formatter,
+                "invalid overlay placement config: gap {gap} / margin {margin} must be finite"
+            ),
+            Self::Engine(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for OverlayError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PlacementConfig { .. } => None,
+            Self::Engine(error) => Some(error),
+        }
+    }
+}
+
 /// 把锚点包围盒 / 浮层尺寸 / 视口解成浮层左上角（**12 向 + flip + clamp** 的唯一实现）。
 ///
-/// 语义（与 CSS anchor positioning / Floating UI 的 `flip` + `shift` 同型）：
+/// 语义（与旧 `gpui_base::Positioner` 的 `side` + `margin` + `offset` 同型，并补上 12 向组合）：
 ///
 /// 1. 先按首选边的「另一条轴对齐」算出候选位置；
-/// 2. `flip` 时若候选位置在视口（内缩 `margin`）里放不下，就翻到对边——对边完整放得下才翻；
-///    两边都放不下时比较可用空间，翻到空间更大的一边（仍由下一步 clamp 兜底）；
+/// 2. `flip` 时**只看主轴**：首选边在主轴方向放不下（Bottom 只看锚点下方空间够不够浮层高度，
+///    Top / Left / Right 对称），才考虑对边 —— 对边主轴放得下就翻；两边都放不下时比较主轴
+///    可用空间，翻到空间更大的一边。**横轴永不触发 flip**（旧 `Positioner` 的语义）：
+///    横轴越界由下一步 clamp 平移解决，否则「下方放得下、只是左右稍越界」的菜单 / 提示会
+///    莫名其妙跑到上方；
 /// 3. 最后沿两条轴 clamp 进 `[margin, 视口 - margin - 浮层尺寸]`；浮层比视口还大时贴 `margin`
 ///    （与 CSS `position: fixed` 的 overscroll 行为一致：不把浮层推到负坐标）。
 ///
-/// 非有限输入（NaN / ±∞）返回 [`Point::ZERO`]（与引擎 `hit_test` 的「非有限 ⇒ 不命中」同向的
-/// 安全兜底：宁可落在左上角也不 panic）。
+/// 非有限输入（NaN / ±∞，含锚点 / 尺寸 / 视口 / `gap` / `margin`）返回 [`Point::ZERO`]（与引擎
+/// `hit_test` 的「非有限 ⇒ 不命中」同向的安全兜底：宁可落在左上角也不 panic）。调用方配置错误
+/// 走 [`Overlay::open`] 的强类型错误（[`OverlayError::PlacementConfig`]），不依赖本兜底。
 #[must_use]
 pub fn resolve_origin(
     anchor: Rect,
@@ -228,22 +296,17 @@ pub fn resolve_origin(
         || !panel.height.is_finite()
         || !viewport.width.is_finite()
         || !viewport.height.is_finite()
+        || !config.gap.is_finite()
+        || !config.margin.is_finite()
     {
         return Point::ZERO;
     }
     let gap = config.gap.max(0.0);
     let margin = config.margin.max(0.0);
     let mut side = placement.side;
-    let preferred = candidate(anchor, panel, placement, gap);
-    if config.flip && !fits(preferred, viewport, margin) {
+    if config.flip && !main_axis_fits(anchor, panel, side, viewport, gap, margin) {
         let opposite = side.opposite();
-        let alternative = candidate(
-            anchor,
-            panel,
-            Placement::new(opposite, placement.align),
-            gap,
-        );
-        if fits(alternative, viewport, margin)
+        if main_axis_fits(anchor, panel, opposite, viewport, gap, margin)
             || available(anchor, opposite, viewport, gap, margin)
                 > available(anchor, side, viewport, gap, margin)
         {
@@ -317,13 +380,22 @@ fn aligned_start(anchor_origin: f32, anchor_size: f32, panel_size: f32, align: A
     }
 }
 
-/// 候选矩形是否完整落在视口内（四边内缩 `margin`，留 0.5 px 浮点容差）。
-fn fits(rect: Rect, viewport: Size, margin: f32) -> bool {
-    let max = rect.max();
-    rect.origin.x >= margin - 0.5
-        && rect.origin.y >= margin - 0.5
-        && max.x <= viewport.width - margin + 0.5
-        && max.y <= viewport.height - margin + 0.5
+/// 首选边在**主轴**方向是否放得下（旧 `Positioner::side` 的判据；横轴不参与，0.5 px 容差）。
+fn main_axis_fits(
+    anchor: Rect,
+    panel: Size,
+    side: Side,
+    viewport: Size,
+    gap: f32,
+    margin: f32,
+) -> bool {
+    const TOLERANCE: f32 = 0.5;
+    match side {
+        Side::Bottom => anchor.max().y + gap + panel.height <= viewport.height - margin + TOLERANCE,
+        Side::Top => anchor.origin.y - gap - panel.height >= margin - TOLERANCE,
+        Side::Right => anchor.max().x + gap + panel.width <= viewport.width - margin + TOLERANCE,
+        Side::Left => anchor.origin.x - gap - panel.width >= margin - TOLERANCE,
+    }
 }
 
 /// 某条边方向上「锚点边到视口边」的可用空间（flip 的次级判据）。
@@ -622,6 +694,8 @@ struct OverlayState {
     anchor: Option<Anchor>,
     /// 上次求值的面板左上角（`None` = 还没有求过）。
     origin: Option<Point>,
+    /// 打开时窗口的提交序号：只有**至少一帧之后**才揭开面板（首帧按零尺寸落位，见 `place`）。
+    frame_at_open: Option<FrameIndex>,
     /// 遮罩上次写下的几何（`(原点, 视口)`；避免每帧写 style 造成布局抖动）。
     scrim_geometry: Option<(Point, Size)>,
     /// 是否正在淡出（`sync` 在进度归零后真正卸载）。
@@ -636,6 +710,11 @@ struct OverlayInner {
     scope: SignalScope,
     /// 是否打开（触发器可以用 `bind_style` 读它画按下态）。
     open: Signal<bool>,
+    /// 面板 / 遮罩是否已过首次实测、可以显示（首帧按零尺寸落位，直接画会跳位）。
+    ///
+    /// 用 `Signal`（不是 `Transient`）：写它要失效面板的 `bind_style`（`visible`）并请求一帧，
+    /// 这正是「测量后显示」那一步。稳态恒为 `true`、不再写。
+    revealed: Signal<bool>,
     /// 淡入淡出进度（`0` = 全透明，`1` = 不透明；逐图元 alpha）。
     fade: Transient<f32>,
     fade_animation: Cell<Option<AnimationId>>,
@@ -662,6 +741,7 @@ impl Overlay {
         Self {
             inner: Rc::new(OverlayInner {
                 open: app.signal_scoped(scope, false),
+                revealed: app.signal_scoped(scope, false),
                 fade: app.transient_scoped(scope, 0.0),
                 key,
                 theme,
@@ -729,50 +809,65 @@ impl Overlay {
     /// 角色，内容只负责内部结构。内容建完立即登记图层带并启动淡入；尺寸要等布局，定位由
     /// [`Overlay::sync`] 纠位。
     ///
+    /// 「已打开」的判据是**引擎里节点还活着**：引擎侧已被关闭（点外部 / Esc / `Dismiss`）但
+    /// [`Overlay::sync`] 还没收尾时，句柄仍是 `Some`，这里做存活探测后走完整重开，不把这次
+    /// 打开静默丢掉（快速「点外部关闭 → 再点触发器」会走到）。
+    ///
+    /// 锚点节点已卸载（[`Anchor::Node`] 读不到布局盒）时返回 `Ok(false)`：没有可依附的东西，
+    /// 不建浮层（旧 dropdown 触发器消失的同义）。
+    ///
     /// # Errors
-    /// `UnknownWindow`（窗口已关闭）；`content` 抛出的建树错误（`StaleNode` 等）原样传播
-    /// （此时浮层节点已卸载，不会留下半成品）。
+    /// [`OverlayError::PlacementConfig`]（`gap` / `margin` 非有限）；[`OverlayError::Engine`]：
+    /// `UnknownWindow`（窗口已关闭）/ `content` 抛出的建树错误（`StaleNode` 等，此时浮层节点
+    /// 已卸载，不会留下半成品）。
     pub fn open(
         &self,
         app: &mut App,
         window: WindowId,
         anchor: Anchor,
         content: impl FnOnce(&mut NodeTree, NodeId) -> Result<(), EngineError>,
-    ) -> Result<bool, EngineError> {
+    ) -> Result<bool, OverlayError> {
+        self.inner.options.placement_config().validate()?;
         if app.window(window).is_none() {
-            return Err(EngineError::UnknownWindow { window });
+            return Err(EngineError::UnknownWindow { window }.into());
         }
         // 已打开：同窗只换锚点（context_menu 换位置 / select 重新对齐），异窗先关旧窗。
         let existing = self.inner.state.borrow().handle;
         if let Some(handle) = existing {
             if handle.window() == window {
-                let (panel, scrim, was_closing) = {
-                    let mut state = self.inner.state.borrow_mut();
-                    state.anchor = Some(anchor);
-                    let was_closing = std::mem::take(&mut state.closing);
-                    (state.panel, state.scrim, was_closing)
-                };
-                // 正在淡出时重新打开 = 撤销关闭并淡回不透明（快速移开又移回指针的提示场景）。
-                if was_closing && let Some(panel) = panel {
-                    self.start_fade(app, window, panel, scrim, 1.0);
+                if self.is_alive(app, window) {
+                    let (panel, scrim, was_closing) = {
+                        let mut state = self.inner.state.borrow_mut();
+                        state.anchor = Some(anchor);
+                        let was_closing = std::mem::take(&mut state.closing);
+                        (state.panel, state.scrim, was_closing)
+                    };
+                    // 正在淡出时重新打开 = 撤销关闭并淡回不透明（快速移开又移回指针的提示场景）。
+                    if was_closing && let Some(panel) = panel {
+                        self.start_fade(app, window, panel, scrim, 1.0);
+                    }
+                    self.place(app);
+                    return Ok(false);
                 }
-                self.place(app);
-                return Ok(false);
+                // 引擎已关闭但还没 sync：死句柄走完整重开（R06）。
+                self.finish_close(app);
+            } else {
+                self.close_now(app);
             }
-            self.close_now(app);
         }
         let viewport = app
             .window(window)
             .map_or(Size::ZERO, |target| target.size());
-        let initial_origin = anchor_rect(app, window, anchor).map_or(Point::ZERO, |rect| {
-            resolve_origin(
-                rect,
-                Size::ZERO,
-                viewport,
-                self.inner.options.placement,
-                self.inner.options.placement_config(),
-            )
-        });
+        let Some(anchor_rect) = anchor_rect(app, window, anchor) else {
+            return Ok(false);
+        };
+        let initial_origin = resolve_origin(
+            anchor_rect,
+            Size::ZERO,
+            viewport,
+            self.inner.options.placement,
+            self.inner.options.placement_config(),
+        );
         let engine_overlay = app.create_overlay(
             window,
             EngineOverlayOptions {
@@ -804,9 +899,10 @@ impl Overlay {
             Err(error) => {
                 // 内容建树失败：把刚铸出的浮层节点卸载，不留半成品。
                 let _ = app.close_overlay(&engine_overlay);
-                return Err(error);
+                return Err(error.into());
             }
         };
+        let frame_at_open = app.window(window).map(|target| target.frame_index());
         {
             let mut state = self.inner.state.borrow_mut();
             state.window = Some(window);
@@ -816,18 +912,23 @@ impl Overlay {
             state.scrim = scrim;
             state.anchor = Some(anchor);
             state.origin = Some(initial_origin);
+            state.frame_at_open = frame_at_open;
             state.scrim_geometry = scrim.map(|_| (initial_origin, viewport));
             state.closing = false;
         }
         self.inner.layer.register(
+            app,
             self.inner.options.band,
             engine_overlay,
             self.inner.options.modal,
         );
         let _ = app.write(&self.inner.open, true);
         self.start_fade(app, window, panel, scrim, 1.0);
-        // 首帧按零尺寸落位，布局后由 `sync` 纠位；这里先让遮罩几何正确。
+        // 首帧按零尺寸落位：面板 / 遮罩在首次实测前不可见（`place` 揭开），这里先让遮罩几何正确。
         let _ = self.sync_scrim(app, window, initial_origin, viewport);
+        // 首帧层带排序：新浮层可能属于更低的层带（alert 之上的 dialog），等下一次 sync 会让第一
+        // 帧的 z 序是错的（R14）。
+        let _ = self.inner.layer.enforce(app, window);
         Ok(true)
     }
 
@@ -868,6 +969,21 @@ impl Overlay {
             self.inner.options.placement_config(),
         );
         let mut changed = false;
+        // 揭开面板：打开后至少过了一帧（布局已跑），此处的实测尺寸才可信。首帧按零尺寸落位时
+        // 一直不可见，`fade: false` 因此也不跳位（R14）；帧序号判据不依赖面板尺寸，空内容 /
+        // 零内边距的面板同样会被揭开。
+        let frame_at_open = self.inner.state.borrow().frame_at_open;
+        let measured = frame_at_open.is_none_or(|opened| {
+            app.window(window)
+                .is_some_and(|target| target.frame_index() != opened)
+        });
+        if !*app.read(&self.inner.revealed) && measured {
+            let _ = app.write(&self.inner.revealed, true);
+            if !self.inner.options.fade {
+                app.write_transient(&self.inner.fade, 1.0);
+            }
+            changed = true;
+        }
         let previous = self.inner.state.borrow().origin;
         let moved = previous.is_none_or(|previous| {
             (previous.x - origin.x).abs() >= 0.5 || (previous.y - origin.y).abs() >= 0.5
@@ -916,13 +1032,19 @@ impl Overlay {
     }
 
     /// 关闭浮层。开启了淡出时先播淡出（节点保留到进度归零，由 [`Overlay::sync`] 卸载）；
-    /// 否则立即卸载。返回是否有浮层被关。
+    /// 否则立即卸载。返回是否有浮层被关（已经关闭 / 已经在淡出 ⇒ `true`，幂等）。
+    ///
+    /// **幂等**：淡出中再次 `close` 是 no-op，不会跳过淡出直接卸载（旧实现 `Presence` 同义）；
+    /// 需要立刻消失时显式用 [`Overlay::close_now`]。
     pub fn close(&self, app: &mut App) -> bool {
         if self.inner.state.borrow().handle.is_none() {
             return false;
         }
-        let closing = self.inner.state.borrow().closing;
-        if !self.inner.options.fade || closing || self.progress(app) <= 0.0 {
+        // 已经在淡出：第二次关闭不升级成立即卸载（闪断），也不重启动画（重入）。
+        if self.inner.state.borrow().closing {
+            return true;
+        }
+        if !self.inner.options.fade || self.progress(app) <= 0.0 {
             return self.close_now(app);
         }
         self.inner.state.borrow_mut().closing = true;
@@ -940,13 +1062,12 @@ impl Overlay {
     /// 立即卸载（不播淡出）：引擎卸载浮层节点（连同它的遮罩子节点）+ 恢复焦点 + 移除图层登记。
     /// 返回是否有浮层被关。
     pub fn close_now(&self, app: &mut App) -> bool {
-        let handle = self.inner.state.borrow_mut().handle.take();
-        let Some(handle) = handle else {
+        let Some(handle) = self.inner.state.borrow().handle else {
             return false;
         };
-        self.inner.layer.remove(&handle);
         self.cancel_fade(app);
         let closed = app.close_overlay(&handle);
+        // 状态收尾（含 Layer 登记移除）只有 `finish_close` 一处（R03）。
         self.finish_close(app);
         closed
     }
@@ -958,8 +1079,16 @@ impl Overlay {
     }
 
     /// 引擎卸载后的状态收尾（不碰引擎树：节点已经没了）。
+    ///
+    /// **关闭路径的唯一收尾**：程序化关闭、淡出收尾、外部卸载探测（[`Overlay::sync`]）都走这里。
+    /// 它负责把 Layer 登记一起摘掉 —— 否则引擎侧关闭（点外部 / Esc / `Dismiss`）后 `desired`
+    /// 永远失配，只要有第二个浮层存活就每轮 `enforce` 重排 + 出帧（R03）。
     fn finish_close(&self, app: &mut App) {
         self.cancel_fade(app);
+        let handle = self.inner.state.borrow_mut().handle.take();
+        if let Some(handle) = handle {
+            self.inner.layer.remove(&handle);
+        }
         {
             let mut state = self.inner.state.borrow_mut();
             state.window = None;
@@ -969,11 +1098,22 @@ impl Overlay {
             state.scrim = None;
             state.anchor = None;
             state.origin = None;
+            state.frame_at_open = None;
             state.scrim_geometry = None;
             state.closing = false;
         }
         let _ = app.write(&self.inner.open, false);
+        let _ = app.write(&self.inner.revealed, false);
         app.write_transient(&self.inner.fade, 0.0);
+    }
+
+    /// 引擎侧浮层节点是否还活着（外部关闭后句柄仍为 `Some`，直到下一次 [`Overlay::sync`]）。
+    fn is_alive(&self, app: &App, window: WindowId) -> bool {
+        let Some(handle) = self.inner.state.borrow().handle else {
+            return false;
+        };
+        app.window(window)
+            .is_some_and(|target| target.tree().get(handle.node()).is_ok())
     }
 
     /// 建模态遮罩：铺满窗口、`interactive: false`、alpha = 主题 Scrim × density × 淡入进度。
@@ -987,6 +1127,7 @@ impl Overlay {
     ) -> Result<NodeId, EngineError> {
         let theme = self.inner.theme.clone();
         let fade = self.inner.fade;
+        let revealed = self.inner.revealed;
         let density = if scrim.density.is_finite() {
             scrim.density.clamp(0.0, 1.0)
         } else {
@@ -997,11 +1138,12 @@ impl Overlay {
             .style(scrim_style(origin, viewport))
             .bind_style(move |cx| {
                 // 读主题信号（深浅切换失效）+ 淡入进度（动画驱动）；遮罩不可命中 ⇒ 命中穿透背景，
-                // 于是「点遮罩」在引擎眼里就是「点浮层外部」。
+                // 于是「点遮罩」在引擎眼里就是「点浮层外部」。首次实测前与面板一起隐藏。
                 let progress = *cx.read_transient(&fade);
                 StylePatch {
                     background: Some(theme.role(cx, Role::Scrim)),
                     opacity: Some(density * progress),
+                    visible: Some(*cx.read(&revealed)),
                     interactive: Some(false),
                     ..StylePatch::default()
                 }
@@ -1018,6 +1160,7 @@ impl Overlay {
     fn build_panel(&self, tree: &mut NodeTree, parent: NodeId) -> Result<NodeId, EngineError> {
         let theme = self.inner.theme.clone();
         let fade = self.inner.fade;
+        let revealed = self.inner.revealed;
         let surface = self.inner.options.surface;
         let mut paint = PaintBuilder::new().rounded(surface.corner_radius);
         if let Some(shadow) = surface.shadow {
@@ -1037,6 +1180,8 @@ impl Overlay {
             .bind_style(move |cx| StylePatch {
                 background: Some(theme.role(cx, surface.background)),
                 opacity: Some(*cx.read_transient(&fade)),
+                // 首次实测前不画（首帧按零尺寸落位，画出来会跳位；内容子节点也一起隐藏）。
+                visible: Some(*cx.read(&revealed)),
                 ..StylePatch::default()
             })
             .a11y(A11yOverride {
@@ -1078,7 +1223,10 @@ impl Overlay {
     ) {
         let fade = self.inner.fade;
         if !self.inner.options.fade {
-            app.write_transient(&fade, to);
+            // `fade: false` 也不在首帧显示：面板要等 `place` 读到实测尺寸才「揭开」，否则会先
+            // 出现在零尺寸候选位置再跳到正确位置（可见跳变）。已经显示过的重入直接落值。
+            let revealed = *app.read(&self.inner.revealed);
+            app.write_transient(&fade, if revealed { to } else { 0.0 });
             return;
         }
         let mut nodes = Vec::with_capacity(2);
@@ -1288,6 +1436,136 @@ mod tests {
             "负间隙 / 负边距按 0 处理"
         );
     }
+
+    /// 非有限 `gap` / `margin` 也走兜底（R18）：不能产出 `Point(inf, inf)`。
+    #[test]
+    fn non_finite_config_falls_back_to_the_origin() {
+        for broken in [
+            PlacementConfig {
+                gap: f32::INFINITY,
+                margin: 4.0,
+                flip: true,
+            },
+            PlacementConfig {
+                gap: 4.0,
+                margin: f32::NAN,
+                flip: true,
+            },
+        ] {
+            assert_eq!(
+                resolve_origin(ANCHOR, PANEL, VIEWPORT, Placement::BOTTOM_START, broken),
+                Point::ZERO,
+                "非有限定位参数必须回退原点：{broken:?}"
+            );
+        }
+    }
+
+    /// R08：横轴越界**不触发**主轴翻转（旧 `Positioner` 只按主轴 flip，横轴交给 clamp）。
+    #[test]
+    fn cross_axis_overflow_does_not_flip_for_all_twelve_placements() {
+        let cfg = config(true);
+        // 锚点贴左右边（主轴放得下、横轴越界）或贴上下边（Right/Left 的横轴越界）。
+        let cases = [
+            (
+                Rect::new(760.0, 200.0, 40.0, 20.0),
+                Placement::BOTTOM_START,
+                (676.0, 224.0),
+            ),
+            (
+                Rect::new(760.0, 200.0, 40.0, 20.0),
+                Placement::BOTTOM,
+                (676.0, 224.0),
+            ),
+            (
+                Rect::new(10.0, 200.0, 40.0, 20.0),
+                Placement::BOTTOM_END,
+                (4.0, 224.0),
+            ),
+            (
+                Rect::new(760.0, 300.0, 40.0, 20.0),
+                Placement::TOP_START,
+                (676.0, 216.0),
+            ),
+            (
+                Rect::new(760.0, 300.0, 40.0, 20.0),
+                Placement::TOP,
+                (676.0, 216.0),
+            ),
+            (
+                Rect::new(10.0, 300.0, 40.0, 20.0),
+                Placement::TOP_END,
+                (4.0, 216.0),
+            ),
+            (
+                Rect::new(200.0, 590.0, 40.0, 20.0),
+                Placement::RIGHT_START,
+                (244.0, 516.0),
+            ),
+            (
+                Rect::new(200.0, 590.0, 40.0, 20.0),
+                Placement::RIGHT,
+                (244.0, 516.0),
+            ),
+            (
+                Rect::new(200.0, 590.0, 40.0, 20.0),
+                Placement::RIGHT_END,
+                (244.0, 516.0),
+            ),
+            (
+                Rect::new(300.0, 590.0, 40.0, 20.0),
+                Placement::LEFT_START,
+                (176.0, 516.0),
+            ),
+            (
+                Rect::new(300.0, 590.0, 40.0, 20.0),
+                Placement::LEFT,
+                (176.0, 516.0),
+            ),
+            (
+                Rect::new(300.0, 590.0, 40.0, 20.0),
+                Placement::LEFT_END,
+                (176.0, 516.0),
+            ),
+        ];
+        for (anchor, placement, (x, y)) in cases {
+            assert_eq!(
+                resolve_origin(anchor, PANEL, VIEWPORT, placement, cfg),
+                Point::new(x, y),
+                "{placement:?} 横轴越界只 clamp、不翻转（anchor {anchor:?}）"
+            );
+        }
+    }
+
+    /// R08：主轴放不下时翻到对边（12 向逐一）。
+    #[test]
+    fn main_axis_overflow_flips_for_all_twelve_placements() {
+        let cfg = config(true);
+        let narrow = Rect::new(340.0, 590.0, 100.0, 20.0);
+        let low = Rect::new(340.0, 0.0, 100.0, 20.0);
+        let right = Rect::new(760.0, 260.0, 40.0, 40.0);
+        let left = Rect::new(0.0, 260.0, 40.0, 40.0);
+        let cases = [
+            (narrow, Placement::BOTTOM_START, (340.0, 506.0)),
+            (narrow, Placement::BOTTOM, (330.0, 506.0)),
+            (narrow, Placement::BOTTOM_END, (320.0, 506.0)),
+            (low, Placement::TOP_START, (340.0, 24.0)),
+            (low, Placement::TOP, (330.0, 24.0)),
+            (low, Placement::TOP_END, (320.0, 24.0)),
+            (right, Placement::RIGHT_START, (636.0, 260.0)),
+            (right, Placement::RIGHT, (636.0, 240.0)),
+            (right, Placement::RIGHT_END, (636.0, 220.0)),
+            (left, Placement::LEFT_START, (44.0, 260.0)),
+            (left, Placement::LEFT, (44.0, 240.0)),
+            (left, Placement::LEFT_END, (44.0, 220.0)),
+        ];
+        for (anchor, placement, (x, y)) in cases {
+            assert_eq!(
+                resolve_origin(anchor, PANEL, VIEWPORT, placement, cfg),
+                Point::new(x, y),
+                "{placement:?} 主轴放不下必须翻到对边（anchor {anchor:?}）"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1308,7 +1586,8 @@ mod ui_tests {
     };
 
     use super::{
-        Anchor, DismissPolicy, Overlay, OverlayA11y, OverlayOptions, OverlaySurface, Scrim,
+        Anchor, DismissPolicy, Overlay, OverlayA11y, OverlayError, OverlayOptions, OverlaySurface,
+        Scrim,
     };
     use crate::{
         kit::layer::Layer,
@@ -1350,6 +1629,8 @@ mod ui_tests {
         window: WindowId,
         root: NodeId,
         theme: ThemeHandle,
+        /// 组合根共享的 Layer（多个浮层必须登记到同一张层带表）。
+        layer: Layer,
     }
 
     impl Harness {
@@ -1363,6 +1644,7 @@ mod ui_tests {
                 window,
                 root,
                 theme,
+                layer: Layer::new(),
             }
         }
 
@@ -1370,7 +1652,7 @@ mod ui_tests {
             Overlay::new(
                 self.app.app_mut(),
                 self.theme.clone(),
-                Layer::new(),
+                self.layer.clone(),
                 key,
                 options,
             )
@@ -1909,5 +2191,331 @@ mod ui_tests {
             overlay.close_now(harness.app.app_mut());
             let _ = harness.app.drain().expect("帧");
         }
+    }
+
+    #[test]
+    fn an_engine_side_close_cleans_the_layer_entry_and_stops_enforcing() {
+        // R03：点外部 / Esc 是引擎直接卸载节点。关闭路径必须摘掉 Layer 登记；否则只要还有
+        // 第二个浮层存活，`enforce` 每轮都判定失配并重排 + 出帧（I3 破坏）。
+        let mut harness = Harness::new();
+        let anchor = harness.anchor();
+        let background = harness.overlay(
+            "background",
+            OverlayOptions {
+                dismiss: DismissPolicy::Explicit,
+                ..options()
+            },
+        );
+        let foreground = harness.overlay("foreground", options());
+        assert!(harness.open(&background, Anchor::node(anchor)));
+        assert!(harness.open(&foreground, Anchor::node(anchor)));
+        assert_eq!(harness.layer.len(harness.window), 2);
+
+        // 点外部关掉最上层（foreground）：引擎立即卸载节点，kit 下一次 sync 才收尾。
+        harness.click(Point::new(10.0, 10.0));
+        assert!(
+            foreground.sync(harness.app.app_mut()),
+            "sync 必须发现引擎侧关闭"
+        );
+        assert!(!foreground.is_open(harness.app.app()));
+        assert_eq!(
+            harness.layer.len(harness.window),
+            1,
+            "关闭路径必须摘掉 Layer 登记（否则登记泄漏）"
+        );
+        assert!(
+            !background.sync(harness.app.app_mut()),
+            "稳态：没有登记失配 ⇒ enforce 零重排"
+        );
+        let outcome = harness
+            .app
+            .app_mut()
+            .frame(harness.window)
+            .expect("窗口")
+            .expect("帧");
+        assert_eq!(
+            outcome,
+            FrameOutcome::Idle,
+            "关闭收尾后不得每轮出帧（R03 的空转）"
+        );
+    }
+
+    #[test]
+    fn reopening_after_an_engine_side_close_builds_a_new_overlay() {
+        // R06：引擎已关（节点没了）但 kit 还没 sync 时重开，不能返回「本来就开着」把这次
+        // 打开丢掉。
+        let mut harness = Harness::new();
+        let anchor = harness.anchor();
+        let overlay = harness.overlay(
+            "menu",
+            OverlayOptions {
+                dismiss: DismissPolicy::Explicit,
+                ..options()
+            },
+        );
+        assert!(harness.open(&overlay, Anchor::node(anchor)));
+        let old_node = overlay.overlay_node().expect("浮层节点");
+        let _ = harness
+            .app
+            .inject(InputEvent::key_down(KeyCode::Escape, Modifiers::empty()));
+        let _ = harness.app.drain().expect("帧");
+        assert!(
+            harness
+                .app
+                .app()
+                .window(harness.window)
+                .expect("窗口")
+                .tree()
+                .get(old_node)
+                .is_err(),
+            "Esc 已卸载引擎节点（kit 尚未 sync）"
+        );
+        assert!(
+            overlay.is_open(harness.app.app()),
+            "sync 之前 kit 状态仍是打开"
+        );
+
+        let reopened = overlay
+            .open(
+                harness.app.app_mut(),
+                harness.window,
+                Anchor::node(anchor),
+                build_content,
+            )
+            .expect("重开");
+        assert!(reopened, "引擎已关闭时重开必须真的打开，不能静默丢掉");
+        let new_node = overlay.overlay_node().expect("新浮层节点");
+        assert_ne!(new_node, old_node, "重开建的是新浮层");
+        assert!(overlay.is_open(harness.app.app()));
+        assert_eq!(
+            harness.layer.len(harness.window),
+            1,
+            "旧登记被替换，不得重复登记"
+        );
+    }
+
+    #[test]
+    fn closing_twice_during_the_fade_is_idempotent() {
+        // R10：淡出中第二次 close 不得跳过淡出直接卸载（闪断），也不得重入。
+        let mut harness = Harness::new();
+        let anchor = harness.anchor();
+        let overlay = harness.overlay(
+            "menu",
+            OverlayOptions {
+                fade: true,
+                ..options()
+            },
+        );
+        assert!(harness.open(&overlay, Anchor::node(anchor)));
+        harness.app.advance(Duration::from_millis(200));
+        let _ = harness.app.drain().expect("帧");
+        let _ = overlay.sync(harness.app.app_mut());
+        assert_eq!(overlay.progress(harness.app.app()), 1.0, "淡入完成");
+        let node = overlay.overlay_node().expect("浮层节点");
+
+        assert!(overlay.close(harness.app.app_mut()), "第一次关闭");
+        assert!(
+            overlay.close(harness.app.app_mut()),
+            "第二次关闭幂等返回 true"
+        );
+        assert!(
+            overlay.is_open(harness.app.app()),
+            "仍在关闭中（is_open 要到淡出收尾才 false）"
+        );
+        assert!(
+            harness
+                .app
+                .app()
+                .window(harness.window)
+                .expect("窗口")
+                .tree()
+                .get(node)
+                .is_ok(),
+            "第二次 close 不得跳过淡出直接卸载节点"
+        );
+
+        // 淡出结束后由 sync 收尾，关闭只发生一次。
+        harness.app.advance(Duration::from_millis(200));
+        let _ = harness.app.drain().expect("帧");
+        assert!(overlay.sync(harness.app.app_mut()), "淡出收尾");
+        assert!(!overlay.is_open(harness.app.app()));
+        assert!(
+            harness
+                .app
+                .app()
+                .window(harness.window)
+                .expect("窗口")
+                .tree()
+                .get(node)
+                .is_err(),
+            "节点在淡出结束后卸载"
+        );
+        assert!(
+            !overlay.close(harness.app.app_mut()),
+            "已关闭后再关返回 false"
+        );
+    }
+
+    #[test]
+    fn a_fade_less_panel_is_hidden_on_its_first_frame() {
+        // R14：首帧按零尺寸落位。`fade: false` 时不能直接画出来（可见跳位），必须先隐藏，
+        // 等 `sync` 读到实测尺寸、纠位后一起显示。
+        let mut harness = Harness::new();
+        let anchor = harness.anchor();
+        let overlay = harness.overlay("menu", options());
+        assert!(
+            overlay
+                .open(
+                    harness.app.app_mut(),
+                    harness.window,
+                    Anchor::node(anchor),
+                    build_content
+                )
+                .expect("打开")
+        );
+        assert_eq!(
+            overlay.progress(harness.app.app()),
+            0.0,
+            "首帧不显示（等待实测）"
+        );
+        let _ = harness.app.drain().expect("首帧");
+        assert_eq!(
+            overlay.progress(harness.app.app()),
+            0.0,
+            "首次 sync 之前仍不显示"
+        );
+
+        assert!(overlay.sync(harness.app.app_mut()), "首次实测后揭开面板");
+        assert_eq!(
+            overlay.progress(harness.app.app()),
+            1.0,
+            "fade=false 揭开即不透明"
+        );
+        let _ = harness.app.drain().expect("第二帧");
+        let panel = harness.bounds(overlay.overlay_node().expect("浮层节点"));
+        assert_eq!(
+            panel.origin,
+            Point::new(ANCHOR.origin.x, ANCHOR.max().y + 4.0),
+            "第二帧在实测后的正确位置"
+        );
+    }
+
+    #[test]
+    fn a_menu_panel_declares_the_menu_role_and_the_scrim_is_hidden() {
+        let mut harness = Harness::new();
+        harness.app.enable_a11y_capture();
+        let anchor = harness.anchor();
+        let menu = harness.overlay(
+            "menu",
+            OverlayOptions {
+                a11y: OverlayA11y::menu("文件"),
+                ..options()
+            },
+        );
+        // a11y 捕获按帧交付：打开后只出这一帧，快照里才有全树（`harness.open` 的 settle 会把
+        // 帧记录推到「没有 a11y 工作」的后续帧，所以这里直接开 + drain）。
+        assert!(
+            menu.open(
+                harness.app.app_mut(),
+                harness.window,
+                Anchor::node(anchor),
+                build_content
+            )
+            .expect("打开菜单")
+        );
+        let _ = harness.app.drain().expect("帧");
+        let menu_panel = menu.panel_node().expect("菜单面板");
+        let snapshot = harness.app.a11y().expect("a11y 快照");
+        let record = snapshot.node_for(menu_panel).expect("菜单面板 a11y");
+        assert_eq!(record.role, A11yRole::Menu, "菜单面板必须声明 Menu");
+        assert_eq!(record.label_text(), Some("文件"));
+
+        let modal = harness.overlay(
+            "dialog",
+            OverlayOptions {
+                modal: true,
+                scrim: Some(Scrim::default()),
+                surface: OverlaySurface::dialog(),
+                a11y: OverlayA11y::dialog("确认"),
+                dismiss: DismissPolicy::Explicit,
+                ..options()
+            },
+        );
+        assert!(
+            modal
+                .open(
+                    harness.app.app_mut(),
+                    harness.window,
+                    Anchor::node(anchor),
+                    build_content
+                )
+                .expect("打开模态")
+        );
+        let _ = harness.app.drain().expect("帧");
+        let scrim = modal.scrim_node().expect("模态遮罩");
+        let snapshot = harness.app.a11y().expect("a11y 快照");
+        let record = snapshot.node_for(scrim).expect("遮罩 a11y");
+        assert_eq!(record.role, A11yRole::Group, "遮罩是装饰组");
+        assert!(record.hidden, "遮罩必须对 AT 隐藏");
+    }
+
+    #[test]
+    fn a_missing_anchor_does_not_open_an_overlay() {
+        // R19：节点锚点的几何读不到（已卸载）时不建浮层，不在 (0,0) 建一个再等下一帧关。
+        let mut harness = Harness::new();
+        let anchor = harness.anchor();
+        {
+            let tree = harness
+                .app
+                .app_mut()
+                .window_mut(harness.window)
+                .expect("窗口")
+                .tree_mut();
+            tree.remove(anchor).expect("移除锚点");
+        }
+        let _ = harness.app.drain().expect("帧");
+        let overlay = harness.overlay("menu", options());
+        assert!(
+            !overlay
+                .open(
+                    harness.app.app_mut(),
+                    harness.window,
+                    Anchor::node(anchor),
+                    build_content
+                )
+                .expect("锚点失效不报错，只是不开"),
+            "锚点失效 ⇒ open 返回 false"
+        );
+        assert!(overlay.overlay_node().is_none(), "不得建浮层节点");
+        assert!(!overlay.is_open(harness.app.app()));
+        assert_eq!(harness.layer.len(harness.window), 0);
+    }
+
+    #[test]
+    fn an_invalid_placement_config_is_a_typed_error() {
+        // R18：非有限 gap / margin 是调用方配置错误，必须走强类型错误，而不是悄悄落到 (0,0)。
+        let mut harness = Harness::new();
+        let anchor = harness.anchor();
+        let overlay = harness.overlay(
+            "menu",
+            OverlayOptions {
+                gap: f32::INFINITY,
+                ..options()
+            },
+        );
+        let error = overlay
+            .open(
+                harness.app.app_mut(),
+                harness.window,
+                Anchor::node(anchor),
+                build_content,
+            )
+            .expect_err("非有限 gap 必须报错");
+        assert!(
+            matches!(error, OverlayError::PlacementConfig { gap, .. } if gap.is_infinite()),
+            "必须是强类型 PlacementConfig 错误，实际 {error:?}"
+        );
+        assert!(overlay.overlay_node().is_none(), "配置错误不得建节点");
+        assert_eq!(harness.layer.len(harness.window), 0);
     }
 }

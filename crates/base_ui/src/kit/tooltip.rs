@@ -18,6 +18,10 @@
 //!   期间每帧一个动画 tick（连续帧由动画驱动，不是空闲出帧）；延迟结束后动画停止、回到 I3。
 //! - **定位 / 淡入淡出 / 关闭**：全部复用 [`Overlay`]（`Band::Tooltip` 层带、`Placement` 12 向、
 //!   `fade`、`Scrim` 不启用）。
+//! - **共享组合根的 Layer**：`Tooltip::new` 必须拿到组合根（或至少与菜单 / 弹层同一个）的
+//!   [`Layer`]。提示是 `Band::Tooltip` 层带里的一员，只有和 context menu / dialog 登记在
+//!   **同一张层带表**里，旧实现的 `POPUP_PRIORITY + 2`（提示画在菜单之上）才成立；每实例私有
+//!   Layer 会让 `Band::Tooltip` 只和自己比较（R09）。
 //! - **不可交互**：提示内容只有文本节点（没有动作、没有 `tab_stop`），浮层非模态（不抢焦点）；
 //!   指针在提示面板上会**离开触发器** ⇒ `sync` 立即收起提示（与旧实现「hover 离开即关」同义）。
 //! - **关闭策略**：`DismissPolicy::Explicit` —— 提示不是可被「点外部」关闭的模态弹层：外部点击
@@ -27,7 +31,8 @@
 //!
 //! - 新增 **500 ms 延迟**（旧实现无延迟；`TooltipOptions::delay` 可调，`Duration::ZERO` = 立即）。
 //! - 新增 **focus 触发**（键盘用户的提示不能只靠 hover）。
-//! - 内容变化（[`Tooltip::set_content`]）在提示显示期间 = 收起，下一次激活重新延迟打开
+//! - 内容变化（[`Tooltip::set_content`]）在提示显示期间 = 先完整收起（淡出），再按**新内容**
+//!   重开：`Overlay::open` 的同窗重入只换锚点、不重建面板内容，所以不能靠它撤销量变化
 //!   （旧实现靠「撤回内容关、恢复内容不复活」的 hover 语义；引擎没有 per-node hover 回调，
 //!   统一由 `sync` 的激活判据驱动）。
 //! - a11y：提示内容根声明 `A11yRole::Tooltip` + 可访问名；**没有** `aria-describedby` 关系
@@ -36,7 +41,8 @@
 //! # 用法
 //!
 //! ```ignore
-//! let tip = Tooltip::new(app, theme.clone(), "save", TooltipOptions::default());
+//! let layer = Layer::new();   // 组合根唯一；菜单 / 对话框 / 提示都登记到它
+//! let tip = Tooltip::new(app, theme.clone(), layer.clone(), "save", TooltipOptions::default());
 //! tip.set_content(Some(TooltipContent::new("保存").shortcut("Ctrl+S")));
 //! tip.attach(app, window, save_button_node);
 //! // 组合根的 on_frame 钩子里：
@@ -68,7 +74,7 @@ use ui_core::{
 
 use crate::{
     kit::{
-        layer::Band,
+        layer::{Band, Layer},
         overlay::{Anchor, DismissPolicy, Overlay, OverlayOptions, OverlaySurface, Placement},
     },
     style_builder::StyleBuilder,
@@ -178,8 +184,10 @@ struct TooltipInner {
     window: Cell<Option<WindowId>>,
     trigger: Cell<Option<NodeId>>,
     content: RefCell<Option<TooltipContent>>,
-    /// 当前已显示的提示内容（内容变化 ⇒ 收起重开）。
+    /// 当前已显示的提示内容（内容变化 ⇒ 收起后按新内容重开）。
     shown: RefCell<Option<TooltipContent>>,
+    /// 内容变化导致的「等旧浮层关闭后重开」标记（见 [`Tooltip::sync`] 的 `Shown` / `Idle`）。
+    pending_restart: Cell<bool>,
 }
 
 /// 提示句柄（`Rc` 浅拷贝）。
@@ -190,9 +198,13 @@ pub struct Tooltip {
 
 impl Tooltip {
     /// 建提示状态（关闭态）。之后 [`Tooltip::set_content`] + [`Tooltip::attach`]。
+    ///
+    /// `layer` 必须是**组合根的共享 Layer**（与菜单 / 对话框同一个）：提示要在
+    /// [`Band::Tooltip`] 层带上参与跨组件 z 序仲裁（R09）。
     pub fn new(
         app: &mut App,
         theme: ThemeHandle,
+        layer: Layer,
         key: impl Into<SmolStr>,
         options: TooltipOptions,
     ) -> Self {
@@ -201,7 +213,7 @@ impl Tooltip {
         let overlay = Overlay::new(
             app,
             theme.clone(),
-            crate::kit::layer::Layer::new(),
+            layer,
             format_smolstr!("{key}:overlay"),
             OverlayOptions {
                 placement: options.placement,
@@ -235,6 +247,7 @@ impl Tooltip {
                 trigger: Cell::new(None),
                 content: RefCell::new(None),
                 shown: RefCell::new(None),
+                pending_restart: Cell::new(false),
             }),
         }
     }
@@ -310,12 +323,21 @@ impl Tooltip {
                 let has_content = self.inner.content.borrow().is_some();
                 if active && has_content {
                     if self.inner.overlay.is_open(app) {
-                        // 淡出中又被激活：撤销关闭、立即淡回（不再重新等延迟）。
+                        // 淡出中又被激活：内容未变才撤销关闭、立即淡回（不再重新等延迟）。
+                        // 内容变过（`pending_restart`）则必须等旧面板完整关闭，否则 `Overlay::open`
+                        // 的同窗重入只换锚点、屏上仍是旧内容（R05）。
+                        if !self.inner.pending_restart.get() {
+                            changed |= self.show(app);
+                        }
+                    } else if self.inner.pending_restart.replace(false) {
+                        // 旧面板已经关掉：按新内容重开，不再重新等延迟（提示已经显示过一次）。
                         changed |= self.show(app);
                     } else {
                         self.start_delay(app);
                         changed = true;
                     }
+                } else {
+                    self.inner.pending_restart.set(false);
                 }
             }
             Phase::Waiting => {
@@ -329,8 +351,13 @@ impl Tooltip {
             Phase::Shown => {
                 let withdrawn = self.inner.content.borrow().is_none();
                 let content_changed = *self.inner.content.borrow() != *self.inner.shown.borrow();
-                if !active || withdrawn || content_changed {
+                if !active || withdrawn {
                     self.hide(app);
+                    changed = true;
+                } else if content_changed {
+                    // 内容变了：屏上画的是旧内容，先完整收起（淡出），关掉后再按新内容重开。
+                    self.hide(app);
+                    self.inner.pending_restart.set(true);
                     changed = true;
                 }
             }
@@ -450,6 +477,7 @@ impl Tooltip {
     fn reset(&self, app: &mut App) {
         self.inner.phase.set(Phase::Idle);
         *self.inner.shown.borrow_mut() = None;
+        self.inner.pending_restart.set(false);
         self.cancel_delay(app);
         app.write_transient(&self.inner.elapsed, 0.0);
         let _ = self.inner.overlay.close_now(app);
@@ -550,7 +578,7 @@ mod tests {
     use smol_str::format_smolstr;
     use ui_core::{
         a11y::A11yRole,
-        event::{Action, InputEvent, Modifiers},
+        event::{Action, InputEvent, KeyCode, Modifiers},
         math::{Point, Rect},
         node::{builder::NodeBuilder, id::NodeId},
         test_support::app::TestApp,
@@ -559,7 +587,10 @@ mod tests {
 
     use super::{Tooltip, TooltipContent, TooltipOptions};
     use crate::{
-        kit::overlay::Placement,
+        kit::{
+            layer::{Band, Layer},
+            overlay::{Anchor, DismissPolicy, Overlay, OverlayOptions, Placement},
+        },
         theme::{appearance::Appearance, handle::ThemeHandle},
     };
 
@@ -571,10 +602,16 @@ mod tests {
         window: WindowId,
         trigger: NodeId,
         tip: Tooltip,
+        layer: Layer,
+        theme: ThemeHandle,
     }
 
     impl Harness {
         fn new(options: TooltipOptions) -> Self {
+            Self::with_layer(options, Layer::new())
+        }
+
+        fn with_layer(options: TooltipOptions, layer: Layer) -> Self {
             let mut app = TestApp::new();
             let window = app.window_id();
             let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
@@ -588,7 +625,7 @@ mod tests {
                     .build(tree, root)
                     .expect("触发器")
             };
-            let tip = Tooltip::new(app.app_mut(), theme, "tip", options);
+            let tip = Tooltip::new(app.app_mut(), theme.clone(), layer.clone(), "tip", options);
             tip.attach(app.app_mut(), window, trigger);
             tip.set_content(Some(TooltipContent::new("保存").shortcut("Ctrl+S")));
             // 首帧先把布局跑出来：指针命中依赖布局盒（否则 hover 命中不到触发器）。
@@ -598,6 +635,8 @@ mod tests {
                 window,
                 trigger,
                 tip,
+                layer,
+                theme,
             }
         }
 
@@ -866,6 +905,189 @@ mod tests {
         let _ = harness.sync();
         assert!(!harness.tip.is_visible(harness.app.app()));
         assert!(harness.tip.overlay().overlay_node().is_none());
+    }
+
+    #[test]
+    fn losing_focus_hides_the_tooltip() {
+        // 焦点触发的提示在失焦后必须关闭：只靠 focus 激活（没有 hover 兜底）时，焦点闩锁
+        // 不及时清除会让提示永久驻留（R11 的 M9 变异）。
+        let mut harness = Harness::new(TooltipOptions {
+            delay: Duration::ZERO,
+            ..TooltipOptions::default()
+        });
+        harness
+            .app
+            .app_mut()
+            .set_focus(harness.window, Some(harness.trigger));
+        let _ = harness.sync();
+        assert!(
+            harness.tip.is_visible(harness.app.app()),
+            "焦点在触发器上时显示"
+        );
+
+        harness.app.app_mut().set_focus(harness.window, None);
+        let _ = harness.sync();
+        assert!(
+            !harness.tip.is_visible(harness.app.app()),
+            "失焦必须关闭提示"
+        );
+    }
+
+    #[test]
+    fn escape_closes_the_tooltip() {
+        let mut harness = Harness::new(TooltipOptions {
+            delay: Duration::ZERO,
+            ..TooltipOptions::default()
+        });
+        harness.hover(harness.trigger_center());
+        let _ = harness.sync();
+        assert!(harness.tip.is_visible(harness.app.app()));
+
+        // 引擎默认键绑定：Escape → `Action::Dismiss` → 关最上层浮层（含 Explicit）。
+        let _ = harness
+            .app
+            .inject(InputEvent::key_down(KeyCode::Escape, Modifiers::empty()));
+        let _ = harness.app.drain().expect("帧");
+        let _ = harness.sync();
+        assert!(!harness.tip.is_visible(harness.app.app()), "Esc 关闭提示");
+        assert!(harness.tip.overlay().overlay_node().is_none());
+    }
+
+    #[test]
+    fn changing_the_content_while_shown_rebuilds_the_panel() {
+        // R05：显示中改内容必须重建面板。`Overlay::open` 的同窗重入只换锚点、不重建内容，
+        // 所以旧路径会让屏上停留在旧文本。
+        let mut harness = Harness::new(TooltipOptions {
+            delay: Duration::ZERO,
+            ..TooltipOptions::default()
+        });
+        harness.hover(harness.trigger_center());
+        let _ = harness.sync();
+        harness.advance(Duration::from_millis(200));
+        let _ = harness.sync();
+        assert!(harness.tip.is_visible(harness.app.app()));
+        let old_panel = harness.tip.overlay().panel_node().expect("旧面板");
+        assert!(
+            texts_of(&harness, old_panel).contains("保存"),
+            "前置：屏上是旧文本"
+        );
+
+        assert!(
+            harness.tip.set_content(Some(TooltipContent::new("新建"))),
+            "内容变化必须被感知"
+        );
+        let _ = harness.sync();
+        assert!(
+            harness.tip.overlay().overlay_node().is_some(),
+            "旧面板先淡出（节点暂时保留）"
+        );
+
+        // 淡出走完 → 旧浮层关闭 → 同一轮 Idle 分支按新内容重开。
+        for _ in 0..3 {
+            harness.advance(Duration::from_millis(200));
+            let _ = harness.sync();
+        }
+        assert!(
+            harness.tip.is_visible(harness.app.app()),
+            "内容变化后按新内容重新显示"
+        );
+        let panel = harness.tip.overlay().panel_node().expect("新面板");
+        let texts = texts_of(&harness, panel);
+        assert!(
+            texts.contains("新建"),
+            "新文本必须重建到屏上，实际 {texts:?}"
+        );
+        assert!(!texts.contains("保存"), "旧文本不得残留，实际 {texts:?}");
+    }
+
+    #[test]
+    fn immediate_disables_the_delay() {
+        assert_eq!(
+            TooltipOptions::default().delay,
+            Duration::from_millis(500),
+            "默认延迟 500 ms"
+        );
+        assert_eq!(
+            TooltipOptions::default().immediate().delay,
+            Duration::ZERO,
+            "immediate() 关闭延迟"
+        );
+    }
+
+    #[test]
+    fn a_tooltip_is_above_a_context_menu_in_the_shared_layer() {
+        // R09：提示和 context menu 必须登记进同一张层带表；否则 `Band::Tooltip` 只和自己比较，
+        // 后开的菜单会画在提示之上（旧实现是 `POPUP_PRIORITY + 2`）。
+        let mut harness = Harness::with_layer(
+            TooltipOptions {
+                delay: Duration::ZERO,
+                ..TooltipOptions::default()
+            },
+            Layer::new(),
+        );
+        harness.hover(harness.trigger_center());
+        let _ = harness.sync();
+        assert!(harness.tip.is_visible(harness.app.app()));
+        let tip_node = harness.tip.overlay().overlay_node().expect("提示节点");
+
+        let menu = Overlay::new(
+            harness.app.app_mut(),
+            harness.theme.clone(),
+            harness.layer.clone(),
+            "menu",
+            OverlayOptions {
+                band: Band::ContextMenu,
+                dismiss: DismissPolicy::Explicit,
+                fade: false,
+                ..OverlayOptions::default()
+            },
+        );
+        assert!(
+            menu.open(
+                harness.app.app_mut(),
+                harness.window,
+                Anchor::point(Point::new(20.0, 20.0)),
+                |_, _| Ok(())
+            )
+            .expect("打开菜单")
+        );
+        let menu_node = menu.overlay_node().expect("菜单节点");
+
+        let order: Vec<NodeId> = harness
+            .app
+            .app()
+            .overlays(harness.window)
+            .into_iter()
+            .map(|(node, _)| node)
+            .collect();
+        let menu_at = order
+            .iter()
+            .position(|node| *node == menu_node)
+            .expect("菜单");
+        let tip_at = order
+            .iter()
+            .position(|node| *node == tip_node)
+            .expect("提示");
+        assert!(
+            tip_at > menu_at,
+            "提示必须在 context menu 之上（共享层带 Tooltip > ContextMenu），实际 {order:?}"
+        );
+    }
+
+    /// 子树里的文本载荷。
+    fn texts_of(harness: &Harness, root: NodeId) -> BTreeSet<String> {
+        let mut texts = BTreeSet::new();
+        collect_texts(
+            harness
+                .app
+                .app()
+                .window(harness.window)
+                .expect("窗口")
+                .tree(),
+            root,
+            &mut texts,
+        );
+        texts
     }
 
     /// 递归收集子树里的文本载荷。
