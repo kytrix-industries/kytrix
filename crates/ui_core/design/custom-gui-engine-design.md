@@ -2,16 +2,16 @@
 
 > **文档类型**：系统设计规格 —— 只描述最终架构、接口、实现与约束
 > **版本**：v2.3（2026-11-21）
-> **v2.3 变更摘要**（2026-11-21）：**P2（`base_ui` / kit）全批完成，P2 期间追加的引擎扩展 E7–E15 全部实现并合入迁移分支
-> `gui-engine-migration`（HEAD `7ad630f`，24 个 P2 merge）**。本版把 §11 从「E1–E6」扩为 **E1–E15**：新增
+> **v2.3 变更摘要**（2026-11-21；状态口径经 P2-DOC2 修正）：**P2（`base_ui` / kit）主体完成，P2 期间追加的引擎扩展 E7–E15 全部实现并合入迁移分支
+> `gui-engine-migration`（**23 个 P2 merge** = 22 个批次 merge + `merge(p2-5)`；HEAD `1b65c9d`；真实窗口缺陷修复批次 **P2-6 在途**）**。本版把 §11 从「E1–E6」扩为 **E1–E15**：新增
 > **§11.9–§11.15**（E7 图片节点 / E8 scoped 键绑定 / E9+E9c a11y 集合语义 / E10+E10c 定时器与唤醒 / E12 浮层 a11y 与模态 /
 > E13 组不透明度与阴影 / E15 角色补齐与集合根上提）与 **§11.16 范围基线、E 编号纪律与不变量影响**；新增
 > **§12「P2 应用层实现规格」**（模块级增量迁移、主题基座、薄 builder、kit 组件形态、SVG 构建期光栅、
 > `KYTRIX_UI_CORE_MANIFEST` 过渡开关、计划修正、文档一致性修正、P2 测试与门禁事实）。同步回写 §1.3 公开 API 白名单、
 > §2.9（错误仍 **35** 个顶层变体，P2 未新增）、§4.9（`opacity` 组语义 / `PaintSpec.shadows` / `ShadowSpec.spread` /
 > builder **35+6** 方法）、§7（`A11yRole` **43** 变体、集合语义、模态作用域、焦点增量）、§8.4/§8.5（scoped 键绑定、
-> **55** 图标）、§10.2 P2 批次状态与附录。**E2b 候选**（§11.2）与**已接受残余**（§11.8，v2.3 追加 R-19…R-27 / R1–R15 /
-> D9–D12 / E8/E10/E10c 残余）单列并明确标注为未实现/限制，不得当作已交付能力引用。
+> **55** 图标）、§10.2 P2 批次状态与附录。**E2b 候选**（§11.2）与**已接受残余**（§11.8，v2.3 追加 **R-19…R-29**
+> （含 R-28 `set_a11y_patch` 边界、R-29 集合根 D9–D12）/ R1–R15 / E8/E10/E10c 残余）单列并明确标注为未实现/限制，不得当作已交付能力引用。
 > 逐条回写台账（delta 条目 → 章节 → 源码证据）见 `.docs/gui-migration/design-changes.md` §10（v2.2）与 **§11（v2.3）**。
 > **v2.2 变更摘要**（2026-11-21）：P1 引擎扩展 E1–E6 全部实现并合入（迁移分支 HEAD `e1e4ff6`）；§11 从「新增规格」回写为
 > 实现后的精确规格（§11.1–§11.6）。其条目仍有效，v2.3 只在其后追加。
@@ -2112,7 +2112,9 @@ adapter.set_root_window_bounds(outer, inner);
 
 - **单一权威焦点源**：`FocusScope` 的 `focused: NodeId`，a11y `TreeUpdate.focus` 与引擎键盘分发都从它取值，不另设一份。
   **v2.3（E12）**：`TreeUpdate.focus` 用**有效焦点** —— 有模态作用域（`App::modal_scope(window) = Some(root)`）时，
-  `focused` 落在作用域外一律按「无焦点」处理（回落到作用域根或维持上一次有效值），避免把焦点暴露给被 `hidden` 的节点。
+  `focused` 落在作用域外一律按「无焦点」处理（`effective_focus()` 返回 `None` ⇒ `resolve_focus(None)` 回退到
+  **窗口 tree root**；`last_focus` 只用于「焦点是否变化」比较，**不作回退**（不存在「沿用上一有效值」的语义）），避免把
+  焦点暴露给被 `hidden` 的节点；作用域内的再落点由下一次输入 `validate_focus` 补（AR1b N1b）。
 - **窗口焦点**：`update_window_focus_state(bool)`（Win）/ `update_view_focus_state(bool)`（mac）/ `set_root_window_bounds`
   （Linux）在窗口事件里同步。
 - **命中**：macOS adapter 直接调 `hit_test()`；Windows 走 UIA fragment 路径；引擎统一用 `layout::hit_test`（§4.4）的结果，保证视觉命中与
@@ -2523,7 +2525,7 @@ D18 定案「主干冻结窗口」：约定一段时间内不发布、在主干�
 | | P2-4c / 4c2 / 4c3 | 菜单/下拉/选择/上下文菜单（共享条目面板、`PanelWidth::Exact`、行命中壳焦点） | 同上 | ✅ 已完成（`95dc808` / `1f34ea6` → merge `3ce9593`） |
 | | P2-4d1 / 4d1b | 对话框（`Dialog` / `DialogBuilder`；焦点/模态/Esc 走引擎，`OverlaySurface::dialog()`） | 同上 | ✅ 已完成（`252384e` / `9094b1c` → merge `cda7d09`） |
 | | P2-4d2 / 4d2b | 颜色选择器（144 色板 + HSLA 滑条走 `Canvas`；双层阴影回填） | 同上 | ✅ 已完成（`25f0d8b` / `58eddec` → merge `b855b21`） |
-| | P2-5 | base_ui 收口：examples 收敛为 `gallery` + 三端真实验收；**旧模块 `style/`/顶层组件/旧 `markdown/` 的删除推迟到 P5**（§12.7） | gallery 出帧 + 三端验收 | 🔄 收尾中（P2-5 gallery 批；`M3` 随该批达成） |
+| | P2-5 | base_ui 收口：examples 收敛为 `gallery` + 三端真实验收；**旧模块 `style/`/顶层组件/旧 `markdown/` 的删除推迟到 P5**（§12.7） | gallery 出帧 + 三端验收 | ✅ 已合入（`cd607d0` → merge `1b65c9d`；`M3` 达成）；真实窗口缺陷修复由 **P2-6**（`mig/p2-6a` / `p2-6b`，在途）跟进 |
 | **P3 widget 契约 + 20 widgets** | P3-1 | 契约层搬运 + `view`/`any`/`status` 重写 + `WidgetCx`/`AnyWidget` 定稿 | 契约测试 + 签名冻结评审 | ⬜ 待做 |
 | | P3-2 | `surface` / `ui/placeholder` / `binding` + `empty` 标杆 + 运行时 Handle 接线 | 同上 | ⬜ 待做 |
 | | P3-3 | `widget_registry` + `widget_gallery_ui`（24 条注册表遍历） | 同上 | ⬜ 待做 |
@@ -2653,7 +2655,7 @@ M6 kytrix 启动 = P4-1…P4-3；M7 最终验收 = P6-1…P6-3（P5 是 M6 与 M
 ## 11. 引擎扩展实现规格（E1–E15，已实现）
 
 > **本章全部条目已实现并合入 `gui-engine-migration`**：E1–E6 为 P1（HEAD `e1e4ff6`），E7–E15 为 P2 期间裁定并落地
-> （HEAD `7ad630f`）。本章是**实现后的精确规格**（API 形状 / 语义 / 错误 / 不变式 / 测试面），也是 P3（widget）/ P4（外壳）的规格基线；
+> （HEAD `7ad630f`；其后 `merge(p2-5)` = `1b65c9d` 只新增 `gallery` 示例与 `kit/mod.rs` 导出，**无 §11 接口变化**）。本章是**实现后的精确规格**（API 形状 / 语义 / 错误 / 不变式 / 测试面），也是 P3（widget）/ P4（外壳）的规格基线；
 > 与源码冲突时**以源码为准并回写本章**。
 > 依据：`.docs/gui-migration/assess/08-gap-verification.md` §2.1（E1–E6 的 6 项最小可行增量）、P2 各批审查报告的残余/回写清单
 > （`.review/mig-{e7,e8,e9,e9c,e10,e10c,e12,e13,e15,p2-*}-review.md`）与
@@ -2862,7 +2864,7 @@ impl NodeBuilder { pub fn runs(self, runs: impl IntoIterator<Item = TextRun>) ->
 
 **尺寸基线**（E2b 实测，守护测试 `text_payload_sizes_are_budgeted` / `node_size_after_p06`）：`TextStyle` 56 / `TextContent` 112 /
 `InlineBoxSpec` 72 / `ShapedLine` 80 / **`Node` 336 B（硬上限 336 B，v2.3 起已无余量）**。`TextContent` 在 `NodeKind::Text` 里是 `Box` 装载 ⇒
-E2 未改变 `Node` 尺寸；E13 的 `paint_opacity: f32` 使 `Node` 328 → **336 B = 上限**（`node/tree/tests.rs` 两处精确 pin；
+E2 未改变 `Node` 尺寸；E13 的 `paint_opacity: f32` **+4 B（对齐后 +8 B）**使 `Node` 328 → **336 B = 上限**（`node/tree/tests.rs` 两处精确 pin；
 后续加字段必须先把冷字段装箱搬走，**不得**抬高上限）。`PaintSpec` 192 / `Shadows` 88 / `ShadowSpec` 36 B 同为精确 pin（§11.14）。
 
 **语义**：
@@ -3217,7 +3219,7 @@ macOS 纯函数 `traffic_light_position_applies_once_and_never_rolls_back` / 安
 | R-18 | `WM_NCCALCSIZE` `wParam == FALSE` 无测试 | 该变体交 `DefWindowProcW`（与成熟实现同构）；本仓无 `SWP_FRAMECHANGED` 运行期样式变更路径，风险低。若未来引入运行期样式变更需回归。 | 接受；登记 |
 | R-19 | 裸 `resources_mut().unload()` 不触发节点失效 | 绕过 `App::unload_resource` 直接对 `ResourceCache` 调 `unload` 时，引用该资源的图片节点**不会**被置脏，会画到已释放的 tile（花屏）。契约：图片卸载**只能**经 `App::unload_resource`（它遍历全部窗口 `invalidate_images_with_resource`）。 | 接受；应用义务（E7 §11.9） |
 | R-20 | 图片节点的 padding/border 不内缩 | 图片 `bounds` = **border box**（不内缩 padding / border），因此图片会覆盖自身绘制边框；`Style.clip = Clip::Bounds` 对图片内容不生效（图片图元按节点盒发射）。需要内缩时用内层包装节点。 | 接受；应用义务（E7 §11.9） |
-| R-21 | 公开卸载路径不自动清理 scoped 键绑定 / 定时器 | 引擎内部的节点卸载（overlay 关闭、虚拟列表回收、输入层）会清 `scoped_bindings` 与 scope 定时器；但**应用侧** `Window::tree_mut()` + `NodeTree::remove` **不触发**该清理（`App::remove_node` 是 `pub(crate)`）。应用卸载容器时必须显式 `unbind_scope_keys` + `cancel_timer`（组件契约：先卸节点 → 再解绑/摘 handler → 最后 `release_scope`）。 | **需裁决**：是否把清理下沉到 `NodeTree::remove`（引擎改动）或维持应用义务 |
+| R-21 | 公开卸载路径不自动清理 scoped 键绑定 / 定时器 | 引擎内部的节点卸载（overlay 关闭、虚拟列表回收、输入层）会清 `scoped_bindings` 与 scope 定时器；但**应用侧** `Window::tree_mut()` + `NodeTree::remove` **不触发**该清理（`App::remove_node` 是 `pub(crate)`）。应用卸载容器时必须显式 `unbind_scope_keys` + `cancel_timer`（组件契约：先卸节点 → 再解绑/摘 handler → 最后 `release_scope`）。 | **当前契约 = 应用义务**（§11.10 生命周期表 + §12.4，kit `release` 已强制该顺序）；**引擎下沉列入 P3 前评估**（入口 `NodeTree::remove` 删子树前收集 scope，与 `timer::retain_live_scopes` 同批；风险是 `tree_mut` 的允许集合 I6 再扩大，需单独裁决）—— 不阻塞 P2 |
 | R-22 | `Canvas` 内容不受组不透明度（E13-R1） | `StylePatch.opacity` 作用于引擎生成图元（含 `GeometryDraw.color`），但 `Canvas` 内的应用自绘图元颜色由应用生成、引擎不解析 ⇒ 组淡出时 Canvas 不淡（color_picker 的 144 色板/滑条即此情形）。 | 接受；应用在 `Canvas` 内自行乘 opacity |
 | R-23 | 无隔离组（E13-R2） | 半透明子树的图元逐个相乘、无离屏合成 ⇒ 重叠区域比 CSS `isolation: isolate` 更「实」（重叠处 alpha 叠加而非整组一次合成）。 | 接受；v1 不做离屏 layer |
 | R-24 | 阴影与透明边界的边缘行为（E13-R5 / R13 / R14） | ① `Shadows` 构造期 `take(MAX_SHADOWS = 4)`，**超过 4 层静默截断**（无错误、无诊断）；② `opacity == 0` 且带边框时仍发射一个全透明 `Quad`（过滤发生在乘 opacity 之前）；③ 负 `spread` 过度收缩时会产生零 `bounds` 的 `Shadow` 图元（被渲染层丢弃，不 panic）。 | 接受；登记（可在后续批加诊断/早退） |
@@ -3342,7 +3344,7 @@ impl App {
 | 逻辑子 | 被领养的节点从物理父的 `children` 中**过滤掉**，出现在集合根的 `children` 里；`A11yNode::{parent, children}` 暴露的就是逻辑关系 |
 | 行窗口判定 | 虚拟列表窗口的**已挂载项全部声明 `Row`** ⇒ 按行窗口领养（空窗口按行窗口计）；非行窗口 / 嵌套集合**不领养**（R-25） |
 | 虚拟化行号 | `row_index = 基址 + 项号`、`row_count = 逻辑总行数`（含**未挂载**行，来自 `slot.count`）；非行窗口虚拟列表**不占**行号、**不计**行数 |
-| 声明优先 | `A11yPatch` / `A11yOverride` 显式给的 `row_index`/`row_count`/`column_index`/`row_count` 永远优先于推导；推导是交付时现算的纯函数，不缓存 |
+| 声明优先 | `A11yPatch` / `A11yOverride` 显式给的 `row_index`/`row_count`/`column_index`/`column_count` 永远优先于推导；推导是交付时现算的纯函数，不缓存 |
 | 隐藏继承 | `hidden` 沿被跳过的包裹层继承（`hidden_by_skipped_ancestors`），保证「父 hidden ⇒ 子也 hidden」在逻辑树上成立 |
 | 集合边界 | 不做「集合内嵌套集合」的通用支持（`Row` 内直接声明的嵌套 `Table`/`Grid`/`Tree`/`Row` 跳过且不收录，R-25） |
 
@@ -3544,7 +3546,9 @@ impl App {
 
 ## 12. P2 应用层实现规格（`base_ui` / kit，已实现）
 
-> **状态**：P2（`base_ui` 迁移）已按 P2-0…P2-4d2 全部合入迁移分支（HEAD `7ad630f`）；P2-5 收尾为 `gallery` + 三端真实验收。
+> **状态**：P2（`base_ui` 迁移）**主体完成** —— P2-0…P2-4d2 全部合入迁移分支（`7ad630f` 时点 22 个批次 merge），
+> P2-5 `gallery` + 三端真实验收已合入（`merge(p2-5)` = `1b65c9d`，合计 **23 个 P2 merge**，`M3` 达成）；
+> 真实窗口缺陷修复批次 **P2-6**（`mig/p2-6a` / `mig/p2-6b`）在途，收口后再升「P2 完成」。
 > 本章是**应用层的实现后规格**：模块形态 / 主题基座 / 薄 builder / kit 组件契约 / 构建期资产 / 过渡开关 / 计划修正。
 > 引擎侧规格见 §11；应用层与引擎的边界仍由 §1.3 白名单约束 —— `base_ui` **只见引擎类型**（I9）。
 
@@ -3645,7 +3649,7 @@ impl App {
 |---|---|---|---|
 | 1 | 图标数写 **54**（少 1；§1.3 / §5.6 / §8.5） | **55** | `kit/icon.rs` 的 `IconKind::COUNT = 55`、`ALL: [IconKind; 55]`、枚举文档自述「设计文档写 54，实际 55」；资产目录 55 个 SVG |
 | 2 | 角色数写 **32**（§7.4） | **43**（且不得写死个数） | `a11y.rs` 的 `A11yRole::ALL: [Self; 43]`；计数链 32→34→38→43（E9/E12/E15） |
-| 3 | 「`Node` 328 B（硬上限 336 B）」（§11.2） | **`Node` 336 B = 上限，无余量** | `node/tree/tests.rs` 两处 `assert_eq!(size_of::<Node>(), 336)`；E13 的 `paint_opacity: f32` +4 B |
+| 3 | 「`Node` 328 B（硬上限 336 B）」（§11.2） | **`Node` 336 B = 上限，无余量** | `node/tree/tests.rs` 两处 `assert_eq!(size_of::<Node>(), 336)`；E13 的 `paint_opacity: f32` +4 B（**对齐后 +8 B**） |
 | 4 | `PaintSpec` 只有单层 `shadow` 字段（§4.9 / 附录草图形） | **`PaintSpec.shadows: Shadows`** + `MAX_SHADOWS = 4` + `ShadowSpec.spread` | `paint/style.rs`：`pub shadows: Shadows`、`pub const MAX_SHADOWS`、`pub struct ShadowSpec{.., spread, ..}` |
 | 5 | `StylePatch.opacity` = 「逐图元 alpha，不作用于 Geometry」（§4.9.2） | **组不透明度**（× 祖先链，作用于引擎图元含 `GeometryDraw.color`，**不**作用于 `Canvas`） | `paint/style.rs` 字段文档 + `node/tree/content.rs` 的折算 + `paint/pass.rs` 的传播 |
 | 6 | 薄 builder「约 26 个方法」（§1.3 / §4.9.5） | **`StyleBuilder` 35 + `PaintBuilder` 6** | `style_builder.rs` 的 `pub fn` 计数 + 文件头注释自述 |
@@ -3660,13 +3664,13 @@ impl App {
 
 | 项 | 数字 / 结论 |
 |---|---|
-| `ui_core --lib`（`--features hud,test-support`） | **2274 passed / 0 failed / 1 ignored**（P2 起点 2151 ⇒ **+123**） |
+| `ui_core --lib`（`--features hud,test-support`） | **2274 passed / 0 failed / 1 ignored**（P2 起点 2151 ⇒ **+123**；`.review/mig-e15b-lib.log`；= P2-5 门禁基线 2250（`mig-p2-5-g4-ui_core.log`）+ E15 **+24**，合并树同值） |
 | `ui_core --test snapshot` | **11 passed**，42 张 golden（3 平台 × 14）**全程零 diff、零重建** |
-| `base_ui --lib` | **1033 passed**（P2 起点 417 ⇒ **+616**；P2-4c3 时点 990，E15b 后 1033） |
-| 引擎批测试增量（逐批） | E7 19 / E7b +1（2170→2171）· E8 +12（2163）· E9 2159 · E9c +4（2199）· E10 2213→2218 · E12 +7（2202）· E13（golden 零 diff + 像素读回）· E15 2266 → E15b **2274** |
+| `base_ui --lib` | **1099 passed**（P2 起点 417 ⇒ **+682**；`.review/mig-p2-5-g3-base_ui.log`；口径 = P2-4d2 时点 1029 + P2-4a3/4c2/4c3 **+70**，E15 不改 kit 测试数） |
+| 引擎批测试增量（逐批，**各批分支基线、并行分支互不可比**） | E7 19 / E7b +1（2170→2171）· E8 +12（2163，+E8b 3 = 2166）· E9 2159 · E9c +4（2199）· E10 2213→2218 · E12 +7（2202）· **E13 2209**（golden 零 diff + 像素读回）· E15 2266 → E15b **2274**（= 合并树值） |
 | 变异测试 | P2 各批审查累计变异 **60+** 项（E7 3/3、E8 6/6、E9 2/2、E9c 2/2、E10 8/8、E12 3/3、E13 8/10、E15 4/4 等，绝大多数红） |
 | 三端 | Windows 本机 fast/层末；macOS / Linux 远端 quick + 层末 layer；`timer_smoke` 三端 PASS（Win +415.79 / mac +404.63 / Linux +400.79 ms） |
-| 里程碑 | **M2（base_ui 地基）达成** = P2-1a + P2-1b；**M3** 随 P2-5 `gallery` 达成 |
+| 里程碑 | **M2（base_ui 地基）达成** = P2-1a + P2-1b；**M3** 随 P2-5 `gallery` 合入（`1b65c9d`）达成；真实窗口缺陷修复由 **P2-6**（在途）跟进 |
 
 ### 12.10 残余与 P3 入口
 
@@ -3675,7 +3679,7 @@ impl App {
   `kit` 的 `TAB_MAX_WIDTH` / alert 排版 / join 接缝等 9 条 P3 级项（`.review/mig-p2-4a-review.md` §9.5）。
 - **P3 入口**：见 `.docs/gui-migration/plan.md` v1.2 §3 的 P3 表（P3-1 契约层搬运与签名冻结 → P3-2 `surface`/`placeholder`/`binding` + `empty` 标杆 →
   P3-3 `widget_registry` + `widget_gallery_ui` → P3-W1…W9 二十个 widget）；规格基线 = 本文 §11（引擎）+ 本章（应用层组件形态与测试装置约定）。
-- **P3 开工前置**：`base_ui` 的 `gallery` 可运行（M3）、`widget` 契约层的 `WidgetCx` / `AnyWidget` 形状定稿、`on_frame` 单槽的使用约定（§11.12）。
+- **P3 开工前置**：`base_ui` 的 `gallery` 可运行（M3，✅ `1b65c9d` 已达成）、`widget` 契约层的 `WidgetCx` / `AnyWidget` 形状定稿、`on_frame` 单槽的使用约定（§11.12）。
 
 ---
 
@@ -3874,4 +3878,4 @@ pub struct OverlayOptions { /* …, pub trap_focus: bool, pub a11y: A11yOverride
 > 坐标全为**绝对窗口逻辑像素**（`GeometryDraw.transform` 是唯一 per-primitive 变换）；`Primitive` 实测 `size_of == 80` B（软上限 128 B）。
 ---
 
-*文档完 · 本文描述 D1–D25 定案下的最终设计（**v2.3**，2026-11-21）；已实现部分与 `crates/ui_core/src` 对齐，**E1–E15（§11）已全部实现**，**P2 应用层（§12）已实现**（P2-5 `gallery` 收尾）；E2b 候选（§11.2）与已接受残余（§11.8）明确标注为未实现/限制，不得当作已交付能力。*
+*文档完 · 本文描述 D1–D25 定案下的最终设计（**v2.3**，2026-11-21）；已实现部分与 `crates/ui_core/src` 对齐，**E1–E15（§11）已全部实现**，**P2 应用层（§12）已实现**（P2-5 `gallery` 已合入 `1b65c9d`；真实窗口缺陷修复批次 P2-6 在途）；E2b 候选（§11.2）与已接受残余（§11.8）明确标注为未实现/限制，不得当作已交付能力。*
