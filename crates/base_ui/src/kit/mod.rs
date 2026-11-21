@@ -7,8 +7,7 @@
 //! `animation` / `join` / `markdown` / `input` / `list` / `scroll_bar` / `table` / `tree` 是
 //! 引擎化版本；旧顶层模块（`crate::icon`、`crate::assets`、`crate::markdown`、`crate::input`、
 //! `crate::table`…）由尚未迁移的 gpui 组件继续使用，P2-5 迁完后删除。按 AGENTS §1.1，这里
-//! **不提供**任何兼容层 / 转发函数 —— 两个模块树各自独立，组件迁移时整模块切换过去。
-//!
+//! **不提供**任何兼容层 / 转发函数 —— 两个模块树各自独立，组件迁移时整模块切换过去。//!
 //! 本模块树**只依赖 `ui_core`、`smol_str`、`comrak` 等非 gpui 依赖**，任何 gpui 类型都不得
 //! 出现在这里。
 //!
@@ -43,6 +42,9 @@
 //! | [`scroll_bar`] | 自绘滚动条（拖拽 / 轨道点击 / 淡出 / 双轴） | `crate::scroll_bar` |
 //! | [`table`] | 列定义（Fixed/Flex/跨列）、表头排序、行虚拟化、多选、空态（E9 `Table`/`Row`/`Cell`/`ColumnHeader` 集合语义） | `crate::table` |
 //! | [`tree`] | 展开折叠、缩进层级线、选择、键盘导航（实例级键作用域；E9 `Tree`/`TreeItem` + `level` 层级） | `crate::tree` |
+//! | [`overlay`] | 通用锚定浮层：12 向 placement + flip + clamp、滚动跟随、模态遮罩、`Transient` 淡入淡出、焦点陷阱 / 恢复 | `crate::overlay` + `crate::layer` 的浮层部分 |
+//! | [`layer`] | 固定 z 层带（View < Dialog < Alert < Popup < ContextMenu < Tooltip）与 root 子节点排序仲裁 | `crate::layer` |
+//! | [`tooltip`] | hover / focus 触发 + 延迟 + 12 向定位 + 文本 / 快捷键 + 不可交互 + a11y | `crate::tooltip` |
 //! | `test_support` | 基于 `ui_core::test_support` 的测试断言辅助（TestApp/Probe/FrameRecord） | 无（新基建） |
 //!
 //! # 组件形态（与引擎模型对齐）
@@ -86,9 +88,11 @@ pub mod icon;
 pub mod input;
 pub mod interactive;
 pub mod join;
+pub mod layer;
 pub mod list;
 pub mod markdown;
 pub mod motion;
+pub mod overlay;
 pub mod progress;
 pub mod scroll_bar;
 pub mod separator;
@@ -97,6 +101,7 @@ pub mod spinner;
 pub mod tab_bar;
 pub mod table;
 pub mod toggle;
+pub mod tooltip;
 pub mod tree;
 
 /// 测试断言辅助。**只在测试构建里存在**（依赖 `ui_core/test-support`，见本文件模块文档）。
