@@ -8,7 +8,7 @@
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -1000,4 +1000,94 @@ fn a_delayed_timer_then_a_transient_fade_drives_a_tooltip_like_sequence() {
     );
     assert!(!app.app().animations_running(window));
     assert!(!app.app().needs_continuous_frames(), "结束后回到空闲（I3）");
+}
+
+// ── E10c：登记基准与等待期 I3 ──────────────────────────────────────────────
+
+/// **E10c 的根因回归**：生产（活时钟）下 `App::after` 的 deadline 必须以**登记瞬间**的真实
+/// 时间为基准，而不是泵起点同步的引擎时钟。
+///
+/// macOS 真机失败：泵在轮首同步时钟，之后还有事件/窗口状态/出帧等前置工作；应用在 `on_frame`
+/// 里登记 400 ms 定时器时，引擎时钟已经落后真实时间那段工作 ⇒ deadline = 泵起点 + 400 ms，
+/// 平台定时器在「登记后 400 ms」之前到点，实测 `398.648 ms < 400 ms`。
+///
+/// 变异守卫（E10c M1）：把 `timer::after` 的基准改回 `app.clock`（删掉活时钟分支）⇒ 本用例
+/// 的 `deadline >= 登记瞬间 + delay` 断言变红（引擎时钟被显式滞后 2 ms）。
+#[test]
+fn a_timer_registered_on_a_live_clock_is_anchored_to_the_registration_instant() {
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    // 平台泵轮首：引擎时钟推进到真实时间并标记为活时钟。
+    app.app_mut().sync_clock_live();
+    // 模拟「泵起点 → 应用登记」之间的前置工作：引擎时钟落在登记瞬间之后。
+    std::thread::sleep(Duration::from_millis(2));
+    let registered_at = Instant::now();
+    app.app_mut()
+        .after(window, Duration::from_millis(400), |_app| {})
+        .expect("timer");
+    let deadline = app.app().next_wake_deadline().expect("pending timer");
+    assert!(
+        deadline >= registered_at + Duration::from_millis(400),
+        "deadline 必须以登记瞬间为基准（泵起点时钟会把它算早：macOS 真机 398.648 ms < 400 ms）"
+    );
+}
+
+/// **E10c 的 I3 断言**：等待一次性定时器期间，泵轮不提交帧、不请求帧、不派发未到期的定时器
+/// （Windows 同代码 1 轮；macOS 修复前被 display link 的 vsync tick 空转 54 轮）。
+///
+/// 变异守卫（E10c M2）：让 macOS 泵的空闲轮判定恒为真（`platform::macos_pump::app_round`
+/// 恒 true）⇒ 真机 `timer_smoke` 的「等待期轮数」失败；本用例守护引擎侧的同一条不变量
+/// （等待期间 `App::frame` 恒 `Idle`、`FrameIndex` 不变、无帧请求）。
+#[test]
+fn waiting_for_a_one_shot_timer_produces_no_frames_or_wakeups() {
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let _node = painted_node(&mut app, Color::from_rgba8([1, 2, 3, 255]));
+    let _ = pump_round(&mut app);
+    let frame_index = app.app().window(window).expect("window").frame_index();
+    let requests = app.app().frame_requests();
+
+    app.app_mut().sync_clock_live();
+    std::thread::sleep(Duration::from_millis(2));
+    app.app_mut().sync_clock_live();
+    let fired = Rc::new(Cell::new(false));
+    let sink = Rc::clone(&fired);
+    app.app_mut()
+        .after(window, Duration::from_millis(80), move |_app| {
+            sink.set(true)
+        })
+        .expect("timer");
+    assert_eq!(app.app().timer_count_for_test(), 1);
+
+    // 等待期：模拟平台泵的若干轮（轮首同步活时钟 → 帧入口）。定时器未到期 ⇒ 恒 Idle。
+    for _ in 0..3 {
+        std::thread::sleep(Duration::from_millis(10));
+        app.app_mut().sync_clock_live();
+        let outcome = app.app_mut().frame(window);
+        assert!(
+            matches!(outcome, Some(Ok(FrameOutcome::Idle))),
+            "等待定时器期间不得提交帧"
+        );
+        assert_eq!(
+            app.app().window(window).expect("window").frame_index(),
+            frame_index,
+            "等待期不得推进 FrameIndex"
+        );
+        assert_eq!(
+            app.app().frame_requests(),
+            requests,
+            "等待定时器不得请求帧（I3）"
+        );
+        assert!(!fired.get(), "未到期不得派发定时器");
+        assert_eq!(app.app().timer_count_for_test(), 1);
+    }
+
+    // 到点后由下一轮的钩子步骤派发一次；表清空、不重复。
+    std::thread::sleep(Duration::from_millis(90));
+    app.app_mut().sync_clock_live();
+    app.app_mut().run_frame_hook();
+    assert!(fired.get(), "到点必须派发");
+    assert_eq!(app.app().timer_count_for_test(), 0);
+    app.app_mut().run_frame_hook();
+    assert_eq!(app.app().timer_count_for_test(), 0, "只派发一次");
 }

@@ -214,13 +214,16 @@ impl Dispatcher {
         self.modal_loops.load(Ordering::Acquire) > 0
     }
 
-    /// 仅测试（macOS）：当前是否有一个尚未取走的帧唤醒（验证跨线程发布路径真的叫醒了
-    /// 主线程）。
+    /// 当前是否有一个尚未取走的帧唤醒（只读电平位）。
     ///
-    /// **证据边界**：这里只读 `frame_pending` 电平位，证明「生产者置了位」；真实
-    /// `CFRunLoopSourceSignal` / `CFRunLoopWakeUp` 的投递由 mac 真机
-    /// `acceptance window --seconds 8 --hz 1`（静止窗口每拍恢复上屏）人工验证。
-    #[cfg(all(test, any(target_os = "macos", windows)))]
+    /// 生产消费者：macOS 泵的空闲轮判定（`platform::macos_pump`，E10c）—— 没有待处理唤醒且
+    /// 没有其它工作理由时，run loop 的 vsync tick 不跑完整应用轮。
+    ///
+    /// 测试（macOS / Windows）：跨线程发布路径「生产者真的置位」的证据。
+    ///
+    /// **证据边界**：这里只读 `frame_pending` 电平位；真实 `CFRunLoopSourceSignal` /
+    /// `CFRunLoopWakeUp` 的投递由 mac 真机 `acceptance window` 与 `timer_smoke` 覆盖。
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn has_pending_wake(&self) -> bool {
         self.frame_pending.load(Ordering::Acquire)
     }

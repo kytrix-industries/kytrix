@@ -227,6 +227,12 @@ pub struct App {
     thresholds: InputThresholds,
     /// 引擎时钟（生产由平台每轮 `sync_clock`，测试由 `TestApp::advance` 推进）。
     clock: Instant,
+    /// 引擎时钟是否是**活时钟**（平台泵每轮同步真实时间；`TestApp` 恒为 false）。
+    ///
+    /// E10c：一次性定时器的登记基准在生产必须取**登记瞬间**的真实时间（活时钟）；测试必须
+    /// 取引擎时钟（`TestApp::advance` 是唯一推进源，deadline 要能精确断言）。平台泵通过
+    /// [`App::sync_clock_live`] 置位；`App::dispatch` 的 `sync_clock` 不置位（测试会派发输入）。
+    clock_live: bool,
     /// 每个窗口最近一次 a11y 交付的时钟值（节流用，P2-6）。
     ///
     /// 高频实时数据（行情数字）会让 A11Y 脏位每帧都为真，而每次交付都要全树扫描 +
@@ -610,6 +616,7 @@ impl App {
             scoped_bindings: Vec::new(),
             thresholds: InputThresholds::platform_default(),
             clock: Instant::now(),
+            clock_live: false,
             a11y_delivered: ahash::HashMap::default(),
             a11y_delivered_round: false,
             last_click: None,
@@ -2179,6 +2186,15 @@ impl App {
     /// 把引擎时钟推进到真实时间（平台泵每轮一次；测试用 `TestApp::advance`）。
     pub(crate) fn sync_clock(&mut self) {
         animation::sync_clock(self)
+    }
+
+    /// 平台泵的轮首时钟同步：推进到真实时间并**标记为活时钟**（E10c）。
+    ///
+    /// 与 [`App::sync_clock`] 的唯一区别是置 `clock_live`：一次性定时器的登记基准据此选择
+    /// 「登记瞬间真实时间」（生产）还是「引擎时钟」（测试）。平台泵（Windows/macOS/Linux）
+    /// 每轮调用本方法；`App::dispatch` 里的时钟同步**不**置位（测试也会派发输入）。
+    pub(crate) fn sync_clock_live(&mut self) {
+        animation::sync_clock_live(self)
     }
 
     /// 推进测试时钟（`TestApp::advance` 的唯一实现；只在测试构建里存在）。
