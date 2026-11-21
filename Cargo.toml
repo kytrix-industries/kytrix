@@ -312,6 +312,7 @@ prediction_market = { path = "crates/widgets/prediction_market" }
 profile_ui = { path = "crates/profile_ui" }
 settings_ui = { path = "crates/settings_ui" }
 solana_wallet = { path = "crates/widgets/solana_wallet" }
+ui_core = { path = "crates/ui_core" }
 updater_ui = { path = "crates/updater_ui" }
 volume_heatmap = { path = "crates/widgets/volume_heatmap" }
 watch_list = { path = "crates/widgets/watch_list" }

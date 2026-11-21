@@ -925,6 +925,8 @@ dependencies = [
  "rust-embed",
  "smallvec",
  "smol_str",
+ "taffy",
+ "ui_core",
 ]
 
 [[package]]
