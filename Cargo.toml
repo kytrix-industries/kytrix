@@ -233,6 +233,12 @@ reqwest = { version = "0.13.5", default-features = false }
 rmp-serde = "1.3.1"
 rodio = { version = "0.23.0", default-features = false }
 rust-embed = "8.13.0"
+# P2-1b：`base_ui` 的 build.rs 在**构建期**把 Phosphor SVG 光栅化成白色字形 PNG（设计 §8.5 / §5.6：
+# 引擎不依赖 usvg / resvg，图标转换归应用层）。0.46.0 与 `gpui-pre` 已在 `Cargo.lock` 的版本一致
+# （不引入新的 crate / 编译单元）；关掉默认特性（text / system-fonts / raster-images）——图标是纯
+# 路径，不需要字体与内嵌位图解码。
+resvg = { version = "0.46.0", default-features = false }
+usvg = { version = "0.46.0", default-features = false }
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde-saphyr = { version = "2.1.1", default-features = false, features = [
