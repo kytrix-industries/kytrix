@@ -163,6 +163,26 @@ pub(crate) fn dispatch_input(app: &mut App, window: WindowId, event: InputEvent)
     if !app.windows.contains_key(&window) {
         return outcome;
     }
+    // E17：记下「最新指针位置」（`Window::pointer_position` 的唯一写入点）。
+    //
+    // 纯记账：不标脏、不请求帧（I3）；悬停 / 光标 / 拖拽仍按各自路径派生。带窗口逻辑坐标的
+    // 指针事件都算 —— `PointerLeave` 自带离开点（三端都提供），因此离开后保留的最后值就是
+    // 离开点；`Scroll` 的位置同样是指针位置。触摸 / 手势（`Magnify` / `Rotate` /
+    // `SmartMagnify`）没有指针语义，不更新。
+    let position = match &event {
+        InputEvent::PointerEnter { position, .. }
+        | InputEvent::PointerMove { position, .. }
+        | InputEvent::PointerDown { position, .. }
+        | InputEvent::PointerUp { position, .. }
+        | InputEvent::PointerLeave { position, .. }
+        | InputEvent::Scroll { position, .. } => Some(*position),
+        _ => None,
+    };
+    if let Some(position) = position
+        && let Some(target) = app.windows.get_mut(&window)
+    {
+        target.note_pointer_position(position);
+    }
     app.validate_focus(window);
     match event {
         // 进入客户区与移动走同一条路径：两者都要重算命中、悬停与光标。区别只在**应用侧**：

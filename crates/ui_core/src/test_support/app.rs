@@ -8,7 +8,7 @@
 //! push → drain → run 三层时才会现形（旧实现 `TestApp` 根本没有任务泵，a11y 用例全走
 //! `dispatch_request` 直调，把这一层整个跳过了）。
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{
     a11y::ShadowTree,
@@ -19,7 +19,8 @@ use super::{
 use crate::{
     app::{App, AppHandle},
     error::EngineError,
-    event::{Event, InputEvent, InputOutcome},
+    event::{Event, InputEvent, InputOutcome, Modifiers},
+    math::Point,
     window::{FrameOutcome, WindowId, WindowOptions},
 };
 
@@ -364,6 +365,40 @@ impl TestApp {
             other => other,
         };
         self.app.dispatch(self.window, event);
+    }
+
+    // ── E17：指针位置（注入 + 读取） ──────────────────────────────────────
+    //
+    // 三端平台泵的指针事件最终都走 `App::dispatch_input`，这里与它们**同一条**路径：
+    // 位置记录、hover / 光标解析、拖拽状态机都按真机语义跑，测试不另起一套捷径。
+
+    /// 最新指针位置（转发 [`App::pointer_position`]）。
+    #[must_use]
+    pub fn pointer_position(&self) -> Option<Point> {
+        self.app.pointer_position(self.window)
+    }
+
+    /// 注入一次「指针移动」（`PointerMove`）。
+    pub fn move_pointer(&mut self, position: Point) -> InputOutcome {
+        self.inject(InputEvent::pointer_move(position, Modifiers::empty()))
+    }
+
+    /// 注入「指针进入 / 重新进入窗口」（`PointerEnter`，带进入点）。
+    pub fn enter_pointer(&mut self, position: Point) -> InputOutcome {
+        self.inject(InputEvent::PointerEnter {
+            position,
+            modifiers: Modifiers::empty(),
+            timestamp: Instant::now(),
+        })
+    }
+
+    /// 注入「指针离开窗口」（`PointerLeave`，带离开点）。
+    pub fn leave_pointer(&mut self, position: Point) -> InputOutcome {
+        self.inject(InputEvent::PointerLeave {
+            position,
+            modifiers: Modifiers::empty(),
+            timestamp: Instant::now(),
+        })
     }
 
     /// 推进测试时钟（双击窗口 / 动画 / 拖拽时间都读它；不改任何状态）。
