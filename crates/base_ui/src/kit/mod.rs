@@ -35,7 +35,7 @@
 //! | [`spinner`] | 旋转加载指示器（自绘画布 + 引擎动画） | `crate::spinner` |
 //! | [`separator`] | 分割线（横 / 纵） | `crate::separator` |
 //! | [`empty_state`] | 空态说明（弱化文字） | `crate::empty_state` |
-//! | [`alert`] | 对话框内容面板（4 类变体 / 输入校验 / 按钮行） | `crate::alert` |
+//! | [`alert`] | 对话框内容面板（4 类变体 / 输入校验 / 按钮行；内容根通用容器 + 关闭中双击守卫，按钮行实现与 dialog 共用） | `crate::alert` |
 //! | [`dialog`] | 模态对话框容器（遮罩 / 居中面板 / 焦点陷阱与恢复 / Esc 与点外部策略 / E13 组淡入淡出 + E10 完成回调 / a11y Dialog·AlertDialog；标题 / 关闭按钮 / 按钮行 / 确认取消回调；alert 内容协作） | `crate::dialog` + `crate::layer` 的 dialog·alert 槽 |
 //! | [`tab_bar`] | 标签栏（选中指示动画 / 方向键 / 关闭按钮 / a11y） | `crate::tab_bar` |
 //! | [`markdown`] | comrak 解析 → 引擎富文本 run / InlineBox 视图 | `crate::markdown` |

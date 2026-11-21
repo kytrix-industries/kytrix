@@ -28,6 +28,23 @@
 //! `MarkdownState` 画消息与错误，新实现是纯文本（`kit::markdown` 的 view 是 P2-3 的独立组件，
 //! 对话框内容的富文本接线随 P2-4b；登记见 spec-delta §3）。
 //!
+//! # 与 `kit::dialog` 组合（P2-4d1 / P2-4a3）
+//!
+//! alert 只是内容面板：容器 / 模态 / 焦点 / 遮罩 / 动画 / 对话框 a11y 角色都归
+//! [`crate::kit::dialog`]（E12-R1：包装节点声明 `Dialog` / `AlertDialog`）。因此：
+//!
+//! - **内容根不声明对话框角色**，只是 `GenericContainer`（P2-4a3 修 P2-4d1 审查 D6：P2-4a
+//!   交付时内容根声明 `Dialog`，与包装层重复，AT 会读两层对话框）；标题仍由标题文本节点提供；
+//! - **关闭中守卫**：内容按钮（OK / Cancel）在容器开始关闭（淡出）后不再跑用户动作 —— 由
+//!   dialog 挂载内容时经 `AlertBuilder::closing_guard` 注入。旧 dialog 在面板上
+//!   `capture_any_mouse_down` 吞掉退场窗口内的按下；引擎化后内容节点仍是活节点，必须由容器
+//!   告知（P2-4d1 审查 D2 的 alert 内容按钮同类缺陷）；
+//! - **Esc / X 归 dialog**：alert 恒无关闭按钮（旧 alert 没有 X）；Esc 由引擎立即卸载浮层并报
+//!   `Dismissed`，**不跑** `cancel_action`（引擎没有应用层关闭钩子，见 [`crate::kit::dialog`]
+//!   模块文档「alert 的 Esc 语义」）；
+//! - **按钮行**：铺满 / 等分 / 文字居中由 `kit::button` 的 `stretch_button` 统一实现，
+//!   dialog 的确认 / 取消按钮行共用同一份（P2-4a3 去重，AGENTS §6）。
+//!
 //! # 与旧 API 的差异
 //!
 //! - 旧 builder 的输入是 `Entity<InputState>`；新 API 收一个**输入框工厂**（`FnOnce(&mut NodeTree,
@@ -45,7 +62,6 @@ use std::{
 };
 
 use smol_str::SmolStr;
-use taffy::style::{Dimension, JustifyContent};
 use ui_core::{
     a11y::{A11yOverride, A11yRole},
     app::App,
@@ -63,7 +79,10 @@ use ui_core::{
 };
 
 use crate::{
-    kit::{button::Button, input::InputNode},
+    kit::{
+        button::{Button, stretch_button},
+        input::InputNode,
+    },
     style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
 };
@@ -123,6 +142,8 @@ pub struct AlertBuilder {
     validate: Option<Validator>,
     ok_action: Option<OkAction>,
     cancel_action: Option<CancelAction>,
+    /// 容器「关闭中」探针（由 [`crate::kit::dialog`] 注入，见 [`AlertBuilder::closing_guard`]）。
+    closing: Option<Rc<dyn Fn() -> bool>>,
 }
 
 impl AlertBuilder {
@@ -139,6 +160,7 @@ impl AlertBuilder {
             validate: None,
             ok_action: None,
             cancel_action: None,
+            closing: None,
         }
     }
 
@@ -225,6 +247,16 @@ impl AlertBuilder {
         self
     }
 
+    /// 「关闭中」守卫（crate 内部：由 [`crate::kit::dialog`] 挂载 alert 内容时注入）。
+    ///
+    /// 返回 `true`（容器已开始关闭、正在淡出）时内容按钮不再运行用户动作 —— 旧 dialog 在面板上
+    /// `capture_any_mouse_down` 吞掉退场窗口内的按下，引擎化后内容按钮仍是活节点，由容器告知，
+    /// 避免删除类确认在 150 ms 淡出窗口内被双击执行两次（P2-4d1 审查 D2；P2-4a3 修 alert 内容）。
+    pub(crate) fn closing_guard(mut self, closing: impl Fn() -> bool + 'static) -> Self {
+        self.closing = Some(Rc::new(closing));
+        self
+    }
+
     /// 建面板（标题 / 消息 / 输入 + 错误行 / 按钮行）。
     ///
     /// # Errors
@@ -257,8 +289,9 @@ impl AlertBuilder {
                 ..StylePatch::default()
             })
             .a11y(A11yOverride {
-                role: Some(A11yRole::Dialog),
-                label: Some(self.title.clone()),
+                // E12-R1：对话框角色只由 `kit::dialog` 的包装节点声明；内容根只是通用容器
+                // （P2-4a 曾声明 `Dialog`，与包装层形成两层对话框角色，P2-4d1 审查 D6）。
+                role: Some(A11yRole::GenericContainer),
                 ..A11yOverride::default()
             });
         let root = builder.build(
@@ -347,9 +380,13 @@ impl AlertBuilder {
         let ok_action = self.ok_action.clone();
         let error_signal = error;
         let input_for_ok = input_node.clone();
+        let closing_for_ok = self.closing.clone();
         let ok_button = Button::new(app, theme.clone(), smol_str::format_smolstr!("{key}.ok"))
             .label(ok_text)
             .on_click(move |ctx: &mut ActionCtx<'_>| {
+                if closing_for_ok.as_ref().is_some_and(|closing| closing()) {
+                    return;
+                }
                 let value = input_for_ok
                     .as_ref()
                     .map(|input| SmolStr::new(ctx.app_mut().read(&input.state).text()));
@@ -373,6 +410,7 @@ impl AlertBuilder {
         let ok_node = ok_button.build(app, window, row)?;
         stretch_button(app, window, ok_node)?;
         let cancel_action = self.cancel_action.clone();
+        let closing_for_cancel = self.closing.clone();
         let cancel_button = if self.kind.with_cancel() {
             let button = Button::new(
                 app,
@@ -383,6 +421,9 @@ impl AlertBuilder {
             .label(self.cancel_text.clone())
             .joined(1, 2)
             .on_click(move |ctx: &mut ActionCtx<'_>| {
+                if closing_for_cancel.as_ref().is_some_and(|closing| closing()) {
+                    return;
+                }
                 if let Some(action) = &cancel_action {
                     action(ctx.app_mut());
                 }
@@ -403,23 +444,6 @@ impl AlertBuilder {
             scope,
         })
     }
-}
-
-/// 把按钮铺进按钮行：等分（旧 `.flex_1()`）+ 内容居中（旧 `.justify_center()`）。
-///
-/// 裁决：按钮行的布局归 alert 包裹层（旧实现也是调用方在 `Button` 上 `flex_1 / justify_center`），
-/// `Button` 本身不新增 flex 拉伸语义。
-fn stretch_button(app: &mut App, window: WindowId, node: NodeId) -> Result<(), EngineError> {
-    let tree = app
-        .window_mut(window)
-        .ok_or(EngineError::UnknownWindow { window })?
-        .tree_mut();
-    let mut style = tree.get(node)?.style().clone();
-    style.inner.flex_grow = 1.0;
-    style.inner.flex_shrink = 1.0;
-    style.inner.flex_basis = Dimension::length(0.0);
-    style.inner.justify_content = JustifyContent::CENTER;
-    tree.set_style(node, style)
 }
 
 impl Default for AlertBuilder {
@@ -523,7 +547,10 @@ mod tests {
 
     use super::{Alert, AlertBuilder, InputFactory};
     use crate::{
-        kit::input::{InputSpec, InputState, build as build_input},
+        kit::{
+            input::{InputSpec, InputState, build as build_input},
+            test_support::full_a11y,
+        },
         theme::{
             appearance::Appearance, components::ControlSize, handle::ThemeHandle, resolved::Theme,
             role::Role,
@@ -832,24 +859,102 @@ mod tests {
         assert_eq!(calls.get(), 1, "通过后调用 ok_action");
     }
 
-    /// a11y：面板是 Dialog（标题为可访问名），按钮是 Button。
+    /// a11y：内容根只是通用容器（对话框角色归 `kit::dialog` 包装层），按钮是 Button。
     #[test]
-    fn the_alert_panel_declares_dialog_and_button_roles() {
-        let harness = harness(|builder, _, _| builder.ok("Saved", "Written."));
-        let snapshot = harness.app.a11y().expect("a11y");
-        let panel = snapshot
-            .node_for(harness.alert.root_node())
-            .expect("panel a11y");
-        assert_eq!(panel.role, A11yRole::Dialog);
-        assert_eq!(panel.label_text(), Some("Saved"));
-        let ok = harness
-            .alert
-            .ok_button()
-            .node()
-            .and_then(|node| snapshot.node_for(node))
-            .expect("ok a11y");
+    fn the_alert_content_root_is_a_generic_container_not_a_dialog() {
+        let mut harness = harness(|builder, _, _| builder.ok("Saved", "Written."));
+        let alert_root = harness.alert.root_node();
+        let ok_node = harness.alert.ok_button().node().expect("ok node");
+        let snapshot = full_a11y(&mut harness.app);
+        let content = snapshot.node_for(alert_root).expect("内容根 a11y");
+        assert_eq!(
+            content.role,
+            A11yRole::GenericContainer,
+            "内容根不得声明 Dialog（P2-4d1 审查 D6）"
+        );
+        assert_eq!(content.label_text(), None, "可访问名归对话框包装层");
+        let ok = snapshot.node_for(ok_node).expect("ok a11y");
         assert_eq!(ok.role, A11yRole::Button);
         assert_eq!(ok.label_text(), Some("OK"));
+        assert!(
+            snapshot
+                .nodes()
+                .iter()
+                .all(|node| !matches!(node.role, A11yRole::Dialog | A11yRole::AlertDialog)),
+            "alert 内容面板自身不含对话框角色"
+        );
+    }
+
+    /// 调用方给的文案（本地化）同时是按钮可见文字与 a11y 名；默认英文不得残留。
+    #[test]
+    fn the_alert_uses_the_callers_localized_button_labels() {
+        let harness = harness(|builder, _, _| {
+            builder
+                .ok_cancel("删除", "此操作不可撤销。")
+                .ok_text("删除")
+                .cancel_text("取消")
+        });
+        let ok_node = harness.alert.ok_button().node().expect("ok node");
+        let cancel_node = harness
+            .alert
+            .cancel_button()
+            .expect("cancel")
+            .node()
+            .expect("cancel node");
+        let mut app = harness.app;
+        let snapshot = full_a11y(&mut app);
+        for (node, label) in [(ok_node, "删除"), (cancel_node, "取消")] {
+            let record = snapshot.node_for(node).expect("按钮 a11y");
+            assert_eq!(record.role, A11yRole::Button);
+            assert_eq!(record.label_text(), Some(label), "a11y 名用调用方文案");
+        }
+        let probe = app.probe();
+        for label in ["删除", "取消"] {
+            assert!(
+                probe.by_selector(Selector::Text(label)).is_some(),
+                "{label} 必须是按钮的可见文字"
+            );
+        }
+        for default in ["OK", "Cancel"] {
+            assert!(
+                probe.by_selector(Selector::Text(default)).is_none(),
+                "调用方给了本地化文案时不得残留默认英文 {default}"
+            );
+        }
+    }
+
+    /// `closing_guard`：容器开始关闭后，OK / Cancel 都不再跑用户动作（dialog 集成测试另见
+    /// `kit::dialog::a_second_click_on_alert_content_during_the_fade_runs_no_action`）。
+    #[test]
+    fn a_closing_alert_content_runs_no_button_actions() {
+        let closing = Rc::new(Cell::new(false));
+        let ok_runs = Rc::new(Cell::new(0u32));
+        let cancel_runs = Rc::new(Cell::new(0u32));
+        let closing_for_builder = closing.clone();
+        let ok_for_builder = ok_runs.clone();
+        let cancel_for_builder = cancel_runs.clone();
+        let harness = harness(move |builder, _, _| {
+            builder
+                .ok_cancel("Discard", "Lose changes?")
+                .ok_action(move |_, _| ok_for_builder.set(ok_for_builder.get() + 1))
+                .cancel_action(move |_| cancel_for_builder.set(cancel_for_builder.get() + 1))
+                .closing_guard(move || closing_for_builder.get())
+        });
+        let mut app = harness.app;
+        let ok = harness.alert.ok_button().node().expect("ok node");
+        let cancel = harness
+            .alert
+            .cancel_button()
+            .expect("cancel")
+            .node()
+            .expect("cancel node");
+        click(&mut app, ok);
+        assert_eq!(ok_runs.get(), 1, "未关闭时 OK 动作照常跑");
+        closing.set(true);
+        click(&mut app, ok);
+        assert_eq!(ok_runs.get(), 1, "关闭中不得再跑 OK 动作");
+        click(&mut app, cancel);
+        assert_eq!(cancel_runs.get(), 0, "关闭中不得跑 Cancel 动作");
     }
 
     /// 错误行初始不可见（`visible = false`），错误出现后可见。
