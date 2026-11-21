@@ -134,6 +134,45 @@ pub enum A11yRole {
     Tab,
     /// 分隔符（`role="separator"`；菜单 / 工具条分组）。
     Separator,
+    // ── E15：组合控件 / 颜色控件的专用角色（AccessKit 0.25 命名） ──────────────
+    /// 组合框（`role="combobox"`；下拉 / 选择器的**触发器**用它替代 `Button`）。
+    ///
+    /// 展开态走 `A11yPatch::expanded`（`aria-expanded`）；被展开的面板容器用 [`Self::ListBox`]。
+    /// 三端映射：Windows UIA `UIA_ComboBoxControlTypeId`；macOS `NSAccessibilityPopUpButtonRole`
+    /// （AppKit 没有真正的 combo box，弹出按钮是等价物）；AT-SPI `AtspiRole::ComboBox`。
+    ComboBox,
+    /// 列表框容器（`role="listbox"`；子项是 [`Self::ListBoxOption`]）。
+    ///
+    /// 虚拟列表容器默认按种类推导成 [`Self::List`]；选择器 / 菜单这类**集合语义容器**可以显式
+    /// 声明本角色（`A11yPatch::role` / `A11yOverride::role`），避免 AT 读到「列表里套列表」。
+    /// 三端映射：UIA `UIA_ListControlTypeId`；macOS `NSAccessibilityListRole`；AT-SPI
+    /// `AtspiRole::ListBox`。
+    ListBox,
+    /// 可勾选菜单项（`role="menuitemcheckbox"`）。
+    ///
+    /// 勾选态走 `A11yPatch::checked`（AccessKit 的 `Toggled`）—— 与 `MenuItem` 的区别就在这里：
+    /// `MenuItem` 不读 `checked`，AT 因此不会播报勾选。三端映射：UIA
+    /// `UIA_CheckBoxControlTypeId`（`aria_role = "menuitemcheckbox"`，勾选走 TogglePattern）；
+    /// macOS `NSAccessibilityMenuItemRole`（勾选走 value）；AT-SPI `AtspiRole::CheckMenuItem`。
+    ///
+    /// 拼写沿用 AccessKit 0.25 的 `MenuItemCheckBox`（与本枚举既有的 [`Self::CheckBox`] 同款
+    /// 大小写；E15 登记文档里写作 `MenuItemCheckbox`）。
+    MenuItemCheckBox,
+    /// 单选菜单项（`role="menuitemradio"`）。
+    ///
+    /// 勾选态同样走 `A11yPatch::checked`；Windows 的 `SelectionItemPattern.IsSelected` 由
+    /// `Toggled` 推导（`accesskit_windows` 对 `RadioButton` / `MenuItemRadio` 同款处理）。
+    /// 三端映射：UIA `UIA_RadioButtonControlTypeId`（`aria_role = "menuitemradio"`）；macOS
+    /// `NSAccessibilityMenuItemRole`；AT-SPI `AtspiRole::RadioMenuItem`。
+    MenuItemRadio,
+    /// 颜色色块控件（AccessKit 0.25 的 `Role::ColorWell`；对应 `input[type=color]` 的色块）。
+    ///
+    /// 值（当前颜色）走 `value` 通道（HEX / 颜色文本），可访问名走 `label`。
+    /// 三端映射：UIA **没有专用 control type**，`accesskit_windows` 映射到
+    /// `UIA_ButtonControlTypeId`（`aria_role = "textbox"`）；macOS 有专用
+    /// `NSAccessibilityColorWellRole`；AT-SPI **没有专用 role**，`accesskit_atspi_common` 回退到
+    /// `AtspiRole::Button`。三端都可读名字 + 值，交互（打开取色器）由 `Click` 能力表达。
+    ColorWell,
 }
 
 impl A11yRole {
@@ -143,7 +182,7 @@ impl A11yRole {
     /// （`a11y::mapping`）用一个**穷举 `match`** 给每个变体计数并与本数组求和比对 ——
     /// 少列一个变体 ⇒ 求和偏小 ⇒ 测试红；加一个变体忘了加进 `ALL` ⇒ 编译期
     /// `non-exhaustive patterns` 先报错。这正是 R13-11 要求的"手写数组不再假绿"。
-    pub const ALL: [Self; 38] = [
+    pub const ALL: [Self; 43] = [
         Self::Window,
         Self::Application,
         Self::GenericContainer,
@@ -182,6 +221,11 @@ impl A11yRole {
         Self::TabList,
         Self::Tab,
         Self::Separator,
+        Self::ComboBox,
+        Self::ListBox,
+        Self::MenuItemCheckBox,
+        Self::MenuItemRadio,
+        Self::ColorWell,
     ];
 }
 
@@ -194,6 +238,21 @@ pub enum A11ySort {
     Descending,
     /// 可排序但当前未排序（`aria-sort="none"`）。
     None,
+}
+
+/// 控件的方向（`accesskit::Orientation` 的子集；E15）。
+///
+/// 目前有两个生产者：滚动容器（由 `A11yScroll::vertical` 自动推导）与滑条 / 色盘这类
+/// **轴向控件**（`A11yOverride::orientation` / `A11yPatch::orientation` 显式声明）。
+/// 三端都把它当同一属性读取：UIA `OrientationProperty`、macOS `NSAccessibilityOrientationAttribute`、
+/// AT-SPI `getOrientation`。水平滑条不声明时 AT 只拿到 `None`（各平台自行猜），声明后播报
+/// "水平"。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum A11yOrientation {
+    /// 水平。
+    Horizontal,
+    /// 垂直。
+    Vertical,
 }
 
 /// 文本选区（**UTF-8 字节偏移**，落在文本自身；引擎在 a11y 层换算成 grapheme 下标）。
@@ -409,6 +468,8 @@ pub struct A11yOverride {
     pub placeholder: Option<SmolStr>,
     /// 标题层级（`set_level`；`Heading` 用）。
     pub level: Option<usize>,
+    /// 方向（`set_orientation`；滑条 / 色盘等轴向控件用）。`None` = 不表态。
+    pub orientation: Option<A11yOrientation>,
 }
 
 /// `bind_a11y` 每帧求值的**动态**补丁（值语义；`None` = 本帧不覆盖）。
@@ -491,6 +552,26 @@ pub struct A11yPatch {
     pub placeholder: Option<SmolStr>,
     /// 标题层级。
     pub level: Option<usize>,
+    /// 方向（`set_orientation`；滑条 / 色盘等轴向控件用）。`None` = 不表态。
+    pub orientation: Option<A11yOrientation>,
+}
+
+impl A11yPatch {
+    /// 这次补丁变化是否会影响**后代**的 a11y 语义（E15）。
+    ///
+    /// 只有**沿 a11y 子树继承 / 被后代推导**的字段算：
+    /// - `role`：文本子节点的 `TextRun` ↔ `Label` 推导、集合语义（`Table` / `Tree` / `Row`）
+    ///   的领养关系都按祖先的声明角色求；
+    /// - `hidden`：被集合语义跳过（不在 a11y 父链上）的物理祖先若声明隐藏，后代也必须隐藏。
+    ///
+    /// 其余字段只描述本节点，改它们只需重发本节点（`mark_a11y`）；这里返回 `false` 时调用方
+    /// 不做 O(子树) 的标记。（`disabled` 的**祖先继承**只认 `StylePatch::interactive`，那条
+    /// 通道在 `refresh_styles` 里走同一套子树标记，不经过本补丁差分。）
+    /// 消费者：`app::a11y::refresh_a11y_bindings`（`bind_a11y` 的差分写回）。
+    #[must_use]
+    pub fn affects_descendants(&self, previous: &Self) -> bool {
+        self.role != previous.role || self.hidden != previous.hidden
+    }
 }
 
 /// 实时区域（live region）的播报策略。
@@ -626,6 +707,11 @@ pub struct A11yNode {
     pub placeholder: Option<SmolStr>,
     /// 标题层级（`set_level`）。
     pub level: Option<usize>,
+    /// 方向（`set_orientation`；滑条 / 色盘等轴向控件 + 滚动容器都用它，E15）。
+    ///
+    /// 滚动容器在 `scroll` 非空时由 `A11yScroll::vertical` 自动推导；显式声明优先
+    /// （应用对滑条等非滚动控件用它表达轴向）。
+    pub orientation: Option<A11yOrientation>,
     /// 引擎侧的**逻辑**子节点（a11y 树，未过滤）。
     ///
     /// 一般情况下 = 物理子节点；**集合语义**（`Table`/`Grid`/`Tree`/`Row`/`TreeItem`）下，

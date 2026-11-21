@@ -259,7 +259,13 @@ pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePas
                 tree.mark_layout(node);
             }
             if a11y_changed {
-                tree.mark_a11y(node);
+                // E15：`visible` / `interactive` 是**沿祖先链生效**的 a11y 输入 —— `focusable`
+                // （隐式 `Focus` 能力）与 `is_hidden` 都向上看祖先。祖先切换可见/可交互后，
+                // 后代的 `Focus` / `Click` 能力会翻转，但后代自己没有脏位；只标本节点时增量笔
+                // 与全树分叉（P2-4c2 / P2-4d2 的「增量缺 Focus」证据：浮层根 `visible` 一翻，
+                // 面板里的 `Tab` / `List` 容器在增量笔里仍是没有 Focus 的旧记录）。
+                // 整棵子树标 `A11Y`：只重发 a11y 快照字段，不产生像素工作、不清 `REUSABLE`。
+                tree.mark_subtree_a11y(node);
             }
         }
         let mut text_changed_here = false;

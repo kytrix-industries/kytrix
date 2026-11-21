@@ -199,6 +199,37 @@ pub(crate) fn a11y_take(app: &mut App, window: WindowId) -> Option<crate::a11y::
     snapshot
 }
 
+/// 写一个节点的**动态** a11y 补丁并登记交付（E15）。
+///
+/// 与 `NodeBuilder::bind_a11y` 是同一条写入通道（合并方向不变：`patch` > `A11yOverride` >
+/// 由节点种类/结构推导），区别是求值点在**应用侧**：应用自己观察状态变化（虚拟列表行的选中
+/// 集、筛选项的勾选态……）后把新的 [`crate::a11y::A11yPatch`] 推进来，引擎标 `A11Y` 脏位并
+/// 在下一笔增量交付里重发该节点。行节点由列表内核持有、应用拿不到句柄，因此这是「静态快照
+/// 行 a11y」的动态失效面（P2-4c2/4d2 审查：`List::set_row_a11y` 捕获的行 `selected` /
+/// `checked` 在面板打开期间不刷新）；组合控件在选中集变化时对已挂载行逐个调用本方法即可，
+/// 或改用 `bind_a11y` 的 `ReadCtx` 形态由信号依赖自动失效。
+///
+/// **不做等值短路**：补丁是整值替换（与 `bind_a11y` 同语义），且应用通常只在真的变化时调用；
+/// 这里多标一次 `A11Y` 最多换来一次同值重发，不产生像素工作。
+///
+/// # Errors
+/// `EngineError::UnknownWindow`（窗口已关闭）/ `EngineError::StaleNode`（节点已卸载）。
+pub(crate) fn set_a11y_patch(
+    app: &mut App,
+    window: WindowId,
+    node: crate::node::id::NodeId,
+    patch: crate::a11y::A11yPatch,
+) -> Result<(), crate::error::EngineError> {
+    let Some(target) = app.windows.get_mut(&window) else {
+        return Err(crate::error::EngineError::UnknownWindow { window });
+    };
+    let tree = target.tree_mut();
+    tree.get(node)?;
+    tree.set_a11y_patch(node, patch);
+    tree.mark_a11y(node);
+    Ok(())
+}
+
 /// 只重算 `bind_a11y` 的 pass（R13-6 的 `refresh_a11y_bindings`）。
 ///
 /// **不产生任何像素工作**：不标 `BIND`/`PAINT`、不清 `REUSABLE`、不产生 damage。消费者：
@@ -268,9 +299,18 @@ pub(crate) fn refresh_a11y_bindings(app: &mut App, window: WindowId) {
             .a11y_of(node)
             .map_or_else(crate::a11y::A11yPatch::default, |slot| slot.patch.clone());
         if value != previous {
+            // E15：角色 / 隐藏的变化会改变**后代**的 a11y 语义（文本角色推导、集合领养、被跳过
+            // 祖先的隐藏声明），但后代没有自己的脏位。只标本节点会让增量笔与全树分叉；
+            // 这些字段变化时整棵子树标 `A11Y`（只重发快照字段，不产生像素工作）。
+            // （`disabled` 的祖先继承只认 `StylePatch::interactive`，由 `refresh_styles` 的
+            // 子树标记覆盖；A11yPatch::disabled 不进入这条差分。）
+            let affects_descendants = value.affects_descendants(&previous);
             tree.set_a11y_patch(node, value);
             // 只标 `A11Y`：不产生视觉 damage、不清 `REUSABLE`（P03 §9.3 表第 9 行）。
             tree.mark_a11y(node);
+            if affects_descendants {
+                tree.mark_subtree_a11y(node);
+            }
         }
         tree.put_bind_a11y(node, bind);
     }

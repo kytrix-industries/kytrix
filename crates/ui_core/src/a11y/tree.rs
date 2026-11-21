@@ -167,6 +167,9 @@ pub(crate) fn node_a11y_with_cache(
                 | A11yRole::RadioButton
                 | A11yRole::Slider
                 | A11yRole::MenuItem
+                // E15：可勾选菜单项与组合控件同样「没有名字就没有语义」。
+                | A11yRole::MenuItemCheckBox
+                | A11yRole::MenuItemRadio
                 | A11yRole::ListBoxOption
                 // R13-22 补：没有名字就没有语义的容器 / 控件。
                 // 刻意**不含** `Row` / `Cell` / `ColumnHeader` / `RowHeader`：这些角色的
@@ -174,6 +177,9 @@ pub(crate) fn node_a11y_with_cache(
                 | A11yRole::ScrollBar
                 | A11yRole::Menu
                 | A11yRole::MenuBar
+                | A11yRole::ComboBox
+                | A11yRole::ListBox
+                | A11yRole::ColorWell
                 | A11yRole::Tooltip
         )
     {
@@ -281,6 +287,11 @@ pub(crate) fn node_a11y_with_cache(
     let level = patch
         .and_then(|patch| patch.level)
         .or_else(|| over.and_then(|over| over.level));
+    // E15：方向（滑条 / 色盘等轴向控件）。滚动容器的方向由 `A11yScroll` 在 adapter 侧推导，
+    // 显式声明优先（应用对非滚动控件用它表达轴向）。
+    let orientation = patch
+        .and_then(|patch| patch.orientation)
+        .or_else(|| over.and_then(|over| over.orientation));
 
     let id = ids.id_for(
         tree,
@@ -373,6 +384,7 @@ pub(crate) fn node_a11y_with_cache(
         error_message,
         placeholder,
         level,
+        orientation,
         children,
         parent: parent.map(|parent| {
             let key = identity_key(
@@ -718,6 +730,63 @@ pub(crate) fn nearest_collection_ancestor(tree: &NodeTree, node: NodeId) -> Opti
     nearest_ancestor_where(tree, node, |role| {
         matches!(role, A11yRole::Table | A11yRole::Grid | A11yRole::Tree)
     })
+}
+
+/// 最近的**显式声明**的集合语义容器角色（`Table` / `Grid` / `Tree` / `ListBox` / `Menu`）。
+///
+/// 只认声明角色：自动推导的 `List` 不构成集合边界（嵌套列表的窗口仍各自推导）。
+fn nearest_declared_container_role(tree: &NodeTree, node: NodeId) -> Option<A11yRole> {
+    let mut cursor = tree.get(node).ok().and_then(Node::parent);
+    while let Some(current) = cursor {
+        if let Some(
+            role @ (A11yRole::Table
+            | A11yRole::Grid
+            | A11yRole::Tree
+            | A11yRole::ListBox
+            | A11yRole::Menu),
+        ) = declared_role(tree, current)
+        {
+            return Some(role);
+        }
+        cursor = tree.get(current).ok().and_then(Node::parent);
+    }
+    None
+}
+
+/// 虚拟列表容器是否应该**抑制**自动推导的 `List` 角色（E15；E9 残余 R2 的修复判据）。
+///
+/// 虚拟窗口只是一层布局/滚动实现细节，但它默认会被推导成 `List`。当窗口位于一个**显式声明的
+/// 集合语义容器**之下时，那个容器已经在表达集合，窗口再报 `List` 会让 AT 读到「表格/树/列表框/
+/// 菜单里套了一个列表」（`accesskit_consumer::common_filter` 只过滤 `GenericContainer`）：
+///
+/// | 最近的声明祖先 | 抑制判据 |
+/// |---|---|
+/// | `Table` / `Grid` | 已挂载项全部声明 `Row`（空窗口按行窗口计，与 E9 判据同口径） |
+/// | `Tree` | 已挂载项全部声明 `TreeItem`（空窗口同上） |
+/// | `ListBox` / `Menu` | 恒抑制：列表框 / 菜单的项由容器语义负责，窗口只承载布局 |
+///
+/// 只认**声明**角色（`A11yPatch::role` / `A11yOverride::role`）：裸虚拟列表没有声明祖先，继续
+/// 按 `List` 暴露（反向护栏见 `a_plain_virtual_list_keeps_the_list_role`）。
+pub(crate) fn is_suppressed_list_window(tree: &NodeTree, node: NodeId) -> bool {
+    if tree.virtual_slot(node).is_none() {
+        return false;
+    }
+    let Some(owner_role) = nearest_declared_container_role(tree, node) else {
+        return false;
+    };
+    let items_all_declare = |expected: A11yRole| {
+        tree.virtual_slot(node).is_some_and(|slot| {
+            slot.mounted
+                .iter()
+                .all(|(_, row)| declared_role(tree, *row) == Some(expected))
+        })
+    };
+    match owner_role {
+        A11yRole::ListBox | A11yRole::Menu => true,
+        A11yRole::Table | A11yRole::Grid => items_all_declare(A11yRole::Row),
+        A11yRole::Tree => items_all_declare(A11yRole::TreeItem),
+        _ => false,
+    }
 }
 
 /// a11y 树里的**逻辑父**：集合语义把节点挂到最近的集合祖先下、跳过布局包裹层；其它角色就是
@@ -1964,9 +2033,15 @@ mod tests {
             assert_eq!(accesskit_node.row_count(), Some(101));
         }
 
-        // 行窗口自身不再是行的 a11y 父（它的逻辑子节点为空）。
+        // 行窗口自身不再是行的 a11y 父（它的逻辑子节点为空），且 E15 起不再以 `List` 暴露：
+        // 行已被领养到 Table 下，窗口只是布局实现细节；`GenericContainer` 会被平台
+        // `common_filter` 透明上提，AT 因此看不到「表格里套了一个空列表」（E9 残余 R2）。
         let viewport_record = snapshot_with(&tree, viewport, &mut ids, &mut tables);
-        assert_eq!(viewport_record.role, A11yRole::List);
+        assert_eq!(
+            viewport_record.role,
+            A11yRole::GenericContainer,
+            "集合行窗口不得再自动声明 `List`（E15）"
+        );
         assert!(
             viewport_record.children.is_empty(),
             "行被领养到 Table 后，行窗口不得再列出行"
@@ -2589,6 +2664,291 @@ mod tests {
         assert!(
             !snapshot_with(&tree, item, &mut ids, &mut tables).hidden,
             "弹出层内容对 AT 必须可见（对话框里的下拉菜单）"
+        );
+    }
+
+    // ── E15：虚拟容器角色 + orientation ──────────────────────────────────────
+
+    /// 给节点挂虚拟列表槽（E15 容器角色测试的公共前置）。
+    fn declare_virtual_window(
+        tree: &mut NodeTree,
+        node: NodeId,
+        count: usize,
+        mounted: &[(usize, NodeId)],
+    ) {
+        let mut slot = crate::interaction::VirtualSlot::new(20.0, 0);
+        slot.count = count;
+        slot.mounted = mounted.to_vec();
+        tree.ensure_interaction(node)
+            .expect("interaction")
+            .virtual_list = Some(slot);
+    }
+
+    /// E15 反向护栏：**裸**虚拟列表（没有集合祖先）仍然自动推导成 `List` —— 「抑制自动 List」
+    /// 只针对集合行窗口，不能把普通列表也吞掉（那会让行长文本的集合语义整体消失）。
+    #[test]
+    fn a_plain_virtual_list_keeps_the_list_role() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let viewport = NodeBuilder::boxed()
+            .build(&mut tree, root)
+            .expect("viewport");
+        let row = NodeBuilder::boxed()
+            .build(&mut tree, viewport)
+            .expect("row");
+        declare_virtual_window(&mut tree, viewport, 10, &[(0, row)]);
+
+        let mut ids = A11yIds::new();
+        let mut tables = super::CollectionSemanticsCache::default();
+        let record = snapshot_with(&tree, viewport, &mut ids, &mut tables);
+        assert_eq!(
+            record.role,
+            A11yRole::List,
+            "无集合祖先的虚拟列表容器必须仍是 List"
+        );
+        assert_eq!(
+            crate::a11y::adapter::to_accesskit(&record).role(),
+            accesskit::Role::List
+        );
+    }
+
+    /// E15：容器角色可以**显式声明**（`A11yPatch::role` 优先于按种类推导）—— 选择器 / 菜单的
+    /// 虚拟列表容器声明 `ListBox` 后，AT 看到的是列表框而不是「列表里再套一个列表」。
+    #[test]
+    fn an_explicit_container_role_overrides_the_auto_list() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let viewport = NodeBuilder::boxed()
+            .build(&mut tree, root)
+            .expect("viewport");
+        let row = NodeBuilder::boxed()
+            .build(&mut tree, viewport)
+            .expect("row");
+        declare_virtual_window(&mut tree, viewport, 3, &[(0, row)]);
+        tree.set_a11y_patch(
+            viewport,
+            crate::a11y::A11yPatch {
+                role: Some(A11yRole::ListBox),
+                size_of_set: Some(3),
+                ..crate::a11y::A11yPatch::default()
+            },
+        );
+
+        let mut ids = A11yIds::new();
+        let mut tables = super::CollectionSemanticsCache::default();
+        let record = snapshot_with(&tree, viewport, &mut ids, &mut tables);
+        assert_eq!(record.role, A11yRole::ListBox);
+        let ak = crate::a11y::adapter::to_accesskit(&record);
+        assert_eq!(ak.role(), accesskit::Role::ListBox);
+        assert_eq!(ak.size_of_set(), Some(3));
+    }
+
+    /// E15：树的**行窗口**（已挂载项全部声明 `TreeItem`）不再以 `List` 出现；树项仍挂到 `Tree`
+    /// 下（E9 集合语义不变），窗口只作为空的容器留给平台过滤。
+    #[test]
+    fn a_tree_row_window_is_not_exposed_as_a_list() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let tree_node = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Tree),
+                label: Some(smol_str::SmolStr::new_static("持仓")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("tree");
+        let wrapper = NodeBuilder::boxed()
+            .build(&mut tree, tree_node)
+            .expect("wrapper");
+        let viewport = NodeBuilder::boxed()
+            .build(&mut tree, wrapper)
+            .expect("viewport");
+        let mut items = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let item = NodeBuilder::boxed()
+                .a11y(A11yOverride {
+                    role: Some(A11yRole::TreeItem),
+                    label: Some(smol_str::SmolStr::new_static("BTC")),
+                    ..A11yOverride::default()
+                })
+                .build(&mut tree, viewport)
+                .expect("tree item");
+            items.push(item);
+        }
+        declare_virtual_window(&mut tree, viewport, 2, &[(0, items[0]), (1, items[1])]);
+
+        let mut ids = A11yIds::new();
+        let mut tables = super::CollectionSemanticsCache::default();
+        let tree_record = snapshot_with(&tree, tree_node, &mut ids, &mut tables);
+        let viewport_record = snapshot_with(&tree, viewport, &mut ids, &mut tables);
+        assert_eq!(
+            viewport_record.role,
+            A11yRole::GenericContainer,
+            "树的集合行窗口不得暴露成 List（AT 会读成「树里套列表」）"
+        );
+        assert!(
+            viewport_record.children.is_empty(),
+            "树项已被领养到 Tree 下，行窗口不得再列出它们"
+        );
+        for item in items {
+            let record = snapshot_with(&tree, item, &mut ids, &mut tables);
+            assert_eq!(record.role, A11yRole::TreeItem);
+            assert_eq!(record.parent, Some(tree_record.id), "树项的 a11y 父是 Tree");
+        }
+    }
+
+    /// E15：空行窗口按行窗口计（与 E9 的行窗口判据同口径）—— 首帧还没挂载行时，表格里的虚拟
+    /// 容器不能先闪一个 `List` 再变成容器（角色翻转会让 AT 重新播报整棵集合）。
+    #[test]
+    fn an_empty_collection_row_window_is_still_suppressed() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let table = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Table),
+                label: Some(smol_str::SmolStr::new_static("行情")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("table");
+        let viewport = NodeBuilder::boxed()
+            .build(&mut tree, table)
+            .expect("viewport");
+        declare_virtual_window(&mut tree, viewport, 100, &[]);
+
+        let mut ids = A11yIds::new();
+        let mut tables = super::CollectionSemanticsCache::default();
+        assert_eq!(
+            snapshot_with(&tree, viewport, &mut ids, &mut tables).role,
+            A11yRole::GenericContainer,
+            "空行窗口（首帧 / 全未挂载）也按行窗口抑制自动 List"
+        );
+    }
+
+    /// E15：选择器 / 菜单场景 —— 包装容器显式声明 `ListBox` / `Menu` 后，内层的虚拟列表容器
+    /// 不再自成一列表（平台透明上提后是 `ListBox → ListBoxOption` / `Menu → MenuItem`，而不是
+    /// 「列表里再套一个列表」；P2-4c2 F9 / kit-menu 缺口 2）。
+    #[test]
+    fn a_list_box_or_menu_container_suppresses_the_inner_list() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let list_box = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::ListBox),
+                label: Some(smol_str::SmolStr::new_static("选择")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("list box");
+        let list_viewport = NodeBuilder::boxed()
+            .build(&mut tree, list_box)
+            .expect("list viewport");
+        let option = NodeBuilder::boxed()
+            .build(&mut tree, list_viewport)
+            .expect("option");
+        declare_virtual_window(&mut tree, list_viewport, 2, &[(0, option)]);
+
+        let menu = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Menu),
+                label: Some(smol_str::SmolStr::new_static("交易")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("menu");
+        let menu_viewport = NodeBuilder::boxed()
+            .build(&mut tree, menu)
+            .expect("menu viewport");
+        let menu_item = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::MenuItem),
+                label: Some(smol_str::SmolStr::new_static("买入")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, menu_viewport)
+            .expect("menu item");
+        declare_virtual_window(&mut tree, menu_viewport, 1, &[(0, menu_item)]);
+
+        let mut ids = A11yIds::new();
+        let mut tables = super::CollectionSemanticsCache::default();
+        let list_box_record = snapshot_with(&tree, list_box, &mut ids, &mut tables);
+        let list_viewport_record = snapshot_with(&tree, list_viewport, &mut ids, &mut tables);
+        assert_eq!(list_box_record.role, A11yRole::ListBox);
+        assert_eq!(
+            list_viewport_record.role,
+            A11yRole::GenericContainer,
+            "ListBox 包装下的虚拟窗口不得再报 List（否则 AT 读到列表套列表）"
+        );
+        assert_eq!(
+            list_box_record.children,
+            vec![list_viewport_record.id],
+            "窗口仍是物理子节点，只是语义被透明上提"
+        );
+
+        let menu_record = snapshot_with(&tree, menu, &mut ids, &mut tables);
+        let menu_viewport_record = snapshot_with(&tree, menu_viewport, &mut ids, &mut tables);
+        assert_eq!(menu_record.role, A11yRole::Menu);
+        assert_eq!(
+            menu_viewport_record.role,
+            A11yRole::GenericContainer,
+            "Menu 包装下的虚拟窗口不得再报 List"
+        );
+        assert_eq!(
+            snapshot_with(&tree, menu_item, &mut ids, &mut tables).role,
+            A11yRole::MenuItem,
+            "项角色由行声明决定，不受窗口抑制影响"
+        );
+    }
+
+    /// E15：`orientation` 走**动态补丁优先、静态声明兜底**（与 role/label 的合并方向一致），
+    /// 并落进 `accesskit::Node`（三端读同一属性：UIA OrientationProperty / macOS orientation
+    /// attribute / AT-SPI getOrientation）。
+    #[test]
+    fn orientation_follows_the_patch_first_merge() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let slider = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Slider),
+                label: Some(smol_str::SmolStr::new_static("色相")),
+                orientation: Some(crate::a11y::A11yOrientation::Horizontal),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("slider");
+
+        let mut diagnostics = Vec::new();
+        let mut ids = A11yIds::new();
+        let static_record =
+            super::node_a11y(&tree, slider, Scale::ONE, "", &mut ids, &mut diagnostics)
+                .expect("slider record");
+        assert_eq!(
+            static_record.orientation,
+            Some(crate::a11y::A11yOrientation::Horizontal)
+        );
+        assert_eq!(
+            crate::a11y::adapter::to_accesskit(&static_record).orientation(),
+            Some(accesskit::Orientation::Horizontal)
+        );
+
+        tree.set_a11y_patch(
+            slider,
+            crate::a11y::A11yPatch {
+                orientation: Some(crate::a11y::A11yOrientation::Vertical),
+                ..crate::a11y::A11yPatch::default()
+            },
+        );
+        let patch_record =
+            super::node_a11y(&tree, slider, Scale::ONE, "", &mut ids, &mut diagnostics)
+                .expect("slider record after patch");
+        assert_eq!(
+            patch_record.orientation,
+            Some(crate::a11y::A11yOrientation::Vertical),
+            "动态补丁必须能覆盖静态声明（patch-first）"
+        );
+        assert_eq!(
+            crate::a11y::adapter::to_accesskit(&patch_record).orientation(),
+            Some(accesskit::Orientation::Vertical)
         );
     }
 }

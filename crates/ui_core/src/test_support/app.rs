@@ -1326,6 +1326,48 @@ mod p11_tests {
         app.a11y().expect("本帧必须有一笔 a11y 交付")
     }
 
+    /// 虚拟列表容器所需的样式（`Clip::Bounds` + `position: relative`）。
+    fn scroll_container_style(width: f32, height: f32) -> Style {
+        let mut inner = taffy::Style::<SmolStr>::DEFAULT;
+        inner.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::length(width),
+            height: taffy::style::Dimension::length(height),
+        };
+        inner.position = taffy::style::Position::Relative;
+        Style {
+            inner,
+            clip: Clip::Bounds,
+        }
+    }
+
+    /// 固定尺寸的普通容器样式（可以挂子节点；`layout_override` 的节点是叶子）。
+    fn fixed_size_style(width: f32, height: f32) -> Style {
+        let mut inner = taffy::Style::<SmolStr>::DEFAULT;
+        inner.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::length(width),
+            height: taffy::style::Dimension::length(height),
+        };
+        Style {
+            inner,
+            clip: Clip::None,
+        }
+    }
+
+    /// `parent` 的第一个物理子节点（测试里从容器取刚建出来的子节点）。
+    fn child_of(app: &TestApp, parent: NodeId) -> NodeId {
+        let window = app.window_id();
+        app.app()
+            .window(window)
+            .expect("window")
+            .tree()
+            .get(parent)
+            .expect("parent")
+            .children()
+            .first()
+            .copied()
+            .expect("parent has a child")
+    }
+
     #[test]
     fn a11y_roles_labels_and_values() {
         let mut app = TestApp::new();
@@ -1742,6 +1784,472 @@ mod p11_tests {
         assert_eq!(snap.node_for(container).expect("list").role, A11yRole::List);
         assert!(mounted < 100, "100 行的列表不得整表挂载");
         let _ = Point::ZERO;
+    }
+
+    // ── E15：a11y 增量修复（Focus / 容器角色 / 行动态刷新） ──────────────────
+
+    /// E15（P2-4c2 / P2-4d2 的 Focus 增量失败面）：祖先的 `visible` 翻转会改变**后代**的
+    /// 可聚焦性，但后代自己没有脏位。旧实现只标祖先 ⇒ 增量笔里 `Tab` 仍是 `actions=[Click]`
+    /// 的旧记录，全树却是 `[Click, Focus]`，`a11y_oracle_diff` 分叉。
+    #[test]
+    fn a11y_revealing_an_ancestor_refreshes_descendant_focus_incrementally() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let visible = app.app_mut().signal(false);
+        let panel = mount(&mut app, move |tree, root| {
+            let panel = NodeBuilder::boxed()
+                .style(fixed_size_style(120.0, 40.0))
+                .bind_style(move |cx| StylePatch {
+                    visible: Some(*cx.read(&visible)),
+                    ..StylePatch::default()
+                })
+                .id("panel")
+                .build(tree, root)
+                .expect("panel");
+            NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, 0.0, 60.0, 24.0))
+                .tab_stop(true)
+                .on_click(Action::custom("tab"))
+                .id("tab")
+                .build(tree, panel)
+                .expect("tab");
+            panel
+        });
+        let tab = child_of(&app, panel);
+        let _ = app.drain().expect("seed");
+        let seeded = snapshot(&app);
+        let record = seeded.node_for(tab).expect("tab 必须在首笔全树里");
+        assert!(
+            record.actions.contains(&A11yAction::Click),
+            "有 on_click ⇒ Click"
+        );
+        assert!(
+            !record.actions.contains(&A11yAction::Focus),
+            "祖先不可见 ⇒ 后代不可聚焦、不得宣告 Focus：{:?}",
+            record.actions
+        );
+
+        app.app_mut().write(&visible, true);
+        let _ = app.drain().expect("reveal");
+        let revealed = snapshot(&app);
+        assert!(!revealed.full, "揭示面板必须走增量（不是全树）");
+        let record = revealed
+            .node_for(tab)
+            .expect("揭示后后代必须重发（旧实现只标祖先 ⇒ 增量笔丢 Focus）");
+        assert!(
+            record.actions.contains(&A11yAction::Focus),
+            "祖先变为可见后，后代的隐式 Focus 必须出现在增量笔里：{:?}",
+            record.actions
+        );
+        assert_eq!(
+            record.parent,
+            revealed.id_for_engine(panel),
+            "重发记录仍挂原 a11y 父"
+        );
+        // 增量 vs 全树 oracle：这正是 P2-4c2/P2-4d2 报告的分叉（修复后必须一致）。
+        app.assert_a11y_oracle();
+    }
+
+    /// E15：祖先的 `interactive` 翻转同样会改变后代的 `disabled` 与动作能力（命中/焦点/a11y
+    /// 共用同一继承判据）；增量笔必须把后代一起重发。
+    #[test]
+    fn a11y_enabling_an_ancestor_refreshes_descendant_actions() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let enabled = app.app_mut().signal(false);
+        let panel = mount(&mut app, move |tree, root| {
+            let panel = NodeBuilder::boxed()
+                .style(fixed_size_style(120.0, 40.0))
+                .bind_style(move |cx| StylePatch {
+                    interactive: Some(*cx.read(&enabled)),
+                    ..StylePatch::default()
+                })
+                .id("panel")
+                .build(tree, root)
+                .expect("panel");
+            NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, 0.0, 60.0, 24.0))
+                .tab_stop(true)
+                .on_click(Action::custom("buy"))
+                .a11y(A11yOverride {
+                    role: Some(A11yRole::Button),
+                    label: Some(SmolStr::new_static("买入")),
+                    ..A11yOverride::default()
+                })
+                .id("buy")
+                .build(tree, panel)
+                .expect("button");
+            panel
+        });
+        let button = child_of(&app, panel);
+        let _ = app.drain().expect("seed");
+        let seeded = snapshot(&app);
+        let record = seeded.node_for(button).expect("button");
+        assert!(
+            record.disabled,
+            "祖先 interactive=false ⇒ 后代继承 disabled"
+        );
+        assert!(
+            !record.actions.contains(&A11yAction::Click)
+                && !record.actions.contains(&A11yAction::Focus),
+            "禁用子树不得宣告状态改变动作：{:?}",
+            record.actions
+        );
+
+        app.app_mut().write(&enabled, true);
+        let _ = app.drain().expect("enable");
+        let snap = snapshot(&app);
+        assert!(!snap.full);
+        let record = snap
+            .node_for(button)
+            .expect("启用后后代必须重发（旧实现只标祖先）");
+        assert!(!record.disabled, "祖先可交互后后代不再是 disabled");
+        assert!(
+            record.actions.contains(&A11yAction::Click)
+                && record.actions.contains(&A11yAction::Focus),
+            "动作能力必须随祖先一起恢复：{:?}",
+            record.actions
+        );
+        app.assert_a11y_oracle();
+    }
+
+    /// E15（Palette 态 / Tab 切换）：标签页的选中态走动态补丁；切换后增量笔必须刷新两个
+    /// Tab 的 `selected`，且 `Focus` 能力保持（`Tab` 角色 + tab_stop）。
+    #[test]
+    fn a11y_tab_switch_refreshes_selection_and_keeps_focus() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let active = app.app_mut().signal(0usize);
+        let tabs = mount(&mut app, move |tree, root| {
+            let tab_list = NodeBuilder::boxed()
+                .style(fixed_size_style(200.0, 32.0))
+                .a11y(A11yOverride {
+                    role: Some(A11yRole::TabList),
+                    label: Some(SmolStr::new_static("页面")),
+                    ..A11yOverride::default()
+                })
+                .id("tabs")
+                .build(tree, root)
+                .expect("tab list");
+            let mut nodes = Vec::with_capacity(2);
+            let actions = [Action::custom("tab.0"), Action::custom("tab.1")];
+            for (index, action) in actions.into_iter().enumerate() {
+                nodes.push(
+                    NodeBuilder::boxed()
+                        .layout_override(Rect::new(index as f32 * 100.0, 0.0, 100.0, 32.0))
+                        .tab_stop(true)
+                        .on_click(action)
+                        .a11y(A11yOverride {
+                            role: Some(A11yRole::Tab),
+                            label: Some(smol_str::format_smolstr!("页面 {index}")),
+                            ..A11yOverride::default()
+                        })
+                        .bind_a11y(move |cx| A11yPatch {
+                            selected: Some(*cx.read(&active) == index),
+                            pos_in_set: Some(index),
+                            size_of_set: Some(2),
+                            ..A11yPatch::default()
+                        })
+                        .id(smol_str::format_smolstr!("tab.{index}"))
+                        .build(tree, tab_list)
+                        .expect("tab"),
+                );
+            }
+            tab_list
+        });
+        let tab_nodes: Vec<NodeId> = {
+            let window = app.window_id();
+            app.app()
+                .window(window)
+                .expect("window")
+                .tree()
+                .get(tabs)
+                .expect("tabs")
+                .children()
+                .to_vec()
+        };
+        let _ = app.drain().expect("seed");
+        let seeded = snapshot(&app);
+        assert_eq!(
+            seeded.node_for(tab_nodes[0]).expect("tab 0").selected,
+            Some(true)
+        );
+        assert_eq!(
+            seeded.node_for(tab_nodes[1]).expect("tab 1").selected,
+            Some(false)
+        );
+        for tab in &tab_nodes {
+            assert!(
+                seeded
+                    .node_for(*tab)
+                    .expect("tab")
+                    .actions
+                    .contains(&A11yAction::Focus),
+                "Tab 是可聚焦控件，必须宣告 Focus"
+            );
+        }
+
+        app.app_mut().write(&active, 1);
+        let _ = app.drain().expect("switch");
+        let snap = snapshot(&app);
+        assert!(!snap.full);
+        assert_eq!(
+            snap.node_for(tab_nodes[0]).expect("tab 0").selected,
+            Some(false)
+        );
+        assert_eq!(
+            snap.node_for(tab_nodes[1]).expect("tab 1").selected,
+            Some(true)
+        );
+        for tab in &tab_nodes {
+            assert!(
+                snap.node_for(*tab)
+                    .expect("切换后两个 Tab 都必须重发")
+                    .actions
+                    .contains(&A11yAction::Focus),
+                "切换不得丢 Focus 能力"
+            );
+        }
+        app.assert_a11y_oracle();
+    }
+
+    /// E15：祖先的动态 `role` 会改变**后代被推导出来的角色**（输入框里的文本是 `TextRun`，
+    /// 普通容器里的文本是 `Label`）。旧实现只标祖先 ⇒ 后代的角色在增量笔里保持旧值，与全树
+    /// 分叉（`affects_descendants` 的失败面）。
+    #[test]
+    fn a11y_role_change_refreshes_descendant_derived_roles() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let as_input = app.app_mut().signal(false);
+        let panel = mount(&mut app, move |tree, root| {
+            let panel = NodeBuilder::boxed()
+                .style(fixed_size_style(120.0, 40.0))
+                .a11y(A11yOverride {
+                    label: Some(SmolStr::new_static("价格")),
+                    ..A11yOverride::default()
+                })
+                .bind_a11y(move |cx| A11yPatch {
+                    role: Some(if *cx.read(&as_input) {
+                        A11yRole::TextInput
+                    } else {
+                        A11yRole::Group
+                    }),
+                    ..A11yPatch::default()
+                })
+                .id("panel")
+                .build(tree, root)
+                .expect("panel");
+            NodeBuilder::text("42150", TextStyle::new(12.0))
+                .id("value")
+                .build(tree, panel)
+                .expect("text");
+            panel
+        });
+        let text = child_of(&app, panel);
+        let _ = app.drain().expect("seed");
+        let seeded = snapshot(&app);
+        assert_eq!(
+            seeded.node_for(text).expect("text").role,
+            A11yRole::Label,
+            "普通容器里的文本是 Label"
+        );
+
+        app.app_mut().write(&as_input, true);
+        let _ = app.drain().expect("role change");
+        let snap = snapshot(&app);
+        assert!(!snap.full);
+        let record = snap
+            .node_for(text)
+            .expect("祖先角色变化后文本子节点必须重发（affects_descendants）");
+        assert_eq!(
+            record.role,
+            A11yRole::TextRun,
+            "父角色变成 TextInput 后，文本子节点必须被推导成 TextRun"
+        );
+        assert_eq!(
+            crate::a11y::adapter::to_accesskit(record).role(),
+            accesskit::Role::TextRun
+        );
+        app.assert_a11y_oracle();
+    }
+
+    /// E15：虚拟列表行的 a11y 可以在**面板打开期间**动态刷新（静态快照行补丁 → `set_a11y_patch`
+    /// 通道）。行由列表内核持有、应用拿不到 builder，因此这是 `List::set_row_a11y` 这类静态行
+    /// 快照的动态失效面（P2-4c2 F10 / kit-menu 缺口 3）。
+    #[test]
+    fn a11y_virtual_rows_refresh_while_the_panel_stays_open() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let open = app.app_mut().signal(false);
+        let container = mount(&mut app, move |tree, root| {
+            let panel = NodeBuilder::boxed()
+                .style(fixed_size_style(100.0, 80.0))
+                .bind_style(move |cx| StylePatch {
+                    visible: Some(*cx.read(&open)),
+                    ..StylePatch::default()
+                })
+                .id("panel")
+                .build(tree, root)
+                .expect("panel");
+            NodeBuilder::boxed()
+                .style(scroll_container_style(100.0, 80.0))
+                .id("rows")
+                .build(tree, panel)
+                .expect("container")
+        });
+        let list = app
+            .app_mut()
+            .make_virtual_list(
+                window,
+                container,
+                crate::interaction::VirtualListConfig {
+                    extent: 20.0,
+                    extents: None,
+                    overscan: 0,
+                },
+            )
+            .expect("virtual list");
+        app.app_mut()
+            .set_virtual_items(&list, 3, |index| {
+                NodeBuilder::boxed()
+                    .a11y(A11yOverride {
+                        label: Some(smol_str::format_smolstr!("row {index}")),
+                        ..A11yOverride::default()
+                    })
+                    .id("row")
+            })
+            .expect("items");
+        let _ = app.drain().expect("seed");
+        app.app_mut().write(&open, true);
+        let _ = app.drain().expect("open panel");
+        let rows: Vec<NodeId> = app
+            .app()
+            .window(window)
+            .expect("window")
+            .tree()
+            .virtual_slot(container)
+            .expect("virtual slot")
+            .mounted
+            .iter()
+            .map(|(_, row)| *row)
+            .collect();
+        assert!(!rows.is_empty(), "首窗必须挂载行");
+
+        for (index, row) in rows.iter().enumerate() {
+            app.app_mut()
+                .set_a11y_patch(
+                    window,
+                    *row,
+                    A11yPatch {
+                        selected: Some(true),
+                        checked: Some(true),
+                        pos_in_set: Some(index),
+                        ..A11yPatch::default()
+                    },
+                )
+                .expect("dynamic row a11y");
+        }
+        let _ = app.drain().expect("row refresh");
+        let snap = snapshot(&app);
+        assert!(!snap.full, "行选中刷新必须是增量（不得整表重建）");
+        for row in &rows {
+            let record = snap
+                .node_for(*row)
+                .expect("被刷新的行必须在本笔增量里（静态快照的失败面）");
+            assert_eq!(record.selected, Some(true), "selected 必须刷新");
+            assert_eq!(record.checked, Some(true), "多选勾选态必须刷新");
+        }
+        assert_eq!(
+            app.app()
+                .window(window)
+                .expect("window")
+                .tree()
+                .virtual_slot(container)
+                .expect("slot")
+                .mounted
+                .len(),
+            rows.len(),
+            "刷新期不得重建行（同一批句柄仍在挂载）"
+        );
+        app.assert_a11y_oracle();
+    }
+
+    /// E15：行 a11y 的 `ReadCtx` 动态通道（推荐给 base_ui 的 `Fn(&mut ReadCtx, usize)` 形态）：
+    /// 行 `bind_a11y` 读选中集信号 ⇒ 信号写自动失效、增量笔刷新 `selected`/`checked`。
+    #[test]
+    fn a11y_virtual_rows_follow_a_selection_signal() {
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let active = app.app_mut().signal(0usize);
+        let container = mount(&mut app, |tree, root| {
+            NodeBuilder::boxed()
+                .style(scroll_container_style(100.0, 80.0))
+                .id("rows")
+                .build(tree, root)
+                .expect("container")
+        });
+        let list = app
+            .app_mut()
+            .make_virtual_list(
+                window,
+                container,
+                crate::interaction::VirtualListConfig {
+                    extent: 20.0,
+                    extents: None,
+                    overscan: 0,
+                },
+            )
+            .expect("virtual list");
+        app.app_mut()
+            .set_virtual_items(&list, 2, move |index| {
+                NodeBuilder::boxed()
+                    .bind_a11y(move |cx| A11yPatch {
+                        selected: Some(*cx.read(&active) == index),
+                        checked: Some(*cx.read(&active) == index),
+                        pos_in_set: Some(index),
+                        size_of_set: Some(2),
+                        ..A11yPatch::default()
+                    })
+                    .id("row")
+            })
+            .expect("items");
+        let _ = app.drain().expect("settle");
+        // 行在布局/挂载后才有 `bind_a11y` 求值；先让绑定落定再开捕获，首笔全树才是稳定状态。
+        app.enable_a11y_capture();
+        let _ = app.drain().expect("seed");
+        let rows: Vec<NodeId> = app
+            .app()
+            .window(window)
+            .expect("window")
+            .tree()
+            .virtual_slot(container)
+            .expect("virtual slot")
+            .mounted
+            .iter()
+            .map(|(_, row)| *row)
+            .collect();
+        let seeded = snapshot(&app);
+        assert_eq!(
+            seeded.node_for(rows[0]).expect("row 0").selected,
+            Some(true)
+        );
+        assert_eq!(
+            seeded.node_for(rows[1]).expect("row 1").selected,
+            Some(false)
+        );
+
+        app.app_mut().write(&active, 1);
+        let _ = app.drain().expect("select");
+        let snap = snapshot(&app);
+        assert!(!snap.full, "选中集变化必须走增量（bind_a11y 信号依赖）");
+        assert_eq!(
+            snap.node_for(rows[0]).expect("row 0").selected,
+            Some(false),
+            "读写同一个信号 ⇒ 两行都要随依赖失效重发"
+        );
+        assert_eq!(snap.node_for(rows[1]).expect("row 1").checked, Some(true));
+        app.assert_a11y_oracle();
     }
 }
 

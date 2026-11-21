@@ -70,6 +70,14 @@ pub(crate) const fn role_to_accesskit(role: A11yRole) -> accesskit::Role {
         // （`accesskit_windows` 映射 `UIA_SeparatorControlTypeId`、`accesskit_atspi_common`
         // 映射 `AtspiRole::Separator`、`accesskit_macos` 映射 `NSAccessibilitySplitterRole`）。
         R::Separator => Role::Splitter,
+        // E15：组合控件 / 颜色控件。AccessKit 0.25 有同名角色，三端 adapter 直接按角色映射
+        // （见 `A11yRole` 各变体的文档；`ColorWell` 在 UIA/AT-SPI 上退化为按钮语义）。
+        R::ComboBox => Role::ComboBox,
+        R::ListBox => Role::ListBox,
+        // AccessKit 0.25 的拼写是 `MenuItemCheckBox`（大写 B，与本项目既有 `CheckBox` 一致）。
+        R::MenuItemCheckBox => Role::MenuItemCheckBox,
+        R::MenuItemRadio => Role::MenuItemRadio,
+        R::ColorWell => Role::ColorWell,
     }
 }
 
@@ -150,6 +158,16 @@ pub(crate) const fn sort_to_accesskit(sort: crate::a11y::A11ySort) -> accesskit:
     }
 }
 
+/// 方向 → `accesskit::Orientation`（E15；滑条 / 色盘等轴向控件用）。
+pub(crate) const fn orientation_to_accesskit(
+    orientation: crate::a11y::A11yOrientation,
+) -> accesskit::Orientation {
+    match orientation {
+        crate::a11y::A11yOrientation::Horizontal => accesskit::Orientation::Horizontal,
+        crate::a11y::A11yOrientation::Vertical => accesskit::Orientation::Vertical,
+    }
+}
+
 /// 窗口客户区相对、**物理像素**的边界盒（逻辑 × scale，逐边 round；含祖先滚动偏移的屏幕化）。
 ///
 /// 三个平台桥接都要求这个坐标系（逐条核对过上游实现）：
@@ -191,8 +209,15 @@ pub(crate) fn default_actions(role: A11yRole) -> Vec<A11yAction> {
         // 种类**自动推导**的（虚拟列表的每一行），无脑声明 Click 会让没有任何点击处理的
         // 行也暴露 Invoke 模式 —— 用户按下去什么都不会发生（复审 P2-4）。
         // 真实能力由 `effective_actions` 统一补：节点声明了 `on_click`/`on_action` 就会得到
-        // `Click`，与角色无关。
-        R::CheckBox | R::Switch | R::RadioButton | R::MenuItem | R::ListBoxOption => Vec::new(),
+        // `Click`，与角色无关。E15 的可勾选菜单项（`MenuItemCheckBox` / `MenuItemRadio`）
+        // 与 `MenuItem` 同纪律：勾选态走 `checked`，激活能力由真实接线决定。
+        R::CheckBox
+        | R::Switch
+        | R::RadioButton
+        | R::MenuItem
+        | R::MenuItemCheckBox
+        | R::MenuItemRadio
+        | R::ListBoxOption => Vec::new(),
         // 滑块：数值通过 `numeric_value` 通道暴露，写值走 `SetValue`（UIA 的
         // `RangeValuePattern.SetValue` 带 `NumericValue` payload），步进走
         // Increment/Decrement（P2-8 / review P2-5）。
@@ -223,6 +248,10 @@ pub(crate) fn default_actions(role: A11yRole) -> Vec<A11yAction> {
         // 表格/网格的 `ScrollIntoView` 由 `effective_actions` 按「是否真的有滚动容器」补
         // （无滚动祖先时该动作必然失败）。
         R::Table | R::Grid => Vec::new(),
+        // E15：组合框 / 列表框 / 色块也没有「无接线就成立」的默认动作 —— 展开/收起是真实状态机
+        // （`on_click` + `A11yPatch::expanded`），色块打开取色器同样是普通 Action；能力由
+        // `effective_actions` 按真实接线补（与 `Dialog` / `Menu` 同纪律，避免死 Expand）。
+        R::ComboBox | R::ListBox | R::ColorWell => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -250,6 +279,13 @@ pub(crate) fn role_by_kind(tree: &NodeTree, node: NodeId, target: &Node) -> A11y
     }
     // 虚拟列表**先判**：它也带滚动槽，但语义是 `List`（滚动动作由 `effective_actions` 补）。
     if tree.virtual_slot(node).is_some() {
+        // E15：集合语义容器（Table/Grid/Tree/ListBox/Menu）内部的**虚拟窗口**不再自动声明
+        // `List`（E9 残余 R2）。窗口只是布局实现细节；`GenericContainer` 会被平台的
+        // `common_filter` 透明上提，AT 因此看到干净的 `Table → Row` / `Tree → TreeItem` /
+        // `ListBox → ListBoxOption` / `Menu → MenuItem`。
+        if crate::a11y::tree::is_suppressed_list_window(tree, node) {
+            return R::GenericContainer;
+        }
         return R::List;
     }
     if tree.scroll_slot(node).is_some() {
@@ -689,11 +725,12 @@ mod tests {
     use super::{
         a11y_disabled, a11y_read_only, action_allowed, action_from_accesskit, action_to_accesskit,
         bounds_of, default_actions, effective_actions, is_disabled, is_hidden, is_value_mutation,
-        role_by_kind, role_to_accesskit, sort_to_accesskit,
+        orientation_to_accesskit, role_by_kind, role_to_accesskit, sort_to_accesskit,
     };
     use crate::{
         a11y::{
-            A11yAction, A11yLabel, A11yLabelSource, A11yOverride, A11yPatch, A11yRole, A11ySort,
+            A11yAction, A11yLabel, A11yLabelSource, A11yOrientation, A11yOverride, A11yPatch,
+            A11yRole, A11ySort,
         },
         layout::hit_test::HitShape,
         math::{PhysicalRect, Scale},
@@ -755,7 +792,13 @@ mod tests {
                 | A11yRole::Tooltip
                 | A11yRole::TabList
                 | A11yRole::Tab
-                | A11yRole::Separator => 1,
+                | A11yRole::Separator
+                // E15：组合控件 / 颜色控件。
+                | A11yRole::ComboBox
+                | A11yRole::ListBox
+                | A11yRole::MenuItemCheckBox
+                | A11yRole::MenuItemRadio
+                | A11yRole::ColorWell => 1,
             }
         }
 
@@ -838,6 +881,45 @@ mod tests {
                 "A11yRole::ALL 必须包含 E12 新增角色 {role:?}"
             );
         }
+        // E15：组合控件 / 颜色控件 —— AccessKit 0.25 同名映射（`MenuItemCheckBox` 是 0.25 的
+        // 精确拼写；`ColorWell` 在 UIA/AT-SPI 上退化为按钮语义，见 `A11yRole::ColorWell` 文档）。
+        assert_eq!(
+            role_to_accesskit(A11yRole::ComboBox),
+            accesskit::Role::ComboBox,
+            "下拉/选择器触发器（UIA ComboBox / macOS PopUpButton / AT-SPI comboBox）"
+        );
+        assert_eq!(
+            role_to_accesskit(A11yRole::ListBox),
+            accesskit::Role::ListBox,
+            "列表框容器（UIA List / macOS List / AT-SPI list box）"
+        );
+        assert_eq!(
+            role_to_accesskit(A11yRole::MenuItemCheckBox),
+            accesskit::Role::MenuItemCheckBox,
+            "可勾选菜单项（UIA CheckBox ControlType + menuitemcheckbox / AT-SPI check menu item）"
+        );
+        assert_eq!(
+            role_to_accesskit(A11yRole::MenuItemRadio),
+            accesskit::Role::MenuItemRadio,
+            "单选菜单项（UIA RadioButton ControlType + menuitemradio / AT-SPI radio menu item）"
+        );
+        assert_eq!(
+            role_to_accesskit(A11yRole::ColorWell),
+            accesskit::Role::ColorWell,
+            "色块（macOS 有专用 ColorWell；UIA/AT-SPI 退化为按钮 + 值）"
+        );
+        for role in [
+            A11yRole::ComboBox,
+            A11yRole::ListBox,
+            A11yRole::MenuItemCheckBox,
+            A11yRole::MenuItemRadio,
+            A11yRole::ColorWell,
+        ] {
+            assert!(
+                A11yRole::ALL.contains(&role),
+                "A11yRole::ALL 必须包含 E15 新增角色 {role:?}"
+            );
+        }
     }
 
     /// `aria-sort` 的三个状态都必须有映射（UIA/AT-SPI 靠它播报"按价格升序"）。
@@ -855,6 +937,19 @@ mod tests {
             sort_to_accesskit(A11ySort::None),
             accesskit::SortDirection::Other,
             "AccessKit 没有 None 变体：未排序 = Other"
+        );
+    }
+
+    /// E15：方向的两个取值都必须有映射（滑条 / 色盘的轴向语义；三端读同一属性）。
+    #[test]
+    fn orientations_map_to_accesskit() {
+        assert_eq!(
+            orientation_to_accesskit(A11yOrientation::Horizontal),
+            accesskit::Orientation::Horizontal
+        );
+        assert_eq!(
+            orientation_to_accesskit(A11yOrientation::Vertical),
+            accesskit::Orientation::Vertical
         );
     }
 
@@ -912,6 +1007,21 @@ mod tests {
             );
         }
         assert!(default_actions(A11yRole::Label).is_empty());
+        // E15：组合框 / 列表框 / 色块 / 可勾选菜单项也没有「无接线就成立」的默认动作（展开态是
+        // 真实状态机、激活能力由 on_click 接线决定；勾选态走 checked 通道）—— 避免死 Expand /
+        // 死按钮（与 Dialog / Menu 同纪律）。
+        for role in [
+            A11yRole::ComboBox,
+            A11yRole::ListBox,
+            A11yRole::ColorWell,
+            A11yRole::MenuItemCheckBox,
+            A11yRole::MenuItemRadio,
+        ] {
+            assert!(
+                default_actions(role).is_empty(),
+                "{role:?} 的默认动作表必须为空（能力由 effective_actions 按真实接线补）"
+            );
+        }
     }
 
     /// P2-4：可勾选控件的 `Click` 必须由**真实能力**决定（节点声明了 on_click 才有），
@@ -924,6 +1034,8 @@ mod tests {
             A11yRole::Switch,
             A11yRole::RadioButton,
             A11yRole::MenuItem,
+            A11yRole::MenuItemCheckBox,
+            A11yRole::MenuItemRadio,
             A11yRole::ListBoxOption,
         ] {
             let actions = default_actions(role);

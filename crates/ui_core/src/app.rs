@@ -2497,6 +2497,26 @@ impl App {
         a11y::off_a11y_action(self, action)
     }
 
+    /// 写一个节点的**动态** a11y 补丁并登记交付（E15）。
+    ///
+    /// 与 `NodeBuilder::bind_a11y` 同一条写入通道（合并方向不变：`patch` > `A11yOverride` >
+    /// 由节点种类/结构推导），区别是求值点在应用侧：应用自己观察状态变化后把新的
+    /// [`crate::a11y::A11yPatch`] 推进来，引擎标 `A11Y` 脏位并在下一笔增量交付里重发该节点。
+    /// 用于「行 a11y 来自静态快照、但状态在面板打开期间变化」的场景（虚拟列表行由列表内核
+    /// 持有，应用拿不到句柄）：组合控件在选中集变化时对已挂载行逐个调用，或改用 `bind_a11y`
+    /// 的 `ReadCtx` 形态由信号依赖自动失效。
+    ///
+    /// # Errors
+    /// `EngineError::UnknownWindow`（窗口已关闭）/ `EngineError::StaleNode`（节点已卸载）。
+    pub fn set_a11y_patch(
+        &mut self,
+        window: WindowId,
+        node: NodeId,
+        patch: crate::a11y::A11yPatch,
+    ) -> Result<(), EngineError> {
+        a11y::set_a11y_patch(self, window, node, patch)
+    }
+
     /// a11y 诊断（与 `text_diagnostics` 同型；上限 `A11Y_DIAGNOSTIC_CAPACITY`，超出丢最旧）。
     #[must_use]
     pub fn a11y_diagnostics(&self) -> &[crate::a11y::A11yDiagnostic] {
