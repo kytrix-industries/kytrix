@@ -20,11 +20,27 @@
 //! `TreeItem::disabled` 的行不可点击 / 不可键盘导航 / 不可程序化选中（列表内核的 disabled
 //! 集 + [`TreeState::apply_key`] 跳过）；渲染仍是弱化色（旧 gpui `Button::disabled` 语义）。
 //!
-//! # a11y
+//! # a11y（E9 集合语义）
 //!
-//! 引擎 `A11yRole` 没有 `Tree` / `TreeItem` 角色（§7.4 只列到列表 / 表格），树以 `List` +
-//! `ListBoxOption` 行表达：行标签、展开态、禁用态、选中 / 集合位置均已声明。**树层级导航与
-//! `TreeItem` 专有语义（AT 的展开/折叠树模式）登记为缺口**，待引擎补角色（属引擎批）。
+//! 采纳引擎 E9 的树集合语义：容器静态声明 [`A11yRole::Tree`]（`A11yOverride`）并动态宣告集合
+//! 大小（`size_of_set` = 可见行数）；每个可见行在列表行基线之上叠加 [`A11yRole::TreeItem`]、
+//! 行标签、展开态、禁用态（`set_row_a11y` 的 `A11yPatch`，选中态来自列表基线）。引擎把树项
+//! 挂到**最近的** `Tree` / `TreeItem` 祖先下 —— 缩进槽 / 折叠标 / 标签这些渲染包裹层不参与
+//! a11y 父子（角色始终落在逻辑树项那一行）。
+//!
+//! **层级**：本组件是扁平化虚拟树（可见行是虚拟列表的兄弟行，物理节点树里没有嵌套）。因此
+//! a11y 父子是「所有可见树项 = `Tree` 的子节点」，嵌套深度用 `aria-level` 语义
+//! （`A11yPatch::level`，0-based = [`FlatRow::depth`]）表达 —— ARIA 的 flattened-tree 模式。
+//! 不要为了 a11y 层级在物理树里造嵌套：行窗口是虚拟列表，嵌套会和窗口化冲突。
+//!
+//! 折叠标（`▸` / `▾`）与行标签文本节点都显式 `hidden`：树项的**可访问名在逻辑行上**
+//! （`A11yPatch::label`），装饰字形与重复文本不应再作为独立 Label 被读屏朗读。
+//!
+//! **残余**（`.docs/gui-migration/spec-deltas/kit-a11y.md`）：
+//! - 行窗口（列表 `viewport`，角色 `List`）仍是 `Tree` 的 a11y 子节点（E9 R2：集合内虚拟窗口
+//!   未透明化，滚动状态仍挂在窗口上）；`Tree` 自身没有滚动动作/滚动值（AT 通过窗口滚动）。
+//! - AT 的展开 / 折叠动作未接入：`TreeItem` 默认不宣告 `Expand` / `Collapse`（E9 R9 的操作
+//!   路径要求 `on_a11y_action` handler），展开态目前只由状态表达。
 //!
 //! # 折叠标
 //!
@@ -35,7 +51,7 @@ use std::{cell::RefCell, collections::BTreeSet, rc::Rc};
 
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
-    a11y::A11yPatch,
+    a11y::{A11yOverride, A11yPatch, A11yRole},
     app::App,
     error::EngineError,
     event::{Action, KeyBinding, KeyCode, Modifiers},
@@ -489,8 +505,9 @@ impl Tree {
         list.set_initial_count(app, count);
         let disabled = disabled_rows(&flat.borrow());
         list.set_disabled_rows(disabled);
-        // 行级 a11y：树目前用「列表 + 行」语义（引擎 `A11yRole` 没有 `Tree` / `TreeItem`，
-        // 见模块文档〈a11y〉）：行标签、展开态、禁用态在这里声明，选中 / 位置由列表基线给。
+        // 行级 a11y（E9）：逻辑树项 = 可见行。角色 / 标签 / 展开态 / 禁用态 / 层级在这里声明；
+        // 选中与扁平集合位置来自列表行基线。层级用 `level`（0-based depth）表达 —— 行是虚拟列表
+        // 的兄弟行，物理树里没有嵌套，引擎的父子推导因此给出「全部挂在 Tree 下」。
         let flat_a11y = flat.clone();
         list.set_row_a11y(move |index| {
             let flat = flat_a11y.borrow();
@@ -498,7 +515,9 @@ impl Tree {
                 return A11yPatch::default();
             };
             A11yPatch {
+                role: Some(A11yRole::TreeItem),
                 label: Some(row.label.clone()),
+                level: Some(row.depth),
                 expanded: row.folder.then_some(row.expanded),
                 disabled: Some(row.disabled),
                 ..A11yPatch::default()
@@ -547,6 +566,7 @@ impl Tree {
     /// # Errors
     /// `StaleNode`。
     pub fn build(&self, tree: &mut NodeTree, parent: NodeId) -> Result<NodeId, EngineError> {
+        let count = self.inner.list.count_signal();
         let outer = NodeBuilder::boxed()
             .id(format_smolstr!("{}:tree", self.inner.key))
             .style(
@@ -558,6 +578,16 @@ impl Tree {
                     .overflow_hidden()
                     .build(),
             )
+            // a11y（E9）：树的集合根。角色是静态语义；集合大小随行数（含展开/折叠后的可见行）
+            // 动态更新，屏幕阅读器才能播报「第 N 项，共 M 项」。
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Tree),
+                ..A11yOverride::default()
+            })
+            .bind_a11y(move |cx| A11yPatch {
+                size_of_set: Some(*cx.read(&count)),
+                ..A11yPatch::default()
+            })
             .build(tree, parent)?;
         self.inner.list.build(tree, outer)?;
         self.inner.geometry.borrow_mut().outer = Some(outer);
@@ -897,6 +927,12 @@ fn build_row(
             SmolStr::new_static("▸"),
             TextStyle::new(theme.tokens().small.font_size),
         )
+        // 折叠标是纯装饰：树项的可访问名在逻辑行上（`A11yPatch::label`），读屏不应读到
+        //「▸ / ▾」这个字形。
+        .a11y(A11yOverride {
+            hidden: true,
+            ..A11yOverride::default()
+        })
         .bind_text(move |cx| {
             let state = cx.read(&state);
             let expanded = state.is_expanded(&id);
@@ -927,6 +963,12 @@ fn build_row(
         row.label.clone(),
         TextStyle::new(theme.tokens().medium.font_size),
     )
+    // 行的可访问名已经由逻辑树项的 `A11yPatch::label` 承载；这份文本只是绘制用的内容，
+    // 再从 a11y 暴露一次会让读屏把同一个名字读两遍（树的条目是叶子语义）。
+    .a11y(A11yOverride {
+        hidden: true,
+        ..A11yOverride::default()
+    })
     .bind_style(move |cx| StylePatch {
         foreground: Some(label_theme.role(
             cx,
@@ -1120,18 +1162,21 @@ mod tests {
 
 #[cfg(test)]
 mod ui_tests {
-    use smol_str::SmolStr;
+    use smol_str::{SmolStr, format_smolstr};
     use ui_core::{
         a11y::A11yRole,
         event::{Action, InputEvent, KeyCode, Modifiers, PointerButton},
         interaction::ScrollConfig,
         math::Size,
         node::{builder::NodeBuilder, tree::NodeKind},
-        test_support::app::TestApp,
+        test_support::{a11y::assert_incremental_within, app::TestApp},
     };
 
     use super::{Tree, TreeItem, TreeOptions};
     use crate::{
+        kit::test_support::{
+            A11yUpdates, a11y_id, a11y_of, assert_single_parent_per_node, frame_a11y, full_a11y,
+        },
         style_builder::StyleBuilder,
         theme::{appearance::Appearance, handle::ThemeHandle},
     };
@@ -1461,48 +1506,250 @@ mod ui_tests {
         assert_eq!(second.selected_row(app.app()), Some(1));
     }
 
+    /// E9：树容器 = `Tree`、可见行 = `TreeItem`（a11y 父 = `Tree`），标签 / 展开 / 层级 / 选中
+    /// 状态进 a11y；行窗口（`List`）不再是树项的父；装饰字形与重复文本 hidden。
     #[test]
-    fn tree_rows_declare_list_semantics_to_a11y() {
+    fn tree_items_declare_tree_semantics_to_a11y() {
         let mut harness = harness();
         harness.app.enable_a11y_capture();
         let _ = harness.app.drain().expect("frame");
+        harness.app.assert_a11y_contract();
+        let outer = harness.tree.outer_node().expect("tree node");
+        let viewport = harness.tree.list().viewport_node().expect("viewport");
         let row0 = harness
             .tree
             .list()
             .row_node(harness.app.app(), 0)
             .expect("row 0");
-        let viewport = harness.tree.list().viewport_node().expect("viewport");
         {
             let snapshot = harness.app.a11y().expect("a11y snapshot");
-            let container = snapshot.node_for(viewport).expect("viewport a11y");
-            assert_eq!(container.role, A11yRole::List);
-            assert_eq!(container.size_of_set, Some(3));
-            let row = snapshot.node_for(row0).expect("row 0 a11y");
-            assert_eq!(row.role, A11yRole::ListBoxOption);
+            let tree = a11y_of(snapshot, outer);
+            assert_eq!(tree.role, A11yRole::Tree);
+            assert_eq!(tree.size_of_set, Some(3), "集合大小 = 可见行数");
+            let row = a11y_of(snapshot, row0);
+            assert_eq!(row.role, A11yRole::TreeItem);
+            assert_eq!(row.label_text(), Some("first"));
             assert_eq!(
-                row.label.as_ref().map(ui_core::a11y::A11yLabel::text),
-                Some("first")
+                row.level,
+                Some(0),
+                "根层级 0（AccessKit 的 level 是 0-based）"
             );
             assert_eq!(row.expanded, Some(false), "文件夹行宣告折叠态");
-            assert_eq!(row.pos_in_set, Some(0));
+            assert_eq!(
+                row.parent,
+                Some(tree.id),
+                "树项的 a11y 父是 Tree（行窗口只是布局包裹层）"
+            );
+            // 行窗口被 E9 领养规则跳过：它不再列出树项。
+            let window = a11y_of(snapshot, viewport);
+            assert_eq!(window.role, A11yRole::List);
+            assert!(window.children.is_empty(), "行窗口不得再列树项");
+            // 折叠标 / 重复的行标签文本显式 hidden：读屏不应读到「▸」或把名字读两遍。
+            assert!(
+                snapshot.nodes().iter().any(|node| node.hidden),
+                "装饰文本必须 hidden"
+            );
+            for node in snapshot.visible_nodes_in_batch() {
+                if let Some(text) = node.value.as_deref() {
+                    assert!(
+                        !text.contains('▸') && !text.contains('▾'),
+                        "折叠标不得作为可见文本进 a11y：{text:?}"
+                    );
+                }
+            }
         }
-        // 选中 + 展开后行语义更新。a11y 增量与全量对账一次，顺带拿到最近一笔完整交付。
+        // 选中 + 展开后行语义更新；全树快照上同时校验父子结构（父唯一 / 无孤儿）。
         click_row(&mut harness, 0);
         key(&mut harness, KeyCode::Enter);
         settle(&mut harness);
+        let snapshot = full_a11y(&mut harness.app);
+        assert_single_parent_per_node(&snapshot);
+        let outer_id = a11y_id(&snapshot, outer);
         let row0 = harness
             .tree
             .list()
             .row_node(harness.app.app(), 0)
             .expect("row 0");
-        assert!(
-            harness.app.a11y_oracle_diff().is_none(),
-            "a11y 增量与强制全树一致"
+        let first = a11y_of(&snapshot, row0);
+        assert_eq!(first.selected, Some(true));
+        assert_eq!(first.expanded, Some(true), "展开后折叠态更新");
+        let child_row = harness
+            .tree
+            .list()
+            .row_node(harness.app.app(), 1)
+            .expect("child row");
+        let child = a11y_of(&snapshot, child_row);
+        assert_eq!(child.role, A11yRole::TreeItem);
+        assert_eq!(child.label_text(), Some("a"));
+        assert_eq!(child.level, Some(1), "子节点层级 = 1");
+        assert_eq!(
+            child.parent,
+            Some(outer_id),
+            "扁平化虚拟树：子项仍是 Tree 的直接子节点（层级走 aria-level）"
         );
-        let snapshot = harness.app.a11y().expect("a11y snapshot");
-        let row = snapshot.node_for(row0).expect("row 0 a11y");
-        assert_eq!(row.selected, Some(true));
-        assert_eq!(row.expanded, Some(true), "展开后折叠态更新");
+        assert_eq!(
+            a11y_of(&snapshot, outer).size_of_set,
+            Some(4),
+            "展开后可见行数 4"
+        );
+    }
+
+    /// 选中 / 展开 / 禁用三种状态都经 `A11yPatch` 动态更新，且结构变化发增量笔（不是全树）。
+    #[test]
+    fn tree_state_changes_are_incremental_a11y_updates() {
+        let mut harness = harness_with(vec![
+            TreeItem::new("first", "first").child(TreeItem::new("first/a", "a")),
+            TreeItem::new("disabled", "disabled").disabled(),
+            TreeItem::new("leaf", "leaf"),
+        ]);
+        harness.app.enable_a11y_capture();
+        let _ = harness.app.drain().expect("frame");
+        harness.app.assert_a11y_contract();
+        let mut updates = A11yUpdates::new();
+        updates.apply(&harness.app);
+
+        // 点击禁用行：不选中、不产生 a11y 结构变化。
+        click_row(&mut harness, 1);
+        frame_a11y(&mut harness.app);
+        updates.apply(&harness.app);
+        assert_eq!(harness.tree.selected_row(harness.app.app()), None);
+
+        // 展开（行表重建）：结构变化必须是增量笔，不能退化成全树。
+        assert!(
+            harness
+                .tree
+                .toggle(harness.app.app_mut(), "first")
+                .expect("toggle")
+        );
+        let _ = harness.app.drain().expect("展开帧");
+        harness.app.assert_a11y_contract();
+        updates.apply(&harness.app);
+        let update = harness
+            .app
+            .a11y_update()
+            .expect("展开必须产生 a11y 交付")
+            .clone();
+        assert!(update.tree.is_none(), "展开只发增量笔（不是全树重置）");
+
+        let snapshot = full_a11y(&mut harness.app);
+        let disabled_row = harness
+            .tree
+            .list()
+            .row_node(harness.app.app(), 2)
+            .expect("disabled row");
+        let disabled = a11y_of(&snapshot, disabled_row);
+        assert_eq!(disabled.role, A11yRole::TreeItem);
+        assert_eq!(disabled.label_text(), Some("disabled"));
+        assert!(disabled.disabled, "禁用态进 a11y");
+        assert_eq!(disabled.expanded, None, "叶子不宣告展开态");
+
+        // 选中：只有相关节点进增量笔（挂载行 + 祖先链），且有上界。
+        click_row(&mut harness, 0);
+        let _ = harness.app.drain().expect("选中帧");
+        harness.app.assert_a11y_contract();
+        updates.apply(&harness.app);
+        let update = harness
+            .app
+            .a11y_update()
+            .expect("选中必须产生 a11y 交付")
+            .clone();
+        assert!(update.tree.is_none(), "选中只发增量笔");
+        let mounted = harness.tree.list().mounted_rows(harness.app.app()).len();
+        assert_incremental_within(&update, mounted + 8);
+        let snapshot = full_a11y(&mut harness.app);
+        let row0 = harness
+            .tree
+            .list()
+            .row_node(harness.app.app(), 0)
+            .expect("row 0");
+        assert_eq!(a11y_of(&snapshot, row0).selected, Some(true));
+        assert!(
+            updates.applied() >= 4,
+            "每次状态变化都必须逐笔过 ShadowTree 契约（实际 {} 笔）",
+            updates.applied()
+        );
+    }
+
+    /// 虚拟化：a11y 树只含已挂载的可见行，集合大小仍是逻辑总数（可见行数）；滚动换页后
+    /// 每笔 `TreeUpdate` 都过 `ShadowTree` 契约，树项始终挂在 `Tree` 下。
+    #[test]
+    fn a_virtualized_tree_exposes_mounted_items_and_the_logical_set() {
+        let roots: Vec<TreeItem> = (0..40)
+            .map(|index| {
+                TreeItem::new(format_smolstr!("n{index}"), format_smolstr!("node {index}"))
+            })
+            .collect();
+        let mut harness = harness_with(roots);
+        harness.app.enable_a11y_capture();
+        let _ = harness.app.drain().expect("frame");
+        harness.app.assert_a11y_contract();
+        let mut updates = A11yUpdates::new();
+        updates.apply(&harness.app);
+        let outer = harness.tree.outer_node().expect("tree");
+        let mounted = harness.tree.list().mounted_rows(harness.app.app());
+        assert!(mounted.len() < 40, "40 行只挂可见窗口：{}", mounted.len());
+        let snapshot = full_a11y(&mut harness.app);
+        assert_single_parent_per_node(&snapshot);
+        let tree = a11y_of(&snapshot, outer);
+        assert_eq!(tree.size_of_set, Some(40), "集合大小是逻辑总数（可见行数）");
+        let visible_items = tree
+            .children
+            .iter()
+            .filter(|id| {
+                snapshot
+                    .node(**id)
+                    .is_some_and(|node| node.role == A11yRole::TreeItem)
+            })
+            .count();
+        assert_eq!(
+            visible_items,
+            mounted.len(),
+            "a11y 树只含已挂载的可见行（未挂载行不产生节点）"
+        );
+        for (_, row) in &mounted {
+            let node = a11y_of(&snapshot, *row);
+            assert_eq!(node.role, A11yRole::TreeItem);
+            assert_eq!(node.parent, Some(tree.id));
+        }
+
+        // 滚动到第 30 行：窗口换页；新行同样是 Tree 下的 TreeItem，集合大小不变。
+        harness
+            .tree
+            .list()
+            .scroll_to_item(
+                harness.app.app_mut(),
+                30,
+                ui_core::interaction::ItemAlign::Start,
+            )
+            .expect("scroll");
+        frame_a11y(&mut harness.app);
+        updates.apply(&harness.app);
+        settle(&mut harness);
+        let snapshot = full_a11y(&mut harness.app);
+        assert_single_parent_per_node(&snapshot);
+        let tree = a11y_of(&snapshot, outer);
+        assert_eq!(tree.size_of_set, Some(40), "滚动不改变逻辑集合大小");
+        let mounted = harness.tree.list().mounted_rows(harness.app.app());
+        assert!(
+            mounted.first().is_some_and(|(index, _)| *index > 0),
+            "滚动后可见窗口换页"
+        );
+        for (_, row) in &mounted {
+            let node = a11y_of(&snapshot, *row);
+            assert_eq!(node.role, A11yRole::TreeItem);
+            assert_eq!(node.parent, Some(tree.id), "换页后的行仍被领养到 Tree");
+        }
+        let visible_items = tree
+            .children
+            .iter()
+            .filter(|id| {
+                snapshot
+                    .node(**id)
+                    .is_some_and(|node| node.role == A11yRole::TreeItem)
+            })
+            .count();
+        assert_eq!(visible_items, mounted.len());
+        assert!(updates.applied() >= 2, "滚动前后两笔交付都必须过影子树契约");
     }
 
     #[test]

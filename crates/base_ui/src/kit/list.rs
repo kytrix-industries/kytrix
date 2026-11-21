@@ -38,6 +38,15 @@
 //! 应用层的 `RowHeights` 只服务双端列表锚点换算与测量回写，滚动帧不重建它（前缀和只在行高
 //! 变更时重建）。
 //!
+//! # a11y（E9 集合语义下的纯列表）
+//!
+//! 纯列表**不声明**表格 / 树角色：虚拟列表容器由引擎按种类推导成 `List`（`size_of_set` 由
+//! 容器上的 `bind_a11y` 声明），每行自动推导成 `ListBoxOption`（`pos_in_set` / `selected` /
+//! `disabled` 由行基线声明）。E9 的逻辑父领养**只认显式声明的集合角色**（`Row` / `Cell` /
+//! `TreeItem`），所以裸列表的 a11y 父子仍是物理父子（行的父 = 虚拟窗口），不会被 `Table` /
+//! `Tree` 的领养规则误领养（回归测试 `a_plain_list_is_not_adopted_by_collection_semantics`）。
+//! 组合控件（表格 / 树）通过 [`List::set_row_a11y`] 在行基线上叠加集合角色。
+//!
 //! # 双端列表（deque）
 //!
 //! [`ListOptions::capacity`] + [`List::push`]：容量满时丢最旧一条。数据在应用侧（行内容回调按
@@ -1936,6 +1945,83 @@ mod ui_tests {
         let snapshot = harness.app.a11y().expect("a11y snapshot");
         let row = snapshot.node_for(row1).expect("row 1 a11y");
         assert_eq!(row.selected, Some(true), "选中态进 a11y");
+    }
+
+    /// E9 回归：纯列表保持 `List` / `ListBoxOption`，**不被**表格 / 树的集合领养规则误领养
+    /// （行父仍是虚拟窗口；快照里不出现任何集合角色）。
+    #[test]
+    fn a_plain_list_is_not_adopted_by_collection_semantics() {
+        use ui_core::{a11y::A11yRole, interaction::ItemAlign};
+
+        use crate::kit::test_support::{
+            A11yUpdates, a11y_of, assert_single_parent_per_node, full_a11y,
+        };
+
+        let mut harness = harness(20);
+        harness.app.enable_a11y_capture();
+        let _ = harness.app.drain().expect("frame");
+        harness.app.assert_a11y_contract();
+        let viewport = harness.list.viewport_node().expect("viewport");
+        let row0 = harness.list.row_node(harness.app.app(), 0).expect("row 0");
+        {
+            let snapshot = harness.app.a11y().expect("a11y snapshot");
+            let container = a11y_of(snapshot, viewport);
+            assert_eq!(container.role, A11yRole::List);
+            assert_eq!(container.size_of_set, Some(20));
+            let row = a11y_of(snapshot, row0);
+            assert_eq!(row.role, A11yRole::ListBoxOption);
+            assert_eq!(
+                row.parent,
+                Some(container.id),
+                "裸列表的行父是虚拟窗口（物理父子，未被集合角色领养）"
+            );
+            assert_eq!(row.pos_in_set, Some(0));
+            assert_eq!(row.size_of_set, Some(20));
+            for role in [
+                A11yRole::Table,
+                A11yRole::Grid,
+                A11yRole::Row,
+                A11yRole::Cell,
+                A11yRole::ColumnHeader,
+                A11yRole::Tree,
+                A11yRole::TreeItem,
+            ] {
+                assert_eq!(
+                    snapshot.nodes_with_role(role).count(),
+                    0,
+                    "纯列表不得出现集合角色 {role:?}"
+                );
+            }
+        }
+        // 滚动换页：新行仍挂窗口下（不会被别的集合领养），逐笔 TreeUpdate 过影子树契约。
+        let mut updates = A11yUpdates::new();
+        updates.apply(&harness.app);
+        harness
+            .list
+            .scroll_to_item(harness.app.app_mut(), 15, ItemAlign::Start)
+            .expect("scroll");
+        let _ = harness.app.drain().expect("scroll frame");
+        harness.app.assert_a11y_contract();
+        updates.apply(&harness.app);
+        let snapshot = full_a11y(&mut harness.app);
+        assert_single_parent_per_node(&snapshot);
+        let container = a11y_of(&snapshot, viewport);
+        assert_eq!(container.role, A11yRole::List);
+        let mounted = harness.list.mounted_rows(harness.app.app());
+        assert!(
+            mounted.first().is_some_and(|(index, _)| *index > 0),
+            "滚动后窗口换页"
+        );
+        for (index, row) in mounted {
+            let node = a11y_of(&snapshot, row);
+            assert_eq!(node.role, A11yRole::ListBoxOption);
+            assert_eq!(node.parent, Some(container.id));
+            assert_eq!(node.pos_in_set, Some(index), "位置是条目逻辑下标");
+        }
+        assert!(
+            updates.applied() >= 2,
+            "首笔与滚动笔都必须过 ShadowTree 契约"
+        );
     }
 
     /// 组件自有信号作用域：`release` 回收槽位（动态列表不泄漏），重复调用幂等。

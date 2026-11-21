@@ -31,8 +31,8 @@
 //! | [`input`] | 应用层文本编辑状态机（caret / 选区 / IME / undo-redo / 拖选 / 双击选词） | `crate::input` |
 //! | [`list`] | 等高 / 变高、静态 / 双端列表内核（E3 虚拟列表 + 实测回写 + 锚点） | `crate::static_*_list`、`crate::deque_*_list` |
 //! | [`scroll_bar`] | 自绘滚动条（拖拽 / 轨道点击 / 淡出 / 双轴） | `crate::scroll_bar` |
-//! | [`table`] | 列定义（Fixed/Flex/跨列）、表头排序、行虚拟化、多选、空态 | `crate::table` |
-//! | [`tree`] | 展开折叠、缩进层级线、选择、键盘导航（实例级键作用域） | `crate::tree` |
+//! | [`table`] | 列定义（Fixed/Flex/跨列）、表头排序、行虚拟化、多选、空态（E9 `Table`/`Row`/`Cell`/`ColumnHeader` 集合语义） | `crate::table` |
+//! | [`tree`] | 展开折叠、缩进层级线、选择、键盘导航（实例级键作用域；E9 `Tree`/`TreeItem` + `level` 层级） | `crate::tree` |
 //! | `test_support` | 基于 `ui_core::test_support` 的测试断言辅助（TestApp/Probe/FrameRecord） | 无（新基建） |
 //!
 //! # 组件形态（与引擎模型对齐）
@@ -46,6 +46,13 @@
 //!    **没有** `on_frame` 自注册：引擎的 `App::on_frame` 只有一个钩子槽（后注册覆盖先注册），
 //!    组合根应在此钩子里依次调用各组件 `sync`。测试里直接调 `sync` 即可（`TestApp::drain`
 //!    不跑该钩子）。
+//!
+//! # 无障碍（E9 集合语义）
+//!
+//! 本批把容器组件的 a11y 声明对齐引擎 E9：`list` 保持引擎自动推导的 `List` / `ListBoxOption`
+//! （不声明集合角色）；`table` 声明 `Table` / `Row` / `Cell` / `ColumnHeader`；`tree` 声明
+//! `Tree` / `TreeItem`（扁平化虚拟树的嵌套深度走 `aria-level`）。组件不手写 `A11yNode` 结构：
+//! 只声明角色 / 标签 / 状态与推导不出的列语义，父子关系由引擎的 E9「逻辑父」规则推导。
 //!
 //! # 设计约束（为什么这些模块在应用层）
 //!
