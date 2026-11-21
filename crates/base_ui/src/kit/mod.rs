@@ -27,6 +27,16 @@
 //! | [`motion`] | 深度条缓动的响应曲线（纯数学，不建帧循环） | `crate::motion` |
 //! | [`animation`] | 弹层淡出是否该出帧 + 动画 tick（消隐走引擎 `Transient`） | `crate::animation` |
 //! | [`join`] | 拼接控件共享边角的几何规则（纯逻辑） | `crate::join` |
+//! | [`interactive`] | 通用交互状态机（hover / pressed / focus / disabled / loading → `StylePatch`） | `crate::interactive` |
+//! | [`button`] | 按钮（变体 / 尺寸 / 图标 + 文字 / 加载 / 禁用 / on_click / a11y） | `crate::button` |
+//! | [`toggle`] | 开关 / 复选 / 单选（键盘 Space、状态动画、a11y checked） | `crate::toggle` |
+//! | [`badge`] | 状态标签（颜色 × 形状） | `crate::badge` |
+//! | [`progress`] | 确定性进度条（轨道 + 指示器、a11y 数值通道） | `crate::progress` |
+//! | [`spinner`] | 旋转加载指示器（自绘画布 + 引擎动画） | `crate::spinner` |
+//! | [`separator`] | 分割线（横 / 纵） | `crate::separator` |
+//! | [`empty_state`] | 空态说明（弱化文字） | `crate::empty_state` |
+//! | [`alert`] | 对话框内容面板（4 类变体 / 输入校验 / 按钮行） | `crate::alert` |
+//! | [`tab_bar`] | 标签栏（选中指示动画 / 方向键 / 关闭按钮 / a11y） | `crate::tab_bar` |
 //! | [`markdown`] | comrak 解析 → 引擎富文本 run / InlineBox 视图 | `crate::markdown` |
 //! | [`input`] | 应用层文本编辑状态机（caret / 选区 / IME / undo-redo / 拖选 / 双击选词） | `crate::input` |
 //! | [`list`] | 等高 / 变高、静态 / 双端列表内核（E3 虚拟列表 + 实测回写 + 锚点） | `crate::static_*_list`、`crate::deque_*_list` |
@@ -64,19 +74,29 @@
 //! 动画同样不在这里建帧循环：`motion` 只给曲线，`animation` 只给「弹层这一帧要不要画」的判据；
 //! 真正的动画必须注册到引擎 `App::animate`（`Transient` + 显式节点集合），见设计 §3.7 / §10.3。
 
+pub mod alert;
 pub mod animation;
 pub mod assets;
+pub mod badge;
 pub mod brand;
+pub mod button;
+pub mod empty_state;
 pub mod format;
 pub mod icon;
 pub mod input;
+pub mod interactive;
 pub mod join;
 pub mod list;
 pub mod markdown;
 pub mod motion;
+pub mod progress;
 pub mod scroll_bar;
+pub mod separator;
 pub mod size;
+pub mod spinner;
+pub mod tab_bar;
 pub mod table;
+pub mod toggle;
 pub mod tree;
 
 /// 测试断言辅助。**只在测试构建里存在**（依赖 `ui_core/test-support`，见本文件模块文档）。
