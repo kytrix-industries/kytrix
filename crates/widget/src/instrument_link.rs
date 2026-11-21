@@ -1,9 +1,9 @@
 use std::{cell::RefCell, fmt, rc::Rc};
 
-use gpui_kit::App;
 use market_participants_model::{
     listing::route::VenueListingKey, market::selection::InstrumentSelection,
 };
+use ui_core::app::App;
 
 type ApplyHandler = Rc<dyn Fn(InstrumentSelection, &mut App) -> bool + 'static>;
 type ChangeHandler = Rc<dyn Fn(InstrumentSelection, &mut App) + 'static>;
@@ -93,8 +93,18 @@ mod tests {
         market::selection::InstrumentSelection,
     };
     use serde_json::{Map, Value};
+    use ui_core::app::App;
 
     use super::*;
+
+    /// A headless engine app: a link runs against the application context, and this
+    /// one needs nothing else.
+    fn app() -> App {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("the test runtime builds");
+        App::new(runtime.handle().clone())
+    }
 
     fn route(scope: &str) -> VenueRoute {
         VenueRoute::new(
@@ -122,10 +132,9 @@ mod tests {
     #[test]
     fn rejected_remote_selection_does_not_replace_value() {
         let link = InstrumentLink::new(selection("spot", 'a'), |_, _| false);
-        let cx = gpui_kit::TestAppContext::single();
-        cx.update(|cx| {
-            assert!(!link.apply_remote(selection("spot", 'b'), cx));
-        });
+        let mut app = app();
+
+        assert!(!link.apply_remote(selection("spot", 'b'), &mut app));
         assert_eq!(link.selection(), selection("spot", 'a'));
     }
 
@@ -145,11 +154,9 @@ mod tests {
             move |_, _| changes.set(changes.get() + 1)
         });
 
-        let cx = gpui_kit::TestAppContext::single();
-        cx.update(|cx| {
-            link.local_changed(selection("spot", 'b'), cx);
-            assert!(link.apply_remote(selection("spot", 'c'), cx));
-        });
+        let mut app = app();
+        link.local_changed(selection("spot", 'b'), &mut app);
+        assert!(link.apply_remote(selection("spot", 'c'), &mut app));
 
         assert_eq!((changes.get(), applies.get()), (1, 1));
         assert_eq!(link.selection(), selection("spot", 'c'));
@@ -161,11 +168,9 @@ mod tests {
     #[test]
     fn a_link_should_propagate_the_exact_listing_key_it_was_given() {
         let link = InstrumentLink::new(selection("usd-m-perp", 'a'), |_, _| true);
-        let cx = gpui_kit::TestAppContext::single();
+        let mut app = app();
 
-        cx.update(|cx| {
-            assert!(link.apply_remote(selection("spot", 'b'), cx));
-        });
+        assert!(link.apply_remote(selection("spot", 'b'), &mut app));
 
         assert_eq!(link.listing(), listing("spot", 'b'));
         assert_eq!(link.selection().listing.route, route("spot"));
@@ -178,11 +183,9 @@ mod tests {
         let first = selection("spot", 'a');
         let second = selection("spot", 'b');
         let link = InstrumentLink::new(first.clone(), |_, _| true);
-        let cx = gpui_kit::TestAppContext::single();
+        let mut app = app();
 
-        cx.update(|cx| {
-            assert!(link.apply_remote(second.clone(), cx));
-        });
+        assert!(link.apply_remote(second.clone(), &mut app));
 
         assert_eq!(link.selection(), second);
         assert_ne!(link.selection(), first);

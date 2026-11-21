@@ -1,7 +1,9 @@
 # Kytrix 定制化跨平台 GUI 引擎 · 系统设计文档
 
 > **文档类型**：系统设计规格 —— 只描述最终架构、接口、实现与约束
-> **版本**：v2.3（2026-11-21）
+> **版本**：v2.4（2026-11-22）
+>
+> **v2.4 变更摘要（2026-11-22）**：**P3-0（翻译/服务上下文）与 P3-1（widget 契约层冻结）完成**。新增 **§13「widget 契约层规格」**：`crates/widget` 从旧工具包形状冻结为引擎形状（`WidgetView`/`WidgetCx`/`AnyWidget`/`WidgetStatus`/`WidgetSurface`/`FrameRouter`/`WidgetBinding`/`WidgetServices`/`TranslatedError`），`crates/widget` 不再依赖 `gpui-kit`、`crates/widget/src` 零工具包文本；§12.10 的 P3 入口同步 v1.3 批次划分（原 P3-2 的契约层部分并入 P3-1）。
 > **v2.3 变更摘要**（2026-11-21；状态口径经 P2-DOC2 修正）：**P2（`base_ui` / kit）主体完成，P2 期间追加的引擎扩展 E7–E15 全部实现并合入迁移分支
 > `gui-engine-migration`（**23 个 P2 merge** = 22 个批次 merge + `merge(p2-5)`；HEAD `1b65c9d`；真实窗口缺陷修复批次 **P2-6 在途**）**。本版把 §11 从「E1–E6」扩为 **E1–E15**：新增
 > **§11.9–§11.15**（E7 图片节点 / E8 scoped 键绑定 / E9+E9c a11y 集合语义 / E10+E10c 定时器与唤醒 / E12 浮层 a11y 与模态 /
@@ -3677,11 +3679,405 @@ impl App {
 - **应用层残余**（除 §11.8 的引擎残余外）：`kit` 侧的 DPI 换档接线（`IconSpec::reselect` / `set_image_resource` 机制已在，事件接线在 P2-4/P2-5）、
   图标旋转未迁移、`AssetImages` 单消费者契约、`StyleBuilder`/`PaintBuilder` 的圆角·线宽·字体像素阶梯待视觉基线、
   `kit` 的 `TAB_MAX_WIDTH` / alert 排版 / join 接缝等 9 条 P3 级项（`.review/mig-p2-4a-review.md` §9.5）。
-- **P3 入口**：见 `.docs/gui-migration/plan.md` v1.2 §3 的 P3 表（P3-1 契约层搬运与签名冻结 → P3-2 `surface`/`placeholder`/`binding` + `empty` 标杆 →
+- **P3 入口**：见 `.docs/gui-migration/plan.md` v1.3 §3 的 P3 表（P3-1 契约层引擎化冻结（本章） → P3-2 `empty` 标杆 + registry 挂载 →
   P3-3 `widget_registry` + `widget_gallery_ui` → P3-W1…W9 二十个 widget）；规格基线 = 本文 §11（引擎）+ 本章（应用层组件形态与测试装置约定）。
 - **P3 开工前置**：`base_ui` 的 `gallery` 可运行（M3，✅ `1b65c9d` 已达成）、`widget` 契约层的 `WidgetCx` / `AnyWidget` 形状定稿、`on_frame` 单槽的使用约定（§11.12）。
 
 ---
+
+## 13. widget 契约层规格（P3-1 冻结）
+
+> **落点**：`crates/widget/src/**` + `crates/widget/Cargo.toml`。**冻结判据**：`grep -r "gpui" crates/widget/src` = 0；
+> `Cargo.toml` 无 `gpui-kit`（dev 亦无）；`cargo test -p widget` 全绿；`cargo check -p widget --all-targets` 通过。
+> **纪律**：本章签名是 20 个 widget crate 的迁移契约，**只能增补**（新增方法/字段须登记 `.docs/gui-migration/design-changes.md`
+> 并升版本号）；删改 = 契约破坏，W 批必须返工。`crates/widget/src` 的 `pub` 面以本章为准，`pub use` 仍被 workspace lint 禁止。
+
+### 13.1 模块与职责
+
+| 模块 | 职责 | 关键类型 |
+|---|---|---|
+| `view.rs` | 契约本体：widget 实现什么、框架何时调用 | `WidgetView` / `ReloadHandle` / `HeaderGroup` |
+| `cx.rs` | 唯一应用层上下文：服务、窗口、节点树、信号、帧请求 | `WidgetCx<'a>` |
+| `any.rs` | 类型擦除句柄：`NodeId` 即擦除后的句柄 + 单态化 vtable | `AnyWidget` / `WidgetVTable`（私有） |
+| `status.rs` | 状态机：5 状态和、去重写入、notice/failure/action | `WidgetState` / `Notice` / `Failure` / `WidgetAction` / `WidgetStatus` |
+| `surface.rs` | 展示规则唯一实现：banner / 正文槽 / 占位（§13.6） | `WidgetSurface` |
+| `ui/placeholder.rs` | 三种占位的 kit 组合（spinner / empty_state / button） | `Placeholder` |
+| `frame.rs` | `App::on_frame` 单槽唯一注册者 + 扇出（I3） | `FrameRouter` / `RouteId` / `WeakRouter` |
+| `binding.rs` | 执行器桥：tokio 侧消息 → 收件箱 → `sync` 消费 | `WidgetBinding` / `WidgetInbox` / `Inbound` |
+| `services.rs` | 组合根注入的协作者（**唯一**获取途径，无全局） | `WidgetServices` |
+| `error.rs` | 强类型错误 + 29 个 `TranslatedError` 映射（文本只在画的那一帧解析） | `TranslatedError` |
+| `time_zone.rs` | 数据时区接缝：读设置快照 | `data_time_zone(&Config)` |
+| `test_support.rs` | 框架测试宿主（`cfg(test)` 或 `test-support` feature） | `WidgetTestApp` / `WaitingWidget` / `FixtureFailure` |
+| 保留模块 | `account` / `category` / `config` / `descriptor` / `identity` / `instrument_link` / `protocol` / `rpc` / `runtime` / `stream` / `util` / `venue`（`&Translate` 口径） | 语义与 P3 前一致 |
+
+**已删除（AGENTS §1.1，无兼容层）**：`WidgetHeader`（`AnyElement` 双槽）→ `HeaderGroup` + 建树方法；`WidgetStatusExt`
+（E0116 的产物）→ `WidgetStatus` 固有方法；`HasContent` / `BuildHeader` / `PersistedConfig` 中的前两个（`AnyView` 擦除）
+→ vtable 与 `NodeId`；`LocalizedError` → `TranslatedError`；`Render` / `Entity` / `Context` / `AnyElement` / `SharedString`
+全部不再出现。
+
+### 13.2 冻结签名
+
+```rust
+// ── view.rs ────────────────────────────────────────────────────────────────
+pub struct ReloadHandle(/* Rc<dyn Fn(&mut ui_core::app::App)> */);
+impl ReloadHandle {
+    pub fn new(reload: impl Fn(&mut ui_core::app::App) + 'static) -> Self;
+    pub fn reload(&self, app: &mut ui_core::app::App);
+}
+
+pub enum HeaderGroup { Left, Right }
+
+pub trait WidgetView: Sized + 'static {
+    type Config: WidgetConfig;
+
+    const ID: WidgetId;
+    const DISPLAY_NAME: &'static str;                 // i18n key
+    const CATEGORY: WidgetCategory;
+    const DESCRIPTION: Option<&'static str> = None;   // i18n key
+    const ICON: Option<&'static str> = None;
+    const SELECTABLE: bool = true;
+
+    fn new(
+        instance_id: WidgetInstanceId,
+        config: Self::Config,
+        status: WidgetStatus,
+        reload: ReloadHandle,
+        config_change: WidgetConfigChange,
+        recovery: WidgetAction,
+        cx: &mut WidgetCx<'_>,
+    ) -> Result<Self, EngineError>;
+
+    fn load(&mut self, cx: &mut WidgetCx<'_>);
+    fn has_content(&self) -> bool;
+    fn config(&self) -> Option<&Self::Config> { None }
+
+    /// 正文：**一次建树**（首次 has_content == true 时由框架调用；之后靠 bind_*/sync）。
+    fn body(&mut self, parent: NodeId, cx: &mut WidgetCx<'_>) -> Result<(), EngineError>;
+
+    fn sync(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> { Ok(()) }
+
+    fn header(
+        &mut self,
+        group: HeaderGroup,
+        parent: NodeId,
+        cx: &mut WidgetCx<'_>,
+    ) -> Result<(), EngineError> { Ok(()) }
+
+    fn dispatch(&mut self, event: &Event, cx: &mut WidgetCx<'_>) -> bool { false }
+    fn release(&mut self, cx: &mut WidgetCx<'_>) {}
+    fn instrument_link(&self) -> Option<InstrumentLink> { None }
+}
+
+// ── cx.rs ──────────────────────────────────────────────────────────────────
+pub struct WidgetCx<'a> { /* &'a mut App, WindowId, &'a WidgetServices, SignalScope, FrameRouter */ }
+impl<'a> WidgetCx<'a> {
+    pub fn new(
+        app: &'a mut App,
+        window: WindowId,
+        services: &'a WidgetServices,
+        scope: SignalScope,
+        router: FrameRouter,
+    ) -> Self;
+
+    pub fn app(&self) -> &App;
+    pub fn app_mut(&mut self) -> &mut App;
+    pub fn window(&self) -> WindowId;
+    pub fn tree(&self) -> &NodeTree;
+    pub fn tree_mut(&mut self) -> &mut NodeTree;
+
+    pub fn services(&self) -> &WidgetServices;
+    pub fn translate(&self) -> &Translate;
+    pub fn language(&self) -> Signal<LanguageCode>;
+    pub fn theme(&self) -> &ThemeHandle;
+    pub fn config(&self) -> Arc<Config>;          // 设置快照（read 不登记依赖）
+    pub fn data_time_zone(&self) -> time::UtcOffset;
+    pub fn scope(&self) -> SignalScope;
+    pub fn router(&self) -> &FrameRouter;
+
+    pub fn signal<T: Clone + 'static>(&mut self, initial: T) -> Signal<T>;      // 归 widget scope
+    pub fn transient<T: Clone + 'static>(&mut self, initial: T) -> Transient<T>;
+    pub fn read<T: 'static>(&self, signal: &Signal<T>) -> SignalRef<T>;
+    pub fn write<T: Clone + PartialEq + 'static>(&mut self, signal: &Signal<T>, value: T) -> bool;
+    pub fn update<T: 'static>(&mut self, signal: &Signal<T>, update: impl FnOnce(&mut T)) -> bool;
+
+    pub fn request_frame(&mut self) -> Result<(), EngineError>;
+    pub fn request_node_repaint(&mut self, node: NodeId) -> Result<bool, EngineError>;
+    pub fn set_a11y_patch(&mut self, node: NodeId, patch: A11yPatch) -> Result<(), EngineError>;
+    pub fn handle(&self) -> AppHandle;
+    pub fn spawn(&mut self, future: impl Future<Output = ()> + Send + 'static);
+    pub fn runtime(&self) -> &tokio::runtime::Handle;
+}
+
+// ── status.rs ──────────────────────────────────────────────────────────────
+pub enum WidgetState { Connecting, Loading, Ready, Waiting(Notice), Failed(Failure) }
+impl WidgetState {
+    pub const fn waiting(notice: Notice) -> Self;
+    pub fn failed(error: Arc<dyn TranslatedError>, action: WidgetAction) -> Self;
+    pub const fn is_busy(&self) -> bool;
+    pub const fn is_failed(&self) -> bool;
+    pub const fn failure(&self) -> Option<&Failure>;
+    pub const fn notice(&self) -> Option<&Notice>;
+}
+
+pub enum Notice {
+    Message(&'static str),
+    MarketNotLoaded { venues: Vec<VenueId>, supported: Vec<VenueId> },
+}
+impl Notice {
+    pub const fn message(key: &'static str) -> Self;
+    pub fn resolve(&self, translate: &Translate) -> SmolStr;
+}
+
+pub struct WidgetStatus(/* Signal<WidgetState> */);   // Copy + Eq
+impl WidgetStatus {
+    pub fn new(app: &mut App, scope: SignalScope) -> Self;   // 初值 Connecting
+    pub fn state(&self, app: &App) -> WidgetState;
+    pub fn report(&self, app: &mut App, next: WidgetState) -> bool;  // 去重 = App::write
+    pub fn is_failed(&self, app: &App) -> bool;
+    pub fn is_busy(&self, app: &App) -> bool;
+    pub const fn signal(&self) -> Signal<WidgetState>;       // 供 surface 的 bind_* 登记依赖
+}
+
+pub struct Failure;  // Arc<dyn TranslatedError> + WidgetAction；PartialEq = 句柄同一性
+impl Failure {
+    pub fn text(&self, translate: &Translate) -> SmolStr;
+    pub const fn action(&self) -> &WidgetAction;
+}
+
+pub struct WidgetAction;  // label_key + Rc<dyn Fn(&mut App)> + enabled
+impl WidgetAction {
+    pub fn new(label_key: &'static str, run: impl Fn(&mut App) + 'static) -> Self;
+    pub fn label(&self, translate: &Translate) -> SmolStr;
+    pub const fn label_key(&self) -> &'static str;
+    pub fn enabled(self, enabled: bool) -> Self;
+    pub const fn is_enabled(&self) -> bool;
+    pub fn run(&self, app: &mut App);
+}
+
+// ── any.rs ─────────────────────────────────────────────────────────────────
+pub struct AnyWidget { /* Rc<RefCell<WidgetSlot>>；Clone */ }
+impl AnyWidget {
+    pub fn mount<W: WidgetView>(
+        app: &mut App,
+        window: WindowId,
+        parent: NodeId,
+        services: &Rc<WidgetServices>,
+        router: &FrameRouter,
+        instance_id: WidgetInstanceId,
+        config: W::Config,
+        config_change: WidgetConfigChange,
+    ) -> Result<Self, EngineError>;
+
+    pub fn descriptor(&self) -> WidgetDescriptor;
+    pub fn widget_id(&self) -> WidgetId;
+    pub fn instance_id(&self) -> WidgetInstanceId;
+    pub fn display_name(&self) -> &'static str;
+    pub fn surface(&self) -> NodeId;                         // pane 嵌入的根
+    pub fn status(&self) -> WidgetStatus;
+    pub fn config(&self) -> Option<VersionedWidgetConfig>;    // 按需重算
+    pub fn instrument_link(&self) -> Option<InstrumentLink>;
+    pub fn header(&self, app: &mut App, group: HeaderGroup, parent: NodeId) -> Result<(), EngineError>;
+    pub fn sync(&self, app: &mut App) -> Result<(), EngineError>;
+    pub fn dispatch(&self, app: &mut App, event: &Event) -> bool;
+    pub fn release(&self, app: &mut App) -> usize;            // 幂等；返回释放的信号值数
+    pub fn scope(&self) -> SignalScope;
+    pub fn window(&self) -> WindowId;
+    pub fn is_released(&self) -> bool;
+}
+
+// ── surface.rs ─────────────────────────────────────────────────────────────
+pub struct WidgetSurface;
+impl WidgetSurface {
+    pub fn build(cx: &mut WidgetCx<'_>, parent: NodeId, status: WidgetStatus) -> Result<Self, EngineError>;
+    pub fn root(&self) -> NodeId;
+    pub fn content_slot(&self) -> NodeId;
+    pub fn status(&self) -> WidgetStatus;
+    pub fn sync(&mut self, cx: &mut WidgetCx<'_>, has_content: bool) -> Result<(), EngineError>;
+    pub fn dispatch(&self, app: &mut App, event: &Event) -> bool;
+    pub fn release(&self, app: &mut App) -> usize;
+}
+
+// ── frame.rs ───────────────────────────────────────────────────────────────
+pub type RouteResult = Result<(), EngineError>;
+
+pub struct FrameRouter;   // Rc<RefCell<…>>，Clone + Default
+impl FrameRouter {
+    pub fn new(app: &mut App) -> Self;                 // 建 + 安装（幂等）
+    pub fn install(&self, app: &mut App);
+    pub fn register(&self, sync: impl Fn(&mut App) -> RouteResult + 'static) -> RouteId;
+    pub fn unregister(&self, id: RouteId) -> bool;
+    pub fn tick(&self, app: &mut App) -> RouteResult;  // 注册序扇出；首个错误返回，后续仍跑
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+    pub fn installed(&self) -> bool;
+    pub fn downgrade(&self) -> WeakRouter;
+}
+
+pub struct RouteId(u64);                               // Copy + Eq + Hash
+pub struct WeakRouter;                                 // 自注销用
+
+// ── binding.rs ─────────────────────────────────────────────────────────────
+pub type WidgetRpcResult<P> = Result<<P as WidgetProtocol>::Response, RpcCallError<...>>;
+
+pub enum Inbound<P: WidgetProtocol> {
+    Reliable { key: P::StreamKey, message: Arc<P::StreamMessage> },
+    Latest { key: P::StreamKey, message: Arc<P::StreamMessage> },
+    Rpc { request_id: RequestId, result: WidgetRpcResult<P> },
+}
+
+pub struct WidgetInbox<P: WidgetProtocol>;             // Clone（Arc）
+impl<P: WidgetProtocol> WidgetInbox<P> {
+    pub fn new() -> Self;
+    pub fn drain(&self) -> Vec<Inbound<P>>;
+    pub fn is_empty(&self) -> bool;
+    pub fn len(&self) -> usize;
+}
+
+pub struct WidgetBinding<P: WidgetProtocol>;
+impl<P: WidgetProtocol> WidgetBinding<P> {
+    pub fn spawn<S: WidgetService<P>>(cx: &mut WidgetCx<'_>, service: S) -> Self;
+    pub fn spawn_with_config<S: WidgetService<P>>(cx: &mut WidgetCx<'_>, service: S, config: WidgetRuntimeConfig) -> Self;
+    pub fn inbox(&self) -> &WidgetInbox<P>;
+    pub fn take(&self) -> Vec<Inbound<P>>;
+    pub fn client(&self) -> RpcClient<P>;
+    pub fn call(&mut self, cx: &mut WidgetCx<'_>, request: P::Request);  // 替换并 abort 上一次
+    pub fn cancel(&mut self);
+    pub async fn shutdown(self) -> RuntimeExit;
+}
+
+// ── services.rs ────────────────────────────────────────────────────────────
+pub struct WidgetServices {
+    pub translate: Translate,
+    pub language: Signal<LanguageCode>,
+    pub config: Signal<Config>,                       // 设置快照（组合根泵入）
+    pub theme: ThemeHandle,
+    pub market_participants: Option<MarketParticipantsConnector>,
+    pub runtime: tokio::runtime::Handle,
+}
+impl WidgetServices {
+    pub fn market_participants(&self) -> Option<&MarketParticipantsConnector>;
+}
+
+// ── error.rs / time_zone.rs ────────────────────────────────────────────────
+pub trait TranslatedError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr;
+}
+pub fn data_time_zone(config: &Config) -> time::UtcOffset;
+
+// ── test_support.rs（cfg(test) 或 feature = "test-support"）────────────────
+pub struct WidgetTestApp;
+impl WidgetTestApp {
+    pub fn new() -> Self;
+    pub fn app(&self) -> &App;  pub fn app_mut(&mut self) -> &mut App;
+    pub fn services(&self) -> &WidgetServices;
+    pub fn router(&self) -> &FrameRouter;
+    pub fn window(&self) -> WindowId;  pub fn root(&self) -> NodeId;
+    pub fn status(&self) -> WidgetStatus;  pub fn scope(&self) -> SignalScope;
+    pub fn with_cx<R>(&mut self, body: impl FnOnce(&mut WidgetCx<'_>) -> R) -> R;
+    pub fn tick(&mut self);            // router.tick
+    pub fn drain(&mut self);           // tick + TestApp::drain（生产泵序）
+    pub fn report(&mut self, state: WidgetState);
+    pub fn switch_language(&mut self, language: LanguageCode);
+    pub fn build_surface(&mut self) -> WidgetSurface;
+    pub fn sync_surface(&mut self, surface: &mut WidgetSurface, has_content: bool);
+    pub fn mount<W: WidgetView>(&mut self, config: W::Config) -> AnyWidget;
+    pub fn build_body(&mut self, parent: NodeId) -> NodeId;
+    pub fn placeholder_parent(&mut self) -> NodeId;
+    pub fn visible(&self, node: NodeId) -> bool;
+    pub fn text_of(&self, node: NodeId) -> String;
+    pub fn has_text(&self, node: NodeId, text: &str) -> bool;
+    pub fn has_canvas(&self, node: NodeId) -> bool;
+    pub fn click_recovery(&mut self, parent: NodeId);   // 走真实 Action 派发
+    pub fn find_by_debug_prefix(&self, parent: NodeId, prefix: &str) -> Option<NodeId>;
+    pub fn set_a11y_patch(&mut self, node: NodeId, patch: A11yPatch);
+}
+pub struct FixtureFailure;                       // TranslatedError → "sample.failure"
+pub fn fixture_translate(language: LanguageCode) -> Translate;
+pub struct WaitingWidget;                        // WidgetView 最小实现（无内容 + notice）
+```
+
+**类型别名/常量**：`WidgetServices` 的 `market_participants` 为 `Option`（见 §13.9 R-1）；恢复动作 key = `"common.retry"`。
+
+### 13.3 生命周期（五段式映射）
+
+kit 组件的「`new` → `build` → `mount`/`attach` → `sync` → `dispatch` → `release`」约定（§12.4）在 widget 侧的唯一映射：
+
+| kit 阶段 | widget 契约 | 谁调用 | 语义 |
+|---|---|---|---|
+| `new(app, …)` | `WidgetView::new` | `AnyWidget::mount` | 建信号与协作者；**不启动工作** |
+| `build(tree, parent)` | `WidgetView::body` / `header` | 框架（body 首次有内容时）/ pane | 只建节点；body 一次，之后靠 `bind_*` 与 `sync` |
+| `mount`/`attach` | —— | 框架 | surface 建壳（root/slot/content/placeholder）并把 body 槽交给 widget |
+| `sync(app)` | `WidgetView::sync` + `WidgetSurface::sync` | `FrameRouter`（每帧） | 自绘重画 / 倒计时 / 行同步 + 展示规则 |
+| `dispatch(app, &Event)` | `WidgetView::dispatch` + `WidgetSurface::dispatch` | pane 把 `App::drain_events()` 的事件转发进来 | 默认不消费；framework 控件先消费 |
+| `release(app)` | `WidgetView::release` | `AnyWidget::release` | 释放 kit 组件 / 解绑 / 取消定时器 |
+
+**`AnyWidget::mount` 的不可交换顺序**（`any.rs`）：建 scope → 铸 `WidgetStatus` → 建 surface → 建 body 单元与
+`ReloadHandle`（`Weak` 自引用）→ `Widget::new` → 存入 body → 调 `load` → 注册 `FrameRouter` 路由。
+
+**`AnyWidget::release` 的不可交换顺序**：摘路由 → `WidgetView::release`（节点仍在）→ surface 组件 release →
+丢 widget（body 置空）→ `App::remove_node_with_scope(window, surface.root(), scope)`（E16：先删子树、后释放 scope，
+`app.rs:2029`）。返回 `RemoveOutcome.released_values` + 组件释放数；幂等。
+
+**正文只建一次**：`has_content` 首次为 `true` 的帧建 body 并置 `body_built`；此后 `has_content` 再变回 `false` 也只是
+隐藏（`StylePatch.visible=false`），不重建、不丢节点身份与依赖边。语言相关文本必须在 `bind_text` 里读
+`services.language`（读即登记依赖），否则语言切换不会重绘。
+
+### 13.4 错误面
+
+- 所有可失败 API 用 `ui_core::error::EngineError`（树/窗口/节点）；**无字符串错误**。
+- 错误文案统一走 `TranslatedError`（`&Translate -> SmolStr`），`Failure` 只携带强类型句柄；`LocalizedError` 已删除。
+- `FrameRouter::tick` 把首个路由错误原样返回（其余路由仍执行）；`App::on_frame` 闭包裹住它并 `log::error!`。
+- 组合根缺失协作者（目录）由 `WidgetServices::market_participants()` 的 `Option` 表达，widget 自行映射为业务 notice/failure。
+
+### 13.5 语言与主题（依赖登记）
+
+- **语言**：`Translate` 是纯 `i18n` 状态（`Cell`，不引 `ui_core`）；`Signal<LanguageCode>` 是引擎依赖。组合根切换时
+  **先 `Translate::set_language`、后写信号**。widget 在 `bind_text`/`bind_style` 内 `rcx.read(&language)` 登记依赖。
+- **主题**：`ThemeHandle` 的 `role(cx, Role)` 只在 `bind_style` 里读（G3：挂载期常量颜色不会跟外观切换）。
+- **设置**：`WidgetServices::config` 是设置快照信号；时区经 `data_time_zone(&Config)`（`time_zone.rs`）。
+
+### 13.6 六行展示真值表（与 `surface.rs` 模块文档逐字一致）
+
+| what the widget has | its state | result |
+|---|---|---|
+| content | `Failed` | the failure in a banner above the content |
+| content | anything else | the content alone |
+| no content | `Failed` | the failure in a placeholder, with its recovery |
+| no content | `Waiting` | the notice's sentence in a placeholder |
+| no content | `Connecting` | a spinner under the name of the connection |
+| no content | `Loading` or `Ready` | a spinner with no message of its own |
+
+实现约束：正文/占位用 `StylePatch.visible` + `A11yPatch.hidden` 切换（**不用** `display:none`，R-28）；banner 在
+不需要时**不建节点**（不占行）；占位子树在切到有内容时**释放**（spinner 动画不空转，I3）。
+
+### 13.7 FrameRouter 与 I3
+
+- `App::on_frame` 是单槽；`FrameRouter` 是**唯一**注册者。组合根 `FrameRouter::new(&mut app)` 一次，widget 的
+  `AnyWidget::mount` 向它注册自己的 `sync` 路由；`release` 摘除。
+- **空路由不出帧**：`new`/`install`/`tick` 都不请求帧；没有路由时 tick 是 no-op。稳态下 sync 不写信号即不出帧
+  （测试 `an_empty_router_should_request_no_frame` / `a_steady_surface_requests_no_frame`）。
+- `TestApp::drain` 不跑 `on_frame`；`WidgetTestApp::drain` = `router.tick` + `TestApp::drain`（生产泵序）。
+
+### 13.8 测试口径
+
+- **选择器约定**（`NodeBuilder::id`，契约层统一，Probe 可查）：`WIDGET_SURFACE` / `WIDGET_SLOT` / `WIDGET_CONTENT` /
+  `WIDGET_PLACEHOLDER` / `WIDGET_BANNER`；框架控件 key 前缀 `widget.placeholder.action.` / `widget.banner.action.`。
+- **断言面**：`Probe`（存在/布局盒/命中）+ `FrameRecord`（帧/图元）+ `WidgetTestApp`（状态/可见性/文本/点击）。
+  `TestApp::drain` 返回的 `&FrameRecord` 需 clone 或先作用域化再用。
+- 旧 GPUI 测试的去向逐条登记在 `.docs/gui-migration/test-ledger/p3-1.md`。
+- 契约层单测覆盖：状态 6 case 真值表、去重（`frame_requests` 不增）、路由扇出/注销/空路由、擦除调用、surface 占位切换、
+  binding 收件箱/RPC 回投、语言依赖、最小示例 widget 端到端（mount → loading/ready/failed → 语言切换 → release 无泄漏）。
+
+### 13.9 残余与需裁决
+
+| # | 项 | 说明 |
+|---|---|---|
+| R-1 | `WidgetServices::market_participants` 为 `Option` | `MarketParticipantsConnector` 的构造仍需 `widget_tokio_runtime::Runtime`（该 crate 依赖 `gpui-kit`），契约层测试无法在零 gpui 依赖下构造。组合根永远给 `Some`；读市场的 widget 在 `None` 时映射为业务失败。**需裁决**：给 connector 增 gpui-free fixture 缝（P4）后改回必填 |
+| R-2 | `WidgetServices` 形状相对 P3-0 变更 | `config: ConfigManager` → `Signal<Config>`（P3-0 R4 已预告）；新增 `theme`；见 design-changes。P3-0 的 5 字段不复存在 |
+| R-3 | 正文一次建树 | 引擎无 `.cached()`；widget 若按帧重建 body 会破坏节点身份/依赖边。20 crate 迁移时以此为准 |
+| R-4 | notice 的 markdown 文案 | 占位以 `kit::empty_state` 纯文本重建；旧 markdown/kbd 渲染（`test.notice`）不再是契约层职责，`market_not_loaded` 的 `<kbd>` 富文本由后续批在 kit 侧决定 |
+| R-5 | `AnyWidget` 内部唯一 downcast | 类型擦除在 vtable 单态化函数内部完成，公开面无 downcast/trait object；安全由 mount 时同一 `W` 填充保证 |
+| R-6 | a11y 角色 | 引擎 `A11yRole` 无 `Alert`；banner 用 `GenericContainer` + `A11yLive::Assertive` 表达告警语义 |
 
 ## 附录 A：核心接口草图汇总（v2.3 起与 `crates/ui_core/src` 对齐）
 
@@ -3878,4 +4274,4 @@ pub struct OverlayOptions { /* …, pub trap_focus: bool, pub a11y: A11yOverride
 > 坐标全为**绝对窗口逻辑像素**（`GeometryDraw.transform` 是唯一 per-primitive 变换）；`Primitive` 实测 `size_of == 80` B（软上限 128 B）。
 ---
 
-*文档完 · 本文描述 D1–D25 定案下的最终设计（**v2.3**，2026-11-21）；已实现部分与 `crates/ui_core/src` 对齐，**E1–E15（§11）已全部实现**，**P2 应用层（§12）已实现**（P2-5 `gallery` 已合入 `1b65c9d`；真实窗口缺陷修复批次 P2-6 在途）；E2b 候选（§11.2）与已接受残余（§11.8）明确标注为未实现/限制，不得当作已交付能力。*
+*文档完 · 本文描述 D1–D25 定案下的最终设计（**v2.4**，2026-11-22；P3-1 契约层 §13 冻结）；已实现部分与 `crates/ui_core/src` 对齐，**E1–E15（§11）已全部实现**，**P2 应用层（§12）已实现**（P2-5 `gallery` 已合入 `1b65c9d`；真实窗口缺陷修复批次 P2-6 在途）；E2b 候选（§11.2）与已接受残余（§11.8）明确标注为未实现/限制，不得当作已交付能力。*

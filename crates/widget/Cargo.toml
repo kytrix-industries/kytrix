@@ -4,9 +4,13 @@ version.workspace = true
 publish.workspace = true
 edition.workspace = true
 
+[features]
+# The framework's test host (`widget::test_support`) and, through it, the engine's
+# own test support (`TestApp`/`Probe`/`FrameRecord`). Not in the release build.
+test-support = ["ui_core/test-support"]
+
 [dependencies]
 ahash.workspace = true
-gpui-kit.workspace = true
 i18n.workspace = true
 log.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -18,7 +22,6 @@ tokio-util.workspace = true
 
 # Workspace members
 app_config.workspace = true
-app_config_provider.workspace = true
 base_ui.workspace = true
 kytrix_service_provider.workspace = true
 market_participants_connector.workspace = true
@@ -27,13 +30,11 @@ network.workspace = true
 ui_core.workspace = true
 
 [dev-dependencies]
-gpui-kit = { workspace = true, features = ["test-support"] }
-# The services fixture builds the market-participants root through the connector's own
-# test seam: a real root needs a live gateway, and only that seam builds one without a
-# venue answering.
-market_participants_connector = { workspace = true, features = ["test-support"] }
-# The instrument-link tests build legacy payloads as dynamic JSON; production
-# code never touches `serde_json`.
+# The framework's own tests drive `ui_core::test_support` directly; the feature is
+# only turned on for test builds (and for external users through `test-support`).
+ui_core = { workspace = true, features = ["test-support"] }
+# The instrument-link tests build legacy payloads as dynamic JSON; production code
+# never touches `serde_json`.
 serde_json.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
