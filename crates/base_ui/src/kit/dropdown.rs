@@ -15,8 +15,8 @@
 //! - **不自动选中首项**：没有选中项时触发器显示占位文本（旧 dropdown 没有选中状态，首项回退
 //!   只属于 select 的「打开时高亮」）；
 //! - 面板宽度默认对齐触发器实测宽度，但它只是**下限**：内容更宽时面板长到内容宽（旧
-//!   `min_w(trigger)` 口径）；[`DropdownOptions::width`] 显式给宽时按面板口径精确使用；
-//!   打开期间触发器宽度变化会在 `sync` 里重新对齐；
+//!   `min_w(trigger)` 口径）；[`DropdownOptions::width`] 显式给宽时按面板口径**精确使用**
+//!   （旧 `menu_width` 语义，不随内容增长）；打开期间触发器宽度变化只在未给显式宽时重新对齐；
 //! - 面板高度上限 [`DropdownOptions::max_height`]，超出滚动（旧 `menu_max_h`）；
 //! - 条目支持图标（旧 dropdown 的条目就是 `MenuItem`，可带 `IconAction`）：有图标的条目整列
 //!   留槽；选中项的图标同时画在触发器上（换选中时 `sync` 换资源与占位尺寸）。
@@ -111,7 +111,8 @@ pub struct DropdownOptions {
     pub size: UnifiedSize,
     /// 触发器视觉变体。
     pub variant: InteractiveVariant,
-    /// 面板宽度（`None` = 对齐触发器实测宽度）。
+    /// 面板宽度（`None` = 对齐触发器实测宽度、内容更宽时长到内容宽；`Some` = 精确宽度，
+    /// 不随内容增长）。
     pub width: Option<f32>,
     /// 面板最大高度（逻辑像素）。
     pub max_height: f32,
@@ -155,7 +156,7 @@ impl DropdownOptions {
         self
     }
 
-    /// 面板宽度（`None` = 对齐触发器）。
+    /// 面板宽度（`None` = 对齐触发器；显式值 = 精确宽度，不随内容增长）。
     #[must_use]
     pub fn width(mut self, width: f32) -> Self {
         self.width = Some(width);
@@ -268,7 +269,13 @@ impl Dropdown {
                     row: A11yRole::MenuItem,
                 },
                 label: options.label.clone(),
-                width: PanelWidth::AtLeast,
+                // 显式 `width` = 精确宽度（旧 `menu_width` 语义，审查 F24）；未给宽时按触发器
+                // 下限对齐、内容更宽时长到内容宽。
+                width: if options.width.is_some() {
+                    PanelWidth::Exact
+                } else {
+                    PanelWidth::AtLeast
+                },
                 slot: crate::kit::layer::LayerSlot::Exclusive,
             },
         );
@@ -1441,6 +1448,37 @@ mod tests {
             panel.size.width > trigger_width + 100.0,
             "长条目把面板撑宽（旧 min_w 下限口径）：面板 {} / 触发器 {trigger_width}",
             panel.size.width
+        );
+    }
+
+    #[test]
+    fn an_explicit_width_stays_exact_for_long_items() {
+        // 审查 F24：显式 `width` = 精确宽度（旧 `menu_width` 语义），长条目不得把面板撑宽。
+        let mut harness = Harness::new();
+        let dropdown = harness.dropdown(DropdownOptions::default().width(120.0));
+        harness.mount(
+            &dropdown,
+            vec![
+                DropdownItem::new(
+                    "long",
+                    "A very long dropdown entry that cannot fit the stated panel width at all",
+                ),
+                DropdownItem::new("short", "B"),
+            ],
+        );
+        let trigger = dropdown.trigger_node().expect("触发器");
+        harness.click(&dropdown, harness.center(trigger));
+        let panel = harness.bounds(dropdown.panel_node().expect("面板"));
+        assert!(
+            (panel.size.width - 120.0).abs() < 0.5,
+            "显式宽度精确生效、不随长条目增长：{}",
+            panel.size.width
+        );
+        let row = harness.bounds(harness.row(0));
+        assert!(
+            row.size.width <= 120.0 - 8.0 + 0.5,
+            "长条目被面板宽度约束（截断 / 换行）：行宽 {}",
+            row.size.width
         );
     }
 

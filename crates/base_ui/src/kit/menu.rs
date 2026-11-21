@@ -68,7 +68,7 @@ use ui_core::{
     app::{App, TimerId},
     error::EngineError,
     event::{Action, ActionSource, KeyBinding, KeyCode, Modifiers},
-    interaction::{ActionCtx, ItemAlign},
+    interaction::ItemAlign,
     math::Size,
     node::{
         builder::NodeBuilder, dependency::ReadCtx, id::NodeId, image::ImageFit, signal::Signal,
@@ -223,6 +223,7 @@ pub(crate) struct PanelContent {
 /// 引擎没有公开的「量文本」API（`text_caret_rect` 只认已布局的文本节点），因此内核在面板里建
 /// **一个**隐藏测量文本（行文本用 `\n` 连接），布局后用逐行 caret 偏移差算出每行固有宽 ——
 /// 与旧的「面板 `min_w(trigger)`，内容更宽时长宽」口径对齐，且不破坏虚拟列表（O(1) 个额外节点）。
+/// label 自身含换行时按**最宽行段**计（见 `ItemPanel::measure_content`）。
 #[derive(Clone)]
 pub(crate) struct PanelMeasure {
     /// 行文本（按行序；行数应与 `rows.len()` 一致）。
@@ -279,7 +280,7 @@ pub(crate) struct ItemPanelOptions {
     pub roles: PanelRoles,
     /// 面板可访问名。
     pub label: Option<SmolStr>,
-    /// 宽度口径。
+    /// 宽度口径（显式宽 = `Exact`；未给宽 = `AtLeast`，见 [`PanelWidth`]）。
     pub width: PanelWidth,
     /// 层带槽位规则（根菜单 / 下拉 / 选择独占；子菜单嵌套）。
     pub slot: LayerSlot,
@@ -288,9 +289,11 @@ pub(crate) struct ItemPanelOptions {
 /// 面板宽度口径。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PanelWidth {
-    /// 精确宽度（菜单 / 上下文菜单：调用方给的面板宽就是最终宽）。
+    /// 精确宽度（菜单 / 上下文菜单 / 显式 `width` 的下拉与选择：调用方给的面板宽就是最终宽，
+    /// 不随内容增长）。
     Exact,
-    /// 宽度是**下限**（下拉 / 选择：对齐触发器，但内容更宽时长到内容宽 —— 旧 `min_w` 口径）。
+    /// 宽度是**下限**（未给显式宽的下拉 / 选择：对齐触发器，但内容更宽时长到内容宽 —— 旧
+    /// `min_w` 口径）。
     ///
     /// 内容宽由 [`PanelContent::measure`] 在打开后实测（见 [`PanelMeasure`]）。
     AtLeast,
@@ -396,6 +399,9 @@ impl ItemPanel {
                         return Ok(());
                     };
                     // 命中壳：整行可点、满宽；a11y `hidden`（行语义在列表行基线上）。
+                    // `tab_stop(false)`：行不进 Tab 序、指针按下也不把焦点交给命中壳 —— 键盘
+                    // 作用域由 surface 统一承担（审查 F25：默认 `tab_stop=true` 会让点过行之后
+                    // Enter/Space 落进行动作而 `ctx.hit()==None`，激活被吞）。
                     let hit = NodeBuilder::boxed()
                         .id(format_smolstr!("{list_key}:hit:{index}"))
                         .style(
@@ -407,6 +413,7 @@ impl ItemPanel {
                                 .min_width_0()
                                 .build(),
                         )
+                        .tab_stop(false)
                         .on_click(row_action.clone())
                         .a11y(A11yOverride {
                             hidden: true,
@@ -656,6 +663,8 @@ impl ItemPanel {
 
     /// 下限宽变化（下拉 / 选择对齐触发器的路径）；最终宽 = max(下限, 内容固有宽)。
     ///
+    /// `PanelWidth::Exact` 不参与内容增长（只更新下限；当前调用方不会在显式宽下调用本方法）。
+    ///
     /// # Errors
     /// 引擎建树错误。
     pub(crate) fn resize(&self, app: &mut App, width: f32) -> Result<(), EngineError> {
@@ -735,6 +744,10 @@ impl ItemPanel {
     }
 
     /// 量内容固有宽（surface 口径）。文本还没 shape 时返回 `None`（下一帧再量）。
+    ///
+    /// 逐**行段**量：label 内可能含显式换行（`\n` / `\r` / `\r\n`），换行处 caret 的 x 会重置，
+    /// 用「整段 caret 差」会把跨行距离算成宽度（审查 F29）。因此把每个 label 按换行切成行段，
+    /// 各行段分别取 caret 差，最终宽 = 最宽行段 + 固定附加宽。
     fn measure_content(&self, app: &App) -> Option<f32> {
         let (window, node) = {
             let state = self.inner.state.borrow();
@@ -746,12 +759,22 @@ impl ItemPanel {
         let mut offset = 0usize;
         let mut width = 0.0f32;
         for label in &measure.labels {
-            let start = tree.text_caret_rect(node, offset).ok()?;
-            let end_index = offset + label.len();
-            let end = tree.text_caret_rect(node, end_index).ok()?;
+            let bytes = label.as_bytes();
+            let mut segment_start = 0usize;
+            for (index, byte) in bytes.iter().enumerate() {
+                if *byte != b'\n' && *byte != b'\r' {
+                    continue;
+                }
+                let start = tree.text_caret_rect(node, offset + segment_start).ok()?;
+                let end = tree.text_caret_rect(node, offset + index).ok()?;
+                width = width.max((end.origin.x - start.origin.x).abs());
+                segment_start = index + 1;
+            }
+            let start = tree.text_caret_rect(node, offset + segment_start).ok()?;
+            let end = tree.text_caret_rect(node, offset + label.len()).ok()?;
             width = width.max((end.origin.x - start.origin.x).abs());
             // 换行分隔符（最后一行之后没有）。
-            offset = end_index + 1;
+            offset += label.len() + 1;
         }
         Some(width + measure.extra + MENU_PADDING * 2.0)
     }
@@ -975,6 +998,10 @@ impl ItemPanel {
             let Some(index) = this.row_at_node(app, window, hit) else {
                 return;
             };
+            // 指针按下把焦点交给命中链上最近的**可聚焦**祖先（行命中壳已退出 Tab 序，落点是
+            // 列表视口）。键盘激活归 surface：这里把焦点收回面板键盘作用域，点过行之后
+            // Enter / Space 仍激活高亮行（审查 F25）。
+            this.focus(app);
             this.activate(app, index);
         });
     }
@@ -1576,6 +1603,11 @@ impl Menu {
     #[must_use]
     pub fn surface_node(&self) -> Option<NodeId> {
         self.inner.panel.surface_node()
+    }
+
+    /// 引擎浮层包装节点（同带归属判定用：`Layer::Entry::node` 是这个节点而不是面板节点）。
+    pub(crate) fn overlay_node(&self) -> Option<NodeId> {
+        self.inner.panel.overlay().overlay_node()
     }
 
     /// 行数（含分组 / 分隔线）。
@@ -2194,7 +2226,11 @@ impl IconSnapshot {
 /// 裁剪在 surface 外，不参与绘制。
 const MEASURE_WIDTH: f32 = 4096.0;
 
-/// 建宽度测量文本（`PanelWidth::AtLeast`）：行文本用 `\n` 连接，布局后逐行 caret 偏移差 = 固有宽。
+/// 建宽度测量文本（`PanelWidth::AtLeast`）：行文本用 `\n` 连接，布局后逐行段 caret 偏移差 = 固有宽。
+///
+/// label 自身带显式换行（`\n` / `\r` / `\r\n`）时保留原字符 —— 文本长度与字节下标必须与
+/// [`PanelMeasure::labels`] 一致（`measure_content` 按字节偏移取 caret）；换行在量宽时按行段
+/// 切分处理，不参与宽度累计。
 fn build_measure_node(
     tree: &mut NodeTree,
     surface: NodeId,
@@ -2334,9 +2370,6 @@ fn action_foreground(action: &MenuAction) -> Role {
     }
 }
 
-// `ActionCtx` 在动作 handler 里用到（`register_actions` / `bind_extra_keys` 的闭包签名）。
-const _: fn(&mut ActionCtx<'_>) = |_| {};
-
 #[cfg(test)]
 mod tests {
     //! 引擎树上的行为：打开 / 定位翻边 / 键盘高亮 / 激活 / 关闭语义 / 子菜单 / 虚拟化 / a11y / I3。
@@ -2351,15 +2384,13 @@ mod tests {
     use ui_core::{
         a11y::A11yRole,
         event::{InputEvent, KeyCode, Modifiers, PointerButton},
-        math::{Rect, Size},
+        math::Rect,
         node::{builder::NodeBuilder, id::NodeId},
         test_support::app::TestApp,
         window::WindowId,
     };
 
-    use super::{
-        Menu, MenuAction, MenuEntry, MenuMode, MenuOptions, MenuSubmenu, Overlay, Placement,
-    };
+    use super::{Menu, MenuAction, MenuEntry, MenuMode, MenuOptions, MenuSubmenu};
     use crate::{
         kit::{
             layer::Layer,
@@ -2611,7 +2642,6 @@ mod tests {
             panel.max().y <= 560.0 + 0.5,
             "放不下时翻到锚点上方：{panel:?}"
         );
-        let _ = Size::new(800.0, 600.0);
     }
 
     #[test]
@@ -2968,7 +2998,4 @@ mod tests {
             "行声明 ListBoxOption"
         );
     }
-
-    /// 未使用的类型约束：`Overlay` / `Placement` 由本模块文档引用（避免 import 落空）。
-    const _: Option<fn(&Overlay, Placement)> = None;
 }

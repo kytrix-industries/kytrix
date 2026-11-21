@@ -20,7 +20,8 @@
 //!
 //! - 条目支持图标（旧 `Select` 的条目是 `MenuItem`，可带 `IconAction`）；单选选中后触发器
 //!   画出选中项图标（多选画首项图标）；
-//! - 面板宽度对齐触发器实测宽，但它是**下限**：内容更宽时面板长到内容宽（旧 `min_w` 口径）。
+//! - 面板宽度默认对齐触发器实测宽，但它是**下限**：内容更宽时面板长到内容宽（旧 `min_w` 口径）；
+//!   显式 [`SelectOptions::width`] 时面板按该值**精确**宽（旧 `menu_width` 语义，不随内容增长）。
 //!
 //! 标签的视觉与 [`crate::kit::badge`] 的中性色块同源（`SurfaceControl` 底 / `LineBorder` 边 /
 //! `FgDefault` 字 / 4 px 圆角 / 尺寸档高度），但 `Badge` 的文本是**建树期固定**的，而标签文本随
@@ -135,7 +136,8 @@ pub struct SelectOptions {
     pub size: UnifiedSize,
     /// 触发器视觉变体。
     pub variant: InteractiveVariant,
-    /// 触发器 / 面板宽度（`None` = 触发器随内容、面板对齐触发器）。
+    /// 面板宽度（`None` = 对齐触发器实测宽度、内容更宽时长到内容宽；`Some` = 精确宽度，
+    /// 不随内容增长）。
     pub width: Option<f32>,
     /// 面板最大高度。
     pub max_height: f32,
@@ -188,7 +190,7 @@ impl SelectOptions {
         self
     }
 
-    /// 显式宽度。
+    /// 显式面板宽度（精确宽度，不随内容增长）。
     #[must_use]
     pub fn width(mut self, width: f32) -> Self {
         self.width = Some(width);
@@ -325,7 +327,13 @@ impl Select {
                     row: A11yRole::ListBoxOption,
                 },
                 label: options.label.clone(),
-                width: PanelWidth::AtLeast,
+                // 显式 `width` = 精确宽度（旧 `menu_width` 语义，审查 F24）；未给宽时按触发器
+                // 下限对齐、内容更宽时长到内容宽。
+                width: if options.width.is_some() {
+                    PanelWidth::Exact
+                } else {
+                    PanelWidth::AtLeast
+                },
                 slot: crate::kit::layer::LayerSlot::Exclusive,
             },
         );
@@ -1317,7 +1325,7 @@ fn build_tag_chip(
         .build(tree, parent)?;
     let theme_text = theme.clone();
     let items = items.clone();
-    let text = NodeBuilder::text(
+    NodeBuilder::text(
         SmolStr::new_static(""),
         TextStyle::new(size.text_size()).with_wrap(TextWrap::NoWrap),
     )
@@ -1341,7 +1349,6 @@ fn build_tag_chip(
             .tree_mut(),
         chip,
     )?;
-    let _ = text;
     Ok(chip)
 }
 
@@ -1923,6 +1930,148 @@ mod tests {
             panel.size.width > trigger_width + 100.0,
             "长条目把面板撑宽（旧 min_w 下限口径）：面板 {} / 触发器 {trigger_width}",
             panel.size.width
+        );
+    }
+
+    #[test]
+    fn an_explicit_width_stays_exact_for_long_items() {
+        // 审查 F24：显式 `width` = 精确宽度（旧 `menu_width` 语义），长条目不得把面板撑宽。
+        let mut harness = Harness::new();
+        let select = harness.select(SelectOptions::default().width(120.0));
+        harness.mount(
+            &select,
+            vec![
+                SelectItem::new(
+                    "long",
+                    "A very long selection entry that cannot fit the stated panel width at all",
+                ),
+                SelectItem::new("short", "B"),
+            ],
+        );
+        let trigger = select.trigger_node().expect("触发器");
+        harness.click(&select, harness.center(trigger));
+        let panel = harness.bounds(select.panel_node().expect("面板"));
+        assert!(
+            (panel.size.width - 120.0).abs() < 0.5,
+            "显式宽度精确生效、不随长条目增长：{}",
+            panel.size.width
+        );
+        let row = harness.bounds(harness.row(0));
+        assert!(
+            row.size.width <= 120.0 - 8.0 + 0.5,
+            "长条目被面板宽度约束（截断 / 换行）：行宽 {}",
+            row.size.width
+        );
+    }
+
+    #[test]
+    fn a_newline_in_a_label_does_not_distort_the_measured_width() {
+        // 审查 F29：label 内的换行会让 caret 的 x 重置；量宽必须按**行段**取最宽行，
+        // 而不是把跨行距离算成宽度（修复前换行 label 会被量窄、显示被截断）。
+        let mut single = Harness::new();
+        let single_select = single.select(SelectOptions::default());
+        single.mount(
+            &single_select,
+            vec![SelectItem::new("a", "MMMMMMMMMMMMMMMMMMMM")],
+        );
+        let trigger = single_select.trigger_node().expect("触发器");
+        single.click(&single_select, single.center(trigger));
+        let one_line = single
+            .bounds(single_select.panel_node().expect("面板"))
+            .size
+            .width;
+
+        let mut wrapped = Harness::new();
+        let wrapped_select = wrapped.select(SelectOptions::default());
+        wrapped.mount(
+            &wrapped_select,
+            vec![SelectItem::new("b", "MMMMMMMMMMMMMMMMMMMM\nMMMM")],
+        );
+        let trigger = wrapped_select.trigger_node().expect("触发器");
+        wrapped.click(&wrapped_select, wrapped.center(trigger));
+        let two_lines = wrapped
+            .bounds(wrapped_select.panel_node().expect("面板"))
+            .size
+            .width;
+
+        assert!(
+            (one_line - two_lines).abs() < 0.5,
+            "换行 label 按最宽行量宽（与单行同宽）：单行 {one_line} / 换行 {two_lines}"
+        );
+    }
+
+    #[test]
+    fn clicking_a_row_keeps_enter_and_space_activating_it() {
+        // 审查 F25：指针点击把焦点交给行命中壳（默认 `tab_stop=true`）后，键盘 Enter 按
+        // 「焦点节点最近动作」派发到行动作、`ctx.hit()==None` ⇒ 激活被吞。行壳退出 Tab 序，
+        // 行点击再把焦点交回面板 surface，点过行之后 Enter / Space 才继续激活高亮行。
+        let mut harness = Harness::new();
+        let select = harness.select(SelectOptions {
+            multiple: true,
+            ..SelectOptions::default()
+        });
+        harness.mount(&select, items());
+        let trigger = select.trigger_node().expect("触发器");
+        harness.click(&select, harness.center(trigger));
+
+        harness.click(&select, harness.row_center(0));
+        assert_eq!(
+            select.chosen(harness.app.app()),
+            vec![SmolStr::new_static("a")],
+            "点击切换一次"
+        );
+        let surface = harness.find("select:panel:surface").expect("面板 surface");
+        assert_eq!(
+            harness.app.app().focused(harness.window),
+            Some(surface),
+            "点击行后焦点回到面板键盘作用域"
+        );
+
+        harness.key(&select, KeyCode::Enter);
+        assert!(
+            select.chosen(harness.app.app()).is_empty(),
+            "点击行后 Enter 仍切换高亮行"
+        );
+        harness.key(&select, KeyCode::Space);
+        assert_eq!(
+            select.chosen(harness.app.app()),
+            vec![SmolStr::new_static("a")],
+            "点击行后 Space 仍切换高亮行"
+        );
+    }
+
+    #[test]
+    fn row_hit_shells_are_not_in_the_tab_order() {
+        // 审查 F25：命中壳默认 `tab_stop=true` 会让 Tab 逐个遍历行（键鼠焦点模型分裂）。
+        let mut harness = Harness::new();
+        let select = harness.select(SelectOptions::default());
+        harness.mount(&select, items());
+        let trigger = select.trigger_node().expect("触发器");
+        harness.click(&select, harness.center(trigger));
+        assert!(select.is_open(harness.app.app()));
+
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            harness.key(&select, KeyCode::Tab);
+            let focused = harness
+                .app
+                .app()
+                .focused(harness.window)
+                .expect("Tab 后有焦点");
+            let debug = harness
+                .app
+                .app()
+                .window(harness.window)
+                .expect("窗口")
+                .tree()
+                .debug_id(focused)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{focused:?}"));
+            seen.push(debug);
+        }
+        assert!(
+            seen.iter().all(|id| !id.contains(":hit:")),
+            "Tab 序不得落到行命中壳：{seen:?}"
         );
     }
 

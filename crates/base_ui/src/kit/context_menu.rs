@@ -295,8 +295,12 @@ impl ContextMenu {
 
     /// 关掉同层带里别的上下文菜单（旧 `Layer` 的单例语义）；自己的根若已是最上层则保留，
     /// 自己的子菜单（同带的嵌套层）先关掉。
+    ///
+    /// 归属比较用**引擎浮层包装节点**（`Layer::Entry::node`）而不是 kit 面板节点：
+    /// 两者是不同的 `NodeId`，用面板节点会把自己的根也关掉、然后在 `open` 里重建（审查 F26
+    /// 顺带修正）。
     fn close_peers(&self, app: &mut App, window: WindowId) {
-        let own = self.inner.menu.borrow().panel_node();
+        let own = self.inner.menu.borrow().overlay_node();
         while let Some(top) = self.inner.layer.top_of(window, Band::ContextMenu) {
             if Some(top.node()) == own {
                 break;
@@ -641,6 +645,60 @@ mod tests {
             "同层带至多一个（旧 Layer 语义）"
         );
         assert!(second.is_open(harness.app.app()));
+    }
+
+    #[test]
+    fn reopening_closes_the_previous_submenu() {
+        // 审查 F26：`close_peers` 必须在**自身重开**时关掉旧子菜单（同带嵌套层）。只测
+        // 「第二个菜单替换第一个」不够 —— 那条由 `Layer::Exclusive` 槽位兜底，`close_peers`
+        // 改 no-op 后仍然绿。
+        let mut harness = Harness::new();
+        let menu = harness.menu_with(entries_with_submenu(), options());
+        harness.open(&menu, Point::new(300.0, 200.0));
+        let root_panel = menu.panel_node().expect("根面板");
+        let at = harness.row_center(1);
+        harness.hover(&menu, at);
+        assert!(
+            harness
+                .find("context:menu:sub:1:panel:list:row:0")
+                .is_some(),
+            "悬停打开子菜单"
+        );
+        assert_eq!(harness.layer.len(harness.window), 2, "根菜单 + 子菜单两层");
+
+        harness.open(&menu, Point::new(200.0, 150.0));
+        assert!(
+            harness
+                .find("context:menu:sub:1:panel:list:row:0")
+                .is_none(),
+            "自身重开时旧子菜单被关掉"
+        );
+        assert_eq!(
+            menu.panel_node(),
+            Some(root_panel),
+            "自己的根被保留（只换锚点，不重建面板）"
+        );
+        let top = harness
+            .layer
+            .top_of(harness.window, Band::ContextMenu)
+            .expect("根菜单仍在层带里");
+        let tree = harness
+            .app
+            .app()
+            .window(harness.window)
+            .expect("窗口")
+            .tree();
+        let mut cursor = Some(root_panel);
+        let mut top_is_root = false;
+        while let Some(node) = cursor {
+            if node == top.node() {
+                top_is_root = true;
+                break;
+            }
+            cursor = tree.get(node).ok().and_then(|node| node.parent());
+        }
+        assert!(top_is_root, "层带顶部是自己的根浮层（而非旧子菜单）");
+        assert_eq!(harness.layer.len(harness.window), 1, "层带只剩根菜单一层");
     }
 
     #[test]
