@@ -4,7 +4,8 @@
 //!
 //! 本模块树是 `base_ui` 从 `gpui-kit` 迁到自研引擎 `ui_core` 的**目标 API**，当前处于
 //! 「新旧并存」期：本文件公开的 `icon` / `assets` / `brand` / `size` / `format` / `motion` /
-//! `animation` / `join` / `markdown` / `input` / `list` / `scroll_bar` / `table` / `tree` 是
+//! `animation` / `join` / `markdown` / `input` / `list` / `scroll_bar` / `table` / `tree` /
+//! `alert` / `dialog` / `overlay` / `layer` / `tooltip` 是
 //! 引擎化版本；旧顶层模块（`crate::icon`、`crate::assets`、`crate::markdown`、`crate::input`、
 //! `crate::table`…）由尚未迁移的 gpui 组件继续使用，P2-5 迁完后删除。按 AGENTS §1.1，这里
 //! **不提供**任何兼容层 / 转发函数 —— 两个模块树各自独立，组件迁移时整模块切换过去。//!
@@ -35,6 +36,7 @@
 //! | [`separator`] | 分割线（横 / 纵） | `crate::separator` |
 //! | [`empty_state`] | 空态说明（弱化文字） | `crate::empty_state` |
 //! | [`alert`] | 对话框内容面板（4 类变体 / 输入校验 / 按钮行） | `crate::alert` |
+//! | [`dialog`] | 模态对话框容器（遮罩 / 居中面板 / 焦点陷阱与恢复 / Esc 与点外部策略 / E13 组淡入淡出 + E10 完成回调 / a11y Dialog·AlertDialog；标题 / 关闭按钮 / 按钮行 / 确认取消回调；alert 内容协作） | `crate::dialog` + `crate::layer` 的 dialog·alert 槽 |
 //! | [`tab_bar`] | 标签栏（选中指示动画 / 方向键 / 关闭按钮 / a11y） | `crate::tab_bar` |
 //! | [`markdown`] | comrak 解析 → 引擎富文本 run / InlineBox 视图 | `crate::markdown` |
 //! | [`input`] | 应用层文本编辑状态机（caret / 选区 / IME / undo-redo / 拖选 / 双击选词） | `crate::input` |
@@ -82,6 +84,7 @@ pub mod assets;
 pub mod badge;
 pub mod brand;
 pub mod button;
+pub mod dialog;
 pub mod empty_state;
 pub mod format;
 pub mod icon;
