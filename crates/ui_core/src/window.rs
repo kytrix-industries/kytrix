@@ -731,6 +731,15 @@ pub struct Window {
     focus: FocusScope,
     /// 指针状态（hover / 光标 / 按下 / 拖拽 / 捕获）。
     pointer: PointerState,
+    /// **最新指针位置**（逻辑客户区坐标；E17）。
+    ///
+    /// `None` = 本窗口从未收到过带位置的指针事件（建窗后指针还没进来过）。之后一律
+    /// **保留最后值**：离开窗口 / 失焦 / 缩放 / DPI 变化都不清除、不重算（语义见
+    /// [`Window::pointer_position`]）。
+    ///
+    /// 唯一写入点是 [`Window::note_pointer_position`]（`App::dispatch_input` 的指针事件
+    /// 分支）：纯记账，不标脏、不请求帧（I3），也不参与命中 / 悬停 / 光标解析。
+    pointer_position: Option<Point>,
     /// 下一帧必须重绘的逻辑矩形（滚动视口；`paint_frame` 消费后清空）。
     pending_damage: Option<Rect>,
     /// a11y 状态机（P11：变更集合 / 全树旗标 / 捕获开关）。
@@ -851,6 +860,7 @@ impl Window {
             inline_box_image_diagnostics: Vec::new(),
             focus: FocusScope::default(),
             pointer: PointerState::new(),
+            pointer_position: None,
             pending_damage: None,
             a11y: crate::a11y::adapter::A11yBridge::new(),
             ime_cursor: None,
@@ -999,6 +1009,52 @@ impl Window {
             return Err(EngineError::StaleNode { node });
         }
         Ok(self.tree.set_image_resource(node, resource))
+    }
+
+    // ── E17：最新指针位置 ──
+
+    /// **最新指针位置**（逻辑客户区坐标；`None` = 本窗口还没收到过指针事件）。
+    ///
+    /// # 坐标
+    /// - **逻辑像素**（与 [`Self::scale`] 同域）：平台层已按**事件发生时的 DPI** 换算成逻辑
+    ///   坐标再投递（Windows `WM_*` 的物理客户区坐标 ÷ 该消息的 scale；macOS 的 view 点是
+    ///   point；Wayland 的 surface 坐标本来就是逻辑坐标），应用**不需要**再乘 / 除 scale（I11）。
+    /// - 原点 = 客户区左上角，x 向右、y 向下。
+    /// - **不裁剪**到客户区：指针捕获（拖拽 / [`crate::app::App::capture_pointer`]）期间平台
+    ///   继续投递窗口外的移动，坐标可以是负数或超过 [`Self::size`]。
+    ///
+    /// # 语义
+    /// - `None`：本窗口**从未**收到过带位置的指针事件（刚建窗、指针还没进来过）。
+    /// - **保留最后值**：指针离开窗口（`PointerLeave` **自带**离开点，三端都提供）、窗口失焦、
+    ///   窗口缩放 / DPI 变化都**不**清除、不重算。离开之后读到的是最后一个已知位置 —— 平台给
+    ///   的离开点（Win32 `WM_MOUSELEAVE` 没有坐标，用最近一次 `WM_MOUSEMOVE` 的客户区坐标；
+    ///   AppKit `mouseExited:` / Wayland `leave` 用事件携带的离开点）。因此它**可能落在客户区
+    ///   之外**（macOS / Wayland 的离开点常在窗口边界外）。
+    /// - 「指针是否在窗口内」**不是**本 API 的回答：[`crate::app::App::hovered`]（命中语义，
+    ///   受模态作用域影响）与 `InputEvent::PointerEnter` / `PointerLeave` 观测事件才是权威面。
+    /// - 多指针 / 触摸：引擎的输入模型只有**主指针**（鼠标 / 触控板光标）。触摸与手势
+    ///   （`Magnify` / `Rotate` / `SmartMagnify`）**不**更新本值 —— 它们不是指针移动。
+    /// - 更新来源：`PointerEnter` / `PointerMove` / `PointerDown` / `PointerUp` /
+    ///   `PointerLeave` 与 `Scroll`（都带窗口逻辑坐标；第一次事件可能直接是按下，所以按下 /
+    ///   抬起也刷新）。
+    ///
+    /// # 帧语义（I3）
+    /// 纯读取，**不请求帧**；输入事件更新位置本身也不置脏、不请求帧（悬停 / 光标 / 拖拽的
+    /// 失效仍走各自既有路径）。
+    ///
+    /// 平台生产者（三端都已接线，E17 只在分发入口记账）：
+    /// Windows `WM_MOUSEMOVE`（捕获期间含窗口外坐标）/ `WM_MOUSELEAVE`；macOS `mouseMoved:` /
+    /// `mouseDragged:` / `mouseExited:`；Linux `wl_pointer.motion` / `leave`。
+    #[must_use]
+    pub fn pointer_position(&self) -> Option<Point> {
+        self.pointer_position
+    }
+
+    /// 记录最新指针位置（**唯一**写入点：`app::input::dispatch_input` 的指针事件分支）。
+    ///
+    /// 纯记账：不标脏、不请求帧（I3），也不参与命中 / 悬停 / 光标解析。
+    pub(crate) fn note_pointer_position(&mut self, position: Point) {
+        self.pointer_position = Some(position);
     }
 
     /// 指针状态（crate 私有：`App::dispatch_input` 与平台泵是唯一读者）。

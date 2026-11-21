@@ -1646,6 +1646,20 @@ impl App {
         focus::hovered(self, window)
     }
 
+    /// 窗口的**最新指针位置**（逻辑客户区坐标；E17）—— [`Window::pointer_position`] 的
+    /// 便捷读点（`None` = 窗口不存在，或该窗口从未收到过指针事件）。
+    ///
+    /// **保留最后值**语义：指针离开窗口 / 窗口失焦后**不**清除、不重算（离开点是平台事件自带
+    /// 的最后位置）；坐标**不裁剪**到客户区（捕获期间可以是窗口外坐标）。完整语义（坐标域 /
+    /// 触摸与手势 / I3 帧语义 / 三端生产者）见 [`Window::pointer_position`]。
+    ///
+    /// 纯读取：**不请求帧**，不影响悬停 / 焦点 / 光标。需要「指针在不在窗口内」请读
+    /// [`Self::hovered`] 或 `InputEvent::PointerEnter` / `PointerLeave`。
+    #[must_use]
+    pub fn pointer_position(&self, window: WindowId) -> Option<Point> {
+        self.window(window).and_then(Window::pointer_position)
+    }
+
     /// 取得**指针捕获**（R02-8）：请求平台继续把指针事件投递给本窗口，直到
     /// [`App::release_pointer`] / 指针抬起 / 会话取消 / **捕获节点被卸载**。
     ///
@@ -3045,3 +3059,10 @@ mod scoped_tests;
 /// 缺失的时序面。
 #[cfg(all(test, feature = "test-support"))]
 mod e10_tests;
+
+/// E17：公开指针位置（`Window::pointer_position` / `App::pointer_position`）的引擎级用例。
+///
+/// 断言面走 `test_support`（`TestApp` 的指针注入 + 帧记录），与平台泵同一条
+/// `App::dispatch_input` 路径。
+#[cfg(all(test, feature = "test-support"))]
+mod e17_tests;
