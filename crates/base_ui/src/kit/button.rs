@@ -27,6 +27,7 @@
 use std::{cell::RefCell, rc::Rc};
 
 use smol_str::SmolStr;
+use taffy::style::{Dimension, JustifyContent};
 use ui_core::{
     app::App,
     error::EngineError,
@@ -369,6 +370,28 @@ impl UnifiedSizable for Button {
         self.size = size;
         self
     }
+}
+
+/// 按钮铺满父行并居中内容（旧 alert / dialog 按钮行的 `flex_1 + justify_center`）。
+///
+/// 裁决（P2-4a2）：按钮行的 flex 布局归包裹层（`kit::alert` / `kit::dialog`），[`Button`]
+/// 本身不新增 flex 拉伸语义。实现只有这一份，两个容器共用（P2-4a3 去重；旧 `kit::alert` 与
+/// `kit::dialog` 各有一份同名同实现的私有副本）。
+pub(crate) fn stretch_button(
+    app: &mut App,
+    window: WindowId,
+    node: NodeId,
+) -> Result<(), EngineError> {
+    let tree = app
+        .window_mut(window)
+        .ok_or(EngineError::UnknownWindow { window })?
+        .tree_mut();
+    let mut style = tree.get(node)?.style().clone();
+    style.inner.flex_grow = 1.0;
+    style.inner.flex_shrink = 1.0;
+    style.inner.flex_basis = Dimension::length(0.0);
+    style.inner.justify_content = JustifyContent::CENTER;
+    tree.set_style(node, style)
 }
 
 /// `danger` 的四状态角色配方（主题没有 danger 交互配方，这里用状态角色拼）。

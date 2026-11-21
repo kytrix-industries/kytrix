@@ -31,9 +31,11 @@
 //! - **内容所有权**：旧 `Entity<AnyView>` 由 layer 强引用、退场结束才释放；新实现是节点树 +
 //!   `SignalScope`，卸载节点不等于释放应用层信号，调用方在对话框生命周期结束时调
 //!   [`Dialog::release`]（与 `overlay` / `alert` / `button` 的释放契约一致）。
-//! - **alert 内容自带 `Dialog` 角色**（P2-4a 交付），与 dialog 包装层的 `Dialog` / `AlertDialog`
-//!   重复；AT 会读两层对话框。**归属：P2-4a3（alert 批次）修内容根角色**，本批不改 `kit::alert`，
-//!   只登记（见 `spec-deltas/kit-dialog.md` §8）。
+//! - **alert 内容根不再是对话框**（P2-4a3 修 P2-4d1 审查 D6）：`kit::alert` 的内容根声明
+//!   `GenericContainer`，对话框角色只由本模块的包装节点声明（E12-R1），AT 不会读两层对话框。
+//! - **alert 内容按钮的关闭中守卫**（P2-4a3 修 D2 的 alert 同类）：alert 的 OK / Cancel 不是本
+//!   模块的 handler；`build_alert` 把容器的「关闭中」状态注入 `AlertBuilder::closing_guard`，
+//!   淡出窗口内的第二次点击不再跑 alert 的用户动作（旧 dialog 用 `capture_any_mouse_down` 吞按下）。
 //! - **视觉**：面板阴影用旧值 `(0, 25, 50, -12)`（[`OverlaySurface::dialog`]，E13
 //!   `ShadowSpec.spread`）；Dark 外观的 1 px `line.divider` 边缘、旧实现的 8 px 上滑入场与长标题
 //!   右侧留白未复刻（像素基线批次）。
@@ -84,7 +86,7 @@ use std::{
 };
 
 use smol_str::{SmolStr, format_smolstr};
-use taffy::style::{Dimension, JustifyContent, LengthPercentageAuto, Position};
+use taffy::style::{LengthPercentageAuto, Position};
 use ui_core::{
     app::App,
     error::EngineError,
@@ -104,7 +106,7 @@ use ui_core::{
 use crate::{
     kit::{
         alert::{Alert, AlertBuilder},
-        button::Button,
+        button::{Button, stretch_button},
         icon::IconKind,
         layer::Band,
         overlay::{
@@ -319,9 +321,9 @@ impl DialogBuilder {
     /// alert 形状：内容面板由 `build` 造 [`AlertBuilder`]，dialog 只做容器（`AlertDialog` 角色、
     /// `Band::Alert` 槽、无标题行 —— alert 自己画标题、**无关闭按钮**）。
     ///
-    /// alert 形状没有关闭按钮：旧 alert 只有 OK / Cancel；X 无法（在不改 `kit::alert` 的前提下）
-    /// 路由到 alert 的 `cancel_action`，保留它就会绕过用户语义。Esc 仍由引擎关闭（`Dismissed`，
-    /// 不跑 `cancel_action`，见模块文档）。
+    /// alert 形状没有关闭按钮：旧 alert 只有 OK / Cancel；X 与 Esc 同义（`Dismissed`）却无法
+    /// 等价成 alert 的 `cancel_action`（旧用户关闭路径都会跑对应动作），保留它就会绕过用户语义。
+    /// Esc 仍由引擎关闭（`Dismissed`，不跑 `cancel_action`，见模块文档）。
     ///
     /// 回调每次打开都会被调用：alert 的 OK / Cancel 动作里可以拿传入的 [`Dialog`] 句柄关闭对话框
     ///（`AlertBuilder` 的校验失败不会调用 OK 动作，因此「校验通过才关」自然成立）。
@@ -843,6 +845,11 @@ impl Dialog {
             .body
             .ok_or(DialogError::Engine(EngineError::UnknownWindow { window }))?;
         let builder = source(self, &self.inner.theme);
+        // alert 的内容按钮不是 dialog 的 handler：把容器的「关闭中」状态注入 alert，淡出窗口内的
+        // 第二次点击不再跑 alert 的 OK / Cancel 动作（P2-4d1 审查 D2；P2-4a3 修 alert 内容）。
+        let weak = Rc::downgrade(&self.inner);
+        let builder =
+            builder.closing_guard(move || weak.upgrade().is_some_and(|inner| inner.closing.get()));
         let alert = builder.build(app, window, body, &self.inner.theme)?;
         *self.inner.alert.borrow_mut() = Some(alert);
         Ok(())
@@ -967,17 +974,6 @@ fn tree_mut(app: &mut App, window: WindowId) -> Result<&mut NodeTree, EngineErro
         .ok_or(EngineError::UnknownWindow { window })
 }
 
-/// 按钮等分铺满按钮行并居中文字（旧 `flex_1 + justify_center`；`Button` 不加 flex 语义）。
-fn stretch_button(app: &mut App, window: WindowId, node: NodeId) -> Result<(), EngineError> {
-    let tree = tree_mut(app, window)?;
-    let mut style = tree.get(node)?.style().clone();
-    style.inner.flex_grow = 1.0;
-    style.inner.flex_shrink = 1.0;
-    style.inner.flex_basis = Dimension::length(0.0);
-    style.inner.justify_content = JustifyContent::CENTER;
-    tree.set_style(node, style)
-}
-
 /// 关闭按钮贴内容列右上角（标题居中时它不参与标题行的宽度分配）。
 fn position_close_button(app: &mut App, window: WindowId, node: NodeId) -> Result<(), EngineError> {
     let tree = tree_mut(app, window)?;
@@ -1017,7 +1013,7 @@ mod tests {
             alert::AlertBuilder,
             layer::{Band, Layer},
             overlay::{Anchor, AnimationRouter, DismissPolicy, Overlay, OverlayOptions, Placement},
-            test_support::full_a11y,
+            test_support::{a11y_of, full_a11y},
         },
         style_builder::{PaintBuilder, StyleBuilder},
         theme::{appearance::Appearance, handle::ThemeHandle},
@@ -2404,5 +2400,113 @@ mod tests {
             .expect("窗口")
             .expect("帧");
         assert_eq!(outcome, FrameOutcome::Idle, "稳态不请求帧");
+    }
+
+    // ── P2-4a3 alert 收尾（D6 角色唯一 / D2 同类双击守卫）────────────────────────────
+
+    /// D6：alert 形状全树只有一个对话框角色（包装层 `AlertDialog`）；内容根是通用容器。
+    #[test]
+    fn an_alert_shape_declares_exactly_one_dialog_role() {
+        let mut harness = Harness::new();
+        harness.app.enable_a11y_capture();
+        let dialog = harness.dialog(
+            DialogBuilder::alert("Delete file", |_dialog, _theme| {
+                AlertBuilder::new().ok_cancel("Delete file", "This cannot be undone.")
+            })
+            .fade(false),
+            "alert-role-unique",
+        );
+        let wrapper = dialog.overlay_node().expect("包装节点");
+        let content = dialog
+            .with_alert(|alert| alert.root_node())
+            .expect("alert 内容根");
+        let snapshot = full_a11y(&mut harness.app);
+        let dialog_roles = snapshot
+            .nodes()
+            .iter()
+            .filter(|node| matches!(node.role, A11yRole::Dialog | A11yRole::AlertDialog))
+            .count();
+        assert_eq!(
+            dialog_roles, 1,
+            "alert 形状全树只能有一个对话框角色（P2-4d1 审查 D6）"
+        );
+        assert_eq!(a11y_of(&snapshot, wrapper).role, A11yRole::AlertDialog);
+        let record = a11y_of(&snapshot, content);
+        assert_eq!(
+            record.role,
+            A11yRole::GenericContainer,
+            "alert 内容根不得重复声明对话框角色"
+        );
+        assert_eq!(
+            record.label_text(),
+            None,
+            "可访问名归包装层，内容根不重复标题"
+        );
+    }
+
+    /// D2（alert 内容同类）：退场淡出窗口内再点 alert 的 OK / Cancel 不得再跑用户动作。
+    #[test]
+    fn a_second_click_on_alert_content_during_the_fade_runs_no_action() {
+        let mut harness = Harness::new();
+        let ok_runs = Rc::new(Cell::new(0u32));
+        let cancel_runs = Rc::new(Cell::new(0u32));
+        let reason = Rc::new(Cell::new(None));
+        let dialog = harness.dialog(
+            DialogBuilder::alert("Double click", {
+                let ok_runs = ok_runs.clone();
+                let cancel_runs = cancel_runs.clone();
+                move |dialog, _theme| {
+                    let dialog = dialog.clone();
+                    let ok = ok_runs.clone();
+                    let cancel = cancel_runs.clone();
+                    AlertBuilder::new()
+                        .ok_cancel("Double click", "Delete?")
+                        .ok_action(move |_, app| {
+                            ok.set(ok.get() + 1);
+                            dialog.close(app);
+                        })
+                        .cancel_action(move |_| cancel.set(cancel.get() + 1))
+                }
+            })
+            .on_close(record_close(reason.clone())),
+            "alert-double-click",
+        );
+        harness.app.advance(Duration::from_millis(200));
+        let _ = harness.app.drain().expect("淡入帧");
+        let _ = dialog.sync(harness.app.app_mut()).expect("同步");
+        let ok = dialog
+            .with_alert(|alert| alert.ok_button().node())
+            .flatten()
+            .expect("alert OK 节点");
+        let cancel = dialog
+            .with_alert(|alert| alert.cancel_button().and_then(|button| button.node()))
+            .flatten()
+            .expect("alert Cancel 节点");
+        harness.click_node(ok);
+        assert_eq!(ok_runs.get(), 1, "第一次点击跑 alert 的 OK 动作");
+        assert!(dialog.is_closing(), "OK 动作里的 close 开始淡出");
+        harness.click_node(ok);
+        assert_eq!(
+            ok_runs.get(),
+            1,
+            "淡出中的第二次点击不得再跑 alert 的 OK 动作（D2）"
+        );
+        harness.click_node(cancel);
+        assert_eq!(
+            cancel_runs.get(),
+            0,
+            "淡出中 alert 的 Cancel 动作同样不得跑"
+        );
+        for _ in 0..24 {
+            harness.app.advance(Duration::from_millis(16));
+            let _ = dialog.sync(harness.app.app_mut()).expect("同步");
+            let _ = harness.app.drain().expect("帧");
+            if !dialog.is_open(harness.app.app()) {
+                break;
+            }
+        }
+        assert!(!dialog.is_open(harness.app.app()));
+        assert_eq!(reason.get(), Some(DialogClose::Dismissed));
+        assert_eq!(ok_runs.get(), 1, "整段淡出只跑一次 OK 动作");
     }
 }
