@@ -40,8 +40,10 @@ pub struct JoinedEdges {
 /// - 尾元素保留右侧圆角；非尾元素右侧圆角 = 0（与右邻共享边）；
 /// - 每个元素保留自己的右边框 ⇒ 相邻两元素之间恰好一条边（左邻的右边框）。
 ///
-/// `count == 0` 是空拼接（返回全 0，调用方不应渲染任何子元素）；`index >= count` 按「单元素」
-/// 处理（防御：release 下不 panic，debug 下断言抓调用错误）。
+/// `count == 0` 是空拼接（返回全 0，调用方不应渲染任何子元素）。`index >= count` **不是合法
+/// 输入**：debug 构建由 `debug_assert!` 直接抓调用错误；release 构建不 panic，但结果是「按
+/// 尾元素算」（`first = false` / `last = true`，即右圆角保留、左圆角归零）—— 这只是「不 panic
+/// 的产物」，**不是**契约，不要依赖它（审查 F9 指出的文档与 release 行为不符已按此更正）。
 #[must_use]
 pub fn joined_edges(radius: f32, border_width: f32, index: usize, count: usize) -> JoinedEdges {
     debug_assert!(

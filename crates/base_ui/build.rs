@@ -11,6 +11,19 @@
 //! - `OUT_DIR/icons/<stem>-48.png` / `<stem>-96.png`：两档边长，供 1× / 2× 窗口选档；
 //! - `OUT_DIR/icons/built.rs`：全部已生成图标的 stem（字母序），测试用它证明「资产 ⇄ 枚举」无漂移。
 //!
+//! # 像素契约：white matte（透明像素也是白）
+//!
+//! PNG 必须是直通 alpha，且**所有像素（包括 `alpha == 0` 的像素）的 RGB 都写白色**。这不是
+//! 装饰性细节：引擎的图片管线是「straight-alpha 解码 → **先缩放** → 最后在**线性空间预乘**」
+//! （`ui_core/src/resources/image.rs` 的顺序 5），而缩放用的 `image` 按通道独立插值、不做预乘
+//! （其 `resize` 文档明确「assumes alpha pre-multiplication」）。若透明像素写 RGB=0，缩放时
+//! 部分覆盖的边界像素会被拉向黑色 —— 实测 `check-circle-48 → 16` 最坏暗边 **96/255**：
+//! 图标在所有常规尺寸下都是 3× 下采样，于是每个图标都会带一圈暗边。把透明像素的 RGB 也写成
+//! 白色（white matte）后，RGB 通道是常量 255 ⇒ 插值结果恒 255，缩放不引入暗色，预乘后正是
+//! 「白色字形 × 覆盖 alpha」应有的存储值。`kit::icon` 的两条测试锁定它：
+//! `every_icon_raster_is_a_white_glyph_png_of_the_expected_tier`（产物全白）与
+//! `downscaled_icon_edges_have_no_dark_fringe`（复刻引擎管线，断言下采样后无暗边）。
+//!
 //! 确定性：文件名与内容都只由输入 SVG 决定 —— 固定缩放算法（resvg 的解析 AA）、固定档位、无时间戳、
 //! 无随机、无并发写；目录条目按文件名排序后处理，PNG 编码参数固定（`image` 的默认压缩/自适应过滤）。
 //!
@@ -39,6 +52,12 @@ const SOURCE_FILL: &str = "fill=\"#000000\"";
 
 /// 替换成白色字形后的填色。
 const WHITE_FILL: &str = "fill=\"#FFFFFF\"";
+
+/// 完全透明像素的 RGB（white matte，见模块文档的像素契约）。
+///
+/// 必须与字形的白色一致：透明区的 RGB 不是一个「随便的占位值」，它参与引擎在 straight-alpha
+/// 空间的缩放插值 —— 写 0 就是黑边，写 255 才是「透明处无颜色偏置」。
+const MATTE_RGB: u8 = 0xFF;
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -174,12 +193,14 @@ fn rasterize(stem: &str, tree: &usvg::Tree, side: u32) -> Vec<u8> {
     resvg::render(tree, transform, &mut pixmap.as_mut());
 
     // tiny-skia 的像素缓冲是**预乘** RGBA；PNG 要求**直通** alpha。字形是纯白，所以
-    // 「预乘分量 = 覆盖 alpha」，反预乘后 RGB 恒为 255（alpha = 0 的像素 RGB 无意义，写 0）。
+    // 「预乘分量 = 覆盖 alpha」，反预乘后可见像素的 RGB 恒为 255。**alpha == 0 的像素同样写
+    // 白色**（white matte）：引擎在 straight-alpha 空间先缩放、后预乘，透明像素的 RGB 会被
+    // 插值进边缘像素；写 0 会让每个图标下采样后带一圈暗边（最坏 96/255，见模块文档）。
     let mut rgba = Vec::with_capacity((side * side * 4) as usize);
     for pixel in pixmap.pixels() {
         let alpha = pixel.alpha();
         let (red, green, blue) = if alpha == 0 {
-            (0, 0, 0)
+            (MATTE_RGB, MATTE_RGB, MATTE_RGB)
         } else {
             // 反预乘（四舍五入），对白色字形恒等于 255；写通用式避免「假设恒定」。
             let unmultiply = |component: u8| -> u8 {

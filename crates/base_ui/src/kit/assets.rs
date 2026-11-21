@@ -15,6 +15,15 @@
 //!    `App::take_resource_results`，由 [`AssetImages::poll`] 并入状态。UI 线程只做轻量工作，
 //!    解码在引擎的 blocking 池里（设计 §8.5 / D-11：解码不在 UI 线程）。
 //!
+//! # 交付缓冲是全局的：单消费者契约
+//!
+//! `App::take_resource_results` 是**整个 App** 一个的交付缓冲（引擎每帧 `poll_resources`
+//! 往里塞，应用取一次就清空）。因此 [`AssetImages::poll`] 是「每帧只由**一个所有者**调用一次」
+//! 的入口：谁调用它，谁就取走了本帧**所有**缓存的交付。一个应用里有多个 [`AssetImages`]
+//! （例如同一路径的两种尺寸）时，必须用 [`AssetImages::poll_all`] 一次取走再按在途句柄分发，
+//! **不要**让两个缓存各自 `poll` —— 先 poll 的那个会把后者的交付吞掉，后者的条目永远停在
+//! [`AssetImageState::Pending`]（审查 F3）。
+//!
 //! # 范围
 //!
 //! `assets/sounds/news_notification.wav` 不在本批：设计 §9.5 把音效划在引擎范围外，且 `base_ui`
@@ -164,6 +173,9 @@ pub struct AssetLoaded {
 }
 
 /// 资产图的异步解码缓存（应用层持有）。
+///
+/// **单消费者契约**：连同 [`AssetImages::poll`] 的进程内唯一消费点（见模块文档）。需要多个
+/// 缓存时（例如同一路径的两种尺寸）统一走 [`AssetImages::poll_all`]。
 #[derive(Debug, Default)]
 pub struct AssetImages {
     /// 路径 → 状态（`Pending` 在首次 `request` 时写入）。
@@ -183,7 +195,8 @@ impl AssetImages {
     ///
     /// `display` 是**物理目标尺寸**（调用方按 `逻辑尺寸 × 窗口 scale` 算好）：引擎
     /// `insert_async_at_size` 按它取变体（不放大、等比 fit，D-10）。同一路径只解码**第一次**
-    /// 请求的尺寸 —— 不同尺寸的同名图需要两个 `AssetImages` 实例（本批没有这种消费者）。
+    /// 请求的尺寸（变体随首次请求固定）；要同一路径的多种尺寸，就给每个尺寸一个
+    /// [`AssetImages`]，并用 [`AssetImages::poll_all`] 统一取结果（不能各自 `poll`，见模块文档）。
     ///
     /// # Errors
     /// [`AssetError::UnknownAsset`]：路径没登记在 [`ASSETS`] 里。
@@ -208,26 +221,53 @@ impl AssetImages {
         Ok(AssetImageState::Pending)
     }
 
-    /// 每帧一次：取走引擎已交付的解码结果并并入缓存（只返回**本次**交付的条目）。
+    /// 每帧一次：取走引擎已交付的解码结果并并入**本**缓存（只返回本缓存的交付）。
     ///
     /// 交付通道：引擎 `App::poll_resources`（平台泵 / `App::frame` 每轮）把完成项放进
     /// `App::take_resource_results`；这里消费那个缓冲。未交付的项保持 `Pending`。
+    ///
+    /// **单消费者契约**：取走的是**整个 App** 的交付缓冲，每帧只能由一个所有者调用一次；
+    /// 有多个缓存时用 [`AssetImages::poll_all`]（一次取走、按在途句柄分发），否则先 poll 的
+    /// 缓存会吞掉其余缓存的交付（见模块文档）。
     pub fn poll(&mut self, app: &mut App) -> Vec<AssetLoaded> {
+        Self::poll_all(app, &mut [self]).pop().unwrap_or_default()
+    }
+
+    /// 多缓存分发（**单点消费**）：取走引擎的全部交付，按在途句柄并入 `caches` 里对应的缓存。
+    ///
+    /// 返回值与 `caches` 同序：`delivered[i]` 是本次并入 `caches[i]` 的条目（可能为空）。
+    /// 不属于任何缓存的结果被丢弃 —— 本函数是交付缓冲的唯一消费者，没注册过的句柄没有归属，
+    /// 无法分发（需要自己消费的应用应直接 `App::take_resource_results`，不要与本模块混用）。
+    ///
+    /// 这是「一个应用多个 [`AssetImages`]」的正确用法：同一帧只取一次缓冲，各缓存都不会丢
+    /// 交付（审查 F3 的修复；[`AssetImages::poll`] 只是单缓存快捷方式，两者共用同一条路径）。
+    pub fn poll_all(app: &mut App, caches: &mut [&mut AssetImages]) -> Vec<Vec<AssetLoaded>> {
         let results = app.take_resource_results();
-        let mut loaded = Vec::with_capacity(results.len());
+        let mut delivered = vec![Vec::new(); caches.len()];
         for (pending, state) in results {
-            let Some(path) = self.pending.remove(&pending) else {
+            let Some(index) = caches
+                .iter()
+                .position(|cache| cache.pending.contains_key(&pending))
+            else {
                 continue;
             };
-            let state = match state {
-                DecodeState::Pending => AssetImageState::Pending,
-                DecodeState::Ready(image) => AssetImageState::Ready(image),
-                DecodeState::Failed(cause) => AssetImageState::Failed(cause),
-            };
-            self.entries.insert(path.clone(), state.clone());
-            loaded.push(AssetLoaded { path, state });
+            if let Some(loaded) = caches[index].accept(pending, state) {
+                delivered[index].push(loaded);
+            }
         }
-        loaded
+        delivered
+    }
+
+    /// 把一条交付并入本缓存（`poll_all` 的分发单元）；不属于本缓存的句柄返回 `None`。
+    fn accept(&mut self, pending: PendingResource, state: DecodeState) -> Option<AssetLoaded> {
+        let path = self.pending.remove(&pending)?;
+        let state = match state {
+            DecodeState::Pending => AssetImageState::Pending,
+            DecodeState::Ready(image) => AssetImageState::Ready(image),
+            DecodeState::Failed(cause) => AssetImageState::Failed(cause),
+        };
+        self.entries.insert(path.clone(), state.clone());
+        Some(AssetLoaded { path, state })
     }
 
     /// 当前状态（`None` = 从未请求）。
@@ -272,7 +312,9 @@ impl std::error::Error for AssetError {}
 mod tests {
     use ui_core::{math::Size, resources::ResourceImage};
 
-    use super::{ASSETS, AssetError, AssetImageState, AssetImages, AssetKind, bytes, find, list};
+    use super::{
+        ASSETS, AssetError, AssetImageState, AssetImages, AssetKind, AssetLoaded, bytes, find, list,
+    };
     use crate::kit::test_support::DecodeApp;
 
     /// 注册表：数量、唯一性、类别分布、路径可反查、字节是 PNG。
@@ -378,6 +420,61 @@ mod tests {
                 .request(harness.app_mut(), path, Size::new(24.0, 24.0))
                 .expect("已登记"),
             AssetImageState::Ready(image)
+        );
+    }
+
+    /// **F3**：同一帧里两个缓存各自请求一张图时，交付缓冲只取一次、按在途句柄分发 —— 谁都
+    /// 不会吞掉对方的结果（各自 `poll` 会让后 poll 的缓存永远停在 `Pending`）。
+    ///
+    /// 变异「把分发改成全部塞给第一个缓存」⇒ 第二个缓存停在 `Pending`，本用例在
+    /// `poll_until` 的上限处失败。
+    #[test]
+    fn two_caches_share_the_delivery_buffer_without_swallowing() {
+        let mut harness = DecodeApp::new();
+        let mut first = AssetImages::new();
+        let mut second = AssetImages::new();
+        let first_path = "brands/Hyperliquid/hyperliquid.png";
+        let second_path = "brands/Binance/binance.png";
+        first
+            .request(harness.app_mut(), first_path, Size::new(24.0, 24.0))
+            .expect("已登记的资产");
+        second
+            .request(harness.app_mut(), second_path, Size::new(16.0, 16.0))
+            .expect("已登记的资产");
+
+        let mut first_loaded: Vec<AssetLoaded> = Vec::new();
+        let mut second_loaded: Vec<AssetLoaded> = Vec::new();
+        harness
+            .poll_until(600, |app| {
+                let mut delivered = AssetImages::poll_all(app, &mut [&mut first, &mut second]);
+                first_loaded.append(&mut delivered[0]);
+                second_loaded.append(&mut delivered[1]);
+                let ready = matches!(first.state(first_path), Some(AssetImageState::Ready(_)))
+                    && matches!(second.state(second_path), Some(AssetImageState::Ready(_)));
+                ready.then_some(())
+            })
+            .expect("两张图都必须在 ≈3 s 内交付（任何一方被吞都会超时）");
+
+        assert_eq!(
+            first_loaded.len(),
+            1,
+            "第一个缓存只应交付自己的图：{first_loaded:?}"
+        );
+        assert_eq!(first_loaded[0].path, first_path);
+        assert!(matches!(first_loaded[0].state, AssetImageState::Ready(_)));
+        assert_eq!(
+            second_loaded.len(),
+            1,
+            "第二个缓存只应交付自己的图：{second_loaded:?}"
+        );
+        assert_eq!(second_loaded[0].path, second_path);
+        assert!(matches!(second_loaded[0].state, AssetImageState::Ready(_)));
+
+        // 交付缓冲已被取空（每项只交付一次）：再 poll 不会给出新条目。
+        let empty = AssetImages::poll_all(harness.app_mut(), &mut [&mut first, &mut second]);
+        assert!(
+            empty.iter().all(Vec::is_empty),
+            "交付缓冲必须被一次性取空：{empty:?}"
         );
     }
 

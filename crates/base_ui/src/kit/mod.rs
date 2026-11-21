@@ -17,7 +17,7 @@
 //! |---|---|---|
 //! | [`icon`] | 55 个 Phosphor 图标的枚举 / 名称 / 两档构建期 PNG / 图片节点挂载（颜色调制） | `crate::icon` |
 //! | [`assets`] | 品牌图与 Widget 预览图的注册表、路径查找、引擎异步解码接线 | `crate::assets` |
-//! | [`brand`] | 7 个品牌 logo（路径 / 字节 / 固有尺寸 / 挂载） | `crate::brand` |
+//! | [`brand`] | 7 个品牌 logo（路径 / 字节 / 固有尺寸 / Contain 挂载） | `crate::brand` |
 //! | [`size`] | 控件尺寸阶梯（读主题 `ComponentTokens`，不再重复维护数值） | `crate::size` |
 //! | [`format`] | 数字分位格式化（纯文本） | `crate::format` |
 //! | [`motion`] | 深度条缓动的响应曲线（纯数学，不建帧循环） | `crate::motion` |

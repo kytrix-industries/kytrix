@@ -26,13 +26,17 @@
 //!
 //! 结果（测试锁定）：节点布局盒 = 图片逻辑尺寸，`Primitive::Image.bounds` = 同一盒。
 //!
-//! **已登记的引擎后续项**（spec-delta §6）：给 `NodeKind` 加图片，或至少让空文本的
-//! `measure` / rasterize 先看 `inline_boxes` 是否为空；届时本函数删掉空格与固定尺寸两处绕行。
+//! **已登记的引擎后续项（E7，待 Lead 裁决）**：给 `NodeKind` 加图片，或至少让空文本的
+//! `measure` / rasterize 先看 `inline_boxes` 是否为空；届时本模块删掉空格与固定尺寸两处绕行
+//! （公开 API 不变）。**E7 决定后本文件整体替换**，不要在这条绕行上继续加能力（object-fit /
+//! 旋转 / DPI 自动换档都缺引擎原语，见 spec-delta §11）。
 //!
 //! # 局限
 //!
 //! 图片节点是**文本布局叶子**：不能再挂子节点，也不能用 `Style.inner` 表达 flex 尺寸（尺寸就是
 //! 行内盒尺寸）。旋转 / 缩放等节点级变换引擎没有支持，旧 `Icon` 的 `Transformation` 因此不迁移。
+//! 图片本身没有 object-fit：需要等比内嵌 + 居中的调用方（`kit::brand` 的 Contain 语义）自己
+//! 用 flex 容器摆位，见 [`crate::kit::brand`]。
 
 use smol_str::SmolStr;
 use taffy::style::Dimension;

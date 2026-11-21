@@ -5,7 +5,8 @@
 //! ```text
 //! assets/icons/phosphoricons/<stem>.svg   （构建期，crates/base_ui/build.rs）
 //!   ├─ 根元素 fill="#000000" → "#FFFFFF"（白色字形）
-//!   └─ resvg 光栅化 ──▶ OUT_DIR/icons/<stem>-48.png / <stem>-96.png（直通 alpha RGBA8）
+//!   └─ resvg 光栅化 ──▶ OUT_DIR/icons/<stem>-48.png / <stem>-96.png（直通 alpha RGBA8，
+//!                       white matte：含 alpha=0 的像素也写 RGB=255）
 //!
 //! 运行期：IconKind ──name()──▶ <stem> ──raster(tier)──▶ &'static [u8]
 //!          ── Window::scale() 选档 ──▶ ResourceCache::insert_owned_at_size(逻辑尺寸 × scale)
@@ -37,8 +38,11 @@
 //! # 错误语义
 //!
 //! `IconKind` 是编译期完备的枚举，**不存在**未知变体；「未知 kind」只出现在按名字反查
-//! （[`IconKind::from_name`]：旧 `IconKind::path()` 的字符串语义，供 markdown / 配置数据用），
-//! 失败是强类型 [`IconError::UnknownKind`]。挂载 / 解码失败保留引擎的强类型 `EngineError`。
+//! （[`IconKind::from_name`]：接受 [`IconKind::name()`] 的文件 stem，供 markdown / 配置数据用），
+//! 失败是强类型 [`IconError::UnknownKind`]。注意它**不**接受旧 `IconKind::path()` 的全路径
+//! （`icons/phosphoricons/x.svg`）：路径是旧 GPUI 资产系统的寻址方式，新实现按 stem 取构建期
+//! PNG；从旧配置迁字符串时需要在调用点取文件名（见 spec-delta §6 第 2 条）。挂载 / 解码失败
+//! 保留引擎的强类型 `EngineError`。
 
 use std::fmt;
 
@@ -244,7 +248,9 @@ impl IconKind {
         }
     }
 
-    /// 按名字反查（旧 `IconKind::path()` 的字符串语义；未知名字是强类型错误）。
+    /// 按名字反查：接受 [`IconKind::name()`] 的**文件 stem**（`"x"` / `"caret-down"`），
+    /// **不**接受旧 `IconKind::path()` 的 `icons/phosphoricons/x.svg` 全路径（那些调用点需要
+    /// 先取文件名 stem，见模块文档）。
     ///
     /// # Errors
     /// [`IconError::UnknownKind`]：名字不在 [`IconKind::ALL`] 里。
@@ -524,11 +530,11 @@ impl std::error::Error for IconError {
 
 #[cfg(test)]
 mod tests {
-    use image::{GenericImageView, ImageFormat};
+    use image::{GenericImageView, ImageFormat, imageops::FilterType};
     use ui_core::math::Rect;
 
     use super::{DEFAULT_ICON_SIZE, IconError, IconKind, IconSpec, RasterTier, raster};
-    use crate::kit::test_support::{image_primitives, test_app_with_scale};
+    use crate::kit::test_support::{image_primitives, test_app, test_app_with_scale};
 
     // 构建期清单（`build.rs` 写进 `OUT_DIR/icons/built.rs`）：资产 ⇄ 枚举一一对应的机器证据。
     include!(concat!(env!("OUT_DIR"), "/icons/built.rs"));
@@ -580,6 +586,11 @@ mod tests {
     ///
     /// 白色字形是运行期颜色调制的前提：任何非白像素都会被 `texel * modulation` 压暗，
     /// 主题色就不准了（变异「不替换成白色」⇒ 本用例变红）。
+    ///
+    /// **透明像素也必须是白色**（white matte）：引擎在 straight-alpha 空间先缩放、后预乘
+    /// （`ui_core/src/resources/image.rs`），透明像素的 RGB 会插值进边缘像素。这里对**所有**
+    /// 像素断言 RGB=255（含 `alpha == 0`）；变异「把 white matte 改回 RGB=0」⇒ 本用例与
+    /// [`downscaled_icon_edges_have_no_dark_fringe`] 一起变红。
     #[test]
     fn every_icon_raster_is_a_white_glyph_png_of_the_expected_tier() {
         for kind in IconKind::ALL {
@@ -601,17 +612,134 @@ mod tests {
                 let mut opaque = 0usize;
                 for pixel in rgba.pixels() {
                     let [red, green, blue, alpha] = pixel.0;
-                    if alpha == 0 {
-                        continue;
-                    }
-                    opaque += 1;
                     assert_eq!(
                         (red, green, blue),
                         (0xFF, 0xFF, 0xFF),
-                        "{kind:?}/{tier:?} 有非白色字形像素 {pixel:?}（会被调制色压暗）"
+                        "{kind:?}/{tier:?} 的像素 {pixel:?} 不是 white matte（alpha={alpha}）：\
+                         RGB 必须全白，否则引擎缩放会把透明区的暗色插值进边缘"
                     );
+                    if alpha > 0 {
+                        opaque += 1;
+                    }
                 }
                 assert!(opaque > 0, "{kind:?}/{tier:?} 整张图都是透明的（空字形）");
+            }
+        }
+    }
+
+    /// 复刻引擎的缩放管线（`ui_core/src/resources/image.rs` 的固定顺序），返回直通 alpha 的
+    /// `RgbaImage`：这里只做「解码 → 缩放」两步 —— 预乘语义由 [`engine_premultiplied`] 单独算
+    /// （引擎在缩放**之后**才预乘，正是本用例要证明的关键顺序）。
+    fn engine_downscale(bytes: &[u8], side: u32) -> image::RgbaImage {
+        let decoded = image::load_from_memory(bytes).expect("图标 PNG 可解码");
+        assert_eq!(
+            decoded.color(),
+            image::ColorType::Rgba8,
+            "图标产物必须是直通 alpha 的 RGBA8"
+        );
+        // 引擎的目标尺寸路径用 `FilterType::CatmullRom`（`resize_decoded` 的 D-10 分支），
+        // 且 `image::imageops::resize` 不做 alpha 预乘（其文档：assumes alpha pre-multiplication）。
+        image::imageops::resize(&decoded.to_rgba8(), side, side, FilterType::CatmullRom)
+    }
+
+    /// sRGB 解码（IEC 61966-2-1 分段函数；与引擎 `image.rs` 的 `srgb_decode` 同式）。
+    fn srgb_decode(value: u8) -> f32 {
+        let encoded = f32::from(value) / 255.0;
+        if encoded <= 0.040_45 {
+            encoded / 12.92
+        } else {
+            ((encoded + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    /// sRGB 编码（`srgb_decode` 的逆，含四舍五入；与引擎同式，含 `+0.5` 截断）。
+    fn srgb_encode(linear: f32) -> u8 {
+        let value = linear.clamp(0.0, 1.0);
+        let encoded = if value <= 0.003_130_8 {
+            value * 12.92
+        } else {
+            1.055 * value.powf(1.0 / 2.4) - 0.055
+        };
+        (encoded * 255.0 + 0.5) as u8
+    }
+
+    /// 引擎上传给 GPU 的存储值（linear 预乘后 sRGB 编码；`image.rs` 的 `premultiply_channel`）。
+    fn engine_premultiplied(color: u8, alpha: u8) -> u8 {
+        srgb_encode(srgb_decode(color) * (f32::from(alpha) / 255.0))
+    }
+
+    /// **F1 像素级回归**：代表性图标下采样到实际绘制尺寸后，边缘像素不得变暗。
+    ///
+    /// 复刻引擎管线（`insert_owned_at_size` 的 48→16 / 96→32 目标变体）：解码 straight-alpha
+    /// PNG → `CatmullRom` 缩放 → 线性预乘 → sRGB 重编码。白色字形在预乘空间的期望存储值是
+    /// `srgb_encode(srgb_decode(255) × alpha)`；`alpha` 来自字形覆盖率。若透明像素的 RGB 是 0
+    /// （旧缺陷），缩放会把覆盖率的边缘拉向黑色：实测 `check-circle-48 → 16` 最坏暗边
+    /// **96/255**（38%）。white matte ⇒ RGB 通道是常量 255 ⇒ 缩放后仍恒 255 ⇒ 暗边恒为 0。
+    ///
+    /// 与旧 GPUI 渲染的差异（**已登记**，`spec-deltas/kit-assets.md` §11）：旧 `svg()` 由
+    /// GPUI 的 `SvgRenderer` 在 paint 期用 resvg/tiny-skia 按元素尺寸的 2× 光栅化（矢量 AA，
+    /// 单一缩放级）；新路径是构建期 resvg 光栅化（48/96）再经引擎 `CatmullRom` 下采样（两级
+    /// 滤波）。差异只剩 AA 细节（覆盖率被近似两次，边缘可能略微更软），不存在颜色偏置；
+    /// 本用例锁定的正是「不存在颜色偏置」这一可机器验证的部分。
+    #[test]
+    fn downscaled_icon_edges_have_no_dark_fringe() {
+        // 含曲线 / 斜边 / 细笔画（最容易被插值压暗的形状）的代表性字形。
+        let representatives = [
+            IconKind::CheckCircle,
+            IconKind::CircleNotch,
+            IconKind::CaretDown,
+            IconKind::X,
+            IconKind::MagnifyingGlass,
+            IconKind::GearSix,
+        ];
+        // 逻辑尺寸 16 px 是旧用法里最常见（`UnifiedSize::icon_size` 的 Large 档）的目标：
+        // 1× 窗口 48→16、2× 窗口 96→32，都是 3× 下采样。
+        for tier_side in [48u32, 96] {
+            let target = tier_side / 3;
+            for kind in representatives {
+                let bytes = raster(
+                    kind,
+                    if tier_side == 48 {
+                        RasterTier::Small48
+                    } else {
+                        RasterTier::Large96
+                    },
+                );
+                let resized = engine_downscale(bytes, target);
+
+                let mut fringe_pixels = 0usize;
+                let mut worst_darkening = 0u8;
+                for pixel in resized.pixels() {
+                    let [red, green, blue, alpha] = pixel.0;
+                    if alpha == 0 {
+                        continue;
+                    }
+                    if alpha < 255 {
+                        fringe_pixels += 1;
+                        // 白色字形下采样后 RGB 必须仍是白色（white matte 的直接推论）。
+                        let darkest = red.min(green).min(blue);
+                        worst_darkening = worst_darkening.max(255 - darkest);
+                    }
+                    // 端到端：存储值（预乘 + sRGB 编码）必须等于「白色 × 覆盖率」。
+                    let expected = srgb_encode(f32::from(alpha) / 255.0);
+                    for component in [red, green, blue] {
+                        let stored = engine_premultiplied(component, alpha);
+                        assert!(
+                            expected.abs_diff(stored) <= 1,
+                            "{kind:?}/{tier_side}→{target} 的边缘像素 {pixel:?} 存储值 {stored} \
+                             偏离期望 {expected} > 1：图标会带暗边"
+                        );
+                    }
+                }
+                assert!(
+                    fringe_pixels > 0,
+                    "{kind:?}/{tier_side}→{target} 没有部分覆盖像素（用例没有真的踩到边缘）"
+                );
+                assert_eq!(
+                    worst_darkening, 0,
+                    "{kind:?}/{tier_side}→{target} 的边缘像素最暗被压了 {worst_darkening}/255：\
+                     透明像素的 RGB 不是 white matte"
+                );
             }
         }
     }
@@ -736,5 +864,47 @@ mod tests {
             .build(app.app_mut(), window, root)
             .expect_err("窗口已关闭");
         assert!(matches!(error, IconError::UnknownWindow { window: closed } if closed == window));
+    }
+
+    /// 图标节点是**装饰性叶子**：a11y 树里必须 `hidden`，占位空格不得被 AT 播报。
+    ///
+    /// 引擎没有图片节点，图标走「空格文本 + 行内盒图片」（`kit::image_node`）——占位空格是
+    /// 实现细节，对 a11y 必须不可见。审查的变异「删掉 `.a11y(hidden)`」曾存活（38/38 全绿），
+    /// 本用例锁死它：去掉那三行后 `record.hidden` 变 false / 可见节点里出现空白文本 ⇒ 变红。
+    #[test]
+    fn icon_nodes_are_hidden_from_the_a11y_tree() {
+        let mut app = test_app();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let root = app.app().window(window).expect("test window").tree().root();
+        let node = IconSpec::new(IconKind::CheckCircle)
+            .with_size(16.0)
+            .build(app.app_mut(), window, root)
+            .expect("图标挂载");
+        let _ = app.drain().expect("首帧");
+
+        let snapshot = app.a11y().expect("a11y 快照（开启捕获后的首帧是全树）");
+        if let Some(record) = snapshot.node_for(node) {
+            assert!(
+                record.hidden,
+                "图标节点必须在 a11y 树里标记 hidden（占位空格是装饰性文本）：{record:?}"
+            );
+        }
+        // 无论引擎把 hidden 节点留在快照里还是整棵剔除，「可见节点」视图都不得含空白文本。
+        for record in snapshot.visible_nodes_in_batch() {
+            if let Some(label) = record.label_text() {
+                assert!(
+                    !label.trim().is_empty(),
+                    "可见的 a11y 节点不得只有空白文本（图标占位空格被播报了）：{record:?}"
+                );
+            }
+        }
+        assert!(
+            snapshot
+                .nodes()
+                .iter()
+                .all(|record| record.engine != node || record.hidden),
+            "图标节点只能以 hidden 的形式出现在 a11y 树里"
+        );
     }
 }
