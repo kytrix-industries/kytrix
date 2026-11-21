@@ -47,6 +47,7 @@
 //! | [`overlay`] | 通用锚定浮层：12 向 placement + flip + clamp、滚动跟随、模态遮罩、`Transient` 淡入淡出、E10 完成回调收尾（`AnimationRouter` 单槽路由）、E12 显式 a11y 角色、焦点陷阱 / 恢复 | `crate::overlay` + `crate::layer` 的浮层部分 |
 //! | [`layer`] | 固定 z 层带（View < Dialog < Alert < Popup < ContextMenu < Tooltip）与 root 子节点排序仲裁 | `crate::layer` |
 //! | [`tooltip`] | hover / focus 触发 + E10 一次性定时器延迟 + 12 向定位 + 文本 / 快捷键 + 不可交互 + 模态抑制 / 显式 a11y | `crate::tooltip` |
+//! | [`color_picker`] | 颜色选择器：HEX / 色板 / HSLA 滑条（Canvas 自绘 + 拖拽 + 悬停预览）+ 浮层弹出 + HEX 校验 + 受控/非受控 | `crate::color_picker` |
 //! | `test_support` | 基于 `ui_core::test_support` 的测试断言辅助（TestApp/Probe/FrameRecord） | 无（新基建） |
 //!
 //! # 组件形态（与引擎模型对齐）
@@ -84,6 +85,7 @@ pub mod assets;
 pub mod badge;
 pub mod brand;
 pub mod button;
+pub mod color_picker;
 pub mod dialog;
 pub mod empty_state;
 pub mod format;
