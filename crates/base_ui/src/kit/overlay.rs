@@ -875,6 +875,9 @@ impl Overlay {
                 dismiss: self.inner.options.dismiss.engine(),
                 trap_focus: self.inner.options.modal,
                 restore_focus: self.inner.options.restore_focus,
+                // E12 之后引擎浮层包装有了 a11y 通道；本模块的角色声明打在**面板节点**上
+                // （P2-4b 的落点），包装保持默认（`GenericContainer`，平台层透明上提）。
+                a11y: A11yOverride::default(),
             },
         )?;
         let engine_node = engine_overlay.node();

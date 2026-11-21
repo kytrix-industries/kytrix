@@ -420,6 +420,7 @@ mod ui_tests {
                     dismiss,
                     trap_focus,
                     restore_focus: false,
+                    a11y: Default::default(),
                 },
             )
             .expect("建浮层");
