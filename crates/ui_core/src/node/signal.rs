@@ -888,6 +888,18 @@ impl StateStore {
         SignalScope::from_index(index)
     }
 
+    /// 某作用域当前**存活**的信号（不含空闲槽位）。
+    ///
+    /// 已释放 / 根作用域之外越界的作用域返回空切片（根作用域返回其 signals —— 根永不释放，
+    /// 调用方需自行区分）。消费者：`App::remove_node_with_scope` 的作用域归属校验
+    /// （`window_set::remove`：子树外的存活读者 ⇒ 可证明的错配）。
+    pub(crate) fn scope_signals(&self, scope: SignalScope) -> &[SignalId] {
+        self.scopes
+            .get(scope.index() as usize)
+            .filter(|slot| !slot.released)
+            .map_or(&[], |slot| slot.signals.as_slice())
+    }
+
     /// 释放作用域：**回收**它的全部值槽位（值立即 drop、槽位归还空闲栈、代际 +1），返回旧句柄
     /// （调用方负责按旧 id 删除依赖图里的边）。
     ///
@@ -2236,8 +2248,11 @@ mod tests {
             "跨窗口节点不得成为另一窗口的指针捕获目标"
         );
         assert!(
-            !app.remove_node(second, node),
-            "跨窗口节点不得被另一窗口卸载"
+            matches!(
+                app.remove_node(second, node),
+                Err(EngineError::StaleNode { node: reported }) if reported == node
+            ),
+            "跨窗口节点不得被另一窗口卸载（强类型 StaleNode）"
         );
         assert!(
             app.window(first)

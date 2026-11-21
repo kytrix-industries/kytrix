@@ -456,11 +456,11 @@ fn removing_a_scope_subtree_clears_its_bindings_and_keeps_the_ancestors() {
 
     // 只卸载后代（inner 里的叶子）：inner 的绑定必须保留。
     let leaf = mount_box(&mut app, window, inner);
-    assert!(app.remove_node(window, leaf));
+    assert!(app.remove_node(window, leaf).is_ok());
     assert_eq!(scoped_bindings(&app), 2, "卸载后代不影响 scope 绑定");
 
     // 卸载 inner 子树：inner 的绑定清除，outer 的保留。
-    assert!(app.remove_node(window, inner));
+    assert!(app.remove_node(window, inner).is_ok());
     assert_eq!(scoped_bindings(&app), 1, "被卸载 scope 的绑定必须清除");
 
     // 焦点（已陈旧）被过滤成 None，不 panic；outer 绑定仍可命中。
@@ -529,7 +529,7 @@ fn registration_rejects_unknown_windows_and_stale_scopes() {
     assert_eq!(scoped_bindings(&app), 0);
 
     // 已卸载节点：同样在注册期拒绝。
-    assert!(app.remove_node(window, scope));
+    assert!(app.remove_node(window, scope).is_ok());
     assert!(matches!(
         app.bind_key_scoped(window, scope, binding(KeyCode::ArrowDown, action)),
         Err(EngineError::StaleNode { .. })

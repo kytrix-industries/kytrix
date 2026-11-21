@@ -1,24 +1,113 @@
 //! 窗口集合：建 / 关 / 关闭前处理器、窗口控制请求、节点移除。
 //!
-//! `app.rs` 的 `impl App` 只保留同名薄委托，方法体在这里（零行为变更的纯拆分）。
+//! `app.rs` 的 `impl App` 只保留同名薄委托，方法体在这里。`remove_node` 的**卸载清理管线**
+//! （R-21，E16）在本文件实现，因此本模块不是「零行为变更的纯拆分」；其余方法是纯拆分。
 
-use super::App;
+use super::{App, RemoveOutcome, input};
 use crate::{
     error::EngineError,
     interaction,
-    node::{dependency::Owner, id::NodeId},
+    node::{dependency::Owner, id::NodeId, signal::SignalScope},
     window::{Window, WindowId, WindowOptions},
 };
 
-/// 消费者：`App::remove_node`。
+/// 消费者：`App::remove_node`（不带作用域释放）。
+pub(crate) fn remove_node(
+    app: &mut App,
+    window: WindowId,
+    node: NodeId,
+) -> Result<RemoveOutcome, EngineError> {
+    remove(app, window, node, None)
+}
+
+/// 消费者：`App::remove_node_with_scope`（卸载节点后同一调用里释放 `scope`）。
+pub(crate) fn remove_node_with_scope(
+    app: &mut App,
+    window: WindowId,
+    node: NodeId,
+    scope: SignalScope,
+) -> Result<RemoveOutcome, EngineError> {
+    remove(app, window, node, Some(scope))
+}
+
+/// 卸载子树并自动清理引擎级生命周期资源（R-21 引擎下沉，E16）。
 ///
-/// 删除浮层时顺带处理**焦点恢复**（R02-12）：`App::close_overlay`、`Dismiss` 动作与
-/// 「点击外部关闭」三条路径都经过这里，把恢复集中在此才不会漏掉其中一条。
+/// 这是 `App::remove_node` / `App::remove_node_with_scope` 的唯一实现。删除浮层时顺带处理
+/// **焦点恢复**（R02-12）：`App::close_overlay`、`Dismiss` 动作与「点击外部关闭」三条路径都
+/// 经过这里，把恢复集中在此才不会漏掉其中一条。
 ///
 /// 删除子树时还必须**作废落在子树内的指针会话**（R02-8）：捕获目标被卸载后，旧实现让
 /// `pointer_captured()` 永久返回死节点、平台捕获永不释放、按下记录卡在「按住」。
-pub(crate) fn remove_node(app: &mut App, window: WindowId, node: NodeId) -> bool {
-    // 先取浮层的 opener（删除之后槽随节点一起消失）。
+///
+/// # 顺序（不可交换，理由见 `App::remove_node` 的文档）
+///
+/// 校验（无副作用）→ 浮层 / 捕获会话收尾 → 悬停链记取 → 删树 + detach 依赖边 → 指针状态收尾
+/// （悬停 / 按压 / 命中）→ scoped 键绑定 → `after_scoped` 定时器 → 动画槽 → 模态 a11y / 焦点
+/// 恢复 → 可选 `release_scope` → 请求一帧。
+fn remove(
+    app: &mut App,
+    window: WindowId,
+    node: NodeId,
+    scope: Option<SignalScope>,
+) -> Result<RemoveOutcome, EngineError> {
+    // ① 校验**先于任何副作用**：`UnknownWindow` / `StaleNode`（含 root）调用后状态不变。
+    let (mut outcome, removed_set) = {
+        let Some(target) = app.windows.get(&window) else {
+            return Err(EngineError::UnknownWindow { window });
+        };
+        let tree = target.tree();
+        // 跨窗口句柄在 `NodeTree::get` 处确定性失败；root 不是可移除的子节点（N11）。
+        if tree.get(node).is_err() || node == tree.root() {
+            return Err(EngineError::StaleNode { node });
+        }
+        let mut ids: Vec<NodeId> = Vec::with_capacity(16);
+        tree.for_each_subtree(node, |id| ids.push(id));
+        let outcome = RemoveOutcome {
+            removed_nodes: ids.len(),
+            ..RemoveOutcome::default()
+        };
+        (outcome, ids)
+    };
+    let removed_set: ahash::HashSet<NodeId> = removed_set.into_iter().collect();
+    // ①b 虚拟列表的**已挂载行只能由引擎回收**：直接删一行会留下死 `mounted` 项 —— 该 index
+    // 永不再挂载（视觉空洞），`App::virtual_row_index` 也仍把死句柄算作已挂载。删除条目必须
+    // 改数据源后 `App::set_virtual_items`；删除列表容器本身不受此限制（行随容器一起消失）。
+    // debug 构建里把这条契约变成硬失败（release 下只靠文档：引擎看不到应用意图）。
+    #[cfg(debug_assertions)]
+    {
+        let tree = app.windows.get(&window).expect("① 已校验窗口").tree();
+        let mut cursor = tree.get(node).ok().and_then(|target| target.parent());
+        while let Some(ancestor) = cursor {
+            let removed_row_mounted = tree.virtual_slot(ancestor).is_some_and(|slot| {
+                slot.mounted
+                    .iter()
+                    .any(|(_, row)| removed_set.contains(row))
+            });
+            debug_assert!(
+                !removed_row_mounted,
+                "remove_node 删除了虚拟列表的已挂载行：行只能由引擎回收（set_virtual_items / 滚动）。\
+                 死 mounted 项会让该条目永不再挂载；请改数据源后调用 set_virtual_items"
+            );
+            cursor = tree.get(ancestor).ok().and_then(|target| target.parent());
+        }
+    }
+    // ①c 作用域归属校验（F4）：`SignalScope` 与 `NodeId` 正交，引擎没有归属映射；但「释放会
+    // 破坏存活绑定」的错配是**可证明**的 —— 若该作用域的存活信号仍被被删子树之外的节点读取，
+    // 释放必然打断那个节点的绑定 ⇒ 在任何副作用之前返回错误（节点不删、作用域不释放）。根
+    // 作用域永不释放（`release_scope` 返回 0），跳过校验。
+    if let Some(scope) = scope
+        && scope != SignalScope::ROOT
+        && let Some(reader) = app
+            .graph
+            .node_reader_outside(app.store.scope_signals(scope), &removed_set)
+    {
+        return Err(EngineError::ScopeOwnershipMismatch {
+            node,
+            scope,
+            reader,
+        });
+    }
+    // ② 先取浮层的 opener（删除之后槽随节点一起消失）。
     let (opener, modal) = app.windows.get(&window).map_or((None, false), |target| {
         let slot = target.tree().overlay_slot(node);
         (
@@ -31,11 +120,10 @@ pub(crate) fn remove_node(app: &mut App, window: WindowId, node: NodeId) -> bool
     // `DragPhase::Cancel`）、清按压/待定拖拽、请求平台释放捕获、清悬停。
     let captured = app.windows.get(&window).is_some_and(|target| {
         let tree = target.tree();
-        tree.get(node).is_ok()
-            && target
-                .pointer()
-                .capture
-                .is_some_and(|captured| interaction::overlay::is_in_subtree(tree, captured, node))
+        target
+            .pointer()
+            .capture
+            .is_some_and(|captured| interaction::overlay::is_in_subtree(tree, captured, node))
     });
     if captured {
         app.cancel_pointer_session(window);
@@ -48,41 +136,102 @@ pub(crate) fn remove_node(app: &mut App, window: WindowId, node: NodeId) -> bool
             }),
         );
     }
-    let Some(target) = app.windows.get_mut(&window) else {
-        return false;
+    // ③ 悬停链必须在删树**前**记取（由内到外的祖先链；`None` = 悬停不在被删子树）：删后
+    // `update_hover` 的 `previous` 会把死节点过滤成「无悬停」，补调 `revalidate_hover` 会因
+    // `previous == next == None` 早退 ⇒ 应用侧 tooltip / `:hover` 残留到下一次指针移动（F1）。
+    let removed_hover_chain = app.windows.get(&window).and_then(|target| {
+        let hovered = target.pointer().hovered?;
+        removed_set
+            .contains(&hovered)
+            .then(|| input::hover_chain(target.tree(), Some(hovered)))
+    });
+    // ④ 删树：`NodeTree::remove` 把被删节点的 deps 交还，这里逐条 detach（P1-2.5）。
+    // 否则死边会随「挂载/卸载」次数无界累积，而 `App::write` 是最高频热路径 —— 成本会从
+    // O(活跃读者) 退化成 O(历史挂载过的所有读者)。
+    let detached = {
+        let Some(target) = app.windows.get_mut(&window) else {
+            // 校验与删树之间没有 `&mut App` 调用，窗口不可能消失；防御性收口。
+            return Err(EngineError::UnknownWindow { window });
+        };
+        target.tree_mut().remove(node)?
     };
-    // 卸载子树必须同步解开依赖边（P1-2.5）：`NodeTree::remove` 把被删节点的 deps 交还，
-    // 这里逐条 detach。否则死边会随「挂载/卸载」次数无界累积，而 `App::write` 是最高频
-    // 热路径 —— 成本会从 O(活跃读者) 退化成 O(历史挂载过的所有读者)。
-    let removed = match target.tree_mut().remove(node) {
-        Ok(detached) => {
-            for (node, deps) in detached {
-                for signal in deps {
-                    app.graph.detach(signal, Owner::Node { window, node });
-                }
-            }
-            true
+    for (removed_node, deps) in detached {
+        for signal in deps {
+            app.graph.detach(
+                signal,
+                Owner::Node {
+                    window,
+                    node: removed_node,
+                },
+            );
         }
-        Err(_) => false,
-    };
-    if removed {
-        // E8：`bind_key_scoped` 的 scope 若落在被卸载的子树内，绑定必须同批清除 —— 否则
-        // 表项会一直留到关窗（视觉上「没反应」，实际是永不命中的泄漏）。只卸载后代的场景
-        // 不受影响：祖先 scope 仍在树里，绑定保留。
+    }
+    // ⑤ 指针状态收尾：落在被删集合里的悬停 / 按压 / 待定拖拽 / 最近命中的句柄清掉；悬停链被
+    // 卸载时派生 `HoverChanged`，否则应用侧的 hover 状态会残留到下一次指针移动（F1）。
+    input::cleanup_removed_pointer_state(app, window, &removed_set, removed_hover_chain);
+    // ⑥–⑧ 引擎级生命周期资源：scoped 键绑定 / `after_scoped` 定时器 / 与子树绑定的动画槽。
+    let (scoped_key_bindings, timers, animations) =
+        cleanup_removed_subtree(app, window, &removed_set);
+    outcome.scoped_key_bindings = scoped_key_bindings;
+    outcome.timers = timers;
+    outcome.animations = animations;
+    // ⑨ 模态浮层关闭 ⇒ 背景的 a11y `hidden` 语义整体恢复：全树标 `A11Y`，下一笔增量交付
+    // 必须把「背景重新可见」送到 AT（与 `create_overlay` 的打开路径对称）。
+    if modal && let Some(target) = app.windows.get_mut(&window) {
+        crate::a11y::tree::mark_modal_scope_changed(target.tree_mut());
+    }
+    super::focus::restore_focus(app, window, opener);
+    // ⑩ 可选的作用域释放：必须在节点已卸载之后（`bind_*` 闭包不得求值到已回收句柄）。
+    if let Some(scope) = scope {
+        let animations_before = app.animations.len();
+        outcome.released_values = app.release_scope(scope);
+        // `release_scope` 取消引用被释放瞬态值的动画槽（`Released`），与本函数 ⑧ 的判据
+        // 互补；计数合并（同一槽只可能被其中一条路径取消）。
+        outcome.animations += animations_before - app.animations.len();
+    }
+    // ⑪ 卸载改变了像素 ⇒ 请求一帧（与 `App::set_focus` 等 App 级变更同口径）。`request_frame`
+    // 只是合并位 + 唤醒（`App::frame` 的 `take_wake_request` 取走即清零），重复调用无副作用；
+    // 清理本身（解绑 / 取消定时器 / 取消动画）不请求帧、不进入连续帧（I3）。
+    app.request_frame();
+    Ok(outcome)
+}
+
+/// 卸载后自动清理引擎级生命周期资源（E16 / R-21），返回
+/// `(scoped_key_bindings, timers, animations)` 三类清理条数。
+///
+/// 调用前提：节点**已从树里移除**（scoped 绑定 / 定时器按「scope 不再存活」判定），`removed`
+/// 是被卸载子树的句柄集合（动画按重绘节点 / 滚动目标归属）。
+///
+/// 消费者：
+/// - [`remove`]：`App::remove_node` 的完整语义（另有指针会话 / 浮层 / 焦点 / 作用域释放）；
+/// - **虚拟列表行回收**（`app::virtual_list::rewindow_virtual`，引擎内部高频路径）：行上的
+///   scoped 资源同样必须在回收时清掉，否则滚动会留下永不命中的绑定、到期回调跑在死行上的
+///   定时器、以及给死行标脏的动画（否则 R-21 只是在公开入口闭合了一半）。
+pub(crate) fn cleanup_removed_subtree(
+    app: &mut App,
+    window: WindowId,
+    removed: &ahash::HashSet<NodeId>,
+) -> (usize, usize, usize) {
+    // E8：`bind_key_scoped` 的 scope 若落在被卸载的子树内，绑定必须同批清除 —— 否则表项会
+    // 一直留到关窗（视觉上「没反应」，实际是永不命中的泄漏）。只卸载后代的场景不受影响：
+    // 祖先 scope 仍在树里，绑定保留。
+    let scoped_key_bindings = {
+        let Some(target) = app.windows.get(&window) else {
+            return (0, 0, 0);
+        };
         let tree = target.tree();
+        let before = app.scoped_bindings.len();
         app.scoped_bindings
             .retain(|scoped| scoped.window != window || tree.get(scoped.scope).is_ok());
-        // 模态浮层关闭 ⇒ 背景的 a11y `hidden` 语义整体恢复：全树标 `A11Y`，下一笔增量
-        // 交付必须把「背景重新可见」送到 AT（与 `create_overlay` 的打开路径对称）。
-        if modal {
-            crate::a11y::tree::mark_modal_scope_changed(target.tree_mut());
-        }
-        // E10：`after_scoped` 的节点作用域若落在被卸载的子树内，定时器同批取消（与 scoped 键
-        // 绑定同一生命周期规则）；不取消的话到期回调会跑在「组件已经不存在」的状态上。
-        super::timer::retain_live_scopes(app, window);
-        super::focus::restore_focus(app, window, opener);
-    }
-    removed
+        before - app.scoped_bindings.len()
+    };
+    // E10：`after_scoped` 的节点作用域若落在被卸载的子树内，定时器同批取消（与 scoped 键
+    // 绑定同一生命周期规则）；不取消的话到期回调会跑在「组件已经不存在」的状态上。
+    let timers = super::timer::retain_live_scopes(app, window);
+    // 动画槽：重绘节点 / 滚动目标落在被卸载子树内的槽同批取消。不取消的话
+    // `tick_animations` 会继续给死节点标脏、为一条已经看不见的动画持续请求帧。
+    let animations = super::animation::cancel_node_animations(app, window, removed);
+    (scoped_key_bindings, timers, animations)
 }
 
 // ── 窗口 ──────────────────────────────────────────────────────────────────

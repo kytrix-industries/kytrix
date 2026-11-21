@@ -263,21 +263,27 @@ pub(crate) fn rewindow_virtual(app: &mut App, window: WindowId, node: NodeId) {
         })
         .unwrap_or_default();
     let mut changed = false;
+    // 被回收行的句柄集合：行上的 scoped 键绑定 / `after_scoped` 定时器 / 动画必须随行一起
+    // 失效（E16 / R-21 的引擎内部路径；公开路径是 `App::remove_node`）。
+    let mut removed: ahash::HashSet<NodeId> = ahash::HashSet::default();
     for (_, row) in &stale {
         // 回收行同样必须解开依赖边（P1-2.5）：滚动是最高频操作，留下的死边会线性放大
         // 每一次 `App::write`。
+        let mut ids: Vec<NodeId> = Vec::new();
+        target.tree().for_each_subtree(*row, |id| ids.push(id));
         if let Ok(detached) = target.tree_mut().remove(*row) {
-            for (removed, deps) in detached {
+            for (removed_node, deps) in detached {
                 for signal in deps {
                     app.graph.detach(
                         signal,
                         Owner::Node {
                             window,
-                            node: removed,
+                            node: removed_node,
                         },
                     );
                 }
             }
+            removed.extend(ids);
             changed = true;
         }
     }
@@ -313,6 +319,11 @@ pub(crate) fn rewindow_virtual(app: &mut App, window: WindowId, node: NodeId) {
     if changed {
         target.tree_mut().mark_structure(node);
         app.request_frame();
+    }
+    if !removed.is_empty() {
+        // 行已从树里移除 ⇒ 挂在行上的 scoped 键绑定 / 定时器 / 动画同批清理（与
+        // `App::remove_node` 同一条生命周期规则；滚动是最高频的卸载路径）。
+        let _ = super::window_set::cleanup_removed_subtree(app, window, &removed);
     }
 }
 

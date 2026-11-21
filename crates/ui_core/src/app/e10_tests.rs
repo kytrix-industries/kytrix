@@ -692,14 +692,14 @@ fn unloading_the_scope_node_cancels_the_timer() {
         )
         .expect("timer");
 
-    assert!(app.app_mut().remove_node(window, unrelated));
+    assert!(app.app_mut().remove_node(window, unrelated).is_ok());
     assert_eq!(
         app.app().timer_count_for_test(),
         1,
         "卸载无关节点不得误伤定时器"
     );
 
-    assert!(app.app_mut().remove_node(window, scope_node));
+    assert!(app.app_mut().remove_node(window, scope_node).is_ok());
     assert_eq!(app.app().timer_count_for_test(), 0);
     assert_eq!(app.app().next_wake_deadline(), None);
     app.advance(Duration::from_secs(1));
@@ -724,7 +724,7 @@ fn timers_are_validated_against_windows_and_scope_nodes() {
     }
 
     let stale = painted_node(&mut app, Color::from_rgba8([29, 30, 31, 255]));
-    assert!(app.app_mut().remove_node(window, stale));
+    assert!(app.app_mut().remove_node(window, stale).is_ok());
     match app
         .app_mut()
         .after_scoped(window, stale, Duration::from_millis(1), |_app| {})

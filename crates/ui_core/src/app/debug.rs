@@ -55,7 +55,7 @@ pub(crate) fn set_debug_hud(
         app.debug_hud.insert(window, state);
         changed = true;
     } else if let Some(state) = app.debug_hud.remove(&window) {
-        app.remove_node(window, state.root());
+        let _ = app.remove_node(window, state.root());
         changed = true;
     }
     if changed {

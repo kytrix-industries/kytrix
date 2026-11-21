@@ -1,11 +1,12 @@
 //! 动画槽与引擎时钟：注册 / 推进 / 取消 / 完成通知，以及「是否需要持续出帧」。
 //!
-//! `app.rs` 的 `impl App` 只保留同名薄委托，方法体在这里（零行为变更的纯拆分）。
+//! `app.rs` 的 `impl App` 只保留同名薄委托，方法体在这里（拆分；E16 起本模块还承担
+//! 「节点子树卸载 ⇒ 动画槽按归属取消」的判据，见 [`cancel_node_animations`]）。
 //!
-//! **E10 完成通知**：每次 `App::animate` 的动画终止（到达终值 / 取消 / 替换 / 目标作用域释放）
-//! 都会入队一条 [`AnimationCompletion`]，由 [`dispatch_completions`] 在「产生它的那一帧内」
-//! （自然完成）或「下一帧入口」（帧外终止）派发给 [`App::on_animation_complete`] 注册的回调；
-//! 自然完成同时 `Dispatcher::wake` 一次，让**下一轮 `on_frame` 钩子**一定能看到终值。
+//! **E10 完成通知**：每次 `App::animate` 的动画终止（到达终值 / 取消 / 替换 / 目标作用域释放 /
+//! 节点子树卸载）都会入队一条 [`AnimationCompletion`]，由 [`dispatch_completions`] 在「产生它的
+//! 那一帧内」（自然完成）或「下一帧入口」（帧外终止）派发给 [`App::on_animation_complete`]
+//! 注册的回调；自然完成同时 `Dispatcher::wake` 一次，让**下一轮 `on_frame` 钩子**一定能看到终值。
 
 #[cfg(any(test, feature = "test-support"))]
 use std::time::Duration;
@@ -123,6 +124,50 @@ pub(crate) fn release_scope_animations(app: &mut App, signals: &[SignalId]) {
 pub(crate) fn drop_completions_for_window(app: &mut App, window: WindowId) {
     app.animation_completions
         .retain(|event| event.id.window() != window);
+}
+
+/// 卸载子树时取消与该子树绑定的动画槽，返回取消条数（E16；`App::remove_node`）。
+///
+/// 判据（两条互补，避免误杀共享动画）：
+/// 1. **重绘节点全部落在被卸载集合内** ⇒ 动画驱动的视觉目标已经不存在。部分节点存活的槽保留，
+///    但把死节点从重绘列表里剔除（`tick_animations` 不再给陈旧句柄标脏）；
+/// 2. **滚动动画的 `ScrollHandle` 节点被卸载** ⇒ 滚动槽已随树消失，继续插值只会空转请求帧。
+///    滚动槽是引擎内部驱动，不产生公开完成事件。
+///
+/// 被取消的公开动画按 [`AnimationEndKind::Removed`] 入队完成事件（帧外终止，下一帧入口派发）：
+/// 应用侧按 `AnimationId` 维护的登记表（kit `AnimationRouter` 等）因此不会留下永不完成的条目。
+pub(crate) fn cancel_node_animations(
+    app: &mut App,
+    window: WindowId,
+    removed: &ahash::HashSet<NodeId>,
+) -> usize {
+    let mut count = 0usize;
+    let mut cancelled: Vec<AnimationId> = Vec::new();
+    app.animations.retain_mut(|slot| {
+        if slot.window != window {
+            return true;
+        }
+        // ② 滚动动画按 handle 归属（`nodes` 恒为空，不能用重绘节点判）。
+        if let AnimationTarget::Scroll { handle, .. } = &slot.target
+            && removed.contains(&handle.node())
+        {
+            count += 1;
+            return false;
+        }
+        let had_nodes = !slot.nodes.is_empty();
+        slot.nodes.retain(|node| !removed.contains(node));
+        // ① 原本没有重绘节点的动画是窗口级驱动（不归属于某棵子树）⇒ 保留。
+        if had_nodes && slot.nodes.is_empty() {
+            cancelled.push(AnimationId::new(slot.window, slot.id));
+            count += 1;
+            return false;
+        }
+        true
+    });
+    for id in cancelled {
+        queue_completion(app, id, AnimationEndKind::Removed);
+    }
+    count
 }
 
 // ── P10：动画 ──────────────────────────────────────────────────────────────

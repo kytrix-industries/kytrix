@@ -950,6 +950,11 @@ impl Window {
     }
 
     /// 应用层建树的唯一入口（`NodeBuilder::build` 的 `&mut NodeTree` 来自这里）。
+    ///
+    /// **卸载必须走 [`App::remove_node`](crate::app::App::remove_node)**：这里拿到的
+    /// `NodeTree::remove` 是引擎内部原语，**不做 scoped 清理**（键绑定 / `after_scoped` 定时器 /
+    /// 动画槽 / 指针会话 / 浮层焦点恢复）。直接调它会留下永不命中的 scoped 绑定、到期后跑在
+    /// 死节点上的定时器、以及给死节点标脏的动画（R-21，E16）。
     pub fn tree_mut(&mut self) -> &mut NodeTree {
         &mut self.tree
     }

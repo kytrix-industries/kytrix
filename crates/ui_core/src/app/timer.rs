@@ -159,15 +159,20 @@ pub(crate) fn cancel_window(app: &mut App, window: WindowId) {
 
 /// 节点卸载清理：`scope` 落在被卸载子树内的定时器自动取消（E8 scoped 语义）。
 ///
+/// 返回取消的定时器条数（[`crate::app::RemoveOutcome::timers`] 的证据面）。判据是**树里不再
+/// 存在该 scope**（而不是「属于被删集合」）：重复调用 / 其它路径留下的死 scope 一并收口。
+///
 /// 消费者：`App::remove_node`。
-pub(crate) fn retain_live_scopes(app: &mut App, window: WindowId) {
+pub(crate) fn retain_live_scopes(app: &mut App, window: WindowId) -> usize {
     let Some(target) = app.windows.get(&window) else {
-        return;
+        return 0;
     };
     let tree = target.tree();
+    let before = app.timers.len();
     app.timers.retain(|timer| {
         timer.window != window || timer.scope.is_none_or(|scope| tree.get(scope).is_ok())
     });
+    before - app.timers.len()
 }
 
 /// 待派发定时器条数（测试 / 诊断的泄漏证据面）。

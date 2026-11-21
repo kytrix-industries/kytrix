@@ -3874,7 +3874,7 @@ fn removing_the_captured_node_releases_the_capture() {
     let _ = app.drain_events();
 
     // 删掉**祖先**：捕获目标随之卸载。
-    assert!(app.remove_node(window, panel));
+    assert!(app.remove_node(window, panel).is_ok());
     assert_eq!(
         app.pointer_captured(window),
         None,

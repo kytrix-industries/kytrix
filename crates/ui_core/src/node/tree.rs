@@ -680,6 +680,15 @@ impl NodeTree {
         arena::insert_child(self, parent, spec)
     }
     /// 实现见子模块 `arena::remove`（本文件只保留签名）。
+    ///
+    /// # 引擎内部原语：**不做 scoped 清理**
+    ///
+    /// 只删节点、回收 lane / damage / 容器登记并交还被删节点的信号依赖边。**不会**清理
+    /// 挂在被删子树上的 scoped 键绑定（`App::bind_key_scoped`）、`after_scoped` 定时器、
+    /// 动画槽、指针捕获会话与浮层焦点恢复 —— 应用侧卸载必须用
+    /// [`App::remove_node`](crate::app::App::remove_node)（它返回 [`crate::app::RemoveOutcome`]
+    /// 清理计数）；直接经 `Window::tree_mut()` 调本方法会留下永不命中的绑定 / 到期回调跑在
+    /// 死节点上的定时器 / 给死节点标脏的动画（R-21 应用义务，E16 已把应用入口下沉到引擎）。
     pub fn remove(
         &mut self,
         node: NodeId,
