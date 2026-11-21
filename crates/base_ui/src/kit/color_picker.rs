@@ -42,8 +42,9 @@
 //! - **拖拽**：滑条节点 `on_drag`，`DragPhase::Start` 捕获指针、`Move` 用引擎拖拽会话的窗口
 //!   坐标换算成 0..=1 的分量、`End/Cancel` 释放；越界按 clamp 处理（旧实现同义）。
 //! - **浮层**：`kit::overlay` 的 12 向定位（BottomStart）+ flip/clamp + `OutsideClick` 关闭 +
-//!   淡入淡出（E10 完成回调路由）；面板表面沿用菜单配方（旧 `components.menu` 的
-//!   `SurfaceOverlay` + 菜单阴影），内边距 8 与旧 `p_2` 一致。
+//!   淡入淡出（E10 完成回调路由 / E13 组不透明度）；面板表面沿用菜单配方（旧
+//!   `components.menu` 的 `SurfaceOverlay` + **双层**菜单阴影 `(0,1,2,0)+(0,3,6,-2)`，
+//!   内边距 8 与旧 `p_2` 一致，圆角 4 与旧 `rounded_sm` 一致）。
 //! - **HEX 输入**：`kit::input`（`InputSpec::submit` + 读状态信号）——文本变化在 `sync` 里校验，
 //!   `PressEnter` 走 submit 动作，`Blur` 是 `is_focused` 的下降沿。
 //! - **a11y**：触发器 `Button`（可访问名 = 当前 HEX）、色板 `Group`（label = 面板标签）、
@@ -59,6 +60,12 @@
 //! - **挂载期主题常量**：面板里的 HEX 输入框底色与文字色取自打开时的外观；深浅色切换时浮层壳
 //!   （`bind_style` 读主题）+ 自绘内容（`sync` 检测外观变化后重画）会更新，但 `kit::input` 的
 //!   静态底色要等下次重开面板（input 模块自身契约，登记差异）。
+//! - **画布不参与组不透明度**（E13 语义）：淡出期浮层壳 / 文本随组根一起淡，三张自绘画布
+//!   （色板 / 轨道 / 色块）不淡；旧实现是逐图元 alpha（登记差异）。
+//! - **面板 1px divider 边框未画**：旧面板 `.border_1().border_color(line.divider)`，而
+//!   [`OverlaySurface`] 没有 border 字段（过渡期 kit::overlay 缺口，登记差异）。
+//! - **HEX 输入框的可访问名是内部 key**（`<key>.hex`）：`kit::input` 的 `InputSpec.name`
+//!   同时承担动作命名空间与 a11y label，暂未分离（登记 kit-text/E 批）。
 //! - **最近使用色**：旧实现没有该功能；本批不新增（不扩未验证语义）。
 //!
 //! # 生命周期
@@ -90,7 +97,7 @@ use ui_core::{
         canvas::Canvas,
         color::{Color, ColorResolver},
         primitive::{Border, Quad, QuadPaint},
-        style::{Cursor, ShadowSpec, StylePatch},
+        style::{Cursor, StylePatch},
     },
     text::{TextAlign, TextStyle},
     window::WindowId,
@@ -109,9 +116,7 @@ use crate::{
     style_builder::{PaintBuilder, StyleBuilder},
     theme::{
         appearance::Appearance,
-        components::{
-            ComponentTokens, ControlSize, InteractiveElementColors, InteractiveStateColors,
-        },
+        components::{ControlSize, InteractiveElementColors, InteractiveStateColors},
         handle::ThemeHandle,
         role::Role,
     },
@@ -169,8 +174,6 @@ const FOOTER_WELL_SIZE: f32 = 30.0;
 const FOOTER_WELL_RADIUS: f32 = 6.0;
 /// 面板内边距（旧 `p_2`）。
 const PANEL_PADDING: f32 = 8.0;
-/// 面板圆角。
-const PANEL_RADIUS: f32 = 4.0;
 /// 标签页 / 确认按钮圆角。
 const CONTROL_RADIUS: f32 = 4.0;
 /// 色板悬停环的宽度与内缩。
@@ -851,16 +854,8 @@ impl ColorPicker {
                 restore_focus: true,
                 band: Band::Popup,
                 surface: OverlaySurface {
-                    background: Role::SurfaceOverlay,
-                    corner_radius: PANEL_RADIUS,
                     padding: PANEL_PADDING,
-                    shadow: Some(ShadowSpec {
-                        offset: Point::new(0.0, 3.0),
-                        blur: 6.0,
-                        spread: 0.0,
-                        color: Color::BLACK
-                            .with_opacity(ComponentTokens::standard().shadow.menu_alpha),
-                    }),
+                    ..OverlaySurface::menu()
                 },
                 scrim: None,
                 a11y: OverlayA11y::dialog(labels.panel.clone()),
@@ -1277,7 +1272,7 @@ impl ColorPicker {
         let Some(hit) = ctx.hit() else {
             return;
         };
-        let (window, index) = {
+        let index = {
             let panel = self.inner.panel.borrow();
             let Some(panel) = panel.as_ref() else {
                 return;
@@ -1285,7 +1280,7 @@ impl ColorPicker {
             let BodyView::Palette(view) = &panel.body_view else {
                 return;
             };
-            let index = match view.cells.iter().position(|cell| *cell == hit.node) {
+            match view.cells.iter().position(|cell| *cell == hit.node) {
                 Some(index) => Some(index),
                 None => ctx
                     .app_mut()
@@ -1293,10 +1288,8 @@ impl ColorPicker {
                     .and_then(|target| target.tree().get(view.root).ok())
                     .map(|node| node.layout().bounds.size)
                     .and_then(|size| palette_index_at(size, hit.local_point)),
-            };
-            (panel.window, index)
+            }
         };
-        let _ = window;
         if let Some(index) = index {
             self.with_input(|input| {
                 let Some(swatch) = PALETTE.get(index) else {
@@ -1312,7 +1305,7 @@ impl ColorPicker {
         let Some(hit) = ctx.hit() else {
             return;
         };
-        let (track, width) = {
+        let width = {
             let panel = self.inner.panel.borrow();
             let Some(panel) = panel.as_ref() else {
                 return;
@@ -1321,20 +1314,16 @@ impl ColorPicker {
                 return;
             };
             let track = view.tracks[channel.index()].track;
-            let width = ctx
-                .app_mut()
+            ctx.app_mut()
                 .window(panel.window)
                 .and_then(|target| target.tree().get(track).ok())
                 .map(|node| node.layout().bounds.size.width)
-                .unwrap_or(0.0);
-            (track, width)
+                .unwrap_or(0.0)
         };
-        let _ = track;
         if width <= 0.0 {
             return;
         }
-        let t = (hit.local_point.x / width).clamp(0.0, 1.0);
-        self.set_channel(ctx.app_mut(), channel, t);
+        self.set_channel(ctx.app_mut(), channel, hit.local_point.x / width);
     }
 
     fn on_track_drag(&self, ctx: &mut ActionCtx<'_>, channel: HslaChannel) {
@@ -1391,7 +1380,7 @@ impl ColorPicker {
         else {
             return;
         };
-        let t = ((info.current.x - origin) / width).clamp(0.0, 1.0);
+        let t = (info.current.x - origin) / width;
         self.set_channel(app, channel, t);
     }
 
@@ -1416,7 +1405,11 @@ impl ColorPicker {
         self.with_input(|input| self.set_preview_swatch(app, None, input));
     }
 
-    /// 移动一个 HSL 分量（`t` = 轨道上的 0..=1 位置，clamp）。
+    /// 移动一个 HSL 分量。`t` = 轨道上的分量位置，**越界按 clamp**（这里是唯一钳制点：
+    /// 点击 / 拖拽都只负责把指针换算成比例，几何越界不丢给下游）。
+    ///
+    /// 色相必须 clamp 而不是 wrap：旧实现拖过轨道端点停在 0° / 360°（红）；若把越界值直接交给
+    /// [`hsla_to_color`] 的 `rem_euclid`，1.32 会绕回 0.32（绿），语义就变了。
     fn set_channel(&self, app: &mut App, channel: HslaChannel, t: f32) {
         let base = color_to_hsla(self.display_color(app));
         let mut color = base;
@@ -1636,7 +1629,7 @@ impl ColorPicker {
                 })
                 .on_click(inner.actions.tab[index].clone())
                 .build(tree, tabs)?;
-            let text = NodeBuilder::text(label_fn(&labels), TextStyle::new(small.text_size()))
+            NodeBuilder::text(label_fn(&labels), TextStyle::new(small.text_size()))
                 .id(format_smolstr!("{}:panel.tab.{index}.text", inner.key))
                 .style(StyleBuilder::new().flex_1().build())
                 .bind_text(move |cx| label_fn(&cx.read(&labels_for_text)))
@@ -1650,7 +1643,6 @@ impl ColorPicker {
                     }
                 })
                 .build(tree, tab)?;
-            let _ = text;
             tab_nodes[index] = tab;
         }
 
@@ -1780,7 +1772,7 @@ impl ColorPicker {
             })
             .on_click(inner.actions.confirm.clone())
             .build(tree, footer)?;
-        let confirm_text = NodeBuilder::text(labels.confirm, TextStyle::new(medium.text_size()))
+        NodeBuilder::text(labels.confirm, TextStyle::new(medium.text_size()))
             .id(format_smolstr!("{}:panel.confirm.text", inner.key))
             .bind_text(move |cx| cx.read(&labels_signal).confirm.clone())
             .bind_style(move |cx| {
@@ -1793,7 +1785,6 @@ impl ColorPicker {
                 }
             })
             .build(tree, confirm)?;
-        let _ = confirm_text;
 
         input.install(app);
 
@@ -2430,6 +2421,7 @@ mod tests {
         math::{Point, Rect, Size},
         paint::{
             canvas::Canvas,
+            color::ColorResolver,
             primitive::{Primitive, Quad},
         },
     };
@@ -2439,8 +2431,9 @@ mod tests {
         PALETTE_ROWS, PALETTE_SATURATION, PALETTE_SIZE, PALETTE_STEP, PANEL_CONTENT_WIDTH,
         SLIDER_LABEL_WIDTH, SLIDER_ROW_HEIGHT, SLIDER_ROW_INNER_GAP, SLIDER_VALUE_WIDTH,
         THUMB_DIAMETER, TRACK_HEIGHT, TRACK_RADIUS, TRACK_SLICES, color_to_hsla, hex_string,
-        hover_ring_color, hsla, hsla_to_color, palette_canvas, palette_cell_bounds, palette_hue,
-        palette_index_at, parse_hex, rgba8, srgb_components, track_canvas, well_canvas,
+        hover_ring_color, hsla, hsla_to_color, linear_to_srgb, palette_canvas, palette_cell_bounds,
+        palette_hue, palette_index_at, parse_hex, rgba8, srgb_components, track_canvas,
+        well_canvas,
     };
 
     const EPS: f32 = 1.0e-4;
@@ -2850,7 +2843,70 @@ mod tests {
             assert!((back.l - lightness).abs() < EPS);
             samples += 1;
         }
+        // 任意色相（不是 60° 倍数）与 alpha 两端（0 / 1）：旧测试只取 60° 倍数、alpha 固定 0.5。
+        for hue in [0.1_f32, 0.37] {
+            for saturation in [0.3_f32, 1.0] {
+                for lightness in [0.2_f32, 0.8] {
+                    for alpha in [0.0_f32, 1.0] {
+                        let color = hsla_to_color(hsla(hue, saturation, lightness, alpha));
+                        let back = color_to_hsla(color);
+                        assert!(
+                            (back.h - hue).abs() < EPS,
+                            "任意色相 {hue} 往返成 {}（s={saturation}, l={lightness}, a={alpha}）",
+                            back.h
+                        );
+                        assert!((back.s - saturation).abs() < EPS);
+                        assert!((back.l - lightness).abs() < EPS);
+                        assert!((back.a - alpha).abs() < EPS);
+                        samples += 1;
+                    }
+                }
+            }
+        }
         assert!(samples >= 30, "抽样数 {samples} 不足 30");
+    }
+
+    /// 非 `Srgb` 分支（`ColorResolver` + `linear_to_srgb`）与 alpha 0 短路：本批新代码必须有直测。
+    #[test]
+    fn colors_in_other_spaces_should_resolve_through_linear_srgb() {
+        let gray = color_to_hsla(Color::linear_srgb(0.5, 0.5, 0.5, 1.0));
+        assert!(
+            (gray.l - 0.735_356_9).abs() < 2.0e-5,
+            "线性 0.5 灰 → sRGB {}（应 ≈ 0.73536）",
+            gray.l
+        );
+        assert_eq!((gray.h, gray.s), (0.0, 0.0), "灰阶没有色相/饱和度");
+
+        for color in [
+            Color::display_p3(0.6, 0.2, 0.1, 1.0),
+            Color::oklab(0.5, 0.1, 0.05, 0.8),
+            Color::oklch(0.5, 0.1, 0.2, 0.5),
+        ] {
+            let linear = ColorResolver.resolve(color);
+            let [r, g, b, a] = srgb_components(color);
+            let resolved_alpha = linear.components[3];
+            assert!((a - resolved_alpha).abs() < 1.0e-5);
+            for (encoded, channel) in [r, g, b].into_iter().zip(&linear.components[..3]) {
+                assert!(
+                    (encoded - linear_to_srgb(*channel / resolved_alpha)).abs() < 1.0e-5,
+                    "非 Srgb 分量必须走线性（去预乘）→ sRGB 编码"
+                );
+            }
+            // HSL 往返仍落在同一个 sRGB 色上（gamut 映射由 `ColorResolver` 完成）。
+            let back = hsla_to_color(color_to_hsla(color));
+            for (left, right) in srgb_components(back)
+                .into_iter()
+                .zip(srgb_components(color))
+            {
+                assert!((left - right).abs() < EPS);
+            }
+        }
+
+        assert_eq!(
+            srgb_components(Color::display_p3(0.5, 0.5, 0.5, 0.0)),
+            [0.0; 4],
+            "alpha 0 短路（预乘后不可反解）"
+        );
     }
 
     /// sRGB 传递函数：线性 0.5 的编码值是 0.7354…（不是 0.5）；这是「颜色换算错」的变异靶点。
@@ -2966,14 +3022,18 @@ mod tests {
 
 #[cfg(test)]
 mod ui_tests {
-    use std::{cell::RefCell, rc::Rc, time::Duration};
+    use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
     use smol_str::SmolStr;
     use ui_core::{
         a11y::A11yRole,
         event::{Event, InputEvent, KeyCode, KeyState, Modifiers, PointerButton},
         math::{Point, Rect},
-        node::tree::NodeKind,
+        node::{
+            id::NodeId,
+            tree::{NodeKind, NodeTree},
+        },
+        paint::canvas::Canvas,
         test_support::app::TestApp,
     };
 
@@ -2983,7 +3043,7 @@ mod ui_tests {
     };
     use crate::{
         kit::{layer::Layer, overlay::AnimationRouter, test_support::full_a11y},
-        theme::{appearance::Appearance, handle::ThemeHandle},
+        theme::{appearance::Appearance, handle::ThemeHandle, role::Role},
     };
 
     const DEFAULT: Hsla = hsla(0.2, 0.5, 0.4, 1.0);
@@ -3054,6 +3114,17 @@ mod ui_tests {
                 self.app.advance(Duration::from_millis(60));
                 self.pump();
             }
+        }
+
+        /// 泵到「`sync` 不再报变化、也不再出帧」的稳态（I3）；返回是否在预算内达到。
+        fn settled(&mut self) -> bool {
+            for _ in 0..6 {
+                let changed = self.pump();
+                if !changed && !self.app.frame_record().rendered {
+                    return true;
+                }
+            }
+            false
         }
 
         fn bounds(&self, node: ui_core::node::id::NodeId) -> Rect {
@@ -3215,6 +3286,55 @@ mod ui_tests {
             self.pump_times(2);
         }
 
+        /// 指针从 `start_fraction` 按下、越过拖拽阈值后拖到 `target`（越界坐标由调用方给）。
+        fn drag_track(&mut self, channel: usize, start_fraction: f32, target: Point) {
+            let start = self.track_point(channel, start_fraction);
+            let launch_fraction = if target.x >= start.x {
+                (start_fraction + 0.1).min(1.0)
+            } else {
+                (start_fraction - 0.1).max(0.0)
+            };
+            let launch = self.track_point(channel, launch_fraction);
+            let _ = self.app.inject(InputEvent::pointer_down(
+                start,
+                PointerButton::Primary,
+                Modifiers::empty(),
+            ));
+            let _ = self
+                .app
+                .inject(InputEvent::pointer_move(launch, Modifiers::empty()));
+            let _ = self
+                .app
+                .inject(InputEvent::pointer_move(target, Modifiers::empty()));
+            let _ = self.app.inject(InputEvent::pointer_up(
+                target,
+                PointerButton::Primary,
+                Modifiers::empty(),
+            ));
+            self.pump_times(2);
+        }
+
+        fn focus_node(&mut self, node: NodeId) {
+            assert!(
+                self.app.app_mut().set_focus(self.window, Some(node)),
+                "节点可聚焦"
+            );
+            self.pump_times(2);
+        }
+
+        /// 键盘按键的完整 down + up（引擎在焦点节点上按 `on_click` 声明分发动作）。
+        fn key_press(&mut self, code: KeyCode) {
+            for state in [KeyState::Down, KeyState::Up] {
+                self.pump_event(Event::Input(InputEvent::Key {
+                    code,
+                    state,
+                    repeat: false,
+                    modifiers: Modifiers::empty(),
+                    timestamp: std::time::Instant::now(),
+                }));
+            }
+        }
+
         fn track_point(&self, channel: usize, fraction: f32) -> Point {
             let track = self.tracks().expect("HSLA 页")[channel];
             let bounds = self.bounds(track);
@@ -3229,7 +3349,59 @@ mod ui_tests {
             self.click_node(tabs[1]);
         }
 
-        fn panel_painter(&self, node: ui_core::node::id::NodeId) -> Vec<Rect> {
+        /// 画布内容快照（`Arc` 浅拷贝；用于断言「主题切换后重画了什么」）。
+        fn canvas_content(&self, node: NodeId) -> Arc<Canvas> {
+            let tree = self.app.app().window(self.window).expect("窗口").tree();
+            match tree.get(node).expect("节点").kind() {
+                NodeKind::Canvas(canvas) => canvas.clone(),
+                other => panic!("期望 Canvas，实际 {other:?}"),
+            }
+        }
+
+        /// 子树里第一个文本节点（页签 / 确认按钮的文字）。
+        fn text_node(&self, root: NodeId) -> NodeId {
+            fn walk(tree: &NodeTree, node: NodeId) -> Option<NodeId> {
+                let target = tree.get(node).ok()?;
+                if matches!(target.kind(), NodeKind::Text(_)) {
+                    return Some(node);
+                }
+                target
+                    .children()
+                    .iter()
+                    .find_map(|child| walk(tree, *child))
+            }
+
+            let tree = self.app.app().window(self.window).expect("窗口").tree();
+            walk(tree, root).expect("子树里有文本")
+        }
+
+        /// 文本节点 `bind_style` 求出的前景色（主题切换后由样式 pass 更新）。
+        fn text_foreground(&self, node: NodeId) -> Option<Color> {
+            let tree = self.app.app().window(self.window).expect("窗口").tree();
+            tree.get(node).expect("文本节点").style_patch().foreground
+        }
+
+        fn trigger_well(&self) -> NodeId {
+            self.picker
+                .inner
+                .trigger
+                .borrow()
+                .as_ref()
+                .expect("触发器已挂载")
+                .well
+        }
+
+        fn panel_well(&self) -> NodeId {
+            self.picker
+                .inner
+                .panel
+                .borrow()
+                .as_ref()
+                .expect("面板已打开")
+                .well
+        }
+
+        fn panel_painter(&self, node: NodeId) -> Vec<Rect> {
             let tree = self.app.app().window(self.window).expect("窗口").tree();
             match tree.get(node).expect("节点").kind() {
                 NodeKind::Canvas(canvas) => canvas
@@ -3259,6 +3431,29 @@ mod ui_tests {
         );
         assert!(harness.app.probe().bounds(harness.trigger()).is_some());
         assert!(!harness.panel_open(), "面板初始关闭");
+    }
+
+    #[test]
+    fn the_panel_surface_should_use_the_old_double_layer_menu_recipe() {
+        // F1：旧 picker 面板 = 菜单表面（`SurfaceOverlay` / `rounded_sm` / `p_2`）+ 菜单**双层**阴影
+        // `(0,1,2,0)+(0,3,6,-2)`。单层 `(0,3,6,0)` 是视觉差异，不是等价迁移。
+        let harness = Harness::new();
+        let surface = &harness.picker.overlay().options().surface;
+        assert_eq!(surface.background, Role::SurfaceOverlay);
+        assert_eq!(surface.corner_radius, 4.0, "旧 rounded_sm");
+        assert_eq!(surface.padding, super::PANEL_PADDING, "旧 p_2");
+        let layers: Vec<_> = surface.shadows.iter().collect();
+        assert_eq!(layers.len(), 2, "旧面板是双层菜单阴影");
+        assert_eq!(layers[0].offset, Point::new(0.0, 1.0));
+        assert_eq!(layers[0].blur, 2.0);
+        assert_eq!(layers[0].spread, 0.0);
+        assert_eq!(layers[1].offset, Point::new(0.0, 3.0));
+        assert_eq!(layers[1].blur, 6.0);
+        assert_eq!(
+            layers[1].spread, -2.0,
+            "第二层负 spread 是旧菜单的紧凑接触阴影"
+        );
+        assert_eq!(layers[0].color, layers[1].color, "两层同色（菜单阴影色）");
     }
 
     #[test]
@@ -3402,6 +3597,11 @@ mod ui_tests {
             "悬停把色块预览写进 HEX 字段"
         );
         assert_eq!(
+            harness.picker.draft(harness.app.app()),
+            None,
+            "悬停只预览，不得写草稿"
+        );
+        assert_eq!(
             harness.picker.color(harness.app.app()),
             default_color(),
             "悬停不改确认色"
@@ -3416,10 +3616,12 @@ mod ui_tests {
             Some(28),
             "跨色板间隙保留上一个预览"
         );
+        assert_eq!(harness.picker.draft(harness.app.app()), None);
 
         let next = Point::new(cell.x + super::PALETTE_STEP, cell.y);
         harness.hover_at(next);
         assert_eq!(harness.picker.hovered_swatch(harness.app.app()), Some(29));
+        assert_eq!(harness.picker.draft(harness.app.app()), None);
 
         harness.hover_at(Point::new(760.0, 560.0));
         assert_eq!(
@@ -3427,10 +3629,45 @@ mod ui_tests {
             None,
             "离开色板清掉预览"
         );
+        assert_eq!(harness.picker.draft(harness.app.app()), None);
         assert_eq!(
             harness.picker.hex_text(harness.app.app()),
             hex_string(default_color()),
             "离开色板恢复确认色的 HEX"
+        );
+        assert!(harness.changes.borrow().is_empty());
+    }
+
+    #[test]
+    fn keyboard_confirm_after_hovering_should_report_nothing() {
+        // F5：悬停预览不是草稿；焦点在确认按钮上按 Enter 只能关面板，不得把预览色当成编辑报出去。
+        let mut harness = Harness::new();
+        harness.open();
+        let (grid, _) = harness.palette().expect("色板");
+        let cell = Point::new(
+            grid.origin.x + super::PALETTE_STEP * 4.0 + 10.0,
+            grid.origin.y + super::PALETTE_STEP * 2.0 + 10.0,
+        );
+        harness.hover_at(cell);
+        assert_eq!(harness.picker.hovered_swatch(harness.app.app()), Some(28));
+        assert_eq!(
+            harness.picker.draft(harness.app.app()),
+            None,
+            "悬停不写草稿"
+        );
+
+        harness.focus_node(harness.confirm());
+        harness.key_press(KeyCode::Enter);
+        harness.settle();
+        assert!(!harness.panel_open(), "Enter 激活确认并关闭面板");
+        assert!(
+            harness.changes.borrow().is_empty(),
+            "悬停预览不是编辑，确认不得报色"
+        );
+        assert_eq!(harness.picker.color(harness.app.app()), default_color());
+        assert_eq!(
+            harness.picker.hex_text(harness.app.app()),
+            hex_string(default_color())
         );
     }
 
@@ -3926,11 +4163,113 @@ mod ui_tests {
     }
 
     #[test]
+    fn dragging_far_past_every_track_should_clamp_to_the_ends() {
+        // F3：只断言「最终色 = 1.0」不够 —— `hsla_to_color` 会兜底 clamp s/l/a，删掉 `set_channel`
+        // 的钳制也不会变红。色相是唯一可观测的钳制点：必须停在 0° / 360°（红），不能交给
+        // `rem_euclid` 把 1.32 绕回 0.32（绿）；负值同理。
+        let mut harness = Harness::new();
+        harness.open();
+        harness.switch_to_hsla();
+
+        let base = super::color_to_hsla(default_color());
+        harness.drag_track(0, 0.5, harness.track_point(0, -0.5));
+        let draft = harness
+            .picker
+            .draft(harness.app.app())
+            .expect("负向越界仍编辑");
+        assert_eq!(
+            rgba8(draft),
+            rgba8(hsla_to_color(hsla(0.0, base.s, base.l, base.a))),
+            "色相负向越界必须 clamp 到 0°（红），不得绕回"
+        );
+
+        let base = super::color_to_hsla(harness.picker.display_color(harness.app.app()));
+        harness.drag_track(0, 0.5, harness.track_point(0, 1.5));
+        let draft = harness
+            .picker
+            .draft(harness.app.app())
+            .expect("正向越界仍编辑");
+        assert_eq!(
+            rgba8(draft),
+            rgba8(hsla_to_color(hsla(1.0, base.s, base.l, base.a))),
+            "色相 >360° 必须 clamp 到 360°（红），不得绕回 0.32"
+        );
+
+        // 饱和度 / 明度 / 透明度：越界同样停在端点（这三条由 `hsla_to_color` 的 clamp 兜底，
+        // 是行为断言；色相的钳制才是 `set_channel` 的可观测点）。
+        let base = super::color_to_hsla(harness.picker.display_color(harness.app.app()));
+        harness.drag_track(1, 0.5, harness.track_point(1, -0.5));
+        let draft = harness.picker.draft(harness.app.app()).expect("饱和度越界");
+        assert_eq!(
+            rgba8(draft),
+            rgba8(hsla_to_color(hsla(base.h, 0.0, base.l, base.a))),
+            "饱和度越界 clamp 到 0（灰）"
+        );
+
+        let base = super::color_to_hsla(harness.picker.display_color(harness.app.app()));
+        harness.drag_track(1, 0.5, harness.track_point(1, 1.5));
+        let draft = harness.picker.draft(harness.app.app()).expect("饱和度越界");
+        assert_eq!(
+            rgba8(draft),
+            rgba8(hsla_to_color(hsla(base.h, 1.0, base.l, base.a))),
+            "饱和度越界 clamp 到 1"
+        );
+
+        let base = super::color_to_hsla(harness.picker.display_color(harness.app.app()));
+        harness.drag_track(2, 0.5, harness.track_point(2, -0.5));
+        let draft = harness.picker.draft(harness.app.app()).expect("明度越界");
+        assert_eq!(
+            rgba8(draft),
+            rgba8(hsla_to_color(hsla(base.h, base.s, 0.0, base.a))),
+            "明度越界 clamp 到 0（黑）"
+        );
+
+        let base = super::color_to_hsla(harness.picker.display_color(harness.app.app()));
+        harness.drag_track(2, 0.5, harness.track_point(2, 1.5));
+        let draft = harness.picker.draft(harness.app.app()).expect("明度越界");
+        assert_eq!(
+            rgba8(draft),
+            rgba8(hsla_to_color(hsla(base.h, base.s, 1.0, base.a))),
+            "明度越界 clamp 到 1（白）"
+        );
+
+        let base = super::color_to_hsla(harness.picker.display_color(harness.app.app()));
+        harness.drag_track(3, 0.5, harness.track_point(3, -0.5));
+        let draft = harness.picker.draft(harness.app.app()).expect("透明度越界");
+        assert_eq!(
+            rgba8(draft),
+            rgba8(hsla_to_color(hsla(base.h, base.s, base.l, 0.0))),
+            "透明度越界 clamp 到 0"
+        );
+
+        let base = super::color_to_hsla(harness.picker.display_color(harness.app.app()));
+        harness.drag_track(3, 0.5, harness.track_point(3, 1.5));
+        let draft = harness.picker.draft(harness.app.app()).expect("透明度越界");
+        assert_eq!(
+            rgba8(draft),
+            rgba8(hsla_to_color(hsla(base.h, base.s, base.l, 1.0))),
+            "透明度越界 clamp 到 1"
+        );
+        assert!(harness.panel_open(), "越界拖拽不关闭面板");
+        assert!(harness.changes.borrow().is_empty());
+    }
+
+    #[test]
     fn switching_the_theme_should_keep_the_panel_and_its_color() {
         let mut harness = Harness::new();
         harness.open();
         harness.switch_to_hsla();
         let before = harness.picker.color(harness.app.app());
+        let trigger_well = harness.trigger_well();
+        let track_canvas = harness.track_canvas(0).expect("色相画布");
+        let panel_well = harness.panel_well();
+        let tab_text = harness.text_node(harness.tabs()[1]);
+        let trigger_before = harness.canvas_content(trigger_well);
+        let track_before = harness.canvas_content(track_canvas);
+        let well_before = harness.canvas_content(panel_well);
+        let text_before = harness.text_foreground(tab_text);
+        assert!(text_before.is_some(), "页签文本有主题前景色");
+
         assert!(
             harness
                 .theme
@@ -3944,6 +4283,29 @@ mod ui_tests {
             harness.picker.active_tab(harness.app.app()),
             ColorPickerTab::Hsla
         );
+        // F5/F11：旧测试只断言状态不变，「主题切换后重绘」被削弱成空断言。这里恢复：
+        // 触发器色块 / 轨道拇指（`track.last = None` 分支）/ 页脚色块的自绘画布必须按新主题重画，
+        // 文本的 `bind_style` 前景色也必须更新。
+        assert_ne!(
+            harness.canvas_content(trigger_well),
+            trigger_before,
+            "触发器色块按深色主题重绘"
+        );
+        assert_ne!(
+            harness.canvas_content(track_canvas),
+            track_before,
+            "滑条拇指按深色主题重绘"
+        );
+        assert_ne!(
+            harness.canvas_content(panel_well),
+            well_before,
+            "页脚色块按深色主题重绘"
+        );
+        assert_ne!(
+            harness.text_foreground(tab_text),
+            text_before,
+            "页签文本颜色随主题重绘"
+        );
 
         assert!(
             harness
@@ -3953,6 +4315,16 @@ mod ui_tests {
         harness.pump_times(3);
         assert!(harness.panel_open());
         assert_eq!(harness.picker.color(harness.app.app()), before);
+        assert_eq!(
+            harness.canvas_content(trigger_well),
+            trigger_before,
+            "切回浅色恢复原画布内容"
+        );
+        assert_eq!(harness.canvas_content(track_canvas), track_before);
+        assert_eq!(harness.canvas_content(panel_well), well_before);
+        assert_eq!(harness.text_foreground(tab_text), text_before);
+        harness.settle();
+        assert!(harness.settled(), "主题切换后收敛（I3）");
     }
 
     #[test]
@@ -4158,6 +4530,34 @@ mod ui_tests {
             "受控写入不触发确认回调"
         );
         assert_eq!(harness.picker.hex_text(harness.app.app()), hex_string(blue));
+    }
+
+    #[test]
+    fn a_controlled_write_should_settle_without_requesting_frames() {
+        // F4：受控写回后 `sync` 必须把 `last_color` 同步到当前值；否则每一轮都因
+        // `current != last_color` 返回 changed=true，组合根会持续请求帧（I3 破）且无法观测。
+        let mut harness = Harness::new();
+        let signal = harness.picker.color_signal();
+        let blue = super::hsla_to_color(super::hsla(2.0 / 3.0, 1.0, 0.5, 1.0));
+        assert!(harness.app.app_mut().write(&signal, blue));
+        harness.pump_times(3);
+        assert_eq!(harness.picker.color(harness.app.app()), blue);
+        assert_eq!(harness.picker.hex_text(harness.app.app()), hex_string(blue));
+        assert!(harness.settled(), "关闭态受控写回后不得持续请求帧（I3）");
+
+        // 面板打开时同样：受控写 → 同步 HEX / 清草稿 → 收敛（不再有变化、不再出帧）。
+        harness.open();
+        harness.settle();
+        let green = super::hsla_to_color(super::hsla(1.0 / 3.0, 1.0, 0.5, 1.0));
+        assert!(harness.app.app_mut().write(&signal, green));
+        harness.pump_times(2);
+        assert_eq!(harness.picker.color(harness.app.app()), green);
+        assert_eq!(
+            harness.picker.hex_text(harness.app.app()),
+            hex_string(green)
+        );
+        assert!(harness.settled(), "受控写回后不得持续请求帧（I3）");
+        assert!(harness.changes.borrow().is_empty(), "受控写不触发确认回调");
     }
 
     #[test]
