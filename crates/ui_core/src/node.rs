@@ -6,6 +6,7 @@
 //! - `dependency`：`ReadCtx`（公开）+ `Owner`/`DependencyGraph`/`ReadTracker`/`EvalStack`/`EvalGuard`（crate 私有）
 //! - `dirty`：`DirtyFlags` + 冒泡终止判定
 //! - `id`：`NodeId`（公开）+ `Arena`（crate 私有）
+//! - `image`：`ImageFit` / `ImageSource` / `ImageContent`（E7 图片载荷）
 //! - `signal`：`Signal<T>`/`Derived<T>`/`Transient<T>` 等句柄 + `StateStore`（crate 私有）
 //! - `tree`：`Node`/`NodeKind`/`LayoutBox`/`NodeTree`
 
@@ -13,5 +14,6 @@ pub mod builder;
 pub mod dependency;
 pub mod dirty;
 pub mod id;
+pub mod image;
 pub mod signal;
 pub mod tree;

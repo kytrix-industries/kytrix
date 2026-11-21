@@ -164,6 +164,58 @@ impl NodeBuilder {
         }
     }
 
+    /// 图片叶子（E7）：已就绪的图片资源 + 填充方式。
+    ///
+    /// 尺寸：`Style` 的显式尺寸优先；未给尺寸时用资源内在尺寸（tile 逻辑尺寸 =
+    /// 物理像素 ÷ 窗口 scale，由 `App::refresh_images` 在布局前解析）。
+    /// 颜色调制走 [`NodeBuilder::image_modulation`]（静态）或 `bind_style` 的 `foreground`
+    /// （动态，与文本同一条通道）。
+    ///
+    /// 资源未加载 / 已释放时**不画图元**（节点自身的背景/边框照常绘制 = 占位）。
+    #[must_use]
+    pub fn image(
+        resource: crate::resources::ResourceId,
+        fit: crate::node::image::ImageFit,
+    ) -> Self {
+        Self {
+            kind: NodeKind::Image(Box::new(crate::node::image::ImageContent::new(
+                crate::node::image::ImageSource::Ready(resource),
+                fit,
+            ))),
+            ..Self::boxed()
+        }
+    }
+
+    /// 图片叶子（E7）：异步解码中的资源 + 填充方式。
+    ///
+    /// 资源未就绪时是占位（透明）；`App::poll_resources` 交付 `Ready` 后引擎自动把节点改成
+    /// 已就绪、解析内在尺寸并失效重绘 —— 不需要应用重建节点。
+    #[must_use]
+    pub fn image_pending(
+        pending: crate::resources::PendingResource,
+        fit: crate::node::image::ImageFit,
+    ) -> Self {
+        Self {
+            kind: NodeKind::Image(Box::new(crate::node::image::ImageContent::new(
+                crate::node::image::ImageSource::Pending(pending),
+                fit,
+            ))),
+            ..Self::boxed()
+        }
+    }
+
+    /// 图片节点的颜色调制（静态；`Color::WHITE` = 不调制）。非图片节点上是 no-op。
+    ///
+    /// 语义：`texel * modulation`（预乘空间）。动态调制用 `bind_style` 的
+    /// `foreground`（文本/图标同一通道，`StylePatch::foreground` 覆盖本值）。
+    #[must_use]
+    pub fn image_modulation(mut self, modulation: crate::paint::color::Color) -> Self {
+        if let NodeKind::Image(content) = &mut self.kind {
+            content.set_modulation(modulation);
+        }
+        self
+    }
+
     /// 文本叶子（静态文本）。
     ///
     /// 挂载后由 `App::refresh_text` 首次形状 —— **在此之前 measure 是 0×0**
@@ -289,7 +341,8 @@ impl NodeBuilder {
     /// `EngineError::StaleNode { node: parent }`：父节点陈旧（从未存在/已卸载）。
     ///
     /// # Panics（仅 debug）
-    /// 父节点是**布局叶子**（`NodeKind::Canvas` / `Geometry`，或带 `LayoutOverride`）时 `debug_assert!` 失败。
+    /// 父节点是**布局叶子**（`NodeKind::Canvas` / `Geometry` / `Image` / `Text`，或带
+    /// `LayoutOverride`）时 `debug_assert!` 失败。
     /// **release 下允许挂载，但该子树永不产生布局盒、也永不产生任何像素**（P04 对叶子节点的子节点不做布局）
     /// ——这是「已定义但不可见」的行为，不是 UB，也不是静默降级（debug 构建必然失败）。
     pub fn build(self, tree: &mut NodeTree, parent: NodeId) -> Result<NodeId, EngineError> {
@@ -400,6 +453,82 @@ mod tests {
         }
         assert!(tree.get(canvas).expect("存在").kind().is_leaf());
         assert!(tree.get(geometry).expect("存在").kind().is_leaf());
+    }
+
+    /// E7：`image(resource, fit)` 装出图片叶子；未解析前 measure 为空、内在尺寸为 `None`。
+    #[test]
+    fn build_image_sets_kind_and_needs_measure() {
+        use crate::{
+            node::image::{ImageFit, ImageSource},
+            resources::ResourceId,
+        };
+
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let resource = ResourceId::for_test(3, 2);
+        let node = NodeBuilder::image(resource, ImageFit::Cover)
+            .image_modulation(crate::paint::color::Color::BLACK)
+            .build(&mut tree, root)
+            .expect("挂载成功");
+
+        let target = tree.get(node).expect("存在");
+        match target.kind() {
+            NodeKind::Image(content) => {
+                assert_eq!(content.source(), ImageSource::Ready(resource));
+                assert_eq!(content.fit(), ImageFit::Cover);
+                assert_eq!(content.modulation(), crate::paint::color::Color::BLACK);
+                assert_eq!(
+                    content.intrinsic(),
+                    None,
+                    "内在尺寸由 App::refresh_images 在布局前解析"
+                );
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+        assert!(target.kind().is_leaf(), "图片是叶子节点");
+        assert!(
+            tree.measure_of(node).is_none(),
+            "builder 不伪造与资源不一致的尺寸"
+        );
+    }
+
+    /// E7：异步图片构造器（`Pending` 句柄；就绪后由引擎改写成 `Ready`）。
+    #[test]
+    fn build_image_pending_stores_the_pending_handle() {
+        use crate::{
+            node::image::{ImageFit, ImageSource},
+            resources::PendingResource,
+        };
+
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let pending = PendingResource::for_test(7, 4);
+        let node = NodeBuilder::image_pending(pending, ImageFit::Contain)
+            .build(&mut tree, root)
+            .expect("挂载成功");
+
+        match tree.get(node).expect("存在").kind() {
+            NodeKind::Image(content) => {
+                assert_eq!(content.source(), ImageSource::Pending(pending));
+                assert_eq!(content.fit(), ImageFit::Contain);
+                assert_eq!(content.source().resource(), None, "Pending 没有就绪句柄");
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    /// E7：`image_modulation` 对非图片节点是 no-op（与 `inline_boxes` 的形态一致）。
+    #[test]
+    fn image_modulation_is_ignored_on_non_image_nodes() {
+        use crate::paint::color::Color;
+
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let node = NodeBuilder::boxed()
+            .image_modulation(Color::BLACK)
+            .build(&mut tree, root)
+            .expect("挂载成功");
+        assert_eq!(tree.get(node).expect("存在").kind(), &NodeKind::Box);
     }
 
     #[test]

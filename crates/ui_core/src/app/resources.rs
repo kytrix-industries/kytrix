@@ -9,7 +9,7 @@ use crate::{
     error::EngineError,
     event::Event,
     platform::dispatcher::Dispatcher,
-    resources::{DecodeState, PendingResource, ResourceCache},
+    resources::{DecodeState, PendingResource, ResourceCache, ResourceImage},
     window::WindowId,
 };
 
@@ -38,14 +38,107 @@ pub(crate) fn run_frame_hook(app: &mut App) {
 ///
 /// 平台泵**每轮**调用（`App::run_frame_hook`），`App::frame` 入口也兜底一次；空闲且没有
 /// pending 时 `poll` 是 O(0)，不产生帧（I3 不变式）。
+///
+/// **E7**：交付的 `Ready` 结果先写回引用对应 `PendingResource` 的图片节点（内在尺寸 +
+/// `LAYOUT | PAINT`），再进应用可见的缓冲 —— 应用即使完全忽略 `take_resource_results`，
+/// 图片也会自动上屏。
 /// 消费者：`App::poll_resources`。
 pub(crate) fn poll_resources(app: &mut App) {
     let results = app.resources.poll();
     if results.is_empty() {
         return;
     }
+    apply_resource_results(app, &results);
     app.pending_resource_results.extend(results);
     app.request_frame();
+}
+
+/// 把交付结果里的 `Ready` 项写回图片节点（E7）。返回改写的节点数。
+///
+/// `Failed` 项不在这里处理：节点保持 `Pending`（占位），错误分类由应用从
+/// `take_resource_results` 里读取后决定重试 / 换图。
+pub(crate) fn apply_resource_results(
+    app: &mut App,
+    results: &[(PendingResource, DecodeState)],
+) -> usize {
+    let mut resolved: ahash::HashMap<PendingResource, ResourceImage> = ahash::HashMap::default();
+    for (pending, state) in results {
+        if let DecodeState::Ready(image) = state {
+            resolved.insert(*pending, *image);
+        }
+    }
+    if resolved.is_empty() {
+        return 0;
+    }
+    let App { windows, .. } = app;
+    let mut count = 0;
+    for window in windows.values_mut() {
+        let scale = window.scale().factor();
+        count += window.tree_mut().resolve_pending_images(&resolved, scale);
+    }
+    count
+}
+
+/// E7：在布局之前解析图片节点的内在尺寸（首帧 / DPI 换档 / 资源句柄替换）。
+///
+/// **稳态** O(1) 早退条件：树没有「需要解析」标记且窗口 `scale_epoch` 没有变化。
+/// 全树 DFS 只发生在三类低频帧（与 `refresh_text` 的「有脏就全扫」同型）：首帧
+/// （`image_scale_epochs` 无记录）、挂载图片节点 / `set_image_resource` 换句柄、DPI 变化。
+/// 返回尺寸变了的节点数。
+pub(crate) fn refresh_images(app: &mut App, window: WindowId) -> usize {
+    let App {
+        windows,
+        resources,
+        image_scale_epochs,
+        ..
+    } = app;
+    let Some(target) = windows.get_mut(&window) else {
+        return 0;
+    };
+    let scale_epoch = target.scale_epoch();
+    let scale_changed = image_scale_epochs.get(&window).copied() != Some(scale_epoch);
+    // 先取标记：即使没有标记，DPI 变化也必须重解析（内在尺寸 = tile / scale）。
+    let marked = target.tree_mut().take_images_need_refresh();
+    if !marked && !scale_changed {
+        return 0;
+    }
+    image_scale_epochs.insert(window, scale_epoch);
+    let scale = target.scale().factor();
+    target.tree_mut().refresh_image_intrinsics(resources, scale)
+}
+
+/// 释放图片资源并让所有窗口里引用它的图片节点失效重绘（E7）。
+///
+/// 返回 `false` = 资源不存在。**不动布局**：内在尺寸保留（卸载不引起布局跳动），
+/// paint 跳过图元后节点背景 / 透明占位。
+pub(crate) fn unload_resource(app: &mut App, id: crate::resources::ResourceId) -> bool {
+    if !app.resources.unload(id) {
+        return false;
+    }
+    let App { windows, .. } = app;
+    let mut invalidated = 0;
+    for window in windows.values_mut() {
+        invalidated += window.tree_mut().invalidate_images_with_resource(id);
+    }
+    if invalidated > 0 {
+        app.request_frame();
+    }
+    true
+}
+
+/// 关窗释放资源后：让**其它窗口**里引用已释放资源的图片节点失效（E7 悬垂防护）。
+///
+/// 窗口自己的树在关窗时整体丢弃（无悬垂）；这里只处理跨窗口共享句柄的情况。
+/// 返回标脏的节点数（>0 时调用方应请求一帧）。
+pub(crate) fn invalidate_dead_images(app: &mut App) -> usize {
+    let App {
+        windows, resources, ..
+    } = app;
+    let mut invalidated = 0;
+    for window in windows.values_mut() {
+        invalidated += window.tree_mut().invalidate_dead_images(resources);
+    }
+    invalidated
 }
 
 /// 取走已交付的异步解码结果（每项只交付一次；缓冲换空、容量归还）。

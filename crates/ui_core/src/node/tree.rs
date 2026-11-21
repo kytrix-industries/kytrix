@@ -17,6 +17,7 @@
 mod arena;
 mod content;
 mod dirty;
+mod image;
 mod layout;
 #[cfg(test)]
 mod tests;
@@ -43,6 +44,7 @@ use crate::{
         dependency::ReadCtx,
         dirty::{DirtyFlags, DirtySet},
         id::{Arena, NodeId},
+        image::ImageContent,
         signal::SignalId,
     },
     paint::{
@@ -51,6 +53,7 @@ use crate::{
         scene::LaneId,
         style::{Clip, PaintSpec, Style, StylePatch},
     },
+    resources::ResourceId,
     text::{ShapedLine, TextContent},
 };
 
@@ -83,14 +86,23 @@ pub enum NodeKind {
     ///
     /// 在首次 `refresh_text` 之前它的 measure 为 `0×0`（`NodeBuilder::text` 不伪造闭包）。
     Text(Box<TextContent>),
+    /// 图片叶子（E7）：载荷是 [`ImageContent`]（资源 + `fit` + 调制 + 内在尺寸）。
+    ///
+    /// 装箱理由同 `Text`：`ImageContent` 约 40 B，内联会把 `Node` 顶出尺寸预算（≤336 B）。
+    /// 尺寸解析与 measure 安装由 `App::refresh_images` 在布局之前完成 —— 在首次刷新之前
+    /// measure 为 `0×0`（与文本同型：`NodeBuilder::image` 不伪造与资源不一致的尺寸）。
+    Image(Box<ImageContent>),
 }
 
 impl NodeKind {
-    /// 叶子节点（`Canvas`/`Geometry`/`Text`）不布局子节点 —— 消费者：`depends_on_children`、
-    /// `NodeBuilder::build` 的 debug 断言。
+    /// 叶子节点（`Canvas`/`Geometry`/`Text`/`Image`）不布局子节点 —— 消费者：
+    /// `depends_on_children`、`NodeBuilder::build` 的 debug 断言。
     #[must_use]
     pub(crate) fn is_leaf(&self) -> bool {
-        matches!(self, Self::Canvas(_) | Self::Geometry(_) | Self::Text(_))
+        matches!(
+            self,
+            Self::Canvas(_) | Self::Geometry(_) | Self::Text(_) | Self::Image(_)
+        )
     }
 
     /// 静态几何节点（唯一会被 per-draw `Transform` 影响的种类；命中走逆变换）。
@@ -104,6 +116,15 @@ impl NodeKind {
     pub(crate) fn text(&self) -> Option<&TextContent> {
         match self {
             Self::Text(content) => Some(content),
+            _ => None,
+        }
+    }
+
+    /// 图片载荷（E7：paint 分派、`App::refresh_images` 与 a11y 的唯一读入口）。
+    #[must_use]
+    pub(crate) fn image(&self) -> Option<&ImageContent> {
+        match self {
+            Self::Image(content) => Some(content),
             _ => None,
         }
     }
@@ -479,6 +500,11 @@ pub struct NodeTree {
     subtree_bounds: Vec<Rect>,
     /// a11y 载荷旁表（`NodeBuilder::{a11y,bind_a11y}`；按 arena 槽位，槽位复用不继承）。
     a11y_slots: Vec<Option<Box<crate::a11y::tree::NodeA11y>>>,
+    /// 图片节点「需要在布局前重解析内在尺寸」的标记（E7）。
+    ///
+    /// 置位点：图片节点挂载（`arena::insert_child`）、资源句柄替换（`set_image_resource`）。
+    /// 消费点：`App::refresh_images`（`App::frame` 在布局之前取走，未置位时 O(1) 早退）。
+    images_need_refresh: bool,
     /// 动态属性待重算（`BIND`）的节点集合。消费者：`App::refresh_styles`。
     dirty_bind: DirtySet,
     /// 待重排（`LAYOUT`）的节点集合。消费者：`layout_if_dirty` 门禁 + taffy 布局；
@@ -1121,6 +1147,52 @@ impl NodeTree {
         canvas: crate::paint::canvas::Canvas,
     ) -> bool {
         content::set_canvas(self, node, canvas)
+    }
+
+    // ── image（E7）：实现见 `image` 子模块的自由函数 ──
+    /// 取走「图片节点需要在布局前重解析内在尺寸」的标记（`App::refresh_images` 的 O(1) 门禁）。
+    pub(crate) fn take_images_need_refresh(&mut self) -> bool {
+        std::mem::take(&mut self.images_need_refresh)
+    }
+    /// 解析所有图片节点的内在尺寸并安装 measure（返回尺寸真的变了的节点数）。
+    pub(crate) fn refresh_image_intrinsics(
+        &mut self,
+        resources: &crate::resources::ResourceCache,
+        scale: f32,
+    ) -> usize {
+        image::refresh_intrinsics(self, resources, scale)
+    }
+    /// 把异步解码交付的 `Ready` 结果写回图片节点（返回改写的节点数）。
+    pub(crate) fn resolve_pending_images(
+        &mut self,
+        resolved: &ahash::HashMap<
+            crate::resources::PendingResource,
+            crate::resources::ResourceImage,
+        >,
+        scale: f32,
+    ) -> usize {
+        image::resolve_pending(self, resolved, scale)
+    }
+    /// 标记所有引用 `resource` 的图片节点重绘（资源释放后的失效入口）。
+    pub(crate) fn invalidate_images_with_resource(&mut self, resource: ResourceId) -> usize {
+        image::invalidate_with_resource(self, resource)
+    }
+    /// 标记所有引用「已不在缓存里」的资源的图片节点重绘（关窗释放后的悬垂防护）。
+    pub(crate) fn invalidate_dead_images(
+        &mut self,
+        resources: &crate::resources::ResourceCache,
+    ) -> usize {
+        image::invalidate_dead(self, resources)
+    }
+    /// 替换图片节点的资源句柄（E7：DPI 换档 / 换图的引擎实现，公开入口是
+    /// `Window::set_image_resource`；与 `set_canvas` 同型）。
+    ///
+    /// 只改载荷并标该节点 `LAYOUT | PAINT`（尺寸可能变）：新资源的内在尺寸由**下一次**
+    /// `App::refresh_images` 在布局之前重解析。帧外（非 `on_frame` 钩子）调用后需配
+    /// [`App::request_repaint`](crate::app::App::request_repaint) 才会出帧，见
+    /// `Window::set_image_resource` 的文档。返回 `false` = 节点不是图片节点。
+    pub(crate) fn set_image_resource(&mut self, node: NodeId, resource: ResourceId) -> bool {
+        image::set_resource(self, node, resource)
     }
 
     pub(crate) fn set_text_content(&mut self, node: NodeId, content: TextContent) -> bool {

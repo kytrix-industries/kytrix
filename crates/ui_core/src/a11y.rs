@@ -727,6 +727,8 @@ pub enum A11yDrawKind {
     Canvas,
     /// `NodeKind::Geometry`。
     Geometry,
+    /// `NodeKind::Image`（E7：图片节点没有 alt 时按装饰图处理）。
+    Image,
 }
 
 /// a11y 诊断（结构化字段；对齐 `text::TextDiagnostic::FontStackMiss` 的形态）。

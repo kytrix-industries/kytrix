@@ -1614,7 +1614,17 @@ fn text_caret_rect_includes_border_padding_and_node_origin() {
 fn close_window_forgets_the_scale_epoch() {
     let (_rt, mut app, window, _node) = text_app("x", None);
     let _ = refresh(&mut app, window);
+    // 首帧的 `refresh_images` 会为窗口登记图片 scale epoch（E7 旁表）。
+    let _ = app.frame(window).expect("窗口存在").expect("帧成功");
+    assert!(
+        app.image_scale_epochs.contains_key(&window),
+        "首帧必须登记图片 scale epoch（否则下面的清理断言是空断言）"
+    );
     assert!(app.close_window(window));
+    assert!(
+        !app.image_scale_epochs.contains_key(&window),
+        "关窗必须清 image_scale_epochs（create/close 循环下否则无界增长）"
+    );
     assert!(!app.close_window(window), "second close is a no-op");
 }
 

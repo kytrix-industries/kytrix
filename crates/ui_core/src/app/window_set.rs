@@ -314,6 +314,7 @@ pub(crate) fn close_window(app: &mut App, id: WindowId) -> bool {
     app.close_handlers.remove(&id);
     app.a11y_delivered.remove(&id);
     app.scale_epochs.remove(&id);
+    app.image_scale_epochs.remove(&id);
     // E1b：焦点窗口记录不能指向已关闭的窗口；`default_text_scale` 保留最后值
     //（「无窗口时保持上次值」）。
     if app.focused_window == Some(id) {
@@ -350,6 +351,12 @@ pub(crate) fn close_window(app: &mut App, id: WindowId) -> bool {
     // 窗口没了，它名下（`insert_owned`）的图片引用也必须归还：tile 恒有效契约的对偶面。
     // 放在窗口移除**之后**，重复 close（窗口已不存在）会提前 return false，不会误释放。
     app.resources.release_window(id);
+    // E7：释放的 tile 可能被**其它窗口**的图片节点引用（跨窗口共享句柄）。那些窗口的
+    // paint lane 里还烘焙着旧 tile，必须当帧失效 —— 否则会把已回收（可能已被别的图复用）
+    // 的图继续画出来。冷路径（关窗）做一次全窗扫描是可接受的。
+    if super::resources::invalidate_dead_images(app) > 0 {
+        app.request_frame();
+    }
     // 关窗是冷路径：一次 DFS 收集句柄（不再有全序数组可借）。
     let nodes = window.tree().dfs_ids();
     for node in nodes {

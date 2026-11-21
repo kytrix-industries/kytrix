@@ -974,6 +974,33 @@ impl Window {
         Ok(self.tree.set_canvas(node, canvas))
     }
 
+    /// 替换图片节点的资源句柄（E7：DPI 换档 / 换图）。
+    ///
+    /// # 语义
+    /// - 只接受 `NodeKind::Image` 节点：节点不存在 ⇒ [`EngineError::StaleNode`]；节点存在但
+    ///   不是图片 ⇒ `Ok(false)`（不改变任何状态）。
+    /// - 只改载荷并标该节点 `LAYOUT | PAINT`：新资源的内在尺寸在**下一次** `App::frame` 的
+    ///   布局前重解析（尺寸可能变）。资源缺失时保留旧内在尺寸（布局不跳），绘制跳过图元
+    ///   （占位 = 节点背景 / 透明）。
+    /// - `AtlasTile` 的生命周期与 [`Self::set_canvas`] 同：引擎不保留/延长旧 tile、也不自动
+    ///   `unload` 旧资源；应用负责对不再引用的资源调用 `App::unload_resource`。
+    /// - 本方法**不请求帧**（Window 无平台唤醒能力）：在 `on_frame` 钩子里调用时本帧稍后就会
+    ///   重排重绘；其它时机（如 `AppHandle` 回投后）需随后调用
+    ///   [`App::request_repaint`](crate::app::App::request_repaint) 或等下一次帧。
+    ///
+    /// # Errors
+    /// [`EngineError::StaleNode`]：节点不存在 / 已卸载。
+    pub fn set_image_resource(
+        &mut self,
+        node: NodeId,
+        resource: crate::resources::ResourceId,
+    ) -> Result<bool, EngineError> {
+        if self.tree.get(node).is_err() {
+            return Err(EngineError::StaleNode { node });
+        }
+        Ok(self.tree.set_image_resource(node, resource))
+    }
+
     /// 指针状态（crate 私有：`App::dispatch_input` 与平台泵是唯一读者）。
     pub(crate) fn pointer(&self) -> &PointerState {
         &self.pointer
