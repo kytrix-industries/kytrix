@@ -99,8 +99,8 @@ pub(crate) fn release_scope(app: &mut App, scope: SignalScope) -> usize {
     };
     let released = signals.len();
     if !signals.is_empty() {
-        app.animations
-            .retain(|slot| !slot.target.targets_any(&signals));
+        // E10：取消槽 + 为公开动画入队 `Released` 完成事件（滚动槽不产生公开事件）。
+        super::animation::release_scope_animations(app, &signals);
     }
     for signal in signals {
         // 立即删边（不是"等下次写时惰性清理"）：释放的价值就是之后的写不再遍历任何 owner。

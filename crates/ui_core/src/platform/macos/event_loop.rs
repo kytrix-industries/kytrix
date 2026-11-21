@@ -593,6 +593,9 @@ fn pump(state: &mut LoopState, tick: bool) -> Result<(), EngineError> {
         native.set_animating(
             app.needs_continuous_frames() || app.has_deferred_frames() || app.a11y_retry_pending(),
         );
+        // E10：一次性定时器（`App::after`）—— 独立的一次性 run loop 定时器，等待期间不产生
+        // 连续帧；必须在 ⑤ 任务之后对账，任务里注册的定时器才能在同一轮挂表。
+        native.set_wake_deadline(app.next_wake_deadline());
     }
 
     // R09-16：退出握手。Dock 退出 / osascript / Cmd+Q 都汇到 `applicationShouldTerminate:`，

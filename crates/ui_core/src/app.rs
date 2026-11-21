@@ -22,6 +22,7 @@ mod scroll;
 mod signal_api;
 mod style_pass;
 mod text_pass;
+mod timer;
 mod virtual_list;
 mod window_set;
 
@@ -242,6 +243,20 @@ pub struct App {
     animations: Vec<AnimationSlot>,
     /// 下一个动画 id（单调；`AnimationId` 的代际）。
     next_animation: u32,
+    /// 动画终止事件的待派发队列（自然完成 / 取消 / 替换 / 目标释放；E10）。
+    ///
+    /// 事件在**产生它的那一帧内**（自然完成：tick 之后、样式/布局/绘制之前）或**下一帧入口**
+    /// （帧外产生的取消 / 替换 / 释放 / 0 ms 动画）派发 —— 见 [`App::on_animation_complete`]
+    /// 的时序契约。
+    animation_completions: std::collections::VecDeque<AnimationCompletion>,
+    /// 应用注册的动画完成回调（单槽：重复注册替换上一个，与 [`App::on_frame`] 同口径）。
+    animation_complete_handler: Option<Box<dyn FnMut(&mut App, AnimationCompletion)>>,
+    /// 正在派发完成事件：回调里再次取消 / 注册动画时，事件排队等外层循环派发（不重入）。
+    dispatching_animation_completions: bool,
+    /// 一次性定时器表（`App::after` / `App::after_scoped`；按注册顺序，id 单调）。
+    timers: Vec<timer::TimerEntry>,
+    /// 下一个定时器 id（单调；`TimerId` 的代际）。
+    next_timer: u32,
     /// 待推给平台的光标变化（`None` = 没变）。
     /// 待推给平台的**光标变化**（带窗口 id：光标是每窗口状态，P2 复审）。
     cursor_pending: Option<(WindowId, Cursor)>,
@@ -382,6 +397,59 @@ impl AnimationTarget {
             Self::Color { transient, .. } => ids.contains(&transient.id()),
             Self::Scroll { .. } => false,
         }
+    }
+}
+
+/// 动画终止原因（[`AnimationCompletion`] 的载荷；E10）。
+///
+/// 只描述**这次注册的动画**为什么结束；应用可据此区分「正常收尾」与「被中止」，不需要轮询
+/// `App::animations_running`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AnimationEndKind {
+    /// 到达终值：`t >= 1.0`（终值已写入目标 `Transient`）或 0 时长动画的立即到位。
+    ///
+    /// **只有**这一种是「完成」；取消 / 替换 / 目标释放是另外三种（见 [`App::on_animation_complete`]）。
+    Finished,
+    /// 被 [`App::cancel_animation`] 取消（终值**没有**写入）。
+    Cancelled,
+    /// 同一目标上注册了新动画，旧槽被替换（新动画继续驱动同一个值）。
+    Replaced,
+    /// 驱动值所属作用域被释放（`App::release_scope`）—— 目标已回收，旧槽同批取消。
+    Released,
+}
+
+/// 一次动画终止事件（[`App::on_animation_complete`] 的载荷；E10）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AnimationCompletion {
+    /// 结束的动画句柄（`App::animate` 的返回值；`AnimationId` 带窗口身份）。
+    pub id: AnimationId,
+    /// 终止原因。
+    pub kind: AnimationEndKind,
+}
+
+/// 一次性定时器句柄（`Copy`；`(window, generation)` 唯一，取消 / 到期后旧句柄失效）。
+///
+/// 由 [`App::after`] / [`App::after_scoped`] 铸造，[`App::cancel_timer`] 消费。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TimerId {
+    window: WindowId,
+    /// 单调代际（`App::cancel_timer` 只认这一对 `(window, generation)`）。
+    generation: u32,
+}
+
+impl TimerId {
+    pub(crate) fn new(window: WindowId, generation: u32) -> Self {
+        Self { window, generation }
+    }
+
+    /// 所属窗口。
+    #[must_use]
+    pub fn window(&self) -> WindowId {
+        self.window
+    }
+
+    pub(crate) fn generation(&self) -> u32 {
+        self.generation
     }
 }
 
@@ -547,6 +615,11 @@ impl App {
             last_click: None,
             animations: Vec::new(),
             next_animation: 1,
+            animation_completions: std::collections::VecDeque::new(),
+            animation_complete_handler: None,
+            dispatching_animation_completions: false,
+            timers: Vec::new(),
+            next_timer: 1,
             cursor_pending: None,
             capture_requests: ahash::HashMap::default(),
             ime_disabled: ahash::HashSet::default(),
@@ -574,7 +647,13 @@ impl App {
     ///
     /// D-6 起钩子之前先轮询一次异步解码结果（`App::poll_resources`）：平台泵每轮都会调用本函数，
     /// 因此解码完成（工作线程已 `Dispatcher::wake`）后，结果会在这一轮交付并请求一帧。
+    ///
+    /// **E10**：在应用钩子之前先派发两类引擎事件 —— 已到期的**一次性定时器**与上一轮之后产生的
+    /// **动画终止事件**。顺序保证应用钩子（`App::on_frame`）在同一轮就能看到定时器 / 完成回调
+    /// 造成的新状态；钩子仍然是「平台事件已落地、提交本帧之前」的唯一应用同步点。
     pub(crate) fn run_frame_hook(&mut self) {
+        timer::run_due(self);
+        animation::dispatch_completions(self);
         resources::run_frame_hook(self)
     }
 
@@ -1912,6 +1991,133 @@ impl App {
         animation::animate(self, window, value, nodes, spec)
     }
 
+    /// 注册**动画完成回调**（E10）：动画到达终值 / 被取消 / 被替换 / 目标作用域释放时通知。
+    ///
+    /// 单槽：重复注册替换上一个（与 [`App::on_frame`] 同口径）；不需要时注册一个空闭包即可。
+    /// 回调形态是 `FnMut(&mut App, AnimationCompletion)`：可以读 / 写状态、建树、再注册动画
+    /// （回调里产生的新的取消 / 替换事件排队到本轮派发末尾，不会重入）。
+    ///
+    /// # 时序契约（与 [`App::on_frame`] 的关系）
+    ///
+    /// 1. **自然完成**（[`AnimationEndKind::Finished`]）：在**产生终值的那一帧内**派发 ——
+    ///    `tick_animations` 写入终值、标记 `BIND | PAINT` 之后，样式 / 布局 / 绘制之前。
+    ///    因此回调里做的收尾（卸载节点 / 关浮层）**参与本帧绘制**；回调里改状态触发的重绘
+    ///    由应用按常规方式请求（`App::write` 自动请求）或由下一轮补上。
+    /// 2. **帧外终止**（[`AnimationEndKind::Cancelled`] / [`AnimationEndKind::Replaced`] /
+    ///    [`AnimationEndKind::Released`] / 0 ms 动画的 `Finished`）：在**下一帧入口**（或平台泵
+    ///    下一轮的钩子步骤）派发 —— 调用点只入队 + 唤醒泵一次（`Dispatcher::wake`，**不请求
+    ///    帧**，I3）；因此应用最迟在「下一帧开始前」观测到。
+    /// 3. **与 `on_frame` 的关系**：`on_frame` 钩子在帧**之前**运行，看不到本帧刚写入的终值。
+    ///    引擎在动画自然完成时唤醒泵一次（不提交空帧），保证**下一轮钩子**一定能看到终值 ——
+    ///    这是给「只在钩子里同步状态」的应用的兜底，不需要轮询 `App::animations_running`。
+    /// 4. 取消 / 替换**不**派发 `Finished`：只有真正到达终值的动画报告 `Finished`。
+    ///
+    /// 回调在 UI 线程（持有 `&mut App`）内运行；不得在回调里再次调用 `Application::run` /
+    /// 嵌套帧循环（与 `on_frame` 同一约束）。
+    pub fn on_animation_complete(
+        &mut self,
+        handler: impl FnMut(&mut App, AnimationCompletion) + 'static,
+    ) {
+        self.animation_complete_handler = Some(Box::new(handler));
+    }
+
+    /// 注册一个**一次性定时器**（E10）：`delay` 之后（引擎时钟）在 UI 线程回调一次。
+    ///
+    /// 定时器归属 `window`：窗口关闭时自动取消（不会在关窗后再跑应用闭包）。到期前**不请求帧、
+    /// 不让平台进入连续帧**（I3）；平台泵把阻塞等待截止到 `App::next_wake_deadline()` 并在到点
+    /// 唤醒**一次**。派发点 = 平台泵每轮的钩子步骤（`App::run_frame_hook`）或 `App::frame` 入口，
+    /// 因此回调最迟在到期后的**下一个引擎轮次**运行（不会早于 `delay`）。
+    ///
+    /// 不新建线程：复用平台泵已有的定时器（Windows `SetTimer` / macOS `CFRunLoopTimer` /
+    /// Linux calloop timeout）与引擎时钟；`App` 的 tokio runtime 不参与。
+    ///
+    /// 组件生命周期建议用 [`App::after_scoped`]（节点卸载自动取消）；显式取消用
+    /// [`App::cancel_timer`]（幂等）。
+    ///
+    /// # Errors
+    /// [`EngineError::UnknownWindow`]：窗口不存在（关窗后再注册的定时器没有派发轮次）。
+    pub fn after(
+        &mut self,
+        window: WindowId,
+        delay: Duration,
+        callback: impl FnOnce(&mut App) + 'static,
+    ) -> Result<TimerId, EngineError> {
+        timer::after(self, window, None, delay, callback)
+    }
+
+    /// 注册一个**节点作用域**的一次性定时器（E8 scoped 语义）：窗口关闭或 `scope` 子树被卸载
+    /// （`App::remove_node`）时自动取消。
+    ///
+    /// `scope` 可以是组件自己的任何存活节点（通常是面板根 / 触发器）；注册期校验窗口与节点
+    /// 归属（[`EngineError::UnknownWindow`] / [`EngineError::StaleNode`]），与
+    /// [`App::bind_key_scoped`] 同口径。
+    ///
+    /// 其余语义与 [`App::after`] 完全相同。
+    ///
+    /// # Errors
+    /// 同 [`App::after`]。
+    pub fn after_scoped(
+        &mut self,
+        window: WindowId,
+        scope: NodeId,
+        delay: Duration,
+        callback: impl FnOnce(&mut App) + 'static,
+    ) -> Result<TimerId, EngineError> {
+        timer::after(self, window, Some(scope), delay, callback)
+    }
+
+    /// 取消一个一次性定时器（幂等）。返回 `false` = 已到期派发 / 已取消 / 窗口已关闭。
+    pub fn cancel_timer(&mut self, id: &TimerId) -> bool {
+        timer::cancel(self, id)
+    }
+
+    /// 最近一个一次性定时器的到期时刻（平台泵的阻塞等待截止时刻；E10）。
+    ///
+    /// 消费者：三端事件循环（Windows 一次性 `SetTimer` / macOS 一次性 `CFRunLoopTimer` /
+    /// Linux calloop timeout）。`None` = 没有待派发定时器 —— 平台保持原有空闲阻塞（I3）。
+    /// Linux 的实现同时并入「被帧预算门禁推迟的帧」的到期时刻（`Window::frame_budget_deadline`）。
+    pub(crate) fn next_wake_deadline(&self) -> Option<Instant> {
+        #[cfg(target_os = "linux")]
+        {
+            let frames = self
+                .windows()
+                .filter_map(|(_, window)| window.frame_budget_deadline())
+                .min();
+            match (timer::next_deadline(self), frames) {
+                (Some(timer), Some(frame)) => Some(timer.min(frame)),
+                (Some(timer), None) => Some(timer),
+                (None, Some(frame)) => Some(frame),
+                (None, None) => None,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            timer::next_deadline(self)
+        }
+    }
+
+    /// 仅测试：待派发定时器条数（泄漏 / 清理的证据面）。
+    #[cfg(all(test, feature = "test-support"))]
+    #[must_use]
+    pub(crate) fn timer_count_for_test(&self) -> usize {
+        timer::count(self)
+    }
+
+    /// 仅测试：取走平台泵的「有一帧要画」唤醒位（E10 完成唤醒 / 定时器唤醒的证据面）。
+    ///
+    /// 取走即清零，测试应在需要模拟「泵消费一次唤醒」的位置调用。
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn take_pump_wake_for_test(&self) -> bool {
+        self.dispatcher.take_frame_wake()
+    }
+
+    /// 仅测试：待派发的动画终止事件条数。
+    #[cfg(all(test, feature = "test-support"))]
+    #[must_use]
+    pub(crate) fn pending_animation_completions_for_test(&self) -> usize {
+        self.animation_completions.len()
+    }
+
     /// 取消动画（幂等）。
     pub fn cancel_animation(&mut self, id: &AnimationId) -> bool {
         animation::cancel_animation(self, id)
@@ -1938,19 +2144,11 @@ impl App {
     /// 是否有窗口的帧请求正被预算门禁推迟（A5）：平台据此挂一次性唤醒。
     ///
     /// 消费者：Windows 泵 / macOS 泵（按刷新率挂一次性定时器）；Linux 的补帧走
-    /// `next_deferred_deadline` + calloop timeout，不需要这个布尔查询。
+    /// `next_wake_deadline` + calloop timeout，不需要这个布尔查询。
     #[cfg(any(windows, target_os = "macos"))]
     pub(crate) fn has_deferred_frames(&self) -> bool {
         self.windows()
             .any(|(_, window)| window.frame_budget_deferred())
-    }
-
-    /// 所有被推迟帧里最早的放行时刻（A5）：Linux calloop timeout 的到期时刻。
-    #[cfg(target_os = "linux")]
-    pub(crate) fn next_deferred_deadline(&self) -> Option<Instant> {
-        self.windows()
-            .filter_map(|(_, window)| window.frame_budget_deadline())
-            .min()
     }
 
     fn mark_nodes_paint(&mut self, window: WindowId, nodes: &[NodeId]) {
@@ -2769,3 +2967,11 @@ mod image_tests;
 /// （`App::transient_scoped`）的引擎级用例。
 #[cfg(test)]
 mod scoped_tests;
+
+/// E10：动画完成回调 + 一次性定时器的引擎级用例。
+///
+/// 断言面走 `test_support`（`TestApp` 的帧记录 / 探针），并且用「钩子 → 帧」的真实泵序推进
+/// （`App::run_frame_hook` 在 `TestApp::advance` 之后手动调用）—— 这正是 P2-4b 审查 R01/R02
+/// 缺失的时序面。
+#[cfg(all(test, feature = "test-support"))]
+mod e10_tests;

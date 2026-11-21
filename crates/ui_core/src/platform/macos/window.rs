@@ -76,6 +76,7 @@ use std::{
     cell::{Cell, RefCell},
     rc::Rc,
     sync::Arc,
+    time::Instant,
 };
 
 use objc2::{
@@ -1338,6 +1339,14 @@ impl NativeWindow {
     pub(crate) fn set_animating(&self, active: bool) {
         let refresh = self.maximum_frames_per_second().max(1.0);
         wake::set_animating(active, f64::from(1.0 / refresh));
+    }
+
+    /// 一次性定时器的截止时刻（E10；`None` = 没有待派发定时器）。
+    ///
+    /// 与 [`Self::set_animating`] 独立的 **one-shot** run loop 定时器：等待期间不进入连续帧
+    /// 模式（I3），到点只唤醒一次泵；到期派发走应用钩子步骤（`App::run_frame_hook`）。
+    pub(crate) fn set_wake_deadline(&self, deadline: Option<Instant>) {
+        wake::set_deadline(deadline);
     }
 }
 
