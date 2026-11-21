@@ -104,6 +104,10 @@ pub struct StylePassReport {
 ///
 /// 只做**诊断 / 断言**用：计数描述「引擎替应用清掉了什么」，不是业务状态。没有可清理的条目
 /// 时为零（例如叶子节点没有任何 scoped 绑定 / 定时器 / 动画）。
+///
+/// **计数口径不同**：`scoped_key_bindings` / `timers` 按「作用域已不在树里」判定（会把其它
+/// 路径遗留的死作用域一并收口，不能归属到本次删除）；`animations` 只按本次 `removed` 集合
+/// 归属（共享动画保留）；`released_values` 来自显式作用域释放。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RemoveOutcome {
     /// 被卸载的节点数（含整棵子树）。
@@ -1871,6 +1875,15 @@ impl App {
 
     /// 让一个滚动容器变成虚拟列表（要求 `Clip::Bounds` + `position: relative`）。
     ///
+    /// # 行生命周期（应用契约）
+    ///
+    /// 已挂载的行**只能由引擎回收**：滚动 / 视口变化（`rewindow_virtual`）与
+    /// [`App::set_virtual_items`] 负责挂载 / 回收，行上的 scoped 键绑定、`after_scoped` 定时器
+    /// 与动画槽随回收一并清理。应用**不得**对已挂载行调用 [`App::remove_node`] —— 容器的
+    /// `mounted` 索引不会随之更新，该条目此后永不再挂载（视觉空洞）。需要删除条目时改数据源
+    /// 后调用 [`App::set_virtual_items`]；删除容器本身可以用 [`App::remove_node`]（行随容器
+    /// 一起消失）。
+    ///
     /// # Errors
     /// `StaleNode` / `NotVirtualList` / `InvalidVirtualExtent`（预置行高非法）。
     pub fn make_virtual_list(
@@ -2008,25 +2021,30 @@ impl App {
     /// # 清理顺序（不可交换）
     ///
     /// 1. 校验窗口与节点 —— **错误路径不产生任何副作用**；
-    /// 2. 记取浮层 opener / 模态状态与「捕获目标落在子树内」的指针会话，必要时先收尾
-    ///    （派发 `PointerCancel`、请求平台释放捕获、清按压 / 拖拽 / 悬停）；
-    /// 3. `NodeTree::remove`（结构 + lane 回收 + 容器登记 + damage），逐条 detach 被删节点的
+    /// 2. 记取浮层 opener / 模态状态，并收尾「捕获目标落在子树内」的指针会话（派发
+    ///    `PointerCancel`、请求平台释放捕获、清按压 / 拖拽 / 悬停）；
+    /// 3. 记取**悬停链**（必须删树前完成：删后 `update_hover` 的 `previous` 会把死节点过滤成
+    ///    「无悬停」，补调 `revalidate_hover` 派生不出 leave 事件）；
+    /// 4. `NodeTree::remove`（结构 + lane 回收 + 容器登记 + damage），逐条 detach 被删节点的
     ///    信号依赖边；
-    /// 4. **scoped 键绑定**（[`App::bind_key_scoped`]）：`scope` 落在被卸载子树内的条目删除，
+    /// 5. **指针状态收尾**：落在被删集合里的悬停 / 按压 / 待定拖拽 / 最近命中清掉；悬停链被
+    ///    卸载时派生 [`Event::HoverChanged`]（`hovered: None`，`left` 是删前链由内到外）并把
+    ///    光标复位为默认 —— 应用侧的 tooltip / `:hover` 不得残留到下一次指针移动；
+    /// 6. **scoped 键绑定**（[`App::bind_key_scoped`]）：`scope` 落在被卸载子树内的条目删除，
     ///    祖先 scope 的绑定保留；
-    /// 5. **`after_scoped` 定时器**（[`App::after_scoped`]）：`scope` 落在被卸载子树内的条目取消，
+    /// 7. **`after_scoped` 定时器**（[`App::after_scoped`]）：`scope` 落在被卸载子树内的条目取消，
     ///    未派发的回调不会再跑在「组件已不存在」的状态上；
-    /// 6. **动画槽**（[`App::animate`]）：重绘节点**全部**落在被卸载子树内、或滚动动画的
+    /// 8. **动画槽**（[`App::animate`]）：重绘节点**全部**落在被卸载子树内、或滚动动画的
     ///    `ScrollHandle` 节点被卸载的槽取消，并按 [`AnimationEndKind::Removed`] 入队完成事件；
     ///    部分重绘节点存活的槽保留并剔除死节点（共享动画不被误杀）；
-    /// 7. 模态浮层关闭的 a11y 背景语义恢复 + 焦点还给 opener（与 `App::close_overlay` 同路径）；
-    /// 8. 若由 [`App::remove_node_with_scope`] 调用，在节点已卸载之后 `release_scope`：其瞬态值
-    ///    被回收，引用它们的动画同批取消（[`AnimationEndKind::Released`]）；
-    /// 9. 请求一帧（卸载改变了像素；帧内卸载不重复唤醒 —— 本帧管线会消费脏位）。
+    /// 9. 模态浮层关闭的 a11y 背景语义恢复 + 焦点还给 opener（与 `App::close_overlay` 同路径）；
+    /// 10. 若由 [`App::remove_node_with_scope`] 调用，在节点已卸载之后 `release_scope`：其瞬态值
+    ///     被回收，引用它们的动画同批取消（[`AnimationEndKind::Released`]）；
+    /// 11. 请求一帧（卸载改变了像素；`App::request_frame` 是合并位，重复请求无副作用）。
     ///
-    /// 顺序不可交换：先卸载节点再释放作用域，`bind_style` / `bind_text` / `bind_a11y` 闭包
-    /// 才不会被求值到已回收的句柄上（E8 组件契约）；作用域释放放在动画清理之后，保证同一个
-    /// 动画槽只被一条路径取消 / 计数。
+    /// 顺序不可交换：先卸载节点再释放作用域，保证释放发生时节点已不在树里、且同一动画槽只会
+    /// 被一条路径取消 / 计数（`remove` 内部不求值任何 `bind_*` 闭包；真正的保证是「释放后不在
+    /// 同一次调用内留下可能被求值的闭包窗口」）。
     ///
     /// # 不清理的部分（应用义务，最小安全边界）
     ///
@@ -2034,9 +2052,22 @@ impl App {
     ///   组件 / 窗口共享，引擎无法把它归属到一棵子树。自动摘除会静默破坏其它存活组件，因此
     ///   仍由调用方 [`App::off_action`]；
     /// - **全局键绑定**（[`App::bind_key`]）：同理，按 `(key, modifiers)` 全局索引；
+    /// - **a11y Action handler**（[`App::on_a11y_action`]）：与 `on_action` 同构，按
+    ///   `A11yAction` 全局索引（同一动作可被多个组件共享），同样不会被自动摘除；组件卸载后
+    ///   需要调用方 [`App::off_a11y_action`]；
     /// - **`SignalScope`**：节点的生命周期与信号作用域是两套正交句柄（E8）。`remove_node`
     ///   不释放作用域；需要一次调用完成「卸载 + 回收」时用
     ///   [`App::remove_node_with_scope`]，或随后自行 [`App::release_scope`]（幂等）。
+    ///
+    /// # 虚拟列表行（应用契约）
+    ///
+    /// **已挂载的虚拟行只能由引擎回收**（`App::set_virtual_items` 与滚动回收，见
+    /// [`App::make_virtual_list`]）。对已挂载行调用本方法会把它从树里删掉，但容器的
+    /// `NodeId → 条目下标` 索引（`App::virtual_list_state` 的 `mounted`）不会更新 —— 该条目
+    /// 此后**永不再挂载**（视觉空洞），`App::virtual_row_index` 也仍把死句柄当作已挂载。删除
+    /// 条目请改数据源后调用 `App::set_virtual_items`；删除容器本身不受此限制（行随容器一起
+    /// 消失）。debug 构建里本方法对「删除已挂载行」直接 `debug_assert` 失败（release 下只靠
+    /// 文档：引擎看不到应用意图）。
     ///
     /// # 语义
     ///
@@ -2047,7 +2078,7 @@ impl App {
     /// - **root 不可删除**（[`EngineError::StaleNode`]）；
     /// - 跨窗口句柄返回 [`EngineError::StaleNode`]，不会触碰其真正宿主窗口；
     /// - **I3**：取消定时器 / 动画不请求帧、不让平台进入连续帧；`animations_running` 随动画
-    ///   取消回落。只有第 9 步的「树变了要重画」会请求**一帧**。
+    ///   取消回落。只有第 11 步的「树变了要重画」会请求**一帧**。
     ///
     /// # Errors
     ///
@@ -2066,15 +2097,30 @@ impl App {
     /// （= [`App::remove_node`] + [`App::release_scope`] 的同调用组合）。
     ///
     /// 适用于「一个组件 = 一棵子树 + 一个 `SignalScope`」的常规形态：先卸节点、再回收作用域值
-    /// 的顺序由引擎保证（`bind_*` 闭包不会被求值到已回收的句柄）。作用域里的瞬态值被回收时，
-    /// 引用它们的动画槽同批取消（[`AnimationEndKind::Released`]），计入返回值的 `animations`。
+    /// 的顺序由引擎保证（`bind_*` 闭包不会在本调用内被求值到已回收的句柄）。作用域里的瞬态值
+    /// 被回收时，引用它们的动画槽同批取消（[`AnimationEndKind::Released`]），计入返回值的
+    /// `animations`。
     ///
-    /// `scope` 已释放时按幂等处理（`released_values == 0`），节点删除照常完成；错误面与
-    /// [`App::remove_node`] 相同，**错误发生在任何清理之前**，`scope` 不会被提前释放。
+    /// # 契约：`scope` 必须属于该子树
+    ///
+    /// `SignalScope` 与 `NodeId` 是两套**正交**句柄（E8 设计），引擎没有
+    /// `NodeId → SignalScope` 映射，因此无法完整校验归属；但引擎会拒绝**可证明的错配**：
+    ///
+    /// - **子树之外仍有存活读者**（依赖图里该作用域的存活信号被子树外的节点读取，依赖边来自
+    ///   已求值的 `bind_*`）⇒ [`EngineError::ScopeOwnershipMismatch`]：释放必然打断那个存活
+    ///   绑定，因此在任何副作用之前失败 —— 节点**不会**被卸载，作用域**不会**被释放；
+    /// - 传入**已释放**的作用域：幂等（`released_values == 0`），节点删除照常完成；
+    /// - 传入**没有存活读者**（或读者全在被删子树内）的错配作用域：引擎无法识别 —— 它的值会
+    ///   被真实释放（不可恢复，`released_values > 0`），引用这些值的存活组件随后读信号会
+    ///   确定性 panic。调用方必须保证 `scope` 正是该子树所属组件的作用域；不确定时请改用
+    ///   [`App::remove_node`] + 显式 [`App::release_scope`]，把两件事分开写。
     ///
     /// # Errors
     ///
-    /// 同 [`App::remove_node`]。
+    /// 同 [`App::remove_node`]，另有：
+    /// - [`EngineError::ScopeOwnershipMismatch`]：`scope` 的存活信号被子树之外的节点读取
+    ///   （可证明的错配）。**错误发生在任何清理之前**，节点与作用域都保持原状。
+    #[must_use = "scope 错配会不可恢复地释放其它组件的值（引擎只能拒绝可证明的错配），必须检查返回的 RemoveOutcome"]
     pub fn remove_node_with_scope(
         &mut self,
         window: WindowId,

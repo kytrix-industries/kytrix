@@ -57,11 +57,6 @@ impl FrameScheduler {
         }
     }
 
-    /// 是否空闲（没有待办 / 进行中的帧）。消费者：`Window::frame_idle`。
-    pub(crate) fn is_idle(&self) -> bool {
-        self.state.get() == FrameState::Idle
-    }
-
     /// `Pending → Draining`；不在 `Pending` 时返回 `None`（调用方须先 `request_frame`）。
     pub(crate) fn begin(&mut self) -> Option<FrameTicket> {
         if self.state.get() == FrameState::Pending {

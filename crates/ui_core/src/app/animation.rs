@@ -1,11 +1,12 @@
 //! 动画槽与引擎时钟：注册 / 推进 / 取消 / 完成通知，以及「是否需要持续出帧」。
 //!
-//! `app.rs` 的 `impl App` 只保留同名薄委托，方法体在这里（零行为变更的纯拆分）。
+//! `app.rs` 的 `impl App` 只保留同名薄委托，方法体在这里（拆分；E16 起本模块还承担
+//! 「节点子树卸载 ⇒ 动画槽按归属取消」的判据，见 [`cancel_node_animations`]）。
 //!
-//! **E10 完成通知**：每次 `App::animate` 的动画终止（到达终值 / 取消 / 替换 / 目标作用域释放）
-//! 都会入队一条 [`AnimationCompletion`]，由 [`dispatch_completions`] 在「产生它的那一帧内」
-//! （自然完成）或「下一帧入口」（帧外终止）派发给 [`App::on_animation_complete`] 注册的回调；
-//! 自然完成同时 `Dispatcher::wake` 一次，让**下一轮 `on_frame` 钩子**一定能看到终值。
+//! **E10 完成通知**：每次 `App::animate` 的动画终止（到达终值 / 取消 / 替换 / 目标作用域释放 /
+//! 节点子树卸载）都会入队一条 [`AnimationCompletion`]，由 [`dispatch_completions`] 在「产生它的
+//! 那一帧内」（自然完成）或「下一帧入口」（帧外终止）派发给 [`App::on_animation_complete`]
+//! 注册的回调；自然完成同时 `Dispatcher::wake` 一次，让**下一轮 `on_frame` 钩子**一定能看到终值。
 
 #[cfg(any(test, feature = "test-support"))]
 use std::time::Duration;

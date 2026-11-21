@@ -970,7 +970,13 @@ pub(crate) fn cancel_pointer_session(app: &mut App, window: WindowId) {
 // ── 悬停（R02-4） ──────────────────────────────────────────────────────────
 
 /// 从 `node` 到根的祖先链（由外到内）。悬停链就是 CSS `:hover` 的作用集合。
-fn hover_chain(tree: &crate::node::tree::NodeTree, node: Option<NodeId>) -> SmallVec<[NodeId; 8]> {
+///
+/// 消费者：`update_hover`、`revalidate_hover`、`window_set::remove`（子树卸载前记取悬停链；
+/// 见 [`cleanup_removed_pointer_state`]）。
+pub(crate) fn hover_chain(
+    tree: &crate::node::tree::NodeTree,
+    node: Option<NodeId>,
+) -> SmallVec<[NodeId; 8]> {
     let mut chain = SmallVec::new();
     let mut cursor = node;
     while let Some(current) = cursor {
@@ -1070,6 +1076,83 @@ pub(crate) fn revalidate_hover(app: &mut App, window: WindowId) {
         .get(&window)
         .and_then(|target| target.pointer().hovered);
     update_hover(app, window, next);
+}
+
+/// 子树卸载后的指针会话收尾（E16b / F1）：清掉落在被删集合里的悬停 / 按压 / 待定拖拽 / 最近
+/// 命中，并为「悬停链被卸载」派生一条 [`Event::HoverChanged`]（`hovered: None`，`left` 是删前
+/// 链由内到外）。消费者：`window_set::remove`。
+///
+/// `removed_hover_chain` 必须由调用方在**删树前**用 [`hover_chain`] 记取（`None` = 悬停不在
+/// 被删子树，只做前三项清理）：[`update_hover`] 的 `previous` 会把已卸载节点过滤成 `None`，
+/// 删后补调 [`revalidate_hover`] 会因 `previous == next == None` 早退 —— 应用侧的 tooltip /
+/// `:hover` 状态会残留到下一次指针移动。删除后引擎不再知道指针位置，因此悬停直接结束
+/// （`hovered: None`）而不是猜测新目标（与模态作用域变化的收尾口径一致）。
+pub(crate) fn cleanup_removed_pointer_state(
+    app: &mut App,
+    window: WindowId,
+    removed: &ahash::HashSet<NodeId>,
+    removed_hover_chain: Option<SmallVec<[NodeId; 8]>>,
+) {
+    let Some(target) = app.windows.get_mut(&window) else {
+        return;
+    };
+    {
+        let pointer = target.pointer_mut();
+        // 按下 / 待定拖拽 / 最近命中落在被删子树 ⇒ 作废：否则抬起会把 click / `DragPhase`
+        // 派发到已经不存在的节点上。捕获路径已由 `cancel_pointer_session` 收尾，这里是
+        // 「没有捕获的悬停 / 捕获在别处」路径的兜底。
+        if pointer
+            .press
+            .is_some_and(|press| press.node.is_some_and(|node| removed.contains(&node)))
+        {
+            pointer.press = None;
+        }
+        if pointer
+            .pending_drag
+            .as_ref()
+            .is_some_and(|pending| removed.contains(&pending.node))
+        {
+            pointer.pending_drag = None;
+        }
+        if pointer
+            .last_hit
+            .is_some_and(|hit| removed.contains(&hit.node))
+        {
+            pointer.last_hit = None;
+        }
+    }
+    let Some(chain) = removed_hover_chain else {
+        return;
+    };
+    target.pointer_mut().hovered = None;
+    // 存活的祖先也失去悬停：`:hover` / `bind_style` 必须重算（与 `update_hover` 同一口径 ——
+    // 只标挂了动态绑定的节点，死节点无法再标脏）。
+    let marked: SmallVec<[NodeId; 8]> = chain
+        .iter()
+        .copied()
+        .filter(|node| {
+            target
+                .tree()
+                .get(*node)
+                .is_ok_and(|slot| slot.has_bindings())
+        })
+        .collect();
+    for node in marked {
+        target.tree_mut().mark_bind(node);
+        target.tree_mut().mark_paint(node);
+    }
+    let left: Vec<NodeId> = chain.iter().rev().copied().collect();
+    app.events.push(
+        window,
+        Event::HoverChanged {
+            hovered: None,
+            left,
+            entered: Vec::new(),
+        },
+    );
+    // 光标同样来自被卸载的悬停链：没有指针位置可以重算 ⇒ 回到默认（下一次移动会纠正）。
+    update_cursor(app, window, None);
+    app.request_frame();
 }
 
 /// 悬停变化后重新解析光标（只有变化时才推给平台）。

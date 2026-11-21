@@ -16,7 +16,10 @@ use smol_str::SmolStr;
 
 use crate::{
     layout::Axis,
-    node::{id::NodeId, signal::DerivedId},
+    node::{
+        id::NodeId,
+        signal::{DerivedId, SignalScope},
+    },
     paint::atlas::AtlasKind,
     resources::DecodeCause,
     window::WindowId,
@@ -170,6 +173,26 @@ pub enum EngineError {
          or cannot be used as a text hit target"
     )]
     StaleNode { node: NodeId },
+
+    /// [`App::remove_node_with_scope`](crate::app::App::remove_node_with_scope) 的 `scope` 被
+    /// **被删子树之外**的存活节点读取：释放它必然破坏那个存活绑定（作用域不属于这棵子树，或
+    /// 与其它组件共享）。方法在**任何副作用之前**返回本错误（节点未卸载、作用域未释放）。
+    ///
+    /// `SignalScope` 与 `NodeId` 是正交句柄（E8），引擎没有归属映射；可证明的错配只有「子树
+    /// 之外仍有存活读者」这一种。作用域没有任何存活读者、或只被被删子树读取时，引擎**无法**
+    /// 区分错配与正确使用（见该方法的 `# 契约`）。
+    #[error(
+        "signal scope {scope:?} is still read by live node {reader:?}: it does not belong to the \
+         subtree being removed ({node:?}) and releasing it would break that live binding"
+    )]
+    ScopeOwnershipMismatch {
+        /// 调用方要求卸载的子树根。
+        node: NodeId,
+        /// 调用方传入的作用域（其存活信号仍被子树外的节点读取）。
+        scope: SignalScope,
+        /// 证明错配的存活读者（被删子树之外的节点）。
+        reader: NodeId,
+    },
 
     /// 派生值形成环（或该派生的闭包上次 panic 未放回）。
     #[error(
@@ -505,6 +528,11 @@ mod tests {
             EngineError::StaleNode {
                 node: NodeId::for_test(3, 1),
             },
+            EngineError::ScopeOwnershipMismatch {
+                node: NodeId::for_test(9, 1),
+                scope: SignalScope::from_index(2),
+                reader: NodeId::for_test(10, 1),
+            },
             EngineError::CyclicDerived {
                 derived: DerivedId::for_test(0),
             },
@@ -812,6 +840,20 @@ mod tests {
         let text = EngineError::InvalidDpiScale { factor: 2.5 }.to_string();
 
         assert!(text.contains("2.5"), "{text}");
+    }
+
+    /// E16b/F4：作用域错配错误必须点名「子树外的存活读者」—— 调用方据此定位错传的 `scope`。
+    #[test]
+    fn scope_ownership_mismatch_display_names_the_live_reader() {
+        let text = EngineError::ScopeOwnershipMismatch {
+            node: NodeId::for_test(9, 1),
+            scope: SignalScope::from_index(2),
+            reader: NodeId::for_test(10, 1),
+        }
+        .to_string();
+
+        assert!(text.contains("live node"), "{text}");
+        assert!(text.contains("releasing it would break"), "{text}");
     }
 
     /// E1b：canvas 文本的显式光栅 scale 由应用给（`App::set_text_scale`），非法值必须可区分于
