@@ -117,6 +117,101 @@ fn channel_span(a: [u8; 4], b: [u8; 4]) -> u8 {
         .unwrap_or(0)
 }
 
+/// E13：组不透明度是**合成期乘数**（不改图元几何、不增加 draw）——「整组淡出」的最终像素证据。
+///
+/// 场景（窗口 800×600、scale 1）：组 100×100 白 quad（`opacity = 0.5`）+ 子 50×50 白 quad
+/// （自身 `opacity = 0.5`，级联后 = 0.25），都画在透明背景上。真实 GPU 读回的预乘 alpha：
+///
+/// - 子区域 = 0.25 + 0.5 × (1 − 0.25) = **0.625**（组 quad 先画、子 quad 叠上）；
+/// - 只有组、没有子的区域 = **0.5**（组自己的补丁值）；
+/// - 组外 = **0**（透明）。
+///
+/// 三处一起证明：alpha 是逐图元在合成期相乘 + 目标上直接混合（**不重叠**处与 CSS 组不透明
+/// 一致；重叠处比 CSS 的「隔离组」更实，见 spec-delta E13 R2），且整组区域都被组的值覆盖。
+///
+/// 这条与 golden 基线无关（不依赖任何 PNG），三端读回链路各自跑。
+#[test]
+fn group_opacity_is_a_composite_multiplier_in_the_readback() {
+    use taffy::style::Dimension;
+    use ui_core::{
+        node::builder::NodeBuilder,
+        paint::{
+            color::Color,
+            style::{Clip, PaintSpec, Style, StylePatch},
+        },
+        test_support::app::TestApp,
+    };
+
+    fn sized(width: f32, height: f32) -> Style {
+        let mut inner = taffy::Style::<smol_str::SmolStr>::DEFAULT;
+        inner.size = taffy::geometry::Size {
+            width: Dimension::length(width),
+            height: Dimension::length(height),
+        };
+        Style {
+            inner,
+            clip: Clip::None,
+        }
+    }
+    fn white() -> PaintSpec {
+        PaintSpec {
+            background: Color::WHITE,
+            ..PaintSpec::default()
+        }
+    }
+
+    let _guard = gpu_guard();
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let root = app.app().window(window).expect("窗口").tree().root();
+    {
+        let tree = app.app_mut().window_mut(window).expect("窗口").tree_mut();
+        let group = NodeBuilder::boxed()
+            .style(sized(100.0, 100.0))
+            .paint(white())
+            .bind_style(|_cx| StylePatch {
+                opacity: Some(0.5),
+                ..StylePatch::default()
+            })
+            .build(tree, root)
+            .expect("group");
+        NodeBuilder::boxed()
+            .style(sized(50.0, 50.0))
+            .paint(white())
+            .bind_style(|_cx| StylePatch {
+                opacity: Some(0.5),
+                ..StylePatch::default()
+            })
+            .build(tree, group)
+            .expect("child");
+    }
+    app.drain().expect("一帧");
+    let image = app.read_pixels().expect("WARP / Metal 离屏读回");
+
+    // 子区域（组 0..100、子 0..50）与「只有组」区域（50..100）。
+    let child_alpha = pixel(&image, 25, 25)[3];
+    let group_only_alpha = pixel(&image, 75, 75)[3];
+    let outside_alpha = pixel(&image, 300, 300)[3];
+
+    assert!(
+        (i32::from(child_alpha) - 159).abs() <= 6,
+        "子区域 alpha 应为 0.625×255≈159（组 0.5 叠子 0.25），实测 {child_alpha}"
+    );
+    assert!(
+        (i32::from(group_only_alpha) - 128).abs() <= 6,
+        "只有组的区域 alpha 应为 0.5×255≈128，实测 {group_only_alpha}"
+    );
+    assert_eq!(outside_alpha, 0, "组外必须全透明（没有多画出任何区域）");
+    // 预乘 RGB 与 alpha 同阶（白 quad），验证不是「alpha 对了、颜色错了」。
+    let child_pixel = pixel(&image, 25, 25);
+    assert!(
+        child_pixel[..3]
+            .iter()
+            .all(|channel| i32::from(*channel) > 100),
+        "预乘 RGB 必须随 alpha 一起缩放（白 quad 的 rgb 不应被剪成 0）：{child_pixel:?}"
+    );
+}
+
 /// P1-N1 的**不依赖 golden** 的回归闸门：矩形 clip 必须逐列/逐行精确裁掉框外像素。
 ///
 /// 这条测试读**本机 GPU 的读回像素**（WARP / lavapipe / metal 各自跑），断言的是语义而不是

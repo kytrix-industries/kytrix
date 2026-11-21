@@ -3,7 +3,8 @@
 //! 契约：
 //! - **一节点一 lane**（`Node.lane`，粘性保留）；
 //! - lane 内桶序 = 祖先 clip 前缀 → Shadow → 背景/渐变 → 边框 → 内容 → 祖先 clip 后缀；
-//! - 复用判据 = `REUSABLE` + lane 存在 + **clip 上下文一致**（`clip_key`，审查 B1 的守卫）；
+//! - 复用判据 = `REUSABLE` + lane 存在 + **clip 上下文一致**（`clip_key`，审查 B1 的守卫）
+//!   + **组不透明度戳一致**（E13：`StylePatch.opacity` 沿子树级联，父值变化必须重建整棵子树）；
 //! - 隐藏子树（自身/祖先 `display: none`）清空 lane、不产生像素、`clip_key` 置空（重新显示必重建）；
 //! - damage 按「节点级 + 图元级」双写（§6.6）。
 
@@ -230,6 +231,7 @@ impl PaintPass<'_> {
             Point::ZERO,
             0,
             0,
+            1.0,
             mode.is_full(),
         )?;
         match context.mode {
@@ -430,6 +432,10 @@ fn content_needs_clip(content: &Content) -> bool {
 /// 移动，烘焙进去就等于每滚一像素都要重编码全部 lane），改由槽位的屏幕裁剪区在绘制期做
 /// 每 op scissor（`FramePayload::scroll_clip`）。
 ///
+/// `inherited_opacity` 是祖先链累计的组不透明度（不含本节点补丁；根恒 `1.0`，E13）：本节点
+/// 的有效值 = 它 × 自身补丁，乘进每个图元并传给子节点；有效值变化会因 `paint_opacity` 戳失配
+/// 重建本节点 lane，且本节点因此不可复用 ⇒ 子树被 `expand` 覆盖、逐级失配重建。
+///
 /// [`ScrollTable`]: crate::render::delta::ScrollTable
 ///
 /// # 增量剪枝（A1）
@@ -447,6 +453,7 @@ fn paint_node(
     slot_offset: Point,
     slot: u32,
     boundary: usize,
+    inherited_opacity: f32,
     force: bool,
 ) -> Result<(), EngineError> {
     if !force && !context.tree.paint_marked(node) {
@@ -461,14 +468,17 @@ fn paint_node(
     // 画出来，而那些子控件在命中测试里是不可见的（「看得见但点不动」的死像素，P2-3.2）。
     //
     // 复用判据（§5.6 + P10 §7.6）：`REUSABLE` + clip 上下文一致 + **烘焙偏移戳一致**（祖先滚动会
-    // 移动全部后代图元，因此偏移变化必须重建；滚动**本槽**不改变烘焙偏移 ⇒ 不重建）。
+    // 移动全部后代图元，因此偏移变化必须重建；滚动**本槽**不改变烘焙偏移 ⇒ 不重建）+
+    // **组不透明度戳一致**（E13：有效值 = 祖先链 × 自身补丁，变了就要重乘整棵子树的图元）。
     // **不要求** lane 存在：从未产生图元的节点没有 lane，但它的 `clip_key` 已写回，仍可整帧跳过。
     let current_key = clip.key();
-    let Some(state) =
-        context
-            .tree
-            .paint_state(node, total, offset_between(total, slot_offset), current_key)
-    else {
+    let Some(state) = context.tree.paint_state(
+        node,
+        total,
+        offset_between(total, slot_offset),
+        current_key,
+        inherited_opacity,
+    ) else {
         return Ok(());
     };
     if parent_hidden || state.hidden {
@@ -490,7 +500,7 @@ fn paint_node(
     if let Some(geometry) = state.geometry {
         // 几何节点：按块 lane 重建（X5）。数据 range 更新只把受影响块的版本推进，因此这里
         // 只重建版本变化的块 lane —— 追加 K 线只重建尾块，热力图改色只重建受影响块。
-        paint_geometry_node(context, node, &state, geometry, clip, total)?;
+        paint_geometry_node(context, node, &state, geometry, clip, total, state.opacity)?;
     } else if reusable {
         // 增量路径不 push 绘制序：顺序没变（结构未变、lane 成员未变），`Scene::order` 整体保留。
         if context.mode.is_full()
@@ -520,6 +530,7 @@ fn paint_node(
             node_slot,
             node_slot_offset,
             boundary,
+            state.opacity,
         )?;
     }
 
@@ -557,8 +568,8 @@ fn paint_node(
         // 视口 clip 已经「花掉」：子树看到的 `clip.rects[..boundary]` 全部由屏幕裁剪区承担。
         child_boundary = clip.rects.len();
     }
-    // 非 reusable 的节点会让整棵子树的 clip 上下文 / 隐藏状态可能与上一帧不同 ⇒ 增量路径
-    // 保守展开（全量路径本来就访问全部子节点）。
+    // 非 reusable 的节点会让整棵子树的 clip 上下文 / 隐藏状态 / 组不透明度与上一帧不同 ⇒
+    // 增量路径保守展开（全量路径本来就访问全部子节点）。
     let expand = context.mode.is_full() || !reusable;
     for index in 0..child_count {
         let child = match context.tree.get(node) {
@@ -574,6 +585,7 @@ fn paint_node(
             child_slot_offset,
             child_slot,
             child_boundary,
+            state.opacity,
             expand,
         )?;
     }
@@ -729,7 +741,8 @@ fn hide_subtree(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
 ///
 /// `total` = 完整祖先滚动位移（damage 用，屏幕坐标）；
 /// `slot` / `slot_offset` = 该 lane 的滚动槽位与**本槽自己的位移**（图元烘焙时扣掉它，
-/// 绘制期由 GPU 加回来；见 `paint_node` 的文档）。
+/// 绘制期由 GPU 加回来；见 `paint_node` 的文档）；
+/// `opacity` = 本节点的有效组不透明度（E13：自身补丁 × 祖先链，乘进本节点的每个图元并写回复用戳）。
 fn rebuild_lane(
     context: &mut PaintContext<'_>,
     node: NodeId,
@@ -738,6 +751,7 @@ fn rebuild_lane(
     slot: u32,
     slot_offset: Point,
     boundary: usize,
+    opacity: f32,
 ) -> Result<(), EngineError> {
     let created = context.tree.lane_of(node).is_none();
     let lane = match context.tree.lane_of(node) {
@@ -853,6 +867,7 @@ fn rebuild_lane(
         ring,
         content_clip,
         geometry_transform,
+        opacity,
     };
     emitter.emit(context);
 
@@ -875,6 +890,8 @@ fn rebuild_lane(
     context.tree.set_clip_key(node, clip.key());
     // 烘焙偏移戳（**不含本槽位移**）：滚动本容器不改变它 ⇒ 下一帧仍可整条复用。
     context.tree.set_lane_offset(node, bake);
+    // 组不透明度戳（E13）：与本次乘进图元的值一致才可复用（祖先/自身调光必须重建子树）。
+    context.tree.set_paint_opacity(node, opacity);
     context.tree.clear_paint(node);
 
     // 「没有东西要画」的节点不留 lane（空 lane 只占绘制序/内存）：丢弃句柄并释放分配。
@@ -1091,6 +1108,7 @@ fn paint_geometry_node(
     geometry_id: crate::paint::geometry::GeometryId,
     clip: &ClipContext,
     total: Point,
+    opacity: f32,
 ) -> Result<(), EngineError> {
     let snapshot = context.geometry.snapshot_arc(geometry_id);
     // 块数：未注册句柄保守按 1 块；已注册但 **0 块**（`truncate` 到 0 / 空几何）也保留 1 条
@@ -1114,11 +1132,6 @@ fn paint_geometry_node(
         geometry_transform,
         bake,
     } = node_state;
-    let opacity = match patch.opacity {
-        Some(value) if value.is_nan() => 0.0,
-        Some(value) => value.clamp(0.0, 1.0),
-        None => 1.0,
-    };
     let visible = patch.visible.unwrap_or(true);
     let old_lanes = context.tree.lane_count(node);
     // 旧块烘焙状态（决定「哪些块需要重建」与旧 bounds damage），拷进复用工作区。
@@ -1229,6 +1242,7 @@ fn paint_geometry_node(
             ring: if chunk == 0 { ring } else { None },
             geometry_transform,
             content_clip,
+            opacity,
         };
         if chunk == 0 {
             emitter.emit_decorations(context, opacity);
@@ -1334,6 +1348,8 @@ fn paint_geometry_node(
     context.tree.set_reusable(node);
     context.tree.set_clip_key(node, clip.key());
     context.tree.set_lane_offset(node, bake);
+    // 组不透明度戳（E13）：与本次乘进块 lane 图元的值一致才可复用。
+    context.tree.set_paint_opacity(node, opacity);
     context.tree.clear_paint(node);
     if !context.mode.is_full() && created_any {
         context.order_changed = true;
@@ -1430,6 +1446,9 @@ struct PrimitiveEmitter {
     /// `overflow` 裁剪的是元素内容，不是元素自己的装饰。旧实现只把 clip 压给子树，
     /// 于是「容器剪不住自己的 Canvas」：图表的柱子会溢出到容器外（P2-3.2）。
     content_clip: Option<Rect>,
+    /// 本节点的**有效组不透明度**（自身补丁 × 祖先链；E13）：统一乘到本节点发出的每个
+    /// 图元颜色上（阴影 / 背景 / 边框 / 渐变 / 文本 / 图片调制 / 焦点环 / 几何色）。
+    opacity: f32,
 }
 
 /// 取负（`Point` 没有 `Neg`；屏幕 = 内容 − 偏移）。
@@ -1508,49 +1527,49 @@ impl PrimitiveEmitter {
 
     fn emit(&mut self, context: &mut PaintContext<'_>) {
         let visible = self.patch.visible.unwrap_or(true);
-        let opacity = match self.patch.opacity {
-            Some(value) if value.is_nan() => 0.0,
-            Some(value) => value.clamp(0.0, 1.0),
-            None => 1.0,
-        };
         if !visible || self.bounds.is_empty() {
             self.emit_node_damage(context);
             return;
         }
+        // 组不透明度（E13）已由 `paint_node` 折算好（自身补丁 × 祖先链），这里直接使用。
+        let opacity = self.opacity;
         self.emit_decorations(context, opacity);
         self.emit_content(context, opacity);
         self.emit_focus_ring(context, opacity);
         self.emit_node_damage(context);
     }
 
-    /// 装饰层（Shadow → 背景/渐变 → 边框）：不参与内容 clip，也不含焦点环/内容。
+    /// 装饰层（阴影层组 → 背景/渐变 → 边框）：不参与内容 clip，也不含焦点环/内容。
     ///
     /// 拆成独立方法的唯一原因：几何节点的块 0 lane 要在「装饰之后、焦点环之前」插入几何
     /// 内容（X5 的多 lane 分块），而 `emit` 的单 lane 顺序必须逐图元保持原样。
     fn emit_decorations(&mut self, context: &mut PaintContext<'_>, opacity: f32) {
         let spec = self.spec.clone().unwrap_or_default();
         let radii = spec.corner_radius;
-        if let Some(shadow) = spec.shadow {
+        // E13：多层阴影按数组序绘制（先在下、后在上）。每层一个 `Primitive::Shadow`，
+        // spread 在 CPU 侧折算成「投影盒外扩 + 圆角同量增加」，σ 不变 ⇒ 三端 / 字节契约零改动。
+        for shadow in spec.shadows.iter() {
             let color = shadow.color.with_opacity(opacity);
-            if !color.is_transparent() {
-                // 阴影跟随圆角（R05-9）：`box-shadow` 的轮廓就是 `border-radius` 的轮廓，
-                // 半径与背景/边框用同一份 `spec.corner_radius`（编码器再按 CSS 规则 clamp）。
-                let primitive = Shadow {
-                    rect: self.bounds,
-                    offset: shadow.offset,
-                    blur: shadow.blur.max(0.0),
-                    color,
-                    corner_radius: radii,
-                };
-                self.push(context, Primitive::Shadow(primitive));
-                // damage 外扩 = 3σ + 1（σ = blur / 2，物理像素）：与 shader 的顶点外扩一致。
-                // 旧的 `blur + 1` 在 σ 改小后会切掉模糊环（可见缺陷）。
-                let sigma = (primitive.blur * crate::paint::instance::SHADOW_SIGMA_SCALE)
-                    .max(crate::paint::instance::SHADOW_SIGMA_MIN);
-                let pad =
-                    crate::paint::instance::SHADOW_PAD_SIGMAS * sigma * self.scale.factor() + 1.0;
-                self.push_damage(context, primitive.rect.translate(primitive.offset), pad);
+            if color.is_transparent() {
+                continue;
             }
+            // CSS `box-shadow` 的 spread：阴影盒 = 元素盒四边外扩；圆角同量增大（负值 clamp 到 0）。
+            // 半径与背景/边框用同一份 `spec.corner_radius`（编码器再按 CSS 规则 clamp）。
+            let rect = self.bounds.outset(shadow.spread);
+            let primitive = Shadow {
+                rect,
+                offset: shadow.offset,
+                blur: shadow.blur.max(0.0),
+                color,
+                corner_radius: radii.map(|radius| (radius + shadow.spread).max(0.0)),
+            };
+            self.push(context, Primitive::Shadow(primitive));
+            // damage 外扩 = 3σ + 1（σ = blur / 2，物理像素）：与 shader 的顶点外扩一致。
+            // 旧的 `blur + 1` 在 σ 改小后会切掉模糊环（可见缺陷）。spread 已含在 `rect` 里。
+            let sigma = (primitive.blur * crate::paint::instance::SHADOW_SIGMA_SCALE)
+                .max(crate::paint::instance::SHADOW_SIGMA_MIN);
+            let pad = crate::paint::instance::SHADOW_PAD_SIGMAS * sigma * self.scale.factor() + 1.0;
+            self.push_damage(context, primitive.rect.translate(primitive.offset), pad);
         }
 
         let background = self
@@ -2018,7 +2037,7 @@ mod tests {
             geometry::GeometryId,
             primitive::{Border, ClipOp, Gradient, GradientKind, Primitive, QuadPaint},
             scene::{LaneId, Scene},
-            style::{Clip, PaintSpec, ShadowSpec, Style, StylePatch},
+            style::{Clip, PaintSpec, ShadowSpec, Shadows, Style, StylePatch},
         },
         render::damage::DamageAccumulator,
         text::{
@@ -2390,9 +2409,10 @@ mod tests {
             .style(fixed_style(50.0, 20.0))
             .paint(PaintSpec {
                 background: Color::WHITE,
-                shadow: Some(ShadowSpec {
+                shadows: Shadows::from(ShadowSpec {
                     offset: Point::new(1.0, 2.0),
                     blur: 3.0,
+                    spread: 0.0,
                     color: Color::BLACK,
                 }),
                 ..PaintSpec::default()
@@ -4090,6 +4110,576 @@ mod tests {
                 panic!("块 {chunk} 必须有几何绘制");
             };
             assert_eq!(draw.transform, transform, "变换必须进每条块 lane");
+        }
+    }
+
+    // ── E13：组不透明度（`StylePatch.opacity` 沿子树级联）──────────────────────
+
+    /// E13 组不透明度 ①：父 0.5 × 子 0.5 ⇒ 子图元 0.25；父自己的装饰（阴影 / 渐变 / 边框）
+    /// 是 0.5。`Clip::Bounds` 与圆角只影响几何，不参与 alpha 计算（子 lane 的 clip 前缀照旧）。
+    ///
+    /// 变异守卫：把级联拆掉（`paint_state` 不乘 `inherited_opacity`，或 emitter 用自身补丁值）
+    /// ⇒ 子图元回到 0.5 / 1.0，本用例变红。
+    #[test]
+    fn group_opacity_cascades_to_decorations_and_children() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let mut group_style = fixed_style(100.0, 60.0);
+        group_style.clip = Clip::Bounds;
+        let group = NodeBuilder::boxed()
+            .style(group_style)
+            .paint(PaintSpec {
+                corner_radius: [8.0; 4],
+                border: Some(Border {
+                    width: 1.0,
+                    color: Color::BLACK,
+                }),
+                gradient: Some(Gradient {
+                    from: Color::WHITE,
+                    to: Color::BLACK,
+                    kind: GradientKind::Horizontal,
+                }),
+                shadows: Shadows::from(ShadowSpec {
+                    offset: Point::new(0.0, 3.0),
+                    blur: 5.0,
+                    spread: 0.0,
+                    color: Color::BLACK,
+                }),
+                ..PaintSpec::default()
+            })
+            .build(&mut h.tree, root)
+            .expect("group");
+        let child = NodeBuilder::boxed()
+            .style(fixed_style(40.0, 20.0))
+            .paint(with_white())
+            .build(&mut h.tree, group)
+            .expect("child");
+        layout_all(&mut h.tree);
+
+        // 基线：没有补丁时全部不透明（否则下面的 0.25 可能来自别的原因）。
+        let _ = h.paint();
+        let baseline = lane_primitives(&h, group);
+        let shadow_of = |primitives: &[Primitive]| {
+            primitives
+                .iter()
+                .find_map(|primitive| match primitive {
+                    Primitive::Shadow(shadow) => Some(*shadow),
+                    _ => None,
+                })
+                .expect("group 必须有一层阴影")
+        };
+        assert_eq!(shadow_of(&baseline).color, Color::BLACK);
+
+        let _ = h.tree.set_style_patch_for_test(
+            group,
+            StylePatch {
+                opacity: Some(0.5),
+                ..StylePatch::default()
+            },
+        );
+        let _ = h.tree.set_style_patch_for_test(
+            child,
+            StylePatch {
+                opacity: Some(0.5),
+                ..StylePatch::default()
+            },
+        );
+        h.mark_dirty(&[group, child]);
+        let _ = h.paint();
+
+        // 父自己的装饰 × 0.5。
+        let primitives = lane_primitives(&h, group);
+        assert_eq!(
+            shadow_of(&primitives).color,
+            Color::BLACK.with_opacity(0.5),
+            "阴影色乘父的有效不透明度"
+        );
+        let gradient = primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Quad(quad) => match &quad.paint {
+                    QuadPaint::Gradient(gradient) => Some(*gradient),
+                    QuadPaint::Solid { .. } => None,
+                },
+                _ => None,
+            })
+            .expect("渐变 quad");
+        assert_eq!(gradient.from, Color::WHITE.with_opacity(0.5));
+        assert_eq!(gradient.to, Color::BLACK.with_opacity(0.5));
+        let border = primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Quad(quad) => match &quad.paint {
+                    QuadPaint::Solid { border, .. } => *border,
+                    QuadPaint::Gradient(_) => None,
+                },
+                _ => None,
+            })
+            .expect("边框 quad");
+        assert_eq!(border.color, Color::BLACK.with_opacity(0.5));
+
+        // 子节点：0.5 × 0.5 = 0.25（级联，不是逐节点各算各的）。
+        let child_primitives = lane_primitives(&h, child);
+        assert!(
+            child_primitives
+                .iter()
+                .any(|primitive| matches!(primitive, Primitive::Clip(ClipOp::Push(_)))),
+            "`Clip::Bounds` 的裁剪前缀照旧压在子 lane 里（级联不改 clip 链）"
+        );
+        let fill = child_primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Quad(quad) => match &quad.paint {
+                    QuadPaint::Solid { fill, .. } => Some(*fill),
+                    QuadPaint::Gradient(_) => None,
+                },
+                _ => None,
+            })
+            .expect("子节点的背景 quad");
+        assert_eq!(
+            fill,
+            Color::WHITE.with_opacity(0.25),
+            "子图元 = 父 0.5 × 子 0.5 = 0.25"
+        );
+    }
+
+    /// E13 组不透明度 ②：文本色 / 图片调制色 / `GeometryDraw.color` 都被级联乘上。
+    ///
+    /// `Canvas` 内容例外（应用自绘、引擎不解析其颜色）—— 见 spec-delta E13 R1。
+    #[test]
+    fn group_opacity_cascades_to_text_image_and_geometry_colors() {
+        let mut resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
+        let image = resources.insert(ONE_PIXEL_PNG).expect("1×1 PNG");
+        let mut h = Harness::new();
+        h.resources = Some(resources);
+        let root = h.tree.root();
+        let group = NodeBuilder::boxed()
+            .style(fixed_style(100.0, 100.0))
+            .build(&mut h.tree, root)
+            .expect("group");
+        let text = NodeBuilder::text("ab", TextStyle::new(16.0))
+            .style(fixed_style(50.0, 20.0))
+            .build(&mut h.tree, group)
+            .expect("text");
+        let content = TextContent::new("ab", TextStyle::new(16.0));
+        assert!(h.tree.set_text_content(text, content.clone()));
+        assert!(
+            h.tree.install_text_line_for_test(
+                text,
+                &content,
+                Rc::new(shaped_line(
+                    vec![ShapedTextItem::GlyphRun(glyph_run(Color::BLACK, 0..2, 0.0))],
+                    Vec::new(),
+                )),
+                20.0,
+            ),
+            "文本行注入"
+        );
+        let image_node = NodeBuilder::image(image.id, crate::node::image::ImageFit::Fill)
+            .style(fixed_style(40.0, 40.0))
+            .build(&mut h.tree, group)
+            .expect("image");
+        let geometry_id = h.geometry.insert(long_geometry(3)).expect("几何");
+        let geometry = NodeBuilder::geometry(geometry_id)
+            .style(fixed_style(30.0, 30.0))
+            .build(&mut h.tree, group)
+            .expect("geometry");
+        layout_all(&mut h.tree);
+        // 组根 0.5（子节点自身不调光 ⇒ 子图元全部 0.5）。
+        let _ = h.tree.set_style_patch_for_test(
+            group,
+            StylePatch {
+                opacity: Some(0.5),
+                ..StylePatch::default()
+            },
+        );
+        let _ = h.paint();
+
+        let text_color = lane_primitives(&h, text)
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::GlyphRun(run) => Some(run.color),
+                _ => None,
+            })
+            .expect("文本 run");
+        assert_eq!(text_color, Color::BLACK.with_opacity(0.5), "文本色级联");
+
+        let modulation = lane_primitives(&h, image_node)
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Image(image) => Some(image.modulation),
+                _ => None,
+            })
+            .expect("图片图元");
+        assert_eq!(modulation, Color::WHITE.with_opacity(0.5), "图片调制色级联");
+
+        let geometry_color = lane_primitives(&h, geometry)
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Geometry(draw) => Some(draw.color),
+                _ => None,
+            })
+            .expect("几何图元");
+        assert_eq!(
+            geometry_color,
+            Color::WHITE.with_opacity(0.5),
+            "`GeometryDraw.color` 级联（与 Canvas 不同，几何色由引擎给定）"
+        );
+    }
+
+    /// E13 组不透明度 ③：变更只重建被调光的那棵子树（兄弟子树整条复用），
+    /// 且戳写回后稳定帧零重建（I3）。
+    #[test]
+    fn a_group_opacity_change_rebuilds_only_that_subtree_then_settles() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let group_a = NodeBuilder::boxed()
+            .style(fixed_style(50.0, 50.0))
+            .paint(with_white())
+            .build(&mut h.tree, root)
+            .expect("group a");
+        let child_a = NodeBuilder::boxed()
+            .style(fixed_style(20.0, 20.0))
+            .paint(with_white())
+            .build(&mut h.tree, group_a)
+            .expect("child a");
+        let group_b = NodeBuilder::boxed()
+            .style(fixed_style(50.0, 50.0))
+            .paint(with_white())
+            .build(&mut h.tree, root)
+            .expect("group b");
+        let child_b = NodeBuilder::boxed()
+            .style(fixed_style(20.0, 20.0))
+            .paint(with_white())
+            .build(&mut h.tree, group_b)
+            .expect("child b");
+        layout_all(&mut h.tree);
+
+        let first = h.paint();
+        assert!(first.rebuilt >= 4, "四棵都产生像素");
+        let sibling_lane = h.tree.lane_of(group_b).expect("group b lane");
+        let sibling_version = h.scene.lane_state(sibling_lane).expect("lane").0;
+        let settled = h.paint();
+        assert_eq!(settled.rebuilt, 0, "无变化 ⇒ 稳定帧零重建（I3）");
+
+        let _ = h.tree.set_style_patch_for_test(
+            group_a,
+            StylePatch {
+                opacity: Some(0.25),
+                ..StylePatch::default()
+            },
+        );
+        h.mark_paint(group_a);
+        let report = h.paint_incremental(&[group_a]);
+        assert_eq!(report.rebuilt, 2, "只重建 group_a + child_a 两条 lane");
+        assert_eq!(
+            h.scene.lane_state(sibling_lane).expect("lane").0,
+            sibling_version,
+            "兄弟子树整条复用（不因别人的调光重建）"
+        );
+
+        // 戳已写回 ⇒ 下一帧完全静止。
+        let again = h.paint_incremental(&[]);
+        assert_eq!(again.rebuilt, 0, "有效不透明度不变 ⇒ 零重建");
+
+        // 兄弟子树的颜色不受影响（1.0）—— 级联只在各自祖先链内。
+        let sibling_fill = lane_primitives(&h, child_b)
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Quad(quad) => match &quad.paint {
+                    QuadPaint::Solid { fill, .. } => Some(*fill),
+                    QuadPaint::Gradient(_) => None,
+                },
+                _ => None,
+            })
+            .expect("child b quad");
+        assert_eq!(sibling_fill, Color::WHITE, "兄弟子树保持不透明");
+
+        // 增量路径确实把 0.25 乘进了两条 lane。
+        let group_fill = lane_primitives(&h, group_a)
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Quad(quad) => match &quad.paint {
+                    QuadPaint::Solid { fill, .. } => Some(*fill),
+                    QuadPaint::Gradient(_) => None,
+                },
+                _ => None,
+            })
+            .expect("group a quad");
+        assert_eq!(group_fill, Color::WHITE.with_opacity(0.25));
+        let child_fill = lane_primitives(&h, child_a)
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Quad(quad) => match &quad.paint {
+                    QuadPaint::Solid { fill, .. } => Some(*fill),
+                    QuadPaint::Gradient(_) => None,
+                },
+                _ => None,
+            })
+            .expect("child a quad");
+        assert_eq!(
+            child_fill,
+            Color::WHITE.with_opacity(0.25),
+            "子节点继承 0.25（父调光在增量路径上同样级联）"
+        );
+    }
+
+    // ── E13：阴影 `spread` + 多层 ─────────────────────────────────────────────
+
+    /// E13 阴影 ①：`spread` 在 CPU 侧折算成「投影盒四边外扩 + 圆角同量增加」；σ 不变。
+    ///
+    /// 变异守卫：忽略 `spread`（rect 恒 `bounds`、半径不变）⇒ 本用例变红。
+    #[test]
+    fn shadow_spread_expands_the_projection_box_and_the_corner_radii() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let node = NodeBuilder::boxed()
+            .style(fixed_style(50.0, 20.0))
+            .paint(PaintSpec {
+                corner_radius: [8.0; 4],
+                shadows: Shadows::from(ShadowSpec {
+                    offset: Point::new(1.0, 2.0),
+                    blur: 6.0,
+                    spread: 3.0,
+                    color: Color::BLACK,
+                }),
+                ..PaintSpec::default()
+            })
+            .build(&mut h.tree, root)
+            .expect("挂载");
+        layout_all(&mut h.tree);
+        let _ = h.paint();
+        let bounds = h.tree.get(node).expect("node").layout().bounds;
+        let shadow = lane_primitives(&h, node)
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Shadow(shadow) => Some(*shadow),
+                _ => None,
+            })
+            .expect("阴影");
+        assert_eq!(
+            shadow.rect,
+            bounds.outset(3.0),
+            "投影盒 = 布局盒四边外扩 spread"
+        );
+        assert_eq!(shadow.corner_radius, [11.0; 4], "圆角 = 原半径 + spread");
+        assert_eq!(shadow.blur, 6.0, "σ 不随 spread 变");
+
+        // 负 spread：盒收缩，半径 clamp 到 0（CSS `box-shadow` 的语义）。
+        let negative = NodeBuilder::boxed()
+            .style(fixed_style(50.0, 20.0))
+            .paint(PaintSpec {
+                corner_radius: [8.0; 4],
+                shadows: Shadows::from(ShadowSpec {
+                    offset: Point::ZERO,
+                    blur: 2.0,
+                    spread: -5.0,
+                    color: Color::BLACK,
+                }),
+                ..PaintSpec::default()
+            })
+            .build(&mut h.tree, root)
+            .expect("挂载");
+        layout_all(&mut h.tree);
+        let _ = h.paint();
+        let bounds = h.tree.get(negative).expect("node").layout().bounds;
+        let shadow = lane_primitives(&h, negative)
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Shadow(shadow) => Some(*shadow),
+                _ => None,
+            })
+            .expect("阴影");
+        assert_eq!(shadow.rect, bounds.outset(-5.0), "负 spread 收缩投影盒");
+        assert_eq!(shadow.corner_radius, [3.0; 4], "半径随负 spread 减小");
+    }
+
+    /// E13 阴影 ②：多层按数组序发射（先画的在下），全部在背景 quad 之前；层数上限 4。
+    ///
+    /// 变异守卫：只画第一层（`spec.shadows.iter().take(1)`）⇒ 层数断言变红。
+    #[test]
+    fn shadow_layers_are_emitted_in_order_and_capped() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let layers: Vec<ShadowSpec> = (0..5)
+            .map(|index| ShadowSpec {
+                offset: Point::new(0.0, index as f32),
+                blur: 2.0,
+                spread: 0.0,
+                color: Color::BLACK,
+            })
+            .collect();
+        let node = NodeBuilder::boxed()
+            .style(fixed_style(50.0, 20.0))
+            .paint(PaintSpec {
+                background: Color::WHITE,
+                shadows: Shadows::new(layers),
+                ..PaintSpec::default()
+            })
+            .build(&mut h.tree, root)
+            .expect("挂载");
+        layout_all(&mut h.tree);
+        let _ = h.paint();
+        let primitives = lane_primitives(&h, node);
+        let shadows: Vec<crate::paint::primitive::Shadow> = primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::Shadow(shadow) => Some(*shadow),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shadows.len(), 4, "上限 4 层（第 5 层被构造期截断）");
+        assert_eq!(
+            shadows
+                .iter()
+                .map(|shadow| shadow.offset.y)
+                .collect::<Vec<_>>(),
+            vec![0.0, 1.0, 2.0, 3.0],
+            "绘制序 = 数组序（后画的在上；截断丢弃尾部）"
+        );
+        let last_shadow = primitives
+            .iter()
+            .rposition(|primitive| matches!(primitive, Primitive::Shadow(_)))
+            .expect("有阴影");
+        let background = primitives
+            .iter()
+            .position(|primitive| matches!(primitive, Primitive::Quad(_)))
+            .expect("背景 quad");
+        assert!(last_shadow < background, "全部阴影层都在背景之前绘制");
+    }
+
+    // ── E13：整组淡出（`Transient` + `App::animate` 只登记组根）─────────────────
+
+    /// 组不透明度的**端到端**证据：`FrameRecord` 里编码出的 quad 颜色（= 交给 GPU 的实例色）随
+    /// 组根 `Transient` 整体变化，子树自动跟随；兄弟组不受影响；淡到 0 时组件整棵不产生图元。
+    ///
+    /// 为什么用 `FrameRecord` 而不是 paint 内部图元：`App::animate` 的 `nodes` 只登记**组根**，
+    /// 子树的重绘完全靠 `paint_opacity` 戳的级联失配。这条测试同时守护「只登记根节点也能整组
+    /// 淡出」（P2-4b 的 G6 诉求）。
+    #[cfg(feature = "test-support")]
+    mod group_fade {
+        use std::time::Duration;
+
+        use smol_str::SmolStr;
+
+        use crate::{
+            interaction::{AnimatedValue, AnimationSpec, Easing},
+            node::{builder::NodeBuilder, dependency::ReadCtx},
+            paint::{
+                color::Color,
+                style::{Clip, PaintSpec, Style, StylePatch},
+            },
+            test_support::app::TestApp,
+        };
+
+        /// 固定尺寸的布局样式（组 / 子 / 兄弟都是真实布局盒，不用 `layout_override`：
+        /// 覆盖节点是布局叶子，挂不了子节点）。
+        fn sized(width: f32, height: f32) -> Style {
+            let mut inner = taffy::Style::<SmolStr>::DEFAULT;
+            inner.size = taffy::geometry::Size {
+                width: taffy::style::Dimension::length(width),
+                height: taffy::style::Dimension::length(height),
+            };
+            Style {
+                inner,
+                clip: Clip::None,
+            }
+        }
+
+        fn white() -> PaintSpec {
+            PaintSpec {
+                background: Color::WHITE,
+                ..PaintSpec::default()
+            }
+        }
+
+        /// 该节点编码出的 quad 的不透明度（`None` = 本帧没有这个节点的 quad）。
+        fn alpha_of(
+            record: &crate::test_support::record::FrameRecord,
+            node: crate::node::id::NodeId,
+        ) -> Option<f32> {
+            let frame = record.frame.as_ref()?;
+            frame
+                .quads
+                .iter()
+                .find(|quad| quad.node == node)
+                .map(|quad| quad.fill.to_array()[3])
+        }
+
+        #[test]
+        fn a_group_fade_dims_the_whole_subtree_while_the_sibling_stays_opaque() {
+            let mut app = TestApp::new();
+            let window = app.window_id();
+            let fade = app.app_mut().transient(1.0_f32);
+            let root = app.app().window(window).expect("窗口").tree().root();
+            let (group, child, sibling) = {
+                let tree = app.app_mut().window_mut(window).expect("窗口").tree_mut();
+                let binder = fade;
+                let group = NodeBuilder::boxed()
+                    .style(sized(100.0, 100.0))
+                    .paint(white())
+                    .bind_style(move |cx: &mut ReadCtx<'_>| StylePatch {
+                        opacity: Some(*cx.read_transient(&binder)),
+                        ..StylePatch::default()
+                    })
+                    .id("group")
+                    .build(tree, root)
+                    .expect("group");
+                let child = NodeBuilder::boxed()
+                    .style(sized(40.0, 40.0))
+                    .paint(white())
+                    .id("child")
+                    .build(tree, group)
+                    .expect("child");
+                let sibling = NodeBuilder::boxed()
+                    .style(sized(60.0, 60.0))
+                    .paint(white())
+                    .id("sibling")
+                    .build(tree, root)
+                    .expect("sibling");
+                (group, child, sibling)
+            };
+
+            let first = app.drain().expect("首帧").clone();
+            assert_eq!(alpha_of(&first, group), Some(1.0), "初始不透明");
+            assert_eq!(alpha_of(&first, child), Some(1.0));
+            assert_eq!(alpha_of(&first, sibling), Some(1.0));
+
+            // 只登记**组根**：子树必须靠级联戳自动重绘（不逐节点 bind）。
+            app.app_mut()
+                .animate(
+                    window,
+                    AnimatedValue::Scalar {
+                        target: fade,
+                        to: 0.0,
+                    },
+                    &[group],
+                    AnimationSpec {
+                        duration: Duration::from_millis(100),
+                        easing: Easing::Linear,
+                    },
+                )
+                .expect("动画注册");
+            app.advance(Duration::from_millis(50));
+            let middle = app.drain().expect("淡出中帧").clone();
+            let group_alpha = alpha_of(&middle, group).expect("组 quad 仍在");
+            let child_alpha = alpha_of(&middle, child).expect("子 quad 仍在");
+            assert!(
+                (group_alpha - 0.5).abs() < 0.01,
+                "50% 进度 ⇒ 组根 quad 半透明（实测 {group_alpha}）"
+            );
+            assert!(
+                (child_alpha - 0.5).abs() < 0.01,
+                "子节点继承组的不透明度（实测 {child_alpha}）"
+            );
+            assert_eq!(alpha_of(&middle, sibling), Some(1.0), "兄弟组不受影响");
+
+            // 到终值：组与子树整棵不产生图元（alpha 0 ⇒ 图元被丢弃），兄弟保持。
+            app.advance(Duration::from_millis(60));
+            let done = app.drain().expect("淡出结束帧").clone();
+            assert_eq!(alpha_of(&done, group), None, "淡到 0 后组不再产生图元");
+            assert_eq!(alpha_of(&done, child), None, "子树同上");
+            assert_eq!(alpha_of(&done, sibling), Some(1.0), "兄弟组仍然不透明");
         }
     }
 }

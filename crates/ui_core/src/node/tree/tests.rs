@@ -186,13 +186,14 @@ fn node_and_handle_sizes() {
     );
     assert!(
         node_size <= 336,
-        "Node 尺寸超预算: {node_size} B（上限 336 B：冷字段必须装箱，见 R03-3；X5 起多 lane 集合占 24 B）"
+        "Node 尺寸超预算: {node_size} B（上限 336 B：冷字段必须装箱，见 R03-3；X5 起多 lane 集合占 24 B；\
+         E13 的组不透明度戳 `paint_opacity` +4 B ⇒ 补齐到 336 B，**已无余量**，后续加字段须先装箱搬走冷字段）"
     );
     assert_eq!(
         size_of::<crate::text::TextContent>(),
         112,
         "TextContent 的尺寸基线（v2.1 E2 的 `runs: Option<Box<ThinSlice>>` +8；E2b 的归一化诊断 \
-         计数 +8。`NodeKind::Text` 装箱持有 TextContent ⇒ Node 仍 328 B，上限 336 B）"
+         计数 +8。`NodeKind::Text` 装箱持有 TextContent ⇒ Node 336 B，上限 336 B）"
     );
     assert_eq!(
         size_of::<Option<NodeId>>(),
@@ -839,6 +840,7 @@ fn node_size_after_p06() {
     // （`Node.id` 与 `Node.parent` 各 +4 B；`Option<NodeId>` 靠 NonZeroU32 的 niche 保持 12 B）。
     // X5 起 `Node.lane: Option<LaneId>` 改为 `SmallVec<[LaneId; 2]>`（几何节点每块一条块 lane），
     // 集合本身 24 B，预算 +16 B（328 B 实测；仍是「冷字段必须装箱」的同一约束）。
+    // E13 的组不透明度复用戳 `Node.paint_opacity: f32` 再 +4 B ⇒ **336 B（= 上限，已无余量）**。
     assert!(
         size <= 336,
         "Node 超预算：{size} B（备选瘦身：删掉未被读取的 `Node.id` 字段）"
