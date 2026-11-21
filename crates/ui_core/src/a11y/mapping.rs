@@ -380,19 +380,23 @@ pub(crate) fn effective_actions(
         .and_then(|patch| patch.actions.clone())
         .or_else(|| over.and_then(|over| over.actions.clone()))
         .unwrap_or_else(|| default_actions(role));
-    // 带滚动槽的节点（含虚拟列表容器）总能接受滚动动作，与角色无关。
-    if tree.scroll_slot(node).is_some() {
+    // 带滚动槽的节点（含虚拟列表容器）总能接受滚动动作，与角色无关。E15b/F4：集合根在
+    // 「自己的虚拟行窗口被平台过滤」时接管窗口的滚动语义 ⇒ 它也必须宣告同一套滚动动作，
+    // 否则 AT 读到 `scroll` 属性却没有任何可执行动作。
+    let lifted_scroll = crate::a11y::tree::lifted_scroll_window(tree, node);
+    if tree.scroll_slot(node).is_some() || lifted_scroll.is_some() {
         for action in default_actions(A11yRole::ScrollView) {
             if !actions.contains(&action) {
                 actions.push(action);
             }
         }
     }
-    // 表格/网格只有在**真的有滚动容器**（自身滚动槽或滚动祖先）时才提供
+    // 表格/网格只有在**真的有滚动容器**（自身滚动槽 / 上提的虚拟窗口 / 滚动祖先）时才提供
     // `ScrollIntoView`：没有滚动容器时该动作必然失败，暴露出去等于给 AT 一个死按钮
     // （复审 P2-4）。
     if matches!(role, A11yRole::Table | A11yRole::Grid)
         && (tree.scroll_slot(node).is_some()
+            || lifted_scroll.is_some()
             || crate::interaction::scroll::scroll_ancestor(tree, node).is_some())
         && !actions.contains(&A11yAction::ScrollIntoView)
     {
@@ -484,7 +488,9 @@ pub(crate) fn action_allowed(tree: &NodeTree, node: NodeId, action: A11yAction) 
         | A11yAction::ScrollRight
         | A11yAction::ScrollIntoView
         | A11yAction::SetScrollOffset => {
-            let Some(container) = scroll_container(tree, node) else {
+            // 与派发共用同一份目标解析（`a11y_scroll_target`）：不能出现「能力判据解析到
+            // 窗口、派发却解析到别的容器」的分叉。
+            let Some(container) = crate::a11y::tree::a11y_scroll_target(tree, node) else {
                 return false;
             };
             effective_actions_of(tree, container).contains(&action)
@@ -565,14 +571,6 @@ fn custom_action_registered(tree: &NodeTree, node: NodeId, id: i32) -> bool {
             .map_or(&[][..], |over| over.custom_actions.as_slice()),
     };
     registered.iter().any(|custom| custom.id == id)
-}
-
-/// 滚动动作的目标收敛（自身有滚动槽就用自身，否则最近的滚动祖先）。
-fn scroll_container(tree: &NodeTree, node: NodeId) -> Option<NodeId> {
-    if tree.scroll_slot(node).is_some() {
-        return Some(node);
-    }
-    crate::interaction::scroll::scroll_ancestor(tree, node).map(|(container, _)| container)
 }
 
 /// 节点的 a11y "禁用"状态（`node_a11y` 与动作分发**共用同一判据**）。

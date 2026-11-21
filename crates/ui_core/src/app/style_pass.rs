@@ -302,15 +302,13 @@ pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePas
             }
         }
         // P11：`bind_a11y` 的差分与写回（与 `bind_style` 同一个依赖集，见方法文档）。
+        //
+        // E15b F2：这里是 `bind_a11y` 在**普通帧**里的第二份写点（节点同时有
+        // `bind_style`/`bind_text` 时帧走本 pass，不进 a11y-only pass）。必须与
+        // `refresh_a11y_bindings` 共用 `write_a11y_patch`：角色 / 隐藏变化会改变后代的
+        // 推导语义，只标本节点会让增量笔与全树分叉。
         if let Some(bind) = bind_a11y {
-            let previous = tree
-                .a11y_of(node)
-                .map_or_else(crate::a11y::A11yPatch::default, |slot| slot.patch.clone());
-            if a11y_value != previous {
-                tree.set_a11y_patch(node, a11y_value);
-                // 只标 `A11Y`：不产生视觉 damage、不清 `REUSABLE`（P03 §9.3 表第 9 行）。
-                tree.mark_a11y(node);
-            }
+            let _ = crate::a11y::tree::write_a11y_patch(tree, node, a11y_value);
             tree.put_bind_a11y(node, bind);
         }
         // `BIND` 的唯一清除点：本 pass 求值完即消费（`PAINT` 不归这里管）。

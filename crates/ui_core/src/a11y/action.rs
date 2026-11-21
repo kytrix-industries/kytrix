@@ -438,17 +438,17 @@ fn on_focus(app: &mut App, window: WindowId, node: crate::node::id::NodeId) -> b
     focusable_node && app.set_focus(window, Some(node))
 }
 
-/// 把目标收敛到**滚动容器**（自身是容器就用自身，否则找最近的祖先容器）。
+/// 把目标收敛到**滚动容器**（自身 → 上提的虚拟窗口 → 最近的祖先容器）。
+///
+/// 与 [`crate::a11y::mapping::action_allowed`] 共用同一份解析（`a11y_scroll_target`）：
+/// E15b/F4 起集合根接管被抑制窗口的滚动语义，AT 对集合根发的滚动动作必须落到那个窗口上。
 fn scroll_container(
     app: &App,
     window: WindowId,
     node: crate::node::id::NodeId,
 ) -> Option<crate::node::id::NodeId> {
     let tree = app.window(window)?.tree();
-    if tree.scroll_slot(node).is_some() {
-        return Some(node);
-    }
-    crate::interaction::scroll::scroll_ancestor(tree, node).map(|(container, _)| container)
+    crate::a11y::tree::a11y_scroll_target(tree, node)
 }
 
 /// 步进滚动（`ScrollUnit`：`Item` = 一行，`Page` = 一屏）。

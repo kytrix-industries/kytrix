@@ -2497,14 +2497,13 @@ impl App {
         a11y::off_a11y_action(self, action)
     }
 
-    /// 写一个节点的**动态** a11y 补丁并登记交付（E15）。
+    /// 写一个节点的**动态** a11y 补丁并登记交付（应用通道；E15b F3/F5 收敛）。
     ///
-    /// 与 `NodeBuilder::bind_a11y` 同一条写入通道（合并方向不变：`patch` > `A11yOverride` >
-    /// 由节点种类/结构推导），区别是求值点在应用侧：应用自己观察状态变化后把新的
-    /// [`crate::a11y::A11yPatch`] 推进来，引擎标 `A11Y` 脏位并在下一笔增量交付里重发该节点。
-    /// 用于「行 a11y 来自静态快照、但状态在面板打开期间变化」的场景（虚拟列表行由列表内核
-    /// 持有，应用拿不到句柄）：组合控件在选中集变化时对已挂载行逐个调用，或改用 `bind_a11y`
-    /// 的 `ReadCtx` 形态由信号依赖自动失效。
+    /// 详细语义见 `app::a11y::set_a11y_patch`（与 `bind_a11y` 共用差分、`affects_descendants`
+    /// 子树标记、请求帧、覆盖关系）。**公开面保留**：E15 已把本通道登记为 base_ui
+    /// `List::set_row_a11y` 静态快照的动态失效面（spec-delta E15 §4/D4，消费者在 base_ui 后续
+    /// 批），不是"未来可能需要"的预留 API；`A11yPatch::affects_descendants` 则收敛为
+    /// `pub(crate)`（只有引擎内部消费者）。
     ///
     /// # Errors
     /// `EngineError::UnknownWindow`（窗口已关闭）/ `EngineError::StaleNode`（节点已卸载）。

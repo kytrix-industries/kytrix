@@ -199,18 +199,27 @@ pub(crate) fn a11y_take(app: &mut App, window: WindowId) -> Option<crate::a11y::
     snapshot
 }
 
-/// 写一个节点的**动态** a11y 补丁并登记交付（E15）。
+/// 写一个节点的**动态** a11y 补丁并登记交付（E15；E15b F3/F5 收敛）。
 ///
-/// 与 `NodeBuilder::bind_a11y` 是同一条写入通道（合并方向不变：`patch` > `A11yOverride` >
-/// 由节点种类/结构推导），区别是求值点在**应用侧**：应用自己观察状态变化（虚拟列表行的选中
-/// 集、筛选项的勾选态……）后把新的 [`crate::a11y::A11yPatch`] 推进来，引擎标 `A11Y` 脏位并
-/// 在下一笔增量交付里重发该节点。行节点由列表内核持有、应用拿不到句柄，因此这是「静态快照
-/// 行 a11y」的动态失效面（P2-4c2/4d2 审查：`List::set_row_a11y` 捕获的行 `selected` /
-/// `checked` 在面板打开期间不刷新）；组合控件在选中集变化时对已挂载行逐个调用本方法即可，
-/// 或改用 `bind_a11y` 的 `ReadCtx` 形态由信号依赖自动失效。
+/// 与 `NodeBuilder::bind_a11y` 是同一条写入通道的**应用侧求值形态**（合并方向不变：
+/// `patch` > `A11yOverride` > 由节点种类/结构推导）。应用在**引擎外**观察到状态变化（虚拟
+/// 列表行的选中集、筛选项的勾选态……）后把新的 [`crate::a11y::A11yPatch`] 推进来；行节点由
+/// 列表内核持有、应用拿不到 builder，因此这是「静态快照行 a11y」的动态失效面（P2-4c2/4d2：
+/// `List::set_row_a11y` 捕获的行 `selected` / `checked` 在面板打开期间不刷新）。首选形态仍是
+/// `bind_a11y` 的 `ReadCtx` 形态（信号依赖自动失效），本通道只给「写入时点由应用自己掌握」
+/// 的场合。
 ///
-/// **不做等值短路**：补丁是整值替换（与 `bind_a11y` 同语义），且应用通常只在真的变化时调用；
-/// 这里多标一次 `A11Y` 最多换来一次同值重发，不产生像素工作。
+/// 写入语义与 `bind_a11y` 完全一致（共用 [`crate::a11y::tree::write_a11y_patch`]）：整值替换
+/// 并做等值短路；`role` / `hidden` 变化按 `affects_descendants` 把整棵子树标 `A11Y`（后代
+/// 派生角色、被集合领养跳过的祖先隐藏语义），其余字段只标本节点。
+///
+/// **请求一帧**（E15b F5）：`mark_a11y` 只进 `A11Y` 反向集合，`Window::needs_frame` 不看
+/// A11Y 位。泵尾回投任务里调用本方法时循环已经过了帧门禁、即将阻塞 —— 不唤醒平台，TreeUpdate
+/// 会等到下一次无关唤醒（不丢，但读屏反馈迟到；I6 的交互时效）。该帧是 a11y-only 帧：不重绘、
+/// 不提交像素（`A11yBridge` 只重发快照字段）。批处理内由 `App::batch` 合并成一次唤醒。
+///
+/// 与 `bind_a11y` 同时存在时的覆盖关系：下一次 `bind_a11y` 求值整体覆盖本通道写入的补丁
+/// （`bind` 的求值结果是唯一真相；本方法的语义因此只在两次信号失效之间有效）。
 ///
 /// # Errors
 /// `EngineError::UnknownWindow`（窗口已关闭）/ `EngineError::StaleNode`（节点已卸载）。
@@ -220,13 +229,15 @@ pub(crate) fn set_a11y_patch(
     node: crate::node::id::NodeId,
     patch: crate::a11y::A11yPatch,
 ) -> Result<(), crate::error::EngineError> {
-    let Some(target) = app.windows.get_mut(&window) else {
-        return Err(crate::error::EngineError::UnknownWindow { window });
-    };
-    let tree = target.tree_mut();
-    tree.get(node)?;
-    tree.set_a11y_patch(node, patch);
-    tree.mark_a11y(node);
+    {
+        let Some(target) = app.windows.get_mut(&window) else {
+            return Err(crate::error::EngineError::UnknownWindow { window });
+        };
+        let tree = target.tree_mut();
+        tree.get(node)?;
+        crate::a11y::tree::write_a11y_patch(tree, node, patch);
+    }
+    app.request_frame();
     Ok(())
 }
 
@@ -295,23 +306,9 @@ pub(crate) fn refresh_a11y_bindings(app: &mut App, window: WindowId) {
         let old_deps = tree.deps(node).unwrap_or(&[]);
         graph.replace_deps(owner, old_deps, tracker.as_slice());
         tree.set_deps(node, tracker.into_inner());
-        let previous = tree
-            .a11y_of(node)
-            .map_or_else(crate::a11y::A11yPatch::default, |slot| slot.patch.clone());
-        if value != previous {
-            // E15：角色 / 隐藏的变化会改变**后代**的 a11y 语义（文本角色推导、集合领养、被跳过
-            // 祖先的隐藏声明），但后代没有自己的脏位。只标本节点会让增量笔与全树分叉；
-            // 这些字段变化时整棵子树标 `A11Y`（只重发快照字段，不产生像素工作）。
-            // （`disabled` 的祖先继承只认 `StylePatch::interactive`，由 `refresh_styles` 的
-            // 子树标记覆盖；A11yPatch::disabled 不进入这条差分。）
-            let affects_descendants = value.affects_descendants(&previous);
-            tree.set_a11y_patch(node, value);
-            // 只标 `A11Y`：不产生视觉 damage、不清 `REUSABLE`（P03 §9.3 表第 9 行）。
-            tree.mark_a11y(node);
-            if affects_descendants {
-                tree.mark_subtree_a11y(node);
-            }
-        }
+        // E15b F2/F3：三个写入点共用同一份差分（等值短路 + `affects_descendants` 子树标记），
+        // 避免「a11y-only pass 修了、普通帧的 style pass 没修」这类分叉。
+        let _ = crate::a11y::tree::write_a11y_patch(tree, node, value);
         tree.put_bind_a11y(node, bind);
     }
     target.a11y_recycle_bindings(nodes);
@@ -344,7 +341,7 @@ mod tests {
     use smol_str::SmolStr;
 
     use crate::{
-        a11y::A11yPatch,
+        a11y::{A11yDiagnostic, A11yOverride, A11yPatch, A11yRole},
         app::App,
         math::{Rect, Scale, Size},
         node::{builder::NodeBuilder, id::NodeId, signal::Signal},
@@ -566,6 +563,115 @@ mod tests {
         );
         let snapshot = app.a11y_take(window).expect("重置后的第一笔必须产出");
         assert!(snapshot.full, "重置后的第一笔必须是全树");
+    }
+
+    /// E15b F5/P3：`set_a11y_patch` 必须**请求一帧**（`mark_a11y` 只进 A11Y 反向集合，
+    /// `Window::needs_frame` 不看 A11Y 位）。
+    ///
+    /// 变异守卫：删掉 `app.request_frame()` ⇒ 下一次 `App::frame` 在帧门禁前就返回空闲帧
+    /// （`a11y_only_frames == 0`），本用例红 —— 泵尾回投任务里的写入会等到下一次无关唤醒才
+    /// 投递 TreeUpdate。
+    #[test]
+    fn set_a11y_patch_requests_an_a11y_only_frame() {
+        let (_runtime, mut app, window, _label_signal, label) = fixture();
+        let first = app.frame(window).expect("window").expect("first frame");
+        assert!(matches!(first, FrameOutcome::Committed(_)));
+        let _ = app.a11y_take(window).expect("首笔 a11y 交付");
+
+        app.set_a11y_patch(
+            window,
+            label,
+            A11yPatch {
+                label: Some(SmolStr::new_static("新的")),
+                ..A11yPatch::default()
+            },
+        )
+        .expect("a11y patch");
+
+        let outcome = app.frame(window).expect("window").expect("frame");
+        assert!(
+            matches!(outcome, FrameOutcome::Idle),
+            "A11Y 变化不得提交像素（实际 {outcome:?}）"
+        );
+        let record = app
+            .window(window)
+            .expect("window")
+            .record()
+            .expect("record");
+        assert_eq!(
+            record.stats.a11y_only_frames, 1,
+            "set_a11y_patch 必须请求一帧并走 a11y-only 快路径"
+        );
+        assert!(!record.repainted, "a11y-only 帧不得重绘");
+        let snapshot = app.a11y_take(window).expect("a11y 交付");
+        assert!(!snapshot.full, "补丁必须是增量笔");
+        assert_eq!(
+            snapshot.node_for(label).expect("label").label_text(),
+            Some("新的"),
+            "请求到的帧必须把补丁带进交付"
+        );
+    }
+
+    /// E15b P4：`set_a11y_patch` 的两条错误路径（`UnknownWindow` / `StaleNode`，与既有节点
+    /// API 同型；错误面是公开契约的一部分，必须有测试）。
+    #[test]
+    fn set_a11y_patch_reports_unknown_window_and_stale_node() {
+        let (_runtime, mut app, window, _label_signal, label) = fixture();
+        let patch = A11yPatch {
+            label: Some(SmolStr::new_static("x")),
+            ..A11yPatch::default()
+        };
+        let unknown = WindowId::for_test(999);
+        assert!(matches!(
+            app.set_a11y_patch(unknown, label, patch.clone()),
+            Err(crate::error::EngineError::UnknownWindow { window: reported }) if reported == unknown
+        ));
+        let stale = NodeId::for_test(999, 1);
+        assert!(matches!(
+            app.set_a11y_patch(window, stale, patch),
+            Err(crate::error::EngineError::StaleNode { node }) if node == stale
+        ));
+    }
+
+    /// E15 P4（审查 F8）：5 个新角色加入「没有名字就没有语义」诊断名单（`MissingLabel`）。
+    #[test]
+    fn new_roles_without_a_name_are_diagnosed() {
+        let (_runtime, mut app, window, _label_signal, _label) = fixture();
+        let roles = [
+            A11yRole::ComboBox,
+            A11yRole::ListBox,
+            A11yRole::MenuItemCheckBox,
+            A11yRole::MenuItemRadio,
+            A11yRole::ColorWell,
+        ];
+        let mut nodes = Vec::with_capacity(roles.len());
+        {
+            let tree = app.window_mut(window).expect("window").tree_mut();
+            let root = tree.root();
+            for role in roles {
+                nodes.push(
+                    NodeBuilder::boxed()
+                        .a11y(A11yOverride {
+                            role: Some(role),
+                            ..A11yOverride::default()
+                        })
+                        .build(tree, root)
+                        .expect("role node"),
+                );
+            }
+        }
+        let _ = app.frame(window).expect("window").expect("frame");
+        let _ = app.a11y_take(window).expect("a11y delivery");
+        for (role, node) in roles.into_iter().zip(nodes) {
+            assert!(
+                app.a11y_diagnostics().iter().any(|diagnostic| matches!(
+                    diagnostic,
+                    A11yDiagnostic::MissingLabel { node: reported } if *reported == node
+                )),
+                "角色 {role:?} 没有名字必须记 MissingLabel：{:?}",
+                app.a11y_diagnostics()
+            );
+        }
     }
 
     /// RE-01：建窗路径取到的代际必须是窗口 `A11yBridge` 的**同一份** `Arc` —— 否则平台回调

@@ -1913,10 +1913,14 @@ mod p11_tests {
         app.assert_a11y_oracle();
     }
 
-    /// E15（Palette 态 / Tab 切换）：标签页的选中态走动态补丁；切换后增量笔必须刷新两个
-    /// Tab 的 `selected`，且 `Focus` 能力保持（`Tab` 角色 + tab_stop）。
+    /// E15：标签页的选中态走动态补丁；切换后增量笔必须刷新两个 Tab 的 `selected`。
+    ///
+    /// `Focus` 能力在本用例里只是**不变式**（`Tab` 角色 + `tab_stop`）——本用例走 a11y-only
+    /// pass，退回 `mark_a11y(node)` 也仍会绿，因此**不是** Focus 祖先链增量的回归证据（审查
+    /// F8 的归因收窄；真正的证据是 `a11y_revealing_an_ancestor_refreshes_descendant_focus_incrementally`
+    /// 与 `a11y_enabling_an_ancestor_refreshes_descendant_actions`）。
     #[test]
-    fn a11y_tab_switch_refreshes_selection_and_keeps_focus() {
+    fn a11y_tab_switch_refreshes_selection() {
         let mut app = TestApp::new();
         app.enable_a11y_capture();
         let active = app.app_mut().signal(0usize);
@@ -2069,6 +2073,196 @@ mod p11_tests {
         assert_eq!(
             crate::a11y::adapter::to_accesskit(record).role(),
             accesskit::Role::TextRun
+        );
+        app.assert_a11y_oracle();
+    }
+
+    /// E15b F2：`bind_a11y` 在**普通帧**里的第二个写点（节点同时有 `bind_style`/`bind_text`
+    /// 时帧走 style pass，不进 a11y-only pass）也必须做 `affects_descendants` 子树标记。
+    ///
+    /// 变异守卫：把 `app/style_pass.rs` 的写回退回 `mark_a11y(node)` ⇒ 文本子节点在增量笔里
+    /// 缺席 / 角色停在 `Label`（oracle 红）。
+    #[test]
+    fn a11y_role_change_through_the_style_pass_refreshes_descendant_roles() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let as_input = app.app_mut().signal(false);
+        let panel = mount(&mut app, move |tree, root| {
+            let panel = NodeBuilder::boxed()
+                .style(fixed_size_style(120.0, 40.0))
+                .a11y(A11yOverride {
+                    label: Some(SmolStr::new_static("价格")),
+                    ..A11yOverride::default()
+                })
+                // 与 `bind_a11y` 读同一个信号：节点因此有像素工作，帧走普通 style pass
+                // （`refresh_styles` 里的 bind_a11y 写点），而不是 a11y-only pass。
+                .bind_style(move |cx| StylePatch {
+                    opacity: Some(if *cx.read(&as_input) { 0.5 } else { 1.0 }),
+                    ..StylePatch::default()
+                })
+                .bind_a11y(move |cx| A11yPatch {
+                    role: Some(if *cx.read(&as_input) {
+                        A11yRole::TextInput
+                    } else {
+                        A11yRole::Group
+                    }),
+                    ..A11yPatch::default()
+                })
+                .id("panel")
+                .build(tree, root)
+                .expect("panel");
+            NodeBuilder::text("42150", TextStyle::new(12.0))
+                .id("value")
+                .build(tree, panel)
+                .expect("text");
+            panel
+        });
+        let text = child_of(&app, panel);
+        let _ = app.drain().expect("seed");
+        assert_eq!(
+            snapshot(&app).node_for(text).expect("text").role,
+            A11yRole::Label,
+            "普通容器里的文本是 Label"
+        );
+
+        app.app_mut().write(&as_input, true);
+        let _ = app.drain().expect("style pass frame");
+        assert!(
+            !app.frame_record().a11y_only,
+            "本帧有 bind_style 工作，必须走普通 style pass（不是 a11y-only 快路径）"
+        );
+        let snap = snapshot(&app);
+        assert!(!snap.full, "角色变化必须是增量笔");
+        let record = snap
+            .node_for(text)
+            .expect("style pass 的 bind_a11y 写点也必须重发后代（F2）");
+        assert_eq!(
+            record.role,
+            A11yRole::TextRun,
+            "父角色变成 TextInput 后文本子节点必须被推导成 TextRun"
+        );
+        app.assert_a11y_oracle();
+    }
+
+    /// E15b F3：`App::set_a11y_patch`（应用显式通道）与 `bind_a11y` 共用同一份差分 ——
+    /// 祖先 `role` 变化同样必须重发后代（旧实现只标本节点）。
+    ///
+    /// 变异守卫：`set_a11y_patch` 退回 `mark_a11y(node)` ⇒ 本用例红。
+    #[test]
+    fn a11y_set_patch_refreshes_descendant_derived_roles() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let panel = mount(&mut app, |tree, root| {
+            let panel = NodeBuilder::boxed()
+                .style(fixed_size_style(120.0, 40.0))
+                .a11y(A11yOverride {
+                    label: Some(SmolStr::new_static("价格")),
+                    ..A11yOverride::default()
+                })
+                .id("panel")
+                .build(tree, root)
+                .expect("panel");
+            NodeBuilder::text("42150", TextStyle::new(12.0))
+                .id("value")
+                .build(tree, panel)
+                .expect("text");
+            panel
+        });
+        let text = child_of(&app, panel);
+        let _ = app.drain().expect("seed");
+        assert_eq!(
+            snapshot(&app).node_for(text).expect("text").role,
+            A11yRole::Label
+        );
+
+        app.app_mut()
+            .set_a11y_patch(
+                window,
+                panel,
+                A11yPatch {
+                    role: Some(A11yRole::TextInput),
+                    ..A11yPatch::default()
+                },
+            )
+            .expect("explicit a11y patch");
+        let _ = app.drain().expect("patch frame");
+        let snap = snapshot(&app);
+        assert!(!snap.full, "显式补丁必须是增量笔");
+        let record = snap
+            .node_for(text)
+            .expect("set_a11y_patch 通道也必须重发后代（F3）");
+        assert_eq!(
+            record.role,
+            A11yRole::TextRun,
+            "显式补丁与 bind_a11y 同通道：role → 后代 TextRun"
+        );
+        app.assert_a11y_oracle();
+    }
+
+    /// E15b F6（审查 M8 的零测试缺口）：祖先的 `hidden` 变化会改变**被集合领养的后代**的
+    /// 隐藏语义（`hidden_by_skipped_ancestors`：被跳过的物理祖先的隐藏声明沿 a11y 子树继承），
+    /// 但后代没有自己的脏位 —— `affects_descendants` 的 `hidden` 分支必须标子树。
+    ///
+    /// 变异守卫：删掉 `A11yPatch::affects_descendants` 的 `hidden` 比较 ⇒ 本用例红。
+    #[test]
+    fn a11y_hidden_change_refreshes_adopted_descendant_hidden() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let hidden = app.app_mut().signal(false);
+        let table = mount(&mut app, move |tree, root| {
+            let table = NodeBuilder::boxed()
+                .style(fixed_size_style(200.0, 60.0))
+                .a11y(A11yOverride {
+                    role: Some(A11yRole::Table),
+                    label: Some(SmolStr::new_static("行情")),
+                    ..A11yOverride::default()
+                })
+                .id("table")
+                .build(tree, root)
+                .expect("table");
+            // 包裹层是被集合领养**跳过**的物理祖先：它的 hidden 不沿物理父链继承，而是由
+            // `hidden_by_skipped_ancestors` 折算到 Row 自己的记录上 —— Row 因此没有脏位。
+            let wrapper = NodeBuilder::boxed()
+                .style(fixed_size_style(200.0, 20.0))
+                .bind_a11y(move |cx| A11yPatch {
+                    hidden: Some(*cx.read(&hidden)),
+                    ..A11yPatch::default()
+                })
+                .id("wrapper")
+                .build(tree, table)
+                .expect("wrapper");
+            NodeBuilder::boxed()
+                .style(fixed_size_style(200.0, 20.0))
+                .a11y(A11yOverride {
+                    role: Some(A11yRole::Row),
+                    ..A11yOverride::default()
+                })
+                .id("row")
+                .build(tree, wrapper)
+                .expect("row");
+            table
+        });
+        let wrapper = child_of(&app, table);
+        let row = child_of(&app, wrapper);
+        let _ = app.drain().expect("seed");
+        let seeded = snapshot(&app);
+        assert!(!seeded.node_for(row).expect("row").hidden, "初始不隐藏");
+        assert_eq!(
+            seeded.node_for(row).expect("row").parent,
+            Some(seeded.node_for(table).expect("table").id),
+            "行被领养到 Table 下（物理父是包裹层）"
+        );
+
+        app.app_mut().write(&hidden, true);
+        let _ = app.drain().expect("hidden change");
+        let snap = snapshot(&app);
+        assert!(!snap.full);
+        assert!(
+            snap.node_for(row)
+                .expect("被领养行必须重发（affects_descendants 的 hidden 分支）")
+                .hidden,
+            "跳过的物理祖先声明 hidden ⇒ 被领养的后代必须隐藏"
         );
         app.assert_a11y_oracle();
     }

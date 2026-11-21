@@ -375,6 +375,11 @@ fn node_summary(id: AkNodeId, node: &accesskit::Node) -> String {
     if node.clips_children() {
         let _ = write!(out, " clips_children");
     }
+    // 方向（E15b P4）：显式声明或滚动轴推导出的 `orientation` 必须进 oracle 摘要，否则
+    // 增量笔漏发 / 发错方向时增量与全树不会分叉（E15 审查 F8）。
+    if let Some(orientation) = node.orientation() {
+        let _ = write!(out, " orientation={orientation:?}");
+    }
     if !node.custom_actions().is_empty() {
         let mut custom: Vec<String> = node
             .custom_actions()

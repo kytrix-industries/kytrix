@@ -150,10 +150,14 @@ pub enum A11yRole {
     ListBox,
     /// 可勾选菜单项（`role="menuitemcheckbox"`）。
     ///
-    /// 勾选态走 `A11yPatch::checked`（AccessKit 的 `Toggled`）—— 与 `MenuItem` 的区别就在这里：
-    /// `MenuItem` 不读 `checked`，AT 因此不会播报勾选。三端映射：UIA
-    /// `UIA_CheckBoxControlTypeId`（`aria_role = "menuitemcheckbox"`，勾选走 TogglePattern）；
-    /// macOS `NSAccessibilityMenuItemRole`（勾选走 value）；AT-SPI `AtspiRole::CheckMenuItem`。
+    /// 与 [`Self::MenuItem`] 的差别是**角色语义**（`menuitemcheckbox` 的 control type / aria
+    /// role），不是勾选态的通道：引擎对任意角色都把 `A11yPatch::checked` 透传成
+    /// `set_toggled`（`a11y/tree.rs`），三端 AT 也按 `Toggled` 是否有值决定是否暴露
+    /// TogglePattern / value / `Checked` —— `MenuItem` + `checked` 同样会被播报。用本角色的
+    /// 理由是让 UIA / AT-SPI 拿到「可勾选菜单项」的 control type / `AtspiRole`。
+    /// 三端映射：UIA `UIA_CheckBoxControlTypeId`（`aria_role = "menuitemcheckbox"`，勾选走
+    /// TogglePattern）；macOS `NSAccessibilityMenuItemRole`（勾选走 value）；AT-SPI
+    /// `AtspiRole::CheckMenuItem`。
     ///
     /// 拼写沿用 AccessKit 0.25 的 `MenuItemCheckBox`（与本枚举既有的 [`Self::CheckBox`] 同款
     /// 大小写；E15 登记文档里写作 `MenuItemCheckbox`）。
@@ -567,9 +571,12 @@ impl A11yPatch {
     /// 其余字段只描述本节点，改它们只需重发本节点（`mark_a11y`）；这里返回 `false` 时调用方
     /// 不做 O(子树) 的标记。（`disabled` 的**祖先继承**只认 `StylePatch::interactive`，那条
     /// 通道在 `refresh_styles` 里走同一套子树标记，不经过本补丁差分。）
-    /// 消费者：`app::a11y::refresh_a11y_bindings`（`bind_a11y` 的差分写回）。
+    ///
+    /// 只供引擎内部使用（公开面最小化，E15b P3）：唯一消费者是
+    /// [`crate::a11y::tree::write_a11y_patch`]，三个写入点（`bind_a11y` 的 a11y-only pass、
+    /// 普通帧的 style pass、`App::set_a11y_patch`）共用同一份差分。
     #[must_use]
-    pub fn affects_descendants(&self, previous: &Self) -> bool {
+    pub(crate) fn affects_descendants(&self, previous: &Self) -> bool {
         self.role != previous.role || self.hidden != previous.hidden
     }
 }
@@ -1098,6 +1105,51 @@ impl std::fmt::Debug for A11yActionCtx<'_> {
             .field("action", &self.action)
             .field("data", &self.data)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{A11yPatch, A11yRole};
+
+    /// E15b（F6/P3）：`affects_descendants` 只认**沿 a11y 子树作用**的字段（`role` / `hidden`），
+    /// 其余字段只描述本节点。
+    ///
+    /// 变异守卫：删掉 `hidden` 比较 ⇒ 本用例红（M8 的零测试缺口）；把比较放宽成"任意字段变化
+    /// 都算" ⇒ `label` / 默认值两条断言红。
+    #[test]
+    fn affects_descendants_only_tracks_scope_fields() {
+        let base = A11yPatch::default();
+        let role = A11yPatch {
+            role: Some(A11yRole::TextInput),
+            ..A11yPatch::default()
+        };
+        let hidden = A11yPatch {
+            hidden: Some(true),
+            ..A11yPatch::default()
+        };
+        let label = A11yPatch {
+            label: Some(smol_str::SmolStr::new_static("价格")),
+            ..A11yPatch::default()
+        };
+        assert!(
+            role.affects_descendants(&base),
+            "role 会改变后代的推导角色（Label ↔ TextRun、集合领养）"
+        );
+        assert!(
+            hidden.affects_descendants(&base),
+            "被集合领养跳过的物理祖先 hidden 会被后代继承"
+        );
+        assert!(role.affects_descendants(&hidden));
+        assert!(
+            !label.affects_descendants(&base),
+            "label 只描述本节点，不该触发 O(子树) 标记"
+        );
+        assert!(!base.affects_descendants(&A11yPatch::default()));
+        assert!(
+            base.affects_descendants(&role),
+            "撤掉覆盖（Some → None）同样改变后代的合并角色"
+        );
     }
 }
 
