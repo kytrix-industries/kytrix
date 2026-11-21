@@ -1,13 +1,31 @@
 //! P11 a11y：快照交付与捕获（窗口侧入口）。
 
 use super::Window;
+use crate::node::id::NodeId;
+
+/// 交付给 AT 的**有效焦点**（E12）：与 [`crate::app::App::focused`] 同一判据 —— 模态作用域
+/// 外的焦点视为无焦点。
+///
+/// 为什么不能直接用 `window.focus.focused()`：模态刚打开时背景控件可能仍持有焦点
+/// （`validate_focus` 要等下一次输入才把它移进对话框），若把背景节点作为 `TreeUpdate.focus`
+/// 发出去，AT 的焦点会停在一个已经被标 `hidden` 的节点上 —— 与「背景 inert」自相矛盾。
+/// 三个读点（`a11y_pending` / `a11y_focus_pending` / `a11y_take`）必须用**同一个**有效焦点，
+/// 否则 `pending` 会与已交付焦点永远不相等（每轮都判「焦点变了」= 破坏 I3）。
+fn effective_focus(window: &Window) -> Option<NodeId> {
+    let focus = window.focus.focused()?;
+    if window.tree.get(focus).is_err() {
+        return None;
+    }
+    let scope = crate::interaction::overlay::focus_scope_root(&window.tree, window.tree.root());
+    crate::interaction::overlay::in_modal_scope(&window.tree, focus, scope).then_some(focus)
+}
 
 // 消费者：`impl Window::a11y_pending` 的薄委托（外部调用点见该方法文档）。
 // ── P11：a11y（快照交付 + 捕获） ─────────────────────────────────────────
 
 /// 本轮是否有 a11y 工作（O(1)；平台泵每轮用它过滤 `update_if_active` 调用）。
 pub(crate) fn a11y_pending(window: &Window) -> bool {
-    window.a11y.pending(&window.tree, window.focus.focused())
+    window.a11y.pending(&window.tree, effective_focus(window))
 }
 
 // 消费者：`impl Window::a11y_focus_pending` 的薄委托。
@@ -17,7 +35,7 @@ pub(crate) fn a11y_pending(window: &Window) -> bool {
 pub(crate) fn a11y_focus_pending(window: &Window) -> bool {
     window
         .a11y
-        .focus_pending(&window.tree, window.focus.focused())
+        .focus_pending(&window.tree, effective_focus(window))
 }
 
 /// 消费端树生命周期代际句柄（E1）：交给平台 adapter 的激活/停用回调 `bump()`。
@@ -79,10 +97,11 @@ pub(crate) fn a11y_take(
     window: &mut Window,
     diagnostics: &mut Vec<crate::a11y::A11yDiagnostic>,
 ) -> Option<crate::a11y::A11yTreeSnapshot> {
+    // 有效焦点在解构前求（解构把 `window` 的字段借走，`effective_focus` 需要整个 `&Window`）。
+    let focus = effective_focus(window);
     let Window {
         tree,
         a11y,
-        focus,
         scale,
         options,
         ime_cursor,
@@ -93,7 +112,7 @@ pub(crate) fn a11y_take(
     let caret = ime_cursor.map(|request| (request.node, request.byte_index));
     a11y.take(
         tree,
-        focus.focused(),
+        focus,
         *scale,
         options.title.as_str(),
         caret,

@@ -42,13 +42,20 @@ pub(crate) fn focus_scope(app: &App, window: WindowId) -> Option<NodeId> {
     overlay_util::focus_scope_root(tree, tree.root())
 }
 
-/// 指针当前悬停的节点（陈旧节点视为无悬停）。
+/// 指针当前悬停的节点（陈旧节点 / **模态作用域外** ⇒ 无悬停）。
 /// 消费者：`App::hovered`。
 #[must_use]
 pub(crate) fn hovered(app: &App, window: WindowId) -> Option<NodeId> {
     let target = app.windows.get(&window)?;
     let node = target.pointer().hovered?;
-    target.tree().get(node).ok().map(|_| node)
+    let tree = target.tree();
+    if tree.get(node).is_err() {
+        return None;
+    }
+    // 模态作用域（E12）：作用域外的悬停读作 `None` —— tooltip / `:hover` 的驱动方（应用层）
+    // 由此天然拿不到背景节点，不必各自重实现「模态挡住了吗」。
+    let scope = overlay_util::focus_scope_root(tree, tree.root());
+    overlay_util::in_modal_scope(tree, node, scope).then_some(node)
 }
 
 /// 清理失效焦点（读取路径都是只读，清理集中在这里）。

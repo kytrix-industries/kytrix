@@ -19,12 +19,13 @@ use crate::{
 /// `pointer_captured()` 永久返回死节点、平台捕获永不释放、按下记录卡在「按住」。
 pub(crate) fn remove_node(app: &mut App, window: WindowId, node: NodeId) -> bool {
     // 先取浮层的 opener（删除之后槽随节点一起消失）。
-    let opener = app.windows.get(&window).and_then(|target| {
-        target
-            .tree()
-            .overlay_slot(node)
-            .filter(|slot| slot.restore_focus)
-            .and_then(|slot| slot.opener)
+    let (opener, modal) = app.windows.get(&window).map_or((None, false), |target| {
+        let slot = target.tree().overlay_slot(node);
+        (
+            slot.filter(|slot| slot.restore_focus)
+                .and_then(|slot| slot.opener),
+            slot.is_some_and(|slot| slot.trap_focus),
+        )
     });
     // 捕获目标（含「被删节点是捕获目标的祖先」）⇒ 先收尾会话：结束拖拽（派发
     // `DragPhase::Cancel`）、清按压/待定拖拽、请求平台释放捕获、清悬停。
@@ -71,6 +72,11 @@ pub(crate) fn remove_node(app: &mut App, window: WindowId, node: NodeId) -> bool
         let tree = target.tree();
         app.scoped_bindings
             .retain(|scoped| scoped.window != window || tree.get(scoped.scope).is_ok());
+        // 模态浮层关闭 ⇒ 背景的 a11y `hidden` 语义整体恢复：全树标 `A11Y`，下一笔增量
+        // 交付必须把「背景重新可见」送到 AT（与 `create_overlay` 的打开路径对称）。
+        if modal {
+            crate::a11y::tree::mark_modal_scope_changed(target.tree_mut());
+        }
         app.request_frame();
         super::focus::restore_focus(app, window, opener);
     }

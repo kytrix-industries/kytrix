@@ -128,9 +128,11 @@ pub(crate) fn node_a11y_with_cache(
     let description = effective_description(over, patch);
     // 与 `selected` / `expanded` 同型：布尔状态只走动态补丁（`A11yOverride` 不承载）。
     let checked = patch.and_then(|patch| patch.checked);
-    // 隐藏 = 本地判据 ∪ 被领养跳过的物理祖先的隐藏声明（AccessKit 只沿 a11y 子树继承）。
+    // 隐藏 = 本地判据 ∪ 被领养跳过的物理祖先的隐藏声明（AccessKit 只沿 a11y 子树继承）
+    //        ∪ 模态作用域外（E12：背景 inert，见 [`hidden_outside_modal_scope`]）。
     let hidden = is_hidden(target, role, label.as_ref(), over, patch)
-        || hidden_by_skipped_ancestors(tree, node, parent);
+        || hidden_by_skipped_ancestors(tree, node, parent)
+        || hidden_outside_modal_scope(tree, node);
     let disabled = a11y_disabled(tree, node);
     // `read_only` 必须在能力计算之前求（E3：能力集 = 分发判据，read_only 剔除值变更类动作）。
     let read_only = a11y_read_only(tree, node);
@@ -238,11 +240,18 @@ pub(crate) fn node_a11y_with_cache(
             .is_ok_and(|state| state.style().clip != Clip::None);
 
     // 表单 / 状态属性（R13-14）。`read_only` 已在能力计算之前求（E3）。
-    let modal = patch
-        .and_then(|patch| patch.modal)
-        .or_else(|| over.map(|over| over.modal))
-        // 浮层自动模态：`Dialog` 角色且确实在浮层槽里 ⇒ AT 必须把阅读限制在对话框内。
-        .unwrap_or_else(|| role == A11yRole::Dialog && tree.overlay_slot(node).is_some());
+    //
+    // 模态（E12）：浮层包装的 `aria-modal` 跟**引擎的模态作用域**走（`OverlaySlot::trap_focus`），
+    // 不跟角色走、也不被 `A11yOverride::modal = false`（静态声明的默认值）吞掉 —— 否则
+    // 「声明了 Dialog 角色」反而会把真正的模态声明成非模态。非浮层节点仍可用
+    // `A11yOverride::modal` / `A11yPatch::modal` 显式声明；动态补丁最优先。
+    let modal =
+        patch
+            .and_then(|patch| patch.modal)
+            .unwrap_or_else(|| match tree.overlay_slot(node) {
+                Some(slot) => slot.trap_focus,
+                None => over.is_some_and(|over| over.modal),
+            });
     let busy = patch
         .and_then(|patch| patch.busy)
         .or_else(|| over.map(|over| over.busy))
@@ -836,6 +845,41 @@ fn hidden_by_skipped_ancestors(tree: &NodeTree, node: NodeId, a11y_parent: Optio
 
 fn children_of(tree: &NodeTree, node: NodeId) -> &[NodeId] {
     tree.get(node).map_or(&[], |target| target.children())
+}
+
+/// 模态作用域外 ⇒ a11y `hidden`（E12：背景 `inert` / `aria-hidden` 语义）。
+///
+/// 判据与交互层**同一份**：模态浮层的作用域 = 模态子树 ∪ 经 `opener` 链属于该模态的弹出层
+/// （[`crate::interaction::overlay::in_modal_scope`]）。它和焦点陷阱、指针 hover/按下过滤
+/// 共用 `focus_scope_root`，因此「AT 读到什么」与「鼠标键盘能操作什么」不会分叉。
+///
+/// 例外是**窗口根**：它是模态浮层的祖先，隐藏它会把对话框一起隐藏。引擎把浮层恒挂 root，
+/// 所以 root 之外不存在「作用域内的节点却位于根之上」的情况。
+///
+/// 注意：`hidden` 沿 a11y 子树向下继承（AccessKit 语义），背景节点的后代无需逐节点标记也
+/// 会隐藏；这里仍逐节点计算是为了让快照/增量直接可断言（数据库式真相，不依赖 AT 侧继承）。
+fn hidden_outside_modal_scope(tree: &NodeTree, node: NodeId) -> bool {
+    if node == tree.root() {
+        return false;
+    }
+    let Some(scope) = crate::interaction::overlay::focus_scope_root(tree, tree.root()) else {
+        return false;
+    };
+    !crate::interaction::overlay::in_modal_scope(tree, node, Some(scope))
+}
+
+/// 模态作用域变化（模态浮层打开 / 关闭 / 提到栈顶）⇒ 整棵树的 a11y `hidden` 语义都变了。
+///
+/// [`hidden_outside_modal_scope`] 是**每节点**的判据，而 a11y 交付是增量的：背景节点没有
+/// 自己的脏位就永远不会重发，AT 影子树里会留着旧的 `hidden = false`。引擎的做法是在作用域
+/// 改变时把全树标 `A11Y`（O(n) 一次；模态开合的频次远低于任何一帧的节点数），下一笔交付
+/// 把新 hidden 状态带到 AT。消费者：`create_overlay`（模态）/ `remove_node` / `bring_overlay_to_front`。
+pub(crate) fn mark_modal_scope_changed(tree: &mut NodeTree) {
+    let mut ids = Vec::with_capacity(tree.len());
+    tree.for_each_subtree(tree.root(), |node| ids.push(node));
+    for node in ids {
+        tree.mark_a11y(node);
+    }
 }
 
 fn derive_table_semantics(
@@ -1705,6 +1749,23 @@ mod tests {
             .expect("snapshot")
     }
 
+    /// 给节点挂浮层槽（E12 测试的公共前置：模态作用域来自 `OverlaySlot::trap_focus`）。
+    fn declare_overlay(
+        tree: &mut NodeTree,
+        node: NodeId,
+        trap_focus: bool,
+        opener: Option<NodeId>,
+    ) {
+        tree.ensure_interaction(node).expect("interaction").overlay =
+            Some(crate::interaction::OverlaySlot {
+                dismiss: crate::interaction::OverlayDismiss::Explicit,
+                placement: crate::interaction::OverlayPlacement::Point(crate::math::Point::ZERO),
+                trap_focus,
+                opener,
+                restore_focus: false,
+            });
+    }
+
     /// a11y 树的硬不变量：每个节点**只有一个父**，且父的 `children` 必须列出它（无孤儿 / 无双父）。
     ///
     /// 引擎侧快照（不是 `TreeUpdate`）也要钉住这条：F1 这类「同一节点同时挂在 Table 与物理父
@@ -2262,5 +2323,204 @@ mod tests {
         );
         assert_eq!(nested_record.parent, Some(inner_item_record.id));
         assert_single_parent_per_node(&tree, &mut ids, &mut tables);
+    }
+
+    /// E12：浮层包装节点是**容器**，不是对话框 —— 引擎不再按浮层槽猜角色。
+    ///
+    /// 这里钉住三条：
+    /// 1. 没有 `role` 声明 ⇒ `GenericContainer`（平台侧透明，不会让 AT 读成对话框）；
+    /// 2. 默认动作表为空（旧实现的 `Dialog` 默认带 `Expand`/`Collapse`，是死动作）；
+    /// 3. 显式声明的角色（Menu / Dialog / AlertDialog / Tooltip）原样生效，不被 kind 覆盖。
+    #[test]
+    fn an_overlay_wrapper_is_a_container_unless_it_declares_a_role() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let plain = NodeBuilder::boxed()
+            .build(&mut tree, root)
+            .expect("overlay");
+        declare_overlay(&mut tree, plain, false, None);
+        let menu = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Menu),
+                label: Some(smol_str::SmolStr::new_static("交易菜单")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("menu");
+        declare_overlay(&mut tree, menu, false, None);
+        let dialog = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Dialog),
+                label: Some(smol_str::SmolStr::new_static("确认下单")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("dialog");
+        declare_overlay(&mut tree, dialog, false, None);
+        let alert = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::AlertDialog),
+                label: Some(smol_str::SmolStr::new_static("风险提示")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("alert");
+        declare_overlay(&mut tree, alert, false, None);
+
+        let mut ids = A11yIds::new();
+        let mut tables = super::CollectionSemanticsCache::default();
+        let plain_record = snapshot_with(&tree, plain, &mut ids, &mut tables);
+        assert_eq!(
+            plain_record.role,
+            A11yRole::GenericContainer,
+            "没有显式声明的浮层包装必须按容器处理（不得猜成 Dialog）"
+        );
+        assert!(
+            plain_record.actions.is_empty(),
+            "浮层包装不得自动宣告 Expand/Collapse：{:?}",
+            plain_record.actions
+        );
+        assert!(!plain_record.modal, "非模态浮层的包装不是 modal");
+
+        let menu_record = snapshot_with(&tree, menu, &mut ids, &mut tables);
+        assert_eq!(menu_record.role, A11yRole::Menu, "显式 Menu 角色必须生效");
+        assert_eq!(menu_record.label_text(), Some("交易菜单"));
+        assert!(menu_record.actions.is_empty(), "Menu 默认不宣告动作");
+        assert_eq!(
+            crate::a11y::adapter::to_accesskit(&menu_record).role(),
+            accesskit::Role::Menu
+        );
+
+        let dialog_record = snapshot_with(&tree, dialog, &mut ids, &mut tables);
+        assert_eq!(dialog_record.role, A11yRole::Dialog);
+        assert!(
+            !dialog_record
+                .actions
+                .contains(&crate::a11y::A11yAction::Expand),
+            "显式 Dialog 也不得默认宣告 Expand（aria-expanded 属于触发器）"
+        );
+        let alert_record = snapshot_with(&tree, alert, &mut ids, &mut tables);
+        assert_eq!(alert_record.role, A11yRole::AlertDialog);
+        assert_eq!(
+            crate::a11y::adapter::to_accesskit(&alert_record).role(),
+            accesskit::Role::AlertDialog
+        );
+    }
+
+    /// E12：模态浮层的作用域外节点在 a11y 树里标 `hidden`（背景 `inert` / `aria-hidden`）。
+    ///
+    /// 关键断言：
+    /// - 根**不**隐藏（它是模态的祖先）；
+    /// - 模态包装、模态子树里的节点不隐藏（AT 仍可读对话框内容）；
+    /// - 背景与「不属于该模态的另一个浮层」都隐藏；
+    /// - 包装的 a11y `modal` 跟 `OverlaySlot::trap_focus` 走（不再要求角色是 Dialog）。
+    #[test]
+    fn a_modal_overlay_hides_the_background_from_a11y() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let background = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Button),
+                label: Some(smol_str::SmolStr::new_static("下单")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("background");
+        let stray_overlay = NodeBuilder::boxed().build(&mut tree, root).expect("popup");
+        declare_overlay(&mut tree, stray_overlay, false, None);
+        let stray_item = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::MenuItem),
+                label: Some(smol_str::SmolStr::new_static("复制")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, stray_overlay)
+            .expect("popup item");
+        let modal = NodeBuilder::boxed().build(&mut tree, root).expect("modal");
+        declare_overlay(&mut tree, modal, true, None);
+        let confirm = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Button),
+                label: Some(smol_str::SmolStr::new_static("确认")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, modal)
+            .expect("confirm");
+
+        let mut ids = A11yIds::new();
+        let mut tables = super::CollectionSemanticsCache::default();
+        let root_record = snapshot_with(&tree, root, &mut ids, &mut tables);
+        assert!(!root_record.hidden, "根是模态的祖先，必须保持可见");
+        let background_record = snapshot_with(&tree, background, &mut ids, &mut tables);
+        assert!(
+            background_record.hidden,
+            "模态作用域外的背景节点必须 aria-hidden"
+        );
+        assert!(
+            crate::a11y::adapter::to_accesskit(&background_record).is_hidden(),
+            "hidden 必须真的落进 accesskit::Node"
+        );
+        let stray_record = snapshot_with(&tree, stray_overlay, &mut ids, &mut tables);
+        assert!(stray_record.hidden, "不属于该模态的浮层也必须隐藏");
+        assert!(snapshot_with(&tree, stray_item, &mut ids, &mut tables).hidden);
+
+        let modal_record = snapshot_with(&tree, modal, &mut ids, &mut tables);
+        assert!(!modal_record.hidden, "模态包装本身必须可见");
+        assert_eq!(
+            modal_record.role,
+            A11yRole::GenericContainer,
+            "未声明的包装仍是容器（模态由 trap_focus 表达，不靠 Dialog 角色）"
+        );
+        assert!(modal_record.modal, "a11y modal 跟 trap_focus 走");
+        let modal_ak = crate::a11y::adapter::to_accesskit(&modal_record);
+        assert!(modal_ak.is_modal(), "accesskit::Node 必须带 modal 状态");
+        assert!(!snapshot_with(&tree, confirm, &mut ids, &mut tables).hidden);
+
+        // 正反对照：没有模态时背景可见（hidden 不是常态）。
+        tree.ensure_interaction(modal).expect("interaction").overlay = None;
+        let mut fresh_ids = A11yIds::new();
+        let mut fresh_tables = super::CollectionSemanticsCache::default();
+        assert!(
+            !snapshot_with(&tree, background, &mut fresh_ids, &mut fresh_tables).hidden,
+            "没有模态时背景不得隐藏"
+        );
+    }
+
+    /// E12：模态里打开的弹出层经 `opener` 链属于作用域 ⇒ a11y 不隐藏（与交互层同判据）。
+    #[test]
+    fn a_popup_opened_inside_the_modal_stays_visible_to_a11y() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let modal = NodeBuilder::boxed().build(&mut tree, root).expect("modal");
+        declare_overlay(&mut tree, modal, true, None);
+        let trigger = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Button),
+                label: Some(smol_str::SmolStr::new_static("选择数量")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, modal)
+            .expect("trigger");
+        let menu = NodeBuilder::boxed().build(&mut tree, root).expect("menu");
+        declare_overlay(&mut tree, menu, false, Some(trigger));
+        let item = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::MenuItem),
+                label: Some(smol_str::SmolStr::new_static("全部")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, menu)
+            .expect("item");
+
+        let mut ids = A11yIds::new();
+        let mut tables = super::CollectionSemanticsCache::default();
+        assert!(
+            !snapshot_with(&tree, menu, &mut ids, &mut tables).hidden,
+            "opener 在模态内的弹出层属于作用域，不得隐藏"
+        );
+        assert!(
+            !snapshot_with(&tree, item, &mut ids, &mut tables).hidden,
+            "弹出层内容对 AT 必须可见（对话框里的下拉菜单）"
+        );
     }
 }

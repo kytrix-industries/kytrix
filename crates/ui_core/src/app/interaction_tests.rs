@@ -3016,6 +3016,7 @@ fn a_modal_overlay_traps_focus_and_restores_it_on_close() {
                 dismiss: OverlayDismiss::Explicit,
                 trap_focus: true,
                 restore_focus: true,
+                a11y: crate::a11y::A11yOverride::default(),
             },
         )
         .expect("overlay");
@@ -3246,6 +3247,7 @@ fn a_popup_opened_from_a_modal_receives_clicks() {
                 dismiss: OverlayDismiss::Explicit,
                 trap_focus: true,
                 restore_focus: true,
+                a11y: crate::a11y::A11yOverride::default(),
             },
         )
         .expect("modal");
@@ -3341,6 +3343,7 @@ fn a_popup_opened_in_the_same_callback_as_its_modal_receives_clicks() {
                 dismiss: OverlayDismiss::Explicit,
                 trap_focus: true,
                 restore_focus: true,
+                a11y: crate::a11y::A11yOverride::default(),
             },
         )
         .expect("modal");
@@ -3429,6 +3432,7 @@ fn a_popup_opened_without_any_focus_still_receives_clicks() {
                 dismiss: OverlayDismiss::Explicit,
                 trap_focus: true,
                 restore_focus: true,
+                a11y: crate::a11y::A11yOverride::default(),
             },
         )
         .expect("modal");
@@ -3523,6 +3527,7 @@ fn a_modal_opened_without_any_focus_fills_the_first_focusable_node() {
                 dismiss: OverlayDismiss::Explicit,
                 trap_focus: true,
                 restore_focus: true,
+                a11y: crate::a11y::A11yOverride::default(),
             },
         )
         .expect("modal");
@@ -3587,6 +3592,7 @@ fn enter_cannot_activate_a_background_button_behind_a_modal() {
                 dismiss: OverlayDismiss::Explicit,
                 trap_focus: true,
                 restore_focus: true,
+                a11y: crate::a11y::A11yOverride::default(),
             },
         )
         .expect("modal");
@@ -3931,4 +3937,353 @@ fn a_two_dimensional_wheel_delta_is_split_across_the_scroll_chain() {
         3.0,
         "纵向分量必须传给外层容器"
     );
+}
+
+// ── E12：浮层 a11y 角色 + 模态作用域 ─────────────────────────────────────
+
+/// E12：浮层包装节点的 a11y 角色来自**显式声明**，`App::modal_scope` 是可查询的模态作用域。
+///
+/// 旧实现把每个浮层包装节点自动推成 `Dialog`（并带 Expand/Collapse 死动作），菜单 / tooltip
+/// 会被 AT 读成对话框；而且应用无法在建节点后覆写（`Tree::set_a11y_patch` 是 crate 内 API）。
+/// 现在：无声明 ⇒ `GenericContainer`；声明 Menu / Dialog 原样生效；模态状态由 `trap_focus`
+/// 表达（包装的 `aria-modal` 跟它走，不再跟角色走）。
+#[test]
+fn an_overlay_a11y_role_is_declared_explicitly_and_the_modal_scope_is_queryable() {
+    let (_rt, mut app, window) = setup();
+    frame(&mut app, window);
+    assert_eq!(app.modal_scope(window), None, "没有模态浮层");
+
+    let menu = app
+        .create_overlay(
+            window,
+            OverlayOptions {
+                placement: OverlayPlacement::Point(Point::new(120.0, 60.0)),
+                dismiss: OverlayDismiss::OutsideClick,
+                a11y: crate::a11y::A11yOverride {
+                    role: Some(crate::a11y::A11yRole::Menu),
+                    label: Some(smol_str::SmolStr::new_static("交易菜单")),
+                    ..crate::a11y::A11yOverride::default()
+                },
+                ..OverlayOptions::default()
+            },
+        )
+        .expect("menu");
+    frame(&mut app, window);
+    let snapshot = app.a11y_take(window).expect("首笔 a11y 交付");
+    let menu_record = snapshot
+        .node_for(menu.node())
+        .expect("浮层包装必须出现在 a11y 树里");
+    assert_eq!(
+        menu_record.role,
+        crate::a11y::A11yRole::Menu,
+        "显式 Menu 角色必须生效（不得被浮层 kind 覆盖成 Dialog）"
+    );
+    assert_eq!(menu_record.label_text(), Some("交易菜单"));
+    assert!(
+        menu_record.actions.is_empty(),
+        "菜单包装不得自动宣告 Expand/Collapse：{:?}",
+        menu_record.actions
+    );
+    assert!(!menu_record.hidden);
+
+    let modal = app
+        .create_overlay(
+            window,
+            OverlayOptions {
+                placement: OverlayPlacement::Point(Point::new(20.0, 20.0)),
+                dismiss: OverlayDismiss::Explicit,
+                trap_focus: true,
+                a11y: crate::a11y::A11yOverride {
+                    role: Some(crate::a11y::A11yRole::Dialog),
+                    label: Some(smol_str::SmolStr::new_static("确认下单")),
+                    ..crate::a11y::A11yOverride::default()
+                },
+                ..OverlayOptions::default()
+            },
+        )
+        .expect("modal");
+    assert_eq!(
+        app.modal_scope(window),
+        Some(modal.node()),
+        "模态作用域根必须可查询"
+    );
+    let confirm = NodeBuilder::boxed()
+        .layout_override(Rect::new(10.0, 10.0, 80.0, 24.0))
+        .on_click(Action::custom("modal.confirm"))
+        .build(
+            app.window_mut(window).expect("window").tree_mut(),
+            modal.node(),
+        )
+        .expect("mount");
+    frame(&mut app, window);
+    let snapshot = app.a11y_take(window).expect("模态打开必须交付 a11y 增量");
+    let modal_record = snapshot.node_for(modal.node()).expect("模态包装");
+    assert_eq!(modal_record.role, crate::a11y::A11yRole::Dialog);
+    assert!(
+        modal_record.modal,
+        "a11y modal 必须跟 trap_focus 走（引擎真值），与角色无关"
+    );
+    assert!(!modal_record.hidden);
+    assert!(
+        !snapshot.node_for(confirm).expect("确认按钮").hidden,
+        "模态子树对 AT 必须可见"
+    );
+    assert!(
+        snapshot.node_for(menu.node()).expect("菜单").hidden,
+        "模态作用域外的浮层必须 aria-hidden（tooltip / 菜单不得被 AT 读到）"
+    );
+
+    // 关闭模态：作用域消失、背景恢复可见。
+    assert!(app.close_overlay(&modal));
+    assert_eq!(app.modal_scope(window), None);
+    frame(&mut app, window);
+    let snapshot = app.a11y_take(window).expect("模态关闭必须交付 a11y 增量");
+    assert!(
+        !snapshot.node_for(menu.node()).expect("菜单").hidden,
+        "模态关闭后背景必须重新可见"
+    );
+}
+
+/// E12：模态打开时背景 hover 被过滤 —— 背景 tooltip **不可能**在模态之上打开（P2-4b R07）。
+///
+/// 旧 `BlockMouse` 的 hitbox 同时挡命中与 hover；引擎模态作用域必须给出同一语义。这里钉住：
+/// - 模态**打开瞬间**，作用域外的悬停立即结束（派生 `HoverChanged(None)`，不需要动鼠标）；
+/// - 指针在背景上移动不会重新产生悬停；
+/// - 模态子树（以及属于该模态的弹出层）的悬停照常。
+#[test]
+fn a_modal_filters_background_hover_so_tooltips_cannot_open_over_it() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let trigger = mount_override(&mut app, window, root, Rect::new(0.0, 0.0, 100.0, 100.0));
+    frame(&mut app, window);
+    let _ = app.drain_events();
+
+    // 前置：没有模态时，背景触发器正常悬停（tooltip 的输入就是这个）。
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(Point::new(50.0, 50.0), Modifiers::empty()),
+    );
+    assert_eq!(app.hovered(window), Some(trigger));
+    let _ = app.drain_events();
+
+    let modal = app
+        .create_overlay(
+            window,
+            OverlayOptions {
+                placement: OverlayPlacement::Point(Point::new(200.0, 0.0)),
+                dismiss: OverlayDismiss::Explicit,
+                trap_focus: true,
+                ..OverlayOptions::default()
+            },
+        )
+        .expect("modal");
+    let confirm = NodeBuilder::boxed()
+        .layout_override(Rect::new(10.0, 10.0, 80.0, 40.0))
+        .on_click(Action::custom("modal.confirm"))
+        .build(
+            app.window_mut(window).expect("window").tree_mut(),
+            modal.node(),
+        )
+        .expect("mount");
+    frame(&mut app, window);
+
+    // 模态打开 ⇒ 作用域外的悬停立即结束（不需要 PointerMove）。
+    assert_eq!(
+        app.hovered(window),
+        None,
+        "模态一打开，背景悬停必须立即失效（tooltip 不得留在模态之上）"
+    );
+    let hover_event = app
+        .drain_events()
+        .into_iter()
+        .find_map(|(_, event)| match event {
+            Event::HoverChanged { hovered, left, .. } => Some((hovered, left)),
+            _ => None,
+        })
+        .expect("作用域外悬停结束必须派生 HoverChanged");
+    assert_eq!(hover_event.0, None);
+    assert!(
+        hover_event.1.contains(&trigger),
+        "背景触发器必须收到 leave：{:?}",
+        hover_event.1
+    );
+
+    // 指针在背景上移动：仍然没有悬停（背景 `:hover` 不得亮）。
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(Point::new(60.0, 60.0), Modifiers::empty()),
+    );
+    assert_eq!(app.hovered(window), None);
+    assert!(
+        app.drain_events()
+            .into_iter()
+            .all(|(_, event)| !matches!(event, Event::HoverChanged { .. })),
+        "背景被模态挡住时不得产生悬停迁移事件"
+    );
+
+    // 模态子树里的悬停照常（对话框按钮仍要有 :hover）。
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(Point::new(215.0, 15.0), Modifiers::empty()),
+    );
+    assert_eq!(app.hovered(window), Some(confirm), "模态内部的悬停必须正常");
+
+    // 对话框里的菜单（opener 在模态内）也属于作用域：悬停照常。
+    let menu = app
+        .create_overlay(
+            window,
+            OverlayOptions {
+                placement: OverlayPlacement::Point(Point::new(300.0, 100.0)),
+                dismiss: OverlayDismiss::OutsideClick,
+                ..OverlayOptions::default()
+            },
+        )
+        .expect("menu");
+    let item = NodeBuilder::boxed()
+        .layout_override(Rect::new(10.0, 10.0, 100.0, 20.0))
+        .on_click(Action::custom("menu.item"))
+        .build(
+            app.window_mut(window).expect("window").tree_mut(),
+            menu.node(),
+        )
+        .expect("mount");
+    frame(&mut app, window);
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(Point::new(320.0, 118.0), Modifiers::empty()),
+    );
+    assert_eq!(
+        app.hovered(window),
+        Some(item),
+        "属于模态的弹出层必须可悬停（对话框里的下拉菜单）"
+    );
+}
+
+/// E12：模态挡住背景点击，但 Esc / 焦点陷阱 / 关闭后的交互恢复保持不变。
+#[test]
+fn a_modal_blocks_background_clicks_and_restores_interaction_on_close() {
+    let (_rt, mut app, window) = setup();
+    let clicks = Rc::new(Cell::new(0_u32));
+    let seen = clicks.clone();
+    app.on_action(Action::custom("background"), move |_ctx| {
+        seen.set(seen.get() + 1);
+    });
+    let ok_clicks = Rc::new(Cell::new(0_u32));
+    let seen_ok = ok_clicks.clone();
+    app.on_action(Action::custom("modal.ok"), move |_ctx| {
+        seen_ok.set(seen_ok.get() + 1);
+    });
+    let root = root_of(&app, window);
+    let background = NodeBuilder::boxed()
+        .layout_override(Rect::new(0.0, 0.0, 100.0, 100.0))
+        .on_click(Action::custom("background"))
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("mount");
+    frame(&mut app, window);
+    // 模态打开前焦点在背景（模态打开瞬间背景仍是 raw focus）。
+    assert!(app.set_focus(window, Some(background)));
+
+    let modal = app
+        .create_overlay(
+            window,
+            OverlayOptions {
+                placement: OverlayPlacement::Point(Point::new(150.0, 50.0)),
+                dismiss: OverlayDismiss::Explicit,
+                trap_focus: true,
+                ..OverlayOptions::default()
+            },
+        )
+        .expect("modal");
+    let ok = NodeBuilder::boxed()
+        .layout_override(Rect::new(10.0, 10.0, 60.0, 24.0))
+        .on_click(Action::custom("modal.ok"))
+        .build(
+            app.window_mut(window).expect("window").tree_mut(),
+            modal.node(),
+        )
+        .expect("mount");
+    frame(&mut app, window);
+
+    // a11y 焦点（E12）：模态作用域外的 raw 焦点不得作为 `TreeUpdate.focus` 发给 AT ——
+    // 背景已经被标 hidden，AT 焦点停在那里与 inert 语义自相矛盾。
+    let snapshot = app.a11y_take(window).expect("a11y 交付");
+    assert_ne!(
+        snapshot.focus_node().engine,
+        background,
+        "作用域外的背景不得成为 a11y 焦点"
+    );
+
+    // 焦点陷阱：作用域外节点不得被设为焦点；焦点移动落在模态内。
+    assert!(
+        !app.set_focus(window, Some(background)),
+        "模态作用域外的节点不得获得焦点"
+    );
+    app.focus_next(window);
+    assert_eq!(app.focused(window), Some(ok), "Tab 必须落在模态内");
+
+    // 背景点击被整体消费（不派发任何动作）。
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_down(
+            Point::new(50.0, 50.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
+    );
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_up(
+            Point::new(50.0, 50.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
+    );
+    assert_eq!(clicks.get(), 0, "模态作用域外的点击不得派发");
+
+    // 模态内点击正常。
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_down(
+            Point::new(170.0, 70.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
+    );
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_up(
+            Point::new(170.0, 70.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
+    );
+    assert_eq!(ok_clicks.get(), 1, "模态内的点击必须正常派发");
+
+    // Esc（`Dismiss`）仍然可关模态：作用域只约束「激活节点」，引擎级动作不受限。
+    assert!(app.dispatch_action(window, root, Action::Dismiss, ActionSource::Programmatic));
+    assert_eq!(app.modal_scope(window), None, "Esc/Dismiss 必须关掉模态");
+
+    // 关闭后背景恢复：hover 与点击都回来了。
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(Point::new(50.0, 50.0), Modifiers::empty()),
+    );
+    assert_eq!(app.hovered(window), Some(background));
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_down(
+            Point::new(50.0, 50.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
+    );
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_up(
+            Point::new(50.0, 50.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
+    );
+    assert_eq!(clicks.get(), 1, "模态关闭后背景点击必须恢复");
 }
