@@ -871,14 +871,13 @@ impl Gallery {
                 .expect("swatch");
             themed_label(app, window, wrapper, name, 10.5, 500, Role::FgMuted, &theme);
         }
-        let icon_color = initial.role(Role::FgMuted);
         for chunk in IconKind::ALL.chunks(19) {
             let icons_row = row(app, window, s1, 8.0);
             for kind in chunk {
                 // 主题调制色：外观切换只失效图标节点（`bind_style.foreground` = E7 调制通道）。
+                // `build_themed` 的首帧占位色取主题角色，静态 `with_color` 在这条路径被忽略。
                 let icon = IconSpec::new(*kind)
                     .with_size(16.0)
-                    .with_color(icon_color)
                     .build_themed(app, window, icons_row, &theme, Role::FgMuted)
                     .expect("gallery icon");
                 if theme_icons.len() < 3 {
@@ -2094,7 +2093,10 @@ impl Gallery {
             // `log_line` 写的日志在第 ⑮ 分区（内容坐标 y≈4500），页在顶部时它在视口外 ⇒ 本帧没有
             // GPU 工作，引擎按 I3 / V-122⑧ 结算为 Idle、`FrameIndex` 不变（这是正确行为，不是丢帧）。
             // 因此这里额外写一次**顶栏 status**（屏内 `bind_text` 节点）：它必然产生 damage 与发布。
-            // 实测：定时器回调里写信号 → 帧号 3→13（含浮层淡入动画），见 `.review/mig-p2-6a-*`。
+            // 实测（`--auto-demo`）：派发时同帧 `2 -> 2`（回调里的写已过本帧提交点），600 ms 后
+            // `frame_index=3` —— 见 `.review/mig-p2-6-review-gallery-auto-demo.log`。
+            // 注意 P2-6a §10.3 的 `3→13` 是「定时器里**打开浮层**」的另一条路径（含淡入动画），
+            // 与这里的 `--auto-demo` 口径不同，不要混用。
             let button = self.primary_button.clone();
             let log = self.log;
             let demo = self.demo_fired.clone();

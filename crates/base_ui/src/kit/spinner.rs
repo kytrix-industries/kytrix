@@ -141,6 +141,10 @@ impl Spinner {
     }
 
     /// 点的固定颜色（引擎没有颜色继承，必须显式给；与外观无关）。
+    ///
+    /// **构造期配置**：颜色存在共享的 `Rc<Inner>` 里（`set_color` 需要在 `&self` 句柄上运行时
+    /// 改色），因此对克隆句柄调用本方法会改到**已挂载实例** —— 与 [`Spinner::with_size`] /
+    /// `with_label` / `spinning` 的按句柄语义不同。只应在 `build` 之前对构造出来的句柄调用。
     #[must_use]
     pub fn with_color(self, color: Color) -> Self {
         self.inner.color.set(SpinnerColor::Fixed(color));
@@ -148,6 +152,8 @@ impl Spinner {
     }
 
     /// 点的颜色跟随主题语义角色（G6）：`sync` 按当前外观解析，深浅色切换后自动重画。
+    ///
+    /// 与 [`Spinner::with_color`] 同一份共享状态（构造期配置，`build` 前调用）。
     #[must_use]
     pub fn with_role(self, role: Role) -> Self {
         self.inner.color.set(SpinnerColor::Role(role));
@@ -251,7 +257,12 @@ impl Spinner {
     /// 运行时改固定颜色（G6）：清掉画布缓存并标脏节点，下一次 `sync` 按新颜色重画。
     ///
     /// 返回是否真的改了（等值写入是 no-op，不标脏、不出帧）。`with_role` 的组件调用本方法后
-    /// 变成固定色（角色跟随关闭）。
+    /// 变成固定色（角色跟随关闭，单向）。
+    ///
+    /// **残余（登记 P3，F5）**：`Role` 挂载的节点登记过一条只读外观依赖（`build` 里的空
+    /// `bind_style`），引擎没有「卸载依赖边」的公开入口 —— 切到 `Fixed` 后外观变化仍会失效该
+    /// 节点并出一帧（画面不变，只是多一帧），与「角色跟随关闭」的表述有偏差。没有 `set_role`
+    /// 回切；如需运行时切角色，补一个「重建节点」的 API，而不是在旧节点上改状态。
     pub fn set_color(&self, app: &mut App, color: Color) -> bool {
         let next = SpinnerColor::Fixed(color);
         if self.inner.color.get() == next {
