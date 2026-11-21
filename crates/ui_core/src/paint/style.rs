@@ -314,6 +314,9 @@ mod tests {
 
     /// E13：`Shadows` 的体积预算 —— 常见 1–2 层不分配（内联），且 `PaintSpec` 装在
     /// `Option<Box<PaintSpec>>` 里（`Node` 不因阴影层增长）。
+    ///
+    /// 审查 F6：spec-delta E13 §2.4 的尺寸表是**精确基线**（不是上界），这里逐项 pin 住
+    /// （336 / 192 / 88 / 36）；任何布局变化都要同步 E13.md 与 design §11.2。
     #[test]
     fn shadows_size_budget() {
         let single = size_of::<ShadowSpec>();
@@ -322,11 +325,14 @@ mod tests {
         println!("size_of::<ShadowSpec>() = {single}");
         println!("size_of::<Shadows>() = {shadows}");
         println!("size_of::<PaintSpec>() = {paint}");
-        assert!(single > 0 && shadows > 0 && paint > 0);
-        assert!(
-            shadows <= 96,
-            "Shadows 超预算：{shadows} B（ShadowSpec {single} B、PaintSpec {paint} B）；\
-             内联 2 层是旧菜单双层阴影的常见形态"
+        assert_eq!(single, 36, "ShadowSpec 尺寸基线（E13 §2.4）");
+        assert_eq!(
+            shadows, 88,
+            "Shadows 尺寸基线（内联 2 层 = ShadowSpec 36×2 + SmallVec 头 16）"
+        );
+        assert_eq!(
+            paint, 192,
+            "PaintSpec 尺寸基线（E13 §2.4；装在 `Option<Box<...>>` 里，不影响 `Node` 336 B）"
         );
     }
 }
