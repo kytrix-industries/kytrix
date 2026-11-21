@@ -42,9 +42,9 @@
 //! | [`scroll_bar`] | 自绘滚动条（拖拽 / 轨道点击 / 淡出 / 双轴） | `crate::scroll_bar` |
 //! | [`table`] | 列定义（Fixed/Flex/跨列）、表头排序、行虚拟化、多选、空态（E9 `Table`/`Row`/`Cell`/`ColumnHeader` 集合语义） | `crate::table` |
 //! | [`tree`] | 展开折叠、缩进层级线、选择、键盘导航（实例级键作用域；E9 `Tree`/`TreeItem` + `level` 层级） | `crate::tree` |
-//! | [`overlay`] | 通用锚定浮层：12 向 placement + flip + clamp、滚动跟随、模态遮罩、`Transient` 淡入淡出、焦点陷阱 / 恢复 | `crate::overlay` + `crate::layer` 的浮层部分 |
+//! | [`overlay`] | 通用锚定浮层：12 向 placement + flip + clamp、滚动跟随、模态遮罩、`Transient` 淡入淡出、E10 完成回调收尾（`AnimationRouter` 单槽路由）、E12 显式 a11y 角色、焦点陷阱 / 恢复 | `crate::overlay` + `crate::layer` 的浮层部分 |
 //! | [`layer`] | 固定 z 层带（View < Dialog < Alert < Popup < ContextMenu < Tooltip）与 root 子节点排序仲裁 | `crate::layer` |
-//! | [`tooltip`] | hover / focus 触发 + 延迟 + 12 向定位 + 文本 / 快捷键 + 不可交互 + a11y | `crate::tooltip` |
+//! | [`tooltip`] | hover / focus 触发 + E10 一次性定时器延迟 + 12 向定位 + 文本 / 快捷键 + 不可交互 + 模态抑制 / 显式 a11y | `crate::tooltip` |
 //! | `test_support` | 基于 `ui_core::test_support` 的测试断言辅助（TestApp/Probe/FrameRecord） | 无（新基建） |
 //!
 //! # 组件形态（与引擎模型对齐）

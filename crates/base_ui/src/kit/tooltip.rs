@@ -13,11 +13,17 @@
 //! - **触发**：引擎的 hover 是全局镜像（`App::hovered`，不进 `ReadCtx`），焦点是
 //!   `App::focused`。本模块在 [`Tooltip::sync`] 里把「指针/焦点落在触发器子树内」当作激活判据，
 //!   与 `scroll_bar` 的悬停镜像同一机制（hover 变化本身会请求一帧，因此 sync 一定会被叫到）。
-//! - **延迟**：引擎没有墙钟定时器 / `defer` API。延迟用「0 → 1 的线性动画」表达：`App::animate`
-//!   在 `delay` 期间按显示节拍推进 `Transient<f32>`，`sync` 读到 1 才真正打开浮层。代价是延迟
-//!   期间每帧一个动画 tick（连续帧由动画驱动，不是空闲出帧）；延迟结束后动画停止、回到 I3。
+//! - **延迟（E10 一次性定时器）**：`App::after_scoped(window, trigger, delay, ..)` 在到期时于
+//!   UI 线程回调一次（引擎时钟、等待期零帧 / 零唤醒）；回调只把「到点」标记置位，状态仍由
+//!   [`Tooltip::sync`] 在下一轮钩子里推进。不再用「0 → 1 动画」表达延迟：那会在延迟期每帧
+//!   一个动画 tick，而且终值在钩子之后写入、真实泵序下可能永远等不到（P2-4b R02）。
 //! - **定位 / 淡入淡出 / 关闭**：全部复用 [`Overlay`]（`Band::Tooltip` 层带、`Placement` 12 向、
-//!   `fade`、`Scrim` 不启用）。
+//!   `fade`、`Scrim` 不启用）。淡出收尾由 kit 的 [`AnimationRouter`]（E10 完成回调）负责：
+//!   `Tooltip::new` 必须拿到组合根**共享的** router（与 overlay 同一个单槽）。
+//! - **模态抑制（E12 / R07）**：模态浮层打开后，引擎把作用域外的 `hover` / `focus` 读作
+//!   `None`（`App::modal_scope` 是公开查询面）。本模块的激活判据只读这两个镜像 —— **不自行
+//!   推导**「背景是否被模态挡住」，因此背景触发器不会在模态之上打开提示，而模态内部（含
+//!   经 `opener` 链属于该模态的弹出层）的触发器照常工作。
 //! - **共享组合根的 Layer**：`Tooltip::new` 必须拿到组合根（或至少与菜单 / 弹层同一个）的
 //!   [`Layer`]。提示是 `Band::Tooltip` 层带里的一员，只有和 context menu / dialog 登记在
 //!   **同一张层带表**里，旧实现的 `POPUP_PRIORITY + 2`（提示画在菜单之上）才成立；每实例私有
@@ -34,15 +40,21 @@
 //! - 内容变化（[`Tooltip::set_content`]）在提示显示期间 = 先完整收起（淡出），再按**新内容**
 //!   重开：`Overlay::open` 的同窗重入只换锚点、不重建面板内容，所以不能靠它撤销量变化
 //!   （旧实现靠「撤回内容关、恢复内容不复活」的 hover 语义；引擎没有 per-node hover 回调，
-//!   统一由 `sync` 的激活判据驱动）。
-//! - a11y：提示内容根声明 `A11yRole::Tooltip` + 可访问名；**没有** `aria-describedby` 关系
-//!   （引擎 `A11yOverride` 无 description 关系通道），触发器与提示是两棵子树里的节点。
+//!   统一由 `sync` 的激活判据驱动）。**撤回内容（`None`）后在淡出窗口内恢复 `Some(new)` 也走
+//!   同一条重建路径**（`pending_restart`；P2-4b3 N1：旧实现会在 Idle 分支撤销关闭、让屏上留在
+//!   旧文本）。
+//! - a11y：提示的 `Tooltip` 角色 + 可访问名（文本 + 快捷键）**显式声明在引擎浮层包装节点**上
+//!   （E12：包装不再自动 `Dialog`；内容根保持通用容器，避免 AT 读两层同名角色）；**没有**
+//!   `aria-describedby` 关系（引擎 `A11yOverride` 无 description 关系通道），触发器与提示是
+//!   两棵子树里的节点。
 //!
 //! # 用法
 //!
 //! ```ignore
-//! let layer = Layer::new();   // 组合根唯一；菜单 / 对话框 / 提示都登记到它
-//! let tip = Tooltip::new(app, theme.clone(), layer.clone(), "save", TooltipOptions::default());
+//! let layer = Layer::new();              // 组合根唯一；菜单 / 对话框 / 提示都登记到它
+//! let router = AnimationRouter::new();   // 组合根唯一；overlay / tooltip 共用完成路由（E10 单槽）
+//! let tip = Tooltip::new(app, theme.clone(), layer.clone(), router.clone(), "save",
+//!     TooltipOptions::default());
 //! tip.set_content(Some(TooltipContent::new("保存").shortcut("Ctrl+S")));
 //! tip.attach(app, window, save_button_node);
 //! // 组合根的 on_frame 钩子里：
@@ -57,16 +69,9 @@ use std::{
 
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
-    a11y::{A11yOverride, A11yRole},
-    app::App,
+    app::{App, TimerId},
     error::EngineError,
-    interaction::{AnimatedValue, AnimationId, AnimationSpec, Easing},
-    node::{
-        builder::NodeBuilder,
-        id::NodeId,
-        signal::{SignalScope, Transient},
-        tree::NodeTree,
-    },
+    node::{builder::NodeBuilder, id::NodeId, signal::SignalScope, tree::NodeTree},
     paint::style::StylePatch,
     text::TextStyle,
     window::WindowId,
@@ -75,7 +80,10 @@ use ui_core::{
 use crate::{
     kit::{
         layer::{Band, Layer},
-        overlay::{Anchor, DismissPolicy, Overlay, OverlayOptions, OverlaySurface, Placement},
+        overlay::{
+            Anchor, AnimationRouter, DismissPolicy, Overlay, OverlayA11y, OverlayOptions,
+            OverlaySurface, Placement,
+        },
     },
     style_builder::StyleBuilder,
     theme::{components::ComponentTokens, handle::ThemeHandle, role::Role},
@@ -177,9 +185,10 @@ struct TooltipInner {
     options: TooltipOptions,
     scope: SignalScope,
     overlay: Overlay,
-    /// 延迟计时（`Transient<f32>`：`0` → `1`，由 `App::animate` 推进；不进依赖图）。
-    elapsed: Transient<f32>,
-    delay_animation: Cell<Option<AnimationId>>,
+    /// 延迟的一次性定时器（E10 `App::after_scoped`；等待期零帧 / 零唤醒）。
+    delay_timer: Cell<Option<TimerId>>,
+    /// 定时器到点标记：回调只置位，打开动作仍由 [`Tooltip::sync`] 推进（状态机单一入口）。
+    delay_ready: Cell<bool>,
     phase: Cell<Phase>,
     window: Cell<Option<WindowId>>,
     trigger: Cell<Option<NodeId>>,
@@ -201,10 +210,13 @@ impl Tooltip {
     ///
     /// `layer` 必须是**组合根的共享 Layer**（与菜单 / 对话框同一个）：提示要在
     /// [`Band::Tooltip`] 层带上参与跨组件 z 序仲裁（R09）。
+    /// `router` 必须是**组合根的共享 [`AnimationRouter`]**（与所有 overlay 同一个单槽）：
+    /// 淡出收尾依赖 E10 完成回调，各自注册会互相覆盖（E10-R02）。
     pub fn new(
         app: &mut App,
         theme: ThemeHandle,
         layer: Layer,
+        router: AnimationRouter,
         key: impl Into<SmolStr>,
         options: TooltipOptions,
     ) -> Self {
@@ -214,6 +226,7 @@ impl Tooltip {
             app,
             theme.clone(),
             layer,
+            router,
             format_smolstr!("{key}:overlay"),
             OverlayOptions {
                 placement: options.placement,
@@ -228,20 +241,20 @@ impl Tooltip {
                 band: Band::Tooltip,
                 surface: OverlaySurface::tooltip(),
                 scrim: None,
-                // 角色 / 可访问名挂在内容根上（内容每次打开按当前文本重建）。
-                a11y: Default::default(),
+                // 角色 / 可访问名挂在引擎浮层包装节点上（每次 show 按当前内容刷新）。
+                a11y: OverlayA11y::default(),
                 fade: options.fade,
             },
         );
         Self {
             inner: Rc::new(TooltipInner {
-                elapsed: app.transient_scoped(scope, 0.0),
                 scope,
                 key,
                 theme,
                 options,
                 overlay,
-                delay_animation: Cell::new(None),
+                delay_timer: Cell::new(None),
+                delay_ready: Cell::new(false),
                 phase: Cell::new(Phase::Idle),
                 window: Cell::new(None),
                 trigger: Cell::new(None),
@@ -300,9 +313,10 @@ impl Tooltip {
     /// 帧同步（组合根的 `on_frame` 钩子里调用；测试直接调）：推进延迟 / 打开 / 收起。
     ///
     /// 返回 `true` = 本帧有状态变化（或浮层自身做了工作）。稳态（未激活 / 已显示且指针未动）
-    /// 零工作、不出帧（I3）。
+    /// 零工作、不出帧（I3）。延迟到点由 E10 定时器回调置位（下一轮钩子仍在帧之前），淡出收尾
+    /// 由 E10 完成回调在动画终值那一帧完成 —— 本方法不再观测动画进度。
     pub fn sync(&self, app: &mut App) -> bool {
-        // 浮层自身的帧同步始终跑：淡出收尾 / 引擎侧 Esc 关闭的探测都靠它。
+        // 浮层自身的帧同步始终跑：引擎侧 Esc 关闭的探测 / 定位 / 层带仲裁靠它。
         let mut changed = self.inner.overlay.sync(app);
         if self.inner.phase.get() == Phase::Shown && !self.inner.overlay.is_open(app) {
             // 引擎侧关闭（Esc / `Dismiss`）：状态回到未激活。
@@ -344,7 +358,7 @@ impl Tooltip {
                 if !active || self.inner.content.borrow().is_none() {
                     self.reset(app);
                     changed = true;
-                } else if self.delay_elapsed(app) >= 1.0 {
+                } else if self.inner.delay_ready.replace(false) {
                     changed |= self.show(app);
                 }
             }
@@ -352,7 +366,11 @@ impl Tooltip {
                 let withdrawn = self.inner.content.borrow().is_none();
                 let content_changed = *self.inner.content.borrow() != *self.inner.shown.borrow();
                 if !active || withdrawn {
+                    // 收起；若屏上内容已经和「当前应有内容」不一致（撤回 / 变了），淡出窗口内
+                    // 不得被 Idle 分支的撤销关闭复活旧面板 —— 等完整关闭后按当前内容重建
+                    // （N1：`set_content(None)` 后在淡出窗口内恢复 `Some(new)` 走同一条重建路径）。
                     self.hide(app);
+                    self.inner.pending_restart.set(withdrawn || content_changed);
                     changed = true;
                 } else if content_changed {
                     // 内容变了：屏上画的是旧内容，先完整收起（淡出），关掉后再按新内容重开。
@@ -367,6 +385,7 @@ impl Tooltip {
 
     /// 释放提示与浮层的信号作用域（组合根卸载提示后调用一次；幂等）。
     pub fn release(&self, app: &mut App) {
+        self.cancel_delay(app);
         self.inner.overlay.release(app);
         let _ = app.release_scope(self.inner.scope);
     }
@@ -381,6 +400,11 @@ impl Tooltip {
 
     /// 指针或焦点是否落在触发器子树内（引擎的 hover / focus 都是「最具体节点」，
     /// 触发器内部的图标 / 文本会挡住触发器本身，因此要向上找祖先）。
+    ///
+    /// R07（E12）：模态浮层打开后，`App::hovered` / `App::focused` 已经把**作用域外**的输入
+    /// 读作 `None`（`App::modal_scope` 是公开查询面，判据由引擎唯一提供）。本模块只读这两个
+    /// 镜像，**不自行推导**「背景是否被模态挡住」—— 背景触发器因此不会在模态之上打开提示，
+    /// 而模态内部（含经 `opener` 链属于该模态的弹出层）的触发器照常工作。
     fn is_active(&self, app: &App, trigger: NodeId) -> bool {
         let Some(window) = self.inner.window.get() else {
             return false;
@@ -396,42 +420,39 @@ impl Tooltip {
             .any(|node| is_within(tree, node, trigger))
     }
 
-    /// 开始延迟计时（`delay == 0` ⇒ 直接打开）。
+    /// 开始延迟（E10 一次性定时器；`delay == 0` ⇒ 直接打开）。
+    ///
+    /// 定时器绑在**触发器节点**上（`after_scoped`）：触发器卸载时引擎自动取消；指针离开 /
+    /// 内容撤回 / 改绑由 [`Tooltip::cancel_delay`] 显式取消。等待期不请求帧、不进连续帧（I3）。
     fn start_delay(&self, app: &mut App) {
+        self.cancel_delay(app);
+        let (Some(window), Some(trigger)) = (self.inner.window.get(), self.inner.trigger.get())
+        else {
+            return;
+        };
         if self.inner.options.delay.is_zero() {
             self.inner.phase.set(Phase::Waiting);
             let _ = self.show(app);
             return;
         }
         self.inner.phase.set(Phase::Waiting);
-        self.cancel_delay(app);
-        app.write_transient(&self.inner.elapsed, 0.0);
-        let Some(window) = self.inner.window.get() else {
-            return;
-        };
-        match app.animate(
-            window,
-            AnimatedValue::Scalar {
-                target: self.inner.elapsed,
-                to: 1.0,
-            },
-            &[],
-            AnimationSpec {
-                duration: self.inner.options.delay,
-                easing: Easing::Linear,
-            },
-        ) {
-            Ok(id) => self.inner.delay_animation.set(Some(id)),
-            Err(_) => app.write_transient(&self.inner.elapsed, 1.0),
+        let ready = Rc::downgrade(&self.inner);
+        let registered = app.after_scoped(window, trigger, self.inner.options.delay, move |_app| {
+            if let Some(inner) = ready.upgrade() {
+                // 到期后句柄失效（一次性）；回调只置位，打开动作仍由 `sync` 推进。
+                inner.delay_timer.set(None);
+                inner.delay_ready.set(true);
+            }
+        });
+        match registered {
+            Ok(id) => self.inner.delay_timer.set(Some(id)),
+            // 窗口 / 触发器在登记瞬间已失效：复位（不会再有显示对象）。
+            Err(_) => self.reset(app),
         }
     }
 
-    /// 延迟进度（`1` = 延迟已走完）。
-    fn delay_elapsed(&self, app: &App) -> f32 {
-        *app.read_transient(&self.inner.elapsed)
-    }
-
-    /// 打开提示浮层（内容按当前 `content` 重建）。
+    /// 打开提示浮层（内容按当前 `content` 重建；a11y 角色 / 可访问名按当前内容刷新到
+    /// 引擎浮层包装节点上）。
     fn show(&self, app: &mut App) -> bool {
         let (Some(window), Some(trigger), Some(content)) = (
             self.inner.window.get(),
@@ -442,6 +463,9 @@ impl Tooltip {
         };
         let theme = self.inner.theme.clone();
         let key = self.inner.key.clone();
+        self.inner
+            .overlay
+            .set_a11y(OverlayA11y::tooltip(content.label()));
         let built = content.clone();
         let opened =
             self.inner
@@ -462,7 +486,7 @@ impl Tooltip {
         }
     }
 
-    /// 收起提示（播浮层的淡出；`sync` 的 `overlay.sync` 负责卸载收尾）。
+    /// 收起提示（播浮层的淡出；E10 完成回调在同一帧收尾卸载）。
     fn hide(&self, app: &mut App) {
         if self.inner.phase.get() == Phase::Shown {
             let _ = self.inner.overlay.close(app);
@@ -470,22 +494,22 @@ impl Tooltip {
         self.inner.phase.set(Phase::Idle);
         *self.inner.shown.borrow_mut() = None;
         self.cancel_delay(app);
-        app.write_transient(&self.inner.elapsed, 0.0);
     }
 
-    /// 收起（不播淡出）+ 清空计时。
+    /// 收起（不播淡出）+ 清空延迟计时。
     fn reset(&self, app: &mut App) {
         self.inner.phase.set(Phase::Idle);
         *self.inner.shown.borrow_mut() = None;
         self.inner.pending_restart.set(false);
         self.cancel_delay(app);
-        app.write_transient(&self.inner.elapsed, 0.0);
         let _ = self.inner.overlay.close_now(app);
     }
 
+    /// 取消在飞的延迟定时器（幂等；到期 / 已取消返回 false 不需要处理）。
     fn cancel_delay(&self, app: &mut App) {
-        if let Some(id) = self.inner.delay_animation.take() {
-            let _ = app.cancel_animation(&id);
+        self.inner.delay_ready.set(false);
+        if let Some(id) = self.inner.delay_timer.take() {
+            let _ = app.cancel_timer(&id);
         }
     }
 }
@@ -503,6 +527,9 @@ fn is_within(tree: &NodeTree, node: NodeId, ancestor: NodeId) -> bool {
 }
 
 /// 提示内容：一行（文本 + 可选快捷键），主题色走 `bind_style.foreground`（逐节点着色）。
+///
+/// `Tooltip` 角色 / 可访问名声明在**引擎浮层包装节点**上（[`Overlay::set_a11y`]，E12：包装不再
+/// 自动 `Dialog`），内容根保持通用容器 —— 两层同名角色会让 AT 读两遍（E12-R1）。
 fn build_content(
     tree: &mut NodeTree,
     panel: NodeId,
@@ -520,11 +547,6 @@ fn build_content(
                 .min_width_0()
                 .build(),
         )
-        .a11y(A11yOverride {
-            role: Some(A11yRole::Tooltip),
-            label: Some(content.label()),
-            ..A11yOverride::default()
-        })
         .build(tree, panel)?;
     let tokens = ComponentTokens::standard();
     let size = tokens.small.font_size;
@@ -570,27 +592,33 @@ fn theme_role(theme: &ThemeHandle, role: Role) -> ui_core::paint::color::Color {
 
 #[cfg(test)]
 mod tests {
-    //! 行为断言：延迟 / hover 与 focus 触发 / 离开关闭 / 12 向定位复用 / 文本与快捷键渲染 /
-    //! 不可交互与 a11y / 撤回内容。
+    //! 行为断言：延迟（E10 定时器）/ hover 与 focus 触发 / 离开关闭 / 12 向定位复用 /
+    //! 文本与快捷键渲染 / 不可交互与 a11y（E12 包装角色）/ 撤回内容 / 模态抑制（R07）/
+    //! 淡出窗口内的内容重建（N1/N2）。
 
-    use std::{collections::BTreeSet, time::Duration};
+    use std::{cell::Cell, collections::BTreeSet, rc::Rc, time::Duration};
 
     use smol_str::format_smolstr;
     use ui_core::{
         a11y::A11yRole,
+        error::EngineError,
         event::{Action, InputEvent, KeyCode, Modifiers},
         math::{Point, Rect},
-        node::{builder::NodeBuilder, id::NodeId},
+        node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
         test_support::app::TestApp,
-        window::WindowId,
+        window::{FrameOutcome, WindowId},
     };
 
     use super::{Tooltip, TooltipContent, TooltipOptions};
     use crate::{
         kit::{
             layer::{Band, Layer},
-            overlay::{Anchor, DismissPolicy, Overlay, OverlayOptions, Placement},
+            overlay::{
+                Anchor, AnimationRouter, DismissPolicy, Overlay, OverlayA11y, OverlayOptions,
+                OverlaySurface, Placement,
+            },
         },
+        style_builder::StyleBuilder,
         theme::{appearance::Appearance, handle::ThemeHandle},
     };
 
@@ -603,6 +631,7 @@ mod tests {
         trigger: NodeId,
         tip: Tooltip,
         layer: Layer,
+        router: AnimationRouter,
         theme: ThemeHandle,
     }
 
@@ -625,7 +654,15 @@ mod tests {
                     .build(tree, root)
                     .expect("触发器")
             };
-            let tip = Tooltip::new(app.app_mut(), theme.clone(), layer.clone(), "tip", options);
+            let router = AnimationRouter::new();
+            let tip = Tooltip::new(
+                app.app_mut(),
+                theme.clone(),
+                layer.clone(),
+                router.clone(),
+                "tip",
+                options,
+            );
             tip.attach(app.app_mut(), window, trigger);
             tip.set_content(Some(TooltipContent::new("保存").shortcut("Ctrl+S")));
             // 首帧先把布局跑出来：指针命中依赖布局盒（否则 hover 命中不到触发器）。
@@ -636,6 +673,7 @@ mod tests {
                 trigger,
                 tip,
                 layer,
+                router,
                 theme,
             }
         }
@@ -656,12 +694,57 @@ mod tests {
             let _ = self.app.drain().expect("帧");
         }
 
+        /// 真实泵序的一轮：钩子（`Tooltip::sync` = 组合根 `on_frame`）→ 帧。
+        /// E10 的定时器 / 完成回调在帧入口或帧内派发，因此断言在 `pump` 之后。
+        fn pump(&mut self, by: Duration) {
+            self.app.advance(by);
+            let _ = self.sync();
+            let _ = self.app.drain().expect("帧");
+        }
+
         fn settle(&mut self) {
             for _ in 0..3 {
                 self.advance(Duration::ZERO);
                 let _ = self.sync();
             }
             let _ = self.app.drain().expect("帧");
+        }
+
+        /// 模态对话框（kit `Overlay`；fade=false，便于断言 hover 判定本身）。
+        fn open_modal(
+            &mut self,
+            content: impl FnOnce(&mut NodeTree, NodeId) -> Result<(), EngineError>,
+        ) -> Overlay {
+            let dialog = Overlay::new(
+                self.app.app_mut(),
+                self.theme.clone(),
+                self.layer.clone(),
+                self.router.clone(),
+                "dialog",
+                OverlayOptions {
+                    modal: true,
+                    dismiss: DismissPolicy::Explicit,
+                    surface: OverlaySurface::dialog(),
+                    a11y: OverlayA11y::dialog("对话框"),
+                    fade: false,
+                    ..OverlayOptions::default()
+                },
+            );
+            assert!(
+                dialog
+                    .open(
+                        self.app.app_mut(),
+                        self.window,
+                        Anchor::point(Point::new(50.0, 50.0)),
+                        content
+                    )
+                    .expect("打开模态对话框")
+            );
+            let _ = self.app.drain().expect("帧");
+            // 首帧按零尺寸落位，`sync` 用实测尺寸纠位并揭开面板（不可见的节点不参与命中）。
+            let _ = dialog.sync(self.app.app_mut());
+            let _ = self.app.drain().expect("帧");
+            dialog
         }
 
         fn trigger_center(&self) -> Point {
@@ -675,27 +758,49 @@ mod tests {
 
     #[test]
     fn a_tooltip_opens_only_after_its_delay() {
+        // R02（E10）：延迟是**一次性定时器**，不是 0→1 动画 —— 等待期零帧、零动画；定时器在
+        // 到期帧的入口派发（回调只置位），下一轮钩子（`sync`）才打开。
         let mut harness = Harness::new(TooltipOptions {
             delay: Duration::from_millis(500),
             ..TooltipOptions::default()
         });
         harness.hover(harness.trigger_center());
-        assert!(harness.sync(), "悬停后进入延迟计时");
+        assert!(harness.sync(), "悬停后进入延迟（登记定时器）");
         assert!(
             !harness.tip.is_visible(harness.app.app()),
             "延迟未走完不得显示"
         );
+        assert!(
+            !harness.app.app().animations_running(harness.window),
+            "延迟不得用动画驱动（E10 定时器；旧写法会在延迟期每帧 tick）"
+        );
 
-        // 走一半延迟：仍然不可见。
-        harness.advance(Duration::from_millis(250));
+        // 走一半：仍然不可见，而且等待期这一帧是 Idle（I3：定时器不请求帧、不进连续帧）。
+        harness.app.advance(Duration::from_millis(250));
+        let outcome = harness
+            .app
+            .app_mut()
+            .frame(harness.window)
+            .expect("窗口")
+            .expect("帧");
+        assert_eq!(
+            outcome,
+            FrameOutcome::Idle,
+            "定时器等待期不得按帧空转（旧动画延迟会每帧 tick，这里会红）"
+        );
         let _ = harness.sync();
         assert!(
             !harness.tip.is_visible(harness.app.app()),
-            "延迟中途不得显示（延迟失效会在这里变红）"
+            "延迟中途不得显示"
         );
 
-        // 走完延迟：打开。
-        harness.advance(Duration::from_millis(300));
+        // 走完：到期帧入口派发定时器（只置位），下一轮钩子打开。
+        harness.app.advance(Duration::from_millis(300));
+        let _ = harness.app.drain().expect("到期帧");
+        assert!(
+            !harness.tip.is_visible(harness.app.app()),
+            "定时器回调只置位，打开动作由下一轮钩子做（状态机单一入口）"
+        );
         let _ = harness.sync();
         assert!(harness.tip.is_visible(harness.app.app()), "延迟结束后显示");
         harness.settle();
@@ -703,7 +808,7 @@ mod tests {
     }
 
     #[test]
-    fn leaving_the_trigger_hides_the_tooltip() {
+    fn leaving_the_trigger_hides_the_tooltip_and_the_fade_completion_unloads_it() {
         let mut harness = Harness::new(TooltipOptions {
             delay: Duration::ZERO,
             ..TooltipOptions::default()
@@ -711,6 +816,15 @@ mod tests {
         harness.hover(harness.trigger_center());
         let _ = harness.sync();
         assert!(harness.tip.is_visible(harness.app.app()), "零延迟立即显示");
+        // 先让淡入完成（E10 完成回调在帧内清动画句柄，不关闭）。
+        harness.advance(Duration::from_millis(200));
+        let _ = harness.app.drain().expect("淡入帧");
+        let _ = harness.sync();
+        assert_eq!(
+            harness.tip.overlay().progress(harness.app.app()),
+            1.0,
+            "淡入完成"
+        );
 
         harness.hover(Point::new(10.0, 10.0));
         let _ = harness.sync();
@@ -718,11 +832,22 @@ mod tests {
             !harness.tip.is_visible(harness.app.app()),
             "离开触发器即收起"
         );
-        harness.advance(Duration::from_millis(200));
-        let _ = harness.sync();
         assert!(
-            harness.tip.overlay().overlay_node().is_none(),
-            "淡出结束后浮层节点卸载"
+            harness.tip.overlay().overlay_node().is_some(),
+            "淡出期间节点保留"
+        );
+        // 真实泵序：淡出到终值的那一帧由 E10 完成回调卸载（断言紧跟该轮帧，不补 sync）。
+        let mut unloaded_in_the_completion_frame = false;
+        for _ in 0..16 {
+            harness.pump(Duration::from_millis(16));
+            if harness.tip.overlay().overlay_node().is_none() {
+                unloaded_in_the_completion_frame = true;
+                break;
+            }
+        }
+        assert!(
+            unloaded_in_the_completion_frame,
+            "淡出结束必须由 E10 完成回调收尾（真实泵序下 sync 观测不到终值）"
         );
     }
 
@@ -799,6 +924,8 @@ mod tests {
 
     #[test]
     fn a_tooltip_is_not_interactive_and_declares_the_tooltip_role() {
+        // R12/E12：`Tooltip` 角色 + 可访问名（文本 + 快捷键）显式声明在引擎浮层**包装节点**上
+        // （E12 之后包装不再自动 Dialog）；内容根保持通用容器。
         let mut harness = Harness::new(TooltipOptions {
             delay: Duration::ZERO,
             ..TooltipOptions::default()
@@ -808,21 +935,10 @@ mod tests {
         let _ = harness.sync();
         let _ = harness.app.drain().expect("帧");
 
+        let wrapper = harness.tip.overlay().overlay_node().expect("浮层包装节点");
         let panel = harness.tip.overlay().panel_node().expect("面板");
-        let tip_row = harness
-            .app
-            .app()
-            .window(harness.window)
-            .expect("窗口")
-            .tree()
-            .get(panel)
-            .expect("面板")
-            .children()
-            .first()
-            .copied()
-            .expect("提示内容根");
         let snapshot = harness.app.a11y().expect("a11y 快照");
-        let record = snapshot.node_for(tip_row).expect("提示 a11y");
+        let record = snapshot.node_for(wrapper).expect("包装节点 a11y");
         assert_eq!(record.role, A11yRole::Tooltip, "提示角色");
         assert_eq!(
             record.label_text(),
@@ -832,6 +948,12 @@ mod tests {
         assert!(
             record.actions.is_empty(),
             "提示没有任何 a11y 动作（不可交互）"
+        );
+        let panel_record = snapshot.node_for(panel).expect("面板 a11y");
+        assert_eq!(
+            panel_record.role,
+            A11yRole::GenericContainer,
+            "面板不得重复声明 Tooltip（E12-R1：AT 不读两层同名角色）"
         );
     }
 
@@ -955,17 +1077,25 @@ mod tests {
 
     #[test]
     fn changing_the_content_while_shown_rebuilds_the_panel() {
-        // R05：显示中改内容必须重建面板。`Overlay::open` 的同窗重入只换锚点、不重建内容，
-        // 所以旧路径会让屏上停留在旧文本。
+        // R05/N2：显示中改内容必须**先完整淡出、关闭后再按新内容重建**。测试必须走真实淡出
+        // 窗口（淡入先完成、内容变化后在淡出窗口内继续 sync + tick + drain）——旧写法
+        // 「advance 后不 drain ⇒ 淡入未 tick ⇒ progress == 0 ⇒ close_now 立即卸载」只覆盖
+        // 立即关闭路径，M4 变异（内容变化不重建）漏检。
         let mut harness = Harness::new(TooltipOptions {
             delay: Duration::ZERO,
             ..TooltipOptions::default()
         });
         harness.hover(harness.trigger_center());
         let _ = harness.sync();
+        // 淡入完成（E10 完成回调在帧内收尾）：只有 progress == 1 时 `close` 才走淡出而不是立即卸载。
         harness.advance(Duration::from_millis(200));
+        let _ = harness.app.drain().expect("淡入帧");
         let _ = harness.sync();
-        assert!(harness.tip.is_visible(harness.app.app()));
+        assert_eq!(
+            harness.tip.overlay().progress(harness.app.app()),
+            1.0,
+            "前置：淡入已完成（否则内容变化走 close_now 立即卸载路径，覆盖不到 pending_restart）"
+        );
         let old_panel = harness.tip.overlay().panel_node().expect("旧面板");
         assert!(
             texts_of(&harness, old_panel).contains("保存"),
@@ -982,10 +1112,24 @@ mod tests {
             "旧面板先淡出（节点暂时保留）"
         );
 
-        // 淡出走完 → 旧浮层关闭 → 同一轮 Idle 分支按新内容重开。
-        for _ in 0..3 {
-            harness.advance(Duration::from_millis(200));
-            let _ = harness.sync();
+        // 真实淡出窗口内：内容变化标记必须阻止 Idle 分支撤销关闭（否则旧面板复活）。
+        harness.pump(Duration::from_millis(16));
+        let _ = harness.sync();
+        assert!(
+            !harness.tip.is_visible(harness.app.app()),
+            "内容变化的淡出窗口内不得复活旧面板（M4 变异：这里会变可见）"
+        );
+        assert!(
+            harness.tip.overlay().overlay_node().is_some(),
+            "前置：仍在淡出窗口内，旧面板还没卸载"
+        );
+
+        // 淡出走完（完成回调卸载）→ 下一轮 Idle 分支按新内容重开。
+        for _ in 0..20 {
+            harness.pump(Duration::from_millis(16));
+            if harness.tip.is_visible(harness.app.app()) {
+                break;
+            }
         }
         assert!(
             harness.tip.is_visible(harness.app.app()),
@@ -998,6 +1142,205 @@ mod tests {
             "新文本必须重建到屏上，实际 {texts:?}"
         );
         assert!(!texts.contains("保存"), "旧文本不得残留，实际 {texts:?}");
+    }
+
+    #[test]
+    fn restoring_content_during_the_fade_rebuilds_with_the_new_text() {
+        // N1（P2-4b 审查轮次 2）：`set_content(None)` 后在淡出窗口内恢复 `Some(new)`，旧路径在
+        // Idle 分支撤销关闭 ⇒ 屏上仍是旧面板文本，而 `shown` 已是新内容，之后不再重建。
+        let mut harness = Harness::new(TooltipOptions {
+            delay: Duration::ZERO,
+            ..TooltipOptions::default()
+        });
+        harness.hover(harness.trigger_center());
+        let _ = harness.sync();
+        harness.advance(Duration::from_millis(200));
+        let _ = harness.app.drain().expect("淡入帧");
+        let _ = harness.sync();
+        assert!(harness.tip.is_visible(harness.app.app()));
+        assert_eq!(harness.tip.overlay().progress(harness.app.app()), 1.0);
+
+        // 先撤回内容（开始淡出），再在淡出窗口内恢复新内容。
+        assert!(harness.tip.set_content(None));
+        let _ = harness.sync();
+        assert!(!harness.tip.is_visible(harness.app.app()));
+        assert!(
+            harness.tip.overlay().overlay_node().is_some(),
+            "前置：撤回后进入淡出窗口"
+        );
+        assert!(harness.tip.set_content(Some(TooltipContent::new("新建"))));
+
+        // 淡出窗口内不得复活旧面板。
+        harness.pump(Duration::from_millis(16));
+        let _ = harness.sync();
+        assert!(
+            !harness.tip.is_visible(harness.app.app()),
+            "撤回→恢复不得在淡出窗口内撤销关闭（N1 变异：这里会复活旧面板）"
+        );
+        assert!(
+            harness.tip.overlay().overlay_node().is_some(),
+            "前置：仍在淡出窗口内"
+        );
+
+        // 旧浮层关闭后按恢复的新内容重建。
+        for _ in 0..20 {
+            harness.pump(Duration::from_millis(16));
+            if harness.tip.is_visible(harness.app.app()) {
+                break;
+            }
+        }
+        assert!(
+            harness.tip.is_visible(harness.app.app()),
+            "恢复内容后按新内容重新显示"
+        );
+        let panel = harness.tip.overlay().panel_node().expect("新面板");
+        let texts = texts_of(&harness, panel);
+        assert!(
+            texts.contains("新建"),
+            "恢复的新文本必须重建到屏上，实际 {texts:?}"
+        );
+        assert!(!texts.contains("保存"), "旧文本不得残留，实际 {texts:?}");
+    }
+
+    #[test]
+    fn leaving_during_the_delay_cancels_the_timer_and_restarts_it_on_reentry() {
+        // E10 定时器生命周期：离开触发器 / 撤回内容时取消；再次进入重新计时（不是沿用旧到期点）。
+        let mut harness = Harness::new(TooltipOptions {
+            delay: Duration::from_millis(500),
+            ..TooltipOptions::default()
+        });
+        harness.hover(harness.trigger_center());
+        let _ = harness.sync();
+        harness.hover(Point::new(10.0, 10.0));
+        let _ = harness.sync();
+        assert!(!harness.tip.is_visible(harness.app.app()));
+
+        // 离开后即使走过原到期点也不得显示（定时器已取消）。
+        harness.advance(Duration::from_millis(700));
+        let _ = harness.app.drain().expect("帧");
+        let _ = harness.sync();
+        assert!(
+            !harness.tip.is_visible(harness.app.app()),
+            "离开后定时器必须取消（否则旧到期点会弹出提示）"
+        );
+
+        // 重新进入：重新计满 500 ms 才显示。
+        harness.hover(harness.trigger_center());
+        let _ = harness.sync();
+        harness.advance(Duration::from_millis(400));
+        let _ = harness.app.drain().expect("帧");
+        let _ = harness.sync();
+        assert!(
+            !harness.tip.is_visible(harness.app.app()),
+            "重新进入后必须重新计时（400 ms 时不得显示）"
+        );
+        harness.advance(Duration::from_millis(150));
+        let _ = harness.app.drain().expect("到期帧");
+        let _ = harness.sync();
+        assert!(
+            harness.tip.is_visible(harness.app.app()),
+            "重新计满延迟后显示"
+        );
+    }
+
+    #[test]
+    fn a_modal_scope_suppresses_a_background_tooltip() {
+        // R07/E12：模态作用域由引擎唯一提供（`App::modal_scope`）；作用域外的 hover / focus
+        // 读作 `None`，背景触发器因此不会在模态之上打开提示。kit 不自行推导模态作用域。
+        let mut harness = Harness::new(TooltipOptions {
+            delay: Duration::ZERO,
+            ..TooltipOptions::default()
+        });
+        let _dialog = harness.open_modal(|tree, panel| {
+            NodeBuilder::boxed()
+                .id("dialog-box")
+                .style(StyleBuilder::new().width(120.0).height(40.0).build())
+                .build(tree, panel)?;
+            Ok(())
+        });
+        assert!(
+            harness.app.app().modal_scope(harness.window).is_some(),
+            "前置：模态作用域存在（E12 公开查询面）"
+        );
+
+        // 指针移到**背景**触发器上：模态作用域存在时，提示不得在模态之上打开。
+        harness.hover(harness.trigger_center());
+        let _ = harness.sync();
+        assert!(
+            !harness.tip.is_visible(harness.app.app()),
+            "背景触发器不得在模态之上打开提示（撤销 E12 的 hover 过滤时这里会红）"
+        );
+        assert!(harness.tip.overlay().overlay_node().is_none());
+        assert!(
+            harness.app.app().hovered(harness.window).is_none(),
+            "模态作用域外的 hover 必须读作 None（E12/R07；引擎过滤是唯一口径）"
+        );
+        assert!(
+            harness.app.app().modal_scope(harness.window).is_some(),
+            "提示被抑制后模态作用域保持不变"
+        );
+    }
+
+    #[test]
+    fn a_tooltip_triggered_inside_the_modal_scope_still_works_and_stays_above_it() {
+        // R07 的反向保证：模态**内部**（含经 opener 链属于该模态的弹出层）的触发器照常工作；
+        // `Band::Tooltip` 最高 ⇒ 提示画在对话框之上。
+        let mut harness = Harness::new(TooltipOptions {
+            delay: Duration::ZERO,
+            ..TooltipOptions::default()
+        });
+        let inner_slot = Rc::new(Cell::new(None));
+        let slot = Rc::clone(&inner_slot);
+        let dialog = harness.open_modal(move |tree, panel| {
+            let node = NodeBuilder::boxed()
+                .id("inner-trigger")
+                .layout_override(Rect::new(10.0, 10.0, 100.0, 40.0))
+                .build(tree, panel)?;
+            slot.set(Some(node));
+            Ok(())
+        });
+        let inner = inner_slot.get().expect("模态内的触发器");
+        // 提示绑定到模态内的触发器（背景触发器仍在树里，但不参与这次激活）。
+        harness
+            .tip
+            .attach(harness.app.app_mut(), harness.window, inner);
+        let bounds = harness.app.probe().bounds(inner).expect("触发器布局");
+        let center = Point::new(
+            bounds.origin.x + bounds.size.width * 0.5,
+            bounds.origin.y + bounds.size.height * 0.5,
+        );
+        harness.hover(center);
+        assert_eq!(
+            harness.app.app().hovered(harness.window),
+            Some(inner),
+            "模态作用域内的悬停必须可见"
+        );
+        let _ = harness.sync();
+        assert!(
+            harness.tip.is_visible(harness.app.app()),
+            "模态内部的触发器照常显示提示"
+        );
+        let tip_node = harness.tip.overlay().overlay_node().expect("提示节点");
+        let dialog_node = dialog.overlay_node().expect("对话框节点");
+        let order: Vec<NodeId> = harness
+            .app
+            .app()
+            .overlays(harness.window)
+            .into_iter()
+            .map(|(node, _)| node)
+            .collect();
+        let tip_at = order
+            .iter()
+            .position(|node| *node == tip_node)
+            .expect("提示");
+        let dialog_at = order
+            .iter()
+            .position(|node| *node == dialog_node)
+            .expect("对话框");
+        assert!(
+            tip_at > dialog_at,
+            "提示必须画在对话框之上（Band::Tooltip 最高），实际 {order:?}"
+        );
     }
 
     #[test]
@@ -1034,6 +1377,7 @@ mod tests {
             harness.app.app_mut(),
             harness.theme.clone(),
             harness.layer.clone(),
+            harness.router.clone(),
             "menu",
             OverlayOptions {
                 band: Band::ContextMenu,

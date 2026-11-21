@@ -27,14 +27,25 @@
 //! | 固定 z 层带 | [`crate::kit::layer::Band`] + [`crate::kit::layer::Layer`] |
 //! | modal 遮罩（密度可调） | [`Scrim`]（浮层的**子节点**，`interactive: false` 命中穿透） |
 //! | `Transient` 淡入淡出 | [`Overlay::progress`] + `App::animate`（不建帧循环） |
-//! | a11y 角色（Dialog / Menu / Tooltip） | [`OverlayA11y`] |
+//! | 淡出收尾（真实泵序下可观察） | [`AnimationRouter`]（E10 `App::on_animation_complete` 的 kit 单槽路由） |
+//! | a11y 角色（Dialog / AlertDialog / Menu / Tooltip） | [`OverlayA11y`] → 引擎 `OverlayOptions::a11y`（E12） |
+//!
+//! ## 动画完成路由（E10，单槽）
+//!
+//! 引擎只有一个 `App::on_animation_complete` 槽（后注册覆盖先注册）。overlay 与 tooltip 的淡入
+//! 淡出完成**必须共用同一个路由**：[`AnimationRouter`]。组合根建一个 router（与 [`Layer`] 一样
+//! 是应用级唯一），传给每一个 [`Overlay::new`] / `Tooltip::new`；router 在第一次
+//! `Overlay::new` 时安装引擎回调，之后按 `AnimationId` 把终值事件分发给对应的浮层句柄。
+//! **不得**让调用方 / 组件各自 `on_animation_complete` —— 会静默覆盖，表现为某条淡出永远
+//! 收不了尾（E10-R02 裁决）。
 //!
 //! ## 与引擎语义的差异（已接受的取舍，见 spec-delta）
 //!
 //! - **点击外部 / Esc 关闭是即时的**：引擎在按下 / `Dismiss` 处理里直接卸载浮层节点，没有
-//!   「先淡出再走」的中间态。程序化 [`Overlay::close`] 才有淡出（淡出结束由 [`Overlay::sync`]
-//!   收尾）。旧实现在两者上都会淡出。
-//! - **淡出是逐图元 alpha，不是组不透明度**（引擎 G6 未实现组不透明度）：`StylePatch::opacity`
+//!   「先淡出再走」的中间态。程序化 [`Overlay::close`] 才有淡出；淡出到终值的同一帧由
+//!   [`AnimationRouter`] 的完成回调卸载节点（E10：不再靠下一轮 `sync` 观测 `progress == 0`）。
+//!   旧实现在两者上都会淡出。
+//! - **淡出是逐图元 alpha，不是组不透明度**（引擎 G6 未实现组不透明度；E13 未合入本批）：`StylePatch::opacity`
 //!   作用在浮层壳（面板背景 / 边框 / 遮罩）的每个图元上，内容子节点不跟着淡。内容需要
 //!   跟随淡出时读 [`Overlay::progress`] 自己缩放透明度（参考 `animation::popup_should_render`）。
 //! - **遮罩是浮层自己的子节点**：与浮层同生命周期（引擎的「点击外部关闭」只移除浮层节点），
@@ -53,7 +64,8 @@
 //!
 //! ```ignore
 //! let layer = Layer::new();
-//! let menu = Overlay::new(app, theme.clone(), layer.clone(), "menu", OverlayOptions {
+//! let router = AnimationRouter::new();   // 应用级唯一：overlay / tooltip 共用一个完成路由
+//! let menu = Overlay::new(app, theme.clone(), layer.clone(), router.clone(), "menu", OverlayOptions {
 //!     band: Band::ContextMenu,
 //!     ..OverlayOptions::default()
 //! });
@@ -74,13 +86,13 @@
 use std::{
     cell::{Cell, RefCell},
     fmt,
-    rc::Rc,
+    rc::{Rc, Weak},
 };
 
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     a11y::{A11yOverride, A11yRole},
-    app::App,
+    app::{AnimationCompletion, AnimationEndKind, App},
     error::EngineError,
     interaction::{
         AnimatedValue, AnimationId, AnimationSpec, Easing, Overlay as EngineOverlay,
@@ -105,6 +117,89 @@ use crate::{
     style_builder::{PaintBuilder, StyleBuilder},
     theme::{components::ComponentTokens, handle::ThemeHandle, role::Role},
 };
+
+// ── 动画完成路由（E10 单槽的 kit 统一入口） ───────────────────────────────
+
+/// kit 层唯一的动画完成路由（overlay / tooltip 的淡入淡出共用）。
+///
+/// 引擎 `App::on_animation_complete` 是**单槽**（重复注册替换，E10-R02 裁决）：overlay 与
+/// tooltip 若各自注册，后注册者会静默覆盖先注册者，表现为某条淡出永远等不到收尾。因此本模块
+/// 提供这个共享路由：
+///
+/// - 组合根建一个 `AnimationRouter`（与 [`Layer`] 一样是应用级唯一），传给每个 [`Overlay::new`]
+///   与 `Tooltip::new`；
+/// - 第一次 `Overlay::new` 时 router 把 kit 的完成回调装进当前 `App`（此后该 App 的完成槽由 kit
+///   拥有；应用自己的动画收尾也应经同一路由，不得再调 `on_animation_complete`）；
+/// - 每次淡入 / 淡出注册动画后按 `AnimationId` 登记对应浮层句柄；终值事件到达时按 id 分发，
+///   收到事件即摘除登记（一次性）。
+///
+/// 分发只处理 `Finished`（`Cancelled` / `Replaced` / `Released` 只摘登记、不动浮层状态）：
+/// 淡出的 `Finished` 由 [`Overlay`] 在**产生终值的同一帧**收尾（`close_now`），交给 `sync`
+/// 的旧路径（下一轮观测 `progress == 0`）在真实泵序下不可观察（P2-4b R01）。
+#[derive(Clone, Default)]
+pub struct AnimationRouter {
+    inner: Rc<RefCell<AnimationRouterState>>,
+}
+
+#[derive(Default)]
+struct AnimationRouterState {
+    /// 是否已把 kit 的回包装进某个 `App`（router 是应用级唯一，首次 `Overlay::new` 安装）。
+    installed: bool,
+    /// 在飞的淡入淡出动画（`AnimationId` → 浮层句柄；句柄已释放时自动丢弃）。
+    consumers: Vec<(AnimationId, Weak<OverlayInner>)>,
+}
+
+impl AnimationRouter {
+    /// 建一个路由（组合根唯一；与 [`Layer`] 同一个生命周期）。
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 把 kit 的统一完成回调装进 `app`（幂等：同一 router 只装一次）。
+    fn install(&self, app: &mut App) {
+        if self.inner.borrow().installed {
+            return;
+        }
+        self.inner.borrow_mut().installed = true;
+        let router = self.clone();
+        app.on_animation_complete(move |app, completion| router.dispatch(app, completion));
+    }
+
+    /// 登记一条在飞的淡入淡出动画（同一 id 不会重复登记）。
+    fn track(&self, id: AnimationId, overlay: &Rc<OverlayInner>) {
+        let mut state = self.inner.borrow_mut();
+        state.consumers.retain(|(tracked, _)| *tracked != id);
+        state.consumers.push((id, Rc::downgrade(overlay)));
+    }
+
+    /// 摘除一条登记（动画被取消 / 替换 / 浮层卸载时调用）。
+    fn untrack(&self, id: Option<AnimationId>) {
+        let Some(id) = id else {
+            return;
+        };
+        self.inner
+            .borrow_mut()
+            .consumers
+            .retain(|(tracked, _)| *tracked != id);
+    }
+
+    /// 按 `AnimationId` 分发一条完成事件给对应的浮层句柄。
+    fn dispatch(&self, app: &mut App, completion: AnimationCompletion) {
+        // 先摘登记再调用：回调里可能重新注册动画 / 卸载浮层（不持有 `RefCell` 借用）。
+        let consumer = {
+            let mut state = self.inner.borrow_mut();
+            state
+                .consumers
+                .iter()
+                .position(|(tracked, _)| *tracked == completion.id)
+                .map(|index| state.consumers.swap_remove(index).1)
+        };
+        if let Some(inner) = consumer.and_then(|weak| weak.upgrade()) {
+            Overlay { inner }.animation_completed(app, completion);
+        }
+    }
+}
 
 // ── 定位（纯逻辑） ─────────────────────────────────────────────────────────
 
@@ -586,9 +681,15 @@ impl Scrim {
 }
 
 /// 浮层的 a11y 声明（角色 + 可访问名）。
+///
+/// E12 之后引擎**不再**给浮层包装节点自动推导 `Dialog`（无显式声明 = `GenericContainer`），
+/// 因此角色必须由调用方显式声明：`dialog()` / `alert_dialog()` / `menu()` / `tooltip()` 分别
+/// 对应旧语义里的对话框 / 警告对话框 / 菜单 / 提示。声明被映射到引擎
+/// `OverlayOptions::a11y`（浮层**包装节点**），面板 / 内容不再重复声明同一语义（E12-R1：
+/// 两层同名角色会让 AT 读两遍）。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct OverlayA11y {
-    /// 覆盖角色（对话框 `Dialog` / 菜单 `Menu` / 提示 `Tooltip`）。
+    /// 覆盖角色（对话框 `Dialog` / 警告对话框 `AlertDialog` / 菜单 `Menu` / 提示 `Tooltip`）。
     pub role: Option<A11yRole>,
     /// 可访问名。
     pub label: Option<SmolStr>,
@@ -600,6 +701,15 @@ impl OverlayA11y {
     pub fn dialog(label: impl Into<SmolStr>) -> Self {
         Self {
             role: Some(A11yRole::Dialog),
+            label: Some(label.into()),
+        }
+    }
+
+    /// 警告对话框语义（需要用户确认的模态；AT 立即播报）。
+    #[must_use]
+    pub fn alert_dialog(label: impl Into<SmolStr>) -> Self {
+        Self {
+            role: Some(A11yRole::AlertDialog),
             label: Some(label.into()),
         }
     }
@@ -646,7 +756,10 @@ pub struct OverlayOptions {
     pub surface: OverlaySurface,
     /// 模态遮罩（只在 `modal` 时生效；`None` = 模态但无遮罩）。
     pub scrim: Option<Scrim>,
-    /// a11y 角色与可访问名。
+    /// a11y 角色与可访问名（声明在引擎浮层**包装节点**上；E12 之前靠引擎自动 `Dialog`，
+    /// 现在必须显式给，否则包装是 `GenericContainer`）。
+    ///
+    /// 运行期可用 [`Overlay::set_a11y`] 覆盖下一次 `open` 的声明（tooltip 的内容变化重建）。
     pub a11y: OverlayA11y,
     /// 是否播放淡入淡出（`false` = 立即显示 / 立即卸载）。
     pub fade: bool,
@@ -706,6 +819,8 @@ struct OverlayInner {
     key: SmolStr,
     theme: ThemeHandle,
     layer: Layer,
+    /// kit 的动画完成路由（overlay / tooltip 共用；单槽，不得各自注册）。
+    router: AnimationRouter,
     options: OverlayOptions,
     scope: SignalScope,
     /// 是否打开（触发器可以用 `bind_style` 读它画按下态）。
@@ -718,6 +833,8 @@ struct OverlayInner {
     /// 淡入淡出进度（`0` = 全透明，`1` = 不透明；逐图元 alpha）。
     fade: Transient<f32>,
     fade_animation: Cell<Option<AnimationId>>,
+    /// 下一次 `open` 写到引擎浮层**包装节点**上的 a11y 声明（tooltip 每次按内容刷新）。
+    a11y: RefCell<OverlayA11y>,
     state: RefCell<OverlayState>,
 }
 
@@ -729,15 +846,21 @@ pub struct Overlay {
 
 impl Overlay {
     /// 建浮层状态（关闭态）。之后用 [`Overlay::open`] 打开。
+    ///
+    /// `router` 必须是组合根的共享 [`AnimationRouter`]（overlay / tooltip 共用一个单槽路由；
+    /// 每个实例各建一个会让后建的覆盖先建的完成回调，淡出收不了尾）。
     pub fn new(
         app: &mut App,
         theme: ThemeHandle,
         layer: Layer,
+        router: AnimationRouter,
         key: impl Into<SmolStr>,
         options: OverlayOptions,
     ) -> Self {
         let key = key.into();
         let scope = app.signal_scope();
+        router.install(app);
+        let a11y = options.a11y.clone();
         Self {
             inner: Rc::new(OverlayInner {
                 open: app.signal_scoped(scope, false),
@@ -746,9 +869,11 @@ impl Overlay {
                 key,
                 theme,
                 layer,
+                router,
                 options,
                 scope,
                 fade_animation: Cell::new(None),
+                a11y: RefCell::new(a11y),
                 state: RefCell::new(OverlayState::default()),
             }),
         }
@@ -764,6 +889,14 @@ impl Overlay {
     #[must_use]
     pub fn options(&self) -> &OverlayOptions {
         &self.inner.options
+    }
+
+    /// 覆盖**下一次 `open`** 写到引擎浮层包装节点上的 a11y 声明。
+    ///
+    /// tooltip 的可访问名来自当前内容（`set_content` 可变），在每次 `show` 前用本方法刷新；
+    /// 已经打开的浮层不重建（tooltip 的内容变化走「关闭 → 按新内容重开」，见 `Tooltip`）。
+    pub(crate) fn set_a11y(&self, a11y: OverlayA11y) {
+        *self.inner.a11y.borrow_mut() = a11y;
     }
 
     /// 打开状态信号（`bind_style` / `bind_a11y` 可读；触发器画按下态用）。
@@ -868,6 +1001,9 @@ impl Overlay {
             self.inner.options.placement,
             self.inner.options.placement_config(),
         );
+        // E12：角色 / 可访问名显式写在引擎浮层**包装节点**上（无声明 = GenericContainer）；
+        // 面板 / 内容不再重复声明同一语义（否则 AT 树里多一层同名角色，E12-R1）。
+        let a11y = self.inner.a11y.borrow().clone();
         let engine_overlay = app.create_overlay(
             window,
             EngineOverlayOptions {
@@ -875,6 +1011,11 @@ impl Overlay {
                 dismiss: self.inner.options.dismiss.engine(),
                 trap_focus: self.inner.options.modal,
                 restore_focus: self.inner.options.restore_focus,
+                a11y: A11yOverride {
+                    role: a11y.role,
+                    label: a11y.label,
+                    ..A11yOverride::default()
+                },
             },
         )?;
         let engine_node = engine_overlay.node();
@@ -996,11 +1137,15 @@ impl Overlay {
         changed
     }
 
-    /// 帧同步（组合根的 `on_frame` 钩子里调用；测试直接调）：外部关闭探测 → 淡出收尾 →
-    /// 层带排序 → 跟随锚点。返回 `true` = 本帧做了工作（写 inset / 重排 / 卸载）。
+    /// 帧同步（组合根的 `on_frame` 钩子里调用；测试直接调）：外部关闭探测 → 层带排序 →
+    /// 跟随锚点。返回 `true` = 本帧做了工作（写 inset / 重排 / 卸载）。
     ///
     /// **没有自注册帧源**：与 `list` / `table` / `tree` 的 sync 同一约定（引擎 `App::on_frame`
     /// 只有一个钩子槽）。
+    ///
+    /// 淡出收尾**不在这里**：程序化关闭的淡出到终值时，E10 完成回调（[`AnimationRouter`]）
+    /// 在产生终值的同一帧调用 [`Overlay::close_now`]；本方法不再观测 `progress == 0`
+    /// （泵序是「钩子 → 帧」，动画终值在钩子之后写入，靠 sync 观测会漏掉最后一帧 —— R01）。
     pub fn sync(&self, app: &mut App) -> bool {
         let (window, handle) = {
             let state = self.inner.state.borrow();
@@ -1017,12 +1162,8 @@ impl Overlay {
             self.finish_close(app);
             return true;
         }
-        // ② 淡出结束 ⇒ 真正卸载（淡出完成由动画时钟给出，sync 只做收尾）。
+        // ② 淡出中：节点保留到 E10 完成回调收尾，这里不做层带重排 / 定位。
         if self.inner.state.borrow().closing {
-            if self.progress(app) <= 0.0 {
-                self.close_now(app);
-                return true;
-            }
             return false;
         }
         // ③ 层带排序（只有失配才重排）+ ④ 锚点跟随。
@@ -1156,7 +1297,10 @@ impl Overlay {
             .build(tree, parent)
     }
 
-    /// 建面板：背景 / 圆角 / 内边距 / 阴影 + a11y 角色；内容建在它里面。
+    /// 建面板：背景 / 圆角 / 内边距 / 阴影；内容建在它里面。
+    ///
+    /// a11y 角色不在这里声明：它属于**引擎浮层包装节点**（E12 之后角色必须显式声明，
+    /// 面板保持 `GenericContainer`，AT 不会多读一层同名角色）。
     fn build_panel(&self, tree: &mut NodeTree, parent: NodeId) -> Result<NodeId, EngineError> {
         let theme = self.inner.theme.clone();
         let fade = self.inner.fade;
@@ -1183,12 +1327,6 @@ impl Overlay {
                 // 首次实测前不画（首帧按零尺寸落位，画出来会跳位；内容子节点也一起隐藏）。
                 visible: Some(*cx.read(&revealed)),
                 ..StylePatch::default()
-            })
-            .a11y(A11yOverride {
-                role: self.inner.options.a11y.role,
-                label: self.inner.options.a11y.label.clone(),
-                modal: self.inner.options.modal,
-                ..A11yOverride::default()
             })
             .build(tree, parent)
     }
@@ -1236,13 +1374,19 @@ impl Overlay {
             duration: ComponentTokens::standard().animation_tick,
             easing: Easing::EaseOutCubic,
         };
+        // 同一目标上的新动画会替换旧槽（旧动画报 `Replaced`）：先摘旧登记，再登记新的。
+        // 完成事件按 id 分发，过期事件在 [`AnimationRouter::dispatch`] 里找不到句柄即丢弃。
+        self.inner.router.untrack(self.inner.fade_animation.take());
         match app.animate(
             window,
             AnimatedValue::Scalar { target: fade, to },
             &nodes,
             spec,
         ) {
-            Ok(id) => self.inner.fade_animation.set(Some(id)),
+            Ok(id) => {
+                self.inner.fade_animation.set(Some(id));
+                self.inner.router.track(id, &self.inner);
+            }
             // 窗口已关：直接落值（不会再有帧）。
             Err(_) => app.write_transient(&fade, to),
         }
@@ -1250,8 +1394,28 @@ impl Overlay {
 
     /// 取消在飞的淡入 / 淡出动画（卸载前必须做，否则动画会继续给死节点标脏）。
     fn cancel_fade(&self, app: &mut App) {
-        if let Some(id) = self.inner.fade_animation.take() {
+        let animation = self.inner.fade_animation.take();
+        self.inner.router.untrack(animation);
+        if let Some(id) = animation {
             let _ = app.cancel_animation(&id);
+        }
+    }
+
+    /// 淡入 / 淡出动画的终值事件（由 [`AnimationRouter`] 按 `AnimationId` 分发）。
+    ///
+    /// `Finished` + 正在淡出 ⇒ **同一帧内**卸载浮层（E10 完成回调在绘制之前派发，节点不会
+    /// 多画一帧终态）；淡入完成 / 取消 / 替换只清动画句柄，不改浮层状态。
+    fn animation_completed(&self, app: &mut App, completion: AnimationCompletion) {
+        // 过期事件（已被更晚的动画替换）不碰状态。
+        if self.inner.fade_animation.get() != Some(completion.id) {
+            return;
+        }
+        self.inner.fade_animation.set(None);
+        if completion.kind != AnimationEndKind::Finished {
+            return;
+        }
+        if self.inner.state.borrow().closing {
+            self.close_now(app);
         }
     }
 }
@@ -1586,8 +1750,8 @@ mod ui_tests {
     };
 
     use super::{
-        Anchor, DismissPolicy, Overlay, OverlayA11y, OverlayError, OverlayOptions, OverlaySurface,
-        Scrim,
+        Anchor, AnimationRouter, DismissPolicy, Overlay, OverlayA11y, OverlayError, OverlayOptions,
+        OverlaySurface, Scrim,
     };
     use crate::{
         kit::layer::Layer,
@@ -1631,6 +1795,8 @@ mod ui_tests {
         theme: ThemeHandle,
         /// 组合根共享的 Layer（多个浮层必须登记到同一张层带表）。
         layer: Layer,
+        /// 组合根共享的动画完成路由（overlay / tooltip 单槽共用）。
+        router: AnimationRouter,
     }
 
     impl Harness {
@@ -1645,6 +1811,7 @@ mod ui_tests {
                 root,
                 theme,
                 layer: Layer::new(),
+                router: AnimationRouter::new(),
             }
         }
 
@@ -1653,9 +1820,18 @@ mod ui_tests {
                 self.app.app_mut(),
                 self.theme.clone(),
                 self.layer.clone(),
+                self.router.clone(),
                 key,
                 options,
             )
+        }
+
+        /// 真实泵序的一轮：钩子（`Overlay::sync`）在帧之前 —— 与组合根 `on_frame` 同一位置。
+        /// 淡出收尾的 E10 完成回调在**帧内**（tick 之后）派发，因此断言必须紧跟 `drain`。
+        fn round(&mut self, by: Duration, overlay: &Overlay) {
+            self.app.advance(by);
+            let _ = overlay.sync(self.app.app_mut());
+            let _ = self.app.drain().expect("帧");
         }
 
         fn anchor(&mut self) -> NodeId {
@@ -1943,7 +2119,11 @@ mod ui_tests {
     }
 
     #[test]
-    fn closing_fades_out_before_the_panel_is_removed() {
+    fn closing_fades_out_and_a_finished_animation_unloads_in_the_same_frame() {
+        // R01（E10）：泵序是「钩子 → 帧」，淡出的最后一 tick 在钩子之后把 progress 写成 0。
+        // 旧实现靠 `sync` 观测 `progress == 0` 收尾 ⇒ 真实泵序下永远等不到。现在由
+        // `AnimationRouter` 的完成回调在**产生终值的同一帧内**卸载（断言紧跟该轮 `drain`，
+        // 不补 sync —— 补 sync 正是会掩盖 R01 的写法）。
         let mut harness = Harness::new();
         let anchor = harness.anchor();
         let overlay = harness.overlay(
@@ -1954,13 +2134,12 @@ mod ui_tests {
             },
         );
         assert!(harness.open(&overlay, Anchor::node(anchor)));
-        // 淡入：动画时钟推进后进度到 1。
+        // 淡入：时钟推进 + 帧内 tick（完成回调只清动画句柄，不关闭）。
         harness.app.advance(Duration::from_millis(200));
         let _ = harness.app.drain().expect("帧");
         assert_eq!(overlay.progress(harness.app.app()), 1.0, "淡入完成");
         let node = overlay.overlay_node().expect("浮层节点");
 
-        // 程序化关闭：先淡出，节点此刻仍在树里。
         assert!(overlay.close(harness.app.app_mut()));
         assert!(
             overlay.is_open(harness.app.app()),
@@ -1976,12 +2155,19 @@ mod ui_tests {
             .is_ok();
         assert!(alive, "淡出期间节点保留");
 
-        // 淡出结束：sync 收尾卸载。
-        harness.app.advance(Duration::from_millis(200));
-        let _ = harness.app.drain().expect("帧");
-        assert!(overlay.sync(harness.app.app_mut()), "同步完成收尾");
+        let mut unloaded_in_the_completion_frame = false;
+        for _ in 0..16 {
+            harness.round(Duration::from_millis(16), &overlay);
+            if overlay.overlay_node().is_none() {
+                unloaded_in_the_completion_frame = true;
+                break;
+            }
+        }
+        assert!(
+            unloaded_in_the_completion_frame,
+            "淡出到终值必须由 E10 完成回调在同一帧收尾（不能等下一次 sync）"
+        );
         assert!(!overlay.is_open(harness.app.app()), "淡出结束后关闭");
-        assert!(overlay.overlay_node().is_none());
         let alive = harness
             .app
             .app()
@@ -1992,6 +2178,57 @@ mod ui_tests {
             .is_ok();
         assert!(!alive, "淡出结束后节点卸载");
         assert_eq!(overlay.progress(harness.app.app()), 0.0);
+        let outcome = harness
+            .app
+            .app_mut()
+            .frame(harness.window)
+            .expect("窗口")
+            .expect("帧");
+        assert_eq!(outcome, FrameOutcome::Idle, "收尾后不得残留出帧");
+    }
+
+    #[test]
+    fn two_overlays_share_one_animation_completion_route() {
+        // E10 单槽（E10-R02）：每个 Overlay 各自注册 `on_animation_complete` 时后注册者会静默
+        // 覆盖先注册者，先关闭的浮层淡出永远收不了尾。共享 `AnimationRouter` 后两条淡出都必须
+        // 收到完成事件并卸载。
+        let mut harness = Harness::new();
+        let anchor = harness.anchor();
+        let first = harness.overlay(
+            "first",
+            OverlayOptions {
+                dismiss: DismissPolicy::Explicit,
+                fade: true,
+                ..options()
+            },
+        );
+        let second = harness.overlay(
+            "second",
+            OverlayOptions {
+                dismiss: DismissPolicy::Explicit,
+                fade: true,
+                ..options()
+            },
+        );
+        assert!(harness.open(&first, Anchor::node(anchor)));
+        assert!(harness.open(&second, Anchor::node(anchor)));
+        harness.app.advance(Duration::from_millis(200));
+        let _ = harness.app.drain().expect("淡入帧");
+        assert_eq!(first.progress(harness.app.app()), 1.0, "淡入完成");
+        assert_eq!(second.progress(harness.app.app()), 1.0, "淡入完成");
+
+        assert!(first.close(harness.app.app_mut()));
+        assert!(second.close(harness.app.app_mut()));
+        for _ in 0..16 {
+            harness.round(Duration::from_millis(16), &first);
+            if first.overlay_node().is_none() && second.overlay_node().is_none() {
+                break;
+            }
+        }
+        assert!(!first.is_open(harness.app.app()), "第一个浮层已收尾");
+        assert!(!second.is_open(harness.app.app()), "第二个浮层已收尾");
+        assert!(first.overlay_node().is_none());
+        assert!(second.overlay_node().is_none());
     }
 
     #[test]
@@ -2124,7 +2361,9 @@ mod ui_tests {
     }
 
     #[test]
-    fn the_panel_declares_its_a11y_role() {
+    fn the_overlay_wrapper_declares_its_a11y_role() {
+        // R12/E12：引擎浮层包装节点不再自动推导 `Dialog`（无声明 = GenericContainer）；角色/
+        // 可访问名由 kit 的 `OverlayA11y` 显式写到包装节点，面板保持通用容器（不重复声明）。
         let mut harness = Harness::new();
         harness.app.enable_a11y_capture();
         let anchor = harness.anchor();
@@ -2151,12 +2390,19 @@ mod ui_tests {
                 .expect("打开")
         );
         let _ = harness.app.drain().expect("帧");
+        let wrapper = overlay.overlay_node().expect("浮层包装节点");
         let panel = overlay.panel_node().expect("面板");
         let snapshot = harness.app.a11y().expect("a11y 快照");
-        let record = snapshot.node_for(panel).expect("面板 a11y");
-        assert_eq!(record.role, A11yRole::Dialog);
+        let record = snapshot.node_for(wrapper).expect("包装节点 a11y");
+        assert_eq!(record.role, A11yRole::Dialog, "包装节点必须显式声明 Dialog");
         assert_eq!(record.label_text(), Some("确认"));
         assert!(record.modal, "模态对话框必须声明 modal");
+        let panel_record = snapshot.node_for(panel).expect("面板 a11y");
+        assert_eq!(
+            panel_record.role,
+            A11yRole::GenericContainer,
+            "面板不得重复声明同一角色（否则 AT 读两层对话框）"
+        );
     }
 
     #[test]
@@ -2334,10 +2580,13 @@ mod ui_tests {
             "第二次 close 不得跳过淡出直接卸载节点"
         );
 
-        // 淡出结束后由 sync 收尾，关闭只发生一次。
-        harness.app.advance(Duration::from_millis(200));
-        let _ = harness.app.drain().expect("帧");
-        assert!(overlay.sync(harness.app.app_mut()), "淡出收尾");
+        // 淡出到终值时由 E10 完成回调收尾（真实泵序：钩子 → 帧）；第二次 close 没有重启动画。
+        for _ in 0..16 {
+            harness.round(Duration::from_millis(16), &overlay);
+            if overlay.overlay_node().is_none() {
+                break;
+            }
+        }
         assert!(!overlay.is_open(harness.app.app()));
         assert!(
             harness
@@ -2401,7 +2650,7 @@ mod ui_tests {
     }
 
     #[test]
-    fn a_menu_panel_declares_the_menu_role_and_the_scrim_is_hidden() {
+    fn the_wrapper_declares_menu_dialog_and_alert_dialog_roles_and_the_scrim_is_hidden() {
         let mut harness = Harness::new();
         harness.app.enable_a11y_capture();
         let anchor = harness.anchor();
@@ -2424,10 +2673,10 @@ mod ui_tests {
             .expect("打开菜单")
         );
         let _ = harness.app.drain().expect("帧");
-        let menu_panel = menu.panel_node().expect("菜单面板");
+        let menu_wrapper = menu.overlay_node().expect("菜单包装节点");
         let snapshot = harness.app.a11y().expect("a11y 快照");
-        let record = snapshot.node_for(menu_panel).expect("菜单面板 a11y");
-        assert_eq!(record.role, A11yRole::Menu, "菜单面板必须声明 Menu");
+        let record = snapshot.node_for(menu_wrapper).expect("菜单包装 a11y");
+        assert_eq!(record.role, A11yRole::Menu, "菜单包装节点必须声明 Menu");
         assert_eq!(record.label_text(), Some("文件"));
 
         let modal = harness.overlay(
@@ -2452,11 +2701,45 @@ mod ui_tests {
                 .expect("打开模态")
         );
         let _ = harness.app.drain().expect("帧");
+        let modal_wrapper = modal.overlay_node().expect("对话框包装节点");
         let scrim = modal.scrim_node().expect("模态遮罩");
         let snapshot = harness.app.a11y().expect("a11y 快照");
+        let record = snapshot.node_for(modal_wrapper).expect("对话框包装 a11y");
+        assert_eq!(record.role, A11yRole::Dialog);
+        assert_eq!(record.label_text(), Some("确认"));
         let record = snapshot.node_for(scrim).expect("遮罩 a11y");
         assert_eq!(record.role, A11yRole::Group, "遮罩是装饰组");
         assert!(record.hidden, "遮罩必须对 AT 隐藏");
+
+        // AlertDialog（E12 新增角色）：确认类模态显式声明，AT 立即播报。
+        let alert = harness.overlay(
+            "alert",
+            OverlayOptions {
+                modal: true,
+                scrim: Some(Scrim::default()),
+                surface: OverlaySurface::dialog(),
+                a11y: OverlayA11y::alert_dialog("删除？"),
+                dismiss: DismissPolicy::Explicit,
+                ..options()
+            },
+        );
+        assert!(
+            alert
+                .open(
+                    harness.app.app_mut(),
+                    harness.window,
+                    Anchor::node(anchor),
+                    build_content
+                )
+                .expect("打开警告对话框")
+        );
+        let _ = harness.app.drain().expect("帧");
+        let alert_wrapper = alert.overlay_node().expect("警告对话框包装节点");
+        let snapshot = harness.app.a11y().expect("a11y 快照");
+        let record = snapshot.node_for(alert_wrapper).expect("警告对话框 a11y");
+        assert_eq!(record.role, A11yRole::AlertDialog);
+        assert_eq!(record.label_text(), Some("删除？"));
+        assert!(record.modal, "警告对话框是模态");
     }
 
     #[test]
