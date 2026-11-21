@@ -497,9 +497,10 @@ impl IconSpec {
     /// `theme.role(cx, role)` —— 走 `bind_style.foreground`（E7 图片调制色与文本着色的同一条
     /// 动态通道），外观切换时只失效本节点并按新角色重画，**不需要重建**图标。
     ///
-    /// 静态 [`IconSpec::color`] 仍作为首帧样式 pass 求值前的占位值（真正绘制由 `bind_style`
-    /// 覆盖）。两种挂载方式的取舍：颜色是固定品牌色/状态色用 [`IconSpec::build`]，颜色由主题
-    /// 语义决定（例如 `FgMuted`）用本方法。
+    /// 首帧占位色取**主题角色**（`theme.theme_for(theme.current(app)).role(role)`），
+    /// `bind_style.foreground` 在样式 pass 求值后覆盖它；静态 [`IconSpec::color`] 在这条路径上
+    /// **被忽略**（只在 [`IconSpec::build`] 里生效）。两种挂载方式的取舍：颜色是固定品牌色 /
+    /// 状态色用 [`IconSpec::build`]，颜色由主题语义决定（例如 `FgMuted`）用本方法。
     ///
     /// # Errors
     /// 同 [`IconSpec::build`]（`UnknownWindow` / `InvalidSize` / `Decode` / `Node`）。

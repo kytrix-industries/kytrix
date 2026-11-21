@@ -36,6 +36,10 @@
 //!   估计值，滚动到那里后再量。重建（`set_items` / `set_count` / `push`）与 `attach` 在同步
 //!   建完行内容后先 settle 一次布局（[`settle_layout`]）：真实泵序里 `sync` 早于帧布局，不
 //!   settle 的话首轮实测会读到未布局的 0 高并写进全零 extents（G2，行会被引擎永久回收）。
+//!   含**文本**的行例外：文本 measure 要等帧内 text pass 的 shape，帧前的 settle 只能量到
+//!   padding（4 px 左右）；`sync` 对这些行延后一帧实测（`pending_text_measure`，F2），否则
+//!   padding-only 高度写进 extents 会把 `set_count` 保留的滚动偏移 clamp 到 0。显式行高的行
+//!   不依赖文本 shape，settle 后首轮即可测 —— G2 的回归测试钉住这点。
 //!
 //! 应用层的 `RowHeights` 只服务双端列表锚点换算与测量回写，滚动帧不重建它（前缀和只在行高
 //! 变更时重建）。
@@ -62,7 +66,11 @@
 //! `set_virtual_items(0)` → `set_virtual_items(n)` 强制重建可见窗口（行内容按新下标重新生成）；
 //! 代价是每次 push 重挂可见行，与旧 gpui `splice` 保测量不同，登记为已知差异。
 
-use std::{cell::RefCell, collections::BTreeSet, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeSet,
+    rc::Rc,
+};
 
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
@@ -78,10 +86,10 @@ use ui_core::{
         builder::NodeBuilder,
         id::NodeId,
         signal::{Signal, SignalScope},
-        tree::NodeTree,
+        tree::{NodeKind, NodeTree},
     },
     paint::style::StylePatch,
-    window::WindowId,
+    window::{FrameIndex, WindowId},
 };
 
 use crate::{
@@ -599,6 +607,10 @@ struct ListInner {
     /// 行级 a11y 补丁（表 / 树在列表基线上叠加角色 / 标签 / 展开态）。
     row_a11y: RefCell<Option<Rc<dyn Fn(usize) -> A11yPatch>>>,
     heights: RefCell<RowHeights>,
+    /// 重建 / 首帧建行发生在哪一帧（F2）：该帧的布局跑在 text pass **之前**，行内容里的文本
+    /// 尚未 shape（量到 0），含文本的行的实测因此不可信 —— `sync` 只在 `frame_index` 前进
+    /// 后（文本已 shape、帧内布局已跑）才测量这些行。`None` = 没有待测的文本行。
+    pending_text_measure: Cell<Option<FrameIndex>>,
     geometry: RefCell<Geometry>,
     select_action: Action,
     activate: RefCell<Option<Rc<dyn Fn(&mut App, usize)>>>,
@@ -642,6 +654,7 @@ impl List {
                 disabled: RefCell::new(BTreeSet::new()),
                 row_a11y: RefCell::new(None),
                 heights: RefCell::new(RowHeights::default()),
+                pending_text_measure: Cell::new(None),
                 geometry: RefCell::new(Geometry::default()),
                 content: Rc::new(content),
                 select_action: Action::Custom(format_smolstr!("{key}.select")),
@@ -1066,6 +1079,20 @@ impl List {
         }
         // ③ 变高列表：实测内容容器高度并回写（引擎按锚点补偿偏移）。
         if self.inner.options.row_height.is_variable() {
+            // G2/F2：rebuild / attach 的首帧建行发生在帧钩子里，settle 跑在该帧 text pass
+            // **之前** ⇒ 行内容里的文本尚未 shape，布局量到 0（只剩 padding）。这类行的实测
+            // 不可信：写进 extents 会把内容高度压成 padding-only，引擎重算前缀和时把
+            // `set_count` 保留的偏移 clamp 到 0（文本行高列表的既有缺陷）。等 `frame_index`
+            // 前进（帧内 text pass + layout 已完成）后再量。显式行高的行（菜单 / 表格形态）
+            // 不依赖文本 shape，settle 后立即可测 —— G2 的两条真实泵序回归依赖这一点。
+            let pending = self.inner.pending_text_measure.get();
+            let defer_text = pending.is_some_and(|pending| {
+                app.window(window)
+                    .is_some_and(|target| target.frame_index() == pending)
+            });
+            if pending.is_some() && !defer_text {
+                self.inner.pending_text_measure.set(None);
+            }
             let mut measured = false;
             {
                 let Some(target) = app.window(window) else {
@@ -1085,6 +1112,9 @@ impl List {
                     else {
                         continue;
                     };
+                    if defer_text && subtree_contains_text(tree, content) {
+                        continue;
+                    }
                     let height = tree
                         .get(content)
                         .map(|node| node.layout().bounds.size.height)
@@ -1353,6 +1383,12 @@ impl List {
             // 消失）。建完立即 settle，首轮实测就能读到真实行高。
             if !populated.is_empty() && self.inner.options.row_height.is_variable() {
                 settle_layout(app, window)?;
+                // F2：本帧的布局在 text pass 之前，文本行只量到 padding；这些行等到下一帧
+                // （`frame_index` 前进）再实测，避免把 padding-only 高度写进 extents 后
+                // clamp 掉 `set_count` 保留的滚动偏移。
+                self.inner
+                    .pending_text_measure
+                    .set(app.window(window).map(|target| target.frame_index()));
             }
         }
         Ok(())
@@ -1405,6 +1441,10 @@ impl List {
         let populated = self.fill_row_contents(app, window)?;
         if !populated.is_empty() && self.inner.options.row_height.is_variable() {
             settle_layout(app, window)?;
+            // F2：同 `rebuild` —— 文本行在帧内 text pass 之前量不到真实高度，延后一帧实测。
+            self.inner
+                .pending_text_measure
+                .set(app.window(window).map(|target| target.frame_index()));
         }
         Ok(())
     }
@@ -1428,6 +1468,24 @@ fn settle_layout(app: &mut App, window: WindowId) -> Result<(), EngineError> {
         target.compute_layout()?;
     }
     Ok(())
+}
+
+/// 内容子树里是否含文本节点（F2 的实测延后判据）。
+///
+/// 文本的 measure 闭包由帧内 text pass 的 `set_text_shaped` 安装；在那之前布局把它量成
+/// `0×0`（`Window::compute_layout` 的文档前置条件）。因此**只对含文本的行**延后实测：
+/// 显式行高的行（菜单 / 表格）在 settle 后已有真实布局盒，不需要等帧（G2 依赖这一点）。
+fn subtree_contains_text(tree: &NodeTree, node: NodeId) -> bool {
+    let Ok(target) = tree.get(node) else {
+        return false;
+    };
+    if matches!(target.kind(), NodeKind::Text(_)) {
+        return true;
+    }
+    target
+        .children()
+        .iter()
+        .any(|child| subtree_contains_text(tree, *child))
 }
 
 impl ListInner {
@@ -2391,37 +2449,17 @@ mod ui_tests {
         let _ = RowHeight::Fixed(1.0);
     }
 
-    /// 真实泵序下的变高列表：`mount` / `set_items` 返回后**不先 drain**（= 帧布局尚未发生）。
-    ///
-    /// 行内容用显式高度（菜单行 / 表格单元格的真实形态），测量与文本 shape 无关。
-    fn variable_list_without_frames() -> (TestApp, List) {
-        const ROWS: usize = 8;
-        const VARIABLE_EXTENT: f32 = 26.0;
-        fn row_height(index: usize) -> f32 {
-            if index.is_multiple_of(2) { 40.0 } else { 20.0 }
-        }
-
+    /// 真实泵序下的变高列表：`mount` / `set_items` / `set_count` / `push` 返回后**不先 drain**
+    /// （= 帧布局尚未发生）。
+    fn variable_list_without_frames_with(
+        options: ListOptions,
+        rows: usize,
+        content: impl Fn(&mut NodeTree, NodeId, usize) -> Result<(), EngineError> + 'static,
+    ) -> (TestApp, List) {
         let mut app = TestApp::new();
         let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
-        let list = List::new(
-            app.app_mut(),
-            theme,
-            "real-pump",
-            ListOptions::variable(VARIABLE_EXTENT),
-            |tree: &mut NodeTree, parent: NodeId, index: usize| {
-                NodeBuilder::boxed()
-                    .style(
-                        StyleBuilder::new()
-                            .width_full()
-                            .height(row_height(index))
-                            .flex_none()
-                            .build(),
-                    )
-                    .build(tree, parent)?;
-                Ok::<(), EngineError>(())
-            },
-        );
-        list.set_initial_count(app.app_mut(), ROWS);
+        let list = List::new(app.app_mut(), theme, "real-pump", options, content);
+        list.set_initial_count(app.app_mut(), rows);
         let window = app.window_id();
         let root = app.app().window(window).expect("window").tree().root();
         let parent = {
@@ -2438,6 +2476,53 @@ mod ui_tests {
         };
         list.mount(app.app_mut(), window, parent).expect("mount");
         (app, list)
+    }
+
+    /// 显式行高的变高行（菜单行 / 表格单元格的真实形态）：偶数行 60、奇数行 30。
+    ///
+    /// 列表默认 `padding_y = 2.0` ⇒ 实测行高 64 / 34。测量与文本 shape 无关（G2 的修法在
+    /// settle 后即可测），因此和 `estimate = 26` 明显不同 —— 首轮读到 64/34 才证明 settle 生效。
+    fn explicit_height_row(
+        tree: &mut NodeTree,
+        parent: NodeId,
+        index: usize,
+    ) -> Result<(), EngineError> {
+        let height = if index.is_multiple_of(2) { 60.0 } else { 30.0 };
+        NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .width_full()
+                    .height(height)
+                    .flex_none()
+                    .build(),
+            )
+            .build(tree, parent)?;
+        Ok(())
+    }
+
+    /// 显式行高的真实泵序 fixture（`mount` 返回后不先 drain）。
+    fn variable_list_without_frames() -> (TestApp, List) {
+        const ROWS: usize = 8;
+        const VARIABLE_EXTENT: f32 = 26.0;
+        fn row_height(index: usize) -> f32 {
+            if index.is_multiple_of(2) { 40.0 } else { 20.0 }
+        }
+        variable_list_without_frames_with(
+            ListOptions::variable(VARIABLE_EXTENT),
+            ROWS,
+            |tree: &mut NodeTree, parent: NodeId, index: usize| {
+                NodeBuilder::boxed()
+                    .style(
+                        StyleBuilder::new()
+                            .width_full()
+                            .height(row_height(index))
+                            .flex_none()
+                            .build(),
+                    )
+                    .build(tree, parent)?;
+                Ok::<(), EngineError>(())
+            },
+        )
     }
 
     /// 实测回写断言：`sync` 开始时已挂载的行 = 内容显式高 + `padding_y × 2`（列表默认 2.0）；
@@ -2499,6 +2584,212 @@ mod ui_tests {
         let changed = list.sync(app.app_mut()).expect("sync");
         assert!(changed, "重建后首轮实测回写必须报告变化");
         assert_first_measurement_is_real(&app, &list, &measured);
+    }
+
+    /// F1 回归（真实泵序）：`set_count`（活数据刷新，承诺**保留滚动位置**）走的是 `rebuild`
+    /// 共同路径，但既有 G2 回归只覆盖 `mount` 与 `set_items`。
+    ///
+    /// 把 settle 收窄成「仅 `set_items`」（`target_offset == Some(0.0)`）时本用例必须红：
+    /// `set_count` 不 settle ⇒ 新建行内容尚未布局 ⇒ 首轮实测读到 padding-only（4.0），
+    /// 偏移被 clamp。显式行高（菜单 / 表格形态）不依赖文本 shape，首轮就该读到 64 / 34。
+    #[test]
+    fn the_first_sync_after_set_count_measures_real_heights_and_keeps_the_offset() {
+        let (mut app, list) =
+            variable_list_without_frames_with(ListOptions::variable(26.0), 5, explicit_height_row);
+        assert!(
+            list.sync(app.app_mut()).expect("首轮 sync"),
+            "首轮实测必须回写真实行高"
+        );
+        let before = list.row_heights();
+        assert_eq!(before.get(0), Some(64.0), "显式行高 60 + padding 2*2");
+        assert_eq!(before.get(1), Some(34.0), "显式行高 30 + padding 2*2");
+
+        list.scroll_to_item(app.app_mut(), 2, ui_core::interaction::ItemAlign::Start)
+            .expect("scroll");
+        let offset = list.offset(app.app()).expect("offset");
+        assert!(
+            offset > 0.0,
+            "先滚到非零偏移（set_count 保留它的前提）：{offset}"
+        );
+
+        list.set_count(app.app_mut(), 5).expect("set count");
+        let mounted: Vec<usize> = list
+            .mounted_rows(app.app())
+            .into_iter()
+            .map(|(index, _)| index)
+            .collect();
+        assert!(!mounted.is_empty(), "重建后必须挂载可见行");
+
+        list.sync(app.app_mut())
+            .expect("重建后首轮 sync（不先 drain）");
+        let after = list.row_heights();
+        for index in &mounted {
+            let expected = if index.is_multiple_of(2) { 64.0 } else { 34.0 };
+            assert_eq!(
+                after.get(*index),
+                Some(expected),
+                "第 {index} 行：set_count 后首轮实测必须是真实行高（不是 padding-only 4.0）"
+            );
+        }
+        assert_eq!(
+            list.offset(app.app()),
+            Some(offset),
+            "set_count 保留滚动偏移（首轮实测不得把它 clamp 掉）"
+        );
+    }
+
+    /// F1 回归（真实泵序）：`push`（双端列表，容量满时丢最旧一条 + 锚点保持）同样走
+    /// `rebuild` 共同路径。
+    ///
+    /// 行内容高度取自 deque 数据（数据随 push 位移，行高表也随位移对齐）；settle 收窄成
+    /// 「仅 `set_items`」时本用例必须红：新建行未布局 ⇒ 首轮实测 padding-only ⇒ 锚点偏移被
+    /// clamp 到 0。断言读者贴顶的条目（旧下标 2 → 新下标 1）仍在顶部。
+    #[test]
+    fn the_first_sync_after_push_measures_real_heights_and_keeps_the_reader_anchor() {
+        let data: Rc<RefCell<VecDeque<f32>>> =
+            Rc::new(RefCell::new(VecDeque::from([60.0, 30.0, 60.0, 30.0, 60.0])));
+        let rows = data.clone();
+        let (mut app, list) = variable_list_without_frames_with(
+            ListOptions::variable(26.0).deque(5),
+            5,
+            move |tree: &mut NodeTree, parent: NodeId, index: usize| {
+                let height = rows.borrow().get(index).copied().unwrap_or(0.0);
+                NodeBuilder::boxed()
+                    .style(
+                        StyleBuilder::new()
+                            .width_full()
+                            .height(height)
+                            .flex_none()
+                            .build(),
+                    )
+                    .build(tree, parent)?;
+                Ok::<(), EngineError>(())
+            },
+        );
+        assert!(
+            list.sync(app.app_mut()).expect("首轮 sync"),
+            "首轮实测必须回写真实行高"
+        );
+        let before = list.row_heights();
+        assert_eq!(before.get(0), Some(64.0), "数据行高 60 + padding 2*2");
+        assert_eq!(before.get(1), Some(34.0), "数据行高 30 + padding 2*2");
+
+        list.scroll_to_item(app.app_mut(), 2, ui_core::interaction::ItemAlign::Start)
+            .expect("scroll");
+        assert!(
+            list.offset(app.app()).expect("offset") > 0.0,
+            "先滚到非零偏移（锚点保持的前提）"
+        );
+
+        {
+            let mut data = data.borrow_mut();
+            data.pop_front();
+            data.push_back(30.0);
+        }
+        list.push(app.app_mut()).expect("push");
+        let mounted: Vec<usize> = list
+            .mounted_rows(app.app())
+            .into_iter()
+            .map(|(index, _)| index)
+            .collect();
+        assert!(!mounted.is_empty(), "push 后必须挂载可见行");
+
+        list.sync(app.app_mut())
+            .expect("push 后首轮 sync（不先 drain）");
+        let after = list.row_heights();
+        let data = data.borrow();
+        for index in &mounted {
+            let content = data.get(*index).copied().expect("新数据覆盖已挂载行");
+            assert_eq!(
+                after.get(*index),
+                Some(content + 4.0),
+                "第 {index} 行：push 后首轮实测必须是真实行高（不是 padding-only 4.0）"
+            );
+        }
+        let offset = list.offset(app.app()).expect("offset");
+        assert!(
+            offset > 0.0,
+            "读者锚点仍在列表中部（没有被 clamp 到 0）：{offset}"
+        );
+        assert!(
+            (offset - after.top(1)).abs() < 0.5,
+            "读者贴顶的条目丢首项后是下标 1：offset={offset} top(1)={}",
+            after.top(1)
+        );
+    }
+
+    /// F2 回归（真实泵序，文本行高）：`set_count` 的「保留滚动位置」契约在**文本行高**列表上
+    /// 必须成立。
+    ///
+    /// 文本的 measure 要等帧内 text pass 的 shape；重建发生在帧钩子里，帧前的 settle 只能量到
+    /// padding（≈4.0）。若把 padding-only 高度写进 extents，内容高度塌到视口以下，`set_count`
+    /// 保留的偏移被 clamp 到 0（合并后审查实测 80 → 0 的既有缺陷）。修法：含文本的行延后一帧
+    /// 实测（`pending_text_measure`），帧后由 shape 完成的布局补齐真实高度且不移动读者。
+    #[test]
+    fn set_count_on_a_text_row_height_list_keeps_the_scroll_offset() {
+        let (mut app, list) = variable_list_without_frames_with(
+            ListOptions::variable(26.0),
+            12,
+            |tree: &mut NodeTree, parent: NodeId, index: usize| {
+                NodeBuilder::text(format_smolstr!("row{index}"), TextStyle::new(12.0))
+                    .build(tree, parent)?;
+                Ok::<(), EngineError>(())
+            },
+        );
+        // 先让文本 shape、变高实测稳定（真实窗口里滚动之前也已经过若干帧）。
+        for _ in 0..3 {
+            let _ = app.drain().expect("frame");
+            let _ = list.sync(app.app_mut()).expect("sync");
+        }
+        let before = list.row_heights();
+        let first = before.get(0).expect("第 0 行高度");
+        assert!(
+            (5.0..40.0).contains(&first),
+            "文本行应有真实实测高度（不是 estimate / padding-only）：{first}"
+        );
+
+        list.scroll_to_item(app.app_mut(), 4, ui_core::interaction::ItemAlign::Start)
+            .expect("scroll");
+        let offset = list.offset(app.app()).expect("offset");
+        assert!(offset > 0.0, "先滚到非零偏移：{offset}");
+
+        list.set_count(app.app_mut(), 12).expect("set count");
+        list.sync(app.app_mut())
+            .expect("重建后首轮 sync（不先 drain）");
+        assert_eq!(
+            list.row_heights().as_slice(),
+            before.as_slice(),
+            "首轮 sync 不得用 padding-only 高度覆盖已实测行高"
+        );
+        assert_eq!(
+            list.offset(app.app()),
+            Some(offset),
+            "set_count 必须保留文本行高列表的滚动偏移（修好前实测 80 → 0）"
+        );
+
+        // 下一帧 shape + layout 之后延后的实测补齐：所有挂载行都是真实高度，读者不动。
+        let _ = app.drain().expect("frame");
+        list.sync(app.app_mut()).expect("帧后 sync");
+        assert_eq!(
+            list.offset(app.app()),
+            Some(offset),
+            "帧后补测量也不得移动读者"
+        );
+        let mounted: Vec<usize> = list
+            .mounted_rows(app.app())
+            .into_iter()
+            .map(|(index, _)| index)
+            .collect();
+        let after = list.row_heights();
+        let real = after.get(mounted[0]).expect("挂载行高度");
+        assert!(real > 4.0, "挂载行必须补上真实高度：{after:?}");
+        for index in &mounted {
+            assert_eq!(
+                after.get(*index),
+                Some(real),
+                "第 {index} 行：同文本文本行高应一致（且不是 padding-only）：{after:?}"
+            );
+        }
     }
 }
 

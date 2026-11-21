@@ -786,7 +786,7 @@ struct Inner {
     tab_hover: Signal<Option<usize>>,
     confirm_hovered: Signal<bool>,
     change: RefCell<Option<Rc<dyn Fn(&mut App, Color)>>>,
-    /// 打开回调（关闭 → 打开的那次 `sync` 里调用一次；G5 的可观测面）。
+    /// 打开回调（`open_panel` 建好面板内容后**同步**调用一次；G5 的可观测面）。
     open_callback: RefCell<Option<Rc<dyn Fn(&mut App)>>>,
     trigger: RefCell<Option<TriggerView>>,
     panel: RefCell<Option<Panel>>,
@@ -971,8 +971,10 @@ impl ColorPicker {
 
     /// 程序化打开面板（与点击触发器同一条路径：浮层 + 面板内容；已打开时 no-op）。
     ///
-    /// 返回是否真的打开了；[`ColorPicker::on_open`] 在下一次 `sync` 的关闭→打开边沿触发
-    /// （与点击路径一致）。真实窗口验收用它拿确定性证据（不依赖 OS 输入注入）。
+    /// 返回是否真的打开了：面板打开时**同步**调用一次 [`ColorPicker::on_open`]（点击路径与
+    /// `open()` 共用 `open_panel`；`build_panel` 已把 `was_open` 置位，下一次 `sync` 不再有
+    /// 边沿）。已打开时 no-op 返回 `false`；淡出动画期间 overlay 仍报 `is_open = true`，此时
+    /// 也无法重开（既有 overlay 模型）。真实窗口验收用它拿确定性证据（不依赖 OS 输入注入）。
     pub fn open(&self, app: &mut App, window: WindowId) -> bool {
         if self.inner.overlay.is_open(app) {
             return false;

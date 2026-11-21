@@ -429,7 +429,11 @@ impl MarkdownNode {
     /// 外观变化时按新主题重建子树；返回是否重建（帧钩子里、样式 pass 之前调用）。
     ///
     /// 子树节点是纯静态载荷（没有 `bind_*` / 没有自持信号依赖），因此直接 `NodeTree::remove`
-    /// 不残留依赖边。根节点原地保留（外部持有的 probe / 布局锚点不失效）。
+    /// 不残留依赖边。**不变量**：markdown 子树不得挂 `bind_*` —— `NodeTree::remove` 只把被删
+    /// 节点仍持有的**非空**依赖边交还调用方（由 `App` 逐条 `detach`），所以「返回空」就等于
+    /// 「子树无绑定」；忽略返回值只有在子树无绑定时才安全，由 `debug_assert` 守护（F6）。根节点
+    /// 原地保留（外部持有的 probe / 布局锚点不失效；回归测试
+    /// `rebuilding_keeps_the_markdown_root_identity_and_the_page_offset`）。
     pub fn sync(&mut self, app: &mut App) -> bool {
         let appearance = self.theme.current(app);
         if appearance == self.appearance {
@@ -451,7 +455,12 @@ impl MarkdownNode {
             return false;
         };
         for child in children {
-            let _ = tree.remove(child);
+            if let Ok(removed) = tree.remove(child) {
+                debug_assert!(
+                    removed.is_empty(),
+                    "markdown 子树不得挂 bind_*：重建会留下未释放的依赖边（App::write 退化 + 泄漏）"
+                );
+            }
         }
         let mut images = super::inline_flow::PlaceholderImagePaint {
             color: view.style.image_placeholder,
@@ -811,8 +820,9 @@ mod tests {
 
     use smol_str::SmolStr;
     use ui_core::{
+        interaction::ScrollConfig,
         math::{Point, Size},
-        node::tree::NodeKind,
+        node::{builder::NodeBuilder, tree::NodeKind},
         test_support::{app::TestApp, probe::Selector},
         text::TextStyle,
     };
@@ -827,6 +837,7 @@ mod tests {
             inline_flow::{FlowStyle, InvisibleImages},
             source::InlineImageFormat,
         },
+        style_builder::StyleBuilder,
         theme::{appearance::Appearance, handle::ThemeHandle, resolved::Theme, role::Role},
     };
 
@@ -1430,6 +1441,158 @@ mod tests {
             resolved(Theme::of(Appearance::Light).role(Role::FgDefault)),
             resolved(Theme::of(Appearance::Dark).role(Role::FgDefault)),
             "两套外观的正文色必须不同（否则上面的断言无意义）"
+        );
+    }
+
+    /// F8（契约测试）：重建**原地保留根节点身份**（外部 probe / 布局锚点不失效），且页面滚动
+    /// 位置不被重建移动。
+    ///
+    /// 变异验证：把 `sync` 改成「删根重建新根」时本用例必须红（根 `NodeId` 变化 / 页面偏移
+    /// 被 clamp）。文档里「根节点原地保留」此前没有测试守护。
+    #[test]
+    fn rebuilding_keeps_the_markdown_root_identity_and_the_page_offset() {
+        let mut app = TestApp::new();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let window = app.window_id();
+        let root = app.app().window(window).expect("窗口").tree().root();
+        // 可滚动页面：容器 600 高、内容 1800 高；markdown 挂在容器里。
+        let page = {
+            let tree = app.app_mut().window_mut(window).expect("窗口").tree_mut();
+            NodeBuilder::boxed()
+                .id("page")
+                .style(
+                    StyleBuilder::new()
+                        .relative()
+                        .width(800.0)
+                        .height(600.0)
+                        .overflow_hidden()
+                        .build(),
+                )
+                .build(tree, root)
+                .expect("页面")
+        };
+        let handle = app
+            .app_mut()
+            .make_scroll(window, page, ScrollConfig::default())
+            .expect("滚动容器");
+        app.app_mut()
+            .set_scroll_content(&handle, Size::new(800.0, 1800.0))
+            .expect("滚动内容");
+        let blocks = (0..12)
+            .map(|index| paragraph(vec![text(&format!("段落 {index}"))]))
+            .collect::<Vec<_>>();
+        let mut node =
+            MarkdownNode::mount(app.app_mut(), window, page, theme.clone(), document(blocks));
+        let _ = app.drain().expect("首帧");
+        app.app_mut()
+            .scroll_to(&handle, Point::new(0.0, 240.0))
+            .expect("滚动");
+        let _ = app.drain().expect("滚动帧");
+        let offset = app.app().scroll_state(&handle).expect("滚动状态").offset.y;
+        assert!((offset - 240.0).abs() < 0.5, "页面滚到 240：{offset}");
+
+        let root_before = node.root();
+        let first_child_before = app
+            .app()
+            .window(window)
+            .expect("窗口")
+            .tree()
+            .get(root_before)
+            .expect("根节点")
+            .children()[0];
+
+        assert!(
+            theme.set_appearance(app.app_mut(), Appearance::Dark),
+            "写外观信号"
+        );
+        assert!(node.sync(app.app_mut()), "外观变化 = 重建子树");
+        let _ = app.drain().expect("重建后的帧");
+
+        assert_eq!(
+            node.root(),
+            root_before,
+            "根节点原地保留（外部 probe / 布局锚点不失效）"
+        );
+        let tree = app.app().window(window).expect("窗口").tree();
+        let rebuilt = tree.get(root_before).expect("根节点存活");
+        assert!(!rebuilt.children().is_empty(), "重建后根下仍有块");
+        assert_ne!(
+            rebuilt.children()[0],
+            first_child_before,
+            "子树节点是真重建（不是复用旧块）"
+        );
+        assert_eq!(rebuilt.parent(), Some(page), "根节点的父节点不变");
+        let offset_after = app.app().scroll_state(&handle).expect("滚动状态").offset.y;
+        assert!(
+            (offset_after - offset).abs() < 0.5,
+            "重建不移动页面滚动：{offset_after}"
+        );
+    }
+
+    /// F6：markdown 子树的**不变量** —— 不得挂 `bind_*`。
+    ///
+    /// `MarkdownNode::sync` 用 `NodeTree::remove` 重建子树并忽略返回的依赖边；子树若挂绑定，
+    /// 这些边会留在依赖图里（`App::write` 退化 + 泄漏）。观测面：`NodeTree::remove` **只**交还
+    /// 仍持有非空依赖边的被删节点 —— markdown 子树必须返回空，根节点自己的 `bind_style`
+    /// （外观失效通道）必须返回非空（否则这条断言测不到东西）。
+    #[test]
+    fn the_markdown_subtree_holds_no_signal_dependency_edges() {
+        let mut app = TestApp::new();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let window = app.window_id();
+        let root = app.app().window(window).expect("窗口").tree().root();
+        let node = MarkdownNode::mount(
+            app.app_mut(),
+            window,
+            root,
+            theme,
+            document(vec![
+                paragraph(vec![linked("链接", 0), text("与正文")]),
+                MarkdownBlock::CodeBlock {
+                    language: None,
+                    code: SmolStr::new_static("let x = 1;"),
+                },
+            ]),
+        );
+        let _ = app
+            .drain()
+            .expect("首帧（样式 pass 求值根节点的 bind_style）");
+
+        let children: Vec<_> = app
+            .app()
+            .window(window)
+            .expect("窗口")
+            .tree()
+            .get(node.root())
+            .expect("根节点")
+            .children()
+            .to_vec();
+        assert!(!children.is_empty(), "markdown 根下必须有块");
+        for child in children {
+            let removed = app
+                .app_mut()
+                .window_mut(window)
+                .expect("窗口")
+                .tree_mut()
+                .remove(child)
+                .expect("移除 markdown 子树");
+            assert!(
+                removed.is_empty(),
+                "markdown 子树不得挂 bind_*（remove 只交还非空依赖边）：{removed:?}"
+            );
+        }
+        // 检测面自检：根节点的 `bind_style`（外观依赖）必须在移除时被交还 —— 非空即证明
+        // `remove` 的交还通道确实在收集依赖边，上面的「子树返回空」才有意义。
+        let removed_root = app
+            .app_mut()
+            .window_mut(window)
+            .expect("窗口")
+            .tree_mut()
+            .remove(node.root())
+            .expect("移除根节点");
+        assert!(
+            !removed_root.is_empty(),
+            "根节点持有外观依赖边（G3 的失效通道）；移除时应交还 —— 否则上面的空依赖断言不成立"
         );
     }
 }
