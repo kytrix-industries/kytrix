@@ -15,6 +15,12 @@
 //! `build` 返回 [`Alert`]，其中 `root` 是要挂进对话框面板的节点；P2-4b 的 `LayerExt::alert` 只是把它
 //! 包进遮罩 + 面板 + 进出场动画，面板内容不需要重写。
 //!
+//! # 排版（按旧实现）
+//!
+//! 面板宽 384 px、列间距 8 px、裁剪子树；消息 16 px；输入框与错误行同列（间距 4 px），错误行
+//! 14 px + `status.danger.base` 前景；按钮行由本模块自己布局 —— 单按钮铺满面板，双按钮各占一半
+//! 且内容居中（旧 `Join + flex_1 + justify_center`；`Button` 不新增 flex 拉伸语义）。
+//!
 //! # 校验（旧语义原样保留）
 //!
 //! `validate` 在点 OK 时跑：`Err(message)` 把 message 写进错误行、**不**关闭（不调用 `ok_action`）；
@@ -39,6 +45,7 @@ use std::{
 };
 
 use smol_str::SmolStr;
+use taffy::style::{Dimension, JustifyContent};
 use ui_core::{
     a11y::{A11yOverride, A11yRole},
     app::App,
@@ -240,6 +247,7 @@ impl AlertBuilder {
             .flex_col()
             .width(PANEL_WIDTH)
             .gap(8.0)
+            .overflow_hidden()
             .build();
         let builder = NodeBuilder::boxed()
             .id(smol_str::format_smolstr!("{key}:panel"))
@@ -277,7 +285,8 @@ impl AlertBuilder {
             root,
         )?;
         let msg_theme = message_color;
-        NodeBuilder::text(self.message.clone(), TextStyle::new(14.0))
+        // 旧实现的消息是 Markdown，继承窗口默认字号（16 px）；新实现是纯文本，按旧字号写死。
+        NodeBuilder::text(self.message.clone(), TextStyle::new(16.0))
             .bind_style(move |cx| StylePatch {
                 foreground: Some(msg_theme.role(cx, Role::FgDefault)),
                 ..StylePatch::default()
@@ -290,17 +299,28 @@ impl AlertBuilder {
             )?;
         let mut input_node = None;
         if let Some(factory) = &self.input {
+            // 旧实现把输入框与错误行放在内层列里、列间距 4 px（旧 `.gap_1()`）。
+            let input_column = NodeBuilder::boxed()
+                .style(StyleBuilder::new().flex_col().gap(4.0).build())
+                .build(
+                    app.window_mut(window)
+                        .ok_or(EngineError::UnknownWindow { window })?
+                        .tree_mut(),
+                    root,
+                )?;
             let input = factory(
                 app.window_mut(window)
                     .ok_or(EngineError::UnknownWindow { window })?
                     .tree_mut(),
-                root,
+                input_column,
             );
-            NodeBuilder::text("", TextStyle::new(12.0))
+            let error_theme = theme.clone();
+            NodeBuilder::text("", TextStyle::new(14.0))
                 .bind_text(move |cx| cx.read(&error).clone().unwrap_or_else(SmolStr::default))
                 .bind_style(move |cx| {
                     let visible = cx.read(&error).is_some();
                     StylePatch {
+                        foreground: Some(error_theme.role(cx, Role::StatusDangerBase)),
                         visible: Some(visible),
                         ..StylePatch::default()
                     }
@@ -309,7 +329,7 @@ impl AlertBuilder {
                     app.window_mut(window)
                         .ok_or(EngineError::UnknownWindow { window })?
                         .tree_mut(),
-                    root,
+                    input_column,
                 )?;
             input_node = Some(input);
         }
@@ -350,7 +370,8 @@ impl AlertBuilder {
         } else {
             ok_button
         };
-        ok_button.build(app, window, row)?;
+        let ok_node = ok_button.build(app, window, row)?;
+        stretch_button(app, window, ok_node)?;
         let cancel_action = self.cancel_action.clone();
         let cancel_button = if self.kind.with_cancel() {
             let button = Button::new(
@@ -366,7 +387,8 @@ impl AlertBuilder {
                     action(ctx.app_mut());
                 }
             });
-            button.build(app, window, row)?;
+            let node = button.build(app, window, row)?;
+            stretch_button(app, window, node)?;
             Some(button)
         } else {
             None
@@ -381,6 +403,23 @@ impl AlertBuilder {
             scope,
         })
     }
+}
+
+/// 把按钮铺进按钮行：等分（旧 `.flex_1()`）+ 内容居中（旧 `.justify_center()`）。
+///
+/// 裁决：按钮行的布局归 alert 包裹层（旧实现也是调用方在 `Button` 上 `flex_1 / justify_center`），
+/// `Button` 本身不新增 flex 拉伸语义。
+fn stretch_button(app: &mut App, window: WindowId, node: NodeId) -> Result<(), EngineError> {
+    let tree = app
+        .window_mut(window)
+        .ok_or(EngineError::UnknownWindow { window })?
+        .tree_mut();
+    let mut style = tree.get(node)?.style().clone();
+    style.inner.flex_grow = 1.0;
+    style.inner.flex_shrink = 1.0;
+    style.inner.flex_basis = Dimension::length(0.0);
+    style.inner.justify_content = JustifyContent::CENTER;
+    tree.set_style(node, style)
 }
 
 impl Default for AlertBuilder {
@@ -477,7 +516,8 @@ mod tests {
     use ui_core::{
         a11y::A11yRole,
         event::{InputEvent, Modifiers, PointerButton},
-        node::id::NodeId,
+        node::{id::NodeId, tree::NodeKind},
+        paint::{color::ColorResolver, style::Clip},
         test_support::{app::TestApp, probe::Selector},
     };
 
@@ -486,6 +526,7 @@ mod tests {
         kit::input::{InputSpec, InputState, build as build_input},
         theme::{
             appearance::Appearance, components::ControlSize, handle::ThemeHandle, resolved::Theme,
+            role::Role,
         },
     };
 
@@ -603,6 +644,95 @@ mod tests {
                 .children()
                 .len();
             assert!(buttons >= 3, "标题 + 消息 + 按钮行");
+        }
+    }
+
+    /// 旧断言恢复：单按钮铺满面板（按钮行是 `kit::alert` 自己建的，不归 P2-4b 面板）。
+    #[test]
+    fn an_alert_without_a_cancel_button_should_draw_one_filling_button() {
+        let harness = harness(|builder, _, _| builder.ok("Saved", "The file has been written."));
+        let panel = harness
+            .app
+            .probe()
+            .bounds(harness.alert.root_node())
+            .expect("panel");
+        let ok = harness
+            .app
+            .probe()
+            .bounds(harness.alert.ok_button().node().expect("ok"))
+            .expect("ok bounds");
+        assert_eq!(panel.size.width, 384.0, "面板宽度 w_96");
+        assert_eq!(ok.size.width, panel.size.width, "单按钮铺满面板");
+        assert_eq!(ok.origin.x, panel.origin.x, "按钮贴面板左缘");
+        let window = harness.app.window_id();
+        let tree = harness.app.app().window(window).expect("window").tree();
+        assert_eq!(
+            tree.get(harness.alert.root_node())
+                .expect("panel")
+                .style()
+                .clip,
+            Clip::Bounds,
+            "面板裁剪子树（旧 overflow_hidden）"
+        );
+        let message = harness
+            .app
+            .probe()
+            .by_selector(Selector::Text("The file has been written."))
+            .expect("message");
+        match tree.get(message).expect("message").kind() {
+            NodeKind::Text(content) => {
+                assert_eq!(content.style.size, 16.0, "消息继承旧 16 px 字号")
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    /// 旧断言恢复：两个按钮均分并铺满面板，内容居中（旧 `Join + flex_1 + justify_center`）。
+    #[test]
+    fn two_buttons_should_share_the_panel() {
+        let harness = harness(|builder, _, _| builder.ok_cancel("Discard", "Lose changes?"));
+        let probe = harness.app.probe();
+        let panel = probe.bounds(harness.alert.root_node()).expect("panel");
+        let ok_node = harness.alert.ok_button().node().expect("ok");
+        let cancel_node = harness
+            .alert
+            .cancel_button()
+            .expect("cancel")
+            .node()
+            .expect("cancel node");
+        let ok = probe.bounds(ok_node).expect("ok bounds");
+        let cancel = probe.bounds(cancel_node).expect("cancel bounds");
+        assert!(
+            (ok.size.width - cancel.size.width).abs() < 0.5,
+            "两按钮等分（ok {} / cancel {}）",
+            ok.size.width,
+            cancel.size.width
+        );
+        assert!(
+            (ok.size.width + cancel.size.width - panel.size.width).abs() < 0.5,
+            "两按钮合计铺满面板（{} + {} vs {}）",
+            ok.size.width,
+            cancel.size.width,
+            panel.size.width
+        );
+        assert_eq!(ok.origin.x, panel.origin.x, "OK 贴左缘");
+        assert_eq!(
+            cancel.origin.x + cancel.size.width,
+            panel.origin.x + panel.size.width,
+            "Cancel 贴右缘"
+        );
+        for (node, label) in [(ok_node, "OK"), (cancel_node, "Cancel")] {
+            let bounds = probe.bounds(node).expect("button bounds");
+            let text = probe
+                .by_selector(Selector::Text(label))
+                .unwrap_or_else(|| panic!("{label} 文字"));
+            let text_bounds = probe.bounds(text).expect("text bounds");
+            let center = text_bounds.origin.x + text_bounds.size.width / 2.0;
+            let button_center = bounds.origin.x + bounds.size.width / 2.0;
+            assert!(
+                (center - button_center).abs() < 1.0,
+                "{label} 的文字必须居中（{center} vs {button_center}）"
+            );
         }
     }
 
@@ -745,6 +875,31 @@ mod tests {
             tree.get(error).expect("error").style_patch().visible,
             Some(true),
             "错误出现后错误行可见"
+        );
+        // 旧语义：错误行 `text_sm`（14 px）+ `status.danger.base` 前景；与输入框同列、列间距 4 px。
+        match tree.get(error).expect("error").kind() {
+            NodeKind::Text(content) => assert_eq!(content.style.size, 14.0, "错误行字号 14 px"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        let danger = Theme::of(Appearance::Light).role(Role::StatusDangerBase);
+        assert_eq!(
+            tree.get(error)
+                .expect("error")
+                .style_patch()
+                .foreground
+                .map(|color| ColorResolver.resolve(color).components),
+            Some(ColorResolver.resolve(danger).components),
+            "错误行必须用 danger 前景"
+        );
+        let column = tree
+            .get(error)
+            .expect("error")
+            .parent()
+            .expect("error column");
+        assert_eq!(
+            tree.get(column).expect("column").style().inner.gap.height,
+            taffy::style::LengthPercentage::length(4.0),
+            "输入框与错误行的列间距 4 px（旧 gap_1）"
         );
     }
 }

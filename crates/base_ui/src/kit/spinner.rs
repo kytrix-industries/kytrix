@@ -5,9 +5,11 @@
 //! **自绘画布**（`NodeKind::Canvas`）画一圈渐隐的点，每个 `sync` 帧按当前角度重画：
 //!
 //! - 角度是 `Transient<f32>`，由 `App::animate(AnimatedValue::Scalar, ..)` 驱动（§3.7：
-//!   高频状态不进依赖图）；一次注册覆盖约 2.5 小时 / 10 000 圈，剩余不足一圈时 `sync` 自动续注册；
+//!   高频状态不进依赖图）；一圈 900 ms（`animation_tick × 6`），一次注册覆盖约 2.5 小时 /
+//!   10 000 圈，剩余不足一圈时 `sync` 自动续注册；
 //! - `sync` 读角度 → `Window::set_canvas` 重画（`Canvas` 图元用**窗口绝对坐标**，几何从
-//!   `Probe::bounds` 取节点当前布局盒）；
+//!   `Probe::bounds` 取节点当前布局盒）；画布内容（布局盒 + 角度）与上次相同时短路返回 `false`，
+//!   静止 / 稳态不标 `PAINT`、不请求帧（I3）；
 //! - 颜色是**显式参数**：引擎没有文本颜色继承链（评估 §7.2 第 10 条），调用方必须给
 //!   `with_color`（旧实现取「周围文字色」，新实现由调用方传入同一角色色）。
 //!
@@ -48,8 +50,8 @@ use crate::{
     theme::{components::ComponentTokens, handle::ThemeHandle},
 };
 
-/// 一圈的时长（旧 `ANIMATION_TICK * 6` = 900 ms）。
-const ROTATION_MILLIS: u64 = 900;
+/// 一圈的时长 = 主题动画节拍 × 6（旧 `ANIMATION_TICK * 6` = 150 ms × 6 = 900 ms）。
+const ROTATION_TICKS: u32 = 6;
 
 /// 点数量（旧 Phosphor `circle-notch` 的缺口用一圈点近似）。
 const DOTS: usize = 8;
@@ -78,6 +80,9 @@ struct SpinnerInner {
     angle: Transient<f32>,
     /// 当前动画的目标角度（续注册判据）。
     target: Cell<f32>,
+    /// 上一次真正写进画布的内容 `(节点当前布局盒, 角度)`：稳态（静止 / 角度未变 / 盒未变）
+    /// 短路返回 `false`，不重复标 `PAINT`（I3）。
+    last_paint: Cell<Option<(Rect, f32)>>,
     geometry: std::cell::RefCell<Geometry>,
 }
 
@@ -88,17 +93,18 @@ struct Geometry {
 }
 
 impl Spinner {
-    /// 建指示器。`key` 是调试 id 前缀；一次注册的时长取主题 `animation_tick × 6`。
+    /// 建指示器。`key` 是调试 id 前缀；一圈的时长取主题 `animation_tick × 6`（= 900 ms）。
     pub fn new(app: &mut App, theme: ThemeHandle, key: impl Into<SmolStr>) -> Self {
         let scope = app.signal_scope();
         let tick = theme.tokens().animation_tick;
         Self {
             inner: Rc::new(SpinnerInner {
                 key: key.into(),
-                duration: tick * ROTATION_MILLIS as u32,
+                duration: tick * ROTATION_TICKS,
                 scope,
                 angle: app.transient_scoped(scope, 0.0f32),
                 target: Cell::new(0.0),
+                last_paint: Cell::new(None),
                 geometry: std::cell::RefCell::new(Geometry::default()),
             }),
             size: ComponentTokens::standard().medium.icon_size,
@@ -147,7 +153,7 @@ impl Spinner {
         parent: NodeId,
     ) -> Result<NodeId, EngineError> {
         let style = StyleBuilder::new().size(self.size, self.size).build();
-        let mut builder = NodeBuilder::canvas(Canvas::new(Rect::default()))
+        let builder = NodeBuilder::canvas(Canvas::new(Rect::default()))
             .id(format_smolstr!("{}:spinner", self.inner.key))
             .style(style)
             .tab_stop(false)
@@ -162,13 +168,6 @@ impl Spinner {
                     ..A11yOverride::default()
                 },
             });
-        if let Some(label) = &self.label {
-            builder = builder.a11y(A11yOverride {
-                role: Some(A11yRole::ProgressIndicator),
-                label: Some(label.clone()),
-                ..A11yOverride::default()
-            });
-        }
         let node = {
             let tree = app
                 .window_mut(window)
@@ -207,7 +206,8 @@ impl Spinner {
 
     /// 帧驱动：把当前角度画成点环；剩余不足一圈时续注册动画。
     ///
-    /// 返回是否重画了画布。静止（`spinning(false)`）且已画过时返回 `false`（I3：不请求帧）。
+    /// 返回是否重画了画布。稳态（静止 / 角度未变 / 布局盒未变）返回 `false`，不调 `set_canvas`
+    /// （I3：不请求帧、不标 `PAINT`）。
     ///
     /// # Errors
     /// `StaleNode` / `UnknownWindow`。
@@ -236,11 +236,19 @@ impl Spinner {
                 self.register_rotation(app, window, node)?;
             }
         }
-        let angle = *app.read_transient(&self.inner.angle);
-        let canvas = spinner_canvas(bounds, angle.rem_euclid(TAU), self.color);
-        app.window_mut(window)
+        let angle = app.read_transient(&self.inner.angle).rem_euclid(TAU);
+        if self.inner.last_paint.get() == Some((bounds, angle)) {
+            return Ok(false);
+        }
+        let canvas = spinner_canvas(bounds, angle, self.color);
+        let changed = app
+            .window_mut(window)
             .ok_or(EngineError::UnknownWindow { window })?
-            .set_canvas(node, canvas)
+            .set_canvas(node, canvas)?;
+        if changed {
+            self.inner.last_paint.set(Some((bounds, angle)));
+        }
+        Ok(changed)
     }
 
     /// 释放信号作用域（动态创建 / 销毁的指示器调用）。
@@ -395,13 +403,50 @@ mod tests {
         assert_ne!(before[0], after[0], "点的位置随角度改变");
     }
 
-    /// 静止：不注册动画，也不出帧（I3）。
+    /// 速度：900 ms 恰好转一圈（旧 `ANIMATION_TICK * 6`；变异：周期再乘 150 → 本测试红）。
+    #[test]
+    fn the_spinner_turns_once_in_nine_hundred_milliseconds() {
+        use std::f32::consts::TAU;
+
+        let mut harness = harness(true);
+        let before = harness.spinner.angle(harness.app.app());
+        harness.app.advance(Duration::from_millis(900));
+        let _ = harness.app.drain().expect("frame");
+        let _ = harness.spinner.sync(harness.app.app_mut()).expect("sync");
+        let turns = (harness.spinner.angle(harness.app.app()) - before) / TAU;
+        assert!(
+            (turns - 1.0).abs() < 0.05,
+            "900 ms 应转约 1 圈（实际 {turns:.3} 圈）"
+        );
+    }
+
+    /// 静止：不注册动画；稳态 `sync` 短路返回 false，也不标 `PAINT`（I3）。
     #[test]
     fn a_still_spinner_does_not_request_frames() {
         let mut harness = harness(false);
         let window = harness.app.window_id();
         assert!(!harness.app.app().animations_running(window));
-        let _ = harness.app.drain().expect("frame");
+        // harness 已画过一帧；静止节点之后的 `sync` 不得再写画布（否则每帧都标 PAINT）。
+        assert!(
+            !harness
+                .spinner
+                .sync(harness.app.app_mut())
+                .expect("still sync"),
+            "静止 spinner 的稳态 sync 必须返回 false"
+        );
+        let dirty = harness
+            .app
+            .app()
+            .window(window)
+            .expect("window")
+            .tree()
+            .get(harness.node)
+            .expect("node")
+            .dirty();
+        assert!(
+            !dirty.contains(ui_core::node::dirty::DirtyFlags::PAINT),
+            "稳态 spinner 不得标 PAINT（实际 {dirty:?}）"
+        );
         let record = harness.app.drain().expect("idle frame").clone();
         assert!(!record.rendered, "静止指示器不得出帧");
     }

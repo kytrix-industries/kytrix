@@ -291,8 +291,9 @@ impl Interactive {
         self
     }
 
-    /// 去掉控件外壳（背景 / 边框 / 高度 / 内边距）：toggle、tab 这类「状态机在根、视觉在子节点」
-    /// 的组合控件用。前景 / 光标 / 命中开关仍然输出。
+    /// 去掉控件外壳的**绘制**（背景 / 边框）：toggle 这类「状态机在根、视觉在子节点」的组合控件用。
+    /// 尺寸阶梯的高度 / 水平内边距仍然写进布局（旧 `unified_sized` 的行密度语义），前景 / 光标 /
+    /// 命中开关照常输出。
     #[must_use]
     pub fn chrome(mut self, chrome: bool) -> Self {
         self.chrome = chrome;
@@ -444,7 +445,8 @@ impl Interactive {
     ///
     /// 语义：
     /// - 布局：flex row + `items_center` + 尺寸阶梯的高度 / 间隙 / 水平内边距 + 1 px **布局**边框
-    ///   （旧 `.border_1()` 的占位语义，`StyleBuilder::border`）；圆角走静态 `PaintSpec`；
+    ///   （旧 `.border_1()` 的占位语义，`StyleBuilder::border`）；`chrome(false)` 去掉绘制外壳，
+    ///   但高度 / 水平内边距仍写（旧 `unified_sized`）；圆角走静态 `PaintSpec`；
     /// - 动态：`bind_style` 输出背景 / 前景 / 边框 / 光标 / 命中开关；`bind_a11y` 输出
     ///   `disabled` / `busy` / `selected`；
     /// - 动作：显式 `action`，或由 `on_click` 自动生成 `"<key>.click"`；回调在 `build` 里注册，
@@ -518,10 +520,14 @@ impl Interactive {
                 .border(theme.tokens().border_width)
                 .build()
         } else {
+            // 旧 `unified_sized` 的布局仍要写：toggle 这类「状态机在根、视觉在子节点」的组合控件
+            // 根上没有外壳，但行高与左侧留白是它布局的一部分（旧 toggle 根 = h 30 / gap 6 / px 6）。
             StyleBuilder::new()
                 .flex_row()
                 .items_center()
                 .gap(self.size.gap())
+                .height(self.size.h())
+                .padding_x(self.size.px())
                 .build()
         };
         let paint = {
@@ -754,11 +760,13 @@ impl Interactive {
 
     /// 释放本组件的 Action handler 与信号作用域（动态创建 / 销毁的控件调用；先卸载节点）。
     ///
-    /// 返回被释放的槽位数（9 个信号 / 瞬态槽）；重复调用返回 0（幂等）。
+    /// 返回被释放的槽位数（9 个信号 / 瞬态槽）；重复调用返回 0（幂等）。释放后清掉几何句柄：
+    /// `sync` 不再拿陈旧 `NodeId` 去查树。
     pub fn release(&self, app: &mut App) -> usize {
         if let Some(action) = self.inner.registered.borrow_mut().take() {
             app.off_action(&action);
         }
+        *self.inner.geometry.borrow_mut() = Geometry::default();
         app.release_scope(self.inner.scope)
     }
 }
@@ -928,7 +936,7 @@ mod tests {
         a11y::A11yRole,
         event::{ActionSource, Event, InputEvent, KeyCode, Modifiers, PointerButton},
         math::Point,
-        node::id::NodeId,
+        node::{dirty::DirtyFlags, id::NodeId},
         paint::{
             color::{Color, ColorResolver},
             style::Cursor,
@@ -1325,6 +1333,89 @@ mod tests {
                 .interactive
                 .set_loading(harness.app.app_mut(), false),
             "等值写入短路"
+        );
+    }
+
+    /// `force_hover`：弹层盖住控件时不动指针也画成悬停；清除后回到普通态。
+    #[test]
+    fn force_hover_paints_the_hover_recipe_without_the_pointer() {
+        let mut harness = harness_with(|interactive| interactive.force_hover(true));
+        let _ = harness.interactive.sync(harness.app.app_mut());
+        settle(&mut harness);
+        assert_eq!(
+            harness.interactive.state(harness.app.app()),
+            InteractiveState::Hover,
+            "force_hover 必须让状态机停在 Hover"
+        );
+        let recipe = light_theme().components().interactive.filled.hover;
+        assert_color(
+            patch(&harness).background,
+            recipe.background,
+            "强制悬停背景",
+        );
+        assert!(
+            harness
+                .interactive
+                .set_force_hover(harness.app.app_mut(), false)
+        );
+        let _ = harness.interactive.sync(harness.app.app_mut());
+        settle(&mut harness);
+        assert_eq!(
+            harness.interactive.state(harness.app.app()),
+            InteractiveState::Normal,
+            "清除 force_hover 后回到 Normal"
+        );
+    }
+
+    /// tooltip 挂点：文本在 `build` 前后都可读（P2-4b 的 tooltip 层按它挂浮层）。
+    #[test]
+    fn the_tooltip_text_is_kept_for_the_tooltip_layer() {
+        let mut app = TestApp::new();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let interactive = Interactive::new(app.app_mut(), theme, "tooltip").tooltip_text("Reload");
+        assert_eq!(interactive.tooltip(), Some("Reload"));
+        let window = app.window_id();
+        let root = app.app().window(window).expect("window").tree().root();
+        let node = interactive
+            .build_bare(app.app_mut(), window, root)
+            .expect("build");
+        let _ = app.drain().expect("frame");
+        assert_eq!(interactive.tooltip(), Some("Reload"));
+        assert_eq!(interactive.node(), Some(node));
+    }
+
+    /// 失效通道：悬停只重算动态属性 + 重绘，**不**标 `LAYOUT`
+    /// （变异：`StylePatch` 加 `affects_layout: true` → 本测试红）。
+    #[test]
+    fn hovering_repaints_without_marking_layout() {
+        let mut harness = harness();
+        let point = center(&harness.app, harness.node);
+        let _ = harness
+            .app
+            .inject(InputEvent::pointer_move(point, Modifiers::empty()));
+        let _ = harness.interactive.sync(harness.app.app_mut());
+        let window = harness.app.window_id();
+        harness
+            .app
+            .app_mut()
+            .refresh_styles(window)
+            .expect("style pass");
+        let dirty = harness
+            .app
+            .app()
+            .window(window)
+            .expect("window")
+            .tree()
+            .get(harness.node)
+            .expect("node")
+            .dirty();
+        assert!(
+            dirty.contains(DirtyFlags::PAINT),
+            "悬停必须请求重绘（实际 {dirty:?}）"
+        );
+        assert!(
+            !dirty.contains(DirtyFlags::LAYOUT),
+            "纯绘制属性不得触发布局（实际 {dirty:?}）"
         );
     }
 

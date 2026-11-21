@@ -17,13 +17,16 @@
 //! - **键盘方向键**：`Left` / `Right` 用 E8 的 `App::bind_key_scoped` 绑在**行节点**上 —— 只有焦点
 //!   落在本标签栏子树内时才消费，同屏多个标签栏 / 滚动容器的方向键互不干扰；移动后焦点跟到新标签；
 //! - **关闭按钮**：`closable(true)` 且标签数 > 1 时每个标签右侧画一个 X（旧实现同样在只剩一个标签
-//!   时隐藏关闭按钮）；点击只调 `on_close(index)`，不改变选中（调用方负责移除标签并重挂）；
+//!   时隐藏关闭按钮）；点击只调 `on_close(index)`，不改变选中（调用方负责移除标签并重挂）；尺寸与
+//!   颜色按旧实现（12 / 16 / 20 px 方框 + 满尺寸 X、常态 `fg.muted`、hover 洗色）；
+//! - 标签宽度上限 160 px（旧 `.max_w_40()`），超长文本用 `TextOverflow::Ellipsis` 截断；
 //! - 溢出滚动：旧 `tab_bar` **没有**滚动（评估 §7.1：386 行里无滚动容器），本批同样不做。
 //!
 //! # 动画
 //!
 //! `Fade`：标签背景 / 文字色由 [`Interactive`] 的状态过渡（150 ms）；`Slide`：指示条位置 / 宽度由
-//! 引擎动画时钟插值。两者都不建应用层帧循环，稳态不出帧（I3）。
+//! 引擎动画时钟插值，**标签自己不画填充**（旧实现把 tab `bg` 强制透明，填充只由指示条承担）。
+//! 两者都不建应用层帧循环，稳态不出帧（I3）。
 //!
 //! # 生命周期
 //!
@@ -44,6 +47,7 @@ use std::{
 };
 
 use smol_str::{SmolStr, format_smolstr};
+use taffy::style::LengthPercentageAuto;
 use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
     app::App,
@@ -58,7 +62,7 @@ use ui_core::{
         signal::{Signal, SignalScope, Transient},
     },
     paint::style::StylePatch,
-    text::TextStyle,
+    text::{TextOverflow, TextStyle, TextWrap},
     window::WindowId,
 };
 
@@ -69,7 +73,7 @@ use crate::{
         size::{UnifiedSizable, UnifiedSize},
     },
     style_builder::{PaintBuilder, StyleBuilder},
-    theme::{components::InteractiveVariant, handle::ThemeHandle, role::Role},
+    theme::{handle::ThemeHandle, role::Role},
 };
 
 /// 轨道圆角（旧 `rounded_sm`）。
@@ -78,6 +82,8 @@ const TRACK_RADIUS: f32 = 4.0;
 const TRACK_PADDING: f32 = 4.0;
 /// 标签间距（旧 `.gap_1()` = 4 px）。
 const TAB_GAP: f32 = 4.0;
+/// 标签宽度上限（旧 `.max_w_40()` = 160 px；超出用省略号截断）。
+const TAB_MAX_WIDTH: f32 = 160.0;
 
 /// 指示条动画模式。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -369,11 +375,10 @@ impl TabBar {
                 let inner_close = inner.clone();
                 Some(
                     Interactive::new(app, inner.theme.clone(), close_key)
-                        .variant(InteractiveVariant::Ghost)
-                        .with_unified_size(UnifiedSize::Small)
                         .a11y_role(A11yRole::Button)
                         .label(format_smolstr!("Close {}", item.label))
                         .tab_stop(false)
+                        .role_palette(close_palette())
                         .on_click(move |ctx| {
                             if let Some(callback) = inner_close.on_close.borrow().as_ref() {
                                 callback(index, ctx.app_mut());
@@ -392,7 +397,9 @@ impl TabBar {
                 .a11y_set(index, count)
                 .label(item.label.clone())
                 .selected(index == 0)
-                .role_palette(tab_palette())
+                .role_palette(tab_palette(
+                    inner.options.indicator == IndicatorAnimation::Slide,
+                ))
                 .on_click(move |ctx| {
                     select(&inner_select, ctx.app_mut(), index, true);
                 });
@@ -403,7 +410,12 @@ impl TabBar {
             let label_bind = tab.clone();
             let size = inner.options.size;
             let tab_node = tab.build(app, window, row, move |app, window, parent| {
-                let text = NodeBuilder::text(label, TextStyle::new(size.text_size()))
+                let text_style = TextStyle::new(size.text_size())
+                    .with_wrap(TextWrap::NoWrap)
+                    .with_overflow(TextOverflow::Ellipsis, 1);
+                let text = NodeBuilder::text(label, text_style)
+                    // 旧 `.truncate()`：文本可以被压到内容宽度以下（否则自动最小尺寸会撑破上限）。
+                    .style(StyleBuilder::new().min_width_0().build())
                     .bind_style(move |cx| StylePatch {
                         foreground: Some(label_bind.foreground_color(cx)),
                         ..StylePatch::default()
@@ -418,24 +430,28 @@ impl TabBar {
                 if let Some(close) = close_for_content {
                     let close_icon = close.clone();
                     let close_bind = close.clone();
-                    close.build(app, window, parent, move |app, window, parent| {
-                        let icon = mount_dynamic_icon(
-                            app,
-                            window,
-                            parent,
-                            IconKind::X,
-                            UnifiedSize::Small.icon_size(),
-                            move |cx| StylePatch {
-                                foreground: Some(close_bind.foreground_color(cx)),
-                                ..StylePatch::default()
-                            },
-                        )?;
-                        close_icon.watch(icon);
-                        Ok(())
-                    })?;
+                    let side = close_side(size);
+                    let close_node =
+                        close.build(app, window, parent, move |app, window, parent| {
+                            let icon = mount_dynamic_icon(
+                                app,
+                                window,
+                                parent,
+                                IconKind::X,
+                                side,
+                                move |cx| StylePatch {
+                                    foreground: Some(close_bind.foreground_color(cx)),
+                                    ..StylePatch::default()
+                                },
+                            )?;
+                            close_icon.watch(icon);
+                            Ok(())
+                        })?;
+                    set_square_close_style(app, window, close_node, side)?;
                 }
                 Ok(())
             })?;
+            set_tab_max_width(app, window, tab_node)?;
             tabs.push(tab);
             close_buttons.push(close_watch);
             tab_nodes.push(tab_node);
@@ -709,7 +725,10 @@ fn select(inner: &Rc<TabBarInner>, app: &mut App, index: usize, notify: bool) {
 }
 
 /// 标签的四状态角色配方（旧 tab_bar 的选中 / 悬停画法）。
-fn tab_palette() -> RolePalette {
+///
+/// `Slide` 模式下标签**不画自己的填充**（旧实现把 tab `bg` 强制为透明）：滑动指示条是唯一的填充，
+/// 否则指示条滑入时目的标签的背景会先淡入、把滑动遮住。
+fn tab_palette(slide: bool) -> RolePalette {
     RolePalette {
         normal: StateRoles {
             background: None,
@@ -717,12 +736,12 @@ fn tab_palette() -> RolePalette {
             border: None,
         },
         hover: StateRoles {
-            background: Some(Role::VeilHover),
+            background: (!slide).then_some(Role::VeilHover),
             foreground: Role::FgMuted,
             border: None,
         },
         active: StateRoles {
-            background: Some(Role::SurfaceOverlay),
+            background: (!slide).then_some(Role::SurfaceOverlay),
             foreground: Role::FgDefault,
             border: None,
         },
@@ -734,6 +753,72 @@ fn tab_palette() -> RolePalette {
     }
 }
 
+/// 关闭按钮的四状态角色配方（旧实现：透明 → `veil.hover` / `veil.active`，前景 `fg.muted` →
+/// `fg.default`）。
+fn close_palette() -> RolePalette {
+    RolePalette {
+        normal: StateRoles {
+            background: None,
+            foreground: Role::FgMuted,
+            border: None,
+        },
+        hover: StateRoles {
+            background: Some(Role::VeilHover),
+            foreground: Role::FgDefault,
+            border: None,
+        },
+        active: StateRoles {
+            background: Some(Role::VeilActive),
+            foreground: Role::FgDefault,
+            border: None,
+        },
+        disabled: StateRoles {
+            background: None,
+            foreground: Role::FgDisabled,
+            border: None,
+        },
+    }
+}
+
+/// 关闭按钮的方框边长（旧 `size_3/4/5` = 12 / 16 / 20 px，随尺寸档）。
+fn close_side(size: UnifiedSize) -> f32 {
+    match size {
+        UnifiedSize::Small => 12.0,
+        UnifiedSize::Medium => 16.0,
+        UnifiedSize::Large => 20.0,
+    }
+}
+
+/// 标签宽度上限（旧 `.max_w_40()` = 160 px）：超出由文本节点的省略号截断。
+fn set_tab_max_width(app: &mut App, window: WindowId, node: NodeId) -> Result<(), EngineError> {
+    let tree = app
+        .window_mut(window)
+        .ok_or(EngineError::UnknownWindow { window })?
+        .tree_mut();
+    let mut style = tree.get(node)?.style().clone();
+    style.inner.max_size.width = LengthPercentageAuto::length(TAB_MAX_WIDTH);
+    tree.set_style(node, style)
+}
+
+/// 关闭按钮是旧实现的「小方框 + 满尺寸 X」：洗净交互根的 chrome（高度 / 内边距 / 布局边框），
+/// 只留一个正方的命中盒。
+fn set_square_close_style(
+    app: &mut App,
+    window: WindowId,
+    node: NodeId,
+    side: f32,
+) -> Result<(), EngineError> {
+    let style = StyleBuilder::new()
+        .flex_row()
+        .items_center()
+        .size(side, side)
+        .build();
+    app.window_mut(window)
+        .ok_or(EngineError::UnknownWindow { window })?
+        .tree_mut()
+        .set_style(node, style)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{cell::Cell, rc::Rc, time::Duration};
@@ -742,9 +827,10 @@ mod tests {
         a11y::A11yRole,
         event::{InputEvent, KeyCode, Modifiers, PointerButton},
         math::{Point, Rect},
-        node::id::NodeId,
+        node::{id::NodeId, tree::NodeKind},
         paint::color::{Color, ColorResolver},
         test_support::app::TestApp,
+        text::{TextOverflow, TextWrap},
     };
 
     use super::{IndicatorAnimation, TabBar, TabBarOptions, TabItem};
@@ -839,8 +925,35 @@ mod tests {
             .clone()
     }
 
+    fn patch_at(harness: &Harness, node: NodeId) -> ui_core::paint::style::StylePatch {
+        let window = harness.app.window_id();
+        harness
+            .app
+            .app()
+            .window(window)
+            .expect("window")
+            .tree()
+            .get(node)
+            .expect("node")
+            .style_patch()
+            .clone()
+    }
+
     fn resolved(color: Color) -> [f32; 4] {
         ColorResolver.resolve(color).components
+    }
+
+    /// 过渡结束后的线性预乘分量可能差最后一位（1.0 的 lerp 收尾），比较时给 1e-5 容差。
+    fn assert_color(actual: Option<Color>, expected: Color, message: &str) {
+        let actual = actual.map(resolved);
+        let expected = resolved(expected);
+        let close = actual.is_some_and(|actual| {
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| (actual - expected).abs() < 1.0e-5)
+        });
+        assert!(close, "{message}（实际 {actual:?} / 期望 {expected:?}）");
     }
 
     /// 默认选中第一个；点击第二个标签选中它并回调。
@@ -1057,6 +1170,173 @@ mod tests {
             .children()
             .len();
         assert_eq!(children, 1, "只剩一个标签时只画文字");
+    }
+
+    /// Slide：选中标签自己不画填充（旧实现强制透明），填充只由滑动指示条承担。
+    #[test]
+    fn slide_mode_does_not_paint_the_selected_tab_background() {
+        let harness = harness(IndicatorAnimation::Slide, false, 3);
+        assert!(harness.bar.indicator_node().is_some());
+        assert_eq!(
+            tab_patch(&harness, 0).background.map(resolved),
+            Some(resolved(Color::TRANSPARENT)),
+            "Slide 的选中标签不得画 surface.overlay 填充"
+        );
+    }
+
+    /// 长标签：宽度上限 160 px（旧 `.max_w_40()`），文本 `NoWrap + Ellipsis` 截断。
+    #[test]
+    fn a_long_tab_label_is_capped_and_truncated() {
+        let mut app = TestApp::new();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let long = "a_very_long_tab_label_that_must_not_stretch_the_bar";
+        let bar = TabBar::new(
+            app.app_mut(),
+            theme,
+            "long-tabs",
+            [TabItem::new(long)],
+            TabBarOptions::default(),
+        );
+        let window = app.window_id();
+        let root = app.app().window(window).expect("window").tree().root();
+        bar.mount(app.app_mut(), window, root).expect("mount");
+        let _ = app.drain().expect("frame");
+        let tab = bar.tab_nodes()[0];
+        let bounds = app.probe().bounds(tab).expect("tab");
+        assert!(
+            bounds.size.width <= super::TAB_MAX_WIDTH + 0.5,
+            "标签宽度上限 160 px（实际 {}）",
+            bounds.size.width
+        );
+        let (text, text_style) = {
+            let tree = app.app().window(window).expect("window").tree();
+            let text = tree.get(tab).expect("tab").children()[0];
+            let style = match tree.get(text).expect("text").kind() {
+                NodeKind::Text(content) => content.style.clone(),
+                other => panic!("expected Text, got {other:?}"),
+            };
+            (text, style)
+        };
+        assert_eq!(text_style.wrap, TextWrap::NoWrap);
+        assert_eq!(text_style.overflow, TextOverflow::Ellipsis);
+        assert_eq!(text_style.max_lines, 1);
+        let text_bounds = app.probe().bounds(text).expect("text bounds");
+        assert!(
+            text_bounds.size.width < bounds.size.width,
+            "文字必须被压到标签以内（{} vs {}）",
+            text_bounds.size.width,
+            bounds.size.width
+        );
+    }
+
+    /// 关闭按钮：恢复旧的 16×16 方框（Medium）+ 满尺寸 X + `fg.muted`，hover 洗色。
+    #[test]
+    fn the_close_button_keeps_the_legacy_square_size_and_colors() {
+        let mut harness = harness(IndicatorAnimation::Fade, true, 3);
+        let tab = harness.bar.tab_nodes()[1];
+        let window = harness.app.window_id();
+        let (close, icon_size) = {
+            let tree = harness.app.app().window(window).expect("window").tree();
+            let close = *tree
+                .get(tab)
+                .expect("tab")
+                .children()
+                .last()
+                .expect("close");
+            let icon = tree.get(close).expect("close").children()[0];
+            (
+                close,
+                tree.get(icon).expect("icon").style().inner.size.width,
+            )
+        };
+        let bounds = harness.app.probe().bounds(close).expect("close bounds");
+        assert_eq!(bounds.size.width, 16.0, "Medium 关闭按钮 16 px");
+        assert_eq!(bounds.size.height, 16.0);
+        assert_eq!(icon_size, taffy::style::Dimension::length(16.0), "X 满尺寸");
+        let theme = Theme::of(Appearance::Light);
+        assert_color(
+            patch_at(&harness, close).foreground,
+            theme.role(Role::FgMuted),
+            "常态前景 fg.muted",
+        );
+        let point = Point::new(
+            bounds.origin.x + bounds.size.width / 2.0,
+            bounds.origin.y + bounds.size.height / 2.0,
+        );
+        let _ = harness
+            .app
+            .inject(InputEvent::pointer_move(point, Modifiers::empty()));
+        let _ = harness.bar.sync(harness.app.app_mut());
+        settle(&mut harness);
+        assert_color(
+            patch_at(&harness, close).background,
+            theme.role(Role::VeilHover),
+            "hover 背景 veil.hover",
+        );
+        assert_color(
+            patch_at(&harness, close).foreground,
+            theme.role(Role::FgDefault),
+            "hover 前景 fg.default",
+        );
+    }
+
+    /// release：E8 scoped 键与所有 Action handler 都必须摘除（变异：不调 `unbind_scope_keys`
+    /// / `off_action` → 本测试红）。
+    #[test]
+    fn releasing_the_tab_bar_unbinds_scoped_keys_and_action_handlers() {
+        let mut harness = harness(IndicatorAnimation::Slide, true, 3);
+        let window = harness.app.window_id();
+        let row = harness.bar.inner.geometry.borrow().row.expect("row node");
+        let left = harness.bar.inner.actions.left.clone();
+        let right = harness.bar.inner.actions.right.clone();
+        let tab_action = harness
+            .bar
+            .inner
+            .tabs
+            .borrow()
+            .first()
+            .expect("tab")
+            .action_identity()
+            .expect("tab click action");
+        let close_action = harness
+            .bar
+            .inner
+            .close_buttons
+            .borrow()
+            .first()
+            .cloned()
+            .flatten()
+            .expect("close button")
+            .action_identity()
+            .expect("close click action");
+        assert_eq!(
+            harness.app.app().scoped_key_binding_count(window, row),
+            2,
+            "Direction 键绑在行节点上"
+        );
+        for action in [&left, &right, &tab_action, &close_action] {
+            assert!(
+                harness.app.app().has_action_handler(action),
+                "{action:?} 必须在册"
+            );
+        }
+        assert!(harness.bar.release(harness.app.app_mut()) > 0);
+        assert_eq!(
+            harness.app.app().scoped_key_binding_count(window, row),
+            0,
+            "release 必须摘掉 E8 scoped 键"
+        );
+        for action in [&left, &right, &tab_action, &close_action] {
+            assert!(
+                !harness.app.app().has_action_handler(action),
+                "{action:?} 必须在 release 后摘除"
+            );
+        }
+        assert_eq!(
+            harness.bar.release(harness.app.app_mut()),
+            0,
+            "release 幂等"
+        );
     }
 
     /// I3：动画结束后的稳态不出帧。

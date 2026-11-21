@@ -107,6 +107,7 @@ struct Geometry {
     node: Option<NodeId>,
     control: Option<NodeId>,
     knob: Option<NodeId>,
+    mark: Option<NodeId>,
 }
 
 impl Toggle {
@@ -245,6 +246,7 @@ impl Toggle {
         let interactive = inner
             .interactive
             .clone()
+            .with_unified_size(self.size)
             .variant(crate::theme::components::InteractiveVariant::Ghost)
             .disabled(self.disabled)
             .checked_signal(checked)
@@ -270,7 +272,6 @@ impl Toggle {
         let kind = self.kind;
         let size = self.size;
         let label = self.label.clone();
-        let checked = inner.checked;
         let mix = inner.mix;
         let geometry = Rc::clone(&inner.geometry);
         let for_label = interactive.clone();
@@ -283,13 +284,15 @@ impl Toggle {
                 kind,
                 size,
                 theme.clone(),
-                checked,
                 mix,
                 disabled_signal,
             )?;
             watcher.watch(control.node);
             if let Some(knob) = control.knob {
                 watcher.watch(knob);
+            }
+            if let Some(mark) = control.mark {
+                watcher.watch(mark);
             }
             if let Some(label) = label {
                 let text_style = TextStyle::new(size.text_size());
@@ -311,6 +314,7 @@ impl Toggle {
             let mut target = geometry.borrow_mut();
             target.control = Some(control.node);
             target.knob = control.knob;
+            target.mark = control.mark;
             Ok(())
         })?;
         {
@@ -413,10 +417,12 @@ impl UnifiedSizable for Toggle {
 /// 滑块相对轨道的内边距。
 const KNOB_INSET: f32 = 2.0;
 
-/// 几何控制节点及其可选的滑块。
+/// 几何控制节点及其可选的滑块 / 勾（内点）。
 struct Control {
     node: NodeId,
     knob: Option<NodeId>,
+    /// 勾（Checkbox）或内点（Radio）：`opacity` 读 `mix` 瞬态，必须登记进动画目标。
+    mark: Option<NodeId>,
 }
 
 /// Switch 轨道的尺寸。
@@ -443,11 +449,9 @@ fn build_control(
     kind: ToggleKind,
     size: UnifiedSize,
     theme: ThemeHandle,
-    checked: Signal<bool>,
     mix: Transient<f32>,
     disabled: Signal<bool>,
 ) -> Result<Control, EngineError> {
-    let _ = checked;
     let colors_theme = theme.clone();
     let colors_mix = mix;
     match kind {
@@ -492,50 +496,51 @@ fn build_control(
                 )?;
             let theme_mark = theme.clone();
             let mark_mix = mix;
-            match kind {
-                ToggleKind::Checkbox => {
-                    mount_dynamic_icon(
-                        app,
-                        window,
-                        control,
-                        IconKind::Check,
-                        side * 0.7,
-                        move |cx| {
-                            let progress = *cx.read_transient(&mark_mix);
-                            StylePatch {
-                                foreground: Some(theme_mark.role(cx, Role::FgOnBrand)),
-                                opacity: Some(progress),
-                                ..StylePatch::default()
-                            }
-                        },
-                    )?;
-                }
+            let mark = match kind {
+                ToggleKind::Checkbox => Some(mount_dynamic_icon(
+                    app,
+                    window,
+                    control,
+                    IconKind::Check,
+                    side * 0.7,
+                    move |cx| {
+                        let progress = *cx.read_transient(&mark_mix);
+                        StylePatch {
+                            foreground: Some(theme_mark.role(cx, Role::FgOnBrand)),
+                            opacity: Some(progress),
+                            ..StylePatch::default()
+                        }
+                    },
+                )?),
                 ToggleKind::Radio => {
                     let dot = side * 0.42;
                     let theme_dot = theme;
-                    NodeBuilder::boxed()
-                        .style(StyleBuilder::new().size(dot, dot).build())
-                        .paint(PaintBuilder::new().rounded(dot / 2.0).build())
-                        .bind_style(move |cx| {
-                            let progress = *cx.read_transient(&mark_mix);
-                            StylePatch {
-                                background: Some(theme_dot.role(cx, Role::FgOnBrand)),
-                                opacity: Some(progress),
-                                ..StylePatch::default()
-                            }
-                        })
-                        .build(
-                            app.window_mut(window)
-                                .ok_or(EngineError::UnknownWindow { window })?
-                                .tree_mut(),
-                            control,
-                        )?;
+                    Some(
+                        NodeBuilder::boxed()
+                            .style(StyleBuilder::new().size(dot, dot).build())
+                            .paint(PaintBuilder::new().rounded(dot / 2.0).build())
+                            .bind_style(move |cx| {
+                                let progress = *cx.read_transient(&mark_mix);
+                                StylePatch {
+                                    background: Some(theme_dot.role(cx, Role::FgOnBrand)),
+                                    opacity: Some(progress),
+                                    ..StylePatch::default()
+                                }
+                            })
+                            .build(
+                                app.window_mut(window)
+                                    .ok_or(EngineError::UnknownWindow { window })?
+                                    .tree_mut(),
+                                control,
+                            )?,
+                    )
                 }
-                ToggleKind::Switch => {}
-            }
+                ToggleKind::Switch => None,
+            };
             Ok(Control {
                 node: control,
                 knob: None,
+                mark,
             })
         }
         ToggleKind::Switch => {
@@ -590,6 +595,7 @@ fn build_control(
             Ok(Control {
                 node: track,
                 knob: Some(knob),
+                mark: None,
             })
         }
     }
@@ -725,6 +731,30 @@ mod tests {
         ColorResolver.resolve(color).components
     }
 
+    fn mark_node(harness: &Harness) -> NodeId {
+        harness
+            .toggle
+            .inner
+            .geometry
+            .borrow()
+            .mark
+            .expect("勾 / 内点节点")
+    }
+
+    fn mark_patch(harness: &Harness) -> ui_core::paint::style::StylePatch {
+        let window = harness.app.window_id();
+        harness
+            .app
+            .app()
+            .window(window)
+            .expect("window")
+            .tree()
+            .get(mark_node(harness))
+            .expect("mark")
+            .style_patch()
+            .clone()
+    }
+
     fn light_theme() -> Theme {
         Theme::of(Appearance::Light)
     }
@@ -821,6 +851,104 @@ mod tests {
         assert!(
             after.origin.x + after.size.width <= track_bounds.size.width + 0.5,
             "滑块不得移出轨道"
+        );
+    }
+
+    /// 勾 / 内点是动画目标：点击后 `opacity` 从 0 走到 1（变异：不登记 `watch` → 恒 0，本测试红）。
+    #[test]
+    fn clicking_fades_the_mark_in() {
+        for kind in [ToggleKind::Checkbox, ToggleKind::Radio] {
+            let mut harness = harness(kind, false);
+            assert_eq!(
+                mark_patch(&harness).opacity,
+                Some(0.0),
+                "{kind:?} 未选中时勾 / 内点透明"
+            );
+            click(&mut harness);
+            settle(&mut harness);
+            assert_eq!(
+                mark_patch(&harness).opacity,
+                Some(1.0),
+                "{kind:?} 选中后勾 / 内点必须可见"
+            );
+        }
+    }
+
+    /// 根节点保留旧 `unified_sized` 的行高与水平内边距（`chrome(false)` 也要写）。
+    #[test]
+    fn the_root_keeps_the_old_row_height_and_left_padding() {
+        for size in [
+            crate::kit::size::UnifiedSize::Small,
+            crate::kit::size::UnifiedSize::Medium,
+            crate::kit::size::UnifiedSize::Large,
+        ] {
+            let harness = harness_with(ToggleKind::Checkbox, false, |toggle| {
+                crate::kit::size::UnifiedSizable::with_unified_size(toggle, size)
+            });
+            let window = harness.app.window_id();
+            let bounds = harness
+                .app
+                .probe()
+                .bounds(harness.node)
+                .expect("root bounds");
+            assert_eq!(bounds.size.height, size.h(), "{size:?} 的行高");
+            let style = harness
+                .app
+                .app()
+                .window(window)
+                .expect("window")
+                .tree()
+                .get(harness.node)
+                .expect("root")
+                .style();
+            assert_eq!(
+                style.inner.padding.left,
+                taffy::style::LengthPercentage::length(size.px()),
+                "{size:?} 的左内边距"
+            );
+        }
+    }
+
+    /// `checked` 双向：点击后的状态进 a11y 快照（变异：不读 `checked` 信号 → 快照停在 false）。
+    #[test]
+    fn clicking_updates_the_checked_state_in_the_a11y_snapshot() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let toggle = Toggle::new(app.app_mut(), theme, "checked-a11y").label("Enabled");
+        let window = app.window_id();
+        let root = app.app().window(window).expect("window").tree().root();
+        let node = toggle.build(app.app_mut(), window, root).expect("build");
+        let _ = app.drain().expect("frame");
+        let _ = toggle.sync(app.app_mut());
+        assert_eq!(
+            app.a11y()
+                .expect("a11y")
+                .node_for(node)
+                .expect("a11y node")
+                .checked,
+            Some(false)
+        );
+        let point = center(&app, node);
+        let _ = app.inject(InputEvent::pointer_down(
+            point,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        let _ = app.inject(InputEvent::pointer_up(
+            point,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        let _ = app.drain().expect("frame");
+        assert_eq!(
+            app.a11y()
+                .expect("a11y")
+                .node_for(node)
+                .expect("a11y node")
+                .checked,
+            Some(true),
+            "点击后 a11y 的 checked 必须更新为 true"
         );
     }
 
