@@ -183,6 +183,9 @@ pub(crate) fn frame(
     // 共享的，页内 tile 已全部重排，而各窗口文本 lane 里存的是旧 `AtlasTile` —— 必须让
     // **所有窗口**的文本节点重绘。放在 `layout_text` 之前：本帧就会用新 UV 重建 lane。
     app.repaint_text_if_atlas_changed();
+    // E7：图片节点的内在尺寸在布局之前解析（首帧挂载 / DPI 换档 / 资源句柄替换）。
+    // 无变化时 O(1) 早退（不扫描树，I3 的空闲路径不受影响）。
+    app.refresh_images(window);
     let layout = match app.windows.get_mut(&window).map(Window::layout_if_dirty) {
         Some(Ok(report)) => report,
         Some(Err(error)) => {

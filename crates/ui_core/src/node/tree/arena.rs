@@ -81,6 +81,7 @@ pub(crate) fn new() -> NodeTree {
         clip_keys: vec![None],
         subtree_bounds: vec![Rect::default()],
         a11y_slots: vec![None],
+        images_need_refresh: false,
         dirty_bind: DirtySet::new(),
         dirty_layout,
         dirty_paint,
@@ -254,6 +255,14 @@ pub(crate) fn insert_child(
         interaction,
         lane_offset: Point::ZERO,
     });
+    // E7：新挂载的图片节点需要在首次布局之前解析内在尺寸（安装 measure 闭包）。
+    if tree
+        .arena
+        .get(id)
+        .is_some_and(|target| target.kind.image().is_some())
+    {
+        tree.images_need_refresh = true;
+    }
     // 槽位复用：上一代节点的 taffy 缓存必须丢弃，否则新节点继承陈旧布局（P04 §6.1）。
     tree.layout_cache.remove(&id);
     let index = id.index() as usize;

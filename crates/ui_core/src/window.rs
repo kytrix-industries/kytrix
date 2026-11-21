@@ -974,6 +974,21 @@ impl Window {
         Ok(self.tree.set_canvas(node, canvas))
     }
 
+    /// 替换图片节点的资源句柄（E7：DPI 换档 / 换图）。
+    ///
+    /// 语义见 [`NodeTree::set_image_resource`]：新资源的内在尺寸在下一次 `App::frame` 的布局前
+    /// 重解析（尺寸可能变），该帧一定重排重绘。返回 `false` = 节点不是图片节点。
+    ///
+    /// # Errors
+    /// [`EngineError::StaleNode`]：节点不存在 / 已卸载。
+    pub fn set_image_resource(
+        &mut self,
+        node: NodeId,
+        resource: crate::resources::ResourceId,
+    ) -> Result<bool, EngineError> {
+        self.tree.set_image_resource(node, resource)
+    }
+
     /// 指针状态（crate 私有：`App::dispatch_input` 与平台泵是唯一读者）。
     pub(crate) fn pointer(&self) -> &PointerState {
         &self.pointer

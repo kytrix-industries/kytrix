@@ -133,6 +133,8 @@ pub struct App {
     text_layout_scratch: Vec<crate::node::id::NodeId>,
     /// 每窗口「图集已同步到的 `scale_epoch`」（DPI 变化 ⇒ 图集换代）。
     scale_epochs: ahash::HashMap<WindowId, u32>,
+    /// 每窗口「图片内在尺寸已按哪个 `scale_epoch` 解析」（E7；DPI 变化 ⇒ 重解析 + 重排）。
+    image_scale_epochs: ahash::HashMap<WindowId, u32>,
     /// 已按其重绘过文本的图集代际（P1-2.6）。
     ///
     /// 图集是进程级共享的：任一窗口 DPI 变化或字形容量逃逸都会让 `generation` 递增、
@@ -480,6 +482,7 @@ impl App {
             text_dirty_scratch: Vec::new(),
             text_layout_scratch: Vec::new(),
             scale_epochs: ahash::HashMap::default(),
+            image_scale_epochs: ahash::HashMap::default(),
             atlas_generation_seen: 0,
             atlas_generation_lease,
             default_text_scale: 1.0,
@@ -550,8 +553,30 @@ impl App {
     /// 应用在 `on_frame` 钩子里取走并把 `Ready(ResourceImage)` 应用到节点（例如
     /// `Window::set_canvas`）或对 `Failed(DecodeCause)` 画占位/记录；每项只交付一次。
     /// 任务仍在途时返回空列表（稍后的轮次再交付）。
+    ///
+    /// **E7**：引用 `PendingResource` 的图片节点由引擎在 `poll_resources` 里**自动**改成
+    /// 已就绪（内在尺寸 + 失效重绘），应用不需要为它们再处理本列表。
     pub fn take_resource_results(&mut self) -> Vec<(PendingResource, DecodeState)> {
         resources::take_resource_results(self)
+    }
+
+    /// 释放一个图片资源并让所有引用它的图片节点失效重绘（E7）。
+    ///
+    /// 资源 tile 的契约是「恒有效直到 unload」（`资源 §11.8 R-12`）：卸载后若继续复用上一帧
+    /// 的 lane，会把已回收的 tile（可能已被别的图复用）画出来。本入口把 unload 与节点失效
+    /// 合成一步 —— 应用应使用它而不是直接 `resources_mut().unload()`。
+    ///
+    /// 返回 `false` = 资源不存在（已释放 / 陈旧句柄）。
+    pub fn unload_resource(&mut self, id: crate::resources::ResourceId) -> bool {
+        resources::unload_resource(self, id)
+    }
+
+    /// E7：在布局之前解析图片节点的内在尺寸（`App::frame` 内部调用；低频）。
+    ///
+    /// 触发条件：新挂载的图片节点 / `set_image_resource` / 窗口 DPI 变化。没有图片节点或
+    /// 没有变化时是 O(1) 早退（不扫描树，I3 的空闲路径不受影响）。
+    pub(crate) fn refresh_images(&mut self, window: WindowId) -> usize {
+        resources::refresh_images(self, window)
     }
 
     /// 跨线程句柄（`AppHandle`）。
@@ -2547,3 +2572,10 @@ mod resources_tests;
 /// R01-16：按节点 / 按窗口请求重绘的失效范围（子树 + 祖先链校验、不放大到整窗）。
 #[cfg(test)]
 mod invalidate_tests;
+
+/// E7：`NodeKind::Image` 的布局 / 绘制 / 资源生命周期 / DPI / a11y 集成用例。
+///
+/// 断言面依赖 `test_support`（`FrameRecord::primitives` 的图片 bounds / 调制 / UV 与 a11y
+/// 快照），因此只在 `--features test-support` 的 lib 测试里编译。
+#[cfg(all(test, feature = "test-support"))]
+mod image_tests;

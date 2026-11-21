@@ -201,6 +201,15 @@ pub struct PendingResource {
 }
 
 impl PendingResource {
+    /// 仅测试用的构造器（不扩大公开面；E7 的图片节点载荷测试用）。
+    #[cfg(test)]
+    pub(crate) const fn for_test(index: u32, generation: u32) -> Self {
+        match NonZeroU32::new(generation) {
+            Some(generation) => Self { index, generation },
+            None => panic!("PendingResource 的代际不得为 0"),
+        }
+    }
+
     /// 槽位下标。
     #[must_use]
     pub const fn index(self) -> u32 {
@@ -893,12 +902,13 @@ impl ResourceCache {
             .map_or(DecodeState::Pending, |job| job.state.clone())
     }
 
-    /// 按句柄取**存活**图片的 tile 信息（v2.1 E2，`§11.2`：`InlineBoxPaint::Image` 的 paint 期
-    /// 解析）。
+    /// 按句柄取**存活**图片的 tile 信息（v2.1 E2 / E7：`InlineBoxPaint::Image` 与
+    /// `NodeKind::Image` 的 paint 期解析）。
     ///
     /// 语义：只返回引用计数 > 0 的条目；资源被 `unload` / `release_window` 回收后返回 `None`
-    /// （旧句柄不复活 —— `ResourceId` 带代际）。消费者：`paint/pass.rs::emit_text`；返回 `None`
-    /// 时跳过该图元并压 `TextDiagnostic::InlineBoxImageMissing`（不画占位图、不 panic）。
+    /// （旧句柄不复活 —— `ResourceId` 带代际）。消费者：`paint/pass.rs::emit_inline_box` /
+    /// `paint/pass.rs::emit_image`；返回 `None` 时跳过该图元并压 `TextDiagnostic::InlineBoxImageMissing`
+    /// （行内盒）或按占位处理（图片节点），都不画占位图、不 panic。
     #[must_use]
     pub(crate) fn image(&self, id: ResourceId) -> Option<ResourceImage> {
         self.entries.get(id).map(|entry| entry.image)

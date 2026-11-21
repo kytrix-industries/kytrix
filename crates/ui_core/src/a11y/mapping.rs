@@ -216,7 +216,7 @@ pub(crate) fn role_by_kind(tree: &NodeTree, node: NodeId, target: &Node) -> A11y
         return R::Window;
     }
     match target.kind() {
-        NodeKind::Canvas(_) | NodeKind::Geometry(_) => return R::Image,
+        NodeKind::Canvas(_) | NodeKind::Geometry(_) | NodeKind::Image(_) => return R::Image,
         // 文本节点的角色取决于父节点：文本输入框里的文本是 **`TextRun`**（AccessKit 的
         // `TextPosition.node` 硬性要求 `Role::TextRun` 才承认 `text_selection`），其余场合
         // 是 `Label`（可访问名走 `value`）。
@@ -626,9 +626,12 @@ pub(crate) fn is_hidden(
     if matches!(target.style().inner.display, taffy::style::Display::None) {
         return true;
     }
-    // 自绘节点必须有替代文本，否则 hidden + 诊断（§7.4 / §5.4）。
-    matches!(target.kind(), NodeKind::Canvas(_) | NodeKind::Geometry(_))
-        && label.is_none()
+    // 自绘 / 图片节点必须有替代文本，否则 hidden + 诊断（§7.4 / §5.4）。E7：图片节点的
+    // 可访问名只能来自 `A11yOverride::label`（`ImageContent` 不承载 alt），没有则视为装饰图。
+    matches!(
+        target.kind(),
+        NodeKind::Canvas(_) | NodeKind::Geometry(_) | NodeKind::Image(_)
+    ) && label.is_none()
         && role == A11yRole::Image
 }
 

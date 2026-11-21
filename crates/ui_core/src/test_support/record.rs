@@ -130,6 +130,12 @@ pub struct PrimitiveRecord {
     pub kind: PrimitiveKind,
     /// 逻辑像素 AABB（`GlyphRun` = 字形并集；`ClipPop`/`Geometry` = 节点盒）。
     pub bounds: Rect,
+    /// E7：`PrimitiveKind::Image` 的调制色（已解析成线性预乘）；其余种类 `None`。
+    ///
+    /// 图片节点（`NodeKind::Image`）与行内盒图片都产生 `Primitive::Image`，两者都带这一项。
+    pub image_modulation: Option<LinearPremulRgba>,
+    /// E7：`PrimitiveKind::Image` 的图集 UV `[u0, v0, u1, v1]`（`Cover` 的源裁切断言面）。
+    pub image_uv: Option<[f32; 4]>,
 }
 
 /// 8 类图元 + `Clip` 的两个指令。
@@ -315,7 +321,20 @@ pub(crate) fn capture(
             .map_or(Rect::default(), |target| target.layout().bounds);
         for primitive in scene.lane_primitives(*lane).unwrap_or(&[]) {
             let (kind, bounds) = primitive_kind(primitive, node_bounds);
-            primitives.push(PrimitiveRecord { node, kind, bounds });
+            let (image_modulation, image_uv) = match primitive {
+                Primitive::Image(image) => (
+                    Some(resolver.resolve(image.modulation)),
+                    Some(image.tile.uv()),
+                ),
+                _ => (None, None),
+            };
+            primitives.push(PrimitiveRecord {
+                node,
+                kind,
+                bounds,
+                image_modulation,
+                image_uv,
+            });
             if let Primitive::Quad(quad) = primitive {
                 quads.push(quad_record(node, quad, resolver));
             }

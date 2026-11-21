@@ -126,6 +126,7 @@ pub(crate) fn node_a11y_with_cache(
         && let Some(kind) = match target.kind() {
             NodeKind::Canvas(_) => Some(crate::a11y::A11yDrawKind::Canvas),
             NodeKind::Geometry(_) => Some(crate::a11y::A11yDrawKind::Geometry),
+            NodeKind::Image(_) => Some(crate::a11y::A11yDrawKind::Image),
             _ => None,
         }
     {

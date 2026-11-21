@@ -15,9 +15,10 @@ use smallvec::SmallVec;
 use crate::test_support::record::{LaneOutcome, LanePaintEntry, PaintLog};
 use crate::{
     error::EngineError,
-    math::{PhysicalRect, Point, Rect, Scale},
+    math::{PhysicalRect, Point, Rect, Scale, Size},
     node::{
         id::NodeId,
+        image::{ImageContent, ImageFit, cover_tile, fit_bounds},
         tree::{BakedGeometryChunk, NodeKind, NodeTree, PaintNodeState},
     },
     paint::{
@@ -392,6 +393,8 @@ enum Content {
     Box,
     Text(Option<Rc<ShapedLine>>),
     Canvas(Arc<crate::paint::canvas::Canvas>),
+    /// E7：图片节点载荷（资源来源 + fit + 调制）。
+    Image(ImageContent),
 }
 
 /// 该内容是否会产生图元（决定要不要为它压一层内容 clip）。
@@ -403,6 +406,9 @@ fn content_needs_clip(content: &Content) -> bool {
         Content::Box => false,
         Content::Text(line) => line.is_some(),
         Content::Canvas(_) => true,
+        // 图片的图元恒落在节点盒内（Contain 内嵌 / Cover 用 UV 裁切而不是溢出 + clip），
+        // 不占 clip 深度。
+        Content::Image(_) => false,
     }
 }
 
@@ -774,6 +780,7 @@ fn rebuild_lane(
             NodeKind::Box => Content::Box,
             NodeKind::Text(_) => Content::Text(context.tree.text_line(node).cloned()),
             NodeKind::Canvas(canvas) => Content::Canvas(Arc::clone(canvas)),
+            NodeKind::Image(content) => Content::Image((**content).clone()),
             // 几何节点在 paint_node 就分流到 paint_geometry_node（块 lane 路径），
             // 不会走到单 lane 的重建里；这里只是满足 match 的穷尽性。
             NodeKind::Geometry(_) => Content::Box,
@@ -1468,6 +1475,10 @@ fn painted_content(tree: &NodeTree, scene: &Scene, node: NodeId) -> PaintedConte
                     }
                 }
                 Primitive::Canvas(canvas) => screen = screen.union(canvas.bounds()),
+                Primitive::Image(image) => {
+                    // 图片图元与字形同空间（烘焙坐标）⇒ 与字形一起换算回内容坐标。
+                    content = content.union(image.bounds);
+                }
                 _ => {}
             }
         }
@@ -1739,6 +1750,7 @@ impl PrimitiveEmitter {
                     self.emit_text(context, &line, opacity);
                 }
             }
+            Content::Image(content) => self.emit_image(context, &content, opacity),
         }
         if content_clip.is_some() {
             let _ = context.scene.push(self.lane, Primitive::Clip(ClipOp::Pop));
@@ -1855,6 +1867,61 @@ impl PrimitiveEmitter {
                 self.push_damage(context, bounds, 0.0);
             }
         }
+    }
+
+    /// 图片节点的绘制（E7）：`ResourceId → ResourceImage.tile` 在 paint 期解析。
+    ///
+    /// - 资源未就绪（`Pending`）/ 已释放 / 无 `ResourceCache`（headless）：**跳过图元**，
+    ///   节点自身的背景/边框照常绘制（占位 = 背景 / 透明），不 panic、不画错图；
+    /// - `Fill` = 拉伸到节点盒；`Contain` = 等比内嵌居中；`Cover` = 等比铺满 + **UV 裁切**
+    ///   （源区域收缩，图元 bounds 恒等于节点盒 ⇒ 不需要溢出 + clip，布局与绘制一致）；
+    /// - 调制色：`bind_style` 的 `foreground`（动态，与文本同通道）覆盖静态
+    ///   `image_modulation`，再乘节点不透明度。
+    ///
+    /// 图元 bounds 取节点 **border box**（`image` 是替换元素语义的最小实现）：需要留白的图
+    /// 由容器 padding / 显式尺寸承担（残余见 `spec-deltas/E7.md`）。
+    fn emit_image(&mut self, context: &mut PaintContext<'_>, content: &ImageContent, opacity: f32) {
+        let Some(image) = context.resources.and_then(|resources| {
+            content
+                .source()
+                .resource()
+                .and_then(|resource| resources.image(resource))
+        }) else {
+            // 未就绪 / 已释放：占位（节点背景 / 透明），不产生图元也不留下旧图元
+            //（lane 已在本节点标脏时重建）。
+            return;
+        };
+        let image_size = Size::new(image.width as f32, image.height as f32);
+        let bounds = self.bounds;
+        let Some(rect) = fit_bounds(bounds, content.fit(), image_size) else {
+            return;
+        };
+        let tile = match content.fit() {
+            ImageFit::Cover => {
+                let Some(tile) = cover_tile(bounds, image_size, image.tile) else {
+                    return;
+                };
+                tile
+            }
+            ImageFit::Contain | ImageFit::Fill => image.tile,
+        };
+        let modulation = self
+            .patch
+            .foreground
+            .unwrap_or(content.modulation())
+            .with_opacity(opacity);
+        if modulation.is_transparent() || rect.size.is_empty() {
+            return;
+        }
+        self.push(
+            context,
+            Primitive::Image(Image {
+                bounds: rect,
+                tile,
+                modulation,
+            }),
+        );
+        self.push_damage(context, rect, 0.0);
     }
 
     /// 行内盒的引擎绘制（v2.1 E2，`§11.2`）：`Quad` 直接编码；`Image` 经 `ResourceCache` 解析
