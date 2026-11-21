@@ -41,7 +41,12 @@ pub(crate) const fn role_to_accesskit(role: A11yRole) -> accesskit::Role {
         R::ListBoxOption => Role::ListBoxOption,
         R::Table => Role::Table,
         R::Grid => Role::Grid,
+        // 树（E9）：三端 adapter 都直接按角色映射（Windows `UIA_TreeControlTypeId` /
+        // macOS `NSAccessibilityOutlineRole` + outline row subrole / AT-SPI `tree`/`tree item`），
+        // 平台层不需要额外接线。
+        R::Tree => Role::Tree,
         R::Row => Role::Row,
+        R::TreeItem => Role::TreeItem,
         R::Cell => Role::Cell,
         // 表头（R13-3）：UIA 的 `ITableItemProvider::GetColumnHeaderItems` / AT-SPI 的
         // `getColumnHeader` 由角色推导，缺这两个角色时交易表格的列名永远到不了 AT。
@@ -711,7 +716,9 @@ mod tests {
                 | A11yRole::ListBoxOption
                 | A11yRole::Table
                 | A11yRole::Grid
+                | A11yRole::Tree
                 | A11yRole::Row
+                | A11yRole::TreeItem
                 | A11yRole::Cell
                 | A11yRole::ColumnHeader
                 | A11yRole::RowHeader
@@ -762,6 +769,22 @@ mod tests {
         assert_eq!(
             role_to_accesskit(A11yRole::TextRun),
             accesskit::Role::TextRun
+        );
+        // 树（E9）：`Tree` / `TreeItem` 与 AccessKit 0.25 同名同义；三端 adapter 都按角色
+        // 直接映射（Windows UIA tree/tree item、macOS outline/outline row、AT-SPI tree/tree item）。
+        assert_eq!(role_to_accesskit(A11yRole::Tree), accesskit::Role::Tree);
+        assert_eq!(
+            role_to_accesskit(A11yRole::TreeItem),
+            accesskit::Role::TreeItem
+        );
+        // `ALL` 必须真的收录树角色（漏列 ⇒ 上面的求和断言红，这里给出更直接的失败面）。
+        assert!(
+            A11yRole::ALL.contains(&A11yRole::Tree),
+            "A11yRole::ALL 必须包含 Tree"
+        );
+        assert!(
+            A11yRole::ALL.contains(&A11yRole::TreeItem),
+            "A11yRole::ALL 必须包含 TreeItem"
         );
     }
 

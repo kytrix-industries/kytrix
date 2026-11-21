@@ -8,8 +8,20 @@
 //! 2. **自动语义**：虚拟列表位置、表格的行列索引与总数、文本的 grapheme 长度与词边界、
 //!    滚动状态 —— 这些是引擎**已经知道**的事实，不该逼应用逐节点手填；
 //! 3. **稳定身份**：一切 id（自身 / children / parent）都经 `a11y::identity` 的分配器发放。
+//!
+//! # 集合语义（E9）
+//!
+//! 表格 / 树是**集合**：AccessKit 的消费端要求「`Row` 在 `Table`/`Grid` 下」「单元格在 `Row`
+//! 下」「`TreeItem` 在 `Tree`/`TreeItem` 下」，且行列索引与总数必须描述**逻辑集合**。但物理
+//! 节点树里这些语义节点通常隔着一层布局实现细节（虚拟列表的 `List` 行窗口、单元格的排板盒），
+//! 直接按物理父子建树会让行挂到 `List` 下、`row_count` 退化成「已挂载行数」。
+//!
+//! 因此 a11y 树用**逻辑父**（[`logical_a11y_parent`]）而不是物理父：集合角色（`Row` /
+//! `Cell` / `ColumnHeader` / `RowHeader` / `TreeItem`）挂到最近的集合祖先下，包裹层只保留
+//! 它们自己的普通子节点。逻辑父是物理祖先的子集（永远更浅），所以「父先于子」的交付顺序不
+//! 受影响；集合结构由 [`CollectionSemanticsCache`] 每笔交付扫一次（逻辑父 / 逻辑子 / 行列位置
+//! 都是 O(1) 查询）。**只认显式声明的角色**：裸虚拟列表（自动推导的 `ListBoxOption`）结构不变。
 
-use ahash::HashMapExt;
 use smallvec::SmallVec;
 
 use crate::{
@@ -70,7 +82,7 @@ impl std::fmt::Debug for NodeA11y {
 
 /// 构建一个节点的 a11y 快照记录（角色 → 名字 → 值 → 隐藏 → 禁用 → 动作 → 自动语义 → 稳定身份）。
 ///
-/// 生产入口是 [`node_a11y_with_cache`]：表级语义索引由调用方跨节点复用。这里只为同模块单测
+/// 生产入口是 [`node_a11y_with_cache`]：集合语义索引由调用方跨节点复用。这里只为同模块单测
 /// 保留一次性的索引（每个测试用例的树/结构独立，缓存没有复用价值）。
 ///
 /// 返回 `None` = 句柄陈旧（调用方已过滤，防御性）。诊断直接推进 `diagnostics`。
@@ -84,7 +96,7 @@ pub(crate) fn node_a11y(
     ids: &mut A11yIds,
     diagnostics: &mut Vec<A11yDiagnostic>,
 ) -> Option<A11yNode> {
-    let mut tables = TableSemanticsCache::default();
+    let mut tables = CollectionSemanticsCache::default();
     node_a11y_with_cache(tree, node, scale, title, ids, &mut tables, diagnostics)
 }
 
@@ -94,7 +106,7 @@ pub(crate) fn node_a11y_with_cache(
     scale: Scale,
     title: &str,
     ids: &mut A11yIds,
-    tables: &mut TableSemanticsCache,
+    tables: &mut CollectionSemanticsCache,
     diagnostics: &mut Vec<A11yDiagnostic>,
 ) -> Option<A11yNode> {
     let target = tree.get(node).ok()?;
@@ -103,6 +115,8 @@ pub(crate) fn node_a11y_with_cache(
     let patch = slot.map(|slot| &slot.patch);
 
     let role = effective_role(tree, node, target, over, patch);
+    // 集合语义：行 / 单元格 / 树项的 a11y 父是最近的集合祖先（布局包裹层被跳过）。
+    let parent = logical_a11y_parent(tree, node);
     let mut label = effective_label(target, role, over, patch);
     if node == tree.root() && label.is_none() && !title.is_empty() {
         label = Some(A11yLabel::new(
@@ -114,7 +128,9 @@ pub(crate) fn node_a11y_with_cache(
     let description = effective_description(over, patch);
     // 与 `selected` / `expanded` 同型：布尔状态只走动态补丁（`A11yOverride` 不承载）。
     let checked = patch.and_then(|patch| patch.checked);
-    let hidden = is_hidden(target, role, label.as_ref(), over, patch);
+    // 隐藏 = 本地判据 ∪ 被领养跳过的物理祖先的隐藏声明（AccessKit 只沿 a11y 子树继承）。
+    let hidden = is_hidden(target, role, label.as_ref(), over, patch)
+        || hidden_by_skipped_ancestors(tree, node, parent);
     let disabled = a11y_disabled(tree, node);
     // `read_only` 必须在能力计算之前求（E3：能力集 = 分发判据，read_only 剔除值变更类动作）。
     let read_only = a11y_read_only(tree, node);
@@ -263,17 +279,17 @@ pub(crate) fn node_a11y_with_cache(
         identity_key(tree, node, over, patch),
         diagnostics,
     );
-    let children = target
-        .children()
-        .iter()
+    // 逻辑子节点（集合语义下 = 未被领养走的物理子节点 + 被领养到本节点的行 / 单元格 / 树项）。
+    let children = a11y_children(tree, node, role, tables)
+        .into_iter()
         .map(|child| {
             let key = identity_key(
                 tree,
-                *child,
-                over_child(tree, *child),
-                patch_child(tree, *child),
+                child,
+                over_child(tree, child),
+                patch_child(tree, child),
             );
-            ids.id_for(tree, *child, key, diagnostics)
+            ids.id_for(tree, child, key, diagnostics)
         })
         .collect();
     Some(A11yNode {
@@ -349,7 +365,7 @@ pub(crate) fn node_a11y_with_cache(
         placeholder,
         level,
         children,
-        parent: target.parent().map(|parent| {
+        parent: parent.map(|parent| {
             let key = identity_key(
                 tree,
                 parent,
@@ -434,35 +450,63 @@ struct TableSemantics {
     column_count: Option<usize>,
 }
 
-/// 表级语义索引：一张表只扫一遍直接子节点，行/列号与总数都是 O(1) 查询。
+/// 集合语义（表格 / 树）的结构索引：一个集合每笔交付只扫一遍子树，逻辑父 / 逻辑子 / 行列
+/// 位置都是 O(1) 查询。
 ///
-/// 旧实现每个 `Row`/`Cell` 都重新遍历整张表（`count_rows` / `count_columns` /
-/// `sibling_index_where`），5000×8 的表是 O(行×列×行) 的 arena 访问；AT 接入或 DPI
-/// 变化时按 2048/批交付，会把 UI 冻结数秒。Chrome 的 `AXTableInfo` 也是构建时一次算好
-/// row/column count，cell 只做索引查询。
+/// **为什么必须有索引**：集合语义要求「行挂 `Table`、单元格挂 `Row`、树项挂 `Tree`/`TreeItem`」，
+/// 而物理节点树里这些语义节点通常隔着一层布局包裹（虚拟列表的 `List` 行窗口、单元格的排板盒）。
+/// 旧实现只认物理父子（表格语义推导要求 `Row` 的直接父是 `Table`、`Cell` 的直接父是 `Row`），
+/// 虚拟化表格的行因此挂在 `List` 下、列号退化成「兄弟序号」。
+///
+/// 旧实现还按每个 `Row`/`Cell` 重扫整张表（`count_rows` / `count_columns` /
+/// `sibling_index_where`），5000×8 的表是 O(行×列×行) 的 arena 访问。Chrome 的 `AXTableInfo`
+/// 也是构建时一次算好 row/column count，cell 只做索引查询 —— 这里同样。
 #[derive(Default)]
-pub(crate) struct TableSemanticsCache {
+pub(crate) struct CollectionSemanticsCache {
     tables: ahash::HashMap<NodeId, TableIndex>,
-    /// 建索引次数（仅测试：证明每个表每笔交付只扫一次）。
+    trees: ahash::HashMap<NodeId, TreeIndex>,
+    /// 建索引次数（仅测试：证明每个集合每笔交付只扫一次）。
     #[cfg(test)]
     builds: u64,
 }
 
+/// 一张表的逻辑结构。
+#[derive(Default)]
 struct TableIndex {
+    /// 逻辑总行数（虚拟化表格 = 行窗口之外的行走完之后的计数，含未挂载的条目）。
     row_count: Option<usize>,
+    /// 列数（最宽的行的单元格数）。
     column_count: Option<usize>,
-    rows: ahash::HashMap<NodeId, RowIndex>,
+    /// 表的逻辑子节点（文档序）：未被领养走的物理子节点 + 被领养到表下的行。
+    children: Vec<NodeId>,
+    /// 逻辑行（文档序）。
+    rows: Vec<RowEntry>,
+    /// 行节点 → `rows` 下标。
+    row_of: ahash::HashMap<NodeId, usize>,
 }
 
-struct RowIndex {
-    row_index: usize,
-    cells: ahash::HashMap<NodeId, usize>,
+/// 一行（表格）的逻辑结构。
+struct RowEntry {
+    /// 行的逻辑行号（虚拟化行窗口 = 窗口基址 + 条目的逻辑下标）。
+    index: usize,
+    /// 行的逻辑子节点（文档序）：未被领养走的物理子节点 + 被领养到行下的单元格。
+    children: Vec<NodeId>,
+    /// 单元格 → 逻辑列号。
+    column_of: ahash::HashMap<NodeId, usize>,
 }
 
-impl TableSemanticsCache {
-    /// 开始一笔新交付：表格结构可能已经变化，索引不能跨批复用。
+/// 一棵树（`Tree` / `TreeItem`）的逻辑结构。
+#[derive(Default)]
+struct TreeIndex {
+    /// 节点（集合根或 `TreeItem`）→ 逻辑子节点（文档序）。
+    children: ahash::HashMap<NodeId, Vec<NodeId>>,
+}
+
+impl CollectionSemanticsCache {
+    /// 开始一笔新交付：集合结构可能已经变化，索引不能跨批复用。
     pub(crate) fn clear(&mut self) {
         self.tables.clear();
+        self.trees.clear();
     }
 
     #[cfg(test)]
@@ -470,7 +514,7 @@ impl TableSemanticsCache {
         self.builds
     }
 
-    fn index(&mut self, tree: &NodeTree, table: NodeId) -> &TableIndex {
+    fn table(&mut self, tree: &NodeTree, table: NodeId) -> &TableIndex {
         self.tables.entry(table).or_insert_with(|| {
             #[cfg(test)]
             {
@@ -479,41 +523,319 @@ impl TableSemanticsCache {
             build_table_index(tree, table)
         })
     }
+
+    fn tree(&mut self, tree: &NodeTree, root: NodeId) -> &TreeIndex {
+        self.trees.entry(root).or_insert_with(|| {
+            #[cfg(test)]
+            {
+                self.builds = self.builds.saturating_add(1);
+            }
+            build_tree_index(tree, root)
+        })
+    }
 }
 
-/// 扫一遍表：直接 `Row` 子节点编号、每个行的 `Cell` 子节点编号、最宽行即列数。
+/// 扫一遍表：逻辑行（含虚拟行窗口的已挂载行与未挂载计数）、每行的单元格、逻辑子节点列表。
 fn build_table_index(tree: &NodeTree, table: NodeId) -> TableIndex {
-    let table_children = children_of(tree, table).len();
-    let mut rows = ahash::HashMap::with_capacity(table_children);
-    let mut row_count = 0usize;
-    let mut widest = 0usize;
-    for row in children_of(tree, table) {
-        if !is_row_role(tree, *row) {
-            continue;
-        }
-        let mut cells = ahash::HashMap::with_capacity(children_of(tree, *row).len());
-        let mut column_index = 0usize;
-        for cell in children_of(tree, *row) {
-            if is_cell_role(tree, *cell) {
-                cells.insert(*cell, column_index);
-                column_index += 1;
+    let mut index = TableIndex::default();
+    // 下一个逻辑行号：非虚拟行逐个递增；虚拟行窗口一次占 `slot.count` 行。
+    let mut next_row = 0usize;
+    let mut stack: Vec<NodeId> = children_of(tree, table).iter().rev().copied().collect();
+    while let Some(node) = stack.pop() {
+        // 虚拟行窗口（`List` 容器）：已挂载的行就是表的**可见行**；未挂载的行只贡献计数。
+        // 行窗口自身是布局/滚动实现细节，只有在它物理上直挂表时才随表出现。
+        //
+        // **行窗口判据 = 已挂载项全部声明了 `Row`**（E9b F1）：表格子树里还可能挂着别的虚拟
+        // 列表（表内分组列表、兼容路径 `Table > Cell` 的虚拟单元格窗口……），它们不是行窗口。
+        // 无条件领养会让同一节点同时出现在 `Table` 与物理父的 `children` 里（a11y 父不唯一，
+        // AccessKit consumer 的父指针被覆盖），`slot.count` 也会虚增 `row_count`。
+        // 非行窗口按普通包裹层继续下降：里面若有声明的 `Row`，走下面的通用行路径。
+        //
+        // 空窗口（0 个已挂载项）无法区分，仍按行窗口计：初始帧还没挂载行时 `slot.count` 已经
+        // 是逻辑行数；声明值（`A11yPatch::row_count`）始终优先（见 E9.md §2.3）。
+        if let Some(slot) = tree.virtual_slot(node) {
+            let row_window = slot
+                .mounted
+                .iter()
+                .all(|(_, row)| declared_role(tree, *row) == Some(A11yRole::Row));
+            if row_window {
+                let base = next_row;
+                next_row = next_row.saturating_add(slot.count);
+                if tree.get(node).ok().and_then(Node::parent) == Some(table) {
+                    index.children.push(node);
+                }
+                for (item, row) in &slot.mounted {
+                    let entry = build_row_entry(tree, *row, base.saturating_add(*item));
+                    index.row_of.insert(*row, index.rows.len());
+                    index.rows.push(entry);
+                    // 行的逻辑父 = 表（见 `logical_a11y_parent`）。
+                    index.children.push(*row);
+                }
+                continue;
             }
         }
-        widest = widest.max(column_index);
-        rows.insert(
-            *row,
-            RowIndex {
-                row_index: row_count,
-                cells,
-            },
-        );
-        row_count += 1;
+        match declared_role(tree, node) {
+            // 嵌套集合：它的行属于它自己，不进入本表索引。
+            Some(A11yRole::Table | A11yRole::Grid) => {
+                if tree.get(node).ok().and_then(Node::parent) == Some(table) {
+                    index.children.push(node);
+                }
+                continue;
+            }
+            Some(A11yRole::Row) => {
+                let entry = build_row_entry(tree, node, next_row);
+                next_row = next_row.saturating_add(1);
+                index.row_of.insert(node, index.rows.len());
+                index.rows.push(entry);
+                index.children.push(node);
+                continue;
+            }
+            _ => {}
+        }
+        if logical_a11y_parent(tree, node) == Some(table) {
+            index.children.push(node);
+        }
+        stack.extend(children_of(tree, node).iter().rev().copied());
     }
-    TableIndex {
-        row_count: (row_count > 0).then_some(row_count),
-        column_count: (widest > 0).then_some(widest),
-        rows,
+    index.row_count = (next_row > 0).then_some(next_row);
+    index.column_count = index
+        .rows
+        .iter()
+        .map(|row| row.column_of.len())
+        .max()
+        .filter(|count| *count > 0);
+    index
+}
+
+/// 一行的逻辑结构：物理子节点（未被领养走的）+ 被领养到行下的单元格（文档序）。
+fn build_row_entry(tree: &NodeTree, row: NodeId, index: usize) -> RowEntry {
+    let mut entry = RowEntry {
+        index,
+        children: Vec::new(),
+        column_of: ahash::HashMap::default(),
+    };
+    let mut stack: Vec<NodeId> = children_of(tree, row).iter().rev().copied().collect();
+    while let Some(node) = stack.pop() {
+        match declared_role(tree, node) {
+            Some(A11yRole::Cell | A11yRole::ColumnHeader | A11yRole::RowHeader) => {
+                let column = entry.column_of.len();
+                entry.column_of.insert(node, column);
+                entry.children.push(node);
+                continue;
+            }
+            // 嵌套集合 / 行：它们自己的集合语义，不领养到本行。
+            Some(A11yRole::Row | A11yRole::Table | A11yRole::Grid | A11yRole::Tree) => continue,
+            _ => {}
+        }
+        if logical_a11y_parent(tree, node) == Some(row) {
+            entry.children.push(node);
+        }
+        stack.extend(children_of(tree, node).iter().rev().copied());
     }
+    entry
+}
+
+/// 扫一棵树：逻辑子节点列表（`Tree` 根 + 每个 `TreeItem`；包裹层的非集合内容按物理父子保留）。
+fn build_tree_index(tree: &NodeTree, root: NodeId) -> TreeIndex {
+    let mut index = TreeIndex::default();
+    // DFS 先序；栈里携带「最近的集合祖先」（根或树项）。
+    let mut stack: Vec<(NodeId, NodeId)> = children_of(tree, root)
+        .iter()
+        .rev()
+        .map(|child| (*child, root))
+        .collect();
+    while let Some((node, logical_parent)) = stack.pop() {
+        let next_parent = match declared_role(tree, node) {
+            Some(A11yRole::TreeItem) => {
+                index.children.entry(logical_parent).or_default().push(node);
+                node
+            }
+            // 嵌套树：它自己是另一棵树的根，不进入本索引。
+            Some(A11yRole::Tree) => {
+                if tree.get(node).ok().and_then(Node::parent) == Some(logical_parent) {
+                    index.children.entry(logical_parent).or_default().push(node);
+                }
+                continue;
+            }
+            _ => {
+                // 非集合节点保留物理父子：它也出现在集合祖先的 children 里（只是包裹层），
+                // 自己的子节点由通用路径（物理子节点过滤）算。
+                if tree.get(node).ok().and_then(Node::parent) == Some(logical_parent) {
+                    index.children.entry(logical_parent).or_default().push(node);
+                }
+                logical_parent
+            }
+        };
+        for child in children_of(tree, node).iter().rev() {
+            stack.push((*child, next_parent));
+        }
+    }
+    index
+}
+
+/// 该节点的**声明**角色（只看 `patch.role` / `over.role`；不做 kind 推导）。
+///
+/// 集合结构的推导只认显式角色：`Row` / `Cell` / `TreeItem` 本来就是"应用声明才有"的角色，靠
+/// kind 猜会把任何虚拟列表行也算进来。
+fn declared_role(tree: &NodeTree, node: NodeId) -> Option<A11yRole> {
+    let slot = tree.a11y_of(node)?;
+    slot.patch
+        .role
+        .or_else(|| slot.over.as_ref().and_then(|over| over.role))
+}
+
+/// 最近的声明了某角色的祖先（不含自身）。
+fn nearest_ancestor_where(
+    tree: &NodeTree,
+    node: NodeId,
+    predicate: impl Fn(A11yRole) -> bool,
+) -> Option<NodeId> {
+    let mut cursor = tree.get(node).ok().and_then(Node::parent);
+    while let Some(current) = cursor {
+        if declared_role(tree, current).is_some_and(&predicate) {
+            return Some(current);
+        }
+        cursor = tree.get(current).ok().and_then(Node::parent);
+    }
+    None
+}
+
+/// a11y 树里的**逻辑父**：集合语义把节点挂到最近的集合祖先下、跳过布局包裹层；其它角色就是
+/// 物理父节点（`None` = 根）。
+///
+/// | 角色 | 逻辑父 |
+/// |---|---|
+/// | `Row` | 最近的 `Table` / `Grid` 祖先（虚拟行窗口 `List` 不是父） |
+/// | `Cell` / `ColumnHeader` / `RowHeader` | 最近的 `Row` 祖先 |
+/// | `TreeItem` | 最近的 `Tree` / `TreeItem` 祖先（嵌套树项） |
+///
+/// 只认**声明**角色（[`declared_role`]）：自动推导出的 `ListBoxOption` 等仍是物理父子，
+/// 裸虚拟列表的 a11y 结构不受影响。
+pub(crate) fn logical_a11y_parent(tree: &NodeTree, node: NodeId) -> Option<NodeId> {
+    let physical = tree.get(node).ok().and_then(Node::parent);
+    let adopted = match declared_role(tree, node) {
+        Some(A11yRole::Row) => nearest_ancestor_where(tree, node, |role| {
+            matches!(role, A11yRole::Table | A11yRole::Grid)
+        }),
+        Some(A11yRole::Cell | A11yRole::ColumnHeader | A11yRole::RowHeader) => {
+            nearest_ancestor_where(tree, node, |role| role == A11yRole::Row)
+        }
+        Some(A11yRole::TreeItem) => nearest_ancestor_where(tree, node, |role| {
+            matches!(role, A11yRole::Tree | A11yRole::TreeItem)
+        }),
+        _ => None,
+    };
+    adopted.or(physical)
+}
+
+/// 树项所属的集合根：**最近的** `Tree` 祖先（找到即停 —— 嵌套 `Tree` 有自己的索引，集合边界不
+/// 穿越）；没有 `Tree` 时取最外层 `TreeItem`（无 `Tree` 的裸树项集合属应用违约，但仍要产出
+/// 父唯一的自洽树）。
+fn tree_collection_root(tree: &NodeTree, node: NodeId) -> Option<NodeId> {
+    let mut outermost_item = None;
+    let mut cursor = tree.get(node).ok().and_then(Node::parent);
+    while let Some(current) = cursor {
+        match declared_role(tree, current) {
+            Some(A11yRole::Tree) => return Some(current),
+            Some(A11yRole::TreeItem) => outermost_item = Some(current),
+            _ => {}
+        }
+        cursor = tree.get(current).ok().and_then(Node::parent);
+    }
+    outermost_item
+}
+
+/// 节点的 a11y 逻辑子节点（集合节点查索引，其余按物理子节点过滤掉被领养走的）。
+fn a11y_children(
+    tree: &NodeTree,
+    node: NodeId,
+    role: A11yRole,
+    tables: &mut CollectionSemanticsCache,
+) -> Vec<NodeId> {
+    match role {
+        A11yRole::Table | A11yRole::Grid => tables.table(tree, node).children.clone(),
+        A11yRole::Row => {
+            let Some(table) = nearest_ancestor_where(tree, node, |role| {
+                matches!(role, A11yRole::Table | A11yRole::Grid)
+            }) else {
+                // 无 `Table`/`Grid` 的 `Row` 是应用违约（文档要求 Row 位于表格内），但引擎不能
+                // 因此产出孤儿：`Cell` 的逻辑父仍是最近的 `Row`，这里按**行内领养规则**构造
+                // children（声明的单元格 / 排板盒都在），否则 Cell 无父可达（E9b F2）。
+                return build_row_entry(tree, node, 0).children;
+            };
+            let index = tables.table(tree, table);
+            index
+                .row_of
+                .get(&node)
+                .and_then(|position| index.rows.get(*position))
+                .map_or_else(
+                    || build_row_entry(tree, node, 0).children,
+                    |row| row.children.clone(),
+                )
+        }
+        A11yRole::Tree => tables
+            .tree(tree, node)
+            .children
+            .get(&node)
+            .cloned()
+            .unwrap_or_default(),
+        A11yRole::TreeItem => {
+            // 集合根 = 最近的 `Tree`（嵌套树有自己的索引）；没有 `Tree` 时以自身为根建索引，
+            // 裸树项集合也能把嵌套树项列全（E9b F3）。
+            let root = tree_collection_root(tree, node).unwrap_or(node);
+            tables
+                .tree(tree, root)
+                .children
+                .get(&node)
+                .cloned()
+                .unwrap_or_else(|| logical_physical_children(tree, node))
+        }
+        _ => logical_physical_children(tree, node),
+    }
+}
+
+/// 物理子节点里**逻辑父仍是本节点**的那些（被集合语义领养走的子节点不在这里重复出现）。
+fn logical_physical_children(tree: &NodeTree, node: NodeId) -> Vec<NodeId> {
+    children_of(tree, node)
+        .iter()
+        .copied()
+        .filter(|child| logical_a11y_parent(tree, *child) == Some(node))
+        .collect()
+}
+
+/// 被集合语义跳过（不在 a11y 父链上）的物理祖先若有隐藏声明，被领养的后代也必须隐藏。
+///
+/// AccessKit 的 `hidden` 只沿 a11y 子树继承：把行从隐藏的包裹层下领养到 `Table` 时，包裹层的
+/// 隐藏语义不能丢。只看**本地声明**（补丁 / 静态 / `visible` / `display:none`），到 a11y 父即止
+/// （再往上由 AccessKit 沿 a11y 父链继承）。
+fn hidden_by_skipped_ancestors(tree: &NodeTree, node: NodeId, a11y_parent: Option<NodeId>) -> bool {
+    let mut cursor = tree.get(node).ok().and_then(Node::parent);
+    while let Some(current) = cursor {
+        if Some(current) == a11y_parent {
+            return false;
+        }
+        let Ok(target) = tree.get(current) else {
+            return false;
+        };
+        let slot = tree.a11y_of(current);
+        let over = slot.and_then(|slot| slot.over.as_ref());
+        let patch = slot.map(|slot| &slot.patch);
+        let hidden = patch
+            .and_then(|patch| patch.hidden)
+            .unwrap_or_else(|| over.is_some_and(|over| over.hidden));
+        if hidden
+            || target.style_patch().visible == Some(false)
+            || matches!(target.style().inner.display, taffy::style::Display::None)
+        {
+            return true;
+        }
+        cursor = target.parent();
+    }
+    false
+}
+
+fn children_of(tree: &NodeTree, node: NodeId) -> &[NodeId] {
+    tree.get(node).map_or(&[], |target| target.children())
 }
 
 fn derive_table_semantics(
@@ -522,7 +844,7 @@ fn derive_table_semantics(
     role: A11yRole,
     over: Option<&A11yOverride>,
     patch: Option<&A11yPatch>,
-    tables: &mut TableSemanticsCache,
+    tables: &mut CollectionSemanticsCache,
 ) -> TableSemantics {
     let mut semantics = TableSemantics {
         row_index: patch
@@ -538,54 +860,63 @@ fn derive_table_semantics(
             .and_then(|patch| patch.column_count)
             .or_else(|| over.and_then(|over| over.column_count)),
     };
-    let parent = tree.get(node).ok().and_then(Node::parent);
     match role {
         A11yRole::Table | A11yRole::Grid => {
-            // 声明齐全的表不需要结构扫描（旧实现对声明完整场景是 O(1)）。
-            if semantics.row_count.is_none() || semantics.column_count.is_none() {
-                let index = tables.index(tree, node);
-                if semantics.row_count.is_none() {
-                    semantics.row_count = index.row_count;
-                }
-                if semantics.column_count.is_none() {
-                    semantics.column_count = index.column_count;
-                }
+            let index = tables.table(tree, node);
+            if semantics.row_count.is_none() {
+                semantics.row_count = index.row_count;
+            }
+            if semantics.column_count.is_none() {
+                semantics.column_count = index.column_count;
             }
         }
         A11yRole::Row => {
-            let Some(parent) = parent else {
+            // 行可能挂在虚拟行窗口（`List`）下：逻辑表是**最近的 Table/Grid 祖先**，不是物理父。
+            let Some(table) = nearest_ancestor_where(tree, node, |role| {
+                matches!(role, A11yRole::Table | A11yRole::Grid)
+            }) else {
                 return semantics;
             };
-            if is_table_role(tree, parent)
-                && (semantics.row_index.is_none() || semantics.row_count.is_none())
-            {
-                let index = tables.index(tree, parent);
+            if semantics.row_index.is_none() || semantics.row_count.is_none() {
+                let index = tables.table(tree, table);
                 if semantics.row_index.is_none() {
-                    semantics.row_index = index.rows.get(&node).map(|row| row.row_index);
+                    semantics.row_index = index
+                        .row_of
+                        .get(&node)
+                        .and_then(|position| index.rows.get(*position))
+                        .map(|row| row.index);
                 }
                 if semantics.row_count.is_none() {
-                    semantics.row_count = declared_row_count(tree, parent).or(index.row_count);
+                    semantics.row_count = declared_row_count(tree, table).or(index.row_count);
                 }
             }
         }
         A11yRole::Cell | A11yRole::ColumnHeader | A11yRole::RowHeader => {
-            let Some(row) = parent else {
+            let Some(row) = nearest_ancestor_where(tree, node, |role| role == A11yRole::Row) else {
+                // 旧兼容路径：非 `Row` 容器直接挂 `Cell`/表头时用同角色兄弟序号。
+                if semantics.column_index.is_none() {
+                    semantics.column_index = cell_sibling_index(tree, node);
+                }
                 return semantics;
             };
-            if is_row_role(tree, row)
-                && let Some(table) = tree.get(row).ok().and_then(Node::parent)
-                && (semantics.row_index.is_none()
-                    || semantics.column_index.is_none()
-                    || semantics.row_count.is_none()
-                    || semantics.column_count.is_none())
+            if let Some(table) = nearest_ancestor_where(tree, row, |role| {
+                matches!(role, A11yRole::Table | A11yRole::Grid)
+            }) && (semantics.row_index.is_none()
+                || semantics.column_index.is_none()
+                || semantics.row_count.is_none()
+                || semantics.column_count.is_none())
             {
-                let index = tables.index(tree, table);
-                let row_info = index.rows.get(&row);
+                let index = tables.table(tree, table);
+                let row_entry = index
+                    .row_of
+                    .get(&row)
+                    .and_then(|position| index.rows.get(*position));
                 if semantics.row_index.is_none() {
-                    semantics.row_index = row_info.map(|row| row.row_index);
+                    semantics.row_index = row_entry.map(|row| row.index);
                 }
                 if semantics.column_index.is_none() {
-                    semantics.column_index = row_info.and_then(|row| row.cells.get(&node).copied());
+                    semantics.column_index =
+                        row_entry.and_then(|row| row.column_of.get(&node).copied());
                 }
                 if semantics.row_count.is_none() {
                     semantics.row_count = declared_row_count(tree, table).or(index.row_count);
@@ -595,8 +926,6 @@ fn derive_table_semantics(
                         declared_column_count(tree, table).or(index.column_count);
                 }
             }
-            // 旧实现的兄弟索引回退：允许非 Row 容器直接挂 Cell/表头（不规范但已有调用方
-            // 依赖 `Some(0)`）。正常 Row 路径已在上面用 O(1) 的 RowIndex 命中。
             if semantics.column_index.is_none() {
                 semantics.column_index = cell_sibling_index(tree, node);
             }
@@ -606,40 +935,7 @@ fn derive_table_semantics(
     semantics
 }
 
-/// 该节点的**声明**角色（只看 `patch.role` / `over.role`；不做 kind 推导）。
-///
-/// 表格结构的推导只认显式角色：`Row` / `Cell` 本来就是"应用声明才有"的角色，靠 kind 猜会把
-/// 任何虚拟列表行也算进来。
-fn declared_role(tree: &NodeTree, node: NodeId) -> Option<A11yRole> {
-    let slot = tree.a11y_of(node)?;
-    slot.patch
-        .role
-        .or_else(|| slot.over.as_ref().and_then(|over| over.role))
-}
-
-fn is_table_role(tree: &NodeTree, node: NodeId) -> bool {
-    matches!(
-        declared_role(tree, node),
-        Some(A11yRole::Table | A11yRole::Grid)
-    )
-}
-
-fn is_row_role(tree: &NodeTree, node: NodeId) -> bool {
-    matches!(declared_role(tree, node), Some(A11yRole::Row))
-}
-
-fn is_cell_role(tree: &NodeTree, node: NodeId) -> bool {
-    matches!(
-        declared_role(tree, node),
-        Some(A11yRole::Cell | A11yRole::ColumnHeader | A11yRole::RowHeader)
-    )
-}
-
-fn children_of(tree: &NodeTree, node: NodeId) -> &[NodeId] {
-    tree.get(node).map_or(&[], |target| target.children())
-}
-
-/// `Cell` 在父容器同角色兄弟里的序号（仅在父不是声明 `Row` 的兼容路径上使用）。
+/// `Cell` 在父容器同角色兄弟里的序号（仅在父链路里没有声明 `Row` 的兼容路径上使用）。
 fn cell_sibling_index(tree: &NodeTree, node: NodeId) -> Option<usize> {
     let parent = tree.get(node).ok()?.parent()?;
     let mut index = 0usize;
@@ -647,7 +943,10 @@ fn cell_sibling_index(tree: &NodeTree, node: NodeId) -> Option<usize> {
         if *child == node {
             return Some(index);
         }
-        if is_cell_role(tree, *child) {
+        if matches!(
+            declared_role(tree, *child),
+            Some(A11yRole::Cell | A11yRole::ColumnHeader | A11yRole::RowHeader)
+        ) {
             index += 1;
         }
     }
@@ -1007,7 +1306,7 @@ mod tests {
         }
 
         let mut ids = A11yIds::new();
-        let mut tables = super::TableSemanticsCache::default();
+        let mut tables = super::CollectionSemanticsCache::default();
         let mut diagnostics = Vec::new();
         let table_node = super::node_a11y_with_cache(
             &tree,
@@ -1057,9 +1356,10 @@ mod tests {
         );
     }
 
-    /// 声明齐全的表格语义必须保持 O(1)，不能为了「自动推导」反而扫描整表。
+    /// 声明齐全的表格语义不再需要逐节点扫描；但**逻辑子节点**（E9 集合语义）必须知道哪些行 /
+    /// 单元格被领养到哪一层，所以一笔交付仍要建一次结构索引（之后 O(1) 复用）。
     #[test]
-    fn declared_table_semantics_do_not_build_the_index() {
+    fn declared_table_semantics_share_one_structure_scan() {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let table = NodeBuilder::boxed()
@@ -1093,7 +1393,7 @@ mod tests {
             .expect("cell");
 
         let mut ids = A11yIds::new();
-        let mut tables = super::TableSemanticsCache::default();
+        let mut tables = super::CollectionSemanticsCache::default();
         let mut diagnostics = Vec::new();
         for (node, expected) in [
             (table, (Some(1), None, None)),
@@ -1116,7 +1416,11 @@ mod tests {
                 "node {node:?}"
             );
         }
-        assert_eq!(tables.builds(), 0, "声明齐全时不得构建表格索引");
+        assert_eq!(
+            tables.builds(),
+            1,
+            "表 / 行 / 单元格共享同一份集合索引（每笔一次，不按节点重扫）"
+        );
     }
 
     /// 兼容路径：`Table > Cell`（没有 Row 容器）仍沿用旧实现的同角色兄弟序号。
@@ -1139,7 +1443,7 @@ mod tests {
             .build(&mut tree, table)
             .expect("cell");
         let mut ids = A11yIds::new();
-        let mut tables = super::TableSemanticsCache::default();
+        let mut tables = super::CollectionSemanticsCache::default();
         let mut diagnostics = Vec::new();
         let record = super::node_a11y_with_cache(
             &tree,
@@ -1388,5 +1692,575 @@ mod tests {
             run_snapshot.actions.contains(&A11yAction::SetTextSelection),
             "TextRun 默认宣告 SetTextSelection"
         );
+    }
+    /// 一次性快照（共享同一份 id 分配器与集合索引：测试里要跨节点断言父 / 子身份）。
+    fn snapshot_with(
+        tree: &NodeTree,
+        node: NodeId,
+        ids: &mut A11yIds,
+        tables: &mut super::CollectionSemanticsCache,
+    ) -> crate::a11y::A11yNode {
+        let mut diagnostics = Vec::new();
+        super::node_a11y_with_cache(tree, node, Scale::ONE, "", ids, tables, &mut diagnostics)
+            .expect("snapshot")
+    }
+
+    /// a11y 树的硬不变量：每个节点**只有一个父**，且父的 `children` 必须列出它（无孤儿 / 无双父）。
+    ///
+    /// 引擎侧快照（不是 `TreeUpdate`）也要钉住这条：F1 这类「同一节点同时挂在 Table 与物理父
+    /// 下」的缺陷只会在快照的 children/parent 交叉比对里暴露（`ShadowTree` 的父唯一性断言另在
+    /// `test_support::a11y` 覆盖 `TreeUpdate` 层）。
+    fn assert_single_parent_per_node(
+        tree: &NodeTree,
+        ids: &mut A11yIds,
+        tables: &mut super::CollectionSemanticsCache,
+    ) {
+        let mut subtree = SmallVec::new();
+        super::collect_subtree(tree, tree.root(), &mut subtree);
+        let records: Vec<crate::a11y::A11yNode> = subtree
+            .iter()
+            .map(|node| snapshot_with(tree, *node, ids, tables))
+            .collect();
+        let by_id: ahash::HashMap<crate::a11y::A11yNodeId, &crate::a11y::A11yNode> =
+            records.iter().map(|record| (record.id, record)).collect();
+        assert_eq!(by_id.len(), records.len(), "a11y id 必须唯一");
+        let mut parent_of: ahash::HashMap<crate::a11y::A11yNodeId, crate::a11y::A11yNodeId> =
+            ahash::HashMap::default();
+        for record in &records {
+            for child in &record.children {
+                let Some(child_record) = by_id.get(child) else {
+                    panic!(
+                        "节点 {:?} 的 children 里有未知子节点 {child:?}（不可达 / 孤儿）",
+                        record.engine
+                    );
+                };
+                if let Some(previous) = parent_of.insert(*child, record.id) {
+                    assert_eq!(
+                        previous, record.id,
+                        "节点 {:?} 同时挂在 {previous:?} 与 {:?} 两个父下",
+                        child_record.engine, record.id
+                    );
+                }
+            }
+        }
+        for record in &records {
+            let Some(parent) = record.parent else {
+                continue;
+            };
+            let Some(parent_record) = by_id.get(&parent) else {
+                continue; // 根节点的 a11y 父不在快照范围内（窗口根没有 a11y 父）
+            };
+            assert!(
+                parent_record.children.contains(&record.id),
+                "节点 {:?} 的父 {parent:?} 没有把它列进 children（孤儿）",
+                record.engine
+            );
+        }
+    }
+
+    /// E9：虚拟化表格的行窗口（`List` 容器）不是行的 a11y 父。
+    ///
+    /// 结构对齐 base_ui 表格：`Table → header → Row → ColumnHeader` 与
+    /// `Table → list → viewport(虚拟行窗口) → Row → column → cells_row → Cell`。行必须挂到
+    /// `Table` 下；行号是**逻辑行号**（窗口基址 + 条目下标），`row_count` 是逻辑总行数
+    /// （含未挂载的条目），不是已挂载行数。
+    #[test]
+    fn a_virtualized_table_hangs_rows_under_the_table() {
+        const FIRST: usize = 10;
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let table = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Table),
+                label: Some(smol_str::SmolStr::new_static("行情")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("table");
+        let header = NodeBuilder::boxed()
+            .build(&mut tree, table)
+            .expect("header");
+        let header_row = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Row),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, header)
+            .expect("header row");
+        let _header_cell = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::ColumnHeader),
+                label: Some(smol_str::SmolStr::new_static("价格")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, header_row)
+            .expect("header cell");
+        let list = NodeBuilder::boxed().build(&mut tree, table).expect("list");
+        let viewport = NodeBuilder::boxed()
+            .build(&mut tree, list)
+            .expect("viewport");
+        let mut rows = Vec::with_capacity(3);
+        let mut cells = Vec::with_capacity(3);
+        for _ in 0..3 {
+            let row = NodeBuilder::boxed()
+                .a11y(A11yOverride {
+                    role: Some(A11yRole::Row),
+                    ..A11yOverride::default()
+                })
+                .build(&mut tree, viewport)
+                .expect("row");
+            let column = NodeBuilder::boxed().build(&mut tree, row).expect("column");
+            let cells_row = NodeBuilder::boxed()
+                .build(&mut tree, column)
+                .expect("cells row");
+            let cell = NodeBuilder::boxed()
+                .a11y(A11yOverride {
+                    role: Some(A11yRole::Cell),
+                    label: Some(smol_str::SmolStr::new_static("42")),
+                    ..A11yOverride::default()
+                })
+                .build(&mut tree, cells_row)
+                .expect("cell");
+            rows.push(row);
+            cells.push(cell);
+        }
+        // 行窗口：100 个逻辑条目，只挂载 10..13（可见窗口）。
+        let mut slot = crate::interaction::VirtualSlot::new(20.0, 0);
+        slot.count = 100;
+        slot.mounted = rows
+            .iter()
+            .enumerate()
+            .map(|(offset, row)| (FIRST + offset, *row))
+            .collect();
+        tree.ensure_interaction(viewport)
+            .expect("viewport interaction")
+            .virtual_list = Some(slot);
+
+        let mut ids = A11yIds::new();
+        let mut tables = super::CollectionSemanticsCache::default();
+        let table_record = snapshot_with(&tree, table, &mut ids, &mut tables);
+        fn stable(node: NodeId, ids: &A11yIds) -> crate::a11y::A11yNodeId {
+            ids.stable_of(node).expect("stable id")
+        }
+
+        // 表：逻辑子节点 = 未被领养走的包裹层（表头 / 列表）+ 被领养的行（文档序）。
+        assert_eq!(
+            table_record.children,
+            vec![
+                stable(header, &ids),
+                stable(header_row, &ids),
+                stable(list, &ids),
+                stable(rows[0], &ids),
+                stable(rows[1], &ids),
+                stable(rows[2], &ids),
+            ],
+            "表的逻辑子节点必须是文档序里的行 + 未被领养走的包裹层"
+        );
+        assert_eq!(table_record.role, A11yRole::Table);
+        assert_eq!(
+            table_record.row_count,
+            Some(101),
+            "逻辑总行数 = 表头 1 行 + 行窗口的 100 个条目（含未挂载）"
+        );
+        assert_eq!(table_record.column_count, Some(1));
+
+        // 行：父 = Table（不是 List 行窗口），行号 = 窗口基址 + 条目下标，总数 = 逻辑总数。
+        let header_row_record = snapshot_with(&tree, header_row, &mut ids, &mut tables);
+        assert_eq!(
+            header_row_record.parent,
+            Some(table_record.id),
+            "表头行的 a11y 父也必须是 Table"
+        );
+        assert_eq!(header_row_record.row_index, Some(0), "表头行 = 第 0 行");
+        assert_eq!(header_row_record.row_count, Some(101));
+        for (offset, row) in rows.iter().enumerate() {
+            let record = snapshot_with(&tree, *row, &mut ids, &mut tables);
+            assert_eq!(
+                record.parent,
+                Some(table_record.id),
+                "虚拟化表格的行必须挂到 Table 下（List 行窗口不是 a11y 父）"
+            );
+            assert_eq!(
+                record.row_index,
+                Some(1 + FIRST + offset),
+                "行号 = 窗口基址（表头 1 行）+ 条目的逻辑下标"
+            );
+            assert_eq!(record.row_count, Some(101), "总数含未挂载的条目");
+            let accesskit_node = crate::a11y::adapter::to_accesskit(&record);
+            assert_eq!(accesskit_node.role(), accesskit::Role::Row);
+            assert_eq!(accesskit_node.row_index(), Some(1 + FIRST + offset));
+            assert_eq!(accesskit_node.row_count(), Some(101));
+        }
+
+        // 行窗口自身不再是行的 a11y 父（它的逻辑子节点为空）。
+        let viewport_record = snapshot_with(&tree, viewport, &mut ids, &mut tables);
+        assert_eq!(viewport_record.role, A11yRole::List);
+        assert!(
+            viewport_record.children.is_empty(),
+            "行被领养到 Table 后，行窗口不得再列出行"
+        );
+
+        // 单元格：父 = 行，行列号从集合结构推导（不是「物理父 + 兄弟序号」）。
+        for (offset, cell) in cells.iter().enumerate() {
+            let record = snapshot_with(&tree, *cell, &mut ids, &mut tables);
+            assert_eq!(record.parent, Some(stable(rows[offset], &ids)));
+            assert_eq!(record.row_index, Some(1 + FIRST + offset));
+            assert_eq!(record.column_index, Some(0));
+            assert_eq!(record.column_count, Some(1));
+            assert_eq!(record.row_count, Some(101));
+        }
+    }
+
+    /// E9：树项挂到最近的 `Tree` / `TreeItem` 祖先下（布局包裹层被跳过），展开 / 选中 / 禁用
+    /// 状态原样进 a11y 节点（`expanded` / `selected` / `disabled`）。
+    #[test]
+    fn tree_items_hang_under_the_tree_and_carry_their_state() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let tree_node = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Tree),
+                label: Some(smol_str::SmolStr::new_static("持仓")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("tree");
+        let panel = NodeBuilder::boxed()
+            .build(&mut tree, tree_node)
+            .expect("panel");
+        let item = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::TreeItem),
+                label: Some(smol_str::SmolStr::new_static("BTC")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, panel)
+            .expect("item");
+        let inner = NodeBuilder::boxed().build(&mut tree, item).expect("inner");
+        let child_item = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::TreeItem),
+                label: Some(smol_str::SmolStr::new_static("现货")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, inner)
+            .expect("child item");
+        let sibling = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::TreeItem),
+                label: Some(smol_str::SmolStr::new_static("ETH")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, panel)
+            .expect("sibling");
+        // 展开 / 选中 / 禁用全部走 `bind_a11y` 的动态补丁。
+        tree.set_a11y_patch(
+            item,
+            crate::a11y::A11yPatch {
+                expanded: Some(true),
+                selected: Some(true),
+                ..crate::a11y::A11yPatch::default()
+            },
+        );
+        tree.set_a11y_patch(
+            sibling,
+            crate::a11y::A11yPatch {
+                expanded: Some(false),
+                disabled: Some(true),
+                ..crate::a11y::A11yPatch::default()
+            },
+        );
+
+        let mut ids = A11yIds::new();
+        let mut tables = super::CollectionSemanticsCache::default();
+        fn stable(node: NodeId, ids: &A11yIds) -> crate::a11y::A11yNodeId {
+            ids.stable_of(node).expect("stable id")
+        }
+        let tree_record = snapshot_with(&tree, tree_node, &mut ids, &mut tables);
+        assert_eq!(tree_record.role, A11yRole::Tree);
+        assert_eq!(
+            tree_record.children,
+            vec![
+                stable(panel, &ids),
+                stable(item, &ids),
+                stable(sibling, &ids)
+            ],
+            "树项必须挂到 Tree 下（包裹层 panel 只是普通子节点）"
+        );
+        let item_record = snapshot_with(&tree, item, &mut ids, &mut tables);
+        assert_eq!(item_record.parent, Some(tree_record.id), "树项的父是 Tree");
+        assert_eq!(item_record.expanded, Some(true));
+        assert_eq!(item_record.selected, Some(true));
+        let child_record = snapshot_with(&tree, child_item, &mut ids, &mut tables);
+        assert_eq!(
+            child_record.parent,
+            Some(item_record.id),
+            "嵌套树项的父是最近的 TreeItem"
+        );
+        let sibling_record = snapshot_with(&tree, sibling, &mut ids, &mut tables);
+        assert_eq!(sibling_record.parent, Some(tree_record.id));
+        assert_eq!(sibling_record.expanded, Some(false));
+        assert!(sibling_record.disabled, "禁用状态必须进 a11y 节点");
+        let accesskit_item = crate::a11y::adapter::to_accesskit(&item_record);
+        assert_eq!(accesskit_item.role(), accesskit::Role::TreeItem);
+        assert_eq!(accesskit_item.is_expanded(), Some(true));
+        assert_eq!(accesskit_item.is_selected(), Some(true));
+        assert_eq!(
+            crate::a11y::adapter::to_accesskit(&tree_record).role(),
+            accesskit::Role::Tree
+        );
+    }
+
+    /// E9：被领养的行若其物理祖先（行窗口 / 排版盒）被隐藏，也必须隐藏 —— AccessKit 的
+    /// `hidden` 只沿 a11y 子树继承，跳过包裹层不能把隐藏语义丢掉。
+    #[test]
+    fn a_hidden_row_window_hides_the_adopted_rows() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let table = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Table),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("table");
+        let window = NodeBuilder::boxed()
+            .build(&mut tree, table)
+            .expect("window");
+        let row = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Row),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, window)
+            .expect("row");
+
+        let mut ids = A11yIds::new();
+        let mut tables = super::CollectionSemanticsCache::default();
+        assert!(
+            !snapshot_with(&tree, row, &mut ids, &mut tables).hidden,
+            "前置条件：未隐藏时行可见"
+        );
+        tree.set_a11y_patch(
+            window,
+            crate::a11y::A11yPatch {
+                hidden: Some(true),
+                ..crate::a11y::A11yPatch::default()
+            },
+        );
+        assert!(
+            snapshot_with(&tree, row, &mut ids, &mut tables).hidden,
+            "被领养跳过的物理祖先隐藏时，行必须继承隐藏语义"
+        );
+    }
+
+    /// E9b F1：表格子树里的**非行**虚拟窗口不得被当行领养。
+    ///
+    /// 旧实现把任何虚拟窗口的已挂载项无条件当行：同一节点同时出现在 `Table` 与物理父的
+    /// `children` 里（a11y 父不唯一，AccessKit consumer 的父指针被覆盖），`row_count` 还被
+    /// `slot.count` 虚增。修复后：只有已挂载项全部声明 `Row` 的窗口才是行窗口。
+    #[test]
+    fn a_non_row_virtual_window_inside_a_table_is_not_adopted_as_rows() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let table = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Table),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("table");
+        let list = NodeBuilder::boxed().build(&mut tree, table).expect("list");
+        let viewport = NodeBuilder::boxed()
+            .build(&mut tree, list)
+            .expect("viewport");
+        let mut items = Vec::with_capacity(3);
+        for _ in 0..3 {
+            // 非 Row 的挂载项（例如表内的分组列表条目）。
+            items.push(
+                NodeBuilder::boxed()
+                    .a11y(A11yOverride {
+                        role: Some(A11yRole::ListBoxOption),
+                        ..A11yOverride::default()
+                    })
+                    .build(&mut tree, viewport)
+                    .expect("item"),
+            );
+        }
+        let mut slot = crate::interaction::VirtualSlot::new(20.0, 0);
+        slot.count = 30; // 分组列表的条目数，不是表格行数
+        slot.mounted = items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (index, *item))
+            .collect();
+        tree.ensure_interaction(viewport)
+            .expect("viewport interaction")
+            .virtual_list = Some(slot);
+
+        let mut ids = A11yIds::new();
+        let mut tables = super::CollectionSemanticsCache::default();
+        let table_record = snapshot_with(&tree, table, &mut ids, &mut tables);
+        assert_eq!(
+            table_record.row_count, None,
+            "非行窗口的 slot.count 不得计入 row_count（旧实现虚增成 30）"
+        );
+        assert_eq!(table_record.column_count, None);
+        assert_eq!(
+            table_record.children,
+            vec![ids.stable_of(list).expect("list id")],
+            "非行窗口的挂载项不得被领养到 Table 下"
+        );
+        let viewport_record = snapshot_with(&tree, viewport, &mut ids, &mut tables);
+        assert_eq!(
+            viewport_record.children.len(),
+            items.len(),
+            "窗口仍按物理父子列出自条目"
+        );
+        for item in &items {
+            let record = snapshot_with(&tree, *item, &mut ids, &mut tables);
+            assert_eq!(
+                record.parent,
+                Some(viewport_record.id),
+                "挂载项的 a11y 父必须还是物理父（行窗口），不能同时挂到 Table"
+            );
+        }
+        assert_single_parent_per_node(&tree, &mut ids, &mut tables);
+    }
+
+    /// E9b F2：没有 `Table`/`Grid` 祖先的 `Row` 仍是应用违约，但引擎必须产出**自洽**的树：
+    /// `Row` 的父回落到物理父（不误领养），`Cell` 仍挂 `Row`，且 `Row.children` 必须列出它
+    /// （旧实现只列物理直系 ⇒ `Cell` 没有父可达，成为孤儿）。
+    #[test]
+    fn a_row_without_a_table_keeps_a_self_consistent_tree() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let list = NodeBuilder::boxed().build(&mut tree, root).expect("list");
+        let wrapper = NodeBuilder::boxed()
+            .build(&mut tree, list)
+            .expect("wrapper");
+        let row = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Row),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, wrapper)
+            .expect("row");
+        let cells_row = NodeBuilder::boxed()
+            .build(&mut tree, row)
+            .expect("cells row");
+        let cell = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Cell),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, cells_row)
+            .expect("cell");
+
+        let mut ids = A11yIds::new();
+        let mut tables = super::CollectionSemanticsCache::default();
+        let row_record = snapshot_with(&tree, row, &mut ids, &mut tables);
+        let cell_record = snapshot_with(&tree, cell, &mut ids, &mut tables);
+        assert_eq!(
+            row_record.parent,
+            Some(ids.stable_of(wrapper).expect("wrapper id")),
+            "无 Table/Grid 的 Row 不得被误领养（父 = 物理父）"
+        );
+        assert_eq!(
+            cell_record.parent,
+            Some(row_record.id),
+            "Cell 的 a11y 父是最近的 Row（没有 Table 也一样）"
+        );
+        assert_eq!(
+            row_record.children,
+            vec![
+                ids.stable_of(cells_row).expect("cells row id"),
+                cell_record.id
+            ],
+            "Row 的 children 必须列出被领养的 Cell（否则 Cell 无父可达）"
+        );
+        assert_eq!(row_record.row_index, None, "没有表格就没有行号可言");
+        assert_single_parent_per_node(&tree, &mut ids, &mut tables);
+    }
+
+    /// E9b F3：`TreeItem` 内嵌 `Tree` 时，内层树的树项必须由**最近的** `Tree` 的索引给出。
+    ///
+    /// 旧实现取「最外层 Tree」：外层索引在嵌套 `Tree` 处停止，内层树项查不到自己的 children
+    /// ⇒ 子项漏列（孤儿）。修复后集合边界不穿越：每棵 `Tree` 有独立索引。
+    #[test]
+    fn a_nested_tree_inside_a_tree_item_indexes_its_own_items() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let outer = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Tree),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("outer tree");
+        let outer_item = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::TreeItem),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, outer)
+            .expect("outer item");
+        let inner = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Tree),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, outer_item)
+            .expect("inner tree");
+        let inner_item = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::TreeItem),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, inner)
+            .expect("inner item");
+        let wrapper = NodeBuilder::boxed()
+            .build(&mut tree, inner_item)
+            .expect("wrapper");
+        let nested_item = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::TreeItem),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, wrapper)
+            .expect("nested item");
+
+        let mut ids = A11yIds::new();
+        let mut tables = super::CollectionSemanticsCache::default();
+        let outer_record = snapshot_with(&tree, outer, &mut ids, &mut tables);
+        let outer_item_record = snapshot_with(&tree, outer_item, &mut ids, &mut tables);
+        let inner_record = snapshot_with(&tree, inner, &mut ids, &mut tables);
+        let inner_item_record = snapshot_with(&tree, inner_item, &mut ids, &mut tables);
+        let nested_record = snapshot_with(&tree, nested_item, &mut ids, &mut tables);
+        assert_eq!(
+            outer_record.children,
+            vec![outer_item_record.id],
+            "外层 Tree 只列自己的树项"
+        );
+        assert_eq!(
+            outer_item_record.children,
+            vec![inner_record.id],
+            "嵌套 Tree 的 a11y 父是最近的 TreeItem（物理父）"
+        );
+        assert_eq!(
+            inner_record.children,
+            vec![inner_item_record.id],
+            "嵌套 Tree 有自己的索引：只列自己的树项"
+        );
+        assert_eq!(
+            inner_item_record.children,
+            vec![
+                ids.stable_of(wrapper).expect("wrapper id"),
+                nested_record.id
+            ],
+            "内层树项的 children 必须完整（包裹层 + 被领养的嵌套树项）"
+        );
+        assert_eq!(nested_record.parent, Some(inner_item_record.id));
+        assert_single_parent_per_node(&tree, &mut ids, &mut tables);
     }
 }

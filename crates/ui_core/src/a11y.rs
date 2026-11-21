@@ -17,7 +17,7 @@ use crate::{
 
 /// a11y 角色（引擎侧，`accesskit::Role` 的子集）。
 ///
-/// 只包含引擎**真实会产生或应用会显式声明**的角色（表头 / 文本运行 / 表格三级都在内）；
+/// 只包含引擎**真实会产生或应用会显式声明**的角色（表头 / 文本运行 / 表格三级 / 树 / 树项都在内）；
 /// 不含 `Unknown`，也不含 130+ 个 HTML/Doc 角色 —— 加变体必须同时给 `a11y::mapping` 的穷举
 /// `match` 补分支（编译期强制，不会静默落到 `Unknown`），并把变体加进 [`A11yRole::ALL`]
 /// （`every_role_is_included_exactly_once_in_all` 用它做编译期锚定；不要在任何地方写死角色个数）。
@@ -63,12 +63,29 @@ pub enum A11yRole {
     Table,
     /// 网格。
     Grid,
-    /// 表格行 / 网格行（**仅**真实表格：`Row` 必须位于 `Table`/`Grid`/`TreeGrid` 内）。
+    /// 树（可展开的层级集合；`Tree` 的子节点是 `TreeItem`，`TreeItem` 可再嵌套 `TreeItem`）。
+    ///
+    /// 语义对齐 `accesskit::Role::Tree`（Windows `UIA_TreeControlTypeId` / macOS
+    /// `NSAccessibilityOutlineRole` / AT-SPI `tree`）。层级由引擎**自动建立**：树项在 a11y 树里
+    /// 挂到最近的 `Tree` / `TreeItem` 祖先下，不受布局包裹层影响（虚拟化树的项窗口直接挂到
+    /// `Tree` 下，`List` 容器不再成为树项的父）。
+    Tree,
+    /// 表格行 / 网格行（**仅**真实表格：`Row` 必须位于 `Table`/`Grid` 内）。
     /// 虚拟列表的行仍用 `ListBoxOption`，位置走 `pos_in_set` / `size_of_set`。
     ///
-    /// 表格语境下的 `row_index` 由引擎从"在父节点 children 里的序号"**自动推导**（应用显式
-    /// 声明优先），`row_count` 由表节点的行数推导 —— 交易表格不必逐行手填。
+    /// **父节点规则**：引擎把 `Row` 在 a11y 树里挂到最近的 `Table`/`Grid` 祖先下 ——
+    /// 虚拟化表格的行窗口（`List` 容器）只是布局实现细节，不会成为行的 a11y 父
+    /// （见 `a11y::tree` 的"集合语义"）。
+    ///
+    /// 表格语境下的 `row_index` 由引擎从行在表里的**逻辑序号**自动推导（应用显式声明优先）；
+    /// 虚拟化表格按「行窗口基址 + 已挂载条目的逻辑下标」推导，`row_count` 是**逻辑总行数**
+    /// （`slot.count` + 行窗口之外的行），不是已挂载行数 —— 交易表格不必逐行手填。
     Row,
+    /// 树项（`Tree` / `TreeItem` 的子节点；层级与展开态是它的核心语义）。
+    ///
+    /// 父节点规则同 [`Self::Row`]：挂到最近的 `Tree` / `TreeItem` 祖先下；展开 / 选中 / 禁用
+    /// 走 `A11yPatch::{expanded, selected, disabled}`（`bind_a11y`）。
+    TreeItem,
     /// 单元格（表格 / 网格里的格子，配合 `row_index` / `column_index`）。
     ///
     /// `column_index` / `row_index` 同样自动推导：列 = 在父行 children 里的序号，行 = 父行的行号。
@@ -110,7 +127,7 @@ impl A11yRole {
     /// （`a11y::mapping`）用一个**穷举 `match`** 给每个变体计数并与本数组求和比对 ——
     /// 少列一个变体 ⇒ 求和偏小 ⇒ 测试红；加一个变体忘了加进 `ALL` ⇒ 编译期
     /// `non-exhaustive patterns` 先报错。这正是 R13-11 要求的"手写数组不再假绿"。
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 34] = [
         Self::Window,
         Self::Application,
         Self::GenericContainer,
@@ -130,7 +147,9 @@ impl A11yRole {
         Self::ListBoxOption,
         Self::Table,
         Self::Grid,
+        Self::Tree,
         Self::Row,
+        Self::TreeItem,
         Self::Cell,
         Self::ColumnHeader,
         Self::RowHeader,
@@ -587,9 +606,13 @@ pub struct A11yNode {
     pub placeholder: Option<SmolStr>,
     /// 标题层级（`set_level`）。
     pub level: Option<usize>,
-    /// 引擎侧的**直接**子节点（未过滤）。
+    /// 引擎侧的**逻辑**子节点（a11y 树，未过滤）。
+    ///
+    /// 一般情况下 = 物理子节点；**集合语义**（`Table`/`Grid`/`Tree`/`Row`/`TreeItem`）下，
+    /// 被集合领养的后代（表行、单元格、树项）会挂到最近的集合祖先下 —— 布局包裹层
+    /// （表格的虚拟行窗口 `List`、单元格的排版盒）不是它们的 a11y 父。见 [`Self::parent`]。
     pub children: Vec<A11yNodeId>,
-    /// 父节点。
+    /// 父节点（a11y 树口径：集合语义下是逻辑父，见 [`Self::children`]）。
     pub parent: Option<A11yNodeId>,
 }
 

@@ -2,11 +2,11 @@
 //!
 //! 这一层回答的是「a11y 修复有没有被**能失败**的测试钉住」，而不是"引擎看起来对不对"：
 //!
-//! - [`ShadowTree`]：把一串 `accesskit::TreeUpdate` 按 AccessKit 的四条硬契约逐步应用
-//!   （父必须已在树里或同批 / `children` 必须可达 / 被删子节点及其后代不得再出现 / `focus`
-//!   必须指向应用后的树里存在的节点）。R13-10 指出全仓没有一处 `TreeUpdate` 端到端断言，
-//!   而这四条恰好对应"脏位漏标、祖先漏发、节点删了还在批里、焦点指向不存在的节点"四类
-//!   "测试全绿但 AT 崩"的 bug。
+//! - [`ShadowTree`]：把一串 `accesskit::TreeUpdate` 按 AccessKit 的五条硬契约逐步应用
+//!   （父必须已在树里或同批 / `children` 必须可达 / 每个节点只有一个父 / 被删子节点及其后代
+//!   不得再出现 / `focus` 必须指向应用后的树里存在的节点）。R13-10 指出全仓没有一处
+//!   `TreeUpdate` 端到端断言，而这五条恰好对应"脏位漏标、祖先漏发、父指针被双父覆盖、节点删了
+//!   还在批里、焦点指向不存在的节点"五类 "测试全绿但 AT 崩" 的 bug。
 //! - [`tree_update_snapshot`]：把 `TreeUpdate` 序列化成**确定性文本**（角色/名字/值/结构/
 //!   焦点/动作/文本长度/排序/滚动/自定义动作），供快照测试审查语义变更。文本而非二进制：
 //!   diff 可读、评审能看到"这一行 a11y 变了什么"。
@@ -128,6 +128,28 @@ impl ShadowTree {
                     return Err(format!(
                         "node {id:?} lists {child:?} in children, but that node is neither in \
                          the tree nor in this batch"
+                    ));
+                }
+            }
+        }
+
+        // ②b 父唯一性：AccessKit 的树要求每个节点只有一个父。同一 id 出现在两个父的 `children`
+        // 里时，consumer 的 parent 指针会被后处理者覆盖（结构与阅读顺序错乱）；旧的"有某个父"
+        // 断言放过了这种双父 bug（E9b F1），这里作为硬契约钉死。
+        let mut parents: ahash::HashMap<AkNodeId, AkNodeId> = ahash::HashMap::default();
+        let kept = self
+            .nodes
+            .iter()
+            .filter(|(id, _)| !batch.contains(id))
+            .map(|(id, node)| (*id, node.children.as_slice()));
+        let updated = update.nodes.iter().map(|(id, node)| (*id, node.children()));
+        for (parent, children) in kept.chain(updated) {
+            for child in children {
+                if let Some(previous) = parents.insert(*child, parent)
+                    && previous != parent
+                {
+                    return Err(format!(
+                        "node {child:?} has multiple parents: {previous:?} and {parent:?}"
                     ));
                 }
             }
@@ -526,6 +548,32 @@ mod tests {
         let update = incremental(vec![(AkNodeId(9), node(Role::Button, &[]))], AkNodeId(1));
         let error = shadow.apply(&update).expect_err("孤儿必须被拒绝");
         assert!(error.contains("no parent"), "{error}");
+    }
+
+    /// 契约 ②b：同一节点不得同时挂在两个父下（"双父"会让 consumer 的 parent 指针被覆盖）。
+    #[test]
+    fn a_node_with_two_parents_is_rejected() {
+        let mut shadow = ShadowTree::new();
+        shadow
+            .apply(&full(
+                vec![
+                    (AkNodeId(1), node(Role::Window, &[AkNodeId(2)])),
+                    (AkNodeId(2), node(Role::Button, &[])),
+                ],
+                AkNodeId(1),
+            ))
+            .expect("first");
+        // 同一笔里 3 既挂在 root 下、又挂在 2 下 ⇒ 双父，非法。
+        let update = incremental(
+            vec![
+                (AkNodeId(1), node(Role::Window, &[AkNodeId(2), AkNodeId(3)])),
+                (AkNodeId(2), node(Role::Button, &[AkNodeId(3)])),
+                (AkNodeId(3), node(Role::Label, &[])),
+            ],
+            AkNodeId(1),
+        );
+        let error = shadow.apply(&update).expect_err("双父必须被拒绝");
+        assert!(error.contains("multiple parents"), "{error}");
     }
 
     /// 契约 ④：被删子节点仍在本批出现必须被拒绝（"节点删了还在批里"）。
