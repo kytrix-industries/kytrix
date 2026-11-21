@@ -1218,6 +1218,9 @@ fn paint_geometry_node(
         }
         // 旧块 bounds 必须在清空 lane 之前记下（内容收缩 / 块删除时旧像素要重画）。
         let previous = context.baked_scratch.get(chunk).copied();
+        // 「清空前这条 lane 有没有图元」只用于 test-support 的 lane 日志（Rebuilt/Allocated
+        // 区分），所以查询与消费方同一 feature 编译：默认特性构建下不留未使用变量。
+        #[cfg(feature = "test-support")]
         let had_primitives = context
             .scene
             .lane_primitives(lane)
