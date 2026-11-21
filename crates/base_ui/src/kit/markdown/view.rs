@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use smol_str::SmolStr;
+use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     math::{Point, Size},
     node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
@@ -103,12 +103,6 @@ impl MarkdownStyle {
         }
     }
 
-    /// 改正文字号（相对主题档位的覆盖）。
-    pub fn with_body_size(mut self, body_size: f32) -> Self {
-        self.body_size = body_size;
-        self
-    }
-
     /// 一行正文的行高（像素；空行占位用它）。
     pub fn line_height(&self) -> f32 {
         self.body_size * self.line_height
@@ -171,27 +165,6 @@ impl ImagePaintSource for ResourceImages<'_> {
         Some(InlineBoxPaint::Image {
             resource: image.id,
             modulation: Color::WHITE,
-        })
-    }
-}
-
-/// 不依赖资产通路的图片画法：一律画占位方块。
-#[derive(Clone, Copy, Debug)]
-pub struct PlaceholderImages {
-    /// 占位色。
-    pub color: Color,
-}
-
-impl ImagePaintSource for PlaceholderImages {
-    fn paint_for(
-        &mut self,
-        _path: &str,
-        _format: InlineImageFormat,
-        _size: Size,
-    ) -> Option<InlineBoxPaint> {
-        Some(InlineBoxPaint::Quad {
-            color: self.color,
-            corner_radius: [2.0; 4],
         })
     }
 }
@@ -259,6 +232,10 @@ impl MarkdownHandles {
     /// 命中链路：节点级几何（`Node::layout().bounds`）→ 点转节点局部坐标 →
     /// 引擎 E5 `Window::text_byte_index_at`（簇边界由 parley 决定）→ 自持的链接字节区间。
     /// 引擎错误（未成形 / 非文本 / 快照过期）一律按"未命中"处理，不 panic。
+    ///
+    /// **已知边界（登记 E2b，不扩引擎）**：纯图片链接没有字节区间（行内图片不占文本字节），
+    /// 因此 `link_at` 无法命中图片；`span.range` 是半开区间，点在最后一个字符右半边时 E5 返回
+    /// `byte == span.end`，同样不命中（E5 边界语义）。
     pub fn link_at(&self, window: &Window, point: Point) -> Option<LinkId> {
         for block in &self.text_blocks {
             if block.links.is_empty() {
@@ -317,7 +294,7 @@ impl MarkdownView {
 
     /// 挂载：行内图片画占位方块（资源通路未接线时的默认）。
     pub fn build(&self, tree: &mut NodeTree, parent: NodeId) -> MarkdownHandles {
-        let mut images = PlaceholderImages {
+        let mut images = super::inline_flow::PlaceholderImagePaint {
             color: self.style.image_placeholder,
         };
         self.build_with_images(tree, parent, &mut images)
@@ -378,16 +355,17 @@ impl BuildCtx<'_> {
     }
 
     /// 一列块：块间距由"上一块是不是空行"决定（与旧 `MarkdownState::render` 同一规则）。
+    ///
+    /// 空行本身不占间距（它自己画一行空行），但**标题的额外上间距与空行无关**：旧实现里空行
+    /// 之后的非首块标题仍然拿 `BLOCK_GAP + HEADING_SPACE_ABOVE`，这里保持一致。
     fn build_blocks(&mut self, tree: &mut NodeTree, parent: NodeId, blocks: &[MarkdownBlock]) {
-        let mut previous_blank = false;
         for (index, block) in blocks.iter().enumerate() {
             let gap = match block {
                 MarkdownBlock::BlankLine => 0.0,
-                _ if index == 0 || previous_blank => 0.0,
+                _ if index == 0 => 0.0,
                 MarkdownBlock::Heading { .. } => BLOCK_GAP + HEADING_SPACE_ABOVE,
                 _ => BLOCK_GAP,
             };
-            previous_blank = matches!(block, MarkdownBlock::BlankLine);
             self.build_block(tree, parent, block, gap, index);
         }
     }
@@ -408,8 +386,8 @@ impl BuildCtx<'_> {
             .margin_sides(gap, 0.0, 0.0, 0.0)
             .build();
         let id = match block {
-            MarkdownBlock::BlankLine => format!("MARKDOWN_BLANK_{index}"),
-            _ => format!("MARKDOWN_BLOCK_{}", self.next_index()),
+            MarkdownBlock::BlankLine => format_smolstr!("MARKDOWN_BLANK_{index}"),
+            _ => format_smolstr!("MARKDOWN_BLOCK_{}", self.next_index()),
         };
         let Ok(wrapper) = NodeBuilder::boxed().style(style).id(id).build(tree, parent) else {
             return;
@@ -585,15 +563,15 @@ impl BuildCtx<'_> {
                 return;
             };
             let marker = if ordered {
-                format!("{}.", start + index as u64)
+                format_smolstr!("{}.", start + index as u64)
             } else {
-                "•".to_string()
+                SmolStr::new_static("•")
             };
             let marker_style = TextStyle::new(self.style().body_size)
                 .with_color(self.style().muted)
                 .with_alignment(TextAlign::Right)
                 .with_wrap(TextWrap::NoWrap);
-            let _ = NodeBuilder::text(SmolStr::new(&marker), marker_style)
+            let _ = NodeBuilder::text(marker, marker_style)
                 .style(StyleBuilder::new().width(LIST_MARKER_WIDTH).build())
                 .id("MARKDOWN_LIST_MARKER")
                 .build(tree, row);
@@ -685,7 +663,7 @@ mod tests {
         text::TextStyle,
     };
 
-    use super::{MarkdownStyle, MarkdownView, PlaceholderImages, RichText, rich_text, text_align};
+    use super::{MarkdownStyle, MarkdownView, RichText, rich_text, text_align};
     use crate::{
         kit::markdown::{
             document::{
@@ -1038,7 +1016,7 @@ mod tests {
 
     #[test]
     fn placeholder_images_are_used_by_default_build() {
-        let mut images = PlaceholderImages {
+        let mut images = crate::kit::markdown::inline_flow::PlaceholderImagePaint {
             color: Theme::of(Appearance::Light).role(crate::theme::role::Role::SurfaceControl),
         };
         let paint = crate::kit::markdown::inline_flow::ImagePaintSource::paint_for(
@@ -1117,5 +1095,75 @@ mod tests {
             .by_selector(Selector::Id("MARKDOWN"))
             .expect("根节点");
         assert_eq!(by_id, handles.root);
+    }
+
+    /// 空行之后的非首块标题仍然拿到额外上间距（旧实现语义；P2-3 审查 M4 的回归）。
+    ///
+    /// 几何：空白行 wrapper 自己高度 = 一行；标题的 `margin_top` 必须是
+    /// `BLOCK_GAP + HEADING_SPACE_ABOVE`，而普通段落只有 `BLOCK_GAP` —— 空行不吞掉标题的额外间距。
+    #[test]
+    fn a_heading_after_a_blank_line_keeps_the_extra_space_above_it() {
+        let heading = || MarkdownBlock::Heading {
+            level: HeadingLevel::H1,
+            pieces: Arc::from(vec![text("Title")]),
+        };
+        let heading_doc = document(vec![heading(), MarkdownBlock::BlankLine, heading()]);
+        let view = MarkdownView::new(heading_doc, style());
+        let (app, handles) = mount(&view);
+        let blank = app
+            .probe()
+            .by_selector(Selector::Id("MARKDOWN_BLANK_1"))
+            .expect("空行 wrapper");
+        let blank_bounds = app.probe().bounds(blank).expect("空行有布局盒");
+        let first = app
+            .probe()
+            .bounds(handles.text_blocks[0].node)
+            .expect("标题 1");
+        let second = app
+            .probe()
+            .bounds(handles.text_blocks[1].node)
+            .expect("标题 2");
+        assert!(
+            first.origin.y < blank_bounds.origin.y,
+            "标题 1 在空行之前：{first:?} vs {blank_bounds:?}"
+        );
+        let heading_gap = second.origin.y - (blank_bounds.origin.y + blank_bounds.size.height);
+        assert!(
+            (heading_gap - (super::BLOCK_GAP + super::HEADING_SPACE_ABOVE)).abs() < 0.01,
+            "空行后标题的上间距 = {}，期望 {}",
+            heading_gap,
+            super::BLOCK_GAP + super::HEADING_SPACE_ABOVE
+        );
+
+        let paragraph_doc = document(vec![
+            heading(),
+            MarkdownBlock::BlankLine,
+            paragraph(vec![text("Body")]),
+        ]);
+        let paragraph_view = MarkdownView::new(paragraph_doc, style());
+        let (paragraph_app, paragraph_handles) = mount(&paragraph_view);
+        let paragraph_blank = paragraph_app
+            .probe()
+            .by_selector(Selector::Id("MARKDOWN_BLANK_1"))
+            .expect("空行 wrapper");
+        let paragraph_blank_bounds = paragraph_app
+            .probe()
+            .bounds(paragraph_blank)
+            .expect("空行有布局盒");
+        let body = paragraph_app
+            .probe()
+            .bounds(paragraph_handles.text_blocks[1].node)
+            .expect("段落");
+        let body_gap =
+            body.origin.y - (paragraph_blank_bounds.origin.y + paragraph_blank_bounds.size.height);
+        assert!(
+            (body_gap - super::BLOCK_GAP).abs() < 0.01,
+            "空行后普通段落的上间距 = {body_gap}，期望 {}",
+            super::BLOCK_GAP
+        );
+        assert!(
+            heading_gap > body_gap,
+            "标题的额外上间距必须大于普通段落：{heading_gap} vs {body_gap}"
+        );
     }
 }

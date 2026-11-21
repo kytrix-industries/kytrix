@@ -2273,3 +2273,137 @@ fn the_deep_nesting_guard_applies_inside_containers() {
         "nesting within the limit inside a quote is still parsed"
     );
 }
+
+/// IR 的最大块容器深度（引用 / 列表项各算一层）。
+fn max_container_depth(block: &MarkdownBlock) -> usize {
+    let children: Vec<&MarkdownBlock> = match block {
+        MarkdownBlock::Quote { blocks } => blocks.iter().collect(),
+        MarkdownBlock::List { items, .. } => {
+            items.iter().flat_map(|item| item.blocks.iter()).collect()
+        }
+        _ => return 0,
+    };
+    let own = usize::from(matches!(
+        block,
+        MarkdownBlock::Quote { .. } | MarkdownBlock::List { .. }
+    ));
+    own + children
+        .into_iter()
+        .map(max_container_depth)
+        .max()
+        .unwrap_or(0)
+}
+
+/// 文档里最深的那条引用链有多少层（列表不算）。
+fn quote_depth(block: &MarkdownBlock) -> usize {
+    match block {
+        MarkdownBlock::Quote { blocks } => 1 + blocks.iter().map(quote_depth).max().unwrap_or(0),
+        MarkdownBlock::List { items, .. } => items
+            .iter()
+            .flat_map(|item| item.blocks.iter())
+            .map(quote_depth)
+            .max()
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// 1000 层嵌套引用（约 2 KB）不会打爆递归栈：块递归有 `MAX_BLOCK_NESTING = 64` 上限，超过
+/// 上限的容器子树拍平成一个普通段落。回归：这条输入曾让进程以 `STATUS_STACK_OVERFLOW` abort。
+#[test]
+fn deeply_nested_quotes_are_capped_instead_of_overflowing_the_stack() {
+    let source = format!("{}deep", "> ".repeat(1_000));
+    let document = parse(&source);
+
+    assert_eq!(document.blocks.len(), 1, "顶层只有一个引用块");
+    assert!(
+        document.plain_text().contains("deep"),
+        "超限后文字仍然可见（降级为普通段落），而不是整段丢失"
+    );
+    assert!(
+        max_container_depth(&document.blocks[0]) <= 64,
+        "IR 的容器深度必须有界：{}",
+        max_container_depth(&document.blocks[0])
+    );
+}
+
+/// 恰好 64 层引用仍按容器结构解析（边界本身没有被提前降级）。
+#[test]
+fn quotes_exactly_at_the_block_nesting_limit_stay_structured() {
+    let source = format!("{}deep", "> ".repeat(64));
+    let document = parse(&source);
+
+    assert_eq!(
+        quote_depth(&document.blocks[0]),
+        64,
+        "64 层引用全部保留为 Quote 结构"
+    );
+    assert!(document.plain_text().contains("deep"));
+}
+
+/// 越过上限（65 层引用）时第 65 层不再成为容器：引用链停在 64 层，文字在最内层拍平为普通段落。
+#[test]
+fn quotes_past_the_block_nesting_limit_degrade_to_flat_text() {
+    let source = format!("{}deep", "> ".repeat(65));
+    let document = parse(&source);
+
+    assert_eq!(
+        quote_depth(&document.blocks[0]),
+        64,
+        "容器深度停在 MAX_BLOCK_NESTING = 64 层"
+    );
+    let mut block = &document.blocks[0];
+    while let MarkdownBlock::Quote { blocks } = block {
+        match blocks.as_ref() {
+            [MarkdownBlock::Quote { .. }] => block = &blocks[0],
+            [MarkdownBlock::Paragraph { pieces, .. }] => {
+                assert_eq!(
+                    pieces
+                        .iter()
+                        .filter_map(|piece| match piece {
+                            MarkdownPiece::Text { text, .. } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                    "deep"
+                );
+                return;
+            }
+            other => panic!("unexpected deepest quote content: {other:?}"),
+        }
+    }
+    panic!("expected a nested quote chain");
+}
+
+/// 深嵌套列表同样有界：300 层 `- ` 不会打爆栈，文字仍可见。
+#[test]
+fn deeply_nested_lists_are_capped_instead_of_overflowing_the_stack() {
+    let source = format!("{}deep", "- ".repeat(300));
+    let document = parse(&source);
+
+    assert!(
+        document.plain_text().contains("deep"),
+        "超限后列表文字仍然可见"
+    );
+    assert!(
+        max_container_depth(&document.blocks[0]) <= 64,
+        "IR 的列表深度必须有界：{}",
+        max_container_depth(&document.blocks[0])
+    );
+}
+
+/// 超限降级不会吞掉兄弟块：深引用后面的普通段落照常产出。
+#[test]
+fn degrading_an_over_deep_container_keeps_its_siblings() {
+    let deep = "> ".repeat(100);
+    let source = format!("{deep}deep\n\nsibling");
+    let document = parse(&source);
+
+    assert_eq!(
+        document.blocks.len(),
+        3,
+        "深引用 + 空行 + 兄弟段落（顶层空行照旧成为一个 BlankLine 块）"
+    );
+    assert!(document.plain_text().contains("deep"));
+    assert!(document.plain_text().contains("sibling"));
+}

@@ -33,15 +33,29 @@
 //!   删除并保证**永不切断 UTF-8**；组合附加符号 / ZWJ 序列会被拆成多个 `char`。
 //! - **上下方向键**：视觉行不是公开 API（`ShapedLine` 只在 crate 内可达），因此 `↑/↓` 不消费
 //!   （不伪造「跳到段首/段尾」的语义）。左右方向键 / Home / End / Ctrl+Home / Ctrl+End 可用。
-//! - **按住拖选**：引擎的指针捕获/拖拽 Action 面向「拖拽有业务语义的控件」；本模块只做点击
-//!   定位，不做按住拖选。
+//!   旧 gpui-base 在单行输入上同样早退，因此当前产品没有回归。
 //! - **密码框 IME 语义**：Linux 的 `Window::set_ime_content_type(ImeContentType::Password)`
 //!   是窗口级接口且属平台批次，未接线。
+//!
+//! # P2-3b 追加能力（审查修复 + 用户裁决）
+//!
+//! - **undo/redo**：快照式、有界历史（100 步）；Ctrl/Cmd+Z 撤销、Ctrl/Cmd+Shift+Z / Ctrl/Cmd+Y
+//!   重做。组合开始时的选区删除与提交合并成一步。
+//! - **拖选**：节点 `on_drag` 借引擎指针捕获，`Start/Move/End/Cancel` 用 `App::drag` 的
+//!   `origin/current` 换算到文本内容坐标。
+//! - **双击选词 / 三击选行**：按字符类别（词字符 / 空白 / 其它）取极大连续段；CJK 连续段为一词。
+//! - **单行水平滚动**：单行文本放进 `*input.viewport*` 横向滚动容器，按 caret 可见性 reveal。
+//! - **单行清洗**：`insert` / 粘贴 / IME 提交 / `set_text` 丢弃 `\r` / `\n` / `\t`。
+//! - **自动重复**：编辑/导航键处理 `repeat`；`Enter`/Submit 与命令快捷键只首按。
+//! - **运行时更新**：[`InputNode::update_value`] / [`InputNode::update_placeholder`]。
 //! - **多输入同窗的 IME 开关**：引擎的 `set_ime_enabled` 是**窗口级**状态。本模块只在
 //!   「本输入框失焦」时关闭、在聚焦时打开，因此同窗多个输入框时以**最后同步者**为准；外壳应
 //!   在焦点转移的那一轮按「先同步失焦者、后同步得焦者」调用 `sync`（或只同步聚焦控件）。
 
-use std::{ops::Range, sync::Arc};
+use std::{
+    ops::Range,
+    sync::{Arc, OnceLock},
+};
 
 use smol_str::{SmolStr, format_smolstr};
 use taffy::style::LengthPercentageAuto;
@@ -51,7 +65,9 @@ use ui_core::{
     event::{
         self, Action, ActionSource, Event, ImeEvent, InputEvent, KeyCode, KeyState, Modifiers,
     },
-    math::{Point, Rect},
+    interaction::{ScrollAxis, ScrollConfig, ScrollHandle},
+    layout::hit_test::HitResult,
+    math::{Point, Rect, Size},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -77,6 +93,8 @@ use crate::{
 const BULLET: char = '•';
 /// 输入框圆角（与旧 `rounded_sm` 的 4 px 一致；主题 token 暂无圆角档位）。
 const CORNER_RADIUS: f32 = 4.0;
+/// 撤销历史最多保留多少步（快照式；超过时丢最旧的一步）。
+const UNDO_HISTORY_LIMIT: usize = 100;
 
 /// 一节输入框的构造参数（挂载期常量；主题/尺寸变化 = 重新挂载）。
 #[derive(Clone, Debug)]
@@ -162,6 +180,16 @@ struct Composition {
     text: String,
     /// 组合串内插入点（UTF-16 码元，相对 `text`）；`None` = 画在末尾。
     caret_utf16: Option<u32>,
+    /// 组合开始前的正文快照：组合开始会删掉选区，提交时这一步删除与随后的提交算**一次**编辑。
+    before: EditSnapshot,
+}
+
+/// 一次可撤销编辑的快照（只含正文与选区，不含焦点/错误/组合）。
+#[derive(Clone, Debug, PartialEq)]
+struct EditSnapshot {
+    text: String,
+    caret: usize,
+    anchor: usize,
 }
 
 /// 输入框的编辑状态（纯数据；`Signal<InputState>` 是唯一真值）。
@@ -186,6 +214,14 @@ pub struct InputState {
     focused: bool,
     /// 最近一次校验/应用写入的错误。
     error: Option<InputError>,
+    /// 撤销栈（编辑前快照；有界，见 [`UNDO_HISTORY_LIMIT`]）。
+    undo: Vec<EditSnapshot>,
+    /// 重做栈（撤销出来的快照；任何新编辑清空）。
+    redo: Vec<EditSnapshot>,
+    /// 是否正在按住拖选。
+    dragging: bool,
+    /// 拖选起点（文本内容坐标；指针移出窗口时按 `Drag` 的 delta 兜底）。
+    drag_origin: Option<Point>,
 }
 
 impl InputState {
@@ -201,6 +237,10 @@ impl InputState {
             composition: None,
             focused: false,
             error: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            dragging: false,
+            drag_origin: None,
         }
     }
 
@@ -269,14 +309,22 @@ impl InputState {
     /// 插入文本（替换选区；先提交组合）。`readonly` / `disabled` 直接拒绝；`max_length`
     /// 按字符裁剪（永不 panic、永不切开字符）。
     ///
+    /// 单行输入会**清洗**掉换行与制表符（`\r` / `\n` / `\t`）：粘贴多行文本、IME 提交与
+    /// 程序化插入走同一条路径。这次插入作为**一步**进入撤销历史（组合提交与插入合并）。
+    ///
     /// 返回正文/选区是否变化。
     pub fn insert(&mut self, spec: &InputSpec, text: &str) -> bool {
         if spec.disabled || spec.readonly {
             return false;
         }
-        let committed = self.commit_composition(spec);
-        let replaced = self.replace_selection_with(spec, text);
-        committed || replaced
+        let before = self
+            .composition
+            .as_ref()
+            .map_or_else(|| self.snapshot(), |composition| composition.before.clone());
+        let mut changed = self.commit_composition(spec);
+        changed |= self.replace_selection_with(spec, text);
+        self.finish_edit(before, changed);
+        changed
     }
 
     /// 退格：先消掉组合（不删组合文本），否则删选区，再否则删光标前一个 `char`。
@@ -290,7 +338,10 @@ impl InputState {
         let selection = self.selection_range();
         let (start, end) = (selection.start, selection.end);
         if start != end {
-            return self.delete_selection();
+            let before = self.snapshot();
+            let changed = self.delete_selection();
+            self.finish_edit(before, changed);
+            return changed;
         }
         let caret = snap_char_boundary(&self.text, self.caret);
         self.caret = caret;
@@ -298,10 +349,12 @@ impl InputState {
         let Some(prev) = prev_char_boundary(&self.text, caret) else {
             return false;
         };
+        let before = self.snapshot();
         self.text.replace_range(prev..caret, "");
         self.caret = prev;
         self.anchor = prev;
         self.error = None;
+        self.finish_edit(before, true);
         true
     }
 
@@ -316,7 +369,10 @@ impl InputState {
         let selection = self.selection_range();
         let (start, end) = (selection.start, selection.end);
         if start != end {
-            return self.delete_selection();
+            let before = self.snapshot();
+            let changed = self.delete_selection();
+            self.finish_edit(before, changed);
+            return changed;
         }
         let caret = snap_char_boundary(&self.text, self.caret);
         self.caret = caret;
@@ -324,8 +380,10 @@ impl InputState {
         let Some(next) = next_char_boundary(&self.text, caret) else {
             return false;
         };
+        let before = self.snapshot();
         self.text.replace_range(caret..next, "");
         self.error = None;
+        self.finish_edit(before, true);
         true
     }
 
@@ -409,20 +467,21 @@ impl InputState {
 
     /// 提交组合文本：`text` 替换整个当前组合串并进入正文（先按 `max_length` 裁剪）。
     ///
-    /// 没有组合时等价于 [`InputState::insert`]。
+    /// 没有组合时等价于 [`InputState::insert`]。提交与组合开始时的选区删除算**一步**撤销。
     pub fn ime_commit(&mut self, spec: &InputSpec, text: &str) -> bool {
         if spec.disabled || spec.readonly {
             self.ime_cancel();
             return false;
         }
-        let start = self.composition.as_ref().map(|comp| comp.start);
-        if let Some(start) = start {
-            self.composition = None;
-            self.caret = start;
-            self.anchor = start;
-        }
-        let inserted = self.insert(spec, text);
-        start.is_some() || inserted
+        let Some(composition) = self.composition.take() else {
+            return self.insert(spec, text);
+        };
+        let before = composition.before;
+        self.caret = composition.start;
+        self.anchor = composition.start;
+        let changed = self.replace_selection_with(spec, text);
+        self.finish_edit(before, changed);
+        true
     }
 
     /// 取消组合（丢弃 preedit，插入点回到组合起点）。
@@ -451,7 +510,10 @@ impl InputState {
         if !self.copy(app, spec) {
             return false;
         }
-        self.delete_selection()
+        let before = self.snapshot();
+        let changed = self.delete_selection();
+        self.finish_edit(before, changed);
+        changed
     }
 
     /// 粘贴剪贴板文本（先提交组合；`readonly` / `disabled` ⇒ `false`）。
@@ -475,7 +537,9 @@ impl InputState {
 
     /// 用 `max_length` + 空值做一次校验并写入错误态。
     ///
-    /// 只做这两条（应用自己的领域校验经 [`InputState::set_error`] 写入）。
+    /// 只做这两条（应用自己的领域校验经 [`InputState::set_error`] 写入）。**空值校验是无条件的**
+    /// （没有 `required` 概念）：可选字段的调用方不要调用 `validate`（或自行忽略 `Empty`）；
+    /// `TooLong` 也只在初始值超限 / 上限调小时可见——插入/粘贴会静默按上限裁剪。
     pub fn validate(&mut self, spec: &InputSpec) -> Option<InputError> {
         let error = if self.text.is_empty() {
             Some(InputError::Empty)
@@ -491,6 +555,154 @@ impl InputState {
     /// 应用写入错误态（`None` = 清空）。
     pub fn set_error(&mut self, error: Option<InputError>) {
         self.error = error;
+    }
+
+    /// 程序化替换整个值（旧 `update_value` 的语义入口）。
+    ///
+    /// - 单行输入先清洗换行/制表符（与 [`InputState::insert`] 同一条规则）；
+    /// - 超过 `max_length` 的值按字符裁剪，并写入 [`InputError::TooLong`]（**非法值错误语义**：
+    ///   调用方给的值不合法时错误态可见，而不是静默截断）；
+    /// - 合法值清空错误、光标/选区落在末尾、取消组合；
+    /// - `readonly` / `disabled` 拒绝（返回 `false`，状态不变）；
+    /// - 这次替换进入撤销历史（一步）。
+    ///
+    /// 返回正文/选区/错误态是否变化。
+    pub fn set_text(&mut self, spec: &InputSpec, text: &str) -> bool {
+        if spec.disabled || spec.readonly {
+            return false;
+        }
+        let before = self.snapshot();
+        let sanitized = clean_single_line(text, spec.multiline);
+        let total = sanitized.chars().count();
+        let clipped: String = match spec.max_length {
+            Some(max) if total > max => sanitized.chars().take(max).collect(),
+            _ => sanitized,
+        };
+        let too_long = clipped.chars().count() < total;
+        let error = spec
+            .max_length
+            .filter(|_| too_long)
+            .map(|max| InputError::TooLong { max });
+        let changed = self.text != clipped
+            || self.caret != clipped.len()
+            || self.anchor != clipped.len()
+            || self.composition.is_some()
+            || (self.error.is_some() && error.is_none());
+        if changed {
+            self.text = clipped;
+            self.caret = self.text.len();
+            self.anchor = self.caret;
+            self.composition = None;
+            self.error = error;
+            self.finish_edit(before, true);
+        }
+        changed
+    }
+
+    /// 是否可撤销。
+    #[must_use]
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    /// 是否可重做。
+    #[must_use]
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    /// 撤销一步（恢复正文与选区；组合被取消）。返回是否真的撤销。
+    pub fn undo(&mut self) -> bool {
+        self.cancel_composition();
+        let Some(previous) = self.undo.pop() else {
+            return false;
+        };
+        let current = self.snapshot();
+        self.redo.push(current);
+        self.restore(previous);
+        true
+    }
+
+    /// 重做一步。返回是否真的重做。
+    pub fn redo(&mut self) -> bool {
+        self.cancel_composition();
+        let Some(next) = self.redo.pop() else {
+            return false;
+        };
+        let current = self.snapshot();
+        self.undo.push(current);
+        self.restore(next);
+        true
+    }
+
+    /// 双击选词：把光标所在 `char` 的同类连续段选成选区。
+    ///
+    /// 规则（明确、可测）：字符分三类——**词字符**（`char::is_alphanumeric()` 或 `_`，CJK 连续段
+    /// 属于这一类）、**空白**（`char::is_whitespace()`）、**其它**（标点/符号）。选区是包含光标
+    /// 字符的同类极大连续段；光标在文本末尾时取前一个字符。空文本无操作。
+    pub fn select_word(&mut self) -> bool {
+        self.cancel_composition();
+        let caret = snap_char_boundary(&self.text, self.caret);
+        let Some(range) = word_range_at(&self.text, caret) else {
+            return false;
+        };
+        let (start, end) = (range.start, range.end);
+        if self.anchor == start && self.caret == end {
+            return false;
+        }
+        self.anchor = start;
+        self.caret = end;
+        true
+    }
+
+    /// 三击选行：选中光标所在行的整行内容（不含行尾 `\n`；单行输入 = 整段文本）。
+    pub fn select_line(&mut self) -> bool {
+        self.cancel_composition();
+        let caret = snap_char_boundary(&self.text, self.caret);
+        let start = self.text[..caret].rfind('\n').map_or(0, |index| index + 1);
+        let end = self.text[caret..]
+            .find('\n')
+            .map_or(self.text.len(), |index| caret + index);
+        if self.anchor == start && self.caret == end {
+            return false;
+        }
+        self.anchor = start;
+        self.caret = end;
+        true
+    }
+
+    /// 是否正在拖选。
+    #[must_use]
+    pub fn is_dragging(&self) -> bool {
+        self.dragging
+    }
+
+    /// 记录拖选起点（内容坐标）并把选区锚在 `origin_caret`。返回是否开始。
+    pub fn begin_drag(&mut self, origin_caret: usize, origin: Point) -> bool {
+        self.cancel_composition();
+        let origin_caret = snap_char_boundary(&self.text, origin_caret);
+        self.dragging = true;
+        self.drag_origin = Some(origin);
+        self.anchor = origin_caret;
+        self.caret = origin_caret;
+        self.error = None;
+        true
+    }
+
+    /// 结束拖选（保留现行选区）。返回之前是否在拖选。
+    pub fn end_drag(&mut self) -> bool {
+        self.drag_origin = None;
+        std::mem::take(&mut self.dragging)
+    }
+
+    /// 拖选落点（`extend = true` 的 caret 移动；不在拖选中时忽略）。返回选区是否变化。
+    pub fn drag_to(&mut self, caret: usize, extend: bool) -> bool {
+        if !self.dragging {
+            return false;
+        }
+        let before = self.caret;
+        self.set_caret(caret, extend);
+        self.caret != before
     }
 
     /// 引擎感知：把文本节点上的局部点换算成插入点（`extend` = Shift 扩选）。
@@ -539,10 +751,13 @@ impl InputState {
         changed
     }
 
-    /// 引擎感知：键盘路由（Ctrl/Cmd+A/C/X/V、Backspace/Delete、←/→ + Shift、Home/End、
-    /// Enter）。返回是否消费该按键；`Space` 由 `InputEvent::Text` 插入，不在这里处理。
+    /// 引擎感知：键盘路由（Ctrl/Cmd+A/C/X/V、Ctrl/Cmd+Z/Shift+Z/Y、Backspace/Delete、
+    /// ←/→ + Shift、Home/End、Enter）。返回是否消费该按键；`Space` 由 `InputEvent::Text` 插入，
+    /// 不在这里处理。
     ///
-    /// 组合期只处理 `Escape`（取消组合），其余按键交给平台/输入法。
+    /// `repeat` 来自平台自动重复：编辑键与导航键**照常处理**（长按退格/方向键是标准行为）；
+    /// `Enter`/`Submit` 与命令快捷键只在首按时处理，重复事件不消费（避免长按回车重复提交、
+    /// 长按 Ctrl+V 重复粘贴）。组合期只处理 `Escape`（取消组合）。
     pub fn handle_key(
         &mut self,
         app: &mut App,
@@ -550,6 +765,7 @@ impl InputState {
         spec: &InputSpec,
         code: KeyCode,
         modifiers: Modifiers,
+        repeat: bool,
     ) -> bool {
         if spec.disabled || !self.focused {
             return false;
@@ -563,6 +779,9 @@ impl InputState {
         }
         let command = modifiers.contains(Modifiers::CONTROL) || modifiers.contains(Modifiers::META);
         let extend = modifiers.contains(Modifiers::SHIFT);
+        if repeat && (command || matches!(code, KeyCode::Enter | KeyCode::NumpadEnter)) {
+            return false;
+        }
         match code {
             KeyCode::KeyA if command => {
                 self.select_all();
@@ -578,6 +797,18 @@ impl InputState {
             }
             KeyCode::KeyV if command => {
                 self.paste(app, spec);
+                true
+            }
+            KeyCode::KeyZ if command => {
+                if extend {
+                    self.redo();
+                } else {
+                    self.undo();
+                }
+                true
+            }
+            KeyCode::KeyY if command => {
+                self.redo();
                 true
             }
             KeyCode::Backspace if !command => {
@@ -614,7 +845,16 @@ impl InputState {
                 self.move_caret(motion, extend);
                 true
             }
-            KeyCode::Enter | KeyCode::NumpadEnter if !command => {
+            KeyCode::Escape => {
+                // 先取消组合（上面已处理），再收缩选区；没有选区时不消费，留给外壳关浮层。
+                let selection = self.selection_range();
+                if selection.is_empty() {
+                    return false;
+                }
+                self.set_caret(selection.start, false);
+                true
+            }
+            KeyCode::Enter | KeyCode::NumpadEnter => {
                 if spec.multiline {
                     self.insert_newline(spec);
                 } else if let Some(submit) = &spec.submit {
@@ -743,6 +983,43 @@ impl InputState {
         }
     }
 
+    /// 当前可撤销快照（组合期用组合起点，撤销不会恢复未提交的组合串）。
+    fn snapshot(&self) -> EditSnapshot {
+        match &self.composition {
+            Some(composition) => EditSnapshot {
+                text: self.text.clone(),
+                caret: composition.start,
+                anchor: composition.start,
+            },
+            None => EditSnapshot {
+                text: self.text.clone(),
+                caret: snap_char_boundary(&self.text, self.caret),
+                anchor: snap_char_boundary(&self.text, self.anchor),
+            },
+        }
+    }
+
+    /// 恢复快照（撤销/重做的唯一写入点）。
+    fn restore(&mut self, snapshot: EditSnapshot) {
+        self.text = snapshot.text;
+        self.caret = snap_char_boundary(&self.text, snapshot.caret);
+        self.anchor = snap_char_boundary(&self.text, snapshot.anchor);
+        self.composition = None;
+        self.error = None;
+    }
+
+    /// 一步编辑收尾：有变化才入撤销栈，并清空重做栈。
+    fn finish_edit(&mut self, before: EditSnapshot, changed: bool) {
+        if !changed {
+            return;
+        }
+        if self.undo.len() >= UNDO_HISTORY_LIMIT {
+            self.undo.remove(0);
+        }
+        self.undo.push(before);
+        self.redo.clear();
+    }
+
     /// 删除当前选区（提交文本）；返回是否真的删了。
     fn delete_selection(&mut self) -> bool {
         let selection = self.selection_range();
@@ -757,7 +1034,7 @@ impl InputState {
         true
     }
 
-    /// 用 `text` 替换选区（`max_length` 按字符裁剪）。
+    /// 用 `text` 替换选区（单行先清洗换行/制表符；`max_length` 按字符裁剪）。
     fn replace_selection_with(&mut self, spec: &InputSpec, text: &str) -> bool {
         let selection = self.selection_range();
         let (start, end) = (selection.start, selection.end);
@@ -766,7 +1043,8 @@ impl InputState {
         let budget = spec
             .max_length
             .map_or(usize::MAX, |max| max.saturating_sub(total - selected));
-        let clipped: String = text.chars().take(budget).collect();
+        let cleaned = clean_single_line(text, spec.multiline);
+        let clipped: String = cleaned.chars().take(budget).collect();
         if clipped.is_empty() && start == end {
             return false;
         }
@@ -794,6 +1072,7 @@ impl InputState {
         if spec.disabled || spec.readonly || self.composition.is_some() {
             return false;
         }
+        let before = self.snapshot();
         self.delete_selection();
         let start = snap_char_boundary(&self.text, self.caret);
         self.caret = start;
@@ -802,6 +1081,7 @@ impl InputState {
             start,
             text: String::new(),
             caret_utf16: None,
+            before,
         });
         true
     }
@@ -879,6 +1159,8 @@ impl InputState {
 pub struct InputNode {
     /// 可聚焦容器：背景 / 边框 / 内边距 / 点击动作。
     pub root: NodeId,
+    /// 单行输入的水平滚动视口（`None` = 多行，不滚动）。
+    pub viewport: Option<NodeId>,
     /// 文本节点（`bind_text` 读显示文本）。
     pub text: NodeId,
     /// 占位符节点（空值可见，`opacity` 切换）。
@@ -887,8 +1169,12 @@ pub struct InputNode {
     pub caret: NodeId,
     /// 编辑状态信号（唯一真值）。
     pub state: Signal<InputState>,
+    /// 占位符文本信号（[`InputNode::update_placeholder`] 的写入口）。
+    pub placeholder_state: Signal<SmolStr>,
     /// 构造参数（`Arc`：点击处理器与订阅方共享）。
     pub spec: Arc<InputSpec>,
+    /// 单行水平滚动句柄（[`InputNode::install`] 里登记）。
+    scroll: Arc<OnceLock<ScrollHandle>>,
     /// caret 颜色（挂载期从主题解析）。
     caret_color: Color,
     /// 选区颜色（挂载期从主题解析）。
@@ -896,6 +1182,9 @@ pub struct InputNode {
 }
 
 /// 在 `tree` 的 `parent` 下挂载输入框，返回节点句柄。
+///
+/// `placeholder_text` 是占位符文本信号（由调用方用 `App::signal(spec.placeholder.clone())` 创建）：
+/// 节点 `bind_text` 读它，[`InputNode::update_placeholder`] 写它。
 ///
 /// # Panics
 /// `parent` 已卸载（陈旧句柄）时 panic：挂载契约与 `NodeBuilder::build` 相同，调用方必须给
@@ -907,6 +1196,7 @@ pub fn build(
     spec: Arc<InputSpec>,
     theme: &Theme,
     state: &Signal<InputState>,
+    placeholder_text: &Signal<SmolStr>,
 ) -> InputNode {
     let tokens = theme.tokens();
     let size = tokens.for_size(spec.size);
@@ -914,6 +1204,7 @@ pub fn build(
     let colors = theme.components().input;
     let danger_border = theme.role(Role::StatusDangerBorder);
     let disabled = spec.disabled;
+    let readonly = spec.readonly;
     let masked = spec.masked;
     let multiline = spec.multiline;
     let name = spec.name.clone();
@@ -961,6 +1252,7 @@ pub fn build(
 
     let style_state = *state;
     let a11y_state = *state;
+    let a11y_placeholder = *placeholder_text;
     let mut root_builder = NodeBuilder::boxed()
         .style(root_style)
         .paint(root_paint)
@@ -1003,18 +1295,53 @@ pub fn build(
         })
         .bind_a11y(move |cx| {
             let state = cx.read(&a11y_state);
+            let placeholder = cx.read(&a11y_placeholder).clone();
             A11yPatch {
                 value: Some(state.display_text(masked)),
                 disabled: Some(disabled),
+                read_only: Some(readonly),
+                invalid: Some(state.error().is_some()),
+                placeholder: Some(placeholder),
                 ..A11yPatch::default()
             }
         });
     if !disabled {
-        root_builder = root_builder.on_click(click_action(&spec));
+        root_builder = root_builder
+            .on_click(click_action(&spec))
+            .on_drag(drag_action(&spec));
     }
     let root = root_builder
         .build(tree, parent)
         .expect("input: root node mounts under a live parent");
+
+    // ── 单行水平滚动视口 ──────────────────────────────────────────────────
+    // 单行文本 NoWrap 且天然宽于输入框：文本放进一个裁剪视口，`install` 把它登记成横向滚动
+    // 容器；`sync` 按 caret 可见性滚动、`caret_canvas` 把滚动偏移从光标几何里减掉。
+    let viewport = if multiline {
+        None
+    } else {
+        let viewport = NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .flex_row()
+                    .items_center()
+                    .height_full()
+                    .flex_1()
+                    .min_width_0()
+                    .relative()
+                    .overflow_hidden()
+                    .build(),
+            )
+            .id(format_smolstr!("{name}.viewport"))
+            .tab_stop(false)
+            .a11y(A11yOverride {
+                hidden: true,
+                ..A11yOverride::default()
+            })
+            .build(tree, root)
+            .expect("input: viewport mounts under the fresh root");
+        Some(viewport)
+    };
 
     // ── 文本 ──────────────────────────────────────────────────────────────
     let text_state = *state;
@@ -1027,20 +1354,28 @@ pub fn build(
         })
         .with_alignment(TextAlign::Start)
         .with_overflow(TextOverflow::Clip, 0);
-    let text = NodeBuilder::text(SmolStr::new_static(""), text_style)
-        .style(StyleBuilder::new().flex_1().min_width_0().build())
+    let text_parent = viewport.unwrap_or(root);
+    let mut text_builder = NodeBuilder::text(SmolStr::new_static(""), text_style)
         .bind_text(move |cx| cx.read(&text_state).display_text(masked))
         .id(format_smolstr!("{name}.text"))
         .tab_stop(false)
         .a11y(A11yOverride {
             hidden: true,
             ..A11yOverride::default()
-        })
-        .build(tree, root)
-        .expect("input: text node mounts under the fresh root");
+        });
+    text_builder = if multiline {
+        text_builder.style(StyleBuilder::new().flex_1().min_width_0().build())
+    } else {
+        // 单行：不参与收缩（内容宽 = 自然宽），溢出交给视口裁剪 + 滚动。
+        text_builder.style(StyleBuilder::new().flex_none().build())
+    };
+    let text = text_builder
+        .build(tree, text_parent)
+        .expect("input: text node mounts under the fresh parent");
 
     // ── 占位符（绝对覆盖在文本位上；空值可见）──────────────────────────────
-    let placeholder_state = *state;
+    let placeholder_state = *placeholder_text;
+    let placeholder_style_state = *state;
     let placeholder_text_style = TextStyle::new(size.font_size)
         .with_color(colors.placeholder)
         .with_wrap(if multiline {
@@ -1050,7 +1385,7 @@ pub fn build(
         })
         .with_alignment(TextAlign::Start)
         .with_overflow(TextOverflow::Clip, 0);
-    let placeholder = NodeBuilder::text(spec.placeholder.clone(), placeholder_text_style)
+    let placeholder = NodeBuilder::text(SmolStr::new_static(""), placeholder_text_style)
         .style(
             StyleBuilder::new()
                 .absolute()
@@ -1059,8 +1394,9 @@ pub fn build(
                 .right(padding_x)
                 .build(),
         )
+        .bind_text(move |cx| cx.read(&placeholder_state).clone())
         .bind_style(move |cx| {
-            let state = cx.read(&placeholder_state);
+            let state = cx.read(&placeholder_style_state);
             // 组合串可见时即使正文为空也压住占位符（否则 preedit 会叠在占位文字上）。
             // `interactive: false`：占位符与文本节点完全重叠，必须让命中穿透到文本节点。
             let empty = state.text().is_empty() && !state.is_composing();
@@ -1105,22 +1441,41 @@ pub fn build(
 
     InputNode {
         root,
+        viewport,
         text,
         placeholder,
         caret,
         state: *state,
+        placeholder_state: *placeholder_text,
         spec,
+        scroll: Arc::new(OnceLock::new()),
         caret_color: theme.role(Role::FgDefault),
         selection_color: colors.selection,
     }
 }
 
 impl InputNode {
-    /// 挂载后调用一次：注册点击定位动作的处理器（焦点 + 光标位置）。
+    /// 挂载后调用一次：登记单行水平滚动容器，并注册点击定位 / 拖选动作的处理器。
     ///
+    /// 点击：焦点 + 光标定位；`click_count == 2` 选词、`click_count >= 3` 选行（按引擎连击计数）。
+    /// 拖选：引擎 `on_drag` 在移动越过阈值后开启指针捕获并派发 `Drag` 动作；几何直接用
+    /// `App::drag` 的 `origin/current` 窗口坐标（移出窗口也有值），`Start` 把锚点放在按下点、
+    /// `Move/End` 扩展选区，`Cancel` 结束。
     pub fn install(&self, app: &mut App) {
         if self.spec.disabled {
             return;
+        }
+        if let (Some(viewport), Some(window)) = (self.viewport, self.root.window())
+            && let Ok(handle) = app.make_scroll(
+                window,
+                viewport,
+                ScrollConfig {
+                    axis: ScrollAxis::Horizontal,
+                    line_height: 1.0,
+                },
+            )
+        {
+            let _ = self.scroll.set(handle);
         }
         let state = self.state;
         let spec = Arc::clone(&self.spec);
@@ -1133,20 +1488,17 @@ impl InputNode {
             };
             let window = ctx.window();
             let extend = ctx.modifiers().contains(Modifiers::SHIFT);
+            let click_count = match ctx.source() {
+                ActionSource::Click { click_count, .. } => click_count,
+                _ => 1,
+            };
             let app = ctx.app_mut();
             let Some(window_ref) = app.window(window) else {
                 return;
             };
-            let tree = window_ref.tree();
-            let (Ok(hit_node), Ok(text_node)) = (tree.get(hit.node), tree.get(text)) else {
+            let Some(local) = text_local_point(window_ref.tree(), hit, text) else {
                 return;
             };
-            let hit_bounds = hit_node.layout().bounds;
-            let text_bounds = text_node.layout().bounds;
-            let local = Point::new(
-                hit.local_point.x + hit_bounds.origin.x - text_bounds.origin.x,
-                hit.local_point.y + hit_bounds.origin.y - text_bounds.origin.y,
-            );
             if app.focused(window) != Some(root) {
                 app.set_focus(window, Some(root));
             }
@@ -1157,11 +1509,155 @@ impl InputNode {
                 return;
             };
             next.set_caret_from_point(window_ref, text, local, extend);
+            if click_count >= 3 {
+                next.select_line();
+            } else if click_count == 2 {
+                next.select_word();
+            }
             if next != before {
                 app.write(&state, next);
             }
             let _ = app.request_repaint(window);
         });
+
+        let state = self.state;
+        let spec = Arc::clone(&self.spec);
+        let text = self.text;
+        let scroll_handle = self.scroll.get().copied();
+        app.on_action(drag_action(&spec), move |ctx| {
+            let window = ctx.window();
+            let hit = ctx.hit();
+            let (phase, delta) = match ctx.source() {
+                ActionSource::Drag { phase, delta } => (phase, delta),
+                _ => return,
+            };
+            let app = ctx.app_mut();
+            let scroll = scroll_handle
+                .and_then(|handle| app.scroll_state(&handle))
+                .map_or(0.0, |state| state.offset.x);
+            let text_origin = {
+                let Some(window_ref) = app.window(window) else {
+                    return;
+                };
+                let Ok(node) = window_ref.tree().get(text) else {
+                    return;
+                };
+                node.layout().bounds.origin
+            };
+            let to_text_local = |point: Point| {
+                Point::new(point.x - text_origin.x + scroll, point.y - text_origin.y)
+            };
+            let before = app.read(&state).clone();
+            let mut next = before.clone();
+            if phase == ui_core::interaction::DragPhase::Cancel {
+                next.end_drag();
+                if next != before {
+                    app.write(&state, next);
+                }
+                return;
+            }
+            let info = app.drag_state(window).and_then(|drag| app.drag(&drag));
+            if let Some(info) = info {
+                match phase {
+                    ui_core::interaction::DragPhase::Start => {
+                        let down = to_text_local(info.origin);
+                        next.set_focused(true);
+                        let Some(window_ref) = app.window(window) else {
+                            return;
+                        };
+                        if !next.set_caret_from_point(window_ref, text, down, false) {
+                            return;
+                        }
+                        let anchor = next.caret();
+                        next.begin_drag(anchor, down);
+                        let Some(window_ref) = app.window(window) else {
+                            return;
+                        };
+                        next.set_caret_from_point(
+                            window_ref,
+                            text,
+                            to_text_local(info.current),
+                            true,
+                        );
+                    }
+                    ui_core::interaction::DragPhase::Move => {
+                        if !next.is_dragging() {
+                            return;
+                        }
+                        let Some(window_ref) = app.window(window) else {
+                            return;
+                        };
+                        next.set_caret_from_point(
+                            window_ref,
+                            text,
+                            to_text_local(info.current),
+                            true,
+                        );
+                    }
+                    ui_core::interaction::DragPhase::End => {
+                        // `App::drag_state` 在 End 派发前已被引擎清掉；正常不会走到这里，
+                        // 保留分支只为防御（真正处理见下面的 no-info 路径）。
+                    }
+                    ui_core::interaction::DragPhase::Cancel => unreachable!("Cancel 已提前返回"),
+                }
+            } else {
+                // End 动作在引擎清掉拖拽会话之后派发：用命中点或「按下点 + 位移」兜底，
+                // 然后结束拖选。移出窗口时命中为 `None`，delta 兜底再由 E5 clamp 到文本边界。
+                if phase != ui_core::interaction::DragPhase::End || !next.is_dragging() {
+                    return;
+                }
+                let current = hit
+                    .and_then(|hit| {
+                        let window_ref = app.window(window)?;
+                        text_local_point(window_ref.tree(), hit, text)
+                    })
+                    .or_else(|| {
+                        next.drag_origin
+                            .map(|origin| Point::new(origin.x + delta.x, origin.y + delta.y))
+                    });
+                if let Some(current) = current
+                    && let Some(window_ref) = app.window(window)
+                {
+                    next.set_caret_from_point(window_ref, text, current, true);
+                }
+                next.end_drag();
+            }
+            if next != before {
+                app.write(&state, next);
+            }
+        });
+    }
+
+    /// 运行时更新值（旧 `update_value` 的替代；生产调用点在 P2-5 接线时直接换过来）。
+    ///
+    /// 语义见 [`InputState::set_text`]：单行清洗、`max_length` 裁剪并置 [`InputError::TooLong`]、
+    /// 光标到末尾、取消组合、一步撤销；`readonly` / `disabled` 拒绝（`false`，状态不变）。
+    /// 改值会让 `Signal<InputState>` 失效并重绘（`bind_text` / `bind_a11y` 依赖它）。
+    pub fn update_value(&self, app: &mut App, value: &str) -> bool {
+        if self.spec.disabled || self.spec.readonly {
+            return false;
+        }
+        let mut next = app.read(&self.state).clone();
+        if !next.set_text(&self.spec, value) {
+            return false;
+        }
+        app.write(&self.state, next);
+        if let Some(window) = self.root.window() {
+            let _ = app.request_repaint(window);
+        }
+        true
+    }
+
+    /// 运行时更新占位符（旧 `update_placeholder` 的替代）：写占位符信号并请求重绘。
+    ///
+    /// 占位符是独立文本节点；空值显示逻辑仍由 `text().is_empty()` 决定，更新自身不会改变
+    /// 可见性。返回信号是否真的变化（同值写入被 `App::write` 等值短路）。
+    pub fn update_placeholder(&self, app: &mut App, placeholder: impl Into<SmolStr>) -> bool {
+        let changed = app.write(&self.placeholder_state, placeholder.into());
+        if changed && let Some(window) = self.root.window() {
+            let _ = app.request_repaint(window);
+        }
+        changed
     }
 
     /// 每轮同步（外壳在帧之前调用）：焦点镜像、IME 开关与 caret 区域、caret/选区 Canvas。
@@ -1196,14 +1692,87 @@ impl InputNode {
                 app.set_ime_enabled(window, false);
             }
         }
+        let scroll_changed = self.sync_horizontal_scroll(app, window, &next);
+        let scroll_x = self.scroll_x(app);
         let canvas = app
             .window(window)
-            .and_then(|window_ref| self.caret_canvas(window_ref, &next));
+            .and_then(|window_ref| self.caret_canvas(window_ref, &next, scroll_x));
         if state_changed {
             app.write(&self.state, next);
         }
         let canvas_changed = canvas.is_some_and(|canvas| self.apply_canvas(app, window, canvas));
-        state_changed || canvas_changed
+        state_changed || scroll_changed || canvas_changed
+    }
+
+    /// 当前单行水平滚动偏移（多行/未登记滚动容器 = 0）。
+    fn scroll_x(&self, app: &App) -> f32 {
+        self.scroll
+            .get()
+            .copied()
+            .and_then(|handle| app.scroll_state(&handle))
+            .map_or(0.0, |state| state.offset.x)
+    }
+
+    /// 单行 caret 可见性滚动：把文本内容宽 + 当前 caret 的几何交给引擎横向滚动容器。
+    ///
+    /// 文本尚未 shape（刚编辑过）时 [`Window::text_caret_rect`] 返回错误：本帧不动滚动，
+    /// 下一轮重试（与 caret 画布同一约定）。返回是否真的改变了滚动偏移。
+    fn sync_horizontal_scroll(&self, app: &mut App, window: WindowId, state: &InputState) -> bool {
+        let Some(handle) = self.scroll.get().copied() else {
+            return false;
+        };
+        let Some(viewport) = self.viewport else {
+            return false;
+        };
+        let byte = state.display_caret_byte(self.spec.masked);
+        let geometry = {
+            let Some(window_ref) = app.window(window) else {
+                return false;
+            };
+            let tree = window_ref.tree();
+            let (Ok(viewport_node), Ok(text_node)) = (tree.get(viewport), tree.get(self.text))
+            else {
+                return false;
+            };
+            let viewport_bounds = viewport_node.layout().bounds;
+            let text_bounds = text_node.layout().bounds;
+            let Ok(caret) = window_ref.text_caret_rect(self.text, byte) else {
+                return false;
+            };
+            (
+                text_bounds.size.width,
+                text_bounds.origin.x,
+                viewport_bounds.size.width,
+                viewport_bounds.size.height,
+                caret,
+            )
+        };
+        let (content_width, text_origin_x, viewport_width, viewport_height, caret) = geometry;
+        if viewport_width <= 0.0 || !content_width.is_finite() {
+            return false;
+        }
+        let _ = app.set_scroll_content(
+            &handle,
+            Size::new(content_width.max(viewport_width), viewport_height.max(1.0)),
+        );
+        let Some(current) = app.scroll_state(&handle) else {
+            return false;
+        };
+        let max_offset = (content_width - viewport_width).max(0.0);
+        let caret_left = caret.origin.x - text_origin_x;
+        let caret_right = caret_left + caret.size.width.max(1.0);
+        let mut next = current.offset.x;
+        if caret_left < next {
+            next = caret_left;
+        }
+        if caret_right > next + viewport_width {
+            next = caret_right - viewport_width;
+        }
+        let next = next.clamp(0.0, max_offset);
+        if (next - current.offset.x).abs() <= f32::EPSILON {
+            return false;
+        }
+        app.scroll_to(&handle, Point::new(next, 0.0)).is_ok()
     }
 
     /// 事件路由（外壳 `drain_events` 之后逐条调用）。返回是否消费。
@@ -1233,12 +1802,8 @@ impl InputNode {
                 modifiers,
                 ..
             }) => {
-                if *repeat {
-                    false
-                } else {
-                    next.set_focused(true);
-                    next.handle_key(app, window, &self.spec, *code, *modifiers)
-                }
+                next.set_focused(true);
+                next.handle_key(app, window, &self.spec, *code, *modifiers, *repeat)
             }
             Event::Input(InputEvent::Key { .. }) => false,
             Event::Ime(ime) => {
@@ -1259,13 +1824,20 @@ impl InputNode {
     }
 
     /// 构造当前帧的 caret + 选区画布（`None` = 文本尚未 shape，保留旧画布）。
-    fn caret_canvas(&self, window: &Window, state: &InputState) -> Option<Canvas> {
+    ///
+    /// `scroll_x` 是单行水平滚动偏移：`Window::text_caret_rect` 给的是布局坐标（内容空间），
+    /// 实际绘制要减去滚动偏移；根节点的 `overflow_hidden` 负责把超出的部分裁掉。
+    fn caret_canvas(&self, window: &Window, state: &InputState, scroll_x: f32) -> Option<Canvas> {
         if !window.focus().is_focused(self.root) {
             return Some(Canvas::new(Rect::default()));
         }
         let masked = self.spec.masked;
+        let shift = Point::new(-scroll_x, 0.0);
         let caret_byte = state.display_caret_byte(masked);
-        let caret_rect = window.text_caret_rect(self.text, caret_byte).ok()?;
+        let caret_rect = window
+            .text_caret_rect(self.text, caret_byte)
+            .ok()?
+            .translate(shift);
         // 选区矩形是文本盒局部坐标；`Window::text_caret_rect` 是窗口绝对坐标。两者在字节 0
         // 处的差就是「节点原点 + 内容偏移 + 祖先滚动偏移」。
         let local_zero = window.tree().text_caret_rect(self.text, 0).ok()?;
@@ -1283,7 +1855,7 @@ impl InputNode {
                 .ok()?;
             for rect in rects {
                 quads.push(Quad {
-                    bounds: rect.translate(origin),
+                    bounds: rect.translate(origin).translate(shift),
                     corner_radius: [0.0; 4],
                     paint: QuadPaint::Solid {
                         fill: self.selection_color,
@@ -1338,10 +1910,98 @@ fn click_action(spec: &InputSpec) -> Action {
     Action::Custom(format_smolstr!("base_ui.input.{}.click", spec.name))
 }
 
+/// 拖选动作的 key（与点击动作同前缀，`name` 保证实例唯一）。
+fn drag_action(spec: &InputSpec) -> Action {
+    Action::Custom(format_smolstr!("base_ui.input.{}.drag", spec.name))
+}
+
+/// 命中点 → 文本节点的 **E5 局部坐标**（文本 content box 的布局坐标，含滚动容器内容偏移）。
+///
+/// `HitResult::local_point` 是「命中节点 border box 局部」；加上命中节点的布局原点得到
+/// 内容坐标，再减去文本节点的布局原点。与 `Window::text_byte_index_at` 的入参同域。
+fn text_local_point(tree: &NodeTree, hit: HitResult, text: NodeId) -> Option<Point> {
+    let hit_node = tree.get(hit.node).ok()?;
+    let text_node = tree.get(text).ok()?;
+    let hit_bounds = hit_node.layout().bounds;
+    let text_bounds = text_node.layout().bounds;
+    Some(Point::new(
+        hit.local_point.x + hit_bounds.origin.x - text_bounds.origin.x,
+        hit.local_point.y + hit_bounds.origin.y - text_bounds.origin.y,
+    ))
+}
+
 /// 未脱敏显示文本字节 → 脱敏显示文本字节（每个字符一个 `•`）。
 fn masked_offset(unmasked_display: &str, byte: usize) -> usize {
     let byte = snap_char_boundary(unmasked_display, byte);
     unmasked_display[..byte].chars().count() * BULLET.len_utf8()
+}
+
+/// 单行输入的清洗：丢掉 `\r` / `\n` / `\t`（多行原样返回）。
+///
+/// 粘贴多行文本、IME 提交、程序化 `set_text` 都经过这条规则；旧实现单行粘贴只删 `\n`，
+/// 本模块同时删 `\r` 与制表符（单行框里的制表符会参与字形布局但不该成为正文）。
+fn clean_single_line(text: &str, multiline: bool) -> String {
+    if multiline {
+        return text.to_string();
+    }
+    text.chars()
+        .filter(|ch| !matches!(ch, '\r' | '\n' | '\t'))
+        .collect()
+}
+
+/// 双击选词的字符分类。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WordClass {
+    /// 词字符：字母/数字/下划线（CJK 连续段是一词）。
+    Word,
+    /// 空白。
+    Space,
+    /// 标点/符号。
+    Other,
+}
+
+fn word_class(ch: char) -> WordClass {
+    if ch.is_alphanumeric() || ch == '_' {
+        WordClass::Word
+    } else if ch.is_whitespace() {
+        WordClass::Space
+    } else {
+        WordClass::Other
+    }
+}
+
+/// `caret` 所在 `char` 的同类连续段（UTF-8 字节范围）；空文本返回 `None`。
+///
+/// 光标在文本末尾时取前一个字符（与常见编辑器的双击末尾行为一致）。
+fn word_range_at(text: &str, caret: usize) -> Option<Range<usize>> {
+    let anchor = if caret == text.len() && caret > 0 {
+        prev_char_boundary(text, caret)?
+    } else {
+        caret
+    };
+    let anchor_char = text[anchor..].chars().next()?;
+    let class = word_class(anchor_char);
+    let mut start = anchor;
+    while let Some(previous) = prev_char_boundary(text, start) {
+        let Some(ch) = text[previous..].chars().next() else {
+            break;
+        };
+        if word_class(ch) != class {
+            break;
+        }
+        start = previous;
+    }
+    let mut end = anchor + anchor_char.len_utf8();
+    while let Some(next) = next_char_boundary(text, end) {
+        let Some(ch) = text[end..].chars().next() else {
+            break;
+        };
+        if word_class(ch) != class {
+            break;
+        }
+        end = next;
+    }
+    Some(start..end)
 }
 
 /// 把字节偏移吸附到 `char` 边界（向下取整，clamp 到文本长度）。
@@ -1406,6 +2066,7 @@ mod tests {
     use smol_str::SmolStr;
     use ui_core::{
         event::{Action, Event, ImeEvent, InputEvent, KeyCode, KeyState, Modifiers, PointerButton},
+        interaction::ScrollHandle,
         math::{Point, Rect},
         node::{id::NodeId, signal::Signal, tree::NodeKind},
         paint::primitive::Primitive,
@@ -1449,12 +2110,14 @@ mod tests {
         app: TestApp,
         node: InputNode,
         state: Signal<InputState>,
+        placeholder: Signal<SmolStr>,
     }
 
     fn harness(spec: InputSpec, initial: InputState) -> Harness {
         let theme = Theme::default();
         let mut app = TestApp::new();
         let state = app.app_mut().signal(initial);
+        let placeholder = app.app_mut().signal(SmolStr::new_static("请输入"));
         let spec = Arc::new(spec);
         let window = app.window_id();
         let root = app.app().window(window).expect("窗口存在").tree().root();
@@ -1467,10 +2130,16 @@ mod tests {
             Arc::clone(&spec),
             &theme,
             &state,
+            &placeholder,
         );
         node.install(app.app_mut());
         app.drain().expect("首帧");
-        Harness { app, node, state }
+        Harness {
+            app,
+            node,
+            state,
+            placeholder,
+        }
     }
 
     impl Harness {
@@ -1524,12 +2193,30 @@ mod tests {
             }));
         }
 
+        fn key_repeat(&mut self, code: KeyCode, modifiers: Modifiers) {
+            self.pump(Event::Input(InputEvent::Key {
+                code,
+                state: KeyState::Down,
+                repeat: true,
+                modifiers,
+                timestamp: Instant::now(),
+            }));
+        }
+
         fn ime(&mut self, event: ImeEvent) {
             self.pump(Event::Ime(event));
         }
 
         fn state(&self) -> InputState {
             self.app.app().read(&self.state).clone()
+        }
+
+        fn write_state(&mut self, state: InputState) {
+            self.app.app_mut().write(&self.state, state);
+        }
+
+        fn scroll_handle(&self) -> Option<ScrollHandle> {
+            self.node.scroll.get().copied()
         }
 
         fn node_text(&self, node: NodeId) -> SmolStr {
@@ -2361,6 +3048,525 @@ mod tests {
         assert_ne!(
             normal.color, with_error.color,
             "错误态必须换掉边框颜色（StatusDangerBorder）"
+        );
+    }
+    // ── P2-3b：undo/redo（快照式、有界）──────────────────────────────────────
+
+    #[test]
+    fn undo_redo_restores_insert_delete_and_selection_replacement() {
+        let spec = spec();
+        let mut state = state("hello");
+        assert!(state.insert(&spec, " world"));
+        assert!(state.delete_backward(&spec));
+        assert_eq!(state.text(), "hello worl");
+
+        assert!(state.undo());
+        assert_eq!(state.text(), "hello world", "撤销一次退格");
+        assert!(state.undo());
+        assert_eq!(state.text(), "hello", "撤销插入");
+        assert!(state.redo());
+        assert_eq!(state.text(), "hello world");
+        assert!(state.redo());
+        assert_eq!(state.text(), "hello worl", "重做退格");
+        assert!(!state.can_redo() || state.redo());
+
+        // 选区替换 → 撤销恢复正文与选区。
+        let mut state = self::state("hello");
+        state.set_caret(1, false);
+        state.set_caret(4, true);
+        assert!(state.insert(&spec, "i"));
+        assert_eq!(state.text(), "hio");
+        assert!(state.undo());
+        assert_eq!(state.text(), "hello");
+        assert_eq!(state.selection(), 1..4, "撤销必须恢复编辑前的选区");
+    }
+
+    #[test]
+    fn undo_history_is_bounded_to_one_hundred_steps() {
+        let spec = spec();
+        let mut state = state("");
+        for _ in 0..120 {
+            assert!(state.insert(&spec, "a"));
+        }
+        assert_eq!(state.text().chars().count(), 120);
+
+        for _ in 0..100 {
+            assert!(state.undo(), "有界历史里的 100 步都能撤销");
+        }
+        assert_eq!(
+            state.text().chars().count(),
+            20,
+            "上限 100 步：最旧的 20 次编辑不再可撤销"
+        );
+        assert!(!state.can_undo());
+        assert!(state.can_redo(), "撤销出来的 100 步都可重做");
+    }
+
+    #[test]
+    fn a_new_edit_clears_the_redo_stack() {
+        let spec = spec();
+        let mut state = state("");
+        assert!(state.insert(&spec, "a"));
+        assert!(state.insert(&spec, "b"));
+        assert!(state.undo());
+        assert!(state.can_redo());
+        assert!(state.insert(&spec, "c"));
+        assert_eq!(state.text(), "ac");
+        assert!(!state.can_redo(), "新编辑必须清空重做栈");
+    }
+
+    #[test]
+    fn keyboard_undo_redo_shortcuts_route_through_dispatch() {
+        let mut harness = harness(spec(), state(""));
+        harness.focus();
+        harness.type_text("ab");
+        harness.drain();
+        assert_eq!(harness.state().text(), "ab");
+
+        harness.key(KeyCode::KeyZ, Modifiers::CONTROL);
+        harness.drain();
+        assert_eq!(harness.state().text(), "", "Ctrl+Z 撤销");
+        harness.key(KeyCode::KeyZ, Modifiers::CONTROL | Modifiers::SHIFT);
+        harness.drain();
+        assert_eq!(harness.state().text(), "ab", "Ctrl+Shift+Z 重做");
+        harness.key(KeyCode::KeyZ, Modifiers::CONTROL);
+        harness.drain();
+        harness.key(KeyCode::KeyY, Modifiers::CONTROL);
+        harness.drain();
+        assert_eq!(harness.state().text(), "ab", "Ctrl+Y 重做");
+    }
+
+    // ── P2-3b：单行清洗 / 自动重复 ─────────────────────────────────────────
+
+    #[test]
+    fn single_line_insert_drops_carriage_returns_newlines_and_tabs() {
+        let mut state = state("");
+        assert!(state.insert(&spec(), "a\r\nb\tc"));
+        assert_eq!(state.text(), "abc");
+        assert_eq!(state.caret(), 3);
+
+        let multiline = InputSpec {
+            multiline: true,
+            ..spec()
+        };
+        let mut state = self::state("");
+        assert!(state.insert(&multiline, "a\r\nb\tc"));
+        assert_eq!(state.text(), "a\r\nb\tc", "多行输入不改写换行/制表符");
+    }
+
+    #[test]
+    fn single_line_ime_commit_and_set_text_drop_line_breaks() {
+        let spec = spec();
+        let mut state = state("");
+        state.set_focused(true);
+        assert!(state.ime_preedit(&spec, "ab", None));
+        assert!(state.ime_commit(&spec, "a\nb\tc"));
+        assert_eq!(state.text(), "abc");
+
+        assert!(state.set_text(&spec, "x\r\ny\tz"));
+        assert_eq!(state.text(), "xyz");
+    }
+
+    #[test]
+    fn repeated_editing_and_navigation_keys_are_not_discarded() {
+        let mut harness = harness(spec(), state("abc"));
+        harness.focus();
+        harness.key_repeat(KeyCode::Backspace, Modifiers::empty());
+        harness.drain();
+        assert_eq!(harness.state().text(), "ab", "长按退格必须持续删除");
+        harness.key_repeat(KeyCode::Backspace, Modifiers::empty());
+        harness.drain();
+        assert_eq!(harness.state().text(), "a");
+        harness.key_repeat(KeyCode::ArrowLeft, Modifiers::empty());
+        harness.drain();
+        assert_eq!(harness.state().caret(), 0, "长按方向键必须移动光标");
+        harness.key_repeat(KeyCode::ArrowRight, Modifiers::empty());
+        harness.drain();
+        assert_eq!(harness.state().caret(), 1);
+    }
+
+    #[test]
+    fn repeated_enter_does_not_submit_again() {
+        let submit = Action::custom("base_ui.input.submit.repeat");
+        let mut harness = harness(
+            InputSpec {
+                submit: Some(submit.clone()),
+                ..spec()
+            },
+            state(""),
+        );
+        let hits = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let counter = hits.clone();
+        harness.app.app_mut().on_action(submit, move |_ctx| {
+            counter.set(counter.get() + 1);
+        });
+        harness.focus();
+        harness.key(KeyCode::Enter, Modifiers::empty());
+        harness.key_repeat(KeyCode::Enter, Modifiers::empty());
+        assert_eq!(hits.get(), 1, "自动重复的 Enter 不再派发 submit");
+    }
+
+    // ── P2-3b：IME End 派发级 ───────────────────────────────────────────────
+
+    #[test]
+    fn ime_end_event_cancels_the_composition_through_dispatch() {
+        let mut harness = harness(spec(), state(""));
+        harness.focus();
+        harness.ime(ImeEvent::Preedit {
+            text: SmolStr::new_static("ni"),
+            caret: Some(2),
+            clauses: Default::default(),
+            replace: None,
+        });
+        harness.drain();
+        assert!(harness.state().is_composing(), "Preedit 必须开启组合");
+        assert_eq!(harness.node_text(harness.node.text), "ni");
+
+        harness.ime(ImeEvent::End);
+        harness.drain();
+        assert!(!harness.state().is_composing(), "End 必须取消组合");
+        assert_eq!(harness.state().text(), "", "组合串不进正文");
+        assert_eq!(harness.node_text(harness.node.text), "");
+        assert_eq!(harness.state().caret(), 0, "caret 回到组合起点");
+    }
+
+    // ── P2-3b：Esc 收缩选区（L5）───────────────────────────────────────────
+
+    #[test]
+    fn escape_collapses_the_selection_after_cancelling_composition() {
+        let mut harness = harness(spec(), state("hello"));
+        harness.focus();
+        let mut state = harness.state();
+        state.set_caret(1, false);
+        state.set_caret(4, true);
+        harness.write_state(state);
+        harness.drain();
+        assert_eq!(harness.state().selection(), 1..4);
+        harness.key(KeyCode::Escape, Modifiers::empty());
+        harness.drain();
+        assert_eq!(
+            harness.state().selection(),
+            1..1,
+            "Esc 收缩选区到 caret 起点"
+        );
+        assert_eq!(harness.state().caret(), 1);
+    }
+
+    // ── P2-3b：单行水平滚动（M1）───────────────────────────────────────────
+
+    #[test]
+    fn long_single_line_scrolls_to_keep_the_caret_visible() {
+        let mut harness = harness(spec(), state(&"a".repeat(200)));
+        harness.focus();
+        for _ in 0..3 {
+            harness.sync();
+            harness.drain();
+        }
+        let handle = harness
+            .scroll_handle()
+            .expect("单行输入必须登记横向滚动容器");
+        let scroll = harness
+            .app
+            .app()
+            .scroll_state(&handle)
+            .expect("滚动容器状态");
+        assert!(
+            scroll.offset.x > 0.0,
+            "200 字符的 caret 在末尾，必须横向滚动才能看见：{:?}",
+            scroll.offset
+        );
+        let viewport = harness.node.viewport.expect("单行视口");
+        let viewport_bounds = harness.app.probe().bounds(viewport).expect("视口布局");
+        let caret = harness
+            .window_ref()
+            .text_caret_rect(harness.node.text, 200)
+            .expect("caret 几何");
+        let caret_screen_right = caret.origin.x - scroll.offset.x + caret.size.width;
+        assert!(
+            caret_screen_right <= viewport_bounds.origin.x + viewport_bounds.size.width + 1.0,
+            "滚动后 caret 必须落在视口内：caret 右缘 {caret_screen_right}，视口右缘 {}",
+            viewport_bounds.origin.x + viewport_bounds.size.width
+        );
+        assert!(
+            caret.origin.x - scroll.offset.x >= viewport_bounds.origin.x - 1.0,
+            "滚动不得把 caret 推到视口左侧之外"
+        );
+    }
+
+    #[test]
+    fn clicks_map_through_the_horizontal_scroll_offset() {
+        let mut harness = harness(spec(), state(&"0123456789".repeat(20)));
+        harness.focus();
+        for _ in 0..3 {
+            harness.sync();
+            harness.drain();
+        }
+        let handle = harness.scroll_handle().expect("横向滚动容器");
+        let scroll = harness.app.app().scroll_state(&handle).expect("滚动状态");
+        assert!(scroll.offset.x > 0.0);
+        let viewport = harness.node.viewport.expect("视口");
+        let viewport_bounds = harness.app.probe().bounds(viewport).expect("视口布局");
+        let text_bounds = harness
+            .app
+            .probe()
+            .bounds(harness.node.text)
+            .expect("文本布局");
+        // 视口节点自身不随内容滚动；可见文本区就是视口的屏幕矩形（内容在它下面平移）。
+        let position = Point::new(
+            viewport_bounds.origin.x + viewport_bounds.size.width - 2.0,
+            text_bounds.origin.y + text_bounds.size.height / 2.0,
+        );
+        harness.app.inject(InputEvent::pointer_down(
+            position,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        harness.app.inject(InputEvent::pointer_up(
+            position,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        harness.drain();
+        assert!(
+            harness.state().caret() > 150,
+            "点在滚动后视口右缘附近必须落到文本尾部：caret={}，offset={}",
+            harness.state().caret(),
+            scroll.offset.x
+        );
+    }
+
+    // ── P2-3b：拖选（用户裁决）─────────────────────────────────────────────
+
+    fn caret_position(harness: &Harness, byte: usize) -> Point {
+        let bounds = harness
+            .app
+            .probe()
+            .bounds(harness.node.text)
+            .expect("文本布局");
+        let caret = harness
+            .window_ref()
+            .text_caret_rect(harness.node.text, byte)
+            .expect("caret 几何");
+        Point::new(
+            caret.origin.x + 0.5,
+            bounds.origin.y + bounds.size.height / 2.0,
+        )
+    }
+
+    fn drag(harness: &mut Harness, from: Point, to: Point) {
+        harness.app.inject(InputEvent::pointer_down(
+            from,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        harness
+            .app
+            .inject(InputEvent::pointer_move(to, Modifiers::empty()));
+        harness.app.inject(InputEvent::pointer_up(
+            to,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        harness.drain();
+    }
+
+    #[test]
+    fn dragging_across_text_selects_the_span_forward() {
+        let mut harness = harness(spec(), state("hello world"));
+        harness.focus();
+        let start = caret_position(&harness, 0);
+        let end = caret_position(&harness, 5);
+        drag(&mut harness, start, end);
+        assert_eq!(harness.state().selection(), 0..5);
+        assert_eq!(&harness.state().text()[0..5], "hello");
+        assert!(!harness.state().is_dragging());
+    }
+
+    #[test]
+    fn dragging_backwards_selects_the_span_the_other_way() {
+        let mut harness = harness(spec(), state("hello world"));
+        harness.focus();
+        let start = caret_position(&harness, 5);
+        let end = caret_position(&harness, 0);
+        drag(&mut harness, start, end);
+        assert_eq!(harness.state().selection(), 0..5);
+        assert_eq!(harness.state().caret(), 0, "反向拖选 caret 在起点");
+        assert_eq!(harness.state().selection_anchor(), 5);
+    }
+
+    #[test]
+    fn dragging_past_the_text_clamps_to_the_edge() {
+        let mut harness = harness(spec(), state("hello world"));
+        harness.focus();
+        let start = caret_position(&harness, 5);
+        let far_right = Point::new(2_000.0, start.y);
+        drag(&mut harness, start, far_right);
+        assert_eq!(
+            harness.state().selection(),
+            5..11,
+            "拖出框必须 clamp 到文本尾"
+        );
+    }
+
+    #[test]
+    fn a_plain_click_after_dragging_collapses_the_selection() {
+        let mut harness = harness(spec(), state("hello world"));
+        harness.focus();
+        let from = caret_position(&harness, 0);
+        let to = caret_position(&harness, 5);
+        drag(&mut harness, from, to);
+        assert_eq!(harness.state().selection(), 0..5);
+        let position = caret_position(&harness, 8);
+        harness.app.inject(InputEvent::pointer_down(
+            position,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        harness.app.inject(InputEvent::pointer_up(
+            position,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        harness.drain();
+        assert_eq!(harness.state().selection(), 8..8, "单击不扩选，折叠选区");
+        assert_eq!(harness.state().caret(), 8);
+    }
+
+    // ── P2-3b：双击选词 / 三击选行（用户裁决）──────────────────────────────
+
+    fn click(harness: &mut Harness, position: Point) {
+        harness.app.inject(InputEvent::pointer_down(
+            position,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        harness.app.inject(InputEvent::pointer_up(
+            position,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+    }
+
+    #[test]
+    fn double_click_selects_the_word_under_the_pointer() {
+        let mut harness = harness(spec(), state("hello world"));
+        harness.focus();
+        let position = caret_position(&harness, 2);
+        click(&mut harness, position);
+        click(&mut harness, position);
+        harness.drain();
+        assert_eq!(harness.state().selection(), 0..5, "双击选中 hello");
+    }
+
+    #[test]
+    fn double_click_treats_a_cjk_run_as_one_word() {
+        let mut harness = harness(spec(), state("你好世界 abc"));
+        harness.focus();
+        let position = caret_position(&harness, 3);
+        click(&mut harness, position);
+        click(&mut harness, position);
+        harness.drain();
+        assert_eq!(harness.state().selection(), 0..12, "CJK 连续段是一词");
+    }
+
+    #[test]
+    fn triple_click_selects_the_whole_single_line() {
+        let mut harness = harness(spec(), state("hello world"));
+        harness.focus();
+        let position = caret_position(&harness, 2);
+        click(&mut harness, position);
+        click(&mut harness, position);
+        click(&mut harness, position);
+        harness.drain();
+        assert_eq!(
+            harness.state().selection(),
+            0..11,
+            "三击选行（单行 = 全文）"
+        );
+    }
+
+    // ── P2-3b：InputSpec 运行时更新（M7）───────────────────────────────────
+
+    #[test]
+    fn update_value_rewrites_the_signal_and_reports_invalid_values() {
+        let mut harness = harness(
+            InputSpec {
+                max_length: Some(3),
+                ..spec()
+            },
+            state("old"),
+        );
+        assert!(harness.node.update_value(harness.app.app_mut(), "new"));
+        assert_eq!(harness.state().text(), "new");
+        harness.drain();
+        assert_eq!(
+            harness.node_text(harness.node.text),
+            "new",
+            "重绘后文本节点更新"
+        );
+
+        assert!(
+            harness.node.update_value(harness.app.app_mut(), "abcd"),
+            "超长值按字符裁剪后仍然生效"
+        );
+        assert_eq!(harness.state().text(), "abc");
+        assert_eq!(
+            harness.state().error(),
+            Some(&InputError::TooLong { max: 3 }),
+            "非法值必须写入错误态"
+        );
+        harness.drain();
+        assert_eq!(harness.node_text(harness.node.text), "abc");
+
+        assert!(harness.node.update_value(harness.app.app_mut(), "ab"));
+        assert_eq!(harness.state().text(), "ab");
+        assert_eq!(harness.state().error(), None, "合法值清空错误态");
+    }
+
+    #[test]
+    fn update_value_respects_readonly_and_disabled() {
+        let mut harness = harness(
+            InputSpec {
+                readonly: true,
+                ..spec()
+            },
+            state("locked"),
+        );
+        assert!(!harness.node.update_value(harness.app.app_mut(), "changed"));
+        assert_eq!(harness.state().text(), "locked");
+        let mut harness = self::harness(
+            InputSpec {
+                disabled: true,
+                ..spec()
+            },
+            state("locked"),
+        );
+        assert!(!harness.node.update_value(harness.app.app_mut(), "changed"));
+        assert_eq!(harness.state().text(), "locked");
+    }
+
+    #[test]
+    fn update_placeholder_rewrites_the_placeholder_node() {
+        let mut harness = harness(spec(), state(""));
+        harness.drain();
+        assert_eq!(harness.node_text(harness.node.placeholder), "请输入");
+        assert!(
+            harness
+                .node
+                .update_placeholder(harness.app.app_mut(), "搜索…")
+        );
+        assert_eq!(
+            harness.app.app().read(&harness.placeholder).as_str(),
+            "搜索…",
+            "占位符信号必须失效"
+        );
+        harness.drain();
+        assert_eq!(harness.node_text(harness.node.placeholder), "搜索…");
+        assert!(
+            !harness
+                .node
+                .update_placeholder(harness.app.app_mut(), "搜索…"),
+            "同值写入被等值短路"
         );
     }
 }

@@ -22,6 +22,10 @@
 //! 嵌套的列表 / 引用照常产出块。容器内部**不**合成 [`MarkdownBlock::BlankLine`]——它们的块间距
 //! 由视图决定；空行只在顶层与对齐标签对的内容里按原文补齐。
 //!
+//! 块容器递归有硬性上限 [`MAX_BLOCK_NESTING`]（64 层）：超过上限的容器子树不再递归，可见文字被
+//! 拍平成一个普通段落（容器本身保留一层）。这是防止不可信 markdown（1000 层 `>` 只有约 2 KB）
+//! 把递归栈打爆导致进程 abort 的兜底；comrak 自身的 AST 解析不是本上限的约束对象。
+//!
 //! 图片只认 `![alt](file://{asset_path}?…)` 这一种写法（语法见 [`super::source`]）；
 //! alt 文本照旧不显示，`![alt](https://…)` 之类的图片整张忽略。
 //!
@@ -62,7 +66,7 @@
 //! 这是防止用户可控输入（例如两侧各几千个 `*`）把递归栈打爆导致进程 abort 的兜底，
 //! 真实 markdown 的行内嵌套个位数就够。
 
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
 
 use comrak::{
     Arena, Options,
@@ -81,6 +85,14 @@ use super::{
 
 /// 行内节点允许的最大嵌套层数。
 const MAX_INLINE_NESTING: usize = 64;
+
+/// 块容器（引用 / 列表）的递归深度上限。
+///
+/// 与行内上限对称：源 markdown 并不总是可信（release notes 来自网络、监控文案可由数据拼出），
+/// 1000 层 `>` 只有约 2 KB，却会让「容器 → 子块 → 容器」的递归打爆栈（`STATUS_STACK_OVERFLOW`
+/// 是 abort，不是可捕获的 panic）。超过上限的容器子树**不再递归**：它的可见文字被拍平成一个
+/// 普通段落（容器本身保留一层），排版层因此拿到的 IR 深度有界。
+const MAX_BLOCK_NESTING: usize = 64;
 /// comrak 的 HTML 块类型（`NodeHtmlBlock::block_type`）里第一个"原文就是一串标签"的类型。
 ///
 /// 1..=5 分别是 `<pre>` / `<script>` / `<style>` / `<textarea>`、注释、`<?…?>`、`<!…>` 与
@@ -304,7 +316,7 @@ pub fn parse_document(source: &str, assets: &dyn MarkdownAssets) -> MarkdownDocu
             }
             _ => {
                 let Some((block, end)) =
-                    content_block(node, ParagraphAlign::Left, assets, &mut links)
+                    content_block(node, ParagraphAlign::Left, assets, &mut links, 0)
                 else {
                     continue;
                 };
@@ -334,6 +346,7 @@ fn content_block(
     align: ParagraphAlign,
     assets: &dyn MarkdownAssets,
     links: &mut Vec<SmolStr>,
+    depth: usize,
 ) -> Option<(MarkdownBlock, usize)> {
     let data = node.data();
     let end = data.sourcepos.end.line;
@@ -366,22 +379,33 @@ fn content_block(
             // comrak 的 literal 总以行尾换行结尾；IR 的代码原文不带它（排版层自己决定行尾）。
             code: SmolStr::new(code.literal.strip_suffix('\n').unwrap_or(&code.literal)),
         },
-        NodeValue::BlockQuote => MarkdownBlock::Quote {
-            blocks: container_blocks(node, assets, links).into(),
-        },
+        NodeValue::BlockQuote => {
+            let blocks = if depth + 1 >= MAX_BLOCK_NESTING {
+                Arc::from(vec![flattened_block(node)])
+            } else {
+                container_blocks(node, assets, links, depth + 1).into()
+            };
+            MarkdownBlock::Quote { blocks }
+        }
         NodeValue::List(list) => {
             let ordered = list.list_type == ListType::Ordered;
             // 无序列表恒从 1 开始；有序列表用原文写的起始编号（`0.` 就是 0）。
             let start = if ordered { list.start as u64 } else { 1 };
-            let items = node
-                .children()
-                .filter_map(|item| match &item.data().value {
-                    NodeValue::Item(..) => Some(MarkdownListItem {
-                        blocks: container_blocks(item, assets, links).into(),
-                    }),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
+            let items = if depth + 1 >= MAX_BLOCK_NESTING {
+                // 超过块嵌套上限：列表项的可见文字拍平成一个普通条目。
+                vec![MarkdownListItem {
+                    blocks: Arc::from(vec![flattened_block(node)]),
+                }]
+            } else {
+                node.children()
+                    .filter_map(|item| match &item.data().value {
+                        NodeValue::Item(..) => Some(MarkdownListItem {
+                            blocks: container_blocks(item, assets, links, depth + 1).into(),
+                        }),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
             MarkdownBlock::List {
                 ordered,
                 start,
@@ -398,6 +422,45 @@ fn content_block(
     Some((block, end))
 }
 
+/// 超过块嵌套上限的容器子树：把可见文字拍平成一个普通段落（不再递归）。
+///
+/// 只在 [`content_block`] 的容器分支命中；遍历用 comrak 的 `descendants()`（迭代器，不递归），
+/// 因此这里不会重新引入深递归。行内标记全部丢弃、只留文字与换行——这是**降级**，不是等价渲染；
+/// 台账与 spec-delta 登记该语义（`MAX_BLOCK_NESTING`）。
+fn flattened_block(node: Node<'_>) -> MarkdownBlock {
+    let mut pieces: Vec<MarkdownPiece> = Vec::new();
+    let mut text = String::new();
+    let push_text = |text: &mut String, pieces: &mut Vec<MarkdownPiece>| {
+        if !text.is_empty() {
+            pieces.push(MarkdownPiece::Text {
+                text: SmolStr::new(std::mem::take(text)),
+                strong: false,
+                emphasis: false,
+                strike: false,
+                code: false,
+                link: None,
+                kbd: None,
+            });
+        }
+    };
+    for descendant in node.descendants() {
+        match &descendant.data().value {
+            NodeValue::Text(literal) => text.push_str(literal),
+            NodeValue::Code(code) => text.push_str(&code.literal),
+            NodeValue::SoftBreak | NodeValue::LineBreak => {
+                push_text(&mut text, &mut pieces);
+                pieces.push(MarkdownPiece::LineBreak);
+            }
+            _ => {}
+        }
+    }
+    push_text(&mut text, &mut pieces);
+    MarkdownBlock::Paragraph {
+        align: ParagraphAlign::Left,
+        pieces: pieces.into(),
+    }
+}
+
 /// 解析一个容器（引用、列表项）里的块。
 ///
 /// 容器内部**不**合成 [`MarkdownBlock::BlankLine`]：块间距由视图决定，空行只在顶层与对齐标签对的
@@ -407,9 +470,10 @@ fn container_blocks(
     node: Node<'_>,
     assets: &dyn MarkdownAssets,
     links: &mut Vec<SmolStr>,
+    depth: usize,
 ) -> Vec<MarkdownBlock> {
     node.children()
-        .filter_map(|child| content_block(child, ParagraphAlign::Left, assets, links))
+        .filter_map(|child| content_block(child, ParagraphAlign::Left, assets, links, depth))
         .map(|(block, _)| block)
         .collect()
 }
@@ -740,7 +804,7 @@ fn pair_blocks(
     let mut previous_end = None;
 
     for node in root.children() {
-        let Some((block, end)) = content_block(node, align, assets, links) else {
+        let Some((block, end)) = content_block(node, align, assets, links, 0) else {
             continue;
         };
         push_blank_lines(

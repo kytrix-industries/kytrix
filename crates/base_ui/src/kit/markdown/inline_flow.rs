@@ -133,14 +133,6 @@ impl FlowStyle {
         self.bold = bold;
         self
     }
-
-    /// 本块兜底样式（段落级：字号、颜色、字重）。
-    pub fn base_style(&self) -> TextStyle {
-        let weight = if self.bold { 700 } else { 400 };
-        TextStyle::new(self.font_size)
-            .with_color(self.color)
-            .with_weight(weight)
-    }
 }
 
 /// 一张行内图片的绘制方式：视图层按资源通路决定（`Image` / 占位 `Quad` / 不画）。
