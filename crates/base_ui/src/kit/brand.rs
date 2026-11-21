@@ -1,11 +1,11 @@
-//! 品牌 logo：7 个内置品牌的路径 / 字节 / 固有尺寸，以及图片节点挂载。
+//! 品牌 logo：7 个内置品牌的路径 / 字节 / 固有尺寸，以及 E7 图片节点挂载。
 //!
 //! # 与旧实现的关系
 //!
 //! 旧 `crate::brand` 是「7 条路径常量 + 一个 `Brand` 元素（`img(path)`）」：路径常量给
 //! **命名者**（Widget 占位文案里的内联 `<img>`）用，`Brand` 给**画图者**用。两条用途在这里
 //! 合成一份数据：`BrandKind` 是唯一事实源（路径 / 字节 / 固有尺寸都从它取），`Brand` 负责把
-//! logo 挂成图片节点。
+//! logo 挂成 E7 图片节点。
 //!
 //! # 显式尺寸是 **Contain**（等比内嵌 + 居中），不是拉伸
 //!
@@ -14,30 +14,48 @@
 //! `object_fit.get_bounds(bounds, image_size)`，`src/style.rs`）。旧调用点给的是正方形盒子
 //! （`profile_ui/src/menu.rs` 的 `.size(px(14.))`、`base_ui` 的 `.size_4()`），于是非正方形
 //! logo（Ethereum 44×72、Solana 81×72）是**等比内缩 + 居中**、两侧留白，而不是被拉扁。
-//! 新实现按同一语义复刻：[`Brand::build`] 用 [`contain`] 算出图元矩形，留白时先挂一个
-//! `display_size` 大小的居中容器再挂图片节点（引擎图元没有 object-fit，只能由布局承担）。
+//!
+//! E7 图片节点的 [`ImageFit::Contain`] 就是同一条 CSS `object-fit: contain` 语义：节点盒是
+//! 布局盒（显式尺寸 / 固有尺寸），引擎在 paint 期把 tile 等比内嵌 + 居中（图元 bounds 小于节点
+//! 盒）。本模块因此**不再手算 contain 几何**：给节点显式 `Style` 尺寸 + `ImageFit::Contain`，
+//! 几何由引擎负责（旧实现的私有 `contain()` 与容器节点已删除）。
+//!
+//! # 字节与调制
 //!
 //! 字节来自 [`crate::kit::assets`] 的注册表（`include_bytes!`）；运行期用引擎
-//! `ResourceCache::insert_owned_at_size` 取变体（同内容 + 同变体只占一个 tile）。品牌 logo 是
-//! **彩色** PNG，调制色恒为 `Color::WHITE`（不染色）；白字调制的图片语义见
-//! [`crate::kit::icon`] 的模块文档。
+//! `ResourceCache::insert_owned_at_size`（= `insert_for_display` 的窗口归属版）取变体（同内容 +
+//! 同变体只占一个 tile）。品牌 logo 是**彩色** PNG，调制色恒为 `Color::WHITE`（不染色）。
+//!
+//! # DPI
+//!
+//! 与 [`crate::kit::icon`] 同一条语义：挂载时按 `Window::scale()` 取物理变体，DPI 变化后由
+//! [`Brand::reselect`] 重取变体并 `Window::set_image_resource`（E7 只重解析内在尺寸，不换资产；
+//! 节点的显式 `Style` 尺寸保证布局不跳）。
+//!
+//! # a11y
+//!
+//! 有 [`Brand::with_alt`] 时挂 E7 `Image` 角色 + `A11yOverride::label`（不隐藏）；没有 alt 时由
+//! 引擎按装饰图处理（`hidden` + `MissingAltText { kind: Image }`），与旧实现没有可访问名一致。
 //!
 //! 合规口径沿用旧注释：`Longbridge` 的 PNG 是占位图，正式资产要在取得展示权后替换；路径不变
 //! （设计 §8.5 的合规缺口只登记，不在本批范围）。
 
 use std::fmt;
 
-use taffy::style::{AlignItems, Dimension, JustifyContent};
+use smol_str::SmolStr;
+use taffy::style::Dimension;
 use ui_core::{
+    a11y::A11yOverride,
     app::App,
     error::EngineError,
-    math::{Rect, Size},
-    node::{builder::NodeBuilder, id::NodeId},
+    math::Size,
+    node::{builder::NodeBuilder, id::NodeId, image::ImageFit},
     paint::{color::Color, style::Style},
+    resources::ResourceImage,
     window::WindowId,
 };
 
-use crate::kit::{assets, image_node};
+use crate::kit::assets;
 
 /// 一个内置品牌（= 旧 `crate::brand` 的 7 条路径常量）。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -109,52 +127,64 @@ impl BrandKind {
 }
 
 /// 一个品牌 logo 的绘制声明（尺寸可选：不给 = 固有尺寸）。
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Brand {
     /// 画哪个品牌。
     pub kind: BrandKind,
-    /// 逻辑边长（正方形**容器盒**；`None` = 用固有宽高）。
+    /// 逻辑边长（正方形**节点盒**；`None` = 用固有宽高）。
     ///
-    /// 语义是旧 GPUI `img()` 的默认 `ObjectFit::Contain`（`ImageStyle::default()`）：logo
+    /// 语义是旧 GPUI `img()` 的默认 `ObjectFit::Contain`：logo 由 E7 [`ImageFit::Contain`]
     /// **等比内嵌**进这个正方形并居中，非正方形 logo（Ethereum 44×72 / Solana 81×72）会留白，
     /// 而不是被拉伸成正方形（见模块文档与 spec-delta §6 第 5 条）。
     pub size: Option<f32>,
+    /// 可访问名（alt）。`None` = 装饰图（引擎按 hidden + `MissingAltText` 处理）。
+    pub alt: Option<SmolStr>,
 }
 
 impl Brand {
-    /// 固有尺寸的 logo。
+    /// 固有尺寸、无 alt 的 logo。
     #[must_use]
     pub const fn new(kind: BrandKind) -> Self {
-        Self { kind, size: None }
+        Self {
+            kind,
+            size: None,
+            alt: None,
+        }
     }
 
-    /// 正方形容器盒的边长（逻辑像素）。
+    /// 正方形节点盒的边长（逻辑像素）。
     #[must_use]
     pub const fn with_size(mut self, side: f32) -> Self {
         self.size = Some(side);
         self
     }
 
-    /// 容器盒尺寸（逻辑像素；正方形盒 / 固有尺寸）。
-    ///
-    /// 图元本身按 Contain 等比内嵌（[`contain`]），所以非正方形 logo 在正方形盒里的图元尺寸
-    /// **小于**盒尺寸；唯一没有留白的情况是盒子与 logo 同宽高比（正方形品牌、或不给尺寸）。
+    /// 可访问名（旧 GPUI `img().alt(..)` 的对位；E7 走 `A11yOverride::label`）。
     #[must_use]
-    pub fn display_size(self) -> Size {
+    pub fn with_alt(mut self, alt: impl Into<SmolStr>) -> Self {
+        self.alt = Some(alt.into());
+        self
+    }
+
+    /// 节点盒尺寸（逻辑像素；正方形盒 / 固有尺寸）。
+    ///
+    /// E7 `Contain` 的图元 bounds 可能小于节点盒（非正方形 logo 的留白）；唯一没有留白的情况是
+    /// 盒子与 logo 同宽高比（正方形品牌、或不给尺寸）。
+    #[must_use]
+    pub fn display_size(&self) -> Size {
         match self.size {
             Some(side) => Size::new(side, side),
             None => self.kind.native_size(),
         }
     }
 
-    /// 把 logo 挂到 `parent` 末尾，返回**布局容器**句柄（无留白时就是图片节点本身）。
+    /// 把 logo 挂到 `parent` 末尾，返回 E7 图片节点句柄（布局盒 = [`Brand::display_size`]）。
     ///
-    /// 与 [`crate::kit::icon::IconSpec::build`] 同一条图片通道（行内盒图片），差别是：
-    /// - 资源是**彩色**品牌 PNG、调制色恒为白色；
-    /// - 显式尺寸按旧 GPUI `ObjectFit::Contain` 语义**等比内嵌 + 居中**：无留白（正方形品牌 /
-    ///   固有尺寸）直接挂图片节点；有留白时先挂一个 `display_size` 大小的 flex 容器
-    ///   （`justify_content` / `align_items` = CENTER），图片节点是它唯一的子节点。返回的句柄
-    ///   布局盒恒为 [`Brand::display_size`]。
+    /// 与 [`crate::kit::icon::IconSpec::build`] 同一条 E7 图片通道，差别是：
+    /// - 资源是**彩色**品牌 PNG，调制色 `Color::WHITE`（不染色）；
+    /// - [`ImageFit::Contain`] = 旧 `ObjectFit::Contain` 语义（等比内嵌 + 居中，图元 bounds 在
+    ///   节点盒内留白）：几何由引擎在 paint 期算，本模块不再手算 contain、也不再挂容器节点；
+    /// - 有 [`Brand::alt`] 时挂 `Image` 角色 + label；没有 alt 时引擎按装饰图隐藏。
     ///
     /// # Errors
     /// - [`BrandError::UnknownWindow`]：窗口已关闭；
@@ -172,66 +202,91 @@ impl Brand {
         {
             return Err(BrandError::InvalidSize { size: side });
         }
+        let frame = self.display_size();
         let scale = app
             .window(window)
             .ok_or(BrandError::UnknownWindow { window })?
             .scale()
             .factor();
-        let frame = self.display_size();
-        let image = contain(self.kind.native_size(), frame);
-        let draw = image.size;
-        // 物理目标按**图元**尺寸取（不是容器盒）：留白区不该占图集分辨率。
-        let physical = Size::new(draw.width * scale, draw.height * scale);
-        let resource = app
-            .resources_mut()
-            .insert_owned_at_size(window, self.kind.bytes(), physical)
-            .map_err(BrandError::Decode)?;
-        if image.origin.x == 0.0 && image.origin.y == 0.0 {
-            return image_node::mount(app, window, parent, resource.id, draw, Color::WHITE)
-                .map_err(BrandError::Node);
-        }
+        let resource = self.resource_for(app, window, scale)?;
+
         let mut style = Style::default();
         style.inner.size.width = Dimension::length(frame.width);
         style.inner.size.height = Dimension::length(frame.height);
-        style.inner.justify_content = JustifyContent::CENTER;
-        style.inner.align_items = AlignItems::CENTER;
-        let container = NodeBuilder::boxed()
-            .style(style)
+        let mut builder = NodeBuilder::image(resource.id, ImageFit::Contain)
+            .image_modulation(Color::WHITE)
+            .style(style);
+        if let Some(alt) = self.alt {
+            builder = builder.a11y(A11yOverride {
+                label: Some(alt),
+                ..A11yOverride::default()
+            });
+        }
+        builder
             .build(
                 app.window_mut(window)
                     .ok_or(BrandError::UnknownWindow { window })?
                     .tree_mut(),
                 parent,
             )
-            .map_err(BrandError::Node)?;
-        image_node::mount(app, window, container, resource.id, draw, Color::WHITE)
-            .map_err(BrandError::Node)?;
-        Ok(container)
+            .map_err(BrandError::Node)
     }
-}
 
-/// 等比内缩（CSS `object-fit: contain`）：把 `native` 等比缩放进 `frame` 并居中。
-///
-/// 公式与旧 GPUI `ObjectFit::Contain::get_bounds`（`gpui-pre-0.3.12/src/style.rs`）逐式相同：
-/// 按「容器宽高比 vs 图宽高比」选约束方向，再把余量**均分**到两侧。返回**相对 frame 左上角**
-/// 的图元矩形（逻辑像素）—— `x` / `y` 就是留白。
-///
-/// 例：Ethereum（44×72）在 36×36 的盒里 ⇒ 22×36，左右各留白 7；Solana（81×72）⇒ 36×32，
-/// 上下各留白 2。Contain 允许**放大**（10×10 放进 40×40 ⇒ 40×40），与 GPUI 一致（不是 ScaleDown）。
-fn contain(native: Size, frame: Size) -> Rect {
-    let native_ratio = native.width / native.height;
-    let frame_ratio = frame.width / frame.height;
-    let draw = if frame_ratio > native_ratio {
-        Size::new(native.width * (frame.height / native.height), frame.height)
-    } else {
-        Size::new(frame.width, native.height * (frame.width / native.width))
-    };
-    Rect::new(
-        (frame.width - draw.width) / 2.0,
-        (frame.height - draw.height) / 2.0,
-        draw.width,
-        draw.height,
-    )
+    /// DPI 变化后重选档位并把新变体换到已挂载的品牌图片节点上（E7 `set_image_resource`）。
+    ///
+    /// 语义与 [`crate::kit::icon::IconSpec::reselect`] 相同：节点盒是显式 `Style` 尺寸，换变体
+    /// 只影响采样密度、不改变布局；帧外调用后由 `App::request_repaint` 保证下一帧重绘。
+    ///
+    /// # Errors
+    /// - [`BrandError::UnknownWindow`] / [`BrandError::InvalidSize`]：同 [`Brand::build`]；
+    /// - [`BrandError::NotImageNode`]：`node` 不是品牌图节点（例如传成了别的节点）；
+    /// - [`BrandError::Decode`] / [`BrandError::Node`]：引擎强类型错误（陈旧节点是
+    ///   `Node(EngineError::StaleNode { .. })`）。
+    pub fn reselect(
+        self,
+        app: &mut App,
+        window: WindowId,
+        node: NodeId,
+    ) -> Result<ResourceImage, BrandError> {
+        if let Some(side) = self.size
+            && (!side.is_finite() || side <= 0.0)
+        {
+            return Err(BrandError::InvalidSize { size: side });
+        }
+        let scale = app
+            .window(window)
+            .ok_or(BrandError::UnknownWindow { window })?
+            .scale()
+            .factor();
+        let resource = self.resource_for(app, window, scale)?;
+        let accepted = app
+            .window_mut(window)
+            .ok_or(BrandError::UnknownWindow { window })?
+            .set_image_resource(node, resource.id)
+            .map_err(BrandError::Node)?;
+        if !accepted {
+            return Err(BrandError::NotImageNode { node });
+        }
+        app.request_repaint(window).map_err(BrandError::Node)?;
+        Ok(resource)
+    }
+
+    /// 按 `scale` 取图集变体（`build` / `reselect` 共用的插入路径）。
+    ///
+    /// 物理目标 = 节点盒 × scale：引擎按目标尺寸等比 fit 解码，所以非正方形 logo 的留白区不占
+    /// 图集分辨率（Ethereum 44×72 在 36×36 盒里解出 22×36）。
+    fn resource_for(
+        &self,
+        app: &mut App,
+        window: WindowId,
+        scale: f32,
+    ) -> Result<ResourceImage, BrandError> {
+        let frame = self.display_size();
+        let physical = Size::new(frame.width * scale, frame.height * scale);
+        app.resources_mut()
+            .insert_owned_at_size(window, self.kind.bytes(), physical)
+            .map_err(BrandError::Decode)
+    }
 }
 
 /// 品牌 logo 挂载失败（强类型；`Display` 给日志，`source` 给引擎错误链）。
@@ -247,9 +302,14 @@ pub enum BrandError {
         /// 传入的边长。
         size: f32,
     },
+    /// `reselect` 的目标节点不是品牌图片节点。
+    NotImageNode {
+        /// 传入的节点句柄。
+        node: NodeId,
+    },
     /// 品牌 PNG 解码 / 图集装箱失败（引擎错误）。
     Decode(EngineError),
-    /// 建树失败（引擎错误）。
+    /// 建树 / 换句柄失败（引擎错误）。
     Node(EngineError),
 }
 
@@ -262,6 +322,12 @@ impl fmt::Display for BrandError {
             BrandError::InvalidSize { size } => {
                 write!(formatter, "brand logo size {size} must be finite and > 0")
             }
+            BrandError::NotImageNode { node } => {
+                write!(
+                    formatter,
+                    "brand reselect target {node:?} is not an image node"
+                )
+            }
             BrandError::Decode(error) => write!(formatter, "brand logo decode failed: {error}"),
             BrandError::Node(error) => write!(formatter, "brand logo node mount failed: {error}"),
         }
@@ -272,7 +338,9 @@ impl std::error::Error for BrandError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             BrandError::Decode(error) | BrandError::Node(error) => Some(error),
-            BrandError::UnknownWindow { .. } | BrandError::InvalidSize { .. } => None,
+            BrandError::UnknownWindow { .. }
+            | BrandError::InvalidSize { .. }
+            | BrandError::NotImageNode { .. } => None,
         }
     }
 }
@@ -280,12 +348,17 @@ impl std::error::Error for BrandError {
 #[cfg(test)]
 mod tests {
     use ui_core::{
-        math::{Rect, Size},
+        a11y::A11yRole,
+        math::{Rect, Scale, Size},
+        node::{builder::NodeBuilder, image::ImageFit, tree::NodeKind},
         paint::{color::Color, primitive::Image},
+        test_support::app::TestApp,
     };
 
-    use super::{Brand, BrandError, BrandKind, contain};
-    use crate::kit::test_support::{assert_single_image, bounds, image_primitives, test_app};
+    use super::{Brand, BrandError, BrandKind};
+    use crate::kit::test_support::{
+        assert_single_image, bounds, image_primitives, test_app, test_app_with_scale,
+    };
 
     /// 7 个品牌：名字唯一、路径与旧模块的常量逐字一致、字节与旧 rust-embed 资产逐字节一致。
     #[test]
@@ -334,7 +407,7 @@ mod tests {
         );
     }
 
-    /// 容器盒 / 图元盒的浮点容差断言（`contain` 的除法在 f32 末位有抖动）。
+    /// 浮点容差断言（E7 `Contain` 的等比缩放 / 居中是 f32 计算，末位有抖动）。
     fn assert_rect_near(actual: Rect, expected: Rect) {
         let eps = 1e-2;
         assert!(
@@ -346,84 +419,37 @@ mod tests {
         );
     }
 
-    /// 挂一个品牌并返回（容器盒, 唯一图元）。每个 `TestApp` 只挂一个品牌。
+    /// 挂一个品牌并返回（节点盒, 唯一图元）；同时锁定节点形态（E7 图片叶子 + `Contain`）。
     fn measured(brand: Brand) -> (Rect, Image) {
         let mut app = test_app();
         let window = app.window_id();
         let root = app.app().window(window).expect("test window").tree().root();
         let node = brand.build(app.app_mut(), window, root).expect("品牌挂载");
         let _ = app.drain().expect("首帧");
-        let frame = bounds(&app, node).expect("容器布局盒");
+        {
+            let tree = app.app().window(window).expect("test window").tree();
+            let mounted = tree.get(node).expect("品牌节点");
+            assert!(
+                matches!(
+                    mounted.kind(),
+                    NodeKind::Image(content) if content.fit() == ImageFit::Contain
+                ),
+                "品牌必须是 ImageFit::Contain 的 E7 图片节点：{:?}",
+                mounted.kind()
+            );
+            assert!(
+                mounted.children().is_empty(),
+                "品牌是图片叶子，不能挂子节点"
+            );
+        }
+        let frame = bounds(&app, node).expect("品牌节点布局盒");
         (frame, assert_single_image(&app))
     }
 
-    /// **F2 纯几何**：`contain` 在 1:1 / 2:1 / 1:2 与不同比例容器下的内缩 + 居中。
+    /// **Contain 集成**：真实品牌在正方形节点盒里等比内嵌 + 居中 + 留白；正方形品牌/固有尺寸无留白。
     ///
-    /// 公式与旧 GPUI `ObjectFit::Contain::get_bounds` 逐式相同；这里锁定「等比、居中、留白」
-    /// 三条可机器验证的性质（把 `build` 改回拉伸填充 ⇒ 集成用例变红，见
-    /// `non_square_brands_are_contained_in_the_requested_square`）。
-    #[test]
-    fn contain_keeps_the_aspect_ratio_and_centers_the_letterbox() {
-        // 1:1 图放进 2:1 容器：上下贴满、左右各留白 50。
-        assert_rect_near(
-            contain(Size::new(100.0, 100.0), Size::new(200.0, 100.0)),
-            Rect::new(50.0, 0.0, 100.0, 100.0),
-        );
-        // 2:1 图放进 1:1 容器：左右贴满、上下各留白 25。
-        assert_rect_near(
-            contain(Size::new(200.0, 100.0), Size::new(100.0, 100.0)),
-            Rect::new(0.0, 25.0, 100.0, 50.0),
-        );
-        // 1:2 图放进 1:1 容器：上下贴满、左右各留白 25。
-        assert_rect_near(
-            contain(Size::new(100.0, 200.0), Size::new(100.0, 100.0)),
-            Rect::new(25.0, 0.0, 50.0, 100.0),
-        );
-        // 1:1 图放进 1:1 容器：没有留白（盒子与图元重合）。
-        assert_rect_near(
-            contain(Size::new(100.0, 100.0), Size::new(100.0, 100.0)),
-            Rect::new(0.0, 0.0, 100.0, 100.0),
-        );
-        // 4:3 图放进 3:4 容器：宽度贴满、上下各留白 87.5。
-        assert_rect_near(
-            contain(Size::new(400.0, 300.0), Size::new(300.0, 400.0)),
-            Rect::new(0.0, 87.5, 300.0, 225.0),
-        );
-        // Contain 允许放大（不是 ScaleDown）：10×10 放进 40×40 ⇒ 40×40。
-        assert_rect_near(
-            contain(Size::new(10.0, 10.0), Size::new(40.0, 40.0)),
-            Rect::new(0.0, 0.0, 40.0, 40.0),
-        );
-
-        // 性质断言（不依赖具体数字）：图元宽高比 == 源宽高比、图元不溢出、x/y 余量两侧相等。
-        for (native, frame) in [
-            (Size::new(44.0, 72.0), Size::new(36.0, 36.0)),
-            (Size::new(81.0, 72.0), Size::new(36.0, 36.0)),
-            (Size::new(300.0, 100.0), Size::new(64.0, 48.0)),
-            (Size::new(100.0, 300.0), Size::new(64.0, 48.0)),
-        ] {
-            let image = contain(native, frame);
-            let native_ratio = native.width / native.height;
-            let drawn_ratio = image.size.width / image.size.height;
-            assert!(
-                (native_ratio - drawn_ratio).abs() < 1e-4,
-                "{native:?} → {frame:?} 的图元宽高比漂移：{drawn_ratio} vs {native_ratio}"
-            );
-            assert!(
-                image.size.width <= frame.width + 1e-3 && image.size.height <= frame.height + 1e-3,
-                "{native:?} → {frame:?} 的图元溢出容器：{image:?}"
-            );
-            assert!(
-                (image.origin.x - (frame.width - image.size.width) / 2.0).abs() < 1e-4
-                    && (image.origin.y - (frame.height - image.size.height) / 2.0).abs() < 1e-4,
-                "{native:?} → {frame:?} 没有居中：{image:?}"
-            );
-        }
-    }
-
-    /// **F2 集成**：真实品牌在正方形盒里等比内嵌 + 居中 + 留白；正方形品牌/固有尺寸无留白。
-    ///
-    /// 变异「改回拉伸填充」（图元 = 容器盒）⇒ Ethereum 的 22×36 / Solana 的 36×32 断言变红。
+    /// 变异「把 `ImageFit::Contain` 改回 `Fill`」（图元 = 节点盒）⇒ Ethereum 的 22×36 / Solana 的
+    /// 36×32 断言变红。
     #[test]
     fn non_square_brands_are_contained_in_the_requested_square() {
         // Ethereum 44×72 放进 36×36：等比内缩到 22×36，左右各留白 7。
@@ -437,7 +463,7 @@ mod tests {
         assert_rect_near(frame, Rect::new(0.0, 0.0, 36.0, 36.0));
         assert_rect_near(image.bounds, Rect::new(0.0, 2.0, 36.0, 32.0));
 
-        // 正方形品牌：盒子与图元重合，没有留白（也不需要多余的容器节点）。
+        // 正方形品牌：节点盒与图元重合，没有留白（单节点，没有额外容器）。
         let (frame, image) = measured(Brand::new(BrandKind::Binance).with_size(36.0));
         assert_rect_near(frame, Rect::new(0.0, 0.0, 36.0, 36.0));
         assert_rect_near(image.bounds, Rect::new(0.0, 0.0, 36.0, 36.0));
@@ -448,14 +474,18 @@ mod tests {
         assert_rect_near(image.bounds, Rect::new(0.0, 0.0, 44.0, 72.0));
     }
 
-    /// 挂载：一个 `Image` 图元、不染色（`Color::WHITE`）、容器盒 = 给定尺寸。
+    /// 挂载：一个 `Image` 图元、不染色（`Color::WHITE`）、节点盒 = 给定尺寸。
+    ///
+    /// Solana 81×72 放进 32×32：解码变体按物理目标等比 fit 成 **32×28**（整数像素取整，见
+    /// `resources::image::resolve_target`），E7 `Contain` 再按 tile 宽高比内嵌 + 居中 ⇒ 32×28
+    /// （上下各留白 2）。这是 E7 语义与旧实现（手算 32×28.444 后拉伸 tile）**有意的差异**：
+    /// 几何跟随真实解码像素，而不是 FP 理论值。
     #[test]
     fn a_brand_mounts_an_unmodulated_image_node() {
         let (frame, image) = measured(Brand::new(BrandKind::Solana).with_size(32.0));
         assert_rect_near(frame, Rect::new(0.0, 0.0, 32.0, 32.0));
         assert_eq!(image.modulation, Color::WHITE, "品牌图不染色");
-        // Solana 81×72 放进 32×32：等比内缩到 32×28.44，上下各留白 1.78。
-        assert_rect_near(image.bounds, Rect::new(0.0, 1.778, 32.0, 28.444));
+        assert_rect_near(image.bounds, Rect::new(0.0, 2.0, 32.0, 28.0));
     }
 
     /// 非法尺寸（0 / 负数 / NaN / ±∞）/ 已关闭窗口是强类型错误。
@@ -475,6 +505,24 @@ mod tests {
             );
         }
 
+        // `reselect` 只接受图片节点（与 `set_image_resource` 的契约一致）。
+        let container = NodeBuilder::boxed()
+            .build(
+                app.app_mut()
+                    .window_mut(window)
+                    .expect("test window")
+                    .tree_mut(),
+                root,
+            )
+            .expect("容器");
+        let error = Brand::new(BrandKind::Binance)
+            .reselect(app.app_mut(), window, container)
+            .expect_err("非图片节点必须失败");
+        assert!(
+            matches!(error, BrandError::NotImageNode { node } if node == container),
+            "非图片节点的错误分类不对：{error:?}"
+        );
+
         assert!(app.app_mut().close_window(window), "窗口必须存在");
         let error = Brand::new(BrandKind::Binance)
             .build(app.app_mut(), window, root)
@@ -482,7 +530,7 @@ mod tests {
         assert!(matches!(error, BrandError::UnknownWindow { window: closed } if closed == window));
     }
 
-    /// 旧的 `image_primitives` 视图在品牌挂载后只有一张图（回归：容器 + 子节点不得复制图元）。
+    /// 品牌挂载后场景里只有一张图（回归：E7 单图片叶子不得复制图元）。
     #[test]
     fn a_letterboxed_brand_still_encodes_exactly_one_image_primitive() {
         let mut app = test_app();
@@ -494,5 +542,110 @@ mod tests {
             .expect("品牌挂载");
         let _ = app.drain().expect("首帧");
         assert_eq!(image_primitives(&app).len(), 1);
+    }
+
+    /// **a11y**：有 alt ⇒ E7 `Image` 角色 + label（不隐藏）；无 alt ⇒ 引擎按装饰图 hidden。
+    #[test]
+    fn brand_alt_maps_to_the_image_role_and_label() {
+        let mut app = test_app();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let root = app.app().window(window).expect("test window").tree().root();
+        let labelled = Brand::new(BrandKind::Binance)
+            .with_size(16.0)
+            .with_alt("Binance")
+            .build(app.app_mut(), window, root)
+            .expect("有 alt 的品牌挂载");
+        let decorative = Brand::new(BrandKind::Ethereum)
+            .with_size(16.0)
+            .build(app.app_mut(), window, root)
+            .expect("无 alt 的品牌挂载");
+        let _ = app.drain().expect("首帧");
+
+        let snapshot = app.a11y().expect("a11y 交付");
+        let labelled_record = snapshot.node_for(labelled).expect("有 alt 的品牌节点");
+        assert_eq!(labelled_record.role, A11yRole::Image, "E7 图片节点角色");
+        assert_eq!(
+            labelled_record.label_text(),
+            Some("Binance"),
+            "alt 进 label"
+        );
+        assert!(!labelled_record.hidden, "有 alt 的品牌图不得隐藏");
+        assert!(
+            labelled_record.actions.is_empty(),
+            "品牌图默认非交互，实际 {:?}",
+            labelled_record.actions
+        );
+
+        let decorative_record = snapshot.node_for(decorative).expect("无 alt 的品牌节点");
+        assert_eq!(decorative_record.role, A11yRole::Image);
+        assert!(
+            decorative_record.hidden,
+            "无 alt 的品牌图按装饰图 hidden（引擎的 MissingAltText 语义）"
+        );
+    }
+
+    /// **DPI 换档**：2× 后 `reselect` 等价于引擎的 `insert_for_display(节点盒, 2×)`；图元换新 tile、
+    /// `Contain` 几何与布局盒不变（显式 `Style` 尺寸）。
+    ///
+    /// 变异防线：`reselect` 不换句柄 / 固定 1× 变体 ⇒ 变体相等与 tile 变化断言变红。
+    #[test]
+    fn reselecting_after_a_dpi_change_swaps_to_the_2x_variant() {
+        let mut app = test_app_with_scale(1.0);
+        let window = app.window_id();
+        let root = app.app().window(window).expect("test window").tree().root();
+        let brand = Brand::new(BrandKind::Solana).with_size(32.0);
+        let node = brand
+            .clone()
+            .build(app.app_mut(), window, root)
+            .expect("品牌挂载");
+        let _ = app.drain().expect("1× 首帧");
+        let before = assert_single_image(&app);
+
+        set_window_scale(&mut app, 2.0);
+        let _ = app.drain().expect("2× 首帧（E7 只重解析内在尺寸）");
+        assert_rect_near(
+            bounds(&app, node).expect("品牌节点布局盒"),
+            Rect::new(0.0, 0.0, 32.0, 32.0),
+        );
+        assert_eq!(
+            assert_single_image(&app).bounds,
+            before.bounds,
+            "换变体前几何照旧"
+        );
+
+        let resource = brand
+            .reselect(app.app_mut(), window, node)
+            .expect("重选档位");
+        let expected = app
+            .app_mut()
+            .resources_mut()
+            .insert_for_display(BrandKind::Solana.bytes(), Size::new(32.0, 32.0), 2.0)
+            .expect("引擎的 E7 显示变体");
+        assert_eq!(
+            resource, expected,
+            "reselect 必须等价于 insert_for_display(节点盒, 2×)"
+        );
+        assert!(
+            resource.width > 32 || resource.height > 32,
+            "2× 变体的物理像素必须比 1× 更大：{resource:?}"
+        );
+
+        let _ = app.drain().expect("换变体后一帧");
+        let after = assert_single_image(&app);
+        assert_eq!(after.tile, resource.tile, "图元必须用 2× 变体的 tile");
+        assert_ne!(after.tile, before.tile, "换档必须换到另一张 tile");
+        // 解码变体：1× = 32×28、2× = 64×56（`fit_into` 等比 + floor 取整），宽高比同为 8:7 ⇒
+        // E7 `Contain` 的图元几何在两个 DPI 档一致（32×28，上下各留白 2）。
+        assert_rect_near(after.bounds, Rect::new(0.0, 2.0, 32.0, 28.0));
+    }
+
+    /// 改窗口 DPI（`Window::set_scale` 递增 `scale_epoch`；E7 下一帧布局前重解析内在尺寸）。
+    fn set_window_scale(app: &mut TestApp, scale: f32) {
+        let window = app.window_id();
+        app.app_mut()
+            .window_mut(window)
+            .expect("test window")
+            .set_scale(Scale::new(scale).expect("测试 DPI 必须是有限正数"));
     }
 }
