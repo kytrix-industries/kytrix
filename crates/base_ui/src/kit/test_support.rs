@@ -23,11 +23,16 @@
 use std::{thread, time::Duration};
 
 use ui_core::{
+    a11y::{A11yNode, A11yNodeId, A11yTreeSnapshot},
     app::App,
     math::{Rect, Scale},
     node::id::NodeId,
     paint::primitive::{Image, Primitive},
-    test_support::{app::TestApp, record::FrameRecord},
+    test_support::{
+        a11y::{ShadowTree, tree_update_snapshot},
+        app::TestApp,
+        record::FrameRecord,
+    },
     window::{WindowId, WindowOptions},
 };
 
@@ -185,6 +190,159 @@ impl DecodeApp {
 impl Default for DecodeApp {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── a11y 断言辅助（P2-2e：列表 / 表格 / 树采纳 E9 集合语义） ────────────────────────────
+
+/// 逐笔校验 `TreeUpdate` 的影子树。
+///
+/// 与 [`TestApp::assert_a11y_contract`] 同源（都用 `ui_core::test_support::a11y::ShadowTree`，
+/// 含 E9b 的**父唯一性**契约），区别是这里由测试自己**逐笔**应用：可以断言「每一笔都合法」，
+/// 而不是只看 `TestApp` 记录的最近一笔。用法：
+///
+/// ```ignore
+/// let mut updates = A11yUpdates::new();
+/// // 每个 drain 之后：
+/// updates.apply(&app);
+/// // 场景结束：
+/// assert!(updates.applied() >= 2, "多笔交付都必须过契约");
+/// ```
+#[derive(Debug, Default)]
+pub struct A11yUpdates {
+    shadow: ShadowTree,
+    applied: usize,
+}
+
+impl A11yUpdates {
+    /// 空影子。
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 应用最近一帧的 `TreeUpdate`（没有交付时返回 `false`）。
+    ///
+    /// # Panics
+    /// `TreeUpdate` 违反 AccessKit 契约（父唯一 / 无孤儿 / 删除可达 / 焦点存在）。
+    pub fn apply(&mut self, app: &TestApp) -> bool {
+        let Some(update) = app.a11y_update() else {
+            return false;
+        };
+        if let Err(error) = self.shadow.apply(update) {
+            panic!(
+                "TreeUpdate 违反 AccessKit 契约：{error}\n--- update ---\n{}",
+                tree_update_snapshot(update)
+            );
+        }
+        self.applied += 1;
+        true
+    }
+
+    /// 已应用的笔数。
+    #[must_use]
+    pub fn applied(&self) -> usize {
+        self.applied
+    }
+
+    /// 影子树里的节点数。
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.shadow.len()
+    }
+
+    /// 影子树是否为空。
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.shadow.is_empty()
+    }
+}
+
+/// 强制一笔全树 a11y 交付并返回快照（同时校验「增量树 = 全树」oracle 与最近一笔契约）。
+///
+/// 需要先 [`TestApp::enable_a11y_capture`]。
+///
+/// # Panics
+/// a11y 增量与全量分叉，或最近一笔违反契约。
+#[must_use]
+pub fn full_a11y(app: &mut TestApp) -> A11yTreeSnapshot {
+    if let Some(diff) = app.a11y_oracle_diff() {
+        panic!("a11y 增量与全量分叉：{diff}");
+    }
+    app.assert_a11y_contract();
+    app.a11y().expect("强制全树交付必须产出 a11y 快照").clone()
+}
+
+/// 推进一帧并断言本帧的 a11y `TreeUpdate` 合法（没有交付的帧是 no-op）。
+///
+/// # Panics
+/// 帧失败，或本帧 `TreeUpdate` 违反契约。
+pub fn frame_a11y(app: &mut TestApp) {
+    let _ = app.drain().expect("a11y 帧");
+    app.assert_a11y_contract();
+}
+
+/// 快照里某个引擎句柄的 a11y 记录（全树快照上使用）。
+///
+/// # Panics
+/// 快照里没有该节点（多半是拿增量快照当全树用了）。
+#[must_use]
+pub fn a11y_of(snapshot: &A11yTreeSnapshot, node: NodeId) -> &A11yNode {
+    snapshot
+        .node_for(node)
+        .unwrap_or_else(|| panic!("a11y 快照里没有引擎节点 {node:?}（需要全树快照）"))
+}
+
+/// 快照里某个引擎句柄的 a11y 身份。
+///
+/// # Panics
+/// 快照里没有该节点。
+#[must_use]
+pub fn a11y_id(snapshot: &A11yTreeSnapshot, node: NodeId) -> A11yNodeId {
+    a11y_of(snapshot, node).id
+}
+
+/// a11y 树的硬不变量：每个节点**只有一个父**，且父的 `children` 必须列出它（E9 父唯一性 /
+/// 无孤儿）。与 `ui_core::a11y::tree` 测试里的同名 helper 同口径，断言面是引擎快照。
+///
+/// # Panics
+/// 双父 / 孤儿 / children 指向快照里不存在的节点。
+pub fn assert_single_parent_per_node(snapshot: &A11yTreeSnapshot) {
+    let mut by_id: ahash::HashMap<A11yNodeId, &A11yNode> = ahash::HashMap::default();
+    for node in snapshot.nodes() {
+        by_id.insert(node.id, node);
+    }
+    let mut parent_of: ahash::HashMap<A11yNodeId, A11yNodeId> = ahash::HashMap::default();
+    for node in snapshot.nodes() {
+        for child in &node.children {
+            let Some(child_node) = by_id.get(child) else {
+                panic!(
+                    "节点 {:?} 的 children 里有快照外的子节点 {child:?}（不可达 / 孤儿）",
+                    node.engine
+                );
+            };
+            if let Some(previous) = parent_of.insert(*child, node.id) {
+                assert_eq!(
+                    previous, node.id,
+                    "节点 {:?} 同时挂在 {previous:?} 与 {:?} 两个父下",
+                    child_node.engine, node.id
+                );
+            }
+        }
+    }
+    for node in snapshot.nodes() {
+        let Some(parent) = node.parent else {
+            continue;
+        };
+        let Some(parent_node) = by_id.get(&parent) else {
+            // 窗口根的 a11y 父不在快照范围内；其余父必须在。
+            continue;
+        };
+        assert!(
+            parent_node.children.contains(&node.id),
+            "节点 {:?} 的父 {parent:?} 没有把它列进 children（孤儿）",
+            node.engine
+        );
     }
 }
 

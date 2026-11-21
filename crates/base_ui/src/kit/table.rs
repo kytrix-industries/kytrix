@@ -34,13 +34,35 @@
 //! 列**的 `sortable`，指示符画在这个合并表头里；行命中 / 选中 / hover 语义不变（命中链落到
 //! 行容器）。
 //!
-//! # a11y
+//! # a11y（E9 集合语义）
 //!
-//! 表格容器 `Table`、表头行 / 数据行 `Row`、表头 `ColumnHeader`、单元格 `Cell` 都显式声明，
-//! 行列位置 / 总数与 `aria-sort` 走 `A11yPatch`（虚拟列表的行挂在列表容器下、不是 `Table` 的
-//! 直接子节点，引擎的自动表格推导覆盖不到，所以索引全部显式给）。**残余**：AccessKit 的
-//! 表格行列导航按 `Table` 的直接子节点遍历，虚拟化后行在 `List` 视口内，AT 的“按行/列跳转”
-//! 不完整 —— 登记为缺口（需要引擎在虚拟列表上提行角色或提供表格专用的虚拟化语义）。
+//! 采纳引擎 E9 的表格集合语义：容器静态声明 [`A11yRole::Table`]、表头行与数据行 `Row`、表头
+//! `ColumnHeader`、单元格 `Cell`。引擎把**行窗口**（行体虚拟列表的 `viewport`）里声明了 `Row`
+//! 的已挂载行挂到最近的 `Table` 祖先下、把单元格挂到最近的 `Row` 下 —— 行体 `List` 与单元格
+//! 排板盒只是布局包裹层，`Table → Row → Cell` 的 AT 结构成立。
+//!
+//! **行列语义**（E9）：`Row::row_index` 由引擎推导 —— 0 = 表头行、数据行 = 行窗口基址 + 条目
+//! **逻辑下标**；`Cell::row_index` / `column_index` 来自所在行。行**总数**同样由引擎推导
+//! （行窗口 `slot.count` + 表头行，含未挂载条目）。例外是表头行 / 表头单元格：它们不随虚拟行
+//! 重建，而引擎在 `slot.count` 变化时不会把集合节点标 A11Y 脏 —— 两者显式声明 `row_count`
+//! （读行数信号）保证增量交付里的总数是新鲜的（数据行 / 表格容器会在 `set_count` 重建行时
+//! 随新行或被重发的行窗口祖先链更新；增量 vs 全树 oracle 会抓到漏更新）。另两项是推导不出来
+//! 的，必须声明：
+//! - `column_index`（`A11yOverride`）：跨列合并时被覆盖的列不单独绘制，列号必须按**起始列**
+//!   声明（声明值优先于「行内单元格序」的推导）；
+//! - `Table::column_count`：推导只能数画出来的单元格，跨列合并时小于逻辑列数，故在表上声明。
+//!
+//! 多选状态由列表内核的行基线进 `A11yPatch::selected`（每行一个布尔）；可排序表头宣告
+//! `A11ySort::{Ascending, Descending, None}`（`aria-sort`），▲ / ▼ 装饰字形显式 hidden。
+//! 空态文案是行体浮层里的 `Label` 节点：行数为 0 时可见，有行后随浮层 `visible = false`
+//! 变成 a11y `hidden`（AccessKit 沿 a11y 子树排除）。
+//!
+//! **残余**（`.docs/gui-migration/spec-deltas/kit-a11y.md`）：
+//! - 行窗口（`List`）自身仍是 `Table` 的 a11y 子节点（E9 R2：集合内虚拟窗口未透明化；滚动
+//!   状态仍挂在窗口上）；
+//! - AccessKit 没有 `colspan` 等价字段：跨列表头只暴露起始列与逻辑列数，AT 的列导航会跳过
+//!   被跨列；
+//! - UIA / AT-SPI 的表格接口受上游 adapter 限制（E9 R1）；`TreeGrid` 未加（E9 R3）。
 //!
 //! # 迁移映射（widget 批 P3）
 //!
@@ -63,7 +85,7 @@ use std::{
 use smol_str::{SmolStr, format_smolstr};
 use taffy::style::Dimension;
 use ui_core::{
-    a11y::{A11yPatch, A11yRole, A11ySort},
+    a11y::{A11yOverride, A11yPatch, A11yRole, A11ySort},
     app::App,
     error::EngineError,
     event::Action,
@@ -421,9 +443,6 @@ impl Table {
                     let style =
                         span_cell_style(&list_columns, column_index, span, tokens.padding_x, 4.0);
                     let cell_theme = list_theme.clone();
-                    let cell_a11y_count = count_for_rows.clone();
-                    let column_count = list_columns.len();
-                    let cell_row = row;
                     let cell = NodeBuilder::boxed()
                         .id(format_smolstr!("{table_key}:cell:{row}:{column_index}"))
                         .style(style)
@@ -431,15 +450,16 @@ impl Table {
                             foreground: Some(cell_theme.role(cx, Role::FgDefault)),
                             ..StylePatch::default()
                         })
-                        // 表格语义（§7.4）：行 / 列位置与总数显式声明 —— 虚拟列表的行挂在列表
-                        // 容器下（不是 `Table` 的直接子节点），引擎的自动推导不覆盖这条路径。
-                        .bind_a11y(move |_cx| A11yPatch {
+                        // 单元格 = 表格第 `row` 行、起始列 `column_index` 的 `Cell`。行号 / 行总数 /
+                        // 列总数由引擎按集合结构推导（E9：行窗口基址 + 条目逻辑下标、逻辑总行数含
+                        // 未挂载行、列总数取表上声明值）；这里只声明**推导不出来的**列起点 —— 跨列
+                        // 合并时被覆盖的列不单独绘制，列号必须按起始列声明（声明值优先于行内单元格序）。
+                        // 角色与列号是静态语义，用 `A11yOverride`：行内容重建时立刻生效，不依赖
+                        // `bind_a11y` 的下一帧求值。
+                        .a11y(A11yOverride {
                             role: Some(A11yRole::Cell),
-                            row_index: Some(cell_row + 1),
                             column_index: Some(column_index),
-                            row_count: Some(cell_a11y_count.get() + 1),
-                            column_count: Some(column_count),
-                            ..A11yPatch::default()
+                            ..A11yOverride::default()
                         })
                         .build(tree, cells_row)?;
                     (cells_for_rows)(tree, cell, row, column_index);
@@ -464,14 +484,10 @@ impl Table {
                 Ok(())
             },
         );
-        // 行级 a11y：表格行用 `Row`（不是默认的 `ListBoxOption`），行号 0 = 表头行。
-        let a11y_rows = row_count.clone();
-        let a11y_columns = columns.len();
-        list.set_row_a11y(move |row| A11yPatch {
+        // 行级 a11y（E9）：表格行用 `Row`（不是默认的 `ListBoxOption`）。行号 / 行总数由引擎
+        // 从集合结构推导：0 = 表头行、数据行 = 行窗口基址 + 条目逻辑下标、总数含未挂载条目。
+        list.set_row_a11y(|_| A11yPatch {
             role: Some(A11yRole::Row),
-            row_index: Some(row + 1),
-            row_count: Some(a11y_rows.get() + 1),
-            column_count: Some(a11y_columns),
             ..A11yPatch::default()
         });
         Self {
@@ -592,8 +608,7 @@ impl Table {
     /// `StaleNode`。
     pub fn build(&self, tree: &mut NodeTree, parent: NodeId) -> Result<NodeId, EngineError> {
         let inner = &self.inner;
-        let a11y_count = inner.list.count_signal();
-        let a11y_columns = inner.columns.len();
+        let column_count = inner.columns.len();
         let outer = NodeBuilder::boxed()
             .id(format_smolstr!("{}:table", inner.key))
             .style(
@@ -605,12 +620,14 @@ impl Table {
                     .overflow_hidden()
                     .build(),
             )
-            // a11y（§7.4）：表格容器 + 行列总数。行 / 单元格的角色与索引在行工厂 / 表头里声明。
-            .bind_a11y(move |cx| A11yPatch {
+            // a11y（E9）：表格容器。行号 / 行总数由引擎按集合结构推导（行号 = 行窗口基址 +
+            // 条目逻辑下标；行总数 = 行窗口 `slot.count` + 窗口之外的行，含未挂载条目）。
+            // 推导只能数「画出来的单元格」，跨列合并时列总数会偏小，所以在表上静态声明逻辑
+            // 列数（`Row` / `Cell` 的 `column_count` 由它推导）。
+            .a11y(A11yOverride {
                 role: Some(A11yRole::Table),
-                row_count: Some(*cx.read(&a11y_count) + 1),
-                column_count: Some(a11y_columns),
-                ..A11yPatch::default()
+                column_count: Some(column_count),
+                ..A11yOverride::default()
             })
             .build(tree, parent)?;
         // 表头：单元格行 + 底部分隔线。
@@ -638,18 +655,19 @@ impl Table {
                     .height(inner.header_height)
                     .build(),
             )
-            // 表头行 = 表格的第 0 行（`AccessKit` 的 `Row`）。
-            .bind_a11y(move |cx| A11yPatch {
+            // 表头行 = 表格的第 0 行（`AccessKit` 的 `Row`）。行号由引擎推导（0）；行总数显式
+            // 读行数信号（见表格容器的注释：集合节点不会因 `slot.count` 变化自动标脏）。
+            .a11y(A11yOverride {
                 role: Some(A11yRole::Row),
-                row_index: Some(0),
+                ..A11yOverride::default()
+            })
+            .bind_a11y(move |cx| A11yPatch {
                 row_count: Some(*cx.read(&header_row_count) + 1),
-                column_count: Some(a11y_columns),
                 ..A11yPatch::default()
             })
             .build(tree, header)?;
         let sort = inner.sort;
         let header_count = inner.list.count_signal();
-        let header_columns = inner.columns.len();
         let mut index = 0;
         while index < inner.columns.len() {
             let column = &inner.columns[index];
@@ -660,7 +678,6 @@ impl Table {
             let sortable = column.sortable;
             let a11y_sort = sort;
             let cell_count = header_count;
-            let column_count = header_columns;
             let cell = NodeBuilder::boxed()
                 .id(format_smolstr!("{}:header:{}", inner.key, index))
                 .style(style)
@@ -668,13 +685,15 @@ impl Table {
                     foreground: Some(header_theme.role(cx, Role::FgMuted)),
                     ..StylePatch::default()
                 })
-                // 列头：`ColumnHeader` + 列号 / 排序状态（`aria-sort`）。
-                .bind_a11y(move |cx| A11yPatch {
+                // 列头：`ColumnHeader` + 列号（跨列时 = 起始列，声明值优先于行内单元格序）+
+                // 排序状态（`aria-sort`）；行号 / 行列总数由引擎从集合结构推导。
+                .a11y(A11yOverride {
                     role: Some(A11yRole::ColumnHeader),
-                    row_index: Some(0),
                     column_index: Some(index),
+                    ..A11yOverride::default()
+                })
+                .bind_a11y(move |cx| A11yPatch {
                     row_count: Some(*cx.read(&cell_count) + 1),
-                    column_count: Some(column_count),
                     sort: sortable.then(|| match *cx.read(&a11y_sort) {
                         Some((sorted, SortOrder::Ascending)) if sorted == index => {
                             A11ySort::Ascending
@@ -709,6 +728,11 @@ impl Table {
                     SmolStr::new_static(""),
                     TextStyle::new(inner.theme.tokens().small.font_size),
                 )
+                // ▲ / ▼ 是纯装饰：排序语义已经在列头上用 `aria-sort` 表达，读屏不应再读字形。
+                .a11y(A11yOverride {
+                    hidden: true,
+                    ..A11yOverride::default()
+                })
                 .bind_text(move |cx| match *cx.read(&sort) {
                     Some((sorted, SortOrder::Ascending)) if sorted == column_index => {
                         SmolStr::new_static("▲")
@@ -937,7 +961,10 @@ mod tests {
         Column, ColumnAlign, ColumnWidth, SortOrder, Table, TableOptions, next_sort_order,
     };
     use crate::{
-        kit::list::{RowHeight, SelectionMode},
+        kit::{
+            list::{RowHeight, SelectionMode},
+            test_support::{a11y_of, assert_single_parent_per_node, frame_a11y, full_a11y},
+        },
         style_builder::StyleBuilder,
         theme::{appearance::Appearance, handle::ThemeHandle},
     };
@@ -1420,43 +1447,287 @@ mod tests {
         assert!((bounds.size.width - 50.0).abs() < 0.5, "{bounds:?}");
     }
 
-    /// a11y（§7.4）：表格 / 表头 / 行 / 单元格的角色与行列位置显式声明，排序状态进 `aria-sort`。
+    /// E9：虚拟化表格的行被领养到 `Table` 下（父不是 `List`），行号 / 总行数按**逻辑集合**
+    /// 推导（0 = 表头行；总数含未挂载行），单元格父 = 行、列号来自声明。
     #[test]
-    fn table_semantics_are_declared_to_a11y() {
+    fn virtualized_table_rows_hang_under_the_table() {
         let mut app = TestApp::new();
-        let table = table_with_rows(&mut app, 3);
+        let table = table_with_rows(&mut app, 100);
         mount(&mut app, &table);
         app.enable_a11y_capture();
         let _ = app.drain().expect("frame");
+        app.assert_a11y_contract();
         let table_node = table.outer_node().expect("table node");
+        let viewport = table.list().viewport_node().expect("viewport");
         let header0 = table.header_node(app.app(), 0).expect("header 0");
+        let header_row = app
+            .app()
+            .window(app.window_id())
+            .expect("window")
+            .tree()
+            .get(header0)
+            .expect("header cell")
+            .parent()
+            .expect("header row");
+        let mounted = table.list().mounted_rows(app.app());
+        assert!(mounted.len() < 100, "100 行只挂可见窗口：{}", mounted.len());
+        let snapshot = app.a11y().expect("a11y snapshot").clone();
+        let table_a11y = a11y_of(&snapshot, table_node);
+        assert_eq!(table_a11y.role, A11yRole::Table);
+        assert_eq!(
+            table_a11y.row_count,
+            Some(101),
+            "逻辑总行数 = 表头 1 行 + 100 个条目（含未挂载行）"
+        );
+        assert_eq!(table_a11y.column_count, Some(2));
+        // 表头行 = 第 0 行，父 = Table；列头父 = 表头行。
+        let header = a11y_of(&snapshot, header_row);
+        assert_eq!(header.role, A11yRole::Row);
+        assert_eq!(header.row_index, Some(0));
+        assert_eq!(header.row_count, Some(101));
+        assert_eq!(
+            header.parent,
+            Some(table_a11y.id),
+            "表头行的 a11y 父 = Table"
+        );
+        let header_cell = a11y_of(&snapshot, header0);
+        assert_eq!(header_cell.role, A11yRole::ColumnHeader);
+        assert_eq!(header_cell.parent, Some(header.id), "列头父 = 表头行");
+        assert_eq!(header_cell.row_index, Some(0));
+        assert_eq!(header_cell.row_count, Some(101));
+        assert_eq!(header_cell.column_index, Some(0));
+        // 行窗口被 E9 领养规则跳过：不再列出行。
+        let window = a11y_of(&snapshot, viewport);
+        assert_eq!(window.role, A11yRole::List);
+        assert!(window.children.is_empty(), "行窗口不得再列行（E9 领养）");
+        // 数据行 / 单元格：父链 Table → Row → Cell；行号 = 1（表头）+ 条目逻辑下标。
+        for (index, row) in &mounted {
+            let row_a11y = a11y_of(&snapshot, *row);
+            assert_eq!(row_a11y.role, A11yRole::Row);
+            assert_eq!(
+                row_a11y.parent,
+                Some(table_a11y.id),
+                "行父 = Table（不是 List）"
+            );
+            assert_eq!(row_a11y.row_index, Some(1 + index));
+            assert_eq!(row_a11y.row_count, Some(101), "总数含未挂载的条目");
+        }
         let row0 = table.list().row_node(app.app(), 0).expect("row 0");
         let cell00 = table.cell_node(app.app(), 0, 0).expect("cell 0/0");
-        {
-            let snapshot = app.a11y().expect("a11y snapshot");
-            let node = snapshot.node_for(table_node).expect("table a11y");
-            assert_eq!(node.role, A11yRole::Table);
-            assert_eq!(node.row_count, Some(4), "3 行 + 表头行");
-            assert_eq!(node.column_count, Some(2));
-            let header = snapshot.node_for(header0).expect("header a11y");
-            assert_eq!(header.role, A11yRole::ColumnHeader);
-            assert_eq!(header.column_index, Some(0));
-            assert_eq!(header.sort, Some(A11ySort::None), "可排序且当前未排序");
-            let row = snapshot.node_for(row0).expect("row a11y");
-            assert_eq!(row.role, A11yRole::Row);
-            assert_eq!(row.row_index, Some(1), "0 = 表头行");
-            assert_eq!(row.row_count, Some(4));
-            let cell = snapshot.node_for(cell00).expect("cell a11y");
-            assert_eq!(cell.role, A11yRole::Cell);
-            assert_eq!(cell.row_index, Some(1));
-            assert_eq!(cell.column_index, Some(0));
+        let cell = a11y_of(&snapshot, cell00);
+        assert_eq!(cell.role, A11yRole::Cell);
+        assert_eq!(cell.parent, Some(a11y_of(&snapshot, row0).id));
+        assert_eq!(cell.row_index, Some(1));
+        assert_eq!(cell.column_index, Some(0));
+        assert_eq!(cell.row_count, Some(101));
+        assert_eq!(cell.column_count, Some(2));
+        assert_single_parent_per_node(&snapshot);
+        // 滚动到第 60 行：行窗口换页，新行仍被领养，行号是逻辑下标（不是已挂载序号）。
+        table
+            .list()
+            .scroll_to_item(app.app_mut(), 60, ItemAlign::Start)
+            .expect("scroll");
+        frame_a11y(&mut app);
+        let snapshot = full_a11y(&mut app);
+        assert_single_parent_per_node(&snapshot);
+        let table_a11y = a11y_of(&snapshot, table_node);
+        assert_eq!(table_a11y.row_count, Some(101), "滚动不改变逻辑总行数");
+        let mounted = table.list().mounted_rows(app.app());
+        assert!(
+            mounted.first().is_some_and(|(index, _)| *index > 0),
+            "可见窗口换页"
+        );
+        for (index, row) in &mounted {
+            let row_a11y = a11y_of(&snapshot, *row);
+            assert_eq!(row_a11y.role, A11yRole::Row);
+            assert_eq!(row_a11y.parent, Some(table_a11y.id));
+            assert_eq!(row_a11y.row_index, Some(1 + index), "逻辑行号");
         }
+    }
+
+    /// 跨列表头 / 跨列单元格：列号按起始列声明（声明优先于「行内单元格序」推导），列总数是
+    /// **逻辑列数**（不是画出来的单元格数）。
+    #[test]
+    fn merged_columns_keep_logical_column_semantics() {
+        let mut app = TestApp::new();
+        let table = table_with(
+            &mut app,
+            vec![
+                Column::fixed("name", 100.0).span(2).sortable(),
+                Column::flex("value", 1.0),
+                Column::fixed("size", 50.0),
+                Column::flex("change", 1.0),
+            ],
+            TableOptions::fixed(28.0),
+            4,
+            text_cell,
+        );
+        mount_in(&mut app, &table, 400.0, 240.0);
+        app.enable_a11y_capture();
+        let _ = app.drain().expect("frame");
+        let snapshot = app.a11y().expect("a11y snapshot").clone();
+        let table_node = table.outer_node().expect("table");
+        let table_a11y = a11y_of(&snapshot, table_node);
+        assert_eq!(
+            table_a11y.column_count,
+            Some(4),
+            "逻辑列数 4（一行只画出 3 个单元格）"
+        );
+        assert_eq!(table_a11y.row_count, Some(5), "表头 + 4 行");
+        // 跨列表头：column_index = 起始列 0；被覆盖的列 1 没有节点。
+        let header0 = table.header_node(app.app(), 0).expect("header 0");
+        assert!(table.header_node(app.app(), 1).is_none(), "被跨列不绘制");
+        let header2 = table.header_node(app.app(), 2).expect("header 2");
+        let merged = a11y_of(&snapshot, header0);
+        assert_eq!(merged.role, A11yRole::ColumnHeader);
+        assert_eq!(merged.column_index, Some(0));
+        assert_eq!(
+            merged.column_count,
+            Some(4),
+            "列头列总数 = 表声明的逻辑列数"
+        );
+        assert_eq!(
+            a11y_of(&snapshot, header2).column_index,
+            Some(2),
+            "被跨过的列号不连续（声明值优先于行内单元格序）"
+        );
+        // 数据行：第 2 个画出来的单元格列号是 2（不是文档序 1）。
+        let row0 = table.list().row_node(app.app(), 0).expect("row 0");
+        let row_a11y = a11y_of(&snapshot, row0);
+        for (column, expected) in [(0usize, 0usize), (2, 2), (3, 3)] {
+            let cell = table.cell_node(app.app(), 0, column).expect("cell");
+            let node = a11y_of(&snapshot, cell);
+            assert_eq!(node.role, A11yRole::Cell);
+            assert_eq!(node.parent, Some(row_a11y.id));
+            assert_eq!(node.column_index, Some(expected));
+            assert_eq!(node.column_count, Some(4));
+            assert_eq!(node.row_index, Some(1));
+        }
+        assert_single_parent_per_node(&snapshot);
+    }
+
+    /// 多选 / 排序指示进 a11y：行 `selected` 是集合状态，可排序列头宣告 `aria-sort`、
+    /// 不可排序列头不宣告。
+    #[test]
+    fn multi_selection_and_sort_reach_a11y() {
+        let mut app = TestApp::new();
+        let table = table_with_rows(&mut app, 10);
+        mount(&mut app, &table);
+        app.enable_a11y_capture();
+        let _ = app.drain().expect("frame");
+        // 普通点击选一行 + Ctrl 点击加选一行。
+        let row3 = table.list().row_node(app.app(), 3).expect("row 3");
+        let point3 = center(&app, row3);
+        click(&mut app, point3);
+        let row5 = table.list().row_node(app.app(), 5).expect("row 5");
+        let point5 = center(&app, row5);
+        let _ = app.inject(InputEvent::pointer_down(
+            point5,
+            PointerButton::Primary,
+            Modifiers::CONTROL,
+        ));
+        let _ = app.inject(InputEvent::pointer_up(
+            point5,
+            PointerButton::Primary,
+            Modifiers::CONTROL,
+        ));
+        let _ = app.drain().expect("selection frame");
+        app.assert_a11y_contract();
+        let update = app.a11y_update().expect("选中交付").clone();
+        assert!(update.tree.is_none(), "选中变化是增量笔（不是全树）");
+        let snapshot = full_a11y(&mut app);
+        assert_single_parent_per_node(&snapshot);
+        let selected: Vec<usize> = (0..10)
+            .filter_map(|index| {
+                let row = table.list().row_node(app.app(), index)?;
+                (a11y_of(&snapshot, row).selected == Some(true)).then_some(index)
+            })
+            .collect();
+        assert_eq!(selected, vec![3, 5], "多选状态逐行进 a11y");
+        // 排序：可排序表头宣告 aria-sort，不可排序列头不宣告。
+        let header0 = table.header_node(app.app(), 0).expect("header 0");
+        let header1 = table.header_node(app.app(), 1).expect("header 1");
         let point = center(&app, header0);
         click(&mut app, point);
+        let _ = app.drain().expect("sort frame");
+        let snapshot = full_a11y(&mut app);
+        assert_eq!(
+            a11y_of(&snapshot, header0).sort,
+            Some(A11ySort::Ascending),
+            "点击后升序"
+        );
+        assert_eq!(
+            a11y_of(&snapshot, header1).sort,
+            None,
+            "不可排序列头不宣告排序状态"
+        );
+        click(&mut app, point);
+        let _ = app.drain().expect("sort frame");
+        let snapshot = full_a11y(&mut app);
+        assert_eq!(
+            a11y_of(&snapshot, header0).sort,
+            Some(A11ySort::Descending),
+            "再点切降序"
+        );
+    }
+
+    /// 空态：行数为 0 时提示文本作为 `Label` 进 a11y；有行后浮层 hidden（AT 不再读到）。
+    #[test]
+    fn empty_state_text_is_exposed_until_rows_arrive() {
+        let mut app = TestApp::new();
+        let table = table_with_rows(&mut app, 0);
+        mount(&mut app, &table);
+        app.enable_a11y_capture();
         let _ = app.drain().expect("frame");
-        let snapshot = app.a11y().expect("a11y snapshot");
-        let header = snapshot.node_for(header0).expect("header a11y");
-        assert_eq!(header.sort, Some(A11ySort::Ascending));
+        let snapshot = app.a11y().expect("a11y snapshot").clone();
+        let table_node = table.outer_node().expect("table");
+        assert_eq!(
+            a11y_of(&snapshot, table_node).row_count,
+            Some(1),
+            "空表只有表头行"
+        );
+        let empty = table.empty_node().expect("empty overlay");
+        let empty_a11y = a11y_of(&snapshot, empty);
+        assert!(!empty_a11y.hidden, "空表时空态浮层可见");
+        let labels: Vec<&str> = empty_a11y
+            .children
+            .iter()
+            .filter_map(|id| snapshot.node(*id).and_then(|node| node.value.as_deref()))
+            .collect();
+        assert_eq!(labels, vec!["empty"], "空态文案作为 Label 暴露");
+        // 有行之后：浮层 hidden，表行出现；空态文案随 hidden 子树被 AT 排除。
+        table.set_rows(app.app_mut(), 2).expect("rows");
+        settle(&mut app, &table);
+        let snapshot = full_a11y(&mut app);
+        assert!(a11y_of(&snapshot, empty).hidden, "有行后空态浮层 hidden");
+        let row0 = table.list().row_node(app.app(), 0).expect("row 0");
+        assert_eq!(a11y_of(&snapshot, row0).role, A11yRole::Row);
+        assert_eq!(
+            a11y_of(&snapshot, table_node).row_count,
+            Some(3),
+            "2 行 + 表头行"
+        );
+        // 行数变化后，表头行 / 表头单元格 / 数据行的总行数都必须刷新（它们读行数信号；
+        // 引擎不会因 `slot.count` 变化自动标脏集合节点 —— 见模块文档〈a11y〉）。
+        let header0 = table.header_node(app.app(), 0).expect("header 0");
+        let header_row = app
+            .app()
+            .window(app.window_id())
+            .expect("window")
+            .tree()
+            .get(header0)
+            .expect("header cell")
+            .parent()
+            .expect("header row");
+        assert_eq!(a11y_of(&snapshot, header_row).row_count, Some(3));
+        assert_eq!(a11y_of(&snapshot, header0).row_count, Some(3));
+        assert_eq!(a11y_of(&snapshot, row0).row_count, Some(3));
+        assert!(
+            snapshot
+                .visible_nodes_in_batch()
+                .all(|node| node.value.as_deref() != Some("empty")),
+            "空态文案不得出现在可见 a11y 节点里"
+        );
     }
 
     /// 组件自有信号作用域：`release` 回收排序 + 行体列表 / 滚动条槽位，重复调用幂等。
