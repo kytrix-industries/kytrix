@@ -70,6 +70,9 @@ impl TestApp {
             .build()
             .expect("test runtime");
         let mut app = App::new(runtime.handle().clone());
+        // E10c-R01：生产默认活时钟；测试宿主必须切回引擎时钟（`TestApp::advance` 是唯一
+        // 推进源，一次性定时器的 deadline 要能精确断言）。
+        app.use_engine_clock();
         let window = app.create_window(options);
         Self {
             _runtime: runtime,

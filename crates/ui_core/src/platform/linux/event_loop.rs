@@ -325,7 +325,7 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                 return Ok(());
             }
 
-            app.sync_clock();
+            app.sync_clock_live();
             app.run_frame_hook();
             // ③b 自绘标题栏的窗口控制：与触发它的输入事件同一轮执行，`serial` 仍是按下时的值。
             if let Some((window, control)) = app.take_window_control()

@@ -711,7 +711,7 @@ pub(super) fn pump_loop(
         // ② 平台事件 → App。
         {
             let mut app = app_cell.borrow_mut();
-            app.sync_clock();
+            app.sync_clock_live();
             // ②a 运行时窗口生命周期（P1-2.8）：`App` 里新增/移除的窗口要同步到原生窗口。
             if sync_native_windows(&mut app, app_cell, windows, dispatcher)? {
                 retarget_wake(windows, dispatcher);
