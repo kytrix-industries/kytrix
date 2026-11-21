@@ -65,6 +65,12 @@ pub(crate) fn remove_node(app: &mut App, window: WindowId, node: NodeId) -> bool
         Err(_) => false,
     };
     if removed {
+        // E8：`bind_key_scoped` 的 scope 若落在被卸载的子树内，绑定必须同批清除 —— 否则
+        // 表项会一直留到关窗（视觉上「没反应」，实际是永不命中的泄漏）。只卸载后代的场景
+        // 不受影响：祖先 scope 仍在树里，绑定保留。
+        let tree = target.tree();
+        app.scoped_bindings
+            .retain(|scoped| scoped.window != window || tree.get(scoped.scope).is_ok());
         app.request_frame();
         super::focus::restore_focus(app, window, opener);
     }
@@ -315,6 +321,9 @@ pub(crate) fn close_window(app: &mut App, id: WindowId) -> bool {
     app.a11y_delivered.remove(&id);
     app.scale_epochs.remove(&id);
     app.image_scale_epochs.remove(&id);
+    // E8：scoped 键盘绑定按窗口归属；窗口没了它们永远不会再命中（焦点只能是本窗口节点），
+    // 必须在关窗时清掉，否则 create/close 循环下无界增长。
+    app.scoped_bindings.retain(|scoped| scoped.window != id);
     // E1b：焦点窗口记录不能指向已关闭的窗口；`default_text_scale` 保留最后值
     //（「无窗口时保持上次值」）。
     if app.focused_window == Some(id) {

@@ -12,7 +12,6 @@ pub mod dialog;
 pub mod dropdown;
 pub mod empty_state;
 pub mod format;
-pub mod grid_list;
 pub mod icon;
 pub mod input;
 pub mod interactive;

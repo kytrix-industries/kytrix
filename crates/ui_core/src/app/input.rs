@@ -717,7 +717,54 @@ pub(crate) fn on_key(
                 return;
             }
         }
-        // ③ 全局绑定（精确匹配 key + modifiers）。
+        // ③a 焦点作用域化绑定（E8）：只有本窗口焦点落在 `scope` 子树内时才命中并消费；
+        //     焦点不在作用域内时**不消费**，继续走 ③b 全局绑定与 ④ 默认键盘行为。
+        //     这是「树的方向键只在自己聚焦时吃掉」与「文本框编辑键」的机制；放在全局绑定
+        //     之前，因此实例级绑定优先于应用级快捷键。
+        //
+        //     嵌套 scope：从焦点节点向上到根逐个 scope 匹配，**由内向外**尝试；第一个
+        //     `Action` 有 handler 且分派成功的消费按键。全部未命中（或无 handler）则回落
+        //     全局绑定 —— 内层显式不处理时外层实例仍有机会，语义与事件冒泡一致。
+        let focused = app.focused(window);
+        let mut scoped_actions: SmallVec<[Action; 4]> = SmallVec::new();
+        if let Some(focused) = focused
+            && let Some(tree) = app.windows.get(&window).map(Window::tree)
+        {
+            let mut cursor = Some(focused);
+            while let Some(scope) = cursor {
+                if let Some(action) = app
+                    .scoped_bindings
+                    .iter()
+                    .find(|scoped| {
+                        scoped.window == window
+                            && scoped.scope == scope
+                            && scoped.binding.key == code
+                            && scoped.binding.modifiers == modifiers
+                    })
+                    .map(|scoped| scoped.binding.action.clone())
+                {
+                    scoped_actions.push(action);
+                }
+                cursor = tree.get(scope).ok().and_then(|target| target.parent());
+            }
+        }
+        if let Some(node) = focused {
+            for action in scoped_actions {
+                if app.dispatch_action_with_hit(
+                    window,
+                    node,
+                    action.clone(),
+                    ActionSource::Key,
+                    None,
+                    modifiers,
+                ) {
+                    outcome.action = Some(action);
+                    outcome.target = Some(node);
+                    return;
+                }
+            }
+        }
+        // ③b 全局绑定（精确匹配 key + modifiers）。
         //
         //    绑定是**应用级**语义（`Ctrl+S`、`Tab`、`Esc`），不是「激活某个节点」：它不受模态
         //    作用域限制（对话框里仍要能按 Esc 关闭、Tab 遍历模态内控件）。target 只是
@@ -729,9 +776,8 @@ pub(crate) fn on_key(
             .find(|binding| binding.key == code && binding.modifiers == modifiers)
             .map(|binding| binding.action.clone());
         if let Some(action) = binding {
-            let node = app
-                .focused(window)
-                .or_else(|| app.windows.get(&window).map(|target| target.tree().root()));
+            let node =
+                focused.or_else(|| app.windows.get(&window).map(|target| target.tree().root()));
             let Some(node) = node else {
                 return;
             };

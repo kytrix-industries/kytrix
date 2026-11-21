@@ -214,6 +214,14 @@ pub struct App {
     close_handlers: ahash::HashMap<WindowId, CloseHandler>,
     /// 键盘绑定表（线性扫描：默认 3 条 + 应用若干）。
     bindings: Vec<KeyBinding>,
+    /// **焦点作用域化**的键盘绑定（线性扫描；只在焦点落在 `scope` 子树内时消费）。
+    ///
+    /// 与全局 `bindings` 表的区别是「谁有资格吃这个键」：全局绑定（`Ctrl+S` / `Tab` / `Esc`）
+    /// 是应用级语义；而文本框的编辑键、树的方向键这类只在**某个实例聚焦时**成立。放在全局表里
+    /// 会吞掉其它控件的默认键盘行为（引擎在命中绑定后不再走 `default_key_scroll`）。
+    /// 生命周期：`App::remove_node` 卸载 scope 子树时自动清除，`App::close_window` 清空该窗口
+    /// 全部条目；组件也可显式 `unbind_key_scoped` / `unbind_scope_keys`。
+    scoped_bindings: Vec<ScopedKeyBinding>,
     /// 输入判定阈值（probe 真值；平台在 `platform_init` 覆盖）。
     thresholds: InputThresholds,
     /// 引擎时钟（生产由平台每轮 `sync_clock`，测试由 `TestApp::advance` 推进）。
@@ -288,6 +296,22 @@ struct ClickRecord {
     count: u8,
 }
 
+/// 一条焦点作用域化的键盘绑定（`App::bind_key_scoped`）。
+///
+/// 命中条件 = `(key, modifiers)` 精确匹配 **且** 该窗口的焦点节点在 `scope` 子树内（含
+/// `scope` 自身）。不满足焦点条件时**不消费**，继续走全局绑定 / 默认键盘行为。
+///
+/// 多个 scope 同时命中（嵌套）时由 `app::input::on_key` 从焦点向上**由内向外**尝试；
+/// 表本身不排序 —— 查找顺序由祖先链决定，因此「后写覆盖」只针对同一个 scope。
+struct ScopedKeyBinding {
+    /// 绑定所属窗口（焦点是每窗口状态；同一 `NodeId` 不会跨窗口）。
+    window: WindowId,
+    /// 焦点作用域根：焦点必须是它或它的后代。
+    scope: NodeId,
+    /// 实际绑定（键 + 修饰键 + 动作）。
+    binding: KeyBinding,
+}
+
 /// 一个动画槽（`tick_animations` 推进；`t == 1.0` 时删槽）。
 struct AnimationSlot {
     /// 单调 id（`AnimationId` 的载荷）。
@@ -343,6 +367,20 @@ impl AnimationTarget {
                 *left == *right
             }
             _ => false,
+        }
+    }
+
+    /// 是否驱动 `ids` 里的某个瞬态值（作用域释放时取消动画用）。
+    ///
+    /// **扩展点（必须同步）**：给 [`AnimationTarget`] 新增任何「引用 `Transient`」的变体时，
+    /// 必须在这里把它纳入判据，并同步 [`App::animate`] 的注册路径 —— 否则作用域释放后
+    /// `tick_animations` 会继续写已回收的槽位（引擎不变量被破坏，见 `signal_api::release_scope`）。
+    /// 不引用瞬态值的变体（如 `Scroll`）返回 `false`。
+    fn targets_any(&self, ids: &[SignalId]) -> bool {
+        match self {
+            Self::Scalar { transient, .. } => ids.contains(&transient.id()),
+            Self::Color { transient, .. } => ids.contains(&transient.id()),
+            Self::Scroll { .. } => false,
         }
     }
 }
@@ -501,6 +539,7 @@ impl App {
             handlers: ahash::HashMap::default(),
             close_handlers: ahash::HashMap::default(),
             bindings: default_bindings(),
+            scoped_bindings: Vec::new(),
             thresholds: InputThresholds::platform_default(),
             clock: Instant::now(),
             a11y_delivered: ahash::HashMap::default(),
@@ -868,14 +907,21 @@ impl App {
         signal_api::signal_scoped(self, scope, initial)
     }
 
-    /// 释放信号作用域：其值**立即回收**（槽位归还空闲栈、代际 +1），依赖图里以它们为键的边被
-    /// **立即**删除；此后旧句柄的读 panic、写/更新是 no-op（见 [`SignalScope`]）。
+    /// 释放信号作用域：其值（信号 / 瞬态值）**立即回收**（槽位归还空闲栈、代际 +1），依赖图里
+    /// 以它们为键的边被**立即**删除；此后旧句柄的读 panic、写/更新是 no-op（见 [`SignalScope`]）。
+    /// 引用该作用域瞬态值的动画槽同批取消，不会在下一帧写死槽位；取消后这些动画不再请求帧
+    /// （**I3**：静止即回 Idle）。
     ///
     /// **派生侧**：根作用域派生的闭包若捕获了本作用域的句柄，释放后既不会再被失效（缓存永久
     /// 陈旧），又会在下次重算时读死句柄 panic。引擎无法检测不透明闭包，因此这是应用层硬契约
     /// （禁止跨作用域捕获，见 [`App::derived`] 与 [`Derived`]）。
     ///
-    /// 返回被释放的信号数（重复释放返回 0；根作用域不可释放）。
+    /// **节点侧**：`bind_style` / `bind_text` / `bind_a11y` 闭包捕获的句柄在释放后一求值就
+    /// panic。组件先卸载自己的节点、再释放作用域（`base_ui` 组件的 `release` 即此顺序契约）。
+    ///
+    /// 返回被释放的值槽位数（信号 + 瞬态值；重复释放返回 0；根作用域不可释放）。计数口径是
+    /// 「回收了多少个值」，不是「有多少个节点读它们」—— 调用方只能把它用于诊断/断言，不得
+    /// 反推业务状态。
     pub fn release_scope(&mut self, scope: SignalScope) -> usize {
         signal_api::release_scope(self, scope)
     }
@@ -883,6 +929,40 @@ impl App {
     /// 建一个瞬态值（读不登记、写不失效）。
     pub fn transient<T: Clone + 'static>(&mut self, initial: T) -> Transient<T> {
         signal_api::transient(self, initial)
+    }
+
+    /// 在指定作用域里注册瞬态值（随 [`App::release_scope`] 一起回收）。
+    ///
+    /// # 语义
+    ///
+    /// 与 [`App::transient`] 完全相同（读不登记依赖、写不失效、不进依赖图 —— **I3** 的
+    /// 「高频状态不污染依赖图」），唯一区别是**归属**：值槽位记在 `scope` 名下，作用域释放时
+    /// 与普通信号一起立即回收（槽位归还空闲栈、代际 +1）。
+    ///
+    /// 这是动态创建 / 销毁组件（滚动条淡出、拖拽快照、列表滚动状态）的必需入口：用
+    /// [`App::transient`] 会落在**根作用域**、永不释放，长期 churn 会把槽位峰值推高。
+    ///
+    /// # 释放语义
+    ///
+    /// [`App::release_scope`] 之后：
+    /// - 旧 `Transient` 句柄的**读 / 写都 panic**（确定性失败，绝不读到槽位复用后的新值；
+    ///   见 `node::signal` 模块文档〈作用域回收与句柄失效〉）；
+    /// - 引用它的动画槽**同批取消**（`AnimationTarget::targets_any`）：否则下一帧
+    ///   `tick_animations` 会写已回收的槽位。取消发生在槽位回收之后、同一调用内，中间没有帧
+    ///   推进；取消后不再因该动画请求帧（I3）。
+    ///
+    /// 组件契约为「**先卸载节点、再释放作用域**」：`bind_style` / `bind_text` 闭包捕获的句柄
+    /// 在释放后一求值就 panic（见 [`App::release_scope`]）。
+    ///
+    /// # Panics
+    ///
+    /// `scope` 已释放（引擎误用：释放后不可再 mint 值）。
+    pub fn transient_scoped<T: Clone + 'static>(
+        &mut self,
+        scope: SignalScope,
+        initial: T,
+    ) -> Transient<T> {
+        signal_api::transient_scoped(self, scope, initial)
     }
 
     /// 注册一个派生值（**不**立即求值；环在运行期检测）。
@@ -967,8 +1047,14 @@ impl App {
 
     /// 写一个瞬态值：**不**失效、**不**请求唤醒（滚动偏移/悬浮态，§3.7）。
     ///
+    /// 与 [`App::write`] 的失效句柄语义**不同**：普通信号在作用域释放后的迟到写是 no-op
+    /// （返回 `false`，R03-6 的僵尸唤醒防护），而瞬态值没有「返回 false」的第二形态 —— 读
+    /// 会 panic，写同样 panic，绝不静默丢弃或写到槽位复用后的新值。
+    ///
     /// # Panics
-    /// 该瞬态值存在活跃读守卫。
+    ///
+    /// - 该瞬态值存在活跃读守卫；
+    /// - 该句柄已失效（所属作用域已释放 / 槽位已回收）：与读同口径的**确定性失败**。
     pub fn write_transient<T: 'static>(&mut self, transient: &Transient<T>, value: T) {
         signal_api::write_transient(self, transient, value)
     }
@@ -1082,9 +1168,109 @@ impl App {
         style_pass::off_action(self, action)
     }
 
+    /// 仅测试（`test-support`）：某个动作当前是否注册了处理器。
+    ///
+    /// 组件 `release` 清理的直接证据面：泄漏的 handler 不一定会 panic（指针路径对死句柄是
+    /// no-op、滚动条 handler 只写引擎滚动状态），「重放输入不 panic」不能证明表项被摘掉。
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn has_action_handler(&self, action: &Action) -> bool {
+        style_pass::has_action_handler(self, action)
+    }
+
+    /// 仅测试（`test-support`）：某个 `(window, scope)` 上剩余的焦点作用域化键绑定条数。
+    ///
+    /// `App::unbind_scope_keys` 的直接证据面（`Tree::release`）：handler 被摘但绑定残留时，
+    /// 重放按键既不 panic 也不消费（回落到默认行为），只能直接观察表项。
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn scoped_key_binding_count(&self, window: WindowId, scope: NodeId) -> usize {
+        style_pass::scoped_binding_count(self, window, scope)
+    }
+
     /// 添加/替换一条键盘绑定（同 `(key, modifiers)` 后写覆盖）。
+    ///
+    /// 这是**应用级**绑定：不论焦点落在哪个控件上都命中（`Ctrl+S` / `Tab` / `Esc`）。
+    /// 只在某个实例聚焦时才成立的键（文本编辑键、树方向键）用 [`App::bind_key_scoped`]。
     pub fn bind_key(&mut self, binding: KeyBinding) {
         style_pass::bind_key(self, binding)
+    }
+
+    /// 添加/替换一条**焦点作用域化**的键盘绑定（同 `(window, scope, key, modifiers)` 后写覆盖）。
+    ///
+    /// # 语义
+    ///
+    /// 只有该窗口的**焦点节点落在 `scope` 子树内**（含 `scope` 自身）时，绑定才命中并消费按键；
+    /// 否则按键继续走全局绑定（[`App::bind_key`]）与默认键盘行为（方向键滚动等）。
+    ///
+    /// 求值顺序（`app::input::on_key` 的 ③a/③b/④）：
+    ///
+    /// 1. **scoped 绑定**：从焦点节点向上到根，逐个 scope 找 `(key, modifiers)` 精确匹配的绑定，
+    ///    由**内向外**依次尝试 —— 焦点在嵌套 scope（如树里的文本域）内时**内层优先**；
+    /// 2. **全局绑定**：scoped 无命中 / 命中的 action 没有 `on_action` handler 时回落；
+    /// 3. **默认键盘行为**：全局也无绑定时的方向键滚动等。
+    ///
+    /// 「消费」= 该 `Action` 注册了 handler 且分派返回 `true`。绑定存在但 handler 被
+    /// [`App::off_action`] 移除时不消费、不吞键 —— 组件 `release` 先摘 handler 再解绑，
+    /// 中间窗口不会出现「按键被吃但没有响应」。
+    ///
+    /// # 防泄漏与生命周期
+    ///
+    /// - 同 `(window, scope, key, modifiers)` **后写覆盖**：重复注册不会增长表项；
+    /// - [`App::remove_node`] 卸载 `scope` 所在子树 ⇒ 该 scope 的绑定**自动清除**；
+    ///   只卸载后代节点不影响祖先 scope 的绑定；
+    /// - [`App::close_window`] ⇒ 该窗口的全部 scoped 绑定清除；
+    /// - 组件需要主动清理（不卸载节点 / 不关窗）用 [`App::unbind_scope_keys`] 或
+    ///   [`App::unbind_key_scoped`]。
+    ///
+    /// 绑定不写状态、不标脏、不请求帧（**I3**）；`scope` 与 handler 读到的状态都由调用方在
+    /// Action handler 内经 `ActionCtx` 改写（**I6**：可见状态只经 Signal/Action 写入）。
+    ///
+    /// 焦点经 [`App::focused`] 过滤：已卸载节点的陈旧焦点、模态浮层作用域外的焦点都被视为
+    /// 无焦点 ⇒ 陈旧 `NodeId` 与多窗口下「另一窗口的陈旧焦点」都不会误触本窗口的绑定
+    /// （`NodeId` 本身携带窗口身份，跨窗口注册在 [`App::bind_key_scoped`] 里就被拒绝）。
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::UnknownWindow`]：窗口不存在（`WindowId` 单调不复用，注册给未知窗口的
+    ///   绑定永远不会命中，必须在注册期拒绝）；
+    /// - [`EngineError::StaleNode`]：`scope` 不在该窗口的节点树中（已卸载 / 从未挂载 /
+    ///   属于另一窗口）。
+    ///
+    /// # Panics
+    ///
+    /// 无。`scope` 之后被卸载是正常生命周期：绑定随 [`App::remove_node`] 自动清除。
+    pub fn bind_key_scoped(
+        &mut self,
+        window: WindowId,
+        scope: NodeId,
+        binding: KeyBinding,
+    ) -> Result<(), EngineError> {
+        style_pass::bind_key_scoped(self, window, scope, binding)
+    }
+
+    /// 删除一条**焦点作用域化**的键盘绑定（返回是否真的删了）。
+    ///
+    /// 与 [`App::bind_key_scoped`] 对称的显式清理；窗口 / `scope` 已不存在时按「没有这条绑定」
+    /// 处理（返回 `false`，不 panic）。同 `(window, scope, key, modifiers)` 后写覆盖保证至多
+    /// 一条匹配 ⇒ 删除是幂等的。
+    pub fn unbind_key_scoped(
+        &mut self,
+        window: WindowId,
+        scope: NodeId,
+        key: KeyCode,
+        modifiers: Modifiers,
+    ) -> bool {
+        style_pass::unbind_key_scoped(self, window, scope, key, modifiers)
+    }
+
+    /// 删除某个 `scope` 在某个窗口上的**全部**焦点作用域化绑定，返回删除条数。
+    ///
+    /// 组件 `release` 的清理入口：调用方不需要复述自己绑定过哪些键（键表可能随组件参数变化）。
+    /// 幂等；窗口 / `scope` 已不存在时返回 0。节点卸载与关窗已有自动清理，本方法是
+    /// **不卸载节点就释放组件**（例如复用节点树、热切换控件）时的显式出口。
+    pub fn unbind_scope_keys(&mut self, window: WindowId, scope: NodeId) -> usize {
+        style_pass::unbind_scope_keys(self, window, scope)
     }
 
     /// 删除一条键盘绑定（返回是否真的删了）。
@@ -2579,3 +2765,7 @@ mod invalidate_tests;
 /// 快照），因此只在 `--features test-support` 的 lib 测试里编译。
 #[cfg(all(test, feature = "test-support"))]
 mod image_tests;
+/// E8：焦点作用域化键绑定（`App::bind_key_scoped`）与作用域瞬态值
+/// （`App::transient_scoped`）的引擎级用例。
+#[cfg(test)]
+mod scoped_tests;
