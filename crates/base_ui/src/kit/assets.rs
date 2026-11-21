@@ -172,6 +172,12 @@ pub fn list(prefix: &str) -> impl Iterator<Item = &'static str> {
 #[derive(Clone, Debug, PartialEq)]
 pub enum AssetImageState {
     /// 后台解码中（尚未经 `poll` 交付）：`PendingResource` 可直接给 `NodeBuilder::image_pending`。
+    ///
+    /// **一次性句柄（审查 F3）**：引擎交付（`Ready` / `Failed`）后句柄被回收，
+    /// `ResourceCache::state` 对旧句柄只会返回 `Pending`，不会重投递。因此把它存进视图状态、
+    /// 跨帧重建节点会得到**永远空白**的占位图且不报错 —— 交付后必须重新
+    /// [`AssetImages::poll`]，再从 [`AssetImages::state`] / [`AssetImages::node_source`] 取当前
+    /// 来源，不要复用首次请求的 `Pending`。
     Pending(PendingResource),
     /// 已进图集，可直接画。
     Ready(ResourceImage),
@@ -185,6 +191,10 @@ impl AssetImageState {
     /// 用法：`Some(Pending)` ⇒ [`ui_core::node::builder::NodeBuilder::image_pending`]；
     /// `Some(Ready(image))` ⇒ `NodeBuilder::image(image.id, fit)`。`Failed` 没有可挂来源，
     /// 应用按 [`DecodeCause`] 决定重试 / 换图。
+    ///
+    /// **`Pending` 只在交付前有效**（一次性句柄，见 [`AssetImageState::Pending`]）：跨帧重建节点
+    /// 时必须先 `poll` 再从 [`AssetImages::node_source`] / [`AssetImages::state`] 重新取，不能
+    /// 把首次请求的 `Pending` 存起来复用。
     #[must_use]
     pub fn node_source(&self) -> Option<ImageSource> {
         match self {
@@ -264,6 +274,10 @@ impl AssetImages {
     ///   重试 / 换图。
     ///
     /// 交付契约与 [`AssetImages::request`] 相同（同一路径只解码第一次请求的尺寸）。
+    ///
+    /// **`Pending` 返回值的有效期只到本次交付**（一次性句柄）：引擎交付后同一句柄不再复活，
+    /// 跨帧重建节点时必须重新 `poll` 并调用本方法 / [`AssetImages::node_source`] 取当前来源
+    /// （见 [`AssetImageState::Pending`]）。
     ///
     /// # Errors
     /// [`AssetError::UnknownAsset`]：路径没登记在 [`ASSETS`] 里。
@@ -374,6 +388,8 @@ impl std::error::Error for AssetError {}
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use smol_str::SmolStr;
     use taffy::style::Dimension;
     use ui_core::{
         app::App,
@@ -510,6 +526,60 @@ mod tests {
                 .request(harness.app_mut(), path, Size::new(24.0, 24.0))
                 .expect("已登记"),
             AssetImageState::Ready(image)
+        );
+        // 去重命中的 `request_source` 直接给 `Ready` 来源（不再投递解码）。
+        assert_eq!(
+            images
+                .request_source(harness.app_mut(), path, Size::new(24.0, 24.0))
+                .expect("已登记"),
+            Some(ImageSource::Ready(image.id)),
+            "去重命中时 request_source 必须直接给出 Ready 来源"
+        );
+    }
+
+    /// **失败来源**（P2-1b3b / 审查 F8）：解码失败的资产没有可挂来源（`Failed` ⇒ `node_source`
+    /// 为 `None`），且 `request_source` 不会重新投递。
+    ///
+    /// 注册表里的资产都是合法 PNG，所以这里绕过 [`AssetImages::request`]，直接投递一段无法解析
+    /// 的字节，并按 `request` 的记账方式登记到缓存（tests 与实现同模块，可访问私有字段）。
+    #[test]
+    fn a_failed_decode_has_no_image_source() {
+        let mut harness = DecodeApp::new();
+        let mut images = AssetImages::new();
+        let path = "widgets/news.png";
+        let pending = harness
+            .app_mut()
+            .resources_mut()
+            .insert_async_at_size(Bytes::from_static(b"not a png"), Size::new(8.0, 8.0));
+        images.pending.insert(pending, SmolStr::new_static(path));
+        images
+            .entries
+            .insert(SmolStr::new_static(path), AssetImageState::Pending(pending));
+
+        let loaded = harness
+            .poll_until(600, |app| {
+                let loaded = images.poll(app);
+                (!loaded.is_empty()).then_some(loaded)
+            })
+            .expect("失败结果也必须经引擎交付");
+        assert_eq!(loaded.len(), 1);
+        assert!(
+            matches!(loaded[0].state, AssetImageState::Failed(_)),
+            "无法解析的字节必须交付 Failed，实际 {:?}",
+            loaded[0].state
+        );
+        assert_eq!(images.state(path), Some(&loaded[0].state));
+        assert_eq!(
+            images.node_source(path),
+            None,
+            "Failed 状态没有可挂的 E7 图片来源"
+        );
+        assert_eq!(
+            images
+                .request_source(harness.app_mut(), path, Size::new(8.0, 8.0))
+                .expect("已登记的路径"),
+            None,
+            "Failed 后 request_source 不得重新投递或给出来源"
         );
     }
 

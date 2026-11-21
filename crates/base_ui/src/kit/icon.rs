@@ -446,7 +446,8 @@ impl IconSpec {
     /// - 节点是 `NodeKind::Image` 叶子：显式 `Style` 尺寸 = 逻辑正方形、`ImageFit::Fill`
     ///   （图标 PNG 是正方形，`Fill` 与 `Contain` 几何等价，取 `Fill` 避免额外的等比计算）、
     ///   `image_modulation(color)` 走 E7 调制通道；
-    /// - a11y 显式 `hidden`（装饰性叶子；有语义的图标由使用方在容器上给 role/label）。
+    /// - a11y 显式 `hidden`（装饰性叶子：显式 hidden = 装饰声明，引擎不产生
+    ///   `MissingAltText` 诊断；有语义的图标由使用方在容器上给 role/label）。
     ///
     /// # Errors
     /// - [`IconError::UnknownWindow`]：窗口已关闭；
@@ -618,7 +619,7 @@ impl std::error::Error for IconError {
 mod tests {
     use image::{GenericImageView, ImageFormat, imageops::FilterType};
     use ui_core::{
-        a11y::A11yRole,
+        a11y::{A11yDiagnostic, A11yDrawKind, A11yRole},
         math::{Rect, Scale, Size},
         node::{
             id::NodeId,
@@ -978,10 +979,13 @@ mod tests {
         assert!(matches!(error, IconError::UnknownWindow { window: closed } if closed == window));
     }
 
-    /// 图标节点是**装饰性叶子**：E7 `Image` 角色 + 显式 `hidden`，不得被 AT 播报。
+    /// 图标节点是**装饰性叶子**：E7 `Image` 角色 + 显式 `hidden`，不得被 AT 播报，也不得产生
+    /// `MissingAltText` 诊断。
     ///
-    /// 变异防线：删掉 `.a11y(hidden: true)` 后 `record.hidden` 变 false ⇒ 本用例变红（E7 对无
-    /// label 的图片也会默认 hidden，但装饰语义必须由 base_ui 显式声明，不能依赖兜底）。
+    /// 变异防线：E7 对无 label 的图片**默认** hidden，所以 `record.hidden` 无法区分「显式装饰
+    /// 声明」与「引擎兜底」——删掉 `.a11y(hidden: true)` 后本用例原来仍然绿（P2-1b3 审查 F1）。
+    /// 真正的防线是诊断断言：显式 `hidden` 让引擎把节点视为装饰图而**免**诊断；删掉
+    /// `.a11y(hidden: true)` 后本图标会被记一条 `MissingAltText { kind: Image }` ⇒ 本用例变红。
     #[test]
     fn icon_nodes_are_hidden_from_the_a11y_tree() {
         let mut app = test_app();
@@ -1003,6 +1007,19 @@ mod tests {
                 .visible_nodes_in_batch()
                 .any(|visible| visible.engine == node),
             "图标节点不得出现在可见 a11y 视图里"
+        );
+
+        // 装饰图免诊断（P2-1b3 裁决）：显式 hidden 是装饰声明，缺失的替代文本不是缺陷。
+        let diagnostics = app.app().a11y_diagnostics();
+        assert!(
+            !diagnostics.iter().any(|diagnostic| matches!(
+                diagnostic,
+                A11yDiagnostic::MissingAltText {
+                    node: target,
+                    kind: A11yDrawKind::Image
+                } if *target == node
+            )),
+            "显式装饰的图标不得产生 MissingAltText 诊断：{diagnostics:?}"
         );
     }
 

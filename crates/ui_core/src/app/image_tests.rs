@@ -5,7 +5,7 @@
 //! - 绘制：`Primitive::Image` 的 bounds / 调制 / `Cover` 的 UV 裁切（`FrameRecord`）；
 //! - 资源：未就绪占位（无图元）、`poll_resources` 交付后自动失效重绘、释放后不再画旧 tile；
 //! - DPI：按新 scale 重算内在尺寸 + `set_image_resource` 换变体；
-//! - a11y：默认 `Image` 角色、可选标签、无标签 hidden、默认非交互；
+//! - a11y：默认 `Image` 角色、可选标签、无标签 hidden、显式 hidden = 装饰图免诊断、默认非交互；
 //! - I3：稳定后不再出帧。
 
 use std::time::{Duration, Instant};
@@ -657,4 +657,77 @@ fn image_nodes_map_to_the_image_role_with_optional_label() {
         )),
         "有 alt 的图片节点不得记 MissingAltText，实际 {diagnostics:?}"
     );
+}
+
+/// **装饰图免诊断**（P2-1b3 裁决）：显式 `A11yOverride { hidden: true }` 的图片是装饰声明，
+/// **不**产生 `MissingAltText`；没有显式 hidden 的图片（即便被引擎「无 label ⇒ hidden」兜底
+/// 隐藏）仍记诊断；有 label 的图片（即使同时 hidden）也不记诊断。
+#[test]
+fn explicitly_decorative_images_have_no_missing_alt_diagnostic() {
+    let mut app = TestApp::new();
+    app.enable_a11y_capture();
+    let resource = app
+        .app_mut()
+        .resources_mut()
+        .insert(&png(4, 4))
+        .expect("insert");
+    let window = app.window_id();
+    let root = app.app().window(window).expect("window").tree().root();
+    let mount = |app: &mut TestApp, over: A11yOverride| {
+        NodeBuilder::image(resource.id, ImageFit::Contain)
+            .layout_override(Rect::new(0.0, 0.0, 16.0, 16.0))
+            .a11y(over)
+            .build(
+                app.app_mut().window_mut(window).expect("window").tree_mut(),
+                root,
+            )
+            .expect("image")
+    };
+    let decorative = mount(
+        &mut app,
+        A11yOverride {
+            hidden: true,
+            ..A11yOverride::default()
+        },
+    );
+    let unnamed = mount(&mut app, A11yOverride::default());
+    let hidden_labelled = mount(
+        &mut app,
+        A11yOverride {
+            hidden: true,
+            label: Some(SmolStr::new_static("隐藏但有名字")),
+            ..A11yOverride::default()
+        },
+    );
+    let _ = app.drain().expect("frame");
+
+    let diagnostics = app.app().a11y_diagnostics();
+    let missing_alt = |node: NodeId| {
+        diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic,
+                A11yDiagnostic::MissingAltText {
+                    node: target,
+                    kind: A11yDrawKind::Image
+                } if *target == node
+            )
+        })
+    };
+    assert!(
+        !missing_alt(decorative),
+        "显式 hidden 的装饰图不得记 MissingAltText，实际 {diagnostics:?}"
+    );
+    assert!(
+        missing_alt(unnamed),
+        "没有显式 hidden / label 的图片必须记 MissingAltText，实际 {diagnostics:?}"
+    );
+    assert!(
+        !missing_alt(hidden_labelled),
+        "有 label 的图片不得记 MissingAltText，实际 {diagnostics:?}"
+    );
+
+    let snapshot = app.a11y().expect("a11y 交付");
+    let record = snapshot.node_for(decorative).expect("装饰图节点");
+    assert_eq!(record.role, A11yRole::Image);
+    assert!(record.hidden, "装饰图仍然 hidden（只是免诊断）");
 }

@@ -34,8 +34,10 @@
 //!
 //! # a11y
 //!
-//! 有 [`Brand::with_alt`] 时挂 E7 `Image` 角色 + `A11yOverride::label`（不隐藏）；没有 alt 时由
-//! 引擎按装饰图处理（`hidden` + `MissingAltText { kind: Image }`），与旧实现没有可访问名一致。
+//! 有 [`Brand::with_alt`] 时挂 E7 `Image` 角色 + `A11yOverride::label`（不隐藏）；没有 alt 时不写
+//! a11y 声明，引擎兜底把它当无名的图片隐藏，并记 `MissingAltText { kind: Image }` —— 品牌 logo
+//! 承载「哪家交易所」的语义，这条诊断就是「用 `with_alt` 补可访问名」的提示（显式装饰声明是
+//! 图标侧的做法：`IconSpec` 没有 label 通道，因此固定显式 `hidden` 免诊断）。
 //!
 //! 合规口径沿用旧注释：`Longbridge` 的 PNG 是占位图，正式资产要在取得展示权后替换；路径不变
 //! （设计 §8.5 的合规缺口只登记，不在本批范围）。
@@ -137,7 +139,8 @@ pub struct Brand {
     /// **等比内嵌**进这个正方形并居中，非正方形 logo（Ethereum 44×72 / Solana 81×72）会留白，
     /// 而不是被拉伸成正方形（见模块文档与 spec-delta §6 第 5 条）。
     pub size: Option<f32>,
-    /// 可访问名（alt）。`None` = 装饰图（引擎按 hidden + `MissingAltText` 处理）。
+    /// 可访问名（alt）。`None` = 不提供可访问名：引擎兜底 hidden 并记
+    /// `MissingAltText { kind: Image }`（有语义的品牌 logo 应给 alt）。
     pub alt: Option<SmolStr>,
 }
 
@@ -184,7 +187,8 @@ impl Brand {
     /// - 资源是**彩色**品牌 PNG，调制色 `Color::WHITE`（不染色）；
     /// - [`ImageFit::Contain`] = 旧 `ObjectFit::Contain` 语义（等比内嵌 + 居中，图元 bounds 在
     ///   节点盒内留白）：几何由引擎在 paint 期算，本模块不再手算 contain、也不再挂容器节点；
-    /// - 有 [`Brand::alt`] 时挂 `Image` 角色 + label；没有 alt 时引擎按装饰图隐藏。
+    /// - 有 [`Brand::alt`] 时挂 `Image` 角色 + label；没有 alt 时引擎兜底 hidden，并记
+    ///   `MissingAltText { kind: Image }`（提示用 [`Brand::with_alt`] 补可访问名）。
     ///
     /// # Errors
     /// - [`BrandError::UnknownWindow`]：窗口已关闭；
@@ -348,9 +352,9 @@ impl std::error::Error for BrandError {
 #[cfg(test)]
 mod tests {
     use ui_core::{
-        a11y::A11yRole,
+        a11y::{A11yDiagnostic, A11yDrawKind, A11yRole},
         math::{Rect, Scale, Size},
-        node::{builder::NodeBuilder, image::ImageFit, tree::NodeKind},
+        node::{builder::NodeBuilder, id::NodeId, image::ImageFit, tree::NodeKind},
         paint::{color::Color, primitive::Image},
         test_support::app::TestApp,
     };
@@ -474,6 +478,34 @@ mod tests {
         assert_rect_near(image.bounds, Rect::new(0.0, 0.0, 44.0, 72.0));
     }
 
+    /// **生产尺寸锁**（P2-1b3b / 审查 F8）：14 / 16 px 是菜单里的真实调用尺寸
+    /// （`profile_ui/src/menu.rs`、`market_participants_ui/src/menu.rs`），也是相对误差最大的
+    /// 地方。E7 `Contain` 按**解码 tile 的整数宽高比**（`fit_into` 两轴 `floor`）计算，因此图元
+    /// 比「理论 FP 比例」系统性偏窄 ≤1 逻辑 px —— 这里把已接受的具体值锁住（引擎取整或
+    /// Contain 几何回归会让本用例变红）。
+    #[test]
+    fn production_sizes_14_and_16_letterbox_the_decoded_tile() {
+        // Ethereum 44×72 → tile 8×14（floor(44×14/72)=8）；Contain 图元 8×14，左右各留白 3。
+        let (frame, image) = measured(Brand::new(BrandKind::Ethereum).with_size(14.0));
+        assert_rect_near(frame, Rect::new(0.0, 0.0, 14.0, 14.0));
+        assert_rect_near(image.bounds, Rect::new(3.0, 0.0, 8.0, 14.0));
+
+        // Ethereum 44×72 → tile 9×16（floor(44×16/72)=9）；图元 9×16，左右各留白 3.5。
+        let (frame, image) = measured(Brand::new(BrandKind::Ethereum).with_size(16.0));
+        assert_rect_near(frame, Rect::new(0.0, 0.0, 16.0, 16.0));
+        assert_rect_near(image.bounds, Rect::new(3.5, 0.0, 9.0, 16.0));
+
+        // Solana 81×72 → tile 14×12（floor(72×14/81)=12）；图元 14×12，上下各留白 1。
+        let (frame, image) = measured(Brand::new(BrandKind::Solana).with_size(14.0));
+        assert_rect_near(frame, Rect::new(0.0, 0.0, 14.0, 14.0));
+        assert_rect_near(image.bounds, Rect::new(0.0, 1.0, 14.0, 12.0));
+
+        // Solana 81×72 → tile 16×14（floor(72×16/81)=14）；图元 16×14，上下各留白 1。
+        let (frame, image) = measured(Brand::new(BrandKind::Solana).with_size(16.0));
+        assert_rect_near(frame, Rect::new(0.0, 0.0, 16.0, 16.0));
+        assert_rect_near(image.bounds, Rect::new(0.0, 1.0, 16.0, 14.0));
+    }
+
     /// 挂载：一个 `Image` 图元、不染色（`Color::WHITE`）、节点盒 = 给定尺寸。
     ///
     /// Solana 81×72 放进 32×32：解码变体按物理目标等比 fit 成 **32×28**（整数像素取整，见
@@ -544,7 +576,8 @@ mod tests {
         assert_eq!(image_primitives(&app).len(), 1);
     }
 
-    /// **a11y**：有 alt ⇒ E7 `Image` 角色 + label（不隐藏）；无 alt ⇒ 引擎按装饰图 hidden。
+    /// **a11y**：有 alt ⇒ E7 `Image` 角色 + label（不隐藏、无诊断）；无 alt ⇒ 引擎兜底 hidden，
+    /// 并记 `MissingAltText`（提示用 `with_alt` 补可访问名）。
     #[test]
     fn brand_alt_maps_to_the_image_role_and_label() {
         let mut app = test_app();
@@ -581,7 +614,30 @@ mod tests {
         assert_eq!(decorative_record.role, A11yRole::Image);
         assert!(
             decorative_record.hidden,
-            "无 alt 的品牌图按装饰图 hidden（引擎的 MissingAltText 语义）"
+            "无 alt 的品牌图按兜底语义 hidden（引擎的 MissingAltText 语义）"
+        );
+
+        // 诊断语义（P2-1b3 引擎修正）：显式 hidden 才是装饰声明（Icon 的路径）；Brand 的可访问名
+        // 通道是 `with_alt`，无 alt ⇒ 未声明装饰 ⇒ 仍记 MissingAltText 作为补 alt 的提示。
+        let diagnostics = app.app().a11y_diagnostics();
+        let missing_alt = |node: NodeId| {
+            diagnostics.iter().any(|diagnostic| {
+                matches!(
+                    diagnostic,
+                    A11yDiagnostic::MissingAltText {
+                        node: target,
+                        kind: A11yDrawKind::Image
+                    } if *target == node
+                )
+            })
+        };
+        assert!(
+            !missing_alt(labelled),
+            "有 alt 的品牌图不得记 MissingAltText：{diagnostics:?}"
+        );
+        assert!(
+            missing_alt(decorative),
+            "无 alt 的品牌图必须记 MissingAltText（提示 with_alt）：{diagnostics:?}"
         );
     }
 

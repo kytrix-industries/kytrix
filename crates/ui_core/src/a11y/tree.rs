@@ -19,7 +19,7 @@ use crate::{
         identity::{A11yIds, A11yKey},
         mapping::{
             a11y_disabled, a11y_read_only, bounds_of, effective_actions, effective_description,
-            effective_label, effective_role, effective_value, is_hidden,
+            effective_label, effective_role, effective_value, is_decorative_image, is_hidden,
         },
         textrun,
     },
@@ -121,12 +121,17 @@ pub(crate) fn node_a11y_with_cache(
     let actions = effective_actions(tree, node, role, over, patch, disabled, read_only);
 
     // 诊断：自绘缺替代文本（§5.4）、交互节点无名（§5.2）。
+    //
+    // E7 图片节点的**显式** `A11yOverride { hidden: true }` 是装饰声明（P2-1b3 裁决）：装饰图
+    // 不需要可访问名，因此免 `MissingAltText`。**没有**显式 hidden 的图片（包括靠引擎
+    // 「无 label ⇒ hidden」兜底兜下来的）仍记诊断 —— 应用要么给 label，要么显式声明装饰。
+    let decorative_image = is_decorative_image(target, over);
     if role == A11yRole::Image
         && label.is_none()
         && let Some(kind) = match target.kind() {
             NodeKind::Canvas(_) => Some(crate::a11y::A11yDrawKind::Canvas),
             NodeKind::Geometry(_) => Some(crate::a11y::A11yDrawKind::Geometry),
-            NodeKind::Image(_) => Some(crate::a11y::A11yDrawKind::Image),
+            NodeKind::Image(_) if !decorative_image => Some(crate::a11y::A11yDrawKind::Image),
             _ => None,
         }
     {
