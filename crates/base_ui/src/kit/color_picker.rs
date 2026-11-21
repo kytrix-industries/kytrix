@@ -786,6 +786,8 @@ struct Inner {
     tab_hover: Signal<Option<usize>>,
     confirm_hovered: Signal<bool>,
     change: RefCell<Option<Rc<dyn Fn(&mut App, Color)>>>,
+    /// 打开回调（关闭 → 打开的那次 `sync` 里调用一次；G5 的可观测面）。
+    open_callback: RefCell<Option<Rc<dyn Fn(&mut App)>>>,
     trigger: RefCell<Option<TriggerView>>,
     panel: RefCell<Option<Panel>>,
     was_open: Cell<bool>,
@@ -883,6 +885,7 @@ impl ColorPicker {
             tab_hover: app.signal_scoped(scope, None),
             confirm_hovered: app.signal_scoped(scope, false),
             change: RefCell::new(None),
+            open_callback: RefCell::new(None),
             trigger: RefCell::new(None),
             panel: RefCell::new(None),
             was_open: Cell::new(false),
@@ -957,6 +960,32 @@ impl ColorPicker {
         self.inner.overlay.is_open(app)
     }
 
+    /// 打开状态信号（`bind_style` / `bind_a11y` 可读；验收与组合根观测不靠截图）。
+    ///
+    /// 与 [`ColorPicker::is_open`] 是同一份真相（overlay 的 `Signal<bool>`）：读它即登记依赖，
+    /// 状态变化只失效读过它的节点（I6/I17）。
+    #[must_use]
+    pub fn open_state(&self) -> Signal<bool> {
+        self.inner.overlay.open_state()
+    }
+
+    /// 程序化打开面板（与点击触发器同一条路径：浮层 + 面板内容；已打开时 no-op）。
+    ///
+    /// 返回是否真的打开了；[`ColorPicker::on_open`] 在下一次 `sync` 的关闭→打开边沿触发
+    /// （与点击路径一致）。真实窗口验收用它拿确定性证据（不依赖 OS 输入注入）。
+    pub fn open(&self, app: &mut App, window: WindowId) -> bool {
+        if self.inner.overlay.is_open(app) {
+            return false;
+        }
+        self.open_panel(app, window);
+        self.inner.overlay.is_open(app)
+    }
+
+    /// 程序化关闭面板（与点击触发器 / 引擎侧外部点击关闭同一语义）。
+    pub fn close(&self, app: &mut App) -> bool {
+        self.inner.overlay.close(app)
+    }
+
     /// 触发器节点（`build` 之后可用）。
     #[must_use]
     pub fn trigger_node(&self) -> Option<NodeId> {
@@ -972,6 +1001,14 @@ impl ColorPicker {
     /// 确认回调（旧 `ColorPickerEvent::ColorChanged`）：只在按确认按钮、且确有编辑时调用一次。
     pub fn on_change(&self, callback: impl Fn(&mut App, Color) + 'static) {
         *self.inner.change.borrow_mut() = Some(Rc::new(callback));
+    }
+
+    /// 打开回调：面板打开时同步调用一次（点击触发器与 [`ColorPicker::open`] 同一条路径；
+    /// 关闭**不**回调）。
+    ///
+    /// G5 的可观测面之一：验收 / 埋点不靠截图判读；重复注册替换上一个回调。
+    pub fn on_open(&self, callback: impl Fn(&mut App) + 'static) {
+        *self.inner.open_callback.borrow_mut() = Some(Rc::new(callback));
     }
 
     /// 设置面板文本（等值写入是 no-op；面板打开时立即重绘文本）。
@@ -1519,6 +1556,13 @@ impl ColorPicker {
         let built = self.build_panel(app, window, panel).is_ok();
         if !built {
             inner.overlay.close_now(app);
+            return;
+        }
+        // G5：打开回调在面板内容建好之后同步触发（`build_panel` 已把 `was_open` 置真，
+        // 因此不能等下一次 `sync` 的边沿）。
+        let callback = inner.open_callback.borrow().clone();
+        if let Some(callback) = callback {
+            callback(app);
         }
     }
 
@@ -3022,7 +3066,12 @@ mod tests {
 
 #[cfg(test)]
 mod ui_tests {
-    use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+        sync::Arc,
+        time::Duration,
+    };
 
     use smol_str::SmolStr;
     use ui_core::{
@@ -3485,6 +3534,52 @@ mod ui_tests {
             .overlay_node()
             .map(|node| harness.app.probe().bounds(node));
         let _ = visual;
+    }
+
+    /// G5：打开状态必须可观测（`open_state` 信号 + `on_open` 回调），不必靠截图判读。
+    #[test]
+    fn the_open_state_signal_and_on_open_callback_track_the_panel() {
+        let mut harness = Harness::new();
+        let opened = Rc::new(Cell::new(0usize));
+        let sink = opened.clone();
+        harness.picker.on_open(move |_| sink.set(sink.get() + 1));
+        let state = harness.picker.open_state();
+        assert!(
+            !*harness.app.app().read(&state),
+            "初始关闭：open_state 信号必须是 false"
+        );
+        assert!(!harness.picker.is_open(harness.app.app()));
+
+        harness.open();
+        assert!(
+            harness.picker.is_open(harness.app.app()),
+            "点击触发器后 is_open 必须可观测为 true"
+        );
+        assert!(
+            *harness.app.app().read(&state),
+            "点击触发器后 open_state 信号必须为 true"
+        );
+        assert_eq!(opened.get(), 1, "关闭 → 打开的边沿只回调一次");
+
+        assert!(harness.picker.close(harness.app.app_mut()));
+        harness.pump_times(2);
+        assert!(!harness.picker.is_open(harness.app.app()));
+        assert!(!*harness.app.app().read(&state));
+        assert_eq!(opened.get(), 1, "关闭不触发 on_open");
+
+        assert!(
+            harness.picker.open(harness.app.app_mut(), harness.window),
+            "程序化打开返回 true"
+        );
+        harness.pump_times(1);
+        assert!(harness.picker.is_open(harness.app.app()));
+        assert_eq!(opened.get(), 2, "程序化打开同样触发 on_open");
+        assert!(
+            !harness.picker.open(harness.app.app_mut(), harness.window),
+            "已打开时程序化 open 是 no-op"
+        );
+        harness.pump_times(1);
+        assert_eq!(opened.get(), 2, "重复打开不再回调");
     }
 
     #[test]

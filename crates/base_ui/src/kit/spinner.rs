@@ -8,10 +8,11 @@
 //!   高频状态不进依赖图）；一圈 900 ms（`animation_tick × 6`），一次注册覆盖约 2.5 小时 /
 //!   10 000 圈，剩余不足一圈时 `sync` 自动续注册；
 //! - `sync` 读角度 → `Window::set_canvas` 重画（`Canvas` 图元用**窗口绝对坐标**，几何从
-//!   `Probe::bounds` 取节点当前布局盒）；画布内容（布局盒 + 角度）与上次相同时短路返回 `false`，
-//!   静止 / 稳态不标 `PAINT`、不请求帧（I3）；
+//!   `Probe::bounds` 取节点当前布局盒）；画布内容（布局盒 + 角度 + 颜色）与上次相同时短路返回
+//!   `false`，静止 / 稳态不标 `PAINT`、不请求帧（I3）；
 //! - 颜色是**显式参数**：引擎没有文本颜色继承链（评估 §7.2 第 10 条），调用方必须给
-//!   `with_color`（旧实现取「周围文字色」，新实现由调用方传入同一角色色）。
+//!   `with_color`（固定色）或 `with_role`（语义角色，跟随深浅外观）；运行时改固定色用
+//!   [`Spinner::set_color`]。旧实现取「周围文字色」，新实现由调用方传入同一角色色。
 //!
 //! # a11y
 //!
@@ -41,13 +42,14 @@ use ui_core::{
         canvas::Canvas,
         color::Color,
         primitive::{Border, Quad, QuadPaint},
+        style::StylePatch,
     },
     window::WindowId,
 };
 
 use crate::{
     style_builder::StyleBuilder,
-    theme::{components::ComponentTokens, handle::ThemeHandle},
+    theme::{components::ComponentTokens, handle::ThemeHandle, role::Role},
 };
 
 /// 一圈的时长 = 主题动画节拍 × 6（旧 `ANIMATION_TICK * 6` = 150 ms × 6 = 900 ms）。
@@ -62,12 +64,24 @@ const ROTATIONS_PER_ANIMATION: f32 = 10_000.0;
 /// 点的最小直径（逻辑像素）。
 const MIN_DOT: f32 = 1.5;
 
+/// 点的颜色来源。
+///
+/// - [`SpinnerColor::Fixed`]：固定色（`with_color` / `set_color`），与外观无关；
+/// - [`SpinnerColor::Role`]：主题语义角色（`with_role`），每次 `sync` 按当前外观解析 —— 深浅色
+///   切换后画布跟着重画（节点上登记了外观依赖，切换外观会失效它并出一帧）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SpinnerColor {
+    /// 固定颜色。
+    Fixed(Color),
+    /// 主题角色（跟随外观）。
+    Role(Role),
+}
+
 /// 旋转加载指示器。
 #[derive(Clone)]
 pub struct Spinner {
     inner: Rc<SpinnerInner>,
     size: f32,
-    color: Color,
     label: Option<SmolStr>,
     spinning: bool,
 }
@@ -76,13 +90,17 @@ struct SpinnerInner {
     key: SmolStr,
     duration: std::time::Duration,
     scope: SignalScope,
+    /// 主题服务：颜色角色按当前外观解析（`with_role` 路径）。
+    theme: ThemeHandle,
+    /// 点的颜色来源（`Cell` 让 `set_color` 在 `&self` 句柄上运行时改色）。
+    color: std::cell::Cell<SpinnerColor>,
     /// 累计角度（弧度；画布取 `angle.rem_euclid(TAU)`）。
     angle: Transient<f32>,
     /// 当前动画的目标角度（续注册判据）。
     target: Cell<f32>,
-    /// 上一次真正写进画布的内容 `(节点当前布局盒, 角度)`：稳态（静止 / 角度未变 / 盒未变）
-    /// 短路返回 `false`，不重复标 `PAINT`（I3）。
-    last_paint: Cell<Option<(Rect, f32)>>,
+    /// 上一次真正写进画布的内容 `(节点当前布局盒, 角度, 颜色)`：稳态（静止 / 角度未变 /
+    /// 盒未变 / 颜色未变）短路返回 `false`，不重复标 `PAINT`（I3）。
+    last_paint: Cell<Option<(Rect, f32, Color)>>,
     geometry: std::cell::RefCell<Geometry>,
 }
 
@@ -102,13 +120,14 @@ impl Spinner {
                 key: key.into(),
                 duration: tick * ROTATION_TICKS,
                 scope,
+                theme,
+                color: std::cell::Cell::new(SpinnerColor::Fixed(Color::WHITE)),
                 angle: app.transient_scoped(scope, 0.0f32),
                 target: Cell::new(0.0),
                 last_paint: Cell::new(None),
                 geometry: std::cell::RefCell::new(Geometry::default()),
             }),
             size: ComponentTokens::standard().medium.icon_size,
-            color: Color::WHITE,
             label: None,
             spinning: true,
         }
@@ -121,10 +140,17 @@ impl Spinner {
         self
     }
 
-    /// 点的颜色（引擎没有颜色继承，必须显式给）。
+    /// 点的固定颜色（引擎没有颜色继承，必须显式给；与外观无关）。
     #[must_use]
-    pub fn with_color(mut self, color: Color) -> Self {
-        self.color = color;
+    pub fn with_color(self, color: Color) -> Self {
+        self.inner.color.set(SpinnerColor::Fixed(color));
+        self
+    }
+
+    /// 点的颜色跟随主题语义角色（G6）：`sync` 按当前外观解析，深浅色切换后自动重画。
+    #[must_use]
+    pub fn with_role(self, role: Role) -> Self {
+        self.inner.color.set(SpinnerColor::Role(role));
         self
     }
 
@@ -168,6 +194,18 @@ impl Spinner {
                     ..A11yOverride::default()
                 },
             });
+        // 角色色（G6）：节点登记一条只读外观依赖 —— 切换外观会失效它并出一帧，`sync` 再按新
+        // 外观重画（与 `kit::input` 的 caret 节点同一形态：空补丁只登记依赖）。
+        let builder = match self.inner.color.get() {
+            SpinnerColor::Role(_) => {
+                let theme = self.inner.theme.clone();
+                builder.bind_style(move |cx| {
+                    let _ = theme.appearance(cx);
+                    StylePatch::default()
+                })
+            }
+            SpinnerColor::Fixed(_) => builder,
+        };
         let node = {
             let tree = app
                 .window_mut(window)
@@ -196,6 +234,36 @@ impl Spinner {
     #[must_use]
     pub fn angle(&self, app: &App) -> f32 {
         *app.read_transient(&self.inner.angle)
+    }
+
+    /// 当前生效的点颜色：固定色原样，角色色按当前外观解析（不登记依赖，帧外读取用）。
+    #[must_use]
+    pub fn color(&self, app: &App) -> Color {
+        match self.inner.color.get() {
+            SpinnerColor::Fixed(color) => color,
+            SpinnerColor::Role(role) => {
+                let appearance = self.inner.theme.current(app);
+                self.inner.theme.theme_for(appearance).role(role)
+            }
+        }
+    }
+
+    /// 运行时改固定颜色（G6）：清掉画布缓存并标脏节点，下一次 `sync` 按新颜色重画。
+    ///
+    /// 返回是否真的改了（等值写入是 no-op，不标脏、不出帧）。`with_role` 的组件调用本方法后
+    /// 变成固定色（角色跟随关闭）。
+    pub fn set_color(&self, app: &mut App, color: Color) -> bool {
+        let next = SpinnerColor::Fixed(color);
+        if self.inner.color.get() == next {
+            return false;
+        }
+        self.inner.color.set(next);
+        self.inner.last_paint.set(None);
+        let geometry = self.inner.geometry.borrow();
+        if let (Some(window), Some(node)) = (geometry.window, geometry.node) {
+            let _ = app.request_node_repaint(window, node);
+        }
+        true
     }
 
     /// 是否在旋转（读配置，不读状态）。
@@ -237,16 +305,17 @@ impl Spinner {
             }
         }
         let angle = app.read_transient(&self.inner.angle).rem_euclid(TAU);
-        if self.inner.last_paint.get() == Some((bounds, angle)) {
+        let color = self.color(app);
+        if self.inner.last_paint.get() == Some((bounds, angle, color)) {
             return Ok(false);
         }
-        let canvas = spinner_canvas(bounds, angle, self.color);
+        let canvas = spinner_canvas(bounds, angle, color);
         let changed = app
             .window_mut(window)
             .ok_or(EngineError::UnknownWindow { window })?
             .set_canvas(node, canvas)?;
         if changed {
-            self.inner.last_paint.set(Some((bounds, angle)));
+            self.inner.last_paint.set(Some((bounds, angle, color)));
         }
         Ok(changed)
     }
@@ -322,7 +391,7 @@ mod tests {
     };
 
     use super::Spinner;
-    use crate::theme::{appearance::Appearance, handle::ThemeHandle};
+    use crate::theme::{appearance::Appearance, handle::ThemeHandle, resolved::Theme, role::Role};
 
     struct Harness {
         app: TestApp,
@@ -355,6 +424,26 @@ mod tests {
                 .iter()
                 .filter_map(|primitive| match primitive {
                     ui_core::paint::primitive::Primitive::Quad(quad) => Some(quad.bounds),
+                    _ => None,
+                })
+                .collect(),
+            other => panic!("spinner 必须是 Canvas 节点，实际 {other:?}"),
+        }
+    }
+
+    /// 画布上每个点的填充色（按绘制顺序）。
+    fn canvas_dot_fills(harness: &Harness) -> Vec<ui_core::paint::color::Color> {
+        let window = harness.app.window_id();
+        let tree = harness.app.app().window(window).expect("window").tree();
+        match tree.get(harness.node).expect("node").kind() {
+            NodeKind::Canvas(canvas) => canvas
+                .primitives()
+                .iter()
+                .filter_map(|primitive| match primitive {
+                    ui_core::paint::primitive::Primitive::Quad(quad) => match &quad.paint {
+                        ui_core::paint::primitive::QuadPaint::Solid { fill, .. } => Some(*fill),
+                        _ => None,
+                    },
                     _ => None,
                 })
                 .collect(),
@@ -401,6 +490,64 @@ mod tests {
             "角度必须单调增加"
         );
         assert_ne!(before[0], after[0], "点的位置随角度改变");
+    }
+
+    /// G6：颜色可配置 —— `with_role` 跟随外观（深浅切换后重画），`set_color` 运行时改固定色。
+    #[test]
+    fn a_role_coloured_spinner_follows_the_appearance_and_set_color_updates_it() {
+        let mut app = TestApp::new();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let spinner = Spinner::new(app.app_mut(), theme.clone(), "themed")
+            .with_size(24.0)
+            .with_role(Role::BrandBase)
+            .spinning(false);
+        let window = app.window_id();
+        let root = app.app().window(window).expect("window").tree().root();
+        let node = spinner.build(app.app_mut(), window, root).expect("build");
+        let _ = app.drain().expect("frame");
+        let _ = spinner.sync(app.app_mut()).expect("sync");
+        let _ = app.drain().expect("frame");
+        let mut harness = Harness { app, spinner, node };
+
+        // 第 0 个点的不透明度（`spinner_canvas`: 0.15 + 0.85 × 0 / 7）。
+        const FIRST_DOT_ALPHA: f32 = 0.15;
+        let light = Theme::of(Appearance::Light).role(Role::BrandBase);
+        assert_eq!(
+            canvas_dot_fills(&harness)[0],
+            light.with_opacity(FIRST_DOT_ALPHA),
+            "浅色外观下取 brand.base"
+        );
+
+        assert!(theme.set_appearance(harness.app.app_mut(), Appearance::Dark));
+        let _ = harness.app.drain().expect("frame");
+        assert!(
+            harness.spinner.sync(harness.app.app_mut()).expect("sync"),
+            "外观切换后角色色必须重画画布"
+        );
+        let dark = Theme::of(Appearance::Dark).role(Role::BrandBase);
+        assert_ne!(light, dark, "深浅两套调色板的 brand.base 不同");
+        assert_eq!(
+            canvas_dot_fills(&harness)[0],
+            dark.with_opacity(FIRST_DOT_ALPHA),
+            "深色外观下取深色 brand.base"
+        );
+
+        let white = ui_core::paint::color::Color::WHITE;
+        assert!(
+            harness.spinner.set_color(harness.app.app_mut(), white),
+            "运行时改固定色返回 true"
+        );
+        let _ = harness.app.drain().expect("frame");
+        assert!(harness.spinner.sync(harness.app.app_mut()).expect("sync"));
+        assert_eq!(
+            canvas_dot_fills(&harness)[0],
+            white.with_opacity(FIRST_DOT_ALPHA),
+            "set_color 之后画固定色（角色跟随关闭）"
+        );
+        assert!(
+            !harness.spinner.set_color(harness.app.app_mut(), white),
+            "等值 set_color 是 no-op（不标脏、不出帧）"
+        );
     }
 
     /// 速度：900 ms 恰好转一圈（旧 `ANIMATION_TICK * 6`；变异：周期再乘 150 → 本测试红）。

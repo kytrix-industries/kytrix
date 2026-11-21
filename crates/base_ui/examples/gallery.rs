@@ -1,4 +1,5 @@
-//! `base_ui::kit` 组件的**真实窗口画廊**（P2-5 建立；P2-6b 补 `--theme-check` 主题响应性验收）。
+//! `base_ui::kit` 组件的**真实窗口画廊**（P2-5 建立；P2-6b 补 `--theme-check` 主题响应性验收；
+//! P2-6c 补 `--dump-overlay` 的 G2/G5 浮层验收与 Spinner 角色色）。
 //!
 //! ```text
 //! cargo run -p base_ui --example gallery
@@ -37,14 +38,18 @@
 //!   帧号不变是正确的），因此这里同时写一次**顶栏 status**（屏内 `bind_text`）——「定时器回调
 //!   写信号 → 出帧」由帧号推进证明（P2-6a G4）；
 //! - `--idle-check`：1 s 取基线帧号，再过 3 s 比较：空闲帧增量 ≤ 2 打印 PASS（I3），然后关窗；
-//! - `--dump-overlay`：0.6 s 把页面滚到 ⑫⑭ 那一屏、0.9 s 程序化打开 Menu，随后每 600 ms 打印
-//!   浮层子树（调试 id / 布局盒 / 子节点数 / 滚动槽）与 ColorPicker 的 `is_open`（G2/G5 探针）；
+//! - `--dump-overlay`：0.6 s 把页面滚到 ⑫⑭ 那一屏、0.9 s 程序化打开 Menu，随后每 600 ms
+//!   打印浮层子树（调试 id / 布局盒 / 子节点数 / 滚动槽）并记录验收判据：菜单虚拟列表
+//!   `viewport children > 0`、`content height > 0`、滚动条 `thumb height > 0`；第 2 轮关菜单、
+//!   程序化打开 ColorPicker（`open_state` 可观测），末轮打印 `overlay-check PASS/FAIL`（G2/G5）。
+//!   失败与 `--theme-check` / `--idle-check` 一样以退出码 3 上报（需配合 `--auto-close` 无人值守）；
 //! - `--theme-check`：深 ↔ 浅往返切换外观，逐组件核对颜色（输入框 / 图标 / markdown /
 //!   列表行 / 树行；G3 的端到端证据），全对 PASS 并关窗；
 //! - `--start-light`：以浅色外观启动（截图 / 手动验收用；默认深色）；
 //! - `--auto-close=<秒>`：到点关闭窗口（无人值守验收用；默认不自动关）。
 //!
-//! 退出码：`0` = 正常关窗（或 idle-check / theme-check PASS）；`3` = idle-check / theme-check FAIL。
+//! 退出码：`0` = 正常关窗（或 idle-check / theme-check / overlay-check PASS）；
+//! `3` = 任一检查 FAIL。
 //!
 //! 本示例真实窗口运行中暴露的 kit / 引擎缺口记录在
 //! `.docs/gui-migration/spec-deltas/kit-gallery.md`。
@@ -215,7 +220,7 @@ struct Flags {
     auto_close: Option<u64>,
     /// 打印关键节点布局盒（计算外部点击坐标用）。
     probe: bool,
-    /// 程序化打开浮层（Menu / ColorPicker）并打印浮层子树（真实窗口浮层空白缺陷的探针）。
+    /// 程序化打开 Menu / ColorPicker 并验收浮层内容（G2 行窗口 / G5 打开可观测；退出码 3 报失败）。
     dump_overlay: bool,
     /// 打开后自动把页面滚到指定纵向偏移（无人值守截图用；避开滚轮路径的引擎缺陷）。
     scroll_to: Option<f32>,
@@ -270,6 +275,32 @@ struct ThemeCheckReport {
     failures: Vec<SmolStr>,
     /// 首帧就绪等待的轮数（Linux 软渲染冷启动可能 >900 ms）。
     attempts: u32,
+}
+
+/// 浮层验收结果（`--dump-overlay`：G2 行窗口 / G5 色板打开可观测）。
+#[derive(Debug, Default)]
+struct OverlayCheckReport {
+    /// 菜单面板虚拟列表的实测 `(viewport children, content height, scrollbar thumb height)`。
+    menu: Option<(usize, f32, f32)>,
+    /// 色板 `is_open`（与 `open_state` 信号一致）的观测值。
+    picker_open: bool,
+    /// 色板面板内容根（`…:panel.content`）的子节点数。
+    picker_panel_children: Option<usize>,
+}
+
+impl OverlayCheckReport {
+    /// G2 + G5 的验收判据：菜单行窗口有行、内容高度 > 0、滑块高度 > 0；色板可观测为打开且
+    /// 面板内容根有子节点（不是只有浮层壳）。
+    fn pass(&self) -> bool {
+        let menu_ok = self
+            .menu
+            .is_some_and(|(children, content, thumb)| children > 0 && content > 0.0 && thumb > 0.0);
+        menu_ok
+            && self.picker_open
+            && self
+                .picker_panel_children
+                .is_some_and(|children| children > 0)
+    }
 }
 
 /// 切换外观：镜像信号 + `ThemeHandle` + 窗口背景色（顶栏按钮与 `--theme-check` 共用）。
@@ -604,6 +635,8 @@ struct Gallery {
     theme_icons: Vec<NodeId>,
     /// 主题响应性检查报告（`--theme-check`）。
     theme_check: Rc<RefCell<ThemeCheckReport>>,
+    /// 浮层验收报告（`--dump-overlay`：G2/G5）。
+    overlay_check: Rc<RefCell<OverlayCheckReport>>,
     /// 下拉。
     dropdown: Dropdown,
     /// 选择器。
@@ -1033,7 +1066,8 @@ impl Gallery {
         let _ = progress.build(app, window, progress_box);
         let spinner = Spinner::new(app, theme.clone(), "gallery.spinner")
             .with_size(18.0)
-            .with_color(initial.role(Role::BrandBase))
+            // G6：颜色跟随主题角色（深浅切换自动重画），不再是挂载期固定色。
+            .with_role(Role::BrandBase)
             .with_label("静态加载指示（动画默认关闭，保 I3）")
             .spinning(false);
         let _ = spinner.build(app, window, feedback_row);
@@ -1881,6 +1915,7 @@ impl Gallery {
             markdown: Rc::new(RefCell::new(markdown)),
             theme_icons,
             theme_check: Rc::new(RefCell::new(ThemeCheckReport::default())),
+            overlay_check: Rc::new(RefCell::new(OverlayCheckReport::default())),
             dropdown,
             select,
             menu,
@@ -1952,14 +1987,15 @@ impl Gallery {
             });
         }
         if self.flags.dump_overlay {
-            // 真实窗口浮层探针（G2/G5 的复现口径见 `.docs/gui-migration/spec-deltas/kit-gallery.md`）：
-            // 600 ms 把页面滚到 ⑫⑭ 那一屏（Menu / ColorPicker 都在这里），900 ms 程序化打开
-            // Menu（确定性证据），随后每 600 ms 打一次浮层子树 —— 外部脚本可以在这中间做真实
-            // OS 点击（色板触发器），因此「点前 / 点后」两帧的浮层状态都能看到。
+            // 真实窗口浮层验收（G2/G5）：600 ms 把页面滚到 ⑫⑭ 那一屏，900 ms 程序化打开
+            // Menu，随后 / 600 ms 一轮 dump 浮层子树并记录判据（行窗口 children / content
+            // 高度 / 滑块高度），第 2 轮关闭菜单、程序化打开 ColorPicker（`open_state` 可观测），
+            // 末轮打印 PASS/FAIL（失败由 `main` 以退出码 3 上报）。
             let viewport = self.viewport;
             let menu = self.menu.clone();
             let color_picker = self.color_picker.clone();
             let nodes = self.probe_nodes.clone();
+            let report = self.overlay_check.clone();
             let _ = app.after(window, Duration::from_millis(600), move |app| {
                 if let Some(handle) = app.scroll_handle(window, viewport) {
                     let _ = app.scroll_to(&handle, Point::new(0.0, 3_150.0));
@@ -1968,32 +2004,74 @@ impl Gallery {
                 app.handle().wake();
                 let menu = menu.clone();
                 let color_picker = color_picker.clone();
+                let report = report.clone();
                 let _ = app.after(window, Duration::from_millis(300), move |app| {
                     if let Some((_, anchor)) = nodes.iter().find(|(name, _)| name == "menu") {
                         let opened = menu.open(app, window, Anchor::node(*anchor));
                         println!("gallery: overlay-probe menu.open -> {opened:?}");
                     }
                     app.handle().wake();
-                    for round in 0..6_u32 {
+                    for round in 0..5_u32 {
+                        let menu = menu.clone();
                         let color_picker = color_picker.clone();
+                        let report = report.clone();
                         let delay = Duration::from_millis(u64::from(600 * (round + 1)));
-                        let dump = move |app: &mut App| {
+                        let step = move |app: &mut App| {
                             let frame = app
                                 .window(window)
                                 .map(|target| target.frame_index().get())
                                 .unwrap_or(0);
-                            println!(
-                                "gallery: overlay-probe round={round} frame={frame} color-picker is_open={}",
-                                color_picker.is_open(app)
-                            );
-                            dump_overlay_nodes(
-                                app,
-                                window,
-                                &["gallery.menu:panel", "gallery.color-picker"],
-                            );
+                            match round {
+                                0 | 1 => {
+                                    let metrics = menu_metrics(app, window);
+                                    println!(
+                                        "gallery: overlay-check menu round={round} frame={frame} metrics={metrics:?}"
+                                    );
+                                    record_menu_metrics(&report, metrics);
+                                    dump_overlay_nodes(app, window, &["gallery.menu:panel"]);
+                                    if round == 1 {
+                                        let closed = menu.close(app);
+                                        let opened = color_picker.open(app, window);
+                                        println!(
+                                            "gallery: overlay-check menu.close -> {closed}; color-picker.open -> {opened}"
+                                        );
+                                    }
+                                }
+                                2 | 3 => {
+                                    let (is_open, children) =
+                                        picker_metrics(app, window, &color_picker);
+                                    println!(
+                                        "gallery: overlay-check picker round={round} frame={frame} is_open={is_open} content_children={children:?}"
+                                    );
+                                    record_picker_metrics(&report, is_open, children);
+                                    dump_overlay_nodes(app, window, &["gallery.color-picker"]);
+                                }
+                                _ => {
+                                    let (is_open, children) =
+                                        picker_metrics(app, window, &color_picker);
+                                    record_picker_metrics(&report, is_open, children);
+                                    let passed = report.borrow().pass();
+                                    println!(
+                                        "gallery: overlay-check final round={round} frame={frame} {}",
+                                        if passed { "PASS" } else { "FAIL" }
+                                    );
+                                    if !passed {
+                                        println!(
+                                            "gallery: overlay-check detail {:?}",
+                                            report.borrow()
+                                        );
+                                    }
+                                    let _ = color_picker.close(app);
+                                    dump_overlay_nodes(
+                                        app,
+                                        window,
+                                        &["gallery.menu:panel", "gallery.color-picker"],
+                                    );
+                                }
+                            }
                             app.handle().wake();
                         };
-                        if let Err(error) = app.after(window, delay, move |app| dump(app)) {
+                        if let Err(error) = app.after(window, delay, move |app| step(app)) {
                             println!("gallery: overlay-probe timer failed: {error}");
                             break;
                         }
@@ -2653,6 +2731,81 @@ fn dump_overlay_nodes(app: &mut App, window: WindowId, prefixes: &[&str]) {
     }
 }
 
+/// 按调试 id 深搜节点（浮层验收 / 探针用）。
+fn find_debug_id(app: &App, window: WindowId, debug_id: &str) -> Option<NodeId> {
+    let tree = app.window(window)?.tree();
+    let mut stack = vec![tree.root()];
+    while let Some(node) = stack.pop() {
+        if tree.debug_id(node) == Some(debug_id) {
+            return Some(node);
+        }
+        if let Ok(entry) = tree.get(node) {
+            stack.extend(entry.children().iter().rev().copied());
+        }
+    }
+    None
+}
+
+/// 菜单面板（G2）的 `(viewport children, content height, scrollbar thumb height)`。
+fn menu_metrics(app: &App, window: WindowId) -> Option<(usize, f32, f32)> {
+    let viewport = find_debug_id(app, window, "gallery.menu:panel:list:viewport")?;
+    let children = {
+        let tree = app.window(window)?.tree();
+        tree.get(viewport).ok()?.children().len()
+    };
+    let handle = app.scroll_handle(window, viewport)?;
+    let content = app.scroll_state(&handle)?.content.height;
+    let thumb = find_debug_id(app, window, "gallery.menu:panel:list:scrollbar:thumb")?;
+    let thumb_height = {
+        let tree = app.window(window)?.tree();
+        tree.get(thumb).ok()?.layout().bounds.size.height
+    };
+    Some((children, content, thumb_height))
+}
+
+/// 色板（G5）的 `(is_open 且 open_state 信号为真, 面板内容根子节点数)`。
+fn picker_metrics(app: &App, window: WindowId, picker: &ColorPicker) -> (bool, Option<usize>) {
+    let open = picker.is_open(app) && *app.read(&picker.open_state());
+    let children =
+        find_debug_id(app, window, "gallery.color-picker:panel.content").and_then(|node| {
+            let tree = app.window(window)?.tree();
+            Some(tree.get(node).ok()?.children().len())
+        });
+    (open, children)
+}
+
+/// 记录菜单指标（多轮取各分量最大值：菜单关闭后节点会被回收，不能只看最后一轮）。
+fn record_menu_metrics(
+    report: &Rc<RefCell<OverlayCheckReport>>,
+    metrics: Option<(usize, f32, f32)>,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    let mut report = report.borrow_mut();
+    report.menu = Some(match report.menu {
+        Some((children, content, thumb)) => (
+            children.max(metrics.0),
+            content.max(metrics.1),
+            thumb.max(metrics.2),
+        ),
+        None => metrics,
+    });
+}
+
+/// 记录色板指标（`picker_open` 与面板内容子节点数按轮取或）。
+fn record_picker_metrics(
+    report: &Rc<RefCell<OverlayCheckReport>>,
+    is_open: bool,
+    children: Option<usize>,
+) {
+    let mut report = report.borrow_mut();
+    report.picker_open |= is_open;
+    if children.is_some_and(|count| count > 0) {
+        report.picker_panel_children = children;
+    }
+}
+
 /// markdown 解析期的空资源面（行内图片只算尺寸 / 视图层画占位块）。
 struct NoAssets;
 
@@ -2716,6 +2869,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("gallery: theme-check FAIL (report never produced)");
                 failed = true;
             }
+        }
+    }
+    if gallery.flags.dump_overlay {
+        let report = gallery.overlay_check.borrow();
+        if report.pass() {
+            println!(
+                "gallery: overlay-check PASS (menu={:?} picker_open={} picker_children={:?})",
+                report.menu, report.picker_open, report.picker_panel_children
+            );
+        } else {
+            println!("gallery: overlay-check FAIL ({report:?})");
+            failed = true;
         }
     }
     if failed {

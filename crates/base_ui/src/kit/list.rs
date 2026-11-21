@@ -33,7 +33,9 @@
 //! - [`RowHeight::Fixed`]：所有行同高，引擎按 `index * extent` 布局；
 //! - [`RowHeight::Variable`]：先用 `estimate` 挂载，`sync` 逐行量内容容器的实测高度并
 //!   `set_virtual_extents` 回写（引擎重算前缀和并按锚点补偿偏移，E3 语义）。未挂载的行保持
-//!   估计值，滚动到那里后再量。
+//!   估计值，滚动到那里后再量。重建（`set_items` / `set_count` / `push`）与 `attach` 在同步
+//!   建完行内容后先 settle 一次布局（[`settle_layout`]）：真实泵序里 `sync` 早于帧布局，不
+//!   settle 的话首轮实测会读到未布局的 0 高并写进全零 extents（G2，行会被引擎永久回收）。
 //!
 //! 应用层的 `RowHeights` 只服务双端列表锚点换算与测量回写，滚动帧不重建它（前缀和只在行高
 //! 变更时重建）。
@@ -1344,7 +1346,14 @@ impl List {
         // 同步补行内容（P2-2b）：`set_virtual_items` 已把行容器挂上，这里立刻建内容子树，
         // 重建路径的首帧就不是空行。`scroll_to_item` 在帧内挂载的新行仍走下一帧 `sync`。
         if let Some(window) = window {
-            let _ = self.fill_row_contents(app, window)?;
+            let populated = self.fill_row_contents(app, window)?;
+            // G2（P2-6c）：真实泵序是「钩子（派发 + `sync`）→ 帧（text → layout）」，重建
+            // 发生在钩子里，下一轮 `sync` 的变高实测早于任何布局 —— 刚建的内容子树还是
+            // `0` 高，实测会写进全零 extents，引擎按契约把可见窗口回收成 `0..0`（行永久
+            // 消失）。建完立即 settle，首轮实测就能读到真实行高。
+            if !populated.is_empty() && self.inner.options.row_height.is_variable() {
+                settle_layout(app, window)?;
+            }
         }
         Ok(())
     }
@@ -1374,7 +1383,9 @@ impl List {
     /// 1. `Window::compute_layout` 跑一次布局拿到真实视口尺寸（幂等；尚未 shape 的文本测量为 0，
     ///    但只影响文本自身，不影响外层 / 行容器几何）；
     /// 2. 再 `set_virtual_items` 让引擎按真实视口重挂可见窗口（**同步**挂载行容器）；
-    /// 3. `fill_row_contents` 同步建内容子树。
+    /// 3. `fill_row_contents` 同步建内容子树；
+    /// 4. 变高列表再 settle 一次：同一轮真实泵序的 `sync` 早于帧布局，不 settle 的话首轮实测
+    ///    读到未布局的 `0` 高，会把全零 extents 写进引擎（与 [`List::rebuild`] 同一个 G2 根因）。
     ///
     /// 新挂的内容子树是 `LAYOUT` 脏节点：首帧的 `refresh_text` + 布局会正常处理它们（内容文本
     /// 在强制布局时还不存在，因此不会被 0 测量冻结）。程序化 `scroll_to_item` 在**帧内**挂载的
@@ -1391,9 +1402,32 @@ impl List {
             return Ok(());
         };
         app.set_virtual_items(&list, count, self.row_builder())?;
-        let _ = self.fill_row_contents(app, window)?;
+        let populated = self.fill_row_contents(app, window)?;
+        if !populated.is_empty() && self.inner.options.row_height.is_variable() {
+            settle_layout(app, window)?;
+        }
         Ok(())
     }
+}
+
+/// 布局沉降：让同步建好的行内容子树拿到真实布局盒。
+///
+/// 真实泵序是「钩子（事件派发 + 各组件 `sync`）→ 帧（text → layout）」；重建 / `attach` 在钩子
+/// 里同步建内容，下一轮 `sync` 的变高实测**早于**任何布局。不 settle 的话实测读到内容节点的
+/// `layout().bounds.height == 0`，`set_virtual_extents` 写进全零 extents，引擎按「零高条目折叠」
+/// 契约把可见窗口算成 `0..0` 并回收全部行 —— 之后没有行可测，列表永久空白（G2；根因链见
+/// spec-delta `kit-gallery.md` §10.2）。
+///
+/// 与 [`List::populate_first_frame`] 的首次 `compute_layout`（measure-then-place 拿真实视口）同一
+/// 入口：幂等，taffy 缓存让重复调用只算脏子树。
+///
+/// # Errors
+/// `EngineError::InvalidMeasure`：某个 measure 闭包返回非有限 / 负尺寸。
+fn settle_layout(app: &mut App, window: WindowId) -> Result<(), EngineError> {
+    if let Some(target) = app.window_mut(window) {
+        target.compute_layout()?;
+    }
+    Ok(())
 }
 
 impl ListInner {
@@ -2355,6 +2389,116 @@ mod ui_tests {
         );
         let _ = SelectionMode::Single;
         let _ = RowHeight::Fixed(1.0);
+    }
+
+    /// 真实泵序下的变高列表：`mount` / `set_items` 返回后**不先 drain**（= 帧布局尚未发生）。
+    ///
+    /// 行内容用显式高度（菜单行 / 表格单元格的真实形态），测量与文本 shape 无关。
+    fn variable_list_without_frames() -> (TestApp, List) {
+        const ROWS: usize = 8;
+        const VARIABLE_EXTENT: f32 = 26.0;
+        fn row_height(index: usize) -> f32 {
+            if index.is_multiple_of(2) { 40.0 } else { 20.0 }
+        }
+
+        let mut app = TestApp::new();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let list = List::new(
+            app.app_mut(),
+            theme,
+            "real-pump",
+            ListOptions::variable(VARIABLE_EXTENT),
+            |tree: &mut NodeTree, parent: NodeId, index: usize| {
+                NodeBuilder::boxed()
+                    .style(
+                        StyleBuilder::new()
+                            .width_full()
+                            .height(row_height(index))
+                            .flex_none()
+                            .build(),
+                    )
+                    .build(tree, parent)?;
+                Ok::<(), EngineError>(())
+            },
+        );
+        list.set_initial_count(app.app_mut(), ROWS);
+        let window = app.window_id();
+        let root = app.app().window(window).expect("window").tree().root();
+        let parent = {
+            let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+            NodeBuilder::boxed()
+                .style(
+                    StyleBuilder::new()
+                        .width(BOX_WIDTH)
+                        .height(BOX_HEIGHT)
+                        .build(),
+                )
+                .build(tree, root)
+                .expect("parent")
+        };
+        list.mount(app.app_mut(), window, parent).expect("mount");
+        (app, list)
+    }
+
+    /// 实测回写断言：`sync` 开始时已挂载的行 = 内容显式高 + `padding_y × 2`（列表默认 2.0）；
+    /// 内容高度（前缀和）必须 > 0、可见行不得被引擎回收。
+    fn assert_first_measurement_is_real(app: &TestApp, list: &List, measured: &[usize]) {
+        const ROWS: usize = 8;
+        fn real_height(index: usize) -> f32 {
+            let content = if index.is_multiple_of(2) { 40.0 } else { 20.0 };
+            content + 2.0 * 2.0
+        }
+
+        assert!(measured.len() >= 4, "首轮至少测量若干可见行：{measured:?}");
+        let heights = list.row_heights();
+        assert_eq!(heights.len(), ROWS, "逐项高度表长度 = 条目数");
+        for &index in measured {
+            assert_eq!(
+                heights.get(index),
+                Some(real_height(index)),
+                "第 {index} 行高度（首轮必须读到实测真实高，而不是 0 / 估计值）"
+            );
+        }
+        let state = list.state(app.app()).expect("虚拟列表状态");
+        assert!(state.mounted > 0, "可见行必须挂载：{state:?}");
+        assert!(
+            heights.total() > 0.0,
+            "内容高度（前缀和）必须 > 0：{}",
+            heights.total()
+        );
+    }
+
+    /// G2 回归（真实泵序）：`mount` 后不先 drain 直接 `sync` —— `attach` 的首帧建行必须已 settle，
+    /// 首轮实测读到真实行高（否则全零 extents 会把可见行永久回收）。
+    #[test]
+    fn the_first_sync_after_mount_measures_real_row_heights_without_a_frame_first() {
+        let (mut app, list) = variable_list_without_frames();
+        let measured: Vec<usize> = list
+            .mounted_rows(app.app())
+            .into_iter()
+            .map(|(index, _)| index)
+            .collect();
+        let changed = list.sync(app.app_mut()).expect("sync");
+        assert!(changed, "首轮实测回写必须报告变化");
+        assert_first_measurement_is_real(&app, &list, &measured);
+    }
+
+    /// G2 回归（真实泵序）：重建路径（`set_items`）建完行内容后不先 drain 直接 `sync`。
+    ///
+    /// 真实窗口里重建发生在帧钩子内（`ItemPanel::open` → `list.set_items`），下一轮 `sync`
+    /// 早于帧布局 —— 这正是 P2-6a §10.2 定位的「菜单面板行全零、永久空白」路径。
+    #[test]
+    fn the_first_sync_after_a_rebuild_measures_real_row_heights_without_a_frame_first() {
+        let (mut app, list) = variable_list_without_frames();
+        list.set_items(app.app_mut(), 8).expect("set items");
+        let measured: Vec<usize> = list
+            .mounted_rows(app.app())
+            .into_iter()
+            .map(|(index, _)| index)
+            .collect();
+        let changed = list.sync(app.app_mut()).expect("sync");
+        assert!(changed, "重建后首轮实测回写必须报告变化");
+        assert_first_measurement_is_real(&app, &list, &measured);
     }
 }
 
