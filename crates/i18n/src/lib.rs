@@ -5,4 +5,5 @@ pub mod language;
 mod loader;
 mod store;
 pub mod template;
+pub mod translate;
 pub mod translator;

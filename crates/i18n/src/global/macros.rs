@@ -21,6 +21,13 @@ macro_rules! __i18n_value {
 /// [`LanguageCode`](crate::language::codes::LanguageCode) global, which
 /// [`install`](crate::global::embedded::install) selects next to the translator.
 ///
+/// New code should use [`t_smol!`](crate::t_smol) instead: it takes an explicitly
+/// injected [`Translate`](crate::translate::Translate) context and returns a
+/// `SmolStr` rather than a gpui `SharedString`. This macro is kept for the GPUI
+/// callers that already use it — `base_ui`'s legacy modules, the `*_ui` crates and
+/// `kytrix` — and is removed in P5 together with those callers and the globals it
+/// reads.
+///
 /// ```no_run
 /// # use i18n::{global::embedded, language::codes::LanguageCode, t};
 /// # fn render(cx: &mut gpui_kit::App) -> gpui_kit::SharedString {

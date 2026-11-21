@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 
 use gpui_kit::{App, SharedString};
-use i18n::t;
+use i18n::{t, t_smol, translate::Translate};
 use kytrix_service_provider::service::{
     engine::{ErrorCode, KytrixServiceError},
     ethereum_wallet::{EthereumWalletApiError, EthereumWalletMutationUnknown},
@@ -51,8 +51,30 @@ pub trait LocalizedError {
     fn localized_message(&self, cx: &App) -> SharedString;
 }
 
+/// Renders a typed failure through an injected [`Translate`] context.
+///
+/// This is the successor of [`LocalizedError`]: it takes the translation context the
+/// composition root hands in and returns `SmolStr`, so stating why a widget failed
+/// needs no GPUI context and no global lookup. P3-0 ports the transport/network
+/// failure family, the Kytrix service failure and the listing presentation; the
+/// remaining implementations still use [`LocalizedError`] and follow in P3-1, which
+/// deletes that trait and the globals it reads.
+///
+/// Both mappings exist for the ported failures until then, and the tests pin that they
+/// state the same text: the port moves the context, it does not reword the interface.
+pub trait TranslatedError {
+    /// Returns the failure as text in the language `translate` renders.
+    fn translated_message(&self, translate: &Translate) -> SmolStr;
+}
+
 impl LocalizedError for Infallible {
     fn localized_message(&self, _cx: &App) -> SharedString {
+        match *self {}
+    }
+}
+
+impl TranslatedError for Infallible {
+    fn translated_message(&self, _translate: &Translate) -> SmolStr {
         match *self {}
     }
 }
@@ -151,6 +173,17 @@ impl LocalizedReason {
     }
 }
 
+impl TranslatedError for LocalizedReason {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
+        match self {
+            Self::UnknownListing => t_smol!(translate, "error.display.unknown_listing"),
+            Self::Resolved | Self::DisplayUnavailable => {
+                t_smol!(translate, "error.display.display_unavailable")
+            }
+        }
+    }
+}
+
 /// The name one listing is presented by, and the answer of the read that produced
 /// it.
 ///
@@ -213,6 +246,15 @@ impl LocalizedError for ListingErrorPresentation {
             return self.reason.localized_message(cx);
         };
         SharedString::new(display.as_str())
+    }
+}
+
+impl TranslatedError for ListingErrorPresentation {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
+        let Some(display) = &self.display else {
+            return self.reason.translated_message(translate);
+        };
+        SmolStr::new(display.as_str())
     }
 }
 
@@ -1297,6 +1339,64 @@ impl LocalizedError for NetworkError {
     }
 }
 
+impl TranslatedError for NetworkError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
+        match self {
+            Self::DnsResolutionFailed { host } => {
+                t_smol!(
+                    translate,
+                    "error.network.dns_resolution_failed",
+                    host = host
+                )
+            }
+            Self::TcpConnectionFailed { endpoint } => {
+                t_smol!(
+                    translate,
+                    "error.network.tcp_connection_failed",
+                    endpoint = endpoint
+                )
+            }
+            Self::TlsHandshakeFailed { endpoint } => {
+                t_smol!(
+                    translate,
+                    "error.network.tls_handshake_failed",
+                    endpoint = endpoint
+                )
+            }
+            Self::WebSocketUpgradeFailed { endpoint, failure } => t_smol!(
+                translate,
+                "error.network.websocket_upgrade_failed",
+                endpoint = endpoint,
+                cause = failure.translated_message(translate)
+            ),
+            Self::ProxyConnectionFailed {
+                proxy_type,
+                message,
+            } => {
+                t_smol!(
+                    translate,
+                    "error.network.proxy_connection_failed",
+                    proxy_type = proxy_type,
+                    message = message
+                )
+            }
+            Self::Io { message } => t_smol!(translate, "error.network.io", message = message),
+            Self::InvalidData { operation, reason } => t_smol!(
+                translate,
+                "error.network.invalid_data",
+                operation = operation,
+                reason = reason
+            ),
+            Self::LimitExceeded { operation, limit } => t_smol!(
+                translate,
+                "error.network.limit_exceeded",
+                operation = operation,
+                limit = limit
+            ),
+        }
+    }
+}
+
 impl LocalizedError for DisconnectReason {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
@@ -1819,6 +1919,55 @@ impl LocalizedError for TransportError {
     }
 }
 
+impl TranslatedError for TransportError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
+        match self {
+            Self::ProxyConfiguration => t_smol!(translate, "error.transport.proxy"),
+            Self::HttpClientConfiguration => t_smol!(translate, "error.transport.http_client"),
+            Self::ClientPoolUnavailable => t_smol!(translate, "error.transport.client_pool"),
+            Self::RequestTimedOut => t_smol!(translate, "error.transport.timeout"),
+            Self::ResponseReadFailed => t_smol!(translate, "error.transport.response_read"),
+            Self::ResponseBodyTooLarge { limit } => {
+                t_smol!(
+                    translate,
+                    "error.transport.response_too_large",
+                    limit = limit
+                )
+            }
+            Self::Cancelled => t_smol!(translate, "error.transport.cancelled"),
+            Self::Disconnected => t_smol!(translate, "error.transport.disconnected"),
+            Self::SlowSubscriber => t_smol!(translate, "error.transport.slow_subscriber"),
+            Self::RouteChanged => t_smol!(translate, "error.transport.route_changed"),
+            Self::CredentialChanged => t_smol!(translate, "error.transport.credential_changed"),
+            Self::ResyncFailed => t_smol!(translate, "error.transport.resync_failed"),
+            Self::Protocol { operation } => {
+                t_smol!(translate, "error.transport.protocol", operation = operation)
+            }
+            Self::SubscriptionRejected { code, message } => {
+                t_smol!(
+                    translate,
+                    "error.transport.rejected",
+                    code = code,
+                    message = message
+                )
+            }
+            Self::Closed => t_smol!(translate, "error.transport.closed"),
+            Self::InvalidSubscriptionCapacity => {
+                t_smol!(translate, "error.transport.invalid_capacity")
+            }
+            Self::InvalidWebSocketEndpoint => {
+                t_smol!(translate, "error.transport.invalid_websocket_endpoint")
+            }
+            Self::WebSocketConnect { failure } => t_smol!(
+                translate,
+                "error.transport.websocket_connect",
+                cause = failure.translated_message(translate)
+            ),
+            Self::WebSocketIo => t_smol!(translate, "error.transport.websocket_io"),
+        }
+    }
+}
+
 impl LocalizedError for UpgradeFailure {
     fn localized_message(&self, cx: &App) -> SharedString {
         match self {
@@ -1826,6 +1975,23 @@ impl LocalizedError for UpgradeFailure {
             Self::Transport { detail } => t!(cx, "error.upgrade.transport", detail = detail),
             Self::Rejected { status } => t!(cx, "error.upgrade.rejected", status = status),
             Self::Handshake { detail } => t!(cx, "error.upgrade.handshake", detail = detail),
+        }
+    }
+}
+
+impl TranslatedError for UpgradeFailure {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
+        match self {
+            Self::Timeout => t_smol!(translate, "error.upgrade.timeout"),
+            Self::Transport { detail } => {
+                t_smol!(translate, "error.upgrade.transport", detail = detail)
+            }
+            Self::Rejected { status } => {
+                t_smol!(translate, "error.upgrade.rejected", status = status)
+            }
+            Self::Handshake { detail } => {
+                t_smol!(translate, "error.upgrade.handshake", detail = detail)
+            }
         }
     }
 }
@@ -1850,6 +2016,32 @@ impl LocalizedError for KytrixServiceError {
     }
 }
 
+impl TranslatedError for KytrixServiceError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
+        match self {
+            Self::InvalidUrl(detail) => {
+                t_smol!(translate, "error.kytrix.invalid_url", detail = detail)
+            }
+            Self::Connect(detail) => t_smol!(translate, "error.kytrix.connect", detail = detail),
+            Self::Authentication(detail) => {
+                t_smol!(translate, "error.kytrix.authentication", detail = detail)
+            }
+            Self::Read(detail) => t_smol!(translate, "error.kytrix.read", detail = detail),
+            Self::Write(detail) => t_smol!(translate, "error.kytrix.write", detail = detail),
+            Self::Timeout => t_smol!(translate, "error.kytrix.timeout"),
+            Self::Closed => t_smol!(translate, "error.kytrix.closed"),
+            Self::Protocol(detail) => {
+                t_smol!(translate, "error.kytrix.protocol", detail = detail)
+            }
+            Self::Server(code) => translated_server_error(translate, *code),
+            Self::Disconnected => t_smol!(translate, "error.kytrix.disconnected"),
+            Self::SlowSubscriber => t_smol!(translate, "error.kytrix.slow_subscriber"),
+            Self::AccountChanged => t_smol!(translate, "error.kytrix.account_changed"),
+            Self::RouteChanged => t_smol!(translate, "error.kytrix.route_changed"),
+        }
+    }
+}
+
 fn localized_server_error(cx: &App, code: ErrorCode) -> SharedString {
     match code {
         ErrorCode::Unspecified => t!(cx, "error.kytrix.server_unspecified"),
@@ -1870,6 +2062,35 @@ fn localized_server_error(cx: &App, code: ErrorCode) -> SharedString {
         ErrorCode::Timeout => t!(cx, "error.kytrix.server_timeout"),
         ErrorCode::MutationUnknown => t!(cx, "error.kytrix.server_mutation_unknown"),
         ErrorCode::Protocol => t!(cx, "error.kytrix.server_protocol"),
+    }
+}
+
+fn translated_server_error(translate: &Translate, code: ErrorCode) -> SmolStr {
+    match code {
+        ErrorCode::Unspecified => t_smol!(translate, "error.kytrix.server_unspecified"),
+        ErrorCode::RateLimit => t_smol!(translate, "error.kytrix.server_rate_limit"),
+        ErrorCode::EntitlementRequired => {
+            t_smol!(translate, "error.kytrix.server_entitlement_required")
+        }
+        ErrorCode::FinancialIndexTopicLimitExceeded => {
+            t_smol!(translate, "error.kytrix.server_index_limit")
+        }
+        ErrorCode::InvalidTopic => t_smol!(translate, "error.kytrix.server_invalid_topic"),
+        ErrorCode::AuthenticationUnavailable => {
+            t_smol!(translate, "error.kytrix.server_authentication_unavailable")
+        }
+        ErrorCode::InvalidRequest => t_smol!(translate, "error.kytrix.server_invalid_request"),
+        ErrorCode::NotReady => t_smol!(translate, "error.kytrix.server_not_ready"),
+        ErrorCode::InvalidArgument => t_smol!(translate, "error.kytrix.server_invalid_argument"),
+        ErrorCode::NotFound => t_smol!(translate, "error.kytrix.server_not_found"),
+        ErrorCode::QuotaExceeded => t_smol!(translate, "error.kytrix.server_quota_exceeded"),
+        ErrorCode::ProtectedAccount => t_smol!(translate, "error.kytrix.server_protected_account"),
+        ErrorCode::UpstreamUnavailable => {
+            t_smol!(translate, "error.kytrix.server_upstream_unavailable")
+        }
+        ErrorCode::Timeout => t_smol!(translate, "error.kytrix.server_timeout"),
+        ErrorCode::MutationUnknown => t_smol!(translate, "error.kytrix.server_mutation_unknown"),
+        ErrorCode::Protocol => t_smol!(translate, "error.kytrix.server_protocol"),
     }
 }
 
@@ -1987,10 +2208,11 @@ impl LocalizedError for SolanaWalletMutationUnknown {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, fmt::Display};
+    use std::{collections::BTreeSet, fmt::Display, rc::Rc};
 
     use gpui_kit::TestAppContext;
-    use i18n::language::codes::LanguageCode;
+    use i18n::{language::codes::LanguageCode, translate::Translate};
+    use kytrix_service_provider::service::engine::ErrorCode;
     use market_participants_connector::{
         account::error::{AccountCatalogError, AccountError},
         catalog::error::SourceProtocolRejection,
@@ -2009,10 +2231,11 @@ mod tests {
     use smol_str::{SmolStr, format_smolstr};
 
     use super::{
-        CatalogError, CatalogValidationError, DisplayError, ListingErrorPresentation,
-        ListingIdentifierError, LocalizedError, LocalizedReason, NetworkError, SourceError,
-        TransportError, UpgradeFailure, account_is_catalog_not_loaded, is_catalog_not_loaded,
-        listing_identity_diagnostic, market_is_catalog_not_loaded,
+        CatalogError, CatalogValidationError, DisplayError, KytrixServiceError,
+        ListingErrorPresentation, ListingIdentifierError, LocalizedError, LocalizedReason,
+        NetworkError, SourceError, TranslatedError, TransportError, UpgradeFailure,
+        account_is_catalog_not_loaded, is_catalog_not_loaded, listing_identity_diagnostic,
+        market_is_catalog_not_loaded,
     };
     use crate::venue::{VenueDisplay, route_display_string};
 
@@ -2031,6 +2254,94 @@ mod tests {
             route("spot"),
             VenueListingId::from_identity_value(&id).expect("the fixture listing id is canonical"),
         )
+    }
+
+    /// A translation context built from the embedded catalogue, rendering `language`.
+    ///
+    /// The composition root builds the same handle from the catalogue it loads; a test can
+    /// build it with no application at all, which is the point of the injected context.
+    fn translate(language: LanguageCode) -> Translate {
+        Translate::new(
+            Rc::new(i18n::global::embedded::load().expect("the embedded locales load")),
+            language,
+        )
+    }
+
+    /// The injected renderer states the same text as the global one: P3-0 moves the context
+    /// failures are rendered through, it does not reword the interface.
+    #[test]
+    fn the_injected_renderer_states_what_the_global_one_states() {
+        let cx = TestAppContext::single();
+
+        cx.update(|cx| {
+            i18n::global::embedded::install(cx).expect("the embedded locales load");
+            let translate = translate(LanguageCode::En);
+
+            let refused = TransportError::WebSocketConnect {
+                failure: UpgradeFailure::Rejected { status: 403 },
+            };
+            let timed_out = NetworkError::WebSocketUpgradeFailed {
+                endpoint: SmolStr::new_static("wss://stream.example.test/ws"),
+                failure: UpgradeFailure::Timeout,
+            };
+            let rejection = TransportError::SubscriptionRejected {
+                code: SmolStr::new_static("4401"),
+                message: SmolStr::new_static("token expired"),
+            };
+            let unready = KytrixServiceError::Server(ErrorCode::NotReady);
+
+            for language in [LanguageCode::En, LanguageCode::ZhCn] {
+                cx.set_global(language);
+                translate.set_language(language);
+
+                assert_eq!(
+                    refused.translated_message(&translate).as_str(),
+                    refused.localized_message(cx).as_ref(),
+                    "the upgrade refusal reads the same in {language}"
+                );
+                assert_eq!(
+                    timed_out.translated_message(&translate).as_str(),
+                    timed_out.localized_message(cx).as_ref(),
+                    "the nested network failure reads the same in {language}"
+                );
+                assert_eq!(
+                    rejection.translated_message(&translate).as_str(),
+                    rejection.localized_message(cx).as_ref(),
+                    "the subscription rejection reads the same in {language}"
+                );
+                assert_eq!(
+                    unready.translated_message(&translate).as_str(),
+                    unready.localized_message(cx).as_ref(),
+                    "the service failure reads the same in {language}"
+                );
+            }
+        });
+    }
+
+    /// Stating a failure through the injected context needs no GPUI application at all: this
+    /// test never creates one, so the ported mappings cannot be reaching a global.
+    #[test]
+    fn an_injected_context_renders_a_failure_without_any_global() {
+        let translate = translate(LanguageCode::En);
+        let failure = NetworkError::WebSocketUpgradeFailed {
+            endpoint: SmolStr::new_static("wss://stream.example.test/ws"),
+            failure: UpgradeFailure::Timeout,
+        };
+
+        let english = failure.translated_message(&translate);
+        assert!(
+            english.contains("wss://stream.example.test/ws"),
+            "{english}"
+        );
+        assert!(english.contains("timed out"), "{english}");
+
+        translate.set_language(LanguageCode::ZhCn);
+        let chinese = failure.translated_message(&translate);
+        assert!(!chinese.is_empty(), "the failure states itself in Chinese");
+        assert_ne!(
+            chinese, english,
+            "the language the injected context carries decides the text"
+        );
     }
 
     /// Why a socket never came up is the whole content of these messages, so the
@@ -2662,6 +2973,45 @@ mod tests {
         });
     }
 
+    /// The listing presentation and its fallback reason state the same text through the
+    /// injected context as through the global one, in both languages. They are the newest
+    /// mapping of the module, and the one a widget renders without touching the venue
+    /// catalogue.
+    #[test]
+    fn a_listing_presentation_reads_the_same_through_the_injected_context() {
+        let cx = TestAppContext::single();
+
+        cx.update(|cx| {
+            i18n::global::embedded::install(cx).expect("the embedded locales load");
+
+            let absent = ListingErrorPresentation::of(Err(DisplayError::ListingNotFound {
+                listing: Box::new(listing_key('f')),
+            }));
+
+            for language in [LanguageCode::En, LanguageCode::ZhCn] {
+                cx.set_global(language);
+                let translate = translate(language);
+
+                assert_eq!(
+                    absent.translated_message(&translate).as_str(),
+                    absent.localized_message(cx).as_ref(),
+                    "the refused listing read reads the same in {language}"
+                );
+                for reason in [
+                    LocalizedReason::Resolved,
+                    LocalizedReason::UnknownListing,
+                    LocalizedReason::DisplayUnavailable,
+                ] {
+                    assert_eq!(
+                        reason.translated_message(&translate).as_str(),
+                        reason.localized_message(cx).as_ref(),
+                        "the fallback reason reads the same in {language}"
+                    );
+                }
+            }
+        });
+    }
+
     /// A market request refused because a listing no longer reads states the
     /// published state, which is the refusal itself: the request's own listing id
     /// stays a typed field of the error and never reaches the message as a label.
@@ -2894,7 +3244,7 @@ mod tests {
     /// every placeholder of the catalogue bound to a marker of its own. The two renders have to
     /// agree, which is only true when the mapping supplies every placeholder the message
     /// declares, and neither may leave a `%{…}` behind.
-    /// The `t!` call sites of the widget crates that name this catalogue's messages.
+    /// The translation call sites of the widget crates that name this catalogue's messages.
     ///
     /// Almost every mapping of the catalogue is in this module, so the guard above
     /// reads its arguments out of this module's own source. A few families belong to
@@ -2907,8 +3257,8 @@ mod tests {
     /// a compile error rather than a silently uncovered one.
     ///
     /// The guard reads a call site's key from the invocation itself: the reader takes the
-    /// second argument as the key, so a `t!` whose key is a constant is read as the *name*
-    /// of that constant, which no locale defines and nothing checks. A listed source
+    /// second argument as the key, so an invocation whose key is a constant is read as the
+    /// *name* of that constant, which no locale defines and nothing checks. A listed source
     /// therefore names every key where it uses it.
     const WIDGET_MESSAGE_SOURCES: &[&str] = &[
         include_str!("../../widgets/force_order/src/view.rs"),
@@ -2979,255 +3329,6 @@ mod tests {
         }
     }
 
-    /// The production source of every widget that hands the framework a notice.
-    ///
-    /// Listed rather than discovered: `include_str!` takes a literal, so a file that moves is a
-    /// compile error rather than one that silently leaves the guard's reach, and the guard below
-    /// reads exactly these files. Each entry is spelled the way the repository spells the file,
-    /// so a failure names the source a reader has to open; the paths are relative to this file
-    /// because that is what `include_str!` resolves against.
-    ///
-    /// `empty` is not here: it never enters the waiting state, so it never hands over a notice.
-    /// `perpetual_statistics` is the one entry whose file is not a `view.rs` — it publishes more
-    /// than one widget and keeps their shared pane a directory below `src`.
-    const WIDGET_NOTICE_SOURCES: &[(&str, &str)] = &[
-        (
-            "crates/widgets/candlestick/src/view.rs",
-            include_str!("../../widgets/candlestick/src/view.rs"),
-        ),
-        (
-            "crates/widgets/coin_market_cap_fear_and_greed_index/src/view.rs",
-            include_str!("../../widgets/coin_market_cap_fear_and_greed_index/src/view.rs"),
-        ),
-        (
-            "crates/widgets/cryptocurrency_etf/src/view.rs",
-            include_str!("../../widgets/cryptocurrency_etf/src/view.rs"),
-        ),
-        (
-            "crates/widgets/financial_calendar/src/view.rs",
-            include_str!("../../widgets/financial_calendar/src/view.rs"),
-        ),
-        (
-            "crates/widgets/force_order/src/view.rs",
-            include_str!("../../widgets/force_order/src/view.rs"),
-        ),
-        (
-            "crates/widgets/global_shipping_chokepoint/src/view.rs",
-            include_str!("../../widgets/global_shipping_chokepoint/src/view.rs"),
-        ),
-        (
-            "crates/widgets/hyperliquid_wallet/src/view.rs",
-            include_str!("../../widgets/hyperliquid_wallet/src/view.rs"),
-        ),
-        (
-            "crates/widgets/financial_index/src/view.rs",
-            include_str!("../../widgets/financial_index/src/view.rs"),
-        ),
-        (
-            "crates/widgets/market_trade/src/view.rs",
-            include_str!("../../widgets/market_trade/src/view.rs"),
-        ),
-        (
-            "crates/widgets/news/src/view.rs",
-            include_str!("../../widgets/news/src/view.rs"),
-        ),
-        (
-            "crates/widgets/order_book/src/view.rs",
-            include_str!("../../widgets/order_book/src/view.rs"),
-        ),
-        (
-            "crates/widgets/pentagon_pizza_index/src/view.rs",
-            include_str!("../../widgets/pentagon_pizza_index/src/view.rs"),
-        ),
-        (
-            "crates/widgets/prediction_market/src/view.rs",
-            include_str!("../../widgets/prediction_market/src/view.rs"),
-        ),
-        (
-            "crates/widgets/perpetual_statistics/src/widget/display/pane.rs",
-            include_str!("../../widgets/perpetual_statistics/src/widget/display/pane.rs"),
-        ),
-        (
-            "crates/widgets/x/src/view.rs",
-            include_str!("../../widgets/x/src/view.rs"),
-        ),
-        (
-            "crates/widgets/volume_heatmap/src/view.rs",
-            include_str!("../../widgets/volume_heatmap/src/view.rs"),
-        ),
-        (
-            "crates/widgets/ethereum_wallet/src/view.rs",
-            include_str!("../../widgets/ethereum_wallet/src/view.rs"),
-        ),
-        (
-            "crates/widgets/solana_wallet/src/view.rs",
-            include_str!("../../widgets/solana_wallet/src/view.rs"),
-        ),
-        (
-            "crates/widgets/watch_list/src/view.rs",
-            include_str!("../../widgets/watch_list/src/view.rs"),
-        ),
-    ];
-
-    /// The two spellings a widget hands a message key over in: the constructor, and the variant
-    /// it constructs. A widget that writes the variant out by hand names the same key.
-    const NOTICE_MESSAGE_CALLS: &[&str] = &["Notice::message(", "Notice::Message("];
-
-    /// The key of the one notice a widget does not name itself.
-    ///
-    /// A pane that needs a market loaded hands over the venues it waits for and the venues it
-    /// can read at all, and the sentence that names the second set is the catalogue's own:
-    /// `venue::market_not_loaded_sentence` renders `common.market_not_loaded` from them.
-    const MARKET_NOT_LOADED_KEY: &str = "common.market_not_loaded";
-
-    /// Every key a widget hands a notice over under is one every locale defines and renders.
-    ///
-    /// A notice is a reference to the catalogue rather than a sentence, so nothing else reads its
-    /// key: a key no locale defines translates to the empty string, and the placeholder of a
-    /// waiting pane would be blank instead of the guidance it exists to give. The keys are read
-    /// out of the call sites that name them, so a notice that is added — or one whose key is
-    /// mistyped — is covered by the call site rather than by a list written beside it.
-    #[test]
-    fn every_notice_a_widget_reports_should_be_named_in_every_locale() {
-        let i18n = i18n::global::embedded::load().expect("the embedded locales load");
-        let mut named = Vec::new();
-        for (listed, source) in WIDGET_NOTICE_SOURCES {
-            named.extend(notice_keys(source).into_iter().map(|key| (*listed, key)));
-        }
-
-        let distinct = named
-            .iter()
-            .map(|(_, key)| key.as_str())
-            .collect::<BTreeSet<_>>();
-        assert!(
-            distinct.len() >= 12,
-            "the widgets hand their notices over by key, and {} distinct key(s) were read out of \
-             them: {distinct:?}",
-            distinct.len()
-        );
-
-        for language in i18n.languages() {
-            let defined = i18n
-                .keys(language)
-                .expect("an embedded language exposes its keys")
-                .collect::<Vec<_>>();
-
-            for (source, key) in &named {
-                assert!(
-                    defined.contains(&key.as_str()),
-                    "{source} hands a notice over under {key}, which {language} does not define"
-                );
-                assert!(
-                    i18n.try_translate(language, key)
-                        .is_some_and(|text| !text.is_empty()),
-                    "{source} hands a notice over under {key}, which renders empty in {language}"
-                );
-            }
-        }
-    }
-
-    /// Every widget source that hands a notice over in production is one the guard above reads.
-    ///
-    /// [`WIDGET_NOTICE_SOURCES`] is written by hand, so a widget that starts reporting a notice is
-    /// covered only if someone names it there, and the key it hands over — the whole content of a
-    /// waiting pane — would be checked by nothing. The walk reads every widget source, recursively
-    /// because a crate that publishes more than one widget keeps their shared pane a directory
-    /// below `src`, slices each file at its test module, and compares the repository spelling of
-    /// every file that hands a notice over with the list — in both directions, so an entry whose
-    /// file stops handing one over is removed rather than kept as a file nothing needs read. Each
-    /// entry is then read back through the path it names, because `include_str!` cannot take that
-    /// path from the list: without this, the path a reader is sent to would be a label nothing
-    /// checks against the source actually read.
-    #[test]
-    fn every_production_notice_call_site_should_be_listed_for_the_guard_to_read() {
-        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("the widget crate lives one directory below the crates directory");
-        let widgets = crates.join("widgets");
-        let workspace = crates
-            .parent()
-            .expect("the crates directory lives below the workspace root");
-        let mut discovered = Vec::new();
-        let mut pending = vec![widgets.clone()];
-
-        while let Some(directory) = pending.pop() {
-            for entry in std::fs::read_dir(&directory).expect("a widget crate is readable") {
-                let path = entry.expect("a widget source is readable").path();
-                if path.is_dir() {
-                    pending.push(path);
-                    continue;
-                }
-                // A module that is a directory keeps its tests in sibling `*_tests.rs` files and
-                // the fakes several of them share in `test_support.rs`, both declared
-                // `#[cfg(test)]` by their parent module (`crates/widgets/AGENTS.md` §2). Neither
-                // is compiled into a widget, so neither hands a notice over: a notice a test
-                // writes for itself is not one a pane draws.
-                let name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or_default();
-                if !path.extension().is_some_and(|extension| extension == "rs")
-                    || name.ends_with("_tests.rs")
-                    || name == "test_support.rs"
-                {
-                    continue;
-                }
-                let source = std::fs::read_to_string(&path).expect("a widget source is readable");
-                if names_a_notice(production_source(&source)) {
-                    discovered.push(format!(
-                        "crates/widgets/{}",
-                        path.strip_prefix(&widgets)
-                            .expect("a source read out of the widget crates is below them")
-                            .to_string_lossy()
-                            .replace('\\', "/")
-                    ));
-                }
-            }
-        }
-
-        assert!(
-            !discovered.is_empty(),
-            "the walk found no production notice call site, so it is reading nothing"
-        );
-
-        let unlisted = discovered
-            .iter()
-            .filter(|source| {
-                !WIDGET_NOTICE_SOURCES
-                    .iter()
-                    .any(|(listed, _)| *listed == source.as_str())
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            unlisted.is_empty(),
-            "these widget sources hand a notice over in production and no guard reads them, so \
-             the key they hand over is checked by nothing: {unlisted:?} — add each to \
-             WIDGET_NOTICE_SOURCES"
-        );
-
-        let unread = WIDGET_NOTICE_SOURCES
-            .iter()
-            .filter(|(listed, _)| !discovered.iter().any(|source| source == listed))
-            .collect::<Vec<_>>();
-        assert!(
-            unread.is_empty(),
-            "these sources are listed as handing a notice over and no longer do, so the list \
-             names files the guard does not need: {unread:?} — remove each from \
-             WIDGET_NOTICE_SOURCES"
-        );
-
-        for (listed, source) in WIDGET_NOTICE_SOURCES {
-            let on_disk = std::fs::read_to_string(workspace.join(listed))
-                .unwrap_or_else(|error| panic!("{listed} is readable: {error}"));
-            // Compared as a predicate rather than with `assert_eq!`, because the two sides are
-            // whole files and a failure has to name the entry to fix rather than print them.
-            assert!(
-                on_disk == *source,
-                "{listed} is listed, but the source read for it is another file"
-            );
-        }
-    }
-
     /// A conversion reference disagrees with its contract on one named role, and
     /// that role is a lexical label rather than a value: rendering it from the model
     /// label would put an English word inside the Chinese sentence, so each locale
@@ -3277,28 +3378,49 @@ mod tests {
     /// it out here would be a second one to find.
     const TEST_MODULE_ATTRIBUTE: &str = concat!("#[cfg", "(test)]");
 
-    /// The message keys the `t!` invocations of one source file name, in source order.
+    /// The macros that render one message: the GPUI-global `t!` and its injected successor
+    /// `t_smol!`.
+    ///
+    /// Both are read by the guards below, because P3-0 ports the mappings of this module to
+    /// the injected context incrementally: a reader that only looked for `t!(` would silently
+    /// stop covering every mapping converted so far, and the key or placeholder it names would
+    /// be checked by nothing.
+    const TRANSLATION_CALLS: &[&str] = &["t_smol!(", "t!("];
+
+    /// The first translation invocation of one source: the offset of its macro name and the
+    /// length of that name.
+    ///
+    /// `t_smol!(` does not contain `t!(` (the `t` is followed by `_`), so each name is searched
+    /// for on its own and the earliest one wins.
+    fn next_translation_call(source: &str) -> Option<(usize, usize)> {
+        TRANSLATION_CALLS
+            .iter()
+            .filter_map(|call| source.find(call).map(|offset| (offset, call.len())))
+            .min_by_key(|(offset, _)| *offset)
+    }
+
+    /// The message keys the translation invocations of one source file name, in source order.
     ///
     /// Only the production half of the file is read, sliced the way [`production_source`] slices
     /// it: the keys a test writes for itself are not messages the interface renders. An
     /// invocation is written both on one line and one argument per line, so the literal is
-    /// looked for after the translator the macro is given rather than assumed to follow it on
+    /// looked for after the context the macro is given rather than assumed to follow it on
     /// the same line.
     fn message_keys(source: &str) -> Vec<String> {
         let production = production_source(source);
         let mut keys = Vec::new();
         let mut rest = production;
 
-        while let Some(invocation) = rest.find("t!(") {
-            rest = &rest[invocation + "t!(".len()..];
+        while let Some((invocation, length)) = next_translation_call(rest) {
+            rest = &rest[invocation + length..];
             let Some(opening) = rest.find('"') else {
                 break;
             };
-            let translator = rest[..opening]
-                .trim_start()
-                .strip_prefix("cx")
-                .map(str::trim_start);
-            if !translator.is_some_and(|arguments| arguments.starts_with(',')) {
+            let context = rest[..opening].trim();
+            let Some(context) = context.strip_suffix(',') else {
+                continue;
+            };
+            if context.is_empty() {
                 continue;
             }
             let key = &rest[opening + 1..];
@@ -3312,54 +3434,8 @@ mod tests {
         keys
     }
 
-    /// Whether one production half hands the framework a notice.
-    ///
-    /// The identifier has to be the framework's own constructor or variant rather than any
-    /// mention of the word: a widget that draws a notice of its own names a private function, and
-    /// a widget that carries one in a field constructs it here.
-    fn names_a_notice(production: &str) -> bool {
-        NOTICE_MESSAGE_CALLS
-            .iter()
-            .any(|call| production.contains(call))
-            || production.contains("Notice::MarketNotLoaded")
-    }
-
-    /// The message keys the production half of one widget source hands a notice over under.
-    ///
-    /// A notice names its key as a literal at every call site, so the literal after the call is
-    /// the whole of what it names. The literal is looked for after the call rather than on the
-    /// same line, because a call site is written both on one line and one argument per line. The
-    /// market-not-loaded notice is the one whose key is not at the call site: the widget hands
-    /// over the venues it needs, and the catalogue renders them through a key of its own.
-    fn notice_keys(source: &str) -> Vec<String> {
-        let production = production_source(source);
-        let mut keys = Vec::new();
-
-        for &call in NOTICE_MESSAGE_CALLS {
-            let mut rest = production;
-            while let Some(handed_over) = rest.find(call) {
-                rest = &rest[handed_over + call.len()..];
-                let Some(opening) = rest.find('"') else {
-                    break;
-                };
-                let key = &rest[opening + 1..];
-                let Some(closing) = key.find('"') else {
-                    break;
-                };
-                keys.push(key[..closing].to_owned());
-                rest = &key[closing..];
-            }
-        }
-
-        if production.contains("Notice::MarketNotLoaded") {
-            keys.push(MARKET_NOT_LOADED_KEY.to_owned());
-        }
-
-        keys
-    }
-
-    /// The key and the argument names of every `t!` invocation of one source file, in source
-    /// order.
+    /// The key and the argument names of every translation invocation of one source file, in
+    /// source order.
     ///
     /// The mapping half of the file is what is read — the slice [`production_source`] takes,
     /// where the first `#[cfg(test)]` would cut the mappings after an accessor a test drives
@@ -3370,17 +3446,17 @@ mod tests {
         let mut mappings = Vec::new();
         let mut rest = production;
 
-        while let Some(start) = rest.find("t!(") {
-            let Some((body, after)) = invocation_body(&rest[start + "t!(".len()..]) else {
+        while let Some((start, length)) = next_translation_call(rest) {
+            let Some((body, after)) = invocation_body(&rest[start + length..]) else {
                 break;
             };
             rest = after;
             let arguments = top_level_arguments(body);
-            // The translator the macro is given comes first, and it is a context rather than a
+            // The context the macro is given comes first, and it is a value rather than a
             // literal: an invocation written without one is not a mapping of this module.
             if arguments
                 .first()
-                .and_then(|translator| bound_name(translator))
+                .and_then(|context| bound_name(context))
                 .is_none()
             {
                 continue;
@@ -3400,14 +3476,15 @@ mod tests {
     }
 
     /// Both readers of the widget sources skip the accessor a test drives rather than the
-    /// mappings written after it.
+    /// mappings written after it, and both read the GPUI-global macro and its injected
+    /// successor alike.
     ///
     /// `hyperliquid_wallet` marks such an accessor in the middle of its production half,
     /// and both readers sliced each source at the first `#[cfg(test)]` until this rule was
-    /// written down: every `t!` invocation below that accessor was read by nothing, so a mapping
-    /// there could lose a placeholder — or name a key no locale defines — with both guards
-    /// green. The mappings past the accessor and past the test module are what the two readers
-    /// have to disagree about.
+    /// written down: every translation invocation below that accessor was read by nothing, so a
+    /// mapping there could lose a placeholder — or name a key no locale defines — with both
+    /// guards green. The mappings past the accessor and past the test module are what the two
+    /// readers have to disagree about.
     #[test]
     fn a_mapping_after_an_inline_test_accessor_should_still_be_read() {
         let source = concat!(
@@ -3422,6 +3499,10 @@ mod tests {
             "    t!(cx, \"widget.panel.waiting\", market = joined_names(cx, &markets))\n",
             "}\n",
             "\n",
+            "fn caption(translate: &Translate) -> SmolStr {\n",
+            "    t_smol!(translate, \"widget.panel.queued\", market = markets)\n",
+            "}\n",
+            "\n",
             "#[cfg(test)]\n",
             "mod tests {\n",
             "    fn copy(cx: &App) -> SharedString {\n",
@@ -3430,10 +3511,19 @@ mod tests {
             "}\n",
         );
 
-        assert_eq!(message_keys(source), ["widget.panel.waiting".to_owned()]);
+        assert_eq!(
+            message_keys(source),
+            [
+                "widget.panel.waiting".to_owned(),
+                "widget.panel.queued".to_owned()
+            ]
+        );
         assert_eq!(
             message_arguments(source),
-            [("widget.panel.waiting".to_owned(), vec!["market".to_owned()])]
+            [
+                ("widget.panel.waiting".to_owned(), vec!["market".to_owned()]),
+                ("widget.panel.queued".to_owned(), vec!["market".to_owned()])
+            ]
         );
     }
 
