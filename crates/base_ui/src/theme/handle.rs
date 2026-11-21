@@ -14,12 +14,15 @@
 //! 两套 [`Theme`] 在构造时各解析一次；切换只写信号、不重算主题。句柄 `Clone` 是 `Rc` 浅拷贝（每个
 //! `bind_style`/`bind_text` 闭包持有一份），所以节点侧的 clone 不复制两套主题数据。
 //!
-//! 组件取色的两条路：
+//! 组件取色的三条路：
 //!
 //! - **动态**：`bind_style(move |cx| StylePatch { background: Some(theme.role(cx, Role::SurfaceCanvas)), .. })`
-//!   ——读主题信号，深浅切换自动失效；
-//! - **挂载期常量**：`theme.theme_for(appearance).role(..)` 或 `theme.resolve(cx, role)`
-//!   ——静态 `PaintSpec` 不随主题切换更新（与引擎的静态/动态通道划分一致，设计 §4.9.2）。
+//!   ——读主题信号，深浅切换自动失效（文本 / 图片调制共用 `foreground` 通道）；
+//! - **帧外重算**：`theme.current(app)` 取当前外观，组件在 `sync` 里重取颜色（自绘画布）或重建
+//!   静态载荷子树（`MarkdownNode`）；节点侧再用一条只读外观的空 `bind_style` 登记依赖，保证
+//!   「写外观 → 标脏 → 出一帧 → `sync`」的闭环；
+//! - **挂载期常量**：`theme.theme_for(appearance)` / `Theme::of(..)` —— 只适用于与外观无关的
+//!   几何/文案；**颜色不得走这条路**（否则浅色主题下会残留深色文字，见 `kit/mod.rs` 的 G3 一节）。
 
 use std::rc::Rc;
 
@@ -37,12 +40,13 @@ use super::{
 };
 
 /// 应用层主题服务（`Rc` 句柄，可自由 clone 进 `bind_*` 闭包）。
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ThemeHandle {
     inner: Rc<ThemeData>,
 }
 
 /// 句柄共享的数据：主题信号 + 两套已加载主题。
+#[derive(Debug)]
 struct ThemeData {
     current: Signal<Appearance>,
     light: Theme,
@@ -83,6 +87,12 @@ impl ThemeHandle {
     /// 读当前外观，并在 `cx` 所属节点上登记主题依赖。
     pub fn appearance(&self, cx: &mut ReadCtx<'_>) -> Appearance {
         *cx.read(&self.inner.current)
+    }
+
+    /// 读当前外观，**不登记依赖**：帧外 `sync` 的「外观是否变了」判据（帧钩子里比较后按需重算
+    /// 静态载荷；节点侧的失效由 `bind_*` 里的 [`ThemeHandle::appearance`] 负责）。
+    pub fn current(&self, app: &App) -> Appearance {
+        app.read_with(&self.inner.current, |appearance| *appearance)
     }
 
     /// 读当前外观对应的主题（登记依赖）。

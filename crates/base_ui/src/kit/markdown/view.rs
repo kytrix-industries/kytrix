@@ -6,8 +6,10 @@
 //! 1. **块 → 节点**：标题/段落挂一个引擎文本节点（行内混排由 [`super::inline_flow`] 展开成
 //!    `runs` + `inline_boxes`）；代码块/引用/列表/表格/分隔线各自按节点树表达（表格是简单的
 //!    行列 `flex` 布局，不依赖容器的 `table` 组件批次）。
-//! 2. **样式**：从 [`crate::theme`] 解析一次的 [`MarkdownStyle`]（挂载期常量，不做信号），
+//! 2. **样式**：从 [`crate::theme`] 解析的 [`MarkdownStyle`]（挂载期常量），
 //!    布局/绘制走 `crate::style_builder::{StyleBuilder, PaintBuilder}`。
+//!    静态用法是 [`MarkdownView`]（样式定死）；主题响应式用法是 [`MarkdownNode`]：外观变化时
+//!    按新主题重建子树（逐 run 颜色没有动态通道，见 `MarkdownNode` 的文档）。
 //!
 //! 链接命中不在节点树上做（引擎只有节点级命中），而是 [`MarkdownHandles`] 自持每条文本节点的
 //! 链接字节区间，再用引擎 E5 的 `Window::text_byte_index_at` 把点变成字节偏移：见
@@ -20,12 +22,13 @@ use std::sync::Arc;
 
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
+    app::App,
     math::{Point, Size},
     node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
-    paint::color::Color,
+    paint::{color::Color, style::StylePatch},
     resources::ResourceCache,
     text::{InlineBoxPaint, TextAlign, TextStyle, TextWrap},
-    window::Window,
+    window::{Window, WindowId},
 };
 
 use crate::{
@@ -35,7 +38,7 @@ use crate::{
         source::{InlineImageFormat, MarkdownAssets},
     },
     style_builder::{PaintBuilder, StyleBuilder},
-    theme::{resolved::Theme, role::Role},
+    theme::{appearance::Appearance, handle::ThemeHandle, resolved::Theme, role::Role},
 };
 
 /// 正文行高倍率（与旧 `window.text_style()` 的行高比例一致：1.4）。
@@ -321,6 +324,16 @@ impl MarkdownView {
             .id("MARKDOWN")
             .build(tree, parent)
             .expect("markdown root needs a live parent");
+        self.build_into(tree, root, images)
+    }
+
+    /// 在已存在的 `root` 下建全部块（`build_with_images` 与主题重建共用）。
+    fn build_into(
+        &self,
+        tree: &mut NodeTree,
+        root: NodeId,
+        images: &mut dyn ImagePaintSource,
+    ) -> MarkdownHandles {
         let mut ctx = BuildCtx {
             view: self,
             images,
@@ -332,6 +345,131 @@ impl MarkdownView {
             root,
             text_blocks: ctx.texts,
         }
+    }
+}
+
+/// 主题化 markdown 组件：静态载荷（`runs` / 装饰 / 代码块颜色）在挂载期按**当前外观**烘焙，
+/// 外观变化时由 [`MarkdownNode::sync`] 用新主题**重建子树**。
+///
+/// 为什么是重建而不是 `bind_style`：markdown 的行内颜色是**逐 run** 的（链接 / 行内代码 /
+/// 列表标记），而 `StylePatch::foreground` 是整段文本的统一覆盖（`paint/pass.rs` 的文本分支），
+/// 绑它会把一行里的多种颜色压成一种。逐 run 颜色没有动态通道，重建是正确的语义。
+///
+/// 失效链路：根节点绑一个只读主题依赖的空补丁（组件不产出挂载期颜色之外的静态色），外观
+/// 信号写入 → 根节点标脏 → 出现一帧 → 组合根的帧钩子（样式 pass **之前**）调用 `sync` 重建，
+/// 同帧完成新颜色的塑形与绘制。没有读主题的节点（其它静态子树）不受影响。
+pub struct MarkdownNode {
+    root: NodeId,
+    document: Arc<MarkdownDocument>,
+    theme: ThemeHandle,
+    appearance: Appearance,
+    handles: MarkdownHandles,
+}
+
+impl MarkdownNode {
+    /// 在 `parent` 下挂载（根节点 debug id = `MARKDOWN`），样式取 `theme` 的**当前外观**。
+    ///
+    /// # Panics
+    /// 窗口已关闭 / `parent` 已卸载（与 [`MarkdownView::build`] 同一契约：根节点建树失败
+    /// 只可能是调用方给了陈旧句柄）。
+    #[must_use]
+    pub fn mount(
+        app: &mut App,
+        window: WindowId,
+        parent: NodeId,
+        theme: ThemeHandle,
+        document: Arc<MarkdownDocument>,
+    ) -> Self {
+        let appearance = theme.current(app);
+        let view = MarkdownView::new(
+            document.clone(),
+            MarkdownStyle::from_theme(theme.theme_for(appearance)),
+        );
+        let dependency_theme = theme.clone();
+        let root = NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .flex_col()
+                    .width_full()
+                    .min_width_0()
+                    .build(),
+            )
+            .id("MARKDOWN")
+            .bind_style(move |cx| {
+                // 只登记依赖：外观写入时本节点标脏 → 一帧 → `sync` 重建子树。
+                let _ = dependency_theme.appearance(cx);
+                StylePatch::default()
+            })
+            .build(
+                app.window_mut(window)
+                    .expect("markdown: window must be alive")
+                    .tree_mut(),
+                parent,
+            )
+            .expect("markdown root needs a live parent");
+        let mut images = super::inline_flow::PlaceholderImagePaint {
+            color: view.style.image_placeholder,
+        };
+        let handles = view.build_into(
+            app.window_mut(window)
+                .expect("markdown: window must be alive")
+                .tree_mut(),
+            root,
+            &mut images,
+        );
+        Self {
+            root,
+            document,
+            theme,
+            appearance,
+            handles,
+        }
+    }
+
+    /// 外观变化时按新主题重建子树；返回是否重建（帧钩子里、样式 pass 之前调用）。
+    ///
+    /// 子树节点是纯静态载荷（没有 `bind_*` / 没有自持信号依赖），因此直接 `NodeTree::remove`
+    /// 不残留依赖边。根节点原地保留（外部持有的 probe / 布局锚点不失效）。
+    pub fn sync(&mut self, app: &mut App) -> bool {
+        let appearance = self.theme.current(app);
+        if appearance == self.appearance {
+            return false;
+        }
+        self.appearance = appearance;
+        let Some(window) = self.root.window() else {
+            return false;
+        };
+        let view = MarkdownView::new(
+            self.document.clone(),
+            MarkdownStyle::from_theme(self.theme.theme_for(appearance)),
+        );
+        let Some(target) = app.window_mut(window) else {
+            return false;
+        };
+        let tree = target.tree_mut();
+        let Ok(children) = tree.get(self.root).map(|node| node.children().to_vec()) else {
+            return false;
+        };
+        for child in children {
+            let _ = tree.remove(child);
+        }
+        let mut images = super::inline_flow::PlaceholderImagePaint {
+            color: view.style.image_placeholder,
+        };
+        self.handles = view.build_into(tree, self.root, &mut images);
+        true
+    }
+
+    /// 视图根节点。
+    #[must_use]
+    pub fn root(&self) -> NodeId {
+        self.root
+    }
+
+    /// 当前子树挂载出来的文本块（链接命中用；重建后是新的一组）。
+    #[must_use]
+    pub fn handles(&self) -> &MarkdownHandles {
+        &self.handles
     }
 }
 
@@ -674,11 +812,12 @@ mod tests {
     use smol_str::SmolStr;
     use ui_core::{
         math::{Point, Size},
+        node::tree::NodeKind,
         test_support::{app::TestApp, probe::Selector},
         text::TextStyle,
     };
 
-    use super::{MarkdownStyle, MarkdownView, RichText, rich_text, text_align};
+    use super::{MarkdownNode, MarkdownStyle, MarkdownView, RichText, rich_text, text_align};
     use crate::{
         kit::markdown::{
             document::{
@@ -688,7 +827,7 @@ mod tests {
             inline_flow::{FlowStyle, InvisibleImages},
             source::InlineImageFormat,
         },
-        theme::{appearance::Appearance, resolved::Theme},
+        theme::{appearance::Appearance, handle::ThemeHandle, resolved::Theme, role::Role},
     };
 
     fn theme() -> Theme {
@@ -1217,6 +1356,80 @@ mod tests {
             (gap_after_paragraph - (super::BLOCK_GAP + super::HEADING_SPACE_ABOVE)).abs() < 0.01,
             "无空行时标题上间距 = {gap_after_paragraph}，期望 {}",
             super::BLOCK_GAP + super::HEADING_SPACE_ABOVE
+        );
+    }
+
+    // ── G3：主题化挂载（外观切换 = 按新主题重建子树） ─────────────────────
+
+    /// 子树里第一个文本节点的兜底文字色（markdown 的逐 run 颜色烘焙在 `TextStyle` 里）。
+    fn first_text_color(
+        app: &TestApp,
+        root: ui_core::node::id::NodeId,
+    ) -> ui_core::paint::color::Color {
+        let window = app.window_id();
+        let tree = app.app().window(window).expect("窗口").tree();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            let entry = tree.get(node).expect("节点存活");
+            if let NodeKind::Text(content) = entry.kind() {
+                return content.style.color;
+            }
+            stack.extend(entry.children().iter().rev().copied());
+        }
+        panic!("markdown 子树里没有文本节点");
+    }
+
+    fn resolved(color: ui_core::paint::color::Color) -> [f32; 4] {
+        ui_core::paint::color::ColorResolver
+            .resolve(color)
+            .components
+    }
+
+    /// `MarkdownNode`：外观切换后 `sync` 重建子树，文本颜色换成新主题（逐 run 颜色没有
+    /// 动态通道，重建是正确语义）；同一外观再调用是 no-op。
+    #[test]
+    fn switching_appearance_rebuilds_the_markdown_with_the_new_theme() {
+        let mut app = TestApp::new();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let window = app.window_id();
+        let root = app.app().window(window).expect("窗口").tree().root();
+        let doc = document(vec![
+            MarkdownBlock::Heading {
+                level: HeadingLevel::H1,
+                pieces: Arc::from(vec![text("标题")]),
+            },
+            paragraph(vec![linked("链接", 0), text("与")]),
+            MarkdownBlock::CodeBlock {
+                language: Some(SmolStr::new_static("rust")),
+                code: SmolStr::new_static("let x = 1;"),
+            },
+        ]);
+        let mut node = MarkdownNode::mount(app.app_mut(), window, root, theme.clone(), doc);
+        let _ = app.drain().expect("首帧");
+
+        assert_eq!(
+            resolved(first_text_color(&app, node.root())),
+            resolved(Theme::of(Appearance::Light).role(Role::FgDefault)),
+            "浅色正文"
+        );
+        assert!(!node.sync(app.app_mut()), "外观未变时 no-op");
+
+        assert!(
+            theme.set_appearance(app.app_mut(), Appearance::Dark),
+            "写外观信号"
+        );
+        assert!(node.sync(app.app_mut()), "外观变化 = 重建子树");
+        let _ = app.drain().expect("重建后的帧");
+
+        assert_eq!(
+            resolved(first_text_color(&app, node.root())),
+            resolved(Theme::of(Appearance::Dark).role(Role::FgDefault)),
+            "深色正文（子树的静态 TextStyle.color 被重建换掉）"
+        );
+        assert_ne!(
+            resolved(Theme::of(Appearance::Light).role(Role::FgDefault)),
+            resolved(Theme::of(Appearance::Dark).role(Role::FgDefault)),
+            "两套外观的正文色必须不同（否则上面的断言无意义）"
         );
     }
 }

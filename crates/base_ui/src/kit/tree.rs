@@ -1178,12 +1178,13 @@ mod ui_tests {
             A11yUpdates, a11y_id, a11y_of, assert_single_parent_per_node, frame_a11y, full_a11y,
         },
         style_builder::StyleBuilder,
-        theme::{appearance::Appearance, handle::ThemeHandle},
+        theme::{appearance::Appearance, handle::ThemeHandle, resolved::Theme, role::Role},
     };
 
     struct Harness {
         app: TestApp,
         tree: Tree,
+        theme: ThemeHandle,
     }
 
     fn items() -> Vec<TreeItem> {
@@ -1201,7 +1202,13 @@ mod ui_tests {
     fn harness_with(items: Vec<TreeItem>) -> Harness {
         let mut app = TestApp::new();
         let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
-        let tree = Tree::new(app.app_mut(), theme, "tree", items, TreeOptions::default());
+        let tree = Tree::new(
+            app.app_mut(),
+            theme.clone(),
+            "tree",
+            items,
+            TreeOptions::default(),
+        );
         let window = app.window_id();
         let root = app.app().window(window).expect("window").tree().root();
         let parent = {
@@ -1212,7 +1219,7 @@ mod ui_tests {
                 .expect("parent")
         };
         tree.mount(app.app_mut(), window, parent).expect("mount");
-        let mut harness = Harness { app, tree };
+        let mut harness = Harness { app, tree, theme };
         settle(&mut harness);
         harness
     }
@@ -1876,5 +1883,139 @@ mod ui_tests {
         );
         // 解析出的节点仍可查（纯树查询，不读信号）。
         assert!(harness.tree.list().row_node(harness.app.app(), 1).is_some());
+    }
+
+    // ── G3：运行时主题响应性（行文字 / 折叠标 / 选中底色） ─────────────────
+
+    fn resolved(color: ui_core::paint::color::Color) -> [f32; 4] {
+        ui_core::paint::color::ColorResolver
+            .resolve(color)
+            .components
+    }
+
+    /// 行内文本节点的 `bind_style.foreground`（DFS 顺序：折叠标在前、标签在后）。
+    fn row_text_foregrounds(
+        harness: &Harness,
+        row: usize,
+    ) -> Vec<Option<ui_core::paint::color::Color>> {
+        let window = harness.app.window_id();
+        let tree = harness.app.app().window(window).expect("window").tree();
+        let Some(node) = harness.tree.list().row_node(harness.app.app(), row) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut stack = vec![node];
+        while let Some(current) = stack.pop() {
+            let Ok(entry) = tree.get(current) else {
+                continue;
+            };
+            if matches!(entry.kind(), NodeKind::Text(_)) {
+                out.push(entry.style_patch().foreground);
+            }
+            stack.extend(entry.children().iter().rev().copied());
+        }
+        out
+    }
+
+    /// 外观切换后树行的文字 / 折叠标 / 选中底色换成新主题的角色色；不读主题的静态节点不被失效。
+    #[test]
+    fn switching_appearance_repaints_tree_row_text_and_selection() {
+        let mut harness = harness();
+        click_row(&mut harness, 0);
+        settle(&mut harness);
+
+        let light = Theme::of(Appearance::Light);
+        let window = harness.app.window_id();
+        let row_node = harness
+            .tree
+            .list()
+            .row_node(harness.app.app(), 0)
+            .expect("row");
+        let row_background = |harness: &Harness| {
+            harness
+                .app
+                .app()
+                .window(window)
+                .expect("window")
+                .tree()
+                .get(row_node)
+                .expect("row node")
+                .style_patch()
+                .background
+        };
+        assert_eq!(
+            row_background(&harness).map(resolved),
+            Some(resolved(light.role(Role::Selection))),
+            "浅色选中行底色"
+        );
+        let texts = row_text_foregrounds(&harness, 0);
+        assert_eq!(
+            texts.first().copied().flatten().map(resolved),
+            Some(resolved(light.role(Role::FgMuted))),
+            "浅色折叠标"
+        );
+        assert_eq!(
+            texts.last().copied().flatten().map(resolved),
+            Some(resolved(light.role(Role::FgDefault))),
+            "浅色行标签"
+        );
+
+        // 静态节点（不读任何信号）：主题切换不得失效它。
+        let static_node = {
+            let parent = harness.tree.outer_node().expect("树的外层");
+            let window = harness.app.window_id();
+            let tree = harness
+                .app
+                .app_mut()
+                .window_mut(window)
+                .expect("window")
+                .tree_mut();
+            NodeBuilder::boxed()
+                .style(StyleBuilder::new().size(8.0, 8.0).build())
+                .build(tree, parent)
+                .expect("静态兄弟")
+        };
+        settle(&mut harness);
+
+        assert!(
+            harness
+                .theme
+                .set_appearance(harness.app.app_mut(), Appearance::Dark)
+        );
+        let record = harness.app.drain().expect("切深色").clone();
+        assert!(
+            record.dirty_nodes.contains(&row_node),
+            "读过主题的行节点必须被失效：{:?}",
+            record.dirty_nodes
+        );
+        assert!(
+            !record.dirty_nodes.contains(&static_node),
+            "未读主题的静态节点不得被失效：{:?}",
+            record.dirty_nodes
+        );
+        settle(&mut harness);
+
+        let dark = Theme::of(Appearance::Dark);
+        assert_eq!(
+            row_background(&harness).map(resolved),
+            Some(resolved(dark.role(Role::Selection))),
+            "深色选中行底色"
+        );
+        let texts = row_text_foregrounds(&harness, 0);
+        assert_eq!(
+            texts.first().copied().flatten().map(resolved),
+            Some(resolved(dark.role(Role::FgMuted))),
+            "深色折叠标"
+        );
+        assert_eq!(
+            texts.last().copied().flatten().map(resolved),
+            Some(resolved(dark.role(Role::FgDefault))),
+            "深色行标签"
+        );
+        assert_ne!(
+            resolved(light.role(Role::FgDefault)),
+            resolved(dark.role(Role::FgDefault)),
+            "两套外观的 FgDefault 必须不同（否则上面的断言无意义）"
+        );
     }
 }

@@ -38,8 +38,8 @@
 //! | [`alert`] | 对话框内容面板（4 类变体 / 输入校验 / 按钮行；内容根通用容器 + 关闭中双击守卫，按钮行实现与 dialog 共用） | `crate::alert` |
 //! | [`dialog`] | 模态对话框容器（遮罩 / 居中面板 / 焦点陷阱与恢复 / Esc 与点外部策略 / E13 组淡入淡出 + E10 完成回调 / a11y Dialog·AlertDialog；标题 / 关闭按钮 / 按钮行 / 确认取消回调；alert 内容协作） | `crate::dialog` + `crate::layer` 的 dialog·alert 槽 |
 //! | [`tab_bar`] | 标签栏（选中指示动画 / 方向键 / 关闭按钮 / a11y） | `crate::tab_bar` |
-//! | [`markdown`] | comrak 解析 → 引擎富文本 run / InlineBox 视图 | `crate::markdown` |
-//! | [`input`] | 应用层文本编辑状态机（caret / 选区 / IME / undo-redo / 拖选 / 双击选词） | `crate::input` |
+//! | [`markdown`] | comrak 解析 → 引擎富文本 run / InlineBox 视图（`MarkdownNode` 外观切换按新主题重建） | `crate::markdown` |
+//! | [`input`] | 应用层文本编辑状态机（caret / 选区 / IME / undo-redo / 拖选 / 双击选词；颜色全部走 `bind_style`/`sync` 读主题） | `crate::input` |
 //! | [`list`] | 等高 / 变高、静态 / 双端列表内核（E3 虚拟列表 + 实测回写 + 锚点） | `crate::static_*_list`、`crate::deque_*_list` |
 //! | [`scroll_bar`] | 自绘滚动条（拖拽 / 轨道点击 / 淡出 / 双轴） | `crate::scroll_bar` |
 //! | [`table`] | 列定义（Fixed/Flex/跨列）、表头排序、行虚拟化、多选、空态（E9 `Table`/`Row`/`Cell`/`ColumnHeader` 集合语义） | `crate::table` |
@@ -65,6 +65,24 @@
 //!    **没有** `on_frame` 自注册：引擎的 `App::on_frame` 只有一个钩子槽（后注册覆盖先注册），
 //!    组合根应在此钩子里依次调用各组件 `sync`。测试里直接调 `sync` 即可（`TestApp::drain`
 //!    不跑该钩子）。
+//!
+//! # 运行时主题响应性（G3）
+//!
+//! 组件取色必须经 [`crate::theme::handle::ThemeHandle`] 在**信号依赖**通道里读，不能把
+//! `theme.role(..)` / `theme.components()` 的返回值写进挂载期常量（那样 `Appearance` 切换后
+//! 颜色会留在旧外观，浅色主题下的深色文字/图标不可读）。三条落点：
+//!
+//! 1. **动态补丁**：`bind_style` 的 `background` / `foreground` / `border`（文本与 E7 图片
+//!    调制共用 `foreground` 通道）——外观写入时引擎只失效读过主题的节点；[`icon::IconSpec::build_themed`]
+//!    是图标的这条通道；
+//! 2. **画布重画**：自绘内容（input 的 caret / 选区）在组件 `sync` 里按
+//!    [`crate::theme::handle::ThemeHandle::current`] 重取颜色；节点侧由 `bind_style` 登记
+//!    主题依赖来保证「外观写入 → 出一帧 → sync 重画」；
+//! 3. **静态载荷重建**：[`markdown::view::MarkdownNode`] 的逐 run 颜色没有动态通道，外观变化
+//!    时在 `sync` 里按新主题重建子树（根节点保留，无依赖边残留）。
+//!
+//! 例外：品牌 logo 是**彩色**资产、按深色背景设计，[`brand::Brand`] 不做调制/背景适配（G7，
+//! 旧 `crate::brand` 也只是 `img(path)`；正确修法是资产批次补浅色变体，示例用固定深色底板承载）。
 //!
 //! # 无障碍（E9 集合语义）
 //!

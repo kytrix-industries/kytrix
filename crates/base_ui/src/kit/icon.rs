@@ -60,10 +60,15 @@ use ui_core::{
     error::EngineError,
     math::Size,
     node::{builder::NodeBuilder, id::NodeId, image::ImageFit},
-    paint::{color::Color, style::Style},
+    paint::{
+        color::Color,
+        style::{Style, StylePatch},
+    },
     resources::ResourceImage,
     window::WindowId,
 };
+
+use crate::theme::{handle::ThemeHandle, role::Role};
 
 /// 构造图标时的默认逻辑边长（旧用法里最常见的 16 px；`UnifiedSize::icon_size` 的 Large 档）。
 pub const DEFAULT_ICON_SIZE: f32 = 16.0;
@@ -488,13 +493,66 @@ impl IconSpec {
             .map_err(IconError::Node)
     }
 
+    /// 用**主题角色**作调制色挂载：与 [`IconSpec::build`] 同一个节点形态，但调制色取
+    /// `theme.role(cx, role)` —— 走 `bind_style.foreground`（E7 图片调制色与文本着色的同一条
+    /// 动态通道），外观切换时只失效本节点并按新角色重画，**不需要重建**图标。
+    ///
+    /// 静态 [`IconSpec::color`] 仍作为首帧样式 pass 求值前的占位值（真正绘制由 `bind_style`
+    /// 覆盖）。两种挂载方式的取舍：颜色是固定品牌色/状态色用 [`IconSpec::build`]，颜色由主题
+    /// 语义决定（例如 `FgMuted`）用本方法。
+    ///
+    /// # Errors
+    /// 同 [`IconSpec::build`]（`UnknownWindow` / `InvalidSize` / `Decode` / `Node`）。
+    pub fn build_themed(
+        self,
+        app: &mut App,
+        window: WindowId,
+        parent: NodeId,
+        theme: &ThemeHandle,
+        role: Role,
+    ) -> Result<NodeId, IconError> {
+        if !self.size.is_finite() || self.size <= 0.0 {
+            return Err(IconError::InvalidSize { size: self.size });
+        }
+        let scale = app
+            .window(window)
+            .ok_or(IconError::UnknownWindow { window })?
+            .scale()
+            .factor();
+        let resource = self.resource_for(app, window, scale)?;
+        let initial = theme.theme_for(theme.current(app)).role(role);
+        let mut style = Style::default();
+        style.inner.size.width = Dimension::length(self.size);
+        style.inner.size.height = Dimension::length(self.size);
+        let style_theme = theme.clone();
+        NodeBuilder::image(resource.id, ImageFit::Fill)
+            .image_modulation(initial)
+            .style(style)
+            .a11y(A11yOverride {
+                hidden: true,
+                ..A11yOverride::default()
+            })
+            .bind_style(move |cx| StylePatch {
+                foreground: Some(style_theme.role(cx, role)),
+                ..StylePatch::default()
+            })
+            .build(
+                app.window_mut(window)
+                    .ok_or(IconError::UnknownWindow { window })?
+                    .tree_mut(),
+                parent,
+            )
+            .map_err(IconError::Node)
+    }
+
     /// DPI 变化后**重选光栅档位**并把新变体换到已挂载的图标节点上（E7 `set_image_resource`）。
     ///
     /// E7 在窗口 `scale_epoch` 变化时只重解析内在尺寸（tile 物理像素 ÷ 新 scale），不会替应用
     /// 重选资产变体；应用在 `Event::DpiChanged` 后调用本方法即可恢复像素密度，**不需要**重建
     /// 节点。图标节点的尺寸是显式 `Style` 尺寸，所以换变体不会改变布局（只是采样变清晰）。
     ///
-    /// 本方法只重选档位：`kind` / `size` / `color` 的语义变化（例如主题切换）仍应重建节点。
+    /// 本方法只重选档位：`kind` / `size` 的语义变化仍应重建节点（主题色的变化走
+    /// [`IconSpec::build_themed`] 的 `bind_style` 通道，不需要重建）。
     /// 换句柄本身不请求帧；这里显式调用 [`App::request_repaint`]，保证帧外调用（事件处理器）
     /// 后下一帧会重绘。
     ///
@@ -631,7 +689,10 @@ mod tests {
     };
 
     use super::{DEFAULT_ICON_SIZE, IconError, IconKind, IconSpec, RasterTier, raster};
-    use crate::kit::test_support::{bounds, image_primitives, test_app, test_app_with_scale};
+    use crate::{
+        kit::test_support::{bounds, image_primitives, test_app, test_app_with_scale},
+        theme::{appearance::Appearance, handle::ThemeHandle, resolved::Theme, role::Role},
+    };
 
     // 构建期清单（`build.rs` 写进 `OUT_DIR/icons/built.rs`）：资产 ⇄ 枚举一一对应的机器证据。
     include!(concat!(env!("OUT_DIR"), "/icons/built.rs"));
@@ -1180,5 +1241,80 @@ mod tests {
             .window_mut(window)
             .expect("test window")
             .set_scale(Scale::new(scale).expect("测试 DPI 必须是有限正数"));
+    }
+
+    // ── G3：主题调制色（`build_themed` = `bind_style.foreground` 通道） ────
+
+    fn resolved(color: Color) -> [f32; 4] {
+        ui_core::paint::color::ColorResolver
+            .resolve(color)
+            .components
+    }
+
+    /// `build_themed` 的图标在深浅切换后按新角色重画，且**只有**图标节点被失效（同窗口的
+    /// 静态调制图标不受主题信号影响）。
+    #[test]
+    fn a_themed_icon_follows_the_appearance_and_a_static_icon_does_not() {
+        let mut app = test_app_with_scale(1.0);
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let window = app.window_id();
+        let root = app.app().window(window).expect("test window").tree().root();
+
+        let themed = IconSpec::new(IconKind::CheckCircle)
+            .with_size(16.0)
+            .build_themed(app.app_mut(), window, root, &theme, Role::FgMuted)
+            .expect("主题图标");
+        let static_icon = IconSpec::new(IconKind::GearSix)
+            .with_size(16.0)
+            .with_color(Color::from_rgba8([0xFF, 0x00, 0x00, 0xFF]))
+            .build(app.app_mut(), window, root)
+            .expect("静态图标");
+        let _ = app.drain().expect("首帧");
+
+        let light = Theme::of(Appearance::Light);
+        let light_muted = resolved(light.role(Role::FgMuted));
+        let images = image_primitives(&app);
+        assert_eq!(
+            images
+                .iter()
+                .find(|image| image.bounds.origin.x == 0.0)
+                .map(|image| resolved(image.modulation)),
+            Some(light_muted),
+            "首帧：主题图标的调制色 = 浅色 FgMuted"
+        );
+
+        assert!(theme.set_appearance(app.app_mut(), Appearance::Dark));
+        let record = app.drain().expect("切深色").clone();
+        assert!(
+            record.dirty_nodes.contains(&themed),
+            "读主题的图标必须被失效：{:?}",
+            record.dirty_nodes
+        );
+        assert!(
+            !record.dirty_nodes.contains(&static_icon),
+            "静态调制色的图标不得被主题切换失效：{:?}",
+            record.dirty_nodes
+        );
+
+        let dark_muted = resolved(Theme::of(Appearance::Dark).role(Role::FgMuted));
+        let images = image_primitives(&app);
+        let themed_modulation = images
+            .iter()
+            .find(|image| image.bounds.origin.x == 0.0)
+            .map(|image| resolved(image.modulation));
+        assert_eq!(themed_modulation, Some(dark_muted), "深色主题图标的调制色");
+        assert_ne!(
+            light_muted, dark_muted,
+            "两套外观的 FgMuted 必须不同（否则上面的断言无意义）"
+        );
+        let static_modulation = images
+            .iter()
+            .find(|image| image.bounds.origin.x > 0.0)
+            .map(|image| resolved(image.modulation));
+        assert_eq!(
+            static_modulation,
+            Some(resolved(Color::from_rgba8([0xFF, 0x00, 0x00, 0xFF]))),
+            "静态图标的调制色不随主题变化"
+        );
     }
 }
