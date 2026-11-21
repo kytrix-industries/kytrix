@@ -1,23 +1,35 @@
 # Kytrix 定制化跨平台 GUI 引擎 · 系统设计文档
 
 > **文档类型**：系统设计规格 —— 只描述最终架构、接口、实现与约束
-> **版本**：v2.2（2026-11-21）
-> **v2.2 变更摘要**（2026-11-21）：**P1 引擎扩展 E1–E6 已全部实现并合入 `gui-engine-migration`（迁移分支 HEAD `e1e4ff6`）**。
-> 本版把 §11 从「新增规格（待落地）」回写为**实现后的精确规格**（API 形状 / 语义 / 错误 / 不变式 / 测试面），并同步
-> §1.3 公开 API 白名单、§2.9 错误变体计数（**35**）、§4.5 缓存键、§5.5/§5.9、§6.3/§6.8/§6.9、§8.2/§8.6（平台能力表）、
-> §10.2 状态与附录。**E2b 候选**（§11.2）与**已接受残余**（§11.8）单列并明确标注为未实现/限制，不得当作已交付能力引用。
-> 逐条回写台账（spec-delta 条目 → 章节 → 源码证据）见 `.docs/gui-migration/design-changes.md` §10。
+> **版本**：v2.3（2026-11-21）
+> **v2.3 变更摘要**（2026-11-21）：**P2（`base_ui` / kit）全批完成，P2 期间追加的引擎扩展 E7–E15 全部实现并合入迁移分支
+> `gui-engine-migration`（HEAD `7ad630f`，24 个 P2 merge）**。本版把 §11 从「E1–E6」扩为 **E1–E15**：新增
+> **§11.9–§11.15**（E7 图片节点 / E8 scoped 键绑定 / E9+E9c a11y 集合语义 / E10+E10c 定时器与唤醒 / E12 浮层 a11y 与模态 /
+> E13 组不透明度与阴影 / E15 角色补齐与集合根上提）与 **§11.16 范围基线、E 编号纪律与不变量影响**；新增
+> **§12「P2 应用层实现规格」**（模块级增量迁移、主题基座、薄 builder、kit 组件形态、SVG 构建期光栅、
+> `KYTRIX_UI_CORE_MANIFEST` 过渡开关、计划修正、文档一致性修正、P2 测试与门禁事实）。同步回写 §1.3 公开 API 白名单、
+> §2.9（错误仍 **35** 个顶层变体，P2 未新增）、§4.9（`opacity` 组语义 / `PaintSpec.shadows` / `ShadowSpec.spread` /
+> builder **35+6** 方法）、§7（`A11yRole` **43** 变体、集合语义、模态作用域、焦点增量）、§8.4/§8.5（scoped 键绑定、
+> **55** 图标）、§10.2 P2 批次状态与附录。**E2b 候选**（§11.2）与**已接受残余**（§11.8，v2.3 追加 R-19…R-27 / R1–R15 /
+> D9–D12 / E8/E10/E10c 残余）单列并明确标注为未实现/限制，不得当作已交付能力引用。
+> 逐条回写台账（delta 条目 → 章节 → 源码证据）见 `.docs/gui-migration/design-changes.md` §10（v2.2）与 **§11（v2.3）**。
+> **v2.2 变更摘要**（2026-11-21）：P1 引擎扩展 E1–E6 全部实现并合入（迁移分支 HEAD `e1e4ff6`）；§11 从「新增规格」回写为
+> 实现后的精确规格（§11.1–§11.6）。其条目仍有效，v2.3 只在其后追加。
 > **适用平台**：Windows（x64 / ARM64）、macOS（Apple Silicon / 受支持 Intel）、Linux（x64 / ARM64，**仅 Wayland**）
 > **上游关系**：技术路线论证见 `custom-gui-engine-technical-research.md`；本文是其定案（D1–D25）的实现规格，不重复论证
 > **工程约束**：`AGENTS.md`（模块化、`lib.rs` 只做模块声明、强类型错误、不做预防性抽象、单测与生产代码同模块；验收
 > `cargo test` + `cargo +nightly clippy -- -D warnings` + `cargo +nightly fmt`）
-> **代码状态**（v2.2 校准）：本文正文与 `crates/ui_core/src` 的 `pub` 面逐项对齐（类型名 / 方法名 / 签名 / 字段以源码为准）；
-> E1–E6 的引擎增量已全部实现（§11）。`crates/ui_core` 之外的迁移目标（`base_ui` / widgets / `*_ui` / `kytrix`）仍是
-> **待迁移**。Rust 片段分三类，各自必须显式标注：
+> **代码状态**（v2.3 校准）：本文正文与 `crates/ui_core/src` 的 `pub` 面逐项对齐（类型名 / 方法名 / 签名 / 字段以源码为准）；
+> **引擎侧 E1–E15 全部已实现**（§11.1–§11.15）；**应用层 `base_ui`（`theme/` + `kit/`）已实现**（§12）。
+> 尚未迁移的只有：widgets（P3）、`*_ui` 与 `kytrix` 外壳（P4）、旧 `base_ui` 模块与 gpui 系依赖的删除（**P5**）。
+> Rust 片段分三类，各自必须显式标注：
 >
 > 1. **已实现契约**——与源码一致，片段只是摘要；
 > 2. **E2b 候选 / 已接受残余**——明确标注为**未实现候选或受限项**（§11.2 / §11.8），应用不得依赖；
 > 3. **接口草图**——固定语义与形状、非可编译实现。
+>
+> **与 P2 现实对齐的两条口径**：① `base_ui` 迁移采取**模块级增量**（新 `theme/` / `kit/` 与旧模块并存，旧模块 **P5 删除**，
+> §12.1）；② 迁移期 `ui_core` 的进程清单与 `gpui-pre` 冲突，用 `KYTRIX_UI_CORE_MANIFEST=0` 过渡（§12.6，P5 移除）。
 >
 > 任何未标「E2b 候选 / 已接受残余」的条目都视为「现在就可依赖的能力」；若与源码冲突，**以源码为准并回写本文**。
 
@@ -55,10 +67,10 @@
 |-----|---------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------|
 | I1  | **编译期单一后端**：`render/` 与 `platform/` 三平台子模块按 `#[cfg(target_os)]` 选择，运行时不存在后端枚举、不存在可插拔 `Renderer` / 事件循环 trait          | 退化为通用框架抽象，违反 D2                         |
 | I2  | **一套数据契约**：`Scene` / `#[repr(C)] GpuPrimitive` / `PhysicalRect`（damage）/ `AtlasTile` / `GeometryDesc` / `Color` 只有一份定义，三套 renderer 只消费不重定义；迁移期的引擎扩展只允许「**不改** `GpuPrimitive` 字节布局、不改 `render/shaders/contract.md`」的能力，唯一例外是 E4（`GeometryDraw.range`），已按「三端 encoder 共享参数纯函数 + `contract.md` + 参数单测/WARP 子区间像素测试」同批落地（§11.4）      | 三份代码语义漂移                                    |
-| I3  | **空闲不提交帧**：无任何 dirty 标记时，帧调度器停在 `Idle`，不录制命令、不 present。**受管动画是唯一「自动」连续帧入口**（`App::animate(window, AnimatedValue, &[NodeId], AnimationSpec)`；`needs_continuous_frames` 的判据来自「有活跃动画」）；应用自驱的逐帧路径（`on_frame` + `set_canvas` 等）必须自带收敛条件并在收敛后停止请求，不得无条件 `request_repaint`（§8.4 / §11.7） | 空闲 GPU 占用与功耗 |
+| I3  | **空闲不提交帧**：无任何 dirty 标记时，帧调度器停在 `Idle`，不录制命令、不 present。**受管动画是唯一「自动」连续帧入口**（`App::animate(window, AnimatedValue, &[NodeId], AnimationSpec)`；`needs_continuous_frames` 的判据来自「有活跃动画」）；应用自驱的逐帧路径（`on_frame` + `set_canvas` 等）必须自带收敛条件并在收敛后停止请求，不得无条件 `request_repaint`（§8.4 / §11.7）。**v2.3 拆分口径（E10/E10c）**：本条约束的是「**应用级**零唤醒」——等待期不产生应用轮次、不跑 `on_frame`、不提交帧（已达成，三端可达）；**OS 级**仍有平台唤醒源（macOS display link 的 vsync tick，`IDLE_GRACE = 250 ms` 滞回），它们**不再**驱动应用轮次（§11.12）。**合法的一次性唤醒源**除「有动画」外还有：一次性定时器到期、动画完成事件回投（`Dispatcher::wake`）、`AppHandle::wake`、输入/DPI/外观事件；这些唤醒不产生连续帧 | 空闲 GPU 占用与功耗 |
 | I4  | **GPU 资源只经延迟销毁**：任何释放请求按 `FrameIndex` 入队，fence / semaphore / command buffer 完成后才真正释放                                               | GPU 端 use-after-free、驱动相关花屏                 |
 | I5  | **节点树与布局树同一份存储**：引擎节点实现 taffy `LayoutPartialTree`，不维护第二棵布局树                                                                      | 双树同步错误、命中盒与布局不一致                    |
-| I6  | **UI 可见状态只能经 `Signal` 写入**：应用层不得直接改节点字段。**布局 / 绘制 / `bind_*` 求值上下文内**的读取必须经 `ReadCtx::read()` 登记依赖并返回 `SignalRef<T>` **读守卫**（`Rc`；守卫存活期再写同一信号会 panic，必须改用 `App::{write_with, update_with}` 或先 clone 再写）；上下文外的一次性读取用 `App::read`（不登记依赖、不参与失效传播）。`Window::tree_mut()` 的允许集合 = 挂载期 `NodeBuilder::build` / `NodeTree::remove` / `NodeTree::{set_style, set_layout_override, invalidate_measure}`；**不得**直接改节点字段或绑定闭包（§6.10 迁移纪律） | stale drawing |
+| I6  | **UI 可见状态只能经 `Signal` 写入**：应用层不得直接改节点字段。**布局 / 绘制 / `bind_*` 求值上下文内**的读取必须经 `ReadCtx::read()` 登记依赖并返回 `SignalRef<T>` **读守卫**（`Rc`；守卫存活期再写同一信号会 panic，必须改用 `App::{write_with, update_with}` 或先 clone 再写）；上下文外的一次性读取用 `App::read`（不登记依赖、不参与失效传播）。`Window::tree_mut()` 的允许集合 = 挂载期 `NodeBuilder::build` / `NodeTree::remove` / `NodeTree::{set_style, set_layout_override, invalidate_measure}`；**不得**直接改节点字段或绑定闭包（§6.10 迁移纪律）。**v2.3 增补的引擎级写入口**（属「引擎 API」而非「应用直改节点」，应用可用）：`Window::set_image_resource`（E7，图片资源替换）、`App::set_a11y_patch`（E15，a11y 增量写，含 `request_frame`）、`App::write_transient`（瞬态值）；三者都由引擎负责置脏与失效传播，不得被当作绕过 `Signal` 的后门 | stale drawing |
 | I7  | **测试 harness 默认无 GPU**：`renderer = None` 是默认配置，CPU 帧记录契约与 device 无关                                                                       | 测试基建无法在门禁复现                              |
 | I8  | **三套 shader 共享字节布局与视觉 golden**：任何 `GpuPrimitive` / uniform / `Color` / 主题色 / 文本栈变更必须触发像素快照回归                                  | 三平台视觉不一致                                    |
 | I9  | **应用层不接触平台 API**：`base_ui` / widgets 只见引擎类型，不见 `HWND` / `MTLDevice` / `VkDevice` / `wl_surface`。自绘标题栏、窗口按钮（最小化/最大化/关闭）、任务栏图标、运行时改标题等**平台能力必须由引擎提供**（§8.6 契约、§11.6 E6 规格）；**不允许**给应用层开平台口子（那会同时违反 I9 与 D15）                                             | 平台差异泄漏到业务 crate                            |
@@ -230,21 +242,22 @@ pub(crate) use windows as backend;
 2. **模块可见性**：`render` / `platform` 是**私有**模块，GPU 与平台类型（`GpuPrimitive`、`Device`、`HWND`…）不在公开面；
    `test_support` 由 `feature = "test-support"` 门控（不进发布物，I7）。
 3. **白名单语义**：下表是「应用层允许依赖的类型与入口」，深路径省略 `ui_core::` 前缀；`error::EngineError` 是所有可失败
-   API 的返回错误（缺它无法写应用代码）。**E1–E6 的公开面已全部实现**（P1 完成，§11），应用现在即可依赖。
+   API 的返回错误（缺它无法写应用代码）。**E1–E15 的公开面已全部实现**（P1 完成 E1–E6，§11.1–§11.6；P2 完成 E7–E15，
+   §11.9–§11.15），应用现在即可依赖。**P2 未新增 `EngineError` 变体**（仍 **35** 个，§2.9）。
 
 | 类别 | 可依赖类型 / 入口（深路径省略 `ui_core::`） | 一句话用途 / 边界 |
 |---|---|---|
 | 错误 | `error::EngineError`（顶层 **35** 个变体，§2.9；含 E1–E6 新增的 `TextShapeStandalone` / `InvalidTextScale` / `VirtualListExtents` / `InvalidVirtualExtent` / `UnsupportedWindowCapability` / `WindowIcon`） | 所有 `Result` 的错误类型；应用按变体分类处理（`StaleNode` 同时覆盖「不能作为文本命中目标」，§11.5），禁止字符串错误穿透 |
-| 应用 | `app::{App, AppHandle, Application, StylePassReport}`、`window::{WindowId, Window, WindowOptions, FrameIndex, FrameOutcome, FramePresentation, Decorations}`、`window::{WindowControl, WindowState, WindowResizeEdge}`（**三端可见**：E6 已移除 `cfg(target_os = "linux")`）、`window::ImeContentType`、`App::{on_frame, create_window, window, window_mut, frame, set_drag_regions, request_node_repaint, take_resource_results, handle, runtime_handle, close_window, set_title, request_window_control, set_traffic_light_position, traffic_light_inset, shape_text, shaped_inline_boxes, text_scale, set_text_scale, clear_text_scale_override}`、`Window::{state, text_byte_index_at, text_caret_rect, set_drag_regions, set_canvas, scene}` | 启动、建窗、帧驱动、窗口 chrome（E6：装饰 / 标题 / 系统按钮 / 交通灯 / 状态回报）；`AppHandle::{wake, send, spawn}` 是**唯一跨线程入口**（`platform` 私有，应用看不到 `PlatformDispatcher`） |
-| 节点 | `node::id::NodeId`、`node::builder::NodeBuilder`、`node::tree::{NodeTree, Node, NodeKind, LayoutBox}`、`node::dirty::DirtyFlags`、`NodeTree::{new, root, get, append_child, remove, set_style, set_layout_override, invalidate_measure, hit_test, text_selection_rects, text_caret_rect, len, is_empty, debug_id}`、`Window::{tree, tree_mut}` | 建树与增删子节点（`NodeTree::{append_child, remove}`）；**没有 `NodeHandle` / `Children` / 声明式子节点 `Slot`**（`node::id::Slot<T>` 是私有 arena 槽，且 workspace lint 禁止半公开）。`NodeTree::text_byte_index_at` / `text_line` 是 `pub(crate)`，公开入口只有 `Window::*`（§11.5） |
-| 状态 | `node::signal::{Signal, SignalId, Derived, Transient, SignalScope}`、`node::dependency::ReadCtx`、`App::{signal, signal_scope, signal_scoped, window_signal, release_scope, transient, derived, batch, write, write_with, update, update_with, read, read_with, write_transient, read_transient}` | 状态写入与依赖追踪。`read` 返回 `SignalRef<T>` 读守卫（守卫存活期写同一信号 **panic**）。**没有 `TaskHandle`**：异步回投是 `AppHandle::{send, spawn}`；资源解码结果经 `App::take_resource_results()` 取回 |
-| 样式 / 布局 | `paint::style::{Style, PaintSpec, StylePatch, FocusRing, ShadowSpec, Clip, Cursor}`、`layout::{MeasureFn, LayoutOverride}`、`layout::hit_test::HitShape`、`math::{Rect, Size, Point, Transform, Scale, Edges, PhysicalRect}`、`NodeBuilder::{boxed, text, canvas, geometry, style, paint, bind_style, bind_text, bind_a11y, a11y, measure, hit_shape, layout_override, focus_ring, tab_stop, id, inline_boxes, runs, on_click, on_action, on_drag, build}` | 挂载期静态样式 / 动态补丁。`bind_*` **恰好三个**（`bind_text` / `bind_style` / `bind_a11y`），且**只在 `App::frame` 求值**（`Window::frame()` 不求值）。`NodeBuilder::runs` 是多 run 覆盖样式的挂载入口（E2，§11.2） |
+| 应用 | `app::{App, AppHandle, Application, StylePassReport}`、`window::{WindowId, Window, WindowOptions, FrameIndex, FrameOutcome, FramePresentation, Decorations}`、`window::{WindowControl, WindowState, WindowResizeEdge}`（**三端可见**：E6 已移除 `cfg(target_os = "linux")`）、`window::ImeContentType`、`App::{on_frame, create_window, window, window_mut, frame, set_drag_regions, request_node_repaint, take_resource_results, handle, runtime_handle, close_window, set_title, request_window_control, set_traffic_light_position, traffic_light_inset, shape_text, shaped_inline_boxes, text_scale, set_text_scale, clear_text_scale_override, unload_resource, modal_scope, set_a11y_patch, after, after_scoped, cancel_timer, on_animation_complete}`、`Window::{state, text_byte_index_at, text_caret_rect, set_drag_regions, set_canvas, scene, set_image_resource, scale_epoch}` | 启动、建窗、帧驱动、窗口 chrome（E6：装饰 / 标题 / 系统按钮 / 交通灯 / 状态回报）；**E7**：`unload_resource` / `set_image_resource` / `scale_epoch`（图片生命周期与 DPI 世代）；**E10**：`after` / `after_scoped` / `cancel_timer` / `on_animation_complete`（一次性定时器与动画完成）；**E12**：`modal_scope`（模态作用域根）；**E15**：`set_a11y_patch`（a11y 增量写）。`AppHandle::{wake, send, spawn}` 是**唯一跨线程入口**（`platform` 私有，应用看不到 `PlatformDispatcher`） |
+| 节点 | `node::id::NodeId`、`node::builder::NodeBuilder`、`node::tree::{NodeTree, Node, NodeKind, LayoutBox}`、`node::image::{ImageFit, ImageSource, ImageContent}`、`node::dirty::DirtyFlags`、`NodeTree::{new, root, get, append_child, remove, set_style, set_layout_override, invalidate_measure, hit_test, text_selection_rects, text_caret_rect, len, is_empty, debug_id}`、`NodeBuilder::{image, image_pending, image_modulation}`、`Window::{tree, tree_mut}` | 建树与增删子节点（`NodeTree::{append_child, remove}`）；**E7 图片节点**：`NodeKind::Image(Box<ImageContent>)`（叶子）、`ImageFit::{Fill, Contain, Cover}`、`ImageSource::{Ready, Pending}`、`NodeBuilder::{image, image_pending, image_modulation}`（§11.9）。**没有 `NodeHandle` / `Children` / 声明式子节点 `Slot`**（`node::id::Slot<T>` 是私有 arena 槽，且 workspace lint 禁止半公开）。`NodeTree::{text_byte_index_at, text_line, set_image_resource}` 是 `pub(crate)`，公开入口只有 `Window::*`（§11.5 / §11.9） |
+| 状态 | `node::signal::{Signal, SignalId, Derived, Transient, SignalScope}`、`node::dependency::ReadCtx`、`App::{signal, signal_scope, signal_scoped, window_signal, release_scope, transient, transient_scoped, derived, batch, write, write_with, update, update_with, read, read_with, write_transient, read_transient}` | 状态写入与依赖追踪。`read` 返回 `SignalRef<T>` 读守卫（守卫存活期写同一信号 **panic**）。**E8**：`transient_scoped(scope: SignalScope, initial)` 把瞬态值绑定到作用域，`release_scope` 返回**值槽位数**（信号 + 瞬态值）并在同批取消引用该瞬态值的动画槽（§11.10）。**没有 `TaskHandle`**：异步回投是 `AppHandle::{send, spawn}`；资源解码结果经 `App::take_resource_results()` 取回 |
+| 样式 / 布局 | `paint::style::{Style, PaintSpec, StylePatch, FocusRing, ShadowSpec, Shadows, MAX_SHADOWS, Clip, Cursor}`、`layout::{MeasureFn, LayoutOverride}`、`layout::hit_test::HitShape`、`math::{Rect, Size, Point, Transform, Scale, Edges, PhysicalRect}`、`NodeBuilder::{boxed, text, canvas, geometry, style, paint, bind_style, bind_text, bind_a11y, a11y, measure, hit_shape, layout_override, focus_ring, tab_stop, id, inline_boxes, runs, on_click, on_action, on_drag, build}` | 挂载期静态样式 / 动态补丁。`bind_*` **恰好三个**（`bind_text` / `bind_style` / `bind_a11y`），且**只在 `App::frame` 求值**（`Window::frame()` 不求值）。`NodeBuilder::runs` 是多 run 覆盖样式的挂载入口（E2，§11.2）。**E13**：`StylePatch.opacity` 是**组不透明度**（自身 × 祖先链，§11.14）、`PaintSpec.shadows: Shadows`（`MAX_SHADOWS = 4`，数组序 = 绘制序）、`ShadowSpec{offset, blur, spread, color}`（§11.14） |
 | 绘制 | `paint::scene::Scene`（**只能经 `Window::scene()` 取 `&Scene`**，写方法属引擎内部）、`paint::primitive::{Primitive, Quad, QuadPaint, Border, Gradient, GradientKind, GlyphRun, PositionedGlyph, Image, Path, Shadow, ClipOp, ClipRect, GeometryDraw}`（`GeometryDraw` 含 E4 的 `range: Range<u32>` 与 `GeometryDraw::full`）、`paint::canvas::Canvas`（含 E1 的 `push_shaped_text`）、`paint::geometry::{GeometryId, GeometryDesc, GeometryPipeline, GeometryUpdate, IndexType, Topology}`、`paint::geometry_store::GeometryStore`（经 `App::geometry_mut()`）、`paint::color::{Color, ColorResolver}`、`paint::atlas::{AtlasKind, AtlasTile}`（`AtlasTile` 含 E1d 的 CPU 侧 `slot` / `slot_epoch`）、`Window::set_canvas` | 自绘（`Canvas` 只装引擎 8 类图元，§5.9；canvas 文本走 `App::shape_text` + `Canvas::push_shaped_text`，§11.1）、注册静态几何与子区间绘制（§5.5 / §11.4）、颜色解析。**没有裸类型 `Geometry`、没有 `Brush`**；`AtlasAllocator::is_alive` 是 `pub(crate)`，不进公开面 |
 | 文本 | `text::{TextStyle, TextStyleExtras, TextContent, TextRun, TextDecoration, TextAlign, TextSlant, TextWrap, TextDirection, TextOverflow, TextLineBreak, FontStack, FontStackStatus, TextDiagnostic, InlineBoxSpec, InlineBoxPaint, InlineAlign, ShapedLine, ShapedTextHandle, ShapedTextLine, ShapedTextItem, ShapedGlyphRun, ShapedInlineBox, ShapedDecoration, ThinSlice, FeatureSet, FontVariationSet, TextFeature, TextFontVariation, TextPassReport, TextLayoutReport}`；`App::{refresh_text, layout_text, font_stack, font_stack_version, set_font_stack, reload_system_fonts, text_diagnostics, font_stack_status, shape_text, shaped_inline_boxes, text_scale, set_text_scale, clear_text_scale_override}`；`TextContent::{runs, with_runs}`、`TextStyle::{decoration, with_decoration}` | 文本组件。**`ShapedLine` 类型公开但节点文本路径的应用拿不到实例**（`NodeTree::text_line` 是 `pub(crate)`）；无节点归属的 shaping 用 `App::shape_text` 拿 `ShapedTextHandle`（E1），富文本 runs / 装饰 / InlineBox 绘制与诊断为 E2（§11.2） |
-| 资源 | `resources::{ResourceId, ResourceCache, ResourceImage, DecodeState, ResourceStats, PendingResource}`、`App::{resources, resources_mut}` | 图标 / 图片 / 远程头像；`ResourceImage.tile` 恒有效直到 unload（图片 tile 不参与 E1d 的编码期逐 tile 判活，§11.8） |
-| 交互 | `interaction::{FocusScope, ScrollHandle, ScrollConfig, ScrollState, ScrollAxis, VirtualList, VirtualListConfig, VirtualListState, ItemAlign, Overlay, OverlayOptions, OverlayPlacement, OverlayDismiss, AnchorSide, DragState, DragInfo, DragPhase, AnimationId, Easing, AnimatedValue, AnimationSpec, ActionCtx, InputThresholds}`；`App::{make_scroll, set_scroll_content, scroll_to, scroll_by, scroll_state, capture_pointer, focused, hovered, key_down, set_focus, focus_next, focus_prev, make_virtual_list, set_virtual_items, set_virtual_extents, scroll_to_item, virtual_list_state, virtual_row_index, create_overlay, close_overlay, place_overlay, bring_overlay_to_front, overlays, drag_state, drag, cancel_drag, animate, cancel_animation, animations_running}` | 通用交互机制。`VirtualListConfig { extent, extents, overscan }`：`extents = None` 等高行、`Some(..)` 逐项高度（E3 已实现，§11.3；`VirtualListConfig` 因 `Box<[f32]>` **不再是 `Copy`**）。**没有 `AnimationClock`**：动画是 `App::animate(window, AnimatedValue, &[NodeId], AnimationSpec)` |
-| 事件 | `event::{Event, InputEvent, InputOutcome, Action, ActionSource, KeyBinding, Key, KeyCode, Modifiers, PointerButton, ImeEvent}`、`layout::hit_test::HitResult`、`App::{drain_events, on_action, off_action, bind_key, unbind_key, dispatch_action, dispatch_action_focused}` | 事件处理与快捷键。`Action` 是 `{ FocusNext, FocusPrev, Dismiss, Custom(SmolStr) }`：**应用动作只能是字符串 key**（没有强类型变体表）；「怎么触发」在 `ActionSource` |
-| 无障碍 | `a11y::{A11yRole, A11yNode, A11yLabel, A11yAction, A11yOverride, A11yPatch, A11yActionCtx, A11yActionData, A11yDiagnostic, A11yTreeSnapshot, A11yLive, A11ySort}`、`NodeBuilder::{a11y, bind_a11y}`、`App::{on_a11y_action, off_a11y_action, a11y_diagnostics}` | 自定义组件声明语义。`a11y` 接受**整值** `A11yOverride`（不是 `(role, label 闭包)`） |
+| 资源 | `resources::{ResourceId, ResourceCache, ResourceImage, DecodeState, ResourceStats, PendingResource}`、`App::{resources, resources_mut, take_resource_results, unload_resource}`、`Window::set_image_resource` | 图标 / 图片 / 远程头像；`ResourceImage.tile` 恒有效直到 unload（图片 tile 不参与 E1d 的编码期逐 tile 判活，§11.8）。**E7 生命周期**：`insert_async*` 产出 `PendingResource`，`poll()` 的结果交给 `App` 后，**挂载了 Pending 图片的节点自动转 Ready**（无需应用插手）；`App::unload_resource` 是**唯一**能让图片节点失效的卸载入口（裸 `resources_mut().unload()` 不触发节点失效，R-19） |
+| 交互 | `interaction::{FocusScope, ScrollHandle, ScrollConfig, ScrollState, ScrollAxis, VirtualList, VirtualListConfig, VirtualListState, ItemAlign, Overlay, OverlayOptions, OverlayPlacement, OverlayDismiss, AnchorSide, DragState, DragInfo, DragPhase, AnimationId, Easing, AnimatedValue, AnimationSpec, ActionCtx, InputThresholds}`、`app::{AnimationCompletion, AnimationEndKind, TimerId}`、`App::{make_scroll, set_scroll_content, scroll_to, scroll_by, scroll_state, capture_pointer, focused, hovered, key_down, set_focus, focus_next, focus_prev, make_virtual_list, set_virtual_items, set_virtual_extents, scroll_to_item, virtual_list_state, virtual_row_index, create_overlay, close_overlay, place_overlay, bring_overlay_to_front, overlays, drag_state, drag, cancel_drag, animate, cancel_animation, animations_running, after, after_scoped, cancel_timer, on_animation_complete, modal_scope}` | 通用交互机制。`VirtualListConfig { extent, extents, overscan }`：`extents = None` 等高行、`Some(..)` 逐项高度（E3 已实现，§11.3；`VirtualListConfig` 因 `Box<[f32]>` **不再是 `Copy`**）。**E10**：`after` / `after_scoped` / `cancel_timer` / `on_animation_complete`（**单槽**，kit 层 `AnimationRouter` 是唯一注册者，§11.12）；**E12**：`OverlayOptions{.., trap_focus, a11y: A11yOverride}`（新增 `a11y` 字段 ⇒ `OverlayOptions` **不再是 `Copy`**）、`App::modal_scope`。**没有 `AnimationClock`**：动画是 `App::animate(window, AnimatedValue, &[NodeId], AnimationSpec)` |
+| 事件 | `event::{Event, InputEvent, InputOutcome, Action, ActionSource, KeyBinding, Key, KeyCode, Modifiers, PointerButton, ImeEvent}`、`layout::hit_test::HitResult`、`App::{drain_events, on_action, off_action, bind_key, unbind_key, bind_key_scoped, unbind_key_scoped, unbind_scope_keys, has_action_handler, scoped_key_binding_count, dispatch_action, dispatch_action_focused}` | 事件处理与快捷键。`Action` 是 `{ FocusNext, FocusPrev, Dismiss, Custom(SmolStr) }`：**应用动作只能是字符串 key**（没有强类型变体表）；「怎么触发」在 `ActionSource`。**E8**：`bind_key_scoped(window, scope: NodeId, binding) -> Result<(), EngineError>`（破坏性变更：旧签名返回 `()`）、`unbind_key_scoped`、`unbind_scope_keys`；作用域键绑定按焦点祖先链**内→外**求值，无 handler 不吞键（§11.10）。`has_action_handler` / `scoped_key_binding_count` 是 `test-support` 只读观测面 |
+| 无障碍 | `a11y::{A11yRole, A11yOrientation, A11yNode, A11yLabel, A11yAction, A11yOverride, A11yPatch, A11yActionCtx, A11yActionData, A11yDiagnostic, A11yTreeSnapshot, A11yLive, A11ySort}`、`NodeBuilder::{a11y, bind_a11y}`、`App::{on_a11y_action, off_a11y_action, a11y_diagnostics, set_a11y_patch, modal_scope}` | 自定义组件声明语义。`a11y` 接受**整值** `A11yOverride`（不是 `(role, label 闭包)`）。**E15**：`A11yRole` 共 **43** 个变体（`A11yRole::ALL: [Self; 43]`，§11.15），`A11yOrientation::{Horizontal, Vertical}`；`App::set_a11y_patch(window, node, A11yPatch)` 是运行期 a11y 增量的公开写入口（内部 `request_frame`，§11.15） |
 | 测试（`test-support` feature） | `test_support::app::{TestApp, TestWindow}`、`test_support::probe::{Probe, Selector}`、`test_support::record::{FrameRecord, RenderedFrame, QuadRecord, PrimitiveRecord, PrimitiveKind, PaintLog, LanePaintEntry, LaneOutcome, DeltaRecord, FrameStats}`、`test_support::script::{FrameScript, ScriptFrame, FrameSample, ScriptReport, A11yCapture, A11yDelivery}`、`test_support::snapshot::{SnapshotCase, SnapshotScene, SnapshotTheme, SnapshotImage, SnapshotDiff, SnapshotError, GoldenError, Tolerance, PixelBounds}`、`test_support::{a11y, acceptance, gui_smoke, pixels, diagnostics}` | 布局与图形测试（§6.2–§6.5）。**没有 `TestApp::mount`、没有 `TestApp::new(renderer: None)`、没有 `Probe::a11y()`，`Selector` 只有 `Id` / `Text` / `Path`（无 `Role`）**。E1–E6 新增观测面：`FrameRecord.stale_canvas_runs`、`Window::inline_box_image_diagnostics()`、`App::frame_requests()`（§6.3 / §6.8） |
 
 **E1–E6 已实现的公开面（P1 完成；均可依赖）**：
@@ -258,15 +271,34 @@ pub(crate) use windows as backend;
 | E5 | `Window::text_byte_index_at` | §11.5 |
 | E6 | `Decorations`、`WindowOptions::{decorations, icon}`、`App::{set_title, request_window_control, set_traffic_light_position, traffic_light_inset}`、三端 `WindowControl` / `WindowState` / `WindowResizeEdge`、`EngineError::{UnsupportedWindowCapability, WindowIcon}`、`WindowIconCause` | §11.6 |
 
+**E7–E15 已实现的公开面（P2 完成；均可依赖；逐项签名见 §11.9–§11.15）**：
+
+| 扩展 | 新增 / 变更公开面 | 章节 |
+|---|---|---|
+| E7 | `node::image::{ImageFit, ImageSource, ImageContent}`、`NodeKind::Image`、`NodeBuilder::{image, image_pending, image_modulation}`、`Window::{set_image_resource, scale_epoch}`、`App::unload_resource`、`A11yRole::Image`、`A11yDiagnostic::MissingAltText{kind: Image}`、test-support `PrimitiveRecord::{image_modulation, image_uv}` | §11.9 |
+| E8 | `App::{bind_key_scoped, unbind_key_scoped, unbind_scope_keys, transient_scoped}`（`bind_key_scoped` 改为返回 `Result`）、test-support `App::{has_action_handler, scoped_key_binding_count}`、`InputOutcome::action` | §11.10 |
+| E9 / E9c | `A11yRole::{Tree, TreeItem}`（32→34）、`A11yNode::{children, parent}` 语义改为 a11y 逻辑父子、`A11yPatch::{row_index, row_count, column_index, column_count, pos_in_set, size_of_set}` 集合字段生效 | §11.11 |
+| E10 / E10c | `app::{AnimationCompletion, AnimationEndKind, TimerId}`、`App::{on_animation_complete, after, after_scoped, cancel_timer}`、`TimerId::window` | §11.12 |
+| E12 | `A11yRole::{AlertDialog, TabList, Tab, Separator}`（34→38）、`OverlayOptions.a11y: A11yOverride`、`App::modal_scope` | §11.13 |
+| E13 | `paint::style::{Shadows, MAX_SHADOWS, ShadowSpec.spread}`、`PaintSpec.shadows`（替换 `shadow`）、`StylePatch.opacity` 组语义、`Node.paint_opacity`（**不是**公开面，内部戳） | §11.14 |
+| E15 | `A11yRole::{ComboBox, ListBox, MenuItemCheckBox, MenuItemRadio, ColorWell}`（38→43）、`a11y::A11yOrientation`、`A11yPatch.orientation`、`App::set_a11y_patch` | §11.15 |
+
 **E2b 候选（未实现，仅登记，不得依赖）**：Canvas / standalone shaping 不绘制装饰与行内盒；节点文本路径的 InlineBox 命中只读访问面（`App::shaped_inline_boxes` 只覆盖 standalone handle）。详见 §11.2。
 
-**明确留在应用层**：`base_ui` 全部设计系统模块与主题语义色 / 调色板 / 深浅色映射、54 个 Phosphor SVG + 7 品牌 PNG + 23
+**明确留在应用层**：`base_ui` 全部设计系统模块与主题语义色 / 调色板 / 深浅色映射、**55** 个 Phosphor SVG + 7 品牌 PNG + 23
 预览图 + WAV、`IconKind → path` 映射、全部 widget 业务与几何、i18n、widget 注册表，以及 **D24 的薄 `StyleBuilder`**。
 引擎只提供「资源字节 → GPU 图集」与「颜色值 → GPU 值」的机制，不持有资源文件或调色板。
 
-> **`base_ui::StyleBuilder` 的落点（v2.1 新增要求）**：引擎**不提供** builder（`Style` 只有 `Default`，无构造器/访问器），
-> `base_ui` 必须自己新建：`crates/base_ui/Cargo.toml` 增加 `ui_core = { workspace = true }` 与 `taffy = { workspace = true }`
-> （根 `Cargo.toml` 的 `[workspace.dependencies]` 目前**没有 `ui_core` 行**，需先补），并在 **P2-1a 的首个交付**里落地（§4.9.5、§10.2）。
+> **P2 已落地的应用层部分**（v2.3，§12）：`base_ui` 的 `theme/`（`Palette` 61 → `RoleColors` **64 角色** → `ComponentTokens` →
+> `Theme` → `ThemeHandle`）与 `kit/`（33 个组件模块）已在 `ui_core` 之上实现；**薄 builder 的方法面已定稿为
+> `StyleBuilder` 35 个 + `PaintBuilder` 6 个**（§12.3）。旧 `base_ui` 模块（`style/`、顶层组件文件、旧 `markdown/`）仍在，
+> **P2-5 不删、推迟到 P5**（消费方 P3/P4 迁完之后，§12.7）。
+
+> **`base_ui::StyleBuilder` 的落点（v2.1 新增要求；v2.3 已兑现）**：引擎**不提供** builder（`Style` 只有 `Default`，无构造器/访问器），
+> `base_ui` 必须自己新建。**P2-1a 已交付**：`crates/base_ui/Cargo.toml` 已含 `ui_core = { workspace = true }` 与
+> `taffy = { workspace = true }`（根 `Cargo.toml` 的 `[workspace.dependencies]` 已补 `ui_core` 行），
+> `StyleBuilder`（**35 方法** → `Style`）与 `PaintBuilder`（**6 方法** → `PaintSpec`）落在 `crates/base_ui/src/style_builder.rs`
+> （§4.9.5、§12.3）。
 
 ### 1.4 所有权与线程模型
 
@@ -898,6 +930,8 @@ D22）；**禁止**在异步任务里直接写状态或改节点（I6）。**没
 | 动画（缓动 / 淡入淡出）        | `App::animate(window, AnimatedValue::{Scalar, Color}, &[NodeId], AnimationSpec { duration, easing })` 每 tick 推进 `Transient` 并给**显式注册的节点**标 `BIND + PAINT`；`t >= 1` 即停帧（`App::animations_running` 可轮询） | 避免把时间信号接进 `dependents`；`Easing` 只有 `Linear` / `EaseOutCubic`（补曲线是可选增量，不是本批范围） |
 | 行情推送（高频、多面板共享）   | 普通 `Signal<Quote>`，按面板订阅粒度拆分信号；`Derived` 做派生指标                              | 细粒度收益正来自「改一个报价只失效读它的面板」                          |
 | 窗口 resize / DPI              | 引擎内部事件，根 `LAYOUT`，不走 `Signal`                                                        | 与业务状态无关                                                          |
+| 一次性定时器（v2.3 / E10）     | `App::after` / `after_scoped(delay, cb)`：到期派发一次，等待期**零帧**、不进连续帧集合、无新线程（I3） | 替代「用动画时钟轮询」；旧 `on_frame` 轮询每帧出帧 |
+| 动画完成回投（v2.3 / E10）     | `App::on_animation_complete(handler)` **单槽**（后注册覆盖），`AnimationCompletion{ id, kind }`；自然完成**同帧内**派发（tick 后、样式/布局/绘制前）并 `Dispatcher::wake` 一次；帧外终止（`Cancelled`/`Replaced`/`Released`/0 ms `Finished`）在**下一帧入口**派发 | kit 的 `AnimationRouter` 是应用层**唯一**注册者（§12.4），引擎不提供多播/路由类型 |
 
 ### 3.8 正确性保障：stale drawing 的成因与对策
 
@@ -1123,8 +1157,8 @@ Markdown AST → Vec<InlineFragment>（Text | Link | Kbd | Image）
 | 类型 | 职责 | 存放位置 | 写入时机 | 失效通道 |
 |---|---|---|---|---|
 | `Style` | **布局 + 子树裁剪**：`{ inner: taffy::Style<SmolStr>, clip: Clip }` | `Node.style` | 挂载期一次（`NodeBuilder::style`）；结构变化时 `NodeTree::set_style` | `LAYOUT`（clip 变化时另重建子树 lane） |
-| `PaintSpec` | **静态绘制属性**：`background` / `border` / `corner_radius` / `shadow: Option<ShadowSpec>` / `gradient: Option<Gradient>` | `Node.paint`（`NodeBuilder::paint`） | 挂载期一次 | `PAINT` |
-| `StylePatch` | **动态属性增量**（8 字段）：`background` / `foreground` / `border` / `opacity` / `visible` / `interactive` / `cursor` / `affects_layout` | `Node.style_patch`（`bind_style` 上次求值结果） | 每帧按依赖求值（`App::refresh_styles`） | `BIND` → 值变才 `PAINT`（`affects_layout` ⇒ 追加 `LAYOUT`） |
+| `PaintSpec` | **静态绘制属性**：`background` / `border` / `corner_radius` / `shadows: Shadows`（v2.3 由单层 `shadow: Option<…>` 改为多层，**破坏性变更、无兼容层**；`MAX_SHADOWS = 4`）/ `gradient: Option<Gradient>` | `Node.paint`（`NodeBuilder::paint`） | 挂载期一次 | `PAINT` |
+| `StylePatch` | **动态属性增量**（8 字段）：`background` / `foreground` / `border` / `opacity`（v2.3 起为**组不透明度**）/ `visible` / `interactive` / `cursor` / `affects_layout` | `Node.style_patch`（`bind_style` 上次求值结果） | 每帧按依赖求值（`App::refresh_styles`） | `BIND` → 值变才 `PAINT`（`affects_layout` ⇒ 追加 `LAYOUT`） |
 
 **引擎不提供**任何构造器 / 访问器 / 链式 DSL / 宏 / `Styled` 形状的 trait；`Style` 只有 `Default`。布局属性由应用**直接构造
 `taffy::Style<SmolStr>` 再包一层**（`base_ui` 需自行声明 `taffy = { workspace = true }`，版本由 workspace 精确钉住）。
@@ -1139,7 +1173,7 @@ Markdown AST → Vec<InlineFragment>（Text | Link | Kbd | Image）
 **薄 builder 的硬边界**（写进 code review 约定，防止长成通用 DSL；迁移期还有 13 处 `impl Styled`、14 处 `refine_style`、
 30 处 `.when(` 要按此重写 —— 见 §6.10「禁止为过测试留兼容层」）：
 
-1. 只允许「字段直写 + 少量命名组合」，方法集合固定且设上限（约 26 个，清单见 `02-base-ui.md` §9.3）。
+1. 只允许「字段直写 + 少量命名组合」，方法集合固定且设上限（**`StyleBuilder` 35 + `PaintBuilder` 6**，清单见 §12.3；旧文写的「约 26 个」已废止）。
 2. 不引入宏、字符串选择器、嵌套闭包 DSL、可插拔扩展 trait。
 3. 不提供 `.when()` / `.map()` / 条件样式；不实现 `Styled` / `StyleRefinement` 形状。
 4. 复杂布局（grid、多层嵌套、自定义 measure）、状态样式、clip / 渐变一律直接构造 `Style` / `PaintSpec` + `bind_style`。
@@ -1156,7 +1190,11 @@ Markdown AST → Vec<InlineFragment>（Text | Link | Kbd | Image）
 
 **语义要点（v2.1 校准）**：
 
-- `StylePatch.opacity` 是**逐图元 alpha**，不是组不透明度；它**不作用于 `Canvas` / `Geometry` 内容**（应用自己生成的图元，引擎不解析其颜色）。
+- `StylePatch.opacity` 是**组不透明度**（v2.3 / E13 起；旧文写的「逐图元 alpha」已不成立）：本节点的有效值 = 自身值 ×
+  **祖先链**上全部值（`NaN ⇒ 0`、否则 clamp 到 `[0,1]`），并乘到本节点与整棵子树的每个**引擎生成图元**上（父 0.5 × 子 0.5
+  ⇒ 子图元 0.25）。**不作用于 `Canvas` 内容**（应用自己生成的图元，引擎不解其颜色；R1），**作用于** `GeometryDraw`
+  （`color` 被乘）。没有隔离组（R2）：重叠的半透明子树按图元逐个相乘，视觉上比 CSS `isolation: isolate` 更「实」。
+  详见 §11.14。
 - 内侧边框宽度是**绘制**宽度（编码期吸附成整数物理像素），**不参与布局**；要为边框留空间请用 `Style.inner.border`（taffy 布局边框）。
 - `Clip` v1 只有 `None` / `Bounds`（直角、按 padding box、只裁子树）；圆角裁剪用图元 `ClipRect`（`Canvas::push_clip`）。
 - taffy 的 `calc()` 不解析：`Dimension::Calc` 在 v1 按 0 处理，应用层不要用 `calc`。
@@ -1173,9 +1211,13 @@ pub struct PaintSpec {
     pub background: Color,              // Color::TRANSPARENT（默认）= 不画背景
     pub border: Option<Border>,         // 内侧边框（绘制宽度）
     pub corner_radius: [f32; 4],        // [tl, tr, br, bl]，逻辑像素
-    pub shadow: Option<ShadowSpec>,
+    pub shadows: Shadows,               // v2.3：多层阴影（0..=4 层，数组序 = 绘制序）
     pub gradient: Option<Gradient>,     // 双色渐变；与 border 同时存在时拆成两个 Quad
 }
+// v2.3 / E13：阴影规格（spread 是 CSS spread-radius，CPU 侧折算成 rect.outset，σ 不变）
+pub struct ShadowSpec { pub offset: Point, pub blur: f32, pub spread: f32, pub color: Color }
+pub const MAX_SHADOWS: usize = 4;       // 构造期 take(4) 静默截断（R5）
+pub struct Shadows(SmallVec<[ShadowSpec; 2]>);   // new / len / is_empty / iter / From<ShadowSpec> / FromIterator
 #[derive(Default)]
 pub struct StylePatch {
     pub background: Option<Color>,
@@ -1271,7 +1313,7 @@ app.write(&disabled, true);   // → 一个节点 → 一个 lane → 一个 dam
 |---|---|
 | 依赖前置 | `crates/base_ui/Cargo.toml` 增加 `ui_core = { workspace = true }` + `taffy = { workspace = true }`；根 `Cargo.toml` 的 `[workspace.dependencies]` 目前**没有 `ui_core` 行**，需先补 |
 | 交付位置 | **P2-1a 的首个交付物**，先于任何 `base_ui` 组件迁移（`style` 被约 100 处引用） |
-| 方法面 | 固定约 26 个高频方法（flex 方向 / `gap` / padding / `size` / `background` / `rounded` / `border` …）；`affects_layout` 由 builder 在「设置尺寸类属性」时**自动置位**（否则尺寸变化不重排） |
+| 方法面 | **已定稿（v2.3 / P2-1a）**：`StyleBuilder` **35 个方法**（含 `new` / `build`；flex 方向 / `gap` / padding / `size` / `clip` / 布局 `border` …）+ `PaintBuilder` **6 个方法**（`new` / `background` / `rounded` / `border` / `shadow` / `build`）；两个 builder 拆开是因为 `Style` / `PaintSpec` 是两条独立失效通道（§12.3）。布局 `border` 与绘制 `border` **必须成对书写**（前者占位不画像素、后者画线不参与布局） |
 | 禁止 | `Styled` / `StyleRefinement` / `refine_style` / `.when()` / `.map()` / 宏；不得返回可继续链式修改的对象 |
 | 验收 | `base_ui` 内 `.when(`（30 处 / 13 文件）与 `refine_style`（14 处）全部改写成 `bind_style` + `Signal`，**不留兼容层** |
 
@@ -1419,7 +1461,7 @@ pub struct GeometryDesc {
 - 字形与图片分图集，`etagere` 装箱 + 脏行增量上传；`generation` 变化时失效引用节点。
 - 批次按 `(clip_chain, pipeline, texture_index)` 归并；启用平台原生 bindless 后不再因纹理切换切批（§2.8）。
 - **目标**：典型场景 `draw_calls_per_frame ≤ 8`（uber-quad + geometry）；遮挡区域由 damage 剔除，不生成 `Primitive`。
-- 运行时**不做** SVG 光栅：54 个图标必须在**应用层构建期**转成路径数据（`Geometry`）或预生成 PNG 图集；引擎不依赖
+- 运行时**不做** SVG 光栅：**55** 个图标必须在**应用层构建期**转成路径数据（`Geometry`）或预生成 PNG 图集；引擎不依赖
   `usvg` / `resvg`。**迁移前引擎基线的「图标构建期转换」尚未落地**（无 `svg_build.rs`、`ResourceCache` 只收 PNG/JPEG/WebP），
   迁移时它是 `base_ui` 的交付项（P2-1b 迁入项，§10.2）。
 
@@ -1964,21 +2006,35 @@ pub struct TreeUpdate {
 
 ### 7.4 节点树 → a11y 树映射
 
-| 引擎节点               | `Role`                                | 主要属性                                | 备注                                         |
+> **v2.3 口径**：`A11yRole` 共 **43** 个变体（`crates/ui_core/src/a11y.rs:189` 的 `A11yRole::ALL: [Self; 43]` 是穷举锚点；
+> **任何文档/代码都不得写死角色个数**，计数链 32 →(E9 +2) 34 →(E12 +4) 38 →(E15 +5) **43**）。下表是**默认映射**：
+> 应用可用 `A11yOverride`（挂载期整值）/ `A11yPatch`（运行期）覆盖角色；**声明值永远优先**（§11.11 / §11.15）。
+> 角色 `Separator` 在引擎里叫 `Separator`，AccessKit 映射成 `Role::Splitter`（AccessKit 0.25 没有 `Role::Separator`；
+> 引擎枚举**没有** `Splitter` 变体，§11.13）。
+
+| 引擎节点               | `A11yRole`                            | 主要属性                                | 备注                                         |
 |------------------------|---------------------------------------|-----------------------------------------|----------------------------------------------|
 | `Window` 根            | `Window`                              | `label` = 窗口标题、`children`          | `TreeInfo.root`                              |
-| `Box`（容器）          | `GenericContainer`                    | `children`                              | 纯布局容器不暴露动作                         |
-| `Text`                 | `TextRun` / `Label`                   | `label` = 文本、`bounds`                | 与 `ShapedLine` 共用文本来源（`A11yRole` 共 32 变体，没有 `StaticText`） |
+| `Box`（容器）          | `GenericContainer`                    | `children`                              | 纯布局容器不暴露动作；**浮层包装节点默认也是它**（E12） |
+| `Text`                 | `TextRun` / `Label`                   | `label` = 文本、`bounds`                | 与 `ShapedLine` 共用文本来源（没有 `StaticText`） |
 | 按钮（`A11yOverride`） | `Button`                              | `label`、`add_action(Click)`            | 应用层声明 override                          |
-| 输入框                 | `TextInput`                           | `value`、`SetValue`、`SetTextSelection` | 选区见 §4.7                                  |
-| 列表 / 表格 / 虚拟列表 | `List` / `Grid` / `ListBoxOption`     | `children` 仅暴露可见窗口               | 虚拟列表按可见范围生成子节点                 |
-| 滚动容器               | `ScrollView` + `ScrollBar`            | `ScrollUp/Down/Left/Right` / `SetScrollOffset` | 与 `ScrollHandle` 联动（**不是** `ScrollArea`）  |
-| `Canvas` / `Geometry`  | `Image` + 替代文本                    | `label`（**应用层必须提供**）           | 无替代文本时标 `hidden` 并写诊断，不静默丢弃（没有 `GraphicsObject`） |
-| 浮层 / 菜单            | `Menu` / `MenuItem` / `Dialog`        | `children`、`Expand/Collapse`           | 与 `Overlay` 层级同步                        |
-| 隐藏 / 被 clip 裁掉    | `set_hidden(true)`                    | —                                       | `hidden` 同时从树与命中测试中排除            |
+| 输入框                 | `TextInput` / `MultilineTextInput`    | `value`、`SetValue`、`SetTextSelection` | 选区见 §4.7                                  |
+| 列表 / 表格 / 虚拟列表 | `List` / `Grid` / `Table` / `ListBoxOption` | `children` 仅暴露可见窗口；集合字段 `row_index`/`row_count`/`pos_in_set`/`size_of_set` | 虚拟列表按可见范围生成子节点（§11.11） |
+| 表格结构               | `Row` / `Cell` / `ColumnHeader` / `RowHeader` | 逻辑父 = 最近声明 `Table|Grid` / `Row` | 逻辑父子只在 **a11y 树**表达，物理树不动（§11.11） |
+| 树                     | `Tree` / `TreeItem`                   | 逻辑父 = 最近声明 `Tree|TreeItem`；`expanded` | E9 新增两角色                                |
+| 滚动容器               | `ScrollView` + `ScrollBar`            | `ScrollUp/Down/Left/Right` / `SetScrollOffset` | 与 `ScrollHandle` 联动（**不是** `ScrollArea`） |
+| `Canvas` / `Geometry` / `Image` | `Image` + 替代文本            | `label`（**应用层必须提供**）           | 无替代文本时标 `hidden` 并写诊断，不静默丢弃（没有 `GraphicsObject`）；**显式 `A11yOverride{hidden:true}` = 装饰声明 ⇒ 免 `MissingAltText`**（E7） |
+| 浮层 / 菜单            | **应用显式声明**（无声明 = `GenericContainer`） | `children`、`Dialog`/`AlertDialog`/`Menu`/`MenuItem`/`TabList`/`Tab` 等由 `OverlayOptions::a11y` 给 | v2.3 更正：浮层包装**不再**自动 `Dialog`（E12）；`aria-modal` 跟 `trap_focus` |
+| 数值 / 开关控件        | `ComboBox` / `ListBox` / `MenuItemCheckBox` / `MenuItemRadio` / `ColorWell` / `Slider` / `CheckBox` / `Switch` / `RadioButton` | `checked` / `selected` / `numeric_value*` / `orientation` | E15 补齐；`MenuItemCheckBox` 是**准确拼写**（AccessKit 0.25 口径，大写 `B`） |
+| 隐藏 / 被 clip 裁掉    | `set_hidden(true)`                    | —                                       | `hidden` 同时从树与命中测试中排除；**沿被跳过的包裹层继承**（E9） |
+| 模态作用域外           | `hidden`（引擎自动）                  | —                                       | 非模态焦点被隐藏但**不卸载**；root 例外（E12，§11.13） |
 
 **几何换算**：`Node.bounds` 按平台要求给（Windows UIA 为屏幕物理像素）；引擎用 `LayoutBox × scale` 一次换算（I11），与
 `HitResult` 共用同一份几何。
+
+**集合语义与集合根上提（v2.3 新增，E9/E15）**：a11y 的父子关系是**逻辑**父子 —— 被领养的行/单元格/树项的 `parent` 与父节点
+`children` 按集合结构重建，`A11yNode::{parent, children}` 暴露的就是逻辑关系。集合根（声明 `Table` / `Grid` / `Tree` 的节点）
+在 E15 后接管被抑制行窗口的 `scroll` / `clips_children` / `size_of_set` 与滚动动作（§11.15）。
 
 ### 7.5 增量更新算法
 
@@ -1998,6 +2054,10 @@ pub struct TreeUpdate {
 | 结构变化           | 子节点增删必须重发父节点（否则 children 数组陈旧）                                                                                       |
 | 懒激活             | 无辅助技术连接时 adapter 不活跃，`update_if_active` 的闭包不执行 → 零开销                                                                |
 | 与细粒度架构的关系 | `A11Y` 是 `DirtyFlags` 独立位；纯视觉 `PAINT` 不触发 a11y 更新；a11y 更新不产生 `DamageRect`                                             |
+| 集合计数变化（v2.3 / E9c） | `App::set_virtual_items` 的 `count` 变化 ⇒ 向上找**最近声明集合根**（`Table`/`Grid`/`Tree`）⇒ 只对该子树 `touch(A11Y)`（不布局、不重绘、不全树）；`count` 不变**不标脏**（保 I3）。基址变化/滚动不走此分支（§11.11） |
+| 祖先作用域字段变化（v2.3 / E15） | a11y 增量写（`A11yPatch`）的值变化若影响后代作用域（仅 `role` / `hidden`），**必须** `mark_subtree_a11y` 整棵子树；三个写入点（a11y-only pass / `App::refresh_styles` 的 `visible`·`interactive` 变化 / `App::set_a11y_patch`）共用同一差分函数（`affects_descendants`，`pub(crate)`）。否则后代不会重发（E15 的 `Focus` 增量化根因） |
+| 模态作用域变化（v2.3 / E12） | `OverlaySlot::trap_focus` 变化 ⇒ `mark_modal_scope_changed` 对**全树**标 `A11Y`（O(n) 一次）；作用域外节点 `hidden=true`（root 例外），`TreeUpdate.focus` 用**有效焦点**（`focused` 在作用域外时视为无，§7.8） |
+| 行/列语义推导（v2.3 / E9） | `row_index` / `row_count` / `column_index` 的声明值优先，缺失才按集合索引推导；推导是「交付时现算」的纯函数，不在树上缓存 |
 
 ### 7.6 平台 adapter 直连初始化（D22）
 
@@ -2051,6 +2111,8 @@ adapter.set_root_window_bounds(outer, inner);
 ### 7.8 焦点与命中测试
 
 - **单一权威焦点源**：`FocusScope` 的 `focused: NodeId`，a11y `TreeUpdate.focus` 与引擎键盘分发都从它取值，不另设一份。
+  **v2.3（E12）**：`TreeUpdate.focus` 用**有效焦点** —— 有模态作用域（`App::modal_scope(window) = Some(root)`）时，
+  `focused` 落在作用域外一律按「无焦点」处理（回落到作用域根或维持上一次有效值），避免把焦点暴露给被 `hidden` 的节点。
 - **窗口焦点**：`update_window_focus_state(bool)`（Win）/ `update_view_focus_state(bool)`（mac）/ `set_root_window_bounds`
   （Linux）在窗口事件里同步。
 - **命中**：macOS adapter 直接调 `hit_test()`；Windows 走 UIA fragment 路径；引擎统一用 `layout::hit_test`（§4.4）的结果，保证视觉命中与
@@ -2087,6 +2149,10 @@ assert!(!node.hidden);
 | 几何一致                  | `A11yNode.bounds`（物理像素）== `Probe::bounds(id)`（逻辑像素）× scale |
 | Action 往返               | 注入 `ActionRequest::Click` → 与 `InputEvent` 注入产生相同的状态变化 |
 | `bind_a11y` 正确性        | `A11yPatch`（如 `disabled`）按依赖失效，且不产生视觉 damage          |
+| 集合语义（v2.3 / E9）     | 行/单元格/树项的 `A11yNode.parent` 与父 `children` = **逻辑**结构；`row_index`/`row_count` 含未挂载行；声明值优先于推导 |
+| 集合计数（v2.3 / E9c）    | `set_virtual_items(count)` 变化后集合根子树重发且 `row_count`/`size_of_set` 同步；`count` 不变时该子树零重发 |
+| 模态作用域（v2.3 / E12）  | 作用域外节点 `hidden=true` 且不可交互；`aria-modal` 跟 `trap_focus`；`TreeUpdate.focus` = 有效焦点 |
+| 角色计数（v2.3 / E15）    | `A11yRole::ALL` 长度 == 枚举变体数（穷举测试锚点，**不得写死 43**）；`role_to_accesskit` 穷举 |
 
 平台 adapter 的真实联动（UIA / NSAccessibility / AT-SPI）放在 L5 实机矩阵验证，不在门禁的 CPU 层断言。
 
@@ -2189,6 +2255,8 @@ platform/                     # 模块本身私有：应用只见 AppHandle 与 
 | 机制                  | 引擎职责                                                               | 状态归类                   |
 |-----------------------|------------------------------------------------------------------------|----------------------------|
 | 焦点                  | `FocusScope`：Tab 序、焦点环、`A11Y` dirty、键盘分发                   | 普通 `Signal`              |
+| 作用域键绑定（v2.3 / E8） | `bind_key_scoped(window, scope, binding)`：按焦点祖先链**内→外**求值，先于全局 `bind_key`，**无 handler 不吞键**；`unbind_key_scoped` / `unbind_scope_keys` 显式解绑；节点卸载/关窗由引擎清理（仅引擎内部卸载路径，应用侧卸载需显式解绑，R-21） | 普通 `Signal` + 引擎内部绑定表 |
+| 模态作用域（v2.3 / E12） | `Overlay` 的 `trap_focus` ⇒ `App::modal_scope(window)`；作用域外的 hover / 光标 / 按下 / 滚动**全部过滤**，作用域外 a11y `hidden`（root 例外）；作用域变化重算 hover 并全树标 `A11Y` | 普通 `Signal` |
 | 滚动                  | `ScrollHandle`：偏移、惯性、scroll rect / damage、虚拟列表窗口         | `Transient` + 显式动画注册 |
 | 虚拟列表              | 只挂载可见窗口节点、回收离屏节点、子树 `PAINT`；a11y 只暴露可见子节点 | 结构变化（非 dirty 位）    |
 | 浮层 / tooltip / 菜单 | `Overlay` 栈、层级、定位、点击外部关闭、clip 链                        | 普通 `Signal`              |
@@ -2202,9 +2270,12 @@ platform/                     # 模块本身私有：应用只见 AppHandle 与 
 ### 8.5 资源、图标与主题（应用层保留）
 
 - 引擎提供 `ResourceCache`：字节 → 解码 → GPU 句柄 / `AtlasTile`，含远程图片的磁盘缓存；资源**文件**在 `base_ui`。
-- **54 个 Phosphor SVG** 的转换**不在引擎内**（引擎不依赖 `usvg` / `resvg` / `tiny-skia`）：应用层在**构建期**把它们转成
+- **55 个 Phosphor SVG**（v2.3 更正：v2.2 及更早写「54」是**文档错误**；`IconKind::COUNT = 55`）的转换**不在引擎内**
+  （引擎不依赖 `usvg` / `resvg` / `tiny-skia`）：应用层在**构建期**把它们转成
   路径数据（`GeometryDesc`）或预生成 PNG；品牌 PNG / 预览 PNG 走 `image 0.25` + 图集（`ResourceCache` 只收 PNG / JPEG / WebP）。
-  **迁移前引擎基线的「图标构建期转换」尚未落地**，是 P2-1b 的迁入项（§10.2）。
+  **P2-1b 已落地**：`crates/base_ui/build.rs` 用 build-dependency `resvg`/`usvg` **0.46.0** 把 SVG 光栅化成
+  `OUT_DIR/icons/<stem>-48.png` / `-96.png` 并生成 `built.rs`（两档覆盖 1×/2×、3× 有余量；确定性来自固定缩放与无时间戳；
+  透明像素 RGB=255 的 white matte 修复避免预乘暗边）。详见 §12.5。
 - 主题语义色、调色板、深浅色映射、i18n 全在应用层；引擎只暴露 `Color` / `ColorResolver` / 混合模式 / `TextStyle` 接口。
 - 合规缺口（GPLv3 元数据、Phosphor MIT 无 LICENSE、ODbL 公开副本 URL）**仅登记 RK9，按 D19 不在本次范围**。
 
@@ -2433,12 +2504,26 @@ D18 定案「主干冻结窗口」：约定一段时间内不发布、在主干�
 | | P1-E4 | `GeometryDraw.range`（§11.4） | 同上 + 三端 encoder/`contract.md`/参数 golden 同批 | ✅ 已完成（P1 各批合入 `e1e4ff6`） |
 | | P1-E5 | `text_byte_index_at`（§11.5） | 同上 | ✅ 已完成（P1 各批合入 `e1e4ff6`） |
 | | P1-E6 | Windows chrome + macOS 交通灯（§11.6；**D-02 已裁决必做**） | L1/L5 + Win11 真机 + 合并点三端 layer | ✅ 已完成（P1 各批合入 `e1e4ff6`；真机覆盖见 §11.8） |
-| **P2 base_ui** | P2-1a | 主题与颜色基座 + 薄 `StyleBuilder`（首个交付）+ `.hsla` 全删 + 64 角色×2 外观基线 | `cargo test -p base_ui` + gallery 出帧 | ⬜ 待做 |
-| | P2-1b | 资产与基础件（icon/assets/brand/size/format/motion/animation/join + `test_support`；含旧 M4 遗留的「图标构建期转换」） | 同上 | ⬜ 待做 |
-| | P2-2 | 容器与列表（`static_sized_list` / `scroll_bar` / `table` / `tree` / `deque_*`；`grid_list` 删） | 同上 + E3 | ⬜ 待做 |
-| | P2-3 | 文本与输入（markdown parse/source/document 纯移植；inline_flow/view 用 E2；`input` / `select`） | 同上 | ⬜ 待做 |
-| | P2-4 | 交互与浮层（button/toggle/badge/interactive/tab_bar/dropdown/menu/context_menu/tooltip/overlay/dialog/alert/layer/color_picker） | 同上 | ⬜ 待做 |
-| | P2-5 | base_ui 收口（gallery、删 `Styled`/`refine_style`/`.when(` 残留、测试折算台账、视觉基线） | 同上 | ⬜ 待做 |
+| **P1+ 引擎追加**（P2 期间裁决，编号 E7–E15） | E7 | 图片节点 `NodeKind::Image`（§11.9） | L1/L2 + 三端契约零 diff + golden 零 diff | ✅ 已完成（merge `8b6211f`，含 E7b） |
+| | E8 | scoped 键绑定 / scoped transient（§11.10） | 单测 + 变异 + kit release 覆盖 | ✅ 已完成（merge `6eeac52`，含 E8b） |
+| | E9 / E9c | a11y `Tree`/`TreeItem` + 表格集合语义 + 虚拟化行号 + `slot.count` 脏标记（§11.11） | L1/L2 + a11y oracle | ✅ 已完成（merge `afee2ca` / `ef4d86e`） |
+| | E10 / E10c | 动画完成唤醒 + 一次性定时器 + macOS 定时器/空闲唤醒修复（§11.12） | 三端 `timer_smoke` | ✅ 已完成（merge `b54b753` / `df5f177`） |
+| | E12 | 浮层 a11y 角色 + 模态作用域（§11.13） | a11y oracle + 输入过滤测试 | ✅ 已完成（merge `f76d75d`） |
+| | E13 | 组不透明度 + 多层阴影（§11.14） | golden 零 diff + damage 残影回归 | ✅ 已完成（merge `07f319d`，含 E13b） |
+| | E15 | a11y 角色补齐 + 容器角色 + 集合根语义上提（§11.15） | a11y oracle + 变异 | ✅ 已完成（merge `7ad630f`，含 E15b） |
+| **P2 base_ui** | P2-0 | 迁移期 manifest 过渡开关（`KYTRIX_UI_CORE_MANIFEST`，`xtask gates` **按命令**注入；§12.6） | `cargo test -p base_ui` + `xtask gates` 全绿 | ✅ 已完成（`3adc5d7` / `e0d3f7b` → merge `3ed24a7`） |
+| | P2-1a | 主题与颜色基座 + 薄 `StyleBuilder`（**35**）/`PaintBuilder`（**6**，§12.3）+ `.hsla` 全删 + 64 角色×2 外观基线（§12.2） | `cargo test -p base_ui` + gallery 出帧 | ✅ 已完成（`05f52e0` / `6e4d413` → merge `828bf53`） |
+| | P2-1b / 1b2 | 资产与基础件（icon/assets/brand/size/format/motion/animation/join + `test_support`；旧 M4 遗留的「图标构建期转换」用 resvg 0.46 落地，§12.5） | 同上 | ✅ 已完成（`eb464f6` / `e9aeda4` → merge `8ed4714`；white matte 修复 + 110 PNG 全像素校验） |
+| | P2-1b3 / 1b3b | E7 采用：删 `kit/image_node.rs` 绕行，Icon/Brand/Assets 改用 `NodeKind::Image`（§11.9） | 同上 | ✅ 已完成（`3b3b752` / `fc4fd14` → merge `bbd75e4`；含装饰图免诊断判据） |
+| | P2-2 | 容器与列表（`static_sized_list` / `scroll_bar` / `table` / `tree` / `deque_*`；`grid_list` 删；用 E3） | 同上 + E3 | ✅ 已完成（`de475b6` / `5b154e2` → merge `6eeac52`；含 E8 与 `column_span`） |
+| | P2-2e | 列表/表格/树采纳 E9 a11y 角色与集合语义（§11.11） | 同上 | ✅ 已完成（`ebecb1a` → merge `4056cbe`） |
+| | P2-3 / 3b / 3c | 文本与输入（markdown parse/source/document 纯移；inline_flow/view 用 E2；`input` 编辑状态机含 undo/redo/拖选/双击选词；`select`） | 同上 | ✅ 已完成（`4b667e2` / `686d661` / `4b40f2e` / `4dc8f65` → merge `b475566`；3 轮复核） |
+| | P2-4a / 4a2 / 4a3 | 交互控件（interactive/button/toggle/badge/progress/spinner/separator/empty_state/alert/tab_bar） | 同上 | ✅ 已完成（`3c708ef` / `1a4ab5a` / `b63890e` → merge `b3cc264` / `93609e3`） |
+| | P2-4b / 4b2 / 4b3 / 4b4 | 浮层基础与收尾（overlay/tooltip/layer；E10 定时器路由 / E12 模态与角色 / E13 接入；R01–R12） | 同上 | ✅ 已完成（`65a38eb` / `77fbc6d` / `270fbcd` / `1b6ceae` → merge `50c6fe3` / `244c9c5`） |
+| | P2-4c / 4c2 / 4c3 | 菜单/下拉/选择/上下文菜单（共享条目面板、`PanelWidth::Exact`、行命中壳焦点） | 同上 | ✅ 已完成（`95dc808` / `1f34ea6` → merge `3ce9593`） |
+| | P2-4d1 / 4d1b | 对话框（`Dialog` / `DialogBuilder`；焦点/模态/Esc 走引擎，`OverlaySurface::dialog()`） | 同上 | ✅ 已完成（`252384e` / `9094b1c` → merge `cda7d09`） |
+| | P2-4d2 / 4d2b | 颜色选择器（144 色板 + HSLA 滑条走 `Canvas`；双层阴影回填） | 同上 | ✅ 已完成（`25f0d8b` / `58eddec` → merge `b855b21`） |
+| | P2-5 | base_ui 收口：examples 收敛为 `gallery` + 三端真实验收；**旧模块 `style/`/顶层组件/旧 `markdown/` 的删除推迟到 P5**（§12.7） | gallery 出帧 + 三端验收 | 🔄 收尾中（P2-5 gallery 批；`M3` 随该批达成） |
 | **P3 widget 契约 + 20 widgets** | P3-1 | 契约层搬运 + `view`/`any`/`status` 重写 + `WidgetCx`/`AnyWidget` 定稿 | 契约测试 + 签名冻结评审 | ⬜ 待做 |
 | | P3-2 | `surface` / `ui/placeholder` / `binding` + `empty` 标杆 + 运行时 Handle 接线 | 同上 | ⬜ 待做 |
 | | P3-3 | `widget_registry` + `widget_gallery_ui`（24 条注册表遍历） | 同上 | ⬜ 待做 |
@@ -2565,15 +2650,18 @@ M6 kytrix 启动 = P4-1…P4-3；M7 最终验收 = P6-1…P6-3（P5 是 M6 与 M
 
 ---
 
-## 11. 引擎扩展实现规格（E1–E6，已实现）
+## 11. 引擎扩展实现规格（E1–E15，已实现）
 
-> **本章全部条目已实现并合入 `gui-engine-migration`（P1-E1…P1-E6，迁移分支 HEAD `e1e4ff6`）。** 本章是**实现后的精确规格**
-> （API 形状 / 语义 / 错误 / 不变量 / 测试面），也是 P2（base_ui）与 P3（widget）的规格基线；与源码冲突时**以源码为准并回写本章**。
-> 依据：`.docs/gui-migration/assess/08-gap-verification.md` §2.1（6 项最小可行增量）与各批差异清单
-> `.docs/gui-migration/spec-deltas/E1–E6.md`；逐条回写台账见 `.docs/gui-migration/design-changes.md` §10。
-> **状态口径**：§11.1–§11.6 全部 ✅ 已实现；**E2b 候选**（§11.2 末）与**已接受残余**（§11.8）明确标注为未实现/限制，不得当作已交付能力引用。
+> **本章全部条目已实现并合入 `gui-engine-migration`**：E1–E6 为 P1（HEAD `e1e4ff6`），E7–E15 为 P2 期间裁定并落地
+> （HEAD `7ad630f`）。本章是**实现后的精确规格**（API 形状 / 语义 / 错误 / 不变式 / 测试面），也是 P3（widget）/ P4（外壳）的规格基线；
+> 与源码冲突时**以源码为准并回写本章**。
+> 依据：`.docs/gui-migration/assess/08-gap-verification.md` §2.1（E1–E6 的 6 项最小可行增量）、P2 各批审查报告的残余/回写清单
+> （`.review/mig-{e7,e8,e9,e9c,e10,e10c,e12,e13,e15,p2-*}-review.md`）与
+> `.docs/gui-migration/spec-deltas/{E1…E6,E7,E8,E9,E9c,E10,E10c,E12,E13,E15}.md`；逐条回写台账见
+> `.docs/gui-migration/design-changes.md` §10（v2.2）与 **§11（v2.3）**。
+> **状态口径**：§11.1–§11.15 全部 ✅ 已实现；**E2b 候选**（§11.2 末）与**已接受残余**（§11.8）明确标注为未实现/限制，不得当作已交付能力引用。
 
-### 11.0 总表、分级与准入规则（E1–E6 全量落地）
+### 11.0 总表、分级与准入规则（E1–E15 全量落地）
 
 | ID | 增量 | 量级 | 受影响不变量 | 阻塞 crate（08 口径） | 分级 | 状态 / 批次 |
 |---|---|---|---|---|---|---|
@@ -2587,7 +2675,23 @@ M6 kytrix 启动 = P4-1…P4-3；M7 最终验收 = P6-1…P6-3（P5 是 M6 与 M
 **量级口径**：S ≤ 1 人日、M = 2–5 人日、L ≥ 6 人日（仅引擎侧改动，不含迁移）。**分级口径**：硬阻塞 = 不做就无法实现既有功能；
 **必做（已裁决）** = 产品/架构取舍已由用户裁决必须实现（D-02 保留自绘标题栏 ⇒ E6、D-03 扩展富文本 ⇒ E2），属于必须实现项，不存在降级替代。
 
-**引擎扩展准入规则（v2.1 起生效，迁移期全程适用；E1–E6 均按此验收）**：
+**P2 期间追加的引擎扩展（E7–E15；由 P2 组件批的审查结论驱动，逐条批准记录见 `ledger.md` §4）**：
+
+| ID | 增量 | 量级 | 受影响不变量 | 触发来源 | 状态 / 批次 |
+|---|---|---|---|---|---|
+| **E7** | 图片节点 `NodeKind::Image`（fit / 调制 / 异步 pending / DPI 世代 / a11y） | **M** | I2（零契约变更：图元仍是既有 `Primitive::Image`）、I6（`set_image_resource` 是引擎入口）、I11（逻辑尺寸换算）、I12 | P2-1b 图片绕行（`kit/image_node`）不可维护 | ✅ 已实现（P2-1b3 采用） |
+| **E8** | scoped 键绑定 / scoped transient 正式化 | **M** | I3（无 handler 不吞键、不产生空帧）、I6（绑定表归引擎） | P2-2 顺带 API 需正式化 | ✅ 已实现 |
+| **E9 / E9c** | a11y 集合语义（`Tree`/`TreeItem`、逻辑父子、虚拟化行号、`slot.count` 脏标记） | **M** | I5（集合语义只在 a11y 树表达，物理树不动）、I6（脏位由引擎标） | P2-2 表格/树 a11y 缺陷 | ✅ 已实现（P2-2e 采用） |
+| **E10 / E10c** | 动画完成唤醒 + 一次性定时器 + 跨端时钟/唤醒修复 | **L** | **I3（契约细化：应用级零唤醒 vs OS 级 tick）**、I5 | P2-4b 的 P0×4（tooltip 永不触发 / 淡出收尾失败） | ✅ 已实现（P2-4b3 采用） |
+| **E12** | 浮层 a11y 角色 + 模态作用域 | **M** | I6（作用域过滤）、I9（不涉平台） | P2-4b 浮层 a11y/模态缺口 | ✅ 已实现（P2-4b3 采用） |
+| **E13** | 组不透明度 + 多层阴影（`spread`） | **M** | I2（`GpuPrimitive`/shader 零改动）、**I8（golden 必须零 diff）**、I3（稳态零重建） | P2-4b 淡出/阴影需求 | ✅ 已实现（P2-4b4 采用） |
+| **E15** | a11y 角色补齐 + 容器角色抑制 + 集合根语义上提 + 焦点增量 | **M** | I6（三个写入点共用一个差分）、I9 | P2-4c2/4c3 F27 + P2-4d2 G12 | ✅ 已实现（P2-4d2 后接入） |
+
+> **E 编号纪律（v2.3）**：E11 已被 **E10 吸收**（一次性定时器与动画完成同批交付），不再单列；**E14**（`Dismiss` 前置回调）
+> 与 **E16**（`node_screen_rect` / `anchor_rect` 公开面）**未实现**，仅登记（E16 在 `kit-overlay.md` 原稿中误用 E15 编号，
+> P2-4c3 已改号，§11.16）；**不得**把 E15 用于指 a11y 之外的缺口。
+
+**引擎扩展准入规则（v2.1 起生效，迁移期全程适用；E1–E15 均按此验收）**：
 
 1. 只允许「**不改** `GpuPrimitive` 字节布局、不改 `render/shaders/contract.md`」的能力扩展；**E4 是唯一例外**，已按此交付：三端
    encoder（Windows `render/windows/compositor.rs` 的 `GeometryRegistry`；macOS `render/macos/geometry.rs`；Linux
@@ -2757,8 +2861,9 @@ impl NodeBuilder { pub fn runs(self, runs: impl IntoIterator<Item = TextRun>) ->
 ```
 
 **尺寸基线**（E2b 实测，守护测试 `text_payload_sizes_are_budgeted` / `node_size_after_p06`）：`TextStyle` 56 / `TextContent` 112 /
-`InlineBoxSpec` 72 / `ShapedLine` 80 / **`Node` 328 B（硬上限 336 B）**。`TextContent` 在 `NodeKind::Text` 里是 `Box` 装载 ⇒
-`Node` 尺寸不变（E2 自述的「Node 328→336」不成立）。
+`InlineBoxSpec` 72 / `ShapedLine` 80 / **`Node` 336 B（硬上限 336 B，v2.3 起已无余量）**。`TextContent` 在 `NodeKind::Text` 里是 `Box` 装载 ⇒
+E2 未改变 `Node` 尺寸；E13 的 `paint_opacity: f32` 使 `Node` 328 → **336 B = 上限**（`node/tree/tests.rs` 两处精确 pin；
+后续加字段必须先把冷字段装箱搬走，**不得**抬高上限）。`PaintSpec` 192 / `Shadows` 88 / `ShadowSpec` 36 B 同为精确 pin（§11.14）。
 
 **语义**：
 
@@ -3081,7 +3186,7 @@ macOS 纯函数 `traffic_light_position_applies_once_and_never_rolls_back` / 安
 `GetClientRect == GetMonitorInfoW(rcWork)` 逐像素相等；125% DPI 实测客户区 3840×2100 物理 == 工作区，窗口 3858×2118）；
 `frameless_smoke` example 自检；八向命中 / 拖动区 `HTCAPTION`（`SendMessageW(WM_NCHITTEST)`）。**真机覆盖与残余见 §11.8**。
 
-### 11.7 明确**不**进 E1–E6 的引擎扩展（范围基线）
+### 11.7 明确**不**进 E1–E6 的引擎扩展（E1–E6 范围基线；E7–E15 见 §11.9–§11.15）
 
 `08-gap-verification.md` §2.4 的「可选增量」**全部不进 E1–E6**，只登记（应用层绕行已够，或收益/成本不划算）：
 
@@ -3096,7 +3201,7 @@ macOS 纯函数 `traffic_light_position_applies_once_and_never_rolls_back` / 安
 | `open_url` | 不做；应用层 `std::process::Command` |
 | SVG 光栅化进引擎 | **不做**；应用层构建期转换（§8.5） |
 
-### 11.8 已接受残余与限制（v2.2 单列）
+### 11.8 已接受残余与限制（v2.2 起单列，v2.3 追加 R-19…R-29 与 E 系列残余）
 
 以下条目**不是已交付能力**；引用 / 审查时按「已知限制」处理，不得写成已实现：
 
@@ -3110,13 +3215,474 @@ macOS 纯函数 `traffic_light_position_applies_once_and_never_rolls_back` / 安
 | R-16 | E2b 候选两项 | ① Canvas / standalone shaping 不绘制装饰与行内盒；② 节点文本路径的 InlineBox 命中只读访问面不存在（仅 standalone handle 路径可读落点）。 | 未实现，登记于 §11.2 |
 | R-17 | 合并提交不可单独构建（bisect 例外） | P1 各批以 merge 提交合入 `gui-engine-migration`，部分 merge 提交单独 checkout 不保证可构建（跨分支 crate / 特性依赖）。`git bisect` / 回溯以 batch 的**功能提交**为单位，不以 merge 提交为构建判据。 | 接受（流程例外） |
 | R-18 | `WM_NCCALCSIZE` `wParam == FALSE` 无测试 | 该变体交 `DefWindowProcW`（与成熟实现同构）；本仓无 `SWP_FRAMECHANGED` 运行期样式变更路径，风险低。若未来引入运行期样式变更需回归。 | 接受；登记 |
+| R-19 | 裸 `resources_mut().unload()` 不触发节点失效 | 绕过 `App::unload_resource` 直接对 `ResourceCache` 调 `unload` 时，引用该资源的图片节点**不会**被置脏，会画到已释放的 tile（花屏）。契约：图片卸载**只能**经 `App::unload_resource`（它遍历全部窗口 `invalidate_images_with_resource`）。 | 接受；应用义务（E7 §11.9） |
+| R-20 | 图片节点的 padding/border 不内缩 | 图片 `bounds` = **border box**（不内缩 padding / border），因此图片会覆盖自身绘制边框；`Style.clip = Clip::Bounds` 对图片内容不生效（图片图元按节点盒发射）。需要内缩时用内层包装节点。 | 接受；应用义务（E7 §11.9） |
+| R-21 | 公开卸载路径不自动清理 scoped 键绑定 / 定时器 | 引擎内部的节点卸载（overlay 关闭、虚拟列表回收、输入层）会清 `scoped_bindings` 与 scope 定时器；但**应用侧** `Window::tree_mut()` + `NodeTree::remove` **不触发**该清理（`App::remove_node` 是 `pub(crate)`）。应用卸载容器时必须显式 `unbind_scope_keys` + `cancel_timer`（组件契约：先卸节点 → 再解绑/摘 handler → 最后 `release_scope`）。 | **需裁决**：是否把清理下沉到 `NodeTree::remove`（引擎改动）或维持应用义务 |
+| R-22 | `Canvas` 内容不受组不透明度（E13-R1） | `StylePatch.opacity` 作用于引擎生成图元（含 `GeometryDraw.color`），但 `Canvas` 内的应用自绘图元颜色由应用生成、引擎不解析 ⇒ 组淡出时 Canvas 不淡（color_picker 的 144 色板/滑条即此情形）。 | 接受；应用在 `Canvas` 内自行乘 opacity |
+| R-23 | 无隔离组（E13-R2） | 半透明子树的图元逐个相乘、无离屏合成 ⇒ 重叠区域比 CSS `isolation: isolate` 更「实」（重叠处 alpha 叠加而非整组一次合成）。 | 接受；v1 不做离屏 layer |
+| R-24 | 阴影与透明边界的边缘行为（E13-R5 / R13 / R14） | ① `Shadows` 构造期 `take(MAX_SHADOWS = 4)`，**超过 4 层静默截断**（无错误、无诊断）；② `opacity == 0` 且带边框时仍发射一个全透明 `Quad`（过滤发生在乘 opacity 之前）；③ 负 `spread` 过度收缩时会产生零 `bounds` 的 `Shadow` 图元（被渲染层丢弃，不 panic）。 | 接受；登记（可在后续批加诊断/早退） |
+| R-25 | a11y 表格接口与嵌套集合边界（E9-R1 / E9-R7） | ① 上游 `accesskit_windows 0.35.2` 无 `ITableProvider` / `ITableItemProvider`，`accesskit_atspi_common 0.21.1` 未实现 Table 接口 ⇒ 表格语义只到 AccessKit 树层，系统级表格导航能力受限（平台 adapter 升级后复核）；② `Row` 子树内**直接声明**的嵌套 `Table`/`Grid`/`Tree`/`Row` 不被行领养（跳过且不收录）⇒ 行内嵌套集合是应用违约。 | 接受；随 adapter 升级复核 / 应用义务 |
+| R-26 | 定时器与唤醒的平台边界（E10/E10c） | ① Windows 系统模态循环（拖动/缩放）期间定时器推迟到松手（不丢、会晚）；② 每轮 `KillTimer` + `SetTimer`（60 fps 时每帧 2 次系统调用，可接受）；③ `TimerId` 的 `generation: u32` 回绕后理论上可与旧 id 相撞（实际不可达）；④ 无自动化三端定时器回归（只有一次性 `timer_smoke` 证据）；⑤ **OS 级** vsync 唤醒仍在（macOS ≤ `IDLE_GRACE = 250 ms` 一次），只是不再驱动应用轮次。 | 接受；登记（④ 建议随 P3 补） |
+| R-27 | 浮层 a11y / 模态的非目标（E12） | 不做：`aria-describedby`、跨窗口模态、`App::hit_at` 的作用域过滤（`hit_at` 仍返回作用域外节点）、tooltip 的独立绘制层带。 | 接受；非目标 |
+| R-28 | `set_a11y_patch` 的作用域边界（E15） | 写 `role` / `hidden` 会整子树重发（`affects_descendants`），其余字段只重发本节点；**运行期 `NodeTree::set_style` 把 `display` 改成 `none` 不会重发后代 a11y**（只有 `bind_style` 的 `visible` 变化会）。应用应走 `StylePatch.visible` 或 `A11yPatch.hidden`。 | 接受；应用义务（D6） |
+| R-29 | 集合根接管的边界（E15 D9 / D10 / D11 / D12） | **D9**：集合根自身已有滚动槽时不接管（避免两份矛盾 `scroll`）。**D10**：`ListBox` / `Menu` 恒抑制自动 `List` —— 真嵌套虚拟列表会失去自动 `List`；首帧 `mounted` 混合时角色可能在 `List` ↔ `GenericContainer` 间翻转 ⇒ 应用在窗口上**显式**声明角色逃生。**D11**：集合根的 `size_of_set`（窗口口径）与 Table 的 `row_count`（含表头行）口径不同。**D12**：a11y oracle 摘要含 `orientation`，仍缺 `pos_in_set` / `size_of_set`（由针对性断言覆盖）。 | 接受；登记（D12 是否补摘要待 P3 决定） |
+
+### 11.9 E7 · 图片节点 `NodeKind::Image`（已实现，量级 M，P2-1b3 采用）
+
+**实现事实**：图片成为一等**叶子**节点（`NodeKind::Image(Box<ImageContent>)`），**不新增 `Primitive` 变体**（绘制仍是既有的
+`Primitive::Image`），`Node` 预算不变（`ImageContent` 装箱）。资源解析（异步解码）+ fit 裁剪 + DPI 重解析全部在引擎内完成。
+
+```rust
+// node/image.rs（字段私有，无公开构造器）
+pub enum ImageFit { Fill, Contain, Cover }               // Default = Fill
+pub enum ImageSource { Ready(ResourceId), Pending(PendingResource) }
+impl ImageSource { pub const fn resource(self) -> Option<ResourceId>; }   // #[must_use]
+
+pub struct ImageContent { /* source / fit / modulation / intrinsic */ }
+impl ImageContent {
+    pub const fn source(&self) -> ImageSource;            // #[must_use]
+    pub const fn fit(&self) -> ImageFit;                  // #[must_use]
+    pub const fn modulation(&self) -> Color;              // #[must_use]
+    pub const fn intrinsic(&self) -> Option<Size>;        // #[must_use]：已解析的内在逻辑尺寸
+}
+
+// node/builder.rs（全部 #[must_use]）
+impl NodeBuilder {
+    pub fn image(resource: ResourceId, fit: ImageFit) -> Self;
+    pub fn image_pending(pending: PendingResource, fit: ImageFit) -> Self;
+    pub fn image_modulation(self, modulation: Color) -> Self;
+}
+
+// window.rs / app.rs
+impl Window {
+    /// 换图（同一节点换资源）；**不请求帧** —— 帧外调用须配 `App::request_repaint` / `request_node_repaint`。
+    pub fn set_image_resource(&mut self, node: NodeId, resource: ResourceId) -> Result<bool, EngineError>;
+    /// DPI 世代（缩放变化时前进）；图片内在尺寸按它重解析。
+    pub fn scale_epoch(&self) -> u32;
+}
+impl App { pub fn unload_resource(&mut self, id: ResourceId) -> bool; }
+```
+
+**语义**：
+
+1. **尺寸来源**：`Style` 显式尺寸**优先**；否则用内在尺寸 = tile 物理像素 ÷ 窗口 `scale`（逻辑像素）。资源未解析前
+   `measure = 0×0`（占位），解析完成后自动重排 + 重绘（**不需要**应用插手）。
+2. **异步生命周期**：`ResourceCache::insert_async*` → `PendingResource`；`poll()` 的结果交给 `App` 后，挂载了该
+   `PendingResource` 的节点**自动转 Ready**（`resolve_pending` → 写 `source` / `intrinsic` / measure → 上冒 `LAYOUT` +
+   `PAINT`）；解码 `Failed` **不**进 resolved 集合 ⇒ 节点保持 Pending（继续显示占位）。刷新是 **O(1) 早退**，但**只限稳态**：
+   首帧 / 挂载 / 换句柄 / DPI 变化帧各有一次全树 DFS。
+3. **fit 与绘制**：`Fill` / `Contain` / `Cover` 都在 `bounds`（= 节点 border box）内完成；`Cover` 用 **CPU 侧 UV 居中收缩**
+   （只改 `tile.u0..v1`，保留 `page` / `generation` / `slot` / `slot_epoch`）⇒ **不加 clip 深度、不改图元、不改契约（I2 零改动）**；
+   收缩比只含两轴等比项，所以与 scale 无关。
+4. **资源卸载（唯一合法入口）**：`App::unload_resource(id)` 才会把**全部窗口**中引用该资源的节点置脏（只 `PAINT`、不动布局、
+   保留 `intrinsic`）；裸 `resources_mut().unload()` 不触发节点失效（**R-19**）。关窗路径按 `resources.image(id).is_none()` 判死清悬垂引用。
+5. **DPI**：窗口 `scale_epoch` 前进 ⇒ 重新解析图片内在逻辑尺寸（tile 物理像素不变时，逻辑尺寸与 scale 反比）；应用换变体后
+   逻辑尺寸恢复。不自动重新解码不同倍图（换图由应用 `set_image_resource`）。
+6. **a11y**：`NodeKind::Image` 的默认角色是 `A11yRole::Image`；**可访问名只来自 `A11yOverride::label`**，无 `value`；
+   默认**非交互**（无 `Click` / `Focus` 动作）。无 label 的图片按 §7.4 标 `hidden` 并写 `A11yDiagnostic::MissingAltText{kind: Image}`；
+   **显式 `A11yOverride { hidden: true }` = 装饰声明 ⇒ 免诊断**（无 label 的**兜底 hidden 不算**声明）。
+7. **应用义务**：`NodeBuilder::image*` 之后仍需给可访问名（或显式声明装饰）；帧外 `set_image_resource` 要自己请求帧；
+   图片不受组不透明度的「应用自绘」豁免影响（它是引擎图元，§11.14）。
+
+**测试面**：19 个新测试（fit 三态、pending→ready、卸载跨窗口、DPI epoch、a11y 正反断言、调制通道路径、L2 UV 数值断言）；
+`ui_core --lib` 2170→2171（E7b）；**golden 零 diff**；三端渲染契约零 diff。
+
+### 11.10 E8 · scoped 键绑定与 scoped transient（已实现，量级 M）
+
+**实现事实**：P2-2 为组件「局部快捷键」临时加的能力被正式化：作用域键绑定挂到节点、按焦点祖先链求值；瞬态值可挂到
+`SignalScope` 上随作用域回收。
+
+```rust
+impl App {
+    /// **破坏性变更**：旧签名返回 `()`，现返回 `Result`（`UnknownWindow` / `StaleNode`）。
+    pub fn bind_key_scoped(&mut self, window: WindowId, scope: NodeId, binding: KeyBinding) -> Result<(), EngineError>;
+    pub fn unbind_key_scoped(&mut self, window: WindowId, scope: NodeId, key: KeyCode, modifiers: Modifiers) -> bool;
+    /// 返回清除条数。
+    pub fn unbind_scope_keys(&mut self, window: WindowId, scope: NodeId) -> usize;
+
+    pub fn bind_key(&mut self, binding: KeyBinding);                              // 全局，未变
+    pub fn unbind_key(&mut self, key: KeyCode, modifiers: Modifiers) -> bool;     // 全局，未变
+    pub fn transient_scoped<T: Clone + 'static>(&mut self, scope: SignalScope, initial: T) -> Transient<T>;
+}
+// test-support 只读观测面
+impl App {
+    pub fn has_action_handler(&self, action: &Action) -> bool;                    // #[cfg(feature = "test-support")]
+    pub fn scoped_key_binding_count(&self, window: WindowId, scope: NodeId) -> usize; // #[cfg(feature = "test-support")]
+}
+```
+
+**求值顺序（每次非 repeat 的 `KeyDown`）**：① 焦点激活（`Enter` / `Space` 等 Action）→ ② **scoped 绑定**：从
+`App::focused(window)` 沿 `parent()` 上溯，**内层优先**，每个 scope 精确匹配 `(window, scope, key, modifiers)`；命中就
+依次派发，**首个返回 `true` 即消费** → ③ 全局 `bind_key` → ④ 默认键盘行为（滚动 / Tab 序）。
+**无 handler 不吞键**：`scoped` 命中但 action 无 handler（`has_action_handler == false`）或分派返回 `false` 时**继续外层**，
+最后仍会到全局与默认行为。修饰键**精确匹配**；`repeat` 不查绑定；绑定**按窗口隔离**；scoped 无「模态」限制（模态只过滤指针，§11.13）。
+
+**生命周期**：
+
+| 事件 | 行为 |
+|---|---|
+| 同 `(window, scope, key, modifiers)` 再次 `bind_key_scoped` | **后写覆盖**前一条（不累积、不报错） |
+| **引擎内部**节点卸载（overlay 关闭 / 虚拟列表回收 / 输入层） | 自动清该节点及其子树的作用域绑定（`retain` 存活 scope）；同批清该 scope 的定时器 |
+| `App::close_window` | 清该窗口**全部** scoped 绑定 + 动画 + 定时器 |
+| `release_scope(scope)` | 与键绑定**无关**（键绑定按 `NodeId` 作用域，不是 `SignalScope`）；返回**值槽位数**（信号 + 瞬态值槽位），不是信号数 |
+| 释放作用域时仍有动画指向被释放的瞬态值 | 同批取消这些动画槽并按 `AnimationEndKind::Released` 入队完成事件（`targets_any` 判据；新增 `Transient` 变体必须同步该判据） |
+| **应用侧** `Window::tree_mut()` + `NodeTree::remove` | **不触发**自动清理（`App::remove_node` 是 `pub(crate)`）⇒ **R-21 应用义务** |
+
+**组件契约（kit 层，§12.4）**：释放顺序固定为「先卸载节点 → 再解绑 scoped 键 / 摘 action handler → 最后 `release_scope`」；
+`release` 必须幂等（重复调用返回 0）。
+
+### 11.11 E9 / E9c · a11y 集合语义（已实现，量级 M）
+
+**E9（`A11yRole` 32→34 + 集合语义）**：新增 `Tree` / `TreeItem` 两个角色（表格族 `Table` / `Grid` / `Row` / `Cell` /
+`ColumnHeader` / `RowHeader` 已在位）；**集合语义只在 a11y 树表达**，物理节点树不动（I5）。
+
+| 规则 | 内容（实现：`a11y/tree.rs`） |
+|---|---|
+| 逻辑父 | `Row` → 最近**声明** `Table`/`Grid`；`Cell`/`ColumnHeader`/`RowHeader` → 最近**声明** `Row`；`TreeItem` → 最近**声明** `Tree`/`TreeItem`；其余 = 物理父。**只认声明角色**（`patch.role.or(over.role)`），自动推导的角色不参与领养 |
+| 逻辑子 | 被领养的节点从物理父的 `children` 中**过滤掉**，出现在集合根的 `children` 里；`A11yNode::{parent, children}` 暴露的就是逻辑关系 |
+| 行窗口判定 | 虚拟列表窗口的**已挂载项全部声明 `Row`** ⇒ 按行窗口领养（空窗口按行窗口计）；非行窗口 / 嵌套集合**不领养**（R-25） |
+| 虚拟化行号 | `row_index = 基址 + 项号`、`row_count = 逻辑总行数`（含**未挂载**行，来自 `slot.count`）；非行窗口虚拟列表**不占**行号、**不计**行数 |
+| 声明优先 | `A11yPatch` / `A11yOverride` 显式给的 `row_index`/`row_count`/`column_index`/`row_count` 永远优先于推导；推导是交付时现算的纯函数，不缓存 |
+| 隐藏继承 | `hidden` 沿被跳过的包裹层继承（`hidden_by_skipped_ancestors`），保证「父 hidden ⇒ 子也 hidden」在逻辑树上成立 |
+| 集合边界 | 不做「集合内嵌套集合」的通用支持（`Row` 内直接声明的嵌套 `Table`/`Grid`/`Tree`/`Row` 跳过且不收录，R-25） |
+
+**E9c（`slot.count` 脏标记）**：`App::set_virtual_items` 的 `count` **变化**时，从窗口向上找**最近声明集合根**
+（`Table`/`Grid`/`Tree`）并对其**整棵子树** `touch(A11Y)`（不布局、不重绘、不全树）；无集合根时维持只标窗口；
+`count` 不变**不标脏**（保 I3：滚动 / 基址变化走另一条路径）。集合派生字段（`row_count` / `size_of_set`）是**交付时现算**的值，
+写点只负责标脏 ⇒ **应用不需要为集合节点手工转发 count**，也不需要 `force_full`。
+
+**E9 的 R6 事实更正（v2.3）**：E9 审查稿曾写「`crates/ui_core/src/a11y.rs` 注释写 32 个变体」——**该说法有误**：
+`a11y.rs` 从未写过 32（只用 `A11yRole::ALL` 数组长度表达）；该计数的**唯一出处是本设计文档 §7.4（旧文）**。
+以源码为准：`A11yRole::ALL: [Self; 43]`（E15 后），且**任何地方都不得写死角色个数**。
+
+**残余**：E9-R1（上游 adapter 无 `ITableProvider`/`ITableItemProvider`）、E9-R2（**已闭合** —— E15 抑制自动 `List` 前半 +
+E15b 集合根接管后半）、E9-R7（行内嵌套集合边界）、E9 F4/F5（`A11yNode.hidden` 文档与隐藏判据去重）。
+
+### 11.12 E10 / E10c · 动画完成、一次性定时器与唤醒契约（已实现，量级 L）
+
+**实现事实**：P2-4b 的 4 个 P0（tooltip 永不触发、淡出收尾失败、Layer 登记泄漏、每轮 enforce 出帧）根因是「缺少完成通知 +
+缺少一次性定时器 + 平台定时器语义不一致」，因此新增 E10（引擎侧完成事件与定时器）与 E10c（macOS 定时器/空闲唤醒修复）。
+
+```rust
+pub enum AnimationEndKind { Finished, Cancelled, Replaced, Released }
+pub struct AnimationCompletion { pub id: AnimationId, pub kind: AnimationEndKind }
+pub struct TimerId { /* 字段私有：window / generation: u32 */ }
+impl TimerId { pub fn window(&self) -> WindowId; }        // #[must_use]
+
+impl App {
+    /// **单槽**：后注册覆盖先注册；kit 的 `AnimationRouter` 是应用层唯一注册者（硬契约，§12.4）。
+    pub fn on_animation_complete(&mut self, handler: impl FnMut(&mut App, AnimationCompletion) + 'static);
+    pub fn after(&mut self, window: WindowId, delay: Duration, callback: impl FnOnce(&mut App) + 'static) -> Result<TimerId, EngineError>;
+    pub fn after_scoped(&mut self, window: WindowId, scope: NodeId, delay: Duration, callback: impl FnOnce(&mut App) + 'static) -> Result<TimerId, EngineError>;
+    pub fn cancel_timer(&mut self, id: &TimerId) -> bool;
+}
+```
+
+**时序契约（应用可见）**：
+
+| 场景 | 派发时机 |
+|---|---|
+| 动画**自然完成** | **同帧内**：tick 写终值 → 标脏 → `queue_completion` → 派发（在样式 / 布局 / 绘制之前）；另 `Dispatcher::wake()` 一次，保证即使没有回调，下一轮 `on_frame` 也能看到终值（且不提交空帧） |
+| 动画**帧外终止**（`Cancelled` / `Replaced` / `Released` / 0 ms `Finished`） | 入队 + 唤醒，**下一帧入口**派发 |
+| 定时器到期 | 帧入口 `run_frame_hook`（`timer::run_due` → 动画完成 → 资源轮询）；**等待期零帧零唤醒**、不进连续帧集合、无新线程（I3） |
+| 回调里再注册定时器 | **不**在同一次派发内内联派发（0 ms 自续期不会变成不返回的循环）；按 `(deadline, id)` 排序，派发顺序确定 |
+| 派发点无 handler | 事件**静默丢弃**（不累积、不补发） |
+| 派发过程中替换 handler | 只影响**下一批**（重入有守卫；回调内重新注册则保留新 handler） |
+
+**清理**：`close_window` 取消该窗口全部定时器与动画；**引擎内部**节点卸载取消该 scope 的定时器（`retain_live_scopes`）；
+树重建 / 只 `release_scope` 不卸载**不会**取消（R-21 同类应用义务）。
+
+**`clock_live`（E10c 根因修复）**：旧实现 `deadline = app.clock + delay`，而 `app.clock` 是**泵起点**同步值 ⇒ 前置工作被算进
+delay，macOS 实测**早触发**（`398.65 ms < 400 ms`）。修复：`App::new` 起 `clock_live = true`（登记瞬间取 `Instant::now()`，
+含首次泵启动前），`run_due` 仍用泵起点时钟判 `deadline <= now` ⇒ **平台提前唤醒不派发**、下一轮重挂（**只晚不早**）。
+`TestApp` 显式改用引擎时钟（`use_engine_clock`）以保持可确定性推进。**三端精度**：Windows `WM_TIMER` 粒度 ≈ 15.6 ms、
+Linux 1 ms、macOS `CFRunLoopTimer`；契约只保证「不早于 delay」，晚多少随平台。
+
+**macOS 空闲 vsync tick 不再跑应用轮（契约变化）**：旧实现每轮 run loop 都跑完整应用轮 ⇒ 400 ms 等待期实测 **54 轮**。
+现在把判据抽成平台无关纯函数 `macos_pump::{RoundInputs, app_round}`（9 个判据：tick / changed / pending_wake / timer_due /
+continuous / deferred / a11y_retry / a11y_backlog / quit），只有 `app_round == true` 才 `run_frame_hook`；纯 vsync tick 只做
+display pacing + a11y 投递对账。**应用可见后果**：`on_frame` **不是**固定频率轮询，应用不得把它当定时器
+（用 `after` / `after_scoped`）。三端实测首 fire：Win **+415.79 ms / 0 空闲应用轮**、mac **+404.63 ms / 1 轮**、
+Linux **+400.79 ms / 5 轮**（既有启动补轮，门槛 8）。
+
+**I3 口径细化（v2.3）**：「应用级零唤醒」已达成（等待期无应用轮次）；**OS 级**仍有 vsync 唤醒（macOS `IDLE_GRACE = 250 ms`
+滞回），这是平台事件循环的固有成本，不计入 I3 违例（§0.2）。
+
+**残余**：R-26（Windows 系统模态循环期间推迟 / 每轮 `KillTimer`+`SetTimer` / `TimerId` 回绕 / 无自动化三端回归 / OS 级 tick）。
+
+### 11.13 E12 · 浮层 a11y 与模态作用域（已实现，量级 M）
+
+**角色（34→38）**：新增 `AlertDialog` / `TabList` / `Tab` / `Separator`。**`Separator` 是引擎枚举名**；AccessKit 0.25 没有
+`Role::Separator`，映射到 `Role::Splitter`（`a11y/mapping.rs`）——**引擎枚举里没有 `Splitter` 变体**。
+
+**语义**：
+
+1. **浮层包装节点不再自动 `Dialog`**（v2.2 的错误行为已修）：无显式声明 ⇒ `A11yRole::GenericContainer`（平台
+   `common_filter` 透明）。显式角色走 `OverlayOptions.a11y: A11yOverride`（**新增字段 ⇒ `OverlayOptions` 失去 `Copy`**），
+   合并优先级：`A11yPatch.role` > `A11yOverride.role` > 按节点类型推导。
+2. **`aria-modal` 跟 `trap_focus`**（不再要求角色 == `Dialog`）：包装节点的 `modal` 取 `OverlaySlot::trap_focus`（引擎真值）；
+   动态 `A11yPatch::modal` 可覆盖；静态 `A11yOverride::modal = false` **不吞**引擎真值。
+3. **模态作用域**：`App::modal_scope(window) -> Option<NodeId>` 返回当前模态根。作用域外：
+   - 指针 **hover / 光标 / 按下 / 滚动全部过滤**（`in_modal_scope` 判据，与视觉遮罩一致；作用域变化后立即 `revalidate_hover`）；
+   - a11y 节点 `hidden = true`（**root 例外**），作用域变化 ⇒ `mark_modal_scope_changed` 对全树标 `A11Y`（O(n) 一次）；
+   - `TreeUpdate.focus` 用**有效焦点**（作用域外的 `focused` 视为无，§7.8）。
+4. **非目标**：`aria-describedby`、跨窗口模态、`App::hit_at` 的作用域过滤、tooltip 独立绘制层带（R-27）。
+
+**成本**：作用域切换 = 一次全树 `A11Y` 标脏（不是每帧）；模态外过滤只发生在指针事件路径（O(祖先链)）。
+
+### 11.14 E13 · 组不透明度与多层阴影（已实现，量级 M）
+
+**实现事实**：淡出/遮罩需要「组」不透明度（一个 `Signal` 让整棵子树淡出）与多层阴影（旧菜单双层、dialog 单层），
+但**不新增 draw call、不改 `GpuPrimitive` / shader / 三端 encoder**（I2 零改动）。
+
+**API**：
+
+```rust
+pub struct ShadowSpec { pub offset: Point, pub blur: f32, pub spread: f32, pub color: Color }
+pub const MAX_SHADOWS: usize = 4;
+pub struct Shadows(SmallVec<[ShadowSpec; 2]>);       // 构造期 take(4) 截断；数组序 = 绘制序
+impl Shadows {
+    pub fn new(layers: impl IntoIterator<Item = ShadowSpec>) -> Self;
+    #[must_use] pub fn len(&self) -> usize;
+    #[must_use] pub fn is_empty(&self) -> bool;
+    pub fn iter(&self) -> std::slice::Iter<'_, ShadowSpec>;
+}
+impl From<ShadowSpec> for Shadows { .. }
+impl FromIterator<ShadowSpec> for Shadows { .. }
+pub struct PaintSpec { /* background / border / corner_radius */ pub shadows: Shadows, /* gradient */ }
+```
+
+**语义**：
+
+1. **`StylePatch.opacity` = 组不透明度**：有效值 = 自身 × 祖先链（`NaN ⇒ 0`，否则 clamp `[0,1]`），乘到本节点与整棵子树的
+   **每个引擎图元**（`Quad` / `GlyphRun` / `Image` / `Shadow` / `GeometryDraw.color`）；**`Canvas` 内容例外**（R-22）。
+   只给组根绑一个值即整组淡出，**稳定帧零重建**（I3）。
+2. **戳记 `Node.paint_opacity: f32`**（内部字段，不是公开面）：记录「上次重建 lane 时实际乘进图元的值」，进 `reusable` 判据
+   （`REUSABLE && clip_key 一致 && lane_offset 一致 && paint_opacity == 有效值`）。有效值变化 ⇒ `expand` 覆盖子树 ⇒ 逐级失配重建。
+   三个写回点：普通 lane、几何块 lane、几何节点零尺寸早退分支。
+3. **damage 必须覆盖旧图元**：lane 重建前把**上一帧该 lane 全部图元**的实际覆盖区（`Quad` / `Shadow` 外扩 `3σ·scale+1` /
+   `Image` / `GlyphRun` / `Canvas` 屏幕区）并入节点 damage；几何节点重建同理并上旧装饰覆盖区。否则组淡出到 0 会留残影
+   （E13 审查 F1 / 已修 + 双帧回归测试）。
+4. **阴影**：`spread` 是 CSS spread-radius，CPU 侧折算 `rect.outset(spread)` + 圆角同量（σ **不变**），**不进**
+   `GpuPrimitive` / uniform / shader；每层发一个 `Primitive::Shadow`，颜色乘组不透明度。
+5. **尺寸预算（精确 pin）**：`Node` **336 B = 硬上限，无余量**（E13 的 `paint_opacity` +4 B；两处 `assert_eq!` 精确 pin；
+   后续加字段必须先把冷字段装箱搬走）；`PaintSpec` 192 / `Shadows` 88 / `ShadowSpec` 36 B；`GpuPrimitive` 128 / `Primitive` 80 /
+   `Lane` 32 B 不变。
+6. **golden**：`Shadows::default()` ≡ 旧 `shadow: None`、`spread = 0` ⇒ `outset(0)` 逐位等价 ⇒ **42 张 golden 零 diff、零重建**；
+   另加一条**不依赖 golden** 的「整组淡出像素读回」用例锁住合成语义。
+
+**残余**：R-22（Canvas）、R-23（无隔离组）、R-24（>4 层截断 / `opacity=0` 仍发透明 Quad / 负 spread 零 bounds）。
+
+### 11.15 E15 · a11y 角色补齐、容器角色抑制与集合根语义上提（已实现，量级 M）
+
+**角色（38→43）**：新增 `ComboBox` / `ListBox` / `MenuItemCheckBox` / `MenuItemRadio` / `ColorWell`。
+**`MenuItemCheckBox` 是精确拼写**（AccessKit 0.25 用大写 `B`；审查稿/台账里的 `MenuItemCheckbox` 是笔误，源码为准）。
+计数链：32 →(E9) 34 →(E12) 38 →(E15) **43**；`A11yRole::ALL: [Self; 43]` 是穷举锚点，**不得写死个数**。
+
+**公开面**：
+
+```rust
+pub enum A11yOrientation { Horizontal, Vertical }                 // a11y.rs；#[must_use] 语义同 A11yRole
+impl A11yPatch { /* + orientation: Option<A11yOrientation> */ }   // 字段扩充（结构体字面量兼容）
+impl A11yOverride { /* + orientation: Option<A11yOrientation> */ }
+impl App {
+    /// 运行期 a11y 增量写；内部 `request_frame()`，等值短路。
+    pub fn set_a11y_patch(&mut self, window: WindowId, node: NodeId, patch: A11yPatch) -> Result<(), EngineError>;
+}
+```
+
+**E15 修复的三件事**：
+
+1. **焦点增量（`Focus` 动作脏位根因）**：a11y 增量若只标本节点，祖先作用域属性（`role` / `hidden` / `visible` / `interactive`）
+   变化时后代不会重发 ⇒ 焦点动作/可见性在 a11y 侧陈旧。修法：三个写入点（a11y-only pass / `App::refresh_styles` 的
+   `visible`·`interactive` 变化 / `App::set_a11y_patch`）**共用**同一个差分函数 `write_a11y_patch`，当
+   `affects_descendants`（**只认 `role` / `hidden`**，`pub(crate)`）为真时 `mark_subtree_a11y` 整棵子树。
+2. **容器角色抑制**：声明集合容器（`Table`/`Grid`/`Tree`）下的虚拟列表窗口**不再**自动暴露 `List` —— 判据
+   `is_suppressed_list_window`：`Table`/`Grid` 需已挂载项全声明 `Row`、`Tree` 需全声明 `TreeItem`、`ListBox`/`Menu` **恒抑制**；
+   命中 ⇒ `GenericContainer`（裸虚拟列表仍是 `List`）。`ListBox`/`Menu` 恒抑制的边界见 R-29（D10）。
+3. **集合根语义上提（E15b，闭合 E9-R2）**：被抑制的行窗口无法承担滚动/裁剪/集合大小语义 ⇒ 由集合根接管：
+   `lifted_scroll_root` 四条件（窗口有 VirtualSlot + ScrollSlot / 窗口角色是自动推导 / 被抑制 / 集合根自身无滚动槽）命中时，
+   集合根接管 `scroll` / `clips_children` / `size_of_set` 与 `ScrollIntoView` 等滚动动作；滚动偏移变化补标集合根。
+   集合根自身已有滚动槽时**不接管**（R-29 D9，避免两份矛盾 `scroll`）。
+
+**`orientation`（D7 最小版）**：显式声明优先（`A11yPatch` > `A11yOverride`），否则按滚动轴推导；**不做**自动方向推断。
+`node_summary` 摘要已含 `orientation`，仍缺 `pos_in_set` / `size_of_set`（R-29 D12）。
+
+**残余**：R-29（D9–D12）、R-28（运行期 `set_style` 的 `display:none` 不重发后代 a11y）。
+**拆回 base_ui 后续批的缺口**（不在引擎批）：虚拟容器角色（`List` 语义由 kit 容器显式声明）、`List::set_row_a11y` 接
+`ReadCtx`（`kit-menu.md §5/§13.5`，P2-4c2/F27 拆分结论）。
+
+### 11.16 E7–E15 的不变量影响、错误面与编号纪律
+
+**不变量影响（逐条对照 §0.2）**：
+
+| 不变量 | E7–E15 是否触及 | 结论 |
+|---|---|---|
+| I1 编译期单一后端 | 否 | E10c 只改 macOS 泵的**调度判据**（纯函数 + 接线），仍是编译期单一实现、无可插拔 trait |
+| **I2 一套数据契约** | **触及但零变更** | E7 复用 `Primitive::Image`、E13 只用既有 `Shadow` 图元 + CPU 侧 `spread`/组 opacity 折算 ⇒ `GpuPrimitive` 128 B / shader / `contract.md` **零改动**；E4 仍是唯一例外 |
+| **I3 空闲不提交帧** | **是（细化）** | E10 的一次性定时器与完成回投是**合法一次性唤醒源**；E10c 把 I3 拆成「应用级零唤醒（已达成）/ OS 级 tick（平台固有）」；E13 的稳态零重建、E9c 的 count 不变不标脏都在守 I3 |
+| I4 GPU 资源延迟销毁 | 否 | 图片仍走既有 `ResourceImage` / 图集回收；`unload_resource` 只置脏 |
+| **I5 节点树即布局树** | 是（澄清） | E9 的集合语义**只在 a11y 树**表达，物理节点树与 taffy 树仍同一份（§11.11） |
+| **I6 可见状态只经 `Signal`** | 是（增补） | 新增引擎级写入口 `Window::set_image_resource` / `App::set_a11y_patch` / `App::write_transient`（§0.2 已登记），它们由引擎置脏；E8 的绑定表、E10 的定时器表都归引擎 |
+| I7 测试无 GPU | 否 | 新增测试全在 CPU harness（a11y oracle / L2 / damage 断言） |
+| **I8 三套 shader 共享视觉 golden** | 是（验证） | E13 触发 golden 复核 ⇒ **零 diff**（等价性已论证 + 42 张逐张 `max=0 / avg=0.000`） |
+| **I9 应用层不接触平台 API** | 否 | E12 的模态/cursor 过滤全在引擎；E10c 的泵判据在 `platform/`（私有） |
+| I10 不静默降级 | 否 | P2 **未新增** `EngineError` 变体（仍 35）；E13 的 >4 层阴影截断是**构造期**的显式上限（R-24），不是降级 |
+| I11 逻辑像素存储 / 物理绘制 | 是（沿用） | 图片内在尺寸按 scale 换算（§11.9 语义 1/5） |
+| **I12 指令与像素分别验证** | 是（沿用） | E13 新增像素读回用例，但文本仍不进 golden（`SnapshotScene` 无 `Glyphs`）；E7 的 Cover 只有 L2 数值断言（无 L3 裁剪用例，记为可选增强） |
+| I13–I17 | 否 | 未触及；I16 的「零 `x11rb`」仍是 **P5-2 判据**（不变） |
+
+**错误面**：P2 全程**未新增** `EngineError` 顶层变体（仍 **35**，§2.9）；新路径全部复用既有强类型：
+`UnknownWindow`（`bind_key_scoped` / `after`）、`StaleNode`（scope / 节点失效）、`InvalidVirtualExtent` / `VirtualListExtents`
+（E3 既有）。**没有**「定时器过期」「角色非法」这类新错误——非法输入按契约钳制或静默丢弃（并在 §11.8 登记）。
+
+**编号纪律**：E7–E10、E10c、E12、E13、E15 为已实现扩展；**E11 已被 E10 吸收**（不单列）；**E14**（`Dismiss` 前置回调）与
+**E16**（`node_screen_rect` / `anchor_rect` 公开面，`kit-overlay.md` 原稿误用 E15 编号，P2-4c3 已改号）**未实现**、只登记。
+任何新缺口**不得**复用已占用编号（详见 §12.7）。
 
 ---
 
-## 附录 A：核心接口草图汇总（v2.2 起与 `crates/ui_core/src` 对齐）
+## 12. P2 应用层实现规格（`base_ui` / kit，已实现）
 
-> 本附录只列**已实现**的公开形状（摘录，不是全量；全量见 §1.3 与源码）。**E1–E6 的公开面同样已实现**，精确规格与签名见 §11
-> （本附录不重复，避免两处签名漂移）。
+> **状态**：P2（`base_ui` 迁移）已按 P2-0…P2-4d2 全部合入迁移分支（HEAD `7ad630f`）；P2-5 收尾为 `gallery` + 三端真实验收。
+> 本章是**应用层的实现后规格**：模块形态 / 主题基座 / 薄 builder / kit 组件契约 / 构建期资产 / 过渡开关 / 计划修正。
+> 引擎侧规格见 §11；应用层与引擎的边界仍由 §1.3 白名单约束 —— `base_ui` **只见引擎类型**（I9）。
+
+### 12.1 模块级增量迁移形态（不是兼容层）
+
+| 项 | 事实 |
+|---|---|
+| 新模块 | `crates/base_ui/src/theme/`（8 个模块 + `mod.rs`：`appearance` / `color` / `components` / `handle` / `palette` / `resolved` / `role` / `roles`）、`crates/base_ui/src/kit/`（33 个组件模块 + `mod.rs` + `test_support`（`#[cfg(test)]`）；`kit/markdown/` 6 个模块 + `parse_tests`） |
+| 旧模块 | 旧 `src/style/`（5 个模块 + `mod.rs`）、`src/` 顶层组件文件、旧 `src/markdown/` **仍在**（迁移期并存），**P5 删除**（§12.7） |
+| 迁移形态裁决 | **模块级增量**：新模块用新路径与新 API，旧模块不改造、不桥接、不 re-export；**不是**公开 API 兼容层（AGENTS §1.1） |
+| 依赖 | `crates/base_ui/Cargo.toml` 运行时仍含 `gpui-kit`（旧模块需要），故旧模块的 gpui 文本引用 ≈304 处；新 `theme/` / `kit/` **零 `gpui`** |
+| 测试事实标准 | `cargo test -p base_ui --lib`（迁移期须带 `KYTRIX_UI_CORE_MANIFEST=0`，否则 Windows 清单冲突，§12.6） |
+
+### 12.2 主题基座（`theme/`）
+
+分层：`Palette`（手写 OKLCH 原值）→ `RoleColors`（**64 个语义角色**）→ `ComponentColors` + `ComponentTokens`/`SizeTokens`/
+`ShadowTokens`/`ScrollbarTokens` + 14 个组件色配方 → `Theme`（`resolved`，浅/深各一份）→ `ThemeHandle`。
+
+| 项 | 规格 |
+|---|---|
+| `ThemeHandle` | `Rc<ThemeData { current: Signal<Appearance>, light: Theme, dark: Theme }>`；**单** `Signal<Appearance>` 是唯一事实源（否决「epoch + current」双信号草案，避免第二事实源） |
+| 方法（逐字） | `new(app: &mut App, appearance: Appearance) -> Self`、`set_appearance(&self, app: &mut App, appearance: Appearance) -> bool`、`appearance(&self, cx: &mut ReadCtx<'_>) -> Appearance`、`theme(&self, cx) -> &Theme`、`role(&self, cx, role: Role) -> Color`、`resolve(&self, cx, role: Role) -> LinearPremulRgba`、`theme_for(&self, appearance) -> &Theme`、`components(&self, cx) -> &ComponentColors`、`tokens(&self) -> &ComponentTokens` |
+| 依赖追踪 | 所有取色都经 `ReadCtx`（`cx.read`）登记 ⇒ 外观切换 = 一次语义信号写，只有读过它的节点 `BIND`；`set_appearance` 的 `bool` 直接来自 `App::write` 的等值短路 |
+| 色彩空间 | `Palette` 手写 OKLCH → `RoleColors` 在 sRGB 空间对齐；tonal 合成改**线性 / OKLCH 混合**（用户裁决，接受视觉变化；Dark active 最大差 43/255） |
+| gamut | 接受引擎 `ColorResolver` 的映射，用 golden 锁定；对比度地板 **58 条**全量移植（8 组 gamut golden + tonal 逐值 golden） |
+| 禁止 | 主题**不**持有资源、**不**做动画（切换动画归组件层）；旧 `style/` 的 `.hsla` 取值路径**已全删** |
+
+### 12.3 薄 builder（`style_builder.rs`）：`StyleBuilder` 35 + `PaintBuilder` 6
+
+两个 builder **分开**，因为 `Style` 与 `PaintSpec` 是两条独立失效通道（`LAYOUT` / `PAINT`），合并会让「只改颜色」误触布局。
+
+| 项 | 规格 |
+|---|---|
+| `StyleBuilder` | **35 个方法**（含 `new` / `build`）：flex 方向 / `gap` / padding / `size` / `clip` / 布局 `border` 等；`build() -> Style` |
+| `PaintBuilder` | **6 个方法**：`new` / `background` / `rounded` / `border` / `shadow` / `build`；`build() -> PaintSpec`（`shadow` 仍是**单层**入口：`Shadows::from(shadow)`，多层直接构造 `Shadows::new`） |
+| 两套 border | `StyleBuilder::border` = **taffy 占位**（不画像素）；`PaintBuilder::border` = **画线**（不参与布局）。迁移旧 `.border_1()` **必须成对书写**，否则要么没线、要么错位 |
+| 不做 | 不提供 `text_size` / `font_weight` / `line_height`（直接用 `TextStyle`）；不处理 `StylePatch` 动态字段；**不自动置 `affects_layout`**；无宏 / 无字符串选择器 / 无嵌套闭包 DSL / 无可插拔扩展 trait / 无 `.when()` / 无 `Styled` |
+| 硬边界理由 | D24 + I17：builder 只在**挂载期调用一次**，返回值是 `Style` / `PaintSpec` **值**，不是可持续修改的对象；运行期变化只经 `Signal` → `StylePatch` |
+
+### 12.4 kit 组件形态与 `AnimationRouter`
+
+**组件生命周期（约定，不是 trait —— 全仓 `pub trait` 仍为 0）**：`new(app, …)` 建状态 → `build(tree, parent)` 只建节点 →
+`mount(app, window, parent)` / `attach(app, window)` 接进引擎（首帧 measure-then-place）→ `sync(app)` 帧驱动 →
+`dispatch(app, &Event) -> bool` 交互 → `release(app) -> usize` 幂等释放（先卸节点 → 解绑 scoped 键/摘 handler → `release_scope`）。
+**没有**组件自注册 `on_frame`（`App::on_frame` 是单槽，归应用）。
+
+| 组件族 | 形态要点 |
+|---|---|
+| `interactive` / `button` / `toggle` / `badge` / `progress` / `spinner` / `separator` / `empty_state` / `alert` / `tab_bar` | 状态（hover/pressed/focus/disabled/loading/selected）→ `StylePatch` + `A11yPatch`；150 ms hover 用 `Transient` + `App::animate`（不进依赖图） |
+| `list` / `table` / `tree` / `deque_*` / `scroll_bar` | 虚拟化行窗口 + E3 变高；行/单元格/树项**声明**集合角色（E9/E15 语义，§11.11/§11.15） |
+| `overlay` / `layer` / `tooltip` / `dialog` / `alert` / `menu` / `dropdown` / `select` / `context_menu` / `color_picker` | `Overlay` 栈 + 固定 z 层带（`View < Dialog < Alert < Popup < ContextMenu < Tooltip`）+ `Layer` 按窗口分区；`OverlaySurface::{dialog,menu}` 统一表面（双层阴影按旧值回填，E13 真实接入）；模态走 `trap_focus` + `restore_focus`（E12） |
+| `markdown` / `input` | markdown 5 文件（`document`/`source`/`parse`/`inline_flow`/`view`），块容器递归上限 `MAX_BLOCK_NESTING = 64`（旧 comrak 1000 层引用会栈溢出 abort）；`input` 是应用层编辑状态机（IME / 水平滚动 / undo·redo / 拖选 / 双击选词），**不是**引擎能力 |
+
+**`AnimationRouter`（唯一动画完成注册者，硬契约）**：引擎 `App::on_animation_complete` 是**单槽**（后注册覆盖）；kit 的
+`kit/overlay.rs` 里的 `AnimationRouter`（`Rc<RefCell<…>>`，`Clone + Default`）是**应用层唯一**注册者——`install(app)` 幂等装一次，
+内部按 `AnimationId` 一次性地 `track` / `untrack` / `dispatch`。**应用不得**再调 `App::on_animation_complete`；需要更多订阅者
+只能扩展该路由（`AnimationRouter` 的订阅面是 P2-4b3 B3 登记的后续项）。淡出收尾因此可以在 `Finished` **同帧**执行 `close_now`
+（旧的「下一轮 `sync` 观察 progress == 0」路径在真实泵序下不可观察，已删除）。
+
+### 12.5 构建期 SVG 光栅（`base_ui/build.rs`）
+
+| 项 | 规格 |
+|---|---|
+| 依赖 | `crates/base_ui/Cargo.toml` 的 **build-dependencies**：`image` / `resvg` / `usvg`；workspace 钉 **0.46.0**（与 `gpui-pre` 在 `Cargo.lock` 的版本一致，`default-features = false`） |
+| 产物 | `OUT_DIR/icons/<stem>-48.png` / `-96.png`（两档覆盖 1×/2×，3× 有 48→96 的余量）+ `OUT_DIR/icons/built.rs`（`IconKind → 路径` 表） |
+| 图标数 | **55**（`kit::icon::IconKind::COUNT = 55`，`ALL: [IconKind; COUNT]` 穷举；枚举文档明写「设计文档写 54，实际 55」） |
+| 确定性 | 固定缩放算法（resvg 解析 AA）+ 固定档位 + 无时间戳；`white matte`：透明像素 RGB **= 255**（否则引擎「先 resize 后预乘」产生最坏 96/255 暗边；110 PNG 全像素校验 + 暗边探针 0/255） |
+| 文字/品牌 | `Brand` 显式尺寸 = **Contain 等比内嵌 + 居中**（旧文档写「拉伸」是事实错误）；品牌 PNG 走 `image 0.25` + 图集 |
+| 引擎边界 | 引擎**不**依赖 `usvg` / `resvg` / `tiny-skia`；`ResourceCache` 只收 PNG / JPEG / WebP（§8.5） |
+
+### 12.6 `KYTRIX_UI_CORE_MANIFEST` 过渡开关（P5 移除）
+
+| 项 | 规格 |
+|---|---|
+| 现象 | 迁移期 `base_ui` / `widgets/*_ui` 仍依赖 `gpui-pre`，其 `gpui.lib` 也带 `RT_MANIFEST` ID 1 ⇒ 同一 exe 两份清单 ⇒ `link.exe CVT1100: duplicate resource. type:MANIFEST, name:1` |
+| 开关 | `crates/ui_core/build.rs` 读环境变量 `KYTRIX_UI_CORE_MANIFEST`：`"0"` ⇒ **只跳过**进程清单的 rc 编译与链接（其他值/未设置 = 不启用）；清单存在性、DPI 锚点、MSVC 与 rerun 校验**一律照旧**；跳过时打 warning |
+| xtask 注入 | `xtask/src/gates.rs` **按命令**注入（不是按 scope）：按 scope 注入会让 `ui_core` 自己丢清单、125% DPI 用例回归（P2-0b 修复 F0） |
+| 移除计划（**P5**） | 删 `ui_core/build.rs` 的开关分支、`xtask/src/gates.rs` 的 `links_gpui_pre` / `injects_manifest_switch` / `stream_command_with_env`，删 `spec-deltas/build-transition.md`，并用 4 条验证命令确认「默认清单链接存在 + 锚点校验通过」 |
+| 契约 | 这是**迁移期过渡开关**，不是产品能力：终态（P5-2 删除 gpui 系后）**不存在**该环境变量 |
+
+### 12.7 计划修正（P2 期间裁决；权威版本见 `.docs/gui-migration/plan.md` v1.2）
+
+1. **旧 `base_ui` 模块删除 / `gpui-kit` 移除从 P2-5 推迟到 P5**：旧模块仍被 P3/P4 的消费方（`widgets/*`、`*_ui`、`kytrix`）在
+   迁移期引用，**只有等 P3/P4 迁完才能删**。P2-5 不再承担删除，只做 `gallery` 收尾。
+2. **P2-5 = `gallery` + 三端真实验收**：`crates/base_ui/examples/gallery`（ui_core 之上的主题 + 全部组件）作活体证据；
+   Windows 真窗口出帧 + Probe 断言，mac/Linux 离屏；`M3` 随该批达成。
+3. **P2 实际批次比 plan v1.1 多**：新增 `P2-0` / `P2-1b3` / `P2-2e` / `P2-4a3` / `P2-4c2` / `P2-4c3` / `P2-4d1b` / `P2-4d2b`
+   等收尾批（plan v1.2 §3 已补全，§10.2 表同步）。
+4. **E 编号纪律**：E11 = 被 E10 吸收（不单列）；E14（`Dismiss` 前置回调）与 E16（`node_screen_rect` / `anchor_rect`）**未实现**、
+   只登记；**E15 专指 a11y 角色批**，不得再用于其它缺口。
+5. **门禁口径**：引擎批合入后必须同时 `cargo check -p base_ui --all-targets`（教训：E12 的 `OverlayOptions.a11y` 新字段曾让
+   迁移分支 `base_ui` 连续两批不可编译）；手工跑 `ui_core` 测试前必须清除 `KYTRIX_UI_CORE_MANIFEST=0` 残留（否则 frameless
+   DPI 用例假红），门禁统一走 `xtask gates`（per-command 注入）。
+
+### 12.8 文档一致性修正（v2.3 逐条纠正，均有源码依据）
+
+| # | 旧文（v2.2 及更早） | v2.3 更正 | 依据 |
+|---|---|---|---|
+| 1 | 图标数写 **54**（少 1；§1.3 / §5.6 / §8.5） | **55** | `kit/icon.rs` 的 `IconKind::COUNT = 55`、`ALL: [IconKind; 55]`、枚举文档自述「设计文档写 54，实际 55」；资产目录 55 个 SVG |
+| 2 | 角色数写 **32**（§7.4） | **43**（且不得写死个数） | `a11y.rs` 的 `A11yRole::ALL: [Self; 43]`；计数链 32→34→38→43（E9/E12/E15） |
+| 3 | 「`Node` 328 B（硬上限 336 B）」（§11.2） | **`Node` 336 B = 上限，无余量** | `node/tree/tests.rs` 两处 `assert_eq!(size_of::<Node>(), 336)`；E13 的 `paint_opacity: f32` +4 B |
+| 4 | `PaintSpec` 只有单层 `shadow` 字段（§4.9 / 附录草图形） | **`PaintSpec.shadows: Shadows`** + `MAX_SHADOWS = 4` + `ShadowSpec.spread` | `paint/style.rs`：`pub shadows: Shadows`、`pub const MAX_SHADOWS`、`pub struct ShadowSpec{.., spread, ..}` |
+| 5 | `StylePatch.opacity` = 「逐图元 alpha，不作用于 Geometry」（§4.9.2） | **组不透明度**（× 祖先链，作用于引擎图元含 `GeometryDraw.color`，**不**作用于 `Canvas`） | `paint/style.rs` 字段文档 + `node/tree/content.rs` 的折算 + `paint/pass.rs` 的传播 |
+| 6 | 薄 builder「约 26 个方法」（§1.3 / §4.9.5） | **`StyleBuilder` 35 + `PaintBuilder` 6** | `style_builder.rs` 的 `pub fn` 计数 + 文件头注释自述 |
+| 7 | §7.4「浮层 ⇒ `Menu`/`MenuItem`/`Dialog`」 | 浮层包装**默认 `GenericContainer`**，角色由 `OverlayOptions::a11y` 显式声明 | `a11y/mapping.rs`（`overlay_slot ⇒ GenericContainer`）；E12 审查 F1 |
+| 8 | §7.4「`A11yRole` 没有 `StaticText`」等映射缺口 | 补齐 E9/E12/E15 新角色行与集合语义（§7.4 新表） | §11.11 / §11.13 / §11.15 |
+| 9 | `Separator` 的 AccessKit 映射未说明 | 引擎枚举 `Separator` → AccessKit `Role::Splitter`（**引擎无 `Splitter` 变体**） | `a11y/mapping.rs` 注释 + 映射测试 |
+| 10 | 台账/登记稿写 `MenuItemCheckbox` | **`MenuItemCheckBox`**（大写 `B`，AccessKit 0.25 口径） | `a11y.rs` 变体 + 注释「登记文档里写作 `MenuItemCheckbox`」 |
+| 11 | E9 审查稿「`a11y.rs` 注释原写 32 个变体」 | **不成立**：32 的唯一出处是本文档 §7.4 旧文 | `a11y.rs` 全文无该计数的字样；`mig-e9-review.md` §8.3-9 同结论 |
+| 12 | 「迁移期 `ui_core` 的 `[workspace.dependencies]` 没有 `ui_core` 行」（§1.3） | 已补齐（P2-1a） | 根 `Cargo.toml` 的 `[workspace.dependencies]` 含 `ui_core`；`base_ui` 已引用 |
+
+### 12.9 P2 测试与门禁事实（里程碑证据）
+
+| 项 | 数字 / 结论 |
+|---|---|
+| `ui_core --lib`（`--features hud,test-support`） | **2274 passed / 0 failed / 1 ignored**（P2 起点 2151 ⇒ **+123**） |
+| `ui_core --test snapshot` | **11 passed**，42 张 golden（3 平台 × 14）**全程零 diff、零重建** |
+| `base_ui --lib` | **1033 passed**（P2 起点 417 ⇒ **+616**；P2-4c3 时点 990，E15b 后 1033） |
+| 引擎批测试增量（逐批） | E7 19 / E7b +1（2170→2171）· E8 +12（2163）· E9 2159 · E9c +4（2199）· E10 2213→2218 · E12 +7（2202）· E13（golden 零 diff + 像素读回）· E15 2266 → E15b **2274** |
+| 变异测试 | P2 各批审查累计变异 **60+** 项（E7 3/3、E8 6/6、E9 2/2、E9c 2/2、E10 8/8、E12 3/3、E13 8/10、E15 4/4 等，绝大多数红） |
+| 三端 | Windows 本机 fast/层末；macOS / Linux 远端 quick + 层末 layer；`timer_smoke` 三端 PASS（Win +415.79 / mac +404.63 / Linux +400.79 ms） |
+| 里程碑 | **M2（base_ui 地基）达成** = P2-1a + P2-1b；**M3** 随 P2-5 `gallery` 达成 |
+
+### 12.10 残余与 P3 入口
+
+- **应用层残余**（除 §11.8 的引擎残余外）：`kit` 侧的 DPI 换档接线（`IconSpec::reselect` / `set_image_resource` 机制已在，事件接线在 P2-4/P2-5）、
+  图标旋转未迁移、`AssetImages` 单消费者契约、`StyleBuilder`/`PaintBuilder` 的圆角·线宽·字体像素阶梯待视觉基线、
+  `kit` 的 `TAB_MAX_WIDTH` / alert 排版 / join 接缝等 9 条 P3 级项（`.review/mig-p2-4a-review.md` §9.5）。
+- **P3 入口**：见 `.docs/gui-migration/plan.md` v1.2 §3 的 P3 表（P3-1 契约层搬运与签名冻结 → P3-2 `surface`/`placeholder`/`binding` + `empty` 标杆 →
+  P3-3 `widget_registry` + `widget_gallery_ui` → P3-W1…W9 二十个 widget）；规格基线 = 本文 §11（引擎）+ 本章（应用层组件形态与测试装置约定）。
+- **P3 开工前置**：`base_ui` 的 `gallery` 可运行（M3）、`widget` 契约层的 `WidgetCx` / `AnyWidget` 形状定稿、`on_frame` 单槽的使用约定（§11.12）。
+
+---
+
+## 附录 A：核心接口草图汇总（v2.3 起与 `crates/ui_core/src` 对齐）
+
+> 本附录只列**已实现**的公开形状（摘录，不是全量；全量见 §1.3 与源码）。**E1–E15 的公开面同样已实现**，精确规格与签名见 §11
+> （本附录不重复，避免两处签名漂移）；**P2 应用层**的公开形状见 §12。
 
 ```rust
 // ── 应用启动（引擎自有事件循环；D8 检测在 platform_init 内） ──
@@ -3238,6 +3804,43 @@ impl TestApp {
 
 > `ReadCtx::peek` **不在本清单**：它是 `#[cfg(test)]` 的 crate 内测试专用方法（生产构建不存在；`ReadCtx` 对外可用的方法只有 `read` / `read_transient` / `read_derived`）。
 
+```rust
+// ── P2 引擎增量（E7–E15；精确语义见 §11.9–§11.15） ───────────────
+impl NodeBuilder {
+    pub fn image(resource: ResourceId, fit: ImageFit) -> Self;
+    pub fn image_pending(pending: PendingResource, fit: ImageFit) -> Self;
+    pub fn image_modulation(self, modulation: Color) -> Self;
+}
+impl Window {
+    pub fn set_image_resource(&mut self, node: NodeId, resource: ResourceId) -> Result<bool, EngineError>;
+    pub fn scale_epoch(&self) -> u32;
+}
+impl App {
+    pub fn unload_resource(&mut self, id: ResourceId) -> bool;
+    pub fn bind_key_scoped(&mut self, window: WindowId, scope: NodeId, binding: KeyBinding) -> Result<(), EngineError>;
+    pub fn unbind_key_scoped(&mut self, window: WindowId, scope: NodeId, key: KeyCode, modifiers: Modifiers) -> bool;
+    pub fn unbind_scope_keys(&mut self, window: WindowId, scope: NodeId) -> usize;
+    pub fn transient_scoped<T: Clone + 'static>(&mut self, scope: SignalScope, initial: T) -> Transient<T>;
+    pub fn on_animation_complete(&mut self, handler: impl FnMut(&mut App, AnimationCompletion) + 'static);
+    pub fn after(&mut self, window: WindowId, delay: Duration, callback: impl FnOnce(&mut App) + 'static) -> Result<TimerId, EngineError>;
+    pub fn after_scoped(&mut self, window: WindowId, scope: NodeId, delay: Duration, callback: impl FnOnce(&mut App) + 'static) -> Result<TimerId, EngineError>;
+    pub fn cancel_timer(&mut self, id: &TimerId) -> bool;
+    pub fn modal_scope(&self, window: WindowId) -> Option<NodeId>;
+    pub fn set_a11y_patch(&mut self, window: WindowId, node: NodeId, patch: A11yPatch) -> Result<(), EngineError>;
+}
+pub enum A11yRole { /* 43 变体，以 A11yRole::ALL: [Self; 43] 为准（§11.15） */ }
+pub enum A11yOrientation { Horizontal, Vertical }
+pub enum ImageFit { Fill, Contain, Cover }
+pub enum ImageSource { Ready(ResourceId), Pending(PendingResource) }
+pub enum AnimationEndKind { Finished, Cancelled, Replaced, Released }
+pub struct AnimationCompletion { pub id: AnimationId, pub kind: AnimationEndKind }
+pub struct TimerId { /* 私有 */ }
+pub struct ShadowSpec { pub offset: Point, pub blur: f32, pub spread: f32, pub color: Color }
+pub const MAX_SHADOWS: usize = 4;
+pub struct Shadows(/* SmallVec<[ShadowSpec; 2]> */);
+pub struct OverlayOptions { /* …, pub trap_focus: bool, pub a11y: A11yOverride（⇒ 不再是 Copy） */ }
+```
+
 ## 附录 B：`GpuPrimitive` 字节布局（`render/shaders/contract.md` 镜像）
 
 | offset  | size | 字段            | 类型      | 语义                                               |
@@ -3271,4 +3874,4 @@ impl TestApp {
 > 坐标全为**绝对窗口逻辑像素**（`GeometryDraw.transform` 是唯一 per-primitive 变换）；`Primitive` 实测 `size_of == 80` B（软上限 128 B）。
 ---
 
-*文档完 · 本文描述 D1–D25 定案下的最终设计（v2.2）；已实现部分与 `crates/ui_core/src` 对齐，E1–E6（§11）已全部实现；E2b 候选（§11.2）与已接受残余（§11.8）明确标注为未实现/限制，不得当作已交付能力。*
+*文档完 · 本文描述 D1–D25 定案下的最终设计（**v2.3**，2026-11-21）；已实现部分与 `crates/ui_core/src` 对齐，**E1–E15（§11）已全部实现**，**P2 应用层（§12）已实现**（P2-5 `gallery` 收尾）；E2b 候选（§11.2）与已接受残余（§11.8）明确标注为未实现/限制，不得当作已交付能力。*
