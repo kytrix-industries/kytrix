@@ -17,6 +17,7 @@ pub mod icon;
 pub mod input;
 pub mod interactive;
 pub mod join;
+pub mod kit;
 pub mod layer;
 pub mod markdown;
 pub mod menu;

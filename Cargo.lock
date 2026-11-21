@@ -916,17 +916,22 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 name = "base_ui"
 version = "0.0.3"
 dependencies = [
+ "ahash",
+ "bytes",
  "color",
  "comrak",
  "either",
  "gpui-kit",
  "i18n",
  "image",
+ "resvg 0.46.0",
  "rust-embed",
  "smallvec",
  "smol_str",
  "taffy",
+ "tokio",
  "ui_core",
+ "usvg 0.46.0",
 ]
 
 [[package]]
