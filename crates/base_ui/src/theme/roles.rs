@@ -5,8 +5,14 @@
 //! 画布。旧实现把 58 条对比度地板写成表（设计规格即测试），这里原样保留：**调色板读不出来就是
 //! debug 构建加载主题时失败**，而不是等到截图。
 //!
-//! 与旧实现的唯一数学差异：对比度在**线性亮度**上算（引擎的合成空间），半透明前景也在线性空间
-//! 合成；旧的 gpui 路径在 sRGB 编码空间合成。58 条地板的底色/前景都不透明，因此数值逐位相同。
+//! 与旧实现的两处已登记数学差异：
+//!
+//! - **对比度**在**线性亮度**上算（引擎的合成空间），半透明前景也在线性空间合成；旧的 gpui 路径
+//!   在 sRGB 编码空间合成。58 条地板的底色/前景都不透明，因此**地板值（角色对与下限）逐条相同**；
+//!   参与越界色（8 对）的少数地板，比值因 gamut mapping 有 <0.25 的微小差（见 `resolved.rs` 与
+//!   `spec-deltas/theme.md` §3/§4）。
+//! - **越界色渲染**：旧实现逐通道 clamp、引擎做 CSS Color 4 chroma 二分，8 对角色 × 外观的 8 位
+//!   sRGB 不同（最大 15/255）。用户裁决以引擎映射为准；golden 表在 `resolved.rs`。
 
 use ui_core::paint::color::Color;
 
@@ -321,6 +327,85 @@ mod tests {
         }
     }
 
+    /// 地板表本身：58 条、每组都有覆盖。截断/改序会被这条挡住。
+    #[test]
+    fn the_contrast_floor_table_covers_fifty_eight_pairs() {
+        use std::collections::HashSet;
+
+        let roles = resolve_roles(&Palette::light());
+        let floors = roles.contrast_floors();
+        assert_eq!(floors.len(), 58, "旧实现的 58 条对比度地板必须逐条保留");
+
+        let foregrounds: HashSet<_> = floors
+            .iter()
+            .map(|(foreground, _, _)| *foreground)
+            .collect();
+        let backgrounds: HashSet<_> = floors
+            .iter()
+            .map(|(_, background, _)| *background)
+            .collect();
+        // 五个状态色、六个图表系列、行情与品牌这些「必须被读」的前景都在表里。
+        for role in [
+            Role::StatusDangerBase,
+            Role::StatusWarningBase,
+            Role::StatusSuccessBase,
+            Role::StatusInfoBase,
+            Role::StatusElevatedBase,
+            Role::ChartSeries0,
+            Role::ChartSeries1,
+            Role::ChartSeries2,
+            Role::ChartSeries3,
+            Role::ChartSeries4,
+            Role::ChartSeries5,
+            Role::MarketUp,
+            Role::MarketDown,
+            Role::BrandBase,
+            Role::FgDefault,
+            Role::FgMuted,
+        ] {
+            assert!(
+                foregrounds.contains(&role),
+                "{} 必须出现在地板前景里",
+                role.name()
+            );
+        }
+        for role in [
+            Role::SurfaceCanvas,
+            Role::SurfaceRaised,
+            Role::SurfaceSunken,
+            Role::SurfaceOverlay,
+            Role::SurfaceControl,
+            Role::SurfaceInverse,
+        ] {
+            assert!(
+                backgrounds.contains(&role),
+                "{} 必须出现在地板背景里",
+                role.name()
+            );
+        }
+        assert!(backgrounds.contains(&Role::ChartMapLand));
+        assert!(backgrounds.contains(&Role::ChartMapOcean));
+    }
+
+    /// debug 期检查的守护：地板不达标时**加载主题就会失败**。
+    ///
+    /// `assert_contrast_floors` 是 `debug_assert!`，它的失败会 panic；如果实现被删空（或
+    /// `resolve_roles` 不再调用它），本测试会红——这正是审查 F3-1 的覆盖缺口。
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_palette_that_breaks_a_floor_is_rejected_when_the_theme_loads() {
+        let mut broken = Palette::light();
+        // 正文提到近白：`fg.default on surface.canvas >= 12.0` 不可能成立。
+        broken.text = ui_core::paint::color::Color::oklch(0.9, 0.0, 0.0, 1.0);
+
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| resolve_roles(&broken)));
+        assert!(
+            result.is_err(),
+            "debug 构建必须在 `resolve_roles` 里断言对比度地板（空实现 = 审查 F3-1 回归）"
+        );
+    }
+
     /// A2：两种外观里表面都按 `raised → canvas → sunken` 堆叠（旧灰阶在一个表里向下一步、在另一
     /// 个表里向上一步，正是这条要挡住的）。
     #[test]
@@ -566,9 +651,9 @@ mod tests {
 
     /// 旧测试的移植：浅色外观画 CMC 自己的五个颜色，深色外观只抬两端。
     ///
-    /// 这里断言的是**引擎解析后的 8 位 sRGB**。旧实现用「逐通道 clamp」，引擎用 CSS Color 4 的
-    /// chroma 二分；越界色因此可能相差一两个 8 位步——这正是 P2-1a 要量出来的差异（spec-delta
-    /// `theme.md` 记录实测偏差），因此断言给每个通道 ±2 的容差并打印实际值。
+    /// 这里比较的是**作者写下的调色板色值**（硬编码 golden），不是旧实现的渲染值：恐慌贪婪五色
+    /// 实测都在 sRGB 色域内（旧/新 8 位差 0），因此本测试与 gamut mapping 无关；越界色的引擎映射
+    /// 基线在 `resolved.rs` 的 8 组 golden 里（`spec-deltas/theme.md` §3）。
     #[test]
     fn the_fear_greed_scale_paints_its_authored_colors() {
         let cases: [(Appearance, Role, [u8; 3]); 8] = [

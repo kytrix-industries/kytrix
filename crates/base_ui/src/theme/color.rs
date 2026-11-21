@@ -107,6 +107,11 @@ pub(crate) fn black_with_alpha(alpha: f32) -> Color {
 ///
 /// 用在「底色已知且不透明」的组件配方上（tonal 按钮的 hover 洗色）：配方在主题加载时把结果算成
 /// 一个颜色，运行期只有一种颜色要过渡。返回非预乘的线性颜色。
+///
+/// **合成空间是用户裁决的视觉基线**：旧实现（`Hsla::blend` → sRGB 编码通道混合）与这里只对
+/// 半透明洗色的结果不同；对 tonal 的四个不透明填充，8 位 sRGB 差是 Light hover 7、Light active
+/// 12、Dark hover 34、Dark active 43（/255，逐通道最大）。差异表与 golden 在
+/// `theme/components.rs` 的测试里，登记在 `spec-deltas/theme.md` §6；M2 视觉基准确认这一条。
 pub(crate) fn over(base: Color, veil: Color) -> Color {
     let resolver = ColorResolver;
     let base = resolver.resolve(base).components;
@@ -286,6 +291,58 @@ mod tests {
         assert!(
             oklch_components(composited)[0] < oklch_components(base)[0],
             "黑色 veil 必须把底色压暗"
+        );
+    }
+
+    /// `over` 的合成空间就是引擎的：线性预乘里的 source-over，不是「先编码成 sRGB 再加权」。
+    ///
+    /// 两种算法对半透明洗色的结果不同（线性合成在 sRGB 编码里更亮），这是 P2-1a 用户裁决接受的
+    /// 视觉变化；本测试把它钉在**算法**这一层，和主题数据无关——把 `over` 改回 sRGB 混合就会红。
+    #[test]
+    fn a_veil_over_an_opaque_base_is_source_over_in_linear_space() {
+        let resolver = ColorResolver;
+        let base = Color::srgb(0.2, 0.3, 0.4, 1.0);
+        let veil = Color::srgb(0.9, 0.9, 0.9, 0.25);
+        let base_linear = resolver.resolve(base).components;
+        let veil_linear = resolver.resolve(veil).components;
+        let alpha = veil_linear[3];
+
+        let composited = resolver.resolve(over(base, veil)).components;
+        for channel in 0..3 {
+            let expected = veil_linear[channel] + base_linear[channel] * (1.0 - alpha);
+            assert!(
+                (composited[channel] - expected).abs() < 1e-6,
+                "线性 source-over：通道 {channel} 期望 {expected}，实际 {}",
+                composited[channel]
+            );
+        }
+
+        // 同一对颜色在**旧的** sRGB 编码空间混合是 [96, 115, 134]；线性空间是 [130, 137, 148]。
+        // 这一行就是用户裁决的差异在算法层的最小复现（主题里的差异表见 `theme/components.rs`）。
+        let old_srgb_blend = |channel: usize| {
+            let encode = |linear: f32| {
+                if linear <= 0.003_130_8 {
+                    linear * 12.92
+                } else {
+                    1.055 * linear.powf(1.0 / 2.4) - 0.055
+                }
+            };
+            let base_encoded = encode(base_linear[channel]);
+            let veil_encoded = encode(veil_linear[channel] / alpha);
+            (base_encoded * (1.0 - alpha) + veil_encoded * alpha) * 255.0
+        };
+        let new_srgb8 = to_srgb8(over(base, veil));
+        for (channel, actual) in new_srgb8.iter().take(3).enumerate() {
+            let old = old_srgb_blend(channel).round();
+            assert!(
+                f32::from(*actual) > old + 5.0,
+                "线性合成必须明显比旧的 sRGB 混合亮：通道 {channel} 新 {actual} vs 旧 {old}"
+            );
+        }
+        assert_eq!(
+            [new_srgb8[0], new_srgb8[1], new_srgb8[2]],
+            [130, 137, 148],
+            "线性空间 source-over 的逐值基线"
         );
     }
 

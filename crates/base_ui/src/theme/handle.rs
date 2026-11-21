@@ -5,6 +5,12 @@
 //! 主题的节点**（设计 §3.4 / §4.9.4 的 I6/I17 验收面）。没有读主题的节点（静态绘制、只读其它信号
 //! 的节点）不会被写信号触达，也不会产生一帧。
 //!
+//! **失效语义（引擎事实，不是"值变才重绘"）**：写信号时 `ui_core` 的 `invalidate` 直接给每个视觉
+//! 读者标 `BIND` + `PAINT`（`StylePatch::affects_layout` 时是 `BIND` + `LAYOUT`），不等
+//! `bind_style`/`bind_text` 求值后的差分。求值只决定补丁/文本是否真的替换；一个始终返回同一值的
+//! 主题读者在切换外观后**仍会**被标脏并进帧（`a_reader_with_constant_output_is_still_invalidated`
+//! 记录了这一点）。"输出不变则不重绘"若成为产品要求，属于引擎 P2-0/P2-4 的差分优化，不在本批。
+//!
 //! 两套 [`Theme`] 在构造时各解析一次；切换只写信号、不重算主题。句柄 `Clone` 是 `Rc` 浅拷贝（每个
 //! `bind_style`/`bind_text` 闭包持有一份），所以节点侧的 clone 不复制两套主题数据。
 //!
@@ -287,6 +293,66 @@ mod tests {
         assert_eq!(
             static_quad.fill.components,
             ColorResolver.resolve(Color::WHITE).components
+        );
+    }
+
+    /// 输出恒定的主题读者在切换外观后**仍会**被标脏：引擎在写信号时就标 `PAINT`，不做输出差分。
+    ///
+    /// 这是审查 F2-1（P2）要求固定的真实行为：不是"值变才重绘"，而是"读过就重算"。这里断言的
+    /// 是节点的失效状态与帧的产出；画出的像素不变（补丁等值）。
+    #[test]
+    fn a_reader_with_constant_output_is_still_invalidated() {
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let handle = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let root = app.app().window(window).expect("窗口").tree().root();
+        let constant = Color::WHITE;
+
+        let reader = {
+            let theme = handle.clone();
+            NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, 0.0, 20.0, 20.0))
+                .paint(PaintSpec {
+                    background: constant,
+                    ..PaintSpec::default()
+                })
+                .bind_style(move |cx| {
+                    // 读主题 → 登记依赖，但输出与外观无关（永远同一个值）。
+                    let _ = theme.appearance(cx);
+
+                    StylePatch {
+                        background: Some(constant),
+                        ..StylePatch::default()
+                    }
+                })
+                .build(
+                    app.app_mut().window_mut(window).expect("窗口").tree_mut(),
+                    root,
+                )
+                .expect("恒定输出读者")
+        };
+        let _ = app.drain().expect("首帧").clone();
+
+        assert!(handle.set_appearance(app.app_mut(), Appearance::Dark));
+        let record = app.drain().expect("切深色").clone();
+
+        assert!(
+            record.dirty_nodes.contains(&reader),
+            "读过主题的节点在写信号时就被标脏，与输出是否变化无关：{:?}",
+            record.dirty_nodes
+        );
+        let quad = record
+            .frame
+            .as_ref()
+            .expect("已提交")
+            .quads
+            .iter()
+            .find(|quad| quad.node == reader)
+            .expect("恒定输出读者的图元");
+        assert_eq!(
+            quad.fill.components,
+            ColorResolver.resolve(constant).components,
+            "输出不变：画出的填充仍是同一个值"
         );
     }
 

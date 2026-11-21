@@ -170,44 +170,30 @@ mod tests {
         }
     }
 
-    /// 每个角色与旧调色板解析出的 8 位 sRGB 对齐（抽样 24 个高频角色）。
+    /// 全 128 对（64 角色 × 2 外观）与旧实现 8 位 sRGB 的逐值对照。
     ///
-    /// 见 `palette.rs` 的逐字段数值对齐与 `roles.rs` 的引擎解析断言；这里验证**整条链路**（新调色板
-    /// → 角色解析 → 引擎 `ColorResolver` → 8 位 sRGB）与旧实现的 sRGB 输出一致。容差说明：
-    /// 8 位舍入 ±1；越界色（旧实现逐通道 clamp、引擎做 CSS Color 4 chroma 二分）单独跳过并由
-    /// `roles.rs` 的权限测试覆盖。
+    /// 差异只有一个来源：旧实现逐通道 clamp、引擎做 CSS Color 4 chroma 二分。实测**只有 8 对越界色**
+    /// 受影响（其余 120 对逐位相同），本测试把「只有这 8 对」这个事实钉住：多一对、少一对、或
+    /// in-gamut 角色被改色，都会红。8 对的具体差异由下一个测试锁定，越界映射的裁决见
+    /// `spec-deltas/theme.md` §3（用户裁决：以引擎映射为准）。
     #[test]
-    fn sampled_roles_match_the_old_style_srgb_output() {
+    fn every_role_is_compared_with_the_old_style_srgb_output() {
         use crate::style::{palette::Palette as OldPalette, roles::Roles as OldRoles};
 
-        let sampled = [
-            Role::SurfaceCanvas,
-            Role::SurfaceRaised,
-            Role::SurfaceSunken,
-            Role::SurfaceOverlay,
-            Role::SurfaceControl,
-            Role::SurfaceInverse,
-            Role::LineDivider,
-            Role::LineBorder,
-            Role::LineStrong,
-            Role::LineFocus,
-            Role::FgDefault,
-            Role::FgMuted,
-            Role::FgSubtle,
-            Role::FgDisabled,
-            Role::FgOnBrand,
-            Role::FgOnInverse,
-            Role::BrandBase,
-            Role::BrandHover,
-            Role::BrandActive,
-            Role::StatusDangerBase,
-            Role::StatusWarningBase,
-            Role::StatusSuccessBase,
-            Role::StatusInfoBase,
-            Role::StatusElevatedBase,
+        // 实测越界清单（角色 × 外观）；顺序与枚举顺序一致，便于阅读。
+        let expected_out_of_gamut = [
+            (Appearance::Light, Role::LineFocus),
+            (Appearance::Light, Role::BrandBase),
+            (Appearance::Light, Role::BrandHover),
+            (Appearance::Light, Role::BrandActive),
+            (Appearance::Light, Role::StatusWarningBase),
+            (Appearance::Light, Role::ChartSeries2),
+            (Appearance::Light, Role::ChartSeries4),
+            (Appearance::Dark, Role::BrandActive),
         ];
 
-        let mut in_gamut = 0;
+        let mut compared = 0;
+        let mut found_out_of_gamut = Vec::with_capacity(expected_out_of_gamut.len());
         for (appearance, old_palette) in [
             (Appearance::Light, OldPalette::light()),
             (Appearance::Dark, OldPalette::dark()),
@@ -215,32 +201,136 @@ mod tests {
             let theme = Theme::of(appearance);
             let old = OldRoles::resolve(&old_palette);
 
-            for role in sampled {
-                let old_color = old_color(&old, role);
-                let Some(expected) = old_srgb8(old_color) else {
-                    // 旧实现的逐通道 clamp 与引擎的 chroma 二分对越界色给出不同结果：这类颜色由
-                    // `roles.rs` 的引擎解析测试覆盖，不参与逐 8 位对齐。
-                    continue;
-                };
-                in_gamut += 1;
-                let actual = crate::theme::color::to_srgb8(theme.role(role));
+            for role in Role::ALL {
+                let (out_of_gamut, old_color) = old_srgb8(old_color(&old, role));
+                compared += 1;
 
+                if out_of_gamut {
+                    found_out_of_gamut.push((appearance, role));
+                    continue;
+                }
+
+                let actual = crate::theme::color::to_srgb8(theme.role(role));
                 for channel in 0..3 {
-                    let difference = i32::from(actual[channel]) - i32::from(expected[channel]);
+                    let difference = i32::from(actual[channel]) - i32::from(old_color[channel]);
                     assert!(
                         difference.abs() <= 1,
-                        "{appearance:?} {} 通道 {channel}: 新 {} vs 旧 {}",
+                        "{appearance:?} {} 通道 {channel}: 新 {} vs 旧 {}（in-gamut 角色只允许 8 位舍入）",
                         role.name(),
                         actual[channel],
-                        expected[channel]
+                        old_color[channel]
                     );
                 }
             }
         }
 
-        assert!(
-            in_gamut >= 40,
-            "至少要有 40 个（角色 × 外观）落在 sRGB 色域内参与对齐，实际 {in_gamut}"
+        assert_eq!(compared, 128, "64 角色 × 2 外观");
+        assert_eq!(
+            found_out_of_gamut, expected_out_of_gamut,
+            "越界色集合是登记事实：只允许这 8 对（spec-deltas/theme.md §3）"
+        );
+    }
+
+    /// 8 对越界色的新基线：引擎 gamut mapping 的 8 位 sRGB，与旧实现逐通道 clamp 的差异。
+    ///
+    /// 用户裁决：以引擎映射为准，不改调色板源值、不在应用层 clamp。这张表同时锁旧值与新值，
+    /// 任何一侧改动（调色板、引擎解析器、旧实现）都必须重新做 M2 视觉确认。
+    #[test]
+    fn the_eight_out_of_gamut_roles_are_locked_to_the_engine_gamut_mapping() {
+        use crate::style::{palette::Palette as OldPalette, roles::Roles as OldRoles};
+
+        // (外观, 角色, 旧逐通道 clamp, 引擎 gamut mapping)。
+        let cases: [(Appearance, Role, [u8; 3], [u8; 3]); 8] = [
+            (
+                Appearance::Light,
+                Role::LineFocus,
+                [0, 109, 189],
+                [0, 109, 187],
+            ),
+            (
+                Appearance::Light,
+                Role::BrandBase,
+                [0, 109, 189],
+                [0, 109, 187],
+            ),
+            (
+                Appearance::Light,
+                Role::BrandHover,
+                [0, 95, 175],
+                [0, 96, 166],
+            ),
+            (
+                Appearance::Light,
+                Role::BrandActive,
+                [0, 86, 165],
+                [0, 88, 152],
+            ),
+            (
+                Appearance::Light,
+                Role::StatusWarningBase,
+                [150, 101, 0],
+                [150, 101, 0],
+            ),
+            (
+                Appearance::Light,
+                Role::ChartSeries2,
+                [0, 139, 139],
+                [0, 134, 133],
+            ),
+            (
+                Appearance::Light,
+                Role::ChartSeries4,
+                [102, 121, 0],
+                [102, 121, 0],
+            ),
+            (
+                Appearance::Dark,
+                Role::BrandActive,
+                [105, 198, 255],
+                [120, 198, 255],
+            ),
+        ];
+
+        let mut worst_difference = 0;
+        for (appearance, role, old_expected, new_expected) in cases {
+            let theme = Theme::of(appearance);
+            let new = crate::theme::color::to_srgb8(theme.role(role));
+            assert_eq!(
+                [new[0], new[1], new[2]],
+                new_expected,
+                "{appearance:?} {} 的引擎 gamut mapping 基线",
+                role.name()
+            );
+
+            // 旧值从旧实现现场计算：登记表不是抄来的常数，旧实现改了也会红。
+            let old_palette = match appearance {
+                Appearance::Light => OldPalette::light(),
+                Appearance::Dark => OldPalette::dark(),
+            };
+            let old_roles = OldRoles::resolve(&old_palette);
+            let (out_of_gamut, old) = old_srgb8(old_color(&old_roles, role));
+            assert!(out_of_gamut, "{appearance:?} {} 必须是越界色", role.name());
+            assert_eq!(
+                [old[0], old[1], old[2]],
+                old_expected,
+                "{appearance:?} {} 的旧逐通道 clamp 值",
+                role.name()
+            );
+
+            for channel in 0..3 {
+                let difference = i32::from(new[channel]) - i32::from(old[channel]);
+                worst_difference = worst_difference.max(difference.abs());
+                assert!(
+                    difference.abs() <= 15,
+                    "{appearance:?} {} 通道 {channel}: 差异 {difference} 超过登记的 15/255",
+                    role.name()
+                );
+            }
+        }
+
+        assert_eq!(
+            worst_difference, 15,
+            "登记的最大差是 Dark brand.active 的 15/255；上限变化必须同步台账"
         );
     }
 
@@ -333,8 +423,11 @@ mod tests {
         }
     }
 
-    /// 旧颜色的 8 位 sRGB；越出 sRGB 色域（旧实现会逐通道 clamp 掉）时返回 `None`。
-    fn old_srgb8(color: crate::style::color::ResolvedColor) -> Option<[u8; 4]> {
+    /// 旧颜色的 8 位 sRGB，以及它是否越出 sRGB 色域。
+    ///
+    /// 越界标志用**未 clamp** 的 OKLCH → sRGB 转换判定；返回的 8 位值则是旧实现真正画出来的像素
+    /// （旧 `Oklch::hsla()` 逐通道 clamp 后转 HSL，`Rgba::from` 再回到 sRGB 编码空间）。
+    fn old_srgb8(color: crate::style::color::ResolvedColor) -> (bool, [u8; 4]) {
         use color::{ColorSpaceTag, DynamicColor, Flags};
         use gpui_kit::Rgba;
 
@@ -354,17 +447,17 @@ mod tests {
         let out_of_gamut = srgb[..3]
             .iter()
             .any(|channel| !(-1e-4..=1.0 + 1e-4).contains(channel));
-        if out_of_gamut {
-            return None;
-        }
 
         let rgba = Rgba::from(color.hsla);
 
-        Some([
-            (rgba.r.clamp(0.0, 1.0) * 255.0).round() as u8,
-            (rgba.g.clamp(0.0, 1.0) * 255.0).round() as u8,
-            (rgba.b.clamp(0.0, 1.0) * 255.0).round() as u8,
-            (rgba.a.clamp(0.0, 1.0) * 255.0).round() as u8,
-        ])
+        (
+            out_of_gamut,
+            [
+                (rgba.r.clamp(0.0, 1.0) * 255.0).round() as u8,
+                (rgba.g.clamp(0.0, 1.0) * 255.0).round() as u8,
+                (rgba.b.clamp(0.0, 1.0) * 255.0).round() as u8,
+                (rgba.a.clamp(0.0, 1.0) * 255.0).round() as u8,
+            ],
+        )
     }
 }

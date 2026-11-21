@@ -1,8 +1,14 @@
 //! 组件侧：控件被画成什么（颜色配方）与组件度量 token。
 //!
-//! 这是旧 `style/components.rs` 的完整移植：一个配方是一个角色或一小组合角色合成出一个控件需要
+//! 这是旧 `style/components.rs` 的移植：一个配方是一个角色或一小组合角色合成出一个控件需要
 //! 的颜色——按钮每种状态的填充/文字/边缘、输入框的字段与边、菜单的表面、对话框的阴影——在主题加
 //! 载时解析一次，组件读字段而不是现场合成。
+//!
+//! **唯一有意的颜色差异**是 tonal 的 hover/active 填充：旧实现把洗色合成在 sRGB 编码空间
+//! （`Hsla::blend` → 通道加权），新实现合成在引擎的线性预乘空间（[`over`]，§5.8.4）。8 位 sRGB
+//! 差是 Light hover 7、Light active 12、Dark hover 34、Dark active 43（/255）；这是用户裁决的
+//! 新视觉基线（保持引擎空间），逐值 golden 与旧/新差异表在本模块测试里，登记在
+//! `spec-deltas/theme.md` §6，M2 视觉基线需确认。其余颜色（含 tonal 的文字/边缘）逐值相同。
 //!
 //! 除颜色外，本模块还给出一套**组件度量 token**（`ComponentTokens`）：控件高度、间距、水平内边
 //! 距、字号、图标尺寸、边框线宽、动画 tick、阴影与滚动条 alpha。这些值此前散落在 `size.rs`、
@@ -102,7 +108,13 @@ pub struct ComponentTokens {
     pub medium: SizeTokens,
     /// 大号尺寸。
     pub large: SizeTokens,
-    /// 控件的边框线宽（逻辑像素；绘制宽度，不参与布局）。
+    /// 控件的边框线宽（逻辑像素）。
+    ///
+    /// 旧 `.border_1()` 同时做两件事：让边框参与布局（`border_widths` 挤占盒子）、并画一条线。
+    /// 新引擎把两者拆开——布局占位走 [`StyleBuilder::border`](crate::style_builder::StyleBuilder::border)
+    /// （`Style.inner.border`），画线走
+    /// [`PaintBuilder::border`](crate::style_builder::PaintBuilder::border)（`PaintSpec.border`）；
+    /// P2-4 迁移旧控件时用同一个 token 值成对写两处。
     pub border_width: f32,
     /// 动画的一帧时长（旧 `animation.rs::ANIMATION_TICK`）。
     pub animation_tick: Duration,
@@ -616,9 +628,10 @@ impl ChartColors {
 
 #[cfg(test)]
 mod tests {
-    use super::{ComponentTokens, ControlSize, InteractiveVariant, SizeTokens};
+    use super::{ComponentTokens, ControlSize, InteractiveVariant};
     use crate::theme::{
-        color::contrast, palette::Palette, resolved::Theme, role::Role, roles::resolve_roles,
+        appearance::Appearance, color::contrast, palette::Palette, resolved::Theme, role::Role,
+        roles::resolve_roles,
     };
 
     /// 旧测试的移植：指向中的滚动条拇指在它所在的表面上必须比静止的拇指更醒目（比 alpha 或未合
@@ -765,46 +778,224 @@ mod tests {
         );
     }
 
-    /// token 阶梯的数值与旧 `size.rs::UnifiedSize` 对齐（20/30/40 高、4/6/8 间隙、4/6/10 内边距、
-    /// 12/14/18 字号、8/12/16 图标）。
+    /// tonal 四种状态的三块颜色在两种外观下的新基线（引擎线性合成）逐值锁定。
+    ///
+    /// 用户裁决：tonal 洗色采用引擎的线性预乘合成空间（保持当前实现），接受视觉变化。因此这份
+    /// 8 位 sRGB 表是**新的**视觉基线；旧实现的 sRGB 编码空间差异由下一个测试登记，M2 视觉基线
+    /// 要按这两张表确认（spec-delta `theme.md` §6）。
+    #[test]
+    fn the_tonal_palette_is_locked_to_the_engine_linear_composite() {
+        // (外观, 状态, 背景, 文字, 边缘) 的 8 位 sRGB。
+        let cases: [(Appearance, &str, [u8; 3], [u8; 3], [u8; 3]); 8] = [
+            (
+                Appearance::Light,
+                "normal",
+                [255, 255, 255],
+                [29, 31, 46],
+                [140, 142, 150],
+            ),
+            (
+                Appearance::Light,
+                "hover",
+                [248, 248, 248],
+                [29, 31, 46],
+                [87, 89, 101],
+            ),
+            (
+                Appearance::Light,
+                "active",
+                [244, 244, 244],
+                [29, 31, 46],
+                [87, 89, 101],
+            ),
+            (
+                Appearance::Light,
+                "disabled",
+                [255, 255, 255],
+                [156, 158, 165],
+                [189, 190, 195],
+            ),
+            (
+                Appearance::Dark,
+                "normal",
+                [27, 33, 40],
+                [235, 241, 248],
+                [107, 114, 121],
+            ),
+            (
+                Appearance::Dark,
+                "hover",
+                [78, 82, 87],
+                [235, 241, 248],
+                [129, 135, 143],
+            ),
+            (
+                Appearance::Dark,
+                "active",
+                [99, 103, 108],
+                [235, 241, 248],
+                [129, 135, 143],
+            ),
+            (
+                Appearance::Dark,
+                "disabled",
+                [27, 33, 40],
+                [93, 99, 106],
+                [72, 78, 86],
+            ),
+        ];
+
+        for (appearance, state, background, foreground, border) in cases {
+            let tonal = Theme::of(appearance).components().interactive.tonal;
+            let colors = match state {
+                "normal" => tonal.normal,
+                "hover" => tonal.hover,
+                "active" => tonal.active,
+                "disabled" => tonal.disabled,
+                other => panic!("未知状态 {other}"),
+            };
+
+            for (field, color, expected) in [
+                ("background", colors.background, background),
+                ("foreground", colors.foreground, foreground),
+                ("border", colors.border, border),
+            ] {
+                let actual = crate::theme::color::to_srgb8(color);
+                assert_eq!(
+                    [actual[0], actual[1], actual[2]],
+                    expected,
+                    "{appearance:?} tonal {state}.{field} 的引擎线性合成基线"
+                );
+            }
+        }
+    }
+
+    /// 旧（sRGB 编码空间混合）与新（引擎线性预乘合成）tonal 洗色的逐值差异表。
+    ///
+    /// 这张表就是 P2-1a 审查 F1-2 的登记：用户裁决保留线性合成，因此差异是**已知且被接受的
+    /// 视觉变化**，不是移植缺陷。表里同时锁旧值（从旧实现现场计算）与新值，任一侧改动都会红。
+    #[test]
+    fn the_tonal_washes_register_the_old_srgb_versus_new_linear_difference() {
+        // (外观, 状态, 旧 [u8;3], 新 [u8;3], 逐通道差)。
+        let cases: [(Appearance, &str, [u8; 3], [u8; 3], [i32; 3]); 4] = [
+            (
+                Appearance::Light,
+                "hover",
+                [241, 242, 242],
+                [248, 248, 248],
+                [7, 6, 6],
+            ),
+            (
+                Appearance::Light,
+                "active",
+                [232, 233, 234],
+                [244, 244, 244],
+                [12, 11, 10],
+            ),
+            (
+                Appearance::Dark,
+                "hover",
+                [44, 50, 57],
+                [78, 82, 87],
+                [34, 32, 30],
+            ),
+            (
+                Appearance::Dark,
+                "active",
+                [56, 62, 69],
+                [99, 103, 108],
+                [43, 41, 39],
+            ),
+        ];
+
+        for (appearance, state, old_expected, new_expected, registered) in cases {
+            let theme = Theme::of(appearance);
+            let old_washes = old_tonal_washes(appearance);
+            let new_washes = theme.components().interactive.tonal;
+            let (old_color, new_color) = match state {
+                "hover" => (old_washes.hover.background, new_washes.hover.background),
+                "active" => (old_washes.active.background, new_washes.active.background),
+                other => panic!("未知状态 {other}"),
+            };
+
+            let old = old_srgb8(old_color);
+            let new = crate::theme::color::to_srgb8(new_color);
+            assert_eq!(
+                [old[0], old[1], old[2]],
+                old_expected,
+                "{appearance:?} tonal {state} 的旧 sRGB 合成值（登记表）"
+            );
+            assert_eq!(
+                [new[0], new[1], new[2]],
+                new_expected,
+                "{appearance:?} tonal {state} 的新线性合成值"
+            );
+            let delta = [
+                i32::from(new[0]) - i32::from(old[0]),
+                i32::from(new[1]) - i32::from(old[1]),
+                i32::from(new[2]) - i32::from(old[2]),
+            ];
+            assert_eq!(delta, registered, "{appearance:?} tonal {state} 的登记差异");
+        }
+    }
+
+    /// 旧 `style/components.rs` 的 tonal 配方（sRGB 编码空间合成）。
+    fn old_tonal_washes(
+        appearance: Appearance,
+    ) -> crate::style::components::InteractiveStateColors {
+        use crate::style::{
+            components::ComponentColors, palette::Palette as OldPalette, roles::Roles,
+        };
+
+        let palette = match appearance {
+            Appearance::Light => OldPalette::light(),
+            Appearance::Dark => OldPalette::dark(),
+        };
+
+        ComponentColors::resolve(&Roles::resolve(&palette))
+            .interactive
+            .tonal
+    }
+
+    /// 旧 `ResolvedColor` 的 8 位 sRGB（旧实现渲染的像素）。
+    fn old_srgb8(color: crate::style::color::ResolvedColor) -> [u8; 4] {
+        let rgba = gpui_kit::Rgba::from(color.hsla);
+
+        [
+            (rgba.r.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (rgba.g.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (rgba.b.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (rgba.a.clamp(0.0, 1.0) * 255.0).round() as u8,
+        ]
+    }
+
+    /// token 阶梯的数值必须与旧 `size.rs::UnifiedSize` 现场对齐（20/30/40 高、4/6/8 间隙、
+    /// 4/6/10 内边距、12/14/18 字号、8/12/16 图标）。
+    ///
+    /// 旧值从 `crate::size` 读，而不是抄一份硬编码期望：P2-5 删旧模块之前，旧值一改这里就会红。
     #[test]
     fn the_size_token_ladder_matches_the_old_unified_size() {
-        let tokens = ComponentTokens::standard();
+        use crate::size::UnifiedSize;
 
-        for (size, expected) in [
-            (
-                ControlSize::Small,
-                SizeTokens {
-                    height: 20.0,
-                    gap: 4.0,
-                    padding_x: 4.0,
-                    font_size: 12.0,
-                    icon_size: 8.0,
-                },
-            ),
-            (
-                ControlSize::Medium,
-                SizeTokens {
-                    height: 30.0,
-                    gap: 6.0,
-                    padding_x: 6.0,
-                    font_size: 14.0,
-                    icon_size: 12.0,
-                },
-            ),
-            (
-                ControlSize::Large,
-                SizeTokens {
-                    height: 40.0,
-                    gap: 8.0,
-                    padding_x: 10.0,
-                    font_size: 18.0,
-                    icon_size: 16.0,
-                },
-            ),
+        /// 旧 gpui 的 `Rems` 在布局里按 16 px 根字号换算。
+        const ROOT_FONT_SIZE: f32 = 16.0;
+
+        let tokens = ComponentTokens::standard();
+        for (size, old) in [
+            (ControlSize::Small, UnifiedSize::Small),
+            (ControlSize::Medium, UnifiedSize::Medium),
+            (ControlSize::Large, UnifiedSize::Large),
         ] {
-            assert_eq!(tokens.for_size(size), expected);
-            assert_eq!(tokens.for_size(size), expected, "纯函数，重复读取不变");
+            let token = tokens.for_size(size);
+            assert_eq!(token.height, f32::from(old.h()), "高度");
+            assert_eq!(token.gap, f32::from(old.gap()), "间隙");
+            assert_eq!(token.padding_x, f32::from(old.px()), "水平内边距");
+            assert_eq!(
+                token.font_size,
+                old.text_size().0 * ROOT_FONT_SIZE,
+                "字号（rems × 根字号）"
+            );
+            assert_eq!(token.icon_size, f32::from(old.icon_size()), "图标边长");
         }
 
         assert_eq!(tokens.border_width, 1.0);

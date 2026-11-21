@@ -3,7 +3,7 @@
 //! 引擎**不提供**任何样式构造器（`ui_core::paint::style` 只有三个数据契约 + `Default`），布局属性由
 //! 应用直接构造 `taffy::Style<SmolStr>` 再包一层。这个文件就是那一层，按 D24 的边界写得尽可能薄：
 //!
-//! 1. **只覆盖高频组合**，方法集合固定：[`StyleBuilder`] 34 个方法（含 `new`/`build`），
+//! 1. **只覆盖高频组合**，方法集合固定：[`StyleBuilder`] 35 个方法（含 `new`/`build`），
 //!    [`PaintBuilder`] 6 个；不新增"为了以后可能用到"的入口。
 //! 2. **无宏、无字符串选择器、无嵌套闭包 DSL、无扩展 trait**：方法就是字段直写。
 //! 3. **无 `.when()`/`.map()`/条件样式**：条件样式走 `bind_style` + `Signal`（运行时样式必须走
@@ -25,6 +25,19 @@
 //!   （flex/grid 子项的自动最小尺寸变 0）。**只设 `clip` 不产生自动最小尺寸语义，只设 taffy
 //!   overflow 不产生引擎裁剪**，两半都要。
 //! - [`PaintBuilder`] 只写 `PaintSpec`（静态绘制，`PAINT`）；它**不参与布局**。
+//!
+//! # 布局边框 vs 绘制边框
+//!
+//! 引擎把旧 gpui `.border_1()` 的两件事拆成两条通道：**占位**与**画线**。
+//!
+//! - 占位（参与布局）：[`StyleBuilder::border`] 写 `taffy::Style::border`，盒子四周各留出线宽，
+//!   内容区被挤进去——这正是旧 `border_widths` 的行为；
+//! - 画线（不参与布局）：[`PaintBuilder::border`] 写 `PaintSpec.border`，只画内侧边框。
+//!
+//! 从旧控件迁移时**成对书写**：`StyleBuilder::new().border(1.0)` +
+//! `PaintBuilder::new().border(1.0, color)`；只写后者会静默丢掉旧边框的布局占位（审查 F2-2）。
+//! `ComponentTokens::border_width` 是这两处共用的值来源。
+//!
 //! - 动态属性（`background`/`foreground`/`border`/`opacity`/`visible`/`interactive`/`cursor`）**不在
 //!   任何 builder 里**：它们属于 `StylePatch`，由 `bind_style` 闭包每帧求值；尺寸会变时作者在
 //!   `StylePatch::affects_layout` 置 `true`（builder 无从得知运行期值是否会变）。
@@ -74,6 +87,9 @@ impl StyleBuilder {
     }
 
     /// 一个可伸缩的 flex 子项（`flex: 1 1 0`）。
+    ///
+    /// `flex_shrink = 1.0` 恰好是 taffy 的默认值；这里显式写出来是意图声明（可伸缩、可收缩），
+    /// 删掉这一行与保留它布局等价——变异自检里它是**等价变异**，不是测试覆盖缺口。
     #[must_use]
     pub fn flex_1(mut self) -> Self {
         self.style.inner.flex_grow = 1.0;
@@ -194,6 +210,23 @@ impl StyleBuilder {
             right: LengthPercentageAuto::length(right),
             top: LengthPercentageAuto::length(top),
             bottom: LengthPercentageAuto::length(bottom),
+        };
+        self
+    }
+
+    /// **布局**边框：taffy 在盒子四周各留出 `width`（CSS `border-width`），内容区被挤进去。
+    ///
+    /// 它只占位、**不画任何像素**。要看得见的边缘，另用 [`PaintBuilder::border`] 写绘制宽度与
+    /// 颜色：旧 gpui `.border_1()` 同时做这两件事，迁移时必须成对写（模块文档「布局边框 vs
+    /// 绘制边框」）。动态边框（按下变宽/变色）属于 `StylePatch`，不在 builder 里。
+    #[must_use]
+    pub fn border(mut self, width: f32) -> Self {
+        let value = LengthPercentage::length(width);
+        self.style.inner.border = Rect {
+            left: value,
+            right: value,
+            top: value,
+            bottom: value,
         };
         self
     }
@@ -377,7 +410,10 @@ impl PaintBuilder {
         self
     }
 
-    /// 内侧边框：绘制宽度 + 颜色（绘制宽度不参与布局）。
+    /// 内侧边框：绘制宽度 + 颜色（绘制宽度**不参与布局**）。
+    ///
+    /// 这是**画线**通道；旧 `.border_1()` 的布局占位由 [`StyleBuilder::border`] 写
+    /// `Style.inner.border`，两者成对使用（模块文档「布局边框 vs 绘制边框」）。
     #[must_use]
     pub fn border(mut self, width: f32, color: Color) -> Self {
         self.paint.border = Some(Border { width, color });
@@ -437,7 +473,7 @@ mod tests {
     /// 抽样 ≥15 组组合：builder 输出与直接构造 `taffy::Style` 逐字段等价。
     #[test]
     fn style_builder_matches_direct_taffy_style() {
-        let cases: [(&str, fn(StyleBuilder) -> Style, Style); 20] = [
+        let cases: [(&str, fn(StyleBuilder) -> Style, Style); 21] = [
             (
                 "flex_row",
                 |builder| builder.flex_row().build(),
@@ -625,6 +661,22 @@ mod tests {
                 },
             ),
             (
+                "layout_border",
+                |builder| builder.border(1.0).build(),
+                Style {
+                    inner: taffy::Style {
+                        border: Rect {
+                            left: LengthPercentage::length(1.0),
+                            right: LengthPercentage::length(1.0),
+                            top: LengthPercentage::length(1.0),
+                            bottom: LengthPercentage::length(1.0),
+                        },
+                        ..taffy_style()
+                    },
+                    clip: Clip::None,
+                },
+            ),
+            (
                 "width_height",
                 |builder| builder.width(120.0).height(40.0).build(),
                 Style {
@@ -788,6 +840,45 @@ mod tests {
         // 除 clip/overflow 外没有别的字段被改。
         assert_eq!(style.inner.size, taffy_style().size);
         assert_eq!(style.inner.padding, taffy_style().padding);
+    }
+
+    /// 布局边框占位、绘制边框画线：引擎把旧 `.border_1()` 拆成两条通道，迁移时必须成对写。
+    ///
+    /// 审查 F2-2：只写 `PaintBuilder::border` 会静默丢掉旧边框的布局占位；`StyleBuilder::border`
+    /// 是补上的那条入口（写 `taffy::Style::border`，不画像素）。
+    #[test]
+    fn a_layout_border_takes_space_while_the_paint_border_draws() {
+        use crate::theme::components::ComponentTokens;
+
+        let style = StyleBuilder::new().border(1.0).build();
+        for side in [
+            style.inner.border.left,
+            style.inner.border.right,
+            style.inner.border.top,
+            style.inner.border.bottom,
+        ] {
+            assert_eq!(side, LengthPercentage::length(1.0), "四边都占位");
+        }
+        assert_eq!(style.clip, Clip::None);
+
+        // 只写布局边框：绘制通道仍然是"不画"。
+        assert!(
+            PaintBuilder::new().build().border.is_none(),
+            "布局边框不画线（画线是 PaintBuilder 的职责）"
+        );
+
+        // 成对写法：同一个 token 线宽同时进两条通道。
+        let width = ComponentTokens::standard().border_width;
+        let style = StyleBuilder::new().border(width).build();
+        let paint = PaintBuilder::new().border(width, Color::WHITE).build();
+        assert_eq!(style.inner.border.top, LengthPercentage::length(width));
+        assert_eq!(
+            paint.border,
+            Some(Border {
+                width,
+                color: Color::WHITE,
+            })
+        );
     }
 
     /// 链式组合只写它点到的字段：一个典型面板（列 + 撑满 + 间隙 + 内边距 + 居中）。
