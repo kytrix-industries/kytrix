@@ -244,6 +244,7 @@ impl Tooltip {
                 // 提示不抢焦点、关闭也不改焦点。
                 restore_focus: false,
                 band: Band::Tooltip,
+                slot: crate::kit::layer::LayerSlot::Exclusive,
                 surface: OverlaySurface::tooltip(),
                 scrim: None,
                 // 角色 / 可访问名挂在引擎浮层包装节点上（每次 show 按当前内容刷新）。
