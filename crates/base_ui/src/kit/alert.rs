@@ -564,7 +564,7 @@ mod tests {
 
     fn input_factory(
         app: &mut TestApp,
-        theme: &Theme,
+        theme: &ThemeHandle,
         text: &str,
     ) -> (InputFactory, ui_core::node::signal::Signal<InputState>) {
         let spec = Arc::new(InputSpec {
@@ -598,13 +598,12 @@ mod tests {
     }
 
     fn harness(
-        configure: impl FnOnce(AlertBuilder, &mut TestApp, &Theme) -> AlertBuilder,
+        configure: impl FnOnce(AlertBuilder, &mut TestApp, &ThemeHandle) -> AlertBuilder,
     ) -> Harness {
         let mut app = TestApp::new();
         app.enable_a11y_capture();
         let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
-        let resolved = Theme::of(Appearance::Light);
-        let builder = configure(AlertBuilder::new(), &mut app, &resolved);
+        let builder = configure(AlertBuilder::new(), &mut app, &theme);
         let window = app.window_id();
         let root = app.app().window(window).expect("window").tree().root();
         let alert = builder

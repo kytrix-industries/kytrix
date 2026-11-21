@@ -1,4 +1,4 @@
-//! `base_ui::kit` 组件的**真实窗口画廊**（P2-5 验收示例）。
+//! `base_ui::kit` 组件的**真实窗口画廊**（P2-5 建立；P2-6b 补 `--theme-check` 主题响应性验收）。
 //!
 //! ```text
 //! cargo run -p base_ui --example gallery
@@ -34,9 +34,12 @@
 //! - `--auto-demo`：1.2 s 后经 `App::dispatch_action(.., ActionSource::Programmatic)` 触发主按钮，
 //!   打印派发前后的帧号并写一条交互日志（没有 GUI 注入能力的环境用它证明动作路径可用）；
 //! - `--idle-check`：1 s 取基线帧号，再过 3 s 比较：空闲帧增量 ≤ 2 打印 PASS（I3），然后关窗；
+//! - `--theme-check`：深 ↔ 浅往返切换外观，逐组件核对颜色（输入框 / 图标 / markdown /
+//!   列表行 / 树行；G3 的端到端证据），全对 PASS 并关窗；
+//! - `--start-light`：以浅色外观启动（截图 / 手动验收用；默认深色）；
 //! - `--auto-close=<秒>`：到点关闭窗口（无人值守验收用；默认不自动关）。
 //!
-//! 退出码：`0` = 正常关窗（或 idle-check PASS）；`3` = idle-check FAIL。
+//! 退出码：`0` = 正常关窗（或 idle-check / theme-check PASS）；`3` = idle-check / theme-check FAIL。
 //!
 //! 本示例真实窗口运行中暴露的 kit / 引擎缺口记录在
 //! `.docs/gui-migration/spec-deltas/kit-gallery.md`。
@@ -58,7 +61,7 @@ use base_ui::{
         input::{self, InputNode, InputSpec, InputState},
         layer::{Band, Layer},
         list::{List, ListOptions, SelectionMode},
-        markdown::{parse::parse_document, source::MarkdownAssets, view::MarkdownView},
+        markdown::{parse::parse_document, source::MarkdownAssets, view::MarkdownNode},
         menu::{Menu, MenuAction, MenuEntry, MenuOptions, MenuSubmenu},
         overlay::{Anchor, AnimationRouter, Overlay, OverlayOptions},
         progress::Progress,
@@ -82,9 +85,14 @@ use ui_core::{
     event::{Action, ActionSource, Event, InputEvent},
     interaction::ScrollConfig,
     math::{Point, Rect, Size},
-    node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
+    node::{
+        builder::NodeBuilder,
+        id::NodeId,
+        signal::Signal,
+        tree::{NodeKind, NodeTree},
+    },
     paint::{
-        color::Color,
+        color::{Color, ColorResolver},
         primitive::Border,
         style::{PaintSpec, Style, StylePatch},
     },
@@ -188,6 +196,10 @@ struct Flags {
     auto_demo: bool,
     /// 空闲 3 秒帧增量检查（I3）。
     idle_check: bool,
+    /// 深浅色往返切换后逐组件核对颜色（G3 端到端证据）。
+    theme_check: bool,
+    /// 以浅色外观启动（截图 / 手动验收用；默认深色）。
+    start_light: bool,
     /// 到点自动关窗（秒）。
     auto_close: Option<u64>,
     /// 打印关键节点布局盒（计算外部点击坐标用）。
@@ -204,6 +216,10 @@ fn parse_flags() -> Flags {
             flags.auto_demo = true;
         } else if arg == "--idle-check" {
             flags.idle_check = true;
+        } else if arg == "--theme-check" {
+            flags.theme_check = true;
+        } else if arg == "--start-light" {
+            flags.start_light = true;
         } else if let Some(value) = arg.strip_prefix("--auto-close=") {
             flags.auto_close = value.parse::<u64>().ok();
         } else if arg == "--probe" {
@@ -228,6 +244,78 @@ struct IdleReport {
     frames: u32,
     /// 是否通过（增量 ≤ 2）。
     pass: Option<bool>,
+}
+
+/// 主题响应性检查结果（`--theme-check`：G3 的 gallery 端到端证据）。
+#[derive(Debug, Default)]
+struct ThemeCheckReport {
+    /// 是否通过。
+    pass: Option<bool>,
+    /// 失败项（`外观/组件: expected … actual …`）。
+    failures: Vec<SmolStr>,
+    /// 首帧就绪等待的轮数（Linux 软渲染冷启动可能 >900 ms）。
+    attempts: u32,
+}
+
+/// 切换外观：镜像信号 + `ThemeHandle` + 窗口背景色（顶栏按钮与 `--theme-check` 共用）。
+fn switch_appearance(
+    app: &mut App,
+    window: WindowId,
+    theme: &ThemeHandle,
+    mirror: &Signal<Appearance>,
+    next: Appearance,
+) {
+    app.write(mirror, next);
+    theme.set_appearance(app, next);
+    if let Some(target) = app.window_mut(window) {
+        target.set_background_color(theme.theme_for(next).role(Role::SurfaceCanvas));
+    }
+}
+
+/// 节点的样式补丁（`None` = 节点已卸载 / 窗口已关闭）。
+fn node_patch(app: &App, window: WindowId, node: NodeId) -> Option<StylePatch> {
+    app.window(window)?
+        .tree()
+        .get(node)
+        .ok()
+        .map(|node| node.style_patch().clone())
+}
+
+/// 子树里全部文本节点的 DFS 顺序：`(静态 TextStyle.color, bind_style.foreground)`。
+fn text_colors(app: &App, window: WindowId, root: NodeId) -> Vec<(Color, Option<Color>)> {
+    let Some(target) = app.window(window) else {
+        return Vec::new();
+    };
+    let tree = target.tree();
+    let mut colors = Vec::with_capacity(2);
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let Ok(entry) = tree.get(node) else {
+            continue;
+        };
+        if let NodeKind::Text(content) = entry.kind() {
+            colors.push((content.style.color, entry.style_patch().foreground));
+        }
+        stack.extend(entry.children().iter().rev().copied());
+    }
+    colors
+}
+
+/// 一条颜色断言：`actual` 按引擎解析后的线性预乘分量与 `expected` 比较。
+fn check_color(
+    failures: &mut Vec<SmolStr>,
+    appearance: Appearance,
+    label: &str,
+    actual: Option<Color>,
+    expected: Color,
+) {
+    let actual = actual.map(|color| ColorResolver.resolve(color).components);
+    let expected = ColorResolver.resolve(expected).components;
+    if actual != Some(expected) {
+        failures.push(format_smolstr!(
+            "{appearance:?}/{label}: expected {expected:?} actual {actual:?}"
+        ));
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -291,14 +379,34 @@ fn themed_label(
     theme: &ThemeHandle,
 ) -> NodeId {
     let initial = theme.theme_for(Appearance::Dark).role(role);
+    themed_text(
+        tree(app, window),
+        parent,
+        text,
+        text_style(size, weight, initial),
+        role,
+        theme,
+    )
+    .expect("themed label must have a live parent")
+}
+
+/// 在已拿到的 `tree` 上挂一段主题化文本（列表 / 表格的行内容闭包里用）：静态初值随便给
+///（样式 pass 早于塑形与绘制），真正的前景由 `bind_style` 按 `role` 读主题信号。
+fn themed_text(
+    tree: &mut NodeTree,
+    parent: NodeId,
+    text: impl Into<SmolStr>,
+    style: TextStyle,
+    role: Role,
+    theme: &ThemeHandle,
+) -> Result<NodeId, ui_core::error::EngineError> {
     let theme = theme.clone();
-    NodeBuilder::text(text, text_style(size, weight, initial))
+    NodeBuilder::text(text, style)
         .bind_style(move |cx| StylePatch {
             foreground: Some(theme.role(cx, role)),
             ..StylePatch::default()
         })
-        .build(tree(app, window), parent)
-        .expect("themed label must have a live parent")
+        .build(tree, parent)
 }
 
 /// 事件日志追加一行（最多 [`LOG_CAPACITY`] 条，超出丢最旧）。
@@ -390,20 +498,30 @@ fn scroll_demo(app: &mut App, window: WindowId, parent: NodeId, theme: &ThemeHan
             .build(),
     );
     for index in 0..20usize {
-        let shade = if index % 2 == 0 { 0x1F } else { 0x26 };
+        let row_theme = theme.clone();
+        let role = if index % 2 == 0 {
+            Role::SurfaceSunken
+        } else {
+            Role::SurfaceRaised
+        };
         let _ = NodeBuilder::boxed()
             .layout_override(Rect::new(0.0, index as f32 * 26.0, 360.0, 25.0))
-            .paint(PaintSpec {
-                background: Color::from_rgba8([shade, shade, shade + 8, 0xFF]),
-                ..PaintSpec::default()
+            .bind_style(move |cx| StylePatch {
+                background: Some(row_theme.role(cx, role)),
+                ..StylePatch::default()
             })
             .build(tree(app, window), viewport)
             .expect("scroll row");
+        let label_theme = theme.clone();
         let _ = NodeBuilder::text(
             format_smolstr!("滚动行 #{index} — 滚轮 / 拖条 / 轨道点击"),
             text_style(12.0, 400, fg),
         )
         .layout_override(Rect::new(12.0, index as f32 * 26.0 + 4.0, 320.0, 18.0))
+        .bind_style(move |cx| StylePatch {
+            foreground: Some(label_theme.role(cx, Role::FgMuted)),
+            ..StylePatch::default()
+        })
         .build(tree(app, window), viewport)
         .expect("scroll label");
     }
@@ -465,6 +583,12 @@ struct Gallery {
     tree: Tree,
     /// 输入框。
     inputs: Vec<InputNode>,
+    /// markdown（主题化：外观变化时 `sync` 按新主题重建子树）。
+    markdown: Rc<RefCell<MarkdownNode>>,
+    /// 主题响应性检查用的图标节点（`--theme-check`）。
+    theme_icons: Vec<NodeId>,
+    /// 主题响应性检查报告（`--theme-check`）。
+    theme_check: Rc<RefCell<ThemeCheckReport>>,
     /// 下拉。
     dropdown: Dropdown,
     /// 选择器。
@@ -494,27 +618,33 @@ struct Gallery {
 impl Gallery {
     /// 建窗 + 建树 + 建组件（不注册帧钩子；见 [`Gallery::install`]）。
     fn build(app: &mut App, flags: Flags) -> Self {
-        let theme = ThemeHandle::new(app, Appearance::Dark);
+        let start_appearance = if flags.start_light {
+            Appearance::Light
+        } else {
+            Appearance::Dark
+        };
+        let theme = ThemeHandle::new(app, start_appearance);
         let layer = Layer::new();
         let router = AnimationRouter::new();
-        let initial = theme.theme_for(Appearance::Dark);
+        let initial = theme.theme_for(start_appearance);
         let canvas = initial.role(Role::SurfaceCanvas);
         let fg = initial.role(Role::FgDefault);
         let muted = initial.role(Role::FgMuted);
 
         let window = app.create_window(WindowOptions {
-            title: SmolStr::new_static("Kytrix · base_ui kit gallery (P2-5)"),
+            title: SmolStr::new_static("Kytrix · base_ui kit gallery (P2-6b)"),
             size: Size::new(WINDOW_W, WINDOW_H),
             background: canvas,
             ..WindowOptions::default()
         });
 
-        let appearance = app.signal(Appearance::Dark);
+        let appearance = app.signal(start_appearance);
         let log = app.signal(Vec::<SmolStr>::new());
         let status = app.signal(SmolStr::new_static("DPI 读取中…"));
         let mut buttons: Vec<Button> = Vec::with_capacity(32);
         let mut chrome_buttons: Vec<Button> = Vec::with_capacity(1);
         let mut primary_button: Option<Button> = None;
+        let mut theme_icons: Vec<NodeId> = Vec::with_capacity(3);
 
         // ── 根 + 顶栏 ────────────────────────────────────────────────────────
         let root = tree(app, window).root();
@@ -583,12 +713,7 @@ impl Gallery {
                     } else {
                         Appearance::Dark
                     };
-                    app.write(&appearance, next);
-                    theme.set_appearance(app, next);
-                    if let Some(target) = app.window_mut(window) {
-                        target
-                            .set_background_color(theme.theme_for(next).role(Role::SurfaceCanvas));
-                    }
+                    switch_appearance(app, window, &theme, &appearance, next);
                     log_line(app, &log, format_smolstr!("theme: 切换为 {next:?}"));
                 }
             });
@@ -700,14 +825,21 @@ impl Gallery {
         for chunk in IconKind::ALL.chunks(19) {
             let icons_row = row(app, window, s1, 8.0);
             for kind in chunk {
-                let _ = IconSpec::new(*kind)
+                // 主题调制色：外观切换只失效图标节点（`bind_style.foreground` = E7 调制通道）。
+                let icon = IconSpec::new(*kind)
                     .with_size(16.0)
                     .with_color(icon_color)
-                    .build(app, window, icons_row);
+                    .build_themed(app, window, icons_row, &theme, Role::FgMuted)
+                    .expect("gallery icon");
+                if theme_icons.len() < 3 {
+                    theme_icons.push(icon);
+                }
             }
         }
-        // 品牌 logo 资产按深色背景设计（浅色主题下部分白/浅色 logo 不可见）：
-        // 示例固定给一块深色底板，让 7 个 logo 在两种外观下都可辨认（资产批次应补浅色变体）。
+        // G7（P3，登记项）：品牌 logo 资产按深色背景设计（Ethereum / Solana 等浅色 logo 在浅色
+        // 主题不可辨），旧 `crate::brand` 同样只是 `img(path)`、不做色调/背景适配 —— 这不是迁移
+        // 回归，正确修法是资产批次补浅色变体（kit 侧没有可用的动态反色通道）。示例按产品用法给
+        // 一块**固定深色**底板，两种外观下都可辨认；底板刻意不跟随主题（跟随会破坏对比度）。
         let brand_plate = NodeBuilder::boxed()
             .style(
                 StyleBuilder::new()
@@ -981,20 +1113,26 @@ impl Gallery {
 
         let list_columns = row(app, window, s6, 12.0);
         let fixed_style = text_style(11.5, 400, muted);
+        let fixed_theme = theme.clone();
         let fixed_list = List::new(
             app,
             theme.clone(),
             "gallery.list.fixed",
             ListOptions::fixed(26.0),
             move |tree: &mut NodeTree, parent: NodeId, index: usize| {
+                let theme = fixed_theme.clone();
                 NodeBuilder::text(format_smolstr!("等高行 #{index}"), fixed_style.clone())
                     .style(StyleBuilder::new().width_full().build())
+                    .bind_style(move |cx| StylePatch {
+                        foreground: Some(theme.role(cx, Role::FgMuted)),
+                        ..StylePatch::default()
+                    })
                     .build(tree, parent)?;
                 Ok(())
             },
         );
-        let variable_style = text_style(11.5, 400, Color::from_rgba8([0xC8, 0xD0, 0xDA, 0xFF]))
-            .with_wrap(TextWrap::Wrap);
+        let variable_style = text_style(11.5, 400, Color::WHITE).with_wrap(TextWrap::Wrap);
+        let variable_theme = theme.clone();
         let variable_list = List::new(
             app,
             theme.clone(),
@@ -1006,13 +1144,19 @@ impl Gallery {
                 for _ in 0..lines {
                     text = format_smolstr!("{text}测量回写内容 ");
                 }
+                let theme = variable_theme.clone();
                 NodeBuilder::text(text, variable_style.clone())
                     .style(StyleBuilder::new().width_full().build())
+                    .bind_style(move |cx| StylePatch {
+                        foreground: Some(theme.role(cx, Role::FgDefault)),
+                        ..StylePatch::default()
+                    })
                     .build(tree, parent)?;
                 Ok(())
             },
         );
         let deque_style = text_style(11.5, 400, muted);
+        let deque_theme = theme.clone();
         let deque_list = {
             let data = deque_data.clone();
             List::new(
@@ -1026,8 +1170,13 @@ impl Gallery {
                         .get(index)
                         .cloned()
                         .unwrap_or_else(|| format_smolstr!("deque #{index}"));
+                    let theme = deque_theme.clone();
                     NodeBuilder::text(text, deque_style.clone())
                         .style(StyleBuilder::new().width_full().build())
+                        .bind_style(move |cx| StylePatch {
+                            foreground: Some(theme.role(cx, Role::FgMuted)),
+                            ..StylePatch::default()
+                        })
                         .build(tree, parent)?;
                     Ok(())
                 },
@@ -1084,13 +1233,14 @@ impl Gallery {
             Column::fixed("标签", 130.0).span(2),
             Column::fixed("数值", 90.0).align(ColumnAlign::End),
         ];
+        let table_theme = theme.clone();
         let table = Table::new(
             app,
             theme.clone(),
             "gallery.table",
             columns,
             TableOptions::variable(30.0).selection(SelectionMode::Multi),
-            |tree: &mut NodeTree, parent: NodeId, row: usize, column: usize| {
+            move |tree: &mut NodeTree, parent: NodeId, row: usize, column: usize| {
                 let text = match column {
                     0 => format_smolstr!("资产 #{row}"),
                     1 => {
@@ -1110,13 +1260,15 @@ impl Gallery {
                     3 => format_smolstr!("跨列标签 {row}"),
                     _ => format_smolstr!("{}", row * 100),
                 };
-                NodeBuilder::text(
-                    text,
-                    text_style(11.5, 400, Color::from_rgba8([0xD8, 0xDE, 0xE6, 0xFF])),
-                )
-                .style(StyleBuilder::new().width_full().build())
-                .build(tree, parent)
-                .expect("table cell");
+                let theme = table_theme.clone();
+                NodeBuilder::text(text, text_style(11.5, 400, Color::WHITE))
+                    .style(StyleBuilder::new().width_full().build())
+                    .bind_style(move |cx| StylePatch {
+                        foreground: Some(theme.role(cx, Role::FgDefault)),
+                        ..StylePatch::default()
+                    })
+                    .build(tree, parent)
+                    .expect("table cell");
             },
             "表格无数据",
         );
@@ -1265,8 +1417,8 @@ impl Gallery {
             &theme,
         );
         let doc = Arc::new(parse_document(MARKDOWN_SOURCE, &NoAssets));
-        let view = MarkdownView::from_theme(theme.theme_for(Appearance::Dark), doc);
-        let _markdown = view.build(tree(app, window), s11);
+        // 主题化挂载：外观切换时 `MarkdownNode::sync` 按新主题重建（逐 run 颜色无动态通道）。
+        let markdown = MarkdownNode::mount(app, window, s11, theme.clone(), doc);
 
         // ⑫ 浮层 ─────────────────────────────────────────────────────────────
         let s12 = section(
@@ -1303,17 +1455,23 @@ impl Gallery {
         );
         app.on_action(overlay_action, {
             let overlay = overlay.clone();
+            let panel_theme = theme.clone();
             move |ctx| {
                 let node = ctx.node();
                 let window = ctx.window();
                 let app = ctx.app_mut();
                 let anchor = Anchor::node(node);
-                let opened = overlay.open(app, window, anchor, |tree, panel| {
+                let theme = panel_theme.clone();
+                let opened = overlay.open(app, window, anchor, move |tree, panel| {
                     NodeBuilder::text(
                         "Overlay 面板（12 向 placement + flip/clamp + 淡入淡出）",
-                        text_style(12.0, 400, Color::from_rgba8([0xE6, 0xE8, 0xEB, 0xFF])),
+                        text_style(12.0, 400, Color::WHITE),
                     )
                     .style(StyleBuilder::new().padding(8.0).build())
+                    .bind_style(move |cx| StylePatch {
+                        foreground: Some(theme.role(cx, Role::FgDefault)),
+                        ..StylePatch::default()
+                    })
                     .build(tree, panel)?;
                     Ok(())
                 });
@@ -1504,14 +1662,19 @@ impl Gallery {
             &theme,
         );
         let dialog_row = row(app, window, s13, 12.0);
+        let dialog_theme = theme.clone();
         let dialog = DialogBuilder::new("示例对话框")
-            .content(|app, window, body| {
+            .content(move |app, window, body| {
+                let theme = dialog_theme.clone();
                 NodeBuilder::text(
                     "模态对话框：Esc 关闭 / 点遮罩关闭 / 焦点陷阱与恢复。",
-                    text_style(12.5, 400, Color::from_rgba8([0xD8, 0xDE, 0xE6, 0xFF]))
-                        .with_wrap(TextWrap::Wrap),
+                    text_style(12.5, 400, Color::WHITE).with_wrap(TextWrap::Wrap),
                 )
                 .style(StyleBuilder::new().width_full().build())
+                .bind_style(move |cx| StylePatch {
+                    foreground: Some(theme.role(cx, Role::FgDefault)),
+                    ..StylePatch::default()
+                })
                 .build(tree(app, window), body)?;
                 Ok(())
             })
@@ -1615,6 +1778,7 @@ impl Gallery {
             &theme,
         );
         let log_text = log;
+        let log_theme = theme.clone();
         NodeBuilder::text(
             "",
             text_style(12.0, 400, fg)
@@ -1631,6 +1795,10 @@ impl Gallery {
                 text = SmolStr::new_static("（尚无事件：点击任意控件）");
             }
             text
+        })
+        .bind_style(move |cx| StylePatch {
+            foreground: Some(log_theme.role(cx, Role::FgDefault)),
+            ..StylePatch::default()
         })
         .style(StyleBuilder::new().width_full().flex_1().build())
         .build(tree(app, window), s15)
@@ -1691,6 +1859,9 @@ impl Gallery {
             table,
             tree: tree_view,
             inputs,
+            markdown: Rc::new(RefCell::new(markdown)),
+            theme_icons,
+            theme_check: Rc::new(RefCell::new(ThemeCheckReport::default())),
             dropdown,
             select,
             menu,
@@ -1712,6 +1883,12 @@ impl Gallery {
         app.on_frame(move |app| hook.tick(app));
 
         let window = self.window;
+        if self.flags.theme_check {
+            let gallery = self.clone();
+            let _ = app.after(window, Duration::from_millis(900), move |app| {
+                gallery.start_theme_check(app, window);
+            });
+        }
         if self.flags.probe {
             let nodes = self.probe_nodes.clone();
             let viewport = self.viewport;
@@ -1883,6 +2060,10 @@ impl Gallery {
         for input in &self.inputs {
             let _ = input.sync(app);
         }
+        if let Ok(mut markdown) = self.markdown.try_borrow_mut() {
+            // 外观变化 → 用新主题重建 markdown 子树（逐 run 颜色没有动态通道）。
+            markdown.sync(app);
+        }
         for bar in &self.scroll_bars {
             let _ = bar.sync(app);
         }
@@ -1895,6 +2076,208 @@ impl Gallery {
         let _ = self.dialog.sync(app);
         let _ = self.alert_dialog.sync(app);
         let _ = self.color_picker.sync(app);
+    }
+
+    /// `--theme-check`：真实窗口里深 → 浅 → 深往返切换，逐组件核对颜色（G3 端到端证据）。
+    ///
+    /// 覆盖：输入框（底色 / 边框 / 文字 / 占位符 / 禁用态）、图标调制色、markdown（静态
+    /// `TextStyle.color`，靠重建）、列表行前景、树行（折叠标 + 标签）。断言口径与 lib 测试同一
+    /// 条：`ColorResolver` 解析后的线性预乘分量相等。
+    fn start_theme_check(&self, app: &mut App, window: WindowId) {
+        // 首帧未完成时样式补丁还没求值（Linux 软渲染冷启动可能 >900 ms）：等一帧再检查，
+        // 否则会把「还没求值」误报成颜色错误。最多重试 20 次（≈4 s，足够冷启动）。
+        let frames = app
+            .window(window)
+            .map(|target| target.frame_index().get())
+            .unwrap_or(0);
+        if frames == 0 {
+            let attempts = {
+                let mut report = self.theme_check.borrow_mut();
+                report.attempts += 1;
+                report.attempts
+            };
+            if attempts > 20 {
+                println!("gallery: theme-check FAIL (no frame rendered within ~4 s)");
+                let mut report = self.theme_check.borrow_mut();
+                report.pass = Some(false);
+                drop(report);
+                app.close_window(window);
+                app.handle().wake();
+                return;
+            }
+            let gallery = self.clone();
+            let _ = app.after(window, Duration::from_millis(200), move |app| {
+                gallery.start_theme_check(app, window);
+            });
+            app.handle().wake();
+            return;
+        }
+        let start = self.theme.current(app);
+        let other = match start {
+            Appearance::Dark => Appearance::Light,
+            Appearance::Light => Appearance::Dark,
+        };
+        let start_failures = self.verify_theme(app, window, start);
+        println!(
+            "gallery: theme-check {start:?} failures={}",
+            start_failures.len()
+        );
+        switch_appearance(app, window, &self.theme, &self.appearance, other);
+        let gallery = self.clone();
+        let _ = app.after(window, Duration::from_millis(400), move |app| {
+            let other_failures = gallery.verify_theme(app, window, other);
+            println!(
+                "gallery: theme-check {other:?} failures={}",
+                other_failures.len()
+            );
+            switch_appearance(app, window, &gallery.theme, &gallery.appearance, start);
+            let mut failures = start_failures.clone();
+            failures.extend(other_failures);
+            let gallery = gallery.clone();
+            let _ = app.after(window, Duration::from_millis(400), move |app| {
+                let back = gallery.verify_theme(app, window, start);
+                println!(
+                    "gallery: theme-check {start:?}-again failures={}",
+                    back.len()
+                );
+                failures.extend(back);
+                let pass = failures.is_empty();
+                for failure in &failures {
+                    println!("gallery: theme-check FAIL {failure}");
+                }
+                println!(
+                    "gallery: theme-check {} ({} failure(s) across {start:?}/{other:?}/{start:?})",
+                    if pass { "PASS" } else { "FAIL" },
+                    failures.len()
+                );
+                let mut report = gallery.theme_check.borrow_mut();
+                report.pass = Some(pass);
+                report.failures = failures;
+                drop(report);
+                app.close_window(window);
+                app.handle().wake();
+            });
+            app.handle().wake();
+        });
+        app.handle().wake();
+    }
+
+    /// 当前外观下逐组件核对颜色；返回失败项（空 = 全对）。
+    fn verify_theme(&self, app: &App, window: WindowId, appearance: Appearance) -> Vec<SmolStr> {
+        let mut failures: Vec<SmolStr> = Vec::with_capacity(10);
+        let theme = self.theme.theme_for(appearance);
+        let input = theme.components().input;
+        let default_fg = theme.role(Role::FgDefault);
+        let muted = theme.role(Role::FgMuted);
+
+        // 输入框：第一个是单行可用输入框；顺带核对禁用态的配色。
+        if let Some(built) = self.inputs.first() {
+            let root = node_patch(app, window, built.root);
+            check_color(
+                &mut failures,
+                appearance,
+                "input.root.background",
+                root.as_ref().and_then(|patch| patch.background),
+                input.background.enabled,
+            );
+            check_color(
+                &mut failures,
+                appearance,
+                "input.root.border",
+                root.as_ref()
+                    .and_then(|patch| patch.border)
+                    .map(|border| border.color),
+                input.border.normal,
+            );
+            check_color(
+                &mut failures,
+                appearance,
+                "input.text.foreground",
+                node_patch(app, window, built.text).and_then(|patch| patch.foreground),
+                input.foreground.enabled,
+            );
+            check_color(
+                &mut failures,
+                appearance,
+                "input.placeholder.foreground",
+                node_patch(app, window, built.placeholder).and_then(|patch| patch.foreground),
+                input.placeholder,
+            );
+        }
+        for (index, built) in self.inputs.iter().enumerate() {
+            if !built.spec.disabled {
+                continue;
+            }
+            let label = format_smolstr!("input{index}.disabled.background");
+            check_color(
+                &mut failures,
+                appearance,
+                &label,
+                node_patch(app, window, built.root).and_then(|patch| patch.background),
+                input.background.disabled,
+            );
+        }
+
+        // 图标：调制色走 `bind_style.foreground`（E7 图片通道）。
+        for (index, node) in self.theme_icons.iter().enumerate() {
+            let label = format_smolstr!("icon{index}.foreground");
+            check_color(
+                &mut failures,
+                appearance,
+                &label,
+                node_patch(app, window, *node).and_then(|patch| patch.foreground),
+                muted,
+            );
+        }
+
+        // markdown：静态文字色靠 `MarkdownNode::sync` 重建。
+        if let Ok(markdown) = self.markdown.try_borrow() {
+            let colors = text_colors(app, window, markdown.root());
+            check_color(
+                &mut failures,
+                appearance,
+                "markdown.text.color",
+                colors.first().map(|(color, _)| *color),
+                default_fg,
+            );
+        }
+
+        // 列表行：行内容文本的前景由 `bind_style` 读主题。
+        if let Some(row) = self
+            .lists
+            .first()
+            .and_then(|list| list.row_content_node(app, 0))
+        {
+            let colors = text_colors(app, window, row);
+            check_color(
+                &mut failures,
+                appearance,
+                "list.row.foreground",
+                colors.first().and_then(|(_, patch)| *patch),
+                muted,
+            );
+        }
+
+        // 树行（第 0 行 = 根文件夹）：折叠标 muted、标签 fg.default。
+        if let Some(row) = self.tree.list().row_content_node(app, 0) {
+            let colors = text_colors(app, window, row);
+            check_color(
+                &mut failures,
+                appearance,
+                "tree.row.caret",
+                colors.first().and_then(|(_, patch)| *patch),
+                muted,
+            );
+            check_color(
+                &mut failures,
+                appearance,
+                "tree.row.label",
+                colors.last().and_then(|(_, patch)| *patch),
+                default_fg,
+            );
+        }
+
+        failures
     }
 
     /// 单条事件：日志 / 关窗语义 / 组件 dispatch。
@@ -2093,7 +2476,7 @@ fn make_input(
         tree(app, window),
         parent,
         spec,
-        theme.theme_for(Appearance::Dark),
+        theme,
         &state,
         &placeholder_signal,
     );
@@ -2184,6 +2567,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     drop(idle);
+    if gallery.flags.theme_check {
+        let report = gallery.theme_check.borrow();
+        let failures = report.failures.len();
+        match report.pass {
+            Some(true) => println!("gallery: theme-check PASS ({failures} failure(s))"),
+            Some(false) => {
+                println!("gallery: theme-check FAIL ({failures} failure(s), see lines above)");
+                failed = true;
+            }
+            None => {
+                println!("gallery: theme-check FAIL (report never produced)");
+                failed = true;
+            }
+        }
+    }
     if failed {
         std::process::exit(3);
     }

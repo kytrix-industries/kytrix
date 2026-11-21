@@ -360,8 +360,11 @@ mod tests {
     };
 
     use super::{Brand, BrandError, BrandKind};
-    use crate::kit::test_support::{
-        assert_single_image, bounds, image_primitives, test_app, test_app_with_scale,
+    use crate::{
+        kit::test_support::{
+            assert_single_image, bounds, image_primitives, test_app, test_app_with_scale,
+        },
+        theme::{appearance::Appearance, handle::ThemeHandle},
     };
 
     /// 7 个品牌：名字唯一、路径与旧模块的常量逐字一致、字节与旧 rust-embed 资产逐字节一致。
@@ -703,5 +706,39 @@ mod tests {
             .window_mut(window)
             .expect("test window")
             .set_scale(Scale::new(scale).expect("测试 DPI 必须是有限正数"));
+    }
+
+    /// G7（P3，登记项）：品牌 PNG 是**彩色**资产、`Brand` 不做主题调制/背景适配 —— 旧
+    /// `crate::brand` 同样只是 `img(path)`，所以这不是迁移回归；正确修法是资产批次补浅色变体
+    /// （kit 侧没有动态反色通道），示例用固定深色底板承载。
+    ///
+    /// 本用例把该决策固定下来：外观切换**不失效**品牌节点、调制色恒为 `Color::WHITE`。
+    /// 变异（给品牌加主题绑定/调制）⇒ 本例变红。
+    #[test]
+    fn a_brand_logo_is_theme_independent() {
+        let mut app = TestApp::new();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let window = app.window_id();
+        let root = app.app().window(window).expect("test window").tree().root();
+        let node = Brand::new(BrandKind::Ethereum)
+            .with_size(26.0)
+            .with_alt("Ethereum")
+            .build(app.app_mut(), window, root)
+            .expect("品牌挂载");
+        let _ = app.drain().expect("首帧");
+
+        assert!(theme.set_appearance(app.app_mut(), Appearance::Dark));
+        let record = app.drain().expect("切深色").clone();
+        assert!(
+            !record.dirty_nodes.contains(&node),
+            "品牌图不读主题（G7：kit 不做主题适配）：{:?}",
+            record.dirty_nodes
+        );
+        let images = image_primitives(&app);
+        assert_eq!(
+            images.first().map(|image| image.modulation),
+            Some(Color::WHITE),
+            "品牌图调制色恒为白（不染色）"
+        );
     }
 }

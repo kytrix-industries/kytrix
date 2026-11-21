@@ -94,7 +94,7 @@ use ui_core::{
 
 use crate::{
     style_builder::{PaintBuilder, StyleBuilder},
-    theme::{components::ControlSize, resolved::Theme, role::Role},
+    theme::{components::ControlSize, handle::ThemeHandle, role::Role},
 };
 
 /// 掩码字符（密码框逐字符显示）。
@@ -1189,16 +1189,20 @@ pub struct InputNode {
     pub spec: Arc<InputSpec>,
     /// 单行水平滚动句柄（[`InputNode::install`] 里登记）。
     scroll: Arc<OnceLock<ScrollHandle>>,
-    /// caret 颜色（挂载期从主题解析）。
-    caret_color: Color,
-    /// 选区颜色（挂载期从主题解析）。
-    selection_color: Color,
+    /// caret 颜色来源：外观切换后 `sync` 按 `ThemeHandle` 的当前外观重取（信号依赖在
+    /// `caret` 节点的 `bind_style` 里登记，外观写入时该节点标脏 → 出一帧 → `sync` 重画画布）。
+    theme: ThemeHandle,
 }
 
 /// 在 `tree` 的 `parent` 下挂载输入框，返回节点句柄。
 ///
 /// `placeholder_text` 是占位符文本信号（由调用方用 `App::signal(spec.placeholder.clone())` 创建）：
 /// 节点 `bind_text` 读它，[`InputNode::update_placeholder`] 写它。
+///
+/// **主题响应性**：所有颜色（底色 / 文字 / 占位符 / 边框 / caret / 选区）都在 `bind_style` /
+/// `sync` 里经 [`ThemeHandle`] 读取信号，不写挂载期常量 —— 运行时切换深浅色只重画读过主题的
+/// 节点（本模块的静态载荷只有尺寸 / 文案 / 动作）。`theme` 只用于度量 token（与外观无关）和
+/// 颜色通道，`build` 不需要窗口 / 外观。
 ///
 /// # Panics
 /// `parent` 已卸载（陈旧句柄）时 panic：挂载契约与 `NodeBuilder::build` 相同，调用方必须给
@@ -1208,15 +1212,13 @@ pub fn build(
     tree: &mut NodeTree,
     parent: NodeId,
     spec: Arc<InputSpec>,
-    theme: &Theme,
+    theme: &ThemeHandle,
     state: &Signal<InputState>,
     placeholder_text: &Signal<SmolStr>,
 ) -> InputNode {
     let tokens = theme.tokens();
     let size = tokens.for_size(spec.size);
     let border_width = tokens.border_width;
-    let colors = theme.components().input;
-    let danger_border = theme.role(Role::StatusDangerBorder);
     let disabled = spec.disabled;
     let readonly = spec.readonly;
     let masked = spec.masked;
@@ -1224,21 +1226,6 @@ pub fn build(
     let name = spec.name.clone();
     let padding_x = size.padding_x;
     let padding_y = if multiline { size.padding_x } else { 0.0 };
-    let background = if disabled {
-        colors.background.disabled
-    } else {
-        colors.background.enabled
-    };
-    let foreground = if disabled {
-        colors.foreground.disabled
-    } else {
-        colors.foreground.enabled
-    };
-    let normal_border = if disabled {
-        colors.border.disabled
-    } else {
-        colors.border.normal
-    };
 
     // ── 容器 ──────────────────────────────────────────────────────────────
     let mut root_style = StyleBuilder::new()
@@ -1258,15 +1245,17 @@ pub fn build(
     } else {
         root_style.inner.size.height = taffy::style::Dimension::length(size.height);
     }
+    // 静态绘制载荷只留几何（圆角 / 边框宽度）：颜色由 `bind_style` 在首帧样式 pass 求值，
+    // 早于本帧绘制，因此不会出现「无底色」的中间帧。
     let root_paint = PaintBuilder::new()
-        .background(background)
-        .border(border_width, normal_border)
+        .border(border_width, Color::TRANSPARENT)
         .rounded(CORNER_RADIUS)
         .build();
 
     let style_state = *state;
     let a11y_state = *state;
     let a11y_placeholder = *placeholder_text;
+    let style_theme = theme.clone();
     let mut root_builder = NodeBuilder::boxed()
         .style(root_style)
         .paint(root_paint)
@@ -1284,16 +1273,22 @@ pub fn build(
         })
         .bind_style(move |cx| {
             let state = cx.read(&style_state);
+            let colors = style_theme.components(cx).input;
             let border_color = if disabled {
                 colors.border.disabled
             } else if state.error().is_some() {
-                danger_border
+                style_theme.role(cx, Role::StatusDangerBorder)
             } else if state.is_focused() {
                 colors.border.focused
             } else {
                 colors.border.normal
             };
             StylePatch {
+                background: Some(if disabled {
+                    colors.background.disabled
+                } else {
+                    colors.background.enabled
+                }),
                 border: Some(Border {
                     width: border_width,
                     color: border_color,
@@ -1359,8 +1354,9 @@ pub fn build(
 
     // ── 文本 ──────────────────────────────────────────────────────────────
     let text_state = *state;
+    // 文字色不写进 `TextStyle`（那是静态载荷）：`bind_style.foreground` 是文本/图片共用的动态
+    // 着色通道，首帧样式 pass 求值早于塑形与绘制。
     let text_style = TextStyle::new(size.font_size)
-        .with_color(foreground)
         .with_wrap(if multiline {
             TextWrap::Wrap
         } else {
@@ -1368,9 +1364,21 @@ pub fn build(
         })
         .with_alignment(TextAlign::Start)
         .with_overflow(TextOverflow::Clip, 0);
+    let text_theme = theme.clone();
     let text_parent = viewport.unwrap_or(root);
     let mut text_builder = NodeBuilder::text(SmolStr::new_static(""), text_style)
         .bind_text(move |cx| cx.read(&text_state).display_text(masked))
+        .bind_style(move |cx| {
+            let foreground = text_theme.components(cx).input.foreground;
+            StylePatch {
+                foreground: Some(if disabled {
+                    foreground.disabled
+                } else {
+                    foreground.enabled
+                }),
+                ..StylePatch::default()
+            }
+        })
         .id(format_smolstr!("{name}.text"))
         .tab_stop(false)
         .a11y(A11yOverride {
@@ -1390,8 +1398,8 @@ pub fn build(
     // ── 占位符（绝对覆盖在文本位上；空值可见）──────────────────────────────
     let placeholder_state = *placeholder_text;
     let placeholder_style_state = *state;
+    let placeholder_theme = theme.clone();
     let placeholder_text_style = TextStyle::new(size.font_size)
-        .with_color(colors.placeholder)
         .with_wrap(if multiline {
             TextWrap::Wrap
         } else {
@@ -1415,6 +1423,7 @@ pub fn build(
             // `interactive: false`：占位符与文本节点完全重叠，必须让命中穿透到文本节点。
             let empty = state.text().is_empty() && !state.is_composing();
             StylePatch {
+                foreground: Some(placeholder_theme.components(cx).input.placeholder),
                 opacity: Some(if empty { 1.0 } else { 0.0 }),
                 interactive: Some(false),
                 ..StylePatch::default()
@@ -1430,6 +1439,7 @@ pub fn build(
         .expect("input: placeholder node mounts under the fresh root");
 
     // ── caret / 选区 Canvas（绝对覆盖在文本位上；`sync` 换内容）─────────────
+    let caret_theme = theme.clone();
     let caret = NodeBuilder::canvas(Canvas::new(Rect::default()))
         .style(
             StyleBuilder::new()
@@ -1440,9 +1450,14 @@ pub fn build(
                 .bottom(padding_y)
                 .build(),
         )
-        .bind_style(|_cx| StylePatch {
-            interactive: Some(false),
-            ..StylePatch::default()
+        .bind_style(move |cx| {
+            // 画布内容由 `sync` 生成；这里读外观只是把主题信号登记成依赖：外观写入时本节点
+            // 标脏 → 出一帧 → 组合根的帧钩子（样式 pass 之前）调用 `sync` 用新外观重画画布。
+            let _ = caret_theme.appearance(cx);
+            StylePatch {
+                interactive: Some(false),
+                ..StylePatch::default()
+            }
         })
         .id(format_smolstr!("{name}.caret"))
         .tab_stop(false)
@@ -1463,8 +1478,7 @@ pub fn build(
         placeholder_state: *placeholder_text,
         spec,
         scroll: Arc::new(OnceLock::new()),
-        caret_color: theme.role(Role::FgDefault),
-        selection_color: colors.selection,
+        theme: theme.clone(),
     }
 }
 
@@ -1718,9 +1732,15 @@ impl InputNode {
             }
         }
         let scroll_changed = self.sync_horizontal_scroll(app, window, &next);
-        let canvas = app
-            .window(window)
-            .and_then(|window_ref| self.caret_canvas(window_ref, &next));
+        // 外观每次按 `ThemeHandle` 的当前外观重取 caret / 选区色：画布内容与颜色不等价时
+        // `apply_canvas` 会换画布并请求一帧（`caret` 节点的 `bind_style` 保证外观写入时先标脏）。
+        let appearance = self.theme.current(app);
+        let theme = self.theme.theme_for(appearance);
+        let caret_color = theme.role(Role::FgDefault);
+        let selection_color = theme.components().input.selection;
+        let canvas = app.window(window).and_then(|window_ref| {
+            self.caret_canvas(window_ref, &next, caret_color, selection_color)
+        });
         if state_changed {
             app.write(&self.state, next);
         }
@@ -1840,13 +1860,22 @@ impl InputNode {
 
     /// 构造当前帧的 caret + 选区画布（`None` = 文本尚未 shape，保留旧画布）。
     ///
+    /// `caret_color` / `selection_color` 由 [`InputNode::sync`] 按主题当前外观解析后传入：
+    /// 外观切换后画布颜色跟着变（画布是自绘内容，不受 `bind_style.foreground` 影响）。
+    ///
     /// 坐标：Canvas 图元是**窗口绝对（屏幕）坐标**，`paint/canvas.rs` 的契约也这么写。因此：
     /// - caret 直接用 [`Window::text_caret_rect`]（引擎已补上节点原点、内容偏移与祖先滚动偏移）；
     /// - 选区矩形来自 `NodeTree::text_selection_rects`（文本盒**局部**坐标），补上「窗口绝对 −
     ///   局部」的原点差即得屏幕坐标——这个差里已经包含滚动偏移。
     ///
     /// 单行水平滚动**不要**在这里再减一次 `scroll.offset.x`：引擎给的已经是屏幕坐标。
-    fn caret_canvas(&self, window: &Window, state: &InputState) -> Option<Canvas> {
+    fn caret_canvas(
+        &self,
+        window: &Window,
+        state: &InputState,
+        caret_color: Color,
+        selection_color: Color,
+    ) -> Option<Canvas> {
         if !window.focus().is_focused(self.root) {
             return Some(Canvas::new(Rect::default()));
         }
@@ -1873,7 +1902,7 @@ impl InputNode {
                     bounds: rect.translate(origin),
                     corner_radius: [0.0; 4],
                     paint: QuadPaint::Solid {
-                        fill: self.selection_color,
+                        fill: selection_color,
                         border: None,
                     },
                 });
@@ -1883,7 +1912,7 @@ impl InputNode {
             bounds: caret_rect,
             corner_radius: [0.0; 4],
             paint: QuadPaint::Solid {
-                fill: self.caret_color,
+                fill: caret_color,
                 border: None,
             },
         });
@@ -2083,8 +2112,12 @@ mod tests {
         event::{Action, Event, ImeEvent, InputEvent, KeyCode, KeyState, Modifiers, PointerButton},
         interaction::ScrollHandle,
         math::{Point, Rect},
-        node::{id::NodeId, signal::Signal, tree::NodeKind},
-        paint::primitive::Primitive,
+        node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeKind},
+        paint::{
+            color::{Color, ColorResolver},
+            primitive::Primitive,
+            style::PaintSpec,
+        },
         test_support::{app::TestApp, record::PrimitiveKind},
         window::WindowId,
     };
@@ -2093,7 +2126,13 @@ mod tests {
         CaretMotion, InputError, InputNode, InputSpec, InputState, build, click_action,
         utf8_from_utf16_offset, utf16_len,
     };
-    use crate::theme::{components::ControlSize, resolved::Theme};
+    use crate::{
+        style_builder::StyleBuilder,
+        theme::{
+            appearance::Appearance, components::ControlSize, handle::ThemeHandle, resolved::Theme,
+            role::Role,
+        },
+    };
 
     // ── 构造工具 ────────────────────────────────────────────────────────────
 
@@ -2126,11 +2165,12 @@ mod tests {
         node: InputNode,
         state: Signal<InputState>,
         placeholder: Signal<SmolStr>,
+        theme: ThemeHandle,
     }
 
     fn harness(spec: InputSpec, initial: InputState) -> Harness {
-        let theme = Theme::default();
         let mut app = TestApp::new();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
         let state = app.app_mut().signal(initial);
         let placeholder = app.app_mut().signal(SmolStr::new_static("请输入"));
         let spec = Arc::new(spec);
@@ -2154,6 +2194,7 @@ mod tests {
             node,
             state,
             placeholder,
+            theme,
         }
     }
 
@@ -2266,6 +2307,27 @@ mod tests {
                 .iter()
                 .filter_map(|primitive| match primitive {
                     Primitive::Quad(quad) => Some(quad.bounds),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// caret 画布上每个 Quad 的填充色（顺序 = 选区若干 + caret 一个）。
+        fn caret_fills(&self) -> Vec<Color> {
+            let window = self.window();
+            let tree = self.app.app().window(window).expect("窗口存在").tree();
+            let NodeKind::Canvas(canvas) = tree.get(self.node.caret).expect("节点存在").kind()
+            else {
+                panic!("caret 节点必须是 Canvas");
+            };
+            canvas
+                .primitives()
+                .iter()
+                .filter_map(|primitive| match primitive {
+                    Primitive::Quad(quad) => match quad.paint {
+                        ui_core::paint::primitive::QuadPaint::Solid { fill, .. } => Some(fill),
+                        _ => None,
+                    },
                     _ => None,
                 })
                 .collect()
@@ -3743,6 +3805,200 @@ mod tests {
                 .node
                 .update_placeholder(harness.app.app_mut(), "搜索…"),
             "同值写入被等值短路"
+        );
+    }
+
+    // ── G3：运行时主题响应性（外观切换 = 只失效读过主题的节点） ─────────────
+
+    fn resolved(color: Color) -> [f32; 4] {
+        ColorResolver.resolve(color).components
+    }
+
+    fn style_patch(
+        app: &ui_core::app::App,
+        window: WindowId,
+        node: NodeId,
+    ) -> ui_core::paint::style::StylePatch {
+        app.window(window)
+            .expect("窗口存在")
+            .tree()
+            .get(node)
+            .expect("节点存活")
+            .style_patch()
+            .clone()
+    }
+
+    /// 外观切换后输入框的底色 / 边框 / 文字 / 占位符全部换成新主题的角色色，且不读主题的
+    /// 静态兄弟节点不被失效（G3 + I6/I17 的组件级验收）。
+    #[test]
+    fn switching_appearance_repaints_every_input_color() {
+        let mut harness = harness(spec(), state(""));
+        // 静态兄弟：不读任何信号 —— 主题切换不得触达它。
+        let static_node = {
+            let window = harness.app.window_id();
+            let parent = harness.node.root;
+            let tree = harness
+                .app
+                .app_mut()
+                .window_mut(window)
+                .expect("窗口存在")
+                .tree_mut();
+            NodeBuilder::boxed()
+                .style(StyleBuilder::new().size(10.0, 10.0).build())
+                .paint(PaintSpec {
+                    background: Color::WHITE,
+                    ..PaintSpec::default()
+                })
+                .build(tree, parent)
+                .expect("静态兄弟")
+        };
+        harness.drain();
+
+        let light = Theme::of(Appearance::Light);
+        let light_input = light.components().input;
+        let window = harness.window();
+        let root_patch = style_patch(harness.app.app(), window, harness.node.root);
+        assert_eq!(
+            root_patch.background.map(resolved),
+            Some(resolved(light_input.background.enabled)),
+            "浅色输入框底色"
+        );
+        assert_eq!(
+            root_patch.border.map(|border| resolved(border.color)),
+            Some(resolved(light_input.border.normal)),
+            "浅色边框"
+        );
+        assert_eq!(
+            style_patch(harness.app.app(), window, harness.node.text)
+                .foreground
+                .map(resolved),
+            Some(resolved(light_input.foreground.enabled)),
+            "浅色文字"
+        );
+        assert_eq!(
+            style_patch(harness.app.app(), window, harness.node.placeholder)
+                .foreground
+                .map(resolved),
+            Some(resolved(light_input.placeholder)),
+            "浅色占位符"
+        );
+
+        assert!(
+            harness
+                .theme
+                .set_appearance(harness.app.app_mut(), Appearance::Dark)
+        );
+        let record = harness.app.drain().expect("切深色").clone();
+        for node in [
+            harness.node.root,
+            harness.node.text,
+            harness.node.placeholder,
+            harness.node.caret,
+        ] {
+            assert!(
+                record.dirty_nodes.contains(&node),
+                "读过主题的节点必须被失效：{node:?}"
+            );
+        }
+        assert!(
+            !record.dirty_nodes.contains(&static_node),
+            "未读主题的静态节点不得被失效：{:?}",
+            record.dirty_nodes
+        );
+
+        let dark = Theme::of(Appearance::Dark);
+        let dark_input = dark.components().input;
+        let window = harness.window();
+        assert_eq!(
+            style_patch(harness.app.app(), window, harness.node.root)
+                .background
+                .map(resolved),
+            Some(resolved(dark_input.background.enabled)),
+            "深色输入框底色"
+        );
+        assert_eq!(
+            style_patch(harness.app.app(), window, harness.node.root)
+                .border
+                .map(|border| resolved(border.color)),
+            Some(resolved(dark_input.border.normal)),
+            "深色边框"
+        );
+        assert_eq!(
+            style_patch(harness.app.app(), window, harness.node.text)
+                .foreground
+                .map(resolved),
+            Some(resolved(dark_input.foreground.enabled)),
+            "深色文字"
+        );
+        assert_eq!(
+            style_patch(harness.app.app(), window, harness.node.placeholder)
+                .foreground
+                .map(resolved),
+            Some(resolved(dark_input.placeholder)),
+            "深色占位符"
+        );
+        assert_ne!(
+            resolved(light_input.background.enabled),
+            resolved(dark_input.background.enabled),
+            "两套外观的输入框底色必须不同（否则上面的断言无意义）"
+        );
+    }
+
+    /// caret / 选区是自绘画布：外观切换后 `sync` 必须用新主题的颜色重画（不再是挂载期常量）。
+    #[test]
+    fn switching_appearance_repaints_the_caret_and_selection_canvas() {
+        let mut harness = harness(spec(), state("abc"));
+        harness.focus();
+        let mut selected = harness.state();
+        selected.set_caret(0, false);
+        selected.set_caret(3, true);
+        harness.write_state(selected);
+        harness.sync();
+        harness.drain();
+
+        let light = Theme::of(Appearance::Light);
+        let light_fills = harness.caret_fills();
+        assert_eq!(
+            light_fills.len(),
+            2,
+            "一个选区 + 一个 caret：{light_fills:?}"
+        );
+        assert_eq!(
+            resolved(light_fills[0]),
+            resolved(light.components().input.selection),
+            "浅色选区"
+        );
+        assert_eq!(
+            resolved(light_fills[1]),
+            resolved(light.role(Role::FgDefault)),
+            "浅色 caret"
+        );
+
+        assert!(
+            harness
+                .theme
+                .set_appearance(harness.app.app_mut(), Appearance::Dark)
+        );
+        harness.sync();
+        harness.drain();
+
+        let dark = Theme::of(Appearance::Dark);
+        let dark_fills = harness.caret_fills();
+        assert_eq!(dark_fills.len(), 2, "一个选区 + 一个 caret：{dark_fills:?}");
+        assert_eq!(
+            resolved(dark_fills[0]),
+            resolved(dark.components().input.selection),
+            "深色选区"
+        );
+        assert_eq!(
+            resolved(dark_fills[1]),
+            resolved(dark.role(Role::FgDefault)),
+            "深色 caret"
+        );
+        assert_ne!(
+            resolved(light.role(Role::FgDefault)),
+            resolved(dark.role(Role::FgDefault)),
+            "两套外观的 caret 颜色必须不同（否则上面的断言无意义）"
         );
     }
 }

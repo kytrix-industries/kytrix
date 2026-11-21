@@ -1532,7 +1532,6 @@ impl ColorPicker {
         let labels = app.read(&inner.labels).clone();
         let active = *app.read(&inner.active_tab);
         let appearance = inner.appearance.get();
-        let theme = inner.theme.theme_for(appearance);
         let labels_signal = inner.labels;
         let active_signal = inner.active_tab;
         let tab_hover = inner.tab_hover;
@@ -1723,7 +1722,7 @@ impl ColorPicker {
                 size: ControlSize::Medium,
                 submit: Some(hex_submit),
             }),
-            theme,
+            &inner.theme,
             &hex_state,
             &hex_placeholder,
         );
