@@ -621,6 +621,7 @@ impl OverlaySurface {
             shadow: Some(ShadowSpec {
                 offset: Point::new(0.0, 3.0),
                 blur: 6.0,
+                spread: 0.0,
                 color: Color::BLACK.with_opacity(tokens.shadow.menu_alpha),
             }),
         }
@@ -637,6 +638,7 @@ impl OverlaySurface {
             shadow: Some(ShadowSpec {
                 offset: Point::new(0.0, 4.0),
                 blur: 12.0,
+                spread: 0.0,
                 color: Color::BLACK.with_opacity(tokens.shadow.dialog_alpha),
             }),
         }
