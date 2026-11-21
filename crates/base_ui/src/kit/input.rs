@@ -3291,6 +3291,16 @@ mod tests {
             caret.origin.x - scroll.offset.x >= viewport_bounds.origin.x - 1.0,
             "滚动不得把 caret 推到视口左侧之外"
         );
+        // 渲染偏移：caret Canvas 的 quad 必须同样减去滚动偏移（否则光标画在框外）。
+        let quads = harness.caret_quads();
+        let caret_quad = quads.last().expect("caret 画布至少有一个 quad");
+        assert!(
+            (caret_quad.origin.x - (caret.origin.x - scroll.offset.x)).abs() < 1.0,
+            "caret 画布的 x 必须 = 布局坐标 - 滚动偏移：quad={}，布局={}，offset={}",
+            caret_quad.origin.x,
+            caret.origin.x,
+            scroll.offset.x
+        );
     }
 
     #[test]
