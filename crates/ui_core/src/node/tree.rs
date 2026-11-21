@@ -905,6 +905,13 @@ impl NodeTree {
     pub(crate) fn mark_subtree_paint(&mut self, node: NodeId) -> usize {
         dirty::mark_subtree_paint(self, node)
     }
+    /// 整棵子树标 `A11Y`（不冒泡、不产生像素工作）。
+    ///
+    /// 消费者：`app::virtual_list::set_virtual_items`（条目数变化 ⇒ 行数 / 行号 / 集合位置等
+    /// 派生字段整体失效，必须重进下一笔增量交付）。
+    pub(crate) fn mark_subtree_a11y(&mut self, node: NodeId) -> usize {
+        dirty::mark_subtree_a11y(self, node)
+    }
     pub(crate) fn clear_bind(&mut self, node: NodeId) -> bool {
         dirty::clear_bind(self, node)
     }
