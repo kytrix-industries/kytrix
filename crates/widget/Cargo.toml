@@ -24,9 +24,14 @@ kytrix_service_provider.workspace = true
 market_participants_connector.workspace = true
 market_participants_model.workspace = true
 network.workspace = true
+ui_core.workspace = true
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
+# The services fixture builds the market-participants root through the connector's own
+# test seam: a real root needs a live gateway, and only that seam builds one without a
+# venue answering.
+market_participants_connector = { workspace = true, features = ["test-support"] }
 # The instrument-link tests build legacy payloads as dynamic JSON; production
 # code never touches `serde_json`.
 serde_json.workspace = true

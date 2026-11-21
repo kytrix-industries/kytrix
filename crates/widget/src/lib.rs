@@ -12,6 +12,7 @@ pub mod instrument_link;
 pub mod protocol;
 pub mod rpc;
 pub mod runtime;
+pub mod services;
 pub mod status;
 pub mod stream;
 pub mod surface;
